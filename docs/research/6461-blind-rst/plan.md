@@ -1105,22 +1105,57 @@ attacker-poisonable):**
        kept as belt-and-suspenders). Bulk markers park with the
        deltas (`reconcileStaleSessions` at BulkEnd must not run
        against a partially-buffered bulk).
-       (4) NO RESET LOOP (round-33 AGY: with a stuck apply — #6387 —
-       the naive overflow→reset→re-bulk cycle repeats forever):
-       while parked, buffer overflow does NOT reset the connection —
-       it drops the OLDEST buffered deltas and sets
-       `syncBackfillNeeded` (the existing window-replay mechanism,
-       `sync_conn_sweep.go:185`), so once the barrier passes the
-       drained park plus the backfill replay restore the window;
-       the connection (heartbeats, config) stays up throughout.
+       (4) OVERFLOW REPAIR, NO RESET LOOP, NO SILENT LOSS (v9.9.19,
+       round-34 Codex B1 + round-34 SMR F1 — the v9.9.18 clause was
+       wrong twice over: `syncBackfillNeeded` is a SENDER-local flag
+       armed by OUTBOUND `sendCh` overflow (`sync_conn_write.go:36,
+       :46`; the sweep replays only LOCALLY OWNED sessions,
+       `sync_conn_sweep.go:65, :137`), so the receiver setting it
+       cannot make owner A resend a frame B discarded — and A
+       already advanced its sweep window on queue success
+       (`sync_conn_sweep.go:180`); and a discarded DELETE is
+       recoverable ONLY by authoritative bulk repair, since deletes
+       are journaled just when local enqueue fails
+       (`sync_conn_write.go:69`). The corrected protocol: the park
+       buffer is bounded; on overflow the receiver marks the
+       in-flight bulk/window LOSSY — a bulk that discarded ANY
+       member neither reconciles at BulkEnd nor ACKs
+       (`sync_conn_read.go:205, :241`) — and disconnects ONCE PER
+       LATCHED EPOCH (the latch prevents hot reset loops), dropping
+       the parked buffer entirely: the reconnect's authoritative
+       FULL RESYNC is the repair (a bulk is a complete snapshot, so
+       the dropped partial window — installs AND deletes — is
+       reconstructed by it; the receiver's resync request is
+       authenticated on the existing channel). During the outage
+       the sender's own send queue fills and self-arms
+       `syncBackfillNeeded` (`sync_conn_write.go:46`), holding its
+       sweep window; on reconnect the config-first ordering (3)
+       applies the config BEFORE the re-driven bulk, the park
+       drains, and the full resync plus the sender's held-window
+       replay restore everything. With a stuck apply (#6387) the
+       park latches again after the next buffer of churn — the
+       cycle repeats at reconnect/bulk cadence (not hot), the node
+       stays operator-visible via `configSyncFailing`, and (5)
+       keeps it from mastering; progress is guaranteed whenever the
+       config can apply.
        (5) THE TAKEOVER FENCE: a node whose config apply is stuck
        (the #6387 `configSyncFailing` condition — diagnostic-only
        today, `manager.go:321`, `readiness.go:20`) is NOT
-       transfer-ready for takeover until its published forwarding
-       epoch reaches the peer's advertised high-water (taking over
-       with stale NAT policy re-creates exactly the misdelivery
-       class this mechanism exists to prevent); the readiness gate
-       gains that condition.
+       transfer-ready for takeover until BOTH (a) its published
+       forwarding epoch reaches the peer's high-water — where the
+       peer high-water itself advances from EVERY authenticated
+       observed session INSTALL epoch, not only Config frames
+       (v9.9.19, round-34 Codex H4: the authority can publish/admit
+       under C2 before the peer push, `daemon_apply_commit.go:245,
+       :270`, so a Config-only high-water at
+       `sync_conn_read.go:301` lags the sessions it must cover) —
+       AND (b) its parked queues are EMPTY with no outstanding
+       repair (a successful apply advances `lastAppliedConfigGen`
+       and clears `applyingConfigGen` immediately,
+       `sync_conn_config.go:389`; a crash in the
+       apply-success→FIFO-drain interval must not promote a node
+       whose parked E1 is still unapplied); the readiness gate
+       gains both conditions.
        At processing time the receiver's local rule config IS the
        sender's admitting config, so the shape checks and the
        wire-carried lease inputs agree — the two mechanisms are
@@ -1176,6 +1211,38 @@ attacker-poisonable):**
        the lease refcount; `Replaced(old_state)` → remove the new
        record and reinstate `old_state`) — never a blind
        `rollback_flow` of whatever the flow currently maps to.
+       **Single reservation point (v9.9.19, round-34 Codex B2):**
+       the receipt alone does not make reserve→publish one
+       transaction across WORKERS — the coordinator publishes the
+       canonical shared entry first (`ha/session_import.rs:115`),
+       then fans the identical entry to EVERY worker
+       (`ha/session_import.rs:215`), each importing independently
+       (`session_glue/mod.rs:744`) through one Arc-shared allocator
+       (`allocator.rs:742`): W0 reserves F/P (`Inserted`); before
+       W0 publishes, W1 observes F/P (`NoChange`) and publishes E1;
+       W0's covered post-reservation failure then removes F/P under
+       W1's live entry, and E2 claims P through the normal bitmap
+       CAS (`allocator.rs:1018`). The reservation therefore moves
+       OUT of the per-worker import entirely: the coordinator's
+       import entry point performs the reserve-with-receipt ONCE,
+       BEFORE canonical publication and fan-out — one transaction,
+       one receipt, one rollback site, no cross-worker pending
+       window — and on receipt-failure the install is rejected
+       before ANY worker (or the canonical shared entry) ever sees
+       it; per-worker fan-out imports (and later materializations,
+       `session_glue/mod.rs:1157`) find ownership already committed
+       and NEVER create or mutate it (their `NoChange` is an
+       assertion against committed state, not a transaction). The
+       receipt's inverse captures the FULL mutation, not just a
+       refcount: `Retained` records and restores the complete delta
+       (the `live_by_flow` record, the expiry-index entries, the
+       activation metadata, `active_flows`, and for address-only
+       the reverse-owner token, `allocator.rs:1238, :2018`), and
+       `Replaced(old_state)` DUAL-HOLDS the old and new ownership
+       from the critical section until the transaction commits (the
+       old tuple cannot be claimed between allocator unlock and a
+       later rollback — preserving the DATA alone would leave P
+       claimable in that window).
        **Capability gate (v9.9.17, round-32 Codex):** clustered
        persistent source NAT is COMMIT-TIME REJECTED today
        (`capabilities.go:87`, `persistentSourceNATHAUnsupportedReason`
@@ -1477,17 +1544,40 @@ attacker-poisonable):**
        retained as the fallback for any holder class that cannot
        hold the indirection; option (iii), a retired-A→B
        release-forwarding record — keeps retired A alive for the
-       longest token lifetime, an unbounded pin.) A stale raw
-       `Arc<PortAllocator>` A-handle used for a NEW allocation
-       (a worker that has not yet refreshed its forwarding Arc)
-       still fails transiently at A's closed gate and re-resolves
-       through the current published allocator — the transient-fail
-       path is for new-mutation ATTEMPTS, which have a caller who
-       can retry, never for RAII releases. There is NO dual-record
-       and NO cross-allocator mutex: B is never worker-visible
-       until fully populated, and the Arc swap is the single
-       handoff, so B can neither issue a held tuple nor leak a
-       freed one. New
+       longest token lifetime, an unbounded pin.) The release path
+       is LINEARIZED with the retarget (v9.9.19, round-34 Codex B3
+       — an atomic pointer swap alone does not make "load allocator
+       → acquire gate → release" atomic with the cut: a token that
+       loads `slot.current == A` and pauses before acquiring A's
+       READ permit resumes after the migration drained, snapshotted,
+       retargeted, and closed A, and its release into cached-A can
+       never decrement B's copied holder — a permanent B ghost, or a
+       reissue-under-live-session if the count was omitted): every
+       ownership operation — release included, RAII `Drop`
+       included — goes through `slot.with_current()`: load
+       `(generation, allocator)`, acquire that allocator's gate
+       READ permit, REVALIDATE the slot while holding the permit
+       (generation unchanged AND the allocator not retired); on
+       mismatch or closed-gate, drop the permit, reload, and RETRY
+       — the loop is CPU-only, bounded (the slot converges; a
+       retarget happens at most once per migration), and safe from
+       RAII context; the migration takes the slot-WRITE before the
+       allocator-WRITE (the stated lock order — no reverse order
+       exists because ownership operations never take slot-WRITE),
+       so a release is always observed on exactly one side of the
+       cut. A stale raw `Arc<PortAllocator>` A-handle used for a
+       NEW allocation (a worker that has not yet refreshed its
+       forwarding Arc) still fails transiently at A's closed gate
+       and re-resolves through the current published allocator.
+       The slots are keyed by `SourceNatPoolAllocatorKey`, NOT by
+       rule ordinal (round-34 AGY trace-2: a pool reorder/rename
+       must not retarget slot-0's tokens into a different pool's
+       allocator; a deleted/renamed pool's retired allocator
+       persists until its last pre-cut token drops). There is NO
+       dual-record and NO cross-allocator mutex: B is never
+       worker-visible until fully populated, and the Arc swap is
+       the single handoff, so B can neither issue a held tuple nor
+       leak a freed one. New
        mutations arriving during the window block briefly on the
        gate or fail transiently (the packet path re-resolves on the
        next packet — the window is µs-ms and config changes are
@@ -2756,10 +2846,14 @@ admitted interval):
   never bypass the parked install (stream-order proof); (c) kind
   dispatch — a persistent address-only flow preserving source port 80
   imports on the standby with NO port-bit reservation and keeps its
-  public address at failover; (d) the import-transaction rollback —
-  a post-retain failure (incl. the install.rs:310 check) rolls back
-  via `rollback_flow` with no orphan lease (`active_flows` returns
-  to the pre-import value); (e) legacy tail-less import stays
+  public address at failover; (d) the import-transaction receipt —
+  a post-reservation failure (incl. the install.rs:310 check) undoes
+  EXACTLY the receipt's mutation through the RAII guard (v9.9.19:
+  never a bare `rollback_flow` — `NoChange` undoes nothing,
+  `Inserted`/`Retained` undo their full captured delta incl. expiry
+  indexes/activation metadata/reverse-owner token, `Replaced`
+  reinstates the dual-held old ownership), leaving no orphan lease
+  (`active_flows` returns to the pre-import value); (e) legacy tail-less import stays
   non-persistent (rolling-upgrade parity with master); (f) the
   migration gate — a deterministic-PAT allocation, a `rollback_flow`,
   and an expiry-GC pass each attempted during the migration window
@@ -2797,6 +2891,32 @@ admitted interval):
   raw A-handle's NEW allocation transient-fails and re-resolves;
   (g) ordering — config push serialized before BulkStart for the
   same epoch.
+- **Overflow repair + single reservation point + slot
+  linearization (v9.9.19, round-34):** (a) lossy-bulk suppression —
+  a bulk that discarded any parked member neither reconciles at
+  BulkEnd nor ACKs; the once-per-latched-epoch disconnect drops the
+  parked buffer and the reconnect's full resync is the repair
+  (installs AND deletes reconstructed); (b) takeover-after-drain —
+  readiness requires BOTH published epoch >= peer high-water (the
+  high-water advanced by an observed INSTALL stamp, no Config
+  frame) AND empty parked queues with no outstanding repair (a
+  crash in the apply-success→drain interval does not promote);
+  (c) single reservation point — two workers importing the same
+  flow concurrently never race the allocator: the coordinator's
+  pre-publication reserve-with-receipt is the only transaction;
+  a coordinator-side failure rejects before any worker or the
+  canonical entry sees the install (W1 can never publish against
+  W0's later-rolled-back reservation); (d) slot linearization —
+  the pause-between-slot-load-and-gate-acquire race: the release
+  revalidates under the READ permit and retries into B (lands on
+  exactly one side of the cut; no B ghost, no reissue under a live
+  session); (e) pool reorder/rename — slots keyed by
+  `SourceNatPoolAllocatorKey`: a renamed pool's retired allocator
+  persists until its last pre-cut token drops, and a reordered
+  rule never retargets tokens into a different pool's allocator;
+  (f) receipt-vs-GC — a `Replaced(old_state)` reinstatement runs
+  entirely inside the allocator critical section, so expiry GC
+  cannot interleave.
 - **Escrow + conditional-delete fences (v9.9.3, round-19 Codex M4):**
   (a) two-phase stop: quiesce acknowledged (no new commits) BEFORE
   handoff; handoff completes BEFORE any side-map drop (no hold
