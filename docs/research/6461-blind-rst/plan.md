@@ -1346,10 +1346,25 @@ attacker-poisonable):**
        — two endpoints can retain opposite halves of different
        connections and repeatedly miss cold-prime: the
        address-ordered setup owner dials ONE tie-broken setup
-       that carries BOTH directional reset triples (the
-       reset-generation exchange for both directions rides the
-       single new connection's handshake; the alternative —
-       a separate control channel — is documented), and an
+       that carries BOTH directional reset triples — through a
+       barrier-EXEMPT authenticated pre-slot RESET LANE
+       (v9.9.37, round-45 Codex H6: if B owns the barrier while
+       A is the selected dialer, B's own barrier refusal would
+       reject A's only setup before the generations exchange,
+       and simultaneous barriers would reject both directions
+       until timeout; and the address ordering is NOT total —
+       parse failure returns "dial" on either endpoint
+       (`sync_conn.go:12`, `sync_test.go:1337`) and each fabric
+       currently selects its owner independently
+       (`sync_conn.go:319`): the reset exchange rides a
+       dedicated pre-slot control lane EXEMPT from
+       `barrierActive` (it exists precisely to negotiate the
+       barrier, so it cannot be gated by it); the setup owner
+       is chosen by a STABLE node-pair ordering key (node ids,
+       not address parsing); a deterministic live-fabric
+       fallback covers a failed preferred fabric; and the
+       connection installs only after BOTH reset triples have
+       drained and ACK'd), and an
        equal-generation `RESET_ACK` is idempotent so the loser
        of a setup race re-ACKs without re-mutating). The
        handshake's loss semantics are pinned (v9.9.33, round-43
@@ -1508,7 +1523,24 @@ attacker-poisonable):**
        unreachable) NOTHING changes: T1 remains live, T2 is
        not installed, and the install retries; the publication
        path's epoch validation is a single atomic load,
-       negligible against the map operation).
+       negligible against the map operation); and the outcome
+       and family-side-effect contracts are complete (v9.9.37,
+       round-45 Codex H5: helper IPC has unreachable/hung
+       outcomes (`manager_ha.go:1771, :1806`), and a cluster
+       install writes forward, reverse, and DNAT state
+       SEQUENTIALLY (`session_store.go:274, :284, :289`) with
+       reverse writes bypassing helper validation
+       (`manager_ha.go:1125`) — a T1 handler can commit its
+       forward, be superseded, then resume stale reverse/DNAT
+       writes: the `replace` CAS is IDEMPOTENT AND QUERYABLE —
+       on a lost ACK, Go QUERIES the registry (T2 present → the
+       commit landed; absent → retry), and the slot is STAGED
+       NON-DISPATCHABLE while the outcome is uncertain, with
+       bounded retry and the repair/not-ready fallback; and
+       EVERY family side effect (forward, reverse, DNAT) is one
+       epoch-validated transaction — each write validates the
+       presented token epoch, and a superseded epoch rolls the
+       whole family write back atomically).
        and the canonical transaction (Go AND the mirrored Rust
        side) checks the presented token's validity and
        repair-era authorization ATOMICALLY with the
@@ -1745,7 +1777,25 @@ attacker-poisonable):**
        existing channel — and the peer's periodic resend also
        retries it), and the node reports not-ready/degraded
        until the cohort imports — so HA readiness can never
-       stand while a live flow's standby cohort is missing);
+       stand while a live flow's standby cohort is missing); the
+       set's own lifecycle is complete (v9.9.37, round-45 Codex
+       B1): an entry is CANCELLED on (a) a matching DELETE for
+       the cohort's key (B's delete path deletes only an
+       INSTALLED key today, `sync_conn_gen.go:493` — the pending
+       entry must be retired explicitly, or B would stay
+       not-ready for a cohort that can never import), (b) a
+       clean authoritative absence (a bulk/repair whose
+       validated snapshot omits the cohort), (c) a newer
+       same-key identity, and (d) peer-incarnation retirement;
+       and RETRY is driven by a bounded pending-set timer PLUS
+       every state transition that can make the claim
+       satisfiable — including LEASE GC (E2's final flow drop
+       only schedules lease expiry while retaining P
+       (`allocator.rs:1349`); P is actually freed later by GC
+       (`allocator.rs:2138, :2292`), so the GC path ALSO
+       notifies the set — the zero-transition hook covers direct
+       holds, and the lease-GC notification covers persistent
+       ownership);
        (c) a NAT tuple conflict — A's missing E1 claiming public
        P while B's different-key LOCAL E2 already owns P
        (`allocator.rs:1617, :1682`) — resolves LOCAL-AUTHORITY-
@@ -1773,7 +1823,21 @@ attacker-poisonable):**
        generation's retention is what lets the NEXT reconcile
        attempt retry with a fresh generation; and force-killing
        the stuck worker is explicitly rejected — kernel-state
-       corruption risk). and a bulk
+       corruption risk) — GATED BY A DURABLE TEARDOWN-FAILED
+       LATCH (v9.9.37, round-45 Codex B4: a deadline expiry
+       BEFORE quiesce acknowledgement can leave an old worker
+       inside its loop — it checks stop only at
+       `loop_body/mod.rs:332` — able to publish BPF/shared/DNAT
+       state later (`poll_descriptor/mod.rs:2578`), while the
+       escrow contract would let the next reconcile bring up
+       another dataplane whose replay/allocate races the
+       never-handed-off holds: rebind/reconcile is PROHIBITED
+       while the latch is set — it clears only when EVERY
+       unquiesced old worker has exited (or the process
+       restarts); the retained generation AND the latch are
+       operator-visible, and the documented recovery action for
+       a latch that outlives the workers' ability to exit is a
+       process restart). and a bulk
        whose ID is not the current repair ID is WHOLLY
        NON-MUTATING — its `BulkStart` does not `resetRecvGen`,
        its installs do not publish, its BulkEnd neither
@@ -2485,7 +2549,25 @@ attacker-poisonable):**
        old quarantine generation — the old retry entry is
        cancelled and removed, never left as obsolete durable
        work — while the old identity's stage 2 has already been
-       superseded by the new epoch's publication);
+       superseded by the new epoch's publication); and the OLD
+       family's companions are never stranded by the
+       supersession (v9.9.37, round-45 Codex B3: E1(K,P1)
+       prepublishes K and reverse R1 before fan-out
+       (`session_import.rs:104, :187`); E2(K,P2)'s publication
+       replaces K and inserts only P2-derived aliases
+       (`shared_ops.rs:907, :918`) — it does NOT remove R1/P1,
+       and a later deletion derives companions from the CURRENT
+       K/P2 (`session_import.rs:257`), so R1 and G1's hold
+       would linger, R1 remaining materializable
+       (`session_glue/mod.rs:1157`): the quarantine preserves an
+       IMMUTABLE old-family cleanup record keyed by
+       `(family, SessionIdentity, quarantine_generation)` —
+       capturing the old family's companions (reverse, NAT/wire
+       aliases, the group hold) at quarantine time — and the
+       cleanup (stage 2 OR the supersession path) removes ONLY
+       identity-matching old companions against that record
+       before dropping G1, regardless of what currently
+       occupies K);
        and the
        notification is lock-free, drained ONLY with canonical,
        allocator, migration-gate, and queue locks released);
@@ -3697,7 +3779,17 @@ namespace, capability, terminal ACK, receipt rule, and discharge
 predicate lives HERE, additive and rolling-gated like the
 identity tails): the capability handshake exchanges
 `(capacity, capacity_config_generation, heartbeat-ack-capable,
-identity-enforcement-capable, lease-input-capable)`;
+identity-enforcement-capable, lease-input-capable,
+repair-vN, reset-vN)` — the two protocol-version bits are
+explicit (v9.9.37, round-45 Codex H7: an intermediate peer can
+support identity/heartbeat features while speaking only legacy
+`BulkEnd`/`BulkAck`, and without the version bits a new node
+would wait indefinitely for a terminal frame the peer cannot
+send; today's hello is auth-only and keyed-only
+(`sync_auth.go:314`), so the connection-independent hello
+negotiates `repair-vN` and `reset-vN` BEFORE any corresponding
+frame — an intermediate peer gets the legacy paths and never a
+wait-forever);
 `RESYNC_REQUEST(repair_id)` (incarnation-scoped:
 `(sender_incarnation, request_seqno)`); `RESET_GEN` /
 `RESET_ACK` carry `(direction, node_incarnation,
@@ -3710,10 +3802,26 @@ u64 can never discharge: the legacy `BulkEnd`→reconcile/ACK
 path (`sync_conn_read.go:205`) and the epoch-floor `BulkAck`
 check (`:249`) are retained for unnegotiated peers only, and a
 delayed O1 ACK is never accepted against O2's obligation);
-the completed-repair RECEIPT is keyed `(repair_id,
-terminal_seqno)` and retained for a bounded window (a duplicate
-`JOURNAL-END` revalidates against it and re-ACKs WITHOUT
-re-mutating); and every session frame is
+the terminal exchange is TWO distinct frames (v9.9.37,
+round-45 Codex B2 — earlier text had the receiver "send an
+ACK" while calling `JOURNAL-END` itself the terminal ACK and
+defining no receiver→sender frame; today's only return frame
+is a bare `BulkAck(u64)`, `sync_bulk.go:282`, with epoch-only
+handling at `sync_conn_read.go:249`):
+`JOURNAL_END(repair_id, journal_epoch, terminal_seqno)` flows
+sender→receiver and is applied; `JOURNAL_ACK` flows
+receiver→sender carrying the SAME immutable triple and is the
+ONLY discharge for the sender's OUTBOUND obligation (the
+cold-prime latch likewise clears only on `JOURNAL_ACK`, never
+on `doBulkSync` merely writing `BulkEnd`, `sync_conn.go:194`);
+the completed-repair RECEIPT is keyed by the FULL immutable
+triple `(repair_id, journal_epoch, terminal_seqno)` and
+retained through the terminal retransmission lifetime (a
+duplicate `JOURNAL_END` revalidates against it and re-ACKs
+WITHOUT re-mutating); after receipt expiry the sender mints a
+FRESH repair ID for the next attempt (a receipt is never
+reused past expiry, so a changed same-ID attempt can never be
+mistaken for the original); and every session frame is
 presented with its connection's slot-membership token out-of-band
 (the token is per-connection metadata, not a frame field).
 The sender/receiver store lifecycle: the Go sidecar synced store gains
@@ -3993,7 +4101,7 @@ documented mixed-version behavior).
 | Lifetime / borrow-checker | LOW | Anchor is `Copy` POD on an existing entry; marking restructured into the existing post-borrow propagation phase; no new cross-boundary borrows. |
 | Performance regression | LOW-MED | ~104 B/entry slab growth (~13.6 MiB/worker at cap); one TCP-header view compute (seq/ack/wnd/flags/seg_len) + ≤2 gated stores per committed TCP data packet (closing segments skip updates entirely); one extra probe per closing segment. Must be measured at minimum-frame rates (§9) — the 23 Gbit/s MTU-sized iperf run alone is insufficient (≈37 Mpps at 25 Gbit/s small-frame is the real gate; `iperf3 -l 64` is a proxy, not a demonstrated line-rate generator — gate on pps, not bandwidth). |
 | Architectural mismatch | LOW | No new subsystem; anchors at the existing #2501/#3706 chokepoints; #4400-style always-on gate. No pipeline restructure. |
-| HA / rolling upgrade | LOW-MED | Part A: no wire change; Part B adds rolling-gated additive identity tails on INSTALL/Open AND DELETE (old decoders ignore them via the trailing-field tolerance; mixed-version behavior documented: gen-based deletes apply only to non-locally-authoritative entries, and identity-dependent deletes are suppressed toward unnegotiated peers); pre-upgrade and imported entries sit in the absorbing zero-trust state — closes refuse until churn (strictly more conservative than master; bounded lingering, §2; Phase 2 §10.5 closes it for synced flows). The replica no-Close invariant + the SharedPromote refuse trace are regression-tested. Accepted residual (v9.9.16): a temporary stop whose rebind never comes pins preserved sessions + escrowed NAT ports until process exit — no workers, no reaper; escape is the declared-permanent stop; strictly more conservative than today's lose-everything link-cycle behavior. |
+| HA / rolling upgrade | LOW-MED | Part A: no wire change; Part B adds rolling-gated additive identity tails on INSTALL/Open AND DELETE PLUS the negotiated repair protocol (v9.9.37: capability-negotiated `repair-vN`/`reset-vN` — RESET_GEN/RESET_ACK on a barrier-exempt lane, RESYNC_REQUEST, repair_cutoff_epoch/repair_id on BulkStart, JOURNAL_END/JOURNAL_ACK as the only discharge, the post-cut journal, the completed-repair receipt, slot-membership tokens, and capacity negotiation; intermediate peers get the legacy paths via the version bits, never a wait-forever; old decoders ignore additive frames via the trailing-field tolerance; mixed-version behavior documented: gen-based deletes apply only to non-locally-authoritative entries, and identity-dependent deletes are suppressed toward unnegotiated peers); pre-upgrade and imported entries sit in the absorbing zero-trust state — closes refuse until churn (strictly more conservative than master; bounded lingering, §2; Phase 2 §10.5 closes it for synced flows). The replica no-Close invariant + the SharedPromote refuse trace are regression-tested. Accepted residual (v9.9.16): a temporary stop whose rebind never comes pins preserved sessions + escrowed NAT ports until process exit — no workers, no reaper; escape is the declared-permanent stop; strictly more conservative than today's lose-everything link-cycle behavior; and a teardown-failed latch (v9.9.37) prohibits rebind/reconcile after a deadline-expired teardown until every unquiesced old worker exits or the process restarts (operator-visible). |
 | Merge collision | LOW | No `FlowCacheEntry` change (v1's #6457 tension gone). `account_packet` signature change is local to two call sites; `SessionInstall`/`SessionUpdate` gains are crate-internal. |
 
 ---
