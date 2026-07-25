@@ -27,6 +27,9 @@
 | r8 | Codex (gpt-5.5 via codex-companion, resumed session) | task-mrzpy4kp-52b8bu (18m59s, completed) | PLAN NO (6 BLOCKER, 3 HIGH, 1 MEDIUM, 1 LOW) | codex-plan-r8.md |
 | r8 | AGY (direct binary, scoped run) | r8-agy-out1 | 3xSOUND (ticket narrowing/origin disjointness, per-side writer totality, owner-only lease renewal), no contradictions | agy-plan-r8.md |
 | r8 | Claude SMR | in-conversation | PLAN NO for v7.4 — 5 of 6 blockers confirmed + folded into v7.5; Codex 5 (split steering) re-adjudicated to master-parity on verification (master's propagation is local-table-only) | claude-smr-plan-r8.md |
+| r9 | Codex (gpt-5.5 via codex-companion, resumed session) | task-mrzr3o36-444ag1 (19m36s, completed) | PLAN NO (7 BLOCKER, 3 HIGH, 2 MEDIUM, 1 LOW) — the round that killed the v7.x ticket tower | codex-plan-r9.md |
+| r9 | AGY (direct binary, scoped run) | r9-agy-out1 | 4xUNSOUND (owner_rg unstamped, worker-bit mint divergence, equal-epoch baseline overwrite, 3 text contradictions) — all folded v7.6/v8 | agy-plan-r9.md |
+| r9 | Claude SMR | in-conversation | PLAN NO for v7.5/v7.6 — answered by DELETION (v8: marked-only emission + TTL sweep + id-conditional Go fence + RX-worker commit + Phase-2 bundles/floor/freshness) | claude-smr-plan-r9.md |
 
 Infra notes (per feedback_codex_infra_must_retry — all retries documented):
 - Codex: 10m client timeout kill → job found alive server-side → polled 25+ min →
