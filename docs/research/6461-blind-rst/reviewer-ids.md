@@ -33,6 +33,9 @@
 | r10 | Codex (gpt-5.5 via codex-companion, resumed session) | task-mrzsb8yw-3oxx15 (25m22s, completed) | PLAN NO (6 BLOCKER, 3 HIGH, 3 MEDIUM, 1 LOW) | codex-plan-r10.md |
 | r10 | AGY (direct binary, scoped run) | r10-agy-out1 | Q1 SOUND (single producer + exactly-one Close), Q2 UNSOUND (TTL purges live-but-quiet — liveness push folded v8.1), Q3 UNSOUND (stale v7.2 test text — swept) | agy-plan-r10.md |
 | r10 | Claude SMR | in-conversation | PLAN NO for v8/v8.1 — all twelve Codex findings adjudicated; v8.2 folds (one emission predicate with the normative sticky mark, TTL liveness clock + compare-delete, flow_incarnation_id, writer_gen + owner-epoch gate, fresh-at-write-time, marked-sibling emission with exactly-once via delete propagation, dominated async residual) | claude-smr-plan-r10.md |
+| r11 | Codex (gpt-5.5 via codex-companion, resumed session) | task-mrztzy3r-cn3tgd (18m56s, completed) | PLAN NO (7 BLOCKER, 1 HIGH, 3 MEDIUM) | codex-plan-r11.md |
+| r11 | AGY (direct binary, scoped run) | r11-agy-out1 | 3xUNSOUND (mark rules vs raw seeds — enforcement at constructors stated; reservation released ~3T before alias purge — release drives purge v8.3; text contradictions — swept) | agy-plan-r11.md |
+| r11 | Claude SMR | in-conversation | PLAN NO for v8.2/v8.3 — all eleven Codex findings adjudicated; v8.4 folds (no read-touch, one canonical family clock + lock order, mark on the Phase-2 tail, owner gate by node identity, coordinator-sequenced bundles, AnchorStreamStart + typed observed_ns freshness + atomic epoch activation, forward-mint inheritance + conditional DeleteSynced + Close codec fields, honest resource-retention framing, ~104B cost) | claude-smr-plan-r11.md |
 
 Infra notes (per feedback_codex_infra_must_retry — all retries documented):
 - Codex: 10m client timeout kill → job found alive server-side → polled 25+ min →
