@@ -1337,7 +1337,21 @@ attacker-poisonable):**
        node-scoped AND direction-scoped (each barrier's state is
        the triple `(direction, node incarnation, generation)`,
        so two simultaneous resets proceed as two independent
-       transitions, never one tied state machine). The
+       transitions, never one tied state machine). The PHYSICAL
+       setup ownership is tie-broken deterministically
+       (v9.9.35, round-44 Codex H4: today one address-ordered
+       endpoint owns each fabric's dialer (`sync_conn.go:12,
+       :319`), and crossed reset setups compete for one slot,
+       each install closing its predecessor (`sync_conn.go:244`)
+       — two endpoints can retain opposite halves of different
+       connections and repeatedly miss cold-prime: the
+       address-ordered setup owner dials ONE tie-broken setup
+       that carries BOTH directional reset triples (the
+       reset-generation exchange for both directions rides the
+       single new connection's handshake; the alternative —
+       a separate control channel — is documented), and an
+       equal-generation `RESET_ACK` is idempotent so the loser
+       of a setup race re-ACKs without re-mutating). The
        handshake's loss semantics are pinned (v9.9.33, round-43
        Codex B1): `RESET_GEN(g)` is retransmitted on the
        control/setup connection until `RESET_ACK(g)` or a
@@ -1475,7 +1489,20 @@ attacker-poisonable):**
        revocation is atomic WITH the slot swap: T1 is revoked
        BEFORE T2 installs, and the revocation is mirrored into
        the repair commit, so a paused C1 handler can never
-       publish after the repair);
+       publish after the repair); and the revocation's
+       Go↔helper linearization is an ACKNOWLEDGED TRANSACTION
+       (v9.9.35, round-44 Codex H5: ordinary supersession has no
+       repair commit to mirror into, and a T1 handler can pass
+       the Go check, pause, and publish after T2's slot swap
+       while the helper still accepts T1 — today's helper
+       publication is a separate call (`sync_conn_gen.go:435`)
+       and the `SessionStore` interface carries no token or
+       registry epoch (`session_store.go:50`): the slot swap
+       performs a helper-side `replace(slot, T1, T2,
+       token_epoch)` transaction ACKNOWLEDGED BEFORE T2's first
+       dispatch, and EVERY canonical mutation and repair commit
+       validates the current token epoch against the registry —
+       Go and Rust share the one epoch).
        and the canonical transaction (Go AND the mirrored Rust
        side) checks the presented token's validity and
        repair-era authorization ATOMICALLY with the
@@ -1667,19 +1694,36 @@ attacker-poisonable):**
        (`poll_descriptor/mod.rs:2560, :2591`) whose length the
        import admission compares against B's worker-derived cap
        (`session_import.rs:24, :91`), so a valid K-entry repair
-       plus L local entries can exceed C: preflight computes
-       K + L ≤ C INSIDE the quiesce (v9.9.34, round-44 SMR F1 —
-       local admissions freeze at quiesce entry, so L stops
-       growing and the preflight is exact by construction; an
-       outside-quiesce preflight would have a TOCTOU), and on
+       plus L local entries can exceed C: the preflight runs
+       AFTER freezing admissions (v9.9.35, round-44 Codex B2 —
+       an any-time preflight races local admission: workers can
+       still create and publish E2 (`poll_descriptor/mod.rs:2560,
+       :2591`) between the check and the quiesce): the order is
+       FREEZE admissions → AWAIT quiesce → REPEAT the complete
+       capacity and NAT-conflict preflight INSIDE the frozen
+       interval → commit or rollback (exact by construction,
+       because L cannot change in the frozen interval), and on
        overflow the repair
        enters the defined degraded state (operator-visible,
        not-ready) rather than committing an over-capacity table;
-       and a rejected cohort is never stranded (the peer's
-       periodic resend retries its exact reserve — which
-       succeeds once the conflicting local flow dies and its
-       hold releases — and the undischarged obligation also
-       re-drives the repair);
+       and a rejected cohort is never stranded: EVERY
+       reservation rejection — not only repair-era ones — arms a
+       durable cohort-scoped not-ready condition (v9.9.35,
+       round-44 Codex B1: outside an active repair, no
+       obligation is armed, and the sender advances its sweep
+       cutoff after LOCAL ENQUEUE, not receiver acceptance
+       (`sync_conn_sweep.go:137, :185`), so an ordinary
+       rejected E1 would never be retried after the conflicting
+       holder drops): the receiver records the rejected
+       `(flow key, tuple, SessionIdentity)` cohort in a durable
+       pending-rejection set, the allocator's release path
+       notifies that set on EVERY hold drop (when the
+       conflicting holder drops, the receiver requests the
+       cohort's re-drive — a sequenced re-request on the
+       existing channel — and the peer's periodic resend also
+       retries it), and the node reports not-ready/degraded
+       until the cohort imports — so HA readiness can never
+       stand while a live flow's standby cohort is missing);
        (c) a NAT tuple conflict — A's missing E1 claiming public
        P while B's different-key LOCAL E2 already owns P
        (`allocator.rs:1617, :1682`) — resolves LOCAL-AUTHORITY-
@@ -1689,12 +1733,18 @@ attacker-poisonable):**
        remains outstanding and readiness stays degraded without
        the `JOURNAL-END` acknowledgement (a local-wins-plus-ACK
        outcome is explicitly forbidden); and (d) the stop is
-       BOUNDED: the migration gate's WRITE permit is NEVER held
-       across the quiesce/join; the worker join carries an
-       explicit deadline (today's unbounded `join()`,
-       `worker_manager.rs:146`); and a rebuild/rollback failure
-       leaves XSK disabled with readiness DEGRADED (never a
-       silent half-rebuilt table). and a bulk
+       BOUNDED BY ONE DEADLINE over the WHOLE sequence
+       (v9.9.35, round-44 Codex H6 — a join-only deadline leaves
+       the escrow's quiesce-acknowledgement and token-handoff
+       phases able to block indefinitely): ONE deadline covers
+       quiesce + handoff + join (`worker_manager.rs:141, :146,
+       :149, :154`, `coordinator/mod.rs:680`); the migration
+       gate's WRITE permit is NEVER held across the
+       quiesce/join; and on deadline expiry the rebuild ABORTS —
+       XSK is disabled, the OLD worker/allocator/registry/escrow
+       generation is retained until the workers actually exit,
+       and every late publication is rejected (readiness
+       degraded, never a silent half-rebuilt table). and a bulk
        whose ID is not the current repair ID is WHOLLY
        NON-MUTATING — its `BulkStart` does not `resetRecvGen`,
        its installs do not publish, its BulkEnd neither
@@ -2391,7 +2441,22 @@ attacker-poisonable):**
        newly-published family before its worker clones fan out
        (`session_import.rs:115, :187, :215`); and a SUCCESSFUL
        stage 2 removes the flag and the queue entry atomically
-       in the same transaction as the family removal);
+       in the same transaction as the family removal; and the
+       placement and supersession are pinned (v9.9.35, round-44
+       Codex M7: publication today spans separate forward,
+       reverse, and fan-out operations (`session_import.rs:115,
+       :187, :215`) and `publish_shared_session` releases
+       `synced` before locking companion maps
+       (`shared_ops.rs:897`) — the quarantine state lives in the
+       canonical `synced` LOCK DOMAIN (the same mutex the
+       publication's forward entry takes, so the cancel and the
+       publication are one critical section); and a
+       DIFFERENT-identity publication (or any identity mismatch
+       against the queued entry) is TERMINAL SUPERSESSION of the
+       old quarantine generation — the old retry entry is
+       cancelled and removed, never left as obsolete durable
+       work — while the old identity's stage 2 has already been
+       superseded by the new epoch's publication);
        and the
        notification is lock-free, drained ONLY with canonical,
        allocator, migration-gate, and queue locks released);
@@ -3597,20 +3662,31 @@ the numeric-ID selection at `daemon_policy_invalidate.go:311` where a
 surviving rule's E2 can alias a deleted rule's old position and be
 companion-deleted through `session_store.go:391`); the session DELETE
 delta carries `{(origin_process_nonce, flow_incarnation_id)}`.
-The REPAIR PROTOCOL frames (v9.9.33, round-43 Codex B4 — additive
-and rolling-gated like the identity tails): `BulkStart` carries
-`(repair_cutoff_epoch, repair_id, declared_member_count?)`; the
-bulk markers echo `repair_id`; `JOURNAL-END` carries
-`(repair_id, journal_epoch, terminal_seqno)`; `RESET_GEN` /
+The REPAIR PROTOCOL frames (v9.9.33, round-43 Codex B4 —
+consolidated v9.9.35, round-44 Codex B3: EVERY repair frame,
+namespace, capability, terminal ACK, receipt rule, and discharge
+predicate lives HERE, additive and rolling-gated like the
+identity tails): the capability handshake exchanges
+`(capacity, capacity_config_generation, heartbeat-ack-capable,
+identity-enforcement-capable, lease-input-capable)`;
+`RESYNC_REQUEST(repair_id)` (incarnation-scoped:
+`(sender_incarnation, request_seqno)`); `RESET_GEN` /
 `RESET_ACK` carry `(direction, node_incarnation,
-reset_generation)`; the capability handshake exchanges
-`(capacity, heartbeat-ack-capable)`; and every session frame is
+reset_generation)`; `BulkStart` carries
+`(repair_cutoff_epoch, repair_id, declared_member_count?)`; the
+bulk markers echo `repair_id`; the TERMINAL ACK is its own
+frame — `JOURNAL-END` carries `(repair_id, journal_epoch,
+terminal_seqno)` and is the ONLY discharge (a bare `BulkAck`
+u64 can never discharge: the legacy `BulkEnd`→reconcile/ACK
+path (`sync_conn_read.go:205`) and the epoch-floor `BulkAck`
+check (`:249`) are retained for unnegotiated peers only, and a
+delayed O1 ACK is never accepted against O2's obligation);
+the completed-repair RECEIPT is keyed `(repair_id,
+terminal_seqno)` and retained for a bounded window (a duplicate
+`JOURNAL-END` revalidates against it and re-ACKs WITHOUT
+re-mutating); and every session frame is
 presented with its connection's slot-membership token out-of-band
-(the token is per-connection metadata, not a frame field). A
-completed repair retains a bounded RECEIPT `(repair_id,
-terminal_seqno)` so a duplicate `JOURNAL-END` validates against
-the receipt and re-ACKs WITHOUT re-mutating (round-43 Codex B4's
-terminal-ACK-loss contract).
+(the token is per-connection metadata, not a frame field).
 The sender/receiver store lifecycle: the Go sidecar synced store gains
 `(origin_process_nonce, flow_incarnation_id, row_version,
 stable_rule_id_hash, admission_config_version, persistent_nat,
@@ -4019,12 +4095,14 @@ admitted interval):
   keeping the node not-transfer-ready until its published epoch
   reaches the peer's high-water AND its parked queues are empty
   with no outstanding obligation; (d2) resync CAUSALITY
-  (v9.9.21, round-36 Codex M3): the repair bulk is asserted
+  (v9.9.21, round-36 Codex M3; discharge wording updated
+  v9.9.35): the repair bulk is asserted
   A→B (B's loss causes SENDER A's full-table iteration — a
   wrong-direction B→A bulk fails the test); a delayed
   PRE-obligation ACK does not discharge; a second overflow O2
   during O1's repair re-arms the raising-point generation and
-  only a clean bulk started after O2's generation discharges; a
+  only the `JOURNAL-END` marker validating the exact
+  post-O2 repair ID plus terminal sequence discharges; a
   failed redrive re-kicks (the obligation, not the
   `bulkRedriveInFlight` CAS, is the durable state); the
   close-both reset asserts the reconnect barrier (one fabric
@@ -4046,7 +4124,8 @@ admitted interval):
   occupies a slot AT barrier end); the repair-ID correlation
   (a bulk without the current repair ID is not the repair; a
   pre-request delayed bulk is serialized/superseded; discharge
-  only on the ACK echoing the exact repair ID); the full
+  only at `JOURNAL-END` validating the exact repair ID plus
+  terminal sequence, v9.9.35); the full
   identity pair in the helper inventory (a queued cleanup for
   `(n1,id7)` never matches `(n2,id7)` after sender restart);
   identity-conditional replacement (E1/P1/G1 → E2/P2/G2 installs
