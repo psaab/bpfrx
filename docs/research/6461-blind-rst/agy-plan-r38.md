@@ -54,3 +54,44 @@ VERDICT: PLAN NO
    ```
 AGY EXIT: 0
 --- Q3/Q4 first attempt: model refusal; retried with defensive framing (out4) ---
+VERDICT: PLAN NO
+
+---
+
+### Q3: Two-stage cleanup + deferred finalizer + heartbeat cascade
+
+* **(a) UNSOUND**
+  * **Evidence:** In [pkg/cluster/sync_conn_read.go:98-115](file:///home/ps/git/bpfrx/pkg/cluster/sync_conn_read.go#L98-L115), `syncMsgSessionV4` messages immediately mutate/install sessions into `s.sessions` upon receipt rather than freezing incremental application into an ordered buffer. In [pkg/cluster/sync_conn_read.go:183-195](file:///home/ps/git/bpfrx/pkg/cluster/sync_conn_read.go#L183-L195), `syncMsgBulkStart` calls `s.resetRecvGen()` ([pkg/cluster/sync_conn_gen.go:324](file:///home/ps/git/bpfrx/pkg/cluster/sync_conn_gen.go#L324)) to clear stored generations immediately upon start. If a wrong-epoch `BulkEnd` arrives, [pkg/cluster/sync_conn_read.go:228-239](file:///home/ps/git/bpfrx/pkg/cluster/sync_conn_read.go#L228-L239) rejects `BulkEnd` after state mutations (`resetRecvGen()` and session updates) have already occurred.
+
+* **(b) UNSOUND**
+  * **Evidence:** In [userspace-dp/src/afxdp/coordinator/snapshot_refresh.rs:316-318](file:///home/ps/git/bpfrx/userspace-dp/src/afxdp/coordinator/snapshot_refresh.rs#L316-L318), `purge_remapped_tunnel_sessions` is invoked synchronously on the coordinator thread. In [userspace-dp/src/afxdp/ha/tunnel_purge.rs:77-78](file:///home/ps/git/bpfrx/userspace-dp/src/afxdp/ha/tunnel_purge.rs#L77-L78), it executes `self.delete_synced_session(key.clone())` inline. There is no lock-free deferred-release queue holding allocation generations without allocator handles.
+
+* **(c) UNSOUND**
+  * **Evidence:** In [pkg/cluster/sync_conn.go:244-248](file:///home/ps/git/bpfrx/pkg/cluster/sync_conn.go#L244-L248), `wasDisconnected` evaluates `s.conn0 == nil && s.conn1 == nil` directly under `s.mu`. In [pkg/cluster/sync_conn.go:480-496](file:///home/ps/git/bpfrx/pkg/cluster/sync_conn.go#L480-L496) and [pkg/cluster/sync_conn.go:565](file:///home/ps/git/bpfrx/pkg/cluster/sync_conn.go#L565), TCP socket disconnects clear `s.conn0` / `s.conn1` upon TCP stream failure, rather than relying on a ~1s heartbeat detector mechanism.
+
+---
+
+### Q4: Part B Mechanism Stack Convergence Sweep
+
+* **UNSOUND**
+  * **Evidence & Availability Harm:** 
+    1. **Standby State Desynchronization:** `syncMsgBulkStart` ([pkg/cluster/sync_conn_read.go:183](file:///home/ps/git/bpfrx/pkg/cluster/sync_conn_read.go#L183)) clears receiver generation tracking via `resetRecvGen()` ([pkg/cluster/sync_conn_gen.go:324](file:///home/ps/git/bpfrx/pkg/cluster/sync_conn_gen.go#L324)) before validating the full bulk transfer. If the bulk transfer aborts or terminates with a mismatched epoch ([pkg/cluster/sync_conn_read.go:228-239](file:///home/ps/git/bpfrx/pkg/cluster/sync_conn_read.go#L228-L239)), the receiver is left with cleared generation maps while `bulkInProgress` remains set, desynchronizing standby session state and allowing stale messages to bypass generation checks.
+    2. **Premature Inline Deletion:** Synchronous inline deletion of synced sessions during snapshot refresh ([userspace-dp/src/afxdp/ha/tunnel_purge.rs:77-78](file:///home/ps/git/bpfrx/userspace-dp/src/afxdp/ha/tunnel_purge.rs#L77-L78)) risks state inconsistency across concurrent worker lookups if sessions are unmapped before worker reference release.
+
+---
+
+### New Traces Folded Open in v9.9.23
+
+1. **Unvalidated BulkStart Generation Wipe Trace:**
+   * `sync_conn_read.go:183`: `case syncMsgBulkStart` triggers when a bulk start frame arrives.
+   * `sync_conn_read.go:195`: `s.resetRecvGen()` runs immediately on the receiver.
+   * `sync_conn_gen.go:340`: All stored generation entries in `recvGenV4` and `recvGenV6` are cleared.
+   * `sync_conn_read.go:228-238`: A subsequent `syncMsgBulkEnd` with a mismatched epoch fails validation and breaks, leaving generation maps cleared without executing `reconcileStaleSessions()`.
+
+2. **Synchronous Coordinator Snapshot Purge Trace:**
+   * `snapshot_refresh.rs:316`: Coordinator computes `tunnel_purge_ids`.
+   * `snapshot_refresh.rs:318`: Calls `self.purge_remapped_tunnel_sessions(&tunnel_purge_ids)`.
+   * `tunnel_purge.rs:77-78`: Iterates over keys and synchronously invokes `self.delete_synced_session(key.clone())` inline, bypassing deferred queueing.
+AGY EXIT: 0
+
+--- round-38 infra ledger: out1 timeout; out3 model refusal; out4 derail (reviewed a different project plan); out5 (defensive framing) produced the Q3/Q4 verdict above ---
