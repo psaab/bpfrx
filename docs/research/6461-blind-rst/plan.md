@@ -1322,7 +1322,19 @@ attacker-poisonable):**
        inbound, records both slots empty, and answers
        `RESET_ACK(g)`; B reopens admission only after
        `RESET_ACK(g)` (with the silence-timeout backstop for a
-       lost ACK); unnegotiated peers use the time barrier above. and (ii) the barrier's
+       lost ACK); unnegotiated peers use the time barrier above.
+       The exchange's channel and the dual case are pinned
+       (v9.9.32, round-43 SMR F1): the handshake rides the NEXT
+       connection's setup (both fabrics are closed at reset time
+       — B dials after its drain, `RESET_GEN(g)` rides the
+       handshake, A quiesces dialers AND rejects other inbound,
+       records both slots empty, and answers `RESET_ACK(g)` in
+       the handshake response; the connection then cold-primes);
+       and the dual-simultaneous case is two INDEPENDENT
+       barriers — A's barrier governs the B→A repair, B's
+       barrier the A→B repair, each node processes the peer's
+       GEN on its own connection, and the generations are
+       node-scoped, so there is no tie to break. and (ii) the barrier's
        linearization is ONE lock domain: admission
        (`preAuthMu`, `sync_admission.go:66`), generation capture,
        `barrierActive`, slot closure, and install rejection are
@@ -1426,7 +1438,11 @@ attacker-poisonable):**
        and the canonical transaction (Go AND the mirrored Rust
        side) checks the presented token's validity and
        repair-era authorization ATOMICALLY with the
-       publication). The repair
+       publication — so a handler paused with a then-valid token
+       whose connection was revoked mid-handler is discarded AT
+       PUBLICATION, never at handle time; and the minting is
+       monotone never-reused (a per-node u64 counter — no ABA
+       after revocation, v9.9.32, round-43 SMR F2)). The repair
        ID also orders the repair's CONTENTS, not just its
        completion (v9.9.23, round-38 Codex B2: `BulkSync` pins one
        connection (`sync_bulk.go:53`) while queued incrementals
@@ -1519,7 +1535,14 @@ attacker-poisonable):**
        sequence, and ONLY that validation discharges the
        negotiated repair obligation; a crash before the marker
        leaves the obligation armed and the partial journal is
-       superseded by a new full repair; the normative §5.8 wire
+       superseded by a new full repair; the marker validation is
+       IDEMPOTENT (v9.9.32, round-43 SMR F5: the
+       receiver→sender ACK can be lost, the sender's OUTBOUND
+       obligation persists and re-kicks the repair, and the
+       receiver treats a duplicate repair carrying the same
+       repair ID as a no-side-effect revalidation — the bulk is
+       loss-free and already committed, so it re-ACKs without
+       re-mutating); the normative §5.8 wire
        schema gains `repair_cutoff_epoch` on `BulkStart`, the
        repair-ID echo on the bulk markers, the optional declared
        member count, and the `JOURNAL-END` frame — additive,
@@ -1581,7 +1604,16 @@ attacker-poisonable):**
        shadow creation MERGED AND REVALIDATED at commit
        (peer-owned state comes from the shadow;
        locally-authoritative state is preserved by the merge,
-       never root-swapped away), and lookups resume — or the
+       never root-swapped away — the merge's precedence is
+       locally-authoritative-WINS (v9.9.32, round-43 SMR F4: the
+       shadow carries only peer-owned state, so a
+       locally-authoritative E2 admitted after shadow creation
+       is preserved and any shadow row aliasing its tuple is
+       discarded by the incarnation/identity fence; and the
+       rebuild quiesce and the migration gate's quiesce
+       SERIALIZE on the coordinator's single-threaded lifecycle
+       — one quiesced operation at a time, no cross-quiesce
+       deadlock possible), and lookups resume — or the
        whole repair rolls back, with no partial visibility at
        any point); and a bulk
        whose ID is not the current repair ID is WHOLLY
@@ -1950,7 +1982,11 @@ attacker-poisonable):**
        `install_epoch` (`session/mod.rs:737, :1384`; the
        canonical `SyncedSessionEntry` has no corresponding
        version, `worker/mod.rs:375`): the canonical row version
-       is bumped by every canonical mutation, and the
+       is bumped by every canonical mutation — PER-ENTRY, never
+       a global counter (v9.9.32, round-43 SMR F3: a global
+       version would serialize unrelated conversions into an
+       availability hazard; unrelated entries never contend),
+       and the
        conversion is an explicit PENDING-CONVERSION transaction
        — prepare (read row version + identity), execute the
        cell swap, COMMIT by CAS on the row version, with
@@ -2243,7 +2279,14 @@ attacker-poisonable):**
        queues a zero-holder family with no future wake: the
        quarantine flag arms BEFORE the holder count is read, so
        a drop after the read sees the flag and re-notifies;
-       queue entries are deduplicated by family key; and the
+       queue entries are deduplicated by family key; the
+       quarantine and its retry entry are INCARNATION-SCOPED
+       (v9.9.32, round-43 SMR F6: they carry the family's
+       `SessionIdentity` — a new import with a DIFFERENT
+       identity is a new family epoch and installs normally,
+       with stage 2 proceeding against the old identity only,
+       while a SAME-identity re-import cancels the quarantine);
+       and the
        notification is lock-free, drained ONLY with canonical,
        allocator, migration-gate, and queue locks released);
        the retry queue drains from the coordinator side —
