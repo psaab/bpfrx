@@ -1502,7 +1502,13 @@ attacker-poisonable):**
        token_epoch)` transaction ACKNOWLEDGED BEFORE T2's first
        dispatch, and EVERY canonical mutation and repair commit
        validates the current token epoch against the registry —
-       Go and Rust share the one epoch).
+       Go and Rust share the one epoch; the transaction is
+       ATOMIC (v9.9.36, round-45 SMR F3: revoke-T1 and
+       register-T2 are one step — on failure (helper
+       unreachable) NOTHING changes: T1 remains live, T2 is
+       not installed, and the install retries; the publication
+       path's epoch validation is a single atomic load,
+       negligible against the map operation).
        and the canonical transaction (Go AND the mirrored Rust
        side) checks the presented token's validity and
        repair-era authorization ATOMICALLY with the
@@ -1701,8 +1707,12 @@ attacker-poisonable):**
        :2591`) between the check and the quiesce): the order is
        FREEZE admissions → AWAIT quiesce → REPEAT the complete
        capacity and NAT-conflict preflight INSIDE the frozen
-       interval → commit or rollback (exact by construction,
-       because L cannot change in the frozen interval), and on
+       interval → commit or rollback (exact by construction:
+       the freeze stops NEW commits but lets in-flight
+       slow-path commits COMPLETE — that drain IS the quiesce
+       (v9.9.36, round-45 SMR F2) — so L cannot change in the
+       frozen interval and the preflight counts the drained
+       commits exactly), and on
        overflow the repair
        enters the defined degraded state (operator-visible,
        not-ready) rather than committing an over-capacity table;
@@ -1716,8 +1726,20 @@ attacker-poisonable):**
        rejected E1 would never be retried after the conflicting
        holder drops): the receiver records the rejected
        `(flow key, tuple, SessionIdentity)` cohort in a durable
-       pending-rejection set, the allocator's release path
-       notifies that set on EVERY hold drop (when the
+       pending-rejection set — LATCHED per cohort (deduped by
+       `(flow key, SessionIdentity)`) and bounded by the
+       shared-table capacity (v9.9.36, round-45 SMR F1: a
+       rejection can only follow a legitimate peer install
+       attempt — blind packets fail earlier at the identity/gen
+       checks, so no blind-reject flood exists; a legitimate
+       wide config skew producing many pending cohorts is the
+       CORRECT conservative posture — the standby genuinely
+       lacks them) — the allocator's release path
+       notifies that set on EVERY hold drop through ONE hook at
+       the hold CELL's zero transition (the single release
+       point — reap, rollback, GC, migration, and conversion
+       all release through it, so coverage is total by
+       construction, v9.9.36) (when the
        conflicting holder drops, the receiver requests the
        cohort's re-drive — a sequenced re-request on the
        existing channel — and the peer's periodic resend also
@@ -1744,7 +1766,14 @@ attacker-poisonable):**
        XSK is disabled, the OLD worker/allocator/registry/escrow
        generation is retained until the workers actually exit,
        and every late publication is rejected (readiness
-       degraded, never a silent half-rebuilt table). and a bulk
+       degraded, never a silent half-rebuilt table); the
+       terminal state is RECOVERABLE and operator-visible
+       (v9.9.36, round-45 SMR F4: the failure surfaces through
+       the existing reconcile-stage reporting (#6244); the old
+       generation's retention is what lets the NEXT reconcile
+       attempt retry with a fresh generation; and force-killing
+       the stuck worker is explicitly rejected — kernel-state
+       corruption risk). and a bulk
        whose ID is not the current repair ID is WHOLLY
        NON-MUTATING — its `BulkStart` does not `resetRecvGen`,
        its installs do not publish, its BulkEnd neither
