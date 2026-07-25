@@ -859,8 +859,8 @@ attacker-poisonable):**
        were round-14 AGY's final coverage catch.)
        Each consumer re-reads BOTH the canonical record AND the exact
        source alias slot it consumed under the canonical lock at
-       commit, requiring each stored `flow_incarnation_id` to still
-       match the clone's (v9.4, round-14 Codex H3a: a different-forward
+       commit, requiring each stored `SessionIdentity` (the full
+       pair, v9.9.27) to still match the clone's (v9.4, round-14 Codex H3a: a different-forward
        E2 can displace E1's NAT/wire alias while E1's canonical record
        is unchanged — a canonical-only compare would pass on a stale
        alias; static/interface NAT has no allocator conflict to catch
@@ -1245,7 +1245,32 @@ attacker-poisonable):**
        then, and the first install on either side cold-primes
        (a message-bound refusal would wait for the peer's repair
        bulk that the peer is itself refusing — impossible by
-       construction here).
+       construction here). The teardown bound and the install
+       fence are complete (v9.9.27, round-40 Codex B1 — two
+       residual gaps: `missedHeartbeats` increments only when
+       `peerHeartbeatAckEver` is already true
+       (`sync_conn_read.go:32, :296`), so the ack-timeout arm
+       covers only ESTABLISHED connections; and sockets admitted
+       before the barrier can complete their asynchronous
+       handshake mid-barrier and call `installConn` with no
+       barrier recheck (`sync_conn.go:100, :388`,
+       `sync_admission.go:66`)): every slot's teardown is bounded
+       by the EARLIEST of (i) the FIN/read error (immediate —
+       the common case, and always the case for the refused
+       immediate-close attempts), (ii) the established-connection
+       heartbeat-ack timeout (2 missed acks after
+       `syncReadDeadline` 10 s — peers that ever acked, i.e.
+       every connection that was live before the barrier), and
+       (iii) the setup/handshake bound (a connection whose
+       handshake cannot complete closes by the handshake's own
+       timeout — the pre-ACK case can therefore never outlive
+       the barrier); and a BARRIER GENERATION (a per-peer
+       counter bumped at barrier start) fences installation:
+       `installConn` REJECTS any socket whose setup/admission
+       predates the barrier generation (immediate close), so an
+       async handshake completing mid-barrier can never occupy a
+       slot — the both-empty state at barrier end is guaranteed
+       by the fence, not by timing alone.
        B's inbound-repair obligation is DURABLE —
        a pathological miss (no bulk arrives) never clears it, and
        B escalates to a second close-both with exponential backoff
@@ -1275,6 +1300,24 @@ attacker-poisonable):**
        echoing the exact repair ID; a legacy sender ignores the
        request, and the receiver falls back to (a) after a
        bounded wait; unnegotiated peers always use (a). The repair
+       path's stream hygiene is explicit (v9.9.27, round-40 Codex
+       B2 — a sender quiesce cannot recall bytes already accepted
+       by ANOTHER TCP stream: `I(E1)` written to delayed fab1 can
+       land after `D(E1)` arrived on fab0 and an E1-absent repair
+       committed, because bulk pins one connection
+       (`sync_bulk.go:53`) while incrementals choose the active
+       fabric (`sync_conn_write.go:268`)): the PRIMARY close-both
+       path is immune by construction — every old stream is dead
+       and the repair arrives on a NEW post-reset connection, so
+       no old-stream byte can follow it; and the RESYNC_REQUEST
+       fast path RESETS EVERY NON-SURVIVOR STREAM at repair start
+       (their TCP resets discard in-flight bytes), and the
+       receiver fences any straggler by repair-ID and generation
+       (a frame whose generation predates the repair cutoff is
+       discarded, never published — absence reconciliation
+       records no tombstone, `sync.go:1080`, so the fence, not
+       the transport, is the ordering guarantee off the pinned
+       stream). The repair
        ID also orders the repair's CONTENTS, not just its
        completion (v9.9.23, round-38 Codex B2: `BulkSync` pins one
        connection (`sync_bulk.go:53`) while queued incrementals
@@ -1335,7 +1378,38 @@ attacker-poisonable):**
        (`sync.go:474`, `sync_bulk.go:65`), so epoch 1 from a
        restarted sender can never exceed the receiver's old
        raising point — the comparison key is
-       `(sender_incarnation, bulk_epoch)`); and a bulk
+       `(sender_incarnation, bulk_epoch)`); the POST-CUT window is
+       bounded and its delivery gates discharge (v9.9.27,
+       round-40 Codex H4: during a long joined repair, explicit
+       producers keep queueing into the 4,096-frame channel
+       (`sync.go:805`, `sync_conn_write.go:14`) — installs merely
+       arm backfill while deletes enter the journal
+       (`sync_conn_write.go:36, :69`), and a `BulkEnd` that
+       discharges B's obligation/readiness before the next sweep
+       replays that window leaves a takeover missing E2 or
+       retaining deleted E1): post-cut frames enter a BOUNDED
+       post-cut journal; journal overflow INVALIDATES the repair
+       and re-arms the obligation with a fresh generation (never
+       a silently-truncated window); and the obligation
+       discharges ONLY after the post-cut window has been
+       DELIVERED and ACKNOWLEDGED (the repair's ACK follows the
+       journal flush — readiness can never clear ahead of
+       convergence). The staging itself has a capacity and
+       progress contract (v9.9.27, round-40 Codex H5: `BulkStart`
+       advertises no member count and the per-payload 16 MiB cap
+       (`sync_conn_read.go:62`) leaves aggregate staged state
+       unbounded, while a missing `BulkEnd` would retain it
+       forever; an arbitrary fixed cap would loop
+       invalidate/re-bulk on a legitimate full table): the staged
+       budget is TABLE-DERIVED (a multiple of the current shared
+       table size, recomputed per repair — a full table always
+       fits), a missing/failed `BulkEnd` releases the staged
+       state on the connection's teardown, and progress is
+       guaranteed by a SHADOW-CHUNKED commit (the staged bulk
+       commits in bounded chunks with the generation-map commit
+       last, so an interrupted repair leaves the pre-repair
+       generation state intact and the next repair resumes
+       rather than restarting); and a bulk
        whose ID is not the current repair ID is WHOLLY
        NON-MUTATING — its `BulkStart` does not `resetRecvGen`,
        its installs do not publish, its BulkEnd neither
@@ -1652,8 +1726,24 @@ attacker-poisonable):**
        first, per the mixed-version matrix — so the conversion
        only ever runs on an entry that is still peer-owned at
        commit time);
-       the receipt×variant transition matrix: `NoChange` on a
-       DirectHold incumbent → convert-then-clone; `NoChange` on a
+       the receipt×variant transition matrix (v9.9.27, round-40
+       Codex B3 — `NoChange` is defined as no-mutation/no-undo,
+       so the conversion CANNOT be a `NoChange` arm: it is its own
+       receipt): `NoChange` on a
+       DirectHold incumbent is IMPOSSIBLE for a peer replacement —
+       the arm is `Converted(old_state)`, a mutation receipt with
+       its own exact undo (re-increment the direct count and drop
+       the minted group clone — never the no-op undo, which would
+       leave a stale DirectHold double-release path or an unused
+       GroupHold pin), and the conversion is conditioned on a
+       VERSIONED identity/origin recheck serialized with commit
+       (the demoted entry's origin/identity version at reserve
+       time must equal the version at publish-commit — an
+       intervening local re-promotion (`promote.rs:99`) bumps the
+       version, the commit fails the recheck, and the
+       `Converted(old_state)` undo restores the direct hold
+       exactly, closing the demote→convert→re-promote→reject
+       schedule); `NoChange` on a
        GroupHold incumbent → clone; `Inserted` → new hold of the
        appropriate variant; `Retained` → increment within the
        incumbent's variant; `Replaced` → per the
@@ -1877,7 +1967,10 @@ attacker-poisonable):**
        cohort can NEVER satisfy "no holder anywhere in the family"
        — the canonical family's own clones always exist):
        stage 1 checks EXTERNAL/live holders only (worker replicas,
-       materialized entries — the fan-out outcomes); stage 2, with
+       materialized entries, AND pending queue clones — v9.9.27,
+       round-40 Codex M6: a queued `GroupHold` command owns a
+       clone, so the fan-out outcomes include not-yet-consumed
+       commands); stage 2, with
        no external holder, atomically removes the quarantined
        canonical family (the pre-published BPF row and the shared
        forward+reverse entries, under the alias-token fencing) and
@@ -1925,7 +2018,16 @@ attacker-poisonable):**
        token is inserted, and unlaunched-worker queues get EXPLICIT
        rejections (their queued commands contain no hold token yet,
        `runtime.rs:408` — replay queues carry pending-outcome
-       tickets); reconcile ABANDONMENT does NOT drain the escrow —
+       tickets; v9.9.27, round-40 Codex M6: "no hold token" is
+       scoped to `DirectHold` — a queued `GroupHold` command DOES
+       own a clone (that is the distribution model), and the
+       clone's lifecycle is accounted: rejection or queue
+       destruction DROPS the clone explicitly (never a stranded
+       last-clone), and the two-stage cohort cleanup's
+       external-holder check COUNTS pending queue clones
+       alongside replicas and materializations, so a never-
+       consumed command can neither hold the reservation open
+       indefinitely nor outlive it); reconcile ABANDONMENT does NOT drain the escrow —
        it persists until a dataplane (new or restored-old) confirms
        replay consumption, draining only on a declared permanent
        dataplane stop or on that confirmation (v9.9.9's durable-escrow
@@ -2237,7 +2339,7 @@ attacker-poisonable):**
        state, current shared aliases, and peer replicas
        (`session_delta.rs:84, :406`, `shared_ops.rs:960`). Every local
        mutation driven by a Close delta becomes incarnation-conditional
-       on the delta's `flow_incarnation_id` (queued packet drops are
+       on the delta's `SessionIdentity` (the full pair, v9.9.27) (queued packet drops are
        tuple-scoped and safe; state deletes compare first).
        (d) **Reap-side release via the holder refcount (v9.5 —
        supersedes the v9.4 locally-born-only rule):**
@@ -2300,7 +2402,7 @@ attacker-poisonable):**
        HELPER-side current-state selection is still wrong for
        HISTORICAL predicates:** Go submits the filter/predicate to the
        helper, and the HELPER selects matching entries from its own
-       shared aliases (which carry `flow_incarnation_id`), captures
+       shared aliases (which carry the full `SessionIdentity`), captures
        the selected identities atomically under the canonical lock,
        and deletes under the alias-token fencing in one transaction —
        the incarnation never leaves the helper, so the
@@ -3505,10 +3607,15 @@ admitted interval):
   token-drop-free WRITE span (a last-clone drop during a
   migration defers to the release queue — no inline gate READ;
   the tunnel-remap purge runs before the WRITE permit). (d4)
-  v9.9.23 mechanisms: the heartbeat-detector cascade (B closes
-  both fabrics; A's detector clears both slots within ~1s with NO
-  cascade over sender state — a one-fabric flap never triggers
-  it); repair-content ordering (with a repair armed, incrementals
+  v9.9.23 mechanisms — with the v9.9.23.1/v9.9.24/v9.9.27
+  corrections: the barrier-and-drain reset with the barrier
+  generation fence (B closes both and refuses dial+accept;
+  A's slots drain via FIN or the per-connection heartbeat-ack
+  detector (2 missed acks after the 10 s `syncReadDeadline` —
+  NOT the cluster-manager's 5×200 ms election heartbeat — and
+  async handshakes completing mid-barrier are rejected at
+  `installConn` by the barrier generation; a one-fabric flap
+  never triggers any of it); repair-content ordering (with a repair armed, incrementals
   on any fabric BUFFER and flush after the repair's BulkEnd — the
   fab0-DELETE-then-delayed-fab1-INSTALL schedule restores
   recency; a wrong-ID bulk is wholly non-mutating — no
@@ -3769,8 +3876,8 @@ admitted interval):
 - **Phase-2 contract (deferred to the phase2-brief.md track):** per-direction bundles merge by
   lexicographic `(bulk_epoch, writer_gen, seqno)` per bundle
   (coordinator-issued writer generation kills equal-version
-  migration conflicts); updates are incarnation-conditional on
-  `flow_incarnation_id` (delayed E1 cannot attach to E2);
+  migration conflicts); updates are incarnation-conditional on the full
+  `SessionIdentity` pair (delayed E1 cannot attach to E2);
   `BulkStart` carries the sender process nonce and incrementals are
   accepted only after the first BulkStart of a connection (nonce
   change resets the floor); `fresh` is computed at write time;
@@ -3798,8 +3905,9 @@ admitted interval):
   :243, :264` treats the helper-local deletion as authoritative)
   all become incarnation-conditional: the
   purge/publish fires only when the detached entry's
-  `flow_incarnation_id` still matches the canonical record's (v9.4,
-  round-14 Codex H3b/c/d + round-15 Codex H4). (d) a validated
+  full `SessionIdentity` still matches the canonical record's (v9.4,
+  round-14 Codex H3b/c/d + round-15 Codex H4; v9.9.27 — the pair,
+  not the scalar). (d) a validated
   close on an import marks it and the marking worker's 2 s reap emits
   the authoritative Close (exactly one in the normal case — forward
   emits, reverse suppressed by `is_reverse`; the documented rare
@@ -3830,8 +3938,8 @@ admitted interval):
   (forward when present, reverse for lone reverse imports) with
   `expires_after_ns` copied at publish and refreshed on every stamp
   (OPENING→ESTABLISHED: a quiet established flow is never swept at
-  K × opening_timeout); compare-delete per member on
-  flow_incarnation_id under the documented lock order incl. the
+  K × opening_timeout); compare-delete per member on the full
+  `SessionIdentity` pair under the documented lock order incl. the
   dnat_table side effect; a colliding E2 alias survives E1's sweep;
   the NAT reservation release purges the alias family only via the
   holder refcount zero (the holder refcount shipped as Part B — NOT
