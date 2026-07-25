@@ -876,38 +876,57 @@ attacker-poisonable):**
        entry's hold references the FORWARD allocation and releases
        through the forward allocation's refcount (not the reverse
        early-return path at `source.rs:789`); and the refcount itself
-       is overflow-checked. **Reconcile hold escrow (v9.7, round-16
-       Codex B1 — the drain-everything rule would otherwise destroy
-       exactly what compatible-config reconcile preserves):** the
-       reconcile sequence snapshots shared entries
-       (`coordinator/reconcile/teardown.rs:54`), stops and joins all
-       workers (`:80`, `worker_manager.rs:146`), and replays detached
-       `SyncedSessionEntry` clones at bring-up
+       is overflow-checked. **Reconcile hold escrow (v9.8, round-17
+       Codex B1 — the v9.7 escrow had no safe release boundary and no
+       quiesced snapshot):** the reconcile sequence is: (1) workers are
+       stopped and joined FIRST (`teardown.rs:80`,
+       `worker_manager.rs:146`) — the teardown SNAPSHOT
+       (`teardown.rs:54`) then runs QUIESCED (no worker can commit a
+       new SNAT flow mid-shutdown, `loop_body/mod.rs:332`,
+       `poll_descriptor/mod.rs:2560` — the v9.7 race where a
+       post-snapshot commit escaped both snapshot and escrow is
+       closed); (2) the teardown transfers ONE exact hold per
+       allocation into `PreservedReconcileState` (the refcount never
+       reaches zero across the window — the escrow token is the
+       KEEPER, one per allocation, not per replica); (3) bring-up
        (`coordinator/reconcile/bringup.rs:421`,
-       `coordinator/mod.rs:761`) — if the workers' exit drains every
-       hold to zero, the allocation is freed before the replay's
-       verify-and-retain, the replay is rejected (it has no packet to
-       re-resolve), and the live flow's NAT state is destroyed by a
-       routine reconcile. The rule: BEFORE joining the workers, the
-       teardown transfers ONE exact hold per allocation into
-       `PreservedReconcileState` (an escrow vec of tokens — the
-       refcount never reaches zero across the reconcile window);
-       bring-up transfers each escrowed token into the replayed worker
-       entries as they are installed; the escrow releases only after
-       successful replay or conclusive abandonment (in which case the
-       normal sweep/reap machinery takes over). The replay's
-       verify-and-retain then succeeds because the allocation never
-       died, and the BPF-before-consume ordering at
-       `coordinator/mod.rs:771` is covered by the alias-token fencing
-       (external deletes re-check the alias at delete time). The entry then carries
-       `nat_hold: bool` — shorthand for `token.is_some()` (v9.7,
-       round-16 Codex H2: a boolean cannot identify the allocation,
-       so the token itself is an owned, LINEAR `Option<NatHoldToken>`
-       carrying the exact allocator/allocation identity — the rule id
-       plus the flow tuple, since today's release searches the current
-       rule set by tuple at `source.rs:761`; `NatDecision` alone is
-       insufficient, `nat/mod.rs:90`). Every removal path takes() the
-       token exactly once and either releases or transfers it:
+       `coordinator/mod.rs:761`) replays detached
+       `SyncedSessionEntry` clones, and every queued upsert gains an
+       **install acknowledgement**: `handle_upsert_synced`
+       (`upsert_synced.rs:64`) returns an outcome per command
+       (installed / rejected), and each installed entry performs its
+       own verify-and-retain (which succeeds because the escrow kept
+       the allocation alive and increments the refcount per replica —
+       solving "one linear token cannot transfer into every worker
+       replica": the replicas retain, the escrow only keeps the
+       allocation alive meanwhile); (4) the escrow releases ONLY
+       after replay-consumption-confirmed (all queued outcomes
+       collected — NEVER at workers-READY, `loop_body/mod.rs:150,
+       :682`, which precedes consumption) — for rejected entries the
+       escrow releases immediately (the allocation frees, which is
+       correct for a flow that failed to reinstall); on abandonment,
+       dropping the escrow drains the tokens and the normal
+       sweep/reap machinery takes over (no leak). The
+       BPF-before-consume ordering at `coordinator/mod.rs:771` is
+       covered by the alias-token fencing (external deletes re-check
+       the alias at delete time). The token itself is an owned, LINEAR `NatHoldToken`
+       (v9.8, round-17 Codex H3): it owns the exact allocator HANDLE
+       (`Arc<PortAllocator>`, `allocator.rs:742` — `SourceNatRule` has
+       no stable allocator identifier, `source.rs:251`, and allocators
+       are shared/reused by pool configuration, `source.rs:327, :726`),
+       the flow tuple, the expected translation, and the allocation
+       KIND (SNAT / NAT64 — the NAT64 allocator's equivalent identity
+       scheme at `nat64.rs:915` — / address-only). It lives in a
+       PER-WORKER SIDE MAP (entry handle → token) so `SessionEntry`
+       does NOT grow (the 56 B claim stands); RAII semantics: `Drop`
+       releases the hold unless the token was defused by an explicit
+       `take()`/transfer — so exceptional destruction is covered too
+       (a worker panic unwinds and drops the side map before the
+       supervisor catches it, `supervisor.rs:80`: every token's `Drop`
+       fires, decrementing refcounts correctly; queue rejection/drop
+       and unlaunched-worker queues use the same RAII path). Every
+       removal path takes() the token exactly once and either
+       releases or transfers it:
        reap (via `ExpiredSession`), `remove_entry` returns,
        fresh-install replacement (`install.rs:139`), explicit
        deletion (`install.rs:538`), synced-upsert replacement
@@ -973,24 +992,39 @@ attacker-poisonable):**
        the redirect map stores a u8 action, and DNAT values lack any
        incarnation — so no map-ABI field is possible without a shim
        change this plan forbids; the canonical shared alias already
-       carries the id and IS the sidecar). The rule: DELETES are
-       compare-gated — the alias is compare-deleted first under the
-       canonical lock, and the external state (redirect/conntrack/
-       DNAT/canonical BPF) is deleted ONLY when the alias delete won
-       (slot held OUR incarnation) or the slot was already absent; a
-       stale E1 re-check right before deletion sees E2's alias and
-       skips everything. WRITES are last-writer-wins driven by live
+       carries the id and IS the sidecar). **Ownership rule (v9.8,
+       round-17 Codex B2):** ALL session-related external-map
+       mutations — create or delete, on the redirect, conntrack, DNAT,
+       and canonical session maps — are HELPER-OWNED under the
+       canonical alias lock; the Go side NEVER deletes session-map
+       state directly for closes (a delayed E1 Close otherwise races
+       Rust committing same-key E2, and Go's `DeleteWithCompanionsV4`
+       reads E2's current BPF value and deletes the derived DNAT
+       record before the helper can compare the E2 alias,
+       `session_store.go:391, :537` — retired for session closes; Go
+       routes the Close to the helper, which performs the fenced
+       transaction; Go's direct map writes are confined to paths where
+       no fencing is needed, e.g. quiesced full-table rebuilds at
+       bring-up, and `manager_ha.go:1771`'s mutex-drop during helper
+       IPC becomes irrelevant because the fence lives entirely in the
+       helper). **Per-operation span (normative, v9.8):** every
+       external mutation is its own transaction — canonical lock →
+       re-read the EXACT SOURCE ALIAS for the key being mutated (the
+       derived key's own alias record, not just the canonical family —
+       a different-forward E2 can displace E1's derived alias
+       independently, `shared_ops.rs:918`) → one syscall → unlock;
+       no initial alias win is ever cached as authorization for a
+       later syscall. WRITES are last-writer-wins driven by live
        traffic — E2's publish is never blocked by E1's stale slot
-       (round-15 Codex B1's E2-rejection defect: a same-incarnation
-       write rule would reject the legitimate replacement); the
-       write's own commit-time verify-and-retain already established
-       that the writer is live. This closes the E1-lookup→E2-overwrite
-       →E1-delete race (`publish_conntrack.rs:142`'s BPF_ANY write vs
-       `bpf_map/mod.rs:321`'s key-only delete): E1's delete re-reads
-       the alias in the same lock it deletes from and finds E2. No
-       shim/meta change, no `make generate`. Tuple-scoped queued-frame
-       cancellation stays unconditional (bounded packet loss only,
-       safe).
+       (round-15 Codex B1's E2-rejection defect); the write's own
+       commit-time verify-and-retain already established that the
+       writer is live. The E1-lookup→E2-overwrite→E1-delete race
+       (`publish_conntrack.rs:142`'s BPF_ANY write vs
+       `bpf_map/mod.rs:321`'s key-only delete) is closed: E1's delete
+       re-reads the exact alias in the same syscall span and finds E2.
+       No shim/meta change, no `make generate`. Tuple-scoped
+       queued-frame cancellation stays unconditional (bounded packet
+       loss only, safe).
        No Close producer is required; staleness is bounded. (The
        Go-side floor already exists — `pkg/conntrack` GC with HA
        delete-sync callbacks.)
@@ -1627,6 +1661,13 @@ admitted interval):
   delta on its ordinary reap (peer-synced origin). (A later non-close
   packet may promote it; the then-promoted entry's natural reap DOES
   emit Close — correct owner semantics, round-6 Codex 10.)
+- **Probation two-branch (v9.8, round-17 Codex M4):** (a) a blind
+  non-close packet that is FILTERED/TTL-dropped: probation untouched
+  (no clear, no refresh, no Open, no replication, no publication, no
+  family stamp); (b) a blind non-close that COMMITS: probation clears
+  exactly once, ordinary established idle refresh, exactly one
+  Open/replication/stamp, and subsequent hits do NOT re-promote; no
+  accelerated reap and no close mark in either branch.
 - **Trust transactions (v5, round-3 Codex 3):** authenticated sample
   REPLACES untrusted storage (planted X discarded, not blessed/max-merged);
   unauthenticated sample never clears/alters trusted state (SYN
@@ -1654,10 +1695,11 @@ admitted interval):
 - **Two-packet reverse-NAT bypass (round-1 Codex B2):** blind RST on
   reverse tuple → NO reverse entry minted (skip-install), forward
   companion NOT marked, `tcp_close_seq_rejected` bumped; in-window
-  variant → seeded closing + the honest master chain (reverse marked;
-  #4380 companion retention defers its reap while the forward lives;
-  next accepted hit propagates to both) — NOT an idealized 2 s whole-flow
-  reap (round-2 Codex 8). Match-provenance: a SHARED forward match with a
+  variant → seeded closing + the FULL mark applied atomically to the
+  forward family in hand (sticky bits + reset-before-timeout recompute
+  + last_seen + wheel push in the same resolve, v9.2+) so the forward
+  emits at its 2 s reap — NOT an idealized whole-flow reap and NOT a
+  later-hit propagation (round-2 Codex 8, round-17 Codex M5). Match-provenance: a SHARED forward match with a
   coexisting local fabric placeholder validates against the SHARED
   snapshot (refuse), never the wrong local anchor.
 - **Materialize gate (site 2c):** closing-flagged shared-hit materialize
