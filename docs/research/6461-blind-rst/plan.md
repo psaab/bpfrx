@@ -881,10 +881,18 @@ attacker-poisonable):**
        could acquire them, since joining waits for worker-local state
        to destruct and the RAII side map drops every old hold during
        the join, `worker_manager.rs:146`):** the reconcile sequence is
-       a TWO-PHASE stop: (1) SIGNAL quiesce — workers stop processing
-       NEW packets (no new commits) but stay ALIVE and keep their
-       tables and side-map tokens; (2) HANDOFF — each worker transfers
-       its outstanding `NatHoldToken`s to the coordinator escrow
+       a TWO-PHASE stop (a NEW mechanism — today `teardown.rs:80`'s
+       `stop_inner(false)` signals `stop=true` and joins/destructs
+       worker threads in one step, `worker_manager.rs:146`, with no
+       quiesce-without-destruct state; it is added here): (1) SIGNAL
+       quiesce — workers stop processing NEW packets (no new commits)
+       but stay ALIVE and keep their tables and side-map tokens, AND
+       drain or extract the tokens held in pending COMMAND QUEUES
+       (round-19 AGY: unconsumed queued commands can reference holds —
+       a join/destruct would RAII-drop them and release the holds
+       prematurely instead of transferring them); (2) HANDOFF — each
+       worker transfers its outstanding `NatHoldToken`s (table-held
+       AND queue-drained) to the coordinator escrow
        DURING its own shutdown, while it still owns them (the keeper
        set is complete: every hold that existed at quiesce is in the
        escrow before any worker's side map can drop); (3) JOIN
