@@ -628,6 +628,17 @@ pub(in crate::afxdp) struct BatchCounters {
     // BindingLiveState.nat64_ineligible_source and surfaced as the `NAT64
     // ineligible-source drops` operator counter.
     nat64_ineligible_source: u64,
+    // #6475: fail-closed NAT64 DESTINATION-ineligibility drops — an incoming
+    // IPv6 packet whose NAT64-prefix-matched destination embeds a non-global
+    // IPv4 per RFC 6052 §2.2 (0.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16,
+    // 224.0.0.0/4, 240.0.0.0/4 — e.g. `64:ff9b::127.0.0.1`, which would
+    // otherwise resolve LocalDelivery to the localhost-only control plane once
+    // lo0 lands in `state.local_v4`) is dropped BEFORE route lookup, policy, or
+    // `allocate_source`. Distinct from the source gate above and from the pool
+    // counters (config/capacity on an ELIGIBLE flow) — this is a destination
+    // input-validation reject. Flushed to BindingLiveState.nat64_ineligible_dest
+    // and surfaced as the `NAT64 ineligible-destination drops` operator counter.
+    nat64_ineligible_dest: u64,
     // #5625: fail-closed NAT64 EXTENSION-HEADER ineligibility drops — a v6→v4
     // forward translation was rejected BEFORE it proceeded because the IPv6
     // packet carried an Authentication Header (51), an ACTIVE Routing header
@@ -832,6 +843,22 @@ impl BatchCounters {
         self.nat64_ineligible_source += 1;
     }
 
+    /// #6475: record a fail-closed NAT64 DESTINATION-ineligibility drop — an
+    /// incoming IPv6 packet whose NAT64-prefix-matched destination embeds a
+    /// non-global IPv4 per RFC 6052 §2.2 (e.g. `64:ff9b::127.0.0.1`, which
+    /// would otherwise LocalDeliver to the localhost-only control plane).
+    /// Bumped at the pre-routing NAT64 classification
+    /// (`classify_ipv6_packet`/`classify_ipv6_dest` →
+    /// `Nat64Match::IneligibleDestination`) before any route lookup, policy, or
+    /// `allocate_source`, so no session/BIB/allocation state is minted. Batched
+    /// like the sibling nat64 drop counters and flushed to
+    /// `BindingLiveState.nat64_ineligible_dest`.
+    #[inline]
+    pub(in crate::afxdp) fn record_nat64_ineligible_dest(&mut self) {
+        self.touched = true;
+        self.nat64_ineligible_dest += 1;
+    }
+
     /// #5625: record a fail-closed NAT64 extension-header ineligibility drop —
     /// a v6→v4 forward translation rejected because the IPv6 packet carried an
     /// Authentication Header, an active Routing header (Segments Left > 0), or a
@@ -939,6 +966,13 @@ impl BatchCounters {
             live.nat64_ineligible_source
                 .fetch_add(self.nat64_ineligible_source, Ordering::Relaxed);
             self.nat64_ineligible_source = 0;
+        }
+        // #6475: fail-closed NAT64 destination-ineligibility tally, batched
+        // like the sibling nat64 drop counters above.
+        if self.nat64_ineligible_dest != 0 {
+            live.nat64_ineligible_dest
+                .fetch_add(self.nat64_ineligible_dest, Ordering::Relaxed);
+            self.nat64_ineligible_dest = 0;
         }
         // #5625: fail-closed NAT64 ext-header-ineligibility tally, batched like
         // the sibling nat64 drop counters above.

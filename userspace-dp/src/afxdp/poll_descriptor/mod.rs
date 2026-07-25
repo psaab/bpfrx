@@ -1212,6 +1212,24 @@ pub(super) fn poll_binding_process_descriptor(
                                         binding.scratch.scratch_recycle.push(desc.addr);
                                         continue;
                                     }
+                                    crate::nat64::Nat64Match::IneligibleDestination => {
+                                        // #6475: RFC 6052 §2.2 non-global
+                                        // embedded-destination drop. The extracted
+                                        // v4 destination is 0.0.0.0/8, 127.0.0.0/8,
+                                        // 169.254.0.0/16, 224.0.0.0/4, or
+                                        // 240.0.0.0/4 — e.g. `64:ff9b::127.0.0.1`,
+                                        // which would otherwise resolve
+                                        // LocalDelivery to the localhost-only
+                                        // control plane (gRPC 50051 / REST 8080)
+                                        // once lo0 lands in `state.local_v4`.
+                                        // Fail closed with a distinct counter
+                                        // BEFORE route lookup, policy, or
+                                        // `allocate_source` — no session, BIB, or
+                                        // allocation state is minted.
+                                        telemetry.counters.record_nat64_ineligible_dest();
+                                        binding.scratch.scratch_recycle.push(desc.addr);
+                                        continue;
+                                    }
                                     crate::nat64::Nat64Match::MatchUnavailable => {
                                         // Fail closed: a NAT64 prefix matched
                                         // but the source pool is empty/exhausted.

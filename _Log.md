@@ -61068,6 +61068,45 @@ top.
   unchanged → no regen).
 - **File(s)**: pkg/dataplane/userspace/eventstream_oversized_drop_path_6160_test.go,
     _Log.md
+## 2026-07-24 — #6475 NAT64 non-global embedded-destination gate (RFC 6052 §2.2)
+- **Timestamp**: 2026-07-24
+- **Action**: Closed the #6475 NAT64 destination-side eligibility gap.
+    `match_ipv6_dest` extracted the low 32 bits of a prefix-matched IPv6
+    destination unconditionally, so `64:ff9b::127.0.0.1` classified
+    `MatchReady(127.0.0.1)` and — with lo0 configured (its addresses land in
+    `state.local_v4`) — resolved LocalDelivery to the localhost-only control
+    plane (gRPC 50051 / REST 8080), reachable bidirectionally from any NAT64
+    client through a minted session. `classify_ipv6_dest` now screens the
+    extracted v4 via `Nat64State::embedded_v4_is_non_global` (0.0.0.0/8,
+    127.0.0.0/8, 169.254.0.0/16, 224.0.0.0/4, 240.0.0.0/4 — subsumes
+    255.255.255.255/32 and both Pref64 boundaries) BEFORE the pool check and
+    returns the distinct fail-closed `Nat64Match::IneligibleDestination`; the
+    pre-routing arm in `poll_descriptor` drops with
+    `BatchCounters::record_nat64_ineligible_dest`, plumbed like the #5623
+    source gate (BindingLiveState atomic → snapshot → wire
+    `BindingStatus.nat64_ineligible_dest` → `NAT64 ineligible-destination
+    drops` row). RFC 1918 / TEST-NET embedded destinations intentionally still
+    translate (issue scopes that screening to optional; an NSP may target
+    internal v4). Fail-on-revert: 8 nat64_tests.rs cases; the 6 reject/ordering
+    tests verified RED with the gate neutralized, controls GREEN. Go:
+    `Nat64IneligibleDest` wire field + agg + row +
+    `TestFormatStatusSummaryShowsNAT64IneligibleDest`; status-summary golden
+    regenerated (one added row); `protocol_wire_v1.json` regenerated (one added
+    key). Docs: FEATURES.md nat64.rs row + docs/feature-coverage.md NAT64 row.
+- **File(s)**: userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs,
+    userspace-dp/src/afxdp/poll_descriptor/mod.rs, userspace-dp/src/afxdp/mod.rs,
+    userspace-dp/src/afxdp/umem/mod.rs, userspace-dp/src/afxdp/umem/snapshot.rs,
+    userspace-dp/src/afxdp/worker/mod.rs,
+    userspace-dp/src/afxdp/coordinator/refresh_bindings.rs,
+    userspace-dp/src/afxdp/coordinator/reconcile/reset.rs,
+    userspace-dp/src/protocol/binding.rs,
+    userspace-dp/tests/fixtures/protocol_wire_v1.json,
+    userspace-dp/src/FEATURES.md, docs/feature-coverage.md,
+    pkg/dataplane/userspace/protocol_binding.go,
+    pkg/dataplane/userspace/format/status_sections.go,
+    pkg/dataplane/userspace/format/status_test.go,
+    pkg/dataplane/userspace/format/status_golden_test.go,
+    pkg/dataplane/userspace/format/testdata/status_summary.golden, _Log.md
 - **Timestamp**: 2026-07-24
 - **Action**: Extract `afxdp::binding_state` out of `afxdp::umem` (#6436).
     `umem/mod.rs` was ~85% binding runtime state fused into the memory-region
