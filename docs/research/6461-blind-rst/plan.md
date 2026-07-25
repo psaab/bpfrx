@@ -917,6 +917,24 @@ attacker-poisonable):**
        and increments the refcount per replica — solving "one linear
        token cannot transfer into every worker replica": the replicas
        retain, the escrow only keeps the allocation alive meanwhile).
+       **Persistent-NAT lease migration (v9.9.13, round-28 Codex B3):**
+       distinct flows can share ONE persistent source key and
+       translated tuple (`source.rs:201`, `allocator.rs:1114, :1224`,
+       with the regression test at `tests_pool.rs:2536` confirming),
+       and per-flow `reserve_flow(F1,P)` records `persistent_key:
+       None`, so `reserve_flow(F2,P)` then fails because P is occupied
+       (`allocator.rs:1654, :1682, :1691`) — a per-flow migration of a
+       shared persistent lease can never work. The token and the
+       migration API therefore carry the persistent KEY, the permit,
+       the timeout, and the co-holder semantics: the migration
+       transfers the persistent LEASE OBJECT (key, timeout, co-holder
+       count) into the target allocator as a unit (the distinct
+       persistent address-only API at `allocator.rs:1894` confirms
+       lease scope/refcount semantics require separate machinery), and
+       each co-holder flow's entry references the migrated lease
+       (retaining increments the lease's holder count, not a new
+       reservation), so a shared persistent lease migrates atomically
+       with all its co-holders intact.
        The escrow's lifetime is UNTIL REPLAY CONSUMPTION BY WHICHEVER
        DATAPLANE COMES UP — new or restored-old (v9.9.8, round-23
        partial's "lose the final NAT holder" trace: reconcile
@@ -1048,7 +1066,26 @@ attacker-poisonable):**
        equality (`source.rs:726`), so a name-only rename creates
        allocator B while E1 remains held only in A — B may then assign
        E1's public tuple to another flow, and re-resolving E1 may swap
-       its pool port mid-connection. The rule: on a config change
+       its pool port mid-connection. AND the migration covers the
+       IN-PLACE REFRESH path, not just restore (v9.9.13, round-28
+       Codex B2: NAT configuration is ABSENT from the binding-plan
+       key (`server/helpers/planning.rs:85`), so a healthy rename
+       takes the in-place refresh path (`server/handlers/snapshot.rs:163,
+       :239`) and publishes new forwarding WITHOUT replay/restore
+       (`afxdp/coordinator/snapshot_refresh.rs:212, :319, :397`) —
+       because the allocator key includes `pool_name` and reuse is
+       exact-key only (`source.rs:327, :726`), B starts with an empty
+       bitmap and can issue E1's tuple to E2 (`allocator.rs:595,
+       :999`), and the repository identifies identical tuples from
+       independent allocators as reverse-NAT misdelivery
+       (`pkg/config/compiler_tailgates.go:212`). The rule: the refresh
+       path DETECTS allocator changes (allocator key or collision
+       domain) and either MIGRATES in place (reserve E1's exact tuple
+       into the refreshed allocator before the old allocator is
+       dropped) or forces the quiesced reconcile path (which has the
+       escrow); a collision-domain-compatible change migrates in
+       place; an incompatible change forces the reconcile). The rule
+       for the reconcile/restore path itself: on a config change
        whose pool collision domain is COMPATIBLE (same address space,
        regardless of name), the restore path MIGRATES E1's exact
        reservation — PAT, NAT64 (`nat64.rs:915`), and address-only
@@ -1221,20 +1258,33 @@ attacker-poisonable):**
        update and promotion, `session/mod.rs:761, :1384`, so it is NOT
        the admission generation; the write-once field is stamped once
        at entry creation and never rewritten) — and the stamped value
-       is the #3931 CONFIG-SYNC GENERATION (`configGenCounter`,
-       `pkg/cluster/sync_conn_config.go:222`), the authority-issued
-       epoch that IS cluster-ordered (v9.9.12, round-27 Codex B1: the
-       v9.9.11.2 citation of `store.go:88` was wrong — that is
-       `candidateGen`, a NODE-LOCAL transaction token changed by
-       candidate edits, configuration-mode transitions, rollbacks, and
-       resets (`store.go:72`, `store_gen.go:19`), and `SyncApply` bumps
-       it only when that node happens to be in configuration mode
-       (`store.go:691`), so it is not comparable across nodes: A
-       admits E2 under config C2 with local token 10; B's independent
-       candidate activity has advanced its token to 100; E2 reaches B
-       before B's C2 invalidation; comparing `10 < 100` falsely selects
-       and companion-deletes a flow already admitted under C2, and the
-       reverse skew can retain stale E1. The version is carried through
+       is the AUTHORITY-ISSUED CONFIG EPOCH (v9.9.13, round-28
+       Codex B1 — `configGenCounter` (`pkg/cluster/sync_conn_config.go:222`)
+       is NOT sufficient as-is: A publishes C2, performs invalidation,
+       and only then pushes it (`daemon_apply_commit.go:245, 270, 274`),
+       while `QueueConfig` first allocates `g+1` at send time
+       (`sync_conn_config.go:234`), so an E2 admitted under a
+       still-permitting modified policy after C2 activates can only
+       stamp old `g`; cutoff `g+1` falsely selects and identity-deletes
+       E2, while cutoff `g` retains C1/E1; unchanged reconnect
+       re-pushes allocate another generation
+       (`configsync_reconcile_5863_test.go:171`), and the receiver
+       skips rebuilding equal text (`daemon_ha_sync.go:549`) but
+       advances its high-water (`sync_conn_config.go:389`), causing
+       current-config installs to fail `epoch < barrier`
+       (`sync_conn_gen.go:424`); and repository tests explicitly
+       define this as a directional sender namespace, with a future
+       authority's counter remaining frozen
+       (`sync_config_epoch_active_active_6284_test.go:12, 90`). The
+       rule: the config authority RESERVES the epoch BEFORE LOCAL
+       APPLY (the new generation is allocated at apply time, not at
+       send time — the epoch and the config it names are committed
+       together, so invalidation never precedes publication), the
+       same epoch is REUSED on every resend (never re-allocated per
+       send), and on authority transition the new authority ADOPTS
+       `max(own, received)` as its counter floor (so the counter is
+       cluster-monotonic across failovers even though it is
+       authority-namespaced). The version is carried through
        config apply (the receiver callback at `daemon_ha_sync.go:910`
        currently passes only config text, not that generation — it
        must also capture and store the generation) and rides
@@ -1391,7 +1441,36 @@ attacker-poisonable):**
        incarnation-dependent delete is sent at all — the legacy peer
        cleans up its own E1 standby via its own aging, invalidation
        pass (both nodes run it, per v9.9.5), and TTL-sweep machinery
-       (master's pre-existing behavior, documented). The mixed-version
+       (master's pre-existing behavior, documented) — and plain
+       owner-validated Close deltas are SUPPRESSED toward the legacy
+       peer too (v9.9.10+: a Close is incarnation-dependent by
+       construction — the legacy receiver's key-based application
+       cannot distinguish E1 from a re-seeded E2 sharing the tuple
+       (legacy B replaces E1 with authoritative same-key E2; new A
+       sends E1's Close; B ignores the identity, accepts the
+       generation at `sync_conn_gen.go:263, :282`, and key-deletes E2
+       plus companions at `sync_conn_gen.go:493`), so suppressing it
+       is the only safe posture). **Mixed-version
+       bulk reconciliation is suppressed entirely (v9.9.13, round-28
+       Codex B4):** a reconnect unconditionally sends authoritative
+       bulk (`sync_conn.go:138, :194`), and its markers and installs
+       are direct writes outside the tagged queue
+       (`sync_bulk.go:81, :105, :183`) — the implicit delete channel:
+       new A suppresses E1's Close to legacy B, then reconnects with
+       E1 absent; B snapshots secondary ownership at `BulkStart`
+       (`sync_conn_read.go:183, :196`), flips primary and installs
+       same-key E2 — a supported mid-bulk transition
+       (`sync_test.go:1535, :1573`); `BulkEnd` invokes legacy
+       reconciliation (`sync_conn_read.go:240`), which uses frozen
+       ownership and selects the absent key (`sync.go:1080, :1114`);
+       the legacy store deletes current E2 and its NAT/reverse
+       companions (`session_store.go:626, :644, :399`). The plan's
+       receiver-side revalidation cannot retrofit legacy B, so the
+       rule: on an unnegotiated connection the sender sends bulk as
+       INSTALL-ONLY PRIMING (no reconciliation pass — the receiver's
+       stale entries are left to its own aging/invalidation/sweep
+       machinery); reconciliation (the delete-stale-entries step) runs
+       only on negotiated connections. The mixed-version
        POLICY-INVALIDATION window gets an explicit operational gate
        (v9.9.12, round-27 Codex H6: the legacy binary publishes the
        new policy BEFORE clearing old sessions
