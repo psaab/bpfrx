@@ -1380,7 +1380,15 @@ attacker-poisonable):**
        reset lane and use the time-barrier/legacy path); and
        the hello binds the stable node ID AND the current
        process incarnation, revalidated before any barrier
-       mutation — a stale-incarnation frame is discarded);
+       mutation — a stale-incarnation frame is discarded; and
+       the freshness is lifecycle-bound (v9.9.40, round-47 SMR
+       F2: a peer restart mid-lane kills the lane with the
+       connection — TCP reset or the silence teardown — and the
+       new lane re-handshakes with the new incarnation; a
+       delayed old-incarnation `RESET_ACK` arriving on a NEW
+       lane is discarded because the frame's incarnation must
+       equal the LANE's bound incarnation, not any
+       recently-seen one));
        and the
        connection installs only after BOTH reset triples have
        drained and ACK'd), and an
@@ -1581,9 +1589,19 @@ attacker-poisonable):**
        partial family; and reverse writes bypass helper
        validation today (`manager_ha.go:1125`): the family
        transaction holds a shared FAMILY-TRANSACTION PERMIT
-       from its first write to its last, `replace(T1, T2)`
+       from its first write to its last — HELPER-ISSUED
+       (v9.9.40, round-47 SMR F1: Go acquires it with the
+       family's first write, identified by the canonical key;
+       the helper tracks outstanding permits in the same
+       transaction context as `replace(slot, T1, T2,
+       token_epoch)` — the map writes are helper-owned state, so
+       a Go-only permit would leave the reverse/DNAT writes
+       outside the drain's reach) — `replace(T1, T2)`
        DRAINS or CAS-invalidates outstanding family permits
-       before retargeting, and the rollback is token-conditional
+       before retargeting (the drain never waits indefinitely:
+       a family transaction carries its own deadline — µs-ms
+       for three sequential map writes — after which `replace`
+       CAS-invalidates it, preserving availability), and the rollback is token-conditional
        CAS per preimage — a preimage is restored only if the
        row's current token still matches T1, never a blind
        restore-over).
@@ -4162,6 +4180,7 @@ documented mixed-version behavior).
 | Performance regression | LOW-MED | ~104 B/entry slab growth (~13.6 MiB/worker at cap); one TCP-header view compute (seq/ack/wnd/flags/seg_len) + ≤2 gated stores per committed TCP data packet (closing segments skip updates entirely); one extra probe per closing segment. Must be measured at minimum-frame rates (§9) — the 23 Gbit/s MTU-sized iperf run alone is insufficient (≈37 Mpps at 25 Gbit/s small-frame is the real gate; `iperf3 -l 64` is a proxy, not a demonstrated line-rate generator — gate on pps, not bandwidth). |
 | Architectural mismatch | LOW | No new subsystem; anchors at the existing #2501/#3706 chokepoints; #4400-style always-on gate. No pipeline restructure. |
 | HA / rolling upgrade | LOW-MED | Part A: no wire change; Part B adds rolling-gated additive identity tails on INSTALL/Open AND DELETE PLUS the negotiated repair protocol (v9.9.37: capability-negotiated `repair-vN`/`reset-vN` — RESET_GEN/RESET_ACK on a barrier-exempt lane, RESYNC_REQUEST, repair_cutoff_epoch/repair_id on BulkStart, JOURNAL_END/JOURNAL_ACK as the only discharge, the post-cut journal, the completed-repair receipt, slot-membership tokens, and capacity negotiation; intermediate peers get the legacy paths via the version bits, never a wait-forever; old decoders ignore additive frames via the trailing-field tolerance; mixed-version behavior documented: gen-based deletes apply only to non-locally-authoritative entries, and identity-dependent deletes are suppressed toward unnegotiated peers); pre-upgrade and imported entries sit in the absorbing zero-trust state — closes refuse until churn (strictly more conservative than master; bounded lingering, §2; Phase 2 §10.5 closes it for synced flows). The replica no-Close invariant + the SharedPromote refuse trace are regression-tested. Accepted residual (v9.9.16): a temporary stop whose rebind never comes pins preserved sessions + escrowed NAT ports until process exit — no workers, no reaper; escape is the declared-permanent stop; strictly more conservative than today's lose-everything link-cycle behavior; and a teardown-failed latch (v9.9.37) prohibits rebind/reconcile after a deadline-expired teardown until every unquiesced old worker exits or the process restarts (operator-visible). |
+| Teardown-failed latch | LOW (probability) | v9.9.40: a deadline-expired teardown arms the durable latch — rebind/reconcile prohibited until every unquiesced old worker exits or the process restarts. Terminal state: XSK disabled, dataplane down, readiness degraded, operator-visible (#6244 stage reporting); recovery action documented (worker exit or `systemctl restart xpfd`); next reconcile retries with a fresh generation once the latch clears. |
 | Merge collision | LOW | No `FlowCacheEntry` change (v1's #6457 tension gone). `account_packet` signature change is local to two call sites; `SessionInstall`/`SessionUpdate` gains are crate-internal. |
 
 ---
