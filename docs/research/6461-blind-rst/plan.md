@@ -1165,24 +1165,48 @@ attacker-poisonable):**
        ALL-FABRIC RESET: overflow marks the window lossy and
        closes BOTH connections to the peer ATOMICALLY, suppressing
        reconnection until the sender has observed a true
-       both-empty epoch (a receiver-side action needing NO wire
-       change — but not a naive double-close: one fabric
-       reconnecting before the other's EOF is processed leaves
-       `wasDisconnected == false`, `sync_conn.go:248`, and no
-       cold-prime follows; the close must quiesce the
-       reconnect/accept path until both sides register both slots
-       empty) → cold-prime → the sender drives a FULL bulk A→B
-       with the config-first ordering of (3); the
+       both-empty epoch — and the observation is made reliable by
+       a SENDER-SIDE FIRST-EOF CASCADE (v9.9.22, round-37 Codex B1:
+       EOF handling clears one slot at a time
+       (`sync_conn_read.go:14`, `sync_conn.go:480`) while fabrics
+       reconnect independently (`sync_conn.go:388, :435`), and B
+       has no observation that A processed both EOFs — fab0
+       reconnecting before fab1's EOF leaves `wasDisconnected ==
+       false` and no cold-prime, while holding B's barrier
+       indefinitely is an availability outage): with an obligation
+       outstanding for the peer, the SENDER's first EOF on either
+       fabric cascades — it atomically clears BOTH slots (treats
+       the peer as fully disconnected, declining further traffic on
+       the survivor), so the NEXT connection install computes
+       `wasDisconnected == true` deterministically and cold-primes;
+       B's barrier is then bounded (it holds only until the first
+       EOF lands — the cascade guarantees the both-empty state
+       from there). (The equivalent alternative — an acknowledged
+       reset generation, where B's reset carries a generation the
+       sender acks after clearing both slots — is the documented
+       fallback for transports where the cascade is unsafe.)
+       Cold-prime then drives the sender's FULL bulk A→B with the
+       config-first ordering of (3); the
        once-per-latched-epoch latch keeps this from hot-looping.
        (b) OPTIONAL fast path for negotiated pairs — an additive
-       authenticated RESYNC_REQUEST(generation N) message
+       authenticated RESYNC_REQUEST(repair-ID) message
        (rolling-gated like the identity tails): the RECEIVER
-       requests with a monotone generation; a new SENDER arms an
-       outbound-repair obligation for N and repeatedly drives its
-       outbound FULL bulk A→B over the surviving connection
-       (clearing its own sticky gates per the obligation);
-       generation N discharges ONLY on the exact replacement bulk
-       associated with N (see (c)); a legacy sender ignores the
+       requests with an incarnation-scoped repair ID (monotone per
+       (sender, peer-incarnation)); a new SENDER arms an
+       outbound-repair obligation for that ID and repeatedly
+       drives its outbound FULL bulk A→B over the surviving
+       connection (clearing its own sticky gates per the
+       obligation), ECHOING the repair ID in `BulkStart`,
+       `BulkEnd`, and the receiver's ACK (v9.9.22, round-37 Codex
+       B1: `BulkStart` today carries only the sender-local bulk
+       epoch (`sync_bulk.go:53, :65`), so a PRE-REQUEST snapshot
+       delayed on the survivor can arrive after the request and
+       masquerade as the repair while omitting later state — the
+       repair ID is the correlation: a bulk that does not carry
+       the current repair ID is not the repair; pre-request bulks
+       in flight are serialized behind or superseded by the
+       repair bulk); the obligation discharges ONLY on the ACK
+       echoing the exact repair ID; a legacy sender ignores the
        request, and the receiver falls back to (a) after a
        bounded wait; unnegotiated peers always use (a). (c)
        OBLIGATION BOOKKEEPING, direction-split and
@@ -1369,8 +1393,14 @@ attacker-poisonable):**
        `upsert_synced.rs:80`-style per-entry reserve applies only
        here) and `GroupHold(Arc<GroupHold>)` for IMPORTED flows
        (clone distribution; reap/panic-Drop drops only the clone;
-       the allocator releases exactly when the last clone drops,
-       through a finalizer that follows the declared
+       the allocator releases exactly when the last clone drops —
+       and that finalizer NEVER runs inline (v9.9.22, round-37
+       Codex H6: an inline finalizer can fire in contexts holding
+       `A.live` or the migration gate's WRITE permit and deadlock
+       on the gate READ): the last-clone Drop ENQUEUES the release
+       to a lock-free deferred-release queue drained by a context
+       holding no other locks, which performs the
+       `slot.with_current()` release following the declared
        canonical→allocator lock order and NEVER reacquires
        canonical locks from inside allocator cleanup). The
        lifecycle sites per variant: FAN-OUT — DirectHold: each
@@ -1386,9 +1416,39 @@ attacker-poisonable):**
        materialize clones the PUBLISHED entry's group-hold (never
        a direct allocator mutation). REPLACEMENT — DirectHold:
        retain-before-replace transfers the direct hold atomically
-       (`install.rs:322`); GroupHold: the replacement takes the
-       displaced entry's clone (clone-then-drop in one step — the
-       count never dips). ESCROW — the keeper holds the variant's
+       (`install.rs:322`); GroupHold: the replacement is
+       IDENTITY-CONDITIONAL (v9.9.22, round-37 Codex B3 — the
+       worker sink replaces any prior same-key entry
+       (`install.rs:310, :322`), so for E1/P1/G1 → E2/P2/G2 a
+       literal "take the displaced entry's clone" leaves worker
+       E2 holding G1 while the coordinator's deletion removes
+       E2's canonical/reverse G2 clones before queuing worker
+       deletes (`session_import.rs:290, :313`) — P2 reclaimed
+       under a forwarding E2): IDENTICAL ownership (same
+       incarnation AND allocation) reuses the displaced clone
+       (clone-then-drop in one step — the count never dips);
+       DIFFERENT incarnation/allocation installs the INCOMING
+       entry's G2 clone FIRST and only then drops G1
+       (retain-before-replace at the group level — the incoming
+       hold is distributed with the incoming entry and the
+       displaced hold drops after the replacement publishes).
+       PROMOTION/DEMOTION (v9.9.22, round-37 Codex H4): hold
+       provenance is IMMUTABLE and carried INDEPENDENTLY of
+       `SessionOrigin` — origin mutates in place (imported →
+       `SharedPromote` at `promote.rs:99, :116`, locally-born →
+       `SyncImport` at `install.rs:542`, and `SharedPromote` is
+       not peer-synced per the origin predicate, `entry.rs:245`)
+       and projections reduce entries to key/decision/metadata
+       (`shared_ops.rs:638`), so the variant can NEVER be derived
+       from origin: the token's own enum tag is the provenance,
+       carried through promotion, demotion, commands,
+       `SyncedSessionEntry`, `ForwardSessionMatch`, synthesis, and
+       materialization; a promoted imported flow KEEPS its
+       GroupHold (the origin flip touches no allocator state —
+       no retain is needed at promote and no variant transition
+       ever occurs; the DirectHold path applies only to flows
+       ADMITTED locally via `allocate_translation`, never to
+       promoted imports). ESCROW — the keeper holds the variant's
        token (a DirectHold keeper or a GroupHold clone); the
        handoff/retokenization moves the variant unchanged. REAP —
        each variant drops only its own representation; and
@@ -1552,7 +1612,23 @@ attacker-poisonable):**
        incarnation check completes takes the family off the cleanup
        list), so a mixed-outcome fanout or a live materialized holder
        can never delete beneath a successfully installed or
-       materialized family member). Pending
+       materialized family member). Under the GROUP-HOLD the
+       no-holder predicate is TWO-STAGE (v9.9.22, round-37 Codex H5 —
+       the canonical forward and reverse entries themselves own
+       clones, and imports pre-publish both before the asynchronous
+       fan-out (`session_import.rs:115, :187`), so an all-rejected
+       cohort can NEVER satisfy "no holder anywhere in the family"
+       — the canonical family's own clones always exist):
+       stage 1 checks EXTERNAL/live holders only (worker replicas,
+       materialized entries — the fan-out outcomes); stage 2, with
+       no external holder, atomically removes the quarantined
+       canonical family (the pre-published BPF row and the shared
+       forward+reverse entries, under the alias-token fencing) and
+       THEN drops its internal clones — the reservation releases
+       only if no external clone ever existed, which is exactly
+       the all-rejected case; the two stages run under the same
+       incarnation recheck so a concurrent materialize between
+       them re-quarantines. Pending
        commands are claimed-before-executed: a worker CLAIMS a pending
        command before running it, and the barrier converts only
        UNCLAIMED commands to rejections at the deadline; a CLAIMED
@@ -1730,7 +1806,29 @@ attacker-poisonable):**
        allocator-WRITE (the stated lock order — no reverse order
        exists because ownership operations never take slot-WRITE),
        so a release is always observed on exactly one side of the
-       cut. Two ordering invariants make the continuity exact
+       cut. The WRITE-permit span is TOKEN-DROP-FREE (v9.9.22,
+       round-37 Codex H6 + round-37 AGY Q2 — the last-clone
+       finalizer's inline `with_current()` would deadlock twice
+       over: a worker holding `A.live` during reap whose Drop
+       blocks on the gate READ inverts against the migration
+       thread holding gate-WRITE and waiting for `A.live`; and a
+       drop fired on the migration thread itself — e.g. the
+       tunnel-remap purge synchronously removing shared entries
+       mid-refresh (`snapshot_refresh.rs:316`, `tunnel_purge.rs:77`)
+       — self-deadlocks on the same RW lock): (i) every
+       potentially-final token drop ENQUEUES the release
+       obligation to a lock-free deferred-release queue instead of
+       releasing inline — a `Drop` never acquires any lock, from
+       any context (worker reap, panic unwind, migration cleanup);
+       the queue is drained by a context holding NO other locks,
+       which performs the actual `slot.with_current()` release
+       (bounded retry on retarget — the reservation simply lives
+       until the drain, never less); and (ii) the migration's
+       WRITE span performs NO token drops — the tunnel-remap purge
+       runs BEFORE the WRITE permit is acquired (or its removals
+       defer to after retarget+publish+WRITE-release), so the
+       finalizer can never fire inside the span at all.
+       Two ordering invariants make the continuity exact
        (v9.9.20, round-35 SMR F2): (a) the migration's snapshot
        runs AFTER the gate-WRITE drain, so any release that
        observed `slot == A` under A's READ permit completes into A
@@ -2746,10 +2844,20 @@ source.
   `sync_protocol.go:95-102, :470-497` trailing-field tolerance), and
   no config schema change. The NODE-LOCAL shared-map
   schema gains additive fields (`last_touch_ns`, `expires_after_ns`,
-  `flow_incarnation_id`, `stable_rule_id_hash`,
+  `origin_process_nonce`, `flow_incarnation_id`,
+  `stable_rule_id_hash`,
   `admission_config_version`, `persistent_nat`,
   `persistent_nat_permit` — v9.9.15, round-30 Codex M5 + v9.9.17,
-  round-32 Codex B1: the selector fields AND the lease-derivation
+  round-32 Codex B1 + v9.9.22, round-37 Codex B2: the fence is the
+  FULL `(origin_process_nonce, flow_incarnation_id)` pair, and the
+  helper-local inventory listed only the incarnation —
+  `SyncedSessionEntry` carries neither today (`worker/mod.rs:375`),
+  so a queued cleanup for A1/E1 `(n1,id7)` could match same-key
+  A2/E2 `(n2,id7)` after a sender restart and delete the
+  replacement inside Rust before the Go sidecar can protect it;
+  the FULL pair is carried and compared through canonical entries,
+  aliases, worker entries, detached snapshots, and queued
+  mutations; the selector fields AND the lease-derivation
   inputs must live on the shared entries too, since the
   helper-side current-state selection of §5.2 reads its own shared
   aliases and neither can be reconstructed from the BPF
@@ -3090,7 +3198,27 @@ admitted interval):
   token asserts `DirectHold` (locally-born: direct refcount,
   reap decrements) vs `GroupHold` (imported: clone distribution,
   reap drops only the clone, last-clone finalizer releases in
-  canonical→allocator order) with no shared drop path; (e) the typed undo receipt — `NoChange` replay rolls
+  canonical→allocator order) with no shared drop path; (d3)
+  v9.9.22 mechanisms: the first-EOF cascade (with an obligation
+  outstanding, the sender's first EOF on either fabric clears
+  BOTH slots — the next install always cold-primes; no
+  `wasDisconnected == false` window); the repair-ID correlation
+  (a bulk without the current repair ID is not the repair; a
+  pre-request delayed bulk is serialized/superseded; discharge
+  only on the ACK echoing the exact repair ID); the full
+  identity pair in the helper inventory (a queued cleanup for
+  `(n1,id7)` never matches `(n2,id7)` after sender restart);
+  identity-conditional replacement (E1/P1/G1 → E2/P2/G2 installs
+  G2's clone BEFORE dropping G1; identical ownership reuses the
+  displaced clone with no count dip); immutable hold provenance
+  (a promoted imported flow keeps its GroupHold across
+  `SharedPromote` and demotion retags — variant never derives
+  from origin); the two-stage cohort cleanup (an all-rejected
+  import cohort is deleted — external-holders check, then
+  canonical-family removal, then internal-clone drop); and the
+  token-drop-free WRITE span (a last-clone drop during a
+  migration defers to the release queue — no inline gate READ;
+  the tunnel-remap purge runs before the WRITE permit). (e) the typed undo receipt — `NoChange` replay rolls
   back nothing (pre-existing ownership untouched), `Inserted`/
   `Retained` undo exactly their mutation, and `Replaced(old_state)`
   with a FAILED new claim reinstates the displaced record's tuple +
@@ -3548,10 +3676,15 @@ It is therefore split to its own research track:
    every expired forward unconditionally calls release
    (`loop_body/mod.rs:1481`) and the allocation has no replica
    refcount (`nat/allocator.rs:1318, :1664`), so an idle sibling
-   replica's reap can free a live flow's port ON MASTER TODAY. Is the
-   trace right (does anything actually gate the release on origin or
-   holder?), and is filing it separately (with the last-holder
-   refcount as the fix) the correct disposition for this plan?
+   replica's reap can free a live flow's port ON MASTER TODAY.
+   DISPOSITION DECIDED (v9.9.22, round-37 Codex L7 — this question
+   was stale): the trace was verified in round 12 and the fix —
+   the holder-lifetime machinery, now the typed
+   `DirectHold`/`GroupHold` token with the group-hold clone
+   distribution for imported flows — SHIPS AS PART B of this plan
+   (§5.2's escrow/token paragraphs); #6522 tracks the master bug
+   for the commit reference and is CLOSED by this work, not filed
+   separately.
 3. **Family clock + sweep (Part B):** the clock lives on the family's
    canonical-KEY record (forward when present, reverse for lone
    reverse imports); `expires_after_ns` is copied at publish; the
