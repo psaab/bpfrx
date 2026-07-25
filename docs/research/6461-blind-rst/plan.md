@@ -1049,22 +1049,78 @@ attacker-poisonable):**
        crash before any reconnect/bulk (crash takeover is expressly
        ungated, `manager.go:321`), leaving E1 to re-seed at Q: a
        prohibited mid-flow port swap. The fix is RECEIVER-SIDE
-       EXACT-EPOCH DEFERRAL: a session INSTALL stamped with a config
-       epoch greater than the receiver's applied/applying high-water
-       is NOT processed immediately — the receiver PARKS that
-       connection's remaining stream (head-of-line) until a config
-       with epoch ≥ the stamp is locally applied, then drains.
-       Head-of-line parking is the ordering proof, not just the
-       simple mechanism: install and delete deltas ride the SAME
-       FIFO connection, so consuming strictly in stream order means
-       a delete can never bypass a deferred install for the same key
-       (the naive per-key deferral zombie — install deferred, delete
-       applied as no-op, install then lands — is impossible by
-       construction). The park is bounded by a buffer; on overflow
-       the connection resets and re-bulks through the existing
-       reconnect machinery; a stuck config apply (#6387) is already
-       operator-visible via `configSyncFailing`, and a parked
-       standby stream is strictly safer than a mis-reserving one.
+       EXACT-EPOCH DEFERRAL, with the protocol pinned as follows
+       (v9.9.18, round-33 Codex B1 + round-33 AGY reset-loop +
+       round-33 SMR heartbeat — the v9.9.17 whole-stream park had
+       three code-verified defects: it admitted when
+       `applying == stamp` although C2's allocator is not published
+       until the apply callback succeeds (`sync_conn_config.go:289,
+       :343, :389`); it could put the enabling Config frame behind
+       the parked g2 INSTALL — `OnPeerConnected`'s config push is
+       asynchronous while BulkStart/INSTALLs are direct writes
+       (`sync_conn.go:130, :142, :194`, `sync_bulk.go:81, :95`) —
+       self-deadlocking the drain; and BulkStart RESET the
+       watermarks (`sync_conn_read.go:183`, `sync_conn_gen.go:324`),
+       while the watermark itself was directional — the config
+       authority never applies peer-pushed config, so its receive
+       high-water stays zero
+       (`sync_config_epoch_active_active_6284_test.go:12, :71`) and
+       a non-authority's locally-born g2 flow would park forever at
+       the authority in active/active):
+       (1) THE WATERMARK is a NODE-GLOBAL fully-published
+       forwarding-config epoch — `max(own_committed_epoch as
+       authority, lastAppliedConfigGen from the peer)` — advanced by
+       BOTH local-authority commits and successful peer applies,
+       cluster-monotonic, and NEVER cleared by BulkStart (the
+       per-bulk reset at `sync_conn_read.go:183` /
+       `sync_conn_gen.go:324` is removed for these watermarks).
+       (2) THE READINESS PREDICATE at the Go receive layer (the same
+       pre-helper gate where `configEpochStale` is authoritative,
+       `sync_conn_gen.go:404-412`): `epoch < stale-barrier` →
+       refuse (existing #5274 semantics, unchanged); process IFF
+       `stamp <= published_epoch AND applyingConfigGen == 0`;
+       otherwise PARK — `applying == stamp` stays PARKED, because
+       lastApplied advances only after the apply callback (and its
+       dataplane publication) succeeds.
+       (3) THE PARK IS MESSAGE-CLASS-SELECTIVE (round-33 SMR:
+       heartbeats ride the SAME connection —
+       `syncMsgHeartbeat`/`syncMsgHeartbeatAck` are handled in the
+       same `handleMessage` dispatcher as installs,
+       `sync_conn_read.go:284, :296`, and a whole-stream park would
+       stall heartbeat-acks and trip missed-heartbeat failover
+       during a routine apply lag — a self-inflicted availability
+       hazard): SESSION-STATE messages (session installs, deletes,
+       bulk Start/End/markers — everything that mutates or
+       reconciles session state) buffer behind the park in arrival
+       order (the FIFO ordering proof is preserved: buffered deltas
+       keep stream order, so a delete can never bypass a deferred
+       install for the same key — the naive per-key deferral zombie
+       is impossible by construction); CONTROL messages
+       (heartbeat/ack, and the Config frame — whose receipt only
+       queues the async apply, `sync_conn_read.go:298`) keep
+       flowing, so the enabling Config always reaches the apply
+       queue regardless of the park (the reconnect self-deadlock is
+       closed by construction, with the sender-side ordering —
+       config push serialized BEFORE BulkStart for the same epoch —
+       kept as belt-and-suspenders). Bulk markers park with the
+       deltas (`reconcileStaleSessions` at BulkEnd must not run
+       against a partially-buffered bulk).
+       (4) NO RESET LOOP (round-33 AGY: with a stuck apply — #6387 —
+       the naive overflow→reset→re-bulk cycle repeats forever):
+       while parked, buffer overflow does NOT reset the connection —
+       it drops the OLDEST buffered deltas and sets
+       `syncBackfillNeeded` (the existing window-replay mechanism,
+       `sync_conn_sweep.go:185`), so once the barrier passes the
+       drained park plus the backfill replay restore the window;
+       the connection (heartbeats, config) stays up throughout.
+       (5) THE TAKEOVER FENCE: a node whose config apply is stuck
+       (the #6387 `configSyncFailing` condition — diagnostic-only
+       today, `manager.go:321`, `readiness.go:20`) is NOT
+       transfer-ready for takeover until its published forwarding
+       epoch reaches the peer's advertised high-water (taking over
+       with stale NAT policy re-creates exactly the misdelivery
+       class this mechanism exists to prevent); the readiness gate
+       gains that condition.
        At processing time the receiver's local rule config IS the
        sender's admitting config, so the shape checks and the
        wire-carried lease inputs agree — the two mechanisms are
@@ -1076,21 +1132,50 @@ attacker-poisonable):**
        watermark; NACK/backfill adds a protocol ack for a problem
        the receiver can solve locally.)
        **Import-transaction rollback edge (v9.9.17, round-32 Codex
-       M3):** inverting today's order (upsert succeeds first, NAT
+       M3; transaction shape pinned v9.9.18, round-33 Codex B2):**
+       inverting today's order (upsert succeeds first, NAT
        reserved after, `upsert_synced.rs:64`) into
        create-or-retain-BEFORE-publication opens an orphan edge: a
        replay can reserve P and then lose a later check (the
        locally-authoritative-entry check, `install.rs:310`), leaving
        an orphan lease at `active_flows=1` that expiry GC will not
-       reclaim (`allocator.rs:2302`). The import transaction is
-       therefore: preflight every check that does not require the
-       reservation → create-or-retain → publish — and ANY
-       post-retain failure (including the publish path and panic
-       unwind) rolls the reservation back through `rollback_flow`
-       (`allocator.rs:1392`, verified to remove `live_by_flow`,
-       `address_only_owners`, persistent lease membership, and the
-       port bit), with an RAII guard so the exceptional path
-       cannot leak the retain.
+       reclaim (`allocator.rs:2302`). But the naive fix — bare
+       `rollback_flow(flow, tuple)` on failure — is NOT the inverse
+       of the reservation (round-33 Codex B2, both traces
+       code-verified): (a) `reserve_flow`'s replacement path removes
+       the displaced record and frees its port BEFORE attempting the
+       new claim (`allocator.rs:1671`), so a failed replacement
+       (replacement E2's Q is owned elsewhere, `:1682`) leaves the
+       displaced E1's PUBLISHED decision pointing at unreserved P —
+       another flow claims P through the normal path, the
+       prohibited reverse-NAT alias; and (b) an idempotent replay's
+       exact same-flow reservation is a NO-OP (`allocator.rs:1636,
+       :1944`), while `rollback_flow` unconditionally removes the
+       current record and decrements/frees (`:1398, :1405, :1419`),
+       so a post-retain failure would destroy ownership that existed
+       BEFORE this import. The import reservation is therefore
+       NON-DESTRUCTIVE-ON-FAILURE and returns a TYPED UNDO RECEIPT:
+       in one allocator critical section, evaluate the request
+       against current state and return `NoChange` (idempotent
+       replay — the exact record already exists; nothing was
+       mutated, nothing to undo), `Inserted` (a new per-flow record
+       / new lease was created), `Retained` (an existing lease's
+       co-holder count was incremented), or `Replaced(old_state)`
+       (the displaced record's complete prior ownership state —
+       translated tuple, persistent-key membership, address-only
+       token — captured; the new claim attempted only after the old
+       state is preserved, and on claim failure the old state is
+       reinstated IN THE SAME CRITICAL SECTION so a failed
+       replacement never leaves the incumbent unreserved). The
+       import transaction is then: preflight every check that does
+       not require the reservation → reserve-with-receipt → publish
+       — and ANY post-reservation failure (including the publish
+       path and panic unwind) invokes the RAII guard, which undoes
+       EXACTLY the receipt's mutation (`NoChange` → nothing;
+       `Inserted` → remove the record/lease; `Retained` → decrement
+       the lease refcount; `Replaced(old_state)` → remove the new
+       record and reinstate `old_state`) — never a blind
+       `rollback_flow` of whatever the flow currently maps to.
        **Capability gate (v9.9.17, round-32 Codex):** clustered
        persistent source NAT is COMMIT-TIME REJECTED today
        (`capabilities.go:87`, `persistentSourceNATHAUnsupportedReason`
@@ -1289,7 +1374,12 @@ attacker-poisonable):**
        covered by the alias-token fencing (external deletes re-check
        the alias at delete time). The token itself is an owned, LINEAR `NatHoldToken`
        (v9.9.12, round-27 Codex H5): it owns the exact allocator HANDLE
-       (`Arc<PortAllocator>`, `allocator.rs:742` — `SourceNatRule` has
+       through the STABLE ALLOCATION-SLOT INDIRECTION (v9.9.18,
+       round-33 Codex B3 — the token references an `Arc` slot per
+       pool-rule allocator whose inner `Arc<PortAllocator>` the
+       migration gate retargets A→B atomically at the cut, so a
+       pre-cut token's later release always lands in the CURRENT
+       allocator; `SourceNatRule` has
        no stable allocator identifier, `source.rs:251`, and allocators
        are shared/reused by pool configuration, `source.rs:327, :726`),
        AND it carries the allocation's COLLISION DOMAIN (the pool's
@@ -1356,12 +1446,48 @@ attacker-poisonable):**
        `address_only_owners`, recycle queues, deterministic state)
        into B under A's `live` lock, atomically publishes B (the
        existing Arc swap at `snapshot_refresh.rs:397`), then opens
-       B's gate; A's gate stays CLOSED (retired) — a stale A-holder
-       fails transiently at the closed gate and re-resolves through
-       the current published allocator. There is NO dual-record and
-       NO cross-allocator mutex: B is never worker-visible until
-       fully populated, and the Arc swap is the single handoff, so B
-       can neither issue a held tuple nor leak a freed one. New
+       B's gate; A's gate stays CLOSED (retired). HOLDER LIFETIME
+       crosses the cut by INDIRECTION, not by copying (v9.9.18,
+       round-33 Codex B3 — the v9.9.17 text copied A's ownership
+       into B and closed A while every `NatHoldToken` still owned
+       the exact `Arc<PortAllocator>` A: a surviving pre-cut
+       token's later release lands in the closed A, so B's copied
+       refcount becomes a permanent ghost (eventual pool
+       exhaustion) — or, if the unretargetable count is omitted
+       from the copy, B frees and reissues P while E1's session
+       still forwards with P; and an RAII `Drop` has neither the
+       current allocator nor a retry channel, so "fails
+       transiently and re-resolves" is not a lifecycle. The fix is
+       option (ii) of the three explicit lifecycles): the token
+       (and every holder — worker side maps, queued commands, the
+       escrow) references a STABLE ALLOCATION-SLOT INDIRECTION (an
+       `Arc` slot per pool-rule allocator, shared by the
+       forwarding state's rule and every token) whose inner
+       allocator handle the migration atomically RETARGETS from A
+       to B at the cut — one atomic swap per slot under the write
+       permit — so every pre-cut token's later release lands in B,
+       which owns the migrated ownership state; no per-holder walk
+       is needed at cutover, retired A owns nothing and is simply
+       dropped when its last raw `Arc` dies, and the
+       temporary-stop escrow's tokens cross rebinds the same way.
+       (Rejected: option (i), quiesce-and-retokenize every
+       worker/queue/escrow holder before publishing B — an
+       O(holders) walk under the write permit with per-worker
+       coordination the in-place-refresh path does not have —
+       retained as the fallback for any holder class that cannot
+       hold the indirection; option (iii), a retired-A→B
+       release-forwarding record — keeps retired A alive for the
+       longest token lifetime, an unbounded pin.) A stale raw
+       `Arc<PortAllocator>` A-handle used for a NEW allocation
+       (a worker that has not yet refreshed its forwarding Arc)
+       still fails transiently at A's closed gate and re-resolves
+       through the current published allocator — the transient-fail
+       path is for new-mutation ATTEMPTS, which have a caller who
+       can retry, never for RAII releases. There is NO dual-record
+       and NO cross-allocator mutex: B is never worker-visible
+       until fully populated, and the Arc swap is the single
+       handoff, so B can neither issue a held tuple nor leak a
+       freed one. New
        mutations arriving during the window block briefly on the
        gate or fail transiently (the packet path re-resolves on the
        next packet — the window is µs-ms and config changes are
@@ -2644,6 +2770,33 @@ admitted interval):
   empty-standby bulk re-emits the ENTRY's stamped lease inputs (not
   a queue-time re-derivation), so the restart-bulk co-holder case
   imports persistently.
+- **Epoch-park protocol + import receipt + token indirection
+  (v9.9.18, round-33):** (a) readiness predicate — a g2 INSTALL
+  arriving while `applyingConfigGen == g2` (apply callback not yet
+  succeeded) stays PARKED and processes only after
+  `lastAppliedConfigGen >= g2 AND applyingConfigGen == 0`; (b)
+  selective park — heartbeats and the enabling Config frame flow
+  while session-state messages buffer: no missed-heartbeat failover
+  during an apply lag, and the Config frame is never behind a parked
+  INSTALL (the reconnect self-deadlock case: BulkStart/INSTALLs
+  racing the async config push); (c) node-global watermark — in
+  active/active, a non-authority's locally-born g2 flow does NOT
+  park at the authority (both published C2), and BulkStart does not
+  clear the watermarks; (d) no reset loop — a stuck apply (#6387)
+  parks with overflow→drop-oldest + `syncBackfillNeeded`, the
+  connection stays up, and the takeover fence keeps the node
+  not-transfer-ready until its published epoch reaches the peer's
+  high-water; (e) the typed undo receipt — `NoChange` replay rolls
+  back nothing (pre-existing ownership untouched), `Inserted`/
+  `Retained` undo exactly their mutation, and `Replaced(old_state)`
+  with a FAILED new claim reinstates the displaced record's tuple +
+  lease + token in the same critical section (E1's published
+  decision never points at unreserved P); (f) token indirection —
+  a pre-cut token released AFTER the migration cut lands in B
+  (B's refcount decrements; retired A owns nothing), and a stale
+  raw A-handle's NEW allocation transient-fails and re-resolves;
+  (g) ordering — config push serialized before BulkStart for the
+  same epoch.
 - **Escrow + conditional-delete fences (v9.9.3, round-19 Codex M4):**
   (a) two-phase stop: quiesce acknowledged (no new commits) BEFORE
   handoff; handoff completes BEFORE any side-map drop (no hold
