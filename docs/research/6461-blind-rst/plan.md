@@ -1234,7 +1234,18 @@ attacker-poisonable):**
        the cold-prime that matters is the SENDER's bulk drive on
        A's `installConn` decision, and A's post-barrier install
        always computes both-empty because the barrier outlasts
-       A's slot drain.
+       A's slot drain. The refusal's END is pinned (v9.9.26,
+       round-40 SMR F1): it releases when the barrier timer
+       expires (≥ the slow-detector bound + RTT margin) AND B
+       observes both of ITS OWN slots empty — and it is strictly
+       TIME-bound, never message-bound, so the dual-simultaneous
+       case (BOTH nodes raise obligations in the same window,
+       both close-both, both refuse) cannot deadlock: each
+       barrier expires independently, both nodes have drained by
+       then, and the first install on either side cold-primes
+       (a message-bound refusal would wait for the peer's repair
+       bulk that the peer is itself refusing — impossible by
+       construction here).
        B's inbound-repair obligation is DURABLE —
        a pathological miss (no bulk arrives) never clears it, and
        B escalates to a second close-both with exponential backoff
@@ -1298,7 +1309,13 @@ attacker-poisonable):**
        active, `sync_conn_write.go:268`, so an enqueue pause alone
        lets a pre-cutoff frame land post-`BulkEnd` from the retry
        path — the cutoff is taken with the sendLoop's retry loop
-       JOINED), FLUSHES the pre-cutoff
+       JOINED — and frames re-queued DURING the join (a fabric
+       flap mid-join pushes them back through the paused enqueue
+       gate) are tagged pre-cutoff and DISCARDED, because the
+       cutoff snapshot subsumes their state: the join's
+       completion is a real fixed point, so no frame that
+       entered the system before the cutoff can land after
+       `BulkEnd`), FLUSHES the pre-cutoff
        queue, takes the snapshot (the snapshot IS the cutoff —
        every pre-cutoff frame is either flushed before
        `BulkStart` or subsumed by the snapshot), drives the bulk,
@@ -1611,7 +1628,12 @@ attacker-poisonable):**
        like the escrow — the detached snapshots and commands that
        are freely cloned today (`runtime.rs:408`,
        `coordinator/mod.rs:753`) carry `AllocationRef`s, and the
-       executing worker rehydrates the hold from the registry);
+       executing worker rehydrates the hold from the registry —
+       claim-then-execute (v9.9.26, round-40 SMR F4: the worker
+       takes a STRONG registry reference at dequeue, so registry
+       retirement can never race a rehydrating command — the
+       retired entry's strong reference lives in the executing
+       worker's hand until the command completes);
        and a peer-state REPLACEMENT of a locally-born or demoted
        `DirectHold` entry (the in-place demotion at
        `install.rs:542` then a permitted peer replacement,
@@ -1622,6 +1644,14 @@ attacker-poisonable):**
        allocator critical section, a `GroupHold` is minted owning
        the SAME reservation and the direct count is decremented
        as the group registers (the entry's token variant swaps;
+       and the conversion can never race a local re-promotion
+       (v9.9.26, round-40 SMR F4: a demoted entry re-promoted
+       locally to `SharedPromote` before the peer replacement
+       lands is locally authoritative and IMMUNE to the
+       replacement — the candidate-class re-validation skips it
+       first, per the mixed-version matrix — so the conversion
+       only ever runs on an entry that is still peer-owned at
+       commit time);
        the receipt×variant transition matrix: `NoChange` on a
        DirectHold incumbent → convert-then-clone; `NoChange` on a
        GroupHold incumbent → clone; `Inserted` → new hold of the
@@ -1664,8 +1694,14 @@ attacker-poisonable):**
        retain) atomically CANCELS/CLAIMS that ticket in the same
        critical section as its reservation check (the reservation
        continues, the pending release revoked — or, if the
-       pending release already committed, the new claim creates a
-       genuinely NEW credit with a new generation); and the drain
+       pending release already committed, the new claim is a
+       FRESH allocation evaluated under the same critical
+       section: P free → a genuinely NEW credit with a new
+       generation; P claimed by a third flow in the interim →
+       the exact-reserve fails and the import rejects (v9.9.26,
+       round-40 SMR F3 — a re-resolution, not a continuation:
+       the committed pending release means the reservation was
+       legitimately dead, so nothing is ever "revived")); and the drain
        compares BOTH the allocation generation AND the ticket
        before removal — a claimed ticket or a moved generation is
        discarded as stale, so a queued release can never land on
