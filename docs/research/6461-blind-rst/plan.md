@@ -876,8 +876,48 @@ attacker-poisonable):**
        entry's hold references the FORWARD allocation and releases
        through the forward allocation's refcount (not the reverse
        early-return path at `source.rs:789`); and the refcount itself
-       is overflow-checked. The entry then carries
-       `nat_hold: bool`; its reap decrements the holder count
+       is overflow-checked. **Reconcile hold escrow (v9.7, round-16
+       Codex B1 — the drain-everything rule would otherwise destroy
+       exactly what compatible-config reconcile preserves):** the
+       reconcile sequence snapshots shared entries
+       (`coordinator/reconcile/teardown.rs:54`), stops and joins all
+       workers (`:80`, `worker_manager.rs:146`), and replays detached
+       `SyncedSessionEntry` clones at bring-up
+       (`coordinator/reconcile/bringup.rs:421`,
+       `coordinator/mod.rs:761`) — if the workers' exit drains every
+       hold to zero, the allocation is freed before the replay's
+       verify-and-retain, the replay is rejected (it has no packet to
+       re-resolve), and the live flow's NAT state is destroyed by a
+       routine reconcile. The rule: BEFORE joining the workers, the
+       teardown transfers ONE exact hold per allocation into
+       `PreservedReconcileState` (an escrow vec of tokens — the
+       refcount never reaches zero across the reconcile window);
+       bring-up transfers each escrowed token into the replayed worker
+       entries as they are installed; the escrow releases only after
+       successful replay or conclusive abandonment (in which case the
+       normal sweep/reap machinery takes over). The replay's
+       verify-and-retain then succeeds because the allocation never
+       died, and the BPF-before-consume ordering at
+       `coordinator/mod.rs:771` is covered by the alias-token fencing
+       (external deletes re-check the alias at delete time). The entry then carries
+       `nat_hold: bool` — shorthand for `token.is_some()` (v9.7,
+       round-16 Codex H2: a boolean cannot identify the allocation,
+       so the token itself is an owned, LINEAR `Option<NatHoldToken>`
+       carrying the exact allocator/allocation identity — the rule id
+       plus the flow tuple, since today's release searches the current
+       rule set by tuple at `source.rs:761`; `NatDecision` alone is
+       insufficient, `nat/mod.rs:90`). Every removal path takes() the
+       token exactly once and either releases or transfers it:
+       reap (via `ExpiredSession`), `remove_entry` returns,
+       fresh-install replacement (`install.rs:139`), explicit
+       deletion (`install.rs:538`), synced-upsert replacement
+       (`install.rs:322` — transfer), `take_synced_local`
+       (`lookup.rs:407`), scoped one-shot guards, the reconcile
+       escrow above, and the worker drain. A concurrent same-entry
+       reap is NOT a hazard (`SessionTable` is worker-owned and
+       single-threaded, `session/mod.rs:429`); the contract is
+       exactly-once consumption across every path. Its reap decrements
+       the holder count
        REGARDLESS of origin (the retain is per-entry), and the
        allocation frees only at refcount zero. **That refcount IS
        #6522's machinery — this plan now includes it as a Part-B
@@ -1243,11 +1283,18 @@ the TTL check at `poll_descriptor/mod.rs:846`, so an undelivered
 packet would stamp ownership/refresh/Open state; at the commit arm
 only delivered packets do). **Probation entries additionally SUPPRESS
 ownership promotion, Open emission, replication, and every family-clock
-stamp until a committed non-close packet clears the flag** (round-15
-Codex B2's two-packet chain: refused close → probation zombie, blind
-non-close → promote → SharedPromote authority — under v9.6 the blind
-non-close neither promotes nor refreshes a probation entry; the
-zombie dies at 20 s unless real traffic arrives).
+stamp until a committed non-close packet clears the flag** (round-15/16
+Codex's two-packet chain, resolved precisely: refused close →
+probation zombie; a blind non-close that is FILTERED/TTL-dropped
+neither promotes nor refreshes anything (the commit arm never runs);
+a blind non-close that COMMITS clears the flag and may promote
+exactly once — and that is not a kill: the promote sets no close
+mark, retains the NAT decision, and refreshes/recomputes only the
+ORDINARY established idle timeout (`session/mod.rs:1397, :1430`), so
+any Close is emitted only at normal inactivity expiry of an entry
+that is genuinely idle — correct cluster hygiene (Junos reaps idle
+flows too), with any retention effect bounded by the attacker's
+spray budget (the documented poisoned-anchor residual class).
 
 ### 5.6 Constructor gating (sites 2b + 2c)
 
@@ -1630,7 +1677,7 @@ admitted interval):
   path (assert no forward entry carries 0 except the LocalDelivery and
   #2120 held classes); (f) the demotion live-state gate: an entry
   whose RG just demoted emits nothing at its next reap.
-- **Phase-2 contract v8.2:** per-direction bundles merge by
+- **Phase-2 contract (deferred to the phase2-brief.md track):** per-direction bundles merge by
   lexicographic `(bulk_epoch, writer_gen, seqno)` per bundle
   (coordinator-issued writer generation kills equal-version
   migration conflicts); updates are incarnation-conditional on
@@ -1804,8 +1851,9 @@ Smoke (loss userspace cluster, lock protocol per CLAUDE.md):
   segment. Bigger, throughput-sensitive, asymmetric-routing-hostile;
   separate issue. (Named honestly: xpf lacks this Junos-DEFAULT check;
   this plan closes only the RST/FIN demote DoS.)
-(See §10.5 for the Phase-2 HA-wire anchor — a REQUIRED fast-follow, not
-an option for the synced class.)
+(See §10.5 for the Phase-2 HA-wire anchor — on its own research track
+as of v9; an optimization for the absorbing-state residual, not part of
+this issue's gate.)
 
 ### 10.5 Phase 2 (SEPARATE RESEARCH TRACK): HA-wire anchor carriage
 
