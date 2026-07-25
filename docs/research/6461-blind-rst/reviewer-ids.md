@@ -30,6 +30,9 @@
 | r9 | Codex (gpt-5.5 via codex-companion, resumed session) | task-mrzr3o36-444ag1 (19m36s, completed) | PLAN NO (7 BLOCKER, 3 HIGH, 2 MEDIUM, 1 LOW) — the round that killed the v7.x ticket tower | codex-plan-r9.md |
 | r9 | AGY (direct binary, scoped run) | r9-agy-out1 | 4xUNSOUND (owner_rg unstamped, worker-bit mint divergence, equal-epoch baseline overwrite, 3 text contradictions) — all folded v7.6/v8 | agy-plan-r9.md |
 | r9 | Claude SMR | in-conversation | PLAN NO for v7.5/v7.6 — answered by DELETION (v8: marked-only emission + TTL sweep + id-conditional Go fence + RX-worker commit + Phase-2 bundles/floor/freshness) | claude-smr-plan-r9.md |
+| r10 | Codex (gpt-5.5 via codex-companion, resumed session) | task-mrzsb8yw-3oxx15 (25m22s, completed) | PLAN NO (6 BLOCKER, 3 HIGH, 3 MEDIUM, 1 LOW) | codex-plan-r10.md |
+| r10 | AGY (direct binary, scoped run) | r10-agy-out1 | Q1 SOUND (single producer + exactly-one Close), Q2 UNSOUND (TTL purges live-but-quiet — liveness push folded v8.1), Q3 UNSOUND (stale v7.2 test text — swept) | agy-plan-r10.md |
+| r10 | Claude SMR | in-conversation | PLAN NO for v8/v8.1 — all twelve Codex findings adjudicated; v8.2 folds (one emission predicate with the normative sticky mark, TTL liveness clock + compare-delete, flow_incarnation_id, writer_gen + owner-epoch gate, fresh-at-write-time, marked-sibling emission with exactly-once via delete propagation, dominated async residual) | claude-smr-plan-r10.md |
 
 Infra notes (per feedback_codex_infra_must_retry — all retries documented):
 - Codex: 10m client timeout kill → job found alive server-side → polled 25+ min →
