@@ -916,18 +916,31 @@ attacker-poisonable):**
        token cannot transfer into every worker replica": the replicas
        retain, the escrow only keeps the allocation alive meanwhile).
        **Keeper accounting is PER ALLOCATION with a pending-command
-       count and a BOUNDED barrier (v9.9, round-18 Codex H3):** the
-       keeper for allocation A releases only when A's pending count
-       reaches zero (every command for A has an outcome — an early
-       `Rejected` decrements the count but never drops the keeper
-       while later replicas for A are still pending); the barrier is
-       bounded (a replay deadline), a dead/hung worker's pending
-       commands convert to rejections on supervisor-detected death
-       (`supervisor.rs:80`), and abandonment drains the escrow via
-       RAII — so reconcile can never stall on a permanently absent
-       acknowledgement (workers report READY before consuming
-       commands, `loop_body/mod.rs:150, :682`, and launched workers
-       retain the queue-map `Arc`, `bringup.rs:598`). The
+       count, a CLAIM rule, and a BOUNDED barrier (v9.9.3, round-19
+       Codex M3):** the keeper for allocation A releases only when A's
+       pending count reaches zero (every command for A has an outcome —
+       an early `Rejected` decrements the count but never drops the
+       keeper while later replicas for A are still pending). Pending
+       commands are claimed-before-executed: a worker CLAIMS a pending
+       command before running it, and the barrier converts only
+       UNCLAIMED commands to rejections at the deadline; a CLAIMED
+       command gets its execution window, and a claimed-but-never-
+       finished command converts on worker DEATH (panic unwind or
+       supervisor-detected death, `supervisor.rs:80, :98`), not on the
+       deadline — a SLOW-but-alive worker's late execution either
+       completes normally (its verify-and-retain fails cleanly if the
+       allocation was freed meanwhile, per round-19 AGY's trace: the
+       live allocation mismatches under the allocator lock, install
+       aborts, no hold is re-created on a reused port) or is cancelled
+       with the worker. `Installed` is emitted only after the side-map
+       token is inserted, and unlaunched-worker queues get EXPLICIT
+       rejections (their queued commands contain no hold token yet,
+       `runtime.rs:408` — replay queues carry pending-outcome
+       tickets); abandonment drains the escrow via RAII — so reconcile
+       can never stall on a permanently absent acknowledgement
+       (workers report READY before consuming commands,
+       `loop_body/mod.rs:150, :682`, and launched workers retain the
+       queue-map `Arc`, `bringup.rs:598`). The
        BPF-before-consume ordering at `coordinator/mod.rs:771` is
        covered by the alias-token fencing (external deletes re-check
        the alias at delete time). The token itself is an owned, LINEAR `NatHoldToken`
@@ -1028,21 +1041,32 @@ attacker-poisonable):**
        no fencing is needed, e.g. quiesced full-table rebuilds at
        bring-up, and `manager_ha.go:1771`'s mutex-drop during helper
        IPC becomes irrelevant because the fence lives entirely in the
-       helper). **Conditional control-plane deletes carry their
-       incarnation from SELECTION (v9.9, round-18 Codex B2's second
-       trace):** policy invalidation detaches E1 entries at
-       `daemon_policy_invalidate.go:311` and deletes them later at
-       `:357` via a tuple-only helper delete (`manager_ha.go:1498` →
-       `sync_session.rs:29` reconstructs the key and deletes
-       unconditionally) — while the dataplane can replace E1 with
-       same-key E2 in between, and a helper that re-reads the current
-       alias would find E2 and "authorize" deleting E2. The rule:
-       every conditional delete path (policy invalidation, cluster-bulk
-       reconciliation at `session_store.go:626`, filtered session
-       clearing) CAPTURES the `(origin_process_nonce,
-       flow_incarnation_id)` at selection/detach time and CARRIES it
-       through to the helper commit, and the helper's delete compares
-       the CARRIED incarnation (not merely the current alias); only
+       helper). **Conditional control-plane selection is HELPER-AUTHORITATIVE
+       (v9.9.3, round-19 Codex B1 — the named selectors receive only
+       BPF `Key + SessionValue` whose fixed ABI omits the identity
+       fields (`maps_session.go:225`, `bpf_session_value.go:31`), so
+       capturing the incarnation at selection through the BPF-only API
+       is impossible, and an after-selection alias lookup races E2's
+       commit):** conditional delete paths — policy invalidation
+       (`daemon_policy_invalidate.go:311 → :357`), cluster-bulk
+       reconciliation (`session_store.go:626`), filtered session
+       clearing (`grpcapi/server_sessions.go:1234`) — no longer select
+       tuples in Go and delete them later. Instead Go submits the
+       filter/predicate to the helper, and the HELPER selects the
+       matching entries from its own shared aliases (which carry
+       `flow_incarnation_id`), captures the selected identities
+       atomically under the canonical lock, and deletes under the
+       alias-token fencing in one transaction — the incarnation never
+       leaves the helper, so the select→replace→delete race has no
+       window. The HA continuation is fenced the same way: the
+       peer-visible delete delta emitted by the helper carries the
+       SELECTED `(origin_process_nonce, flow_incarnation_id)` (not a
+       fresh generation over the current key —
+       `daemon_policy_invalidate.go:366`'s tombstone over
+       `sync_conn_write.go:69`/`sync_conn_gen.go:156` would otherwise
+       delete E2's standby at `sync_conn_gen.go:493` when E2 was
+       re-synced after E1's selection); the receiver applies such
+       deletes only when its stored incarnation matches. Only
        deliberately unconditional administrative clears ("delete
        everything regardless") keep separate, unconditional semantics
        and are documented as such. **Per-operation span (normative, v9.8):** every
@@ -1577,7 +1601,9 @@ and one ungated node, each gating only its own packet-driven marks).
   `sync_conn_gen.go:493-506`; gen-zero fallback deletes apply
   unconditionally, :176-186), so this Rust gate plus the refuse-demote
   flip are the barriers between a non-owner/unvalidated reap and the
-  owner's authoritative entry. The plan adds exact regression tests
+  owner's authoritative entry; a refused (out-of-window or
+  no-baseline) close never crosses them, while an in-window blind
+  guess validates by design at the documented window probability. The plan adds exact regression tests
   (`SharedMaterialize + reset + FabricRedirect + stale-ceiling reap` →
   no delta, no owner/shared deletion; blind first-packet close on a
   promotable import → no mark, install-alive, no delta) and names the
@@ -1706,6 +1732,29 @@ admitted interval):
   exactly once, ordinary established idle refresh, exactly one
   Open/replication/stamp, and subsequent hits do NOT re-promote; no
   accelerated reap and no close mark in either branch.
+- **Escrow + conditional-delete fences (v9.9.3, round-19 Codex M4):**
+  (a) two-phase stop: quiesce acknowledged (no new commits) BEFORE
+  handoff; handoff completes BEFORE any side-map drop (no hold
+  escapes to RAII at join, incl. pending command-queue tokens);
+  (b) partial spawn: a worker that never launches has its pending
+  commands EXPLICITLY rejected (not dropped via Drop), and the
+  keeper releases only when the allocation's pending count is zero;
+  (c) multi-replica pending: an early `Rejected` never drops the
+  keeper while later replicas are pending; (d) deadline-vs-claim:
+  an unclaimed command converts to `Rejected` at the deadline; a
+  claimed command gets its execution window and converts only on
+  worker death; a late verify-and-retain on a freed/reused
+  allocation MISMATCHES and aborts (no hold re-created on a reused
+  port — the round-19 AGY trace); (e) helper-authoritative
+  conditional delete: Go submits the predicate; the helper selects
+  from its own shared aliases, captures the selected
+  `(origin_process_nonce, flow_incarnation_id)` under the canonical
+  lock, and deletes under the alias-token fencing in one
+  transaction; E1-selected → E2-replaced → the delete compares the
+  CARRIED (E1) identity and skips E2's family; the peer delete delta
+  carries the SELECTED identity (not a fresh generation over the
+  current key) and the receiver applies it only when its stored
+  incarnation matches.
 - **Trust transactions (v5, round-3 Codex 3):** authenticated sample
   REPLACES untrusted storage (planted X discarded, not blessed/max-merged);
   unauthenticated sample never clears/alters trusted state (SYN
@@ -1894,7 +1943,8 @@ admitted interval):
   packets after an accepted close.
 - **HA invariant regression (round-1 Codex B8):** `SharedMaterialize +
   reset + FabricRedirect + stale-ceiling reap` emits no Close delta and no
-  shared/owner deletion.
+  shared/owner deletion (the reset here is a REFUSED/out-of-window
+  blind close — an in-window guess validates by design).
 - seg_len: GRE synthetic-frame correctness (active frame, IP-declared
   length), Ethernet-padding exclusion, IPv6 ext-chain walk, fragment →
   None, TFO SYN-with-data.
