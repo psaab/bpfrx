@@ -876,19 +876,25 @@ attacker-poisonable):**
        entry's hold references the FORWARD allocation and releases
        through the forward allocation's refcount (not the reverse
        early-return path at `source.rs:789`); and the refcount itself
-       is overflow-checked. **Reconcile hold escrow (v9.8, round-17
-       Codex B1 — the v9.7 escrow had no safe release boundary and no
-       quiesced snapshot):** the reconcile sequence is: (1) workers are
-       stopped and joined FIRST (`teardown.rs:80`,
-       `worker_manager.rs:146`) — the teardown SNAPSHOT
-       (`teardown.rs:54`) then runs QUIESCED (no worker can commit a
-       new SNAT flow mid-shutdown, `loop_body/mod.rs:332`,
+       is overflow-checked. **Reconcile hold escrow (v9.9, round-18
+       Codex B1 — join-first would destroy the holds before the keeper
+       could acquire them, since joining waits for worker-local state
+       to destruct and the RAII side map drops every old hold during
+       the join, `worker_manager.rs:146`):** the reconcile sequence is
+       a TWO-PHASE stop: (1) SIGNAL quiesce — workers stop processing
+       NEW packets (no new commits) but stay ALIVE and keep their
+       tables and side-map tokens; (2) HANDOFF — each worker transfers
+       its outstanding `NatHoldToken`s to the coordinator escrow
+       DURING its own shutdown, while it still owns them (the keeper
+       set is complete: every hold that existed at quiesce is in the
+       escrow before any worker's side map can drop); (3) JOIN
+       (`worker_manager.rs:146`) — side maps drop with nothing left
+       to drop; (4) the teardown SNAPSHOT runs QUIESCED
+       (`teardown.rs:54`) — no worker can commit a new SNAT flow
+       mid-shutdown (`loop_body/mod.rs:332`,
        `poll_descriptor/mod.rs:2560` — the v9.7 race where a
        post-snapshot commit escaped both snapshot and escrow is
-       closed); (2) the teardown transfers ONE exact hold per
-       allocation into `PreservedReconcileState` (the refcount never
-       reaches zero across the window — the escrow token is the
-       KEEPER, one per allocation, not per replica); (3) bring-up
+       closed); (5) bring-up
        (`coordinator/reconcile/bringup.rs:421`,
        `coordinator/mod.rs:761`) replays detached
        `SyncedSessionEntry` clones, and every queued upsert gains an
@@ -1007,7 +1013,24 @@ attacker-poisonable):**
        no fencing is needed, e.g. quiesced full-table rebuilds at
        bring-up, and `manager_ha.go:1771`'s mutex-drop during helper
        IPC becomes irrelevant because the fence lives entirely in the
-       helper). **Per-operation span (normative, v9.8):** every
+       helper). **Conditional control-plane deletes carry their
+       incarnation from SELECTION (v9.9, round-18 Codex B2's second
+       trace):** policy invalidation detaches E1 entries at
+       `daemon_policy_invalidate.go:311` and deletes them later at
+       `:357` via a tuple-only helper delete (`manager_ha.go:1498` →
+       `sync_session.rs:29` reconstructs the key and deletes
+       unconditionally) — while the dataplane can replace E1 with
+       same-key E2 in between, and a helper that re-reads the current
+       alias would find E2 and "authorize" deleting E2. The rule:
+       every conditional delete path (policy invalidation, cluster-bulk
+       reconciliation at `session_store.go:626`, filtered session
+       clearing) CAPTURES the `(origin_process_nonce,
+       flow_incarnation_id)` at selection/detach time and CARRIES it
+       through to the helper commit, and the helper's delete compares
+       the CARRIED incarnation (not merely the current alias); only
+       deliberately unconditional administrative clears ("delete
+       everything regardless") keep separate, unconditional semantics
+       and are documented as such. **Per-operation span (normative, v9.8):** every
        external mutation is its own transaction — canonical lock →
        re-read the EXACT SOURCE ALIAS for the key being mutated (the
        derived key's own alias record, not just the canonical family —
