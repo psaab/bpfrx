@@ -3981,7 +3981,15 @@ authenticated wrapper (post-install, via `CAPABILITY_CONFIRM`);
 a pre-proof capability record may be sent only when BOTH
 HELLO versions are v2 — the version field in the HELLO
 (`sync_auth.go:345`'s `{version, keyed, nonce}`) tells the
-v2 peer which case it is in; the v1 HELLO's own layout is
+v2 peer which case it is in, and its pre-proof
+unauthenticated state is safe by construction (v9.9.50,
+round-52 SMR F2: a v2 peer seeing a v1-version claim simply
+uses v1 rules — ALL capabilities are disabled on a v1-proof
+connection until matching CONFIRMs, so a false v1 claim can
+only DE_FEATURE the connection, never elevate it; a v1 peer
+ignores the version entirely and reads the nonce; and
+between v2 peers the version is covered by the v2 transcript
+itself — no proof-covered version field is needed); the v1 HELLO's own layout is
 NEVER reordered or extended in-frame, or an old peer would
 authenticate different bytes and reconnect-loop at
 `:401-404`); EITHER peer being v1 selects the v1 proof (a v2
@@ -4039,7 +4047,14 @@ reconnect-loop (`sync_auth.go:401-404`,
 `sync_conn.go:106-110, :435-477`):
 `AUTH_PROOF_v2 = HMAC(key, tag_v2 || prover_role ||
 dialer_hello || acceptor_hello || dialer_cap ||
-acceptor_cap)` (v9.9.49, round-51 Codex B2 — the earlier
+acceptor_cap) — with the cap records entering the proof as
+the EXACT WIRE BYTES sent and received (v9.9.50, round-52 SMR
+F1: the sender hashes what it sent, the verifier hashes what
+it received — byte-identical by TCP; never as reconstructed
+fields, which could diverge in integer widths and field
+order; and the cap record's own wire encoding follows the
+same discipline: declared field order, u16-LE lengths,
+little-endian integers, no padding) (v9.9.49, round-51 Codex B2 — the earlier
 `prover_record || verifier_record` conflicted with
 "dialer-first" for an acceptor proof, and the legacy HELLO
 carries only `{version, keyed, nonce}` (`sync_auth.go:345`),
