@@ -1334,7 +1334,22 @@ attacker-poisonable):**
        barriers — A's barrier governs the B→A repair, B's
        barrier the A→B repair, each node processes the peer's
        GEN on its own connection, and the generations are
-       node-scoped, so there is no tie to break. and (ii) the barrier's
+       node-scoped AND direction-scoped (each barrier's state is
+       the triple `(direction, node incarnation, generation)`,
+       so two simultaneous resets proceed as two independent
+       transitions, never one tied state machine). The
+       handshake's loss semantics are pinned (v9.9.33, round-43
+       Codex B1): `RESET_GEN(g)` is retransmitted on the
+       control/setup connection until `RESET_ACK(g)` or a
+       defined retry count, and TIMEOUT ALONE IS NEVER PROOF of
+       remote drain — the silence-timeout backstop only re-opens
+       admission (avoiding a permanent wedge); the OBLIGATION
+       remains outstanding and readiness stays degraded until a
+       repair actually completes (so "GEN never arrived" and
+       "ACK was lost" need not be distinguished: both leave the
+       obligation armed and the node not-ready, and the next
+       successful handshake-driven cold-prime discharges it).
+       and (ii) the barrier's
        linearization is ONE lock domain: admission
        (`preAuthMu`, `sync_admission.go:66`), generation capture,
        `barrierActive`, slot closure, and install rejection are
@@ -1368,8 +1383,12 @@ attacker-poisonable):**
        repair ID is the correlation: a bulk that does not carry
        the current repair ID is not the repair; pre-request bulks
        in flight are serialized behind or superseded by the
-       repair bulk); the obligation discharges ONLY on the ACK
-       echoing the exact repair ID; a legacy sender ignores the
+       repair bulk); the obligation discharges ONLY at the
+       `JOURNAL-END` marker validating the exact repair ID plus
+       the journal epoch/terminal sequence (v9.9.33 — this
+       supersedes the earlier "ACK echoing the exact repair ID":
+       the discharge point is the marker, never a bare `BulkEnd`
+       or bulk ACK); a legacy sender ignores the
        request, and the receiver falls back to (a) after a
        bounded wait; unnegotiated peers always use (a). The repair
        path's stream hygiene is explicit (v9.9.27, round-40 Codex
@@ -1432,9 +1451,24 @@ attacker-poisonable):**
        generation guard and the canonical `Put` are separate
        operations (`sync_conn_gen.go:381, :435`): each installed
        connection is minted an opaque token BEFORE any frame
-       dispatch; every mutation presents its connection's token;
+       dispatch — structured `(node/process incarnation,
+       monotone counter)` so the identity is never reused
+       (v9.9.33, round-43 Codex H5: "opaque" alone does not
+       establish never-reused identity; and the legacy pending
+       frame is handled ONLY AFTER token installation — today
+       it is handled first, `sync_conn.go:119`);
+       every mutation presents its connection's token;
        the repair protocol authorizes the pinned stream's token
-       for the repair era; the token is revoked at disconnect;
+       for the repair era; the token is revoked at disconnect
+       AND AT SUPERSESSION (v9.9.33, round-43 Codex H5:
+       installing C2 closes and overwrites C1's slot under
+       `s.mu` (`sync_conn.go:244`), and C1's LATER disconnect
+       sees the stale connection and returns without revoking
+       T1 (`sync_conn.go:480`) — so the displaced token's
+       revocation is atomic WITH the slot swap: T1 is revoked
+       BEFORE T2 installs, and the revocation is mirrored into
+       the repair commit, so a paused C1 handler can never
+       publish after the repair);
        and the canonical transaction (Go AND the mirrored Rust
        side) checks the presented token's validity and
        repair-era authorization ATOMICALLY with the
@@ -1615,7 +1649,36 @@ attacker-poisonable):**
        — one quiesced operation at a time, no cross-quiesce
        deadlock possible), and lookups resume — or the
        whole repair rolls back, with no partial visibility at
-       any point); and a bulk
+       any point. The rebuild's stop contract and the
+       capacity/conflict rules are pinned (v9.9.33, round-43
+       Codex B3 + M8): (a) the capacity negotiation is
+       GENERATION-TAGGED (worker count is a binding-plan input,
+       `planning.rs:93`, so capacity re-negotiates whenever the
+       plan changes); (b) the commit PREFLIGHTS the complete
+       peer/local union against every target map — B's own
+       locally-born flows publish into the same shared map
+       (`poll_descriptor/mod.rs:2560, :2591`) whose length the
+       import admission compares against B's worker-derived cap
+       (`session_import.rs:24, :91`), so a valid K-entry repair
+       plus L local entries can exceed C: preflight computes
+       K + L ≤ C BEFORE the quiesce, and on overflow the repair
+       enters the defined degraded state (operator-visible,
+       not-ready) rather than committing an over-capacity table;
+       (c) a NAT tuple conflict — A's missing E1 claiming public
+       P while B's different-key LOCAL E2 already owns P
+       (`allocator.rs:1617, :1682`) — resolves LOCAL-AUTHORITY-
+       WINS: E2 keeps P, E1's exact reserve fails, E1's cohort
+       remains UNPUBLISHED (rejected, resend retries), and the
+       repair NEVER reports E1 protected — the obligation
+       remains outstanding and readiness stays degraded without
+       the `JOURNAL-END` acknowledgement (a local-wins-plus-ACK
+       outcome is explicitly forbidden); and (d) the stop is
+       BOUNDED: the migration gate's WRITE permit is NEVER held
+       across the quiesce/join; the worker join carries an
+       explicit deadline (today's unbounded `join()`,
+       `worker_manager.rs:146`); and a rebuild/rollback failure
+       leaves XSK disabled with readiness DEGRADED (never a
+       silent half-rebuilt table). and a bulk
        whose ID is not the current repair ID is WHOLLY
        NON-MUTATING — its `BulkStart` does not `resetRecvGen`,
        its installs do not publish, its BulkEnd neither
@@ -1806,7 +1869,13 @@ attacker-poisonable):**
        token-Drop drop their clone — they NEVER touch the allocator
        directly — and the allocator reservation releases exactly
        when the LAST clone drops (canonical + all replicas +
-       materializations + escrow). The per-entry "retain" contract
+       materializations + escrow) — v9.9.33, round-43 Codex B2:
+       the Arc finalizer is only the DETECTION mechanism for the
+       last reference; the release itself is the per-credit
+       HOLD CELL's zero transition (the Arc never owns a count
+       of its own — the single-counter rule of v9.9.31 governs
+       every release path, and no text in this plan prescribes a
+       separate Arc-side release). The per-entry "retain" contract
        is thereby re-expressed as clone distribution at fan-out/
        materialize time (not per-entry allocator mutations): the
        early-replica-reap trace dies by construction (W0's reap
@@ -2009,20 +2078,28 @@ attacker-poisonable):**
        receipt): `NoChange` on a
        DirectHold incumbent is IMPOSSIBLE for a peer replacement —
        the arm is `Converted(old_state)`, a mutation receipt with
-       its own exact undo (re-increment the direct count and drop
-       the minted group clone — never the no-op undo, which would
-       leave a stale DirectHold double-release path or an unused
-       GroupHold pin), and the conversion is conditioned on a
+       its own exact undo — the count-preserving CELL SWAP-BACK
+       (v9.9.33, round-43 Codex B2: this supersedes the earlier
+       "re-increment the direct count and drop the minted group
+       clone" — under the single-counter hold cell there is no
+       variant-specific decrement; the undo swaps the cell's
+       content back, a no-op if the cell already released), and the conversion is conditioned on a
        VERSIONED identity/origin recheck serialized with commit
        (the demoted entry's origin/identity version at reserve
        time must equal the version at publish-commit — the
-       version is `install_epoch`, the worker-local mutation
-       counter rewritten on update AND promotion
-       (`session/mod.rs:761, :1384` — v9.9.28, round-41 SMR F3:
-       this is the version for THIS purpose, while
-       `admission_config_version` remains the write-once admission
-       stamp and is NOT; the recheck reads
-       `(install_epoch, SessionIdentity)` inside the entry's
+       version is the canonical PER-ENTRY ROW VERSION
+       (v9.9.33, round-43 Codex B2: this supersedes the v9.9.28
+       `install_epoch` declaration — `install_epoch` is allocated
+       independently per worker `SessionTable`
+       (`session/mod.rs:737, :1384`) and the canonical
+       `SyncedSessionEntry` has no counterpart
+       (`worker/mod.rs:375`): the canonical row version is a
+       per-entry CAS field on `SyncedSessionEntry` itself, valued
+       from a never-reused coordinator sequence and refreshed
+       across deletion/reinsertion; `admission_config_version`
+       remains the write-once admission stamp and is NOT this
+       either; the recheck reads
+       `(row_version, SessionIdentity)` inside the entry's
        table critical section — an
        intervening local re-promotion (`promote.rs:99`) bumps the
        version, the commit fails the recheck, and the
@@ -2281,11 +2358,22 @@ attacker-poisonable):**
        a drop after the read sees the flag and re-notifies;
        queue entries are deduplicated by family key; the
        quarantine and its retry entry are INCARNATION-SCOPED
-       (v9.9.32, round-43 SMR F6: they carry the family's
-       `SessionIdentity` — a new import with a DIFFERENT
+       (v9.9.32, round-43 SMR F6; lifecycle pinned v9.9.33,
+       round-43 Codex H6: the state is the tuple `(family key,
+       SessionIdentity, quarantine generation, row version)` — a
+       new import with a DIFFERENT
        identity is a new family epoch and installs normally,
-       with stage 2 proceeding against the old identity only,
-       while a SAME-identity re-import cancels the quarantine);
+       with stage 2 proceeding against the old identity only;
+       and a SAME-identity re-import ATOMICALLY CANCELS the
+       quarantine in the same critical section as its
+       publication — never a blind clear: a same-E1 resend that
+       republishes (`session_import.rs:53` accepts
+       equal-generation resends) cancels the OLD stage-2
+       cleanup, so the stale cleanup can never remove the
+       newly-published family before its worker clones fan out
+       (`session_import.rs:115, :187, :215`); and a SUCCESSFUL
+       stage 2 removes the flag and the queue entry atomically
+       in the same transaction as the family removal);
        and the
        notification is lock-free, drained ONLY with canonical,
        allocator, migration-gate, and queue locks released);
@@ -3068,9 +3156,18 @@ attacker-poisonable):**
        it carries the id; today the primary reverse publication
        carries zero, `poll_descriptor/mod.rs:2897`); worker replicas
        inherit from the alias/wire at materialize/install instead of
-       minting from zero; HA coordinator imports mint ONCE before
-       fanout (`session_import.rs:115` publishes before cloning —
-       round-9 AGY 2's per-worker divergence dies). `DeleteSynced`
+       minting from zero; and HA coordinator imports ADOPT the
+       wire-carried identity BYTE-FOR-BYTE (v9.9.33, round-43
+       Codex H7 — this supersedes "mint ONCE before fanout":
+       §5.8's rule is that the sender's pair is wire-carried and
+       a receiver-minted identity can never equal it; if A sends
+       E1 with identity IA and B minted IB, A's conditional
+       delete for IA would be refused on B and B would retain
+       stale E1 plus its NAT hold. Only LOCALLY-BORN forwards
+       mint; every import inherits — the single canonical
+       adoption happens ONCE at canonical publication
+       (`session_import.rs:115`) and fan-out copies it verbatim,
+       so round-9 AGY 2's per-worker divergence still dies). `DeleteSynced`
        becomes incarnation-conditional (today key-only,
        `session_glue/mod.rs:851` → `delete_synced.rs:9`: a delayed E1
        cleanup can kill replacement E2) — the command carries the
@@ -3456,7 +3553,7 @@ non-close path.
 
 ### 5.8 Signature/signature-shape changes (all crate-internal)
 
-**Wire schema (normative, consolidated — v9.9.17):**
+**Wire schema (normative, consolidated — v9.9.33):**
 The session INSTALL/Open delta carries the additive identity tail
 `{(origin_process_nonce, flow_incarnation_id, stable_rule_id_hash,
 admission_config_version, persistent_nat, persistent_nat_permit)}`
@@ -3482,6 +3579,20 @@ the numeric-ID selection at `daemon_policy_invalidate.go:311` where a
 surviving rule's E2 can alias a deleted rule's old position and be
 companion-deleted through `session_store.go:391`); the session DELETE
 delta carries `{(origin_process_nonce, flow_incarnation_id)}`.
+The REPAIR PROTOCOL frames (v9.9.33, round-43 Codex B4 — additive
+and rolling-gated like the identity tails): `BulkStart` carries
+`(repair_cutoff_epoch, repair_id, declared_member_count?)`; the
+bulk markers echo `repair_id`; `JOURNAL-END` carries
+`(repair_id, journal_epoch, terminal_seqno)`; `RESET_GEN` /
+`RESET_ACK` carry `(direction, node_incarnation,
+reset_generation)`; the capability handshake exchanges
+`(capacity, heartbeat-ack-capable)`; and every session frame is
+presented with its connection's slot-membership token out-of-band
+(the token is per-connection metadata, not a frame field). A
+completed repair retains a bounded RECEIPT `(repair_id,
+terminal_seqno)` so a duplicate `JOURNAL-END` validates against
+the receipt and re-ACKs WITHOUT re-mutating (round-43 Codex B4's
+terminal-ACK-loss contract).
 The sender/receiver store lifecycle: the Go sidecar synced store gains
 `(origin_process_nonce, flow_incarnation_id, row_version,
 stable_rule_id_hash, admission_config_version, persistent_nat,
@@ -3996,7 +4107,27 @@ admitted interval):
   obligation armed); hold-cell conversion ordering (single
   per-credit counter, reference flavors only); and the cleanup
   lost-wakeup interleaving (arm-before-read closes it; the
-  drop-after-read re-notifies). (e) the typed undo receipt — `NoChange` replay rolls
+  drop-after-read re-notifies). (d7)
+  v9.9.33 transition boundaries (round-43 Codex L9): RESET_GEN
+  loss and simultaneous resets (retransmit on the control
+  connection; timeout never discharges the obligation, only
+  re-opens admission with readiness degraded); same-fabric
+  token supersession (C2 installs → T1 revoked before the slot
+  swap; a paused C1 handler never publishes); merged-capacity
+  preflight (K + L > C → defined degraded state, no
+  over-capacity commit) and the NAT tuple conflict (local
+  authority wins; the conflicting peer cohort stays
+  unpublished; the repair never ACKs E1 protected);
+  terminal-marker/ACK retry (the completed-repair receipt
+  re-ACKs a duplicate JOURNAL-END without re-mutating);
+  identity adoption (an import carries the wire identity
+  byte-for-byte — A's conditional delete for IA matches on B);
+  the same-E1-resend vs stage-2 race (the resend's publication
+  atomically cancels the stale cleanup); the rebuild stop
+  contract (join deadline; migration WRITE never held across
+  quiesce/join; failure leaves XSK disabled + readiness
+  degraded); and the Arc-vs-cell single-counter assertion (no
+  release path outside the cell's zero transition). (e) the typed undo receipt — `NoChange` replay rolls
   back nothing (pre-existing ownership untouched), `Inserted`/
   `Retained` undo exactly their mutation, and `Replaced(old_state)`
   with a FAILED new claim reinstates the displaced record's tuple +
