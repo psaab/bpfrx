@@ -20,9 +20,14 @@ family-clock TTL sweep with a commit-time incarnation recheck, and the
 NAT-release investigation FILED as its own pre-existing bug); Phase 2 —
 the HA-wire anchor that would restore fast-reap for synced flows — moves
 to its own research track with the rounds 6-12 findings preserved as its
-design brief. The issue's HA teeth are closed by Part A alone: a blind
-close can never mark, so it can never produce a Close delta, so the
-cluster-kill channel is dead with or without Phase 2.
+design brief. The issue's HA teeth are closed by Part A alone, stated
+precisely (round-13 Codex's wording catch): a blind close can mark ONLY
+inside the acceptance window (~1/2^12–1/2^14 per blind packet) and every
+such mark was validated against observed flow state — so the
+1-packet-anytime cluster kill is dead, and what remains is the
+documented sustained-spray capability at window probability, whose every
+successful mark is, by construction, one the endpoints' own RFC 5961
+handling also had a chance to reject.
 
 v1 → v2: round-1 review killed v1's architecture (attacker-writable trust
 anchor, missed reverse-NAT constructor, invalid cross-store serial merge).
@@ -1638,8 +1643,10 @@ an option for the synced class.)
 ### 10.5 Phase 2 (SEPARATE RESEARCH TRACK): HA-wire anchor carriage
 
 Phase 1 (this plan's ship candidate) closes the issue and its HA teeth
-without any wire change: a blind close can never mark, so it can never
-produce a Close delta, and the cluster-kill channel is dead. What Phase 1
+without any wire change: a blind close can mark only inside the
+acceptance window (~1/2^12–1/2^14 per blind packet), and every mark was
+validated against observed flow state — the 1-packet-anytime cluster
+kill is dead. What Phase 1
 does NOT restore is the 2 s fast-reap for synced flows after failover —
 imported entries refuse closes until churn (the §2 absorbing-state
 residual, bounded, delivery-safe, accepted). Phase 2 — carrying a trusted
