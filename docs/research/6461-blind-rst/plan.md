@@ -831,11 +831,18 @@ attacker-poisonable):**
        decision — `materialize_shared_session_hit`; the reverse-synth
        path (`lookup_forward_nat_across_scopes`,
        `shared_ops.rs:638-665` → `install_reverse_session_from_forward_match`);
-       the embedded-ICMP consumers (`icmp_embed/nat_match_v4.rs:41`,
-       `nat_match_v6.rs:66`); and the asynchronous upsert/prewarm
+       the embedded-ICMP consumers — BOTH the NAT-match paths
+       (`icmp_embed/nat_match_v4.rs:41` and the session-fallback lookups
+       at `nat_match_v4.rs:78, :87`, `nat_match_v6.rs:66, :100, :117`)
+       and the return-resolution path (`icmp_embed/return_resolution.rs:20`);
+       the `keep_transient` clone branch at
+       `session_glue/mod.rs:1194-1195`; and the asynchronous
+       upsert/prewarm
        command consumption (activation prewarm clones at
        `shared_ops.rs:304, :357`; replication clones at
        `session_glue/mod.rs:838`; install at `upsert_synced.rs:64`).
+       (The icmp_embed session-fallback and keep_transient consumers
+       were round-14 AGY's final coverage catch.)
        Each consumer re-reads the canonical record under the canonical
        lock at commit and requires the clone's `flow_incarnation_id`
        to still match the record's; AND every install/publish path
