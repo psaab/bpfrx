@@ -24,6 +24,9 @@
 | r7 | Codex (gpt-5.5 via codex-companion, resumed session) | task-mrzomipt-t7v4xi (24m07s, completed) | PLAN NO (6 BLOCKER, 2 HIGH, 2 MEDIUM, 1 LOW) | codex-plan-r7.md |
 | r7 | AGY (direct binary, scoped single-question run) | r7-agy-out1 | Q1 UNSOUND (ticket coverage — folded wrong in v7.3, corrected in v7.4), Q2 SOUND (atomic delete), Q3 UNSOUND (idle decay kills the target class — heartbeat folded v7.3/v7.4) | agy-plan-r7.md |
 | r7 | Claude SMR | in-conversation | PLAN NO for v7.2/v7.3 — all eleven Codex findings confirmed + folded into v7.4 (race narrowed to true HA-import origins, session_id CAS ticket, per-side writer ownership, phase byte, Go end-to-end protocol, lease decay, pending-neigh re-resolve) | claude-smr-plan-r7.md |
+| r8 | Codex (gpt-5.5 via codex-companion, resumed session) | task-mrzpy4kp-52b8bu (18m59s, completed) | PLAN NO (6 BLOCKER, 3 HIGH, 1 MEDIUM, 1 LOW) | codex-plan-r8.md |
+| r8 | AGY (direct binary, scoped run) | r8-agy-out1 | 3xSOUND (ticket narrowing/origin disjointness, per-side writer totality, owner-only lease renewal), no contradictions | agy-plan-r8.md |
+| r8 | Claude SMR | in-conversation | PLAN NO for v7.4 — 5 of 6 blockers confirmed + folded into v7.5; Codex 5 (split steering) re-adjudicated to master-parity on verification (master's propagation is local-table-only) | claude-smr-plan-r8.md |
 
 Infra notes (per feedback_codex_infra_must_retry — all retries documented):
 - Codex: 10m client timeout kill → job found alive server-side → polled 25+ min →
