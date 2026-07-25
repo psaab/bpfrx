@@ -1388,7 +1388,26 @@ attacker-poisonable):**
        delayed old-incarnation `RESET_ACK` arriving on a NEW
        lane is discarded because the frame's incarnation must
        equal the LANE's bound incarnation, not any
-       recently-seen one));
+       recently-seen one); and the incarnation TRANSITION is
+       one locked state machine (v9.9.41, round-47 Codex H2 —
+       overlapping authenticated setups (accepts in independent
+       goroutines, `sync_conn.go:388`; setup tracking records
+       only membership, `sync_admission.go:66`; the process
+       nonce is random, not ordered, `heartbeat.go:624`) can
+       interleave n1-stalled → n2-completes → n1-resumes, and
+       both naive rules fail (reject-every-mismatch can leave
+       the genuine restart permanently non-current;
+       last-completer-wins can regress to n1 and apply its
+       stale reset): the peer-incarnation registry maintains
+       `{current, pending, retired}` and every slot/pre-slot
+       lane under ONE lock (`s.mu`): a different incarnation
+       first DRAINS/REVOKES the current incarnation's handlers
+       and lanes, then ATOMICALLY retires current and promotes
+       pending; the `(node_id, incarnation, lane_token)`
+       triple is rechecked immediately before every mutation;
+       a retired incarnation is never readopted; and a
+       reset-generation high-water is kept PER INCARNATION, so
+       n1's frames can never pass n2's lane);
        and the
        connection installs only after BOTH reset triples have
        drained and ACK'd), and an
@@ -1438,7 +1457,13 @@ attacker-poisonable):**
        drives its outbound FULL bulk A→B over the surviving
        connection (clearing its own sticky gates per the
        obligation), ECHOING the repair ID in `BulkStart`,
-       `BulkEnd`, and the receiver's ACK (v9.9.22, round-37 Codex
+       `BulkEnd`, and the receiver's `JOURNAL_ACK` (never a
+       bulk ACK — v9.9.41, round-47 Codex B1: `JOURNAL_END` is
+       the terminal MARKER the receiver applies, `JOURNAL_ACK`
+       is the receiver's return that alone discharges the
+       sender's obligation; negotiated `BulkEnd` and bare
+       `BulkAck(u64)` NEVER clear either obligation or
+       readiness) (v9.9.22, round-37 Codex
        B1: `BulkStart` today carries only the sender-local bulk
        epoch (`sync_bulk.go:53, :65`), so a PRE-REQUEST snapshot
        delayed on the survivor can arrive after the request and
@@ -1680,9 +1705,12 @@ attacker-poisonable):**
        (`sync.go:805`, `sync_conn_write.go:14`) — installs merely
        arm backfill while deletes enter the journal
        (`sync_conn_write.go:36, :69`), and a `BulkEnd` that
-       discharges B's obligation/readiness before the next sweep
-       replays that window leaves a takeover missing E2 or
-       retaining deleted E1): post-cut frames enter a BOUNDED
+       WOULD discharge B's obligation/readiness before the next
+       sweep replays that window leaves a takeover missing E2
+       or retaining deleted E1 — the hazard; under this design a
+       `BulkEnd` NEVER discharges anything: readiness moves only
+       on the applied `JOURNAL_END` (v9.9.41, round-47 Codex
+       B1): post-cut frames enter a BOUNDED
        post-cut journal; journal overflow INVALIDATES the repair
        and re-arms the obligation with a fresh generation (never
        a silently-truncated window); and the obligation
@@ -1939,8 +1967,11 @@ attacker-poisonable):**
        OBLIGATION BOOKKEEPING, direction-split and
        generation-specific (round-36 Codex B1: bulk epochs are
        allocated at `sync_bulk.go:65` but the pending epoch is
-       installed only near BulkEnd, `:169`, and the ACK handler
-       accepts any epoch not lower than pending,
+       installed only near BulkEnd, `:169`, and TODAY's ACK
+       handler accepts any epoch not lower than pending (the
+       pre-design behavior this plan replaces: under the
+       negotiated protocol a bare `BulkAck` never discharges —
+       only `JOURNAL_ACK`, v9.9.41),
        `sync_conn_read.go:257` — a delayed pre-obligation ACK, or
        an ACK for obligation O1's bulk after a second overflow
        O2, must never discharge the current obligation): the
@@ -1956,8 +1987,10 @@ attacker-poisonable):**
        `bulkRedriveInFlight` is set, another disconnect loses the
        CAS trigger and completion currently only clears the
        flag, `sync_conn.go:594`: the obligation, not the CAS, is
-       the durable state — completion of a clean replacement bulk
-       discharges; failure re-arms the drive). A second overflow
+       the durable state — and its completion is the matching
+       full-triple `JOURNAL_ACK`, never a clean replacement bulk
+       on its own (v9.9.41, round-47 Codex B1); failure re-arms
+       the drive). A second overflow
        while an obligation is outstanding re-arms the
        raising-point generation. During the outage the
        sender's own send queue fills and self-arms
