@@ -1458,7 +1458,10 @@ attacker-poisonable):**
        repair actually completes (so "GEN never arrived" and
        "ACK was lost" need not be distinguished: both leave the
        obligation armed and the node not-ready, and the next
-       successful handshake-driven cold-prime discharges it);
+       successful handshake-driven cold-prime's terminal
+       exchange completes it — the receiver's readiness on the
+       applied `JOURNAL_END`, the sender's obligation on the
+       matching `JOURNAL_ACK`, v9.9.45);
        the re-open's driver is the existing per-install gate
        (v9.9.34, round-44 SMR F3: the first install after the
        drain computes both-empty and cold-primes, and that
@@ -3929,7 +3932,22 @@ a direct proof-algorithm change would break rolling upgrades:
 current peers compute `HMAC(tag || nonce)` (`sync_auth.go:217`,
 verified at `:401`), so a whole-transcript proof and the
 nonce-only proof would reject each other and reconnect
-indefinitely: v1 peers keep the v1 nonce-only proof and the
+indefinitely — with the mixed-version rules byte-exact
+(v9.9.45, round-49 Codex H2: the LEGACY HELLO PREFIX is
+preserved byte-for-byte — today's v1 reads its challenge from
+the fixed bytes `payload[2:34]` and always uses the nonce-only
+proof (`sync_auth.go:345-376, :387-404`), so the v2 fields
+are APPENDED after the v1 prefix via trailing-field
+tolerance, NEVER reordered (reordering would make an old peer
+authenticate different bytes and reconnect-loop at
+`:401-404`); EITHER peer being v1 selects the v1 proof (a v2
+peer proving to a v1 peer uses the v1 nonce-only proof over
+the legacy prefix bytes), and every capability field is
+masked or post-authenticated on a v1-proof connection; the
+v2 byte vectors are literal: the domain tag string, the
+record-order rule, u16-LE length widths, little-endian
+integers, and the proof-direction rule (each side proves its
+OWN transcript)): v1 peers keep the v1 nonce-only proof and the
 v1-v1 pair MASKS `reset-vN` plus every transcript-dependent
 capability — enumerated EXACTLY (v9.9.44, round-49 SMR F1:
 the transcript-dependent features are the reset lane itself,
@@ -3953,9 +3971,12 @@ installs (the wrapper installs only after verification,
 `sync_auth.go:406` — the transcript is not "inside" the
 wrapper; it is what the wrapper's installation is gated on));
 the canonical transcript — node ID, process incarnation,
-capabilities, nonces — is authenticated inside the
-authenticated frame wrapper, so `AUTH_PROOF` covers the whole
-transcript, not a bare nonce (`sync_auth.go:217`); the
+capabilities, nonces — is what `AUTH_PROOF` covers (not a
+bare nonce) — and the proof is verified BEFORE the
+authenticated frame wrapper installs (v9.9.45, round-49 Codex
+H2: this strikes the contradictory "inside the wrapper"
+phrasing — the wrapper installs only after verification,
+`sync_auth.go:406`); the
 transcript's encoding is canonical (v9.9.42, round-48 SMR F3:
 an ORDERED field list, each field length-prefixed, fields in
 the tuple's declared order — node_id, process_incarnation,
@@ -3980,7 +4001,31 @@ wait-forever);
 `RESET_ACK` carry `(direction, node_incarnation,
 reset_generation)`; `BulkStart` carries
 `(repair_cutoff_epoch, repair_id, declared_member_count?)`; the
-bulk markers echo `repair_id`; the terminal exchange is TWO
+bulk markers echo `repair_id`; the CAPABILITY-CONDITIONED
+COMPLETION MATRIX (v9.9.45, round-49 Codex B1 — the two-frame
+rule cannot apply to mixed-version pairs: a legacy receiver
+can't return `JOURNAL_ACK` (or even a bare `BulkAck` when
+new→legacy synchronization is INSTALL-only without `BulkEnd`,
+this plan's own install-only rule), and arming a negotiated
+obligation there would strand the sender's cold-prime
+forever; while legacy→new REQUIRES the current `BulkEnd`
+readiness path (`sync_conn_read.go:241-247` →
+`daemon_ha_sync.go:90-100`), which the "BulkEnd never
+discharges" rule would forbid): (a) `repair-vN` pairs —
+applied `JOURNAL_END` clears receiver inbound/readiness;
+matching full-triple `JOURNAL_ACK` clears sender
+outbound/cold-prime; `BulkEnd` and bare `BulkAck` clear
+neither; (b) legacy→new full bulk — LEGACY completion is
+retained (the `BulkEnd` readiness path stands for
+unnegotiated senders; the "never discharges" rule applies
+ONLY to negotiated repair-era bulks); (c) new→legacy
+INSTALL-only prime — NO negotiated repair obligation is
+armed AT ALL (the prime is fire-and-forget: cold-prime
+clears after successful lossless emission, and the legacy
+peer converges by its own invalidation and aging — the
+pre-existing legacy semantics; suppressing the obligation is
+the only safe posture, since the legacy peer can neither ACK
+nor enforce identity); the terminal exchange is TWO
 distinct frames with LOCKED ROLES (v9.9.43, round-48 Codex B1 —
 this supersedes calling `JOURNAL-END` "the terminal ACK" or
 "the ONLY discharge": `JOURNAL_END(repair_id, journal_epoch,
@@ -4577,7 +4622,25 @@ admitted interval):
   retarget; rollback is token-conditional per preimage);
   reset-lane frame rejection and current-incarnation fencing
   (non-RESET types dropped; stale incarnation discarded;
-  unkeyed peers get no lane); the pending-rejection GC wakeup
+  unkeyed peers get no lane); (d9) v9.9.45 protocol boundaries
+  (round-49 Codex L3): v2↔v1 interoperability (a v2 peer uses
+  the v1 nonce-only proof over the legacy prefix bytes —
+  connection establishes, `reset-vN` and the named reset
+  frames masked, repair-vN negotiated independently);
+  canonical transcript vectors (byte-exact: literal domain
+  tag, record-order rule, u16-LE lengths, little-endian
+  integers, own-transcript proof direction); the legacy HELLO
+  prefix preserved byte-for-byte (an old peer authenticates
+  the same bytes — no reconnect loop); capability masking on a
+  v1-proof connection (reset-vN + the named frames never
+  offered); the mixed-version discharge matrix (repair-vN:
+  JOURNAL_END/JOURNAL_ACK; legacy→new: BulkEnd readiness
+  retained; new→legacy INSTALL-only: no obligation armed,
+  cold-prime clears on lossless emission); pre-HELLO
+  incarnation fencing (frames before the transcript verified
+  are not session frames); and the stale transition-CAS (a
+  superseded pending's completion fails the CAS);
+  the pending-rejection GC wakeup
   (persistent P freed at GC notifies; a third-flow reclaim
   re-arms); old-family DNAT cleanup (the immutable record
   covers the reverse/DNAT aliases); and the teardown latch
