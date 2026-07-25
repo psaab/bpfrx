@@ -4071,7 +4071,11 @@ payload bytes plus their u16-LE length, never the frame
 header); the capability record's own layout is fully defined
 (field order `(node_id, process_incarnation, capacity,
 capacity_config_generation, capability bits)`, fixed widths —
-u32/u64/u64/u64/u32, the bits packed LSB-first in the u32,
+u32/u64/u64/u64/u32, the bits packed LSB-first in the u32 per
+the assignment table (v9.9.52, round-53 SMR F2: bit 0 =
+identity-enforcement, bit 1 = lease-input, bit 2 = repair-vN,
+bit 3 = reset-vN, bit 4 = heartbeat-ack-capable, bits 5-31
+reserved-zero — so "packed LSB-first" is unambiguous),
 little-endian integers, no padding); never as reconstructed
 fields, which could diverge in integer widths and field
 order; the SHARED record segment
@@ -4079,7 +4083,14 @@ order; the SHARED record segment
 term(dialer_cap) || term(acceptor_cap)`) is byte-identical
 for both sides, and the FULL inputs differ ONLY by
 `prover_role`; and literal KEYED HEXADECIMAL vectors for both
-roles ship in §9; and the cap records entering the proof as
+roles ship in §9 as COMPLETE (input, key, output) triples
+(v9.9.52, round-53 SMR F1: each vector pins the ENTIRE input
+byte string — both HELLO payloads and both capability
+records with EVERY field value written out, not a
+representative subset — plus the exact HMAC key bytes and
+the expected output, for BOTH roles; a vector that leaves
+any field unpinned lets two conforming implementations
+diverge on that field); and the cap records entering the proof as
 the EXACT WIRE BYTES sent and received (v9.9.50, round-52 SMR
 F1: the sender hashes what it sent, the verifier hashes what
 it received — byte-identical by TCP) (v9.9.49, round-51 Codex B2 — the earlier
