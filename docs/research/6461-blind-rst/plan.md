@@ -1925,9 +1925,10 @@ admitted interval):
   duplication, no RT_FLOW dupes); (c) the shared-map TTL sweep purges
   a stale canonical + NAT + wire alias family after K × timeout (the
   round-5 stranding) and a rematerialize after the sweep finds
-  nothing; (d) Go close processing is `(origin_node_id, session_id)`-
-  conditional where the id exists — a stale E1 Close cannot kill E2's
-  cluster entry; (e) owner_rg_id is stamped on every forward install
+  nothing; (d) Go close processing is `(origin_process_nonce,
+  flow_incarnation_id)`-conditional where the id exists — a stale E1
+  Close cannot kill E2's cluster entry; (e) owner_rg_id is stamped on
+  every forward install
   path (assert no forward entry carries 0 except the LocalDelivery and
   #2120 held classes); (f) the demotion live-state gate: an entry
   whose RG just demoted emits nothing at its next reap.
