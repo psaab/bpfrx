@@ -1300,7 +1300,29 @@ attacker-poisonable):**
        idle-but-alive connection always answers when asked —
        silence means no inbound frames at all, including ACKs,
        i.e. dead or partitioned), which makes the slot's
-       drain deterministic in all cases; and (ii) the barrier's
+       drain deterministic in all cases — BUT the absolute
+       teardown is CAPABILITY-SCOPED (v9.9.31, round-42 Codex B1:
+       today's regression explicitly keeps a quiet LEGACY peer
+       connected even when it never acknowledges heartbeat
+       traffic (`sync_test.go:4721`), so the silence teardown
+       applies only to negotiated pairs; legacy connections keep
+       today's behavior, and the legacy repair path relies on
+       FIN delivery plus the durable-obligation escalation —
+       documented as eventually-consistent, with the takeover
+       fence backstopping a permanently-impaired peer); and the
+       barrier's remote guarantee is a NEGOTIATED
+       RESET-GENERATION HANDSHAKE for capable pairs (v9.9.31,
+       round-42 Codex B1 — the finite node-local barrier cannot
+       prove the REMOTE peer observed both slots empty: a retry
+       accepted-and-immediately-closed just before the barrier
+       ends can occupy A's slot until ITS silence timeout
+       expires, and extending the barrier only moves the
+       endpoint race): B sends `RESET_GEN(g)` (rolling-gated
+       additive frame), A quiesces its dialers AND rejects
+       inbound, records both slots empty, and answers
+       `RESET_ACK(g)`; B reopens admission only after
+       `RESET_ACK(g)` (with the silence-timeout backstop for a
+       lost ACK); unnegotiated peers use the time barrier above. and (ii) the barrier's
        linearization is ONE lock domain: admission
        (`preAuthMu`, `sync_admission.go:66`), generation capture,
        `barrierActive`, slot closure, and install rejection are
@@ -1387,7 +1409,24 @@ attacker-poisonable):**
        every `installConn` — never per-connection, or two
        simultaneous connections sharing a value would let a
        pre-cutoff handler's mutation pass the fence on the
-       sibling connection). The repair
+       sibling connection) — and the fence's exact stream
+       identity is an OPAQUE PER-FABRIC SLOT-MEMBERSHIP TOKEN
+       (v9.9.31, round-42 Codex B2: a peer-global monotone
+       counter cannot distinguish the pinned repair stream from
+       a later non-repair connection — advancing it either
+       invalidates the valid stream or permits the later one;
+       and a pending frame can be handled BEFORE `installConn`
+       assigns the slot (`sync_conn.go:100`), while the
+       generation guard and the canonical `Put` are separate
+       operations (`sync_conn_gen.go:381, :435`): each installed
+       connection is minted an opaque token BEFORE any frame
+       dispatch; every mutation presents its connection's token;
+       the repair protocol authorizes the pinned stream's token
+       for the repair era; the token is revoked at disconnect;
+       and the canonical transaction (Go AND the mirrored Rust
+       side) checks the presented token's validity and
+       repair-era authorization ATOMICALLY with the
+       publication). The repair
        ID also orders the repair's CONTENTS, not just its
        completion (v9.9.23, round-38 Codex B2: `BulkSync` pins one
        connection (`sync_bulk.go:53`) while queued incrementals
@@ -1473,7 +1512,18 @@ attacker-poisonable):**
        application both complete — so a post-cut E2 delta
        delayed on another fabric can never arrive after
        readiness cleared, because readiness clears only at the
-       marker); a sender crash/restart mid-repair is equally
+       marker — and this rule SUPERSEDES every older
+       "clears on a clean `BulkEnd`" clause (v9.9.31, round-42
+       Codex H5: `JOURNAL-END` carries and validates the exact
+       current repair ID plus the journal epoch/terminal
+       sequence, and ONLY that validation discharges the
+       negotiated repair obligation; a crash before the marker
+       leaves the obligation armed and the partial journal is
+       superseded by a new full repair; the normative §5.8 wire
+       schema gains `repair_cutoff_epoch` on `BulkStart`, the
+       repair-ID echo on the bulk markers, the optional declared
+       member count, and the `JOURNAL-END` frame — additive,
+       rolling-gated like the identity tails); a sender crash/restart mid-repair is equally
        pinned (v9.9.30, round-42 SMR F5: the obligation stays
        undischarged BY DESIGN, and the sender's NEW incarnation
        — new `origin_process_nonce` — supersedes every
@@ -1504,18 +1554,36 @@ attacker-poisonable):**
        visibility rule: row application becomes live immediately
        today (`sync_conn_gen.go:452`, `session_store.go:257`)):
        the staged rows apply to an INVISIBLE shadow store (not
-       visible to lookups), committed by ONE atomic visibility
-       switch at `BulkEnd` validation (a commit-epoch/root swap)
-       — or rolled back completely on failure: no partial
-       visibility ever, and the v9.9.28 SMR F4 intermediate-state
-       concern disappears with the shadow; the shadow's cost and
-       read semantics are stated (v9.9.30, round-42 SMR F4: at
-       most one additional configured table's memory during a
-       repair — accepted: repairs are rare and the budget is
-       capacity-based, so the shadow is bounded by the same
-       capacity; and the visibility switch is an RCU-style
-       root/epoch swap, so in-flight lookups holding the old
-       root complete safely); and a bulk
+       visible to lookups), committed atomically at `BulkEnd`
+       validation — with the commit's REAL storage semantics and
+       the capacity contract stated (v9.9.31, round-42 Codex B4:
+       "a legitimate full table always fits" is FALSE for
+       asymmetric peers — import capacity derives from the
+       receiving node's own workers and limits
+       (`session_import.rs:24, :61`), and the control plane
+       explicitly recognizes a larger peer can legitimately
+       exceed a smaller receiver (`protocol_status.go:259`) — so
+       capacity compatibility is an HA-READINESS PREREQUISITE
+       negotiated at the handshake (peers exchange capacity; an
+       asymmetric pair reports a DEFINED DEGRADED STATE — HA
+       repair incomplete-by-config, operator-visible — rather
+       than looping rollback/retry forever); and the atomic
+       root swap has no matching storage primitive — session,
+       DNAT, and conntrack are SEPARATE fixed BPF maps updated
+       per key (`bpf_maps.rs:8`, `bpf_map/mod.rs:48`), companion
+       rows published sequentially (`session_store.go:257`), and
+       a whole-root swap would lose a locally-authoritative E2
+       admitted after shadow creation: the commit is a QUIESCED
+       REBUILD with explicit availability semantics — dataplane
+       lookups pause briefly (a bounded, stated unavailability
+       window for a repair event), the maps are rebuilt from the
+       shadow with LOCALLY-AUTHORITATIVE entries admitted after
+       shadow creation MERGED AND REVALIDATED at commit
+       (peer-owned state comes from the shadow;
+       locally-authoritative state is preserved by the merge,
+       never root-swapped away), and lookups resume — or the
+       whole repair rolls back, with no partial visibility at
+       any point); and a bulk
        whose ID is not the current repair ID is WHOLLY
        NON-MUTATING — its `BulkStart` does not `resetRecvGen`,
        its installs do not publish, its BulkEnd neither
@@ -1552,8 +1620,13 @@ attacker-poisonable):**
        an ACK for obligation O1's bulk after a second overflow
        O2, must never discharge the current obligation): the
        RECEIVER keeps an INBOUND-REPAIR obligation, cleared only
-       when a CLEAN post-reset BulkEnd (loss-free, generation
-       newer than the raising-point) arrives; the SENDER keeps an
+       at the `JOURNAL-END` marker (v9.9.31, round-42 Codex H5 —
+       this supersedes the earlier "cleared on a clean post-reset
+       `BulkEnd`": `JOURNAL-END` carries and validates the exact
+       current repair ID plus the journal epoch/terminal
+       sequence, and only that validation discharges; a clean
+       `BulkEnd` commits the bulk but NEVER clears the
+       obligation); the SENDER keeps an
        OUTBOUND-BULK obligation, cleared only on the exact ACK
        for a bulk STARTED after the applicable obligation
        generation — not "any epoch ≥ pending"; and a FAILED
@@ -1858,6 +1931,32 @@ attacker-poisonable):**
        AND the hold-cell content — a worker-table mutation
        happens only after the CAS wins, so the promote-first-
        worker-then-canonical ordering can no longer split the
+       linearization) — and the cell is the ONLY ownership
+       model (v9.9.31, round-42 Codex B3: the
+       `DirectHold`/`GroupHold(Arc)` text as a TWO-counter
+       duality conflicts with the cell — a pre-conversion direct
+       token could outlive the last Arc's finalizer, or the Arc
+       finalizer and the cell count could release the same
+       credit twice: the duality collapses to reference
+       FLAVORS over the single per-credit cell counter — a
+       "direct" hold is a linear reference to the cell, a
+       "group" hold is a clonable reference to the SAME cell;
+       the Arc is only the reference mechanism and never owns a
+       count of its own, so exactly one counter exists per
+       credit and exactly one release fires at zero);
+       and the canonical side gains a coordinator-global
+       ROW VERSION on `SyncedSessionEntry` (v9.9.31 — the
+       conversion recheck cannot be the worker-local
+       `install_epoch` (`session/mod.rs:737, :1384`; the
+       canonical `SyncedSessionEntry` has no corresponding
+       version, `worker/mod.rs:375`): the canonical row version
+       is bumped by every canonical mutation, and the
+       conversion is an explicit PENDING-CONVERSION transaction
+       — prepare (read row version + identity), execute the
+       cell swap, COMMIT by CAS on the row version, with
+       promotion/reap/replacement joining the same CAS domain,
+       so the promote-first-worker-then-canonical ordering
+       (`promote.rs:99, :131`) can no longer split the
        linearization); the cell's own ordering is pinned
        (v9.9.30, round-42 SMR F3: the cell swap is
        COUNT-PRESERVING across variants (direct 1 → group 1);
@@ -2133,7 +2232,21 @@ attacker-poisonable):**
        on the external count's transition to zero —
        alternatively and equivalently, the drop site runs stage 2
        inline under the canonical lock when the count hits
-       zero; the retry queue drains from the coordinator side —
+       zero — the INLINE alternative is WITHDRAWN and the
+       queue's arm/wake is an ATOMIC ARM-THEN-RECHECK state
+       machine (v9.9.31, round-42 Codex H6: a final drop can
+       occur while canonical locks are held, so inline stage 2
+       would conflict with the lock-free finalizer rule; and the
+       naive arm order has a lost-wakeup window — a clone
+       dropping after the holder count is read but before the
+       quarantine flag is armed sees no waiter, and stage 1 then
+       queues a zero-holder family with no future wake: the
+       quarantine flag arms BEFORE the holder count is read, so
+       a drop after the read sees the flag and re-notifies;
+       queue entries are deduplicated by family key; and the
+       notification is lock-free, drained ONLY with canonical,
+       allocator, migration-gate, and queue locks released);
+       the retry queue drains from the coordinator side —
        the same drain context as the deferred-release queue —
        deduped by family key (a family re-quarantined while
        queued updates in place, v9.9.30, round-42 SMR F6)); stage 2, with
@@ -3822,7 +3935,25 @@ admitted interval):
   conversion (a peer replacement of a demoted locally-born entry
   converts the direct hold atomically — group minted owning the
   same reservation, direct count decremented in the same
-  critical section; no uncredited GroupHold). (e) the typed undo receipt — `NoChange` replay rolls
+  critical section; no uncredited GroupHold). (d6)
+  v9.9.31 failure boundaries (round-42 Codex L7): a retry
+  installed at the barrier endpoint (the RESET_GEN/RESET_ACK
+  handshake closes it; the time-barrier-only legacy path is
+  covered by the durable obligation + takeover fence); a quiet
+  LEGACY peer under the hard silence teardown (capability-scoped
+  — never torn down; `sync_test.go:4721`'s contract preserved);
+  exact per-slot publication tokens (a mutation from a revoked
+  or non-authorized token is discarded at the canonical
+  transaction); asymmetric capacity (handshake negotiation →
+  defined degraded state, never a rollback loop); shadow
+  interruption (deadline/teardown releases; no partial
+  visibility) and the locally-authoritative merge at commit;
+  O1/O2 `JOURNAL-END` correlation (only the exact repair ID +
+  terminal sequence discharges; crash-before-marker leaves the
+  obligation armed); hold-cell conversion ordering (single
+  per-credit counter, reference flavors only); and the cleanup
+  lost-wakeup interleaving (arm-before-read closes it; the
+  drop-after-read re-notifies). (e) the typed undo receipt — `NoChange` replay rolls
   back nothing (pre-existing ownership untouched), `Inserted`/
   `Retained` undo exactly their mutation, and `Replaced(old_state)`
   with a FAILED new claim reinstates the displaced record's tuple +
