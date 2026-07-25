@@ -1362,7 +1362,14 @@ attacker-poisonable):**
        barrier, so it cannot be gated by it); the setup owner
        is chosen by a STABLE node-pair ordering key (node ids,
        not address parsing); a deterministic live-fabric
-       fallback covers a failed preferred fabric; and the
+       fallback covers a failed preferred fabric; the lane is
+       type-constrained and incarnation-bound (v9.9.38, round-46
+       SMR F4: it accepts ONLY the `RESET_GEN`/`RESET_ACK`
+       frame types — every other type is dropped at demux — and
+       the reset triple's node incarnation must match the
+       peer's authenticated current incarnation, so the
+       exemption cannot smuggle session frames past the
+       barrier); and the
        connection installs only after BOTH reset triples have
        drained and ACK'd), and an
        equal-generation `RESET_ACK` is idempotent so the loser
@@ -1533,7 +1540,10 @@ attacker-poisonable):**
        (`manager_ha.go:1125`) — a T1 handler can commit its
        forward, be superseded, then resume stale reverse/DNAT
        writes: the `replace` CAS is IDEMPOTENT AND QUERYABLE —
-       on a lost ACK, Go QUERIES the registry (T2 present → the
+       on a lost ACK, Go QUERIES the registry keyed on the
+       EXACT T2 VALUE (monotone never-reused tokens — T2-present
+       means THIS attempt's commit, never a stale aborted
+       attempt's, v9.9.38, round-46 SMR F4) (T2 present → the
        commit landed; absent → retry), and the slot is STAGED
        NON-DISPATCHABLE while the outcome is uncertain, with
        bounded retry and the repair/not-ready fallback; and
@@ -1785,7 +1795,10 @@ attacker-poisonable):**
        entry must be retired explicitly, or B would stay
        not-ready for a cohort that can never import), (b) a
        clean authoritative absence (a bulk/repair whose
-       validated snapshot omits the cohort), (c) a newer
+       VALIDATED snapshot omits the cohort — only a current,
+       repair-ID-correct bulk whose `BulkEnd` validates; a
+       stale/wrong-ID repair is non-mutating and can never
+       cancel, v9.9.38, round-46 SMR F1), (c) a newer
        same-key identity, and (d) peer-incarnation retirement;
        and RETRY is driven by a bounded pending-set timer PLUS
        every state transition that can make the claim
@@ -1795,7 +1808,11 @@ attacker-poisonable):**
        (`allocator.rs:2138, :2292`), so the GC path ALSO
        notifies the set — the zero-transition hook covers direct
        holds, and the lease-GC notification covers persistent
-       ownership);
+       ownership; a retried cohort that loses P to a THIRD flow
+       re-arms against the NEW conflicting holder with the same
+       lifecycle rules (each churn cycle requires a legitimate
+       owner for P, and the bounded timer independently drives
+       retries — no livelock, v9.9.38));
        (c) a NAT tuple conflict — A's missing E1 claiming public
        P while B's different-key LOCAL E2 already owns P
        (`allocator.rs:1617, :1682`) — resolves LOCAL-AUTHORITY-
@@ -2563,7 +2580,13 @@ attacker-poisonable):**
        IMMUTABLE old-family cleanup record keyed by
        `(family, SessionIdentity, quarantine_generation)` —
        capturing the old family's companions (reverse, NAT/wire
-       aliases, the group hold) at quarantine time — and the
+       aliases, the group hold) at quarantine time — with the
+       capture ordering guaranteed (v9.9.38, round-46 SMR F3:
+       the reverse is synthesized and pre-published BEFORE
+       fan-out (`session_import.rs:104` synthesizes, `:115`
+       publishes forward, `:187` publishes the reverse), and
+       the record is captured at fan-out completion — all
+       replicas rejected — so R1 is always inside the record) — and the
        cleanup (stage 2 OR the supersession path) removes ONLY
        identity-matching old companions against that record
        before dropping G1, regardless of what currently
@@ -3821,7 +3844,11 @@ duplicate `JOURNAL_END` revalidates against it and re-ACKs
 WITHOUT re-mutating); after receipt expiry the sender mints a
 FRESH repair ID for the next attempt (a receipt is never
 reused past expiry, so a changed same-ID attempt can never be
-mistaken for the original); and every session frame is
+mistaken for the original; and a `JOURNAL_END` whose repair ID
+matches no current obligation and no live receipt is
+DISCARDED, never processed as a repair — a very-late duplicate
+of an expired repair can never mutate state, v9.9.38,
+round-46 SMR F2); and every session frame is
 presented with its connection's slot-membership token out-of-band
 (the token is per-connection metadata, not a frame field).
 The sender/receiver store lifecycle: the Go sidecar synced store gains
