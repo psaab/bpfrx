@@ -1,6 +1,6 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v7.2 — revised after round-6 reviews (Codex PLAN NO 5B/3H/1M/1L on v7; AGY single-question runs: 2 SOUND folds, 2 UNSOUND folds applied)**
+**Status: DRAFT v7.3 — revised after round-6 reviews (Codex PLAN NO 5B/3H/1M/1L) + round-7 AGY interim folds (alias-for-every-import; idle heartbeat before decay)**
 
 v1 → v2: round-1 review killed v1's architecture (attacker-writable trust
 anchor, missed reverse-NAT constructor, invalid cross-store serial merge).
@@ -614,7 +614,14 @@ attacker-poisonable):**
      currently active on this node)`, AND an imported entry additionally
      emits only after **winning the node-local shared-map delete race**
      (the reaping worker removes the shared alias first; the Close fires
-     only if the alias was present). Authority therefore follows CURRENT
+     only if the alias was present). **Every import class publishes the
+     alias at import time (v7.3, round-7 AGY Q1):** `SyncImport` and
+     `SharedMaterialize` already do (`publish_shared_session`); v7.2's
+     spec left `WorkerLocalImport` and non-NAT `fabric_ingress` imports
+     without one — the import path now publishes for ALL classes, so no
+     entry class lacks a producer ticket. The delete is atomic per key
+     under the coordinator mutex (`lock_shared_recover` — exactly one
+     worker observes `Some` on removal, round-7 AGY Q2 verified). Authority therefore follows CURRENT
      HA state with NO stored-provenance transition (no origin flip —
      round-6 Codex 1's per-worker fanout flip transaction and its
      `fabric_ingress` early-Age bypass are both moot), and the shared
@@ -1353,25 +1360,33 @@ validated baseline. The full contract (v7.2, round-6 Codex 3/4/6):
   interval, RE-BASELINE silently (baseline := current, nothing sent) —
   so a fast flow that later quiets resumes emitting with a fresh
   baseline (v7's cumulative-since-last-emit filter had a terminal
-  no-emit state, round-6 Codex 4); (iv) a per-worker bounded dirty ring
-  (~4,096 keys, drop-oldest with watermark) feeding BATCHED messages
-  (up to ~64 anchor records per control message), under a per-worker
-  AGGREGATE cap (~256 records/s, jittered — round-6 AGY Q1: per-entry
-  limits alone scale linearly with flow count; the stream is shared
-  with Open/Close installs and the peer's 4,096-message nonblocking
-  queue, `sync_conn_write.go:36`).
-- **Receiver trust decay (v7.2, round-6 Codex 4):** a wire-trusted
-  anchor side DECAYS to untrusted if not refreshed within `T_anchor`
-  (~4 × the emission interval). Without decay, a stale-but-trusted
-  standby anchor accepts blind closes in dead sequence space forever
-  (a wrong-accept window at normal blind-guess difficulty — the
-  firewall demotes on a packet the endpoint long moved past). With
-  decay, loss (ring eviction, overflow, a deliberately fast-moving
-  anchor — all observable via the watermark counter) degrades to the
-  Phase-1 refuse-biased posture instead of a permanent stale-accept
-  channel. An attacker suppressing a victim's updates (keeping the
-  anchor fast-moving, or filling the ring with permitted-client flows)
-  buys exactly that refuse-biased posture and nothing more.
+  no-emit state, round-6 Codex 4); (iv) **idle heartbeat (v7.3, round-7
+  AGY Q3):** an entry whose anchor has NOT moved since the last emit
+  (a genuinely idle flow — its anchor is exact, not stale) re-emits a
+  heartbeat at the heartbeat interval (~30 s); without it, receiver
+  trust decay would invalidate PERFECTLY ACCURATE idle anchors and
+  defeat Phase 2's entire purpose (the quiet SSH/BGP/mgmt class);
+  (v) a per-worker bounded dirty ring (~4,096 keys, drop-oldest with
+  watermark) feeding BATCHED messages (up to ~64 anchor records per
+  control message), under a per-worker AGGREGATE cap (~64 messages/s
+  ≈ 4,096 records/s, jittered — round-6 AGY Q1: per-entry limits alone
+  scale linearly; the stream is shared with Open/Close installs and the
+  peer's 4,096-message nonblocking queue, `sync_conn_write.go:36`;
+  50k idle entries at 30 s heartbeats ≈ 1.7k records/s ≈ 26
+  messages/s cluster-wide — well inside budget).
+- **Receiver trust decay (v7.3, round-6 Codex 4 + round-7 AGY Q3):** a
+  wire-trusted anchor side DECAYS to untrusted if not refreshed within
+  `T_anchor` (~4 × the 30 s heartbeat interval ≈ 120 s). Decay exists
+  for one purpose: killing the stale-accept window for anchors whose
+  flow has MOVED on (a stale-but-trusted standby anchor would otherwise
+  accept blind closes in dead sequence space forever at normal
+  blind-guess difficulty). Idle flows do not decay — their heartbeat
+  (rule iv) proves continued idleness, and their anchor is exact. A
+  flow moving too fast to emit (rule iii) stops refreshing → decays →
+  refuse-biased, exactly as designed. Loss modes (ring eviction,
+  overflow, attacker suppression via fast-moving anchors or permitted-
+  client ring filling) all degrade to the Phase-1 refuse-biased
+  posture; none produces a wrong accept.
 - **Semantics on import:** a wire-carried side lands `valid`+`trusted`
   (validated by the owner from real traffic). Stated honestly: the
   anchor is at most ~1 interval stale at failover, and a fast flow
