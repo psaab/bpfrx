@@ -77,6 +77,9 @@ reviewer (joins at /engineer on the code PR).
 | r24 | Codex | codex companion task-mrzjrwtg-0bq72q (session 019f965f-707a-76f2-bd78-5baa34dbfe6f) | NEEDS-REVISION (2 MAJOR, 4 MINOR) |
 | r24 | AGY | agy print-mode direct (agy-plan-r24.md) | PLAN-READY (0 findings) |
 | r24 | Claude SMR | in-conversation (claude-smr-plan-r24.md) | PLAN-READY-WITH-NITS (0 MAJOR, 2 MINOR — write-failure doctrine + operator-ownership pins, subsumed by Codex M1/m3) |
+| r25 | Codex | codex companion task-mrzl4988-0rbcj8 (session 019f9681-db28-79e2-b870-a05d5b58f32f) | NEEDS-REVISION (2 MAJOR, 4 MINOR) |
+| r25 | AGY | agy print-mode direct (agy-plan-r25.md) | PLAN-READY (0 findings) |
+| r25 | Claude SMR | in-conversation (claude-smr-plan-r25.md) | PLAN-READY-WITH-NITS (0 MAJOR, 2 MINOR — rationale sharpening + key remediation pointer, folded via Codex m1/m2) |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 
