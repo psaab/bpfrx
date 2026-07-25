@@ -754,11 +754,13 @@ attacker-poisonable):**
        hold; jitter is absorbed by the 4× margin.
        (c) **ONE family liveness record + ordered compare-delete
        (v8.4, round-11 Codex 2):** the family's clock lives ONLY on
-       the canonical forward entry — every family event/read/push on
+       the canonical forward entry — every family event/push on
        any member (canonical forward, canonical REVERSE
        (`ha/session_import.rs:104` — named in the family), NAT alias,
        forward-wire alias) stamps the CANONICAL record's
-       `last_touch_ns` via a helper that resolves the canonical key;
+       `last_touch_ns` via a helper that resolves the canonical key
+       (reads never stamp, per (a) — round-12 AGY caught the
+       contradictory "/read/" here);
        the sibling clones carry no clock of their own (round-11 Codex
        2's incoherent-clones defect: a NAT lookup refreshing only its
        own clone could orphan or preserve the wrong member). The
