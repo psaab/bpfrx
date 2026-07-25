@@ -1401,6 +1401,28 @@ attacker-poisonable):**
        stale reset): the peer-incarnation registry maintains
        `{current, pending, retired}` and every slot/pre-slot
        lane under ONE lock (`s.mu`): the registry admits at
+       most ONE `pending` incarnation per peer, and the
+       transition CAS includes the SETUP ADMISSION GENERATION
+       (v9.9.47, round-50 Codex B2 — a delayed PRE-AUTH setup
+       can regress the peer incarnation after a newer process
+       is current: handshakes run concurrently
+       (`sync_conn.go:388-430`), setup tracking records only
+       membership (`sync_admission.go:66-83`), authentication
+       finishes before slot installation (`sync_conn.go:100-130`),
+       and incarnations are random, not ordered
+       (`heartbeat.go:624-632`): n2 admitted and paused
+       pre-auth, n3 authenticates and becomes current, n2
+       completes — without the admission generation in the
+       CAS, n2 would be treated as "newest authenticated" and
+       retire n3, then fail installation at the
+       setup-generation fence and strand n3 un-readoptable:
+       every pre-auth admission carries a PROVISIONAL pending
+       slot keyed by its admission generation; promotion is
+       atomically coupled with slot authorization (a
+       transition that cannot authorize its slot fails
+       entirely); promotion REVOKES older unbound pre-slot
+       tokens; and n2-resume loses the CAS because its
+       admission generation predates n3's promotion); the registry admits at
        most ONE `pending` incarnation per peer (v9.9.44,
        round-49 SMR F3: a THIRD incarnation arriving while one
        is pending REPLACES the pending entry — the newest
@@ -3946,8 +3968,20 @@ reordered or extended in-frame, or an old peer would
 authenticate different bytes and reconnect-loop at
 `:401-404`); EITHER peer being v1 selects the v1 proof (a v2
 peer proving to a v1 peer uses the v1 nonce-only proof over
-the legacy prefix bytes), and every capability field is
-masked or post-authenticated on a v1-proof connection —
+the legacy prefix bytes), and on a v1-proof connection the
+capability rule is TOTAL (v9.9.47, round-50 Codex H3 — the
+v1 proof covers only the nonce (`sync_auth.go:217-224`), so
+capability bits in the HELLO are unauthenticated: an
+asymmetric `repair-vN` bit would leave one side waiting for
+`JOURNAL_ACK`, and an asymmetric identity-enforcement bit
+would permit a delete toward a key-deleting decoder
+(`sync_conn_gen.go:263-290, :493-506`): EITHER every
+capability is MASKED under v1 proof (a v1-proof connection
+offers NO negotiated capabilities — both peers fall back to
+legacy behavior for everything), OR, to preserve `repair-vN`
+on such connections, a post-wrapper authenticated
+`CAPABILITY_CONFIRM` frame carries the full tuple and a
+feature enables ONLY when both sides' CONFIRMs agree —
 "post-authenticated" meaning concretely (v9.9.46, round-50
 SMR F2): on a v1-proof connection the capability fields are
 exchanged but NOT transcript-covered; a peer wanting them
@@ -3973,8 +4007,22 @@ v2 transcript, and is negotiated independently — never
 masked);
 when BOTH peers are v2, they exchange bounded raw HELLO
 records and `AUTH_PROOF` authenticates a DOMAIN-SEPARATED,
-length-prefixed, ORDERED pair of those exact records — the
-separator being a fixed tag distinct from the v1 proof tag
+length-prefixed, ORDERED pair of those exact records — with
+ONE exact byte formula and golden vectors for both
+directions (v9.9.47, round-50 Codex H4 — the raw-record and
+field-list phrasings could conflict and independent
+implementations could compute different proofs and
+reconnect-loop (`sync_auth.go:401-404`,
+`sync_conn.go:106-110, :435-477`):
+`AUTH_PROOF_v2 = HMAC(key, tag_v2 || role ||
+prover_record || verifier_record)`, where `tag_v2` is the
+literal ASCII `xpf-cluster-sync/v2/hello-transcript`, `role`
+is one byte (`0x01` dialer / `0x02` acceptor), the records
+are the raw HELLO frames exactly as received in
+(dialer-first) order each prefixed by its u16-LE length, and
+all integers are little-endian; the golden vectors for both
+directions ship in the test plan),
+the separator being a fixed tag distinct from the v1 proof tag
 (v9.9.44, round-49 SMR F2: a different constant —
 `xpf-cluster-sync/v2/hello-transcript` — so a v2 transcript
 proof can never collide with or be mistaken for a v1 nonce
@@ -4038,7 +4086,23 @@ clears after successful lossless emission, and the legacy
 peer converges by its own invalidation and aging — the
 pre-existing legacy semantics; suppressing the obligation is
 the only safe posture, since the legacy peer can neither ACK
-nor enforce identity; and the readiness ownership is explicit
+nor enforce identity; and the DOWNGRADE TRANSITION is
+explicit (v9.9.47, round-50 Codex B1: an OUTBOUND repair
+obligation can already exist under `repair-vN` when the peer
+reconnects as legacy — capabilities are per-connection
+(`sync_auth.go`), and the INSTALL-only prime can't produce
+`JOURNAL_ACK`: obligations are keyed by `(creation protocol,
+both peer incarnations)`, and a negotiated→legacy downgrade
+either (i) persists the obligation in an explicit DEGRADED
+state until the negotiated repair returns (the takeover
+fence as backstop — never an implicit clear, because
+clearing on emission would treat an unacknowledged prime as
+repair), or (ii) ATOMICALLY supersedes the obligation into
+the documented LEGACY BASELINE after a post-reset prime that
+is itself a fresh incarnation-scoped act; and a legacy
+`BulkEnd` NEVER clears a negotiated (repair-ID-bound)
+obligation implicitly — the matrix's legacy-completion class
+applies only to obligations CREATED as legacy); and the readiness ownership is explicit
 (v9.9.46, round-50 SMR F1: the new node's transfer-readiness
 for the install-only prime gates on its OWN sync state and
 the lossless emission — never on the legacy peer's state,
