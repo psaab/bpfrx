@@ -2217,7 +2217,11 @@ admitted interval):
   invalidation/conditional deletes are NOT sent at all — the legacy
   peer's own invalidation pass deletes its own E1s with the old
   gen-based semantics (master's pre-existing behavior), while plain
-  owner-validated Close deltas continue; (h) the durable
+  owner-validated Close deltas are SUPPRESSED toward the legacy peer
+  too (a Close is incarnation-dependent by construction — the legacy
+  receiver's key-based application cannot distinguish E1 from a
+  re-seeded E2 sharing the tuple, so suppressing it is the only safe
+  posture); (h) the durable
   coordinator-owned escrow: lifetime independent of command permits
   and of `PreservedReconcileState`, persisting across reconcile
   attempts (teardown → bring-up → failure → retry) until a dataplane
