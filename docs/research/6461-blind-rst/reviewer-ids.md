@@ -21,6 +21,9 @@
 | r6 | Codex (gpt-5.5 via codex-companion, resumed session) | task-mrzmtihg-eo9gek (19m22s, completed) | PLAN NO (5 BLOCKER, 3 HIGH, 1 MEDIUM, 1 LOW) | codex-plan-r6.md |
 | r6 | AGY (direct binary, single-question runs after 4 documented 5m timeouts) | out1-out4 (timeouts), out5 (Phase-2 pipeline), out6 (activation authority) | Q1 UNSOUND (volume cap needed, fixed v7.1), Q3 UNSOUND (lazy authority window, fixed v7.1/v7.2), Q2/Q4/Q5 SOUND | agy-plan-r6.md |
 | r6 | Claude SMR | in-conversation | PLAN NO for v7/v7.1 — all ten Codex findings confirmed + folded into v7.2 (shared-delete race authority, full Phase-2 contract, trust decay + re-baseline, final-admission commit + pending-neigh token, narrowed ack-stall residual, open_valid predicate, 1/6554 arithmetic) | claude-smr-plan-r6.md |
+| r7 | Codex (gpt-5.5 via codex-companion, resumed session) | task-mrzomipt-t7v4xi (24m07s, completed) | PLAN NO (6 BLOCKER, 2 HIGH, 2 MEDIUM, 1 LOW) | codex-plan-r7.md |
+| r7 | AGY (direct binary, scoped single-question run) | r7-agy-out1 | Q1 UNSOUND (ticket coverage — folded wrong in v7.3, corrected in v7.4), Q2 SOUND (atomic delete), Q3 UNSOUND (idle decay kills the target class — heartbeat folded v7.3/v7.4) | agy-plan-r7.md |
+| r7 | Claude SMR | in-conversation | PLAN NO for v7.2/v7.3 — all eleven Codex findings confirmed + folded into v7.4 (race narrowed to true HA-import origins, session_id CAS ticket, per-side writer ownership, phase byte, Go end-to-end protocol, lease decay, pending-neigh re-resolve) | claude-smr-plan-r7.md |
 
 Infra notes (per feedback_codex_infra_must_retry — all retries documented):
 - Codex: 10m client timeout kill → job found alive server-side → polled 25+ min →
