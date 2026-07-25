@@ -726,10 +726,12 @@ attacker-poisonable):**
        out naturally and the reservation-release/alias sweep cleans
        up (the prompt delete and RT_FLOW close record are lost — a
        telemetry/hygiene degradation, never a stale-alias hazard);
-       (b) a reverse-synth accepted close with no later packet marks
-       only the reverse entry (is_reverse → silent) — the forward
-       entry reaps at its natural timeout and emits as locally-born
-       (a producer exists, just later). The mark is incarnation-bound
+       (b) a reverse-synth accepted close marks the FULL forward
+       family atomically in the same resolve (v9.2+; the reverse entry
+       stays `is_reverse`-silent at reap) — the forward emits at its
+       2 s reap; with no later packet the emission still happens (the
+       mark was applied at accept time, not on a later hit). The mark
+       is incarnation-bound
        by entry lifetime — live state at reap time
        (closes the publish-before-command demotion window for stamped
        entries; `owner_rg_id` is now stamped on EVERY forward install
@@ -924,15 +926,21 @@ attacker-poisonable):**
        commands are claimed-before-executed: a worker CLAIMS a pending
        command before running it, and the barrier converts only
        UNCLAIMED commands to rejections at the deadline; a CLAIMED
-       command gets its execution window, and a claimed-but-never-
-       finished command converts on worker DEATH (panic unwind or
-       supervisor-detected death, `supervisor.rs:80, :98`), not on the
-       deadline — a SLOW-but-alive worker's late execution either
-       completes normally (its verify-and-retain fails cleanly if the
-       allocation was freed meanwhile, per round-19 AGY's trace: the
-       live allocation mismatches under the allocator lock, install
-       aborts, no hold is re-created on a reused port) or is cancelled
-       with the worker. `Installed` is emitted only after the side-map
+       command gets its execution window — BOUNDED by a claim PERMIT
+       with expiry (v9.9.4, round-20 Codex H4): a claimed-but-stuck
+       command whose permit expires converts `Claimed → Abandoned`
+       (the keeper releases; reconcile never pins), and the late
+       executor must RECHECK ITS PERMIT at commit time — an expired
+       permit means the verify-and-retain also fails cleanly (the
+       allocation is gone or reallocated; install aborts, no hold is
+       re-created on a reused port, per round-19 AGY's trace: the live
+       allocation mismatches under the allocator lock). A genuinely
+       dead worker's commands convert on worker DEATH (panic unwind or
+       supervisor-detected death, `supervisor.rs:80, :95-98` — death
+       is panic-only, `worker_runtime.rs:239`, so the permit-expiry
+       transition is the bound for alive-but-stuck commands; the
+       supervisor's join blocking at `worker_manager.rs:146` is then
+       irrelevant to keeper release). `Installed` is emitted only after the side-map
        token is inserted, and unlaunched-worker queues get EXPLICIT
        rejections (their queued commands contain no hold token yet,
        `runtime.rs:408` — replay queues carry pending-outcome
@@ -1041,32 +1049,74 @@ attacker-poisonable):**
        no fencing is needed, e.g. quiesced full-table rebuilds at
        bring-up, and `manager_ha.go:1771`'s mutex-drop during helper
        IPC becomes irrelevant because the fence lives entirely in the
-       helper). **Conditional control-plane selection is HELPER-AUTHORITATIVE
-       (v9.9.3, round-19 Codex B1 — the named selectors receive only
-       BPF `Key + SessionValue` whose fixed ABI omits the identity
-       fields (`maps_session.go:225`, `bpf_session_value.go:31`), so
-       capturing the incarnation at selection through the BPF-only API
-       is impossible, and an after-selection alias lookup races E2's
-       commit):** conditional delete paths — policy invalidation
-       (`daemon_policy_invalidate.go:311 → :357`), cluster-bulk
-       reconciliation (`session_store.go:626`), filtered session
-       clearing (`grpcapi/server_sessions.go:1234`) — no longer select
-       tuples in Go and delete them later. Instead Go submits the
-       filter/predicate to the helper, and the HELPER selects the
-       matching entries from its own shared aliases (which carry
-       `flow_incarnation_id`), captures the selected identities
-       atomically under the canonical lock, and deletes under the
-       alias-token fencing in one transaction — the incarnation never
-       leaves the helper, so the select→replace→delete race has no
-       window. The HA continuation is fenced the same way: the
-       peer-visible delete delta emitted by the helper carries the
-       SELECTED `(origin_process_nonce, flow_incarnation_id)` (not a
-       fresh generation over the current key —
-       `daemon_policy_invalidate.go:366`'s tombstone over
-       `sync_conn_write.go:69`/`sync_conn_gen.go:156` would otherwise
-       delete E2's standby at `sync_conn_gen.go:493` when E2 was
-       re-synced after E1's selection); the receiver applies such
-       deletes only when its stored incarnation matches. Only
+       helper). **Conditional control-plane selection is HELPER-AUTHORITATIVE with
+       TEMPORAL CUTS (v9.9.4, round-19 Codex B1 + round-20 Codex B1):
+       the named selectors receive only BPF `Key + SessionValue` whose
+       fixed ABI omits the identity fields (`maps_session.go:225`,
+       `bpf_session_value.go:31`), so capturing the incarnation at
+       selection through the BPF-only API is impossible — and a
+       HELPER-side current-state selection is still wrong for
+       HISTORICAL predicates:** Go submits the filter/predicate to the
+       helper, and the HELPER selects matching entries from its own
+       shared aliases (which carry `flow_incarnation_id`), captures
+       the selected identities atomically under the canonical lock,
+       and deletes under the alias-token fencing in one transaction —
+       the incarnation never leaves the helper, so the
+       select→replace→delete race has no window. The three predicate
+       classes get their correct temporal semantics: (a) **policy
+       invalidation** (`daemon_policy_invalidate.go:311 → :357`, which
+       runs AFTER the new policy snapshot activates,
+       `daemon_apply_commit.go:245, :256-270`, and targets OLD numeric
+       policy IDs, `daemon_policy_invalidate.go:129, :160-168,
+       :261-266` — which can collide with a different NEW policy,
+       `policies_ids.go:60`): the selection is cut by a CONFIG EPOCH
+       (a monotonic counter bumped per commit; entries stamp their
+       admission epoch at install; the invalidation predicate selects
+       only entries whose admission epoch is BEFORE the invalidated
+       snapshot's activation — a flow admitted after activation by the
+       new still-permitting version is never selected, and an
+       old-ID/new-policy collision is disambiguated by the epoch, not
+       the numeric ID); (b) **cluster-bulk cleanup**
+       (`sync.go:1069, :1080-1126` — BulkStart-snapshot-driven, with a
+       secondary→primary ownership flip expressly permitted mid-bulk,
+       `sync_test.go:1535, :1573-1585`): the delete re-validates the
+       CANDIDATE CLASS at commit time (the entry is still peer-owned
+       AND still locally absent at the moment of deletion) — a
+       locally authoritative E2 committed after the flip fails the
+       re-validation and is skipped, even though it satisfied the old
+       snapshot predicate; (c) **filtered administrative clearing**
+       (`grpcapi/server_sessions.go:1234`): current-state selection is
+       CORRECT by intent (the operator means "delete whatever matches
+       now") — but CHUNKED identically to today (≤1,024-key chunks,
+       `server_sessions.go:1193, :1216-1231, :1293-1373` — the
+       fabric-reachable collect-all O(matches) memory/CPU DoS bound),
+       with each chunk its own canonical-lock span and per-chunk
+       candidate re-validation at delete. The HA continuation is
+       handled node-locally first (v9.9.4): BOTH nodes run the same
+       policy-invalidation pass independently (each node applies the
+       same config commits and runs the same helper-authoritative
+       selection with its own fence) — each node deletes its own E1s
+       with the carried identity, so the common case needs NO
+       propagated delete and NO wire change (round-20 Codex B2's
+       contradiction between the identity fence and the no-wire
+       requirement dissolves for this case). For the residual
+       propagation still needed (asymmetric invalidation timing, where
+       one node's standby entries outlive the other's pass), the
+       session DELETE delta gains a small ADDITIVE identity tail
+       `{(origin_process_nonce, flow_incarnation_id)}` — the wire
+       framing tolerates trailing length-gated fields
+       (`sync_protocol.go:95-102, :470-497`), so this is rolling-gated
+       with an explicit honest statement: Part A has NO wire change;
+       Part B adds the additive delete tail, and a mixed-version pair
+       keeps today's gen-based unconditional delete on the old peer
+       (the documented mixed-version behavior — the E2-standby-delete
+       hazard in a mixed pair is bounded to the asymmetric-timing
+       window and stated, vs. `daemon_policy_invalidate.go:366`'s
+       fresh-generation tombstone over `sync_conn_write.go:69`/
+       `sync_conn_gen.go:156` which would otherwise delete E2's
+       standby at `sync_conn_gen.go:493` when E2 was re-synced after
+       E1's selection); the receiver applies an identity-carrying
+       delete only when its stored incarnation matches. Only
        deliberately unconditional administrative clears ("delete
        everything regardless") keep separate, unconditional semantics
        and are documented as such. **Per-operation span (normative, v9.8):** every
@@ -1125,7 +1175,8 @@ attacker-poisonable):**
        the BPF ABI drops, `bpf_session_value.go:204`). Phase 1 keeps
        master's unconditional gen-zero behavior for id-less entries
        (the mark→reap vs re-seed race is master's existing exposure,
-       documented). The blind close remains inert (no mark, no
+       documented). A refused (out-of-window or no-baseline) close
+       remains inert (no mark, no
        refresh, no accelerated reap). The close packet itself
        forwards on the current decision; packet-driven promotion
        still exists for entries imported after activation and still
@@ -1676,7 +1727,7 @@ and one ungated node, each gating only its own packet-driven marks).
   carries A's trusted fwd sides (the anchor_update op already applies
   to shared aliases), and B's observed rev samples cross-prove against
   them → B's sides become trusted → validated demote on B, better
-  than master (and blind closes refused). Writer migration (queue
+  than master (and refused blind closes never mark at all). Writer migration (queue
   re-balance) is covered by the per-side lease: the old writer's
   sides decay unless it keeps observing (its heartbeats stop when its
   observation stops — the heartbeat is an OBSERVATION refresh, not a
@@ -1746,15 +1797,32 @@ admitted interval):
   worker death; a late verify-and-retain on a freed/reused
   allocation MISMATCHES and aborts (no hold re-created on a reused
   port — the round-19 AGY trace); (e) helper-authoritative
-  conditional delete: Go submits the predicate; the helper selects
-  from its own shared aliases, captures the selected
-  `(origin_process_nonce, flow_incarnation_id)` under the canonical
-  lock, and deletes under the alias-token fencing in one
-  transaction; E1-selected → E2-replaced → the delete compares the
-  CARRIED (E1) identity and skips E2's family; the peer delete delta
-  carries the SELECTED identity (not a fresh generation over the
-  current key) and the receiver applies it only when its stored
-  incarnation matches.
+  conditional delete with TEMPORAL CUTS: Go submits the predicate;
+  the helper selects from its own shared aliases, captures the
+  selected `(origin_process_nonce, flow_incarnation_id)` under the
+  canonical lock, and deletes under the alias-token fencing in one
+  transaction — CHUNKED identically to today (≤1,024-key chunks,
+  `server_sessions.go:1193, :1216-1231, :1293-1373` — the
+  fabric-reachable collect-all O(matches) memory/CPU DoS bound),
+  with each chunk its own canonical-lock span and per-chunk candidate
+  re-validation at delete. The test schedules are the OPERATIVE
+  races (round-20 Codex M5): policy invalidation — E2 admitted AFTER
+  the new snapshot activates by the still-permitting version is
+  NEVER selected (config-epoch cut; the numeric-ID collision at
+  `policies_ids.go:60` is disambiguated by the epoch); cluster-bulk
+  cleanup — a locally authoritative E2 committed after a mid-bulk
+  secondary→primary flip (`sync_test.go:1535, :1573-1585`) FAILS the
+  commit-time candidate-class re-validation (still peer-owned AND
+  locally absent?) and is skipped; filtered clearing — current-state
+  selection deletes whatever matches now, in ≤1,024-key chunks;
+  same-`session_id`/different-process-nonce — the fence compares the
+  FULL `(origin_process_nonce, flow_incarnation_id)` pair, so a
+  post-restart E2 with the same per-worker counter value is not
+  deleted by a pre-restart E1's delta; the peer delete delta carries
+  the SELECTED identity (rolling-gated additive tail) and the
+  receiver applies it only when its stored incarnation matches (a
+  mixed-version pair falls back to today's gen-based delete,
+  documented).
 - **Trust transactions (v5, round-3 Codex 3):** authenticated sample
   REPLACES untrusted storage (planted X discarded, not blessed/max-merged);
   unauthenticated sample never clears/alters trusted state (SYN
@@ -1795,7 +1863,10 @@ admitted interval):
   tracking only.
 - **Close authority v8:** (a) a validated close on an import-class
   entry marks it and the marking worker's 2 s reap emits the
-  authoritative Close (single producer, no duplicates); (b) an
+  authoritative Close (single producer in the normal case; the
+  documented rare exception is two workers marked by a retransmitted
+  valid close before the delete lands — idempotent at the store plus
+  a bounded duplicate RT_FLOW record, round-10 Codex 7a); (b) an
   unmarked import reaps silently on every worker (no fanout
   duplication, no RT_FLOW dupes); (c) the shared-map TTL sweep purges
   a stale canonical + NAT + wire alias family after K × timeout (the
@@ -1875,7 +1946,9 @@ admitted interval):
   refcount fixes); (e) emission — the reverse-synth accept
   marks the forward family atomically (full mark semantics: sticky
   bits + reset-before-timeout recompute + last_seen + wheel push);
-  exactly one Close per flow (forward emits, reverse suppressed);
+  exactly one Close per flow in the normal case (forward emits,
+  reverse suppressed; the documented rare two-marked-workers case
+  emits an idempotent duplicate at the store);
   (f) resource-retention residual asserted: a poisoned anchor
   soft-refuses the endpoint's close; the entry is held only while the
   spray continues (bound: spray duration + one timeout); (g) wire
