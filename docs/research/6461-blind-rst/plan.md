@@ -927,20 +927,28 @@ attacker-poisonable):**
        command before running it, and the barrier converts only
        UNCLAIMED commands to rejections at the deadline; a CLAIMED
        command gets its execution window — BOUNDED by a claim PERMIT
-       with expiry (v9.9.4, round-20 Codex H4): a claimed-but-stuck
-       command whose permit expires converts `Claimed → Abandoned`
-       (the keeper releases; reconcile never pins), and the late
-       executor must RECHECK ITS PERMIT at commit time — an expired
-       permit means the verify-and-retain also fails cleanly (the
-       allocation is gone or reallocated; install aborts, no hold is
-       re-created on a reused port, per round-19 AGY's trace: the live
-       allocation mismatches under the allocator lock). A genuinely
-       dead worker's commands convert on worker DEATH (panic unwind or
-       supervisor-detected death, `supervisor.rs:80, :95-98` — death
-       is panic-only, `worker_runtime.rs:239`, so the permit-expiry
-       transition is the bound for alive-but-stuck commands; the
-       supervisor's join blocking at `worker_manager.rs:146` is then
-       irrelevant to keeper release). `Installed` is emitted only after the side-map
+       with expiry AND a single-winner terminal transition (v9.9.5,
+       round-21 Codex H4 — permit checking, allocator retain, table
+       insertion, side-map insertion, and terminal outcome were
+       separate operations, so a command could retain an allocation
+       and stall mid-pipeline): the terminal state transition
+       (`Abandoned` vs `Installed`) happens FIRST at the coordinator's
+       pending map (`transition(command, state) -> winner`) — a
+       claimed-but-stuck command whose permit expires converts
+       `Claimed → Abandoned` there (the keeper releases; reconcile
+       never pins), and the late executor's FINAL step before side-map
+       insertion is `if pending_map.claim_state(cmd) == Abandoned {
+       release the retained hold immediately; abort } else { insert
+       side-map; emit Installed }` — a single winner, no split-brain,
+       and the abandoned-but-retained case releases AT THE RECHECK
+       because the worker is alive to recheck (the residual pinning
+       where RAII cannot run is bounded by worker lifetime; the
+       supervisor's panic-only death marking at `supervisor.rs:95` /
+       `worker_runtime.rs:239` covers the unwind case). A genuinely
+       dead worker's commands convert on worker DEATH
+       (`supervisor.rs:80, :95-98`, panic-only at
+       `worker_runtime.rs:239`), and the supervisor's join blocking at
+       `worker_manager.rs:146` is then irrelevant to keeper release. `Installed` is emitted only after the side-map
        token is inserted, and unlaunched-worker queues get EXPLICIT
        rejections (their queued commands contain no hold token yet,
        `runtime.rs:408` — replay queues carry pending-outcome
@@ -1016,7 +1024,9 @@ attacker-poisonable):**
        refcount (`nat/allocator.rs:1318, :1664`) — an unobserving
        sibling's AGE-reap can therefore release the live worker's
        shared allocation TODAY, on master, independent of this plan
-       (the pre-existing hazard, **filed as #6522**). The v9.4 rule
+       (the pre-existing premature-release bug this plan's holder
+       refcount fixes as Part B — **filed as #6522** for tracking,
+       since master has it today independent of this plan). The rule:
        every entry carrying a NAT hold releases it at reap and the
        allocation frees only at refcount zero — the #6522 machinery
        shipped as Part B (the forward entry's original reserve counts
@@ -1071,12 +1081,35 @@ attacker-poisonable):**
        :261-266` — which can collide with a different NEW policy,
        `policies_ids.go:60`): the selection is cut by a CONFIG EPOCH
        (a monotonic counter bumped per commit; entries stamp their
-       admission epoch at install; the invalidation predicate selects
-       only entries whose admission epoch is BEFORE the invalidated
-       snapshot's activation — a flow admitted after activation by the
-       new still-permitting version is never selected, and an
-       old-ID/new-policy collision is disambiguated by the epoch, not
-       the numeric ID); (b) **cluster-bulk cleanup**
+       admission epoch at install; the invalidation predicate selects on the STABLE ADMITTING-RULE
+       identity and the forwarding generation carried in the SAME
+       immutable policy snapshot (v9.9.5, round-21 Codex B1 — numeric
+       policy IDs are POSITIONAL and collide across configurations,
+       `policies_ids.go:52`, `session/README.md:876`: C1 inserting B
+       before A renumbers A's old ID to B while the existing alias
+       retains the number (policy re-resolution updates only the BPF
+       row, `bpf_map/mod.rs:384`), so `(old numeric ID,
+       admission_epoch < activation)` would delete still-permitted
+       flows of the displaced policy A when B is later deleted
+       (`daemon_policy_invalidate.go:62`). The rule: entries stamp the
+       admitting rule's STABLE identity (content-addressed rule hash,
+       not the positional ID) plus the immutable forwarding generation
+       at install; the invalidation predicate selects only entries
+       whose stamped stable rule identity is in the deleted set AND
+       whose stamped forwarding generation is BEFORE the invalidated
+       snapshot's generation — and because selection keys on the
+       FORWARDING generation (the snapshot that actually carries
+       policy), the split publication race (coordinator stores
+       validation then forwarding at `snapshot_refresh.rs:397`;
+       workers load validation then forwarding at `loop_body/mod.rs:462`
+       — a worker can admit under new policy while stamping old
+       validation) is closed: the stamp and the admission both come
+       from the same immutable forwarding snapshot. A usable monotonic
+       generation exists today (`manager_generation.go:33`, published
+       through `ValidationState` at `snapshot_refresh.rs:397`, and
+       `SessionEntry` already carries `install_epoch: u64` at
+       `session/mod.rs:348` — the stamp needs no layout change,
+       round-21 AGY); (b) **cluster-bulk cleanup**
        (`sync.go:1069, :1080-1126` — BulkStart-snapshot-driven, with a
        secondary→primary ownership flip expressly permitted mid-bulk,
        `sync_test.go:1535, :1573-1585`): the delete re-validates the
@@ -1093,13 +1126,28 @@ attacker-poisonable):**
        with each chunk its own canonical-lock span and per-chunk
        candidate re-validation at delete. The HA continuation is
        handled node-locally first (v9.9.4): BOTH nodes run the same
-       policy-invalidation pass independently (each node applies the
-       same config commits and runs the same helper-authoritative
-       selection with its own fence) — each node deletes its own E1s
+       policy-invalidation pass independently (the config authority
+       invalidates at `daemon_apply_commit.go:245`, and the receiving
+       secondary retains `oldActive` and performs the same clear at
+       `daemon_apply_commit.go:326` — each node deletes its own E1s
        with the carried identity, so the common case needs NO
        propagated delete and NO wire change (round-20 Codex B2's
        contradiction between the identity fence and the no-wire
-       requirement dissolves for this case). For the residual
+       requirement dissolves for this case). **Where propagation does
+       happen it is per-entry-owner-gated (v9.9.5, round-21 Codex B3):
+       today owning ANY RG enables delete sync for EVERY matched
+       forward entry (`daemon_policy_invalidate.go:294, :366`) — a
+       node owning RG1 can clear a peer-owned RG2 E1 and propagate
+       that delete to an old peer currently owning RG2 with
+       replacement E2; the sender never installed that peer-owned E1,
+       so `takeDeleteGen` returns zero (`sync_conn_gen.go:176`) and
+       the gen-zero delete applies unconditionally
+       (`sync_conn_gen.go:263`), deleting the AUTHORITATIVE E2 and its
+       NAT companions (`session_store.go:537`). The rule: an
+       invalidation delete sync is emitted only for entries whose
+       `owner_rg_id` the SENDER currently owns (per-entry owner gate);
+       a peer-owned E1 is deleted only by its owner's own pass (which
+       runs on both nodes, above). For the residual
        propagation still needed (asymmetric invalidation timing, where
        one node's standby entries outlive the other's pass), the
        session DELETE delta gains a small ADDITIVE identity tail
@@ -1631,13 +1679,15 @@ and one ungated node, each gating only its own packet-driven marks).
   timeout without event/read/touch) — no Close producer required, no
   incarnation ticket anywhere. `WorkerLocalImport` and
   fabric replicas never race (their owner worker emits directly, or
-  they stay silent). No origin flip anywhere; authority is never
-  stored, never packet-driven. Documented pre-existing: the
+  they stay silent). The authority-ARMING origin flip is never
+  driven by a CLOSING packet; the committed non-close ownership
+  promote (`SharedPromote`, `promote.rs:86-99`) remains — computed at
+  resolve, applied at the commit arm. Documented pre-existing: the
   publish-before-command demotion ordering (`state.rs:72`,
   `loop_body/mod.rs:682`) can emit an old-owner Close during the retag
   window — master has this race today; this plan does not widen it.
-  Packet-driven promotion (`SharedPromote` on a committed non-close
-  packet) remains for entries imported after activation; closing
+  Packet-driven promotion remains for entries imported after
+  activation; closing
   packets never trigger it.
 - **HA replica no-Close invariant (LOAD-BEARING, round-1 Codex B8,
   restated for v8.3):** the master's gate (`expire.rs:342-345`:
@@ -1793,8 +1843,12 @@ admitted interval):
   (c) multi-replica pending: an early `Rejected` never drops the
   keeper while later replicas are pending; (d) deadline-vs-claim:
   an unclaimed command converts to `Rejected` at the deadline; a
-  claimed command gets its execution window and converts only on
-  worker death; a late verify-and-retain on a freed/reused
+  claimed command gets its permit-bounded execution window; a
+  claimed-but-stuck command whose permit expires converts
+  `Claimed → Abandoned` at the coordinator pending map (single-winner
+  terminal transition); a late executor rechecks the permit before
+  side-map insertion — `Abandoned` releases the retained hold
+  immediately and aborts; a late verify-and-retain on a freed/reused
   allocation MISMATCHES and aborts (no hold re-created on a reused
   port — the round-19 AGY trace); (e) helper-authoritative
   conditional delete with TEMPORAL CUTS: Go submits the predicate;
