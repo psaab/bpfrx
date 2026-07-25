@@ -2111,7 +2111,14 @@ admitted interval):
   transaction — CHUNKED via the same insertion-ordered secondary index
   with a cursor position (the `Mutex<FxHashMap>` stores have no key
   ordering, `session/key.rs:9` — the index is ordered by
-  `(install_epoch, key)` and maintained alongside the map under the
+  COORDINATOR-GLOBAL immutable insertion sequence (a u64 seqno
+  allocated by an `AtomicU64` fetch_add INSIDE the map's insertion
+  lock span — round-26 AGY's cursor-safety catch: allocating outside
+  the lock lets out-of-order lock acquisition insert seq 101 before
+  seq 100, and a cursor advancing to 101 permanently skips the
+  late-inserted 100 in subsequent `seqno > cursor` scans; allocating
+  inside guarantees monotonic cursor safety) and maintained alongside
+  the map under the
   same lock exactly as `nat_reverse_index`/`forward_wire_index` are;
   the scan iterates the INDEX with a cursor position, taking the lock
   per ≤1,024-entry chunk, advancing, releasing, and resuming —
