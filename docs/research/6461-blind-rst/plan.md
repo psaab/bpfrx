@@ -1,6 +1,6 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v7.6 — revised after round-8/9 reviews (Codex r8 PLAN NO 6B/3H/1M/1L; AGY r8 3xSOUND, AGY r9 4xUNSOUND folded: universal owner_rg stamping, alias-carrying-mint producer, (epoch,seqno) lexicographic ordering, contradiction sweep)**
+**Status: DRAFT v8 — the simplification round (Codex r9 PLAN NO 7B/3H/2M/1L answered by DELETING the v7.x incarnation-ticket tower: import entries emit only when marked by a validated close, unmarked reaps stay silent as master, stranded aliases die to a shared-map TTL sweep, Go close fence via (origin_node, session_id) with a random process nonce)**
 
 v1 → v2: round-1 review killed v1's architecture (attacker-writable trust
 anchor, missed reverse-NAT constructor, invalid cross-store serial merge).
@@ -436,28 +436,34 @@ learns ONLY from packets the firewall **successfully committed to the
 wire or the local stack** — applied in the successful dispatch arms,
 never inside the session lookup or the request-build stage:
 
-- **Commit point = FINAL ADMISSION with geometry hoisted (v7.5,
-  round-8 Codex 4):** neither the request build nor the queue append is
-  the commit — cache "rewrite success" only appends a
-  `PreparedTxRequest` (`flow_cache_hit.rs:444`), slow-path enqueue
-  appends to software queues (`cos.rs:100`), and CoS admission can
-  still drop on flow-share/buffer pressure while returning `Ok(())`
-  (`cos_classify.rs:1449, :1527`; bounded pending queues evict at
-  `drain/mod.rs:33`). The anchor applies only on final-admission
-  SUCCESS — the admission layer REPORTS its drop — on all three arms
-  (transit dispatch, cache prepared-TX, LocalDelivery + fallback
-  reinjection), AND the admission stage must subsume every
-  **geometry-determined** check (MTU, slice validity, frame malformed —
-  `transmit/stage.rs:23`, `verify.rs:16`, `tunnel.rs:119`): packet
-  geometry is attacker-chosen and pairs with any chosen sequence, so a
-  geometric check left in the tail is a sequence-targeted poisoning
-  channel (an attacker walks the anchor with deliberately malformed
-  in-window packets that never transmit). The documented residual tail
-  is then ONLY runtime-capacity classes (ring fullness, alloc pressure,
-  XSK commit race, CoS handoff) — a function of aggregate state,
-  influencible only volumetrically, which is out of threat model.
-  Per-item post-XSK-commit callbacks are explicitly rejected (per-packet
-  cross-worker mutation traffic is worse than the residual).
+- **Commit point = RX-WORKER FINAL ADMISSION with geometry hoisted
+  (v8, round-9 Codex 5):** the anchor lives on the canonical forward
+  entry in the RECEIVING worker's table, but CoS can hand the request
+  to a different owner before final admission (`cos.rs:125`) — a
+  target-side admission point cannot mutate the RX worker's table
+  without a per-packet cross-worker callback (rejected: worse than the
+  residual). The anchor therefore applies at the RX worker's OWN final
+  admission point — after binding/MTU/translation/CoS-selection AND
+  after every **geometry-determined** check (MTU, slice validity,
+  frame malformed — `transmit/stage.rs:23`; packet geometry is
+  attacker-chosen and pairs with any chosen sequence, so a geometric
+  check left in the tail is a sequence-targeted poisoning channel).
+  The documented tail: (a) the CoS-owner's admission drop
+  (flow-share/buffer pressure — runtime-capacity, aggregate-state,
+  volumetric-only); (b) runtime-state UMEM slice validity
+  (`verify.rs:16` — depends on the assigned offset, not hoistable;
+  capacity class); (c) XSK commit race (capacity); (d) **the
+  tunnel/TUN/kernel-slowpath egress subset** (`tunnel.rs:119, :180`,
+  `slowpath.rs:534, :607`): async write failures INCLUDING per-packet
+  malformed/mis-sliced `EINVAL` — geometry-steerable, observable only
+  after the fact, so for GRE/WireGuard/kernel-reinjected TCP flows a
+  chosen-malformed in-window sample can advance the anchor without
+  delivery. That residual is griefing-only (soft-stall of future
+  closes; the usual 1/2^13 entry cost per planted sample), bounded to
+  the tunnel-egress subset, and documented — the alternative
+  (per-packet post-commit callbacks or a no-update-on-tunnel rule that
+  freezes tunnel anchors entirely) is worse. All other arms are
+  commit-clean.
 - **Pending-neighbor carriage (v7.2, round-6 Codex 5b):**
   `PendingNeighPacket` (`types/mod.rs:77`) currently carries no
   segment/proof token and `retry_pending_neigh`
@@ -626,96 +632,61 @@ attacker-poisonable):**
      ANY expiry, marked or not, `expire.rs:342-377`) and suppresses the
      import's RG-activation self-heal (`expire.rs:213-237`), letting a
      refused close convert a silent standby reap into an authoritative,
-     possibly accelerated, Close. **Close authority = live RG ownership
-     + a single-producer race (v7.5):** the `expire.rs:342-345` delta
-     gate becomes `!is_reverse && !is_transient_seed &&
-     owner_rg_active(entry)` where `owner_rg_active` consults the
-     entry's `metadata.owner_rg_id` against CURRENT HA state at reap
-     time (round-8 Codex 3a: this CLOSES the publish-before-command
-     demotion window for stamped entries — the worker reads live state,
-     so an entry whose RG just demoted emits nothing). **Stamping is
-     made universal first (v7.6, round-9 AGY 1):** today only promote
-     stamps (`promote.rs:93-94`); primary installs store metadata as-is
-     (`install.rs:150`) and LocalDelivery passes `owner_rg_id: 0`
-     explicitly (`poll_descriptor/mod.rs:1922`) — every forward install
-     path now stamps `owner_rg_id` from `owner_rg_for_resolution` at
-     install, so the gate covers the host-inbound victim class
-     (BGP/IKE/SSH) too. The only remaining unstamped class is the
-     #2120 held standby class (owner_rg_id==0 by design — peer-synced
-     standby holds, where silent is the correct posture), AND — for the true HA-import origins
-     (`SyncImport` / `SharedMaterialize` ONLY) — additionally emits only
-     after **winning an origin+id compare-and-delete on the node-local
-     shared alias** (v7.5, round-8 Codex 1/2: the CAS requires
-     `alias.origin ∈ {SyncImport, SharedMaterialize}` AND
-     `alias.session_id == entry.session_id` AND nonzero, atomic under
-     the coordinator mutex, `lock_shared_recover`). Three hardening
-     rules: (i) **mint-on-zero, alias-carrying mint is the producer** —
-     legacy/bulk imports can carry `session_id == 0`
-     (`session_sync.rs:274`, `install.rs:335`, `export.rs:143`); the
-     import path mints a fresh stable id (`alloc_session_id` embeds
-     worker bits, `session/mod.rs:784-790`, so two workers mint
-     DIFFERENT ids for the same key — round-9 AGY 2) and publishes the
-     alias WITH its own mint. Exactly the alias-carrying worker can win
-     the CAS — a deterministic single producer; every other mint reaps
-     silently, and the id-conditional downstream delete skips them
-     (they linger to their own natural reaps, bounded). Post-failover
-     this node is the owner, so the winning Close is authoritative
-     hygiene, matching the owner-born single-producer model; (ii) **promote publishes before it flips** —
-     `maybe_promote_synced_session` must republish the alias with the
-     entry's OWN stable id and the promoted origin BEFORE the origin
-     flip (today it flips first and republishes with id 0,
-     `promote.rs:99-131`): after republication the alias origin is no
-     longer import-class, so a stale sibling's CAS fails — the
-     `SyncImport → SharedPromote` transition no longer straddles the
-     ticket (the pre-republish window is a microseconds in-memory
-     interval inside one worker command, documented); (iii) **id-
-     conditional downstream teardown** — the Close's downstream alias/
-     worker deletes (`session_delta.rs:436, :453`, `delete_synced.rs:16`)
-     become conditional on the delta's `session_id` (already carried,
-     #4915): an E1 Close that won its CAS before E2 republished cannot
-     key-only-delete E2's aliases or entries. **`WorkerLocalImport` and
-     fabric-ingress replicas are NOT in the race (v7.4, round-7 Codex
-     1):** a `WorkerLocalImport` is the sibling replica of a LOCALLY-
-     BORN flow whose authoritative entry lives on its observing worker
-     and emits directly as today — letting a stale, unobserving sibling
-     win a ticket would delete a live owner session and release its
-     NAT allocation (`session_delta.rs:436, :453` → `delete_synced.rs:16`).
-     The sibling stays peer-synced-silent exactly as master. The CAS
-     closes the ABA hole: an E1-stale worker whose key was re-published
-     by incarnation E2 fails the id compare and reaps silently; without
-     it (`shared_ops.rs:960`'s unconditional key-only remove) E1 could
-     delete E2's alias and emit E1's stale Close. The secondary alias
-     family (NAT/forward-wire maps) is cleaned by the Close's normal
-     downstream processing (`session_delta.rs:436`); the ticket itself
-     is the canonical alias only. Authority therefore follows CURRENT
-     HA state with NO stored-provenance transition (no origin flip —
-     round-6 Codex 1's per-worker fanout flip transaction and its
-     `fabric_ingress` early-Age bypass are both moot), and the shared
-     map itself serializes producers: imports fanned to every worker
-     (`session_import.rs:215`) reap on all of them, but exactly one
-     worker wins the alias — no duplicate Closes, no RT_FLOW dupes, and
-     the stale-alias stranding (round-5 Codex 1: demotion retags make
-     BOTH copies peer-synced; shared deletion is Close-driven at
-     `session_delta.rs:406-452`; a stale shared NAT alias could
-     rematerialize after allocator reuse) dies because the winning
-     reaper deletes the alias as the price of authority. On the standby
-     nothing attempts (RG not active); demotion silences instantly;
-     VRRP-overlap double-wins across nodes are idempotent gen-rule
-     deletes (milliseconds). The winning Close carries the import's
-     stored generation, so a newer same-key incarnation (re-seeded on
-     the peer) wins the gen compare (round-6 Codex 2's gen-zero concern
-     does not apply — no Open-on-promote is required for authority).
-     The blind close remains inert (no mark, no refresh, no accelerated
-     reap). **Cross-node staleness fence (v7.5, round-8 Codex 3b):** Go
-     close processing (`daemon_ha_userspace_stream.go:393`) becomes
-     `(node_id, session_id)`-conditional — a Close deletes the cluster
-     entry only when the store's incarnation matches (id-0 legacy
-     entries keep today's unconditional behavior and churn out); a
-     stale E1 Close can never kill E2's cluster entry even when it
-     legitimately won its node-local ticket. The close packet itself
-     forwards on the current decision; packet-driven promotion still
-     exists for entries imported after activation and still skips
-     closing packets.
+     possibly accelerated, Close. **Close authority (v8 — the simplification round,
+     replacing the v7.x ticket tower):**
+     - **Gate:** the `expire.rs:342-345` delta gate becomes
+       `!is_reverse && !is_transient_seed &&
+       (owner_rg_id > 0 && owner_rg_active(owner_rg_id) ||
+        owner_rg_id == 0 && locally-born)` — live state at reap time
+       (closes the publish-before-command demotion window for stamped
+       entries; `owner_rg_id` is now stamped on EVERY forward install
+       path via `owner_rg_for_resolution` — round-9 AGY 1: today only
+       promote stamps, `promote.rs:93-94`, and LocalDelivery passes 0
+       explicitly — LocalDelivery stays owner-zero BY DESIGN since Go
+       excludes host-local sessions from HA sync,
+       `daemon_ha_userspace_stream.go:29`, so no cluster cleanup is
+       owed; the #2120 held standby class stays zero-and-silent).
+     - **Single producer WITHOUT a ticket (v8):** an import-class entry
+       (`SyncImport`/`SharedMaterialize`) emits a Close ONLY when it
+       was MARKED by a validated close (accepted per §5.4) — the
+       marking worker is the only possible producer, the close was
+       validated against a trusted anchor, and deletion is therefore
+       correct by construction. Unmarked import reaps are silent
+       (exactly master's origin rule for them). No alias CAS, no
+       mint-on-zero, no promote-ordering machinery — the v7.x
+       incarnation-ticket tower (round-9 Codex 1-3: no end-to-end
+       identity, promotion resurrection races, non-universal mints) is
+       deleted, not patched.
+     - **Stranded-alias cleanup via a TTL reaper (v8):** the hazard
+       round-5 Codex 1 found (close-first failover leaves no Close
+       producer; stale shared NAT aliases can rematerialize after
+       allocator reuse, `upsert_synced.rs:80`) is closed NOT by
+       authority semantics but by a coordinator-side **shared-map TTL
+       sweep**: the existing `refresh_owner_rgs` shared-map iteration
+       gains an age check — a shared entry with no worker refresh for
+       K × its session timeout is purged (canonical + NAT + wire
+       aliases together, under the coordinator mutex). No Close
+       producer is required; staleness is bounded by the sweep;
+       rematerialization of a stale alias is impossible past it. (The
+       Go-side floor already exists — `pkg/conntrack` GC with HA
+       delete-sync callbacks.)
+     - **Cross-node staleness fence (kept from v7.5, hardened per
+       round-9 Codex 4):** Go close processing
+       (`daemon_ha_userspace_stream.go:393`) becomes
+       `(origin_node_id, session_id)`-conditional where the id exists —
+       the Close delta carries the origin node id (additive field; the
+       Rust entry retains it from the wire import) — and Phase 2's
+       sidecar gives the Go side the ids its BPF store drops
+       (`bpf_session_value.go:204`). Node identity uses a RANDOM
+       process nonce (the `heartbeat.go:624` precedent), not a
+       wall-clock `boot_id` (timestamp collision/rollback). Phase 1
+       keeps master's unconditional gen-zero behavior for id-less
+       entries (the mark→reap vs re-seed race is master's existing
+       exposure, documented). The blind close remains inert (no mark,
+       no refresh, no accelerated reap). The close packet itself
+       forwards on the current decision; packet-driven promotion still
+       exists for entries imported after activation and still skips
+       closing packets.
    - The establishment promote additionally requires the strong OPENING
      proof (rule 4): a reverse SYN-ACK promotes OPENING→ESTABLISHED only
      when its ack lies in the IMMUTABLE `[open_ack_lo, open_ack_hi]`
@@ -1103,14 +1074,19 @@ and one ungated node, each gating only its own packet-driven marks).
   only withholds a mark, never clears one. The #3046 timeout-selection
   ordering (`reset` set before `expires_after_ns` is chosen) is preserved
   on the accepted-mark path.
-- **Close authority = live RG ownership + incarnation-CAS ticket
-  (v7.6):** the `expire.rs:342-345` delta gate is `!is_reverse &&
-  !is_transient_seed && owner_rg_active(metadata.owner_rg_id)` (live
-  state at reap time; `owner_rg_id` stamped on every forward install
-  path; the #2120 held class stays unstamped-and-silent by design);
-  `SyncImport`/`SharedMaterialize` entries additionally emit only after
-  an `(origin, session_id)` compare-and-delete on their node-local
-  shared alias (single producer via the alias-carrying mint, ABA-safe). `WorkerLocalImport` and
+- **Close authority (v8):** the `expire.rs:342-345` delta gate is
+  `!is_reverse && !is_transient_seed &&
+  (owner_rg_id > 0 && owner_rg_active(owner_rg_id) ||
+   owner_rg_id == 0 && locally-born)` (live state at reap time;
+  `owner_rg_id` stamped on EVERY forward install path; LocalDelivery
+  owner-zero by design — Go excludes host-local sessions from HA sync;
+  the #2120 held class zero-and-silent). Import-class entries
+  (`SyncImport`/`SharedMaterialize`) emit ONLY when marked by a
+  validated close (single producer = the marking worker, deletion
+  correct by construction); unmarked import reaps are silent (master's
+  rule). Stranded shared aliases are purged by the coordinator
+  shared-map TTL sweep (K × timeout without worker refresh) — no
+  Close producer required, no incarnation ticket anywhere. `WorkerLocalImport` and
   fabric replicas never race (their owner worker emits directly, or
   they stay silent). No origin flip anywhere; authority is never
   stored, never packet-driven. Documented pre-existing: the
@@ -1295,26 +1271,33 @@ admitted interval):
   installs the copy ALIVE (`closing=false, reset=false`), no Close delta
   on its later ordinary reap; non-closing materialize adopts untrusted
   tracking only.
-- **Authority ticket narrowing + CAS (v7.4, round-7 Codex 1/2):**
-  (a) a stale `WorkerLocalImport` sibling NEVER wins/emits (its owner
-  worker holds direct authority; sibling reaps silently, live owner
-  session + NAT allocation intact); (b) the ticket delete is a
-  `session_id` compare-and-delete — an E1-stale worker fails the
-  compare after E2 republishes the key (ABA) and reaps silently;
-  (c) only `SyncImport`/`SharedMaterialize` origins race; (d) the
-  secondary alias family is cleaned by the winning Close's downstream
-  processing.
-- **Phase-2 contract v7.4:** incarnation triple fences restarts and
-  id-0 local publications (race classes always carry wire ids);
-  per-side writer ownership under split RSS (each side exactly one
-  writer; field-wise merge; equal interval seqnos across workers
-  cannot collide); `established` phase byte imported (OPENING
-  failover validates under OPENING rules); Go sidecar store
-  lifecycle (Open/Anchor/Delete, snapshot locking, bulk-supersedes
-  ordering); lease-based decay (lazy at validation, owner-only
-  renewal, stale bulk never renews); retain-on-rebaseline emits the
-  next quiet interval; pending-neigh incarnation mismatch →
-  re-resolve-or-drop (never transmits the stale decision).
+- **Close authority v8:** (a) a validated close on an import-class
+  entry marks it and the marking worker's 2 s reap emits the
+  authoritative Close (single producer, no duplicates); (b) an
+  unmarked import reaps silently on every worker (no fanout
+  duplication, no RT_FLOW dupes); (c) the shared-map TTL sweep purges
+  a stale canonical + NAT + wire alias family after K × timeout (the
+  round-5 stranding) and a rematerialize after the sweep finds
+  nothing; (d) Go close processing is `(origin_node_id, session_id)`-
+  conditional where the id exists — a stale E1 Close cannot kill E2's
+  cluster entry; (e) owner_rg_id is stamped on every forward install
+  path (assert no forward entry carries 0 except the LocalDelivery and
+  #2120 held classes); (f) the demotion live-state gate: an entry
+  whose RG just demoted emits nothing at its next reap.
+- **Phase-2 contract v8:** per-direction bundles merge by
+  lexicographic `(bulk_epoch, seqno)` per bundle (same-epoch delayed
+  baseline cannot overwrite a newer incremental); the `BulkStart(E)`
+  global floor discards all older-epoch updates on receipt; a full
+  session install applies the sidecar's MERGED anchor state (no
+  trust regression on rebuild); sender `fresh` bits omit
+  observation-stale bundles (a stale sidecar value cannot resurrect
+  trust with a fresh receiver lease); observation-gated heartbeats
+  (migrated-away writers decay, keepalived flows stay fresh, totally
+  silent flows decay to refuse-biased); random process nonce
+  incarnation; per-direction writer ownership under split RSS with
+  same-node alias fanout (worker→coordinator shared map→worker, no
+  Go round trip); pending-neigh incarnation mismatch → ONE
+  deadline-preserving re-resolution then drop.
 - **Close authority = live ownership + shared-delete race (v7.2):
   (a) blind first-packet close on a pre-activation import → NO
   ownership promote (origin stays `SharedMaterialize`), no mark, no
@@ -1448,29 +1431,34 @@ validate closes until churn. Phase 2 carries the trusted anchor from the
 RG owner to the standby so a post-failover/re-import node inherits a
 validated baseline. The full contract (v7.2, round-6 Codex 3/4/6):
 
-- **Payload (~72 B, additive tail, presence-gated):**
-  `{fwd_seq_hi, fwd_ack_hi, rev_seq_hi, rev_ack_hi: u32,
-  fwd_wnd, rev_wnd: u16, valid: u8, trusted: u8, established: u8,
-  side_present: u8, fwd_open_ack_lo, fwd_open_ack_hi,
-  rev_open_ack_lo, rev_open_ack_hi: u32, side_seqno: [u32; 4],
-  node_id: u8, boot_id: u64, session_id: u64, bulk_epoch: u32}`.
-  **Incarnation = `(node_id, boot_id, session_id)` (v7.5, round-8
-  Codex 6b: the sync generation is NOT stable identity — every sweep
-  reassigns it, `sync_conn_gen.go:113`, `sync_conn_sweep.go:142`).
-  `boot_id` is the daemon boot timestamp (unique per process
-  incarnation); `session_id` is scoped by both. `side_present` is a
-  MESSAGE-presence mask distinct from the `valid`/`trusted` state
-  masks (round-8 Codex 6c): a partial writer marks only the sides it
-  owns; absent sides are left untouched by the merge (never
-  clobbered, never invalidated — a dead side is handled by the
-  lease, not by absence). Snapshot-class fields are ordered
-  explicitly (round-8 Codex 6d): OPENING endpoints are immutable per
-  incarnation (all copies agree); `established` merges monotonically
-  (OPENING→ESTABLISHED only); `wnd`s follow the corresponding side's
-  seqno. The existing payload framing tolerates trailing length-gated
-  fields (`sync_protocol.go:95-102, :470-497`); tail presence per
-  message IS the rolling gate (no bitmap — none exists in
-  `syncHeader`/the auth HELLO).
+- **Payload (two per-direction bundles, additive tail,
+  presence-gated):** `{incarnation {node_id, process_nonce: u64,
+  session_id: u64}, established: u8, fwd_open_ack_lo, fwd_open_ack_hi,
+  rev_open_ack_lo, rev_open_ack_hi: u32, bulk_epoch: u32,
+  dir[2] {seq_hi: u32, ack_hi: u32, wnd: u16, seqno: u32,
+  present: u8, valid: u8, trusted: u8, fresh: u8}}` (~70 B packed).
+  Grouping is per DIRECTION (v8, round-9 Codex 8's wnd-ordering fix):
+  each direction-observing worker versions its OWN bundle
+  (`seq_hi(D)`, `ack_hi(D)`, `wnd(D)` — all learned from D's packets)
+  with one seqno; the receiver merges per bundle with the
+  lexicographic `(bulk_epoch, seqno)` rule. **Incarnation =
+  `(node_id, process_nonce, session_id)`** — a RANDOM process nonce
+  (the `heartbeat.go:624` precedent), NOT a wall-clock boot id
+  (timestamp collision/rollback, round-9 Codex 4). `side_present` per
+  bundle distinguishes "not carried" from "carried untrusted"; absent
+  bundles are left untouched (never clobbered, never invalidated — a
+  dead bundle is handled by the lease). **`fresh` per bundle (v8,
+  round-9 Codex 8):** the sender sets it only when the bundle's last
+  local observation is younger than T_anchor — a bulk baseline or
+  update may carry ONLY fresh bundles (a sidecar value stale from
+  overflow/writer-movement/update-loss cannot resurrect time-stale
+  trust by landing with a fresh receiver lease). Snapshot-class
+  fields: OPENING endpoints immutable per incarnation; `established`
+  merges monotonically (OPENING→ESTABLISHED only). The existing
+  payload framing tolerates trailing length-gated fields
+  (`sync_protocol.go:95-102, :470-497`); tail presence per message IS
+  the rolling gate (no bitmap — none exists in `syncHeader`/the auth
+  HELLO).
 - **Channel end to end (v7.4, round-7 Codex 6):** (i) Rust→Go: a
   dedicated `AnchorUpdate` event-stream message type — current
   `MSG_SESSION_UPDATE` decodes as a full session and maps to "open"
@@ -1489,12 +1477,19 @@ validated baseline. The full contract (v7.2, round-6 Codex 3/4/6):
   the receiver installs frames immediately, `sync_conn_read.go:96`,
   and `BulkStart` resets generation guards, `sync_conn_read.go:183`).
   The epoch increments per bulk cycle; the merge rule is a
-  lexicographic `(bulk_epoch, side_seqno)` compare PER SIDE (v7.6,
-  round-9 AGY 3): apply a message's side iff its epoch is greater, or
-  equal with a strictly greater side_seqno. A delayed same-epoch
+  lexicographic `(bulk_epoch, seqno)` compare PER BUNDLE (v7.6,
+  round-9 AGY 3): apply a message's bundle iff its epoch is greater,
+  or equal with a strictly greater bundle seqno. A delayed same-epoch
   baseline (snapshot at t0) therefore cannot overwrite a newer
-  same-epoch incremental (t1 > t0 — its side_seqno is newer); an
-  older-epoch update is always discarded; (iv) Go→peer
+  same-epoch incremental (t1 > t0 — its bundle seqno is newer).
+  **Global epoch floor (v8, round-9 Codex 7):** on receiving
+  `BulkStart(E)` the receiver immediately discards any update with
+  `bulk_epoch < E` (an E−1 update queued before BulkStart can no
+  longer land after it), and a full session install applies the
+  SIDECAR'S MERGED anchor state for that key (rather than wiping it —
+  the raw full upsert's `remove_entry` at `install.rs:317` is followed
+  by an anchor re-apply from the merged sidecar, so a bulk rebuild
+  cannot regress anchor trust); (iv) Go→peer
   Rust: a matching `anchor_update` op in the helper control protocol
   (`sync_session.rs:19` today has only upsert/delete), applied IN
   PLACE (no `remove_entry`, no anchor wipe) to the shared aliases AND
@@ -1537,12 +1532,16 @@ validated baseline. The full contract (v7.2, round-6 Codex 3/4/6):
   interval, RE-BASELINE silently (baseline := current, nothing sent) —
   so a fast flow that later quiets resumes emitting with a fresh
   baseline (v7's cumulative-since-last-emit filter had a terminal
-  no-emit state, round-6 Codex 4); (iv) **idle heartbeat (v7.3, round-7
-  AGY Q3):** an entry whose anchor has NOT moved since the last emit
-  (a genuinely idle flow — its anchor is exact, not stale) re-emits a
-  heartbeat at the heartbeat interval (~60 s); without it, receiver
-  trust decay would invalidate PERFECTLY ACCURATE idle anchors and
-  defeat Phase 2's entire purpose (the quiet SSH/BGP/mgmt class);
+  no-emit state, round-6 Codex 4); (iv) **idle heartbeat, observation-gated (v8, round-9 Codex 6c):** an
+  entry the worker COMMITTED ≥1 packet for this interval with zero
+  anchor movement re-emits a heartbeat at the heartbeat interval
+  (~60 s) — a migrated-away writer stops observing and stops
+  heartbeating (its sides decay), while a keepalived quiet flow
+  (SSH/BGP/mgmt) stays fresh; without heartbeats, receiver trust decay
+  would invalidate PERFECTLY ACCURATE idle anchors and defeat Phase 2's
+  entire purpose (round-7 AGY Q3). A TOTALLY SILENT flow (no packets
+  at all) does not heartbeat — its wire anchor decays to untrusted
+  (refuse-biased until churn; the conservative posture, documented);
   (v) a per-worker bounded dirty ring (~4,096 keys, retain-on-rebaseline, drop-oldest with
   watermark) feeding BATCHED messages (up to ~256 anchor records per
   cluster message), under a NODE-GLOBAL aggregate cap (~16 messages/s,
@@ -1606,51 +1605,44 @@ validated baseline. The full contract (v7.2, round-6 Codex 3/4/6):
 
 ---
 
-## 11. Open questions for adversarial review (round 8)
+## 11. Open questions for adversarial review (round 10)
 
-1. **Authority ticket (§5.2 rule 5, §7):** race narrowed to
-   `SyncImport`/`SharedMaterialize` with an `(origin, session_id)` CAS.
-   Verify: (a) mint-on-zero is airtight — reactive materialize inherits
-   the wire id (#5212), but legacy/bulk imports can carry id 0
-   (`session_sync.rs:274`, `export.rs:143`), and the alias-carrying
-   mint is the only CAS winner (worker-embedded ids differ per worker,
-   `session/mod.rs:784-790` — confirm every entry/alias pair for one
-   key on one node converges to exactly one CAS-eligible worker);
-   (b) the winning worker's local entry and the alias it CAS-deleted
-   are the same incarnation in every path (materialize refreshes the
-   local id from the shared entry?); (c) no path exists where the
-   OWNER worker's direct emission and a racing import both fire for
-   the same incarnation (duplicate Close) — the origins are disjoint
-   (locally-born vs import) but check the promote transition doesn't
-   straddle.
-2. **Per-side writer ownership (§10.5):** a worker owns `seq_hi(D)` and
-   `ack_hi(D)` for the directions it observes. Verify the mapping is
-   total (all four sides covered under both symmetric and split
-   steering) and that field-wise merge cannot resurrect a dead side
-   (a side whose writer crashed/flow moved — the lease covers it?).
-3. **Lease decay posture (§10.5):** T_anchor=240 s with 60 s heartbeats
-   and owner-only renewal. Verify the volume recalibration under a
-   quiet-heavy cluster (50k idle + 10k active quiet) and that a stale
-   reconnect bulk cannot keep a dead anchor's lease alive (bulk lands
-   as baseline with its own lease — is that a renewal path?).
-4. **Split-steering residual (§7):** a close landing on the non-owner
-   worker soft-refuses (replica untrusted). Quantify how often a close
-   lands on the "wrong" worker under non-symmetric RSS (closes follow
-   the flow's own queue mapping like any other packet — the residual
-   is exactly the split flows, whose BOTH directions are consistently
-   split — so each direction's close lands on the worker that saw that
-   direction's traffic... which DID observe that direction! Recheck:
-   under split steering, does the reverse-direction close land on the
-   worker that observes the reverse direction (which HAS the anchor
-   sides for that direction) rather than a replica worker? If so the
-   residual may be smaller than stated — adjudicate precisely.)
-5. **Pending-neigh re-resolve (§5.2):** on incarnation mismatch the
-   retry re-resolves against the new incarnation or drops. Verify
-   re-resolution cannot loop into a second pending state without
-   bound.
-6. **Final-admission tail (§5.2):** the documented post-admission
-   classes (transmit stage/rewrite/verify/alloc, XSK commit, TUN
-   terminal) are capacity/allocation only. Name any sequence-targeted
-   steering that remains, or confirm the tail is volumetric-only.
-7. **Observability:** counter + rate-limited structured event.
+1. **Marked-only emission (v8):** an import-class entry emits Close
+   only when marked by a validated close. Verify: (a) the marking
+   worker is necessarily the reaping worker (the mark and the wheel
+   entry live in the same worker's table — any path where a marked
+   entry is re-materialized elsewhere before reap?); (b) an accepted
+   close on a STALE-anchor import (validated against an outdated but
+   trusted baseline — e.g., the flow died and the anchor is old but
+   leased) — is demote-then-delete still correct (the close was
+   validated; the flow is dead); (c) no duplicate RT_FLOW close can
+   arise (companion propagation marks both halves — both emit? or does
+   the is_reverse gate already suppress the reverse half — confirm
+   the forward half is the only emitter).
+2. **TTL sweep safety (§5.2 rule 5, §7):** a shared entry purged at
+   K × timeout without worker refresh. Verify: (a) every LIVE shared
+   entry gets worker refreshes more often than K × timeout (what
+   refreshes a shared entry on a live flow — materialize/promote/
+   replicate/refresh_owner_rgs only, or per-packet? If refresh is
+   event-driven only, can a live-but-quiet flow's alias be purged
+   under it — consequence: re-materialize creates a fresh import —
+   bounded?); (b) K's floor (≥2 × the established timeout?).
+3. **Tunnel-egress poisoning residual (§5.2 commit arms):** for
+   GRE/WireGuard/kernel-reinjected TCP, chosen-malformed in-window
+   samples can advance the anchor without delivery (griefing-only).
+   Is the subset bounded as claimed (which dispositions actually
+   reach the TUN/slowpath async writers), and is "freeze tunnel
+   anchors entirely" really worse (it would soft-refuse ALL closes
+   on tunnel-egress flows — quantify which is the smaller harm)?
+4. **Phase-2 bundle merge (§10.5):** `(bulk_epoch, seqno)` per bundle
+   + the BulkStart floor + merged full installs. Verify no
+   interleaving remains where a stale state wins, and that the
+   sidecar's merge survives a full-table rebuild (Go restart on one
+   node — the nonce fences it?).
+5. **Observation-gated heartbeats:** a keepalived flow whose
+   keepalives are pure ACKs (seg_len 0 — zero anchor movement)
+   heartbeats correctly (committed ≥1 packet, zero movement)? And a
+   totally silent flow decays — is refuse-until-churn for that class
+   acceptable to operators (documented in §2 already?).
+6. **Observability:** counter + rate-limited structured event.
    Sufficient?
