@@ -1400,7 +1400,16 @@ attacker-poisonable):**
        last-completer-wins can regress to n1 and apply its
        stale reset): the peer-incarnation registry maintains
        `{current, pending, retired}` and every slot/pre-slot
-       lane under ONE lock (`s.mu`): a different incarnation
+       lane under ONE lock (`s.mu`): the registry admits at
+       most ONE `pending` incarnation per peer (v9.9.44,
+       round-49 SMR F3: a THIRD incarnation arriving while one
+       is pending REPLACES the pending entry — the newest
+       authenticated incarnation is always authoritative; the
+       replaced pending is retired without ever becoming
+       current; and the completion CAS checks the transition
+       epoch against the CURRENT pending, so a superseded
+       pending's completion fails the CAS and cannot promote):
+       a different incarnation
        first REVOKES the current incarnation's lane tokens and
        retires it, then ATOMICALLY promotes pending and
        RELEASES the lock BEFORE closing or joining anything
@@ -3922,10 +3931,23 @@ verified at `:401`), so a whole-transcript proof and the
 nonce-only proof would reject each other and reconnect
 indefinitely: v1 peers keep the v1 nonce-only proof and the
 v1-v1 pair MASKS `reset-vN` plus every transcript-dependent
-capability (the reset lane and its frames are never offered);
+capability — enumerated EXACTLY (v9.9.44, round-49 SMR F1:
+the transcript-dependent features are the reset lane itself,
+`RESET_GEN`/`RESET_ACK`, and the reset-generation handshake,
+so the mask is `reset-vN` plus those named frames; the
+REPAIR protocol (`repair-vN`, `JOURNAL_END`/`JOURNAL_ACK`,
+`RESYNC_REQUEST`, the cutoff/marker frames) rides the
+ESTABLISHED authenticated connection, does NOT depend on the
+v2 transcript, and is negotiated independently — never
+masked);
 when BOTH peers are v2, they exchange bounded raw HELLO
 records and `AUTH_PROOF` authenticates a DOMAIN-SEPARATED,
-length-prefixed, ORDERED pair of those exact records — and
+length-prefixed, ORDERED pair of those exact records — the
+separator being a fixed tag distinct from the v1 proof tag
+(v9.9.44, round-49 SMR F2: a different constant —
+`xpf-cluster-sync/v2/hello-transcript` — so a v2 transcript
+proof can never collide with or be mistaken for a v1 nonce
+proof) — and
 the proof runs BEFORE the authenticated frame wrapper
 installs (the wrapper installs only after verification,
 `sync_auth.go:406` — the transcript is not "inside" the
