@@ -952,7 +952,7 @@ attacker-poisonable):**
        replayed entries that retained (or releases if none did — the
        flow failed to reinstall, and freeing is correct); a REJECTED
        replay command additionally performs explicit family cleanup
-       (v9.9.11, round-25 Codex H4a + round-26 Codex B3: shared state
+       (v9.9.12, round-27 Codex B3: shared state
        survives teardown (`coordinator/mod.rs:709`), replay publishes
        once and fans the same entry to EVERY worker
        (`coordinator/mod.rs:770`, `session_glue/mod.rs:838`), and a
@@ -961,18 +961,30 @@ attacker-poisonable):**
        shared family would linger; a later materialization would see
        stale E1 (`session_glue/mod.rs:1157`), fail its retain, and
        re-resolve — potentially changing the live flow's port. The
-       rule: an individual rejection only DECREMENTS the allocation's
-       pending-command count (round-26 Codex B3's mixed-outcome trace:
+       rule: an individual rejection only DECREMENTS the pending count
+       (round-26 Codex B3's mixed-outcome trace:
        W0 installs E1, retains its hold, and publishes successfully
        (`upsert_synced.rs:64`); W1 rejects; W1's cleanup carries the
        same incarnation, so alias fencing passes and deletes the
-       common family/BPF row underneath W0's live entry); the family
+       common family/BPF row underneath W0's live entry). The family
        cleanup (removing the pre-published row and the shared family
        under the alias-token fencing) runs ONLY after the FINAL
-       outcome for that entry and ONLY when `installed_count == 0`
-       (every replica rejected — the flow failed to reinstall, and
-       freeing is correct), so a mixed-outcome fanout can never delete
-       a successfully installed sibling replica). Pending
+       outcome for the complete `(incarnation, allocation, family)`
+       COHORT — the forward entry AND its synthesized reverse
+       (separate shared entries at `ha/session_import.rs:104`,
+       separately snapshotted, pre-published, and fanned out at
+       `coordinator/mod.rs:753, :771`) AND any reactive
+       materialization through `session_glue/mod.rs:1157` (which is
+       NOT counted in replay `installed_count` — a live
+       materialized holder must veto the cleanup too); cleanup runs
+       only when NO holder exists across the whole family (every
+       replay of every family entry rejected AND no live materialized
+       entry and no retained hold), serialized with non-replay retain
+       (a materialize that commits a hold before the cleanup's
+       incarnation check completes takes the family off the cleanup
+       list), so a mixed-outcome fanout or a live materialized holder
+       can never delete beneath a successfully installed or
+       materialized family member). Pending
        commands are claimed-before-executed: a worker CLAIMS a pending
        command before running it, and the barrier converts only
        UNCLAIMED commands to rejections at the deadline; a CLAIMED
@@ -1025,10 +1037,33 @@ attacker-poisonable):**
        BPF-before-consume ordering at `coordinator/mod.rs:771` is
        covered by the alias-token fencing (external deletes re-check
        the alias at delete time). The token itself is an owned, LINEAR `NatHoldToken`
-       (v9.8, round-17 Codex H3): it owns the exact allocator HANDLE
+       (v9.9.12, round-27 Codex H5): it owns the exact allocator HANDLE
        (`Arc<PortAllocator>`, `allocator.rs:742` — `SourceNatRule` has
        no stable allocator identifier, `source.rs:251`, and allocators
        are shared/reused by pool configuration, `source.rs:327, :726`),
+       AND it carries the allocation's COLLISION DOMAIN (the pool's
+       address space at retain time) so allocator changes migrate
+       safely: the `SourceNatPoolAllocatorKey` includes `pool_name`
+       (`source.rs:327`) and allocator reuse requires exact-key
+       equality (`source.rs:726`), so a name-only rename creates
+       allocator B while E1 remains held only in A — B may then assign
+       E1's public tuple to another flow, and re-resolving E1 may swap
+       its pool port mid-connection. The rule: on a config change
+       whose pool collision domain is COMPATIBLE (same address space,
+       regardless of name), the restore path MIGRATES E1's exact
+       reservation — PAT, NAT64 (`nat64.rs:915`), and address-only
+       alike — into every compatible current allocator BEFORE
+       releasing A's hold (via `reserve_flow` / `reserve_address_only`,
+       confirmed available per round-27 AGY), so B can never assign
+       E1's public tuple elsewhere (`source.rs:829`,
+       `allocator.rs:1617`'s collision is thereby prevented
+       structurally, not just detected); on a config change that
+       shrinks or replaces the collision domain incompatibly, the
+       escrow tokens for the old domain are invalidated at restore
+       time — the verify-and-retain fails cleanly and the flow
+       re-resolves, which is semantically REQUIRED because the
+       translation changed; the escrow's job is to preserve flows
+       whose collision domain is compatible),
        the flow tuple, the expected translation, and the allocation
        KIND (SNAT / NAT64 — the NAT64 allocator's equivalent identity
        scheme at `nat64.rs:915` — / address-only). It lives in a
@@ -1186,31 +1221,40 @@ attacker-poisonable):**
        update and promotion, `session/mod.rs:761, :1384`, so it is NOT
        the admission generation; the write-once field is stamped once
        at entry creation and never rewritten) — and the stamped value
-       is the CONFIG'S OWN VERSION, not any node-local generation
-       (v9.9.11.2, round-27 Codex's partial: a node-local forwarding
-       generation is explicitly node-local and advances on local FIB
-       churn, so comparing node A's stamp to node B's invalidation
-       cutoff is not ordered — a valid imported E2 could satisfy B's
-       "older than" predicate and lose its shared/NAT family; the
-       config is CLUSTER-SYNCED, so the config store's monotonic commit
-       version (`pkg/configstore`'s commit counter, round-21 AGY's
-       `store.go:88` finding) IS cluster-ordered by construction).
-       The config version rides `ForwardingState` (which gains it —
+       is the #3931 CONFIG-SYNC GENERATION (`configGenCounter`,
+       `pkg/cluster/sync_conn_config.go:222`), the authority-issued
+       epoch that IS cluster-ordered (v9.9.12, round-27 Codex B1: the
+       v9.9.11.2 citation of `store.go:88` was wrong — that is
+       `candidateGen`, a NODE-LOCAL transaction token changed by
+       candidate edits, configuration-mode transitions, rollbacks, and
+       resets (`store.go:72`, `store_gen.go:19`), and `SyncApply` bumps
+       it only when that node happens to be in configuration mode
+       (`store.go:691`), so it is not comparable across nodes: A
+       admits E2 under config C2 with local token 10; B's independent
+       candidate activity has advanced its token to 100; E2 reaches B
+       before B's C2 invalidation; comparing `10 < 100` falsely selects
+       and companion-deletes a flow already admitted under C2, and the
+       reverse skew can retain stale E1. The version is carried through
+       config apply (the receiver callback at `daemon_ha_sync.go:910`
+       currently passes only config text, not that generation — it
+       must also capture and store the generation) and rides
+       `ForwardingState` (which gains it —
        `types/forwarding.rs:33` has none today; the compiler stamps
-       the config version it was built from, so the version and the
-       policy it carries are published atomically together, closing
-       the old-validation/new-forwarding observation race at
-       `snapshot_refresh.rs:397` and `loop_body/mod.rs:462`), and the
-       invalidation cutoff is the invalidated config's version (the
-       same cluster-ordered value on every node), and BOTH selector
-       fields (`stable_rule_id_hash`, `admission_config_version`) are
-       stamped into local, shared, AND imported entries with their
-       install/import carriage defined (installed entries stamp at
-       creation from the config version the admitting snapshot was
-       built from; imported entries inherit the sender's stamp via the
-       same additive install tail that carries the incarnation — and
-       because both are the CONFIG'S version, A's stamp and B's cutoff
-       are ordered correctly); (b) **cluster-bulk cleanup**
+       the config-sync generation the snapshot was built from, so the
+       version and the policy it carries are published atomically
+       together, closing the old-validation/new-forwarding observation
+       race at `snapshot_refresh.rs:397` and `loop_body/mod.rs:462`),
+       and the invalidation cutoff is the invalidated config's
+       config-sync generation (the same cluster-ordered value on every
+       node), and BOTH selector fields (`stable_rule_id_hash`,
+       `admission_config_version`) are stamped into local, shared, AND
+       imported entries with their install/import carriage defined
+       (installed entries stamp at creation from the config-sync
+       generation the admitting snapshot was built from; imported
+       entries inherit the sender's stamp via the same additive install
+       tail that carries the incarnation — and because both are the
+       authority-issued config-sync generation, A's stamp and B's
+       cutoff are ordered correctly); (b) **cluster-bulk cleanup**
        (`sync.go:1069, :1080-1126` — BulkStart-snapshot-driven, with a
        secondary→primary ownership flip expressly permitted mid-bulk,
        `sync_test.go:1535, :1573-1585`): the delete re-validates the
@@ -1240,7 +1284,9 @@ attacker-poisonable):**
        the late-inserted 100 in subsequent `seqno > cursor` scans;
        allocating inside the insertion lock guarantees monotonic
        cursor safety — alternatively per-map seqnos, also allocated
-       inside that map's lock) — then key as tiebreak; v9.9.10,
+       inside that map's lock; the seqno is already unique per
+       allocation, so no tiebreak is needed — round-27 Codex LOW);
+       v9.9.10,
        round-25 Codex M5: `(install_epoch,
        key)` is unusable because `install_epoch` is per-worker and
        mutable (`session/mod.rs:761, :1384`) and `SessionKey` has no
@@ -1345,7 +1391,28 @@ attacker-poisonable):**
        incarnation-dependent delete is sent at all — the legacy peer
        cleans up its own E1 standby via its own aging, invalidation
        pass (both nodes run it, per v9.9.5), and TTL-sweep machinery
-       (master's pre-existing behavior, documented). A legacy receiver
+       (master's pre-existing behavior, documented). The mixed-version
+       POLICY-INVALIDATION window gets an explicit operational gate
+       (v9.9.12, round-27 Codex H6: the legacy binary publishes the
+       new policy BEFORE clearing old sessions
+       (`daemon_apply_commit.go:245`) and selects only by reused
+       numeric `PolicyID` (`daemon_policy_invalidate.go:311`) — during
+       that window, a surviving rule can inherit a deleted rule's
+       numeric slot and admit E2, and the old pass selects E2 as
+       belonging to the deleted rule and companion-deletes it
+       (`session_store.go:391`); capability negotiation cannot retrofit
+       the stable selector into an old binary. The gate: during a
+       mixed-version pair (capability unnegotiated), the NEW node
+       suppresses its own policy-invalidation pass entirely (no
+       invalidation happens on the new node during the window), and
+       the operator guidance is to sequence policy deletions outside
+       mixed-version windows (which are brief during rolling
+       upgrades); the residual — the legacy node's own local pass
+       mis-selecting E2 during that window — is an explicitly accepted
+       risk, documented, and bounded by the per-entry owner gate on
+       propagation (v9.9.5: the NEW node never propagates invalidation
+       deletes for peer-owned entries during the window, limiting the
+       kill surface to the legacy node's own local pass). A legacy receiver
        decodes only the generation (`sync_conn_read.go:150`) and
        applies gen-based deletes unconditionally (`sync_conn_gen.go:263`),
        so suppression is the only safe posture toward it); the receiver applies an identity-carrying
@@ -1772,6 +1839,35 @@ non-close path.
 
 ### 5.8 Signature/signature-shape changes (all crate-internal)
 
+**Wire schema (normative, consolidated — v9.9.12, round-27 Codex B2):**
+BOTH the session INSTALL/Open AND the session DELETE delta carry the
+additive identity tail `{(origin_process_nonce, flow_incarnation_id)}`.
+The sender/receiver store lifecycle: the Go sidecar synced store gains
+`(origin_process_nonce, flow_incarnation_id, row_version)` per entry,
+learned from the install delta, compared on delete; the install data
+for bulk and periodic resend is produced by the helper-authoritative
+ATOMIC SNAPSHOT (a new helper method acquiring the canonical hierarchy
+locks (`synced` → `nat` → `forward_wire` → indexes,
+`coordinator/session_manager.rs:12-18`) and producing `(BPF/NAT row,
+identity, row_version)` triples in one lock span); the sender's install
+pipeline RE-VALIDATES at send time that the row's current version still
+matches the snapshot's stored version (else re-resolve — closing the
+ABA trace where bulk captures E1's row while E2 replaces the tuple and
+identity and a later sidecar lookup returns I2). Today's install
+payload ends with `ConfigEpoch` and `RTFlowSessionID` at
+`sync_protocol.go:192, :485`, `SessionValue` contains neither identity
+component at `types.go:89`, `SessionDelta` has no nonce/incarnation
+pair at `entry.rs:283`, and `SyncedSessionEntry` has no pair at
+`worker/mod.rs:375` — the tail is additive on both message kinds, and
+a receiver-minted incarnation can never equal the sender's, so the
+identity must come from the wire. Bulk and periodic resend currently
+reconstruct installs from BPF rows alone (`sync_bulk.go:95`,
+`sync_conn_sweep.go:142`), whose projection deliberately drops
+sync-only fields (`bpf_session_value.go:168, :204`) — so an
+incremental Open tail would be lost on resend without the atomic
+source.
+
+
 - **Commit-hook plumbing (v5):** the §5.3 seg view is computed once per
   TCP packet at the flow-resolve stage and threaded to the per-disposition
   commit hooks (transit slow path, cache path, LocalDelivery). The anchor
@@ -2030,7 +2126,7 @@ admitted interval):
   accelerated reap and no close mark in either branch.
 - **Escrow + conditional-delete fences (v9.9.9):** (f) the stable
   logical rule ID (`<from>-><to>/<name>`, `policies_ids.go:101`) plus
-  content version and the write-once admission forwarding generation
+  content version and the write-once admission config-sync generation
   as DISTINCT fields: same-content-different-name rules never
   cross-select (the round-24 G1/G2/G3 trace); a rule edited in place
   keeps its name and is correctly selected; a renamed rule is
@@ -2135,7 +2231,7 @@ admitted interval):
   (`<from>-><to>/<name>`, `policies_ids.go:101`) disambiguates
   same-content rules by name; the numeric positional ID
   (`RuntimePolicyIndex`, `policies_ids.go:112`) is never consulted,
-  and the admission forwarding generation (write-once at entry
+  and the admission config-sync generation (write-once at entry
   creation, never rewritten — NOT `install_epoch`'s mutation counter)
   bounds the selection to entries admitted before the invalidated
   snapshot's generation); cluster-bulk
@@ -2429,8 +2525,9 @@ It is therefore split to its own research track:
 
 1. **The scope split itself (the v9 question):** Part A (the dataplane
    demote gate) closes the issue AND its HA teeth with no wire change
-   IN PART A (Part B adds the rolling-gated additive identity tails —
-   see §5.2)
+   IN PART A (Part B adds the rolling-gated additive identity tails on
+   session INSTALL/Open AND DELETE — see the normative wire schema in
+   §5.8)
    (a REFUSED — out-of-window or no-baseline — blind close never marks
    → never produces a Close delta → the 1-packet-anytime cluster-kill
    channel is dead; an in-window blind guess validates by design at the
