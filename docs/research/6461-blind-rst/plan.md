@@ -1,6 +1,6 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v7.1 — revised after round-5 reviews (Codex PLAN NO 3B/4H/1M/1L, AGY PLAN YES) + round-6 AGY interim folds (live-ownership Close authority; AnchorUpdate aggregate cap)**
+**Status: DRAFT v7.2 — revised after round-6 reviews (Codex PLAN NO 5B/3H/1M/1L on v7; AGY single-question runs: 2 SOUND folds, 2 UNSOUND folds applied)**
 
 v1 → v2: round-1 review killed v1's architecture (attacker-writable trust
 anchor, missed reverse-NAT constructor, invalid cross-store serial merge).
@@ -160,19 +160,23 @@ What the fix buys, at absolute scale:
 - Today: a **single** off-path packet with a guessed 5-tuple kills a chosen
   flow's firewall state (plus HA standby copy, plus a possible SNAT
   pool-port mid-flow swap). Attacker cost: 1 packet per ~2 s, anytime.
-- After: a blind close must land inside one of up to **three**
-  independent windows (v7 — two `seg.seq` legs + the own-ack `seg.ack`
-  leg, §5.4), each `BACK_SLACK + slack + 1` wide (slack self-bounding at
-  131,070 since raw `wnd` is u16, and `wnd` accepted only from
-  authenticated segments). Worst case (all three disjoint): floor
-  `3 × 131,073 = 393,219` values ≈ **1/10,923 per guess**; cap
-  `3 × 196,607 = 589,821` ≈ **1/7,282** (round-5 Codex 5 — the v6 text
-  counted only the two seq legs). With the two seq windows fully
-  overlapped the floor is `2W ≈ 1/16,384`; the typical case lies between.
-  At 1,000 minimum-size closes/s (~1 Mbit/s) the expected spray-to-kill
-  is **~11 s (floor) to ~7 s (cap)** of sustained spraying per kill —
-  the honest worst case, ~2^12–2^14 per guess across all configurations.
-  A precursor seed attempt can place independent guesses in BOTH the seq
+- After: a blind RST|ACK carries **two** independently chosen 32-bit
+  values — `seg.seq` (tested against the union of the two seq legs) and
+  `seg.ack` (tested against the own-ack leg, §5.4) — each leg
+  `BACK_SLACK + slack + 1` wide (slack self-bounding at 131,070 since raw
+  `wnd` is u16, and `wnd` accepted only from authenticated segments).
+  Worst case (all legs disjoint): floor `2×131,073 + 131,073 = 393,219`
+  ≈ **1/10,923 per packet**; cap `2×196,607 + 262,141 = 655,355` ≈
+  **1/6,554** (round-6 Codex 9 — leg 3 is symmetric ±slack at the cap).
+  With the two seq windows fully overlapped the floor is `2W ≈ 1/16,384`;
+  the typical case lies between. At 1,000 minimum-size closes/s
+  (~1 Mbit/s) the expected spray-to-kill is **~11 s (floor) to ~6.5 s
+  (cap)** of sustained spraying per kill. The honest framing (round-6
+  Codex 9): against an RFC 5961 endpoint's exact `RCV.NXT` coordinate the
+  firewall remains the weaker validator — the improvement is from
+  **1 packet anytime** to **~6.5–16 s of sustained spray per kill plus
+  the endpoint's own handling**, not parity with the endpoint. A
+  precursor seed attempt can place independent guesses in BOTH the seq
   and ack fields of one packet — its chances are additive even where the
   close's intervals overlap, so "seed cost == direct close cost" is
   optimistic by up to ~2× (stated, not hidden).
@@ -395,8 +399,11 @@ pub(crate) struct TcpSeqAnchor {
     rev_ack_hi: u32,  // max ack accepted on reverse segments
     fwd_wnd: u16,     // last raw advertised window, forward
     rev_wnd: u16,     // last raw advertised window, reverse
-    valid: u8,        // bit0 fwd seq, bit1 fwd ack, bit2 rev seq, bit3 rev ack
-    trusted: u8,      // same bit layout: this side may validate a close (§5.2)
+    valid: u8,        // bit0 fwd seq, bit1 fwd ack, bit2 rev seq, bit3 rev ack;
+                      // bit4 fwd OPENING interval, bit5 rev OPENING interval
+                      // (round-6 Codex 8: rule 2 requires open_valid(dir) — a
+                      // default [0,0] interval must never validate a seq=0 RST)
+    trusted: u8,      // same bit layout as valid: this side may validate a close
     _pad: [u8; 2],
     fwd_open_ack_lo: u32,  // OPENING interval lower bound (isn+1), forward — IMMUTABLE
     rev_open_ack_lo: u32,  // same, reverse (simultaneous open)
@@ -428,35 +435,37 @@ learns ONLY from packets the firewall **successfully committed to the
 wire or the local stack** — applied in the successful dispatch arms,
 never inside the session lookup or the request-build stage:
 
-- **Transit slow path:** on CONFIRMED `PendingForwardRequest` dispatch
-  enqueue (after dispatch validation — binding, MTU, translation build,
-  oversize; `dispatch/mod.rs:512-573, :728-747`), NOT at request build
-  (`forward_request.rs:264-290`) — dispatch-validation drops (MTU-fail on
-  an egress, NAT64 protocol reject of e.g. AH+TCP, binding miss) are
-  attacker-steerable per flow and must not move the anchor. "Confirmed"
-  is load-bearing (v7, round-5 Codex 6a): cross-worker
-  `enqueue_tx_owned` currently returns success after
-  `push_redirect_inbox`, which DISCARDS at capacity without error
-  (`umem/mod.rs:1257, :1305`) — the helper must report the discard and
-  the anchor applies only on true acceptance (queue pressure is
-  traffic-driven; an unreported discard is a steerable poisoning
-  channel).
-- **Cache path:** after rewrite success in the descriptor fast path (not
-  merely after the precomputed drop gate) — rewrite fallback/failure
-  (`flow_cache_hit.rs:427-555`) leaves the anchor unmoved.
-- **LocalDelivery + fallback reinjection (host-inbound AND transit
-  fallback):** on reinject acceptance (`poll_descriptor/mod.rs:5117-5139`,
-  `tx/dispatch/slow_path.rs:186-357`) — post host-admission AND post
-  reinject rate-limit/MTU/enqueue checks. This arm also covers the
-  ForwardCandidate dispatch-failure fallback (`dispatch/mod.rs:898,
-  :1378` → `slow_path.rs:223, :297`) which can successfully enqueue to a
-  tunnel or the kernel — accepted traffic that v6 left untracked
-  (round-5 Codex 6b). A firewall-originated flow's outbound direction
-  is kernel-TX (unseen); its anchor side is pinned by the inbound ACK
-  stream (cross-direction leg, §5.4).
-- **Residual (documented):** post-enqueue TX-completion failure happens
-  after the apply point; it is transient, not per-packet steerable, and
-  its worst case is the documented soft-refuse class. #2501 counter
+- **Commit point = FINAL ADMISSION (v7.2, round-6 Codex 5):** neither
+  the request build nor the queue append is the commit — cache "rewrite
+  success" only appends a `PreparedTxRequest` (`flow_cache_hit.rs:444`),
+  slow-path enqueue appends to software queues (`cos.rs:100`), and CoS
+  admission can still drop on flow-share/buffer pressure while
+  returning `Ok(())` (`cos_classify.rs:1449, :1527`; bounded pending
+  queues evict at `drain/mod.rs:33`). The anchor applies only on
+  final-admission SUCCESS — the CoS/admission layer must REPORT its
+  drop (another signature fix) — on all three arms: transit slow path
+  (dispatch final admission, after binding/MTU/translation/CoS),
+  cache path (prepared-TX final admission), LocalDelivery + the
+  ForwardCandidate dispatch-failure fallback reinjection
+  (`poll_descriptor/mod.rs:5117-5139`, `dispatch/mod.rs:898, :1378` →
+  `slow_path.rs:186-357`).
+- **Pending-neighbor carriage (v7.2, round-6 Codex 5b):**
+  `PendingNeighPacket` (`types/mod.rs:77`) currently carries no
+  segment/proof token and `retry_pending_neigh`
+  (`neighbor_dispatch.rs:156, :344`) has no `SessionTable` — a buffered
+  SYN-ACK would deliver without its establishment promote (a live flow
+  could reap on the 20 s opening trajectory), and buffered non-close
+  samples would update nothing. The packet gains a mutation token (seg
+  view + the pre-computed proof outcome, bound to the session
+  incarnation id); the retry path applies anchor updates and the staged
+  promote only on successful final enqueue; a pending-queue eviction/
+  timeout discards them. Demote marking for an ACCEPTED close stays at
+  resolve time (master parity — a close buffered for ARP already
+  demotes on master; only anchor updates and the establishment promote
+  are delivery-gated).
+- **Residual (documented):** TX-completion failure (driver/UMEM ring
+  after final admission) is the irreducible unobserved tail — not
+  per-packet steerable in any sequence-targeted way. #2501 counter
   placement is UNCHANGED (`account_packet` keeps counting attempted
   forwards at `flow_cache_hit.rs:312` / `poll_descriptor/mod.rs:3497` —
   RT_FLOW volume semantics untouched); the anchor rides its own apply
@@ -597,29 +606,36 @@ attacker-poisonable):**
      ANY expiry, marked or not, `expire.rs:342-377`) and suppresses the
      import's RG-activation self-heal (`expire.rs:213-237`), letting a
      refused close convert a silent standby reap into an authoritative,
-     possibly accelerated, Close. **Close authority instead derives from
-     LIVE RG ownership at reap time (v7.1, round-6 AGY — strictly simpler
-     than v7's origin flip):** the `expire.rs:342-345` delta gate becomes
-     `!is_reverse && !is_transient_seed && (origin is locally-born
+     possibly accelerated, Close. **Close authority = live RG ownership
+     + a single-producer race (v7.2, round-6 Codex 1/2):** the
+     `expire.rs:342-345` delta gate becomes `!is_reverse &&
+     !is_transient_seed && (origin is locally-born
      (ForwardFlow/SharedPromote/LocalMiss family) || owner_rg_id is
-     currently active on this node)`. Authority then follows CURRENT HA
-     state with no stored-provenance transition at all: on the active
-     node every reaped forward entry (owner-born, promoted, OR imported)
-     emits the Close; on the standby nothing does; demotion silences
-     instantly (`SyncImport` retag becomes cosmetic for the gate);
-     RG flaps can double-emit only during the milliseconds of VRRP
-     overlap, where duplicate deletes are idempotent under the gen
-     rules. The lazy-self-heal window AGY found (an entry reaping as
-     `SyncImport` between activation and its first wheel examination,
-     stranding Close-driven shared cleanup at `session_delta.rs:406-452`)
-     disappears: authority is computed at the reap, not stored. This
-     also fixes the round-5 Codex 1 stranding (demotion retags make
-     BOTH copies peer-synced) — the new owner's natural reaps are
-     authoritative from the moment the RG is active, and the blind close
-     remains inert (no mark, no refresh, no accelerated reap). The close
-     packet itself forwards on the current decision; packet-driven
-     promotion still exists for entries imported after activation and
-     still skips closing packets.
+     currently active on this node)`, AND an imported entry additionally
+     emits only after **winning the node-local shared-map delete race**
+     (the reaping worker removes the shared alias first; the Close fires
+     only if the alias was present). Authority therefore follows CURRENT
+     HA state with NO stored-provenance transition (no origin flip —
+     round-6 Codex 1's per-worker fanout flip transaction and its
+     `fabric_ingress` early-Age bypass are both moot), and the shared
+     map itself serializes producers: imports fanned to every worker
+     (`session_import.rs:215`) reap on all of them, but exactly one
+     worker wins the alias — no duplicate Closes, no RT_FLOW dupes, and
+     the stale-alias stranding (round-5 Codex 1: demotion retags make
+     BOTH copies peer-synced; shared deletion is Close-driven at
+     `session_delta.rs:406-452`; a stale shared NAT alias could
+     rematerialize after allocator reuse) dies because the winning
+     reaper deletes the alias as the price of authority. On the standby
+     nothing attempts (RG not active); demotion silences instantly;
+     VRRP-overlap double-wins across nodes are idempotent gen-rule
+     deletes (milliseconds). The winning Close carries the import's
+     stored generation, so a newer same-key incarnation (re-seeded on
+     the peer) wins the gen compare (round-6 Codex 2's gen-zero concern
+     does not apply — no Open-on-promote is required for authority).
+     The blind close remains inert (no mark, no refresh, no accelerated
+     reap). The close packet itself forwards on the current decision;
+     packet-driven promotion still exists for entries imported after
+     activation and still skips closing packets.
    - The establishment promote additionally requires the strong OPENING
      proof (rule 4): a reverse SYN-ACK promotes OPENING→ESTABLISHED only
      when its ack lies in the IMMUTABLE `[open_ack_lo, open_ack_hi]`
@@ -639,11 +655,27 @@ next new-sequence sample is bounded by the *reordering extent* of the
 path (in practice ≪ 64 KiB), NOT by in-flight size. The anchor can fall
 >`FWD_SLACK` behind when (a) observation is interrupted (an untracked
 stretch — the documented residuals in §7), (b) reordering extent exceeds
-`FWD_SLACK`, or (c) **a both-direction path switch** (round-2 Codex 7): a
+`FWD_SLACK`, (c) **a both-direction path switch** (round-2 Codex 7): a
 route/asymmetry flap lets seq AND cumulative-ack progress advance off-box
 together, then rejoin >slack ahead — the endpoints accepted the stretch,
 nothing retransmits near the stale anchor, and both legs stay rejected
-permanently. The consequence per flow is soft-refused legit closes +
+permanently, or (d) **an ack repair jump beyond slack** (round-6 Codex 7):
+with window scaling the effective receive window can be megabytes while
+raw `wnd` stays small; a lost segment holds the cumulative ack while
+later data buffers, and the hole-fill produces a single legal ack jump
+far beyond the ≤131,070 raw-wnd gate — `ack_hi` stalls permanently.
+Consequence is deliberately NARROW: only leg 2 (the restart-RST leg)
+consults `ack_hi(O)`; normal closes still validate via leg 1 (`seq_hi`)
+and leg 3 (the close's own ack against `seq_hi(O)` — seq tracking is
+unaffected by loss, since the firewall forwards the data). A restart-RST
+on such a stalled flow soft-refuses and the entry idles out on its
+ordinary timeout — the peer is already dead, so the residual is table
+pressure only. **wscale tracking is rejected again**: a gate wide enough
+to swallow multi-MB repair jumps (≥1 MiB) widens the blind acceptance
+interval by ~3×, and a "K dup-acks then accept the jump" repair hatch is
+stageable for free (dup acks don't advance, so they cost the attacker
+nothing — the r2 rejection applies). The scaled-window test asserts the
+documented behavior: stall confined to leg 2. The consequence per flow is soft-refused legit closes +
 ordinary-timeout aging (delivery unaffected, endpoints tear down
 normally); the aggregate version is many flows lingering to their
 established timeouts after one path event — bounded, self-healing as
@@ -735,11 +767,16 @@ all three legs is honestly stated in §2 (up to 3W disjoint ≈
    guess, §2).
 2. **OPENING** (`!established` on the FORWARD entry): both legs consult
    ONLY the IMMUTABLE per-direction interval
-   `[open_ack_lo(D̂), open_ack_hi(D̂)]` = `[isn+1, isn+SEG.LEN]`
-   (§5.1 — v7, round-5 Codex 2: the live `seq_hi` slides on any committed
-   in-window sample, which would let an attacker move the proof ceiling
-   or the self-abort coordinate at ~1/2^16 guess cost; the immutable
-   pair keeps the proof at 1/2^32 for a bare SYN, ≥ ~1/2^20 for max TFO):
+   `[open_ack_lo(D̂), open_ack_hi(D̂)]` = `[isn+1, isn+SEG.LEN]`, and each
+   leg first requires **`open_valid(direction)`** (§5.1 bit4/bit5 — set
+   only when that direction's SYN actually seeded the interval;
+   round-6 Codex 8: without the predicate the default `[0,0]` interval
+   of the un-seeded direction accepts a bare `seq=0` RST through the
+   self-abort leg). The interval is v7's immutability fix (round-5
+   Codex 2: the live `seq_hi` slides on any committed in-window sample,
+   which would let an attacker move the proof ceiling or the self-abort
+   coordinate at ~1/2^16 guess cost; the immutable pair keeps the proof
+   at 1/2^32 for a bare SYN, ≥ ~1/2^20 for max TFO):
    (a) **ack leg:** `ACK` set and `seg.ack ∈ [open_ack_lo(D̂), open_ack_hi(D̂)]`
    — RFC 9293 SYN-SENT `ISS < SEG.ACK <= SND.NXT`, covering RFC 7413
    §4.2.2 TFO partial-ack; accepts the Linux/Windows connection-refused
@@ -978,17 +1015,17 @@ and one ungated node, each gating only its own packet-driven marks).
   only withholds a mark, never clears one. The #3046 timeout-selection
   ordering (`reset` set before `expires_after_ns` is chosen) is preserved
   on the accepted-mark path.
-- **Close authority = live RG ownership (v7.1, round-6 AGY):** the
-  `expire.rs:342-345` delta gate consults CURRENT HA state
+- **Close authority = live RG ownership + shared-delete race (v7.2):**
+  the `expire.rs:342-345` delta gate consults CURRENT HA state
   (`owner_rg_id` active locally) in addition to the stored origin
-  class — authority is computed at the reap, never stored, never
-  packet-driven. Exactly one Close producer exists per RG at any moment
-  (VRRP-overlap duplicates are idempotent); demotion silences
-  immediately; the lazy self-heal window and the demotion-retag
-  stranding both disappear. Packet-driven promotion (`SharedPromote`
-  on a committed non-close packet) remains for entries imported after
-  activation; closing packets never trigger it. No stale shared NAT
-  alias can rematerialize without an authoritative deletion.
+  class, and an imported entry emits only after winning the node-local
+  shared-alias delete (the alias IS the single-producer ticket and its
+  deletion IS the cleanup). No origin flip anywhere; authority is never
+  stored, never packet-driven; the lazy self-heal window, the
+  per-worker fanout flip, the `fabric_ingress` bypass, and the
+  demotion-retag stranding are all moot. Packet-driven promotion
+  (`SharedPromote` on a committed non-close packet) remains for entries
+  imported after activation; closing packets never trigger it.
 - **HA replica no-Close invariant (LOAD-BEARING, round-1 Codex B8):**
   `expire.rs:342-345` emits Close deltas only for non-peer-synced,
   non-reverse, non-transient-seed origins; `SharedMaterialize`/`SyncImport`/
@@ -1095,8 +1132,10 @@ admitted interval):
   self-authenticates (SYN/pickup seeds trusted); materialize/import/
   reverse-synth/upsert NEVER self-authenticate — a non-close attacker
   packet materializing a shared victim plants only untrusted state, a
-  following close refuses, and the promoted entry emits NO Close delta
-  on its ordinary reap.
+  following close refuses, and the UNPROMOTED entry emits NO Close
+  delta on its ordinary reap (peer-synced origin). (A later non-close
+  packet may promote it; the then-promoted entry's natural reap DOES
+  emit Close — correct owner semantics, round-6 Codex 10.)
 - **Trust transactions (v5, round-3 Codex 3):** authenticated sample
   REPLACES untrusted storage (planted X discarded, not blessed/max-merged);
   unauthenticated sample never clears/alters trusted state (SYN
@@ -1134,18 +1173,36 @@ admitted interval):
   installs the copy ALIVE (`closing=false, reset=false`), no Close delta
   on its later ordinary reap; non-closing materialize adopts untrusted
   tracking only.
-- **Closing-never-promote + activation authority (v7, round-5 Codex
-  1/9):** (a) blind first-packet close on a pre-activation import → NO
+- **Close authority = live ownership + shared-delete race (v7.2):**
+  (a) blind first-packet close on a pre-activation import → NO
   ownership promote (origin stays `SharedMaterialize`), no mark, no
-  refresh — fully inert; self-heal unsuppressed; ordinary reap emits NO
-  Close (peer-synced origin). (b) after RG activation, the self-heal
-  HAS flipped the import to locally-authoritative origin: a blind close
-  is still refused (no mark, no refresh); the entry reaps at its TRUE
-  natural timeout and DOES emit the authoritative Close (correct
-  hygiene — the test asserts the reap was not accelerated and the
-  shared-map copy is deleted). (c) a validated post-trust close on a
-  packet-promoted entry emits the Close (owner semantics). (d) demoted
-  (old-owner) copies reap silently (`SyncImport`).
+  refresh — fully inert; ordinary reap silent (RG not active).
+  (b) post-activation: a blind close is still refused (inert); the
+  entry reaps at its TRUE natural timeout; exactly ONE worker wins the
+  shared-alias delete and emits the authoritative Close (no duplicate
+  deltas, no RT_FLOW dupes); the alias is GONE (no rematerialization).
+  (c) `fabric_ingress` imports take the same path (no early-Age
+  bypass). (d) a validated post-trust close on a packet-promoted entry
+  emits the Close. (e) demoted-node copies never attempt the race
+  (RG not active). (f) RG flap: VRRP-overlap double-wins are
+  idempotent under the gen rules. (g) a newer same-key incarnation
+  (re-seeded on the peer) wins the gen compare against a stale winning
+  Close.
+- **Phase-2 contract (v7.2):** wire tail round-trips all fields
+  (seq/ack/wnd/OPENING endpoints/seqno/session_id); `session_id`
+  mismatch discards; seqno serial-compare rejects late updates;
+  re-baseline-on-skip resumes emission after a fast stretch;
+  receiver trust decay reverts an unrefreshed wire anchor to untrusted
+  after T_anchor (stale blind-close window dies); batched aggregate cap
+  holds the 256 records/s budget under a quiet-heavy churn flood.
+- **Ack-stall residual (v7.2, round-6 Codex 7):** scaled-window loss
+  burst (repair jump > raw-wnd gate) stalls `ack_hi` — leg-2
+  restart-RST soft-refuses, legs 1/3 still validate normal closes;
+  no wscale gate widening.
+- **Pending-neigh token (v7.2):** a buffered SYN-ACK promotes only on
+  successful retry enqueue (not at buffer admission, not on eviction);
+  buffered non-close samples apply on retry; buffered accepted close
+  marks at resolve (master parity).
 - **Promote staging (v6):** closing-flagged packets never promote
   (neither in-borrow `established` nor the ownership flip); a reverse
   SYN-ACK promotes OPENING→ESTABLISHED only with `ack ∈ [isn+1,
@@ -1245,110 +1302,135 @@ an option for the synced class.)
 ### 10.5 Phase 2 (required, same feature, ordered second PR): HA-wire anchor carriage
 
 Phase 1 leaves the §2 absorbing-state residual: imported entries never
-validate closes until churn. Phase 2 carries the trusted anchor on the HA
-session-sync channel so a post-failover/re-import node inherits the
-peer's validated baseline. Spec (fully specified here — not an
-unspecified fast-follow; the feature ships as two ordered PRs under one
-gate, Phase 1 standalone-safe):
+validate closes until churn. Phase 2 carries the trusted anchor from the
+RG owner to the standby so a post-failover/re-import node inherits a
+validated baseline. The full contract (v7.2, round-6 Codex 3/4/6):
 
-- **Field:** additive per-entry tail on the session-sync delta/snapshot
-  payload: `{fwd_seq_hi, fwd_ack_hi, rev_seq_hi, rev_ack_hi: u32,
-  valid: u8, trusted: u8}` (18 B). The existing payload framing already
+- **Payload (~50 B, additive tail, presence-gated):**
+  `{fwd_seq_hi, fwd_ack_hi, rev_seq_hi, rev_ack_hi: u32,
+  fwd_wnd, rev_wnd: u16, valid: u8, trusted: u8,
+  fwd_open_ack_lo, fwd_open_ack_hi, rev_open_ack_lo, rev_open_ack_hi: u32,
+  anchor_seqno: u32, session_id: u64}`. Every field the import rule or
+  the slack arithmetic needs is on the wire (v7's 18 B tail omitted the
+  seqno, the wnds, the OPENING endpoints, and an incarnation identity —
+  round-6 Codex 3). `session_id` (#4915, already node-unique) binds the
+  anchor to the session INCARNATION: an update for a reaped/re-seeded
+  tuple whose id mismatches is discarded, so an old high-seqno update
+  can never bless a same-tuple replacement. The existing payload framing
   tolerates trailing length-gated fields (`sync_protocol.go:95-102,
-  :470-497`), so old decoders ignore the tail. **No capability bitmap is
-  needed (round-4 Codex 7a — none exists in `syncHeader`/the auth HELLO):
-  presence of the tail per-delta IS the gate.** Mixed pair: an old peer
-  sends tail-less deltas → the new node imports them zero-trust
-  (Phase-1 behavior); a new peer's tails → the old node ignores them.
-- **Transport (v7, round-5 Codex 3 — the sweep is NOT viable):** the Go
-  incremental sweep selects entries by `Created` threshold and skips
-  when NEW/CLOSED counters are unchanged (`sync_conn_sweep.go:125-137`),
-  the userspace `Sessions()` export is the anchorless BPF-compatible
-  `SessionValue` (`manager.go:387`, `types.go:15`), and the userspace
-  sweep cadence is 15 s active / 60 s idle (`manager.go:452`) — none of
-  it can observe or carry anchor changes. The anchor instead rides:
-  (i) the **Open-delta tail** at install/promote (initial carriage); and
-  (ii) a NEW **`AnchorUpdate` delta kind** on the existing Rust→Go event
-  stream, reusing the unused `MSG_SESSION_UPDATE` wire type
-  (`event_stream/codec/wire.rs:20`, `session/entry.rs:277-290`), emitted
-  per-worker from a bounded dirty ring (keys whose trusted anchor moved;
-  ~4,096 slots, drop-oldest with a watermark counter) at ≤1 update per
-  entry per second, **capped AGGREGATE (v7.1, round-6 AGY Q1: per-entry
-  limits scale linearly with flow count — a quiet-heavy cluster could
-  still inject thousands/sec into the stream shared with Open/Close
-  installs) at a per-worker global budget (~256 updates/s, jittered,
-  FIFO from the ring with drop-oldest watermark — the lossy posture
-  makes drops safe by construction)**, and **only when the anchor
-  advanced ≤ one slack since the last emit** (the quiet-flow filter:
-  a faster-moving anchor would be useless at the standby anyway — bulk
-  flows emit nothing, so steady-state volume tracks the quiet class,
-  not line rate). Only `trusted` sides are ever sent.
-- **Import semantics (v7):** in-place field update — NO `remove_entry`
-  (no anchor wipe, no index churn): each entry carries an `anchor_seqno`
-  (u32, incremented per trusted change); an `AnchorUpdate` applies only
-  when its seqno serially-exceeds the stored one, lands `valid`+`trusted`
-  for the carried sides, and leaves everything else untouched. Emission
-  is lossy-with-watermark: a dropped update just means the standby keeps
-  an older anchor (refuse-biased for fast movers — the designed
-  posture).
+  :470-497`); tail presence per message IS the rolling gate (no bitmap —
+  none exists in `syncHeader`/the auth HELLO).
+- **Channel (dedicated, not MSG_SESSION_UPDATE):** current
+  `MSG_SESSION_UPDATE` decodes as a full session and maps to "open"
+  (`eventstream.go:559` → `daemon_ha_userspace_stream.go:205` → a fresh
+  install generation + full upsert) — unusable. Phase 2 adds a dedicated
+  `AnchorUpdate` message type on the Rust→Go event stream and a matching
+  `anchor_update` op in the Rust helper control protocol
+  (`sync_session.rs:19` today has only upsert/delete), applied IN PLACE
+  (no `remove_entry`, no anchor wipe, no index churn) to the shared
+  aliases AND worker replicas; worker commands gain the operation
+  (`types/runtime.rs:408`).
+- **Go-side store + bulk (the scope guard is restated honestly):** Go
+  gains anchor fields in its synced session store (updated by
+  `AnchorUpdate`), and the authoritative reconnect bulk
+  (`sync_bulk.go:40, :95` — which enumerates the anchorless
+  BPF-compatible store and deliberately not the Rust table,
+  `daemon_ha_sync.go:974`) carries them as the same additive tail. v7's
+  "no Go behavioral change beyond decode/re-encode" was impossible
+  (round-6 Codex 3): a reconnect full-upsert of tail-less snapshots
+  would otherwise wipe a previously current quiet-flow anchor with no
+  repair. Phase 2's Go surface = the new opcode handler, the store
+  fields, and the bulk tail — no control-plane BEHAVIOR change beyond
+  those.
+- **Emission (single writer, interval seqno, aggregate budget):** only
+  the worker that OBSERVES the flow emits (the shim's flow-hash steering
+  binds both directions to one worker, so the writer is naturally
+  unique — round-6 Codex 6a). `anchor_seqno` increments per EMISSION
+  INTERVAL (per entry ≤ 1/s — not per packet; a u32 then outlives any
+  deployment at 2^31 s). Emission rules: (i) at most one update per
+  entry per interval (~1 s); (ii) emit only when the anchor advanced
+  ≤ one slack since the last BASELINE; (iii) on an over-threshold
+  interval, RE-BASELINE silently (baseline := current, nothing sent) —
+  so a fast flow that later quiets resumes emitting with a fresh
+  baseline (v7's cumulative-since-last-emit filter had a terminal
+  no-emit state, round-6 Codex 4); (iv) a per-worker bounded dirty ring
+  (~4,096 keys, drop-oldest with watermark) feeding BATCHED messages
+  (up to ~64 anchor records per control message), under a per-worker
+  AGGREGATE cap (~256 records/s, jittered — round-6 AGY Q1: per-entry
+  limits alone scale linearly with flow count; the stream is shared
+  with Open/Close installs and the peer's 4,096-message nonblocking
+  queue, `sync_conn_write.go:36`).
+- **Receiver trust decay (v7.2, round-6 Codex 4):** a wire-trusted
+  anchor side DECAYS to untrusted if not refreshed within `T_anchor`
+  (~4 × the emission interval). Without decay, a stale-but-trusted
+  standby anchor accepts blind closes in dead sequence space forever
+  (a wrong-accept window at normal blind-guess difficulty — the
+  firewall demotes on a packet the endpoint long moved past). With
+  decay, loss (ring eviction, overflow, a deliberately fast-moving
+  anchor — all observable via the watermark counter) degrades to the
+  Phase-1 refuse-biased posture instead of a permanent stale-accept
+  channel. An attacker suppressing a victim's updates (keeping the
+  anchor fast-moving, or filling the ring with permitted-client flows)
+  buys exactly that refuse-biased posture and nothing more.
 - **Semantics on import:** a wire-carried side lands `valid`+`trusted`
-  (validated by the owner from real traffic). **Stated honestly:** the
-  anchor is at most ~1 s stale at failover (per-entry emission
-  coalescing), and a fast flow advances far beyond slack in 1 s
-  (64–128 KiB ≈ 52–105 µs at 10 Gbit/s, 21–42 µs at 25 Gbit/s) — so the
-  wire anchor is EXACT for quiet and moderate flows (precisely the idle
-  SSH/BGP/IKE/management class the issue names) and REFUSE-BIASED for
-  bulk flows (which the emission filter deliberately does not even
-  carry — their closes soft-refuse post-failover until churn, the same
-  bounded residual as Phase 1, and the class whose churn cost is
-  lowest). This is the design intent, not a defect: the victims are the
-  quiet flows.
+  (validated by the owner from real traffic). Stated honestly: the
+  anchor is at most ~1 interval stale at failover, and a fast flow
+  advances far beyond slack in 1 s (64–128 KiB ≈ 52–105 µs at 10 Gbit/s,
+  21–42 µs at 25 Gbit/s) — the wire anchor is EXACT for quiet and
+  moderate flows (precisely the idle SSH/BGP/IKE/management class the
+  issue names) and REFUSE-BIASED for bulk flows (emission filter +
+  trust decay both point there; their churn cost is lowest). This is
+  the design intent: the victims are the quiet flows.
 - **Security review surface:** the wire is the cluster trusted domain
   (same as heartbeat/session sync today — an attacker who can inject
   session-sync frames already owns the table). The field adds content to
   an existing trust domain, not a new one.
-- **Scope guard:** no Go control-plane behavioral change beyond
-  decode/re-encode of the additive tail and the sweep-diff hook; the
-  Rust expire/delta origin gates stay exactly as Phase 1 leaves them.
 
 ---
 
-## 11. Open questions for adversarial review (round 6)
+## 11. Open questions for adversarial review (round 7)
 
-1. **Activation-time authority transfer (§5.2 rule 5, §7):** the
-   self-heal flip makes every activated import locally-authoritative.
-   Verify: (a) no packet-driven path can accelerate an entry's reap
-   beyond its true natural timeout (blind closes are inert — no mark,
-   no refresh — but does the activation self-heal's own re-stamp +
-   rebucket interact with a concurrent spray?); (b) exactly one Close
-   producer exists across activation/demotion cycles incl. flapping
-   RG transitions (demote retags `SyncImport`; re-activation re-heals);
-   (c) the flip needs no delta of its own (the entries are already
-   known cluster-wide — the Open-on-promote path is only for
-   post-activation imports).
-2. **Immutable OPENING interval (§5.1/§5.4 rule 2):** both legs consult
-   only `[open_ack_lo, open_ack_hi]`. Verify the sent-data-then-abort
-   residual is as small as claimed (a client aborting after sending
-   post-SYN data but before establishment RSTs beyond the interval →
-   soft-refuse inside the 20 s opening window), and that no RFC-legal
-   handshake drives the proof endpoints outside the immutable pair.
-3. **Per-stream slack (§5.4 intro):** every quantity's slack derives
-   from the RECEIVER of its stream. Verify the ack-lag bound for leg 3
-   (`wnd(D)`) against a scaled-window asymmetric pair, and that the
-   `ack_hi(D)` slide gate using `FWD_SLACK(O)` cannot stall a legit ack
-   stream (cumulative ack jumps after loss bursts — bounded by D's own
-   advertised window?).
-4. **AnchorUpdate pipeline (§10.5):** the quiet-flow emission filter
-   (≤1/entry/s, only when advance ≤ one slack) is what keeps the
-   control-plane volume inside budget. Verify the volume model (N
-   quiet flows changing anchors ≤ 1 Hz each) and the lossy-with-watermark
-   posture (a dropped update = older standby anchor = refuse-biased,
-   never a wrong accept). Is the `anchor_seqno` serial-compare import
-   rule sufficient against reordering on the event stream?
-5. **Three-leg arithmetic (§2):** worst-case ≈ 1/7,282 per blind
-   RST|ACK at the cap. Is the three-window independence claim right
-   (can the attacker really place all three guesses independently in
-   one packet), and is ~7 s at 1,000 pps still an honest "the firewall
-   is no longer the weakest link" story against endpoint RFC 5961?
-6. **Observability:** `tcp_close_seq_rejected` via worker metrics +
+1. **Shared-delete race (§5.2 rule 5, §7):** Close authority for an
+   imported entry requires winning the node-local shared-alias delete.
+   Verify: (a) the alias exists at reap time for every import class
+   (SharedMaterialize, SyncImport, WorkerLocalImport, fabric_ingress —
+   does EVERY one publish a node-local shared alias, or are there
+   import classes with no alias whose Close then never fires?); (b)
+   the delete is atomic per key under the coordinator lock; (c) the
+   winning worker's Close carries the import's stored generation (a
+   newer same-key incarnation on the peer wins the gen compare); (d)
+   owner-BORN entries keep today's direct emission (no race needed —
+   their alias is the live session's own).
+2. **Receiver trust decay + re-baseline (§10.5):** an unrefreshed wire
+   anchor reverts to untrusted after T_anchor (~4 s). Verify the
+   interaction with legit quiet flows whose keepalive period EXCEEDS
+   T_anchor (a 30 s BGP keepalive flow emits an update only when the
+   anchor MOVES — a totally idle flow emits nothing for minutes → its
+   wire anchor decays to untrusted → post-failover closes refuse until
+   the next packet re-refreshes. Is that the right posture — the anchor
+   IS stale by then — or should idle entries emit a heartbeat refresh
+   (cheap: re-emit current anchor before decay)? Adjudicate.
+3. **Final-admission apply (§5.2):** the anchor updates at final CoS/
+   admission success, with the admission layer reporting drops. Verify
+   no post-admission drop class remains except the documented
+   TX-completion tail, and that the pending-neigh token cannot be
+   replayed across a session re-seed (incarnation binding).
+4. **Leg-2 ack-stall residual (§5.2):** the design accepts `ack_hi`
+   stalls on scaled-window repair jumps >131,070 (restart-RST leg
+   soft-refuses; legs 1/3 unaffected). Check the claim that seq
+   tracking cannot stall from the same loss event (the firewall
+   forwards the data, so seq_hi advances past the hole — true for
+   downstream loss; what about loss BEFORE the firewall on the inbound
+   path — sender side — does the retransmit repair it in-window?).
+5. **OPENING open_valid predicate (§5.4 rule 2):** interval legs
+   require open_valid(direction). Any legit case where the interval
+   seeded but the bit didn't set (mid-stream pickup of a SYN-ACK —
+   does the pickup seed BOTH the rev interval (from the SYN-ACK) and
+   infer the fwd one (from its ack)?)?
+6. **Phase-2 Go surface (§10.5):** dedicated opcode + store fields +
+   bulk tail + in-place apply across shared aliases and worker
+   replicas. Verify the apply fanout cost (N workers × M updates under
+   the aggregate cap) and that the bulk tail keeps old-decoder
+   tolerance.
+7. **Observability:** `tcp_close_seq_rejected` via worker metrics +
    rate-limited structured event. Sufficient, or per-zone?
