@@ -3937,8 +3937,12 @@ indefinitely — with the mixed-version rules byte-exact
 preserved byte-for-byte — today's v1 reads its challenge from
 the fixed bytes `payload[2:34]` and always uses the nonce-only
 proof (`sync_auth.go:345-376, :387-404`), so the v2 fields
-are APPENDED after the v1 prefix via trailing-field
-tolerance, NEVER reordered (reordering would make an old peer
+ride a NEW FRAME TYPE after the untouched legacy HELLO frame
+(v9.9.45.1, round-50 SMR: the length-prefixed demux skips an
+unknown frame type by length — `handleMessage`'s switch has
+no default arm, `sync_conn_read.go`, so an old peer silently
+skips the v2 frame; the v1 HELLO's own layout is NEVER
+reordered or extended in-frame, or an old peer would
 authenticate different bytes and reconnect-loop at
 `:401-404`); EITHER peer being v1 selects the v1 proof (a v2
 peer proving to a v1 peer uses the v1 nonce-only proof over
