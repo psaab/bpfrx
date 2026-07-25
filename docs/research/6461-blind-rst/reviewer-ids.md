@@ -56,3 +56,41 @@ Infra notes (per feedback_codex_infra_must_retry — all retries documented):
 - AGY r2 convergence: first attempt hit the headless command-permission denial
   (model invoked a shell tool); retry with an explicit built-in-file-tools-only
   preamble produced the full review.
+
+## Rounds 13-31 (v9.x convergence tail — ledger backfilled at r31)
+
+Codex ran as one resumed session per arc (019f95f3-c124-7c60-9d1b-198b9629c197
+for r13-r27; 019f990b-7ec8-7f01-872a-275842ade004 for r28-r31). AGY ran via the
+working direct-binary invocation (`agy --print`, no flags, `env -C <worktree>`,
+built-in-file-tools-only preamble). Claude SMR ran in-conversation; rounds
+13-30 SMR verdicts were the fold decisions themselves (each Codex finding
+adjudicated and folded, evidenced by the per-round commit messages); the r31
+SMR review is written as a file (claude-smr-plan-r31.md). Per-round review
+outputs for r13-r30 were backfilled from .scratch/ into
+docs/research/6461-blind-rst/ at r31 (codex-plan-r<N>.md / agy-plan-r<N>.md);
+r22/r23 Codex outputs were not separately preserved — their substance is
+captured in the r24 Codex final's disposition chain (which re-verifies and
+dispositions every open finding each round).
+
+| Round | Codex verdict | AGY verdict | Plan version folded to |
+|---|---|---|---|
+| r13 | PLAN NO (2B) — v9 restructure follow-ups | PLAN YES | v9.1/v9.2 |
+| r14 | PLAN NO (2B) | PLAN YES | v9.3/v9.4 |
+| r15 | PLAN NO (3B) — token lifecycle | PLAN YES | v9.5/v9.6 |
+| r16 | PLAN NO (1B) | PLAN YES | v9.7 |
+| r17 | PLAN NO (2B) | PLAN YES | v9.8 |
+| r18 | PLAN NO (2B) | PLAN YES | v9.9 |
+| r19 | PLAN NO (1B) — temporal cuts | PLAN YES | v9.9.3/v9.9.4 |
+| r20 | PLAN NO (2B) | PLAN YES | v9.9.4/v9.9.5 |
+| r21 | PLAN NO (3B) — selector/generation | PLAN YES | v9.9.5 |
+| r22 | (not separately preserved; see r24 dispositions) | PLAN YES | v9.9.6/v9.9.7 |
+| r23 | (not separately preserved; see r24 dispositions) | PLAN YES | v9.9.8 |
+| r24 | PLAN NO (4B) — mixed-version kill, durable escrow | PLAN YES | v9.9.9 |
+| r25 | PLAN NO (3B) — legacy Close, atomic snapshot | PLAN YES | v9.9.10 |
+| r26 | PLAN NO (3B) — row-version pipeline | PLAN YES | v9.9.11 |
+| r27 | PLAN NO (4B) — config epoch, cohort | PLAN YES | v9.9.12 |
+| r28 | PLAN NO (4B) — in-place refresh, persistent migration, temporary stop | PLAN YES | v9.9.13 |
+| r29 | PLAN NO (2B) — cutover fence, mixed-version matrix | PLAN YES | v9.9.14 |
+| r30 | PLAN NO (3B/1H/1M) — mode collision, persistent INSTALL, temp stop, §9 matrix, selector inventory (session 019f990b-…-275842ade004) | PLAN YES | v9.9.15 |
+| r31 | (running — resumed session 019f990b-…-275842ade004) | PLAN YES (4xSOUND, no new traces) | — |
+| r31 SMR | — | — | claude-smr-plan-r31.md: PLAN NO for v9.9.15 — 2 self-found precision defects (persistent ADDRESS-ONLY lease arm unnamed in B2 fold; "never wire-carried in Phase 1" straggler), 3 state-explicitly nits |
