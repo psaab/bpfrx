@@ -4011,7 +4011,27 @@ offers NO negotiated capabilities — both peers fall back to
 legacy behavior for everything), OR, to preserve `repair-vN`
 on such connections, a post-wrapper authenticated
 `CAPABILITY_CONFIRM` frame carries the full tuple and a
-feature enables ONLY when both sides' CONFIRMs agree — the
+feature enables ONLY when both sides' CONFIRMs agree — with
+the ACTIVATION BARRIER pinned (v9.9.53, round-53 Codex H2:
+the wrapper and slot install at `sync_conn.go:118`, the
+receive loop starts at `:132`, and cold-prime starts
+immediately at `:138-194`, while a bulk is one live
+`BulkStart → rows → BulkEnd` transaction (`sync_bulk.go:50`)
+— a CONFIRM arriving DURING an install-only prime would
+activate `repair-vN` mid-transaction (continuing the prime
+leaves stale peer rows; switching protocols mid-window
+produces incompatible terminal processing): the
+`CAPABILITY_CONFIRM` exchange COMPLETES BEFORE slot
+installation, session dispatch, and cold-prime (the
+confirmation is part of the pre-dispatch handshake; the
+protocol class — legacy vs repair-era — is LATCHED for the
+connection's lifetime at that point; a confirmation that
+cannot complete before dispatch aborts the install and
+retries; and the documented fallback for a lazy confirm is
+to latch the protocol class for the entire transaction and,
+on the inactive→active transition, explicitly schedule a
+FRESH repair-era full bulk — never a mid-transaction
+switch); the
 negotiated feature state being PER-CONNECTION (v9.9.48,
 round-51 SMR F3: it never persists across connections — a
 reconnect re-runs the full negotiation (hello, proof,
