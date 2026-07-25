@@ -1184,23 +1184,35 @@ attacker-poisonable):**
        the surviving slot would be an availability regression;
        round-38 Codex's alternatives — an authenticated reset/ack
        signal or an unconditional cascade with an accepted
-       flap-cost — are both unnecessary): B's atomic close stops
-       its heartbeat-acks on BOTH fabrics, so A's heartbeat
-       detector (threshold 5 × 200 ms = 1 s) declares the peer
-       down and clears ANY slot whose TCP EOF has not yet
-       processed — BOTH of A's slots are empty within ~1 s
-       deterministically regardless of EOF scheduling, and a
-       one-fabric flap keeps heartbeats alive on the survivor so
-       no peer-down declaration ever fires for it (the flap
-       confusion does not exist); B holds a bounded reconnect
-       barrier (≥ 2× the heartbeat timeout + RTT margin) before
-       redialing, so A's both-empty state has long landed when the
-       first new connection installs and `wasDisconnected == true`
+       flap-cost — are both unnecessary): the detection runs on
+       EXISTING machinery at two speeds (v9.9.23.1 — constants and
+       mechanism corrected: the earlier "threshold 5 × 200 ms
+       declares the peer down" conflated the cluster-manager
+       heartbeat with the session-sync detector): (i) B's atomic
+       close delivers FIN on both fabrics within milliseconds in
+       the common case, and A's per-connection `receiveLoop`
+       treats the read error as an immediate `handleDisconnect`
+       for that slot (`sync_conn_read.go:14-30`) — both slots
+       empty in ~ms; and (ii) if a FIN is lost (partition), each
+       connection's own heartbeat-ack timeout closes it
+       independently: the `receiveLoop` sends a heartbeat request
+       after `syncReadDeadline` (10 s, `sync.go:90`) of read
+       silence and closes the connection after 2 consecutive
+       missed acks (`sync_conn_read.go:33-44`) — every slot is
+       cleared within ~20-30 s deterministically,
+       PER-CONNECTION (no peer-wide declaration is needed; each
+       slot's own detector cleans it), and a one-fabric flap
+       keeps acks flowing on the survivor so its detector never
+       fires (the flap confusion does not exist). B's reconnect
+       barrier is sized to the SLOW detector (≥ the 2-missed-ack
+       bound + RTT margin — a repair event, not a fast path), so
+       A's both-empty state has long landed when the first new
+       connection installs and `wasDisconnected == true`
        cold-primes; and B's inbound-repair obligation is DURABLE —
        a pathological miss (no bulk arrives) never clears it, and
        B escalates to a second close-both with exponential backoff
-       (the barrier grows past any feasible heartbeat-detector
-       delay, so the retry terminates).
+       (the barrier grows past any feasible detector delay, so
+       the retry terminates).
        Cold-prime then drives the sender's FULL bulk A→B with the
        config-first ordering of (3); the
        once-per-latched-epoch latch keeps this from hot-looping.
