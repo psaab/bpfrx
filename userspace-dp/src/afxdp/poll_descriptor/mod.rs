@@ -264,7 +264,10 @@ pub(super) fn poll_binding_process_descriptor(
                 // the slow-path TUN; recycle the UMEM frame. #4323: a NEW
                 // inbound IKE initiation the ingress zone's host-inbound
                 // set does not permit is denied here (silent drop) before
-                // it can reach the local IKE daemon.
+                // it can reach the local IKE daemon. #6471: a
+                // Responder-SPI-nonzero IKE packet matching NO seeded live
+                // exchange faces the same gate — a forged Responder SPI no
+                // longer rides the established exemption on a closed zone.
                 match stage_ipsec_passthrough_check(
                     flow.as_ref(),
                     packet_frame,
@@ -272,6 +275,7 @@ pub(super) fn poll_binding_process_descriptor(
                     ingress_zone_override,
                     &binding.live,
                     worker_ctx,
+                    now_ns,
                 ) {
                     IpsecPassthroughOutcome::NotClaimed => {}
                     IpsecPassthroughOutcome::Passthrough => {
@@ -279,10 +283,12 @@ pub(super) fn poll_binding_process_descriptor(
                         continue;
                     }
                     IpsecPassthroughOutcome::Denied { from_zone_id } => {
-                        // #4323: NEW inbound IKE denied by the ingress zone's
-                        // host-inbound set. Emit the tuple-rich deny event and
-                        // account the drop (GlobalCtrHostInboundDeny), then
-                        // recycle the frame — a silent drop, never a reject.
+                        // #4323/#6471: IKE denied by the ingress zone's
+                        // host-inbound set (a NEW initiation, or a
+                        // Responder-SPI-nonzero packet with no live-exchange
+                        // seed). Emit the tuple-rich deny event and account
+                        // the drop (GlobalCtrHostInboundDeny), then recycle
+                        // the frame — a silent drop, never a reject.
                         if let Some(flow) = flow.as_ref() {
                             emit_host_inbound_deny(
                                 worker_ctx.forwarding,

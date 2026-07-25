@@ -224,6 +224,7 @@ fn session_miss_ack_stage_invokes_syn_cookie_runtime_validation() {
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let ike_exchanges = Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new());
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
     let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
@@ -249,6 +250,7 @@ fn session_miss_ack_stage_invokes_syn_cookie_runtime_validation() {
         shared_nat_sessions: &shared_nat_sessions,
         shared_forward_wire_sessions: &shared_forward_wire_sessions,
         shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        ike_exchanges: &ike_exchanges,
         slow_path: None,
         event_stream: Some(&event_handle),
         local_tunnel_deliveries: &local_tunnel_deliveries,
@@ -425,6 +427,7 @@ fn priority_tagged_vlan0_screen_stage_parses_l3_at_offset_18() {
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let ike_exchanges = Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new());
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
     let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
@@ -450,6 +453,7 @@ fn priority_tagged_vlan0_screen_stage_parses_l3_at_offset_18() {
         shared_nat_sessions: &shared_nat_sessions,
         shared_forward_wire_sessions: &shared_forward_wire_sessions,
         shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        ike_exchanges: &ike_exchanges,
         slow_path: None,
         event_stream: Some(&event_handle),
         local_tunnel_deliveries: &local_tunnel_deliveries,
@@ -633,6 +637,9 @@ fn neighbor_learn_ctx(
     let shared_forward_wire_sessions =
         Box::leak(Box::new(Arc::new(Mutex::new(FastMap::default()))));
     let shared_owner_rg_indexes = Box::leak(Box::new(SharedSessionOwnerRgIndexes::default()));
+    let ike_exchanges = Box::leak(Box::new(Arc::new(
+        crate::afxdp::forwarding::IkeExchangeTable::new(),
+    )));
     let local_tunnel_deliveries =
         Box::leak(Box::new(Arc::new(ArcSwap::from_pointee(BTreeMap::new()))));
     let recent_exceptions = Box::leak(Box::new(Arc::new(Mutex::new(ExceptionEventRing::new()))));
@@ -652,6 +659,7 @@ fn neighbor_learn_ctx(
         shared_nat_sessions,
         shared_forward_wire_sessions,
         shared_owner_rg_indexes,
+        ike_exchanges,
         slow_path: None,
         event_stream: None,
         local_tunnel_deliveries,
@@ -1655,6 +1663,7 @@ fn screen_zone_lookup_uses_logical_ingress_ifindex_3022() {
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let ike_exchanges = Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new());
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
     let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
@@ -1680,6 +1689,7 @@ fn screen_zone_lookup_uses_logical_ingress_ifindex_3022() {
         shared_nat_sessions: &shared_nat_sessions,
         shared_forward_wire_sessions: &shared_forward_wire_sessions,
         shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        ike_exchanges: &ike_exchanges,
         slow_path: None,
         event_stream: Some(&event_handle),
         local_tunnel_deliveries: &local_tunnel_deliveries,
@@ -1866,6 +1876,7 @@ fn run_stage_screen(
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let ike_exchanges = Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new());
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
     let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
@@ -1891,6 +1902,7 @@ fn run_stage_screen(
         shared_nat_sessions: &shared_nat_sessions,
         shared_forward_wire_sessions: &shared_forward_wire_sessions,
         shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        ike_exchanges: &ike_exchanges,
         slow_path: None,
         event_stream: Some(&event_handle),
         local_tunnel_deliveries: &local_tunnel_deliveries,
@@ -2295,6 +2307,7 @@ fn stage_ipsec_passthrough_exempts_all_classes_3616() {
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let ike_exchanges = Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new());
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
     let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
@@ -2320,6 +2333,7 @@ fn stage_ipsec_passthrough_exempts_all_classes_3616() {
         shared_nat_sessions: &shared_nat_sessions,
         shared_forward_wire_sessions: &shared_forward_wire_sessions,
         shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        ike_exchanges: &ike_exchanges,
         slow_path: None,
         event_stream: Some(&event_handle),
         local_tunnel_deliveries: &local_tunnel_deliveries,
@@ -2366,7 +2380,7 @@ fn stage_ipsec_passthrough_exempts_all_classes_3616() {
         meta.addr_family = family as u8;
         meta.protocol = protocol;
         let outcome =
-            stage_ipsec_passthrough_check(Some(&flow), &frame, meta, None, &live, &worker_ctx);
+            stage_ipsec_passthrough_check(Some(&flow), &frame, meta, None, &live, &worker_ctx, TEST_NOW_NS);
         assert!(
             matches!(outcome, IpsecPassthroughOutcome::Passthrough),
             "Stage 11 must exempt raw IPsec (family {family}, proto {protocol}, \
@@ -2388,7 +2402,8 @@ fn stage_ipsec_passthrough_exempts_all_classes_3616() {
                 meta,
                 None,
                 &live,
-                &worker_ctx
+                &worker_ctx,
+                TEST_NOW_NS,
             ),
             IpsecPassthroughOutcome::NotClaimed
         ),
@@ -2399,7 +2414,7 @@ fn stage_ipsec_passthrough_exempts_all_classes_3616() {
     let meta = tcp_v4_meta(&frame, TCP_FLAG_ACK);
     assert!(
         matches!(
-            stage_ipsec_passthrough_check(None, &frame, meta, None, &live, &worker_ctx),
+            stage_ipsec_passthrough_check(None, &frame, meta, None, &live, &worker_ctx, TEST_NOW_NS),
             IpsecPassthroughOutcome::NotClaimed
         ),
         "a flowless packet is not claimed by Stage 11"
@@ -2416,6 +2431,21 @@ fn stage_ipsec_passthrough_exempts_all_classes_3616() {
 /// stage reads `meta.protocol`, not the IP header, and does not verify
 /// checksums).
 fn ike_v4_frame(natt_marker: bool, responder_spi_zero: bool) -> Vec<u8> {
+    ike_v4_frame_spis(
+        natt_marker,
+        0x1122_3344_5566_7788,
+        if responder_spi_zero {
+            0
+        } else {
+            0xdead_beef_cafe_0001
+        },
+    )
+}
+
+/// #6471: as [`ike_v4_frame`] but with explicit Initiator/Responder SPIs — a
+/// FORGED "established" packet picks arbitrary non-zero Responder bytes with
+/// an Initiator SPI that matches no seeded exchange.
+fn ike_v4_frame_spis(natt_marker: bool, initiator_spi: u64, responder_spi: u64) -> Vec<u8> {
     let mut frame = vec![0u8; 42];
     frame[12] = 0x08; // IPv4 ethertype (readability only)
     frame[13] = 0x00;
@@ -2424,13 +2454,9 @@ fn ike_v4_frame(natt_marker: bool, responder_spi_zero: bool) -> Vec<u8> {
     if natt_marker {
         frame.extend_from_slice(&[0, 0, 0, 0]); // NAT-T non-ESP marker
     }
-    // ISAKMP: Initiator SPI (non-zero), Responder SPI (zero or set).
-    frame.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
-    if responder_spi_zero {
-        frame.extend_from_slice(&[0u8; 8]);
-    } else {
-        frame.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0x00, 0x01]);
-    }
+    // ISAKMP: Initiator SPI, Responder SPI.
+    frame.extend_from_slice(&initiator_spi.to_be_bytes());
+    frame.extend_from_slice(&responder_spi.to_be_bytes());
     // next-payload / version (2.0) / exchange (34 = IKE_SA_INIT) / flags.
     frame.extend_from_slice(&[0x00, 0x20, 0x22, 0x08]);
     frame.extend_from_slice(&0u32.to_be_bytes()); // message id
@@ -2525,20 +2551,22 @@ fn ike_gate_snapshot() -> crate::ConfigSnapshot {
 }
 
 /// #4323 RED-on-revert: Stage 11 gates a NEW inbound IKE initiation on the
-/// ingress zone's host-inbound `ike`/`ipsec` admission, while ESP/AH, the
-/// IPsec data plane (ESP-in-UDP) and every established/reply IKE packet stay
-/// exempt (unconditional passthrough).
+/// ingress zone's host-inbound `ike`/`ipsec` admission, while ESP/AH and the
+/// IPsec data plane (ESP-in-UDP) stay exempt (unconditional passthrough).
+/// #6471: an "established" (Responder-SPI-set) IKE packet is exempt ONLY with
+/// a matching live-exchange seed; an unseeded one faces the same gate.
 ///
 /// - NEW IKE (Responder SPI == 0) from a zone OMITTING ike  → `Denied`.
-/// - NEW IKE from a zone LISTING ike                        → `Passthrough`.
+/// - NEW IKE from a zone LISTING ike                        → `Passthrough` + seeds.
 /// - NEW NAT-T IKE (4500 + non-ESP marker) from deny zone   → `Denied`.
-/// - established IKE (Responder SPI set) from deny zone      → `Passthrough`.
+/// - established IKE matching the seeded exchange, deny zone → `Passthrough`.
+/// - FORGED established IKE (Responder SPI set, no seed) on deny zone → `Denied`.
 /// - ESP-in-UDP (4500, non-marker) from deny zone           → `Passthrough`.
 /// - raw ESP from deny zone                                  → `Passthrough`.
 ///
 /// Fail-on-revert: drop the `NewInboundIke` gate (always reinject) and the
-/// two `Denied` assertions flip — a NEW inbound IKE from an unpermitted
-/// source would reach the local IKE daemon unfiltered.
+/// `Denied` assertions flip — a NEW inbound IKE from an unpermitted source
+/// would reach the local IKE daemon unfiltered.
 #[test]
 fn stage_ipsec_passthrough_gates_new_ike_4323() {
     const DENY_IF: u32 = 24;
@@ -2561,6 +2589,7 @@ fn stage_ipsec_passthrough_gates_new_ike_4323() {
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let ike_exchanges = Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new());
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
     let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
@@ -2586,6 +2615,7 @@ fn stage_ipsec_passthrough_gates_new_ike_4323() {
         shared_nat_sessions: &shared_nat_sessions,
         shared_forward_wire_sessions: &shared_forward_wire_sessions,
         shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        ike_exchanges: &ike_exchanges,
         slow_path: None,
         event_stream: Some(&event_handle),
         local_tunnel_deliveries: &local_tunnel_deliveries,
@@ -2607,6 +2637,7 @@ fn stage_ipsec_passthrough_gates_new_ike_4323() {
         None,
         &live,
         &worker_ctx,
+        TEST_NOW_NS,
     );
     assert!(
         matches!(
@@ -2619,7 +2650,10 @@ fn stage_ipsec_passthrough_gates_new_ike_4323() {
          drop), not reach the IKE daemon (#4323)",
     );
 
-    // NEW inbound IKE on the PERMIT zone → admitted (passthrough).
+    // NEW inbound IKE on the PERMIT zone → admitted (passthrough) AND the
+    // exchange is SEEDED (#6471), so its established follow-ups are
+    // recognized below. The `ike_v4_frame` initiator SPI is
+    // 0x1122334455667788; the flow is 192.0.2.10 -> 10.0.61.1.
     let permit_flow = ipsec_flow(libc::AF_INET, PROTO_UDP, 500);
     assert!(
         matches!(
@@ -2630,10 +2664,22 @@ fn stage_ipsec_passthrough_gates_new_ike_4323() {
                 None,
                 &live,
                 &worker_ctx,
+                TEST_NOW_NS,
             ),
             IpsecPassthroughOutcome::Passthrough
         ),
         "NEW inbound IKE from a zone listing `ike` must be admitted (Passthrough)",
+    );
+    assert!(
+        ike_exchanges.matches(
+            &crate::afxdp::forwarding::IkeExchangeKey::new(
+                0x1122_3344_5566_7788,
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 61, 1)),
+            ),
+            TEST_NOW_NS,
+        ),
+        "#6471: an ADMITTED NEW inbound IKE must seed the live-exchange table          (a denied initiation must NOT seed — asserted by the forged-SPI deny          cases in `stage_ipsec_passthrough_gates_forged_responder_spi_6471`)",
     );
 
     // NEW NAT-T IKE (UDP 4500 + non-ESP marker, Responder SPI == 0) on the
@@ -2649,14 +2695,17 @@ fn stage_ipsec_passthrough_gates_new_ike_4323() {
                 None,
                 &live,
                 &worker_ctx,
+                TEST_NOW_NS,
             ),
             IpsecPassthroughOutcome::Denied { .. }
         ),
         "NEW inbound NAT-T IKE (4500) from a zone omitting `ike` must be Denied",
     );
 
-    // ESTABLISHED IKE (Responder SPI set) on the DENY zone → passthrough
-    // (mirrors `ct established,related accept`; return/reply IKE never drops).
+    // ESTABLISHED IKE (Responder SPI set) matching the seeded exchange on the
+    // DENY zone → passthrough (#6471: the live-exchange seed is the
+    // established discriminator, mirroring `ct established,related accept`;
+    // return/reply IKE of a REAL exchange never drops).
     let est_ike = ike_v4_frame(false, false);
     assert!(
         matches!(
@@ -2667,11 +2716,12 @@ fn stage_ipsec_passthrough_gates_new_ike_4323() {
                 None,
                 &live,
                 &worker_ctx,
+                TEST_NOW_NS,
             ),
             IpsecPassthroughOutcome::Passthrough
         ),
-        "established/reply IKE (Responder SPI set) must stay exempt even on a \
-         zone omitting `ike` — established-first ordering (#4323)",
+        "established/reply IKE matching a seeded exchange must stay admitted \
+         even on a zone omitting `ike` — established-first ordering (#6471)",
     );
 
     // ESP-in-UDP (UDP 4500, first word a non-zero ESP SPI, NOT a marker) on
@@ -2686,6 +2736,7 @@ fn stage_ipsec_passthrough_gates_new_ike_4323() {
                 None,
                 &live,
                 &worker_ctx,
+                TEST_NOW_NS,
             ),
             IpsecPassthroughOutcome::Passthrough
         ),
@@ -2705,10 +2756,247 @@ fn stage_ipsec_passthrough_gates_new_ike_4323() {
                 None,
                 &live,
                 &worker_ctx,
+                TEST_NOW_NS,
             ),
             IpsecPassthroughOutcome::Passthrough
         ),
         "raw ESP must stay unconditionally exempt on any zone (#4323)",
+    );
+}
+
+/// #6471 RED-on-revert: a FORGED Responder-SPI-nonzero IKE packet to a
+/// firewall-local address on the secondary path must NOT ride the
+/// established exemption — without a matching live-exchange seed it faces the
+/// same host-inbound `ike` gate a NEW initiation faces (denied on a zone
+/// that omits `ike`), while the legitimate follow-up of a seeded exchange is
+/// admitted.
+///
+/// - forged Responder-SPI IKE (500) on DENY zone, no seed        → `Denied`.
+/// - forged NAT-T Responder-SPI IKE (4500) on DENY zone, no seed → `Denied`.
+/// - forged Responder-SPI IKE on PERMIT zone, no seed            → `Passthrough`
+///   (the zone admits IKE by configuration — primary-path parity: the kernel
+///   chain also admits NEW IKE there).
+/// - seeded exchange follow-up (matching Initiator SPI + addrs) on DENY zone
+///   → `Passthrough`.
+/// - seeded exchange, WRONG Initiator SPI / WRONG peer address   → `Denied`.
+/// - ESP-in-UDP (non-marker 4500) on DENY zone                   → `Passthrough`
+///   (data plane untouched by the discriminator).
+///
+/// Fail-on-revert: restore the unconditional `Exempt` for Responder-SPI-set
+/// IKE and every `Denied` assertion below flips to `Passthrough` — the
+/// forged packet would reach strongSwan on a zone the operator closed to IKE.
+#[test]
+fn stage_ipsec_passthrough_gates_forged_responder_spi_6471() {
+    const DENY_IF: u32 = 24;
+    const PERMIT_IF: u32 = 25;
+
+    let forwarding = build_forwarding_state(&ike_gate_snapshot());
+    let ident = BindingIdentity {
+        slot: 0,
+        queue_id: 0,
+        worker_id: 0,
+        interface: Arc::<str>::from("ge-0-0-1"),
+        ifindex: DENY_IF as i32,
+    };
+    let live = BindingLiveState::new();
+    let binding_lookup = WorkerBindingLookup::default();
+    let mirror_targets = MirrorTargetMap::default();
+    let ha_state = BTreeMap::new();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::default());
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let ike_exchanges = Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new());
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
+    let last_resolution = Arc::new(Mutex::new(None));
+    let peer_worker_commands = Vec::new();
+    let dnat_fds = DnatTableFds::default();
+    let rg_epochs = std::array::from_fn(|_| AtomicU32::new(0));
+    let (event_handle, _event_rx) = crate::event_stream::test_worker_handle(
+        8,
+        DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    let worker_ctx = WorkerContext {
+        ident: &ident,
+        binding_lookup: &binding_lookup,
+        mirror_targets: &mirror_targets,
+        forwarding: &forwarding,
+        ha_state: &ha_state,
+        dynamic_neighbors: &dynamic_neighbors,
+        neighbor_resolver: None,
+        shared_sessions: &shared_sessions,
+        shared_nat_sessions: &shared_nat_sessions,
+        shared_forward_wire_sessions: &shared_forward_wire_sessions,
+        shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        ike_exchanges: &ike_exchanges,
+        slow_path: None,
+        event_stream: Some(&event_handle),
+        local_tunnel_deliveries: &local_tunnel_deliveries,
+        recent_exceptions: &recent_exceptions,
+        last_resolution: &last_resolution,
+        peer_worker_commands: &peer_worker_commands,
+        dnat_fds: &dnat_fds,
+        rg_epochs: &rg_epochs,
+        cold_path_sample_mask: 0xff,
+    };
+
+    let flow = ipsec_flow(libc::AF_INET, PROTO_UDP, 500);
+    let natt_flow = ipsec_flow(libc::AF_INET, PROTO_UDP, 4500);
+
+    // FORGED "established" IKE (Responder SPI set, Initiator SPI matching NO
+    // seed) on the DENY zone → Denied. On the pre-#6471 code this was
+    // unconditionally Exempt → the fail-on-revert core.
+    let forged = ike_v4_frame_spis(false, 0x0102_0304_0506_0708, 0xaabb_ccdd_eeff_0011);
+    assert!(
+        matches!(
+            stage_ipsec_passthrough_check(
+                Some(&flow),
+                &forged,
+                ike_v4_meta(&forged, DENY_IF),
+                None,
+                &live,
+                &worker_ctx,
+                TEST_NOW_NS,
+            ),
+            IpsecPassthroughOutcome::Denied { .. }
+        ),
+        "forged Responder-SPI IKE with no live-exchange seed must be Denied \
+         on a zone omitting `ike` (#6471)",
+    );
+
+    // Same forgery over NAT-T (4500 + non-ESP marker) → Denied.
+    let forged_natt = ike_v4_frame_spis(true, 0x0102_0304_0506_0708, 0xaabb_ccdd_eeff_0011);
+    assert!(
+        matches!(
+            stage_ipsec_passthrough_check(
+                Some(&natt_flow),
+                &forged_natt,
+                ike_v4_meta(&forged_natt, DENY_IF),
+                None,
+                &live,
+                &worker_ctx,
+                TEST_NOW_NS,
+            ),
+            IpsecPassthroughOutcome::Denied { .. }
+        ),
+        "forged NAT-T Responder-SPI IKE with no live-exchange seed must be \
+         Denied on a zone omitting `ike` (#6471)",
+    );
+
+    // The same forged packet on the PERMIT zone → admitted: the zone lists
+    // `ike`, so IKE to it is config-sanctioned (primary-path parity — the
+    // kernel chain admits NEW IKE there too).
+    assert!(
+        matches!(
+            stage_ipsec_passthrough_check(
+                Some(&flow),
+                &forged,
+                ike_v4_meta(&forged, PERMIT_IF),
+                None,
+                &live,
+                &worker_ctx,
+                TEST_NOW_NS,
+            ),
+            IpsecPassthroughOutcome::Passthrough
+        ),
+        "a zone listing `ike` admits IKE regardless of the exchange seed \
+         (config-sanctioned openness)",
+    );
+
+    // SEED a live exchange exactly as the firewall-initiated outbound path
+    // does (`maybe_seed_local_origin_ike` in the GRE local-origin thread):
+    // the peer 192.0.2.10, the firewall-local address 10.0.61.1, Initiator
+    // SPI 0x5152....
+    let seeded_key = crate::afxdp::forwarding::IkeExchangeKey::new(
+        0x5152_5354_5556_5758,
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 61, 1)),
+    );
+    ike_exchanges.seed(seeded_key, TEST_NOW_NS);
+
+    // The legitimate Responder packet of that established exchange on the
+    // DENY zone → admitted (the seed — not the SPI bytes alone — vouches).
+    let legit = ike_v4_frame_spis(false, 0x5152_5354_5556_5758, 0xdead_beef_cafe_0001);
+    assert!(
+        matches!(
+            stage_ipsec_passthrough_check(
+                Some(&flow),
+                &legit,
+                ike_v4_meta(&legit, DENY_IF),
+                None,
+                &live,
+                &worker_ctx,
+                TEST_NOW_NS,
+            ),
+            IpsecPassthroughOutcome::Passthrough
+        ),
+        "the Responder packet of a seeded live exchange must be admitted even \
+         on a zone omitting `ike` (#6471 established-first parity)",
+    );
+
+    // Same packet shape but a WRONG Initiator SPI (no matching seed) → Denied.
+    let wrong_spi = ike_v4_frame_spis(false, 0x6152_5354_5556_5758, 0xdead_beef_cafe_0001);
+    assert!(
+        matches!(
+            stage_ipsec_passthrough_check(
+                Some(&flow),
+                &wrong_spi,
+                ike_v4_meta(&wrong_spi, DENY_IF),
+                None,
+                &live,
+                &worker_ctx,
+                TEST_NOW_NS,
+            ),
+            IpsecPassthroughOutcome::Denied { .. }
+        ),
+        "a Responder-SPI packet whose Initiator SPI matches no seed must be \
+         Denied on a zone omitting `ike` (#6471)",
+    );
+
+    // Same SPIs but from a DIFFERENT peer address (no matching seed) → Denied.
+    let mut wrong_peer_flow = ipsec_flow(libc::AF_INET, PROTO_UDP, 500);
+    wrong_peer_flow.src_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
+    wrong_peer_flow.forward_key.src_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
+    assert!(
+        matches!(
+            stage_ipsec_passthrough_check(
+                Some(&wrong_peer_flow),
+                &legit,
+                ike_v4_meta(&legit, DENY_IF),
+                None,
+                &live,
+                &worker_ctx,
+                TEST_NOW_NS,
+            ),
+            IpsecPassthroughOutcome::Denied { .. }
+        ),
+        "a packet matching the seed's SPIs but not its address pair must be \
+         Denied on a zone omitting `ike` (#6471)",
+    );
+
+    // ESP-in-UDP on 4500 (non-zero ESP SPI, no marker) → data plane, still
+    // unconditionally exempt.
+    let esp_udp = esp_in_udp_v4_frame();
+    assert!(
+        matches!(
+            stage_ipsec_passthrough_check(
+                Some(&natt_flow),
+                &esp_udp,
+                ike_v4_meta(&esp_udp, DENY_IF),
+                None,
+                &live,
+                &worker_ctx,
+                TEST_NOW_NS,
+            ),
+            IpsecPassthroughOutcome::Passthrough
+        ),
+        "ESP-in-UDP must stay exempt — the #6471 discriminator touches IKE \
+         only, never the IPsec data plane",
     );
 }
 
@@ -2739,6 +3027,7 @@ fn run_stage11(
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let ike_exchanges = Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new());
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
     let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
@@ -2764,6 +3053,7 @@ fn run_stage11(
         shared_nat_sessions: &shared_nat_sessions,
         shared_forward_wire_sessions: &shared_forward_wire_sessions,
         shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        ike_exchanges: &ike_exchanges,
         slow_path: None,
         event_stream: Some(&event_handle),
         local_tunnel_deliveries: &local_tunnel_deliveries,
@@ -2774,7 +3064,7 @@ fn run_stage11(
         rg_epochs: &rg_epochs,
         cold_path_sample_mask: 0xff,
     };
-    stage_ipsec_passthrough_check(Some(flow), frame, meta, None, &live, &worker_ctx)
+    stage_ipsec_passthrough_check(Some(flow), frame, meta, None, &live, &worker_ctx, TEST_NOW_NS)
 }
 
 /// #5620 RED-on-revert: Stage 11 must NOT claim the kernel-XFRM passthrough

@@ -106,6 +106,11 @@ pub(crate) struct WorkerSharedDataplane {
     pub(in crate::afxdp) slow_path: Option<Arc<SlowPathReinjector>>,
     pub(in crate::afxdp) neighbors: WorkerNeighbors,
     pub(in crate::afxdp) sessions: WorkerSharedSessions,
+    /// #6471: node-shared live-IKE-exchange table for the Stage-11
+    /// established-vs-forged discriminator (not a session map — kept out of
+    /// [`WorkerSharedSessions`] so the swap-compatible trio stays the only
+    /// same-typed set the wiring test has to pin).
+    pub(in crate::afxdp) ike_exchanges: crate::afxdp::forwarding::SharedIkeExchangeTable,
 }
 
 impl WorkerSharedDataplane {
@@ -138,6 +143,7 @@ impl WorkerSharedDataplane {
                 forward_wire: coord.sessions.forward_wire.clone(),
                 owner_rg_indexes: coord.sessions.owner_rg_indexes.clone(),
             },
+            ike_exchanges: coord.ike_exchanges.clone(),
         }
     }
 }
@@ -334,6 +340,10 @@ mod tests {
             &bundle.neighbors.dynamic,
             &coord.neighbors.dynamic
         ));
+        // #6471: the IKE exchange table wires to coord.ike_exchanges (not a
+        // session map — a same-typed swap with one of the trio above would
+        // fail their assertions first).
+        assert!(Arc::ptr_eq(&bundle.ike_exchanges, &coord.ike_exchanges));
     }
 
     #[test]

@@ -159,8 +159,10 @@ fn classify_system_service(token: &str, hi: &mut ZoneHostInbound) {
         // admit is consulted for a NEW inbound IKE initiation (an ISAKMP header
         // with an all-zero Responder SPI) via `host_inbound_admits_iface`: a zone
         // omitting `ike`/`ipsec` drops it before it reaches the local IKE daemon.
-        // Raw ESP/AH and every established/reply IKE packet stay EXEMPT on that
-        // path (ratified #3616 Option A) — the SA is the authorization.
+        // Raw ESP/AH stays EXEMPT on that path (ratified #3616 Option A) — the
+        // SA is the authorization; established/reply IKE is exempt only while a
+        // live seeded exchange matches (#6471 secondary path, see
+        // forwarding/ipsec.rs).
         "ike" | "ipsec" => {
             hi.udp_ports.insert(500);
             hi.udp_ports.insert(4500);

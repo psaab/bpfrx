@@ -78,6 +78,7 @@ pub(crate) fn worker_loop(
                 forward_wire: shared_forward_wire_sessions,
                 owner_rg_indexes: shared_owner_rg_indexes,
             },
+        ike_exchanges,
     } = shared;
     let WorkerControlChannels {
         commands,
@@ -931,6 +932,7 @@ pub(crate) fn worker_loop(
                 &shared_nat_sessions,
                 &shared_forward_wire_sessions,
                 &shared_owner_rg_indexes,
+                &ike_exchanges,
                 slow_path.as_ref(),
                 event_stream.as_ref(),
                 &local_tunnel_deliveries,
