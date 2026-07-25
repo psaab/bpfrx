@@ -1,6 +1,6 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v8 — the simplification round (Codex r9 PLAN NO 7B/3H/2M/1L answered by DELETING the v7.x incarnation-ticket tower: import entries emit only when marked by a validated close, unmarked reaps stay silent as master, stranded aliases die to a shared-map TTL sweep, Go close fence via (origin_node, session_id) with a random process nonce)**
+**Status: DRAFT v8.1 — the simplification round + round-10 AGY fold (TTL sweep gains a batched worker liveness push: shared-map age is event-only today, so a naive TTL would purge live-but-quiet flows; workers push active-key touches every 30s in the expire pass; K≥2 gives ≥4x margin)**
 
 v1 → v2: round-1 review killed v1's architecture (attacker-writable trust
 anchor, missed reverse-NAT constructor, invalid cross-store serial merge).
@@ -657,17 +657,27 @@ attacker-poisonable):**
        incarnation-ticket tower (round-9 Codex 1-3: no end-to-end
        identity, promotion resurrection races, non-universal mints) is
        deleted, not patched.
-     - **Stranded-alias cleanup via a TTL reaper (v8):** the hazard
-       round-5 Codex 1 found (close-first failover leaves no Close
-       producer; stale shared NAT aliases can rematerialize after
-       allocator reuse, `upsert_synced.rs:80`) is closed NOT by
-       authority semantics but by a coordinator-side **shared-map TTL
-       sweep**: the existing `refresh_owner_rgs` shared-map iteration
-       gains an age check — a shared entry with no worker refresh for
-       K × its session timeout is purged (canonical + NAT + wire
-       aliases together, under the coordinator mutex). No Close
-       producer is required; staleness is bounded by the sweep;
-       rematerialization of a stale alias is impossible past it. (The
+     - **Stranded-alias cleanup via a TTL reaper (v8.1, round-10 AGY
+       Q2):** the hazard round-5 Codex 1 found (close-first failover
+       leaves no Close producer; stale shared NAT aliases can
+       rematerialize after allocator reuse, `upsert_synced.rs:80`) is
+       closed NOT by authority semantics but by a coordinator-side
+       **shared-map TTL sweep with a batched liveness push**. Shared
+       entry age today refreshes ONLY on events (materialize/promote/
+       replicate/`refresh_owner_rgs`); per-packet accounting is
+       worker-local (`loop_body/mod.rs:394`) and never touches the
+       shared map — so a live-but-quiet flow would be purged under a
+       naive TTL (round-10 AGY Q2's kill). The v8.1 rule: each worker,
+       every `T_touch` (30 s), folds a **batched active-key touch**
+       into its existing expire pass — for entries with local
+       `last_seen_ns` within the last `T_touch`, one batched
+       coordinator call refreshes the shared aliases' ages (the
+       expire pass already iterates the table; the batch is one lock
+       acquisition per shard). The sweep then purges only aliases
+       with no event AND no touch for K × timeout (K ≥ 2, giving
+       ≥ 4× `T_touch` margin): live-but-quiet flows stay (their
+       workers push touches), truly dead flows' aliases die. No
+       Close producer is required; staleness is bounded; (the
        Go-side floor already exists — `pkg/conntrack` GC with HA
        delete-sync callbacks.)
      - **Cross-node staleness fence (kept from v7.5, hardened per
@@ -1085,8 +1095,10 @@ and one ungated node, each gating only its own packet-driven marks).
   validated close (single producer = the marking worker, deletion
   correct by construction); unmarked import reaps are silent (master's
   rule). Stranded shared aliases are purged by the coordinator
-  shared-map TTL sweep (K × timeout without worker refresh) — no
-  Close producer required, no incarnation ticket anywhere. `WorkerLocalImport` and
+  shared-map TTL sweep (K × timeout without event OR batched worker
+  liveness touch — live-but-quiet flows are retained by the 30 s
+  batched push) — no Close producer required, no incarnation ticket
+  anywhere. `WorkerLocalImport` and
   fabric replicas never race (their owner worker emits directly, or
   they stay silent). No origin flip anywhere; authority is never
   stored, never packet-driven. Documented pre-existing: the
@@ -1298,28 +1310,22 @@ admitted interval):
   same-node alias fanout (worker→coordinator shared map→worker, no
   Go round trip); pending-neigh incarnation mismatch → ONE
   deadline-preserving re-resolution then drop.
-- **Close authority = live ownership + shared-delete race (v7.2):
-  (a) blind first-packet close on a pre-activation import → NO
-  ownership promote (origin stays `SharedMaterialize`), no mark, no
-  refresh — fully inert; ordinary reap silent (RG not active).
-  (b) post-activation: a blind close is still refused (inert); the
-  entry reaps at its TRUE natural timeout; exactly ONE worker wins the
-  shared-alias delete and emits the authoritative Close (no duplicate
-  deltas, no RT_FLOW dupes); the alias is GONE (no rematerialization).
-  (c) `fabric_ingress` imports take the same path (no early-Age
-  bypass). (d) a validated post-trust close on a packet-promoted entry
-  emits the Close. (e) demoted-node copies never attempt the race
-  (RG not active). (f) RG flap: VRRP-overlap double-wins are
-  idempotent under the gen rules. (g) a newer same-key incarnation
-  (re-seeded on the peer) wins the gen compare against a stale winning
-  Close.
-- **Phase-2 contract (v7.2):** wire tail round-trips all fields
-  (seq/ack/wnd/OPENING endpoints/seqno/session_id); `session_id`
-  mismatch discards; seqno serial-compare rejects late updates;
-  re-baseline-on-skip resumes emission after a fast stretch;
-  receiver trust decay reverts an unrefreshed wire anchor to untrusted
-  after T_anchor (stale blind-close window dies); batched aggregate cap
-  holds the 256 records/s budget under a quiet-heavy churn flood.
+- **Close authority v8 semantics:** (a) blind first-packet close on a
+  pre-activation import → NO ownership promote, no mark, no refresh —
+  fully inert; ordinary reaps silent on every worker (no fanout
+  duplication). (b) post-activation: a blind close is still refused
+  (inert); entries reap at their TRUE natural timeout, silently;
+  the TTL sweep purges the alias family after K × timeout without
+  event or batched touch (no rematerialization after the sweep).
+  (c) `fabric_ingress` imports take the same path. (d) a validated
+  close on an import marks it and the marking worker's 2 s reap emits
+  the authoritative Close (exactly one — forward emits, reverse
+  suppressed by `is_reverse`). (e) a live-but-quiet flow's alias
+  SURVIVES the sweep via the worker's 30 s batched touch; a truly
+  dead flow's aliases die. (f) demoted-node copies never emit (RG not
+  active). (g) a newer same-key incarnation (re-seeded on the peer)
+  is protected by the `(origin_node_id, session_id)`-conditional Go
+  close processing where ids exist.
 - **Ack-stall residual (v7.2, round-6 Codex 7):** scaled-window loss
   burst (repair jump > raw-wnd gate) stalls `ack_hi` — leg-2
   restart-RST soft-refuses, legs 1/3 still validate normal closes;
