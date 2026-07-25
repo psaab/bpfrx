@@ -1080,9 +1080,27 @@ attacker-poisonable):**
        independent allocators as reverse-NAT misdelivery
        (`pkg/config/compiler_tailgates.go:212`). The rule: the refresh
        path DETECTS allocator changes (allocator key or collision
-       domain) and either MIGRATES in place (reserve E1's exact tuple
-       into the refreshed allocator before the old allocator is
-       dropped) or forces the quiesced reconcile path (which has the
+       domain) and either MIGRATES in place WITH A CUTOVER FENCE
+       (v9.9.14, round-29 Codex B1: today allocator B is built while
+       A remains worker-visible (`afxdp/coordinator/snapshot_refresh.rs:212`),
+       B is published later at `:397`, and workers retain A until their
+       per-loop Arc refresh (`worker/loop_body/mod.rs:467`) — so a
+       worker still holding A can admit E1 and claim P AFTER the
+       migration snapshot through the live allocation path
+       (`allocator.rs:999`), B is published WITHOUT P, and E2 then
+       claims P in B; independent allocator bitmaps issuing the same
+       tuple produce the documented reverse-NAT misdelivery
+       (`pkg/config/compiler_tailgates.go:212`). The fence: the
+       migration FREEZES A's allocation path at snapshot time
+       (allocator-level: A's `allocate_translation` returns a
+       transient error or redirects to B during the window;
+       already-committed in-flight allocations are fine), migrates
+       the retained tuples into B, THEN publishes B — so no worker
+       can still allocate through A after the migration snapshot.
+       Alternatively the dual-write bridge: during the migration
+       window, allocations through A are also reserved in B, with an
+       acknowledgement that no worker can still allocate through A
+       after the cutover) or forces the quiesced reconcile path (which has the
        escrow); a collision-domain-compatible change migrates in
        place; an incompatible change forces the reconcile). The rule
        for the reconcile/restore path itself: on a config change
@@ -1918,9 +1936,19 @@ non-close path.
 
 ### 5.8 Signature/signature-shape changes (all crate-internal)
 
-**Wire schema (normative, consolidated — v9.9.12, round-27 Codex B2):**
-BOTH the session INSTALL/Open AND the session DELETE delta carry the
-additive identity tail `{(origin_process_nonce, flow_incarnation_id)}`.
+**Wire schema (normative, consolidated — v9.9.14):**
+The session INSTALL/Open delta carries the additive identity tail
+`{(origin_process_nonce, flow_incarnation_id, stable_rule_id_hash,
+admission_config_version)}` (v9.9.14, round-29 Codex H4: the main
+design requires imported entries to inherit `stable_rule_id_hash` and
+`admission_config_version` through the INSTALL tail, and they cannot
+be reconstructed from the BPF projection (`bpf_session_value.go:168`),
+whose positional policy ID is rewritten across policy reorder
+(`bpf_map/mod.rs:384`) — a §5.8 implementation without them retains
+the numeric-ID selection at `daemon_policy_invalidate.go:311` where a
+surviving rule's E2 can alias a deleted rule's old position and be
+companion-deleted through `session_store.go:391`); the session DELETE
+delta carries `{(origin_process_nonce, flow_incarnation_id)}`.
 The sender/receiver store lifecycle: the Go sidecar synced store gains
 `(origin_process_nonce, flow_incarnation_id, row_version)` per entry,
 learned from the install delta, compared on delete; the install data
@@ -1928,7 +1956,8 @@ for bulk and periodic resend is produced by the helper-authoritative
 ATOMIC SNAPSHOT (a new helper method acquiring the canonical hierarchy
 locks (`synced` → `nat` → `forward_wire` → indexes,
 `coordinator/session_manager.rs:12-18`) and producing `(BPF/NAT row,
-identity, row_version)` triples in one lock span); the sender's install
+identity, row_version, stable_rule_id_hash, admission_config_version)`
+tuples in one lock span); the sender's install
 pipeline RE-VALIDATES at send time that the row's current version still
 matches the snapshot's stored version (else re-resolve — closing the
 ABA trace where bulk captures E1's row while E2 replaces the tuple and
@@ -2266,8 +2295,17 @@ admitted interval):
   conditional delete with TEMPORAL CUTS: Go submits the predicate;
   (e2) the wire identity matrix: new-sender→new-receiver (tail
   applied), old-sender→new-receiver (tail-less install → the receiver
-  stores NO identity and falls back to gen-based deletes — but ONLY
-  for NON-locally-authoritative entries (standby/replica copies);
+  stores NO identity; new-sender→old-receiver: the INSTALL tail is
+  ignored by old decoders (harmless extra bytes), while
+  identity-dependent DELETEs (Close, invalidation, conditional) are
+  SUPPRESSED entirely toward the unnegotiated peer (v9.9.14, round-29
+  Codex H5: the matrix previously said new→old "tail ignored" AND
+  "mixed-version pairs fall back to generation deletes" generically —
+  followed for DELETE, A's E1 Close reaches legacy B; B decodes key
+  plus generation (`sync_conn_read.go:150`), accepts the equal/fresh
+  generation (`sync_conn_gen.go:263`), and key-deletes current
+  same-key E2 plus companions at `sync_conn_gen.go:493-506`; so the
+  old-receiver fallback is: gen-based deletes — but ONLY
   v9.9.8, round-23 partial: a stale gen-based delete from the old
   sender carries the sender's fresh generation (which always advances
   past the receiver's tracked generation for that key,
