@@ -900,19 +900,26 @@ attacker-poisonable):**
        `SyncedSessionEntry` clones, and every queued upsert gains an
        **install acknowledgement**: `handle_upsert_synced`
        (`upsert_synced.rs:64`) returns an outcome per command
-       (installed / rejected), and each installed entry performs its
-       own verify-and-retain (which succeeds because the escrow kept
-       the allocation alive and increments the refcount per replica —
-       solving "one linear token cannot transfer into every worker
-       replica": the replicas retain, the escrow only keeps the
-       allocation alive meanwhile); (4) the escrow releases ONLY
-       after replay-consumption-confirmed (all queued outcomes
-       collected — NEVER at workers-READY, `loop_body/mod.rs:150,
-       :682`, which precedes consumption) — for rejected entries the
-       escrow releases immediately (the allocation frees, which is
-       correct for a flow that failed to reinstall); on abandonment,
-       dropping the escrow drains the tokens and the normal
-       sweep/reap machinery takes over (no leak). The
+       (`Installed` — emitted ONLY after the side-map token is
+       inserted, so an ack implies the hold exists — or `Rejected`),
+       and each installed entry performs its own verify-and-retain
+       (which succeeds because the escrow kept the allocation alive
+       and increments the refcount per replica — solving "one linear
+       token cannot transfer into every worker replica": the replicas
+       retain, the escrow only keeps the allocation alive meanwhile).
+       **Keeper accounting is PER ALLOCATION with a pending-command
+       count and a BOUNDED barrier (v9.9, round-18 Codex H3):** the
+       keeper for allocation A releases only when A's pending count
+       reaches zero (every command for A has an outcome — an early
+       `Rejected` decrements the count but never drops the keeper
+       while later replicas for A are still pending); the barrier is
+       bounded (a replay deadline), a dead/hung worker's pending
+       commands convert to rejections on supervisor-detected death
+       (`supervisor.rs:80`), and abandonment drains the escrow via
+       RAII — so reconcile can never stall on a permanently absent
+       acknowledgement (workers report READY before consuming
+       commands, `loop_body/mod.rs:150, :682`, and launched workers
+       retain the queue-map `Arc`, `bringup.rs:598`). The
        BPF-before-consume ordering at `coordinator/mod.rs:771` is
        covered by the alias-token fencing (external deletes re-check
        the alias at delete time). The token itself is an owned, LINEAR `NatHoldToken`
@@ -1796,8 +1803,9 @@ admitted interval):
   BPF/conntrack/DNAT/aliases/replicas); `DeleteSynced` deletes only on
   id match; (c) commit coverage — materialize, reverse-synth,
   icmp_embed, and async upsert/prewarm consumption all perform the
-  incarnation recheck + required reserve (reserve failure → discard,
-  never publish); (d) TTL/family — one canonical-key family clock
+  incarnation recheck + the atomic verify-and-retain (a stale
+  translation mismatches → discard, never publish); (d) TTL/family —
+  one canonical-key family clock
   (forward when present, reverse for lone reverse imports) with
   `expires_after_ns` copied at publish and refreshed on every stamp
   (OPENING→ESTABLISHED: a quiet established flow is never swept at
@@ -1805,7 +1813,9 @@ admitted interval):
   flow_incarnation_id under the documented lock order incl. the
   dnat_table side effect; a colliding E2 alias survives E1's sweep;
   the NAT reservation release purges the alias family only via the
-  LAST holder (pending #6522); (e) emission — the reverse-synth accept
+  holder refcount zero (the holder refcount shipped as Part B — NOT
+  "pending #6522"; #6522's premature-release class is what the
+  refcount fixes); (e) emission — the reverse-synth accept
   marks the forward family atomically (full mark semantics: sticky
   bits + reset-before-timeout recompute + last_seen + wheel push);
   exactly one Close per flow (forward emits, reverse suppressed);
@@ -1954,8 +1964,10 @@ It is therefore split to its own research track:
 
 1. **The scope split itself (the v9 question):** Part A (the dataplane
    demote gate) closes the issue AND its HA teeth with no wire change
-   (a blind close never marks → never produces a Close delta → the
-   cluster-kill channel is dead). Phase 2 (wire anchor, restoring
+   (a REFUSED — out-of-window or no-baseline — blind close never marks
+   → never produces a Close delta → the 1-packet-anytime cluster-kill
+   channel is dead; an in-window blind guess validates by design at the
+   documented window probability). Phase 2 (wire anchor, restoring
    fast-reap for synced flows) is an optimization for the bounded
    absorbing-state residual and is split to its own research track
    (phase2-brief.md). Is any part of the ISSUE's actual harm left
