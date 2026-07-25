@@ -1,6 +1,6 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v7.5 — revised after round-8 reviews (Codex r8 PLAN NO 6B/3H/1M/1L; AGY r8 3xSOUND) — folds: origin+id CAS ticket with mint-on-zero + promote-publishes-first, owner_rg-active gate, Go id-conditional close, geometry-hoisted admission, split-steering master-parity analysis, 72B payload with boot_id/presence/bulk_epoch, per-side leases, bounded pending-neigh re-resolve**
+**Status: DRAFT v7.6 — revised after round-8/9 reviews (Codex r8 PLAN NO 6B/3H/1M/1L; AGY r8 3xSOUND, AGY r9 4xUNSOUND folded: universal owner_rg stamping, alias-carrying-mint producer, (epoch,seqno) lexicographic ordering, contradiction sweep)**
 
 v1 → v2: round-1 review killed v1's architecture (attacker-writable trust
 anchor, missed reverse-NAT constructor, invalid cross-store serial merge).
@@ -633,22 +633,34 @@ attacker-poisonable):**
      entry's `metadata.owner_rg_id` against CURRENT HA state at reap
      time (round-8 Codex 3a: this CLOSES the publish-before-command
      demotion window for stamped entries — the worker reads live state,
-     so an entry whose RG just demoted emits nothing; entries with
-     `owner_rg_id == 0` (unstamped edge/legacy) fall back to the
-     pre-existing locally-born-origin rule and keep master's window,
-     documented), AND — for the true HA-import origins
+     so an entry whose RG just demoted emits nothing). **Stamping is
+     made universal first (v7.6, round-9 AGY 1):** today only promote
+     stamps (`promote.rs:93-94`); primary installs store metadata as-is
+     (`install.rs:150`) and LocalDelivery passes `owner_rg_id: 0`
+     explicitly (`poll_descriptor/mod.rs:1922`) — every forward install
+     path now stamps `owner_rg_id` from `owner_rg_for_resolution` at
+     install, so the gate covers the host-inbound victim class
+     (BGP/IKE/SSH) too. The only remaining unstamped class is the
+     #2120 held standby class (owner_rg_id==0 by design — peer-synced
+     standby holds, where silent is the correct posture), AND — for the true HA-import origins
      (`SyncImport` / `SharedMaterialize` ONLY) — additionally emits only
      after **winning an origin+id compare-and-delete on the node-local
      shared alias** (v7.5, round-8 Codex 1/2: the CAS requires
      `alias.origin ∈ {SyncImport, SharedMaterialize}` AND
      `alias.session_id == entry.session_id` AND nonzero, atomic under
      the coordinator mutex, `lock_shared_recover`). Three hardening
-     rules: (i) **mint-on-zero** — legacy/bulk imports can carry
-     `session_id == 0` (`session_sync.rs:274`, `install.rs:335`,
-     `export.rs:143`); the import path mints a fresh node-local stable
-     id and publishes the alias WITH it, so the CAS always has an
-     identity (the ticket is node-local — node-local uniqueness
-     suffices); (ii) **promote publishes before it flips** —
+     rules: (i) **mint-on-zero, alias-carrying mint is the producer** —
+     legacy/bulk imports can carry `session_id == 0`
+     (`session_sync.rs:274`, `install.rs:335`, `export.rs:143`); the
+     import path mints a fresh stable id (`alloc_session_id` embeds
+     worker bits, `session/mod.rs:784-790`, so two workers mint
+     DIFFERENT ids for the same key — round-9 AGY 2) and publishes the
+     alias WITH its own mint. Exactly the alias-carrying worker can win
+     the CAS — a deterministic single producer; every other mint reaps
+     silently, and the id-conditional downstream delete skips them
+     (they linger to their own natural reaps, bounded). Post-failover
+     this node is the owner, so the winning Close is authoritative
+     hygiene, matching the owner-born single-producer model; (ii) **promote publishes before it flips** —
      `maybe_promote_synced_session` must republish the alias with the
      entry's OWN stable id and the promoted origin BEFORE the origin
      flip (today it flips first and republishes with id 0,
@@ -1092,11 +1104,13 @@ and one ungated node, each gating only its own packet-driven marks).
   ordering (`reset` set before `expires_after_ns` is chosen) is preserved
   on the accepted-mark path.
 - **Close authority = live RG ownership + incarnation-CAS ticket
-  (v7.4):** the `expire.rs:342-345` delta gate is `!is_reverse &&
-  !is_transient_seed && (locally-born origin || owner_rg_id active
-  locally)`; `SyncImport`/`SharedMaterialize` entries additionally emit
-  only after a `session_id` compare-and-delete on their node-local
-  shared alias (single producer, ABA-safe). `WorkerLocalImport` and
+  (v7.6):** the `expire.rs:342-345` delta gate is `!is_reverse &&
+  !is_transient_seed && owner_rg_active(metadata.owner_rg_id)` (live
+  state at reap time; `owner_rg_id` stamped on every forward install
+  path; the #2120 held class stays unstamped-and-silent by design);
+  `SyncImport`/`SharedMaterialize` entries additionally emit only after
+  an `(origin, session_id)` compare-and-delete on their node-local
+  shared alias (single producer via the alias-carrying mint, ABA-safe). `WorkerLocalImport` and
   fabric replicas never race (their owner worker emits directly, or
   they stay silent). No origin flip anywhere; authority is never
   stored, never packet-driven. Documented pre-existing: the
@@ -1474,10 +1488,13 @@ validated baseline. The full contract (v7.2, round-6 Codex 3/4/6):
   incrementals, `sync_bulk.go:81, :105` x `sync_conn_write.go:268`,
   the receiver installs frames immediately, `sync_conn_read.go:96`,
   and `BulkStart` resets generation guards, `sync_conn_read.go:183`).
-  The epoch increments per bulk cycle; an update applies only when
-  `update.bulk_epoch >= stored.bulk_epoch`; a bulk baseline lands with
-  the current epoch; interleaved older-epoch updates are discarded
-  (never overwrite a newer incremental); (iv) Go→peer
+  The epoch increments per bulk cycle; the merge rule is a
+  lexicographic `(bulk_epoch, side_seqno)` compare PER SIDE (v7.6,
+  round-9 AGY 3): apply a message's side iff its epoch is greater, or
+  equal with a strictly greater side_seqno. A delayed same-epoch
+  baseline (snapshot at t0) therefore cannot overwrite a newer
+  same-epoch incremental (t1 > t0 — its side_seqno is newer); an
+  older-epoch update is always discarded; (iv) Go→peer
   Rust: a matching `anchor_update` op in the helper control protocol
   (`sync_session.rs:19` today has only upsert/delete), applied IN
   PLACE (no `remove_entry`, no anchor wipe) to the shared aliases AND
@@ -1592,9 +1609,13 @@ validated baseline. The full contract (v7.2, round-6 Codex 3/4/6):
 ## 11. Open questions for adversarial review (round 8)
 
 1. **Authority ticket (§5.2 rule 5, §7):** race narrowed to
-   `SyncImport`/`SharedMaterialize` with a `session_id` CAS. Verify:
-   (a) HA-imported entries ALWAYS carry a nonzero wire session_id
-   (the #5212 inheritance) so the CAS never degenerates to key-only;
+   `SyncImport`/`SharedMaterialize` with an `(origin, session_id)` CAS.
+   Verify: (a) mint-on-zero is airtight — reactive materialize inherits
+   the wire id (#5212), but legacy/bulk imports can carry id 0
+   (`session_sync.rs:274`, `export.rs:143`), and the alias-carrying
+   mint is the only CAS winner (worker-embedded ids differ per worker,
+   `session/mod.rs:784-790` — confirm every entry/alias pair for one
+   key on one node converges to exactly one CAS-eligible worker);
    (b) the winning worker's local entry and the alias it CAS-deleted
    are the same incarnation in every path (materialize refreshes the
    local id from the shared entry?); (c) no path exists where the
