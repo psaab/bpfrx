@@ -823,7 +823,16 @@ attacker-poisonable):**
        run under a DOCUMENTED lock order (canonical → NAT → wire →
        indexes — every publisher, promote, touch helper, sweep, and
        materialization commit takes them in this order), and each
-       member is deleted ONLY if its stored `flow_incarnation_id`
+       member is deleted ONLY if its stored `SessionIdentity` —
+       the FULL `(origin_process_nonce, flow_incarnation_id)` pair
+       (v9.9.23, round-38 Codex B4: every identity comparison in the
+       design uses ONE `SessionIdentity { nonce, id }` type — the
+       family sweep here, the Close fencing, `ExpiredSession`,
+       `DeleteSynced`, the alias fence, and the cleanup recheck; a
+       scalar `flow_incarnation_id` collides across a sender restart
+       (queued A1/E1 `(n1,id7)` cleanup matching restarted A2/E2
+       `(n2,id7)` and removing the replacement through the
+       key-driven deletion path, `session_import.rs:243`) —
        equals the candidate's — a live colliding E2 that displaced
        E1's alias (`shared_ops.rs:918`) is never removed by E1's
        sweep, and a promote/republish mid-scan either updates the
@@ -1163,28 +1172,35 @@ attacker-poisonable):**
        message): the repair bulk must be A→B, and exactly two
        mechanisms can produce it. (a) PRIMARY — the TRUE
        ALL-FABRIC RESET: overflow marks the window lossy and
-       closes BOTH connections to the peer ATOMICALLY, suppressing
-       reconnection until the sender has observed a true
-       both-empty epoch — and the observation is made reliable by
-       a SENDER-SIDE FIRST-EOF CASCADE (v9.9.22, round-37 Codex B1:
-       EOF handling clears one slot at a time
-       (`sync_conn_read.go:14`, `sync_conn.go:480`) while fabrics
-       reconnect independently (`sync_conn.go:388, :435`), and B
-       has no observation that A processed both EOFs — fab0
-       reconnecting before fab1's EOF leaves `wasDisconnected ==
-       false` and no cold-prime, while holding B's barrier
-       indefinitely is an availability outage): with an obligation
-       outstanding for the peer, the SENDER's first EOF on either
-       fabric cascades — it atomically clears BOTH slots (treats
-       the peer as fully disconnected, declining further traffic on
-       the survivor), so the NEXT connection install computes
-       `wasDisconnected == true` deterministically and cold-primes;
-       B's barrier is then bounded (it holds only until the first
-       EOF lands — the cascade guarantees the both-empty state
-       from there). (The equivalent alternative — an acknowledged
-       reset generation, where B's reset carries a generation the
-       sender acks after clearing both slots — is the documented
-       fallback for transports where the cascade is unsafe.)
+       closes BOTH connections to the peer ATOMICALLY — and the
+       sender-visible both-empty signal is the EXISTING heartbeat
+       detector, not a cascade over sender state the primary path
+       does not have (v9.9.23, round-38 Codex B1 + round-38 SMR F1:
+       the v9.9.22 "sender-side first-EOF cascade with an
+       obligation outstanding" is incoherent on the primary path —
+       the overflow obligation is RECEIVER-side, A holds no
+       obligation, and A cannot distinguish B's deliberate
+       full-close from an ordinary one-fabric flap, where clearing
+       the surviving slot would be an availability regression;
+       round-38 Codex's alternatives — an authenticated reset/ack
+       signal or an unconditional cascade with an accepted
+       flap-cost — are both unnecessary): B's atomic close stops
+       its heartbeat-acks on BOTH fabrics, so A's heartbeat
+       detector (threshold 5 × 200 ms = 1 s) declares the peer
+       down and clears ANY slot whose TCP EOF has not yet
+       processed — BOTH of A's slots are empty within ~1 s
+       deterministically regardless of EOF scheduling, and a
+       one-fabric flap keeps heartbeats alive on the survivor so
+       no peer-down declaration ever fires for it (the flap
+       confusion does not exist); B holds a bounded reconnect
+       barrier (≥ 2× the heartbeat timeout + RTT margin) before
+       redialing, so A's both-empty state has long landed when the
+       first new connection installs and `wasDisconnected == true`
+       cold-primes; and B's inbound-repair obligation is DURABLE —
+       a pathological miss (no bulk arrives) never clears it, and
+       B escalates to a second close-both with exponential backoff
+       (the barrier grows past any feasible heartbeat-detector
+       delay, so the retry terminates).
        Cold-prime then drives the sender's FULL bulk A→B with the
        config-first ordering of (3); the
        once-per-latched-epoch latch keeps this from hot-looping.
@@ -1208,7 +1224,39 @@ attacker-poisonable):**
        repair bulk); the obligation discharges ONLY on the ACK
        echoing the exact repair ID; a legacy sender ignores the
        request, and the receiver falls back to (a) after a
-       bounded wait; unnegotiated peers always use (a). (c)
+       bounded wait; unnegotiated peers always use (a). The repair
+       ID also orders the repair's CONTENTS, not just its
+       completion (v9.9.23, round-38 Codex B2: `BulkSync` pins one
+       connection (`sync_bulk.go:53`) while queued incrementals
+       choose whichever fabric is currently active
+       (`sync_conn_write.go:268`) — repair N's bulk on delayed
+       fab1 carries E1's older INSTALL while fab0 delivers E1's
+       fresh higher-generation DELETE first
+       (`sync_conn_gen.go:156`), and the delayed fab1 `BulkStart`
+       then clears the tombstone via `resetRecvGen`
+       (`sync_conn_read.go:183`, `sync_conn_gen.go:324`), letting
+       the stale INSTALL publish and the exact-N `BulkEnd`
+       reconcile/ACK/discharge with B holding stale E1): while a
+       repair obligation is armed, the receiver FREEZES
+       incremental application — incoming installs/deletes on any
+       fabric BUFFER (in order) rather than publishing — and
+       flushes the buffer AFTER the repair's BulkEnd lands (the
+       buffered DELETE then lands after the repair's older
+       INSTALL, restoring recency by construction); and a bulk
+       whose ID is not the current repair ID is WHOLLY
+       NON-MUTATING — its `BulkStart` does not `resetRecvGen`,
+       its installs do not publish, its BulkEnd neither
+       reconciles nor ACKs (it is quarantined/discarded, never
+       "applied but unable to discharge" — today's handlers would
+       otherwise publish every INSTALL and reconcile every
+       completed bulk immediately, `sync_conn_read.go:98, :241`).
+       The repair covers SENDER-SIDE in-flight loss identically
+       (v9.9.23, round-38 SMR F2: during the close→detect window
+       A's outbound queue keeps accepting and transmitting deltas
+       into dying sockets; the cold-prime/repair FULL bulk
+       reconstructs those too — the repair is not limited to
+       receiver-park drops).
+       (c)
        OBLIGATION BOOKKEEPING, direction-split and
        generation-specific (round-36 Codex B1: bulk epochs are
        allocated at `sync_bulk.go:65` but the pending epoch is
@@ -1446,9 +1494,45 @@ attacker-poisonable):**
        materialization; a promoted imported flow KEEPS its
        GroupHold (the origin flip touches no allocator state —
        no retain is needed at promote and no variant transition
-       ever occurs; the DirectHold path applies only to flows
-       ADMITTED locally via `allocate_translation`, never to
-       promoted imports). ESCROW — the keeper holds the variant's
+       ever occurs; the DirectHold path applies to EVERY
+       locally-admitted allocation path (v9.9.23, round-38 Codex
+       H5 — not just `allocate_translation`: deterministic PAT
+       (`source.rs:1431`), deterministic NAT64 (`source.rs:995`),
+       address-only round-robin (`source.rs:1523`), and persistent
+       address-only (`source.rs:1497`) admit locally too and hold
+       `DirectHold`), never to promoted imports). The token's enum
+       tag is the provenance, but the CARRIAGE rule separates the
+       two variants (v9.9.23, round-38 Codex H5 — "the tag travels
+       through commands" contradicted the replay rule that queued
+       commands contain no hold token (:1732)): `DirectHold` is
+       LINEAR and never cloned — a queued command that would need
+       one references the durable coordinator registry entry
+       instead (the side-map token is inserted by the executing
+       worker from the registry, never by the queue); `GroupHold`
+       clones are freely clonable BY DESIGN — fan-out, commands,
+       and detached carriers each hold a clone, which is exactly
+       the distribution model. ALLOCATION-INSTANCE IDENTITY (v9.9.23,
+       round-38 Codex B3 — the identity-conditional replacement
+       fixed P1→P2 ordering but not a NEW incarnation reusing the
+       SAME flow key K and tuple P: `SourceNatFlowKey` carries no
+       session identity (`source.rs:144`), an exact `(K,P)`
+       reserve is a no-op (`allocator.rs:1664`), so a
+       different-incarnation G2 over the same `(K,P)` receives no
+       new allocator credit — and G1's later deferred release by
+       `(K,P)` (`allocator.rs:1318`) would remove ownership
+       beneath the live E2, freeing P for reissue
+       (`allocator.rs:1007`)): `LiveAllocation` gains an
+       immutable ALLOCATION GENERATION (a per-allocator u64
+       minted at every ownership creation); the group-hold and
+       every deferred-release receipt carry it; a same-`(K,P)`
+       `NoChange` across session incarnations TRANSFERS the
+       incumbent group to the new incarnation (the incoming entry
+       clones the incumbent group-hold — reservation continuity
+       is by allocation generation, never re-credited); and every
+       deferred release compares the allocation generation before
+       removal (a queued release whose generation no longer
+       matches the live allocation is discarded as stale — the
+       ABA is structurally impossible). ESCROW — the keeper holds the variant's
        token (a DirectHold keeper or a GroupHold clone); the
        handoff/retokenization moves the variant unchanged. REAP —
        each variant drops only its own representation; and
@@ -1820,7 +1904,15 @@ attacker-poisonable):**
        obligation to a lock-free deferred-release queue instead of
        releasing inline — a `Drop` never acquires any lock, from
        any context (worker reap, panic unwind, migration cleanup);
-       the queue is drained by a context holding NO other locks,
+       the queue is drained by a coordinator-side task woken on
+       every enqueue (v9.9.23, round-38 SMR F3 — the drain context
+       is named and its progress rule stated: the task drains on
+       wake AND at least once per reconcile/migration span, holding
+       NO other locks; a finalizer's reservation lives at most one
+       drain interval longer than its last clone — never less,
+       bounded more; the queued item carries the allocation
+       generation and NO allocator handle, so a slot retarget
+       between enqueue and drain is resolved fresh by the drain),
        which performs the actual `slot.with_current()` release
        (bounded retry on retarget — the reservation simply lives
        until the drain, never less); and (ii) the migration's
@@ -1999,7 +2091,10 @@ attacker-poisonable):**
        at commit and each reap drops only its own clone, so an early
        replica reap can never free the reservation under a surviving
        replica). `ExpiredSession` gains the
-       entry's `flow_incarnation_id` (`entry.rs:337` lacks it today),
+       entry's full `SessionIdentity` (the
+       `(origin_process_nonce, flow_incarnation_id)` pair —
+       `entry.rs:337` lacks both today; v9.9.23, round-38 Codex B4:
+       one identity type everywhere, no scalar-ID stragglers),
        and every EXTERNAL-map mutation is fenced by the canonical
        shared alias AS THE INCARNATION TOKEN (v9.6, round-15 Codex B1:
        the conntrack values are exact 136/184-byte C mirrors whose
@@ -2327,7 +2422,11 @@ attacker-poisonable):**
        decodes only the generation (`sync_conn_read.go:150`) and
        applies gen-based deletes unconditionally (`sync_conn_gen.go:263`),
        so suppression is the only safe posture toward it); the receiver applies an identity-carrying
-       delete only when its stored incarnation matches. Only
+       delete only when its stored incarnation matches ("incarnation"
+       HERE AND EVERYWHERE in this plan means the full
+       `SessionIdentity { nonce, id }` pair, v9.9.23 — every
+       comparison is the pair, never the scalar
+       `flow_incarnation_id`). Only
        deliberately unconditional administrative clears ("delete
        everything regardless") keep separate, unconditional semantics
        and are documented as such. **Per-operation span (normative, v9.8):** every
@@ -2369,7 +2468,8 @@ attacker-poisonable):**
        becomes incarnation-conditional (today key-only,
        `session_glue/mod.rs:851` → `delete_synced.rs:9`: a delayed E1
        cleanup can kill replacement E2) — the command carries the
-       expected id and deletes only on match. The Close delta carries
+       expected `SessionIdentity` (the FULL pair, v9.9.23 — not a
+       scalar id) and deletes only on match. The Close delta carries
        `(origin_process_nonce, flow_incarnation_id)` end to end
        (additive fields on `SessionDelta` + the event codec + the Go
        decoder — today the codec drops both, `session_sync.rs:215`,
@@ -3218,7 +3318,28 @@ admitted interval):
   canonical-family removal, then internal-clone drop); and the
   token-drop-free WRITE span (a last-clone drop during a
   migration defers to the release queue — no inline gate READ;
-  the tunnel-remap purge runs before the WRITE permit). (e) the typed undo receipt — `NoChange` replay rolls
+  the tunnel-remap purge runs before the WRITE permit). (d4)
+  v9.9.23 mechanisms: the heartbeat-detector cascade (B closes
+  both fabrics; A's detector clears both slots within ~1s with NO
+  cascade over sender state — a one-fabric flap never triggers
+  it); repair-content ordering (with a repair armed, incrementals
+  on any fabric BUFFER and flush after the repair's BulkEnd — the
+  fab0-DELETE-then-delayed-fab1-INSTALL schedule restores
+  recency; a wrong-ID bulk is wholly non-mutating — no
+  resetRecvGen, no publish, no reconcile, no ACK); the
+  allocation generation (same-(K,P)/different-incarnation
+  `NoChange` TRANSFERS the incumbent group to the new incarnation
+  without re-crediting; a deferred release whose generation
+  mismatches the live allocation is discarded — no
+  release-beneath-live-E2); one `SessionIdentity` type (the
+  family sweep, Close fencing, `ExpiredSession`, `DeleteSynced`,
+  the alias fence, and the cleanup recheck all compare the full
+  pair — a `(n1,id7)` cleanup never matches `(n2,id7)`);
+  DirectHold scope (every locally-admitted path — PAT,
+  deterministic, address-only, persistent address-only — holds
+  DirectHold; commands reference the durable registry, never a
+  cloned linear token); and the two-stage cleanup counts queued
+  clones consistently (r37-5's disposition condition). (e) the typed undo receipt — `NoChange` replay rolls
   back nothing (pre-existing ownership untouched), `Inserted`/
   `Retained` undo exactly their mutation, and `Replaced(old_state)`
   with a FAILED new claim reinstates the displaced record's tuple +
@@ -3672,7 +3793,8 @@ It is therefore split to its own research track:
    (phase2-brief.md). Is any part of the ISSUE's actual harm left
    unaddressed by Part A + Part B? Name it with a trace, or the split
    stands.
-2. **The pre-existing NAT release bug (round-12 Codex 1, filed):**
+2. **The pre-existing NAT release bug (round-12 Codex 1, #6522 —
+   CLOSED by this plan):**
    every expired forward unconditionally calls release
    (`loop_body/mod.rs:1481`) and the allocation has no replica
    refcount (`nat/allocator.rs:1318, :1664`), so an idle sibling
