@@ -3966,12 +3966,23 @@ indefinitely — with the mixed-version rules byte-exact
 preserved byte-for-byte — today's v1 reads its challenge from
 the fixed bytes `payload[2:34]` and always uses the nonce-only
 proof (`sync_auth.go:345-376, :387-404`), so the v2 fields
-ride a NEW FRAME TYPE after the untouched legacy HELLO frame
-(v9.9.45.1, round-50 SMR: the length-prefixed demux skips an
-unknown frame type by length — `handleMessage`'s switch has
-no default arm, `sync_conn_read.go`, so an old peer silently
-skips the v2 frame; the v1 HELLO's own layout is NEVER
-reordered or extended in-frame, or an old peer would
+ride a NEW FRAME TYPE — but NEVER between the legacy HELLO
+and the AUTH_PROOF (v9.9.49, round-51 Codex B1: the v1 peer
+during authentication does NOT use `handleMessage`'s skip
+logic — after HELLO it reads exactly ONE raw frame
+(`sync_auth.go:392`) and requires it to be
+`syncMsgAuthProof` (`:401-404`); unknown-frame skipping
+starts only at `sync_conn_read.go:96`, AFTER auth and
+wrapper installation (`sync_conn.go:116`): a v2 endpoint
+that has read the peer HELLO sends the v1 AUTH_PROOF
+IMMEDIATELY when EITHER version is v1 (no pre-proof frame of
+any new type), and the capability exchange occurs INSIDE the
+authenticated wrapper (post-install, via `CAPABILITY_CONFIRM`);
+a pre-proof capability record may be sent only when BOTH
+HELLO versions are v2 — the version field in the HELLO
+(`sync_auth.go:345`'s `{version, keyed, nonce}`) tells the
+v2 peer which case it is in; the v1 HELLO's own layout is
+NEVER reordered or extended in-frame, or an old peer would
 authenticate different bytes and reconnect-loop at
 `:401-404`); EITHER peer being v1 selects the v1 proof (a v2
 peer proving to a v1 peer uses the v1 nonce-only proof over
@@ -4026,12 +4037,25 @@ field-list phrasings could conflict and independent
 implementations could compute different proofs and
 reconnect-loop (`sync_auth.go:401-404`,
 `sync_conn.go:106-110, :435-477`):
-`AUTH_PROOF_v2 = HMAC(key, tag_v2 || role ||
-prover_record || verifier_record)`, where `tag_v2` is the
-literal ASCII `xpf-cluster-sync/v2/hello-transcript`, `role`
-is one byte (`0x01` dialer / `0x02` acceptor), the records
-are the raw HELLO frames in (dialer-first) order each
-prefixed by its u16-LE length — with the pair IDENTICAL for
+`AUTH_PROOF_v2 = HMAC(key, tag_v2 || prover_role ||
+dialer_hello || acceptor_hello || dialer_cap ||
+acceptor_cap)` (v9.9.49, round-51 Codex B2 — the earlier
+`prover_record || verifier_record` conflicted with
+"dialer-first" for an acceptor proof, and the legacy HELLO
+carries only `{version, keyed, nonce}` (`sync_auth.go:345`),
+so the capability fields need their own record): `tag_v2` is
+the literal ASCII `xpf-cluster-sync/v2/hello-transcript`;
+`prover_role` is one byte (`0x01` dialer / `0x02` acceptor)
+identifying WHICH side computed this proof; `dialer_hello`
+and `acceptor_hello` are BOTH sides' exact legacy-HELLO
+payloads in FIXED (dialer, acceptor) order regardless of
+who proves; `dialer_cap` and `acceptor_cap` are the two
+capability records (each carrying `(node_id,
+process_incarnation, capacity, capacity_config_generation,
+the capability bits)`) in the same fixed order, each prefixed
+by its u16-LE length; all integers are little-endian; and
+golden HEXADECIMAL input/output vectors for BOTH proof
+directions ship in the test plan — with the pair IDENTICAL for
 both sides (v9.9.48, round-51 SMR F4: `prover_record` is the
 prover's OWN sent HELLO, which the verifier also holds as
 received, and `verifier_record` is the peer's HELLO as
@@ -4746,8 +4770,14 @@ admitted interval):
   integers, own-transcript proof direction); the legacy HELLO
   prefix preserved byte-for-byte (an old peer authenticates
   the same bytes — no reconnect loop); capability masking on a
-  v1-proof connection (reset-vN + the named frames never
-  offered); the mixed-version discharge matrix (repair-vN:
+  v1-proof connection (v9.9.49, round-51 Codex M3 — EVERY
+  capability is DISABLED on a v1-proof connection until
+  MATCHING authenticated `CAPABILITY_CONFIRM`s have been
+  received ON THAT SAME CONNECTION: no `reset-vN`, no
+  `repair-vN`, no identity enforcement, nothing negotiated —
+  a capability asserted without a matching confirm is ignored,
+  so neither side can enter repair-era completion while the
+  other follows legacy `BulkEnd` processing); the mixed-version discharge matrix (repair-vN:
   JOURNAL_END/JOURNAL_ACK; legacy→new: BulkEnd readiness
   retained; new→legacy INSTALL-only: no obligation armed,
   cold-prime clears on lossless emission); pre-HELLO
