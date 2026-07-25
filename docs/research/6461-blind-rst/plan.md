@@ -859,7 +859,24 @@ attacker-poisonable):**
        publish, leaving the installed entry holding E1's decision on
        E2's port): in one critical section, check that the live
        allocation for this tuple equals the decision's exact translated
-       tuple AND register a holder on it. The entry then carries
+       tuple AND register a holder on it. The hold is an **owned token
+       with a complete lifecycle (v9.6, round-15 Codex B3):** the token
+       carries the exact allocator/allocation identity; a re-import/
+       upsert TRANSFERS it atomically from the old entry to the new
+       one in the same operation (retain-before-replace — never
+       leak-per-refresh and never release-then-reacquire,
+       `install.rs:322`); every non-reap deletion path releases it
+       explicitly (common `remove_entry` returns the entry — all
+       callers drain the token, `session/mod.rs:1746`), and worker
+       shutdown drains the table's outstanding tokens
+       (`loop_body/mod.rs:1428`); one-shot consumers (embedded-ICMP)
+       use a SCOPED guard token released at end of packet processing
+       (the µs-scale window is the only exposure, and the packet
+       already forwarded is the only effect); a synthesized reverse
+       entry's hold references the FORWARD allocation and releases
+       through the forward allocation's refcount (not the reverse
+       early-return path at `source.rs:789`); and the refcount itself
+       is overflow-checked. The entry then carries
        `nat_hold: bool`; its reap decrements the holder count
        REGARDLESS of origin (the retain is per-entry), and the
        allocation frees only at refcount zero. **That refcount IS
@@ -908,20 +925,32 @@ attacker-poisonable):**
        port, and the re-steering edge (two locally-born entries for
        one flow) is also covered by the refcount). `ExpiredSession` gains the
        entry's `flow_incarnation_id` (`entry.rs:337` lacks it today),
-       and the reap's EXTERNAL-map deletes (BPF/conntrack,
-       `loop_body/mod.rs:1490, :1507`) become incarnation-conditional:
-       the conntrack value carries the `flow_incarnation_id` in a new
-       spare field (old Go decoders ignore it,
-       `bpf_session_value.go:204` precedent), and the delete fires
-       only when the map's stored id matches the expiring entry's or
-       the slot is absent — worker B's E2 publication
-       (`poll_descriptor/mod.rs:2578, :2591`) can no longer be
-       key-deleted by worker A's stale E1 reap. The publication side
-       (E2's BPF publish at :2578 before its canonical record at
-       :2591) gets the same compare on the write path: the publish
-       writes only when the slot is absent or holds the SAME
-       incarnation. Tuple-scoped queued-frame cancellation stays
-       unconditional (bounded packet loss only, safe).
+       and every EXTERNAL-map mutation is fenced by the canonical
+       shared alias AS THE INCARNATION TOKEN (v9.6, round-15 Codex B1:
+       the conntrack values are exact 136/184-byte C mirrors whose
+       padding is 1/2/4-byte alignment gaps, not a spare u64
+       (`xpf_conntrack.h:17, :82`, `bpf_session_value.go:5, :39, :59`),
+       the redirect map stores a u8 action, and DNAT values lack any
+       incarnation — so no map-ABI field is possible without a shim
+       change this plan forbids; the canonical shared alias already
+       carries the id and IS the sidecar). The rule: DELETES are
+       compare-gated — the alias is compare-deleted first under the
+       canonical lock, and the external state (redirect/conntrack/
+       DNAT/canonical BPF) is deleted ONLY when the alias delete won
+       (slot held OUR incarnation) or the slot was already absent; a
+       stale E1 re-check right before deletion sees E2's alias and
+       skips everything. WRITES are last-writer-wins driven by live
+       traffic — E2's publish is never blocked by E1's stale slot
+       (round-15 Codex B1's E2-rejection defect: a same-incarnation
+       write rule would reject the legitimate replacement); the
+       write's own commit-time verify-and-retain already established
+       that the writer is live. This closes the E1-lookup→E2-overwrite
+       →E1-delete race (`publish_conntrack.rs:142`'s BPF_ANY write vs
+       `bpf_map/mod.rs:321`'s key-only delete): E1's delete re-reads
+       the alias in the same lock it deletes from and finds E2. No
+       shim/meta change, no `make generate`. Tuple-scoped queued-frame
+       cancellation stays unconditional (bounded packet loss only,
+       safe).
        No Close producer is required; staleness is bounded. (The
        Go-side floor already exists — `pkg/conntrack` GC with HA
        delete-sync callbacks.)
@@ -1205,8 +1234,20 @@ closing-flagged packet never reaches this path at all (rule 5 — the
 ownership promote is skipped wholesale)**, so there is no partial-promote
 transaction to specify: no origin flip, no Close-authority arming, no
 self-heal suppression, no refresh question (round-4 Codex 2). A
-non-closing promoting packet refreshes/promotes exactly as today.
-Wire-driven `update_session` callers (no packet) skip validation.
+non-closing promoting packet's OWNERSHIP promote is computed at resolve
+but APPLIED at the packet's commit arm (v9.6, round-15 Codex B2 —
+uniform with the establishment promote: today
+`maybe_promote_synced_session` flips origin, refreshes, republishes,
+replicates, and emits Open at RESOLVE time, before input filters and
+the TTL check at `poll_descriptor/mod.rs:846`, so an undelivered
+packet would stamp ownership/refresh/Open state; at the commit arm
+only delivered packets do). **Probation entries additionally SUPPRESS
+ownership promotion, Open emission, replication, and every family-clock
+stamp until a committed non-close packet clears the flag** (round-15
+Codex B2's two-packet chain: refused close → probation zombie, blind
+non-close → promote → SharedPromote authority — under v9.6 the blind
+non-close neither promotes nor refreshes a probation entry; the
+zombie dies at 20 s unless real traffic arrives).
 
 ### 5.6 Constructor gating (sites 2b + 2c)
 
@@ -1369,7 +1410,7 @@ and one ungated node, each gating only its own packet-driven marks).
   (hit path, promote, materialize, synth, missing-forward).
   **Closing packets never promote** (neither `established` nor the
   `SharedPromote` ownership flip), so no Close authority can be armed
-  by an unvalidated close.
+  by a refused (out-of-window or no-baseline) close.
 - **Pre-packet validation:** a closing segment never updates the anchor
   (rule 1), never promotes (rule 5), and on refuse mutates nothing at all.
 - **Plausibility-gated slides:** the anchor cannot jump more than
@@ -1612,12 +1653,16 @@ admitted interval):
   (c) `fabric_ingress` imports take the same path. (c2) the
   pre-materialization transient purge (`session_glue/mod.rs:1165,
   :1181`, `promote.rs:167` — a detached `hit.shared_entry` driving
-  shared/local/BPF deletion and NAT release) and the activation
+  shared/local/BPF deletion and NAT release), the activation
   prewarm/republisher publication paths (`shared_ops.rs:304, :357,
-  :390, :448, :462`) all become incarnation-conditional: the
+  :390, :448, :462`), and the runtime tunnel-remap purge
+  (`ha/tunnel_purge.rs:24, :77` — snapshots keys/deltas under the
+  shared lock, then deletes by key later, and `session_import.rs:227,
+  :243, :264` treats the helper-local deletion as authoritative)
+  all become incarnation-conditional: the
   purge/publish fires only when the detached entry's
   `flow_incarnation_id` still matches the canonical record's (v9.4,
-  round-14 Codex H3b/c/d). (d) a validated
+  round-14 Codex H3b/c/d + round-15 Codex H4). (d) a validated
   close on an import marks it and the marking worker's 2 s reap emits
   the authoritative Close (exactly one — forward emits, reverse
   suppressed by `is_reverse`). (e) a live-but-quiet flow's alias

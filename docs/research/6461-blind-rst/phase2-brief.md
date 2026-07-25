@@ -11,8 +11,10 @@
 
 ## What the Phase-1 gate already gives (so Phase 2 is optional)
 
-- A blind close can never mark an entry → never produces a Close delta →
-  the cluster-kill channel (#6461's HA teeth) is dead with no wire change.
+- A refused (out-of-window or no-baseline) close can never mark an entry →
+  never produces a Close delta → the 1-packet-anytime cluster-kill
+  channel (#6461's HA teeth) is dead with no wire change; an in-window
+  blind guess validates by design (the plan's honest capability claim).
 - Imported entries are zero-trust absorbing: their closes refuse until
   churn (bounded; delivery unaffected; endpoints tear down normally).
 - Cleanup of stranded shared state: the family-clock TTL sweep
