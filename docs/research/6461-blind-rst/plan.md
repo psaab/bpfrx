@@ -1293,7 +1293,13 @@ attacker-poisonable):**
        installed connection with no inbound frame for the
        silence limit closes, ack history irrelevant — the
        `syncPeerSilenceTimeout` concept, `sync.go:91`, promoted
-       from liveness query to teardown), which makes the slot's
+       from liveness query to teardown; a quiet-but-VALID
+       connection is never at risk (v9.9.30, round-42 SMR F1:
+       heartbeat requests are outbound and the peer's ACK is an
+       inbound frame that resets the silence clock, so an
+       idle-but-alive connection always answers when asked —
+       silence means no inbound frames at all, including ACKs,
+       i.e. dead or partitioned), which makes the slot's
        drain deterministic in all cases; and (ii) the barrier's
        linearization is ONE lock domain: admission
        (`preAuthMu`, `sync_admission.go:66`), generation capture,
@@ -1375,7 +1381,13 @@ attacker-poisonable):**
        inside the coordinator's canonical lock — a mutation from
        a pre-cutoff connection or a superseded repair generation
        is discarded at the publication point, never published,
-       on BOTH the primary and the request paths). The repair
+       on BOTH the primary and the request paths; the
+       `connection_generation` is PER-PEER monotonic (v9.9.30,
+       round-42 SMR F2: a per-peer install counter bumped at
+       every `installConn` — never per-connection, or two
+       simultaneous connections sharing a value would let a
+       pre-cutoff handler's mutation pass the fence on the
+       sibling connection). The repair
        ID also orders the repair's CONTENTS, not just its
        completion (v9.9.23, round-38 Codex B2: `BulkSync` pins one
        connection (`sync_bulk.go:53`) while queued incrementals
@@ -1461,7 +1473,15 @@ attacker-poisonable):**
        application both complete — so a post-cut E2 delta
        delayed on another fabric can never arrive after
        readiness cleared, because readiness clears only at the
-       marker). The staging itself has a capacity and
+       marker); a sender crash/restart mid-repair is equally
+       pinned (v9.9.30, round-42 SMR F5: the obligation stays
+       undischarged BY DESIGN, and the sender's NEW incarnation
+       — new `origin_process_nonce` — supersedes every
+       outstanding repair obligation from the old incarnation,
+       because repair epochs are `(sender_incarnation,
+       bulk_epoch)`; the new incarnation's cold-prime bulk IS
+       the new repair, so no protocol-level recovery path is
+       needed for a half-flushed journal). The staging itself has a capacity and
        progress contract (v9.9.27, round-40 Codex H5: `BulkStart`
        advertises no member count and the per-payload 16 MiB cap
        (`sync_conn_read.go:62`) leaves aggregate staged state
@@ -1488,7 +1508,14 @@ attacker-poisonable):**
        switch at `BulkEnd` validation (a commit-epoch/root swap)
        — or rolled back completely on failure: no partial
        visibility ever, and the v9.9.28 SMR F4 intermediate-state
-       concern disappears with the shadow); and a bulk
+       concern disappears with the shadow; the shadow's cost and
+       read semantics are stated (v9.9.30, round-42 SMR F4: at
+       most one additional configured table's memory during a
+       repair — accepted: repairs are rare and the budget is
+       capacity-based, so the shadow is bounded by the same
+       capacity; and the visibility switch is an RCU-style
+       root/epoch swap, so in-flight lookups holding the old
+       root complete safely); and a bulk
        whose ID is not the current repair ID is WHOLLY
        NON-MUTATING — its `BulkStart` does not `resetRecvGen`,
        its installs do not publish, its BulkEnd neither
@@ -1831,7 +1858,16 @@ attacker-poisonable):**
        AND the hold-cell content — a worker-table mutation
        happens only after the CAS wins, so the promote-first-
        worker-then-canonical ordering can no longer split the
-       linearization). With the cell,
+       linearization); the cell's own ordering is pinned
+       (v9.9.30, round-42 SMR F3: the cell swap is
+       COUNT-PRESERVING across variants (direct 1 → group 1);
+       the canonical version/CAS runs after the allocator
+       section releases, per the no-nesting rule; a reap landing
+       between them decrements the CELL — the single counter, so
+       order-safe; a CAS failure swaps the cell BACK, which is a
+       no-op if the cell already released — the
+       `Converted(old_state)` undo IS the swap-back, never a
+       variant-specific decrement). With the cell,
        the receipt×variant transition matrix (v9.9.27, round-40
        Codex B3 — `NoChange` is defined as no-mutation/no-undo,
        so the conversion CANNOT be a `NoChange` arm: it is its own
@@ -2097,7 +2133,10 @@ attacker-poisonable):**
        on the external count's transition to zero —
        alternatively and equivalently, the drop site runs stage 2
        inline under the canonical lock when the count hits
-       zero); stage 2, with
+       zero; the retry queue drains from the coordinator side —
+       the same drain context as the deferred-release queue —
+       deduped by family key (a family re-quarantined while
+       queued updates in place, v9.9.30, round-42 SMR F6)); stage 2, with
        no external holder, atomically removes the quarantined
        canonical family (the pre-published BPF row and the shared
        forward+reverse entries, under the alias-token fencing) and
