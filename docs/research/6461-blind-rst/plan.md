@@ -950,7 +950,19 @@ attacker-poisonable):**
        but never touches the keeper — the keeper is permit-independent);
        when the last outcome lands, the keeper TRANSFERS to the
        replayed entries that retained (or releases if none did — the
-       flow failed to reinstall, and freeing is correct). Pending
+       flow failed to reinstall, and freeing is correct); a REJECTED
+       replay command additionally performs explicit family cleanup
+       (v9.9.10, round-25 Codex H4a: shared state survives teardown
+       (`coordinator/mod.rs:709`), replay publishes before command
+       consumption (`coordinator/mod.rs:761`), and a rejected upsert
+       today performs no family cleanup (`upsert_synced.rs:64`) — so
+       the pre-published BPF row and shared family would linger; a
+       later materialization would see stale E1
+       (`session_glue/mod.rs:1157`), fail its retain, and re-resolve —
+       potentially changing the live flow's port; the bring-up removes
+       the pre-published row and the shared family for rejected
+       commands under the alias-token fencing, so a rejection leaves
+       no residue). Pending
        commands are claimed-before-executed: a worker CLAIMS a pending
        command before running it, and the barrier converts only
        UNCLAIMED commands to rejections at the deadline; a CLAIMED
@@ -1135,8 +1147,15 @@ attacker-poisonable):**
        admission_epoch < activation)` would delete still-permitted
        flows of the displaced policy A when B is later deleted
        (`daemon_policy_invalidate.go:62`). The rule: entries stamp the
-       admitting rule's STABLE identity (content-addressed rule hash,
-       not the positional ID) plus the immutable forwarding generation
+       admitting rule's STABLE LOGICAL identity (the
+       `<from>-><to>/<name>` triple, `policies_ids.go:101` —
+       position-independent and same-content-different-name safe:
+       distinct P1 with identical content C inserted ahead of P2 gets
+       `<from>-><to>/P1` while P2 keeps `<from>-><to>/P2`, so deleting
+       P1 later can never select P2's flow — the content-addressed
+       rule hash supplement from earlier drafts was superseded in
+       v9.9.9 because a content-only identity cross-selects
+       same-content rules) plus the immutable forwarding generation
        at install; the invalidation predicate selects only entries
        whose stamped stable rule identity is in the deleted set AND
        whose stamped forwarding generation is BEFORE the invalidated
@@ -1150,9 +1169,13 @@ attacker-poisonable):**
        from the same immutable forwarding snapshot. A usable monotonic
        generation exists today (`manager_generation.go:33`, published
        through `ValidationState` at `snapshot_refresh.rs:397`, and
-       `SessionEntry` already carries `install_epoch: u64` at
-       `session/mod.rs:348` — the stamp needs no layout change,
-       round-21 AGY); (b) **cluster-bulk cleanup**
+       the stamp is a NEW write-once
+       `admission_fwd_generation: u64` field — NOT `install_epoch`
+       (round-21 AGY's suggestion of `session/mod.rs:348` is corrected:
+       `install_epoch` is a worker-local MUTATION counter rewritten on
+       update and promotion, `session/mod.rs:761, :1384`, so it is NOT
+       the admission generation; the write-once field is stamped once
+       at entry creation and never rewritten); (b) **cluster-bulk cleanup**
        (`sync.go:1069, :1080-1126` — BulkStart-snapshot-driven, with a
        secondary→primary ownership flip expressly permitted mid-bulk,
        `sync_test.go:1535, :1573-1585`): the delete re-validates the
@@ -1173,10 +1196,26 @@ attacker-poisonable):**
        release-and-rescan is O(N²), retaining the iterator holds the
        global lock across the full clear, and collecting/sorting is
        O(N) memory): the shared session map gains an INSERTION-ORDERED
-       SECONDARY INDEX (ordered by `(install_epoch, key)` — maintained
-       alongside the map under the same lock exactly as the existing
-       secondary indexes (`nat_reverse_index`, `forward_wire_index`)
-       are maintained at `session/mod.rs` and `afxdp/shared_ops.rs`),
+       SECONDARY INDEX (ordered by a COORDINATOR-GLOBAL immutable
+       insertion sequence — a u64 seqno assigned by the coordinator on
+       every shared-map insert, monotonic and never rewritten — then
+       key as tiebreak; v9.9.10, round-25 Codex M5: `(install_epoch,
+       key)` is unusable because `install_epoch` is per-worker and
+       mutable (`session/mod.rs:761, :1384`) and `SessionKey` has no
+       order (`session/key.rs:9`). The index lives under the CANONICAL
+       shared map's OWN mutex — each shared map has its own mutex
+       (`coordinator/session_manager.rs:12`), so the index for map M
+       is maintained inside M's lock, and the documented family lock
+       order (canonical → NAT → wire → indexes) governs cross-map
+       transactions; the owner-index update at `shared_ops.rs:897` is
+       one of those separate locks and follows the same order). The
+       scan uses an EXCLUSIVE range cursor (entries with seqno >
+       cursor), with a scan-start high-watermark (entries inserted
+       after the watermark are next pass's work — the sweep is
+       periodic, so stragglers are covered next cycle); replacement
+       preserves the original seqno (upserts update the entry in
+       place keeping its seqno; a true remove+insert gets a new
+       seqno),
        and the scan iterates the INDEX with a cursor position, taking
        the lock per ≤1,024-entry chunk, advancing, releasing, and
        resuming from the cursor position — O(N) total with bounded
@@ -1218,27 +1257,35 @@ attacker-poisonable):**
        Part B adds the additive delete tail, and a mixed-version pair
        keeps today's gen-based unconditional delete on the old peer
        (the documented mixed-version behavior — and the stronger rule
-       (v9.9.9, round-24 Codex B1): a new sender SUPPRESSES
-       identity-dependent deletes (invalidation/conditional deletes)
-       toward a peer that has not negotiated identity enforcement —
-       a legacy receiver decodes only the generation
-       (`sync_conn_read.go:150`) and applies gen-based deletes
-       unconditionally (`sync_conn_gen.go:263`), so a stale
-       invalidation delete from the new sender would remove the
-       legacy peer's locally re-seeded authoritative E2 and its NAT
-       companions (`session_store.go:537`) in the dual-active window
-       (upgraded A and legacy B both believe they own the RG; A's
-       owner gate passes; A emits for peer-imported E1; `takeDeleteGenV4`
-       can return zero at `sync_conn_gen.go:176` or draw a fresh
-       greater generation at `sync_conn_write.go:69`). The rule: an
-       identity-dependent delete is emitted ONLY to a peer that has
-       negotiated enforcement (capability bit in the handshake); to an
-       unnegotiated peer, invalidation/conditional deletes are NOT
-       sent at all — the legacy peer's own invalidation pass (both
-       nodes run it, per v9.9.5) deletes its own E1s with the old
-       gen-based semantics (master's pre-existing behavior,
-       documented), and plain owner-validated Close deltas continue to
-       legacy peers as today); the receiver applies an identity-carrying
+       (v9.9.10, round-24 Codex B1 + round-25 Codex B1): a new sender
+       SUPPRESSES EVERY incarnation-dependent delete — invalidation/
+       conditional deletes AND plain Close deltas — toward a peer that
+       has not negotiated identity enforcement. A Close is
+       incarnation-dependent by CONSTRUCTION (it is about the sender's
+       own incarnation I1; the legacy receiver's key-based application
+       cannot distinguish E1 from a re-seeded E2 sharing the tuple:
+       during dual-primary overlap, legacy B replaces E1 with
+       authoritative same-key E2; new A later emits E1's legitimate
+       (or documented in-window blind) Close; A's local owner view
+       passes (`daemon_ha_userspace_stream.go:28`); the Close enters
+       the key-only delete path (`:393`); legacy B ignores the
+       identity tail, reads only generation (`sync_conn_read.go:150`),
+       accepts A's fresh/non-stale generation (`sync_conn_gen.go:263`),
+       and key-deletes current E2 and its NAT companions
+       (`sync_conn_gen.go:493`, `session_store.go:537`) — the exact
+       HA-propagated authoritative kill this issue forbids). The rule:
+       an identity-dependent delete (Close, invalidation, or
+       conditional) is emitted ONLY to a peer that has negotiated
+       enforcement (capability bit in the handshake,
+       `sync_auth.go:314-370`'s existing version/feature-flag
+       exchange, round-25 AGY); to an unnegotiated peer, NO
+       incarnation-dependent delete is sent at all — the legacy peer
+       cleans up its own E1 standby via its own aging, invalidation
+       pass (both nodes run it, per v9.9.5), and TTL-sweep machinery
+       (master's pre-existing behavior, documented). A legacy receiver
+       decodes only the generation (`sync_conn_read.go:150`) and
+       applies gen-based deletes unconditionally (`sync_conn_gen.go:263`),
+       so suppression is the only safe posture toward it); the receiver applies an identity-carrying
        delete only when its stored incarnation matches. Only
        deliberately unconditional administrative clears ("delete
        everything regardless") keep separate, unconditional semantics
@@ -1705,9 +1752,14 @@ non-close path.
 No public API exists to preserve: `SessionTable`, `account_packet`,
 `lookup_with_origin`, `update_session`, `install_with_protocol_with_origin`,
 `FlowCacheEntry` are all `pub(crate)`/`pub(super)`. gRPC/REST/CLI surfaces
-unchanged. HA sync wire unchanged (rolling-upgrade safe: no wire field
-added or reinterpreted; a mixed-version peer pair simply has one gated node
-and one ungated node, each gating only its own packet-driven marks).
+unchanged. HA sync wire unchanged IN PART A (the demote gate adds no wire
+field); Part B adds the rolling-gated additive identity tails on session
+INSTALL/Open AND DELETE messages (old decoders ignore them via the
+`sync_protocol.go:95-102, :470-497` trailing-field tolerance; a
+mixed-version peer pair has the new node suppressing ALL
+incarnation-dependent deletes toward the unnegotiated peer, with the
+legacy peer cleaning up via its own aging/invalidation/sweep machinery —
+documented mixed-version behavior).
 `UserspaceDpMeta` and the XDP shim are untouched.
 
 ---
@@ -2009,8 +2061,14 @@ admitted interval):
   O(N) total, no O(N²) rescan, no full-clear lock hold), The test schedules are the OPERATIVE
   races (round-20 Codex M5): policy invalidation — E2 admitted AFTER
   the new snapshot activates by the still-permitting version is
-  NEVER selected (config-epoch cut; the numeric-ID collision at
-  `policies_ids.go:60` is disambiguated by the epoch); cluster-bulk
+  NEVER selected (the stable logical rule ID
+  (`<from>-><to>/<name>`, `policies_ids.go:101`) disambiguates
+  same-content rules by name; the numeric positional ID
+  (`RuntimePolicyIndex`, `policies_ids.go:112`) is never consulted,
+  and the admission forwarding generation (write-once at entry
+  creation, never rewritten — NOT `install_epoch`'s mutation counter)
+  bounds the selection to entries admitted before the invalidated
+  snapshot's generation); cluster-bulk
   cleanup — a locally authoritative E2 committed after a mid-bulk
   secondary→primary flip (`sync_test.go:1535, :1573-1585`) FAILS the
   commit-time candidate-class re-validation (still peer-owned AND
