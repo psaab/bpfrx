@@ -346,7 +346,7 @@ in §1.*
 | 2 | `session/mod.rs:1396-1432` `update_session` via `promote_synced_with_origin` (HA shared-promote, `session_glue/promote.rs:99-107`) | wire packet flags on the promoting packet | same gate (flags threaded with seg view); no-baseline → refuse (§5.4 rule 3) |
 | 2b | **reverse-NAT companion synthesizer** — `session_glue/mod.rs:1262-1284` → `shared_ops.rs:857-865` → `install_with_protocol_with_origin` (seeds at `install.rs:179-180`) | wire packet flags on a reverse-tuple miss with a live forward match; runs at resolve time, BEFORE the #4400 guard | gate the seed with the validator against the in-hand forward entry's anchor; refused close → **skip the install entirely** (§5.6); a SHARED `ForwardSessionMatch` carries no anchor (`entry.rs:209`) → no-baseline → refuse → skip-install (round-2 Codex 8) |
 | 2c | **reactive shared materialize** — `materialize_shared_session_hit` (`session_glue/mod.rs:1092-1118`) threads the current packet's `tcp_flags` into `upsert_synced_with_origin` (seeds at `install.rs:399-400`) | wire packet flags on a shared-map hit | **round-2 Codex 1 / SMR 2 — v3 missed this constructor.** Gate the flag seed with the validator; an imported entry has no anchor → no-baseline → refuse → install the copy **alive** (`closing=false, reset=false`; the install cannot be skipped — the packet needs its decision and the entry must own the flow going forward) |
-| 3 | `install.rs:179-180` primary miss installs | creating packet flags | unreachable for bare closes on TRANSIT dispositions (#4400); **LocalDelivery is deliberately exempt** (`session_admission.rs:78`) — a host-inbound bare close can seed a new locally-born entry from raw flags (round-11 Codex 9b), harmless-by-class (owner-zero: Go excludes host-local sessions from HA sync, `daemon_ha_userspace_stream.go:29` — the entry's Close is local RT_FLOW only, never cluster-authoritative); SYN-bearing malformed closes are screen-owned |
+| 3 | `install.rs:179-180` primary miss installs | creating packet flags | unreachable for bare closes on TRANSIT dispositions (#4400) and LocalDelivery caches TCP only with SYN (`local_delivery.rs:20` — the "LocalDelivery bare-close seed" residual from round 11 does not exist, round-13 Codex M9). The actual residual: a SYN|RST/SYN|FIN new-flow packet passes the #4400 guard (it has SYN, `session_admission.rs:53`) and seeds closing/reset from raw flags — a self-anchoring invented-tuple entry (attacker kills only a flow it created — no victim impact, master parity since install.rs:179 seeded from flags before this plan); malformed SYN+close combos are screen-owned where screened |
 | 4 | HA wire re-import — eventstream `UpsertSynced` → `upsert_synced_with_origin` (no packet exists) | peer delta | validation-free by design (the peer validated before reaping and emitting the Close); distinct from site 2c, which HAS a packet |
 | 5 | tunnel `UpsertLocal` (`tunnel.rs:563-615` → `session_glue/mod.rs:786-800`) | locally generated packets (firewall-originated tunnel TX) | trusted-local class, documented; not wire-attacker-controllable. Inbound tunnel closes land on site 1 with whatever anchor the inbound stream built — none if the flow is outbound-only → refuse-demote; local blast radius (round-2 Codex 5) |
 | 6 | fabric-return reverse seed (`cluster_peer_return_fast_path` install) | fabric-ingress packet flags | bare closes already excluded (#4453); SYN|ACK|RST/FIN combos pass the guards (`fabric.rs:404`) and seed raw flags — an unvalidated constructor, harmless-by-class (the seed is `is_reverse` → silent at reap; the non-owner's forward import validates closes at site 1 with no anchor in Phase 1 → refuse → no mark). The seed bypasses the commit hooks so it carries no anchor — a later close on it is REFUSED (missing-forward/no-baseline, §5.1); documented |
@@ -502,13 +502,18 @@ never inside the session lookup or the request-build stage:
   close is soft-refused RETAINS a slot/NAT reservation for the
   entry's ordinary timeout (300 s default, up to 86,400 s per-app) —
   a resource-retention objective some attackers prefer over a 2 s
-  demote that releases resources. It is a same-probability
-  resource-retention channel, bounded by the ordinary timeout (the
-  refused close never refreshes `last_seen`, §5.7), and accepted
-  because the alternatives (per-packet post-commit callbacks, or
-  freezing these anchors and soft-refusing every close on the
-  host-inbound victim class) are worse. All other arms are
-  commit-clean.
+  demote that releases resources. Its honest bound (round-12 Codex 11
+  + round-13 M9): spray duration PLUS one inactivity timeout — the
+  walk's follow-on packets are ordinary non-close packets that refresh
+  `last_seen` through the unchanged non-close path (`lookup.rs:150`,
+  `flow_cache_hit.rs:295`), so the attacker holds the entry only by
+  continuing to spray — exactly what a plain valid-looking keep-alive
+  spray already buys on master at identical in-window guess cost, so
+  this is NOT a new pin primitive; when the spray stops, the entry
+  idles out within one timeout. Accepted because the alternatives
+  (per-packet post-commit callbacks, or freezing these anchors and
+  soft-refusing every close on the host-inbound victim class) are
+  worse. All other arms are commit-clean.
 - **Pending-neighbor carriage (v7.2, round-6 Codex 5b):**
   `PendingNeighPacket` (`types/mod.rs:77`) currently carries no
   segment/proof token and `retry_pending_neigh`
@@ -764,9 +769,17 @@ attacker-poisonable):**
        liveness clock and compare-delete**:
        (a) `SyncedSessionEntry` gains `last_touch_ns: u64` AND
        `expires_after_ns: u64` (shared-map schema is node-local —
-       additive; the timeout is COPIED at publish time, fixing the
-       provenance gap round-12 Codex 6 found — the shared entry today
-       carries no timeout, `worker/mod.rs:375`). The family's clock
+       additive; the timeout is COPIED at publish time AND refreshed
+       on every later stamp — v9.2, round-13 Codex H6: a SYN publishes
+       the 20 s opening timeout (`install.rs:157` →
+       `poll_descriptor/mod.rs:2560`) and the handshake later gives the
+       entry its established/application timeout (`lookup.rs:146`);
+       the promote re-publish updates the field, and the 30 s batched
+       push carries BOTH `last_touch_ns` and the worker entry's current
+       `expires_after_ns`, each incarnation-conditional — a quiet
+       established flow can never be swept at `K × opening_timeout`
+       while its worker entry is valid, and an explicit
+       OPENING→ESTABLISHED sweep test is mandatory). The family's clock
        lives on the CANONICAL-KEY record of the family — the forward
        canonical entry when present, the REVERSE canonical entry for
        a lone reverse import (`ha/session_import.rs:78` — a
@@ -793,7 +806,10 @@ attacker-poisonable):**
        reverse for a lone reverse import) — every family event/push on
        any member (canonical forward, canonical REVERSE
        (`ha/session_import.rs:104` — named in the family), NAT alias,
-       forward-wire alias) stamps THAT record's
+       forward-wire alias, and the `dnat_table` side effect created at
+       `ha/session_import.rs:122` and removed by normal cleanup at
+       `:273` — named in the family and in the deletion order, round-13
+       Codex M9) stamps THAT record's
        `last_touch_ns` via a helper that resolves the canonical key
        (reads never stamp, per (a));
        the sibling clones carry no clock of their own (round-11 Codex
@@ -809,14 +825,43 @@ attacker-poisonable):**
        sweep, and a promote/republish mid-scan either updates the
        incarnation (mismatch → skip) or the recheck passes (same
        incarnation → correct delete). **The
-       detached-clone race (round-12 Codex 2) is closed at the
-       materialize commit:** `materialize_shared_session_hit` re-reads
-       the canonical record under the canonical lock at commit and
-       requires (i) the clone's `flow_incarnation_id` to still match
-       the record's AND (ii) for NAT'd decisions the reservation to
-       still be live (a retain probe) — on either failure the stale
-       decision is DISCARDED and the packet re-resolves through the
-       normal path (never installs a stale clone).
+       detached-clone race (round-12 Codex 2) is closed at
+       every shared-decision commit (v9.2, round-13 Codex B2/H5):**
+       the recheck applies at EVERY consumer of a cloned shared
+       decision — `materialize_shared_session_hit`; the reverse-synth
+       path (`lookup_forward_nat_across_scopes`,
+       `shared_ops.rs:638-665` → `install_reverse_session_from_forward_match`);
+       the embedded-ICMP consumers (`icmp_embed/nat_match_v4.rs:41`,
+       `nat_match_v6.rs:66`); and the asynchronous upsert/prewarm
+       command consumption (activation prewarm clones at
+       `shared_ops.rs:304, :357`; replication clones at
+       `session_glue/mod.rs:838`; install at `upsert_synced.rs:64`).
+       Each consumer re-reads the canonical record under the canonical
+       lock at commit and requires the clone's `flow_incarnation_id`
+       to still match the record's; AND every install/publish path
+       REQUIRES its NAT reservation reserve to succeed
+       (`upsert_synced.rs:80` currently ignores reserve failure and
+       publishes anyway at :112 — failure now discards and
+       re-resolves, never publishes a stale decision). On either
+       failure the stale decision is DISCARDED and the packet
+       re-resolves through the normal path (never installs or
+       forwards on a stale clone). The NAT retain needs no separate
+       probe: the incarnation compare distinguishes E1 from E2 on the
+       alias (E2's republish changes the id; E1's purge removes the
+       record — both fail the compare), and the re-resolve's own
+       fresh reservation is correct for the flow the packet actually
+       belongs to.
+       **Uniform incarnation fencing for every local Close mutation
+       (v9.2, round-13 Codex B1):** a stale E1 Close can otherwise
+       erase replacement E2 locally — the worker reaps E1, queues the
+       Close (`loop_body/mod.rs:811`), processes packets that install
+       same-key E2 (`:887`), then drains the stale Close (`:970`) —
+       which today key-deletes queued traffic, BPF/conntrack/DNAT
+       state, current shared aliases, and peer replicas
+       (`session_delta.rs:84, :406`, `shared_ops.rs:960`). Every local
+       mutation driven by a Close delta becomes incarnation-conditional
+       on the delta's `flow_incarnation_id` (queued packet drops are
+       tuple-scoped and safe; state deletes compare first).
        (d) **The NAT reservation drives the alias purge — via the
        LAST holder, not any worker's reap (v9, round-12 Codex 1):**
        locally-born forwards replicate to every sibling worker
@@ -1094,7 +1139,13 @@ segments only; the no-close path is byte-identical):
    and here is that propagation + `push_to_wheel`, `lookup.rs:198-218`,
    same thread, no observer of the interim state): probe the forward
    entry, read the pre-packet anchor AND the forward entry's
-   `established`, run §5.4.
+   `established`, run §5.4. An accepted mark applies the FULL mark
+   semantics atomically (v9.2, round-13 Codex M8): sticky `closing`/
+   `reset` with `reset` set BEFORE the timeout recomputation, the
+   `expires_after_ns` recompute, the `last_seen_ns` refresh, and the
+   wheel push — on the matched entry and, at the reverse-synth accept
+   site, on the forward family in hand (so the forward emits at its
+   2 s reap; §5.6).
    - **Accept:** re-probe the matched entry, set `closing`/`reset`
      (`reset |=` BEFORE timeout selection, preserving #3046 ordering;
      OR-assignment preserves #3489 stickiness), refresh `last_seen_ns`,
@@ -1162,8 +1213,15 @@ adopt `valid`+untrusted only, so a non-close attacker packet materializing
 a shared victim plants nothing usable; (ii) an imported replica carries no
 trusted anchor → every closing-flagged materialize is no-baseline →
 **refuse**: install the copy ALIVE (`closing=false, reset=false`)
-regardless of the packet's flags. Unlike site 2b the install cannot be
-skipped — the packet needs its decision and the entry must own the flow —
+but at the PROBATIONARY opening-window timeout (v9.2, round-13 Codex
+H7: a full-timeout alive install lets an attacker renew an obsolete
+non-NAT permit indefinitely with periodic blind closes — each
+materialize stamps the family clock and each zombie lives 300 s;
+probation bounds the zombie to 20 s and the sustain cost to
+1 packet/20 s), and a closing-flagged materialize does NOT stamp the
+family clock (only committed non-close packets and non-close events
+stamp). Unlike site 2b the install cannot be skipped — the packet
+needs its decision and the entry must own the flow —
 so the seed is suppressed instead. (Phase 2 §10.5's wire-carried anchor
 makes this site validatable; until then every materialize-seed close is
 refused by construction.)
@@ -1509,31 +1567,33 @@ admitted interval):
   active). (g) a newer same-key incarnation (re-seeded on the peer)
   is protected by the `(origin_process_nonce, flow_incarnation_id)`-
   conditional Go close processing where ids exist.
-- **v8.4 mechanism tests:** (a) mark rules — no constructor seeds
-  closing/reset without validation (reverse-synth refuse → no install;
-  materialize refuse → install alive unmarked; fabric SYN|ACK|RST seed
-  is `is_reverse`-silent; LocalDelivery bare-close seed is owner-zero
-  local-only); (b) wire mark — a Phase-2 anchor message carrying
-  `closing` marks the import (peer-validated); a Phase-1 reimport with
-  flags=0 erases the mark (documented residual, sweep cleans up);
-  (c) TTL/family — one canonical family clock (any member's event
-  stamps it); reads never stamp; compare-delete per member on
-  flow_incarnation_id under the documented lock order; a colliding E2
-  alias survives E1's sweep; the NAT reservation release purges the
-  alias family at release (zero hazard window); (d) incarnation —
-  reverse/fabric/tunnel constructors inherit the forward mint;
-  `DeleteSynced` deletes only on id match; the Close codec carries
-  `(origin_process_nonce, flow_incarnation_id)`; (e) Phase-2 —
-  per-bundle writer identity; coordinator-sequenced `coord_seqno`
-  (migration conflicts arrival-ordered); the owner gate compares
-  `writer_node == current_owner(rg)` (a non-owner's update is
-  rejected); `AnchorStreamStart` required before incrementals on
-  every connection incl. secondary fabrics; `observed_ns` freshness
-  computed by the receiver (a retried frame reports its true age);
-  epoch activation atomic with the `BulkStart` write; (f) resource-
-  retention residual asserted: a poisoned anchor soft-refuses the
-  endpoint's close and the entry idles at its ordinary timeout (no
-  `last_seen` refresh, §5.7).
+- **Part-B mechanism tests (v9.2):** (a) mark rules — no constructor
+  seeds closing/reset without validation (reverse-synth refuse → no
+  install; materialize refuse → probationary alive install, unmarked,
+  no clock stamp; fabric SYN|ACK|RST seed is `is_reverse`-silent;
+  SYN|RST invented-tuple self-anchors); (b) uniform fencing — every
+  local Close mutation is incarnation-conditional (a queued stale E1
+  Close drained after E2's install cannot delete E2's
+  BPF/conntrack/DNAT/aliases/replicas); `DeleteSynced` deletes only on
+  id match; (c) commit coverage — materialize, reverse-synth,
+  icmp_embed, and async upsert/prewarm consumption all perform the
+  incarnation recheck + required reserve (reserve failure → discard,
+  never publish); (d) TTL/family — one canonical-key family clock
+  (forward when present, reverse for lone reverse imports) with
+  `expires_after_ns` copied at publish and refreshed on every stamp
+  (OPENING→ESTABLISHED: a quiet established flow is never swept at
+  K × opening_timeout); compare-delete per member on
+  flow_incarnation_id under the documented lock order incl. the
+  dnat_table side effect; a colliding E2 alias survives E1's sweep;
+  the NAT reservation release purges the alias family only via the
+  LAST holder (pending #6522); (e) emission — the reverse-synth accept
+  marks the forward family atomically (full mark semantics: sticky
+  bits + reset-before-timeout recompute + last_seen + wheel push);
+  exactly one Close per flow (forward emits, reverse suppressed);
+  (f) resource-retention residual asserted: a poisoned anchor
+  soft-refuses the endpoint's close; the entry is held only while the
+  spray continues (bound: spray duration + one timeout); (g) wire
+  mark (Phase-2 track — see phase2-brief.md).
 - **Ack-stall residual (v7.2, round-6 Codex 7):** scaled-window loss
   burst (repair jump > raw-wnd gate) stalls `ack_hi` — leg-2
   restart-RST soft-refuses, legs 1/3 still validate normal closes;
