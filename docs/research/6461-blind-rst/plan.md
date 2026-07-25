@@ -952,17 +952,27 @@ attacker-poisonable):**
        replayed entries that retained (or releases if none did — the
        flow failed to reinstall, and freeing is correct); a REJECTED
        replay command additionally performs explicit family cleanup
-       (v9.9.10, round-25 Codex H4a: shared state survives teardown
-       (`coordinator/mod.rs:709`), replay publishes before command
-       consumption (`coordinator/mod.rs:761`), and a rejected upsert
-       today performs no family cleanup (`upsert_synced.rs:64`) — so
-       the pre-published BPF row and shared family would linger; a
-       later materialization would see stale E1
-       (`session_glue/mod.rs:1157`), fail its retain, and re-resolve —
-       potentially changing the live flow's port; the bring-up removes
-       the pre-published row and the shared family for rejected
-       commands under the alias-token fencing, so a rejection leaves
-       no residue). Pending
+       (v9.9.11, round-25 Codex H4a + round-26 Codex B3: shared state
+       survives teardown (`coordinator/mod.rs:709`), replay publishes
+       once and fans the same entry to EVERY worker
+       (`coordinator/mod.rs:770`, `session_glue/mod.rs:838`), and a
+       rejected upsert today performs no family cleanup
+       (`upsert_synced.rs:64`) — so the pre-published BPF row and
+       shared family would linger; a later materialization would see
+       stale E1 (`session_glue/mod.rs:1157`), fail its retain, and
+       re-resolve — potentially changing the live flow's port. The
+       rule: an individual rejection only DECREMENTS the allocation's
+       pending-command count (round-26 Codex B3's mixed-outcome trace:
+       W0 installs E1, retains its hold, and publishes successfully
+       (`upsert_synced.rs:64`); W1 rejects; W1's cleanup carries the
+       same incarnation, so alias fencing passes and deletes the
+       common family/BPF row underneath W0's live entry); the family
+       cleanup (removing the pre-published row and the shared family
+       under the alias-token fencing) runs ONLY after the FINAL
+       outcome for that entry and ONLY when `installed_count == 0`
+       (every replica rejected — the flow failed to reinstall, and
+       freeing is correct), so a mixed-outcome fanout can never delete
+       a successfully installed sibling replica). Pending
        commands are claimed-before-executed: a worker CLAIMS a pending
        command before running it, and the barrier converts only
        UNCLAIMED commands to rejections at the deadline; a CLAIMED
@@ -1175,7 +1185,26 @@ attacker-poisonable):**
        `install_epoch` is a worker-local MUTATION counter rewritten on
        update and promotion, `session/mod.rs:761, :1384`, so it is NOT
        the admission generation; the write-once field is stamped once
-       at entry creation and never rewritten); (b) **cluster-bulk cleanup**
+       at entry creation and never rewritten) — and its END-TO-END
+       home is explicit (v9.9.11, round-26 Codex H5: the selection
+       runs over shared aliases, but `SyncedSessionEntry` carries
+       neither policy field today, `worker/mod.rs:375`, and the
+       generation currently lives in separately published
+       `ValidationState` — coordinator and worker ordering permits
+       old-validation/new-forwarding observation,
+       `snapshot_refresh.rs:397`, `loop_body/mod.rs:462`, so a newly
+       admitted E2 on a modified-rule invalidation can carry the old
+       generation and satisfy the historical delete predicate): the
+       generation moves INTO `ForwardingState` (which gains it —
+       `types/forwarding.rs:33` has none today; the compiler bumps it
+       per snapshot, so the generation and the policy it carries are
+       published atomically together), and BOTH selector fields
+       (`stable_rule_id_hash`, `admission_fwd_generation`) are stamped
+       into local, shared, AND imported entries with their
+       install/import carriage defined (installed entries stamp at
+       creation from the current `ForwardingState` snapshot; imported
+       entries inherit the sender's stamp via the same additive
+       install tail that carries the incarnation); (b) **cluster-bulk cleanup**
        (`sync.go:1069, :1080-1126` — BulkStart-snapshot-driven, with a
        secondary→primary ownership flip expressly permitted mid-bulk,
        `sync_test.go:1535, :1573-1585`): the delete re-validates the
@@ -1283,9 +1312,30 @@ attacker-poisonable):**
        HA-propagated authoritative kill this issue forbids). The rule:
        an identity-dependent delete (Close, invalidation, or
        conditional) is emitted ONLY to a peer that has negotiated
-       enforcement (capability bit in the handshake,
-       `sync_auth.go:314-370`'s existing version/feature-flag
-       exchange, round-25 AGY); to an unnegotiated peer, NO
+       enforcement — and the negotiation is per-CONNECTION and checked
+       at EVERY write/replay (v9.9.11, round-26 Codex B2: deletes are
+       opaque `[]byte` queue/journal entries (`sync.go:467`,
+       `sync_conn_write.go:114`), and `sendLoop` retries an
+       already-dequeued frame on whichever connection becomes active
+       WITHOUT a send-time capability check (`sync_conn_write.go:268`)
+       — so an E1 Close admitted while B was capable can cross after B
+       reconnects as legacy and installs authoritative same-key E2,
+       and legacy B ignores identity and key-deletes E2 and its NAT
+       companions. The rule: every queued frame is tagged
+       `requires_identity_enforcement` (Close/invalidation/conditional
+       delete frames) or not; the frame is written or replayed ONLY on
+       a connection whose negotiated capabilities include enforcement,
+       and DROPPED (not retried) on any connection that lacks it — so
+       a capability downgrade between dequeue and write can never
+       carry an identity-dependent delete across. The capability
+       exchange runs on EVERY connection type (round-26 Codex B2's
+       second gap: the cited handshake at `sync_auth.go:321, :345`
+       carries no feature set and runs only when a PSK is configured —
+       the version/feature-flag exchange is made connection-type-
+       independent (a lightweight capabilities word in every
+       connection's hello), and unnegotiated legacy peers (raw frames
+       or `keyed=0`) never receive identity-dependent deletes); to an
+       unnegotiated peer, NO
        incarnation-dependent delete is sent at all — the legacy peer
        cleans up its own E1 standby via its own aging, invalidation
        pass (both nodes run it, per v9.9.5), and TTL-sweep machinery
