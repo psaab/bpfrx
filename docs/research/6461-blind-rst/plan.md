@@ -852,25 +852,32 @@ attacker-poisonable):**
        E2 can displace E1's NAT/wire alias while E1's canonical record
        is unchanged — a canonical-only compare would pass on a stale
        alias; static/interface NAT has no allocator conflict to catch
-       it). For NAT'd decisions the consumer performs a READ-ONLY
-       **translation-consistency verify** — NEVER an acquire (v9.4,
-       round-14 Codex B1: the reserve is not an incarnation fence and
-       is destructive — E2 allocates before publishing
-       (`poll_descriptor/mod.rs:2255`), the reserve reconstructs only
-       the tuple (`source.rs:880`), and `reserve_flow` can remove E2
-       and free its port before trying E1's old translation
-       (`allocator.rs:1671, :1675`); address-only reserve doesn't
-       verify the requested translation either (`:1748`). The verify
-       is: does the live allocation for this tuple exist AND equal the
-       decision's exact translated tuple? — a stale E1 decision whose
-       port was released/reused mismatches and is DISCARDED with a
-       re-resolve; an E2 whose translation is identical to E1's is the
-       SAME NAT decision and commits correctly. No holder semantics
-       needed, no #6522 dependency for THIS fence — #6522 stays a
-       pre-existing fix for the premature-release class). On any
-       failure the stale decision is DISCARDED and the packet
-       re-resolves through the normal path (never installs or
-       forwards on a stale clone).
+       it). For NAT'd decisions the consumer performs an atomic
+       **verify-and-retain** under the allocator's lock (v9.5 —
+       round-14 Codex B1 sharpened further: a READ-ONLY verify can
+       still race release+reuse between the check and the install's
+       publish, leaving the installed entry holding E1's decision on
+       E2's port): in one critical section, check that the live
+       allocation for this tuple equals the decision's exact translated
+       tuple AND register a holder on it. The entry then carries
+       `nat_hold: bool`; its reap decrements the holder count
+       REGARDLESS of origin (the retain is per-entry), and the
+       allocation frees only at refcount zero. **That refcount IS
+       #6522's machinery — this plan now includes it as a Part-B
+       requirement** (it also fixes the premature-release class
+       directly: the sibling replica's reap decrements its holder,
+       the live owner's stays, the port survives until the last
+       holder reaps; the v9.4 locally-born-only release rule is
+       superseded by the refcount, which is the general form).
+       Address-only flows retain identically (compare the requested
+       translated IP, `allocator.rs:1748` today returns the same-flow
+       allocation without comparing). A stale E1 decision whose
+       translation no longer matches is DISCARDED with a re-resolve
+       (and on retain failure the entry is never installed, so no
+       holder leaks); an E2 whose translation is identical to E1's is
+       the SAME NAT decision and commits correctly (retain succeeds).
+       On any failure the packet re-resolves through the normal path
+       (never installs or forwards on a stale clone).
        **Uniform incarnation fencing for every local Close mutation
        (v9.2, round-13 Codex B1):** a stale E1 Close can otherwise
        erase replacement E2 locally — the worker reaps E1, queues the
@@ -882,8 +889,8 @@ attacker-poisonable):**
        mutation driven by a Close delta becomes incarnation-conditional
        on the delta's `flow_incarnation_id` (queued packet drops are
        tuple-scoped and safe; state deletes compare first).
-       (d) **Reap-side release gated to locally-born entries (v9.4,
-       round-14 Codex B2), with the alias purge via the TTL sweep:**
+       (d) **Reap-side release via the holder refcount (v9.5 —
+       supersedes the v9.4 locally-born-only rule):**
        locally-born forwards replicate to every sibling worker
        (`poll_descriptor/mod.rs:2560`, `session_glue/mod.rs:838`), and
        every expired forward unconditionally calls release
@@ -892,18 +899,14 @@ attacker-poisonable):**
        sibling's AGE-reap can therefore release the live worker's
        shared allocation TODAY, on master, independent of this plan
        (the pre-existing hazard, **filed as #6522**). The v9.4 rule
-       closes the premature-release class WITHOUT the refcount:
-       `reap_expired_sessions` releases NAT/NAT64 allocations ONLY
-       for entries whose origin is locally-born — the forward entry
-       installs from the forward-direction packet, and all forward
-       packets land on ONE worker by queue steering, so exactly one
-       locally-born forward entry exists per flow (single releaser;
-       reverse entries already early-return; `WorkerLocalImport`
-       siblings are not locally-born and no longer release). The
-       residual re-steering edge (a flow re-homed mid-flight installs
-       a second locally-born entry on the new worker; the old one's
-       reap releases while the new one lives) is bounded, pre-existing,
-       and is exactly #6522's refcount fix. `ExpiredSession` gains the
+       every entry carrying a NAT hold releases it at reap and the
+       allocation frees only at refcount zero — the #6522 machinery
+       shipped as Part B (the forward entry's original reserve counts
+       as the first holder; replicas/materializes/synths retain at
+       commit per the verify-and-retain above; each reap decrements;
+       the sibling replica's reap no longer frees the live owner's
+       port, and the re-steering edge (two locally-born entries for
+       one flow) is also covered by the refcount). `ExpiredSession` gains the
        entry's `flow_incarnation_id` (`entry.rs:337` lacks it today),
        and the reap's EXTERNAL-map deletes (BPF/conntrack,
        `loop_body/mod.rs:1490, :1507`) become incarnation-conditional:
