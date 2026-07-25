@@ -917,6 +917,17 @@ attacker-poisonable):**
        and increments the refcount per replica — solving "one linear
        token cannot transfer into every worker replica": the replicas
        retain, the escrow only keeps the allocation alive meanwhile).
+       The escrow's lifetime is UNTIL REPLAY CONSUMPTION BY WHICHEVER
+       DATAPLANE COMES UP — new or restored-old (v9.9.8, round-23
+       partial's "lose the final NAT holder" trace: reconcile
+       ABANDONMENT after teardown means some dataplane must still come
+       up and serve traffic; draining the escrow on abandonment would
+       free every preserved allocation and kill every preserved NAT'd
+       flow mid-connection. The escrow therefore does NOT drain on
+       abandonment — it persists until the up-coming dataplane's
+       replay consumption is confirmed, exactly as on success; a full
+       helper RESTART (as opposed to a reconcile) loses session state
+       anyway and is out of scope).
        **Keeper accounting is PER ALLOCATION with a pending-command
        count, a CLAIM rule, and a BOUNDED barrier (v9.9.3, round-19
        Codex M3):** the keeper for allocation A releases only when A's
@@ -1865,9 +1876,25 @@ admitted interval):
   conditional delete with TEMPORAL CUTS: Go submits the predicate;
   (e2) the wire identity matrix: new-sender→new-receiver (tail
   applied), old-sender→new-receiver (tail-less install → the receiver
-  stores NO identity and falls back to today's gen-based delete
-  acceptance for those entries, with the documented mixed-version
-  asymmetric-timing hazard stated and bounded), new-sender→old-receiver
+  stores NO identity and falls back to gen-based deletes — but ONLY
+  for NON-locally-authoritative entries (standby/replica copies);
+  v9.9.8, round-23 partial: a stale gen-based delete from the old
+  sender carries the sender's fresh generation (which always advances
+  past the receiver's tracked generation for that key,
+  `sync_conn_write.go:69`), and E2 re-seeded on the NEW node does NOT
+  advance the OLD sender's generation — so an unconditional gen-based
+  fallback would delete the new node's authoritative E2 in the
+  dual-active mixed-version window (the quadruple coincidence:
+  mixed-version pair + failover + policy invalidation + new flow in
+  the same ~100 ms masterDownInterval window). The rule: gen-based
+  deletes in a mixed-version pair apply only when the entry is NOT
+  locally authoritative on the receiver (a standby/replica copy —
+  the owner's gen-based delete correctly kills it); locally
+  authoritative entries (locally-born or `SharedPromote`) are IMMUNE
+  to gen-based peer deletes — the new node's re-seeded E2 survives,
+  and the old node's own invalidation pass deletes its own E1 copy
+  with its own fence. The hazard is thereby closed, not just
+  bounded), new-sender→old-receiver
   (tail ignored), and the dual-active propagation case (both nodes
   believe they own the RG: the delete delta carries the selected
   identity and the receiver applies it only when its stored
