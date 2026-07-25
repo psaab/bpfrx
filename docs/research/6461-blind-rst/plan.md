@@ -928,42 +928,61 @@ attacker-poisonable):**
        replay consumption is confirmed, exactly as on success; a full
        helper RESTART (as opposed to a reconcile) loses session state
        anyway and is out of scope).
-       **Keeper accounting is PER ALLOCATION with a pending-command
-       count, a CLAIM rule, and a BOUNDED barrier (v9.9.3, round-19
-       Codex M3):** the keeper for allocation A releases only when A's
-       pending count reaches zero (every command for A has an outcome —
-       an early `Rejected` decrements the count but never drops the
-       keeper while later replicas for A are still pending). Pending
+       **Keeper accounting (v9.9.9, round-24 Codex B3 — the durable
+       escrow):** the escrow is a coordinator-owned DURABLE
+       `NatHoldEscrow` object whose lifetime is INDEPENDENT of command
+       permits and of `PreservedReconcileState` (which is consumed by
+       bring-up at `reconcile/mod.rs:102, :391`) — it persists across
+       reconcile attempts (teardown → bring-up → failure → retry)
+       until a dataplane is up AND its replay consumption is
+       confirmed, and it drains only when a dataplane is declared
+       permanently down (a full helper stop — which loses session
+       state anyway and is out of scope) or when that confirmation
+       lands. `PreservedReconcileState` merely POINTS at it (the
+       post-teardown-failure case at `reconcile/mod.rs:403`, which
+       leaves the dataplane down rather than automatically restoring
+       old workers, is covered: the next reconcile attempt or operator
+       restore consumes the replay through the same escrow, which is
+       explicitly coordinator-owned across attempts). Per allocation,
+       the escrow holds ONE keeper token from quiesce until
+       replay-consumption-confirmed; command outcomes NEVER release it
+       (a `Rejected` decrements the allocation's pending COMMAND count
+       but never touches the keeper — the keeper is permit-independent);
+       when the last outcome lands, the keeper TRANSFERS to the
+       replayed entries that retained (or releases if none did — the
+       flow failed to reinstall, and freeing is correct). Pending
        commands are claimed-before-executed: a worker CLAIMS a pending
        command before running it, and the barrier converts only
        UNCLAIMED commands to rejections at the deadline; a CLAIMED
        command gets its execution window — BOUNDED by a claim PERMIT
-       with expiry AND a single-winner terminal transition (v9.9.5,
-       round-21 Codex H4 — permit checking, allocator retain, table
-       insertion, side-map insertion, and terminal outcome were
-       separate operations, so a command could retain an allocation
-       and stall mid-pipeline): the terminal state transition
-       (`Abandoned` vs `Installed`) happens FIRST at the coordinator's
-       pending map (`transition(command, state) -> winner`) — a
-       claimed-but-stuck command whose permit expires converts
-       `Claimed → Abandoned` there (the keeper releases; reconcile
-       never pins), and the late executor's FINAL step before side-map
+       with expiry AND a single-winner terminal transition at the
+       coordinator's pending map (`transition(command, state) ->
+       winner`) — a claimed-but-stuck command whose permit expires
+       converts `Claimed → Abandoned` THERE (rolling back ITS OWN
+       retained hold via the worker's recheck, NEVER the escrow
+       keeper), and the late executor's FINAL step before side-map
        insertion is `if pending_map.claim_state(cmd) == Abandoned {
        release the retained hold immediately; abort } else { insert
        side-map; emit Installed }` — a single winner, no split-brain,
        and the abandoned-but-retained case releases AT THE RECHECK
-       because the worker is alive to recheck. The RAII drop DISARMS
-       the permit expiration timer at drop time (round-22 AGY: without
-       disarming, a worker that claims, retains, and dies before the
-       recheck would fire BOTH the RAII drop (releasing the hold) AND
-       the later permit expiry (releasing the keeper's pending slot
-       again) — a double-release of the pending map slot that races
+       because the worker is alive to recheck. The terminal-winner-
+       before-insertion race (a worker panic before insertion drops
+       its retained token during unwind, `supervisor.rs:98`) is safe
+       because the ESCROW KEEPER still holds the allocation (refcount
+       ≥ 1) until replay consumption is confirmed — the worker's
+       retained-but-never-installed hold releases via RAII (correct —
+       the entry never installed), and the port survives for the next
+       attempt. The RAII drop DISARMS the permit expiration timer at
+       drop time (round-22 AGY: without disarming, a worker that
+       claims, retains, and dies before the recheck would fire BOTH
+       the RAII drop (releasing the hold) AND the later permit expiry
+       (releasing the pending slot again) — a double-release racing
        subsequent allocations; the permit timer is cancelled when the
        token's RAII drop fires, and the permit expiry fires only for
        tokens still live at expiry). The residual pinning
        where RAII cannot run is bounded by worker lifetime; the
        supervisor's panic-only death marking at `supervisor.rs:95` /
-       `worker_runtime.rs:239` covers the unwind case). A genuinely
+       `worker_runtime.rs:239` covers the unwind case. A genuinely
        dead worker's commands convert on worker DEATH
        (`supervisor.rs:80, :95-98`, panic-only at
        `worker_runtime.rs:239`), and the supervisor's join blocking at
@@ -1139,9 +1158,26 @@ attacker-poisonable):**
        snapshot predicate; (c) **filtered administrative clearing**
        (`grpcapi/server_sessions.go:1234`): current-state selection is
        CORRECT by intent (the operator means "delete whatever matches
-       now") — but CHUNKED identically to today (≤1,024-key chunks,
-       `server_sessions.go:1193, :1216-1231, :1293-1373` — the
-       fabric-reachable collect-all O(matches) memory/CPU DoS bound),
+       — but CHUNKED via an explicit
+       STABLE CURSOR (v9.9.9, round-22 partial + round-24 Codex 5: the
+       Go implementation relies on BPF `GET_NEXT_KEY` as a live anchor
+       (`server_sessions.go:1298`), which does NOT translate to the
+       helper's authoritative tables — single `Mutex<FxHashMap<…>>`
+       values (`coordinator/session_manager.rs:12`, `types/mod.rs:37`)
+       whose `SessionKey` has NO ordering (`session/key.rs:9`); a naive
+       release-and-rescan is O(N²), retaining the iterator holds the
+       global lock across the full clear, and collecting/sorting is
+       O(N) memory): the shared session map gains an INSERTION-ORDERED
+       SECONDARY INDEX (ordered by `(install_epoch, key)` — maintained
+       alongside the map under the same lock exactly as the existing
+       secondary indexes (`nat_reverse_index`, `forward_wire_index`)
+       are maintained at `session/mod.rs` and `afxdp/shared_ops.rs`),
+       and the scan iterates the INDEX with a cursor position, taking
+       the lock per ≤1,024-entry chunk, advancing, releasing, and
+       resuming from the cursor position — O(N) total with bounded
+       per-chunk lock holds, and inserts/deletes update the index
+       under the same lock so the cursor never observes an
+       inconsistent map.,
        with each chunk its own canonical-lock span and per-chunk
        candidate re-validation at delete. The HA continuation is
        handled node-locally first (v9.9.4): BOTH nodes run the same
@@ -1176,13 +1212,28 @@ attacker-poisonable):**
        with an explicit honest statement: Part A has NO wire change;
        Part B adds the additive delete tail, and a mixed-version pair
        keeps today's gen-based unconditional delete on the old peer
-       (the documented mixed-version behavior — the E2-standby-delete
-       hazard in a mixed pair is bounded to the asymmetric-timing
-       window and stated, vs. `daemon_policy_invalidate.go:366`'s
-       fresh-generation tombstone over `sync_conn_write.go:69`/
-       `sync_conn_gen.go:156` which would otherwise delete E2's
-       standby at `sync_conn_gen.go:493` when E2 was re-synced after
-       E1's selection); the receiver applies an identity-carrying
+       (the documented mixed-version behavior — and the stronger rule
+       (v9.9.9, round-24 Codex B1): a new sender SUPPRESSES
+       identity-dependent deletes (invalidation/conditional deletes)
+       toward a peer that has not negotiated identity enforcement —
+       a legacy receiver decodes only the generation
+       (`sync_conn_read.go:150`) and applies gen-based deletes
+       unconditionally (`sync_conn_gen.go:263`), so a stale
+       invalidation delete from the new sender would remove the
+       legacy peer's locally re-seeded authoritative E2 and its NAT
+       companions (`session_store.go:537`) in the dual-active window
+       (upgraded A and legacy B both believe they own the RG; A's
+       owner gate passes; A emits for peer-imported E1; `takeDeleteGenV4`
+       can return zero at `sync_conn_gen.go:176` or draw a fresh
+       greater generation at `sync_conn_write.go:69`). The rule: an
+       identity-dependent delete is emitted ONLY to a peer that has
+       negotiated enforcement (capability bit in the handshake); to an
+       unnegotiated peer, invalidation/conditional deletes are NOT
+       sent at all — the legacy peer's own invalidation pass (both
+       nodes run it, per v9.9.5) deletes its own E1s with the old
+       gen-based semantics (master's pre-existing behavior,
+       documented), and plain owner-validated Close deltas continue to
+       legacy peers as today); the receiver applies an identity-carrying
        delete only when its stored incarnation matches. Only
        deliberately unconditional administrative clears ("delete
        everything regardless") keep separate, unconditional semantics
@@ -1633,8 +1684,11 @@ non-close path.
   read + validator call.
 - `SessionUpdate` gains `seg: Option<TcpSegView>`.
 - No `FlowCacheEntry` change, no shim/meta change (no `make generate`),
-  no HA wire change in Phase 1 (the §10.5 anchor+mark tail is the
-  Phase-2 PR), no config schema change. The NODE-LOCAL shared-map
+  no HA wire change in Part A (the demote gate); Part B adds the
+  rolling-gated additive identity tails on session INSTALL/Open AND
+  DELETE messages (tolerated by old decoders via the
+  `sync_protocol.go:95-102, :470-497` trailing-field tolerance), and
+  no config schema change. The NODE-LOCAL shared-map
   schema gains additive fields (`last_touch_ns`, `expires_after_ns`,
   `flow_incarnation_id`) — never wire-carried in Phase 1, so
   rolling-upgrade safe.
@@ -1714,7 +1768,9 @@ and one ungated node, each gating only its own packet-driven marks).
   REPLACED by the v8.3 predicate above — peer-synced entries
   (`SharedMaterialize`/`SyncImport`/`WorkerLocalImport`,
   `entry.rs:245-250`) still cannot emit UNMARKED (their
-  `locally_born` is false and a blind close never marks), and a
+  `locally_born` is false and a REFUSED (out-of-window or
+  no-baseline) blind close never marks — an in-window blind guess
+  validates by design at the documented window probability), and a
   marked import emits only because its close was validated (locally
   or by the peer). The Go side has NO origin/generation protection
   that would save the owner (stamped deletes apply,
@@ -1816,7 +1872,7 @@ and one ungated node, each gating only its own packet-driven marks).
 | Lifetime / borrow-checker | LOW | Anchor is `Copy` POD on an existing entry; marking restructured into the existing post-borrow propagation phase; no new cross-boundary borrows. |
 | Performance regression | LOW-MED | ~104 B/entry slab growth (~13.6 MiB/worker at cap); one TCP-header view compute (seq/ack/wnd/flags/seg_len) + ≤2 gated stores per committed TCP data packet (closing segments skip updates entirely); one extra probe per closing segment. Must be measured at minimum-frame rates (§9) — the 23 Gbit/s MTU-sized iperf run alone is insufficient (≈37 Mpps at 25 Gbit/s small-frame is the real gate; `iperf3 -l 64` is a proxy, not a demonstrated line-rate generator — gate on pps, not bandwidth). |
 | Architectural mismatch | LOW | No new subsystem; anchors at the existing #2501/#3706 chokepoints; #4400-style always-on gate. No pipeline restructure. |
-| HA / rolling upgrade | LOW-MED | Phase 1: no wire change; mixed-version peers each gate only their own marks; pre-upgrade and imported entries sit in the absorbing zero-trust state — closes refuse until churn (strictly more conservative than master; bounded lingering, §2; Phase 2 §10.5 closes it for synced flows). The replica no-Close invariant + the SharedPromote refuse trace are regression-tested. |
+| HA / rolling upgrade | LOW-MED | Part A: no wire change; Part B adds rolling-gated additive identity tails on INSTALL/Open AND DELETE (old decoders ignore them via the trailing-field tolerance; mixed-version behavior documented: gen-based deletes apply only to non-locally-authoritative entries, and identity-dependent deletes are suppressed toward unnegotiated peers); pre-upgrade and imported entries sit in the absorbing zero-trust state — closes refuse until churn (strictly more conservative than master; bounded lingering, §2; Phase 2 §10.5 closes it for synced flows). The replica no-Close invariant + the SharedPromote refuse trace are regression-tested. |
 | Merge collision | LOW | No `FlowCacheEntry` change (v1's #6457 tension gone). `account_packet` signature change is local to two call sites; `SessionInstall`/`SessionUpdate` gains are crate-internal. |
 
 ---
@@ -1852,13 +1908,48 @@ admitted interval):
   exactly once, ordinary established idle refresh, exactly one
   Open/replication/stamp, and subsequent hits do NOT re-promote; no
   accelerated reap and no close mark in either branch.
+- **Escrow + conditional-delete fences (v9.9.9):** (f) the stable
+  logical rule ID (`<from>-><to>/<name>`, `policies_ids.go:101`) plus
+  content version and the write-once admission forwarding generation
+  as DISTINCT fields: same-content-different-name rules never
+  cross-select (the round-24 G1/G2/G3 trace); a rule edited in place
+  keeps its name and is correctly selected; a renamed rule is
+  delete+add; the admission generation is stamped once at entry
+  creation and never rewritten (unlike `install_epoch`'s mutation
+  counter); (g) new-sender suppression toward unnegotiated (legacy)
+  peers: an identity-dependent delete is emitted only to a negotiated
+  peer (capability bit in the handshake); to an unnegotiated peer,
+  invalidation/conditional deletes are NOT sent at all — the legacy
+  peer's own invalidation pass deletes its own E1s with the old
+  gen-based semantics (master's pre-existing behavior), while plain
+  owner-validated Close deltas continue; (h) the durable
+  coordinator-owned escrow: lifetime independent of command permits
+  and of `PreservedReconcileState`, persisting across reconcile
+  attempts (teardown → bring-up → failure → retry) until a dataplane
+  is up AND replay consumption is confirmed, draining only on a
+  declared permanent dataplane stop or on that confirmation; the
+  terminal-winner-before-insertion race (worker panic before
+  insertion, `supervisor.rs:98`) is safe because the escrow keeper
+  still holds the allocation (refcount ≥ 1) until consumption is
+  confirmed; (i) the mixed-version gen-based fallback: gen-based
+  deletes apply only to NON-locally-authoritative entries (standby/
+  replica copies); locally authoritative entries (locally-born or
+  `SharedPromote`) are IMMUNE to gen-based peer deletes in a
+  mixed-version pair — a stale gen-based delete from the old sender
+  (whose fresh generation always advances past the receiver's tracked
+  generation for that key, `sync_conn_write.go:69`) can never delete
+  the new node's re-seeded E2 in the dual-active window.
 - **Escrow + conditional-delete fences (v9.9.3, round-19 Codex M4):**
   (a) two-phase stop: quiesce acknowledged (no new commits) BEFORE
   handoff; handoff completes BEFORE any side-map drop (no hold
   escapes to RAII at join, incl. pending command-queue tokens);
   (b) partial spawn: a worker that never launches has its pending
-  commands EXPLICITLY rejected (not dropped via Drop), and the
-  keeper releases only when the allocation's pending count is zero;
+  commands EXPLICITLY rejected (not dropped via Drop), and the DURABLE
+  escrow keeper is never released by command outcomes at all — it
+  transfers to the replayed entries that retained only when replay
+  consumption is confirmed (or releases if none retained), across as
+  many reconcile attempts as needed (the `reconcile/mod.rs:403`
+  dataplane-down case included);
   (c) multi-replica pending: an early `Rejected` never drops the
   keeper while later replicas are pending; (d) deadline-vs-claim:
   an unclaimed command converts to `Rejected` at the deadline; a
@@ -1903,11 +1994,14 @@ admitted interval):
   the helper selects from its own shared aliases, captures the
   selected `(origin_process_nonce, flow_incarnation_id)` under the
   canonical lock, and deletes under the alias-token fencing in one
-  transaction — CHUNKED identically to today (≤1,024-key chunks,
-  `server_sessions.go:1193, :1216-1231, :1293-1373` — the
-  fabric-reachable collect-all O(matches) memory/CPU DoS bound),
-  with each chunk its own canonical-lock span and per-chunk candidate
-  re-validation at delete. The test schedules are the OPERATIVE
+  transaction — CHUNKED via the same insertion-ordered secondary index
+  with a cursor position (the `Mutex<FxHashMap>` stores have no key
+  ordering, `session/key.rs:9` — the index is ordered by
+  `(install_epoch, key)` and maintained alongside the map under the
+  same lock exactly as `nat_reverse_index`/`forward_wire_index` are;
+  the scan iterates the INDEX with a cursor position, taking the lock
+  per ≤1,024-entry chunk, advancing, releasing, and resuming —
+  O(N) total, no O(N²) rescan, no full-clear lock hold), The test schedules are the OPERATIVE
   races (round-20 Codex M5): policy invalidation — E2 admitted AFTER
   the new snapshot activates by the still-permitting version is
   NEVER selected (config-epoch cut; the numeric-ID collision at
@@ -1996,7 +2090,8 @@ admitted interval):
 - **Close authority v8 semantics:** (a) blind first-packet close on a
   pre-activation import → NO ownership promote, no mark, no refresh —
   fully inert; ordinary reaps silent on every worker (no fanout
-  duplication). (b) post-activation: a blind close is still refused
+  duplication). (b) post-activation: a REFUSED (out-of-window or no-baseline) blind
+  close is still refused
   (inert); entries reap at their TRUE natural timeout, silently;
   the TTL sweep purges the alias family after K × timeout without
   event or batched touch (no rematerialization after the sweep).
@@ -2201,6 +2296,8 @@ It is therefore split to its own research track:
 
 1. **The scope split itself (the v9 question):** Part A (the dataplane
    demote gate) closes the issue AND its HA teeth with no wire change
+   IN PART A (Part B adds the rolling-gated additive identity tails —
+   see §5.2)
    (a REFUSED — out-of-window or no-baseline — blind close never marks
    → never produces a Close delta → the 1-packet-anytime cluster-kill
    channel is dead; an in-window blind guess validates by design at the
