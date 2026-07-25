@@ -3413,8 +3413,12 @@ attacker-poisonable):**
        second gap: the cited handshake at `sync_auth.go:321, :345`
        carries no feature set and runs only when a PSK is configured —
        the version/feature-flag exchange is made connection-type-
-       independent (a lightweight capabilities word in every
-       connection's hello), and unnegotiated legacy peers (raw frames
+       independent (v9.9.51, round-52 Codex M2: the HELLO's
+       capabilities word is ADVERTISEMENT ONLY — it selects the
+       transcript version and names what CAN be confirmed later;
+       on a v1-proof connection NO capability becomes active
+       except through matching authenticated same-connection
+       `CAPABILITY_CONFIRM`s, and unnegotiated legacy peers (raw frames
        or `keyed=0`) never receive identity-dependent deletes); to an
        unnegotiated peer, NO
        incarnation-dependent delete is sent at all — the legacy peer
@@ -4033,9 +4037,16 @@ the transcript-dependent features are the reset lane itself,
 so the mask is `reset-vN` plus those named frames; the
 REPAIR protocol (`repair-vN`, `JOURNAL_END`/`JOURNAL_ACK`,
 `RESYNC_REQUEST`, the cutoff/marker frames) rides the
-ESTABLISHED authenticated connection, does NOT depend on the
-v2 transcript, and is negotiated independently — never
-masked);
+ESTABLISHED authenticated connection and does not depend on
+the v2 transcript — BUT on a v1-proof connection it is
+INACTIVE like everything else until the matching
+authenticated `CAPABILITY_CONFIRM` (v9.9.51, round-52 Codex
+M2: this supersedes "negotiated independently — never
+masked": on a v1-proof connection NO capability becomes
+active except through matching same-connection CONFIRMs; the
+repair protocol's independence from the v2 transcript is why
+it CAN be confirmed post-wrapper rather than requiring the
+v2 transcript at all);
 when BOTH peers are v2, they exchange bounded raw HELLO
 records and `AUTH_PROOF` authenticates a DOMAIN-SEPARATED,
 length-prefixed, ORDERED pair of those exact records — with
@@ -4046,15 +4057,32 @@ implementations could compute different proofs and
 reconnect-loop (`sync_auth.go:401-404`,
 `sync_conn.go:106-110, :435-477`):
 `AUTH_PROOF_v2 = HMAC(key, tag_v2 || prover_role ||
-dialer_hello || acceptor_hello || dialer_cap ||
-acceptor_cap) — with the cap records entering the proof as
+term(dialer_hello) || term(acceptor_hello) ||
+term(dialer_cap) || term(acceptor_cap))` — with an EXECUTABLE
+byte grammar (v9.9.51, round-52 Codex B1 — without it, two
+conforming implementations hash different bytes and
+reconnect-loop (`sync_auth.go:401-404`,
+`sync_conn.go:106-110, :435-477`)): every term is
+`u16-LE(len) || the exact raw PAYLOAD bytes as transmitted`
+(the wire payload, frame header EXCLUDED —
+`readSyncFrameRaw` returns the payload separately from its
+header (`sync_auth.go:289-310`), so the term covers the
+payload bytes plus their u16-LE length, never the frame
+header); the capability record's own layout is fully defined
+(field order `(node_id, process_incarnation, capacity,
+capacity_config_generation, capability bits)`, fixed widths —
+u32/u64/u64/u64/u32, the bits packed LSB-first in the u32,
+little-endian integers, no padding); never as reconstructed
+fields, which could diverge in integer widths and field
+order; the SHARED record segment
+(`term(dialer_hello) || term(acceptor_hello) ||
+term(dialer_cap) || term(acceptor_cap)`) is byte-identical
+for both sides, and the FULL inputs differ ONLY by
+`prover_role`; and literal KEYED HEXADECIMAL vectors for both
+roles ship in §9; and the cap records entering the proof as
 the EXACT WIRE BYTES sent and received (v9.9.50, round-52 SMR
 F1: the sender hashes what it sent, the verifier hashes what
-it received — byte-identical by TCP; never as reconstructed
-fields, which could diverge in integer widths and field
-order; and the cap record's own wire encoding follows the
-same discipline: declared field order, u16-LE lengths,
-little-endian integers, no padding) (v9.9.49, round-51 Codex B2 — the earlier
+it received — byte-identical by TCP) (v9.9.49, round-51 Codex B2 — the earlier
 `prover_record || verifier_record` conflicted with
 "dialer-first" for an acceptor proof, and the legacy HELLO
 carries only `{version, keyed, nonce}` (`sync_auth.go:345`),
@@ -4094,13 +4122,9 @@ bare nonce) — and the proof is verified BEFORE the
 authenticated frame wrapper installs (v9.9.45, round-49 Codex
 H2: this strikes the contradictory "inside the wrapper"
 phrasing — the wrapper installs only after verification,
-`sync_auth.go:406`); the
-transcript's encoding is canonical (v9.9.42, round-48 SMR F3:
-an ORDERED field list, each field length-prefixed, fields in
-the tuple's declared order — node_id, process_incarnation,
-capacity, capacity_config_generation, the capability bits,
-nonces — so two implementations compute byte-identical
-transcripts and verify the same proof); and the RESET-only
+`sync_auth.go:406`; and v9.9.51 strikes the older field-list
+encoding formerly here — the v9.9.51 executable grammar above
+is the ONLY transcript grammar); and the RESET-only
 allowlist explicitly includes the handshake sequence (HELLO
 transcript → capability exchange → `AUTH_PROOF(transcript)` →
 `RESET_GEN`/`RESET_ACK`), so the required proof is never an
@@ -4111,8 +4135,13 @@ support identity/heartbeat features while speaking only legacy
 would wait indefinitely for a terminal frame the peer cannot
 send; today's hello is auth-only and keyed-only
 (`sync_auth.go:314`), so the connection-independent hello
-negotiates `repair-vN` and `reset-vN` BEFORE any corresponding
-frame — an intermediate peer gets the legacy paths and never a
+ADVERTISES `repair-vN` and `reset-vN` (v9.9.51, round-52
+Codex M2: "negotiates" is corrected to "advertises" — the
+HELLO only selects the transcript version and names what can
+be confirmed later; on a v1-proof connection NO advertised
+capability becomes active except through a matching
+authenticated same-connection `CAPABILITY_CONFIRM`) — an
+intermediate peer gets the legacy paths and never a
 wait-forever);
 `RESYNC_REQUEST(repair_id)` (incarnation-scoped:
 `(sender_incarnation, request_seqno)`); `RESET_GEN` /
@@ -4778,8 +4807,17 @@ admitted interval):
   unkeyed peers get no lane); (d9) v9.9.45 protocol boundaries
   (round-49 Codex L3): v2↔v1 interoperability (a v2 peer uses
   the v1 nonce-only proof over the legacy prefix bytes —
-  connection establishes, `reset-vN` and the named reset
-  frames masked, repair-vN negotiated independently);
+  connection establishes, ALL capabilities inactive until the
+  matching authenticated `CAPABILITY_CONFIRM` on the same
+  connection, v9.9.51); the v2 proof's literal KEYED
+  HEXADECIMAL vectors for BOTH roles (v9.9.51, round-52
+  Codex B1: `term(x) = u16-LE(len) || exact raw payload
+  bytes`, frame header excluded; dialer vector: tag
+  `xpf-cluster-sync/v2/hello-transcript`, prover_role 0x01;
+  acceptor vector: prover_role 0x02; the shared record
+  segment byte-identical across both, the full inputs
+  differing only by prover_role — the vectors are normative
+  test constants, not examples);
   canonical transcript vectors (byte-exact: literal domain
   tag, record-order rule, u16-LE lengths, little-endian
   integers, own-transcript proof direction); the legacy HELLO
