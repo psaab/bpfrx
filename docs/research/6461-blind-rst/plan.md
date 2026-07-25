@@ -1,6 +1,6 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v8.2 — simplification + round-10 folds (Codex PLAN NO 6B/3H/3M/1L answered: ONE emission predicate with the normative sticky mark, TTL sweep with last_touch_ns clock + compare-delete family removal + K≥4 hold-ceiling floor, flow_incarnation_id end to end, fence tuple (origin_process_nonce, flow_incarnation_id), writer generation + owner-epoch gate, fresh-at-write-time + BulkStart nonce floor, selective no-learn on exceptional dispositions with the dominated-residual proof, marked WorkerLocalImport emits with delete-propagation exactly-once, staggered heartbeats + flush floor + whole-cost accounting)**
+**Status: DRAFT v8.3 — simplification + round-10/11 folds (v8.2 + round-11 AGY 3xUNSOUND folded: mark rules enforced at the constructors per §5.6 (raw flag seeds at install.rs:179-180/399-400 run before validation — reverse-synth validates before seeding, materialize installs alive on refuse, fabric-ingress closes validate at site 1); the NAT reservation drives the alias purge at release (pool port freed at worker entry reap, loop_body:1491-1506 — the r5 hazard reborn by long K is closed event-driven); §7/§5.2 text aligned to the full predicate)**
 
 v1 → v2: round-1 review killed v1's architecture (attacker-writable trust
 anchor, missed reverse-NAT constructor, invalid cross-store serial merge).
@@ -639,8 +639,9 @@ attacker-poisonable):**
      abort, not an establishment signal; round-3 Codex 10).
    - The ownership promote is skipped: a blind first close post-failover
      must not flip `SyncImport`→`SharedPromote` — the flip both arms
-     Close authority (a forward `SharedPromote` emits a Close delta at
-     ANY expiry, marked or not, `expire.rs:342-377`) and suppresses the
+     Close authority (on MASTER today, a forward `SharedPromote` emits a
+     Close delta at ANY expiry, marked or not, `expire.rs:342-377`) and
+     suppresses the
      import's RG-activation self-heal (`expire.rs:213-237`), letting a
      refused close convert a silent standby reap into an authoritative,
      possibly accelerated, Close. **Close authority (v8 — the simplification round,
@@ -660,7 +661,16 @@ attacker-poisonable):**
        on reimport (a full reimport remove/replaces the record and
        re-seeds the bits from the wire — a peer-validated close is
        never lost, round-10 Codex 7b); never set by a refused close
-       (§5.7). The mark is incarnation-bound by entry lifetime — live state at reap time
+       (§5.7). **Enforcement point (v8.3, round-11 AGY Q1):** the raw
+       flag seeds at `install.rs:179-180/399-400` run BEFORE validation
+       today, so the rules are enforced at the constructors per §5.6 —
+       the reverse-synth validates BEFORE seeding (refuse → skip
+       install), the materialize installs ALIVE on a refused closing
+       hit (no seed), and fabric-ingress closing hits validate at site
+       1 like any other (the non-owner's import has no trusted anchor
+       in Phase 1 → refuse → no mark → the 2 s failover window AGY
+       traced is closed); propagation fires only on ACCEPTED marks
+       (§5.5). The mark is incarnation-bound by entry lifetime — live state at reap time
        (closes the publish-before-command demotion window for stamped
        entries; `owner_rg_id` is now stamped on EVERY forward install
        path via `owner_rg_for_resolution` — round-9 AGY 1: today only
@@ -728,6 +738,20 @@ attacker-poisonable):**
        flow's clone-materialize creates a worker-local import whose
        alias is gone (it re-publishes on the next event — ordinary
        churn, documented).
+       (d) **The NAT reservation drives the alias purge (v8.3, round-11
+       AGY Q2 — the r5 hazard reborn by long K):** the SNAT/NAT64 pool
+       port is released at WORKER ENTRY reap
+       (`loop_body/mod.rs:1491-1506`), but the alias lingers
+       K × expires_after (up to ~4 days for app-timeout flows) — the
+       port is freed ~3 days before the alias dies, gets reallocated,
+       and a packet matching the lingering alias rematerializes the
+       DEAD session (misdirection). The fix is event-driven, not
+       K-driven: the reservation-release path
+       (`release_source_nat_allocation` / `release_nat64_allocation`)
+       purges the alias family AT RELEASE (compare-deleting on
+       `flow_incarnation_id` exactly as the sweep does) — the hazard
+       window for NAT'd flows is zero; the TTL sweep remains only the
+       backstop for non-NAT stragglers.
        No Close producer is required; staleness is bounded. (The
        Go-side floor already exists — `pkg/conntrack` GC with HA
        delete-sync callbacks.)
@@ -1145,21 +1169,20 @@ and one ungated node, each gating only its own packet-driven marks).
   only withholds a mark, never clears one. The #3046 timeout-selection
   ordering (`reset` set before `expires_after_ns` is chosen) is preserved
   on the accepted-mark path.
-- **Close authority (v8):** the `expire.rs:342-345` delta gate is
+- **Close authority (v8.3):** the `expire.rs:342-345` delta gate is
   `!is_reverse && !is_transient_seed &&
   (owner_rg_id > 0 && owner_rg_active(owner_rg_id) ||
-   owner_rg_id == 0 && locally-born)` (live state at reap time;
-  `owner_rg_id` stamped on EVERY forward install path; LocalDelivery
-  owner-zero by design — Go excludes host-local sessions from HA sync;
-  the #2120 held class zero-and-silent). Import-class entries
-  (`SyncImport`/`SharedMaterialize`) emit ONLY when marked by a
-  validated close (single producer = the marking worker, deletion
-  correct by construction); unmarked import reaps are silent (master's
-  rule). Stranded shared aliases are purged by the coordinator
-  shared-map TTL sweep (K × timeout without event OR batched worker
-  liveness touch — live-but-quiet flows are retained by the 30 s
-  batched push) — no Close producer required, no incarnation ticket
-  anywhere. `WorkerLocalImport` and
+   owner_rg_id == 0 && locally-born) && (locally_born || closing ||
+   reset)` — the full predicate (live owner state at reap time; the
+  sticky mark with its normative creation rules; `owner_rg_id` stamped
+  on EVERY forward install path; LocalDelivery owner-zero by design —
+  Go excludes host-local sessions from HA sync; the #2120 held class
+  zero-and-silent). Import-class entries emit ONLY when marked;
+  unmarked import reaps are silent. Stranded shared aliases are
+  purged by the reservation-release-driven alias delete (NAT'd
+  flows) and the coordinator shared-map TTL sweep (backstop, K ×
+  timeout without event/read/touch) — no Close producer required, no
+  incarnation ticket anywhere. `WorkerLocalImport` and
   fabric replicas never race (their owner worker emits directly, or
   they stay silent). No origin flip anywhere; authority is never
   stored, never packet-driven. Documented pre-existing: the
@@ -1169,23 +1192,20 @@ and one ungated node, each gating only its own packet-driven marks).
   Packet-driven promotion (`SharedPromote` on a committed non-close
   packet) remains for entries imported after activation; closing
   packets never trigger it.
-- **HA replica no-Close invariant (LOAD-BEARING, round-1 Codex B8):**
-  `expire.rs:342-345` emits Close deltas only for non-peer-synced,
-  non-reverse, non-transient-seed origins; `SharedMaterialize`/`SyncImport`/
-  `WorkerLocalImport` are all peer-synced (`entry.rs:245-250`), and
-  promotion requires a `ForwardCandidate` disposition on the promoting node
-  (`promote.rs:86-90`) — i.e. local RG ownership
-  (`enforce_session_ha_resolution` → HAInactive on the non-owner). The Go
-  side has NO origin/generation protection that would save the owner
-  (stamped deletes apply, `sync_conn_gen.go:493-506`; gen-zero fallback
-  deletes apply unconditionally, :176-186), so this Rust gate plus the
-  refuse-demote flip are the barriers between a non-owner/unvalidated
-  reap and the owner's authoritative entry. **`SharedPromote` is
-  deliberately NOT peer-synced** (the promoted node IS the owner; its
-  validated closes MUST propagate) — which is exactly why refuse-demote
-  on no-baseline is load-bearing: without it, a blind first-packet close
-  on a freshly promoted entry emits a cluster-wide Close (the §5.4
-  rule-3 trace). The plan adds exact regression tests
+- **HA replica no-Close invariant (LOAD-BEARING, round-1 Codex B8,
+  restated for v8.3):** the master's gate (`expire.rs:342-345`:
+  non-peer-synced, non-reverse, non-transient-seed origins) is
+  REPLACED by the v8.3 predicate above — peer-synced entries
+  (`SharedMaterialize`/`SyncImport`/`WorkerLocalImport`,
+  `entry.rs:245-250`) still cannot emit UNMARKED (their
+  `locally_born` is false and a blind close never marks), and a
+  marked import emits only because its close was validated (locally
+  or by the peer). The Go side has NO origin/generation protection
+  that would save the owner (stamped deletes apply,
+  `sync_conn_gen.go:493-506`; gen-zero fallback deletes apply
+  unconditionally, :176-186), so this Rust gate plus the refuse-demote
+  flip are the barriers between a non-owner/unvalidated reap and the
+  owner's authoritative entry. The plan adds exact regression tests
   (`SharedMaterialize + reset + FabricRedirect + stale-ceiling reap` →
   no delta, no owner/shared deletion; blind first-packet close on a
   promotable import → no mark, install-alive, no delta) and names the
