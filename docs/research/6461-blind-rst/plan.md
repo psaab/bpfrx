@@ -914,9 +914,15 @@ attacker-poisonable):**
        inserted, so an ack implies the hold exists — or `Rejected`),
        and each installed entry performs its own verify-and-retain
        (which succeeds because the escrow kept the allocation alive
-       and increments the refcount per replica — solving "one linear
+       and — v9.9.20, round-35 Codex B2: re-expressed by the
+       coordinator-owned GROUP-HOLD below — each replica's "retain"
+       is a CLONE of the group-hold Arc distributed at fan-out/
+       replay time, not a per-replica allocator refcount increment;
+       the allocator reservation releases exactly when the LAST
+       clone (canonical + every worker replica + materializations +
+       escrow keeper) drops — solving "one linear
        token cannot transfer into every worker replica": the replicas
-       retain, the escrow only keeps the allocation alive meanwhile).
+       hold clones, the escrow only keeps the allocation alive meanwhile).
        **Persistent-NAT lease migration (v9.9.13, round-28 Codex B3):**
        distinct flows can share ONE persistent source key and
        translated tuple (`source.rs:201`, `allocator.rs:1114, :1224`,
@@ -1117,17 +1123,38 @@ attacker-poisonable):**
        recoverable ONLY by authoritative bulk repair, since deletes
        are journaled just when local enqueue fails
        (`sync_conn_write.go:69`). The corrected protocol: the park
-       buffer is bounded; on overflow the receiver marks the
+       buffer is bounded; on overflow the receiver (i) marks the
        in-flight bulk/window LOSSY — a bulk that discarded ANY
        member neither reconciles at BulkEnd nor ACKs
-       (`sync_conn_read.go:205, :241`) — and disconnects ONCE PER
-       LATCHED EPOCH (the latch prevents hot reset loops), dropping
-       the parked buffer entirely: the reconnect's authoritative
-       FULL RESYNC is the repair (a bulk is a complete snapshot, so
-       the dropped partial window — installs AND deletes — is
-       reconstructed by it; the receiver's resync request is
-       authenticated on the existing channel). During the outage
-       the sender's own send queue fills and self-arms
+       (`sync_conn_read.go:205, :241`) — and (ii) raises a
+       LOGICAL-PEER FULL-RESYNC OBLIGATION (v9.9.20, round-35 Codex
+       B1 — a per-connection disconnect does NOT guarantee the
+       repair in the dual-fabric transport: `handleDisconnect`
+       removes only the failed connection (`sync_conn.go:480`), a
+       surviving fabric avoids the full-disconnect path (`:498`),
+       survivor re-bulk runs only while `outboundBulkAcked` is
+       false (`:572`) — a flag deliberately sticky forever after
+       any successful bulk (`sync.go:479`) — and reconnection does
+       not cold-prime because `wasDisconnected` requires BOTH
+       slots empty (`:248`): B can overflow-close fab0 while A
+       continues on fab1, no queue overflows, no bulk ever
+       follows). The obligation is per-PEER, not per-connection:
+       it drives the EXISTING BulkSync machinery over the
+       SURVIVING active connection (no new wire message — the
+       obligation explicitly OVERRIDES the sticky cold-prime
+       gates: it clears `outboundBulkAcked` for this peer and
+       treats the peer as cold-primed, so the next bulk drive runs
+       a FULL table iteration, `sync_bulk.go:93, :134`), drops the
+       parked buffer entirely, and is CLEARED only when the
+       replacement full bulk's ACK lands — a lossy bulk's own
+       suppressed ACK never clears it, and the obligation persists
+       across reconnects until then. The once-per-latched-epoch
+       disconnect remains as the buffer-release mechanism; the
+       obligation is what guarantees the repair. The alternative —
+       closing BOTH fabrics on overflow to force the cold-prime —
+       is the documented fallback for transports where driving a
+       bulk over the survivor is unsafe. During the outage the
+       sender's own send queue fills and self-arms
        `syncBackfillNeeded` (`sync_conn_write.go:46`), holding its
        sweep window; on reconnect the config-first ordering (3)
        applies the config BEFORE the re-driven bulk, the park
@@ -1242,7 +1269,45 @@ attacker-poisonable):**
        from the critical section until the transaction commits (the
        old tuple cannot be claimed between allocator unlock and a
        later rollback — preserving the DATA alone would leave P
-       claimable in that window).
+       claimable in that window). **The holder DISTRIBUTION is a
+       coordinator-owned GROUP-HOLD (v9.9.20, round-35 Codex B2 —
+       "workers never create or mutate ownership" contradicts the
+       plan's per-entry retain contract (:915's every-replica
+       retain, :1650's per-worker token-Drop decrement, :1710's
+       retain-at-commit) under a scalar refcount: coordinator
+       reserve = one holder, W0/W1 add none, and W0's independent
+       reap (`loop_body/mod.rs:1481`) would release the SOLE holder
+       while W1 still forwards E1, freeing P under a live replica):
+       the coordinator's reservation produces ONE group-hold object
+       per imported flow (an `Arc`); the canonical shared entry,
+       every fanned-out worker entry, every later materialization
+       (`session_glue/mod.rs:1092, :1157`), and the escrow keeper
+       each hold a CLONE of that Arc; worker-entry reap and
+       token-Drop drop their clone — they NEVER touch the allocator
+       directly — and the allocator reservation releases exactly
+       when the LAST clone drops (canonical + all replicas +
+       materializations + escrow). The per-entry "retain" contract
+       is thereby re-expressed as clone distribution at fan-out/
+       materialize time (not per-entry allocator mutations): the
+       early-replica-reap trace dies by construction (W0's reap
+       drops only its clone; the reservation lives until W1's and
+       the canonical clones also drop), the "NoChange only" clause
+       and the per-entry-release clause reconcile (workers mutate
+       no allocator state, yet every entry holds lifetime), and the
+       coordinator's receipt undo applies to the group-hold's
+       creation — a failed/rejected import never distributes a
+       clone, so no replica can ever hold lifetime the coordinator
+       rolled back. The allocator critical section NEVER nests
+       with the canonical publish (v9.9.20, round-35 SMR F1: the
+       reserve-with-receipt completes and RELEASES the allocator
+       lock before `publish_shared_session` takes the canonical
+       `synced → nat → forward_wire → indexes` hierarchy
+       (`session_manager.rs:12-18`) — reserve → unlock → publish;
+       the RAII guard re-acquires the allocator lock for a
+       post-publish undo — so no thread ever holds both orders
+       (import: allocator-live then synced; delete/TTL-sweep:
+       synced then allocator-live) and the two-lock inversion is
+       impossible by construction).
        **Capability gate (v9.9.17, round-32 Codex):** clustered
        persistent source NAT is COMMIT-TIME REJECTED today
        (`capabilities.go:87`, `persistentSourceNATHAUnsupportedReason`
@@ -1565,7 +1630,18 @@ attacker-poisonable):**
        allocator-WRITE (the stated lock order — no reverse order
        exists because ownership operations never take slot-WRITE),
        so a release is always observed on exactly one side of the
-       cut. A stale raw `Arc<PortAllocator>` A-handle used for a
+       cut. Two ordering invariants make the continuity exact
+       (v9.9.20, round-35 SMR F2): (a) the migration's snapshot
+       runs AFTER the gate-WRITE drain, so any release that
+       observed `slot == A` under A's READ permit completes into A
+       BEFORE the snapshot and is thereby included in B's copied
+       state (snapshot-before-drain would lose that in-flight
+       release from B's copy); (b) the retarget publishes BEFORE
+       A's gate is marked retired — or, equivalently, a
+       `with_current()` loader that lands in the close-then-retarget
+       window spins CPU-only until the retarget publishes (bounded:
+       the retarget is the very next step; the loop converges in at
+       most two iterations). A stale raw `Arc<PortAllocator>` A-handle used for a
        NEW allocation (a worker that has not yet refreshed its
        forwarding Arc) still fails transiently at A's closed gate
        and re-resolves through the current published allocator.
@@ -1714,7 +1790,12 @@ attacker-poisonable):**
        commit per the verify-and-retain above; each reap decrements;
        the sibling replica's reap no longer frees the live owner's
        port, and the re-steering edge (two locally-born entries for
-       one flow) is also covered by the refcount). `ExpiredSession` gains the
+       one flow) is also covered by the refcount — v9.9.20: for
+       IMPORTED flows the "refcount" is the coordinator-owned
+       GROUP-HOLD Arc's clone count (below): replicas receive clones
+       at commit and each reap drops only its own clone, so an early
+       replica reap can never free the reservation under a surviving
+       replica). `ExpiredSession` gains the
        entry's `flow_incarnation_id` (`entry.rs:337` lacks it today),
        and every EXTERNAL-map mutation is fenced by the canonical
        shared alias AS THE INCARNATION TOKEN (v9.6, round-15 Codex B1:
@@ -2876,11 +2957,17 @@ admitted interval):
   racing the async config push); (c) node-global watermark — in
   active/active, a non-authority's locally-born g2 flow does NOT
   park at the authority (both published C2), and BulkStart does not
-  clear the watermarks; (d) no reset loop — a stuck apply (#6387)
-  parks with overflow→drop-oldest + `syncBackfillNeeded`, the
-  connection stays up, and the takeover fence keeps the node
-  not-transfer-ready until its published epoch reaches the peer's
-  high-water; (e) the typed undo receipt — `NoChange` replay rolls
+  clear the watermarks; (d) no silent loss and no hot loop
+  (v9.9.20, superseding the v9.9.18 drop-oldest clause): overflow
+  marks the bulk/window LOSSY (no BulkEnd reconcile, no ACK),
+  raises the logical-peer full-resync OBLIGATION (drives a full
+  BulkSync over the SURVIVING fabric — the sticky
+  `outboundBulkAcked`/`wasDisconnected` cold-prime gates are
+  overridden), disconnects once per latched epoch, and clears the
+  obligation only on the replacement full bulk's ACK; a stuck
+  apply repeats at bulk cadence with the takeover fence keeping
+  the node not-transfer-ready until its published epoch reaches
+  the peer's high-water AND its parked queues are empty; (e) the typed undo receipt — `NoChange` replay rolls
   back nothing (pre-existing ownership untouched), `Inserted`/
   `Retained` undo exactly their mutation, and `Replaced(old_state)`
   with a FAILED new claim reinstates the displaced record's tuple +
@@ -2912,11 +2999,30 @@ admitted interval):
   exactly one side of the cut; no B ghost, no reissue under a live
   session); (e) pool reorder/rename — slots keyed by
   `SourceNatPoolAllocatorKey`: a renamed pool's retired allocator
-  persists until its last pre-cut token drops, and a reordered
-  rule never retargets tokens into a different pool's allocator;
+  persists until its last pre-cut token drops, a reordered
+  rule never retargets tokens into a different pool's allocator,
+  AND the compatible cross-key migration is asserted end-to-end
+  (v9.9.20, round-35 Codex M3: `SourceNatPoolAllocatorKey`
+  includes `pool_name`, `source.rs:327`, and reuse is exact-key
+  only, `:726` — persistence of A alone does not stop an
+  independently keyed B from issuing E1's tuple; the test asserts
+  the drained-snapshot migration into B, the old slot's retarget,
+  and release-accounting continuity — a pre-cut token's release
+  decrements B's migrated holder, never a ghost);
   (f) receipt-vs-GC — a `Replaced(old_state)` reinstatement runs
   entirely inside the allocator critical section, so expiry GC
-  cannot interleave.
+  cannot interleave; (g) early replica reap — two worker replicas
+  of an imported flow hold group-hold clones; the first reap drops
+  only its clone (the reservation survives until the canonical and
+  second replica also reap; the port is never freed under a live
+  replica); (h) lock-order — the allocator critical section never
+  nests with the canonical publish (assert by construction: no
+  code path holds both); (i) the COMPOSITION scenario (v9.9.20,
+  round-35 SMR F3): config change → apply lag on the standby →
+  epoch park → RG failover mid-park → in-place-refresh migration
+  on the survivor → drain, full resync with the obligation
+  clearing on ACK, slot retarget, and every pre-cut token
+  releasing into B.
 - **Escrow + conditional-delete fences (v9.9.3, round-19 Codex M4):**
   (a) two-phase stop: quiesce acknowledged (no new commits) BEFORE
   handoff; handoff completes BEFORE any side-map drop (no hold
