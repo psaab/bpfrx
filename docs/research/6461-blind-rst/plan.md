@@ -861,7 +861,13 @@ attacker-poisonable):**
        publish, leaving the installed entry holding E1's decision on
        E2's port): in one critical section, check that the live
        allocation for this tuple equals the decision's exact translated
-       tuple AND register a holder on it. The hold is an **owned token
+       tuple AND register a holder on it (v9.9.21: this
+       direct-registration path is the `DirectHold` variant —
+       LOCALLY-BORN flows and locally-born shared-entry
+       materializations only; IMPORTED flows never register here —
+       their entries carry `GroupHold` clones distributed at
+       fan-out, and an imported shared-entry materialization clones
+       the published entry's group-hold instead). The hold is an **owned token
        with a complete lifecycle (v9.6, round-15 Codex B3):** the token
        carries the exact allocator/allocation identity; a re-import/
        upsert TRANSFERS it atomically from the old entry to the new
@@ -1138,22 +1144,69 @@ attacker-poisonable):**
        not cold-prime because `wasDisconnected` requires BOTH
        slots empty (`:248`): B can overflow-close fab0 while A
        continues on fab1, no queue overflows, no bulk ever
-       follows). The obligation is per-PEER, not per-connection:
-       it drives the EXISTING BulkSync machinery over the
-       SURVIVING active connection (no new wire message — the
-       obligation explicitly OVERRIDES the sticky cold-prime
-       gates: it clears `outboundBulkAcked` for this peer and
-       treats the peer as cold-primed, so the next bulk drive runs
-       a FULL table iteration, `sync_bulk.go:93, :134`), drops the
-       parked buffer entirely, and is CLEARED only when the
-       replacement full bulk's ACK lands — a lossy bulk's own
-       suppressed ACK never clears it, and the obligation persists
-       across reconnects until then. The once-per-latched-epoch
-       disconnect remains as the buffer-release mechanism; the
-       obligation is what guarantees the repair. The alternative —
-       closing BOTH fabrics on overflow to force the cold-prime —
-       is the documented fallback for transports where driving a
-       bulk over the survivor is unsafe. During the outage the
+       follows). The obligation is per-PEER, not per-connection,
+       and its driver is stated precisely (v9.9.21, round-36 AGY
+       Q1 + round-36 SMR F1 + round-36 Codex B1 — the v9.9.20
+       "drive the existing BulkSync machinery over the SURVIVING
+       active connection, no new wire message" clause is
+       unreachable, twice over: `doBulkSync` is SENDER-driven only
+       (`sync_conn.go:130-194`, `sync_bulk.go:40-90`) AND —
+       round-36 Codex's sharper point — `BulkSync` exports the
+       INVOKING node's locally-owned table (`sync_bulk.go:50,
+       :95`), so B driving "a bulk" sends B→A and can never
+       reconstruct the A→B INSTALL/DELETE that B discarded; and
+       `outboundBulkAcked` is SENDER-side state ("set ONLY when
+       the peer acks OUR outbound bulk", `sync.go:475-482`), the
+       survivor re-drive at `sync_conn.go:572` being the sender
+       re-driving its OWN stranded outbound bulk — a receiver-side
+       obligation cannot clear the sender's flag without a
+       message): the repair bulk must be A→B, and exactly two
+       mechanisms can produce it. (a) PRIMARY — the TRUE
+       ALL-FABRIC RESET: overflow marks the window lossy and
+       closes BOTH connections to the peer ATOMICALLY, suppressing
+       reconnection until the sender has observed a true
+       both-empty epoch (a receiver-side action needing NO wire
+       change — but not a naive double-close: one fabric
+       reconnecting before the other's EOF is processed leaves
+       `wasDisconnected == false`, `sync_conn.go:248`, and no
+       cold-prime follows; the close must quiesce the
+       reconnect/accept path until both sides register both slots
+       empty) → cold-prime → the sender drives a FULL bulk A→B
+       with the config-first ordering of (3); the
+       once-per-latched-epoch latch keeps this from hot-looping.
+       (b) OPTIONAL fast path for negotiated pairs — an additive
+       authenticated RESYNC_REQUEST(generation N) message
+       (rolling-gated like the identity tails): the RECEIVER
+       requests with a monotone generation; a new SENDER arms an
+       outbound-repair obligation for N and repeatedly drives its
+       outbound FULL bulk A→B over the surviving connection
+       (clearing its own sticky gates per the obligation);
+       generation N discharges ONLY on the exact replacement bulk
+       associated with N (see (c)); a legacy sender ignores the
+       request, and the receiver falls back to (a) after a
+       bounded wait; unnegotiated peers always use (a). (c)
+       OBLIGATION BOOKKEEPING, direction-split and
+       generation-specific (round-36 Codex B1: bulk epochs are
+       allocated at `sync_bulk.go:65` but the pending epoch is
+       installed only near BulkEnd, `:169`, and the ACK handler
+       accepts any epoch not lower than pending,
+       `sync_conn_read.go:257` — a delayed pre-obligation ACK, or
+       an ACK for obligation O1's bulk after a second overflow
+       O2, must never discharge the current obligation): the
+       RECEIVER keeps an INBOUND-REPAIR obligation, cleared only
+       when a CLEAN post-reset BulkEnd (loss-free, generation
+       newer than the raising-point) arrives; the SENDER keeps an
+       OUTBOUND-BULK obligation, cleared only on the exact ACK
+       for a bulk STARTED after the applicable obligation
+       generation — not "any epoch ≥ pending"; and a FAILED
+       redrive is explicitly re-kicked (while
+       `bulkRedriveInFlight` is set, another disconnect loses the
+       CAS trigger and completion currently only clears the
+       flag, `sync_conn.go:594`: the obligation, not the CAS, is
+       the durable state — completion of a clean replacement bulk
+       discharges; failure re-arms the drive). A second overflow
+       while an obligation is outstanding re-arms the
+       raising-point generation. During the outage the
        sender's own send queue fills and self-arms
        `syncBackfillNeeded` (`sync_conn_write.go:46`), holding its
        sweep window; on reconnect the config-first ordering (3)
@@ -1280,6 +1333,10 @@ attacker-poisonable):**
        while W1 still forwards E1, freeing P under a live replica):
        the coordinator's reservation produces ONE group-hold object
        per imported flow (an `Arc`); the canonical shared entry,
+       its synthesized REVERSE companion (`ha/session_import.rs:104`
+       — a separately published family member,
+       `coordinator/mod.rs:753, :771`, whose clone keeps the
+       family-cohort accounting exact),
        every fanned-out worker entry, every later materialization
        (`session_glue/mod.rs:1092, :1157`), and the escrow keeper
        each hold a CLONE of that Arc; worker-entry reap and
@@ -1297,7 +1354,50 @@ attacker-poisonable):**
        coordinator's receipt undo applies to the group-hold's
        creation — a failed/rejected import never distributes a
        clone, so no replica can ever hold lifetime the coordinator
-       rolled back. The allocator critical section NEVER nests
+       rolled back. The token representation is TYPED, one
+       unambiguous lifecycle per variant (v9.9.21, round-36 Codex
+       H2 — the direct-holder and group-holder models must never
+       share one undifferentiated drop path: coordinator-only
+       reservation with today's direct per-worker reap
+       (`loop_body/mod.rs:1491`) would free the sole reservation
+       under surviving clones; direct retains with clone-only reap
+       would never drain): `NatHoldToken` is an enum —
+       `DirectHold` for LOCALLY-BORN allocations (today's model,
+       unchanged: the dataplane allocation registers a direct
+       allocator refcount holder per entry; reap/panic-Drop
+       decrements the allocator refcount directly;
+       `upsert_synced.rs:80`-style per-entry reserve applies only
+       here) and `GroupHold(Arc<GroupHold>)` for IMPORTED flows
+       (clone distribution; reap/panic-Drop drops only the clone;
+       the allocator releases exactly when the last clone drops,
+       through a finalizer that follows the declared
+       canonical→allocator lock order and NEVER reacquires
+       canonical locks from inside allocator cleanup). The
+       lifecycle sites per variant: FAN-OUT — DirectHold: each
+       worker replica verify-and-retains (direct increment);
+       GroupHold: each worker replica receives a clone from the
+       coordinator's fan-out. REVERSE SYNTHESIS — DirectHold: the
+       reverse entry's hold references the FORWARD allocation and
+       releases through its refcount (per the earlier rule);
+       GroupHold: the reverse companion receives its own clone at
+       synthesis. MATERIALIZATION — DirectHold (a locally-born
+       shared entry): the consumer's verify-and-retain registers a
+       direct holder; GroupHold (an imported shared entry): the
+       materialize clones the PUBLISHED entry's group-hold (never
+       a direct allocator mutation). REPLACEMENT — DirectHold:
+       retain-before-replace transfers the direct hold atomically
+       (`install.rs:322`); GroupHold: the replacement takes the
+       displaced entry's clone (clone-then-drop in one step — the
+       count never dips). ESCROW — the keeper holds the variant's
+       token (a DirectHold keeper or a GroupHold clone); the
+       handoff/retokenization moves the variant unchanged. REAP —
+       each variant drops only its own representation; and
+       PANIC-DROP — RAII drops the enum, whose Drop routes by
+       variant. Every earlier "register a holder in the allocator"
+       clause (the :858 verify-and-retain, the per-worker
+       token-Drop decrement) is scoped to `DirectHold` by this
+       sentence; imported flows NEVER take the direct path.
+       The allocator critical section NEVER nests
        with the canonical publish (v9.9.20, round-35 SMR F1: the
        reserve-with-receipt completes and RELEASES the allocator
        lock before `publish_shared_session` takes the canonical
@@ -1729,7 +1829,12 @@ attacker-poisonable):**
        `take()`/transfer — so exceptional destruction is covered too
        (a worker panic unwinds and drops the side map before the
        supervisor catches it, `supervisor.rs:80`: every token's `Drop`
-       fires, decrementing refcounts correctly; queue rejection/drop
+       fires, routing by variant (v9.9.21) — a `DirectHold`
+       decrements the allocator refcount directly, a `GroupHold`
+       clone decrements only the Arc (the allocator release fires
+       from the last clone's finalizer, in canonical→allocator
+       order, never reacquiring canonical locks inside the
+       cleanup); queue rejection/drop
        and unlaunched-worker queues use the same RAII path). Every
        removal path takes() the token exactly once and either
        releases or transfers it:
@@ -2958,16 +3063,34 @@ admitted interval):
   active/active, a non-authority's locally-born g2 flow does NOT
   park at the authority (both published C2), and BulkStart does not
   clear the watermarks; (d) no silent loss and no hot loop
-  (v9.9.20, superseding the v9.9.18 drop-oldest clause): overflow
+  (v9.9.21, superseding the v9.9.18 drop-oldest clause): overflow
   marks the bulk/window LOSSY (no BulkEnd reconcile, no ACK),
-  raises the logical-peer full-resync OBLIGATION (drives a full
-  BulkSync over the SURVIVING fabric — the sticky
-  `outboundBulkAcked`/`wasDisconnected` cold-prime gates are
-  overridden), disconnects once per latched epoch, and clears the
-  obligation only on the replacement full bulk's ACK; a stuck
-  apply repeats at bulk cadence with the takeover fence keeping
-  the node not-transfer-ready until its published epoch reaches
-  the peer's high-water AND its parked queues are empty; (e) the typed undo receipt — `NoChange` replay rolls
+  raises the logical-peer full-resync OBLIGATION whose PRIMARY
+  driver closes BOTH fabrics (receiver-side, no wire change —
+  cold-prime on reconnect drives the full bulk), with the
+  rolling-gated RESYNC_REQUEST fast path for negotiated pairs and
+  SEQUENCED DISCHARGE (only a loss-free bulk initiated after the
+  raising — ACK epoch above every in-flight epoch at raising —
+  clears it; a pre-overflow or in-flight ACK does not), and a
+  stuck apply repeats at bulk cadence with the takeover fence
+  keeping the node not-transfer-ready until its published epoch
+  reaches the peer's high-water AND its parked queues are empty
+  with no outstanding obligation; (d2) resync CAUSALITY
+  (v9.9.21, round-36 Codex M3): the repair bulk is asserted
+  A→B (B's loss causes SENDER A's full-table iteration — a
+  wrong-direction B→A bulk fails the test); a delayed
+  PRE-obligation ACK does not discharge; a second overflow O2
+  during O1's repair re-arms the raising-point generation and
+  only a clean bulk started after O2's generation discharges; a
+  failed redrive re-kicks (the obligation, not the
+  `bulkRedriveInFlight` CAS, is the durable state); the
+  close-both reset asserts the reconnect barrier (one fabric
+  cannot reconnect before the other's EOF registers — no
+  `wasDisconnected == false` cold-prime miss); and the typed
+  token asserts `DirectHold` (locally-born: direct refcount,
+  reap decrements) vs `GroupHold` (imported: clone distribution,
+  reap drops only the clone, last-clone finalizer releases in
+  canonical→allocator order) with no shared drop path; (e) the typed undo receipt — `NoChange` replay rolls
   back nothing (pre-existing ownership untouched), `Inserted`/
   `Retained` undo exactly their mutation, and `Replaced(old_state)`
   with a FAILED new claim reinstates the displaced record's tuple +
