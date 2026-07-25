@@ -3947,7 +3947,16 @@ authenticate different bytes and reconnect-loop at
 `:401-404`); EITHER peer being v1 selects the v1 proof (a v2
 peer proving to a v1 peer uses the v1 nonce-only proof over
 the legacy prefix bytes), and every capability field is
-masked or post-authenticated on a v1-proof connection; the
+masked or post-authenticated on a v1-proof connection —
+"post-authenticated" meaning concretely (v9.9.46, round-50
+SMR F2): on a v1-proof connection the capability fields are
+exchanged but NOT transcript-covered; a peer wanting them
+authenticated performs the v2 transcript proof as a SECOND
+proof exchange once the connection's authenticated wrapper
+is installed (the wrapper exists by then, so the v2 proof
+can ride it), and until then the fields are advisory-only —
+a v1 peer treats them as hints and keeps v1 behavior for
+anything security-relevant; the
 v2 byte vectors are literal: the domain tag string, the
 record-order rule, u16-LE length widths, little-endian
 integers, and the proof-direction rule (each side proves its
@@ -4029,7 +4038,17 @@ clears after successful lossless emission, and the legacy
 peer converges by its own invalidation and aging — the
 pre-existing legacy semantics; suppressing the obligation is
 the only safe posture, since the legacy peer can neither ACK
-nor enforce identity); the terminal exchange is TWO
+nor enforce identity; and the readiness ownership is explicit
+(v9.9.46, round-50 SMR F1: the new node's transfer-readiness
+for the install-only prime gates on its OWN sync state and
+the lossless emission — never on the legacy peer's state,
+which converges by its own mechanisms; and when a legacy→new
+bulk completes while the new node ALSO has a negotiated
+repair obligation outstanding, the two completion classes are
+independent — the legacy bulk's completion does not touch the
+armed obligation, and the node's readiness is the
+CONJUNCTION: every armed obligation discharged per its own
+rule, plus the legacy completion); the terminal exchange is TWO
 distinct frames with LOCKED ROLES (v9.9.43, round-48 Codex B1 —
 this supersedes calling `JOURNAL-END` "the terminal ACK" or
 "the ONLY discharge": `JOURNAL_END(repair_id, journal_epoch,
