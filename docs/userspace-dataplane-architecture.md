@@ -1680,9 +1680,13 @@ is [`userspace-dataplane-gaps.md`](userspace-dataplane-gaps.md).
   A), but a **NEW inbound IKE initiation is GATED** on the ingress zone's
   `system-services ike`/`ipsec` (#4323 Option B). `classify_ipsec_admission`
   splits the two by the ISAKMP Responder SPI: an all-zero Responder SPI is
-  the first packet of a new exchange (gated); a set Responder SPI is an
-  established/reply packet (exempt — the stateless mirror of `ct
-  established,related accept`, so return IKE never drops). A denied NEW IKE
+  the first packet of a new exchange (gated); a set Responder SPI is only
+  admitted as a reply of a LIVE exchange — #6471: on the secondary path
+  (DNAT-to-self / GRE-inner) a set-SPI packet must match a seeded exchange
+  (Initiator SPI, peer IP, local IP), installed only AFTER the gate admits a
+  zero-Responder initiation, with a 4096 cap + 24h sliding idle reap, so a
+  forged set-SPI packet can no longer mint its own admission (the pre-#6471
+  text here called every set-SPI packet unconditionally exempt). A denied NEW IKE
   is a silent drop (`host_inbound_denied_packets` +
   `RT_FLOW_CLOSE_REASON_HOST_INBOUND`) so it never reaches the local IKE
   daemon. The PRIMARY host-inbound enforcement for direct IPsec-to-self is

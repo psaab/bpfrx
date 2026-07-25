@@ -340,6 +340,7 @@ func firewallTermFromUnconstrained(t *FirewallFilterTerm) bool {
 		len(t.UnknownICMPTypes) == 0 &&
 		len(t.UnknownICMPCodes) == 0 &&
 		len(t.UnknownPorts) == 0 &&
+		len(t.UnknownAddresses) == 0 &&
 		len(t.TCPFlags) == 0 &&
 		!t.IsFragment &&
 		t.FlexMatch == nil &&

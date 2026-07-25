@@ -703,6 +703,7 @@ pub(crate) fn worker_loop(
         } else {
             WorkerCommandResults {
                 cancelled_keys: Vec::new(),
+                deleted_synced_keys: Vec::new(),
                 exported_sequences: Vec::new(),
                 export_owner_rgs: Vec::new(),
                 shaped_tx_requests: Vec::new(),
@@ -711,6 +712,7 @@ pub(crate) fn worker_loop(
         };
         let WorkerCommandResults {
             cancelled_keys,
+            deleted_synced_keys,
             exported_sequences,
             export_owner_rgs,
             shaped_tx_requests,
@@ -726,6 +728,19 @@ pub(crate) fn worker_loop(
             for binding in bindings.iter_mut() {
                 vacate_all_shared_exact_slots_for_binding(binding);
             }
+        }
+        // #6457: same-thread flow-cache invalidation for every session a
+        // control-plane `DeleteSynced` dropped this tick (operator
+        // `clear security flow session`, cluster-stale sweep, HA
+        // DeleteSynced propagation). `apply_worker_commands` has no
+        // `BindingWorker` access, so — exactly like the vacate dispatch
+        // above — it records the keys and the loop applies the eviction
+        // here where `&mut bindings` is held.
+        if !deleted_synced_keys.is_empty() {
+            invalidate_flow_cache_slots_for_deleted_sessions(
+                &mut bindings,
+                &deleted_synced_keys,
+            );
         }
         if !shaped_tx_requests.is_empty() {
             apply_worker_shaped_tx_requests(
@@ -1524,6 +1539,55 @@ fn reap_expired_sessions(
     }
 }
 
+/// #6457: invalidate the per-worker flow-cache slot(s) backing every session
+/// a control-plane `WorkerCommand::DeleteSynced` dropped this tick.
+///
+/// This is the delete-path twin of #3776's GC-reap invalidation in
+/// `reap_expired_sessions` above. Three control-plane flows funnel through
+/// `DeleteSynced` — the operator's `clear security flow session [all]`
+/// (`ClearAllSessions` / singular `DeleteSession` in the Go manager), the
+/// cluster-stale sweep (`BatchDeleteSessions`), and HA DeleteSynced
+/// propagation from the peer (`delete_synced_session_gen` fan-out plus
+/// cross-worker `replicate_session_delete`). None of them bumps
+/// config/fib generation, RG epoch, or RG lease, and none is an LRU
+/// eviction, so without this eviction a revoked-but-still-active 5-tuple
+/// kept HITTING its cached `RewriteDescriptor` on the owning worker —
+/// forwarded indefinitely with no session row, no policy re-evaluation,
+/// no `show security flow session` visibility, and no HA sync (a fail-open
+/// revocation primitive: the operator's explicit `clear` did not stop
+/// forwarding). Evicting here forces the next packet on the tuple to MISS
+/// the cache and re-run full session lookup/creation + policy — fail-closed.
+///
+/// Ownership and precision mirror the reap path: the flow cache is
+/// per-binding and worker-owned and this runs on the owning worker's
+/// command dispatch, so the eviction is a same-thread mutation — no
+/// cross-thread flush. Every binding is walked because a deleted session
+/// does not carry the ingress ifindex the cache is keyed on; the session
+/// table is keyed by the 5-tuple alone, so at most one live session —
+/// hence at most one VALID descriptor — exists per key, and
+/// `invalidate_slot` drops only a slot whose key AND ingress_ifindex both
+/// match (on a non-owning binding it either no-ops or evicts a stale
+/// prior-flow slot with the same tuple, never another live flow's entry).
+/// `delete_synced_session_gen` fans out the forward AND reverse keys, so
+/// both directions' slots are covered. The work is bounded by the
+/// control-plane delete rate (one Vec push per delete inside
+/// `handle_delete_synced`, one `invalidate_slot` walk per binding per
+/// delete here) — zero per-packet cost: the hit path is untouched and
+/// empty-delete ticks skip the call entirely.
+fn invalidate_flow_cache_slots_for_deleted_sessions(
+    bindings: &mut [BindingWorker],
+    deleted_keys: &[crate::session::SessionKey],
+) {
+    for key in deleted_keys {
+        for binding in bindings.iter_mut() {
+            binding
+                .flow
+                .flow_cache
+                .invalidate_slot(key, binding.ifindex);
+        }
+    }
+}
+
 /// #2428: count only the create-counted LOCAL-origin expired sessions for
 /// the `session_expires` counter (which the Go control plane reads as
 /// `GlobalCtrSessionsClosed`).
@@ -1574,7 +1638,7 @@ fn count_local_session_expiries(
 }
 
 #[cfg(test)]
-mod reap_flow_cache_tests {
+mod flow_cache_invalidation_tests {
     //! #3776: the GC reap path must invalidate the per-worker flow-cache
     //! slot(s) backing every session it reaps, so a packet that resumes on the
     //! same 5-tuple after the idle timeout MISSES the cache and re-runs full
@@ -1585,6 +1649,17 @@ mod reap_flow_cache_tests {
     //! helper the expiry loop calls; deleting its `invalidate_slot` loop turns
     //! `reaped_session_flow_cache_slot_is_invalidated` and
     //! `reaped_snat_descriptor_is_not_reused` RED.
+    //!
+    //! #6457: the control-plane delete path (operator `clear security flow
+    //! session`, cluster-stale sweep, HA DeleteSynced — all funnelled through
+    //! `WorkerCommand::DeleteSynced`) must invalidate the same slot(s) for the
+    //! revoked key. Those tests drive the production
+    //! `invalidate_flow_cache_slots_for_deleted_sessions` helper the worker
+    //! loop calls with `WorkerCommandResults.deleted_synced_keys`; deleting
+    //! its `invalidate_slot` loop turns `delete_synced_flow_cache_slot_is_
+    //! invalidated` and `delete_synced_snat_descriptor_is_not_reused` RED.
+    //! (The `handle_delete_synced` half — recording the key unconditionally —
+    //! is pinned in `afxdp/session_glue/tests.rs`.)
     use super::*;
     use crate::nat::NatDecision;
     use crate::session::{
@@ -1653,11 +1728,20 @@ mod reap_flow_cache_tests {
     }
 
     fn insert_cache_entry(binding: &mut BindingWorker, key: &SessionKey, snat_port: Option<u16>) {
+        insert_cache_entry_on_if(binding, key, snat_port, REAP_INGRESS_IF);
+    }
+
+    fn insert_cache_entry_on_if(
+        binding: &mut BindingWorker,
+        key: &SessionKey,
+        snat_port: Option<u16>,
+        ingress_ifindex: i32,
+    ) {
         let decision = reap_decision(snat_port);
         binding.flow.flow_cache.insert(FlowCacheEntry {
             key: key.clone(),
-            ingress_ifindex: REAP_INGRESS_IF,
-            logical_ingress_ifindex: REAP_INGRESS_IF,
+            ingress_ifindex,
+            logical_ingress_ifindex: ingress_ifindex,
             descriptor: RewriteDescriptor {
                 dst_mac: [0; 6],
                 src_mac: [0; 6],
@@ -1702,14 +1786,23 @@ mod reap_flow_cache_tests {
         key: &SessionKey,
         rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
     ) -> bool {
+        cache_hits_on_if(binding, key, rg_epochs, REAP_INGRESS_IF)
+    }
+
+    fn cache_hits_on_if(
+        binding: &mut BindingWorker,
+        key: &SessionKey,
+        rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
+        ingress_ifindex: i32,
+    ) -> bool {
         binding
             .flow
             .flow_cache
             .lookup(
                 key,
                 FlowCacheLookup {
-                    ingress_ifindex: REAP_INGRESS_IF,
-                    logical_ingress_ifindex: REAP_INGRESS_IF,
+                    ingress_ifindex,
+                    logical_ingress_ifindex: ingress_ifindex,
                     config_generation: 1,
                     fib_generation: 1,
                 },
@@ -1829,6 +1922,107 @@ mod reap_flow_cache_tests {
             cache_hits(&mut binding, &live, &rg_epochs),
             "a still-live flow's slot must survive the reap of a different flow \
              (no keepalive/hot-path regression, no collateral invalidation)"
+        );
+    }
+
+    // #6457 H1: a control-plane session delete (operator `clear security flow
+    // session`, cluster-stale sweep `BatchDeleteSessions`, HA DeleteSynced
+    // propagation — all funnelled through `WorkerCommand::DeleteSynced`) must
+    // evict the flow-cache slot backing the revoked session. None of those
+    // paths bumps config/fib generation, RG epoch, or RG lease, so without
+    // the explicit eviction the revoked-but-still-active 5-tuple keeps
+    // HITTING its cached RewriteDescriptor and forwards with no live
+    // session — the operator's revocation primitive silently defeated
+    // (fail-open). Drives the production
+    // `invalidate_flow_cache_slots_for_deleted_sessions` the worker loop
+    // calls with `WorkerCommandResults.deleted_synced_keys`. RED on revert
+    // (the entry survives, `cache_hits` stays true after the delete).
+    #[test]
+    fn delete_synced_flow_cache_slot_is_invalidated() {
+        let rg_epochs = reap_rg_epochs();
+        let mut binding = BindingWorker::new_for_mirror_test(0, 0, REAP_INGRESS_IF, 0);
+        let key = reap_key(34567);
+        insert_cache_entry(&mut binding, &key, None);
+        assert!(
+            cache_hits(&mut binding, &key, &rg_epochs),
+            "precondition: an active flow's descriptor is cached and hits"
+        );
+
+        invalidate_flow_cache_slots_for_deleted_sessions(
+            std::slice::from_mut(&mut binding),
+            &[key.clone()],
+        );
+
+        assert!(
+            !cache_hits(&mut binding, &key, &rg_epochs),
+            "#6457: a packet on a revoked flow's tuple must MISS the cache so \
+             it re-runs full session lookup + policy (no sessionless forward \
+             under a stale cached permit)"
+        );
+        assert_eq!(
+            binding.flow.flow_cache.entries.iter().flatten().count(),
+            0,
+            "#6457: the revoked flow's cache slot must be evicted"
+        );
+    }
+
+    // #6457 H2: the SNAT-bearing descriptor of a revoked flow must not
+    // survive the delete to re-drive a translation whose pool port
+    // `handle_delete_synced` just returned to the allocator (the port may
+    // already belong to a different flow). RED on revert (the SNAT
+    // descriptor keeps hitting).
+    #[test]
+    fn delete_synced_snat_descriptor_is_not_reused() {
+        let rg_epochs = reap_rg_epochs();
+        let mut binding = BindingWorker::new_for_mirror_test(0, 0, REAP_INGRESS_IF, 0);
+        let key = reap_key(45678);
+        insert_cache_entry(&mut binding, &key, Some(21000));
+        assert!(cache_hits(&mut binding, &key, &rg_epochs));
+
+        invalidate_flow_cache_slots_for_deleted_sessions(
+            std::slice::from_mut(&mut binding),
+            &[key.clone()],
+        );
+
+        assert!(
+            !cache_hits(&mut binding, &key, &rg_epochs),
+            "#6457: a revoked SNAT descriptor must not survive the delete and \
+             re-SNAT to a port now owned by a different flow"
+        );
+    }
+
+    // #6457: a deleted session carries no ingress ifindex, so the eviction
+    // must walk EVERY binding of the worker — the flow may have been pinned
+    // to any queue. Seed the revoked flow's descriptor in the SECOND
+    // binding's cache (keyed on that binding's ingress ifindex) and assert
+    // the walk reaches it; the first binding's still-live flow must survive
+    // (no collateral invalidation of an unrelated key).
+    #[test]
+    fn delete_synced_invalidation_walks_every_binding() {
+        let rg_epochs = reap_rg_epochs();
+        let other_if = REAP_INGRESS_IF + 1;
+        let mut binding_a = BindingWorker::new_for_mirror_test(0, 0, REAP_INGRESS_IF, 0);
+        let mut binding_b = BindingWorker::new_for_mirror_test(1, 0, other_if, 0);
+        let revoked = reap_key(56789);
+        let live = reap_key(56790);
+        insert_cache_entry_on_if(&mut binding_b, &revoked, None, other_if);
+        insert_cache_entry(&mut binding_a, &live, None);
+        assert!(cache_hits_on_if(&mut binding_b, &revoked, &rg_epochs, other_if));
+        assert!(cache_hits(&mut binding_a, &live, &rg_epochs));
+
+        let mut bindings = [binding_a, binding_b];
+        invalidate_flow_cache_slots_for_deleted_sessions(&mut bindings, &[revoked.clone()]);
+        let [binding_a, binding_b] = &mut bindings;
+
+        assert!(
+            !cache_hits_on_if(binding_b, &revoked, &rg_epochs, other_if),
+            "#6457: the revoked flow's slot must be evicted even when it \
+             lives on a non-first binding (the delete carries no ifindex)"
+        );
+        assert!(
+            cache_hits(binding_a, &live, &rg_epochs),
+            "#6457: an unrelated live flow must survive the delete of a \
+             different flow (no collateral invalidation)"
         );
     }
 }

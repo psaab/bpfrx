@@ -40,7 +40,9 @@ Mirrors the BPF firewall-filter pipeline in userspace.
     protocol esp; then discard` term matched EVERY protocol — a
     fail-wide security bug. The Go gate is the primary defense; this is
     the helper-boundary backstop against version/snapshot drift.
-- `engine.rs` — per-term evaluation, first-match-wins. It carries the
+- `engine/` — per-term evaluation, first-match-wins (the #1546 split of
+  the monolithic `engine.rs` into `mod.rs` / `eval.rs` / `matching.rs` /
+  `policer.rs` / `tx_selection.rs` / `cache_sensitive*.rs`). It carries the
   matched `then policer ...` name in the filter result. Routing-instance
   evaluation can also return log/action/filter/term metadata so AF_XDP
   can emit PBR RT_FLOW filter-log events without re-evaluating the term
@@ -506,8 +508,11 @@ exactly one of these two classes:
 The `tcp_flags_mask` / `tcp_flags_forbidden` / `is_fragment` / `icmp_type` /
 `icmp_code` inputs (and the #3077 `flex_match` L3 slice, `flex_l3`) are
 carried in a small `TermMatchExtra` built once per packet at the filter-eval
-call sites (`term_match_extra_from_frame` and its `ForwardPacketMeta` /
-meta-only variants). `flex_l3` borrows the live frame's L3 header, so
+call sites (`term_match_extra_from_frame` — one unified builder since #6435,
+generic over `impl Into<ForwardPacketMeta>` so the input-filter
+`UserspaceDpMeta` and TX-selection `ForwardPacketMeta` callers share it, the
+byte-identical `_fwd` twin retired — and the meta-only
+`term_match_extra_from_meta`). `flex_l3` borrows the live frame's L3 header, so
 `TermMatchExtra` is parameterized by a lifetime; the deferred CoS/TX-selection
 snapshot drops the borrow (`to_static()` → `flex_l3 = None`) and the flex term
 fails closed there (the frame may be recycled). The builder is fragment-safe:
@@ -538,7 +543,8 @@ than spuriously matching `icmp-type 0` / `icmp-code 0`.
 **#5568 (SCALAR declared-length bound).** #2449 keyed the ICMP presence test on
 the physical `frame.len()`; #5568 keys EVERY scalar L4/fragment input on the
 IP-DECLARED datagram end (`ip_declared_end` — the same SSOT that bounds the
-#5150 flex slices), computed FIRST in both frame builders. The shim stamps
+#5150 flex slices), computed FIRST in the frame builder (one unified builder
+for both metadata flavors since #6435). The shim stamps
 `l3_offset`/`l4_offset` from the raw frame, so without this, attacker-controlled
 Ethernet padding beyond the declared IP length manufactures a scalar match out of
 slack. Concretely: (a) the fragment walkers (`is_any_fragment` /
@@ -887,6 +893,49 @@ Tests: `icmp_type_unrepresentable_marker_*`, `icmp_code_unrepresentable_marker_*
 (Rust) and
 `TestFilterSnapshot{ICMP,DSCPMatch,DSCPRewrite,FlexMatchOversizedWidth,MixedPortExcept}*`
 (Go) (fail-on-revert).
+
+Partially-unresolvable port/address list backstops (#6459/#6463): the same
+fail-closed family, a different failure MECHANISM. The #3406 markers cover the
+case where a dropped token leaves an EMPTY match vector (which the matcher
+reads as "no constraint" = WIDENING). A partially-unresolvable
+`from {source,destination}-port[-except]` list or literal
+`from {source,destination}-address` list fails the OTHER way: the surviving
+tokens still build a matcher, so the term silently enforces a NARROWER set
+than the operator wrote — a `then discard`/`reject` term drops only the
+surviving subset and the rest falls through to the implicit accept (fail-OPEN
+for the deny). The all-unresolvable case was already covered at match-time
+(`constrained && PortMatcher::Any` / `constrained && empty`, #2400/#3205);
+the partial case was not. Two wire bools close it, same shape as the #3406
+markers (Go builder sets, `parse_term` rejects the whole snapshot; strict
+commit gates `validateFilterMatchValuesStrict` /
+`validateFilterAddressLiteralsStrict` are the primary defense):
+
+- **`ports_unrepresentable` (#6459):** set when compileFilterFrom records any
+  unresolvable port token on `term.UnknownPorts`; `parse_term` raises
+  `SnapshotIntegrityError::UnrepresentableFilterPorts`.
+- **`address_unrepresentable` (#6463):** set when compileFilterFrom records
+  any literal address token `classifyFilterAddrFamily` rejects on
+  `term.UnknownAddresses`; `parse_term` raises
+  `SnapshotIntegrityError::UnrepresentableFilterAddress`.
+
+Sibling parser-alignment fix (#6477): the filter-side `parse_port_spec`
+(compiler.rs) now routes every numeric token through the SHARED digit-only
+`crate::policy::parse_port_u16` (#3606) instead of Rust's u16 `FromStr`, which
+accepts a leading `+` ("+80" → 80). One of four port parsers (Go commit gate,
+Go capability gate, policy-side Rust, filter-side Rust) was more lenient than
+the rest — the #3606 agreement-invariant residual; a tolerant-path `from
+destination-port +80` survived verbatim and was enforced as port 80 HERE only.
+A rejected token yields zero ranges on a constrained direction, so the term
+fails closed (matches nothing) rather than enforcing a token the other three
+parsers reject.
+
+Tests: `ports_unrepresentable_marker_*`, `address_unrepresentable_marker_*`,
+`filter_parse_port_spec_rejects_signed_6477`,
+`firewall_term_snapshot_unrepresentable_marker_wire_keys_6459_6463` (Rust) and
+`TestFilterSnapshot{Ports,Address}Unrepresentable*`,
+`TestFilterSnapshotLenientPartial{Port,Address}List*`,
+`TestFirewallTermSnapshotUnrepresentableMarkerWireKeys_6459_6463`,
+`TestFilterMalformedAddressRecorded_6463` (Go) (fail-on-revert).
 
 ### Negated port match — `source-port-except` / `destination-port-except` (#2622)
 

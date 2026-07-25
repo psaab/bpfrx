@@ -37,16 +37,20 @@ pub(in crate::afxdp) fn is_ipsec_traffic(protocol: u8, dst_port: u16) -> bool {
 
 /// #4323: the Stage-11 admission class of an IPsec packet that `is_ipsec_traffic`
 /// already matched. Only a NEW inbound IKE initiation is subject to the per-zone
-/// host-inbound `ike`/`ipsec` gate; every other IPsec class is unconditionally
-/// exempt (the negotiated SA is the authorization).
+/// host-inbound `ike`/`ipsec` gate; every other IPsec class is exempt (the
+/// negotiated SA is the authorization) — with the #6471 refinement that a
+/// set-Responder-SPI IKE packet on the secondary path is exempt ONLY while a
+/// live seeded exchange matches it (see `classify_ipsec_admission`'s call-site
+/// discriminator; a forged set-SPI packet mints no admission).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::afxdp) enum IpsecAdmissionClass {
     /// ESP/AH raw data plane, ESP-in-UDP, a NAT-T keepalive, OR a NON-initial
-    /// IKE packet (the exchange already carries a responder SPI). Always
-    /// passthrough — mirrors the kernel host-inbound chain's global
-    /// `meta l4proto { 50, 51 } accept` (ESP/AH) and `ct established,related
-    /// accept` (later IKE), so the IPsec data plane and every return/reply IKE
-    /// packet transit even on a zone that omits `ike`.
+    /// IKE packet of a LIVE exchange (the exchange already carries a responder
+    /// SPI AND — #6471 secondary path — a seeded (Initiator SPI, peer, local)
+    /// match exists). Passthrough for ESP/AH and NAT-T keepalives mirrors the
+    /// kernel host-inbound chain's global `meta l4proto { 50, 51 } accept`;
+    /// return IKE mirrors `ct established,related accept` via the seed table —
+    /// an unmatched set-SPI packet falls through to the NEW-initiation gate.
     Exempt,
     /// The FIRST packet of a NEW inbound IKE exchange (we would be the
     /// responder): an ISAKMP header whose Responder SPI/cookie is all-zero
@@ -306,9 +310,12 @@ impl IkeExchangeTable {
     /// would be host-inbound-gated and dropped on `ike`-omitting zones —
     /// while the oldest entry is the one most likely stale. A flood of
     /// forged initiations on an IKE-PERMITTING zone can still churn
-    /// legitimate seeds out of the table (bounded by the cap); that zone
-    /// already exposes strongSwan to the same flood by configuration, and
-    /// the stage-10 udp-flood screen is the rate limiter.
+    /// legitimate seeds out of the table (bounded by the cap) — and because
+    /// eviction is oldest-first GLOBALLY, the victim can be a seed serving a
+    /// DIFFERENT, closed zone (e.g. a firewall-initiated GRE exchange whose
+    /// reply then re-gates); the blast radius is availability-only and
+    /// self-heals at the next re-auth, and the stage-10 udp-flood screen is
+    /// the rate limiter.
     pub(in crate::afxdp) fn seed(&self, key: IkeExchangeKey, now_ns: u64) {
         let mut entries = self.lock_entries();
         if let Some(seen) = entries.get_mut(&key) {

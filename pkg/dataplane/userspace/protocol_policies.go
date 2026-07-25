@@ -148,6 +148,43 @@ type FirewallTermSnapshot struct {
 	// default keep wire parity with an older control plane that omits the field
 	// (#1961).
 	DSCPMatchUnrepresentable bool `json:"dscp_match_unrepresentable,omitempty"`
+	// PortsUnrepresentable (#6459) is set true when the term carried at least
+	// one `from {source,destination}-port[-except]` token the compiler could
+	// NOT resolve to a number (an unknown service name, a malformed range, or
+	// a non-canonical token such as "+80"), recorded on term.UnknownPorts. The
+	// strict commit gate (validateFilterMatchValuesStrict, #3205) rejects it,
+	// so a committed config never sets this; it is the helper-boundary
+	// fail-closed marker for the tolerant load / peer-sync path. The
+	// pre-#6459 Rust filter compiler dropped the unresolvable token PER-TOKEN
+	// (`filter_map(parse_port_spec)`): a PARTIALLY-unresolvable list built a
+	// matcher over only the surviving subset, so a discard/reject term
+	// silently enforced a NARROWER port set than the operator wrote — the
+	// traffic meant for the dropped ports fell through to the implicit accept
+	// (fail-OPEN). (An ALL-unresolvable list already failed closed at
+	// match-time via `constrained && PortMatcher::Any`, #2400/#3205.) With
+	// this flag the Rust filter compiler raises
+	// SnapshotIntegrityError::UnrepresentableFilterPorts and rejects the whole
+	// snapshot instead. omitempty + the Rust serde default keep wire parity
+	// with an older control plane that omits the field (#1961).
+	PortsUnrepresentable bool `json:"ports_unrepresentable,omitempty"`
+	// AddressUnrepresentable (#6463) is set true when the term carried at
+	// least one literal `from source-address` / `destination-address` token
+	// that is not a parseable IP/CIDR (classifyFilterAddrFamily rejects it),
+	// recorded on term.UnknownAddresses. The strict commit gate
+	// (validateFilterAddressLiteralsStrict, #3433) rejects it, so a committed
+	// config never sets this; it is the helper-boundary fail-closed marker for
+	// the tolerant load / peer-sync path. The pre-#6463 Rust parse_address
+	// dropped such a token PER-TOKEN (its `Err(_)` arm pushed nothing): a
+	// PARTIALLY-malformed list matched only the surviving prefixes, so a
+	// discard/reject term silently enforced a NARROWER address set than the
+	// operator wrote — a host in the dropped range was accepted by
+	// fall-through (fail-OPEN). (An ALL-malformed direction already failed
+	// closed at match-time via `constrained && empty`, #2400.) With this flag
+	// the Rust filter compiler raises
+	// SnapshotIntegrityError::UnrepresentableFilterAddress and rejects the
+	// whole snapshot instead. omitempty + the Rust serde default keep wire
+	// parity with an older control plane that omits the field (#1961).
+	AddressUnrepresentable bool `json:"address_unrepresentable,omitempty"`
 	// FlexMatch is the Junos `from flexible-match-range` byte-offset match
 	// (#3077). Before this wiring it was parsed + compiled for the retired
 	// legacy dataplane but DROPPED on the userspace wire, so the byte-offset

@@ -59,6 +59,8 @@ macro_rules! debug_log {
 
 #[path = "bind.rs"]
 mod bind;
+#[path = "binding_state/mod.rs"]
+mod binding_state;
 #[path = "bpf_map/mod.rs"]
 mod bpf_map;
 #[path = "checksum.rs"]
@@ -154,6 +156,7 @@ use self::bind::{
     bind_strategy_for_driver, binder_for_strategy, describe_bind_flags,
     shared_umem_group_key_for_device,
 };
+use self::binding_state::*;
 use self::bpf_map::*;
 use self::checksum::*;
 use self::event_emit::*;
@@ -213,6 +216,15 @@ pub(crate) use self::frame::write_eth_header_slice;
 // IPv6 ext-header loop bound so `crate::nat64`'s private walkers stay
 // in lockstep with the forwarding/screen paths (one const, no skew).
 pub(crate) use self::frame::MAX_IPV6_EXT_HEADERS;
+// #6435: and now the canonical WALK itself — `crate::nat64`'s
+// L4-offset / non-first-fragment / fragment-header resolvers fold this
+// one shared walker (declared in `frame/inspect.rs`) instead of
+// hand-mirroring the loop, retiring the last private copies the #4435
+// bound-share left behind. `afxdp/icmp_embed/parse.rs` reaches the same
+// items through this re-export + its `use super::*` chain. Only the two
+// items NAT64/icmp_embed NAME are re-exported here — the `ExtChainWalk`
+// / `ExtChainFragment` field access needs no import.
+pub(crate) use self::frame::{ExtChainOutcome, walk_ipv6_ext_chain};
 use self::umem::*;
 
 // #4435 (test-only): a thin `pub(crate)` wrapper over the canonical
@@ -616,6 +628,17 @@ pub(in crate::afxdp) struct BatchCounters {
     // BindingLiveState.nat64_ineligible_source and surfaced as the `NAT64
     // ineligible-source drops` operator counter.
     nat64_ineligible_source: u64,
+    // #6475: fail-closed NAT64 DESTINATION-ineligibility drops — an incoming
+    // IPv6 packet whose NAT64-prefix-matched destination embeds a non-global
+    // IPv4 per RFC 6052 §2.2 (0.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16,
+    // 224.0.0.0/4, 240.0.0.0/4 — e.g. `64:ff9b::127.0.0.1`, which would
+    // otherwise resolve LocalDelivery to the localhost-only control plane once
+    // lo0 lands in `state.local_v4`) is dropped BEFORE route lookup, policy, or
+    // `allocate_source`. Distinct from the source gate above and from the pool
+    // counters (config/capacity on an ELIGIBLE flow) — this is a destination
+    // input-validation reject. Flushed to BindingLiveState.nat64_ineligible_dest
+    // and surfaced as the `NAT64 ineligible-destination drops` operator counter.
+    nat64_ineligible_dest: u64,
     // #5625: fail-closed NAT64 EXTENSION-HEADER ineligibility drops — a v6→v4
     // forward translation was rejected BEFORE it proceeded because the IPv6
     // packet carried an Authentication Header (51), an ACTIVE Routing header
@@ -820,6 +843,22 @@ impl BatchCounters {
         self.nat64_ineligible_source += 1;
     }
 
+    /// #6475: record a fail-closed NAT64 DESTINATION-ineligibility drop — an
+    /// incoming IPv6 packet whose NAT64-prefix-matched destination embeds a
+    /// non-global IPv4 per RFC 6052 §2.2 (e.g. `64:ff9b::127.0.0.1`, which
+    /// would otherwise LocalDeliver to the localhost-only control plane).
+    /// Bumped at the pre-routing NAT64 classification
+    /// (`classify_ipv6_packet`/`classify_ipv6_dest` →
+    /// `Nat64Match::IneligibleDestination`) before any route lookup, policy, or
+    /// `allocate_source`, so no session/BIB/allocation state is minted. Batched
+    /// like the sibling nat64 drop counters and flushed to
+    /// `BindingLiveState.nat64_ineligible_dest`.
+    #[inline]
+    pub(in crate::afxdp) fn record_nat64_ineligible_dest(&mut self) {
+        self.touched = true;
+        self.nat64_ineligible_dest += 1;
+    }
+
     /// #5625: record a fail-closed NAT64 extension-header ineligibility drop —
     /// a v6→v4 forward translation rejected because the IPv6 packet carried an
     /// Authentication Header, an active Routing header (Segments Left > 0), or a
@@ -927,6 +966,13 @@ impl BatchCounters {
             live.nat64_ineligible_source
                 .fetch_add(self.nat64_ineligible_source, Ordering::Relaxed);
             self.nat64_ineligible_source = 0;
+        }
+        // #6475: fail-closed NAT64 destination-ineligibility tally, batched
+        // like the sibling nat64 drop counters above.
+        if self.nat64_ineligible_dest != 0 {
+            live.nat64_ineligible_dest
+                .fetch_add(self.nat64_ineligible_dest, Ordering::Relaxed);
+            self.nat64_ineligible_dest = 0;
         }
         // #5625: fail-closed NAT64 ext-header-ineligibility tally, batched like
         // the sibling nat64 drop counters above.

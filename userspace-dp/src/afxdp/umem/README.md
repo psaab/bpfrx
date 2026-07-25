@@ -5,15 +5,20 @@ region where AF_XDP zero-copy frames live. Owns the `mmap` region,
 wraps the crate-local `Umem` type from `xsk_ffi` (a libxdp-backed
 drop-in for xdpilone), and tracks frame budgets per binding.
 
+> #6436: the per-binding runtime-state cluster that historically
+> lived here (`BindingLiveState`, the redirect TX inbox, the latency
+> histogram primitives, the HA session-delta fallback buffer, and the
+> snapshot/debug-state/profile renderers) moved to
+> `../binding_state/`. This module is now only the memory region.
+
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `mod.rs` | `WorkerUmem` / `WorkerUmemInner` — Rc-shared UMEM handle held by the owner worker. |
+| `mod.rs` | `WorkerUmem` / `WorkerUmemInner` / `WorkerUmemPool` — Rc-shared UMEM handle held by the owner worker, plus the free-frame pool. |
 | `mmap.rs` | `MmapArea` — the raw `mmap` region. |
 | `mmap_tests.rs` | Co-located mmap unit tests. |
-| `profile.rs` | `OwnerProfileOwnerWrites` / `OwnerProfilePeerWrites` — per-frame profiling counters split by who's writing. |
-| `tests/` | Co-located UMEM unit tests, split per-concern (#4667): `mod.rs` (shared `use` header + the cross-concern `test_tx_request_for_inbox` fixture), `mmap_area.rs`, `tx_inbox.rs`, `latency_buckets.rs`, `snapshot_propagation.rs`, `tx_submit_latency.rs`, `tx_kick_latency.rs`, `debug_state.rs`. |
+| `tests/` | Co-located UMEM unit tests: `mod.rs` + `mmap_area.rs`. The binding-state concern tests moved to `../binding_state/tests/` in #6436 (the #4667 per-concern split maps 1:1 onto the new location). |
 
 ## Where it sits
 
@@ -38,19 +43,6 @@ drop-in for xdpilone), and tracks frame budgets per binding.
   unit tests can exercise worker-owned drain paths without creating
   kernel AF_XDP sockets; production UMEM construction remains
   `WorkerUmem::new`.
-- **Status-snapshot `last_error` precedence (#4971 / #6145).**
-  `snapshot()` (`snapshot.rs`) renders `last_error` from TWO sources with
-  a fixed precedence: the `last_error` **mutex** string (written by the
-  exceptional `TxError::Drop` / bind / reconcile paths via `set_error`)
-  wins whenever non-empty; only when it is empty does the snapshot fall
-  back to the lock-free `last_tx_retry_status` atomic (the expected-TX
-  backpressure hint from #4971). Consequence: a latched `TxError::Drop`
-  **masks** a live retry hint until the binding rebinds and
-  `clear_error()` resets both. This stale-masking is intentional — a
-  Drop is rarer and more severe than routine backpressure — and is
-  pinned by `tx_status_drop_error_outranks_retry_hint_until_rebind_6145`
-  (`tests/snapshot_propagation.rs`). See `../tx/README.md` for the full
-  rationale.
 - In **zero-copy mode on mlx5**, an `XDP_PASS` action permanently
   consumes a fill-ring frame: the kernel holds the UMEM buffer in
   an SKB and never returns it. Sustained traffic drains all 12K+ RX

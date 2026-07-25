@@ -14,7 +14,7 @@ use crate::afxdp::tx::recycle_prepared_immediately_with_shared;
 use crate::afxdp::types::{
     PreparedTxRequest, TxRequest, WorkerCoSInterfaceFastPath, WorkerCoSQueueFastPath, WorkerCommand,
 };
-use crate::afxdp::umem::BindingLiveState;
+use crate::afxdp::binding_state::BindingLiveState;
 use crate::afxdp::worker::BindingWorker;
 
 /// #780: Step 1 action variants. Mirrors the action taken inside
