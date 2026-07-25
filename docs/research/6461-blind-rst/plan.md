@@ -1417,7 +1417,14 @@ attacker-poisonable):**
        retire n3, then fail installation at the
        setup-generation fence and strand n3 un-readoptable:
        every pre-auth admission carries a PROVISIONAL pending
-       slot keyed by its admission generation; promotion is
+       slot keyed by its admission generation — bounded and
+       expiring (v9.9.48, round-51 SMR F2: an admission that
+       never authenticates dies at the handshake deadline —
+       the auth handshake's own failure path closes the
+       connection — and the provisional set is bounded by the
+       existing admission cap (`sync_admission.go:66`'s slot
+       limit), so stalled admissions can neither leak nor
+       exhaust it); promotion is
        atomically coupled with slot authorization (a
        transition that cannot authorize its slot fails
        entirely); promotion REVOKES older unbound pre-slot
@@ -3981,7 +3988,12 @@ offers NO negotiated capabilities — both peers fall back to
 legacy behavior for everything), OR, to preserve `repair-vN`
 on such connections, a post-wrapper authenticated
 `CAPABILITY_CONFIRM` frame carries the full tuple and a
-feature enables ONLY when both sides' CONFIRMs agree —
+feature enables ONLY when both sides' CONFIRMs agree — the
+negotiated feature state being PER-CONNECTION (v9.9.48,
+round-51 SMR F3: it never persists across connections — a
+reconnect re-runs the full negotiation (hello, proof,
+wrapper, CONFIRM) before any feature enables, so there is
+no cross-connection feature memory to race a downgrade);
 "post-authenticated" meaning concretely (v9.9.46, round-50
 SMR F2): on a v1-proof connection the capability fields are
 exchanged but NOT transcript-covered; a peer wanting them
@@ -4018,8 +4030,14 @@ reconnect-loop (`sync_auth.go:401-404`,
 prover_record || verifier_record)`, where `tag_v2` is the
 literal ASCII `xpf-cluster-sync/v2/hello-transcript`, `role`
 is one byte (`0x01` dialer / `0x02` acceptor), the records
-are the raw HELLO frames exactly as received in
-(dialer-first) order each prefixed by its u16-LE length, and
+are the raw HELLO frames in (dialer-first) order each
+prefixed by its u16-LE length — with the pair IDENTICAL for
+both sides (v9.9.48, round-51 SMR F4: `prover_record` is the
+prover's OWN sent HELLO, which the verifier also holds as
+received, and `verifier_record` is the peer's HELLO as
+received, so the dialer and the acceptor compute
+byte-identical inputs despite each HELLO carrying per-side
+nonces), and
 all integers are little-endian; the golden vectors for both
 directions ship in the test plan),
 the separator being a fixed tag distinct from the v1 proof tag
@@ -4097,9 +4115,18 @@ either (i) persists the obligation in an explicit DEGRADED
 state until the negotiated repair returns (the takeover
 fence as backstop — never an implicit clear, because
 clearing on emission would treat an unacknowledged prime as
-repair), or (ii) ATOMICALLY supersedes the obligation into
-the documented LEGACY BASELINE after a post-reset prime that
-is itself a fresh incarnation-scoped act; and a legacy
+repair; and a v2↔legacy FLAPPING peer never clears the
+v2-incarnation obligation this way — the obligation keys
+include both incarnations, so a legacy incarnation's
+completion can't touch it, and each legacy→v2 flap re-arms
+the negotiated path with the obligation discharging on the
+next negotiated repair, v9.9.48, round-51 SMR F1), or (ii) ATOMICALLY supersedes the obligation into
+the documented LEGACY BASELINE — ATOMICALLY at downgrade
+detection, never lazily (v9.9.48: the baseline's prime is
+defined concretely: the fresh incarnation-scoped close-both
++ cold-prime cycle — the legacy baseline's own reset —
+whose completion is the lossless INSTALL-only emission);
+and a legacy
 `BulkEnd` NEVER clears a negotiated (repair-ID-bound)
 obligation implicitly — the matrix's legacy-completion class
 applies only to obligations CREATED as legacy); and the readiness ownership is explicit
