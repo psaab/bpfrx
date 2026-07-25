@@ -1027,6 +1027,81 @@ attacker-poisonable):**
        standby gap is diagnosable rather than silent.
        Co-holder imports then arrive in any order: F1 creates,
        F2 retains, and neither fails the occupied-bit check.
+       **Future-epoch deferral (v9.9.17, round-32 Codex B2):** the
+       wire-carried lease inputs fix key DERIVATION, but the
+       receiver's allocator SHAPE checks (port-range bitmap,
+       `allocator.rs:537, :672`; pool membership, `source.rs:900`)
+       still evaluate against the LOCALLY APPLIED config, and a
+       future-epoch exact reservation can fail them before its
+       allocator configuration arrives: C1's pool ends at port
+       40000, C2 expands it to 40001; A admits E1 at 40001; B
+       receives E1's g2 INSTALL before applying C2 (config receipt
+       only queues asynchronous application,
+       `sync_conn_read.go:298`, while session frames process
+       immediately, `:96`, and the epoch fence refuses only epochs
+       BELOW the applied/applying barrier, `sync_conn_gen.go:424`),
+       and B's C1 bitmap rejects 40001 out of range. Sender-side
+       retry cannot close this: the rejection is invisible to the
+       sender — the sweep considers only entries created since its
+       prior cutoff and advances that cutoff after LOCAL QUEUE
+       success, not receiver acceptance (`sync_conn_sweep.go:137,
+       :185`) — so B can apply C2 after the resend window and A can
+       crash before any reconnect/bulk (crash takeover is expressly
+       ungated, `manager.go:321`), leaving E1 to re-seed at Q: a
+       prohibited mid-flow port swap. The fix is RECEIVER-SIDE
+       EXACT-EPOCH DEFERRAL: a session INSTALL stamped with a config
+       epoch greater than the receiver's applied/applying high-water
+       is NOT processed immediately — the receiver PARKS that
+       connection's remaining stream (head-of-line) until a config
+       with epoch ≥ the stamp is locally applied, then drains.
+       Head-of-line parking is the ordering proof, not just the
+       simple mechanism: install and delete deltas ride the SAME
+       FIFO connection, so consuming strictly in stream order means
+       a delete can never bypass a deferred install for the same key
+       (the naive per-key deferral zombie — install deferred, delete
+       applied as no-op, install then lands — is impossible by
+       construction). The park is bounded by a buffer; on overflow
+       the connection resets and re-bulks through the existing
+       reconnect machinery; a stuck config apply (#6387) is already
+       operator-visible via `configSyncFailing`, and a parked
+       standby stream is strictly safer than a mis-reserving one.
+       At processing time the receiver's local rule config IS the
+       sender's admitting config, so the shape checks and the
+       wire-carried lease inputs agree — the two mechanisms are
+       complementary: deferral aligns the allocator SHAPE, the
+       wire-carried stamps pin the lease-input PROVENANCE (resend/
+       bulk re-emission never re-derives from queue-time state).
+       (Rejected alternatives: exact-epoch deferral ON THE SENDER
+       cannot work — the sender does not know the receiver's apply
+       watermark; NACK/backfill adds a protocol ack for a problem
+       the receiver can solve locally.)
+       **Import-transaction rollback edge (v9.9.17, round-32 Codex
+       M3):** inverting today's order (upsert succeeds first, NAT
+       reserved after, `upsert_synced.rs:64`) into
+       create-or-retain-BEFORE-publication opens an orphan edge: a
+       replay can reserve P and then lose a later check (the
+       locally-authoritative-entry check, `install.rs:310`), leaving
+       an orphan lease at `active_flows=1` that expiry GC will not
+       reclaim (`allocator.rs:2302`). The import transaction is
+       therefore: preflight every check that does not require the
+       reservation → create-or-retain → publish — and ANY
+       post-retain failure (including the publish path and panic
+       unwind) rolls the reservation back through `rollback_flow`
+       (`allocator.rs:1392`, verified to remove `live_by_flow`,
+       `address_only_owners`, persistent lease membership, and the
+       port bit), with an RAII guard so the exceptional path
+       cannot leak the retain.
+       **Capability gate (v9.9.17, round-32 Codex):** clustered
+       persistent source NAT is COMMIT-TIME REJECTED today
+       (`capabilities.go:87`, `persistentSourceNATHAUnsupportedReason`
+       — a cluster + `persistent-nat` config fails the userspace
+       capability check), so the persistent-import machinery above
+       defends a currently-disarmed configuration and ships dark;
+       the gate REMAINS until the lease-input capability is
+       negotiated cluster-wide (the same rolling-upgrade negotiation
+       that gates the INSTALL identity tail), and only then is
+       persistent NAT armable on a cluster. Non-clustered persistent
+       NAT is unaffected by every mechanism in this plan.
        **Temporary stop/rebind (v9.9.15, round-30 Codex B3):** the
        two-phase sequence and the durable escrow are NOT scoped to
        the reconcile sequence — they are THE worker-teardown
@@ -1248,35 +1323,49 @@ attacker-poisonable):**
        (`allocator.rs:999`), B is published WITHOUT P, and E2 then
        claims P in B; independent allocator bitmaps issuing the same
        tuple produce the documented reverse-NAT misdelivery
-       (`pkg/config/compiler_tailgates.go:212`). The fence: the
-       migration FREEZES A's ownership interface at snapshot time
-       (allocator-level, covering EVERY ownership-mutating entry
-       point — v9.9.16, round-31 Codex B2: ownership is created not
-       only through `allocate_translation` but through the
-       deterministic PAT path (`source.rs:1431`), deterministic NAT64
-       (`source.rs:995`), address-only round-robin
-       (`source.rs:1523`), persistent address-only
-       (`source.rs:1497`), and the import/restore reservations
-       (`reserve_flow` / `reserve_address_only*`); and it is
-       DESTROYED through the release paths (`release_flow` /
-       `free_translated_port` / the address-only release). During
-       the window every one of these entry points either dual-applies
-       to A and B under one lock or returns a transient error — a
-       worker still holding A can create or destroy ownership ONLY
-       with B kept in lockstep; already-committed in-flight
-       allocations are fine), migrates the retained tuples into B,
-       THEN publishes B — so no worker can still allocate through A
-       alone after the migration snapshot, and the dual-record is
-       SYMMETRIC: a release through A during the window releases
-       BOTH A's record and B's dual-record (the dual-record IS B's
-       ownership state kept in lockstep with A's for exactly the
-       window — B can neither issue a held tuple nor leak a freed
-       one; the quiesced-retokenize path remains the fallback for
-       any entry point that cannot dual-apply).
-       Alternatively the dual-write bridge: during the migration
-       window, allocations through A are also reserved in B, with an
-       acknowledgement that no worker can still allocate through A
-       after the cutover), AND the compatibility detection includes
+       (`pkg/config/compiler_tailgates.go:212`). The fence is a
+       per-allocator MIGRATION GATE (v9.9.17, round-32 AGY Q2 +
+       round-32 Codex r31-B2-disposition — this SUPERSEDES the
+       v9.9.14 freeze and the v9.9.16 dual-record/lockstep bridge:
+       AGY verified the lockstep is unimplementable as stated,
+       because `allocate_translation` performs the lock-free
+       `occ.claim()` at `allocator.rs:1017` BEFORE acquiring
+       `shared.live` at `:1034` (no mutex wrapper can mirror that
+       claim into B), and A/B are distinct `PortAllocator` objects
+       with independent `shared.live` mutexes (`allocator.rs:720,
+       :743`) so cross-allocator locking invites inversion): an
+       RW-style gate on the allocator object. EVERY
+       ownership-mutating entry point acquires the gate's READ
+       permit BEFORE any mutation — the full enumeration:
+       `allocate_translation`, the deterministic PAT path
+       (`source.rs:1431`), deterministic NAT64 (`source.rs:995`),
+       address-only round-robin (`source.rs:1523`), persistent
+       address-only (`source.rs:1497`), the import/restore
+       reservations (`reserve_flow` / `reserve_address_only*`), the
+       release paths (`release_flow` / `free_translated_port` / the
+       address-only release), `rollback_flow` (`allocator.rs:1392`
+       — round-32 AGY trace-1: omitted in v9.9.16, it destroys
+       ownership on flow-setup abort and would leak B's record),
+       and expiry GC (`allocator.rs:2302`) — including the lock-free
+       bitmap claim, which happens INSIDE the read permit (the gate
+       is taken before `occ.claim()`, not just before the `live`
+       lock). The in-place-refresh migration takes the gate's WRITE
+       permit — draining in-flight mutations (µs-scale, bounded) —
+       snapshots A's COMPLETE ownership state (occupancy bitmaps,
+       `live_by_flow`, `persistent_by_source` leases,
+       `address_only_owners`, recycle queues, deterministic state)
+       into B under A's `live` lock, atomically publishes B (the
+       existing Arc swap at `snapshot_refresh.rs:397`), then opens
+       B's gate; A's gate stays CLOSED (retired) — a stale A-holder
+       fails transiently at the closed gate and re-resolves through
+       the current published allocator. There is NO dual-record and
+       NO cross-allocator mutex: B is never worker-visible until
+       fully populated, and the Arc swap is the single handoff, so B
+       can neither issue a held tuple nor leak a freed one. New
+       mutations arriving during the window block briefly on the
+       gate or fail transiently (the packet path re-resolves on the
+       next packet — the window is µs-ms and config changes are
+       rare), AND the compatibility detection includes
        ALLOCATION MODE, not just address space (v9.9.15, round-30
        Codex B1a: `SourceNatPoolAllocatorKey` contains only pool
        name, addresses, and port range — NOT `no_translation` or
@@ -1304,15 +1393,17 @@ attacker-poisonable):**
        (not just `address_only_owners`), and PAT allocation ALSO
        consults `address_only_owners` — so the identical public
        reverse tuple can never be issued across modes regardless of
-       detection timing. The A/B retain/release bridge is explicit:
-       during the migration window, retain operations through A are
-       ALSO recorded in B (dual-record), or the workers are quiesced
-       and retokenized — a post-snapshot materialization
-       (`session_glue/mod.rs:1157`) can otherwise still retain E1
-       through A while tokens own the exact A allocator handle
-       (:1057), leaving B's safe release point undefined; freezing
-       only fresh allocation does not define B's safe release point)
-       or forces the quiesced reconcile path (which has the
+       detection timing. The retain/release side is covered by the
+       same migration gate: retain AND release operations through A
+       during the window hold the gate's read permit, so the
+       drained-snapshot into B already contains every ownership
+       state at the cut — a post-snapshot materialization
+       (`session_glue/mod.rs:1157`) either completes before the
+       write permit lands (its result is in the snapshot) or fails
+       transiently at the closed gate and re-resolves through B
+       (v9.9.17: this supersedes the v9.9.15 dual-record bridge,
+       which left B's release point undefined) — or forces the
+       quiesced reconcile path (which has the
        escrow); a collision-domain-compatible change migrates in
        place; an incompatible change forces the reconcile). The rule
        for the reconcile/restore path itself: on a config change
@@ -2159,10 +2250,23 @@ non-close path.
 
 ### 5.8 Signature/signature-shape changes (all crate-internal)
 
-**Wire schema (normative, consolidated — v9.9.14):**
+**Wire schema (normative, consolidated — v9.9.17):**
 The session INSTALL/Open delta carries the additive identity tail
 `{(origin_process_nonce, flow_incarnation_id, stable_rule_id_hash,
-admission_config_version)}` (v9.9.14, round-29 Codex H4: the main
+admission_config_version, persistent_nat, persistent_nat_permit)}`
+(v9.9.17, round-32 Codex B1: the lease-derivation inputs are part of
+the NORMATIVE tail, not just the §5.2 narrative — they are stamped
+INTO THE ENTRY at admission by the helper (a new entry-level field
+pair; `NatDecision` carries only rewrite fields today,
+`nat/mod.rs:84`, and neither `SessionDelta` nor `SyncedSessionEntry`
+stores lease provenance, `entry.rs:283` / `worker/mod.rs:375`), and
+EVERY wire emission — initial install, periodic resend, and bulk —
+carries the ENTRY's stamps, never a queue-time re-derivation from
+the sender's current rule config (which would reopen the r31-B1
+epoch-skew trace through the resend path: an empty-standby bulk
+without the stamps imports non-persistently, F2 fails the
+occupied-bit check, and takeover swaps its port). The selector
+fields (v9.9.14, round-29 Codex H4: the main
 design requires imported entries to inherit `stable_rule_id_hash` and
 `admission_config_version` through the INSTALL tail, and they cannot
 be reconstructed from the BPF projection (`bpf_session_value.go:168`),
@@ -2174,7 +2278,8 @@ companion-deleted through `session_store.go:391`); the session DELETE
 delta carries `{(origin_process_nonce, flow_incarnation_id)}`.
 The sender/receiver store lifecycle: the Go sidecar synced store gains
 `(origin_process_nonce, flow_incarnation_id, row_version,
-stable_rule_id_hash, admission_config_version)` per entry (v9.9.15,
+stable_rule_id_hash, admission_config_version, persistent_nat,
+persistent_nat_permit)` per entry (v9.9.15,
 round-30 Codex M5: the two selector fields are STORED per entry, not
 recomputed — they cannot be reconstructed from the BPF projection
 (`bpf_session_value.go:168`), whose positional policy ID is rewritten
@@ -2186,8 +2291,8 @@ for bulk and periodic resend is produced by the helper-authoritative
 ATOMIC SNAPSHOT (a new helper method acquiring the canonical hierarchy
 locks (`synced` → `nat` → `forward_wire` → indexes,
 `coordinator/session_manager.rs:12-18`) and producing `(BPF/NAT row,
-identity, row_version, stable_rule_id_hash, admission_config_version)`
-tuples in one lock span); the sender's install
+identity, row_version, stable_rule_id_hash, admission_config_version,
+persistent_nat, persistent_nat_permit)` tuples in one lock span); the sender's install
 pipeline RE-VALIDATES at send time that the row's current version still
 matches the snapshot's stored version (else re-resolve — closing the
 ABA trace where bulk captures E1's row while E2 replaces the tuple and
@@ -2240,10 +2345,12 @@ source.
   no config schema change. The NODE-LOCAL shared-map
   schema gains additive fields (`last_touch_ns`, `expires_after_ns`,
   `flow_incarnation_id`, `stable_rule_id_hash`,
-  `admission_config_version` — v9.9.15, round-30 Codex M5: the two
-  selector fields must live on the shared entries too, since the
+  `admission_config_version`, `persistent_nat`,
+  `persistent_nat_permit` — v9.9.15, round-30 Codex M5 + v9.9.17,
+  round-32 Codex B1: the selector fields AND the lease-derivation
+  inputs must live on the shared entries too, since the
   helper-side current-state selection of §5.2 reads its own shared
-  aliases and the fields cannot be reconstructed from the BPF
+  aliases and neither can be reconstructed from the BPF
   projection) — of these, `last_touch_ns` and `expires_after_ns`
   are node-local only (never wire-carried); the identity and
   selector fields ride the Part-B rolling-gated INSTALL tail
@@ -2511,6 +2618,32 @@ admitted interval):
   (whose fresh generation always advances past the receiver's tracked
   generation for that key, `sync_conn_write.go:69`) can never delete
   the new node's re-seeded E2 in the dual-active window.
+- **Persistent-import provenance + epoch deferral (v9.9.17, round-32
+  SMR):** (a) epoch-skew lease import — C1 `target-host-port` → C2
+  `any-remote-host`; g2 INSTALLs processed while C1 is applied; F1/F2
+  co-hold P via the wire-carried `(persistent_nat,
+  persistent_nat_permit)` inputs and NO mid-flow port swap occurs at
+  takeover; (b) allocator-shape deferral — C1 pool ends at 40000, C2
+  expands to 40001; the g2 INSTALL at 40001 parks the connection
+  stream until C2 applies, then reserves exactly (no out-of-range
+  rejection, no silent gap); a following delete for the same key can
+  never bypass the parked install (stream-order proof); (c) kind
+  dispatch — a persistent address-only flow preserving source port 80
+  imports on the standby with NO port-bit reservation and keeps its
+  public address at failover; (d) the import-transaction rollback —
+  a post-retain failure (incl. the install.rs:310 check) rolls back
+  via `rollback_flow` with no orphan lease (`active_flows` returns
+  to the pre-import value); (e) legacy tail-less import stays
+  non-persistent (rolling-upgrade parity with master); (f) the
+  migration gate — a deterministic-PAT allocation, a `rollback_flow`,
+  and an expiry-GC pass each attempted during the migration window
+  either complete before the write permit (their state is in the
+  drained snapshot) or transient-fail at the closed gate; B is
+  published with the complete ownership state and never issues a
+  held tuple or leaks a freed one; (g) resend/bulk fidelity — an
+  empty-standby bulk re-emits the ENTRY's stamped lease inputs (not
+  a queue-time re-derivation), so the restart-bulk co-holder case
+  imports persistently.
 - **Escrow + conditional-delete fences (v9.9.3, round-19 Codex M4):**
   (a) two-phase stop: quiesce acknowledged (no new commits) BEFORE
   handoff; handoff completes BEFORE any side-map drop (no hold
