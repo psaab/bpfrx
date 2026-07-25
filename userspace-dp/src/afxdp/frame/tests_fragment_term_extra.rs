@@ -490,9 +490,10 @@ fn term_extra_flex_clamped_to_ipv6_declared_end_excludes_ethernet_slack() {
 
 #[test]
 fn term_extra_fwd_flex_clamped_to_ipv4_declared_end_excludes_slack() {
-    // The ForwardPacketMeta (CoS / TX-selection) builder is the twin fold and
-    // MUST apply the identical clamp — otherwise a CoS-action byte-match on that
-    // path reads Ethernet slack.
+    // The ForwardPacketMeta (CoS / TX-selection) flavor of the one unified
+    // builder (#6435 — the byte-identical `_fwd` twin is retired) MUST apply
+    // the identical clamp — otherwise a CoS-action byte-match on that path
+    // reads Ethernet slack.
     let payload = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
     let datagram = frag_v4_packet(PROTO_UDP, 0x0000, &payload);
     let total_length = datagram.len();
@@ -506,7 +507,7 @@ fn term_extra_fwd_flex_clamped_to_ipv4_declared_end_excludes_slack() {
         protocol: PROTO_UDP,
         ..ForwardPacketMeta::default()
     };
-    let extra = term_match_extra_from_frame_fwd(&frame, meta);
+    let extra = term_match_extra_from_frame(&frame, meta);
     let flex_l3 = extra.flex_l3.expect("l3 slice present");
     assert_eq!(
         flex_l3.len(),
@@ -953,7 +954,8 @@ fn term_extra_ipv6_real_fragment_still_detected_no_slack() {
 }
 
 
-// #5568: the ForwardPacketMeta (CoS / TX-selection) twin builder MUST apply the
+// #5568: the ForwardPacketMeta (CoS / TX-selection) flavor of the one unified
+// builder (#6435 — the byte-identical `_fwd` twin is retired) MUST apply the
 // identical declared-end gate — otherwise a CoS-action scalar match on that path
 // reads Ethernet slack. Mirrors the primary ICMP axis on the fwd builder.
 #[test]
@@ -969,7 +971,7 @@ fn term_extra_fwd_icmp_type_from_slack_beyond_declared_end_fails_closed() {
         protocol: PROTO_ICMP,
         ..ForwardPacketMeta::default()
     };
-    let extra = term_match_extra_from_frame_fwd(&frame, meta);
+    let extra = term_match_extra_from_frame(&frame, meta);
     assert!(
         !extra.l4_present,
         "fwd twin must fail closed on slack icmp type/code (identical to the input builder)"

@@ -514,7 +514,7 @@ pub(in crate::afxdp) struct DebugPollCounters {
 
 /// #945: shared/passed-through context for `poll_binding_process_descriptor`.
 ///
-/// All 16 fields are shared (`&'a` or `&'a Arc<...>`) references that
+/// The fields are shared (`&'a` or `&'a Arc<...>`) references that
 /// the function reads from or that wrap interior-mutable state behind
 /// `Mutex`/`Arc`. NOT read-only in the strict sense — several entries
 /// like `dynamic_neighbors` are mutated through their inner `Mutex`
@@ -543,6 +543,12 @@ pub(in crate::afxdp) struct WorkerContext<'a> {
     pub(in crate::afxdp) shared_forward_wire_sessions:
         &'a Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     pub(in crate::afxdp) shared_owner_rg_indexes: &'a SharedSessionOwnerRgIndexes,
+    /// #6471: the node-shared live-IKE-exchange table backing Stage 11's
+    /// established-vs-forged discriminator on the IPsec secondary path
+    /// (seeded on admitted NEW IKE initiations and on firewall-initiated
+    /// outbound IKE via the GRE local-origin thread). Touched ONLY for
+    /// IKE-to-self packets — never for ESP/AH or the general session path.
+    pub(in crate::afxdp) ike_exchanges: &'a crate::afxdp::forwarding::SharedIkeExchangeTable,
     pub(in crate::afxdp) slow_path: Option<&'a Arc<SlowPathReinjector>>,
     pub(in crate::afxdp) event_stream: Option<&'a crate::event_stream::EventStreamWorkerHandle>,
     pub(in crate::afxdp) local_tunnel_deliveries:

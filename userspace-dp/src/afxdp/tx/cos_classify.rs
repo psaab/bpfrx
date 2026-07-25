@@ -86,7 +86,10 @@ pub(in crate::afxdp) fn classify_generated_reply(
     // #2362 fold B: classify the generated reply on its OWN bytes — build the
     // fragment-safe per-packet match inputs from the reply frame so a
     // tcp-flags / icmp-type output-filter term matches the reply correctly.
-    let extra = crate::afxdp::frame::term_match_extra_from_frame_fwd(frame, meta);
+    // #6435: the single unified builder (the byte-identical
+    // `term_match_extra_from_frame_fwd` twin is retired; the builder now
+    // takes `impl Into<ForwardPacketMeta>`).
+    let extra = crate::afxdp::frame::term_match_extra_from_frame(frame, meta);
     let selection =
         resolve_cos_tx_selection_at(forwarding, egress_ifindex, meta, Some(&key), extra, now_ns);
     GeneratedReplyVerdict {

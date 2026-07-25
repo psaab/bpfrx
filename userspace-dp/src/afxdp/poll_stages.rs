@@ -909,18 +909,20 @@ pub(super) fn stage_screen_syn_cookie_ack_on_session_miss(
 /// GRE `local_tunnel_deliveries` channel (`tx/dispatch/slow_path.rs`),
 /// diverting it away from the generic kernel TUN injector. Carrying a
 /// real ingress ifindex here would therefore MIS-DELIVER IPsec-to-self,
-/// not enforce host-inbound — Stage 11 short-circuits with
-/// `RecycleAndContinue` before `host_inbound_admits_iface` is ever
-/// reached, so the passthrough is exempt from the per-zone host-inbound
-/// gate by design (see `forwarding/README.md`, "Host-terminated IPsec
-/// passthrough"). Telemetry carries the real ingress ifindex via `meta`
-/// on the exception record, never through this routing decision.
+/// not enforce host-inbound — the ESP/AH passthrough short-circuits with
+/// `RecycleAndContinue` before `host_inbound_admits_iface` is ever reached
+/// and stays exempt from the per-zone host-inbound gate by design (see
+/// `forwarding/README.md`, "Host-terminated IPsec passthrough"); IKE carries
+/// its own SEPARATE in-stage admit checks (#4323 / #6471, below). Telemetry
+/// carries the real ingress ifindex via `meta` on the exception record,
+/// never through this routing decision.
 ///
-/// A per-zone host-inbound gate for NEW IKE / inner-ESP at Stage 11 is
-/// deferred hardening (#3616 Option B): it must reproduce the kernel
-/// chain's `ct established,related accept`-first ordering and resolve
-/// the logical / GRE-inner ingress zone, or it drops return/established
-/// and tunnelled IPsec.
+/// A per-zone host-inbound gate for NEW IKE at Stage 11 landed as #4323
+/// (Option B), extended by #6471 to Responder-SPI-nonzero IKE with no
+/// seeded live exchange. Both run as SEPARATE admit checks BEFORE the
+/// reinject, keyed on the resolved ingress zone — never by setting a real
+/// `local_ifindex` here, which would divert the reinject into the GRE
+/// channel.
 fn ipsec_passthrough_decision() -> SessionDecision {
     SessionDecision {
         resolution: ForwardingResolution {
@@ -947,10 +949,54 @@ pub(super) enum IpsecPassthroughOutcome {
     /// recycles the UMEM frame and moves to the next descriptor.
     Passthrough,
     /// A NEW inbound IKE initiation the ingress zone's host-inbound set does
-    /// NOT permit — a silent drop (Junos host-inbound posture). The caller
-    /// recycles the frame, accounts `host_inbound_denied_packets`, and emits the
-    /// tuple-rich host-inbound deny event on `from_zone_id`.
+    /// NOT permit — OR (#6471) a Responder-SPI-nonzero IKE packet that matches
+    /// NO seeded live exchange on such a zone — a silent drop (Junos
+    /// host-inbound posture). The caller recycles the frame, accounts
+    /// `host_inbound_denied_packets`, and emits the tuple-rich host-inbound
+    /// deny event on `from_zone_id`.
     Denied { from_zone_id: u16 },
+}
+
+/// #4323/#6471: resolve the LOGICAL ingress ifindex + from-zone exactly as the
+/// local-delivery resolver does (a VLAN sub-interface keys its own unit; a
+/// fabric-ingress packet keys the override zone), then apply the per-interface
+/// / per-zone host-inbound admit check for IKE. `host_inbound_admits_iface`
+/// honours a per-interface override where one exists and otherwise falls back
+/// to the from-zone set. Returns `Some(from_zone_id)` when IKE is NOT admitted
+/// (the caller returns `Denied`), `None` when admitted.
+fn ike_host_inbound_deny_zone(
+    flow: &SessionFlow,
+    meta: UserspaceDpMeta,
+    dst_port: u16,
+    ingress_zone_override: Option<u16>,
+    worker_ctx: &WorkerContext,
+) -> Option<u16> {
+    let ingress_logical = crate::afxdp::forwarding::resolve_ingress_logical_ifindex(
+        worker_ctx.forwarding,
+        meta.ingress_ifindex as i32,
+        meta.ingress_vlan_id,
+    )
+    .unwrap_or(meta.ingress_ifindex as i32);
+    let (from_zone_id, _to_zone_id) =
+        crate::afxdp::forwarding::zone_pair_ids_for_flow_with_override(
+            worker_ctx.forwarding,
+            ingress_logical,
+            ingress_zone_override,
+            0,
+        );
+    if crate::afxdp::forwarding::host_inbound_admits_iface(
+        worker_ctx.forwarding,
+        ingress_logical,
+        from_zone_id,
+        PROTO_UDP,
+        dst_port,
+        matches!(flow.dst_ip, IpAddr::V6(_)),
+        0,
+    ) {
+        None
+    } else {
+        Some(from_zone_id)
+    }
 }
 
 /// Stage 11 — IPsec passthrough.
@@ -967,10 +1013,26 @@ pub(super) enum IpsecPassthroughOutcome {
 /// the ingress zone's host-inbound `ike`/`ipsec` admission. A zone that omits
 /// `ike` drops the unsolicited inbound IKE (`Denied`) so it never reaches the
 /// local IKE daemon; a zone that lists `ike`/`ipsec` admits it. ESP/AH, the
-/// IPsec data plane (ESP-in-UDP / NAT-T keepalive) and every established/reply
-/// IKE packet stay EXEMPT (unconditional passthrough) — the SA is the
-/// authorization, mirroring the kernel chain's global ESP/AH accept and
-/// `ct established,related accept` for return IKE.
+/// IPsec data plane (ESP-in-UDP / NAT-T keepalive) stay EXEMPT (unconditional
+/// passthrough) — the SA is the authorization, mirroring the kernel chain's
+/// global ESP/AH accept.
+///
+/// #6471: a Responder-SPI-nonzero IKE packet is NOT automatically
+/// "established" — the SPI bytes are attacker-controlled, so a forged
+/// non-zero Responder SPI otherwise rode the #4323 `Exempt` class straight
+/// to strongSwan on a zone the operator closed to IKE. Established now means
+/// MATCHING the shared live-exchange table (`IkeExchangeTable`): seeded here
+/// when a NEW initiation passes the host-inbound gate, and seeded in the
+/// native-GRE local-origin path when the firewall initiates IKE through a
+/// tunnel (its replies arrive on this stage with the Responder SPI set and
+/// no inbound seed). A non-zero-Responder IKE packet that matches a seed is
+/// admitted (and refreshes it); one that matches NOTHING is handed to the
+/// SAME host-inbound gate a NEW initiation faces — denied on a zone that
+/// omits `ike` (the forged-SPI bypass, now closed), admitted on a zone that
+/// lists `ike` (config-sanctioned openness, primary-path parity: the kernel
+/// chain admits NEW IKE there too). This mirrors the primary path's `ct
+/// established,related accept`-first ordering, with the exchange table
+/// playing the conntrack role the secondary path lacks.
 ///
 /// This SECONDARY AF_XDP path is reached by DNAT/static-NAT-to-self IKE and by
 /// native-GRE-inner local IPsec; direct IKE to a firewall interface IP / VIP is
@@ -1002,6 +1064,7 @@ pub(super) fn stage_ipsec_passthrough_check(
     ingress_zone_override: Option<u16>,
     binding_live: &BindingLiveState,
     worker_ctx: &WorkerContext,
+    now_ns: u64,
 ) -> IpsecPassthroughOutcome {
     let Some(flow) = flow else {
         return IpsecPassthroughOutcome::NotClaimed;
@@ -1033,45 +1096,66 @@ pub(super) fn stage_ipsec_passthrough_check(
     if !worker_ctx.forwarding.owns_configured_ip(flow.dst_ip) {
         return IpsecPassthroughOutcome::NotClaimed;
     }
-    // #4323 Option B: gate ONLY a NEW inbound IKE initiation; ESP/AH and every
-    // established/related IPsec class stay unconditionally exempt.
-    if let crate::afxdp::forwarding::IpsecAdmissionClass::NewInboundIke =
-        crate::afxdp::forwarding::classify_ipsec_admission(
-            packet_frame,
-            meta.l4_offset as usize,
-            meta.protocol,
-            dst_port,
-        )
-    {
-        // Resolve the LOGICAL ingress ifindex + from-zone exactly as the
-        // local-delivery resolver does (a VLAN sub-interface keys its own unit;
-        // a fabric-ingress packet keys the override zone), then apply the
-        // per-interface / per-zone host-inbound admit check.
-        // `host_inbound_admits_iface` honours a per-interface override where one
-        // exists and otherwise falls back to the from-zone set.
-        let ingress_logical = crate::afxdp::forwarding::resolve_ingress_logical_ifindex(
-            worker_ctx.forwarding,
-            meta.ingress_ifindex as i32,
-            meta.ingress_vlan_id,
-        )
-        .unwrap_or(meta.ingress_ifindex as i32);
-        let (from_zone_id, _to_zone_id) =
-            crate::afxdp::forwarding::zone_pair_ids_for_flow_with_override(
-                worker_ctx.forwarding,
-                ingress_logical,
-                ingress_zone_override,
-                0,
-            );
-        if !crate::afxdp::forwarding::host_inbound_admits_iface(
-            worker_ctx.forwarding,
-            ingress_logical,
-            from_zone_id,
-            PROTO_UDP,
-            dst_port,
-            matches!(flow.dst_ip, IpAddr::V6(_)),
-            0,
-        ) {
-            return IpsecPassthroughOutcome::Denied { from_zone_id };
+    match crate::afxdp::forwarding::classify_ipsec_admission(
+        packet_frame,
+        meta.l4_offset as usize,
+        meta.protocol,
+        dst_port,
+    ) {
+        // #4323 Option B: gate a NEW inbound IKE initiation on host-inbound.
+        crate::afxdp::forwarding::IpsecAdmissionClass::NewInboundIke => {
+            if let Some(from_zone_id) =
+                ike_host_inbound_deny_zone(flow, meta, dst_port, ingress_zone_override, worker_ctx)
+            {
+                return IpsecPassthroughOutcome::Denied { from_zone_id };
+            }
+            // #6471: the initiation was ADMITTED — seed the exchange so its
+            // established follow-ups (Responder SPI set) are recognized. A
+            // DENIED initiation must never seed: a forged follow-up would
+            // otherwise mint its own "established" entry and re-open the
+            // bypass on a closed zone.
+            if let Some(initiator_spi) = crate::afxdp::forwarding::ike_initiation_spi(
+                packet_frame,
+                meta.l4_offset as usize,
+                dst_port,
+            ) {
+                worker_ctx.ike_exchanges.seed(
+                    crate::afxdp::forwarding::IkeExchangeKey::new(
+                        initiator_spi,
+                        flow.src_ip,
+                        flow.dst_ip,
+                    ),
+                    now_ns,
+                );
+            }
+        }
+        crate::afxdp::forwarding::IpsecAdmissionClass::Exempt => {
+            // #6471: a Responder-SPI-nonzero IKE packet is "established" only
+            // with a matching live-exchange seed; otherwise it faces the same
+            // host-inbound gate as a NEW initiation. ESP/AH, ESP-in-UDP and
+            // NAT-T keepalives (`None`) stay unconditionally exempt.
+            if let Some(initiator_spi) = crate::afxdp::forwarding::established_ike_initiator_spi(
+                packet_frame,
+                meta.l4_offset as usize,
+                dst_port,
+            ) {
+                let key = crate::afxdp::forwarding::IkeExchangeKey::new(
+                    initiator_spi,
+                    flow.src_ip,
+                    flow.dst_ip,
+                );
+                if !worker_ctx.ike_exchanges.matches(&key, now_ns)
+                    && let Some(from_zone_id) = ike_host_inbound_deny_zone(
+                        flow,
+                        meta,
+                        dst_port,
+                        ingress_zone_override,
+                        worker_ctx,
+                    )
+                {
+                    return IpsecPassthroughOutcome::Denied { from_zone_id };
+                }
+            }
         }
     }
     let ipsec_decision = ipsec_passthrough_decision();

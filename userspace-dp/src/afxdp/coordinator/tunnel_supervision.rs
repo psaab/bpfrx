@@ -227,6 +227,11 @@ impl super::Coordinator {
         let shared_nat_sessions = self.sessions.nat.clone();
         let shared_forward_wire_sessions = self.sessions.forward_wire.clone();
         let shared_owner_rg_indexes = self.sessions.owner_rg_indexes.clone();
+        // #6471: the loop seeds the shared IKE exchange table when the
+        // firewall INITIATES IKE through this tunnel, so the peer's replies
+        // (Responder SPI set, no inbound seed) are recognized as established
+        // at Stage 11 instead of facing the host-inbound gate as forgeries.
+        let ike_exchanges = self.ike_exchanges.clone();
         let worker_commands = self
             .workers
             .records
@@ -293,6 +298,7 @@ impl super::Coordinator {
                     shared_nat_sessions,
                     shared_forward_wire_sessions,
                     shared_owner_rg_indexes,
+                    ike_exchanges,
                     worker_commands,
                     delivery_rx,
                     thread_wake,

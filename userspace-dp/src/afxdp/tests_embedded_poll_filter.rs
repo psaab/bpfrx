@@ -468,6 +468,7 @@ fn poll_descriptor_embedded_icmp_reversal_reachable_on_flowless_path_5690() {
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let ike_exchanges = Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new());
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
     let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
@@ -493,6 +494,7 @@ fn poll_descriptor_embedded_icmp_reversal_reachable_on_flowless_path_5690() {
         shared_nat_sessions: &shared_nat_sessions,
         shared_forward_wire_sessions: &shared_forward_wire_sessions,
         shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        ike_exchanges: &ike_exchanges,
         slow_path: None,
         event_stream: Some(&event_handle),
         local_tunnel_deliveries: &local_tunnel_deliveries,
@@ -725,6 +727,7 @@ fn poll_descriptor_policy_deny_path_emits_rt_flow_event() {
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let ike_exchanges = Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new());
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
     let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
@@ -750,6 +753,7 @@ fn poll_descriptor_policy_deny_path_emits_rt_flow_event() {
         shared_nat_sessions: &shared_nat_sessions,
         shared_forward_wire_sessions: &shared_forward_wire_sessions,
         shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        ike_exchanges: &ike_exchanges,
         slow_path: None,
         event_stream: Some(&event_handle),
         local_tunnel_deliveries: &local_tunnel_deliveries,
@@ -962,6 +966,7 @@ fn poll_descriptor_policy_deny_keys_logical_ingress_zone_3021() {
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let ike_exchanges = Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new());
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
     let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
@@ -987,6 +992,7 @@ fn poll_descriptor_policy_deny_keys_logical_ingress_zone_3021() {
         shared_nat_sessions: &shared_nat_sessions,
         shared_forward_wire_sessions: &shared_forward_wire_sessions,
         shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        ike_exchanges: &ike_exchanges,
         slow_path: None,
         event_stream: Some(&event_handle),
         local_tunnel_deliveries: &local_tunnel_deliveries,
@@ -1167,6 +1173,7 @@ fn poll_descriptor_input_filter_discard_drops_and_logs() {
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let ike_exchanges = Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new());
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
     let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
@@ -1192,6 +1199,7 @@ fn poll_descriptor_input_filter_discard_drops_and_logs() {
         shared_nat_sessions: &shared_nat_sessions,
         shared_forward_wire_sessions: &shared_forward_wire_sessions,
         shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        ike_exchanges: &ike_exchanges,
         slow_path: None,
         event_stream: Some(&event_handle),
         local_tunnel_deliveries: &local_tunnel_deliveries,
@@ -1340,6 +1348,7 @@ fn poll_descriptor_session_hit_rechecks_dscp_input_filter() {
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let ike_exchanges = Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new());
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
     let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
@@ -1365,6 +1374,7 @@ fn poll_descriptor_session_hit_rechecks_dscp_input_filter() {
         shared_nat_sessions: &shared_nat_sessions,
         shared_forward_wire_sessions: &shared_forward_wire_sessions,
         shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        ike_exchanges: &ike_exchanges,
         slow_path: None,
         event_stream: Some(&event_handle),
         local_tunnel_deliveries: &local_tunnel_deliveries,
@@ -1566,6 +1576,7 @@ fn poll_descriptor_lo0_filter_discard_drops_without_reinject() {
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let ike_exchanges = Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new());
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
     let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
@@ -1591,6 +1602,7 @@ fn poll_descriptor_lo0_filter_discard_drops_without_reinject() {
         shared_nat_sessions: &shared_nat_sessions,
         shared_forward_wire_sessions: &shared_forward_wire_sessions,
         shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        ike_exchanges: &ike_exchanges,
         slow_path: None,
         event_stream: Some(&event_handle),
         local_tunnel_deliveries: &local_tunnel_deliveries,
@@ -1752,6 +1764,7 @@ fn poll_descriptor_lo0_filter_drops_cached_local_delivery_session_hit() {
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let ike_exchanges = Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new());
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
     let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
@@ -1777,6 +1790,7 @@ fn poll_descriptor_lo0_filter_drops_cached_local_delivery_session_hit() {
         shared_nat_sessions: &shared_nat_sessions,
         shared_forward_wire_sessions: &shared_forward_wire_sessions,
         shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        ike_exchanges: &ike_exchanges,
         slow_path: None,
         event_stream: Some(&event_handle),
         local_tunnel_deliveries: &local_tunnel_deliveries,

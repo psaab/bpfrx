@@ -30,7 +30,7 @@ code-motion — functions moved verbatim, visibility preserved
 | `nat.rs` | Source-NAT flow matching (`nat_scope_ctx_for_flow`, `match_source_nat_for_flow*`) and interface-NAT local resolution (`interface_nat_local_resolution*`, `should_block_tunnel_interface_nat_session_miss`). |
 | `ha.rs` | HA redundancy-group resolution enforcement (`enforce_ha_resolution*`, `cached_flow_decision_valid`, `finalize_new_flow_ha_resolution`), owner-RG attribution (`owner_rg_for_flow`, `owner_rg_for_resolution`), and demoted/activated owner-RG set diffs. |
 | `mss.rs` | TCP MSS clamp + tunnel/GRE outer-MTU derivation (`effective_tcp_mss`, `native_gre_*`, `tunnel_outer_mtu`, `tunnel_tcp_mss`, `select_tcp_mss`). |
-| `ipsec.rs` | IPsec traffic classification + inbound admission (`is_ipsec_traffic` (`#[inline]`), `IpsecAdmissionClass`, `classify_ipsec_admission`). |
+| `ipsec.rs` | IPsec traffic classification + inbound admission (`is_ipsec_traffic` (`#[inline]`), `IpsecAdmissionClass`, `classify_ipsec_admission`, the #6471 live-IKE-exchange table `IkeExchangeTable`/`SharedIkeExchangeTable` + SPI extractors + outbound-seed helper). |
 | `pbr.rs` | Policy-based routing: `ingress_route_table_override` and its `PbrRejectSink` / `RouteOverride` support types. |
 | `local_delivery.rs` | Host-local delivery session caching on session-miss (`should_cache_local_delivery_session_on_miss`, `install_helper_local_session_on_miss`, `ingress_interface_local_resolution*`, the `LOCAL_DELIVERY_IFINDEX0` counter). |
 | `tunnel.rs` | Tunnel outer-header forwarding resolution (`resolve_tunnel_outer`, `resolve_tunnel_forwarding_resolution`, `outer_neighbor_ifindex`) and neighbor-entry lookup/parse (`lookup_neighbor_entry`, `parse_neighbor_entries`). |
@@ -720,7 +720,7 @@ coverage would require the shim to surface an "AH present" signal
 instead of walking past the header — out of scope here, and
 unnecessary given the local-dest shunt.
 
-### Host-inbound ordering: ESP/AH exempt, NEW IKE gated (#3616 Option A + #4323 Option B)
+### Host-inbound ordering: ESP/AH exempt, IKE gated on a live exchange (#3616 Option A + #4323 Option B + #6471)
 
 Stage 11 runs BEFORE the per-zone host-inbound admission gate
 (`host_inbound_admits_iface`) and, on a match, short-circuits the poll
@@ -743,18 +743,32 @@ class (`classify_ipsec_admission`):
   zone lists `ike`/`ipsec`. A zone that omits the token DROPS it
   (`Denied`, silent, `host_inbound_denied_packets` accounted +
   `RT_FLOW_CLOSE_REASON_HOST_INBOUND` event) so an unsolicited inbound
-  IKE never reaches the local IKE daemon (strongSwan).
-- **Every established/reply IKE packet stays EXEMPT.** Once the exchange
-  is under way the Responder SPI is set, so `classify_ipsec_admission`
-  returns `Exempt` — the stateless mirror of the kernel chain's `ct
-  established,related accept`-first ordering. Return IKE (e.g. the reply
-  for a firewall-initiated tunnel) is never dropped even on a zone that
-  omits `ike`, which is why the gate needs no conntrack state (the
-  secondary path installs no session for a passthrough flow, so a
-  session lookup would be dead). Residual: a forged non-zero Responder
-  SPI on a NEW packet would read as `Exempt` and reach strongSwan, which
-  drops it as an unknown SA — the initiation packet that actually
-  establishes a tunnel always carries a zero Responder SPI and is gated.
+  IKE never reaches the local IKE daemon (strongSwan). An ADMITTED
+  initiation SEEDS the shared live-exchange table
+  (`IkeExchangeTable`, #6471) — a denied initiation never seeds.
+- **A Responder-SPI-nonzero IKE packet is admitted ONLY with a matching
+  live-exchange seed (#6471).** The SPI bytes are attacker-controlled, so
+  a non-zero Responder SPI alone does NOT prove "established" — a forged
+  one otherwise rode the #4323 `Exempt` class straight to strongSwan on a
+  zone the operator closed to IKE (the pre-#6471 residual, now closed).
+  The seed table plays the conntrack role the secondary path lacks (it
+  installs no session for a passthrough flow): seeded inbound on an
+  admitted initiation, seeded outbound in the native-GRE local-origin
+  path when the firewall initiates IKE through a tunnel (the peer's
+  replies arrive GRE-inner on Stage 11 with the Responder SPI set and no
+  inbound seed), matched (and sliding-window refreshed) per packet on the
+  (Initiator SPI, peer/local address pair) key — ports deliberately
+  excluded so an RFC 5996 NAT-T float does not strand the seed. A
+  Responder-SPI-nonzero packet matching NOTHING faces the SAME
+  host-inbound gate as a NEW initiation: denied on a zone omitting `ike`,
+  admitted on a zone listing `ike` (config-sanctioned openness —
+  primary-path parity, since the kernel chain also admits NEW IKE there).
+  Bounded: 4096-entry cap (oldest evicted on full) + 24h sliding idle
+  reap; NOT HA-synced (the primary path's kernel conntrack for
+  host-terminated IKE is not synced either — same failover posture); an
+  xpfd restart drops the seeds, which self-heal on the next admitted
+  initiation or firewall-outbound IKE packet, with the ESP data plane
+  exempt throughout.
 
 **Two enforcement paths.** The PRIMARY host-inbound enforcement for
 IPsec-to-self is the kernel nftables chain (`pkg/daemon/daemon_nft.go`).
@@ -770,7 +784,11 @@ shunted to the kernel: DNAT/static-NAT-to-self IKE, native-GRE inner
 IPsec whose inner destination is a firewall-local address (redirected to
 the XSK and decapped in userspace), and transit/NAT IPv4 AH and IKE
 (UDP 500/4500) that the shim steered to the helper. The #4323 gate
-closes the NEW-inbound-IKE host-inbound parity gap on this path.
+closes the NEW-inbound-IKE host-inbound parity gap on this path, and the
+#6471 live-exchange discriminator closes the residual established-parity
+gap (a forged non-zero Responder SPI can no longer mint "established"
+the way kernel conntrack NEW/ESTABLISHED cannot be faked on the primary
+path).
 
 ### #5620: the passthrough claim is scoped to a firewall-local destination
 
