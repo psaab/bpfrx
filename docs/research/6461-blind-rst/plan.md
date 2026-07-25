@@ -1,6 +1,6 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v7 — revised after round-5 reviews (Codex PLAN NO 3B/4H/1M/1L, AGY PLAN YES 0 findings)**
+**Status: DRAFT v7.1 — revised after round-5 reviews (Codex PLAN NO 3B/4H/1M/1L, AGY PLAN YES) + round-6 AGY interim folds (live-ownership Close authority; AnchorUpdate aggregate cap)**
 
 v1 → v2: round-1 review killed v1's architecture (attacker-writable trust
 anchor, missed reverse-NAT constructor, invalid cross-store serial merge).
@@ -597,25 +597,28 @@ attacker-poisonable):**
      ANY expiry, marked or not, `expire.rs:342-377`) and suppresses the
      import's RG-activation self-heal (`expire.rs:213-237`), letting a
      refused close convert a silent standby reap into an authoritative,
-     possibly accelerated, Close. **Close authority instead transfers at
-     RG ACTIVATION, never from packets (v7, round-5 Codex 1):** the
-     activation self-heal that already re-stamps held imports
-     (`expire.rs:213-237`) also flips their origin to
-     locally-authoritative (the `SharedPromote` class). This is required
-     because demotion retags the old owner's entries `SyncImport`
-     (`install.rs:572`, `shared_ops.rs:179-206`) — without activation-
-     side authority, a close-first-after-failover flow would leave NO
-     authoritative Close producer anywhere (both copies peer-synced,
-     shared-map deletion is Close-driven at `session_delta.rs:406-452`,
-     and a stale shared NAT alias could rematerialize after allocator
-     reuse, `session_glue/mod.rs:1092` + `upsert_synced.rs:80`). With
-     activation-time authority: the new owner's entries are authoritative
-     from activation; a blind close is refused (no mark, no refresh) and
-     the entry reaps at its TRUE natural timeout with a correct
-     authoritative Close — the attacker cannot accelerate anything; the
-     old owner's demoted copies reap silently as designed. The close
+     possibly accelerated, Close. **Close authority instead derives from
+     LIVE RG ownership at reap time (v7.1, round-6 AGY — strictly simpler
+     than v7's origin flip):** the `expire.rs:342-345` delta gate becomes
+     `!is_reverse && !is_transient_seed && (origin is locally-born
+     (ForwardFlow/SharedPromote/LocalMiss family) || owner_rg_id is
+     currently active on this node)`. Authority then follows CURRENT HA
+     state with no stored-provenance transition at all: on the active
+     node every reaped forward entry (owner-born, promoted, OR imported)
+     emits the Close; on the standby nothing does; demotion silences
+     instantly (`SyncImport` retag becomes cosmetic for the gate);
+     RG flaps can double-emit only during the milliseconds of VRRP
+     overlap, where duplicate deletes are idempotent under the gen
+     rules. The lazy-self-heal window AGY found (an entry reaping as
+     `SyncImport` between activation and its first wheel examination,
+     stranding Close-driven shared cleanup at `session_delta.rs:406-452`)
+     disappears: authority is computed at the reap, not stored. This
+     also fixes the round-5 Codex 1 stranding (demotion retags make
+     BOTH copies peer-synced) — the new owner's natural reaps are
+     authoritative from the moment the RG is active, and the blind close
+     remains inert (no mark, no refresh, no accelerated reap). The close
      packet itself forwards on the current decision; packet-driven
-     promotion still exists for entries imported AFTER activation and
+     promotion still exists for entries imported after activation and
      still skips closing packets.
    - The establishment promote additionally requires the strong OPENING
      proof (rule 4): a reverse SYN-ACK promotes OPENING→ESTABLISHED only
@@ -975,16 +978,17 @@ and one ungated node, each gating only its own packet-driven marks).
   only withholds a mark, never clears one. The #3046 timeout-selection
   ordering (`reset` set before `expires_after_ns` is chosen) is preserved
   on the accepted-mark path.
-- **Activation-time authority transfer (v7, round-5 Codex 1):** Close
-  authority follows RG activation (the `expire.rs:213-237` self-heal
-  flips imported entries to locally-authoritative origin), NEVER packet
-  content. Packet-driven promotion (`SharedPromote` on a committed
-  non-close packet) remains for entries imported after activation;
-  closing packets never trigger it. Demotion retags to `SyncImport`
-  (`install.rs:572`, `shared_ops.rs:179-206`) — silent reaps on the
-  demoted node, authoritative reaps on the activated one, so exactly
-  one Close producer exists at any time and no stale shared NAT alias
-  can rematerialize without an authoritative deletion.
+- **Close authority = live RG ownership (v7.1, round-6 AGY):** the
+  `expire.rs:342-345` delta gate consults CURRENT HA state
+  (`owner_rg_id` active locally) in addition to the stored origin
+  class — authority is computed at the reap, never stored, never
+  packet-driven. Exactly one Close producer exists per RG at any moment
+  (VRRP-overlap duplicates are idempotent); demotion silences
+  immediately; the lazy self-heal window and the demotion-retag
+  stranding both disappear. Packet-driven promotion (`SharedPromote`
+  on a committed non-close packet) remains for entries imported after
+  activation; closing packets never trigger it. No stale shared NAT
+  alias can rematerialize without an authoritative deletion.
 - **HA replica no-Close invariant (LOAD-BEARING, round-1 Codex B8):**
   `expire.rs:342-345` emits Close deltas only for non-peer-synced,
   non-reverse, non-transient-seed origins; `SharedMaterialize`/`SyncImport`/
@@ -1269,12 +1273,16 @@ gate, Phase 1 standalone-safe):
   (`event_stream/codec/wire.rs:20`, `session/entry.rs:277-290`), emitted
   per-worker from a bounded dirty ring (keys whose trusted anchor moved;
   ~4,096 slots, drop-oldest with a watermark counter) at ≤1 update per
-  entry per second, and **only when the anchor advanced ≤ one slack
-  since the last emit** (the quiet-flow filter: a faster-moving anchor
-  would be useless at the standby anyway — bulk flows emit nothing, so
-  steady-state volume tracks the quiet class, not line rate; the
-  control-socket contention budget is unaffected). Only `trusted` sides
-  are ever sent.
+  entry per second, **capped AGGREGATE (v7.1, round-6 AGY Q1: per-entry
+  limits scale linearly with flow count — a quiet-heavy cluster could
+  still inject thousands/sec into the stream shared with Open/Close
+  installs) at a per-worker global budget (~256 updates/s, jittered,
+  FIFO from the ring with drop-oldest watermark — the lossy posture
+  makes drops safe by construction)**, and **only when the anchor
+  advanced ≤ one slack since the last emit** (the quiet-flow filter:
+  a faster-moving anchor would be useless at the standby anyway — bulk
+  flows emit nothing, so steady-state volume tracks the quiet class,
+  not line rate). Only `trusted` sides are ever sent.
 - **Import semantics (v7):** in-place field update — NO `remove_entry`
   (no anchor wipe, no index churn): each entry carries an `anchor_seqno`
   (u32, incremented per trusted change); an `AnchorUpdate` applies only
