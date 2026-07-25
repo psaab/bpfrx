@@ -1348,7 +1348,14 @@ attacker-poisonable):**
        repair actually completes (so "GEN never arrived" and
        "ACK was lost" need not be distinguished: both leave the
        obligation armed and the node not-ready, and the next
-       successful handshake-driven cold-prime discharges it).
+       successful handshake-driven cold-prime discharges it);
+       the re-open's driver is the existing per-install gate
+       (v9.9.34, round-44 SMR F3: the first install after the
+       drain computes both-empty and cold-primes, and that
+       cold-prime's bulk re-drive IS the next repair attempt —
+       the backstop needs no separate driver, and the obligation
+       discharges only when that (or a later) repair completes
+       with `JOURNAL-END`).
        and (ii) the barrier's
        linearization is ONE lock domain: admission
        (`preAuthMu`, `sync_admission.go:66`), generation capture,
@@ -1661,9 +1668,18 @@ attacker-poisonable):**
        import admission compares against B's worker-derived cap
        (`session_import.rs:24, :91`), so a valid K-entry repair
        plus L local entries can exceed C: preflight computes
-       K + L ≤ C BEFORE the quiesce, and on overflow the repair
+       K + L ≤ C INSIDE the quiesce (v9.9.34, round-44 SMR F1 —
+       local admissions freeze at quiesce entry, so L stops
+       growing and the preflight is exact by construction; an
+       outside-quiesce preflight would have a TOCTOU), and on
+       overflow the repair
        enters the defined degraded state (operator-visible,
        not-ready) rather than committing an over-capacity table;
+       and a rejected cohort is never stranded (the peer's
+       periodic resend retries its exact reserve — which
+       succeeds once the conflicting local flow dies and its
+       hold releases — and the undischarged obligation also
+       re-drives the repair);
        (c) a NAT tuple conflict — A's missing E1 claiming public
        P while B's different-key LOCAL E2 already owns P
        (`allocator.rs:1617, :1682`) — resolves LOCAL-AUTHORITY-
@@ -2366,7 +2382,9 @@ attacker-poisonable):**
        with stage 2 proceeding against the old identity only;
        and a SAME-identity re-import ATOMICALLY CANCELS the
        quarantine in the same critical section as its
-       publication — never a blind clear: a same-E1 resend that
+       publication — the flag lives in the SAME canonical lock
+       domain as the publication (the canonical store mutex, not
+       an ordered pair — v9.9.34, round-44 SMR F2) — never a blind clear: a same-E1 resend that
        republishes (`session_import.rs:53` accepts
        equal-generation resends) cancels the OLD stage-2
        cleanup, so the stale cleanup can never remove the
