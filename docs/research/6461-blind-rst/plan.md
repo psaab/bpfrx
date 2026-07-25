@@ -1180,31 +1180,37 @@ attacker-poisonable):**
        generation exists today (`manager_generation.go:33`, published
        through `ValidationState` at `snapshot_refresh.rs:397`, and
        the stamp is a NEW write-once
-       `admission_fwd_generation: u64` field — NOT `install_epoch`
+       `admission_config_version: u64` field — NOT `install_epoch`
        (round-21 AGY's suggestion of `session/mod.rs:348` is corrected:
        `install_epoch` is a worker-local MUTATION counter rewritten on
        update and promotion, `session/mod.rs:761, :1384`, so it is NOT
        the admission generation; the write-once field is stamped once
-       at entry creation and never rewritten) — and its END-TO-END
-       home is explicit (v9.9.11, round-26 Codex H5: the selection
-       runs over shared aliases, but `SyncedSessionEntry` carries
-       neither policy field today, `worker/mod.rs:375`, and the
-       generation currently lives in separately published
-       `ValidationState` — coordinator and worker ordering permits
-       old-validation/new-forwarding observation,
-       `snapshot_refresh.rs:397`, `loop_body/mod.rs:462`, so a newly
-       admitted E2 on a modified-rule invalidation can carry the old
-       generation and satisfy the historical delete predicate): the
-       generation moves INTO `ForwardingState` (which gains it —
-       `types/forwarding.rs:33` has none today; the compiler bumps it
-       per snapshot, so the generation and the policy it carries are
-       published atomically together), and BOTH selector fields
-       (`stable_rule_id_hash`, `admission_fwd_generation`) are stamped
-       into local, shared, AND imported entries with their
+       at entry creation and never rewritten) — and the stamped value
+       is the CONFIG'S OWN VERSION, not any node-local generation
+       (v9.9.11.2, round-27 Codex's partial: a node-local forwarding
+       generation is explicitly node-local and advances on local FIB
+       churn, so comparing node A's stamp to node B's invalidation
+       cutoff is not ordered — a valid imported E2 could satisfy B's
+       "older than" predicate and lose its shared/NAT family; the
+       config is CLUSTER-SYNCED, so the config store's monotonic commit
+       version (`pkg/configstore`'s commit counter, round-21 AGY's
+       `store.go:88` finding) IS cluster-ordered by construction).
+       The config version rides `ForwardingState` (which gains it —
+       `types/forwarding.rs:33` has none today; the compiler stamps
+       the config version it was built from, so the version and the
+       policy it carries are published atomically together, closing
+       the old-validation/new-forwarding observation race at
+       `snapshot_refresh.rs:397` and `loop_body/mod.rs:462`), and the
+       invalidation cutoff is the invalidated config's version (the
+       same cluster-ordered value on every node), and BOTH selector
+       fields (`stable_rule_id_hash`, `admission_config_version`) are
+       stamped into local, shared, AND imported entries with their
        install/import carriage defined (installed entries stamp at
-       creation from the current `ForwardingState` snapshot; imported
-       entries inherit the sender's stamp via the same additive
-       install tail that carries the incarnation); (b) **cluster-bulk cleanup**
+       creation from the config version the admitting snapshot was
+       built from; imported entries inherit the sender's stamp via the
+       same additive install tail that carries the incarnation — and
+       because both are the CONFIG'S version, A's stamp and B's cutoff
+       are ordered correctly); (b) **cluster-bulk cleanup**
        (`sync.go:1069, :1080-1126` — BulkStart-snapshot-driven, with a
        secondary→primary ownership flip expressly permitted mid-bulk,
        `sync_test.go:1535, :1573-1585`): the delete re-validates the
