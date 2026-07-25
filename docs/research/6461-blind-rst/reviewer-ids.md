@@ -15,6 +15,9 @@
 | r4 | Codex (gpt-5.5 via codex-companion, resumed session) | task-mrzjrykr-7io911 (2m47s, content-filter turn failure while reading the plan); resumed task-mrzjwgox-olobll (28m11s, completed) | PLAN NO (4 BLOCKER, 4 HIGH, 1 MEDIUM, 1 LOW) | codex-plan-r4.md |
 | r4 | AGY (direct binary, built-in-tools-only preamble) | r4-agy-out1 (single run, full coverage) | PLAN YES (1 LOW: metrics-surface export for tcp_close_seq_rejected) | agy-plan-r4.md |
 | r4 | Claude SMR | in-conversation | PLAN NO for v5 — all ten Codex findings confirmed + folded into v6; v5 dissent withdrawn (own-ack close leg replaces segment-wide adoption) | claude-smr-plan-r4.md |
+| r5 | Codex (gpt-5.5 via codex-companion, resumed session) | task-mrzlgpx5-odo1nx (19m33s, completed) | PLAN NO (3 BLOCKER, 4 HIGH, 1 MEDIUM, 1 LOW) | codex-plan-r5.md |
+| r5 | AGY (direct binary, built-in-tools-only preamble) | r5-agy-out1 (single run, full coverage) | PLAN YES (0 findings) | agy-plan-r5.md |
+| r5 | Claude SMR | in-conversation | PLAN NO for v6 — all nine Codex findings confirmed + folded into v7 (activation-time authority, immutable OPENING endpoints, real AnchorUpdate pipeline, per-stream slack, three-leg arithmetic) | claude-smr-plan-r5.md |
 
 Infra notes (per feedback_codex_infra_must_retry — all retries documented):
 - Codex: 10m client timeout kill → job found alive server-side → polled 25+ min →
