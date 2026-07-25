@@ -1262,6 +1262,19 @@ attacker-poisonable):**
        "applied but unable to discharge" — today's handlers would
        otherwise publish every INSTALL and reconcile every
        completed bulk immediately, `sync_conn_read.go:98, :241`).
+       The generation reset itself becomes transactional
+       (v9.9.23.1, round-38 AGY Q3a — a PRE-EXISTING master
+       hazard the repair protocol must not inherit: `BulkStart`
+       wipes the receiver's generation maps via `resetRecvGen`
+       (`sync_conn_read.go:183`, `sync_conn_gen.go:324, :340`)
+       BEFORE the bulk validates, and a mismatched/aborted
+       `BulkEnd` (`sync_conn_read.go:228-239`) then leaves the
+       maps cleared with `bulkInProgress` set — stale messages
+       bypass the generation checks and the standby
+       desynchronizes): the reset is STAGED with the bulk and
+       applies only when the bulk's BulkEnd validates (an
+       aborted or wrong-ID bulk never touches the generation
+       maps).
        The repair covers SENDER-SIDE in-flight loss identically
        (v9.9.23, round-38 SMR F2: during the close→detect window
        A's outbound queue keeps accepting and transmitting deltas
