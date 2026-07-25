@@ -1858,8 +1858,21 @@ admitted interval):
   side-map insertion — `Abandoned` releases the retained hold
   immediately and aborts; a late verify-and-retain on a freed/reused
   allocation MISMATCHES and aborts (no hold re-created on a reused
-  port — the round-19 AGY trace); (e) helper-authoritative
+  port — the round-19 AGY trace); the RAII drop DISARMS the permit
+  expiration timer at drop time (no double-release of the pending
+  slot when a worker claims, retains, and dies before the recheck —
+  the round-22 AGY trace); (e) helper-authoritative
   conditional delete with TEMPORAL CUTS: Go submits the predicate;
+  (e2) the wire identity matrix: new-sender→new-receiver (tail
+  applied), old-sender→new-receiver (tail-less install → the receiver
+  stores NO identity and falls back to today's gen-based delete
+  acceptance for those entries, with the documented mixed-version
+  asymmetric-timing hazard stated and bounded), new-sender→old-receiver
+  (tail ignored), and the dual-active propagation case (both nodes
+  believe they own the RG: the delete delta carries the selected
+  identity and the receiver applies it only when its stored
+  incarnation matches, so node A's propagated delete of E1 never kills
+  node B's live E2 aliasing the same key);
   the helper selects from its own shared aliases, captures the
   selected `(origin_process_nonce, flow_incarnation_id)` under the
   canonical lock, and deletes under the alias-token fencing in one
@@ -1974,8 +1987,11 @@ admitted interval):
   `flow_incarnation_id` still matches the canonical record's (v9.4,
   round-14 Codex H3b/c/d + round-15 Codex H4). (d) a validated
   close on an import marks it and the marking worker's 2 s reap emits
-  the authoritative Close (exactly one — forward emits, reverse
-  suppressed by `is_reverse`). (e) a live-but-quiet flow's alias
+  the authoritative Close (exactly one in the normal case — forward
+  emits, reverse suppressed by `is_reverse`; the documented rare
+  exception is two workers marked by a retransmitted valid close
+  before the delete lands — idempotent at the store plus a bounded
+  duplicate RT_FLOW record, round-10 Codex 7a). (e) a live-but-quiet flow's alias
   SURVIVES the sweep via the worker's 30 s batched touch; a truly
   dead flow's aliases die. (f) demoted-node copies never emit (RG not
   active). (g) a newer same-key incarnation (re-seeded on the peer)
