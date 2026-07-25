@@ -17,7 +17,8 @@ clocks → versions → ownership terms). v9 restructures: Part A ships the
 gate; Part B handles its HA consequences with the minimum machinery that
 survives review (closing-never-promote, ONE emission predicate, a
 family-clock TTL sweep with a commit-time incarnation recheck, and the
-NAT-release investigation FILED as its own pre-existing bug); Phase 2 —
+pre-existing NAT release bug SHIPPED as Part B's holder-lifetime
+machinery — #6522, closed by this plan); Phase 2 —
 the HA-wire anchor that would restore fast-reap for synced flows — moves
 to its own research track with the rounds 6-12 findings preserved as its
 design brief. The issue's HA teeth are closed by Part A alone, stated
@@ -1203,12 +1204,29 @@ attacker-poisonable):**
        PER-CONNECTION (no peer-wide declaration is needed; each
        slot's own detector cleans it), and a one-fabric flap
        keeps acks flowing on the survivor so its detector never
-       fires (the flap confusion does not exist). B's reconnect
+       fires (the flap confusion does not exist). The reconnect
+       side is a BARRIER-AND-DRAIN invariant, not a race
+       (v9.9.24, round-39 Codex B1 — "B does not redial early"
+       is insufficient: A's OWN dialer reconnects independently
+       (`sync_conn.go:388, :435`) and can install fab0 while
+       fab1's slot is still occupied → `wasDisconnected ==
+       false`, no cold-prime, and fab1's later clear finds fab0
+       live — no cold-prime ever): B REFUSES inbound connections
+       (dial AND accept) during its barrier — every connection
+       attempt is accepted-and-immediately-closed (or never
+       answered, letting the attempt's own detector kill it), so
+       no install during the barrier can occupy a slot on either
+       node; A's slots therefore drain to both-empty via EOF or
+       the per-connection detector regardless of A's dialer
+       retries (each retry installs briefly on A, dies at B, and
+       — crucially — the cold-prime gate is evaluated PER
+       INSTALL, so it need not fire on the first reconnect: the
+       dialer's retry loop guarantees a LATER install); the
        barrier is sized to the SLOW detector (≥ the 2-missed-ack
-       bound + RTT margin — a repair event, not a fast path), so
-       A's both-empty state has long landed when the first new
-       connection installs and `wasDisconnected == true`
-       cold-primes; and B's inbound-repair obligation is DURABLE —
+       bound + RTT margin — a repair event, not a fast path),
+       and the FIRST install after the barrier finds both slots
+       empty on both nodes and cold-primes deterministically.
+       B's inbound-repair obligation is DURABLE —
        a pathological miss (no bulk arrives) never clears it, and
        B escalates to a second close-both with exponential backoff
        (the barrier grows past any feasible detector delay, so
@@ -1254,7 +1272,37 @@ attacker-poisonable):**
        fabric BUFFER (in order) rather than publishing — and
        flushes the buffer AFTER the repair's BulkEnd lands (the
        buffered DELETE then lands after the repair's older
-       INSTALL, restoring recency by construction); and a bulk
+       INSTALL, restoring recency by construction); and the
+       SENDER takes a CUTOFF at repair start (v9.9.24, round-39
+       Codex B2 — buffering what the receiver OBSERVES before
+       BulkEnd does not cover frames delayed until after it:
+       `BulkSync` pins one connection (`sync_bulk.go:53`) while
+       `sendLoop` drains opaque frames over whichever connection
+       is active (`sync_conn_write.go:268`), so a stale pre-repair
+       INSTALL can land after an E1-absent repair has reconciled
+       — and absence reconciliation records no generation
+       tombstone, `sync.go:1080`): the sender PAUSES incremental
+       emission when it arms the repair, FLUSHES the pre-cutoff
+       queue, takes the snapshot (the snapshot IS the cutoff —
+       every pre-cutoff frame is either flushed before
+       `BulkStart` or subsumed by the snapshot), drives the bulk,
+       and resumes incrementals only after `BulkEnd` — no
+       pre-cutoff frame can ever land after the repair. The bulk
+       itself is TRANSACTIONAL: its member installs AND the
+       generation-map reset are STAGED and committed only when a
+       matching `BulkEnd` validates (all-or-nothing — an aborted
+       bulk, or one superseded by a newer obligation O2 mid-way,
+       commits nothing, so O1's partial members and generation
+       wipe can never leak in; the freeze/repair buffer's own
+       overflow INVALIDATES the repair and raises a fresh
+       obligation generation rather than committing partial
+       state); and repair epochs are namespaced by the
+       authenticated SENDER INCARNATION (the sender's
+       process-local bulk counter restarts on restart
+       (`sync.go:474`, `sync_bulk.go:65`), so epoch 1 from a
+       restarted sender can never exceed the receiver's old
+       raising point — the comparison key is
+       `(sender_incarnation, bulk_epoch)`); and a bulk
        whose ID is not the current repair ID is WHOLLY
        NON-MUTATING — its `BulkStart` does not `resetRecvGen`,
        its installs do not publish, its BulkEnd neither
@@ -1536,7 +1584,34 @@ attacker-poisonable):**
        worker from the registry, never by the queue); `GroupHold`
        clones are freely clonable BY DESIGN — fan-out, commands,
        and detached carriers each hold a clone, which is exactly
-       the distribution model. ALLOCATION-INSTANCE IDENTITY (v9.9.23,
+       the distribution model. The registry and the cross-variant
+       transition are pinned (v9.9.24, round-39 Codex H4): the
+       clonable descriptor is `AllocationRef { slot,
+       allocation_id, SessionIdentity }` — references, never
+       ownership; the DURABLE coordinator registry is keyed by
+       allocation id, keeps a strong reference per live
+       allocation, and retires an entry only through the same
+       ownership paths (it persists across stop/rebind exactly
+       like the escrow — the detached snapshots and commands that
+       are freely cloned today (`runtime.rs:408`,
+       `coordinator/mod.rs:753`) carry `AllocationRef`s, and the
+       executing worker rehydrates the hold from the registry);
+       and a peer-state REPLACEMENT of a locally-born or demoted
+       `DirectHold` entry (the in-place demotion at
+       `install.rs:542` then a permitted peer replacement,
+       `upsert_synced.rs:29`) NEVER mints an uncredited
+       `GroupHold` over the direct reservation (the eventual
+       direct release would free P beneath the imported
+       replacement): the direct hold CONVERTS atomically — in one
+       allocator critical section, a `GroupHold` is minted owning
+       the SAME reservation and the direct count is decremented
+       as the group registers (the entry's token variant swaps;
+       the receipt×variant transition matrix: `NoChange` on a
+       DirectHold incumbent → convert-then-clone; `NoChange` on a
+       GroupHold incumbent → clone; `Inserted` → new hold of the
+       appropriate variant; `Retained` → increment within the
+       incumbent's variant; `Replaced` → per the
+       identity-conditional rule). ALLOCATION-INSTANCE IDENTITY (v9.9.23,
        round-38 Codex B3 — the identity-conditional replacement
        fixed P1→P2 ordering but not a NEW incarnation reusing the
        SAME flow key K and tuple P: `SourceNatFlowKey` carries no
@@ -1547,17 +1622,38 @@ attacker-poisonable):**
        `(K,P)` (`allocator.rs:1318`) would remove ownership
        beneath the live E2, freeing P for reissue
        (`allocator.rs:1007`)): `LiveAllocation` gains an
-       immutable ALLOCATION GENERATION (a per-allocator u64
-       minted at every ownership creation); the group-hold and
+       immutable ALLOCATION GENERATION (a u64 minted at every
+       ownership creation, namespaced to the STABLE SLOT with its
+       counter floor preserved across compatible retargets plus
+       an allocator-instance nonce — v9.9.24, round-39 Codex B3:
+       a counter restarting in each rebuilt allocator would let
+       an old deferred receipt's generation match a fresh
+       allocation); the group-hold and
        every deferred-release receipt carry it; a same-`(K,P)`
        `NoChange` across session incarnations TRANSFERS the
        incumbent group to the new incarnation (the incoming entry
        clones the incumbent group-hold — reservation continuity
-       is by allocation generation, never re-credited); and every
-       deferred release compares the allocation generation before
-       removal (a queued release whose generation no longer
-       matches the live allocation is discarded as stale — the
-       ABA is structurally impossible). ESCROW — the keeper holds the variant's
+       is by allocation generation, never re-credited); and the
+       last-drop→release path is TICKETED, closing the
+       pending-release ABA (v9.9.24, round-39 Codex B3's
+       schedule: E1/G1's last clone drops and queues `D(K,P,g)`;
+       before D drains, E2 with the same `(K,P)` arrives and
+       exact-reserves `NoChange` (`allocator.rs:1664`); G1 no
+       longer exists to clone, G2 references the same `g`, and
+       D's drain finds the live record at `g` and removes it
+       beneath the live E2 (`allocator.rs:1318`), P reissued at
+       `:1007`): the last drop atomically marks
+       `PendingRelease(g, ticket)` on the allocation INSTEAD of a
+       bare enqueue; a same-`(K,P)` `NoChange` (or any new
+       retain) atomically CANCELS/CLAIMS that ticket in the same
+       critical section as its reservation check (the reservation
+       continues, the pending release revoked — or, if the
+       pending release already committed, the new claim creates a
+       genuinely NEW credit with a new generation); and the drain
+       compares BOTH the allocation generation AND the ticket
+       before removal — a claimed ticket or a moved generation is
+       discarded as stale, so a queued release can never land on
+       a re-acquired allocation. ESCROW — the keeper holds the variant's
        token (a DirectHold keeper or a GroupHold clone); the
        handoff/retokenization moves the variant unchanged. REAP —
        each variant drops only its own representation; and
@@ -2476,9 +2572,18 @@ attacker-poisonable):**
        Go-side floor already exists — `pkg/conntrack` GC with HA
        delete-sync callbacks.)
      - **One flow incarnation, end to end (v8.4, round-11 Codex 7):**
-       every entry, replica, and alias gains `flow_incarnation_id: u64`,
+       every entry, replica, and alias gains the full
+       `SessionIdentity { origin_process_nonce, flow_incarnation_id }`
+       (v9.9.24, round-39 Codex M5: the umbrella rule — the
+       incarnation COMPONENT is
        SEPARATE from the RT_FLOW `session_id` (#4915 per-worker
-       correlation ids are untouched). Minting authority is the
+       correlation ids are untouched), and EVERY comparison,
+       inheritance, command field, and test in this plan uses the
+       pair, never the scalar component; where this paragraph and
+       the §9 tests say "the id" they mean the incarnation
+       component of the pair, with the nonce carried alongside —
+       the detached consumers, Close processing, helper aliases,
+       and purge paths all compare the full pair). Minting authority is the
        FORWARD entry only: locally-born flows stamp the alias with the
        forward mint at publication (today id 0,
        `poll_descriptor/mod.rs:2560`); the reverse entry and its
@@ -3324,10 +3429,14 @@ admitted interval):
   reap decrements) vs `GroupHold` (imported: clone distribution,
   reap drops only the clone, last-clone finalizer releases in
   canonical→allocator order) with no shared drop path; (d3)
-  v9.9.22 mechanisms: the first-EOF cascade (with an obligation
-  outstanding, the sender's first EOF on either fabric clears
-  BOTH slots — the next install always cold-primes; no
-  `wasDisconnected == false` window); the repair-ID correlation
+  v9.9.22 mechanisms — with the v9.9.23.1/v9.9.24 corrections:
+  the barrier-and-drain reset (B refuses inbound dial+accept
+  during the barrier; A's slots drain to both-empty via EOF or
+  the per-connection heartbeat-ack detector — NOT a sender-side
+  first-EOF cascade, which v9.9.22 posited and v9.9.23+
+  replaced; the cold-prime gate fires on the first POST-barrier
+  install, and A's dialer retries can never occupy a slot during
+  the barrier); the repair-ID correlation
   (a bulk without the current repair ID is not the repair; a
   pre-request delayed bulk is serialized/superseded; discharge
   only on the ACK echoing the exact repair ID); the full
@@ -3364,7 +3473,28 @@ admitted interval):
   deterministic, address-only, persistent address-only — holds
   DirectHold; commands reference the durable registry, never a
   cloned linear token); and the two-stage cleanup counts queued
-  clones consistently (r37-5's disposition condition). (e) the typed undo receipt — `NoChange` replay rolls
+  clones consistently (r37-5's disposition condition). (d5)
+  v9.9.24 mechanisms: the barrier-and-drain reset (B refuses
+  inbound dial+accept during the barrier — A's dialer retries
+  install-and-die and never occupy a slot; the first
+  post-barrier install cold-primes on BOTH nodes); the sender
+  cutoff (no pre-cutoff incremental lands after the repair's
+  BulkEnd — pause, flush, snapshot, drive, resume); the
+  transactional bulk (members + generation-map staged, committed
+  only at a validating BulkEnd; O2 superseding O1 mid-way
+  commits nothing; freeze-buffer overflow invalidates and
+  re-raises rather than committing partial state);
+  incarnation-namespaced repair epochs (`(sender_incarnation,
+  bulk_epoch)` — a restarted sender's epoch 1 cannot discharge
+  an old obligation); the pending-release ticket (last-drop
+  marks `PendingRelease(g, ticket)`; a same-(K,P) `NoChange`
+  claims/cancels the ticket atomically; the drain compares
+  generation AND ticket — the re-acquire-before-drain schedule
+  cannot release beneath live E2); and the DirectHold→GroupHold
+  conversion (a peer replacement of a demoted locally-born entry
+  converts the direct hold atomically — group minted owning the
+  same reservation, direct count decremented in the same
+  critical section; no uncredited GroupHold). (e) the typed undo receipt — `NoChange` replay rolls
   back nothing (pre-existing ownership untouched), `Inserted`/
   `Retained` undo exactly their mutation, and `Replaced(old_state)`
   with a FAILED new claim reinstates the displaced record's tuple +
@@ -3851,6 +3981,7 @@ It is therefore split to its own research track:
    walk packets that refresh last_seen, so the bound is the attacker's
    own spray budget, not a new pin primitive); (d) absorbing zero-trust
    imports (Phase-2 track); (e) the pre-existing NAT release bug
-   (filed). Complete and shippable?
+   (#6522 — SHIPPED as Part B's typed holder-lifetime machinery,
+   closed by this plan, not deferred). Complete and shippable?
 6. **Observability:** counter + rate-limited structured event.
    Sufficient?
