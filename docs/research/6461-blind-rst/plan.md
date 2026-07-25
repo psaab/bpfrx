@@ -1197,9 +1197,16 @@ attacker-poisonable):**
        global lock across the full clear, and collecting/sorting is
        O(N) memory): the shared session map gains an INSERTION-ORDERED
        SECONDARY INDEX (ordered by a COORDINATOR-GLOBAL immutable
-       insertion sequence — a u64 seqno assigned by the coordinator on
-       every shared-map insert, monotonic and never rewritten — then
-       key as tiebreak; v9.9.10, round-25 Codex M5: `(install_epoch,
+       insertion sequence — a u64 seqno allocated by an `AtomicU64`
+       fetch_add INSIDE the map's insertion lock span (v9.9.10.1,
+       round-26 AGY's cursor-safety catch: allocating the seqno OUTSIDE
+       the lock lets out-of-order lock acquisition insert seq 101
+       before seq 100, and a cursor advancing to 101 permanently skips
+       the late-inserted 100 in subsequent `seqno > cursor` scans;
+       allocating inside the insertion lock guarantees monotonic
+       cursor safety — alternatively per-map seqnos, also allocated
+       inside that map's lock) — then key as tiebreak; v9.9.10,
+       round-25 Codex M5: `(install_epoch,
        key)` is unusable because `install_epoch` is per-worker and
        mutable (`session/mod.rs:761, :1384`) and `SessionKey` has no
        order (`session/key.rs:9`). The index lives under the CANONICAL
