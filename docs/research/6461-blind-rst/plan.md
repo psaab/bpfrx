@@ -935,6 +935,98 @@ attacker-poisonable):**
        (retaining increments the lease's holder count, not a new
        reservation), so a shared persistent lease migrates atomically
        with all its co-holders intact.
+       **Persistent-lease ORDINARY peer INSTALLs (v9.9.15, round-30
+       Codex B2):** the same lease discipline applies to initial and
+       replayed peer INSTALLs, not just reconcile migration — the
+       generic per-flow reservation cannot represent a shared
+       persistent lease on the standby. The active allocator
+       legitimately issues ONE persistent lease to co-holder flows
+       F1/F2 sharing a translated tuple (`allocator.rs:1114, :1224`;
+       regression test `tests_pool.rs:2536`), but the standby's
+       generic reservation (`upsert_synced.rs:64` → `source.rs:868` →
+       `reserve_flow`, `allocator.rs:1654`) records
+       `persistent_key: None` per flow, so F2's import fails the
+       occupied-bit check (`allocator.rs:1688`) while the upsert still
+       publishes (`upsert_synced.rs:112`); after failover F1's
+       teardown takes the non-persistent release branch and frees P
+       (`allocator.rs:1318`) with F2 still live and holding no lease
+       membership, and a same-remote E3 can then obtain P —
+       reverse-NAT misdelivery. No new wire field is needed: the
+       `PersistentSourceKey` is a pure function of the flow key, the
+       pool's persistent flag, and the permit
+       (`allocator.rs:1116`'s
+       `flow.persistent_source_key(persistent_nat_permit)`), so the
+       standby derives the SAME key the active node used. The rule:
+       every initial or replayed peer install of an entry whose
+       decision belongs to a persistent pool performs an ATOMIC exact
+       lease-create-or-retain BEFORE publication — in one allocator
+       critical section, derive the key; if the lease exists, verify
+       its translated tuple equals the wire decision and increment
+       its co-holder count (mismatch = failure); if not, create the
+       lease object (key, timeout, translated tuple, co-holder count
+       1) and reserve the port bit in the same section; and the
+       imported flow's `LiveAllocation` records
+       `persistent_key: Some(key)`, so teardown releases through the
+       lease refcount and the port frees only when the LAST
+       co-holder releases. Any failure (the port is owned by a
+       different allocation, or an existing lease carries a
+       mismatched tuple) REJECTS the install — the upsert does NOT
+       publish; the standby lacks that copy until the next resend
+       retries (a standby gap is safe; a misdelivering alias is
+       not). Co-holder imports then arrive in any order: F1 creates,
+       F2 retains, and neither fails the occupied-bit check.
+       **Temporary stop/rebind (v9.9.15, round-30 Codex B3):** the
+       two-phase sequence and the durable escrow are NOT scoped to
+       the reconcile sequence — they are THE worker-teardown
+       discipline for EVERY stop that anticipates a later bring-up.
+       `stop()` → `stop_inner(clear_synced_state = true)`
+       (`stop_workers.rs:7` → `coordinator/mod.rs:429`, used by
+       PrepareLinkCycle before a link DOWN/UP, and the
+       disarmed-forwarding stop at `server/helpers/status.rs:377`)
+       today joins and drops worker-held state in one step
+       (`stop_and_clear`, `coordinator/mod.rs:645`) — RAII-dropping
+       every `NatHoldToken` — and then drops the allocators
+       themselves (`ForwardingState::default()`), so E1's final
+       reservation disappears during a temporary link cycle even
+       though E1's BPF session-map row persists in the kernel (only
+       the coordinator's fd is closed at `coordinator/mod.rs:675`;
+       the pinned map content survives), the Go sidecar keeps its
+       copy, and the HA peer keeps its exported copy: after the
+       rebind, a peer re-push of E1 (bulk re-sync carrying the
+       original translated tuple) or a fresh E2 allocation against
+       the new empty allocator can produce the identical public
+       reverse tuple — the documented reverse-NAT misdelivery
+       (`pkg/config/compiler_tailgates.go:212`). Permanent shutdown
+       remains a distinct path (`stop_with_event_stream`,
+       `coordinator/mod.rs:441`), so treating every `stop()` as
+       permanent is not a valid fence. The generalization: (1) the
+       temporary stop runs the SAME quiesce → handoff → join
+       ordering — workers quiesce (no new commits), every
+       outstanding token transfers to the durable escrow BEFORE
+       `stop_and_clear` can RAII-drop it and BEFORE `ForwardingState`
+       is defaulted (the escrow keeper's `Arc` keeps allocator A
+       alive past the default); (2) a temporary stop is NOT the
+       escrow's "declared permanent dataplane stop" — that
+       declaration is process shutdown (`stop_with_event_stream` /
+       process exit), the only path that drains without replay
+       confirmation; (3) the synced-map wipe at
+       `coordinator/mod.rs:709` moves to the declared-permanent path
+       only — a temporary stop PRESERVES the synced session maps
+       exactly as `stop_inner(false)` does, so the rebind's
+       bring-up (`rebind.rs` → `reconcile_status_bindings` →
+       teardown/bringup) has the SAME finite, acknowledged replay
+       set as a reconcile (the `rebind.rs:18` comment already
+       documents today's wipe as wrong for a rebind: the synced map
+       "should be replayed into BPF maps on bringup" — preserving
+       it also stops losing sessions across a RETH-MAC link cycle,
+       the behavioral change that comment asserts as intended); and
+       (4) the rebind bring-up is the consuming dataplane: escrowed
+       reservations migrate into the new allocators under the same
+       collision-domain compatibility rule (incl. allocation mode,
+       v9.9.15 above) BEFORE workers resume admission, and the
+       escrow drains on the bring-up's replay-consumption
+       confirmation, keepers releasing for reservations no replayed
+       or materialized entry retained.
        The escrow's lifetime is UNTIL REPLAY CONSUMPTION BY WHICHEVER
        DATAPLANE COMES UP — new or restored-old (v9.9.8, round-23
        partial's "lose the final NAT holder" trace: reconcile
@@ -1100,7 +1192,40 @@ attacker-poisonable):**
        Alternatively the dual-write bridge: during the migration
        window, allocations through A are also reserved in B, with an
        acknowledgement that no worker can still allocate through A
-       after the cutover) or forces the quiesced reconcile path (which has the
+       after the cutover), AND the compatibility detection includes
+       ALLOCATION MODE, not just address space (v9.9.15, round-30
+       Codex B1a: `SourceNatPoolAllocatorKey` contains only pool
+       name, addresses, and port range — NOT `no_translation` or
+       ownership mode (`source.rs:327`) — so exact-key reload reuses
+       the same allocator (`source.rs:726`) without triggering the
+       migration fence: C1 PAT E1 owns public P in the occupancy
+       bitmap (`allocator.rs:999`); C2 changes the same pool to
+       `port no-translation`; E2 has preserved source port P and the
+       same remote; address-only admission checks only
+       `address_only_owners` (`allocator.rs:1727`) and succeeds
+       despite P's bitmap ownership; E1 and E2 now have the
+       identical public reverse tuple, and the reverse transition is
+       symmetric (an address-only owner is invisible to new PAT
+       bitmap allocation). The rule: the collision domain is
+       (address space, ALLOCATION MODE (PAT / no-translation /
+       ownership mode)); a mode change is treated as an INCOMPATIBLE
+       collision-domain change (the old domain's escrow tokens are
+       invalidated and flows re-resolve, which is semantically
+       REQUIRED because the translation shape changed); and the
+       cross-mode occupancy check is structural in BOTH directions —
+       address-only admission ALSO consults the PAT occupancy bitmap
+       (not just `address_only_owners`), and PAT allocation ALSO
+       consults `address_only_owners` — so the identical public
+       reverse tuple can never be issued across modes regardless of
+       detection timing. The A/B retain/release bridge is explicit:
+       during the migration window, retain operations through A are
+       ALSO recorded in B (dual-record), or the workers are quiesced
+       and retokenized — a post-snapshot materialization
+       (`session_glue/mod.rs:1157`) can otherwise still retain E1
+       through A while tokens own the exact A allocator handle
+       (:1057), leaving B's safe release point undefined; freezing
+       only fresh allocation does not define B's safe release point)
+       or forces the quiesced reconcile path (which has the
        escrow); a collision-domain-compatible change migrates in
        place; an incompatible change forces the reconcile). The rule
        for the reconcile/restore path itself: on a config change
@@ -1108,8 +1233,14 @@ attacker-poisonable):**
        regardless of name), the restore path MIGRATES E1's exact
        reservation — PAT, NAT64 (`nat64.rs:915`), and address-only
        alike — into every compatible current allocator BEFORE
-       releasing A's hold (via `reserve_flow` / `reserve_address_only`,
-       confirmed available per round-27 AGY), so B can never assign
+       releasing A's hold, ROUTED BY ALLOCATION KIND (v9.9.15,
+       round-30 Codex B2): NON-persistent reservations via
+       `reserve_flow` / `reserve_address_only` (confirmed available
+       per round-27 AGY); PERSISTENT leases via the lease-object
+       transfer above — a per-flow `reserve_flow` can never migrate
+       a shared persistent lease (`persistent_key: None` per flow,
+       `allocator.rs:1654`, so the second co-holder fails the
+       occupied-bit check) — so B can never assign
        E1's public tuple elsewhere (`source.rs:829`,
        `allocator.rs:1617`'s collision is thereby prevented
        structurally, not just detected); on a config change that
@@ -1950,7 +2081,14 @@ surviving rule's E2 can alias a deleted rule's old position and be
 companion-deleted through `session_store.go:391`); the session DELETE
 delta carries `{(origin_process_nonce, flow_incarnation_id)}`.
 The sender/receiver store lifecycle: the Go sidecar synced store gains
-`(origin_process_nonce, flow_incarnation_id, row_version)` per entry,
+`(origin_process_nonce, flow_incarnation_id, row_version,
+stable_rule_id_hash, admission_config_version)` per entry (v9.9.15,
+round-30 Codex M5: the two selector fields are STORED per entry, not
+recomputed — they cannot be reconstructed from the BPF projection
+(`bpf_session_value.go:168`), whose positional policy ID is rewritten
+across policy reorder (`bpf_map/mod.rs:384`), so dropping them here
+would re-open the numeric-ID selection at
+`daemon_policy_invalidate.go:311`),
 learned from the install delta, compared on delete; the install data
 for bulk and periodic resend is produced by the helper-authoritative
 ATOMIC SNAPSHOT (a new helper method acquiring the canonical hierarchy
@@ -2009,7 +2147,12 @@ source.
   `sync_protocol.go:95-102, :470-497` trailing-field tolerance), and
   no config schema change. The NODE-LOCAL shared-map
   schema gains additive fields (`last_touch_ns`, `expires_after_ns`,
-  `flow_incarnation_id`) — never wire-carried in Phase 1, so
+  `flow_incarnation_id`, `stable_rule_id_hash`,
+  `admission_config_version` — v9.9.15, round-30 Codex M5: the two
+  selector fields must live on the shared entries too, since the
+  helper-side current-state selection of §5.2 reads its own shared
+  aliases and the fields cannot be reconstructed from the BPF
+  projection) — never wire-carried in Phase 1, so
   rolling-upgrade safe.
 
 ---
@@ -2233,9 +2376,13 @@ admitted interval):
   Open/replication/stamp, and subsequent hits do NOT re-promote; no
   accelerated reap and no close mark in either branch.
 - **Escrow + conditional-delete fences (v9.9.9):** (f) the stable
-  logical rule ID (`<from>-><to>/<name>`, `policies_ids.go:101`) plus
-  content version and the write-once admission config-sync generation
-  as DISTINCT fields: same-content-different-name rules never
+  logical rule ID (`<from>-><to>/<name>`, `policies_ids.go:101`) and
+  the write-once admission config-sync generation as the DISTINCT
+  selector fields — exactly `stable_rule_id_hash` +
+  `admission_config_version` (v9.9.15, round-30 Codex M5: the
+  content-addressed hash supplement was superseded in v9.9.9 — §5.2 —
+  so there is NO "content version" selector; earlier drafts' mention
+  of one is removed): same-content-different-name rules never
   cross-select (the round-24 G1/G2/G3 trace); a rule edited in place
   keeps its name and is correctly selected; a renamed rule is
   delete+add; the admission generation is stamped once at entry
@@ -2293,41 +2440,46 @@ admitted interval):
   slot when a worker claims, retains, and dies before the recheck —
   the round-22 AGY trace); (e) helper-authoritative
   conditional delete with TEMPORAL CUTS: Go submits the predicate;
-  (e2) the wire identity matrix: new-sender→new-receiver (tail
-  applied), old-sender→new-receiver (tail-less install → the receiver
-  stores NO identity; new-sender→old-receiver: the INSTALL tail is
-  ignored by old decoders (harmless extra bytes), while
-  identity-dependent DELETEs (Close, invalidation, conditional) are
-  SUPPRESSED entirely toward the unnegotiated peer (v9.9.14, round-29
-  Codex H5: the matrix previously said new→old "tail ignored" AND
-  "mixed-version pairs fall back to generation deletes" generically —
-  followed for DELETE, A's E1 Close reaches legacy B; B decodes key
-  plus generation (`sync_conn_read.go:150`), accepts the equal/fresh
-  generation (`sync_conn_gen.go:263`), and key-deletes current
-  same-key E2 plus companions at `sync_conn_gen.go:493-506`; so the
-  old-receiver fallback is: gen-based deletes — but ONLY
-  v9.9.8, round-23 partial: a stale gen-based delete from the old
-  sender carries the sender's fresh generation (which always advances
-  past the receiver's tracked generation for that key,
-  `sync_conn_write.go:69`), and E2 re-seeded on the NEW node does NOT
-  advance the OLD sender's generation — so an unconditional gen-based
-  fallback would delete the new node's authoritative E2 in the
-  dual-active mixed-version window (the quadruple coincidence:
-  mixed-version pair + failover + policy invalidation + new flow in
-  the same ~100 ms masterDownInterval window). The rule: gen-based
-  deletes in a mixed-version pair apply only when the entry is NOT
-  locally authoritative on the receiver (a standby/replica copy —
-  the owner's gen-based delete correctly kills it); locally
-  authoritative entries (locally-born or `SharedPromote`) are IMMUNE
-  to gen-based peer deletes — the new node's re-seeded E2 survives,
-  and the old node's own invalidation pass deletes its own E1 copy
-  with its own fence. The hazard is thereby closed, not just
-  bounded), new-sender→old-receiver
-  (tail ignored), and the dual-active propagation case (both nodes
-  believe they own the RG: the delete delta carries the selected
-  identity and the receiver applies it only when its stored
-  incarnation matches, so node A's propagated delete of E1 never kills
-  node B's live E2 aliasing the same key);
+  (e2) the wire identity matrix — the ONLY satisfiable form
+  (v9.9.15, round-30 Codex H4: the previously retained clauses —
+  "new-sender→old-receiver (tail ignored)" and "mixed-version pairs
+  fall back to generation deletes" — made the matrix internally
+  unsatisfiable: followed literally, A's E1 Close reaches legacy B,
+  which decodes key plus generation (`sync_conn_read.go:150`),
+  accepts the equal/fresh generation (`sync_conn_gen.go:263`), and
+  key-deletes the current same-key E2 plus companions at
+  `sync_conn_gen.go:493-506`. There is NO gen-based fallback for
+  sender-initiated deletes toward a legacy receiver, full stop):
+  new-sender→new-receiver — the tail is applied: identity-dependent
+  deletes carry the selected `(origin_process_nonce,
+  flow_incarnation_id)` and the receiver applies them only when its
+  stored incarnation matches; old-sender→new-receiver — the
+  tail-less install stores NO identity, and the legacy sender's
+  gen-based deletes apply ONLY to entries that are NOT locally
+  authoritative on the receiver (a standby/replica copy — the
+  owner's gen-based delete correctly kills it), while locally
+  authoritative entries (locally-born or `SharedPromote`) are
+  IMMUNE: the old sender's fresh generation always advances past
+  the receiver's tracked generation for that key
+  (`sync_conn_write.go:69`), while E2 re-seeded on the NEW node does
+  NOT advance the OLD sender's generation — so an unconditional
+  gen-based fallback would delete the new node's authoritative E2 in
+  the dual-active mixed-version window (the v9.9.8 quadruple
+  coincidence: mixed-version pair + failover + policy invalidation
+  + new flow in the same ~100 ms masterDownInterval window), and the
+  old node's own invalidation pass deletes its own E1 copy with its
+  own fence — the hazard is closed, not just bounded;
+  new-sender→old-receiver — the INSTALL tail is ignored by old
+  decoders (harmless extra bytes), and identity-dependent DELETEs
+  (Close, invalidation, conditional) are SUPPRESSED ENTIRELY toward
+  the unnegotiated peer: the new sender emits them only to
+  negotiated peers (capability bit in the handshake), and the legacy
+  receiver converges by its OWN local invalidation pass and aging —
+  master's pre-existing behavior for every entry today; dual-active
+  propagation (both nodes believe they own the RG) — the delete
+  delta carries the selected identity and the receiver applies it
+  only when its stored incarnation matches, so node A's propagated
+  delete of E1 never kills node B's live E2 aliasing the same key;
   the helper selects from its own shared aliases, captures the
   selected `(origin_process_nonce, flow_incarnation_id)` under the
   canonical lock, and deletes under the alias-token fencing in one
@@ -2366,9 +2518,11 @@ admitted interval):
   post-restart E2 with the same per-worker counter value is not
   deleted by a pre-restart E1's delta; the peer delete delta carries
   the SELECTED identity (rolling-gated additive tail) and the
-  receiver applies it only when its stored incarnation matches (a
-  mixed-version pair falls back to today's gen-based delete,
-  documented).
+  receiver applies it only when its stored incarnation matches;
+  toward an UNNEGOTIATED (legacy) peer the delete is SUPPRESSED
+  entirely — never a gen-based fallback (per (g)/(e2) — and a legacy
+  SENDER's gen-based deletes apply only to non-locally-authoritative
+  entries on the new receiver, per (i)).
 - **Trust transactions (v5, round-3 Codex 3):** authenticated sample
   REPLACES untrusted storage (planted X discarded, not blessed/max-merged);
   unauthenticated sample never clears/alters trusted state (SYN
