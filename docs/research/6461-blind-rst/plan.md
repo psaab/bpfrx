@@ -990,7 +990,12 @@ attacker-poisonable):**
        token is inserted, and unlaunched-worker queues get EXPLICIT
        rejections (their queued commands contain no hold token yet,
        `runtime.rs:408` — replay queues carry pending-outcome
-       tickets); abandonment drains the escrow via RAII — so reconcile
+       tickets); reconcile ABANDONMENT does NOT drain the escrow —
+       it persists until a dataplane (new or restored-old) confirms
+       replay consumption, draining only on a declared permanent
+       dataplane stop or on that confirmation (v9.9.9's durable-escrow
+       rule — this line supersedes the older drain-on-abandonment
+       phrasing); reconcile
        can never stall on a permanently absent acknowledgement
        (workers report READY before consuming commands,
        `loop_body/mod.rs:150, :682`, and launched workers retain the
