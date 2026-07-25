@@ -941,7 +941,15 @@ attacker-poisonable):**
        release the retained hold immediately; abort } else { insert
        side-map; emit Installed }` — a single winner, no split-brain,
        and the abandoned-but-retained case releases AT THE RECHECK
-       because the worker is alive to recheck (the residual pinning
+       because the worker is alive to recheck. The RAII drop DISARMS
+       the permit expiration timer at drop time (round-22 AGY: without
+       disarming, a worker that claims, retains, and dies before the
+       recheck would fire BOTH the RAII drop (releasing the hold) AND
+       the later permit expiry (releasing the keeper's pending slot
+       again) — a double-release of the pending map slot that races
+       subsequent allocations; the permit timer is cancelled when the
+       token's RAII drop fires, and the permit expiry fires only for
+       tokens still live at expiry). The residual pinning
        where RAII cannot run is bounded by worker lifetime; the
        supervisor's panic-only death marking at `supervisor.rs:95` /
        `worker_runtime.rs:239` covers the unwind case). A genuinely
