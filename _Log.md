@@ -1,3 +1,44 @@
+## 2026-07-24 — #6434: split filter compiler god-functions
+
+- **Timestamp**: 2026-07-24 (fix/6434-filter-compiler-split)
+- **Action**: Decomposed the two remaining god-functions in
+  `userspace-dp/src/filter/compiler.rs` into single-responsibility phase
+  helpers — pure code motion, zero behavior delta.
+  `parse_filter_state_with_three_color_preserving` (274 lines → 26) now
+  orchestrates `load_three_color_policer_runtimes`,
+  `lower_single_rate_policer_runtimes`, `parse_filter_table`,
+  `assign_interface_filters` (+ the per-hook `resolve_interface_filter`,
+  which dedupes the four near-identical inet/inet6 x input/output blocks),
+  `recompute_fast_map_aggregates`, and `resolve_lo0_filter` (dedupes the
+  two lo0 blocks). `parse_term` (477 lines → 27) now orchestrates
+  `preflight_term_markers` (the six Go-builder unrepresentable wire-marker
+  guards #3367/#3406/#6459/#6463), `preflight_term_value_ranges` (#3715
+  DSCP ranges + #3406 flex length), `parse_term_addresses` (#2400/#2506),
+  `resolve_term_protocols` (#2505), `check_cross_field_satisfiability`
+  (#3723), `parse_term_ports` (#2622/#3716/#2400), `resolve_term_action`
+  (#2399/#2544), and `build_filter_term` (assembly, with the #3077/#3232
+  flex lowering in `lower_flex_match`). Error-precedence order is
+  preserved exactly (marker guards → value ranges → protocol resolution →
+  cross-field → lowering); every SnapshotIntegrityError construction is
+  verbatim; the unknown-action eprintln side effect still fires only after
+  all error paths pass. Largest resulting fn is 102 lines
+  (`build_filter_term`); all others ≤ 94. No public signature changed;
+  the four interface-hook error strings and lo0 guards produce identical
+  MissingFilterRef fields. Docs: filter/README.md needs no change — its
+  `compiler.rs` bullet describes responsibilities (still accurate, no new
+  files), the #6510-era `parse_term raises ...` references stay true (the
+  errors surface through parse_term's Result via `?`), and the engine/
+  bullet was already fixed in #6511.
+- **File(s)**: userspace-dp/src/filter/{compiler.rs, mod.rs} (mod.rs:
+  FlexMatchSnapshot added to the existing crate-root snapshot import so
+  `lower_flex_match` can name the type), _Log.md
+- **Validation**: cargo build clean with 159 warnings before AND after
+  (identical set — zero new warnings, verified against a pristine
+  origin/master build); full crate suite 4164 passed / 0 failed /
+  2 ignored (same baseline as master); filter:: module 203 passed /
+  0 failed unmodified; the #6510 marker pins + #3716 positive-wins +
+  #3715/#3723 guards subset 29 passed / 0 failed unmodified.
+
 ## 2026-07-24 — #6471: forged IKE Responder SPI bypasses the Stage-11 host-inbound gate
 
 - **Timestamp**: 2026-07-24 (fix/6471-ike-responder-spi-gate)
