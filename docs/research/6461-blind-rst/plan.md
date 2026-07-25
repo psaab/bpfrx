@@ -1401,18 +1401,32 @@ attacker-poisonable):**
        stale reset): the peer-incarnation registry maintains
        `{current, pending, retired}` and every slot/pre-slot
        lane under ONE lock (`s.mu`): a different incarnation
-       first DRAINS/REVOKES the current incarnation's handlers
-       and lanes — a drain that CANNOT hang (v9.9.42, round-48
-       SMR F1: the superseded connection's natural death — TCP
-       reset or the silence teardown — completes the drain
-       automatically, because the handlers die with the
-       connection; the atomic step never waits on anything
-       other than an already-dying lane) — then ATOMICALLY
-       retires current and promotes
+       first REVOKES the current incarnation's lane tokens and
+       retires it, then ATOMICALLY promotes pending and
+       RELEASES the lock BEFORE closing or joining anything
+       (v9.9.43, round-48 Codex M3 + round-48 AGY trace-2 —
+       "drain under `s.mu`" admits a blocking interpretation:
+       holding `s.mu`, closing n1, and synchronously awaiting
+       its handler deadlocks, because `receiveLoop`'s deferred
+       `handleDisconnect` blocks acquiring the same mutex
+       (`sync_conn_read.go:14`, `sync_conn.go:480`): the lock-
+       held phase is metadata-only — revoke exact lane tokens,
+       retire n1, promote n2 — and socket close/join happens
+       AFTER release; a superseded connection's natural death
+       then completes cleanup automatically, v9.9.42's
+       drain-cannot-hang rule; an asynchronous pending state is
+       keyed by TRANSITION EPOCH plus the live-lane set —
+       natural lane death cancels it, and completion CASes the
+       same epoch before promotion);
        pending; the `(node_id, incarnation, lane_token)`
        triple is rechecked immediately before every mutation;
        a retired incarnation is never readopted; and a
-       reset-generation high-water is kept PER INCARNATION,
+       reset-generation high-water is kept PER
+       `(direction, node_id, process_incarnation)` (v9.9.43,
+       round-48 Codex M3 — not merely per incarnation: the
+       triple keys it, and the `RESET_GEN` behavior is defined
+       for lower (stale — discard), equal (idempotent re-ACK),
+       and higher (supersede — arm) generations),
        STARTING FRESH (v9.9.42, round-48 SMR F2: the high-water
        is per `(node_id, incarnation)`; a new incarnation
        inherits NOTHING from its predecessor — the old
@@ -1483,19 +1497,15 @@ attacker-poisonable):**
        repair ID is the correlation: a bulk that does not carry
        the current repair ID is not the repair; pre-request bulks
        in flight are serialized behind or superseded by the
-       repair bulk); the obligation discharges ONLY at the
-       `JOURNAL-END` marker validating the exact repair ID plus
-       the journal epoch/terminal sequence (v9.9.33 — this
-       supersedes the earlier "ACK echoing the exact repair ID":
-       the discharge point is the marker, never a bare `BulkEnd`
-       or bulk ACK — and the DIRECTIONS are explicit (v9.9.39,
-       round-46 Codex B1: the RECEIVER's INBOUND obligation and
-       its readiness clear ONLY after APPLYING the exact
-       `JOURNAL_END`; the SENDER's OUTBOUND obligation AND the
-       cold-prime latch clear ONLY after the matching
-       full-triple `JOURNAL_ACK` — a bare `BulkAck(u64)` or a
-       `BulkEnd` write never clears either, `sync_conn.go:194`,
-       `sync_bulk.go:282`); a legacy sender ignores the
+       repair bulk); the RECEIVER's INBOUND obligation and its
+       readiness clear ONLY after APPLYING the exact
+       `JOURNAL_END`, and the SENDER's OUTBOUND obligation (this
+       one) clears ONLY at the matching full-triple
+       `JOURNAL_ACK` (v9.9.43, round-48 Codex B1 — every
+       discharge clause in this plan names its obligation:
+       `JOURNAL_END` is never a sender-side discharge, a bare
+       `BulkAck(u64)` or a `BulkEnd` write never clears either
+       obligation, `sync_conn.go:194`, `sync_bulk.go:282`); a legacy sender ignores the
        request, and the receiver falls back to (a) after a
        bounded wait; unnegotiated peers always use (a). The repair
        path's stream hygiene is explicit (v9.9.27, round-40 Codex
@@ -1734,8 +1744,11 @@ attacker-poisonable):**
        repair stream (never the active-fabric lottery,
        `sync_conn_write.go:268`), and terminates with an
        explicit JOURNAL-END marker (an additive frame); the
-       receiver ACKs ONLY the marker — bulk commit AND journal
-       application both complete — so a post-cut E2 delta
+       receiver's readiness moves ONLY on APPLYING the marker
+       (bulk commit AND journal application both complete —
+       never on the bulk's `BulkEnd`), and the sender's
+       obligation clears ONLY at the matching `JOURNAL_ACK`
+       (v9.9.43) — so a post-cut E2 delta
        delayed on another fabric can never arrive after
        readiness cleared, because readiness clears only at the
        marker — and this rule SUPERSEDES every older
@@ -3901,7 +3914,22 @@ identity tails): the capability handshake exchanges
 capacity_config_generation, heartbeat-ack-capable,
 identity-enforcement-capable, lease-input-capable,
 repair-vN, reset-vN)` — the identity fields are part of the
-AUTHENTICATED HELLO TRANSCRIPT (v9.9.41, round-47 Codex M3:
+AUTHENTICATED HELLO TRANSCRIPT under an explicit
+AUTH-TRANSCRIPT PROTOCOL VERSION (v9.9.43, round-48 Codex H2 —
+a direct proof-algorithm change would break rolling upgrades:
+current peers compute `HMAC(tag || nonce)` (`sync_auth.go:217`,
+verified at `:401`), so a whole-transcript proof and the
+nonce-only proof would reject each other and reconnect
+indefinitely: v1 peers keep the v1 nonce-only proof and the
+v1-v1 pair MASKS `reset-vN` plus every transcript-dependent
+capability (the reset lane and its frames are never offered);
+when BOTH peers are v2, they exchange bounded raw HELLO
+records and `AUTH_PROOF` authenticates a DOMAIN-SEPARATED,
+length-prefixed, ORDERED pair of those exact records — and
+the proof runs BEFORE the authenticated frame wrapper
+installs (the wrapper installs only after verification,
+`sync_auth.go:406` — the transcript is not "inside" the
+wrapper; it is what the wrapper's installation is gated on));
 the canonical transcript — node ID, process incarnation,
 capabilities, nonces — is authenticated inside the
 authenticated frame wrapper, so `AUTH_PROOF` covers the whole
@@ -3930,9 +3958,17 @@ wait-forever);
 `RESET_ACK` carry `(direction, node_incarnation,
 reset_generation)`; `BulkStart` carries
 `(repair_cutoff_epoch, repair_id, declared_member_count?)`; the
-bulk markers echo `repair_id`; the TERMINAL ACK is its own
-frame — `JOURNAL-END` carries `(repair_id, journal_epoch,
-terminal_seqno)` and is the ONLY discharge (a bare `BulkAck`
+bulk markers echo `repair_id`; the terminal exchange is TWO
+distinct frames with LOCKED ROLES (v9.9.43, round-48 Codex B1 —
+this supersedes calling `JOURNAL-END` "the terminal ACK" or
+"the ONLY discharge": `JOURNAL_END(repair_id, journal_epoch,
+terminal_seqno)` flows sender→receiver as the terminal MARKER
+the receiver applies — its APPLICATION clears the RECEIVER's
+inbound obligation and readiness, and it is NOT an
+acknowledgement of anything; `JOURNAL_ACK` flows
+receiver→sender carrying the SAME immutable triple and is the
+ONLY discharge for the SENDER's outbound obligation and the
+cold-prime latch; a bare `BulkAck`
 u64 can never discharge: the legacy `BulkEnd`→reconcile/ACK
 path (`sync_conn_read.go:205`) and the epoch-floor `BulkAck`
 check (`:249`) are retained for unnegotiated peers only, and a
@@ -4381,9 +4417,10 @@ admitted interval):
   A→B (B's loss causes SENDER A's full-table iteration — a
   wrong-direction B→A bulk fails the test); a delayed
   PRE-obligation ACK does not discharge; a second overflow O2
-  during O1's repair re-arms the raising-point generation and
-  only the `JOURNAL-END` marker validating the exact
-  post-O2 repair ID plus terminal sequence discharges; a
+  during O1's repair re-arms the raising-point generation;
+  the RECEIVER's readiness moves only after APPLYING the exact
+  post-O2 `JOURNAL_END`, and the SENDER's obligation clears
+  only at the matching `JOURNAL_ACK` (v9.9.43); a
   failed redrive re-kicks (the obligation, not the
   `bulkRedriveInFlight` CAS, is the durable state); the
   close-both reset asserts the reconnect barrier (one fabric
@@ -4404,9 +4441,10 @@ admitted interval):
   the refusal mechanism itself; the guarantee is that no retry
   occupies a slot AT barrier end); the repair-ID correlation
   (a bulk without the current repair ID is not the repair; a
-  pre-request delayed bulk is serialized/superseded; discharge
-  only at `JOURNAL-END` validating the exact repair ID plus
-  terminal sequence, v9.9.35); the full
+  pre-request delayed bulk is serialized/superseded; the
+  receiver's readiness moves only on the applied
+  `JOURNAL_END`, and the sender's obligation clears only at
+  the matching `JOURNAL_ACK` (v9.9.43)); the full
   identity pair in the helper inventory (a queued cleanup for
   `(n1,id7)` never matches `(n2,id7)` after sender restart);
   identity-conditional replacement (E1/P1/G1 → E2/P2/G2 installs
@@ -4480,9 +4518,11 @@ admitted interval):
   defined degraded state, never a rollback loop); shadow
   interruption (deadline/teardown releases; no partial
   visibility) and the locally-authoritative merge at commit;
-  O1/O2 `JOURNAL-END` correlation (only the exact repair ID +
-  terminal sequence discharges; crash-before-marker leaves the
-  obligation armed); hold-cell conversion ordering (single
+  O1/O2 terminal correlation (only the exact post-O2
+  `JOURNAL_END` moves the receiver's readiness and only the
+  matching `JOURNAL_ACK` clears the sender's obligation;
+  crash-before-marker leaves both armed, v9.9.43); hold-cell
+  conversion ordering (single
   per-credit counter, reference flavors only); and the cleanup
   lost-wakeup interleaving (arm-before-read closes it; the
   drop-after-read re-notifies). (d7)
