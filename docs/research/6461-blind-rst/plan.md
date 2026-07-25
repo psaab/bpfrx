@@ -1212,10 +1212,15 @@ attacker-poisonable):**
        fab1's slot is still occupied → `wasDisconnected ==
        false`, no cold-prime, and fab1's later clear finds fab0
        live — no cold-prime ever): B REFUSES inbound connections
-       (dial AND accept) during its barrier — every connection
-       attempt is accepted-and-immediately-closed (or never
-       answered, letting the attempt's own detector kill it), so
-       no install during the barrier can occupy a slot on either
+       during its barrier — and the refusal is pinned
+       (v9.9.25, round-39 SMR F1): (i) on the ACCEPT side B
+       accepts-and-immediately-closes every attempt (immediate
+       close, never "never-answer" — silence wedges A's
+       connect-timeout accounting and retry backoff detection);
+       and (ii) B SUPPRESSES ITS OWN outbound dial for the
+       barrier's duration (a B-initiated early dial is an
+       install on B too), so no install during the barrier can
+       occupy a slot on either
        node; A's slots therefore drain to both-empty via EOF or
        the per-connection detector regardless of A's dialer
        retries (each retry installs briefly on A, dies at B, and
@@ -1225,7 +1230,11 @@ attacker-poisonable):**
        barrier is sized to the SLOW detector (≥ the 2-missed-ack
        bound + RTT margin — a repair event, not a fast path),
        and the FIRST install after the barrier finds both slots
-       empty on both nodes and cold-primes deterministically.
+       empty on both nodes and cold-primes deterministically —
+       the cold-prime that matters is the SENDER's bulk drive on
+       A's `installConn` decision, and A's post-barrier install
+       always computes both-empty because the barrier outlasts
+       A's slot drain.
        B's inbound-repair obligation is DURABLE —
        a pathological miss (no bulk arrives) never clears it, and
        B escalates to a second close-both with exponential backoff
@@ -1282,7 +1291,14 @@ attacker-poisonable):**
        INSTALL can land after an E1-absent repair has reconciled
        — and absence reconciliation records no generation
        tombstone, `sync.go:1080`): the sender PAUSES incremental
-       emission when it arms the repair, FLUSHES the pre-cutoff
+       emission when it arms the repair — and the pause is a
+       QUIESCE-AND-JOIN of the `sendLoop`, not merely an enqueue
+       gate (v9.9.25, round-39 SMR F2: the `sendLoop` retries an
+       already-dequeued frame on whichever connection becomes
+       active, `sync_conn_write.go:268`, so an enqueue pause alone
+       lets a pre-cutoff frame land post-`BulkEnd` from the retry
+       path — the cutoff is taken with the sendLoop's retry loop
+       JOINED), FLUSHES the pre-cutoff
        queue, takes the snapshot (the snapshot IS the cutoff —
        every pre-cutoff frame is either flushed before
        `BulkStart` or subsumed by the snapshot), drives the bulk,
