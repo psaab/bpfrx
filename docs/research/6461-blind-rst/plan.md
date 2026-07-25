@@ -1364,12 +1364,24 @@ attacker-poisonable):**
        not address parsing); a deterministic live-fabric
        fallback covers a failed preferred fabric; the lane is
        type-constrained and incarnation-bound (v9.9.38, round-46
-       SMR F4: it accepts ONLY the `RESET_GEN`/`RESET_ACK`
-       frame types — every other type is dropped at demux — and
-       the reset triple's node incarnation must match the
-       peer's authenticated current incarnation, so the
-       exemption cannot smuggle session frames past the
-       barrier); and the
+       SMR F4; confinement completed v9.9.39, round-46 Codex H3:
+       the lane runs a RESET-ONLY parser — HELLO/capability plus
+       fixed-size `RESET_GEN`/`RESET_ACK` only; today's setup
+       reader accepts any message type up to 16 MiB
+       (`sync_auth.go:289`) and a non-HELLO becomes an
+       arbitrary pending frame (`:363`) dispatched before slot
+       installation (`sync_conn.go:119`), so Bulk/Config frames
+       could mutate receive state before a slot token exists
+       (`sync_conn_read.go:183, :298`) — the lane rejects every
+       other type at demux with strict size, admission, and
+       deadline bounds; the reset capability is restricted to
+       AUTHENTICATED peers (unkeyed setups perform no
+       authentication at all, `sync_auth.go:321` — they get NO
+       reset lane and use the time-barrier/legacy path); and
+       the hello binds the stable node ID AND the current
+       process incarnation, revalidated before any barrier
+       mutation — a stale-incarnation frame is discarded);
+       and the
        connection installs only after BOTH reset triples have
        drained and ACK'd), and an
        equal-generation `RESET_ACK` is idempotent so the loser
@@ -1431,7 +1443,14 @@ attacker-poisonable):**
        the journal epoch/terminal sequence (v9.9.33 — this
        supersedes the earlier "ACK echoing the exact repair ID":
        the discharge point is the marker, never a bare `BulkEnd`
-       or bulk ACK); a legacy sender ignores the
+       or bulk ACK — and the DIRECTIONS are explicit (v9.9.39,
+       round-46 Codex B1: the RECEIVER's INBOUND obligation and
+       its readiness clear ONLY after APPLYING the exact
+       `JOURNAL_END`; the SENDER's OUTBOUND obligation AND the
+       cold-prime latch clear ONLY after the matching
+       full-triple `JOURNAL_ACK` — a bare `BulkAck(u64)` or a
+       `BulkEnd` write never clears either, `sync_conn.go:194`,
+       `sync_bulk.go:282`); a legacy sender ignores the
        request, and the receiver falls back to (a) after a
        bounded wait; unnegotiated peers always use (a). The repair
        path's stream hygiene is explicit (v9.9.27, round-40 Codex
@@ -1550,7 +1569,24 @@ attacker-poisonable):**
        EVERY family side effect (forward, reverse, DNAT) is one
        epoch-validated transaction — each write validates the
        presented token epoch, and a superseded epoch rolls the
-       whole family write back atomically).
+       whole family write back atomically; and the transaction
+       is serialized with replacement (v9.9.39, round-46 Codex
+       H2: T1 can write its forward row
+       (`session_store.go:274`), T2 can replace T1 while helper
+       IPC has released `m.mu` (`manager_ha.go:1779`), and T1
+       resumes at the reverse/DNAT writes
+       (`session_store.go:284, :289`) — a blind snapshot
+       rollback (`session_store.go:237`) could restore prior
+       rows over T2, while declining rollback leaves T1's
+       partial family; and reverse writes bypass helper
+       validation today (`manager_ha.go:1125`): the family
+       transaction holds a shared FAMILY-TRANSACTION PERMIT
+       from its first write to its last, `replace(T1, T2)`
+       DRAINS or CAS-invalidates outstanding family permits
+       before retargeting, and the rollback is token-conditional
+       CAS per preimage — a preimage is restored only if the
+       row's current token still matches T1, never a blind
+       restore-over).
        and the canonical transaction (Go AND the mirrored Rust
        side) checks the presented token's validity and
        repair-era authorization ATOMICALLY with the
@@ -1891,16 +1927,13 @@ attacker-poisonable):**
        an ACK for obligation O1's bulk after a second overflow
        O2, must never discharge the current obligation): the
        RECEIVER keeps an INBOUND-REPAIR obligation, cleared only
-       at the `JOURNAL-END` marker (v9.9.31, round-42 Codex H5 —
-       this supersedes the earlier "cleared on a clean post-reset
-       `BulkEnd`": `JOURNAL-END` carries and validates the exact
-       current repair ID plus the journal epoch/terminal
-       sequence, and only that validation discharges; a clean
-       `BulkEnd` commits the bulk but NEVER clears the
-       obligation); the SENDER keeps an
-       OUTBOUND-BULK obligation, cleared only on the exact ACK
-       for a bulk STARTED after the applicable obligation
-       generation — not "any epoch ≥ pending"; and a FAILED
+       after APPLYING the exact `JOURNAL_END` (v9.9.39,
+       round-46 Codex B1 — direction-explicit); the SENDER keeps an
+       OUTBOUND-BULK obligation, cleared only at the matching
+       full-triple `JOURNAL_ACK` (v9.9.39 — this supersedes
+       "the exact ACK for a bulk started after the applicable
+       obligation generation" and every other bulk-ACK
+       discharge; a bare `BulkAck(u64)` never clears); and a FAILED
        redrive is explicitly re-kicked (while
        `bulkRedriveInFlight` is set, another disconnect loses the
        CAS trigger and completion currently only clears the
@@ -4252,9 +4285,13 @@ admitted interval):
   driver closes BOTH fabrics (receiver-side, no wire change —
   cold-prime on reconnect drives the full bulk), with the
   rolling-gated RESYNC_REQUEST fast path for negotiated pairs and
-  SEQUENCED DISCHARGE (only a loss-free bulk initiated after the
-  raising — ACK epoch above every in-flight epoch at raising —
-  clears it; a pre-overflow or in-flight ACK does not), and a
+  SEQUENCED DISCHARGE (v9.9.39: the receiver's inbound
+  obligation clears only after APPLYING the exact
+  `JOURNAL_END`; the sender's outbound obligation and the
+  cold-prime latch clear only at the matching full-triple
+  `JOURNAL_ACK` — this supersedes the earlier "ACK epoch above
+  every in-flight epoch at raising" clause; a pre-overflow,
+  in-flight, or bare-epoch ACK never clears), and a
   stuck apply repeats at bulk cadence with the takeover fence
   keeping the node not-transfer-ready until its published epoch
   reaches the peer's high-water AND its parked queues are empty
@@ -4388,7 +4425,21 @@ admitted interval):
   contract (join deadline; migration WRITE never held across
   quiesce/join; failure leaves XSK disabled + readiness
   degraded); and the Arc-vs-cell single-counter assertion (no
-  release path outside the cell's zero transition). (e) the typed undo receipt — `NoChange` replay rolls
+  release path outside the cell's zero transition). (d8)
+  v9.9.37-39 boundaries (round-46 Codex L4): cold-prime waits
+  for `JOURNAL_ACK` (a `BulkEnd` write never releases the
+  latch); receipt expiry plus a late old marker (discarded);
+  the exact-T2 query after a lost replace ACK (stale aborted
+  attempts never match); replacement concurrent with a family
+  transaction (the permit drains/CAS-invalidates before
+  retarget; rollback is token-conditional per preimage);
+  reset-lane frame rejection and current-incarnation fencing
+  (non-RESET types dropped; stale incarnation discarded;
+  unkeyed peers get no lane); the pending-rejection GC wakeup
+  (persistent P freed at GC notifies; a third-flow reclaim
+  re-arms); old-family DNAT cleanup (the immutable record
+  covers the reverse/DNAT aliases); and the teardown latch
+  clearing after a late worker exit (rebind then permitted). (e) the typed undo receipt — `NoChange` replay rolls
   back nothing (pre-existing ownership untouched), `Inserted`/
   `Retained` undo exactly their mutation, and `Replaced(old_state)`
   with a FAILED new claim reinstates the displaced record's tuple +
