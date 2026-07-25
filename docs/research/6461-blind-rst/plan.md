@@ -1270,7 +1270,15 @@ attacker-poisonable):**
        predates the barrier generation (immediate close), so an
        async handshake completing mid-barrier can never occupy a
        slot — the both-empty state at barrier end is guaranteed
-       by the fence, not by timing alone.
+       by the fence, not by timing alone. The generation's
+       mechanics are pinned (v9.9.28, round-41 SMR F1): the
+       ACCEPT side checks the barrier BEFORE admission (no new
+       setup starts during the barrier — the generation recheck
+       then only catches setups already in flight at the bump);
+       and the generation is a per-peer atomic whose bump AND
+       whose comparison both happen under `s.mu` (the slot-
+       registry lock), so a setup racing the bump cannot slip an
+       install between the bump and the fence arming.
        B's inbound-repair obligation is DURABLE —
        a pathological miss (no bulk arrives) never clears it, and
        B escalates to a second close-both with exponential backoff
@@ -1317,7 +1325,16 @@ attacker-poisonable):**
        discarded, never published — absence reconciliation
        records no tombstone, `sync.go:1080`, so the fence, not
        the transport, is the ordering guarantee off the pinned
-       stream). The repair
+       stream; the fence's sufficiency rests on the in-order
+       argument (v9.9.28, round-41 SMR F2: the receiver's own
+       `close()` of a reset stream discards its kernel receive
+       buffer, so only application-accepted stragglers exist;
+       those were accepted in stream order BEFORE the repair and
+       route to the armed-repair freeze buffer — they flush
+       AFTER the repair's `BulkEnd`, the correct recency; and a
+       straggler cannot masquerade as a repair member — the
+       message types differ and the repair members carry the ID
+       echo). The repair
        ID also orders the repair's CONTENTS, not just its
        completion (v9.9.23, round-38 Codex B2: `BulkSync` pins one
        connection (`sync_bulk.go:53`) while queued incrementals
@@ -1409,7 +1426,15 @@ attacker-poisonable):**
        commits in bounded chunks with the generation-map commit
        last, so an interrupted repair leaves the pre-repair
        generation state intact and the next repair resumes
-       rather than restarting); and a bulk
+       rather than restarting; the intermediate state is the
+       SAFE direction (v9.9.28, round-41 SMR F4: the dataplane
+       never consults the generation map for forwarding — it is
+       the sync protocol's stale detector — so a crash mid-commit
+       leaves some keys' gen records OLDER than their installed
+       state, and a subsequent stale-generation message for such
+       a key is REFUSED (fail toward retention) until the next
+       resend carries the fresh generation — never a wrong
+       delete); and a bulk
        whose ID is not the current repair ID is WHOLLY
        NON-MUTATING — its `BulkStart` does not `resetRecvGen`,
        its installs do not publish, its BulkEnd neither
@@ -1738,7 +1763,15 @@ attacker-poisonable):**
        GroupHold pin), and the conversion is conditioned on a
        VERSIONED identity/origin recheck serialized with commit
        (the demoted entry's origin/identity version at reserve
-       time must equal the version at publish-commit — an
+       time must equal the version at publish-commit — the
+       version is `install_epoch`, the worker-local mutation
+       counter rewritten on update AND promotion
+       (`session/mod.rs:761, :1384` — v9.9.28, round-41 SMR F3:
+       this is the version for THIS purpose, while
+       `admission_config_version` remains the write-once admission
+       stamp and is NOT; the recheck reads
+       `(install_epoch, SessionIdentity)` inside the entry's
+       table critical section — an
        intervening local re-promotion (`promote.rs:99`) bumps the
        version, the commit fails the recheck, and the
        `Converted(old_state)` undo restores the direct hold
