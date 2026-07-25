@@ -1402,11 +1402,23 @@ attacker-poisonable):**
        `{current, pending, retired}` and every slot/pre-slot
        lane under ONE lock (`s.mu`): a different incarnation
        first DRAINS/REVOKES the current incarnation's handlers
-       and lanes, then ATOMICALLY retires current and promotes
+       and lanes — a drain that CANNOT hang (v9.9.42, round-48
+       SMR F1: the superseded connection's natural death — TCP
+       reset or the silence teardown — completes the drain
+       automatically, because the handlers die with the
+       connection; the atomic step never waits on anything
+       other than an already-dying lane) — then ATOMICALLY
+       retires current and promotes
        pending; the `(node_id, incarnation, lane_token)`
        triple is rechecked immediately before every mutation;
        a retired incarnation is never readopted; and a
-       reset-generation high-water is kept PER INCARNATION, so
+       reset-generation high-water is kept PER INCARNATION,
+       STARTING FRESH (v9.9.42, round-48 SMR F2: the high-water
+       is per `(node_id, incarnation)`; a new incarnation
+       inherits NOTHING from its predecessor — the old
+       high-water retires with the old incarnation — so n3 can
+       neither be confused with n2's retired state nor starved
+       by it), so
        n1's frames can never pass n2's lane);
        and the
        connection installs only after BOTH reset triples have
@@ -3885,9 +3897,25 @@ consolidated v9.9.35, round-44 Codex B3: EVERY repair frame,
 namespace, capability, terminal ACK, receipt rule, and discharge
 predicate lives HERE, additive and rolling-gated like the
 identity tails): the capability handshake exchanges
-`(capacity, capacity_config_generation, heartbeat-ack-capable,
+`(node_id, process_incarnation, capacity,
+capacity_config_generation, heartbeat-ack-capable,
 identity-enforcement-capable, lease-input-capable,
-repair-vN, reset-vN)` — the two protocol-version bits are
+repair-vN, reset-vN)` — the identity fields are part of the
+AUTHENTICATED HELLO TRANSCRIPT (v9.9.41, round-47 Codex M3:
+the canonical transcript — node ID, process incarnation,
+capabilities, nonces — is authenticated inside the
+authenticated frame wrapper, so `AUTH_PROOF` covers the whole
+transcript, not a bare nonce (`sync_auth.go:217`); the
+transcript's encoding is canonical (v9.9.42, round-48 SMR F3:
+an ORDERED field list, each field length-prefixed, fields in
+the tuple's declared order — node_id, process_incarnation,
+capacity, capacity_config_generation, the capability bits,
+nonces — so two implementations compute byte-identical
+transcripts and verify the same proof); and the RESET-only
+allowlist explicitly includes the handshake sequence (HELLO
+transcript → capability exchange → `AUTH_PROOF(transcript)` →
+`RESET_GEN`/`RESET_ACK`), so the required proof is never an
+implicit exception) — the two protocol-version bits are
 explicit (v9.9.37, round-45 Codex H7: an intermediate peer can
 support identity/heartbeat features while speaking only legacy
 `BulkEnd`/`BulkAck`, and without the version bits a new node
