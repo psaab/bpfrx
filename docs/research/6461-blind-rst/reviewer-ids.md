@@ -36,6 +36,9 @@
 | r11 | Codex (gpt-5.5 via codex-companion, resumed session) | task-mrztzy3r-cn3tgd (18m56s, completed) | PLAN NO (7 BLOCKER, 1 HIGH, 3 MEDIUM) | codex-plan-r11.md |
 | r11 | AGY (direct binary, scoped run) | r11-agy-out1 | 3xUNSOUND (mark rules vs raw seeds — enforcement at constructors stated; reservation released ~3T before alias purge — release drives purge v8.3; text contradictions — swept) | agy-plan-r11.md |
 | r11 | Claude SMR | in-conversation | PLAN NO for v8.2/v8.3 — all eleven Codex findings adjudicated; v8.4 folds (no read-touch, one canonical family clock + lock order, mark on the Phase-2 tail, owner gate by node identity, coordinator-sequenced bundles, AnchorStreamStart + typed observed_ns freshness + atomic epoch activation, forward-mint inheritance + conditional DeleteSynced + Close codec fields, honest resource-retention framing, ~104B cost) | claude-smr-plan-r11.md |
+| r12 | Codex (gpt-5.5 via codex-companion, resumed session) | task-mrzvbi3h-3kaqng (6m03s, content-filter turn failure mid-analysis); resumed task-mrzvmwvx-xz909e (6m45s, completed) | PLAN NO (5 BLOCKER, 4 HIGH, 4 MEDIUM) — the round that triggered the v9 restructure; found the pre-existing NAT release bug (filed #6522) | codex-plan-r12.md |
+| r12 | AGY (direct binary, scoped run) | out1 (agent error), out2 (retry, full) | 3xSOUND (mutation inventory, overlap flap safety, non-owner poisoning blocked) + 1 text contradiction (fixed v8.4.1) | agy-plan-r12.md |
+| r12 | Claude SMR | in-conversation | PLAN NO for v8.4-as-single-ship — answered by the v9 CONVERGENCE RESTRUCTURE (Part A ships the gate, Part B minimal machinery, Phase 2 split to its own research track, #6522 filed and verified) | claude-smr-plan-r12.md |
 
 Infra notes (per feedback_codex_infra_must_retry — all retries documented):
 - Codex: 10m client timeout kill → job found alive server-side → polled 25+ min →

@@ -1,0 +1,26 @@
+# AGY hostile plan review — round 12 — #6461
+
+Reviewer: Antigravity (jetski 1.1.6, direct `agy --print`, built-in file tools only, scoped sections). Scope: plan v8.4. Run ledger: out1 (agent execution error), out2 (retry, full). Transcript: .scratch/r12-agy-out2.txt (verbatim below).
+
+---
+
+### Design Review Verdicts (#6461 Plan v8.4)
+
+#### (1) Shared-State Mutation Paths & Family Clock — SOUND
+- **Shared-State Mutation Paths:** 
+  1. `materialize` ([shared_ops.rs:L824](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/shared_ops.rs#L824))
+  2. `promote` ([promote.rs:L71](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/session_glue/promote.rs#L71))
+  3. `replicate` ([upsert_synced.rs:L35](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/session_glue/commands/upsert_synced.rs#L35), [delete_synced.rs:L20](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/session_glue/commands/delete_synced.rs#L20))
+  4. `refresh_owner_rgs` ([refresh_owner_rgs.rs:L40](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/session_glue/commands/refresh_owner_rgs.rs#L40))
+  5. `batched push` ([shared_ops.rs:L897](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/shared_ops.rs#L897))
+  6. `demote_owner_rgs` ([shared_ops.rs:L161](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/shared_ops.rs#L161), [demote_owner_rgs.rs:L24](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/session_glue/commands/demote_owner_rgs.rs#L24))
+- **Analysis:** `demote_shared_owner_rgs` is a 6th shared mutation path. It retags `origin = SyncImport` on failover without calling the flow event stamp helper, which is correct because HA demotion is administrative metadata maintenance, not flow activity. Restricting clock updates to flow event/push helpers while keeping reads inert ([plan.md:L744-L761](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/docs/research/6461-blind-rst/plan.md#L744-L761)) prevents attacker-refreshed clock DoS while resolving incoherent clone sweeps.
+
+#### (2) Owner Gate & VRRP Overlap Flapping — SOUND
+- **Analysis:** During VRRP failover overlap, the owner gate checks `writer_node == current_owner(rg)` per local HA state ([plan.md:L1608-L1625](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/docs/research/6461-blind-rst/plan.md#L1608-L1625), [plan.md:L1849](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/docs/research/6461-blind-rst/plan.md#L1849)). The receiver merges bundles via lexicographic `(bulk_epoch, coord_seqno)` ordering ([plan.md:L1616-L1618](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/docs/research/6461-blind-rst/plan.md#L1616-L1618)). A delayed frame from Node A with a lower `coord_seqno` than Node B's state under the same `bulk_epoch` is dropped. Even if updates apply out-of-order, both nodes observe legitimate packet sequences ([plan.md:L1607-L1615](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/docs/research/6461-blind-rst/plan.md#L1607-L1615)), preserving valid TCP sequence window baselines without corrupting state or inducing false closes.
+
+#### (3) Pre-FabricRedirect Poisoned Local Anchor — SOUND
+- **Analysis:** Updating a non-owner local replica anchor before `FabricRedirect` ([plan.md:L1733-L1736](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/docs/research/6461-blind-rst/plan.md#L1733-L1736)) cannot trigger local Close delta emission because Close authority strictly requires `owner_rg_active(owner_rg_id)` ([plan.md:L661](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/docs/research/6461-blind-rst/plan.md#L661)), which evaluates to false on standby nodes. Wire propagation to peers is blocked at receiving nodes by the wire owner gate `writer_node == current_owner(rg)` ([plan.md:L1481-L1483](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/docs/research/6461-blind-rst/plan.md#L1481-L1483), [plan.md:L1849](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/docs/research/6461-blind-rst/plan.md#L1849)).
+
+#### (4) Plan-Text Contradictions — UNSOUND
+- **Analysis:** A direct contradiction exists in §5.2 between bullet (a) and bullet (c). [plan.md:L744](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/docs/research/6461-blind-rst/plan.md#L744) states `Reads do NOT touch (v8.4, round-11 Codex 1)... reads need no clock`, whereas [plan.md:L757](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/docs/research/6461-blind-rst/plan.md#L757) states `every family event/read/push on any member... stamps the CANONICAL record's last_touch_ns`. Bullet (c) erroneously retains `/read/` in its trigger list, contradicting the normative read-touch elimination in bullet (a) and header line 3 ([plan.md:L3](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/docs/research/6461-blind-rst/plan.md#L3)).
