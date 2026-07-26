@@ -226,7 +226,7 @@ pub(super) fn poll_binding_process_descriptor(
                 let FabricIngressOutcome {
                     ingress_zone_override,
                     packet_fabric_ingress,
-                } = stage_classify_fabric_ingress(packet_frame, &mut meta, worker_ctx);
+                } = stage_classify_fabric_ingress(packet_frame, &mut meta, now_secs, worker_ctx);
                 // #946 Phase 1 stage 10: screen / IDS slow-path.
                 // Caller still owns the recycle push (matches
                 // original code's pattern).
@@ -278,6 +278,7 @@ pub(super) fn poll_binding_process_descriptor(
                     &binding.live,
                     worker_ctx,
                     now_ns,
+                    now_secs,
                 ) {
                     IpsecPassthroughOutcome::NotClaimed => {}
                     IpsecPassthroughOutcome::Passthrough => {
@@ -937,98 +938,25 @@ pub(super) fn poll_binding_process_descriptor(
                         let resolution_target =
                             parse_packet_destination_from_frame(packet_frame, meta)
                                 .unwrap_or(flow.dst_ip);
-                        // Cluster peer return fast path:
-                        // a packet arriving from zone-encoded fabric ingress has already
-                        // been policy/NAT-validated by the active owner. Allow the inactive
-                        // peer to hand it to the resolved local egress zone instead of
-                        // treating it as a brand-new flow. Keep pure TCP SYN excluded so
-                        // brand-new connects still require local session ownership.
-                        if let Some((fabric_return_decision, fabric_return_metadata)) =
-                            cluster_peer_return_fast_path(
-                                worker_ctx.forwarding,
-                                worker_ctx.dynamic_neighbors,
-                                packet_frame,
-                                meta,
-                                ingress_zone_override,
-                                resolution_target,
-                            )
-                        {
-                            let ingress_ident = BindingIdentity {
-                                slot: binding.slot,
-                                queue_id: binding.queue_id,
-                                worker_id: binding.worker_id,
-                                interface: binding.interface.clone(),
-                                ifindex: binding.ifindex,
-                            };
-                            if let Some(mut request) = build_live_forward_request_from_frame(
-                                worker_ctx.binding_lookup,
-                                binding_index,
-                                &ingress_ident,
-                                desc,
-                                packet_frame,
-                                meta,
-                                &fabric_return_decision,
-                                worker_ctx.forwarding,
-                                Some(flow),
-                                None,
-                                false,
-                                now_ns,
-                                worker_ctx.event_stream,
-                                None,
-                                None,
-                                // #3608: output-filter `then reject` on the
-                                // fabric-return forward emits the active reply
-                                // rather than silently dropping.
-                                Some(ForwardRejectReply {
-                                    tx_pipeline: &mut binding.tx_pipeline,
-                                    counters: telemetry.counters,
-                                }),
-                                // #5606: mirror the peer-return session metadata's
-                                // NAT64 reverse info onto the request. Always
-                                // `None` today — the peer-return fast path builds
-                                // metadata with `nat64_reverse: None` (the active
-                                // owner already validated/translated) — but reading
-                                // the Copy field here (before the metadata is moved
-                                // into the install below) keeps the invariant
-                                // uniform. Correctness-by-construction no-op.
-                                fabric_return_metadata.nat64_reverse,
-                            ) {
-                                request.frame = owned_packet_frame
-                                    .take()
-                                    .map(PendingForwardFrame::Owned)
-                                    .unwrap_or(PendingForwardFrame::Live);
-                                if sessions.install_with_protocol_with_origin(
-                                    flow.forward_key.clone(),
-                                    fabric_return_decision,
-                                    fabric_return_metadata,
-                                    SessionOrigin::ReverseFlow,
-                                    now_ns,
-                                    meta.protocol,
-                                    meta.tcp_flags,
-                                ) {
-                                    // #1789: a failed publish leaves the
-                                    // shim without this key (NO_SESSION
-                                    // degraded path). Count it; one
-                                    // Relaxed fetch_add on the rare error
-                                    // branch only.
-                                    if publish_live_session_entry(
-                                        binding.bpf_maps.session_map_fd,
-                                        &flow.forward_key,
-                                        NatDecision::default(),
-                                        true,
-                                    )
-                                    .is_err()
-                                    {
-                                        binding
-                                            .live
-                                            .session_publish_errors
-                                            .fetch_add(1, Ordering::Relaxed);
-                                    }
-                                }
-                                binding.scratch.scratch_forwards.push(request);
-                                continue;
-                            }
-                        }
+                        // #6478: the cluster-peer return fast path was REMOVED.
+                        // It fast-pathed session-less fabric-ingress TCP
+                        // SYN-ACK / ACK / ICMP echo-reply forms into a NAT-less
+                        // `SessionOrigin::ReverseFlow` seed gated only on the
+                        // forgeable zone-encoded stamp — after #6458's stamp
+                        // validation a forged frame can still pass V1 on any
+                        // node whose claimed zone's RG is remote, so the seed
+                        // stayed forgeable. Session-less fabric-ingress
+                        // packets now take the normal miss path below: policy
+                        // under the #6458-validated zone, NAT applied, a
+                        // FORWARD session when permitted (the Junos
+                        // no-syn-check asymmetric pickup, #3152). The sync-race
+                        // sub-window the fast path covered (a peer-punted
+                        // return packet arriving before its synced session)
+                        // reverts to a bounded drop, which the #6478 verifier
+                        // explicitly prefers over unauthenticated seeding; a
+                        // genuine established flow's return is still served by
+                        // the synced session in `resolve_flow_session_decision`
+                        // before this point.
 
                         // --- DNAT pre-routing ---
                         // #6473: Junos evaluates static NAT BEFORE
@@ -1491,6 +1419,22 @@ pub(super) fn poll_binding_process_descriptor(
                         // at the pre-routing DNAT site above — the pre-routing NAT
                         // scope and the zone-pair policy now share ONE logical-unit
                         // ingress identity.
+                        // #6458 V2: a zone-encoded fabric stamp drives
+                        // NEW-flow policy only when the resolution's owner
+                        // RG is forwarding-active LOCALLY (the peer punts a
+                        // new flow to us only because we own its egress
+                        // RG). Otherwise the stamp is ignored and the
+                        // fabric interface's own zone governs. Shadow the
+                        // override so every zone-pair consumer below (this
+                        // site, the NAT scope borrows, and the
+                        // MissingNeighbor arm) sees the gated value.
+                        let ingress_zone_override = gate_fabric_zone_override_on_owner_rg(
+                            worker_ctx.forwarding,
+                            worker_ctx.ha_state,
+                            now_secs,
+                            ingress_zone_override,
+                            resolution,
+                        );
                         let (from_zone_id, to_zone_id) = zone_pair_ids_for_flow_with_override(
                             worker_ctx.forwarding,
                             ingress_logical,
@@ -1682,12 +1626,12 @@ pub(super) fn poll_binding_process_descriptor(
                         // local session from this packet. Legitimate teardowns
                         // for a SYNCED peer-owned session are session HITs served
                         // by `resolve_flow_session_decision` before the fast path;
-                        // a session-MISS fabric-ingress bare RST/FIN now falls
-                        // through `cluster_peer_return_fast_path` (which REFUSES
-                        // it per #4453) and is dropped RIGHT HERE by this
-                        // strict-syn-check — so the local guard and the #4453
-                        // fabric arm give consistent bare-RST/FIN handling on
-                        // both the local and fabric-ingress paths.
+                        // a session-MISS fabric-ingress bare RST/FIN is dropped
+                        // RIGHT HERE by this strict-syn-check (#6478 removed the
+                        // cluster-peer return fast path — session-less
+                        // fabric-ingress packets take this normal miss path), so
+                        // the local and fabric-ingress paths handle a bare
+                        // RST/FIN identically.
                         // Counted in the aggregate `screen_drops` flow-statistics
                         // tally (no per-reason ordinal — that array mirrors the
                         // Junos SCREEN checks, and strict-syn-check is a flow
@@ -3353,6 +3297,20 @@ pub(super) fn poll_binding_process_descriptor(
                         base_resolution
                     };
 
+                    // #6458 V2: honor the zone-encoded fabric stamp for this
+                    // flowless enforcement only when the resolution's owner RG
+                    // is forwarding-active locally (mirrors the flow-backed
+                    // session-miss gate above); otherwise the stamp is ignored
+                    // and the fabric interface's own zone governs the transit
+                    // policy (3) and host-inbound local-delivery (4) checks.
+                    let ingress_zone_override = gate_fabric_zone_override_on_owner_rg(
+                        worker_ctx.forwarding,
+                        worker_ctx.ha_state,
+                        now_secs,
+                        ingress_zone_override,
+                        final_resolution,
+                    );
+
                     // (3) Zone security policy — only for TRANSIT
                     //     (ForwardCandidate). Local delivery (host-inbound) is
                     //     #3292; NoRoute drops anyway; MissingNeighbor keeps its
@@ -4084,6 +4042,18 @@ pub(super) fn poll_binding_process_descriptor(
                                     meta.ingress_vlan_id,
                                 )
                                 .unwrap_or(meta.ingress_ifindex as i32);
+                                // #6458 V2: same owner-RG binding as the
+                                // ForwardCandidate session-miss gate above —
+                                // a zone-encoded fabric stamp is honored here
+                                // only when the decision's owner RG is
+                                // forwarding-active locally.
+                                let ingress_zone_override = gate_fabric_zone_override_on_owner_rg(
+                                    worker_ctx.forwarding,
+                                    worker_ctx.ha_state,
+                                    now_secs,
+                                    ingress_zone_override,
+                                    decision.resolution,
+                                );
                                 let (from_zone_id, to_zone_id) = zone_pair_ids_for_flow_with_override(
                                     worker_ctx.forwarding,
                                     ingress_logical,

@@ -338,7 +338,13 @@ pub(in crate::afxdp::icmp_embed) fn build_nat_reversed_icmp_error_v6(
 ///     value (`nat.rewrite_src_port`), the tuple the remote replied to;
 ///   * outer ICMP checksum recomputed over the whole message.
 /// The quoted L4 checksum is left unchanged (informational — a receiver
-/// does not validate it), mirroring the #5690 reversed builders' policy.
+/// does not validate it). For TCP/UDP quotes this mirrors the #5690
+/// reversed builders' policy exactly; an ICMP-echo quote through an
+/// echo-id-translating SNAT is the one nuance — the rewritten echo id is
+/// covered by the quoted echo's ORIGINAL checksum (the #5690 builders
+/// adjust that layer with `checksum16_adjust`; this builder deliberately
+/// does not, matching the no-mainstream-stack-validates-quoted-checksums
+/// posture; the outer ICMP checksum receivers DO validate IS recomputed).
 /// The outer destination and the quote's source are untouched — the
 /// error is addressed to the remote server, which is exactly who must
 /// associate it.

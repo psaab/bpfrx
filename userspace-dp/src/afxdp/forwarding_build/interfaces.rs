@@ -340,6 +340,37 @@ pub(super) fn populate_egress(
     Ok(())
 }
 
+/// #6458: build `state.zone_to_rgs` — zone ID → deduplicated
+/// redundancy-group IDs (> 0) of the zone's member interfaces. Runs after
+/// [`populate_egress`] so both inputs (`ifindex_to_zone_id` and
+/// `EgressInterface.redundancy_group`) are final. A zone whose members are
+/// all RG-unbound (mgmt/fxp0, control/em0+fab, node-specific physical
+/// interfaces) or that has no members is ABSENT from the map; the
+/// fabric-ingress zone-stamp validation
+/// (`forwarding::fabric::zone_encoded_fabric_stamp_valid`) treats an absent
+/// zone as "can never be legitimately stamped" — a zone-encoded stamp
+/// claims the packet ingressed the PEER in that zone, which is only
+/// possible when the zone participates in RG ownership.
+pub(super) fn populate_zone_to_rgs(state: &mut ForwardingState) {
+    for (ifindex, zone_id) in state.ifindex_to_zone_id.iter() {
+        if *zone_id == 0 {
+            continue;
+        }
+        let rg = state
+            .egress
+            .get(ifindex)
+            .map(|iface| iface.redundancy_group)
+            .unwrap_or(0);
+        if rg <= 0 {
+            continue;
+        }
+        let rgs = state.zone_to_rgs.entry(*zone_id).or_default();
+        if !rgs.contains(&rg) {
+            rgs.push(rg);
+        }
+    }
+}
+
 /// #2388: canonical (v4, v6) connected-route table names for a routing
 /// instance. The empty instance name is the default instance
 /// (inet.0 / inet6.0); a named instance maps to "<ri>.inet.0" /

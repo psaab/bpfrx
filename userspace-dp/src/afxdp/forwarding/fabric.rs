@@ -182,6 +182,182 @@ pub(in crate::afxdp) fn ingress_is_fabric(forwarding: &ForwardingState, ingress_
     })
 }
 
+/// #6458: the fabric link whose parent OR overlay ifindex is
+/// `ingress_ifindex`, or `None` when the ingress is not a fabric. Single
+/// source of truth for the parent-or-overlay match so the identity check
+/// below and [`ingress_is_fabric`] cannot drift.
+pub(in crate::afxdp) fn fabric_for_ingress(
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+) -> Option<&FabricLink> {
+    forwarding.fabrics.iter().find(|fabric| {
+        fabric.parent_ifindex == ingress_ifindex || fabric.overlay_ifindex == ingress_ifindex
+    })
+}
+
+/// #6458: validate a zone-encoded fabric-ingress stamp against the fabric
+/// link identity and live RG ownership. A stamped frame claims "this
+/// packet ingressed the PEER in zone `zone_id`, and the peer punted it
+/// here" — an L2-adjacent host on the fabric segment can forge the magic
+/// bytes and compute any configured zone's `StableZoneID` offline, so the
+/// stamp is honored only when the frame ALSO looks like something the
+/// peer actually sent:
+///
+/// - **V1a — unicast to our fabric link.** The frame's destination MAC
+///   must equal the matched fabric link's `local_mac`. The legitimate
+///   sender always redirects to the peer's fabric MAC
+///   (`resolve_fabric_redirect_from_list` sets
+///   `neighbor_mac = fabric.peer_mac`; on the IPVLAN fabric the peer's
+///   neighbor MAC is the same MAC the receiver reports as `local_mac`).
+///   This rejects broadcast/multicast sprays and frames addressed to a
+///   third party.
+/// - **V1b — RG binding.** The claimed zone must have at least one
+///   RG-bound member interface (`zone_to_rgs`), and NOT ALL of its bound
+///   RGs may be forwarding-active LOCALLY — at least one must be
+///   peer-active for the stamp to hold. When every RG the zone spans is
+///   primary on the RECEIVER, traffic in that zone ingresses locally —
+///   the peer has no business stamping it (on a single-primary cluster
+///   this rejects every stamp on the primary; the policy teeth are V2's
+///   owner-RG gate regardless). A zone spanning MULTIPLE RGs on a
+///   split-RG node (one locally active, one peer-active) still accepts:
+///   the peer legitimately punts the flows it owns (review-fold — the
+///   NONE-active form over-rejected that legitimate active/active
+///   stamp). A zone with no RG-bound members (`mgmt`/fxp0,
+///   `control`/em0+fab, empty zones) can never be legitimately stamped,
+///   which kills the host-inbound variant's `mgmt` claim.
+///
+/// What this deliberately does NOT try to stop: on a SHARED fabric
+/// segment with a live RG split, an attacker can clone the exact stamp
+/// shape of a currently-legitimate punt (remote-RG zone, unicast dst) —
+/// indistinguishable from the real thing at L2. That residual is closed
+/// only by a direct-attached or MACsec fabric; see
+/// `docs/fabric-cross-chassis-fwd.md` (#6458 section).
+///
+/// Hot-path: runs only for frames that already matched the fabric-ingress
+/// + magic + zone-exists gates in
+/// `parse_zone_encoded_fabric_ingress_from_frame`. One 6-byte compare, one
+/// `zone_to_rgs` hash lookup, and one `ha_state` lookup per bound RG
+/// (typically one). No allocation, no atomics.
+pub(in crate::afxdp) fn zone_encoded_fabric_stamp_valid(
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    now_secs: u64,
+    frame_dst_mac: &[u8],
+    ingress_ifindex: i32,
+    zone_id: u16,
+) -> bool {
+    let Some(fabric) = fabric_for_ingress(forwarding, ingress_ifindex) else {
+        return false;
+    };
+    // V1a: the redirect is always unicast to our fabric link's MAC.
+    if frame_dst_mac != fabric.local_mac.as_slice() {
+        return false;
+    }
+    // V1b: the claimed zone must be RG-bound, and NOT ALL of its RGs may
+    // be forwarding-active locally — at least one must be peer-active
+    // (reject only when EVERY bound RG is locally active: the single-
+    // primary kill with no multi-RG-zone over-rejection). An absent/empty
+    // entry means the zone has no RG-bound members and can never be
+    // legitimately stamped.
+    match forwarding.zone_to_rgs.get(&zone_id) {
+        Some(rgs) => {
+            !rgs.is_empty()
+                && !rgs.iter().all(|rg| {
+                    ha_state
+                        .get(rg)
+                        .is_some_and(|group| group.is_forwarding_active(now_secs))
+                })
+        }
+        None => false,
+    }
+}
+
+/// #6458: V2 owner binding for the session-MISS zone-pair computation. A
+/// (V1-validated) zone-encoded stamp drives NEW-flow policy / NAT scope /
+/// host-inbound evaluation only when the packet's resolved owner RG is
+/// forwarding-active LOCALLY — the peer punts a new flow to us only
+/// because WE own its egress RG (split-RG active/active or an asymmetric
+/// failover window). On a single-primary backup nothing is locally
+/// active, so every stamp degrades to the fabric interface's own zone
+/// (default-deny) there. The resolution's owner RG is identical before
+/// and after `finalize_new_flow_ha_resolution` for a fabric-ingress
+/// packet, so gating here at the zone-pair site covers the final
+/// resolution.
+#[inline]
+pub(in crate::afxdp) fn gate_fabric_zone_override_on_owner_rg(
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    now_secs: u64,
+    ingress_zone_override: Option<u16>,
+    resolution: ForwardingResolution,
+) -> Option<u16> {
+    let zone = ingress_zone_override?;
+    let owner_rg = owner_rg_for_resolution(forwarding, resolution);
+    if owner_rg > 0
+        && ha_state
+            .get(&owner_rg)
+            .is_some_and(|group| group.is_forwarding_active(now_secs))
+    {
+        Some(zone)
+    } else {
+        None
+    }
+}
+
+/// #6458 (review fold): owner RG of a LOCAL (firewall-owned) address —
+/// the redundancy group of the egress interface whose primary address
+/// matches, 0 when no RG-bound interface owns it. Used by the IKE
+/// host-inbound variant of the V2 owner binding: a stamped zone may drive
+/// host-inbound admission for an address only when THAT address's RG is
+/// forwarding-active locally (on a single-primary backup no local address
+/// is locally active, so every stamped host-inbound admission degrades to
+/// the fabric interface's own zone — default-deny).
+pub(in crate::afxdp) fn owner_rg_for_local_address(
+    forwarding: &ForwardingState,
+    ip: IpAddr,
+) -> i32 {
+    forwarding
+        .egress
+        .values()
+        .find(|iface| match ip {
+            IpAddr::V4(v4) => iface.primary_v4 == Some(v4),
+            IpAddr::V6(v6) => iface.primary_v6 == Some(v6),
+        })
+        .map(|iface| iface.redundancy_group.max(0))
+        .unwrap_or_default()
+}
+
+/// #6458 (review fold): V2 owner binding for HOST-DESTINED packets (the
+/// Stage-11 IKE host-inbound gate). Mirrors
+/// [`gate_fabric_zone_override_on_owner_rg`] but resolves the owner RG
+/// from the packet's local destination address instead of a forwarding
+/// resolution — a stamped zone drives host-inbound admission only when
+/// the destination address's owner RG is forwarding-active LOCALLY. A
+/// forged stamp to a backup's reth address (owner RG primary on the peer)
+/// is stripped, so the fabric interface's own zone governs (default-deny)
+/// and a forged NEW IKE initiation is denied instead of seeding the
+/// #6471 live-exchange table.
+#[inline]
+pub(in crate::afxdp) fn gate_fabric_zone_override_on_local_owner_rg(
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    now_secs: u64,
+    ingress_zone_override: Option<u16>,
+    dst_ip: IpAddr,
+) -> Option<u16> {
+    let zone = ingress_zone_override?;
+    let owner_rg = owner_rg_for_local_address(forwarding, dst_ip);
+    if owner_rg > 0
+        && ha_state
+            .get(&owner_rg)
+            .is_some_and(|group| group.is_forwarding_active(now_secs))
+    {
+        Some(zone)
+    } else {
+        None
+    }
+}
+
 pub(in crate::afxdp) fn ingress_is_fabric_overlay(
     forwarding: &ForwardingState,
     ingress_ifindex: i32,
@@ -297,17 +473,11 @@ pub(in crate::afxdp) fn resolve_fabric_redirect_from_list(
     })
 }
 
-pub(in crate::afxdp) fn resolve_zone_encoded_fabric_redirect(
-    forwarding: &ForwardingState,
-    ingress_zone: &str,
-) -> Option<ForwardingResolution> {
-    let zone_id = forwarding.zone_name_to_id.get(ingress_zone).copied()?;
-    resolve_zone_encoded_fabric_redirect_by_id(forwarding, zone_id)
-}
-
-/// #919/#922: ID-keyed variant of `resolve_zone_encoded_fabric_redirect`.
-/// Avoids the name-string round-trip when the caller already has a u16
-/// zone ID (e.g. from `SessionMetadata.ingress_zone`).
+/// #919/#922: ID-keyed zone-encoded redirect. Avoids the name-string
+/// round-trip: every caller already has a u16 zone ID (e.g. from
+/// `SessionMetadata.ingress_zone`). #6478: the name-keyed wrapper was
+/// removed with the cluster-peer return fast path (its last production
+/// caller); tests use this ID-keyed form directly.
 pub(in crate::afxdp) fn resolve_zone_encoded_fabric_redirect_by_id(
     forwarding: &ForwardingState,
     zone_id: u16,
@@ -386,107 +556,3 @@ pub(in crate::afxdp) fn prefer_local_forward_candidate_for_fabric_ingress(
     resolution
 }
 
-pub(in crate::afxdp) fn cluster_peer_return_fast_path(
-    forwarding: &ForwardingState,
-    dynamic_neighbors: &Arc<ShardedNeighborMap>,
-    packet_frame: &[u8],
-    meta: UserspaceDpMeta,
-    ingress_zone_override: Option<u16>,
-    resolution_target: IpAddr,
-) -> Option<(SessionDecision, SessionMetadata)> {
-    if !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32) {
-        return None;
-    }
-    let ingress_zone = ingress_zone_override?;
-    if is_icmp_echo_request(packet_frame, meta) {
-        return None;
-    }
-    // #2151: `is_initial_syn` == the prior
-    // `(tcp_flags & SYN) != 0 && (tcp_flags & ACK) == 0` — a bare
-    // connection-opening SYN has no peer-owned session to return for.
-    if meta.protocol == PROTO_TCP && crate::tcp_flags::is_initial_syn(meta.tcp_flags) {
-        return None;
-    }
-    // #4453: a bare TCP RST/FIN (closing flags, SYN clear) is the same
-    // session-less phantom-closing packet the LOCAL session-miss path drops
-    // via the #4400 strict-syn-check (`strict_syn_check_drops_new_flow` ==
-    // PROTO_TCP && is_closing && !has_syn). It carries no return value: a real
-    // established flow's RST/FIN is served by the synced session in
-    // `resolve_flow_session_decision` before this point. Without this arm, a
-    // transit bare RST/FIN to a locally-HAInactive RG is converted to a
-    // FabricRedirect (safety net) and forwarded to the peer, where it arrives
-    // as fabric ingress and gets fast-pathed into a NAT-less
-    // `SessionOrigin::ReverseFlow` seed — installing on the peer, via the
-    // trusted fabric path, exactly the immediately-closing session the peer's
-    // own #4400 guard prevents locally. Exclude it here (SAME predicate as
-    // #4400) so it falls through to the peer's normal forward decision, whose
-    // session-miss guard drops it — no reverse seed. This completes the
-    // fast-path invariant: fire ONLY for provably-return traffic (exclude the
-    // TCP initial SYN, the ICMP echo request, all UDP, AND the bare RST/FIN).
-    if meta.protocol == PROTO_TCP
-        && crate::tcp_flags::is_closing(meta.tcp_flags)
-        && !crate::tcp_flags::has_syn(meta.tcp_flags)
-    {
-        return None;
-    }
-    // #4439/#4414: this fast path may fire ONLY for packets that are provably
-    // RETURN traffic — the reverse direction of a flow the active owner
-    // already policy/NAT-validated. That requires a protocol with a
-    // packet-level flow-initiator marker so the initiating (forward) form can
-    // be told apart from the return form, and the initiator is excluded above:
-    // TCP excludes the initial SYN (and the bare RST/FIN, #4453); ICMP/ICMPv6
-    // exclude the echo REQUEST. Every OTHER protocol — UDP (#4439), and
-    // likewise ESP/AH/GRE/SCTP/OSPF/… (the #4414 residual) — has NO such
-    // marker: any datagram can open a new flow, and there is no
-    // "non-initiating" form to key on. A session-less packet of one of these
-    // protocols reaching here (a real established reply is served by the
-    // synced session in `resolve_flow_session_decision` before this point) is
-    // therefore a NEW forward flow, NOT return traffic. Fast-pathing it built
-    // a NAT-less, reverse-keyed session for a forward flow — the source-NAT a
-    // new outbound flow requires was skipped (NAT bypass) and the owner
-    // recorded the flow in the wrong direction (session-state corruption).
-    // Refuse every protocol that is not TCP or ICMP/ICMPv6 so it falls through
-    // to the RG owner's normal forward decision: source-NAT applied and a
-    // FORWARD session installed. (Subsumes the #4439 UDP-only guard.)
-    if !matches!(meta.protocol, PROTO_TCP | PROTO_ICMP | PROTO_ICMPV6) {
-        return None;
-    }
-
-    let fabric_return_resolution =
-        lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, resolution_target);
-    if fabric_return_resolution.disposition != ForwardingDisposition::ForwardCandidate {
-        return None;
-    }
-    // #921: direct ifindex → u16 lookup (was a two-hop name round-trip).
-    let egress_zone = forwarding
-        .ifindex_to_zone_id
-        .get(&fabric_return_resolution.egress_ifindex)
-        .copied()?;
-    let metadata = SessionMetadata {
-        ingress_zone,
-        egress_zone,
-        owner_rg_id: owner_rg_for_resolution(forwarding, fabric_return_resolution),
-        fabric_ingress: true,
-        is_reverse: true,
-        nat64_reverse: None,
-        // #2508: fabric-return reverse seed carries no local per-policy
-        // `then log` selection (the admitting node logs).
-        log_session_init: false,
-        log_session_close: false,
-        // #3056: the fabric-return reverse seed is created on the peer-forwarding
-        // node, which never ran the admitting policy — leave the policy ID unset.
-        policy_id: 0,
-        inactivity_timeout_ns: None,
-        // #3073: peer-forwarded fabric-return seed; no local admitting rule, so
-        // no per-rule hit counter.
-        policy_counter_idx: 0,
-        policy_counter: None,
-    };
-    Some((
-        SessionDecision {
-            resolution: fabric_return_resolution,
-            nat: NatDecision::default(),
-        },
-        metadata,
-    ))
-}

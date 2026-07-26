@@ -48,6 +48,45 @@
   forwarding/tests.rs} (constructor field),
   userspace-dp/src/afxdp/README.md, _Log.md
 
+## 2026-07-24 — #6458 (review fold): IKE local-owner V2 gate + multi-RG V1b refinement
+
+- **Timestamp**: 2026-07-24 (fix/6458-fabric-zone-stamp-validation)
+- **Action**: Folded the hostile review's two PoC-proven findings on the
+  #6458 stamp validation. (1) MEDIUM/security: the Stage-11 IKE
+  host-inbound gate consumed the V1-only stamp — a forged stamped NEW IKE
+  initiation to a single-primary backup's reth address was Passthrough AND
+  seeded the #6471 live-exchange table for forged Responder-SPI follow-ups.
+  `ike_host_inbound_deny_zone` now shadows the override through the new
+  `gate_fabric_zone_override_on_local_owner_rg` (fabric.rs), the V2 owner
+  binding resolved from the packet's local destination address via
+  `owner_rg_for_local_address` (EgressInterface primary_v4/v6 → RG) — on a
+  backup no local address is locally active, so the forged stamp degrades
+  to the fabric zone (default-deny). (2) MEDIUM/availability: V1b
+  over-rejected zones spanning multiple RGs on split nodes (one locally
+  active + one peer-active RG killed the legitimate active/active punt).
+  The NONE-active condition is now ALL-active: reject only when EVERY
+  bound RG is forwarding-active locally (single-primary kill preserved;
+  V2 remains the policy teeth). (3) LOW (filter-log zone misattribution on
+  V1-passing spoofed stamps) is deferred as an accepted residual — no
+  verdict impact, noted in the PR. Docs posture section updated to match
+  (the "host-inbound variant is dead" claim is now true; multi-RG
+  behavior documented).
+- **File(s)**: userspace-dp/src/afxdp/forwarding/fabric.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/poll_stages_tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  docs/fabric-cross-chassis-fwd.md, _Log.md
+- **Validation**: new pins `gate_fabric_zone_override_on_local_owner_rg_6458`
+  (owner resolution + active/inactive/no-RG/no-stamp cases) and
+  `zone_encoded_fabric_stamp_honored_for_multi_rg_zone_split_6458`
+  (split-accept + all-local-reject); RED proven firsthand on the V1b
+  refinement (reverted to NONE-active → multi-RG pin FAILS with the
+  over-rejection; restored → 12/12 6458-tagged green); the IKE gate's RED
+  was proven by the hostile reviewer's stage-level PoC (stamped
+  Passthrough pre-fold). Full crate suite 4211 passed / 0 failed;
+  poll_stages_tests' 17 stage-11 call sites carry the new now_secs arg
+  unmodified.
 ## 2026-07-26 — #6472: NAT64 ICMP error translation on the flowless arm
 
 - **Timestamp**: 2026-07-26 (fix/6472-nat64-icmp-error-translation)
@@ -61423,3 +61462,35 @@ top.
     userspace-dp/src/afxdp/{coordinator/status.rs,coordinator/tests.rs,
     cos/cross_binding.rs,neighbor_dispatch.rs,tx/stats.rs,types/cos.rs},
     docs/pr/6436-binding-state-extract/plan.md, _Log.md
+- **Timestamp**: 2026-07-26
+- **Action**: #6458 fabric zone-encoded src-MAC trust validation (PR1):
+  stamp honored only on unicast dst == fabric local_mac (V1a) + claimed
+  zone RG-bound and not locally forwarding-active (V1b, stage 9) +
+  resolution owner RG locally forwarding-active (V2, session-miss zone
+  pairs). New ForwardingState.zone_to_rgs. Fail-on-revert unit tests +
+  poll-loop e2e pins (RED verified by neutralizing V1b / V2); split-RG
+  legit punt preservation pins. Full cargo suite 4241 passed / 0 failed.
+- **File(s)**: userspace-dp/src/afxdp/types/forwarding.rs,
+    userspace-dp/src/afxdp/forwarding_build/{mod.rs,interfaces.rs},
+    userspace-dp/src/afxdp/forwarding/{fabric.rs,tests.rs},
+    userspace-dp/src/afxdp/frame/inspect.rs,
+    userspace-dp/src/afxdp/poll_stages.rs,
+    userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+    userspace-dp/src/afxdp/{mod.rs,tests_fabric_zone_stamp.rs},
+    docs/fabric-cross-chassis-fwd.md,
+    docs/pr/6458-fabric-zone-stamp/plan.md, _Log.md
+- **Timestamp**: 2026-07-26
+- **Action**: #6478 remove cluster_peer_return_fast_path (PR2, stacked on
+  the #6458 PR): the fast path adopted session-less fabric-ingress
+  SYN-ACK / ACK / echo-reply forms into a NAT-less ReverseFlow seed gated
+  on the forgeable zone stamp. Deleted the fn + call site + its guard
+  tests + newly-dead is_icmp_echo_request and the name-keyed
+  resolve_zone_encoded_fabric_redirect wrapper; session-less fabric
+  packets now take the normal policy/NAT miss path. Fail-on-revert
+  verified against the pre-removal commit (both new tests return
+  Some(ReverseFlow) there); split-RG legit punt still admitted.
+- **File(s)**: userspace-dp/src/afxdp/forwarding/{fabric.rs,mod.rs,tests.rs},
+    userspace-dp/src/afxdp/frame/tests_ports_live_forward.rs,
+    userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+    userspace-dp/src/afxdp/tests_fabric_zone_stamp.rs,
+    docs/fabric-cross-chassis-fwd.md, _Log.md

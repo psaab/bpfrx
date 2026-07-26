@@ -500,6 +500,9 @@ mod tests_icmp_reject_reversal;
 #[path = "tests_embedded_poll_filter.rs"]
 mod tests_embedded_poll_filter;
 #[cfg(test)]
+#[path = "tests_fabric_zone_stamp.rs"]
+mod tests_fabric_zone_stamp;
+#[cfg(test)]
 #[path = "tests_slow_path_disposition.rs"]
 mod tests_slow_path_disposition;
 #[cfg(test)]

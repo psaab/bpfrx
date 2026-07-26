@@ -367,7 +367,8 @@ fn build_forwarding_state_uses_fabric_snapshot_macs_without_parent_interface() {
 fn zone_encoded_fabric_redirect_preserves_ingress_zone() {
     let state = build_forwarding_state(&nat_snapshot_with_fabric());
     let redirected =
-        resolve_zone_encoded_fabric_redirect(&state, "lan").expect("zone-encoded redirect");
+        resolve_zone_encoded_fabric_redirect_by_id(&state, TEST_LAN_ZONE_ID)
+        .expect("zone-encoded redirect");
     assert_eq!(
         redirected.disposition,
         ForwardingDisposition::FabricRedirect
@@ -391,6 +392,9 @@ fn zone_encoded_fabric_redirect_round_trips_zone_id_above_255() {
     let mut state = build_forwarding_state(&nat_snapshot_with_fabric());
     let zone_id: u16 = 300; // 0x012c — above the old u8 cap
     state.zone_id_to_name.insert(zone_id, "highzone".into());
+    // #6458: a configured high-id zone is RG-bound (a reth member), so the
+    // stamp validation finds it in `zone_to_rgs`.
+    state.zone_to_rgs.insert(zone_id, vec![2]);
 
     // Encode: the src MAC carries 300 as 02:bf:72:fe:01:2c.
     let redirected = resolve_zone_encoded_fabric_redirect_by_id(&state, zone_id)
@@ -400,8 +404,12 @@ fn zone_encoded_fabric_redirect_round_trips_zone_id_above_255() {
         Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x01, 0x2c])
     );
 
-    // Decode: the same MAC parses back to 300.
+    // Decode: the same MAC parses back to 300. #6458: the frame must be
+    // unicast to the fabric link's local MAC and the claimed zone's RG (2)
+    // must not be forwarding-active locally — an empty ha_state satisfies
+    // both here.
     let mut frame = vec![0u8; 64];
+    frame[0..6].copy_from_slice(&[0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]);
     frame[6..12].copy_from_slice(&[0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x01, 0x2c]);
     let mut area = MmapArea::new(4096).expect("mmap");
     area.slice_mut(0, frame.len())
@@ -424,6 +432,8 @@ fn zone_encoded_fabric_redirect_round_trips_zone_id_above_255() {
             },
             meta,
             &state,
+            &BTreeMap::new(),
+            0,
         ),
         Some(zone_id)
     );
@@ -433,6 +443,9 @@ fn zone_encoded_fabric_redirect_round_trips_zone_id_above_255() {
 fn parse_zone_encoded_fabric_ingress_uses_zone_override() {
     let state = build_forwarding_state(&nat_snapshot_with_fabric());
     let mut frame = vec![0u8; 64];
+    // #6458: the legitimate stamp is unicast to the fabric link's local MAC
+    // (02:bf:72:ff:00:01 on ifindex 21 in this fixture).
+    frame[0..6].copy_from_slice(&[0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]);
     frame[6..12].copy_from_slice(&[0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x01]);
     let mut area = MmapArea::new(4096).expect("mmap");
     area.slice_mut(0, frame.len())
@@ -455,8 +468,303 @@ fn parse_zone_encoded_fabric_ingress_uses_zone_override() {
             },
             meta,
             &state,
+            // The lan zone's RG (2) is NOT forwarding-active locally (empty
+            // ha_state) — the split-RG shape the stamp exists for.
+            &BTreeMap::new(),
+            0,
         ),
         Some(TEST_LAN_ZONE_ID)
+    );
+}
+
+// #6458 fail-on-revert: a zone-encoded stamp addressed to something OTHER
+// than the fabric link's own local MAC is not a peer redirect — the
+// legitimate sender always unicasts to `FabricLink.local_mac`. Before the
+// fix the decode ignored the destination MAC entirely and returned
+// `Some(zone)` for this frame (magic + zone-exists only).
+#[test]
+fn zone_encoded_fabric_stamp_rejected_on_non_unicast_dst_6458() {
+    let state = build_forwarding_state(&nat_snapshot_with_fabric());
+    let mut frame = vec![0u8; 64];
+    // dst = all-zero (a spray / off-target frame), NOT 02:bf:72:ff:00:01.
+    frame[6..12].copy_from_slice(&[0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x01]);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 21,
+        ..UserspaceDpMeta::default()
+    };
+    assert_eq!(
+        parse_zone_encoded_fabric_ingress_from_frame(frame.as_slice(), meta, &state, &BTreeMap::new(), 0),
+        None,
+        "stamp with a non-fabric destination MAC must be ignored"
+    );
+}
+
+// #6458 fail-on-revert: the claimed zone's RG is forwarding-active LOCALLY
+// — on this node `lan` (RG 2) traffic ingresses directly, so the peer has
+// no business stamping it. This is the single-primary-node case that
+// rejects EVERY stamp on the RG owner. Before the fix the decode returned
+// `Some(lan)` and the attacker picked the ingress zone.
+#[test]
+fn zone_encoded_fabric_stamp_rejected_when_claimed_zone_rg_local_6458() {
+    let state = build_forwarding_state(&nat_snapshot_with_fabric());
+    let now_secs = monotonic_nanos() / 1_000_000_000;
+    let ha_state = BTreeMap::from([(2, active_ha_runtime(now_secs))]);
+    let mut frame = vec![0u8; 64];
+    frame[0..6].copy_from_slice(&[0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]);
+    frame[6..12].copy_from_slice(&[0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x01]);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 21,
+        ..UserspaceDpMeta::default()
+    };
+    assert_eq!(
+        parse_zone_encoded_fabric_ingress_from_frame(frame.as_slice(), meta, &state, &ha_state, now_secs),
+        None,
+        "stamp claiming a locally-primary zone must be ignored"
+    );
+}
+
+// #6458 fail-on-revert: a zone with NO RG-bound member interfaces
+// (mgmt/fxp0, control/em0+fab, or an empty zone) can never be legitimately
+// stamped — node-specific traffic is never punted across the fabric. This
+// kills the host-inbound variant's `mgmt` claim. Before the fix any
+// configured zone name hashed to an accepted id.
+#[test]
+fn zone_encoded_fabric_stamp_rejected_for_zone_without_rg_members_6458() {
+    let mut state = build_forwarding_state(&nat_snapshot_with_fabric());
+    let mgmt_id: u16 = 9;
+    state.zone_id_to_name.insert(mgmt_id, "mgmt".into());
+    // No zone_to_rgs entry: mgmt has no RG-bound members.
+    let mut frame = vec![0u8; 64];
+    frame[0..6].copy_from_slice(&[0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]);
+    frame[6..12].copy_from_slice(&[0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x09]);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 21,
+        ..UserspaceDpMeta::default()
+    };
+    assert_eq!(
+        parse_zone_encoded_fabric_ingress_from_frame(frame.as_slice(), meta, &state, &BTreeMap::new(), 0),
+        None,
+        "stamp claiming a zone with no RG-bound members must be ignored"
+    );
+}
+
+// #6458 preservation pin: the legitimate split-RG shape — claimed zone
+// `lan` (RG 2) is NOT forwarding-active locally while a DIFFERENT RG (1)
+// is — plus the unicast fabric dst MAC — keeps the override working.
+#[test]
+fn zone_encoded_fabric_stamp_honored_for_remote_rg_zone_6458() {
+    let state = build_forwarding_state(&nat_snapshot_with_fabric());
+    let now_secs = monotonic_nanos() / 1_000_000_000;
+    let ha_state = BTreeMap::from([(1, active_ha_runtime(now_secs))]);
+    let mut frame = vec![0u8; 64];
+    frame[0..6].copy_from_slice(&[0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]);
+    frame[6..12].copy_from_slice(&[0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x01]);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 21,
+        ..UserspaceDpMeta::default()
+    };
+    assert_eq!(
+        parse_zone_encoded_fabric_ingress_from_frame(frame.as_slice(), meta, &state, &ha_state, now_secs),
+        Some(TEST_LAN_ZONE_ID),
+        "legitimate split-RG stamp must keep working"
+    );
+}
+
+// #6458 (review fold) preservation pin — the multi-RG-zone refinement. A
+// zone spanning TWO redundancy groups (reth1.0→RG2 + reth2.0→RG1, both
+// `lan`) on a split-RG node: one bound RG locally active, one peer-active.
+// V1b must ACCEPT the legitimate punt stamp (the NONE-active form
+// over-rejected this shape and default-denied active/active new flows).
+// The kill is preserved only when EVERY bound RG is locally active (the
+// single-primary posture for a multi-RG zone).
+#[test]
+fn zone_encoded_fabric_stamp_honored_for_multi_rg_zone_split_6458() {
+    let mut state = build_forwarding_state(&nat_snapshot_with_fabric());
+    let now_secs = monotonic_nanos() / 1_000_000_000;
+    // lan spans RG 1 and RG 2 in this fixture mutation.
+    state.zone_to_rgs.insert(TEST_LAN_ZONE_ID, vec![1, 2]);
+    let mut frame = vec![0u8; 64];
+    frame[0..6].copy_from_slice(&[0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]);
+    frame[6..12].copy_from_slice(&[0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x01]);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 21,
+        ..UserspaceDpMeta::default()
+    };
+    // Split node: RG 1 locally active, RG 2 peer-active → accept (the
+    // peer owns part of the zone and legitimately punts its flows).
+    let split = BTreeMap::from([
+        (1, active_ha_runtime(now_secs)),
+        (2, inactive_ha_runtime(now_secs)),
+    ]);
+    assert_eq!(
+        parse_zone_encoded_fabric_ingress_from_frame(frame.as_slice(), meta, &state, &split, now_secs),
+        Some(TEST_LAN_ZONE_ID),
+        "multi-RG zone with a peer-active RG must keep the legitimate stamp"
+    );
+    // Every bound RG locally active → reject (the kill shape).
+    let all_local = BTreeMap::from([
+        (1, active_ha_runtime(now_secs)),
+        (2, active_ha_runtime(now_secs)),
+    ]);
+    assert_eq!(
+        parse_zone_encoded_fabric_ingress_from_frame(frame.as_slice(), meta, &state, &all_local, now_secs),
+        None,
+        "multi-RG zone with every RG locally active must still reject the stamp"
+    );
+}
+
+// #6458 fail-on-revert (V2 owner binding): a validated stamp drives
+// NEW-flow zone-pair policy only when the resolution's owner RG is
+// forwarding-active locally. The egress in this fixture is reth0.80
+// (ifindex 12, RG 1). Before the fix there was no gate — the override
+// passed straight through.
+#[test]
+fn gate_fabric_zone_override_on_owner_rg_6458() {
+    let state = build_forwarding_state(&nat_snapshot_with_fabric());
+    let now_secs = monotonic_nanos() / 1_000_000_000;
+    let resolution = ForwardingResolution {
+        disposition: ForwardingDisposition::ForwardCandidate,
+        local_ifindex: 0,
+        egress_ifindex: 12,
+        tx_ifindex: 12,
+        tunnel_endpoint_id: 0,
+        next_hop: None,
+        neighbor_mac: None,
+        src_mac: None,
+        tx_vlan_id: 0,
+    };
+    // Owner RG (1) locally active -> honored (legitimate punt).
+    let active = BTreeMap::from([(1, active_ha_runtime(now_secs))]);
+    assert_eq!(
+        gate_fabric_zone_override_on_owner_rg(
+            &state,
+            &active,
+            now_secs,
+            Some(TEST_LAN_ZONE_ID),
+            resolution,
+        ),
+        Some(TEST_LAN_ZONE_ID)
+    );
+    // Owner RG present but NOT forwarding-active -> stripped (backup node).
+    let inactive = BTreeMap::from([(1, inactive_ha_runtime(now_secs))]);
+    assert_eq!(
+        gate_fabric_zone_override_on_owner_rg(
+            &state,
+            &inactive,
+            now_secs,
+            Some(TEST_LAN_ZONE_ID),
+            resolution,
+        ),
+        None
+    );
+    // Owner RG absent from ha_state (startup window / not local) -> stripped.
+    assert_eq!(
+        gate_fabric_zone_override_on_owner_rg(
+            &state,
+            &BTreeMap::new(),
+            now_secs,
+            Some(TEST_LAN_ZONE_ID),
+            resolution,
+        ),
+        None
+    );
+    // No stamp -> None in, None out.
+    assert_eq!(
+        gate_fabric_zone_override_on_owner_rg(&state, &active, now_secs, None, resolution),
+        None
+    );
+}
+
+// #6458 (review fold) fail-on-revert: the HOST-DESTINED (Stage-11 IKE)
+// variant of the V2 owner binding. A stamped zone drives host-inbound
+// admission for a local address only when THAT address's owner RG is
+// forwarding-active locally — on a single-primary backup a forged stamp to
+// the backup's reth address (172.16.80.8 on reth0.80, RG 1 in this fixture)
+// is stripped, so the forged NEW IKE initiation degrades to the fabric
+// zone (default-deny) instead of seeding the #6471 live-exchange table.
+#[test]
+fn gate_fabric_zone_override_on_local_owner_rg_6458() {
+    let state = build_forwarding_state(&nat_snapshot_with_fabric());
+    let now_secs = monotonic_nanos() / 1_000_000_000;
+    let reth_addr = IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 80, 8));
+    // The fixture maps the local address to its interface's RG.
+    let owner = owner_rg_for_local_address(&state, reth_addr);
+    assert_eq!(owner, 1, "reth0.80's primary address must resolve to RG 1");
+    // Owner RG (1) locally active -> honored (legitimate punt of a
+    // host-inbound flow we own).
+    let active = BTreeMap::from([(1, active_ha_runtime(now_secs))]);
+    assert_eq!(
+        gate_fabric_zone_override_on_local_owner_rg(
+            &state,
+            &active,
+            now_secs,
+            Some(TEST_LAN_ZONE_ID),
+            reth_addr,
+        ),
+        Some(TEST_LAN_ZONE_ID)
+    );
+    // Owner RG NOT forwarding-active (single-primary backup) -> stripped:
+    // the forged stamped IKE initiation falls to the fabric zone.
+    let inactive = BTreeMap::from([(1, inactive_ha_runtime(now_secs))]);
+    assert_eq!(
+        gate_fabric_zone_override_on_local_owner_rg(
+            &state,
+            &inactive,
+            now_secs,
+            Some(TEST_LAN_ZONE_ID),
+            reth_addr,
+        ),
+        None
+    );
+    // A destination with no RG-bound owning interface (owner 0 — e.g. the
+    // fabric peer address or an lo0 address) -> stripped, never trusted.
+    let no_rg_dst = IpAddr::V4(std::net::Ipv4Addr::new(10, 99, 13, 1));
+    assert_eq!(owner_rg_for_local_address(&state, no_rg_dst), 0);
+    assert_eq!(
+        gate_fabric_zone_override_on_local_owner_rg(
+            &state,
+            &active,
+            now_secs,
+            Some(TEST_LAN_ZONE_ID),
+            no_rg_dst,
+        ),
+        None
+    );
+    // No stamp -> None in, None out.
+    assert_eq!(
+        gate_fabric_zone_override_on_local_owner_rg(&state, &active, now_secs, None, reth_addr),
+        None
+    );
+}
+
+// #6458: the zone -> RG-bound-member map drives the RG-binding check. The
+// fixture's lan (reth1.0, RG 2) and wan (reth0.80, RG 1) zones map to
+// their single RGs; the fabric parent (ge-0/0/0, RG 0, unzoned here)
+// contributes nothing.
+#[test]
+fn zone_to_rgs_built_from_member_redundancy_groups_6458() {
+    let state = build_forwarding_state(&nat_snapshot_with_fabric());
+    assert_eq!(state.zone_to_rgs.get(&TEST_LAN_ZONE_ID), Some(&vec![2]));
+    assert_eq!(state.zone_to_rgs.get(&TEST_WAN_ZONE_ID), Some(&vec![1]));
+    assert!(
+        state.zone_to_rgs.len() == 2,
+        "only RG-bound zones are mapped: {:?}",
+        state.zone_to_rgs
     );
 }
 
@@ -839,318 +1147,6 @@ fn fabric_originated_reverse_session_uses_zone_encoded_fabric_redirect_when_clie
     );
 }
 
-#[test]
-fn cluster_peer_return_fast_path_allows_sfmix_to_lan_reply() {
-    let mut state = build_forwarding_state(&native_gre_pbr_snapshot(true));
-    state.fabrics.push(FabricLink {
-        parent_ifindex: 4,
-        overlay_ifindex: 104,
-        peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
-        peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
-        local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
-        up: true,
-    });
-    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
-    dynamic_neighbors.insert(
-        (5, IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
-        NeighborEntry {
-            mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
-        },
-    );
-    let meta = UserspaceDpMeta {
-        ingress_ifindex: 4,
-        protocol: PROTO_ICMP,
-        l4_offset: 0,
-        ..UserspaceDpMeta::default()
-    };
-    let packet_frame = [0u8];
-
-    let (decision, metadata) = cluster_peer_return_fast_path(
-        &state,
-        &dynamic_neighbors,
-        &packet_frame,
-        meta,
-        Some(TEST_SFMIX_ZONE_ID),
-        IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
-    )
-    .expect("fabric return fast path");
-
-    assert_eq!(
-        decision.resolution.disposition,
-        ForwardingDisposition::ForwardCandidate
-    );
-    assert_eq!(decision.resolution.egress_ifindex, 5);
-    assert_eq!(metadata.ingress_zone, 5);
-    assert_eq!(metadata.egress_zone, 1);
-    assert!(metadata.fabric_ingress);
-    assert!(metadata.is_reverse);
-}
-
-#[test]
-fn cluster_peer_return_fast_path_skips_udp_new_flow_4439() {
-    // #4439: a session-less UDP datagram arriving on the fabric is a NEW
-    // forward flow, not return traffic (UDP has no packet-level initiator
-    // marker like TCP SYN / ICMP echo-request). It MUST fall through to the
-    // owner's forward decision — source-NAT applied + a FORWARD session
-    // installed — not be fast-pathed as a NAT-less reverse seed. This is the
-    // exact `_allows_sfmix_to_lan_reply` setup (whose ICMP-reply target
-    // resolves to a ForwardCandidate) with the protocol flipped to UDP: on
-    // revert the fast path returns Some (the reverse seed / NAT bypass), so
-    // asserting None is RED-on-revert. The ICMP-reply test above proves the
-    // legitimate return-traffic fast path is preserved.
-    let mut state = build_forwarding_state(&native_gre_pbr_snapshot(true));
-    state.fabrics.push(FabricLink {
-        parent_ifindex: 4,
-        overlay_ifindex: 104,
-        peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
-        peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
-        local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
-        up: true,
-    });
-    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
-    dynamic_neighbors.insert(
-        (5, IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
-        NeighborEntry {
-            mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
-        },
-    );
-    let meta = UserspaceDpMeta {
-        ingress_ifindex: 4,
-        protocol: PROTO_UDP,
-        l4_offset: 0,
-        ..UserspaceDpMeta::default()
-    };
-    let packet_frame = [0u8];
-
-    assert!(
-        cluster_peer_return_fast_path(
-            &state,
-            &dynamic_neighbors,
-            &packet_frame,
-            meta,
-            Some(TEST_SFMIX_ZONE_ID),
-            IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
-        )
-        .is_none()
-    );
-}
-
-#[test]
-fn cluster_peer_return_fast_path_skips_markerless_proto_new_flow_4414() {
-    // #4414: the #4439 UDP exclusion left every OTHER markerless protocol
-    // (ESP, AH, GRE, SCTP, OSPF, …) still adopted by the fast path. Like UDP
-    // they have no packet-level flow-initiator marker, so a session-less
-    // datagram of one of these protocols arriving on the fabric is a NEW
-    // forward flow, not return traffic. It MUST fall through to the owner's
-    // forward decision — source-NAT applied + a FORWARD session installed —
-    // not be fast-pathed into a NAT-less `SessionOrigin::ReverseFlow` seed
-    // (NAT bypass + reverse-seed session corruption). This is the exact
-    // `_allows_sfmix_to_lan_reply` / `_skips_udp_new_flow_4439` setup (whose
-    // target resolves to a ForwardCandidate) with the protocol flipped to each
-    // markerless L4: on revert the fast path returns Some (the reverse seed /
-    // NAT bypass), so asserting None is RED-on-revert. The ICMP-reply test
-    // proves the legitimate return-traffic fast path is preserved.
-    let mut state = build_forwarding_state(&native_gre_pbr_snapshot(true));
-    state.fabrics.push(FabricLink {
-        parent_ifindex: 4,
-        overlay_ifindex: 104,
-        peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
-        peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
-        local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
-        up: true,
-    });
-    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
-    dynamic_neighbors.insert(
-        (5, IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
-        NeighborEntry {
-            mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
-        },
-    );
-    for proto in [
-        crate::ip_proto::PROTO_ESP,
-        crate::ip_proto::PROTO_AH,
-        crate::ip_proto::PROTO_GRE,
-        crate::ip_proto::PROTO_SCTP,
-        crate::ip_proto::PROTO_OSPF,
-    ] {
-        let meta = UserspaceDpMeta {
-            ingress_ifindex: 4,
-            protocol: proto,
-            l4_offset: 0,
-            ..UserspaceDpMeta::default()
-        };
-        let packet_frame = [0u8];
-        assert!(
-            cluster_peer_return_fast_path(
-                &state,
-                &dynamic_neighbors,
-                &packet_frame,
-                meta,
-                Some(TEST_SFMIX_ZONE_ID),
-                IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
-            )
-            .is_none(),
-            "markerless proto {proto} must not fast-path a NAT-less reverse seed"
-        );
-    }
-}
-
-#[test]
-fn cluster_peer_return_fast_path_skips_bare_rst_fin_4453() {
-    // #4453: a bare TCP RST/FIN (closing flags, no SYN) arriving on the
-    // fabric is a session-less phantom-closing packet with no return value —
-    // the exact packet the LOCAL #4400 strict-syn-check drops on a session
-    // miss. It MUST fall through to the owner's forward decision (where the
-    // peer's own session-miss guard drops it), NOT be fast-pathed into a
-    // NAT-less `SessionOrigin::ReverseFlow` seed. This is the same
-    // `_allows_sfmix_to_lan_reply` setup (whose target resolves to a
-    // ForwardCandidate) with a bare RST / FIN / FIN|ACK: on revert the fast
-    // path returns Some (the reverse seed installed on the peer via the
-    // fabric path), so asserting None is RED-on-revert. The ICMP-reply test
-    // above proves the legitimate return-traffic fast path is preserved, and
-    // the SYN test below proves the initial-SYN exclusion is untouched.
-    let mut state = build_forwarding_state(&native_gre_pbr_snapshot(true));
-    state.fabrics.push(FabricLink {
-        parent_ifindex: 4,
-        overlay_ifindex: 104,
-        peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
-        peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
-        local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
-        up: true,
-    });
-    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
-    dynamic_neighbors.insert(
-        (5, IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
-        NeighborEntry {
-            mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
-        },
-    );
-    for flags in [
-        crate::tcp_flags::TCP_RST,
-        crate::tcp_flags::TCP_FIN,
-        crate::tcp_flags::TCP_FIN | crate::tcp_flags::TCP_ACK,
-        crate::tcp_flags::TCP_RST | crate::tcp_flags::TCP_ACK,
-    ] {
-        let meta = UserspaceDpMeta {
-            ingress_ifindex: 4,
-            protocol: PROTO_TCP,
-            tcp_flags: flags,
-            l4_offset: 0,
-            ..UserspaceDpMeta::default()
-        };
-        let packet_frame = [0u8];
-        assert!(
-            cluster_peer_return_fast_path(
-                &state,
-                &dynamic_neighbors,
-                &packet_frame,
-                meta,
-                Some(TEST_SFMIX_ZONE_ID),
-                IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
-            )
-            .is_none(),
-            "bare closing flags {flags:#04x} must not fast-path a reverse seed"
-        );
-    }
-}
-
-#[test]
-fn cluster_peer_return_fast_path_skips_pure_tcp_syn() {
-    let mut state = build_forwarding_state(&native_gre_pbr_snapshot(true));
-    state.fabrics.push(FabricLink {
-        parent_ifindex: 4,
-        overlay_ifindex: 104,
-        peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
-        peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
-        local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
-        up: true,
-    });
-    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
-    let meta = UserspaceDpMeta {
-        ingress_ifindex: 4,
-        protocol: PROTO_TCP,
-        tcp_flags: TCP_FLAG_SYN,
-        ..UserspaceDpMeta::default()
-    };
-
-    assert!(
-        cluster_peer_return_fast_path(
-            &state,
-            &dynamic_neighbors,
-            &[],
-            meta,
-            Some(TEST_SFMIX_ZONE_ID),
-            IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
-        )
-        .is_none()
-    );
-}
-
-#[test]
-fn cluster_peer_return_fast_path_skips_icmp_echo_request() {
-    let mut state = build_forwarding_state(&native_gre_pbr_snapshot(true));
-    state.fabrics.push(FabricLink {
-        parent_ifindex: 4,
-        overlay_ifindex: 104,
-        peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
-        peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
-        local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
-        up: true,
-    });
-    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
-    let meta = UserspaceDpMeta {
-        ingress_ifindex: 4,
-        protocol: PROTO_ICMP,
-        l4_offset: 0,
-        ..UserspaceDpMeta::default()
-    };
-    let packet_frame = [8u8];
-
-    assert!(
-        cluster_peer_return_fast_path(
-            &state,
-            &dynamic_neighbors,
-            &packet_frame,
-            meta,
-            Some(TEST_LAN_ZONE_ID),
-            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-        )
-        .is_none()
-    );
-}
-
-#[test]
-fn cluster_peer_return_fast_path_skips_icmpv6_echo_request() {
-    let mut state = build_forwarding_state(&native_gre_pbr_snapshot(true));
-    state.fabrics.push(FabricLink {
-        parent_ifindex: 4,
-        overlay_ifindex: 104,
-        peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
-        peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
-        local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
-        up: true,
-    });
-    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
-    let meta = UserspaceDpMeta {
-        ingress_ifindex: 4,
-        protocol: PROTO_ICMPV6,
-        l4_offset: 0,
-        ..UserspaceDpMeta::default()
-    };
-    let packet_frame = [128u8];
-
-    assert!(
-        cluster_peer_return_fast_path(
-            &state,
-            &dynamic_neighbors,
-            &packet_frame,
-            meta,
-            Some(TEST_LAN_ZONE_ID),
-            IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
-        )
-        .is_none()
-    );
-}
 
 // #4082: the cross-chassis fabric redirect must prefer a fabric whose local
 // parent carrier is UP so a dual-fabric cluster fails over to the secondary
