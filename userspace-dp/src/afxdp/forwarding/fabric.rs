@@ -182,6 +182,120 @@ pub(in crate::afxdp) fn ingress_is_fabric(forwarding: &ForwardingState, ingress_
     })
 }
 
+/// #6458: the fabric link whose parent OR overlay ifindex is
+/// `ingress_ifindex`, or `None` when the ingress is not a fabric. Single
+/// source of truth for the parent-or-overlay match so the identity check
+/// below and [`ingress_is_fabric`] cannot drift.
+pub(in crate::afxdp) fn fabric_for_ingress(
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+) -> Option<&FabricLink> {
+    forwarding.fabrics.iter().find(|fabric| {
+        fabric.parent_ifindex == ingress_ifindex || fabric.overlay_ifindex == ingress_ifindex
+    })
+}
+
+/// #6458: validate a zone-encoded fabric-ingress stamp against the fabric
+/// link identity and live RG ownership. A stamped frame claims "this
+/// packet ingressed the PEER in zone `zone_id`, and the peer punted it
+/// here" — an L2-adjacent host on the fabric segment can forge the magic
+/// bytes and compute any configured zone's `StableZoneID` offline, so the
+/// stamp is honored only when the frame ALSO looks like something the
+/// peer actually sent:
+///
+/// - **V1a — unicast to our fabric link.** The frame's destination MAC
+///   must equal the matched fabric link's `local_mac`. The legitimate
+///   sender always redirects to the peer's fabric MAC
+///   (`resolve_fabric_redirect_from_list` sets
+///   `neighbor_mac = fabric.peer_mac`; on the IPVLAN fabric the peer's
+///   neighbor MAC is the same MAC the receiver reports as `local_mac`).
+///   This rejects broadcast/multicast sprays and frames addressed to a
+///   third party.
+/// - **V1b — RG binding.** The claimed zone must have at least one
+///   RG-bound member interface (`zone_to_rgs`), and NONE of its bound RGs
+///   may be forwarding-active LOCALLY. When the claimed zone's RG is
+///   primary on the RECEIVER, traffic in that zone ingresses locally —
+///   the peer has no business stamping it (on a single-primary cluster
+///   this rejects every stamp on the primary). A zone with no RG-bound
+///   members (`mgmt`/fxp0, `control`/em0+fab, empty zones) can never be
+///   legitimately stamped, which kills the host-inbound variant's
+///   `mgmt` claim.
+///
+/// What this deliberately does NOT try to stop: on a SHARED fabric
+/// segment with a live RG split, an attacker can clone the exact stamp
+/// shape of a currently-legitimate punt (remote-RG zone, unicast dst) —
+/// indistinguishable from the real thing at L2. That residual is closed
+/// only by a direct-attached or MACsec fabric; see
+/// `docs/fabric-cross-chassis-fwd.md` (#6458 section).
+///
+/// Hot-path: runs only for frames that already matched the fabric-ingress
+/// + magic + zone-exists gates in
+/// `parse_zone_encoded_fabric_ingress_from_frame`. One 6-byte compare, one
+/// `zone_to_rgs` hash lookup, and one `ha_state` lookup per bound RG
+/// (typically one). No allocation, no atomics.
+pub(in crate::afxdp) fn zone_encoded_fabric_stamp_valid(
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    now_secs: u64,
+    frame_dst_mac: &[u8],
+    ingress_ifindex: i32,
+    zone_id: u16,
+) -> bool {
+    let Some(fabric) = fabric_for_ingress(forwarding, ingress_ifindex) else {
+        return false;
+    };
+    // V1a: the redirect is always unicast to our fabric link's MAC.
+    if frame_dst_mac != fabric.local_mac.as_slice() {
+        return false;
+    }
+    // V1b: the claimed zone must be RG-bound and none of its RGs may be
+    // forwarding-active locally. An absent/empty entry means the zone has
+    // no RG-bound members and can never be legitimately stamped.
+    match forwarding.zone_to_rgs.get(&zone_id) {
+        Some(rgs) => {
+            !rgs.is_empty()
+                && !rgs.iter().any(|rg| {
+                    ha_state
+                        .get(rg)
+                        .is_some_and(|group| group.is_forwarding_active(now_secs))
+                })
+        }
+        None => false,
+    }
+}
+
+/// #6458: V2 owner binding for the session-MISS zone-pair computation. A
+/// (V1-validated) zone-encoded stamp drives NEW-flow policy / NAT scope /
+/// host-inbound evaluation only when the packet's resolved owner RG is
+/// forwarding-active LOCALLY — the peer punts a new flow to us only
+/// because WE own its egress RG (split-RG active/active or an asymmetric
+/// failover window). On a single-primary backup nothing is locally
+/// active, so every stamp degrades to the fabric interface's own zone
+/// (default-deny) there. The resolution's owner RG is identical before
+/// and after `finalize_new_flow_ha_resolution` for a fabric-ingress
+/// packet, so gating here at the zone-pair site covers the final
+/// resolution.
+#[inline]
+pub(in crate::afxdp) fn gate_fabric_zone_override_on_owner_rg(
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    now_secs: u64,
+    ingress_zone_override: Option<u16>,
+    resolution: ForwardingResolution,
+) -> Option<u16> {
+    let zone = ingress_zone_override?;
+    let owner_rg = owner_rg_for_resolution(forwarding, resolution);
+    if owner_rg > 0
+        && ha_state
+            .get(&owner_rg)
+            .is_some_and(|group| group.is_forwarding_active(now_secs))
+    {
+        Some(zone)
+    } else {
+        None
+    }
+}
+
 pub(in crate::afxdp) fn ingress_is_fabric_overlay(
     forwarding: &ForwardingState,
     ingress_ifindex: i32,

@@ -702,3 +702,108 @@ ICMP-reply test uses — returns `Some` on revert, `None` with the fix)
 alongside the preserved `_allows_sfmix_to_lan_reply`,
 `_skips_udp_new_flow_4439`, `_skips_bare_rst_fin_4453`, `_skips_pure_tcp_syn`,
 and `_skips_icmp_echo_request`.
+
+## The zone-encoded stamp must prove it came from the peer (#6458)
+
+The zone-encoded synthetic source MAC (`02:bf:72:fe:<hi>:<lo>`) exists so a
+new flow whose ingress-RG primary and egress-RG primary differ — split-RG
+active/active steady state, or an asymmetric failover window — can be
+punted raw to the egress RG owner and admitted there under the TRUE zone
+pair. Before #6458 the receive-side decode
+(`parse_zone_encoded_fabric_ingress_from_frame`) validated only fabric
+ingress + magic bytes + that the zone id exists, and every session-MISS
+consumer (zone-pair policy, screens, SYN cookie, IKE admission,
+host-inbound, `cluster_peer_return_fast_path`) preferred the decoded
+override over the interface-derived zone. `StableZoneID` is a public FNV-1a
+name hash (`pkg/config/zoneid.go`), so any L2-adjacent host on the fabric
+segment could compute the stamp offline and PICK the ingress zone the
+receiving node evaluates under — a fail-open of the zone-policy, screen,
+and host-inbound trust boundaries (a forged `mgmt` stamp made the
+management plane reachable from the fabric segment with no transit policy
+at all).
+
+### Why validation, not removal
+
+Deleting the override on session miss (the issue's option (a)) fails
+closed but ALSO fails the legitimate case the stamp exists for: the owner
+can no longer evaluate the true zone pair for a punted new flow, so every
+split-RG active/active flow and every asymmetric-window new flow
+default-denies permanently (see
+`docs/active-active-new-connections.md`). The stamp is the only carrier of
+the true ingress zone on the receiver, so the fix VALIDATES it instead.
+
+### The validation (receive side)
+
+A stamp is honored only when ALL of the following hold, in addition to the
+pre-existing gates (fabric ingress, magic, id != 0, zone exists):
+
+- **V1a — unicast to our fabric link.** The frame's destination MAC must
+  equal the matched fabric link's `FabricLink.local_mac`
+  (`forwarding::fabric::zone_encoded_fabric_stamp_valid`). The legitimate
+  sender always unicasts the redirect to the peer's fabric MAC
+  (`resolve_fabric_redirect_from_list` sets
+  `neighbor_mac = fabric.peer_mac`; on the IPVLAN fabric the peer's
+  neighbor MAC and the receiver's `local_mac` are the same
+  parent-shared MAC). Broadcast/multicast sprays and off-target frames
+  are rejected.
+- **V1b — RG binding.** The claimed zone must have at least one RG-bound
+  member interface (new `ForwardingState.zone_to_rgs`, built from
+  `ifindex_to_zone_id` x `EgressInterface.redundancy_group`), and NONE of
+  its bound RGs may be forwarding-active LOCALLY. A legitimate stamp means
+  "this packet ingressed the PEER in this zone"; when the claimed zone's
+  RG is primary on the RECEIVER the traffic ingresses locally and the peer
+  has no business stamping it. Zones with no RG-bound members (`mgmt`,
+  `control`, empty zones) can never be legitimately stamped — this kills
+  the host-inbound variant. Evaluated once at stage 9
+  (`stage_classify_fabric_ingress`), so screens / SYN cookie / IKE
+  admission consume only validated zones.
+- **V2 — owner binding.** At every session-MISS zone-pair computation
+  (flow-backed, flowless transit, flowless local-delivery, and the
+  MissingNeighbor arm) the validated override is honored only when the
+  resolution's owner RG (`owner_rg_for_resolution`) is forwarding-active
+  locally (`gate_fabric_zone_override_on_owner_rg`): the peer punts a new
+  flow to us only because WE own its egress RG. This binds the stamp to
+  the packet's actual forwarding outcome, including the rg-0
+  local-delivery case V1b cannot see.
+
+### Resulting posture
+
+- **Single-primary cluster (the normal mode):** the primary rejects every
+  stamp (V1b: every zone's RG is local); the backup rejects every stamp
+  for new-flow purposes (V2: no owner RG is locally active, and transit
+  resolutions are HAInactive there anyway). Both nodes fail closed; the
+  host-inbound and transit variants are dead on both.
+- **Split-RG active/active:** exactly the stamp shapes matching the live
+  RG split (claimed-zone RG remote + resolution-owner RG local) are
+  honored — the legitimate punt keeps working (pinned by
+  `legitimate_fabric_punted_flow_still_admitted_6458` and
+  `legitimate_fabric_punted_host_inbound_still_admitted_6458`).
+- **A rejected stamp** degrades the frame to today's UNSTAMPED
+  fabric-frame posture (the fabric interface's own zone governs policy,
+  screens, and host-inbound) — never below it. The subsequent default-deny
+  is accounted on the normal policy-deny paths; a dedicated reject counter
+  is deferred (it needs proto + Go status plumbing).
+
+### Residual (accepted, documented)
+
+On a SHARED fabric segment with a live RG split, an attacker can clone the
+exact stamp shape of a currently-legitimate punt (remote-RG zone, unicast
+dst) — byte-identical to the real thing at L2, so no receiver-side check
+can reject it without also rejecting the legitimate flow. Full closure on
+a shared segment requires a cryptographic boundary: run the fabric
+direct-attached (the Junos requirement) or under MACsec. This is the same
+trust-domain boundary #4107 draws for the fabric CONTROL plane; the data
+path now fails closed everywhere EXCEPT this documented clone case.
+
+RED-on-revert coverage: `forwarding/tests.rs`
+(`zone_encoded_fabric_stamp_rejected_on_non_unicast_dst_6458`,
+`_rejected_when_claimed_zone_rg_local_6458`,
+`_rejected_for_zone_without_rg_members_6458`,
+`gate_fabric_zone_override_on_owner_rg_6458`,
+`zone_to_rgs_built_from_member_redundancy_groups_6458`) and the poll-loop
+end-to-end pins in `afxdp/tests_fabric_zone_stamp.rs`
+(`forged_fabric_stamp_denied_when_claimed_zone_rg_is_local_6458` — RED
+when the V1b check is neutralized;
+`forged_fabric_stamp_denied_for_host_inbound_when_owner_rg_remote_6458` —
+RED when the V2 gate is neutralized), plus the split-RG preservation pins
+named above.

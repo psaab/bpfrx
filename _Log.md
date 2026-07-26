@@ -61220,3 +61220,20 @@ top.
     userspace-dp/src/afxdp/{coordinator/status.rs,coordinator/tests.rs,
     cos/cross_binding.rs,neighbor_dispatch.rs,tx/stats.rs,types/cos.rs},
     docs/pr/6436-binding-state-extract/plan.md, _Log.md
+- **Timestamp**: 2026-07-26
+- **Action**: #6458 fabric zone-encoded src-MAC trust validation (PR1):
+  stamp honored only on unicast dst == fabric local_mac (V1a) + claimed
+  zone RG-bound and not locally forwarding-active (V1b, stage 9) +
+  resolution owner RG locally forwarding-active (V2, session-miss zone
+  pairs). New ForwardingState.zone_to_rgs. Fail-on-revert unit tests +
+  poll-loop e2e pins (RED verified by neutralizing V1b / V2); split-RG
+  legit punt preservation pins. Full cargo suite 4241 passed / 0 failed.
+- **File(s)**: userspace-dp/src/afxdp/types/forwarding.rs,
+    userspace-dp/src/afxdp/forwarding_build/{mod.rs,interfaces.rs},
+    userspace-dp/src/afxdp/forwarding/{fabric.rs,tests.rs},
+    userspace-dp/src/afxdp/frame/inspect.rs,
+    userspace-dp/src/afxdp/poll_stages.rs,
+    userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+    userspace-dp/src/afxdp/{mod.rs,tests_fabric_zone_stamp.rs},
+    docs/fabric-cross-chassis-fwd.md,
+    docs/pr/6458-fabric-zone-stamp/plan.md, _Log.md

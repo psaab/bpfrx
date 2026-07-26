@@ -231,6 +231,9 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
         &excluded_local_v6,
     )?;
     interfaces::populate_egress(snapshot, &mut state, &iface_ctx)?;
+    // #6458: zone -> RG-bound-member map for the fabric-ingress zone-stamp
+    // validation; needs both ifindex_to_zone_id and egress final.
+    interfaces::populate_zone_to_rgs(&mut state);
 
     fib::sort_connected(&mut state);
     // #3771: fail the snapshot CLOSED on a route whose `family` contradicts its

@@ -135,6 +135,17 @@ pub(in crate::afxdp) struct ForwardingState {
     pub(in crate::afxdp) ifindex_to_zone_id: FastMap<i32, u16>,
     pub(in crate::afxdp) zone_name_to_id: FastMap<String, u16>,
     pub(in crate::afxdp) zone_id_to_name: FastMap<u16, String>,
+    /// #6458: zone ID → deduplicated redundancy-group IDs (> 0) of the
+    /// zone's member interfaces, built at config-commit from
+    /// `ifindex_to_zone_id` x `EgressInterface.redundancy_group`. A zone is
+    /// ABSENT here when none of its members is RG-bound (mgmt/fxp0,
+    /// control/em0+fab, unzoned-member zones, empty zones). Read on the
+    /// fabric-ingress zone-stamp validation path
+    /// (`forwarding::fabric::zone_encoded_fabric_stamp_valid`): a stamped
+    /// zone claim is legitimate only when the zone could have been
+    /// ingressed on the PEER, which requires the zone to be RG-bound and
+    /// none of its RGs to be forwarding-active locally.
+    pub(in crate::afxdp) zone_to_rgs: FastMap<u16, Vec<i32>>,
     /// #3070: per-zone host-inbound-traffic admission set, keyed by the same
     /// validated zone id as `zone_id_to_name`. A zone is present here only when
     /// the config declared a `host-inbound-traffic` stanza for it; an absent
