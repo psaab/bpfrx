@@ -473,17 +473,11 @@ pub(in crate::afxdp) fn resolve_fabric_redirect_from_list(
     })
 }
 
-pub(in crate::afxdp) fn resolve_zone_encoded_fabric_redirect(
-    forwarding: &ForwardingState,
-    ingress_zone: &str,
-) -> Option<ForwardingResolution> {
-    let zone_id = forwarding.zone_name_to_id.get(ingress_zone).copied()?;
-    resolve_zone_encoded_fabric_redirect_by_id(forwarding, zone_id)
-}
-
-/// #919/#922: ID-keyed variant of `resolve_zone_encoded_fabric_redirect`.
-/// Avoids the name-string round-trip when the caller already has a u16
-/// zone ID (e.g. from `SessionMetadata.ingress_zone`).
+/// #919/#922: ID-keyed zone-encoded redirect. Avoids the name-string
+/// round-trip: every caller already has a u16 zone ID (e.g. from
+/// `SessionMetadata.ingress_zone`). #6478: the name-keyed wrapper was
+/// removed with the cluster-peer return fast path (its last production
+/// caller); tests use this ID-keyed form directly.
 pub(in crate::afxdp) fn resolve_zone_encoded_fabric_redirect_by_id(
     forwarding: &ForwardingState,
     zone_id: u16,
@@ -562,107 +556,3 @@ pub(in crate::afxdp) fn prefer_local_forward_candidate_for_fabric_ingress(
     resolution
 }
 
-pub(in crate::afxdp) fn cluster_peer_return_fast_path(
-    forwarding: &ForwardingState,
-    dynamic_neighbors: &Arc<ShardedNeighborMap>,
-    packet_frame: &[u8],
-    meta: UserspaceDpMeta,
-    ingress_zone_override: Option<u16>,
-    resolution_target: IpAddr,
-) -> Option<(SessionDecision, SessionMetadata)> {
-    if !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32) {
-        return None;
-    }
-    let ingress_zone = ingress_zone_override?;
-    if is_icmp_echo_request(packet_frame, meta) {
-        return None;
-    }
-    // #2151: `is_initial_syn` == the prior
-    // `(tcp_flags & SYN) != 0 && (tcp_flags & ACK) == 0` — a bare
-    // connection-opening SYN has no peer-owned session to return for.
-    if meta.protocol == PROTO_TCP && crate::tcp_flags::is_initial_syn(meta.tcp_flags) {
-        return None;
-    }
-    // #4453: a bare TCP RST/FIN (closing flags, SYN clear) is the same
-    // session-less phantom-closing packet the LOCAL session-miss path drops
-    // via the #4400 strict-syn-check (`strict_syn_check_drops_new_flow` ==
-    // PROTO_TCP && is_closing && !has_syn). It carries no return value: a real
-    // established flow's RST/FIN is served by the synced session in
-    // `resolve_flow_session_decision` before this point. Without this arm, a
-    // transit bare RST/FIN to a locally-HAInactive RG is converted to a
-    // FabricRedirect (safety net) and forwarded to the peer, where it arrives
-    // as fabric ingress and gets fast-pathed into a NAT-less
-    // `SessionOrigin::ReverseFlow` seed — installing on the peer, via the
-    // trusted fabric path, exactly the immediately-closing session the peer's
-    // own #4400 guard prevents locally. Exclude it here (SAME predicate as
-    // #4400) so it falls through to the peer's normal forward decision, whose
-    // session-miss guard drops it — no reverse seed. This completes the
-    // fast-path invariant: fire ONLY for provably-return traffic (exclude the
-    // TCP initial SYN, the ICMP echo request, all UDP, AND the bare RST/FIN).
-    if meta.protocol == PROTO_TCP
-        && crate::tcp_flags::is_closing(meta.tcp_flags)
-        && !crate::tcp_flags::has_syn(meta.tcp_flags)
-    {
-        return None;
-    }
-    // #4439/#4414: this fast path may fire ONLY for packets that are provably
-    // RETURN traffic — the reverse direction of a flow the active owner
-    // already policy/NAT-validated. That requires a protocol with a
-    // packet-level flow-initiator marker so the initiating (forward) form can
-    // be told apart from the return form, and the initiator is excluded above:
-    // TCP excludes the initial SYN (and the bare RST/FIN, #4453); ICMP/ICMPv6
-    // exclude the echo REQUEST. Every OTHER protocol — UDP (#4439), and
-    // likewise ESP/AH/GRE/SCTP/OSPF/… (the #4414 residual) — has NO such
-    // marker: any datagram can open a new flow, and there is no
-    // "non-initiating" form to key on. A session-less packet of one of these
-    // protocols reaching here (a real established reply is served by the
-    // synced session in `resolve_flow_session_decision` before this point) is
-    // therefore a NEW forward flow, NOT return traffic. Fast-pathing it built
-    // a NAT-less, reverse-keyed session for a forward flow — the source-NAT a
-    // new outbound flow requires was skipped (NAT bypass) and the owner
-    // recorded the flow in the wrong direction (session-state corruption).
-    // Refuse every protocol that is not TCP or ICMP/ICMPv6 so it falls through
-    // to the RG owner's normal forward decision: source-NAT applied and a
-    // FORWARD session installed. (Subsumes the #4439 UDP-only guard.)
-    if !matches!(meta.protocol, PROTO_TCP | PROTO_ICMP | PROTO_ICMPV6) {
-        return None;
-    }
-
-    let fabric_return_resolution =
-        lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, resolution_target);
-    if fabric_return_resolution.disposition != ForwardingDisposition::ForwardCandidate {
-        return None;
-    }
-    // #921: direct ifindex → u16 lookup (was a two-hop name round-trip).
-    let egress_zone = forwarding
-        .ifindex_to_zone_id
-        .get(&fabric_return_resolution.egress_ifindex)
-        .copied()?;
-    let metadata = SessionMetadata {
-        ingress_zone,
-        egress_zone,
-        owner_rg_id: owner_rg_for_resolution(forwarding, fabric_return_resolution),
-        fabric_ingress: true,
-        is_reverse: true,
-        nat64_reverse: None,
-        // #2508: fabric-return reverse seed carries no local per-policy
-        // `then log` selection (the admitting node logs).
-        log_session_init: false,
-        log_session_close: false,
-        // #3056: the fabric-return reverse seed is created on the peer-forwarding
-        // node, which never ran the admitting policy — leave the policy ID unset.
-        policy_id: 0,
-        inactivity_timeout_ns: None,
-        // #3073: peer-forwarded fabric-return seed; no local admitting rule, so
-        // no per-rule hit counter.
-        policy_counter_idx: 0,
-        policy_counter: None,
-    };
-    Some((
-        SessionDecision {
-            resolution: fabric_return_resolution,
-            nat: NatDecision::default(),
-        },
-        metadata,
-    ))
-}

@@ -110,21 +110,6 @@ pub(super) fn allow_unsolicited_dns_reply(
         && flow.forward_key.src_port == 53
 }
 
-pub(super) fn is_icmp_echo_request(packet_frame: &[u8], meta: UserspaceDpMeta) -> bool {
-    if !matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
-        return false;
-    }
-    packet_frame
-        .get(meta.l4_offset as usize)
-        .copied()
-        .map(|icmp_type| {
-            matches!(
-                (meta.protocol, icmp_type),
-                (PROTO_ICMP, 8) | (PROTO_ICMPV6, 128)
-            )
-        })
-        .unwrap_or(false)
-}
 
 pub(super) fn resolve_ingress_logical_ifindex(
     forwarding: &ForwardingState,

@@ -61429,3 +61429,18 @@ top.
     userspace-dp/src/afxdp/{mod.rs,tests_fabric_zone_stamp.rs},
     docs/fabric-cross-chassis-fwd.md,
     docs/pr/6458-fabric-zone-stamp/plan.md, _Log.md
+- **Timestamp**: 2026-07-26
+- **Action**: #6478 remove cluster_peer_return_fast_path (PR2, stacked on
+  the #6458 PR): the fast path adopted session-less fabric-ingress
+  SYN-ACK / ACK / echo-reply forms into a NAT-less ReverseFlow seed gated
+  on the forgeable zone stamp. Deleted the fn + call site + its guard
+  tests + newly-dead is_icmp_echo_request and the name-keyed
+  resolve_zone_encoded_fabric_redirect wrapper; session-less fabric
+  packets now take the normal policy/NAT miss path. Fail-on-revert
+  verified against the pre-removal commit (both new tests return
+  Some(ReverseFlow) there); split-RG legit punt still admitted.
+- **File(s)**: userspace-dp/src/afxdp/forwarding/{fabric.rs,mod.rs,tests.rs},
+    userspace-dp/src/afxdp/frame/tests_ports_live_forward.rs,
+    userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+    userspace-dp/src/afxdp/tests_fabric_zone_stamp.rs,
+    docs/fabric-cross-chassis-fwd.md, _Log.md

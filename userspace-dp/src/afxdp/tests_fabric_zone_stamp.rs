@@ -261,3 +261,143 @@ fn legitimate_fabric_punted_flow_still_admitted_6458() {
         "the legitimate split-RG fabric punt must keep forwarding"
     );
 }
+
+const TCP_FLAG_ACK: u8 = 0x10;
+
+/// #6478 fail-on-revert: a session-less fabric-ingress TCP SYN-ACK (a
+/// forgeable "return" form) must NOT be adopted into a NAT-less
+/// `SessionOrigin::ReverseFlow` seed. Before this PR the cluster-peer
+/// return fast path fired for exactly this shape — a validated stamp
+/// (claimed `lan`, whose RG 2 is remote in this split placement), a
+/// ForwardCandidate-resolving destination — and installed the reverse
+/// seed with `NatDecision::default()` and no policy evaluation. With the
+/// fast path removed the packet takes the normal session-miss path:
+/// zone-pair POLICY under the #6458-validated zone, source-NAT applied,
+/// FORWARD-origin sessions. The lookup must therefore NEVER resolve the
+/// packet tuple to a `ReverseFlow` origin.
+#[test]
+fn fabric_ingress_syn_ack_seeds_no_reverse_session_6478() {
+    let forwarding = build_forwarding_state(&nat_snapshot_with_fabric());
+    let now_secs = monotonic_nanos() / 1_000_000_000;
+    // Split placement: WAN RG (1) is local; LAN RG (2) is the peer's — the
+    // ONLY placement where the #6458-validated stamp survives, and where
+    // the pre-fix fast path could fire.
+    let ha_state = BTreeMap::from([(1, active_rg(now_secs))]);
+    let src = Ipv4Addr::new(10, 0, 61, 102);
+    let dst = Ipv4Addr::new(8, 8, 8, 8);
+    let mut frame = build_txn_tcp_syn_frame_v4(src, dst, 12345, 443, TCP_FLAG_SYN | TCP_FLAG_ACK);
+    let [hi, lo] = TEST_LAN_ZONE_ID.to_be_bytes();
+    frame[0..6].copy_from_slice(&[0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]);
+    frame[6..12].copy_from_slice(&[0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, hi, lo]);
+    let meta = txn_meta_v4(21, TCP_FLAG_SYN | TCP_FLAG_ACK, (frame.len() - 14) as u16);
+
+    let mut binding = fabric_binding();
+    let mut sessions = SessionTable::new();
+    txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+
+    let key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(src),
+        dst_ip: IpAddr::V4(dst),
+        src_port: 12345,
+        dst_port: 443,
+    };
+    let origin = sessions
+        .lookup_with_origin(&key, 123_000_000_000, TCP_FLAG_SYN | TCP_FLAG_ACK)
+        .map(|(_, origin)| origin);
+    assert_ne!(
+        origin,
+        Some(SessionOrigin::ReverseFlow),
+        "RED on revert: the fast path installed a NAT-less ReverseFlow seed \
+         for a session-less fabric-ingress SYN-ACK"
+    );
+    // Post-fix the packet is a normal asymmetric-pickup new flow (#3152):
+    // policy PERMIT under the validated lan -> wan pair installs the
+    // forward + reverse companion pair WITH source-NAT — never the
+    // policy-less single reverse seed.
+    assert_eq!(
+        sessions.len(),
+        2,
+        "the policy-path new flow installs the forward + reverse companion pair"
+    );
+}
+
+/// #6478 fail-on-revert: same residual class as the SYN-ACK form, via an
+/// ICMP echo REPLY — the second forgeable "return" form the removed fast
+/// path adopted. Assert the packet tuple never resolves to a
+/// `ReverseFlow` origin and that any installed state is the policy-path
+/// forward flow.
+#[test]
+fn fabric_ingress_icmp_echo_reply_seeds_no_reverse_session_6478() {
+    let forwarding = build_forwarding_state(&nat_snapshot_with_fabric());
+    let now_secs = monotonic_nanos() / 1_000_000_000;
+    let ha_state = BTreeMap::from([(1, active_rg(now_secs))]);
+    let src = Ipv4Addr::new(10, 0, 61, 102);
+    let dst = Ipv4Addr::new(8, 8, 8, 8);
+    let mut frame = build_icmp_echo_frame_v4(src, dst, 64);
+    // Flip the echo REQUEST (type 8) the builder emits to an echo REPLY
+    // (type 0) and recompute the ICMP checksum.
+    let icmp_start = 34;
+    frame[icmp_start] = 0;
+    frame[icmp_start + 2..icmp_start + 4].copy_from_slice(&[0, 0]);
+    let icmp_csum = checksum16(&frame[icmp_start..]);
+    frame[icmp_start + 2..icmp_start + 4].copy_from_slice(&icmp_csum.to_be_bytes());
+    let [hi, lo] = TEST_LAN_ZONE_ID.to_be_bytes();
+    frame[0..6].copy_from_slice(&[0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]);
+    frame[6..12].copy_from_slice(&[0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, hi, lo]);
+    let meta_len = std::mem::size_of::<UserspaceDpMeta>();
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: meta_len as u16,
+        ingress_ifindex: 21,
+        l3_offset: 14,
+        l4_offset: 34,
+        payload_offset: 42,
+        pkt_len: (frame.len() - 14) as u16,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    };
+
+    let mut binding = fabric_binding();
+    let mut sessions = SessionTable::new();
+    txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+
+    let key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        src_ip: IpAddr::V4(src),
+        dst_ip: IpAddr::V4(dst),
+        // parse_flow_ports keys an identifier-bearing ICMP query as
+        // (identifier, 0); the builder stamps identifier 0x1234.
+        src_port: 0x1234,
+        dst_port: 0,
+    };
+    let origin = sessions
+        .lookup_with_origin(&key, 123_000_000_000, 0)
+        .map(|(_, origin)| origin);
+    assert_ne!(
+        origin,
+        Some(SessionOrigin::ReverseFlow),
+        "RED on revert: the fast path installed a NAT-less ReverseFlow seed \
+         for a session-less fabric-ingress ICMP echo reply"
+    );
+}

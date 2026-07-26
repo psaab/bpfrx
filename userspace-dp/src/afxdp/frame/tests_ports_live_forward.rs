@@ -1033,8 +1033,8 @@ fn build_live_forward_request_uses_flow_or_metadata_ports_when_frame_ports_unava
 fn build_live_forward_request_marks_session_fabric_redirect_for_nat_and_zone() {
     let forwarding = build_forwarding_state(&nat_snapshot_with_fabric());
     let fabric_redirect = resolve_fabric_redirect(&forwarding).expect("fabric redirect");
-    let zone_redirect =
-        resolve_zone_encoded_fabric_redirect(&forwarding, "wan").expect("zone redirect");
+    let zone_redirect = resolve_zone_encoded_fabric_redirect_by_id(&forwarding, TEST_WAN_ZONE_ID)
+        .expect("zone redirect");
     let mut area = MmapArea::new(256).expect("mmap");
     area.slice_mut(0, 64).expect("slice").fill(0xaa);
     let ingress_ident = BindingIdentity {
