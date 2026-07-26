@@ -5,7 +5,7 @@
 //! sweep → tombstone, stale prune, spawn with backoff — see the
 //! "Aux tunnel threads" section of this directory's README.md for
 //! the family differences that matter. The thread BODIES live
-//! elsewhere (`wg_control.rs` for WG, `afxdp/tunnel.rs` for GRE);
+//! elsewhere (`wg_control/` for WG, `afxdp/tunnel.rs` for GRE);
 //! this file owns the coordinator-side lifecycle only. The entry
 //! maps themselves (`tunnel_sources`, `wg_control_threads`) stay on
 //! `Coordinator` in mod.rs, and `stop_inner` keeps its own inline

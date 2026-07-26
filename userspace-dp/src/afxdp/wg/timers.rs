@@ -6,7 +6,7 @@
 //! Design of record: `docs/research/1888-wg-timers/plan.md` (plan v9,
 //! 3/3 PLAN-READY). The §3 timer-semantics table is authoritative for
 //! WHICH packets arm/clear WHICH timers; this file implements the
-//! engine-resident half, `coordinator/wg_control.rs` implements the
+//! engine-resident half, `coordinator/wg_control/` implements the
 //! control-loop half (poll(2) timeout, handshake attempt machine,
 //! keepalive emission).
 //!
