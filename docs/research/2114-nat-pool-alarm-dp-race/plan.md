@@ -1,8 +1,10 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v30 — r29 findings folded (Codex NEEDS-REVISION
-  2M/5m; AGY PLAN-READY; Claude SMR PLAN-READY 0M/0m — both confirm
-  the §4.7 structure); pending convergence review r30
+- **Status**: DRAFT v31 — r30 findings folded (Codex NEEDS-REVISION
+  2M/2m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m —
+  its barrier-choice nit folded into the Codex m2 deferred-barrier
+  pin; all three confirm the §4.7 structure); pending convergence
+  review r31
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -524,7 +526,9 @@
   the four-state removal table; W-kind runs a three-state rewrite
   table (match → rewrite durable; mismatch → supersession
   transitions; absent → restore-from-in-memory-window-state or
-  stale-clear); absent-for-W is NO-OP-and-clear ONLY when a same-key
+  stale-clear — the (w-u) UNREADABLE-slot restore-over leg joins
+  in r23, making it four-legged); absent-for-W is NO-OP-and-clear
+  ONLY when a same-key
   R consumed it. (c) BOOT-origin persistent substates (Codex M3,
   verified the clear-and-defer hole: health went green with the
   record's fate unsettled, and a replacement landing DURING the
@@ -1080,6 +1084,53 @@
   variants); the both-files provenance assumption is scoped
   outside FACTORY RESET (`factory_reset.go:252-268` — itself an
   operator action).
+  v31: r30 convergence — the remediation protocol is sealed against
+  the split-key interleave and the latch/debt branch confusion
+  (Codex NEEDS-REVISION 2M/2m, folds 2 FOLDED / 5 PARTIAL,
+  structure confirmed; AGY PLAN-READY 7/7 with 3 fresh attacks
+  FAILED, structure confirmed; SMR PLAN-READY-WITH-NITS 0M/1m —
+  its barrier-choice nit folded into (d)): (a) the runbook branch
+  keys on LIVE DEBT, not latch origin (Codex M2, verified: a
+  confirmed commit during the BOOT latch can fail its arm
+  pre-rename and create a W debt, so TerminalUnreadable and a
+  nonzero mask coexist — the stop branch would abandon the live
+  debt): ANY live process-local debt (`ConfirmDebtKindMask ≠ 0`,
+  whatever the latch origin) forces the running/wait branch; only
+  `mask == 0` permits the stopped-restore path; the mixed-state
+  regression pins BOOT latch + live W → running/wait rendered.
+  (b) The split-key interleave closes structurally (Codex M1,
+  verified: with R_A and persistDegraded live under K, installing
+  wrong-but-valid K″ lets the active-persist heal re-encrypt
+  active.json under K″ — `store_persist.go:414-428` heals active
+  FIRST, `crypto.go:262-270,457-465` encrypts with the installed
+  key — after which no single key converges): WHILE ANY KEY-CLASS
+  FAILURE IS OUTSTANDING, EVERY ENCRYPTED config-DB write is
+  blocked (the active-persist retry withholds its encrypted write;
+  NEW arms/commits are REFUSED at the persistence layer with a
+  key-remediation error) — no file is ever re-encrypted under an
+  unverified key, so the split cannot form; the loop order stays
+  active-heal → resolution-finalize (the #5473 ordering), so the
+  gate evaluates the previous pass's confirm-side state (one pass
+  of lag, zero hazard); intentional key ROTATION is out of scope
+  (no tooling exists on master either). (c) The clear-time re-read
+  taxonomy is representable (Codex m1, verified the sole keyClass
+  bit could not hold it): byte-MISMATCH sets the debt's keyClass
+  state EXPLICITLY (the key's identity changed) and invalid-length
+  matches `ErrMasterKeyLength` — BOTH restoration-required;
+  EACCES/ENOENT/mount-IO → key-state-UNVERIFIABLE (generic text,
+  NO restoration claim); all three branches carry x23/x24 legs.
+  (d) The arm-supersession barrier is the dir-fsync DURABILITY
+  barrier (SMR m1 = Codex m2): NEVER mere rename visibility — a
+  FAILED barrier (pre- or post-rename) leaves D standing,
+  suppressed by the resulting W debt; and a successful (w-a)
+  durability completion IS the deferred barrier — D clears WITH W
+  (the post-rename arm's live record made durable), pinned in the
+  m3 text and both x22a legs. (e) Residual copies swept: both x23
+  copies name (w-u); both x24 copies carry the re-read taxonomy;
+  the W table is four-legged everywhere (the v20-history and §5.1
+  "three-state" copies annotated); the §9 partition is consistent
+  (item 1 untagged both-units, items 3-5 [CORE]); the
+  source-comment rewording block points at the FOLLOW-UP unit.
 
 ---
 
@@ -2040,8 +2091,9 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   error → typed). The W-kind (rewrite) debt — AT MOST ONE, keyed to
   the LIVE window's desired record and re-keyed at every arm outcome
   (r20 Codex M1: a nested arm re-keys it; a dead window's W never
-  heals) — runs a THREE-STATE rewrite
-  table: (w-a) current record's ArmID == the key (the live window's
+  heals) — runs the FOUR-LEGGED rewrite
+  table ((w-a)/(w-b)/(w-c) plus the r23 (w-u) unreadable-slot leg):
+  (w-a) current record's ArmID == the key (the live window's
   record is on disk) → `WriteConfirm` it durable → clear;
   (w-b) current record DIFFERS (a dead window's record) → restore
   `s.armedRecord` over it (the restore IS the supersession — the
@@ -2451,39 +2503,83 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   path, `crypto.go:443-479`, and the operator is explicitly
   permitted live restoration): two pins close the residual. (i) Key
   remediation is SERIALIZED BY RUNBOOK, with the branch chosen BY
-  STATE PROVENANCE (r29 Codex M1, verified the stopped-restore
-  loses process-local debt provenance: a keep-active confirmation
-  can resolve A in memory while a wrong key makes its tombstone
-  read fail and retain R_A — process-local — and stopping xpfd
-  abandons that retry, `store_persist.go:397-401`; after restoring
-  K and restarting, the pending-shaped A still hash-matches and
-  recovery re-arms or expired-reverts an ALREADY-CONFIRMED config,
+  LIVE-DEBT STATE — NOT latch origin (r29 Codex M1 + r30 Codex M1/M2,
+  verified: the stopped-restore loses process-local debt provenance
+  — a keep-active confirmation can resolve A in memory while a
+  wrong key makes its tombstone read fail and retain R_A
+  process-locally, and stopping xpfd abandons that retry,
+  `store_persist.go:397-401`; after restoring K and restarting, the
+  pending-shaped A still hash-matches and recovery re-arms or
+  expired-reverts an ALREADY-CONFIRMED config,
   `store_persist.go:149-165,231-255` — the admitted replay
-  residual): DEBT-ORIGIN state (live process-local debts — the
-  snapshot's DEBT-origin substate) → restore the key with xpfd
+  residual; AND the BOOT latch is NOT a stable no-live-debts state
+  — a confirmed commit during the latch can fail its arm pre-rename
+  and create a W debt, so TerminalUnreadable and a nonzero debt
+  mask can coexist in one snapshot): ANY live process-local debt
+  (`ConfirmDebtKindMask ≠ 0`, whatever the latch origin) forces the
+  DEBT-ORIGIN branch → restore the key with xpfd
   RUNNING and WAIT for health/debt clearance (the retry loop
   re-validates under the restored key and the debts heal through
-  their own tables) — NEVER stop xpfd mid-debt; BOOT-ORIGIN state
-  (the terminal latch with NO live debts — the latch survives
-  restart by design) → the stopped-restore path is safe (restore
+  their own tables) — NEVER stop xpfd mid-debt; only `mask == 0`
+  (with or without a latch) permits the BOOT-ORIGIN stopped-restore
+  path (restore
   with xpfd stopped, restart, and the latch's boot reconstruction
   re-validates the restored key). The operator-facing message names
-  the branch via the same DEBT-origin vs BOOT-origin substate the
-  health snapshot already renders.
+  the branch from the live mask — a mixed-state regression pins
+  BOOT latch + live W → the running/wait branch rendered, never
+  the stop branch.
+  AND THE SPLIT-KEY INTERLEAVE IS CLOSED STRUCTURALLY (r30 Codex
+  M1, verified: with R_A and persistDegraded both live under the
+  original K, installing wrong-but-valid K″ lets the retry loop's
+  active-persist heal re-encrypt active.json under K″ —
+  `store_persist.go:414-428` heals active FIRST,
+  `crypto.go:262-270,457-465` encrypts with the currently installed
+  key — after which restoring K makes the ACTIVE side unreadable
+  and retaining K″ keeps the CONFIRM side unreadable: no single key
+  converges): WHILE ANY KEY-CLASS FAILURE IS OUTSTANDING (any
+  confirm-side debt or latch whose LATEST retained failure is
+  key-class), EVERY ENCRYPTED config-DB write is blocked — the
+  active-persist retry withholds its encrypted write (plaintext
+  writes unaffected; the in-memory active tree stays the source of
+  truth and is re-written once the key situation resolves), and NEW
+  arms/commits are REFUSED at the persistence layer with a clear
+  key-remediation error (a commit during unresolved key-class would
+  write under an unverified key — the same split). No file is ever
+  re-encrypted under an unverified key, so the two-key split cannot
+  form: with K restored, the confirm-side re-reads re-validate and
+  heal, the outstanding-key-class flag clears, and the next pass's
+  active write proceeds under K; with K″ installed, the key-class
+  debts keep failing and the active write stays blocked — the files
+  never diverge. The retry loop's order stays
+  active-heal → resolution-finalize (the #5473 durability
+  ordering), so the active-write gate evaluates the outstanding
+  key-class state as of the PREVIOUS pass's confirm-side actions —
+  one pass of lag after the operator's key restoration, zero
+  hazard. Intentional key ROTATION is out of scope: no
+  re-encryption tooling exists on master either (a follow-up may
+  add it); the gate blocks the accidental split, not a supported
+  workflow.
   (ii)
   EVERY debt clear that consumed a key snapshot RE-READS the key
   path at clear time and compares bytes to the snapshot — a
   mismatch (the operator swapped the path mid-action) RETAINS the
   debt with the restoration message instead of clearing: a clear
   never lands on a key generation different from the one the
-  validation and the write used. The re-read's own ERROR branch is
-  pinned (r29 Codex m1): EACCES / ENOENT / invalid-length / any
-  other read failure → RETAIN the debt and journal the EXACT
-  verification error, with the message saying key state
-  UNVERIFIABLE — NOT restoration-required (that claim is reserved
-  for a byte-MISMATCH or a key-class-observed failure); the
+  validation and the write used. The re-read's own outcome taxonomy
+  is pinned (r29 Codex m1 + r30 Codex m1, verified the sole
+  keyClass bit could not represent it: byte MISMATCH and
+  INVALID-LENGTH are RESTORATION-REQUIRED — the mismatch sets the
+  debt's keyClass state EXPLICITLY (the key's identity changed —
+  a key-class condition even though it is a comparison outcome,
+  not a wrapped crypto failure) and invalid observed length already
+  matches `ErrMasterKeyLength` via `errors.As`; EACCES / ENOENT /
+  mount-IO / any other read failure → RETAIN the debt and journal
+  the EXACT verification error with the message saying key state
+  UNVERIFIABLE — NO restoration claim (the operator investigates
+  the mount/permissions; the generic confirm-debt text renders,
+  never the key-class variant); the
   exact-bytes compare is deliberate (a legitimate same-content key
-  rewrite passes), and the error branch carries x23/x24 legs.
+  rewrite passes), and all three branches carry x23/x24 legs.
   PLAINTEXT repair writes are EXEMPT by
   construction (r27 SMR m1, verified `crypto.go:262-265`:
   `maybeEncryptTreeJSON` returns the body untouched when the
@@ -2532,8 +2628,9 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   retry BY KIND (r19 Codex M2: an R-kind debt resumes the four-state
   removal table — tombstone→delete, NEVER a window re-arm, which
   would roll back a confirmed config; a W-kind debt resumes the
-  THREE-STATE rewrite table — rewrite-durable / supersession
-  transitions / restore-or-stale — NEVER a tombstone of a live
+  FOUR-LEGGED rewrite table — rewrite-durable / supersession
+  transitions / restore-or-stale / (w-u) restore-over-unreadable —
+  NEVER a tombstone of a live
   window's record); (ii) BOOT-origin latch (recovery's read failed —
   no timer, no debt, the record never classified) splits into TWO
   persistent substates (r19 Codex M3, verified the clear-and-defer
@@ -2671,8 +2768,22 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   ARM'S OWN action, not a D action (r28 Codex m3: the arm-time
   clearing is not subject to the D precondition or the active
   gate; the arm's own write path is the only gate it needs, and
-  the clear rides the arm's barrier); absent such an arm, D stays
-  inert until its fresh re-classification under the full
+  the clear rides the arm's barrier). THE BARRIER IS THE
+  DURABILITY BARRIER (r30 SMR m1 + r30 Codex m2: the dir-fsync,
+  `fsatomic.go:45-79` — NEVER mere rename visibility): on arm
+  SUCCESS the record is durable and D clears with it; on a FAILED
+  barrier — PRE-rename (slot untouched) or POST-rename (record
+  merely VISIBLE, a W debt created) — D SURVIVES, suppressed by
+  the resulting W debt, and re-classifies fresh when W resolves;
+  and a successful (w-a) durability completion IS the deferred
+  barrier (r30 Codex m2, verified the ambiguity: the post-rename
+  arm leaves the live record visible-but-undurable and
+  `armedArmID` live, so every D clear would otherwise wait for
+  window resolution with health degraded): when (w-a)'s
+  `WriteConfirm` lands the live record durably, D clears WITH W —
+  the supersession is complete, the slot provably holds the
+  durable live record; absent such an arm-or-(w-a), D stays inert
+  until its fresh re-classification under the full
   three-conjunct precondition.
   The D-kind debt is PROCESS-LOCAL (r22 Codex M3, verified: the retry
   is an unjoined plain goroutine abandoned on exit, BOOT-origin is
@@ -3220,8 +3331,14 @@ inert beside a durable arm" is the WRONG expectation — the arm
 kills D itself): (x22a) ARM-BARRIER CLEARANCE — seed a D-kind slot
 debt, land a FULLY DURABLE arm on the slot (no W debt created), and
 assert D is CLEARED by the arm's own supersession (riding the arm's
-barrier — gate-independent, not a D action), never acted on by D's
-own machinery afterward; (x22b) SYNCAPPLY-PRE-RENAME (r27 Codex
+dir-fsync DURABILITY barrier — gate-independent, not a D action;
+a FAILED barrier — pre- or post-rename — leaves D standing,
+suppressed by the resulting W debt), never acted on by D's
+own machinery afterward; AND the deferred-barrier leg (r30 Codex
+m2): a post-rename arm failure then a SUCCESSFUL (w-a) durability
+completion clears D WITH W (the (w-a) `WriteConfirm` IS the
+deferred barrier — the slot provably holds the durable live
+record); (x22b) SYNCAPPLY-PRE-RENAME (r27 Codex
 M3): D seeded beside durable live C, SyncApply cancels C and its
 replacement active write fails PRE-rename — assert D stays
 INERT while `persistDegraded` stands (C's record survives per
@@ -3233,13 +3350,11 @@ that raises D beside a live window keeps it inert), with a leg
 that seeds D beside a live window via test seam and asserts no D
 action until the window resolves; the D-regression suite covers
 every read classification × the three-conjunct precondition;
-INERT while `persistDegraded` stands (C's window record survives —
-#5473 retention — and no tombstone/delete runs), then let the
-replacement retry land and assert D's fresh re-read proceeds per
-the (ii-b) eager rule; (x23) ACTIVE-GATE MATRIX (r27 Codex M1 +
-r28 Codex M1's inventory completion):
+(x23) ACTIVE-GATE MATRIX (r27 Codex M1 +
+r28 Codex M1's inventory completion + r29 Codex m2's (w-u) leg):
 (g-ok)/(g-absent)/(g-err) × (W (w-a) durable rewrite, W (w-b)/(w-c)
-restore, R (a) tombstone+delete, R (c) mismatch rewrite, D
+restore, W (w-u) unreadable-slot restore-over,
+R (a) tombstone+delete, R (c) mismatch rewrite, D
 tombstone, D delete,
 confirm-side clear, sanctioned both-files-removed barrier) at BOTH
 placements (boot — consuming the same `ReadActiveMeta` result
@@ -3247,7 +3362,8 @@ placements (boot — consuming the same `ReadActiveMeta` result
 time), asserting (g-absent) PROCEEDS only for the barrier and
 withholds everything else, and (g-err) withholds + retains with NO
 terminalization for both EACCES and corrupt-active; (x24) KEY-CLASS
-CLASSIFICATION BOUNDARIES (r27 Codex M4 + r28 Codex m1/m2): auth failure →
+CLASSIFICATION BOUNDARIES (r27 Codex M4 + r28 Codex m1/m2 + r30
+Codex m1's re-read outcome taxonomy): auth failure →
 `ConfirmRecordKeyClassError`; invalid observed length → key-class;
 missing key file / EACCES → NOT key-class (READ-side TRANSIENT);
 unsupported PRF / too-new envelope / bad nonce ENCODING or length /
@@ -3258,14 +3374,21 @@ key-class (NON-key-class permanent — these fail BEFORE AEAD,
 (`crypto.go:354-356`); the COMBINED plaintext-active /
 K-encrypted-confirm scenario under a swapped-but-valid K′ asserts
 ZERO write/delete (the read-side key-class rule retains; the
-no-create primitive is never reached); PLUS the NO-CREATE write pin
+no-create primitive is never reached); the CLEAR-TIME re-read
+taxonomy (r30 Codex m1): byte-MISMATCH → RETAIN + keyClass set
+EXPLICITLY (restoration-required); invalid-length →
+restoration-required (via `ErrMasterKeyLength`); EACCES / ENOENT /
+mount-IO → RETAIN + journal the exact error with the
+key-state-UNVERIFIABLE message (generic text, NO restoration
+claim); a legitimate same-content rewrite passes;
+PLUS the NO-CREATE write pin
 (r27 Codex M2 + r28 Codex M1): an encrypted repair write attempted
 with the key
 file missing FAILS with no key created (the file stays absent), a
 K-swap between gate and write is impossible by construction (one
 snapshot), a plaintext repair write proceeds with no key access
 at all, and EVERY non-arm `WriteConfirm` producer ((w-a), (w-b)/
-(w-c), R (a), R (c), D tombstone) takes the primitive. This closes the
+(w-c), (w-u), R (a), R (c), D tombstone) takes the primitive. This closes the
 master's re-arm-after-confirmed residual for the whole confirm-type
 class AND the post-durability replacement finalize — the two places a
 lingering record's replay is unsafe.
@@ -3736,7 +3859,9 @@ classification snapshot.
   first-commit rollback bullet (:578-585), AND the live
   `d.dp.ApplyConfig` reference (:936) (r2 Codex MINOR 3).
 - Source comments contradicting the rollback recurrence get reworded in
-  the same PR: `daemon_run_naming.go:200-206` ("one-way ... at most once"),
+  the FOLLOW-UP unit (§4.7 — these comments document the recurrence
+  work item H terminates; the "same PR" framing predates the r28
+  split): `daemon_run_naming.go:200-206` ("one-way ... at most once"),
   `bootstrap.go:284-289` ("one-way for the daemon's lifetime"),
   `daemon_apply.go:213-220` ("Exit is one-way"), plus the r3 additions
   `daemon.go:901`, `bootstrap.go:276` ("written once at startup and at most
@@ -4006,7 +4131,7 @@ the full Go/Rust suites, smoke) run for BOTH units.*
 
 1. `go build ./... && go vet ./pkg/daemon/... ./pkg/fwdstatus/...` — the
    field retype makes the compiler enumerate every conversion site.
-   **[CORE]**
+   (Untagged — runs for BOTH units per the partition header.)
 2. New `pkg/daemon/daemon_dp_race_test.go` (under `-race`, `-count=5`)
    — the accessor/race tests are **[CORE]**; the work-item G gate
    tests and work-item H/H2 tests nested below are **[FOLLOW-UP]**:
@@ -4386,9 +4511,12 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      (x22) D-SUPPRESSION LEGS (r27 Codex m1 + r29 Codex m3): (x22a)
      ARM-BARRIER CLEARANCE — seed a D-kind slot debt, land a FULLY
      DURABLE arm on the slot (no W debt), assert D is CLEARED by the
-     arm's own supersession (riding the arm's barrier —
-     gate-independent, not a D action), never acted on by D's own
-     machinery afterward; (x22b) SYNCAPPLY-PRE-RENAME (r27 Codex
+     arm's own supersession (riding the arm's dir-fsync DURABILITY
+     barrier — gate-independent, not a D action; a FAILED barrier
+     leaves D standing, suppressed by the resulting W debt); AND
+     the deferred-barrier leg (r30 Codex m2): a post-rename arm
+     failure then a SUCCESSFUL (w-a) durability completion clears
+     D WITH W; (x22b) SYNCAPPLY-PRE-RENAME (r27 Codex
      M3): D inert while `persistDegraded` stands (C's record
      survives per #5473), D's fresh re-read proceeds once the
      replacement lands; the `armedArmID != ""` conjunct is
@@ -4396,22 +4524,32 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      with a test-seam leg seeding D beside a live window and
      asserting no D action until the window resolves;
      (x23) ACTIVE-GATE MATRIX (r27 Codex M1 +
-     r28 Codex M1's inventory completion): (g-ok)/(g-absent)/
-     (g-err) × (W (w-a) rewrite, W (w-b)/(w-c) restore, R (a)
+     r28 Codex M1's inventory completion + r29 Codex m2's (w-u)
+     leg): (g-ok)/(g-absent)/
+     (g-err) × (W (w-a) rewrite, W (w-b)/(w-c) restore, W (w-u)
+     unreadable-slot restore-over, R (a)
      tombstone+delete, R (c) mismatch rewrite, D tombstone, D
      delete, confirm-side clear, sanctioned both-files-removed
      barrier) at BOTH placements, asserting (g-absent) PROCEEDS
      only for the barrier and (g-err) withholds + retains with NO
      terminalization (EACCES and corrupt-active legs);
      (x24) KEY-CLASS CLASSIFICATION BOUNDARIES (r27 Codex M4 + r28
-     Codex m1/m2): auth failure → key-class; invalid observed
+     Codex m1/m2 + r30 Codex m1's re-read outcome taxonomy): auth
+     failure → key-class; invalid observed
      length → key-class; missing key file / EACCES → NOT key-class
      (READ-side TRANSIENT); unsupported PRF / too-new envelope /
      bad nonce ENCODING or length → NOT key-class (NON-key-class
      permanent — the failures precede AEAD, `crypto.go:328-353`),
      while a well-formed TAMPERED nonce reaches `gcm.Open` and is
      key-class by authentication indistinguishability
-     (`crypto.go:354-356`); the COMBINED plaintext-active /
+     (`crypto.go:354-356`); the CLEAR-TIME re-read taxonomy (r30
+     Codex m1): byte-MISMATCH → RETAIN + keyClass set EXPLICITLY
+     (restoration-required); invalid-length → restoration-required
+     (via `ErrMasterKeyLength`); EACCES / ENOENT / mount-IO →
+     RETAIN + journal the exact error with the
+     key-state-UNVERIFIABLE message (generic text, NO restoration
+     claim); a legitimate same-content rewrite passes; the COMBINED
+     plaintext-active /
      K-encrypted-confirm scenario under a swapped-but-valid K′
      asserts ZERO write/delete (the read-side key-class rule
      retains; the no-create primitive is never reached); and the
@@ -4419,21 +4557,22 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      missing FAILS with NO key created (the file stays absent),
      one snapshot feeds gate+write, a plaintext repair write
      performs no key access, and EVERY non-arm `WriteConfirm`
-     producer ((w-a), (w-b)/(w-c), R (a), R (c), D tombstone) is
+     producer ((w-a), (w-b)/(w-c), (w-u), R (a), R (c), D
+     tombstone) is
      covered.
 3. Update `daemon_natpoolalarm_race_test.go` (`writeDPFor` →
    `setDataplane`) and `daemon_forwarding_status_test.go` (rewrite against
    the narrowed adapter: `ProjectsMapStats`/`UsesUserspaceStatusAdapter`
    move to asserting `CachedStatus` per-call probing;
    `UsesCurrentDataplaneAfterSwap` maps onto the narrowed shape with
-   `setDataplane` swaps).
+   `setDataplane` swaps). **[CORE]**
 4. Scoped race gate: new `test-race-dp` make target —
    `go test -race ./pkg/daemon/ -run 'DataplaneCell|NATPoolAlarm|ForwardingStatus|BootstrapExit' -count=2`
    — invoked from `test-go` (r1/r2: plain `go test ./...` has no race
-   teeth; full-repo `-race` stays out of scope).
+   teeth; full-repo `-race` stays out of scope). **[CORE]**
 5. Canary tests: redesigned matcher self-tests both directions; new
    `daemon_dp_canary_test.go` asserts no direct `dpCell` access outside the
-   accessors.
+   accessors. **[CORE]**
 6. `make test` explicitly (Go + Rust legs), plus the full Go suite.
 7. Smoke gates (engineering-style.md:93-103 — NOT waivable; r2 Codex M6
    specifics folded):
@@ -4480,7 +4619,7 @@ the full Go/Rust suites, smoke) run for BOTH units.*
   past the next boot; the lifecycle redesign is a pre-existing policy
   question, not a `d.dp` publication concern.
 
-## 11. Open questions for adversarial review (r30)
+## 11. Open questions for adversarial review (r31)
 
 Resolved in v2-v9 (for the record): A2 deletion; atomic cell choice;
 sampler-only adapter — now STRUCTURAL via `CachedStatusProvider`;
