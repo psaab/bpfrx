@@ -1,3 +1,43 @@
+## 2026-07-24 — #6458 (review fold): IKE local-owner V2 gate + multi-RG V1b refinement
+
+- **Timestamp**: 2026-07-24 (fix/6458-fabric-zone-stamp-validation)
+- **Action**: Folded the hostile review's two PoC-proven findings on the
+  #6458 stamp validation. (1) MEDIUM/security: the Stage-11 IKE
+  host-inbound gate consumed the V1-only stamp — a forged stamped NEW IKE
+  initiation to a single-primary backup's reth address was Passthrough AND
+  seeded the #6471 live-exchange table for forged Responder-SPI follow-ups.
+  `ike_host_inbound_deny_zone` now shadows the override through the new
+  `gate_fabric_zone_override_on_local_owner_rg` (fabric.rs), the V2 owner
+  binding resolved from the packet's local destination address via
+  `owner_rg_for_local_address` (EgressInterface primary_v4/v6 → RG) — on a
+  backup no local address is locally active, so the forged stamp degrades
+  to the fabric zone (default-deny). (2) MEDIUM/availability: V1b
+  over-rejected zones spanning multiple RGs on split nodes (one locally
+  active + one peer-active RG killed the legitimate active/active punt).
+  The NONE-active condition is now ALL-active: reject only when EVERY
+  bound RG is forwarding-active locally (single-primary kill preserved;
+  V2 remains the policy teeth). (3) LOW (filter-log zone misattribution on
+  V1-passing spoofed stamps) is deferred as an accepted residual — no
+  verdict impact, noted in the PR. Docs posture section updated to match
+  (the "host-inbound variant is dead" claim is now true; multi-RG
+  behavior documented).
+- **File(s)**: userspace-dp/src/afxdp/forwarding/fabric.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/poll_stages_tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  docs/fabric-cross-chassis-fwd.md, _Log.md
+- **Validation**: new pins `gate_fabric_zone_override_on_local_owner_rg_6458`
+  (owner resolution + active/inactive/no-RG/no-stamp cases) and
+  `zone_encoded_fabric_stamp_honored_for_multi_rg_zone_split_6458`
+  (split-accept + all-local-reject); RED proven firsthand on the V1b
+  refinement (reverted to NONE-active → multi-RG pin FAILS with the
+  over-rejection; restored → 12/12 6458-tagged green); the IKE gate's RED
+  was proven by the hostile reviewer's stage-level PoC (stamped
+  Passthrough pre-fold). Full crate suite 4211 passed / 0 failed;
+  poll_stages_tests' 17 stage-11 call sites carry the new now_secs arg
+  unmodified.
+
 ## 2026-07-24 — #6434: split filter compiler god-functions
 
 - **Timestamp**: 2026-07-24 (fix/6434-filter-compiler-split)

@@ -769,15 +769,24 @@ pre-existing gates (fabric ingress, magic, id != 0, zone exists):
 ### Resulting posture
 
 - **Single-primary cluster (the normal mode):** the primary rejects every
-  stamp (V1b: every zone's RG is local); the backup rejects every stamp
-  for new-flow purposes (V2: no owner RG is locally active, and transit
-  resolutions are HAInactive there anyway). Both nodes fail closed; the
+  stamp (V1b: every zone's RGs are ALL local); the backup rejects every
+  stamp for new-flow purposes (V2: no owner RG is locally active, and
+  transit resolutions are HAInactive there anyway) — INCLUDING the
+  Stage-11 IKE host-inbound gate, which applies the same V2 owner binding
+  resolved from the packet's local destination address
+  (`gate_fabric_zone_override_on_local_owner_rg`, review fold: a forged
+  stamped NEW IKE initiation to the backup's reth address is denied and
+  never seeds the #6471 live-exchange table). Both nodes fail closed; the
   host-inbound and transit variants are dead on both.
 - **Split-RG active/active:** exactly the stamp shapes matching the live
   RG split (claimed-zone RG remote + resolution-owner RG local) are
   honored — the legitimate punt keeps working (pinned by
   `legitimate_fabric_punted_flow_still_admitted_6458` and
-  `legitimate_fabric_punted_host_inbound_still_admitted_6458`).
+  `legitimate_fabric_punted_host_inbound_still_admitted_6458`). A zone
+  spanning MULTIPLE RGs keeps the stamp whenever at least one bound RG is
+  peer-active (the V1b NONE-active form over-rejected that shape; the
+  `zone_encoded_fabric_stamp_honored_for_multi_rg_zone_split_6458` pin
+  covers it).
 - **A rejected stamp** degrades the frame to today's UNSTAMPED
   fabric-frame posture (the fabric interface's own zone governs policy,
   screens, and host-inbound) — never below it. The subsequent default-deny

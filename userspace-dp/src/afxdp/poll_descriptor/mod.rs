@@ -276,6 +276,7 @@ pub(super) fn poll_binding_process_descriptor(
                     &binding.live,
                     worker_ctx,
                     now_ns,
+                    now_secs,
                 ) {
                     IpsecPassthroughOutcome::NotClaimed => {}
                     IpsecPassthroughOutcome::Passthrough => {

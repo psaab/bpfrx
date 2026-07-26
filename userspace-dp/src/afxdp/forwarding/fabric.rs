@@ -212,14 +212,19 @@ pub(in crate::afxdp) fn fabric_for_ingress(
 ///   This rejects broadcast/multicast sprays and frames addressed to a
 ///   third party.
 /// - **V1b — RG binding.** The claimed zone must have at least one
-///   RG-bound member interface (`zone_to_rgs`), and NONE of its bound RGs
-///   may be forwarding-active LOCALLY. When the claimed zone's RG is
+///   RG-bound member interface (`zone_to_rgs`), and NOT ALL of its bound
+///   RGs may be forwarding-active LOCALLY — at least one must be
+///   peer-active for the stamp to hold. When every RG the zone spans is
 ///   primary on the RECEIVER, traffic in that zone ingresses locally —
 ///   the peer has no business stamping it (on a single-primary cluster
-///   this rejects every stamp on the primary). A zone with no RG-bound
-///   members (`mgmt`/fxp0, `control`/em0+fab, empty zones) can never be
-///   legitimately stamped, which kills the host-inbound variant's
-///   `mgmt` claim.
+///   this rejects every stamp on the primary; the policy teeth are V2's
+///   owner-RG gate regardless). A zone spanning MULTIPLE RGs on a
+///   split-RG node (one locally active, one peer-active) still accepts:
+///   the peer legitimately punts the flows it owns (review-fold — the
+///   NONE-active form over-rejected that legitimate active/active
+///   stamp). A zone with no RG-bound members (`mgmt`/fxp0,
+///   `control`/em0+fab, empty zones) can never be legitimately stamped,
+///   which kills the host-inbound variant's `mgmt` claim.
 ///
 /// What this deliberately does NOT try to stop: on a SHARED fabric
 /// segment with a live RG split, an attacker can clone the exact stamp
@@ -248,13 +253,16 @@ pub(in crate::afxdp) fn zone_encoded_fabric_stamp_valid(
     if frame_dst_mac != fabric.local_mac.as_slice() {
         return false;
     }
-    // V1b: the claimed zone must be RG-bound and none of its RGs may be
-    // forwarding-active locally. An absent/empty entry means the zone has
-    // no RG-bound members and can never be legitimately stamped.
+    // V1b: the claimed zone must be RG-bound, and NOT ALL of its RGs may
+    // be forwarding-active locally — at least one must be peer-active
+    // (reject only when EVERY bound RG is locally active: the single-
+    // primary kill with no multi-RG-zone over-rejection). An absent/empty
+    // entry means the zone has no RG-bound members and can never be
+    // legitimately stamped.
     match forwarding.zone_to_rgs.get(&zone_id) {
         Some(rgs) => {
             !rgs.is_empty()
-                && !rgs.iter().any(|rg| {
+                && !rgs.iter().all(|rg| {
                     ha_state
                         .get(rg)
                         .is_some_and(|group| group.is_forwarding_active(now_secs))
@@ -285,6 +293,60 @@ pub(in crate::afxdp) fn gate_fabric_zone_override_on_owner_rg(
 ) -> Option<u16> {
     let zone = ingress_zone_override?;
     let owner_rg = owner_rg_for_resolution(forwarding, resolution);
+    if owner_rg > 0
+        && ha_state
+            .get(&owner_rg)
+            .is_some_and(|group| group.is_forwarding_active(now_secs))
+    {
+        Some(zone)
+    } else {
+        None
+    }
+}
+
+/// #6458 (review fold): owner RG of a LOCAL (firewall-owned) address —
+/// the redundancy group of the egress interface whose primary address
+/// matches, 0 when no RG-bound interface owns it. Used by the IKE
+/// host-inbound variant of the V2 owner binding: a stamped zone may drive
+/// host-inbound admission for an address only when THAT address's RG is
+/// forwarding-active locally (on a single-primary backup no local address
+/// is locally active, so every stamped host-inbound admission degrades to
+/// the fabric interface's own zone — default-deny).
+pub(in crate::afxdp) fn owner_rg_for_local_address(
+    forwarding: &ForwardingState,
+    ip: IpAddr,
+) -> i32 {
+    forwarding
+        .egress
+        .values()
+        .find(|iface| match ip {
+            IpAddr::V4(v4) => iface.primary_v4 == Some(v4),
+            IpAddr::V6(v6) => iface.primary_v6 == Some(v6),
+        })
+        .map(|iface| iface.redundancy_group.max(0))
+        .unwrap_or_default()
+}
+
+/// #6458 (review fold): V2 owner binding for HOST-DESTINED packets (the
+/// Stage-11 IKE host-inbound gate). Mirrors
+/// [`gate_fabric_zone_override_on_owner_rg`] but resolves the owner RG
+/// from the packet's local destination address instead of a forwarding
+/// resolution — a stamped zone drives host-inbound admission only when
+/// the destination address's owner RG is forwarding-active LOCALLY. A
+/// forged stamp to a backup's reth address (owner RG primary on the peer)
+/// is stripped, so the fabric interface's own zone governs (default-deny)
+/// and a forged NEW IKE initiation is denied instead of seeding the
+/// #6471 live-exchange table.
+#[inline]
+pub(in crate::afxdp) fn gate_fabric_zone_override_on_local_owner_rg(
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    now_secs: u64,
+    ingress_zone_override: Option<u16>,
+    dst_ip: IpAddr,
+) -> Option<u16> {
+    let zone = ingress_zone_override?;
+    let owner_rg = owner_rg_for_local_address(forwarding, dst_ip);
     if owner_rg > 0
         && ha_state
             .get(&owner_rg)

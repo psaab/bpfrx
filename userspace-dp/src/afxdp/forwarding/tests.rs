@@ -581,6 +581,52 @@ fn zone_encoded_fabric_stamp_honored_for_remote_rg_zone_6458() {
     );
 }
 
+// #6458 (review fold) preservation pin — the multi-RG-zone refinement. A
+// zone spanning TWO redundancy groups (reth1.0→RG2 + reth2.0→RG1, both
+// `lan`) on a split-RG node: one bound RG locally active, one peer-active.
+// V1b must ACCEPT the legitimate punt stamp (the NONE-active form
+// over-rejected this shape and default-denied active/active new flows).
+// The kill is preserved only when EVERY bound RG is locally active (the
+// single-primary posture for a multi-RG zone).
+#[test]
+fn zone_encoded_fabric_stamp_honored_for_multi_rg_zone_split_6458() {
+    let mut state = build_forwarding_state(&nat_snapshot_with_fabric());
+    let now_secs = monotonic_nanos() / 1_000_000_000;
+    // lan spans RG 1 and RG 2 in this fixture mutation.
+    state.zone_to_rgs.insert(TEST_LAN_ZONE_ID, vec![1, 2]);
+    let mut frame = vec![0u8; 64];
+    frame[0..6].copy_from_slice(&[0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]);
+    frame[6..12].copy_from_slice(&[0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x01]);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 21,
+        ..UserspaceDpMeta::default()
+    };
+    // Split node: RG 1 locally active, RG 2 peer-active → accept (the
+    // peer owns part of the zone and legitimately punts its flows).
+    let split = BTreeMap::from([
+        (1, active_ha_runtime(now_secs)),
+        (2, inactive_ha_runtime(now_secs)),
+    ]);
+    assert_eq!(
+        parse_zone_encoded_fabric_ingress_from_frame(frame.as_slice(), meta, &state, &split, now_secs),
+        Some(TEST_LAN_ZONE_ID),
+        "multi-RG zone with a peer-active RG must keep the legitimate stamp"
+    );
+    // Every bound RG locally active → reject (the kill shape).
+    let all_local = BTreeMap::from([
+        (1, active_ha_runtime(now_secs)),
+        (2, active_ha_runtime(now_secs)),
+    ]);
+    assert_eq!(
+        parse_zone_encoded_fabric_ingress_from_frame(frame.as_slice(), meta, &state, &all_local, now_secs),
+        None,
+        "multi-RG zone with every RG locally active must still reject the stamp"
+    );
+}
+
 // #6458 fail-on-revert (V2 owner binding): a validated stamp drives
 // NEW-flow zone-pair policy only when the resolution's owner RG is
 // forwarding-active locally. The egress in this fixture is reth0.80
@@ -639,6 +685,68 @@ fn gate_fabric_zone_override_on_owner_rg_6458() {
     // No stamp -> None in, None out.
     assert_eq!(
         gate_fabric_zone_override_on_owner_rg(&state, &active, now_secs, None, resolution),
+        None
+    );
+}
+
+// #6458 (review fold) fail-on-revert: the HOST-DESTINED (Stage-11 IKE)
+// variant of the V2 owner binding. A stamped zone drives host-inbound
+// admission for a local address only when THAT address's owner RG is
+// forwarding-active locally — on a single-primary backup a forged stamp to
+// the backup's reth address (172.16.80.8 on reth0.80, RG 1 in this fixture)
+// is stripped, so the forged NEW IKE initiation degrades to the fabric
+// zone (default-deny) instead of seeding the #6471 live-exchange table.
+#[test]
+fn gate_fabric_zone_override_on_local_owner_rg_6458() {
+    let state = build_forwarding_state(&nat_snapshot_with_fabric());
+    let now_secs = monotonic_nanos() / 1_000_000_000;
+    let reth_addr = IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 80, 8));
+    // The fixture maps the local address to its interface's RG.
+    let owner = owner_rg_for_local_address(&state, reth_addr);
+    assert_eq!(owner, 1, "reth0.80's primary address must resolve to RG 1");
+    // Owner RG (1) locally active -> honored (legitimate punt of a
+    // host-inbound flow we own).
+    let active = BTreeMap::from([(1, active_ha_runtime(now_secs))]);
+    assert_eq!(
+        gate_fabric_zone_override_on_local_owner_rg(
+            &state,
+            &active,
+            now_secs,
+            Some(TEST_LAN_ZONE_ID),
+            reth_addr,
+        ),
+        Some(TEST_LAN_ZONE_ID)
+    );
+    // Owner RG NOT forwarding-active (single-primary backup) -> stripped:
+    // the forged stamped IKE initiation falls to the fabric zone.
+    let inactive = BTreeMap::from([(1, inactive_ha_runtime(now_secs))]);
+    assert_eq!(
+        gate_fabric_zone_override_on_local_owner_rg(
+            &state,
+            &inactive,
+            now_secs,
+            Some(TEST_LAN_ZONE_ID),
+            reth_addr,
+        ),
+        None
+    );
+    // A destination with no RG-bound owning interface (owner 0 — e.g. the
+    // fabric peer address or an lo0 address) -> stripped, never trusted.
+    let no_rg_dst = IpAddr::V4(std::net::Ipv4Addr::new(10, 99, 13, 1));
+    assert_eq!(owner_rg_for_local_address(&state, no_rg_dst), 0);
+    assert_eq!(
+        gate_fabric_zone_override_on_local_owner_rg(
+            &state,
+            &active,
+            now_secs,
+            Some(TEST_LAN_ZONE_ID),
+            no_rg_dst,
+        ),
+        None
+    );
+    // No stamp -> None in, None out.
+    assert_eq!(
+        gate_fabric_zone_override_on_local_owner_rg(&state, &active, now_secs, None, reth_addr),
         None
     );
 }

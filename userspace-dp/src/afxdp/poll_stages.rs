@@ -980,6 +980,7 @@ fn ike_host_inbound_deny_zone(
     meta: UserspaceDpMeta,
     dst_port: u16,
     ingress_zone_override: Option<u16>,
+    now_secs: u64,
     worker_ctx: &WorkerContext,
 ) -> Option<u16> {
     let ingress_logical = crate::afxdp::forwarding::resolve_ingress_logical_ifindex(
@@ -988,6 +989,20 @@ fn ike_host_inbound_deny_zone(
         meta.ingress_vlan_id,
     )
     .unwrap_or(meta.ingress_ifindex as i32);
+    // #6458 (review fold): the V1-validated stamp drives host-inbound
+    // admission only when the DESTINATION address's owner RG is
+    // forwarding-active LOCALLY — the same V2 owner binding the session-miss
+    // zone-pair sites apply, resolved for a host-destined packet from the
+    // local address (review MEDIUM: a forged stamped NEW IKE initiation to a
+    // single-primary backup's reth address was Passthrough AND seeded the
+    // #6471 live-exchange table; it now degrades to the fabric zone).
+    let ingress_zone_override = crate::afxdp::forwarding::gate_fabric_zone_override_on_local_owner_rg(
+        worker_ctx.forwarding,
+        worker_ctx.ha_state,
+        now_secs,
+        ingress_zone_override,
+        flow.dst_ip,
+    );
     let (from_zone_id, _to_zone_id) =
         crate::afxdp::forwarding::zone_pair_ids_for_flow_with_override(
             worker_ctx.forwarding,
@@ -1076,6 +1091,7 @@ pub(super) fn stage_ipsec_passthrough_check(
     binding_live: &BindingLiveState,
     worker_ctx: &WorkerContext,
     now_ns: u64,
+    now_secs: u64,
 ) -> IpsecPassthroughOutcome {
     let Some(flow) = flow else {
         return IpsecPassthroughOutcome::NotClaimed;
@@ -1116,7 +1132,7 @@ pub(super) fn stage_ipsec_passthrough_check(
         // #4323 Option B: gate a NEW inbound IKE initiation on host-inbound.
         crate::afxdp::forwarding::IpsecAdmissionClass::NewInboundIke => {
             if let Some(from_zone_id) =
-                ike_host_inbound_deny_zone(flow, meta, dst_port, ingress_zone_override, worker_ctx)
+                ike_host_inbound_deny_zone(flow, meta, dst_port, ingress_zone_override, now_secs, worker_ctx)
             {
                 return IpsecPassthroughOutcome::Denied { from_zone_id };
             }
@@ -1161,6 +1177,7 @@ pub(super) fn stage_ipsec_passthrough_check(
                         meta,
                         dst_port,
                         ingress_zone_override,
+                        now_secs,
                         worker_ctx,
                     )
                 {

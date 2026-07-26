@@ -2380,7 +2380,7 @@ fn stage_ipsec_passthrough_exempts_all_classes_3616() {
         meta.addr_family = family as u8;
         meta.protocol = protocol;
         let outcome =
-            stage_ipsec_passthrough_check(Some(&flow), &frame, meta, None, &live, &worker_ctx, TEST_NOW_NS);
+            stage_ipsec_passthrough_check(Some(&flow), &frame, meta, None, &live, &worker_ctx, TEST_NOW_NS, TEST_NOW_SECS);
         assert!(
             matches!(outcome, IpsecPassthroughOutcome::Passthrough),
             "Stage 11 must exempt raw IPsec (family {family}, proto {protocol}, \
@@ -2403,7 +2403,7 @@ fn stage_ipsec_passthrough_exempts_all_classes_3616() {
                 None,
                 &live,
                 &worker_ctx,
-                TEST_NOW_NS,
+                TEST_NOW_NS, TEST_NOW_SECS,
             ),
             IpsecPassthroughOutcome::NotClaimed
         ),
@@ -2414,7 +2414,7 @@ fn stage_ipsec_passthrough_exempts_all_classes_3616() {
     let meta = tcp_v4_meta(&frame, TCP_FLAG_ACK);
     assert!(
         matches!(
-            stage_ipsec_passthrough_check(None, &frame, meta, None, &live, &worker_ctx, TEST_NOW_NS),
+            stage_ipsec_passthrough_check(None, &frame, meta, None, &live, &worker_ctx, TEST_NOW_NS, TEST_NOW_SECS),
             IpsecPassthroughOutcome::NotClaimed
         ),
         "a flowless packet is not claimed by Stage 11"
@@ -2637,7 +2637,7 @@ fn stage_ipsec_passthrough_gates_new_ike_4323() {
         None,
         &live,
         &worker_ctx,
-        TEST_NOW_NS,
+        TEST_NOW_NS, TEST_NOW_SECS,
     );
     assert!(
         matches!(
@@ -2664,7 +2664,7 @@ fn stage_ipsec_passthrough_gates_new_ike_4323() {
                 None,
                 &live,
                 &worker_ctx,
-                TEST_NOW_NS,
+                TEST_NOW_NS, TEST_NOW_SECS,
             ),
             IpsecPassthroughOutcome::Passthrough
         ),
@@ -2695,7 +2695,7 @@ fn stage_ipsec_passthrough_gates_new_ike_4323() {
                 None,
                 &live,
                 &worker_ctx,
-                TEST_NOW_NS,
+                TEST_NOW_NS, TEST_NOW_SECS,
             ),
             IpsecPassthroughOutcome::Denied { .. }
         ),
@@ -2716,7 +2716,7 @@ fn stage_ipsec_passthrough_gates_new_ike_4323() {
                 None,
                 &live,
                 &worker_ctx,
-                TEST_NOW_NS,
+                TEST_NOW_NS, TEST_NOW_SECS,
             ),
             IpsecPassthroughOutcome::Passthrough
         ),
@@ -2736,7 +2736,7 @@ fn stage_ipsec_passthrough_gates_new_ike_4323() {
                 None,
                 &live,
                 &worker_ctx,
-                TEST_NOW_NS,
+                TEST_NOW_NS, TEST_NOW_SECS,
             ),
             IpsecPassthroughOutcome::Passthrough
         ),
@@ -2756,7 +2756,7 @@ fn stage_ipsec_passthrough_gates_new_ike_4323() {
                 None,
                 &live,
                 &worker_ctx,
-                TEST_NOW_NS,
+                TEST_NOW_NS, TEST_NOW_SECS,
             ),
             IpsecPassthroughOutcome::Passthrough
         ),
@@ -2861,7 +2861,7 @@ fn stage_ipsec_passthrough_gates_forged_responder_spi_6471() {
                 None,
                 &live,
                 &worker_ctx,
-                TEST_NOW_NS,
+                TEST_NOW_NS, TEST_NOW_SECS,
             ),
             IpsecPassthroughOutcome::Denied { .. }
         ),
@@ -2880,7 +2880,7 @@ fn stage_ipsec_passthrough_gates_forged_responder_spi_6471() {
                 None,
                 &live,
                 &worker_ctx,
-                TEST_NOW_NS,
+                TEST_NOW_NS, TEST_NOW_SECS,
             ),
             IpsecPassthroughOutcome::Denied { .. }
         ),
@@ -2900,7 +2900,7 @@ fn stage_ipsec_passthrough_gates_forged_responder_spi_6471() {
                 None,
                 &live,
                 &worker_ctx,
-                TEST_NOW_NS,
+                TEST_NOW_NS, TEST_NOW_SECS,
             ),
             IpsecPassthroughOutcome::Passthrough
         ),
@@ -2931,7 +2931,7 @@ fn stage_ipsec_passthrough_gates_forged_responder_spi_6471() {
                 None,
                 &live,
                 &worker_ctx,
-                TEST_NOW_NS,
+                TEST_NOW_NS, TEST_NOW_SECS,
             ),
             IpsecPassthroughOutcome::Passthrough
         ),
@@ -2950,7 +2950,7 @@ fn stage_ipsec_passthrough_gates_forged_responder_spi_6471() {
                 None,
                 &live,
                 &worker_ctx,
-                TEST_NOW_NS,
+                TEST_NOW_NS, TEST_NOW_SECS,
             ),
             IpsecPassthroughOutcome::Denied { .. }
         ),
@@ -2971,7 +2971,7 @@ fn stage_ipsec_passthrough_gates_forged_responder_spi_6471() {
                 None,
                 &live,
                 &worker_ctx,
-                TEST_NOW_NS,
+                TEST_NOW_NS, TEST_NOW_SECS,
             ),
             IpsecPassthroughOutcome::Denied { .. }
         ),
@@ -2991,7 +2991,7 @@ fn stage_ipsec_passthrough_gates_forged_responder_spi_6471() {
                 None,
                 &live,
                 &worker_ctx,
-                TEST_NOW_NS,
+                TEST_NOW_NS, TEST_NOW_SECS,
             ),
             IpsecPassthroughOutcome::Passthrough
         ),
@@ -3064,7 +3064,7 @@ fn run_stage11(
         rg_epochs: &rg_epochs,
         cold_path_sample_mask: 0xff,
     };
-    stage_ipsec_passthrough_check(Some(flow), frame, meta, None, &live, &worker_ctx, TEST_NOW_NS)
+    stage_ipsec_passthrough_check(Some(flow), frame, meta, None, &live, &worker_ctx, TEST_NOW_NS, TEST_NOW_SECS)
 }
 
 /// #5620 RED-on-revert: Stage 11 must NOT claim the kernel-XFRM passthrough
