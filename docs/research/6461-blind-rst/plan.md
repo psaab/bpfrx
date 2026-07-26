@@ -4170,7 +4170,13 @@ entered ONLY after authenticated support ADVERTISEMENT
 capability record); a baseline peer's first ordinary
 legacy frame is BUFFERED, the connection latches legacy,
 installs, and dispatches the buffered frame in order —
-never rejected); and the CONFIRM-timeout byte
+never rejected — and the latch SETTLES PERMANENTLY on that
+first ordinary frame (v9.9.54.11, round-59 SMR F1: the
+arrival of the first ordinary legacy frame (ClockSync or a
+session frame) IS the proof of the baseline class — there
+is no advertisement-timeout retry cycle; the latch settles
+at the frame, not on a timer, and holds for the
+connection's lifetime); and the CONFIRM-timeout byte
 rules are exact (v9.9.54.9: the stream retains and
 legacy-latches ONLY if ZERO bytes were consumed; a partial
 CONFIRM frame closes; a COMPLETE late CONFIRM is consumed
@@ -4236,8 +4242,13 @@ restore preemption (`vrrp/manager.go:389`) while still
 lacking A's complete table — and normal VRRP does not
 consume the packed private-election readiness bit
 (`cluster/manager.go:289`); the alternative is the explicit
-aggregate: EVERY locally relevant inbound AND outbound
-obligation discharged at the current generation); and the hold's timeout
+aggregate: EVERY locally relevant obligation discharged at
+the current generation — enumerated EXACTLY (v9.9.54.11,
+round-59 SMR F2: the THREE classes are the inbound repair
+obligation (peer→local table completeness), the outbound
+bulk obligation (local→peer state), and every cohort in the
+pending-rejection set (which gates readiness per the
+earlier folds)); and the hold's timeout
 NEVER silently releases while a negotiated repair
 obligation remains armed (a stale timeout checks the
 generation and re-arms); and the hold's SCOPE is
@@ -4354,7 +4365,14 @@ as generation-tagged IDEMPOTENT follow-ups with their own
 deadlines OUTSIDE the packed word's critical section (the
 activation serialization NEVER spans VRRP/netlink
 operations), and a hung effect abandons its ticket so a
-later activation retries it (v9.9.54.10: this REPLACES the
+later activation retries it — IDEMPOTENTLY (v9.9.54.11,
+round-59 SMR F3: the effect set contains NO counters and NO
+one-shots — the hold release is a state (release twice =
+no-op), the mirror write is a value (write twice = same
+value), the primed flag is a flag (set twice = no-op), and
+the timer cancellation is a cancel (twice = no-op) — so the
+retry re-runs the whole effect set idempotently with no
+double-execution hazard) (v9.9.54.10: this REPLACES the
 v9.9.54.10-SMR-F2 "no I/O in the critical section" premise,
 which was wrong about `ReleaseSyncHold`)); then bumps the
 generation AND RE-ARMS THE ELECTION HOLD before exposing
