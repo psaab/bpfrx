@@ -4023,15 +4023,43 @@ leaves stale peer rows; switching protocols mid-window
 produces incompatible terminal processing): the
 `CAPABILITY_CONFIRM` exchange COMPLETES BEFORE slot
 installation, session dispatch, and cold-prime (the
-confirmation is part of the pre-dispatch handshake; the
+confirmation is part of the pre-dispatch handshake — and
+its lifecycle is TRACKED AND DEADLINED (v9.9.54.2,
+round-54 Codex H2: a confirmation phase between the wrapper
+(`sync_conn.go:118`) and slot installation (`:130`) can
+otherwise wait with NO deadline while belonging to neither
+lifecycle registry — `Stop` closes installed slots
+(`:363-370`) and tracked setups (`:371-375`) but would miss
+it: the connection KEEPS its setup registration and a HARD
+confirmation deadline until the atomic
+finish-setup/install transition, so `Stop` covers it and
+the deadline is real; admission-cap retention follows the
+same registration); the
 protocol class — legacy vs repair-era — is LATCHED for the
-connection's lifetime at that point; a confirmation that
-cannot complete before dispatch aborts the install and
-retries; and the documented fallback for a lazy confirm is
-to latch the protocol class for the entire transaction and,
-on the inactive→active transition, explicitly schedule a
-FRESH repair-era full bulk — never a mid-transaction
-switch); the
+connection's lifetime at that point; and the timeout path
+is the LATCH, never an abort-retry flap (v9.9.54.1,
+round-54 AGY Q2/Q3 — the earlier text had BOTH "aborts the
+install and retries" AND the latch fallback, which are
+mutually exclusive: a slow or never-arriving CONFIRM
+LATCHES THE CONNECTION INTO THE LEGACY CLASS for the
+connection's lifetime (the CONFIRM exchange carries its own
+deadline, like the auth handshake's; the peer that cannot
+confirm gets legacy — the safe, complete class — and a
+later v2-capable connection re-runs the full negotiation
+from scratch); the connection never aborts over a late
+CONFIRM, so there is no reconnect flap); and when a
+capability transitions inactive→active on a LATER
+connection, a FRESH repair-era full bulk is explicitly
+scheduled — and the ACTIVATION ITSELF is one transaction
+(v9.9.54.2, round-54 Codex H3: the legacy-class prime
+completing and readiness clearing BEFORE repair-vN
+activates leaves an interval where transfer can occur with
+the obligations and freeze unarmed: on ANY transition to
+repair-vN, the activation FIRST mints the repair ID and
+atomically establishes the outbound obligation AND the
+not-ready state, and only THEN exposes `repair-vN` and
+drives the bulk — so readiness never clears ahead of the
+armed repair); the
 negotiated feature state being PER-CONNECTION (v9.9.48,
 round-51 SMR F3: it never persists across connections — a
 reconnect re-runs the full negotiation (hello, proof,
@@ -4076,9 +4104,12 @@ field-list phrasings could conflict and independent
 implementations could compute different proofs and
 reconnect-loop (`sync_auth.go:401-404`,
 `sync_conn.go:106-110, :435-477`):
-`AUTH_PROOF_v2 = HMAC(key, tag_v2 || prover_role ||
+`AUTH_PROOF_v2 = HMAC-SHA256(key, tag_v2 || prover_role ||
 term(dialer_hello) || term(acceptor_hello) ||
-term(dialer_cap) || term(acceptor_cap))` — with an EXECUTABLE
+term(dialer_cap) || term(acceptor_cap))` — the algorithm
+named exactly (v9.9.53, round-53 Codex B1: "HMAC" alone is
+ambiguous; the existing v1 proof already uses HMAC-SHA256,
+`sync_auth.go:217`) — with an EXECUTABLE
 byte grammar (v9.9.51, round-52 Codex B1 — without it, two
 conforming implementations hash different bytes and
 reconnect-loop (`sync_auth.go:401-404`,
@@ -4102,8 +4133,35 @@ order; the SHARED record segment
 (`term(dialer_hello) || term(acceptor_hello) ||
 term(dialer_cap) || term(acceptor_cap)`) is byte-identical
 for both sides, and the FULL inputs differ ONLY by
-`prover_role`; and literal KEYED HEXADECIMAL vectors for both
-roles ship in §9 as COMPLETE (input, key, output) triples
+`prover_role`; and the golden vectors are NORMATIVE AND
+LITERAL (v9.9.54.1, round-54 AGY Q1 + round-53 Codex B1 —
+computed per the formula above): the shared test key is
+`000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f`;
+the shared inputs are `dialer_hello =
+02014141414141414141414141414141414141414141414141414141414141414141`
+(v2, keyed, 32×0x41), `acceptor_hello =
+02014242424242424242424242424242424242424242424242424242424242424242`
+(v2, keyed, 32×0x42), `dialer_cap =
+01000000887766554433221100093d000000000007000000000000001f000000`
+(node_id 1, incarnation 0x1122334455667788, capacity 4000000,
+gen 7, bits 0x1F), and `acceptor_cap =
+02000000112233445566778800093d000000000007000000000000001f000000`
+(node_id 2, incarnation 0x8877665544332211, capacity 4000000,
+gen 7, bits 0x1F); the DIALER vector (prover_role 0x01) has
+input
+`7870662d636c75737465722d73796e632f76322f68656c6c6f2d7472616e73637269707401220002014141414141414141414141414141414141414141414141414141414141414141220002014242424242424242424242424242424242424242424242424242424242424242200001000000887766554433221100093d000000000007000000000000001f000000200002000000112233445566778800093d000000000007000000000000001f000000`
+and expected digest
+`48fdf3d1119bce50cf76abd185678c4c9f39701d678c9aead4c864bb907790f3`;
+the ACCEPTOR vector (prover_role 0x02) has input
+`7870662d636c75737465722d73796e632f76322f68656c6c6f2d7472616e73637269707402220002014141414141414141414141414141414141414141414141414141414141414141220002014242424242424242424242424242424242424242424242424242424242424242200001000000887766554433221100093d000000000007000000000000001f000000200002000000112233445566778800093d000000000007000000000000001f000000`
+and expected digest
+`13dff63c649c4e72b2df5e6a7f275fecb335d78363344dbf00464a81d35dd428`
+(both computed with HMAC-SHA256 over the formula's exact byte
+grammar; each vector is a labeled triple of hex strings —
+the key, the complete role-specific input concatenation,
+the expected digest — with every field label named, so the
+test file leaves no interpretation freedom, v9.9.54,
+round-54 SMR F1)
 (v9.9.52, round-53 SMR F1: each vector pins the ENTIRE input
 byte string — both HELLO payloads and both capability
 records with EVERY field value written out, not a
@@ -4133,9 +4191,11 @@ directions ship in the test plan — with the pair IDENTICAL for
 both sides (v9.9.48, round-51 SMR F4: `prover_record` is the
 prover's OWN sent HELLO, which the verifier also holds as
 received, and `verifier_record` is the peer's HELLO as
-received, so the dialer and the acceptor compute
-byte-identical inputs despite each HELLO carrying per-side
-nonces), and
+received, so the dialer and the acceptor compute a
+byte-identical SHARED RECORD SEGMENT despite each HELLO
+carrying per-side nonces (the FULL inputs then differ ONLY
+by `prover_role` — v9.9.54.2, round-54 Codex B1's wording
+reconciliation), and
 all integers are little-endian; the golden vectors for both
 directions ship in the test plan),
 the separator being a fixed tag distinct from the v1 proof tag
