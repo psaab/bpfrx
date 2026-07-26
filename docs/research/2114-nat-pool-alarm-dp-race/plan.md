@@ -1,8 +1,10 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v39 — r38 findings folded (Codex NEEDS-REVISION
-  4M/1m; AGY PLAN-READY; Claude SMR PLAN-READY 0M/0m — all three
-  confirm the §4.7 structure); pending convergence review r39
+- **Status**: DRAFT v40 — r39 findings folded (Codex NEEDS-REVISION
+  6M/0m; AGY PLAN-READY-WITH-NITS; Claude SMR PLAN-READY-WITH-NITS
+  0M/1m — AGY's attack-2 and SMR m1 are the same prefer-removal
+  nit, the third independent convergence; all three confirm the
+  §4.7 structure); pending convergence review r40
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -1455,6 +1457,65 @@
   no deadline field, `journal.go:59-80`, and confirm.json may be
   encrypted, `db.go:199-216` — the remaining interval is read
   from `store_persist.go:254-255`).
+  v40: r39 convergence — the fence becomes a full-state,
+  peer-preflighted, ordered procedure and the runbook's operator
+  contract is corrected end-to-end (Codex NEEDS-REVISION 6M/0m,
+  folds 2 FOLDED / 2 NOT-FOLDED / 1 PARTIAL, structure confirmed;
+  AGY PLAN-READY-WITH-NITS — its attack-2 IS the same
+  prefer-removal nit as SMR m1, the third independent convergence;
+  SMR PLAN-READY-WITH-NITS 0M/1m): (a) the re-check becomes a
+  FULL-STATE check (Codex M1, verified: a queued local apply can
+  promote, cancel the old window, and FAIL its active write —
+  `store.go:687-717,738-746` — leaving `ActivePersistDegraded`
+  while the old record stands as the SOLE crash-recovery intent,
+  which a mask-only check reads as clean):
+  `ConfirmDebtKindMask == 0` AND `persistDegraded == false`; and
+  the capped pass is noted to drain the local receiver's queued
+  apply (a LOCAL operation whose promotion/cancellation/debt-raise
+  lands synchronously within the pass it runs in,
+  `cluster/sync.go:594-616,850-857`,
+  `sync_conn_config.go:325-351`). (b) The peer fence gains its
+  peer-side preflight and lifecycle ordering (Codex M2, verified:
+  the peer stop abandons the PEER's process-local debts
+  symmetrically, so the peer needs the SAME full-state preflight;
+  and the ordering is keep-the-peer-fenced until the target is
+  fully stopped, then START THE LOCAL first — its `Load`
+  classification completes BEFORE cluster comms,
+  `daemon_run.go:157-177,393-398` — and only then restart the
+  peer; an unclean peer makes the stopped path UNAVAILABLE — use
+  live removal). (c) The `down em0` alternative is dropped
+  (Codex M3, verified: config sync uses the configured control
+  interface only when both control fields exist and otherwise
+  falls back to the fabric, possibly over TWO redundant paths —
+  `daemon_ha_sync.go:774-785,820-860`; the peer stop is the
+  universal fence over every transport). (d) The dead-record
+  offline repair is REMOVAL, PREFERRED IN EVERY CASE (Codex M4 =
+  SMR m1 = AGY attack-2, three-way convergence: the
+  `Resolved: true` shape is the MACHINERY's own synthesized form
+  — a new reader's validation runs BEFORE the Resolved check and
+  requires a nonzero parseable `Deadline` and non-null
+  `PrevTree`, `db.go:254-281`, and the downgrade-old reader
+  IGNORES `Resolved`, requiring the FULL synthetic field set —
+  never hand-authored); the two stale copies permitting
+  pre-tombstone/pending-shaped restoration are swept to the
+  shape-split (a LIVE window's record repairs pending-shaped; a
+  DEAD record is REMOVED). (e) The offline removal carries the
+  durability barrier (Codex M5, verified: a bare `rm` is an
+  unlink WITHOUT the parent-directory fsync — a power loss can
+  replay the stale record, `db.go:284-315`): `rm` then `sync -f`
+  on the `.configdb/` directory — the `DeleteConfirm`-equivalent
+  barrier. (f) The bare-`commit` probe after expiry is FORBIDDEN
+  (Codex M6, verified: only the explicit `ConfirmCommitAs` path
+  returns "no pending confirmed commit"; a BARE commit falls
+  through to an ORDINARY promotion — `cli_config.go:257-280`,
+  `grpcapi/server_config.go:257-282`, `api/config.go:238-256`,
+  `store_commit.go:155-225` — and after the expired recovery
+  reset the candidate to the reverted tree, that ordinary
+  promotion COMMITS THE REVERTED (possibly EMPTY) configuration,
+  after which the HA node guard and the active-config predicate
+  SUPPRESS the later `xpf.conf` import,
+  `bootstrap.go:65-79,237-247`): the operator STAGES the
+  intended configuration first, then commits.
 
 ---
 
@@ -3310,8 +3371,11 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   already-admitted tombstone-write-failure ∧ crash-before-heal
   class, with the heal operator-paced rather than loop-paced for
   this one crash case (an operator repair inside it restores the
-  pre-tombstone state, which the GuardedHash gate plus the
-  documented operator-error boundary governs).
+  record — for a DEAD (D-target) record NEVER pending-shaped per
+  the r38/r39 pin (REMOVAL with the directory fsync, or the
+  machinery's own `Resolved: true` synthesized shape), with the
+  GuardedHash gate plus the documented operator-error boundary
+  governing the live-record shapes).
   The rule applies where supersession is CERTAIN: a PLAIN COMMIT or
   SYNCAPPLY that lands durably while
   the BOOT latch stands has armed NO new window, and the replacement
@@ -3411,8 +3475,13 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   repaired record is CLASSIFIED (re-validated through the normal
   total order), never trusted on the operator's say-so; the
   sanctioned remediations are REMOVAL (confirmed absence clears via
-  the barrier re-drive) or repair-to-a-valid-record followed by
-  classification — and an arm or restore overwriting a differing
+  the barrier re-drive — and the offline form carries the
+  directory-fsync barrier) or repair-to-a-valid-record followed by
+  classification (shape-split per the r38/r39 pin: a LIVE window's
+  record repairs pending-shaped; a DEAD superseded record is
+  REMOVED, never repaired pending-shaped — the `Resolved: true`
+  synthesized shape is the machinery's own, never hand-authored)
+  — and an arm or restore overwriting a differing
   record is intentional (the Store owns the slot; the single-Store
   invariant at `daemon.go:1042-1053` covers processes, and this pin
   covers hand edits). THE TWO REMEDIATIONS SPLIT BY RACE SAFETY
@@ -3462,26 +3531,53 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   check — (1) the operator ensures NO live commit-confirmed
   window stands (confirm or roll back any armed window first —
   window resolution is operator-paced), (2) the operator REFRAINS
-  from new commits and FENCES the async producer ENFORCEABLY
-  (r38 Codex M1, verified the observability gap: the SyncApply
-  apply flag and queue are PRIVATE — `cluster/sync.go:594-616` —
-  and the public status surfaces expose only cumulative/history
-  data — `cluster/sync.go:191-228`, `cluster/status.go:340-356` —
-  so "peer stable, no in-flight sync" is NOT operator-observable
-  as a predicate): the operator STOPS THE PEER xpfd (or downs
-  the cluster control link `em0`) BEFORE the fence wait — a
-  stopped peer is a deterministic barrier for every peer-driven
-  SyncApply (peer reconnect, promotion, or the 30-second
-  reconciler, `daemon_ha_sync.go:417-430,500-522,926-956`) — and
-  waits ONE full pass at the retry loop's CAPPED backoff (the
+  from new commits and FENCES the async producer ENFORCEABLY,
+  with the peer-side preflight and ordering PINNED (r38 Codex M1
+  + r39 Codex M2/M3, all verified: (i) the SyncApply apply flag
+  and queue are PRIVATE — `cluster/sync.go:594-616` — and the
+  public status surfaces expose only cumulative/history data —
+  `cluster/sync.go:191-228`, `cluster/status.go:340-356` — so no
+  observable predicate fences peer-driven syncs; (ii) `down em0`
+  is NOT a universal alternative: config sync uses the
+  configured control interface only when both control fields
+  exist and otherwise falls back to the fabric, possibly over
+  TWO redundant paths — `daemon_ha_sync.go:774-785,820-860`;
+  (iii) the peer stop abandons the PEER's process-local debts
+  symmetrically, so the peer needs the SAME full-state
+  preflight before IT is stopped; (iv) the restart ORDER
+  matters — a peer restarted before the target stops resumes
+  reconnect/reconcile pushes, `daemon_ha_sync.go:926-956`, while
+  a peer left stopped after the target stops is a full cluster
+  outage): (2a) PEER-SIDE PREFLIGHT — on the PEER, verify the
+  same full-state condition (peer `ConfirmDebtKindMask == 0` AND
+  peer `persistDegraded == false`); if the peer is not clean,
+  the stopped path is UNAVAILABLE — use the live removal path
+  instead; (2b) STOP THE PEER xpfd (the universal fence — a
+  stopped peer cannot push over ANY transport); (2c) wait ONE
+  full pass at the retry loop's CAPPED backoff (the
   `maxBackoff` parameter — debts themselves are raised
   SYNCHRONOUSLY in memory under `s.mu` at the producing
   operation's failure, so the re-check observes them regardless
   of backoff phase, but an in-flight resolution's finalize runs
-  inside a pass, so one capped pass guarantees any pending
-  finalize has either completed or re-raised), (3)
-  the operator RE-CHECKS `mask == 0` (a debt raised mid-wait now
-  shows), and only then (4) stops xpfd and repairs. The residual
+  inside a pass, and the local receiver's queued apply —
+  `cluster/sync.go:594-616,850-857`,
+  `sync_conn_config.go:325-351` — is a LOCAL operation whose
+  promotion/cancellation/debt-raise lands synchronously within
+  the pass it runs in, so one capped pass guarantees any
+  in-flight or queued apply has either completed or re-raised);
+  (3)
+  the operator RE-CHECKS THE FULL STATE — `ConfirmDebtKindMask
+  == 0` AND `persistDegraded == false` (r39 Codex M1, verified
+  the mask-only gap: a queued apply can promote, cancel the old
+  window, and FAIL its active write — `store.go:687-717,738-746`
+  — leaving `ActivePersistDegraded` while the old record stands
+  as the SOLE crash-recovery intent, which a mask-only check
+  would read as clean and stop on top of), and only then (4)
+  stops xpfd and repairs. The ordering after the repair is
+  PINNED (r39 Codex M2): START THE LOCAL xpfd first — its
+  `Load` classification completes BEFORE cluster comms
+  (`daemon_run.go:157-177,393-398` — cluster comms start only
+  after Load) — and only then restart the peer. The residual
   after the fence is explicitly ADMITTED in TWO bounded shapes:
   (i) a window whose deadline fires between the re-check and the
   stop (the process-local provenance loss admitted since r29);
@@ -3499,10 +3595,26 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   same-content `GuardedHash`, `store_persist.go:149-165,171-255`
   — and replay the RESOLVED window through the recovery total
   order): the offline repair of a DEAD (D-target, superseded)
-  record is NEVER pending-shaped — the operator either REMOVES
-  the record (always live-safe, offline too) or writes the
-  repair with `Resolved: true` (dropped at the Resolved-first
-  recovery check) — a pending-shaped repair of a dead record is
+  record is REMOVAL, PREFERRED IN EVERY CASE (r39 Codex M4 = SMR
+  m1 = AGY attack-2, all three converged: the `Resolved: true`
+  tombstone shape is the MACHINERY's own synthesized form and is
+  NOT an operator-authoring instruction — a new reader's
+  validation runs BEFORE the Resolved check and requires at
+  least a nonzero parseable `Deadline` and non-null `PrevTree`,
+  `db.go:254-281`, and the downgrade-old reader IGNORES
+  `Resolved` entirely, requiring the FULL synthetic field set —
+  current-tree `PrevTree`, bounded deadline, canonical
+  hash/basis, fresh `ArmID`, `FirstCommit:false` — an
+  unrealistic and unnecessary hand-authoring burden); and the
+  offline removal carries the SAME durability barrier as the
+  live path (r39 Codex M5, verified: a bare `rm` is an unlink
+  WITHOUT the parent-directory fsync — a power loss can replay
+  the stale record, `db.go:284-315`; the live path survives via
+  the probe's `DeleteConfirm` re-drive, but the stopped path has
+  no probe before `Load`): the operator runs the removal WITH
+  the directory fsync (`rm` then `sync -f` on the `.configdb/`
+  directory — the `DeleteConfirm`-equivalent barrier).
+  A pending-shaped repair of a dead record is
   explicitly FORBIDDEN in the runbook. The post-restart
   recovery path is NAMED AND CORRECTED TWICE (r37 Codex M2 + m1
   and r38 Codex M3/M4, all verified): the cases SPLIT on the
@@ -3517,10 +3629,23 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   removal, which does NOT cancel the in-memory timer);
   (EXPIRED/already-reverted) `Load` has ALREADY reverted inside
   the boot (the expired path, `store_persist.go:171-228`) —
-  there is NO pending window to confirm (bare `commit` returns
-  "no pending confirmed commit", `store_commit.go:729-746`) —
-  the operator restores the intended configuration by
-  RE-COMMITTING it, not by confirming; and the
+  there is NO pending window to confirm, AND A BARE `commit`
+  PROBE IS FORBIDDEN (r39 Codex M6, verified the diagnostic is
+  false and dangerous: only the explicit `ConfirmCommitAs` path
+  returns "no pending confirmed commit",
+  `store_commit.go:729-746`; a BARE commit falls through to an
+  ORDINARY promotion, `cli_config.go:257-280`,
+  `grpcapi/server_config.go:257-282`, `api/config.go:238-256`,
+  `store_commit.go:155-225` — and after the expired recovery
+  reset the candidate to the reverted tree, that ordinary
+  promotion COMMITS THE REVERTED (possibly EMPTY) configuration,
+  after which the HA node guard and the active-config predicate
+  SUPPRESS the later `xpf.conf` import,
+  `bootstrap.go:65-79,237-247`): the operator STAGES the
+  intended configuration first (set commands loading the
+  intended config) and only then commits — never probes the
+  state with a bare commit;
+  and the
   FirstCommit+cluster class has NO live escape BY DESIGN — H
   intercepts the unexpired record before re-arm and reverts it
   INSIDE `Load` (the recovery invariant), and a subsequent
@@ -5373,32 +5498,46 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      is safe LIVE (the probe's confirmed-absence barrier is
      idempotent), repair-to-valid FILESYSTEM remediation requires
      xpfd STOPPED with the MANDATORY `mask == 0` precondition
-     EXPLICIT and FENCED (the r36-r38 producer-quiesce protocol:
+     EXPLICIT and FENCED (the r36-r40 producer-quiesce protocol:
      (1) no live commit-confirmed window stands, (2) refrain
-     from commits and FENCE the async producer ENFORCEABLY —
-     STOP THE PEER xpfd (or down `em0`): the SyncApply apply
-     flag/queue are private (`cluster/sync.go:594-616`) and the
-     public surfaces expose only cumulative/history data, so an
-     observable predicate cannot fence peer-driven syncs — and
+     from commits and FENCE the async producer ENFORCEABLY with
+     the peer-side preflight — PEER full-state clean (peer
+     `ConfirmDebtKindMask == 0` AND peer `persistDegraded ==
+     false`; an unclean peer makes the stopped path UNAVAILABLE
+     — use live removal), then STOP THE PEER xpfd (the universal
+     fence over every transport — `down em0` is NOT universal:
+     sync falls back to fabric over possibly two paths,
+     `daemon_ha_sync.go:774-785,820-860`) — and
      wait ONE full pass at the loop's
-     CAPPED backoff, (3) RE-CHECK
-     `mask == 0`, (4) stop and repair — a debt raised mid-wait
+     CAPPED backoff (drains the local receiver's queued apply),
+     (3) RE-CHECK THE FULL STATE —
+     `ConfirmDebtKindMask == 0` AND `persistDegraded == false`
+     (a queued apply can leave `ActivePersistDegraded` with the
+     old record as the sole crash-recovery intent — a mask-only
+     check reads it clean), (4) stop and repair — a debt raised mid-wait
      shows at the re-check; the blind-spot residuals are admitted
      and bounded: a mid-fence window deadline (the r29
      provenance loss) SPLIT by deadline at restart — still-
      pending → CONFIRM AWAY with a BARE `commit` (cancels the
      timer; NEVER `commit check` — it only validates; NEVER
      manual removal — it does not cancel the in-memory timer);
-     already-expired → `Load` already reverted, so RE-COMMIT the
-     intended config; the FirstCommit+cluster class reverts
+     already-expired → `Load` already reverted, so STAGE the
+     intended config and commit it — a BARE `commit` probe is
+     FORBIDDEN (it ordinary-promotes the reverted, possibly
+     EMPTY, candidate and SUPPRESSES the later `xpf.conf`
+     import, `bootstrap.go:65-79,237-247`); the
+     FirstCommit+cluster class reverts
      INSIDE `Load` and recovers via the preflight's own named
      path (restart xpfd INTO the clustered configuration / the
      `xpf.conf` boot import — a live CLUSTERED commit is
      rejected with no runtime), and a post-barrier SyncApply
-     D-abandonment whose offline repair is NEVER pending-shaped
-     (a DEAD record repaired pending-shaped can BIND and replay
-     the resolved window — the operator REMOVES it or writes
-     `Resolved: true`),
+     D-abandonment whose offline repair is REMOVAL with the
+     directory fsync (`rm` then `sync -f` on `.configdb/` — a
+     bare unlink can replay the stale record after power loss,
+     `db.go:284-315`; a DEAD record repaired pending-shaped can
+     BIND and replay the resolved window, and the `Resolved:
+     true` synthesized shape is the machinery's own, never
+     hand-authored),
      and every
      content-INDEPENDENT repair write
      RE-VERIFIES the target's classification inside the SAME
@@ -5475,7 +5614,7 @@ the full Go/Rust suites, smoke) run for BOTH units.*
   past the next boot; the lifecycle redesign is a pre-existing policy
   question, not a `d.dp` publication concern.
 
-## 11. Open questions for adversarial review (r39)
+## 11. Open questions for adversarial review (r40)
 
 Resolved in v2-v9 (for the record): A2 deletion; atomic cell choice;
 sampler-only adapter — now STRUCTURAL via `CachedStatusProvider`;
