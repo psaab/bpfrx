@@ -50,6 +50,52 @@
   2799→2781 with an identical direct-call symbol multiset — deltas are
   register allocation / stack offsets / NOP forms (CGU-reshuffle
   inlining variance), no new arithmetic or control flow.
+## 2026-07-26 — #6437: extract ZoneScreenState + two-phase SYN-flood gate into screen/zone.rs
+
+- **Timestamp**: 2026-07-26 (fix/6437-screen-zone-state)
+- **Action**: Removed the last inlined god-block from the per-packet
+  `ScreenState::check_packet_with_zone_id_opts` (`userspace-dp/src/screen/mod.rs`,
+  ~315 lines, ~155 of them the SYN-flood / SYN-cookie enforcement left over
+  after #6238 extracted the stateless tail and the shared ICMP/UDP
+  rate-flood block). Pure code motion: new `userspace-dp/src/screen/zone.rs`
+  now owns `ZoneScreenState` (the #4969 consolidated per-zone value, field
+  order verbatim), `from_profile` / `reconcile_substate` /
+  `reconcile_flood_sketch`, the ICMP/UDP flood admission helpers,
+  `enforce_common_rate_floods` (#6238), `SECONDARY_FLOOD_CEILING_MULT`, and
+  the new two-phase `ZoneScreenState::syn_flood_gate` + owned `SynFloodGate`
+  enum. PHASE 1 (the gate) performs every zone-local mutation in the exact
+  #3315/#4112-F19 order (aggregate → per-destination → aggregate verdict
+  incl. the active-until stamp + `alarm_without_drop` audit gate → alarm
+  cadence → per-source) and returns the owned verdict so the `zones` borrow
+  ends at the call; the caller's PHASE 2 applies the whole-`ScreenState`
+  side effects (`syn_alarm_pending`, `syn_flood_alarm_events`,
+  `syn_flood_{dst,src}_drops`, the cookie mint). The validated-cache consume
+  stays in the caller as PHASE 0; `codec_available` is a pre-call snapshot
+  of the disjoint codec-presence flag, and the caller still re-checks the
+  codec at the mint site so `syn-cookie-unavailable` stays fail-closed.
+  Drop precedence, reason strings (the `screen_reason_drop_index` ordinals),
+  every counter site, the count-min sketch semantics, the #3607 cookie-OFF
+  bucket regime, the alarm cadence, and the audit-mode contract are
+  unchanged; the 5,858-LOC screen test suites are unmodified.
+  Hot-path shape: `syn_flood_gate` keeps the plain `#[inline]` hint (the
+  #6238 precedent); LLVM outlines it at the single callsite, so the
+  enforcement sits behind one direct call — the posture the base build
+  already had for `enforce_common_rate_floods`. Asm-diff (release, base vs
+  patched): hot fn 478 → 457 instructions, enforcement contiguous in the
+  outlined gate, identical callee set, PHASE-2 match lowers to a jump
+  table, reason immediates (9/22) unchanged; no new allocation, lock,
+  atomic, or dynamic dispatch. Validation: full `cargo test --release
+  --test-threads=1` GREEN (4250 passed / 0 failed); `cargo check
+  --all-targets` shows no new warnings vs base. Docs:
+  `docs/syn-cookie-flood-protection.md` enforcement-order + #4969 citations
+  repointed at `screen/zone.rs`; `userspace-dp/README.md`'s stale
+  `src/screen.rs` row predates this change (screen/ has been a directory
+  since the tests relocation) — left alone, not this PR's scope.
+- **File(s)**: userspace-dp/src/screen/mod.rs,
+    userspace-dp/src/screen/zone.rs (new),
+    docs/syn-cookie-flood-protection.md, _Log.md
+
+## 2026-07-24 — #6434: split filter compiler god-functions
 
 - **Timestamp**: 2026-07-24 (fix/6434-filter-compiler-split)
 - **Action**: Decomposed the two remaining god-functions in
