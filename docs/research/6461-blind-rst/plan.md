@@ -1345,7 +1345,9 @@ attacker-poisonable):**
        each install closing its predecessor (`sync_conn.go:244`)
        — two endpoints can retain opposite halves of different
        connections and repeatedly miss cold-prime: the
-       address-ordered setup owner dials ONE tie-broken setup
+       stable-node-ID-ordered setup owner dials ONE tie-broken
+       setup (v9.9.54.10, round-58 Codex M7's totality sweep —
+       stable node-ID ordering, never address parsing)
        that carries BOTH directional reset triples — through a
        barrier-EXEMPT authenticated pre-slot RESET LANE
        (v9.9.37, round-45 Codex H6: if B owns the barrier while
@@ -4106,7 +4108,8 @@ has dispatched NOTHING when the decision arrives));
 a timeout with NO committed decision closes and retries
 with bounded backoff (never an independent class selection
 while retaining the connection; and if the
-address-ordered owner DIES before publishing, the
+stable-node-ID-ordered owner DIES before publishing
+(v9.9.54.10, round-58 Codex M7's totality sweep), the
 decision is UNCOMMITTED (v9.9.54.5, round-56 SMR F2: the
 connection closes and retries with bounded backoff; the
 retry's new connection may elect a different owner per
