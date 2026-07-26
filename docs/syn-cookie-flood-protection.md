@@ -164,8 +164,10 @@ screen runtime:
   "accepted but NOT yet enforced" WARNING is removed now that the leaf is
   effective.
 
-Enforcement order (`screen/mod.rs`, inside the initial-SYN gate, after the
-validated-cookie bypass): (1) the aggregate `attack-threshold` (+
+Enforcement order (`ZoneScreenState::syn_flood_gate` in `screen/zone.rs`
+since #6437 — previously inlined in `screen/mod.rs`; the caller
+`check_packet_with_zone_id_opts` runs the validated-cookie bypass first and
+applies the returned `SynFloodGate` verdict): (1) the aggregate `attack-threshold` (+
 `alarm-threshold`) ALWAYS counts via a single `RateCounter::increment_and_classify`
 so its cookie-activation side-effect can never be skipped — it does NOT return
 here; (2) the per-destination cap is evaluated BEFORE the aggregate over-attack
@@ -227,7 +229,8 @@ counter, the SYN-cookie active-until / standby-budget / profile-generation
 fields, and the ICMP/UDP flood aggregates + per-destination sketches ALL live in
 one `ZoneScreenState` value per zone, stored in a single
 `FxHashMap<String, ZoneScreenState>` (`ScreenState::zones` in
-`userspace-dp/src/screen/mod.rs`) — not the ~13 parallel `FxHashMap<String, _>`
+`userspace-dp/src/screen/mod.rs`; the `ZoneScreenState` type itself lives in
+`userspace-dp/src/screen/zone.rs` since #6437) — not the ~13 parallel `FxHashMap<String, _>`
 tables that preceded #4969. A `ZoneScreenState` is built by
 `ZoneScreenState::from_profile`, which allocates every threshold-gated sub-state
 together (`Some ⟺ configured` for the sketches). The two consequences: a

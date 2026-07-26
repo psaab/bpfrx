@@ -1,0 +1,252 @@
+//! #6472: NAT64 (cross-family) embedded-ICMP error session match, wired
+//! into the FLOWLESS poll arm — the path every non-query ICMP error takes
+//! (#3290). The same-family reversal (`nat_match_v4`/`nat_match_v6`) cannot
+//! serve a NAT64 session: its builders are single-family (the v4 builder
+//! declines a V6 `original_src`, the v6 builder a V4 one), and the flowless
+//! L3 enforcement that follows cannot route the synthetic Pref64
+//! destination (case B) nor associate the pool-address destination with a
+//! local socket (case A) — so PTB / Time-Exceeded / Dest-Unreachable toward
+//! a NAT64 session dropped fail-closed and PMTUD + traceroute were dead
+//! across the boundary even though the RFC 7915 §4.2/§5.2 translators in
+//! `nat64.rs` existed (reachable only from the flow-backed arm, which an
+//! ICMP error never enters).
+//!
+//! Two directions, distinguished by the QUOTE's direction (an ICMP error is
+//! always addressed to the source of the offending packet — RFC 792 — so
+//! the outer destination must equal the quote's source; that equality is
+//! the fail-closed anti-spoof gate):
+//!
+//! * **V4ToV6** (RFC 7915 §4.2): an ICMPv4 error from a v4 hop addressed to
+//!   the session's pool address, quoting the FORWARD wire packet
+//!   `(pool:xlated_port → server:port)`. The quote's reply key is the
+//!   installed v4 reverse companion's primary key. The error is translated
+//!   to ICMPv6 toward the original v6 client: outer src = Pref64 ∷ router
+//!   (§6 stateless source mapping), outer dst = `orig_src_v6`, and the
+//!   embedded quote reads back as the ORIGINAL v6 forward packet
+//!   `(client:orig_port → Pref64::server:port)` — the L4 source port/echo
+//!   id is restored from the reverse decision's `rewrite_dst_port`.
+//!
+//! * **V6ToV4** (RFC 7915 §5.2): an ICMPv6 error from a v6 hop about the
+//!   session's translated REPLY packet, addressed to the synthetic
+//!   `Pref64::server` destination and quoting `(Pref64::server:port →
+//!   client:orig_port)`. The quote's reply key is the installed forward
+//!   session's primary key. The error is translated to ICMPv4 toward the
+//!   v4 server: outer src = the translator's pool address (the session's
+//!   own translated source — the translator's address for that session,
+//!   used because the v6 hop's source has no IPv4 mapping, the RFC 6791
+//!   §6 case), outer dst = the extracted server v4, and the embedded quote
+//!   reads back as the v4 reply the server sent
+//!   `(server:port → pool:xlated_port)` — the L4 destination port/echo id
+//!   is restored from the forward decision's `rewrite_src_port`.
+//!
+//! Both directions ride the ADMITTED session (the flow was permitted by
+//! policy; the error is that session's control traffic), mirroring the
+//! #5690 same-family reversal's posture — and like it, the translated
+//! error is queued as a prebuilt forward with `flow_key = None`, so the
+//! #3290 no-fake-session invariant is preserved.
+
+use super::parse::{embedded_reply_key, parse_embedded_v4, parse_embedded_v6};
+use super::*;
+
+/// Outcome of [`try_nat64_icmp_error_match`]: the matched session plus
+/// every datum the poll-side builder needs to translate and forward the
+/// error, split by translation direction.
+pub(in crate::afxdp) enum Nat64IcmpErrorMatch {
+    /// ICMPv4 error → ICMPv6 toward the v6 client (RFC 7915 §4.2).
+    V4ToV6 {
+        /// Original IPv6 client (`Nat64ReverseInfo.orig_src_v6`) — the
+        /// translated error's outer destination.
+        orig_src_v6: Ipv6Addr,
+        /// Original synthetic destination (`Nat64ReverseInfo.orig_dst_v6`)
+        /// — its high 96 bits are the NAT64 prefix the outer source and
+        /// the embedded destination compose onto.
+        orig_dst_v6: Ipv6Addr,
+        /// The v6 client's ORIGINAL L4 source port / echo id (reverse
+        /// decision's `rewrite_dst_port`), restored into the quote.
+        orig_client_port: u16,
+        /// Forwarding resolution toward the v6 client (the reverse
+        /// companion's cached decision resolution).
+        resolution: ForwardingResolution,
+        /// Reverse companion metadata (zones for the HA/fabric finalizer).
+        metadata: SessionMetadata,
+    },
+    /// ICMPv6 error → ICMPv4 toward the v4 server (RFC 7915 §5.2).
+    V6ToV4 {
+        /// The session's translated pool source — the translated error's
+        /// outer source (the translator's own v4 address for this session).
+        pool_v4: Ipv4Addr,
+        /// The extracted IPv4 server (`rewrite_dst`) — outer destination.
+        server_v4: Ipv4Addr,
+        /// The session's TRANSLATED L4 source port / echo id (forward
+        /// decision's `rewrite_src_port`), restored into the quote's
+        /// destination field so the server associates the error.
+        translated_port: u16,
+        /// Forwarding resolution toward the v4 server (the forward
+        /// session's cached decision resolution).
+        resolution: ForwardingResolution,
+        /// Forward session metadata (zones for the HA/fabric finalizer).
+        metadata: SessionMetadata,
+    },
+}
+
+/// Match a flowless ICMP error against the NAT64 session tables. Returns
+/// `None` (caller falls through to the same-family #5690 reversal and then
+/// normal flowless enforcement, unchanged) when no NAT64 prefix is
+/// configured, the packet is not an ICMP error carrying a parseable quote,
+/// the outer-destination/quote-source consistency gate fails, or the quote
+/// matches no live NAT64 session half.
+pub(in crate::afxdp::icmp_embed) fn try_nat64_icmp_error_match(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    ctx: &mut NatMatchCtx<'_>,
+    now_ns: u64,
+) -> Option<Nat64IcmpErrorMatch> {
+    // Zero-cost gate for non-NAT64 deployments: one Vec::is_empty() branch
+    // before any parse (this match runs on the flowless arm, which also
+    // serves ordinary non-first fragments).
+    if ctx.forwarding.nat64.prefixes.is_empty() {
+        return None;
+    }
+    let l4 = meta.l4_offset as usize;
+    let icmp_type = *frame.get(l4)?;
+    if !is_icmp_error(meta.protocol, icmp_type) {
+        return None;
+    }
+    match meta.protocol {
+        PROTO_ICMP => match_v4_error(frame, meta, ctx, now_ns),
+        PROTO_ICMPV6 => match_v6_error(frame, meta, ctx, now_ns),
+        _ => None,
+    }
+}
+
+/// V4ToV6 arm: an ICMPv4 error about the session's forward wire packet.
+fn match_v4_error(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    ctx: &mut NatMatchCtx<'_>,
+    now_ns: u64,
+) -> Option<Nat64IcmpErrorMatch> {
+    let l3 = meta.l3_offset as usize;
+    let l4 = meta.l4_offset as usize;
+    // Outer destination: the address the error is addressed TO — for a
+    // genuine error about the session's forward packet, the session's pool
+    // address (the offending packet's source, RFC 792).
+    let outer_dst_v4 = Ipv4Addr::from(<[u8; 4]>::try_from(frame.get(l3 + 16..l3 + 20)?).ok()?);
+
+    let hdr = parse_embedded_v4(frame, l4 + 8)?;
+    // Fail-closed consistency gate: the quote's source must BE the outer
+    // destination. A mismatch means the error is not about this session's
+    // wire packet (misrouted/forged) — decline to the same-family arm.
+    if hdr.src != outer_dst_v4 {
+        return None;
+    }
+    // The quote is the forward wire packet (pool:xlated → server:port); its
+    // reply key is the installed v4 reverse companion's primary key.
+    let reply_key = embedded_reply_key(
+        libc::AF_INET as u8,
+        hdr.proto,
+        IpAddr::V4(hdr.src),
+        IpAddr::V4(hdr.dst),
+        hdr.src_port,
+        hdr.dst_port,
+    );
+    let resolved = lookup_session_across_scopes(
+        ctx.sessions,
+        ctx.shared_sessions,
+        ctx.shared_forward_wire_sessions,
+        &reply_key,
+        now_ns,
+        0,
+    )?;
+    let sl = resolved.lookup;
+    // Must be the v4 REVERSE companion of a NAT64 flow — a same-family
+    // session half (or the forward half) is the #5690 arm's business.
+    let info = sl.metadata.nat64_reverse?;
+    if !sl.metadata.is_reverse || !sl.decision.nat.nat64 {
+        return None;
+    }
+    // The reverse decision (produced by `NatDecision::reverse`) carries the
+    // ORIGINAL client source port / echo id in `rewrite_dst_port`; absent a
+    // port translation the quote already carries the original value.
+    let orig_client_port = sl.decision.nat.rewrite_dst_port.unwrap_or(hdr.src_port);
+    Some(Nat64IcmpErrorMatch::V4ToV6 {
+        orig_src_v6: info.orig_src_v6,
+        orig_dst_v6: info.orig_dst_v6,
+        orig_client_port,
+        resolution: sl.decision.resolution,
+        metadata: sl.metadata,
+    })
+}
+
+/// V6ToV4 arm: an ICMPv6 error about the session's translated reply packet.
+fn match_v6_error(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    ctx: &mut NatMatchCtx<'_>,
+    now_ns: u64,
+) -> Option<Nat64IcmpErrorMatch> {
+    let l3 = meta.l3_offset as usize;
+    let l4 = meta.l4_offset as usize;
+    let outer_dst_v6 =
+        Ipv6Addr::from(<[u8; 16]>::try_from(frame.get(l3 + 24..l3 + 40)?).ok()?);
+    // Only an error addressed to a SYNTHETIC Pref64 destination can be a
+    // NAT64 session error; an error addressed to a real v6 host (e.g. the
+    // client, about the forward packet) is ordinary v6 traffic that the
+    // flowless arm routes normally — do not intercept it.
+    ctx.forwarding.nat64.match_ipv6_dest(outer_dst_v6)?;
+
+    let hdr = parse_embedded_v6(frame, l4 + 8)?;
+    // Fail-closed consistency gate: the quote must be the session's
+    // RETURN-direction wire packet — its source is the same synthetic
+    // Pref64 address the error is addressed to (the offending packet's
+    // source, RFC 792). A quote of the FORWARD packet (client → Pref64)
+    // belongs to an error addressed to the client and fails this gate.
+    if hdr.src_wire != outer_dst_v6 {
+        return None;
+    }
+    // The quote is the translated reply (Pref64::server:port → client:port);
+    // its reply key is the installed forward session's primary key.
+    let forward_key = embedded_reply_key(
+        libc::AF_INET6 as u8,
+        hdr.proto,
+        IpAddr::V6(hdr.src_wire),
+        hdr.dst,
+        hdr.src_port,
+        hdr.dst_port,
+    );
+    let resolved = lookup_session_across_scopes(
+        ctx.sessions,
+        ctx.shared_sessions,
+        ctx.shared_forward_wire_sessions,
+        &forward_key,
+        now_ns,
+        0,
+    )?;
+    let sl = resolved.lookup;
+    // Must be the FORWARD half of a NAT64 flow carrying the v4 translation.
+    if sl.metadata.is_reverse
+        || !sl.decision.nat.nat64
+        || sl.metadata.nat64_reverse.is_none()
+    {
+        return None;
+    }
+    let pool_v4 = match sl.decision.nat.rewrite_src {
+        Some(IpAddr::V4(v4)) => v4,
+        _ => return None,
+    };
+    let server_v4 = match sl.decision.nat.rewrite_dst {
+        Some(IpAddr::V4(v4)) => v4,
+        _ => return None,
+    };
+    // The forward decision carries the TRANSLATED source port / echo id in
+    // `rewrite_src_port`; absent a port translation the quote already
+    // carries the value the server replied to.
+    let translated_port = sl.decision.nat.rewrite_src_port.unwrap_or(hdr.dst_port);
+    Some(Nat64IcmpErrorMatch::V6ToV4 {
+        pool_v4,
+        server_v4,
+        translated_port,
+        resolution: sl.decision.resolution,
+        metadata: sl.metadata,
+    })
+}

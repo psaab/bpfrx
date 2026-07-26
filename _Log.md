@@ -37,6 +37,158 @@
   Passthrough pre-fold). Full crate suite 4211 passed / 0 failed;
   poll_stages_tests' 17 stage-11 call sites carry the new now_secs arg
   unmodified.
+## 2026-07-26 — #6472: NAT64 ICMP error translation on the flowless arm
+
+- **Timestamp**: 2026-07-26 (fix/6472-nat64-icmp-error-translation)
+- **Action**: Wired the RFC 7915 §4.2/§5.2 ICMP error translators live on
+  the FLOWLESS poll arm — the path every non-query ICMP error takes
+  (#3290). The translators previously ran only from the flow-backed arm
+  (`build_nat64_forwarded_frame`), which an ICMP error never enters, so
+  PTB / Time-Exceeded / Dest-Unreachable toward a NAT64 session dropped
+  fail-closed in production (MissingNeighbor on the pool address, NoRoute
+  on the synthetic Pref64 destination) and PMTUD + traceroute were dead
+  across the boundary despite the #2219 feature-coverage claim. New
+  `icmp_embed::nat64_match` classifies direction behind an RFC 792
+  fail-closed consistency gate (outer destination must equal the quote's
+  source): an ICMPv4 error quoting the forward wire packet matches the
+  installed v4 reverse companion (v4→v6, outer src = Pref64 ∷ error-sender,
+  outer dst = client); an ICMPv6 error quoting the translated reply and
+  addressed to the synthetic Pref64 destination matches the forward session
+  (v6→v4, outer src = pool address, outer dst = server). The embedded
+  quote's L4 port/echo id is restored to the value the error receiver
+  carries (v4→v6 the client's ORIGINAL port via the reverse decision's
+  `rewrite_dst_port`; v6→v4 the TRANSLATED pool port via the forward
+  decision's `rewrite_src_port`) inside the translators BEFORE the outer
+  checksum (`EmbeddedV4ToV6.mapped_embedded_src_port` /
+  `EmbeddedV6ToV4.mapped_embedded_dst_port`; `None` on every data-packet
+  caller keeps the pre-#6472 bytes). New
+  `poll_descriptor::nat64_icmp_error::try_translate_nat64_icmp_error` runs
+  BEFORE the #5690 same-family reversal, NOT gated on
+  `allow_embedded_icmp` (core translator behavior for the translator's own
+  admitted sessions, not the optional passthrough that flag controls), and
+  shares the extracted `queue_prebuilt_embedded_icmp_error` tail with the
+  #5690 arm (HA/fabric finalizer, CoS classify with `flow_key = None`,
+  prebuilt forward — never a session/flow-cache authority).
+  `finalize_embedded_icmp_resolution_parts` factors the (resolution,
+  ingress-zone) finalizer core out of `finalize_embedded_icmp_resolution`
+  (the #5690 wrapper delegates — byte-identical). Non-NAT64 deployments
+  exit on the empty-prefix gate before any parse.
+- **Validation**: `cargo test` full suite GREEN (4207 bin + 60 + 8 + 22 + 1,
+  0 failed, --test-threads=1). Fail-on-revert: both poll-level tests
+  (`poll_descriptor_nat64_icmp_error_{v4_to_v6,v6_to_v4}_translated_on_
+  flowless_path_6472`) go RED with the call site disabled (v4→v6 queues
+  nothing; v6→v4 forwards UNtranslated — content assertions fire); the
+  four translator tests (`nat64_{v4_to_v6,v6_to_v4}_icmp_error_restores_
+  embedded_{src,dst}_port_6472` / `_echo_id_6472`) go RED with the port
+  restore stubbed out. `poll_descriptor_nat64_icmp_error_outer_dst_
+  mismatch_declined_6472` pins the RFC 792 gate;
+  `poll_descriptor_same_family_reversal_not_stolen_by_nat64_arm_6472`
+  pins #5690 parity with a NAT64 prefix configured. Warning parity
+  161/161 (`cargo check`) vs the pristine base.
+- **File(s)**: userspace-dp/src/nat64.rs,
+  userspace-dp/src/nat64_tests.rs,
+  userspace-dp/src/afxdp/icmp_embed/{mod.rs,builders.rs,nat64_match.rs},
+  userspace-dp/src/afxdp/poll_descriptor/{mod.rs,embedded_icmp.rs,
+  nat64_icmp_error.rs}, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/tests_embedded_poll_filter.rs,
+  userspace-dp/src/FEATURES.md, userspace-dp/src/afxdp/README.md,
+  docs/feature-coverage.md, _Log.md
+## 2026-07-26 — #6438: split wg_control.rs into wg_control/{mtu,sock,attempt,dispatch}.rs
+
+- **Timestamp**: 2026-07-26 (fix/6438-wg-control-split)
+- **Action**: Decomposed `userspace-dp/src/afxdp/coordinator/wg_control.rs`
+  (exactly 1,600 LOC, god-fns `run_wg_control_loop` 325 ln/9 params,
+  `dispatch_inbound` 209 ln, `drive_attempt_machine` 130 ln) into a
+  `wg_control/` module directory — pure code motion, zero behavior delta.
+  `mod.rs` keeps the thread entry (`wg_control_loop`) and the
+  orchestrating `run_wg_control_loop`; the five fused layers land as
+  `mtu.rs` (pad-aware encapped-size + outer-MTU guard), `sock.rs`
+  (dual-stack bind, v4-mapped send shim, #2317 outer-TOS cmsg codec,
+  poll(2) wait layer), `attempt.rs` (#1888 S5 handshake attempt machine
+  + keepalive emit/pace), `dispatch.rs` (type-byte dispatch with the
+  auth-before-roam `InboundOutcome` contract + TUN-read encap-and-send).
+  `wg_control_tests.rs` (822 LOC) moved byte-identical into the
+  directory and passes unmodified via its existing `use super::*`.
+  Also folded the `pad_to_16` triplication (wg_control.rs, wg/engine.rs,
+  frame/wg.rs) into a single `pub(crate) const fn` in `wg/mod.rs` next
+  to the other wire-format constants. Visibility is preserved exactly:
+  moved items are `pub(super)` within the `wg_control` tree (their
+  pre-split file-private reach); `WG_DEFAULT_OUTER_MTU` keeps its
+  coordinator-tree visibility via a `pub(super) use` re-export at the
+  historical `wg_control::WG_DEFAULT_OUTER_MTU` path; test-only seams
+  re-import `#[cfg(test)]`-gated (the #6436 precedent). The 64 KiB
+  scratch buffers stay once-allocated in the loop; the `CmsgBuf`
+  align(8) const assert travels to sock.rs; `#[inline]` /
+  `#[allow(clippy::too_many_arguments)]` attributes travel with their
+  fns. Docs: coordinator/README.md gained the `wg_control/` file-table
+  row; stale `wg_control.rs` path citations in slowpath.rs, gre.rs,
+  wg/timers.rs, wg/mod.rs, frame/wg.rs, tunnel_supervision.rs updated.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/wg_control/{mod,mtu,
+  sock,attempt,dispatch}.rs (new, from wg_control.rs),
+  coordinator/wg_control_tests.rs → wg_control/wg_control_tests.rs
+  (rename, verbatim), afxdp/wg/mod.rs (+pad_to_16 SSOT),
+  afxdp/wg/engine.rs, afxdp/frame/wg.rs (−local pad_to_16 copies),
+  coordinator/README.md, comment-only path fixes in slowpath.rs,
+  afxdp/gre.rs, afxdp/wg/timers.rs, afxdp/coordinator/tunnel_supervision.rs,
+  docs/pr/6438-wg-control-split/plan.md, _Log.md
+- **Validation**: `cargo check` / `cargo check --tests` warning parity
+  vs the 4bc33a3b0 base (identical sorted warning sets — zero new
+  warnings); full crate suite `cargo test --release --bins --tests --
+  --test-threads=1` green (4,290 passed / 0 failed / 2 ignored);
+  `wg_control::tests` 22/22 pass unmodified; asm-diff (objdump -Cd,
+  address/symbol normalized) on the release binary: `wg_encap_frame`
+  576/576 and `WgEngine::encap_inner` 278/278 identical modulo
+  relocation addresses (the pad_to_16 fold is codegen-invisible),
+  `drive_initiation` 160/160 identical, `send_keepalive` 186→176 (same
+  stream modulo one LLVM-eliminated dead 2-byte store, tail alignment
+  padding, and the resulting branch-offset shifts), `wg_control_loop`
+  2799→2781 with an identical direct-call symbol multiset — deltas are
+  register allocation / stack offsets / NOP forms (CGU-reshuffle
+  inlining variance), no new arithmetic or control flow.
+## 2026-07-26 — #6437: extract ZoneScreenState + two-phase SYN-flood gate into screen/zone.rs
+
+- **Timestamp**: 2026-07-26 (fix/6437-screen-zone-state)
+- **Action**: Removed the last inlined god-block from the per-packet
+  `ScreenState::check_packet_with_zone_id_opts` (`userspace-dp/src/screen/mod.rs`,
+  ~315 lines, ~155 of them the SYN-flood / SYN-cookie enforcement left over
+  after #6238 extracted the stateless tail and the shared ICMP/UDP
+  rate-flood block). Pure code motion: new `userspace-dp/src/screen/zone.rs`
+  now owns `ZoneScreenState` (the #4969 consolidated per-zone value, field
+  order verbatim), `from_profile` / `reconcile_substate` /
+  `reconcile_flood_sketch`, the ICMP/UDP flood admission helpers,
+  `enforce_common_rate_floods` (#6238), `SECONDARY_FLOOD_CEILING_MULT`, and
+  the new two-phase `ZoneScreenState::syn_flood_gate` + owned `SynFloodGate`
+  enum. PHASE 1 (the gate) performs every zone-local mutation in the exact
+  #3315/#4112-F19 order (aggregate → per-destination → aggregate verdict
+  incl. the active-until stamp + `alarm_without_drop` audit gate → alarm
+  cadence → per-source) and returns the owned verdict so the `zones` borrow
+  ends at the call; the caller's PHASE 2 applies the whole-`ScreenState`
+  side effects (`syn_alarm_pending`, `syn_flood_alarm_events`,
+  `syn_flood_{dst,src}_drops`, the cookie mint). The validated-cache consume
+  stays in the caller as PHASE 0; `codec_available` is a pre-call snapshot
+  of the disjoint codec-presence flag, and the caller still re-checks the
+  codec at the mint site so `syn-cookie-unavailable` stays fail-closed.
+  Drop precedence, reason strings (the `screen_reason_drop_index` ordinals),
+  every counter site, the count-min sketch semantics, the #3607 cookie-OFF
+  bucket regime, the alarm cadence, and the audit-mode contract are
+  unchanged; the 5,858-LOC screen test suites are unmodified.
+  Hot-path shape: `syn_flood_gate` keeps the plain `#[inline]` hint (the
+  #6238 precedent); LLVM outlines it at the single callsite, so the
+  enforcement sits behind one direct call — the posture the base build
+  already had for `enforce_common_rate_floods`. Asm-diff (release, base vs
+  patched): hot fn 478 → 457 instructions, enforcement contiguous in the
+  outlined gate, identical callee set, PHASE-2 match lowers to a jump
+  table, reason immediates (9/22) unchanged; no new allocation, lock,
+  atomic, or dynamic dispatch. Validation: full `cargo test --release
+  --test-threads=1` GREEN (4250 passed / 0 failed); `cargo check
+  --all-targets` shows no new warnings vs base. Docs:
+  `docs/syn-cookie-flood-protection.md` enforcement-order + #4969 citations
+  repointed at `screen/zone.rs`; `userspace-dp/README.md`'s stale
+  `src/screen.rs` row predates this change (screen/ has been a directory
+  since the tests relocation) — left alone, not this PR's scope.
+- **File(s)**: userspace-dp/src/screen/mod.rs,
+    userspace-dp/src/screen/zone.rs (new),
+    docs/syn-cookie-flood-protection.md, _Log.md
 
 ## 2026-07-24 — #6434: split filter compiler god-functions
 

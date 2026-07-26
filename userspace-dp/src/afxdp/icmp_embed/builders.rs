@@ -336,8 +336,31 @@ pub(in crate::afxdp::icmp_embed) fn finalize_embedded_icmp_resolution(
     ingress_ifindex: i32,
     icmp_match: &EmbeddedIcmpMatch,
 ) -> ForwardingResolution {
-    let enforced =
-        enforce_ha_resolution_snapshot(forwarding, ha_state, now_secs, icmp_match.resolution);
+    finalize_embedded_icmp_resolution_parts(
+        forwarding,
+        ha_state,
+        now_secs,
+        ingress_ifindex,
+        icmp_match.resolution,
+        icmp_match.metadata.ingress_zone,
+    )
+}
+
+/// #6472: the (resolution, ingress-zone) core of
+/// [`finalize_embedded_icmp_resolution`], shared with the NAT64 flowless
+/// ICMP-error arm whose match carries the two fields directly instead of
+/// an [`EmbeddedIcmpMatch`]. Identical semantics: HA-enforce the cached
+/// resolution, then re-redirect via fabric when the local outcome is
+/// HAInactive/NoRoute/DiscardRoute (non-fabric ingress only).
+pub(in crate::afxdp::icmp_embed) fn finalize_embedded_icmp_resolution_parts(
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    now_secs: u64,
+    ingress_ifindex: i32,
+    resolution: ForwardingResolution,
+    ingress_zone: u16,
+) -> ForwardingResolution {
+    let enforced = enforce_ha_resolution_snapshot(forwarding, ha_state, now_secs, resolution);
     if !ingress_is_fabric(forwarding, ingress_ifindex)
         && matches!(
             enforced.disposition,
@@ -346,10 +369,9 @@ pub(in crate::afxdp::icmp_embed) fn finalize_embedded_icmp_resolution(
                 | ForwardingDisposition::DiscardRoute
         )
     {
-        if let Some(redirect) = resolve_zone_encoded_fabric_redirect_by_id(
-            forwarding,
-            icmp_match.metadata.ingress_zone,
-        ) {
+        if let Some(redirect) =
+            resolve_zone_encoded_fabric_redirect_by_id(forwarding, ingress_zone)
+        {
             return redirect;
         }
     }

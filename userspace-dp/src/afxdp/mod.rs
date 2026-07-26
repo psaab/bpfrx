@@ -185,8 +185,9 @@ use self::icmp_embed::{
     try_embedded_icmp_session_match_from_frame,
 };
 use self::icmp_embed::{
-    build_nat_reversed_icmp_error_v4, build_nat_reversed_icmp_error_v6,
-    finalize_embedded_icmp_resolution, try_embedded_icmp_nat_match,
+    Nat64IcmpErrorMatch, build_nat_reversed_icmp_error_v4, build_nat_reversed_icmp_error_v6,
+    finalize_embedded_icmp_resolution, finalize_embedded_icmp_resolution_parts,
+    try_embedded_icmp_nat_match, try_nat64_icmp_error_match_from_frame,
 };
 use self::mirror::*;
 use self::mpsc_inbox::MpscInbox;

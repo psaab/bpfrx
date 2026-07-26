@@ -43,6 +43,7 @@ mod flow_cache_seed;
 mod flowless_verdict;
 mod frag_assoc;
 mod host_inbound_policy;
+mod nat64_icmp_error;
 mod nat_exception;
 mod prerouting_scope;
 pub(in crate::afxdp) mod reject_reply;
@@ -66,6 +67,7 @@ use flowless_verdict::{
 use host_inbound_policy::{
     JunosHostLocalPolicy, emit_host_inbound_deny, junos_host_local_policy, policy_packet_icmp,
 };
+use nat64_icmp_error::try_translate_nat64_icmp_error;
 use rx_telemetry::record_rx_descriptor_telemetry;
 use session_admission::{new_flow_session_limit_drop, strict_syn_check_drops_new_flow};
 
@@ -3125,6 +3127,51 @@ pub(super) fn poll_binding_process_descriptor(
                 {
                     hit
                 } else {
+                    // #6472: NAT64 (cross-family) ICMP error translation
+                    // (RFC 7915 §4.2/§5.2), wired HERE on the flowless arm —
+                    // the path an ICMP error actually takes (#3290 below).
+                    // Tried BEFORE the same-family #5690 reversal and NOT
+                    // gated on `allow_embedded_icmp`: translating errors for
+                    // the translator's OWN admitted sessions is core NAT64
+                    // behavior, and the same-family arm's NAT64 matches
+                    // decline anyway (its single-family builders reject a
+                    // cross-family `original_src`), so nothing it serves is
+                    // stolen. A non-NAT64 deployment exits on the
+                    // empty-prefix gate before any parse; a match queues the
+                    // translated error as a prebuilt forward and consumes
+                    // the descriptor; a miss falls through to the #5690
+                    // reversal and normal flowless enforcement, unchanged.
+                    let is_nat64_icmp_error = !worker_ctx.forwarding.nat64.prefixes.is_empty()
+                        && matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
+                        && packet_frame
+                            .get(meta.l4_offset as usize)
+                            .copied()
+                            .map(|icmp_type| is_icmp_error(meta.protocol, icmp_type))
+                            .unwrap_or(false);
+                    if is_nat64_icmp_error {
+                        match try_translate_nat64_icmp_error(
+                            desc,
+                            raw_frame,
+                            meta,
+                            binding_index,
+                            sessions,
+                            worker_ctx,
+                            &mut binding.scratch.scratch_forwards,
+                            now_ns,
+                            now_secs,
+                        ) {
+                            EmbeddedIcmpReversal::Queued => {
+                                telemetry.counters.touched = true;
+                                continue;
+                            }
+                            EmbeddedIcmpReversal::Dropped => {
+                                telemetry.counters.touched = true;
+                                binding.scratch.scratch_recycle.push(desc.addr);
+                                continue;
+                            }
+                            EmbeddedIcmpReversal::NotHandled => {}
+                        }
+                    }
                     // #5690: an inbound non-query ICMP error referencing a NAT'd
                     // flow is FLOWLESS (#3290 discards its metadata pseudo-port so
                     // it never seeds a session). Attempt the generic embedded-ICMP
