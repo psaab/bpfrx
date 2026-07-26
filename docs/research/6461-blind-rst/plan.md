@@ -4166,8 +4166,12 @@ peer completes authentication, installs its slot
 would reject, looping the connection and defeating the
 zero-byte timeout's legacy latch: the decision phase is
 entered ONLY after authenticated support ADVERTISEMENT
-(the peer must advertise the decision capability in its
-capability record); a baseline peer's first ordinary
+(the peer must advertise the decision capability — BIT 5 of
+the capability record, rolling-gated; the advertisement
+point on a v1-proof connection is the capability record
+itself, which rides the authenticated connection and is
+therefore authenticated by construction, v9.9.54.12,
+round-59 Codex B1); a baseline peer's first ordinary
 legacy frame is BUFFERED, the connection latches legacy,
 installs, and dispatches the buffered frame in order —
 never rejected — and the latch SETTLES PERMANENTLY on that
@@ -4241,7 +4245,19 @@ A→B remains incomplete would release its VRRP hold and
 restore preemption (`vrrp/manager.go:389`) while still
 lacking A's complete table — and normal VRRP does not
 consume the packed private-election readiness bit
-(`cluster/manager.go:289`); the alternative is the explicit
+(`cluster/manager.go:289`); and the hold is a STATE
+MACHINE, not a one-shot acquisition (v9.9.54.12, round-59
+Codex B2: acquisition limited to the initial `repair-vN`
+activation leaves a later readiness LOSS unfenced — an
+overflow, a reservation rejection, or an epoch park can
+make the node incomplete WITHOUT reacquiring the hold, and
+normal VRRP preemption does not consume cluster `syncReady`
+(`instance.go:880`, `sync_state.go:11`), so an initial
+repair can complete, a later overflow can lose E1, and a
+priority event can promote the incomplete standby before
+the replacement `JOURNAL_END`: EVERY aggregate readiness
+true→false transition acquires a new generation-scoped
+hold); the alternative is the explicit
 aggregate: EVERY locally relevant obligation discharged at
 the current generation — enumerated EXACTLY (v9.9.54.11,
 round-59 SMR F2: the THREE classes are the inbound repair
@@ -4263,7 +4279,23 @@ private/direct RG mode (whose `takeoverReadinessForRG`
 today omits sync readiness, `daemon_ha_vip.go:40`) — and a
 planned transfer uses the explicit post-barrier override
 equivalent to VRRP's `ForceRGMaster` path
-(`vrrp/manager.go:761`), which does NOT clear the
+(`vrrp/manager.go:761`) — issued as a ONE-SHOT, PER-RG
+TRANSFER-GENERATION TOKEN with operator-intent provenance
+(v9.9.54.12, round-59 Codex H5: `ClusterEvent` carries no
+transition reason (`cluster/manager.go:73`) and `sendEvent`
+discards the textual reason (`:460`), so every
+`Secondary → Primary` event invokes `ForceRGMaster`
+(`daemon_ha.go:314`) and a literal "ForceRGMaster-equivalent"
+cannot distinguish planned transfer from automatic election:
+the token is issued only after the explicit repair/barrier
+proof, carries the operator intent (the request's
+authenticated source and reason), and is consumed by the
+override; a `Secondary → Primary` event WITHOUT a token is
+an automatic election and fenced by the hold; and the
+initiating preflight at `failover.go:267` (which can reject
+pending bulk before that repair sequence begins) is
+reconciled — its pending-bulk rejection defers to the
+token flow, not an independent rejection), which does NOT clear the
 underlying repair obligation: planned userspace transfer
 intentionally bypasses bulk readiness and relies on the
 final barrier (`daemon_ha_userspace_readiness.go:155`), so
@@ -4475,9 +4507,16 @@ header); the capability record's own layout is fully defined
 (field order `(node_id, process_incarnation, capacity,
 capacity_config_generation, capability bits)`, fixed widths —
 u32/u64/u64/u64/u32, the bits packed LSB-first in the u32 per
-the assignment table (v9.9.52, round-53 SMR F2: bit 0 =
+the assignment table (v9.9.52, round-53 SMR F2 + v9.9.54.12,
+round-59 Codex B1: bit 0 =
 identity-enforcement, bit 1 = lease-input, bit 2 = repair-vN,
-bit 3 = reset-vN, bit 4 = heartbeat-ack-capable, bits 5-31
+bit 3 = reset-vN, bit 4 = heartbeat-ack-capable, BIT 5 =
+DECISION-PROTOCOL (the shared capability commit —
+rolling-gated like the others; the decision-phase entry
+predicate reads BIT 5 explicitly and NEVER infers decision
+support from `repair-vN` (an intermediate peer carrying
+`repair-vN` but not bit 5 is legacy for the decision class
+and gets the buffered-first-frame path); bits 6-31
 reserved-zero — so "packed LSB-first" is unambiguous),
 little-endian integers, no padding); never as reconstructed
 fields, which could diverge in integer widths and field
@@ -5241,6 +5280,28 @@ admitted interval):
   and absent-vs-partial CONFIRM timeout (zero bytes consumed →
   retain and legacy-latch; partial → close; complete late →
   consume and ignore before declarations);
+  (d11) v9.9.54.12 boundaries (round-59 Codex L6): exact
+  decision-support gating (BIT 5 present/absent → decision
+  class vs buffered-legacy; an intermediate repair-vN peer
+  without bit 5 gets the buffered-first-frame path, never a
+  reconnect loop); baseline-frame replay (the buffered
+  ClockSync dispatches in order after the legacy latch);
+  later readiness-loss hold reacquisition (an overflow,
+  rejection, or epoch park after a completed repair arms a
+  fresh generation-scoped hold before any priority event can
+  promote); completion expiry without another activation
+  (the durable same-generation executor retries the
+  abandoned ticket; each target API validates ticket AND
+  generation); late abandoned effects racing G2 (G2's bump
+  wins by monotonicity; G1's stale effects perform nothing);
+  planned transfer with missing state (the override issues
+  only after the pending-rejection set is empty, no repair
+  obligation is outstanding, and the last full repair
+  completed through JOURNAL_END at the current generation —
+  or a forced-and-validated full repair runs first); and the
+  one-shot per-RG transfer-generation token (a
+  Secondary→Primary event without a token is an automatic
+  election and fenced);
   the pending-rejection GC wakeup
   re-opens admission with readiness degraded); same-fabric
   token supersession (C2 installs → T1 revoked before the slot
