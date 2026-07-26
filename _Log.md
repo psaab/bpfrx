@@ -1,3 +1,60 @@
+## 2026-07-26 — #6472: NAT64 ICMP error translation on the flowless arm
+
+- **Timestamp**: 2026-07-26 (fix/6472-nat64-icmp-error-translation)
+- **Action**: Wired the RFC 7915 §4.2/§5.2 ICMP error translators live on
+  the FLOWLESS poll arm — the path every non-query ICMP error takes
+  (#3290). The translators previously ran only from the flow-backed arm
+  (`build_nat64_forwarded_frame`), which an ICMP error never enters, so
+  PTB / Time-Exceeded / Dest-Unreachable toward a NAT64 session dropped
+  fail-closed in production (MissingNeighbor on the pool address, NoRoute
+  on the synthetic Pref64 destination) and PMTUD + traceroute were dead
+  across the boundary despite the #2219 feature-coverage claim. New
+  `icmp_embed::nat64_match` classifies direction behind an RFC 792
+  fail-closed consistency gate (outer destination must equal the quote's
+  source): an ICMPv4 error quoting the forward wire packet matches the
+  installed v4 reverse companion (v4→v6, outer src = Pref64 ∷ error-sender,
+  outer dst = client); an ICMPv6 error quoting the translated reply and
+  addressed to the synthetic Pref64 destination matches the forward session
+  (v6→v4, outer src = pool address, outer dst = server). The embedded
+  quote's L4 port/echo id is restored to the value the error receiver
+  carries (v4→v6 the client's ORIGINAL port via the reverse decision's
+  `rewrite_dst_port`; v6→v4 the TRANSLATED pool port via the forward
+  decision's `rewrite_src_port`) inside the translators BEFORE the outer
+  checksum (`EmbeddedV4ToV6.mapped_embedded_src_port` /
+  `EmbeddedV6ToV4.mapped_embedded_dst_port`; `None` on every data-packet
+  caller keeps the pre-#6472 bytes). New
+  `poll_descriptor::nat64_icmp_error::try_translate_nat64_icmp_error` runs
+  BEFORE the #5690 same-family reversal, NOT gated on
+  `allow_embedded_icmp` (core translator behavior for the translator's own
+  admitted sessions, not the optional passthrough that flag controls), and
+  shares the extracted `queue_prebuilt_embedded_icmp_error` tail with the
+  #5690 arm (HA/fabric finalizer, CoS classify with `flow_key = None`,
+  prebuilt forward — never a session/flow-cache authority).
+  `finalize_embedded_icmp_resolution_parts` factors the (resolution,
+  ingress-zone) finalizer core out of `finalize_embedded_icmp_resolution`
+  (the #5690 wrapper delegates — byte-identical). Non-NAT64 deployments
+  exit on the empty-prefix gate before any parse.
+- **Validation**: `cargo test` full suite GREEN (4207 bin + 60 + 8 + 22 + 1,
+  0 failed, --test-threads=1). Fail-on-revert: both poll-level tests
+  (`poll_descriptor_nat64_icmp_error_{v4_to_v6,v6_to_v4}_translated_on_
+  flowless_path_6472`) go RED with the call site disabled (v4→v6 queues
+  nothing; v6→v4 forwards UNtranslated — content assertions fire); the
+  four translator tests (`nat64_{v4_to_v6,v6_to_v4}_icmp_error_restores_
+  embedded_{src,dst}_port_6472` / `_echo_id_6472`) go RED with the port
+  restore stubbed out. `poll_descriptor_nat64_icmp_error_outer_dst_
+  mismatch_declined_6472` pins the RFC 792 gate;
+  `poll_descriptor_same_family_reversal_not_stolen_by_nat64_arm_6472`
+  pins #5690 parity with a NAT64 prefix configured. Warning parity
+  161/161 (`cargo check`) vs the pristine base.
+- **File(s)**: userspace-dp/src/nat64.rs,
+  userspace-dp/src/nat64_tests.rs,
+  userspace-dp/src/afxdp/icmp_embed/{mod.rs,builders.rs,nat64_match.rs},
+  userspace-dp/src/afxdp/poll_descriptor/{mod.rs,embedded_icmp.rs,
+  nat64_icmp_error.rs}, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/tests_embedded_poll_filter.rs,
+  userspace-dp/src/FEATURES.md, userspace-dp/src/afxdp/README.md,
+  docs/feature-coverage.md, _Log.md
+
 ## 2026-07-24 — #6434: split filter compiler god-functions
 
 - **Timestamp**: 2026-07-24 (fix/6434-filter-compiler-split)

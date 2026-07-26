@@ -135,6 +135,39 @@ pub(super) fn try_reverse_embedded_icmp_error(
         }
         return EmbeddedIcmpReversal::NotHandled;
     };
+    queue_prebuilt_embedded_icmp_error(
+        desc,
+        meta,
+        binding_index,
+        worker_ctx,
+        scratch_forwards,
+        now_ns,
+        icmp_resolution,
+        rewritten_frame,
+        #[cfg(feature = "debug-log")]
+        icmpv6_trace,
+    )
+}
+
+/// Shared tail of the embedded-ICMP error paths (#5690 same-family
+/// reversal, #6472 NAT64 cross-family translation): run egress CoS /
+/// output classification on the already-finalized resolution and queue the
+/// prebuilt frame as a forward that never seeds a session. Extracted so
+/// both arms carry ONE copy of the CoS/target-binding/queue mechanics —
+/// behavior for the #5690 path is byte-identical to the pre-extraction
+/// inline tail.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn queue_prebuilt_embedded_icmp_error(
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+    binding_index: usize,
+    worker_ctx: &WorkerContext,
+    scratch_forwards: &mut Vec<PendingForwardRequest>,
+    now_ns: u64,
+    icmp_resolution: ForwardingResolution,
+    rewritten_frame: Vec<u8>,
+    #[cfg(feature = "debug-log")] icmpv6_trace: bool,
+) -> EmbeddedIcmpReversal {
     let icmp_decision = SessionDecision {
         resolution: icmp_resolution,
         nat: NatDecision::default(),

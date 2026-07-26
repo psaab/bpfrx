@@ -2393,6 +2393,235 @@ fn nat64_unsupported_icmpv6_type_still_dropped() {
 }
 
 // ===========================================================================
+// #6472: flowless NAT64 ICMP-error translation — embedded-quote L4
+// port/identifier restoration. The quote must read back as the tuple the
+// ERROR RECEIVER carries for the flow: v4→v6 the ORIGINAL v6 client
+// source port/echo id (the wire quote holds the translated pool value);
+// v6→v4 the TRANSLATED pool destination port/echo id (the wire quote holds
+// the original client value). Without the restore the error is delivered
+// but unassociable — PMTUD dead, the exact defect class of the issue.
+// ===========================================================================
+
+#[test]
+fn nat64_v4_to_v6_icmp_error_restores_embedded_src_port_6472() {
+    // v6 client 2001:db8::1 :12345 -> 64:ff9b::c000:0205 :443, translated on
+    // the v4 wire to pool 198.51.100.1 :40000. A v4 hop (203.0.113.9) sends
+    // Time-Exceeded quoting the FORWARD wire packet (pool:40000 -> server:443).
+    let client_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let server_v4 = Ipv4Addr::new(192, 0, 2, 5);
+    let server_v6: Ipv6Addr = "64:ff9b::c000:0205".parse().unwrap();
+    let pool_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let router_v4 = Ipv4Addr::new(203, 0, 113, 9);
+    // The translated error's outer src = Pref64 :: router (RFC 7915 §6
+    // stateless mapping of the error's sender).
+    let router_v6: Ipv6Addr = "64:ff9b::cb00:7109".parse().unwrap();
+
+    let inner_l4 = [0x9Cu8, 0x40, 0x01, 0xBB, 0xaa, 0xbb, 0xcc, 0xdd]; // 40000 -> 443
+    let embedded = build_v4_with_l4(pool_v4, server_v4, PROTO_TCP, 1, &inner_l4);
+    let icmp = build_icmpv4_error(11, 0, [0, 0, 0, 0], &embedded);
+    let v4_pkt = build_v4_with_l4(router_v4, pool_v4, PROTO_ICMP_C, 64, &icmp);
+
+    let mut buf = vec![0u8; v4_pkt.len() + 64];
+    let written = write_v4_to_v6_icmp_error_into(
+        &mut buf,
+        &v4_pkt,
+        router_v6,
+        client_v6,
+        Some(12345),
+    )
+    .expect("ICMPv4 Time-Exceeded must translate");
+    let v6 = &buf[..written];
+
+    assert_eq!(&v6[8..24], &router_v6.octets(), "outer src = Pref64::router");
+    assert_eq!(&v6[24..40], &client_v6.octets(), "outer dst = v6 client");
+    assert_eq!(v6[40], 3, "ICMPv6 Time Exceeded type");
+    // Embedded quote (v6 header at v6[48..88], L4 at 88..): reads back as the
+    // ORIGINAL client tuple — the source port is RESTORED to 12345.
+    let emb = &v6[48..];
+    assert_eq!(&emb[8..24], &client_v6.octets(), "embedded src = client");
+    assert_eq!(&emb[24..40], &server_v6.octets(), "embedded dst = Pref64::server");
+    assert_eq!(
+        &emb[40..42],
+        &12345u16.to_be_bytes(),
+        "quote src port must be restored to the ORIGINAL client port"
+    );
+    assert_eq!(
+        &emb[42..44],
+        &443u16.to_be_bytes(),
+        "quote dst port untouched"
+    );
+    // The outer ICMPv6 checksum covers the restored bytes (pseudo-header oracle).
+    let s6 = Ipv6Addr::from(<[u8; 16]>::try_from(&v6[8..24]).unwrap());
+    let d6 = Ipv6Addr::from(<[u8; 16]>::try_from(&v6[24..40]).unwrap());
+    assert_eq!(
+        checksum16_ipv6_pseudo(s6, d6, PROTO_ICMPV6_C, &v6[40..]),
+        0,
+        "outer ICMPv6 checksum must verify over the restored quote"
+    );
+
+    // RED-on-revert pin: the None / data-packet entry leaves the TRANSLATED
+    // pool port verbatim (the pre-#6472, unassociable behavior).
+    let mut buf2 = vec![0u8; v4_pkt.len() + 64];
+    let w2 = write_v4_to_v6_into(&mut buf2, &v4_pkt, router_v6, client_v6)
+        .expect("data-packet entry translates");
+    assert_eq!(
+        &buf2[48 + 40..48 + 42],
+        &40000u16.to_be_bytes(),
+        "None port map must leave the translated pool port (revert of #6472 keeps this RED)"
+    );
+    // ... and the icmp_error entry with None is byte-identical to it.
+    let mut buf3 = vec![0u8; v4_pkt.len() + 64];
+    let w3 = write_v4_to_v6_icmp_error_into(&mut buf3, &v4_pkt, router_v6, client_v6, None)
+        .expect("icmp-error entry with None translates");
+    assert_eq!(&buf2[..w2], &buf3[..w3], "None == data-packet entry, byte-for-byte");
+}
+
+#[test]
+fn nat64_v4_to_v6_icmp_error_restores_embedded_echo_id_6472() {
+    // Same topology as the TCP case, but the quoted packet is an ICMPv4 echo
+    // request (pool:xlated_id -> server). The client's echo identifier is
+    // restored at the L4 identifier offset (bytes 4-6 of the quoted L4).
+    let client_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let server_v4 = Ipv4Addr::new(192, 0, 2, 5);
+    let pool_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let router_v4 = Ipv4Addr::new(203, 0, 113, 9);
+    let router_v6: Ipv6Addr = "64:ff9b::cb00:7109".parse().unwrap();
+
+    let inner_l4 = [8u8, 0, 0xAA, 0xBB, 0x9C, 0x40, 0x00, 0x01]; // echo req, csum, id 40000, seq
+    let embedded = build_v4_with_l4(pool_v4, server_v4, PROTO_ICMP_C, 1, &inner_l4);
+    let icmp = build_icmpv4_error(11, 0, [0, 0, 0, 0], &embedded);
+    let v4_pkt = build_v4_with_l4(router_v4, pool_v4, PROTO_ICMP_C, 64, &icmp);
+
+    let mut buf = vec![0u8; v4_pkt.len() + 64];
+    let written =
+        write_v4_to_v6_icmp_error_into(&mut buf, &v4_pkt, router_v6, client_v6, Some(12345))
+            .expect("echo-quoting error must translate");
+    let v6 = &buf[..written];
+    let emb = &v6[48..];
+    assert_eq!(emb[6], PROTO_ICMPV6_C, "embedded proto maps ICMP -> ICMPv6");
+    assert_eq!(emb[40], 128, "embedded echo request maps to ICMPv6 echo request");
+    assert_eq!(
+        &emb[44..46],
+        &12345u16.to_be_bytes(),
+        "embedded echo id must be restored to the ORIGINAL client id"
+    );
+    let s6 = Ipv6Addr::from(<[u8; 16]>::try_from(&v6[8..24]).unwrap());
+    let d6 = Ipv6Addr::from(<[u8; 16]>::try_from(&v6[24..40]).unwrap());
+    assert_eq!(checksum16_ipv6_pseudo(s6, d6, PROTO_ICMPV6_C, &v6[40..]), 0);
+}
+
+#[test]
+fn nat64_v6_to_v4_icmp_error_restores_embedded_dst_port_6472() {
+    // The session's translated REPLY (64:ff9b::808:808:443 -> client:12345)
+    // dies at a v6 hop (2001:db8:ffff::1), which returns Time-Exceeded
+    // addressed to the synthetic source. The translated ICMPv4 error must
+    // quote (8.8.8.8:443 -> pool:40000) — the DESTINATION port restored to
+    // the TRANSLATED value the v4 server replied to — or the server cannot
+    // associate the error with its socket.
+    let client_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap(); // Pref64::8.8.8.8
+    let pool_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let server_v4 = Ipv4Addr::new(8, 8, 8, 8);
+
+    let inner_l4 = [0x01u8, 0xBB, 0x30, 0x39, 0x01, 0x02, 0x03, 0x04]; // 443 -> 12345
+    let embedded = build_v6_with_l4(dst_v6, client_v6, PROTO_TCP, 1, &inner_l4);
+    let icmp = build_icmpv6_error(3, 0, [0, 0, 0, 0], &embedded);
+    let hop_v6: Ipv6Addr = "2001:db8:ffff::1".parse().unwrap();
+    let mut v6_pkt = build_v6_with_l4(hop_v6, dst_v6, PROTO_ICMPV6_C, 64, &icmp);
+    v6_pkt[42..44].copy_from_slice(&[0, 0]);
+    let s = checksum16_ipv6_pseudo(hop_v6, dst_v6, PROTO_ICMPV6_C, &v6_pkt[40..]);
+    v6_pkt[42..44].copy_from_slice(&s.to_be_bytes());
+
+    let mut buf = vec![0u8; v6_pkt.len() + 64];
+    let written = write_v6_to_v4_icmp_error_into(
+        &mut buf,
+        &v6_pkt,
+        pool_v4,
+        server_v4,
+        false,
+        Some(40000),
+    )
+    .expect("ICMPv6 Time-Exceeded must translate");
+    let v4 = &buf[..written];
+
+    assert_eq!(&v4[12..16], &pool_v4.octets(), "outer src = translator pool address");
+    assert_eq!(&v4[16..20], &server_v4.octets(), "outer dst = v4 server");
+    assert_eq!(v4[20], 11, "ICMPv4 Time Exceeded type");
+    // Embedded quote (v4 header at v4[28..48], L4 at 48..): reads back as the
+    // v4 reply the server sent — dst port RESTORED to the translated value.
+    let emb = &v4[28..];
+    assert_eq!(&emb[12..16], &server_v4.octets(), "embedded src = server");
+    assert_eq!(&emb[16..20], &pool_v4.octets(), "embedded dst = pool");
+    assert_eq!(
+        &emb[20..22],
+        &443u16.to_be_bytes(),
+        "quote src port untouched"
+    );
+    assert_eq!(
+        &emb[22..24],
+        &40000u16.to_be_bytes(),
+        "quote dst port must be restored to the TRANSLATED pool port"
+    );
+    // Checksum oracles cover the restored bytes.
+    assert_eq!(checksum16(&v4[..20]), 0, "outer IPv4 header checksum");
+    assert_eq!(checksum16(&v4[20..]), 0, "outer ICMPv4 checksum");
+    assert_eq!(checksum16(&emb[..20]), 0, "embedded IPv4 header checksum");
+
+    // RED-on-revert pin: the data-packet entry leaves the ORIGINAL client
+    // port verbatim (unassociable — the pre-#6472 behavior).
+    let mut buf2 = vec![0u8; v6_pkt.len() + 64];
+    let w2 = write_v6_to_v4_into(&mut buf2, &v6_pkt, pool_v4, server_v4, false)
+        .expect("data-packet entry translates");
+    assert_eq!(
+        &buf2[28 + 22..28 + 24],
+        &12345u16.to_be_bytes(),
+        "None port map must leave the original client port (revert of #6472 keeps this RED)"
+    );
+}
+
+#[test]
+fn nat64_v6_to_v4_icmp_error_restores_embedded_echo_id_6472() {
+    // The quoted reply is an ICMPv6 echo REPLY (Pref64::server -> client) —
+    // its identifier is the ORIGINAL client id on the v6 side; the v4 server
+    // only associates the TRANSLATED id it echoed back. Restore at the L4
+    // identifier offset.
+    let client_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let pool_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let server_v4 = Ipv4Addr::new(8, 8, 8, 8);
+
+    let inner_l4 = [129u8, 0, 0xAA, 0xBB, 0x30, 0x39, 0x00, 0x01]; // echo reply, csum, id 12345, seq
+    let embedded = build_v6_with_l4(dst_v6, client_v6, PROTO_ICMPV6_C, 1, &inner_l4);
+    let icmp = build_icmpv6_error(3, 0, [0, 0, 0, 0], &embedded);
+    let hop_v6: Ipv6Addr = "2001:db8:ffff::1".parse().unwrap();
+    let mut v6_pkt = build_v6_with_l4(hop_v6, dst_v6, PROTO_ICMPV6_C, 64, &icmp);
+    v6_pkt[42..44].copy_from_slice(&[0, 0]);
+    let s = checksum16_ipv6_pseudo(hop_v6, dst_v6, PROTO_ICMPV6_C, &v6_pkt[40..]);
+    v6_pkt[42..44].copy_from_slice(&s.to_be_bytes());
+
+    let mut buf = vec![0u8; v6_pkt.len() + 64];
+    let written = write_v6_to_v4_icmp_error_into(
+        &mut buf,
+        &v6_pkt,
+        pool_v4,
+        server_v4,
+        false,
+        Some(40000),
+    )
+    .expect("echo-reply-quoting error must translate");
+    let v4 = &buf[..written];
+    let emb = &v4[28..];
+    assert_eq!(emb[9], PROTO_ICMP_C, "embedded proto maps ICMPv6 -> ICMP");
+    assert_eq!(emb[20], 0, "embedded echo reply maps to ICMPv4 echo reply");
+    assert_eq!(
+        &emb[24..26],
+        &40000u16.to_be_bytes(),
+        "embedded echo id must be restored to the TRANSLATED id"
+    );
+    assert_eq!(checksum16(&v4[20..]), 0);
+}
+
+// ===========================================================================
 // #2290: IPv6 extension-header walk in the v6->v4 translator.
 //
 // Pre-fix the translator read packet[6] as the L4 protocol and assumed L4 at
