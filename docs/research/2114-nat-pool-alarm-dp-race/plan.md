@@ -1,9 +1,10 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v27 — r26 findings folded (Codex NEEDS-REVISION
-  3M/1m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m — its
-  m1 was folded into the Codex M3 two-sided master-key-IO
-  classification); pending convergence review r27
+- **Status**: DRAFT v28 — r27 findings folded (Codex NEEDS-REVISION
+  4M/2m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m — its
+  plaintext-write over-block nit folded into the Codex M2 no-create
+  single-snapshot write primitive); pending convergence review r28
+  with the explicit SPLIT-OR-CONVERGE question (§11 question 6)
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -659,7 +660,8 @@
   form). (e) The recordless guarantee is SCOPED (Codex m1):
   restore-first ORDERING never creates the gap; a restore FAILURE
   returns K to D1, and a subsequent R_K delete + crash before the
-  next W pass is the admitted best-effort arm-persistence residual.
+  next SUCCESSFUL W restore (failed passes do not close the gap)
+  is the admitted best-effort arm-persistence residual.
   (f) The synthetic record's pins land (Codex m2 = SMR m1):
   `FirstCommit=false` (LOAD-BEARING per r24 Codex M2 — on the NEW
   reader `Resolved` precedes H; on the OLD reader `FirstCommit=true`
@@ -691,7 +693,10 @@
   `readOrCreateMasterKey` would auto-create a fresh key and launder
   the unreadable-active state); W runs BEFORE the slot-keyed D — a
   successful restore installs the live record and subsumes D as
-  moot; a restore FAILURE returns the slot to D's (d-i) path; crash
+  moot; a restore FAILURE returns the slot to D's (d-i) path
+  (SUPERSEDED in r25: a failed W restore RETAINS the W debt — write
+  failures never terminalize — and D stays SUPPRESSED while W
+  pends; D re-evaluates the slot FRESH only when W resolves); crash
   regression drives both. (c) The recordless claim is scoped
   everywhere (Codex m1 — invariant 12's "no recordless live window
   ever" became "restore-first ORDERING never creates the gap", and
@@ -709,7 +714,9 @@
   (e) The health schema is unified (Codex m3): the snapshot is
   exactly `{ActivePersistDegraded, ConfirmDebtKindMask
   (REMOVAL|REWRITE|SLOT_DELETE), ConfirmRecordState
-  (OK|TerminalUnreadable|RestartRecoveryOwed)}` and the aggregate
+  (OK|TerminalUnreadable|RestartRecoveryOwed)}` — r27 adds a fourth,
+  NON-SECRET `ConfirmDebtKeyClass` bool (the retained failure's
+  `errors.As` cause, for the key-class message variant) — and the aggregate
   `ConfigPersistDegraded()` is a DERIVED value
   (`persistDegraded || mask ≠ 0 || enum ≠ OK`), not a snapshot
   field.
@@ -740,7 +747,9 @@
   with the `FirstCommit=true` variant landing in bootstrap handling
   to prove the pin load-bearing. (c) The (w-u) restore failure is
   phase-qualified (Codex m1): PRE-rename → unreadable record stands
-  → D's (d-i); POST-rename → live C VISIBLE → W stays owed ((w-a))
+  → D's (d-i) (the PRE-rename leg is SUPERSEDED in r25: the W debt
+  stays pended and D stays SUPPRESSED — there is NO D path while W
+  pends); POST-rename → live C VISIBLE → W stays owed ((w-a))
   and D's mandatory re-read reaches (d-iii) READABLE → clear as
   moot; phase regressions for both legs. (d) The residual wording is
   corrected (Codex m4): the crash must land INSIDE the seconds-wide
@@ -879,6 +888,71 @@
   suppressed while ANY live window exists); and the x15 taxonomy
   boundary copy generalizes its clear guard to every repair action
   and clear.
+  v28: r27 convergence — the guard is made EXECUTABLE and the last
+  debt-interaction hole closes (Codex NEEDS-REVISION 4M/2m, folds
+  0/5 clean — all PARTIAL; AGY PLAN-READY 5/5 with 3 fresh attacks
+  FAILED; SMR PLAN-READY-WITH-NITS 0M/1m — its plaintext-write
+  over-block nit is folded into (b)): (a) the active-side guard
+  becomes an executable THREE-WAY state machine (Codex M1, verified
+  the under-specification: an error-only predicate accepts ABSENT
+  active state — `ReadActiveMeta` returns `(nil, true, nil)` for a
+  missing active.json, `db.go:319-330` — and a non-nil-tree
+  predicate blocks the sanctioned both-files-removed barrier):
+  (g-ok) tree != nil && err == nil → PROCEED; (g-absent) tree ==
+  nil && err == nil → PROCEED only for the sanctioned
+  `DeleteConfirm` barrier, WITHHOLD everything else; (g-err) err !=
+  nil → WITHHOLD + retain, NO terminalization, the message names
+  the ACTIVE side — with IDENTICAL placement at boot (consuming the
+  same `ReadActiveMeta` result `Load` already took,
+  `store_persist.go:26-35`) and runtime (a fresh read under `s.mu`
+  at action time), and the (x23) regression matrix. (b) ALL
+  confirm-side repair writes become NO-CREATE, SINGLE-SNAPSHOT
+  (Codex M2, verified: every current `WriteConfirm` reaches
+  `readOrCreateMasterKey` through `db.go:207-217` +
+  `crypto.go:262-270,457-479`, so check-then-ordinary-write left
+  the auto-create path live and raced a K→K′ swap): the key is
+  sourced via `readMasterKey` (never creates), a missing/invalid
+  key file FAILS the write, and ONE key snapshot under `s.mu`
+  feeds both the gate's validation and the write's encryption;
+  PLAINTEXT repair writes are EXEMPT by construction (SMR m1,
+  `crypto.go:262-265` — the write-block predicate IS the encryption
+  predicate; a plaintext restore/tombstone/delete performs no key
+  access). (c) D's actionable precondition gains the THIRD conjunct
+  (Codex M3, verified the undurable-replacement outrun: SyncApply
+  cancels live C BEFORE persisting its replacement —
+  `store.go:687-717,738-746` — so a PRE-rename failure leaves no W
+  and `armedArmID == ""`, yet #5473 retention keeps C's window
+  record as the only crash-recovery intent for the still-on-disk
+  UNCONFIRMED C; an actionable D would (d-i) tombstone+delete it
+  while the active gate PASSES on readable C): D acts ONLY when no
+  W debt pends AND `armedArmID == ""` AND `persistDegraded ==
+  false`; the precondition is now stated at the D-table head, and
+  the (d-ii)/(d-iii) clear legs are gated like every other action.
+  (d) The key-class subtype gets TYPED SOURCES (Codex M4, verified:
+  Go's GCM auth error has no exported sentinel —
+  `crypto.go:354-356` wraps it untyped, invalid length is a plain
+  `fmt.Errorf` at `crypto.go:451-453,460-462`): `crypto.go` gains
+  `ErrMasterKeyAuth` + `ErrMasterKeyLength`, each matching
+  `errors.As(err, &ConfirmRecordKeyClassError)` AND preserving
+  `ConfirmRecordPermanentError`; the four classification boundaries
+  are regression-pinned (x24); `crypto.go` JOINS the §5.1 change
+  inventory. (e) The health snapshot gains the NON-SECRET
+  `ConfirmDebtKeyClass` bool (Codex m2 = fold-partial 4: the
+  three-field snapshot + callback payload exposed no key-class bit,
+  so the ORIGINAL-key guidance was unrenderable) populated from the
+  retained failure's `errors.As` check — NEVER message text — with
+  the key-class `/health` variant regression-pinned against the
+  generic one. (f) The acceptance suite gains the DURABLE-ARM
+  D-suppression leg (Codex m1 — seed D, land a fully durable arm
+  with no W, block the moot-clear, assert D inert) and the
+  SyncApply-pre-rename leg (x22). (g) Residual copies swept: the
+  arm-persistence residual everywhere says "before the next
+  SUCCESSFUL W restore (failed passes do not close the gap)"; the
+  v24-history/§11 "a restore FAILURE returns the slot to D's (d-i)
+  path" copies are annotated SUPERSEDED-in-r25 (a failed W restore
+  RETAINS W; D stays suppressed while W pends); the duplicate x15
+  copy generalizes to every repair action and clear; the r24
+  phase-qualification's PRE-rename → D leg is annotated SUPERSEDED.
 
 ---
 
@@ -1859,9 +1933,12 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   authentication failure, invalid observed key length, the
   mechanical `ConfirmRecordKeyClassError` subtype — and ANY
   missing/unreadable key file BLOCK the write: the debt retains and
-  the message names `.configdb/master.key` restoration, since a
-  write under a missing or swapped key would auto-create or launder
-  the unreadable-active state) —
+  the message names `.configdb/master.key` restoration — enforced
+  by the r28 NO-CREATE keyed write primitive, so the write FAILS
+  CLOSED with `readOrCreateMasterKey` never reached — no fresh key
+  is created, and a write under a swapped key cannot launder the
+  unreadable-active state because the restore's write consumes the
+  SAME key snapshot the gate validated) —
   implementing the confirmed-commit-pre-rename case of the (ii-b)
   eager rule. PRIORITY, STRENGTHENED TO FULL SUPPRESSION (r25 Codex
   M2, verified the kill-shot: an EARLIER post-rename W attempt may
@@ -1887,7 +1964,23 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   access to the slot, and the restore handles every slot content
   (unreadable superseded record → (w-u) restore-over; visible live
   C → (w-a) make durable). D acts ONLY when NO live window exists
-  (no W debt AND `armedArmID == ""`) — the
+  (no W debt AND `armedArmID == ""`) AND NO active-persist debt is
+  outstanding (`persistDegraded == false`) — the THIRD conjunct
+  closes the undurable-replacement outrun (r27 Codex M3, verified:
+  SyncApply cancels the live window C BEFORE persisting its
+  replacement — `store.go:687-717,738-746` — so a PRE-rename
+  failure of the replacement's active write leaves NO W debt and
+  `armedArmID == ""`, yet #5473 PRE-rename retention keeps C's
+  window record as the ONLY crash-recovery intent for the
+  still-on-disk UNCONFIRMED C; an actionable D whose fresh re-read
+  turns NON-key-class permanent would (d-i) tombstone+delete that
+  record while the active-side gate PASSES — disk active C is
+  readable — and a crash before the replacement retry lands then
+  boots unconfirmed C with its recovery intent destroyed, a #4577
+  violation): while the replacement's persist is outstanding, D is
+  inert; once the retry lands the replacement durably, the record
+  is genuinely superseded and D's fresh re-read proceeds per the
+  (ii-b) eager rule — the
   plain-commit/SyncApply eager rule, where no live window exists and
   the slot provably holds the superseded record. When the pended W
   resolves (restore succeeded → the slot holds the live record → D
@@ -1940,12 +2033,15 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   precisely (r22 Codex m1): restore-first ORDERING never creates a
   recordless live window by itself — but a restore FAILURE returns K
   to D1, and if R_K's tombstone→delete then SUCCEEDS and a crash
-  lands before the next W pass, K is absent with C's window live and
+  lands before the next SUCCESSFUL W restore (failed passes do not
+  close the gap), K is absent with C's window live and
   recordless: that is the admitted best-effort arm-persistence
   residual (`store_commit.go:548-553` — a live window with no
   recovery record, warned; the exposure is seconds-wide under
   TRANSIENT failure but UNBOUNDED up to the confirm window's own end
-  under a deterministic write failure — the W retry has NO success
+  under a deterministic write failure — the crash must land before
+  the next SUCCESSFUL W restore, failed passes do not close the
+  gap, and the W retry has NO success
   guarantee and dies with the process (`store_commit.go:611-628`;
   `store_persist.go:397-401`), and there is NO post-crash heal),
   not a new class. The retry
@@ -2093,7 +2189,30 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   is MECHANICAL (r26 Codex M3c): the sentinel family gains a
   `ConfirmRecordKeyClassError` subtype (authentication failure +
   invalid observed key length) consumed via `errors.As` — the
-  key-class rule never string-matches; and master-key IO carries the
+  key-class rule never string-matches. THE SUBTYPE HAS TYPED SOURCES
+  (r27 Codex M4, verified the gap: Go's GCM authentication error has
+  NO exported typed sentinel — `crypto.go:354-356` today converts it
+  to an ordinary wrapped error, invalid key length is a plain
+  `fmt.Errorf` at `crypto.go:451-453,460-462`, and `ReadConfirm`
+  merely adds `%w` at `db.go:250-253` — so `errors.As` has nothing
+  to match): `crypto.go` gains TWO typed source errors —
+  `ErrMasterKeyAuth` wrapping the `gcm.Open` failure
+  (`crypto.go:354-356`) and `ErrMasterKeyLength` at both length
+  gates (`crypto.go:451-453,460-462`) — each wrapped so
+  `errors.As(err, &ConfirmRecordKeyClassError)` matches (the
+  key-class subtype carries the permanent umbrella: the chain ALSO
+  satisfies `errors.As(err, &ConfirmRecordPermanentError)` —
+  key-class IS permanent), and `ReadConfirm`'s existing `%w`
+  wrapping passes the typed causes through unchanged. Classification
+  regressions pin all four boundaries: auth failure → key-class;
+  invalid observed length → key-class; missing key file / EACCES
+  (master-key IO) → NOT key-class (READ-side TRANSIENT);
+  unsupported PRF / too-new envelope format / bad nonce / bad
+  base64 → NOT key-class (NON-key-class permanent — the envelope
+  header is unencrypted, `crypto.go:26-32,307,323-326,348-353`, so
+  the content is provably unparseable under ANY key). `crypto.go`
+  JOINS the §5.1 change inventory (its omission was Codex r27's
+  fold-partial 3). And master-key IO carries the
   TWO-SIDED classification (r26 SMR m1: READ-side TRANSIENT — retain
   + retry per the r17 taxonomy, a missing mount/EACCES is
   recoverable; WRITE-side BLOCKED — `readOrCreateMasterKey`
@@ -2105,6 +2224,63 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   (malformed JSON, zero deadline, nil target, too-new envelope
   format, unsupported PRF — content provably unparseable regardless
   of key) take the repair-write exemption.
+  THE GATE IS AN EXECUTABLE THREE-WAY STATE MACHINE (r27 Codex M1,
+  verified the under-specification: an error-only predicate accepts
+  ABSENT active state — `ReadActiveMeta` returns `(nil, true, nil)`
+  for a missing active.json, `db.go:319-330` — and a
+  non-nil-tree predicate blocks the sanctioned both-files-removed
+  barrier). The predicate is evaluated FRESH under `s.mu` at each
+  action time (never a cached result) via `ReadActiveMeta` or
+  equivalent: (g-ok) `tree != nil && err == nil` → the active side
+  is readable under the current key → PROCEED; (g-absent)
+  `tree == nil && err == nil` → the active config is ABSENT →
+  PROCEED only for the sanctioned both-files-removed `DeleteConfirm`
+  barrier (the operator removed both files — active absence IS the
+  operator's intent, and the barrier's unlink is idempotent);
+  WITHHOLD every other action (a missing active with a healthy
+  confirm slot must never clear or repair — the next `Load`
+  re-seeds while the confirm slot outruns it); (g-err) `err != nil`
+  → WITHHOLD — retain the debt, NO terminalization, NO write, NO
+  clear; the message names the ACTIVE side. The active-read error's
+  own transient/permanent class does NOT change the gate's behavior
+  (withheld is withheld; the class only enriches the message) —
+  EACCES and corrupt-active both withhold and retry next pass.
+  PLACEMENT is identical at boot and runtime (r27 Codex M1's
+  placement pin, verified `store_persist.go:26-42,113-140,402-465`:
+  boot reads active ONCE before recovery, the runtime retry loop
+  never reads it today): at BOOT, the gate consumes the SAME
+  `ReadActiveMeta` result `Load` already took at
+  `store_persist.go:26-35` — no second read — and every
+  confirm-recovery repair/clear in the boot sequence is gated on it;
+  at RUNTIME, the retry loop / probe continuation takes a FRESH
+  `ReadActiveMeta` under `s.mu` immediately before each debt action
+  and gates on it. The regression matrix covers all three gate
+  states × (W restore, D tombstone, D delete, confirm-side clear,
+  sanctioned barrier) at BOTH placements.
+  AND THE REPAIR WRITE IS NO-CREATE, SINGLE-SNAPSHOT (r27 Codex M2,
+  verified the hole: every current `WriteConfirm` reaches
+  `readOrCreateMasterKey` through `db.go:207-217` +
+  `crypto.go:262-270,457-479` — a check-then-ordinary-write leaves
+  the auto-create path live AND races a K→K′ swap between the gate's
+  read and the write's own key read): ALL confirm-side repair writes
+  (the W restore, the D synthesized tombstone) use a NO-CREATE keyed
+  write primitive — the key is sourced via `readMasterKey` (which
+  NEVER creates, `crypto.go:443-455`) and a missing/invalid key file
+  FAILS the write with no creation — and the gate's active-side
+  validation and the repair write consume ONE key snapshot: the key
+  bytes are read ONCE under `s.mu` at action time, the active side
+  is validated against them, and the SAME bytes are passed into the
+  write's encryption step — a K→K′ swap between check and write is
+  impossible by construction. PLAINTEXT repair writes are EXEMPT by
+  construction (r27 SMR m1, verified `crypto.go:262-265`:
+  `maybeEncryptTreeJSON` returns the body untouched when the
+  candidate tree carries no master-password leaf and NEVER calls
+  `readOrCreateMasterKey`): the write-block predicate IS the
+  encryption predicate — a plaintext W restore / plaintext
+  synthesized tombstone / slot DELETE performs no key access at
+  all, so the missing-key-file block cannot over-block it; it is
+  gated only by the (g-ok)/(g-absent)/(g-err) active-side machine
+  above (a no-op read for a plaintext active config).
   Terminal for a content-dependent debt means: the confirm-record
   debt stops retrying (no infinite
   capped-backoff loop) while the singleton retry loop KEEPS healing
@@ -2226,7 +2402,15 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   the test asserts each leg.
   (2) `DeleteConfirm` (unlink + dir-fsync barrier).
   Any failure raises the D-kind slot debt, retried by the same
-  singleton loop — but the retry NEVER re-runs the tombstone blindly
+  singleton loop — and the debt is ACTIONABLE only under the full
+  three-conjunct precondition (r26 Codex M2 + r27 Codex M3, stated
+  at the table head so no leg reads unqualified): NO W-kind debt
+  pended AND `armedArmID == ""` AND `persistDegraded == false`
+  (no outstanding active-persist debt); while any conjunct fails,
+  EVERY D leg below — including the (d-ii)/(d-iii) clears — is
+  inert, and each leg's action or clear is additionally gated on
+  the (g-ok)/(g-absent)/(g-err) active-side state machine —
+  but the retry NEVER re-runs the tombstone blindly
   (r22 Codex M2 = SMR M1, both walked the same hazard independently:
   an arm landing between the debt's raise and its retry installs a
   LIVE window's record on the slot, and an unconditional re-run
@@ -2242,8 +2426,9 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   KEY-CLASS case (authentication failure, invalid observed key
   length, or any missing/unreadable key file) RETAINS with the
   `.configdb/master.key` restoration message and NO write:
-  a missing key file would make the write AUTO-CREATE a fresh key
-  and launder the state) (that read does NOT re-terminalize; the tombstone write's
+  the r28 NO-CREATE keyed write primitive fails such a write CLOSED
+  with `readOrCreateMasterKey` never reached — no fresh key is
+  created to launder the state) (that read does NOT re-terminalize; the tombstone write's
   success is the signal); (d-i') the read fails TRANSIENT-class
   (EACCES, short read, master-key IO — READ-side transient per the
   r17 taxonomy; the WRITE-side block for a missing key file lives
@@ -2254,10 +2439,17 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   and a transient error cannot distinguish A-unreadable from
   C-visible — writing on it could tombstone a live C), with a
   dedicated regression; (d-ii) record ABSENT → `DeleteConfirm`
-  re-drive (finish the dir-fsync) → clear; (d-iii) record READABLE →
+  re-drive (finish the dir-fsync) → clear — the re-drive AND the
+  clear gated on the active-side state machine ((g-ok) PROCEED;
+  (g-absent) PROCEED — this IS the sanctioned both-files-removed
+  barrier; (g-err) WITHHOLD); (d-iii) record READABLE →
   the superseded unreadable record is already GONE (replaced — by an
   arm's overwrite per the confirmed-commit rule, or by operator
-  action): the D-kind debt CLEARS as moot, and the readable record
+  action): the D-kind debt CLEARS as moot — the clear gated on the
+  active-side state machine like every confirm-side action ((g-ok)
+  PROCEED; (g-absent)/(g-err) WITHHOLD — a withheld clear is exactly
+  what the live-window and outstanding-persist conjuncts above keep
+  inert) — and the readable record
   follows its normal path (live-window ArmID match → untouched;
   `Resolved` → finish the delete; otherwise → the R-kind /
   seeded-orphan machinery). A successful arm on the slot at ANY
@@ -2450,7 +2642,22 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   stale rollback): "commit-confirmed recovery record persistence
   degraded (removal/rewrite/slot-delete not yet durable; retry in
   progress)" with
-  the mask rendered as the debt-kind detail field,
+  the mask rendered as the debt-kind detail field — AND the snapshot
+  carries the key-class cause ACROSS the Store→API boundary (r27
+  Codex m2 + fold-partial 4, verified the gap: the typed snapshot
+  and the `ConfigPersistDegradedStateFn` payload exposed only an
+  active flag, a debt mask, and the three-state record enum — no
+  key-class bit, so the promised ORIGINAL-key guidance was
+  unrenderable): the snapshot gains a NON-SECRET
+  `ConfirmDebtKeyClass` bool, populated at debt raise/retain time
+  from the retained failure's `errors.As` check against
+  `ConfirmRecordKeyClassError` (never from message text), and
+  `api/health.go` renders the key-class VARIANT of the confirm-debt
+  message when it is set — "restore the ORIGINAL
+  `.configdb/master.key`; writing or deleting under a NEW key would
+  launder an unreadable active config" — in place of the generic
+  removal/rewrite/slot-delete text, with a health regression pinning
+  both variants (key-class set vs clear),
   then the existing active-persist message (`api/health.go:65-71`). The aggregate
   `ConfigPersistDegraded()` stays the OR for the gauge (health can
   never read healthy while the gauge reads 1). The wiring is a
@@ -2718,16 +2925,51 @@ record long gone); (x20) FAIL-CLOSED ROUTING (r18 Codex M6 = SMR M1 + r19 Codex 
 legs), confirm.json-named diagnostic, pinned retry envelope (initial
 read + ≤3 retries, 100/200/400 ms, `LoadContext(ctx)`); (x21)
 HEALTH SNAPSHOT PRECEDENCE (r18 Codex M7/m5 + r19 Codex m4 + r20
-Codex m2 + r23 Codex m3): the exact three-value breakdown
+Codex m2 + r23 Codex m3 + r27 Codex m2): the exact breakdown
 `{ActivePersistDegraded, ConfirmDebtKindMask
 (REMOVAL|REWRITE|SLOT_DELETE), ConfirmRecordState
-(OK|TerminalUnreadable|RestartRecoveryOwed)}` with the aggregate
+(OK|TerminalUnreadable|RestartRecoveryOwed), ConfirmDebtKeyClass
+bool}` — the fourth field NON-SECRET, populated from the retained
+failure's `errors.As` check against `ConfirmRecordKeyClassError`,
+NEVER from message text — with the aggregate
 DERIVED (`persistDegraded || mask ≠ 0 || enum ≠ OK`);
 /health precedence TerminalUnreadable > RestartRecoveryOwed >
 ConfirmDebt (generic removal/rewrite/slot-delete message + mask
-detail) > ActivePersist; the gauge consumes the derived aggregate OR;
+detail, REPLACED by the key-class variant naming ORIGINAL
+`.configdb/master.key` restoration when `ConfirmDebtKeyClass` is
+set — both variants regression-pinned) > ActivePersist; the gauge
+consumes the derived aggregate OR;
 Config → NewServer plumbing
-pinned. This closes the
+pinned; (x22) DURABLE-ARM D-SUPPRESSION (r27 Codex m1, verified the
+acceptance gap: the D regressions covered read classifications but
+never exercised the live-window suppression itself): seed a D-kind
+slot debt, then land a FULLY DURABLE arm (no W debt created), block
+the (d-iii) moot-clear via the active-side gate, and assert D
+remains INERT across later non-key permanent slot-read failures
+while `armedArmID != ""`; PLUS the SyncApply-pre-rename leg (r27
+Codex M3): D seeded beside durable live C, SyncApply cancels C and
+its replacement active write fails PRE-rename — assert D stays
+INERT while `persistDegraded` stands (C's window record survives —
+#5473 retention — and no tombstone/delete runs), then let the
+replacement retry land and assert D's fresh re-read proceeds per
+the (ii-b) eager rule; (x23) ACTIVE-GATE MATRIX (r27 Codex M1):
+(g-ok)/(g-absent)/(g-err) × (W restore, D tombstone, D delete,
+confirm-side clear, sanctioned both-files-removed barrier) at BOTH
+placements (boot — consuming the same `ReadActiveMeta` result
+`Load` already took; runtime — a fresh read under `s.mu` at action
+time), asserting (g-absent) PROCEEDS only for the barrier and
+withholds everything else, and (g-err) withholds + retains with NO
+terminalization for both EACCES and corrupt-active; (x24) KEY-CLASS
+CLASSIFICATION BOUNDARIES (r27 Codex M4): auth failure →
+`ConfirmRecordKeyClassError`; invalid observed length → key-class;
+missing key file / EACCES → NOT key-class (READ-side TRANSIENT);
+unsupported PRF / too-new envelope / bad nonce / bad base64 → NOT
+key-class (NON-key-class permanent); PLUS the NO-CREATE write pin
+(r27 Codex M2): an encrypted repair write attempted with the key
+file missing FAILS with no key created (the file stays absent), a
+K-swap between gate and write is impossible by construction (one
+snapshot), and a plaintext repair write proceeds with no key access
+at all. This closes the
 master's re-arm-after-confirmed residual for the whole confirm-type
 class AND the post-durability replacement finalize — the two places a
 lingering record's replay is unsafe.
@@ -2914,6 +3156,19 @@ coexistence) is deleted as incoherent (r1 B3).
   touch configstore): the permanent FirstCommit+cluster recovery guard +
   the factored expired-branch FirstCommit revert helper + the canonical
   binding capture at Load.
+- `pkg/configstore/crypto.go` (r27 Codex M2/M4 — crypto.go IS
+  touched): the TWO typed source errors `ErrMasterKeyAuth` (wrapping
+  the `gcm.Open` failure, `crypto.go:354-356`) and
+  `ErrMasterKeyLength` (both length gates,
+  `crypto.go:451-453,460-462`), each wrapped so
+  `errors.As(err, &ConfirmRecordKeyClassError)` matches and the
+  chain preserves `ConfirmRecordPermanentError`; and the NO-CREATE
+  keyed write primitive for ALL confirm-side repair writes (key
+  sourced via `readMasterKey` — never `readOrCreateMasterKey` — a
+  missing/invalid key file FAILS the write with no creation; one
+  key snapshot under `s.mu` feeds both the gate's active-side
+  validation and the write's encryption; plaintext writes exempt by
+  construction, `crypto.go:262-265`).
 - `pkg/configstore/store_commit.go` + `db.go` + `store.go` +
   `store_persist.go` (r11-r17): the `canonicalConfigHash` binding at
   the sole arm site (`writeConfirmState`); the additive `Resolved` +
@@ -2986,9 +3241,11 @@ coexistence) is deleted as incoherent (r1 B3).
   the NEW `ErrConfirmStateUnreadable` sentinel routed fail-closed
   through `classifyLoadError`, and the
   typed `ConfigPersistDegradedState()` snapshot accessor returning the
-  exact three-value breakdown `{ActivePersistDegraded bool,
+  exact breakdown `{ActivePersistDegraded bool,
   `ConfirmDebtKindMask (REMOVAL|REWRITE|SLOT_DELETE)`,
-  `ConfirmRecordState (OK|TerminalUnreadable|RestartRecoveryOwed)`}`
+  `ConfirmRecordState (OK|TerminalUnreadable|RestartRecoveryOwed)`,
+  `ConfirmDebtKeyClass bool` — the fourth field NON-SECRET, from the
+  retained failure's `errors.As` check (r27 Codex m2)}`
   with the aggregate `ConfigPersistDegraded()` DERIVED
   (`persistDegraded || mask ≠ 0 || enum ≠ OK`), and precedence
   TerminalUnreadable > RestartRecoveryOwed >
@@ -3002,7 +3259,10 @@ coexistence) is deleted as incoherent (r1 B3).
   consumes) wired from the store's typed snapshot;
   `api/health.go` renders the messages by precedence
   (terminal confirm-record > confirm-persist — GENERIC
-  removal/rewrite/slot-delete text + a debt-kind detail field — >
+  removal/rewrite/slot-delete text + a debt-kind detail field,
+  REPLACED by the key-class variant naming ORIGINAL
+  `.configdb/master.key` restoration when `ConfirmDebtKeyClass` is
+  set — >
   active-persist), plus the
   DISTINCT restart-recovery-owed message for the BOOT-origin substate;
   `metrics.go` keeps the gauge on the aggregate OR;
@@ -3322,7 +3582,8 @@ Preserved exactly:
     the pending removal clears on the restore's barrier — restore-first
     ORDERING never creates a recordless live window; a restore FAILURE
     returns K to D1, and a subsequent R_K delete + crash before the
-    next W pass is the admitted best-effort arm-persistence residual
+    next SUCCESSFUL W restore (failed passes do not close the gap)
+    is the admitted best-effort arm-persistence residual
     (`store_commit.go:548-553`, named in the residual set below)), debt-kind-correct actions (R-kind:
     tombstone→delete; W-kind: rewrite/restore the LIVE window's
     retained immutable record — re-keyed at every arm outcome, never
@@ -3670,8 +3931,8 @@ Preserved exactly:
      (authentication failure, invalid observed key length) → RETAIN
      with the master.key-restoration message — NO repair write
      (writing under a new key would launder the unreadable-active
-     state), and any clear validates active.json is also readable
-     under the current key; (x16) SAME-RECORD
+     state), and EVERY repair action and clear validates the ACTIVE
+     side is also readable under the current key; (x16) SAME-RECORD
      DOMINANCE (r18 Codex M2 + r19 Codex M1): W_B + R_B coexisting
      with B's tombstone
      failed PRE-rename (visible record PENDING-shaped) → the retry
@@ -3788,7 +4049,7 @@ Preserved exactly:
   past the next boot; the lifecycle redesign is a pre-existing policy
   question, not a `d.dp` publication concern.
 
-## 11. Open questions for adversarial review (r27)
+## 11. Open questions for adversarial review (r28)
 
 Resolved in v2-v9 (for the record): A2 deletion; atomic cell choice;
 sampler-only adapter — now STRUCTURAL via `CachedStatusProvider`;
@@ -4073,7 +4334,9 @@ NON-KEY-CLASS-PERMANENT slot
 → restore `s.armedRecord` over it — key-class and any
 missing/unreadable key file BLOCK the write per r26; a successful
 restore subsumes D as
-moot; a restore failure returns the slot to D's (d-i) path), the
+moot; a restore failure returns the slot to D's (d-i) path —
+SUPERSEDED in r25: a failed W restore RETAINS W and D stays
+SUPPRESSED while W pends), the
 recordless claim scoped everywhere (restore-first ORDERING never
 creates the gap; the restore-failure arm-persistence residual joins
 the residual set), the synthetic record completed (`HashBasis` =
@@ -4083,7 +4346,9 @@ rationale corrected to the OLD reader's expired-first-commit
 revert-to-EMPTY path), and the health schema unified (the snapshot is
 exactly `{ActivePersistDegraded, ConfirmDebtKindMask
 (REMOVAL|REWRITE|SLOT_DELETE), ConfirmRecordState
-(OK|TerminalUnreadable|RestartRecoveryOwed)}` with the aggregate a
+(OK|TerminalUnreadable|RestartRecoveryOwed)}` — r27 adds the
+NON-SECRET `ConfirmDebtKeyClass` bool for the key-class message
+variant — with the aggregate a
 DERIVED value, not a snapshot field); r24 additions: the
 permanent-error state machine unified (terminalization SCOPED to
 content-dependent debts — the R-kind read-back tombstone;
@@ -4097,7 +4362,8 @@ rec.PrevTree` ALWAYS; `FirstCommit=true` on the OLD reader forces
 handling, NOT an empty-tree revert; the regression asserts
 `FirstCommit=false` + compiled + `committed=1` + non-bootstrap boot
 class), the (w-u) restore failure phase-qualified (PRE-rename → D's
-(d-i); POST-rename → live C visible, W stays owed, D's re-read
+(d-i) — SUPERSEDED in r25: W stays pended and D stays SUPPRESSED;
+POST-rename → live C visible, W stays owed, D's re-read
 reaches (d-iii) → clear as moot), the residual wording corrected
 (the crash must land before the next SUCCESSFUL W restore —
 seconds-wide under transient failure, UNBOUNDED up to the confirm
@@ -4163,6 +4429,27 @@ Still open:
    reviewers want a lighter `grep`-based `make` check instead?
 5. `test-race-dp` wiring into `test-go`: acceptable growth of the
    pre-commit gate, or documented-manual-gate only?
+6. **SPLIT-OR-CONVERGE (r28, every reviewer rules EXPLICITLY)**: the
+   r19-recorded split analysis (v20 history) established that the
+   only sound split moves H WITH H2 — H-without-H2 would turn
+   master's DELAYED lingering-record hazard into an IMMEDIATE
+   revert-at-load for the confirmed FirstCommit+cluster class.
+   Twenty rounds later the d.dp accessor core (work items A-G:
+   RACE-1/2/3, the atomic cell, the sampler narrowing, the startup
+   gate, the shutdown fence) has been triple-stable while EVERY new
+   MAJOR (r25-r27: key-class rule, laundering generalization,
+   taxonomy mechanics, gate executability, no-create writes, the
+   undurable-replacement outrun) has landed in H2's confirm-record
+   durability machinery. Rule on ONE of: (A) CONVERGE — v28's folds
+   close the H2 design and the full plan (A-G + H + H2) ships as
+   one PR under #2114; or (B) SPLIT — the A-G core ships under
+   #2114 as the PLAN-READY deliverable and H+H2 move to a named
+   follow-up issue carrying this design (the v28 state) as its
+   research seed, per `docs/engineering-style.md` principle 5
+   (narrow scope). If (B): say whether the follow-up must land
+   BEFORE the core's merge (ordering constraint) or may trail it,
+   and why. A reviewer who answered (A) last round may keep (A);
+   the question exists because the loop must terminate.
 
 ---
 

@@ -83,6 +83,9 @@ reviewer (joins at /engineer on the code PR).
 | r26 | Codex | codex companion task-mrzn2yl4-p29s8i (session 019f96b4-30f2-7ad1-af45-907c26112bf3) | NEEDS-REVISION (3 MAJOR, 1 MINOR; folds 2 FOLDED / 5 PARTIAL) |
 | r26 | AGY | agy print-mode direct (agy-plan-r26.md) | PLAN-READY (7/7 folds FOLDED; 3 fresh attacks FAILED) |
 | r26 | Claude SMR | in-conversation (claude-smr-plan-r26.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — two-sided master-key-IO classification pin, folded into Codex M3) |
+| r27 | Codex | codex companion task-ms1m9ysd-yq6urv (session 019f9dd4-d4b4-7530-b617-2890252a82c0) | NEEDS-REVISION (4 MAJOR, 2 MINOR; folds 0/5 clean — all PARTIAL) |
+| r27 | AGY | agy print-mode direct (agy-plan-r27.md) | PLAN-READY (5/5 folds FOLDED; 3 fresh attacks FAILED) |
+| r27 | Claude SMR | in-conversation (claude-smr-plan-r27.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — plaintext-write over-block of the key-file write-block, folded into Codex M2) |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 
