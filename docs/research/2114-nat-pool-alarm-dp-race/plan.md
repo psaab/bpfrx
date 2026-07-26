@@ -1,8 +1,10 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v32 — r31 findings folded (Codex NEEDS-REVISION
-  2M/3m; AGY PLAN-READY; Claude SMR PLAN-READY 0M/0m — all three
-  confirm the §4.7 structure); pending convergence review r32
+- **Status**: DRAFT v33 — r32 findings folded (Codex NEEDS-REVISION
+  2M/2m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m —
+  its irrecoverable-generation nit folded into the Codex M1b
+  confirmed-empty exit; all three confirm the §4.7 structure);
+  pending convergence review r33
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -1174,6 +1176,49 @@
   (ENTER/HOLD/EXIT, the split-key leg, the restoration leg, the
   early-refusal leg, the pass-N/N+1 transition, the fresh-box
   leg).
+  v33: r32 convergence — the write-unverified EXIT is made
+  sufficient, total, observable, and swap-proof (Codex
+  NEEDS-REVISION 2M/2m, folds 3 FOLDED / 2 PARTIAL, structure
+  confirmed; AGY PLAN-READY 5/5 with 3 fresh attacks FAILED,
+  structure confirmed; SMR PLAN-READY-WITH-NITS 0M/1m — its
+  irrecoverable-generation nit folded into (b)): (a) the EXIT is
+  ACTION-SCOPED AND CONTINUOUS, not a one-shot global clear (Codex
+  M1a, verified: validating "an" encrypted record says nothing
+  about a second on-disk generation): the state is the ABSENCE of
+  a current positive validation; EVERY gated encrypted write —
+  including the active heal — re-performs the FRESH same-snapshot
+  validation IMMEDIATELY before encryption, covering BOTH SIDES'
+  present encrypted generations (the dual of the laundering
+  guard: an active write must never outrun an unreadable CONFIRM
+  generation); any mismatch withholds and RE-ENTERS. (b) The EXIT
+  is TOTAL and observable (Codex M1b + SMR m1): a CONFIRMED-EMPTY
+  exit joins the decrypt exit — when no encrypted or unreadable
+  record remains (all plaintext, or the final unreadable record
+  sanctioned-removed), the state exits with the data-loss warning
+  surfaced — and this IS the irrecoverable-generation path (the
+  single-file removal is itself withheld by (g-err), so the
+  operator exits through the BOTH-FILES removal → (g-absent) →
+  the absent/plaintext posture, with the explicit sacrifice
+  warning); the state joins the snapshot as NON-SECRET
+  `ConfigWriteUnverified` (aggregate OR + /health message; §6's
+  repertoire grows to SIX) and the retry loop ACTIVELY probes the
+  key path every pass while the state holds. (c) The second-swap
+  leg closes (Codex M2, verified: an operator swap to K″ between
+  the exit pass and the deferred active write would re-encrypt a
+  PLAINTEXT-on-disk active under K″ while a K-era CONFIRM record
+  stands — the (g-ok) active-side no-op would pass): the active
+  heal's write consumes the fresh both-sides validation from (a)
+  — a plaintext active side does not exempt the write while a
+  confirm-side encrypted generation exists and fails validation.
+  (d) The keyClass copies unify on errors.As-OR-explicit-mismatch
+  (Codex m1; the last two errors.As-only copies swept). (e) The
+  missing-key message is class-split everywhere (Codex m2:
+  invalid-LENGTH or byte-MISMATCH → `.configdb/master.key`
+  RESTORATION; ENOENT/EACCES/mount-IO → key-state UNVERIFIABLE,
+  NO restoration claim — the (w-u)/(d-i) block copies reconciled
+  with the normative taxonomy). (f) The x25 legs gain the
+  second-swap, confirmed-empty, irrecoverable-generation, and
+  observability cases.
 
 ---
 
@@ -2172,7 +2217,10 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   authentication failure, invalid observed key length, the
   mechanical `ConfirmRecordKeyClassError` subtype — and ANY
   missing/unreadable key file BLOCK the write: the debt retains and
-  the message names `.configdb/master.key` restoration — enforced
+  the message is CLASS-SPLIT (r32 Codex m2's reconciliation:
+  invalid-LENGTH or byte-MISMATCH → `.configdb/master.key`
+  RESTORATION; ENOENT/EACCES/mount-IO → key-state UNVERIFIABLE,
+  NO restoration claim) — enforced
   by the r28 NO-CREATE keyed write primitive, so the write FAILS
   CLOSED with `readOrCreateMasterKey` never reached — no fresh key
   is created, and a write under a swapped key cannot launder the
@@ -2609,7 +2657,57 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   decrypt-validation of an on-disk encrypted record (confirm or
   active) under those SAME bytes (single snapshot — the no-create
   primitive's discipline) — never on the mere absence of a
-  failure and never on a non-key-class outcome. The restoration
+  failure and never on a non-key-class outcome. THE EXIT IS
+  ACTION-SCOPED AND CONTINUOUS, NOT A ONE-SHOT GLOBAL CLEAR (r32
+  Codex M1a, verified the insufficiency: validating "an" encrypted
+  record says nothing about a SECOND on-disk generation — a DB
+  can hold active.json under K and a confirm record under K′):
+  the state is the ABSENCE of a current positive validation, and
+  EVERY gated encrypted write — including the active-persist heal
+  — re-performs the FRESH same-snapshot validation IMMEDIATELY
+  BEFORE encryption (never inherited from an earlier pass), and
+  the validation covers BOTH SIDES' present encrypted generations
+  (the write's own target side AND the opposite side when
+  encrypted records exist there — the dual of the generalized
+  laundering guard: an active write must never outrun an
+  unreadable CONFIRM generation, just as a confirm repair must
+  never outrun an unreadable active config); any mismatch
+  withholds the write and RE-ENTERS the state. A premature exit
+  is therefore harmless by construction: the other generation's
+  own action re-validates at its action time and re-blocks.
+  AND THE EXIT IS MADE TOTAL (r32 Codex M1b, verified: after the
+  sanctioned removal of the FINAL unreadable record — or on a
+  never-encrypted DB — NO ciphertext remains to
+  decrypt-validate against, so a decrypt-only exit is
+  unreachable): a CONFIRMED-EMPTY exit joins the decrypt exit —
+  when NO encrypted or unreadable record remains on disk (the DB
+  is provably all-plaintext or all-absent), the state EXITS with
+  the removal's mandated data-loss warning already surfaced by
+  the sanctioned-removal doctrine. The CONFIRMED-EMPTY exit IS
+  the irrecoverable-generation path (r32 SMR m1): when the
+  on-disk records' key generation is irrecoverably lost (every
+  validation fails — and the single-file sanctioned removal is
+  itself withheld by (g-err) because active.json does not read
+  under the installed key either), the operator's exit is the
+  BOTH-FILES removal: the (g-absent) barrier proceeds (it only
+  dir-fsyncs an already-absent slot), the DB returns to the
+  absent/plaintext posture, the CONFIRMED-EMPTY exit clears the
+  state, and the box re-bootstraps — with the explicit sacrifice
+  warning (the on-disk config's crash-recovery intent is lost,
+  matching master's clobbered-key outcome). THE STATE IS
+  OBSERVABLE AND ACTIVELY PROBED (r32 Codex M1b's observability
+  clause, verified it was absent from the health aggregate): the
+  write-unverified state joins the typed snapshot as a
+  NON-SECRET `ConfigWriteUnverified bool` — folded into the
+  `ConfigPersistDegraded()` aggregate OR and rendered in /health
+  with its own message ("config persistence write-unverified:
+  master-key validation outstanding — see journal"; the §6
+  repertoire grows accordingly) — and the retry loop ACTIVELY
+  probes the key path on every pass while the state holds (the
+  loop is kept ALIVE by the outstanding state even with no
+  debt/latch/mask — a restored key is detected within one
+  backoff interval and the decrypt-exit attempt runs on the same
+  pass). The restoration
   flow is then non-circular (r31 Codex M2): the operator restores
   K → the next pass's key-path read succeeds AND the confirm
   re-read (R_A's record) decrypts under K → POSITIVE validation →
@@ -2636,8 +2734,17 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   regression pins the plaintext-candidate/encrypted-PrevTree
   case. The retry loop's order stays
   active-heal → resolution-finalize (the #5473 durability
-  ordering), so the active-write gate evaluates the previous
-  pass's confirm-side state —
+  ordering); the active-write gate evaluates the previous
+  pass's confirm-side state, AND — closing the second-swap leg
+  (r32 Codex M2, verified: an operator swap to K″ between the
+  exit pass and the deferred active write would otherwise
+  re-encrypt active.json under unvalidated K″ when the on-disk
+  active is PLAINTEXT — the (g-ok) active-side no-op would pass
+  while a K-era CONFIRM record stands) — the active heal's write
+  consumes the fresh same-snapshot BOTH-SIDES validation above:
+  a plaintext active side does not exempt the write while a
+  confirm-side encrypted generation exists and fails the
+  snapshot's validation —
   one pass of lag after the operator's key restoration, zero
   hazard. Intentional key ROTATION is out of scope: no
   re-encryption tooling exists on master either (a follow-up may
@@ -2819,7 +2926,10 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   key (r26 Codex M1's generalized laundering guard — and the
   KEY-CLASS case (authentication failure, invalid observed key
   length, or any missing/unreadable key file) RETAINS with the
-  `.configdb/master.key` restoration message and NO write:
+  CLASS-SPLIT message (r32 Codex m2: invalid-LENGTH or
+  byte-MISMATCH → `.configdb/master.key` RESTORATION;
+  ENOENT/EACCES/mount-IO → key-state UNVERIFIABLE, NO restoration
+  claim) and NO write:
   the r28 NO-CREATE keyed write primitive fails such a write CLOSED
   with `readOrCreateMasterKey` never reached — no fresh key is
   created to launder the state) (that read does NOT re-terminalize; the tombstone write's
@@ -2992,7 +3102,8 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   /etc/xpf/.configdb/master.key` / `read master key: ...` / authentication
   failure) and the health DETAIL FIELD carries a key-class indicator
   (from the retained failure's `errors.As` check against
-  `ConfirmRecordKeyClassError`) so the operator-facing guidance can
+  `ConfirmRecordKeyClassError` OR explicit byte-mismatch
+  assignment) so the operator-facing guidance can
   name the real remediation — restore the
   ORIGINAL `.configdb/master.key` (writing or deleting under a NEW key would
   launder the unreadable-active state), never at confirm.json
@@ -3052,13 +3163,16 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   RestartRecoveryOwed), ConfirmRecordKeyClass bool (the LATCH-level
   cause — likewise the class of the latch's LATEST retained/
   observed failure, re-evaluated at each latch observation, cleared
-  with the latch)}` — the mask covers the
+  with the latch), ConfigWriteUnverified bool (the r32
+  WRITE-UNVERIFIED state — NON-SECRET, observable, actively probed;
+  folded into the aggregate)}` — the mask covers the
   removal + rewrite debts (the H2-expanded confirmRemoveDegraded
   category) AND the D-kind slot debt (r22 Codex m3: SLOT_DELETE —
   a synthesized-tombstone record with its delete debt outstanding can
   never read falsely healthy, and the detail field names the live
   kinds; the aggregate `ConfigPersistDegraded()` is the OR of
-  `persistDegraded`, every confirm-side debt kind, and the latch),
+  `persistDegraded`, every confirm-side debt kind, the latch, and
+  the write-unverified state),
   and the enum distinguishes terminal-unreadable from
   readable-but-restart-required — with PRECEDENCE TerminalUnreadable
   > RestartRecoveryOwed > ConfirmDebt > ActivePersist:
@@ -4064,13 +4178,14 @@ Preserved exactly:
 - NAT pool-alarm monitor lifecycle (#2116) and `show security alarms`.
 - NoDataplane mode: cell nil for the daemon lifetime.
 - `applyResult()`, the health endpoint's 200/503 CONTRACT (the response
-  TEXT repertoire grows by FIVE cause-distinct degraded messages —
+  TEXT repertoire grows by SIX cause-distinct degraded messages —
   terminal-unreadable, restart-recovery-owed, generic confirm-debt,
-  PLUS the two key-class variants (terminal-latch key-class,
+  the two key-class variants (terminal-latch key-class,
   confirm-debt key-class) naming ORIGINAL `.configdb/master.key`
-  restoration —
+  restoration, PLUS the write-unverified message (master-key
+  validation outstanding) —
   the 503 semantics are unchanged, r18 Codex item-7 + r20 Codex m2 +
-  r29 Codex fold-partial 7),
+  r29 Codex fold-partial 7 + r32 Codex M1b),
   REST simulator fail-closed `ok=false` (#3414).
 
 ## 7. Hidden invariants the change must preserve
@@ -4688,7 +4803,26 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      exempt it); the pass-N/pass-N+1 transition leg — after the
      state exits on pass N's confirm-side actions, pass N+1's
      active write proceeds under K (one pass of lag, no torn
-     state); and the FRESH-BOX leg — a never-committed box never
+     state); the SECOND-SWAP leg (r32 Codex M2) — K restored and
+     the state exited on pass N, then the operator swaps to K″
+     before pass N+1's active write → the write's FRESH
+     same-snapshot BOTH-SIDES validation at action time fails (the
+     K-era confirm generation does not validate under K″) → the
+     write withholds and the state RE-ENTERS — a plaintext active
+     side does NOT exempt the write while a confirm-side encrypted
+     generation exists; the CONFIRMED-EMPTY exit leg (r32 Codex
+     M1b) — after the sanctioned removal of the FINAL unreadable
+     record (or on a never-encrypted DB), NO ciphertext remains to
+     decrypt-validate: the state EXITS via the confirmed-empty
+     transition with the removal's data-loss warning surfaced —
+     and the irrecoverable-generation path (r32 SMR m1) exits
+     through the BOTH-FILES removal → (g-absent) → the
+     absent/plaintext posture → this exit; the OBSERVABILITY leg
+     (r32 Codex M1b) — `ConfigWriteUnverified` renders in /health
+     and folds into the aggregate OR, and the retry loop ACTIVELY
+     probes the key path every pass while the state holds (a
+     restored key is detected within one backoff);
+     and the FRESH-BOX leg — a never-committed box never
      enters the state (the #1894 first-encrypted-write auto-create
      still works).
 3. Update `daemon_natpoolalarm_race_test.go` (`writeDPFor` →
@@ -4750,7 +4884,7 @@ the full Go/Rust suites, smoke) run for BOTH units.*
   past the next boot; the lifecycle redesign is a pre-existing policy
   question, not a `d.dp` publication concern.
 
-## 11. Open questions for adversarial review (r32)
+## 11. Open questions for adversarial review (r33)
 
 Resolved in v2-v9 (for the record): A2 deletion; atomic cell choice;
 sampler-only adapter — now STRUCTURAL via `CachedStatusProvider`;
