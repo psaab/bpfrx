@@ -68,6 +68,7 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v4(
             embedded_proto: hdr.proto,
             resolution,
             metadata: fwd.metadata,
+            outbound_snat: false,
         });
     }
 
@@ -75,6 +76,27 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v4(
     // reverse. If the matched entry is the reverse direction, its
     // resolution already points back to the client; otherwise resolve
     // the return path via embedded_icmp_return_resolution.
+    //
+    // #6474: the two lookups are mapped SEPARATELY so the direction of the
+    // matched error is recoverable. An ICMP error is always addressed to
+    // the source of the offending packet (RFC 792):
+    //   * as-is hit with `is_reverse == false`: the quote is the session's
+    //     FORWARD wire packet (forward-wire key match) — INBOUND error, the
+    //     #5690 reversal applies.
+    //   * as-is hit with `is_reverse == true`: the quote is the REPLY wire
+    //     packet — an error about the reply, outbound toward the remote.
+    //     The reverse decision carries no `rewrite_src`, so the caller's
+    //     historical gate already declines it to clean untranslated
+    //     flowless forwarding.
+    //   * reply-key hit with `is_reverse == false` on a pure source-NAT
+    //     flow: the quote is the session's reply in PRE-NAT form (the
+    //     internal host emitted the error about the reply it declined) —
+    //     OUTBOUND error. Marked `outbound_snat` so the caller re-NATs the
+    //     outer source and the quote to the session's external identity
+    //     (RFC 5508 §4) instead of leaking the internal source with an
+    //     unassociable quote.
+    //   * reply-key hit otherwise (a DNAT/composed flow): the pre-#6474
+    //     behavior is preserved bit-for-bit.
     lookup_session_across_scopes(
         ctx.sessions,
         ctx.shared_sessions,
@@ -83,6 +105,7 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v4(
         now_ns,
         0,
     )
+    .map(|resolved| (resolved, false))
     .or_else(|| {
         lookup_session_across_scopes(
             ctx.sessions,
@@ -92,14 +115,19 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v4(
             now_ns,
             0,
         )
+        .map(|resolved| (resolved, true))
     })
-    .map(|resolved| {
+    .map(|(resolved, via_reply_key)| {
         let sl = resolved.lookup;
         let resolution = if sl.metadata.is_reverse {
             sl.decision.resolution
         } else {
             embedded_icmp_return_resolution(ctx, &embedded_key, sl.decision, emb_src, now_ns)
         };
+        let outbound_snat = via_reply_key
+            && !sl.metadata.is_reverse
+            && sl.decision.nat.rewrite_src.is_some()
+            && sl.decision.nat.rewrite_dst.is_none();
         EmbeddedIcmpMatch {
             nat: sl.decision.nat,
             original_src: emb_src,
@@ -111,6 +139,7 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v4(
             embedded_proto: hdr.proto,
             resolution,
             metadata: sl.metadata,
+            outbound_snat,
         }
     })
 }

@@ -544,6 +544,29 @@ sync.
     enforcement on any miss / no-source-rewrite / unbuildable frame / CoS drop.
     The reversed error NEVER seeds a session or flow-cache entry (`flow_key =
     None`), so the #3290 no-fake-session invariant is preserved, not bypassed.
+  - **#6474 — OUTBOUND ICMP error through source NAT is re-NAT'd, not
+    leaked (RFC 5508 §4):** an internal host behind SNAT that emits an ICMP
+    error about the session's REPLY (e.g. a port-unreachable for a closed
+    socket) quotes the PRE-NAT tuple, so the quote's reply key EQUALS the
+    forward session's primary key and the session-fallback matched with
+    `is_reverse == false`. The #5690 builders only rewrote the outer source
+    under `had_dst_nat`, so the error went out with the INTERNAL (pre-NAT)
+    source on the wire and a quote the remote cannot associate — silently
+    consuming the descriptor so it could not even fall through to clean
+    untranslated forwarding. The fallback arms (`nat_match_v4` /
+    `nat_match_v6`) now discriminate direction: a reply-key hit with
+    `is_reverse == false` on a pure source-NAT flow (`rewrite_src` set, no
+    dst NAT) marks the match `outbound_snat`, and
+    `build_snat_outbound_icmp_error_{v4,v6}` re-NATs the outer source to
+    the SNAT address and the embedded quote's destination address + L4
+    port/echo id to the translated value (every affected checksum
+    recomputed) — the remote associates the error with its session. A
+    DNAT-carrying or no-NAT flow keeps the pre-#6474 behavior bit-for-bit,
+    and an error quoting the REPLY wire tuple (as-is hit, `is_reverse ==
+    true`) was already declined by the historical `rewrite_src.is_none()`
+    gate into clean untranslated flowless forwarding. Both directions ride
+    the admitted session like the #5690 inbound reversal (prebuilt forward,
+    `flow_key = None`, gated on `allow_embedded_icmp`).
   - **#6472 — NAT64 (cross-family) ICMP error translation on the flowless
     arm:** the RFC 7915 §4.2/§5.2 translators in `nat64.rs` were previously
     reachable only via `build_nat64_forwarded_frame` on the FLOW-BACKED path,

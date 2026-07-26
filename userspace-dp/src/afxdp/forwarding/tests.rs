@@ -1486,6 +1486,7 @@ fn embedded_icmp_to_inactive_owner_rg_uses_zone_encoded_fabric_redirect() {
             policy_counter_idx: 0,
             policy_counter: None,
         },
+        outbound_snat: false,
     };
 
     let resolved = finalize_embedded_icmp_resolution(
@@ -1543,6 +1544,7 @@ fn embedded_icmp_no_route_uses_zone_encoded_fabric_redirect() {
             policy_counter_idx: 0,
             policy_counter: None,
         },
+        outbound_snat: false,
     };
 
     let resolved = finalize_embedded_icmp_resolution(
@@ -1600,6 +1602,7 @@ fn embedded_icmp_discard_route_uses_zone_encoded_fabric_redirect() {
             policy_counter_idx: 0,
             policy_counter: None,
         },
+        outbound_snat: false,
     };
 
     let resolved = finalize_embedded_icmp_resolution(
@@ -1653,6 +1656,7 @@ fn embedded_icmp_from_fabric_does_not_redirect_back_to_fabric() {
             policy_counter_idx: 0,
             policy_counter: None,
         },
+        outbound_snat: false,
     };
 
     let resolved = finalize_embedded_icmp_resolution(
