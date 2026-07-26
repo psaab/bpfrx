@@ -4049,10 +4049,37 @@ latch binds for the CONNECTION's lifetime with NO
 in-connection escape (v9.9.54.3, round-55 SMR F1: a peer
 that upgrades to v2 mid-connection still finishes this
 connection in the legacy class, and the upgrade takes
-effect only on the NEXT connection — a new incarnation
+effect on the NEXT connection — a new incarnation
 re-runs the full negotiation: hello, v2 proof, CONFIRM,
 repair-era — so the latch can never strand a capable peer
-and never permits a mid-connection protocol flip); the connection never aborts over a late
+and never permits a mid-connection protocol flip); and the
+class DECISION is a SHARED COMMIT, never two independent
+local latches (v9.9.54.4, round-55 Codex B1 — independent
+deadlines can split the class on ONE connection: A receives
+B's CONFIRM before its deadline (repair-era for A) while
+A's CONFIRM reaches B after B's deadline (B latches
+legacy); TCP preserves order but cannot reverse B's
+completed latch, so A speaks repair terminal semantics
+while B follows legacy `BulkEnd` processing
+(`sync_conn_read.go:205`) — an inconsistent-reconciliation
+wedge: BOTH sides exchange CONFIRM DECLARATIONS (each
+declares repair-era iff it received the peer's CONFIRM
+before its own deadline), the address-ordered setup owner
+computes the class from BOTH declarations (repair-era IFF
+BOTH declared repair-era, else legacy), publishes
+`CAPABILITY_DECISION(class)`, the peer ACKs, and BOTH sides
+install the published class ONLY after the ACK'd decision —
+a side that latched legacy locally REVERSES to the
+published class (the reversal is safe because nothing has
+dispatched yet: the decision precedes session dispatch);
+a timeout with NO committed decision closes and retries
+with bounded backoff (never an independent class selection
+while retaining the connection); and the decision lane
+handles partial frames explicitly (a partial frame at
+timeout — `sync_auth.go:289` can consume part of a frame —
+is DISCARDED with the framing boundary re-established,
+never half-consumed as state, so the normal reader's next
+header at `sync_conn_read.go:38` is always aligned)); the connection never aborts over a late
 CONFIRM, so there is no reconnect flap); and when a
 capability transitions inactive→active on a LATER
 connection, a FRESH repair-era full bulk is explicitly
@@ -4069,7 +4096,23 @@ F2: the `SessionSync` mutex owning obligations and
 cold-prime state; the readiness gate reads under the same
 lock, so a takeover decision observes either (armed,
 not-ready) or (unarmed, legacy-complete) — never (armed,
-ready)) — and only THEN exposes `repair-vN` and
+ready)); and the readiness STATE ITSELF is versioned
+(v9.9.54.4, round-55 Codex H2: a legacy `BulkEnd` queues
+`go s.OnBulkSyncReceived()` ASYNCHRONOUSLY
+(`sync_conn_read.go:246`) and the callback carries no
+connection, protocol, or activation generation (`func()` at
+`sync.go:407`), so a delayed G1 can call
+`SetSyncReady(true)` (`daemon_ha_sync.go:90`) AFTER the
+activation armed not-ready — and the older readiness timer
+(`:40-47`) can do the same; readiness is a separate boolean
+under `Manager.m.mu` (`sync_state.go:13`): every readiness
+writer — the `OnBulkSyncReceived` callback, the readiness
+timer, and the activation transaction — carries the
+`(connection, protocol, activation)` generation and sets
+ready ONLY by CAS when its generation remains current AND
+no repair obligation is armed, so a stale callback or timer
+can never restore readiness over an armed repair);
+and only THEN exposes `repair-vN` and
 drives the bulk — so readiness never clears ahead of the
 armed repair); the
 negotiated feature state being PER-CONNECTION (v9.9.48,
