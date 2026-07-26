@@ -4179,11 +4179,18 @@ intermediate B sends `{repair=1, decision=0}` — B's OLD
 decoder skips the unknown BIT 5 (trailing tolerance), sees
 A's repair bit, and activates its older repair protocol,
 expecting terminal semantics A will not provide: each side
-computes the INTERSECTION of the two records and activates
+computes the INTERSECTION of the two records ONCE at the
+capability exchange and activates
 only capabilities present in BOTH (never a capability
 absent from the peer's record — the intermediate's
 `decision=0` zeroes the intersection, so BOTH sides use
-legacy); the documented alternative is a new repair version
+legacy) — the intersection LATCHING for the connection's
+lifetime (v9.9.54.15, round-61 SMR F1: a capability-record
+replacement mid-connection (a newer record with fewer bits)
+does NOT re-open the intersection — the recomputation is
+ignored for the current connection (no class change is
+possible mid-connection) and takes effect only on the NEXT
+connection); the documented alternative is a new repair version
 the intermediate cannot interpret at all); and BIT 5 follows
 the SAME v1-proof rule as every other capability (v9.9.54.13,
 round-60 SMR F1: on a v1-proof connection it is advertised,
@@ -4306,7 +4313,14 @@ instances after acquiring only `Manager.mu`
 its priority check and call `becomeMaster` independently
 (`instance.go:839`): the promotion's ownership commit
 revalidates the readiness generation under the SAME lock
-domain, so an acquisition can never land after the
+domain — `Manager.mu` covering BOTH operations (v9.9.54.15,
+round-61 SMR F2: the commit (`becomeMaster`) and the
+acquisition's instance update are both Manager-mutex
+operations, so the revalidation serializes naturally — the
+commit reads the readiness generation under `Manager.mu`,
+the acquisition's update writes under `Manager.mu`, and
+whichever lands second re-checks and fails if the
+generation moved), so an acquisition can never land after the
 promotion's commit without the commit re-checking); and the hold's timeout
 NEVER silently releases while a negotiated repair
 obligation remains armed (a stale timeout checks the
@@ -4357,7 +4371,15 @@ before), with the forced repair running through the NORMAL
 obligation machinery (arm → drive → `JOURNAL_END`,
 re-arming the retry machinery for one cycle) and NEVER
 gated by the barrier (the barrier only gates the override's
-issue — no wait cycle, v9.9.54.13, round-60 SMR F3) —
+issue — no wait cycle, v9.9.54.13, round-60 SMR F3) — and
+its content is mastership-INDEPENDENT (v9.9.54.15,
+round-61 SMR F3: the forced repair transfers the DEMOTING
+NODE'S OWN table, which exists independent of which node is
+master — a mid-repair VRRP priority drop (demotion cost or
+priority-0 advertisements) does not invalidate the repair
+(the peer needs A's table regardless of who holds
+mastership), and the override's barrier follows the
+repair's completion regardless of the then-current master) —
 carrying its TRANSFER-GENERATION and validated
 like the readiness writers — and bound to the readiness
 proof it authorizes (v9.9.54.14, round-60 Codex B4: a proof
@@ -4521,7 +4543,12 @@ waits for `vrrp.Manager.mu` (`vrrp/manager.go:389`), and
 hangs in the bundle would block every later activation: the
 CAS commits the state transition, the external effects run
 as generation-tagged IDEMPOTENT follow-ups with their own
-deadlines OUTSIDE the packed word's critical section (the
+deadlines OUTSIDE the packed word's critical section (with
+completion-time validation (v9.9.54.15, round-61 SMR F4:
+every target API validates ticket AND generation at BOTH
+submission and completion — an attempt whose ticket was
+abandoned while it blocked is rejected at completion, so a
+stale completion can never land an effect), the
 activation serialization NEVER spans VRRP/netlink
 operations), and a hung effect abandons its ticket so a
 later activation retries it — IDEMPOTENTLY (v9.9.54.11,
