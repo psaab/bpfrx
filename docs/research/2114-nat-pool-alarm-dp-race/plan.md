@@ -1,10 +1,8 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v31 — r30 findings folded (Codex NEEDS-REVISION
-  2M/2m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m —
-  its barrier-choice nit folded into the Codex m2 deferred-barrier
-  pin; all three confirm the §4.7 structure); pending convergence
-  review r31
+- **Status**: DRAFT v32 — r31 findings folded (Codex NEEDS-REVISION
+  2M/3m; AGY PLAN-READY; Claude SMR PLAN-READY 0M/0m — all three
+  confirm the §4.7 structure); pending convergence review r32
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -1131,6 +1129,51 @@
   "three-state" copies annotated); the §9 partition is consistent
   (item 1 untagged both-units, items 3-5 [CORE]); the
   source-comment rewording block points at the FOLLOW-UP unit.
+  v32: r31 convergence — the write-safety predicate becomes an
+  explicit state machine (Codex NEEDS-REVISION 2M/3m, folds 1
+  FOLDED / 4 PARTIAL, structure confirmed; AGY PLAN-READY 5/5 with
+  3 fresh attacks FAILED, structure confirmed; SMR PLAN-READY
+  0M/0m, structure confirmed): (a) the config-DB carries an
+  explicit WRITE-UNVERIFIED state (Codex M1, verified the v31
+  predicate's hole: a missing/unreadable key file classifies
+  READ-side TRANSIENT — UNVERIFIABLE, NOT key-class — so a
+  latest-failure-class predicate REOPENS the gate exactly where
+  the auto-create hazard lives, with the active heal creating K′
+  or accepting K″ before the confirm read runs): ENTER on (i) any
+  key-class-observed failure, (ii) any key-path write-side probe
+  failure (ENOENT/EACCES/mount-IO — the UNVERIFIABLE outcomes),
+  (iii) any byte-mismatch; HOLD through every non-positive outcome
+  (EVERY encrypted config-DB write blocked — active heal
+  withheld, repair writes withheld, commits refused; plaintext
+  unaffected); EXIT ONLY on POSITIVE validation — a successful
+  key-path read PLUS a decrypt-validation of an on-disk encrypted
+  record under the SAME bytes. (b) The restoration flow is
+  non-circular (Codex M2, verified: W/R healing itself writes
+  encrypted, so a block keyed on the debt's own bit deadlocks or
+  reopens): the operator restores K → the same pass's key-path
+  read + confirm re-read decrypt-validate under K (POSITIVE
+  validation, single snapshot) → the state EXITS → the healing
+  write proceeds same-snapshot; wrong-K″ → the re-read fails auth
+  → the state HOLDS → no split; a fresh box never enters (the
+  #1894 first-write auto-create still works). (c) The commit
+  refusal carries an EARLY Store-level precheck (Codex m1,
+  verified the post-promotion hole: CommitConfirmed writes active
+  BEFORE promotion and the confirm record's encryption keys off
+  the PREV tree's master-password leaf — `store_commit.go:437-524,
+  530-553`, `crypto.go:262-270` — so a PLAINTEXT candidate with an
+  encrypted PrevTree still produces an encrypted confirm record):
+  refuse at entry when write-unverified AND the commit would
+  produce ANY encrypted write, with a regression for the
+  plaintext-candidate/encrypted-PrevTree case. (d) The keyClass
+  source of truth is unified (Codex m2): per `errors.As` OR
+  explicit assignment at a byte-mismatch clear-time verification,
+  in every schema copy. (e) The last three-state W copies are
+  swept (Codex m3: the retry-table reference and the §5.1
+  inventory now say FOUR-LEGGED with the (w-u) leg). (f) The (x25)
+  WRITE-UNVERIFIED state-machine legs land in the formal §9 list
+  (ENTER/HOLD/EXIT, the split-key leg, the restoration leg, the
+  early-refusal leg, the pass-N/N+1 transition, the fresh-box
+  leg).
 
 ---
 
@@ -2054,7 +2097,7 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   restore's overwrite (a `WriteConfirm` of the live record replaces
   whatever is on disk — the restore IS the supersession), or by the
   R-kind machinery if the window resolved. The W retry re-reads
-  confirm.json and runs the THREE-STATE table pinned in the
+  confirm.json and runs the FOUR-LEGGED table pinned in the
   debt-kind-split block: (w-a) current record's ArmID == the debt key
   (the live window's record IS on disk) → `WriteConfirm` it durable →
   clear; (w-b) current record DIFFERS (a dead window's record) → the
@@ -2536,24 +2579,65 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   `crypto.go:262-270,457-465` encrypts with the currently installed
   key — after which restoring K makes the ACTIVE side unreadable
   and retaining K″ keeps the CONFIRM side unreadable: no single key
-  converges): WHILE ANY KEY-CLASS FAILURE IS OUTSTANDING (any
-  confirm-side debt or latch whose LATEST retained failure is
-  key-class), EVERY ENCRYPTED config-DB write is blocked — the
-  active-persist retry withholds its encrypted write (plaintext
-  writes unaffected; the in-memory active tree stays the source of
-  truth and is re-written once the key situation resolves), and NEW
-  arms/commits are REFUSED at the persistence layer with a clear
-  key-remediation error (a commit during unresolved key-class would
-  write under an unverified key — the same split). No file is ever
-  re-encrypted under an unverified key, so the two-key split cannot
-  form: with K restored, the confirm-side re-reads re-validate and
-  heal, the outstanding-key-class flag clears, and the next pass's
-  active write proceeds under K; with K″ installed, the key-class
-  debts keep failing and the active write stays blocked — the files
-  never diverge. The retry loop's order stays
+  converges): the config-DB carries an explicit WRITE-UNVERIFIED
+  state machine (r30 Codex M1 + r31 Codex M1/M2, verified BOTH
+  failure modes of the v31 key-class-predicate version: a
+  missing/unreadable key file classifies READ-side TRANSIENT —
+  UNVERIFIABLE, NOT key-class — so a latest-failure-class
+  predicate REOPENS the gate exactly where the auto-create hazard
+  lives, with the active heal then creating K′ or accepting K″
+  before the confirm read ever runs; AND the healing path is
+  circular under a write-block keyed on the debt's own bit —
+  W/R healing itself writes encrypted, so the bit must clear
+  BEFORE the write it gates, yet clearing on a non-key outcome
+  recreates the first hole): ENTER write-unverified on (i) ANY
+  key-class-observed failure (authentication failure or invalid
+  observed key length on ANY config-DB read — confirm or active),
+  (ii) ANY key-path write-side probe failure (ENOENT / EACCES /
+  mount-IO at write time or at the clear-time re-read — the
+  UNVERIFIABLE outcomes), (iii) ANY byte-mismatch at the
+  clear-time compare. HOLD: while in write-unverified, EVERY
+  ENCRYPTED config-DB write is blocked — the active-persist retry
+  withholds its encrypted write, every confirm-side repair write
+  withholds, and NEW arms/commits are REFUSED at the persistence
+  layer with a clear key-remediation error — so
+  `readOrCreateMasterKey` can NEVER fire and no file is ever
+  re-encrypted under an unverified key; PLAINTEXT writes are
+  unaffected (the encryption predicate); the in-memory active tree
+  stays the source of truth. EXIT: ONLY a POSITIVE validation —
+  a successful key-path read yielding key bytes PLUS a successful
+  decrypt-validation of an on-disk encrypted record (confirm or
+  active) under those SAME bytes (single snapshot — the no-create
+  primitive's discipline) — never on the mere absence of a
+  failure and never on a non-key-class outcome. The restoration
+  flow is then non-circular (r31 Codex M2): the operator restores
+  K → the next pass's key-path read succeeds AND the confirm
+  re-read (R_A's record) decrypts under K → POSITIVE validation →
+  EXIT → R_A's tombstone→delete proceeds under the SAME snapshot
+  → healed; wrong-but-valid K″ → the re-read fails authentication
+  → the state HOLDS → the active write stays blocked → the files
+  never diverge; a MISSING key file → the probe failure HOLDS the
+  state → the auto-create can never fire. A FRESH box never
+  enters the state (no records exist to fail on, no probe has
+  failed), so the #1894 first-encrypted-write auto-create still
+  works; a fully-plaintext DB vacuously never enters. The commit
+  refusal carries an EARLY Store-level precheck (r31 Codex m1,
+  verified the post-promotion hole: CommitConfirmed writes active
+  BEFORE promotion and arms AFTER — `store_commit.go:437-524,
+  530-553` — and the confirm record's encryption keys off the PREV
+  tree's master-password leaf, `crypto.go:262-270` via
+  `rec.PrevTree`, so a PLAINTEXT candidate with an encrypted
+  PrevTree still produces an encrypted confirm record): at
+  commit/confirm entry, if the DB is write-unverified AND the
+  commit would produce ANY encrypted write (the candidate's own
+  leaf for active.json OR the PREV tree's leaf for the confirm
+  record), the commit is refused BEFORE any write with the
+  key-remediation error — never discovered post-promotion; a
+  regression pins the plaintext-candidate/encrypted-PrevTree
+  case. The retry loop's order stays
   active-heal → resolution-finalize (the #5473 durability
-  ordering), so the active-write gate evaluates the outstanding
-  key-class state as of the PREVIOUS pass's confirm-side actions —
+  ordering), so the active-write gate evaluates the previous
+  pass's confirm-side state —
   one pass of lag after the operator's key restoration, zero
   hazard. Intentional key ROTATION is out of scope: no
   re-encryption tooling exists on master either (a follow-up may
@@ -3006,7 +3090,11 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   at snapshot time as the OR-by-kind over each LIVE debt's own
   keyClass state, where each debt's state is the class of its
   LATEST retained failure per `errors.As` against
-  `ConfirmRecordKeyClassError` — a mixed-R regression pins the OR
+  `ConfirmRecordKeyClassError` OR explicit assignment at a
+  byte-mismatch clear-time verification (r31 Codex m2 — the
+  mismatch is a key-identity change, a key-class condition even
+  though it is a comparison outcome, not a wrapped crypto
+  failure) — a mixed-R regression pins the OR
   semantics: R_A key-class + R_B non-key-class both live → REMOVAL
   bit SET; R_A clears → bit CLEARED, because R_B's latest is
   non-key-class) AND
@@ -3236,7 +3324,8 @@ the exact breakdown `{ActivePersistDegraded bool,
 ConfirmDebtKindMask (REMOVAL|REWRITE|SLOT_DELETE),
 ConfirmDebtKeyClassMask (same kinds — DERIVED OR-by-kind over live
 debts' per-debt keyClass states, each the class of that debt's
-LATEST retained failure),
+LATEST retained failure per `errors.As` OR explicit assignment at
+a byte-mismatch clear-time verification),
 ConfirmRecordState (OK|TerminalUnreadable|RestartRecoveryOwed),
 ConfirmRecordKeyClass (the LATCH-level key-class cause — the
 latch's LATEST observed failure class, cleared with the latch)}`;
@@ -3309,7 +3398,8 @@ breakdown
 `{ActivePersistDegraded, ConfirmDebtKindMask
 (REMOVAL|REWRITE|SLOT_DELETE), ConfirmDebtKeyClassMask (same kinds —
 DERIVED OR-by-kind over live debts' per-debt keyClass states, each
-the class of that debt's LATEST retained failure per `errors.As`),
+the class of that debt's LATEST retained failure per `errors.As`
+OR explicit assignment at a byte-mismatch clear-time verification),
 ConfirmRecordState
 (OK|TerminalUnreadable|RestartRecoveryOwed), ConfirmRecordKeyClass
 (the LATCH-level key-class cause — the latch's LATEST observed
@@ -3388,7 +3478,17 @@ file missing FAILS with no key created (the file stays absent), a
 K-swap between gate and write is impossible by construction (one
 snapshot), a plaintext repair write proceeds with no key access
 at all, and EVERY non-arm `WriteConfirm` producer ((w-a), (w-b)/
-(w-c), (w-u), R (a), R (c), D tombstone) takes the primitive. This closes the
+(w-c), (w-u), R (a), R (c), D tombstone) takes the primitive;
+(x25) WRITE-UNVERIFIED STATE MACHINE (r30 Codex M1 + r31 Codex
+M1/M2/m1 — full legs in the formal §9 list): ENTER on any
+key-class-observed failure / key-path probe failure / byte-mismatch
+→ EVERY encrypted config-DB write blocked (active heal withheld,
+repair writes withheld, commits refused EARLY — incl. the
+plaintext-candidate/ENCRYPTED-PrevTree case); HOLD through
+UNVERIFIABLE classifications; EXIT ONLY on POSITIVE validation
+(same-snapshot key-path read + decrypt-validation of an on-disk
+encrypted record) — the wrong-K″ split can never form and the
+restoration flow is non-circular. This closes the
 master's re-arm-after-confirmed residual for the whole confirm-type
 class AND the post-durability replacement finalize — the two places a
 lingering record's replay is unsafe.
@@ -3666,10 +3766,12 @@ v20 history). The delivery is TWO units:
   stale-clear, read error → typed — + AT MOST ONE W-kind rewrite debt
   keyed to the LIVE WINDOW via `armedArmID`/`s.armedRecord` (the
   immutable attempted record retained at arm) and re-keyed at every arm
-  outcome — three-state table: match → rewrite durable, differ →
+  outcome — FOUR-LEGGED table (r23's (w-u) unreadable-slot
+  restore-over joins the r19 three): match → rewrite durable, differ →
   restore-overwrite SUBSUMING the dead record's R-kind debt on the
   restore's barrier, absent → restore `s.armedRecord` verbatim or
-  stale-clear; SAME-RECORD dominance SCOPED: D1 — an R-kind debt
+  stale-clear, unreadable NON-KEY-CLASS-PERMANENT → restore-over
+  subject to the key-class gate; SAME-RECORD dominance SCOPED: D1 — an R-kind debt
   dominates every IDENTITY-PRESERVING write of its record; D2 — a
   live window's restore is a SUPERSESSION, not a write of that
   record, and subsumes the pending removal; tombstone-required dominates
@@ -3709,7 +3811,8 @@ v20 history). The delivery is TWO units:
   `ConfirmDebtKindMask (REMOVAL|REWRITE|SLOT_DELETE)`,
   `ConfirmDebtKeyClassMask (same kinds — DERIVED OR-by-kind over
   live debts' per-debt keyClass states, each the class of that
-  debt's LATEST retained failure per `errors.As`)`,
+  debt's LATEST retained failure per `errors.As` OR explicit
+  assignment at a byte-mismatch clear-time verification)`,
   `ConfirmRecordState (OK|TerminalUnreadable|RestartRecoveryOwed)`,
   `ConfirmRecordKeyClass bool` — the LATCH-level key-class cause,
   the latch's LATEST observed failure class, cleared with the
@@ -4410,7 +4513,8 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      breakdown `{ActivePersistDegraded bool, ConfirmDebtKindMask
      (REMOVAL|REWRITE|SLOT_DELETE), ConfirmDebtKeyClassMask (same
      kinds — DERIVED OR-by-kind over live debts' per-debt keyClass
-     states, each the class of that debt's LATEST retained failure),
+     states, each the class of that debt's LATEST retained failure
+     per `errors.As` OR explicit byte-mismatch assignment),
      ConfirmRecordState
      (OK|TerminalUnreadable|RestartRecoveryOwed),
      ConfirmRecordKeyClass (the LATCH-level key-class cause — the
@@ -4491,7 +4595,8 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      breakdown `{ActivePersistDegraded bool, ConfirmDebtKindMask
      (REMOVAL|REWRITE|SLOT_DELETE), ConfirmDebtKeyClassMask (same
      kinds — DERIVED OR-by-kind over live debts' per-debt keyClass
-     states, each the class of that debt's LATEST retained failure),
+     states, each the class of that debt's LATEST retained failure
+     per `errors.As` OR explicit byte-mismatch assignment),
      ConfirmRecordState
      (OK|TerminalUnreadable|RestartRecoveryOwed),
      ConfirmRecordKeyClass (the LATCH-level key-class cause — the
@@ -4559,7 +4664,33 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      performs no key access, and EVERY non-arm `WriteConfirm`
      producer ((w-a), (w-b)/(w-c), (w-u), R (a), R (c), D
      tombstone) is
-     covered.
+     covered; (x25) WRITE-UNVERIFIED STATE MACHINE (r30 Codex M1 +
+     r31 Codex M1/M2/m1): ENTER legs — a key-class-observed
+     failure (auth/invalid-length), a key-path probe failure
+     (ENOENT/EACCES/mount-IO), a byte-mismatch — EACH blocks every
+     encrypted config-DB write (the active-persist heal withholds,
+     every repair write withholds, new arms/commits refused) while
+     plaintext writes proceed; the SPLIT-KEY leg — wrong-but-valid
+     K″ installed while R_A + persistDegraded stand under K → the
+     active heal NEVER re-encrypts (the state HOLDS through the
+     UNVERIFIABLE classification — it is exited ONLY by POSITIVE
+     validation, never by a non-key outcome), the files never
+     diverge; the RESTORATION leg — K restored → the same pass's
+     key-path read + confirm re-read decrypt-validate under K
+     (POSITIVE validation, single snapshot) → the state EXITS →
+     R_A's tombstone→delete proceeds same-snapshot (NO circularity
+     — the healing write is gated by the state the validation just
+     exited, not by the debt's own bit); the EARLY-REFUSAL leg —
+     a commit attempted while write-unverified is refused BEFORE
+     any write, including the plaintext-candidate/ENCRYPTED-
+     PrevTree case (the confirm record's encryption keys off the
+     PREV tree's leaf, so the candidate's plaintext shape does not
+     exempt it); the pass-N/pass-N+1 transition leg — after the
+     state exits on pass N's confirm-side actions, pass N+1's
+     active write proceeds under K (one pass of lag, no torn
+     state); and the FRESH-BOX leg — a never-committed box never
+     enters the state (the #1894 first-encrypted-write auto-create
+     still works).
 3. Update `daemon_natpoolalarm_race_test.go` (`writeDPFor` →
    `setDataplane`) and `daemon_forwarding_status_test.go` (rewrite against
    the narrowed adapter: `ProjectsMapStats`/`UsesUserspaceStatusAdapter`
@@ -4619,7 +4750,7 @@ the full Go/Rust suites, smoke) run for BOTH units.*
   past the next boot; the lifecycle redesign is a pre-existing policy
   question, not a `d.dp` publication concern.
 
-## 11. Open questions for adversarial review (r31)
+## 11. Open questions for adversarial review (r32)
 
 Resolved in v2-v9 (for the record): A2 deletion; atomic cell choice;
 sampler-only adapter — now STRUCTURAL via `CachedStatusProvider`;
