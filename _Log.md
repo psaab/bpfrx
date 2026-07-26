@@ -1,4 +1,55 @@
-## 2026-07-24 — #6434: split filter compiler god-functions
+## 2026-07-26 — #6438: split wg_control.rs into wg_control/{mtu,sock,attempt,dispatch}.rs
+
+- **Timestamp**: 2026-07-26 (fix/6438-wg-control-split)
+- **Action**: Decomposed `userspace-dp/src/afxdp/coordinator/wg_control.rs`
+  (exactly 1,600 LOC, god-fns `run_wg_control_loop` 325 ln/9 params,
+  `dispatch_inbound` 209 ln, `drive_attempt_machine` 130 ln) into a
+  `wg_control/` module directory — pure code motion, zero behavior delta.
+  `mod.rs` keeps the thread entry (`wg_control_loop`) and the
+  orchestrating `run_wg_control_loop`; the five fused layers land as
+  `mtu.rs` (pad-aware encapped-size + outer-MTU guard), `sock.rs`
+  (dual-stack bind, v4-mapped send shim, #2317 outer-TOS cmsg codec,
+  poll(2) wait layer), `attempt.rs` (#1888 S5 handshake attempt machine
+  + keepalive emit/pace), `dispatch.rs` (type-byte dispatch with the
+  auth-before-roam `InboundOutcome` contract + TUN-read encap-and-send).
+  `wg_control_tests.rs` (822 LOC) moved byte-identical into the
+  directory and passes unmodified via its existing `use super::*`.
+  Also folded the `pad_to_16` triplication (wg_control.rs, wg/engine.rs,
+  frame/wg.rs) into a single `pub(crate) const fn` in `wg/mod.rs` next
+  to the other wire-format constants. Visibility is preserved exactly:
+  moved items are `pub(super)` within the `wg_control` tree (their
+  pre-split file-private reach); `WG_DEFAULT_OUTER_MTU` keeps its
+  coordinator-tree visibility via a `pub(super) use` re-export at the
+  historical `wg_control::WG_DEFAULT_OUTER_MTU` path; test-only seams
+  re-import `#[cfg(test)]`-gated (the #6436 precedent). The 64 KiB
+  scratch buffers stay once-allocated in the loop; the `CmsgBuf`
+  align(8) const assert travels to sock.rs; `#[inline]` /
+  `#[allow(clippy::too_many_arguments)]` attributes travel with their
+  fns. Docs: coordinator/README.md gained the `wg_control/` file-table
+  row; stale `wg_control.rs` path citations in slowpath.rs, gre.rs,
+  wg/timers.rs, wg/mod.rs, frame/wg.rs, tunnel_supervision.rs updated.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/wg_control/{mod,mtu,
+  sock,attempt,dispatch}.rs (new, from wg_control.rs),
+  coordinator/wg_control_tests.rs → wg_control/wg_control_tests.rs
+  (rename, verbatim), afxdp/wg/mod.rs (+pad_to_16 SSOT),
+  afxdp/wg/engine.rs, afxdp/frame/wg.rs (−local pad_to_16 copies),
+  coordinator/README.md, comment-only path fixes in slowpath.rs,
+  afxdp/gre.rs, afxdp/wg/timers.rs, afxdp/coordinator/tunnel_supervision.rs,
+  docs/pr/6438-wg-control-split/plan.md, _Log.md
+- **Validation**: `cargo check` / `cargo check --tests` warning parity
+  vs the 4bc33a3b0 base (identical sorted warning sets — zero new
+  warnings); full crate suite `cargo test --release --bins --tests --
+  --test-threads=1` green (4,290 passed / 0 failed / 2 ignored);
+  `wg_control::tests` 22/22 pass unmodified; asm-diff (objdump -Cd,
+  address/symbol normalized) on the release binary: `wg_encap_frame`
+  576/576 and `WgEngine::encap_inner` 278/278 identical modulo
+  relocation addresses (the pad_to_16 fold is codegen-invisible),
+  `drive_initiation` 160/160 identical, `send_keepalive` 186→176 (same
+  stream modulo one LLVM-eliminated dead 2-byte store, tail alignment
+  padding, and the resulting branch-offset shifts), `wg_control_loop`
+  2799→2781 with an identical direct-call symbol multiset — deltas are
+  register allocation / stack offsets / NOP forms (CGU-reshuffle
+  inlining variance), no new arithmetic or control flow.
 
 - **Timestamp**: 2026-07-24 (fix/6434-filter-compiler-split)
 - **Action**: Decomposed the two remaining god-functions in

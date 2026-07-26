@@ -28,7 +28,7 @@
 //
 // Re-verified under #1826: removing this allow still surfaces 16
 // dead-code warnings (engine surface remains partially unwired even
-// after the coordinator/wg_control.rs integration), so the
+// after the coordinator/wg_control/ integration), so the
 // module-wide allow stays for now.
 #![allow(dead_code)] // Most of this module is not yet wired into the hot path.
 
@@ -187,6 +187,15 @@ pub(crate) const WG_MSG_RESPONSE_LEN: usize = 92;
 ///   - receiver_id u32 (little-endian)
 ///   - counter     u64 (little-endian)
 pub(crate) const WG_DATA_HEADER_LEN: usize = 1 + 3 + 4 + 8;
+
+/// Round `n` up to the nearest multiple of 16 (WG §5.4.6 data-record
+/// pad). Single source of truth for the padding formula — the encap
+/// sites (`wg::engine`, `frame::wg`, `coordinator::wg_control::mtu`)
+/// previously each carried an identical private copy (#6438).
+#[inline]
+pub(crate) const fn pad_to_16(n: usize) -> usize {
+    (n + 15) & !15
+}
 
 /// Total per-packet WG overhead for IPv4 outer:
 ///   outer IP (20) + UDP (8) + WG data header (16) + Poly1305 tag (16).

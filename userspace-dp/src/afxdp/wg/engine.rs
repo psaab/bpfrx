@@ -64,7 +64,7 @@ use super::session::{REJECT_AFTER_MESSAGES, ReplayDecision, WgSession};
 use super::tai64n::Tai64nClock;
 use super::{
     POLY1305_TAG_LEN, WG_DATA_HEADER_LEN, WG_KEY_LEN, WG_NOISE_PATTERN, WG_PROTOCOL_ID_BYTES,
-    WG_ZERO_PSK,
+    WG_ZERO_PSK, pad_to_16,
 };
 use arc_swap::ArcSwap;
 use curve25519_dalek::MontgomeryPoint;
@@ -320,12 +320,6 @@ const _: () = {
     assert!(pad_to_16(WG_ENGINE_MAX_INNER_MTU) <= PADDED_PLAINTEXT_MAX);
     assert!(pad_to_16(WG_ENGINE_MAX_INNER_MTU + 1) > PADDED_PLAINTEXT_MAX);
 };
-
-/// Round `n` up to the nearest multiple of 16. WG spec §5.4.6.
-#[inline]
-const fn pad_to_16(n: usize) -> usize {
-    (n + 15) & !15
-}
 
 /// One peer's slot in a published `PeerTable` snapshot: its long-lived
 /// session/timer state (`Arc<Peer>`, reused across commits) paired with
