@@ -86,6 +86,9 @@ reviewer (joins at /engineer on the code PR).
 | r27 | Codex | codex companion task-ms1m9ysd-yq6urv (session 019f9dd4-d4b4-7530-b617-2890252a82c0) | NEEDS-REVISION (4 MAJOR, 2 MINOR; folds 0/5 clean — all PARTIAL) |
 | r27 | AGY | agy print-mode direct (agy-plan-r27.md) | PLAN-READY (5/5 folds FOLDED; 3 fresh attacks FAILED) |
 | r27 | Claude SMR | in-conversation (claude-smr-plan-r27.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — plaintext-write over-block of the key-file write-block, folded into Codex M2) |
+| r28 | Codex | codex companion task-ms1oasn4-40irsg (session 019f9e08-ae31-7190-b601-562535fbb2bd) | NEEDS-REVISION (3 MAJOR, 3 MINOR; folds 2 FOLDED / 3 PARTIAL). Split ruling: (B) SPLIT — follow-up before core unless G moves with H+H2 |
+| r28 | AGY | agy print-mode direct (agy-plan-r28.md) | PLAN-READY (5/5 folds FOLDED; 3 fresh attacks FAILED). Split ruling: (A) CONVERGE |
+| r28 | Claude SMR | in-conversation (claude-smr-plan-r28.md) | PLAN-READY (0 MAJOR, 0 MINOR). Split ruling: (B) SPLIT — follow-up may trail |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 

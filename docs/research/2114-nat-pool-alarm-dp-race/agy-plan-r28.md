@@ -1,0 +1,22 @@
+# AGY adversarial plan-review — round 28 (plan v28 @ 7d772594f)
+
+Direct agy print-mode invocation from the trusted workspace with --add-dir (see reviewer-ids.md infra notes). Verdict: PLAN-READY (5/5 folds FOLDED; 3 fresh attacks FAILED). Split ruling: (A) CONVERGE. Raw output follows verbatim.
+
+---
+
+(A) Fold verification:
+1. FOLDED — `pkg/configstore/db.go:319-330` (`readTreeMeta`/`ReadActiveMeta` absence returns `nil, true, nil`), `pkg/configstore/store_persist.go:26-35` (`Load` active read placement), `docs/research/2114-nat-pool-alarm-dp-race/plan.md:2227-2260` (the executable three-way state machine: `(g-ok)`, `(g-absent)` sanctioning only `DeleteConfirm` barrier, `(g-err)` withholding without terminalization).
+2. FOLDED — `pkg/configstore/crypto.go:443-455` (`readMasterKey` never creates), `pkg/configstore/crypto.go:262-265` (`maybeEncryptTreeJSON` short-circuits on plaintext), `pkg/configstore/db.go:207-217` (`WriteConfirm`), `docs/research/2114-nat-pool-alarm-dp-race/plan.md:2260-2283` (no-create single-snapshot repair write primitive closing the check/write K→K′ swap race).
+3. FOLDED — `pkg/configstore/store.go:687-746` (`SyncApply` cancels timer before `writeActive`), `docs/research/2114-nat-pool-alarm-dp-race/plan.md:1968-1988` (the 3rd conjunct `persistDegraded == false` suppresses D while an active-persist replacement write is outstanding, preventing D from tombstoning C's pre-rename retention record).
+4. FOLDED — `pkg/configstore/crypto.go:354-356` (GCM auth error path), `pkg/configstore/crypto.go:451-453,460-462` (key length check paths), `pkg/configstore/db.go:250-253` (`ReadConfirm` `%w` wrapping), `docs/research/2114-nat-pool-alarm-dp-race/plan.md:2192-2226` (`ErrMasterKeyAuth` + `ErrMasterKeyLength` typed sentinels matching `ConfirmRecordKeyClassError` and satisfying `ConfirmRecordPermanentError` across all x24 boundaries).
+5. FOLDED — `docs/research/2114-nat-pool-alarm-dp-race/plan.md:718,940,2652,3247` (`ConfirmDebtKeyClass` non-secret bool in health snapshot), `docs/research/2114-nat-pool-alarm-dp-race/plan.md:697,750,952,955,4338,4365` (historical copies annotated `SUPERSEDED`, stale "before the next W pass" phrases replaced with "before the next SUCCESSFUL W restore", x15 generalized).
+
+(B) Fresh attacks:
+- Attack 1 (Valid K′ key file, active.json PLAINTEXT, confirm record K-encrypted): FAILED — `ReadActiveMeta()` succeeds (`(g-ok)`), but `ReadConfirm()` fails GCM authentication returning `ErrMasterKeyAuth` (`pkg/configstore/crypto.go:354-356`), which matches `ConfirmRecordKeyClassError`. Under the key-class rule, the read-side failure retains the debt with NO repair write attempted (`docs/research/2114-nat-pool-alarm-dp-race/plan.md:2157-2161,2256-2260`), and the no-create repair write primitive is never reached and does not weaken protection (`pkg/configstore/crypto.go:443-455`).
+- Attack 2 ((g-absent) during live window with operator removing both files): FAILED — When both files are unlinked on disk (`pkg/configstore/db.go:245-246,327-328`), `ReadActiveMeta` returns `(nil, true, nil)`. The gate evaluates to `(g-absent)` (`tree == nil && err == nil`), which permits ONLY the sanctioned `DeleteConfirm` dir-fsync barrier while withholding W/D restore writes (`docs/research/2114-nat-pool-alarm-dp-race/plan.md:2235-2240`); no live record is sacrificed unexpectedly because the operator explicitly removed both files to wipe state.
+- Attack 3 (x23 boot placement freshness between `store_persist.go:26-35` and `113-140`): FAILED — `Store.Load()` holds `s.mu.Lock()` continuously from entry (`pkg/configstore/store_persist.go:23-24`) through the entire recovery sequence. No concurrent goroutine can mutate `active.json` under `s.mu`, so the early `ReadActiveMeta` result remains strictly fresh when consumed by recovery at lines 113-140.
+
+(C) Split ruling:
+(A) CONVERGE — With v28 fully folding all round 27 findings, the H2 confirm-record durability redesign is complete, verified, and closed alongside work items A-G and H. Because H cannot ship without H2 (which would cause an immediate revert-at-load for confirmed configs), and H2 is now fully PLAN-READY with zero open design gaps across 28 rounds of refinement, converging the full plan (A-G core + H + H2) into a single PR under #2114 provides a complete, sound deliverable without requiring the administrative overhead of a trailing issue for a design that is already fully validated.
+
+PLAN-READY

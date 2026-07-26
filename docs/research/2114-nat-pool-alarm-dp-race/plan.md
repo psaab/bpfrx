@@ -1,16 +1,21 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v28 — r27 findings folded (Codex NEEDS-REVISION
-  4M/2m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m — its
-  plaintext-write over-block nit folded into the Codex M2 no-create
-  single-snapshot write primitive); pending convergence review r28
-  with the explicit SPLIT-OR-CONVERGE question (§11 question 6)
+- **Status**: DRAFT v29 — r28 findings folded (Codex NEEDS-REVISION
+  3M/3m; AGY PLAN-READY; Claude SMR PLAN-READY 0M/0m) + the SPLIT
+  delivery structure recorded (2-of-3 ruled (B): Codex + SMR SPLIT,
+  AGY CONVERGE — §4.7 + §11 question 6); pending convergence
+  review r29
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
 - **Base**: origin/master @ `ed6999000`
 - **Mode**: `/research` — stops at PLAN-READY. Implementation requires manual
   `/engineer 2114`.
+- **Delivery** (r28 split ruling, §4.7): TWO units — the #2114 PR ships
+  the `d.dp` accessor core (work item A1 + the full site conversion +
+  canaries + sampler narrowing); the named follow-up issue ships
+  G+H+H2 (startup-readiness gate + FirstCommit+cluster Load recovery +
+  confirm-record durability machinery) seeded from this document.
 - **Revision history**: v1 @ `1d62be758` (initial). v2 @ `61568128f` (r1:
   deleted false invariants, deleted A2, canary redesign, sampler-only scope,
   snapshot boundaries, table regeneration). v3 @ `f0c1605cd` (r2: kind-gated
@@ -700,7 +705,8 @@
   regression drives both. (c) The recordless claim is scoped
   everywhere (Codex m1 — invariant 12's "no recordless live window
   ever" became "restore-first ORDERING never creates the gap", and
-  the restore-failure → R-delete → crash-before-next-W
+  the restore-failure → R-delete → crash-before-next-SUCCESSFUL-W
+  (failed passes do not close the gap)
   arm-persistence residual joins the residual set). (d) The
   synthetic record's remaining pins (Codex m2): `HashBasis` =
   `"canonical-v1"` (the hash's actual basis, never a "current"
@@ -714,9 +720,10 @@
   (e) The health schema is unified (Codex m3): the snapshot is
   exactly `{ActivePersistDegraded, ConfirmDebtKindMask
   (REMOVAL|REWRITE|SLOT_DELETE), ConfirmRecordState
-  (OK|TerminalUnreadable|RestartRecoveryOwed)}` — r27 adds a fourth,
-  NON-SECRET `ConfirmDebtKeyClass` bool (the retained failure's
-  `errors.As` cause, for the key-class message variant) — and the aggregate
+  (OK|TerminalUnreadable|RestartRecoveryOwed)}` — r28 grows TWO
+  NON-SECRET cause fields: `ConfirmDebtKeyClassMask` (per-debt
+  key-class cause, cleared only with its owning debt) and
+  `ConfirmRecordKeyClass` (the latch-level cause) — and the aggregate
   `ConfigPersistDegraded()` is a DERIVED value
   (`persistDegraded || mask ≠ 0 || enum ≠ OK`), not a snapshot
   field.
@@ -939,7 +946,9 @@
   inventory. (e) The health snapshot gains the NON-SECRET
   `ConfirmDebtKeyClass` bool (Codex m2 = fold-partial 4: the
   three-field snapshot + callback payload exposed no key-class bit,
-  so the ORIGINAL-key guidance was unrenderable) populated from the
+  so the ORIGINAL-key guidance was unrenderable — grown PER-STATE
+  in r29: `ConfirmDebtKeyClassMask` per-debt +
+  `ConfirmRecordKeyClass` latch-level) populated from the
   retained failure's `errors.As` check — NEVER message text — with
   the key-class `/health` variant regression-pinned against the
   generic one. (f) The acceptance suite gains the DURABLE-ARM
@@ -953,6 +962,65 @@
   RETAINS W; D stays suppressed while W pends); the duplicate x15
   copy generalizes to every repair action and clear; the r24
   phase-qualification's PRE-rename → D leg is annotated SUPERSEDED.
+  v29: r28 convergence — the producer inventory completes and the
+  delivery structure splits (Codex NEEDS-REVISION 3M/3m, folds 2
+  FOLDED / 3 PARTIAL, split ruling (B) with the G-moves-with-H+H2
+  ordering constraint; AGY PLAN-READY 5/5 with 3 fresh attacks
+  FAILED, split ruling (A); SMR PLAN-READY 0M/0m, split ruling
+  (B)): (a) the no-create single-snapshot primitive and the
+  active-side gate extend to EVERY non-arm `WriteConfirm` producer
+  (Codex M1, verified the v28 list omitted retry-side producers —
+  the W (w-a) durable rewrite and the R-kind (a) MATCH tombstone /
+  (c) MISMATCH rewrite also reach `readOrCreateMasterKey` via
+  `db.go:207-217` + `crypto.go:262-270,457-479`): the complete
+  enumeration is (w-a), (w-b)/(w-c), R (a), R (c), D tombstone; the
+  ordinary arm write keeps create-on-first-use (the #1894 fresh-box
+  design); x23 covers the full producer matrix. (b) The key-path
+  generation residual closes (Codex M2, verified: one byte snapshot
+  proves nothing about the unlocked `master.key` PATH across the
+  action — an operator K→K′ swap between snapshot and write leaves
+  both files K-encrypted under an installed K′): key remediation is
+  OFFLINE/SERIALIZED BY RUNBOOK (restore with xpfd stopped, or the
+  next probe validates the restored key first), AND every debt
+  clear that consumed a key snapshot RE-READS the path and compares
+  bytes at clear time — a mismatch RETAINS with the restoration
+  message; the both-files operator-provenance assumption is stated
+  (ENOENT proves no provenance; the store never deletes active.json,
+  so the absence is operator intent by construction — and the
+  barrier is safe-if-wrong: it only dir-fsyncs an already-absent
+  slot). (c) The key-class health cause goes PER-STATE (Codex M3,
+  verified: a singular bool cannot represent coexisting debts, and
+  the boot key-class latch carries NO debt while terminal
+  precedence would have rendered the generic message): the snapshot
+  gains `ConfirmDebtKeyClassMask` (per-debt-kind, set at the owning
+  debt's raise/retain from `errors.As`, cleared only with that
+  debt) AND `ConfirmRecordKeyClass` (the latch-level cause, cleared
+  with the latch); the /health key-class variant renders per the
+  rendered level's cause bit, both variants regression-pinned at
+  both levels. (d) The successful-arm D clear is pinned as the
+  ARM'S OWN supersession (Codex m3 — not a D action, not subject to
+  the D precondition or the gate; absent such an arm, D stays inert
+  until fresh re-classification). (e) x24 gains the COMBINED
+  plaintext-active / K-encrypted-confirm scenario asserting ZERO
+  write/delete (Codex m1) and the nonce boundary is qualified
+  (Codex m2: bad nonce ENCODING/length fails before AEAD →
+  non-key-class, `crypto.go:328-353`; a well-formed TAMPERED nonce
+  reaches `gcm.Open` → key-class, `crypto.go:354-356`). (f) Stale
+  copies swept: the x14/x21 health copies and the normative
+  snapshot definition carry the per-state causes; the (x4e') legs
+  split NON-KEY-CLASS TERMINAL vs KEY-CLASS RETAIN with the
+  content-INDEPENDENT exemption; the v24-history
+  crash-before-next-W copy says next-SUCCESSFUL-W; the formal §9
+  list gains x22-x24. (g) The SPLIT delivery structure lands (§4.7,
+  2-of-3 ruling): PR-1 = the `d.dp` accessor core (A1 + 5-site
+  writer conversion + snapshot boundaries + full reader conversion
+  + sampler narrowing + canaries); the follow-up issue = G+H+H2
+  (Codex's ordering constraint: G-without-H would extend the
+  pre-manager timer window into the post-manager
+  bootstrap-with-live-cluster hybrid, so G moves with H+H2; the
+  core introduces no new exposure, so the follow-up trails without
+  a hard gate); AGY's (A) CONVERGE dissent is recorded — the design
+  closes under EITHER packaging and the user makes the final call.
 
 ---
 
@@ -1087,7 +1155,8 @@ no cycles/MB/retransmits to win back. The win, at absolute scale:
   whose next recovery re-arms the same hybrid. **Consequence (r8-resolved)**:
   the plan does NOT rely on the exclusion for safety — it converts every
   reader uniformly, which covers the legacy path by construction — AND a
-  PERMANENT recovery invariant ships in this PR (work item H, §4): at
+  PERMANENT recovery invariant ships in the FOLLOW-UP unit (work
+  item H, §4 — §4.7 delivery structure: G+H+H2 move together): at
   recovery, ANY FirstCommit record whose recovered active config declares
   a cluster is reverted at Load (before manager construction), terminating
   every recurrence generation at the next boot. Only the BROADER
@@ -1213,7 +1282,10 @@ allocation per Store (≤5 per daemon lifetime), zero per read; matches the
 
 **Work item G — startup-readiness gate for the rollback executor (r5 B1,
 r6/r7-redesigned; closes the pre-existing dispatch-ordering defect the
-RACE-3 audit exposed).** The recovered commit-confirmed timer can fire
+RACE-3 audit exposed).** *Delivery: FOLLOW-UP unit with H+H2 (§4.7 —
+G must not ship without H: its END-of-PHASE-5 release is post-manager
+construction, H's revert is only safe at Load before `d.cluster`
+exists).* The recovered commit-confirmed timer can fire
 before `initManagers` completes (§2 RACE-3), which today can nil-deref
 `d.vrrpMgr` (`daemon_apply_tail.go:50` vs construction at
 `daemon_run_bringup.go:219`) and can arm the dataplane inside bootstrap
@@ -1404,7 +1476,9 @@ if d.stopping.Load() || (d.runCtx != nil && d.runCtx.Err() != nil) {
   `dpCell` conversion.
 
 **Work item H — permanent FirstCommit+cluster recovery invariant,
-revert-at-Load semantics (r8-REDESIGNED; ships IN this PR).** The r6
+revert-at-Load semantics (r8-REDESIGNED; *Delivery: FOLLOW-UP unit
+with G+H2 per §4.7 — the "ships IN this PR" framing below predates
+the r28 split ruling*).** The r6
 cross-upgrade boundary AND the r8 recurrence (§2, both verified) boot a
 node into live-cluster-runtime + pending first-commit-rollback, and the
 timeout rolls into bootstrap-with-cluster — a live-topology hybrid the
@@ -1574,7 +1648,9 @@ and the guard fires on its own predicate; hand-constructed fixture
 files are forbidden for this regression (they stay blind to
 serialization divergence).
 
-**Work item H2 — resolution tombstone + ArmID-keyed removal debt (r11
+**Work item H2 — resolution tombstone + ArmID-keyed removal debt
+(*Delivery: FOLLOW-UP unit with G+H per §4.7, per the r28 split
+ruling*) (r11
 Codex M1 + r12 Codex M1/M2/M3 + r13 Codex M1/M2/M3 + r14 Codex M1/M2/M3
 + r15 Codex M1/M2/M3/M4 + r16 Codex M1/M2/M3/M4/m1/m2/m3, Claude SMR
 m1/m2 + r16 SMR m1, AGY Attacks 1/2 — all verified; in scope because
@@ -1834,7 +1910,15 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   fails, RETAIN the debt — a power-loss replay is handled by recovery
   exactly as today); (d) READ ERROR → the TYPED taxonomy below. No eager
   arm-time clearing — the identity check at retry time is phase-safe by
-  construction. Master's unkeyed version of this race destroys a fresh
+  construction. EVERY action in this table — the (a) tombstone+delete,
+  the (b) `DeleteConfirm` re-drive, the (c) durable rewrite, AND each
+  clear — is gated on the ACTIVE side state machine like every other
+  confirm-side action (r28 Codex M1's inventory completion: the (a)
+  tombstone and (c) rewrite are `WriteConfirm` producers and take the
+  NO-CREATE single-snapshot primitive; (g-absent) proceeds ONLY for
+  the (b) barrier — the both-files operator-intent assumption is
+  stated in the key-class block). Master's unkeyed version of this
+  race destroys a fresh
   pending record's crash-recovery file TODAY; the keyed debt closes it.
 - **The W-kind (rewrite) debt keys the LIVE window's DESIRED record
   and re-keys at EVERY arm outcome (r16 Codex M3 + SMR m1 + r20 Codex
@@ -2239,7 +2323,18 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   operator's intent, and the barrier's unlink is idempotent);
   WITHHOLD every other action (a missing active with a healthy
   confirm slot must never clear or repair — the next `Load`
-  re-seeds while the confirm slot outruns it); (g-err) `err != nil`
+  re-seeds while the confirm slot outruns it). THE OPERATOR
+  PROVENANCE IS AN OPERATIONAL ASSUMPTION (r28 Codex fold-partial 1,
+  verified: ENOENT proves no provenance — `db.go:302-330`): the
+  store NEVER deletes active.json itself, so a both-files absence
+  is BY CONSTRUCTION an operator hand action under the same
+  store-owned-file doctrine as the single-xpfd assumption (one
+  xpfd per `.configdb/`, no flock — hand edits are the operator's
+  intent); and the assumption is SAFE if wrong: the barrier only
+  dir-fsyncs an already-absent slot and writes nothing, so a
+  mistaken assumption costs at most the clear of a debt whose
+  record the operator already deleted by hand — never a write over
+  a present record. (g-err) `err != nil`
   → WITHHOLD — retain the debt, NO terminalization, NO write, NO
   clear; the message names the ACTIVE side. The active-read error's
   own transient/permanent class does NOT change the gate's behavior
@@ -2262,8 +2357,14 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   `readOrCreateMasterKey` through `db.go:207-217` +
   `crypto.go:262-270,457-479` — a check-then-ordinary-write leaves
   the auto-create path live AND races a K→K′ swap between the gate's
-  read and the write's own key read): ALL confirm-side repair writes
-  (the W restore, the D synthesized tombstone) use a NO-CREATE keyed
+  read and the write's own key read): EVERY non-arm `WriteConfirm`
+  producer — the enumeration is COMPLETE (r28 Codex M1, verified the
+  v28 list omitted retry-side producers): the W-kind (w-a) durable
+  rewrite, the W-kind (w-b)/(w-c) restores, the R-kind (a) MATCH
+  tombstone (the read-mutate-write helper — the ONLY read-back
+  tombstone producer), the R-kind (c) MISMATCH durable rewrite of
+  the current record, and the D-kind synthesized tombstone — uses a
+  NO-CREATE keyed
   write primitive — the key is sourced via `readMasterKey` (which
   NEVER creates, `crypto.go:443-455`) and a missing/invalid key file
   FAILS the write with no creation — and the gate's active-side
@@ -2271,7 +2372,27 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   bytes are read ONCE under `s.mu` at action time, the active side
   is validated against them, and the SAME bytes are passed into the
   write's encryption step — a K→K′ swap between check and write is
-  impossible by construction. PLAINTEXT repair writes are EXEMPT by
+  impossible by construction. The ORDINARY arm write
+  (`writeConfirmState`) deliberately KEEPS `WriteConfirm`'s
+  create-on-first-use (the documented #1894 fresh-box design — the
+  first encrypted write must create the key); only repair/resolution
+  writes are no-create. AND the snapshot alone does NOT prove the
+  installed key PATH stayed unchanged across the action (r28 Codex
+  M2, verified: `master.key` is an ordinary unlocked filesystem
+  path, `crypto.go:443-479`, and the operator is explicitly
+  permitted live restoration): two pins close the residual. (i) Key
+  remediation is OFFLINE/SERIALIZED BY RUNBOOK: the operator
+  restores `.configdb/master.key` with xpfd STOPPED (the systemd
+  unit singleton makes the stop natural) or accepts that the
+  daemon's next probe validates the restored key before any debt
+  action — the operator-facing message says so explicitly. (ii)
+  EVERY debt clear that consumed a key snapshot RE-READS the key
+  path at clear time and compares bytes to the snapshot — a
+  mismatch (the operator swapped the path mid-action) RETAINS the
+  debt with the restoration message instead of clearing: a clear
+  never lands on a key generation different from the one the
+  validation and the write used.
+  PLAINTEXT repair writes are EXEMPT by
   construction (r27 SMR m1, verified `crypto.go:262-265`:
   `maybeEncryptTreeJSON` returns the body untouched when the
   candidate tree carries no master-password leaf and NEVER calls
@@ -2453,8 +2574,14 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   follows its normal path (live-window ArmID match → untouched;
   `Resolved` → finish the delete; otherwise → the R-kind /
   seeded-orphan machinery). A successful arm on the slot at ANY
-  point likewise clears the D-kind debt as moot (the overwrite IS
-  the supersession it existed to perform).
+  point likewise SUBSUMES the D-kind debt (the arm's overwrite IS
+  the supersession the debt existed to perform) — this is the
+  ARM'S OWN action, not a D action (r28 Codex m3: the arm-time
+  clearing is not subject to the D precondition or the active
+  gate; the arm's own write path is the only gate it needs, and
+  the clear rides the arm's barrier); absent such an arm, D stays
+  inert until its fresh re-classification under the full
+  three-conjunct precondition.
   The D-kind debt is PROCESS-LOCAL (r22 Codex M3, verified: the retry
   is an unjoined plain goroutine abandoned on exit, BOOT-origin is
   "no timer, no debt", and a pre-tombstone crash persists no D
@@ -2617,10 +2744,20 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   confirm-removal debt must stay visible): the store gains a typed
   snapshot accessor `ConfigPersistDegradedState()` returning THREE
   fields (r19 Codex m2, verified three booleans cannot carry the
-  promised subtypes): `{ActivePersistDegraded bool,
+  promised subtypes) — r28 Codex M3 grows the key-class cause to
+  PER-STATE form (a singular debt-level bool could not represent
+  coexisting debts, and the boot key-class latch carries NO debt at
+  all): `{ActivePersistDegraded bool,
   ConfirmDebtKindMask (bitmask: REMOVAL | REWRITE | SLOT_DELETE),
+  ConfirmDebtKeyClassMask (bitmask over the SAME kinds — a SUBSET
+  of ConfirmDebtKindMask: each bit set at its OWNING debt's
+  raise/retain from the retained failure's `errors.As` check
+  against `ConfirmRecordKeyClassError`, never from message text,
+  and cleared ONLY with its owning debt),
   ConfirmRecordState enum (OK | TerminalUnreadable |
-  RestartRecoveryOwed)}` — the mask covers the
+  RestartRecoveryOwed), ConfirmRecordKeyClass bool (the LATCH-level
+  cause — set when the terminal latch's retained failure is
+  key-class, cleared with the latch)}` — the mask covers the
   removal + rewrite debts (the H2-expanded confirmRemoveDegraded
   category) AND the D-kind slot debt (r22 Codex m3: SLOT_DELETE —
   a synthesized-tombstone record with its delete debt outstanding can
@@ -2648,16 +2785,27 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   and the `ConfigPersistDegradedStateFn` payload exposed only an
   active flag, a debt mask, and the three-state record enum — no
   key-class bit, so the promised ORIGINAL-key guidance was
-  unrenderable): the snapshot gains a NON-SECRET
-  `ConfirmDebtKeyClass` bool, populated at debt raise/retain time
-  from the retained failure's `errors.As` check against
-  `ConfirmRecordKeyClassError` (never from message text), and
-  `api/health.go` renders the key-class VARIANT of the confirm-debt
-  message when it is set — "restore the ORIGINAL
+  unrenderable; r28 Codex M3 then verified the singular-bool form
+  was still wrong: MULTIPLE R debts + a W can coexist, and the boot
+  key-class latch carries no debt while terminal precedence would
+  have rendered the generic corrupt-record message): the snapshot
+  carries the PER-STATE causes — `ConfirmDebtKeyClassMask` (one bit
+  per debt kind, each set at its OWNING debt's raise/retain from
+  the retained failure's `errors.As` check against
+  `ConfirmRecordKeyClassError` and cleared ONLY with that debt) AND
+  `ConfirmRecordKeyClass` (the latch-level cause, set when the
+  terminal latch's retained failure is key-class and cleared with
+  the latch) — and
+  `api/health.go` renders the key-class VARIANT of the message for
+  the level whose cause bit is set — terminal precedence with
+  `ConfirmRecordKeyClass` → "restore the ORIGINAL
+  `.configdb/master.key`; removing the record sacrifices crash
+  recovery"; confirm-debt precedence with any
+  `ConfirmDebtKeyClassMask` bit → "restore the ORIGINAL
   `.configdb/master.key`; writing or deleting under a NEW key would
   launder an unreadable active config" — in place of the generic
   removal/rewrite/slot-delete text, with a health regression pinning
-  both variants (key-class set vs clear),
+  both variants (key-class set vs clear) at BOTH precedence levels,
   then the existing active-persist message (`api/health.go:65-71`). The aggregate
   `ConfigPersistDegraded()` stays the OR for the gauge (health can
   never read healthy while the gauge reads 1). The wiring is a
@@ -2750,10 +2898,17 @@ fails, A's debt retained); (x4d) record ABSENT at retry (post-unlink
 dir-fsync owed) → `DeleteConfirm` re-driven to finish the sync;
 (x4e) READ ERROR, transient → retained, retried; (x4e') READ ERROR,
 PERMANENT — the FULL taxonomy (#5637 parse gates AND
-crypto/envelope/auth/PRF/master-key classes) → PER-DEBT TERMINAL: that
+crypto/envelope/auth/PRF/master-key classes) → split BY CLASS
+(r25-r28): NON-KEY-CLASS permanent → PER-DEBT TERMINAL for the
+content-dependent R-kind debt (that
 debt stops, the singleton loop KEEPS healing `persistDegraded`, health
 503, loud journal, pinned remediation (no infinite loop, no loop
-outright-stop); (x4c') W-kind LIVE-WINDOW re-key (r16 Codex
+outright-stop)); KEY-CLASS permanent (authentication failure,
+invalid observed key length — the `ConfirmRecordKeyClassError`
+subtype) → RETAIN with the `.configdb/master.key` restoration
+message, NO repair write, NO terminalization; content-INDEPENDENT
+debts (W restore, D synthesized tombstone) are EXEMPT from
+terminalization by construction; (x4c') W-kind LIVE-WINDOW re-key (r16 Codex
 M3 + SMR m1 + r20 Codex M1 + r21 Codex M3): the W debt keys the LIVE
 window's desired record, never a dead one: arm C lands DURABLY while
 W_B pends → B's window died at the re-arm → W_B is stale and the debt
@@ -2859,15 +3014,20 @@ construction, systemd re-drives)
 — an unconfirmed config never stands from a lost read; a
 PERMANENT-class boot failure proceeds with the latch + 503;
 (x14) TYPED HEALTH CHANNEL (r17 Codex M6/m2 + r18 M7 + r19 m4 +
-r20 m2 + r23 m3): `ConfigPersistDegradedState()` returns the exact
-three-value breakdown `{ActivePersistDegraded bool,
+r20 m2 + r23 m3 + r28 Codex M3): `ConfigPersistDegradedState()` returns
+the exact breakdown `{ActivePersistDegraded bool,
 ConfirmDebtKindMask (REMOVAL|REWRITE|SLOT_DELETE),
-ConfirmRecordState (OK|TerminalUnreadable|RestartRecoveryOwed)}`;
+ConfirmDebtKeyClassMask (same kinds — a SUBSET, per-debt key-class
+cause, cleared only with its owning debt),
+ConfirmRecordState (OK|TerminalUnreadable|RestartRecoveryOwed),
+ConfirmRecordKeyClass (the LATCH-level key-class cause)}`;
 the aggregate `ConfigPersistDegraded()` is a DERIVED value
 (`persistDegraded || mask ≠ 0 || enum ≠ OK`), not a snapshot field;
 /health renders by precedence TerminalUnreadable > RestartRecoveryOwed >
 ConfirmDebt (generic
-removal/rewrite/slot-delete message + mask detail) > ActivePersist; the
+removal/rewrite/slot-delete message + mask detail, REPLACED by the
+key-class variant naming ORIGINAL `.configdb/master.key`
+restoration when the rendered level's cause bit is set) > ActivePersist; the
 gauge consumes the derived aggregate OR; the
 descriptor/option/wiring comments name all the causes; (x15)
 TAXONOMY
@@ -2925,19 +3085,23 @@ record long gone); (x20) FAIL-CLOSED ROUTING (r18 Codex M6 = SMR M1 + r19 Codex 
 legs), confirm.json-named diagnostic, pinned retry envelope (initial
 read + ≤3 retries, 100/200/400 ms, `LoadContext(ctx)`); (x21)
 HEALTH SNAPSHOT PRECEDENCE (r18 Codex M7/m5 + r19 Codex m4 + r20
-Codex m2 + r23 Codex m3 + r27 Codex m2): the exact breakdown
+Codex m2 + r23 Codex m3 + r27 Codex m2 + r28 Codex M3): the exact
+breakdown
 `{ActivePersistDegraded, ConfirmDebtKindMask
-(REMOVAL|REWRITE|SLOT_DELETE), ConfirmRecordState
-(OK|TerminalUnreadable|RestartRecoveryOwed), ConfirmDebtKeyClass
-bool}` — the fourth field NON-SECRET, populated from the retained
-failure's `errors.As` check against `ConfirmRecordKeyClassError`,
-NEVER from message text — with the aggregate
+(REMOVAL|REWRITE|SLOT_DELETE), ConfirmDebtKeyClassMask (same kinds —
+a SUBSET, per-debt key-class cause from the retained failure's
+`errors.As` check, cleared only with its owning debt),
+ConfirmRecordState
+(OK|TerminalUnreadable|RestartRecoveryOwed), ConfirmRecordKeyClass
+(the LATCH-level key-class cause, set/cleared with the latch)}` —
+all causes NON-SECRET, NEVER from message text — with the aggregate
 DERIVED (`persistDegraded || mask ≠ 0 || enum ≠ OK`);
 /health precedence TerminalUnreadable > RestartRecoveryOwed >
 ConfirmDebt (generic removal/rewrite/slot-delete message + mask
 detail, REPLACED by the key-class variant naming ORIGINAL
-`.configdb/master.key` restoration when `ConfirmDebtKeyClass` is
-set — both variants regression-pinned) > ActivePersist; the gauge
+`.configdb/master.key` restoration when the rendered level's cause
+bit is set — both variants regression-pinned at both levels) >
+ActivePersist; the gauge
 consumes the derived aggregate OR;
 Config → NewServer plumbing
 pinned; (x22) DURABLE-ARM D-SUPPRESSION (r27 Codex m1, verified the
@@ -2952,24 +3116,36 @@ its replacement active write fails PRE-rename — assert D stays
 INERT while `persistDegraded` stands (C's window record survives —
 #5473 retention — and no tombstone/delete runs), then let the
 replacement retry land and assert D's fresh re-read proceeds per
-the (ii-b) eager rule; (x23) ACTIVE-GATE MATRIX (r27 Codex M1):
-(g-ok)/(g-absent)/(g-err) × (W restore, D tombstone, D delete,
+the (ii-b) eager rule; (x23) ACTIVE-GATE MATRIX (r27 Codex M1 +
+r28 Codex M1's inventory completion):
+(g-ok)/(g-absent)/(g-err) × (W (w-a) durable rewrite, W (w-b)/(w-c)
+restore, R (a) tombstone+delete, R (c) mismatch rewrite, D
+tombstone, D delete,
 confirm-side clear, sanctioned both-files-removed barrier) at BOTH
 placements (boot — consuming the same `ReadActiveMeta` result
 `Load` already took; runtime — a fresh read under `s.mu` at action
 time), asserting (g-absent) PROCEEDS only for the barrier and
 withholds everything else, and (g-err) withholds + retains with NO
 terminalization for both EACCES and corrupt-active; (x24) KEY-CLASS
-CLASSIFICATION BOUNDARIES (r27 Codex M4): auth failure →
+CLASSIFICATION BOUNDARIES (r27 Codex M4 + r28 Codex m1/m2): auth failure →
 `ConfirmRecordKeyClassError`; invalid observed length → key-class;
 missing key file / EACCES → NOT key-class (READ-side TRANSIENT);
-unsupported PRF / too-new envelope / bad nonce / bad base64 → NOT
-key-class (NON-key-class permanent); PLUS the NO-CREATE write pin
-(r27 Codex M2): an encrypted repair write attempted with the key
+unsupported PRF / too-new envelope / bad nonce ENCODING or length /
+bad base64 → NOT
+key-class (NON-key-class permanent — these fail BEFORE AEAD,
+`crypto.go:328-353`), while a well-formed TAMPERED nonce reaches
+`gcm.Open` and is KEY-CLASS by authentication indistinguishability
+(`crypto.go:354-356`); the COMBINED plaintext-active /
+K-encrypted-confirm scenario under a swapped-but-valid K′ asserts
+ZERO write/delete (the read-side key-class rule retains; the
+no-create primitive is never reached); PLUS the NO-CREATE write pin
+(r27 Codex M2 + r28 Codex M1): an encrypted repair write attempted
+with the key
 file missing FAILS with no key created (the file stays absent), a
 K-swap between gate and write is impossible by construction (one
-snapshot), and a plaintext repair write proceeds with no key access
-at all. This closes the
+snapshot), a plaintext repair write proceeds with no key access
+at all, and EVERY non-arm `WriteConfirm` producer ((w-a), (w-b)/
+(w-c), R (a), R (c), D tombstone) takes the primitive. This closes the
 master's re-arm-after-confirmed residual for the whole confirm-type
 class AND the post-durability replacement finalize — the two places a
 lingering record's replay is unsafe.
@@ -3130,6 +3306,51 @@ known-issues and rebind only the sampler per transition — fails issue
 requirements #1/#4 and leaves RACE-1 open). v1's A2 (raw field + cell
 coexistence) is deleted as incoherent (r1 B3).
 
+### 4.7 Delivery structure — the r28 SPLIT ruling (2-of-3)
+
+The r28 split rulings: **Codex (B) SPLIT**, **Claude SMR (B) SPLIT**,
+**AGY (A) CONVERGE** (recorded verbatim in
+`codex-plan-r28.md` / `claude-smr-plan-r28.md` / `agy-plan-r28.md`).
+The 2-of-3 majority carries, per `docs/engineering-style.md`
+principle 5 (narrow scope) and the hand of the r19-recorded analysis
+(H-without-H2 is unsound; the only sound split moves H WITH H2 —
+v20 history). The delivery is TWO units:
+
+- **PR-1 (the #2114 deliverable — the titled defect)**: the `d.dp`
+  synchronized-accessor core — work item A1 (the atomic publication
+  cell + uniform accessor), the 5-site writer conversion (§5.2), the
+  per-site snapshot boundaries (§5.3), the full reader conversion
+  (134 prod + ~110 test, §5.4), the `CachedStatusProvider` sampler
+  narrowing (§4 A1), the canary pair (§5.1 + `pkg/daemon` AST
+  canary), docs + tests. This core is complete and self-contained:
+  it closes RACE-1 (watcher chain), RACE-2 (bootstrap-exit arm), and
+  RACE-3 (recovered confirm timer) at the memory-ordering level and
+  regresses nothing — every pre-existing hazard it does NOT address
+  stays exactly as exposed as master is today.
+- **Follow-up issue (filed at /engineer time; seeded from this
+  document)**: "commit-confirmed recovery integrity: startup gate +
+  FirstCommit+cluster Load recovery + confirm-record durability" —
+  work items **G + H + H2 TOGETHER**, per Codex r28's ordering
+  constraint (verified against the plan's own pins): G's gate
+  releases recovery at END-of-PHASE-5, AFTER manager construction,
+  while H's revert-at-Load is only safe BEFORE `d.cluster` exists —
+  landing G without H would convert master's short pre-manager timer
+  window into the known post-manager bootstrap-with-live-cluster
+  hybrid, and H cannot land alone because its correctness depends on
+  H2's durability machinery. The core must therefore NOT ship G:
+  G moves with H+H2 into the follow-up, which lands as the NEXT work
+  item after the core merges (no hard ordering gate — the core
+  introduces no new exposure; the follow-up sequences pre-existing
+  defects rather than gating the titled fix).
+- **Dissent recorded**: AGY ruled (A) CONVERGE — v28's folds close
+  H2, so a single PR avoids administrative overhead for an
+  already-validated design. The user makes the final call at manual
+  approval: the plan converges PLAN-READY under EITHER structure
+  (all three reviewers' verdicts gate the DESIGN, which is
+  identical; the split is a packaging recommendation). If the user
+  prefers one PR, §4.7 collapses to "ship it all" with no design
+  change.
+
 ## 5. Concrete design (A1)
 
 ### 5.1 New/changed types
@@ -3243,9 +3464,13 @@ coexistence) is deleted as incoherent (r1 B3).
   typed `ConfigPersistDegradedState()` snapshot accessor returning the
   exact breakdown `{ActivePersistDegraded bool,
   `ConfirmDebtKindMask (REMOVAL|REWRITE|SLOT_DELETE)`,
+  `ConfirmDebtKeyClassMask (same kinds — a SUBSET, per-debt
+  key-class cause from the retained failure's `errors.As` check,
+  cleared only with its owning debt)`,
   `ConfirmRecordState (OK|TerminalUnreadable|RestartRecoveryOwed)`,
-  `ConfirmDebtKeyClass bool` — the fourth field NON-SECRET, from the
-  retained failure's `errors.As` check (r27 Codex m2)}`
+  `ConfirmRecordKeyClass bool` — the LATCH-level key-class cause,
+  set/cleared with the latch; all NON-SECRET, never from message
+  text (r27 Codex m2 + r28 Codex M3)}`
   with the aggregate `ConfigPersistDegraded()` DERIVED
   (`persistDegraded || mask ≠ 0 || enum ≠ OK`), and precedence
   TerminalUnreadable > RestartRecoveryOwed >
@@ -3261,8 +3486,10 @@ coexistence) is deleted as incoherent (r1 B3).
   (terminal confirm-record > confirm-persist — GENERIC
   removal/rewrite/slot-delete text + a debt-kind detail field,
   REPLACED by the key-class variant naming ORIGINAL
-  `.configdb/master.key` restoration when `ConfirmDebtKeyClass` is
-  set — >
+  `.configdb/master.key` restoration when the RENDERED LEVEL's
+  key-class cause bit is set — `ConfirmRecordKeyClass` at terminal
+  precedence, any `ConfirmDebtKeyClassMask` bit at confirm-debt
+  precedence — >
   active-persist), plus the
   DISTINCT restart-recovery-owed message for the BOOT-origin substate;
   `metrics.go` keeps the gauge on the aggregate OR;
@@ -3825,9 +4052,15 @@ Preserved exactly:
      (dominance D1); (x4d) record absent →
      DeleteConfirm re-driven (dir-fsync); (x4e) transient read error →
      retain+retry; (x4e') PERMANENT read error — full taxonomy (#5637
-     parse gates + crypto/envelope/auth/PRF/master-key) → PER-DEBT
-     TERMINAL (that debt stops, the singleton loop KEEPS healing
-     `persistDegraded`, health 503, pinned remediation); (x4f)
+     parse gates + crypto/envelope/auth/PRF/master-key) → split BY
+     CLASS (r25-r28): NON-KEY-CLASS permanent → PER-DEBT
+     TERMINAL for the content-dependent R-kind debt (that debt stops,
+     the singleton loop KEEPS healing
+     `persistDegraded`, health 503, pinned remediation); KEY-CLASS
+     permanent (the `ConfirmRecordKeyClassError` subtype) → RETAIN
+     with the `.configdb/master.key` restoration message, NO repair
+     write, NO terminalization; content-INDEPENDENT debts (W
+     restore, D synthesized tombstone) EXEMPT; (x4f)
      same-content re-arm → distinct ArmIDs; (x5) the read-mutate-write
      helper is the ONLY READ-BACK tombstone producer (the synthesized
      producer writes ONLY the superseded-UNREADABLE slot) — #5637 gate passes
@@ -3913,16 +4146,23 @@ Preserved exactly:
      `classifyLoadError` fail-closed mapping (NOT
      `loadOtherError` — `bootstrap_test.go:10-36` legs); the fatal
      diagnostic names confirm.json; (x14) TYPED HEALTH CHANNEL (r17
-     Codex M6/m2 + r18 M7 + r19 m4 + r20 Codex m2 + r23 Codex m3):
-     `ConfigPersistDegradedState()` returns the exact three-value
+     Codex M6/m2 + r18 M7 + r19 m4 + r20 Codex m2 + r23 Codex m3 +
+     r28 Codex M3):
+     `ConfigPersistDegradedState()` returns the exact
      breakdown `{ActivePersistDegraded bool, ConfirmDebtKindMask
-     (REMOVAL|REWRITE|SLOT_DELETE), ConfirmRecordState
-     (OK|TerminalUnreadable|RestartRecoveryOwed)}`; the aggregate
+     (REMOVAL|REWRITE|SLOT_DELETE), ConfirmDebtKeyClassMask (same
+     kinds — a SUBSET, per-debt key-class cause, cleared only with
+     its owning debt), ConfirmRecordState
+     (OK|TerminalUnreadable|RestartRecoveryOwed),
+     ConfirmRecordKeyClass (the LATCH-level key-class cause)}`; the aggregate
      `ConfigPersistDegraded()` is DERIVED
      (`persistDegraded || mask ≠ 0 || enum ≠ OK`);
      /health renders by precedence TerminalUnreadable >
      RestartRecoveryOwed > ConfirmDebt (generic
-     removal/rewrite/slot-delete message + mask detail) > ActivePersist;
+     removal/rewrite/slot-delete message + mask detail, REPLACED by
+     the key-class variant naming ORIGINAL `.configdb/master.key`
+     restoration when the rendered level's cause bit is set) >
+     ActivePersist;
      the gauge consumes the derived aggregate OR;
      descriptor/option/wiring comments name all the causes; (x15) TAXONOMY BOUNDARY (r17 Codex M4 + r25 Codex M1): master-key
      IO → TRANSIENT retry, no latch; NON-KEY-CLASS permanent
@@ -3985,20 +4225,58 @@ Preserved exactly:
      + ≤3 retries, delays 100/200/400 ms, `LoadContext(ctx)` with
      `Load()` preserved, clock seam) is asserted;
      (x21) HEALTH SNAPSHOT PRECEDENCE (r18 Codex M7/m5 + r19 Codex
-     m2/m4 + r20 Codex m2 + r23 Codex m3):
-     `ConfigPersistDegradedState()` returns the exact three-value
+     m2/m4 + r20 Codex m2 + r23 Codex m3 + r28 Codex M3):
+     `ConfigPersistDegradedState()` returns the exact
      breakdown `{ActivePersistDegraded bool, ConfirmDebtKindMask
-     (REMOVAL|REWRITE|SLOT_DELETE), ConfirmRecordState
-     (OK|TerminalUnreadable|RestartRecoveryOwed)}`; the aggregate
+     (REMOVAL|REWRITE|SLOT_DELETE), ConfirmDebtKeyClassMask (same
+     kinds — a SUBSET, per-debt key-class cause, cleared only with
+     its owning debt), ConfirmRecordState
+     (OK|TerminalUnreadable|RestartRecoveryOwed),
+     ConfirmRecordKeyClass (the LATCH-level key-class cause)}`; the aggregate
      `ConfigPersistDegraded()` is a DERIVED value
      (`persistDegraded || mask ≠ 0 || enum ≠ OK`), not a snapshot
      field; /health
      renders by precedence TerminalUnreadable > RestartRecoveryOwed
      > ConfirmDebt (generic removal/rewrite/slot-delete message +
-     mask detail)
+     mask detail, REPLACED by the key-class variant naming ORIGINAL
+     `.configdb/master.key` restoration when the rendered level's
+     cause bit is set)
      > ActivePersist; the gauge
      consumes the derived aggregate OR (never healthy-while-gauge-1); the
-     Config → NewServer plumbing test pins both callbacks wired.
+     Config → NewServer plumbing test pins both callbacks wired;
+     (x22) DURABLE-ARM D-SUPPRESSION (r27 Codex m1): seed a D-kind
+     slot debt, land a FULLY DURABLE arm (no W debt), block the
+     (d-iii) moot-clear via the active-side gate, assert D INERT
+     across later non-key permanent slot-read failures while
+     `armedArmID != ""`; PLUS the SyncApply-pre-rename leg (r27
+     Codex M3): D inert while `persistDegraded` stands (C's record
+     survives per #5473), D's fresh re-read proceeds once the
+     replacement lands; (x23) ACTIVE-GATE MATRIX (r27 Codex M1 +
+     r28 Codex M1's inventory completion): (g-ok)/(g-absent)/
+     (g-err) × (W (w-a) rewrite, W (w-b)/(w-c) restore, R (a)
+     tombstone+delete, R (c) mismatch rewrite, D tombstone, D
+     delete, confirm-side clear, sanctioned both-files-removed
+     barrier) at BOTH placements, asserting (g-absent) PROCEEDS
+     only for the barrier and (g-err) withholds + retains with NO
+     terminalization (EACCES and corrupt-active legs);
+     (x24) KEY-CLASS CLASSIFICATION BOUNDARIES (r27 Codex M4 + r28
+     Codex m1/m2): auth failure → key-class; invalid observed
+     length → key-class; missing key file / EACCES → NOT key-class
+     (READ-side TRANSIENT); unsupported PRF / too-new envelope /
+     bad nonce ENCODING or length → NOT key-class (NON-key-class
+     permanent — the failures precede AEAD, `crypto.go:328-353`),
+     while a well-formed TAMPERED nonce reaches `gcm.Open` and is
+     key-class by authentication indistinguishability
+     (`crypto.go:354-356`); the COMBINED plaintext-active /
+     K-encrypted-confirm scenario under a swapped-but-valid K′
+     asserts ZERO write/delete (the read-side key-class rule
+     retains; the no-create primitive is never reached); and the
+     NO-CREATE pin: an encrypted repair write with the key file
+     missing FAILS with NO key created (the file stays absent),
+     one snapshot feeds gate+write, a plaintext repair write
+     performs no key access, and EVERY non-arm `WriteConfirm`
+     producer ((w-a), (w-b)/(w-c), R (a), R (c), D tombstone) is
+     covered.
 3. Update `daemon_natpoolalarm_race_test.go` (`writeDPFor` →
    `setDataplane`) and `daemon_forwarding_status_test.go` (rewrite against
    the narrowed adapter: `ProjectsMapStats`/`UsesUserspaceStatusAdapter`
@@ -4031,6 +4309,14 @@ Preserved exactly:
 
 ## 10. Out of scope (explicitly)
 
+- **The G+H+H2 follow-up unit (§4.7 delivery structure)**: work item G
+  (startup-readiness gate), work item H (FirstCommit+cluster recovery
+  invariant), and work item H2 (confirm-record durability machinery)
+  ship in the named follow-up issue, NOT the #2114 PR — per the r28
+  2-of-3 split ruling and Codex's ordering constraint (G-without-H
+  would extend the pre-manager timer window into the post-manager
+  bootstrap-with-live-cluster hybrid). Their designs remain in this
+  document as the follow-up's research seed.
 - Option B (write-once `d.dp` / degraded-adapter semantics).
 - Swapping capture-once consumers (GC, event stream) to per-tick re-probe.
 - `pkg/grpcapi` / `pkg/cli` boot-captured forwarding-status probes (stale
@@ -4045,7 +4331,8 @@ Preserved exactly:
 - **Broader cluster-runtime lifecycle question (follow-up issue, filed at
   /engineer time)**: should `enterBootstrapMode` stop cluster comms when
   `d.cluster != nil`? The permanent recovery invariant (work item H) ships
-  in this PR and prevents the bootstrap-with-cluster state from persisting
+  in the G+H+H2 follow-up unit (§4.7) and prevents the
+  bootstrap-with-cluster state from persisting
   past the next boot; the lifecycle redesign is a pre-existing policy
   question, not a `d.dp` publication concern.
 
@@ -4346,8 +4633,9 @@ rationale corrected to the OLD reader's expired-first-commit
 revert-to-EMPTY path), and the health schema unified (the snapshot is
 exactly `{ActivePersistDegraded, ConfirmDebtKindMask
 (REMOVAL|REWRITE|SLOT_DELETE), ConfirmRecordState
-(OK|TerminalUnreadable|RestartRecoveryOwed)}` — r27 adds the
-NON-SECRET `ConfirmDebtKeyClass` bool for the key-class message
+(OK|TerminalUnreadable|RestartRecoveryOwed)}` — r28 grows TWO
+NON-SECRET cause fields (`ConfirmDebtKeyClassMask` per-debt +
+`ConfirmRecordKeyClass` latch-level) for the key-class message
 variant — with the aggregate a
 DERIVED value, not a snapshot field); r24 additions: the
 permanent-error state machine unified (terminalization SCOPED to
@@ -4429,27 +4717,23 @@ Still open:
    reviewers want a lighter `grep`-based `make` check instead?
 5. `test-race-dp` wiring into `test-go`: acceptable growth of the
    pre-commit gate, or documented-manual-gate only?
-6. **SPLIT-OR-CONVERGE (r28, every reviewer rules EXPLICITLY)**: the
-   r19-recorded split analysis (v20 history) established that the
-   only sound split moves H WITH H2 — H-without-H2 would turn
-   master's DELAYED lingering-record hazard into an IMMEDIATE
-   revert-at-load for the confirmed FirstCommit+cluster class.
-   Twenty rounds later the d.dp accessor core (work items A-G:
-   RACE-1/2/3, the atomic cell, the sampler narrowing, the startup
-   gate, the shutdown fence) has been triple-stable while EVERY new
-   MAJOR (r25-r27: key-class rule, laundering generalization,
-   taxonomy mechanics, gate executability, no-create writes, the
-   undurable-replacement outrun) has landed in H2's confirm-record
-   durability machinery. Rule on ONE of: (A) CONVERGE — v28's folds
-   close the H2 design and the full plan (A-G + H + H2) ships as
-   one PR under #2114; or (B) SPLIT — the A-G core ships under
-   #2114 as the PLAN-READY deliverable and H+H2 move to a named
-   follow-up issue carrying this design (the v28 state) as its
-   research seed, per `docs/engineering-style.md` principle 5
-   (narrow scope). If (B): say whether the follow-up must land
-   BEFORE the core's merge (ordering constraint) or may trail it,
-   and why. A reviewer who answered (A) last round may keep (A);
-   the question exists because the loop must terminate.
+6. **SPLIT-OR-CONVERGE (r28 RULED; r29 confirms)**: the r28 rulings
+   are recorded in §4.7 — Codex (B) SPLIT with the ordering
+   constraint (G must move with H+H2: G's END-of-PHASE-5 release is
+   post-manager construction while H's revert is only safe at Load
+   before `d.cluster` exists, so G-without-H would convert master's
+   short pre-manager window into the post-manager
+   bootstrap-with-live-cluster hybrid); Claude SMR (B) SPLIT
+   (follow-up may trail — the core introduces no new exposure); AGY
+   (A) CONVERGE (the v28 folds close H2; one PR avoids the
+   overhead). The 2-of-3 majority structure stands in §4.7: PR-1 =
+   the `d.dp` core (A1 + conversion + canaries + sampler); follow-up
+   = G+H+H2 seeded from this document. Each reviewer: confirm the
+   §4.7 structure (or restate your dissent), confirm the design
+   closes under EITHER packaging, and return your verdict on the
+   v29 design. The user makes the final packaging call at manual
+   approval — the plan converges PLAN-READY when all three verdicts
+   gate the DESIGN as ready, whichever packaging they prefer.
 
 ---
 
