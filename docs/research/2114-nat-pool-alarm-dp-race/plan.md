@@ -1,10 +1,8 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v38 — r37 findings folded (Codex NEEDS-REVISION
-  2M/2m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m —
-  its wait-interval nit folded into the Codex M1 quiescence
-  barrier; all three confirm the §4.7 structure); pending
-  convergence review r38
+- **Status**: DRAFT v39 — r38 findings folded (Codex NEEDS-REVISION
+  4M/1m; AGY PLAN-READY; Claude SMR PLAN-READY 0M/0m — all three
+  confirm the §4.7 structure); pending convergence review r39
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -1413,6 +1411,50 @@
   (`fsatomic.go:1-4`) and `pkg/fsatomic/README.md:3-12` — both
   claiming exactly two writers — join the docs inventory for the
   third (Codex m2).
+  v39: r38 convergence — the fence becomes enforceable and the
+  offline repair shape is pinned (Codex NEEDS-REVISION 4M/1m,
+  folds 1 FOLDED / 2 NOT-FOLDED, structure confirmed; AGY
+  PLAN-READY 3/3 with 2 fresh attacks FAILED, structure
+  confirmed; SMR PLAN-READY 0M/0m, structure confirmed): (a) the
+  quiescence check becomes an ENFORCEABLE barrier (Codex M1,
+  verified the observability gap: the SyncApply apply flag and
+  queue are PRIVATE — `cluster/sync.go:594-616` — and the public
+  status surfaces expose only cumulative/history data —
+  `cluster/sync.go:191-228`, `cluster/status.go:340-356` — so no
+  observable predicate can fence peer-driven syncs): the
+  operator STOPS THE PEER xpfd (or downs the cluster control
+  link `em0`) BEFORE the fence wait — a stopped peer is a
+  deterministic barrier for every peer-driven SyncApply. (b)
+  The abandoned-D offline repair shape is pinned (Codex M2,
+  verified the conflation: a tombstone FAILURE leaves the
+  ORIGINAL unreadable pending record, and a PENDING-SHAPED
+  offline repair of that DEAD record can BIND at the next boot
+  — legacy-empty or same-content `GuardedHash`,
+  `store_persist.go:149-165,171-255` — and replay the RESOLVED
+  window): the offline repair of a DEAD (D-target) record is
+  NEVER pending-shaped — the operator REMOVES it (always
+  live-safe, offline too) or writes the repair with
+  `Resolved: true` (dropped at the Resolved-first check). (c)
+  The recovery instruction splits on the record's deadline at
+  restart (Codex M3: a deadline that fired before shutdown is
+  already PAST at restart — `Load` reverts immediately and bare
+  `commit` then returns "no pending confirmed commit",
+  `store_commit.go:729-746`): still-pending → CONFIRM AWAY with
+  a bare `commit` within the ORIGINAL remaining interval;
+  already-expired → the config is already reverted, so RE-COMMIT
+  the intended configuration — never confirm. (d) The
+  H-class recovery is the preflight's OWN named path (Codex M4,
+  verified: H leaves no cluster runtime and a live CLUSTERED
+  commit is REJECTED — `daemon_apply_commit.go:194-205`,
+  `cluster_topology_preflight.go:59-97`, the HA runtime is
+  boot-only-constructed): restart xpfd INTO the clustered
+  configuration (the `xpf.conf` boot import re-imports the seed
+  and commits it on the normal day-0 path), or an offline
+  seed-and-restart. (e) The deadline's operator surface is the
+  startup journald log line (Codex m1: the audit journal carries
+  no deadline field, `journal.go:59-80`, and confirm.json may be
+  encrypted, `db.go:199-216` — the remaining interval is read
+  from `store_persist.go:254-255`).
 
 ---
 
@@ -3420,11 +3462,17 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   check — (1) the operator ensures NO live commit-confirmed
   window stands (confirm or roll back any armed window first —
   window resolution is operator-paced), (2) the operator REFRAINS
-  from new commits, verifies CLUSTER-SYNC QUIESCENCE (the peer is
-  stable and no config sync is in flight — the async producer is
-  peer-driven SyncApply: peer reconnect, promotion, or the
-  30-second reconciler can initiate it independently of operator
-  commits, `daemon_ha_sync.go:417-430,500-522,926-956`), and
+  from new commits and FENCES the async producer ENFORCEABLY
+  (r38 Codex M1, verified the observability gap: the SyncApply
+  apply flag and queue are PRIVATE — `cluster/sync.go:594-616` —
+  and the public status surfaces expose only cumulative/history
+  data — `cluster/sync.go:191-228`, `cluster/status.go:340-356` —
+  so "peer stable, no in-flight sync" is NOT operator-observable
+  as a predicate): the operator STOPS THE PEER xpfd (or downs
+  the cluster control link `em0`) BEFORE the fence wait — a
+  stopped peer is a deterministic barrier for every peer-driven
+  SyncApply (peer reconnect, promotion, or the 30-second
+  reconciler, `daemon_ha_sync.go:417-430,500-522,926-956`) — and
   waits ONE full pass at the retry loop's CAPPED backoff (the
   `maxBackoff` parameter — debts themselves are raised
   SYNCHRONOUSLY in memory under `s.mu` at the producing
@@ -3437,34 +3485,58 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   after the fence is explicitly ADMITTED in TWO bounded shapes:
   (i) a window whose deadline fires between the re-check and the
   stop (the process-local provenance loss admitted since r29);
-  (ii) a post-re-check peer SyncApply raising a process-local
-  D-kind debt that the stop abandons (r37 Codex M1) — BENIGN by
-  construction: D's target is a DEAD record (its window already
-  resolved — that is what makes it D's target, never W's), so
-  the abandoned debt leaves either an unreadable record that the
-  next boot re-classifies into the SAME terminal latch it came
-  from (the sanctioned live removal remediates — removal is
-  always live-safe) or a readable dead record the seeded-orphan
-  machinery resolves at the next commit — NO live-window replay
-  is possible from an abandoned D. The post-restart
-  recovery path is NAMED AND CORRECTED (r37 Codex M2 + m1, all
-  three verified): the recovered timer re-arms for the record's
-  ORIGINAL REMAINING interval — possibly arbitrarily short, NOT
-  a fresh default window (`store_persist.go:231-253`) — so the
-  operator reads the deadline from the record/journal and acts
-  within it; an inappropriately re-armed window is CONFIRMED
-  away with a BARE `commit` (confirmation cancels the timer,
-  `store_commit.go:729-748,796-823` — NEVER `commit check`,
-  which only validates, `cli_config.go:177-185,257-271`, and
-  NEVER manual record removal, which does NOT cancel the
-  in-memory timer); and the FirstCommit+cluster class has NO
-  service-time escape BY DESIGN — H intercepts the unexpired
-  record before re-arm and reverts it INSIDE `Load` (the
-  recovery invariant), so the operator's remediation for that
-  class is to RE-COMMIT after the revert, not to confirm;
-  the expired-revert inside `Load` is bounded to records whose
-  own deadline had already passed — the semantic the window
-  itself would have produced. The confirm-away path's
+  (ii) a post-barrier peer SyncApply raising a process-local
+  D-kind debt that the stop abandons (r37 Codex M1) — bounded to
+  syncs already in flight BEFORE the peer stop (the peer stop is
+  the barrier; nothing new initiates after it). The abandoned-D
+  outcome is bounded AND the offline repair shape for it is
+  PINNED (r38 Codex M2, verified the conflation: a
+  tombstone-SUCCESS/delete-failure leaves a `Resolved:true`
+  record — dropped at the Resolved-first check — but a
+  tombstone FAILURE leaves the ORIGINAL unreadable pending
+  record, and a PENDING-SHAPED offline repair of that DEAD
+  record can then BIND at the next boot — legacy-empty or
+  same-content `GuardedHash`, `store_persist.go:149-165,171-255`
+  — and replay the RESOLVED window through the recovery total
+  order): the offline repair of a DEAD (D-target, superseded)
+  record is NEVER pending-shaped — the operator either REMOVES
+  the record (always live-safe, offline too) or writes the
+  repair with `Resolved: true` (dropped at the Resolved-first
+  recovery check) — a pending-shaped repair of a dead record is
+  explicitly FORBIDDEN in the runbook. The post-restart
+  recovery path is NAMED AND CORRECTED TWICE (r37 Codex M2 + m1
+  and r38 Codex M3/M4, all verified): the cases SPLIT on the
+  record's deadline at restart — (FUTURE/still-pending) the
+  recovered timer re-arms for the record's ORIGINAL REMAINING
+  interval — possibly arbitrarily short, NOT a fresh default
+  window (`store_persist.go:231-253`) — and the operator
+  CONFIRMS AWAY with a BARE `commit` within it (confirmation
+  cancels the timer, `store_commit.go:729-748,796-823` — NEVER
+  `commit check`, which only validates,
+  `cli_config.go:177-185,257-271`, and NEVER manual record
+  removal, which does NOT cancel the in-memory timer);
+  (EXPIRED/already-reverted) `Load` has ALREADY reverted inside
+  the boot (the expired path, `store_persist.go:171-228`) —
+  there is NO pending window to confirm (bare `commit` returns
+  "no pending confirmed commit", `store_commit.go:729-746`) —
+  the operator restores the intended configuration by
+  RE-COMMITTING it, not by confirming; and the
+  FirstCommit+cluster class has NO live escape BY DESIGN — H
+  intercepts the unexpired record before re-arm and reverts it
+  INSIDE `Load` (the recovery invariant), and a subsequent
+  CLUSTERED commit is REJECTED live because H leaves no cluster
+  runtime (`daemon_apply_commit.go:194-205`,
+  `cluster_topology_preflight.go:59-97` — the HA runtime is
+  boot-only-constructed): the supported recovery is the
+  preflight's OWN named path — restart xpfd INTO the clustered
+  configuration (the `xpf.conf` boot import re-imports the seed
+  and commits it on the normal day-0 path,
+  `bootstrapFromFile`), or an offline seed-and-restart. The
+  deadline's operator surface is PINNED (r38 Codex m1): the
+  audit journal carries no deadline field (`journal.go:59-80`)
+  and confirm.json may be encrypted (`db.go:199-216`) — the
+  remaining interval is read from the startup journald log line
+  (`store_persist.go:254-255`). The confirm-away path's
   availability is consistent with the commit refusal by
   construction (re-arm follows a CLEAN `Load` — healthy key
   state, not write-unverified — so the bare `commit` is admitted
@@ -5301,23 +5373,32 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      is safe LIVE (the probe's confirmed-absence barrier is
      idempotent), repair-to-valid FILESYSTEM remediation requires
      xpfd STOPPED with the MANDATORY `mask == 0` precondition
-     EXPLICIT and FENCED (the r36/r37 producer-quiesce protocol:
+     EXPLICIT and FENCED (the r36-r38 producer-quiesce protocol:
      (1) no live commit-confirmed window stands, (2) refrain
-     from commits, verify CLUSTER-SYNC QUIESCENCE (peer stable,
-     no in-flight config sync — peer-driven SyncApply is the
-     async producer), and wait ONE full pass at the loop's
+     from commits and FENCE the async producer ENFORCEABLY —
+     STOP THE PEER xpfd (or down `em0`): the SyncApply apply
+     flag/queue are private (`cluster/sync.go:594-616`) and the
+     public surfaces expose only cumulative/history data, so an
+     observable predicate cannot fence peer-driven syncs — and
+     wait ONE full pass at the loop's
      CAPPED backoff, (3) RE-CHECK
      `mask == 0`, (4) stop and repair — a debt raised mid-wait
      shows at the re-check; the blind-spot residuals are admitted
      and bounded: a mid-fence window deadline (the r29
-     provenance loss) corrected by a BARE `commit` confirmation
-     post-restart (NEVER `commit check` — it only validates;
-     NEVER manual removal — it does not cancel the in-memory
-     timer; the FirstCommit+cluster class reverts INSIDE `Load`
-     and is RE-COMMITTED after), and a post-re-check SyncApply
-     D-abandonment, BENIGN by construction — D's target is a
-     DEAD record, re-classified at the next boot into the same
-     terminal latch or seeded-orphan-resolved),
+     provenance loss) SPLIT by deadline at restart — still-
+     pending → CONFIRM AWAY with a BARE `commit` (cancels the
+     timer; NEVER `commit check` — it only validates; NEVER
+     manual removal — it does not cancel the in-memory timer);
+     already-expired → `Load` already reverted, so RE-COMMIT the
+     intended config; the FirstCommit+cluster class reverts
+     INSIDE `Load` and recovers via the preflight's own named
+     path (restart xpfd INTO the clustered configuration / the
+     `xpf.conf` boot import — a live CLUSTERED commit is
+     rejected with no runtime), and a post-barrier SyncApply
+     D-abandonment whose offline repair is NEVER pending-shaped
+     (a DEAD record repaired pending-shaped can BIND and replay
+     the resolved window — the operator REMOVES it or writes
+     `Resolved: true`),
      and every
      content-INDEPENDENT repair write
      RE-VERIFIES the target's classification inside the SAME
@@ -5394,7 +5475,7 @@ the full Go/Rust suites, smoke) run for BOTH units.*
   past the next boot; the lifecycle redesign is a pre-existing policy
   question, not a `d.dp` publication concern.
 
-## 11. Open questions for adversarial review (r38)
+## 11. Open questions for adversarial review (r39)
 
 Resolved in v2-v9 (for the record): A2 deletion; atomic cell choice;
 sampler-only adapter — now STRUCTURAL via `CachedStatusProvider`;

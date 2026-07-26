@@ -116,6 +116,9 @@ reviewer (joins at /engineer on the code PR).
 | r37 | Codex | codex companion task-ms22y3m4-bidkyu (session 019f9f80-1365-72a1-896b-dd32481233e3) | NEEDS-REVISION (2 MAJOR, 2 MINOR; folds 2 FOLDED / 1 NOT-FOLDED). Structure confirmed |
 | r37 | AGY | agy print-mode direct (agy-plan-r37.md) | PLAN-READY (3/3 folds FOLDED; 2 fresh attacks FAILED). Structure confirmed |
 | r37 | Claude SMR | in-conversation (claude-smr-plan-r37.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — capped-backoff wait pin, folded into Codex M1). Structure confirmed |
+| r38 | Codex | codex companion task-ms23q2tu-8exsvf (session 019f9f93-feb3-71f2-ab29-9405df34aaf1) | NEEDS-REVISION (4 MAJOR, 1 MINOR; folds 1 FOLDED / 2 NOT-FOLDED). Structure confirmed |
+| r38 | AGY | agy print-mode direct (agy-plan-r38.md) | PLAN-READY (3/3 folds FOLDED; 2 fresh attacks FAILED). Structure confirmed |
+| r38 | Claude SMR | in-conversation (claude-smr-plan-r38.md) | PLAN-READY (0 MAJOR, 0 MINOR; 3 fresh attacks). Structure confirmed |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 
