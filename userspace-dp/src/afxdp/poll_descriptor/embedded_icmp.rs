@@ -118,6 +118,16 @@ pub(super) fn try_reverse_embedded_icmp_error(
         &icmp_match,
     );
     let rewritten = match meta.addr_family as i32 {
+        // #6474: an OUTBOUND error through source NAT takes the re-NAT
+        // builders (external outer source + associable quote), never the
+        // #5690 reversal (which would leak the internal source and leave
+        // the quote in pre-NAT form).
+        libc::AF_INET if icmp_match.outbound_snat => {
+            build_snat_outbound_icmp_error_v4(raw_frame, meta, &icmp_match)
+        }
+        libc::AF_INET6 if icmp_match.outbound_snat => {
+            build_snat_outbound_icmp_error_v6(raw_frame, meta, &icmp_match)
+        }
         libc::AF_INET => build_nat_reversed_icmp_error_v4(raw_frame, meta, &icmp_match),
         libc::AF_INET6 => build_nat_reversed_icmp_error_v6(raw_frame, meta, &icmp_match),
         _ => None,

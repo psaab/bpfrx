@@ -612,6 +612,7 @@ pub(super) fn icmpv6_te_match_fixture(
             policy_counter_idx: 0,
             policy_counter: None,
         },
+        outbound_snat: false,
     }
 }
 

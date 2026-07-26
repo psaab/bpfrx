@@ -1,3 +1,53 @@
+## 2026-07-26 — #6474: re-NAT outbound ICMP errors through source NAT
+
+- **Timestamp**: 2026-07-26 (fix/6474-snat-outbound-icmp-error, stacked on
+  fix/6472-nat64-icmp-error-translation)
+- **Action**: An internal host behind SNAT that emits an ICMP error about
+  the session's REPLY (e.g. a port-unreachable for a closed socket) quotes
+  the PRE-NAT tuple, so the quote's reply key EQUALS the forward session's
+  primary key and the #5690 session-fallback matched with
+  `is_reverse == false`. The #5690 builders only rewrote the outer source
+  under `had_dst_nat`, so the error went out with the INTERNAL (pre-NAT)
+  source on the wire and a quote the remote cannot associate (RFC 5508 §4)
+  — and the reversal consumed the descriptor so it could not fall through
+  to clean untranslated forwarding. The fallback arms in
+  `icmp_embed/nat_match_{v4,v6}` now map the as-is and reply-key lookups
+  separately and mark a reply-key hit with `is_reverse == false` on a pure
+  source-NAT flow (`rewrite_src` set, no dst NAT) as
+  `EmbeddedIcmpMatch.outbound_snat`. `try_reverse_embedded_icmp_error`
+  routes marked matches to the new
+  `build_snat_outbound_icmp_error_{v4,v6}` builders, which rewrite the
+  outer source to the SNAT address, the embedded quote's destination
+  address to the SNAT address, and the quote's L4 destination port / echo
+  identifier to the translated value (`rewrite_src_port`), recomputing the
+  outer IP + ICMP checksums and the embedded IP header checksum (the
+  quoted L4 checksum stays informational, mirroring the #5690 policy). A
+  DNAT-carrying or no-NAT flow keeps the pre-#6474 behavior bit-for-bit
+  (marker gated on `rewrite_dst.is_none()`); an error quoting the REPLY
+  wire tuple (as-is hit, `is_reverse == true`) was already declined by the
+  historical `rewrite_src.is_none()` gate into clean untranslated flowless
+  forwarding — verified during analysis, no code change needed there.
+  `EmbeddedIcmpMatch` gained the `outbound_snat` field; all constructor
+  sites (2 match arms x 2 families + test fixtures) updated.
+- **Validation**: full cargo suite GREEN (4210 bin + 60 + 8 + 22 + 1,
+  --test-threads=1). Fail-on-revert: `poll_descriptor_snat_outbound_icmp_
+  error_renat_{v4,v6}_6474` (outbound dest-unreach via SNAT → wire shows
+  the EXTERNAL source + a quote the remote associates: outer src = SNAT
+  address, embedded dst addr/port translated, all checksums verified by
+  oracle) and `embedded_icmp_outbound_snat_marker_scoping_6474` (marker
+  scoping: pure-SNAT marks, DNAT-only does not, inbound never does) all go
+  RED with the marker forced off (recreating the pre-#6474 identity
+  consume). The existing #5690 inbound tests and the #6472 NAT64 tests
+  stay GREEN.
+- **File(s)**: userspace-dp/src/afxdp/icmp_embed/{mod.rs,builders.rs,
+  nat_match_v4.rs,nat_match_v6.rs},
+  userspace-dp/src/afxdp/poll_descriptor/embedded_icmp.rs,
+  userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/tests_embedded_poll_filter.rs,
+  userspace-dp/src/afxdp/{tests_support.rs,tests_icmp_reject_reversal.rs,
+  forwarding/tests.rs} (constructor field),
+  userspace-dp/src/afxdp/README.md, _Log.md
+
 ## 2026-07-26 — #6472: NAT64 ICMP error translation on the flowless arm
 
 - **Timestamp**: 2026-07-26 (fix/6472-nat64-icmp-error-translation)

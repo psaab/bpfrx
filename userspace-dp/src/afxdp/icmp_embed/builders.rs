@@ -325,6 +325,227 @@ pub(in crate::afxdp::icmp_embed) fn build_nat_reversed_icmp_error_v6(
     Some(out)
 }
 
+/// #6474: rewrite an OUTBOUND IPv4 ICMP error through source NAT so the
+/// wire carries the session's EXTERNAL identity (RFC 5508 §4). The
+/// internal host emitted the error about the session's reply, so the
+/// frame arrives with the PRE-NAT source and a quote the remote cannot
+/// associate. Rewrites (everything else preserved):
+///   * outer source → the SNAT address (`nat.rewrite_src`), outer IPv4
+///     header checksum recomputed;
+///   * embedded (quoted) destination address → the SNAT address, embedded
+///     IPv4 header checksum recomputed;
+///   * embedded L4 destination port / echo identifier → the translated
+///     value (`nat.rewrite_src_port`), the tuple the remote replied to;
+///   * outer ICMP checksum recomputed over the whole message.
+/// The quoted L4 checksum is left unchanged (informational — a receiver
+/// does not validate it), mirroring the #5690 reversed builders' policy.
+/// The outer destination and the quote's source are untouched — the
+/// error is addressed to the remote server, which is exactly who must
+/// associate it.
+pub(in crate::afxdp::icmp_embed) fn build_snat_outbound_icmp_error_v4(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    icmp_match: &EmbeddedIcmpMatch,
+) -> Option<Vec<u8>> {
+    let l3 = meta.l3_offset as usize;
+    let l4 = meta.l4_offset as usize;
+    if l3 >= frame.len() || l4 >= frame.len() || l3 >= l4 {
+        return None;
+    }
+    let packet = frame.get(l3..)?;
+    if packet.len() < 20 {
+        return None;
+    }
+    let ihl = ((packet[0] & 0x0f) as usize) * 4;
+    if ihl < 20 || packet.len() < ihl + 8 {
+        return None;
+    }
+    let snat_ip = match icmp_match.nat.rewrite_src {
+        Some(IpAddr::V4(v4)) => v4,
+        _ => return None,
+    };
+    let dst_mac = icmp_match.resolution.neighbor_mac?;
+    let src_mac = icmp_match.resolution.src_mac?;
+    let vlan_id = icmp_match.resolution.tx_vlan_id;
+
+    let ip_total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    let payload = if ip_total_len > 0 && ip_total_len < packet.len() {
+        &packet[..ip_total_len]
+    } else {
+        packet
+    };
+
+    let out_eth_len = if vlan_id > 0 { 18 } else { 14 };
+    let mut out = vec![0u8; out_eth_len + payload.len()];
+    write_eth_header_slice(
+        out.get_mut(..out_eth_len)?,
+        dst_mac,
+        src_mac,
+        vlan_id,
+        0x0800,
+    )?;
+    out.get_mut(out_eth_len..)?.copy_from_slice(payload);
+
+    let pkt = &mut out[out_eth_len..];
+
+    // Outer source → the SNAT (external) address.
+    pkt.get_mut(12..16)?.copy_from_slice(&snat_ip.octets());
+
+    let icmp_offset = ihl;
+    let emb_ip_offset = icmp_offset + 8;
+    if pkt.len() < emb_ip_offset + 20 {
+        return None;
+    }
+    let emb_ihl = ((pkt[emb_ip_offset] & 0x0f) as usize) * 4;
+    if emb_ihl < 20 || pkt.len() < emb_ip_offset + emb_ihl {
+        return None;
+    }
+
+    // Embedded destination → the SNAT address (the quote's destination is
+    // the pre-NAT internal host; the remote only knows the pool identity).
+    pkt.get_mut(emb_ip_offset + 16..emb_ip_offset + 20)?
+        .copy_from_slice(&snat_ip.octets());
+
+    {
+        pkt.get_mut(emb_ip_offset + 10..emb_ip_offset + 12)?
+            .copy_from_slice(&[0, 0]);
+        let emb_ip_header = pkt.get(emb_ip_offset..emb_ip_offset + emb_ihl)?;
+        let csum = checksum16(emb_ip_header);
+        pkt.get_mut(emb_ip_offset + 10..emb_ip_offset + 12)?
+            .copy_from_slice(&csum.to_be_bytes());
+    }
+
+    // Embedded L4 destination port / echo identifier → the translated
+    // value. Same non-first-fragment guard as the #5690 builder (#1852):
+    // a quoted non-first fragment has no L4 header to rewrite.
+    let emb_l4_offset = emb_ip_offset + emb_ihl;
+    let emb_frag_off =
+        u16::from_be_bytes([pkt[emb_ip_offset + 6], pkt[emb_ip_offset + 7]]);
+    let emb_non_first_fragment = (emb_frag_off & 0x1FFF) != 0;
+    if !emb_non_first_fragment && icmp_match.nat.rewrite_src_port.is_some() {
+        let xlated = icmp_match.nat.rewrite_src_port?;
+        let emb_proto = icmp_match.embedded_proto;
+        if matches!(emb_proto, PROTO_TCP | PROTO_UDP) && pkt.len() >= emb_l4_offset + 4 {
+            pkt.get_mut(emb_l4_offset + 2..emb_l4_offset + 4)?
+                .copy_from_slice(&xlated.to_be_bytes());
+        } else if emb_proto == PROTO_ICMP && pkt.len() >= emb_l4_offset + 6 {
+            pkt.get_mut(emb_l4_offset + 4..emb_l4_offset + 6)?
+                .copy_from_slice(&xlated.to_be_bytes());
+        }
+    }
+
+    pkt.get_mut(icmp_offset + 2..icmp_offset + 4)?
+        .copy_from_slice(&[0, 0]);
+    let icmp_data = pkt.get(icmp_offset..)?;
+    let icmp_csum = checksum16(icmp_data);
+    pkt.get_mut(icmp_offset + 2..icmp_offset + 4)?
+        .copy_from_slice(&icmp_csum.to_be_bytes());
+
+    pkt.get_mut(10..12)?.copy_from_slice(&[0, 0]);
+    let ip_header = pkt.get(..ihl)?;
+    let ip_csum = checksum16(ip_header);
+    pkt.get_mut(10..12)?.copy_from_slice(&ip_csum.to_be_bytes());
+
+    Some(out)
+}
+
+/// #6474: IPv6 twin of [`build_snat_outbound_icmp_error_v4`] — an OUTBOUND
+/// ICMPv6 error through SNAT66/NPTv6 leaves with the session's external
+/// identity: outer source → the translated source, embedded destination →
+/// the translated source, embedded L4 destination port / echo identifier →
+/// `nat.rewrite_src_port`, outer ICMPv6 checksum recomputed with the
+/// pseudo-header (canonicalizing a computed 0x0000 to 0xFFFF, same as the
+/// #5690 v6 builder).
+pub(in crate::afxdp::icmp_embed) fn build_snat_outbound_icmp_error_v6(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    icmp_match: &EmbeddedIcmpMatch,
+) -> Option<Vec<u8>> {
+    let l3 = meta.l3_offset as usize;
+    let l4 = meta.l4_offset as usize;
+    if l3 >= frame.len() || l4 >= frame.len() || l3 >= l4 {
+        return None;
+    }
+    let packet = frame.get(l3..)?;
+    if packet.len() < 40 {
+        return None;
+    }
+    let snat_bytes = match icmp_match.nat.rewrite_src {
+        Some(IpAddr::V6(v6)) => v6.octets(),
+        _ => return None,
+    };
+    let dst_mac = icmp_match.resolution.neighbor_mac?;
+    let src_mac = icmp_match.resolution.src_mac?;
+    let vlan_id = icmp_match.resolution.tx_vlan_id;
+
+    let ipv6_payload_len = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+    let ip6_total = 40 + ipv6_payload_len;
+    let payload = if ip6_total > 0 && ip6_total < packet.len() {
+        &packet[..ip6_total]
+    } else {
+        packet
+    };
+
+    let out_eth_len = if vlan_id > 0 { 18 } else { 14 };
+    let mut out = vec![0u8; out_eth_len + payload.len()];
+    write_eth_header_slice(
+        out.get_mut(..out_eth_len)?,
+        dst_mac,
+        src_mac,
+        vlan_id,
+        0x86dd,
+    )?;
+    out.get_mut(out_eth_len..)?.copy_from_slice(payload);
+
+    let pkt = &mut out[out_eth_len..];
+
+    // Outer source → the translated (external) source.
+    pkt.get_mut(8..24)?.copy_from_slice(&snat_bytes);
+
+    // Outer ICMPv6 offset: ext-aware via the shared #1838 helper (same
+    // reasoning as the #5690 v6 builder).
+    let icmp_offset = v6_rel_l4_offset(pkt, meta.l3_offset, meta.l4_offset, meta.addr_family)?;
+    let emb_ip_offset = icmp_offset.checked_add(8)?;
+    if pkt.len() < emb_ip_offset + 40 {
+        return None;
+    }
+
+    // Embedded destination → the translated source.
+    pkt.get_mut(emb_ip_offset + 24..emb_ip_offset + 40)?
+        .copy_from_slice(&snat_bytes);
+
+    // Embedded L4 destination port / echo identifier → the translated
+    // value; fragment-aware via the shared walker (a quoted non-first
+    // fragment has no L4 header).
+    let emb_l4 = parse_embedded_v6_l4(pkt.get(emb_ip_offset..)?);
+    if icmp_match.nat.rewrite_src_port.is_some()
+        && let Some((emb_rel_l4, _)) = emb_l4
+    {
+        let xlated = icmp_match.nat.rewrite_src_port?;
+        let emb_l4_offset = emb_ip_offset.checked_add(emb_rel_l4)?;
+        let emb_proto = icmp_match.embedded_proto;
+        if matches!(emb_proto, PROTO_TCP | PROTO_UDP) && pkt.len() >= emb_l4_offset + 4 {
+            pkt.get_mut(emb_l4_offset + 2..emb_l4_offset + 4)?
+                .copy_from_slice(&xlated.to_be_bytes());
+        } else if emb_proto == PROTO_ICMPV6 && pkt.len() >= emb_l4_offset + 6 {
+            pkt.get_mut(emb_l4_offset + 4..emb_l4_offset + 6)?
+                .copy_from_slice(&xlated.to_be_bytes());
+        }
+    }
+
+    pkt.get_mut(icmp_offset + 2..icmp_offset + 4)?
+        .copy_from_slice(&[0, 0]);
+    let src_v6 = Ipv6Addr::from(<[u8; 16]>::try_from(pkt.get(8..24)?).ok()?);
+    let dst_v6 = Ipv6Addr::from(<[u8; 16]>::try_from(pkt.get(24..40)?).ok()?);
+    let icmp6_data = pkt.get(icmp_offset..)?;
+    let icmp6_csum = checksum16_ipv6(src_v6, dst_v6, PROTO_ICMPV6, icmp6_data);
+    let icmp6_csum = if icmp6_csum == 0 { 0xffff } else { icmp6_csum };
+    pkt.get_mut(icmp_offset + 2..icmp_offset + 4)?
+        .copy_from_slice(&icmp6_csum.to_be_bytes());
+
+    Some(out)
+}
+
 /// Finalize the forwarding resolution attached to an embedded ICMP
 /// match — enforce HA disposition, then re-redirect via fabric if the
 /// local resolution turned into HAInactive/NoRoute/DiscardRoute.

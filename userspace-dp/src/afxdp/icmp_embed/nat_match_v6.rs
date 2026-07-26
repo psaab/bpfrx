@@ -91,12 +91,22 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v6(
             embedded_proto: hdr.proto,
             resolution,
             metadata: fwd.metadata,
+            outbound_snat: false,
         });
     }
 
     // Session-fallback path. Inside .or_else we build a SECOND reverse
     // key — this time using the TRANSLATED emb_src_lookup, mirroring
     // icmp_embed.rs:412-419 (shared_reverse_key).
+    //
+    // #6474: the two lookups are mapped SEPARATELY (the v4 twin of
+    // `nat_match_v4`): a reply-key hit with `is_reverse == false` on a pure
+    // source-NAT (SNAT66/NPTv6) flow is an OUTBOUND error from the internal
+    // host about the session's reply — marked `outbound_snat` so the
+    // caller re-NATs the outer source and the quote to the session's
+    // external identity (RFC 5508 §4) instead of leaking the internal
+    // source with an unassociable quote. Every other combination keeps the
+    // pre-#6474 behavior bit-for-bit.
     lookup_session_across_scopes(
         ctx.sessions,
         ctx.shared_sessions,
@@ -105,6 +115,7 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v6(
         now_ns,
         0,
     )
+    .map(|resolved| (resolved, false))
     .or_else(|| {
         let shared_reverse_key = embedded_reply_key(
             libc::AF_INET6 as u8,
@@ -122,8 +133,9 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v6(
             now_ns,
             0,
         )
+        .map(|resolved| (resolved, true))
     })
-    .map(|resolved| {
+    .map(|(resolved, via_reply_key)| {
         let sl = resolved.lookup;
         let resolution = if sl.metadata.is_reverse {
             sl.decision.resolution
@@ -136,6 +148,10 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v6(
                 now_ns,
             )
         };
+        let outbound_snat = via_reply_key
+            && !sl.metadata.is_reverse
+            && sl.decision.nat.rewrite_src.is_some()
+            && sl.decision.nat.rewrite_dst.is_none();
         EmbeddedIcmpMatch {
             nat: sl.decision.nat,
             original_src: emb_src_lookup,
@@ -147,6 +163,7 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v6(
             embedded_proto: hdr.proto,
             resolution,
             metadata: sl.metadata,
+            outbound_snat,
         }
     })
 }

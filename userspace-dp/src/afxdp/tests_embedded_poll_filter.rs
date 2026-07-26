@@ -1228,6 +1228,418 @@ fn poll_descriptor_same_family_reversal_not_stolen_by_nat64_arm_6472() {
     assert_eq!(fwd.target_ifindex, 24);
 }
 
+// ---------------------------------------------------------------------------
+// #6474: OUTBOUND ICMP error through source NAT — re-NAT the outer source
+// and the embedded quote to the session's external identity (RFC 5508 §4).
+// ---------------------------------------------------------------------------
+
+/// Install the outbound SNAT forward session the #6474 fixtures share:
+/// `client:12345 -> server:80` source-NAT'd to `snat:40000`. The session's
+/// own decision resolution is irrelevant to the error path (the return
+/// resolution toward the server is re-derived), so it points WAN.
+fn n6474_install_snat_session(
+    sessions: &mut SessionTable,
+    client_ip: IpAddr,
+    server_ip: IpAddr,
+    snat_ip: IpAddr,
+    addr_family: u8,
+) {
+    assert!(sessions.install_with_protocol(
+        SessionKey {
+            addr_family,
+            protocol: PROTO_TCP,
+            src_ip: client_ip,
+            dst_ip: server_ip,
+            src_port: 12345,
+            dst_port: 80,
+        },
+        SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 12,
+                tunnel_endpoint_id: 0,
+                next_hop: None,
+                neighbor_mac: Some(N6472_WAN_GW_MAC),
+                src_mac: Some(N6472_WAN_SRC_MAC),
+                tx_vlan_id: 80,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(snat_ip),
+                rewrite_dst: None,
+                rewrite_src_port: Some(40000),
+                rewrite_dst_port: None,
+                nat64: false,
+                nptv6: false,
+            },
+        },
+        SessionMetadata {
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
+            owner_rg_id: 0,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
+            policy_id: 0,
+            inactivity_timeout_ns: None,
+            policy_counter_idx: 0,
+            policy_counter: None,
+        },
+        123_000_000_000,
+        PROTO_TCP,
+        0x18,
+    ));
+}
+
+fn n6474_meta(ingress_ifindex: u32, addr_family: u8, protocol: u8, frame_len: usize) -> UserspaceDpMeta {
+    let (l4, payload) = if addr_family == libc::AF_INET6 as u8 {
+        (54u16, 62u16)
+    } else {
+        (34u16, 42u16)
+    };
+    UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex,
+        l3_offset: 14,
+        l4_offset: l4,
+        payload_offset: payload,
+        pkt_len: (frame_len - 14) as u16,
+        addr_family,
+        protocol,
+        tcp_flags: 0,
+        dscp: 0,
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    }
+}
+
+/// #6474 FAIL-ON-REVERT (v4, RFC 5508 §4): an internal host behind SNAT
+/// emits an ICMP Destination-Unreachable about the session's reply — outer
+/// `10.0.61.102 -> 1.1.1.1`, quote `(1.1.1.1:80 -> 10.0.61.102:12345)`.
+/// Before #6474 the #5690 flowless reversal consumed the descriptor with an
+/// identity rewrite: the wire showed the INTERNAL (pre-NAT) source and a
+/// quote in pre-NAT form the server cannot associate (its socket knows only
+/// `172.16.80.8:40000`). Now the outbound arm re-NATs it: outer source →
+/// the SNAT address, quote destination address → the SNAT address, quote
+/// destination port → the translated 40000, every affected checksum
+/// recomputed. RED on revert: every external-identity assertion below
+/// fails (the old frame keeps the internal source + pre-NAT quote).
+#[test]
+fn poll_descriptor_snat_outbound_icmp_error_renat_v4_6474() {
+    let client_ip = Ipv4Addr::new(10, 0, 61, 102);
+    let server_ip = Ipv4Addr::new(1, 1, 1, 1);
+    let snat_ip = Ipv4Addr::new(172, 16, 80, 8);
+
+    // Outer (client -> server); embedded quote (server:80 -> client:12345).
+    let mut frame = build_icmp_te_frame_v4(client_ip, server_ip, client_ip, 80, 12345, PROTO_TCP);
+    // Destination Unreachable / port-unreachable (3/3): the natural error a
+    // host emits about a reply it cannot handle.
+    frame[34] = 3;
+    frame[35] = 3;
+    frame[36] = 0;
+    frame[37] = 0;
+    let icmp_csum = checksum16(&frame[34..]);
+    frame[36..38].copy_from_slice(&icmp_csum.to_be_bytes());
+
+    let mut snapshot = nat_snapshot();
+    snapshot.flow.allow_embedded_icmp = true;
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    n6474_install_snat_session(
+        &mut sessions,
+        IpAddr::V4(client_ip),
+        IpAddr::V4(server_ip),
+        IpAddr::V4(snat_ip),
+        libc::AF_INET as u8,
+    );
+    let sessions_before = sessions.len();
+
+    let meta = n6474_meta(24, libc::AF_INET as u8, PROTO_ICMP, frame.len());
+    txn_run_descriptor(&mut binding, &mut sessions, &forwarding, &ha_state, &frame, meta);
+
+    assert_eq!(
+        binding.scratch.scratch_forwards.len(),
+        1,
+        "the outbound SNAT ICMP error must be re-NAT'd and queued as one prebuilt forward"
+    );
+    let fwd = &binding.scratch.scratch_forwards[0];
+    let out = match &fwd.frame {
+        PendingForwardFrame::Prebuilt(bytes) => bytes,
+        _ => panic!("the outbound re-NAT must queue a PREBUILT frame"),
+    };
+    // L2 toward the WAN gateway (default route), VLAN 80 tagged.
+    assert_eq!(&out[0..6], &N6472_WAN_GW_MAC, "eth dst = WAN gateway");
+    assert_eq!(&out[16..18], &[0x08, 0x00], "ethertype IPv4 after the VLAN tag");
+    let ip = &out[18..];
+    // THE defect fix: the outer source is the EXTERNAL SNAT address, never
+    // the internal client address (the pre-#6474 leak).
+    assert_eq!(&ip[12..16], &snat_ip.octets(), "outer src re-NAT'd to the SNAT address");
+    assert_eq!(&ip[16..20], &server_ip.octets(), "outer dst untouched (the remote)");
+    assert_eq!(checksum16(&ip[..20]), 0, "outer IPv4 header checksum verifies");
+    // ICMP header: type/code preserved, checksum valid.
+    let icmp = &ip[20..];
+    assert_eq!(icmp[0], 3, "stays Destination Unreachable");
+    assert_eq!(icmp[1], 3, "stays port-unreachable");
+    assert_eq!(checksum16(icmp), 0, "outer ICMP checksum verifies");
+    // Embedded quote: destination address + port re-NAT'd to the external
+    // identity the server associates; source (the server) untouched.
+    let emb = &icmp[8..];
+    assert_eq!(&emb[12..16], &server_ip.octets(), "embedded src untouched (server)");
+    assert_eq!(
+        &emb[16..20],
+        &snat_ip.octets(),
+        "embedded dst re-NAT'd to the SNAT address"
+    );
+    assert_eq!(checksum16(&emb[..20]), 0, "embedded IPv4 header checksum verifies");
+    assert_eq!(&emb[20..22], &80u16.to_be_bytes(), "embedded src port untouched");
+    assert_eq!(
+        &emb[22..24],
+        &40000u16.to_be_bytes(),
+        "embedded dst port re-NAT'd to the translated value"
+    );
+    assert!(
+        matches!(fwd.target_ifindex, 11 | 12),
+        "re-NAT'd error egresses toward the server (WAN unit reth0.80 / its parent)"
+    );
+    assert!(fwd.flow_key.is_none());
+    assert_eq!(sessions.len(), sessions_before, "no new session minted");
+}
+
+/// #6474 FAIL-ON-REVERT (v6): the SNAT66 twin — an internal v6 host emits
+/// an ICMPv6 Destination-Unreachable about the session's reply; the wire
+/// must carry the translated external source and the quote the v6 server
+/// associates (RFC 5508 §4 via the same session machinery).
+#[test]
+fn poll_descriptor_snat_outbound_icmp_error_renat_v6_6474() {
+    let client_v6: Ipv6Addr = "2001:559:8585:ef00::102".parse().expect("client v6");
+    let server_v6: Ipv6Addr = "2001:db8::1".parse().expect("server v6");
+    let snat_v6: Ipv6Addr = "2001:559:8585:80::8".parse().expect("snat v6 (reth0.80)");
+
+    // Outer (client -> server); embedded quote (server:80 -> client:12345).
+    let mut frame = build_icmpv6_te_frame(client_v6, server_v6, client_v6, 80, 12345, PROTO_TCP);
+    // Destination Unreachable / port-unreachable (1/4).
+    let l4 = 54;
+    frame[l4] = 1;
+    frame[l4 + 1] = 4;
+    frame[l4 + 2] = 0;
+    frame[l4 + 3] = 0;
+    let icmp6_csum = checksum16_ipv6(client_v6, server_v6, PROTO_ICMPV6, &frame[l4..]);
+    frame[l4 + 2..l4 + 4].copy_from_slice(&icmp6_csum.to_be_bytes());
+
+    let mut snapshot = nat_snapshot();
+    snapshot.flow.allow_embedded_icmp = true;
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    n6474_install_snat_session(
+        &mut sessions,
+        IpAddr::V6(client_v6),
+        IpAddr::V6(server_v6),
+        IpAddr::V6(snat_v6),
+        libc::AF_INET6 as u8,
+    );
+
+    let meta = n6474_meta(24, libc::AF_INET6 as u8, PROTO_ICMPV6, frame.len());
+    txn_run_descriptor(&mut binding, &mut sessions, &forwarding, &ha_state, &frame, meta);
+
+    assert_eq!(
+        binding.scratch.scratch_forwards.len(),
+        1,
+        "the outbound SNAT66 ICMPv6 error must be re-NAT'd and queued as one prebuilt forward"
+    );
+    let fwd = &binding.scratch.scratch_forwards[0];
+    let out = match &fwd.frame {
+        PendingForwardFrame::Prebuilt(bytes) => bytes,
+        _ => panic!("the outbound re-NAT must queue a PREBUILT frame"),
+    };
+    assert_eq!(&out[12..14], &[0x81, 0x00], "VLAN tag (reth0.80) present");
+    assert_eq!(&out[16..18], &[0x86, 0xdd], "ethertype IPv6 after the tag");
+    let ip = &out[18..];
+    assert_eq!(&ip[8..24], &snat_v6.octets(), "outer src re-NAT'd to the SNAT66 address");
+    assert_eq!(&ip[24..40], &server_v6.octets(), "outer dst untouched (the remote)");
+    let icmp = &ip[40..];
+    assert_eq!(icmp[0], 1, "stays Destination Unreachable");
+    assert_eq!(icmp[1], 4, "stays port-unreachable");
+    // Embedded quote: dst addr + dst port re-NAT'd; ICMPv6 checksum verifies.
+    let emb = &icmp[8..];
+    assert_eq!(&emb[8..24], &server_v6.octets(), "embedded src untouched (server)");
+    assert_eq!(
+        &emb[24..40],
+        &snat_v6.octets(),
+        "embedded dst re-NAT'd to the SNAT66 address"
+    );
+    assert_eq!(&emb[40..42], &80u16.to_be_bytes(), "embedded src port untouched");
+    assert_eq!(
+        &emb[42..44],
+        &40000u16.to_be_bytes(),
+        "embedded dst port re-NAT'd to the translated value"
+    );
+    let s6 = Ipv6Addr::from(<[u8; 16]>::try_from(&ip[8..24]).unwrap());
+    let d6 = Ipv6Addr::from(<[u8; 16]>::try_from(&ip[24..40]).unwrap());
+    assert_eq!(
+        checksum16_ipv6(s6, d6, PROTO_ICMPV6, icmp),
+        0,
+        "outer ICMPv6 checksum verifies"
+    );
+    assert!(
+        matches!(fwd.target_ifindex, 11 | 12),
+        "re-NAT'd error egresses toward the server (WAN unit reth0.80 / its parent)"
+    );
+    assert!(fwd.flow_key.is_none());
+}
+
+/// #6474 marker pin (match level): the OUTBOUND mark fires ONLY for a pure
+/// source-NAT flow (rewrite_src set, no dst NAT) matched via the quote's
+/// reply key. A DNAT-only flow's outbound-direction error keeps the
+/// pre-#6474 identity (`outbound_snat == false`), and the #5690 inbound
+/// matches never carry the mark.
+#[test]
+fn embedded_icmp_outbound_snat_marker_scoping_6474() {
+    let client_ip = Ipv4Addr::new(10, 0, 61, 102);
+    let server_ip = Ipv4Addr::new(1, 1, 1, 1);
+    let snat_ip = Ipv4Addr::new(172, 16, 80, 8);
+    let meta = icmp_err_meta_v4();
+    let forwarding = build_forwarding_state(&nat_snapshot());
+    let neighbors = Arc::new(ShardedNeighborMap::new());
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+
+    // (a) pure SNAT: outbound error marks true.
+    let mut sessions = SessionTable::new();
+    n6474_install_snat_session(
+        &mut sessions,
+        IpAddr::V4(client_ip),
+        IpAddr::V4(server_ip),
+        IpAddr::V4(snat_ip),
+        libc::AF_INET as u8,
+    );
+    let frame = build_icmp_te_frame_v4(client_ip, server_ip, client_ip, 80, 12345, PROTO_TCP);
+    let m = try_embedded_icmp_nat_match_from_frame(
+        &frame,
+        meta,
+        &mut sessions,
+        &forwarding,
+        &neighbors,
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        1_000_000,
+    )
+    .expect("outbound error matches the forward SNAT session");
+    assert!(m.outbound_snat, "pure-SNAT outbound error must carry the re-NAT mark");
+
+    // (b) DNAT-only: the mark stays off (pre-#6474 behavior preserved).
+    let mut sessions = SessionTable::new();
+    assert!(sessions.install_with_protocol(
+        SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(client_ip),
+            dst_ip: IpAddr::V4(server_ip),
+            src_port: 12345,
+            dst_port: 80,
+        },
+        SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 12,
+                tunnel_endpoint_id: 0,
+                next_hop: None,
+                neighbor_mac: Some(N6472_WAN_GW_MAC),
+                src_mac: Some(N6472_WAN_SRC_MAC),
+                tx_vlan_id: 80,
+            },
+            nat: NatDecision {
+                rewrite_src: None,
+                rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 30, 50))),
+                rewrite_src_port: None,
+                rewrite_dst_port: None,
+                nat64: false,
+                nptv6: false,
+            },
+        },
+        SessionMetadata {
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
+            owner_rg_id: 0,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
+            policy_id: 0,
+            inactivity_timeout_ns: None,
+            policy_counter_idx: 0,
+            policy_counter: None,
+        },
+        123_000_000_000,
+        PROTO_TCP,
+        0x18,
+    ));
+    let m = try_embedded_icmp_nat_match_from_frame(
+        &frame,
+        meta,
+        &mut sessions,
+        &forwarding,
+        &neighbors,
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        1_000_000,
+    )
+    .expect("outbound-direction error still matches");
+    assert!(
+        !m.outbound_snat,
+        "a DNAT-carrying flow must NOT take the outbound re-NAT mark"
+    );
+
+    // (c) the INBOUND error (quote = the forward wire packet) never marks.
+    let mut sessions = SessionTable::new();
+    n6474_install_snat_session(
+        &mut sessions,
+        IpAddr::V4(client_ip),
+        IpAddr::V4(server_ip),
+        IpAddr::V4(snat_ip),
+        libc::AF_INET as u8,
+    );
+    let inbound_frame = build_icmp_te_frame_v4(
+        Ipv4Addr::new(172, 16, 80, 1),
+        snat_ip,
+        server_ip,
+        40000,
+        80,
+        PROTO_TCP,
+    );
+    let m = try_embedded_icmp_nat_match_from_frame(
+        &inbound_frame,
+        meta,
+        &mut sessions,
+        &forwarding,
+        &neighbors,
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        1_000_000,
+    )
+    .expect("inbound error matches via the forward-NAT reverse arm");
+    assert!(!m.outbound_snat, "inbound #5690 matches never carry the mark");
+}
+
+
 
 
 #[test]

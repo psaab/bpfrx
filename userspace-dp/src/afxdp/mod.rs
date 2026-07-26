@@ -186,6 +186,7 @@ use self::icmp_embed::{
 };
 use self::icmp_embed::{
     Nat64IcmpErrorMatch, build_nat_reversed_icmp_error_v4, build_nat_reversed_icmp_error_v6,
+    build_snat_outbound_icmp_error_v4, build_snat_outbound_icmp_error_v6,
     finalize_embedded_icmp_resolution, finalize_embedded_icmp_resolution_parts,
     try_embedded_icmp_nat_match, try_nat64_icmp_error_match_from_frame,
 };

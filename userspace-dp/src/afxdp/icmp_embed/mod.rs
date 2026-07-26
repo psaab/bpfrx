@@ -52,6 +52,17 @@ pub(super) struct EmbeddedIcmpMatch {
     pub(super) resolution: ForwardingResolution,
     /// Session metadata (zones, RG).
     pub(super) metadata: SessionMetadata,
+    /// #6474: this match is an OUTBOUND ICMP error through source NAT — the
+    /// internal host emitted the error about the session's REPLY packet, so
+    /// the quote carries the PRE-NAT tuple and the session-fallback matched
+    /// the FORWARD session via the quote's reply key (`is_reverse == false`,
+    /// `rewrite_src` set, no destination NAT). The caller must re-NAT the
+    /// outer source and the embedded quote to the session's external
+    /// identity (RFC 5508 §4) with the `build_snat_outbound_icmp_error_*`
+    /// builders — NOT the #5690 reversal, which would consume the
+    /// descriptor with the internal (pre-NAT) source on the wire and an
+    /// unassociable quote. `false` on every inbound match.
+    pub(super) outbound_snat: bool,
 }
 
 /// Borrow bundle threaded through both v4/v6 NAT-match paths and the
@@ -199,6 +210,26 @@ pub(super) fn build_nat_reversed_icmp_error_v4(
     icmp_match: &EmbeddedIcmpMatch,
 ) -> Option<Vec<u8>> {
     builders::build_nat_reversed_icmp_error_v4(frame, meta, icmp_match)
+}
+
+/// #6474: OUTBOUND ICMP error through source NAT — rewrite the outer
+/// source and the embedded quote to the session's external identity
+/// (RFC 5508 §4). See [`builders::build_snat_outbound_icmp_error_v4`].
+pub(super) fn build_snat_outbound_icmp_error_v4(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    icmp_match: &EmbeddedIcmpMatch,
+) -> Option<Vec<u8>> {
+    builders::build_snat_outbound_icmp_error_v4(frame, meta, icmp_match)
+}
+
+/// #6474: IPv6 twin of [`build_snat_outbound_icmp_error_v4`].
+pub(super) fn build_snat_outbound_icmp_error_v6(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    icmp_match: &EmbeddedIcmpMatch,
+) -> Option<Vec<u8>> {
+    builders::build_snat_outbound_icmp_error_v6(frame, meta, icmp_match)
 }
 
 pub(super) fn build_nat_reversed_icmp_error_v6(
