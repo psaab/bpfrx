@@ -895,8 +895,9 @@ where
 
 /// Write one whole packet to a NON-BLOCKING TUN fd (#2438), wrapping
 /// `write_packet_atomic_nonblocking` around a real `libc::write`. Used by the
-/// WG decap inner-delivery path (`wg_control.rs`) and the GRE local-origin
-/// delivery path (`tunnel.rs`), both of which open their TUN `O_NONBLOCK`.
+/// WG decap inner-delivery path (`coordinator/wg_control/dispatch.rs`) and the
+/// GRE local-origin delivery path (`tunnel.rs`), both of which open their TUN
+/// `O_NONBLOCK`.
 /// Replaces std `Write::write_all`, whose stream-resume loop corrupts a packet
 /// device on a short count.
 pub(crate) fn write_packet_nonblocking(fd: i32, bytes: &[u8]) -> io::Result<()> {

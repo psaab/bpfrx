@@ -1,7 +1,7 @@
 //! WireGuard transit-egress encap for the AF_XDP copy path (#1432 S2a).
 //!
 //! This is the SECOND of the two S2a egress encap sites; the primary is
-//! the WG control thread's TUN-read loop (coordinator/wg_control.rs).
+//! the WG control thread's TUN-read loop (coordinator/wg_control/mod.rs).
 //! This site fires only when an AF_XDP forwarding decision targets a
 //! `mode == "wireguard"` tunnel endpoint id directly (a route/connected
 //! entry carrying the WG endpoint id). In the canonical wgN-TUN topology
@@ -18,17 +18,11 @@
 //! `&str` already loaded for the GRE lookup — no new branch on the
 //! plain-forward path.
 
-use super::super::wg::{EncapError, POLY1305_TAG_LEN, WG_DATA_HEADER_LEN};
+use super::super::wg::{EncapError, POLY1305_TAG_LEN, WG_DATA_HEADER_LEN, pad_to_16};
 use super::super::*;
 use super::checksum::checksum16_ipv6;
 use super::headers::{write_eth_header_slice, write_ipv4_header, write_ipv6_header, write_udp_header};
 use std::net::IpAddr;
-
-/// Round `n` up to the nearest multiple of 16 (WG §5.4.6 pad).
-#[inline]
-const fn pad_to_16(n: usize) -> usize {
-    (n + 15) & !15
-}
 
 /// The exact pad-aware encapped wire size for an `inner_len`-byte inner
 /// packet plus the outer L3/L4 (IP + UDP). Used by the MTU guard so a
