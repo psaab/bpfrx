@@ -1429,11 +1429,14 @@ Scope and deliberate exemptions:
   the two TRANSIT dispositions. A peer RST tearing down a firewall-originated
   TCP session (BGP, IKE, management SSH) is host-inbound and MUST reach the
   local kernel stack, so it is never dropped here.
-- **No fabric exemption needed.** A legitimate cross-chassis teardown for a
-  peer-owned session takes the `cluster_peer_return_fast_path` earlier in the
-  miss block (which exits before this guard). Any bare RST/FIN reaching the
-  guard is a genuine new-flow attempt and is dropped whether it ingressed
-  locally or crossed the fabric.
+- **No fabric exemption needed.** Since #6478 removed the
+  `cluster_peer_return_fast_path`, a fabric-ingress bare RST/FIN takes the
+  normal miss block and IS dropped by this guard — a legitimate
+  cross-chassis teardown arrives as a session HIT (the synced session is
+  present), never as a session-less fabric packet, so no exemption is
+  needed. Any bare RST/FIN reaching the guard is a genuine new-flow
+  attempt and is dropped whether it ingressed locally or crossed the
+  fabric.
 
 ## Why a slab + integer handles
 

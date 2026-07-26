@@ -816,3 +816,45 @@ when the V1b check is neutralized;
 `forged_fabric_stamp_denied_for_host_inbound_when_owner_rg_remote_6458` —
 RED when the V2 gate is neutralized), plus the split-RG preservation pins
 named above.
+
+## The cluster-peer return fast path is removed (#6478)
+
+The sections above describing `cluster_peer_return_fast_path` and its
+#4439/#4453/#4414 guard set are HISTORICAL. The fast path adopted
+session-less fabric-ingress TCP SYN-ACK / ACK / ICMP echo-reply forms
+into a NAT-less (`NatDecision::default()`), reverse-keyed
+(`SessionOrigin::ReverseFlow`) seed gated only on the zone-encoded stamp
+— the residual the guard set deliberately left open for the sync-race
+sub-window. After #6458's stamp validation a forged frame can still pass
+V1 on any node where the claimed zone's RG is remote (the single-primary
+backup, and every split-RG placement), so the seed stayed forgeable: one
+packet forwarded with no policy and no NAT, plus same-tuple fabric-ingress
+packets hitting the seed for its lifetime. (The verifier's owner-sync hop
+was refuted — reverse + fabric_ingress seeds are excluded from every
+export path — so the residual was always confined to the receiving node.)
+
+The fast path and its call site are REMOVED. Session-less fabric-ingress
+packets now take the normal session-miss path: zone-pair policy under the
+#6458-validated zone, source-NAT applied, a FORWARD session when
+permitted — the standard Junos no-syn-check asymmetric-routing pickup
+(#3152), identical to the packet arriving on the real interface. The
+sync-race sub-window the fast path covered (a peer-punted return packet
+arriving before its synced session installs) reverts to a bounded drop:
+the return direction's resolution on the receiving node is HAInactive
+until the RG converges, and the synced session lands within the 1 s
+incremental sweep, so the loss is confined to the race window — which the
+#6478 verifier explicitly prefers over unauthenticated seeding. A genuine
+established flow's return traffic is unaffected: it is a session HIT
+served by `resolve_flow_session_decision` (synced session + #2120 standby
+retention) and never reached the session-less fast path.
+
+RED-on-revert coverage: `afxdp/tests_fabric_zone_stamp.rs`
+`fabric_ingress_syn_ack_seeds_no_reverse_session_6478` and
+`fabric_ingress_icmp_echo_reply_seeds_no_reverse_session_6478` — both
+drive the real poll loop with a validated-stamp SYN-ACK / echo-reply in
+the split-RG placement and assert the packet tuple NEVER resolves to a
+`SessionOrigin::ReverseFlow` seed (verified RED against the pre-removal
+code: the lookup returns `Some(ReverseFlow)`), and that the SYN-ACK
+installs the policy-path forward + reverse companion pair with
+source-NAT instead. The #4439/#4453/#4414 guard tests were removed with
+the function they guarded.
