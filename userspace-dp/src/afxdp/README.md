@@ -544,6 +544,34 @@ sync.
     enforcement on any miss / no-source-rewrite / unbuildable frame / CoS drop.
     The reversed error NEVER seeds a session or flow-cache entry (`flow_key =
     None`), so the #3290 no-fake-session invariant is preserved, not bypassed.
+  - **#6472 — NAT64 (cross-family) ICMP error translation on the flowless
+    arm:** the RFC 7915 §4.2/§5.2 translators in `nat64.rs` were previously
+    reachable only via `build_nat64_forwarded_frame` on the FLOW-BACKED path,
+    which an ICMP error never enters — and the #5690 same-family builders
+    decline a cross-family `original_src`, so PTB / Time-Exceeded /
+    Dest-Unreachable toward a NAT64 session dropped fail-closed (MissingNeighbor
+    on the pool address, NoRoute on the synthetic Pref64 destination) and
+    PMTUD + traceroute were dead across the boundary despite the #2219 doc
+    claim. The flowless arm now tries
+    `nat64_icmp_error::try_translate_nat64_icmp_error` FIRST (before the
+    #5690 reversal, NOT gated on `allow_embedded_icmp` — translating errors
+    for the translator's OWN admitted sessions is core RFC 7915 behavior).
+    `icmp_embed::nat64_match` classifies the direction with an RFC 792
+    fail-closed consistency gate (the error's outer destination must equal
+    the quote's source): an ICMPv4 error quoting the forward wire packet
+    matches the installed v4 reverse companion and translates v4→v6 toward
+    the client (outer src = Pref64 ∷ error-sender); an ICMPv6 error quoting
+    the translated reply and addressed to the synthetic Pref64 destination
+    matches the forward session and translates v6→v4 toward the server
+    (outer src = the translator's pool address). The embedded quote's L4
+    port/echo id is restored to the value the error receiver carries
+    (`write_v4_to_v6_icmp_error_into` /
+    `write_v6_to_v4_icmp_error_into`: v4→v6 the original client port,
+    v6→v4 the translated pool port) — without the restore the error would
+    be delivered but unassociable. The translated frame shares the
+    extracted `queue_prebuilt_embedded_icmp_error` tail with the #5690 arm
+    (HA/fabric finalizer, CoS classify with `flow_key = None`, prebuilt
+    forward, never seeds a session).
 - `frame/` — packet parsing (L2 / L3 / L4), checksum helpers, TCP MSS
   clamp. `tests.rs` was relocated out of `mod.rs` in #1046 Phase 1.
   `headers.rs` holds the consolidated outer-header serializers (#1440).

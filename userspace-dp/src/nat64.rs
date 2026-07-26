@@ -1844,6 +1844,47 @@ pub(crate) fn write_v6_to_v4_into(
     dst_v4: Ipv4Addr,
     no_v6_frag_header: bool,
 ) -> Option<usize> {
+    write_v6_to_v4_translate(dst, packet, snat_v4, dst_v4, no_v6_frag_header, None)
+}
+
+/// #6472: flowless ICMP-error translation entry point (v6→v4). Identical to
+/// [`write_v6_to_v4_into`] except the embedded quote's L4 destination port /
+/// echo identifier is restored to the session's TRANSLATED (pool) value —
+/// the tuple the v4 server actually carries — so the server can associate
+/// the error (RFC 7915 §5.2 quote fidelity; the translators previously
+/// copied the quoted L4 verbatim, leaving the original v6 client port,
+/// which no v4 socket matches). `embedded_dst_port = None` reproduces
+/// [`write_v6_to_v4_into`] byte-for-byte.
+pub(crate) fn write_v6_to_v4_icmp_error_into(
+    dst: &mut [u8],
+    packet: &[u8],
+    snat_v4: Ipv4Addr,
+    dst_v4: Ipv4Addr,
+    no_v6_frag_header: bool,
+    embedded_dst_port: Option<u16>,
+) -> Option<usize> {
+    write_v6_to_v4_translate(
+        dst,
+        packet,
+        snat_v4,
+        dst_v4,
+        no_v6_frag_header,
+        embedded_dst_port,
+    )
+}
+
+/// Shared core of [`write_v6_to_v4_into`] and
+/// [`write_v6_to_v4_icmp_error_into`]; `embedded_dst_port` rides
+/// [`EmbeddedV6ToV4::mapped_embedded_dst_port`] into the quoted-packet
+/// translation (`None` on every data-packet caller).
+fn write_v6_to_v4_translate(
+    dst: &mut [u8],
+    packet: &[u8],
+    snat_v4: Ipv4Addr,
+    dst_v4: Ipv4Addr,
+    no_v6_frag_header: bool,
+    embedded_dst_port: Option<u16>,
+) -> Option<usize> {
     if packet.len() < 40 {
         return None;
     }
@@ -1981,6 +2022,7 @@ pub(crate) fn write_v6_to_v4_into(
         let embedded = EmbeddedV6ToV4 {
             mapped_embedded_src: dst_v4,
             mapped_embedded_dst: snat_v4,
+            mapped_embedded_dst_port: embedded_dst_port,
         };
         translate_icmpv6_message_to_icmpv4(&mut out[20..], l4_payload, &embedded)?
     } else {
@@ -2080,6 +2122,38 @@ pub(crate) fn write_v4_to_v6_into(
     packet: &[u8],
     src_v6: Ipv6Addr,
     dst_v6: Ipv6Addr,
+) -> Option<usize> {
+    write_v4_to_v6_translate(dst, packet, src_v6, dst_v6, None)
+}
+
+/// #6472: flowless ICMP-error translation entry point (v4→v6). Identical to
+/// [`write_v4_to_v6_into`] except the embedded quote's L4 source port /
+/// echo identifier is restored to the ORIGINAL v6 client value — the tuple
+/// the client actually sent — so the client can associate the error with
+/// its session (RFC 7915 §4.2 quote fidelity; the translators previously
+/// copied the quoted L4 verbatim, leaving the TRANSLATED pool port no
+/// client socket matches). `embedded_src_port = None` reproduces
+/// [`write_v4_to_v6_into`] byte-for-byte.
+pub(crate) fn write_v4_to_v6_icmp_error_into(
+    dst: &mut [u8],
+    packet: &[u8],
+    src_v6: Ipv6Addr,
+    dst_v6: Ipv6Addr,
+    embedded_src_port: Option<u16>,
+) -> Option<usize> {
+    write_v4_to_v6_translate(dst, packet, src_v6, dst_v6, embedded_src_port)
+}
+
+/// Shared core of [`write_v4_to_v6_into`] and
+/// [`write_v4_to_v6_icmp_error_into`]; `embedded_src_port` rides
+/// [`EmbeddedV4ToV6::mapped_embedded_src_port`] into the quoted-packet
+/// translation (`None` on every data-packet caller).
+fn write_v4_to_v6_translate(
+    dst: &mut [u8],
+    packet: &[u8],
+    src_v6: Ipv6Addr,
+    dst_v6: Ipv6Addr,
+    embedded_src_port: Option<u16>,
 ) -> Option<usize> {
     if packet.len() < 20 {
         return None;
@@ -2221,6 +2295,7 @@ pub(crate) fn write_v4_to_v6_into(
         let embedded = EmbeddedV4ToV6 {
             mapped_embedded_src: dst_v6,
             prefix_bytes,
+            mapped_embedded_src_port: embedded_src_port,
         };
         translate_icmpv4_message_to_icmpv6(l4_dst, l4_payload, &embedded)?
     } else {
@@ -2401,6 +2476,15 @@ struct EmbeddedV6ToV4 {
     mapped_embedded_src: Ipv4Addr,
     /// IPv4 the embedded IPv6 destination maps to.
     mapped_embedded_dst: Ipv4Addr,
+    /// #6472: optional L4 destination-port / ICMP-identifier rewrite for the
+    /// quoted packet, applied before the outer ICMP checksum is computed.
+    /// The NAT64 flowless ICMP-error path (v6→v4) translates an error about
+    /// the session's RETURN-direction wire packet: the quote's destination
+    /// port / echo id is the ORIGINAL v6 client value, which the v4 server
+    /// can only associate when it reads back as the TRANSLATED (pool) value
+    /// the server actually replied to. `None` leaves the quoted L4 verbatim
+    /// (the data-packet callers — byte-identical to pre-#6472).
+    mapped_embedded_dst_port: Option<u16>,
 }
 
 /// Address mapping for the embedded (quoted) packet of an ICMPv4 error being
@@ -2413,6 +2497,15 @@ struct EmbeddedV4ToV6 {
     mapped_embedded_src: Ipv6Addr,
     /// NAT64 /96 prefix the embedded IPv4 destination is composed onto.
     prefix_bytes: [u8; 12],
+    /// #6472: optional L4 source-port / ICMP-identifier rewrite for the
+    /// quoted packet, applied before the outer ICMPv6 checksum is computed.
+    /// The NAT64 flowless ICMP-error path (v4→v6) translates an error about
+    /// the session's FORWARD wire packet: the quote's source port / echo id
+    /// is the TRANSLATED (pool) value, which the v6 client can only
+    /// associate when it reads back as its ORIGINAL value. `None` leaves
+    /// the quoted L4 verbatim (the data-packet callers — byte-identical to
+    /// pre-#6472).
+    mapped_embedded_src_port: Option<u16>,
 }
 
 /// Translate a complete ICMPv6 message (`src`, starting at the ICMPv6 type
@@ -2693,6 +2786,20 @@ fn translate_embedded_v6_to_v4(
     out[16..20].copy_from_slice(&map.mapped_embedded_dst.octets());
     out[20..total].copy_from_slice(l4);
 
+    // #6472: restore the quoted L4 destination port / echo identifier to the
+    // TRANSLATED (pool) value the v4 server replied to. The quoted L4
+    // checksum is intentionally left unchanged — it is informational and a
+    // receiver does not validate it (the outer ICMP checksum below covers
+    // these bytes). A truncated quote (< the port/id bytes) skips the
+    // rewrite, exactly like the non-matching-protocol case.
+    if let Some(port) = map.mapped_embedded_dst_port {
+        if matches!(l4_protocol, PROTO_TCP | PROTO_UDP) && l4_len >= 4 {
+            out[22..24].copy_from_slice(&port.to_be_bytes());
+        } else if l4_protocol == PROTO_ICMPV6 && l4_len >= 6 {
+            out[24..26].copy_from_slice(&port.to_be_bytes());
+        }
+    }
+
     // If the embedded protocol is ICMPv6, fix the embedded ICMP type byte so the
     // quoted v4 packet is internally consistent (the quoted L4 checksum is left
     // as-is — it is not validated by a receiver). Only the leading type/code are
@@ -2757,6 +2864,21 @@ fn translate_embedded_v4_to_v6(
     out[24..36].copy_from_slice(&map.prefix_bytes);
     out[36..40].copy_from_slice(&quote_in[16..20]);
     out[40..total].copy_from_slice(l4);
+
+    // #6472: restore the quoted L4 source port / echo identifier to the
+    // ORIGINAL v6 client value. The quote carries the TRANSLATED (pool)
+    // source value; the client only associates the error with its session
+    // when the quote reads back as the original tuple it sent. The quoted
+    // L4 checksum is left unchanged (informational — same policy as the
+    // address rewrite above); the outer ICMPv6 checksum recompute covers
+    // these bytes. A truncated quote skips the rewrite.
+    if let Some(port) = map.mapped_embedded_src_port {
+        if matches!(protocol, PROTO_TCP | PROTO_UDP) && l4_len >= 2 {
+            out[40..42].copy_from_slice(&port.to_be_bytes());
+        } else if protocol == PROTO_ICMP && l4_len >= 6 {
+            out[44..46].copy_from_slice(&port.to_be_bytes());
+        }
+    }
 
     if protocol == PROTO_ICMP && l4_len >= 2 {
         if let Some((t, c)) = embedded_icmpv4_type_to_icmpv6(out[40]) {
@@ -3329,6 +3451,72 @@ pub(crate) fn build_nat64_v4_to_v6_frame(
     // #2844: SSOT Ethernet writer (see build_nat64_v6_to_v4_frame).
     write_eth_header_slice(&mut out, eth_dst, eth_src, vlan_id, 0x86dd)?;
     let written = write_v4_to_v6_into(&mut out[eth_len..], ipv4_packet, src_v6, dst_v6)?;
+    out.truncate(eth_len + written);
+    Some(out)
+}
+
+/// #6472: Ethernet + IPv4 frame for a flowless NAT64 ICMPv6 error (an error
+/// about the session's translated REPLY packet, v6→v4). Mirrors
+/// [`build_nat64_v6_to_v4_frame`] but drives
+/// [`write_v6_to_v4_icmp_error_into`] so the embedded quote's L4 destination
+/// port / echo id is restored to the session's translated (pool) value —
+/// the tuple the v4 server associates the error with.
+pub(crate) fn build_nat64_v6_to_v4_icmp_error_frame(
+    frame: &[u8],
+    snat_v4: Ipv4Addr,
+    dst_v4: Ipv4Addr,
+    embedded_dst_port: Option<u16>,
+    eth_dst: [u8; 6],
+    eth_src: [u8; 6],
+    vlan_id: u16,
+    no_v6_frag_header: bool,
+) -> Option<Vec<u8>> {
+    let l3 = frame_l3_offset(frame)?;
+    let ipv6_packet = frame.get(l3..)?;
+    let eth_len = if vlan_id > 0 { 18 } else { 14 };
+    // IPv6→IPv4 shrinks the L3 by 20 bytes, so `eth_len + ipv6_packet.len()`
+    // is a safe upper bound even with the embedded-packet shrink.
+    let mut out = vec![0u8; eth_len + ipv6_packet.len()];
+    write_eth_header_slice(&mut out, eth_dst, eth_src, vlan_id, 0x0800)?;
+    let written = write_v6_to_v4_icmp_error_into(
+        &mut out[eth_len..],
+        ipv6_packet,
+        snat_v4,
+        dst_v4,
+        no_v6_frag_header,
+        embedded_dst_port,
+    )?;
+    out.truncate(eth_len + written);
+    Some(out)
+}
+
+/// #6472: Ethernet + IPv6 frame for a flowless NAT64 ICMPv4 error (an error
+/// about the session's FORWARD wire packet, v4→v6). Mirrors
+/// [`build_nat64_v4_to_v6_frame`] but drives
+/// [`write_v4_to_v6_icmp_error_into`] so the embedded quote's L4 source
+/// port / echo id is restored to the ORIGINAL v6 client value — the tuple
+/// the client associates the error with.
+pub(crate) fn build_nat64_v4_to_v6_icmp_error_frame(
+    frame: &[u8],
+    src_v6: Ipv6Addr,
+    dst_v6: Ipv6Addr,
+    embedded_src_port: Option<u16>,
+    eth_dst: [u8; 6],
+    eth_src: [u8; 6],
+    vlan_id: u16,
+) -> Option<Vec<u8>> {
+    let l3 = frame_l3_offset(frame)?;
+    let ipv4_packet = frame.get(l3..)?;
+    let eth_len = if vlan_id > 0 { 18 } else { 14 };
+    let mut out = vec![0u8; eth_len + ipv4_packet.len().saturating_add(2 * NAT64_HEADER_DELTA as usize)];
+    write_eth_header_slice(&mut out, eth_dst, eth_src, vlan_id, 0x86dd)?;
+    let written = write_v4_to_v6_icmp_error_into(
+        &mut out[eth_len..],
+        ipv4_packet,
+        src_v6,
+        dst_v6,
+        embedded_src_port,
+    )?;
     out.truncate(eth_len + written);
     Some(out)
 }

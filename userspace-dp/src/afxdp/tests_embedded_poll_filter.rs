@@ -640,6 +640,595 @@ fn poll_descriptor_embedded_icmp_reversal_reachable_on_flowless_path_5690() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// #6472: NAT64 (cross-family) ICMP error translation on the flowless arm.
+// ---------------------------------------------------------------------------
+
+/// The IPv6 client, v4 server, NAT64 pool address, and translated port the
+/// #6472 fixtures share. The synthetic destination is `64:ff9b::808:808`
+/// (Pref64 ∷ 8.8.8.8) from the shared `nat64_snapshot` fixture.
+const N6472_CLIENT_PORT: u16 = 12345;
+const N6472_XLATED_PORT: u16 = 40000;
+const N6472_SERVER_PORT: u16 = 443;
+
+fn n6472_client_v6() -> Ipv6Addr {
+    "2001:559:8585:ef00::102".parse().expect("client v6")
+}
+fn n6472_pref64_server() -> Ipv6Addr {
+    "64:ff9b::808:808".parse().expect("Pref64::8.8.8.8")
+}
+fn n6472_server_v4() -> Ipv4Addr {
+    Ipv4Addr::new(8, 8, 8, 8)
+}
+fn n6472_pool_v4() -> Ipv4Addr {
+    Ipv4Addr::new(172, 16, 80, 50)
+}
+const N6472_CLIENT_MAC: [u8; 6] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02];
+const N6472_LAN_SRC_MAC: [u8; 6] = [0x02, 0xbf, 0x72, 0x01, 0x00, 0x01];
+const N6472_WAN_SRC_MAC: [u8; 6] = [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08];
+const N6472_WAN_GW_MAC: [u8; 6] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+
+/// Install the NAT64 forward session + its v4 reverse companion exactly as
+/// the production cold path installs them (#4381/#5606): the forward key is
+/// the original v6 5-tuple with the NAT64 forward decision; the reverse
+/// companion is keyed on the v4 reply tuple `(server:port → pool:xlated)`
+/// with `is_reverse = true`; BOTH halves carry `nat64_reverse`.
+fn n6472_install_sessions(sessions: &mut SessionTable, now_ns: u64) {
+    let fwd_nat = NatDecision {
+        rewrite_src: Some(IpAddr::V4(n6472_pool_v4())),
+        rewrite_dst: Some(IpAddr::V4(n6472_server_v4())),
+        rewrite_src_port: Some(N6472_XLATED_PORT),
+        rewrite_dst_port: None,
+        nat64: true,
+        nptv6: false,
+    };
+    let reverse_info = Nat64ReverseInfo {
+        orig_src_v6: n6472_client_v6(),
+        orig_dst_v6: n6472_pref64_server(),
+    };
+    assert!(sessions.install_with_protocol(
+        SessionKey {
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V6(n6472_client_v6()),
+            dst_ip: IpAddr::V6(n6472_pref64_server()),
+            src_port: N6472_CLIENT_PORT,
+            dst_port: N6472_SERVER_PORT,
+        },
+        SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 12,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 1))),
+                neighbor_mac: Some(N6472_WAN_GW_MAC),
+                src_mac: Some(N6472_WAN_SRC_MAC),
+                tx_vlan_id: 80,
+            },
+            nat: fwd_nat,
+        },
+        SessionMetadata {
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
+            owner_rg_id: 0,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: Some(reverse_info),
+            log_session_init: false,
+            log_session_close: false,
+            policy_id: 0,
+            inactivity_timeout_ns: None,
+            policy_counter_idx: 0,
+            policy_counter: None,
+        },
+        now_ns,
+        PROTO_TCP,
+        0x18,
+    ));
+    // The v4 reverse companion: keyed on the reply wire tuple, resolution
+    // toward the v6 client on the LAN unit (reth1.0, ifindex 24).
+    assert!(sessions.install_with_protocol(
+        SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(n6472_server_v4()),
+            dst_ip: IpAddr::V4(n6472_pool_v4()),
+            src_port: N6472_SERVER_PORT,
+            dst_port: N6472_XLATED_PORT,
+        },
+        SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 24,
+                tx_ifindex: 24,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V6(n6472_client_v6())),
+                neighbor_mac: Some(N6472_CLIENT_MAC),
+                src_mac: Some(N6472_LAN_SRC_MAC),
+                tx_vlan_id: 0,
+            },
+            nat: fwd_nat.reverse(
+                IpAddr::V6(n6472_client_v6()),
+                IpAddr::V6(n6472_pref64_server()),
+                N6472_CLIENT_PORT,
+                N6472_SERVER_PORT,
+            ),
+        },
+        SessionMetadata {
+            ingress_zone: TEST_WAN_ZONE_ID,
+            egress_zone: TEST_LAN_ZONE_ID,
+            owner_rg_id: 0,
+            fabric_ingress: false,
+            is_reverse: true,
+            nat64_reverse: Some(reverse_info),
+            log_session_init: false,
+            log_session_close: false,
+            policy_id: 0,
+            inactivity_timeout_ns: None,
+            policy_counter_idx: 0,
+            policy_counter: None,
+        },
+        now_ns,
+        PROTO_TCP,
+        0x18,
+    ));
+}
+
+/// Flip the shared type-11 v4 fixture into a Packet-Too-Big-class
+/// Fragmentation-Needed error (type 3 / code 4) carrying next-hop MTU 1400.
+fn n6472_patch_ptb(frame: &mut [u8], l4_offset: usize) {
+    frame[l4_offset] = 3;
+    frame[l4_offset + 1] = 4;
+    // RFC 1191 rest-of-header: [unused(2)][next-hop MTU(2)].
+    frame[l4_offset + 4..l4_offset + 8].copy_from_slice(&[0, 0, 0x05, 0x78]);
+    frame[l4_offset + 2] = 0;
+    frame[l4_offset + 3] = 0;
+    let csum = checksum16(&frame[l4_offset..]);
+    frame[l4_offset + 2..l4_offset + 4].copy_from_slice(&csum.to_be_bytes());
+}
+
+/// #6472 FAIL-ON-REVERT (v4→v6, RFC 7915 §4.2): an ICMPv4 PTB from a v4 hop
+/// addressed to the NAT64 pool address — quoting the session's FORWARD wire
+/// packet `(pool:40000 → 8.8.8.8:443)` — must be translated on the REAL
+/// flowless poll path into an ICMPv6 Packet-Too-Big toward the v6 client:
+/// outer src = `64:ff9b::172.16.80.1` (Pref64 mapping of the error sender),
+/// outer dst = the client, MTU = 1400 + 20, and the embedded quote reading
+/// back as the ORIGINAL v6 forward packet `(client:12345 →
+/// 64:ff9b::808:808:443)` — the source port RESTORED from the translated
+/// pool value or the client cannot associate the error (PMTUD).
+///
+/// The reversal runs WITHOUT `allow_embedded_icmp` (left false here): NAT64
+/// error translation for the translator's own sessions is core RFC 7915
+/// behavior, not the optional same-family passthrough that flag gates.
+///
+/// Fail-on-revert: remove the `try_translate_nat64_icmp_error` call from
+/// the flowless arm and the error takes normal flowless enforcement — no
+/// prebuilt forward is queued (the pool address is not a local v4 socket),
+/// so `scratch_forwards` is empty and the test goes RED.
+#[test]
+fn poll_descriptor_nat64_icmp_error_v4_to_v6_translated_on_flowless_path_6472() {
+    let router_ip = Ipv4Addr::new(172, 16, 80, 1);
+    let mut frame = build_icmp_te_frame_v4(
+        router_ip,
+        n6472_pool_v4(),
+        n6472_server_v4(),
+        N6472_XLATED_PORT,
+        N6472_SERVER_PORT,
+        PROTO_TCP,
+    );
+    n6472_patch_ptb(&mut frame, 34);
+
+    // allow_embedded_icmp deliberately NOT set: the NAT64 arm is ungated.
+    let forwarding = build_forwarding_state(&nat64_snapshot(lan_to_wan_permit(
+        "8.8.8.8/32",
+        "permit-nat64-v4",
+    )));
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 12, 0);
+    binding.interface = Arc::<str>::from("reth0.80");
+    let mut sessions = SessionTable::new();
+    n6472_install_sessions(&mut sessions, 123_000_000_000);
+    let sessions_before = sessions.len();
+
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 12,
+        l3_offset: 14,
+        l4_offset: 34,
+        payload_offset: 42,
+        pkt_len: (frame.len() - 14) as u16,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        tcp_flags: 0,
+        dscp: 0,
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    };
+    txn_run_descriptor(&mut binding, &mut sessions, &forwarding, &ha_state, &frame, meta);
+
+    assert_eq!(
+        binding.scratch.scratch_forwards.len(),
+        1,
+        "the NAT64 v4->v6 ICMP error translation must queue exactly one prebuilt \
+         forward on the flowless poll path (RED on revert: no forward is queued)"
+    );
+    let fwd = &binding.scratch.scratch_forwards[0];
+    let out = match &fwd.frame {
+        PendingForwardFrame::Prebuilt(bytes) => bytes,
+        _ => panic!("the NAT64 error translation must queue a PREBUILT frame"),
+    };
+    // L2: toward the client on the LAN unit (untagged, ethertype IPv6).
+    assert_eq!(&out[0..6], &N6472_CLIENT_MAC, "eth dst = client MAC");
+    assert_eq!(&out[6..12], &N6472_LAN_SRC_MAC, "eth src = LAN unit MAC");
+    assert_eq!(&out[12..14], &[0x86, 0xdd], "ethertype IPv6");
+    // Outer IPv6: src = Pref64::router (172.16.80.1 = ac10:5001), dst = client.
+    let expect_router_v6: Ipv6Addr = "64:ff9b::ac10:5001".parse().expect("Pref64::router");
+    assert_eq!(&out[14 + 8..14 + 24], &expect_router_v6.octets(), "outer src = Pref64::router");
+    assert_eq!(
+        &out[14 + 24..14 + 40],
+        &n6472_client_v6().octets(),
+        "outer dst = v6 client"
+    );
+    assert_eq!(out[14 + 6], PROTO_ICMPV6, "next header ICMPv6");
+    assert_eq!(out[14 + 7], 63, "hop limit decremented once");
+    // ICMPv6 PTB: type 2, code 0, MTU = 1400 + 20 = 1420.
+    let icmp6 = &out[14 + 40..];
+    assert_eq!(icmp6[0], 2, "ICMPv6 Packet Too Big type");
+    assert_eq!(icmp6[1], 0, "PTB code 0");
+    let mtu = u32::from_be_bytes([icmp6[4], icmp6[5], icmp6[6], icmp6[7]]);
+    assert_eq!(mtu, 1420, "PTB MTU = v4 next-hop MTU + NAT64 header delta");
+    // ICMPv6 checksum oracle over the translated message.
+    let s6 = Ipv6Addr::from(<[u8; 16]>::try_from(&out[14 + 8..14 + 24]).unwrap());
+    let d6 = Ipv6Addr::from(<[u8; 16]>::try_from(&out[14 + 24..14 + 40]).unwrap());
+    assert_eq!(
+        checksum16_ipv6(s6, d6, PROTO_ICMPV6, icmp6),
+        0,
+        "outer ICMPv6 checksum must verify"
+    );
+    // Embedded quote: the ORIGINAL v6 forward packet — client:12345 ->
+    // Pref64::server:443. The quote's source port is RESTORED from the
+    // translated pool port (40000) to the client's original (12345).
+    let emb = &icmp6[8..];
+    assert_eq!(&emb[8..24], &n6472_client_v6().octets(), "embedded src = client");
+    assert_eq!(
+        &emb[24..40],
+        &n6472_pref64_server().octets(),
+        "embedded dst = Pref64::server"
+    );
+    assert_eq!(
+        &emb[40..42],
+        &N6472_CLIENT_PORT.to_be_bytes(),
+        "embedded src port restored to the ORIGINAL client port"
+    );
+    assert_eq!(
+        &emb[42..44],
+        &N6472_SERVER_PORT.to_be_bytes(),
+        "embedded dst port untouched"
+    );
+    assert_eq!(fwd.target_ifindex, 24, "translated error egresses toward the client");
+    assert!(fwd.flow_key.is_none(), "the error never seeds a session/flow-cache entry");
+    assert_eq!(sessions.len(), sessions_before, "no new session minted");
+    assert!(
+        binding.scratch.scratch_recycle.is_empty(),
+        "a queued prebuilt forward owns the descriptor; no recycle"
+    );
+}
+
+/// #6472 FAIL-ON-REVERT (v6→v4, RFC 7915 §5.2): an ICMPv6 Time-Exceeded
+/// from a v6 hop about the session's translated REPLY packet — addressed to
+/// the synthetic `64:ff9b::808:808` and quoting `(64:ff9b::808:808:443 →
+/// client:12345)` — must be translated on the flowless poll path into an
+/// ICMPv4 Time-Exceeded toward the v4 server: outer src = the pool address
+/// (the translator's own v4 identity for this session; the v6 hop has no
+/// v4 mapping), outer dst = 8.8.8.8, and the embedded quote reading back as
+/// the v4 reply the server sent `(8.8.8.8:443 → pool:40000)` — the
+/// DESTINATION port RESTORED to the translated value or the server cannot
+/// associate the error.
+///
+/// Fail-on-revert: remove the arm and the error is flowless-forwarded
+/// UNTRANSLATED toward the IPv6 default route (ethertype stays 0x86dd and
+/// the synthetic destination is on the wire) — every translated-content
+/// assertion below goes RED.
+#[test]
+fn poll_descriptor_nat64_icmp_error_v6_to_v4_translated_on_flowless_path_6472() {
+    let lan_router: Ipv6Addr = "2001:559:8585:ef00::fe".parse().expect("lan v6 router");
+    let frame = build_icmpv6_te_frame(
+        lan_router,
+        n6472_pref64_server(),
+        n6472_client_v6(),
+        N6472_SERVER_PORT,
+        N6472_CLIENT_PORT,
+        PROTO_TCP,
+    );
+
+    let forwarding = build_forwarding_state(&nat64_snapshot(lan_to_wan_permit(
+        "8.8.8.8/32",
+        "permit-nat64-v4",
+    )));
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    n6472_install_sessions(&mut sessions, 123_000_000_000);
+    let sessions_before = sessions.len();
+
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 24,
+        l3_offset: 14,
+        l4_offset: 54,
+        payload_offset: 62,
+        pkt_len: (frame.len() - 14) as u16,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_ICMPV6,
+        tcp_flags: 0,
+        dscp: 0,
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    };
+    txn_run_descriptor(&mut binding, &mut sessions, &forwarding, &ha_state, &frame, meta);
+
+    assert_eq!(
+        binding.scratch.scratch_forwards.len(),
+        1,
+        "the NAT64 v6->v4 ICMP error translation must queue exactly one prebuilt forward"
+    );
+    let fwd = &binding.scratch.scratch_forwards[0];
+    let out = match &fwd.frame {
+        PendingForwardFrame::Prebuilt(bytes) => bytes,
+        _ => panic!("the NAT64 error translation must queue a PREBUILT frame"),
+    };
+    // L2: toward the WAN gateway, VLAN 80 tagged (18-byte eth header).
+    assert_eq!(&out[0..6], &N6472_WAN_GW_MAC, "eth dst = WAN gateway MAC");
+    assert_eq!(&out[6..12], &N6472_WAN_SRC_MAC, "eth src = WAN unit MAC");
+    assert_eq!(&out[12..14], &[0x81, 0x00], "802.1Q tag present (VLAN 80)");
+    assert_eq!(&out[16..18], &[0x08, 0x00], "ethertype IPv4 after the tag");
+    let ip = &out[18..];
+    // Outer IPv4: src = pool (translator identity), dst = server, TTL 63.
+    assert_eq!(&ip[12..16], &n6472_pool_v4().octets(), "outer src = pool address");
+    assert_eq!(&ip[16..20], &n6472_server_v4().octets(), "outer dst = v4 server");
+    assert_eq!(ip[8], 63, "TTL decremented once");
+    assert_eq!(ip[9], PROTO_ICMP, "protocol ICMPv4");
+    assert_eq!(checksum16(&ip[..20]), 0, "outer IPv4 header checksum verifies");
+    // ICMPv4 Time-Exceeded: type 11, code 0.
+    let icmp = &ip[20..];
+    assert_eq!(icmp[0], 11, "ICMPv4 Time Exceeded type");
+    assert_eq!(icmp[1], 0, "code 0");
+    // Embedded quote: the v4 reply the server sent — 8.8.8.8:443 ->
+    // pool:40000. The quote's DESTINATION port is RESTORED to the translated
+    // value (the server never saw the client's original 12345).
+    let emb = &icmp[8..];
+    assert_eq!(&emb[12..16], &n6472_server_v4().octets(), "embedded src = server");
+    assert_eq!(&emb[16..20], &n6472_pool_v4().octets(), "embedded dst = pool");
+    assert_eq!(checksum16(&emb[..20]), 0, "embedded IPv4 header checksum verifies");
+    assert_eq!(
+        &emb[20..22],
+        &N6472_SERVER_PORT.to_be_bytes(),
+        "embedded src port untouched"
+    );
+    assert_eq!(
+        &emb[22..24],
+        &N6472_XLATED_PORT.to_be_bytes(),
+        "embedded dst port restored to the TRANSLATED pool port"
+    );
+    assert_eq!(fwd.target_ifindex, 12, "translated error egresses toward the server");
+    assert!(fwd.flow_key.is_none());
+    assert_eq!(sessions.len(), sessions_before, "no new session minted");
+    assert!(binding.scratch.scratch_recycle.is_empty());
+}
+
+/// #6472 negative (fail-closed anti-spoof gate): an ICMPv4 error whose
+/// OUTER destination is NOT the quote's source is not about this session's
+/// wire packet (RFC 792: an error is addressed to the offending packet's
+/// source) and MUST be declined to normal flowless enforcement — never
+/// translated on the strength of a fabricated quote.
+#[test]
+fn poll_descriptor_nat64_icmp_error_outer_dst_mismatch_declined_6472() {
+    let router_ip = Ipv4Addr::new(172, 16, 80, 1);
+    // Outer dst = 172.16.80.51, but the quote's source stays 172.16.80.50
+    // (the pool address): the RFC 792 consistency gate rejects the match.
+    let frame = build_icmp_te_frame_v4(
+        router_ip,
+        Ipv4Addr::new(172, 16, 80, 51),
+        n6472_server_v4(),
+        N6472_XLATED_PORT,
+        N6472_SERVER_PORT,
+        PROTO_TCP,
+    );
+    // Patch the embedded quote's source back to the pool address so ONLY the
+    // outer dst differs (the fixture ties them together by construction).
+    // Embedded IP starts at eth(14)+outer IP(20)+ICMP(8)=42; src at +12=54.
+    let mut frame = frame;
+    frame[54..58].copy_from_slice(&n6472_pool_v4().octets());
+    // Fix the embedded IP header checksum after the byte surgery.
+    frame[52] = 0;
+    frame[53] = 0;
+    let emb_csum = checksum16(&frame[42..62]);
+    frame[52..54].copy_from_slice(&emb_csum.to_be_bytes());
+    // Fix the outer ICMP checksum to keep the message well-formed.
+    frame[36] = 0;
+    frame[37] = 0;
+    let icmp_csum = checksum16(&frame[34..]);
+    frame[36..38].copy_from_slice(&icmp_csum.to_be_bytes());
+
+    let forwarding = build_forwarding_state(&nat64_snapshot(lan_to_wan_permit(
+        "8.8.8.8/32",
+        "permit-nat64-v4",
+    )));
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 12, 0);
+    binding.interface = Arc::<str>::from("reth0.80");
+    let mut sessions = SessionTable::new();
+    n6472_install_sessions(&mut sessions, 123_000_000_000);
+
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 12,
+        l3_offset: 14,
+        l4_offset: 34,
+        payload_offset: 42,
+        pkt_len: (frame.len() - 14) as u16,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        tcp_flags: 0,
+        dscp: 0,
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    };
+    txn_run_descriptor(&mut binding, &mut sessions, &forwarding, &ha_state, &frame, meta);
+
+    assert!(
+        binding.scratch.scratch_forwards.is_empty(),
+        "an error not addressed to the quote's source must NOT be translated"
+    );
+}
+
+/// #6472 control (no-steal): with a NAT64 prefix configured, a same-family
+/// NAT44 session's ICMP error STILL takes the #5690 same-family reversal —
+/// the NAT64 arm declines it (no `nat64_reverse` on the matched half), and
+/// nothing about the #5690 path changes.
+#[test]
+fn poll_descriptor_same_family_reversal_not_stolen_by_nat64_arm_6472() {
+    let router_ip = Ipv4Addr::new(10, 0, 0, 1);
+    let snat_ip = Ipv4Addr::new(172, 16, 80, 8);
+    let client_ip = Ipv4Addr::new(10, 0, 61, 102);
+    let server_ip = Ipv4Addr::new(1, 1, 1, 1);
+    let snat_port: u16 = 40000;
+    let client_port: u16 = 12345;
+
+    let frame = build_icmp_te_frame_v4(router_ip, snat_ip, server_ip, snat_port, 80, PROTO_TCP);
+
+    // NAT64 prefix configured AND allow_embedded_icmp set: both arms are
+    // eligible — the NAT64 arm must decline (the NAT44 half carries no
+    // `nat64_reverse`) and the #5690 reversal must fire unchanged.
+    let mut snapshot = nat64_snapshot(lan_to_wan_permit("8.8.8.8/32", "permit-nat64-v4"));
+    snapshot.flow.allow_embedded_icmp = true;
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 12, 0);
+    binding.interface = Arc::<str>::from("reth0.80");
+    let mut sessions = SessionTable::new();
+    assert!(sessions.install_with_protocol(
+        SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(client_ip),
+            dst_ip: IpAddr::V4(server_ip),
+            src_port: client_port,
+            dst_port: 80,
+        },
+        SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 12,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 1))),
+                neighbor_mac: Some(N6472_WAN_GW_MAC),
+                src_mac: Some(N6472_WAN_SRC_MAC),
+                tx_vlan_id: 80,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(snat_ip)),
+                rewrite_dst: None,
+                rewrite_src_port: Some(snat_port),
+                rewrite_dst_port: None,
+                nat64: false,
+                nptv6: false,
+            },
+        },
+        SessionMetadata {
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
+            owner_rg_id: 0,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
+            policy_id: 0,
+            inactivity_timeout_ns: None,
+            policy_counter_idx: 0,
+            policy_counter: None,
+        },
+        123_000_000_000,
+        PROTO_TCP,
+        0x18,
+    ));
+
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 12,
+        l3_offset: 14,
+        l4_offset: 34,
+        payload_offset: 42,
+        pkt_len: (frame.len() - 14) as u16,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        tcp_flags: 0,
+        dscp: 0,
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    };
+    // The #5690 return-path resolution resolves the client's MAC via the
+    // dynamic neighbor table (the connected LAN route + learned entry), so
+    // learn it here exactly like the #5690 test.
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::default());
+    learn_dynamic_neighbor(
+        &forwarding,
+        &dynamic_neighbors,
+        24,
+        0,
+        IpAddr::V4(client_ip),
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+    );
+    txn_run_descriptor_with_neighbors(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+        &dynamic_neighbors,
+    );
+
+    assert_eq!(
+        binding.scratch.scratch_forwards.len(),
+        1,
+        "the same-family #5690 reversal must still queue the reversed error"
+    );
+    let fwd = &binding.scratch.scratch_forwards[0];
+    let reversed = match &fwd.frame {
+        PendingForwardFrame::Prebuilt(bytes) => bytes,
+        _ => panic!("same-family reversal must queue a PREBUILT frame"),
+    };
+    // Same-family (NAT44) outcome: v4 in, v4 out — the outer dst and the
+    // embedded src restored to the v4 CLIENT, never family-translated.
+    assert_eq!(&reversed[12..14], &[0x08, 0x00], "same-family stays IPv4");
+    let outer_dst = Ipv4Addr::new(reversed[30], reversed[31], reversed[32], reversed[33]);
+    assert_eq!(outer_dst, client_ip, "outer dst restored to the v4 client");
+    let embedded_src = Ipv4Addr::new(reversed[54], reversed[55], reversed[56], reversed[57]);
+    assert_eq!(embedded_src, client_ip, "embedded src restored to the v4 client");
+    assert_eq!(fwd.target_ifindex, 24);
+}
+
+
 
 #[test]
 fn poll_descriptor_policy_deny_path_emits_rt_flow_event() {
