@@ -1,10 +1,10 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v36 — r35 findings folded (Codex NEEDS-REVISION
-  1M/2m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m —
-  its m1 IS the same finding as Codex M1, raised independently;
-  all three confirm the §4.7 structure); pending convergence
-  review r36
+- **Status**: DRAFT v37 — r36 findings folded (Codex NEEDS-REVISION
+  1M/1m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m —
+  its temp-cleanup nit IS Codex m1, the second independent
+  convergence this run; all three confirm the §4.7 structure);
+  pending convergence review r37
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -1323,7 +1323,10 @@
   `WriteFileDurableStaged(path, data, perm, preRename func()
   error)` — the classification re-verify runs INSIDE the
   pre-rename hook (still under the same `s.mu` hold), a hook
-  error abandons the temp file and re-classifies, and a test
+  error UNLINKS the temp (the `fsatomic.go:41-44` cleanup
+  discipline, defer-driven per `fsatomic.go:315-321`;
+  crash-leaked temps swept by `NewDB` at open) and re-classifies,
+  and a test
   seam drives the failure path; a post-write read-back is
   explicitly REJECTED (it sees only the daemon's own
   replacement when the operator's write lands first). (c) The
@@ -1331,6 +1334,43 @@
   the `pkg/api/README.md` snapshot description, the
   `health.go:10-16` header, and the descriptor/wiring comment
   copies now name all the causes incl. `ConfigWriteUnverified`).
+  v37: r36 convergence — the mask==0 observation is fenced and
+  the temp fate is pinned (Codex NEEDS-REVISION 1M/1m, folds 2
+  FOLDED / 1 PARTIAL, structure confirmed; AGY PLAN-READY 3/3
+  with 2 fresh attacks FAILED, structure confirmed; SMR
+  PLAN-READY-WITH-NITS 0M/1m — its temp-cleanup nit IS Codex m1,
+  the second independent convergence this run): (a) the stopped
+  remediation runs a PRODUCER-QUIESCE protocol, not a point
+  check (Codex M1, verified the TOCTOU: the mask is derived at
+  snapshot time while a later confirmed commit or an
+  asynchronous HA demotion resolving a window —
+  `daemon_ha.go:466-474`, `store_commit.go:575-608,652-702,
+  780-792` — can re-raise debt between the observation and the
+  stop, and post-restart health is too late because recovery
+  runs inside `Load` before service,
+  `store_persist.go:110-114`): (1) no live commit-confirmed
+  window stands (confirm or roll back first), (2) refrain from
+  commits and wait ONE debt-pass interval, (3) RE-CHECK
+  `mask == 0` (a mid-wait debt shows), (4) stop and repair; the
+  blind-spot residual is explicitly ADMITTED (a window whose
+  deadline fires between the re-check and the stop — the same
+  process-local provenance loss admitted since r29) with the
+  post-restart recovery path NAMED (the recovered timer's
+  operator-scale deadline allows confirming away an
+  inappropriately re-armed window or removing the record via
+  the sanctioned live path; the expired-revert is bounded to
+  records whose own deadline had already passed). (b) The hook
+  fate is pinned (Codex m1 = SMR m1, both verified: "abandons
+  the temp file" was loose against the `fsatomic.go:41-44`
+  discipline — "the temp file is removed on every failure path
+  before rename", defer-driven per `fsatomic.go:315-321`): a
+  hook error UNLINKS the temp; crash-leaked `.<base>.tmp-*`
+  temps are swept by `NewDB` at open (`db.go:61-68`) — never
+  accumulated; a target-unchanged/no-temp regression pins both
+  per `fsatomic_test.go:297-347`. (c) The last two stale
+  cause-count copies are swept (the §5.1 "ALL THREE causes"
+  wiring comment and the docs-inventory enumeration now name
+  the key-class causes AND `ConfigWriteUnverified`).
 
 ---
 
@@ -3324,7 +3364,38 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   `Load` only SEEDS the record as an orphan resolved by the
   next commit —
   while the LIVE alternative is
-  the probe-mediated removal path. As defense-in-depth, every
+  the probe-mediated removal path. AND THE `mask == 0`
+  OBSERVATION IS FENCED AGAINST ITS OWN TOCTOU (r36 Codex M1,
+  verified: the mask is derived at snapshot time, and a later
+  confirmed commit or an asynchronous HA demotion resolving a
+  window — `daemon_ha.go:466-474`, with a failed removal raising
+  process-local debt, `store_commit.go:575-608,652-702,780-792` —
+  can re-raise debt between the observation and the stop;
+  post-restart health is TOO LATE because recovery runs inside
+  `Load` before service, `store_persist.go:110-114`, and on-disk
+  presence cannot reconstruct process-local debt): the stopped
+  remediation runs a PRODUCER-QUIESCE protocol, not a point
+  check — (1) the operator ensures NO live commit-confirmed
+  window stands (confirm or roll back any armed window first —
+  window resolution is operator-paced), (2) the operator REFRAINS
+  from new commits and waits ONE debt-pass interval ( SyncApply
+  is the only non-operator producer; one pass lets any in-flight
+  resolution finalize and any failure re-raise its debt), (3)
+  the operator RE-CHECKS `mask == 0` (a debt raised mid-wait now
+  shows), and only then (4) stops xpfd and repairs. The residual
+  after the fence is explicitly ADMITTED (a debt raised inside
+  the fence's blind spot — a window whose deadline fires between
+  the re-check and the stop — is the same process-local
+  provenance loss admitted since r29), with the post-restart
+  recovery path NAMED: the recovered timer's deadline is
+  operator-scale (the default 10-minute window), so an
+  inappropriately re-armed window is CONFIRMED away (`commit
+  check`-style confirmation) or the record removed via the
+  sanctioned live path BEFORE the deadline; the expired-revert
+  inside `Load` is bounded to records whose own deadline had
+  already passed — the semantic the window itself would have
+  produced.
+  As defense-in-depth, every
   content-INDEPENDENT repair write (the (w-u) restore, the D
   synthesized tombstone) RE-VERIFIES the target's classification
   inside the SAME `s.mu` hold immediately before the rename —
@@ -3339,8 +3410,14 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   — exposing a pre-rename hook that runs AFTER the temp-file
   fsync/close and BEFORE the rename; the repair write's
   classification re-verify runs INSIDE that hook (still under the
-  same `s.mu` hold), an error from the hook abandons the temp
-  file and re-classifies, and a test seam drives the hook's
+  same `s.mu` hold), an error from the hook UNLINKS the temp
+  (the `fsatomic.go:41-44` discipline — "the temp file is removed
+  on every failure path before rename", defer-driven per
+  `fsatomic.go:315-321`; crash-leaked `.<base>.tmp-*` temps are
+  swept by `NewDB` at open, `db.go:61-68` — never accumulated,
+  and a target-unchanged/no-temp regression pins both per
+  `fsatomic_test.go:297-347`)
+  and re-classifies, and a test seam drives the hook's
   failure path; a post-write read-back is explicitly REJECTED as
   the mechanism (it cannot close the hostile interleave — if the
   operator's repair lands before the daemon's rename, the
@@ -3496,8 +3573,10 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   test pins the wiring. The Prometheus descriptor
   (`metrics_descriptors.go:625-630`), the field doc
   (`server.go:132-140`), and the wiring comment
-  (`daemon_run_servers.go:370-374`) are updated to name ALL THREE
-  causes (aggregate semantics), closing r17 Codex m2 + r18 Codex M7
+  (`daemon_run_servers.go:370-374`) are updated to name ALL the
+  causes (aggregate semantics — the three r18 causes plus the
+  per-state key-class causes AND `ConfigWriteUnverified`), closing
+  r17 Codex m2 + r18 Codex M7
   (`pkg/api` IS touched — §5.1 corrected).
 - **Tombstone write = READ-MUTATE-WRITE, full record (r12 Claude SMR m2
   = AGY Attack 2; inventory r13-corrected).** The tombstone is the
@@ -4120,7 +4199,11 @@ v20 history). The delivery is TWO units:
   mechanism): the STAGED variant
   `WriteFileDurableStaged(path, data, perm, preRename func() error)`
   — temp+write+fsync+close, then the pre-rename hook, then the
-  rename; the hook abandons the temp file on error; a test seam
+  rename; the hook UNLINKS the temp on error (the
+  `fsatomic.go:41-44` cleanup discipline, defer-driven per
+  `fsatomic.go:315-321`; crash-leaked temps swept by `NewDB` at
+  open, with a target-unchanged/no-temp regression per
+  `fsatomic_test.go:297-347`); a test seam
   drives the hook's failure path. The monolithic
   `WriteFileDurable` is untouched for all other callers.
 - `pkg/configstore/store_commit.go` + `db.go` + `store.go` +
@@ -4412,8 +4495,11 @@ classification snapshot.
   `daemon_run_servers.go:370-374`) name the degradation causes
   (active-persist retry pending, confirm-record
   removal/rewrite/slot-delete debt,
-  AND terminal confirm-record corruption — "BOTH" was the r17
-  two-cause framing, corrected to three in r18/r19). The r18 additions
+  terminal confirm-record corruption, AND the write-unverified
+  state — "BOTH" was the r17
+  two-cause framing, corrected to three in r18/r19, to per-state
+  key-class causes in r27-r29, and to the write-unverified
+  aggregate member in r32/r33). The r18 additions
   (Codex m4): the #5473 ordering prose
   at `pkg/configstore/README.md:476-540` gains the failure-phase
   classification (PRE-rename retention vs POST-rename immediate
@@ -5134,20 +5220,23 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      RETAIN with the byte-mismatch classification, the loop keeps
      probing; health never goes green on an unvalidated key);
      the operator-race remediation leg (r34 Codex M1 + r35 Codex
-     M1/m1) — REMOVAL
+     M1/m1 + r36 Codex M1) — REMOVAL
      is safe LIVE (the probe's confirmed-absence barrier is
      idempotent), repair-to-valid FILESYSTEM remediation requires
      xpfd STOPPED with the MANDATORY `mask == 0` precondition
-     EXPLICIT (any live process-local debt forbids the stop — the
-     debts die with the process and a repaired pending-shaped
-     record hash-matches into expired-revert/re-arm at the next
-     boot, `store_persist.go:149-165,171-255,397-401`; live-debt
-     remediation uses the running probe/removal path), and every
+     EXPLICIT and FENCED (the r36 producer-quiesce protocol:
+     (1) no live commit-confirmed window stands, (2) refrain
+     from commits and wait ONE debt-pass interval, (3) RE-CHECK
+     `mask == 0`, (4) stop and repair — a debt raised mid-wait
+     shows at the re-check; the blind-spot residual is admitted
+     with the post-restart recovery path named),
+     and every
      content-INDEPENDENT repair write
      RE-VERIFIES the target's classification inside the SAME
      `s.mu` hold immediately before the rename via the PINNED
-     `WriteFileDurableStaged` pre-rename hook (the hook abandons
-     the temp on a classification change; a test seam drives the
+     `WriteFileDurableStaged` pre-rename hook (the hook UNLINKS
+     the temp on a classification change per the
+     `fsatomic.go:41-44` discipline; a test seam drives the
      failure path — defense-in-depth; the stopped
      requirement is the authoritative closure);
      the OBSERVABILITY leg
@@ -5217,7 +5306,7 @@ the full Go/Rust suites, smoke) run for BOTH units.*
   past the next boot; the lifecycle redesign is a pre-existing policy
   question, not a `d.dp` publication concern.
 
-## 11. Open questions for adversarial review (r36)
+## 11. Open questions for adversarial review (r37)
 
 Resolved in v2-v9 (for the record): A2 deletion; atomic cell choice;
 sampler-only adapter — now STRUCTURAL via `CachedStatusProvider`;
