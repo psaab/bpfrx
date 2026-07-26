@@ -4064,22 +4064,60 @@ while B follows legacy `BulkEnd` processing
 (`sync_conn_read.go:205`) — an inconsistent-reconciliation
 wedge: BOTH sides exchange CONFIRM DECLARATIONS (each
 declares repair-era iff it received the peer's CONFIRM
-before its own deadline), the address-ordered setup owner
+before its own deadline), the setup owner — bound to the AUTHENTICATED STABLE NODE-ID
+ordering plus the setup token and the dialer/acceptor role
+(v9.9.54.7, round-56 Codex H3: "address-ordered" is NOT
+total — address parsing failure returns "dial" on EITHER
+endpoint (`sync_conn.go:12`, and `sync_test.go:1337`
+preserves it), so hostname or unparsable endpoints can make
+BOTH nodes act as owner on crossed setup connections,
+competing installs replacing the same fabric slot
+(`sync_conn.go:244`) with repeated setup/cold-prime churn;
+the plan's OWN stable node-ID ordering (already specified
+for the incarnation state machine) is the total rule, and
+the owner identity is `(stable node-ID order, setup token,
+role)`) —
 computes the class from BOTH declarations (repair-era IFF
 BOTH declared repair-era, else legacy), publishes
 `CAPABILITY_DECISION(class)`, the peer ACKs, and BOTH sides
 install the published class ONLY after the ACK'd decision —
 a side that latched legacy locally REVERSES to the
 published class (the reversal is safe because nothing has
-dispatched yet: the decision precedes session dispatch);
+dispatched yet: the decision precedes session dispatch —
+the full pre-dispatch order is pinned (v9.9.54.5,
+round-56 SMR F1: hello → proof → wrapper → CONFIRM
+declarations → `CAPABILITY_DECISION` + ACK → slot
+install → session dispatch/cold-prime — the decision
+ALWAYS completes before `sync_conn.go:138-194`'s
+cold-prime, so a side that declared repair-era locally
+has dispatched NOTHING when the decision arrives));
 a timeout with NO committed decision closes and retries
 with bounded backoff (never an independent class selection
-while retaining the connection); and the decision lane
+while retaining the connection; and if the
+address-ordered owner DIES before publishing, the
+decision is UNCOMMITTED (v9.9.54.5, round-56 SMR F2: the
+connection closes and retries with bounded backoff; the
+retry's new connection may elect a different owner per
+the same deterministic address-ordered rule, and the
+decision is IDEMPOTENT — the same declarations yield
+the same class regardless of who publishes)); and the decision lane
 handles partial frames explicitly (a partial frame at
 timeout — `sync_auth.go:289` can consume part of a frame —
-is DISCARDED with the framing boundary re-established,
-never half-consumed as state, so the normal reader's next
-header at `sync_conn_read.go:38` is always aligned)); the connection never aborts over a late
+CLOSES the transport and retries on a fresh stream
+(v9.9.54.7, round-56 Codex M4 — "discard the partial frame
+and re-establish framing" is not implementable over a
+stream: `readSyncFrameRaw` consumes header and payload with
+`io.ReadFull` (`sync_auth.go:289`), so a deadline firing
+after partial consumption leaves no record boundary to jump
+to, and starting the ordinary receive loop at its next
+header read (`sync_conn_read.go:27`) would interpret the
+suffix as a new frame: every incomplete or timed-out
+decision frame closes the transport, and the retry runs on
+a fresh stream — with the two timeout CLASSES reconciled:
+the DECISION timeout closes and retries with bounded
+backoff, while the CONFIRM timeout latches the connection
+into the legacy class — the earlier "never aborts over a
+late CONFIRM" refers only to the CONFIRM class)); the connection never aborts over a late
 CONFIRM, so there is no reconnect flap); and when a
 capability transitions inactive→active on a LATER
 connection, a FRESH repair-era full bulk is explicitly
@@ -4096,7 +4134,26 @@ F2: the `SessionSync` mutex owning obligations and
 cold-prime state; the readiness gate reads under the same
 lock, so a takeover decision observes either (armed,
 not-ready) or (unarmed, legacy-complete) — never (armed,
-ready)); and the readiness STATE ITSELF is versioned
+ready)); and the repair is BOUND TO THE NEGOTIATING
+CONNECTION (v9.9.54.7, round-56 Codex B1: the protocol
+class is connection-local, but `BulkSync` calls
+`getActiveConn()` (`sync_bulk.go:50`), which ALWAYS prefers
+fabric 0 when present (`sync_conn.go:27`) — fabric 0
+remaining legacy-latched while fabric 1 reconnects and
+commits `repair-vN` would arm the obligation yet drive the
+bulk over the legacy sibling, which can neither emit the
+repair frames nor complete the terminal exchange, leaving
+the obligation permanently armed despite a usable
+repair-capable connection: the activation, the repair ID,
+every redrive, and the terminal exchange bind to the EXACT
+negotiated slot token (the connection that negotiated
+`repair-vN`), so a repair-era bulk is pinned to that
+token's connection and never selected by fabric
+preference; the documented alternative — RETIRE every
+legacy sibling connection before exposing `repair-vN` —
+composes with the barrier/reset machinery and is the
+fallback for transports where pinning is unsafe);
+and the readiness STATE ITSELF is versioned
 (v9.9.54.4, round-55 Codex H2: a legacy `BulkEnd` queues
 `go s.OnBulkSyncReceived()` ASYNCHRONOUSLY
 (`sync_conn_read.go:246`) and the callback carries no
@@ -4109,8 +4166,38 @@ under `Manager.m.mu` (`sync_state.go:13`): every readiness
 writer — the `OnBulkSyncReceived` callback, the readiness
 timer, and the activation transaction — carries the
 `(connection, protocol, activation)` generation and sets
-ready ONLY by CAS when its generation remains current AND
-no repair obligation is armed, so a stale callback or timer
+ready ONLY through ONE packed atomic readiness word
+(v9.9.54.6, round-56 AGY Q2 + round-56 Codex H2's domain
+completion — the earlier "CAS when its generation remains
+current AND no repair obligation is armed" is TWO atomic
+reads across two lock domains, which does NOT compose
+atomically: a delayed callback G1 can read
+no-obligation-armed under `SessionSync.mu`, drop it, and
+CAS ready=true under `Manager.m.mu` while an activation
+G2 arms the obligation and sets ready=false in between
+(`sync_state.go:13`): readiness is a SINGLE packed
+atomic word (generation in the high bits, the ready bit
+low) — a readiness writer CASes
+`{gen, not-ready} → {gen, ready}` in ONE atomic
+operation, so a generation bump by the activation
+(`{gen, not-ready} → {gen+1, not-ready}`) invalidates
+the writer's expectation ATOMICALLY with no cross-lock
+check at all; the callback captures its generation at
+queue time and its stale `{gen, ready}` expectation
+fails the CAS deterministically), and the generation check
+authorizes the ENTIRE completion transaction, not just the
+readiness bit (v9.9.54.7, round-56 Codex H2: the
+`OnBulkSyncReceived` callback marks bulk primed, stops the
+timer, and calls `ReleaseSyncHold()` BEFORE setting the
+Manager readiness bit (`daemon_ha_sync.go:90`) — and
+releasing the hold restores preemption immediately
+(`vrrp/manager.go:380`), so a stale callback whose
+generation fails can still release the operational hold:
+the completion is ONE serialized, generation-conditional
+transaction — the packed-word CAS authorizes the WHOLE
+bundle (timer cancellation, `syncBulkPrimed`, the VRRP hold
+release, and the Manager mirror) and a stale callback
+performs NONE of them), so a stale callback or timer
 can never restore readiness over an armed repair);
 and only THEN exposes `repair-vN` and
 drives the bulk — so readiness never clears ahead of the
