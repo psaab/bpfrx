@@ -1,8 +1,8 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v34 — r33 findings folded (Codex NEEDS-REVISION
-  3M/2m; AGY PLAN-READY; Claude SMR PLAN-READY 0M/0m — all three
-  confirm the §4.7 structure); pending convergence review r34
+- **Status**: DRAFT v35 — r34 findings folded (Codex NEEDS-REVISION
+  3M/1m; AGY PLAN-READY; Claude SMR PLAN-READY 0M/0m — all three
+  confirm the §4.7 structure); pending convergence review r35
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -1258,6 +1258,43 @@
   active-persist debt). (f) The last errors.As-only per-debt
   definition and the three missing-key-file restoration lumps are
   swept to the class-split.
+  v35: r34 convergence — the remediation race and the state-only
+  false clear close (Codex NEEDS-REVISION 3M/1m, folds 4 FOLDED /
+  2 PARTIAL, structure confirmed; AGY PLAN-READY 6/6 with 3 fresh
+  attacks FAILED, structure confirmed; SMR PLAN-READY 0M/0m,
+  structure confirmed): (a) the two sanctioned remediations split
+  by race safety (Codex M1, verified: the classify→overwrite
+  sequence is not serialized against an operator's in-flight hand
+  repair — `db.go:242-253` ordinary read, then an unconditional
+  atomic replacement at `db.go:207-218` + `fsatomic.go:310-366` —
+  so D's tombstone or the (w-u) restore can delete a record the
+  operator JUST repaired to valid): REMOVAL is safe LIVE (the
+  confirmed-absence barrier is idempotent — a removal cannot be
+  destructively overwritten); repair-to-valid FILESYSTEM
+  remediation requires xpfd STOPPED (the BOOT-origin offline
+  posture); and every content-INDEPENDENT repair write RE-VERIFIES
+  the target's classification inside the SAME `s.mu` hold
+  immediately before the rename (abort + re-classify on any
+  change — defense-in-depth; the stopped requirement is the
+  authoritative closure). (b) The state exit re-verifies the key
+  identity (Codex M2, verified the state-only false clear:
+  `Save()` can ENTER the state with NO persistence debt; a pass
+  validates both files, the key path is swapped to K′ before the
+  exit, and the debt-clear compare does not apply — with no debt,
+  clearing the state exits the loop and health goes GREEN while
+  the installed K′ decrypts neither record): the positive-
+  validation exit performs its OWN final key-path re-read and
+  EXACT-BYTES compare against the validation snapshot immediately
+  before clearing — mismatch → RETAIN with the byte-mismatch
+  classification, the loop keeps probing; the x25 state-only
+  second-swap regression pins it. (c) The observability sweep
+  completes (Codex M3): the §5.1 implementation inventory, both
+  formal test inventories, and the API precedence copy now carry
+  `ConfigWriteUnverified` in the aggregate AND the WriteUnverified
+  precedence position. (d) The cumulative-summary master-key-IO
+  sentence is re-punctuated (Codex m1: KEY-CLASS permanent →
+  restoration; master-key IO READ-side → TRANSIENT retry with the
+  UNVERIFIABLE message, NO restoration claim).
 
 ---
 
@@ -2700,7 +2737,23 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   decrypt-validation of an on-disk encrypted record (confirm or
   active) under those SAME bytes (single snapshot — the no-create
   primitive's discipline) — never on the mere absence of a
-  failure and never on a non-key-class outcome. THE EXIT IS
+  failure and never on a non-key-class outcome. AND THE STATE
+  EXIT ITSELF RE-VERIFIES THE KEY IDENTITY (r34 Codex M2,
+  verified the state-only false clear: `Save` can ENTER the state
+  and start the loop with NO persistence debt at all; a pass
+  validates both K-encrypted files, the unlocked key path is then
+  swapped to K′ before the exit, and the debt-clear key compare
+  at (ii) does not apply — with no debt, clearing the state
+  satisfies the loop-exit condition, the loop terminates, and
+  health goes GREEN while the installed K′ decrypts neither
+  record): the positive-validation exit performs its OWN final
+  key-path re-read and EXACT-BYTES compare against the validation
+  snapshot immediately before clearing (the same discipline the
+  debt clear carries at (ii), generalized to the state) — a
+  mismatch RETAINS the state with the byte-mismatch
+  classification (restoration-required) and the loop keeps
+  probing; a match clears. The x25 legs gain the state-only
+  second-swap regression. THE EXIT IS
   ACTION-SCOPED AND CONTINUOUS, NOT A ONE-SHOT GLOBAL CLEAR (r32
   Codex M1a, verified the insufficiency: validating "an" encrypted
   record says nothing about a SECOND on-disk generation — a DB
@@ -3202,7 +3255,30 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   classification — and an arm or restore overwriting a differing
   record is intentional (the Store owns the slot; the single-Store
   invariant at `daemon.go:1042-1053` covers processes, and this pin
-  covers hand edits). The KEY-CLASS remediation is operator-correct
+  covers hand edits). THE TWO REMEDIATIONS SPLIT BY RACE SAFETY
+  (r34 Codex M1, verified: the classify→overwrite sequence —
+  ordinary `ReadConfirm` at `db.go:242-253`, then an unconditional
+  atomic replacement at `db.go:207-218` + `fsatomic.go:310-366` —
+  is NOT serialized against an operator's in-flight hand repair,
+  so D's synthesized tombstone or the (w-u) restore can overwrite
+  and delete a record the operator JUST repaired to valid, never
+  classifying it): REMOVAL is safe LIVE (the operator's `rm`
+  cannot be destructively overwritten — the probe's confirmed
+  absence re-drives only the idempotent barrier); repair-to-valid
+  FILESYSTEM remediation requires xpfd STOPPED (the same
+  offline/serialized posture as the BOOT-origin key-restoration
+  branch — the operator repairs the record, restarts, and the
+  boot total order classifies it), while the LIVE alternative is
+  the probe-mediated removal path. As defense-in-depth, every
+  content-INDEPENDENT repair write (the (w-u) restore, the D
+  synthesized tombstone) RE-VERIFIES the target's classification
+  inside the SAME `s.mu` hold immediately before the rename —
+  byte-identity/hash of the classified content vs the current
+  on-disk content; ANY change aborts the write and re-classifies
+  (best-effort against the unlocked filesystem — the stopped
+  requirement above is the authoritative closure, since the
+  operator's own write can land between the re-verify and the
+  rename by the same unlocked mechanics). The KEY-CLASS remediation is operator-correct
   (r25 Codex m2 + r26 Codex m1): when the stall is crypto-class, the journal
   carries the exact cause (`invalid master key length in
   /etc/xpf/.configdb/master.key` / `read master key: ...` / authentication
@@ -4057,9 +4133,10 @@ v20 history). The delivery is TWO units:
   state, folded into the aggregate; all NON-SECRET, never from message
   text (r27 Codex m2 + r28 Codex M3)}`
   with the aggregate `ConfigPersistDegraded()` DERIVED
-  (`persistDegraded || mask ≠ 0 || enum ≠ OK`), and precedence
+  (`persistDegraded || mask ≠ 0 || enum ≠ OK || writeUnverified`),
+  and precedence
   TerminalUnreadable > RestartRecoveryOwed >
-  ConfirmDebt > ActivePersist; the
+  ConfirmDebt > WriteUnverified > ActivePersist; the
   SyncApply finalize ordering in `store.go`; the hedge-the-cause
   stale-drop diagnostic (`store_persist.go:159-165`).
 - `pkg/api` (r16 Codex m3 + r17 Codex M6/m2 + r18 Codex M7/m5 + r19
@@ -4074,10 +4151,12 @@ v20 history). The delivery is TWO units:
   `.configdb/master.key` restoration when the RENDERED LEVEL's
   key-class cause bit is set — `ConfirmRecordKeyClass` at terminal
   precedence, any `ConfirmDebtKeyClassMask` bit at confirm-debt
-  precedence — >
+  precedence — > write-unverified ("master-key validation
+  outstanding") >
   active-persist), plus the
   DISTINCT restart-recovery-owed message for the BOOT-origin substate;
-  `metrics.go` keeps the gauge on the aggregate OR;
+  `metrics.go` keeps the gauge on the aggregate OR (including
+  `ConfigWriteUnverified`);
   `metrics_descriptors.go` + the field/wiring comments name all three
   causes; a Config → NewServer plumbing test pins the wiring.
 - `pkg/fwdstatus/sampler.go`: `CachedStatusProvider` interface; `NewSampler`
@@ -4766,13 +4845,13 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      latch), ConfigWriteUnverified (the WRITE-UNVERIFIED state,
      folded into the aggregate)}`; the aggregate
      `ConfigPersistDegraded()` is DERIVED
-     (`persistDegraded || mask ≠ 0 || enum ≠ OK`);
+     (`persistDegraded || mask ≠ 0 || enum ≠ OK || writeUnverified`);
      /health renders by precedence TerminalUnreadable >
      RestartRecoveryOwed > ConfirmDebt (generic
      removal/rewrite/slot-delete message + mask detail, REPLACED by
      the key-class variant naming ORIGINAL `.configdb/master.key`
      restoration when the rendered level's cause bit is set) >
-     ActivePersist;
+     WriteUnverified > ActivePersist;
      the gauge consumes the derived aggregate OR;
      descriptor/option/wiring comments name all the causes; (x15) TAXONOMY BOUNDARY (r17 Codex M4 + r25 Codex M1): master-key
      IO → TRANSIENT retry, no latch; NON-KEY-CLASS permanent
@@ -4849,14 +4928,15 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      latch), ConfigWriteUnverified (the WRITE-UNVERIFIED state,
      folded into the aggregate)}`; the aggregate
      `ConfigPersistDegraded()` is a DERIVED value
-     (`persistDegraded || mask ≠ 0 || enum ≠ OK`), not a snapshot
+     (`persistDegraded || mask ≠ 0 || enum ≠ OK || writeUnverified`),
+     not a snapshot
      field; /health
      renders by precedence TerminalUnreadable > RestartRecoveryOwed
      > ConfirmDebt (generic removal/rewrite/slot-delete message +
      mask detail, REPLACED by the key-class variant naming ORIGINAL
      `.configdb/master.key` restoration when the rendered level's
      cause bit is set)
-     > ActivePersist; the gauge
+     > WriteUnverified > ActivePersist; the gauge
      consumes the derived aggregate OR (never healthy-while-gauge-1); the
      Config → NewServer plumbing test pins both callbacks wired;
      (x22) D-SUPPRESSION LEGS (r27 Codex m1 + r29 Codex m3): (x22a)
@@ -4965,6 +5045,21 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      (r33 Codex m2) — SyncApply PROMOTES in-memory per its #1799
      Option-B contract while its encrypted persistence attempt is
      WITHHELD under the state and raises the active-persist debt;
+     the state-only second-swap leg (r34 Codex M2) — `Save()`
+     ENTERS the state with NO persistence debt, a pass validates
+     both files, the key path is swapped to K′ before the exit:
+     the exit's OWN final key-path re-read and EXACT-BYTES compare
+     against the validation snapshot catches it (mismatch →
+     RETAIN with the byte-mismatch classification, the loop keeps
+     probing; health never goes green on an unvalidated key);
+     the operator-race remediation leg (r34 Codex M1) — REMOVAL
+     is safe LIVE (the probe's confirmed-absence barrier is
+     idempotent), repair-to-valid FILESYSTEM remediation requires
+     xpfd STOPPED, and every content-INDEPENDENT repair write
+     RE-VERIFIES the target's classification inside the SAME
+     `s.mu` hold immediately before the rename (abort +
+     re-classify on any change — defense-in-depth; the stopped
+     requirement is the authoritative closure);
      the OBSERVABILITY leg
      (r32 Codex M1b) — `ConfigWriteUnverified` renders in /health
      and folds into the aggregate OR, and the retry loop ACTIVELY
@@ -5032,7 +5127,7 @@ the full Go/Rust suites, smoke) run for BOTH units.*
   past the next boot; the lifecycle redesign is a pre-existing policy
   question, not a `d.dp` publication concern.
 
-## 11. Open questions for adversarial review (r34)
+## 11. Open questions for adversarial review (r35)
 
 Resolved in v2-v9 (for the record): A2 deletion; atomic cell choice;
 sampler-only adapter — now STRUCTURAL via `CachedStatusProvider`;
@@ -5363,13 +5458,14 @@ remaining schema copies unified (exact three-value breakdown with
 the aggregate DERIVED and the four-level precedence); r25 additions:
 the exemption scoped BY FAILURE CLASS (KEY-CLASS permanent —
 authentication failure + invalid observed key length, the mechanical
-`ConfirmRecordKeyClassError` subtype consumed via `errors.As`;
-master-key IO is TWO-SIDED — READ-side TRANSIENT, WRITE-side
+`ConfirmRecordKeyClassError` subtype consumed via `errors.As` —
+retains with the `.configdb/master.key`-RESTORATION message and NO
+repair write, since writing under a new key launders the
+unreadable-active state; master-key IO is TWO-SIDED — READ-side
+TRANSIENT (retain + retry with the key-state UNVERIFIABLE message,
+NO restoration claim) and WRITE-side
 BLOCKED since `readOrCreateMasterKey` auto-creates a fresh key on
-`IsNotExist` — retains
-with the `.configdb/master.key`-restoration message and NO repair
-write, since
-writing under a new key launders the unreadable-active state; only
+`IsNotExist`; only
 NON-key-class permanent failures take the repair-write exemption;
 EVERY repair action and clear validates the ACTIVE side is also
 readable under the current key), D FULLY SUPPRESSED while ANY LIVE
