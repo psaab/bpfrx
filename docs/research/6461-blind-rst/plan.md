@@ -4044,9 +4044,15 @@ mutually exclusive: a slow or never-arriving CONFIRM
 LATCHES THE CONNECTION INTO THE LEGACY CLASS for the
 connection's lifetime (the CONFIRM exchange carries its own
 deadline, like the auth handshake's; the peer that cannot
-confirm gets legacy — the safe, complete class — and a
-later v2-capable connection re-runs the full negotiation
-from scratch); the connection never aborts over a late
+confirm gets legacy — the safe, complete class); and the
+latch binds for the CONNECTION's lifetime with NO
+in-connection escape (v9.9.54.3, round-55 SMR F1: a peer
+that upgrades to v2 mid-connection still finishes this
+connection in the legacy class, and the upgrade takes
+effect only on the NEXT connection — a new incarnation
+re-runs the full negotiation: hello, v2 proof, CONFIRM,
+repair-era — so the latch can never strand a capable peer
+and never permits a mid-connection protocol flip); the connection never aborts over a late
 CONFIRM, so there is no reconnect flap); and when a
 capability transitions inactive→active on a LATER
 connection, a FRESH repair-era full bulk is explicitly
@@ -4057,7 +4063,13 @@ activates leaves an interval where transfer can occur with
 the obligations and freeze unarmed: on ANY transition to
 repair-vN, the activation FIRST mints the repair ID and
 atomically establishes the outbound obligation AND the
-not-ready state, and only THEN exposes `repair-vN` and
+not-ready state — one critical section under the same lock
+domain that owns the sync state (v9.9.54.3, round-55 SMR
+F2: the `SessionSync` mutex owning obligations and
+cold-prime state; the readiness gate reads under the same
+lock, so a takeover decision observes either (armed,
+not-ready) or (unarmed, legacy-complete) — never (armed,
+ready)) — and only THEN exposes `repair-vN` and
 drives the bulk — so readiness never clears ahead of the
 armed repair); the
 negotiated feature state being PER-CONNECTION (v9.9.48,
