@@ -4105,7 +4105,21 @@ address-ordered owner DIES before publishing, the
 decision is UNCOMMITTED (v9.9.54.5, round-56 SMR F2: the
 connection closes and retries with bounded backoff; the
 retry's new connection may elect a different owner per
-the same deterministic address-ordered rule, and the
+the same deterministic STABLE-NODE-ID-ordered rule
+(v9.9.54.9, round-57 Codex H4: this sweeps the last
+"address-ordered" stragglers — address parsing returns
+"dial" at EITHER endpoint on failure
+(`sync_conn.go:12-20`), enabling crossed setups to
+repeatedly supersede the same slot (`sync_conn.go:244-266`);
+the owner rule is stable-node-ID-ordered EVERYWHERE); and
+EQUAL node IDs are explicitly REJECTED (v9.9.54.9, round-57
+Codex H4: equal authenticated node IDs have no strict
+ordering, and the existing HA code treats duplicate IDs as
+invalid and fails closed (`heartbeat.go:811-820`,
+`election.go:195-202`): a transcript presenting equal
+`node_id`s is rejected with an OPERATOR-VISIBLE not-ready
+state, and the setup token and connection role NEVER turn
+duplicate IDs into competing owners); and the
 decision is IDEMPOTENT — the same declarations yield
 the same class regardless of who publishes)); and the decision lane
 handles partial frames explicitly (a partial frame at
@@ -4120,7 +4134,24 @@ to, and starting the ordinary receive loop at its next
 header read (`sync_conn_read.go:27`) would interpret the
 suffix as a new frame: every incomplete or timed-out
 decision frame closes the transport, and the retry runs on
-a fresh stream — with the two timeout CLASSES reconciled:
+a fresh stream — and the post-wrapper decision phase runs an
+ALLOWLISTED AUTHENTICATED reader, never the bare
+header+payload reader (v9.9.54.9, round-57 Codex H3:
+authenticated writes append a sequence/HMAC trailer
+(`sync_protocol.go:49-62`) that the setup reader does NOT
+strip (`sync_auth.go:289-310`), and trailer
+consumption/verification exists only in the ordinary
+receive loop (`sync_conn_read.go:71-94`), which cannot
+start early (it dispatches before the slot token exists) —
+literal reuse leaves the trailer to be parsed as the next
+header, a bad-magic reconnect loop: the pre-install reader
+consumes and verifies header, payload, AND trailer while
+advancing `authConn.recvSeq`, and it is allowlisted to the
+decision-phase frame types); and the CONFIRM-timeout byte
+rules are exact (v9.9.54.9: the stream retains and
+legacy-latches ONLY if ZERO bytes were consumed; a partial
+CONFIRM frame closes; a COMPLETE late CONFIRM is consumed
+and IGNORED before declarations); with the two timeout CLASSES reconciled:
 the DECISION timeout closes and retries with bounded
 backoff, while the CONFIRM timeout latches the connection
 into the legacy class — the earlier "never aborts over a
@@ -4141,7 +4172,26 @@ F2: the `SessionSync` mutex owning obligations and
 cold-prime state; the readiness gate reads under the same
 lock, so a takeover decision observes either (armed,
 not-ready) or (unarmed, legacy-complete) — never (armed,
-ready)); and the repair is BOUND TO THE NEGOTIATING
+ready)); and the activation acquires a GENERATION-SCOPED
+ELECTION HOLD BEFORE exposing `repair-vN` (v9.9.54.9,
+round-57 Codex B1: the VRRP operational hold is acquired
+only during daemon startup
+(`daemon_run_bringup.go:226-233`) and a completed legacy
+bulk RELEASES it (`daemon_ha_sync.go:90-100`), restoring
+preemption (`vrrp/manager.go:389-404`) — while the packed
+`syncReady` state gates only private-RG election
+(`cluster/manager.go:289-293`), NOT normal VRRP: a legacy
+bulk completing, then a later connection activating
+`repair-vN` and going not-ready, would leave normal VRRP
+preemption ENABLED before the repair's `JOURNAL_END` (a
+priority event preempts mid-repair): the activation
+transaction acquires the election hold scoped to ITS
+generation before exposing `repair-vN`; only a
+matching-generation completion (the repair's `JOURNAL_ACK`
+at that generation) may release it; and the hold's timeout
+NEVER silently releases while a negotiated repair
+obligation remains armed (a stale timeout checks the
+generation and re-arms)); and the repair is BOUND TO THE NEGOTIATING
 CONNECTION (v9.9.54.7, round-56 Codex B1: the protocol
 class is connection-local, but `BulkSync` calls
 `getActiveConn()` (`sync_bulk.go:50`), which ALWAYS prefers
@@ -4208,7 +4258,21 @@ never a stale ready), so a generation bump by the activation
 the writer's expectation ATOMICALLY with no cross-lock
 check at all; the callback captures its generation at
 queue time and its stale `{gen, ready}` expectation
-fails the CAS deterministically), and the generation check
+fails the CAS deterministically), and the CAS ORDER and
+bundle serialization are explicit (v9.9.54.9, round-57
+Codex H2: the readiness writer is ONE-SHOT (its CAS attempt
+fires once — a writer that CASes `{g, not-ready} →
+{g, ready}` and pauses has committed ONLY the bit so far,
+and its remaining effects run inside the packed word's own
+critical section, so an activation's bump can never split
+them); the activation CAS-loops `{g, *} → {g+1, not-ready}`;
+if the writer wins the CAS, the activation WAITS for the
+entire completion bundle under the packed word's
+serialization (the word's critical section), then bumps the
+generation AND RE-ARMS THE ELECTION HOLD before exposing
+`repair-vN`; the CAS ALWAYS precedes irreversible effects;
+and a process crash mid-bundle reconstructs not-ready/hold
+from current state at restart); and the generation check
 authorizes the ENTIRE completion transaction, not just the
 readiness bit (v9.9.54.7, round-56 Codex H2: the
 `OnBulkSyncReceived` callback marks bulk primed, stops the
@@ -5043,6 +5107,27 @@ admitted interval):
   v9.9.33 transition boundaries (round-43 Codex L9): RESET_GEN
   loss and simultaneous resets (retransmit on the control
   connection; timeout never discharges the obligation, only
+  readiness is restored by a matching repair completion);
+  (d10) v9.9.54.9 boundaries (round-57 Codex L5): pinned-token
+  death and successor repair (the pin follows the token, the
+  obligation follows the incarnation; the next connection's
+  negotiation re-arms the drive pinned to the new token);
+  both packed-CAS winner orders (writer-wins → activation
+  waits for the bundle, bumps, re-arms the election hold;
+  activation-wins → writer drops every effect); VRRP-hold
+  re-arming on activation (the generation-scoped hold
+  precedes repair-vN exposure; a stale timeout re-arms,
+  never silently releases while an obligation is armed);
+  equal-node-ID rejection (transcript with equal node_ids →
+  refused repair-era, operator-visible not-ready, fail-closed
+  per heartbeat.go:811-820 / election.go:195-202);
+  authenticated decision trailers (the pre-install
+  allowlisted reader consumes and verifies header + payload +
+  trailer and advances authConn.recvSeq — no bad-magic loop);
+  and absent-vs-partial CONFIRM timeout (zero bytes consumed →
+  retain and legacy-latch; partial → close; complete late →
+  consume and ignore before declarations);
+  the pending-rejection GC wakeup
   re-opens admission with readiness degraded); same-fabric
   token supersession (C2 installs → T1 revoked before the slot
   swap; a paused C1 handler never publishes); merged-capacity
