@@ -4170,7 +4170,13 @@ entered ONLY after authenticated support ADVERTISEMENT
 the capability record, rolling-gated; the advertisement
 point on a v1-proof connection is the capability record
 itself, which rides the authenticated connection and is
-therefore authenticated by construction, v9.9.54.12,
+therefore authenticated by construction — and BIT 5 follows
+the SAME v1-proof rule as every other capability (v9.9.54.13,
+round-60 SMR F1: on a v1-proof connection it is advertised,
+not active, until the matching authenticated
+`CAPABILITY_CONFIRM` — the decision phase requires BOTH
+bit 5 present AND, on a v1-proof connection, the
+post-wrapper CONFIRM), v9.9.54.12,
 round-59 Codex B1); a baseline peer's first ordinary
 legacy frame is BUFFERED, the connection latches legacy,
 installs, and dispatches the buffered frame in order —
@@ -4257,7 +4263,13 @@ repair can complete, a later overflow can lose E1, and a
 priority event can promote the incomplete standby before
 the replacement `JOURNAL_END`: EVERY aggregate readiness
 true→false transition acquires a new generation-scoped
-hold); the alternative is the explicit
+hold — MINTED FRESH per transition, with releases
+generation-validated (v9.9.54.13, round-60 SMR F2: a
+true→false→true flap mints a fresh hold generation per
+transition, and a completion releases ONLY the exact
+generation it armed — a release for generation N is a no-op
+when the current hold is generation N+K, so an earlier
+hold's release can never race a newer hold)); the alternative is the explicit
 aggregate: EVERY locally relevant obligation discharged at
 the current generation — enumerated EXACTLY (v9.9.54.11,
 round-59 SMR F2: the THREE classes are the inbound repair
@@ -4288,7 +4300,33 @@ discards the textual reason (`:460`), so every
 (`daemon_ha.go:314`) and a literal "ForceRGMaster-equivalent"
 cannot distinguish planned transfer from automatic election:
 the token is issued only after the explicit repair/barrier
-proof, carries the operator intent (the request's
+proof — AND only after the MISSING-STATE PREDICATES CLEAR
+(v9.9.54.12, round-59 Codex B3: `WaitForPeerBarrier` proves
+only that earlier queued frames were processed
+(`sync_bulk.go:329`; the receiver merely acknowledges the
+marker, `sync_conn_read.go:496`) — it cannot reconstruct E1
+discarded during overflow or rejected before publication,
+and the demoting node explicitly skips bulk readiness,
+stops retry, and then sends the barrier
+(`daemon_ha_userspace_readiness.go:155, :160, :186`): the
+override issues only after the pending-rejection set is
+empty AND no repair obligation is outstanding AND the last
+full repair completed through `JOURNAL_END` at the current
+generation — the barrier alone never substitutes for state
+completeness; the alternative is to FORCE AND VALIDATE a
+full repair through `JOURNAL_END` before the final barrier,
+with the forced repair running through the NORMAL
+obligation machinery (arm → drive → `JOURNAL_END`,
+re-arming the retry machinery for one cycle) and NEVER
+gated by the barrier (the barrier only gates the override's
+issue — no wait cycle, v9.9.54.13, round-60 SMR F3) —
+carrying its TRANSFER-GENERATION and validated
+like the readiness writers (v9.9.54.13, round-60 SMR F4:
+the override validates `token.gen == the RG's current
+transfer-generation` via the same packed-word CAS
+discipline and consumes the token one-shot — a token from
+an OLD generation fails the validation deterministically,
+closing the replay/ABA), carries the operator intent (the request's
 authenticated source and reason), and is consumed by the
 override; a `Secondary → Primary` event WITHOUT a token is
 an automatic election and fenced by the hold; and the
@@ -4378,15 +4416,41 @@ bundle serialization are explicit (v9.9.54.9, round-57
 Codex H2: the readiness writer is ONE-SHOT (its CAS attempt
 fires once — a writer that CASes `{g, not-ready} →
 {g, ready}` and pauses has committed ONLY the bit so far,
-and its remaining effects run inside the packed word's own
-critical section, so an activation's bump can never split
+and its remaining effects run as generation-tagged
+idempotent follow-ups OUTSIDE the packed word's critical
+section (v9.9.54.12, round-59 Codex H4: this strikes the
+last "inside the packed word's critical section" straggler
+— the v9.9.54.10 `Completing(g, ticket)` rule is the only
+effect-placement contract), so an activation's bump can never split
 them); the activation CAS-loops `{g, *} → {g+1, not-ready}`;
 if the writer wins the CAS, the activation WAITS for the
 entire completion bundle under a RECOVERABLE
 `Completing(g, ticket)` state with a deadline and
 generation-tagged, idempotent effects (v9.9.54.10,
 round-58 Codex H3 — "wait under the packed word's critical
-section" can hang FOREVER: the bundle's `ReleaseSyncHold`
+section" can hang FOREVER (and v9.9.54.12, round-59 Codex H4:
+the `Completing(g, ticket)` state gets a DURABLE
+same-generation watchdog/executor — G1 can enter
+`Completing`, block acquiring `vrrp.Manager.mu` through
+`ReleaseSyncHold` (`daemon_ha_sync.go:90`,
+`vrrp/manager.go:389`), and expire while `UpdateInstances`
+waits indefinitely in `vi.stop()` (`:432`, `:510`,
+`instance.go:1382`), so with no later activation nothing
+would retry G1 and G2 cannot safely execute G1's ready
+effects: the executor retries abandoned tickets for the
+CURRENT generation; EACH target API validates ticket AND
+generation before executing an effect; and the executor's
+OWN liveness is structural (v9.9.54.13, round-60 SMR F5:
+the watchdog dispatches effects to per-ticket WORKERS that
+validate ticket+generation, and the watchdog itself NEVER
+calls any effect API — it cannot block on `vrrp.Manager.mu`
+or anything else; it monitors worker deadlines, and a hung
+WORKER's ticket is abandoned by deadline, never by the
+watchdog blocking); and supersession is
+explicit — a new activation supersedes the old ticket only
+after the executor confirms the old ticket's effects either
+completed or were safely abandoned (each effect idempotent,
+so re-running is safe)): the bundle's `ReleaseSyncHold`
 waits for `vrrp.Manager.mu` (`vrrp/manager.go:389`), and
 `UpdateInstances` holds that mutex across reconciliation
 (`:432`) and can wait without a deadline in `vi.stop()`
