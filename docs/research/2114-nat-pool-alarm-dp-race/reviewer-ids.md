@@ -80,6 +80,9 @@ reviewer (joins at /engineer on the code PR).
 | r25 | Codex | codex companion task-mrzl4988-0rbcj8 (session 019f9681-db28-79e2-b870-a05d5b58f32f) | NEEDS-REVISION (2 MAJOR, 4 MINOR) |
 | r25 | AGY | agy print-mode direct (agy-plan-r25.md) | PLAN-READY (0 findings) |
 | r25 | Claude SMR | in-conversation (claude-smr-plan-r25.md) | PLAN-READY-WITH-NITS (0 MAJOR, 2 MINOR — rationale sharpening + key remediation pointer, folded via Codex m1/m2) |
+| r26 | Codex | codex companion task-mrzn2yl4-p29s8i (session 019f96b4-30f2-7ad1-af45-907c26112bf3) | NEEDS-REVISION (3 MAJOR, 1 MINOR; folds 2 FOLDED / 5 PARTIAL) |
+| r26 | AGY | agy print-mode direct (agy-plan-r26.md) | PLAN-READY (7/7 folds FOLDED; 3 fresh attacks FAILED) |
+| r26 | Claude SMR | in-conversation (claude-smr-plan-r26.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — two-sided master-key-IO classification pin, folded into Codex M3) |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 
