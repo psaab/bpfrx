@@ -1,10 +1,9 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v40 — r39 findings folded (Codex NEEDS-REVISION
-  6M/0m; AGY PLAN-READY-WITH-NITS; Claude SMR PLAN-READY-WITH-NITS
-  0M/1m — AGY's attack-2 and SMR m1 are the same prefer-removal
-  nit, the third independent convergence; all three confirm the
-  §4.7 structure); pending convergence review r40
+- **Status**: DRAFT v41 — r40 findings folded (Codex NEEDS-REVISION
+  2M/1m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m —
+  its H-branch config-shape split is folded here; all three
+  confirm the §4.7 structure); pending convergence review r41
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -1424,8 +1423,11 @@
   status surfaces expose only cumulative/history data —
   `cluster/sync.go:191-228`, `cluster/status.go:340-356` — so no
   observable predicate can fence peer-driven syncs): the
-  operator STOPS THE PEER xpfd (or downs the cluster control
-  link `em0`) BEFORE the fence wait — a stopped peer is a
+  operator STOPS THE PEER xpfd (the v39 text also offered
+  "downs the cluster control link `em0`" as an alternative —
+  WITHDRAWN in v40: sync falls back to fabric over possibly two
+  redundant paths, `daemon_ha_sync.go:774-785,820-860`) BEFORE
+  the fence wait — a stopped peer is a
   deterministic barrier for every peer-driven SyncApply. (b)
   The abandoned-D offline repair shape is pinned (Codex M2,
   verified the conflation: a tombstone FAILURE leaves the
@@ -1516,6 +1518,39 @@
   SUPPRESS the later `xpf.conf` import,
   `bootstrap.go:65-79,237-247`): the operator STAGES the
   intended configuration first, then commits.
+  v41: r40 convergence — the fence gains its observable join and
+  the H-branch config-shape split is made explicit (Codex
+  NEEDS-REVISION 2M/1m, folds 3 FOLDED / 3 PARTIAL, structure
+  confirmed; AGY PLAN-READY 6/6 with 2 fresh attacks FAILED,
+  structure confirmed; SMR PLAN-READY-WITH-NITS 0M/1m): (a) the
+  cluster status surface (gRPC/CLI, BOTH nodes) gains a
+  config-sync QUEUE-DEPTH + APPLY-IN-FLIGHT indicator (Codex M1,
+  verified the barrier gap: the private 64-slot channel's
+  consumer invokes `syncAndApply(context.Background())` and can
+  block INDEFINITELY on `applySem` —
+  `sync_conn_config.go:325-351`, `daemon_apply_commit.go:326-335`
+  — so NO time-based wait drains the queue; the currently-private
+  queue and flag, `cluster/sync.go:594-616`, are exposed
+  read-only) and the fence drains BOTH directions through it —
+  (2a) LOCAL DRAIN until the indicator shows queue-empty AND no
+  apply-in-flight locally, then one capped pass; (2b) PEER-SIDE
+  full-state preflight (a just-landed sync's debts are raised
+  synchronously at the peer and visible on its own status — and
+  the reverse-direction TOCTOU is closed by the local drain: no
+  local→peer push can be in flight when the peer stops);
+  (2c) STOP THE PEER; (3) local full-state re-check; (4) stop
+  and repair. (b) The H-branch config-shape split is explicit
+  (SMR m1): in the H case the M6 staged-commit path works ONLY
+  for a NON-clustered intended config — a staged CLUSTERED commit
+  is preflight-REJECTED (cleanly, BEFORE store promotion,
+  `daemon_apply_commit.go:194-205`, with the restart instruction
+  in the error text) — so the operator stages+commits only when
+  the intended configuration is standalone, and uses the
+  restart/import path when it is clustered. (c) The §11
+  question-6 baseline is corrected ("the current design", not
+  "the v29 design" — Codex m1) and the retained v39 history
+  entry's `down em0` alternative is annotated WITHDRAWN (Codex
+  fold-partial 3).
 
 ---
 
@@ -3532,40 +3567,54 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   window stands (confirm or roll back any armed window first —
   window resolution is operator-paced), (2) the operator REFRAINS
   from new commits and FENCES the async producer ENFORCEABLY,
-  with the peer-side preflight and ordering PINNED (r38 Codex M1
-  + r39 Codex M2/M3, all verified: (i) the SyncApply apply flag
-  and queue are PRIVATE — `cluster/sync.go:594-616` — and the
-  public status surfaces expose only cumulative/history data —
+  with the observable join, the peer-side preflight, and the
+  ordering PINNED (r38 Codex M1 + r39 Codex M1/M2/M3 + r40 Codex
+  M1/M2, all verified: (i) the SyncApply apply flag and queue
+  are PRIVATE — `cluster/sync.go:594-616` — and the public
+  status surfaces expose only cumulative/history data —
   `cluster/sync.go:191-228`, `cluster/status.go:340-356` — so no
-  observable predicate fences peer-driven syncs; (ii) `down em0`
-  is NOT a universal alternative: config sync uses the
-  configured control interface only when both control fields
-  exist and otherwise falls back to the fabric, possibly over
-  TWO redundant paths — `daemon_ha_sync.go:774-785,820-860`;
-  (iii) the peer stop abandons the PEER's process-local debts
-  symmetrically, so the peer needs the SAME full-state
-  preflight before IT is stopped; (iv) the restart ORDER
-  matters — a peer restarted before the target stops resumes
-  reconnect/reconcile pushes, `daemon_ha_sync.go:926-956`, while
-  a peer left stopped after the target stops is a full cluster
-  outage): (2a) PEER-SIDE PREFLIGHT — on the PEER, verify the
-  same full-state condition (peer `ConfirmDebtKindMask == 0` AND
-  peer `persistDegraded == false`); if the peer is not clean,
-  the stopped path is UNAVAILABLE — use the live removal path
-  instead; (2b) STOP THE PEER xpfd (the universal fence — a
-  stopped peer cannot push over ANY transport); (2c) wait ONE
-  full pass at the retry loop's CAPPED backoff (the
-  `maxBackoff` parameter — debts themselves are raised
-  SYNCHRONOUSLY in memory under `s.mu` at the producing
-  operation's failure, so the re-check observes them regardless
-  of backoff phase, but an in-flight resolution's finalize runs
-  inside a pass, and the local receiver's queued apply —
-  `cluster/sync.go:594-616,850-857`,
-  `sync_conn_config.go:325-351` — is a LOCAL operation whose
-  promotion/cancellation/debt-raise lands synchronously within
-  the pass it runs in, so one capped pass guarantees any
-  in-flight or queued apply has either completed or re-raised);
-  (3)
+  observable predicate fences peer-driven syncs TODAY; (ii) the
+  private 64-slot channel's consumer invokes
+  `syncAndApply(context.Background())` and can block
+  INDEFINITELY on `applySem` — `sync_conn_config.go:325-351`,
+  `daemon_apply_commit.go:326-335` — so NO time-based wait
+  drains the queue; (iii) `down em0` is NOT a universal
+  alternative: config sync uses the configured control interface
+  only when both control fields exist and otherwise falls back
+  to the fabric, possibly over TWO redundant paths —
+  `daemon_ha_sync.go:774-785,820-860`; (iv) the peer stop
+  abandons the PEER's process-local debts symmetrically, so the
+  peer needs the SAME full-state preflight before IT is stopped;
+  (v) the reverse direction has its own TOCTOU — when the
+  target is RG0 authority, reconnect/promotion/the reconciler
+  can push the current config to the peer BETWEEN the peer's
+  check and its stop, raising peer `persistDegraded` on write
+  failure, `store.go:687-717,738-746`, and degraded health is
+  election-neutral so a crash takeover in the gap stays ungated;
+  (vi) the restart ORDER matters — a peer restarted before the
+  target stops resumes reconnect/reconcile pushes,
+  `daemon_ha_sync.go:926-956`, while a peer left stopped after
+  the target stops is a full cluster outage): THE OBSERVABLE
+  JOIN IS ADDED TO THE PLAN — the cluster status surface
+  (gRPC/CLI, BOTH nodes) gains a config-sync QUEUE-DEPTH +
+  APPLY-IN-FLIGHT indicator (the currently-private queue and
+  flag, `cluster/sync.go:594-616`, exposed read-only) — and the
+  fence drains BOTH directions through it: (2a) LOCAL DRAIN —
+  wait until the indicator shows queue-empty AND no
+  apply-in-flight on the LOCAL node (no local→peer push can be
+  in flight), then ONE full pass at the retry loop's CAPPED
+  backoff (debts themselves are raised SYNCHRONOUSLY in memory
+  under `s.mu` at the producing operation's failure, so the
+  re-check observes them regardless of backoff phase, and an
+  in-flight resolution's finalize runs inside a pass); (2b)
+  PEER-SIDE PREFLIGHT — on the PEER, verify the same
+  full-state condition (peer `ConfirmDebtKindMask == 0` AND
+  peer `persistDegraded == false` — a just-landed sync's debts
+  are raised synchronously at the peer and visible on its own
+  status); if the peer is not clean, the stopped path is
+  UNAVAILABLE — use the live removal path instead; (2c) STOP
+  THE PEER xpfd (the universal fence — a stopped peer cannot
+  push over ANY transport); (3)
   the operator RE-CHECKS THE FULL STATE — `ConfirmDebtKindMask
   == 0` AND `persistDegraded == false` (r39 Codex M1, verified
   the mask-only gap: a queued apply can promote, cancel the old
@@ -3645,18 +3694,21 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   intended configuration first (set commands loading the
   intended config) and only then commits — never probes the
   state with a bare commit;
-  and the
-  FirstCommit+cluster class has NO live escape BY DESIGN — H
-  intercepts the unexpired record before re-arm and reverts it
-  INSIDE `Load` (the recovery invariant), and a subsequent
-  CLUSTERED commit is REJECTED live because H leaves no cluster
   runtime (`daemon_apply_commit.go:194-205`,
   `cluster_topology_preflight.go:59-97` — the HA runtime is
   boot-only-constructed): the supported recovery is the
   preflight's OWN named path — restart xpfd INTO the clustered
   configuration (the `xpf.conf` boot import re-imports the seed
   and commits it on the normal day-0 path,
-  `bootstrapFromFile`), or an offline seed-and-restart. The
+  `bootstrapFromFile`), or an offline seed-and-restart. THE
+  CONFIG-SHAPE SPLIT IS EXPLICIT (r40 SMR m1): in the H case the
+  M6 staged-commit path works ONLY for a NON-clustered intended
+  config — a staged CLUSTERED commit is preflight-REJECTED
+  (cleanly, BEFORE store promotion, `daemon_apply_commit.go:194-205`,
+  with the restart instruction in the error text) — so the
+  operator stages+commits only when the intended configuration
+  is standalone, and uses the restart/import path when it is
+  clustered. The
   deadline's operator surface is PINNED (r38 Codex m1): the
   audit journal carries no deadline field (`journal.go:59-80`)
   and confirm.json may be encrypted (`db.go:199-216`) — the
@@ -6013,7 +6065,7 @@ Still open:
    = G+H+H2 seeded from this document. Each reviewer: confirm the
    §4.7 structure (or restate your dissent), confirm the design
    closes under EITHER packaging, and return your verdict on the
-   v29 design. The user makes the final packaging call at manual
+   current design. The user makes the final packaging call at manual
    approval — the plan converges PLAN-READY when all three verdicts
    gate the DESIGN as ready, whichever packaging they prefer.
 

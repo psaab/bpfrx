@@ -122,6 +122,9 @@ reviewer (joins at /engineer on the code PR).
 | r39 | Codex | codex companion task-ms24nags-qboebk (session 019f9fab-a586-7a80-a096-32c668127acf) | NEEDS-REVISION (6 MAJOR, 0 MINOR; folds 2 FOLDED / 2 NOT-FOLDED / 1 PARTIAL). Structure confirmed |
 | r39 | AGY | agy print-mode direct (agy-plan-r39.md) | PLAN-READY-WITH-NITS (5/5 folds FOLDED; 3 fresh attacks; attack 2 = prefer-removal nit, IS SMR m1). Structure confirmed |
 | r39 | Claude SMR | in-conversation (claude-smr-plan-r39.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — prefer-removal guidance, IS Codex M4 + AGY attack-2). Structure confirmed |
+| r40 | Codex | codex companion task-ms25q9ot-5qc5bg (session 019f9fc7-6365-7632-b3f0-01e94d5a2942) | NEEDS-REVISION (2 MAJOR, 1 MINOR; folds 3 FOLDED / 3 PARTIAL). Structure confirmed |
+| r40 | AGY | agy print-mode direct (agy-plan-r40.md) | PLAN-READY (6/6 folds FOLDED; 2 fresh attacks FAILED). Structure confirmed |
+| r40 | Claude SMR | in-conversation (claude-smr-plan-r40.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — H-branch config-shape split). Structure confirmed |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 
