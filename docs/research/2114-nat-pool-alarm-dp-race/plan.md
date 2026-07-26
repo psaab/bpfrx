@@ -1,10 +1,8 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v33 — r32 findings folded (Codex NEEDS-REVISION
-  2M/2m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m —
-  its irrecoverable-generation nit folded into the Codex M1b
-  confirmed-empty exit; all three confirm the §4.7 structure);
-  pending convergence review r33
+- **Status**: DRAFT v34 — r33 findings folded (Codex NEEDS-REVISION
+  3M/2m; AGY PLAN-READY; Claude SMR PLAN-READY 0M/0m — all three
+  confirm the §4.7 structure); pending convergence review r34
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -591,7 +589,8 @@
   ConfirmRecordState (OK|TerminalUnreadable|RestartRecoveryOwed)}`
   with precedence TerminalUnreadable > RestartRecoveryOwed >
   ConfirmDebt > ActivePersist (Codex m2 — three booleans could not
-  carry the promised subtypes). Stale-expectation repairs (Codex
+  carry the promised subtypes — WriteUnverified joins between
+  ConfirmDebt and ActivePersist in r32/r33). Stale-expectation repairs (Codex
   m3): the x9 legs no longer claim an in-process boot-latch clear
   (substate-keyed remediation), the x11 seeding legs name the
   transient/permanent class split, and the docs sweep says THREE
@@ -636,8 +635,9 @@
   overwrite is the POINT), the §9 x19 copy loses the marker
   workflow, the health legs carry the four-level precedence
   (TerminalUnreadable > RestartRecoveryOwed > ConfirmDebt >
-  ActivePersist) with the enum + mask, and §6 says THREE new
-  degraded messages.
+  ActivePersist — WriteUnverified joins between ConfirmDebt and
+  ActivePersist in r32/r33) with the enum + mask, and §6 says THREE new
+  degraded messages (grown to FIVE in r29 and SIX in r32/r33).
   v23: r22 convergence — the D-kind machinery and the acceptance text
   are completed (Codex 4M/3m; SMR's r22 M1 CONVERGED with Codex M2 on
   the D-kind retry hazard; AGY PLAN-READY with its attack-1 rationale
@@ -1219,6 +1219,45 @@
   with the normative taxonomy). (f) The x25 legs gain the
   second-swap, confirmed-empty, irrecoverable-generation, and
   observability cases.
+  v34: r33 convergence — the state machine survives its own
+  composition with the repair exemptions (Codex NEEDS-REVISION
+  3M/2m, folds 1 FOLDED / 4 PARTIAL, structure confirmed; AGY
+  PLAN-READY 5/5 with 3 fresh attacks FAILED, structure
+  confirmed; SMR PLAN-READY 0M/0m, structure confirmed): (a) the
+  both-sides validation becomes SIDE-ASYMMETRIC (Codex M1,
+  verified the deadlock: requiring the write's OWN target to
+  validate kills the content-INDEPENDENT escape hatch — the (w-u)
+  restore-over and the D synthesized tombstone exist precisely to
+  overwrite a NON-KEY-CLASS-PERMANENT unreadable slot that can
+  never validate): the OPPOSITE side's present encrypted
+  generations MUST validate; the own-target is validated ONLY
+  when it is supposed to be readable — a content-INDEPENDENT
+  repair is EXEMPT from own-target validation exactly when its
+  target classifies NON-KEY-CLASS PERMANENT (the overwrite IS the
+  repair); the (w-u)/(d-i) legs cross-reference the exemption.
+  (b) The CONFIRMED-EMPTY exit gains an executable proof and
+  priority (Codex M2: a key-path probe failure over an
+  all-plaintext DB satisfied BOTH the HOLD and the empty exit):
+  ONE fresh under-`s.mu` classification of BOTH files using ONE
+  key byte snapshot (the envelope-detected bit surfaced at both
+  call sites — `crypto.go:306-314`, `db.go:95-103`, `db.go:242-253`)
+  proves all-plaintext/all-absent and exits AUTHORITATIVE BEFORE
+  the key-probe HOLD; the under-`s.mu` scan excludes Store-origin
+  arm interleavings by construction. (c) The observability
+  contradictions are swept (Codex M3): every loop-exit copy now
+  keeps the loop alive on the outstanding state; every exact
+  schema/aggregate copy carries `ConfigWriteUnverified`; the
+  precedence list inserts WriteUnverified between ConfirmDebt and
+  ActivePersist. (d) `Save()` takes `s.mu.Lock()` (Codex m1,
+  verified the RLock race/deadlock: a failed validation must
+  mutate the state and start/retain the loop). (e) SyncApply's
+  admission is pinned (Codex m2: PROMOTE in-memory per the #1799
+  Option-B degrade-not-fail contract — the cluster never diverges
+  over a key-remediation window — while the encrypted persistence
+  attempt is WITHHELD under the state and raises the
+  active-persist debt). (f) The last errors.As-only per-debt
+  definition and the three missing-key-file restoration lumps are
+  swept to the class-split.
 
 ---
 
@@ -2213,6 +2252,10 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   defined only readable match/differ/absent while the global
   taxonomy terminalizes the read failure): restore `s.armedRecord`
   OVER the unreadable slot — the restore's rename needs no read,
+  and the write-unverified machine's validation EXEMPTS the
+  own-target here (r33 Codex M1: the slot's NON-KEY-CLASS
+  PERMANENT unreadability is the exemption's whole point — the
+  OPPOSITE side must validate, the own-target never can),
   subject to the key-class gate (KEY-CLASS permanent failures —
   authentication failure, invalid observed key length, the
   mechanical `ConfirmRecordKeyClassError` subtype — and ANY
@@ -2666,24 +2709,59 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   EVERY gated encrypted write — including the active-persist heal
   — re-performs the FRESH same-snapshot validation IMMEDIATELY
   BEFORE encryption (never inherited from an earlier pass), and
-  the validation covers BOTH SIDES' present encrypted generations
-  (the write's own target side AND the opposite side when
-  encrypted records exist there — the dual of the generalized
+  the validation is SIDE-ASYMMETRIC (r33 Codex M1, verified the
+  deadlock: requiring the write's OWN target to validate kills the
+  content-INDEPENDENT escape hatch — the (w-u) restore-over and
+  the D synthesized tombstone exist precisely to overwrite a
+  NON-KEY-CLASS-PERMANENT unreadable slot (too-new envelope,
+  unsupported PRF, malformed nonce — content provably unparseable
+  under ANY key, `crypto.go:307-356`), and an own-target
+  validation requirement could never pass for them while
+  CONFIRMED-EMPTY could never fire): the OPPOSITE side's present
+  encrypted generations MUST validate under the snapshot
+  (the dual of the generalized
   laundering guard: an active write must never outrun an
   unreadable CONFIRM generation, just as a confirm repair must
-  never outrun an unreadable active config); any mismatch
+  never outrun an unreadable active config), while the OWN target
+  is validated ONLY when it is supposed to be readable — a
+  content-INDEPENDENT repair (the (w-u) restore-over, the D
+  synthesized tombstone) is EXEMPT from own-target validation
+  exactly when its target's classification is NON-KEY-CLASS
+  PERMANENT (the overwrite IS the repair — the exemption is the
+  whole point); an own-target that fails KEY-CLASS or IO keeps
+  the repair withheld per its own leg's rules. Any opposite-side
+  mismatch
   withholds the write and RE-ENTERS the state. A premature exit
   is therefore harmless by construction: the other generation's
   own action re-validates at its action time and re-blocks.
-  AND THE EXIT IS MADE TOTAL (r32 Codex M1b, verified: after the
-  sanctioned removal of the FINAL unreadable record — or on a
-  never-encrypted DB — NO ciphertext remains to
+  AND THE EXIT IS MADE TOTAL (r32 Codex M1b + r33 Codex M2,
+  verified: after the sanctioned removal of the FINAL unreadable
+  record — or on a never-encrypted DB — NO ciphertext remains to
   decrypt-validate against, so a decrypt-only exit is
-  unreachable): a CONFIRMED-EMPTY exit joins the decrypt exit —
-  when NO encrypted or unreadable record remains on disk (the DB
-  is provably all-plaintext or all-absent), the state EXITS with
+  unreachable; and a key-path probe failure over an all-plaintext
+  DB satisfies BOTH the HOLD and the empty exit): the
+  CONFIRMED-EMPTY exit joins the decrypt exit and is AUTHORITATIVE
+  BEFORE the key-probe HOLD — the proof is ONE fresh under-`s.mu`
+  classification of BOTH files using ONE key byte snapshot
+  (active.json AND confirm.json each classified
+  encrypted-readable / plaintext / absent /
+  unreadable-non-key-class-permanent; the plumbing exposes
+  `maybeDecryptTreeJSON`'s envelope-detected bit,
+  `crypto.go:306-314`, at BOTH call sites — `ReadActiveMeta`'s
+  classification surfacing at `db.go:95-103` and `ReadConfirm`'s
+  retained decrypted flag at `db.go:242-253` — so the scan never
+  re-reads the key path per file): when the scan proves NO
+  encrypted-or-unclassifiable record remains (all plaintext, all
+  absent, or every formerly-unreadable record either repaired or
+  sanctioned-removed), the state EXITS with
   the removal's mandated data-loss warning already surfaced by
-  the sanctioned-removal doctrine. The CONFIRMED-EMPTY exit IS
+  the sanctioned-removal doctrine — regardless of the key path's
+  own state (there is nothing left to protect; the HOLD exists
+  for content, not for the key file in the abstract). The
+  under-`s.mu` scan also excludes Store-origin arm interleavings
+  BY CONSTRUCTION (r33 Codex M2's coverage note: CommitConfirmed,
+  SyncApply, and the bootstrap ordinary commit all serialize on
+  `s.mu`; SyncApply does not itself arm). The CONFIRMED-EMPTY exit IS
   the irrecoverable-generation path (r32 SMR m1): when the
   on-disk records' key generation is irrecoverably lost (every
   validation fails — and the single-file sanctioned removal is
@@ -2732,7 +2810,28 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   record), the commit is refused BEFORE any write with the
   key-remediation error — never discovered post-promotion; a
   regression pins the plaintext-candidate/encrypted-PrevTree
-  case. The retry loop's order stays
+  case. SYNCAPPLY's admission is pinned (r33 Codex m2, verified
+  the ambiguity: SyncApply bypasses commit gates and promotes
+  in-memory BEFORE its degrade-not-fail persistence attempt,
+  `store_commit.go:134-138`, `store.go:687-738`): SyncApply
+  PROMOTES in-memory per its own #1799 Option-B contract (the
+  in-memory apply MUST stand — refusing it would silently diverge
+  the cluster, since the primary is already running the new
+  config and is never notified), while its encrypted PERSISTENCE
+  attempt is WITHHELD while write-unverified and raises the
+  active-persist debt — the in-memory tree stays correct, the
+  disk write proceeds once the state exits, and the cluster never
+  diverges over a key-remediation window. AND THE EXPORTED
+  `Save()` PATH TAKES THE WRITE LOCK (r33 Codex m1, verified:
+  `Save()` currently holds `s.mu.RLock()` and calls `writeActive`
+  whose contract permits either lock, `store_persist.go:258-274`
+  — a failed validation must MUTATE `ConfigWriteUnverified` and
+  start/retain the retry loop, which races under the read lock
+  and deadlocks on upgrade): `Save()` takes `s.mu.Lock()` (it is
+  the operator/API save path, not a hot path), so the
+  write-unverified transition and the loop start/retain are
+  synchronized with every other mutation; the x25 inventory gains
+  the exported-path leg. The retry loop's order stays
   active-heal → resolution-finalize (the #5473 durability
   ordering); the active-write gate evaluates the previous
   pass's confirm-side state, AND — closing the second-swap leg
@@ -2923,8 +3022,12 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   holds an
   unparseable record → proceed with the synthesized tombstone →
   delete, gated on the ACTIVE side being readable under the current
-  key (r26 Codex M1's generalized laundering guard — and the
-  KEY-CLASS case (authentication failure, invalid observed key
+  key (r26 Codex M1's generalized laundering guard — the
+  write-unverified machine's own-target EXEMPTION applies here
+  too, r33 Codex M1: the tombstone overwrites the provably-
+  unparseable slot precisely because it is NON-KEY-CLASS
+  PERMANENT; only the OPPOSITE (active) side must validate — and
+  the KEY-CLASS case (authentication failure, invalid observed key
   length, or any missing/unreadable key file) RETAINS with the
   CLASS-SPLIT message (r32 Codex m2: invalid-LENGTH or
   byte-MISMATCH → `.configdb/master.key` RESTORATION;
@@ -3027,7 +3130,10 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   the same absence instead runs (w-c) — restore-or-stale per the
   in-memory window, since a live window's crash-recovery file must
   not be abandoned. The
-  loop-exit condition gains "and no terminal latch set"; the
+  loop-exit condition gains "and no terminal latch set" AND "and
+  not write-unverified" (r32/r33: the outstanding WRITE-UNVERIFIED
+  state alone keeps the loop alive — the key-path probe runs every
+  pass so a restored key is detected within one backoff); the
   probe keeps the same plain-goroutine shutdown posture as master's
   persistDegraded loop (r18 Codex m3: the worker was never joined —
   process exit abandons it; tests that construct repeated Store
@@ -3151,7 +3257,11 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   its OWN `keyClass` state = the class of that debt's LATEST
   retained failure (re-evaluated at EVERY raise/retain: set when
   the latest retained failure matches `ConfirmRecordKeyClassError`
-  via `errors.As`, cleared when it does not — never from message
+  via `errors.As` OR by EXPLICIT assignment at a byte-mismatch
+  clear-time verification (r33 Codex fold-partial 4 — the mismatch
+  is a key-identity change, a key-class condition even though it
+  is a comparison outcome), cleared when it does not — never from
+  message
   text); the SNAPSHOT mask is DERIVED at snapshot time as the
   OR-by-kind over LIVE debts (a cleared debt simply drops out of
   the OR — no independent clear rule exists to erase a live
@@ -3175,7 +3285,8 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   the write-unverified state),
   and the enum distinguishes terminal-unreadable from
   readable-but-restart-required — with PRECEDENCE TerminalUnreadable
-  > RestartRecoveryOwed > ConfirmDebt > ActivePersist:
+  > RestartRecoveryOwed > ConfirmDebt > WriteUnverified >
+  ActivePersist:
   `api/health.go` renders the terminal confirm-record
   message first ("commit-confirmed recovery record is
   unreadable/corrupt; operator remediation required — see journal"),
@@ -3411,9 +3522,12 @@ passes #5637 and drops at the Resolved-first check on any replay —
 with the D-KIND SLOT DEBT on failure (the retry RE-READS and
 RE-CLASSIFIES: NON-KEY-CLASS-PERMANENT unreadable → proceed with the
 synthesized tombstone → delete, gated on the ACTIVE side readable
-under the current key; KEY-CLASS permanent or a missing/unreadable
-key file → RETAIN with the `.configdb/master.key` restoration
-message, NO write; TRANSIENT-class read failure →
+under the current key; KEY-CLASS permanent (invalid-LENGTH or
+byte-MISMATCH) → RETAIN with the `.configdb/master.key`
+restoration message; a missing/unreadable key file
+(ENOENT/EACCES/mount-IO) → RETAIN with the key-state UNVERIFIABLE
+message (NO restoration claim, r32 Codex m2's class-split);
+BOTH with NO write; TRANSIENT-class read failure →
 retain UNTRIED, no write/delete — a transient failure cannot prove
 the slot's content and must never trigger a tombstone; absent →
 `DeleteConfirm` re-drive; READABLE → clear as moot — never
@@ -3424,7 +3538,9 @@ overwrites, and its PRE-rename failure is handled by the W-kind
 restore REPLACING the unreadable record); an operator
 `rm` reactivates the absent-state (`DeleteConfirm` barrier for
 R-kind; (w-c) restore-or-stale for W-kind) — only the barrier clears;
-the loop still exits when no debt and no latch remain; (x13) BOOT
+the loop still exits when no debt and no latch remain AND the
+write-unverified state is clear (the state alone keeps the loop
+alive for the key-path probe); (x13) BOOT
 FAIL-CLOSED (r17 Codex M5): a TRANSIENT boot `ReadConfirm` failure
 retries bounded inside `Load` (initial read + ≤3 retries,
 100/200/400 ms, `LoadContext(ctx)`) then FAILS `Load` via
@@ -3442,14 +3558,18 @@ LATEST retained failure per `errors.As` OR explicit assignment at
 a byte-mismatch clear-time verification),
 ConfirmRecordState (OK|TerminalUnreadable|RestartRecoveryOwed),
 ConfirmRecordKeyClass (the LATCH-level key-class cause — the
-latch's LATEST observed failure class, cleared with the latch)}`;
+latch's LATEST observed failure class, cleared with the latch),
+ConfigWriteUnverified (the r32/r33 WRITE-UNVERIFIED state —
+NON-SECRET, observable, actively probed)}`;
 the aggregate `ConfigPersistDegraded()` is a DERIVED value
-(`persistDegraded || mask ≠ 0 || enum ≠ OK`), not a snapshot field;
+(`persistDegraded || mask ≠ 0 || enum ≠ OK || writeUnverified`),
+not a snapshot field;
 /health renders by precedence TerminalUnreadable > RestartRecoveryOwed >
 ConfirmDebt (generic
 removal/rewrite/slot-delete message + mask detail, REPLACED by the
 key-class variant naming ORIGINAL `.configdb/master.key`
-restoration when the rendered level's cause bit is set) > ActivePersist; the
+restoration when the rendered level's cause bit is set) >
+WriteUnverified > ActivePersist; the
 gauge consumes the derived aggregate OR; the
 descriptor/option/wiring comments name all the causes; (x15)
 TAXONOMY
@@ -3517,15 +3637,18 @@ OR explicit assignment at a byte-mismatch clear-time verification),
 ConfirmRecordState
 (OK|TerminalUnreadable|RestartRecoveryOwed), ConfirmRecordKeyClass
 (the LATCH-level key-class cause — the latch's LATEST observed
-failure class, cleared with the latch)}` —
+failure class, cleared with the latch), ConfigWriteUnverified
+(the r32/r33 WRITE-UNVERIFIED state — NON-SECRET, observable,
+actively probed)}` —
 all causes NON-SECRET, NEVER from message text — with the aggregate
-DERIVED (`persistDegraded || mask ≠ 0 || enum ≠ OK`);
+DERIVED (`persistDegraded || mask ≠ 0 || enum ≠ OK ||
+writeUnverified`);
 /health precedence TerminalUnreadable > RestartRecoveryOwed >
 ConfirmDebt (generic removal/rewrite/slot-delete message + mask
 detail, REPLACED by the key-class variant naming ORIGINAL
 `.configdb/master.key` restoration when the rendered level's cause
 bit is set — both variants regression-pinned at both levels) >
-ActivePersist; the gauge
+WriteUnverified > ActivePersist; the gauge
 consumes the derived aggregate OR;
 Config → NewServer plumbing
 pinned; (x22) D-SUPPRESSION LEGS (r27 Codex m1 + r29 Codex m3,
@@ -3930,7 +4053,8 @@ v20 history). The delivery is TWO units:
   `ConfirmRecordState (OK|TerminalUnreadable|RestartRecoveryOwed)`,
   `ConfirmRecordKeyClass bool` — the LATCH-level key-class cause,
   the latch's LATEST observed failure class, cleared with the
-  latch; all NON-SECRET, never from message
+  latch; `ConfigWriteUnverified bool` — the WRITE-UNVERIFIED
+  state, folded into the aggregate; all NON-SECRET, never from message
   text (r27 Codex m2 + r28 Codex M3)}`
   with the aggregate `ConfigPersistDegraded()` DERIVED
   (`persistDegraded || mask ≠ 0 || enum ≠ OK`), and precedence
@@ -4604,8 +4728,11 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      the process-local D-kind slot debt (the retry re-reads and
      re-classifies — NON-KEY-CLASS-PERMANENT unreadable → proceed,
      gated on the ACTIVE side readable under the current key;
-     KEY-CLASS permanent or a missing/unreadable key file → RETAIN
-     with the `.configdb/master.key` restoration message, NO write;
+     KEY-CLASS permanent (invalid-LENGTH or byte-MISMATCH) → RETAIN
+     with the `.configdb/master.key` restoration message; a
+     missing/unreadable key file (ENOENT/EACCES/mount-IO) → RETAIN
+     with the key-state UNVERIFIABLE message (NO restoration claim);
+     BOTH with NO write;
      TRANSIENT-class read failure → retain UNTRIED, no write/delete;
      absent →
      `DeleteConfirm` re-drive, READABLE → clear as moot; never
@@ -4615,7 +4742,9 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      operator `rm` → absent-state re-drive (`DeleteConfirm` barrier
      for R-kind; (w-c) restore-or-stale for W-kind);
      loop exits only
-     with no debt AND no latch; (x13) BOOT FAIL-CLOSED (r17 Codex M5):
+     with no debt AND no latch AND the write-unverified state
+     clear (the state alone keeps the loop alive for the key-path
+     probe); (x13) BOOT FAIL-CLOSED (r17 Codex M5):
      TRANSIENT boot `ReadConfirm` failure → bounded retry inside
      `Load` (initial read + ≤3 retries, 100/200/400 ms,
      `LoadContext(ctx)`) → `ErrConfirmStateUnreadable` →
@@ -4634,7 +4763,8 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      (OK|TerminalUnreadable|RestartRecoveryOwed),
      ConfirmRecordKeyClass (the LATCH-level key-class cause — the
      latch's LATEST observed failure class, cleared with the
-     latch)}`; the aggregate
+     latch), ConfigWriteUnverified (the WRITE-UNVERIFIED state,
+     folded into the aggregate)}`; the aggregate
      `ConfigPersistDegraded()` is DERIVED
      (`persistDegraded || mask ≠ 0 || enum ≠ OK`);
      /health renders by precedence TerminalUnreadable >
@@ -4716,7 +4846,8 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      (OK|TerminalUnreadable|RestartRecoveryOwed),
      ConfirmRecordKeyClass (the LATCH-level key-class cause — the
      latch's LATEST observed failure class, cleared with the
-     latch)}`; the aggregate
+     latch), ConfigWriteUnverified (the WRITE-UNVERIFIED state,
+     folded into the aggregate)}`; the aggregate
      `ConfigPersistDegraded()` is a DERIVED value
      (`persistDegraded || mask ≠ 0 || enum ≠ OK`), not a snapshot
      field; /health
@@ -4817,7 +4948,24 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      transition with the removal's data-loss warning surfaced —
      and the irrecoverable-generation path (r32 SMR m1) exits
      through the BOTH-FILES removal → (g-absent) → the
-     absent/plaintext posture → this exit; the OBSERVABILITY leg
+     absent/plaintext posture → this exit; the OWN-TARGET
+     EXEMPTION leg (r33 Codex M1) — a content-INDEPENDENT repair
+     ((w-u) restore-over, D synthesized tombstone) runs while its
+     NON-KEY-CLASS-PERMANENT unreadable target can never validate:
+     only the OPPOSITE side must validate, and the state does NOT
+     re-enter on the own-target's permanent unparseability; the
+     CONFIRMED-EMPTY proof/priority leg (r33 Codex M2) — ONE fresh
+     under-`s.mu` classification of BOTH files using ONE key byte
+     snapshot (the envelope-detected bit surfaced at both call
+     sites) proves all-plaintext/all-absent and exits
+     AUTHORITATIVE BEFORE the key-probe HOLD; the exported-`Save()`
+     leg (r33 Codex m1) — `Save()` takes `s.mu.Lock()` (not
+     RLock), so the write-unverified transition and the loop
+     start/retain are synchronized; the SyncApply-admission leg
+     (r33 Codex m2) — SyncApply PROMOTES in-memory per its #1799
+     Option-B contract while its encrypted persistence attempt is
+     WITHHELD under the state and raises the active-persist debt;
+     the OBSERVABILITY leg
      (r32 Codex M1b) — `ConfigWriteUnverified` renders in /health
      and folds into the aggregate OR, and the retry loop ACTIVELY
      probes the key path every pass while the state holds (a
@@ -4884,7 +5032,7 @@ the full Go/Rust suites, smoke) run for BOTH units.*
   past the next boot; the lifecycle redesign is a pre-existing policy
   question, not a `d.dp` publication concern.
 
-## 11. Open questions for adversarial review (r33)
+## 11. Open questions for adversarial review (r34)
 
 Resolved in v2-v9 (for the record): A2 deletion; atomic cell choice;
 sampler-only adapter — now STRUCTURAL via `CachedStatusProvider`;
@@ -5140,8 +5288,10 @@ workflow swept, and the health legs carried to the four-level
 precedence with the enum + mask; r22 additions: the D-kind retry
 RE-READS and RE-CLASSIFIES (NON-KEY-CLASS-PERMANENT unreadable →
 proceed, gated on the ACTIVE side readable under the current key;
-KEY-CLASS permanent or a missing/unreadable key file → RETAIN with
-the `.configdb/master.key` restoration message, NO write;
+KEY-CLASS permanent (invalid-LENGTH or byte-MISMATCH) → RETAIN with
+the `.configdb/master.key` restoration message; a missing/unreadable
+key file (ENOENT/EACCES/mount-IO) → RETAIN with the key-state
+UNVERIFIABLE message (NO restoration claim); BOTH with NO write;
 TRANSIENT → retain untried (r23 pin); absent →
 `DeleteConfirm` re-drive → clear; READABLE → clear as moot — never
 tombstone a readable record; a successful arm on the slot clears the

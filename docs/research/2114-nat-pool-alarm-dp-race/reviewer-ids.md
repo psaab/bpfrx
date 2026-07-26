@@ -101,6 +101,9 @@ reviewer (joins at /engineer on the code PR).
 | r32 | Codex | codex companion task-ms1uin0x-1t4tuu (session 019f9ea8-08a2-7f53-9953-42c158c13c5e) | NEEDS-REVISION (2 MAJOR, 2 MINOR; folds 3 FOLDED / 2 PARTIAL). Structure confirmed |
 | r32 | AGY | agy print-mode direct (agy-plan-r32.md) | PLAN-READY (5/5 folds FOLDED; 3 fresh attacks FAILED). Structure confirmed |
 | r32 | Claude SMR | in-conversation (claude-smr-plan-r32.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — irrecoverable-generation exit walk, folded into Codex M1b). Structure confirmed |
+| r33 | Codex | codex companion task-ms1wjm1c-wcx9lw (session 019f9edb-fcf4-7a92-962e-f727dff920ea) | NEEDS-REVISION (3 MAJOR, 2 MINOR; folds 1 FOLDED / 4 PARTIAL). Structure confirmed |
+| r33 | AGY | agy print-mode direct (agy-plan-r33.md) | PLAN-READY (5/5 folds FOLDED; 3 fresh attacks FAILED). Structure confirmed |
+| r33 | Claude SMR | in-conversation (claude-smr-plan-r33.md) | PLAN-READY (0 MAJOR, 0 MINOR; 4 fresh attacks). Structure confirmed |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 
