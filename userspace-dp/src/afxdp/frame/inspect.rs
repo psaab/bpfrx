@@ -1873,19 +1873,31 @@ pub(in crate::afxdp) fn parse_zone_encoded_fabric_ingress(
     desc: XdpDesc,
     meta: UserspaceDpMeta,
     forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    now_secs: u64,
 ) -> Option<u16> {
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
-    parse_zone_encoded_fabric_ingress_from_frame(frame, meta, forwarding)
+    parse_zone_encoded_fabric_ingress_from_frame(frame, meta, forwarding, ha_state, now_secs)
 }
 
 /// #919/#922: returns the encoded zone ID directly, no `zone_id_to_name`
 /// lookup or `String` clone. Callers that need a name resolve via
 /// `forwarding.zone_id_to_name` on the slow path. #3075: the id is a u16
 /// carried big-endian across frame[10]/frame[11] of the synthetic fabric MAC.
+///
+/// #6458: the magic + zone-existence decode is necessary but NOT
+/// sufficient — an L2-adjacent host on the fabric segment can forge both
+/// (`StableZoneID` is a public name hash). The decoded zone is returned
+/// only when `zone_encoded_fabric_stamp_valid` ALSO accepts the frame
+/// (unicast dst == our fabric link MAC + the claimed zone is RG-bound and
+/// not locally forwarding-active); otherwise the stamp is ignored and the
+/// frame is treated as an ordinary unstamped fabric-ingress packet.
 pub(in crate::afxdp) fn parse_zone_encoded_fabric_ingress_from_frame(
     frame: &[u8],
     meta: UserspaceDpMeta,
     forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    now_secs: u64,
 ) -> Option<u16> {
     if !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32) {
         return None;
@@ -1910,7 +1922,19 @@ pub(in crate::afxdp) fn parse_zone_encoded_fabric_ingress_from_frame(
     // Validate the encoded ID exists in the configured zone map; an
     // unknown id is a stale or hostile frame. Single hash lookup —
     // the value isn't needed, just presence.
-    forwarding.zone_id_to_name.get(&id).map(|_| id)
+    if !forwarding.zone_id_to_name.contains_key(&id) {
+        return None;
+    }
+    // #6458: fabric-link identity + RG-ownership validation (V1a/V1b).
+    zone_encoded_fabric_stamp_valid(
+        forwarding,
+        ha_state,
+        now_secs,
+        &frame[0..6],
+        meta.ingress_ifindex as i32,
+        id,
+    )
+    .then_some(id)
 }
 
 pub(in crate::afxdp) fn parse_packet_destination_from_frame(

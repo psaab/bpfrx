@@ -226,7 +226,7 @@ pub(super) fn poll_binding_process_descriptor(
                 let FabricIngressOutcome {
                     ingress_zone_override,
                     packet_fabric_ingress,
-                } = stage_classify_fabric_ingress(packet_frame, &mut meta, worker_ctx);
+                } = stage_classify_fabric_ingress(packet_frame, &mut meta, now_secs, worker_ctx);
                 // #946 Phase 1 stage 10: screen / IDS slow-path.
                 // Caller still owns the recycle push (matches
                 // original code's pattern).
@@ -278,6 +278,7 @@ pub(super) fn poll_binding_process_descriptor(
                     &binding.live,
                     worker_ctx,
                     now_ns,
+                    now_secs,
                 ) {
                     IpsecPassthroughOutcome::NotClaimed => {}
                     IpsecPassthroughOutcome::Passthrough => {
@@ -1491,6 +1492,22 @@ pub(super) fn poll_binding_process_descriptor(
                         // at the pre-routing DNAT site above — the pre-routing NAT
                         // scope and the zone-pair policy now share ONE logical-unit
                         // ingress identity.
+                        // #6458 V2: a zone-encoded fabric stamp drives
+                        // NEW-flow policy only when the resolution's owner
+                        // RG is forwarding-active LOCALLY (the peer punts a
+                        // new flow to us only because we own its egress
+                        // RG). Otherwise the stamp is ignored and the
+                        // fabric interface's own zone governs. Shadow the
+                        // override so every zone-pair consumer below (this
+                        // site, the NAT scope borrows, and the
+                        // MissingNeighbor arm) sees the gated value.
+                        let ingress_zone_override = gate_fabric_zone_override_on_owner_rg(
+                            worker_ctx.forwarding,
+                            worker_ctx.ha_state,
+                            now_secs,
+                            ingress_zone_override,
+                            resolution,
+                        );
                         let (from_zone_id, to_zone_id) = zone_pair_ids_for_flow_with_override(
                             worker_ctx.forwarding,
                             ingress_logical,
@@ -3353,6 +3370,20 @@ pub(super) fn poll_binding_process_descriptor(
                         base_resolution
                     };
 
+                    // #6458 V2: honor the zone-encoded fabric stamp for this
+                    // flowless enforcement only when the resolution's owner RG
+                    // is forwarding-active locally (mirrors the flow-backed
+                    // session-miss gate above); otherwise the stamp is ignored
+                    // and the fabric interface's own zone governs the transit
+                    // policy (3) and host-inbound local-delivery (4) checks.
+                    let ingress_zone_override = gate_fabric_zone_override_on_owner_rg(
+                        worker_ctx.forwarding,
+                        worker_ctx.ha_state,
+                        now_secs,
+                        ingress_zone_override,
+                        final_resolution,
+                    );
+
                     // (3) Zone security policy — only for TRANSIT
                     //     (ForwardCandidate). Local delivery (host-inbound) is
                     //     #3292; NoRoute drops anyway; MissingNeighbor keeps its
@@ -4084,6 +4115,18 @@ pub(super) fn poll_binding_process_descriptor(
                                     meta.ingress_vlan_id,
                                 )
                                 .unwrap_or(meta.ingress_ifindex as i32);
+                                // #6458 V2: same owner-RG binding as the
+                                // ForwardCandidate session-miss gate above —
+                                // a zone-encoded fabric stamp is honored here
+                                // only when the decision's owner RG is
+                                // forwarding-active locally.
+                                let ingress_zone_override = gate_fabric_zone_override_on_owner_rg(
+                                    worker_ctx.forwarding,
+                                    worker_ctx.ha_state,
+                                    now_secs,
+                                    ingress_zone_override,
+                                    decision.resolution,
+                                );
                                 let (from_zone_id, to_zone_id) = zone_pair_ids_for_flow_with_override(
                                     worker_ctx.forwarding,
                                     ingress_logical,
