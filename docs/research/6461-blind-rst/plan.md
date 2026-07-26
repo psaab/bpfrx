@@ -4080,10 +4080,15 @@ role)` — with COLLISION DETECTION at the transcript
 (v9.9.54.8, round-57 SMR F3: the transcript carries BOTH
 cap records (`dialer_cap` and `acceptor_cap` each carry
 `node_id`), so a misconfigured collision — both sides
-provisioned the same ID — is detected at the transcript,
-and the decision rule refuses the repair-era class on
-collision, falling back to legacy with an operator-visible
-alarm, since owner selection would be undefined)) —
+provisioned the same ID — is detected at the transcript);
+and REJECTION-BEFORE-OWNER-SELECTION is the SOLE equal-ID
+rule (v9.9.54.10, round-58 Codex M7: equal authenticated
+node IDs are REJECTED with an operator-visible not-ready
+state — the existing duplicate-ID fail-closed precedent
+(`heartbeat.go:811-820`, `election.go:195-202`) — never a
+fallback-to-legacy and never a competing-owner outcome;
+this supersedes any earlier "falls back to legacy with an
+operator-visible alarm" phrasing)) —
 computes the class from BOTH declarations (repair-era IFF
 BOTH declared repair-era, else legacy), publishes
 `CAPABILITY_DECISION(class)`, the peer ACKs, and BOTH sides
@@ -4106,12 +4111,14 @@ decision is UNCOMMITTED (v9.9.54.5, round-56 SMR F2: the
 connection closes and retries with bounded backoff; the
 retry's new connection may elect a different owner per
 the same deterministic STABLE-NODE-ID-ordered rule
-(v9.9.54.9, round-57 Codex H4: this sweeps the last
+(v9.9.54.9, round-57 Codex H4 + v9.9.54.10, round-58 Codex
+M7: this sweeps the last
 "address-ordered" stragglers — address parsing returns
 "dial" at EITHER endpoint on failure
 (`sync_conn.go:12-20`), enabling crossed setups to
 repeatedly supersede the same slot (`sync_conn.go:244-266`);
-the owner rule is stable-node-ID-ordered EVERYWHERE); and
+the owner rule is stable-node-ID-ordered EVERYWHERE, with
+NO address-ordered reference remaining); and
 EQUAL node IDs are explicitly REJECTED (v9.9.54.9, round-57
 Codex H4: equal authenticated node IDs have no strict
 ordering, and the existing HA code treats duplicate IDs as
@@ -4147,11 +4154,39 @@ literal reuse leaves the trailer to be parsed as the next
 header, a bad-magic reconnect loop: the pre-install reader
 consumes and verifies header, payload, AND trailer while
 advancing `authConn.recvSeq`, and it is allowlisted to the
-decision-phase frame types); and the CONFIRM-timeout byte
+decision-phase frame types) — and the phase's ENTRY rule
+(v9.9.54.10, round-58 Codex B1: a BASELINE authenticated
+peer completes authentication, installs its slot
+(`sync_conn.go:118, :130`), and immediately sends
+`ClockSync` (`sync_conn.go:137`, `sync_conn_write.go:256`)
+— a NON-decision frame that an allowlisted-only reader
+would reject, looping the connection and defeating the
+zero-byte timeout's legacy latch: the decision phase is
+entered ONLY after authenticated support ADVERTISEMENT
+(the peer must advertise the decision capability in its
+capability record); a baseline peer's first ordinary
+legacy frame is BUFFERED, the connection latches legacy,
+installs, and dispatches the buffered frame in order —
+never rejected); and the CONFIRM-timeout byte
 rules are exact (v9.9.54.9: the stream retains and
 legacy-latches ONLY if ZERO bytes were consumed; a partial
 CONFIRM frame closes; a COMPLETE late CONFIRM is consumed
-and IGNORED before declarations); with the two timeout CLASSES reconciled:
+and IGNORED before declarations — where "ignored" means
+INELIGIBLE FOR FEATURE ACTIVATION ONLY (v9.9.54.10,
+round-58 Codex H4: the late CONFIRM's identity is needed
+for owner selection — on a v1-proof connection the HELLO
+carries only `{version, keyed, nonce}` (`sync_auth.go:345`)
+and the node ID and process incarnation arrive in the
+capability record, so a delayed CONFIRM can otherwise
+leave the owner uncomputable: the late CONFIRM is still
+schema-validated and its identity/provenance BOUND, and a
+node-ID or incarnation mismatch closes the connection;
+true legacy peers bypass the shared decision entirely, per
+the entry rule above) — and ONLY on tuple match
+(v9.9.54.10, round-58 SMR F3: the late CONFIRM is a
+duplicate only when its tuple equals the connection's
+negotiated tuple; a MISMATCHED tuple is not "late" — it is
+a protocol violation and closes the connection)); with the two timeout CLASSES reconciled:
 the DECISION timeout closes and retries with bounded
 backoff, while the CONFIRM timeout latches the connection
 into the legacy class — the earlier "never aborts over a
@@ -4186,12 +4221,46 @@ bulk completing, then a later connection activating
 preemption ENABLED before the repair's `JOURNAL_END` (a
 priority event preempts mid-repair): the activation
 transaction acquires the election hold scoped to ITS
-generation before exposing `repair-vN`; only a
-matching-generation completion (the repair's `JOURNAL_ACK`
-at that generation) may release it; and the hold's timeout
+generation before exposing `repair-vN`; the hold releases
+ONLY after CURRENT-GENERATION INBOUND `JOURNAL_END`
+APPLICATION — never on an outbound `JOURNAL_ACK` alone
+(v9.9.54.10, round-58 Codex B2: applying inbound
+`JOURNAL_END` proves LOCAL readiness, while receiving
+`JOURNAL_ACK` proves only that the PEER received this
+node's outbound state: B receiving A's ACK for B→A while
+A→B remains incomplete would release its VRRP hold and
+restore preemption (`vrrp/manager.go:389`) while still
+lacking A's complete table — and normal VRRP does not
+consume the packed private-election readiness bit
+(`cluster/manager.go:289`); the alternative is the explicit
+aggregate: EVERY locally relevant inbound AND outbound
+obligation discharged at the current generation); and the hold's timeout
 NEVER silently releases while a negotiated repair
 obligation remains armed (a stale timeout checks the
-generation and re-arms)); and the repair is BOUND TO THE NEGOTIATING
+generation and re-arms); and the hold's SCOPE is
+spontaneous preemption only (v9.9.54.10, round-58 SMR F1:
+a PLANNED/manual failover (`request mastership`,
+`ForceRGMaster`) and priority-0 takeover are
+operator-authoritative and BYPASS the hold via an EXPLICIT
+post-barrier override (v9.9.54.10, round-58 Codex M6: the
+hold is an AUTOMATIC-ELECTION fence — spontaneous
+priority-driven election only, in BOTH normal VRRP and
+private/direct RG mode (whose `takeoverReadinessForRG`
+today omits sync readiness, `daemon_ha_vip.go:40`) — and a
+planned transfer uses the explicit post-barrier override
+equivalent to VRRP's `ForceRGMaster` path
+(`vrrp/manager.go:761`), which does NOT clear the
+underlying repair obligation: planned userspace transfer
+intentionally bypasses bulk readiness and relies on the
+final barrier (`daemon_ha_userspace_readiness.go:155`), so
+the packed not-ready state must NOT fold into the
+`RequestPeerFailover` admission/commit rejection
+(`failover.go:233, :321`) — the override is explicit, not
+an accidental fold-in); exactly as they
+bypass the sync-hold preempt gate today (the same existing
+exemption class) — the repair continues or is superseded by
+the failover's own state transition, and an operator is
+never blocked)); and the repair is BOUND TO THE NEGOTIATING
 CONNECTION (v9.9.54.7, round-56 Codex B1: the protocol
 class is connection-local, but `BulkSync` calls
 `getActiveConn()` (`sync_bulk.go:50`), which ALWAYS prefers
@@ -4267,8 +4336,24 @@ and its remaining effects run inside the packed word's own
 critical section, so an activation's bump can never split
 them); the activation CAS-loops `{g, *} → {g+1, not-ready}`;
 if the writer wins the CAS, the activation WAITS for the
-entire completion bundle under the packed word's
-serialization (the word's critical section), then bumps the
+entire completion bundle under a RECOVERABLE
+`Completing(g, ticket)` state with a deadline and
+generation-tagged, idempotent effects (v9.9.54.10,
+round-58 Codex H3 — "wait under the packed word's critical
+section" can hang FOREVER: the bundle's `ReleaseSyncHold`
+waits for `vrrp.Manager.mu` (`vrrp/manager.go:389`), and
+`UpdateInstances` holds that mutex across reconciliation
+(`:432`) and can wait without a deadline in `vi.stop()`
+(`:510`, `instance.go:1382`) — a G1 writer that wins and
+hangs in the bundle would block every later activation: the
+CAS commits the state transition, the external effects run
+as generation-tagged IDEMPOTENT follow-ups with their own
+deadlines OUTSIDE the packed word's critical section (the
+activation serialization NEVER spans VRRP/netlink
+operations), and a hung effect abandons its ticket so a
+later activation retries it (v9.9.54.10: this REPLACES the
+v9.9.54.10-SMR-F2 "no I/O in the critical section" premise,
+which was wrong about `ReleaseSyncHold`)); then bumps the
 generation AND RE-ARMS THE ELECTION HOLD before exposing
 `repair-vN`; the CAS ALWAYS precedes irreversible effects;
 and a process crash mid-bundle reconstructs not-ready/hold
@@ -4311,7 +4396,15 @@ proof exchange once the connection's authenticated wrapper
 is installed (the wrapper exists by then, so the v2 proof
 can ride it), and until then the fields are advisory-only —
 a v1 peer treats them as hints and keeps v1 behavior for
-anything security-relevant; the
+anything security-relevant — where the "second proof" IS
+the authenticated `CAPABILITY_CONFIRM`/`CAPABILITY_DECISION`
+exchange itself (v9.9.54.10, round-58 Codex H5: the earlier
+"second v2 transcript proof" reading would define a
+SECOND, incompatible v1-proof activation protocol —
+implementations following opposite clauses would latch
+different protocol classes: there is exactly ONE
+post-wrapper authentication step, the CONFIRM/decision
+exchange, and no separate transcript re-proof); the
 v2 byte vectors are literal: the domain tag string, the
 record-order rule, u16-LE length widths, little-endian
 integers, and the proof-direction rule (each side proves its
