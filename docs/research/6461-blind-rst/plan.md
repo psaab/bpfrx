@@ -4076,7 +4076,14 @@ competing installs replacing the same fabric slot
 the plan's OWN stable node-ID ordering (already specified
 for the incarnation state machine) is the total rule, and
 the owner identity is `(stable node-ID order, setup token,
-role)`) —
+role)` — with COLLISION DETECTION at the transcript
+(v9.9.54.8, round-57 SMR F3: the transcript carries BOTH
+cap records (`dialer_cap` and `acceptor_cap` each carry
+`node_id`), so a misconfigured collision — both sides
+provisioned the same ID — is detected at the transcript,
+and the decision rule refuses the repair-era class on
+collision, falling back to legacy with an operator-visible
+alarm, since owner selection would be undefined)) —
 computes the class from BOTH declarations (repair-era IFF
 BOTH declared repair-era, else legacy), publishes
 `CAPABILITY_DECISION(class)`, the peer ACKs, and BOTH sides
@@ -4152,7 +4159,16 @@ token's connection and never selected by fabric
 preference; the documented alternative — RETIRE every
 legacy sibling connection before exposing `repair-vN` —
 composes with the barrier/reset machinery and is the
-fallback for transports where pinning is unsafe);
+fallback for transports where pinning is unsafe); and the
+pin's failure mode is defined (v9.9.54.8, round-57 SMR F1:
+a pinned connection's death mid-repair fails the ATTEMPT
+(its `JOURNAL_ACK` can't arrive) but never strands the
+repair — the repair ID is sender-INCARNATION-scoped (a
+connection death is not an incarnation change), the
+obligation is durable, and the NEXT connection's
+negotiation re-arms the repair drive pinned to the NEW
+token: the pin follows the token, the obligation follows
+the incarnation);
 and the readiness STATE ITSELF is versioned
 (v9.9.54.4, round-55 Codex H2: a legacy `BulkEnd` queues
 `go s.OnBulkSyncReceived()` ASYNCHRONOUSLY
@@ -4179,7 +4195,15 @@ G2 arms the obligation and sets ready=false in between
 atomic word (generation in the high bits, the ready bit
 low) — a readiness writer CASes
 `{gen, not-ready} → {gen, ready}` in ONE atomic
-operation, so a generation bump by the activation
+operation, and the WINNER RULE is explicit (v9.9.54.8,
+round-57 SMR F4: the activation's bump is a CAS LOOP
+(`{gen, *} → {gen+1, not-ready}`, retrying on contention)
+and always wins by monotonicity — the generation only
+increases; a writer's CAS can succeed only for an OLD
+generation's completion BEFORE the bump lands, after which
+the bump's `{gen+1, not-ready}` is authoritative and the
+takeover decision reads the final state (armed, not-ready),
+never a stale ready), so a generation bump by the activation
 (`{gen, not-ready} → {gen+1, not-ready}`) invalidates
 the writer's expectation ATOMICALLY with no cross-lock
 check at all; the callback captures its generation at
@@ -4197,7 +4221,15 @@ the completion is ONE serialized, generation-conditional
 transaction — the packed-word CAS authorizes the WHOLE
 bundle (timer cancellation, `syncBulkPrimed`, the VRRP hold
 release, and the Manager mirror) and a stale callback
-performs NONE of them), so a stale callback or timer
+performs NONE of them — the bundle being STALENESS-atomic
+(v9.9.54.8, round-57 SMR F2: the generation check gates the
+whole bundle atomically against STALENESS (current callback
+→ all effects + ready; stale → none), and a PROCESS crash
+mid-bundle is a different failure class covered by the
+restart-time state rebuild (the VRRP hold is re-acquired,
+primed recomputed, the timer re-armed, readiness recomputed
+from current state) — no persistent inconsistency is
+possible in either class), so a stale callback or timer
 can never restore readiness over an armed repair);
 and only THEN exposes `repair-vN` and
 drives the bulk — so readiness never clears ahead of the
