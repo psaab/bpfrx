@@ -1,8 +1,10 @@
 //! #5650: fabric cross-chassis forwarding — link resolution/skip classification,
-//! fabric redirect selection (plain + zone-encoded), the HA cluster-peer-return
-//! fast path, and the shared kernel-neighbor-state classifier used by the FIB
-//! and tunnel neighbor paths. Pure code-motion split out of `forwarding/mod.rs`
-//! (behavior-identical). See `docs/fabric-cross-chassis-fwd.md`.
+//! fabric redirect selection (plain + zone-encoded), the #6458 zone-stamp
+//! validation gates, and the shared kernel-neighbor-state classifier used by
+//! the FIB and tunnel neighbor paths. Pure code-motion split out of
+//! `forwarding/mod.rs` (behavior-identical). See
+//! `docs/fabric-cross-chassis-fwd.md`. (The HA cluster-peer-return fast path
+//! was removed in #6478.)
 
 use super::*;
 
