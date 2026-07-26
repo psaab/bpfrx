@@ -3960,7 +3960,7 @@ identity tails): the capability handshake exchanges
 `(node_id, process_incarnation, capacity,
 capacity_config_generation, heartbeat-ack-capable,
 identity-enforcement-capable, lease-input-capable,
-repair-vN, reset-vN)` — the identity fields are part of the
+repair-vN, reset-vN, decision-protocol)` — the identity fields are part of the
 AUTHENTICATED HELLO TRANSCRIPT under an explicit
 AUTH-TRANSCRIPT PROTOCOL VERSION (v9.9.43, round-48 Codex H2 —
 a direct proof-algorithm change would break rolling upgrades:
@@ -4172,6 +4172,20 @@ point on a v1-proof connection is the capability record
 itself, which rides the authenticated connection and is
 therefore authenticated by construction — and BIT 5 follows
 the SAME v1-proof rule as every other capability (v9.9.54.13,
+round-60 SMR F1); and the ACTIVATION rule is the
+INTERSECTION, never the local record (v9.9.54.14, round-60
+Codex B1: new A sends `{repair=1, decision=1}` while
+intermediate B sends `{repair=1, decision=0}` — B's OLD
+decoder skips the unknown BIT 5 (trailing tolerance), sees
+A's repair bit, and activates its older repair protocol,
+expecting terminal semantics A will not provide: each side
+computes the INTERSECTION of the two records and activates
+only capabilities present in BOTH (never a capability
+absent from the peer's record — the intermediate's
+`decision=0` zeroes the intersection, so BOTH sides use
+legacy); the documented alternative is a new repair version
+the intermediate cannot interpret at all); and BIT 5 follows
+the SAME v1-proof rule as every other capability (v9.9.54.13,
 round-60 SMR F1: on a v1-proof connection it is advertised,
 not active, until the matching authenticated
 `CAPABILITY_CONFIRM` — the decision phase requires BOTH
@@ -4272,11 +4286,28 @@ when the current hold is generation N+K, so an earlier
 hold's release can never race a newer hold)); the alternative is the explicit
 aggregate: EVERY locally relevant obligation discharged at
 the current generation — enumerated EXACTLY (v9.9.54.11,
-round-59 SMR F2: the THREE classes are the inbound repair
-obligation (peer→local table completeness), the outbound
-bulk obligation (local→peer state), and every cohort in the
-pending-rejection set (which gates readiness per the
-earlier folds)); and the hold's timeout
+round-59 SMR F2 + v9.9.54.14, round-60 Codex B2: the FIVE
+classes are the inbound repair obligation (peer→local table
+completeness), the outbound bulk obligation (local→peer
+state), every cohort in the pending-rejection set, the
+epoch/config publication state (a future-epoch park means
+the config that admitted the flow is not yet applied —
+`plan.md`'s own epoch-park machinery), and the parked FIFO
+drain (no deferred session message still buffered) — a
+future-epoch E1 parked against an unapplied config can
+otherwise satisfy an incomplete three-item release
+predicate while its own admission is unverified); and ONE
+complete readiness generation is published and REVALIDATED
+at every non-authoritative ownership commit (v9.9.54.14,
+round-60 Codex B2: acquisition otherwise races an
+already-authorized promotion — `SetSyncHold` updates
+instances after acquiring only `Manager.mu`
+(`vrrp/manager.go:354`), while the instance loop can pass
+its priority check and call `becomeMaster` independently
+(`instance.go:839`): the promotion's ownership commit
+revalidates the readiness generation under the SAME lock
+domain, so an acquisition can never land after the
+promotion's commit without the commit re-checking); and the hold's timeout
 NEVER silently releases while a negotiated repair
 obligation remains armed (a stale timeout checks the
 generation and re-arms); and the hold's SCOPE is
@@ -4312,21 +4343,38 @@ stops retry, and then sends the barrier
 override issues only after the pending-rejection set is
 empty AND no repair obligation is outstanding AND the last
 full repair completed through `JOURNAL_END` at the current
-generation — the barrier alone never substitutes for state
-completeness; the alternative is to FORCE AND VALIDATE a
-full repair through `JOURNAL_END` before the final barrier,
-with the forced repair running through the NORMAL
+generation — including the epoch-park state (a parked
+future-epoch cohort is outstanding state, v9.9.54.14,
+round-60 Codex B2's full predicate) — the barrier alone
+never substitutes for state completeness; the alternative
+is to FORCE AND VALIDATE a full repair through
+`JOURNAL_END` BEFORE STOPPING RETRY (v9.9.54.14, round-60
+Codex B3: the demoting node stops bulk retry BEFORE sending
+the barrier (`daemon_ha_userspace_readiness.go:155, :160`),
+so forcing the repair must come FIRST — stop retry only
+after the forced repair's `JOURNAL_END` lands, never
+before), with the forced repair running through the NORMAL
 obligation machinery (arm → drive → `JOURNAL_END`,
 re-arming the retry machinery for one cycle) and NEVER
 gated by the barrier (the barrier only gates the override's
 issue — no wait cycle, v9.9.54.13, round-60 SMR F3) —
 carrying its TRANSFER-GENERATION and validated
-like the readiness writers (v9.9.54.13, round-60 SMR F4:
-the override validates `token.gen == the RG's current
-transfer-generation` via the same packed-word CAS
-discipline and consumes the token one-shot — a token from
-an OLD generation fails the validation deterministically,
-closing the replay/ABA), carries the operator intent (the request's
+like the readiness writers — and bound to the readiness
+proof it authorizes (v9.9.54.14, round-60 Codex B4: a proof
+completing at generation G followed by an overflow
+advancing readiness to G+1 must not let the token bypass
+the newer hold: the token binds `(local/peer incarnation,
+request ID, transfer generation, readiness generation)`;
+it is CAS-consumed BEFORE EVERY activation side effect
+(the consumption validates the readiness generation against
+the packed word, not just the transfer-generation); and it
+persists with the exact desired-transition generation
+across event replay — `ClusterEvent` carries the token
+reference (never dropped without the token's lifecycle), so
+a dropped-and-replayed event cannot re-present a stale
+token (`cluster/manager.go:73, :460`), and the dataplane
+activation before `ForceRGMaster` (`daemon_ha.go:287`)
+validates the same tuple), carries the operator intent (the request's
 authenticated source and reason), and is consumed by the
 override; a `Secondary → Primary` event WITHOUT a token is
 an automatic election and fenced by the hold; and the
@@ -4439,7 +4487,22 @@ waits indefinitely in `vi.stop()` (`:432`, `:510`,
 would retry G1 and G2 cannot safely execute G1's ready
 effects: the executor retries abandoned tickets for the
 CURRENT generation; EACH target API validates ticket AND
-generation before executing an effect; and the executor's
+generation before executing an effect — with the APIs
+VERSIONED to take them (v9.9.54.14, round-60 Codex H5:
+today's APIs are unversioned (`ReleaseSyncHold()`,
+`daemon_ha_sync.go:19`'s timer cancellation) — each gains a
+`(generation, ticket)` parameter it validates before
+acting, so a stale ticket's effect performs nothing even if
+dispatched); and the submission is COALESCED and
+NONBLOCKING with at most ONE in-flight attempt per ticket
+(v9.9.54.14, round-60 Codex H5: a naïve watchdog that
+itself calls the blocking API accumulates blocked
+goroutines and cannot cancel a blocked mutex acquisition —
+the executor submits each effect to its target API's own
+deadline-aware submission path (never blocking on
+`vrrp.Manager.mu` in the control path), coalesces retries
+for the same ticket, and caps in-flight attempts at one);
+and the executor's
 OWN liveness is structural (v9.9.54.13, round-60 SMR F5:
 the watchdog dispatches effects to per-ticket WORKERS that
 validate ticket+generation, and the watchdog itself NEVER
@@ -4599,18 +4662,19 @@ the shared inputs are `dialer_hello =
 (v2, keyed, 32×0x42), `dialer_cap =
 01000000887766554433221100093d000000000007000000000000001f000000`
 (node_id 1, incarnation 0x1122334455667788, capacity 4000000,
-gen 7, bits 0x1F), and `acceptor_cap =
-02000000112233445566778800093d000000000007000000000000001f000000`
+gen 7, bits 0x3F — BIT 5 exercised, v9.9.54.14, round-60
+Codex L6), and `acceptor_cap =
+02000000112233445566778800093d000000000007000000000000003f000000`
 (node_id 2, incarnation 0x8877665544332211, capacity 4000000,
-gen 7, bits 0x1F); the DIALER vector (prover_role 0x01) has
+gen 7, bits 0x3F); the DIALER vector (prover_role 0x01) has
 input
-`7870662d636c75737465722d73796e632f76322f68656c6c6f2d7472616e73637269707401220002014141414141414141414141414141414141414141414141414141414141414141220002014242424242424242424242424242424242424242424242424242424242424242200001000000887766554433221100093d000000000007000000000000001f000000200002000000112233445566778800093d000000000007000000000000001f000000`
+`7870662d636c75737465722d73796e632f76322f68656c6c6f2d7472616e73637269707401220002014141414141414141414141414141414141414141414141414141414141414141220002014242424242424242424242424242424242424242424242424242424242424242200001000000887766554433221100093d000000000007000000000000003f000000200002000000112233445566778800093d000000000007000000000000003f000000`
 and expected digest
-`48fdf3d1119bce50cf76abd185678c4c9f39701d678c9aead4c864bb907790f3`;
+`6a56876cb0155a1b37d3a91b9dc742aba33e04d30c4f17d81b80085acbab9344`;
 the ACCEPTOR vector (prover_role 0x02) has input
-`7870662d636c75737465722d73796e632f76322f68656c6c6f2d7472616e73637269707402220002014141414141414141414141414141414141414141414141414141414141414141220002014242424242424242424242424242424242424242424242424242424242424242200001000000887766554433221100093d000000000007000000000000001f000000200002000000112233445566778800093d000000000007000000000000001f000000`
+`7870662d636c75737465722d73796e632f76322f68656c6c6f2d7472616e73637269707402220002014141414141414141414141414141414141414141414141414141414141414141220002014242424242424242424242424242424242424242424242424242424242424242200001000000887766554433221100093d000000000007000000000000003f000000200002000000112233445566778800093d000000000007000000000000003f000000`
 and expected digest
-`13dff63c649c4e72b2df5e6a7f275fecb335d78363344dbf00464a81d35dd428`
+`f46254ed135d2c127421bec0ff2f2f40f5a99c96830ec9abea850f78363d7c4b`
 (both computed with HMAC-SHA256 over the formula's exact byte
 grammar; each vector is a labeled triple of hex strings —
 the key, the complete role-specific input concatenation,
@@ -5366,6 +5430,28 @@ admitted interval):
   one-shot per-RG transfer-generation token (a
   Secondary→Primary event without a token is an automatic
   election and fenced);
+  (d12) v9.9.54.14 boundaries (round-60 Codex L6): asymmetric
+  old-peer activation (new A {repair=1, decision=1} vs
+  intermediate B {repair=1, decision=0} — BOTH compute the
+  intersection (decision=0) and use legacy; B never
+  activates old-repair against A); epoch-park release (a
+  future-epoch E1 parked against an unapplied config is
+  outstanding state — the release predicate's five classes
+  must ALL discharge); acquisition racing becomeMaster (the
+  ownership commit revalidates the readiness generation
+  under the same lock domain — an acquisition landing after
+  the commit fails the recheck); stale transfer-token
+  consumption and event loss (the token binds
+  (local/peer incarnation, request ID, transfer generation,
+  readiness generation) and CAS-consumes before every
+  activation side effect; a dropped-and-replayed ClusterEvent
+  cannot re-present a stale token); bounded executor under a
+  permanently blocked target (the coalesced nonblocking
+  submission caps in-flight attempts at one per ticket and
+  abandons by deadline — no goroutine accumulation, no
+  blocked-mutex cancellation needed); and the literal HMAC
+  vectors with BIT 5 set (0x3F — digests recomputed:
+  dialer 6a56876c..., acceptor f46254ed...);
   the pending-rejection GC wakeup
   re-opens admission with readiness degraded); same-fabric
   token supersession (C2 installs → T1 revoked before the slot
