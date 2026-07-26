@@ -1,10 +1,10 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v37 — r36 findings folded (Codex NEEDS-REVISION
-  1M/1m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m —
-  its temp-cleanup nit IS Codex m1, the second independent
-  convergence this run; all three confirm the §4.7 structure);
-  pending convergence review r37
+- **Status**: DRAFT v38 — r37 findings folded (Codex NEEDS-REVISION
+  2M/2m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m —
+  its wait-interval nit folded into the Codex M1 quiescence
+  barrier; all three confirm the §4.7 structure); pending
+  convergence review r38
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -1371,6 +1371,48 @@
   cause-count copies are swept (the §5.1 "ALL THREE causes"
   wiring comment and the docs-inventory enumeration now name
   the key-class causes AND `ConfigWriteUnverified`).
+  v38: r37 convergence — the fence gains its async-producer
+  barrier and the recovery guidance is corrected to the real
+  semantics (Codex NEEDS-REVISION 2M/2m, folds 2 FOLDED / 1
+  NOT-FOLDED, structure confirmed; AGY PLAN-READY 3/3 with 2
+  fresh attacks FAILED, structure confirmed; SMR
+  PLAN-READY-WITH-NITS 0M/1m — its wait-interval nit is folded
+  into (a)): (a) the quiesce step (2) verifies CLUSTER-SYNC
+  QUIESCENCE (Codex M1, verified the gap: peer reconnect,
+  promotion, or the 30-second reconciler can initiate SyncApply
+  independently of operator commits,
+  `daemon_ha_sync.go:417-430,500-522,926-956`, and a post-re-check
+  SyncApply under the BOOT latch can raise a process-local D
+  debt that the stop abandons) and waits ONE full pass at the
+  loop's CAPPED backoff (the `maxBackoff` parameter — SMR m1:
+  debts are raised SYNCHRONOUSLY in memory under `s.mu` at the
+  producing operation's failure, so the re-check observes them
+  regardless of backoff phase, but an in-flight resolution's
+  finalize runs inside a pass); the post-re-check SyncApply
+  residual is ADMITTED and BENIGN by construction: D's target is
+  a DEAD record (its window already resolved), so abandonment
+  leaves either an unreadable record the next boot re-classifies
+  into the SAME terminal latch (the sanctioned live removal
+  remediates) or a readable dead record the seeded-orphan
+  machinery resolves at the next commit — NO live-window replay
+  is possible from an abandoned D. (b) The post-restart recovery
+  path is corrected to the real semantics (Codex M2 + m1, all
+  three verified): the recovered timer re-arms for the record's
+  ORIGINAL REMAINING interval — possibly arbitrarily short, NOT
+  a fresh default window (`store_persist.go:231-253`) — so the
+  operator reads the deadline from the record/journal; an
+  inappropriately re-armed window is CONFIRMED away with a BARE
+  `commit` (confirmation cancels the timer,
+  `store_commit.go:729-748,796-823` — NEVER `commit check`,
+  which only validates, `cli_config.go:177-185,257-271`, and
+  NEVER manual record removal, which does NOT cancel the
+  in-memory timer); and the FirstCommit+cluster class has NO
+  service-time escape BY DESIGN — H reverts INSIDE `Load`, so
+  the operator RE-COMMITS after the revert rather than
+  confirming. (c) The fsatomic package comment
+  (`fsatomic.go:1-4`) and `pkg/fsatomic/README.md:3-12` — both
+  claiming exactly two writers — join the docs inventory for the
+  third (Codex m2).
 
 ---
 
@@ -3378,23 +3420,55 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   check — (1) the operator ensures NO live commit-confirmed
   window stands (confirm or roll back any armed window first —
   window resolution is operator-paced), (2) the operator REFRAINS
-  from new commits and waits ONE debt-pass interval ( SyncApply
-  is the only non-operator producer; one pass lets any in-flight
-  resolution finalize and any failure re-raise its debt), (3)
+  from new commits, verifies CLUSTER-SYNC QUIESCENCE (the peer is
+  stable and no config sync is in flight — the async producer is
+  peer-driven SyncApply: peer reconnect, promotion, or the
+  30-second reconciler can initiate it independently of operator
+  commits, `daemon_ha_sync.go:417-430,500-522,926-956`), and
+  waits ONE full pass at the retry loop's CAPPED backoff (the
+  `maxBackoff` parameter — debts themselves are raised
+  SYNCHRONOUSLY in memory under `s.mu` at the producing
+  operation's failure, so the re-check observes them regardless
+  of backoff phase, but an in-flight resolution's finalize runs
+  inside a pass, so one capped pass guarantees any pending
+  finalize has either completed or re-raised), (3)
   the operator RE-CHECKS `mask == 0` (a debt raised mid-wait now
   shows), and only then (4) stops xpfd and repairs. The residual
-  after the fence is explicitly ADMITTED (a debt raised inside
-  the fence's blind spot — a window whose deadline fires between
-  the re-check and the stop — is the same process-local
-  provenance loss admitted since r29), with the post-restart
-  recovery path NAMED: the recovered timer's deadline is
-  operator-scale (the default 10-minute window), so an
-  inappropriately re-armed window is CONFIRMED away (`commit
-  check`-style confirmation) or the record removed via the
-  sanctioned live path BEFORE the deadline; the expired-revert
-  inside `Load` is bounded to records whose own deadline had
-  already passed — the semantic the window itself would have
-  produced.
+  after the fence is explicitly ADMITTED in TWO bounded shapes:
+  (i) a window whose deadline fires between the re-check and the
+  stop (the process-local provenance loss admitted since r29);
+  (ii) a post-re-check peer SyncApply raising a process-local
+  D-kind debt that the stop abandons (r37 Codex M1) — BENIGN by
+  construction: D's target is a DEAD record (its window already
+  resolved — that is what makes it D's target, never W's), so
+  the abandoned debt leaves either an unreadable record that the
+  next boot re-classifies into the SAME terminal latch it came
+  from (the sanctioned live removal remediates — removal is
+  always live-safe) or a readable dead record the seeded-orphan
+  machinery resolves at the next commit — NO live-window replay
+  is possible from an abandoned D. The post-restart
+  recovery path is NAMED AND CORRECTED (r37 Codex M2 + m1, all
+  three verified): the recovered timer re-arms for the record's
+  ORIGINAL REMAINING interval — possibly arbitrarily short, NOT
+  a fresh default window (`store_persist.go:231-253`) — so the
+  operator reads the deadline from the record/journal and acts
+  within it; an inappropriately re-armed window is CONFIRMED
+  away with a BARE `commit` (confirmation cancels the timer,
+  `store_commit.go:729-748,796-823` — NEVER `commit check`,
+  which only validates, `cli_config.go:177-185,257-271`, and
+  NEVER manual record removal, which does NOT cancel the
+  in-memory timer); and the FirstCommit+cluster class has NO
+  service-time escape BY DESIGN — H intercepts the unexpired
+  record before re-arm and reverts it INSIDE `Load` (the
+  recovery invariant), so the operator's remediation for that
+  class is to RE-COMMIT after the revert, not to confirm;
+  the expired-revert inside `Load` is bounded to records whose
+  own deadline had already passed — the semantic the window
+  itself would have produced. The confirm-away path's
+  availability is consistent with the commit refusal by
+  construction (re-arm follows a CLEAN `Load` — healthy key
+  state, not write-unverified — so the bare `commit` is admitted
+  exactly when it is needed).
   As defense-in-depth, every
   content-INDEPENDENT repair write (the (w-u) restore, the D
   synthesized tombstone) RE-VERIFIES the target's classification
@@ -4205,7 +4279,10 @@ v20 history). The delivery is TWO units:
   open, with a target-unchanged/no-temp regression per
   `fsatomic_test.go:297-347`); a test seam
   drives the hook's failure path. The monolithic
-  `WriteFileDurable` is untouched for all other callers.
+  `WriteFileDurable` is untouched for all other callers; the
+  package comment (`fsatomic.go:1-4`) and
+  `pkg/fsatomic/README.md:3-12` (both currently claim exactly two
+  writers) are updated for the third (r37 Codex m2).
 - `pkg/configstore/store_commit.go` + `db.go` + `store.go` +
   `store_persist.go` (r11-r17): the `canonicalConfigHash` binding at
   the sole arm site (`writeConfirmState`); the additive `Resolved` +
@@ -5224,12 +5301,23 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      is safe LIVE (the probe's confirmed-absence barrier is
      idempotent), repair-to-valid FILESYSTEM remediation requires
      xpfd STOPPED with the MANDATORY `mask == 0` precondition
-     EXPLICIT and FENCED (the r36 producer-quiesce protocol:
+     EXPLICIT and FENCED (the r36/r37 producer-quiesce protocol:
      (1) no live commit-confirmed window stands, (2) refrain
-     from commits and wait ONE debt-pass interval, (3) RE-CHECK
+     from commits, verify CLUSTER-SYNC QUIESCENCE (peer stable,
+     no in-flight config sync — peer-driven SyncApply is the
+     async producer), and wait ONE full pass at the loop's
+     CAPPED backoff, (3) RE-CHECK
      `mask == 0`, (4) stop and repair — a debt raised mid-wait
-     shows at the re-check; the blind-spot residual is admitted
-     with the post-restart recovery path named),
+     shows at the re-check; the blind-spot residuals are admitted
+     and bounded: a mid-fence window deadline (the r29
+     provenance loss) corrected by a BARE `commit` confirmation
+     post-restart (NEVER `commit check` — it only validates;
+     NEVER manual removal — it does not cancel the in-memory
+     timer; the FirstCommit+cluster class reverts INSIDE `Load`
+     and is RE-COMMITTED after), and a post-re-check SyncApply
+     D-abandonment, BENIGN by construction — D's target is a
+     DEAD record, re-classified at the next boot into the same
+     terminal latch or seeded-orphan-resolved),
      and every
      content-INDEPENDENT repair write
      RE-VERIFIES the target's classification inside the SAME
@@ -5306,7 +5394,7 @@ the full Go/Rust suites, smoke) run for BOTH units.*
   past the next boot; the lifecycle redesign is a pre-existing policy
   question, not a `d.dp` publication concern.
 
-## 11. Open questions for adversarial review (r37)
+## 11. Open questions for adversarial review (r38)
 
 Resolved in v2-v9 (for the record): A2 deletion; atomic cell choice;
 sampler-only adapter — now STRUCTURAL via `CachedStatusProvider`;
