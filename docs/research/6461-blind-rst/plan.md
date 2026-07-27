@@ -4044,10 +4044,17 @@ is the LATCH, never an abort-retry flap (v9.9.54.1,
 round-54 AGY Q2/Q3 — the earlier text had BOTH "aborts the
 install and retries" AND the latch fallback, which are
 mutually exclusive: a slow or never-arriving CONFIRM
-LATCHES THE CONNECTION INTO THE LEGACY CLASS for the
+LATCHES THE CONNECTION INTO THE v1 CLASS (repair active,
+unconfirmed extras INACTIVE) for the
 connection's lifetime (the CONFIRM exchange carries its own
 deadline, like the auth handshake's; the peer that cannot
-confirm gets legacy — the safe, complete class); and the
+confirm gets v1 — the safe, complete class — NEVER v0
+(v9.9.54.19, round-64 Codex B1: the record already
+arrived, so the timeout proves CONFIRM absence only; v0
+requires RECORD absence proven by a complete ordinary
+frame or an explicit authenticated v0 declaration —
+latching v0 on a CONFIRM timeout splits the class against
+a peer that legitimately committed v1)); and the
 latch binds for the CONNECTION's lifetime with NO
 in-connection escape (v9.9.54.3, round-55 SMR F1: a peer
 that upgrades to v2 mid-connection still finishes this
@@ -4229,9 +4236,15 @@ completion is the current `BulkEnd`/`BulkAck`
 (`sync_conn_read.go:205`) and nothing else; **v1** = the
 EXACT old repair-v1 contract — the peer's record carries
 `repair-vN` (bit 2) without bit 5; the repair protocol
-RUNS (RESET_GEN/RESET_ACK, RESYNC_REQUEST, the
+RUNS (RESYNC_REQUEST, the
 cutoff/marker frames, JOURNAL_END/JOURNAL_ACK as the only
-discharge) and the DECISION PHASE never activates (no
+discharge) — the RESET lane (`RESET_GEN`/`RESET_ACK`, the
+reset-generation handshake) activates IFF `reset-vN`
+INDEPENDENTLY negotiates (repair and reset versions are
+independent machines, v9.9.54.19, round-64 Codex H4: a
+repair-v1 peer without reset support selects the
+time-barrier path, and its peer must NOT wait on the
+reset lane) — and the DECISION PHASE never activates (no
 decision frames are sent or expected — the phase's
 terminal completion simply does not exist at v1);
 **v2** = cumulative bits 2+5 — min() ≥ 2 adds the decision
@@ -4276,8 +4289,13 @@ session frame) IS the proof of the baseline class — there
 is no advertisement-timeout retry cycle; the latch settles
 at the frame, not on a timer, and holds for the
 connection's lifetime); and the CONFIRM-timeout byte
-rules are exact (v9.9.54.9: the stream retains and
-legacy-latches ONLY if ZERO bytes were consumed; a partial
+rules are exact (v9.9.54.9: the stream RETAINS and latches
+v1-with-unconfirmed-extras-INACTIVE if ZERO bytes were
+consumed (v9.9.54.19, round-64 Codex B1: the record
+already arrived — the timeout proves CONFIRM absence,
+never RECORD absence; v0 commits ONLY on a complete
+ordinary frame with no record, or an explicit
+authenticated v0 declaration); a partial
 CONFIRM frame closes; a COMPLETE late CONFIRM is consumed
 and IGNORED before declarations — where "ignored" means
 INELIGIBLE FOR FEATURE ACTIVATION ONLY (v9.9.54.10,
@@ -4384,7 +4402,15 @@ revalidates the readiness generation under the SAME lock
 domain — `Manager.mu` covering BOTH operations (v9.9.54.15,
 round-61 SMR F2: the commit (`becomeMaster`) and the
 acquisition's instance update are both Manager-mutex
-operations, so the revalidation serializes naturally — the
+operations — SUPERSEDED at v9.9.54.19 (round-64 Codex H5):
+the serialization object is the `PromotionPermit`, not
+`Manager.mu`; the commit's revalidation takes NO
+`vrrp.Manager.mu` (v9.9.54.18), so the
+`UpdateInstances`/`vi.stop` join cannot cycle with a
+committing run loop; `SetSyncHold`'s instance update
+still takes `Manager.mu`, and the permit's outermost
+ordering makes whichever lands second re-check and fail
+if the generation moved), so the revalidation serializes naturally — the
 commit reads the readiness generation under `Manager.mu`,
 the acquisition's update writes under `Manager.mu`, and
 whichever lands second re-checks and fails if the
@@ -4435,7 +4461,19 @@ cycles with a run loop mid-commit, and the permit would be
 decoration on a live deadlock); and run-loop JOINS never
 occur while holding `Manager.mu` at all (v9.9.54.18,
 round-63 Codex B4: `UpdateInstances` collects its
-stop-set under the mutex and joins AFTER releasing it);
+stop-set under the mutex and joins AFTER releasing it —
+and the collect-then-join runs under ONE reconciliation
+epoch (v9.9.54.19, round-64 Codex H5 + round-64 SMR F5:
+periodic reconciliation (`daemon_ha.go:654`) and config
+apply (`daemon_apply_tail.go:50`) can overlap the
+unlocked join window — double-stop, overwrite, or an
+unindexed live instance: ONE reconciliation mutex/epoch
+serializes every `UpdateInstances` pass (the loser
+re-reads the desired set and re-diffs); the stop-set
+detaches EXACT POINTERS under the lock with
+generation-tagged tombstones (never keys — a re-created
+key maps a NEW object), and completion is
+pointer-and-generation CAS));
 it is acquired BEFORE the generation
 read it validates; its span covers BOTH the normal VRRP
 publication (`instance.go:1305` recheck → `:1330`
@@ -4447,9 +4485,21 @@ Codex H5 + round-63 SMR F6: `sendAdvert`'s IPv4/IPv6
 socket writes have no production write deadline
 (`instance_send.go:39, :140, :218`) — one blocked write
 would stall G2 fencing and every unrelated RG promotion
-indefinitely: publication gains a NAMED write deadline,
-a publication timeout is a POST-PONR failure handled per
-the PONR rule, and the permit is ALWAYS released by its
+indefinitely); the publication OPERATION is cancellable
+and token-fenced, bounded STRICTLY BELOW the peer's
+master-down horizon (v9.9.54.19, round-64 Codex H6: a
+socket deadline alone does not bound the synchronous VIP
+operations — `addVIPsLocked`'s uncontexted
+`netlink.AddrAdd` (`instance_vip.go:185, :208`), direct
+mode likewise (`daemon_ha_vip.go:244`) — and `sendAdvert`
+returns no result while ignoring per-family failures
+(`instance_send.go:39, :68`): the netlink calls gain
+context/deadline, `sendAdvert` returns PER-FAMILY
+outcomes, the whole publication is one cancellable
+token-fenced operation bounded below masterDownInterval,
+and a publication timeout is POSSIBLY-PUBLISHED —
+forward-only idempotent recovery, never reclaim (the
+PONR rule)); the permit is ALWAYS released by its
 own deadline, never held past it);
 and no permit holder ever joins an instance run loop while
 holding it (the run loop does not take the permit))), so an acquisition can never land after the
@@ -4523,23 +4573,32 @@ timeout, peer loss, or generation mismatch it returns an
 error, marks NOTHING, and retains ownership (the ISSU
 drain aborts operator-visible — the operator re-drives),
 never proceeding without the validated transfer; and the
-transaction carries an ADMISSION FREEZE (v9.9.54.18,
-round-63 Codex B2: after the final repair proof the
-demoting node can still admit a NEW session E2 and publish
-it locally (`poll_descriptor/mod.rs:2560, :2591`) — the
-event is accepted while A remains primary and queued
-asynchronously (`daemon_ha_userspace_stream.go:181, :344`,
-`sync_conn_write.go:53`), and `WaitForPeerBarrier` covers
-only deltas queued BEFORE its marker (`sync_bulk.go:310`)
-— A could demote and stop before B receives E2: the
-sequence FREEZES new session admissions/publishes at
-snapshot time (a frozen admission either waits or is
-tagged into the repair's journal up to the freeze), drains
-every in-flight commit (deadline-bounded), sends the
-terminal barrier/marker ONLY AFTER the drain (so the
-barrier covers the drained set), and holds the freeze
-THROUGH the demotion — no old-owner commit lands after
-the cutoff); and the snapshot's substrate is a
+transaction applies a CONTINUE-AND-JOURNAL admission
+policy with an END-TO-END CUTOFF WATERMARK (v9.9.54.19,
+round-64 Codex B2 + round-64 SMR F1/F3 — the v9.9.54.18
+"freeze" was ambiguous between two policies, and a hard
+freeze would stall production new-flows for the whole
+drain, a regression in the opposite direction of the fix;
+and "in-flight commits" was undefined against the
+two-step accept (`install.rs:209, :235` enqueue) → worker
+drain (`loop_body/mod.rs:1096`) → helper→Go stream → Go
+journal pipeline: new admissions CONTINUE under the
+journal (no production stall — every post-snapshot
+admission is journaled by construction); the cutoff
+WATERMARK spans worker → helper → Go → journal — the
+drain's completion predicate is the PEER-ACK of every
+accepted delta up to the watermark (in-flight =
+accepted-not-yet-acked, so a mid-two-step event cannot
+slip past); the post-cut journal seals ONLY after the
+watermark drains (the seal-on-bulk ordering is
+subordinated to the watermark); the terminal
+barrier/marker is sent ONLY AFTER the seal (so the
+barrier covers the sealed set); the freeze applies ONLY
+to non-journaled state (NAT pool releases, config-epoch
+publications) and is held THROUGH the demotion; and an
+abort RELEASES the freeze and unseals (the transaction
+already retains ownership) — no old-owner commit lands
+after the cutoff UN-covered); and the snapshot's substrate is a
 NEVER-REUSED per-RG incarnation PLUS a global
 membership/config generation (v9.9.54.18, round-63 Codex
 H6: today's only per-RG generation is expressly a
@@ -4633,9 +4692,29 @@ promotion precedes sending the final peer commit
 BEFORE the first VIP/netlink ownership mutation in EVERY
 mode — the commit is the write-ahead PONR marker and the
 PEER is its durable store (no local-disk write on the
-failover critical path); the old owner's lease-expiry
+failover critical path); the commit requires the peer's
+ACK before the first mutation (round-64 SMR F8), and a
+sent-but-unACKed commit enters a DURABLE `CommitUncertain`
+claim — NEVER a unilateral abort (v9.9.54.19, round-64
+Codex B3: B may apply the commit, become secondary, and
+clear its restore lease (`failover.go:471`,
+`daemon_ha_sync.go:1045`) with its ACK lost
+(`sync_failover.go:477, :490`); A's timeout
+(`sync_failover.go:255, :271`) aborting before publication
+(`failover.go:305`) leaves B non-restoring and A never
+publishing — dual-secondary availability loss: the
+timeout does NOT abort — the claim retains (both
+incarnations, request/transfer generation, the exact RG
+set) as `CommitUncertain`, the commit is idempotently
+QUERYABLE, and on reconnect A queries B's commit status;
+B answers from its applied record (applied → the
+transition completes per the record; not-applied → A
+aborts cleanly pre-PONR); the claim clears ONLY on a
+definitive answer); the old owner's lease-expiry
 restore CHECKS the commit record first — a committed
-transfer NEVER auto-restores; a restarted node ALWAYS
+transfer NEVER auto-restores (and after ANY restart the
+restore is itself quiesced exactly like a fresh
+promotion — it is one, v9.9.54.19 round-64 SMR F4); a restarted node ALWAYS
 enters the existing startup sync-hold (`preempt=false`),
 never resumes an ownership transaction from volatile
 local state alone, and revalidates (old-owner lease,
@@ -4724,8 +4803,17 @@ are FALSE — a broad bypass is unsafe because current
 events carry neither reason nor token and may be
 dropped/replayed (`manager.go:73, :460`): the claim binds
 (the exact RG set, both incarnations, request ID, transfer
-generation, readiness generation), is consumed once, and
-is validated under the `PromotionPermit` for ONLY that
+generation, readiness generation), is claimed once, and
+enters the SAME `Authorized → Claimed → Applied` stage
+ledger, PONR, `CommitUncertain`, and recovery protocol as
+an ordinary transfer (v9.9.54.19, round-64 Codex H7 +
+round-64 SMR F7: the disruptive transition is itself
+multi-stage (demote + election + dataplane + routes +
+`ForceRGMaster`) — the ONLY difference from an ordinary
+transfer is the admission predicate (the five-class gate
+is bypassed by operator confirmation; everything else is
+identical)), validated under the
+`PromotionPermit` for ONLY that
 transition; and the OPERATOR force path (`ForceRGMaster`
 force=true, priority-0 takeover — today's ungated
 exemption class) carries the same operator-minted claim
@@ -4745,9 +4833,9 @@ CONNECTION (v9.9.54.7, round-56 Codex B1: the protocol
 class is connection-local, but `BulkSync` calls
 `getActiveConn()` (`sync_bulk.go:50`), which ALWAYS prefers
 fabric 0 when present (`sync_conn.go:27`) — fabric 0
-remaining legacy-latched while fabric 1 reconnects and
+remaining v0-class-latched while fabric 1 reconnects and
 commits `repair-vN` would arm the obligation yet drive the
-bulk over the legacy sibling, which can neither emit the
+bulk over the v0 sibling, which can neither emit the
 repair frames nor complete the terminal exchange, leaving
 the obligation permanently armed despite a usable
 repair-capable connection: the activation, the repair ID,
@@ -5156,8 +5244,8 @@ HELLO only selects the transcript version and names what can
 be confirmed later; on a v1-proof connection NO advertised
 capability becomes active except through a matching
 authenticated same-connection `CAPABILITY_CONFIRM`) — an
-intermediate peer gets the legacy paths and never a
-wait-forever);
+intermediate peer gets the v1/v0 class paths and never a
+wait-forever (v9.9.54.19, round-64 Codex L8));
 `RESYNC_REQUEST(repair_id)` (incarnation-scoped:
 `(sender_incarnation, request_seqno)`); `RESET_GEN` /
 `RESET_ACK` carry `(direction, node_incarnation,
@@ -5540,7 +5628,7 @@ documented mixed-version behavior).
 | Lifetime / borrow-checker | LOW | Anchor is `Copy` POD on an existing entry; marking restructured into the existing post-borrow propagation phase; no new cross-boundary borrows. |
 | Performance regression | LOW-MED | ~104 B/entry slab growth (~13.6 MiB/worker at cap); one TCP-header view compute (seq/ack/wnd/flags/seg_len) + ≤2 gated stores per committed TCP data packet (closing segments skip updates entirely); one extra probe per closing segment. Must be measured at minimum-frame rates (§9) — the 23 Gbit/s MTU-sized iperf run alone is insufficient (≈37 Mpps at 25 Gbit/s small-frame is the real gate; `iperf3 -l 64` is a proxy, not a demonstrated line-rate generator — gate on pps, not bandwidth). |
 | Architectural mismatch | LOW | No new subsystem; anchors at the existing #2501/#3706 chokepoints; #4400-style always-on gate. No pipeline restructure. |
-| HA / rolling upgrade | LOW-MED | Part A: no wire change; Part B adds rolling-gated additive identity tails on INSTALL/Open AND DELETE PLUS the negotiated repair protocol (v9.9.37: capability-negotiated `repair-vN`/`reset-vN` — RESET_GEN/RESET_ACK on a barrier-exempt lane, RESYNC_REQUEST, repair_cutoff_epoch/repair_id on BulkStart, JOURNAL_END/JOURNAL_ACK as the only discharge, the post-cut journal, the completed-repair receipt, slot-membership tokens, and capacity negotiation; intermediate peers get the legacy paths via the version bits, never a wait-forever; old decoders ignore additive frames via the trailing-field tolerance; mixed-version behavior documented: gen-based deletes apply only to non-locally-authoritative entries, and identity-dependent deletes are suppressed toward unnegotiated peers); pre-upgrade and imported entries sit in the absorbing zero-trust state — closes refuse until churn (strictly more conservative than master; bounded lingering, §2; Phase 2 §10.5 closes it for synced flows). The replica no-Close invariant + the SharedPromote refuse trace are regression-tested. Accepted residual (v9.9.16): a temporary stop whose rebind never comes pins preserved sessions + escrowed NAT ports until process exit — no workers, no reaper; escape is the declared-permanent stop; strictly more conservative than today's lose-everything link-cycle behavior; and a teardown-failed latch (v9.9.37) prohibits rebind/reconcile after a deadline-expired teardown until every unquiesced old worker exits or the process restarts (operator-visible). |
+| HA / rolling upgrade | LOW-MED | Part A: no wire change; Part B adds rolling-gated additive identity tails on INSTALL/Open AND DELETE PLUS the negotiated repair protocol (v9.9.37: capability-negotiated `repair-vN`/`reset-vN` — RESET_GEN/RESET_ACK on a barrier-exempt lane, RESYNC_REQUEST, repair_cutoff_epoch/repair_id on BulkStart, JOURNAL_END/JOURNAL_ACK as the only discharge, the post-cut journal, the completed-repair receipt, slot-membership tokens, and capacity negotiation; intermediate peers get the v1/v0 class paths via the version bits, never a wait-forever; old decoders ignore additive frames via the trailing-field tolerance; mixed-version behavior documented: gen-based deletes apply only to non-locally-authoritative entries, and identity-dependent deletes are suppressed toward unnegotiated peers); pre-upgrade and imported entries sit in the absorbing zero-trust state — closes refuse until churn (strictly more conservative than master; bounded lingering, §2; Phase 2 §10.5 closes it for synced flows). The replica no-Close invariant + the SharedPromote refuse trace are regression-tested. Accepted residual (v9.9.16): a temporary stop whose rebind never comes pins preserved sessions + escrowed NAT ports until process exit — no workers, no reaper; escape is the declared-permanent stop; strictly more conservative than today's lose-everything link-cycle behavior; and a teardown-failed latch (v9.9.37) prohibits rebind/reconcile after a deadline-expired teardown until every unquiesced old worker exits or the process restarts (operator-visible). |
 | Teardown-failed latch | LOW (probability) | v9.9.40: a deadline-expired teardown arms the durable latch — rebind/reconcile prohibited until every unquiesced old worker exits or the process restarts. Terminal state: XSK disabled, dataplane down, readiness degraded, operator-visible (#6244 stage reporting); recovery action documented (worker exit or `systemctl restart xpfd`); next reconcile retries with a fresh generation once the latch clears. |
 | Merge collision | LOW | No `FlowCacheEntry` change (v1's #6457 tension gone). `account_packet` signature change is local to two call sites; `SessionInstall`/`SessionUpdate` gains are crate-internal. |
 
@@ -5811,7 +5899,8 @@ admitted interval):
   allowlisted reader consumes and verifies header + payload +
   trailer and advances authConn.recvSeq — no bad-magic loop);
   and absent-vs-partial CONFIRM timeout (zero bytes consumed →
-  retain and legacy-latch; partial → close; complete late →
+  retain and latch v1-extras-inactive (v9.9.54.19 —
+  never v0 on a CONFIRM timeout); partial → close; complete late →
   consume and ignore before declarations);
   (d11) v9.9.54.12 boundaries (round-59 Codex L6): exact
   decision-support gating (BIT 5 present/absent on the two
@@ -5843,7 +5932,10 @@ admitted interval):
   (d12) v9.9.54.14 boundaries (round-60 Codex L6): asymmetric
   old-peer activation (new A `{repair=1, decision=1}` vs
   intermediate B `{repair=1, decision=0}` — BOTH compute the
-  negotiated min-version (v1) and use legacy (v9.9.54.17 —
+  negotiated min-version (v1) — repair-v1 RUNS with the
+  decision phase absent (v9.9.54.19, round-64 Codex L8 —
+  the "use legacy" phrasing was the retracted conflation;
+  v9.9.54.17 —
   the intersection is subsumed by the version machine for
   the repair bit); B never
   activates old-repair against A); epoch-park release (a
@@ -5933,6 +6025,33 @@ admitted interval):
   generations, consumed once, validated under the permit —
   the operator force path carries the same operator-minted
   claim);
+  (d15) v9.9.54.19 boundaries (round-64 Codex B1/B2/B3/H4/H5/H6/H7
+  + round-64 SMR F1/F3/F4/F8): the CONFIRM-timeout latch is
+  v1-extras-inactive, never v0 (v0 commits only on a
+  complete ordinary frame with no record, or an explicit
+  authenticated v0 declaration — an asymmetric timeout
+  cannot split the class); the reset lane activates iff
+  reset-vN independently negotiates (a repair-v1 peer
+  without reset support never waits on the reset lane);
+  the continue-and-journal cutoff watermark (admissions
+  continue under the journal; the drain predicate is
+  peer-ACK of every accepted delta up to the watermark;
+  the post-cut journal seals after the watermark drains;
+  the terminal barrier follows the seal; abort releases
+  the non-journaled freeze); the CommitUncertain claim (a
+  sent-but-unACKed commit never unilaterally aborts — it
+  retains (incarnations, generations, RG set), is
+  idempotently queryable, and resolves only on a
+  definitive peer answer); the lease-expiry restore is
+  quiesced after any restart; ONE reconciliation epoch
+  with pointer-identity stop-sets and generation-tagged
+  tombstones; the cancellable token-fenced publication
+  bounded below masterDownInterval (netlink calls
+  contexted, sendAdvert per-family outcomes, timeout =
+  possibly-published with forward-only recovery); and the
+  DisruptiveTransfer claim entering the full
+  Authorized → Claimed → Applied / PONR / CommitUncertain
+  lifecycle;
   the pending-rejection GC wakeup
   re-opens admission with readiness degraded); same-fabric
   token supersession (C2 installs → T1 revoked before the slot
