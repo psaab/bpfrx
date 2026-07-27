@@ -4015,7 +4015,14 @@ transcript vectors already pin — and the frame-32 payload
 IS the transcript capability record byte-for-byte
 (v9.9.54.24, round-69 SMR F6: the golden vectors already
 cover the wire encoding of the frame; no second encoding
-can drift from the hashed one)) IS the capability record on
+can drift from the hashed one) — produced by ONE encoder
+(v9.9.54.25, round-70 AGY Q1 + round-70 SMR F2: golden
+vectors are test assertions, not a compile-time
+invariant — the transcript term and the frame payload are
+the SAME encode function's output, so the identity is
+enforced by construction and a future field addition
+breaks the vectors loudly instead of forking two
+encoders)) IS the capability record on
 a v1-proof connection (the HELLO carries only version,
 keyed flag, nonce — `sync_auth.go:345`); the decision
 phase's own frames are `CAPABILITY_DECISION` (**33** —
@@ -4059,8 +4066,19 @@ computed_class ∈ {0 = v0, 1 = v1, 2 = v2} — the numeric
 mapping, v9.9.54.24, round-69 Codex M5);
 34 `CAPABILITY_DECISION_ACK` = `(sender_incarnation u64,
 decision_seqno u64)` (16 bytes); 40
-`FENCE_CLEARANCE_ACK` = the 36-byte namespace layout
-above), with
+`FENCE_CLEARANCE_ACK` = the 33-byte compact summary form
+`(authority_incarnation u64, target_incarnation u64,
+retirement_generation u64, scope_kind u8, scope_hash u64)`
+(v9.9.54.25, round-70 Codex B2 — the fixed-36-byte and
+33+count layouts disagreed with each other and with the
+132-byte heartbeat budget (`heartbeat.go:48, :87, :157,
+:417`); the AUTHORITATIVE counted record rides frame 41
+`RETIREMENT_NOTICE` on the sync channel); and 41
+`RETIREMENT_NOTICE` = `(authority_node_id u32,
+authority_incarnation u64, target_node_id u32,
+target_incarnation u64, retirement_generation u64,
+scope_count u8, rg_id u8 × scope_count)` (scope_count=0 =
+ALL — v9.9.54.25)), with
 INDIVIDUAL entry predicates (v9.9.54.22, round-67 Codex B1
 — the v9.9.54.21 text bundled every frame 32-39 under the
 v2 gate, which bars a repair-v1 pair from its own terminal
@@ -4315,7 +4333,17 @@ contradiction; the pre-v9.9.54.21 "a side that latched
 legacy locally REVERSES to the published class" is
 superseded — nothing latches on a timeout under
 v9.9.54.20, so there is no local legacy latch to reverse;
-the install is safe because nothing has dispatched yet: the decision precedes session dispatch —
+the install is safe because nothing has dispatched yet — and
+the COMMITTED class is CONNECTION-SCOPED like every class
+state (v9.9.54.25, round-70 AGY T2: it dies with the
+connection — a connection loss at ANY point (before or
+after commitment) invalidates it, the retry re-negotiates
+on a fresh connection, and NO class state crosses
+connections — so the responder-serialized /
+initiator-unreceived window cannot produce a
+cross-reconnect version mismatch; the only state a fresh
+connection inherits is the peer's identity, never its
+class): the decision precedes session dispatch —
 the full pre-dispatch order is pinned (v9.9.54.5,
 round-56 SMR F1: hello → proof → wrapper → CONFIRM
 exchange → `CAPABILITY_DECISION` + ACK → slot
@@ -4923,13 +4951,47 @@ mint-time record is `STAGED` — EMISSION-INELIGIBLE,
 never replayed or wired to the peer; it transitions
 ATOMICALLY to `INSTALLED` ONLY after canonical
 publication (the shared-state publish at
-`poll_descriptor/mod.rs:2578, :2591`); the cutoff's
+`poll_descriptor/mod.rs:2578, :2591`) — with the
+publication itself constructed INVISIBLY behind ONE
+commit cell (v9.9.54.25, round-70 Codex B1: publication
+is multi-step and visible too early — BPF aliases become
+visible sequentially (`bpf_map/mod.rs:82`), the primary
+shared row unlocks BEFORE the NAT/wire aliases are
+installed (`shared_ops.rs:907, :918`), another worker can
+immediately read and materialize it (`shared_ops.rs:630`,
+`session_glue/mod.rs:1092`), and a BPF publication error
+is only counted while publication CONTINUES
+(`poll_descriptor/mod.rs:2578, :2591`): W0 publishes
+E1/P's shared row, W1 materializes and forwards E1/P, A
+stops before the durable `INSTALLED` transition, B never
+received E1 (`STAGED` is emission-ineligible), recovery
+discards `STAGED` and frees P — E2 obtains P while E1
+traffic remains outstanding: every cohort's state is
+written HIDDEN (BPF aliases, shared rows, wire aliases —
+present but not lookup-visible), the durable journal
+record commits `INSTALLED`, and ONLY THEN does ONE atomic
+COMMIT CELL (a per-cohort visibility flag in the shared
+map that EVERY lookup masks with — a lookup for a
+non-committed cohort sees nothing at any publish point)
+flip the cohort visible; a failure BEFORE first
+visibility is the pre-publication rollback (safe); ANY
+failure AT or AFTER first visibility NEVER rolls back —
+retain the allocation and mark the ticket
+`UNCOVERED/DIRTY` (the same rule as the post-publication
+append failure); and `INSTALLED` requires every publish
+point's HIDDEN write confirmed — a partial hidden write
+unwinds all points (each an idempotent set/delete) with
+the ticket staying `STAGED` (round-70 SMR F1));
+the cutoff's
 durable-acceptance predicate counts ONLY `INSTALLED`
 records; the repair replicates ONLY `INSTALLED` records;
 and an uncommitted `STAGED` record is treated as ABSENT
 during recovery — rolled back with its allocation freed,
 which is safe because nothing was ever installed,
-published, or transmitted); and the failure policy SPLIT at publication
+published, or transmitted — and a `STAGED` record whose
+ticket's WORKER is gone is rolled back by the same rule
+(worker-liveness, no node crash required — round-70 SMR
+F6)); and the failure policy SPLIT at publication
 (v9.9.54.23, round-68 Codex B3: the operative dataplane
 order installs the forward entry
 (`poll_descriptor/mod.rs:2449`), publishes shared/sibling
@@ -4963,7 +5025,17 @@ ONLY when an exact helper-authoritative snapshot
 containing that identity reaches `JOURNAL_END`, or an
 identity-matching AUTHORITATIVE ABSENCE is established
 (the helper confirms the cohort exists nowhere — never
-by timeout, never by generation rollover) — and admissions
+by timeout, never by generation rollover; and
+absence-of-identity is SUFFICIENT precisely because the
+never-rollback retention keeps the tuple bound to the
+retained session for its whole natural life (v9.9.54.25,
+round-70 AGY Q2 + round-70 SMR F4: P is never reissued
+while the ticket is open — if the session ends naturally
+before the repair covers it, the cohort is genuinely
+gone and absence-of-identity is the correct clear; a
+partitioned-live E1 is NOT absent — its identity still
+exists, so the absence proof cannot fire and the conflict
+is never masked)) — and admissions
 from `OPEN(g+1)` ride generation g+1's journal FROM MINT
 (v9.9.54.24, round-69 SMR F4: the next cutoff's watermark
 covers them by construction); the cutoff aborts (ownership retained, operator-visible), and
@@ -5364,7 +5436,38 @@ rolling wire contract (v9.9.54.22, round-67 Codex H6: the
 extension appends past `HAProtocolVersion`
 (`heartbeat.go:239`) — old decoders already ignore
 trailing bytes (`heartbeat.go:373`), so the additive
-tolerance exists by construction; the extension carries
+tolerance exists by construction; and the carriage is
+SPLIT for the byte budget (v9.9.54.25, round-70 Codex B2:
+the heartbeat is capped at 1472 bytes (`heartbeat.go:48`),
+carries 255 five-byte RG rows (`heartbeat.go:157, :219`),
+and reserves 52 authentication bytes (`heartbeat.go:87,
+:417`) — a full signed baseline leaves 132 bytes while an
+explicit 255-RG namespace needs 288, so the full counted
+scope CANNOT always ride the heartbeat (and truncating it
+would either let peer state reach election
+(`heartbeat_manager.go:306`, `election.go:172`) or create
+false authoritative absence): the AUTHORITATIVE full fence
+record rides the AUTHENTICATED SESSION-SYNC connection —
+new frame **41** `RETIREMENT_NOTICE` (payload
+`(authority_node_id u32, authority_incarnation u64,
+target_node_id u32, target_incarnation u64,
+retirement_generation u64, scope_count u8, rg_id u8 ×
+scope_count)`, scope_count=0 = ALL — no byte cap); the
+heartbeat extension carries the COMPACT SUMMARY
+`(authority_incarnation u64, target_incarnation u64,
+retirement_generation u64, scope_kind u8 (0=ALL,
+1=EXPLICIT), scope_hash u64)` (33 bytes — fits the
+132-byte budget); an RG is fenced per the summary
+(scope_kind=ALL fences every RG; EXPLICIT fences the
+hashed scope — the per-RG detail resolves from the
+sync-channel `RETIREMENT_NOTICE`, and an
+INCOMPLETE-EXTENSION state (summary received, detail not
+yet applied) keeps the affected scope's election FENCED
+(fail-closed, never open); the compact ACK
+`FENCE_CLEARANCE_ACK` (40) carries the same 33-byte
+summary form (v9.9.54.25 — superseding the fixed
+36-byte/36+count layouts, which disagreed with each
+other and with the budget)); the extension carries
 (sender session-sync incarnation, retired-incarnation
 generation, retirement high-water mark) — keyed by an
 EXACT-MATCH NAMESPACE (v9.9.54.23, round-68 Codex H5:
@@ -5382,7 +5485,18 @@ Codex B3: a u32 bitmap cannot cover the supported RG IDs
 cannot represent an exact multi-RG scope: the scope is
 `(count u8, rg_id u8 × count)` with the canonical
 full-set sentinel `count=0` meaning ALL RGs (the
-`ForceSecondary` case); the eligibility rule is per-RG —
+`ForceSecondary` case) — stored PER-RG (v9.9.54.25,
+round-70 AGY Q2 + round-70 SMR F3: the pending fence is
+stored per-(namespace, rg)-ELEMENT — a mark EXPANDS its
+scope into elements at application time (an ALL mark
+expands to the then-current RG set; a config adding an RG
+after the mark does NOT fence the new RG — it was never
+retired); a clearance CASes per-element (an exact-scope
+clearance against an unexpanded sentinel is REJECTED —
+there is no sentinel left to match — never a partial
+clear); and `count=0` is the ALL sentinel, NEVER an
+empty scope (an empty scope is unencodable — a
+retirement of nothing is rejected at the API)); the eligibility rule is per-RG —
 an RG is election-eligible ONLY WHEN NO PENDING FENCE
 COVERS IT (overlapping fences `R1:{1,2}`, `R2:{2}`
 compose: clearing R1 lifts rg1 but rg2 stays fenced by
@@ -5856,9 +5970,22 @@ phrasing — the wrapper installs only after verification,
 `sync_auth.go:406`; and v9.9.51 strikes the older field-list
 encoding formerly here — the v9.9.51 executable grammar above
 is the ONLY transcript grammar); and the RESET-only
-allowlist explicitly includes the handshake sequence (HELLO
-transcript → capability exchange → `AUTH_PROOF(transcript)` →
-`RESET_GEN`/`RESET_ACK`), so the required proof is never an
+allowlist explicitly includes the handshake sequence —
+named SEPARATELY per proof version (v9.9.54.25, round-70
+Codex M4: the summary's "capability exchange →
+`AUTH_PROOF(transcript)`" contradicted the detailed
+v9.9.49 rule (a v1-proof peer reads exactly ONE raw frame
+after HELLO (`sync_auth.go:392`) and requires
+`syncMsgAuthProof` (`:401-404`), so a pre-proof capability
+frame on a v1-proof connection loops setup): the v1-proof
+sequence is HELLO → immediate `AUTH_PROOF(nonce)` →
+wrapper → `CAPABILITY_CONFIRM` (the capability exchange
+INSIDE the wrapper, post-install) → decision-if-v2 →
+`RESET_GEN`/`RESET_ACK`; the v2-proof sequence is HELLO
+pair (the capability records ride the transcript as the
+new frame type — permitted ONLY when BOTH peers are v2)
+→ `AUTH_PROOF_v2(transcript)` → wrapper →
+`CAPABILITY_DECISION`+ACK → `RESET_GEN`/`RESET_ACK`), so the required proof is never an
 implicit exception) — the two protocol-version bits are
 explicit (v9.9.37, round-45 Codex H7: an intermediate peer can
 support identity/heartbeat features while speaking only legacy
@@ -5878,8 +6005,27 @@ wait-forever (v9.9.54.19, round-64 Codex L8));
 `(sender_incarnation, request_seqno)`); `RESET_GEN` /
 `RESET_ACK` carry `(direction, node_incarnation,
 reset_generation)`; `BulkStart` carries
-`(repair_cutoff_epoch, repair_id, declared_member_count?)`; the
-bulk markers echo `repair_id`; the CAPABILITY-CONDITIONED
+`(repair_cutoff_epoch, repair_id, declared_member_count?)`;
+the bulk markers echo `repair_id` — with the repair-v1
+marker layouts BYTE-EXACT (v9.9.54.25, round-70 Codex H3:
+today both markers contain only the leading u64
+(`sync_bulk.go:65, :183`), which the receiver reads and
+matches at offset zero (`sync_conn_read.go:183, :205`), and
+the tuple text gave no width/order, optional-count
+discriminator, or legacy-prefix disposition: the legacy
+`bulk_epoch u64` prefix is PRESERVED at offset 0 (the
+current match rule is untouched), and the repair-v1
+extension appends — repair-v1 `BulkStart` =
+`(bulk_epoch u64, sender_incarnation u64,
+request_seqno u64, repair_cutoff_epoch u64,
+declared_count_present u8, declared_member_count u32)`
+(37 bytes; declared_count_present ∈ {0,1} — a constant
+length, never an optional-length tail; absent ⇒
+present=0 and the count field is zeroed and ignored);
+repair-v1 `BulkEnd` = `(bulk_epoch u64,
+sender_incarnation u64, request_seqno u64)` (24 bytes —
+the canonical repair-ID pair, byte-for-byte with
+RESYNC_REQUEST)); the CAPABILITY-CONDITIONED
 COMPLETION MATRIX (v9.9.45, round-49 Codex B1 — the two-frame
 rule cannot apply to mixed-version pairs: a legacy receiver
 can't return `JOURNAL_ACK` (or even a bare `BulkAck` when
@@ -6828,7 +6974,10 @@ admitted interval):
   generation, RG scope); clearance CASes only the current
   pending fence; the mark IS the retired
   process_incarnation; capability BIT 6;
-  FENCE_CLEARANCE_ACK = 40 with the 36-byte layout); the
+  FENCE_CLEARANCE_ACK = 40 with the 33-byte compact
+  summary form (the authoritative counted record rides
+  frame 41 RETIREMENT_NOTICE on the sync channel —
+  v9.9.54.25, round-70 Codex B2)); the
   byte-exact payload grammars for frames 33-40 (widths,
   endianness, direction encoding); the reset capability
   ZEROES at repair_version 0 (never refuses a v0 peer);
@@ -6863,6 +7012,40 @@ admitted interval):
   sweep (v1 commits on complete CONFIRM; v2 tentative at
   the exchange, commits at the ACK'd installation; the
   responder commits at the ACK's actual serialization);
+  (d21) v9.9.54.25 boundaries (round-70 Codex B1/B2/H3/M4
+  + round-70 AGY Q1/Q2/Q3/T1-T3 + round-70 SMR F1-F6):
+  the invisible-publication commit cell (every cohort
+  written HIDDEN; the durable INSTALLED commits; ONE
+  atomic visibility flag every lookup masks with flips
+  the cohort visible; INSTALLED requires every publish
+  point's hidden write confirmed — a partial hidden write
+  unwinds all points, ticket stays STAGED; ANY failure at
+  or after first visibility retains + DIRTY, never
+  rolls back; a STAGED record whose worker is gone rolls
+  back by worker-liveness); the split fence carriage
+  (frame 41 RETIREMENT_NOTICE carries the authoritative
+  counted scope on the sync channel; the heartbeat
+  carries the 33-byte compact summary (fitting the
+  132-byte budget); an incomplete-extension state keeps
+  the affected scope's election fenced fail-closed; the
+  pending fence is stored per-RG — expanded at mark,
+  clearance CASes per-element, an exact-scope clearance
+  against an unexpanded sentinel is rejected); the
+  repair-v1 BulkStart/BulkEnd layouts (legacy bulk_epoch
+  prefix preserved at offset 0; BulkStart = 37 bytes with
+  declared_count_present discriminator; BulkEnd = 24
+  bytes carrying the canonical repair-ID pair); the
+  v1-proof vs v2-proof handshake sequences named
+  separately; the one-encoder byte-identity (transcript
+  term and frame payload are the same encode function's
+  output); the receipt re-ACK semantics (same-pair-same-
+  tuple → idempotent re-ACK, never discarded;
+  same-pair-different-tuple → protocol violation,
+  closes); the committed class is connection-scoped
+  (dies with the connection; no cross-reconnect
+  mismatch); and the absence-proof sufficiency (the
+  never-rollback retention keeps the tuple bound for the
+  session's natural life);
   the pending-rejection GC wakeup
   re-opens admission with readiness degraded); same-fabric
   token supersession (C2 installs → T1 revoked before the slot
@@ -6872,7 +7055,17 @@ admitted interval):
   authority wins; the conflicting peer cohort stays
   unpublished; the repair never ACKs E1 protected);
   terminal-marker/ACK retry (the completed-repair receipt
-  re-ACKs a duplicate JOURNAL-END without re-mutating);
+  re-ACKs a duplicate JOURNAL-END without re-mutating —
+  keyed on the repair_id PAIR for the re-ACK path with the
+  full terminal tuple content-matched (v9.9.54.25,
+  round-70 AGY Q3 + round-70 SMR F5: a retransmitted
+  JOURNAL_END carries the SAME immutable triple by
+  construction, so same-pair-same-tuple → idempotent
+  re-ACK, NEVER discarded (no retransmission wedge);
+  same-pair-DIFFERENT-tuple is a protocol violation and
+  closes — the request_seqno makes each repair attempt
+  unique, so a divergent terminal under a known pair is
+  never a legitimate re-send));
   identity adoption (an import carries the wire identity
   byte-for-byte — A's conditional delete for IA matches on B);
   the same-E1-resend vs stage-2 race (the resend's publication
