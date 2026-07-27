@@ -4172,8 +4172,24 @@ point on a v1-proof connection is the capability record
 itself, which rides the authenticated connection and is
 therefore authenticated by construction — and BIT 5 follows
 the SAME v1-proof rule as every other capability (v9.9.54.13,
-round-60 SMR F1); and the ACTIVATION rule is the
-INTERSECTION, never the local record (v9.9.54.14, round-60
+round-60 SMR F1); and the DECISION PHASE is a distinct repair
+protocol VERSION (`repair-v2`), not a bit-flag dependency
+(v9.9.54.16, round-61 Codex B1: an intersection computed by
+the NEW side cannot constrain the OLD endpoint — old B
+ignores BIT 5 (and it sits inside the existing fixed-width
+capability word, not an additive trailing field), sees A's
+`repair=1`, and activates its older repair protocol under
+ITS older matching-CONFIRM rule (both records show
+`repair=1`) while A selects legacy: the decision phase is
+versioned as `repair-v2` (BIT 5 = `repair-v2`), and the
+version negotiation is MAX-COMMON-VERSION — both sides
+compute `min(own_max, peer_max)` DETERMINISTICALLY (v1 if
+either lacks v2, v2 iff both have it), so an intermediate
+peer lacking v2 can never activate v2 semantics against A,
+and A never asserts v2 support toward a v1 peer (A's
+advertised max is conditional on the peer's record); and the
+INTERSECTION rule of v9.9.54.14 governs the remaining bits
+under the same discipline (v9.9.54.14, round-60
 Codex B1: new A sends `{repair=1, decision=1}` while
 intermediate B sends `{repair=1, decision=0}` — B's OLD
 decoder skips the unknown BIT 5 (trailing tolerance), sees
@@ -4320,7 +4336,19 @@ operations, so the revalidation serializes naturally — the
 commit reads the readiness generation under `Manager.mu`,
 the acquisition's update writes under `Manager.mu`, and
 whichever lands second re-checks and fails if the
-generation moved), so an acquisition can never land after the
+generation moved); and the promotion gate is ONE NAMED
+permit held from validation THROUGH publication (v9.9.54.16,
+round-61 Codex H4: `SetSyncHold` uses `vrrp.Manager.mu` and
+per-instance state (`vrrp/manager.go:354`), while
+`becomeMaster` uses separate instance/VIP state — it
+rechecks `ownerGen` at `instance.go:1305`, releases
+`vipMu`, then publishes advert/event at `:1330`, so
+readiness can advance after the check but before
+publication: the promotion gate's permit is held from
+generation validation THROUGH the final ownership
+publication, with explicit ordering across normal VRRP and
+private/direct RG commits — no advance can slip between
+the check and the publish), so an acquisition can never land after the
 promotion's commit without the commit re-checking); and the hold's timeout
 NEVER silently releases while a negotiated repair
 obligation remains armed (a stale timeout checks the
@@ -4360,7 +4388,17 @@ full repair completed through `JOURNAL_END` at the current
 generation — including the epoch-park state (a parked
 future-epoch cohort is outstanding state, v9.9.54.14,
 round-60 Codex B2's full predicate) — the barrier alone
-never substitutes for state completeness; the alternative
+never substitutes for state completeness; and EVERY planned
+demotion entry point uses the same terminally validated
+protocol (v9.9.54.16, round-61 Codex H5: ISSU
+`ForceSecondary` immediately marks every RG secondary
+WITHOUT invoking ManualFailover's pre-hook
+(`failover.go:140, :159`) — if B lacks E1, an ISSU drain
+can demote A without the forced repair/`JOURNAL_END`/token
+sequence, after which B assumes ownership incomplete:
+`ForceSecondary` runs the same forced-repair →
+`JOURNAL_END` → token sequence BEFORE marking RGs
+secondary (its pre-hook is the same transaction)); the alternative
 is to FORCE AND VALIDATE a full repair through
 `JOURNAL_END` BEFORE STOPPING RETRY (v9.9.54.14, round-60
 Codex B3: the demoting node stops bulk retry BEFORE sending
@@ -4387,6 +4425,22 @@ completing at generation G followed by an overflow
 advancing readiness to G+1 must not let the token bypass
 the newer hold: the token binds `(local/peer incarnation,
 request ID, transfer generation, readiness generation)`;
+and the activation is a DURABLE
+`Authorized → Claimed → Applied` TRANSACTION (v9.9.54.16,
+round-61 Codex B2 — a ONE-SHOT token cannot be CAS-consumed
+before EVERY activation side effect, because ownership
+activation is multi-stage
+(`commitRequestedPeerFailover` applies the override and
+runs election (`failover.go:313, :335`); the daemon later
+performs `SetCluster`, `SetRGActive`, route changes, and
+`ForceRGMaster` (`daemon_ha.go:287, :314`)): ONE initial
+CAS claims the exact tuple BEFORE any side effect (the
+`Authorized → Claimed` transition); each later IDEMPOTENT
+stage (election, `SetCluster`, `SetRGActive`, routes,
+`ForceRGMaster`) validates that IMMUTABLE claim and records
+its progress (the claim is never re-consumed — stages
+validate it); and failure rolls back or retains the
+old-owner lease);
 it is CAS-consumed BEFORE EVERY activation side effect
 (the consumption validates the readiness generation against
 the packed word, not just the transfer-generation); and it
@@ -4413,8 +4467,20 @@ the packed not-ready state must NOT fold into the
 an accidental fold-in); exactly as they
 bypass the sync-hold preempt gate today (the same existing
 exemption class) — the repair continues or is superseded by
-the failover's own state transition, and an operator is
-never blocked)); and the repair is BOUND TO THE NEGOTIATING
+the failover's own state transition, and the operator path
+makes NO unconditional-progress promise (v9.9.54.16,
+round-61 Codex M6: the safe gate withholds the token while
+pending rejections, repair, or epoch/park state are
+incomplete — and a PERSISTENT local-authority tuple
+conflict can keep a cohort pending until the local holder
+exits (`plan.md`'s own local-authority-wins rule), which no
+amount of repeated repair can satisfy: the withheld state
+is OPERATOR-VISIBLE as a defined not-ready failure (never a
+silent stall and never a promise of progress), and the only
+bypass is a SEPARATELY EXPLICIT disruptive mode
+(operator-confirmed, named, and alarming) — "the operator
+is never blocked" is superseded by "the operator is never
+SILENTLY blocked")); and the repair is BOUND TO THE NEGOTIATING
 CONNECTION (v9.9.54.7, round-56 Codex B1: the protocol
 class is connection-local, but `BulkSync` calls
 `getActiveConn()` (`sync_bulk.go:50`), which ALWAYS prefers
@@ -4532,6 +4598,20 @@ calls any effect API — it cannot block on `vrrp.Manager.mu`
 or anything else; it monitors worker deadlines, and a hung
 WORKER's ticket is abandoned by deadline, never by the
 watchdog blocking); and supersession is
+explicit — and FENCE-FIRST (v9.9.54.16, round-61 Codex B3:
+ordering the supersession after G1's completion or "safe
+abandonment" lets a G1 worker validate, clear the hold,
+restore one instance, and block during the remaining
+multi-instance release (`vrrp/manager.go:389`), so an
+overflow creating G2 missing state can see the restored
+instance process `preemptNowCh` before G2's fence exists
+(`instance.go:880`): G2 FIRST revokes T1, publishes
+`G2/not-ready`, and establishes the ownership fence, and
+ONLY THEN drains or abandons G1 — never completes-first;
+and target validation is atomic with each EXTERNALLY
+VISIBLE mutation (each effect checks ticket+generation at
+the mutation point, not merely once on API entry)); and
+supersession is
 explicit — a new activation supersedes the old ticket only
 after the executor confirms the old ticket's effects either
 completed or were safely abandoned (each effect idempotent,
@@ -4687,10 +4767,11 @@ the shared inputs are `dialer_hello =
 (v2, keyed, 32×0x41), `acceptor_hello =
 02014242424242424242424242424242424242424242424242424242424242424242`
 (v2, keyed, 32×0x42), `dialer_cap =
-01000000887766554433221100093d000000000007000000000000001f000000`
+01000000887766554433221100093d000000000007000000000000003f000000`
 (node_id 1, incarnation 0x1122334455667788, capacity 4000000,
 gen 7, bits 0x3F — BIT 5 exercised, v9.9.54.14, round-60
-Codex L6), and `acceptor_cap =
+Codex L6; the standalone literal matches the complete
+inputs, v9.9.54.16, round-61 Codex M7), and `acceptor_cap =
 02000000112233445566778800093d000000000007000000000000003f000000`
 (node_id 2, incarnation 0x8877665544332211, capacity 4000000,
 gen 7, bits 0x3F); the DIALER vector (prover_role 0x01) has
