@@ -3978,8 +3978,10 @@ AUTH_HELLO/AUTH_PROOF (`sync_auth.go:60`) — the shared
 class commit is not rolling-interoperable until the frames
 and sequencing are named: the `CAPABILITY_CONFIRM` frame
 (ID **32** — the additive rolling-gated frames occupy
-32+, leaving 27-31 headroom over the current 1-26
-(`sync.go:39-76`), v9.9.54.21, round-66 Codex H7; payload
+32+, leaving 29-31 as headroom over the current 1-28
+(`sync.go:39-76` = 1-26, `sync_auth.go:60-65`
+`syncMsgAuthHello`/`syncMsgAuthProof` = 27-28),
+v9.9.54.21, round-66 Codex H7; payload
 = the full capability tuple laid out per the §5.8 record
 grammar — `(node_id, process_incarnation, capacity,
 capacity_config_generation, capability bits)` as
