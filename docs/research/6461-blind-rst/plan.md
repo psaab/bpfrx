@@ -3461,11 +3461,28 @@ attacker-poisonable):**
        the legacy store deletes current E2 and its NAT/reverse
        companions (`session_store.go:626, :644, :399`). The plan's
        receiver-side revalidation cannot retrofit legacy B, so the
-       rule: on an unnegotiated connection the sender sends bulk as
+       rule — restated in the class machine's terms (v9.9.54.22,
+       round-67 Codex B2 + round-67 SMR F2:
+       "unnegotiated"/"negotiated" predates the three classes, and
+       a RECORDED-v0 connection (all repair bits zero, identity
+       flags possibly set) is "negotiated" under the old phrasing —
+       so the legacy UNCONDITIONAL reconciliation
+       (`sync_conn_read.go:241`) would run on it, selecting a
+       same-key locally-installed E2 by key (`sync.go:1080`,
+       `session_store.go:626`) and deleting its reverse/DNAT
+       companions (`session_store.go:399`): absence reconciliation
+       runs ONLY at negotiated repair version ≥ 1, as the
+       identity-aware repair transaction; repair-v0 — EITHER
+       evidence path — is ALWAYS install-only regardless of any
+       other negotiated flag; the identity/lease additive tails
+       still negotiate and run independently on a v0 connection
+       (v0 gates ONLY the repair/reset/decision machinery) but
+       they NEVER unlock reconciliation): on a v0-class
+       connection the sender sends bulk as
        INSTALL-ONLY PRIMING (no reconciliation pass — the receiver's
        stale entries are left to its own aging/invalidation/sweep
-       machinery); reconciliation (the delete-stale-entries step) runs
-       only on negotiated connections. The mixed-version
+       machinery); reconciliation (the delete-stale-entries step)
+       runs only at repair version ≥ 1. The mixed-version
        POLICY-INVALIDATION window gets an explicit operational gate
        (v9.9.12, round-27 Codex H6: the legacy binary publishes the
        new policy BEFORE clearing old sessions
@@ -4001,9 +4018,28 @@ round-66 Codex H7 — literal IDs, layouts, and
 correlation); the repair/reset frames take **35-39**
 (`RESYNC_REQUEST` = 35, `JOURNAL_END` = 36,
 `JOURNAL_ACK` = 37, `RESET_GEN` = 38, `RESET_ACK` = 39),
-each with the payload layout its definition pins; sent
-only after a COMPLETE bidirectional CONFIRM
-exchange commits v2, never before); and a decision-phase
+each with the payload layout its definition pins; with
+INDIVIDUAL entry predicates (v9.9.54.22, round-67 Codex B1
+— the v9.9.54.21 text bundled every frame 32-39 under the
+v2 gate, which bars a repair-v1 pair from its own terminal
+frames (`RESYNC_REQUEST`/`JOURNAL_END`/`JOURNAL_ACK` ARE
+repair-v1): 32 (`CAPABILITY_CONFIRM`) is the setup record
+itself, class-free; 33-34 (`CAPABILITY_DECISION`/`ACK`)
+require committed repair-v2; 35-37 (`RESYNC_REQUEST`,
+`JOURNAL_END`, `JOURNAL_ACK`) require committed repair-v1
+OR LATER; 38-39 (`RESET_GEN`, `RESET_ACK`) require
+reset-v1 INDEPENDENTLY (the reset lane's own version
+machine); and a reset lane can negotiate ONLY at
+reset_version ≤ repair_version (v9.9.54.22, round-67
+Codex H5: repair and reset versions are independent, but
+the reset obligation's discharge rides the repair
+protocol's terminal frames (`JOURNAL_END`/`JOURNAL_ACK`)
+— a `{repair=0, reset=1}` pair could reset and then never
+discharge (repair-v0 defines only `BulkEnd`/`BulkAck`),
+staying permanently not-ready: the reset negotiation
+REFUSES reset_version > repair_version, so every
+reset-negotiated pair has the repair terminal frames its
+obligation needs)); and a decision-phase
 frame arriving on a connection whose committed class is
 BELOW v2 is a protocol violation and closes the connection
 (v9.9.54.21, round-66 SMR F7: the allowlisted
@@ -4179,8 +4215,18 @@ is a protocol violation and closes the connection — the
 peer never accepts a class it cannot derive) and echoes
 acceptance in `CAPABILITY_DECISION_ACK(decision_seqno)`,
 and BOTH sides install the class ONLY at the ACK'd
-decision installation — the SINGLE commit point
-(v9.9.54.21, round-66 Codex L8: the class is TENTATIVE at
+decision installation — the SINGLE commit point with the
+linearization pinned (v9.9.54.22, round-67 Codex M7 +
+round-67 SMR F3: the OWNER commits on EXACT ACK RECEIPT;
+the RESPONDER commits on the successful full ACK
+write/enqueue on the ordered stream; and the responder's
+install is PROVISIONAL until the connection survives the
+ACK window — a connection loss before any subsequent
+dispatch REVOKES the tentative class, every dispatch
+derived from it is discarded with the connection, and NO
+cross-connection state may derive from a provisional
+install) (v9.9.54.21, round-66 Codex L8: the class is
+TENTATIVE at
 the capability exchange and COMMITS at the ACK'd
 installation — resolving the exchange-vs-installation
 contradiction; the pre-v9.9.54.21 "a side that latched
@@ -4190,10 +4236,12 @@ v9.9.54.20, so there is no local legacy latch to reverse;
 the install is safe because nothing has dispatched yet: the decision precedes session dispatch —
 the full pre-dispatch order is pinned (v9.9.54.5,
 round-56 SMR F1: hello → proof → wrapper → CONFIRM
-declarations → `CAPABILITY_DECISION` + ACK → slot
-install → session dispatch/cold-prime — the decision
+exchange → `CAPABILITY_DECISION` + ACK → slot
+install → session dispatch/cold-prime (v9.9.54.22,
+round-67 Codex L8 — "CONFIRM declarations" predates the
+declaration-removal; the order is the exchange itself) — the decision
 ALWAYS completes before `sync_conn.go:138-194`'s
-cold-prime, so a side that declared repair-era locally
+cold-prime, so a side that computed repair-era locally
 has dispatched NOTHING when the decision arrives));
 a timeout with NO committed decision closes and retries
 with bounded backoff (never an independent class selection
@@ -4403,7 +4451,8 @@ not terminal), and a COMPLETE late CONFIRM on a FRESH
 retry stream is HONORED — it is ignored only on the
 stream that already timed out); a partial
 CONFIRM frame closes; a COMPLETE late CONFIRM is consumed
-and IGNORED before declarations — where "ignored" means
+and IGNORED before activation (v9.9.54.22, round-67 Codex
+L8 — "before declarations" predates the declaration-removal) — where "ignored" means
 INELIGIBLE FOR FEATURE ACTIVATION ONLY (v9.9.54.10,
 round-58 Codex H4: the late CONFIRM's identity is needed
 for owner selection — on a v1-proof connection the HELLO
@@ -4426,8 +4475,10 @@ latched "the legacy class" on a CONFIRM timeout; a
 zero-byte CONFIRM timeout proves record absence for that
 window only, and no timer may commit any class: close and
 retry with bounded backoff — the earlier "never aborts over a
-late CONFIRM" refers only to the CONFIRM class)); the connection never aborts over a late
-CONFIRM, so there is no reconnect flap); and when a
+late CONFIRM" refers only to the CONFIRM class)); a COMPLETE late
+CONFIRM never aborts the connection (it is consumed and
+ignored — only a zero-byte or partial timeout
+closes+retries, v9.9.54.22, round-67 Codex L8), so there is no reconnect flap); and when a
 capability transitions inactive→active on a LATER
 connection, a FRESH repair-era full bulk is explicitly
 scheduled — and the ACTIVATION ITSELF is one transaction
@@ -4744,7 +4795,45 @@ waiting for the loop tail (`loop_body/mod.rs:1096`) and
 reaching Go post-demotion, discarded
 (`daemon_ha_userspace_stream.go:185`): every admission
 takes a READ PERMIT held from BEFORE NAT allocation
-THROUGH publication AND durable local-journal receipt;
+THROUGH publication AND durable local-journal receipt —
+with the receipt given END-TO-END IDENTITY (v9.9.54.22,
+round-67 Codex B3: `SessionDelta` carries no
+admission-ticket identity (`entry.rs:283`), Go discards
+the helper sequence (`daemon_ha_userspace_stream.go:159`),
+calls void `QueueSessionV4/V6`, and returns success
+(`:185`), those queue methods DISCARD `queueMessage`
+failure (`sync_conn_write.go:36, :56`), and EventStream
+marks and ACKs the frame anyway (`eventstream.go:938`) —
+so under send-queue pressure E2 could receive the
+apparent local receipt, release its permit, and let the
+cutoff seal with the retained journal containing NO E2;
+and receipt cardinality was unspecified (reverse entries
+and `MissingNeighborSeed` installations emit NO Open
+delta — `install.rs:225`, `poll_descriptor/mod.rs:4787`):
+ONE generation-tagged ADMISSION TICKET per logical forward
+cohort is minted at admission and carried END-TO-END
+(dataplane install → helper → Go → journal append); the
+EXACT install (every emitted delta of the cohort) is
+appended durably BEFORE the admission returns success —
+`QueueSessionV4/V6` and `queueMessage` propagate failure,
+and a failed append fails the admission (rollback the
+install, never a silent success); the cohort's cardinality
+is EXPLICIT — a reverse entry and a `MissingNeighborSeed`
+either emit their own journaled deltas under the same
+ticket or are explicitly rejected-and-rolled-back (never
+an unjournaled companion); and the fence is a STATE
+MACHINE `OPEN → DRAINING → SEALED/ABORTED` (writer intent
+in DRAINING rejects NEW readers while held permits drain;
+the millisecond deadline's expiry is a fence FAILURE —
+the machine goes ABORTED, the transaction aborts
+operator-visible, and the cutoff NEVER proceeds unsealed
+(round-67 SMR F5); a SEALED generation can NEVER be
+re-opened by a later timeout or retry);
+the permit topology is PER-WORKER (round-67 SMR F4: each
+worker's read side is uncontended on the hot path; the
+fence's write side is an ALL-WORKERS drain bounded by the
+slowest in-flight admission's publish + journal receipt,
+capped by the fence deadline));
 the fence's WRITE side acquires only after every held
 read permit drains (workers keep draining — the fence
 never blocks an in-flight admission); a NEW admission
@@ -4921,11 +5010,32 @@ receipt and publishes while B remains Primary: the
 receipt persists `Prepared` BEFORE execution (one small
 local write, off the failover critical path) and `Applied`
 ONLY AFTER finalization AND lease disposition BOTH
-succeed; a `Prepared`-present restart REPLAYS the
+succeed — and it has TERMINAL states (v9.9.54.22,
+round-67 Codex B4: B's lease can expire and re-elect B
+(`election.go:67`); the delayed commit writes `Prepared`,
+`FinalizePeerTransferOut` rejects (B is Primary), B sends
+the rejected result (`sync_failover.go:477`), and A
+aborts (`failover.go:305`) — but nothing terminal ever
+landed on B's receipt, and after a restart the RGs
+initialize Secondary (`group_state.go:23`) and a replay
+could finalize an ALREADY-ABORTED transfer: a
+definitively rejected commit persists `Rejected/Aborted`
+(or atomically removes `Prepared`) BEFORE the rejection
+result is sent; ONLY retriable `Prepared` receipts
+replay — a `Rejected/Aborted` receipt NEVER replays, and
+the replay itself revalidates the lease's liveness before
+finalizing); a `Prepared`-present restart REPLAYS the
 prepared commit BEFORE any election or status answer
 (so B can never re-elect past a pending prepared commit,
 and A's query never sees "applied" for a commit that was
-never finalized); every commit stage stays an
+never finalized — and the replay re-arms the restoration
+lease with a FRESH expiry (v9.9.54.22, round-67 SMR F6:
+the lease clock ran while B was down; the lease's
+purpose — auto-restore on an incomplete transfer — is
+live until the `Prepared` resolves, and A's view is
+consistent because A's `CommitUncertain` claim retains
+until the replay's resolution provides the definitive
+answer)); every commit stage stays an
 unconditionally-written value (set/delete — round-66 SMR
 F4), never a counter or a conditional mutation, so the
 replay is idempotent); a receipt-absent
@@ -5075,8 +5185,28 @@ state, and runs election IMMEDIATELY (`heartbeat.go:848`,
 `heartbeat_manager.go:293`), so priority processing can
 yield ownership BEFORE the authoritative reseed
 (`election.go:172`): the retirement record rides the
-heartbeat (the sender's session-sync incarnation and the
-peer's retired-incarnation generation), and a heartbeat
+heartbeat as an AUTHENTICATED ADDITIVE EXTENSION with a
+rolling wire contract (v9.9.54.22, round-67 Codex H6: the
+extension appends past `HAProtocolVersion`
+(`heartbeat.go:239`) — old decoders already ignore
+trailing bytes (`heartbeat.go:373`), so the additive
+tolerance exists by construction; the extension carries
+(sender session-sync incarnation, retired-incarnation
+generation, retirement high-water mark); its processing
+is gated on the peer's advertised extension capability
+(rolling-gated like every other additive tail); and fence
+clearance is ACKed — the returner's reseed completion is
+acknowledged before its RG state and priorities are
+election-eligible again; for a peer LACKING the extension
+(an old build — exactly the rolling-upgrade window the
+disruptive path serves), EXTERNAL FENCING is a HARD
+pre-PONR requirement (v9.9.54.22 + round-67 SMR F1: the
+operator's disruptive confirmation ASSERTS the peer is
+dead — not merely unreachable; a partitioned-but-alive
+peer is an operator error the mode cannot fence, VRRP
+priority resolution bounds the window, and the retirement
+advertisement reaches only the RETURNING peer's
+revalidation, never a live partitioned one)), and a heartbeat
 from a retired or unvalidated incarnation is LIVENESS-ONLY
 — it proves the node is up, and its RG state and
 priorities are IGNORED for election until authenticated
@@ -6186,7 +6316,7 @@ admitted interval):
   and absent-vs-partial CONFIRM timeout (zero bytes consumed →
   close and retry with bounded backoff (v9.9.54.20 — no
   timer commits any class); partial → close; complete late →
-  consume and ignore before declarations);
+  consume and ignore before activation (v9.9.54.22));
   (d11) v9.9.54.12 boundaries (round-59 Codex L6): exact
   decision-support gating (BIT 5 present/absent on the two
   records → negotiated min-version v2 vs v1 for the
@@ -6408,6 +6538,39 @@ admitted interval):
   ladder (inner bounded backoff → outer 1s connect loop,
   never fatal; a complete late CONFIRM on a fresh stream
   is honored);
+  (d18) v9.9.54.22 boundaries (round-67 Codex B1/B2/B3/B4/H5/H6/M7/L8
+  + round-67 SMR F1-F7): the per-frame entry predicates
+  (33-34 require repair-v2; 35-37 require repair-v1+;
+  38-39 require reset-v1 independently; reset_version ≤
+  repair_version always — a {repair=0, reset=1} pair is
+  not negotiable); repair-v0 bulk is ALWAYS install-only
+  (absence reconciliation runs only at repair ≥ 1 as the
+  identity-aware repair transaction — a recorded-v0
+  mid-bulk primary flip never key-deletes E2 or its
+  companions); the generation-tagged admission ticket
+  (one per logical forward cohort, carried end-to-end;
+  the exact install appended durably before success —
+  queue failures propagate and fail the admission;
+  reverse/seed cardinality explicit; the fence state
+  machine OPEN → DRAINING → SEALED/ABORTED with
+  deadline-expiry = ABORTED and no re-open); the
+  Rejected/Aborted terminal receipt state (persisted
+  before the rejection result is sent; only retriable
+  Prepared replays; the replay revalidates lease liveness
+  and re-arms with a fresh expiry); the heartbeat
+  retirement extension's rolling contract (additive past
+  HAProtocolVersion, old decoders ignore trailing bytes,
+  capability-gated, high-water + clearance ACK; external
+  fencing is a hard pre-PONR requirement for
+  extension-less peers — the operator asserts the peer is
+  DEAD, not merely unreachable); the decision-ACK
+  linearization (owner commits on exact ACK receipt;
+  responder on successful full ACK write/enqueue; the
+  responder's tentative class is revoked on connection
+  loss before any subsequent dispatch); and the
+  declaration-era stragglers swept ("before
+  declarations" → "before activation", the pre-dispatch
+  order, the "never aborts" reconciliation);
   the pending-rejection GC wakeup
   re-opens admission with readiness degraded); same-fabric
   token supersession (C2 installs → T1 revoked before the slot
