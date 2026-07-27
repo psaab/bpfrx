@@ -3960,7 +3960,8 @@ identity tails): the capability handshake exchanges
 `(node_id, process_incarnation, capacity,
 capacity_config_generation, heartbeat-ack-capable,
 identity-enforcement-capable, lease-input-capable,
-repair-vN, reset-vN, decision-protocol)` — the identity fields are part of the
+repair-vN, reset-vN, repair-v2 (the decision phase —
+ONE name, v9.9.54.18, round-63 Codex L8))` — the identity fields are part of the
 AUTHENTICATED HELLO TRANSCRIPT under an explicit
 AUTH-TRANSCRIPT PROTOCOL VERSION (v9.9.43, round-48 Codex H2 —
 a direct proof-algorithm change would break rolling upgrades:
@@ -4215,9 +4216,34 @@ only capabilities present in BOTH (never a capability
 absent from the peer's record — the intermediate's
 `decision=0` zeroes the intersection, so BOTH sides use
 legacy; for the VERSIONED repair bit the intersection is
-subsumed by the min-version rule of v9.9.54.16 — min()
-yields v1 on the same trace, so BOTH sides use legacy by
-the version machine, v9.9.54.17) — the intersection LATCHING for the connection's
+subsumed by the min-version rule of v9.9.54.16, with the
+THREE negotiated classes defined EXACTLY (v9.9.54.18,
+round-63 Codex B1 + round-63 SMR F4 — "min() yields v1,
+both sides use legacy" conflated the v1 repair contract
+with the v0 baseline path): **v0** = RECORD ABSENCE — no
+capability record ever arrives and the first buffered
+ordinary frame (`ClockSync` or a session frame,
+`sync_conn.go:137`) commits the baseline class
+(`min(own_max, absent) = v0`); NO repair protocol runs —
+completion is the current `BulkEnd`/`BulkAck`
+(`sync_conn_read.go:205`) and nothing else; **v1** = the
+EXACT old repair-v1 contract — the peer's record carries
+`repair-vN` (bit 2) without bit 5; the repair protocol
+RUNS (RESET_GEN/RESET_ACK, RESYNC_REQUEST, the
+cutoff/marker frames, JOURNAL_END/JOURNAL_ACK as the only
+discharge) and the DECISION PHASE never activates (no
+decision frames are sent or expected — the phase's
+terminal completion simply does not exist at v1);
+**v2** = cumulative bits 2+5 — min() ≥ 2 adds the decision
+phase with its own terminal completion; each class
+LATCHES at its commit point (v0 at the first ordinary
+frame, v1/v2 at the capability exchange) for the
+connection's lifetime — on the round-60 trace (new A
+bits 2+5 vs intermediate B bit 2 only) min() = v1:
+repair-v1 RUNS on both sides and the decision phase is
+simply absent — B never activates semantics A lacks and
+A never waits for decision frames B cannot send,
+v9.9.54.18) — the intersection LATCHING for the connection's
 lifetime (v9.9.54.15, round-61 SMR F1: a capability-record
 replacement mid-connection (a newer record with fewer bits)
 does NOT re-open the intersection — the recomputation is
@@ -4240,7 +4266,11 @@ round-59 Codex B1); a baseline peer's first ordinary
 legacy frame is BUFFERED, the connection latches legacy,
 installs, and dispatches the buffered frame in order —
 never rejected — and the latch SETTLES PERMANENTLY on that
-first ordinary frame (v9.9.54.11, round-59 SMR F1: the
+first ordinary frame (v9.9.54.18, round-63 Codex B1: this
+IS the v0 class — RECORD ABSENCE committed by the first
+buffered ordinary frame; `min(own_max, absent) = v0`, no
+repair protocol runs, completion is the current
+`BulkEnd`/`BulkAck` and nothing else) (v9.9.54.11, round-59 SMR F1: the
 arrival of the first ordinary legacy frame (ClockSync or a
 session frame) IS the proof of the baseline class — there
 is no advertisement-timeout retry cycle; the latch settles
@@ -4385,13 +4415,42 @@ entirely: `PromotionPermit` is owned by the cluster
 manager and is the OUTERMOST acquisition in the order —
 acquired BEFORE `Manager.mu`/`vipMu`/`directVIPMu` and any
 instance lock, released after all of them, NEVER acquired
-while holding any of them, and never acquired by the
-readiness advancer (which runs under `Manager.mu` — so no
-AB-BA cycle exists); it is acquired BEFORE the generation
+while holding any of them; the false→true readiness
+ADVANCER never acquires it (the generation CHECK under the
+permit covers it — a stale validation fails fast), but
+EVERY true→false readiness-LOSS writer takes the permit
+(exclusive, same outermost order — v9.9.54.18, round-63
+Codex B4: otherwise G2's not-ready publication can slip
+into G1's validate→publish window and fence or race a
+just-promoted master — whoever holds the permit first
+wins deterministically); the generation revalidation
+under the permit NEVER acquires `vrrp.Manager.mu` (the
+readiness generation lives in the CLUSTER manager's
+domain; `becomeMaster`'s VRRP-side reads
+(`instance.go:1305`) take instance locks only — v9.9.54.18,
+round-63 SMR F1: otherwise the
+`UpdateInstances`-holds-`Manager.mu`-across-`vi.stop()`
+join (`vrrp/manager.go:432-436, :449`, `instance.go:1382`)
+cycles with a run loop mid-commit, and the permit would be
+decoration on a live deadlock); and run-loop JOINS never
+occur while holding `Manager.mu` at all (v9.9.54.18,
+round-63 Codex B4: `UpdateInstances` collects its
+stop-set under the mutex and joins AFTER releasing it);
+it is acquired BEFORE the generation
 read it validates; its span covers BOTH the normal VRRP
 publication (`instance.go:1305` recheck → `:1330`
 advert/event) and the private/direct `directVIPMu`
 publication — the two commit paths hold the SAME permit;
+every publication step under the permit is
+deadline-bounded or nonblocking (v9.9.54.18, round-63
+Codex H5 + round-63 SMR F6: `sendAdvert`'s IPv4/IPv6
+socket writes have no production write deadline
+(`instance_send.go:39, :140, :218`) — one blocked write
+would stall G2 fencing and every unrelated RG promotion
+indefinitely: publication gains a NAMED write deadline,
+a publication timeout is a POST-PONR failure handled per
+the PONR rule, and the permit is ALWAYS released by its
+own deadline, never held past it);
 and no permit holder ever joins an instance run loop while
 holding it (the run loop does not take the permit))), so an acquisition can never land after the
 promotion's commit without the commit re-checking); and the hold's timeout
@@ -4463,7 +4522,40 @@ whole sequence is bounded by a NAMED timeout, and on
 timeout, peer loss, or generation mismatch it returns an
 error, marks NOTHING, and retains ownership (the ISSU
 drain aborts operator-visible — the operator re-drives),
-never proceeding without the validated transfer)); the alternative
+never proceeding without the validated transfer; and the
+transaction carries an ADMISSION FREEZE (v9.9.54.18,
+round-63 Codex B2: after the final repair proof the
+demoting node can still admit a NEW session E2 and publish
+it locally (`poll_descriptor/mod.rs:2560, :2591`) — the
+event is accepted while A remains primary and queued
+asynchronously (`daemon_ha_userspace_stream.go:181, :344`,
+`sync_conn_write.go:53`), and `WaitForPeerBarrier` covers
+only deltas queued BEFORE its marker (`sync_bulk.go:310`)
+— A could demote and stop before B receives E2: the
+sequence FREEZES new session admissions/publishes at
+snapshot time (a frozen admission either waits or is
+tagged into the repair's journal up to the freeze), drains
+every in-flight commit (deadline-bounded), sends the
+terminal barrier/marker ONLY AFTER the drain (so the
+barrier covers the drained set), and holds the freeze
+THROUGH the demotion — no old-owner commit lands after
+the cutoff); and the snapshot's substrate is a
+NEVER-REUSED per-RG incarnation PLUS a global
+membership/config generation (v9.9.54.18, round-63 Codex
+H6: today's only per-RG generation is expressly a
+`ResetFailover` supersession counter (`manager.go:306`,
+`failover.go:200`) — elections change RG state without
+bumping it (`election.go:337`) and config apply
+adds/mutates/removes RGs without touching it
+(`group_state.go:20, :42`), so a config adding RG N during
+the off-lock repair would be missed or demoted
+unsnapshotted: each RG gains a never-reused incarnation
+(`ResetFailover` supersedes by BUMPING, never resetting)
+and a GLOBAL membership generation bumps on every RG
+add/mutate/remove; the atomic revalidation checks BOTH
+the exact membership set and every member incarnation,
+and a membership change aborts the transaction (error,
+ownership retained))); the alternative
 is to FORCE AND VALIDATE a full repair through
 `JOURNAL_END` BEFORE STOPPING RETRY (v9.9.54.14, round-60
 Codex B3: the demoting node stops bulk retry BEFORE sending
@@ -4528,7 +4620,34 @@ emitted advertisement cannot be unsent) — the transition
 either completes FORWARD through the remaining stages or
 reverses through the SAME terminally validated transfer
 protocol in the opposite direction (a new authorized
-transaction back toward the old owner); the pre-v9.9.54.16
+transaction back toward the old owner); and the ledger is
+VOLATILE BY DESIGN with QUIESCED restart recovery
+(v9.9.54.18, round-63 Codex B3 + round-63 AGY Q2 +
+round-63 SMR F5: a crash BETWEEN the first ownership
+publication and the stage-ledger record is
+indistinguishable from pre-PONR — and the old owner's
+uncommitted transfer lease can expire and restore it
+(`daemon_ha_sync.go:999`, `election.go:67`), while local
+promotion precedes sending the final peer commit
+(`failover.go:296`): the final peer commit is REORDERED
+BEFORE the first VIP/netlink ownership mutation in EVERY
+mode — the commit is the write-ahead PONR marker and the
+PEER is its durable store (no local-disk write on the
+failover critical path); the old owner's lease-expiry
+restore CHECKS the commit record first — a committed
+transfer NEVER auto-restores; a restarted node ALWAYS
+enters the existing startup sync-hold (`preempt=false`),
+never resumes an ownership transaction from volatile
+local state alone, and revalidates (old-owner lease,
+transfer generation) WITH THE PEER before any promotion;
+an incomplete ledger reconstructs as pre-PONR and its
+compensation is CLUSTER-LOCAL ONLY (override removal,
+election reversion — never wire reclaim: the "post-PONR
+never compensates by reclaim" invariant holds in BOTH
+classifications because compensation NEVER emits wire
+traffic); a stale advertisement self-expires
+(masterDownInterval ~97ms) and the network reconverges
+through the surviving node's adverts); the pre-v9.9.54.16
 "CAS-consumed BEFORE EVERY activation side effect" clause
 is RETRACTED (v9.9.54.17, round-62 Codex B2: one claim,
 one CAS — each stage validates the immutable claim's
@@ -4595,7 +4714,31 @@ through the normal safe-stop path — the ISSU completion
 check (`upgrade_drain.go:46, :115`) prints safe-to-stop
 only when the five-class predicate is green, and the
 disruptive mode is a DISTINCT named API whose report says
-degraded, never safe)) — "the operator
+degraded, never safe — and it carries a one-shot
+`DisruptiveTransfer` CLAIM (v9.9.54.18, round-63 Codex H7
++ round-63 SMR F2: ordinary transfer tokens issue only
+when the five predicates are green, an event without a
+token is classified automatic and fenced, and the
+disruptive action exists precisely while those predicates
+are FALSE — a broad bypass is unsafe because current
+events carry neither reason nor token and may be
+dropped/replayed (`manager.go:73, :460`): the claim binds
+(the exact RG set, both incarnations, request ID, transfer
+generation, readiness generation), is consumed once, and
+is validated under the `PromotionPermit` for ONLY that
+transition; and the OPERATOR force path (`ForceRGMaster`
+force=true, priority-0 takeover — today's ungated
+exemption class) carries the same operator-minted claim
+(named, audited), so the exemption is never a bare fence
+bypass and never discarded for want of a transaction); and
+the permanent-loss fence lift is an operator RESET
+(v9.9.54.18, round-63 SMR F3: a full repair through
+`JOURNAL_END` requires the old owner alive — if the old
+owner is permanently gone, no `JOURNAL_END` can complete
+and the degraded latch would never lift: the
+`ManualFailover`-reset analog clears the latch after the
+receiver's table is authoritatively re-seeded from the
+surviving cluster state)) — "the operator
 is never blocked" is superseded by "the operator is never
 SILENTLY blocked")); and the repair is BOUND TO THE NEGOTIATING
 CONNECTION (v9.9.54.7, round-56 Codex B1: the protocol
@@ -4895,8 +5038,15 @@ reads BIT 5 explicitly and NEVER infers decision support
 from `repair-vN`" phrasing specified a bit-flag dependency
 that diverges from the version rule the day a repair-v3
 exists); an intermediate peer carrying `repair-vN` but not
-bit 5 negotiates min-version v1 for the decision class and
-gets the legacy buffered-first-frame path); bits 6-31
+bit 5 negotiates min-version v1 — repair-v1 RUNS unchanged
+and the decision phase never activates (the
+buffered-first-frame path is reserved for RECORD-LESS (v0)
+peers, v9.9.54.18, round-63 Codex B1); every `-vN`
+capability bit follows the SAME version machine (base bit
+= v1, a future extension bit = the next version, min()
+governs) while plain flags follow the intersection — a
+future reset-v2 or repair-v3 never re-opens the r61/r62
+class (v9.9.54.18, round-63 SMR F7a)); bits 6-31
 reserved-zero (ENCODE-only — a conforming decoder IGNORES
 unknown set bits, v9.9.54.17) — so "packed LSB-first" is unambiguous),
 little-endian integers, no padding); never as reconstructed
@@ -5668,8 +5818,10 @@ admitted interval):
   records → negotiated min-version v2 vs v1 for the
   decision class (v9.9.54.17 — the gating predicate is the
   version machine, not a presence test); an intermediate
-  repair-vN peer without bit 5 negotiates v1 and gets the
-  buffered-first-frame path, never a
+  repair-vN peer without bit 5 negotiates v1 — repair-v1
+  runs, the decision phase is absent, and only a
+  RECORD-LESS (v0) peer gets the buffered-first-frame path
+  (v9.9.54.18), never a
   reconnect loop); baseline-frame replay (the buffered
   ClockSync dispatches in order after the legacy latch);
   later readiness-loss hold reacquisition (an overflow,
@@ -5699,7 +5851,8 @@ admitted interval):
   outstanding state — the release predicate's five classes
   must ALL discharge); acquisition racing becomeMaster (the
   ownership commit revalidates the readiness generation
-  under the same lock domain — an acquisition landing after
+  under the PromotionPermit with the revalidation
+  serialized per round-61 SMR F2 (v9.9.54.18) — an acquisition landing after
   the commit fails the recheck); stale transfer-token
   consumption and event loss (the token binds
   (local/peer incarnation, request ID, transfer generation,
@@ -5716,9 +5869,14 @@ admitted interval):
   dialer 6a56876c..., acceptor f46254ed...);
   (d13) v9.9.54.17 boundaries (round-62 Codex L7): the
   cumulative version-selection matrix (v0/v1/v2 cross
-  product — each side advertises its immutable maximum
-  unconditionally, both compute min() after the exchange,
-  and a conforming decoder ignores unknown set capability
+  product — v1/v2 sides advertise their immutable maximum
+  unconditionally while a v0 peer is RECORD-LESS (no
+  advertisement exists to test — its class commits at the
+  first buffered ordinary frame), both compute min()
+  after the exchange, a v1 cell runs repair-v1 with the
+  decision phase absent (never buffered-legacy,
+  v9.9.54.18), and a conforming decoder ignores unknown
+  set capability
   bits without rejecting the record); fence-first
   queued-promotion rejection (a wakeup carrying a revoked
   ticket or stale generation is discarded under the
@@ -5735,13 +5893,46 @@ admitted interval):
   error, nothing marked, ownership retained);
   promotion-permit lock ordering (PromotionPermit is the
   outermost acquisition, never taken under Manager.mu /
-  vipMu / directVIPMu, never held by the readiness
-  advancer, never held while joining an instance run
+  vipMu / directVIPMu, never held by the false→true
+  readiness advancer, taken by every true→false
+  readiness-loss writer (v9.9.54.18), never held while
+  joining an instance run
   loop); and disruptive-mode postconditions (readiness
   stays false, obligations retained, subsequent transfers
   fenced, durable degraded alarm until a current full
   repair completes — and the report never says
   safe-to-stop);
+  (d14) v9.9.54.18 boundaries (round-63 Codex B2/B3/H5/H6/H7
+  + round-63 SMR F1/F5): the ForceSecondary admission
+  freeze (new admissions frozen at snapshot, in-flight
+  commits drained deadline-bounded, the terminal barrier
+  sent only after the drain so it covers the drained set —
+  a post-proof E2 cannot miss the handoff); the
+  never-reused RG incarnation plus global membership
+  generation (a config adding RG N mid-repair aborts the
+  transaction with ownership retained); the reordered
+  peer commit (the final peer commit lands BEFORE the
+  first VIP/netlink ownership mutation in every mode —
+  the old owner's lease-expiry restore checks the commit
+  record and a committed transfer never auto-restores);
+  quiesced restart recovery (a restarted node always
+  enters sync-hold, never resumes from volatile local
+  state, revalidates lease + transfer generation with the
+  peer; an incomplete ledger reconstructs as pre-PONR with
+  cluster-local-only compensation — never wire reclaim);
+  the readiness-loss writer taking the PromotionPermit
+  (G2's not-ready cannot slip into G1's validate→publish
+  window); becomeMaster's revalidation taking NO
+  vrrp.Manager.mu (the UpdateInstances/vi.stop join cannot
+  cycle with a committing run loop; joins happen after
+  the mutex is released); the publication write deadline
+  (a blocked advert write times out as a post-PONR failure
+  and the permit always releases by its own deadline);
+  and the DisruptiveTransfer claim (bound to the exact RG
+  set, both incarnations, request/transfer/readiness
+  generations, consumed once, validated under the permit —
+  the operator force path carries the same operator-minted
+  claim);
   the pending-rejection GC wakeup
   re-opens admission with readiness degraded); same-fabric
   token supersession (C2 installs → T1 revoked before the slot
