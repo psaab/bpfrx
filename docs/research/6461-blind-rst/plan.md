@@ -4740,10 +4740,15 @@ round-62 Codex B3: the force-promote path sets the scalar
 enters `becomeMaster` with no ticket check
 (`instance.go:880, :895`) — a G1-queued promotion would
 cross G2's fence: the wakeup carries `(claim,
-generation)`, and the consumer validates them UNDER the
-`PromotionPermit` before any publish; a stale queued
-promotion — ticket revoked or generation advanced — is
-DISCARDED); supersession is ALWAYS fence-first — the
+generation)` and the instance run loop — which NEVER
+acquires the `PromotionPermit` itself (v9.9.54.17 lock
+order) — only DELIVERS the tuple into `becomeMaster`,
+whose commit path already holds the permit and validates
+`(claim, generation)` under it BEFORE any publish
+(`instance.go:1305` recheck → `:1330` advert/event); a
+stale queued promotion — ticket revoked or generation
+advanced — is DISCARDED at that validation, never
+published); supersession is ALWAYS fence-first — the
 pre-v9.9.54.16 completes-first clause ("a new activation
 supersedes the old ticket only after the executor confirms
 the old ticket's effects either completed or were safely
