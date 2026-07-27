@@ -4097,7 +4097,40 @@ legal to SEND or APPLY only while BIT 6 is ACTIVE
 (matching CONFIRM) on the current authenticated
 incarnation; a durable NOTICE whose BIT 6 is not active
 on the current incarnation REMAINS PENDING (never
-applied, never replay-applied after a downgrade))), with
+applied, never replay-applied after a downgrade) — and
+the pending NOTICE lives in a KEYED DURABLE NOTICE STORE
+OUTSIDE the ordinary FIFO (v9.9.54.28, round-73 Codex H6:
+the ordinary queue carries opaque bytes and `sendLoop`
+retries one dequeued frame on the preferred connection
+(`sync_conn_write.go:268`, always fabric 0
+(`sync_conn.go:27`)) — a pending NOTICE there must block
+later deltas, be lost, or busy-loop: the store is keyed
+by `(target incarnation, retirement generation)`, woken
+on capability ACTIVATION (BIT 6 becoming active on the
+current incarnation), pinned to the exact capable slot
+(the connection whose BIT 6 is active — never blindly
+fabric-0-preferred), and a superseded notice is
+atomically suppressed (a newer retirement of the same
+target replaces it in place); the pending NOTICE's
+activation requires its `(target incarnation,
+retirement generation)` to be CURRENT (v9.9.54.28,
+round-73 SMR F5: a NOTICE whose target has since
+restarted (new incarnation) or been re-retired under a
+newer generation is STALE and discarded — a restarted
+target was never retired, and a newer retirement
+supersedes))); and a successor authority ADOPTS the
+pending store by REISSUE (v9.9.54.28, round-72 Codex
+H5-adjacent + round-73 Codex H7: the hash and clearance
+bind the OLD authority incarnation — after A1→A2,
+replaying A1 is rejected and rewriting it as A2 would
+invalidate the hash/ACK correlation: the successor
+re-issues each adopted pending retirement under its OWN
+incarnation with a FRESH generation and hash (the old
+notice is superseded BY REFERENCE, never rewritten), and
+supersession requires an EQUIVALENT desired scope —
+otherwise the requests MERGE (a queued {RG3} followed
+by {RG4} becomes {RG3,RG4}; nothing is silently
+discarded))), with
 INDIVIDUAL entry predicates (v9.9.54.22, round-67 Codex B1
 — the v9.9.54.21 text bundled every frame 32-39 under the
 v2 gate, which bars a repair-v1 pair from its own terminal
@@ -4536,9 +4569,35 @@ decision frames are sent or expected — the phase's
 terminal completion simply does not exist at v1);
 **v2** = cumulative bits 2+5 — min() ≥ 2 adds the decision
 phase with its own terminal completion; each class
-LATCHES at its commit point (v0 at the first ordinary
-frame or the all-zero record, v1 at the COMPLETE
-authenticated CONFIRM, v2 TENTATIVE at the exchange and
+LATCHES at its commit point — the FULL
+proof-version × repair-version commit matrix
+(v9.9.54.28, round-73 Codex H5: two transcript-v2 peers
+can negotiate repair-v1 (A supports repair-v2, B only
+v1 — min() = v1), but the v2-proof branch sends NO
+post-wrapper `CAPABILITY_CONFIRM`, while repair-v1 was
+declared committed only by a complete authenticated
+CONFIRM — no frame could commit the selected class, a
+reconnect loop by construction: **(v1-proof, any
+class)** — the records ride the wrapper and the class
+commits at the COMPLETE authenticated
+`CAPABILITY_CONFIRM` (v2 additionally requires the
+ACK'd decision installation); **(v2-proof, v0 or v1)**
+— the capability records are IN the v2 transcript, so
+they are authenticated BY CONSTRUCTION at
+proof-verification (`AUTH_PROOF_v2` covers
+`dialer_cap`/`acceptor_cap`): the class commits AT the
+proof-verified transcript (min() over the two
+authenticated records — no further frame exists or is
+needed); **(v2-proof, v2)** — the proof authenticates
+the records AND the decision phase runs its
+owner-echoed `CAPABILITY_DECISION` + ACK, committing at
+the ACK'd installation; every generic "CONFIRM
+sequence" elsewhere refers to this matrix): v0 at the
+first ordinary frame or the all-zero record (v1-proof)
+or the proof-verified transcript (v2-proof), v1 at the
+COMPLETE authenticated CONFIRM (v1-proof) or the
+proof-verified transcript (v2-proof), v2 TENTATIVE at
+the exchange and
 COMMITTED ONLY at the ACK'd decision installation —
 v9.9.54.24, round-69 Codex L6, superseding "v1/v2 at the
 capability exchange") for the
@@ -5047,8 +5106,26 @@ reservation / hold-cell) is ADMISSION-VISIBLE from mint
 (`allocator.rs:1664, :1682`), where a second same-tuple
 admission finds it and receives a TYPED
 no-change/RETAIN receipt with a co-holder count (never
-silent sharing); a rollback DECREMENTS the co-holder
-count and frees the port ONLY at zero; and ONLY
+silent sharing) — and every holder's lifecycle is
+DURABLY TOMBSTONED (v9.9.54.28, round-73 Codex H4 +
+round-73 SMR F4: replaying every durable `INSTALLED`
+receipt at restart can resurrect a RELEASED holder —
+persistent co-holders F1/F2 share a lease; closing F1
+decrements `active_flows` 2→1 (`allocator.rs:1318`); a
+restart that replays stale F1 plus live F2 reconstructs
+two holders, and closing F2 then leaves a phantom count
+of one — expiry never starts and GC refuses the lease
+(`allocator.rs:1354, :2302`): each holder carries a
+durable receipt keyed by `(ticket, SessionIdentity,
+allocation generation)`; a holder's release writes a
+durable TOMBSTONE for its receipt BEFORE (atomically
+with) the decrement; and rehydration reconstructs the
+holder set ONLY from the latest NON-TOMBSTONED receipts
+— a tombstoned holder never resurrects); a rollback DECREMENTS the co-holder
+count and frees the port ONLY at zero (the count itself
+is DERIVED — the number of live non-tombstoned receipts
+referencing the tuple, v9.9.54.28 round-73 SMR F4 — no
+independent counter exists to phantom); and ONLY
 packet-matchable state (session rows, aliases, fragment
 associations, flow-cache state) rides the staging
 namespace — packets never match staged state, admission
@@ -5064,17 +5141,39 @@ packet can observe one canonical alias while the
 remaining cohort domains are still hidden: the Rust
 shared-map domain publishes shadow → canonical in one
 batch under the map's own lock; the BPF domains use
-GENERATION-STAMPED values plus ONE global
-published-generation cell per domain (a single-cell
-map — every value carries `(generation, payload)`, the
-cohort's aliases are written with generation G+1, the
-XDP/Rust read rule is the mechanical
-`value.generation ≤ published` test from the value's own
-layout (ONE universal rule, never a per-family
-discipline), and the cohort's commit is the single
-atomic cell write advancing the cell to G+1; the
-fragment-association shards and the flow-cache state
-stamp with the same generation and cell)) — no lookup of any family
+PER-COHORT commit bits carried IN THE VALUE (v9.9.54.28,
+round-73 Codex B1 + round-73 AGY T73-1 — the
+v9.9.54.27 domain-WIDE generation cell can expose an
+INCOMPLETE cohort: W0 partially stages E1 at generation
+G and pauses, W1 completes E2 at G+1 and advances the
+cell, and W0's partial G state reads visible
+(`value.generation ≤ published`) — W0 then unwinds E1
+and frees its tuple while E1's aliases may still be in
+use: every value carries `(commit_bit, payload)`; the
+cohort's aliases are written with `commit_bit = 0`
+(hidden); the publication writes the cohort's data FIRST
+and flips THAT COHORT'S bit LAST (values-then-bit —
+the publisher's ordering is explicit (an `smp_wmb`-class
+barrier between the data writes and the bit write; the
+reader's guard is the bit itself, so a torn read on a
+weakly-ordered CPU fails CLOSED — a value whose bit is
+unset is hidden, never partially visible); the read rule
+is the mechanical `value.commit_bit == 1` test from the
+value's own layout (ONE universal rule, never a
+per-family discipline, and NO cross-cohort exposure is
+possible — the bit exposes only the cohort it belongs
+to); the single-value `userspace_sessions` map stages
+replacements in DUAL slots (two physical slots per key,
+bit-tagged — the incumbent stays visible in its slot
+until the replacement's bit flips (`lib.rs:369, :825`'s
+overwrite would destroy the incumbent)); and the schema
+change is PINNED (the loader's preflight rejects
+`ValueSize` changes (`loader_userspace_shim.go:342`) —
+the map replacement carries a loader-version pin with a
+backfill contract: old-layout values read as
+commit_bit=0 (hidden) until backfilled, never falsely
+visible)); the fragment-association shards and the
+flow-cache state carry the same per-cohort bit) — no lookup of any family
 can see hidden state by construction; the publication is
 INCUMBENT-PRESERVING MVCC (today's single-value
 primary/NAT/wire maps would let a hidden candidate
@@ -5586,8 +5685,12 @@ record rides the AUTHENTICATED SESSION-SYNC connection —
 new frame **41** `RETIREMENT_NOTICE` (payload
 `(authority_node_id u32, authority_incarnation u64,
 target_node_id u32, target_incarnation u64,
-retirement_generation u64, scope_count u8, rg_id u8 ×
-scope_count)`, scope_count=0 = ALL — no byte cap); the
+retirement_generation u64, membership_epoch u64,
+scope_count u8, rg_id u8 × scope_count)` — v9.9.54.28,
+round-73 Codex B2: ONE grammar everywhere (this section
+lagged §5.8's): ALL is authority-expanded BEFORE
+ENCODING (scope_count is always the exact count; 0 =
+empty scope, rejected at the API) — no byte cap); the
 heartbeat extension carries the COMPACT SUMMARY
 `(authority_incarnation u64, target_incarnation u64,
 retirement_generation u64, scope_kind u8 (0=ALL,
@@ -5621,12 +5724,30 @@ A is alive: the fence NEVER drops on silence alone; it
 lifts ONLY on (a) the matching detail + clearance ACK,
 (b) CONFIRMED EXTERNAL FENCING of the retired peer,
 (c) an authenticated COMPLETE FENCE SNAPSHOT from a
-successor authority (an authority restart with a new
-incarnation publishes its fence snapshot — the successor
-continues or releases each fence explicitly; a fence the
-successor's snapshot continues stays; a fence absent
-from it is released by the SUCCESSOR'S AUTHORITY, never
-by silence), or (d) an explicit OPERATOR-CONFIRMED
+successor authority — with the snapshot's trust anchor
+stated (v9.9.54.28, round-73 Codex B3 + round-73 AGY
+T73-2 + round-73 SMR F1: an authority restart is
+process-memory initialization (`manager.go:372`) — a
+FRESH successor can authenticate an EMPTY snapshot
+without inheriting the predecessor's retirement ledger,
+and "absence from the snapshot = release" would lift
+every fence the operator drove (the permanent-loss case
+is exactly the case that produces fresh successors):
+the retirement ledger is CLUSTER-CONFIG-CARRIED state
+(config-sync reconstructs it on a successor — the same
+channel that carries `${node}`-qualified config); the
+successor's snapshot is its RECONSTRUCTED ledger (own
+journal + config sync); the snapshot CONTINUES or
+explicitly TOMBSTONES each fence (a clearance tombstone
+is a durable record — absence is NEVER a release); an
+unknown or empty snapshot PRESERVES every receiver-held
+fence; and a successor whose config-sync has not
+completed holds the revalidation gate (the retired
+peer's quiesced revalidation requires the successor's
+confirmation before election-eligibility — an un-synced
+successor can neither keep the peer out by omission nor
+clear it by default — the gate holds until the sync
+completes and the operator re-confirms or clears)), or (d) an explicit OPERATOR-CONFIRMED
 override (named, audited, alarming — the same class as
 the `CommitUncertain` peer-absent clear); the deadlock
 round-71 AGY T2 feared is escaped by (c) and (d)
@@ -5659,7 +5780,24 @@ transmits the exact ids verbatim (no receiver-side
 expansion); the NOTICE carries the authority's
 membership epoch, and B PARKS any config application
 that would expand its retired incarnation's RG set
-beyond the transmitted set until the fence clears)); the compact ACK
+beyond the transmitted set until the fence clears — and
+the ALREADY-AHEAD case is whole-incarnation (v9.9.54.28,
+round-73 Codex B2: parking covers only FUTURE expansion
+— a receiver whose CURRENT membership already exceeds
+the transmitted set (A knows {RG1,RG2}, B already has
+{RG1,RG2,RG3}) would resolve the global fence into
+elements for RG1/RG2 and leave RG3 eligible
+(`heartbeat_manager.go:306`, `election.go:172`): while
+the receiver's membership EXCEEDS the
+authority-described set, the WHOLE INCARNATION stays
+fenced — the exact-element resolution applies only once
+the receiver's set is within the transmitted set
+(configuration convergence) or a refreshed NOTICE
+covers the excess); and the operator's confirmation
+displays and binds the EXACT transmitted set (an
+operator who means "everything" confirms the
+authority's full current set — no silent ALL-by-proxy,
+round-73 SMR F2)); the compact ACK
 `FENCE_CLEARANCE_ACK` (40) carries the same 33-byte
 summary form (v9.9.54.25 — superseding the fixed
 36-byte/36+count layouts, which disagreed with each
@@ -5686,9 +5824,17 @@ authority with a DURABLE FIFO + SUPERSESSION contract
 queued retirement stays PRE-COMMIT — its ownership PONR
 is prohibited until its summary is ACTIVE (no demotion
 rides an unsummarized retirement); a NEWER retirement of
-the same target SUPERSEDES a queued older one (the
-generation's uniqueness orders them — the operator's
-latest intent wins); a clearance of an active summary
+the same target supersedes a queued older one ONLY for
+an EQUIVALENT desired scope — otherwise the requests
+MERGE (v9.9.54.28, round-73 Codex H7: "newer supersedes
+regardless of scope" lets a queued {RG3} followed by
+{RG4} silently discard RG3: same-scope newer replaces
+older (the generation's uniqueness orders them — the
+operator's latest intent wins); different-scope requests
+MERGE (a queued {RG3} followed by {RG4} becomes
+{RG3,RG4}; nothing is silently discarded); an explicit
+CANCEL of a queued retirement is operator-confirmed,
+named, and audited); a clearance of an active summary
 activates the queue head; and the queue persists across
 authority restart with the same write-ahead discipline
 as the NOTICE — an authority restart never silently
@@ -5761,8 +5907,12 @@ Codex H3: ONE frame-40 grammar everywhere — the
 v9.9.54.23 counted-payload form is superseded; the
 AUTHORITATIVE counted record rides frame 41
 `RETIREMENT_NOTICE` on the sync channel)); its processing
-is gated on the peer's advertised extension capability
-(rolling-gated like every other additive tail); and fence
+is gated on the peer's ACTIVE negotiated extension
+capability (v9.9.54.28, round-73 Codex H5 — "advertised"
+was the pre-activation phrasing: BIT 6 must be ACTIVE
+(matching authenticated CONFIRM) on the current
+incarnation for frames 40/41 to be sent or applied, per
+the §5.8 predicate and the global v1-proof rule); and fence
 clearance is ACKed — the returner's reseed completion is
 acknowledged before its RG state and priorities are
 election-eligible again; for a peer LACKING the extension
@@ -7255,7 +7405,10 @@ admitted interval):
   capability record (4+8+8+8+4; the frame-32 payload IS
   the transcript record byte-for-byte — the golden
   vectors cover the wire encoding); the counted RG-scope
-  grammar ((count u8, rg_id u8 × count), count=0 = ALL;
+  grammar ((membership_epoch u64, count u8, rg_id u8 ×
+  count) — ALL is authority-expanded BEFORE ENCODING
+  (v9.9.54.28 — the "count=0 = ALL" phrasing was the
+  retracted wire sentinel);
   per-RG eligibility — an RG is eligible only when no
   pending fence covers it; incarnations are
   equality/membership identifiers, ONLY
@@ -7317,8 +7470,12 @@ admitted interval):
   redone at restart); the split-carriage causal rules
   (summary-first → the target incarnation is GLOBALLY
   election-ineligible until matching detail; the fence
-  is liveness-bound — it drops on authority loss or a
-  new authority incarnation; RETIREMENT_NOTICE is
+  is DURABLE-LOCAL (v9.9.54.28 — the "liveness-bound"
+  phrasing was reversed at v9.9.54.27: NEVER
+  silence-dropped; lifts ONLY on detail+clearance,
+  confirmed external fencing, a successor authority's
+  authenticated fence snapshot, or an operator-confirmed
+  override); RETIREMENT_NOTICE is
   journaled durable-until-ACK; ALL is authority-expanded
   to the exact transmitted set with the membership epoch
   parked for over-set configs); ONE frame-40 grammar
@@ -7368,6 +7525,45 @@ admitted interval):
   canonical-branch references replace the generic
   sequences (4263's "v2 proof, CONFIRM", the 6030-area
   describe-then-retract second proof);
+  (d24) v9.9.54.28 boundaries (round-73 Codex B1/B2/B3/H4/H5/H6/H7
+  + round-73 AGY T73-1/T73-2 + round-73 SMR F1-F5):
+  per-cohort commit bits in the value (every value carries
+  (commit_bit, payload); data writes FIRST, the cohort's
+  bit flips LAST with an smp_wmb-class barrier; the read
+  rule value.commit_bit == 1 from the value's own layout
+  — no domain-wide generation, no cross-cohort exposure;
+  the single-value userspace_sessions map stages
+  replacements in DUAL slots; the schema change is
+  loader-version pinned with a backfill contract); the
+  excess-membership whole-incarnation fence (a receiver
+  whose current membership EXCEEDS the transmitted set
+  stays wholly fenced until convergence or a refreshed
+  NOTICE covers the excess; the exact-element resolution
+  applies only within the transmitted set); the
+  config-carried fence ledger (config-sync reconstructs
+  it on a successor; a snapshot releases ONLY via
+  explicit durable clearance tombstones — absence is
+  never a release; an unknown or empty snapshot
+  PRESERVES receiver-held fences; an un-synced successor
+  holds the revalidation gate); the durable holder
+  tombstones (each holder's release tombstones its
+  receipt BEFORE the decrement; rehydration counts only
+  the latest non-tombstoned receipts; the co-holder
+  count is derived, never an independent counter); the
+  proof-version × repair-version commit matrix ((v1-proof,
+  any class) → CONFIRM commits (+ decision echo for v2);
+  (v2-proof, v0/v1) → commits AT the proof-verified
+  transcript (records authenticated by construction);
+  (v2-proof, v2) → proof + DECISION+ACK); the keyed
+  durable notice store (outside the ordinary FIFO; woken
+  on capability activation; pinned to the exact capable
+  slot; superseded notices atomically suppressed; a
+  stale NOTICE (target restarted or re-retired newer) is
+  discarded); and the successor adoption/merge rules
+  (re-issue pending retirements under the successor's
+  own incarnation with a fresh generation/hash;
+  supersession only for equivalent scope — otherwise
+  MERGE; an explicit cancel is operator-confirmed);
   the pending-rejection GC wakeup
   re-opens admission with readiness degraded); same-fabric
   token supersession (C2 installs → T1 revoked before the slot
