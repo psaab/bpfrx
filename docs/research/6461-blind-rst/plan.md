@@ -4077,8 +4077,27 @@ retirement_generation u64, scope_kind u8, scope_hash u64)`
 `RETIREMENT_NOTICE` = `(authority_node_id u32,
 authority_incarnation u64, target_node_id u32,
 target_incarnation u64, retirement_generation u64,
-scope_count u8, rg_id u8 × scope_count)` (scope_count=0 =
-ALL — v9.9.54.25)), with
+membership_epoch u64, scope_count u8, rg_id u8 ×
+scope_count)` (v9.9.54.27, round-72 Codex B1: ALL is
+AUTHORITY-EXPANDED BEFORE ENCODING — the wire NEVER
+carries an ALL sentinel; `scope_count` is always the
+exact count (0 is now an EMPTY scope and is rejected at
+the API); the `membership_epoch` is the authority's
+config membership generation, and the receiver PARKS any
+config application that would expand the retired
+incarnation's RG set beyond the transmitted list until
+the fence clears); and frames 40 AND 41 have
+active-capability entry predicates (v9.9.54.27,
+round-72 Codex H5: the predicates enumerated only
+frames 32-39, and retirement processing was gated on an
+ADVERTISED bit — contradicting the global v1-proof rule
+that no capability activates before the matching
+authenticated same-connection CONFIRM: frames 40/41 are
+legal to SEND or APPLY only while BIT 6 is ACTIVE
+(matching CONFIRM) on the current authenticated
+incarnation; a durable NOTICE whose BIT 6 is not active
+on the current incarnation REMAINS PENDING (never
+applied, never replay-applied after a downgrade))), with
 INDIVIDUAL entry predicates (v9.9.54.22, round-67 Codex B1
 — the v9.9.54.21 text bundled every frame 32-39 under the
 v2 gate, which bars a repair-v1 pair from its own terminal
@@ -4241,8 +4260,14 @@ in-connection escape (v9.9.54.3, round-55 SMR F1: a peer
 that upgrades to v2 mid-connection still finishes this
 connection in the legacy class, and the upgrade takes
 effect on the NEXT connection — a new incarnation
-re-runs the full negotiation: hello, v2 proof, CONFIRM,
-repair-era — so the latch can never strand a capable peer
+re-runs the full negotiation per its proof version
+(v9.9.54.27, round-72 Codex M7: the v2-PROOF branch is
+hello pair (caps in transcript) → `AUTH_PROOF_v2` →
+wrapper → `CAPABILITY_DECISION`+ACK (NO post-wrapper
+CONFIRM — "v2 proof, CONFIRM" was the unscoped phrasing);
+the v1-PROOF branch is hello → immediate
+`AUTH_PROOF(nonce)` → wrapper → `CAPABILITY_CONFIRM` →
+decision-if-v2 — so the latch can never strand a capable peer
 and never permits a mid-connection protocol flip); and the
 class DECISION is a SHARED COMMIT, never two independent
 local latches (v9.9.54.4, round-55 Codex B1 — independent
@@ -5005,9 +5030,51 @@ E2; and a discipline of "every lookup masks" is exactly
 the class of rule that keeps failing family-by-family:
 every domain's state (BPF maps, shared aliases, fragment
 associations, flow caches) stages in a STAGING key
-namespace no canonical lookup can match, and the commit
-is ONE atomic key-space publication (staging → canonical
-in a single batch per domain) — no lookup of any family
+namespace no canonical lookup can match — with TWO
+visibility classes named explicitly (v9.9.54.27,
+round-72 Codex H4 + round-72 AGY T1 + round-72 SMR F1:
+staging ALL state packet-invisibly makes a second
+same-tuple admission find nothing at the canonical
+lookup (`shared_ops.rs:594`) and allocate a SECOND
+translated tuple for the same flow (`allocator.rs:1617`)
+— and today's allocator RETURNS an existing same-flow
+tuple WITHOUT adding ownership (`allocator.rs:1035`),
+while a candidate's rollback removes that record and
+frees its port (`poll_descriptor/mod.rs:2472`,
+`allocator.rs:1398`): the tuple-level INTENT (the NAT
+reservation / hold-cell) is ADMISSION-VISIBLE from mint
+— it lives in the allocator's occupied-tuple registry
+(`allocator.rs:1664, :1682`), where a second same-tuple
+admission finds it and receives a TYPED
+no-change/RETAIN receipt with a co-holder count (never
+silent sharing); a rollback DECREMENTS the co-holder
+count and frees the port ONLY at zero; and ONLY
+packet-matchable state (session rows, aliases, fragment
+associations, flow-cache state) rides the staging
+namespace — packets never match staged state, admission
+dedup always sees the reservation), and the commit
+is ONE atomic LINEARIZATION per domain, with the
+primitive NAMED per domain (v9.9.54.27, round-72 Codex
+H3: "single batch" key-copying is not an atomic
+visibility switch — today each canonical alias is
+independently inserted (`bpf_map/mod.rs:48, :76`) and
+XDP directly reads a single canonical map with no
+generation/root indirection (`lib.rs:369, :825`), so a
+packet can observe one canonical alias while the
+remaining cohort domains are still hidden: the Rust
+shared-map domain publishes shadow → canonical in one
+batch under the map's own lock; the BPF domains use
+GENERATION-STAMPED values plus ONE global
+published-generation cell per domain (a single-cell
+map — every value carries `(generation, payload)`, the
+cohort's aliases are written with generation G+1, the
+XDP/Rust read rule is the mechanical
+`value.generation ≤ published` test from the value's own
+layout (ONE universal rule, never a per-family
+discipline), and the cohort's commit is the single
+atomic cell write advancing the cell to G+1; the
+fragment-association shards and the flow-cache state
+stamp with the same generation and cell)) — no lookup of any family
 can see hidden state by construction; the publication is
 INCUMBENT-PRESERVING MVCC (today's single-value
 primary/NAT/wire maps would let a hidden candidate
@@ -5032,9 +5099,19 @@ receipt is MANDATORILY redone at restart (the plan
 recorded `INSTALLED` before visibility flips but defined
 restart recovery only for `STAGED` — a crash in that
 interval leaves the peer emission-eligible while the
-local row is invisible: the recovery redoes the
-visibility flip for every durable `INSTALLED` receipt,
-re-exposing exactly the committed cohorts, so local
+local row is invisible): the recovery REHYDRATES from
+every durable `INSTALLED` receipt (v9.9.54.27,
+round-72 Codex H4 + round-72 AGY T4: the shared maps,
+fragment shards, and allocator ownership are
+process-memory objects recreated EMPTY at startup
+(`manager.go:372`) — "redo the visibility flip" would
+flip nonexistent state: the recovery EXACT-RESERVES the
+receipt's allocation (or detects its occupation by the
+peer's import and takes the typed RETAIN receipt),
+REBUILDS every shadow domain from the receipt's
+contents, and publishes CONDITIONALLY on those contents
+— the same linearization primitive as the live path,
+never a blind flip); so local
 visibility and peer state re-converge));
 and `INSTALLED` requires every publish
 point's HIDDEN write confirmed — a partial hidden write
@@ -5528,16 +5605,32 @@ heartbeat handling rebuilds peer state and invokes
 election immediately (`heartbeat_manager.go:306, :355`),
 so a summary-first receiver must fence the WHOLE
 incarnation, not guess the scope; and the fence — both
-incomplete and complete — is LIVENESS-BOUND: it holds
-ONLY while the authority's heartbeat continues to assert
-it (each summary re-asserts), and it drops on authority
-loss (the authority is the SURVIVOR by construction; if
-the survivor dies, the retired peer is the only node
-left and MUST serve — fencing past the authority's death
-would defeat HA; the incomplete fence also drops when a
-DIFFERENT authority incarnation appears — a restarted
-survivor's fresh fence state supersedes)); the
-`RETIREMENT_NOTICE` (41) itself is DURABLE until ACKed
+incomplete and complete — is DURABLE-LOCAL, never
+silence-dropped (v9.9.54.27, round-72 Codex B2 + round-72
+AGY T2, reconciling round-71 AGY T2's deadlock with
+round-72's partition safety: the v9.9.54.26
+"liveness-bound" rule auto-dropped the fence on
+heartbeat loss — but authority loss and fabric loss are
+the same signal at the receiver (the liveness threshold
+expires after five intervals (`heartbeat.go:52, :874`),
+timeout clears peer state and runs single-node election
+before external fencing (`heartbeat_manager.go:404,
+:425`)), so a control-link partition would let retired B
+drop its fence and resume ownership on stale state while
+A is alive: the fence NEVER drops on silence alone; it
+lifts ONLY on (a) the matching detail + clearance ACK,
+(b) CONFIRMED EXTERNAL FENCING of the retired peer,
+(c) an authenticated COMPLETE FENCE SNAPSHOT from a
+successor authority (an authority restart with a new
+incarnation publishes its fence snapshot — the successor
+continues or releases each fence explicitly; a fence the
+successor's snapshot continues stays; a fence absent
+from it is released by the SUCCESSOR'S AUTHORITY, never
+by silence), or (d) an explicit OPERATOR-CONFIRMED
+override (named, audited, alarming — the same class as
+the `CommitUncertain` peer-absent clear); the deadlock
+round-71 AGY T2 feared is escaped by (c) and (d)
+existing, not by silence); the two
 (v9.9.54.26, round-71 Codex B2: the existing queue
 rejects while disconnected/full (`sync_conn_write.go:36`)
 and retries only an already-dequeued frame
@@ -5578,15 +5671,28 @@ with the hash defined EXACTLY (v9.9.54.26, round-71
 Codex H3: `scope_hash` was algorithm-free: for
 scope_kind=ALL the hash is the constant
 `BLAKE2s-64("xpf-retire-scope/ALL" ||
-authority_incarnation)`; for EXPLICIT it is
-`BLAKE2s-64("xpf-retire-scope" || count ||
-rg_id[0] || … || rg_id[count-1])` over the CANONICAL
+authority_incarnation || membership_epoch ||
+expanded_sorted_list)`; for EXPLICIT it is
+`BLAKE2s-64("xpf-retire-scope" || membership_epoch ||
+count || rg_id[0] || … || rg_id[count-1])` over the CANONICAL
 ascending-sorted RG-id list — the same bytes the
 `RETIREMENT_NOTICE` carries, so the summary and the
-detail always agree; and the heartbeat carries AT MOST
+detail always agree; the output is exactly 8 bytes (64
+bits, v9.9.54.27, round-72 Codex M6); and the heartbeat carries AT MOST
 TWO pending summaries per target (2×33 = 66 bytes ≤ the
 132-byte budget — further retirements QUEUE at the
-authority; two summaries for the same authority and
+authority with a DURABLE FIFO + SUPERSESSION contract
+(v9.9.54.27, round-72 Codex M6 + round-72 AGY T3: a
+queued retirement stays PRE-COMMIT — its ownership PONR
+is prohibited until its summary is ACTIVE (no demotion
+rides an unsummarized retirement); a NEWER retirement of
+the same target SUPERSEDES a queued older one (the
+generation's uniqueness orders them — the operator's
+latest intent wins); a clearance of an active summary
+activates the queue head; and the queue persists across
+authority restart with the same write-ahead discipline
+as the NOTICE — an authority restart never silently
+drops a confirmed retirement); two summaries for the same authority and
 generation are impossible by the generation's
 uniqueness)); the extension carries
 (sender session-sync incarnation, retired-incarnation
@@ -5604,20 +5710,31 @@ Codex B3: a u32 bitmap cannot cover the supported RG IDs
 0-255 and up to 255 configured groups (`heartbeat.go:157`,
 `compiler_validate_strict_chassis.go:69`), and a scalar
 cannot represent an exact multi-RG scope: the scope is
-`(count u8, rg_id u8 × count)` with the canonical
-full-set sentinel `count=0` meaning ALL RGs (the
-`ForceSecondary` case) — stored PER-RG (v9.9.54.25,
+`(count u8, rg_id u8 × count)` — with ALL
+authority-expanded BEFORE ENCODING (v9.9.54.27,
+round-72 Codex B1 — the wire NEVER carries an ALL
+sentinel; the v9.9.54.25 receiver-side expansion rule
+("an ALL mark expands to the then-current RG set; a
+config adding an RG after the mark does NOT fence the
+new RG") is RETRACTED: it let a config-skewed peer
+(A holding {RG1,RG2}, B holding {RG1}) apply RG2 later
+and run its retired incarnation in RG2's election
+(`heartbeat_manager.go:306`, `election.go:172`) — the
+AUTHORITY expands ALL against ITS OWN current RG set
+and transmits the exact ids plus its membership epoch;
+the receiver applies the transmitted list VERBATIM and
+PARKS any config that would expand the retired
+incarnation's RG set beyond it until the fence clears)
+— stored PER-RG (v9.9.54.25,
 round-70 AGY Q2 + round-70 SMR F3: the pending fence is
 stored per-(namespace, rg)-ELEMENT — a mark EXPANDS its
-scope into elements at application time (an ALL mark
-expands to the then-current RG set; a config adding an RG
-after the mark does NOT fence the new RG — it was never
-retired); a clearance CASes per-element (an exact-scope
+scope into elements at application time; a clearance CASes per-element (an exact-scope
 clearance against an unexpanded sentinel is REJECTED —
 there is no sentinel left to match — never a partial
-clear); and `count=0` is the ALL sentinel, NEVER an
-empty scope (an empty scope is unencodable — a
-retirement of nothing is rejected at the API)); the eligibility rule is per-RG —
+clear); and `count=0` is an EMPTY scope and is
+rejected at the API (v9.9.54.27 — the ALL sentinel no
+longer exists on the wire; a retirement of nothing is
+meaningless)); the eligibility rule is per-RG —
 an RG is election-eligible ONLY WHEN NO PENDING FENCE
 COVERS IT (overlapping fences `R1:{1,2}`, `R2:{2}`
 compose: clearing R1 lifts rg1 but rg2 stays fenced by
@@ -5910,21 +6027,19 @@ round-51 SMR F3: it never persists across connections — a
 reconnect re-runs the full negotiation (hello, proof,
 wrapper, CONFIRM) before any feature enables, so there is
 no cross-connection feature memory to race a downgrade);
-"post-authenticated" meaning concretely (v9.9.46, round-50
-SMR F2): on a v1-proof connection the capability fields are
-exchanged but NOT transcript-covered; a peer wanting them
-authenticated performs the v2 transcript proof as a SECOND
-proof exchange once the connection's authenticated wrapper
-is installed (the wrapper exists by then, so the v2 proof
-can ride it), and until then the fields are advisory-only —
-a v1 peer treats them as hints and keeps v1 behavior for
-anything security-relevant — where the "second proof" IS
-the authenticated `CAPABILITY_CONFIRM`/`CAPABILITY_DECISION`
-exchange itself (v9.9.54.10, round-58 Codex H5: the earlier
-"second v2 transcript proof" reading would define a
-SECOND, incompatible v1-proof activation protocol —
-implementations following opposite clauses would latch
-different protocol classes: there is exactly ONE
+"post-authenticated" meaning concretely (v9.9.54.27,
+round-72 Codex M7 — this paragraph previously described a
+v2 transcript proof as a "second proof exchange" before
+retracting it two sentences later (v9.9.46 SMR F2 vs
+v9.9.54.10 round-58 Codex H5: a "second v2 transcript
+proof" would define a SECOND, incompatible v1-proof
+activation protocol): the v1-PROOF canonical branch is
+the whole rule — on a v1-proof connection the capability
+fields ride the wrapper and are ADVISORY-ONLY until the
+authenticated `CAPABILITY_CONFIRM` (the branch's ONE
+post-wrapper authentication step) activates them, and a
+v1 peer treats them as hints and keeps v1 behavior for
+anything security-relevant — there is exactly ONE
 post-wrapper authentication step, the CONFIRM/decision
 exchange, and no separate transcript re-proof); the
 v2 byte vectors are literal: the domain tag string, the
@@ -7217,6 +7332,42 @@ admitted interval):
   (the completed-repair receipt persists write-ahead;
   a wiped receipt re-ACKs iff the table proves the
   content, else the repair re-runs);
+  (d23) v9.9.54.27 boundaries (round-72 Codex B1/B2/H3/H4/H5/M6/M7
+  + round-72 AGY T1-T4 + round-72 SMR F1-F3): the two
+  visibility classes (the tuple-level INTENT is
+  ADMISSION-VISIBLE from mint in the allocator's
+  occupied-tuple registry — a second same-tuple admission
+  gets a typed no-change/RETAIN receipt with a co-holder
+  count, and a rollback decrements and frees only at
+  zero; ONLY packet-matchable state rides the staging
+  namespace); the per-domain linearization primitives
+  (Rust shared map: shadow → canonical batch under the
+  map lock; BPF domains: generation-stamped values + ONE
+  global published-generation cell, read rule
+  value.generation ≤ published from the value layout;
+  fragment shards and flow-cache state stamp with the
+  same cell); the fence is DURABLE-LOCAL (never
+  silence-dropped — lifts ONLY on detail+clearance,
+  confirmed external fencing, a successor authority's
+  authenticated fence snapshot, or an operator-confirmed
+  override); frame 41 carries the exact list plus
+  membership_epoch (ALL is authority-expanded BEFORE
+  ENCODING — no wire sentinel; count=0 = empty scope,
+  rejected; the receiver-expansion rule retracted);
+  frames 40/41 require ACTIVE BIT 6 (matching CONFIRM) on
+  the current incarnation at send AND apply time — a
+  durable NOTICE with inactive BIT 6 stays pending; the
+  retirement queue is durable FIFO + newer-supersedes,
+  with every queued retirement PRE-COMMIT (no ownership
+  PONR until its summary is active); scope_hash binds
+  membership_epoch and the expanded list (BLAKE2s-64 =
+  8 bytes exactly); the restart redo is REHYDRATION
+  (exact-reserve or typed RETAIN, rebuild every shadow
+  domain, publish conditionally on the receipt's
+  contents — never a blind flip); and the
+  canonical-branch references replace the generic
+  sequences (4263's "v2 proof, CONFIRM", the 6030-area
+  describe-then-retract second proof);
   the pending-rejection GC wakeup
   re-opens admission with readiness degraded); same-fabric
   token supersession (C2 installs → T1 revoked before the slot
