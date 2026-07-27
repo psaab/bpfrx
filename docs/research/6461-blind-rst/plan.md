@@ -4002,9 +4002,20 @@ v9.9.54.21, round-66 Codex H7; payload
 = the full capability tuple laid out per the §5.8 record
 grammar — `(node_id, process_incarnation, capacity,
 capacity_config_generation, capability bits)` as
-u32/u64/u64/u64/u32 little-endian (28 bytes), the same
+u32/u64/u64/u64/u32 little-endian (32 bytes —
+4+8+8+8+4, v9.9.54.24, round-69 Codex B2: the v9.9.54.21
+"28 bytes" was an arithmetic error; both literal
+capability vectors ARE 32 bytes and their published
+HMAC-SHA256 digests recompute exactly, and
+`readSyncFrameRaw` reads exactly the declared payload
+length (`sync_auth.go:289`) so a 28/32 disagreement would
+reconnect-loop conforming peers), the same
 byte layout the
-transcript vectors already pin) IS the capability record on
+transcript vectors already pin — and the frame-32 payload
+IS the transcript capability record byte-for-byte
+(v9.9.54.24, round-69 SMR F6: the golden vectors already
+cover the wire encoding of the frame; no second encoding
+can drift from the hashed one)) IS the capability record on
 a v1-proof connection (the HELLO carries only version,
 keyed flag, nonce — `sync_auth.go:345`); the decision
 phase's own frames are `CAPABILITY_DECISION` (**33** —
@@ -4022,17 +4033,30 @@ every payload BYTE-EXACT (v9.9.54.23, round-68 Codex M6:
 the definitions named tuples without widths, endianness,
 or direction encoding, and independent implementations
 could disagree while conforming: all integers are
-little-endian, no padding — 35 `RESYNC_REQUEST` =
-`(repair_id u64, sender_incarnation u64,
-request_seqno u64)` (24 bytes); 36 `JOURNAL_END` =
-`(repair_id u64, journal_epoch u64, terminal_seqno u64)`
-(24 bytes); 37 `JOURNAL_ACK` = the SAME immutable triple
-(24 bytes); 38 `RESET_GEN` = `(direction u8,
+little-endian, no padding — with ONE CANONICAL
+repair-ID type carried byte-for-byte end-to-end
+(v9.9.54.24, round-69 Codex M5: `repair_id` was defined
+as `(sender_incarnation, request_seqno)` while
+`RESYNC_REQUEST` encoded three independent u64s and the
+terminal frames echoed one — delayed terminal-frame
+correlation was implementation-dependent: `repair_id`
+IS the pair `(sender_incarnation u64, request_seqno u64)`
+and EVERY repair frame carries BOTH fields — 35
+`RESYNC_REQUEST` =
+`(sender_incarnation u64, request_seqno u64)` (16 bytes —
+the repair_id itself); 36 `JOURNAL_END` =
+`(sender_incarnation u64, request_seqno u64,
+journal_epoch u64, terminal_seqno u64)`
+(32 bytes — the repair_id plus the terminal tuple); 37
+`JOURNAL_ACK` = the SAME immutable 32-byte layout; 38
+`RESET_GEN` = `(direction u8,
 node_incarnation u64, reset_generation u64)` (17 bytes;
 direction 0x00 = dialer→acceptor, 0x01 =
 acceptor→dialer); 39 `RESET_ACK` = the same 17-byte
 layout; 33 `CAPABILITY_DECISION` = `(sender_incarnation
-u64, decision_seqno u64, computed_class u8)` (17 bytes);
+u64, decision_seqno u64, computed_class u8)` (17 bytes;
+computed_class ∈ {0 = v0, 1 = v1, 2 = v2} — the numeric
+mapping, v9.9.54.24, round-69 Codex M5);
 34 `CAPABILITY_DECISION_ACK` = `(sender_incarnation u64,
 decision_seqno u64)` (16 bytes); 40
 `FENCE_CLEARANCE_ACK` = the 36-byte namespace layout
@@ -4449,7 +4473,11 @@ terminal completion simply does not exist at v1);
 **v2** = cumulative bits 2+5 — min() ≥ 2 adds the decision
 phase with its own terminal completion; each class
 LATCHES at its commit point (v0 at the first ordinary
-frame, v1/v2 at the capability exchange) for the
+frame or the all-zero record, v1 at the COMPLETE
+authenticated CONFIRM, v2 TENTATIVE at the exchange and
+COMMITTED ONLY at the ACK'd decision installation —
+v9.9.54.24, round-69 Codex L6, superseding "v1/v2 at the
+capability exchange") for the
 connection's lifetime — on the round-60 trace (new A
 bits 2+5 vs intermediate B bit 2 only) min() = v1:
 repair-v1 RUNS on both sides and the decision phase is
@@ -4878,7 +4906,30 @@ EXACT install (every emitted delta of the cohort) is
 appended durably BEFORE the admission returns success —
 `QueueSessionV4/V6` and `queueMessage` propagate failure,
 and a failed append fails the admission (never a silent
-success) — with the failure policy SPLIT at publication
+success) — with the journal record TWO-PHASE
+(v9.9.54.24, round-69 Codex B1 + round-69 SMR F1: the
+v9.9.54.23 "append at ticket mint" could journal a cohort
+the dataplane never installs — accepted event-stream
+records become replay/wire-visible at `drain.rs:81`, are
+dispatched by Go at `eventstream.go:559`, and queue to the
+peer at `daemon_ha_userspace_stream.go:185`, while the
+local forward installs only at
+`poll_descriptor/mod.rs:2449`: A allocates tuple P and
+appends E1, B imports E1/P, A crashes before local
+installation — B retains a ghost session and NAT
+reservation, and A's later allocation is rejected by the
+occupied-tuple checks (`allocator.rs:1664, :1682`): the
+mint-time record is `STAGED` — EMISSION-INELIGIBLE,
+never replayed or wired to the peer; it transitions
+ATOMICALLY to `INSTALLED` ONLY after canonical
+publication (the shared-state publish at
+`poll_descriptor/mod.rs:2578, :2591`); the cutoff's
+durable-acceptance predicate counts ONLY `INSTALLED`
+records; the repair replicates ONLY `INSTALLED` records;
+and an uncommitted `STAGED` record is treated as ABSENT
+during recovery — rolled back with its allocation freed,
+which is safe because nothing was ever installed,
+published, or transmitted); and the failure policy SPLIT at publication
 (v9.9.54.23, round-68 Codex B3: the operative dataplane
 order installs the forward entry
 (`poll_descriptor/mod.rs:2449`), publishes shared/sibling
@@ -4889,15 +4940,33 @@ packets may already have left using translated tuple P
 when the append fails, and rolling E1 back frees P
 (`allocator.rs:1392, :1449`) for E2 while E1's
 packets/replies remain in flight: (a) the append is
-attempted EARLY (at ticket mint, before any publication)
+attempted EARLY (the `STAGED` record lands at ticket
+mint, before any publication, and marks `INSTALLED` at
+canonical publication — v9.9.54.24),
 and a PRE-publication failure rolls back (nothing saw the
 entry — the rollback is exempt from the fence's
 new-reader rejection, round-68 SMR F1, and its delete
 deltas journal only the appended prefix — empty prefix =
 local-only); (b) a POST-publication/TX append failure
 NEVER rolls back — the session and its allocation are
-RETAINED, the ticket is marked `UNCOVERED/DIRTY`, the
-cutoff aborts (ownership retained, operator-visible), and
+RETAINED, the ticket is marked `UNCOVERED/DIRTY` — BOUND
+to `(ticket generation, SessionIdentity)` with an exact
+terminal rule (v9.9.54.24, round-69 Codex H4 + round-69
+SMR F4: without a carry rule the dirty set either keeps
+every later transfer permanently not-ready (still in the
+durable-watermark predicate) or drops readiness short of
+proof (discarded at reopen): the dirty set is CARRIED
+into the next generation's repair obligation BY NAME
+(the obligation names exactly those `(ticket generation,
+SessionIdentity)` cohorts), and a dirty ticket clears
+ONLY when an exact helper-authoritative snapshot
+containing that identity reaches `JOURNAL_END`, or an
+identity-matching AUTHORITATIVE ABSENCE is established
+(the helper confirms the cohort exists nowhere — never
+by timeout, never by generation rollover) — and admissions
+from `OPEN(g+1)` ride generation g+1's journal FROM MINT
+(v9.9.54.24, round-69 SMR F4: the next cutoff's watermark
+covers them by construction); the cutoff aborts (ownership retained, operator-visible), and
 the repair obligation bumps so the next authoritative
 repair covers the unjournaled cohort (retaining is
 strictly safer than freeing a live tuple — the exact
@@ -5305,20 +5374,39 @@ and admit stale RG priorities to election
 (`heartbeat_manager.go:293`, `election.go:172`): the
 high-water mark and every clearance are keyed by
 `(authority node/process incarnation, target node/process
-incarnation, retirement generation, RG scope)`; a
+incarnation, retirement generation, RG scope)` — with the
+scope a COUNTED byte-exact record (v9.9.54.23, round-69
+Codex B3: a u32 bitmap cannot cover the supported RG IDs
+0-255 and up to 255 configured groups (`heartbeat.go:157`,
+`compiler_validate_strict_chassis.go:69`), and a scalar
+cannot represent an exact multi-RG scope: the scope is
+`(count u8, rg_id u8 × count)` with the canonical
+full-set sentinel `count=0` meaning ALL RGs (the
+`ForceSecondary` case); the eligibility rule is per-RG —
+an RG is election-eligible ONLY WHEN NO PENDING FENCE
+COVERS IT (overlapping fences `R1:{1,2}`, `R2:{2}`
+compose: clearing R1 lifts rg1 but rg2 stays fenced by
+R2 — `heartbeat_manager.go:306, :355`, `election.go:172`);
+and the incarnation fields are EQUALITY/MEMBERSHIP
+identifiers, NEVER ordered (v9.9.54.23, round-69 Codex B3
++ retracting round-68 SMR F5's "older/newer" phrasing:
+process incarnations are random, unordered values
+(`plan.md`'s own rule and `heartbeat.go:624`) — the fence
+predicate is `heartbeat_incarnation ∈ retired-set`
+(equality), and a restarted peer's DIFFERENT incarnation
+is not in the set, so it proceeds to the quiesced
+revalidation; ONLY `retirement_generation` is ordered);
+a
 clearance CASes ONLY the current pending fence (a stale
-ACK mismatches the namespace and is discarded); the mark's
-comparator is exact (round-68 SMR F5: the mark IS the
-retired `process_incarnation` — heartbeats carrying that
-incarnation or older are LIVENESS-ONLY; a NEWER
-incarnation is not fenced by the mark and proceeds to the
-quiesced revalidation that teaches it the retirement);
+ACK mismatches the namespace and is discarded);
 the extension negotiates as capability BIT 6
 (retirement-extension) in the §5.8 word; and the
 clearance ACK takes frame ID **40** (`FENCE_CLEARANCE_ACK`
 — payload `(authority_node_id u32, authority_incarnation
 u64, target_node_id u32, target_incarnation u64,
-retirement_generation u64, rg_scope u32)`)); its processing
+retirement_generation u64, scope_count u8, rg_id u8 ×
+scope_count)` — v9.9.54.23, round-69 Codex B3's counted
+form, superseding the u32 bitmap)); its processing
 is gated on the peer's advertised extension capability
 (rolling-gated like every other additive tail); and fence
 clearance is ACKed — the returner's reseed completion is
@@ -6703,7 +6791,11 @@ admitted interval):
   extension-less peers — the operator asserts the peer is
   DEAD, not merely unreachable); the decision-ACK
   linearization (owner commits on exact ACK receipt;
-  responder on successful full ACK write/enqueue; the
+  responder on the ACK's actual SERIALIZATION on the exact
+  setup stream completing (v9.9.54.24, round-69 Codex L6 —
+  "write/enqueue" predates the serialization edge; the
+  enqueue receipt completes only after serialization, and
+  no slot exposure or cold-prime precedes it); the
   responder's tentative class is revoked on connection
   loss before any subsequent dispatch); and the
   declaration-era stragglers swept ("before
@@ -6744,6 +6836,33 @@ admitted interval):
   idempotence, the v0 evidence in d15, the d17 terminal
   states + not-applied mapping + the record-less
   recovery's conservative restore-default leg);
+  (d20) v9.9.54.24 boundaries (round-69 Codex B1/B2/B3/H4/M5/L6
+  + round-69 SMR F1/F4/F6): the two-phase journal record
+  (STAGED at mint — emission-ineligible, never replayed;
+  INSTALLED only after canonical publication; the cutoff
+  predicate and the repair count ONLY INSTALLED records;
+  an uncommitted STAGED record is ABSENT during recovery
+  — rolled back with its allocation freed); the 32-byte
+  capability record (4+8+8+8+4; the frame-32 payload IS
+  the transcript record byte-for-byte — the golden
+  vectors cover the wire encoding); the counted RG-scope
+  grammar ((count u8, rg_id u8 × count), count=0 = ALL;
+  per-RG eligibility — an RG is eligible only when no
+  pending fence covers it; incarnations are
+  equality/membership identifiers, ONLY
+  retirement_generation is ordered); the DIRTY carry rule
+  (bound to (ticket generation, SessionIdentity); carried
+  by name into the next repair obligation; clears ONLY on
+  an exact helper-authoritative JOURNAL_END containing
+  the identity or an identity-matching authoritative
+  absence — never by timeout or rollover); the canonical
+  repair-ID ((sender_incarnation, request_seqno) carried
+  byte-for-byte through request, markers, terminal
+  exchange, and receipt — 35 = 16 bytes, 36/37 = 32
+  bytes); computed_class ∈ {0,1,2}; and the commit-boundary
+  sweep (v1 commits on complete CONFIRM; v2 tentative at
+  the exchange, commits at the ACK'd installation; the
+  responder commits at the ACK's actual serialization);
   the pending-rejection GC wakeup
   re-opens admission with readiness degraded); same-fabric
   token supersession (C2 installs → T1 revoked before the slot
