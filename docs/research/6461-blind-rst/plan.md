@@ -4101,9 +4101,10 @@ installed connection's IMMUTABLE COMMITTED repair version
 installed lane's immutable committed reset version (≥ 1,
 INDEPENDENTLY negotiated); legality is evaluated at
 RECEIPT against the committed version (v9.9.54.23,
-round-68 SMR F2: the pre-dispatch order (hello → proof →
-wrapper → CONFIRM → DECISION+ACK → slot install → session
-dispatch) guarantees no repair/reset frame can arrive
+round-68 SMR F2: the per-proof-version pre-dispatch
+order (v9.9.54.26, round-71 Codex M4 — either order ends
+in slot install → session dispatch, and the class commits
+BEFORE slot install in both) guarantees no repair/reset frame can arrive
 before the class commits — they ride the ESTABLISHED
 connection, which exists only after slot install); and a reset lane can negotiate ONLY at
 reset_version ≤ repair_version (v9.9.54.22, round-67
@@ -4344,7 +4345,17 @@ initiator-unreceived window cannot produce a
 cross-reconnect version mismatch; the only state a fresh
 connection inherits is the peer's identity, never its
 class): the decision precedes session dispatch —
-the full pre-dispatch order is pinned (v9.9.54.5,
+the full pre-dispatch order is pinned PER PROOF VERSION
+(v9.9.54.26, round-71 Codex M4 — the generic
+"hello → proof → wrapper → CONFIRM → decision" was
+contradictory across sections: the v1-PROOF order is
+hello → immediate `AUTH_PROOF(nonce)` → wrapper →
+`CAPABILITY_CONFIRM` → decision-if-v2 → slot install →
+session dispatch/cold-prime; the v2-PROOF order is hello
+pair (capability records in the transcript) →
+`AUTH_PROOF_v2(transcript)` → wrapper →
+`CAPABILITY_DECISION` + ACK → slot install → session
+dispatch/cold-prime) (v9.9.54.5,
 round-56 SMR F1: hello → proof → wrapper → CONFIRM
 exchange → `CAPABILITY_DECISION` + ACK → slot
 install → session dispatch/cold-prime (v9.9.54.22,
@@ -4978,7 +4989,54 @@ visibility is the pre-publication rollback (safe); ANY
 failure AT or AFTER first visibility NEVER rolls back —
 retain the allocation and mark the ticket
 `UNCOVERED/DIRTY` (the same rule as the post-publication
-append failure); and `INSTALLED` requires every publish
+append failure); and the invisibility is CONSTRUCTION-LEVEL
+across EVERY visibility domain (v9.9.54.26, round-71
+Codex B1 + round-71 SMR F1: the shared-map visibility
+flag cannot fence the native-XDP map (its value is only a
+`u8` action, read without access to the Rust cell —
+`lib.rs:369, :825`), fragment associations publish BEFORE
+the shared/BPF sequence (`poll_descriptor/mod.rs:2525`),
+are shared across workers (`nat64.rs:386`), and are
+consumed directly with no commit-cell check
+(`nat64.rs:535`, `poll_descriptor/mod.rs:3016`) — W0 can
+expose E1/P's fragment association, W1 forwards a
+fragment through it, and a `STAGED` rollback frees P for
+E2; and a discipline of "every lookup masks" is exactly
+the class of rule that keeps failing family-by-family:
+every domain's state (BPF maps, shared aliases, fragment
+associations, flow caches) stages in a STAGING key
+namespace no canonical lookup can match, and the commit
+is ONE atomic key-space publication (staging → canonical
+in a single batch per domain) — no lookup of any family
+can see hidden state by construction; the publication is
+INCUMBENT-PRESERVING MVCC (today's single-value
+primary/NAT/wire maps would let a hidden candidate
+OVERWRITE the incumbent (`shared_ops.rs:907, :919`) —
+masking E2 then produces a MISS rather than falling back
+to visible E1, and deletion cannot reconstruct E1's
+preimage: the hidden write goes to a SHADOW slot, the
+incumbent stays visible until the atomic swap, and a
+rollback never touches the incumbent); the rollback's
+domain deletes are deadline-bounded and retried
+(round-71 AGY T1: a failed BPF map DELETE during the
+unwind orphans a hidden entry — the ticket stays
+`STAGED`, worker-liveness cleans the userspace
+structures, but the BPF entry leaks and its key collides
+with future allocations: the orphaned hidden entry stays
+tracked by its ticket, the rollback re-drives the domain
+deletes until success (operator-visible past the
+teardown deadline), and the entry's key is
+generation-tagged so a future same-key insert OVERWRITES
+rather than collides); and EVERY durable `INSTALLED`
+receipt is MANDATORILY redone at restart (the plan
+recorded `INSTALLED` before visibility flips but defined
+restart recovery only for `STAGED` — a crash in that
+interval leaves the peer emission-eligible while the
+local row is invisible: the recovery redoes the
+visibility flip for every durable `INSTALLED` receipt,
+re-exposing exactly the committed cohorts, so local
+visibility and peer state re-converge));
+and `INSTALLED` requires every publish
 point's HIDDEN write confirmed — a partial hidden write
 unwinds all points (each an idempotent set/delete) with
 the ticket staying `STAGED` (round-70 SMR F1));
@@ -5462,12 +5520,75 @@ retirement_generation u64, scope_kind u8 (0=ALL,
 hashed scope — the per-RG detail resolves from the
 sync-channel `RETIREMENT_NOTICE`, and an
 INCOMPLETE-EXTENSION state (summary received, detail not
-yet applied) keeps the affected scope's election FENCED
-(fail-closed, never open); the compact ACK
+yet applied) makes the TARGET INCARNATION GLOBALLY
+election-ineligible until the matching detail arrives
+(v9.9.54.26, round-71 Codex B2 + round-71 AGY T2: the
+summary alone cannot name "the affected scope" — current
+heartbeat handling rebuilds peer state and invokes
+election immediately (`heartbeat_manager.go:306, :355`),
+so a summary-first receiver must fence the WHOLE
+incarnation, not guess the scope; and the fence — both
+incomplete and complete — is LIVENESS-BOUND: it holds
+ONLY while the authority's heartbeat continues to assert
+it (each summary re-asserts), and it drops on authority
+loss (the authority is the SURVIVOR by construction; if
+the survivor dies, the retired peer is the only node
+left and MUST serve — fencing past the authority's death
+would defeat HA; the incomplete fence also drops when a
+DIFFERENT authority incarnation appears — a restarted
+survivor's fresh fence state supersedes)); the
+`RETIREMENT_NOTICE` (41) itself is DURABLE until ACKed
+(v9.9.54.26, round-71 Codex B2: the existing queue
+rejects while disconnected/full (`sync_conn_write.go:36`)
+and retries only an already-dequeued frame
+(`sync_conn_write.go:268`) — a NOTICE is journaled like a
+session delta (durable until the peer's ACK, redriven by
+the same ring, surviving disconnect/full); the two
+channels' ordering is pinned BOTH ways (v9.9.54.26,
+round-71 SMR F2: summary-first fences the whole target
+incarnation (above); NOTICE-first APPLIES IMMEDIATELY —
+the NOTICE is itself authenticated (it rides the
+authenticated session-sync connection, the same trust
+domain), the detail is complete on its own, and the
+summary's later arrival dedups on the exact namespace;
+and the summary's real role is the PARTITION case — the
+sync channel dies with the partition, so the heartbeat
+summary is the only carrier that can reach a
+partitioned peer, while the NOTICE is the
+connected-case detail); and ALL is
+AUTHORITY-EXPANDED into the exact transmitted set
+(round-71 Codex B2: A retires B for ALL while A's config
+holds {RG1,RG2} and B's holds {RG1} — receiver-side
+expansion against B's then-current set leaves a
+later-added RG2 unfenced for B's retired incarnation: the
+AUTHORITY expands ALL against ITS OWN current RG set and
+transmits the exact ids verbatim (no receiver-side
+expansion); the NOTICE carries the authority's
+membership epoch, and B PARKS any config application
+that would expand its retired incarnation's RG set
+beyond the transmitted set until the fence clears)); the compact ACK
 `FENCE_CLEARANCE_ACK` (40) carries the same 33-byte
 summary form (v9.9.54.25 — superseding the fixed
 36-byte/36+count layouts, which disagreed with each
-other and with the budget)); the extension carries
+other and with the budget)); the extension carries the
+COMPACT SUMMARY `(authority_incarnation u64,
+target_incarnation u64, retirement_generation u64,
+scope_kind u8 (0=ALL, 1=EXPLICIT), scope_hash u64)` —
+with the hash defined EXACTLY (v9.9.54.26, round-71
+Codex H3: `scope_hash` was algorithm-free: for
+scope_kind=ALL the hash is the constant
+`BLAKE2s-64("xpf-retire-scope/ALL" ||
+authority_incarnation)`; for EXPLICIT it is
+`BLAKE2s-64("xpf-retire-scope" || count ||
+rg_id[0] || … || rg_id[count-1])` over the CANONICAL
+ascending-sorted RG-id list — the same bytes the
+`RETIREMENT_NOTICE` carries, so the summary and the
+detail always agree; and the heartbeat carries AT MOST
+TWO pending summaries per target (2×33 = 66 bytes ≤ the
+132-byte budget — further retirements QUEUE at the
+authority; two summaries for the same authority and
+generation are impossible by the generation's
+uniqueness)); the extension carries
 (sender session-sync incarnation, retired-incarnation
 generation, retirement high-water mark) — keyed by an
 EXACT-MATCH NAMESPACE (v9.9.54.23, round-68 Codex H5:
@@ -5516,11 +5637,13 @@ ACK mismatches the namespace and is discarded);
 the extension negotiates as capability BIT 6
 (retirement-extension) in the §5.8 word; and the
 clearance ACK takes frame ID **40** (`FENCE_CLEARANCE_ACK`
-— payload `(authority_node_id u32, authority_incarnation
-u64, target_node_id u32, target_incarnation u64,
-retirement_generation u64, scope_count u8, rg_id u8 ×
-scope_count)` — v9.9.54.23, round-69 Codex B3's counted
-form, superseding the u32 bitmap)); its processing
+— the 33-byte compact summary form `(authority_incarnation
+u64, target_incarnation u64, retirement_generation u64,
+scope_kind u8, scope_hash u64)` (v9.9.54.26, round-71
+Codex H3: ONE frame-40 grammar everywhere — the
+v9.9.54.23 counted-payload form is superseded; the
+AUTHORITATIVE counted record rides frame 41
+`RETIREMENT_NOTICE` on the sync channel)); its processing
 is gated on the peer's advertised extension capability
 (rolling-gated like every other additive tail); and fence
 clearance is ACKed — the returner's reseed completion is
@@ -5962,8 +6085,16 @@ installs (the wrapper installs only after verification,
 `sync_auth.go:406` — the transcript is not "inside" the
 wrapper; it is what the wrapper's installation is gated on));
 the canonical transcript — node ID, process incarnation,
-capabilities, nonces — is what `AUTH_PROOF` covers (not a
-bare nonce) — and the proof is verified BEFORE the
+capabilities, nonces — is what `AUTH_PROOF_v2` covers
+(the v1-proof proof covers ONLY the nonce
+(`sync_auth.go:217`) — v9.9.54.26, round-71 Codex M4:
+the unqualified "AUTH_PROOF covers the full transcript"
+was true only of v2; and the v1-proof proof IS the
+deployed behavior — the golden vectors in §5.8 cover
+ONLY the NEW v2 transcript, and no v1-proof vector is
+needed (round-71 SMR F4: the v1 proof is
+production-tested by the current suite, not a new
+contract)) — and the proof is verified BEFORE the
 authenticated frame wrapper installs (v9.9.45, round-49 Codex
 H2: this strikes the contradictory "inside the wrapper"
 phrasing — the wrapper installs only after verification,
@@ -6025,7 +6156,21 @@ present=0 and the count field is zeroed and ignored);
 repair-v1 `BulkEnd` = `(bulk_epoch u64,
 sender_incarnation u64, request_seqno u64)` (24 bytes —
 the canonical repair-ID pair, byte-for-byte with
-RESYNC_REQUEST)); the CAPABILITY-CONDITIONED
+RESYNC_REQUEST) — and the marker's WIRE FORM is
+class-conditional (v9.9.54.26, round-71 AGY T3: a v0
+connection carries the legacy prefix-only markers
+(the leading u64 and nothing else — the shared
+deterministic computation means both sides negotiated
+the same class, so a v1-length marker on a v0 connection
+indicates a BUGGY or malicious peer: the receiver
+validates the frame length against the connection's
+COMMITTED class and a length/class mismatch is a
+protocol violation and closes — never a partial read
+(`sync_conn_read.go:71-94, :183`)); a repair-v0 receiver
+on a v0 connection reads the leading u64 and ignores
+nothing (there is nothing extra); a repair-v1+ receiver
+on a v1+ connection requires the full extension — a
+truncated extension is a protocol violation and closes); the CAPABILITY-CONDITIONED
 COMPLETION MATRIX (v9.9.45, round-49 Codex B1 — the two-frame
 rule cannot apply to mixed-version pairs: a legacy receiver
 can't return `JOURNAL_ACK` (or even a bare `BulkAck` when
@@ -7046,6 +7191,32 @@ admitted interval):
   mismatch); and the absence-proof sufficiency (the
   never-rollback retention keeps the tuple bound for the
   session's natural life);
+  (d22) v9.9.54.26 boundaries (round-71 Codex B1/B2/H3/M4
+  + round-71 AGY T1/T2/T3 + round-71 SMR F1-F5):
+  construction-level invisibility across every domain
+  (staging key namespace → ONE atomic key-space
+  publication per domain; incumbent-preserving MVCC
+  shadow slots; the rollback's domain deletes
+  deadline-bounded and retried with generation-tagged
+  keys; EVERY durable INSTALLED receipt mandatorily
+  redone at restart); the split-carriage causal rules
+  (summary-first → the target incarnation is GLOBALLY
+  election-ineligible until matching detail; the fence
+  is liveness-bound — it drops on authority loss or a
+  new authority incarnation; RETIREMENT_NOTICE is
+  journaled durable-until-ACK; ALL is authority-expanded
+  to the exact transmitted set with the membership epoch
+  parked for over-set configs); ONE frame-40 grammar
+  (33-byte summary; scope_hash = BLAKE2s-64 over the
+  domain-separated canonical sorted list; at most two
+  pending summaries per target); the class-conditional
+  marker wire form (v0 → prefix-only; v1+ → extended;
+  a length/class mismatch is a protocol violation and
+  closes); the per-proof-version sequences pinned at
+  every generic site; and the receipt restart rule
+  (the completed-repair receipt persists write-ahead;
+  a wiped receipt re-ACKs iff the table proves the
+  content, else the repair re-runs);
   the pending-rejection GC wakeup
   re-opens admission with readiness degraded); same-fabric
   token supersession (C2 installs → T1 revoked before the slot
@@ -7065,7 +7236,18 @@ admitted interval):
   same-pair-DIFFERENT-tuple is a protocol violation and
   closes — the request_seqno makes each repair attempt
   unique, so a divergent terminal under a known pair is
-  never a legitimate re-send));
+  never a legitimate re-send); and the receipt's restart
+  semantics are stated (v9.9.54.26, round-71 SMR F5:
+  `manager.go:372, :386` recreate the maps empty — the
+  completed-repair receipt persists with the same
+  write-ahead discipline as the commit receipt; a
+  restart-wiped receipt falls back to
+  re-ACK-if-table-complete (the re-ACK is truthful IFF
+  the receiver's table reflects the journal — verified
+  against the incumbent state — else the repair re-runs;
+  an unknown-pair terminal frame with no active
+  obligation re-ACKs when the table proves the content
+  and is a protocol violation otherwise));
   identity adoption (an import carries the wire identity
   byte-for-byte — A's conditional delete for IA matches on B);
   the same-E1-resend vs stage-2 race (the resend's publication
