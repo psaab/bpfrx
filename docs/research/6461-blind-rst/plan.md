@@ -4077,8 +4077,22 @@ retirement_generation u64, scope_kind u8, scope_hash u64)`
 `RETIREMENT_NOTICE` = `(authority_node_id u32,
 authority_incarnation u64, target_node_id u32,
 target_incarnation u64, retirement_generation u64,
-membership_epoch u64, scope_count u8, rg_id u8 ×
-scope_count)` — with a rolling-gated additive
+membership_epoch u64, scope_count u8, rg_entry ×
+scope_count)` with `rg_entry = (rg_id u8,
+rg_incarnation u64)` (9 bytes each — the same
+incarnation the ledger carries (v9.9.54.32, round-77
+Codex B3: frame 41 carried only `rg_id` while the
+ledger carried `(rg_id, rg_incarnation)` — an old
+RG3/I1 notice could be applied to a re-created RG3/I2:
+the SAME authority-issued config-carried incarnation
+appears in the notice, the scope hash, frame 42, and
+every ledger record; the incarnation is minted at RG
+creation by the config-authoring daemon (the config
+model gains the field as system-generated and
+display-only (`types_chassis.go`'s chassis types), is
+synced with the config, is removed with the RG, and is
+re-minted NEW on re-add (a removed-and-re-added RG is
+a new instance — never a reuse))) — with a rolling-gated additive
 SUPERSEDES TAIL (v9.9.54.30, round-75 Codex B3: the
 frame ended after the scope IDs, so a successor
 reissue could not name the fence it replaces, and no
@@ -4123,10 +4137,25 @@ independently, retain F1, and never emit frame 42 —
 and unknown messages fall through the receive switch
 (`sync_conn_read.go:96`): the replacement class
 requires the retirement-extension protocol at version
-≥ 2 (BIT 6 at v2 — a peer that negotiated only v1 of
-the extension gets the external-fencing fallback
-(the pending NOTICE never delivers and the operator
-path applies), never a partial replacement); frame 42
+≥ 2 (BIT 6 AND BIT 7 both active — bit 7 =
+retirement-extension-v2, negotiated by the same min()
+machine (v9.9.54.32, round-77 Codex B2 + round-77 SMR
+F1: a single BIT 6 cannot carry two versions — a
+v1-extension peer and a v2-extension peer would
+advertise identically, and a v2-reader treating BIT 6
+as v2 lets a v1 receiver ignore the supersedes tail,
+install F2, retain F1, and never emit frame 42
+(unknown frames fall through `sync_conn_read.go:96`):
+frames 40/41 are legal at extension ≥ 1 (fence and
+clearance only — NO replacement semantics); frames
+42/43, the frame-41 supersedes-tail semantics, and
+the `RETIREMENT_LEDGER` transfer are legal ONLY at
+extension ≥ 2; a peer that negotiated only v1 of
+the extension gets the TOTAL fallback (it fences and
+clears NEW retirements but NEVER replaces — no partial
+replacement is representable at v1 — and the
+external-fencing precondition covers the operator's
+dead-peer case exactly as before)); frame 42
 is legal to SEND or APPLY only while BIT 6 is ACTIVE
 at protocol version ≥ 2 on the current authenticated
 incarnation (it shares the 40/41 predicate); and the
@@ -4758,7 +4787,11 @@ round-60 SMR F1: on a v1-proof connection it is advertised,
 not active, until the matching authenticated
 `CAPABILITY_CONFIRM` — the decision phase requires BOTH
 bit 5 present AND, on a v1-proof connection, the
-post-wrapper CONFIRM), v9.9.54.12,
+post-wrapper CONFIRM — and it exists ONLY at min() ≥ 2
+(v9.9.54.32, round-77 Codex H6: at min() ≤ 1 there IS no
+decision phase regardless of bit 5 or the CONFIRM — the
+class commits per the matrix's v0/v1 rows, and no
+decision frame is sent or expected)), v9.9.54.12,
 round-59 Codex B1); a baseline peer's first ordinary
 legacy frame is BUFFERED, the connection latches legacy,
 installs, and dispatches the buffered frame in order —
@@ -5365,13 +5398,40 @@ retracted (the selector is the root's `active_slot`
 field resolved through the same record));
 EVERY dependent (the forward session row, companions,
 NAT/wire aliases, fragment shards, flow-cache entries)
-carries ONLY the `(cohort_id, version)` tag and
+carries the `(root_id, cohort_id, version)` triple
+(v9.9.54.32, round-76 Codex B1: "(cohort_id, version)"
+left a replacement candidate unable to locate its
+family's root without an unstated directory — and the
+family identity itself must be byte-exact (the current
+`SessionKey` carries only the network tuple
+(`key.rs:10`) while the flow cache requires logical
+ingress identity to keep identical tuples on separate
+VLANs distinct (`flow_cache.rs:980`): the `root_id` IS
+the byte-exact family identity — the canonical forward
+key PLUS the ingress scope (zone, logical interface,
+VLAN) — so two families that share a bare tuple never
+share a root); and
 VALIDATES it against the root record (a dependent is
 visible IFF `root.active_cohort_id == tag.cohort_id &&
 root.version == tag.version`); the publication writes
 every dependent FIRST and flips the ROOT RECORD ONCE
 (the single atomic authority for the whole cohort —
-one flip, no K-bit tearing, no dual authority);
+one flip, no K-bit tearing, no dual authority) — and
+the publication RESERVES BEFORE STAGING (v9.9.54.32,
+round-76 Codex B1: the expected-root CAS validates only
+the flip — W2 and W3 can both observe E1/slot0, stage
+DIFFERENT candidates into slot1 with interleaved
+unconditional writes (`bpf_map/mod.rs:48`,
+`poll_descriptor/mod.rs:2578`, `session_import.rs:169`
+all `BPF_ANY` today), and W2 can win the CAS after W3
+overwrote some dependencies — a mixed cohort: staging
+is gated on a per-root PUBLICATION RESERVATION (a
+per-root mutex, or a `PREPARING(owner, candidate,
+unique-shadow)` CAS on the root record itself — the
+winner stages only into its OWN unique shadow space
+(per-candidate, never a shared slot), and the loser's
+cleanup is CANDIDATE-CONDITIONAL (it removes only its
+own candidate's shadows, never the winner's));
 the dual-slot replacement resolves through the same
 record (the selector is the root's `active_slot` field
 — the incumbent's slot stays live until the root
@@ -5381,7 +5441,7 @@ references it)); and the reverse-direction paths that
 cannot reconstruct the forward key (the fragment shard
 at `nat64.rs:362`, the DNAT alias at `lib.rs:369,
 :825`, the checksum path at `checksum.rs:304`) read the
-root record DIRECTLY by `cohort_id` (the root's address
+root record DIRECTLY by `root_id` (the root's address
 is derivable from the tag alone — one extra read on the
 seed path only, v9.9.54.29 round-75 SMR F2: the flow
 cache can never hold a pre-commit entry (a hidden
@@ -5409,7 +5469,29 @@ and root versions are NEVER REUSABLE (the root's
 version counter is monotone across deletion, restart,
 and migration — persisted durably, so a stale
 `(cohort_id, old_version)` tag can never validate
-against a recycled version number); and the shadow storage/reclamation is
+against a recycled version number); and the root
+record lives in ONE physical shared primitive
+(v9.9.54.32, round-77 Codex H5: XDP reads a kernel BPF
+hash map directly (`lib.rs:369, :825`) while each Rust
+worker owns an in-process `FlowCache` vector
+(`flow_cache.rs:672`) — a syscall map lookup on every
+cache hit defeats the cache's purpose, and a
+per-worker mirror creates a window where BPF and Rust
+validate different root versions: the root table is a
+single mmappable seqlocked table (the same
+shim-exported pages the userspace-xdp shim already
+shares with the dataplane — BPF-side reads take the
+map form, Rust-side reads read the SAME pages through
+the mmap, and the seqlock gives readers a
+retry-on-torn-read discipline with zero syscalls on
+the hit path); and the root table's lifecycle is
+BOUNDED (the session map's 262,144-entry bound
+(`lib.rs:369`) prices the table's size; a retired root
+holds a TOMBSTONE `(root_id, final_version)` for a
+grace period (bounded by the same high-water
+discipline as the store's floor), and a recycled
+address can NEVER validate a stale tag — the tag's
+version below `final_version` is invalid forever); and the shadow storage/reclamation is
 identity-fenced across every domain (a shadow value is
 reclaimed only when its `(cohort_id, version)` is no
 longer referenced by the root OR any live dependent) — with the commit authority being the ROOT RECORD alone (v9.9.54.29, round-74 Codex
@@ -6024,12 +6106,15 @@ generation (`sync_conn_config.go:230`,
 `sync_protocol.go:670`), and its ordering is scalar —
 not `(authority incarnation, generation)`
 (`sync_conn_config.go:254`) — so a delayed A1 update
-could follow A2's reconstruction: the ledger is a
-NORMATIVE section of the config-sync channel (section
-ID **3** `RETIREMENT_LEDGER`, rolling-gated by the same
-additive discipline; the section envelope is
-`(section_id u8 = 3, section_length u16)`, and each
-record is byte-exact — `(authority_incarnation u64,
+could follow A2's reconstruction: the ledger rides as
+frame **44** `RETIREMENT_LEDGER` on the session-sync
+connection (v9.9.54.32, round-77 Codex B3 — NOT a
+section embedded in the config text: today's wire
+format is raw config text plus a trailing generation,
+and an embedded TLV would either become config text or
+displace the generation trailer; frame 44 carries
+`(record_count u16, record × record_count)` with each
+record byte-exact — `(authority_incarnation u64,
 retirement_generation u64, target_incarnation u64,
 state u8 (0 = Active, 1 = Cleared), scope_count u8,
 rg_entry × scope_count)` with `rg_entry = (rg_id u8,
@@ -6037,14 +6122,22 @@ rg_incarnation u64)` (9 bytes each) — all integers
 little-endian, the `state` IN the record (v9.9.54.31,
 round-76 Codex B3: the v9.9.54.30 "byte-exact" record
 omitted the state it later required to distinguish
-Active from Cleared); the section is ACKed by frame
+Active from Cleared)); the frame is ACKed by frame
 **43** `LEDGER_ACK` = `(target_incarnation u64,
-acknowledged_high_water u64)` (16 bytes — gated on
-ACTIVE BIT 6 like 40-42); compaction is floored (a
+authority_count u8, (authority_incarnation u64,
+high_water u64) × authority_count)` — a PER-AUTHORITY
+high-water vector (v9.9.54.32, round-77 Codex B3:
+`(target_incarnation, high_water)` omitted the
+authority incarnation — a delayed A1 ACK could
+authorize compaction of A2's unacknowledged records:
+each authority's records compact only below THEIR OWN
+slot's high-water); frame 43 is gated on ACTIVE BIT 6
+(and the ledger transfer as a whole requires extension
+≥ 2 (bit 7), v9.9.54.32); compaction is floored (a
 `Cleared` record compacts ONLY below the peer's
-acknowledged high-water — never compacting an
-`Active` record, and never compacting anything newer
-than the acknowledged high-water); and the
+acknowledged high-water for its own authority — never
+compacting an `Active` record, and never compacting
+anything newer than the acknowledged high-water); and the
 `rg_incarnation` is AUTHORITY-ISSUED, durable, and
 cluster-replicated (v9.9.54.31, round-76 Codex B3 +
 round-76 SMR F1: `group_state.go:20` keys only the
@@ -6126,7 +6219,23 @@ notice re-fence the peer: a notice tombstone compacts
 ONLY below the acknowledged receiver/ledger high-water
 AND only after every attempt for that namespace is
 retired — a durable replay floor is always retained,
-so a compacted notice can never re-fence))); the two
+so a compacted notice can never re-fence) — and the
+replay floor is REPRESENTABLE (v9.9.54.32, round-77
+Codex M7: the floor was named with no schema, while
+the store keys only `(target incarnation, retirement
+generation)` and the exact fence namespace is wider
+(authority, target, generation, scope): SENDER and
+RECEIVER floors are keyed by the FULL
+`(authority_incarnation, target_incarnation,
+retirement_generation, scope)` namespace, persisted
+with the same write-ahead discipline as the store,
+carried through successor reconstruction (the
+config-carried ledger covers them); and an `Active`
+record arriving at or below the applicable floor is
+REJECTED (never re-fences — a delayed ledger whose
+Active R10 arrives after R10's tombstone compacted is
+discarded as superseded, with the rejection
+operator-visible))); the two
 channels' ordering is pinned BOTH ways (v9.9.54.26,
 round-71 SMR F2: summary-first fences the whole target
 incarnation (above); NOTICE-first APPLIES IMMEDIATELY —
@@ -6203,7 +6312,27 @@ can then stay incomplete while all new RG admissions
 drop indefinitely; and a shared hit can materialize
 after the proof snapshot (`session_glue/mod.rs:1092`),
 so a generation bump after Go already lifted the fence
-is too late: Go lifts eligibility ONLY after the
+is too late: the helper's commit is a REVOCABLE
+`PREPARED(G)` receipt, held through the
+election-serialized lift (v9.9.54.32, round-77 Codex H4:
+after `commit(G, watermark)` succeeds and BEFORE Go
+consumes it and lifts, a packet can materialize an
+existing shared entry (`session_glue/mod.rs:1092`) —
+advancing the proof generation to G+1 while nothing
+revoked the already-issued success for G: the lift
+itself CASes the SAME generation (`{G, expected}` — a
+materialization between `PREPARED(G)` and the lift
+invalidates G, the CAS fails, the `PREPARED` receipt
+is revoked, and the drain restarts at G+1); and
+reactive materialization participates in the fence
+(round-77 SMR F4: a shared-hit materialization on an
+excess-RG flow during the proof DECLINES to
+materialize (the packet drops — the flow re-seeds on
+the new owner after the lift); the drain's in-flight
+watermark includes pending materializations — any path
+that creates local session state for an excess RG,
+admission or materialization);
+Go lifts eligibility ONLY after the
 helper's conditional commit (the commit validates the
 proof's generation against the current watermark —
 a materialization after the snapshot invalidates the
@@ -6236,8 +6365,15 @@ scope_kind=ALL the hash is the constant
 authority_incarnation || membership_epoch ||
 expanded_sorted_list)`; for EXPLICIT it is
 `BLAKE2s-64("xpf-retire-scope" || membership_epoch ||
-count || rg_id[0] || … || rg_id[count-1])` over the CANONICAL
-ascending-sorted RG-id list — the same bytes the
+count || rg_entry[0] || … || rg_entry[count-1])` over
+the CANONICAL ascending-sorted `(rg_id, rg_incarnation)`
+PAIR list (v9.9.54.32, round-77 Codex B3: the hash
+covered only the RG-ID list while the ledger binds
+`(rg_id, rg_incarnation)` — an old RG3/I1 summary could
+match a re-created RG3/I2's detail: the hash covers
+the same 9-byte entries the notice and the ledger
+carry, so summary, detail, and ledger always agree on
+the instance) — the same bytes the
 `RETIREMENT_NOTICE` carries, so the summary and the
 detail always agree; the output is exactly 8 bytes (64
 bits, v9.9.54.27, round-72 Codex M6); and the heartbeat carries AT MOST
@@ -6688,7 +6824,29 @@ governs) while plain flags follow the intersection — a
 future reset-v2 or repair-v3 never re-opens the r61/r62
 class (v9.9.54.18, round-63 SMR F7a)); bit 6 =
 retirement-extension (the heartbeat fence carriage +
-`FENCE_CLEARANCE_ACK`, v9.9.54.23, round-68 Codex H5); bits 7-31
+`FENCE_CLEARANCE_ACK`, v9.9.54.23, round-68 Codex H5);
+bit 7 = retirement-extension-v2 (the replacement class —
+frame 41's supersedes tail, frames 42/43, and the
+`RETIREMENT_LEDGER` transfer, v9.9.54.32, round-77 Codex
+B2 + round-77 SMR F1: a single BIT 6 cannot carry two
+versions — a v1-extension peer and a v2-extension peer
+would advertise identically, and if v2-readers treat BIT
+6 as v2 a v1 receiver ignores the supersedes tail,
+installs F2, retains F1, and never emits frame 42
+(unknown frames fall through `sync_conn_read.go:96`);
+bit 7 negotiates by the SAME min() machine as every
+other `-vN` bit, and the frame predicates split cleanly:
+frames 40/41 are legal at retirement-extension ≥ 1
+(BIT 6 active — fence and clearance, NO replacement
+semantics), while frames 42/43, the frame-41
+supersedes-tail semantics, and the `RETIREMENT_LEDGER`
+transfer are legal ONLY at retirement-extension ≥ 2
+(BIT 6 AND BIT 7 both active); at extension-v1 a peer
+fences and clears NEW retirements but NEVER replaces
+(the older-peer fallback is total — no partial
+replacement is representable at v1, and the
+external-fencing precondition covers the operator's
+dead-peer case exactly as before)); bits 8-31
 reserved-zero (ENCODE-only — a conforming decoder IGNORES
 unknown set bits, v9.9.54.17) — so "packed LSB-first" is unambiguous),
 little-endian integers, no padding); never as reconstructed
@@ -8026,8 +8184,11 @@ admitted interval):
   receiver-side atomic replacement; bounded visible
   failure); and the receiver-atomic fence replacement
   (the reissue names supersedes=(old incarnation, old
-  generation); B installs+ACKs F2 BEFORE the F1
-  tombstone; a delayed A1 tombstone matches ONLY F1);
+  generation); B atomically persists F2 AND T(F1) as
+  one journaled unit BEFORE the ACK (v9.9.54.31/32 —
+  "installs+ACKs F2 BEFORE the F1 tombstone" was the
+  retracted staging);
+  a delayed A1 tombstone matches ONLY F1);
   (d26) v9.9.54.30 boundaries (round-75 Codex B1/B2/B3/H4/H5/H6/M7
   + round-75 SMR F1-F7): the ONE root record per cohort
   ((active_cohort_id, active_slot, version) — every
@@ -8042,7 +8203,8 @@ admitted interval):
   watermark + proof-generation invalidation on every
   publish/retain/release (a post-proof admission
   reopens the proof); the frame-41 supersedes tail and
-  frame-42 FENCE_REPLACE_ACK (36 bytes — B atomically
+  frame-42 FENCE_REPLACE_ACK (40 bytes (v9.9.54.31 — the
+  "36 bytes" was an arithmetic error) — B atomically
   persists F2 AND T(F1) as one journaled unit, then ONE
   idempotent ACK; an authority restart resumes the
   await); the conditional decision mechanism (WHEN the
@@ -8103,6 +8265,44 @@ admitted interval):
   receiver/ledger high-water after every attempt for
   the namespace is retired, with a durable replay
   floor);
+  (d28) v9.9.54.32 boundaries (round-77 Codex B1/B2/B3/H4/H5/H6/M7
+  + round-77 SMR F1-F6): dependents carry (root_id,
+  cohort_id, version) (the root_id IS the byte-exact
+  family identity — canonical forward key PLUS ingress
+  scope (key.rs:10's bare tuple is insufficient,
+  flow_cache.rs:980); staging is gated on a per-root
+  PUBLICATION RESERVATION (per-root mutex or
+  PREPARING(owner, candidate, unique-shadow) CAS — the
+  winner stages only into its own unique shadow space,
+  the loser's cleanup is candidate-conditional); bit 7
+  = retirement-extension-v2 with the frame split
+  (40/41 legal at extension ≥ 1 (fence/clearance only);
+  42/43, the supersedes-tail semantics, and the ledger
+  transfer legal ONLY at extension ≥ 2; the v1 fallback
+  is total (fence/clear new retirements, never
+  replace)); the incarnation identity is consistent
+  everywhere (frame 41's rg_entry = 9 bytes (rg_id,
+  rg_incarnation); the scope hash covers the PAIR list;
+  the incarnation is minted at creation, config-carried,
+  removed with the RG, re-minted NEW on re-add); the
+  ledger rides as frame 44 RETIREMENT_LEDGER (never
+  embedded in the config text) with frame 43 as a
+  PER-AUTHORITY high-water vector; the PREPARED(G)
+  revocable receipt (the lift CASes the same generation
+  — a materialization between PREPARED and lift revokes
+  it and the drain restarts; reactive materialization
+  declines during the proof); the mmappable seqlocked
+  root table (one physical primitive for BPF-side and
+  Rust-side reads; tombstone + grace-period reclamation
+  priced by the session map's 262,144 bound; a recycled
+  address never validates a stale tag); the replay
+  floors keyed by the FULL (authority, target,
+  generation, scope) namespace (persisted write-ahead,
+  carried through successor reconstruction; an Active
+  record at or below the floor is REJECTED,
+  operator-visible); and the remaining sequence sites
+  scoped (4789's decision-phase existence requires
+  min() ≥ 2 regardless of bit 5);
   the pending-rejection GC wakeup
   re-opens admission with readiness degraded); same-fabric
   token supersession (C2 installs → T1 revoked before the slot
