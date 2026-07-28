@@ -4087,6 +4087,24 @@ RG3/I1 notice could be applied to a re-created RG3/I2:
 the SAME authority-issued config-carried incarnation
 appears in the notice, the scope hash, frame 42, and
 every ledger record; the incarnation is minted at RG
+creation — and BACKFILLED for every existing RG at
+upgrade time (v9.9.54.35, round-80 Codex H7: the plan
+mints only at RG creation, but current configuration
+and runtime contain NO persisted incarnation field
+(`types_chassis.go:137`, `group_state.go:20`) — during
+a rolling upgrade, an existing RG can reach the
+upgraded standby without an exact ledger identity,
+and a failover before authoritative synchronization
+cannot identity-match retirement records: before BIT
+6/7 activates for the first time on an upgraded
+deployment, the RG0-authoritative minter BACKFILLS an
+incarnation for every existing RG (minted, persisted
+in the config, and ACKed by the peer through the
+config sync) — the extension NEVER activates with an
+un-backfilled RG (a missing identity is fail-closed:
+the RG is visible in the backfill-status display and
+the extension's activation waits for the ACK));
+the incarnation is minted at RG
 creation — by ONE cluster-wide mint authority
 (v9.9.54.33, round-78 Codex B3 + round-78 SMR F1:
 "the config-authoring daemon" leaves BOTH nodes free
@@ -4123,7 +4141,25 @@ check BEFORE store promotion — a config whose mint
 cannot be authorized (a partition, or an expired
 lease) FAILS THE APPLY VISIBLY (it never activates
 with a queued mint; the queued mint's completion is
-reported through the same mint-status display); a
+reported through the same mint-status display) — and
+the preflight is ONE SHARED PREFLIGHT across every
+promotion path, with the lease bound to the candidate
+through the linearization (v9.9.54.35, round-80 Codex
+H6: commit-confirmed uses a SEPARATE callback
+(`daemon_apply_commit.go:551`), preflight executes
+OUTSIDE the store lock before the later promotion
+(`daemon_apply_commit.go:103, :116`): A validates
+lease L, stalls; L expires and B obtains the next
+lease and mints I2; A resumes and promotes I1: ONE
+shared preflight covers plain commit, commit-confirmed,
+and the applicable-bootstrap path; and the lease is a
+candidate-bound MONOTONE token (it binds the candidate
+config generation — the promotion RE-VALIDATES the
+token inside the linearization (a token whose
+generation or holder no longer matches fails the
+promote VISIBLY — A's stale I1 can never promote over
+B's I2), or the lease is HELD from preflight through
+promotion (never released between)); a
 STANDALONE deployment (no `/etc/xpf/node-id`) is its
 own authority (self-mints — no block ever, round-79
 SMR F4); and the peer-down queue/status is explicit
@@ -4147,11 +4183,20 @@ frame ended after the scope IDs, so a successor
 reissue could not name the fence it replaces, and no
 frame told A2 the WHOLE replacement completed: frame
 41 gains the additive trailing field
-`(supersedes_authority_incarnation u64,
-supersedes_retirement_generation u64)` — old decoders
-ignore the tail per the additive discipline; a zero
-tail means a genuinely new retirement, not an
-adoption) — and ALL is AUTHORITY-EXPANDED BEFORE
+`(supersedes_count u8, (supersedes_authority_incarnation
+u64, supersedes_retirement_generation u64) ×
+supersedes_count)` — a COUNTED predecessor vector
+(v9.9.54.35, round-80 Codex B3: the single predecessor
+pair cannot represent the ordered supersession's
+merged case — pending F1 `{RG1}` and F2 `{RG2}` merging
+into G3 `{RG1,RG2}`: G3 can tombstone/correlate only
+ONE predecessor and the other fence stays live
+indefinitely: the supersedes tail carries every
+covered predecessor (count=0 means a genuinely new
+retirement, not an adoption; each entry is the
+(authority, generation) pair of one covered
+predecessor) — old decoders
+ignore the tail per the additive discipline); and ALL is AUTHORITY-EXPANDED BEFORE
 ENCODING (v9.9.54.27, round-72 Codex B1: the wire
 NEVER carries an ALL sentinel; `scope_count` is always
 the exact count (0 is an EMPTY scope and is rejected
@@ -4163,10 +4208,13 @@ the fence clears); and the replacement's completion has its
 own durable receipt — frame **42**
 `FENCE_REPLACE_ACK` = `(authority_incarnation u64,
 target_incarnation u64, new_retirement_generation u64,
-supersedes_authority_incarnation u64,
-supersedes_retirement_generation u64)` (40 bytes —
-5×u64, v9.9.54.31, round-76 Codex B2: the v9.9.54.30
-"36 bytes" was an arithmetic error),
+supersedes_count u8, (supersedes_authority_incarnation
+u64, supersedes_retirement_generation u64) ×
+supersedes_count)` — the SAME counted predecessor
+vector (v9.9.54.35, round-80 Codex B3: the ACK covers
+the whole replacement (every covered predecessor's
+tombstone), so a merged replacement's completion
+correlates ALL of its predecessors, never one),
 covering install-F2 AND tombstone-F1 as ONE idempotent
 ACK (v9.9.54.30, round-75 Codex B3: B atomically
 persists F2 and T(F1) (one journaled unit) and ONLY
@@ -5495,8 +5543,14 @@ retracted (the selector is the root's `active_slot`
 field resolved through the same record));
 EVERY dependent (the forward session row, companions,
 NAT/wire aliases, fragment shards, flow-cache entries)
-carries the `(root_id, cohort_id, version)` triple
-(v9.9.54.32, round-76 Codex B1: "(cohort_id, version)"
+carries the `(root_id, RootRef(slot, generation),
+cohort_id, version)` tags (v9.9.9.54.32, round-76 Codex
+B1 — with the RootRef made normative everywhere
+(v9.9.9.54.35, round-80 Codex B2: the earlier
+`(root_id, cohort_id, version)` clauses at 5496/5596
+predated the RootRef's introduction): the RootRef
+locates the slot directly, and the slot validates
+(root_id, generation) on every read) — and: "(cohort_id, version)"
 left a replacement candidate unable to locate its
 family's root without an unstated directory — and the
 family identity itself must be byte-exact (the current
@@ -5594,7 +5648,7 @@ cache can never hold a pre-commit entry (a hidden
 cohort cannot forward), so every cached entry already
 carries the resolved verdict and the indirection fires
 exactly once per flow) — and the flow-cache entry
-ITSELF tags `(root_id, cohort_id, version)` and revalidates
+ITSELF tags `(root_id, RootRef, cohort_id, version)` and revalidates
 against the root on EVERY hit (v9.9.54.31, round-76
 Codex H5: "revalidates on version movement" left the
 movement unobservable — current cache hits check only
@@ -5653,11 +5707,25 @@ partial write" without a stable preimage or
 double-buffered payload leaves no reconstructable
 incumbent — a writer can update `active_cohort_id`,
 terminate before `version`: the root record lives in
-TWO physical copies (A/B), each with its own checksum;
-the writer writes copy A, checksums it, then copy B;
-a reader validates the checksum and falls back to the
-other copy on mismatch (a torn write can never leave
-both copies bad); the recovering writer reads the GOOD
+TWO physical copies (A/B), each with its own checksum
+— with ONE atomic ACTIVE-COPY SELECTOR determining the
+committed copy (v9.9.54.35, round-80 Codex B2: after
+A=new is checksummed but before B is updated, BOTH
+copies are checksum-valid and DISAGREE — "read the
+GOOD copy" cannot distinguish candidate A from
+incumbent B, and a writer terminating there leaves no
+deterministic answer: the selector is a third cell
+`(active_copy, sequence)` — the writer writes copy A,
+checksums it, writes copy B, checksums it, and flips
+the selector LAST (the selector's flip is the commit);
+a reader reads the selector FIRST, then reads the
+SELECTED copy (validating its checksum — a checksum
+failure falls back to the other copy, and both failing
+is the corruption path (operator-visible)); a dead
+writer leaves the selector at the OLD copy (the flip
+never happened) — the committed state is always
+deterministic; and a reader's consecutive reads are
+version-monotonic per the selector's sequence); the recovering writer reads the GOOD
 copy to reconstruct (never guesses); the partial write is discarded, the
 sequence is force-advanced, and readers never see an
 indefinite odd state; during the odd state readers
@@ -6451,10 +6519,23 @@ was an operative choice with no complete predicate or
 ACK contract for either: frame 45 carries the floor,
 is legal to SEND or APPLY only at retirement-extension
 ≥ 2 (BIT 6 AND BIT 7 active, sharing the 42/43/44
-predicate), and is ACKed by the same per-authority
-high-water vector discipline as frame 43 (an
-`LEDGER_ACK` whose vector slot covers the floor's
-authority); and the merge is TRANSACTIONALLY
+predicate), and is ACKed EXACTLY (v9.9.54.35,
+round-80 Codex H4: reusing frame 43's per-authority
+SCALAR high-water slot makes a delayed ACK for
+`{RG1:10, RG2:5}` indistinguishable from
+acknowledgement of a later `{RG1:10, RG2:9}` vector —
+permitting premature RG2 compaction and later
+reapplication of `Active(R8)`: the floor sync's ACK
+is frame 46 `FLOOR_SYNC_ACK` =
+`(authority_incarnation u64, target_incarnation u64,
+floor_sync_id u64, vector_digest u64)` — the
+`floor_sync_id` is a monotone id per sync from the
+issuing authority, and the `vector_digest` is the
+BLAKE2s-64 of the exact `(rg_id, rg_incarnation,
+contiguous_high_water)` vector bytes it acknowledges
+(an ACK whose digest mismatches the pending sync is
+discarded — a delayed ACK for a superseded vector
+never authorizes anything); and the merge is TRANSACTIONALLY
 FLOOR-FIRST (on receipt of a floor sync: FIRST advance
 the floors AND retire every covered Active record (an
 already-applied `Active` fence at or below the merged
@@ -6587,7 +6668,24 @@ ATOMICALLY TRANSFERS to the discovered RG's permit
 after the lookup (one CAS — the intent moves from the
 global registry into the RG's permit set, so the
 RG3-drain sees the holder from the moment of
-discovery); EVERY upsert carries the drain-generation
+discovery) — and the transfer CAS validates the LOOKUP'S
+generation (v9.9.54.35, round-80 Codex B1 + round-80
+SMR F1: the lookup-then-transfer order has the same
+trace one level up — today's shared lookup clones and
+unlocks (`shared_ops.rs:482`), materialization occurs
+later (`session_glue/mod.rs:1157`): P looks up RG3/E1
+under generation G, RG3 observes no attributed permit
+and lifts G→G+1, then P transfers into the CURRENT
+G+1 — its G+1 upsert check SUCCEEDS using the pre-lift
+E1: the lookup CAPTURES the RG's drain generation at
+clone time (in the same read that clones the entry),
+and the transfer is ONE CAS validating `{global intent,
+discovered RG, lookup generation G, drain still open at
+G}` — a lift between lookup and transfer fails the CAS
+and the packet DROPS (never transfers into a lifted
+generation); the entry is usable ONLY after the
+transfer CAS succeeds (never between lookup and
+transfer); EVERY upsert carries the drain-generation
 check (a lift between intent and upsert fails the
 upsert's check — the packet DROPS, never "permits
 lift"; `session_glue/mod.rs:1092` and `:1157` and
@@ -7020,8 +7118,17 @@ drives the bulk — so readiness never clears ahead of the
 armed repair); the
 negotiated feature state being PER-CONNECTION (v9.9.48,
 round-51 SMR F3: it never persists across connections — a
-reconnect re-runs the full negotiation (hello, proof,
-wrapper, CONFIRM) before any feature enables, so there is
+reconnect re-runs the full negotiation PER ITS PROOF
+VERSION (v9.9.54.35, round-80 Codex H5 — "re-runs ...
+(hello, proof, wrapper, CONFIRM)" read as if every
+reconnect runs a CONFIRM: the v2-proof branch runs
+hello pair → `AUTH_PROOF_v2` → wrapper (records in the
+transcript — no CONFIRM exists); the v1-proof branch
+runs hello → `AUTH_PROOF(nonce)` → wrapper →
+`CAPABILITY_CONFIRM`; and the v0-recordless case runs
+no capability exchange at all (the first ordinary frame
+commits the class) — the matrix is the sole normative
+sequence) before any feature enables, so there is
 no cross-connection feature memory to race a downgrade);
 "post-authenticated" meaning concretely (v9.9.54.27,
 round-72 Codex M7 — this paragraph previously described a
@@ -8542,7 +8649,11 @@ admitted interval):
   (id, length); record = (authority_incarnation,
   retirement_generation, target_incarnation, state,
   scope_count, (rg_id, rg_incarnation) × count); frame
-  43 LEDGER_ACK = 16 bytes; compaction below the
+  43 LEDGER_ACK = (target_incarnation u64,
+  authority_count u8, (authority_incarnation u64,
+  high_water u64) × authority_count) — a per-authority
+  high-water VECTOR (v9.9.54.35, round-80 Codex H4 —
+  "16 bytes" predated the vector grammar); compaction below the
   acknowledged high-water; the rg_incarnation is
   AUTHORITY-ISSUED, config-carried, and consistent
   across frame 41, the scope hash, frame 42, and every
@@ -8704,6 +8815,46 @@ admitted interval):
   activates with a queued mint); standalone is
   self-authority; the peer-down queue/status is
   explicit (show cluster mint-status + alarm));
+  (d31) v9.9.54.35 boundaries (round-80 Codex B1/B2/B3/H4/H5/H6/H7
+  + round-80 SMR F1-F7): the transfer CAS validates the
+  LOOKUP'S generation (the lookup CAPTURES the RG's
+  drain generation at clone time; the transfer is ONE
+  CAS validating {global intent, discovered RG, lookup
+  generation G, drain still open at G} — a lift between
+  lookup and transfer fails the CAS and the packet
+  drops; the entry is usable ONLY after the transfer
+  CAS succeeds); the atomic ACTIVE-COPY SELECTOR (a
+  third cell (active_copy, sequence) — the writer
+  writes A, checksums, writes B, checksums, and flips
+  the selector LAST (the flip is the commit); a reader
+  reads the selector FIRST, then the selected copy
+  (validating its checksum); a dead writer leaves the
+  selector at the OLD copy — always deterministic; a
+  reader's consecutive reads are version-monotonic);
+  the full RootRef tag normative everywhere (the
+  5496/5596 clauses swept); the COUNTED predecessor
+  vector in frames 41 and 42 ((supersedes_count,
+  (authority_incarnation, retirement_generation) ×
+  count) — a merged replacement correlates ALL of its
+  predecessors; count=0 = genuinely new); frame 46
+  FLOOR_SYNC_ACK = (authority_incarnation,
+  target_incarnation, floor_sync_id, vector_digest) —
+  the ACK's digest must match the pending sync (a
+  delayed ACK for a superseded vector never authorizes
+  anything); the §9 frame-43 '16 bytes' corrected to
+  the vector grammar; the "every reconnect runs
+  CONFIRM" site scoped per branch (7086); ONE shared
+  mint preflight across plain/confirmed/bootstrap paths
+  with the candidate-bound MONOTONE lease token
+  re-validated inside the promotion (a stale token
+  fails the promote VISIBLY — A's I1 can never promote
+  over B's I2); and the RG0-authoritative BACKFILL
+  (before BIT 6/7 activates on an upgraded deployment,
+  the minter backfills an incarnation for every
+  existing RG — persisted in config and ACKed by the
+  peer; a missing identity is fail-closed (the
+  extension's activation waits for the ACK, visible in
+  the backfill-status display));
   the pending-rejection GC wakeup
   re-opens admission with readiness degraded); same-fabric
   token supersession (C2 installs → T1 revoked before the slot
