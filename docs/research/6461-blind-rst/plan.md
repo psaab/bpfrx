@@ -4106,7 +4106,30 @@ BLOCKED during a partition (a node that cannot confirm
 RG0-primary contact cannot mint — a config apply
 creating a NEW RG queues the mint until contact
 restores (existing RGs continue normally; the block is
-operator-visible)); and an incarnation MISMATCH on
+operator-visible)) — with the mint authorization
+LINEARIZED BEFORE store promotion (v9.9.54.34,
+round-79 Codex M7: current authority is only
+LOCALLY OBSERVED RG0 state (`daemon_ha_sync.go:318`),
+heartbeat loss marks the peer absent and triggers
+single-node election (`heartbeat_manager.go:404`), and
+the config persists at `daemon_apply_commit.go:194` —
+two partitioned nodes can both consider themselves
+RG0-primary and mint different incarnations, or the
+config can become ACTIVE before its queued mint
+completes: the pre-persistence callback at
+`daemon_apply_commit.go:194` validates the mint's
+authority via an authenticated peer-contact/lease
+check BEFORE store promotion — a config whose mint
+cannot be authorized (a partition, or an expired
+lease) FAILS THE APPLY VISIBLY (it never activates
+with a queued mint; the queued mint's completion is
+reported through the same mint-status display); a
+STANDALONE deployment (no `/etc/xpf/node-id`) is its
+own authority (self-mints — no block ever, round-79
+SMR F4); and the peer-down queue/status is explicit
+(`show cluster mint-status` plus an alarm on any apply
+attempt during the block, so an operator's ISSU plan
+is never silently surprised)); and an incarnation MISMATCH on
 convergence is a QUIESCED remove/re-add transaction
 (the mismatched RG is fenced whole-incarnation,
 removed, and re-added under the authority's incarnation
@@ -4228,7 +4251,30 @@ shows the pending replacement and its union); the
 redrive fires when the extension re-negotiates to the
 required version (the wake-on-activation discipline
 covers it — the union resolves through the atomic
-completion); and the exact operator-visible resolution
+completion) — and a pending record interacts with a
+NEWER retirement by ONE ordered supersession
+transaction (v9.9.54.34, round-79 Codex H5 + round-79
+SMR F1: the operator issues G2 for the same target
+while G1 sits pending through a downgrade — B applied
+G1's F2+T(F1) with its ACK lost, and three bad rules
+were available (replace G1 in place, only-unsent
+replaceable, or call G1 stale): the newer retirement's
+record NAMES and COVERS every predecessor's namespace
+explicitly (the supersession evaluates at the store
+BEFORE any redrive — G1 participates in supersession
+exactly like a fresh record: equivalent scope → G2
+supersedes G1 atomically (G2's record names G1's
+namespace, and G1's union state resolves THROUGH G2's
+completion — G1's own redrive never fires); different
+scope → the two MERGE per the H7 rule into ONE
+replacement at the max generation covering the merged
+scope (never two concurrent replacements); a
+predecessor whose scope is NOT covered by G2 FINISHES
+FIRST (idempotently — its union completes through its
+own path) before G2 activates; and a superseded
+pending record's completion correlation is preserved
+by the successor naming it (never lost, never
+duplicated)); and the exact operator-visible resolution
 path while pending is the operator-confirmed clear
 (the same class as `CommitUncertain`'s peer-absent
 clear — the operator completes or rolls back the union
@@ -5490,7 +5536,37 @@ worker-liveness (the reclaim CASes `PREPARING →
 EXPIRED` and cleans the dead candidate's unique shadow
 space CANDIDATE-CONDITIONALLY — only the dead
 candidate's shadows, never the incumbent's or a
-competing live candidate's); the incumbent is preserved
+competing live candidate's) — and the cleanup is itself
+recoverable (v9.9.54.34, round-79 Codex B3 + round-79
+AGY T1: the v9.9.54.33 machine ended at `EXPIRED`
+while the cleanup spans multiple fallible map
+operations (`bpf_map/mod.rs:48`), and current deletes
+even DISCARD errors (`bpf_map/mod.rs:600`): W1 stalls;
+W2 CASes to `EXPIRED`, cleans one domain, then
+terminates — if new preparation waits, the family is
+stranded; if it proceeds, W1's orphan shadows and later
+resumed writes remain unowned, exhausting shadow
+capacity: `EXPIRED` transitions to a LEASED,
+takeover-safe `CLEANING(cleaner, victim, ticket,
+progress)` state (per-domain progress is recorded in
+the root record itself; a cleaner that dies mid-clean
+is itself reclaimed by the next worker observing the
+cleaner's lease expiry — the clean RESUMES from the
+recorded progress, never restarts); a new `PREPARING`
+can begin only after `CLEANING` completes (the
+`CLEANING` state's presence blocks new reservations —
+a third worker cannot stage into space being deleted
+(round-79 AGY T1's W3-races-W4 trace — and by the
+per-candidate-unique-shadow construction (round-79
+SMR F2) a new candidate's space is disjoint from the
+victim's anyway, but the reservation must still wait
+for the terminal CAS); the terminal transition is a
+single `CLEANING → FREE` CAS (the root returns to
+free atomically — never a flag left mid-transition);
+and EVERY staging write validates the reservation
+generation (a write whose reservation generation is
+stale (its PREPARING was reclaimed) is REJECTED — a
+resumed dead owner's write can never land)); the incumbent is preserved
 throughout (staging never touches the incumbent's
 slot); the expected-root CAS validates only the flip — W2 and W3 can both observe E1/slot0, stage
 DIFFERENT candidates into slot1 with interleaved
@@ -5571,7 +5647,18 @@ odd-writer recovery is explicit (a writer sets a
 writer-intent flag with a deadline BEFORE the odd
 increment; a writer that dies mid-write (odd
 sequence) is recovered by the next writer observing
-the deadline — the partial write is discarded, the
+the deadline — and the recovery never needs a
+preimage (v9.9.54.34, round-79 Codex B2: "discard the
+partial write" without a stable preimage or
+double-buffered payload leaves no reconstructable
+incumbent — a writer can update `active_cohort_id`,
+terminate before `version`: the root record lives in
+TWO physical copies (A/B), each with its own checksum;
+the writer writes copy A, checksums it, then copy B;
+a reader validates the checksum and falls back to the
+other copy on mismatch (a torn write can never leave
+both copies bad); the recovering writer reads the GOOD
+copy to reconstruct (never guesses); the partial write is discarded, the
 sequence is force-advanced, and readers never see an
 indefinite odd state; during the odd state readers
 take the bounded slow path (never a drop, never an
@@ -5604,10 +5691,23 @@ traffic uses E1/P while replies and fragments miss the
 cohort, and a write barrier can order K writes but
 cannot make them atomic: the cohort's data values
 (session companions, NAT/wire aliases, fragment shards)
-carry ONLY the `cohort_id` tag (no independent commit
+carry ONLY the `(root_id, RootRef, cohort_id, version)`
+tags (v9.9.54.34, round-79 Codex B2 — "ONLY the
+`cohort_id` tag" left dependents unable to locate the
+root: `root_id` is a byte-exact family identity, but a
+BPF ARRAY is index-addressed (`lib.rs:317`) and
+arbitrary identities today use a hash map
+(`lib.rs:369`), so "locate the root directly by
+`root_id`" has no physical path: every dependent
+carries `RootRef = (slot u32, generation u32)` — the
+slot locates the record DIRECTLY (no directory
+lookup), and the slot record validates `(root_id,
+generation)` on every read (a recycled slot mismatches
+its generation and the validation fails — a collision
+can never alias); no independent commit
 state — they are consulted only THROUGH the root, and a
-lookup that starts at an alias follows the tag to the
-root and takes the ROOT's bit as the verdict); the
+lookup that starts at an alias follows the RootRef to
+the root record and takes the ROOT's bit as the verdict); the
 publication writes every dependency FIRST and flips the
 ROOT's bit LAST — ONE bit flip per cohort, atomic by
 construction (the publisher's ordering is explicit: an
@@ -6340,11 +6440,34 @@ restart loses the floor and a delayed `Active(R10)`
 can re-fence after R10's tombstone compacted: the
 water line is per RG entry and MONOTONE (it only
 advances; the merge takes the max per entry, never a
-whole-scope replacement); the floor rides frame 44 as
-a third record state (`Floor = 2`) or frame 45
-`FLOOR_SYNC` ((authority, target, entry_count,
-(rg_id, rg_incarnation, contiguous_high_water) ×
-count)); and an `Active`
+whole-scope replacement); the floor rides frame **45**
+`FLOOR_SYNC` = `(authority_incarnation u64,
+target_incarnation u64, entry_count u16,
+(rg_id u8, rg_incarnation u64,
+contiguous_high_water u64) × entry_count)` — the ONE
+encoding (v9.9.54.34, round-79 Codex H4 + round-79 AGY
+T2: the v9.9.54.33 "frame 44 `Floor = 2` OR frame 45"
+was an operative choice with no complete predicate or
+ACK contract for either: frame 45 carries the floor,
+is legal to SEND or APPLY only at retirement-extension
+≥ 2 (BIT 6 AND BIT 7 active, sharing the 42/43/44
+predicate), and is ACKed by the same per-authority
+high-water vector discipline as frame 43 (an
+`LEDGER_ACK` whose vector slot covers the floor's
+authority); and the merge is TRANSACTIONALLY
+FLOOR-FIRST (on receipt of a floor sync: FIRST advance
+the floors AND retire every covered Active record (an
+already-applied `Active` fence at or below the merged
+water line is ACTIVELY CLEARED — never merely
+future-rejected: the merge's first step clears it,
+with the transition operator-visible), THEN admit only
+records ABOVE the merged floor — a delayed
+`Active(R10)` that arrives before the floor sync is
+held (never applied out of order: the ledger
+application pipeline applies a floor sync before any
+pending active records from the same peer
+(`sync_conn_read.go:93`), so the pre-convergence floor
+can never validate a stale Active)); and an `Active`
 record arriving at or below the applicable floor is
 REJECTED (never re-fences — a delayed ledger whose
 Active R10 arrives after R10's tombstone compacted is
@@ -6447,10 +6570,39 @@ after the proof ends, it never revokes G (the
 materialize at `session_glue/mod.rs:1157` upserts
 directly, and the check-versus-insert is not atomic
 with Go's CAS): every admission/materialization path
-takes the helper-owned per-RG PERMIT at packet entry
-(BEFORE the shared lookup) and holds it through the
-upsert — the permit registers the packet in the
-drain's in-flight set from before the lookup, and the
+takes a PRE-LOOKUP GLOBAL INTENT at packet entry
+(v9.9.54.34, round-79 Codex B1 + round-79 AGY T3 — the
+v9.9.54.33 "permit BEFORE the shared lookup" is
+unselectable: `SessionKey` contains no RG (`key.rs:10`),
+the RG is learned from the returned entry's metadata
+AFTER `lookup_session_across_scopes` (`shared_ops.rs:594`,
+`entry.rs:24`), and the existing index is `RG → keys`,
+not `key → RG` (`types/mod.rs:39`): a packet acquires an
+ingress-RG1 permit, resolves a shared RG3 entry, RG3's
+drain observes no holder and lifts, then the packet
+materializes RG3 through the unconditional upsert
+(`session_glue/mod.rs:1092`): the packet registers a
+GLOBAL intent at entry (before the lookup); the intent
+ATOMICALLY TRANSFERS to the discovered RG's permit
+after the lookup (one CAS — the intent moves from the
+global registry into the RG's permit set, so the
+RG3-drain sees the holder from the moment of
+discovery); EVERY upsert carries the drain-generation
+check (a lift between intent and upsert fails the
+upsert's check — the packet DROPS, never "permits
+lift"; `session_glue/mod.rs:1092` and `:1157` and
+`install.rs:179` validate the generation on every
+insert); a permit older than its deadline is revoked
+(its packet drops — it never resumes, and a revoked
+permit's resume path is gated by the same
+generation check (a slow-path packet
+(`slow_path.rs:213`, `inspect.rs:1455`) that resumes
+after revocation fails the check and drops — never
+polluting the new generation's table)); and a
+NON-COOPERATIVE holder ABORTS the proof (a holder that
+neither completes nor releases by deadline does NOT
+get its permit silently lifted — the drain aborts
+(fail-closed, operator-visible), never lifts); and the
 drain's `PREPARED` requires EVERY held permit drained
 (a paused packet's permit blocks `PREPARED` until the
 packet completes its upsert (joining the watermark) or
@@ -8274,7 +8426,12 @@ admitted interval):
   the latest non-tombstoned receipts; the co-holder
   count is derived, never an independent counter); the
   proof-version × repair-version commit matrix ((v1-proof,
-  any class) → CONFIRM commits (+ decision echo for v2);
+  v0-recordless) → commits at the first ordinary frame;
+  (v1-proof, recorded (v0-record, v1, v2)) → CONFIRM
+  commits (+ decision echo for v2) (v9.9.54.34, round-79
+  Codex H6 — "(v1-proof, any class) → CONFIRM" omitted
+  the recordless-v0 row and read as if every v1-proof
+  branch needed a CONFIRM);
   (v2-proof, v0/v1) → commits AT the proof-verified
   transcript (records authenticated by construction);
   (v2-proof, v2) → proof + DECISION+ACK); the keyed
@@ -8412,8 +8569,13 @@ admitted interval):
   family identity — canonical forward key PLUS ingress
   scope (key.rs:10's bare tuple is insufficient,
   flow_cache.rs:980); staging is gated on a per-root
-  PUBLICATION RESERVATION (per-root mutex or
-  PREPARING(owner, candidate, unique-shadow) CAS — the
+  PUBLICATION RESERVATION (the ONE PREPARING CAS on the
+  root record — never a mutex (v9.9.54.34, round-79 Codex
+  B3: the "per-root mutex or" alternative is retracted —
+  with the full PREPARING → EXPIRED → CLEANING(leased,
+  takeover-safe, per-domain progress) → FREE machine and
+  reservation-generation validation on every staging
+  write); the
   winner stages only into its own unique shadow space,
   the loser's cleanup is candidate-conditional); bit 7
   = retirement-extension-v2 with the frame split
@@ -8486,8 +8648,11 @@ admitted interval):
   install" → BEFORE slot install); and the transmitted
   floor state ((authority, target, rg_id,
   rg_incarnation) → contiguous_high_water, monotone
-  merge (max per entry); frame 44 gains Floor = 2 or
-  frame 45 FLOOR_SYNC; an Active record at or below
+  merge (max per entry); frame 45 FLOOR_SYNC carries
+  the floor (the ONE encoding (v9.9.54.34 — the
+  "frame 44 Floor = 2 or frame 45" choice is settled
+  on frame 45 with the floor-first transactional
+  merge); an Active record at or below
   the water line is REJECTED);
   the pending-rejection GC wakeup
   re-opens admission with readiness degraded); same-fabric
