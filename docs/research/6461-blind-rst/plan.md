@@ -949,7 +949,10 @@ Today `lookup_with_origin` marks the matched entry inside its `&mut`
 borrow, then propagates post-borrow. Validation needs the FORWARD entry's
 anchor even when the matched entry is the reverse companion — a second
 probe that cannot happen inside the first borrow. Restructure (close
-segments only; the no-close path is byte-identical):
+segments only; the no-close path is byte-identical **for NON-PROBATION
+entries** — probation entries take the deferred-refresh path of §5.6,
+round-88 Codex 1: no in-borrow `last_seen_ns` stamp, timeout recompute,
+or wheel push before final admission):
 
 1. In-borrow: compute `do_close` (flag check) as today; capture
    `actual_key` + `nat` (already captured for propagation). **Do not mark
@@ -1154,6 +1157,32 @@ the family clock is cut machinery (§10.6), and with it that coupling —
 probation is per-entry state only). (Phase 2 §10.5's wire-carried anchor
 makes this site validatable; until then every materialize-seed close is
 refused by construction.)
+
+**Probation lookup does NOT refresh (v10.5.0, round-88 Codex 1):**
+master's in-borrow lookup stamps `last_seen_ns`, recomputes
+`expires_after_ns`, and re-queues the wheel (`lookup.rs:146-156,
+:214-218`) BEFORE the input filter (`poll_descriptor/mod.rs:592`) or
+the TTL check (`poll_descriptor/mod.rs:846`) consume the packet — so
+under a naive "byte-identical non-close path" a blind
+filtered/TTL-dropped non-close packet would refresh the zombie's clock
+on every try and pin it indefinitely (and pinned materialized entries
+pressure the admission ceiling: synced upserts bypass `max_sessions`,
+`install.rs:294`, while fresh installs refuse, `install.rs:113`). The
+rule: for a probation entry, the in-borrow lookup SKIPS the
+`last_seen_ns` stamp, the `expires_after_ns` recompute, and the wheel
+push (the ≤20 s probation clock runs unextended); `touch_if_stale` on
+the cache-hit path (`flow_cache_hit.rs:295` → `session/mod.rs:1118`)
+likewise skips probation entries (a cache-hit packet that drops at
+MTU/egress after the touch must not refresh). Only the matched entry's
+SUCCESSFUL final-admission commit hook — the same commit arms the
+anchor hooks ride — clears `probation` AND applies the ordinary
+established refresh (stamp `last_seen_ns`, recompute the ordinary
+established/per-app timeout, wheel push) in one write; a packet that
+drops anywhere before final admission (input filter, TTL, output
+filter/CoS, redirect-inbox capacity, cache-tail) never clears and
+never refreshes. The §5.5 "non-close path byte-identical" statement is
+qualified accordingly: byte-identical for NON-PROBATION entries;
+probation entries take this deferred-refresh path.
 
 **Primary-install context (site 3 supplement):** the self-authenticating
 provenance is `(origin, FreshPrimary)` — the `LocalMiss` installer can
@@ -1369,14 +1398,17 @@ untouched.
   calls are the pre-existing #6522 class, §10.6.1) — and the probation
   constructor must not multiply its trigger rate.
 - **Hot-path discipline:** zero new allocations; zero new atomics; the
-  per-TCP-data-packet cost at the commit-arm anchor hook (riding the
-  same probe the #2501 accounting already performs) is one
+  per-TCP-data-packet cost at the commit-arm anchor hook (a DISTINCT
+  final-admission apply point from the pre-admission #2501 accounting
+  call, §5.2) is one
   8-byte read + ≤2 gated stores; closing segments add one table probe on a
   path that already takes the full slow path. `SessionEntry` grows 40 B
   (+1 B probation) — slab is uniform, UDP/ICMP entries carry it unused.
 - **Borrow shape:** close-path validation and marking happen post-borrow in
   the existing propagation phase; no new cross-`&mut` aliasing; the
-  non-close path's borrow structure is byte-identical.
+  non-close path's borrow structure is byte-identical for NON-PROBATION
+  entries (probation entries skip the in-borrow refresh/recompute/wheel
+  and take the deferred-refresh commit-hook path, §5.6).
 - **GRE/frame identity:** all frame reads use the ACTIVE `packet_frame`;
   seg_len from IP-declared lengths with frame clamping.
 - **Fragments:** non-first fragments stay flowless (#2344); the helper
@@ -1457,7 +1489,24 @@ untouched.
   retry byte-for-byte (the v7.5-era never-transmit-stale hardening is a
   follow-up candidate, §10.6.2 — the round-84 review sketched its
   correct typed-outcome shape, and the v10.1 attempt at it here
-  generated four BLOCKERs of local machinery for zero gate benefit).
+  generated four BLOCKERs of local machinery for zero gate benefit);
+  **(e) the transient-seed zero-producer (v10.4.0, stated):** an
+  accepted close whose mark lands on a `MissingNeighborSeed` (the hit
+  path's matched entry, or the reverse-synth accept's forward family)
+  reaps at 2 s with NO Close delta — master's exact behavior
+  (`expire.rs:342-350`'s exclusion); HA-safe by construction (seeds
+  emit no Open → no peer copy exists to orphan); **(f) the stale-alias
+  trace:** a seed's reap releases its NAT (the unconditional cleanup,
+  §10.6.1's #6522 class) but never removes the install-published
+  shared/DNAT aliases (`poll_descriptor/mod.rs:4823, :4879`) — a stale
+  shared seed can later be materialized with a released/reassigned
+  translation, on master today; **(g) the stub-metadata gap:** a
+  seed-born flow keeps the `build_missing_neighbor_session_metadata`
+  stub (policy 0, logging false, `inactivity_timeout_ns=None`,
+  `neighbor_dispatch.rs:606`) for its whole life on master — a per-app
+  flow admitted at 3600 s still reaps at the global 300 s. (e)-(g) are
+  PRE-EXISTING, outside this issue's blast radius; their completion is
+  the §10.6.2 follow-up with the round-86 design notes.
 
 ---
 
@@ -1542,13 +1591,24 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   reply re-synthesizes and revalidates); site 2c refuse → install ALIVE
   at the probation timeout with `closing=false, reset=false`; site 2c
   with a non-close attacker packet → untrusted samples only.
-- **Probation two-branch (both directions):** (a) a blind non-close
-  packet that is FILTERED/TTL-dropped: probation untouched (no clear, no
-  refresh, no Open, no replication); (b) a blind non-close that COMMITS:
+- **Probation two-branch (both directions, all drop classes — v10.5.0,
+  round-88 Codex 1):** (a) a blind non-close
+  packet that is FILTERED (input), TTL-dropped, output-filter/CoS-
+  dropped, redirect-inbox capacity-discarded, or cache-tail-dropped:
+  probation untouched — no clear, NO REFRESH (the in-borrow lookup
+  skips the `last_seen_ns` stamp / `expires_after_ns` recompute / wheel
+  push for probation entries; `touch_if_stale` skips them too), no
+  Open, no replication — the ≤20 s clock is NEVER extended by an
+  uncommitted packet, so repeated blind packets cannot pin the zombie
+  (the admission-ceiling pressure bound: pinned zombies age out on the
+  unextended clock; synced-upsert cap bypass at `install.rs:294` vs
+  fresh-install refusal at `install.rs:113` asserted in the test); (b)
+  a blind non-close that COMMITS:
   probation clears exactly once AT THE MATCHED ENTRY (forward-key AND
   reverse-key materialized entries each covered — the clear is not
-  routed through the anchor's forward hop), ordinary established idle
-  refresh, at most one
+  routed through the anchor's forward hop) AND the ordinary established
+  refresh (stamp + recompute + wheel push) lands in the same write at
+  the commit hook, at most one
   promote/Open/replication, and subsequent hits do NOT re-promote; no
   accelerated reap and no close mark in either branch; zombie reap at
   ≤20 s (and never beyond the imported entry's own shorter per-app
@@ -1583,7 +1643,14 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   the SOLE decision object asserted across install, publication,
   buffering, replay, AND the reinjection epilogue
   (`poll_descriptor/mod.rs:5126` → `slow_path.rs:199`); the upstream
-  pipeline (screens, lookup) does not re-run; (d) a genuine top-level
+  pipeline (screens, lookup) does not re-run; (c2) sole-decision
+  consumption at the two remaining consumers (round-88 Codex 2): an
+  RWoLB `ForwardCandidate` inserts the FRESH `P2` into the flow cache
+  (`poll_descriptor/mod.rs:3900` — a stale `P1` cache entry would make
+  later ACKs emit `P1`), and an RWoLB `MissingNeighbor` at session
+  capacity rolls back with the FRESH `P2`
+  (`poll_descriptor/mod.rs:4890` → `nat/source.rs:781` — passing stale
+  `P1` leaks `P2`); (d) a genuine top-level
   MISS with a bare
   close still drops at the #4400 guard before the arm (`SeedRefused`);
   (e) a miss with SYN|close combo still seeds from raw flags
@@ -1652,8 +1719,12 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   FabricRedirect + reap` → no delta, no owner/shared deletion; blind
   first-packet close on a promotable import → no mark, no promote, no
   delta, install-alive at probation; accepted hit-path close → exactly
-  one Close delta (companion propagation unchanged); reverse-synth
-  accept → forward family marked → forward emits at 2 s; refused close
+  one Close delta (companion propagation target-reciprocity-gated)
+  UNLESS the marked entry is a transient `MissingNeighborSeed` (the
+  documented §7 race (e) carve-out: mark lands, 2 s reap, no delta, no
+  peer copy exists to orphan); reverse-synth
+  accept → forward family marked → forward emits at 2 s (same
+  transient-seed carve-out); refused close
   → master's ordinary-timeout emission semantics bit-identical.
 - **Observability:** `tcp_close_seq_rejected` visible via the worker
   statistics surface (production build); the rate-limited structured
@@ -1807,31 +1878,6 @@ this branch only if the minimal fix proves insufficient.
   v10.2.0/v10.3.0 attempt at the simple version of this completion
   generated all four BLOCKERs — do not retry it without the full
   design.
-- **Seed-class lifecycle gaps (v10.4.0 — the second retreat):**
-  (e) the transient-seed zero-producer: an accepted close whose mark
-  lands on a `MissingNeighborSeed` (the hit path's matched entry, or
-  the reverse-synth accept's forward family) reaps at 2 s with NO Close
-  delta — master's exact behavior (`expire.rs:342-350`'s exclusion);
-  HA-safe by construction (seeds emit no Open → no peer copy exists to
-  orphan); (f) the stale-alias trace: a seed's reap releases its NAT
-  (the unconditional cleanup, §10.6.1's #6522 class) but never removes
-  the install-published shared/DNAT aliases
-  (`poll_descriptor/mod.rs:4823, :4879`) — a stale shared seed can
-  later be materialized with a released/reassigned translation, on
-  master today; (g) the stub-metadata gap: a seed-born flow keeps the
-  `build_missing_neighbor_session_metadata` stub (policy 0, logging
-  false, `inactivity_timeout_ns=None`, `neighbor_dispatch.rs:606`) for
-  its whole life on master — a per-app-timeout flow admitted at 3600 s
-  still reaps at the global 300 s. All three are PRE-EXISTING, outside
-  this issue's blast radius, and their completion is the §10.6.2
-  follow-up with the round-86 design notes (count-at-admission,
-  compare-and-transition publication, a process-local collision-free
-  alias-owner token with serialized conditional deletion, admitted-
-  metadata preservation). The v10.2.0/v10.3.0 attempt to complete them
-  here generated round-86's four BLOCKERs (admission bypass,
-  publication overwrite, id collisions + TOCTOU, stub metadata) — the
-  same unfold pattern as rounds 13-82, and the same retreat answer.
-
 ---
 
 ## 11. Open questions for the convergence round (v10.4.1)
@@ -1840,7 +1886,8 @@ this branch only if the minimal fix proves insufficient.
    Part-B rules (closing-never-promote ×2, constructor gating with
    probation + local-only probation reap, normative mark-creation with
    master's emission gate unchanged, the site-9 typed-outcome gate with
-   the clean pre-SNAT baseline, the 2b scope/identity discipline, the
+   the `ResolvedWithoutLocalBacking` cold/miss re-entry, the 2b
+   scope/identity discipline, the
    reverse-hit family reciprocity check, the propagation-target
    reciprocity gate) close the issue and its HA teeth. The machinery is
    cut, not hidden (§10.6); the seed-lifecycle gaps are documented
