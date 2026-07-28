@@ -1,7 +1,7 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.4.1 — THE TERMINAL CUT, round-87 folds (purged class
-re-enters the cold/miss pipeline from the packet; editorials). Ship
+**Status: DRAFT v10.5.0 — THE TERMINAL CUT, round-88 folds (probation
+lookup defers refresh to the commit hook; editorials). Ship
 candidate = the Part-A dataplane demote gate plus the wire-free local HA
 rules. The RG-incarnation/retirement/fence-ledger protocol that rounds
 13–82 grew is KILLED (not deferred): its two customers are re-scoped —
@@ -18,7 +18,11 @@ THE SECOND RETREAT: seed-lifecycle completion retracted v10.4.0;
 accepted round 87); SMR NO (2nit — folded in-revision). Round-87: AGY
 YES; Codex NO (2B/1L + editorials — the purged class now re-enters the
 cold/miss pipeline from the packet, sole-decision end-to-end; folded
-here).**
+v10.4.1). Round-88: AGY YES (6th consecutive); Codex NO (1B/1L +
+editorials — the probation lookup's pre-filter refresh would pin
+zombies; the in-borrow refresh/recompute/wheel now skips probation
+entries and the clear+refresh rides the matched entry's commit hook;
+folded v10.5.0).**
 
 The 82-round arc in one paragraph: the packet-level plausibility gate has
 been stable since v6 — refuse-demote on no trusted baseline, per-field
@@ -1880,7 +1884,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.4.1)
+## 11. Open questions for the convergence round (v10.5.0)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
@@ -1908,7 +1912,7 @@ this branch only if the minimal fix proves insufficient.
    pre-existing, (ii) the zero-producer case carrying no HA consequence,
    and (iii) two reviewed attempts producing cascades? Trace the
    ISSUE-class harm, or the retreats stand.
-3. **Round-86/87 fold verification:** (a) `ResolvedWithoutLocalBacking`
+3. **Round-86/87/88 fold verification:** (a) `ResolvedWithoutLocalBacking`
    re-enters the cold/miss pipeline from the packet (as if the resolve
    had returned `None`) — is the sole-decision rule airtight across
    install, publication, buffering, replay, AND the slow-path
@@ -1920,7 +1924,11 @@ this branch only if the minimal fix proves insufficient.
    occupant B dead in both directions, with positive coverage for
    SNAT/hairpin/NPTv6/NAT64 families? (c) the `account_packet` wording
    (counters unchanged; anchor rides the distinct post-admission hook)
-   — consistent everywhere now (§5.2, §5.8, §7)?
+   — consistent everywhere now (§5.2, §5.8, §7)? (d) the probation
+   deferred refresh (round-88) — is any pre-commit refresh/requeue
+   path left for a probation entry (lookup, `touch_if_stale`, promote,
+   materialize refresh), and does the commit-hook clear+refresh cover
+   every admission arm?
 4. **The emission posture:** master's `expire.rs:342-350` gate is
    UNCHANGED; the additions are the normative mark-creation rules, rule
    5, the reverse-synth forward-family mark, the site-9 producer-
