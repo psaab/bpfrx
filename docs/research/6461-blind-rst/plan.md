@@ -568,13 +568,17 @@ request-build stage:
   (uncounted), publication, retry, and expiry are all byte-identical to
   master. What the demote gate needs from the seed corner is only the
   site-9 typed-outcome gate (no raw-flags replace of a live/marked
-  entry — §3 site 9) and the `ResolvedWithoutLocalBacking` clean
-  baseline (below); both stay.
+  entry — §3 site 9) and the `ResolvedWithoutLocalBacking` cold/miss
+  re-entry (below); both stay.
   (iv) **`ResolvedWithoutLocalBacking` RE-ENTERS the cold/miss pipeline
   from the packet (v10.4.1, round-86 Codex 1 + round-87 Codex 1/2):**
   the purged class is treated as a genuine miss END-TO-END in the
-  strongest sense: the packet goes through the cold/miss pipeline
-  exactly as if the resolve had returned `None` — pre-routing DNAT,
+  strongest sense: the packet goes through the POST-RESOLVE
+  miss-decision pipeline exactly as if the resolve had returned `None`
+  (re-entry is at the miss-decision stage — zones, pre-routing DNAT,
+  policy, SNAT, guard, install; the upstream packet pipeline — screens,
+  flow parse, session lookup — does NOT re-run, so no screen counter or
+  lookup side effect double-fires) — pre-routing DNAT,
   routing, zone, policy, and SNAT all derive FRESH from the packet
   against CURRENT config, and the resulting miss-derived decision is
   the SOLE decision object for install, publication, buffering, replay,
@@ -1570,10 +1574,17 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   never replaced, the sole producer survives to its 2 s reap and emits
   exactly one Close delta; (c) `ResolvedWithoutLocalBacking`
   (transient-purged backing, `session_glue/mod.rs:1178-1193`): a bare
-  close DROPS at the #4400 guard (no install, no seed), a SYN/data
-  packet runs the FULL seed transaction including the deterministic
-  pool reacquire (`allocator.rs:1265`) — master's reverse-backing
-  restoration preserved; (d) a genuine top-level MISS with a bare
+  close DROPS at the #4400 guard (no install, no seed); a SYN/data
+  packet re-enters the post-resolve miss-decision pipeline — DNAT port
+  remaps preserved (`destination.rs:699`), `P2 != P1` installs the
+  OWNED `P2`, current-rule-no-longer-matches yields no translation, and
+  the deterministic persistent reacquire (`allocator.rs:1265`) still
+  reacquires `P1` through the allocator; the miss-derived decision is
+  the SOLE decision object asserted across install, publication,
+  buffering, replay, AND the reinjection epilogue
+  (`poll_descriptor/mod.rs:5126` → `slow_path.rs:199`); the upstream
+  pipeline (screens, lookup) does not re-run; (d) a genuine top-level
+  MISS with a bare
   close still drops at the #4400 guard before the arm (`SeedRefused`);
   (e) a miss with SYN|close combo still seeds from raw flags
   (`SeedInstalled`, site-3 residual, self-anchoring invented tuple);
@@ -1602,14 +1613,19 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   (`NatDecision::reverse` + `reverse_session_key` round-trip all four) —
   a raw-NAT equality mistake that would skip a valid translated
   companion fails these tests.
-- **`ResolvedWithoutLocalBacking` clean baseline (round-86 Codex 1):**
-  the purged class's miss transaction discards the released `P1` before
-  derivation: `P2 != P1` case — the seed/aliases install with the OWNED
-  `P2` and later cleanup releases `P2` (no collision with `P1`'s new
-  owner, no leak); current-rule-no-longer-matches case — no
-  translation; persistent deterministic reacquire
-  (`allocator.rs:1265`) still reacquires `P1` through the allocator
-  (the owned path).
+- **`ResolvedWithoutLocalBacking` cold/miss re-entry (round-86 Codex 1
+  + round-87 Codex 1/2):** the purged class re-enters the post-resolve
+  miss-decision pipeline from the packet: `P2 != P1` case — the
+  seed/aliases install with the OWNED `P2` and later cleanup releases
+  `P2` (no collision with `P1`'s new owner, no leak);
+  current-rule-no-longer-matches case — no translation; DNAT
+  same-address port remap (`K.dst:443 → same-IP:8443`,
+  `destination.rs:699`) is preserved by full derivation (never stranded
+  on the stored decision's stale value); persistent deterministic
+  reacquire (`allocator.rs:1265`) still reacquires `P1` through the
+  allocator (the owned path); one decision object across install,
+  publication, buffering, replay, and reinjection (no P1/P2 split,
+  `poll_descriptor/mod.rs:5126` → `slow_path.rs:199`).
 - **Site-2b scope + identity (round-84 Codex 4):** a `Shared` match
   refuses even when the same canonical key is locally occupied; a Local
   match whose re-probed entry disagrees on key or NAT decision refuses
