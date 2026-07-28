@@ -1,7 +1,7 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.3.0 — THE TERMINAL CUT, round-85 folds (identity
-substrate + accounting-complete class transition). Ship candidate = the
+**Status: DRAFT v10.4.0 — THE TERMINAL CUT, round-86 folds + the SECOND
+RETREAT (seed-lifecycle completion retracted). Ship candidate = the
 Part-A dataplane demote gate plus the wire-free local HA rules. The
 RG-incarnation/retirement/fence-ledger protocol that rounds 13–82 grew is
 KILLED (not deferred): its two customers are re-scoped — the pre-existing
@@ -11,9 +11,15 @@ HA wire format, no schema, no public API (one additive Go worker-status
 decode field for the counter). Round-83: AGY YES; Codex NO (3B/1M/2L —
 folded v10.1.x); SMR NO (1L/5nit — folded v10.0.2). Round-84: AGY YES;
 Codex NO (4B/1H/1M — folded v10.2.0 incl. the pending-neighbor RETREAT,
-which round 85 ACCEPTED); SMR NO (2nit — folded v10.1.1). Round-85: AGY
-YES; Codex NO (4B — local identity/accounting folds here); SMR NO (2nit —
-folded in-revision).**
+accepted at round 85); SMR NO (2nit — folded v10.1.1). Round-85: AGY
+YES; Codex NO (4B — folded v10.3.0); SMR NO (2nit — folded
+in-revision). Round-86: AGY YES; Codex NO (5B/1H/1L — the flip's
+accounting/publication/identity layers, folded here by RETRACTING the
+seed-lifecycle completion: every gap it closed is pre-existing on
+master, and each fix opened the next layer, the same unfold pattern as
+rounds 13-82; the two demote-gate-correctness folds — clean pre-SNAT
+baseline for the purged class, propagation-target reciprocity — are
+KEPT).**
 
 The 82-round arc in one paragraph: the packet-level plausibility gate has
 been stable since v6 — refuse-demote on no trusted baseline, per-field
@@ -529,63 +535,58 @@ request-build stage:
   stale hardening is NOT shipped by this plan; it is a follow-up
   candidate (§10.6.2) whose correct design is the typed-outcome work
   round-84 sketched — not a prerequisite for the demote gate.
-  (iii) **the seed lifecycle is completed locally (v10.3.0, round-84
-  Codex 3 + round-85 Codex 2/3):**
-  any COMMITTED packet on a `MissingNeighborSeed` entry — a fresh
-  packet at its commit arm (slow-path OR cache-hit — a pure-ACK on a
-  cached seed flow flips at `flow_cache_hit.rs:312`'s arm too), or an
-  accepted validated close at its post-borrow mark application —
-  performs an idempotent in-place
-  **class transition** `MissingNeighborSeed → ForwardFlow` with FULL
-  accounting (v10.3.0 — the v10.2.0 bare flip crossed accounting
-  classes): (a) `session_limit_inc(src_ip, dst_ip)` fires AT the flip —
-  a forward seed is UNCOUNTED at install (`install.rs:226`:
-  `counted = !is_reverse && !is_transient_local_seed`), and the removal
-  sink decrements every non-transient forward (`session/mod.rs:1817`),
-  so the flip must add the entry to the counted class or the eventual
-  decrement corrupts the per-IP cap — the existing seed→SyncImport
-  class transition at `install.rs:555-562` is the exact in-tree
-  precedent (snapshot pre-flip class, flip, increment iff the flip
-  added the entry to the counted class); (b) the Open delta fires AT
-  the flip, exactly once — install emits NO Open for a seed (the
-  `counted && !is_peer_synced` gate at `install.rs:226-234`; site 9's
-  `session_creates` bump at `poll_descriptor/mod.rs:4889` is worker
-  telemetry, not an Open) — so the flip's Open is the flow's FIRST and
-  ONLY Open, carrying the entry's real `session_id` (#4915 node-unique)
-  and driving the ordinary locally-born publication/replication
-  (adopting, not duplicating, the install-published state — the shared
-  records' `session_id`/`generation` fields are updated from the
-  install-time zeros, `poll_descriptor/mod.rs:4811`, to the real
-  identity); (c) ordering for the accepted-close case: the mark
-  application pushes Open FIRST, then the mark (the 2 s reap's Close
-  follows in stream order — a coherent Open→Close lifecycle); (d) **the
-  identity substrate for cleanup (round-85 Codex 3):** the install-time
-  `session_id` (node-unique, `install.rs:143-148` — NOT the per-table
-  `install_epoch`, which collides across workers) is stamped on the
-  install-published shared/DNAT records (replacing the
-  `session_id = 0`/`generation = 0` writes at
-  `poll_descriptor/mod.rs:4811`), carried on `ExpiredSession`
-  (`entry.rs:337`), and compared at BOTH the seed-expiry alias cleanup
-  AND the flipped seed's Close drain (`session_delta.rs:420`): a stale
-  seed's cleanup runs ONLY when the alias's recorded `session_id`
-  matches the expiring entry's (a newer generation that reused the
-  key/NAT — even cross-worker — holds a different `session_id` and is
-  left untouched; key/NAT comparison alone cannot distinguish
-  generations, `shared_ops.rs:960`, `checksum.rs:246`); **legacy
-  zero-id records (published pre-upgrade or by a pre-upgrade peer) fall
-  back to master's key-based cleanup — the guard only ever ADDS
-  protection where a real `session_id` exists on both sides, never
-  removes master's cleanup behavior**; (e) **every**
-  `MissingNeighborSeed` expiry (flipped or
-  not, committed or not) additionally removes the shared/DNAT aliases
-  the install published (:4823, :4879) under that identity rule —
-  closing master's stale-shared-seed
-  materialize-with-released-translation trace. The retry's own
-  transmit (no table) does not flip; the next fresh packet or the
-  accepted close's mark does. **The flip is emission/accounting-only:**
-  no re-keying, no NAT change, no anchor change (the seed's FreshPrimary
-  trusted anchor carries forward), no re-validation of any prior
-  verdict.
+  (iii) **the seed class is documented, not completed (v10.4.0 — THE
+  SECOND RETREAT, round-86 Codex 2/3/4/6):** the v10.2.0/v10.3.0
+  seed-lifecycle completion (origin flip, flip-time `session_limit_inc`,
+  flip-time Open, `session_id`-guarded alias cleanup) is RETRACTED.
+  Round-86 review showed each layer of it opens the next (flip-time inc
+  bypasses the configured per-IP admission cap — `session_admission.rs:29`
+  is miss-only and `session_limit_inc` performs no check,
+  `session/mod.rs:909`; flip publication can overwrite a newer
+  generation or undo an HA demotion — publication is unconditional
+  replace, `shared_ops.rs:897`; `session_id` is not collision-free
+  cross-node — worker/counter namespacing at `session/mod.rs:766` +
+  import-adopted ids at `install.rs:324` + bulk-export zero ids at
+  `ha/export.rs:143` — and check/delete has no linearization point,
+  `shared_ops.rs:960`, `checksum.rs:246`, `xpf_maps.h:508`; the flipped
+  seed retains stub policy metadata and the wrong idle timeout —
+  `neighbor_dispatch.rs:606` hardcodes policy 0 / timeout None).
+  Closing those correctly needs count-at-admission, a
+  compare-and-transition publication, a process-local collision-free
+  alias-owner token with serialized conditional deletion, and metadata
+  preservation — the same unfold pattern as rounds 13-82 and the
+  pending-neighbor corner, in a class that is OUTSIDE this issue's
+  blast radius: **every seed-lifecycle gap is pre-existing on master**
+  (master's transient seeds never emit a Close — `expire.rs:342-350`'s
+  exclusion — and no HA peer copy exists to orphan because seeds emit
+  no Open; master's seed reaps never remove the install-published
+  shared/DNAT aliases — the stale-alias materialize-with-released-
+  translation trace exists on master today; master's seed-born flows
+  keep the stub metadata for life). The plan therefore documents the
+  class (§7 emission carve-out, §7 races (e)-(g), §10.6.2 follow-up
+  with the round-86 design notes) and changes NOTHING in the seed
+  lifecycle: `MissingNeighborSeed` install, metadata, accounting
+  (uncounted), publication, retry, and expiry are all byte-identical to
+  master. What the demote gate needs from the seed corner is only the
+  site-9 typed-outcome gate (no raw-flags replace of a live/marked
+  entry — §3 site 9) and the `ResolvedWithoutLocalBacking` clean
+  baseline (below); both stay.
+  (iv) **`ResolvedWithoutLocalBacking` gets a clean pre-SNAT baseline
+  (v10.4.0, round-86 Codex 1):** the purged class's miss transaction
+  must NOT start from the purged session's stored decision — the purge
+  released translation `P1` (`promote.rs:181`), the resolve still
+  returns it (`session_glue/mod.rs:1194`), and the left-biased
+  `NatDecision::merge` (`nat/mod.rs:123`) keeps `P1` over the fresh
+  allocation `P2` — installing seeds/aliases with an unowned `P1`
+  (colliding with `P1`'s new owner) while `live_by_flow` records `P2`
+  (which later cleanup then cannot release — a leak). The transaction
+  for this class recomputes NAT from a CLEAN miss baseline (the purged
+  decision's NAT is discarded before derivation, so the merge takes
+  `P2`; a current configuration that no longer matches SNAT yields no
+  translation) — the deterministic persistent-reacquire case
+  (`allocator.rs:1265`) still reacquires `P1` through the allocator,
+  which is the OWNED path. Tests cover `P2 != P1` and
+  current-rule-no-longer-matches, not only reacquisition.
 - **Residual (documented):** TX-completion failure (driver/UMEM ring
   after final admission) is the irreducible unobserved tail — not
   per-packet steerable in any sequence-targeted way. **Runtime-capacity
@@ -599,12 +600,19 @@ request-build stage:
   channel adds nothing to the demote probability, and the honest bound
   is the attacker's own spray budget plus one timeout. Accepted —
   restructuring the bound-then-apply order across every enqueue site is
-  worse than the residual. **All other arms are commit-clean.** #2501 counter
-  placement is UNCHANGED (`account_packet` keeps counting attempted
-  forwards at `flow_cache_hit.rs:312` / `poll_descriptor/mod.rs:3497` —
-  RT_FLOW volume semantics untouched); the anchor rides its own apply
-  hook fed by the same seg view. **The apply hook has NO
-  missing-forward fallback (round-83 Codex, core-gate note):** unlike
+  worse than the residual. **All other arms are commit-clean.**
+- **`account_packet` is UNCHANGED; the anchor apply rides a DISTINCT
+  post-admission hook (v10.4.0 wording fix, round-86 Codex 7):** #2501
+  counter placement is untouched (`account_packet` keeps counting
+  attempted forwards at `flow_cache_hit.rs:312` /
+  `poll_descriptor/mod.rs:3497` — RT_FLOW volume semantics; the
+  slow-path call PRECEDES build/output-filter/CoS failures, which is
+  why it cannot host the anchor). The anchor's update hooks are the
+  per-disposition FINAL-ADMISSION apply points of §5.2 (two call
+  classes: the cache-hit commit arm and the slow-path commit arms),
+  fed by the same seg view; no signature change to `account_packet`
+  at all. **The apply hook has NO missing-forward fallback (round-83
+  Codex, core-gate note):** unlike
   `account_packet`'s tolerant reverse hop (`session/mod.rs:1205`), a
   missing canonical forward entry means the hook is a NO-OP — updates
   land only on the one canonical store (validation refuses regardless,
@@ -968,14 +976,23 @@ segments only; the no-close path is byte-identical):
    2 s reap; §5.6).
    - **Accept:** re-probe the matched entry, set `closing`/`reset`
      (OR-assignment preserves #3489 stickiness), refresh `last_seen_ns`,
-     recompute `expires_after_ns`, **and — if the matched entry is a
-     `MissingNeighborSeed` — perform the full class transition in the
-     same write** (§5.2(iii): origin → `ForwardFlow`,
-     `session_limit_inc`, Open delta pushed BEFORE the mark so the
-     stream order is Open→Close), then propagate to the companion
-     exactly as today (the propagation path is unchanged — it fires only
-     on accepted marks, inheriting validation AND the family-identity
-     check above).
+     recompute `expires_after_ns`, then propagate to the companion
+     **subject to target reciprocity (v10.4.0, round-86 Codex 5):**
+     propagation derives the companion key (`lookup.rs:204`) and today
+     blindly mutates whatever occupies it (`session/mod.rs:1241`) — an
+     unrelated authoritative forward B can occupy
+     `R = reverse_session_key(K, NAT_A)` with no companion (a supported
+     state, `expire.rs:508`), and A's accepted close would mark B,
+     handing B the 2 s/30 s timeout, an authoritative Close, a NAT
+     release, and a delete fan-out. The propagation target must
+     RECIPROCATE: the entry at the derived key is marked only when it
+     `is_reverse` AND its `(key, nat)` reversed agrees with the
+     matched forward's `(key, nat)`; a mismatch (empty slot, unrelated
+     occupant, non-reverse origin) skips ONLY the companion mark —
+     the matched entry's own mark and emission are unaffected
+     (the #4109 propagation is a best-effort mirror, not the producer).
+     This also closes the pre-existing master wrong-mark of the same
+     shape.
    - **Refuse:** no marks, no refresh, no wheel push; bump the counter.
      `expires_after_ns`/`last_seen_ns` stay at their prior values — the
      entry ages on its pre-attack trajectory.
@@ -1163,36 +1180,32 @@ non-close path.
   buffered packet never runs the anchor hook, the promote, or the
   probation clear (no `SessionTable` on the retry path — the next
   unbuffered packet does all three).
-- **MissingNeighbor dispatch typed outcomes (v10.3.0, round-83 Codex 1 +
-  round-84 Codex 1 + round-85 Codex 1):** the disposition arm branches
+- **MissingNeighbor dispatch typed outcomes (v10.4.0, round-83 Codex 1 +
+  round-84 Codex 1 + round-85 Codex 1 + round-86 Codex 1):** the
+  disposition arm branches
   AT THE ARM HEAD on the resolve outcome — `ExistingResolved` (a live
-  local entry backs the resolve: buffer with the resolver's stored
-  decision; no seed-only NAT/NPT derivation or allocation, metadata,
-  counters, install, rollback, or publication runs),
+  local or shared resolve-time entry backs the resolve: buffer with the
+  resolver's stored decision; no seed-only NAT/NPT derivation or
+  allocation, metadata, counters, install, rollback, or publication
+  runs),
   `ResolvedWithoutLocalBacking` (resolve returned `Some` but the
   backing was transient-purged, `session_glue/mod.rs:1178-1193`: treated
   as a genuine miss end-to-end — #4400 guard applies, bare close drops,
-  SYN/data runs the full seed transaction),
+  SYN/data runs the full seed transaction **from a clean pre-SNAT
+  baseline** — the purged decision's released NAT is discarded before
+  derivation so the left-biased `NatDecision::merge` (`nat/mod.rs:123`)
+  takes the fresh allocation, never the released one),
   `SeedInstalled` (genuine miss: today's full seed transaction),
   `SeedRefused` (miss refused: today's drop). Mechanically the resolve
   layer returns the provenance alongside the decision (including the
   purge flag); the arm's seed-only block is skipped wholesale only for
   `ExistingResolved`.
-- **`MissingNeighborSeed` lifecycle completion (v10.3.0, round-84 Codex
-  3 + round-85 Codex 2/3):** an idempotent in-place class transition
-  `MissingNeighborSeed → ForwardFlow` on any COMMITTED packet
-  (fresh-packet commit arm slow-path or cache-hit, or the
-  accepted-close mark application, §5.5) with FULL accounting:
-  `session_limit_inc` at the flip (the `install.rs:555-562`
-  class-transition precedent), the Open delta emitted AT the flip
-  (exactly once — install emits none for seeds, `install.rs:226-234`),
-  and the node-unique `session_id` (#4915) stamped on the
-  install-published shared/DNAT records (replacing the zero writes at
-  `poll_descriptor/mod.rs:4811`), carried on `ExpiredSession`, and
-  compared at the seed-expiry alias cleanup AND the flipped seed's
-  Close drain (`session_delta.rs:420`) — cleanup/drain proceeds only
-  on `session_id` match; every seed-class expiry removes the
-  install-published aliases under that rule.
+- **The seed lifecycle is UNCHANGED from master (v10.4.0 — the second
+  retreat):** no origin flip, no flip-time `session_limit_inc`, no
+  flip-time Open, no `session_id`-guarded alias cleanup. The
+  pre-existing seed-class gaps are documented (§7 emission carve-out,
+  §7 races (e)-(g)) and their completion is a §10.6.2 follow-up with
+  the round-86 design notes.
 - **`ForwardSessionMatch` scope + identity (v10.2.0, round-84 Codex
   4):** the type gains `scope: Local | Shared` and the identity
   (canonical key + NAT decision) it was found under; site-2b validation
@@ -1288,17 +1301,24 @@ untouched.
   import → no mark, no promote, no delta.
 - **Emission completeness (the zero-producer rules):** an ACCEPTED close
   always leaves exactly one emitting entry: the hit-path accept marks the
-  matched entry and propagates to the companion (#4109, unchanged) —
-  **flipping a `MissingNeighborSeed` match to `ForwardFlow` in the same
-  write so the transient-seed exclusion cannot suppress the delta
-  (§5.5)**; the reverse-synth accept marks the forward family at resolve
+  matched entry and propagates to the reciprocated companion (#4109,
+  target-reciprocity-gated, §5.5); the reverse-synth accept marks the
+  forward family at resolve
   (§5.6) so the owner's forward entry emits at its 2 s reap; **and no
   dispatch path can replace a live/marked entry with a transient seed
   (the site-9 typed-outcome gate, §3/§5.8) — the accepted close's sole
   producer survives to its reap**; a refused
   close leaves no mark anywhere, so master's ordinary-timeout emission
   semantics apply unchanged (locally-born entries emit at natural reap;
-  unmarked import-class reaps stay silent exactly as master). A
+  unmarked import-class reaps stay silent exactly as master). **Carve-out
+  (pre-existing, master-parity — v10.4.0):** an accepted close whose
+  matched entry is a transient `MissingNeighborSeed` marks it and reaps
+  it at 2 s with NO Close delta (`expire.rs:342-350`'s transient-seed
+  exclusion — master's exact behavior for this class). The carve-out is
+  HA-safe by construction: seeds emit no Open, so no HA peer copy exists
+  to orphan; the residue is process-local (the install-published
+  shared/DNAT aliases linger past the seed's NAT release — the
+  pre-existing stale-alias trace, §7 race (f), §10.6.2 follow-up). A
   peer-validated close's mark survives on the peer's own entries (the
   peer marked before reaping and emitting); the Phase-1 residual — an
   accepted close immediately followed by failover and full reimport
@@ -1307,17 +1327,14 @@ untouched.
   `server/helpers/session_sync.rs:168`) — is a telemetry/hygiene
   degradation only: the entries idle out naturally, delivery unaffected;
   the wire-carried mark is Phase-2 scope (§10.5).
-- **Reap-side locality (v10.1.0):** a probation entry's expiry is
+- **Reap-side locality (v10.1.0, round-83 Codex 2 — confirmed RESOLVED
+  at rounds 84/85/86):** a probation entry's expiry is
   local-only (§5.6/§5.8): no NAT release, no BPF family-key delete, no
   delta. The global cleanup of a flow's NAT reservation and BPF keys
   happens at the owner/live entry's own reap — the authoritative
   cleanup event for the family (master's unrefcounted sibling cleanup
   calls are the pre-existing #6522 class, §10.6.1) — and the probation
-  constructor must not multiply its trigger rate. **`MissingNeighborSeed`
-  expiry (v10.2.0):** every seed-class expiry additionally removes the
-  install-published shared/DNAT aliases on owner-identity match
-  (§5.2/§5.8); a flipped (traffic-confirmed) seed emits its Close
-  normally.
+  constructor must not multiply its trigger rate.
 - **Hot-path discipline:** zero new allocations; zero new atomics; the
   per-TCP-data-packet cost inside `account_packet`'s existing probe is one
   8-byte read + ≤2 gated stores; closing segments add one table probe on a
@@ -1422,8 +1439,8 @@ untouched.
 | Pending-neighbor behavior | LOW | Master's buffered-decision retry is UNCHANGED (v10.2.0 retreat): no re-resolution, no hold, no new drop class, no stale-transmit change — the admitted-close delivery is master-parity, and the pre-existing stale-decision window is documented (§7 race d, follow-up §10.6.2). Buffered packets never move the anchor — a fail-toward-refuse residual (anchors lag behind long ARP stalls; closes soft-refuse; entries idle out normally), never a walk/poison channel. |
 | Dispatch-path provenance | LOW-MED | The MissingNeighbor arm branches on typed resolve outcomes at the arm head (round-83 Codex 1 + round-84 Codex 1): `ExistingResolved` preserves the resolver decision and allocator state exactly (no seed-only work runs); `SeedInstalled`/`SeedRefused` are today's miss paths. Risk is confined to the hit-with-cold-neighbor corner (previously the live entry was replaced by a raw-flags seed — master's unguarded demote path); unit-tested for refused and accepted closes and for the no-allocation-leak case. |
 | Probation reap locality | LOW | A probation expiry is local-only (round-83 Codex 2): no NAT release, no BPF family-key delete. Strictly safer than master's born-dying materialized copy (which runs the full cleanup at 2 s — the #6522 class); the owner entry's own reap is the family's authoritative cleanup event. |
-| Seed lifecycle completion | LOW-MED | The idempotent `MissingNeighborSeed → ForwardFlow` class transition on committed traffic (with `session_limit_inc` at the flip — the `install.rs:555-562` precedent — and the Open delta emitted exactly once AT the flip, since install emits none for seeds, `install.rs:226-234`) plus `session_id`-guarded seed-expiry alias cleanup changes master's seed-class accounting: a confirmed flow's Close now emits (zero-producer trace closed), aliases are reclaimed at seed expiry only on node-unique `session_id` match (stale-alias trace closed; cross-worker generation reuse safe). Accounting balance (inc↔dec), Open ordering (Open→Close), and the identity guard are unit-tested; the unguarded shared-state residual stays the #6522 class (§10.6.1). |
-| Merge collision | LOW | No `FlowCacheEntry` change. `account_packet` hook addition is local to two call sites; `SessionInstall`/`SessionUpdate` gains are crate-internal. |
+| Seed class | LOW | Master's seed lifecycle is UNCHANGED (v10.4.0 — the second retreat): no flip, no flip-time accounting, no id-guarded cleanup. The zero-producer transient-seed case is HA-safe by construction (no peer copy exists); the stale-alias and stub-metadata gaps are pre-existing master behavior, documented (§7 races e-g) with a §10.6.2 completion follow-up. |
+| Merge collision | LOW | No `FlowCacheEntry` change. The anchor apply hooks are local to the commit arms; `SessionInstall`/`SessionUpdate` gains are crate-internal. |
 
 ---
 
@@ -1533,18 +1550,29 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   (f) a config-update pool-SNAT-matching live no-SNAT flow HIT with a
   cold next hop: `ExistingResolved` — allocator state bit-identical
   (round-84 Codex 1's pool-exhaustion trace).
-- **Seed lifecycle completion (v10.3.0):** a committed non-close packet
-  on a `MissingNeighborSeed` entry performs the class transition
-  idempotently — origin → `ForwardFlow`, `session_limit_inc` fires at
-  the flip, the Open delta fires AT the flip exactly once (install
-  emits none, `install.rs:226-234`), stream order Open→Close for the
-  accepted-close case; the inc↔dec balance holds across flip-then-reap
-  (no per-IP cap corruption, `session/mod.rs:1817`); the flip changes
-  no key/NAT/anchor/prior verdict; a flipped seed's Close drain and an
-  unflipped seed's alias cleanup each proceed ONLY on node-unique
-  `session_id` match (a cross-worker newer generation reusing the
-  key/NAT is left untouched); a stale shared seed can never be
-  materialized with a released translation.
+- **Seed class (v10.4.0 posture):** the seed lifecycle is byte-identical
+  to master — an accepted close on a transient `MissingNeighborSeed`
+  marks it and reaps it at 2 s with NO Close delta (master parity, no
+  HA peer copy exists); a seed expiry releases NAT exactly as master
+  (the pre-existing §10.6.1 class) and leaves the install-published
+  aliases exactly as master (the pre-existing §7 race (f)); no flip,
+  no flip-time `session_limit_inc` (admission behavior unchanged,
+  `session_admission.rs:29`), no flip-time Open, no id-guarded cleanup.
+- **Propagation target reciprocity (round-86 Codex 5):** an accepted
+  forward close whose derived companion slot holds an UNRELATED forward
+  B (`is_reverse` false, or key/NAT not reciprocating): B is NOT marked
+  (no wrong timeout, no wrong Close, no wrong NAT release, no fan-out);
+  A's own mark and emission are unaffected; a reciprocating reverse
+  companion is marked exactly as #4109 today; the pre-existing master
+  wrong-mark trace is closed by the same rule.
+- **`ResolvedWithoutLocalBacking` clean baseline (round-86 Codex 1):**
+  the purged class's miss transaction discards the released `P1` before
+  derivation: `P2 != P1` case — the seed/aliases install with the OWNED
+  `P2` and later cleanup releases `P2` (no collision with `P1`'s new
+  owner, no leak); current-rule-no-longer-matches case — no
+  translation; persistent deterministic reacquire
+  (`allocator.rs:1265`) still reacquires `P1` through the allocator
+  (the owned path).
 - **Site-2b scope + identity (round-84 Codex 4):** a `Shared` match
   refuses even when the same canonical key is locally occupied; a Local
   match whose re-probed entry disagrees on key or NAT decision refuses
@@ -1702,50 +1730,103 @@ this branch only if the minimal fix proves insufficient.
   cumulatively-bounded hold that round-84 sketched — NOT the
   v10.1 re-resolve/blanket-hold design, which generated four BLOCKERs
   of local machinery for zero gate benefit.
+- **Seed-lifecycle completion (v10.4.0):** the transient-seed
+  zero-producer (accepted close marks, 2 s reap, no Close delta —
+  HA-safe: no peer copy exists), the stale-alias trace (seed reaps
+  never remove the install-published shared/DNAT aliases), and the
+  stub-metadata gap (seed-born flows keep policy-0/timeout-None
+  metadata for life) are all pre-existing master behavior. Their
+  completion is a follow-up effort whose design notes round 86
+  produced: count/reserve the admission slot AT seed admission (seed
+  removal balancing; delaying only Open emission until confirmation is
+  safe — Codex r86 finding 2's prescription); a compare-and-transition
+  publication matching session_id + NAT + expected origin before
+  arming publication/Open (finding 3); a process-local collision-free
+  alias-owner token with serialized conditional publication/deletion —
+  `session_id` as allocated today is NOT collision-free cross-node
+  (worker/counter namespacing at `session/mod.rs:766`, import-adopted
+  ids at `install.rs:324`, bulk-export zero ids at `ha/export.rs:143`)
+  and check/delete has no linearization point (`shared_ops.rs:960`,
+  `checksum.rs:246`, `xpf_maps.h:508`); zero must mean "no new
+  seed-cleanup authority", never unconditional fallback (finding 4);
+  and admitted-metadata preservation (or atomic replace-and-recompute
+  at confirmation) for the stub-metadata gap (finding 6). The
+  v10.2.0/v10.3.0 attempt at the simple version of this completion
+  generated all four BLOCKERs — do not retry it without the full
+  design.
+- **Seed-class lifecycle gaps (v10.4.0 — the second retreat):**
+  (e) the transient-seed zero-producer: an accepted close on a
+  `MissingNeighborSeed` marks it and reaps it at 2 s with NO Close
+  delta — master's exact behavior (`expire.rs:342-350`'s exclusion);
+  HA-safe by construction (seeds emit no Open → no peer copy exists to
+  orphan); (f) the stale-alias trace: a seed's reap releases its NAT
+  (the unconditional cleanup, §10.6.1's #6522 class) but never removes
+  the install-published shared/DNAT aliases
+  (`poll_descriptor/mod.rs:4823, :4879`) — a stale shared seed can
+  later be materialized with a released/reassigned translation, on
+  master today; (g) the stub-metadata gap: a seed-born flow keeps the
+  `build_missing_neighbor_session_metadata` stub (policy 0, logging
+  false, `inactivity_timeout_ns=None`, `neighbor_dispatch.rs:606`) for
+  its whole life on master — a per-app-timeout flow admitted at 3600 s
+  still reaps at the global 300 s. All three are PRE-EXISTING, outside
+  this issue's blast radius, and their completion is the §10.6.2
+  follow-up with the round-86 design notes (count-at-admission,
+  compare-and-transition publication, a process-local collision-free
+  alias-owner token with serialized conditional deletion, admitted-
+  metadata preservation). The v10.2.0/v10.3.0 attempt to complete them
+  here generated round-86's four BLOCKERs (admission bypass,
+  publication overwrite, id collisions + TOCTOU, stub metadata) — the
+  same unfold pattern as rounds 13-82, and the same retreat answer.
 
 ---
 
-## 11. Open questions for the convergence round (v10.3.0)
+## 11. Open questions for the convergence round (v10.4.0)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
    probation + local-only probation reap, normative mark-creation with
-   master's emission gate unchanged, the site-9 typed-outcome gate,
-   the accounting-complete seed class transition + `session_id`
-   identity substrate, the 2b scope/identity discipline, the
-   reverse-hit family reciprocity check) close the issue and its HA
-   teeth. The machinery is cut, not hidden (§10.6). Is any part of the
+   master's emission gate unchanged, the site-9 typed-outcome gate with
+   the clean pre-SNAT baseline, the 2b scope/identity discipline, the
+   reverse-hit family reciprocity check, the propagation-target
+   reciprocity gate) close the issue and its HA teeth. The machinery is
+   cut, not hidden (§10.6); the seed-lifecycle gaps are documented
+   pre-existing (§7 races e-g, §10.6.2), not fixed. Is any part of the
    ISSUE's actual harm — firewall-state kill, SNAT mid-flow port swap,
    HA standby propagation — left unaddressed? Trace it, or the cut
    stands.
-2. **The pending-neighbor RETREAT (accepted by round-85 Codex):**
-   master's buffered-decision retry is byte-identical; buffered packets
-   never move the anchor; the stale-decision window is documented
-   pre-existing (§7 race d) with the typed-outcome hardening deferred
-   (§10.6.2). Settled, unless a reviewer traces an ISSUE-class harm.
-3. **Round-85 fold verification:** (a) `ResolvedWithoutLocalBacking` —
-   is the outcome set now exhaustive (live / purged-backing / genuine
-   miss), and is the miss-class treatment (bare close → #4400 drop;
-   SYN/data → full seed transaction incl. pool reacquire) correct?
-   (b) the flip's accounting — `session_limit_inc` at the flip (the
-   `install.rs:555-562` precedent) + Open exactly once AT the flip +
-   Open→Close stream order — balanced and complete? (c) the
-   `session_id` identity substrate — node-unique, stamped on
-   publication, carried on `ExpiredSession`, compared at alias cleanup
-   AND the flipped drain — does any stale-cleanup-vs-newer-generation
-   trace survive? (d) the reverse-hit reciprocity check — is
-   key+NAT-reciprocal agreement sufficient (exact tuple+NAT reuse
-   packet-indistinguishable), and is any propagation path reachable
-   without it?
+2. **The two retreats (round-84-accepted, round-86-for-decision):**
+   (a) master's buffered-decision retry is byte-identical (round-85
+   Codex accepted); (b) the seed lifecycle is byte-identical — no
+   flip/Open/id-guarded cleanup; every gap it has is pre-existing on
+   master (transient-seed zero-producer is HA-safe by construction: no
+   peer copy exists), and the v10.2.0/v10.3.0 completion attempt
+   produced round-86's four BLOCKERs (admission bypass, publication
+   overwrite, id collisions + TOCTOU, stub metadata) — the same unfold
+   pattern as rounds 13-82. Does any reviewer hold that the seed-class
+   completion MUST ship in THIS plan despite (i) every gap being
+   pre-existing, (ii) the zero-producer case carrying no HA consequence,
+   and (iii) two reviewed attempts producing cascades? Trace the
+   ISSUE-class harm, or the retreats stand.
+3. **Round-86 fold verification:** (a) `ResolvedWithoutLocalBacking`
+   clean pre-SNAT baseline — is the stale-`P1` trace dead (`P2 != P1`,
+   no-longer-matches, deterministic reacquire)? (b) propagation-target
+   reciprocity — is the wrong-mark trace on the unrelated occupant B
+   dead, with the matched entry's own mark/emission unaffected? (c) the
+   §5.8/`account_packet` wording (counters unchanged; anchor rides the
+   distinct post-admission hook) — consistent now?
 4. **The emission posture:** master's `expire.rs:342-350` gate is
    UNCHANGED; the additions are the normative mark-creation rules, rule
    5, the reverse-synth forward-family mark, the site-9 producer-
-   survival rule, the family-identity checks, and the flip's Open.
-   Any remaining zero-producer or duplicate-producer trace?
+   survival rule, the family-identity checks, and the transient-seed
+   carve-out (pre-existing, HA-safe by construction). Any remaining
+   zero-producer or duplicate-producer trace OUTSIDE the carve-out?
 5. **Attack-surface arithmetic (restated):** ~1/2^12 (cap) to ~1/2^14
-   (floor) per blind packet. (Confirmed by round-83 AND round-84 Codex
-   recomputation: 393,219 ≈ 1/10,923; 655,355 ≈ 1/6,554.)
+   (floor) per blind packet. (Confirmed by round-83, round-84, AND
+   round-86 Codex recomputation: 393,219 ≈ 1/10,923; 655,355 ≈ 1/6,554.)
 6. **The re-scope:** #6522 to its own `/engineer` effort; the §10.6.2
-   races as follow-up candidates; Phase 2 on its own track. Does
-   anything further MUST ship in this plan for the issue's fix to be
-   safe? Trace required.
+   races and seed-lifecycle completion (with the round-86 design notes:
+   count-at-admission, compare-and-transition publication, process-local
+   collision-free alias-owner token with serialized conditional
+   deletion, admitted-metadata preservation) as follow-up candidates;
+   Phase 2 on its own track. Does anything further MUST ship in this
+   plan for the issue's fix to be safe? Trace required.
