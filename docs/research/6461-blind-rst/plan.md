@@ -571,7 +571,11 @@ request-build stage:
   matches the expiring entry's (a newer generation that reused the
   key/NAT — even cross-worker — holds a different `session_id` and is
   left untouched; key/NAT comparison alone cannot distinguish
-  generations, `shared_ops.rs:960`, `checksum.rs:246`); (e) **every**
+  generations, `shared_ops.rs:960`, `checksum.rs:246`); **legacy
+  zero-id records (published pre-upgrade or by a pre-upgrade peer) fall
+  back to master's key-based cleanup — the guard only ever ADDS
+  protection where a real `session_id` exists on both sides, never
+  removes master's cleanup behavior**; (e) **every**
   `MissingNeighborSeed` expiry (flipped or
   not, committed or not) additionally removes the shared/DNAT aliases
   the install published (:4823, :4879) under that identity rule —
