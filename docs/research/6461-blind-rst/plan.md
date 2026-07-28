@@ -8977,6 +8977,50 @@ admitted interval):
   peer; a missing identity is fail-closed (the
   extension's activation waits for the ACK, visible in
   the backfill-status display));
+  (d32) v9.9.54.36 boundaries (round-81 Codex B1/B2/B3/B4/B5/B6/H7/H8
+  + round-81 SMR F1-F6): the seqlock double-collect
+  (g1 = drain_generation (acquire); clone(entry);
+  g2 = drain_generation; accept IFF g1 == g2 — a lift
+  between the reads is a detected tear and the packet
+  retries; the transfer CAS publishes the intent only
+  after the double-collect validates); the
+  write-only-INACTIVE copy (the active copy is NEVER
+  written while active; the writer checksums the
+  inactive copy and release-stores the selector (the
+  selector's store is the commit); the OLD copy is
+  retained until the flip completes; a reader takes an
+  acquire load of the selector and validates
+  copy.sequence == selector.sequence AND the checksum —
+  a copy whose sequence is older is NEVER returned
+  (fallback only on sequence match, else slow path));
+  every dependent KEY is the complete family identity
+  (canonical forward key PLUS ingress scope — two
+  same-tuple different-scope families can never collide
+  at the map level (bpf_map/mod.rs:14, lib.rs:229,:825));
+  the per-target HEAD CAS (at most ONE pending
+  replacement per target — the cover-set is bounded by
+  construction (≤255, operator-visible rejection on
+  overflow, never silent truncation)); the §9 frame-42
+  fixed-40-byte mention corrected to the counted-vector
+  grammar; frame 45 gains floor_sync_id IN the frame
+  (the receiver can construct the ACK); the sender
+  persists the exact retry bytes (retransmit =
+  byte-identical); frame 46's explicit extension ≥ 2
+  predicate; frame 47 CONFIG_APPLIED_ACK =
+  (config_generation, rg_incarnation_set_digest) —
+  emitted ONLY after the config's runtime adoption
+  succeeds (a failed apply reports distinctly or times
+  out fail-closed; the digest covers the adopted set;
+  an authority death mid-backfill leaves the minted
+  fields in the synced config itself; the extension
+  activates on the NEXT connection after the ACK); and
+  ONE mint mechanism (the candidate-bound monotone
+  token binding (authority incarnation, lease
+  epoch/expiry, candidate generation AND content
+  digest, minted identities) — re-validated INSIDE
+  Store.mu (NEVER acquiring Manager.mu underneath
+  Store.mu; the token is self-contained); the
+  hold-through alternative retracted);
   the pending-rejection GC wakeup
   re-opens admission with readiness degraded); same-fabric
   token supersession (C2 installs → T1 revoked before the slot
