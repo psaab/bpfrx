@@ -21,7 +21,7 @@
   §2 absorbing residual — v10 cut the family-clock TTL sweep and the
   reservation-purge hook with the rest of the Part-B machinery; a
   probation entry's reap is local-only, and the owner/live entry's own
-  reap performs the global cleanup exactly once).
+  reap performs the family's authoritative global cleanup).
 
 ## The design as it stood at split (v8.4)
 
