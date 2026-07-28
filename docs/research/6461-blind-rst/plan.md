@@ -8654,6 +8654,56 @@ admitted interval):
   on frame 45 with the floor-first transactional
   merge); an Active record at or below
   the water line is REJECTED);
+  (d30) v9.9.54.34 boundaries (round-79 Codex B1/B2/B3/H4/H5/H6/M7
+  + round-79 AGY T1/T2/T3 + round-79 SMR F1-F5): the
+  pre-lookup GLOBAL INTENT (registered at packet entry;
+  atomically transferred to the discovered RG's permit
+  after the lookup (one CAS); EVERY upsert carries the
+  drain-generation check (a lift between intent and
+  upsert fails the upsert — the packet drops, never
+  "permits lift"; a revoked permit's resume path is
+  generation-gated too); a NON-COOPERATIVE holder
+  ABORTS the proof (fail-closed, never lifts)); every
+  dependent carries (root_id, RootRef(slot, generation),
+  cohort_id, version) (the RootRef locates the slot
+  directly — no directory lookup; the slot validates
+  (root_id, generation) on every read); the root
+  record's TWO-COPY/checksummed ABI (copies A/B each
+  with its own checksum; a reader validates and falls
+  back; a torn write never leaves both copies bad; the
+  recovering writer reads the GOOD copy); the CLEANING
+  state (leased, takeover-safe, per-domain progress in
+  the root record; a dead cleaner is itself reclaimed
+  and the clean resumes from the recorded progress; a
+  new PREPARING waits for the CLEANING → FREE CAS;
+  every staging write validates the reservation
+  generation); the §9 mutex-or-CAS alternative
+  retracted; the ONE floor encoding (frame 45
+  FLOOR_SYNC — extension ≥ 2 predicate, per-authority
+  vector ACK) with the TRANSACTIONAL floor-first merge
+  (FIRST advance floors AND retire every covered Active
+  record (an already-applied fence at or below the line
+  is ACTIVELY cleared), THEN admit only records above
+  the merged floor; the ledger pipeline applies a floor
+  sync before any pending active records from the same
+  peer); the ONE ordered supersession transaction (the
+  newer retirement's record NAMES and COVERS every
+  predecessor's namespace — equivalent scope →
+  supersede atomically (the union resolves through the
+  successor's completion); different scope → MERGE into
+  one replacement at max generation; an uncovered
+  predecessor finishes first idempotently; the
+  superseded record's correlation is preserved by the
+  successor naming it); the §9 "(v1-proof, any class)"
+  line amended to the full matrix rows; and the mint
+  authorization linearized BEFORE store promotion (the
+  pre-persistence callback at daemon_apply_commit.go:194
+  validates the mint's authority via an authenticated
+  peer-contact/lease check — a config whose mint can't
+  be authorized FAILS THE APPLY VISIBLY (never
+  activates with a queued mint); standalone is
+  self-authority; the peer-down queue/status is
+  explicit (show cluster mint-status + alarm));
   the pending-rejection GC wakeup
   re-opens admission with readiness degraded); same-fabric
   token supersession (C2 installs → T1 revoked before the slot
