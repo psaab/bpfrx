@@ -1,17 +1,19 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.1.1 — THE TERMINAL CUT, round-83 folds. Ship
-candidate = the Part-A dataplane demote gate plus the wire-free local HA
-rules. The RG-incarnation/retirement/fence-ledger protocol that rounds
-13–82 grew is KILLED (not deferred): its two customers are re-scoped —
-the pre-existing NAT-release bug #6522 to its own issue, and the Phase-2
-HA-wire anchor to its own research track (phase2-brief.md, split at v9).
-Part A changes no HA wire format, no schema, no public API (one additive
-Go worker-status decode field for the counter). Round-83 verdicts: AGY
-PLAN YES (3xSOUND, no new traces); Codex PLAN NO (3 BLOCKERs on the
-MissingNeighbor dispatch path + 1 MEDIUM + 2 LOW + 1 nit — folded at
-v10.1.0, all LOCAL rules, no protocol); Claude SMR PLAN NO (1 LOW + 5
-nits — folded at v10.0.2).**
+**Status: DRAFT v10.2.0 — THE TERMINAL CUT, round-84 folds incl. the
+pending-neighbor RETREAT. Ship candidate = the Part-A dataplane demote
+gate plus the wire-free local HA rules. The
+RG-incarnation/retirement/fence-ledger protocol that rounds 13–82 grew is
+KILLED (not deferred): its two customers are re-scoped — the pre-existing
+NAT-release bug #6522 to its own issue, and the Phase-2 HA-wire anchor to
+its own research track (phase2-brief.md, split at v9). Part A changes no
+HA wire format, no schema, no public API (one additive Go worker-status
+decode field for the counter). Round-83 verdicts: AGY PLAN YES; Codex
+PLAN NO (3B/1M/2L — folded at v10.1.x); Claude SMR PLAN NO (1L/5nit —
+folded at v10.0.2). Round-84 verdicts: AGY PLAN YES (3xSOUND); Codex
+PLAN NO (4B/1H/1M/nits on the seed/pending state machine — folded here,
+incl. the retreat of the v10.1 re-resolve design); Claude SMR PLAN NO
+(2 nit — folded at v10.1.1).**
 
 The 82-round arc in one paragraph: the packet-level plausibility gate has
 been stable since v6 — refuse-demote on no trusted baseline, per-field
@@ -45,9 +47,12 @@ v1 → v9 history: preserved in git on this branch (the v9.9.54.36 plan and
 all 82 rounds of review docs sit alongside this file). v9 → v10: the
 terminal cut — §5 shrinks from 7,310 lines to the gate mechanics; the
 machinery's disposition is §10.6; #6522 is honestly re-scoped (§10.6.1);
-Part B is exactly four local rules (§5.5–§5.6): closing packets never
-promote (either promote), constructor gating with a bounded probation,
-normative mark-creation, and master's emission gate UNCHANGED.
+Part B is a small set of local rules (§5.5–§5.6, §5.8): closing packets
+never promote (either promote), constructor gating with a bounded
+probation and a local-only probation reap, normative mark-creation with
+master's emission gate UNCHANGED, the MissingNeighbor typed-outcome
+gate, the seed-lifecycle completion, and the 2b scope/identity
+discipline.
 
 Research branch: `research/6461-blind-rst`. Plan-only deliverable; no
 production code is changed by this branch. Implementation begins only after
@@ -319,7 +324,7 @@ exhaustive inventory, re-verified against this branch's master base:
 | 6 | fabric-return reverse seed (`cluster_peer_return_fast_path` install) | fabric-ingress packet flags | bare closes already excluded (#4453); SYN|ACK|RST/FIN combos pass the guards (`fabric.rs:404`) and seed raw flags — an unvalidated constructor, harmless-by-class (the seed is `is_reverse` → silent at reap; the non-owner's forward import validates closes at site 1 with no anchor in Phase 1 → refuse → no mark). The seed bypasses the commit hooks so it carries no anchor — a later close on it is REFUSED (missing-forward/no-baseline, §5.1); documented |
 | 7 | CLI/control deletes, GC/reaper, screens/SYN-cookie | — | consumers / unaffected |
 | 8 | **forward-wire immutable match** — `find_forward_wire_match_with_origin` (`lookup.rs:258-293` via `shared_ops.rs:614-628`): NAT64 forward direction, hairpin, non-bijective NAT | wire packet on the forward-wire tuple | The match itself never marks (cloned decision/metadata — no `&mut`, today or after). But it is not demote-free: a promotable-origin forward-wire hit reaches `maybe_promote_synced_session` → `update_session`, which marks closing/reset from the packet's flags on master — gated by §5.5's rule 5 like every other promote (closing packets never promote → never reach `update_session`). The anchor for these flows advances from the reverse (mutable alias) direction only; pre-existing forward-direction accounting/refresh asymmetry (NAT64) is out of scope — filed as a follow-up candidate |
-| 9 | **MissingNeighbor disposition arm** — `poll_descriptor/mod.rs:4034-4798`: a packet (HIT or MISS) whose disposition is MissingNeighbor reaches the common arm, which installs `MissingNeighborSeed(..., meta.tcp_flags)` at :4787 — and `install_with_protocol_with_origin` `remove_entry`s any existing key (`install.rs:140`) and seeds `closing`/`reset`/timeout from the raw flags (`install.rs:179-180`) | any closing-flagged packet with a cold next hop; the #4400 guard at :1640 covers only the ForwardCandidate/MissingNeighbor MISS path | **gated by provenance (v10.1.0, round-83 Codex 1):** the seed install runs ONLY on a genuine top-level session miss (no live entry was resolved — the #4400-guarded class); a HIT-resolved MissingNeighbor (a live entry exists — incl. a validator-REFUSED close, a 2b REFUSE, or an accepted marked close) buffers the packet against the EXISTING entry and installs NOTHING — the gated verdict is terminal across dispatch, a live/marked entry can never be replaced by a transient raw-flags seed, and the accepted close's sole producer survives (§5.5/§5.6) |
+| 9 | **MissingNeighbor disposition arm** — `poll_descriptor/mod.rs:4034-4798`: a packet (HIT or MISS) whose disposition is MissingNeighbor reaches the common arm, which runs seed-only NAT derivation/allocation (:4680, :4745), metadata/counters, and installs `MissingNeighborSeed(..., meta.tcp_flags)` at :4787 — `install_with_protocol_with_origin` `remove_entry`s any existing key (`install.rs:140`) and seeds `closing`/`reset`/timeout from the raw flags (`install.rs:179-180`) | any closing-flagged packet with a cold next hop; the #4400 guard at :1640 covers only the ForwardCandidate/MissingNeighbor MISS path | **gated by typed provenance (v10.2.0, round-83 Codex 1 + round-84 Codex 1):** the arm branches on the resolve outcome AT THE ARM HEAD — before ANY seed-only work (NAT/NPT derivation or allocation, metadata, counters, install, rollback, publication): `ExistingResolved` (a live entry was resolved — incl. a validator-REFUSED close, a 2b REFUSE, or an accepted marked close) buffers the packet with the RESOLVER's stored decision and does NOTHING else (allocator state, metadata, counters, install, publication all untouched — an unowned `live_by_flow` allocation can never leak, `nat/source.rs:1548`); `SeedInstalled` (genuine top-level miss, #4400-passed) runs the full seed transaction as today; `SeedRefused` (miss, refused) drops as today. The gated verdict is terminal across dispatch; a live/marked entry can never be replaced by a transient raw-flags seed; the accepted close's sole producer survives (§5.5/§5.6) |
 
 ---
 
@@ -487,49 +492,67 @@ request-build stage:
   Accepted because the alternatives (per-packet post-commit callbacks,
   or freezing these anchors and soft-refusing every close on the
   host-inbound victim class) are worse. All other arms are commit-clean.
-- **Pending-neighbor carriage (v10.1.0, round-83 Codex 3):**
-  `PendingNeighPacket` (`types/mod.rs:77`) carries no segment/proof
-  state and `retry_pending_neigh` (`neighbor_dispatch.rs:156, :344`)
-  has no `SessionTable` — a buffered SYN-ACK would deliver without its
-  establishment promote, and buffered non-close samples would update
-  nothing. v10's rule (superseding the v7.x mutation-token design): **the
-  retry path re-resolves the packet fresh, exactly once** — the full
-  pipeline reruns (session lookup, close validation, anchor update,
-  establishment promote, NAT/egress decision), the FRESH decision is
-  standard-dispatched (ForwardCandidate, LocalDelivery, FabricRedirect,
-  NoRoute, NextTableUnsupported — each takes its normal path) or the
-  packet drops; NEVER transmit using the buffered stale NAT/egress
-  decision (today the retry reuses it at
-  `neighbor_dispatch.rs:272, :310, :344, :369` — a reaped/re-seeded
-  entry could have released or reassigned the SNAT port). A second
-  `MissingNeighbor` drops (no re-pend loop — re-admission today resets
-  `queued_ns`/`probe_attempts`, `poll_descriptor/mod.rs:5057`). **The
-  interim-expiry hold (round-83 Codex 3):** an entry with a packet in
-  the pending-neighbor queue CANNOT expire — the expiry pass skips it
-  (and its NAT reservation) until the pending resolves or hits the
-  pending timeout. Without the hold, a legit close admitted as a
-  session HIT (soft-refused, so unrefreshed) can be expired by the next
-  worker loop while it waits for ARP, and the mandated fresh
-  re-resolution then sees a session MISS — dropping the admitted close
-  under #4400 where master delivers it from the buffered decision: a
-  new close-after-timeout drop class, and a violation of this plan's
-  own never-block-delivery invariant. The hold is bounded (the pending
-  timeout), local (per-worker queue + expiry pass), and preserves
-  master's pending-timeout drop parity exactly — no new drop class, no
-  stale-decision transmit, no marker semantics. No token, no
-  incarnation id, no buffered mutation state: the retry re-computes
-  everything against live state. Demote marking for an ACCEPTED close
-  stays at resolve time (master parity — a close buffered for ARP
-  already demotes on master; only anchor updates and the establishment
-  promote are delivery-gated). **Non-expiry removals during a pend
-  (stated):** the hold covers the expiry pass only — an operator
-  control-socket session delete (`clear security flow session`) still
-  removes the entry; the pending packet's retry then re-resolves to a
-  miss and drops (operator intent dominates; master would transmit the
-  buffered stale decision — the drop is deliberate, and the flow was
-  just operator-killed anyway). RG vacate touches shared slots, not the
-  local entry — the retry re-resolves to the post-vacate disposition
-  (HAInactive/FabricRedirect) and standard-dispatches fresh.
+- **Pending-neighbor posture (v10.2.0 — THE RETREAT, round-84 Codex
+  2/3/5/6):** master's buffered-decision retry is **UNCHANGED** —
+  `retry_pending_neigh` (`neighbor_dispatch.rs:156, :272, :310, :344,
+  :369`) transmits the buffered decision exactly as today, and the
+  pending machinery (`types/mod.rs:77`, `poll_descriptor/mod.rs:5057`)
+  is untouched. The v10.1 re-resolve-once design and its interim-expiry
+  hold are RETRACTED: they produced four BLOCKERs in one corner (the
+  hold had no typed family identity; `Some(resolved)` does not imply a
+  live entry after the transient purge at `promote.rs:167`; the
+  per-binding pending timeout is not a cumulative per-session bound;
+  wheel reinsertion/bounding was unspecified) — each fixable, but every
+  fix added local machinery to defend an improvement (never-transmit-
+  stale) that is OUTSIDE this issue's blast radius. What the gate
+  actually needs here is only: (i) **a buffered packet never moves the
+  anchor and never drives post-borrow state** (no anchor update, no
+  establishment promote, no probation clear on the retry path — the
+  retry has no `SessionTable`; the next unbuffered packet does all
+  three). The consequence is a documented residual, not a channel: a
+  flow whose traffic is mostly buffered (long ARP stalls) lets its
+  anchor lag the stream — later closes soft-refuse and the entry idles
+  out on its ordinary timeout, the same bounded class as the
+  unobserved-stretch residual (§2), always fail-toward-refuse (a
+  skipped update can never walk or poison an anchor). A buffered
+  SYN-ACK that delivers without its promote leaves the entry OPENING
+  exactly as on master (the promote fires on the next unbuffered
+  packet; if none comes, the 20 s opening window reaps — master
+  parity). (ii) **the buffered stale-decision transmit window is
+  documented as PRE-EXISTING** (§7 races): master today can transmit a
+  pending packet with a NAT/egress decision whose entry expired (or was
+  transient-purged, `promote.rs:167`) during the ARP wait — including
+  an admitted close, which master DELIVERS (and this plan preserves
+  that delivery: the demote verdict is terminal at resolve — refuse =
+  no mark, accept = marked at resolve — so the retry needs no
+  re-validation and no re-resolution). The v7.5-era never-transmit-
+  stale hardening is NOT shipped by this plan; it is a follow-up
+  candidate (§10.6.2) whose correct design is the typed-outcome work
+  round-84 sketched — not a prerequisite for the demote gate.
+  (iii) **the seed lifecycle is completed locally (round-84 Codex 3):**
+  any COMMITTED packet on a `MissingNeighborSeed` entry — a fresh
+  slow-path packet at its commit arm, or an accepted validated close at
+  its post-borrow mark application — performs an idempotent in-place
+  origin flip `MissingNeighborSeed → ForwardFlow` (the entry was a
+  genuine FreshPrimary install; the flip records that real traffic
+  confirmed the flow; Open/create telemetry accounting is unchanged —
+  emitted once at seed install, never re-emitted at the flip;
+  session-limit accounting unchanged — the entry existed; shared/
+  replication state published at install, `poll_descriptor/mod.rs:4823,
+  :4879`, is ADOPTED, not re-published). After the flip the entry is
+  non-transient, so an accepted close's 2 s reap emits the Close delta
+  normally — closing the accepted-close zero-producer trace
+  (`expire.rs:342-350`'s transient-seed exclusion no longer applies to
+  a confirmed flow). **Every** `MissingNeighborSeed` expiry (flipped or
+  not, committed or not) additionally removes the shared/DNAT aliases
+  the install published (:4823, :4879) — keyed from the entry's own
+  decision, removed ONLY when the alias's recorded owner identity
+  matches the expiring entry (a newer live entry owning the same alias
+  key is left untouched — the unrefcounted-shared-state residual is the
+  #6522 class, §10.6.1) — closing master's stale-shared-seed
+  materialize-with-released-translation trace. The retry's own
+  transmit (no table) does not flip; the next fresh packet or the
+  accepted close's mark does.
 - **Residual (documented):** TX-completion failure (driver/UMEM ring
   after final admission) is the irreducible unobserved tail — not
   per-packet steerable in any sequence-targeted way. **Runtime-capacity
@@ -888,7 +911,12 @@ segments only; the no-close path is byte-identical):
    2 s reap; §5.6).
    - **Accept:** re-probe the matched entry, set `closing`/`reset`
      (OR-assignment preserves #3489 stickiness), refresh `last_seen_ns`,
-     recompute `expires_after_ns`, then propagate to the companion
+     recompute `expires_after_ns`, **and — if the matched entry is a
+     `MissingNeighborSeed` — flip its origin to `ForwardFlow` in the
+     same write** (the seed-lifecycle completion, §5.2: a validated
+     close confirms the flow; after the flip the 2 s reap emits the
+     Close delta normally instead of falling under the transient-seed
+     exclusion), then propagate to the companion
      exactly as today (the propagation path is unchanged — it fires only
      on accepted marks, inheriting validation).
    - **Refuse:** no marks, no refresh, no wheel push; bump the counter.
@@ -917,9 +945,28 @@ hygiene, Junos reaps idle flows too).
 ### 5.6 Constructor gating (sites 2b + 2c)
 
 **Reverse-NAT synth (site 2b):** `install_reverse_session_from_forward_match`
-(`shared_ops.rs:857-865`) holds the `forward_match` in hand. When the
-current packet is closing-flagged, validate it (§5.4) against the FORWARD
-entry's anchor first (the cross-direction legs cover a reverse-direction
+(`shared_ops.rs:857-865`) holds the `forward_match` in hand. **The match
+carries explicit scope and identity (v10.2.0, round-84 Codex 4):**
+`lookup_forward_nat_across_scopes` returns the same `ForwardSessionMatch`
+shape for both scopes today (`shared_ops.rs:638`), and the type carries
+only key/decision/metadata (`entry.rs:208`) — the plan's Local-vs-Shared
+rule is not implementable on that shape. The match gains a
+`scope: Local | Shared` tag plus the identity it was found under
+(canonical key + NAT decision). Validation runs ONLY on a `Local` match,
+and the anchor read/mark re-probe must confirm IDENTITY AGREEMENT — the
+re-probed entry's canonical key AND NAT decision equal the match's —
+before reading or marking (round-84 Codex 4's wrong-flow trace: an old
+shared reverse alias for `K/NAT1` can survive while a local replacement
+`K/NAT2` exists; the old reply tuple misses the local NAT index, returns
+the Shared `K/NAT1` match, and a key-only re-probe would validate against
+the WRONG flow and mark the replacement while synthesizing the old
+decision — shared publication inserts new aliases without removing the
+prior decision's, `shared_ops.rs:897`). **A `Shared` match refuses even
+when the same canonical key is locally occupied** (the local entry is a
+different flow generation), and any identity disagreement refuses.
+When the current packet is
+closing-flagged, validate it (§5.4) against the FORWARD entry's anchor
+first (the cross-direction legs cover a reverse-direction
 close — `ack_hi(fwd)` pins the reverse stream's position). A LOCAL forward
 entry carries its anchor; a SHARED `ForwardSessionMatch` carries only
 key/decision/metadata (`entry.rs:209`, `shared_ops.rs:638-665`) → no
@@ -1052,27 +1099,38 @@ non-close path.
   `upsert_synced_with_origin` gain a seed-suppression input (validated
   vs refused) replacing today's raw `tcp_flags` seed at
   `install.rs:179-180/399-400` for the gated paths.
-- `retry_pending_neigh` re-resolves once against live state (§5.2) and
-  never transmits a buffered stale decision; the expiry pass skips any
-  entry with a packet in the pending-neighbor queue (the bounded
-  interim-expiry hold, §5.2).
-- **MissingNeighbor dispatch provenance (v10.1.0, round-83 Codex 1):**
-  the disposition arm's `MissingNeighborSeed` install
-  (`poll_descriptor/mod.rs:4787`) is gated on a genuine top-level session
-  MISS — mechanically: the arm receives the resolve outcome's provenance
-  (`resolved_from_live_entry: bool`, true when
-  `resolve_flow_session_decision` returned a decision, false on the
-  cold/policy path), and the seed install is skipped whenever it is
-  true; a HIT-resolved MissingNeighbor (the resolve layer returned a
-  live-entry decision — including a validator-REFUSED close or a 2b
-  REFUSE) buffers the packet against the existing entry and installs
-  nothing. The gated close verdict is terminal across dispatch; a
-  live/marked entry can never be replaced by a transient raw-flags seed.
-- **Probation local-only reap (v10.1.0, round-83 Codex 2):**
-  `ExpiredSession` carries the probation flag; a probation expiry skips
-  the NAT release (`worker/loop_body/mod.rs:1491-1504`) and the BPF
-  session-map family-key delete (`bpf_map/mod.rs:633, :704`), removing
-  only the worker's local table entry.
+- `retry_pending_neigh` is **UNCHANGED** (master's buffered-decision
+  transmit; the v10.1 re-resolve/hold design is retracted, §5.2). A
+  buffered packet never runs the anchor hook, the promote, or the
+  probation clear (no `SessionTable` on the retry path — the next
+  unbuffered packet does all three).
+- **MissingNeighbor dispatch typed outcomes (v10.2.0, round-83 Codex 1 +
+  round-84 Codex 1):** the disposition arm branches AT THE ARM HEAD on
+  the resolve outcome — `ExistingResolved` (live entry resolved: buffer
+  with the resolver's stored decision; no seed-only NAT/NPT derivation
+  or allocation, metadata, counters, install, rollback, or publication
+  runs), `SeedInstalled` (genuine miss: today's full seed transaction),
+  `SeedRefused` (miss refused: today's drop). Mechanically the resolve
+  layer returns the provenance alongside the decision; the arm's
+  seed-only block is skipped wholesale when a live entry was resolved.
+- **`MissingNeighborSeed` lifecycle completion (v10.2.0, round-84 Codex
+  3):** an idempotent in-place origin flip `MissingNeighborSeed →
+  ForwardFlow` on any COMMITTED packet (fresh-packet commit arm, or the
+  accepted-close mark application, §5.5); every seed-class expiry
+  additionally removes the install-published shared/DNAT aliases
+  (`poll_descriptor/mod.rs:4823, :4879`) keyed from the entry's own
+  decision, ONLY on owner-identity match.
+- **`ForwardSessionMatch` scope + identity (v10.2.0, round-84 Codex
+  4):** the type gains `scope: Local | Shared` and the identity
+  (canonical key + NAT decision) it was found under; site-2b validation
+  and anchor re-probe require Local scope AND identity agreement
+  (§5.6).
+- **Probation local-only reap (v10.1.0, round-83 Codex 2 — confirmed
+  RESOLVED at round 84):** `ExpiredSession` carries the probation flag;
+  a probation expiry skips the NAT release
+  (`worker/loop_body/mod.rs:1491-1504`) and the BPF session-map
+  family-key delete (`bpf_map/mod.rs:633, :704`), removing only the
+  worker's local table entry.
 - The `promote_from_reverse` in-borrow established-promote becomes
   post-borrow and proof-gated; `maybe_promote_synced_session` skips
   closing-flagged packets wholesale and probation entries until cleared.
@@ -1150,11 +1208,13 @@ untouched.
   import → no mark, no promote, no delta.
 - **Emission completeness (the zero-producer rules):** an ACCEPTED close
   always leaves exactly one emitting entry: the hit-path accept marks the
-  matched entry and propagates to the companion (#4109, unchanged); the
-  reverse-synth accept marks the forward family at resolve
+  matched entry and propagates to the companion (#4109, unchanged) —
+  **flipping a `MissingNeighborSeed` match to `ForwardFlow` in the same
+  write so the transient-seed exclusion cannot suppress the delta
+  (§5.5)**; the reverse-synth accept marks the forward family at resolve
   (§5.6) so the owner's forward entry emits at its 2 s reap; **and no
   dispatch path can replace a live/marked entry with a transient seed
-  (the site-9 provenance gate, §3/§5.8) — the accepted close's sole
+  (the site-9 typed-outcome gate, §3/§5.8) — the accepted close's sole
   producer survives to its reap**; a refused
   close leaves no mark anywhere, so master's ordinary-timeout emission
   semantics apply unchanged (locally-born entries emit at natural reap;
@@ -1170,10 +1230,14 @@ untouched.
 - **Reap-side locality (v10.1.0):** a probation entry's expiry is
   local-only (§5.6/§5.8): no NAT release, no BPF family-key delete, no
   delta. The global cleanup of a flow's NAT reservation and BPF keys
-  happens exactly once, at the owner/live entry's own reap — master's
-  unconditional cleanup of a NON-owner copy is the #6522 class
-  (§10.6.1) and the probation constructor must not multiply its trigger
-  rate.
+  happens at the owner/live entry's own reap — the authoritative
+  cleanup event for the family (master's unrefcounted sibling cleanup
+  calls are the pre-existing #6522 class, §10.6.1) — and the probation
+  constructor must not multiply its trigger rate. **`MissingNeighborSeed`
+  expiry (v10.2.0):** every seed-class expiry additionally removes the
+  install-published shared/DNAT aliases on owner-identity match
+  (§5.2/§5.8); a flipped (traffic-confirmed) seed emits its Close
+  normally.
 - **Hot-path discipline:** zero new allocations; zero new atomics; the
   per-TCP-data-packet cost inside `account_packet`'s existing probe is one
   8-byte read + ≤2 gated stores; closing segments add one table probe on a
@@ -1254,7 +1318,15 @@ untouched.
   delta classes; (c) #6522, the unconditional NAT release at reap
   (`worker/loop_body/mod.rs:1491-1498` → `nat/allocator.rs:1318`
   `release_flow` — no replica refcount) — pre-existing, verified, own
-  issue (§10.6.1).
+  issue (§10.6.1); **(d) the pending-neighbor buffered stale-decision
+  transmit window (v10.2.0, stated):** master's retry transmits the
+  buffered NAT/egress decision even when the entry expired or was
+  transient-purged (`promote.rs:167`) during the ARP wait — including
+  an admitted close, which master DELIVERS; this plan preserves master's
+  retry byte-for-byte (the v7.5-era never-transmit-stale hardening is a
+  follow-up candidate, §10.6.2 — the round-84 review sketched its
+  correct typed-outcome shape, and the v10.1 attempt at it here
+  generated four BLOCKERs of local machinery for zero gate benefit).
 
 ---
 
@@ -1267,9 +1339,10 @@ untouched.
 | Performance regression | LOW-MED | ~41 B/entry slab growth (~5.4 MiB/worker at cap); one TCP-header view compute (seq/ack/wnd/flags/seg_len) + ≤2 gated stores per committed TCP data packet (closing segments skip updates entirely); one extra probe per closing segment. Must be measured at minimum-frame rates (§9) — the 23 Gbit/s MTU-sized iperf run alone is insufficient (≈37 Mpps at 25 Gbit/s small-frame is the real gate; `iperf3 -l 64` is a proxy, not a demonstrated line-rate generator — gate on pps, not bandwidth). |
 | Architectural mismatch | LOW | No new subsystem; anchors at the existing #2501/#3706 chokepoints; #4400-style always-on gate. No pipeline restructure. No distributed protocol. |
 | HA / rolling upgrade | LOW | No wire change; mixed-version pair behaves as same-version (a pre-upgrade node keeps master's demote behavior for its own table; the upgraded node simply refuses blind demotes on its own). Pre-upgrade and imported entries sit in the absorbing zero-trust state — closes refuse until churn (strictly more conservative than master; bounded lingering, §2; Phase 2 §10.5 closes it for synced flows). The replica no-Close invariant + the SharedPromote refuse trace are regression-tested. |
-| Pending-neighbor behavior change | LOW-MED | `retry_pending_neigh` now re-resolves once and never transmits a buffered stale decision (today it reuses the buffered decision). Cost: one extra resolution per ARP-pending retry (rare path); a second MissingNeighbor drops. Benefit: closes the stale-NAT-decision transmit window on the retry path. The bounded interim-expiry hold (an entry with a pending packet cannot expire) preserves master's admitted-hit delivery exactly — no new drop class (round-83 Codex 3, unit-tested §9). |
-| Dispatch-path provenance | LOW-MED | The `MissingNeighborSeed` install is restricted to genuine top-level misses (round-83 Codex 1): a HIT-resolved MissingNeighbor buffers against the live entry and installs nothing. Risk is a behavior change confined to the hit-with-cold-neighbor corner (previously the live entry was replaced by a raw-flags seed — itself master's unguarded demote path); unit-tested for both refused and accepted closes. |
-| Probation reap locality | LOW | A probation expiry is local-only (round-83 Codex 2): no NAT release, no BPF family-key delete. Strictly safer than master's born-dying materialized copy (which runs the full cleanup at 2 s — the #6522 class); the owner entry's own reap performs global cleanup exactly once as master. |
+| Pending-neighbor behavior | LOW | Master's buffered-decision retry is UNCHANGED (v10.2.0 retreat): no re-resolution, no hold, no new drop class, no stale-transmit change — the admitted-close delivery is master-parity, and the pre-existing stale-decision window is documented (§7 race d, follow-up §10.6.2). Buffered packets never move the anchor — a fail-toward-refuse residual (anchors lag behind long ARP stalls; closes soft-refuse; entries idle out normally), never a walk/poison channel. |
+| Dispatch-path provenance | LOW-MED | The MissingNeighbor arm branches on typed resolve outcomes at the arm head (round-83 Codex 1 + round-84 Codex 1): `ExistingResolved` preserves the resolver decision and allocator state exactly (no seed-only work runs); `SeedInstalled`/`SeedRefused` are today's miss paths. Risk is confined to the hit-with-cold-neighbor corner (previously the live entry was replaced by a raw-flags seed — master's unguarded demote path); unit-tested for refused and accepted closes and for the no-allocation-leak case. |
+| Probation reap locality | LOW | A probation expiry is local-only (round-83 Codex 2): no NAT release, no BPF family-key delete. Strictly safer than master's born-dying materialized copy (which runs the full cleanup at 2 s — the #6522 class); the owner entry's own reap is the family's authoritative cleanup event. |
+| Seed lifecycle completion | LOW-MED | The idempotent `MissingNeighborSeed → ForwardFlow` flip on committed traffic + seed-expiry alias cleanup (owner-identity match) changes master's seed-class accounting: an Open fires once at seed install (never re-emitted), a confirmed flow's Close now emits (zero-producer trace closed), aliases are reclaimed at seed expiry (stale-alias trace closed). Origin-flip accounting is unit-tested; the alias owner-identity guard keeps the #6522-class shared-state residual unchanged. |
 | Merge collision | LOW | No `FlowCacheEntry` change. `account_packet` hook addition is local to two call sites; `SessionInstall`/`SessionUpdate` gains are crate-internal. |
 
 ---
@@ -1352,24 +1425,44 @@ values (probabilistic sprays can legitimately hit the admitted interval):
 - **Refused-close inertness:** no mark, no `last_seen_ns` refresh, no
   wheel re-queue, `tcp_close_seq_rejected` bumps; the entry's
   pre-refusal expiry trajectory is bit-identical.
-- **Pending-neighbor:** a buffered close delivers on retry with the
-  FRESH decision (re-resolve-once; a second MissingNeighbor drops; no
-  transmit on a stale NAT/egress decision); a buffered SYN-ACK's
-  establishment promote fires only on the strong proof at re-resolution;
-  **the interim-expiry hold: an entry with a queued pending-neighbor
-  packet is skipped by the expiry pass (and its NAT reservation
-  survives) until the pending resolves or times out — a soft-refused
-  close admitted as a hit is NEVER reclassified into the #4400
-  miss/drop class (round-83 Codex 3), and master's pending-timeout drop
-  is unchanged.**
-- **Site-9 dispatch provenance (round-83 Codex 1):** a HIT-resolved
-  MissingNeighbor (a) on a validator-REFUSED close: no seed install, the
-  live entry survives unmarked, the packet buffers against it; (b) on an
-  ACCEPTED marked close: the marked entry is never replaced, the sole
-  producer survives to its 2 s reap and emits exactly one Close delta;
-  (c) a genuine top-level MISS with a bare close still drops at the
-  #4400 guard before the arm; (d) a miss with SYN|close combo still
-  seeds from raw flags (site-3 residual, self-anchoring invented tuple).
+- **Pending-neighbor (v10.2.0 posture):** master's buffered-decision
+  retry is byte-identical (an admitted close transmits on the buffered
+  decision even after an interim expiry — delivery parity); a buffered
+  packet NEVER moves the anchor, NEVER drives the establishment promote,
+  NEVER clears probation (the next unbuffered packet does all three);
+  a buffered SYN-ACK delivering without its promote leaves the entry
+  OPENING exactly as master (20 s window if no further packet).
+- **Site-9 typed outcomes (round-83 Codex 1 + round-84 Codex 1):**
+  (a) `ExistingResolved` on a validator-REFUSED close with a cold next
+  hop: NO seed transaction — assert no NAT/NPT derivation ran (no
+  `live_by_flow` allocation leak, `nat/source.rs:1548`), no metadata/
+  counters/install/publication, the live entry survives unmarked, the
+  packet buffers with the resolver's stored decision; (b)
+  `ExistingResolved` on an ACCEPTED marked close: the marked entry is
+  never replaced, the sole producer survives to its 2 s reap and emits
+  exactly one Close delta; (c) a genuine top-level MISS with a bare
+  close still drops at the #4400 guard before the arm (`SeedRefused`);
+  (d) a miss with SYN|close combo still seeds from raw flags
+  (`SeedInstalled`, site-3 residual, self-anchoring invented tuple);
+  (e) a config-update pool-SNAT-matching live no-SNAT flow HIT with a
+  cold next hop: `ExistingResolved` — allocator state bit-identical
+  (round-84 Codex 1's pool-exhaustion trace).
+- **Seed lifecycle completion (round-84 Codex 3):** a committed
+  non-close packet on a `MissingNeighborSeed` entry flips origin to
+  `ForwardFlow` idempotently (Open emitted exactly once — at install,
+  never at the flip; session-limit accounting unchanged); an accepted
+  validated close on a seed flips in the mark application and the 2 s
+  reap emits the Close delta (zero-producer trace closed); an
+  uncommitted seed expiry AND a committed seed expiry each remove the
+  install-published shared/DNAT aliases on owner-identity match (and
+  leave aliases owned by a newer live entry untouched); a stale shared
+  seed can never be materialized with a released translation.
+- **Site-2b scope + identity (round-84 Codex 4):** a `Shared` match
+  refuses even when the same canonical key is locally occupied; a Local
+  match whose re-probed entry disagrees on key or NAT decision refuses
+  (the `K/NAT1` shared-alias vs `K/NAT2` local-replacement wrong-flow
+  trace); a Local identity-agreeing match validates and marks the
+  forward family in the same resolve.
 - **Probation local-only reap (round-83 Codex 2):** a probation expiry
   removes only the local table entry — assert NO `release_flow` call, NO
   NAT64 release, NO BPF family-key delete, NO delta; the owner/live
@@ -1501,45 +1594,61 @@ this branch only if the minimal fix proves insufficient.
   pre-existing master timing; the v9.x commit-arm restructure is cut
   with the machinery (the probation suppression in §5.5 covers the only
   NEW chain this plan would otherwise introduce).
+- **Pending-neighbor buffered stale-decision transmit (v10.2.0):**
+  master's retry transmits the buffered NAT/egress decision even when
+  the entry expired or was transient-purged during the ARP wait
+  (`neighbor_dispatch.rs:272, :310, :344, :369`; `promote.rs:167`) —
+  pre-existing; this plan preserves master's retry byte-for-byte. The
+  never-transmit-stale hardening is the follow-up: the correct shape is
+  the typed resolve outcome (`LocalFamily{forward, matched}` /
+  `ResolvedWithoutLocalBacking` / genuine miss) plus a family-covering,
+  cumulatively-bounded hold that round-84 sketched — NOT the
+  v10.1 re-resolve/blanket-hold design, which generated four BLOCKERs
+  of local machinery for zero gate benefit.
 
 ---
 
-## 11. Open questions for the convergence round (v10.1.0)
+## 11. Open questions for the convergence round (v10.2.0)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
-   probation, normative mark-creation with master's emission gate
-   unchanged, site-9 dispatch provenance, probation local-only reap,
-   the pending interim-expiry hold) close the issue and its HA teeth.
-   The machinery is cut, not hidden (§10.6). Is any part of the ISSUE's
-   actual harm — firewall-state kill, SNAT mid-flow port swap, HA
-   standby propagation — left unaddressed? Name it with a trace, or the
-   cut stands.
-2. **Round-83 fold verification (Codex 1/2/3):** (a) the
-   MissingNeighbor seed install is now restricted to genuine top-level
-   misses — is the gated close verdict terminal across every dispatch
-   path, or is there a second arm that installs/replaces from raw flags
-   on a hit? (b) the probation reap is local-only — is any residual
-   global-state teardown path reachable for a non-owner copy (NAT64,
-   GRE, tunnel, shared-map publish)? (c) the pending interim-expiry
-   hold — can an entry with a pending packet still expire early through
-   a second path (control-socket delete, GC class, RG vacate), and is
-   the hold's bounding (pending timeout) stated tightly enough?
-3. **The emission posture:** master's `expire.rs:342-350` gate is
-   UNCHANGED; v10.1.0's additions are the normative mark-creation rules
-   plus rule 5 plus the reverse-synth forward-family mark plus the
-   site-9 producer-survival rule. Any remaining zero-producer or
+   probation + local-only probation reap, normative mark-creation with
+   master's emission gate unchanged, the site-9 typed-outcome gate, the
+   seed-lifecycle completion, the 2b scope/identity discipline) close
+   the issue and its HA teeth. The machinery is cut, not hidden (§10.6).
+   Is any part of the ISSUE's actual harm — firewall-state kill, SNAT
+   mid-flow port swap, HA standby propagation — left unaddressed? Name
+   it with a trace, or the cut stands.
+2. **The pending-neighbor RETREAT (v10.2.0):** master's buffered-
+   decision retry is byte-identical; the v10.1 re-resolve/hold design
+   is retracted (its four round-84 BLOCKERs were all machinery defending
+   an out-of-scope improvement); buffered packets never move the anchor
+   (fail-toward-refuse residual); the stale-decision transmit window is
+   documented as pre-existing (§7 race d) with the never-transmit-stale
+   hardening deferred to §10.6.2. Does any reviewer hold that the
+   stale-decision window MUST be closed in this plan — given that it is
+   pre-existing on master, is not a demote-gate concern, and the only
+   reviewed designs for closing it produced BLOCKERs? Trace the
+   ISSUE-class harm, or the retreat stands.
+3. **Round-84 fold verification:** (a) site-9 typed outcomes — is the
+   gated close verdict terminal across every dispatch arm, with no
+   residual seed-only side effect on `ExistingResolved`? (b) seed
+   lifecycle — does the flip + owner-identity alias cleanup close the
+   zero-producer and stale-alias traces without a new accounting hole?
+   (c) 2b scope/identity — is the wrong-flow trace dead on all three of
+   Shared-match, key-mismatch, NAT-mismatch? (d) any SECOND
+   closing/reset installer arm still ungated?
+4. **The emission posture:** master's `expire.rs:342-350` gate is
+   UNCHANGED; the additions are the normative mark-creation rules, rule
+   5, the reverse-synth forward-family mark, the site-9 producer-
+   survival rule, and the seed flip. Any remaining zero-producer or
    duplicate-producer trace?
-4. **Attack-surface arithmetic (restated for the cut):** ~1/2^12 (cap)
-   to ~1/2^14 (floor) per blind packet; ~6.5–11 s of sustained
-   1,000 pkt/s spray per kill; every successful mark validated against
-   observed flow state. Confirmed against §5.4's leg intervals as
-   written? (Round-83 Codex recomputed and confirmed: 393,219 ≈
-   1/10,923 floor; 655,355 ≈ 1/6,554 cap.)
-5. **The re-scope:** #6522 to its own `/engineer` effort (minimal
-   refcount/owner-only-release fix first); the §10.6.2 races as
-   follow-up candidates; Phase 2 on its own track. Round-83 Codex's
-   §11 answer agreed the removed protocol need not ship, conditional on
-   the three local rules (now folded). Does any reviewer hold that
-   anything further MUST ship in this plan for the issue's fix to be
-   safe? Trace required.
+5. **Attack-surface arithmetic (restated):** ~1/2^12 (cap) to ~1/2^14
+   (floor) per blind packet; ~6.5–11 s of sustained 1,000 pkt/s spray
+   per kill; every successful mark validated against observed flow
+   state. (Confirmed by round-83 AND round-84 Codex recomputation:
+   393,219 ≈ 1/10,923; 655,355 ≈ 1/6,554.)
+6. **The re-scope:** #6522 to its own `/engineer` effort; the §10.6.2
+   races (now incl. the stale-decision window) as follow-up candidates;
+   Phase 2 on its own track. Does anything further MUST ship in this
+   plan for the issue's fix to be safe? Trace required.
