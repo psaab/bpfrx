@@ -1,6 +1,6 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.1.0 — THE TERMINAL CUT, round-83 folds. Ship
+**Status: DRAFT v10.1.1 — THE TERMINAL CUT, round-83 folds. Ship
 candidate = the Part-A dataplane demote gate plus the wire-free local HA
 rules. The RG-incarnation/retirement/fence-ledger protocol that rounds
 13–82 grew is KILLED (not deferred): its two customers are re-scoped —
@@ -521,7 +521,15 @@ request-build stage:
   everything against live state. Demote marking for an ACCEPTED close
   stays at resolve time (master parity — a close buffered for ARP
   already demotes on master; only anchor updates and the establishment
-  promote are delivery-gated).
+  promote are delivery-gated). **Non-expiry removals during a pend
+  (stated):** the hold covers the expiry pass only — an operator
+  control-socket session delete (`clear security flow session`) still
+  removes the entry; the pending packet's retry then re-resolves to a
+  miss and drops (operator intent dominates; master would transmit the
+  buffered stale decision — the drop is deliberate, and the flow was
+  just operator-killed anyway). RG vacate touches shared slots, not the
+  local entry — the retry re-resolves to the post-vacate disposition
+  (HAInactive/FabricRedirect) and standard-dispatches fresh.
 - **Residual (documented):** TX-completion failure (driver/UMEM ring
   after final admission) is the irreducible unobserved tail — not
   per-packet steerable in any sequence-targeted way. **Runtime-capacity
@@ -1051,7 +1059,11 @@ non-close path.
 - **MissingNeighbor dispatch provenance (v10.1.0, round-83 Codex 1):**
   the disposition arm's `MissingNeighborSeed` install
   (`poll_descriptor/mod.rs:4787`) is gated on a genuine top-level session
-  MISS; a HIT-resolved MissingNeighbor (the resolve layer returned a
+  MISS — mechanically: the arm receives the resolve outcome's provenance
+  (`resolved_from_live_entry: bool`, true when
+  `resolve_flow_session_decision` returned a decision, false on the
+  cold/policy path), and the seed install is skipped whenever it is
+  true; a HIT-resolved MissingNeighbor (the resolve layer returned a
   live-entry decision — including a validator-REFUSED close or a 2b
   REFUSE) buffers the packet against the existing entry and installs
   nothing. The gated close verdict is terminal across dispatch; a
