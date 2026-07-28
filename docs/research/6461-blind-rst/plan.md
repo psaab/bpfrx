@@ -1,6 +1,6 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.0.0 — THE TERMINAL CUT. Ship candidate = the Part-A
+**Status: DRAFT v10.0.2 — THE TERMINAL CUT. Ship candidate = the Part-A
 dataplane demote gate plus the wire-free local HA rules. The
 RG-incarnation/retirement/fence-ledger protocol that rounds 13–82 grew is
 KILLED (not deferred): its two customers are re-scoped — the pre-existing
@@ -768,9 +768,13 @@ honestly stated in §2 (worst disjoint 655,355 ≈ 1/6,554 at the cap;
    connection-refused RST AND its TFO-reject sibling; (b) **self-abort
    leg:** `seg.seq ∈ [open_ack_lo(D), open_ack_hi(D)]` (the aborting
    side's own SYN interval — a client aborting its half-open connection
-   RSTs at `isn+1`; the residual — sent-data-then-abort before
-   establishment, seq beyond the SYN interval — soft-refuses inside the
-   20 s opening window, negligible). Install seeds are trusted, so an
+   RSTs at `isn+1`; the residuals — sent-data-then-abort before
+   establishment, seq beyond the SYN interval, and TFO retransmit
+   seed-variance (a retransmitted SYN carrying a different data length
+   than the first SYN can make a legit SYN-ACK ack beyond
+   `open_ack_hi`, stranding the proof and leaving the ack side
+   untrusted for the entry's life — the §2 absorbing class, bounded)
+   — soft-refuse inside the 20 s opening window, negligible). Install seeds are trusted, so an
    OPENING entry always has at least its creating direction's trusted
    baseline; a materialized OPENING import with no local observation
    falls to rule 3 (20 s opening window — the lingering cost of a
@@ -875,12 +879,21 @@ key/decision/metadata (`entry.rs:209`, `shared_ops.rs:638-665`) → no
 baseline → refuse:
 
 - **Accept** → install with `closing`/`reset` seeded as today, AND the
-  mark is applied to the FORWARD family atomically in the same resolve
+  mark is applied to the FORWARD family in the same resolve — two
+  sequential same-worker writes: install the reverse companion, then
+  re-probe and mark the local forward entry (the `forward_match` in hand
+  is a CLONE, `shared_ops.rs:638-665`; worker-owned tables have no
+  cross-worker observer, so the pair is indivisible to any reader; the
+  SHARED-match case never reaches the mark — no anchor → refuse)
   (v9, round-12 Codex 10 — v8.x marked only the reverse entry,
   `is_reverse`-silent, leaving zero producers when the forward was an
   unmarked import and no later packet arrived; the forward match is in
   hand at this site, so the forward entry/import is marked at accept
-  time, giving exactly one producer on the owner's forward entry).
+  time, giving exactly one producer on the owner's forward entry — the
+  claim scopes to the mark-creation sites; a same-node cross-worker
+  SharedPromote copy is a second LEGITIMATE emitter on master and v10
+  alike, deduped by the existing delete fan-out, `session_delta.rs:436,
+  :453` → `delete_synced.rs:16`).
   Stated honestly: #4380 companion retention (`expire.rs:318`,
   `companion_keeps_alive`) defers the reverse's 2 s reap while the
   forward companion is live (≤ the 20 s opening window for a half-open
@@ -907,16 +920,23 @@ attacker packet materializing a shared victim plants nothing usable; (ii)
 an imported replica carries no trusted anchor → every closing-flagged
 materialize is no-baseline → **refuse**: install the copy ALIVE
 (`closing=false, reset=false`) but at the **probationary opening-window
-timeout** (a full-timeout alive install lets an attacker renew an
+timeout** (bounded as `min(TCP_OPENING_TIMEOUT_NS, the imported
+entry's own expires_after_ns)` — a per-app value shorter than 20 s is
+never extended; a full-timeout alive install lets an attacker renew an
 obsolete non-NAT permit indefinitely with periodic blind closes — each
 materialize re-installs and each zombie lives 300 s; probation bounds the
-zombie to 20 s and the sustain cost to 1 packet/20 s — the same pinning
+zombie to ≤20 s and the sustain cost to 1 packet/20 s — the same pinning
 cost an attacker already pays on master to keep any entry alive with
 ordinary traffic, so no new pin primitive). The probation entry carries
 an explicit `probation: bool` that (a) suppresses ownership promotion,
 Open emission, and replication (§5.5), and (b) clears on the first
 COMMITTED non-close packet, which also refreshes the entry to its
-ordinary established timeout. Unlike site 2b the install cannot be
+ordinary established timeout. **The clear+refresh runs at the MATCHED
+entry's own commit arm — the entry the packet hit — independent of the
+anchor's reverse→forward hop** (the probation flag lives on the
+materialized entry, which may be a reverse-key entry; wiring the clear
+through the anchor hook would clear the wrong store and strand a live
+flow on 20 s probation churn). Unlike site 2b the install cannot be
 skipped — the packet needs its decision and the entry must own the flow
 going forward — so the seed is suppressed instead. **No family clock, no
 sweep, no incarnation recheck** (v9.x's probation-family-clock coupling
@@ -1134,8 +1154,9 @@ untouched.
   by the inbound ACK stream (cross-direction leg) — the attack-relevant
   inbound direction is fully tracked.
 - **Documented pre-existing races (not widened by this plan; owned by
-  §10.6):** (a) the publish-before-command demotion ordering
-  (`state.rs:72`, `worker/loop_body/mod.rs:682`) can emit an old-owner
+  §10.6):** (a) the publish-before-command demotion ordering (the loop
+  publishes binding state before applying queued coordinator commands,
+  `worker/loop_body/mod.rs:678-690`) can emit an old-owner
   Close during the retag window — master has this race today; the gate
   neither widens nor narrows it; (b) a stale queued Close delta can
   key-delete a reinstalled same-key replacement entry (the delta
@@ -1224,13 +1245,17 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   reply re-synthesizes and revalidates); site 2c refuse → install ALIVE
   at the probation timeout with `closing=false, reset=false`; site 2c
   with a non-close attacker packet → untrusted samples only.
-- **Probation two-branch:** (a) a blind non-close packet that is
-  FILTERED/TTL-dropped: probation untouched (no clear, no refresh, no
-  Open, no replication); (b) a blind non-close that COMMITS: probation
-  clears exactly once, ordinary established idle refresh, at most one
+- **Probation two-branch (both directions):** (a) a blind non-close
+  packet that is FILTERED/TTL-dropped: probation untouched (no clear, no
+  refresh, no Open, no replication); (b) a blind non-close that COMMITS:
+  probation clears exactly once AT THE MATCHED ENTRY (forward-key AND
+  reverse-key materialized entries each covered — the clear is not
+  routed through the anchor's forward hop), ordinary established idle
+  refresh, at most one
   promote/Open/replication, and subsequent hits do NOT re-promote; no
   accelerated reap and no close mark in either branch; zombie reap at
-  20 s is silent (peer-synced origin, unmarked).
+  ≤20 s (and never beyond the imported entry's own shorter per-app
+  timeout) is silent (peer-synced origin, unmarked).
 - **Refused-close inertness:** no mark, no `last_seen_ns` refresh, no
   wheel re-queue, `tcp_close_seq_rejected` bumps; the entry's
   pre-refusal expiry trajectory is bit-identical.
@@ -1375,10 +1400,12 @@ this branch only if the minimal fix proves insufficient.
    firewall-state kill, SNAT mid-flow port swap, HA standby propagation —
    left unaddressed? Name it with a trace, or the cut stands.
 2. **Probation without the family clock (the one NEW simplification in
-   v10):** a refused closing-flagged materialize installs ALIVE at the
-   20 s opening-window timeout with `probation: bool` (suppresses
+   v10):** a refused closing-flagged materialize installs ALIVE at a
+   bounded probation timeout (`min(20 s opening window, the imported
+   entry's own expires_after_ns)`) with `probation: bool` (suppresses
    ownership promotion/Open/replication; clears on the first COMMITTED
-   non-close packet, which refreshes to the ordinary established
+   non-close packet AT THE MATCHED ENTRY — not through the anchor's
+   forward hop — which refreshes to the ordinary established
    timeout). v9.x coupled probation to a family-clock push to avoid
    shortening live siblings; the family clock is cut, and with it the
    coupling. Find a stale-zombie, live-sibling-shortening, or
