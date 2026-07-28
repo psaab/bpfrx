@@ -17,8 +17,11 @@
   blind guess validates by design (the plan's honest capability claim).
 - Imported entries are zero-trust absorbing: their closes refuse until
   churn (bounded; delivery unaffected; endpoints tear down normally).
-- Cleanup of stranded shared state: the family-clock TTL sweep
-  (Part B §5.2/§7) plus the reservation-purge hook.
+- Cleanup of stranded shared state: ordinary-timeout reaping only (the
+  §2 absorbing residual — v10 cut the family-clock TTL sweep and the
+  reservation-purge hook with the rest of the Part-B machinery; a
+  probation entry's reap is local-only, and the owner/live entry's own
+  reap performs the global cleanup exactly once).
 
 ## The design as it stood at split (v8.4)
 
