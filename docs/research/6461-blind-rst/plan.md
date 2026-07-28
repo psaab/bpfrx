@@ -984,11 +984,17 @@ segments only; the no-close path is byte-identical):
      `R = reverse_session_key(K, NAT_A)` with no companion (a supported
      state, `expire.rs:508`), and A's accepted close would mark B,
      handing B the 2 s/30 s timeout, an authoritative Close, a NAT
-     release, and a delete fan-out. The propagation target must
-     RECIPROCATE: the entry at the derived key is marked only when it
-     `is_reverse` AND its `(key, nat)` reversed agrees with the
-     matched forward's `(key, nat)`; a mismatch (empty slot, unrelated
-     occupant, non-reverse origin) skips ONLY the companion mark —
+     release, and a delete fan-out. The propagation target is marked
+     only when it RECIPROCATES the matched entry's family — its
+     `(key, nat)` reversed via the same `reverse_session_key`
+     derivation equals the matched entry's `(key, nat)` — AND, when the
+     matched entry is a FORWARD, the target `is_reverse` (the
+     forward-hit companion must be a reverse entry; the unrelated
+     forward B fails this; when the matched entry is a reverse, the
+     target is the forward — not `is_reverse` — whose reciprocity was
+     already established at validation in the same post-borrow phase,
+     same thread, same derivation inputs). A mismatch (empty slot,
+     unrelated occupant, wrong flag) skips ONLY the companion mark —
      the matched entry's own mark and emission are unaffected
      (the #4109 propagation is a best-effort mirror, not the producer).
      This also closes the pre-existing master wrong-mark of the same
@@ -1755,8 +1761,9 @@ this branch only if the minimal fix proves insufficient.
   generated all four BLOCKERs — do not retry it without the full
   design.
 - **Seed-class lifecycle gaps (v10.4.0 — the second retreat):**
-  (e) the transient-seed zero-producer: an accepted close on a
-  `MissingNeighborSeed` marks it and reaps it at 2 s with NO Close
+  (e) the transient-seed zero-producer: an accepted close whose mark
+  lands on a `MissingNeighborSeed` (the hit path's matched entry, or
+  the reverse-synth accept's forward family) reaps at 2 s with NO Close
   delta — master's exact behavior (`expire.rs:342-350`'s exclusion);
   HA-safe by construction (seeds emit no Open → no peer copy exists to
   orphan); (f) the stale-alias trace: a seed's reap releases its NAT
