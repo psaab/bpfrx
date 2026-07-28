@@ -1,25 +1,24 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.4.0 — THE TERMINAL CUT, round-86 folds + the SECOND
-RETREAT (seed-lifecycle completion retracted). Ship candidate = the
-Part-A dataplane demote gate plus the wire-free local HA rules. The
-RG-incarnation/retirement/fence-ledger protocol that rounds 13–82 grew is
-KILLED (not deferred): its two customers are re-scoped — the pre-existing
-NAT-release bug #6522 to its own issue, and the Phase-2 HA-wire anchor to
-its own research track (phase2-brief.md, split at v9). Part A changes no
-HA wire format, no schema, no public API (one additive Go worker-status
-decode field for the counter). Round-83: AGY YES; Codex NO (3B/1M/2L —
-folded v10.1.x); SMR NO (1L/5nit — folded v10.0.2). Round-84: AGY YES;
-Codex NO (4B/1H/1M — folded v10.2.0 incl. the pending-neighbor RETREAT,
-accepted at round 85); SMR NO (2nit — folded v10.1.1). Round-85: AGY
-YES; Codex NO (4B — folded v10.3.0); SMR NO (2nit — folded
-in-revision). Round-86: AGY YES; Codex NO (5B/1H/1L — the flip's
-accounting/publication/identity layers, folded here by RETRACTING the
-seed-lifecycle completion: every gap it closed is pre-existing on
-master, and each fix opened the next layer, the same unfold pattern as
-rounds 13-82; the two demote-gate-correctness folds — clean pre-SNAT
-baseline for the purged class, propagation-target reciprocity — are
-KEPT).**
+**Status: DRAFT v10.4.1 — THE TERMINAL CUT, round-87 folds (purged class
+re-enters the cold/miss pipeline from the packet; editorials). Ship
+candidate = the Part-A dataplane demote gate plus the wire-free local HA
+rules. The RG-incarnation/retirement/fence-ledger protocol that rounds
+13–82 grew is KILLED (not deferred): its two customers are re-scoped —
+the pre-existing NAT-release bug #6522 to its own issue, and the Phase-2
+HA-wire anchor to its own research track (phase2-brief.md, split at v9).
+Part A changes no HA wire format, no schema, no public API (one additive
+Go worker-status decode field for the counter). Round-83: AGY YES; Codex
+NO (3B/1M/2L — folded v10.1.x); SMR NO (1L/5nit — folded v10.0.2).
+Round-84: AGY YES; Codex NO (4B/1H/1M — folded v10.2.0 incl. the
+pending-neighbor RETREAT, accepted round 85); SMR NO (2nit — folded
+v10.1.1). Round-85: AGY YES; Codex NO (4B — folded v10.3.0); SMR NO
+(2nit — folded in-revision). Round-86: AGY YES; Codex NO (5B/1H/1L —
+THE SECOND RETREAT: seed-lifecycle completion retracted v10.4.0;
+accepted round 87); SMR NO (2nit — folded in-revision). Round-87: AGY
+YES; Codex NO (2B/1L + editorials — the purged class now re-enters the
+cold/miss pipeline from the packet, sole-decision end-to-end; folded
+here).**
 
 The 82-round arc in one paragraph: the packet-level plausibility gate has
 been stable since v6 — refuse-demote on no trusted baseline, per-field
@@ -330,7 +329,7 @@ exhaustive inventory, re-verified against this branch's master base:
 | 6 | fabric-return reverse seed (`cluster_peer_return_fast_path` install) | fabric-ingress packet flags | bare closes already excluded (#4453); SYN|ACK|RST/FIN combos pass the guards (`fabric.rs:404`) and seed raw flags — an unvalidated constructor, harmless-by-class (the seed is `is_reverse` → silent at reap; the non-owner's forward import validates closes at site 1 with no anchor in Phase 1 → refuse → no mark). The seed bypasses the commit hooks so it carries no anchor — a later close on it is REFUSED (missing-forward/no-baseline, §5.1); documented |
 | 7 | CLI/control deletes, GC/reaper, screens/SYN-cookie | — | consumers / unaffected |
 | 8 | **forward-wire immutable match** — `find_forward_wire_match_with_origin` (`lookup.rs:258-293` via `shared_ops.rs:614-628`): NAT64 forward direction, hairpin, non-bijective NAT | wire packet on the forward-wire tuple | The match itself never marks (cloned decision/metadata — no `&mut`, today or after). But it is not demote-free: a promotable-origin forward-wire hit reaches `maybe_promote_synced_session` → `update_session`, which marks closing/reset from the packet's flags on master — gated by §5.5's rule 5 like every other promote (closing packets never promote → never reach `update_session`). The anchor for these flows advances from the reverse (mutable alias) direction only; pre-existing forward-direction accounting/refresh asymmetry (NAT64) is out of scope — filed as a follow-up candidate |
-| 9 | **MissingNeighbor disposition arm** — `poll_descriptor/mod.rs:4034-4798`: a packet (HIT or MISS) whose disposition is MissingNeighbor reaches the common arm, which runs seed-only NAT derivation/allocation (:4680, :4745), metadata/counters, and installs `MissingNeighborSeed(..., meta.tcp_flags)` at :4787 — `install_with_protocol_with_origin` `remove_entry`s any existing key (`install.rs:140`) and seeds `closing`/`reset`/timeout from the raw flags (`install.rs:179-180`) | any closing-flagged packet with a cold next hop; the #4400 guard at :1640 covers only the ForwardCandidate/MissingNeighbor MISS path | **gated by typed provenance (v10.3.0, round-83 Codex 1 + round-84 Codex 1 + round-85 Codex 1):** the arm branches on the resolve outcome AT THE ARM HEAD — before ANY seed-only work (NAT/NPT derivation or allocation, metadata, counters, install, rollback, publication): `ExistingResolved` (a live local entry backs the resolve — incl. a validator-REFUSED close, a 2b REFUSE, or an accepted marked close) buffers the packet with the RESOLVER's stored decision and does NOTHING else (allocator state, metadata, counters, install, publication all untouched — an unowned `live_by_flow` allocation can never leak, `nat/source.rs:1548`); `ResolvedWithoutLocalBacking` (the resolve returned `Some` but its backing was transient-purged, `session_glue/mod.rs:1178-1193` → `promote.rs:181` — `Some(resolved)` does NOT prove live backing) is treated as a GENUINE MISS end-to-end: the #4400 guard applies (a bare close DROPS, no install — the backing was authoritatively torn down; consistent with #4400's shipped miss posture), a SYN/data packet runs the FULL seed transaction as master (restoring reverse-session backing for legit replies, incl. the deterministic pool reacquire at `allocator.rs:1265`); `SeedInstalled` (genuine top-level miss, #4400-passed) runs the full seed transaction as today; `SeedRefused` (miss, refused) drops as today. The gated verdict is terminal across dispatch; a live/marked entry can never be replaced by a transient raw-flags seed; the accepted close's sole producer survives (§5.5/§5.6) |
+| 9 | **MissingNeighbor disposition arm** — `poll_descriptor/mod.rs:4034-4798`: a packet (HIT or MISS) whose disposition is MissingNeighbor reaches the common arm, which runs seed-only NAT derivation/allocation (:4680, :4745), metadata/counters, and installs `MissingNeighborSeed(..., meta.tcp_flags)` at :4787 — `install_with_protocol_with_origin` `remove_entry`s any existing key (`install.rs:140`) and seeds `closing`/`reset`/timeout from the raw flags (`install.rs:179-180`) | any closing-flagged packet with a cold next hop; the #4400 guard at :1640 covers only the ForwardCandidate/MissingNeighbor MISS path | **gated by typed provenance (v10.4.1, rounds 83-87 Codex):** the arm branches on the resolve outcome AT THE ARM HEAD — before ANY seed-only work (NAT/NPT derivation or allocation, metadata, counters, install, rollback, publication): `ExistingResolved` (a live local or shared resolve-time entry backs the resolve — incl. a validator-REFUSED close, a 2b REFUSE, or an accepted marked close) buffers the packet with the RESOLVER's stored decision and does NOTHING else (allocator state, metadata, counters, install, publication all untouched — an unowned `live_by_flow` allocation can never leak, `nat/source.rs:1548`); `ResolvedWithoutLocalBacking` (the resolve returned `Some` but its backing was transient-purged, `session_glue/mod.rs:1178-1193` → `promote.rs:181` — `Some(resolved)` does NOT prove live backing) RE-ENTERS the cold/miss pipeline from the packet exactly as if the resolve had returned `None` (pre-routing DNAT, routing, zone, policy, SNAT all derive fresh from the packet against current config; the miss-derived decision is the SOLE decision object for install, publication, buffering, replay, and reinjection; the #4400 guard applies — a bare close DROPS; the deterministic persistent reacquire at `allocator.rs:1265` still reacquires through the allocator, the owned path); `SeedInstalled` (genuine top-level miss, #4400-passed) runs the full seed transaction as today; `SeedRefused` (miss, refused) drops as today. The gated verdict is terminal across dispatch; a live/marked entry can never be replaced by a transient raw-flags seed; the accepted close's sole producer survives (§5.5/§5.6) |
 
 ---
 
@@ -571,22 +570,39 @@ request-build stage:
   site-9 typed-outcome gate (no raw-flags replace of a live/marked
   entry — §3 site 9) and the `ResolvedWithoutLocalBacking` clean
   baseline (below); both stay.
-  (iv) **`ResolvedWithoutLocalBacking` gets a clean pre-SNAT baseline
-  (v10.4.0, round-86 Codex 1):** the purged class's miss transaction
-  must NOT start from the purged session's stored decision — the purge
-  released translation `P1` (`promote.rs:181`), the resolve still
-  returns it (`session_glue/mod.rs:1194`), and the left-biased
-  `NatDecision::merge` (`nat/mod.rs:123`) keeps `P1` over the fresh
-  allocation `P2` — installing seeds/aliases with an unowned `P1`
-  (colliding with `P1`'s new owner) while `live_by_flow` records `P2`
-  (which later cleanup then cannot release — a leak). The transaction
-  for this class recomputes NAT from a CLEAN miss baseline (the purged
-  decision's NAT is discarded before derivation, so the merge takes
-  `P2`; a current configuration that no longer matches SNAT yields no
-  translation) — the deterministic persistent-reacquire case
-  (`allocator.rs:1265`) still reacquires `P1` through the allocator,
-  which is the OWNED path. Tests cover `P2 != P1` and
-  current-rule-no-longer-matches, not only reacquisition.
+  (iv) **`ResolvedWithoutLocalBacking` RE-ENTERS the cold/miss pipeline
+  from the packet (v10.4.1, round-86 Codex 1 + round-87 Codex 1/2):**
+  the purged class is treated as a genuine miss END-TO-END in the
+  strongest sense: the packet goes through the cold/miss pipeline
+  exactly as if the resolve had returned `None` — pre-routing DNAT,
+  routing, zone, policy, and SNAT all derive FRESH from the packet
+  against CURRENT config, and the resulting miss-derived decision is
+  the SOLE decision object for install, publication, buffering, replay,
+  and reinjection. The purged flow's stored decision is used for
+  NOTHING except the provenance answer ("this packet once belonged to
+  a synced flow"). Two v10.4.0 defects die by construction: (a) the
+  released `P1` can no longer split the transaction — v10.4.0's
+  "discard the NAT" left the OUTER stored decision feeding the
+  slow-path reinjection epilogue (`poll_descriptor/mod.rs:5126` →
+  `slow_path.rs:199`) while the arm's cleaned decision fed
+  install/buffer/replay, so the same flow could emit `P1` and `P2` on
+  different paths (an unowned-tuple collision and translated-source
+  change); with full re-entry there is only one decision and every
+  consumer shares it, and refusal/rollback stays terminal; (b) blanket
+  NAT clearing can no longer erase legitimate pre-routing DNAT — the
+  transient classifier (`is_translated_forward_session_key`,
+  `promote.rs:32`) is ADDRESS-only (it ignores ports, and DNAT supports
+  same-address port remapping, `destination.rs:699`), so "clear the
+  stored NAT and re-derive SNAT" could strand a `K.dst:443 →
+  same-IP:8443` flow on the wrong port; full miss-pipeline re-entry
+  recomputes the complete current pre-routing NAT (DNAT port remaps
+  included, `poll_descriptor/mod.rs:1014`), routing, zone, and policy
+  from the packet. The #4400 guard applies at the miss guard point (a
+  bare close DROPS, no install); the deterministic persistent
+  reacquire (`allocator.rs:1265`) still reacquires `P1` through the
+  allocator — the OWNED path. Tests cover `P2 != P1`,
+  current-rule-no-longer-matches, DNAT port-remap preservation, and
+  single-decision consumption across install/buffer/replay/reinjection.
 - **Residual (documented):** TX-completion failure (driver/UMEM ring
   after final admission) is the irreducible unobserved tail — not
   per-packet steerable in any sequence-targeted way. **Runtime-capacity
@@ -1168,11 +1184,16 @@ non-close path.
   `established`-class local state today).
 - `tcp_seg_view()` (§5.3) — new helper in `frame/tcp.rs`.
 - `close_seq_plausible()` (§5.4) — new pure function in `session/`.
-- `account_packet` gains the seg-view apply (two call sites:
-  `flow_cache_hit.rs:312-317`, `poll_descriptor/mod.rs:3494-3503`) — the
-  update hooks (rule 2/3/4) run from the dispatch commit arms, fed by the
-  same seg view; no signature change to the cache-hit fast path beyond the
-  added hook call.
+- `account_packet` is UNCHANGED (v10.4.1 wording, round-87 Codex
+  r86-7-disposition): counters stay exactly where #2501 put them
+  (`flow_cache_hit.rs:312-317`, `poll_descriptor/mod.rs:3494-3503` —
+  the slow-path call PRECEDES request construction/output filtering,
+  `poll_descriptor/mod.rs:3752`, which is exactly why it cannot host
+  the anchor). The anchor's update hooks (rule 2/3/4) are NEW
+  per-disposition FINAL-ADMISSION apply points in the commit arms
+  (cache-hit commit arm and slow-path commit arms), fed by the same
+  seg view — a discarded packet never reaches them, so it never moves
+  the anchor.
 - `lookup_with_origin` — close-path restructure per §5.5 (in-borrow
   capture, post-borrow validate+mark); non-close path byte-identical.
 - `install_reverse_session_from_forward_match` (site 2b) and
@@ -1186,8 +1207,8 @@ non-close path.
   buffered packet never runs the anchor hook, the promote, or the
   probation clear (no `SessionTable` on the retry path — the next
   unbuffered packet does all three).
-- **MissingNeighbor dispatch typed outcomes (v10.4.0, round-83 Codex 1 +
-  round-84 Codex 1 + round-85 Codex 1 + round-86 Codex 1):** the
+- **MissingNeighbor dispatch typed outcomes (v10.4.1, rounds 83-87
+  Codex):** the
   disposition arm branches
   AT THE ARM HEAD on the resolve outcome — `ExistingResolved` (a live
   local or shared resolve-time entry backs the resolve: buffer with the
@@ -1195,12 +1216,13 @@ non-close path.
   allocation, metadata, counters, install, rollback, or publication
   runs),
   `ResolvedWithoutLocalBacking` (resolve returned `Some` but the
-  backing was transient-purged, `session_glue/mod.rs:1178-1193`: treated
-  as a genuine miss end-to-end — #4400 guard applies, bare close drops,
-  SYN/data runs the full seed transaction **from a clean pre-SNAT
-  baseline** — the purged decision's released NAT is discarded before
-  derivation so the left-biased `NatDecision::merge` (`nat/mod.rs:123`)
-  takes the fresh allocation, never the released one),
+  backing was transient-purged, `session_glue/mod.rs:1178-1193`: the
+  packet RE-ENTERS the cold/miss pipeline exactly as if the resolve had
+  returned `None` — pre-routing DNAT, routing, zone, policy, SNAT all
+  derive fresh from the packet against current config; the
+  miss-derived decision is the SOLE decision object for install,
+  publication, buffering, replay, and reinjection; the purged stored
+  decision is used for nothing but provenance),
   `SeedInstalled` (genuine miss: today's full seed transaction),
   `SeedRefused` (miss refused: today's drop). Mechanically the resolve
   layer returns the provenance alongside the decision (including the
@@ -1318,8 +1340,9 @@ untouched.
   semantics apply unchanged (locally-born entries emit at natural reap;
   unmarked import-class reaps stay silent exactly as master). **Carve-out
   (pre-existing, master-parity — v10.4.0):** an accepted close whose
-  matched entry is a transient `MissingNeighborSeed` marks it and reaps
-  it at 2 s with NO Close delta (`expire.rs:342-350`'s transient-seed
+  mark lands on a transient `MissingNeighborSeed` — the hit path's
+  matched entry, or the reverse-synth accept's forward family — reaps
+  at 2 s with NO Close delta (`expire.rs:342-350`'s transient-seed
   exclusion — master's exact behavior for this class). The carve-out is
   HA-safe by construction: seeds emit no Open, so no HA peer copy exists
   to orphan; the residue is process-local (the install-published
@@ -1342,7 +1365,8 @@ untouched.
   calls are the pre-existing #6522 class, §10.6.1) — and the probation
   constructor must not multiply its trigger rate.
 - **Hot-path discipline:** zero new allocations; zero new atomics; the
-  per-TCP-data-packet cost inside `account_packet`'s existing probe is one
+  per-TCP-data-packet cost at the commit-arm anchor hook (riding the
+  same probe the #2501 accounting already performs) is one
   8-byte read + ≤2 gated stores; closing segments add one table probe on a
   path that already takes the full slow path. `SessionEntry` grows 40 B
   (+1 B probation) — slab is uniform, UDP/ICMP entries carry it unused.
@@ -1564,13 +1588,20 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   aliases exactly as master (the pre-existing §7 race (f)); no flip,
   no flip-time `session_limit_inc` (admission behavior unchanged,
   `session_admission.rs:29`), no flip-time Open, no id-guarded cleanup.
-- **Propagation target reciprocity (round-86 Codex 5):** an accepted
+- **Propagation target reciprocity (round-86 Codex 5 + round-87 Codex
+  3):** an accepted
   forward close whose derived companion slot holds an UNRELATED forward
   B (`is_reverse` false, or key/NAT not reciprocating): B is NOT marked
   (no wrong timeout, no wrong Close, no wrong NAT release, no fan-out);
   A's own mark and emission are unaffected; a reciprocating reverse
   companion is marked exactly as #4109 today; the pre-existing master
-  wrong-mark trace is closed by the same rule.
+  wrong-mark trace is closed by the same rule. **Positive translated-
+  family coverage (round-87 Codex 3):** reverse-hit AND forward-hit
+  propagation succeed with full key/NAT reciprocity for plain SNAT,
+  composed SNAT+DNAT hairpin, NPTv6, and NAT64 families
+  (`NatDecision::reverse` + `reverse_session_key` round-trip all four) —
+  a raw-NAT equality mistake that would skip a valid translated
+  companion fails these tests.
 - **`ResolvedWithoutLocalBacking` clean baseline (round-86 Codex 1):**
   the purged class's miss transaction discards the released `P1` before
   derivation: `P2 != P1` case — the seed/aliases install with the OWNED
@@ -1787,7 +1818,7 @@ this branch only if the minimal fix proves insufficient.
 
 ---
 
-## 11. Open questions for the convergence round (v10.4.0)
+## 11. Open questions for the convergence round (v10.4.1)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
@@ -1814,13 +1845,19 @@ this branch only if the minimal fix proves insufficient.
    pre-existing, (ii) the zero-producer case carrying no HA consequence,
    and (iii) two reviewed attempts producing cascades? Trace the
    ISSUE-class harm, or the retreats stand.
-3. **Round-86 fold verification:** (a) `ResolvedWithoutLocalBacking`
-   clean pre-SNAT baseline — is the stale-`P1` trace dead (`P2 != P1`,
-   no-longer-matches, deterministic reacquire)? (b) propagation-target
-   reciprocity — is the wrong-mark trace on the unrelated occupant B
-   dead, with the matched entry's own mark/emission unaffected? (c) the
-   §5.8/`account_packet` wording (counters unchanged; anchor rides the
-   distinct post-admission hook) — consistent now?
+3. **Round-86/87 fold verification:** (a) `ResolvedWithoutLocalBacking`
+   re-enters the cold/miss pipeline from the packet (as if the resolve
+   had returned `None`) — is the sole-decision rule airtight across
+   install, publication, buffering, replay, AND the slow-path
+   reinjection epilogue (`poll_descriptor/mod.rs:5126` →
+   `slow_path.rs:199`)? Is the DNAT port-remap case
+   (`destination.rs:699`; the address-only classifier at `promote.rs:32`)
+   safe under full re-entry? (b) propagation-target reciprocity
+   (direction-aware) — is the wrong-mark trace on the unrelated
+   occupant B dead in both directions, with positive coverage for
+   SNAT/hairpin/NPTv6/NAT64 families? (c) the `account_packet` wording
+   (counters unchanged; anchor rides the distinct post-admission hook)
+   — consistent everywhere now (§5.2, §5.8, §7)?
 4. **The emission posture:** master's `expire.rs:342-350` gate is
    UNCHANGED; the additions are the normative mark-creation rules, rule
    5, the reverse-synth forward-family mark, the site-9 producer-
