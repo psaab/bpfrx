@@ -980,8 +980,11 @@ non-close path.
 - Worker stats: `tcp_close_seq_rejected: u64` exported through the
   ordinary worker statistics surface.
 
-No Go changes. No wire changes. No schema changes. No gRPC/REST/CLI
-changes.
+Go changes: exactly one additive decode field for the counter in the
+worker-status path (the `screen_reason_drops` pattern — Rust exports,
+`BindingStatus` decodes, the manager aggregates; optionally surfaced in
+`show` output). No HA session-sync wire change. No schema change. No
+gRPC/REST/CLI grammar change.
 
 ---
 
@@ -990,8 +993,9 @@ changes.
 No public API exists to preserve: `SessionTable`, `account_packet`,
 `lookup_with_origin`, `update_session`, `install_with_protocol_with_origin`,
 `FlowCacheEntry` are all `pub(crate)`/`pub(super)`. gRPC/REST/CLI surfaces
-unchanged. **HA sync wire UNCHANGED** — the gate adds no wire field, no
-identity tail, no capability negotiation; a mixed-version pair behaves
+unchanged apart from one additive worker-status counter field (the
+`screen_reason_drops` decode pattern, §5.8). **HA sync wire UNCHANGED** —
+the gate adds no wire field, no identity tail, no capability negotiation; a mixed-version pair behaves
 exactly as a same-version pair (a pre-upgrade node simply keeps master's
 demote behavior for its own table). `UserspaceDpMeta` and the XDP shim are
 untouched.
