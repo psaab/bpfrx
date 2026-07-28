@@ -531,15 +531,20 @@ request-build stage:
   round-84 sketched — not a prerequisite for the demote gate.
   (iii) **the seed lifecycle is completed locally (round-84 Codex 3):**
   any COMMITTED packet on a `MissingNeighborSeed` entry — a fresh
-  slow-path packet at its commit arm, or an accepted validated close at
-  its post-borrow mark application — performs an idempotent in-place
+  packet at its commit arm (slow-path OR cache-hit — a pure-ACK on a
+  cached seed flow flips at `flow_cache_hit.rs:312`'s arm too), or an
+  accepted validated close at its post-borrow mark application —
+  performs an idempotent in-place
   origin flip `MissingNeighborSeed → ForwardFlow` (the entry was a
   genuine FreshPrimary install; the flip records that real traffic
   confirmed the flow; Open/create telemetry accounting is unchanged —
   emitted once at seed install, never re-emitted at the flip;
   session-limit accounting unchanged — the entry existed; shared/
   replication state published at install, `poll_descriptor/mod.rs:4823,
-  :4879`, is ADOPTED, not re-published). After the flip the entry is
+  :4879`, is ADOPTED, not re-published; **the flip re-attributes origin
+  for EMISSION gating only — no new Open delta, no re-sync, no
+  shared-map rewrite; any HA-peer copy ages on the synced timeout
+  exactly as master**). After the flip the entry is
   non-transient, so an accepted close's 2 s reap emits the Close delta
   normally — closing the accepted-close zero-producer trace
   (`expire.rs:342-350`'s transient-seed exclusion no longer applies to
