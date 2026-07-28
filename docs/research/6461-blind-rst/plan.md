@@ -4100,7 +4100,32 @@ cannot identity-match retirement records: before BIT
 deployment, the RG0-authoritative minter BACKFILLS an
 incarnation for every existing RG (minted, persisted
 in the config, and ACKed by the peer through the
-config sync) — the extension NEVER activates with an
+config sync) — with the ACK being a REAL frame
+(v9.9.54.36, round-81 Codex B6: `QueueConfig` returns
+after writing the frame (`sync_conn_config.go:230`)
+and receipt merely queues an ASYNCHRONOUS apply
+(`sync_conn_read.go:298`), which may fail — A would
+either activate before B has adopted the identities or
+wait indefinitely for a nonexistent ACK: frame **47**
+`CONFIG_APPLIED_ACK` = `(config_generation u64,
+rg_incarnation_set_digest u64)` — emitted by the
+receiver ONLY after the config's runtime adoption
+SUCCEEDS (the async apply's completion emits it on
+success; a failed apply emits a distinct failure
+report (or nothing, with the authority's bounded
+timeout treating a missing or failed ACK as
+fail-closed — the extension NEVER activates for
+un-adopted identities); the digest covers the
+canonically sorted `(rg_id, rg_incarnation)` set the
+receiver actually adopted (a partial adoption
+mismatches and is fail-closed); an authority death
+mid-backfill leaves the minted fields in the synced
+config itself (the peer's adoption is of the CONFIG,
+not of the authority — the peer applies from its own
+store and the ACK still comes); and the extension
+activates on the NEXT connection after the ACK
+(never mid-connection, per the lifetime latch));
+the extension NEVER activates with an
 un-backfilled RG (a missing identity is fail-closed:
 the RG is visible in the backfill-status display and
 the extension's activation waits for the ACK));
@@ -4152,14 +4177,28 @@ OUTSIDE the store lock before the later promotion
 lease L, stalls; L expires and B obtains the next
 lease and mints I2; A resumes and promotes I1: ONE
 shared preflight covers plain commit, commit-confirmed,
-and the applicable-bootstrap path; and the lease is a
-candidate-bound MONOTONE token (it binds the candidate
-config generation — the promotion RE-VALIDATES the
-token inside the linearization (a token whose
-generation or holder no longer matches fails the
-promote VISIBLY — A's stale I1 can never promote over
-B's I2), or the lease is HELD from preflight through
-promotion (never released between)); a
+and the applicable-bootstrap path; and the mechanism is
+ONE — the candidate-bound MONOTONE token (v9.9.54.36,
+round-81 Codex H8 + round-81 SMR F5: the fold offered
+an operative CHOICE again (token revalidation OR
+hold-through): the token binds (authority incarnation,
+lease epoch/expiry, candidate config generation AND
+content digest, and the minted identities) and is
+RE-VALIDATED INSIDE the promotion's atomic domain
+(`Store.mu`, `store_commit.go:122` — NEVER acquiring
+`Manager.mu` underneath `Store.mu` (the lock order is
+`Manager.mu` → `Store.mu`, never the reverse; the
+authority state the token needs is captured at
+preflight time INTO the token itself (the token is
+self-contained — no `Manager.mu` needed at promotion
+(`group_state.go:218`)); a token whose generation,
+digest, holder, or expiry no longer matches fails the
+promote VISIBLY — A's stalled-then-resumed I1 can
+never promote over B's I2); the hold-through
+alternative is RETRACTED (a lease held across a
+potentially-slow promotion can itself expire
+mid-promotion — the token is the self-consistent
+form)); a
 STANDALONE deployment (no `/etc/xpf/node-id`) is its
 own authority (self-mints — no block ever, round-79
 SMR F4); and the peer-down queue/status is explicit
@@ -4363,7 +4402,19 @@ bounded per target, overflow rejects the newest
 retirement with an operator error — never evicts the
 oldest — and the wake is idempotent (a flapping
 capability re-wakes; the freshness rule discards
-stale notices either way))); the pending NOTICE's
+stale notices either way); and the cover-set is
+BOUNDED BY CONSTRUCTION (v9.9.54.36, round-81 Codex B4:
+the counted predecessor vector is u8-counted (255 max)
+but the store's bound was unconstrained — at 256
+covered predecessors the required successor cannot be
+encoded: retirements per target serialize on a durable
+per-target HEAD CAS (at most ONE pending replacement
+per target at any instant — a retirement arriving
+while a replacement is pending queues behind the head
+(the head CAS), so the cover-set is bounded by the
+pending count at any instant (capped at 255 with an
+operator-visible rejection on overflow, never a silent
+truncation))); the pending NOTICE's
 activation requires its `(target incarnation,
 retirement generation)` to be CURRENT (v9.9.54.28,
 round-73 SMR F5: a NOTICE whose target has since
@@ -5561,7 +5612,20 @@ VLANs distinct (`flow_cache.rs:980`): the `root_id` IS
 the byte-exact family identity — the canonical forward
 key PLUS the ingress scope (zone, logical interface,
 VLAN) — so two families that share a bare tuple never
-share a root); and
+share a root — and EVERY dependent KEY is the COMPLETE
+family identity (v9.9.54.36, round-81 Codex B3: the
+RootRef in the VALUE cannot represent same-tuple
+families in different ingress scopes — the Rust and
+XDP canonical keys contain only the network tuple
+(`bpf_map/mod.rs:14`, `lib.rs:229`), and XDP performs
+ONE direct lookup (`lib.rs:825`): VLAN10/E1 and
+VLAN20/E2 share a five-tuple, and E2 overwrites E1's
+sole dependent-map value before either root can
+validate it: every dependent map's KEY is the complete
+family identity (the canonical forward key PLUS the
+ingress scope), so two same-tuple different-scope
+families can never collide at the map level — each has
+its own dependent rows, tags, and root); and
 VALIDATES it against the root record (a dependent is
 visible IFF `root.active_cohort_id == tag.cohort_id &&
 root.version == tag.version`); the publication writes
@@ -5714,16 +5778,32 @@ A=new is checksummed but before B is updated, BOTH
 copies are checksum-valid and DISAGREE — "read the
 GOOD copy" cannot distinguish candidate A from
 incumbent B, and a writer terminating there leaves no
-deterministic answer: the selector is a third cell
-`(active_copy, sequence)` — the writer writes copy A,
-checksums it, writes copy B, checksums it, and flips
-the selector LAST (the selector's flip is the commit);
-a reader reads the selector FIRST, then reads the
-SELECTED copy (validating its checksum — a checksum
-failure falls back to the other copy, and both failing
-is the corruption path (operator-visible)); a dead
+deterministic answer — and the write-A-then-B order
+itself destroys the incumbent BEFORE the commit
+(v9.9.54.36, round-81 Codex B2: selector=A/E1; the
+writer writes A=E2 and terminates before the selector
+flip — the selector still names A, but A no longer
+contains E1, so "a dead writer leaves the old committed
+copy" was false: the writer writes ONLY the INACTIVE
+copy (the copy the selector does NOT currently name —
+the active copy is NEVER written while it is active);
+the writer checksums the inactive copy and RELEASE-
+STORES the selector (activating the new copy — the
+selector's store is the commit, with release
+ordering); the OLD copy is retained until the flip
+completes (never overwritten in place); a reader takes
+an ACQUIRE load of the selector, then reads the
+SELECTED copy, and validates
+`copy.sequence == selector.sequence` AND the copy's
+checksum (a copy whose sequence is OLDER than the
+selector's is NEVER returned — the fallback is the
+other copy only if ITS sequence matches the selector,
+else the bounded slow path (never a silent older
+sequence)); a dead
 writer leaves the selector at the OLD copy (the flip
-never happened) — the committed state is always
+never happened — and because only the inactive copy is
+ever written, the OLD copy still holds the incumbent
+intact) — the committed state is always
 deterministic; and a reader's consecutive reads are
 version-monotonic per the selector's sequence); the recovering writer reads the GOOD
 copy to reconstruct (never guesses); the partial write is discarded, the
@@ -6510,9 +6590,22 @@ water line is per RG entry and MONOTONE (it only
 advances; the merge takes the max per entry, never a
 whole-scope replacement); the floor rides frame **45**
 `FLOOR_SYNC` = `(authority_incarnation u64,
-target_incarnation u64, entry_count u16,
+target_incarnation u64, floor_sync_id u64,
+entry_count u16,
 (rg_id u8, rg_incarnation u64,
-contiguous_high_water u64) × entry_count)` — the ONE
+contiguous_high_water u64) × entry_count)` — with the
+`floor_sync_id` IN the frame (v9.9.54.36, round-81
+Codex B5: `FLOOR_SYNC` carried no ID while
+`FLOOR_SYNC_ACK` required the receiver to echo it —
+the receiver could not construct the specified ACK and
+the sender would pend forever: the `floor_sync_id` is
+a monotone id per sync from the issuing authority,
+present in the frame itself; the sender persists the
+EXACT retry bytes (a retransmit is byte-identical, so
+the ACK's digest covers the same bytes every time);
+and frame 46 has an explicit negotiated predicate
+(extension ≥ 2 — BIT 6 AND BIT 7 active, sharing the
+42/43/44 predicate)) — the ONE
 encoding (v9.9.54.34, round-79 Codex H4 + round-79 AGY
 T2: the v9.9.54.33 "frame 44 `Floor = 2` OR frame 45"
 was an operative choice with no complete predicate or
@@ -6678,7 +6771,24 @@ under generation G, RG3 observes no attributed permit
 and lifts G→G+1, then P transfers into the CURRENT
 G+1 — its G+1 upsert check SUCCEEDS using the pre-lift
 E1: the lookup CAPTURES the RG's drain generation at
-clone time (in the same read that clones the entry),
+clone time (in the same read that clones the entry) —
+by SEQLOCK DOUBLE-COLLECT (v9.9.54.36, round-81 Codex
+B1 + round-81 SMR F1: "in the same read" has no atomic
+domain today — the current clone is protected only by
+the shared-map mutex and unlocks IMMEDIATELY
+(`shared_ops.rs:482`), and the drain state is a
+separate object: clone E1/RG3, the drain advances
+G→G+1, then read G+1 and transfer successfully,
+materializing pre-lift E1 (`session_glue/mod.rs:1157`):
+the capture is `g1 = drain_generation (acquire load);
+clone(entry); g2 = drain_generation; accept IFF
+g1 == g2` — a lift between the two reads is a detected
+tear and the packet retries (never proceeds on a
+mismatched pair); and the transfer CAS publishes the
+global intent only AFTER the double-collect validates
+(the release ordering is: double-collect validates →
+transfer CAS (acquire on the generations, release on
+the intent's publication)),
 and the transfer is ONE CAS validating `{global intent,
 discovered RG, lookup generation G, drain still open at
 G}` — a lift between lookup and transfer fails the CAS
@@ -8608,8 +8718,12 @@ admitted interval):
   watermark + proof-generation invalidation on every
   publish/retain/release (a post-proof admission
   reopens the proof); the frame-41 supersedes tail and
-  frame-42 FENCE_REPLACE_ACK (40 bytes (v9.9.54.31 — the
-  "36 bytes" was an arithmetic error) — B atomically
+  frame-42 FENCE_REPLACE_ACK (40-byte header plus the
+  counted predecessor vector (v9.9.9.54.36, round-81
+  Codex B4 — the fixed-40-byte form predated the
+  counted vector; the vector is (supersedes_count u8,
+  (authority_incarnation u64, retirement_generation u64)
+  × count)) — B atomically
   persists F2 AND T(F1) as one journaled unit, then ONE
   idempotent ACK; an authority restart resumes the
   await); the conditional decision mechanism (WHEN the
@@ -8790,8 +8904,11 @@ admitted interval):
   every staging write validates the reservation
   generation); the §9 mutex-or-CAS alternative
   retracted; the ONE floor encoding (frame 45
-  FLOOR_SYNC — extension ≥ 2 predicate, per-authority
-  vector ACK) with the TRANSACTIONAL floor-first merge
+  FLOOR_SYNC — extension ≥ 2 predicate, frame-46
+  FLOOR_SYNC_ACK echoing the frame's OWN floor_sync_id
+  (v9.9.9.54.36, round-81 Codex B5 — the v9.9.9.54.34
+  "per-authority vector ACK" was superseded by the
+  exact ID+digest ACK) with the TRANSACTIONAL floor-first merge
   (FIRST advance floors AND retire every covered Active
   record (an already-applied fence at or below the line
   is ACTIVELY cleared), THEN admit only records above
@@ -8825,7 +8942,12 @@ admitted interval):
   drops; the entry is usable ONLY after the transfer
   CAS succeeds); the atomic ACTIVE-COPY SELECTOR (a
   third cell (active_copy, sequence) — the writer
-  writes A, checksums, writes B, checksums, and flips
+  writes ONLY the INACTIVE copy (the active copy is
+  NEVER written while active), checksums it, and
+  release-stores the selector (activating the new copy —
+  the OLD copy is retained until the flip completes
+  (v9.9.54.36, round-81 Codex B2 — the write-A-then-B
+  order destroyed the incumbent before the commit);
   the selector LAST (the flip is the commit); a reader
   reads the selector FIRST, then the selected copy
   (validating its checksum); a dead writer leaves the
