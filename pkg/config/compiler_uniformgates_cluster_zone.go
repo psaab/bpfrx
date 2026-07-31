@@ -48,12 +48,17 @@ func runUniformGatesClusterZone(tree *ConfigTree, cfg *Config, opts compileOpts)
 	// commit-check (hard-reject a redundancy-group cardinality or id that
 	// exceeds the single-byte heartbeat count / GroupID fields — 256 RGs
 	// advertise as a count of 0 and desync the wire, an id > 255 truncates
-	// and collides with another group). Lenient on load / peer-sync (warn so
-	// an already-persisted or peer-synced config still boots — #1960
-	// no-brick; the heartbeat marshaler independently caps the group section
-	// to the wire limit, marshalHeartbeatBody, so a leniently-loaded
-	// over-size config is bounded, not a panic). Runs on the fully-compiled
-	// *Config (RedundancyGroups populated by compileChassis).
+	// and collides with another group; #4880 the per-RG node priority, #6549
+	// the interface-monitor weight, both of which the heartbeat / VRRP wire
+	// carries in one byte while the local election reads the raw int).
+	// Lenient on load / peer-sync (warn so an already-persisted or peer-synced
+	// config still boots — #1960 no-brick; the heartbeat marshaler
+	// independently caps the group section to the wire limit,
+	// marshalHeartbeatBody, so a leniently-loaded over-size config is bounded,
+	// not a panic, and pkg/cluster clamps a leniently-loaded interface-monitor
+	// weight — ClampInterfaceMonitorWeight / rgWeightFromDebt — so it cannot
+	// diverge the two nodes' views). Runs on the fully-compiled *Config
+	// (RedundancyGroups populated by compileChassis).
 	if err := validateChassisClusterStrict(cfg); err != nil {
 		if opts.lenientChassisRG {
 			cfg.Warnings = append(cfg.Warnings,
