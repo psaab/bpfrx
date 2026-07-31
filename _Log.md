@@ -62439,3 +62439,18 @@ break — `go vet` confirmed passing under every revert.
   vet, gofmt clean.
 - **File(s)**: pkg/dhcprelay/{pending.go,README.md,relay_binding_6562_test.go},
     _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6562 review-fold round 4 (Codex MERGE-NEEDS-MINOR, one residual —
+  the data-structure correction is CONFIRMED closed: mixed-case reclaim bounded
+  at 64 pops still leaving room for the new binding, and the fixture now
+  staggers expiries by 1ms and reaches one-live/4095-expired, failing with 4095
+  scans when the bound is removed). The residual was a documentation math error
+  in two places: `pending.go` and `README.md` both claimed a backlog clears at
+  ~65 slots per admitted packet, on the reasoning that the drain removes 64 and
+  the eviction loop frees one more. The eviction loop cannot run — after any
+  POSITIVE drain `count < capacity`, which the early return in the eviction path
+  proves. The real figure is a NET 63: 64 drained, one added. Corrected in both
+  places and stated with the reason, since the wrong number was arrived at by a
+  plausible-but-false chain that a reader would otherwise re-derive.
+- **File(s)**: pkg/dhcprelay/pending.go, pkg/dhcprelay/README.md, _Log.md
