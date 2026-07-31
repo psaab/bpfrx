@@ -715,9 +715,25 @@ func extractDelegatedPrefixes(msg *dhcpv6.Message, ifaceName string, now time.Ti
 			// never becomes a DelegatedPrefix, so it reaches neither the live
 			// set, the withdrawn set, nor the RA sender — while a sibling
 			// prefix in the same IA_PD is exactly what a correct server would
-			// have sent on its own. If the skip empties both sets, the caller
-			// treats the reply as unusable and retries rather than settling
-			// into an empty lease.
+			// have sent on its own.
+			//
+			// When the skip empties BOTH sets the outcome depends on what
+			// else the reply carried. Neither branch can yield a /0, but they
+			// are NOT the same branch (#6581 review):
+			//
+			//   - No IA_NA address either: parseV6Reply's "no usable IA_NA
+			//     address or live IA_PD prefix" guard rejects the reply and
+			//     the acquire/renew loop retries.
+			//   - A valid IA_NA address: parsing SUCCEEDS — that guard fires
+			//     only when BOTH are missing — so a mixed ia-na + ia-pd
+			//     client installs the address and simply carries no new PD.
+			//     Empty live+withdrawn then reads as SILENCE to
+			//     reconcileDelegatedPDs, which returns (prior, apply=false),
+			//     so a previously held delegation is retained untouched (the
+			//     #1844 anti-outage rule). A malformed IAPREFIX therefore
+			//     cannot clear the held set either.
+			//
+			// Pinned by TestIAPDPrefixLen6531_MixedIANAReplyStaysUsable.
 			ones, bits := prefix.Prefix.Mask.Size()
 			if bits != 128 || ones == 0 {
 				slog.Warn("DHCPv6: refusing IA_PD prefix with invalid mask",

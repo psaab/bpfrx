@@ -23,11 +23,14 @@ package dhcp
 // RED-on-revert: restore `ones, _ := prefix.Prefix.Mask.Size()` and drop the
 // `bits != 128 || ones == 0` guard in extractDelegatedPrefixes.
 // TestIAPDPrefixLen6531_WireBoundaryTable fails on the 129/130/255 rows (each
-// yields a live /0), and TestIAPDPrefixLen6531_BadSiblingDoesNotRideAlong and
-// TestIAPDPrefixLen6531_BadWithdrawalIsDropped fail as well. Every other test
-// in this file is the OVER-REACH guard and must stay GREEN under the revert.
+// yields a live /0), and TestIAPDPrefixLen6531_BadSiblingDoesNotRideAlong,
+// TestIAPDPrefixLen6531_BadWithdrawalIsDropped and
+// TestIAPDPrefixLen6531_MixedIANAReplyStaysUsable fail as well. Every other
+// test in this file is the OVER-REACH guard and must stay GREEN under the
+// revert.
 
 import (
+	"context"
 	"encoding/binary"
 	"net"
 	"net/netip"
@@ -49,6 +52,36 @@ func iaPrefixWire(prefLen uint8, ip string, preferred, valid uint32) []byte {
 
 	tlv := make([]byte, 0, 4+len(body))
 	tlv = binary.BigEndian.AppendUint16(tlv, uint16(dhcpv6.OptionIAPrefix))
+	tlv = binary.BigEndian.AppendUint16(tlv, uint16(len(body)))
+	return append(tlv, body...)
+}
+
+// iaAddrWire builds the raw bytes of one IAADDR (option 5) TLV:
+// 16B address | 4B preferred lifetime | 4B valid lifetime.
+func iaAddrWire(ip string, preferred, valid uint32) []byte {
+	body := make([]byte, 0, 24)
+	body = append(body, net.ParseIP(ip).To16()...)
+	body = binary.BigEndian.AppendUint32(body, preferred)
+	body = binary.BigEndian.AppendUint32(body, valid)
+
+	tlv := make([]byte, 0, 4+len(body))
+	tlv = binary.BigEndian.AppendUint16(tlv, uint16(dhcpv6.OptionIAAddr))
+	tlv = binary.BigEndian.AppendUint16(tlv, uint16(len(body)))
+	return append(tlv, body...)
+}
+
+// iaNAWire wraps IAADDR TLVs in an IA_NA (option 3):
+// 4B IAID | 4B T1 | 4B T2 | sub-options.
+func iaNAWire(inner ...[]byte) []byte {
+	body := []byte{0, 0, 0, 1}
+	body = binary.BigEndian.AppendUint32(body, 1800)
+	body = binary.BigEndian.AppendUint32(body, 2880)
+	for _, b := range inner {
+		body = append(body, b...)
+	}
+
+	tlv := make([]byte, 0, 4+len(body))
+	tlv = binary.BigEndian.AppendUint16(tlv, uint16(dhcpv6.OptionIANA))
 	tlv = binary.BigEndian.AppendUint16(tlv, uint16(len(body)))
 	return append(tlv, body...)
 }
@@ -122,10 +155,23 @@ func TestIAPDPrefixLen6531_WireBoundaryTable(t *testing.T) {
 			name:    "length 0 refused",
 			prefLen: 0,
 			want:    "",
-			why: "RFC 8415 has no zero-length delegation. The library maps a " +
-				"wire length of 0 to a nil Prefix, so the pre-existing nil check " +
-				"already skipped it — this row is GREEN before and after the fix " +
-				"and pins that the /0 cannot re-enter through the length-0 door.",
+			why: "Refusing a zero-length delegation is an xpf POLICY choice, not " +
+				"an RFC prohibition — do not re-justify this row by citation. " +
+				"RFC 8415 §21.22 constrains only the CLIENT's outbound hint: the " +
+				"client 'SHOULD NOT send an IA Prefix option with 0 in the " +
+				"\"prefix-length\" field (and an unspecified value (::) in the " +
+				"\"IPv6-prefix\" field)'. It sets no floor on what a server may " +
+				"delegate — its only normative statement on the field is " +
+				"'prefix-length: Length for this prefix in bits. A 1-octet " +
+				"unsigned integer.' And nothing downstream would reject the /0 " +
+				"either: RFC 4861 §4.6.2 says a Prefix Information prefix length " +
+				"'ranges from 0 to 128'. xpf refuses it because DeriveSubPrefix " +
+				"passes a /0 through unchanged and the RA sender then advertises " +
+				"::/0 to the LAN as on-link + autonomous. " +
+				"Mechanically this row is already GREEN: the library maps a wire " +
+				"length of 0 to a nil Prefix, so the pre-existing nil check " +
+				"skipped it before and after the fix — the row pins that the /0 " +
+				"cannot re-enter through the length-0 door.",
 		},
 		{
 			name:    "length 1 accepted",
@@ -279,11 +325,94 @@ func TestIAPDPrefixLen6531_BadWithdrawalIsDropped(t *testing.T) {
 	}
 }
 
-// Over-reach guard, full chain: a normal delegation decoded from the wire must
-// still survive the hop into the RA sender — DeriveSubPrefix is the boundary
-// pkg/daemon crosses (daemon_ra.go) to turn a delegated prefix into the
-// advertised one. Must stay GREEN under the revert.
-func TestIAPDPrefixLen6531_NormalDelegationStillReachesRA(t *testing.T) {
+// What ACTUALLY happens when the skip empties both PD sets, for the common
+// mixed ia-na + ia-pd client (#6581 review).
+//
+// The original fix documented this as "the reply is treated as unusable and
+// retried", which is only true for a PD-ONLY client. parseV6Reply's rejection
+// requires BOTH no IA_NA address AND no live PD, so a valid IA_NA lets parsing
+// SUCCEED even when every IAPREFIX was skipped. This test pins the real
+// behavior end-to-end through the production parser, and pins that the real
+// behavior is still safe on both counts:
+//
+//  1. The reply parses cleanly and the IA_NA address installs — dropping a
+//     malformed IAPREFIX must not cost the client its v6 address.
+//  2. NO prefix reaches either set, so nothing downstream can advertise a /0.
+//  3. Empty live+withdrawn is SILENCE to reconcileDelegatedPDs, so a prior
+//     delegation is RETAINED verbatim (apply=false, the #1844 anti-outage
+//     rule). A hostile server cannot use a malformed IAPREFIX to clear the
+//     held set — the attack the "retried" wording obscured.
+//
+// RED-on-revert (assertions, not a build break): the length-200 IAPREFIX
+// becomes a live 2001:db8:bad::/0, so assertion 2 reds ("got 1 live prefix …
+// 2001:db8:bad::/0") and assertion 3 reds twice — reconcileDelegatedPDs takes
+// the apply=true branch and the /0 lands in the reconciled set alongside the
+// held /56.
+func TestIAPDPrefixLen6531_MixedIANAReplyStaysUsable(t *testing.T) {
+	msg := decodeReplyWire(t, 1,
+		iaNAWire(iaAddrWire("2001:db8:a::5", 3600, 7200)),
+		iaPDWire(iaPrefixWire(200, "2001:db8:bad::", 3600, 7200)))
+
+	m := NewManagerForTesting(nil)
+	res, err := m.parseV6Reply(context.Background(), "wan0", msg,
+		&DHCPv6Options{IATypes: []string{"ia-na", "ia-pd"}})
+
+	// 1. The reply is USABLE — not "unusable and retried".
+	if err != nil {
+		t.Fatalf("parseV6Reply returned %v; a reply whose IA_NA address is valid "+
+			"must still parse when every IAPREFIX was skipped — the rejection at "+
+			"parseV6Reply requires BOTH no address and no live PD", err)
+	}
+	if got, want := res.lease.Address, netip.MustParsePrefix("2001:db8:a::5/128"); got != want {
+		t.Errorf("lease address = %s, want %s — the IA_NA must survive a "+
+			"skipped IAPREFIX", got, want)
+	}
+
+	// 2. Nothing reached either PD set.
+	if len(res.prefixes) != 0 {
+		t.Errorf("got %d live prefixes %v, want 0 — a wire prefix-length of 200 "+
+			"must never become a delegated prefix", len(res.prefixes), res.prefixes)
+	}
+	if len(res.withdrawnPDs) != 0 {
+		t.Errorf("got %d withdrawn prefixes %v, want 0", len(res.withdrawnPDs), res.withdrawnPDs)
+	}
+
+	// 3. Silence, not withdrawal: the held delegation is retained verbatim.
+	prior := []DelegatedPrefix{{
+		Interface:     "wan0",
+		Prefix:        netip.MustParsePrefix("2001:db8:900d::/56"),
+		ValidLifetime: 7200 * time.Second,
+	}}
+	got, apply := reconcileDelegatedPDs(prior, res.prefixes, res.withdrawnPDs)
+	if apply {
+		t.Errorf("reconcileDelegatedPDs applied a change (apply=true) for a reply "+
+			"whose only IAPREFIX was skipped; empty live+withdrawn is SILENCE and "+
+			"must retain the held set untouched (#1844). Reconciled set: %v", got)
+	}
+	if len(got) != 1 || got[0].Prefix != prior[0].Prefix {
+		t.Errorf("reconciled set = %v, want the held %v unchanged", got, prior)
+	}
+	for _, dp := range got {
+		if dp.Prefix.Bits() == 0 {
+			t.Errorf("a /0 reached the reconciled PD set: %v", dp.Prefix)
+		}
+	}
+}
+
+// Over-reach guard for the FIRST LEG of the PD → RA chain: wire bytes →
+// extractDelegatedPrefixes → DeriveSubPrefix. That is where this leg stops.
+//
+// It deliberately does NOT claim end-to-end RA coverage (#6581 review): it
+// never calls Daemon.buildRAConfigs, never calls ra.buildRA, and never
+// marshals an RA. The remaining legs are covered where their seams live —
+// pkg/daemon/ra_pd_prefixlen_6531_test.go runs the real buildRAConfigs over a
+// stored PD, and pkg/ra/sender_prefixlen_6531_test.go marshals the resulting
+// config.RAPrefix and asserts on the re-parsed wire bytes. DeriveSubPrefix is
+// the boundary pkg/daemon crosses (daemon_ra.go) to turn a delegated prefix
+// into the advertised one, so it is the right handoff point for this leg.
+//
+// Must stay GREEN under the revert.
+func TestIAPDPrefixLen6531_NormalDelegationSurvivesSubPrefixDerivation(t *testing.T) {
 	now := time.Now()
 
 	for _, tc := range []struct {

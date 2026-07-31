@@ -61540,3 +61540,42 @@ would never produce.
 - **File(s)**: pkg/dhcp/dhcpv6.go,
     pkg/dhcp/dhcpv6_iapd_prefixlen_6531_test.go,
     pkg/ra/sender_prefixlen_6531_test.go, pkg/dhcp/README.md, _Log.md
+- **Timestamp**: 2026-07-31
+- **Action**: #6531 / PR #6581 review fold — three documentation-accuracy
+  defects from the Codex review (no logic change; the guard block in
+  extractDelegatedPrefixes is byte-identical to the pre-fold commit).
+  (1) The "empty after skip is unusable and retried" claim in
+  pkg/dhcp/README.md and the extractDelegatedPrefixes comment was FALSE
+  for a mixed ia-na + ia-pd client: parseV6Reply's rejection requires
+  BOTH no IA_NA address and no live PD, so a valid IA_NA lets parsing
+  succeed with zero PDs, and reconcileDelegatedPDs then reads empty
+  live+withdrawn as SILENCE and RETAINS the prior delegation
+  (apply=false, #1844). Verified no /0 is reintroduced on either branch;
+  corrected both statements and bound them with
+  TestIAPDPrefixLen6531_MixedIANAReplyStaysUsable, which drives the real
+  parseV6Reply over hand-rolled IA_NA + IA_PD wire bytes.
+  (2) Two tests over-claimed end-to-end RA coverage. Extended where the
+  seams allowed and renamed where they did not: pkg/ra's prefixInfoFor
+  now MARSHALS the RA and asserts on the RE-PARSED wire bytes instead of
+  buildRA's in-memory option; a new pkg/daemon/ra_pd_prefixlen_6531_test.go
+  calls the real Daemon.buildRAConfigs over a seeded PD (and pins that
+  daemon_ra.go's !subPrefix.IsValid() check does NOT stop a /0);
+  NormalDelegationStillReachesRA renamed to
+  NormalDelegationSurvivesSubPrefixDerivation and re-commented to claim
+  only its leg.
+  (3) The comment "RFC 8415 has no zero-length delegation" was wrong.
+  Verified against the RFC text firsthand: §21.22 says only that a
+  CLIENT "SHOULD NOT send an IA Prefix option with 0 in the
+  'prefix-length' field (and an unspecified value (::) in the
+  'IPv6-prefix' field)" — a hint rule, no delegation floor — and RFC
+  4861 §4.6.2 says a PIO prefix length "ranges from 0 to 128". Restated
+  the row as an xpf policy choice about what is safe to advertise.
+  RED-on-revert re-audited with the guard reverted via Edit: go build +
+  go vet CLEAN (no false red), 6 pre-existing gates plus the new mixed
+  IA_NA test fail on ASSERTIONS naming the live /0, every over-reach row
+  and both consumer-side test pairs stay green. Full pkg/dhcp, pkg/ra
+  and pkg/daemon suites pass.
+- **File(s)**: pkg/dhcp/dhcpv6.go, pkg/dhcp/README.md,
+    pkg/dhcp/dhcpv6_iapd_prefixlen_6531_test.go,
+    pkg/ra/sender_prefixlen_6531_test.go,
+    pkg/daemon/ra_pd_prefixlen_6531_test.go, _Log.md

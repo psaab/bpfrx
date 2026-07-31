@@ -296,16 +296,33 @@ External only: `github.com/insomniacslk/dhcp`, `github.com/vishvananda/netlink`.
   ACK carries exactly one address+mask and there is nothing to salvage.
   A skipped entry enters neither the live nor the withdrawn set, so a
   hostile server gains nothing by pairing a malformed prefix with a
-  well-formed one; if the skip empties both sets the reply is treated as
-  unusable and retried. `/128` is ACCEPTED (a legal single-address
+  well-formed one. When the skip empties BOTH sets the outcome depends
+  on what else the reply carried — neither branch yields a `/0`, but
+  they are not the same branch. With no IA_NA address either, the "no
+  usable IA_NA address or live IA_PD prefix" guard rejects the reply and
+  the acquire/renew loop retries. With a valid IA_NA address the reply
+  is still USABLE (that guard fires only when both are missing), so a
+  mixed `ia-na` + `ia-pd` client installs the address and simply carries
+  no new PD; the empty live+withdrawn pair then reads as SILENCE to
+  `reconcileDelegatedPDs`, which returns `apply=false` so a previously
+  held delegation is retained untouched (the #1844 anti-outage rule).
+  A malformed IAPREFIX therefore cannot clear the held set either.
+  `/128` is ACCEPTED (a legal single-address
   delegation — the bound is inclusive). Pinned by
   `dhcpv6_iapd_prefixlen_6531_test.go`, which drives hand-rolled option
   BYTES through `dhcpv6.MessageFromBytes`; the older IA_PD tests build
   `OptIAPrefix` structs directly and cannot reach this path, which is how
   the bug survived (`OptIAPrefix.ToBytes` derives the wire length from
   `Mask.Size()`, so the library's own marshaller cannot emit > 128
-  either). `pkg/ra/sender_prefixlen_6531_test.go` pins the blast radius
-  from the consumer side.
+  either). The PD → RA chain downstream of the guard is covered in three
+  segments meeting at typed seams, each test claiming only its own leg:
+  `dhcpv6_iapd_prefixlen_6531_test.go` covers wire bytes → `[]DelegatedPrefix`
+  → `DeriveSubPrefix`; `pkg/daemon/ra_pd_prefixlen_6531_test.go` calls the
+  real `buildRAConfigs` to cover the stored PD → `config.RAPrefix` hop (and
+  pins that `daemon_ra.go`'s `!subPrefix.IsValid()` check does NOT stop a
+  `/0`); `pkg/ra/sender_prefixlen_6531_test.go` covers `config.RAPrefix` →
+  `buildRA` → `ndp.MarshalMessage` and asserts on the RE-PARSED wire bytes,
+  pinning the blast radius from the consumer side.
 - **RFC 3442 classless static routes (option 121 / legacy 249, #4118).**
   `leaseFromACKv4` parses option 121 (the standard `ClasslessStaticRoute`
   accessor) and falls back to the legacy Microsoft option 249 (raw
