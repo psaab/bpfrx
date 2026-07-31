@@ -3365,22 +3365,58 @@ reserved for whole-dataplane selection where a rewrite shim
   same way #4434/#4880 gate the RG id and node priority: on the COMPILED
   `*Config` in `validateChassisClusterStrict`, `0..255`, strict-reject at
   commit / warn on the tolerant load / peer-sync path. Running on the
-  compiled int covers BOTH parser shapes at once. It is a wire-width gate
-  like its siblings: the weight is the debt subtracted from the RG weight,
+  compiled int covers the flat-set and container-hierarchical shapes with
+  one gate (the PACKED one-liner `interface-monitor <if> weight <n>;`
+  written directly under `redundancy-group` is a separate matter — it
+  compiles to ZERO monitors, so the gate never sees it and no debt is
+  installed either; tracked as **#6588**). It is a wire-width gate like
+  its siblings: the weight is the debt subtracted from the RG weight,
   which the heartbeat advertises through a single byte
   (`HeartbeatGroup.Weight`, `uint8(rg.Weight)`) while the local election
   reads the raw int — `weight -100` on a down monitor left the local node
   at 355 and the peer receiving 99, so both nodes elected primary from
-  identical state. `pkg/cluster` carries the matching runtime belts so a
-  leniently-loaded value still cannot diverge:
-  `config.ClampInterfaceMonitorWeight` where the configured weight is read
-  (`pollInterfaceMonitors`, `reconcileMonitorDebtsLocked` — a NEGATIVE
-  weight there also credited debt BACK and cancelled a sibling monitor's
-  real link failure) and `rgWeightFromDebt` closing the `rg.Weight` domain
-  at every recompute site. Pinned by
-  `compiler_validate_strict_chassis_ifmon_6549_test.go` (config) and
-  `ifmon_weight_divergence_6549_test.go` (cluster)), `control-ports` (not
-  compiled), and the
+  identical state. Because the gate is DOWNGRADED on the tolerant paths,
+  the runtime — not the commit gate — is what actually holds the domain
+  closed, and it does so at the point debt is INSTALLED rather than at
+  each producer:
+  - `cluster.Manager.SetMonitorWeight` (`election.go`) clamps every debt
+    on the way in. With `reconcileMonitorDebtsLocked` it owns both of the
+    only two writes into `monitorWeights`, so the domain is closed against
+    EVERY producer — including `pkg/daemon`'s config-apply tail, which
+    feeds `pkg/routing`'s monitor statuses straight in on every commit /
+    boot Load / peer SyncApply and would otherwise OVERWRITE the clamp
+    `UpdateConfig` had just applied.
+  - `config.ClampInterfaceMonitorWeight` bounds the configured weight
+    where each producer reads it: `pollInterfaceMonitors`,
+    `reconcileMonitorDebtsLocked`, and `pkg/routing`'s
+    `monitorManager.Apply` (a NEGATIVE weight is negative DEBT — it
+    credits weight BACK and cancels a sibling monitor's real link
+    failure).
+  - `Monitor.ipTargetWeight` and the aggregate branch of
+    `desiredRGIPDebts` bound the ip-monitoring weights. This one is NOT
+    redundant with the chokepoint: in global-threshold mode a negative
+    target weight SUBTRACTS from the cumulative failure sum, so a second
+    genuinely unreachable target pushes the sum back below the threshold
+    and drops the aggregate debt the first failure installed — more
+    failures produce LESS demotion, and no `SetMonitorWeight` call happens
+    at all for the chokepoint to catch.
+  - `rgWeightFromDebt` closes the `rg.Weight` domain at every recompute
+    site, and `clampWireWeight` saturates rather than wraps at the
+    marshal boundary.
+  The display fills route through the same clamp
+  (`pkg/grpcapi/server_cluster.go`, `pkg/cli/cli_helpers.go`) so
+  `show chassis cluster interfaces` never reports a weight the election
+  does not apply. Note the ip-monitoring sibling leaves below are gated
+  ONLY by their schema `ValidateInteger(0, 255)`, which
+  `compileTreeLenient` downgrades to a warning — they carry no compiled-int
+  commit gate, so this stanza's posture is STRONGER than theirs, not
+  merely consistent with it. Pinned by
+  `compiler_validate_strict_chassis_ifmon_6549_test.go` (config),
+  `ifmon_weight_divergence_6549_test.go` +
+  `ifmon_weight_daemon_apply_6549_test.go` (cluster),
+  `monitor_weight_6549_test.go` (routing) and
+  `cluster_monitor_weight_6549_test.go` (grpcapi + cli)), `control-ports`
+  (not compiled), and the
   address/interface string leaves (IP value types arrive with the
   interfaces PR). Known residual: the hierarchical packed one-liner
   `node 0 priority <v>;` bypasses the gate (identity-token rule) even

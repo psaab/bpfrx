@@ -38,6 +38,20 @@ func (mm *monitorManager) Apply(groups []*config.RedundancyGroup) {
 	for _, rg := range groups {
 		var statuses []InterfaceMonitorStatus
 		for _, mon := range rg.InterfaceMonitors {
+			// #6549: bound the configured weight to the [0,255] heartbeat
+			// weight domain. These statuses are not display-only — the daemon
+			// config-apply tail feeds them straight into
+			// cluster.Manager.SetMonitorWeight as election debt
+			// (daemon_apply_tail.go), so the raw value would install
+			// out-of-range debt; and `show chassis cluster interfaces` renders
+			// them, so a raw value would report a weight the election does not
+			// use. The strict commit path rejects an out-of-range weight; the
+			// tolerant load / peer-sync path only warns (#1960 no-brick), so
+			// one can still reach here. Deliberately not logged: the cluster
+			// manager emits the config-apply-frequency warning
+			// (reconcileMonitorDebtsLocked / SetMonitorWeight).
+			weight, _ := config.ClampInterfaceMonitorWeight(mon.Weight)
+
 			// Translate Junos name (ge-0/0/0) to Linux name (ge-0-0-0).
 			linuxName := config.LinuxIfName(mon.Interface)
 			link, err := mm.ops.LinkByName(linuxName)
@@ -48,14 +62,14 @@ func (mm *monitorManager) Apply(groups []*config.RedundancyGroup) {
 			up := linkAttrsUp(link.Attrs())
 			statuses = append(statuses, InterfaceMonitorStatus{
 				Interface: mon.Interface,
-				Weight:    mon.Weight,
+				Weight:    weight,
 				Up:        up,
 			})
 			if !up {
 				slog.Warn("interface monitor: link down",
 					"redundancy_group", rg.ID,
 					"interface", mon.Interface,
-					"weight", mon.Weight)
+					"weight", weight)
 			}
 		}
 		if len(statuses) > 0 {

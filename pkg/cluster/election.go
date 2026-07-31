@@ -448,6 +448,30 @@ func (m *Manager) electSingleNode() {
 
 // SetMonitorWeight updates the weight contribution of an interface monitor.
 // down=true subtracts weight; down=false restores it.
+//
+// #6549: this is the CHOKEPOINT that bounds election debt. Together with
+// reconcileMonitorDebtsLocked it owns both of the only two writes into
+// m.monitorWeights, so clamping here closes the debt domain against EVERY
+// producer rather than each producer separately:
+//
+//   - pkg/cluster/monitor.go pollInterfaceMonitors — interface-monitor link
+//     transitions (clamps its own copy too, because the value it clamps also
+//     feeds the heartbeat monitor section).
+//   - pkg/cluster/monitor.go reconcileRGIPDebts — ip-monitoring target and
+//     aggregate debts. Monitor.ipTargetWeight returns the configured
+//     per-target weight (or the RG global-weight) with no bound of its own,
+//     and validateChassisClusterStrict has no compiled-int gate for
+//     ip-monitoring weights, so this is that class's only runtime defense.
+//   - pkg/daemon/daemon_apply_tail.go — the config-apply tail, on EVERY
+//     commit / boot Load / peer SyncApply. It feeds pkg/routing's
+//     InterfaceMonitorStatus.Weight, copied verbatim off the compiled
+//     *config.InterfaceMonitor. Before this clamp that raw value landed here
+//     six lines after UpdateConfig had already clamped the same debt, so the
+//     apply tail OVERWROTE the clamp and could restore a correctly-demoted
+//     group to primary with every monitored link down. The poll path cannot
+//     repair it: pollInterfaceMonitors re-fires SetMonitorWeight only on a
+//     dampened state TRANSITION, and a link that was already down before the
+//     apply produces none, so the raw debt persists indefinitely.
 func (m *Manager) SetMonitorWeight(rgID int, iface string, down bool, weight int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -457,9 +481,29 @@ func (m *Manager) SetMonitorWeight(rgID int, iface string, down bool, weight int
 		return
 	}
 
+	// Bound the debt to the [0,255] domain the heartbeat weight fields carry.
+	// A negative weight is negative DEBT: it credits weight back and cancels a
+	// sibling monitor's real failure (fail-open); an over-255 one diverges the
+	// local weight from the advertised one (dual primary). Both reach runtime
+	// because the tolerant load / peer-sync compile path downgrades the commit
+	// gate to a warning (#1960 no-brick).
+	requested := weight
+	weight, clamped := config.ClampInterfaceMonitorWeight(weight)
+
 	key := monitorKey{rgID: rgID, iface: iface}
 
 	if down {
+		if clamped {
+			// Debt-install frequency (a dampened transition, an ip-debt diff,
+			// or a config apply), not per-poll-tick — safe at Warn. This is
+			// the ONLY out-of-range signal the ip-monitoring debts get;
+			// reconcileMonitorDebtsLocked separately reports the configured
+			// interface-monitor weight against the config that carried it.
+			slog.Warn("cluster: monitor debt weight out of range, clamped",
+				"rg", rgID, "interface", iface,
+				"requested", requested, "effective", weight,
+				"issue", "#6549")
+		}
 		// Record the monitor weight and add to failure list.
 		m.monitorWeights[key] = weight
 		found := false

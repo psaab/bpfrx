@@ -61817,3 +61817,52 @@ would never produce.
     pkg/cluster/{election.go,failover.go,monitor.go,heartbeat_manager.go,
     ifmon_weight_divergence_6549_test.go},
     docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-07-31
+- **Action**: #6549 review fold — close the FIFTH monitor-debt producer and the
+  ip-monitoring residual. Hostile review found the four-layer fix incomplete:
+  `pkg/daemon/daemon_apply_tail.go` feeds `pkg/routing`'s RAW
+  `InterfaceMonitorStatus.Weight` into `Manager.SetMonitorWeight` on EVERY
+  config apply, six lines after `UpdateConfig` clamped the same debt — so the
+  apply tail did not merely miss the clamp, it OVERWROTE it. Reproduced
+  firsthand: with `trust0 255` + `trust1 -100` and both links down the group
+  goes 0/SECONDARY -> 100/PRIMARY, persistently (pollInterfaceMonitors re-fires
+  only on a dampened TRANSITION, and a link already down before the apply
+  produces none). Fixed at the chokepoint — `Manager.SetMonitorWeight` clamps
+  every debt on the way in, which with `reconcileMonitorDebtsLocked` covers
+  both of the only two writes into `monitorWeights`, closing the domain against
+  every producer instead of an enumeration of them.
+  Beyond the review: the reviewer's claim that the chokepoint closes the
+  ip-monitoring residual "for free" is only half right, and the other half is a
+  sharper fail-open. In global-threshold mode a negative target weight
+  SUBTRACTS from the cumulative failure sum, so a SECOND genuinely unreachable
+  target pushes the sum back below global-threshold and drops the aggregate
+  debt the FIRST failure installed — more failures produce LESS demotion
+  (reproduced: weight 0/SECONDARY -> 255/PRIMARY when the second target dies).
+  The chokepoint cannot see it: no debt is desired, so SetMonitorWeight is
+  never called. Bounded in `Monitor.ipTargetWeight` + the aggregate branch of
+  `desiredRGIPDebts`, where both consumers read the value.
+  Also folded both review MINORs: `pkg/routing/monitor.go` bounds the status
+  weight at its source (it is election input, not display-only) and the four
+  config-only display fills in pkg/grpcapi + pkg/cli render the effective
+  weight, so `show chassis cluster interfaces` never reports a weight the
+  election does not apply; and the `clampWireWeight` CALL SITES are now bound
+  (previously only the function was, so a refactor could drop the belt
+  silently). Doc claims corrected: the ip-monitoring siblings' only defense is
+  a schema validator the lenient path downgrades, so this stanza is STRONGER
+  than them rather than "matching" them; and the compiled-int gate covers the
+  flat-set + container-hierarchical shapes, not the packed one-liner (#6588).
+  Fail-on-revert verified per guard, all ASSERTION failures with `go vet`
+  clean — no build breaks. Full pkg/cluster, pkg/config, pkg/daemon,
+  pkg/routing, pkg/grpcapi, pkg/cli suites green on a FRESH GOCACHE, every new
+  subtest confirmed to have run by name. `go test ./...` fully clean on the
+  rebased head. (TestHeatmapNotStale failed while this branch was based on
+  fff7a4ab5 — verified pre-existing by running it at origin/master a680161ca in
+  a detached worktree, where the canary output was byte-identical to the
+  branch's, so this change shifts nothing in the heatmap. Master has since
+  regenerated it and the canary now passes.)
+- **File(s)**: pkg/cluster/{election.go,monitor.go,
+    ifmon_weight_daemon_apply_6549_test.go}, pkg/routing/{monitor.go,
+    monitor_weight_6549_test.go}, pkg/grpcapi/{server_cluster.go,
+    cluster_monitor_weight_6549_test.go}, pkg/cli/{cli_helpers.go,
+    cluster_monitor_weight_6549_test.go}, pkg/config/schema_chassis.go,
+    docs/config-schema.md, _Log.md

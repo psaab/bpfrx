@@ -241,6 +241,18 @@ var schemaChassis = &schemaNode{desc: "Chassis configuration", children: map[str
 				// weight, which starts at 255 (group_state.go:29,
 				// SetMonitorWeight election.go:324); heartbeat monitor
 				// entries carry weight as uint8.
+				//
+				// #6549: unlike interface-monitor weight, these leaves
+				// have NO compiled-int gate in
+				// validateChassisClusterStrict — this ValidateInteger is
+				// their only commit-side defense, and compileTreeLenient
+				// downgrades it to a warning on Store.Load /
+				// Store.SyncApply (#1960 no-brick). An out-of-range value
+				// therefore REACHES runtime, where pkg/cluster bounds it:
+				// Monitor.ipTargetWeight and the aggregate branch of
+				// desiredRGIPDebts (which also protects the cumulative
+				// global-threshold sum a negative weight would otherwise
+				// mask), plus the Manager.SetMonitorWeight chokepoint.
 				"global-weight": {
 					desc:          "Default weight deducted when a monitored IP fails (0..255)",
 					args:          1,
