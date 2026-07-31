@@ -3,7 +3,7 @@
 //! (`refresh_runtime_snapshot{,_disarmed,_inner}`) — preflight policy
 //! validation, manager-neighbor key rotation, the #1873 tunnel-remap
 //! purge, the forwarding-state swap, the CoS owner/lease-map + fabric
-//! publish (#5166: BEFORE the `ha.forwarding` worker-visible store, so a
+//! publish (#5166: BEFORE the `ha.runtime` worker-visible store, so a
 //! live worker never sees new queue config without its CoS owners), the
 //! WG/GRE aux-thread reconcile or disarmed stop (after the forwarding
 //! store), and the neighbor-warm pass — plus `refresh_fabric_links`
@@ -12,67 +12,60 @@
 //! stay in mod.rs: `reconcile/snapshot.rs` and tests outside this
 //! module reference them at coordinator scope.
 //!
-//! # Publish ordering — `ha.forwarding` is the single worker-visible gate
-//! The forwarding Arc is stored LAST so it acts as the one release-store
-//! that publishes everything committed before it. Two producer/consumer
-//! pairs ride this gate, each requiring the worker to consume in the
-//! OPPOSITE order to the store order:
-//! - **CoS maps ↔ forwarding (#5166).** CoS owner/live/lease/backlog/vtime
-//!   maps + `ha.fabrics` are stored BEFORE forwarding; the worker reads
-//!   forwarding FIRST, then the CoS maps. Observing new forwarding implies
-//!   observing the matching CoS maps.
-//! - **validation ↔ forwarding (#6291).** `shared_validation` is stored
-//!   BEFORE forwarding; the worker acquire-loads forwarding FIRST, then
-//!   validation (`refresh_forwarding_then_validation`). Observing new
-//!   forwarding implies observing new-or-newer validation, so a worker can
-//!   NEVER see old-validation + new-forwarding — which would let a packet
-//!   stamped at the old generation pass `classify_metadata` and then be
-//!   forwarded under the new state.
+//! # Publish ordering — the `RuntimeView` store is the single worker-visible gate
+//! The `RuntimeView` is stored LAST so it acts as the one release-store that
+//! publishes everything committed before it.
 //!
-//! # The mirror window survives and is NOT benign (#6592)
-//! The ordering above excludes ONE of the two torn orientations. The mirror,
-//! `(new-validation, old-forwarding)`, remains reachable — it is in fact what
-//! the reorder produces when a publish straddles the worker's two loads. Such a
-//! worker's forwarding load landed before the `ha.forwarding` store and its
-//! validation load after the `shared_validation` store, so it installs the new
-//! validation (unconditionally, on difference) but keeps its old forwarding Arc
-//! (updated only on rotation). While the shim is still stamping the OLD
-//! generation that pair only DROPS — `ConfigGenerationMismatch`, or
-//! `FibGenerationMismatch` when only the FIB generation moved, for as many
-//! packets as the sweep touches, not just one.
-//! But once this refresh's generation is returned to Go and Go writes
-//! it to `userspace_ctrl`, the shim stamps NEW; a worker still holding the old
-//! forwarding classifies those packets `Valid` and forwards them under the
-//! STALE forwarding state. Nothing orders the Go control-map update after every
-//! worker's next forwarding load. Closing it needs validation tied atomically
-//! to a specific forwarding snapshot (one `ArcSwap` holding both, or generation
-//! fields embedded in `ForwardingState`) — tracked as #6592, out of scope for
-//! the ordering fix documented here.
+//! - **validation ↔ forwarding (#6291 / #6592) — no longer an ordering
+//!   problem.** The two used to be independent `ArcSwap`s, and coherence
+//!   depended on the coordinator storing them in one order and every worker
+//!   loading them in the opposite one. That can only ever exclude ONE of the
+//!   two torn orientations: #6291 excluded `(old validation, new forwarding)`
+//!   and left the mirror `(new validation, old forwarding)` reachable, which
+//!   is not drop-only — once Go writes the new generation to `userspace_ctrl`
+//!   the shim stamps NEW, and a worker holding the old forwarding classifies
+//!   those packets `Valid` and forwards them under the STALE tables. #6592
+//!   publishes both halves in ONE `Arc` (`types/runtime_view.rs`), so a worker
+//!   observes whichever view was published as a unit and BOTH orientations are
+//!   structurally impossible. Every publish site goes through the single choke
+//!   point `Coordinator::publish_runtime_view` (or
+//!   `republish_runtime_validation` for a validation-only change), which builds
+//!   the view from `self.validation` at the store.
+//! - **CoS maps ↔ forwarding (#5166) — still an ordering pair.** The CoS
+//!   owner/live/lease/backlog/vtime maps + `ha.fabrics` are stored BEFORE the
+//!   `RuntimeView`; the worker reads the view FIRST, then the CoS maps.
+//!   Observing a new view implies observing the matching CoS maps. Do NOT move
+//!   these stores after the view store, and do NOT move the worker's view load
+//!   after its CoS loads.
 //!
-//! Both invariants are load-bearing: do NOT reorder the `shared_validation`
-//! / CoS stores to AFTER the `ha.forwarding` store, and do NOT move the
-//! worker's forwarding load to after its validation / CoS loads. Both HALVES
-//! of both pairs are RED-on-revert guarded — the producer side by the
-//! `#[cfg(test)] cos_owner_at_forwarding_publish` /
-//! `validation_at_forwarding_publish` seams captured immediately above the
-//! `ha.forwarding` store (`coordinator/tests.rs`), the consumer side by
-//! `snapshot_refresh_no_old_validation_with_new_forwarding_6291`
-//! (`worker/loop_body/mod.rs`).
+//! Holding an OLD view remains possible and is SAFE — new-stamped packets
+//! mismatch the old validation and DROP, the intended fail-closed behaviour.
+//! #6592 closes INCOHERENT pairs, not stale coherent ones; nothing forces a
+//! refresh.
+//!
+//! Both invariants are RED-on-revert guarded. The #6592 pairing: producer side
+//! by the `#[cfg(test)] runtime_view_at_publish` seam captured immediately
+//! above the view store (`coordinator/tests.rs`), consumer side by
+//! `snapshot_refresh_runtime_view_pair_is_atomic_6592`
+//! (`worker/loop_body/mod.rs`), which drives the worker refresh with a
+//! coordinator publish injected between the two halves and asserts the
+//! observed pair is coherent — splitting the refresh back into two loads goes
+//! RED in EITHER order. The #5166 ordering: by
+//! `refresh_runtime_snapshot_publishes_cos_owner_map_before_forwarding`.
 //!
 //! Coverage is uneven across the publications riding this gate: only the CoS
-//! owner map (#5166) and validation (#6291) have an individual ordering
-//! assertion. The other pre-forwarding publications — CoS owner-live, root
-//! leases, exact backlogs, queue leases, vtime floors, and `ha.fabrics` — are
-//! held in place by comment alone, and the #5166 seam captures only the owner
-//! map so it does not prove its own placement the way the #6291 seam does.
-//! Tracked as #6593.
+//! owner map (#5166) has an individual ordering assertion. The other
+//! pre-view publications — CoS owner-live, root leases, exact backlogs, queue
+//! leases, vtime floors, and `ha.fabrics` — are held in place by comment alone,
+//! and the #5166 seam captures only the owner map so it does not prove its own
+//! placement the way the #6592 seam does. Tracked as #6593.
 //!
 //! The rule is site-wide, not refresh-local: the worker's STARTUP SEED
-//! (`worker/loop_body/setup.rs`) reads forwarding then validation, and
-//! `Coordinator::stop_inner`'s teardown stores validation then forwarding.
-//! Teardown runs after every worker thread has been joined, so it has no
-//! live readers — it follows the order for uniformity, so that no site in
-//! the tree contradicts this section.
+//! (`worker/loop_body/setup.rs`) takes its pair from ONE view load, and
+//! `Coordinator::stop_inner`'s teardown publishes the default pair through the
+//! same choke point. Teardown runs after every worker thread has been joined,
+//! so it has no live readers — it uses the choke point for uniformity, so that
+//! no site in the tree contradicts this section.
 use super::*;
 
 impl super::Coordinator {
@@ -138,11 +131,13 @@ impl super::Coordinator {
             self.forwarding.fabrics = new_fabrics.clone();
             self.forwarding.fabric_skips = pruned;
             self.ha.fabrics.store(Arc::new(new_fabrics));
-            // Also update shared_forwarding so workers see the new fabric
-            // links for fabric redirect resolution. Without this, workers
-            // use the snapshot's forwarding state which may have empty fabrics
-            // if the peer MAC wasn't resolved at snapshot time.
-            self.ha.forwarding.store(Arc::new(self.forwarding.clone()));
+            // Also update the worker-visible view so workers see the new
+            // fabric links for fabric redirect resolution. Without this,
+            // workers use the snapshot's forwarding state which may have empty
+            // fabrics if the peer MAC wasn't resolved at snapshot time.
+            // #6592: through the choke point, so this fabric-only publish
+            // carries the current validation.
+            self.publish_runtime_view();
         } else if skips_changed || superseded_removed {
             // Nothing resolved this pass. Publish either because the skip
             // diagnostics changed or because #5686 pruned a stale (superseded)
@@ -153,14 +148,14 @@ impl super::Coordinator {
                 // fast-path Arc (`shared_fabrics` / `self.ha.fabrics`). The
                 // worker overwrites its forwarding.fabrics from that Arc ONLY
                 // when it is non-empty, so a stale non-empty `ha.fabrics` would
-                // re-add the superseded link the `ha.forwarding` store just
+                // re-add the superseded link the `RuntimeView` store just
                 // removed. Store both so the stale peer is gone from every
                 // reader.
                 self.ha
                     .fabrics
                     .store(Arc::new(self.forwarding.fabrics.clone()));
             }
-            self.ha.forwarding.store(Arc::new(self.forwarding.clone()));
+            self.publish_runtime_view();
         }
     }
 
@@ -418,7 +413,7 @@ impl super::Coordinator {
         // #5166: publish the derived CoS owner/live/lease/backlog/vtime
         // maps AND the fabric-link set BEFORE making the new
         // ForwardingState worker-visible. A live worker refreshes its
-        // per-tick view in a FIXED order — it loads `shared_forwarding`
+        // per-tick view in a FIXED order — it loads the `RuntimeView`
         // first, then the CoS map Arcs (worker/loop_body/mod.rs), and
         // rebuilds `cos_fast_interfaces` from whichever CoS maps it holds.
         // With the pre-#5166 order (forwarding published first, CoS maps
@@ -430,12 +425,12 @@ impl super::Coordinator {
         // `refresh_cos_owner_worker_map_from_identities` builds the maps
         // off `self.forwarding` — already the new state since the swap
         // above — so storing them first makes the invariant hold: because
-        // the worker loads forwarding then CoS in the same tick and the
-        // coordinator now stores CoS then forwarding, any worker that
+        // the worker loads the view then CoS in the same tick and the
+        // coordinator now stores CoS then the view, any worker that
         // observes the new forwarding is guaranteed by ArcSwap acquire/
         // release ordering to also observe the matching CoS maps. The
         // reverse window (new CoS maps visible while a worker still reads
-        // the old forwarding) is benign: added queues are not classified
+        // the old view) is benign: added queues are not classified
         // to until forwarding rotates, and a removed queue merely loses a
         // dying CoS entry for one tick. Pure reordering of coordinator-side
         // stores — no new hot-path cost, no worker-side lock. The full
@@ -447,8 +442,8 @@ impl super::Coordinator {
             .fabrics
             .store(Arc::new(self.forwarding.fabrics.clone()));
         // #5166 test seam: capture the CoS owner map at the instant just
-        // before forwarding becomes worker-visible. With the
-        // CoS-before-forwarding order above it already reflects the new
+        // before the new forwarding becomes worker-visible. With the
+        // CoS-before-view order above it already reflects the new
         // generation; reverting the order captures the stale map, so the
         // ordering regression test goes RED. Absent from release builds.
         #[cfg(test)]
@@ -456,46 +451,21 @@ impl super::Coordinator {
             self.cos_owner_at_forwarding_publish =
                 Some(self.cos.owner_worker_by_queue.load().as_ref().clone());
         }
-        // #6291: `shared_validation` MUST be stored BEFORE `ha.forwarding`.
-        // The worker acquire-loads forwarding FIRST, validation SECOND
-        // (`refresh_forwarding_then_validation`, worker/loop_body/mod.rs), so
-        // this validation-then-forwarding release order is the OPPOSITE-order
-        // half of the message-passing pair: a worker that observes the NEW
-        // forwarding Arc is guaranteed to also observe the NEW (or newer)
-        // validation, and can never see old-validation + new-forwarding (a
-        // packet stamped at the old generation would otherwise pass
-        // `classify_metadata` and then be forwarded under the new state). Do
-        // NOT swap these two stores or move the validation store after
-        // forwarding — that reintroduces the torn window. This also composes
-        // with the #5166 CoS-then-forwarding order above (CoS + validation are
-        // both published before forwarding, the single worker-visible gate).
+        // #6592: ONE worker-visible store carrying BOTH halves. `self.validation`
+        // was assigned above (the atomic commit to the new generation) and
+        // `self.forwarding` is the new table, so the view this publishes is the
+        // new generation's coherent pair. A worker observes that pair as a unit
+        // — it cannot hold this refresh's validation with the previous
+        // forwarding, nor the reverse. Both torn orientations (#6291 and its
+        // mirror #6592) are structurally impossible, so no store/load ordering
+        // discipline is needed between these two values any more; the #5166
+        // CoS-then-view order above still is, and this store is still the gate
+        // it rides.
         //
-        // Scope: this excludes ONE orientation. The mirror, (new-validation,
-        // old-forwarding), is still reachable and is NOT drop-only — after Go
-        // reprograms `userspace_ctrl` a new-stamped packet can be forwarded
-        // under stale forwarding state. See the "mirror window" section in the
-        // module header; tracked as #6592.
-        self.shared_validation.store(Arc::new(self.validation));
-        // #6291 test seam — the producer-side twin of the #5166 CoS capture
-        // above. Records the WORKER-VISIBLE `shared_validation` (not
-        // `self.validation`, which is already the new value either way) at the
-        // instant just before forwarding becomes worker-visible. With the
-        // validation-then-forwarding order it already carries the new
-        // generation; swapping the two stores captures the STALE one and
-        // `refresh_runtime_snapshot_publishes_validation_before_forwarding`
-        // goes RED. The forwarding Arc captured alongside it pins this
-        // capture's POSITION: the test asserts it is not the post-refresh Arc,
-        // so hoisting the `ha.forwarding` store above this block (which would
-        // otherwise make the validation assert pass vacuously) is RED as well.
-        // Absent from release builds.
-        #[cfg(test)]
-        {
-            self.validation_at_forwarding_publish = Some((
-                **self.shared_validation.load(),
-                self.ha.forwarding.load_full(),
-            ));
-        }
-        self.ha.forwarding.store(Arc::new(self.forwarding.clone()));
+        // The `#[cfg(test)] runtime_view_at_publish` seam inside
+        // `store_runtime_view` records the intended pair + the previous view
+        // for the RED-on-revert test.
+        self.publish_runtime_view();
         // #1432 S2a (Copilot C1): reconcile WG control threads on every
         // runtime-snapshot refresh, not just initial bring-up, so a
         // same-plan apply that adds/removes/changes a WG endpoint starts,

@@ -235,7 +235,7 @@ pub(super) fn local_tunnel_source_loop(
     tunnel_name: String,
     tunnel_endpoint_id: u16,
     spawned_logical_ifindex: i32,
-    shared_forwarding: Arc<ArcSwap<ForwardingState>>,
+    shared_runtime: Arc<ArcSwap<RuntimeView>>,
     ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     dynamic_neighbors: Arc<ShardedNeighborMap>,
     live: BTreeMap<u32, Arc<BindingLiveState>>,
@@ -284,7 +284,13 @@ pub(super) fn local_tunnel_source_loop(
     // poll(2) when idle — #2412 replaced the 1ms busy-poll, single-digit
     // pps workload) — a drained read pass IS the batch, so the per-BATCH
     // ArcSwap rule holds and the AF_XDP worker hot path is untouched.
-    let mut forwarding: Arc<ForwardingState> = shared_forwarding.load_full();
+    //
+    // #6592: this thread needs only the forwarding half of the published
+    // `RuntimeView` (it builds and encapsulates local-origin packets; it does
+    // not match shim generation stamps), so it reads through
+    // `load_forwarding_if_changed`. A validation-only publish rotates the view
+    // but not the inner forwarding Arc, so it correctly sees no change here.
+    let mut forwarding: Arc<ForwardingState> = shared_runtime.load().forwarding.clone();
     let mut endpoint_attached = endpoint_attachment_valid(
         &forwarding,
         tunnel_endpoint_id,
@@ -293,7 +299,7 @@ pub(super) fn local_tunnel_source_loop(
     );
     while !stop.load(Ordering::Relaxed) {
         if let Some(new_forwarding) =
-            super::worker::load_arc_if_changed(&forwarding, &shared_forwarding)
+            super::types::load_forwarding_if_changed(&forwarding, &shared_runtime)
         {
             forwarding = new_forwarding;
             endpoint_attached = endpoint_attachment_valid(

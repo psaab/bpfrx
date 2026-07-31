@@ -22,7 +22,7 @@ the workers share.
 | `inject.rs` | `request inject-packet` RPC handler — synthesizes a packet against the live state, reports disposition. The operator/API-supplied `packet_length` is bounded by `MAX_INJECT_PACKET_LENGTH` (= `UMEM_FRAME_SIZE`, 4096): an injected packet is a single unfragmented frame that must fit in one UMEM frame on TX, and 4096 keeps the IPv4 total-length / IPv6 payload-length wire fields within u16. `check_inject_packet_length` REJECTS an over-max request up front (it is NOT clamped, so an API misuse / DoS attempt surfaces as an error); the 64-byte minimum still applies. The frame builders (`frame/mod.rs`) additionally clamp the allocation to the maximum and use `u16::try_from` for the wire length as a defense-in-depth backstop so a bypassed bound can never emit a wrapped on-wire length. (#2443) |
 | `neighbor_manager.rs` | `NeighborManager` — sharded ARP/NDP cache + netlink monitor for incremental updates. **#5165: the monitor thread's `JoinHandle` is now retained (`monitor_join`, no longer discarded via `.ok()`) and `stop_inner` signals + JOINs it via `stop_and_join_monitor` — mirroring `resolver_join`. Joining (bounded by the monitor's 500ms `SO_RCVTIMEO`) is what enforces no-mutation-after-stop: a retired old-generation monitor blocked in `recv()` can no longer apply a queued kernel neighbor event to `dynamic` after a reconcile cleared/rebuilt the baseline. The steady-state loop also re-checks `stop` AFTER `recv()`, before mutating, as belt-and-suspenders.** **#6314: the #1636 neighbor WARMER — the third neighbor aux thread — now follows the SAME pattern (it was the pre-#5165 odd-one-out). Its `JoinHandle` is retained (`warm_join`, no longer discarded via `.ok()`), a spawn failure is now logged instead of swallowed (leaving `warm_queue`/`warm_stop`/`warm_join` all `None` so the next reconcile retries), and `stop_inner` signals `warm_stop` + drops the producer + JOINs it via `stop_and_join_warmer`. Joining (bounded by the warmer loop's 500ms recv timeout) guarantees a detached warmer can never fire a stray ARP/NDP solicit or mutate `last_probed_at` after teardown. Fail-on-revert: `neighbor_warmer_joined_at_teardown_6314`.** |
 | `session_manager.rs` | Cross-thread session-table state shared between coordinator, HA worker, and packet workers via `Arc<Mutex<...>>`. Holds the synced + nat + forward-wire tables together because they're written and queried as a unit. |
-| `snapshot_refresh.rs` | `refresh_runtime_snapshot{,_disarmed,_inner}` (armed/disarmed same-plan snapshot-apply legs: preflight, #1873 tunnel-remap purge, forwarding swap + stores, aux-thread reconcile, CoS owner-map + warm passes) and `refresh_fabric_links`. (#1890 split.) **#5166: the CoS owner/lease maps + `ha.fabrics` are published BEFORE the `ha.forwarding` worker-visible store — a live worker (loop_body loads forwarding then CoS in one tick) must never observe new queue config without its matching CoS owners/leases (else transient class blackhole / stale-rate / over-admission).** **#3766: `_inner` is a FALLIBLE atomic swap — it returns `Result<(), SnapshotIntegrityError>`, builds the new forwarding state FIRST, and only then bumps `self.validation` + rotates the neighbor-manager keys + publishes; on a build integrity error nothing mutates and the error is returned so the handler fails closed (no split-brain, no persisted reject).** |
+| `snapshot_refresh.rs` | `refresh_runtime_snapshot{,_disarmed,_inner}` (armed/disarmed same-plan snapshot-apply legs: preflight, #1873 tunnel-remap purge, forwarding swap + stores, aux-thread reconcile, CoS owner-map + warm passes) and `refresh_fabric_links`. (#1890 split.) **#5166: the CoS owner/lease maps + `ha.fabrics` are published BEFORE the `ha.runtime` worker-visible store — a live worker (loop_body loads forwarding then CoS in one tick) must never observe new queue config without its matching CoS owners/leases (else transient class blackhole / stale-rate / over-admission).** **#6592: validation + forwarding leave through ONE `RuntimeView` store, so a worker cannot pair them across generations in either direction.** **#3766: `_inner` is a FALLIBLE atomic swap — it returns `Result<(), SnapshotIntegrityError>`, builds the new forwarding state FIRST, and only then bumps `self.validation` + rotates the neighbor-manager keys + publishes; on a build integrity error nothing mutates and the error is returned so the handler fails closed (no split-brain, no persisted reject).** |
 | `status.rs` | Read-side snapshots for `show ...` queries. **#5289: `recent_exceptions()` / `last_resolution()` drain the per-worker POD exception rings (#6242: one `Arc<Mutex<ExceptionEventRing>>` per worker, now on each `WorkerRuntimeRecord` in `workers.records` — was the standalone `Coordinator::worker_exception_rings` / `worker_last_resolution` maps, mirroring the also-consolidated `worker_panics`) plus the control-thread ring, format each compact `ExceptionEvent`/`ResolutionEvent` into the operator-visible `ExceptionStatus`/`PacketResolution` HERE (interface/reason/IP/zone strings + monotonic→wall-clock via a single captured `MonoWallAnchor`), and merge by timestamp. The retired inline path formatted + locked a process-global mutex on EVERY terminal packet — the cross-worker DoS closed by #5289. The record path (`disposition::record_exception`) now writes a `&'static`-reason / `Arc<str>`-interface / `Copy`-`IpAddr` / numeric-zone POD event under a per-worker mutex with a per-(reason,5-tuple) sampler; the batched `BindingLiveState` counters stay the lossless signal. #6101: the slow-path reinject-failure sites (`_rate_limited` / `_queue_full` / `_slow_path_mtu_exceeded` / `_enqueue_failed`) record via `disposition::record_exception_suffixed`, which stores a `&'static` base reason + a `&'static` suffix (new `ExceptionEvent::reason_suffix`) so the record path stays alloc-free under a reinject-failure flood — the operator text `"{reason}{suffix}"` is reconstructed byte-identically by `ExceptionEvent::reason()` on the status thread. `record_exception_owned` remains ONLY for genuinely dynamic reasons (the `cfg!(feature = "debug-log")` forward-tuple-mismatch diagnostic). The cross-worker merge/sort/cap (`recent_exceptions`/`last_resolution` across ≥2 per-worker rings + the control ring) and the bring-up insert / teardown record-drop are unit-tested in `status_tests.rs::exception_ring_merge_6101`.** The other read-side exception is `drain_session_deltas`, which mutates per-binding state. **#5290: this RPC-fallback drain is FAIR — it spreads a `budget/num_bindings` quantum across live bindings via a rotating cursor (`WorkerManager::session_delta_drain_cursor`) using the shared `session_delta::drain_session_deltas_fair` helper, instead of handing the whole budget to the first slot with an early break. A low-slot worker can no longer consume the caller-wide budget and starve higher slots during the event-stream fallback. On budget overflow (undrained deltas remain) it arms `BindingLiveState::set_delta_loss` on the residual bindings; the owning worker loop folds that latch into `SessionTable::set_delta_loss` for the existing #2442 owner-RG resync, so no delta is silently lost. The owner-RG bulk-export mirror `ha.rs::drain_session_deltas_from_live` shares the same fair helper but does NOT arm the latch (it IS the resync).** |
 | `supervisor.rs` | `spawn_supervised_worker` / `spawn_supervised_aux` — catches panics, marks the worker dead on its `WorkerRuntimeAtomics`, captures a panic message into a per-worker slot. (#925 Phase 1.) |
 | `tunnel_supervision.rs` | GRE local-origin + WG control-thread LIFECYCLE (three-pass reconcile, tombstone backoff, periodic liveness sweeps, defer-branch snapshot prunes — see "Aux tunnel threads" below). The thread bodies live in `wg_control/` / `afxdp/tunnel.rs`; the entry maps (`tunnel_sources`, `wg_control_threads`) stay on `Coordinator` in `mod.rs`. (#1890 split.) |
@@ -52,8 +52,10 @@ Differences that matter (#1881):
 - WG threads restart when the engine Arc identity OR attachment
   changes; GRE threads restart ONLY on attachment drift — endpoint
   content (destination/source/key, routes, CoS) reaches the live GRE
-  loop through the shared `ha.forwarding` ArcSwap (one
-  `load_arc_if_changed` per loop iteration, the #1188 pattern).
+  loop through the shared `ha.runtime` ArcSwap (one
+  `load_forwarding_if_changed` per loop iteration, the #1188 pattern —
+  it compares the view's NESTED forwarding Arc, so a validation-only
+  publish correctly reads as no change).
 - The GRE loop carries a rotation gate (`endpoint_attachment_valid`,
   `tunnel.rs`): on every forwarding-Arc rotation it re-validates that
   the loaded state still describes its TUN attachment (id present,
@@ -196,7 +198,7 @@ Differences that matter (#1881):
   (#2484), it builds the new `ForwardingState` FIRST and only commits
   the observable mutations — `self.validation` bump (H2), neighbor-
   manager key rotation + stale-key delete (H3), forwarding swap, and the
-  `shared_validation` / `ha.forwarding` publishes — AFTER the build
+  `RuntimeView` publish — AFTER the build
   succeeds. A non-policy integrity fault (invalid interface address,
   CoS queue, NAT64 / NPTv6 rule) that only the full build catches now
   returns `Err(SnapshotIntegrityError)`; the handler reports `ok=false`,
@@ -208,13 +210,13 @@ Differences that matter (#1881):
 - **CoS maps are published BEFORE forwarding becomes worker-visible
   (#5166).** In the same-plan refresh the workers KEEP RUNNING (no
   teardown), so a live worker observes the coordinator's ArcSwap stores
-  per tick. `worker/loop_body` loads `shared_forwarding` FIRST, then the
+  per tick. `worker/loop_body` loads the `RuntimeView` FIRST, then the
   CoS map Arcs (`owner_worker_by_queue` / `owner_live_by_queue` /
   `root_leases` / `exact_backlogs` / `queue_leases` / `queue_vtime_floors`),
   and rebuilds `cos_fast_interfaces` from whichever CoS maps it holds.
   The commit therefore stores the derived CoS maps
   (`refresh_cos_owner_worker_map_from_identities`) and `ha.fabrics`
-  BEFORE `shared_validation` / `ha.forwarding`. Because the worker reads
+  BEFORE the `ha.runtime` store. Because the worker reads
   forwarding-then-CoS in one tick and the coordinator stores
   CoS-then-forwarding, any worker that observes the new forwarding is
   guaranteed by ArcSwap acquire/release ordering to also observe the
@@ -234,80 +236,77 @@ Differences that matter (#1881):
   owner map at the forwarding-publish instant so the ordering regression
   test (`refresh_runtime_snapshot_publishes_cos_owner_map_before_forwarding`)
   goes RED if the reorder is reverted. That seam captures only the owner
-  map, so — unlike the #6291 seam below — it does not prove its own
-  placement: hoisting the `ha.forwarding` store above it would satisfy the
+  map, so — unlike the #6592 seam below — it does not prove its own
+  placement: hoisting the `ha.runtime` store above it would satisfy the
   assert vacuously. The other publications riding the same gate (CoS
   owner-live, root leases, exact backlogs, queue leases, vtime floors, and
   `ha.fabrics`) have no individual ordering assertion at all. Tracked as
   **#6593**.
-- **Validation is published BEFORE forwarding becomes worker-visible
-  (#6291).** The sibling of the #5166 CoS pair. The same-plan refresh
-  stores `shared_validation` BEFORE `ha.forwarding` (both already in this
-  order pre-#6291 — the bug was the WORKER read order), and the worker now
-  acquire-loads forwarding FIRST, then validation
-  (`refresh_forwarding_then_validation`, worker/loop_body). For a
-  producer/consumer pair the acquire/release message-passing must run in
-  OPPOSITE orders: producer stores validation-then-forwarding, consumer
-  reads forwarding-then-validation, so observing the new forwarding Arc
-  implies observing new-or-newer validation. This closes the ≤1-tick window
-  where a worker saw OLD validation with NEW forwarding — a packet stamped
-  at the old `config_generation`/`fib_generation` would pass
-  `classify_metadata` (validation still at the old generation) and then be
-  classified/forwarded under the new forwarding state. Pre-#6291 the store
-  order (validation-then-forwarding) MATCHED the read order
-  (validation-then-forwarding), so new-forwarding could pair with
-  old-validation.
+- **Validation and forwarding are published as ONE atomic pair (#6592,
+  closing #6291).** They used to be two independent `ArcSwap`s
+  (`shared_validation` and `ha.forwarding`), and coherence depended on the
+  coordinator storing them in one order and every worker loading them in
+  the opposite one. That can only ever exclude ONE of the two torn
+  orientations — an acquire/release pair is directional — so it could not
+  close the defect:
+  - `(old validation, new forwarding)`: a packet stamped at the OLD
+    generation passes `classify_metadata` against the worker's old
+    validation and is then forwarded under the NEW tables. This is what
+    #6291 named, and what #6333's read-order flip excluded.
+  - `(new validation, old forwarding)`: the mirror, which that flip left
+    behind — and WIDENED, since it needs only the forwarding load to land
+    inside the publish window rather than the whole window to nest between
+    two adjacent loads. It is not drop-only. While the shim still stamps
+    the OLD generation the pair merely drops
+    (`ConfigGenerationMismatch`, or `FibGenerationMismatch` when only the
+    FIB generation moved). But once the coordinator's reply reaches Go and
+    Go writes the new generation to `userspace_ctrl`, the shim stamps NEW;
+    those packets pass `classify_metadata` against the new validation and
+    are forwarded under the STALE tables — a withdrawn route still
+    resolves, a newly added deny is not applied.
 
-  **Scope — the mirror window survives and is NOT benign (#6592).** This
-  closes ONE of the two torn orientations. `(new-validation,
-  old-forwarding)` remains reachable, and it is exactly what the reorder
-  produces when a publish lands between the two worker loads: validation
-  installs unconditionally on difference, forwarding only on Arc rotation.
-  While the shim still stamps the OLD generation that pair only DROPS
-  (`ConfigGenerationMismatch`, or `FibGenerationMismatch` when only the FIB
-  generation moved — for as many packets as the RX sweep touches, not one).
-  But once Go writes the new generation to `userspace_ctrl` the shim stamps
-  NEW, and a worker still holding the old forwarding classifies those
-  packets `Valid` and forwards them under the STALE forwarding state.
-  Nothing orders the Go control-map update after every worker's next
-  forwarding load. The eliminated orientation needed no extra condition to
-  forward across generations; the surviving one needs the worker to still
-  be behind after a control-socket round trip — a real reduction in
-  exposure, not a closure.
+  #6592 publishes both halves inside ONE `Arc`, `RuntimeView`
+  (`types/runtime_view.rs`), stored through the single choke point
+  `Coordinator::publish_runtime_view`. A worker's refresh is a single
+  `ArcSwap` load, so whichever view it observes, both halves came from the
+  same publish. There is no pair to tear and no ordering discipline to get
+  wrong; both orientations are structurally impossible.
 
-  Size that in both directions. Per occurrence the eliminated orientation
-  was the worse one, but by RATE it was the rarer one: it needed the whole
-  publish window (a full `ForwardingState` clone — 69 fields, ~20
-  heap-owning collections, the FIB among them) to nest inside the
-  nanosecond-scale gap between two adjacent acquire-loads, i.e. a stalled
-  worker. The survivor needs only the forwarding load to land anywhere in
-  that same window, which is near-certain for at least one per-VF worker on
-  every apply. So this removes the rarer orientation and keeps the common
-  one — a genuine reduction, but a smaller one than the sentence above
-  reads alone.
+  **Holding an OLD view stays possible and is SAFE** — new-stamped packets
+  mismatch the old validation and DROP, the intended fail-closed
+  behaviour. The defect is an INCOHERENT pair, not a stale coherent one;
+  nothing forces a refresh.
 
-  Closing it needs validation tied atomically to a
-  specific forwarding snapshot (one `ArcSwap` holding both, or generation
-  fields in `ForwardingState`): tracked as **#6592**.
+  **The forwarding half stays a NESTED `Arc` deliberately (#1188).** The
+  simpler shape — inlining `ValidationState` into `ForwardingState` —
+  would make `bump_fib_generation` rebuild the whole forwarding state to
+  move a generation counter, and rotate the worker-visible `Arc`, dragging
+  every worker through its expensive rotation branch (screen-profile and
+  opening-override clones, cold-path slot rescan, input-filter session
+  purges, CoS runtime reset) for a change that touched no table. Go fires
+  `Manager.BumpFIBGeneration` repeatedly during route convergence
+  precisely to avoid a rebuild. `republish_runtime_validation` instead
+  reuses the published forwarding `Arc`, so the worker's `Arc::ptr_eq`
+  short-circuit still hits. Measured by `benches/runtime_view_refresh.rs`:
+  the rebuild is ~66x the `Arc` reuse at 1K routes and ~262x at 10K, while
+  the per-tick worker refresh went from ~46 ns (two loads) to ~23 ns (one).
 
-  The deterministic regression test
-  (`snapshot_refresh_no_old_validation_with_new_forwarding_6291`,
-  worker/loop_body) drives `refresh_forwarding_then_validation` with a
-  coordinator publish injected between the two acquire-loads and asserts
-  the worker never adopts new forwarding with old validation; swapping the
-  two loads back makes it RED. Its final assertion records the #6592
-  residual explicitly, so the surviving gap is executable rather than
-  prose. The invariant is two-sided, so BOTH halves are
-  RED-on-revert guarded: the producer half has its own per-instance
-  `#[cfg(test)] validation_at_forwarding_publish` seam (the twin of the
-  #5166 CoS seam) recording the WORKER-VISIBLE `shared_validation` at the
-  forwarding-publish instant, asserted by
-  `refresh_runtime_snapshot_publishes_validation_before_forwarding` —
-  swapping the two coordinator stores makes THAT one RED. The worker's
-  startup seed (`worker/loop_body/setup.rs`) reads in the same
-  forwarding-then-validation order, and `stop_inner`'s teardown stores use
-  the same validation-then-forwarding order (no live readers there — the
-  worker threads are already joined — but one order everywhere keeps the
+  Both halves are RED-on-revert guarded. Producer:
+  `refresh_runtime_snapshot_publishes_a_coherent_view_pair` asserts the
+  pair a worker observes IS the pair the choke point intended, using the
+  per-instance `#[cfg(test)] runtime_view_at_publish` seam — which also
+  retains the previous view so it proves its own position (hoisting the
+  store above the capture goes RED). Consumer:
+  `snapshot_refresh_runtime_view_pair_is_atomic_6592` (worker/loop_body)
+  drives the refresh with a coordinator publish injected through the
+  `between` seam and asserts the returned pair is coherent; splitting the
+  refresh back into two `ArcSwap` loads goes RED in EITHER order, naming
+  which orientation it reintroduced. `#1188` itself is pinned by
+  `bump_fib_generation_publishes_new_stamps_without_rotating_forwarding`.
+  The worker's startup seed (`worker/loop_body/setup.rs`) takes its pair
+  from the same single load, and `stop_inner`'s teardown publishes the
+  default pair through the same choke point (no live readers there — the
+  worker threads are already joined — but one path everywhere keeps the
   rule true at every site).
 - **A POST-teardown worker-spawn failure fails closed (#4952).** The
   #2440/#2484/#3789 fail-closed legs above all abort BEFORE `tear_down`,

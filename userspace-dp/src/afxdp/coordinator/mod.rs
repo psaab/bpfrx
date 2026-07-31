@@ -253,7 +253,6 @@ pub struct Coordinator {
     pub(crate) last_slow_path_mtu_reconciled: i32,
     pub(in crate::afxdp) ha: HaState,
     pub(crate) cos: SharedCoSState,
-    pub(crate) shared_validation: Arc<ArcSwap<ValidationState>>,
     pub(crate) neighbors: NeighborManager,
     pub(in crate::afxdp) sessions: SessionManager,
     /// #6471: node-shared live-IKE-exchange table backing the Stage-11
@@ -347,7 +346,7 @@ pub struct Coordinator {
     /// #5166 test seam (per-instance, NOT a process-global): under
     /// `cfg(test)`, `refresh_runtime_snapshot_inner` records a clone of the
     /// `cos.owner_worker_by_queue` map here at the exact instant just before
-    /// it makes the new `ForwardingState` worker-visible (`ha.forwarding`
+    /// it makes the new `ForwardingState` worker-visible (the `ha.runtime`
     /// store). The ordering-regression test asserts this snapshot already
     /// reflects the new generation's queues — i.e. the CoS maps are published
     /// BEFORE forwarding. Reverting the #5166 reorder captures the stale map
@@ -355,29 +354,27 @@ pub struct Coordinator {
     /// parallel tests never race.
     #[cfg(test)]
     pub(crate) cos_owner_at_forwarding_publish: Option<BTreeMap<(i32, u8), u32>>,
-    /// #6291 test seam (per-instance, NOT a process-global): the twin of
-    /// `cos_owner_at_forwarding_publish` for the validation half of the
-    /// publish pair. Under `cfg(test)`, `refresh_runtime_snapshot_inner`
-    /// records the WORKER-VISIBLE `shared_validation` value here at the exact
-    /// instant just before it makes the new `ForwardingState` worker-visible
-    /// (`ha.forwarding` store). The ordering-regression test asserts this
-    /// already carries the new generation — i.e. validation is published
-    /// BEFORE forwarding. Swapping the two coordinator stores captures the
-    /// STALE validation and the test goes RED, which is the producer-side half
-    /// of the invariant the worker-side `refresh_forwarding_then_validation`
-    /// test guards. Absent from release builds; per-instance so parallel tests
-    /// never race.
+    /// #6592 test seam (per-instance, NOT a process-global), inherited from
+    /// the #6291 `validation_at_forwarding_publish` it replaces. Under
+    /// `cfg(test)`, `publish_runtime_view` records the coordinator's INTENDED
+    /// pair — `(self.validation, the ForwardingState it is about to publish)`
+    /// — plus the still-worker-visible PREVIOUS `RuntimeView`, at the exact
+    /// instant just before the view store.
     ///
-    /// The second tuple element is the worker-visible forwarding Arc AT THE
-    /// SAME INSTANT, and it makes the seam guard its own placement: the test
-    /// asserts it is NOT the post-refresh Arc, so a future edit that hoists
-    /// the `ha.forwarding` store above this capture — leaving the capture
-    /// reading an already-published validation and silently defeating the
-    /// first assert — goes RED too. Holding the Arc (not a raw pointer) keeps
-    /// the old allocation alive, so `Arc::ptr_eq` cannot be fooled by the new
-    /// allocation reusing a freed address.
+    /// Two things are asserted from it (`coordinator/tests.rs`):
+    /// - The intended pair EQUALS the pair a worker then observes. A publish
+    ///   site that built its view from a stale validation (or that published
+    ///   forwarding through some path other than this choke point) goes RED.
+    /// - The retained previous view is NOT the post-publish view. That makes
+    ///   the seam PROVE ITS OWN POSITION: hoisting the store above this
+    ///   capture — which would let the first assert pass vacuously by reading
+    ///   an already-published view — goes RED too. It retains an `Arc` rather
+    ///   than a raw pointer deliberately: dropping it would let the next
+    ///   `Arc::new` reuse the freed address and fool `ptr_eq`.
+    ///
+    /// Absent from release builds; per-instance so parallel tests never race.
     #[cfg(test)]
-    pub(crate) validation_at_forwarding_publish: Option<(ValidationState, Arc<ForwardingState>)>,
+    pub(crate) runtime_view_at_publish: Option<(RuntimeView, Arc<RuntimeView>)>,
     /// #6244: typed reconcile progress + failure identity. Replaces the
     /// former free-form `String` side-channel; the legacy operator string is
     /// rendered only at the `reconcile_debug` / `debug_reconcile_stage` wire
@@ -415,7 +412,6 @@ impl Coordinator {
             last_slow_path_mtu_reconciled: 0,
             ha: HaState::new(),
             cos: SharedCoSState::new(),
-            shared_validation: Arc::new(ArcSwap::from_pointee(ValidationState::default())),
             neighbors: NeighborManager::new(),
             sessions: SessionManager::new(),
             ike_exchanges: Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new()),
@@ -447,7 +443,7 @@ impl Coordinator {
             #[cfg(test)]
             cos_owner_at_forwarding_publish: None,
             #[cfg(test)]
-            validation_at_forwarding_publish: None,
+            runtime_view_at_publish: None,
             last_reconcile_stage: ReconcileStage::Idle,
             poll_mode: crate::PollMode::BusyPoll,
             event_stream: None,
@@ -586,7 +582,11 @@ impl Coordinator {
             // infrequently (only when kernel ARP/NDP changes, gated by
             // neighborsEqual in the Go manager). The clone cost is
             // negligible vs packet processing.
-            self.ha.forwarding.store(Arc::new(self.forwarding.clone()));
+            //
+            // #6592: published through the one choke point, so the neighbor
+            // update carries the CURRENT validation rather than leaving a
+            // second, independently-ordered store to get right.
+            self.publish_runtime_view();
         }
         self.neighbors.generation.fetch_add(1, Ordering::Relaxed);
         // #6034: advance the applied replace generation so a later stale /
@@ -712,19 +712,18 @@ impl Coordinator {
         self.bpf_maps.dnat_table_fd = None;
         self.bpf_maps.dnat_table_v6_fd = None;
         self.forwarding = ForwardingState::default();
-        // #6291: validation BEFORE forwarding here too, matching the
-        // snapshot-refresh publish order. `self.workers.stop_and_clear(...)`
-        // above already joined every worker thread, so this teardown has no
-        // live readers and either order is correct TODAY — but one order
-        // across every publish site keeps the invariant documented in
-        // snapshot_refresh.rs true everywhere, so a future refactor that moves
-        // state-clearing ahead of the join cannot silently resurrect the torn
-        // (old-validation, new-forwarding) window.
-        self.shared_validation
-            .store(Arc::new(ValidationState::default()));
-        self.ha
-            .forwarding
-            .store(Arc::new(ForwardingState::default()));
+        // #6592: reset BOTH halves before the single worker-visible publish.
+        // `self.validation` was defaulted further down pre-#6592 — after the
+        // old `shared_validation` / `ha.forwarding` stores — which was
+        // harmless while the two were independent Arcs stored with explicit
+        // values, but would now publish a default forwarding paired with the
+        // OUTGOING validation. `self.workers.stop_and_clear(...)` above has
+        // already joined every worker thread so this teardown has no live
+        // readers either way; publishing the coherent default pair keeps the
+        // "every published view is the intended pair" invariant true at every
+        // site, including this one.
+        self.validation = ValidationState::default();
+        self.publish_runtime_view();
         self.ha.fabrics.store(Arc::new(Vec::new()));
         self.neighbors.generation.store(0, Ordering::Relaxed);
         // #949: clear all shards atomically vs readers.
@@ -777,7 +776,9 @@ impl Coordinator {
         if let Ok(mut last) = self.last_resolution.lock() {
             *last = None;
         }
-        self.validation = ValidationState::default();
+        // #6592: `self.validation` is defaulted ABOVE, immediately before the
+        // `publish_runtime_view` teardown store, so the published pair is
+        // coherent. It used to be reset here.
         self.workers.last_planned_workers = 0;
         self.workers.last_planned_bindings = 0;
         self.workers.last_planned_worker_slots = 0;
@@ -1091,6 +1092,89 @@ impl Coordinator {
         self.validation.fib_generation
     }
 
+    /// #6592: the ONE place a `RuntimeView` becomes worker-visible.
+    ///
+    /// Every publish path funnels through here, and the view is built from
+    /// `self.validation` AT THE STORE — so the pair a worker observes is the
+    /// coordinator's intended pair by construction, at every site, with no
+    /// ordering discipline to get wrong. Before #6592 validation and
+    /// forwarding were two independent `ArcSwap`s and coherence depended on
+    /// each site storing them in the right order AND every reader loading them
+    /// in the opposite order; an acquire/release pair can only exclude ONE of
+    /// the two torn orientations that way (see `types/runtime_view.rs`).
+    ///
+    /// Callers must have finished mutating `self.validation` and
+    /// `self.forwarding` before calling: this is the release store that
+    /// publishes everything committed before it, so the #5166 CoS-map /
+    /// `ha.fabrics` stores must also already have happened.
+    fn store_runtime_view(&mut self, forwarding: Arc<ForwardingState>) {
+        let view = RuntimeView::new(self.validation, forwarding);
+        // #6592 test seam — records the INTENDED pair and the still-visible
+        // PREVIOUS view, so the regression test can assert both that a worker
+        // observes exactly this pair and that the capture sits BEFORE the
+        // store (hoist resistance). Absent from release builds.
+        #[cfg(test)]
+        {
+            self.runtime_view_at_publish = Some((view.clone(), self.ha.runtime.load_full()));
+        }
+        self.ha.runtime.store(Arc::new(view));
+    }
+
+    /// #6592: publish the current `self.forwarding` paired with the current
+    /// `self.validation`. Clones the forwarding tables (as every pre-#6592
+    /// `ha.forwarding.store(Arc::new(self.forwarding.clone()))` site did) and
+    /// rotates the worker-visible forwarding `Arc`, so workers take their
+    /// rotation branch.
+    pub(crate) fn publish_runtime_view(&mut self) {
+        let forwarding = Arc::new(self.forwarding.clone());
+        self.store_runtime_view(forwarding);
+    }
+
+    /// #6592: publish a VALIDATION-ONLY change, reusing the forwarding `Arc`
+    /// that is already worker-visible.
+    ///
+    /// This is what preserves #1188 across the atomic pairing. The alternative
+    /// design — inlining `ValidationState` into `ForwardingState` — would make
+    /// every FIB bump clone the whole forwarding state here and rotate the
+    /// worker-visible `Arc`, forcing each worker through its expensive
+    /// rotation branch (screen-profile and opening-override clones, cold-path
+    /// slot rescan, input-filter session purges, CoS runtime reset) for a
+    /// change that touched no table. Reusing the published `Arc` keeps the
+    /// worker's `Arc::ptr_eq` short-circuit hitting exactly as before; the
+    /// only cost is one small `RuntimeView` allocation on a cold path.
+    ///
+    /// It deliberately reads the PUBLISHED forwarding rather than
+    /// `self.forwarding`: republishing means "same tables, newer stamps", and
+    /// the published `Arc` is by definition the tables workers already hold.
+    pub(crate) fn republish_runtime_validation(&mut self) {
+        let forwarding = self.ha.runtime.load().forwarding.clone();
+        self.store_runtime_view(forwarding);
+    }
+
+    /// #6592 test accessor: the WORKER-VISIBLE validation — the validation half
+    /// of the currently published [`RuntimeView`]. Replaces the reads of the
+    /// former `shared_validation` `ArcSwap` in tests that assert what a worker
+    /// would observe, as distinct from `self.validation` (the coordinator's own
+    /// value, which a mid-apply abort may have left unpublished).
+    #[cfg(test)]
+    pub(crate) fn published_validation(&self) -> ValidationState {
+        self.ha.runtime.load().validation
+    }
+
+    /// #6592 test fixture: seed the worker-visible validation half, keeping the
+    /// published forwarding `Arc`. Replaces the former
+    /// `shared_validation.store(...)` fixture calls that stand in for "a prior
+    /// generation was successfully published and workers are running on it".
+    /// Callers normally set `self.validation` to the same value so the seeded
+    /// state is coherent.
+    #[cfg(test)]
+    pub(crate) fn seed_published_validation(&mut self, validation: ValidationState) {
+        let forwarding = self.ha.runtime.load().forwarding.clone();
+        self.ha
+            .runtime
+            .store(Arc::new(RuntimeView::new(validation, forwarding)));
+    }
+
     /// Bump just the FIB generation counter without a full snapshot rebuild.
     /// Workers will invalidate flow cache entries with stale FIB generations.
     ///
@@ -1119,7 +1203,11 @@ impl Coordinator {
             return false;
         }
         self.validation.fib_generation = fib_generation;
-        self.shared_validation.store(Arc::new(self.validation));
+        // #6592: publish the new stamps paired with the forwarding tables
+        // workers already hold. No rebuild, no forwarding-Arc rotation —
+        // `republish_runtime_validation` reuses the published `Arc`, so the
+        // #1188 short-circuit still short-circuits.
+        self.republish_runtime_validation();
         true
     }
 }

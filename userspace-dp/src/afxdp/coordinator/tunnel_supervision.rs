@@ -215,10 +215,10 @@ impl super::Coordinator {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
         // #1881 D.1: the thread receives the SAME worker-visible
-        // forwarding ArcSwap handle (`ha.forwarding`) instead of a
+        // runtime ArcSwap handle (`ha.runtime`, #6592) instead of a
         // frozen clone — every store on the refresh/reconcile/fabric
         // paths reaches it on its next iteration.
-        let shared_forwarding = self.ha.forwarding.clone();
+        let shared_runtime = self.ha.runtime.clone();
         let ha_state = self.ha.rg_runtime.clone();
         let dynamic_neighbors = self.neighbors.dynamic.clone();
         let live = self.workers.live.clone();
@@ -289,7 +289,7 @@ impl super::Coordinator {
                     thread_tunnel_name,
                     id,
                     logical_ifindex,
-                    shared_forwarding,
+                    shared_runtime,
                     ha_state,
                     dynamic_neighbors,
                     live,

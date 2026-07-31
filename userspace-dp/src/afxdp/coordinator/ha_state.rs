@@ -11,7 +11,13 @@ use super::*;
 pub(in crate::afxdp) struct HaState {
     pub(in crate::afxdp) rg_runtime: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     pub(in crate::afxdp) fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
-    pub(in crate::afxdp) forwarding: Arc<ArcSwap<ForwardingState>>,
+    /// #6592: the single worker-visible runtime gate — validation AND
+    /// forwarding in ONE `Arc`, so a reader can never pair them across
+    /// generations. Replaces the former `forwarding: Arc<ArcSwap<
+    /// ForwardingState>>` + the sibling `Coordinator::shared_validation`;
+    /// see `types/runtime_view.rs` for why the forwarding half stays a
+    /// nested `Arc` (the #1188 short-circuit).
+    pub(in crate::afxdp) runtime: Arc<ArcSwap<RuntimeView>>,
 }
 
 impl HaState {
@@ -19,7 +25,7 @@ impl HaState {
         Self {
             rg_runtime: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             fabrics: Arc::new(ArcSwap::from_pointee(Vec::new())),
-            forwarding: Arc::new(ArcSwap::from_pointee(ForwardingState::default())),
+            runtime: Arc::new(ArcSwap::from_pointee(RuntimeView::default())),
         }
     }
 }

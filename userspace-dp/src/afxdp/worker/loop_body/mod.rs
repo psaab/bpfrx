@@ -15,9 +15,9 @@
 // `load_arc_if_changed` path risks regressing the 10K-100K ticks/s
 // loop.
 //
-// #6291 carve-out: the per-tick path does now call one helper,
-// `refresh_forwarding_then_validation`, which exists to pin the
-// forwarding-then-validation acquire order and to expose a
+// #6291/#6592 carve-out: the per-tick path does now call one helper,
+// `refresh_runtime_view`, which exists to pin the SINGLE-load property
+// of the (validation, forwarding) pair and to expose a
 // controlled-interleaving test seam. It is `#[inline]` and its
 // production `between` argument is `|| {}` (a ZST whose `call_once`
 // body is empty), so it leaves NO call boundary in release: the
@@ -44,84 +44,91 @@ mod setup;
 #[cfg(feature = "debug-log")]
 mod debug_report;
 
-/// #6291: refresh the worker's per-tick forwarding + validation view in the
-/// publish-safe order — forwarding acquire-load FIRST, validation SECOND.
+/// #6592: refresh the worker's per-tick `(validation, forwarding)` view from
+/// ONE `ArcSwap` load, so the two halves can never come from different
+/// generations.
 ///
-/// The coordinator (`snapshot_refresh.rs`) commits a same-plan refresh by
-/// storing `shared_validation` BEFORE `ha.forwarding` (both release-ordered
-/// ArcSwap stores, with the CoS maps stored even earlier per #5166). For a
-/// producer/consumer pair the acquire/release message-passing must run in the
-/// OPPOSITE order on the two sides: because the producer stores validation
-/// (A) then forwarding (B), the consumer must load forwarding (B) then
-/// validation (A). Then observing the NEW forwarding Arc implies — by
-/// ArcSwap acquire/release ordering — also observing the NEW (or newer)
-/// validation. The torn `(old-validation, new-forwarding)` state, in which a
-/// packet stamped at the old generation passes `classify_metadata`
-/// (`forwarding/fib.rs`) and is then classified/forwarded under the new
-/// forwarding state, becomes impossible.
+/// # What went wrong with two loads
 ///
-/// # The mirror orientation survives and is NOT benign (#6592)
+/// Validation and forwarding used to live in two independent `ArcSwap`s, and
+/// this refresh performed two separate acquire-loads. A coordinator publish
+/// landing between them left the worker holding one half from generation N and
+/// the other from N-1 — a torn pair, unsafe in BOTH orientations:
+/// - `(old validation, new forwarding)` — a packet stamped at the OLD
+///   generation matches the worker's old validation, classifies `Valid`
+///   (`classify_metadata`, `forwarding/fib.rs`), and is then forwarded under
+///   the NEW tables. This is what #6291 named.
+/// - `(new validation, old forwarding)` — the mirror. While the shim is still
+///   stamping the OLD generation this pair only drops
+///   (`ConfigGenerationMismatch`, or `FibGenerationMismatch` when only the FIB
+///   generation moved). But once the coordinator's reply reaches Go and Go
+///   writes the new generation to `userspace_ctrl`, the shim stamps NEW; those
+///   packets match the worker's new validation, classify `Valid`, and are
+///   forwarded under the STALE tables — a withdrawn route still resolves, a
+///   newly added deny is not applied. Nothing orders the Go control-map update
+///   after every worker's next forwarding load. This is #6592.
 ///
-/// This closes ONE orientation. `(new-validation, old-forwarding)` remains
-/// reachable — indeed it is what this reorder produces when a publish lands
-/// between the two loads — and it is not drop-only. Its two phases:
-/// - While the shim is still stamping the OLD generation, old-stamped packets
-///   miss the new validation and DROP (`ConfigGenerationMismatch`, or
-///   `FibGenerationMismatch` when only the FIB generation moved) — for as many
-///   packets as the RX sweep touches, not just one.
-/// - Once the coordinator's reply reaches Go and Go writes the new generation
-///   to `userspace_ctrl`, the shim stamps NEW. A worker still holding the old
-///   forwarding classifies those packets `Valid` against its new validation and
-///   forwards them under the STALE forwarding state — a withdrawn route or a
-///   new deny is not applied. Nothing orders the Go control-map update after
-///   every worker's next forwarding load, and a worker can be descheduled in
-///   between.
+/// Reordering the two loads cannot fix this. Producer and consumer must run in
+/// OPPOSITE orders for an acquire/release pair, which excludes exactly one of
+/// the two orientations and widens the other. #6291's reorder closed the first
+/// and left the second — and the second is the COMMON one: it needs only the
+/// forwarding load to land anywhere inside the publish window, whereas the
+/// closed orientation needed the whole window (a full `ForwardingState` clone —
+/// 69 fields, ~20 heap-owning collections including the FIB) to nest inside the
+/// nanosecond-scale gap between two adjacent loads, i.e. a stalled worker.
 ///
-/// So the eliminated orientation needed no extra condition to forward across
-/// generations; the surviving one needs the worker to still be behind after a
-/// control-socket round trip. That is a real reduction in exposure, not a
-/// closure.
+/// # What one load buys
 ///
-/// Size it honestly in BOTH directions, though: per occurrence the eliminated
-/// orientation was the worse one, but by RATE it was the rarer one. It needed
-/// the entire publish window — a full `ForwardingState` clone, 69 fields with
-/// ~20 heap-owning collections including the FIB — to nest inside the
-/// nanosecond-scale gap between two adjacent acquire-loads, i.e. a stalled
-/// worker. The survivor needs only the forwarding load to land anywhere inside
-/// that same publish window, which is near-certain for at least one of the
-/// per-VF workers on every apply. This removes the rarer orientation and keeps
-/// the common one; the net exposure reduction is real but smaller than the
-/// preceding paragraph reads on its own.
+/// The coordinator publishes a single [`RuntimeView`] holding both halves
+/// (`Coordinator::publish_runtime_view`). Whichever view this load observes,
+/// its `validation` and `forwarding` were published together, so the returned
+/// pair is coherent by construction. Neither orientation is reachable; there is
+/// no pair to tear and no ordering discipline to get wrong.
 ///
-/// The fix is to pair validation with a specific forwarding snapshot
-/// atomically (one `ArcSwap` holding both, or generation fields embedded in
-/// `ForwardingState`) — tracked as #6592, deliberately out of scope here.
+/// Observing an OLD view is still possible and still SAFE: new-stamped packets
+/// mismatch the old validation and DROP, the intended fail-closed behaviour.
+/// This closes INCOHERENT pairs, not stale coherent ones — nothing here forces
+/// a refresh.
 ///
-/// This preserves both the #1188 short-circuit (forwarding is loaded via
-/// `load_arc_if_changed`, returning `None` when the Arc did not rotate) and
-/// the #5166 CoS-then-forwarding publish (the caller still reads forwarding
-/// before the CoS map Arcs). `#[inline]` + a no-op `between` collapse to the
-/// original two loads in release builds — no per-tick call boundary or cost
-/// (the loop deliberately stays inline; see the module header).
+/// # Cost
 ///
-/// `between` is a deterministic test seam fired BETWEEN the two acquire-loads
-/// so a controlled-interleaving test can inject a concurrent coordinator
-/// publish and assert the invariant without a flaky thread race; production
-/// passes `|| {}`.
+/// One `ArcSwap` load per tick where there used to be two, and the #1188
+/// short-circuit is preserved exactly: `Arc::ptr_eq` against the caller's
+/// cached forwarding returns `None` when the published forwarding `Arc` did not
+/// rotate, so the caller's expensive rotation branch is skipped. A
+/// validation-only publish (`bump_fib_generation`) rotates the view but reuses
+/// the inner forwarding `Arc`, so it still short-circuits — see
+/// `Coordinator::republish_runtime_validation`. The #5166 CoS pair is unchanged:
+/// the caller still reads this view before the CoS map Arcs.
+///
+/// `between` is a deterministic test seam fired between reading the two halves
+/// OUT of the loaded view. Under this implementation both reads come from the
+/// same already-loaded `Arc`, so a coordinator publish injected there is
+/// invisible and the returned pair stays coherent. Splitting the refresh back
+/// into two `ArcSwap` loads — in EITHER order — makes an injected publish tear
+/// the pair, which is exactly what
+/// `snapshot_refresh_runtime_view_pair_is_atomic_6592` asserts against.
+/// Production passes `|| {}`: a ZST whose `call_once` body is empty, so
+/// `#[inline]` collapses this to the single load in release builds — no
+/// per-tick call boundary or cost (the loop deliberately stays inline; see the
+/// module header).
 #[inline]
-fn refresh_forwarding_then_validation(
+fn refresh_runtime_view(
     forwarding: &Arc<ForwardingState>,
-    shared_forwarding: &ArcSwap<ForwardingState>,
-    shared_validation: &ArcSwap<ValidationState>,
+    shared_runtime: &ArcSwap<RuntimeView>,
     between: impl FnOnce(),
 ) -> (Option<Arc<ForwardingState>>, ValidationState) {
-    // Forwarding FIRST (acquire) — the gate. Its rotation is the signal that
-    // publishes the validation store that preceded it on the coordinator.
-    let new_forwarding = load_arc_if_changed(forwarding, shared_forwarding);
+    // ONE acquire-load. Everything below reads out of `view`, so the two
+    // halves are from the same publish no matter what runs concurrently.
+    let view = shared_runtime.load();
+    let validation = view.validation;
     between();
-    // Validation SECOND (acquire) — sequenced after the forwarding load, so a
-    // NEW forwarding observation carries a NEW-or-newer validation.
-    let validation = **shared_validation.load();
+    // #1188: adopt the forwarding Arc only when it actually rotated.
+    let new_forwarding = if Arc::ptr_eq(forwarding, &view.forwarding) {
+        None
+    } else {
+        Some(view.forwarding.clone())
+    };
     (new_forwarding, validation)
 }
 
@@ -150,8 +157,7 @@ pub(crate) fn worker_loop(
         dnat_fds,
     } = plan;
     let WorkerSharedDataplane {
-        validation: shared_validation,
-        forwarding: shared_forwarding,
+        runtime: shared_runtime,
         ha_state,
         local_tunnel_deliveries,
         fabrics: shared_fabrics,
@@ -226,8 +232,7 @@ pub(crate) fn worker_loop(
     } = setup::worker_loop_setup(
         worker_id,
         binding_plans,
-        &shared_validation,
-        &shared_forwarding,
+        &shared_runtime,
         &shared_cos_owner_worker_by_queue,
         &shared_cos_owner_live_by_queue,
         &shared_cos_root_leases,
@@ -553,20 +558,14 @@ pub(crate) fn worker_loop(
         }
         let loop_now_secs = loop_now_ns / 1_000_000_000;
         let mut rebuild_cos_fast_interfaces = false;
-        // #6291: read forwarding FIRST, then validation — the publish-safe
-        // order. The coordinator stores `shared_validation` BEFORE
-        // `ha.forwarding`, so acquiring forwarding first here guarantees a
-        // worker that observes the NEW forwarding Arc also observes the NEW
-        // (or newer) validation; the torn (old-validation, new-forwarding)
-        // window is impossible. This still loads forwarding before the CoS
-        // map Arcs below (#5166) and keeps the #1188 short-circuit — see
-        // `refresh_forwarding_then_validation`.
-        let (new_forwarding_opt, live_validation) = refresh_forwarding_then_validation(
-            &forwarding,
-            &shared_forwarding,
-            &shared_validation,
-            || {},
-        );
+        // #6592: ONE load for both halves. The coordinator publishes
+        // validation and forwarding in a single `RuntimeView`, so whichever
+        // view this observes gives a coherent pair — neither torn orientation
+        // is reachable. Still read BEFORE the CoS map Arcs below (#5166), and
+        // still #1188-short-circuited on the forwarding Arc — see
+        // `refresh_runtime_view`.
+        let (new_forwarding_opt, live_validation) =
+            refresh_runtime_view(&forwarding, &shared_runtime, || {});
         if live_validation != validation {
             validation = live_validation;
         }
@@ -2224,121 +2223,205 @@ mod expiry_count_tests {
 mod snapshot_refresh_ordering_tests {
     use super::*;
 
-    /// #6291 ordering regression (deterministic fail-on-revert). A worker
-    /// refreshing its per-tick view must acquire-load `shared_forwarding`
-    /// BEFORE `shared_validation`, because the coordinator publishes a
-    /// same-plan refresh by storing validation BEFORE forwarding
-    /// (`refresh_runtime_snapshot_inner`). If the worker reads in the SAME
-    /// order as the stores (validation, then forwarding), a coordinator
-    /// publish landing between the two loads leaves the worker holding NEW
-    /// forwarding + OLD validation — the torn window in which a packet stamped
-    /// at the old generation passes `classify_metadata` (validation still
-    /// old) and is then classified/forwarded under the new forwarding state.
+    /// A published `(generation, forwarding)` fixture. Holding every `Arc`
+    /// alive for the whole test is load-bearing: `Arc::ptr_eq` is the only way
+    /// to map an observed forwarding allocation back to the generation it was
+    /// published with, and a dropped allocation could be recycled by the next
+    /// `Arc::new` and fool it.
+    struct PublishedGenerations {
+        views: Vec<(u64, Arc<ForwardingState>)>,
+    }
+
+    impl PublishedGenerations {
+        fn new() -> Self {
+            Self { views: Vec::new() }
+        }
+
+        /// Mint a fresh forwarding allocation stamped with `generation`, and
+        /// return the `RuntimeView` the coordinator would publish for it.
+        fn mint(&mut self, generation: u64) -> RuntimeView {
+            let forwarding = Arc::new(ForwardingState::default());
+            self.views.push((generation, forwarding.clone()));
+            RuntimeView::new(
+                ValidationState {
+                    snapshot_installed: true,
+                    config_generation: generation,
+                    fib_generation: generation as u32,
+                },
+                forwarding,
+            )
+        }
+
+        /// The generation `forwarding` was published with.
+        fn generation_of(&self, forwarding: &Arc<ForwardingState>) -> u64 {
+            self.views
+                .iter()
+                .find(|(_, published)| Arc::ptr_eq(published, forwarding))
+                .map(|(generation, _)| *generation)
+                .expect("every forwarding allocation under test is minted here")
+        }
+    }
+
+    /// #6592 pairing regression (deterministic fail-on-revert), CONSUMER half.
     ///
-    /// The test drives `refresh_forwarding_then_validation` with the
-    /// coordinator publish (store validation gen N, then store a fresh
-    /// forwarding Arc) injected through the `between` seam — deterministically
-    /// reproducing the ≤1-tick interleaving with NO thread race. With the fix
-    /// (forwarding loaded first) the forwarding load returns `None` (the Arc
-    /// had not rotated at load time), so the worker keeps its old forwarding
-    /// and pairs it with the freshly-loaded new validation. Swapping the two
-    /// loads back (validation first) makes the worker adopt the NEW forwarding
-    /// Arc while still reading the OLD validation → both assertions fire RED.
+    /// A worker's per-tick refresh must take validation AND forwarding from ONE
+    /// `ArcSwap` load, so the pair it ends up holding is always the pair the
+    /// coordinator published. Two separate loads — in EITHER order — let a
+    /// coordinator publish land between them and tear the pair:
+    /// - validation loaded first → `(old validation, new forwarding)`. A packet
+    ///   stamped at the OLD generation passes `classify_metadata` and is then
+    ///   forwarded under the NEW tables. (#6291.)
+    /// - forwarding loaded first → `(new validation, old forwarding)`. Once Go
+    ///   writes the new generation to `userspace_ctrl` the shim stamps NEW;
+    ///   those packets pass `classify_metadata` against the new validation and
+    ///   are forwarded under the STALE tables — a withdrawn route still
+    ///   resolves, a new deny is not applied. (#6592.) This is the orientation
+    ///   #6291's reorder left behind, and it is the COMMON one.
     ///
-    /// # Scope — this test asserts ONE orientation is impossible, not that the
-    /// # pair is coherent
+    /// The test drives `refresh_runtime_view` with a coordinator publish
+    /// injected through the `between` seam — deterministically reproducing the
+    /// ≤1-tick interleaving with NO thread race — and asserts the returned pair
+    /// is COHERENT: the observed validation is the generation the observed
+    /// forwarding was published with. That single assertion catches BOTH
+    /// orientations, because both produce a mismatch. Splitting
+    /// `refresh_runtime_view` back into two `ArcSwap` loads in either order
+    /// turns it RED.
     ///
-    /// The state this test leaves the worker in — NEW validation paired with
-    /// the OLD forwarding Arc — is the MIRROR orientation, and it is a KNOWN
-    /// GAP tracked by **#6592**, not a safe resting state. Do not read the
-    /// assertions below as a coherence proof. While the shim is still stamping
-    /// the old generation the mirror pair only drops
-    /// (`ConfigGenerationMismatch` / `FibGenerationMismatch`, for as many
-    /// packets as the sweep touches). But once Go writes the new generation to
-    /// `userspace_ctrl` and the shim starts stamping it, a worker still holding
-    /// the old forwarding classifies those new-stamped packets `Valid` and
-    /// forwards them under the STALE forwarding state — nothing orders the Go
-    /// control-map update after every worker's next forwarding load. The final
-    /// assertion below records that residual explicitly so it is executable,
-    /// not just prose.
+    /// Note what is deliberately NOT asserted: that the worker observes the
+    /// NEW generation. Observing the OLD view is a legitimate, SAFE outcome —
+    /// a worker that has not refreshed drops new-stamped packets, the intended
+    /// fail-closed behaviour. #6592 closes INCOHERENT pairs, not stale coherent
+    /// ones. Case 3 covers convergence separately.
     #[test]
-    fn snapshot_refresh_no_old_validation_with_new_forwarding_6291() {
-        const OLD_GEN: u64 = 1;
-        const NEW_GEN: u64 = 2;
+    fn snapshot_refresh_runtime_view_pair_is_atomic_6592() {
+        let mut published = PublishedGenerations::new();
 
-        let shared_forwarding = ArcSwap::from_pointee(ForwardingState::default());
-        let shared_validation = ArcSwap::from_pointee(ValidationState {
-            snapshot_installed: true,
-            config_generation: OLD_GEN,
-            fib_generation: 1,
-        });
+        let view1 = published.mint(1);
+        let shared_runtime = ArcSwap::from_pointee(view1);
 
-        // The worker's cached forwarding Arc is the currently-published one,
-        // so an unchanged `shared_forwarding` short-circuits to None (#1188).
-        let cached_forwarding = shared_forwarding.load_full();
-
-        // Injected coordinator publish: validation FIRST, then forwarding —
-        // exactly the store order in refresh_runtime_snapshot_inner. Fires
-        // between the worker's two acquire-loads.
-        let publish = || {
-            shared_validation.store(Arc::new(ValidationState {
-                snapshot_installed: true,
-                config_generation: NEW_GEN,
-                fib_generation: 2,
-            }));
-            shared_forwarding.store(Arc::new(ForwardingState::default()));
+        // Assert the returned pair is internally coherent, and report which
+        // torn orientation a failure represents so a revert names its own bug.
+        let assert_coherent = |published: &PublishedGenerations,
+                               cached: &Arc<ForwardingState>,
+                               new_forwarding_opt: &Option<Arc<ForwardingState>>,
+                               observed: ValidationState,
+                               case: &str| {
+            // The pair the worker actually ends the tick holding: the adopted
+            // Arc if forwarding rotated, otherwise its unchanged cached one.
+            let effective = new_forwarding_opt.as_ref().unwrap_or(cached);
+            let forwarding_generation = published.generation_of(effective);
+            let orientation = if observed.config_generation > forwarding_generation {
+                "(new validation, old forwarding) — the #6592 mirror: \
+                 new-stamped packets classify Valid and forward under STALE tables"
+            } else {
+                "(old validation, new forwarding) — the #6291 orientation: \
+                 old-stamped packets classify Valid and forward under NEW tables"
+            };
+            assert_eq!(
+                observed.config_generation, forwarding_generation,
+                "#6592 [{case}]: worker holds a TORN pair {orientation}. \
+                 Both halves must come from ONE view load",
+            );
         };
 
-        let (new_forwarding_opt, observed_validation) = refresh_forwarding_then_validation(
-            &cached_forwarding,
-            &shared_forwarding,
-            &shared_validation,
-            publish,
+        // --- Case 1: the worker is UP TO DATE and a publish lands mid-refresh.
+        // Its cached forwarding is the currently-published one, so with a
+        // single load nothing rotates (#1188 short-circuit) and it keeps the
+        // whole old pair — coherent, and safe.
+        let cached = shared_runtime.load().forwarding.clone();
+        let view2 = published.mint(2);
+        let (new_forwarding_opt, observed) =
+            refresh_runtime_view(&cached, &shared_runtime, || {
+                shared_runtime.store(Arc::new(view2));
+            });
+        assert_coherent(
+            &published,
+            &cached,
+            &new_forwarding_opt,
+            observed,
+            "publish during refresh, worker up to date",
         );
 
-        // THE INVARIANT, asserted FIRST so a revert reports the invariant
-        // itself rather than the bookkeeping check below: the worker must
-        // never adopt the NEW forwarding Arc while still holding OLD
-        // validation. Forwarding-first makes the load return None here (Arc
-        // not yet rotated), so nothing is adopted; validation-first returns
-        // Some(new Arc) while observed_validation is still OLD_GEN — the torn
-        // (old-validation, new-forwarding) state.
-        let adopted_new_forwarding = new_forwarding_opt.is_some();
-        let torn = adopted_new_forwarding && observed_validation.config_generation < NEW_GEN;
+        // --- Case 2: the worker is BEHIND (a publish already landed before its
+        // load) and ANOTHER publish lands mid-refresh. Now the refresh really
+        // does adopt a new forwarding Arc, so the coherence assert above is not
+        // satisfiable by simply never adopting anything.
+        let view3 = published.mint(3);
+        let (new_forwarding_opt, observed) =
+            refresh_runtime_view(&cached, &shared_runtime, || {
+                shared_runtime.store(Arc::new(view3));
+            });
         assert!(
-            !torn,
-            "#6291: worker adopted NEW forwarding with OLD validation \
-             (config_generation={}) — the torn (old-validation, new-forwarding) \
-             window must be impossible",
-            observed_validation.config_generation,
+            new_forwarding_opt.is_some(),
+            "a worker behind by a generation must adopt the published \
+             forwarding — otherwise the coherence assert is vacuous",
+        );
+        assert_coherent(
+            &published,
+            &cached,
+            &new_forwarding_opt,
+            observed,
+            "publish during refresh, worker behind",
         );
 
-        // Not vacuous: with forwarding read first, validation is loaded AFTER
-        // the injected publish, so the worker always observes the new
-        // generation here. (Reverting to validation-first observes OLD_GEN and
-        // trips this assert too.)
+        // --- Case 3: with no concurrent publish the worker CONVERGES on the
+        // latest published pair. This is what makes cases 1 and 2 non-vacuous:
+        // the injected publishes were real and reachable, they just were not
+        // observable by a load that had already happened.
+        let (new_forwarding_opt, observed) =
+            refresh_runtime_view(&cached, &shared_runtime, || {});
+        let adopted = new_forwarding_opt
+            .clone()
+            .expect("the worker must adopt the latest published forwarding");
+        assert_coherent(
+            &published,
+            &cached,
+            &new_forwarding_opt,
+            observed,
+            "quiescent refresh",
+        );
         assert_eq!(
-            observed_validation.config_generation, NEW_GEN,
-            "the injected coordinator publish must be observed (validation is \
-             loaded after it when forwarding is read first)"
+            observed.config_generation, 3,
+            "a quiescent refresh must converge on the newest published pair",
+        );
+        assert!(
+            Arc::ptr_eq(&adopted, &shared_runtime.load().forwarding),
+            "the adopted forwarding must be the published allocation",
         );
 
-        // #6592 KNOWN GAP, recorded as an executable fact rather than a
-        // comment: the state this test just produced is the MIRROR torn pair —
-        // NEW validation with the OLD forwarding Arc. It is NOT drop-only.
-        // Once Go reprograms `userspace_ctrl` with the new generation, packets
-        // stamped NEW classify `Valid` against this validation and are
-        // forwarded under the stale forwarding state. The real fix is to pair
-        // validation and forwarding atomically (one ArcSwap snapshot, or
-        // generation fields in `ForwardingState`) — out of scope for #6291.
-        // When #6592 lands this assertion SHOULD go RED; that is the point.
+        // --- Case 4 (#1188): a VALIDATION-ONLY publish — what
+        // `Coordinator::republish_runtime_validation` does for a FIB bump —
+        // advances the stamps while REUSING the forwarding Arc, so the worker
+        // sees the new validation with no rotation and skips its expensive
+        // forwarding-rotation branch. The pair stays coherent because it is
+        // still one view.
+        let unrotated = shared_runtime.load().forwarding.clone();
+        shared_runtime.store(Arc::new(RuntimeView::new(
+            ValidationState {
+                snapshot_installed: true,
+                config_generation: 3,
+                fib_generation: 99,
+            },
+            unrotated.clone(),
+        )));
+        let (new_forwarding_opt, observed) =
+            refresh_runtime_view(&adopted, &shared_runtime, || {});
         assert!(
-            !adopted_new_forwarding,
-            "#6592: this test's outcome state is the mirror residual (new \
-             validation, old forwarding). If the worker now adopts forwarding \
-             here, #6592 has changed the pairing — revisit this test and the \
-             ordering docs in coordinator/snapshot_refresh.rs rather than \
-             deleting the assertion",
+            new_forwarding_opt.is_none(),
+            "#1188: a validation-only publish must NOT rotate the worker's \
+             forwarding Arc — rotating it drags every worker through the \
+             expensive rotation branch for a change that touched no table",
+        );
+        assert_eq!(
+            observed.fib_generation, 99,
+            "the validation-only publish must still be observed",
+        );
+        assert_coherent(
+            &published,
+            &adopted,
+            &new_forwarding_opt,
+            observed,
+            "validation-only publish",
         );
     }
 }

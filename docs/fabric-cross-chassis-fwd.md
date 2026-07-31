@@ -480,11 +480,12 @@ unparseable replacement address is ignored (the malformed new link cannot
 resolve anyway).
 
 **Reader visibility.** The pruned set is stored into BOTH the full
-`ha.forwarding` Arc (the worker's authoritative per-tick reload) AND the
+`ha.runtime` view's forwarding Arc (the worker's authoritative per-tick
+reload) AND the
 worker fast-path `ha.fabrics` Arc. The worker overwrites its
 `forwarding.fabrics` from `ha.fabrics` only when that Arc is non-empty, so
 leaving a stale non-empty `ha.fabrics` would re-add the superseded link the
-`ha.forwarding` store just removed — both must be updated in lock-step. A
+`ha.runtime` store just removed — both must be updated in lock-step. A
 torn read (old link gone, replacement not yet visible) is harmless here
 because "no target → safe fallback"; the invariant that must never break is
 that the OLD link is not readable after the replacement is staged.

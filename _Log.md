@@ -62299,3 +62299,63 @@ break — `go vet` confirmed passing under every revert.
     either way.
   - **File(s)**: userspace-dp/src/afxdp/worker/loop_body/mod.rs,
     userspace-dp/src/afxdp/coordinator/README.md
+
+- **Timestamp**: 2026-07-31 07:05
+  - **Action**: #6592 — pair validation and forwarding ATOMICALLY so a worker can
+    never hold one half from generation N and the other from N-1, in EITHER
+    orientation. `shared_validation` (an `ArcSwap<ValidationState>`) and
+    `ha.forwarding` (an `ArcSwap<ForwardingState>`) are replaced by a single
+    `ha.runtime: ArcSwap<RuntimeView>` where `RuntimeView { validation,
+    forwarding: Arc<ForwardingState> }`. The worker's per-tick refresh
+    (`refresh_runtime_view`) and its startup seed both take BOTH halves out of
+    ONE `ArcSwap` load, so whichever view is observed, its two halves were
+    published together. #6291's read-order flip could only ever exclude ONE
+    orientation — an acquire/release pair is directional — and the one it left,
+    `(new validation, old forwarding)`, is the COMMON one and is not drop-only:
+    after Go writes the new generation into `userspace_ctrl` the shim stamps
+    NEW, those packets classify Valid against the worker's new validation, and
+    they forward under the STALE tables.
+    DESIGN: the forwarding half stays a NESTED `Arc` rather than being inlined
+    into a single flat snapshot, because `bump_fib_generation` advances
+    validation with NO table change and Go fires it repeatedly during route
+    convergence. `republish_runtime_validation` reuses the published forwarding
+    `Arc`, so the worker's #1188 `Arc::ptr_eq` short-circuit still hits and the
+    expensive rotation branch is not taken. Measured
+    (`benches/runtime_view_refresh.rs`): validation-only publish 214 ns (reuse)
+    vs 14.2 us (inlined rebuild) at 1K routes — 66x — and 239 ns vs 62.5 us at
+    10K routes — 262x. The per-tick worker refresh went from 45.97 ns (two
+    ArcSwap loads) to 22.57 ns (one), so the hot path got cheaper, not dearer.
+    Every publish site now funnels through one choke point
+    (`Coordinator::publish_runtime_view` / `republish_runtime_validation`), which
+    builds the view from `self.validation` AT the store — so coherence is
+    structural at every site instead of depending on store order. `stop_inner`
+    needed `self.validation` defaulted BEFORE its publish (it used to be reset
+    after the stores, which was harmless with two independent Arcs but would now
+    publish a default forwarding paired with the outgoing validation). #5166 is
+    unchanged: the CoS maps + `ha.fabrics` still store before the view, and the
+    worker still reads the view before the CoS Arcs.
+    GATES: the consumer test
+    (`snapshot_refresh_runtime_view_pair_is_atomic_6592`) drives the refresh with
+    a coordinator publish injected through the `between` seam and asserts the
+    returned pair is coherent — splitting it back into two `ArcSwap` loads goes
+    RED in EITHER order and the message names which orientation was
+    reintroduced. The producer test
+    (`refresh_runtime_snapshot_publishes_a_coherent_view_pair`) asserts the pair a
+    worker observes IS the pair the choke point intended, via the
+    `runtime_view_at_publish` seam, which retains the PREVIOUS view so it proves
+    its own position (hoisting the store above the capture is RED too). #1188 is
+    pinned by `bump_fib_generation_publishes_new_stamps_without_rotating_forwarding`.
+    Release symbol check: `refresh_runtime_view` is absent from `nm` on the
+    release binary while `worker_loop` is present — the seam leaves no call
+    boundary. Full `cargo test --release` green (4220 + 60 + 8 + 22 + 1); all
+    five new/updated test names confirmed in the release `-v` output.
+  - **File(s)**: userspace-dp/src/afxdp/types/{runtime_view.rs,mod.rs},
+    userspace-dp/src/afxdp/coordinator/{mod.rs,ha_state.rs,snapshot_refresh.rs,
+    tunnel_supervision.rs,tests.rs,README.md},
+    userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
+    userspace-dp/src/afxdp/worker/{launch.rs,loop_body/mod.rs,loop_body/setup.rs},
+    userspace-dp/src/afxdp/tunnel.rs,
+    userspace-dp/src/afxdp/forwarding/README.md,
+    userspace-dp/benches/runtime_view_refresh.rs, userspace-dp/Cargo.toml,
+    docs/userspace-dataplane-architecture.md, docs/fabric-cross-chassis-fwd.md,
+    _Log.md

@@ -580,8 +580,8 @@ fn refresh_runtime_snapshot_rebuilds_cos_owner_worker_map_from_identities() {
 
 /// #5166 ordering regression: the in-place `refresh_runtime_snapshot` must
 /// publish the derived CoS owner/live/lease/backlog/vtime maps BEFORE it
-/// makes the new `ForwardingState` worker-visible (`ha.forwarding` store).
-/// A live worker loads `shared_forwarding` first and the CoS maps second
+/// makes the new `ForwardingState` worker-visible (the `ha.runtime` store).
+/// A live worker loads the `RuntimeView` first and the CoS maps second
 /// within one tick, then rebuilds `cos_fast_interfaces` from both — so if
 /// forwarding were published first, a worker could see the new queue config
 /// with a stale/empty CoS owner map (transient class blackhole / old-rate /
@@ -671,33 +671,28 @@ fn refresh_runtime_snapshot_publishes_cos_owner_map_before_forwarding() {
     );
 }
 
-/// #6291 ordering regression, PRODUCER half: the in-place
-/// `refresh_runtime_snapshot` must store `shared_validation` BEFORE it makes
-/// the new `ForwardingState` worker-visible (`ha.forwarding` store).
+/// #6592 pairing regression, PRODUCER half: every worker-visible publish must
+/// carry the coordinator's INTENDED `(validation, forwarding)` pair.
 ///
-/// The invariant is two-sided. The consumer half — the worker acquire-loads
-/// forwarding FIRST, validation SECOND — is guarded by
-/// `snapshot_refresh_no_old_validation_with_new_forwarding_6291`
-/// (worker/loop_body/mod.rs). Without this test the producer half is protected
-/// by a comment alone: swapping the two coordinator stores reintroduces the
-/// torn `(old-validation, new-forwarding)` window in full while every other
-/// test stays green, because for a producer/consumer pair the acquire/release
-/// message-passing only works when the two sides run in OPPOSITE orders.
+/// The consumer half — a worker takes both halves from ONE `ArcSwap` load — is
+/// guarded by `snapshot_refresh_runtime_view_pair_is_atomic_6592`
+/// (worker/loop_body/mod.rs). That test proves no reader can tear the pair;
+/// this one proves the pair was coherent when it was published. Both are
+/// needed: an atomic reader faithfully delivers whatever the producer put in
+/// the view, so a site that published a stale validation alongside a new
+/// forwarding would produce exactly the #6291 defect with a perfectly atomic
+/// worker.
 ///
-/// The coordinator records `validation_at_forwarding_publish` (a `cfg(test)`
-/// seam, the twin of the #5166 `cos_owner_at_forwarding_publish`) at the exact
-/// instant just before the forwarding store, reading the WORKER-VISIBLE
-/// `shared_validation` rather than `self.validation` (which is already the new
-/// value under either order). With the fix the seam already carries the new
-/// generation; swapping the two stores captures the stale one and this test
-/// goes RED.
-///
-/// Scope: together the two tests exclude the `(old-validation,
-/// new-forwarding)` orientation only. The mirror pair — new validation with a
-/// worker's old forwarding — survives and is NOT drop-only; see the "mirror
-/// window" section in `snapshot_refresh.rs` and #6592.
+/// The coordinator records `runtime_view_at_publish` (a `cfg(test)` seam
+/// inside the single publish choke point `store_runtime_view`, successor to the
+/// #6291 `validation_at_forwarding_publish`) at the exact instant just before
+/// the view store: the intended pair, plus the still-visible previous view.
+/// The previous view makes the seam prove its own position — hoisting the store
+/// above the capture would let the equality assert pass vacuously, and goes RED
+/// here instead. It retains an `Arc` rather than a raw pointer so the old
+/// allocation stays alive and `ptr_eq` cannot be fooled by address reuse.
 #[test]
-fn refresh_runtime_snapshot_publishes_validation_before_forwarding() {
+fn refresh_runtime_snapshot_publishes_a_coherent_view_pair() {
     const NEW_GEN: u64 = 7;
     const NEW_FIB_GEN: u32 = 3;
 
@@ -706,10 +701,10 @@ fn refresh_runtime_snapshot_publishes_validation_before_forwarding() {
     // Sanity: a fresh coordinator has published nothing yet, and the
     // worker-visible validation is still the default (old) generation.
     assert!(
-        coordinator.validation_at_forwarding_publish.is_none(),
+        coordinator.runtime_view_at_publish.is_none(),
         "no snapshot applied yet",
     );
-    let before = **coordinator.shared_validation.load();
+    let before = coordinator.published_validation();
     assert_eq!(
         before,
         ValidationState::default(),
@@ -726,49 +721,132 @@ fn refresh_runtime_snapshot_publishes_validation_before_forwarding() {
         .refresh_runtime_snapshot(&snapshot)
         .expect("refresh_runtime_snapshot must succeed");
 
-    let (captured, forwarding_at_capture) = coordinator
-        .validation_at_forwarding_publish
+    let (intended, previous_view) = coordinator
+        .runtime_view_at_publish
         .clone()
-        .expect("refresh must record the validation at the forwarding-publish point");
+        .expect("refresh must record the view it published");
+    let published = coordinator.ha.runtime.load_full();
 
-    // THE INVARIANT: at the instant forwarding became worker-visible, the
-    // worker-visible validation already carried the NEW generation. Otherwise
-    // a worker that observes the new forwarding Arc can still read the old
-    // validation, and a packet stamped at the old generation passes
-    // `classify_metadata` and is then forwarded under the new state.
+    // THE INVARIANT, part 1: the pair the coordinator intended IS the pair a
+    // worker observes — same validation, same forwarding allocation. A publish
+    // site that built its view from a stale `validation`, or that stored
+    // forwarding through some path other than the choke point, breaks this.
     assert_eq!(
-        captured,
+        published.validation,
         ValidationState {
             snapshot_installed: true,
             config_generation: NEW_GEN,
             fib_generation: NEW_FIB_GEN,
         },
-        "validation must be published BEFORE forwarding becomes worker-visible \
-         (#6291 ordering)",
+        "the published view must carry this refresh's generation",
+    );
+    assert_eq!(
+        intended.validation, published.validation,
+        "the published validation must be the one the choke point intended \
+         (#6592 coherent publish)",
+    );
+    assert!(
+        Arc::ptr_eq(&intended.forwarding, &published.forwarding),
+        "the published forwarding must be the exact allocation the choke point \
+         paired with that validation — a second store would decouple them",
     );
 
-    // The capture is positioned BEFORE the `ha.forwarding` store — without
-    // this the assert above could be satisfied vacuously by hoisting the
-    // forwarding store above the seam. The captured Arc is retained by the
-    // seam, so its allocation cannot be recycled into the new one and
-    // `ptr_eq` cannot be fooled.
+    // THE INVARIANT, part 2 (position proof): the capture is taken BEFORE the
+    // view store. Without this, hoisting the store above the seam would satisfy
+    // the equality asserts vacuously by capturing an already-published view.
     assert!(
-        !Arc::ptr_eq(&forwarding_at_capture, &coordinator.ha.forwarding.load_full()),
-        "the validation capture must be taken BEFORE the ha.forwarding store, \
-         or the ordering assert above proves nothing",
+        !Arc::ptr_eq(&previous_view, &published),
+        "the view capture must be taken BEFORE the ha.runtime store, or the \
+         asserts above prove nothing",
     );
 
     // Not vacuous: the fixture really did rotate the generation, so the
-    // captured value could have differed from the pre-refresh default.
-    assert_eq!(
-        **coordinator.shared_validation.load(),
-        captured,
-        "post-refresh the worker-visible validation is the captured one",
-    );
+    // published value could have differed from the pre-refresh default.
     assert_ne!(
-        captured, before,
-        "the fixture must actually rotate the generation, or the assert above \
-         is vacuous",
+        published.validation, before,
+        "the fixture must actually rotate the generation, or the asserts above \
+         are vacuous",
+    );
+    assert_eq!(
+        previous_view.validation, before,
+        "the retained previous view is the pre-refresh one",
+    );
+}
+
+/// #6592 / #1188: a validation-only publish (`bump_fib_generation`) must
+/// advance the worker-visible stamps WITHOUT rotating the forwarding `Arc`.
+///
+/// This is the measured constraint that decided the design. The structurally
+/// simplest atomic pairing — inlining `ValidationState` into `ForwardingState`
+/// — would make this path clone the whole forwarding state (69 fields, ~20
+/// heap-owning collections including the FIB) and rotate the worker-visible
+/// `Arc`, dragging every worker through its expensive rotation branch
+/// (screen-profile and opening-override clones, cold-path slot rescan,
+/// input-filter session purges, CoS runtime reset) for a change that touched no
+/// table. Go fires `Manager.BumpFIBGeneration` repeatedly during route
+/// convergence precisely to avoid a full rebuild, so that is a real regression
+/// and #1188 exists to prevent it.
+///
+/// Nesting the forwarding half as an `Arc` inside `RuntimeView` keeps the pair
+/// atomic AND keeps this path allocation-light: one small view, same inner
+/// `Arc`. If the pairing is ever reworked so a FIB bump rotates forwarding,
+/// this goes RED.
+#[test]
+fn bump_fib_generation_publishes_new_stamps_without_rotating_forwarding() {
+    let mut coordinator = Coordinator::new();
+
+    let snapshot = ConfigSnapshot {
+        generation: 4,
+        fib_generation: 9,
+        ..Default::default()
+    };
+    coordinator
+        .refresh_runtime_snapshot(&snapshot)
+        .expect("refresh_runtime_snapshot must succeed");
+
+    let before = coordinator.ha.runtime.load_full();
+    assert_eq!(before.validation.fib_generation, 9);
+
+    assert!(
+        coordinator.bump_fib_generation(10),
+        "a monotone bump must be accepted"
+    );
+
+    let after = coordinator.ha.runtime.load_full();
+
+    // The stamps advanced and are worker-visible...
+    assert_eq!(
+        after.validation.fib_generation, 10,
+        "the bump must be published to workers"
+    );
+    assert_eq!(
+        after.validation.config_generation, 4,
+        "a FIB bump must not disturb the config generation"
+    );
+    // ...paired with the SAME forwarding allocation, so the worker's #1188
+    // `Arc::ptr_eq` short-circuit still short-circuits and the rotation branch
+    // is not taken.
+    assert!(
+        Arc::ptr_eq(&before.forwarding, &after.forwarding),
+        "#1188: a validation-only publish must REUSE the published forwarding \
+         Arc — rotating it forces every worker through the expensive \
+         forwarding-rotation branch for a change that touched no table",
+    );
+    // The view Arc itself DID rotate, or the bump would not be visible at all.
+    assert!(
+        !Arc::ptr_eq(&before, &after),
+        "the view must rotate, or the new stamps never reach a worker",
+    );
+
+    // A rejected (rollback) bump publishes nothing at all.
+    let before_reject = coordinator.ha.runtime.load_full();
+    assert!(
+        !coordinator.bump_fib_generation(9),
+        "a rollback bump must be refused (#3767)"
+    );
+    assert!(
+        Arc::ptr_eq(&before_reject, &coordinator.ha.runtime.load_full()),
+        "a refused bump must not publish a new view",
     );
 }
 
@@ -3614,7 +3692,7 @@ fn fail_open_snapshot(generation: u64) -> ConfigSnapshot {
 ///
 /// Fail-on-revert proof: if the fix is reverted so publish happens
 /// before the open (the pre-#2440 order), the reconcile stamps the new
-/// generation into `validation` + `shared_validation` BEFORE the session
+/// generation into `validation` + the published `RuntimeView` BEFORE the session
 /// open fails, and every assertion below that the prior generation
 /// survives will fail.
 #[test]
@@ -3629,7 +3707,7 @@ fn reconcile_mandatory_map_open_failure_keeps_prior_generation_published() {
         fib_generation: 3,
     };
     coordinator.validation = prior;
-    coordinator.shared_validation.store(Arc::new(prior));
+    coordinator.seed_published_validation(prior);
 
     let mut bindings: Vec<BindingStatus> = vec![BindingStatus {
         slot: 1,
@@ -3681,12 +3759,15 @@ fn reconcile_mandatory_map_open_failure_keeps_prior_generation_published() {
         coordinator.validation.snapshot_installed,
         "snapshot_installed must stay at its prior value"
     );
-    let shared = **coordinator.shared_validation.load();
+    let shared = coordinator.published_validation();
     assert_eq!(
         shared.config_generation, 7,
-        "shared_validation (the worker-visible view) must still hold the prior generation"
+        "the published RuntimeView (the worker-visible pair) must still hold the prior generation"
     );
-    assert_eq!(shared, prior, "shared_validation must equal the prior published state");
+    assert_eq!(
+        shared, prior,
+        "the published validation must equal the prior published state"
+    );
 
     // The registered binding records the open failure for the operator.
     assert!(
@@ -3713,7 +3794,7 @@ fn reconcile_missing_session_pin_keeps_prior_generation_published() {
         fib_generation: 5,
     };
     coordinator.validation = prior;
-    coordinator.shared_validation.store(Arc::new(prior));
+    coordinator.seed_published_validation(prior);
 
     let mut bindings: Vec<BindingStatus> = vec![BindingStatus {
         slot: 1,
@@ -3739,7 +3820,7 @@ fn reconcile_missing_session_pin_keeps_prior_generation_published() {
         "missing_session_pin"
     );
     assert_eq!(coordinator.validation.config_generation, 11);
-    assert_eq!((**coordinator.shared_validation.load()).config_generation, 11);
+    assert_eq!(coordinator.published_validation().config_generation, 11);
     assert_eq!(
         bindings[0].last_error, "missing session map pin path",
         "expected per-binding last_error for the missing session pin"
@@ -3760,7 +3841,7 @@ fn reconcile_all_mandatory_maps_open_advances_published_generation() {
         fib_generation: 0,
     };
     coordinator.validation = prior;
-    coordinator.shared_validation.store(Arc::new(prior));
+    coordinator.seed_published_validation(prior);
 
     let mut bindings: Vec<BindingStatus> = Vec::new();
 
@@ -3774,7 +3855,7 @@ fn reconcile_all_mandatory_maps_open_advances_published_generation() {
         coordinator.validation.config_generation, 2,
         "a fully-openable snapshot must advance the published generation"
     );
-    assert_eq!((**coordinator.shared_validation.load()).config_generation, 2);
+    assert_eq!(coordinator.published_validation().config_generation, 2);
 }
 
 /// #3789: a snapshot that PASSES the policy preflight and opens every
@@ -3800,7 +3881,7 @@ fn reconcile_build_failure_returns_integrity_err_and_keeps_prior_generation_3789
         fib_generation: 3,
     };
     coordinator.validation = prior;
-    coordinator.shared_validation.store(Arc::new(prior));
+    coordinator.seed_published_validation(prior);
 
     let mut bindings: Vec<BindingStatus> = Vec::new();
 
@@ -3833,7 +3914,7 @@ fn reconcile_build_failure_returns_integrity_err_and_keeps_prior_generation_3789
         "the rejected build must not advance the published generation"
     );
     assert_eq!(
-        (**coordinator.shared_validation.load()).config_generation,
+        coordinator.published_validation().config_generation,
         7,
         "the rejected build must not advance the worker-visible generation"
     );
@@ -4608,7 +4689,7 @@ fn reconcile_fresh_boot_concrete_zone_policy_passes_preflight_3402() {
         fib_generation: 0,
     };
     coordinator.validation = prior;
-    coordinator.shared_validation.store(Arc::new(prior));
+    coordinator.seed_published_validation(prior);
 
     let mut bindings: Vec<BindingStatus> = Vec::new();
     // All three mandatory pins resolve so the reconcile proceeds to publish.
@@ -4671,7 +4752,7 @@ fn reconcile_policy_references_undefined_zone_still_fails_closed_3402() {
         fib_generation: 2,
     };
     coordinator.validation = prior;
-    coordinator.shared_validation.store(Arc::new(prior));
+    coordinator.seed_published_validation(prior);
 
     let mut bindings: Vec<BindingStatus> = Vec::new();
     let mut snap = fail_open_snapshot(6);
@@ -4734,7 +4815,7 @@ fn reconcile_policy_references_undefined_zone_still_fails_closed_3402() {
 /// the policy/address-book state), so before #2484 it reached the
 /// `apply_snapshot` integrity Err arm — which ran AFTER `tear_down`
 /// (`stop_inner`) had already reset `coord.validation`,
-/// `shared_validation`, `snapshot_installed`, and stopped the workers.
+/// the published `RuntimeView`, `snapshot_installed`, and stopped the workers.
 /// #2484 hoists the full forwarding build into the pre-teardown preflight
 /// (`build_reconcile_forwarding`), so the fault is now detected with the
 /// prior state still live. Map pins are sentinel-OK so the map-FD preflight
@@ -4745,7 +4826,7 @@ fn reconcile_policy_references_undefined_zone_still_fails_closed_3402() {
 /// post-teardown). With the fix reverted — integrity build back inside
 /// `apply_snapshot`, after `tear_down` — `stop_inner` resets
 /// `coord.validation` (config_generation -> 0, snapshot_installed -> false)
-/// and `shared_validation` to default, so EVERY preservation assertion
+/// and the published `RuntimeView` to default, so EVERY preservation assertion
 /// below fails. The stage assertion alone is NOT revert-sensitive (both the
 /// old post-teardown leg and the new pre-teardown leg set it); the
 /// preservation assertions are.
@@ -4758,7 +4839,7 @@ fn reconcile_snapshot_integrity_error_preserves_prior_generation_and_state() {
         fib_generation: 7,
     };
     coordinator.validation = prior;
-    coordinator.shared_validation.store(Arc::new(prior));
+    coordinator.seed_published_validation(prior);
 
     // Seed a sentinel live worker. `tear_down` -> `stop_inner` ->
     // `workers.stop_and_clear` would empty `workers.live`; if the integrity
@@ -4814,10 +4895,10 @@ fn reconcile_snapshot_integrity_error_preserves_prior_generation_and_state() {
         coordinator.validation.snapshot_installed,
         "integrity reject must keep snapshot_installed (stop_inner would clear it)"
     );
-    let shared = **coordinator.shared_validation.load();
+    let shared = coordinator.published_validation();
     assert_eq!(
         shared, prior,
-        "shared_validation (worker-visible view) must still hold the prior published state"
+        "the published RuntimeView (worker-visible pair) must still hold the prior published state"
     );
     // The rejected generation is never published anywhere.
     assert_ne!(coordinator.validation.config_generation, 21);
@@ -4882,7 +4963,7 @@ fn reconcile_present_conntrack_pin_open_failure_keeps_prior_generation() {
         fib_generation: 9,
     };
     coordinator.validation = prior;
-    coordinator.shared_validation.store(Arc::new(prior));
+    coordinator.seed_published_validation(prior);
 
     let mut bindings: Vec<BindingStatus> = vec![BindingStatus {
         slot: 1,
@@ -4923,9 +5004,9 @@ fn reconcile_present_conntrack_pin_open_failure_keeps_prior_generation() {
     );
     assert_eq!(coordinator.validation.fib_generation, 9);
     assert_eq!(
-        (**coordinator.shared_validation.load()).config_generation,
+        coordinator.published_validation().config_generation,
         30,
-        "shared_validation must still hold the prior generation"
+        "the published validation must still hold the prior generation"
     );
     assert!(
         bindings[0]
@@ -4952,7 +5033,7 @@ fn reconcile_present_dnat_pin_open_failure_keeps_prior_generation() {
         fib_generation: 12,
     };
     coordinator.validation = prior;
-    coordinator.shared_validation.store(Arc::new(prior));
+    coordinator.seed_published_validation(prior);
 
     let mut bindings: Vec<BindingStatus> = vec![BindingStatus {
         slot: 1,
@@ -4990,7 +5071,7 @@ fn reconcile_present_dnat_pin_open_failure_keeps_prior_generation() {
         "config_generation must NOT advance on a present-but-unopenable dnat map"
     );
     assert_eq!(
-        (**coordinator.shared_validation.load()).config_generation,
+        coordinator.published_validation().config_generation,
         40
     );
     assert!(
@@ -5015,7 +5096,7 @@ fn reconcile_empty_optional_pins_advance_published_generation() {
         fib_generation: 0,
     };
     coordinator.validation = prior;
-    coordinator.shared_validation.store(Arc::new(prior));
+    coordinator.seed_published_validation(prior);
 
     let mut bindings: Vec<BindingStatus> = Vec::new();
 
@@ -5033,7 +5114,7 @@ fn reconcile_empty_optional_pins_advance_published_generation() {
         "empty optional pins must NOT gate the reconcile (anti-over-gate)"
     );
     assert_eq!(
-        (**coordinator.shared_validation.load()).config_generation,
+        coordinator.published_validation().config_generation,
         51
     );
 }
@@ -5050,7 +5131,7 @@ fn reconcile_present_optional_pins_open_ok_advance_generation() {
         fib_generation: 0,
     };
     coordinator.validation = prior;
-    coordinator.shared_validation.store(Arc::new(prior));
+    coordinator.seed_published_validation(prior);
 
     let mut bindings: Vec<BindingStatus> = Vec::new();
 
@@ -5068,7 +5149,7 @@ fn reconcile_present_optional_pins_open_ok_advance_generation() {
         "present + openable optional maps must reconcile normally"
     );
     assert_eq!(
-        (**coordinator.shared_validation.load()).config_generation,
+        coordinator.published_validation().config_generation,
         61
     );
 }
@@ -5445,7 +5526,7 @@ fn both_paths_open_full_seven_pin_bundle_before_ok_6243() {
         fib_generation: 0,
     };
     coord.validation = prior;
-    coord.shared_validation.store(Arc::new(prior));
+    coord.seed_published_validation(prior);
     let mut bindings: Vec<BindingStatus> = Vec::new();
     let snap = ConfigSnapshot {
         generation: 71,
@@ -5635,7 +5716,7 @@ fn refresh_runtime_snapshot_build_failure_is_atomic_noop_3766() {
         "rejected snapshot must not bump validation.fib_generation"
     );
     assert_eq!(
-        (**coordinator.shared_validation.load()).config_generation,
+        coordinator.published_validation().config_generation,
         7,
         "worker-visible published generation must stay at the prior good value"
     );
@@ -5666,7 +5747,7 @@ fn refresh_runtime_snapshot_build_failure_is_atomic_noop_3766() {
         .expect("valid snapshot must still apply after a rejected one");
     assert_eq!(coordinator.validation.config_generation, 11);
     assert_eq!(
-        (**coordinator.shared_validation.load()).config_generation,
+        coordinator.published_validation().config_generation,
         11
     );
 }
