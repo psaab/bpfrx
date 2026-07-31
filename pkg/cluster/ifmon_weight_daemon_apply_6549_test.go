@@ -18,11 +18,29 @@ import (
 //	19a. d.cluster.UpdateConfig(cfg.Chassis.Cluster)   -> reconcileMonitorDebtsLocked
 //	19b. d.cluster.SetMonitorWeight(rgID, st.Interface, !st.Up, st.Weight)
 //
-// pkg/routing's monitorManager.Apply copies `mon.Weight` verbatim off the
-// compiled *config.InterfaceMonitor, so step 19b feeds the RAW configured
-// weight into the debt map — overwriting the value step 19a just clamped. The
-// clamp has to live at the chokepoint every debt producer funnels through
-// (Manager.SetMonitorWeight), not at each producer.
+// pkg/routing's monitorManager.Apply USED to copy `mon.Weight` verbatim off
+// the compiled *config.InterfaceMonitor, so step 19b fed the RAW configured
+// weight into the debt map — overwriting the value step 19a had just clamped.
+//
+// That is now closed at TWO independent layers, deliberately: pkg/routing
+// bounds the weight where it builds the status (it is election input, not
+// display-only, and it is also what `show chassis cluster interfaces`
+// renders), and Manager.SetMonitorWeight bounds every debt on the way in so a
+// FUTURE producer that forgets its own clamp is still safe.
+//
+// WHAT THESE TESTS BIND. Because both layers are live, the two
+// TestDaemonApplyTail_* cases below fail only when BOTH are removed — either
+// clamp alone keeps the end-to-end path safe, which is the whole point of
+// layering it. They are the END-TO-END guard, not a single-clamp guard. Each
+// individual clamp has its own dedicated binder:
+//
+//   - Manager.SetMonitorWeight        -> TestSetMonitorWeight_ClosesTheDebtDomain_6549 (this file)
+//   - pkg/routing monitorManager.Apply -> TestInterfaceMonitorStatus_WeightIsBounded_6549 (pkg/routing)
+//
+// Verified by mutation: a compile-clean removal of the SetMonitorWeight clamp
+// alone (go vet clean) leaves both TestDaemonApplyTail_* cases GREEN and fails
+// TestSetMonitorWeight_ClosesTheDebtDomain_6549; removing both together fails
+// the TestDaemonApplyTail_* cases with the fail-open assertions below.
 //
 // These tests drive the REAL producer (routing.Manager against a fake netlink
 // surface) and the REAL consumer in the daemon's exact call order, rather than
@@ -111,9 +129,12 @@ func runDaemonApplyTail(m *Manager, rm *routing.Manager, cfg *config.ClusterConf
 // transition when the link was already down before the config apply. The raw
 // debt sits in m.monitorWeights indefinitely.
 //
-// Fail-on-revert: drop the config.ClampInterfaceMonitorWeight call in
-// Manager.SetMonitorWeight and the debt becomes 255 + (-100) = 155, leaving
-// weight 100 and the node primary.
+// Fail-on-revert (END-TO-END guard — see the file preamble): drop the
+// config.ClampInterfaceMonitorWeight call in BOTH pkg/routing's
+// monitorManager.Apply and Manager.SetMonitorWeight, and the debt becomes
+// 255 + (-100) = 155, leaving weight 100 and the node primary. Either clamp
+// alone keeps this green; that is the layering working, and each clamp has its
+// own dedicated binder.
 func TestDaemonApplyTail_OutOfRangeWeightCannotCancelARealFailure_6549(t *testing.T) {
 	const ifA, ifB = "trust0", "trust1"
 
@@ -150,8 +171,10 @@ func TestDaemonApplyTail_OutOfRangeWeightCannotCancelARealFailure_6549(t *testin
 // overwrites it with the raw value — promoting a correctly-demoted group back
 // to primary.
 //
-// Fail-on-revert: drop the config.ClampInterfaceMonitorWeight call in
-// Manager.SetMonitorWeight and the group goes 0 -> 100 across the apply tail.
+// Fail-on-revert (END-TO-END guard — see the file preamble): drop the
+// config.ClampInterfaceMonitorWeight call in BOTH pkg/routing's
+// monitorManager.Apply and Manager.SetMonitorWeight, and the group goes
+// 0 -> 100 across the apply tail. Either clamp alone keeps this green.
 func TestDaemonApplyTail_CannotRegressAClampedDebt_6549(t *testing.T) {
 	const ifA, ifB = "trust0", "trust1"
 
@@ -200,18 +223,23 @@ func TestDaemonApplyTail_CannotRegressAClampedDebt_6549(t *testing.T) {
 // TestIPMonitor_OutOfRangeWeightCannotCancelARealFailure_6549 covers the OTHER
 // debt class the chokepoint now bounds.
 //
-// ip-monitoring weights have no runtime clamp of their own — Monitor.ipTargetWeight
-// returns target.Weight (or rg.IPMonitoring.GlobalWeight) verbatim — and
-// validateChassisClusterStrict carries no compiled-int gate for them, so their
-// ONLY commit-side defense is the schema's ValidateInteger(0,255), which
-// compileTreeLenient downgrades to a warning on Store.Load / Store.SyncApply.
-// A negative ip-monitoring weight is therefore reachable at runtime and is
-// negative debt exactly like a negative interface-monitor weight: it cancels a
-// sibling target's real unreachability.
+// validateChassisClusterStrict carries no compiled-int gate for ip-monitoring
+// weights, so their ONLY commit-side defense is the schema's
+// ValidateInteger(0,255), which compileTreeLenient downgrades to a warning on
+// Store.Load / Store.SyncApply. A negative ip-monitoring weight is therefore
+// reachable at runtime and is negative debt exactly like a negative
+// interface-monitor weight: it cancels a sibling target's real unreachability.
 //
-// Fail-on-revert: drop the config.ClampInterfaceMonitorWeight call in
-// Manager.SetMonitorWeight and the debt becomes 255 + (-100) = 155, leaving
-// weight 100 and the node primary with BOTH monitored targets unreachable.
+// Fail-on-revert (END-TO-END guard, same shape as the daemon cases above):
+// drop the config.ClampInterfaceMonitorWeight call in BOTH
+// Monitor.ipTargetWeight and Manager.SetMonitorWeight, and the debt becomes
+// 255 + (-100) = 155, leaving weight 100 and the node primary with BOTH
+// monitored targets unreachable. Either clamp alone keeps this green — the
+// chokepoint bounds what is installed, ipTargetWeight bounds what is computed
+// and reported. Their dedicated binders are
+// TestSetMonitorWeight_ClosesTheDebtDomain_6549 and
+// TestIPMonitor_NegativeWeightCannotMaskTheGlobalThreshold_6549 (the
+// global-threshold case the chokepoint provably cannot reach).
 func TestIPMonitor_OutOfRangeWeightCannotCancelARealFailure_6549(t *testing.T) {
 	const addrA, addrB = "10.0.0.1", "10.0.0.2"
 
@@ -497,13 +525,18 @@ func TestBuildHeartbeat_WireWeightSaturatesAtTheCallSites_6549(t *testing.T) {
 // inside the [0,255] heartbeat weight domain, and the local weight never
 // diverges from the advertised one.
 //
-// The daemon apply tail is one caller; ip-monitoring target debt
-// (Monitor.ipTargetWeight, which has no clamp of its own) is another. Binding
-// the chokepoint rather than each caller is what makes a future producer safe
-// by construction.
+// This is the DEDICATED binder for the chokepoint clamp, and the only test in
+// the #6549 set that fails when that clamp alone is removed. Every current
+// producer (the daemon apply tail via pkg/routing, the interface-monitor poll,
+// ip-monitoring via ipTargetWeight) bounds its own value first, so the
+// end-to-end tests above stay green on a chokepoint-only revert — by design.
+// Binding the chokepoint directly here is what keeps it from being silently
+// dropped, and what makes a FUTURE producer that forgets its own clamp safe by
+// construction.
 //
 // Fail-on-revert: drop the config.ClampInterfaceMonitorWeight call in
-// Manager.SetMonitorWeight and every out-of-range row escapes the domain.
+// Manager.SetMonitorWeight and every out-of-range row escapes the domain
+// (verified: compile-clean removal, go vet clean, this test the sole red).
 func TestSetMonitorWeight_ClosesTheDebtDomain_6549(t *testing.T) {
 	tests := []struct {
 		name     string

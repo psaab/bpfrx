@@ -48,8 +48,11 @@ func (mm *monitorManager) Apply(groups []*config.RedundancyGroup) {
 			// use. The strict commit path rejects an out-of-range weight; the
 			// tolerant load / peer-sync path only warns (#1960 no-brick), so
 			// one can still reach here. Deliberately not logged: the cluster
-			// manager emits the config-apply-frequency warning
-			// (reconcileMonitorDebtsLocked / SetMonitorWeight).
+			// manager's reconcileMonitorDebtsLocked already reports this
+			// weight once per config apply, against the config that carried
+			// it. (Because this clamp runs first, the SetMonitorWeight
+			// chokepoint sees an already-bounded value and stays silent — its
+			// warning fires only for a producer that skipped its own clamp.)
 			weight, _ := config.ClampInterfaceMonitorWeight(mon.Weight)
 
 			// Translate Junos name (ge-0/0/0) to Linux name (ge-0-0-0).

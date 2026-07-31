@@ -61866,3 +61866,45 @@ would never produce.
     cluster_monitor_weight_6549_test.go}, pkg/cli/{cli_helpers.go,
     cluster_monitor_weight_6549_test.go}, pkg/config/schema_chassis.go,
     docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-07-31
+- **Action**: #6549 Codex re-review fold (MERGE-NEEDS-MINOR) — correct comments
+  and fail-on-revert labels that the previous fold made stale. COMMENT-ONLY; no
+  production line changed (verified by filtering the diff to non-comment lines).
+  Codex found three tests labelled as `Manager.SetMonitorWeight` chokepoint
+  guards that its own upstream clamps now MASK. Reproduced firsthand with a
+  compile-clean chokepoint removal (`go vet` clean, so a real mutation and not
+  a build break): only `TestSetMonitorWeight_ClosesTheDebtDomain_6549` goes red;
+  both `TestDaemonApplyTail_*` and
+  `TestIPMonitor_OutOfRangeWeightCannotCancelARealFailure_6549` stay green.
+  Established what they DO bind by pairwise mutation: the two daemon cases fail
+  only when the `pkg/routing` clamp AND the chokepoint are both removed; the
+  independent-IP case only when `ipTargetWeight` AND the chokepoint are both
+  removed. They are END-TO-END guards over a deliberately layered defense, and
+  each individual clamp already has a dedicated binder
+  (`TestSetMonitorWeight_ClosesTheDebtDomain_6549`,
+  `TestInterfaceMonitorStatus_WeightIsBounded_6549`,
+  `TestIPMonitor_NegativeWeightCannotMaskTheGlobalThreshold_6549`), so this was
+  a labelling defect, not a coverage hole — relabelled rather than padded with
+  redundant tests.
+  Also corrected three comments left describing the PRE-fold flow: election.go
+  no longer claims `ipTargetWeight` is unbounded or that the chokepoint is the
+  ip-monitoring class's only runtime defense; the test preamble no longer says
+  `pkg/routing` copies weights verbatim; and the warn-site comment no longer
+  claims to be the ONLY out-of-range signal for ip debts — it now says plainly
+  that reaching that branch means a producer skipped its own clamp, and points
+  a reader chasing a MISSING warning at reconcileMonitorDebtsLocked and
+  ipTargetWeight instead. That last one was the one that could send someone
+  debugging to the wrong file.
+  Recorded the CLAMP DIRECTION adjudication at the clamp itself (negative -> 0,
+  not 255) with the peer-push reasoning, so it is not re-litigated: clamp-255
+  turns a typo'd weight arriving over HA config-sync into an instant
+  redundancy-group resignation on the RECEIVING node — a remote HA
+  denial-of-service — whereas 0 is an already-legal operator-reachable state (a
+  weight-less interface-monitor compiles to exactly 0) and is loud via WARN.
+  Codex accepted this on re-review ("no counterargument defeating the peer-push
+  denial-of-service reasoning").
+  Full pkg/cluster, pkg/config, pkg/routing, pkg/grpcapi, pkg/cli suites green.
+  Cluster smoke was already banked by the parent (14/14, unclean sysrq reboot,
+  22.7 Gbps) and needs no re-run for a comment-only change.
+- **File(s)**: pkg/cluster/{election.go,ifmon_weight_daemon_apply_6549_test.go},
+    pkg/routing/monitor.go, _Log.md

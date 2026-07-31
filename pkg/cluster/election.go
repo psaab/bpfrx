@@ -452,26 +452,32 @@ func (m *Manager) electSingleNode() {
 // #6549: this is the CHOKEPOINT that bounds election debt. Together with
 // reconcileMonitorDebtsLocked it owns both of the only two writes into
 // m.monitorWeights, so clamping here closes the debt domain against EVERY
-// producer rather than each producer separately:
+// producer — including one added later that forgets to bound its own value.
+//
+// Each producer ALSO bounds the weight where it computes it, because each
+// reports that weight somewhere the chokepoint cannot reach (a heartbeat
+// monitor entry, a rendered status, an event ledger) and a producer-side
+// clamp is the only way the reported value matches the applied one. So this
+// is a genuine second belt, not the sole defense:
 //
 //   - pkg/cluster/monitor.go pollInterfaceMonitors — interface-monitor link
-//     transitions (clamps its own copy too, because the value it clamps also
-//     feeds the heartbeat monitor section).
-//   - pkg/cluster/monitor.go reconcileRGIPDebts — ip-monitoring target and
-//     aggregate debts. Monitor.ipTargetWeight returns the configured
-//     per-target weight (or the RG global-weight) with no bound of its own,
-//     and validateChassisClusterStrict has no compiled-int gate for
-//     ip-monitoring weights, so this is that class's only runtime defense.
-//   - pkg/daemon/daemon_apply_tail.go — the config-apply tail, on EVERY
-//     commit / boot Load / peer SyncApply. It feeds pkg/routing's
-//     InterfaceMonitorStatus.Weight, copied verbatim off the compiled
-//     *config.InterfaceMonitor. Before this clamp that raw value landed here
-//     six lines after UpdateConfig had already clamped the same debt, so the
-//     apply tail OVERWROTE the clamp and could restore a correctly-demoted
-//     group to primary with every monitored link down. The poll path cannot
-//     repair it: pollInterfaceMonitors re-fires SetMonitorWeight only on a
-//     dampened state TRANSITION, and a link that was already down before the
-//     apply produces none, so the raw debt persists indefinitely.
+//     transitions. Clamps its own copy, which also feeds the heartbeat
+//     monitor section.
+//   - pkg/cluster/monitor.go ipTargetWeight / desiredRGIPDebts —
+//     ip-monitoring target and aggregate debts. Those bound the value before
+//     it reaches the cumulative global-threshold sum, which this chokepoint
+//     could not protect: a masked threshold installs NO debt, so
+//     SetMonitorWeight is never called at all.
+//   - pkg/routing/monitor.go monitorManager.Apply — the statuses
+//     pkg/daemon/daemon_apply_tail.go feeds back in on EVERY commit / boot
+//     Load / peer SyncApply. Before either clamp existed, that raw value
+//     landed here six lines after UpdateConfig had already clamped the same
+//     debt, so the apply tail OVERWROTE the clamp and could restore a
+//     correctly-demoted group to primary with every monitored link down. The
+//     poll path cannot repair it: pollInterfaceMonitors re-fires
+//     SetMonitorWeight only on a dampened state TRANSITION, and a link that
+//     was already down before the apply produces none, so the raw debt
+//     persists indefinitely.
 func (m *Manager) SetMonitorWeight(rgID int, iface string, down bool, weight int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -487,6 +493,30 @@ func (m *Manager) SetMonitorWeight(rgID int, iface string, down bool, weight int
 	// local weight from the advertised one (dual primary). Both reach runtime
 	// because the tolerant load / peer-sync compile path downgrades the commit
 	// gate to a warning (#1960 no-brick).
+	//
+	// CLAMP DIRECTION — negative maps to 0, deliberately. This was contested in
+	// review (clamping to 255 was argued as the fail-CLOSED choice, since an
+	// inert monitor can leave a node primary behind a dead link) and settled on
+	// 0. Recorded here so it is not re-litigated:
+	//
+	//   - 0 is an already-legal, operator-reachable state. An interface-monitor
+	//     with no `weight` token compiles to exactly 0 and means "monitor this,
+	//     contribute no debt". Clamping onto 0 maps invalid input onto an
+	//     existing semantic; clamping onto 255 maps it onto a DIFFERENT existing
+	//     semantic ("maximally fatal") that the operator never asked for.
+	//   - The decisive asymmetry is the peer-push path. The reason this class is
+	//     hardened at runtime at all is that configs arrive over HA config-sync.
+	//     Under clamp-255, a typo'd `-100` pushed from the peer makes the
+	//     RECEIVING node instantly resign its redundancy group the moment that
+	//     link flaps — turning the config-sync channel into a remote HA
+	//     denial-of-service. Inert-plus-WARN beats auto-resignation there.
+	//   - The local authoring path can never produce this at all
+	//     (validateChassisClusterStrict hard-rejects it at commit), so the only
+	//     ways here are a pre-fix persisted config or a peer push — exactly the
+	//     cases where the above holds.
+	//
+	// Over-255 saturates to 255: that preserves operator intent, and 255 is
+	// already the maximum meaningful debt since the group starts there.
 	requested := weight
 	weight, clamped := config.ClampInterfaceMonitorWeight(weight)
 
@@ -495,10 +525,16 @@ func (m *Manager) SetMonitorWeight(rgID int, iface string, down bool, weight int
 	if down {
 		if clamped {
 			// Debt-install frequency (a dampened transition, an ip-debt diff,
-			// or a config apply), not per-poll-tick — safe at Warn. This is
-			// the ONLY out-of-range signal the ip-monitoring debts get;
-			// reconcileMonitorDebtsLocked separately reports the configured
-			// interface-monitor weight against the config that carried it.
+			// or a config apply), not per-poll-tick — safe at Warn.
+			//
+			// In practice every current producer bounds the weight before it
+			// gets here, so reaching this branch means a producer skipped its
+			// own clamp — which is exactly what makes it worth logging. Do NOT
+			// read a missing warning here as "no out-of-range weight was
+			// configured": the interface-monitor class is reported by
+			// reconcileMonitorDebtsLocked against the config that carried it,
+			// and the ip-monitoring class is bounded upstream in ipTargetWeight
+			// / desiredRGIPDebts. Those are the places to look first.
 			slog.Warn("cluster: monitor debt weight out of range, clamped",
 				"rg", rgID, "interface", iface,
 				"requested", requested, "effective", weight,
