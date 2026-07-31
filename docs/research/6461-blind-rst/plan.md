@@ -1,6 +1,6 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.31.0 — THE TERMINAL CUT, round-115 folds (the
+**Status: DRAFT v10.31.1 — THE TERMINAL CUT, round-115 folds (+ round-115 AGY folds: the reverse entry gains `fwd_companion_epoch: u64` — the hop's epoch compare has no other source, install.rs:152 — taking SessionEntry to 48 B with the cost statements updated; the closing-SYN-ACK-at-2b corner is stated explicitly) (the
 site-2b reverse synth gains the strong OPENING proof for SYN-ACK-driven
 synths — the installer was treating every non-initial-SYN TCP packet as
 established with no proof, so an unproven spoofed reverse SYN-ACK could
@@ -345,7 +345,8 @@ What the fix buys, at absolute scale:
   (round-2 Codex): a both-direction path-switch can stall an anchor
   permanently (§5.2); many flows stalling after one path event linger to
   their established timeouts — bounded, self-healing as flows churn.
-- Cost (stated whole, v10): **40 B** of anchor/proof state on
+- Cost (stated whole, v10): **48 B** of anchor/proof state on (v10.31.1:
+  40 B anchor/proof + 8 B `fwd_companion_epoch`, round-115 AGY 2)
   `SessionEntry` (no wire leases, no incarnation ids, no scheduling
   state — those were machinery and are gone) on the uniform slab
   (UDP/ICMP entries carry it unused; ≈ 5.2 MiB per worker at the
@@ -542,7 +543,7 @@ the machinery's customers are re-scoped (§10.6), and the gate ships alone.
 
 ### 5.1 The anchor: one two-direction track on the canonical forward entry
 
-`SessionEntry` gains (40 B; plain POD, worker-owned, no serde, no HA
+`SessionEntry` gains (48 B; plain POD, worker-owned, no serde, no HA
 wire):
 
 ```rust
@@ -574,7 +575,7 @@ pub(crate) struct TcpSeqAnchor {
                            // the live-sliding seq_hi — see §5.4 rule 2)
 }
 ```
-(40 B for the tracking/proof state — round-4 Codex 4a + round-5 Codex
+(48 B for the tracking/proof state, v10.31.1 — round-4 Codex 4a + round-5 Codex
 2/9: both OPENING interval endpoints are explicit immutable state; a
 compile-time layout assertion pins the size; `seq+SEG.LEN` arithmetic is
 `wrapping_add` everywhere.)
@@ -1298,7 +1299,18 @@ first (the cross-direction legs cover a reverse-direction
 close — `ack_hi(fwd)` pins the reverse stream's position). A LOCAL forward
 entry carries its anchor; a SHARED `ForwardSessionMatch` carries only
 key/decision/metadata (`entry.rs:209`, `shared_ops.rs:638-665`) → no
-baseline → refuse:
+baseline → refuse. (The closing-SYN-ACK corner stated, v10.31.1,
+round-115 AGY 1: a closing-flagged SYN-ACK at site 2b first runs the
+round-115 strong OPENING proof, then the §5.4 close validation; a
+proven closing SYN-ACK on an OPENING forward entry marks the forward
+family closing/reset per the accept rule — the entry's `established`
+flag is NEVER set by a closing packet (rule 5), so the marked entry
+is the never-established forward, which is the sole producer and
+reaps at 2 s/30 s with the Close delta; the companion retention can
+defer the reverse's reap only while the forward is live and only up
+to the Hold ceiling — stated, bounded; an UNPROVEN closing SYN-ACK
+skips the install entirely per the round-115 fold, so no zombie class
+arises from blind sprays.) The accept/refuse split:
 
 - **Accept** → install with `closing`/`reset` seeded as today, AND the
   mark is applied to the FORWARD family in the same resolve — two
@@ -1670,6 +1682,7 @@ adopting the shared decision/metadata, §5.6).
 ### 5.8 Signature/signature-shape changes (all crate-internal)
 
 - `SessionEntry` gains the 40 B `TcpSeqAnchor` (§5.1) + `probation: bool`
+  + the 8 B `fwd_companion_epoch` (v10.31.1, round-115 AGY 2)
   (§5.6) — POD, `Copy`, no serde, never on the HA wire (the sync
   install/upsert paths zero/default both fields exactly as they do
   `established`-class local state today).
@@ -1940,12 +1953,19 @@ adopting the shared decision/metadata, §5.6).
     returning (`lookup.rs:105-218`), and the existing
     `touch_if_stale` (`flow_cache_hit.rs:295-301`,
     `session/mod.rs:1118-1133`) is covered by the same guard. The
-    token binds the FAMILY (v10.31.0, round-115 Codex 5): the
+    token binds the FAMILY (v10.31.0, round-115 Codex 5; the epoch
+    source made precise v10.31.1, round-115 AGY 2): the
     reverse→forward `account_packet`-style hop derives a forward key
     and mutates whichever entry currently occupies it
     (`session/mod.rs:1177-1205`), so the hop RE-VERIFIES the forward
     entry's identity (key AND NAT AND epoch) before writing the
-    anchor sample — in the stale-R1/replacement-K2 state, R1's sample
+    anchor sample — the reverse entry gains
+    `fwd_companion_epoch: u64` (recorded at the entry's own install
+    and refreshed at each committed packet's hop; the reverse entry
+    does NOT otherwise store the forward entry's epoch,
+    `install.rs:152`, and a same-key+NAT replacement K2 would pass a
+    key+NAT-only check, so the epoch compare is what stops R1's
+    sample landing on K2) — in the stale-R1/replacement-K2 state, R1's sample
     can never land on K2. A token MISMATCH at the cache-hit path
     EVICTS the descriptor and falls through to a fresh resolution
     (round-115 Codex 6 — suppression alone would leave a stale active
@@ -2305,7 +2325,8 @@ untouched.
   final-admission apply point from the pre-admission #2501 accounting
   call, §5.2) is one
   8-byte read + ≤2 gated stores; closing segments add one table probe on a
-  path that already takes the full slow path. `SessionEntry` grows 40 B
+  path that already takes the full slow path. `SessionEntry` grows 48 B
+  (v10.31.1)
   (+1 B probation) — slab is uniform, UDP/ICMP entries carry it unused.
 - **Borrow shape:** close-path validation and marking happen post-borrow in
   the existing propagation phase; no new cross-`&mut` aliasing; the
@@ -3147,7 +3168,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.31.0)
+## 11. Open questions for the convergence round (v10.31.1)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
