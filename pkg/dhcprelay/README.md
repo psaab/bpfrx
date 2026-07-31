@@ -177,14 +177,30 @@ cannot check the MAC, a presence test admits exactly the attacker it is meant to
 stop. Most deployed clients do not implement RFC 3118 at all, so nothing
 downstream would catch it either.
 
-Refusing is a **handled condition, not an outage**. RFC 3203 §2.2 specifies the
-server's behavior when the message does not arrive: "If the FORCERENEW message
-is lost, the DHCP server will not receive a DHCP REQUEST from the client and it
-should retransmit the FORCERENEW message using an exponential backoff
-algorithm." Ordinary leasing is untouched — clients still renew at T1/T2. Only
-the server's ability to force an *early* renew through this relay is withdrawn,
-and it is withdrawn **loudly**: every refusal bumps `RepliesDroppedForceRenew`
-and the first one per session logs at `Warn`.
+**Refusing costs a conformant deployment nothing**, because a conformant
+FORCERENEW never reaches this socket. RFC 3203 §2.2 opens:
+
+> The DHCP server sends a unicast FORCERENEW message to the client.
+
+A unicast addressed to the client's own leased address routes as ordinary
+traffic and is never delivered to the relay's `giaddr:67` server socket at all.
+The only FORCERENEW that can arrive *here* is one deliberately addressed to
+`giaddr:67` — a non-conformant server, or the attacker §6 is about. Ordinary
+leasing is untouched either way: clients still renew at T1/T2. The refusal is
+**loud** — every one bumps `RepliesDroppedForceRenew` and the first per session
+logs at `Warn`.
+
+> Do **not** justify this by §2.2's retransmission sentence ("it should
+> retransmit the FORCERENEW message using an exponential backoff algorithm").
+> That describes recovery from *transient* loss. Here the loss is **permanent** —
+> every retransmission hits the same refusal — and §2.2 itself bounds the
+> attempts: "The amount of retransmissions should be limited." The backoff never
+> converges, so it cannot carry the argument. The unicast sentence above can.
+
+The refusal is also **belt-and-braces**: FORCERENEW is server-initiated, so its
+xid matches no outstanding request and the binding gate below would drop it
+regardless. The dedicated arm exists to give the refusal its own counter and
+log, so an operator can tell it apart from an ordinary unbound reply.
 
 There is deliberately **no opt-in knob** to re-enable forwarding. If a
 deployment genuinely needs relayed FORCERENEW, that is a follow-up that should
@@ -233,9 +249,11 @@ RFC 768).
   replies dropped because they answered no outstanding relayed request —
   either an injection that passed the source check, **or a legitimate reply
   that missed the binding window**, which is a client-visible DHCP failure, so
-  this one must be *watched*, not assumed hostile. **`PendingEvicted` (#6562)**
-  is the early warning that pairs with it: the outstanding-request table is at
-  capacity, so legitimate bindings are being lost.
+  this one must be *watched*, not assumed hostile. **`PendingSize` /
+  `PendingCapacity` (#6562)** are the outstanding-request table's occupancy and
+  ceiling — the **leading** indicator: occupancy approaching capacity means
+  bindings are about to be evicted. **`PendingEvicted` (#6562)** is coincident,
+  not leading: it rises only once bindings are already being lost.
   **`RepliesDroppedForceRenew` (#6562)** counts refused DHCPFORCERENEW
   messages. See "Outstanding-request binding" below.
   **`RequestsDroppedRateLimit` (#5670)** counts
@@ -306,16 +324,55 @@ it and only RFC 6842 §3 (2013) reversed that to a MUST, so keying on it would
 drop every reply from a pre-RFC-6842 server — a silent, segment-wide outage. The
 ingress interface is not keyed either: each relay interface owns its own table.
 
-**Bounded — 8192 entries, evict-oldest.** The cap is a *backstop*, not the
-primary bound: the #5670 ingress rate limiter already caps the fill rate
-(default 100 pps), so steady-state occupancy is ~`rate × TTL` = ~3000 entries and
-a default-configured relay never evicts. At the cap the table reaps expired
-entries first, then evicts the **oldest** — it does **not** refuse the new
-request. Refusing new requests would let an attacker who fills the table lock
-out every new client (a total segment outage); evicting the oldest degrades
-gracefully, and the choice trades away no security, because eviction can only
-cause a legitimate reply to be *dropped*, never an unsolicited reply to be
-*accepted*. Every eviction bumps `PendingEvicted`.
+**Bounded — capacity is derived from `maximum-packet-rate`, evict-oldest.**
+Steady-state occupancy is `rate × TTL`, and the fill rate is the configurable
+#5670 limit — so capacity **must** track it. `pendingCapacityFor` sizes the
+table at `rate × pendingTTL + relayBurstFor(rate)` (the sustained window plus
+the token bucket's 2-second burst allowance), clamped to
+`[4096, 131072]`. `maxPacketRate` participates in `relaySpec.equal()`, so a
+day-2 rate change restarts the session and re-derives it.
+
+> A **fixed** capacity is a trap, and this originally shipped as a hardcoded
+> 8192. Above ~273 pps the table became cap-bound and the binding window
+> silently collapsed from 30 s to `8192/rate` seconds — while the
+> "Ingress rate limit" section below *recommends raising*
+> `maximum-packet-rate` on a busy segment. A segment provisioned at 3000 pps
+> had a 2.7 s window; a boot storm against a server whose RTT exceeded that had
+> every reply dropped at the relay, turning a storm that previously completed
+> into a permanent retry storm. `TestPendingCapacity_TracksMaxPacketRate` pins
+> the property (a reply arriving one server RTT later still binds), not the
+> number.
+
+The **ceiling** is mandatory in the other direction: the schema allows up to
+1000000 pps, and an unclamped derivation would be ~3×10⁷ entries — gigabytes,
+i.e. the memory-exhaustion vector this table exists not to be. Above ~4096 pps
+the ceiling binds and the effective window is `capacity/rate` seconds; that is
+unavoidable (window × rate *is* memory) but it is made explicit rather than
+emergent — `Apply` logs a startup `Warn` naming the reduced window, and
+`PendingSize`/`PendingCapacity` show the runtime truth.
+
+At capacity the table reaps expired slots first, then evicts the **oldest** — it
+does **not** refuse the new request. Refusing new requests would let an attacker
+who fills the table lock out every new client (a total segment outage); evicting
+the oldest degrades gracefully, and the choice trades away no security, because
+eviction can only cause a legitimate reply to be *dropped*, never an unsolicited
+reply to be *accepted*. Every eviction bumps `PendingEvicted`.
+
+**O(1) at capacity.** Expiry and eviction go through a fixed-size ring of
+insertions, not a scan. This works because every entry carries the *same* TTL,
+so insertion order **is** expiry order and the oldest is always at the ring
+head. The original implementation ranged the whole map for the minimum expiry —
+two full `O(capacity)` scans per admitted packet once full, on the single
+client-facing read goroutine, which saturates a core in exactly the overload
+the table is meant to survive. A key re-inserted before its old slot expires
+(a retransmission, or the SELECTING REQUEST reusing the DISCOVER's xid) simply
+gets a new slot; the older one is stale (the map holds a later expiry) and is
+discarded for free at the head. Because a slot is always freed before a push,
+`len(entries) ≤ count ≤ capacity` — the ring bounds the map, so duplicate
+inserts cannot grow either structure.
+`TestPendingTable_AtCapInsertIsConstantTime` pins this by counting ring slots
+examined (deterministic, no timing), with a **lower** bound as well as an upper
+one so an implementation that bypasses the ring cannot pass by reporting zero.
 
 **TTL — 30s.** This bounds the window in which a guessed xid would be accepted,
 while covering realistic server latency. RFC 2131 §4.1's retransmission schedule
@@ -334,8 +391,23 @@ Consuming on first match would silently break multi-server redundancy.
 
 **Fail direction.** A binding that is too strict silently breaks DHCP for real
 clients, which is a worse outage than the injection it prevents. Every drop is
-therefore counted (`RepliesDroppedNoRequest`) and logged warn-once-then-`Debug`,
-and `PendingEvicted` warns before drops start. A nil table fails **closed** (it
+therefore counted (`RepliesDroppedNoRequest`) and logged warn-once-then-`Debug`.
+
+The **leading** indicator is `PendingSize`/`PendingCapacity`: occupancy climbing
+toward capacity means the relay is about to start evicting bindings, and it is
+visible *before* any reply is lost. `PendingEvicted` is **coincident**, not
+leading — an eviction is what *causes* the subsequent drop, so its lead time is
+one server RTT (tens of ms to a couple of seconds). Alert on the
+size/capacity ratio; treat a rising `PendingEvicted` as damage already in
+progress.
+
+These counters are currently surfaced only by the **on-box console CLI**
+(`show services dhcp relay`) — there is no gRPC RPC or Prometheus collector for
+`RelayStats`, so the remote `cli` and external alerting do not see them. That
+gap is pre-existing and tracked separately; it does bound "visible" to the
+console today.
+
+A nil table fails **closed** (it
 admits nothing), matching the #4163 empty-allow-set posture, so a wiring
 regression is a loud counted outage rather than a silent loss of the control;
 `TestManagerRelay_HasPendingTable` guards the production wiring.
@@ -413,11 +485,20 @@ set forwarding-options dhcp-relay group <g> overrides maximum-packet-rate <pps>
   the sustained rate throttles a persistent flood. Set a high value
   (schema range `1..1000000`) to effectively disable the bound on a segment that
   legitimately needs it.
+  - **Raising this also resizes the #6562 outstanding-request table**, whose
+    capacity is derived as `rate × 30s + 2×rate` — that is deliberate, so the
+    reply-binding window does not collapse on a segment you just told the relay
+    to expect more traffic from. Above **~4096 pps** the table's memory ceiling
+    (131072 entries) binds instead, the effective binding window becomes
+    `capacity/rate` seconds rather than 30 s, and the relay logs a startup
+    `Warn` naming the reduced window. Watch `PendingSize`/`PendingCapacity` on
+    such a segment. See "Outstanding-request binding" above.
 - **Counted + throttled log.** Every dropped datagram bumps
   `RelayStats.RequestsDroppedRateLimit`; the log is warn-once-per-session then
   `Debug` (never per packet, per the project logging rules). A sustained
   nonzero counter means the segment is exceeding its pps bound — a flood /
-  amplification attempt or a segment that should raise `maximum-packet-rate`.
+  amplification attempt or a segment that should raise `maximum-packet-rate`
+  (which resizes the #6562 binding table with it — see the sub-bullet above).
 - Compiles to `DHCPRelayGroup.MaximumPacketRate` and flows into
   `relaySpec.maxPacketRate` (a change resizes the bucket, so it restarts the
   per-interface relay). All three parse shapes (flat-set, merged-Keys, block

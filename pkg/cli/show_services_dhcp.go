@@ -184,12 +184,18 @@ func (c *CLI) showDHCPRelay() error {
 			// legitimate bindings are being lost. "forcerenew" counts
 			// DHCPFORCERENEW refused (RFC 3203 §6 requires RFC 3118 auth that a
 			// relay cannot verify).
+			// "Pending" is occupancy/capacity — the LEADING indicator. When it
+			// approaches capacity the relay is about to evict bindings and drop
+			// legitimate replies; "evicted" only rises once that has started.
 			fmt.Println("\nReply request binding (#6562):")
-			fmt.Printf("  %-16s %-22s %-18s %s\n",
-				"Interface", "Dropped (no-request)", "Pending evicted", "Refused (forcerenew)")
+			fmt.Printf("  %-16s %-14s %-22s %-16s %s\n",
+				"Interface", "Pending", "Dropped (no-request)", "Pending evicted",
+				"Refused (forcerenew)")
 			for _, s := range stats {
-				fmt.Printf("  %-16s %-22d %-18d %d\n",
-					s.Interface, s.RepliesDroppedNoRequest, s.PendingEvicted,
+				fmt.Printf("  %-16s %-14s %-22d %-16d %d\n",
+					s.Interface,
+					fmt.Sprintf("%d/%d", s.PendingSize, s.PendingCapacity),
+					s.RepliesDroppedNoRequest, s.PendingEvicted,
 					s.RepliesDroppedForceRenew)
 			}
 		}

@@ -129,7 +129,7 @@ func armedRelay(name string, replies ...*dhcpv4.DHCPv4) *interfaceRelay {
 func unarmedRelay(name string) *interfaceRelay {
 	return &interfaceRelay{
 		ifaceName: name,
-		pending:   newPendingTable(pendingCap, pendingTTL, time.Now),
+		pending:   newPendingTable(defaultTestPendingCap(), pendingTTL, time.Now),
 	}
 }
 

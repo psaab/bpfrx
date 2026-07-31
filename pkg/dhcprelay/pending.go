@@ -49,20 +49,17 @@ import (
 // entirely on the xid for uniqueness, which is the pre-existing RFC 2131
 // matching rule and no weaker than what the client itself relies on.
 //
-// The ingress interface does not need to be part of the key: each relay
-// interface owns its own table (a field on interfaceRelay), so entries are
-// already scoped per-interface by construction.
-//
 // FAIL DIRECTION. This table gates live DHCP for real clients, so every path
 // that can drop a legitimate reply is counted and logged on interfaceRelay
 // (repliesDroppedNoRequest, pendingEvicted) — an over-strict binding must be
 // visible in `show services dhcp relay`, never silent.
 
 const (
-	// pendingTTL is how long a forwarded request stays bindable. It bounds the
-	// window in which a spoofed reply carrying a guessed xid would be accepted,
-	// so shorter is safer; it must still cover the worst-case server response
-	// time, because an entry that expires early drops a LEGITIMATE reply.
+	// pendingTTL is the NOMINAL reply-binding window: how long a forwarded
+	// request stays bindable. It bounds the window in which a spoofed reply
+	// carrying a guessed xid would be accepted, so shorter is safer; it must
+	// still cover the worst-case server response time, because an entry that
+	// expires early drops a LEGITIMATE reply.
 	//
 	// 30s is chosen against RFC 2131 §4.1's client retransmission schedule:
 	// "the delay before the first retransmission SHOULD be 4 seconds
@@ -82,25 +79,84 @@ const (
 	// whatever xid it carries, and the server's answer to it echoes that same
 	// xid (§4.3.1 Table 3). The failure mode of a too-short TTL is therefore a
 	// bounded retry, not a stuck client.
+	//
+	// The window is only NOMINAL when the memory ceiling binds; see
+	// pendingCapacityFor.
 	pendingTTL = 30 * time.Second
 
-	// pendingCap bounds the table so it cannot become the remote
-	// memory-exhaustion vector it exists to prevent. It is a BACKSTOP, not the
-	// primary bound: the #5670 per-interface ingress rate limiter already caps
-	// the fill rate at maxPacketRate (default 100 pps), so steady-state
-	// occupancy is rate x pendingTTL = 100 x 30 = ~3000 entries at the default.
-	// 8192 leaves ~2.7x headroom over that, so a default-configured relay never
-	// reaches the cap and never evicts; only an operator who raised
-	// `overrides maximum-packet-rate` well past the default can reach it.
-	pendingCap = 8192
+	// pendingCapMin is the floor on table capacity. At the default 100 pps the
+	// derivation below wants 100*30 + 200 = 3200 entries; the floor rounds that
+	// up so a default relay has headroom and never evicts.
+	pendingCapMin = 4096
 
-	// pendingReapInterval bounds how often insert sweeps expired entries when
-	// the table is NOT under cap pressure. Expired entries are already inert
-	// for correctness (matches re-checks the expiry), so this only reclaims
-	// memory; doing it at most once a second keeps the O(n) sweep off the
-	// per-packet path.
-	pendingReapInterval = time.Second
+	// pendingCapMax is the memory ceiling on table capacity. The derivation is
+	// rate-driven and `overrides maximum-packet-rate` accepts up to 1000000, so
+	// an UNCLAMPED derivation would itself be the memory-exhaustion vector this
+	// table exists not to be: 1e6 pps x 30 s is 3e7 entries, on the order of
+	// gigabytes. 131072 entries is ~6 MB of ring plus the map — a bounded cost
+	// per relay interface — and it covers the full 30s window for every rate up
+	// to ~4096 pps, which spans realistic large campus/access deployments.
+	//
+	// Above that rate the ceiling binds and the EFFECTIVE window shrinks to
+	// capacity/rate seconds. That is unavoidable — window x rate IS memory —
+	// but it is made explicit rather than emergent: pendingCapacityFor reports
+	// the clamp, Apply logs a startup Warn naming the reduced window, and
+	// PendingSize/PendingEvicted expose the runtime truth.
+	pendingCapMax = 131072
 )
+
+// pendingCapacityFor sizes the outstanding-request table from the interface's
+// #5670 ingress packet-rate limit, and reports whether the memory ceiling
+// clamped the result.
+//
+// WHY THIS IS RATE-DERIVED (#6603 review F1). A fixed capacity is wrong because
+// the fill rate is configurable: steady-state occupancy is rate x pendingTTL,
+// so a hardcoded 8192 was cap-bound above ~273 pps and the binding window
+// silently collapsed from 30s to 8192/rate seconds. That is an availability
+// regression in exactly the direction this file declares worse than the attack
+// it prevents — and the relay's own README recommends raising
+// `maximum-packet-rate` on a busy segment, steering operators straight into it.
+// A boot storm on a segment provisioned for 3000 pps would collapse the window
+// to 2.7s; a saturated server whose RTT exceeds that then has every reply
+// dropped at the relay, turning a storm that previously COMPLETED into a
+// permanent retry storm.
+//
+// Capacity therefore tracks the rate: rate x TTL covers the sustained window,
+// and + relayBurstFor(rate) covers the token bucket's 2-second burst allowance,
+// so every packet the limiter can admit within one TTL has a slot.
+// maxPacketRate participates in relaySpec.equal(), so a day-2 rate change
+// restarts the session and re-derives this.
+func pendingCapacityFor(maxPacketRate int) (capacity int, clamped bool) {
+	rate := resolveMaxPacketRate(maxPacketRate)
+	// Any rate at or above the ceiling saturates it anyway. Short-circuiting
+	// here also keeps the arithmetic below overflow-free on 32-bit int, so a
+	// nonsense rate from a hand-edited active.json cannot wrap.
+	if rate >= pendingCapMax {
+		return pendingCapMax, true
+	}
+	want := rate*int(pendingTTL/time.Second) + relayBurstFor(rate)
+	switch {
+	case want > pendingCapMax:
+		return pendingCapMax, true
+	case want < pendingCapMin:
+		return pendingCapMin, false
+	default:
+		return want, false
+	}
+}
+
+// pendingWindow reports the EFFECTIVE reply-binding window a table of the given
+// capacity provides at the given packet rate: the table can only hold
+// capacity/rate seconds' worth of requests. Used for the startup Warn when the
+// memory ceiling clamps capacity below the nominal pendingTTL.
+func pendingWindow(capacity, maxPacketRate int) time.Duration {
+	rate := resolveMaxPacketRate(maxPacketRate)
+	w := time.Duration(capacity) * time.Second / time.Duration(rate)
+	if w > pendingTTL {
+		return pendingTTL
+	}
+	return w
+}
 
 // pendingKey identifies one outstanding client transaction. It is an
 // all-array, comparable struct so it can be a map key with no allocation and
@@ -136,6 +192,12 @@ func pendingKeyFor(pkt *dhcpv4.DHCPv4) pendingKey {
 	return k
 }
 
+// pendingSlot is one insertion in the expiry-ordered ring.
+type pendingSlot struct {
+	key pendingKey
+	exp time.Time
+}
+
 // pendingTable is a bounded, expiring set of outstanding relayed requests.
 //
 // It is written by the client-facing read loop and read by the server-facing
@@ -143,40 +205,63 @@ func pendingKeyFor(pkt *dhcpv4.DHCPv4) pendingKey {
 // mutex-guarded. The table lives on interfaceRelay rather than on the session,
 // so a session rebuild (#2347 ifindex drift / #3960 re-address) does NOT wipe
 // in-flight bindings and strand a client mid-transaction.
+//
+// STRUCTURE. A map for O(1) lookup, plus a fixed-size ring of insertions for
+// O(1) expiry and eviction. The ring works because EVERY entry is inserted with
+// the SAME ttl, so insertion order IS expiry order — the oldest slot is always
+// at the head, and finding it needs no scan. The earlier implementation ranged
+// the whole map to find the minimum expiry, which cost two full O(capacity)
+// scans per admitted packet once the table was full: at a raised packet rate
+// that was hundreds of microseconds per packet on the single client-facing read
+// goroutine, saturating a core in the exact overload the table is meant to
+// survive (#6603 review F1).
+//
+// A key re-inserted before its previous slot expires (a client retransmitting,
+// or the SELECTING REQUEST reusing the DISCOVER's xid) simply gets a NEW slot;
+// the older slot becomes stale because the map now holds a later expiry, and it
+// is discarded for free when it reaches the head. Because the ring length is
+// the capacity and a slot is always freed before a push, len(entries) <= count
+// <= capacity holds — the ring bounds the map, so duplicate inserts cannot grow
+// either structure past the cap.
 type pendingTable struct {
 	mu      sync.Mutex
 	entries map[pendingKey]time.Time // key -> expiry
-	cap     int
+	ring    []pendingSlot            // fixed length == capacity; expiry-ordered
+	head    int                      // index of the oldest slot
+	count   int                      // slots in use
 	ttl     time.Duration
 	now     func() time.Time
 
-	// lastReap is when the non-cap-pressure sweep last ran.
-	lastReap time.Time
-
-	// evicted counts entries removed by cap pressure (NOT ordinary expiry). It
-	// is surfaced through interfaceRelay.pendingEvicted; a nonzero value means
-	// the table is full and a legitimate reply may now be dropped, which is the
-	// signal an operator needs to raise the rate limit or investigate a flood.
+	// evicted counts entries removed by CAP PRESSURE (not by ordinary expiry).
+	// It is surfaced through interfaceRelay.pendingEvicted; a nonzero value
+	// means the table is full and a legitimate reply may now be dropped.
 	evicted uint64
+
+	// slotScans counts ring slots examined by the expiry/eviction path. It
+	// exists to pin the O(1) invariant deterministically in tests
+	// (TestPendingTable_AtCapInsertIsConstantTime) without timing: if the
+	// eviction path ever regresses to a scan, scans-per-insert grows with
+	// capacity instead of staying a small constant.
+	slotScans uint64
 }
 
 // newPendingTable builds a table. A nil clock defaults to time.Now; a
 // non-positive capacity or ttl falls back to the package defaults so a
 // mis-wired caller cannot silently create an unbounded or never-expiring
-// table.
+// table. Production sizes capacity with pendingCapacityFor.
 func newPendingTable(capacity int, ttl time.Duration, now func() time.Time) *pendingTable {
 	if now == nil {
 		now = time.Now
 	}
 	if capacity <= 0 {
-		capacity = pendingCap
+		capacity, _ = pendingCapacityFor(defaultMaxPacketRate)
 	}
 	if ttl <= 0 {
 		ttl = pendingTTL
 	}
 	return &pendingTable{
 		entries: make(map[pendingKey]time.Time),
-		cap:     capacity,
+		ring:    make([]pendingSlot, capacity),
 		ttl:     ttl,
 		now:     now,
 	}
@@ -199,41 +284,59 @@ func (t *pendingTable) insert(k pendingKey) {
 
 	now := t.now()
 
-	// Off the cap-pressure path, sweep expired entries at most once per
-	// pendingReapInterval purely to reclaim memory.
-	if now.Sub(t.lastReap) >= pendingReapInterval {
-		t.reapLocked(now)
-		t.lastReap = now
+	// Reclaim expired slots from the head. The ring is expiry-ordered, so this
+	// stops at the first unexpired slot — amortized O(1), since every slot is
+	// popped at most once.
+	for t.count > 0 && !now.Before(t.ring[t.head].exp) {
+		t.popHeadLocked()
 	}
 
-	if len(t.entries) >= t.cap {
-		// Reap first: at the cap, expired-but-unswept entries are free space.
-		t.reapLocked(now)
-		t.lastReap = now
-	}
-	if len(t.entries) >= t.cap {
-		// EVICTION POLICY — evict the OLDEST, do not refuse the NEW request.
-		//
-		// The alternative (drop new requests at the cap) is strictly worse
-		// here: an attacker who fills the table would lock out every NEW
-		// client until entries aged out, i.e. a total DHCP outage on the
-		// segment. Evicting the oldest degrades gracefully instead — new
-		// clients keep being served, and only the entries closest to expiry
-		// anyway lose their binding.
-		//
-		// Crucially, the choice does not trade away the security property.
-		// Eviction can only cause a legitimate reply to be DROPPED; it can
-		// never cause an unsolicited reply to be ACCEPTED. Both policies fail
-		// in the availability direction only, so the tie-break is which outage
-		// is smaller — and "new clients still work" beats "no client works".
-		// A client whose entry was evicted recovers on its next retransmission
-		// (RFC 2131 §4.1, same xid).
-		if t.evictOldestLocked() {
+	// Make room if still full. EVICTION POLICY — evict the OLDEST, do not
+	// refuse the NEW request.
+	//
+	// The alternative (drop new requests at the cap) is strictly worse here:
+	// an attacker who fills the table would lock out every NEW client until
+	// entries aged out, i.e. a total DHCP outage on the segment. Evicting the
+	// oldest degrades gracefully instead — new clients keep being served, and
+	// only the entries closest to expiry anyway lose their binding.
+	//
+	// Crucially, the choice does not trade away the security property.
+	// Eviction can only cause a legitimate reply to be DROPPED; it can never
+	// cause an unsolicited reply to be ACCEPTED. Both policies fail in the
+	// availability direction only, so the tie-break is which outage is smaller
+	// — and "new clients still work" beats "no client works". A client whose
+	// entry was evicted recovers on its next retransmission (RFC 2131 §4.1).
+	//
+	// This loop pops exactly one slot (count is at most the ring length, and
+	// one pop drops it below), so the at-cap path stays O(1).
+	for t.count >= len(t.ring) {
+		if t.popHeadLocked() {
 			t.evicted++
 		}
 	}
 
-	t.entries[k] = now.Add(t.ttl)
+	exp := now.Add(t.ttl)
+	t.entries[k] = exp
+	t.ring[(t.head+t.count)%len(t.ring)] = pendingSlot{key: k, exp: exp}
+	t.count++
+}
+
+// popHeadLocked removes the oldest ring slot and reports whether it removed a
+// LIVE map entry. A slot is stale (and its removal frees nothing in the map)
+// when the key was re-inserted after it: the map then holds a LATER expiry than
+// the slot, so the expiry comparison identifies the live slot exactly. Caller
+// holds mu.
+func (t *pendingTable) popHeadLocked() bool {
+	s := t.ring[t.head]
+	t.ring[t.head] = pendingSlot{} // drop the time.Time reference
+	t.head = (t.head + 1) % len(t.ring)
+	t.count--
+	t.slotScans++
+	if exp, ok := t.entries[s.key]; ok && exp.Equal(s.exp) {
+		delete(t.entries, s.key)
+		return true
+	}
+	return false
 }
 
 // matches reports whether a reply binds to an unexpired outstanding request.
@@ -275,8 +378,12 @@ func (t *pendingTable) evictions() uint64 {
 	return t.evicted
 }
 
-// size returns the current entry count (including not-yet-swept expired
-// entries). Test/diagnostic helper.
+// size returns the current entry count. Expired entries are reclaimed on the
+// next insert (the ring head is drained first), so on an idle relay this can
+// briefly include entries past their expiry; they are inert either way because
+// matches re-checks the expiry. Surfaced as RelayStats.PendingSize — occupancy
+// approaching capacity is the LEADING indicator that bindings are about to
+// start being evicted (#6603 review F3).
 func (t *pendingTable) size() int {
 	if t == nil {
 		return 0
@@ -286,34 +393,23 @@ func (t *pendingTable) size() int {
 	return len(t.entries)
 }
 
-// reapLocked deletes every expired entry. Caller holds mu.
-func (t *pendingTable) reapLocked(now time.Time) {
-	for k, exp := range t.entries {
-		if !now.Before(exp) {
-			delete(t.entries, k)
-		}
+// capacity returns the table's fixed entry ceiling.
+func (t *pendingTable) capacity() int {
+	if t == nil {
+		return 0
 	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.ring)
 }
 
-// evictOldestLocked removes the entry with the earliest expiry and reports
-// whether one was removed. Because every entry is inserted with the same ttl,
-// earliest-expiry is the same ordering as oldest-insertion. Caller holds mu.
-//
-// The O(n) scan runs only while the table is at capacity, which the #5670 rate
-// limiter keeps unreachable at the default packet rate.
-func (t *pendingTable) evictOldestLocked() bool {
-	var (
-		oldestKey pendingKey
-		oldestExp time.Time
-		found     bool
-	)
-	for k, exp := range t.entries {
-		if !found || exp.Before(oldestExp) {
-			oldestKey, oldestExp, found = k, exp, true
-		}
+// scans returns the number of ring slots examined by the expiry/eviction path.
+// Test probe for the O(1) invariant; see slotScans.
+func (t *pendingTable) scans() uint64 {
+	if t == nil {
+		return 0
 	}
-	if found {
-		delete(t.entries, oldestKey)
-	}
-	return found
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.slotScans
 }

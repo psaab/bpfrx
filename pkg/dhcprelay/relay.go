@@ -270,13 +270,28 @@ type RelayStats struct {
 	RepliesDroppedForceRenew uint64
 
 	// PendingEvicted counts outstanding-request entries dropped by CAP PRESSURE
-	// on the #6562 pending table (not by ordinary expiry). The #5670 rate
-	// limiter keeps the table far below its cap at the default packet rate, so
-	// a nonzero value means the relay is under a request flood (or
-	// `overrides maximum-packet-rate` is set far above the default) and
-	// legitimate replies may now be dropped for want of a binding. It is the
-	// early-warning signal that pairs with RepliesDroppedNoRequest.
+	// on the #6562 pending table (not by ordinary expiry). Capacity is derived
+	// from the interface's maximum-packet-rate, so under a correctly-sized
+	// relay this stays 0; a nonzero value means the table filled anyway (the
+	// rate limiter's burst allowance, or a rate high enough that the memory
+	// ceiling clamped capacity) and legitimate replies may now be dropped for
+	// want of a binding.
+	//
+	// NOTE it is a COINCIDENT signal, not a leading one: an eviction is what
+	// CAUSES the subsequent drop, so the lead time is one server RTT. Use
+	// PendingSize/PendingCapacity for advance warning.
 	PendingEvicted uint64
+
+	// PendingSize is the CURRENT occupancy of the #6562 outstanding-request
+	// table, and PendingCapacity its ceiling. This pair is the genuine LEADING
+	// indicator (#6603 review F3): occupancy climbing toward capacity means the
+	// relay is about to start evicting bindings and dropping legitimate
+	// replies, and it is observable BEFORE any reply is lost. Alert on the
+	// ratio; PendingEvicted only rises once the damage has begun.
+	//
+	// These are gauges (instantaneous), not monotonic counters.
+	PendingSize     uint64
+	PendingCapacity uint64
 
 	// Reply-delivery breakdown (#2076). These distinguish WHY a reply was
 	// broadcast vs L2-unicast so an L2/CAP_NET_RAW/driver/MTU regression is
@@ -380,7 +395,13 @@ type interfaceRelay struct {
 	// drift / #3960 re-address) does NOT wipe in-flight bindings and strand a
 	// client mid-transaction. Always non-nil in production (set where this
 	// struct is built); a nil table fails CLOSED — see pendingTable.matches.
+	// Its capacity is derived from maxPacketRate (pendingCapacityFor).
 	pending *pendingTable
+
+	// pendingClamped records that pendingCapacityFor hit the memory ceiling,
+	// so the effective reply-binding window is shorter than pendingTTL. Set
+	// once at start; read-only thereafter. Drives the startup Warn in Apply.
+	pendingClamped bool
 
 	// repliesDroppedNoRequest counts server replies dropped because they bind
 	// to no outstanding request (#6562). Observability for a spoofed-source
@@ -887,6 +908,14 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.DHCPRelayConfig) {
 			continue
 		}
 		rctx, cancel := context.WithCancel(ctx)
+		// #6562: size the outstanding-request table from THIS interface's
+		// ingress packet-rate limit. A fixed capacity would be cap-bound (and
+		// the reply-binding window would silently collapse) on any segment
+		// whose `overrides maximum-packet-rate` is raised — which the relay's
+		// own docs recommend for a busy segment. pendingCapacityFor reports
+		// when the memory ceiling clamps it; that case is logged below.
+		rate := resolveMaxPacketRate(d.spec.maxPacketRate)
+		pendingCapacity, pendingClamped := pendingCapacityFor(rate)
 		ir := &interfaceRelay{
 			ifaceName:       d.ifaceName,
 			cancel:          cancel,
@@ -895,12 +924,12 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.DHCPRelayConfig) {
 			alwaysBroadcast: d.spec.alwaysBroadcast,
 			maxHopCount:     resolveMaxHopCount(d.spec.maxHopCount),
 			trustOption82:   d.spec.trustOption82,
-			maxPacketRate:   resolveMaxPacketRate(d.spec.maxPacketRate),
-			// #6562: the outstanding-request table that binds replies to
-			// requests. Built here, with the relay, so it survives session
+			maxPacketRate:   rate,
+			// The table is built here, with the relay, so it survives session
 			// rebuilds; it shares the manager clock seam with the #5670 token
 			// bucket so tests drive expiry deterministically.
-			pending: newPendingTable(pendingCap, pendingTTL, m.now),
+			pending:        newPendingTable(pendingCapacity, pendingTTL, m.now),
+			pendingClamped: pendingClamped,
 		}
 		m.relays[name] = ir
 		toStart = append(toStart, struct {
@@ -931,6 +960,22 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.DHCPRelayConfig) {
 			"interface", s.ir.ifaceName,
 			"group", s.group,
 			"servers", s.ir.spec.servers)
+
+		// #6562: the reply-binding window is nominally pendingTTL, but at a
+		// high `overrides maximum-packet-rate` the memory ceiling on the
+		// outstanding-request table binds first and the real window is
+		// capacity/rate. Say so at startup with the actual number — an
+		// operator who raised the rate must not have to infer a shortened
+		// binding window from a rising PendingEvicted later.
+		if s.ir.pendingClamped {
+			slog.Warn("dhcp-relay: reply-binding window reduced by the pending-table "+
+				"memory ceiling at this packet rate",
+				"interface", s.ir.ifaceName,
+				"max_packet_rate", s.ir.maxPacketRate,
+				"pending_capacity", s.ir.pending.capacity(),
+				"nominal_window", pendingTTL,
+				"effective_window", pendingWindow(s.ir.pending.capacity(), s.ir.maxPacketRate))
+		}
 	}
 }
 
@@ -952,6 +997,8 @@ func (m *Manager) Stats() []RelayStats {
 			RepliesDroppedNoRequest:      ir.repliesDroppedNoRequest.Load(),
 			RepliesDroppedForceRenew:     ir.repliesDroppedForceRenew.Load(),
 			PendingEvicted:               ir.pending.evictions(),
+			PendingSize:                  uint64(ir.pending.size()),
+			PendingCapacity:              uint64(ir.pending.capacity()),
 			RepliesL2Unicast:             ir.repliesL2Unicast.Load(),
 			RepliesUnicastCiaddr:         ir.repliesUnicastCiaddr.Load(),
 			RepliesBroadcastFlag1:        ir.repliesBroadcastFlag1.Load(),
@@ -1685,14 +1732,28 @@ func handleServerResponses(ctx context.Context, serverConn, clientConn net.Packe
 			// while most real clients do not implement RFC 3118 at all and
 			// would never catch it downstream.
 			//
-			// Refusing is a HANDLED condition, not an outage. RFC 3203 §2.2
-			// specifies the server's behavior when the message does not arrive:
-			// "If the FORCERENEW message is lost, the DHCP server will not
-			// receive a DHCP REQUEST from the client and it should retransmit
-			// the FORCERENEW message using an exponential backoff algorithm."
-			// Normal leasing is untouched — clients still renew at T1/T2. Only
-			// the server's ability to force an EARLY renew through this relay is
-			// withdrawn, and it is withdrawn loudly (counter + warn-once).
+			// Refusing costs a CONFORMANT deployment nothing, because a
+			// conformant FORCERENEW never reaches this socket. RFC 3203 §2.2
+			// opens: "The DHCP server sends a unicast FORCERENEW message to
+			// the client." A unicast to the client's own leased address routes
+			// as ordinary traffic and is never delivered to the relay's
+			// giaddr:67 server socket at all. The only FORCERENEW that can
+			// arrive HERE is one deliberately addressed to giaddr:67 — a
+			// non-conformant server, or the attacker §6 is about. Normal
+			// leasing is untouched either way: clients still renew at T1/T2.
+			//
+			// (Do NOT justify this by §2.2's retransmission sentence. That
+			// describes recovery from TRANSIENT loss; the loss here is
+			// PERMANENT — every retransmission hits this same arm — and §2.2
+			// itself bounds the attempts: "The amount of retransmissions should
+			// be limited." The backoff never converges, so it cannot carry the
+			// argument.)
+			//
+			// This arm is also belt-and-braces: FORCERENEW is server-initiated,
+			// so its xid matches no outstanding request and the #6562 binding
+			// below would drop it regardless. The dedicated arm exists to give
+			// the refusal its OWN counter and log, so an operator can tell it
+			// apart from an ordinary unbound reply.
 			ir.repliesDroppedForceRenew.Add(1)
 			if !warnedForceRenew {
 				slog.Warn("dhcp-relay: refusing to forward DHCPFORCERENEW "+

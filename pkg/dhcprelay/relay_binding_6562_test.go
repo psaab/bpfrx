@@ -248,7 +248,7 @@ func TestRelay_NormalExchange_EndToEndStillRelays(t *testing.T) {
 	}
 	if got := ir.pending.evictions(); got != 0 {
 		t.Errorf("pendingEvicted = %d, want 0 (4 requests cannot fill an %d-entry table)",
-			got, pendingCap)
+			got, ir.pending.capacity())
 	}
 	if got := ir.repliesForwarded.Load(); got != 4 {
 		t.Errorf("repliesForwarded = %d, want 4 (OFFER, ACK, RENEW-ACK, REBIND-ACK)", got)
@@ -368,7 +368,7 @@ func TestHandleServerResponses_WrongChaddrDropped(t *testing.T) {
 // xid. Consuming the entry on first match would drop every reply after the
 // first and silently break multi-server redundancy.
 func TestPendingTable_MatchDoesNotConsume(t *testing.T) {
-	tbl := newPendingTable(pendingCap, pendingTTL, time.Now)
+	tbl := newPendingTable(defaultTestPendingCap(), pendingTTL, time.Now)
 	k := pendingKey{xid: dhcpv4.TransactionID{1, 2, 3, 4}, hlen: 6}
 	tbl.insert(k)
 
@@ -384,7 +384,7 @@ func TestPendingTable_MatchDoesNotConsume(t *testing.T) {
 func TestPendingTable_Expiry(t *testing.T) {
 	now := time.Unix(1000, 0)
 	clock := func() time.Time { return now }
-	tbl := newPendingTable(pendingCap, 30*time.Second, clock)
+	tbl := newPendingTable(defaultTestPendingCap(), 30*time.Second, clock)
 	k := pendingKey{xid: dhcpv4.TransactionID{9, 9, 9, 9}, hlen: 6}
 	tbl.insert(k)
 
@@ -560,5 +560,254 @@ func TestManagerRelay_HasPendingTable(t *testing.T) {
 		if ir.pending == nil {
 			t.Errorf("relay %q has a nil pending table — every reply would be dropped", name)
 		}
+	}
+}
+
+// defaultTestPendingCap is the capacity a default-rate relay gets. Tests that
+// only need "a table big enough not to interfere" use it rather than a literal.
+func defaultTestPendingCap() int {
+	c, _ := pendingCapacityFor(defaultMaxPacketRate)
+	return c
+}
+
+// TestPendingCapacity_TracksMaxPacketRate is the #6603-F1 fail-on-revert guard.
+// It pins the PROPERTY — a reply arriving one server-RTT after its request must
+// still bind at a raised `overrides maximum-packet-rate` — not the capacity
+// number.
+//
+// The regression it guards: capacity used to be a hardcoded 8192 while the fill
+// rate is the configurable maxPacketRate, so steady-state occupancy
+// (rate x pendingTTL) exceeded capacity above ~273 pps and the effective
+// binding window collapsed from 30s to 8192/rate seconds. On a segment
+// provisioned at 3000 pps — which the relay's own README recommends for a busy
+// segment — the window collapsed to 2.7s, so a boot storm against a saturated
+// server (RTT > 2.7s) had every reply dropped at the relay: a completed storm
+// turned into a permanent retry storm.
+//
+// Reverting pendingCapacityFor to a fixed 8192 makes this RED as an assertion:
+// the victim's binding is evicted by the intervening traffic and the reply that
+// arrives one RTT later no longer matches.
+func TestPendingCapacity_TracksMaxPacketRate(t *testing.T) {
+	const (
+		rate      = 3000     // operator raised maximum-packet-rate
+		rttPacket = rate * 3 // 3 seconds of traffic while the server thinks
+		oldFixed  = 8192     // the pre-fix hardcoded capacity
+	)
+	// The scenario is only meaningful if the intervening traffic would have
+	// overflowed the OLD fixed capacity; otherwise the test proves nothing.
+	if rttPacket <= oldFixed {
+		t.Fatalf("test is vacuous: %d intervening inserts do not exceed the old cap %d",
+			rttPacket, oldFixed)
+	}
+
+	capacity, clamped := pendingCapacityFor(rate)
+	if clamped {
+		t.Fatalf("capacity for %d pps was clamped (%d) — the ceiling must not bind "+
+			"at a realistic campus rate", rate, capacity)
+	}
+	now := time.Unix(5000, 0)
+	tbl := newPendingTable(capacity, pendingTTL, func() time.Time { return now })
+
+	// A client's request goes upstream.
+	victim := pendingKey{xid: dhcpv4.TransactionID{0xDE, 0xAD, 0xBE, 0xEF}, hlen: 6}
+	tbl.insert(victim)
+
+	// The server is saturated; meanwhile the segment keeps offering traffic at
+	// the configured rate for one server RTT (3s, inside the 30s TTL).
+	for i := 0; i < rttPacket; i++ {
+		tbl.insert(pendingKey{
+			xid:  dhcpv4.TransactionID{byte(i), byte(i >> 8), byte(i >> 16), 0x01},
+			hlen: 6,
+		})
+	}
+	now = now.Add(3 * time.Second)
+
+	// The OFFER finally arrives, still well inside the 30s binding window.
+	if !tbl.matches(victim) {
+		t.Errorf("a reply arriving %s after its request no longer binds at %d pps "+
+			"(capacity %d, %d intervening requests, evictions %d) — the binding "+
+			"window collapsed and legitimate DHCP is being dropped",
+			3*time.Second, rate, capacity, rttPacket, tbl.evictions())
+	}
+	if got := tbl.evictions(); got != 0 {
+		t.Errorf("evictions = %d, want 0 — a correctly-sized table must not evict "+
+			"within one TTL of legitimate rate-limited traffic", got)
+	}
+}
+
+// TestPendingCapacity_Derivation pins the sizing rule and its bounds: capacity
+// covers the sustained window plus the token bucket's burst, never drops below
+// the floor, and is clamped (with the clamp REPORTED) at the memory ceiling so
+// the derivation cannot itself become a memory-exhaustion vector.
+func TestPendingCapacity_Derivation(t *testing.T) {
+	ttlSecs := int(pendingTTL / time.Second)
+
+	for _, rate := range []int{1, 50, defaultMaxPacketRate, 500, 3000} {
+		capacity, clamped := pendingCapacityFor(rate)
+		if clamped {
+			t.Errorf("rate %d: unexpectedly clamped at capacity %d", rate, capacity)
+		}
+		if capacity < pendingCapMin {
+			t.Errorf("rate %d: capacity %d below the floor %d", rate, capacity, pendingCapMin)
+		}
+		// Must hold a full TTL of rate-limited traffic (the whole point).
+		if want := rate * ttlSecs; capacity < want {
+			t.Errorf("rate %d: capacity %d < rate*TTL %d — the window would collapse",
+				rate, capacity, want)
+		}
+	}
+
+	// Ceiling: the schema allows up to 1000000 pps; an unclamped derivation
+	// would be ~3e7 entries (gigabytes).
+	capacity, clamped := pendingCapacityFor(1000000)
+	if !clamped {
+		t.Error("1000000 pps was not reported as clamped")
+	}
+	if capacity != pendingCapMax {
+		t.Errorf("capacity at 1000000 pps = %d, want the ceiling %d", capacity, pendingCapMax)
+	}
+	// And the clamp must be reported with an honest effective window.
+	if w := pendingWindow(capacity, 1000000); w >= pendingTTL {
+		t.Errorf("effective window at the ceiling = %v, want < nominal %v", w, pendingTTL)
+	}
+
+	// A nonsense rate from a hand-edited active.json must not overflow.
+	if c, cl := pendingCapacityFor(1 << 40); !cl || c != pendingCapMax {
+		t.Errorf("absurd rate: capacity=%d clamped=%v, want %d/true", c, cl, pendingCapMax)
+	}
+	// Unset/negative falls back to the default rate, not to zero capacity.
+	if c, _ := pendingCapacityFor(0); c < pendingCapMin {
+		t.Errorf("unset rate: capacity %d below floor %d", c, pendingCapMin)
+	}
+}
+
+// TestManagerRelay_PendingCapacityFollowsOverride pins the WIRING: the relay
+// the manager builds must size its table from the interface's resolved
+// maximum-packet-rate, not from a constant. Without this the derivation could
+// be correct and simply not plumbed in.
+func TestManagerRelay_PendingCapacityFollowsOverride(t *testing.T) {
+	cfg := singleInterfaceConfig()
+	cfg.Groups["g"].MaximumPacketRate = 3000
+
+	client := newFakeConn()
+	server := newFakeConn()
+	factory, _ := recordingFactory(client, server)
+	m := testManager(factory)
+	m.Apply(context.Background(), cfg)
+	defer m.Stop()
+
+	want, _ := pendingCapacityFor(3000)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for name, ir := range m.relays {
+		if got := ir.pending.capacity(); got != want {
+			t.Errorf("relay %q pending capacity = %d, want %d (derived from "+
+				"maximum-packet-rate 3000)", name, got, want)
+		}
+		if ir.pendingClamped {
+			t.Errorf("relay %q reported a clamp at 3000 pps", name)
+		}
+	}
+}
+
+// TestPendingTable_AtCapInsertIsConstantTime pins the O(1) invariant of the
+// at-capacity insert path deterministically — by counting ring slots examined,
+// not by timing, so it cannot flake.
+//
+// The regression it guards: the original implementation ranged the ENTIRE map
+// to find the minimum expiry, and did so twice per admitted packet once full
+// (a reap sweep plus an evict scan). That is O(capacity) per packet on the
+// single client-facing read goroutine — hundreds of microseconds per packet at
+// a raised rate, saturating a core during exactly the overload the table is
+// meant to survive. Because every entry carries the SAME ttl, insertion order
+// IS expiry order, so the oldest is always at the ring head and no scan is
+// needed.
+func TestPendingTable_AtCapInsertIsConstantTime(t *testing.T) {
+	now := time.Unix(7000, 0)
+	clock := func() time.Time { return now }
+	const capacity = 2048
+	tbl := newPendingTable(capacity, time.Hour, clock) // long TTL: force CAP pressure
+
+	key := func(i int) pendingKey {
+		return pendingKey{
+			xid:  dhcpv4.TransactionID{byte(i), byte(i >> 8), byte(i >> 16), byte(i >> 24)},
+			hlen: 6,
+		}
+	}
+	for i := 0; i < capacity; i++ {
+		tbl.insert(key(i))
+	}
+	if tbl.size() != capacity {
+		t.Fatalf("size = %d, want %d", tbl.size(), capacity)
+	}
+
+	// Now every insert is at capacity and must evict exactly one entry.
+	const atCapInserts = 4096
+	before := tbl.scans()
+	for i := 0; i < atCapInserts; i++ {
+		tbl.insert(key(capacity + i))
+	}
+	scans := tbl.scans() - before
+
+	// LOWER bound first, and it is load-bearing. Each at-cap insert must free a
+	// slot through the ring, so scans must be at LEAST one per insert. Without
+	// this, an implementation that abandons the ring for a map scan reports
+	// zero scans and would sail past the upper bound alone — the test would
+	// pass for the wrong reason. (Verified: reverting the eviction to the
+	// original minimum-expiry map scan leaves the upper bound green and is
+	// caught only here.)
+	if scans < uint64(atCapInserts) {
+		t.Errorf("at-cap inserts examined only %d ring slots for %d inserts; each "+
+			"at-cap insert must free a slot through the ring. The eviction path "+
+			"is bypassing the ring, so this test can no longer see its cost.",
+			scans, atCapInserts)
+	}
+	// O(1) means a small constant per insert. O(capacity) would be
+	// atCapInserts*capacity = 8388608. Allow generous slack (4x) so the bound
+	// still fails loudly on any return to scanning.
+	if maxScans := uint64(atCapInserts * 4); scans > maxScans {
+		t.Errorf("at-cap inserts examined %d ring slots for %d inserts (%.1f per insert); "+
+			"want O(1) (<= %d total). The eviction path has regressed to a scan.",
+			scans, atCapInserts, float64(scans)/float64(atCapInserts), maxScans)
+	}
+	if got := tbl.evictions(); got != atCapInserts {
+		t.Errorf("evictions = %d, want %d (one per at-cap insert)", got, atCapInserts)
+	}
+	if tbl.size() != capacity {
+		t.Errorf("size = %d, want %d — the table must stay bounded", tbl.size(), capacity)
+	}
+}
+
+// TestPendingTable_DuplicateKeyDoesNotGrowRing pins the ring/map invariant for
+// a repeated key: a client retransmitting the same xid (or the SELECTING
+// REQUEST reusing the DISCOVER's xid) adds a ring slot each time while the map
+// keeps one entry. The stale slots must be reclaimed for free rather than
+// pushing the structures past capacity or evicting live entries.
+func TestPendingTable_DuplicateKeyDoesNotGrowRing(t *testing.T) {
+	now := time.Unix(8000, 0)
+	clock := func() time.Time { return now }
+	const capacity = 64
+	tbl := newPendingTable(capacity, time.Hour, clock)
+
+	dup := pendingKey{xid: dhcpv4.TransactionID{7, 7, 7, 7}, hlen: 6}
+	for i := 0; i < capacity*8; i++ {
+		tbl.insert(dup)
+		now = now.Add(time.Millisecond) // distinct expiries, as a real clock gives
+	}
+	if got := tbl.size(); got != 1 {
+		t.Errorf("size = %d, want 1 — a repeated key must not accumulate entries", got)
+	}
+	if !tbl.matches(dup) {
+		t.Error("the repeated key no longer binds")
+	}
+	if got := tbl.capacity(); got != capacity {
+		t.Errorf("capacity = %d, want %d (the ring must not grow)", got, capacity)
+	}
+	// Stale slots are reclaimed, so a fresh key must still be admitted without
+	// evicting the live one.
+	fresh := pendingKey{xid: dhcpv4.TransactionID{1, 1, 1, 1}, hlen: 6}
+	tbl.insert(fresh)
+	if !tbl.matches(fresh) || !tbl.matches(dup) {
+		t.Error("a fresh key evicted the live duplicate, or was not admitted")
 	}
 }

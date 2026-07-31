@@ -62186,3 +62186,77 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/dhcprelay/{pending.go,relay.go,README.md,
     relay_binding_6562_test.go,delivery_test.go,relay_test.go},
     pkg/cli/show_services_dhcp.go, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6562 / PR #6603 review fold — F1 MAJOR (pending-table capacity
+  did not track maximum-packet-rate) + F2/F3/F4/F5 MINORs.
+
+  F1 (MAJOR). `pendingCap` was a hardcoded 8192 while the fill rate is the
+  configurable #5670 `maxPacketRate` (schema 1..1000000, default 100). Steady
+  occupancy is rate x TTL, so above ~273 pps the table was CAP-BOUND and the
+  reply-binding window silently collapsed from 30s to 8192/rate seconds — and
+  README.md recommends raising maximum-packet-rate on a busy segment, steering
+  operators straight into it. At 3000 pps the window is 2.7s; a boot storm
+  against a server whose RTT exceeds that has every reply dropped at the relay,
+  turning a completing storm into a permanent retry storm. Compounding it, the
+  at-cap path did TWO full O(cap) map scans per admitted packet (reap sweep +
+  minimum-expiry scan) on the single client-facing read goroutine.
+
+  REMEDIATION: took BOTH reviewer shapes (b)+(a), not (c). (b) alone leaves the
+  window collapse — the actual availability regression — unfixed; (c) only
+  warns about it. (b) O(1) ring: every entry carries the SAME ttl, so insertion
+  order IS expiry order and the oldest is always at the ring head — no scan.
+  Duplicate inserts get a new slot; the old one is stale (map holds a later
+  expiry) and is discarded free at the head. A slot is always freed before a
+  push, so len(entries) <= count <= capacity — the ring bounds the map. (a)
+  capacity = rate*pendingTTL + relayBurstFor(rate), clamped [4096, 131072]. The
+  ceiling is mandatory: 1e6 pps x 30s is ~3e7 entries (GBs), i.e. the
+  memory-exhaustion vector the table exists not to be. Above ~4096 pps the
+  ceiling binds; that is unavoidable (window x rate IS memory) but is now
+  EXPLICIT — pendingCapacityFor reports the clamp and Apply logs a startup Warn
+  naming the effective window.
+
+  F2. Cap comment claimed "well past the default"; the real threshold was 273
+  pps = 2.73x default. Moot now that capacity is derived, but the README's
+  #5670 section gained the actual ~4096 pps ceiling threshold and a
+  cross-reference in both places that recommend raising the rate.
+
+  F3. PendingEvicted is COINCIDENT, not leading — an eviction causes the
+  subsequent drop, lead time one server RTT. Plumbed the already-existing
+  size() through as PendingSize + PendingCapacity (gauges) into RelayStats,
+  Stats() and the CLI as "Pending N/M"; corrected the README claim.
+
+  F4 (text only). The "handled condition" argument rested on RFC 3203 §2.2's
+  retransmission sentence, which describes TRANSIENT loss — here the loss is
+  PERMANENT and §2.2 itself says "The amount of retransmissions should be
+  limited", so the backoff never converges. Replaced in relay.go + README with
+  the dispositive §2.2 sentence, verified verbatim at rfc3203.txt:71: "The DHCP
+  server sends a unicast FORCERENEW message to the client." A conformant
+  unicast to the client's leased IP never lands on the relay's giaddr:67
+  socket, so refusal costs a conformant deployment NOTHING and the only
+  FORCERENEW reaching this arm is non-conformant or hostile. Also recorded that
+  the arm is belt-and-braces (a server-chosen xid matches no outstanding
+  request, so the binding gate would drop it anyway) — it buys a distinct
+  counter and log. Scoped the "must be visible" claim to the console CLI:
+  RelayStats has no gRPC/Prometheus surface (pre-existing, filed separately).
+
+  F5. fakeConn.ReadFrom no longer self-recurses after a wake; plain for loop.
+
+  VALIDATION — three revert probes, each in a THROWAWAY detached worktree at
+  the branch HEAD (never the PR worktree), each build+vet CLEAN so the red is
+  an ASSERTION: (1) capacity back to fixed 8192 -> TracksMaxPacketRate RED
+  ("a reply arriving 3s after its request no longer binds at 3000 pps
+  (capacity 8192, 9000 intervening requests, evictions 809)") + Derivation RED;
+  (2) eviction back to the O(n) minimum-expiry map scan -> AtCapInsertIsConstant
+  Time RED; (3) relay.go un-wired to a constant while pendingCapacityFor stays
+  correct -> PendingCapacityFollowsOverride RED ("capacity = 8192, want 96000").
+  Probe (2) initially PASSED — the reverted code bypasses the ring so slotScans
+  stayed 0 and sailed under the upper bound. Added a LOWER bound (>= 1 scan per
+  at-cap insert) which makes the counter's liveness part of the contract; probe
+  re-run then went RED. Over-reach guard NormalExchange_EndToEndStillRelays and
+  ForceRenewRefused stayed GREEN under all three. Suites: pkg/dhcprelay
+  -race -count=5 PASS; pkg/dhcp, pkg/dhcpserver, pkg/cli -race PASS; build,
+  gofmt, vet clean.
+- **File(s)**: pkg/dhcprelay/{pending.go,relay.go,README.md,
+    relay_binding_6562_test.go,delivery_test.go,relay_test.go},
+    pkg/cli/show_services_dhcp.go, _Log.md

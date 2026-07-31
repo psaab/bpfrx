@@ -473,33 +473,38 @@ func newFakeConn() *fakeConn {
 
 func (f *fakeConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	f.readCalls.Add(1)
-	f.mu.Lock()
-	if len(f.pending) > 0 {
-		d := f.pending[0]
-		f.pending = f.pending[1:]
-		src := f.srcAddr
-		f.mu.Unlock()
-		n := copy(p, d)
-		if src == nil {
-			src = &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 68}
+	// Loop rather than recurse after a wake: a push that is consumed by a
+	// racing reader leaves this reader to block again, and iteration keeps
+	// that bounded by the stack the caller already has.
+	for {
+		f.mu.Lock()
+		if len(f.pending) > 0 {
+			d := f.pending[0]
+			f.pending = f.pending[1:]
+			src := f.srcAddr
+			f.mu.Unlock()
+			n := copy(p, d)
+			if src == nil {
+				src = &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 68}
+			}
+			return n, src, nil
 		}
-		return n, src, nil
-	}
-	rerr := f.readErr
-	f.mu.Unlock()
-	if rerr != nil {
-		return 0, nil, rerr
-	}
-	// Nothing queued: block until Close (the pre-existing behavior every
-	// pre-seeding test relies on) OR until push() queues a datagram mid-flight.
-	// The wake path exists for the #6562 end-to-end exchange test, which must
-	// inject a server reply only AFTER the request it answers has been relayed
-	// — a reply pre-seeded before the session starts would race the binding.
-	select {
-	case <-f.closeCh:
-		return 0, nil, net.ErrClosed
-	case <-f.wake:
-		return f.ReadFrom(p)
+		rerr := f.readErr
+		f.mu.Unlock()
+		if rerr != nil {
+			return 0, nil, rerr
+		}
+		// Nothing queued: block until Close (the pre-existing behavior every
+		// pre-seeding test relies on) OR until push() queues a datagram
+		// mid-flight. The wake path exists for the #6562 end-to-end exchange
+		// test, which must inject a server reply only AFTER the request it
+		// answers has been relayed — a reply pre-seeded before the session
+		// starts would race the binding.
+		select {
+		case <-f.closeCh:
+			return 0, nil, net.ErrClosed
+		case <-f.wake:
+		}
 	}
 }
 
