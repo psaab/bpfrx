@@ -21,7 +21,7 @@ moved with its assertions intact.
 | `backend_rfc2136.go` | The LIVE RFC 2136 backend (`rfc2136Updater`): exact-RR adds/deletes, TSIG, RFC 4701 DHCID + RFC 4703 replace-owned two-attempt, the `errDDNSConflictRefused` / `errDDNSPTRPending` sentinels — moved from `dhcpserver/ddns_rfc2136.go`. `sendRemoveForward(..., keepDHCID)` keeps a shared DHCID on a partial dual-stack teardown (#2700); `dnsCanonicalFQDN` mirrors the DHCID FQDN canonicalization. |
 | `hostname.go` | Deterministic hostname → DNS-label normalization (pure) — moved from `dhcpserver/ddns_hostname.go`. |
 | `surface_a.go` | Surface A router/interface-address publish engine (`SurfaceAManager`): change-detection, forced-refresh wire floor, the `ForceRefresh()` operator force-now latch (#3276), per-scope error backoff, per-RG HA gate, the backend factory `productionSurfaceABackend` (#2691 P2/P3). **Operator-hostname intent (#2779):** the publish path (`surfaceAName` → `sanitizeFQDN`) lower-cases + strips non-LDH characters + drops empty-sanitizing labels. For a *router-owned* Surface A record the hostname is operator intent (the operator types the exact public name), so a name that sanitization would STRUCTURALLY change is now a **commit error** (`config.ValidateDDNSHostname` on the typed `interfaces … dynamic-dns hostname` leaf) instead of a silent rewrite to a different DNS name — e.g. `wan_1.example.net` is rejected at commit rather than published as `wan1.example.net`. Case-folding and a single trailing dot are accepted (benign DNS canonicalizations). Every name that PASSES the commit check is a fixed point of `sanitizeFQDN` (cross-package contract test `surface_a_hostname_2779_test.go`), so the published name equals operator intent. |
-| `backend_http.go` | Shared HTTP-backend discipline (#2691 P3): hardened `http.Client` (TLS-verified, bounded timeout), capped body read, `classifyHTTPStatus`, `queryEscape`, the `errHTTPAuth`/`errHTTPRateLimited` verdicts, and **`scrubURLError` — the single renderer for any error that may carry a request URL** (#6545): it emits at most `scheme://host[:port]` and withholds a URL that does not parse entirely. The allowlist is over the CHARACTERS, not only the `url.URL` fields: `Host` is **not** credential-free (an IPv6 zone id, a reg-name label, decoded non-ASCII bytes and the port are all places a `%p`-expanded password or a provider `Location` can land), so `safeHostText`/`safeScheme` rebuild it from a closed grammar — IP literals re-rendered from `netip` with the zone dropped, reg-names restricted to `[A-Za-z0-9._-]` labels, port 1..65535, scheme `http`/`https`. `scrubInnerError` is likewise **total**: an error's text is rendered only by known provenance (`errRedirectRefused`, a `syscall.Errno`, or a stdlib class collapsed onto the closed `transportReason` enum), never verbatim. Every build-request and transport error in the package routes through it; `TestDDNSURLErrorRendersGoThroughScrubber` fails any new site that does not, and `TestClientDoHasExactlyOneCallSite` denies the wrapper-helper move that would hide one from the walk. **Source binding (#2846):** `newHTTPClientBound(bindConfig)` installs the SAME `backend_bind.go` source/interface/VRF `Dialer` (via `Transport.DialContext`) so the HTTP backends + checkip egress from the operator-configured `source-address` / `destination-interface` / `routing-instance` — not the kernel default route. `newHTTPClient()` is the no-bind alias (unbound default, behaviour unchanged). `resolveProviderBindConfig`/`newProviderHTTPClient` adapt a `config.DDNSProvider`'s leaves onto `resolveBindConfig`; a malformed `source-address` is a hard error so the backend constructor degrades to no-op (fail-open, mirrors rfc2136). **Redirect policy (#4861, #6545):** `guardRedirect` is the single `CheckRedirect` every DDNS HTTP client carries. It refuses a scheme downgrade (HTTPS→HTTP) AND any cross-host hop, strips `Referer` from every redirect it does follow, and re-implements the 10-hop cap that setting `CheckRedirect` removes. The cross-host half closes a real credential disclosure: Go's `refererForURL` puts the FULL previous URL — query string included — in `Referer` on an HTTPS→HTTPS hop (the DuckDNS/`generic`/`checkip-url` token), and `shouldCopyHeaderOnRedirect` forwards `Authorization`/`Cookie` to any SUBDOMAIN of the original host (the dyndns2/`generic` Basic credential, the Cloudflare bearer token). Same-host redirects still work. See “Redirect policy” below. |
+| `backend_http.go` | Shared HTTP-backend discipline (#2691 P3): hardened `http.Client` (TLS-verified, bounded timeout), capped body read, `classifyHTTPStatus`, `queryEscape`, the `errHTTPAuth`/`errHTTPRateLimited` verdicts, and **`scrubURLError` — the single renderer for any error that may carry a request URL** (#6545): it emits at most `scheme://host[:port]` and withholds a URL that does not parse entirely. The allowlist is over the CHARACTERS, not only the `url.URL` fields: `Host` is **not** credential-free (an IPv6 zone id, a reg-name label, decoded non-ASCII bytes and the port are all places a `%p`-expanded password or a provider `Location` can land), so `safeHostText`/`safeScheme` rebuild it from a closed grammar — IP literals re-rendered from `netip` with the zone dropped, reg-names restricted to `[A-Za-z0-9._-]` labels, port 1..65535, scheme `http`/`https`. `scrubInnerError` renders **only what this package declares**: `classifyTransportError` returns the closed `transportReason` type and every return names a declared constant (proven by `TestClassifyTransportErrorReturnsOnlyConstants`, which resolves each with `go/types`), and the one error whose text is rendered — `*redirectRefusal` — is found by **type assertion**, not `errors.Is`, because `errors.Is`/`As` dispatch to methods a caller-supplied error defines. `safeOp` bounds `url.Error.Op` for the same reason. Every build-request and transport error in the package routes through it; `TestDDNSURLErrorRendersGoThroughScrubber` fails any new site that does not, and `TestClientDoHasExactlyOneCallSite` denies the wrapper-helper move that would hide one from the walk. **Source binding (#2846):** `newHTTPClientBound(bindConfig)` installs the SAME `backend_bind.go` source/interface/VRF `Dialer` (via `Transport.DialContext`) so the HTTP backends + checkip egress from the operator-configured `source-address` / `destination-interface` / `routing-instance` — not the kernel default route. `newHTTPClient()` is the no-bind alias (unbound default, behaviour unchanged). `resolveProviderBindConfig`/`newProviderHTTPClient` adapt a `config.DDNSProvider`'s leaves onto `resolveBindConfig`; a malformed `source-address` is a hard error so the backend constructor degrades to no-op (fail-open, mirrors rfc2136). **Redirect policy (#4861, #6545):** `guardRedirect` is the single `CheckRedirect` every DDNS HTTP client carries. It refuses a scheme downgrade (HTTPS→HTTP) AND any cross-host hop, strips `Referer` from every redirect it does follow, and re-implements the 10-hop cap that setting `CheckRedirect` removes. The cross-host half closes a real credential disclosure: Go's `refererForURL` puts the FULL previous URL — query string included — in `Referer` on an HTTPS→HTTPS hop (the DuckDNS/`generic`/`checkip-url` token), and `shouldCopyHeaderOnRedirect` forwards `Authorization`/`Cookie` to any SUBDOMAIN of the original host (the dyndns2/`generic` Basic credential, the Cloudflare bearer token). Same-host redirects still work. See “Redirect policy” below. |
 | `backend_dyndns2.go` | dyndns2 backend (#2691 P3): one impl behind many provider names (`dyndns2Endpoints`), `good`/`nochg`/`badauth`/`abuse`/`911`/`nohost` verdict parsing. |
 | `backend_cloudflare.go` | Cloudflare API backend (#2691 P3): Bearer token, zone-id resolve → list → PATCH/POST/DELETE record. **Upsert is value-specific (#3739 H11):** `UpsertLease` lists EVERY A/AAAA at the name and touches ONLY xpf's own row — a row already carrying the new value is a no-op, else the row carrying xpf's PREVIOUS value (`rec.PrevAddr`) is PATCHed in place, else a new record is POSTed. It NEVER PATCHes `recs[0]` (an API-ordering artifact), so a co-resident FOREIGN A/AAAA a human set on the same name is never rewritten to xpf's address. **Withdraw is content-scoped (#2770):** `DeleteLease` lists EVERY record for the FQDN+type and deletes only the rows whose `content` equals the owned address (`rec.Addr.Unmap().String()`), removing ALL such duplicates. It never deletes a row with a different value (a human/automation changed it after xpf published — an ownership conflict that is a success no-op), honouring the Surface A sole-delete-authority boundary that RFC 2136 also enforces (Route 53 now preserves co-resident foreign members via a read-modify-write — #5389, see the P2 note). `recs[0]` is an API-ordering artifact, not ownership. **Record listing paginates (#4909):** `listRecords` walks every page of the dns_records list (driven by `result_info.total_pages`, with a short-page fallback and a 1000-page runaway cap), so an xpf-owned row past the first 100-row page is never hidden — the pre-fix single unpaginated GET could drive a duplicate create (owned row unseen) or a false "already absent" delete. |
 | `backend_dyndns2.go` | dyndns2 backend (#2691 P3): one impl behind many provider names (`dyndns2Endpoints`), `good`/`nochg`/`badauth`/`abuse`/`911`/`nohost` verdict parsing. **Withdraw (#2772):** `DeleteLease` issues the same update GET with `offline=YES` (the de-facto dyndns2 withdraw verb) and parses the body verdict; a provider failure returns a non-nil error so the engine keeps ownership for retry (was a silent no-op that orphaned the public record). **Dual-stack sibling guard (#3738):** `offline=YES` is HOSTNAME-level (both A and AAAA); when the engine sets `LeaseDNSRecord.SiblingFamilyOwned` (a sibling family is still published at this name/provider) `DeleteLease` SKIPS the offline so the live sibling is preserved (see "Dual-stack same-name withdraw" below). **DuckDNS is NOT here (#2960):** DuckDNS is not dyndns2-protocol-compatible, so it has its own `backend_duckdns.go`; `duckdns` was removed from `dyndns2Endpoints`. **Server validation (#3737):** `resolveDyndns2Endpoint` decides full-URL vs bare-host on the `://` delimiter, parses the URL with `url.Parse`, compares the scheme with `strings.EqualFold` (case-INSENSITIVE per RFC 3986 §3.1, so `HTTPS://host` is accepted — the old case-sensitive `HasPrefix` misclassified it as a bare host and produced a doubly-suffixed malformed URL), and requires a non-empty `Hostname()` in BOTH cases so a hostless value (`http://`, `https:///nic/update`, `:8080`) fails at construction (manager falls back to no-op) instead of only at the first publish. This is the SAME discipline as checkip's `validateCheckIPURL` (#2842) and generic's `validateGenericURLTemplate` (#2841). A malformed `server` is also warned at commit by `config.validateSurfaceADDNSWarnings` (mirror `ddnsDyndns2ServerValid`, RedactURL'd in the message). |
@@ -298,17 +298,31 @@ and transport site routes through it. It allowlists at **two** levels:
   Userinfo was never in this list — `url.Parse` splits `user:pass@host` into
   `u.User`, so an ordinary credentialed URL was already safe.
 
-**The rendered error is now guaranteed to contain**, for the URL, at most:
-`http` or `https`, then `://`, then either a zone-free IP literal or a
-`[A-Za-z0-9._-]` reg-name, then optionally `:` and 1–5 decimal digits — plus one
-of three fixed notes when something was withheld. No `%`, no non-ASCII, no
-delimiter, no path/query/fragment/userinfo, nothing of unbounded length.
+**The rendered error is now guaranteed to contain**, for the URL, at most: the
+bounded operation word, then `http` or `https`, then `://`, then either a
+zone-free IP literal or a `[A-Za-z0-9._-]` reg-name, then optionally `:` and 1–5
+decimal digits — plus, where a whole component vanished, one of three fixed
+notes (an out-of-range port is dropped silently, since the host is still fully
+rendered). No `%`, no non-ASCII, no delimiter, no path/query/fragment/userinfo,
+nothing of unbounded length. `url.Error.Op` is allowlisted too (`safeOp`): it is
+caller-settable, and a forged `&url.Error{Op: req.URL.String(), URL:
+"https://safe.example/"}` leaked the whole URL through the one field the rebuild
+did not touch.
 
-The residual is stated, not papered over: an operator whose template puts the
-password in the **DNS name itself** has already published it to their resolver,
-to every on-path observer, and in TLS SNI; it will appear here. That is a
-configuration error the logging boundary cannot repair, and hiding it would make
-it less likely to be noticed.
+**And for the inner error**, exactly one of: a `transportReason` constant
+declared in `backend_http.go`, or a `*redirectRefusal` rendered from fixed prose
+plus `refusalHost`/`refusalScheme` output. No error's own `Error()` text and no
+Go type name reach the output on any path.
+
+Two residuals, stated rather than papered over. A password used as the **DNS
+name** (`https://%p.example.com/`) is retained — it is already in every resolver
+query and in the TLS SNI the endpoint sees, the renderer cannot tell a
+legitimate label from a password without template-expansion taint, and
+withholding every hostname would gut diagnosis. A **numeric** password used as a
+valid **port** is likewise retained, as up to five decimal digits. Note the
+asymmetry honestly, though: a log is durable and often more widely readable than
+a packet capture, so "disclosed elsewhere" justifies these two specifically —
+it is not a general licence.
 
 Two further consequences:
 
@@ -316,22 +330,42 @@ Two further consequences:
   `urlParseCause` reason. The old verbatim `ue.URL` fallback was survivable only
   while the helper was reachable from the transport path alone; a build-request
   failure's defining input is a URL that does not parse.
-- **`scrubInnerError` is total (round 7).** It used to return any non-`*url.Error`
-  verbatim, reasoning that transport errors name a host, never a URL. `CheckIP`
-  takes a caller-supplied `*http.Client`, so that does not hold — a RoundTripper
-  returning `fmt.Errorf("request %s failed: %w", req.URL, …)` put the whole path
-  credential through, and the special case for `net/http`'s `failed to parse
-  Location header %q` was an exact *prefix* match that the same message one wrap
-  deep walked past. An error's text is now rendered only when its provenance is
-  known: our own `errRedirectRefused` refusals (built here from fixed prose plus
-  grammar-bounded hosts), a `syscall.Errno` (the kernel's fixed table), or a
-  recognised stdlib class collapsed onto the closed `transportReason`
-  enumeration — read **structurally** (`net.Error.Timeout`,
-  `DNSError.IsNotFound`, `OpError.Op`/`.Net` against an allowlist), never by
-  message text, because `DNSError.Name` and `OpError.Addr` are the request host
-  and x509 errors quote provider-supplied certificate fields. Anything else is
-  withheld down to its Go **type**, a compile-time symbol carrying no operator
-  data.
+- **`scrubInnerError` renders only what this package declares (round 8).**
+  Round 7 made it "total" by asking, of each error, whether its **provenance**
+  was known — and every way of asking that routes through something a
+  caller-supplied error controls. `CheckIP` takes a caller-supplied
+  `*http.Client`, so its RoundTripper's errors are arbitrary values, and Codex
+  defeated the check four ways: `errors.Is` dispatches to the error's own
+  `Is(error) bool`, so an error whose `Is` always returns `true` was accepted as
+  one of our refusals and its `Error()` — the request URL — printed verbatim;
+  `url.Error.Op` was never rebuilt; `syscall.Errno.Error()` is **not** a closed
+  table (`syscall.Errno(65432)` renders `"errno 65432"`, so a numeric credential
+  survived); and `%T` is **not** a compile-time symbol, because
+  `reflect.StructOf` builds a runtime type whose name embeds an input-derived
+  struct **tag**.
+
+  The fix removes the ability to express the leak rather than checking for it.
+  `classifyTransportError` returns the closed `transportReason` type and **every
+  return names a declared constant** — errno is an allowlist of *values*, the
+  `*net.OpError` branch selects a stage constant from `Op` alone, and the
+  fallback is a bare constant with no type name.
+  `TestClassifyTransportErrorReturnsOnlyConstants` proves it by **resolving**
+  each returned identifier with `go/types`, the same discipline (and the same
+  shadow-proofing) as the `urlParseCause` gate. Classes are still read
+  *structurally* (`net.Error.Timeout`, `DNSError.IsNotFound`), never by message
+  text — and forging one of those buys nothing, because every branch returns a
+  constant.
+
+  The one error whose text is rendered is `*redirectRefusal`, reached by **type
+  assertion** over the unwrap chain, never `errors.Is`/`As`: an unexported
+  concrete struct type cannot be named, constructed or impersonated from outside
+  the package, and a type assertion has no user-defined hook. It stores the
+  `*url.URL`s and applies the host/scheme grammar in `Error()`, so the bounding
+  happens on the way out rather than being trusted to the construction site.
+  Chain walks are depth-bounded (`maxUnwrapDepth`) because `Unwrap` is also the
+  caller's method. The diagnostic cost — `net/http`'s internal prose, the failing
+  address, the unknown-error type name — is accepted: an unrecognised error is
+  exactly the case where we cannot say what it contains.
 - **`guardRedirect`'s refusals are grammar-bounded too.** The redirect target is
   *provider*-supplied: a provider answering `Location: https://<our-password>.evil.example/`
   gets the hop refused — that is the point — and, before round 7, the echoed
@@ -351,6 +385,10 @@ through the real template expander),
 `TestGuardRedirectRefusalBoundsProviderSuppliedHost`,
 `TestScrubURLErrorWithholdsLocationHeaderEcho`,
 `TestBackendBuildRequestErrorsWithholdCredentials` across all six backends).
+`TestScrubInnerErrorResistsForgedProvenance` drives all four round-8 forgeries
+through a caller-supplied RoundTripper — an error whose `Is` always says true,
+a `url.Error` carrying the URL in `Op`, an out-of-table `syscall.Errno`, and a
+`reflect.StructOf` type whose name embeds an input-derived struct tag.
 `TestScrubInnerErrorKeepsRecognisedDiagnostics` is the over-reach floor for the
 totality fix — withholding everything would pass every leak test and destroy the
 package's diagnostics, so `connection refused`, the DNS/TLS classes and above all
@@ -375,11 +413,11 @@ Round 7 fixed the self-expiry itself: it recorded the exemption as *hit* merely
 because a handler existed in that function, so sanitizing the site left the
 exemption standing and green — the opposite of expiring. The hit is now
 conditional on the site still being **unsafe**, so fixing #6606 turns this red
-and forces the stale entry out. `TestCheckIPTransportFailureRedactsFragment`,
-`TestScrubURLErrorClearsFragment` and
-`TestCheckIPTransportFailureWarnRedactsFragment` (daemon-level: a real listener
-bound then closed, asserting on rendered log bytes and the dedup map) remain as
-the fragment-specific gates.
+and forces the stale entry out. Round 8 narrowed the exemption from
+file+function to **file + function + producer + error variable**, and asserts it
+covers exactly **one** site: a different unsafe handler moving into
+`resolveDyndns2Endpoint` is no longer absorbed by an exemption written for
+another one.
 
 `scrubURLError` is still not used in the VALIDATOR paths, which render the cause
 directly through `urlParseCause`: it is the same no-leak primitive either way,

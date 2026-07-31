@@ -62621,3 +62621,91 @@ break — `go vet` confirmed passing under every revert.
   logging hygiene only.
 - **File(s)**: pkg/ddns/{backend_http.go,url_render_class_6545_test.go,README.md},
     _Log.md
+
+- **Timestamp**: 2026-07-31 17:20 UTC
+- **Action**: #6545 round 8 (Codex re-gate MAJOR on PR #6594) — stop asking
+  whether an error is ours and stop rendering anything an error says about
+  itself.
+
+  **MAJOR — `scrubInnerError` was still not total.** Round 7 made it "total" by
+  PROVENANCE: render an error's own text once we believe it is ours or the
+  kernel's. Every way of asking that question routes through something a
+  caller-supplied error controls, and `CheckIP` takes a caller-supplied
+  `*http.Client`, so RoundTripper errors are arbitrary values. Codex defeated
+  it four independent ways:
+
+  1. `errors.Is(err, errRedirectRefused)` dispatches to the error's OWN
+     `Is(error) bool`. An error whose `Is` always returns true and whose
+     `Error()` is the request URL was accepted as one of our refusals and
+     printed VERBATIM. `errors.As` has the same hole (`As(any) bool`).
+  2. `url.Error.Op` was never rebuilt, so a RoundTripper returning
+     `&url.Error{Op: req.URL.String(), URL: "https://safe.example/"}` leaked
+     the complete request URL through the one field the scrub skipped.
+  3. `syscall.Errno.Error()` is NOT a closed table. An unknown value renders
+     dynamically — `syscall.Errno(65432)` becomes "errno 65432" — so a numeric
+     credential survived the "kernel vocabulary" argument.
+  4. `%T` is NOT a compile-time symbol. `reflect.StructOf` builds a runtime
+     type that satisfies `error` by method promotion and whose NAME embeds an
+     input-derived struct TAG (verified firsthand on Go 1.26.4: the built type
+     prints as `struct { ddns.CodexBaseError; X string "secret:\"...\"" }`).
+
+  Fix removes the ability to express the leak rather than checking for it, the
+  same move that made the URL allowlist and `parseReason` hold.
+  `classifyTransportError` returns the closed `transportReason` type and EVERY
+  return names a declared constant: `errnoReason` became an allowlist of errno
+  VALUES (17 constants; unknown → withheld), the `*net.OpError` branch selects
+  a stage constant from `Op` alone (Net dropped — it only made combinations,
+  and Addr is the request host), `classifyTLSError` was inlined so its returns
+  are constants too, and the `%T` fallback is a bare constant.
+  `TestClassifyTransportErrorReturnsOnlyConstants` proves it the way the
+  `urlParseCause` gate does — hermetic `go/types` (non-resolving importer +
+  swallowing `Config.Error`), each returned identifier RESOLVED to a
+  package-scope `*types.Const` of type `transportReason`, no descent into
+  `ast.FuncLit`, result type pinned, plus a non-vacuity floor per function. A
+  shadowed local that merely spells a constant's name fails it.
+
+  The one error whose text is rendered is the new unexported concrete
+  `*redirectRefusal`, found by TYPE ASSERTION over the unwrap chain — never
+  `errors.Is`/`As`. A foreign package cannot name, construct or impersonate an
+  unexported struct type, and a type assertion has no user-defined hook. It
+  stores the `*url.URL`s and applies `refusalHost`/`refusalScheme` inside
+  `Error()`, so the grammar is applied on the way OUT rather than trusted to
+  the construction site. `errRedirectRefused` survives only as the sentinel
+  callers match with `errors.Is`, via an `Is` method on our own type — us
+  answering about ourselves, not believing a stranger. Chain walks are
+  depth-bounded (`maxUnwrapDepth`) since `Unwrap` is also the caller's method.
+  `safeOp` allowlists `url.Error.Op` to the ten values net/http and net/url
+  emit.
+
+  **MINOR — exemption granularity.** The #6606 exemption named only a file and
+  a function, so every unsafe handler inside `resolveDyndns2Endpoint` was
+  exempt; fixing the one that exists while adding another kept it satisfied.
+  It now pins file + function + PRODUCER + error variable, and the gate asserts
+  it covers exactly ONE site.
+
+  **Doc corrections Codex raised**: the zone note said "link-local", which is
+  wrong for a zone on a global or IPv4-mapped literal (now "IPv6 zone id
+  withheld"); the "one of three notes" claim did not cover an out-of-range
+  port, which is dropped silently and is now documented as such; the residual
+  now also names the numeric-password-as-port case, drops the incorrect "a SYN
+  exposes the DNS name" reasoning, and states plainly that "disclosed
+  elsewhere" justifies those two cases specifically rather than licensing
+  secrets in logs generally.
+
+  **The inner-error render is now guaranteed to be** exactly one of: a
+  `transportReason` constant declared in backend_http.go, or a
+  `*redirectRefusal` rendered from fixed prose plus `refusalHost`/
+  `refusalScheme` output. No error's own `Error()` text and no Go type name
+  reach the output on any path.
+
+  **Validation**: mutation-proven in a THROWAWAY detached worktree
+  (`/dev/shm/probe-6594k`), build + vet CLEAN so every red is an ASSERTION,
+  using Codex's shapes (forged `Is`, forged `url.Error.Op`, out-of-table errno,
+  `reflect.StructOf` tag). Over-reach floors green: connection refused, no
+  route to host, the DNS/x509 classes, the OpError stage, and both forms of the
+  cross-host refusal still surface, and a valid credentialed URL still renders
+  its host. `TestDDNSURLErrorRendersGoThroughScrubber` passes with its floor
+  intact (14 sites, floor 12). gofmt clean; go vet clean; full `go test ./...`
+  green. No cluster smoke: control-plane logging hygiene only.
+- **File(s)**: pkg/ddns/{backend_http.go,url_render_class_6545_test.go,README.md},
+    _Log.md

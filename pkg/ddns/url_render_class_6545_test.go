@@ -3,10 +3,12 @@ package ddns
 import (
 	"context"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -14,12 +16,25 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"syscall"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
 )
+
+// mustParseURL is a test helper for building the *url.URL fields a
+// redirectRefusal carries.
+func mustParseURL(t *testing.T, s string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(s)
+	if err != nil {
+		t.Fatalf("parse %q: %v", s, err)
+	}
+	return u
+}
 
 // url_render_class_6545_test.go: the CLASS gate for URL rendering in pkg/ddns
 // (#6545 review round 6).
@@ -96,15 +111,217 @@ const hostSentinel = "ZONE-PASSWORD-MUST-NOT-LOG"
 // Written out as literals, not built by calling the code under test, so a change
 // to the rendering has to be made HERE too rather than tracking itself.
 const (
-	zoneNote   = " (link-local zone id withheld)"
+	zoneNote   = " (IPv6 zone id withheld)"
 	hostNote   = " (host withheld: not a plain host name)"
 	schemeNote = " (url withheld: scheme is not http or https)"
 )
 
 // wantSyntheticRender is how the classifier renders errSyntheticTransport: an
-// error whose CLASS it cannot recognise is withheld down to its Go type. Again a
-// literal, so this pins the contract instead of restating the implementation.
-const wantSyntheticRender = "transport error withheld (*errors.errorString)"
+// error whose CLASS it cannot recognise is withheld to a FIXED CONSTANT. Round 7
+// appended the Go type via %T on the reasoning that a type name is a
+// compile-time symbol; round 8 removed that — reflect.StructOf builds a runtime
+// type whose name embeds an input-derived struct TAG, so %T is an input channel.
+// A literal here, so this pins the contract instead of restating the code.
+const wantSyntheticRender = "transport error withheld"
+
+// forgedIsError is Codex's round-8 attack in its purest form: an error that
+// LIES about its identity. errors.Is dispatches to this method, so any check of
+// the shape "is this error one of ours?" answers YES — and round 7 then printed
+// Error() verbatim as a trusted refusal.
+//
+// This is reachable by construction: CheckIP takes a caller-supplied
+// *http.Client, so its RoundTripper's errors are arbitrary values.
+type forgedIsError struct{ text string }
+
+func (e forgedIsError) Error() string      { return e.text }
+func (e forgedIsError) Is(error) bool      { return true }
+func (e forgedIsError) As(target any) bool { return false }
+func (e forgedIsError) Unwrap() error      { return nil }
+func (e forgedIsError) Timeout() bool      { return true }
+func (e forgedIsError) Temporary() bool    { return true }
+func (e forgedIsError) private()           {}
+
+var _ error = forgedIsError{}
+
+// CodexBaseError is the embedded base for the reflect.StructOf attack. It must
+// be EXPORTED (reflect.StructOf panics on an unexported field name, and an
+// embedded field is named for its type) and must carry exactly ONE method —
+// reflect refuses to promote from an embedded type with methods when the struct
+// has more than one field, and a fatter base hits other limits. Method
+// promotion through StructOf is what makes the built type satisfy `error` and
+// therefore reach the renderer.
+type CodexBaseError struct{}
+
+func (CodexBaseError) Error() string { return "codex base" }
+
+// backendHTTPSourceFile is the file the transportReason gate reads.
+const backendHTTPSourceFile = "backend_http.go"
+
+// transportClassifiers are the functions whose EVERY return must name a
+// declared transportReason constant. classifyTransportError may additionally
+// return a direct call to one of these, which is how errnoReason is reached.
+var transportClassifiers = map[string]bool{
+	"classifyTransportError": true,
+	"errnoReason":            true,
+}
+
+// TestClassifyTransportErrorReturnsOnlyConstants is the round-8 structural
+// gate, and the direct analogue of TestURLParseCauseReturnsOnlyDeclaredConstants
+// next door.
+//
+// The behavioural gates catch the leaks someone thought to plant. This one
+// covers branches no input reaches, and it is what makes the closed
+// transportReason type mean something: the type alone stops `return text` from
+// COMPILING, but an explicit transportReason(x) conversion compiles fine, and
+// round 7 shipped THREE of them — errnoReason's Errno.Error() passthrough, the
+// OpError op+net concatenation, and the %T fallback. Every one turned out to be
+// an input channel.
+//
+// IT RESOLVES, IT DOES NOT NAME-MATCH. A local variable shadowing a constant
+// name would satisfy a string comparison while returning arbitrary text, which
+// is exactly how the reviewer walked the first version of the urlParseCause
+// gate. go/types is asked what each returned identifier actually IS.
+func TestClassifyTransportErrorReturnsOnlyConstants(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, backendHTTPSourceFile, nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse %s: %v", backendHTTPSourceFile, err)
+	}
+
+	// Type-check backend_http.go on its own. Import errors are EXPECTED and
+	// ignored; what must work is package-scope resolution of our own constants.
+	info := &types.Info{
+		Defs: map[*ast.Ident]types.Object{},
+		Uses: map[*ast.Ident]types.Object{},
+	}
+	conf := types.Config{
+		Importer:                 unresolvedImporter{},
+		Error:                    func(error) {},
+		DisableUnusedImportCheck: true,
+	}
+	pkg, _ := conf.Check("ddns", fset, []*ast.File{file}, info)
+	if pkg == nil {
+		t.Fatal("go/types returned no package for " + backendHTTPSourceFile +
+			"; the gate cannot resolve identifiers and must not silently pass")
+	}
+	if len(info.Uses) == 0 {
+		t.Fatal("go/types resolved no identifier uses in " + backendHTTPSourceFile +
+			"; the gate would pass vacuously")
+	}
+
+	// Non-vacuity of the resolution: transportReason must be a named type in
+	// package scope and at least one of its constants must resolve.
+	reasonType := pkg.Scope().Lookup("transportReason")
+	if _, isType := reasonType.(*types.TypeName); !isType {
+		t.Fatalf("package scope does not resolve transportReason to a type (got %T); "+
+			"the resolution this gate depends on is broken", reasonType)
+	}
+	declared := 0
+	for _, name := range pkg.Scope().Names() {
+		c, isConst := pkg.Scope().Lookup(name).(*types.Const)
+		if isConst && types.Identical(c.Type(), reasonType.Type()) {
+			declared++
+		}
+	}
+	if declared == 0 {
+		t.Fatal("found no transportReason constants; this gate cannot work and must not " +
+			"silently pass")
+	}
+
+	checked := map[string]int{}
+	for _, decl := range file.Decls {
+		fn, isFunc := decl.(*ast.FuncDecl)
+		if !isFunc || fn.Recv != nil || !transportClassifiers[fn.Name.Name] {
+			continue
+		}
+		// The signature is half the invariant: widening the result to `string`
+		// would re-open the bare `return text` form the closed type forbids.
+		if fn.Type.Results == nil || len(fn.Type.Results.List) != 1 {
+			t.Fatalf("%s must return exactly one result", fn.Name.Name)
+		}
+		resultType, isIdent := fn.Type.Results.List[0].Type.(*ast.Ident)
+		if !isIdent || resultType.Name != "transportReason" {
+			t.Fatalf("%s returns %v, want the closed transportReason type", fn.Name.Name,
+				fn.Type.Results.List[0].Type)
+		}
+
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			// Do NOT descend into a closure: its returns are the closure's, and
+			// counting them would let one satisfy the floor below while the real
+			// body was gutted.
+			if _, isFuncLit := n.(*ast.FuncLit); isFuncLit {
+				return false
+			}
+			ret, isReturn := n.(*ast.ReturnStmt)
+			if !isReturn || len(ret.Results) != 1 {
+				return true
+			}
+			checked[fn.Name.Name]++
+			pos := fset.Position(ret.Pos())
+
+			// Form (ii): a direct call to a sibling classifier, itself gated.
+			if call, isCall := ret.Results[0].(*ast.CallExpr); isCall {
+				callee, isCalleeIdent := call.Fun.(*ast.Ident)
+				if isCalleeIdent && transportClassifiers[callee.Name] {
+					return true
+				}
+				t.Errorf("%s: %s returns a call that is not a gated classifier. "+
+					"Only %v may be returned as calls; everything else must be a "+
+					"declared constant.", pos, fn.Name.Name, sortedKeys(transportClassifiers))
+				return true
+			}
+
+			// Form (i): a bare identifier resolving to a package-scope
+			// transportReason CONSTANT.
+			id, isIdentResult := ret.Results[0].(*ast.Ident)
+			if !isIdentResult {
+				t.Errorf("%s: %s returns %T, not a bare identifier. A conversion, a "+
+					"concatenation or a fmt.Sprintf here is how an error's own text "+
+					"gets out — round 7 shipped three of them (Errno.Error(), "+
+					"OpError op+net, and %%T) and all three were input channels.",
+					pos, fn.Name.Name, ret.Results[0])
+				return true
+			}
+			obj := info.Uses[id]
+			c, isConst := obj.(*types.Const)
+			if !isConst {
+				t.Errorf("%s: %s returns %q, which go/types resolves to %T, not a "+
+					"constant. A local variable that merely SPELLS a constant's name "+
+					"shadows it and carries arbitrary text out.", pos, fn.Name.Name, id.Name, obj)
+				return true
+			}
+			if c.Parent() != pkg.Scope() {
+				t.Errorf("%s: %s returns %q, a constant that is NOT package-scope; "+
+					"a local const declared from input satisfies a name check but not this one",
+					pos, fn.Name.Name, id.Name)
+				return true
+			}
+			if !types.Identical(c.Type(), reasonType.Type()) {
+				t.Errorf("%s: %s returns %q of type %v, want transportReason",
+					pos, fn.Name.Name, id.Name, c.Type())
+			}
+			return true
+		})
+	}
+
+	// Non-vacuity floor: both classifiers must have been found and walked.
+	for name := range transportClassifiers {
+		if checked[name] == 0 {
+			t.Errorf("no single-value returns were checked in %s. If it was renamed or "+
+				"inlined, move this gate with it rather than letting it pass vacuously.", name)
+		}
+	}
+}
+
+// sortedKeys renders a set deterministically for an error message.
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // TestScrubURLErrorRendersOnlySchemeAndHost pins the scrub by EXACT EQUALITY.
 //
@@ -361,6 +578,102 @@ func TestScrubInnerErrorWithholdsURLFromArbitraryTransportError(t *testing.T) {
 	}
 }
 
+// TestScrubInnerErrorResistsForgedProvenance is the round-8 gate.
+//
+// Round 7 made scrubInnerError "total" by asking, of each error, whether its
+// PROVENANCE was known — and every way of asking that question routes through
+// something a caller-supplied error controls. Codex demonstrated four:
+//
+//  1. errors.Is dispatches to the error's own Is(error) bool. An error whose Is
+//     always returns true was accepted as one of our own redirect refusals and
+//     its Error() — the request URL — printed verbatim.
+//  2. url.Error.Op was never rebuilt, so a RoundTripper returning
+//     &url.Error{Op: req.URL.String(), URL: "https://safe.example/"} leaked the
+//     whole URL through the one field the scrub skipped.
+//  3. syscall.Errno.Error() is NOT a closed table — an unknown value renders
+//     "errno 65432", so a numeric credential survived the "kernel vocabulary"
+//     argument.
+//  4. %T is not a compile-time symbol. reflect.StructOf builds a runtime type
+//     whose NAME embeds a struct tag, and the tag is input.
+//
+// The fix is not a better provenance check — it is that no error's own Error()
+// or type name reaches the output at all. These cases assert that.
+func TestScrubInnerErrorResistsForgedProvenance(t *testing.T) {
+	const cred = "FORGED-CREDENTIAL-MUST-NOT-LOG"
+	urlStr := "https://checkip.example/v1/" + cred + "/myip"
+
+	// A RUNTIME type whose NAME embeds input, via a struct tag. reflect promotes
+	// CodexBaseError's Error method, so the value satisfies `error` and reaches
+	// the renderer; %T then prints the whole synthesized type, tag included.
+	forgedType := reflect.StructOf([]reflect.StructField{{
+		Name:      "CodexBaseError",
+		Type:      reflect.TypeOf(CodexBaseError{}),
+		Anonymous: true,
+		Tag:       reflect.StructTag(`secret:"` + cred + `"`),
+	}})
+
+	for _, tc := range []struct {
+		name string
+		make func(req *http.Request) error
+	}{
+		{"error whose Is() always says true, text is the URL", func(req *http.Request) error {
+			return forgedIsError{text: req.URL.String()}
+		}},
+		{"forged url.Error carries the URL in Op", func(req *http.Request) error {
+			return &url.Error{
+				Op:  req.URL.String(),
+				URL: "https://safe.example/",
+				Err: errors.New("x"),
+			}
+		}},
+		{"unknown errno renders dynamically", func(req *http.Request) error {
+			// A numeric credential steered into the errno slot. 65432 is far
+			// outside the kernel's table, so Errno.Error() formats it.
+			return syscall.Errno(65432)
+		}},
+		{"runtime type name carries an input-derived struct tag", func(req *http.Request) error {
+			return reflect.New(forgedType).Elem().Interface().(error)
+		}},
+		{"forged Is() nested under a real url.Error", func(req *http.Request) error {
+			return &url.Error{Op: "Get", URL: req.URL.String(),
+				Err: forgedIsError{text: req.URL.String()}}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return nil, tc.make(req)
+			})}
+			_, ok, err := CheckIP(context.Background(), client, urlStr, true, nil)
+			if ok {
+				t.Fatal("a failing transport must not yield an observation")
+			}
+			if err == nil {
+				t.Fatal("a transport failure must be reported; got nil, so this test is vacuous")
+			}
+			if !strings.Contains(err.Error(), "request failed") {
+				t.Fatalf("CheckIP err = %q, want the transport-failure error; the test is not "+
+					"exercising doRequest/scrubURLError", err)
+			}
+			if strings.Contains(err.Error(), cred) {
+				t.Fatalf("a caller-supplied error smuggled its own text into the rendered "+
+					"error:\n  error = %q\n"+
+					"PROVENANCE IS FORGEABLE. errors.Is/As dispatch to methods the error "+
+					"defines; url.Error.Op is caller-set; syscall.Errno.Error() is not a "+
+					"closed table; %%T is not a compile-time symbol (reflect.StructOf). The "+
+					"rendered text must come from THIS package's declared constants — plus "+
+					"*redirectRefusal, found by TYPE ASSERTION, which cannot be impersonated "+
+					"from outside the package.", err)
+			}
+		})
+	}
+	// The unknown errno must also not surface its numeric form at all.
+	if got := scrubInnerError(syscall.Errno(65432)); strings.Contains(got, "65432") {
+		t.Fatalf("scrubInnerError(syscall.Errno(65432)) = %q; an errno outside the allowlist "+
+			"must be withheld, not formatted — Errno.Error() renders unknown values as "+
+			"\"errno N\", which is a channel for a numeric credential", got)
+	}
+}
+
 // TestScrubInnerErrorKeepsRecognisedDiagnostics is the over-reach floor for the
 // totality fix above. Withholding everything would satisfy the leak test and
 // destroy the package's diagnostics, so the classes an operator actually reads
@@ -376,13 +689,22 @@ func TestScrubInnerErrorKeepsRecognisedDiagnostics(t *testing.T) {
 		{"errno wrapped by net.OpError", &net.OpError{
 			Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED,
 		}, "connection refused"},
+		{"no route to host", syscall.EHOSTUNREACH, "no route to host"},
+		{"opError with no recognised errno", &net.OpError{
+			Op: "dial", Net: "tcp", Err: errors.New("x"),
+		}, "dial failed"},
 		{"context deadline", context.DeadlineExceeded, "context deadline exceeded"},
 		{"dns not found", &net.DNSError{Err: "x", Name: hostSentinel, IsNotFound: true},
 			"dns lookup failed: no such host"},
 		{"unknown authority", x509.UnknownAuthorityError{},
 			"tls: certificate signed by unknown authority"},
-		{"our own redirect refusal", fmt.Errorf("%w: refusing cross-host redirect from a to b",
-			errRedirectRefused), "refusing cross-host redirect from a to b"},
+		{"our own redirect refusal", &redirectRefusal{
+			reason: redirectReasonCrossHost,
+			from:   mustParseURL(t, "https://prov.example/a"),
+			to:     mustParseURL(t, "https://evil.example/b"),
+		}, "refusing cross-host redirect from prov.example to evil.example"},
+		{"our own refusal, wrapped by the http client", fmt.Errorf("wrapped: %w",
+			&redirectRefusal{reason: redirectReasonHopCap}), "stopped after 10 redirects"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := scrubInnerError(tc.err)
@@ -392,6 +714,13 @@ func TestScrubInnerErrorKeepsRecognisedDiagnostics(t *testing.T) {
 					"classes an operator diagnoses from.", tc.err, got, tc.want)
 			}
 		})
+	}
+	// The refusal path must be reachable ONLY by our own type. An impostor that
+	// answers errors.Is(…, errRedirectRefused) with true must NOT be rendered.
+	if got := scrubInnerError(forgedIsError{text: "IMPOSTOR-TEXT"}); strings.Contains(got, "IMPOSTOR-TEXT") {
+		t.Fatalf("scrubInnerError rendered an impostor's text: %q\n"+
+			"The refusal must be found by TYPE ASSERTION on the unexported *redirectRefusal, "+
+			"never by errors.Is on a sentinel — errors.Is asks the error itself.", got)
 	}
 	// And the classifier must not smuggle host text out of a class it recognises:
 	// net.DNSError.Name is the request host.
@@ -626,7 +955,19 @@ var urlErrorRenderers = map[string]bool{
 // It is written to SELF-EXPIRE: the gate asserts the exemption is actually HIT,
 // so when #6606 lands this test goes red and forces the stale exemption out
 // instead of quietly widening the hole for whatever moves in next.
-var issue6606Exemption = struct{ file, fn string }{"backend_dyndns2.go", "resolveDyndns2Endpoint"}
+// ROUND 8 MADE IT SITE-SPECIFIC. It used to name only a FILE and a FUNCTION, so
+// every unsafe handler inside resolveDyndns2Endpoint was exempt: fixing the one
+// that exists while adding a different unsafe handler in the same function kept
+// the exemption satisfied and the new leak silent. It now pins the exact
+// PRODUCER and error variable, and the gate additionally requires that exactly
+// ONE unsafe site exists in that function — a second one is not exempt, it is a
+// failure.
+var issue6606Exemption = struct{ file, fn, producer, errVar string }{
+	file:     "backend_dyndns2.go",
+	fn:       "resolveDyndns2Endpoint",
+	producer: "url.Parse",
+	errVar:   "err",
+}
 
 // minURLErrorSites is the non-vacuity floor. If a refactor renames the
 // producers or restructures the error handling, the walk must not silently
@@ -649,6 +990,7 @@ func TestDDNSURLErrorRendersGoThroughScrubber(t *testing.T) {
 	fset := token.NewFileSet()
 	sites := 0
 	exemptionHit := false
+	exemptedSites := 0
 
 	for _, entry := range entries {
 		name := entry.Name()
@@ -669,15 +1011,22 @@ func TestDDNSURLErrorRendersGoThroughScrubber(t *testing.T) {
 				for _, site := range urlErrorHandlers(n, aliases) {
 					sites++
 					bad := unscrubbedUses(fset, site.stmts, site.errVar, aliases)
-					if name == issue6606Exemption.file && fn.Name.Name == issue6606Exemption.fn {
-						// The exemption is only HIT when the site is still
-						// UNSAFE. Recording the hit merely because a handler
-						// exists here (the round-6 form) meant sanitizing the
-						// site left the exemption standing and green — the exact
-						// opposite of self-expiring.
-						if len(bad) > 0 {
-							exemptionHit = true
-						}
+					if len(bad) > 0 && name == issue6606Exemption.file &&
+						fn.Name.Name == issue6606Exemption.fn &&
+						site.producer == issue6606Exemption.producer &&
+						site.errVar == issue6606Exemption.errVar {
+						// The exemption is only HIT when the EXACT pinned site is
+						// still UNSAFE. Round 6 recorded the hit merely because a
+						// handler existed in this function, so sanitizing the
+						// site left the exemption standing and green — the
+						// opposite of self-expiring. Round 8 narrowed it from
+						// file+function to file+function+producer+variable, so a
+						// DIFFERENT unsafe handler moving into the same function
+						// is not covered by it (it falls through and fails), and
+						// exemptedSites below rejects a second copy of even the
+						// pinned shape.
+						exemptionHit = true
+						exemptedSites++
 						continue
 					}
 					for _, pos := range bad {
@@ -703,9 +1052,16 @@ func TestDDNSURLErrorRendersGoThroughScrubber(t *testing.T) {
 			"that matches nothing passes vacuously", sites, minURLErrorSites)
 	}
 	if !exemptionHit {
-		t.Errorf("the #6606 exemption for %s/%s was never hit. If that site was fixed, DELETE "+
-			"the exemption — leaving it standing silently exempts whatever occupies that "+
-			"function next.", issue6606Exemption.file, issue6606Exemption.fn)
+		t.Errorf("the #6606 exemption for %s/%s (%s -> %q) was never hit. If that site was "+
+			"fixed, DELETE the exemption — leaving it standing silently exempts whatever "+
+			"occupies that slot next.", issue6606Exemption.file, issue6606Exemption.fn,
+			issue6606Exemption.producer, issue6606Exemption.errVar)
+	}
+	if exemptedSites > 1 {
+		t.Errorf("the #6606 exemption covered %d sites, want exactly 1. It names ONE known "+
+			"leak. A second handler of the same shape in %s/%s is a NEW leak and must be "+
+			"fixed, not absorbed by an exemption written for a different one.",
+			exemptedSites, issue6606Exemption.file, issue6606Exemption.fn)
 	}
 }
 
@@ -782,8 +1138,9 @@ func forEachProductionFunc(t *testing.T, visit func(name string, file *ast.File,
 // handlerSite is one place a URL-bearing error is handled: the error variable's
 // name and every statement the value can still be read from.
 type handlerSite struct {
-	errVar string
-	stmts  []ast.Stmt
+	errVar   string
+	producer string // the call whose error this is, e.g. "url.Parse"
+	stmts    []ast.Stmt
 }
 
 // urlErrorHandlers recognises the two shapes in which a URL-bearing error is
@@ -817,7 +1174,7 @@ func urlErrorHandlers(n ast.Node, aliases map[string]string) []handlerSite {
 		// Shape 1: the assignment is a preceding statement in the same block.
 		var sites []handlerSite
 		for i := 0; i+1 < len(node.List); i++ {
-			errVar := producedErrVar(node.List[i], aliases)
+			errVar, producer := producedErrVar(node.List[i], aliases)
 			if errVar == "" {
 				continue
 			}
@@ -829,7 +1186,7 @@ func urlErrorHandlers(n ast.Node, aliases map[string]string) []handlerSite {
 				}
 			}
 			if len(reach) > 0 {
-				sites = append(sites, handlerSite{errVar: errVar, stmts: reach})
+				sites = append(sites, handlerSite{errVar: errVar, producer: producer, stmts: reach})
 			}
 		}
 		return sites
@@ -838,31 +1195,35 @@ func urlErrorHandlers(n ast.Node, aliases map[string]string) []handlerSite {
 		if node.Init == nil {
 			return nil
 		}
-		errVar := producedErrVar(node.Init, aliases)
+		errVar, producer := producedErrVar(node.Init, aliases)
 		if errVar == "" || !testsErrVar(node.Cond, errVar) {
 			return nil
 		}
-		return []handlerSite{{errVar: errVar, stmts: node.Body.List}}
+		return []handlerSite{{errVar: errVar, producer: producer, stmts: node.Body.List}}
 	}
 	return nil
 }
 
 // producedErrVar returns the name of the error variable assigned from a
 // URL-bearing call, or "" if the statement is not such an assignment.
-func producedErrVar(stmt ast.Stmt, aliases map[string]string) string {
+func producedErrVar(stmt ast.Stmt, aliases map[string]string) (errVar, producer string) {
 	assign, isAssign := stmt.(*ast.AssignStmt)
 	if !isAssign || len(assign.Rhs) != 1 || len(assign.Lhs) == 0 {
-		return ""
+		return "", ""
 	}
 	call, isCall := assign.Rhs[0].(*ast.CallExpr)
-	if !isCall || !urlErrorProducers[calleeName(call.Fun, aliases)] {
-		return ""
+	if !isCall {
+		return "", ""
+	}
+	callee := calleeName(call.Fun, aliases)
+	if !urlErrorProducers[callee] {
+		return "", ""
 	}
 	last, isIdent := assign.Lhs[len(assign.Lhs)-1].(*ast.Ident)
 	if !isIdent || last.Name == "_" {
-		return ""
+		return "", ""
 	}
-	return last.Name
+	return last.Name, callee
 }
 
 // assignsVar reports whether stmt assigns to name, which ends the reach of the
