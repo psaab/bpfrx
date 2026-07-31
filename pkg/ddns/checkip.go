@@ -332,18 +332,39 @@ const AddressSourceCheckIP AddressSource = "checkip"
 // diagnostic. That is the same discipline backend_generic.go applies to
 // url-template and doRequest applies to transport errors.
 func validateCheckIPURL(u string) error {
-	safe := config.RedactURL(u)
 	parsed, err := url.Parse(u)
 	if err != nil {
 		// Render the parse failure's CAUSE as a plain string and drop the %w
 		// wrap: url.Parse returns a *url.Error whose Error() re-embeds the FULL
 		// raw input, query included, so wrapping it (with %w or %v) would put
-		// the credential straight back into the message the redaction above just
-		// cleaned. scrubURLError is deliberately not reused here — it recovers a
-		// safe URL by RE-PARSING ue.URL, and this URL is precisely the one that
-		// does not parse, so it would fall through to the raw string.
-		return fmt.Errorf("ddns checkip: url %q is not a valid URL: %s", safe, urlParseCause(err))
+		// the credential straight back. Dropping the wrapper is NOT sufficient
+		// either — several inner causes embed input too, one of them unbounded —
+		// so the cause goes through urlParseCause, which only ever returns a
+		// fixed constant. scrubURLError is deliberately not reused here: it
+		// recovers a safe URL by RE-PARSING ue.URL, and this URL is precisely
+		// the one that does not parse, so it would fall through to the raw
+		// string.
+		//
+		// And the URL itself is omitted ENTIRELY from this branch, because
+		// RedactURL cannot be trusted on a string that is not a URL. Its scan is
+		// authority-bounded and keys on '@' to find userinfo, so the single most
+		// likely credentialed typo — omitting the '@' — defeats it completely:
+		// RedactURL("http://user:s3cr3t.example/") returns that string UNCHANGED
+		// (no '@', so no userinfo redaction; no '?', so no query redaction),
+		// putting the password in the message even with the cause sanitized.
+		// A parse failure means there is no authority to bound and no structure
+		// to trust, so nothing derived from the input is safe to print. The
+		// provider name is carried as its own log attribute (and by the
+		// commit-time warning), so the operator can still identify the leaf.
+		return fmt.Errorf("ddns checkip: url is not a valid URL: %s", urlParseCause(err))
 	}
+	// Past this point url.Parse SUCCEEDED, which is exactly what makes
+	// RedactURL sound here: a parsed URL has a well-formed authority
+	// ([userinfo@]host[:port]), any userinfo is delimited by the '@' RedactURL
+	// keys on, and net/url REJECTS a non-numeric port (":abc" is the
+	// invalid-port parse error above), so no credential can be hiding in the
+	// host:port position for RedactURL to miss.
+	safe := config.RedactURL(u)
 	if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
 		return fmt.Errorf("ddns checkip: url %q must be http(s)", safe)
 	}
@@ -353,22 +374,105 @@ func validateCheckIPURL(u string) error {
 	return nil
 }
 
-// urlParseCause renders WHY url.Parse rejected an input without the *url.Error
-// wrapper that carries the raw input string. url.Parse always fails with a
-// *url.Error{Op: "parse", URL: <raw input>, Err: <cause>}, and only the wrapper
-// holds the input: the causes are fixed sentences ("missing protocol scheme",
-// "first path segment in URL cannot contain colon", "net/url: invalid control
-// character in URL") or quote at most the offending fragment from the authority
-// ("invalid URL escape \"%zz\"", "invalid character \"x\" in host name") — never
-// the query string where the credential lives.
+// The reason constants urlParseCause may return. Every one is a compile-time
+// literal — see urlParseCause for why that is the whole safety property.
+const (
+	causeMalformedURL = "malformed URL"
+	causeInvalidPort  = "invalid port after host"
+	causeInvalidHost  = "invalid host"
+	causeBadEscape    = "invalid percent-escape"
+	causeBadHostChar  = "invalid character in host"
+)
+
+// urlParseSafeCauses are the net/url parse failures whose text is a FIXED
+// sentence containing no part of the input. Enumerated deliberately from the
+// Go 1.26.4 net/url/url.go parse path rather than guessed: errors.New at lines
+// 380, 436, 440, 470, 481, 526, 550, 556 and 603. (470 "invalid URI for
+// request" is ParseRequestURI-only and so unreachable through url.Parse; it is
+// listed anyway because this helper is meant to be reusable by the other DDNS
+// URL validators — see #6606.)
 //
-// A non-*url.Error cannot come from url.Parse, so the fallback is unreachable
-// today; it returns a fixed phrase rather than err.Error() so a future stdlib
-// error shape cannot silently reintroduce the leak this function exists to stop.
+// The list is an ALLOWLIST, never a blocklist: anything not on it fails CLOSED
+// to causeMalformedURL, so a stdlib rewording or a brand-new cause degrades the
+// diagnostic instead of opening a leak.
+var urlParseSafeCauses = []string{
+	"missing protocol scheme",
+	"net/url: invalid control character in URL",
+	"empty url",
+	"invalid URI for request",
+	"first path segment in URL cannot contain colon",
+	"net/url: invalid userinfo",
+	"invalid IP-literal",
+	"missing ']' in host",
+}
+
+// urlParseCause renders WHY url.Parse rejected an input, guaranteeing the result
+// carries NO part of that input.
+//
+// THE INVARIANT: every return path yields a compile-time constant. Nothing
+// derived from the argument is ever returned — not even after inspection. That,
+// not any particular enumeration below, is what makes this safe, and it holds
+// no matter how net/url's messages change.
+//
+// The enumeration exists only to keep the message useful. It is NOT sufficient
+// on its own, and two things make that concrete:
+//
+//   - Dropping the *url.Error wrapper is not enough. The wrapper re-embeds the
+//     whole raw URL, but several INNER causes embed input too, and one is
+//     unbounded: fmt.Errorf("invalid port %q after host", colonPort) (url.go
+//     561/630) quotes an arbitrary-length substring. The realistic trigger is an
+//     operator who omits the '@' in a credentialed URL —
+//     "https://user:s3cr3t.example/" parses as host "user", port
+//     ":s3cr3t.example" — so the failure mode puts the PASSWORD in the message.
+//     fmt.Errorf("invalid host: %w", err) (line 600) is unbounded the same way
+//     via netip's ParseAddr("<raw host>"). url.EscapeError (118/127/139) and
+//     url.InvalidHostError (148) quote a bounded 3- and 1-character fragment.
+//
+//   - Switching on the error TYPE cannot work. fmt.Errorf without %w returns
+//     *errors.errorString, which is exactly the type of the SAFE errors.New
+//     causes, so "invalid port \"...\" after host" and "missing protocol scheme"
+//     are indistinguishable by type. Hence the exact-match allowlist for the
+//     fixed sentences, plus class detection for the four input-bearing shapes —
+//     each of which maps to its own constant so the class stays diagnostic
+//     ("invalid port after host" still tells the operator where to look) without
+//     the offending bytes.
 func urlParseCause(err error) string {
 	var ue *url.Error
-	if errors.As(err, &ue) && ue.Err != nil {
-		return ue.Err.Error()
+	if !errors.As(err, &ue) || ue.Err == nil {
+		// Not a url.Parse failure at all (unreachable via url.Parse, which
+		// always wraps). Nothing is known about this text — fail closed.
+		return causeMalformedURL
 	}
-	return "malformed URL"
+	cause := ue.Err.Error()
+
+	// Fixed sentences: return the matched LITERAL from the allowlist, not the
+	// string we compared, so the returned value is a package constant by
+	// construction and not merely equal to one.
+	for _, safe := range urlParseSafeCauses {
+		if cause == safe {
+			return safe
+		}
+	}
+
+	// Input-bearing classes, each collapsed to its own constant. The two typed
+	// ones are matched by type; the two fmt.Errorf ones have no distinguishing
+	// type, so they are matched on the invariant PREFIX that precedes the
+	// interpolated input.
+	var esc url.EscapeError
+	if errors.As(ue.Err, &esc) {
+		return causeBadEscape
+	}
+	var badHost url.InvalidHostError
+	if errors.As(ue.Err, &badHost) {
+		return causeBadHostChar
+	}
+	if strings.HasPrefix(cause, "invalid port \"") {
+		return causeInvalidPort
+	}
+	if strings.HasPrefix(cause, "invalid host: ") {
+		return causeInvalidHost
+	}
+
+	// Unrecognized: fail closed rather than pass an unaudited string through.
+	return causeMalformedURL
 }

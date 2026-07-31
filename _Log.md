@@ -62315,3 +62315,65 @@ break — `go vet` confirmed passing under every revert.
     compiler_warn_checkip_redaction_6545_test.go},
     pkg/daemon/{daemon_ddns_surface_a.go,
     daemon_ddns_checkip_warn_redaction_6545_test.go}, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6545 review fold round 2 (Codex re-gate, security MINOR) — the
+  checkip-url redaction was incomplete: it closed the `*url.Error` WRAPPER leak
+  but left the credential reachable one layer down. Codex reported the inner
+  parse cause; verifying it firsthand against Go 1.26.4 turned up a SECOND
+  surface Codex did not name, and the two together share one root cause — the
+  parse-failure branch was reasoning about a string that is not a URL.
+  (1) INNER CAUSE. `urlParseCause` returned `ue.Err.Error()` unsanitized on the
+  belief that only the wrapper carries input. False: enumerating
+  `net/url/url.go` deliberately (Go 1.26.4) shows
+  `fmt.Errorf("invalid port %q after host", colonPort)` (lines 561/630) and
+  `fmt.Errorf("invalid host: %w", err)` (line 600, via netip `ParseAddr("<raw
+  host>")`) embed UNBOUNDED raw substrings, while `url.EscapeError` (118/127/
+  139) and `url.InvalidHostError` (148) embed bounded 3- and 1-byte fragments.
+  A type switch cannot separate safe from unsafe: `fmt.Errorf` without `%w`
+  returns `*errors.errorString`, the SAME type as the safe `errors.New` causes
+  — verified, not assumed.
+  (2) URL DISPLAY. `config.RedactURL` is authority-bounded and locates userinfo
+  by `@`, so the single most likely credentialed typo — omitting the `@` —
+  defeats it entirely: `RedactURL("http://user:s3cr3t.example/")` returns that
+  string UNCHANGED (no `@`, no `?`), so the password rode out in the redacted
+  display half even with the cause sanitized. Confirmed firsthand; that same
+  input is what produces the unbounded `invalid port ":s3cr3t.example" after
+  host` cause, so one realistic operator mistake hit both surfaces at once.
+  **Fix**: `urlParseCause` now returns ONLY compile-time constants — an
+  exact-match ALLOWLIST of the input-free `net/url` sentences (enumerated from
+  the parse path, returning the matched literal rather than the compared
+  string) plus class detection for the four input-bearing shapes, each mapped
+  to its own constant so the diagnostic survives ("invalid port after host"
+  still points the operator at the right place). Anything unrecognized fails
+  CLOSED to "malformed URL"; so does a non-`*url.Error`. The invariant — every
+  return path is a literal — is the safety property, not the enumeration, and
+  it holds across stdlib rewordings. The parse-FAILURE branch now omits the URL
+  outright, because there is no authority to bound and no structure to trust;
+  `RedactURL` is applied only AFTER `url.Parse` succeeds, where it is provably
+  sound (well-formed authority, `@`-delimited userinfo, and `net/url` rejects a
+  non-numeric port, so nothing can hide in `host:port` — verified: `http://h:abc/x`
+  is a parse error). The commit-time twin in `pkg/config` got the same
+  parse-first split. The helper is left safe for #6606 to reuse, per the
+  coordinator's note; #6606 itself is NOT touched here.
+  **Validation**: RED-on-revert in a THROWAWAY detached worktree
+  (`/dev/shm/probe-6594c`), build+vet CLEAN there so the red is an assertion.
+  New coverage: sentinels planted INSIDE the malformed portion (port via the
+  missing-`@` typo, IP-literal host, bad percent-escape) in the package test,
+  the rendered-daemon test, and the commit-warning test — the round-1 sentinels
+  all sat in a well-formed userinfo/query and could not see either surface.
+  `TestURLParseCauseAlwaysReturnsAConstant` asserts the closed-constant-set
+  invariant over a hostile corpus plus degenerate inputs;
+  `TestValidateCheckIPURLOmitsUnparseableURL` pins the structural rule using a
+  benign legible host, independent of any sentinel. Per Codex's note,
+  `TestCheckIPValidURLStillAccepted` keeps its USERINFO cases as the load-bearing
+  guard (`url.Parse` rejects `<redacted>@host` with "invalid userinfo") and
+  documents that a query-only case would be vacuous, since `?<redacted>` parses
+  fine. `gofmt -l` clean on every touched file; `go build ./...`,
+  `go vet ./pkg/ddns/ ./pkg/config/ ./pkg/daemon/`, and the FULL `go test ./...`
+  suite green (59 packages ok, exit 0). No cluster smoke: control-plane logging
+  hygiene only.
+- **File(s)**: pkg/ddns/{checkip.go,checkip_url_redaction_6545_test.go,README.md},
+    pkg/config/{compiler_validate_warn_ddns.go,
+    compiler_warn_checkip_redaction_6545_test.go},
+    pkg/daemon/daemon_ddns_checkip_warn_redaction_6545_test.go, _Log.md

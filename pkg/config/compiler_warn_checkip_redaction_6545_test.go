@@ -26,6 +26,13 @@ func TestCheckIPURLWarningRedactsCredential(t *testing.T) {
 	}{
 		{"key in query", "ftp://checkip.example/?apikey=" + checkIPWarnCredential},
 		{"key in userinfo", "ftp://user:" + checkIPWarnCredential + "@checkip.example/"},
+		// The missing-'@' typo: the value does NOT parse, and RedactURL is
+		// authority-bounded and keys on '@', so it returns this string
+		// unchanged. Redacting is therefore not enough here — the URL has to be
+		// omitted from the warning entirely, matching the pkg/ddns runtime gate.
+		{"key lands in the port (missing @)", "http://user:" + checkIPWarnCredential + ".example/"},
+		// Credential inside a malformed IP-literal host.
+		{"key in an IP-literal host", "http://user:pass@[" + checkIPWarnCredential + "]/"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tree := buildTree(t, []string{

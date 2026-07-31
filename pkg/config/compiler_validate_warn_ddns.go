@@ -403,13 +403,27 @@ func validateSurfaceADDNSWarnings(cfg *Config) []string {
 		// masquerading as a transient observation failure that suppresses publishing
 		// indefinitely (#2773). The runtime CheckIP gate fails closed regardless.
 		if p.CheckIPURL != "" && !ddnsCheckIPURLValid(p.CheckIPURL) {
-			// RedactURL the checkip-url for the same reason as the url-template
+			// Redact the checkip-url for the same reason as the url-template
 			// above: it commonly carries the endpoint's API key in its query
 			// ("https://checkip.example/?apikey=SECRET") or its userinfo, and a
 			// commit warning is surfaced to the operator AND written to the log.
-			warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
-				"provider %q checkip-url %q is not a valid http(s) URL with a host; "+
-				"scopes using address-source checkip publish nothing", name, RedactURL(p.CheckIPURL)))
+			//
+			// RedactURL is only sound once url.Parse has SUCCEEDED — its scan is
+			// authority-bounded and finds userinfo via '@', so the commonest
+			// credentialed typo, a missing '@' ("https://user:s3cr3t.example/"),
+			// passes straight through it unredacted. When the value does not
+			// parse there is no structure to trust, so the URL is omitted
+			// entirely and the provider name carries the diagnosis. This mirrors
+			// pkg/ddns validateCheckIPURL, the authoritative runtime gate.
+			if _, perr := url.Parse(p.CheckIPURL); perr != nil {
+				warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
+					"provider %q checkip-url is not a valid http(s) URL with a host; "+
+					"scopes using address-source checkip publish nothing", name))
+			} else {
+				warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
+					"provider %q checkip-url %q is not a valid http(s) URL with a host; "+
+					"scopes using address-source checkip publish nothing", name, RedactURL(p.CheckIPURL)))
+			}
 		}
 
 		// checkip-allowlist is a bogus-IP safety gate: each entry is an address

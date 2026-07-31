@@ -188,23 +188,46 @@ signal at all, the class #2773/#3737 closed for the publish path.
 
 **The reported reason is credential-free.** Making the failure operator-visible
 also made it operator-LOGGED: the daemon writes the error as a `slog.Warn`
-attribute AND retains its text as the `checkIPProbeWarned` dedup map key. A
-`checkip-url` routinely carries an API key in its query or userinfo, so
-`validateCheckIPURL` renders the URL through `config.RedactURL` in all three
-refusal branches instead of interpolating the raw value. The parse-failure
-branch additionally does NOT `%w`-wrap `url.Parse`'s error: `*url.Error.Error()`
-re-embeds the full raw input, query included, which would defeat the redaction —
-only the inner cause is rendered (`urlParseCause`), which is a fixed sentence or
-at most the offending authority fragment. `scrubURLError` is not reusable here
-because it recovers a safe URL by RE-PARSING, and this is precisely the URL that
-does not parse. The commit-time mirror
-(`config.validateSurfaceADDNSWarnings`) redacts the same way.
-`TestValidateCheckIPURLRedactsCredentials` /
+attribute AND retains its text as the `checkIPProbeWarned` dedup map key — so a
+leak there is both journalled and resident in memory for the process lifetime. A
+`checkip-url` routinely carries an API key in its query or userinfo. Three
+distinct surfaces had to be closed, and the split between them is structural:
+
+- **The `*url.Error` wrapper.** `(*url.Error).Error()` re-embeds the complete
+  raw URL, query included, so the parse-failure branch must not `%w`-wrap it.
+- **The inner parse cause.** Dropping the wrapper is *not* sufficient: several
+  `net/url` causes embed input themselves, and two are UNBOUNDED —
+  `invalid port %q after host` and `invalid host: ParseAddr("…")`.
+  (`url.EscapeError` / `url.InvalidHostError` leak a bounded 3- and 1-byte
+  fragment.) Switching on the error *type* cannot separate them: `fmt.Errorf`
+  without `%w` yields `*errors.errorString`, the same type as the safe
+  `errors.New` causes. `urlParseCause` therefore uses an exact-match allowlist
+  of the fixed sentences plus class detection for the four input-bearing shapes,
+  and **every return path is a compile-time constant** — that invariant, not the
+  enumeration, is the safety property, and an unrecognised cause fails CLOSED to
+  `malformed URL`. `TestURLParseCauseAlwaysReturnsAConstant` pins it.
+- **The URL display itself.** `config.RedactURL` is only sound on a string that
+  actually parsed. Its scan is authority-bounded and finds userinfo via `@`, so
+  the commonest credentialed typo — omitting the `@`, as in
+  `https://user:s3cr3t.example/` — passes through it **completely unredacted**.
+  So the parse-failure branch prints no part of the input at all; the provider
+  name (a separate log attribute, and named by the commit warning) carries the
+  diagnosis. Once `url.Parse` has SUCCEEDED, `RedactURL` is sound: the authority
+  is well-formed, userinfo is `@`-delimited, and `net/url` rejects a non-numeric
+  port, so nothing can hide in `host:port`.
+
+`scrubURLError` is not reusable in any of this because it recovers a safe URL by
+RE-PARSING, and this is precisely the URL that does not parse. The commit-time
+mirror (`config.validateSurfaceADDNSWarnings`) applies the same parse-first
+split. `TestValidateCheckIPURLRedactsCredentials`,
+`TestValidateCheckIPURLOmitsUnparseableURL`, and
 `TestCheckIPProbeWarnRedactsCredential` (which asserts on rendered log bytes and
 on the dedup map keys) are the fail-on-revert gates;
 `TestCheckIPValidURLStillAccepted` is the over-reach guard — a credentialed but
 VALID `checkip-url` must still be accepted, since redacting before parsing would
-refuse every keyed endpoint.
+refuse every keyed endpoint. Its userinfo cases are what make it a real guard
+(`url.Parse` rejects `<redacted>@host` with "invalid userinfo"); a query-only
+case would be vacuous, since `?<redacted>` parses fine as a raw query.
 
 ### Withdraw (DeleteLease) semantics per backend (#2772)
 

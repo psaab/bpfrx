@@ -56,6 +56,16 @@ func TestCheckIPProbeWarnRedactsCredential(t *testing.T) {
 		{"no host, key in query", "http://?apikey=" + checkIPWarnSentinel},
 		{"unparseable, key in query", "http://[::1/?apikey=" + checkIPWarnSentinel},
 		{"bad scheme, key in userinfo", "ftp://user:" + checkIPWarnSentinel + "@checkip.example/"},
+		// The cases below plant the key INSIDE the malformed portion, where
+		// RedactURL cannot reach it: the leak then rides out on url.Parse's
+		// inner cause rather than on the *url.Error wrapper. Everything above
+		// keeps the key in a well-formed userinfo/query and so cannot catch it.
+		{"unparseable, key lands in the port (missing @)",
+			"http://user:" + checkIPWarnSentinel + ".example/"},
+		{"unparseable, key in an IP-literal host",
+			"http://user:pass@[" + checkIPWarnSentinel + "]/"},
+		{"unparseable, key after a bad percent-escape",
+			"http://user:%" + checkIPWarnSentinel + "@checkip.example/"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			buf := captureRenderedWarnings(t)
