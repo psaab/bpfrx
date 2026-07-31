@@ -444,7 +444,9 @@ func validateApplicationSyntaxStrict(cfg *Config) error {
 				"application %q: unknown statement %q in the application body; a "+
 					"custom application accepts only protocol / source-port / "+
 					"destination-port / inactivity-timeout / timeout / icmp-type / "+
-					"icmp-code / alg / description / term, each taking a SINGLE value. "+
+					"icmp-code / alg / description / term. Every one of those takes a "+
+					"SINGLE value except `description`, whose unquoted multi-word tail "+
+					"is absorbed when it trails the chain. "+
 					"The token is silently dropped, which changes what the application "+
 					"matches: dropping a port or icmp-type constraint WIDENS it (an "+
 					"unset port matches every port), while dropping an alternative from "+

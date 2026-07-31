@@ -62349,3 +62349,16 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/config/{compiler_applications.go,types_security.go,
     compiler_application_chained_leaves_6524_test.go},
     docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6524 review-fold round 4 (Codex MERGE-NEEDS-MINOR, one residual).
+  The strict-path diagnostic listed every direct leaf as "each taking a SINGLE
+  value", which contradicted the packed multi-word `description` tail this PR
+  deliberately accepts. An operator hitting the message would be told the
+  opposite of the behaviour. Reworded to exempt `description` explicitly. No
+  code change; Codex reproduced all three description AST shapes and their
+  SchemaValidate outcomes, confirmed tolerant poisoning preserves
+  master-enforced sibling leaves, confirmed both recovery orderings permit
+  TCP/22 under the MAJOR revert with every named over-reach guard green, and
+  confirmed collision enumeration and compilation still share the one walk.
+- **File(s)**: pkg/config/compiler_validate_strict_application.go, _Log.md
