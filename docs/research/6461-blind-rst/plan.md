@@ -1,18 +1,15 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.13.0 — THE TERMINAL CUT, round-96 folds (the
-purged-class cold path asserts PARITY not correctness — master's own
-merge keeps the released P1 over the fresh P2, a pre-existing
-purge-aftermath released-tuple family now documented; the purging
-dispatch suppresses the flow-cache insert for the retained decision —
-the one justified hardening delta, closing the close-then-ACK
-stale-P1 pin without forcing installs; the RG-activation crossover and
-the corrected retention bound are documented exactly; the overdue-K
-adopt becomes local-only remove + skip install — the in-place write
-needed an atomic reindex, a counted-class transition, and an
-authority-safe origin to keep alive an entry that is already due; the
-arm-head outcomes are renamed `ExistingResolved`/`PurgedRetained`/
-`SeedEligible` with `SeedInstalled`/`SeedRefused` as results). Ship
+**Status: DRAFT v10.14.0 — THE TERMINAL CUT, round-97 folds (the
+cache suppression is now conditioned on the NEW close-retained marker
+on the shared row — the unconditional version was history-blind and
+reintroduced the #6599 acceleration for ACK-first flows; the overdue-K
+rule reverts to skip-wholesale plus a never-refresh-on-overdue guard —
+the remove-locally shape destroyed probation pre-admission; the
+conflicted state is documented reachable via #6522 OR #6600; the
+sessionless-cache timing delta, the 3-packet close→ACK sequence, the
+cold-path transient-seed HIT, and the 10×/150× retention delta are all
+stated). Ship
 candidate = the Part-A dataplane demote gate plus the wire-free local HA
 rules. The RG-incarnation/retirement/fence-ledger protocol that rounds
 13–82 grew is KILLED (not deferred): its two customers are re-scoped —
@@ -700,7 +697,10 @@ request-build stage:
   resolve-time transient purge fires, master's own machinery keeps the
   packet in the HIT branch on the retained lookup
   (`session_glue/mod.rs:1194-1196` — `resolved = hit.lookup.clone()`),
-  and this plan keeps that dispatch byte-identical: with a WARM next
+  and this plan keeps that dispatch master-split with ONE
+  marker-conditioned delta (the close-retained-marker cache
+  suppression, v10.14.0 — so not byte-identical, round-97 Codex 7):
+  with a WARM next
   hop the packet forwards on the retained decision with no install;
   with a COLD next hop it takes master's own MissingNeighbor seed
   transaction (derive/allocate P2, install the transient
@@ -739,7 +739,10 @@ request-build stage:
   staleness window under a mid-dispatch config change is master's
   documented pre-existing behavior (§7 race (d), the v10.2.0 retreat).
   The close-aware purge gate (§5.6 site-3 supplement) is unchanged and
-  remains the plan's ONLY departure on this path.
+  is the plan's primary departure on this path; the complete
+  departure list is the gate, the close-retained marker, and the
+  marker-conditioned cache suppression (v10.14.0 — the earlier
+  "ONLY departure" phrasing was an overclaim, round-97 Codex 7).
 - **Residual (documented):** TX-completion failure (driver/UMEM ring
   after final admission) is the irreducible unobserved tail — not
   per-packet steerable in any sequence-targeted way. **Runtime-capacity
@@ -1310,29 +1313,31 @@ K-wins and S2-wins cases. **The overdue branch (v10.11.0, round-93 Codex 3 + rou
 wheel-driven, `expire.rs:130-168`, `wheel.rs:39-50`), the encoding
 degenerates (`expires_after_ns = 0` targets the CURRENT tick, and a
 packet per tick boundary ahead of the phase-shifted GC would re-queue
-K forever). The rule (v10.13.0, round-96 Codex 5 — the in-place adopt is
-RETRACTED): an adopt against an overdue probation entry REMOVES K
-locally and installs NOTHING. The in-place adopt could not be made
-safe: decision/metadata carry orientation and owner-RG, so an in-place
-write needs the atomic reindex (`session/mod.rs:1627-1663`), a
-presence-based counted-class transition (a forward→reverse flip leaks
-or double-charges the per-IP count, `install.rs:434-447`,
-`session/mod.rs:1782-1821`, `:901-941`), and an authority-safe origin
-(only `SharedMaterialize` is promotable; shared publication can
-replace the same-key origin, `shared_ops.rs:897-916`, so retaining K's
-stale origin could grant or suppress a later promotion wrongly) — and
-every one of those is machinery to keep alive an entry that is
-already due. Removing K locally (the probation local-only removal:
-no NAT release, no BPF family-key delete, no delta) leaves no
-split-brain (K is gone), no pin (nothing re-queues), no counted-class
-or origin hazard (the normal removal path cleans against K's current
-fields); the packet forwards with the materialized S2 decision in
-hand, and the next packet re-materializes from the shared row with a
-fresh probation clock. The §9 test asserts the removal, the
-local-only cleanup discipline, and decision delivery. The
-§9 test covers the phase-shifted GC regression (adopts at
-one-per-tick can never pin an overdue K) AND decision agreement after
-the in-place adopt. Wording correction: the preserved deadline is
+K forever). The rule (v10.14.0, round-97 Codex 2 — the in-place adopt AND the
+remove-locally shape are both retracted): a materialize against an
+overdue probation entry SKIPS the upsert wholesale — no
+remove/recreate, no restamp, no re-queue, NO REMOVAL (the v10.13.0
+remove-locally shape ran pre-admission, destroying probation on a
+filtered packet and breaking the commit-hook clear path; the v10.12.0
+in-place adopt needed an atomic reindex
+(`session/mod.rs:1627-1663`), a counted-class transition
+(`install.rs:434-447`, `session/mod.rs:1782-1821`, `:901-941`), and an
+authority-safe origin (`entry.rs:242-269`, `shared_ops.rs:897-916`) —
+all machinery to keep alive an entry that is already due) — K keeps
+its existing wheel slot and the GC reaps it on schedule; the packet
+forwards with the materialized S2 decision in hand. The S1/S2
+split-brain window is bounded by the GC lag (sub-tick to one pass)
+and stated. And the commit-hook clear+refresh NEVER applies to an
+overdue probation entry (an overdue entry reaps on schedule even if a
+non-close packet commits against it first — otherwise the commit
+would refresh the stale S1 for a full ordinary timeout, round-94
+Codex 5's residual). "Overdue" means D ≤ `now_ns`; at D == `now_ns`
+strict expiry has not yet occurred (`expire.rs:166-168`), so the
+skip+no-refresh rule is a deliberate one-instant shortening, stated
+(round-97 Codex 8). The §9 test asserts: no upsert, no removal, no
+re-queue, no commit-refresh on overdue entries, decision delivery
+with S2, and the GC reaping K on schedule under one-per-tick
+pressure. Wording correction: the preserved deadline is
 "shorten-only, never extended" — the `last_seen_ns = now_ns` write in
 the non-overdue encoding is the vehicle, not a refresh (the absolute
 deadline D is what is preserved; earlier "immutable/never restamped"
@@ -1499,24 +1504,42 @@ The rules:
   purges and dispatches MASTER-SPLIT (v10.13.0 — the re-entry is
   retracted: warm next hop forwards on the retained lookup, no
   install; cold takes master's seed transaction; the ForwardFlow
-  install/Open happen on the LATER clean-miss packet with a fresh
-  derivation — §5.2 (iv)) — with ONE justified hardening delta
-  (round-96 Codex 2): the PURGING dispatch suppresses the flow-cache
-  insert for the retained decision. The purge just released the tuple;
-  caching the sessionless retained descriptor pins a released tuple
-  (the cache has no idle TTL and is consulted before session
-  resolution, `poll_descriptor/mod.rs:298-327`), and without the
-  suppression the plan's retention would convert a close→ACK sequence
-  into an indefinite stale-P1 pin (master avoids that specific
-  sequence only because its flag-agnostic purge fires on the
-  ineligible close first; master's own ACK-first case pins identically
-  — pre-existing, §7). The suppression forces no install — the next
-  packet clean-misses and installs fresh, converging to master's
-  close-first end-state. Cold-corner delta stated (round-96 Codex 2):
+  install/Open happen per master's own sequence — §5.2 (iv)) — with
+  ONE marker-conditioned hardening delta (v10.14.0, round-97 Codex
+  1/4): the close-aware gate, on retaining a close, marks the retained
+  shared row **close-retained** (a sticky marker on the shared entry —
+  the historical state the purge predicate itself lacks,
+  `promote.rs:48-59` is history-blind and `SyncedSessionEntry`
+  otherwise carries only install-time flags, `worker/mod.rs:375-401`);
+  the marker is sticky across shared republication
+  (`shared_ops.rs:897-916`) — a re-published row may lose it, which
+  self-limits any purge→suppress cycle (below). The PURGING dispatch
+  suppresses the flow-cache insert for the retained decision ONLY when
+  the purged row bears the marker: caching a just-released tuple pins
+  it (the cache has no idle TTL and is consulted before session
+  resolution, `poll_descriptor/mod.rs:298-327`), and the marker
+  condition is what keeps the delta justified — an ACK-first flow (no
+  close ever retained) purges and caches EXACTLY as master (no
+  marker → no suppression → master's cache escape and no forced
+  install, so the round-94 Codex 3 acceleration stays dead), while a
+  close→ACK sequence (marker set) purges on the ACK with the insert
+  suppressed, and the following packet clean-misses and installs fresh
+  with an owned P2 — converging to master's close-first end-state at
+  the cost of ONE extra packet versus master for that sequence
+  (master: purge-on-close + install-on-ACK = 2; the plan: retain,
+  purge+suppress, install = 3 — the documented price of killing the
+  one-shot provenance destruction; not livelock-free by construction:
+  a reverse packet can take reverse-policy denial, and the clean-miss
+  install can fail capacity admission and drop — both master-shared
+  behaviors; the re-import republish cycle self-limits because
+  republication drops the marker, restoring master's cache escape).
+  Cold-corner delta stated (round-96 Codex 2 + round-97 Codex 6):
   master's close purges and seeds CLOSING (2 s/30 s transient reap);
   the plan's retained close lets the later cold ACK seed NON-closing
-  (~300 s transient) — a timeout-class delta on a transient,
-  never-emitting placeholder only.
+  (~300 s transient) — a 10×/150× timeout-class delta on a transient
+  placeholder that still consumes global table/NAT and publishes
+  shared/BPF state (it emits no Open); and the cold packet TWO hits
+  the transient seed (HIT), not a clean miss.
   (v10.8.0 retracts the v10.7.0 rollback + skip-install shape, which
   round-91 Codex killed twice: freeing P2 and then forwarding/buffering
   with the derived decision races the allocator — the existing rollback
@@ -1604,7 +1627,13 @@ adopting the shared decision/metadata, §5.6).
   canonical key ADOPTS the shared decision/metadata wholesale while
   preserving only `last_seen_ns`/`expires_after_ns`/`probation`/alive
   flags (v10.7.0, round-89 Codex 2 + round-90 Codex 3 — §5.6).
-- The transient-purge gate becomes close-aware and the
+- The transient-purge gate becomes close-aware, the retained shared
+  row gains the sticky **close-retained marker** (`SyncedSessionEntry`
+  — an internal shared-map value field, never on the HA wire; set by
+  the gate on each retained close; republication may drop it, which
+  self-limits the suppression cycle), and the purge-dispatch
+  flow-cache insert is suppressed ONLY for marker-bearing rows
+  (v10.14.0, round-97 Codex 1/4), and the
   `ReplacedSyncedLocal` constructor branches on closing flags BEFORE
   `take_synced_local` (v10.8.0, rounds 89-91 Codex — §5.6 site-3
   supplement): a closing-flagged packet (SYN-bearing included, which
@@ -1971,7 +2000,22 @@ untouched.
     mismatches and leaks P2 (`poll_descriptor/mod.rs:4890-4909`,
     `allocator.rs:1398-1404`); the reinjection epilogue consumes the
     retained P1 (`poll_descriptor/mod.rs:5126-5138`) — all
-    master-verbatim, all pre-existing, all riding the #6599 machinery;
+    master-verbatim, all pre-existing, all riding the #6599 machinery.
+    The conflicted state itself is reachable through EITHER the #6600
+    import race OR the #6522 unrefcounted sibling release (a sibling
+    expiry releases the shared token while another worker's/shared row
+    survives — `allocator.rs:742-745`, `:1318-1332`, `:1664-1674`,
+    `worker/loop_body/mod.rs:1490-1505`) — both pre-existing, both
+    their own issues (round-97 Codex 5). The sessionless-cache timing
+    delta (round-97 Codex 3): a cached forwarded decision can keep
+    forwarding after its session entry reaps (the cache checks
+    config/FIB/RG epochs, not session existence, and has no idle
+    eviction — `flow_cache.rs:962-1039`,
+    `flow_cache_hit.rs:295-317`'s touch/accounting no-op on a missing
+    session); master reaches the same sessionless-cache state at the
+    entry's natural expiry — the probation bound reaches it sooner
+    (≤20 s vs the full timeout), a timing delta on a master-reachable
+    state, stated;
     (ii) the RG-activation crossover — a conflicted retained row whose
     RG activates locally stops matching the purge predicate
     (`promote.rs:48-59`), so the next non-close MATERIALIZES/PROMOTES
@@ -2147,16 +2191,17 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   candidate)` in the §5.6 encoding (`last_seen_ns = now_ns`,
   `expires_after_ns = D.saturating_sub(now_ns)`, wheel sum re-derives
   D) — cover BOTH K-wins and S2-wins fixtures (round-92 Codex 3); the
-  OVERDUE-K fixture (D ≤ now at adopt time): K is REMOVED locally
-  (v10.13.0 — the in-place adopt is retracted: it needed an atomic
-  reindex, a counted-class transition, and an authority-safe origin to
-  keep alive an entry that is already due, round-96 Codex 5) — assert
-  the local-only removal discipline (no NAT release, no BPF family-key
-  delete, no delta), NO wheel re-queue, NO install, the packet
-  forwarded with the materialized S2 decision, and the next packet
-  re-materializing from the shared row with a fresh probation clock;
-  one-removal-per-tick pressure ahead of the phase-shifted GC can never
-  pin anything (round-93 Codex 3's pin trace); and
+  OVERDUE-K fixture (D ≤ now at adopt time): the upsert is SKIPPED
+  wholesale (v10.14.0 — no remove/recreate, no restamp, no re-queue,
+  NO removal — the v10.13.0 remove-locally ran pre-admission and broke
+  the commit-hook clear path; the v10.12.0 in-place adopt needed
+  machinery to keep alive an already-due entry): assert K's fields are
+  bit-identical, the packet forwards with the materialized S2
+  decision, the commit-hook clear+refresh NEVER fires on an overdue
+  entry (no S1-for-a-full-timeout resurrection, round-94 Codex 5),
+  the GC reaps K on its existing wheel slot under one-per-tick
+  pressure ahead of the phase-shifted GC (round-93 Codex 3's pin
+  trace), and the S1/S2 divergence is bounded by the GC lag; and
   assert
   repetition across 3× the probation window never extends the clock;
   a non-probation existing entry takes master's
@@ -2549,7 +2594,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.13.0)
+## 11. Open questions for the convergence round (v10.14.0)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
@@ -2596,18 +2641,16 @@ this branch only if the minimal fix proves insufficient.
    deferred refresh (round-88) — is any pre-commit refresh/requeue
    path left for a probation entry (lookup, `touch_if_stale`, promote,
    materialize refresh), and does the commit-hook clear+refresh cover
-   every admission arm? (e) the v10.13.0 end-state: the purged-class
-   dispatch is master-SPLIT (warm: retained-lookup forward, no
-   install, cache-insert suppressed — the one hardening delta; cold:
-   master's own seed transaction, merge-keeps-P1 purge-aftermath
-   included and documented) plus the close-aware purge gate
-   (unconditional retention) — is any close-class state mutation left
-   on peer-synced provenance beyond the scoped #2501 accounting
-   fields; is the #6599 class packet-for-packet master-identical on
-   both paths; does the overdue-K local-only remove close the pin
-   with no split-brain, no counted-class hazard, and no origin
-   hazard; and are the documented #6600 interactions (retention
-   bound, cache corner, RG-activation crossover) now exact?
+   every admission arm? (e) the v10.14.0 end-state: the close-aware
+   purge gate (unconditional retention + the close-retained marker)
+   plus the marker-conditioned cache suppression; the purged-class
+   dispatch otherwise master-split; the overdue-K skip-wholesale with
+   the never-refresh-on-overdue guard — does the marker carry exactly
+   the historical state the suppression needs (ACK-first flows keep
+   master's behavior; close→ACK converges to master's close-first
+   end-state at one extra packet); is any close-class state mutation
+   left on peer-synced provenance beyond the scoped accounting fields;
+   and is the #6600/#6522 interaction documentation now exact?
 
 4. **The emission posture:** master's `expire.rs:342-350` gate is
    UNCHANGED; the additions are the normative mark-creation rules, rule
