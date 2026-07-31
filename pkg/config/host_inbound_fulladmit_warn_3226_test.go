@@ -211,6 +211,37 @@ func hostInboundUnportedWarnings(cfg *Config) []string {
 // RED. The negative case pins that a fully-ported stanza stays quiet, so the
 // advisory cannot degrade into noise on every commit.
 func Test_3226_UnportedSystemServiceEmitsAdvisory(t *testing.T) {
+	// The expected reason class per token, recorded INDEPENDENTLY of
+	// config.HostInboundNoAdmitReason. Reading that map to decide what the
+	// advisory should say would be a tautology: the production wording is
+	// derived from the same map, so any reclassification would be self-
+	// consistent and invisible. Pinning the judgement here means silently
+	// moving a token between classes — e.g. relabelling `rpm`, whose port Junos
+	// documents as operator-configured, as merely unfound — goes RED.
+	wantNoAdmitClass := map[string]string{
+		// Junos DOCUMENTS these ports as operator-chosen over a range.
+		"rpm":  HostInboundNoPortOperatorConfigured,
+		"r2cp": HostInboundNoPortOperatorConfigured,
+		// xpf could not find an authoritative tuple for these.
+		"tcp-encap":         HostInboundNoPortUnsourced,
+		"appqoe":            HostInboundNoPortUnsourced,
+		"high-availability": HostInboundNoPortUnsourced,
+	}
+	for tok := range wantNoAdmitClass {
+		if !HostInboundUnportedSystemServices[tok] {
+			t.Fatalf("wantNoAdmitClass names %q, which is not in HostInboundUnportedSystemServices "+
+				"— the expectation table is stale", tok)
+		}
+		if got := HostInboundNoAdmitReason[tok]; got != wantNoAdmitClass[tok] {
+			t.Errorf("%q is classified %q but should be %q — a token's reason class is a "+
+				"human judgement about the EVIDENCE, not a free parameter: "+
+				"%q means Junos documents the port as operator-chosen, %q means xpf simply "+
+				"could not find it, and telling an operator the wrong one is a lie either way",
+				tok, got, wantNoAdmitClass[tok],
+				HostInboundNoPortOperatorConfigured, HostInboundNoPortUnsourced)
+		}
+	}
+
 	compile := func(t *testing.T, cmds ...string) *Config {
 		t.Helper()
 		cfg, err := CompileConfig(buildTree(t, cmds))
@@ -222,6 +253,10 @@ func Test_3226_UnportedSystemServiceEmitsAdvisory(t *testing.T) {
 
 	// Every unported token draws the advisory when named explicitly.
 	for tok := range HostInboundUnportedSystemServices {
+		if _, ok := wantNoAdmitClass[tok]; !ok {
+			t.Fatalf("no expected reason class recorded for %q in wantNoAdmitClass — add it "+
+				"deliberately; the expectation must be INDEPENDENT of the map under test", tok)
+		}
 		t.Run(tok, func(t *testing.T) {
 			cfg := compile(t,
 				"set security zones security-zone wan host-inbound-traffic system-services "+tok)
@@ -253,7 +288,7 @@ func Test_3226_UnportedSystemServiceEmitsAdvisory(t *testing.T) {
 			// bijection between the sets is asserted in
 			// TestHostInboundUnportedJunosServicesCommit_3226; this pins that the
 			// classification actually reaches the operator.
-			switch HostInboundNoAdmitReason[tok] {
+			switch wantNoAdmitClass[tok] {
 			case HostInboundNoPortOperatorConfigured:
 				if !strings.Contains(got[0], "operator-configured port") {
 					t.Errorf("%q has an operator-configured port; the advisory must say so "+
