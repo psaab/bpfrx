@@ -14,6 +14,10 @@ to the interface name.
   AND on every day-2 commit (#2348). A nil `cfg` stops all relays.
 - `Stats()` — `relay.go`. Per-interface counters.
 - `RelayStats` — `relay.go`.
+- `pendingTable` — `pending.go`. The bounded, expiring outstanding-request
+  table that binds each relayed reply to a request the relay actually
+  forwarded (#6562). Internal; reached through `interfaceRelay.pending`. See
+  "Outstanding-request binding" below.
 - `SetMasterGate(g)` — `relay.go`. Installs the per-interface HA master-state
   gate (#2456); the daemon passes `Daemon.relayMasterGateOpen`. nil = always
   relay (standalone). Read per packet, so failover is followed live.
@@ -41,7 +45,7 @@ carries server-bound options, per RFC 2131 §3.4:
 | `INFORM` | yes (#2153) | client already holds an address, asks only for supplemental parameters (DNS/domain/NTP) |
 | `DECLINE` | yes (#2789) | client detected the offered address already in use (ARP probe) and broadcasts a DHCPDECLINE (RFC 2131 §3.1 step 4, §4.4.1); relayed so the originating server marks the address unavailable instead of re-offering it. Carries no server reply |
 | `RELEASE` | no | unicast by the client directly to its bound server (RFC 2131 §4.4.4) — it routes without relay assistance and is never seen on the relay's client-facing broadcast socket |
-| server reply types (`OFFER`/`ACK`/`NAK`/`FORCERENEW`) | n/a | not client-originated; the client→server gate never sees them. The reverse server→client path (`handleServerResponses`) forwards `OFFER`, `ACK`, `NAK` (#2606), and `FORCERENEW` (#2645) — see the reply matrix below |
+| server reply types (`OFFER`/`ACK`/`NAK`/`FORCERENEW`) | n/a | not client-originated; the client→server gate never sees them. The reverse server→client path (`handleServerResponses`) forwards `OFFER`, `ACK` and `NAK` (#2606) **when they bind to an outstanding request** (#6562); `FORCERENEW` is **refused** (#6562, reversing #2645) — see the reply matrix below |
 
 The `INFORM` reply (a server-issued `ACK` with no `yiaddr` but a real
 `ciaddr`) is delivered by the matrix below via the "flag clear, `yiaddr==0`,
@@ -112,8 +116,9 @@ identity.
 
 ## Reply delivery model (#2076)
 
-Server replies (OFFER/ACK/NAK/FORCERENEW) are delivered to clients honoring the
-RFC 2131 §4.1 broadcast flag:
+Server replies (OFFER/ACK/NAK) that pass the source check (#4163) **and** bind
+to an outstanding request (#6562) are delivered to clients honoring the RFC 2131
+§4.1 broadcast flag:
 
 | Condition | Delivery |
 |-----------|----------|
@@ -136,17 +141,55 @@ has no usable address, and broadcasting also prevents a server that
 erroneously echoes a stale `ciaddr` from steering the NAK into a UDP unicast to
 an address the client does not own.
 
-**DHCPFORCERENEW (#2645).** A server sends `DHCPFORCERENEW` (RFC 3203, message
-type 9) to a client that **already holds a lease** to force it back into the
-`RENEWING` state ahead of its T1 timer (for example, to push a configuration
-change). Before #2645 `handleServerResponses` dropped it via the `default` arm,
-so a server could never reach a relayed client. It is now forwarded. Unlike a
-NAK, FORCERENEW is **not** force-broadcast: the target client owns a current
-address (carried in `ciaddr`, `yiaddr==0`) and answers ARP for it, so the reply
-matrix routes it through the normal "flag clear, `yiaddr==0`, real `ciaddr`"
-UDP-unicast row — the same row that delivers an INFORM `ACK`. The relay only
-forwards the message; RFC 3203's RFC-3118 authentication is end-to-end between
-client and server and is out of scope for the relay agent.
+**DHCPFORCERENEW — REFUSED (#6562, reversing #2645).** A server sends
+`DHCPFORCERENEW` (RFC 3203, message type 9 — defined in §4 "Message layout",
+assigned in §5 "IANA Considerations") to a client that **already holds a lease**
+to force it back into the `RENEWING` state ahead of its T1 timer. #2645 made the
+relay forward it, on the reasoning that RFC 3118 authentication is end-to-end
+between client and server and therefore out of scope for a relay. **That
+reasoning was wrong, and the relay now refuses the message.**
+
+RFC 3203 **§6** (Security Considerations — *not* §5, which is IANA
+Considerations) makes the authentication mandatory, and says why:
+
+> As in some network environments FORCERENEW can be used to snoop and spoof
+> traffic, the FORCERENEW message MUST be authenticated using the procedures as
+> described in [DHCP-AUTH]. FORCERENEW messages failing the authentication
+> should be silently discarded by the client.
+
+A relay **structurally cannot** discharge that MUST:
+
+- RFC 3118 §5.2 defines the key as "K — a secret value shared between the
+  **source and destination** of the message", and notes that "Delayed
+  authentication requires a shared secret key for each client on each DHCP
+  server". The relay is neither endpoint and holds no secret or secret-ID map.
+- RFC 3118 §3 ("Interaction with Relay Agents") casts the relay purely as a
+  transparent mutator whose `giaddr`/`hops`/Option-82 changes are **excluded**
+  from the hash — it is not a party to the authentication.
+- RFC 3118 §5.3 assigns validation to the receiver: "If the MAC computed by the
+  **receiver** does not match the MAC contained in the authentication option,
+  the receiver MUST discard the DHCP message."
+
+Checking only that Option 90 is **present** would be theater: the off-path
+attacker in this threat model already forges the server's source IP, so they can
+equally attach a well-formed Option 90 with a bogus MAC — and since the relay
+cannot check the MAC, a presence test admits exactly the attacker it is meant to
+stop. Most deployed clients do not implement RFC 3118 at all, so nothing
+downstream would catch it either.
+
+Refusing is a **handled condition, not an outage**. RFC 3203 §2.2 specifies the
+server's behavior when the message does not arrive: "If the FORCERENEW message
+is lost, the DHCP server will not receive a DHCP REQUEST from the client and it
+should retransmit the FORCERENEW message using an exponential backoff
+algorithm." Ordinary leasing is untouched — clients still renew at T1/T2. Only
+the server's ability to force an *early* renew through this relay is withdrawn,
+and it is withdrawn **loudly**: every refusal bumps `RepliesDroppedForceRenew`
+and the first one per session logs at `Warn`.
+
+There is deliberately **no opt-in knob** to re-enable forwarding. If a
+deployment genuinely needs relayed FORCERENEW, that is a follow-up that should
+come with a way to actually verify the message, not a flag that restores an
+unverifiable forward.
 
 **Why raw L2 (`l2send_linux.go`).** A client in SELECTING/REQUESTING that
 clears the broadcast flag has **not yet configured** the offered address,
@@ -178,13 +221,24 @@ RFC 768).
   (`RepliesL2Unicast`, `RepliesUnicastCiaddr`, `RepliesBroadcastFlag1`,
   `RepliesBroadcastForced`, `RepliesBroadcastNoTarget`,
   `RepliesBroadcastL2Fallback`, `RepliesBroadcastNak`,
-  `RepliesDroppedUnknownServer`). **`RepliesBroadcastL2Fallback` is the one
+  `RepliesDroppedUnknownServer`, `RepliesDroppedNoRequest`,
+  `RepliesDroppedForceRenew`, `PendingEvicted`).
+  **`RepliesBroadcastL2Fallback` is the one
   to alert on** — it means the raw-L2 path failed (CAP_NET_RAW, driver, or
   MTU) and the relay degraded to broadcast. **`RepliesDroppedUnknownServer`
   (#4163)** counts replies dropped because their source IP was not a
   configured server — a non-zero value is a rogue-reply injection attempt (or
   a multi-homed server unicasting from an unlisted source IP); see "Reply
-  source validation" below. **`RequestsDroppedRateLimit` (#5670)** counts
+  source validation" below. **`RepliesDroppedNoRequest` (#6562)** counts
+  replies dropped because they answered no outstanding relayed request —
+  either an injection that passed the source check, **or a legitimate reply
+  that missed the binding window**, which is a client-visible DHCP failure, so
+  this one must be *watched*, not assumed hostile. **`PendingEvicted` (#6562)**
+  is the early warning that pairs with it: the outstanding-request table is at
+  capacity, so legitimate bindings are being lost.
+  **`RepliesDroppedForceRenew` (#6562)** counts refused DHCPFORCERENEW
+  messages. See "Outstanding-request binding" below.
+  **`RequestsDroppedRateLimit` (#5670)** counts
   client-facing datagrams dropped by the per-interface ingress rate limiter — a
   sustained nonzero value is a flood / amplification attempt (see "Ingress rate
   limit" below). `show ... dhcp-relay` prints this breakdown.
@@ -219,10 +273,83 @@ from the relay's explicit, configured server list.
   presenting as a silent black-hole. If a real deployment needs that, a
   follow-up can add an explicit extra-reply-source allow-list knob; it is not
   needed to close the injection hole.
-- `giaddr`-echo and Option-82 correlation are strictly-stronger secondary
-  checks and are **out of scope** here (Option 82 is stripped on the reply, but
-  not echo-validated); source-set membership is the primary, highest-value
-  control. This is DHCPv4-only (there is no DHCPv6 relay — see below).
+- Source-set membership is necessary but **not sufficient** — a source IP is
+  spoofable. Since #6562 it is the *first* of two checks; see
+  "Outstanding-request binding" immediately below. (`giaddr`-echo and Option-82
+  correlation remain out of scope: Option 82 is stripped on the reply but not
+  echo-validated.) This is DHCPv4-only (there is no DHCPv6 relay — see below).
+
+## Outstanding-request binding (#6562)
+
+The #4163 source check above stops an attacker who cannot forge a source
+address. It does **not** stop one who can: an off-path attacker who spoofs a
+configured server's IP passes it, and the relay would then forward a forged
+`OFFER`/`ACK` (hostile gateway/DNS) or `NAK` (forced client restart) to the
+client. So every reply must additionally **bind to a request the relay actually
+forwarded**.
+
+`pending.go` holds a bounded, expiring table of outstanding transactions. The
+client-facing loop inserts an entry for each request it relays upstream
+(*before* the upstream write — the reply loop is a different goroutine, and a
+fast server can answer before a post-send insert would have run); the
+server-facing loop forwards a reply only if `pendingTable.matches` hits.
+
+**Key — `xid` + `chaddr`.** RFC 2131 §4.1 gives the xid's purpose ("The 'xid'
+field is used by the client to match incoming DHCP messages with pending
+requests"), and its §4.3.1 Table 3 requires a server to copy **both** `xid` and
+`chaddr` from the client's message into `DHCPOFFER`/`DHCPACK`/`DHCPNAK` — so
+both halves are present on the request and echoed on the reply. The relay's own
+mutations (`hops`, `giaddr`, Option 82) touch neither, so the key is stable
+across stamping. Option 61 (client-identifier) is **deliberately excluded**
+even though it is a stronger identity: RFC 2131 told servers they MUST NOT echo
+it and only RFC 6842 §3 (2013) reversed that to a MUST, so keying on it would
+drop every reply from a pre-RFC-6842 server — a silent, segment-wide outage. The
+ingress interface is not keyed either: each relay interface owns its own table.
+
+**Bounded — 8192 entries, evict-oldest.** The cap is a *backstop*, not the
+primary bound: the #5670 ingress rate limiter already caps the fill rate
+(default 100 pps), so steady-state occupancy is ~`rate × TTL` = ~3000 entries and
+a default-configured relay never evicts. At the cap the table reaps expired
+entries first, then evicts the **oldest** — it does **not** refuse the new
+request. Refusing new requests would let an attacker who fills the table lock
+out every new client (a total segment outage); evicting the oldest degrades
+gracefully, and the choice trades away no security, because eviction can only
+cause a legitimate reply to be *dropped*, never an unsolicited reply to be
+*accepted*. Every eviction bumps `PendingEvicted`.
+
+**TTL — 30s.** This bounds the window in which a guessed xid would be accepted,
+while covering realistic server latency. RFC 2131 §4.1's retransmission schedule
+is 4s, then 8s, doubling to a 64s maximum, so 30s spans the first three
+retransmissions. A too-short TTL is self-healing rather than fatal: the client's
+retransmission traverses the relay and arms a fresh entry, and this holds
+whichever xid it uses — §4.1 leaves that open ("A client may choose to reuse the
+same 'xid' or select a new 'xid' for each retransmitted message") — because the
+server's answer echoes whatever xid the retransmission carried.
+
+**A match does not consume the entry.** The relay fans each request out to
+*every* server in the group, so an N-server group answers one `DISCOVER` with N
+`OFFER`s; and RFC 2131 §4.4.1 has the SELECTING `DHCPREQUEST` reuse the
+`DHCPOFFER`'s xid, so the same binding must also admit the `ACK`/`NAK`.
+Consuming on first match would silently break multi-server redundancy.
+
+**Fail direction.** A binding that is too strict silently breaks DHCP for real
+clients, which is a worse outage than the injection it prevents. Every drop is
+therefore counted (`RepliesDroppedNoRequest`) and logged warn-once-then-`Debug`,
+and `PendingEvicted` warns before drops start. A nil table fails **closed** (it
+admits nothing), matching the #4163 empty-allow-set posture, so a wiring
+regression is a loud counted outage rather than a silent loss of the control;
+`TestManagerRelay_HasPendingTable` guards the production wiring.
+
+**Table lifetime.** The table lives on `interfaceRelay`, not on the session, so
+a session rebuild (#2347 ifindex drift, #3960 re-address) does not wipe
+in-flight bindings and strand a client mid-transaction.
+
+**HA note (#2456).** Entries are per-node. If a client's transaction spans a
+failover, the newly-active node has no binding for the in-flight reply and drops
+it; the client's normal retransmission then re-arms the new node. The window is
+bounded by one client retransmission, and the drop is visible in
+`RepliesDroppedNoRequest`. (A BACKUP node never inserts, because the master gate
+drops the request before it is forwarded.)
 
 ### `overrides always-broadcast` config
 

@@ -62122,3 +62122,67 @@ break — `go vet` confirmed passing under every revert.
   22.7 Gbps) and needs no re-run for a comment-only change.
 - **File(s)**: pkg/cluster/{election.go,ifmon_weight_daemon_apply_6549_test.go},
     pkg/routing/monitor.go, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6562 (dhcprelay security) — bind every relayed reply to an
+  outstanding request, and REFUSE DHCPFORCERENEW. Two defects, two gates.
+
+  DEFECT 1: `handleServerResponses` forwarded any well-formed BOOTREPLY that
+  passed the #4163 source-IP allow-list. A source IP is spoofable, so an
+  off-path attacker forging a configured server's address could inject an
+  OFFER/ACK (hostile gateway/DNS) or a NAK (forced client restart). FIX: new
+  `pending.go` — a bounded, expiring table of outstanding transactions. The
+  client loop inserts a key BEFORE the upstream write (the reply loop is a
+  different goroutine; a post-send insert races a fast server's OFFER); the
+  reply loop forwards OFFER/ACK/NAK only on a match. Key is xid + chaddr:
+  RFC 2131 §4.3.1 Table 3 requires a server to copy BOTH from the client's
+  message, and the relay's own mutations (hops/giaddr/Option 82) touch
+  neither. Option 61 deliberately NOT keyed — RFC 2131 told servers they MUST
+  NOT echo it and only RFC 6842 §3 reversed that, so keying on it would drop
+  every reply from a pre-6842 server. Cap 8192, TTL 30s, evict-OLDEST (not
+  drop-new: drop-new lets an attacker who fills the table lock out every new
+  client; eviction can only cause a drop, never an accept, so it trades away
+  no security). A match does NOT consume the entry — the relay fans out to
+  every server in the group, so one DISCOVER draws N OFFERs, and RFC 2131
+  §4.4.1 has the SELECTING REQUEST reuse the OFFER's xid. Table lives on
+  interfaceRelay so a #2347/#3960 session rebuild does not strand a client.
+
+  DEFECT 2: FORCERENEW was forwarded unauthenticated (#2645 reasoned RFC 3118
+  auth is end-to-end and out of scope for a relay). REVERSED. RFC 3203 §6 —
+  NOT §5, which is IANA Considerations; the issue and a stale code comment
+  both mis-cited it — makes authentication a MUST precisely because
+  "FORCERENEW can be used to snoop and spoof traffic". A relay cannot
+  discharge that MUST: RFC 3118 §5.2 puts the secret between source and
+  destination, §3 casts the relay as a transparent mutator excluded from the
+  hash, and §5.3 assigns validation to the receiver. An Option-90 PRESENCE
+  check would be theater — the same spoofing attacker supplies the option.
+  Refusal is a handled condition, not an outage: RFC 3203 §2.2 defines server
+  retransmission on loss, and T1/T2 renewal is untouched. No opt-in knob.
+
+  OBSERVABILITY (the fail direction matters more than usual here — an
+  over-strict binding silently breaks DHCP for real clients): three new
+  counters on RelayStats + `show services dhcp relay` —
+  RepliesDroppedNoRequest, PendingEvicted (early warning that the table is at
+  capacity and legitimate bindings are being lost), RepliesDroppedForceRenew.
+  Both new drop paths log warn-once-then-Debug. A nil table fails CLOSED,
+  matching the #4163 empty-allow-set posture.
+
+  VALIDATION: fail-on-revert proven SEPARATELY for both defects, each an
+  ASSERTION failure with `go vet` clean (no build break). Disabling only the
+  binding gate → NoOutstandingRequestDropped + WrongChaddrDropped RED,
+  ForceRenewRefused GREEN. Restoring the FORCERENEW forward → ForceRenewRefused
+  RED, binding tests GREEN. OVER-REACH GUARD
+  TestRelay_NormalExchange_EndToEndStillRelays drives DISCOVER/OFFER,
+  REQUEST/ACK, RENEW and REBIND through the LIVE manager (bindings created by
+  production code, not a test helper) and stayed GREEN under both reverts.
+  Required a `fakeConn.push()` wake path so a reply can be injected only after
+  the request it answers was relayed. #2645's two tests were updated: the
+  forwarded-assert became ForceRenewRefused (armed for the xid, so the refusal
+  is pinned to the message TYPE, not to a missing binding), and the
+  deliverReply-level FORCERENEW test was removed as unreachable (the matrix
+  test already covers the ciaddr row). Suites: pkg/dhcprelay, pkg/dhcp,
+  pkg/dhcpserver all PASS incl. -race; pkg/cli PASS; go build ./... clean;
+  gofmt/vet clean.
+- **File(s)**: pkg/dhcprelay/{pending.go,relay.go,README.md,
+    relay_binding_6562_test.go,delivery_test.go,relay_test.go},
+    pkg/cli/show_services_dhcp.go, _Log.md
