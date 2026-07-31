@@ -273,7 +273,7 @@ func (m *Manager) buildHeartbeat() *HeartbeatPacket {
 		pkt.Groups = append(pkt.Groups, HeartbeatGroup{
 			GroupID:  uint8(rg.GroupID),
 			Priority: uint16(rg.LocalPriority),
-			Weight:   uint8(rg.Weight),
+			Weight:   clampWireWeight(rg.Weight),
 			State:    uint8(rg.State),
 		})
 	}
@@ -282,12 +282,33 @@ func (m *Manager) buildHeartbeat() *HeartbeatPacket {
 	for _, ls := range localStatuses {
 		pkt.Monitors = append(pkt.Monitors, HeartbeatMonitor{
 			RGID:      uint8(ls.RedundancyGroup),
-			Weight:    uint8(ls.Weight),
+			Weight:    clampWireWeight(ls.Weight),
 			Up:        ls.Up,
 			Interface: ls.Interface,
 		})
 	}
 	return pkt
+}
+
+// clampWireWeight narrows a weight onto the single-byte heartbeat weight field
+// by SATURATING instead of truncating (#6549).
+//
+// This is the last belt, not the fix. `uint8(w)` wraps — 355 leaves as 99 —
+// which is what let a node's local weight and its advertised weight disagree
+// and put two primaries on the LAN. The fix is that the weight domain is closed
+// upstream (rgWeightFromDebt for rg.Weight, config.ClampInterfaceMonitorWeight
+// for the per-monitor weight), so every value that reaches here is already in
+// [0,255] and this is an identity. Saturating rather than wrapping means a
+// future writer that bypasses those helpers degrades to a bounded, monotonic
+// weight instead of silently aliasing to an unrelated one.
+func clampWireWeight(w int) uint8 {
+	if w < 0 {
+		return 0
+	}
+	if w > maxRedundancyGroupWeight {
+		return maxRedundancyGroupWeight
+	}
+	return uint8(w)
 }
 
 // handlePeerHeartbeat processes an incoming peer heartbeat.
