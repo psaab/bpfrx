@@ -1,6 +1,6 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.27.1 — THE TERMINAL CUT, round-110 folds (+ round-110 AGY consistency folds: `effective_transition` is in the struct declaration with its explicit `Option<TransitionResult>` type; every consumer gate reads it; the last two stragglers)
+**Status: DRAFT v10.27.2 — THE TERMINAL CUT, round-110/111 folds (v10.27.1 folded the AGY r110 struct/consumer/type findings; v10.27.2 folds Codex r111's residual: the last three categorical overdue-contradicting claims — the site-2c refuse-install summary, the §9 install-ALIVE test, and the retry-path all-three claim — now carry the OverdueSkipped qualification) (+ round-110 AGY consistency folds: `effective_transition` is in the struct declaration with its explicit `Option<TransitionResult>` type; every consumer gate reads it; the last two stragglers)
 (`effective_transition` is now a carried struct field initialized in
 `MaterializeReport::NONE` and named at EVERY consumer — promotion,
 poller carriage, the MissingNeighbor composition, the teardown
@@ -1307,7 +1307,9 @@ the driving packet's samples adopt `valid`+untrusted only, so a non-close
 attacker packet materializing a shared victim plants nothing usable; (ii)
 an imported replica carries no trusted anchor → every closing-flagged
 materialize is no-baseline → **refuse**: install the copy ALIVE
-(`closing=false, reset=false`) but at the **probationary opening-window
+(unless the existing entry is overdue — the materialize is then
+skipped wholesale, `OverdueSkipped`, §5.8 contract; v10.27.1,
+round-111 Codex 2) (`closing=false, reset=false`) but at the **probationary opening-window
 timeout** (bounded as `min(TCP_OPENING_TIMEOUT_NS, the imported
 entry's own expires_after_ns)` — a per-app value shorter than 20 s is
 never extended; a full-timeout alive install lets an attacker renew an
@@ -2432,6 +2434,8 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   reap); site 2b refuse → NO install (`created=false,
   install_failed=true`, no cache insert, packet still forwarded, next
   reply re-synthesizes and revalidates); site 2c refuse → install ALIVE
+  (or skip wholesale when the existing entry is overdue —
+  `OverdueSkipped`, v10.27.1)
   at the probation timeout with `closing=false, reset=false`; site 2c
   with a non-close attacker packet → untrusted samples only.
 - **Materialize preservation + retention fence (v10.7.0, rounds 89-90
@@ -2608,7 +2612,8 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   retry is byte-identical (an admitted close transmits on the buffered
   decision even after an interim expiry — delivery parity); a buffered
   packet NEVER moves the anchor, NEVER drives the establishment promote,
-  NEVER clears probation (the next unbuffered packet does all three);
+  NEVER clears probation (the next unbuffered packet does all three
+  when its effective transition is not `OverdueSkipped`, v10.27.1);
   a buffered SYN-ACK delivering without its promote leaves the entry
   OPENING exactly as master (20 s window if no further packet).
 - **Site-9 typed outcomes (round-83 Codex 1 + round-84 Codex 1 +
@@ -2949,7 +2954,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.27.1)
+## 11. Open questions for the convergence round (v10.27.2)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
