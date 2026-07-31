@@ -1,3 +1,289 @@
+## 2026-07-31 — #6532 round-4 fold: stopped patching callee shapes, changed the approach
+
+- **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact, PR #6602)
+- **Action**: Codex found two more escapes on db5162267 — `[](byte)(x.PSK)` and
+  `([](byte))(x.PSK)` (the callee was de-parenthesized but `arr.Elt` was still
+  required to be an immediate Ident), and `string(x.PSK[:])` (trailingIdent did
+  not traverse SliceExpr). It also named the escape that ends the approach:
+  `type Clear string; Clear(x.PSK)` unwraps the secret and NO builtin-name
+  matching can ever see it, because a conversion's callee is a type expression
+  whose grammar is open.
+  Per the team-lead directive, stopped patching outward and changed the design:
+  the conversion check NO LONGER INSPECTS THE CALLEE AT ALL. It now fires on a
+  one-argument call whose argument names a Secret-bearing field. Every
+  conversion — builtin, parenthesized at any depth, aliased, or a named string
+  type declared anywhere — is a one-argument call, so the whole callee-shape
+  dimension collapses to zero code. One argument is a deliberate line, not an
+  oversight: the SAFE idiom `fmt.Fprintf(buf, "%s", x.PSK)` is multi-argument
+  and redacts correctly, so flagging it would fire on every correct render.
+  `secretUnwrapConversionName` and `unwrapParens` were deleted outright.
+  The remaining gated dimension — the argument's wrapper chain — is closed by
+  ENUMERATING go/ast node kinds rather than source shapes: secretExprTail now
+  handles Paren, Star, Index, IndexList, Slice, TypeAssert and address-of Unary.
+  Harvest gaps Codex flagged also fixed: typeMentionsSecret now strips parens
+  (`PSK (Secret)` is legal) and follows ChanType; structTypeOf follows map KEYS
+  as well as values (an anonymous struct is a legal comparable map key).
+  Added TestSecretFieldHarvestShapes — 13 synthetic declaration shapes plus a
+  negative control — because the harvest had been widened in prose and code but
+  never tested, the same gap that let the scanner ship blind twice.
+  STATED THE HARD LIMIT, which is the substantive answer rather than another
+  near-miss: this guard is syntactic and fires where a field is NAMED, so it
+  cannot follow a value into a local, a parameter, a helper return, an
+  out-of-package field or a multi-argument handoff, nor see append/copy/range/
+  reflection. Closing those needs go/types (x/tools is only an INDIRECT
+  dependency today) or an explicit-allowlist inversion over all 42 conversions
+  in pkg/grpcapi (measured, not estimated). Named the clean upstream fix:
+  making config.Secret a struct instead of a named string type would make
+  `string(s)` fail to COMPILE and collapse the entire shape space to the single
+  Reveal accessor — a pkg/config-wide change (Secret is comparable and used as
+  a map key), so it belongs in its own issue, not this PR.
+  Also corrected the remaining false claims: the file header no longer says
+  "the TWO ways to defeat"; the Reveal false positive is now stated as EVERY
+  selector named Reveal (package members and fields, not merely methods); and
+  the residual list no longer claims named-type conversions escape, because
+  after the redesign they do not.
+  Validation — 10 mutations, each in a throwaway detached worktree with
+  build+vet CLEAN so every red is an assertion:
+    M1 drop ParenExpr from secretExprTail   -> parenthesized_conversion_argument
+    M2 drop SliceExpr                       -> sliced_field, sliced_field_with_bounds
+    M3 drop StarExpr                        -> pointer_deref, address-of_field,
+                                               pointer_deref_of_indexed_collection
+    M4 drop IndexExpr                       -> indexed_collection_field, +deref
+    M5 drop TypeAssertExpr                  -> type-asserted_field
+    M6 drop ParenExpr from typeMentionsSecret -> parenthesized_type
+    M7 drop ChanType                        -> channel_of_Secret
+    M8 stop following map KEY               -> map_KEY_anonymous_struct
+    M9 drop embedded-field handling         -> embedded_Secret
+    M10 RESTORE callee-shape gating         -> 13 subtests RED, including both
+        named-string-type cases — the empirical proof that the redesign, not
+        another shape patch, was the necessary fix.
+  Meta-tests now run 42 subtests. Probe worktree removed; the PR worktree was
+  never used for a probe. gofmt clean, go build ./... and go vet ./... clean,
+  pkg/grpcapi + pkg/api + pkg/config + pkg/cli green.
+- **File(s)**: pkg/grpcapi/server_fabric_secret_render_6532_test.go,
+    docs/architecture.md, _Log.md
+
+## 2026-07-31 — #6532 round-3 fold: parenthesized callees escaped the scanner
+
+- **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact, PR #6602)
+- **Action**: Codex found the round-2 scanner still missed shapes it claimed to
+  cover, and it was right. `(x.PSK.Reveal)()`, `(string)(x.PSK)`,
+  `([]byte)(x.PSK)` and `((string))(x.PSK)` are legal Go that gofmt leaves
+  untouched, and every one presents `call.Fun` as an `*ast.ParenExpr` — proved
+  firsthand with a standalone go/ast program: all four print
+  `Fun=*ast.ParenExpr selector=false ident=false arraytype=false PAREN=true`,
+  so neither the Reveal check nor the conversion check saw them. A method VALUE
+  (`reveal := x.PSK.Reveal`) escaped too: its call site is `reveal()` with no
+  selector at all.
+  Same failure mode as the round-2 MAJOR, one level up — the check was correct
+  for the shapes it was tested against, and the meta-test only fed shapes the
+  scanner already handled. A meta-test that exercises only what already works
+  proves nothing.
+  Fix, and the AST program pointed at a better one than paren-unwrapping the
+  Reveal callee: `ast.Inspect` reaches every `.Reveal` SelectorExpr regardless
+  of parenthesization AND when it is never called (verified — it printed the
+  selector for both the paren-called form and the method-value binding). So
+  Reveal detection now matches the SELECTION rather than the call, covering all
+  three shapes uniformly with no paren logic. The conversion check gets
+  recursive `unwrapParens` on the callee (single-level is not enough —
+  `((string))(x)` is legal).
+  MINOR 1 — architecture.md said "exactly two escape hatches" while the test
+  itself listed append/index/range/reflection; that contradiction is resolved
+  by saying two DETECTED forms and enumerating the residuals, now including
+  `copy(dst, secret)`. `collectSecretFieldNames` recursed only when the
+  immediate expression was a StructType, missing `[]struct{...}`,
+  `*struct{...}`, `map[K]struct{...}` and embedded unnamed Secret fields; it
+  now looks through slice/array/pointer/map via structTypeOf and harvests an
+  embedded Secret under its type name. Harvest still resolves the same 13 live
+  names (no live nested-struct Secret exists today — the widening is for the
+  next one).
+  MINOR 2 — completed the false-positive disclosure: ANY method named Reveal is
+  flagged whatever its receiver (no type resolution); the conversion check
+  matches a trailing IDENTIFIER so unrelated locals and parameters named
+  Password/PSK are flagged too, not merely fields; shadowing applies to rune,
+  uint8 and int32 as well as string and byte.
+  Validation — per-shape mutation, each in a throwaway detached worktree with
+  build+vet CLEAN so every red is an assertion:
+    A. drop unwrapParens from the conversion callee -> RED on
+       parenthesized_string_conversion, parenthesized_byte_slice_conversion,
+       doubly_parenthesized_conversion.
+    B. revert Reveal to CallExpr-anchored matching -> RED on
+       parenthesized_Reveal_callee, Reveal_bound_as_a_method_value.
+    C. drop ParenExpr from trailingIdent -> RED on
+       parenthesized_conversion_argument.
+  That is all six newly-covered shapes, each proven to fail without its fix.
+  Meta-test now runs 15 shapes plus the negative control. Probe worktree
+  removed; the PR worktree was never used for a probe. gofmt clean, go build
+  ./... and go vet ./... clean, pkg/grpcapi + pkg/api + pkg/config + pkg/cli
+  green.
+- **File(s)**: pkg/grpcapi/server_fabric_secret_render_6532_test.go,
+    docs/architecture.md, _Log.md
+
+## 2026-07-31 — #6532 round-2 fold: my previous fold BROKE the guard it widened
+
+- **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact, PR #6602)
+- **Action**: Codex re-gate found a MAJOR in the round-1 fold, and it was
+  correct. Widening the structural guard from a Reveal() line-grep to an AST
+  scan, I put `if !ok || len(call.Args) != 1 { return true }` ahead of the
+  Reveal check. A zero-argument method call has len(Args)==0 — the receiver
+  lives in CallExpr.Fun, not Args — so the Reveal branch became UNREACHABLE
+  DEAD CODE. Net effect: I added conversion detection and silently deleted the
+  original protection, on exactly the paths (wireguard / ipsec-statistics /
+  bfd-peers, which short-circuit on a nil dataplane) where this guard is the
+  ONLY net. Proved firsthand with a standalone go/ast program:
+  `CallExpr Reveal(): len(Args)=0 -> gate returns early: true`.
+  Root cause of it shipping: my round-1 mutation probe for the Reveal branch
+  injected `var _ = "x.Reveal()"` — a STRING LITERAL. That matched the old
+  line-grep, but a string literal is not a CallExpr, so the probe was never
+  valid against the AST implementation, and I never re-ran it after the
+  rewrite. I proved the NEW detection fired and never re-proved the OLD one.
+  Fix: extracted the scan into a pure function (scanSecretUnwraps) returning
+  findings, with the two detections INDEPENDENT — Reveal is matched before any
+  argument-count gate, and neither shares a precondition with the other.
+  Added TestSecretUnwrapScannerDetectsBothForms, a meta-test that feeds the
+  scanner synthetic sources and asserts it REPORTS each shape it claims: the
+  Reveal accessor, string/[]byte/[]rune/[]uint8 conversions, a conversion
+  nested in a call argument, through a pointer deref, and of an indexed
+  collection field — plus a negative control that a plain %s render of a
+  Secret is NOT flagged.
+  MINOR 1 — widened the harvest. `APIKeys []Secret` (types_system.go:377) is
+  REAL, not hypothetical, and the old `field.Type == Ident("Secret")` match
+  missed it, so `string(...APIKeys[i])` went undetected. typeMentionsSecret now
+  walks slice/array/pointer/map/qualified shapes and recurses into nested
+  anonymous structs; harvest went 12 -> 13 names, gaining APIKeys. Confirmed
+  the real WireGuard names ARE covered (PresharedKeyHex, WgLocalPrivkeyHex).
+  Rewrote the scope block to state the residuals COMPLETELY — aliased locals,
+  parameters, helper returns, out-of-package fields, type aliases, and
+  non-conversion unwrapping (append/index/range/reflection) — and to record
+  that name-based matching false-positives on unrelated fields named
+  Password/PSK and on shadowed string/byte identifiers, which is the correct
+  bias on a network-exposed surface.
+  MINOR 2 — corrected three false doc claims: architecture.md no longer says
+  the surface is safe "because no Reveal() call exists" (both escape hatches
+  now named, with the residuals and the meta-test); the test file header no
+  longer names the old test or the Reveal-only rationale; system-login.md no
+  longer groups `show snmp v3` with the masked community path (the snmp-v3
+  topic renders no community and no placeholder) and now states that remote
+  `cli show system services` uses the `system-services` topic, whose renderer
+  omits SNMP entirely (verified: zero SNMP references in
+  pkg/grpcapi/server_show_system.go).
+  Validation: the meta-test was proven to CATCH this exact MAJOR — in a
+  throwaway detached worktree, reintroducing `len(call.Args) != 1` ahead of
+  the Reveal check makes TestSecretUnwrapScannerDetectsBothForms/Reveal_accessor
+  go RED with build+vet CLEAN, while TestGRPCAPINeverUnwrapsSecretCleartext
+  stays GREEN — demonstrating the real guard structurally cannot detect its own
+  breakage and the meta-test is load-bearing. Probe worktree removed; the PR
+  worktree was never used for a probe. gofmt clean, go build ./... and
+  go vet ./... clean, pkg/grpcapi + pkg/api + pkg/config + pkg/cli green.
+- **File(s)**: pkg/grpcapi/server_fabric_secret_render_6532_test.go,
+    docs/{architecture.md,system-login.md}, _Log.md
+
+## 2026-07-31 — #6532 review fold: three MINORs, all about artifacts overstating coverage
+
+- **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact, PR #6602)
+- **Action**: Hostile review returned MERGE-NEEDS-MINOR with no code-correctness
+  defect. All three MINORs were artifacts claiming more than they delivered;
+  each is now either corrected or actually delivered.
+  MINOR 1 — the "#4111 behaviour is unchanged / super-user still reads
+  cleartext" claim is FALSE for the remote `cli` binary. `cmd/cli/show.go`
+  routes `show snmp` straight to the RPC via `c.showText("snmp")`, and
+  `cmd/cli` has zero login-class awareness (verified: no userClass/LoginClass/
+  PermAll/showConfigRedacted hits), so a super-user on `cli` now gets
+  `##SECRET-DATA##`. Kept the posture — threading a class into pkg/grpcapi is
+  impossible today and meaningless on the fabric listener where the caller is
+  the peer chassis, and `cli show configuration snmp` was ALREADY masked for
+  every class by #4051, so the two remote read-back paths now agree instead of
+  contradicting. Amended docs/system-login.md: the #4111 paragraph now scopes
+  its allowance to the CONSOLE CLI, and a new callout states the remote-CLI
+  masking plus the operational consequence (no remote read-back; recover from
+  console as super-user or the DR archive, noting a redacted export is
+  deliberately not restorable per #4060).
+  MINOR 2 — the MonitorInterface audit-register entry was factually wrong on
+  all three counts. It streams pre-formatted TEXT frames of counter snapshots
+  (RenderTrafficSummary/RenderSingleInterface), it DOES render configuration
+  (interface set + display names from the active config), and there is no pcap
+  anywhere in server_diag_monitor.go. Rather than just restate it, promoted it
+  to a REAL probe: a monitorFrameSink mock stream captures the first frame and
+  aborts, so it is now driven with a nil dataplane like the seven unary probes.
+  MINOR 3 — `TestGRPCAPINeverRevealsSecretCleartext` claimed "the ONE way to
+  defeat String() is Reveal()". False: config.Secret is `type Secret string`,
+  so `string(x.PSK)` / `[]byte(x.PSK)` yields cleartext and a Reveal() grep
+  misses it. Replaced the line-grep with an AST scan covering BOTH paths,
+  matching conversions against the Secret-typed field names parsed from
+  FILE-SCOPE declarations in pkg/config (12 unique names; the function-local
+  `Name Secret` alias fields in the SNMPCommunity marshallers are correctly
+  excluded). Renamed to TestGRPCAPINeverUnwrapsSecretCleartext and stated the
+  real residual instead of overclaiming again: a conversion applied to a local
+  variable previously assigned from a secret field is not caught.
+  NIT 4 — delivered the determinism parity rather than scoping the claim.
+  gRPC showSNMP now sorts trap groups and USM users as well as communities
+  (shared sortedMapKeys helper), and both pkg/cli community loops sort via
+  sortedSNMPCommunityNames. This matters most under redaction: every displayed
+  key is the same placeholder, so an unsorted map printed N indistinguishable
+  lines with shuffling authorization modes.
+  NIT 5 — documented that the interceptor source scan is textual and reads only
+  the function bodies, so hoisting a method-name constant into a helper would
+  silently drop it from the audited set; added a canary that fails if the scan
+  stops finding SystemAction (reachable ONLY via the scan — it is in neither
+  allowlist map).
+  Validation: the widened scan was proven firsthand in a THROWAWAY detached
+  worktree, twice. Injecting `string(u.AuthPassword)` into showSNMP: build+vet
+  CLEAN, scan FAILS as an assertion. Then the reviewer's actual scenario —
+  `string(u.PrivPassword)` injected BEHIND a nil-dataplane short-circuit: the
+  empirical sweep PASSES (blind to that path) while the structural guard FAILS,
+  proving it is the only net there. Probe worktree removed; PR worktree never
+  used for a revert probe. New determinism test mutation-tested (reverting the
+  community sort goes RED at attempt 4). gofmt clean, go build ./... and
+  go vet ./... clean, pkg/grpcapi + pkg/api + pkg/config + pkg/cli +
+  pkg/refactoraudit green.
+- **File(s)**: pkg/grpcapi/{server_fabric_secret_render_6532_test.go,
+    server_show_snmp_community_redaction_6532_test.go,
+    server_show_dhcp_lldp_snmp.go},
+    pkg/cli/{show_services_snmp.go,cli_show_system.go},
+    docs/system-login.md, _Log.md
+
+## 2026-07-31 — #6532: redact the SNMP community on the fabric-reachable gRPC ShowText
+
+- **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact)
+- **Action**: gRPC `ShowText{Topic:"snmp"}` rendered the SNMPv1/v2c community
+  string — which IS the authenticator for v1/v2c — in cleartext. The usual
+  loopback bound does not apply: `ShowText` is on the cluster-fabric allowlist
+  (#4122), so the render is reachable from the peer chassis over the fabric IP.
+  Both sibling surfaces had already been hardened (REST #5315, CLI #4111) and
+  this one was left behind. The community is the ONE operator secret the
+  `config.Secret` newtype does not protect — it stays a plain string because it
+  is the `Communities` map key — so every manual renderer must mask it by hand,
+  which is exactly how three independent copies of the rule let one drift.
+  Fixed by masking unconditionally on the gRPC path (gRPC carries no login
+  class to gate on, matching REST and the sibling `ShowConfig` #4051), and by
+  collapsing all four render sites onto one shared helper,
+  `config.SNMPCommunityDisplayName(name, redact)`. The CLI keeps its per-class
+  predicate (`showConfigRedacted()`), so #4111 behaviour is unchanged:
+  view-only masked, super-user cleartext.
+  Audited the whole fabric allowlist as the issue asked. Empirical sweep: one
+  config staging every secret leaf in the redaction SSOT, driven through all
+  ~115 ShowText topics and every allowlisted RPC — the SNMP community was the
+  only leak. Structural reason: every other secret is `config.Secret` (its
+  `String()` masks under %s/%v, #2053) and `pkg/grpcapi` never calls the
+  `Reveal()` cleartext accessor. Both facts are now asserted, along with a
+  completeness gate that enumerates the allowlist maps AND the method names the
+  interceptor source special-cases (so `SystemAction` is covered too), and a
+  ShowText topic-coverage gate derived from the dispatcher source.
+  Validation: RED-on-revert verified as an assertion failure (not a build
+  break) on the community mask; all four new gates mutation-tested individually
+  (drop the mask / drop a probe / drop a topic / inject a `Reveal()`), each RED,
+  all restore GREEN. A staging-is-real test asserts all 21 secret sentinels
+  actually reach the committed active config, so the "no secret appeared"
+  scans cannot pass vacuously. Full pkg/grpcapi, pkg/api, pkg/cli, pkg/config,
+  pkg/daemon, pkg/dataplane/userspace suites green (the event-stream socket
+  tests need TMPDIR=/tmp — sun_path 108). Heatmap regenerated
+  (types_system.go 1645 -> 1684).
+- **File(s)**: pkg/config/types_system.go, pkg/grpcapi/server_show_dhcp_lldp_snmp.go,
+    pkg/api/show_text.go, pkg/cli/{show_services_snmp.go,cli_show_system.go},
+    pkg/grpcapi/{server_show_snmp_community_redaction_6532_test.go,
+    server_fabric_secret_render_6532_test.go},
+    docs/{architecture.md,system-login.md,refactoring-audit-current.txt}, _Log.md
+
 ## 2026-07-26 — #6474: re-NAT outbound ICMP errors through source NAT
 
 - **Timestamp**: 2026-07-26 (fix/6474-snat-outbound-icmp-error, stacked on
@@ -62124,6 +62410,23 @@ break — `go vet` confirmed passing under every revert.
     pkg/routing/monitor.go, _Log.md
 
 - **Timestamp**: 2026-07-31
+- **Action**: #6532 review-fold round 5 (Codex MERGE-NEEDS-MINOR). Codex confirmed
+  the argument-gating inversion CLOSES the conversion-callee shape class and the
+  production redaction is correct; all three findings were claim-accuracy plus one
+  small harvest gap. (1) `collectSecretFieldNames` now recurses into BOTH map
+  halves explicitly — `structTypeOf` can only return one struct, so
+  `map[struct{ Key Secret }]struct{ Value Secret }` harvested `Key` and silently
+  never visited `Value` while the doc claimed both sides were followed. (2)
+  Replaced the "TWO independent ways to defeat" framing with "TWO DETECTED
+  SHAPES", since Go's expression grammar is open and enumerating defeat
+  mechanisms is not something a syntactic guard can claim. (3) Added an explicit
+  RESIDUALS block naming what is NOT flagged: a COMPUTED argument
+  (`Clear(x.PSK + "")`, `Clear([]config.Secret{x.PSK}[0])`, `Clear(<-ch)`) which
+  passes the arity gate but does not resolve to a harvested field name;
+  `copy(dst, secret)` / `append(dst, secret...)` which are two-argument; and
+  reflection / interface-value unwraps. No production code changed. Full
+  `go test ./pkg/grpcapi/` green.
+- **File(s)**: pkg/grpcapi/server_fabric_secret_render_6532_test.go, _Log.md
 - **Action**: #6551 — bound the SNMP GETBULK grid AT the response ceiling instead
   of expanding it fully and trimming afterwards.
   Reproduced first. With 50 interfaces, a 4094-byte v2c GETBULK carrying 580
