@@ -1,16 +1,17 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.26.1 — THE TERMINAL CUT, round-109 folds (+ round-109 AGY consistency folds: `effective_transition` joined the struct declaration and every consumer gate reads it; the last two unqualified probation-clear statements qualified) (the
-post-state S2 family is a first-class producer — without it a
-no-P/no-predecessor `(Refused, Installed)` would produce an empty set
-and a surviving older cache entry would keep serving the tuple; the
-producer writes ONE derived `effective_transition` that every
-consumer including the pre-resolved-result promotion reads; the
-second composition clause is site-qualified; every unconditional
-clear/install claim outside the SSOT now carries the
-`transition != OverdueSkipped` qualification). Round-109: Codex NO
-(1B/2H/1M — precise residuals); AGY r108 SOUND (v10.25.0, no
-findings); SMR r109 YES (fold verification). Ship
+**Status: DRAFT v10.27.0 — THE TERMINAL CUT, round-110 folds
+(`effective_transition` is now a carried struct field initialized in
+`MaterializeReport::NONE` and named at EVERY consumer — promotion,
+poller carriage, the MissingNeighbor composition, the teardown
+guards, the cache-insert suppression, and the commit hooks; the
+remaining categorical install/clear claims outside the SSOT are
+qualified; §9 gained the end-to-end stale-cache regression).
+Round-110: Codex NO (1B/1M/1L — the effective transition was not yet
+a carried field named at every consumer; the outside-SSOT
+contradictions; the missing e2e fixture — all folded); AGY r109
+SOUND (2 textual findings, folded v10.26.1); SMR r110 YES (fold
+verification). Ship
 candidate = the Part-A dataplane demote gate plus the wire-free local HA
 rules. The RG-incarnation/retirement/fence-ledger protocol that rounds
 13–82 grew is KILLED (not deferred): its two customers are re-scoped —
@@ -433,7 +434,7 @@ exhaustive inventory, re-verified against this branch's master base:
 | 1 | `session/lookup.rs:105-128` HIT path (real endpoint FIN/RST) | wire packet flags | gate via pre-packet anchor validation, marking moved to post-borrow phase (§5.5); closing packets never promote (§5.5) |
 | 2 | `session/mod.rs:1396-1432` `update_session` via `promote_synced_with_origin` (HA shared-promote, `session_glue/promote.rs:86-107`) | wire packet flags on the promoting packet | closing packets never reach this path (rule 5 — the ownership promote is skipped wholesale); a non-closing promote threads the seg view for anchor purposes |
 | 2b | **reverse-NAT companion synthesizer** — `session_glue/mod.rs:1262-1284` → `shared_ops.rs:857-865` → `install_with_protocol_with_origin` (seeds at `install.rs:179-180`) | wire packet flags on a reverse-tuple miss with a live forward match; runs at resolve time, BEFORE the #4400 guard | gate the seed with the validator against the in-hand forward entry's anchor; refused close → **skip the install entirely** (§5.6); a SHARED `ForwardSessionMatch` carries no anchor (`entry.rs:209`) → no-baseline → refuse → skip-install |
-| 2c | **reactive shared materialize** — `materialize_shared_session_hit` (`session_glue/mod.rs:1092-1118`) threads the current packet's `tcp_flags` into `upsert_synced_with_origin` (seeds at `install.rs:399-400`) | wire packet flags on a shared-map hit | gate the flag seed with the validator; an imported entry has no anchor → no-baseline → refuse → install the copy **alive** (`closing=false, reset=false`) at the bounded probation timeout (§5.6); re-materialization against an existing probation entry atomically ADOPTS the shared S2 decision/metadata while preserving only the probation deadline/flag — no decision split-brain, no clock restart (§5.6, v10.7.0) |
+| 2c | **reactive shared materialize** — `materialize_shared_session_hit` (`session_glue/mod.rs:1092-1118`) threads the current packet's `tcp_flags` into `upsert_synced_with_origin` (seeds at `install.rs:399-400`) | wire packet flags on a shared-map hit | gate the flag seed with the validator; an imported entry has no anchor → no-baseline → refuse → install the copy **alive** (`closing=false, reset=false`) at the bounded probation timeout (§5.6) — UNLESS the existing entry is overdue, in which case the materialize is skipped wholesale (`OverdueSkipped`, §5.8 contract); re-materialization against an existing probation entry atomically ADOPTS the shared S2 decision/metadata while preserving only the probation deadline/flag — no decision split-brain, no clock restart (§5.6, v10.7.0) |
 | 3 | `install.rs:179-180` primary miss installs | creating packet flags | unreachable for bare closes on TRANSIT dispositions (#4400) and LocalDelivery caches TCP only with SYN (`local_delivery.rs:20`). The actual residual: a SYN|RST/SYN|FIN new-flow packet passes the #4400 guard (it has SYN, `session_admission.rs:82-87`) and seeds closing/reset from raw flags — a self-anchoring invented-tuple entry (attacker kills only a flow it created — no victim impact, master parity); malformed SYN+close combos are screen-owned where screened. **Provenance bound (v10.15.0, rounds 89-98 Codex):** the invented-tuple harmlessness holds ONLY when the tuple is genuinely new in this dispatch; when the tuple carries peer-synced provenance (the transient-purge class or `ReplacedSyncedLocal` displacement) it is a REAL victim's — a closing-flagged packet on the transient-purge class purges and dispatches EXACTLY as master (the close-aware gate line is retracted v10.15.0; the master's-own follow-through is the documented #6599-family exposure, §7) and never displaces the synced victim (`ReplacedSyncedLocal`: deliver locally, no install) — §5.6 site-3 supplement |
 | 4 | HA wire re-import — eventstream `UpsertSynced` → `upsert_synced_with_origin` (no packet exists) | peer delta | validation-free by design (the peer validated before reaping and emitting the Close); distinct from site 2c, which HAS a packet |
 | 5 | tunnel `UpsertLocal` (`tunnel.rs:563-615` → `session_glue/mod.rs:786-800`) | locally generated packets (firewall-originated tunnel TX) | trusted-local class, documented; not wire-attacker-controllable. Inbound tunnel closes land on site 1 with whatever anchor the inbound stream built — none if the flow is outbound-only → refuse-demote; local blast radius |
@@ -647,7 +648,8 @@ request-build stage:
   anchor and never drives post-borrow state** (no anchor update, no
   establishment promote, no probation clear on the retry path — the
   retry has no `SessionTable`; the next unbuffered packet does all
-  three). The consequence is a documented residual, not a channel: a
+  three PROVIDED its effective transition is not `OverdueSkipped`,
+  v10.27.0, round-110 Codex 2). The consequence is a documented residual, not a channel: a
   flow whose traffic is mostly buffered (long ARP stalls) lets its
   anchor lag the stream — later closes soft-refuse and the entry idles
   out on its ordinary timeout, the same bounded class as the
@@ -1392,7 +1394,8 @@ Adopt-S2 makes the entry and the packet agree by construction; a
 generation change inherits the min() deadline too — bounded harm, it
 only ever SHORTENS a new materialization to the prior clock, never
 extends.) Only the entry's own successful final-admission commit hook
-(a committed non-close packet) clears probation and applies the
+(a committed non-close packet whose effective transition is not
+`OverdueSkipped`, v10.27.0) clears probation and applies the
 ordinary refresh. A non-probation existing entry takes today's upsert
 unchanged. The probation entry carries
 an explicit `probation: bool` that (a) suppresses ownership promotion,
@@ -1622,7 +1625,8 @@ of a transient-purge-class entry is not a gate effect and still runs.
 Ordinary
 data/ACK packets continue to refresh normally through the unchanged
 non-close path — with the §5.6 probation exception: a probation entry is
-refreshed ONLY by a committed non-close packet at its commit hook (and a
+refreshed ONLY by a committed non-close packet at its commit hook
+(never on an `OverdueSkipped` effective transition, v10.27.0) (and a
 pre-admission materialize against it preserves its deadline while
 adopting the shared decision/metadata, §5.6).
 
@@ -1765,7 +1769,8 @@ adopting the shared decision/metadata, §5.6).
   - **Fields:** `ResolvedFlowSessionDecision`
     (`shared_ops.rs:563-578`) gains the whole
     `report: MaterializeReport`, initialized `MaterializeReport::NONE`
-    (site None, validation None, transition None, displaced empty) at
+    (site None, validation None, transition None, displaced empty,
+    effective_transition None — v10.27.0, round-110 Codex 1) at
     BOTH constructors (`session_glue/mod.rs:1254-1261` and
     `:1330-1344`) and set from the materializer's OUT report. There is
     NO separate `displaced` field anywhere else.
@@ -1794,7 +1799,13 @@ adopting the shared decision/metadata, §5.6).
     `install_failed` hoist (`poll_descriptor/mod.rs:509`) and stores
     it on the per-descriptor dispatch context that survives the
     `resolved.decision` reduction (`:883`); consumers read the
-    dispatch context. The pre-hoist policy-counter fallback
+    dispatch context — and EVERY consumer read of the transition is
+    `report.effective_transition` (v10.27.0, round-110 Codex 1:
+    promotion, the poller carriage, the MissingNeighbor composition,
+    the teardown guards, the cache-insert suppression, and the commit
+    hooks all name the derived field, never the raw `transition`;
+    `effective_transition` is a carried struct field initialized in
+    `NONE` and written by the producer). The pre-hoist policy-counter fallback
     (`poll_descriptor/mod.rs:487-509`, `lookup.rs:345-354`) attributes
     the packet to the SURVIVING entry's rule when S2 lacks a bound
     counter — master's own fallback semantics, explicitly ACCEPTED
@@ -1828,7 +1839,8 @@ adopting the shared decision/metadata, §5.6).
     `:5057-5068`, `neighbor_dispatch.rs:272-405`); the deferred RST
     teardown cannot engage (`session_glue/mod.rs:863-875`).
   - **Composition (normative, part of the MissingNeighbor outcome
-    list below):** an `OverdueSkipped` OR `UpsertRefused` transition
+    list below):** an `effective_transition ∈ {OverdueSkipped,
+    UpsertRefused}`
     (both exist only on `Some(Site2c)` reports) with a MissingNeighbor
     disposition takes the live-backed `ExistingResolved` buffer-only
     arm — NEVER the common seed block
@@ -1944,7 +1956,7 @@ adopting the shared decision/metadata, §5.6).
   still refuse at capacity (`install.rs:123-125`) and NAT64 drops
   before the seed block (`poll_descriptor/mod.rs:4634-4656`), so
   `SeedInstalled`/`SeedRefused` are RESULTS, not arm-head outcomes.
-  An `OverdueSkipped` OR `UpsertRefused` transition outcome (the
+  An `effective_transition ∈ {OverdueSkipped, UpsertRefused}` (the
   contract bullet above — both exist only on `report.site ==
   Some(Site2c)`, v10.26.0 round-109 Codex 3; an impossible
   `site=None` report follows master's own dispatch) COMPOSES to the
@@ -2384,7 +2396,8 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   non-close attacker packet materializing a shared victim plants only
   untrusted state, a following close refuses, and the UNPROMOTED entry
   emits NO Close delta on its ordinary reap (peer-synced origin). (A
-  later committed non-close packet may promote it; the then-promoted
+  later committed non-close packet (with a non-OverdueSkipped
+  effective transition) may promote it; the then-promoted
   entry's natural reap DOES emit Close — correct owner semantics.)
 - **Strong OPENING proof:** exact-interval SYN-ACK authenticates the whole
   segment (both sides trusted) and drives the establishment promote;
@@ -2504,7 +2517,15 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   arm); (ix-b) `UpsertRefused +
   MissingNeighbor` never enters the seed block (which would replace K
   via `install.rs:139`); (ix-c) the P+K+S2 maximum-cardinality case
-  and a full 64-descriptor/192-family batch;
+  and a full 64-descriptor/192-family batch; (ix-d) the r109-1
+  end-to-end stale-cache regression (v10.27.0, round-110 Codex 3):
+  pre-seed an OLD cache descriptor for the tuple; process a
+  cache-ineligible close (FIN/RST bypasses the lookup,
+  `flow_cache.rs:352-358`) that installs S2 with no P and no
+  predecessor; assert the following ACK misses the old descriptor on
+  the current AND sibling bindings (the ACK consults the cache before
+  session resolution, `poll_descriptor/mod.rs:298-327`;
+  exact-key invalidation, `flow_cache.rs:1105-1120`);
   (x) an overdue skip WITH a shadowed placeholder (the placeholder's
   identity is in the set, so a later ACK cannot refresh it from
   cache, `flow_cache_hit.rs:295-317`).
@@ -2917,7 +2938,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.26.1)
+## 11. Open questions for the convergence round (v10.27.0)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
@@ -2964,11 +2985,10 @@ this branch only if the minimal fix proves insufficient.
    deferred refresh (round-88) — is any pre-commit refresh/requeue
    path left for a probation entry (lookup, `touch_if_stale`, promote,
    materialize refresh), and does the commit-hook clear+refresh cover
-   every admission arm? (e) the v10.26.0 end-state: the contract is a
-   single coherent block with the S2 producer, the effective
-   transition, the site-qualified compositions, and the qualified
-   clear/install claims — read it as an implementer and find any
-   remaining contradiction.
+   every admission arm? (e) the v10.27.0 end-state: the effective
+   transition is a carried field read by every consumer, every
+   clear/install claim is qualified, and the e2e stale-cache
+   regression is tested — is anything left?
 
 4. **The emission posture:** master's `expire.rs:342-350` gate is
    UNCHANGED; the additions are the normative mark-creation rules, rule

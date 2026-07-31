@@ -1,0 +1,20 @@
+# Codex hostile plan-review — round 110 (v10.26.0)
+
+Reviewer: Codex (fresh thread, job task-ms9entz3-mufb0j, 2026-07-31). Verdict: PLAN NO (1B/1M/1L). r109-1/r109-3 RESOLVED; r109-2 UNRESOLVED at the reviewed commit (the effective transition was not yet a carried field named at every consumer — the v10.26.1 AGY fold had covered the struct + two gates, and r110 demands it at ALL consumers, which v10.27.0 folds); r109-4 UNRESOLVED (outside-SSOT contradictions); plus the missing end-to-end stale-cache fixture.
+
+## Verbatim review
+
+PLAN NO 1. **BLOCKER — `effective_transition` remains mechanically undefined.** `MaterializeR...
+
+[2026-07-31T20:47:16.942Z] Assistant message
+PLAN NO
+
+1. **BLOCKER — `effective_transition` remains mechanically undefined.** `MaterializeReport` contains only `site/validation/transition/displaced`; `MaterializeReport::NONE` and poller carriage likewise transport only that raw report, while promotion and commit consumers still explicitly inspect `report.transition` ([plan.md:1729](/home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/docs/research/6461-blind-rst/plan.md:1729), `plan.md:1746-1769`, `plan.md:1791-1821`). This contradicts the claim that every consumer reads one derived effective transition.
+
+   Code trace: materialization is followed immediately by promotion before `ResolvedFlowSessionDecision` is constructed ([session_glue/mod.rs:1194](/home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/session_glue/mod.rs:1194)); promotion currently gates only origin/disposition before overwriting, publishing, and replicating ([promote.rs:86](/home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/session_glue/promote.rs:86)). Thus the cited invalid `(Some(Site2c), Accepted, Installed)` report still has no specified mechanism preventing promotion. Define `effective_transition` as a carried field or total accessor, initialize it in `NONE`, and name it at promotion, poller carriage, MissingNeighbor, teardown, cache, and commit consumers.
+
+2. **MEDIUM — The overdue exception still contradicts active summaries and tests outside the SSOT.** Several passages categorically say a refused site-2c close installs an alive probation copy (`plan.md:436`, `plan.md:1305-1307`, `plan.md:2403-2410`) or that the next committed/unbuffered non-close necessarily clears, refreshes, and promotes (`plan.md:646-650`, `plan.md:1224-1229`, `plan.md:1527-1531`, `plan.md:1621-1625`, `plan.md:2573-2577`). But `(Refused, OverdueSkipped)` performs no upsert and none of those authority mutations (`plan.md:1351-1379`, `plan.md:1805-1821`). This is reachable because expiry is strict and wheel-driven, leaving a due entry visible before GC processes its slot ([expire.rs:130](/home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/session/expire.rs:130)). SSOT precedence makes the intended behavior recoverable, but the header’s “every unconditional claim” assertion is false.
+
+3. **LOW — The exact stale-cache regression behind r109-1 is not explicit.** Section 9 asserts S2 membership and separately tests current/sibling invalidation (`plan.md:2457-2484`), but lacks the end-to-end fixture: pre-seed an old cache descriptor, process a cache-ineligible close that installs S2 with no P/predecessor, then prove the following ACK misses the old descriptor on current and sibling bindings. That is the critical ordering because closes bypass cache lookup ([flow_cache.rs:352](/home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/flow_cache.rs:352)), ACKs consult it before session resolution ([poll_descriptor/mod.rs:298](/home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/poll_descriptor/mod.rs:298)), and invalidation is exact-key (`flow_cache.rs:1105-1120`). The S2 producer and capacity-three accounting themselves are sound.
+
+Round-109 dispositions: r109-1 RESOLVED; r109-2 UNRESOLVED; r109-3 RESOLVED; r109-4 UNRESOLVED.
