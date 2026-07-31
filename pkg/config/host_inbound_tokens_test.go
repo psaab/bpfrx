@@ -1,7 +1,12 @@
 package config
 
 import (
+	"compress/gzip"
+	"crypto/sha256"
+	"fmt"
+	"io"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -130,59 +135,184 @@ func TestHostInboundRoutingProtocolTokensCommit(t *testing.T) {
 	}
 }
 
-// junosSchemaOracle is the vendored extract of Juniper's PUBLISHED YANG
-// enumeration for `security zones ... host-inbound-traffic system-services`.
-// See the file header for provenance and the (verified reproducible)
-// regeneration command.
+// The Junos `system-services` oracle: Juniper's PUBLISHED YANG MODULE, vendored
+// whole and PARSED at test time.
 //
-// It exists because the `system-services all` union was wrong THREE times while
-// the oracle was a hand-transcribed list copied out of Juniper's prose
-// reference pages. Those pages are individually incomplete and mutually
-// inconsistent — between them they omit `lsping`, `sip`, `appqoe`,
-// `tcp-encap`, `lsselfping` and `high-availability` — so a test that claimed to
-// carry the list "verbatim" was asserting against a set that had never been the
-// real one. The YANG module is the schema the Junos CLI validates against, so
-// it is complete by construction for a stated release, and deriving the oracle
-// from a vendored copy of it removes the hand-transcription step entirely.
-const junosSchemaOracle = "testdata/junos-24.4R2-host-inbound-system-services.txt"
+// This union was wrong three times while the oracle was a list hand-copied out
+// of Juniper's prose reference pages, which are individually incomplete and
+// mutually inconsistent. A fourth revision replaced that with a hand-copied list
+// of tokens EXTRACTED from the YANG — which was no better in kind: it was still
+// a literal nobody could check, and deleting a token from it (and from the
+// implementation) stayed green.
+//
+// So the module itself is vendored, gzipped, and the test does the extraction.
+// Three gates make the derivation real rather than asserted:
+//
+//  1. SHA-256 of the DECOMPRESSED module is pinned to the byte-identical hash of
+//     the file Juniper publishes. Any edit to the vendored copy — including
+//     deleting one `enum` — changes it and REDS. Anyone can check the pin by
+//     hand against upstream; see the regeneration recipe below.
+//  2. The enumeration is extracted by brace-matching the grouping and reading
+//     its `enum` statements. Nothing is transcribed.
+//  3. The token COUNT is pinned, so a deletion still REDS even if the hash pin
+//     were re-baselined along with the edit.
+//
+// Regenerate (network required; verified to reproduce the pinned hash):
+//
+//	U=https://raw.githubusercontent.com/Juniper/yang/master/24.4/24.4R2
+//	U=$U/native/conf-and-rpcs/junos-es/conf/models
+//	curl -sSL "$U/junos-es-conf-security%402024-01-01.yang" |
+//	  tee >(sha256sum) | gzip -9 -n > \
+//	  pkg/config/testdata/junos-es-conf-security@2024-01-01.yang.gz
+//
+// `gzip -n` omits the mtime, so the vendored file is byte-reproducible: running
+// the recipe again yields an identical blob rather than a spurious diff.
+const (
+	// junosSchemaModule is the vendored module: junos-es (the SRX/vSRX platform
+	// family) security configuration, revision 2024-01-01, whose revision
+	// description reads "Junos: 24.4R2.25" — the target release.
+	junosSchemaModule = "testdata/junos-es-conf-security@2024-01-01.yang.gz"
 
-// junosSchemaSystemServices parses the vendored oracle and returns the CONCRETE
-// service tokens (the enumeration minus the two meta tokens `all` /
-// `any-service`, which name no single service).
+	// junosSchemaModuleSHA256 is the SHA-256 of the DECOMPRESSED module, equal to
+	// the hash of the file published at the URL in the recipe above. It is the
+	// tamper gate: it makes the vendored copy checkable against upstream by hand,
+	// and makes any local edit fail loudly instead of silently redefining what
+	// "Juniper documents".
+	junosSchemaModuleSHA256 = "3d03d81b1ac2041c070610c9708f74c3bc67c6d26790d4fe2509b63d5d3bd70e"
+
+	// junosSchemaZoneGrouping is the zone-level stanza
+	// (`security zones security-zone <z> host-inbound-traffic system-services`).
+	junosSchemaZoneGrouping = "zone-system-services-object-type"
+	// junosSchemaIfaceGrouping is the per-interface override
+	// (`... security-zone <z> interfaces <i> host-inbound-traffic
+	// system-services`). The two must enumerate the same tokens; the test
+	// ENFORCES that rather than recording it as a comment.
+	junosSchemaIfaceGrouping = "interface-system-services-object-type"
+
+	// junosSchemaTokenCount is the size of the 24.4R2 enumeration: 35 concrete
+	// services plus the two meta tokens `all` and `any-service`. Pinned as a
+	// second, independent guard so a token deletion REDS even if the hash pin is
+	// re-baselined in the same edit. Bumping this is a deliberate act that must
+	// come with a re-vendored module and a new hash.
+	junosSchemaTokenCount = 37
+)
+
+// junosSchemaModuleSource decompresses the vendored YANG module and gates it on
+// the pinned SHA-256.
+func junosSchemaModuleSource(t *testing.T) string {
+	t.Helper()
+	f, err := os.Open(junosSchemaModule)
+	if err != nil {
+		t.Fatalf("opening the vendored Junos schema module %s: %v", junosSchemaModule, err)
+	}
+	defer f.Close()
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatalf("gunzip %s: %v", junosSchemaModule, err)
+	}
+	defer zr.Close()
+	raw, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("reading %s: %v", junosSchemaModule, err)
+	}
+	if got := fmt.Sprintf("%x", sha256.Sum256(raw)); got != junosSchemaModuleSHA256 {
+		t.Fatalf("vendored Junos schema module %s has SHA-256 %s, want %s.\n"+
+			"The module is the ORACLE for a security allowlist: it must be Juniper's "+
+			"published bytes, not a locally edited copy. If you are intentionally moving to "+
+			"a new target release, re-vendor from upstream and update the pin (and "+
+			"junosSchemaTokenCount) in the same commit.",
+			junosSchemaModule, got, junosSchemaModuleSHA256)
+	}
+	return string(raw)
+}
+
+// junosSchemaGroupingEnums extracts the `enum` values of a YANG grouping's
+// `leaf name { type enumeration { ... } }` by brace-matching the grouping body,
+// so an `enum` belonging to some later grouping can never leak in.
+func junosSchemaGroupingEnums(t *testing.T, src, grouping string) []string {
+	t.Helper()
+	lines := strings.Split(src, "\n")
+	head := regexp.MustCompile(`^\s*grouping ` + regexp.QuoteMeta(grouping) + `\s*\{`)
+	start := -1
+	for i, l := range lines {
+		if head.MatchString(l) {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		t.Fatalf("grouping %q not found in %s — the module moved or was replaced; "+
+			"the oracle cannot be derived", grouping, junosSchemaModule)
+	}
+	depth, end := 0, -1
+	for i := start; i < len(lines); i++ {
+		depth += strings.Count(lines[i], "{") - strings.Count(lines[i], "}")
+		if depth == 0 && i > start {
+			end = i
+			break
+		}
+	}
+	if end < 0 {
+		t.Fatalf("grouping %q in %s is unterminated — parser or module is broken", grouping, junosSchemaModule)
+	}
+	enumRe := regexp.MustCompile(`^\s*enum "([^"]+)"`)
+	var out []string
+	for _, l := range lines[start : end+1] {
+		if m := enumRe.FindStringSubmatch(l); m != nil {
+			out = append(out, m[1])
+		}
+	}
+	return out
+}
+
+// junosSchemaSystemServices parses the vendored module and returns the CONCRETE
+// `system-services` tokens — the enumeration minus the two meta tokens `all` and
+// `any-service`, which name no single service.
 //
-// It fails loudly on a short/garbled parse: a silently-empty oracle would make
-// every "the union covers Juniper's set" assertion pass vacuously, which is the
-// same class of false-green the hand-typed list produced.
+// It also ENFORCES the zone-level / per-interface agreement that earlier
+// revisions merely asserted in a comment: both groupings must enumerate exactly
+// the same tokens, so one oracle legitimately governs both surfaces.
 func junosSchemaSystemServices(t *testing.T) []string {
 	t.Helper()
-	raw, err := os.ReadFile(junosSchemaOracle)
-	if err != nil {
-		t.Fatalf("reading the Junos schema oracle %s: %v", junosSchemaOracle, err)
+	src := junosSchemaModuleSource(t)
+
+	zone := junosSchemaGroupingEnums(t, src, junosSchemaZoneGrouping)
+	iface := junosSchemaGroupingEnums(t, src, junosSchemaIfaceGrouping)
+
+	if len(zone) != junosSchemaTokenCount {
+		t.Fatalf("grouping %s enumerates %d tokens, want %d (%v).\n"+
+			"A changed count means the vendored module is not the pinned 24.4R2 enumeration "+
+			"— re-vendor and update junosSchemaTokenCount deliberately, never to make a test pass.",
+			junosSchemaZoneGrouping, len(zone), junosSchemaTokenCount, zone)
 	}
+	zoneSet, ifaceSet := map[string]bool{}, map[string]bool{}
+	for _, tok := range zone {
+		zoneSet[tok] = true
+	}
+	for _, tok := range iface {
+		ifaceSet[tok] = true
+	}
+	missing, extra := diffSets(zoneSet, ifaceSet)
+	if len(missing) != 0 || len(extra) != 0 {
+		t.Fatalf("the zone-level (%s) and per-interface (%s) groupings enumerate DIFFERENT "+
+			"tokens (only-in-zone %v, only-in-interface %v) — one oracle cannot govern both "+
+			"surfaces; xpf models them with a single token set",
+			junosSchemaZoneGrouping, junosSchemaIfaceGrouping, missing, extra)
+	}
+
 	var concrete []string
 	meta := map[string]bool{}
-	for _, line := range strings.Split(string(raw), "\n") {
-		tok := strings.TrimSpace(line)
-		if tok == "" || strings.HasPrefix(tok, "#") {
-			continue
-		}
+	for _, tok := range zone {
 		if tok == "all" || tok == "any-service" {
 			meta[tok] = true
 			continue
 		}
 		concrete = append(concrete, tok)
 	}
-	// Anti-vacuity: the 24.4R2 enumeration has 37 entries (35 concrete + 2
-	// meta). Allow the count to grow with a future release bump, but never let a
-	// truncated or mis-parsed file through.
-	if len(concrete) < 30 {
-		t.Fatalf("%s parsed only %d concrete tokens (%v) — oracle truncated or parser broken; "+
-			"every union assertion built on it would pass vacuously",
-			junosSchemaOracle, len(concrete), concrete)
-	}
 	for _, m := range []string{"all", "any-service"} {
 		if !meta[m] {
-			t.Fatalf("%s is missing the meta token %q — the extract is not the full enumeration", junosSchemaOracle, m)
+			t.Fatalf("grouping %s is missing the meta token %q — this is not the "+
+				"host-inbound system-services enumeration", junosSchemaZoneGrouping, m)
 		}
 	}
 	return concrete
@@ -404,10 +534,15 @@ func TestHostInboundFixedPortJunosServicesCommit_3226(t *testing.T) {
 //	  probe-server container is presence-gated so nothing listens without
 //	  explicit configuration.
 //
-// The evidence is POSITIVE rather than absence-of-evidence: the same 24.4R2
-// module tree carries `default "2900"` / `default "2901"` on the reverse-telnet
-// / reverse-ssh port leaves, so the schema does record platform defaults where
-// they exist, and their absence here is a statement that none does.
+// The basis is a deliberate CHOICE under uncertainty, NOT an inference from the
+// schema. An earlier revision argued that the absence of a YANG `default` proved
+// no fixed port existed; that generalization is false — `[edit system services
+// telnet]` has no port leaf either, yet telnet is TCP/23 — and has been
+// withdrawn. What holds is narrower: no authoritative host-inbound tuple was
+// found for these tokens, and under that gap opening nothing fails in one
+// direction and visibly, whereas a guessed port fails in both directions and
+// silently. See config.HostInboundUnportedSystemServices for per-token evidence
+// and for what is explicitly NOT sourced.
 //
 // FAIL-ON-REVERT: give any of these a tuple (add a case arm, or drop it from
 // HostInboundUnportedSystemServices) and the no-tuple assertion goes RED naming
@@ -419,6 +554,42 @@ func TestHostInboundUnportedJunosServicesCommit_3226(t *testing.T) {
 	}
 	if len(HostInboundUnportedSystemServices) == 0 {
 		t.Fatal("HostInboundUnportedSystemServices is empty — the subtests below would be vacuous")
+	}
+	// BIJECTION with the reason map: a token cannot be given a no-admit mapping
+	// without stating WHY, and a reason cannot name a token that is not actually
+	// unported. The two classes are epistemically different — an
+	// operator-configured port is a positive fact about how Junos defines the
+	// service, an unsourced one is an admission about the limits of our sourcing
+	// — and conflating them is the overstatement pattern this fold keeps having
+	// to correct.
+	for tok := range HostInboundUnportedSystemServices {
+		reason, ok := HostInboundNoAdmitReason[tok]
+		if !ok {
+			t.Errorf("%q has no HostInboundNoAdmitReason — every no-admit token must state "+
+				"whether its port is operator-configured or simply unsourced", tok)
+			continue
+		}
+		if reason != HostInboundNoPortOperatorConfigured && reason != HostInboundNoPortUnsourced {
+			t.Errorf("%q has reason %q, which is neither %q nor %q", tok, reason,
+				HostInboundNoPortOperatorConfigured, HostInboundNoPortUnsourced)
+		}
+	}
+	for tok := range HostInboundNoAdmitReason {
+		if !HostInboundUnportedSystemServices[tok] {
+			t.Errorf("%q has a no-admit REASON but is not in HostInboundUnportedSystemServices — "+
+				"the reason map must not claim a token xpf actually admits", tok)
+		}
+	}
+	// Both classes must be populated, or the distinction is decorative.
+	classes := map[string]int{}
+	for _, r := range HostInboundNoAdmitReason {
+		classes[r]++
+	}
+	for _, want := range []string{HostInboundNoPortOperatorConfigured, HostInboundNoPortUnsourced} {
+		if classes[want] == 0 {
+			t.Errorf("no token carries reason %q — if a class is empty, delete it rather than "+
+				"keeping a distinction nothing uses", want)
+		}
 	}
 	for tok := range HostInboundUnportedSystemServices {
 		t.Run(tok, func(t *testing.T) {

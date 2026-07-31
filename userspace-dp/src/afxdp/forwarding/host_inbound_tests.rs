@@ -447,7 +447,7 @@ fn system_services_all_excludes_non_junos_extensions() {
 // validator rejects any token outside the same allowlist).
 //
 // The set is derived from Juniper's published YANG schema, extracted into
-// pkg/config/testdata/junos-24.4R2-host-inbound-system-services.txt — NOT from
+// pkg/config/testdata/junos-es-conf-security@2024-01-01.yang.gz — NOT from
 // the prose reference pages, which are individually incomplete and had this
 // union wrong three times.
 //
@@ -517,10 +517,13 @@ fn system_services_all_admits_documented_junos_services_3226() {
 // actually configured. An unverified port is wrong in BOTH directions at once,
 // which is why the correct model is no tuple plus a commit advisory.
 //
-// The evidence is positive, not absence-of-evidence: Juniper's YANG carries a
-// `default` statement wherever a platform default exists — the sibling
-// reverse-telnet / reverse-ssh port leaves do, and are admitted above — so its
-// absence on these leaves is a schema-level statement that none exists.
+// The basis is a deliberate CHOICE under uncertainty, NOT an inference from the
+// schema. (An earlier revision argued the absence of a YANG `default` proved
+// there was no fixed port; that is false — `[edit system services telnet]` has
+// no port leaf either, yet telnet is TCP/23 — and has been withdrawn.) No
+// authoritative host-inbound tuple was found for these tokens, and under that
+// gap opening nothing fails in one direction and visibly, whereas a guess fails
+// in both directions and silently.
 //
 // FAIL-ON-REVERT: hand any of these tokens a port (in classify_system_service or
 // by dropping it from HOST_INBOUND_UNPORTED_SERVICES while adding an insert) and

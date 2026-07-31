@@ -105,7 +105,7 @@ var KnownHostInboundSystemServices = map[string]bool{
 	//
 	// The membership of this map is now derived from Juniper's PUBLISHED YANG
 	// SCHEMA, not from prose reference pages — see
-	// testdata/junos-24.4R2-host-inbound-system-services.txt for the extract and
+	// testdata/junos-es-conf-security@2024-01-01.yang.gz for the extract and
 	// its provenance, and TestHostInboundAllUnionMatchesJunosSchema_3226 for the
 	// bidirectional assertion. The prose pages were the reason this set was
 	// wrong three times: they are individually incomplete and mutually
@@ -272,87 +272,214 @@ var HostInboundNonJunosSystemServices = map[string]bool{
 }
 
 // HostInboundUnportedSystemServices is the set of recognized JUNOS
-// `system-services` tokens for which no platform-fixed host-inbound listening
-// port exists, so xpf synthesizes NO admission tuple for them (#3226 fold).
+// `system-services` tokens for which xpf could not establish an authoritative
+// host-inbound listening tuple, and therefore synthesizes NO admission tuple
+// (#3226 fold).
 //
 // These are NOT xpf extensions — they are in Juniper's published schema (see
-// testdata/junos-24.4R2-host-inbound-system-services.txt), so they stay in
+// the oracle in host_inbound_tokens_test.go), so they stay in
 // KnownHostInboundSystemServices (a valid vSRX stanza naming them must commit,
 // the #3200 parity rule) and stay in the `system-services all` union (Junos's
-// `all` covers them). They simply contribute no L4Match on ANY enforcement
-// surface, because the port that would have to be opened is not fixed by the
-// platform: it is operator-configured, derived from another stanza, or never
-// documented at all.
+// `all` covers them). They simply contribute no L4Match on any enforcement
+// surface.
 //
-// The alternative — picking a plausible-looking port — is the failure mode this
-// set exists to prevent. An unverified port does not fail safe in one
-// direction: it silently ADMITS a port nothing listens on (gratuitous attack
-// surface on every `all` zone) while still DENYING the port the service
-// actually uses. Both halves are wrong, and neither is visible to the operator.
-// Emitting nothing is at least uniformly fail-CLOSED, and the commit advisory
-// in compiler_validate_warn.go makes the gap explicit at the moment the
-// operator names the token.
+// # This is a CHOICE under uncertainty, not an inference
 //
-// The evidence is POSITIVE, not an absence-of-evidence argument. Juniper's YANG
-// records a `default` statement wherever a platform default exists — the
-// sibling reverse-telnet / reverse-ssh port leaves carry `default "2900"` /
-// `default "2901"` in the very same 24.4R2 module tree. So the ABSENCE of a
-// `default` on these leaves is a schema-level statement that there is none:
+// An earlier revision justified the empty mapping by arguing that Juniper's
+// YANG records a `default` wherever a platform default exists, so its absence
+// proved there was none. That generalization is FALSE and has been withdrawn:
+// `[edit system services telnet]` has no port leaf and no default either, yet
+// telnet plainly has a fixed wire tuple, and this very file maps it to TCP/23.
+// The absence of a configuration leaf says nothing about whether a service has
+// a fixed listening port.
 //
-//	r2cp   — `[edit protocols r2cp] server-port` (junos-es-conf-protocols
-//	         24.4R2) is `range "1 .. 65535"` with NO default. The TRANSPORT is
-//	         UDP (the sibling `client-port port-number` is described as "UDP
-//	         port number for R2CP clients"), but the server port is chosen by
-//	         the operator. UDP/28762 — carried by earlier revisions of this fold
-//	         — appears only in draft-dubois-r2cp-00, which calls it a SUGGESTED
-//	         value used by prototypes, and Juniper never adopts it in schema or
-//	         docs.
+// What is actually true is narrower: for each token below we looked and did not
+// find an authoritative source for a host-inbound listening tuple. That is a gap
+// in our knowledge. Faced with it there are two options, and we pick the second
+// deliberately:
+//
+//	GUESS a port. If the guess is wrong it is wrong in BOTH directions at once —
+//	  it opens a port with no listener (real attack surface on every `all` zone)
+//	  AND still denies the port actually in use. Neither half is visible to the
+//	  operator. An earlier revision did this for two tokens: r2cp udp/28762 (a
+//	  value draft-dubois-r2cp-00 says prototypes merely SUGGESTED, adopted by
+//	  Juniper nowhere) and rpm tcp+udp/7 (the FLOOR of an explicitly
+//	  operator-configured range, not a default).
+//
+//	OPEN NOTHING. Wrong in ONE direction — traffic Junos would admit is denied —
+//	  but the failure is announced at commit (compiler_validate_warn.go), is
+//	  recoverable by the operator without a code change, and never silently
+//	  widens the host's exposure.
+//
+// We choose OPEN NOTHING because its failure mode is one-directional, visible
+// and recoverable, and because a firewall is the wrong place to guess. If an
+// authoritative tuple is found for any token below, move it out of this set with
+// the source recorded — that is a strict improvement and is expected.
+//
+// # Per-token evidence, including what is NOT sourced
+//
+//	r2cp   — `[edit protocols r2cp] server-port` (junos-es-conf-protocols 24.4R2)
+//	         is `range "1 .. 65535"`, i.e. the server port is operator-chosen.
+//	         Transport is UDP by the sibling `client-port port-number`
+//	         description ("UDP port number for R2CP clients") — INDIRECT, and no
+//	         default port is documented. NOT SOURCED: a default listening port.
 //	rpm    — `[edit services rpm probe-server] tcp|udp port`
-//	         (junos-es-conf-services 24.4R2) is described "Port number 7 through
-//	         65535" with NO default; 7 is the RANGE FLOOR, not a default, and
-//	         the probe-server container is `presence`-gated, so with no
-//	         configuration nothing listens at all. Earlier revisions of this
-//	         fold admitted tcp+udp/7 on every `all` zone on the strength of that
-//	         floor.
-//	tcp-encap — `[edit security tcp-encap]` (junos-es-conf-security 24.4R2)
-//	         has NO port leaf anywhere: a profile carries only `ssl-profile`
-//	         and `log`. The listener port comes from the referenced SSL
-//	         termination profile, i.e. it is operator-configured per deployment.
-//	appqoe — the APPQOE ACTIVE probe. The whole appqoe / advance-policy-based
-//	         -routing subtree of junos-es-conf-security 24.4R2 contains NO port
-//	         leaf: `active-probe-params` configures data-fill, data-size,
-//	         probe-interval, probe-count, burst-size, dscp-code-points and so on,
-//	         and the probe TARGET is an overlay `probe-path ... ip-address`, an
-//	         IP with no port. Note the decoy: UDP/36000 appears in AppQoE
-//	         documentation but belongs to the PASSIVE probe, which is TRANSIT
-//	         traffic — Juniper's own guidance is an input filter that DISCARDS
-//	         udp/36000 on non-WAN interfaces, so admitting it host-inbound would
-//	         be doubly wrong.
+//	         (junos-es-conf-services 24.4R2) is "Port number 7 through 65535",
+//	         and Juniper's RPM receiver documentation describes the port as
+//	         explicitly configured. The container is `presence`-gated, so with no
+//	         configuration nothing listens. This is the best-evidenced member of
+//	         the set: the port is genuinely per-deployment, not merely unfound.
+//	tcp-encap — transport is TCP (the feature is IPsec/IKE encapsulated in a TCP
+//	         connection). NOT SOURCED: the listening port. `[edit security
+//	         tcp-encap]` carries no port leaf, and the earlier claim that the
+//	         port comes from the referenced SSL termination profile was an
+//	         inference, not something Juniper documents — it has been withdrawn.
+//	appqoe — the APPQOE ACTIVE probe. NOT SOURCED: transport or port. No
+//	         authoritative host-inbound tuple was found. Note the decoy: UDP/36000
+//	         appears in AppQoE documentation but belongs to the PASSIVE probe,
+//	         which is TRANSIT traffic — Juniper's own guidance is an input filter
+//	         that DISCARDS udp/36000 on non-WAN interfaces, so admitting it
+//	         host-inbound would be doubly wrong.
 //	high-availability — Multinode High Availability (MNHA) inter-node control
-//	         traffic over the interchassis link. `[edit chassis
-//	         high-availability]` (junos-es-conf-chassis 24.4R2) spans 1037 lines
-//	         with NO port leaf: peering is configured entirely by local-ip /
-//	         peer-ip / interface / routing-instance / vpn-profile. Juniper's MNHA
-//	         preparation guidance tells operators to permit the ICL path without
-//	         publishing any port number for it. Do not attribute udp/500+4500,
-//	         ESP or tcp/22 to this token — MNHA examples admit those through
-//	         their OWN tokens (`ike`, `ssh`) alongside this one.
-//
-// Consequence, documented in docs/host-inbound-service-matrix.md: a zone that
-// actually terminates one of these services must admit it with an explicit
-// firewall filter, or fall back to `system-services any-service`. This is a
-// KNOWN, fail-closed divergence from Junos, recorded deliberately rather than
-// papered over with a guessed port.
+//	         over the interchassis link. NOT SOURCED: transport or port. This is
+//	         the sharpest case, because Juniper's MNHA examples explicitly place
+//	         this token on the ICL zone. MITIGATION: xpf does not implement MNHA;
+//	         its own inter-node HA control plane (heartbeat on the cluster
+//	         control interface, session/config sync over the fabric) rides
+//	         LIFELINE interfaces — fxp0, em0, fab*, plus any configured
+//	         control-interface / fabric-interface (HostInboundLifelineSet, #3277)
+//	         — which BuildZoneHostInboundViews removes before generating
+//	         host-inbound deny sets. So an unported `high-availability` cannot
+//	         break xpf's own HA. It would bite only an operator carrying a Junos
+//	         MNHA config onto a non-lifeline zone, who gets the commit advisory.
 //
 // The Rust classifier mirrors this set via HOST_INBOUND_UNPORTED_SERVICES and
 // the #3486 parity test asserts the two sets are equal, so a future edit that
-// teaches one surface a port without the other cannot go unnoticed.
+// teaches one surface a port without the other cannot go unnoticed. The
+// operator-facing consequence — including which escape hatches actually work on
+// which enforcement surface — is in docs/host-inbound-service-matrix.md.
 var HostInboundUnportedSystemServices = map[string]bool{
 	"r2cp":              true,
 	"rpm":               true,
 	"tcp-encap":         true,
 	"appqoe":            true,
 	"high-availability": true,
+}
+
+// The two REASONS a recognized Junos service ends up in
+// HostInboundUnportedSystemServices. They are epistemically different and must
+// not be conflated: one is a positive fact about how Junos defines the service,
+// the other is an admission about the limits of our sourcing. Folding them into
+// one undifferentiated set implies they were all established the same way, which
+// is the overstatement pattern this fold keeps having to correct.
+const (
+	// HostInboundNoPortOperatorConfigured: Junos DOCUMENTS the listening port as
+	// chosen by the operator, over a range, with no platform default. There is no
+	// "correct port" for xpf to admit — not because we failed to find it, but
+	// because the service does not have one until the operator configures it.
+	// Restoring a port for these services is not an available option; the only
+	// choice is between a guess and nothing.
+	HostInboundNoPortOperatorConfigured = "operator-configured port"
+
+	// HostInboundNoPortUnsourced: xpf could NOT find an authoritative
+	// host-inbound listening tuple. This is an admission of ignorance, not a
+	// finding. The service may well have a fixed port that we did not locate. If
+	// one is found, move the token out of HostInboundUnportedSystemServices with
+	// the source recorded — that is a strict improvement and is expected.
+	HostInboundNoPortUnsourced = "no authoritative tuple found"
+)
+
+// HostInboundNoAdmitReason gives the REASON class for every token in
+// HostInboundUnportedSystemServices. The two sets are held in bijection by
+// TestHostInboundUnportedJunosServicesCommit_3226, so a token cannot be added to
+// the no-admit set without stating WHY it is there.
+//
+// The distinction is operator-visible: the commit advisory words itself
+// differently for the two classes, because the operator's situation differs. For
+// an operator-configured port they know their own port and can act on it
+// directly; for an unsourced service nobody knows the port, including us.
+var HostInboundNoAdmitReason = map[string]string{
+	// Juniper's RPM receiver documentation describes the probe-server port as
+	// explicitly configured, and `[edit services rpm probe-server] tcp|udp port`
+	// (junos-es-conf-services 24.4R2) is "Port number 7 through 65535". The
+	// container is presence-gated, so with no configuration nothing listens at
+	// all. An earlier revision admitted tcp+udp/7 — the range FLOOR, not a
+	// default.
+	"rpm": HostInboundNoPortOperatorConfigured,
+	// `[edit protocols r2cp] server-port` (junos-es-conf-protocols 24.4R2) is
+	// `range "1 .. 65535"`, operator-chosen, no default. Transport is UDP by the
+	// sibling `client-port port-number` description ("UDP port number for R2CP
+	// clients") — INDIRECT evidence, and moot while no port is admitted.
+	// udp/28762, carried by an earlier revision, appears only in
+	// draft-dubois-r2cp-00, which calls it a value prototypes SUGGESTED.
+	"r2cp": HostInboundNoPortOperatorConfigured,
+	// Transport is TCP (the feature encapsulates IKE/ESP in a TCP connection).
+	// No DEFAULT listening port is documented. The closest Juniper evidence is
+	// the sample output of `show security tcp-encap connection detail`, whose
+	// "Local Gateway" (the SRX side) appears as 10.4.0.2:443 in one session and
+	// 10.4.0.2:500 in another — so the vendor's own example shows TWO different
+	// listening ports and its Output Fields table never documents the port
+	// component at all. `[edit security tcp-encap]` exposes only profile /
+	// ssl-profile / log / traceoptions, and `services ssl termination profile`
+	// has no port option and no documented default either; an earlier revision
+	// claimed the port comes from that profile, which was an inference Juniper
+	// does not state, and it is withdrawn. TCP/443 is CONVENTION — the NCP Path
+	// Finder client guide describes falling back to "TCP encapsulation of IPsec
+	// with SSL header (via port 443)", but that is the CLIENT vendor describing
+	// client behaviour, and Juniper's own Secure Connect guide never mentions
+	// 443 at all. A sample and a third-party convention are not a default, so
+	// this stays unsourced rather than being promoted to an admit.
+	//
+	// Practical note for operators: TCP/443 is ALREADY in the `all` union via
+	// `https` / `webapi-ssl`, so on an `all` zone the observable gap is
+	// narrower than it looks — it is the non-443 case (e.g. the TCP/500 the
+	// same sample shows) that is actually denied.
+	"tcp-encap": HostInboundNoPortUnsourced,
+	// The APPQOE ACTIVE probe. Neither transport nor port sourced: Juniper
+	// describes the active probe only as "custom packets are sent between spoke
+	// and hub points on all the multiple routes", and `active-probe-params`
+	// exposes probe-count / probe-interval / data-fill / data-size /
+	// dscp-code-points / enable-sla-export / per-packet-loss-timeout /
+	// forwarding-class / loss-priority — no port and no transport. The
+	// `show ... sla active-probe-statistics` output fields are addresses and
+	// timings only, with no port column.
+	//
+	// Decoy to avoid: udp/36000 is the only port on the AppQoE page, and it
+	// belongs to the PASSIVE probe — the Limitations section says "An input
+	// firewall filter is required at the non-WAN interfaces to discard UDP
+	// packets with UDP destination port 36000." That is TRANSIT traffic Juniper
+	// tells operators to DISCARD, so admitting it host-inbound would be doubly
+	// wrong.
+	"appqoe": HostInboundNoPortUnsourced,
+	// Multinode High Availability (MNHA) inter-node control over the interchassis
+	// link. Juniper EXPLICITLY ACKNOWLEDGES that a protocol and port exist and
+	// declines to publish them — the MNHA preparation guidance says the ICL
+	// "path uses (whether the ICL is encrypted or not) IP address, protocol, and
+	// port details. You must ensure that this communication is allowed between
+	// the nodes if any firewall or other inspection is in place." That is the
+	// entire published statement; no numbers appear anywhere. A sweep of the
+	// full Junos High Availability User Guide found 12 config examples using
+	// this token and not one port, and every TCP/UDP port in the book belongs to
+	// the generic BFD chapters, not to MNHA. The `show chassis high-availability
+	// information` / `peer-info` outputs carry peer IP, interface,
+	// routing-instance and encryption state — there is no port field.
+	//
+	// Do NOT attribute udp/500+4500 or ESP here. Those belong to the OPTIONAL
+	// `ha-link-encryption`, and Juniper's own MNHA examples admit them through
+	// the SEPARATE `ike` token configured alongside this one. Search summarizers
+	// volunteer that mapping readily; it is wrong.
+	//
+	// What makes it tolerable in xpf specifically: xpf does NOT implement MNHA.
+	// Its inter-node HA control plane is the chassis-cluster model — heartbeat on
+	// the control interface, session/config sync over the fabric — and those ride
+	// LIFELINE interfaces (fxp0, em0, fab*, plus any configured
+	// control-interface / fabric-interface; HostInboundLifelineSet, #3277) which
+	// BuildZoneHostInboundViews removes before generating host-inbound deny sets.
+	// So an unported `high-availability` cannot break xpf's own HA. Naming the
+	// token is, for xpf, a NO-OP: there is no MNHA ICL for it to govern. It bites
+	// only an operator porting a Junos MNHA config onto a non-lifeline zone, who
+	// gets the commit advisory.
+	"high-availability": HostInboundNoPortUnsourced,
 }
 
 // HostInboundAllExpansionServices returns the `system-services` tokens that

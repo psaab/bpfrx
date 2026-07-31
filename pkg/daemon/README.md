@@ -1347,10 +1347,12 @@ never lock an operator out of a remote box it manages.
   `high-availability`. Without them a scoped `all` denied a defined service AND
   the operator could not name it (strict validation rejects tokens outside the
   same allowlist), a fail-CLOSED regression rather than an over-admit closed.
-  The union's membership is DERIVED from Juniper's published YANG schema
-  (vendored extract: `pkg/config/testdata/junos-24.4R2-host-inbound-system-
-  services.txt`), not from the prose reference pages, which are individually
-  incomplete and had this set wrong three times.
+  The union's membership is DERIVED at test time from Juniper's published YANG
+  module, vendored whole and gzipped at
+  `pkg/config/testdata/junos-es-conf-security@2024-01-01.yang.gz` and PARSED by
+  `pkg/config/host_inbound_tokens_test.go` under a pinned SHA-256 — not from the
+  prose reference pages, which are individually incomplete and had this set
+  wrong three times.
   Of those, only `reverse-telnet` (tcp 2900), `reverse-ssh` (tcp 2901) and
   `lsselfping` (udp 8503) render a match: the first two carry explicit YANG
   platform defaults, the third is RFC 7746 / IANA. The rest are in

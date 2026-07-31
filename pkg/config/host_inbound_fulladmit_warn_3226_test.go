@@ -235,9 +235,42 @@ func Test_3226_UnportedSystemServiceEmitsAdvisory(t *testing.T) {
 			if !strings.Contains(got[0], `zone "wan"`) {
 				t.Errorf("advisory must name the zone, got: %q", got[0])
 			}
-			// It must point at a real remedy, or it is just noise.
-			if !strings.Contains(got[0], "any-service") || !strings.Contains(got[0], "firewall filter") {
-				t.Errorf("advisory must name the remedy (firewall filter / any-service), got: %q", got[0])
+			// It must point at a remedy that ACTUALLY WORKS, or it is worse than
+			// noise. An earlier revision told operators to "admit the real port
+			// with a firewall filter" full stop — but the AF_XDP local-delivery
+			// path runs host-inbound BEFORE the lo0 filter (#3485) and never
+			// evaluates the filter after a deny, so that rescue works on the
+			// kernel path only. `any-service` is the only escape that works on
+			// both surfaces, so the advisory must name it AND must carry the lo0
+			// surface caveat rather than promising an unconditional filter fix.
+			if !strings.Contains(got[0], "any-service") {
+				t.Errorf("advisory must name the escape that works on BOTH surfaces (any-service), got: %q", got[0])
+			}
+			// The wording must match the token's REASON CLASS. Telling an operator
+			// their port "is configurable" when in truth xpf simply could not find
+			// it would be a lie, and telling them xpf "could not find" a port that
+			// Junos documents as operator-chosen would be a different lie. The
+			// bijection between the sets is asserted in
+			// TestHostInboundUnportedJunosServicesCommit_3226; this pins that the
+			// classification actually reaches the operator.
+			switch HostInboundNoAdmitReason[tok] {
+			case HostInboundNoPortOperatorConfigured:
+				if !strings.Contains(got[0], "operator-configured port") {
+					t.Errorf("%q has an operator-configured port; the advisory must say so "+
+						"rather than claiming xpf could not find one, got: %q", tok, got[0])
+				}
+			case HostInboundNoPortUnsourced:
+				if !strings.Contains(got[0], "could not find an authoritative listening port") {
+					t.Errorf("%q is unsourced; the advisory must say xpf could not find the port "+
+						"rather than implying the operator configured it, got: %q", tok, got[0])
+				}
+			default:
+				t.Errorf("%q carries no recognized no-admit reason class", tok)
+			}
+			if !strings.Contains(got[0], "kernel path only") {
+				t.Errorf("advisory must qualify the lo0 filter remedy as kernel-path-only — the "+
+					"AF_XDP path evaluates host-inbound before the filter (#3485), so an "+
+					"unconditional \"use a firewall filter\" is false, got: %q", got[0])
 			}
 		})
 	}

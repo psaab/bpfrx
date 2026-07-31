@@ -398,7 +398,24 @@ func ValidateConfig(cfg *Config) []string {
 	//
 	// That divergence is fail-CLOSED but it must not be SILENT: an operator who
 	// went to the trouble of naming the service plainly expects it to work.
-	// Warn at the moment they name it, and name the remedy.
+	// Warn at the moment they name it, and name a remedy that ACTUALLY WORKS.
+	//
+	// The remedy wording is load-bearing and was wrong in an earlier revision,
+	// which told operators to "admit the real port with a firewall filter". That
+	// only holds on ONE of the two enforcement surfaces:
+	//
+	//   kernel nft path — WORKS. The xpf_lo0 base chain has hook-input priority
+	//     0, strictly below xpf_hostinbound at 10, so an operator lo0 `accept`
+	//     term terminates before the host-inbound backstop ever runs.
+	//   AF_XDP local-delivery path — DOES NOT WORK. #3485 deliberately runs the
+	//     host-inbound gate FIRST so a denied packet incurs none of the lo0
+	//     filter's side-effects (counter, log, reject reply); on a deny the lo0
+	//     filter is never evaluated at all, so no `accept` term can rescue it.
+	//
+	// `any-service` is therefore the only escape that works on BOTH surfaces,
+	// and it is what this advisory leads with. The lo0 caveat is stated rather
+	// than omitted, because on the kernel path — which carries ordinary direct
+	// traffic to a local address — the filter genuinely is the narrower fix.
 	//
 	// Gated on explicit naming only. `system-services all` also covers these
 	// tokens (contributing nothing), but warning there would fire on a large
@@ -420,14 +437,39 @@ func ValidateConfig(cfg *Config) []string {
 			return
 		}
 		sort.Strings(named)
+		// The two reason classes describe different operator situations, so they
+		// get different wording. For an operator-configured port the operator
+		// KNOWS their port and can act on it; for an unsourced service nobody
+		// knows it, including xpf, and saying "the port is configurable" there
+		// would be a lie.
+		var configured, unsourced []string
+		for _, tok := range named {
+			if HostInboundNoAdmitReason[tok] == HostInboundNoPortOperatorConfigured {
+				configured = append(configured, tok)
+			} else {
+				unsourced = append(unsourced, tok)
+			}
+		}
+		var why []string
+		if len(configured) > 0 {
+			why = append(why, fmt.Sprintf(
+				"[%s] have an operator-configured port with no platform default, so there "+
+					"is no fixed port for xpf to admit", strings.Join(configured, " ")))
+		}
+		if len(unsourced) > 0 {
+			why = append(why, fmt.Sprintf(
+				"for [%s] xpf could not find an authoritative listening port and will not "+
+					"guess one", strings.Join(unsourced, " ")))
+		}
 		warnings = append(warnings, fmt.Sprintf(
-			"%s: system-services [%s] accepted but NOT enforced — Junos fixes no "+
-				"listening port for these services, so xpf opens nothing rather than "+
-				"guessing (a guessed port would open an unused port while still denying "+
-				"the one actually in use). Their traffic is DENIED to the zone's local "+
-				"addresses unless you admit the real port with a firewall filter, or use "+
-				"\"any-service\".",
-			where, strings.Join(named, " ")))
+			"%s: system-services [%s] accepted but NOT enforced — %s (a guessed port "+
+				"opens an unused port while still denying the one actually in use). "+
+				"Their traffic is DENIED to the zone's local addresses. Use "+
+				"\"any-service\" — it is the only escape that works on BOTH enforcement "+
+				"surfaces. An lo0 input-filter accept fixes this on the kernel path only "+
+				"(xpf_lo0 runs before xpf_hostinbound); the AF_XDP local-delivery path "+
+				"evaluates host-inbound FIRST and never reaches the filter after a deny.",
+			where, strings.Join(named, " "), strings.Join(why, "; ")))
 	}
 	hiZoneNames := make([]string, 0, len(cfg.Security.Zones))
 	for name := range cfg.Security.Zones {

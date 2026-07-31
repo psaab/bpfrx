@@ -62484,3 +62484,60 @@ break — `go vet` confirmed passing under every revert.
   `TestHeatmapNotStale` (#6617) fails. `cargo test` — 4225+60+8+22+1 passed, 0
   failed. gofmt clean on every changed file. Per-arm mutation proofs (Go and
   Rust separately) run in a throwaway detached worktree.
+
+## 2026-07-31 — #3226 fold r4: real YANG derivation; withdraw the invalid no-port inference
+
+- **Timestamp**: 2026-07-31
+- **Action**: Fold the second Codex MAJOR round on PR #6616 (three findings).
+- **Finding 1 — the oracle was still a hand-maintained literal.** r3 vendored only
+  the EXTRACTED TOKEN LIST; the test read it directly, never parsing the YANG,
+  never checking the recorded SHA-256. Codex showed that deleting `appqoe` from
+  both the fixture and the implementations stayed GREEN. Fixed by vendoring the
+  MODULE itself (gzipped, 97 KB) and having the test parse it under three gates:
+  a SHA-256 pin on the decompressed bytes (equal to the upstream file's hash),
+  real brace-matched grouping extraction, and an independent token-count pin.
+  The zone-vs-interface grouping agreement is now ENFORCED, not commented.
+- **Finding 2 — the "positive evidence" argument was logically invalid.** r3
+  claimed YANG records a `default` wherever a platform default exists, so its
+  absence proved there was none. Codex refuted it: `[edit system services
+  telnet]` has no port leaf either, yet telnet is TCP/23. The generalization is
+  WITHDRAWN everywhere it appeared (Go SSOT, Go tests, Rust const, Rust tests,
+  matrix doc). The five no-admit services are now justified as an explicit
+  CHOICE under uncertainty, and split into two labelled classes
+  (`HostInboundNoAdmitReason`, held in bijection with the no-admit set by test):
+    - operator-configured port (`rpm`, `r2cp`) — Junos documents the port as
+      operator-chosen over a range with no default, so there is no correct port
+      to admit and restoring one is not an available option;
+    - unsourced (`tcp-encap`, `appqoe`, `high-availability`) — we did not find
+      the tuple, which is an admission, not a finding.
+  The commit advisory now words itself differently per class.
+- **Finding 3 — the advertised escape hatch did not work.** The advisory told
+  operators to "admit the real port with a firewall filter". Verified firsthand:
+  on the kernel path `xpf_lo0` (hook-input priority 0) runs BEFORE
+  `xpf_hostinbound` (10), so a filter accept DOES rescue; but on the AF_XDP
+  local-delivery path #3485 deliberately runs host-inbound FIRST and never
+  evaluates lo0 after a deny, so a filter CANNOT rescue there. Advisory rewritten
+  to lead with `any-service` (the only both-surface escape) and to qualify the
+  lo0 remedy as kernel-path-only. Reordering the userspace path is explicitly
+  NOT the fix (it would revert codex-review-118 M1) and is recorded as such.
+- **File(s)**:
+  - `pkg/config/testdata/junos-es-conf-security@2024-01-01.yang.gz` (NEW, vendored
+    module, `gzip -9 -n` so it is byte-reproducible)
+  - `pkg/config/testdata/junos-24.4R2-host-inbound-system-services.txt` (DELETED —
+    the literal that called itself derived)
+  - `pkg/config/host_inbound_tokens.go` (withdraw the inference; add
+    `HostInboundNoAdmitReason` + the two class constants)
+  - `pkg/config/host_inbound_tokens_test.go` (gunzip + SHA-256 gate + real
+    grouping parse + count pin + enforced zone/interface agreement + reason
+    bijection)
+  - `pkg/config/compiler_validate_warn.go` (per-class advisory wording; corrected
+    escape-hatch text)
+  - `pkg/config/host_inbound_fulladmit_warn_3226_test.go` (pin both)
+  - `pkg/dataplane/userspace/host_inbound_all_scoping_3226_test.go`,
+    `userspace-dp/src/afxdp/forwarding/host_inbound.rs` (+`_tests.rs`)
+  - `docs/host-inbound-service-matrix.md`, `docs/junos-cli-reference.md`,
+    `pkg/daemon/README.md`
+- **Validation**: `go test ./...`, `cargo test`, gofmt clean on changed files,
+  per-arm mutation proofs (Go and Rust separately) in a throwaway detached
+  worktree — including the exact case Codex showed passing: deleting a token from
+  the vendored oracle now REDs.

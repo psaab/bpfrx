@@ -134,7 +134,7 @@ const KNOWN_SYSTEM_SERVICE_TOKENS: &[&str] = &[
     "traceroute",
     // #3226 fold: Junos host-inbound services xpf previously did not recognize
     // at all. Membership is derived from Juniper's published YANG schema
-    // (pkg/config/testdata/junos-24.4R2-host-inbound-system-services.txt), not
+    // (pkg/config/testdata/junos-es-conf-security@2024-01-01.yang.gz), not
     // from prose reference pages — those were incomplete and had this set wrong
     // three times. Mirror of config.KnownHostInboundSystemServices.
     //
@@ -179,14 +179,27 @@ const HOST_INBOUND_NON_JUNOS_SERVICES: &[&str] = &["gre", "r-exec", "rexec"];
 /// Junos fixes no port for them — the port is operator-configured, derived from
 /// another stanza, or never published.
 ///
-/// Synthesizing a plausible-looking port instead would not fail safe: it opens
-/// a port nothing listens on while still denying the port actually in use. The
-/// evidence is positive rather than absence-of-evidence — Juniper's YANG
-/// carries a `default` statement wherever a platform default exists (the
-/// sibling reverse-telnet / reverse-ssh port leaves do), so its absence on
-/// these leaves is a schema-level statement that there is none. Per-token
-/// provenance lives on the Go set; the operator-facing consequence is in
-/// docs/host-inbound-service-matrix.md.
+/// This is a deliberate CHOICE under uncertainty, not an inference. For each of
+/// these tokens xpf looked for an authoritative host-inbound listening tuple and
+/// did not find one. (An earlier revision argued the absence of a YANG `default`
+/// PROVED there was no fixed port; that generalization is false — `[edit system
+/// services telnet]` has no port leaf either, yet telnet is TCP/23 — and has
+/// been withdrawn.) Faced with the gap, guessing a port is wrong in BOTH
+/// directions at once: it opens a port nothing listens on while still denying
+/// the port actually in use, invisibly. Opening nothing is wrong in one
+/// direction only, is announced to the operator at commit, and never silently
+/// widens the host's exposure.
+///
+/// The five are NOT one class, and the Go side labels them
+/// (config.HostInboundNoAdmitReason): `rpm` and `r2cp` have an
+/// OPERATOR-CONFIGURED port that Junos documents as a range with no default — so
+/// there is no correct port to admit, and restoring one is not even an available
+/// option; `tcp-encap`, `appqoe` and `high-availability` are UNSOURCED — we did
+/// not find the tuple, which is an admission, not a finding. This surface does
+/// not need the distinction (both classes admit nothing), so the mirror stays a
+/// single array; the labelling lives with the evidence, on the Go set. The
+/// operator-facing consequence, and which escape hatch works on which surface,
+/// is in docs/host-inbound-service-matrix.md.
 ///
 /// Keep in lockstep with the Go set — the #3486 parity test asserts equality,
 /// and `unported_services_admit_nothing_3226` asserts the behavior, so this

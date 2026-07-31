@@ -124,7 +124,7 @@ func TestClassifyHostInboundSystemServicesAllExcludesGRE(t *testing.T) {
 // regression for a real service, not an over-admit closed.
 //
 // The union is derived from Juniper's published YANG schema, vendored at
-// pkg/config/testdata/junos-24.4R2-host-inbound-system-services.txt. The prose
+// pkg/config/testdata/junos-es-conf-security@2024-01-01.yang.gz. The prose
 // reference pages are individually incomplete and had this set wrong three
 // times.
 //
@@ -184,10 +184,13 @@ func TestClassifyHostInboundAllAdmitsDocumentedJunosServices(t *testing.T) {
 //
 // An unverified port does not fail safe in one direction — it opens a port with
 // no listener on every `all` zone AND still denies the port actually in use.
-// The evidence for "no default" is positive rather than absence-of-evidence:
-// the same 24.4R2 module tree carries `default "2900"` / `default "2901"` on
-// the reverse-telnet / reverse-ssh port leaves, so the schema does record
-// platform defaults where they exist.
+// The basis is a deliberate CHOICE under uncertainty, NOT an inference from the
+// schema: no authoritative host-inbound tuple was found for these tokens, and
+// under that gap opening nothing fails in one direction and visibly, whereas a
+// guessed port fails in both directions and silently. (An earlier revision
+// argued the absence of a YANG `default` proved no fixed port existed; that is
+// false — `[edit system services telnet]` has no port leaf either, yet telnet is
+// TCP/23 — and has been withdrawn.)
 //
 // FAIL-ON-REVERT: restore a synthesized port (add a case arm in
 // config.HostInboundServiceMatch, or drop the token from
