@@ -62246,3 +62246,93 @@ break — `go vet` confirmed passing under every revert.
   probe still 54.9x, so fixed overhead does not mask a partial regression) and
   `AllocsPerRun` stable at exactly 8199 over five runs.
 - **File(s)**: pkg/snmp/README.md, _Log.md
+- **Action**: #6554 — constrain the fabric peer-MAC IPv6-NDP fallback to the
+  peer's identity. `refreshFabricFwd`'s last-resort leg swept the fabric
+  parent's IPv6 NDP table (deliberately seeded by the `ff02::1` all-nodes probe
+  in `probeFabricNeighbor`) and took the FIRST non-self link-local neighbour,
+  so on a shared fabric segment any IPv6-speaking adjacent host was accepted as
+  the peer chassis. Added `selectFabricPeerLinkLocalMAC`: accept only the
+  cached ADDRESS-MATCHED peer MAC when one is known, else the sole eligible
+  neighbour, refusing an ambiguous segment. The identity cache
+  (`d.fabricPeerMAC`/`fabricPeerMAC1`) is written only by address-matched
+  resolutions — never by the fallback, so a bad guess cannot self-confirm — and
+  is dropped when the configured peer address changes. Refusal is fail-closed
+  onto the pre-existing "peer neighbour missing" path.
+  IMPACT CORRECTION vs the issue text: the misdelivery claim is NOT reachable
+  on today's forwarding path. `FabricFwdInfo.PeerMAC` is written into the
+  `fabric_fwd` pinned array and read by nobody post-#1476 (the retained
+  `userspace-xdp` shim never references the map; `userspace-dp` never reads it;
+  no Go reader). The dataplane's actual redirect dst-MAC comes from
+  `FabricSnapshot.peer_mac` via `buildFabricPeerMAC`, which is address-matched.
+  The live defect is a FALSE-SUCCESS health signal: a decoy made the refresh
+  report success, latch `fabricPopulated` (which feeds the RG
+  takeover-readiness gate in `daemon_ha.go`), end the fast-retry probe loop
+  early, and log a stranger's MAC as the fabric peer during an HA incident.
+  Also rejected the issue's suggested RETH virtual-MAC-prefix constraint:
+  fabric members (`ge-0/0/0`) carry no `redundant-parent`, so they never get a
+  `02:bf:72:…` MAC and that constraint would reject the real peer.
+  Added `d.neighListFn` seam so the fail-on-revert test drives the real
+  `refreshFabricFwd` and asserts on the MAC handed to `SetFabricForwarding`.
+  Verified RED-on-revert is an ASSERTION failure (decoy programmed), with both
+  over-reach guards GREEN under revert. Full Go suite green.
+- **File(s)**: pkg/daemon/{daemon.go,daemon_ha_fabric.go,
+    daemon_ha_fabric_peer_identity_6554_test.go},
+    docs/fabric-cross-chassis-fwd.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6554 review-fold (Codex MERGE-NEEDS-MINOR on PR #6595). Three
+  findings, all folded. (1) `populateFabricFwd` / `populateFabricFwd1` checked
+  `ctx.Done()` only inside the `i > 0` sleep arm, so iteration 0 ran
+  unconditionally — an already-cancelled caller still reached
+  `probeFabricNeighbor`, which dumps the kernel neighbour table and, on a miss,
+  transmits a raw ICMP probe plus an `ff02::1` solicitation on a live NIC.
+  Hoisted a `ctx.Err()` check to the top of both retry loops and pinned it with
+  `TestPopulateFabricFwdHonoursCancelledContextBeforeFirstProbe`, which asserts
+  ZERO netlink touches under a cancelled context (both siblings). (2)
+  `probeFabricNeighbor` called `netlink.LinkByName` / `netlink.NeighList`
+  directly, bypassing the `fabricLinkByName` / `fabricNeighList` seams the rest
+  of the refresh uses; routed both through the seams and made
+  `TestFabricPeerIdentityClearedOnPeerChange` hermetic by pinning the seams to
+  hard errors, so the test's safety no longer depends on the cancellation guard
+  surviving. The residual transmit hazard (a seam returning a synthetic link
+  with no matching neighbour still falls through to the probe transmits) is
+  documented at the function rather than papered over — the read seams are set
+  to the real netlink calls by the constructor, so seam-presence cannot gate the
+  transmit. (3) Corrected a disproven impact claim in the test message and in
+  `docs/fabric-cross-chassis-fwd.md`: verified firsthand that the MAC this path
+  programs lands in the retired-eBPF `fabric_fwd` map (`UpdateFabricFwd`,
+  pkg/dataplane/maps_fabric.go) while the live Rust redirect takes
+  `neighbor_mac` from `FabricSnapshot.PeerMAC`, which
+  `pkg/dataplane/userspace/fabric.go` re-derives with its own address-matched
+  `buildFabricPeerMAC` (no link-local fallback). A mis-identified peer therefore
+  never becomes an L2 destination — the damage is false readiness, a truncated
+  fast-retry probe loop, and a misleading `peer_mac` log line. Also ran
+  `gofmt -w pkg/daemon/daemon.go` (the PR's added struct fields broke the
+  comment alignment; master was clean).
+- **File(s)**: pkg/daemon/{daemon.go,daemon_ha_fabric.go,
+    daemon_ha_fabric_peer_identity_6554_test.go},
+    docs/fabric-cross-chassis-fwd.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6554 review-fold round 2 (independent hostile review MINOR 1 +
+  MINOR 2). MINOR 1: documented the `SyncFabricState` coupling in
+  `docs/fabric-cross-chassis-fwd.md`. The peer-MAC RESOLVER is independent of
+  this path, but its refresh TRIGGER is not — `refreshFabricFwd` calls
+  `SyncFabricState` only on the success path, and that verb is the sole caller
+  of the Rust `Coordinator::refresh_fabric_links`, so a #6554 refusal also
+  withholds the push until the next full forwarding rebuild. Not a blackhole
+  (`resolve_fabric_redirect` returning None takes the safe non-fabric
+  disposition, per #5686) but a real latency coupling the "resolved
+  independently" wording did not cover. Deliberately did NOT add a
+  `SyncFabricState` call on the refusal path: this leg runs per neighbour event
+  plus a 30s tick plus the 2s `triggerFabricRefresh`, and CLAUDE.md forbids a
+  new control-socket caller above 1/s (starves session installs during bulk
+  sync) — so the coupling is documented, not removed. MINOR 2 was filed as
+  issue #6605 rather than folded: `buildFabricPeerMAC`
+  (pkg/dataplane/userspace/fabric.go) accepts NUD_FAILED/NUD_INCOMPLETE
+  neighbours and any-length lladdr for the LIVE redirect MAC, while
+  `refreshFabricFwd` requires `len==6` plus the `fabricNeighValidStates` mask —
+  the live resolver is measurably weaker than the code #6554 hardened, but it
+  is address-matched and a separate surface. Codex re-review of the folded head
+  918ea0b95 returned MERGE-READY with no findings.
+- **File(s)**: docs/fabric-cross-chassis-fwd.md, _Log.md

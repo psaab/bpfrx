@@ -331,6 +331,109 @@ the parent interface. Two resolution passes build them:
   `SyncFabricState`/`refreshFabricFwd` (`update_fabrics` control verb) once
   ARP/NDP resolves the peer MAC that was unresolved at initial build.
 
+### Peer-MAC resolution is constrained to the peer's identity (#6554)
+
+Every peer-MAC resolution that reaches the dataplane is keyed on the
+**configured fabric peer address**:
+
+- `FabricSnapshot.peer_mac` comes from `buildFabricPeerMAC`
+  (`pkg/dataplane/userspace/fabric.go`) — an address-matched neighbour
+  lookup on the overlay, then the parent.
+- The Rust redirect's own late resolution
+  (`resolve_fabric_links_from_snapshots`) looks the peer up in
+  `dynamic_neighbors` keyed on `(ifindex, peer_addr)`.
+
+The Go daemon's `refreshFabricFwd` (`pkg/daemon/daemon_ha_fabric.go`) has
+one leg that has **no peer address to match on**: after overlay ARP and
+parent ARP both miss, it sweeps the fabric parent's IPv6 NDP table for a
+link-local neighbour. That table is deliberately seeded by pinging
+`ff02::1` (all-nodes link-local multicast) in `probeFabricNeighbor`, so
+**every** IPv6-speaking host on the fabric segment answers and lands in
+it. Before #6554 the sweep took the first non-self link-local entry it
+found — on a shared fabric segment that is an unrelated adjacent host.
+
+`selectFabricPeerLinkLocalMAC` now constrains the sweep to the peer's
+identity, strongest constraint first:
+
+1. **Known peer MAC.** `refreshFabricFwd`/`refreshFabricFwd1` cache the
+   MAC of every ADDRESS-MATCHED resolution (`d.fabricPeerMAC`,
+   `d.fabricPeerMAC1`) — the MAC that actually answered for the
+   configured peer address. When that identity is known, only a
+   neighbour bearing it is accepted. The cache is never written by the
+   fallback itself (a bad guess must not self-confirm) and is dropped
+   when the configured peer address changes, so a re-pointed fabric is
+   not pinned to the old chassis and a legitimately changed peer MAC
+   self-heals on the next address-matched resolution.
+2. **Checked point-to-point assumption.** On a cold start with no
+   address-matched observation yet — the crash-recovery case this
+   fallback exists for — the sole eligible neighbour is accepted and an
+   ambiguous segment (two or more distinct neighbour MACs) is refused.
+   Candidates are deduplicated by MAC, so a peer owning several
+   link-local addresses on one NIC still counts as one host.
+
+Ineligible entries never become candidates: a non-`fe80::/10` address, an
+unusable NUD state, a group-bit (multicast) MAC, or this node's own MAC.
+
+**Fail direction — refuse, do not fall back to permissive.** A refusal
+returns no MAC, which lands on the existing "peer neighbour missing"
+path: `retainFabricFwdOnNeighborMiss` keeps a previously-good
+`fabric_fwd` entry, otherwise `clearFabricFwd0` clears it and
+`fabricPopulated` stays false. That is the *same* state the node already
+occupies whenever the peer genuinely does not resolve on a normal fabric
+— not a new degradation mode. It does **not** blackhole cross-chassis
+traffic: the dataplane's redirect takes its destination MAC from
+`FabricSnapshot.peer_mac`, resolved independently and strictly by peer
+address. What a refusal does cost is the `fabricPopulated` latch, which
+feeds the RG takeover-readiness gate (`daemon_ha.go`, evaluated only
+while the peer is alive) — so the node advertises `fabric forwarding
+path not ready` instead of falsely reporting a fabric it cannot identify.
+Accepting a stranger's MAC was the worse failure: it reported success,
+latched readiness, ended the fast-retry probe loop early, and logged a
+peer MAC belonging to an unrelated host during an HA incident.
+
+Distinct from #6458, which validates the **receive** side (zone-encoded
+fabric-ingress stamps); this constrains the **daemon-side identity check**
+that decides when the fabric is declared ready.
+
+Scope limit, stated precisely because it bounds the severity: the MAC this
+path programs lands in the retired-eBPF `fabric_fwd` map
+(`UpdateFabricFwd`, `pkg/dataplane/maps_fabric.go`). The live Rust redirect
+does **not** read it — `resolve_fabric_redirect_from_list` takes
+`neighbor_mac` from `FabricSnapshot.PeerMAC`, which
+`pkg/dataplane/userspace/fabric.go` re-derives with its own
+**address-matched** neighbour lookup (`buildFabricPeerMAC`, which matches
+on `neigh.IP.Equal(peer)` and has no link-local fallback). So a
+mis-identified peer accepted here never becomes an L2 destination for
+cross-chassis frames. The damage is exactly the three effects listed
+above — false readiness, a truncated fast-retry probe loop, and a
+misleading `peer_mac` log line during an HA incident.
+
+One coupling that the word "independent" above does NOT cover, and that an
+operator debugging a slow fabric bring-up needs to know. The *resolver* is
+independent, but its *refresh trigger* is not: `refreshFabricFwd` calls
+`SyncFabricState` only on its SUCCESS path, and that verb is the sole caller of
+the Rust `Coordinator::refresh_fabric_links`
+(`userspace-dp/src/afxdp/coordinator/snapshot_refresh.rs`) — i.e. the only thing
+that drives the helper's `dynamic_neighbors` late resolution outside a full
+forwarding rebuild. So when this path REFUSES an ambiguous peer, the push does
+not fire either.
+
+The one scenario where that is observable: the peer address is present in the
+helper's neighbour map but absent or NUD-invalid in the daemon's view, on an
+ambiguous segment. Before the #6554 constraint, the decoy made the refresh
+"succeed", which fired `SyncFabricState`, and Rust then resolved the CORRECT MAC
+by address. Now the push waits for the next full forwarding rebuild. This is not
+a blackhole — `resolve_fabric_redirect` returning `None` puts the packet on its
+normal non-fabric disposition, the same safe path #5686 relies on — but it is a
+real latency coupling, not an independence.
+
+Calling `SyncFabricState` on the refusal path as well is deliberately NOT done.
+This leg runs on every neighbour event plus the 30 s tick plus the 2 s
+reconcile-driven `triggerFabricRefresh`, and the control socket is shared with
+status poll, HA sync, session installs, and snapshot sync; CLAUDE.md is explicit
+that a new control-socket caller above 1/s starves session installs during bulk
+sync. The coupling is documented rather than removed.
+
 ### M13 — skipped fabric links are counted + named (was a silent `continue`)
 
 Before #3773 each pass dropped a fabric link on a bare `continue` when
