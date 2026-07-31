@@ -61639,3 +61639,61 @@ would never produce.
     is retuned, and replaced test 2's false subsumption claim with an honest
     accounting.
   - **File(s)**: pkg/dataplane/userspace/routes_6467_crossfamily_test.go
+- **Timestamp**: 2026-07-31
+- **Action**: #6531 guard the DHCPv6 IA_PD prefix-length at the wire
+  decoder. insomniacslk/dhcp decodes the IAPREFIX length byte as
+  net.CIDRMask(length, 128), which returns a NIL mask for any length
+  > 128; net.IPMask(nil).Size() is (0,0), so extractDelegatedPrefixes
+  reading only `ones` and discarding `bits` turned a crafted length of
+  129..255 into a <ip>/0 that reached pkg/ra and was advertised on-link
+  + autonomous to the LAN. Added `bits != 128 || ones == 0`, skipping
+  the offending IAPREFIX (an IA_PD is a multi-element container, so this
+  matches the option-121 classless-route loop rather than
+  leaseFromACKv4's whole-message refusal for a single-valued v4 ACK).
+  Verified firsthand that the library produces a nil mask for > 128 and
+  a nil Prefix for 0 (the latter already skipped). RED-on-revert
+  confirmed: the 129/130/255 rows, the good+bad sibling test, and the
+  withdrawal test all fail with a live /0; the 0/1/48/56/64/128
+  over-reach rows and both pkg/ra tests stay green.
+- **File(s)**: pkg/dhcp/dhcpv6.go,
+    pkg/dhcp/dhcpv6_iapd_prefixlen_6531_test.go,
+    pkg/ra/sender_prefixlen_6531_test.go, pkg/dhcp/README.md, _Log.md
+- **Timestamp**: 2026-07-31
+- **Action**: #6531 / PR #6581 review fold — three documentation-accuracy
+  defects from the Codex review (no logic change; the guard block in
+  extractDelegatedPrefixes is byte-identical to the pre-fold commit).
+  (1) The "empty after skip is unusable and retried" claim in
+  pkg/dhcp/README.md and the extractDelegatedPrefixes comment was FALSE
+  for a mixed ia-na + ia-pd client: parseV6Reply's rejection requires
+  BOTH no IA_NA address and no live PD, so a valid IA_NA lets parsing
+  succeed with zero PDs, and reconcileDelegatedPDs then reads empty
+  live+withdrawn as SILENCE and RETAINS the prior delegation
+  (apply=false, #1844). Verified no /0 is reintroduced on either branch;
+  corrected both statements and bound them with
+  TestIAPDPrefixLen6531_MixedIANAReplyStaysUsable, which drives the real
+  parseV6Reply over hand-rolled IA_NA + IA_PD wire bytes.
+  (2) Two tests over-claimed end-to-end RA coverage. Extended where the
+  seams allowed and renamed where they did not: pkg/ra's prefixInfoFor
+  now MARSHALS the RA and asserts on the RE-PARSED wire bytes instead of
+  buildRA's in-memory option; a new pkg/daemon/ra_pd_prefixlen_6531_test.go
+  calls the real Daemon.buildRAConfigs over a seeded PD (and pins that
+  daemon_ra.go's !subPrefix.IsValid() check does NOT stop a /0);
+  NormalDelegationStillReachesRA renamed to
+  NormalDelegationSurvivesSubPrefixDerivation and re-commented to claim
+  only its leg.
+  (3) The comment "RFC 8415 has no zero-length delegation" was wrong.
+  Verified against the RFC text firsthand: §21.22 says only that a
+  CLIENT "SHOULD NOT send an IA Prefix option with 0 in the
+  'prefix-length' field (and an unspecified value (::) in the
+  'IPv6-prefix' field)" — a hint rule, no delegation floor — and RFC
+  4861 §4.6.2 says a PIO prefix length "ranges from 0 to 128". Restated
+  the row as an xpf policy choice about what is safe to advertise.
+  RED-on-revert re-audited with the guard reverted via Edit: go build +
+  go vet CLEAN (no false red), 6 pre-existing gates plus the new mixed
+  IA_NA test fail on ASSERTIONS naming the live /0, every over-reach row
+  and both consumer-side test pairs stay green. Full pkg/dhcp, pkg/ra
+  and pkg/daemon suites pass.
+- **File(s)**: pkg/dhcp/dhcpv6.go, pkg/dhcp/README.md,
+    pkg/dhcp/dhcpv6_iapd_prefixlen_6531_test.go,
+    pkg/ra/sender_prefixlen_6531_test.go,
+    pkg/daemon/ra_pd_prefixlen_6531_test.go, _Log.md
