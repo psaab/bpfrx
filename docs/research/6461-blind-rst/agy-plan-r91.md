@@ -1,0 +1,44 @@
+# AGY hostile plan-review — round 91 (v10.8.0)
+
+Reviewer: AGY (direct binary: agy --print-timeout 11m --print, env -C worktree, built-in-file-tools-only). Verdict: SOUND — 9th consecutive AGY YES. Verified all three v10.8.0 folds against code; stress-checked the cold-neighbor spray (pending_neigh DuplicateDrop/CapacityDrop bounds memory), the close/non-close orderings (single-threaded worker => race-free), and the purge/install interleaves. One editorial nit: section 11's version tag said v10.7.0 (fixed in-place at the same commit).
+
+## Verbatim review
+
+SOUND
+
+### 1. Verification of Round-91 Folds
+
+1. **Close-Aware Transient-Purge Gate**: [plan.md:1369-1398](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/docs/research/6461-blind-rst/plan.md#L1369-L1398), [session_glue/mod.rs:1178-1188](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/session_glue/mod.rs#L1178-L1188), [promote.rs:48](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/session_glue/promote.rs#L48), [promote.rs:167-207](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/session_glue/promote.rs#L167-L207).
+   - **Verification**: When `resolve_flow_session_decision` matches a peer-synced translated-forward entry where `should_keep_synced_hit_transient` evaluates to true, a closing-flagged segment (`is_closing(tcp_flags)`) overrides `keep_transient` to `false`, bypassing `purge_translated_synced_hit`. The lookup returns `hit.lookup.clone()` taking the `ExistingResolved` outcome with the resolver's stored decision ($P1$). The packet buffers with $P1$ and transmits upon neighbor resolution; on lookup/transmit validation, the absence of a trusted anchor on the peer-synced entry (`trusted == 0`) forces a refuse-demote. Nothing is purged, derived, allocated, installed, published, or emitted. Because the shared entry is preserved, subsequent closing packets remain inert without triggering clean-miss re-installs.
+
+2. **ExistingResolved Buffer-with-Stored-Decision Path**: [plan.md:394](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/docs/research/6461-blind-rst/plan.md#L394), [poll_descriptor/mod.rs:4015-4816](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/poll_descriptor/mod.rs#L4015-L4816), [neighbor_dispatch.rs:156](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/neighbor_dispatch.rs#L156), [:272](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/neighbor_dispatch.rs#L272), [:310](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/neighbor_dispatch.rs#L310), [:344](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/neighbor_dispatch.rs#L344), [:369](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/neighbor_dispatch.rs#L369).
+   - **Verification**: The `MissingNeighbor` arm branches at the head on the resolved `StageOutcome`. `ExistingResolved` skips seed-only NAT/NPT derivation and allocation, metadata, counters, install, and publication. The frame buffers under `pending_neigh` with the stored decision and transmits via `retry_pending_neigh` upon neighbor resolution without re-running session lookup or NAT allocation.
+
+3. **Matched-Probation Skip vs Accept Rule**: [plan.md:1107-1121](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/docs/research/6461-blind-rst/plan.md#L1107-L1121), [lookup.rs:62](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/session/lookup.rs#L62).
+   - **Verification**: Direct lookup hits on a reverse-key probation row (`lookup.rs:62`) validate against the canonical forward family's anchor. When accepted, the matched-entry mark/refresh/recompute/wheel-push is skipped wholesale on the probation row, while propagation marks the live non-probation forward companion normally. Together with the v10.7.0 propagation-target skip, probation entries are never marked or restamped from either direction.
+
+4. **min() Deadline Adoption**: [plan.md:1241-1244](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/docs/research/6461-blind-rst/plan.md#L1241-L1244), [install.rs:382](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/session/install.rs#L382).
+   - **Verification**: Re-materialization against an existing local probation entry $K$ under the same canonical key adopts $S2$'s decision and metadata while carrying over $K$'s `probation=true` flag and deadline computed as `min(K.last_seen_ns + K.expires_after_ns, now_ns + S2.inactivity_timeout_ns)`. This guarantees that adopting $S2$ never extends an entry with a shorter per-application timeout.
+
+---
+
+### 2. Adversarial & Edge Case Resilience
+
+1. **Close Spray at a Permanently-Cold Neighbor**: [poll_descriptor/mod.rs:5057-5079](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/poll_descriptor/mod.rs#L5057-L5079), [neighbor_dispatch.rs:55-83](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/neighbor_dispatch.rs#L55-L83).
+   - **Analysis**: `pending_neigh` is keyed by `(egress_ifindex, next_hop)` and enforces `PendingNeighAdmission::DuplicateDrop` (keep-oldest packet, immediately recycling duplicate frame descriptors back to UMEM). Distinct unresolved next-hop destinations are capped by `MAX_PENDING_NEIGH` via `PendingNeighAdmission::CapacityDrop`. Memory is strictly bounded at $\le 1$ frame per pending neighbor across $\le \text{MAX\_PENDING\_NEIGH}$ total destinations.
+
+2. **Close Racing a Non-Close Purge on the Same Worker**: [plan.md:1369-1398](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/docs/research/6461-blind-rst/plan.md#L1369-L1398), [session_glue/mod.rs:1178-1188](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/afxdp/session_glue/mod.rs#L1178-L1188).
+   - **Analysis**: Processing within an AF_XDP worker ring is single-threaded and strictly ordered. If non-close arrives first, it purges the peer-synced entry, re-enters the miss pipeline, and installs a fresh local entry; a following close hits the fresh entry at Site 1 and is refuse-demoted for lack of a trusted anchor. If close arrives first, it skips the transient purge, takes `ExistingResolved`, buffers/transmits, and is refuse-demoted; a following non-close then purges the entry and installs the fresh local state. Both sequences are race-free.
+
+3. **Close Arriving After a Non-Close Purged and Installed Fresh Local Entry**: [plan.md:388](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/docs/research/6461-blind-rst/plan.md#L388), [lookup.rs:105](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/session/lookup.rs#L105).
+   - **Analysis**: The close hits the newly installed local entry at Site 1. The validator evaluates the close against the local entry's pre-packet anchor; because the fresh entry has no trusted anchor state, the close is refuse-demoted. The fresh local entry remains live and untouched.
+
+4. **Close Arriving Between Purge and Install with a Cold Neighbor**: [plan.md:394](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/docs/research/6461-blind-rst/plan.md#L394), [expire.rs:342-350](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/userspace-dp/src/session/expire.rs#L342-L350).
+   - **Analysis**: Purge-through-install execution for a single frame is atomic per worker loop iteration. If a preceding non-close installed a `MissingNeighborSeed` and buffered, a subsequent close hits the seed (at Site 9 or Site 1) and is refuse-demoted. When the seed eventually expires, `is_transient_local_seed` in `expire.rs:342-350` suppresses Close delta emission, preventing peer synchronization side effects.
+
+---
+
+### 3. Document Consistency & Editorial Notes
+
+1. **Leftover Section 11 Version Tag**: [plan.md:2214](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/docs/research/6461-blind-rst/plan.md#L2214).
+   - `## 11. Open questions for the convergence round (v10.7.0)` carries a leftover `(v10.7.0)` version tag. For consistency with the document status (`Status: DRAFT v10.8.0`, [plan.md:3](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/docs/research/6461-blind-rst/plan.md#L3)) and Section 11 text (`v10.8.0 round-89/90/91 folds`, [plan.md:2258](file:///home/ps/git/kimi-xpf/.claude/worktrees/6461-research-blind-rst/docs/research/6461-blind-rst/plan.md#L2258)), this tag should be updated to `(v10.8.0)`.
