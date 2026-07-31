@@ -63,6 +63,20 @@
 //!    half of that: every `load()` yields one coherent view, so a single call
 //!    can never tear a pair — only two calls in one tick can.
 //!
+//! # Which half a line is in
+//!
+//! Rules 2 and 3 need to tell production code from test code, and an earlier
+//! version did it by TRUNCATING each file at its first top-level
+//! `#[cfg(test)]`. A hostile review showed that is fail-open, not conservative:
+//! `#[cfg(test)]` on an item hides only THAT item, and in
+//! `src/afxdp/coordinator/mod.rs` the first one sits on a test-only `use` at
+//! line 35 — so 1200+ lines of production code, including the publish choke
+//! point itself and the exact site where the residue above would be written,
+//! were silently excluded from the scan. [`split_halves`] therefore tracks
+//! regions: it skips the attributed item (or, for `mod`/`impl`/`macro!` forms,
+//! its brace-delimited body) and KEEPS SCANNING. Brace tracking runs over
+//! comment- and literal-masked text so a `"{"` in a string cannot desync it.
+//!
 //! Adding a legitimate site is meant to be possible — update the table below
 //! and say why in the PR. Silently growing one is not.
 
@@ -97,7 +111,9 @@ const ALLOWED_CONSTRUCTION: &[(&str, usize, &str)] = &[
 ];
 
 /// Rule 3: production reader load sites, as `(file, expected_count, why)`.
-/// Counted only in the code BEFORE the file's first top-level `#[cfg(test)]`.
+/// Counted over the file's production code — everything outside a top-level
+/// `#[cfg(test)]` item, which is NOT the same as everything above the first one
+/// (see [`split_halves`]).
 const ALLOWED_READER_LOADS: &[(&str, usize, &str)] = &[
     (
         "src/afxdp/worker/loop_body/mod.rs",
@@ -154,14 +170,348 @@ fn rust_sources(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Everything before the file's first top-level `#[cfg(test)]` attribute. Test
-/// modules in this tree are declared at column 0, so this is the production
-/// half of the file.
-fn production_half(content: &str) -> &str {
-    match content.find("\n#[cfg(test)]") {
-        Some(idx) => &content[..idx],
-        None => content,
+/// Stand-in for a line that belongs to the OTHER half.
+///
+/// Deliberately not the empty string. [`code_blob_no_whitespace`] deletes all
+/// whitespace and concatenates what is left, so eliding a region with blanks
+/// could splice the tail of one surviving line onto the head of another across
+/// the gap and manufacture a match present in neither. A NUL is not whitespace,
+/// so it breaks that adjacency, and it is not a comment, so [`code_lines`]
+/// keeps it.
+const ELIDED: &str = "\u{0}";
+
+/// `content` with every byte inside a comment, string literal or char literal
+/// replaced by a space, and every other byte kept verbatim.
+///
+/// Byte- and line-aligned with `content`: multi-byte characters are masked to
+/// as many spaces as they occupy and newlines are always restored, so an offset
+/// into the mask is the same offset into the original. Only region detection
+/// reads the mask — the halves are always built from the ORIGINAL lines.
+///
+/// Masking is what makes brace tracking trustworthy. `"{"` in a string literal
+/// or a `//` comment would otherwise desync the depth counter for the rest of
+/// the file, and desync is not a benign failure here: it decides which half a
+/// line lands in.
+fn mask_non_code(content: &str) -> String {
+    let b = content.as_bytes();
+    let n = b.len();
+    let mut out = vec![b' '; n];
+    let mut i = 0usize;
+    while i < n {
+        match b[i] {
+            b'/' if i + 1 < n && b[i + 1] == b'/' => {
+                while i < n && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < n && b[i + 1] == b'*' => {
+                // Rust block comments nest.
+                let mut depth = 1usize;
+                i += 2;
+                while i < n && depth > 0 {
+                    if b[i] == b'/' && i + 1 < n && b[i + 1] == b'*' {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && i + 1 < n && b[i + 1] == b'/' {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'r' | b'b' if raw_string_open(b, i).is_some() => {
+                let (quote, hashes) = raw_string_open(b, i).expect("just checked");
+                i = quote + 1;
+                while i < n {
+                    if b[i] == b'"' {
+                        let mut k = i + 1;
+                        let mut seen = 0usize;
+                        while k < n && seen < hashes && b[k] == b'#' {
+                            seen += 1;
+                            k += 1;
+                        }
+                        if seen == hashes {
+                            i = k;
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < n {
+                    if b[i] == b'\\' {
+                        i += 2;
+                    } else if b[i] == b'"' {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'\'' => match char_literal_end(b, i) {
+                Some(end) => i = end + 1,
+                // A lifetime tick, not a literal — ordinary code.
+                None => {
+                    out[i] = b[i];
+                    i += 1;
+                }
+            },
+            _ => {
+                out[i] = b[i];
+                i += 1;
+            }
+        }
     }
+    for (idx, byte) in b.iter().enumerate() {
+        if *byte == b'\n' {
+            out[idx] = b'\n';
+        }
+    }
+    String::from_utf8(out).expect("masking only ever substitutes ASCII spaces")
+}
+
+/// If a raw string literal opens at `at`, its opening quote offset and hash
+/// count. Handles `r"..."`, `r#"..."#` and the `br` byte-string forms.
+fn raw_string_open(b: &[u8], at: usize) -> Option<(usize, usize)> {
+    // Must be the start of a token, or this is the `r` in `for`.
+    if at > 0 && (b[at - 1].is_ascii_alphanumeric() || b[at - 1] == b'_') {
+        return None;
+    }
+    let mut k = at;
+    if b[k] == b'b' {
+        k += 1;
+    }
+    if k >= b.len() || b[k] != b'r' {
+        return None;
+    }
+    k += 1;
+    let mut hashes = 0usize;
+    while k < b.len() && b[k] == b'#' {
+        hashes += 1;
+        k += 1;
+    }
+    if k < b.len() && b[k] == b'"' {
+        Some((k, hashes))
+    } else {
+        None
+    }
+}
+
+/// If a char literal starts at `at`, the offset of its closing tick. `None`
+/// means the tick opens a lifetime (`&'a T`), which is ordinary code.
+///
+/// The case that matters is `'{'` / `'}'` / `'"'` and the escape form
+/// `'\u{1F600}'` — each carries a brace or a quote that would otherwise be
+/// counted.
+fn char_literal_end(b: &[u8], at: usize) -> Option<usize> {
+    let n = b.len();
+    if at + 1 >= n {
+        return None;
+    }
+    if b[at + 1] == b'\\' {
+        // `'\''`, `'\\'`, `'\n'`, `'\u{1F600}'` — the byte after the backslash
+        // is always part of the escape, so the search starts past it.
+        let limit = (at + 16).min(n);
+        let mut k = at + 3;
+        while k < limit {
+            if b[k] == b'\n' {
+                return None;
+            }
+            if b[k] == b'\'' {
+                return Some(k);
+            }
+            k += 1;
+        }
+        return None;
+    }
+    let width = match b[at + 1] {
+        x if x < 0x80 => 1,
+        x if x < 0xE0 => 2,
+        x if x < 0xF0 => 3,
+        _ => 4,
+    };
+    let close = at + 1 + width;
+    if close < n && b[close] == b'\'' {
+        Some(close)
+    } else {
+        None
+    }
+}
+
+/// Byte offset at which each line of `content` starts.
+fn line_starts(content: &str) -> Vec<usize> {
+    let mut starts = vec![0usize];
+    for (idx, byte) in content.bytes().enumerate() {
+        if byte == b'\n' {
+            starts.push(idx + 1);
+        }
+    }
+    starts
+}
+
+fn line_of(starts: &[usize], offset: usize) -> usize {
+    match starts.binary_search(&offset) {
+        Ok(idx) => idx,
+        Err(idx) => idx - 1,
+    }
+}
+
+/// End offset (inclusive) of the item that the attribute beginning at `at`
+/// applies to, over MASKED text.
+///
+/// This is the whole point of region tracking. `#[cfg(test)]` on an item hides
+/// only THAT item — a `use`, a `const`, an `impl`, a `mod` — and the code after
+/// it is production. Only the brace-delimited forms introduce a region.
+///
+/// Terminates at whichever comes first:
+///   * a `;` outside any bracket (`mod tests;`, `use a::b;`, `static X: T = v;`)
+///   * the `}` that closes the item's own body, plus a trailing `;` if present
+///     (`mod tests { .. }`, `impl T { .. }`, `use a::{b, c};`)
+fn attributed_item_end(masked: &[u8], at: usize) -> usize {
+    let n = masked.len();
+    let mut i = at;
+    // Consume the whole attribute run — `#[cfg(test)]` is routinely followed by
+    // `#[path = "..._tests.rs"]` before the item it attributes.
+    loop {
+        while i < n && masked[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= n || masked[i] != b'#' {
+            break;
+        }
+        let mut j = i + 1;
+        if j < n && masked[j] == b'!' {
+            j += 1;
+        }
+        if j >= n || masked[j] != b'[' {
+            break;
+        }
+        let mut depth = 0i64;
+        while j < n {
+            match masked[j] {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        i = j + 1;
+    }
+    // `i` now sits on the item itself.
+    let mut brace = 0i64;
+    let mut aux = 0i64;
+    let mut saw_brace = false;
+    while i < n {
+        match masked[i] {
+            b'{' => {
+                brace += 1;
+                saw_brace = true;
+            }
+            b'}' => {
+                brace -= 1;
+                if saw_brace && brace == 0 {
+                    let mut k = i + 1;
+                    while k < n && masked[k].is_ascii_whitespace() {
+                        k += 1;
+                    }
+                    return if k < n && masked[k] == b';' { k } else { i };
+                }
+            }
+            b'(' | b'[' => aux += 1,
+            b')' | b']' => aux -= 1,
+            b';' if brace == 0 && aux == 0 => return i,
+            _ => {}
+        }
+        i += 1;
+    }
+    n.saturating_sub(1)
+}
+
+/// Inclusive line ranges covered by a top-level `#[cfg(test)]` item.
+///
+/// Region tracking, not truncation. The previous implementation cut the file at
+/// its FIRST top-level `#[cfg(test)]` and treated everything below as test
+/// code. A hostile review showed that is fail-open: in
+/// `src/afxdp/coordinator/mod.rs` the first such attribute sits on a test-only
+/// `use` at line 35, so 1200+ lines of production code — INCLUDING the publish
+/// choke point itself — were being discarded from the scan. An explicit
+/// construct-and-publish added below that line was invisible to rule 2 and any
+/// production load was invisible to rule 3. A canary blind to the file it most
+/// needs to watch is worse than no canary.
+fn test_regions(content: &str) -> Vec<(usize, usize)> {
+    const CFG_TEST: &str = "#[cfg(test)]";
+    let masked = mask_non_code(content);
+    let mb = masked.as_bytes();
+    let starts = line_starts(content);
+    let mut regions = Vec::new();
+    let mut brace = 0i64;
+    let mut aux = 0i64;
+    let mut i = 0usize;
+    while i < mb.len() {
+        let top_level_cfg_test = brace == 0
+            && aux == 0
+            && mb[i] == b'#'
+            && masked[i..].starts_with(CFG_TEST)
+            && mb[starts[line_of(&starts, i)]..i]
+                .iter()
+                .all(u8::is_ascii_whitespace);
+        if top_level_cfg_test {
+            let end = attributed_item_end(mb, i);
+            regions.push((line_of(&starts, i), line_of(&starts, end)));
+            // The item is brace-balanced, so depth is still 0 after it.
+            i = end + 1;
+            continue;
+        }
+        match mb[i] {
+            b'{' => brace += 1,
+            b'}' => brace -= 1,
+            b'(' | b'[' => aux += 1,
+            b')' | b']' => aux -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    regions
+}
+
+/// Split a file into its production and test text, line by line.
+///
+/// The two halves are line-aligned with the original: every line appears
+/// verbatim in exactly one half and as [`ELIDED`] in the other.
+fn split_halves(content: &str) -> (String, String) {
+    let regions = test_regions(content);
+    let mut production = String::with_capacity(content.len());
+    let mut test = String::with_capacity(content.len() / 4);
+    for (idx, line) in content.lines().enumerate() {
+        let in_test = regions
+            .iter()
+            .any(|(first, last)| idx >= *first && idx <= *last);
+        let (mine, theirs) = if in_test {
+            (&mut test, &mut production)
+        } else {
+            (&mut production, &mut test)
+        };
+        mine.push_str(line);
+        mine.push('\n');
+        theirs.push_str(ELIDED);
+        theirs.push('\n');
+    }
+    (production, test)
+}
+
+/// The file's production code: everything outside a top-level `#[cfg(test)]`
+/// item, with the test regions elided line for line.
+fn production_half(content: &str) -> String {
+    split_halves(content).0
 }
 
 /// Lines of CODE — comment-only lines dropped.
@@ -274,13 +624,15 @@ fn scan_publish(rel: &str, content: &str, violations: &mut Vec<Violation>) {
     }
     // The `test-local` marker is honoured ONLY in a file's TEST half. Left
     // unconstrained it silences PRODUCTION code — a reviewer flagged that the
-    // marker's mere presence on any line suppressed the rule.
-    let production = production_half(content);
-    let test_half = &content[production.len()..];
-    let constructions = code_lines(production)
+    // marker's mere presence on any line suppressed the rule. Which half a line
+    // lands in comes from region tracking, not from truncating at the first
+    // `#[cfg(test)]`: under truncation every line below a test-only `use` was
+    // "test half", so the marker silenced production code after all.
+    let (production, test_half) = split_halves(content);
+    let constructions = code_lines(&production)
         .filter(|line| constructs_runtime_view(line))
         .count()
-        + code_lines(test_half)
+        + code_lines(&test_half)
             .filter(|line| {
                 constructs_runtime_view(line) && !line.contains(TEST_LOCAL_MARKER)
             })
@@ -310,48 +662,6 @@ fn scan_publish(rel: &str, content: &str, violations: &mut Vec<Violation>) {
         });
     }
 }
-
-/// Rule 3's truncation heuristic assumes everything after a file's first
-/// top-level `#[cfg(test)]` is test code. A `#[cfg(not(test))]` block down
-/// there would be PRODUCTION code silently excluded from the load count, so say
-/// so loudly rather than let the heuristic rot into a blind spot. No file in
-/// the tree does this today; this fires the day one does.
-fn scan_truncation_heuristic(rel: &str, content: &str, violations: &mut Vec<Violation>) {
-    let production = production_half(content);
-    if production.len() == content.len() {
-        return;
-    }
-    let discarded = &content[production.len()..];
-
-    // Scoped to the files rule 3 actually counts. A load past the truncation
-    // point is NOT by itself a finding — a file's own test module legitimately
-    // has several — so the signal is `#[cfg(not(test))]`, which is the only way
-    // PRODUCTION code gets down there. Zero occurrences today; this fires the
-    // day the heuristic stops holding rather than letting it rot into a blind
-    // spot. Distinguishing test from production loads precisely would need
-    // region tracking, which is more machinery than the risk warrants while the
-    // count stays at zero.
-    if !ALLOWED_READER_LOADS.iter().any(|(file, _, _)| *file == rel) {
-        return;
-    }
-    let cfg_not_test = code_lines(discarded)
-        .filter(|line| line.contains("#[cfg(not(test))]"))
-        .count();
-    if cfg_not_test != 0 {
-        violations.push(Violation {
-            rule: "3 (one load per reader)",
-            detail: format!(
-                "{rel} is a counted runtime-view reader and has {cfg_not_test} \
-                 `#[cfg(not(test))]` after the first top-level `#[cfg(test)]`. \
-                 Rule 3 treats everything past that point as test code, so a \
-                 load added in that production block would go uncounted. Move it \
-                 above the test module, or teach `production_half` to skip only \
-                 the test module's braces."
-            ),
-        });
-    }
-}
-
 
 /// Rule 3, over one file's PRODUCTION half.
 fn scan_reader_loads(rel: &str, production: &str, violations: &mut Vec<Violation>) {
@@ -396,8 +706,7 @@ fn runtime_view_publish_and_read_sites_are_pinned() {
         let content = fs::read_to_string(&path)
             .unwrap_or_else(|err| panic!("cannot read {} — {err}", path.display()));
         scan_publish(&rel, &content, &mut violations);
-        scan_truncation_heuristic(&rel, &content, &mut violations);
-        scan_reader_loads(&rel, production_half(&content), &mut violations);
+        scan_reader_loads(&rel, &production_half(&content), &mut violations);
     }
 
     // Every entry in the tables must correspond to a real file, or the table has
@@ -522,55 +831,183 @@ mod self_tests {
 
     #[test]
     fn test_module_loads_are_not_counted() {
-        // Production half ends at the first top-level `#[cfg(test)]`, so loads
-        // inside a test module do not inflate the count.
+        // A `#[cfg(test)] mod` IS a test region, so loads inside it do not
+        // inflate the count.
         let content = "let view = shared_runtime.load();\n#[cfg(test)]\nmod t {\n\
                        let a = shared_runtime.load();\n let b = shared_runtime.load();\n}\n";
         let mut v = Vec::new();
         scan_reader_loads(
             "src/afxdp/worker/loop_body/mod.rs",
-            production_half(content),
+            &production_half(content),
             &mut v,
         );
         assert!(v.is_empty(), "test-module loads must not count: {v:?}");
     }
 
+    /// THE hole a hostile review found, and the reason `production_half` does
+    /// region tracking instead of truncating.
+    ///
+    /// `#[cfg(test)]` on a `use` hides ONLY that import. Under truncation the
+    /// entire rest of the file counted as test code — and in
+    /// `src/afxdp/coordinator/mod.rs` that attribute sits on line 35, so the
+    /// publish choke point and every other production item in the file were
+    /// unscanned. Each assertion here failed before region tracking.
     #[test]
-    fn detects_production_code_hidden_after_the_test_module() {
+    fn production_items_after_a_cfg_test_import_are_still_scanned() {
+        let content = "use a::b;\n\
+                       #[cfg(test)]\n\
+                       use c::{d, e};\n\
+                       fn prod(&mut self) {\n\
+                       \x20   let view = RuntimeView::new(stale, fwd);\n\
+                       \x20   let again = shared_runtime.load();\n\
+                       }\n";
+
         let mut v = Vec::new();
-        scan_truncation_heuristic(
-            "src/afxdp/worker/loop_body/mod.rs",
-            "fn prod() {}\n#[cfg(test)]\nmod t {}\n#[cfg(not(test))]\n\
-             fn also_prod() { let v = shared_runtime.load(); }\n",
-            &mut v,
-        );
-        assert_eq!(
-            v.len(),
-            1,
-            "a counted reader with cfg(not(test)) past the truncation point must \
-             be reported: {v:?}"
+        scan_publish("src/afxdp/coordinator/somewhere.rs", content, &mut v);
+        assert!(
+            v.iter().any(|x| x.rule.starts_with('2')),
+            "a construction below a test-only import is PRODUCTION and must \
+             fire: {v:?}"
         );
 
-        // An unrelated file with cfg(not(test)) but no runtime-view load is NOT
-        // a finding — the tree has several and they are harmless.
         let mut v = Vec::new();
-        scan_truncation_heuristic(
-            "src/filter/mod.rs",
-            "fn prod() {}\n#[cfg(test)]\nmod t {}\n#[cfg(not(test))]\nfn x() {}\n",
+        scan_reader_loads(
+            "src/afxdp/coordinator/somewhere.rs",
+            &production_half(content),
             &mut v,
         );
-        assert!(v.is_empty(), "unrelated cfg(not(test)) must be quiet: {v:?}");
+        assert!(
+            v.iter().any(|x| x.rule.starts_with('3')),
+            "a load below a test-only import is PRODUCTION and must fire: {v:?}"
+        );
+
+        // The test-only import itself is the only thing hidden.
+        let (production, test_half) = split_halves(content);
+        assert!(production.contains("RuntimeView::new(stale, fwd)"));
+        assert!(!production.contains("use c::{d, e};"));
+        assert!(test_half.contains("use c::{d, e};"));
+        assert!(!test_half.contains("RuntimeView::new"));
     }
 
+    /// The same hole, exercised through the marker — the bypass it actually
+    /// enabled. `runtime-view-canary: test-local` is honoured only in a file's
+    /// test half; truncation made the whole file below line 35 "test half", so
+    /// the marker silenced production code exactly where it mattered most.
     #[test]
-    fn truncation_heuristic_is_quiet_on_a_normal_file() {
+    fn the_marker_cannot_hide_behind_a_cfg_test_import() {
         let mut v = Vec::new();
-        scan_truncation_heuristic(
-            "src/afxdp/worker/loop_body/mod.rs",
-            "fn prod() {}\n#[cfg(test)]\nmod t { fn a() {} }\n",
+        scan_publish(
+            "src/afxdp/coordinator/mod.rs",
+            // The leading production line is load-bearing: it puts the
+            // attribute where `coordinator/mod.rs` has it — mid-file — so a
+            // truncating implementation really does truncate here.
+            "use super::*;\n\
+             #[cfg(test)]\n\
+             use cos_leases::{build_a, build_b};\n\
+             fn store_runtime_view(&mut self) {\n\
+             \x20   let view = RuntimeView::new(self.validation, fwd);\n\
+             \x20   self.ha.runtime.publish(view);\n\
+             }\n\
+             fn sneak(&mut self) {\n\
+             \x20   let torn = RuntimeView::new(stale, fwd); // runtime-view-canary: test-local\n\
+             \x20   let channel = &self.ha.runtime;\n\
+             \x20   channel.publish(torn);\n\
+             }\n",
             &mut v,
         );
-        assert!(v.is_empty(), "a normal file must not fire: {v:?}");
+        assert!(
+            v.iter().any(|x| x.rule.starts_with('2')),
+            "a marked construction in PRODUCTION code must still count — the \
+             marker is only for a real test region: {v:?}"
+        );
+    }
+
+    /// `#[cfg(test)] #[path = "x_tests.rs"] mod tests;` ends at its semicolon.
+    /// Some 60 files in this tree declare their tests that way, several of them
+    /// mid-file; truncation discarded everything after such a declaration.
+    #[test]
+    fn a_path_attributed_test_module_ends_at_its_semicolon() {
+        let content = "use super::*;\n\
+                       #[cfg(test)]\n\
+                       #[path = \"mod_tests.rs\"]\n\
+                       mod tests;\n\
+                       fn prod() { let v = shared_runtime.load(); }\n";
+        let (production, test_half) = split_halves(content);
+        assert!(test_half.contains("mod tests;"));
+        assert!(
+            production.contains("shared_runtime.load()"),
+            "production after an external test module must survive: {production:?}"
+        );
+        let mut v = Vec::new();
+        scan_reader_loads("src/afxdp/somewhere.rs", &production, &mut v);
+        assert_eq!(v.len(), 1, "that load must be counted: {v:?}");
+    }
+
+    /// Region tracking must not over-correct: a real `#[cfg(test)] mod` body —
+    /// and a `#[cfg(test)] impl` block, which `coordinator/mod.rs` also has —
+    /// stay test regions, marker and all.
+    #[test]
+    fn cfg_test_blocks_remain_test_regions() {
+        let content = "fn prod() {}\n\
+                       #[cfg(test)]\n\
+                       impl Coordinator {\n\
+                       \x20   fn seam(&self) { let v = shared_runtime.load(); }\n\
+                       }\n\
+                       fn between() {}\n\
+                       #[cfg(test)]\n\
+                       mod t {\n\
+                       \x20   fn mint() -> Arc<RuntimeView> {\n\
+                       \x20       Arc::new(RuntimeView::new(  // runtime-view-canary: test-local\n\
+                       \x20           v, f,\n\
+                       \x20       ))\n\
+                       \x20   }\n\
+                       }\n";
+        let (production, _) = split_halves(content);
+        assert!(production.contains("fn between()"), "{production:?}");
+        assert!(!production.contains("shared_runtime.load()"));
+
+        let mut v = Vec::new();
+        scan_publish("src/afxdp/worker/loop_body/mod.rs", content, &mut v);
+        assert!(
+            v.is_empty(),
+            "a marked construction inside a real test region stays exempt: {v:?}"
+        );
+        let mut v = Vec::new();
+        scan_reader_loads("src/afxdp/somewhere.rs", &production, &mut v);
+        assert!(v.is_empty(), "a test-region load must not count: {v:?}");
+    }
+
+    /// Brace tracking runs over MASKED text, so a brace or a `#[cfg(test)]`
+    /// inside a string literal or a comment cannot desync which half a line
+    /// lands in. Desync is not benign here — it decides what gets scanned.
+    #[test]
+    fn braces_and_attributes_in_literals_do_not_desync_regions() {
+        let content = "const UNBALANCED: &str = \"{\";\n\
+                       const QUOTED: &str = \"#[cfg(test)]\";\n\
+                       // prose: #[cfg(test)] hides only its own item\n\
+                       const BRACE_CHAR: char = '{';\n\
+                       #[cfg(test)]\n\
+                       mod t { fn x() { let v = RuntimeView::new(a, b); } } \
+                       // runtime-view-canary: test-local\n\
+                       fn prod() { let v = shared_runtime.load(); }\n";
+        let (production, test_half) = split_halves(content);
+        assert!(
+            test_half.contains("RuntimeView::new(a, b)"),
+            "the real test module must be the region: {test_half:?}"
+        );
+        assert!(
+            production.contains("shared_runtime.load()"),
+            "production after it must survive: {production:?}"
+        );
+        assert!(production.contains("const QUOTED"), "{production:?}");
+
+        let mut v = Vec::new();
+        scan_publish("src/afxdp/somewhere.rs", content, &mut v);
+        assert!(
+            v.is_empty(),
+            "an unmarked construction inside a real test region is exempt and \
+             quoted attributes are not regions: {v:?}"
+        );
     }
 
     #[test]

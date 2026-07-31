@@ -287,7 +287,15 @@ Differences that matter (#1881):
   `tests/runtime_view_publish_canary.rs` remains as defence in depth for the
   residue types cannot express: a new publish site inside `coordinator/`, the
   raw `ArcSwap<RuntimeView>` escaping its module again, and a second view load
-  in one worker tick.
+  in one worker tick. For the `coordinator/` half of that claim to be true the
+  canary has to actually scan this file, and a follow-up review found it did
+  not: it split production from test code by truncating at the first top-level
+  `#[cfg(test)]`, which in `mod.rs` sits on a test-only `use` at line 35 — so
+  everything below it, choke point included, went unscanned, and a marked
+  construct-and-publish added there compiled and passed the canary. It now
+  tracks regions instead (skip the attributed item or its braces, keep
+  scanning), with self-tests pinning that production code after a `#[cfg(test)]`
+  import is still counted.
 
   **Holding an OLD view stays possible and is SAFE** — new-stamped packets
   mismatch the old validation and DROP, the intended fail-closed

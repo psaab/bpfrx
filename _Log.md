@@ -62510,3 +62510,73 @@ break — `go vet` confirmed passing under every revert.
     userspace-dp/src/afxdp/worker/{launch.rs,loop_body/mod.rs,loop_body/setup.rs},
     userspace-dp/src/afxdp/tunnel.rs,
     userspace-dp/tests/runtime_view_publish_canary.rs, _Log.md
+
+- **Timestamp**: 2026-07-31 14:33
+  - **Action**: Fold the Codex re-gate on PR #6608 (#6592) — the canary's
+    test-region heuristic was fail-open, and the file it was blind to is the
+    one file it most needs to watch.
+    REPRODUCED FIRST, on head 3b2151aa3, in a throwaway detached worktree.
+    Codex's finding: production_half truncated a file at its FIRST top-level
+    cfg(test), and in coordinator/mod.rs that attribute sits on a test-only
+    `use` at line 35 — so 1200+ lines, INCLUDING the publish choke point at
+    line 1117, were discarded from the scan. Its words: "unconditional
+    production items after the first cfg(test) are discarded". Injected an
+    explicit construct-and-publish below line 35, spelled to dodge rule 1 by
+    rebinding the channel and carrying the test-local marker (honoured in the
+    "test half", which truncation had made the whole file):
+      fn probe_torn_publish(&mut self, stale: ValidationState,
+                            forwarding: Arc<ForwardingState>) {
+          let torn = Arc::new(RuntimeView::new(stale, forwarding)); // marker
+          let channel = &self.ha.runtime;
+          channel.publish(torn);
+      }
+    That COMPILED, published the (stale validation, live forwarding) tear, and
+    all 20 canary tests PASSED (exit 0). This is the residue the type system
+    explicitly cannot express — the one thing the canary is now the sole
+    guard for — so the blind spot sat exactly on top of the remaining risk.
+    Fourth enumeration/heuristic failure on this canary, after the
+    rustfmt-wrapped chain and the cloned-view bypass.
+    FIX — region tracking, not a wider heuristic. A top-level cfg(test) on an
+    ITEM hides only that item; only the brace-delimited forms (mod, impl,
+    macro!) introduce a region. `test_regions` skips the attributed item —
+    consuming the whole attribute run, so `#[cfg(test)] #[path = "x_tests.rs"]
+    mod tests;` ends at its semicolon — and CONTINUES scanning. Brace tracking
+    runs over comment- and literal-masked text (`mask_non_code`: nested block
+    comments, raw/byte strings, char literals incl. '{' and '\u{...}'), because
+    a single "{" in a string would otherwise desync the depth counter for the
+    rest of the file, and desync decides which half a line lands in. The halves
+    are line-aligned and elided regions are filled with a NUL rather than a
+    blank, so the whitespace-stripped blob (which is what makes the
+    rustfmt-wrapped-chain rule work) cannot splice two lines across a gap and
+    manufacture a match present in neither.
+    Deleted `scan_truncation_heuristic` — the cfg(not(test))-past-truncation
+    early warning — rather than keep it: with region tracking there is no
+    truncation point, so the rule could never fire again, and this file's own
+    doctrine is that a canary that cannot fire is worse than no canary. It is
+    strictly subsumed: that production code is now simply scanned.
+    5 new self-tests, each verified NON-VACUOUS by neutralizing split_halves
+    back to truncation (all 5 RED, 18 pass). Two of them initially passed
+    under truncation for the wrong reason — their fixture STARTED with
+    cfg(test), so `find("\n#[cfg(test)]")` found nothing and scanned the whole
+    file; both now carry a leading production line so a truncating
+    implementation really does truncate. MUTATION: same injected tree, fixed
+    canary — rule 2 fires, "src/afxdp/coordinator/mod.rs: 2 RuntimeView
+    construction(s), expected 1", exit 101.
+    The corrected scan is much wider (coordinator/mod.rs goes from 34 scanned
+    lines to 1276; ~100 files across the tree gain production code that the
+    truncation had discarded) and the tree is clean under it — no table entry
+    needed relaxing.
+    Docs: coordinator/README.md claimed the canary covers "a new publish site
+    inside coordinator/". That claim was false for most of that file; the
+    README now records why and what replaced it.
+    GATES: cargo test --release --bins --tests -- --test-threads=1 green
+    (60 + 4220 + 8 + 22 + 23 + 1, exit 0; canary 20 -> 23 tests). Type-level
+    containment re-verified firsthand, unchanged by this fold: Codex's
+    aliased-writer injection still fails to build with 2x E0599 (no `load_full`
+    / no `store` on RuntimeViewReader), and routing the same injection through
+    the coordinator's own channel to unmask the other two legs fails with 2x
+    E0616 (private field `validation`) plus E0308 (RuntimeView is not Clone, so
+    `.as_ref().clone()` yields a reference). All probes in a throwaway detached
+    worktree, removed after.
+  - **File(s)**: userspace-dp/tests/runtime_view_publish_canary.rs,
+    userspace-dp/src/afxdp/coordinator/README.md, _Log.md
