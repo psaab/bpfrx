@@ -1,23 +1,22 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.20.1 — THE TERMINAL CUT, round-103 folds (+ round-103 AGY folds: the §5.6 EMPTY-set straggler and the bullet-(i) UpsertRefused enumeration) (the
-full six-variant `MaterializeOutcome` with `ValidatorRefused`/
-`UpsertRefused` defined against the actual code — the synced upsert's
-refusal is the NON-PEER-predecessor refusal, not capacity;
-`UpsertRefused` gates the same authority consumers as
-`OverdueSkipped`; the displaced set becomes a small INLINE
-per-descriptor array on the resolved result (both constructors
-initialize it) with a SEPARATE preallocated `WorkerScratch` batch
-accumulator for the sibling fan-out, and the shadowed-placeholder
-identity rides the set even on `OverdueSkipped`; the last parity
-overclaims and inertness stragglers scoped). Round-103: AGY SOUND
-(v10.19.0 — every named site verified); Codex NO (4B/2H/1M — the
-set's carrier was still not fully realizable, the refusal outcomes
-were undefined and code-misclassified, `OverdueSkipped` could not
-carry an empty set when a placeholder was shadowed, §9 contradicted
-the SSOT and missed the refusal tests, and the last parity
-overclaims and inertness stragglers remained — all folded v10.20.0);
-SMR r103 YES (fold verification). Ship
+**Status: DRAFT v10.21.0 — THE TERMINAL CUT, round-104 folds (the
+outcome splits into TWO fields — `validation: Option<CloseValidation>`
+and `transition: TransitionResult` — so no precedence question can
+arise; `UpsertRefused` joins the MissingNeighbor composition and the
+teardown enumeration; the placeholder OUT is STAGED across the purge
+decision and committed only on the site-2c materialization branch;
+the displaced set dedups by (key, NAT, orientation) with capacity 4
+and the promote's preimage OUT contract named; the last EMPTY-case,
+parity, and inertness stragglers corrected). Round-104: Codex NO
+(4B/2H/2M — the single enum had overlapping producers with no
+precedence; UpsertRefused was missing from the composition and the
+teardown enumeration; the placeholder OUT lacked staging across the
+purge decision; the set needed dedup rules and the promote's
+preimage; the §9 EMPTY case was impossible as stated; §5.8's FULL
+MASTER PARITY straggler; the last inertness stragglers — all folded);
+AGY r103 UNSOUND (2 findings, folded v10.20.1); SMR r104 YES (fold
+verification). Ship
 candidate = the Part-A dataplane demote gate plus the wire-free local HA
 rules. The RG-incarnation/retirement/fence-ledger protocol that rounds
 13–82 grew is KILLED (not deferred): its two customers are re-scoped —
@@ -338,6 +337,8 @@ What the fix buys, at absolute scale:
 - What this costs a legitimate teardown when the gate misjudges: the
   packet is always delivered (endpoints tear down normally), the entry
   idles out on its ordinary timeout instead of the 2 s/30 s fast reap —
+  unless master's own flag-agnostic purge removes the entry first
+  (the purge-class exemption, v10.21.0 round-104 Codex 8) —
   a table-pressure cost, never a broken connection. Aggregate version
   (round-2 Codex): a both-direction path-switch can stall an anchor
   permanently (§5.2); many flows stalling after one path event linger to
@@ -363,7 +364,7 @@ whose unobserved in-flight data at abort time exceeds the forward slack
 (64–128 KiB ≈ 21–42 µs at 25 Gbit/s — sized for reordering, not BDP) is
 refused the early demote — the packet is delivered, endpoints tear down
 normally, and the entry idles out on its ordinary timeout instead of the
-2 s fast reap. That is a table-pressure cost, never a broken connection.
+2 s fast reap (same purge-class exemption, v10.21.0). That is a table-pressure cost, never a broken connection.
 
 *If reviewers conclude the residual attack surface or the blast radius does
 not justify the churn (new per-entry state, a validation phase on the close
@@ -1652,12 +1653,18 @@ adopting the shared decision/metadata, §5.6).
   canonical key ADOPTS the shared decision/metadata wholesale while
   preserving only `last_seen_ns`/`expires_after_ns`/`probation`/alive
   flags (v10.7.0, round-89 Codex 2 + round-90 Codex 3 — §5.6).
-- The transient-purge path is FULL MASTER PARITY (v10.15.0, round-98
-  Codex 1-3 — the close-aware gate, the close-retained marker, and
+- The transient-purge DECISION and dispatch are master-identical
+  (v10.15.0, round-98 Codex 1-3 — the close-aware gate, the
+  close-retained marker, and
   the marker-conditioned cache suppression are all retracted: the
   marker's identity-safe lifecycle, cross-worker topology, and
   pre-existing-cache fencing requirements ARE the #6599 sync-identity
-  fix in disguise and do not belong in this plan). The
+  fix in disguise and do not belong in this plan; the 'FULL MASTER
+  PARITY' phrasing is corrected v10.21.0, round-104 Codex 7 — the
+  lookup marks and propagates before the purge decision,
+  `lookup.rs:105-128`, `:198-218`, `session_glue/mod.rs:1157-1197`,
+  so the gate's refusal on anchorless peer-synced entries remains the
+  deliberate documented delta, §5.2 (iv)). The
   `ReplacedSyncedLocal` constructor branches on closing flags BEFORE
   `take_synced_local` (v10.8.0, rounds 89-91 Codex, confirmed sound
   every round since — §5.6 site-3
@@ -1686,18 +1693,29 @@ adopting the shared decision/metadata, §5.6).
 - **`MaterializeOutcome` / `OverdueSkipped` — the full normative
   contract (v10.19.0, rounds 98-102 Codex; this bullet is the SSOT —
   every earlier summary paragraph is superseded):**
-  - **Type (v10.20.0, round-103 Codex 1/2):** `MaterializeOutcome ::=
-    None | Installed | AdoptedPreservingDeadline | ValidatorRefused |
-    UpsertRefused | OverdueSkipped` (defined in `session_glue/`).
-    `ValidatorRefused` — the site-2c close-validator refuse-install
-    (the alive probation entry IS installed and CAN displace a
-    canonical predecessor; the displaced set carries that
-    predecessor's family). `UpsertRefused` — the synced upsert's
+  - **Type (v10.21.0, round-104 Codex 1 — two FIELDS, no precedence
+    question):** the validation verdict and the transition result are
+    SEPARATE fields, because a closing shared materialization is
+    validator-refused AND independently adopts / skips / fails:
+    `validation: Option<CloseValidation> ::= None |
+    Accepted | Refused` (the site-2c close-validator verdict — present
+    only when the driving packet was closing-flagged) and
+    `transition: TransitionResult ::= None | Installed |
+    AdoptedPreservingDeadline | UpsertRefused | OverdueSkipped`
+    (defined in `session_glue/`). `(Refused, Installed)` is the
+    site-2c refuse-install (the alive probation entry IS installed and
+    CAN displace a canonical predecessor; the displaced set carries
+    that family). `UpsertRefused` — the synced upsert's
     NON-PEER-PREDECESSOR refusal (`install.rs:310-315`; the capacity
     refusal belongs to the FRESH-install path, `install.rs:123-125`,
     not to the synced upsert, which has no capacity check — the
-    v10.19.0 parenthetical misclassified it): the local row is NOT
-    replaced (the non-peer predecessor survives unmodified), the
+    v10.19.0 parenthetical misclassified it): at the failed-upsert
+    instant the local row is NOT replaced (the non-peer predecessor
+    survives unmodified AT THAT INSTANT — the same resolve's promotion
+    attempt MAY still overwrite/publish/replicate it,
+    `promote.rs:99-139`, and the ordinary allowed accounting can
+    mutate its counters/flags, `session/mod.rs:1177-1210` — both
+    stated, round-104 Codex 6), the
     dispatch carries S2's decision for FORWARDING ONLY, and
     `UpsertRefused` gates the SAME authority consumers as
     `OverdueSkipped` (teardown/cache/commit — the table state and the
@@ -1744,15 +1762,33 @@ adopting the shared decision/metadata, §5.6).
     `neighbor_dispatch.rs:272-405`); the deferred RST teardown cannot
     engage (`session_glue/mod.rs:863-875`).
   - **Composition (normative, part of the MissingNeighbor outcome
-    list below):** an `OverdueSkipped` result with a MissingNeighbor
-    disposition takes the live-backed `ExistingResolved` buffer-only
-    arm — it NEVER enters the common seed block
+    list below):** an `OverdueSkipped` OR `UpsertRefused` transition
+    with a MissingNeighbor disposition takes the live-backed
+    `ExistingResolved` buffer-only arm (v10.21.0, round-104 Codex 2 —
+    on `UpsertRefused` the promotion no-ops for a non-ForwardCandidate,
+    `promote.rs:86-90`, leaving the non-peer predecessor installed,
+    and without the composition the common arm could seed-transact a
+    raw-flags `MissingNeighborSeed` that replaces the predecessor via
+    `install.rs:139`) — NEVER the common seed block
     (`poll_descriptor/mod.rs:4662-4829`).
   - **The displaced-identity set (producer + carrier, v10.20.0,
-    round-103 Codex 1/3/4):** every site-2c transition result carries
+    round-103 Codex 1/3/4; dedup/capacity/promote completeness
+    v10.21.0, round-104 Codex 4):** every site-2c transition result carries
     `displaced: DisplacedSet` — a small INLINE fixed-capacity array
-    (≤ 3 identity families; no allocation — NOT a scratch structure;
-    the `WorkerScratch` confusion of v10.19.0 is corrected) —
+    (capacity 4 identity families: the shadowed placeholder P, the
+    removed canonical predecessor K, the newly installed S2, AND the
+    promote step's displaced preimage — all four can occur in one
+    transition; no allocation). The set DEDUPLICATES by alias-family
+    inputs (key, NAT decision, orientation) — a repeat contribution
+    merges; overflow cannot occur by construction (each producer
+    contributes at most one family per transition, and the producers
+    are mutually exclusive per dispatch) — and the PROMOTE step's OUT
+    contract is named: `maybe_promote_synced_session`
+    (`promote.rs:71-140`, currently returning metadata/bool,
+    `session/mod.rs:1673-1675`) gains an OUT parameter reporting its
+    displaced preimage; an `UpsertRefused → promotion` sequence
+    records BOTH the old K family AND the resulting S2 family (plus P
+    if shadowed) —
     containing: the new S2 alias family (on any install/adopt), PLUS
     any removed canonical predecessor's full old alias family (the
     upsert's currently-discarded `_previous`,
@@ -1762,7 +1798,19 @@ adopting the shared decision/metadata, §5.6).
     shadowed by the lookup is displaced even when the materialize
     itself is a no-op, so `OverdueSkipped` carries the
     shadowed-placeholder identity and is NOT necessarily empty,
-    round-103 Codex 3). The resolved result
+    round-103 Codex 3). **The placeholder OUT is STAGED, not immediate
+    (v10.21.0, round-104 Codex 3):** the substitution runs BEFORE the
+    `keep_transient` decision (`session_glue/mod.rs:1157-1197`), so an
+    immediately-accumulated identity would invalidate P's cache family
+    even on a purge-class close where materialization never runs and P
+    remains installed (the purge deletes only the shared/canonical
+    key, `promote.rs:181-190`) — changing master's cache behavior (the
+    next ACK may hit P before resolution, `flow_cache.rs:352-358`,
+    `poll_descriptor/mod.rs:298-327`). The staged identity is COMMITTED
+    to the displaced set only on the site-2c materialization branch
+    and DISCARDED for the purge path and the non-materializing callers
+    (`icmp_embed/nat_match_v4.rs:78-95`, `nat_match_v6.rs:100-125`,
+    `return_resolution.rs:20-28`). The resolved result
     (`ResolvedFlowSessionDecision`, `shared_ops.rs:563-578`) gains
     `displaced: DisplacedSet` initialized EMPTY at BOTH constructors
     (`session_glue/mod.rs:1254-1261`, `:1330-1344`) and accumulated
@@ -2349,8 +2397,11 @@ values (probabilistic sprays can legitimately hit the admitted interval):
 - **Invalidation lifecycle (v10.18.0, round-101 Codex 3/4):** the
   displaced-identity SET (new S2 family + any removed canonical
   predecessor's old family + any shadowed placeholder's key family;
-  EMPTY only for an OverdueSkipped with no shadowed placeholder or a
-  no-predecessor refusal — v10.20.0, round-103 Codex 3/5) is asserted
+  EMPTY only for an `OverdueSkipped` with no shadowed placeholder —
+  v10.21.0, round-104 Codex 5: `UpsertRefused` necessarily HAS a
+  non-peer predecessor (`install.rs:310-315`), and a no-predecessor
+  `ValidatorRefused` successfully installs the probation S2 and
+  therefore carries the new S2 family) is asserted
   across: (i)
   initial probation construction with a pre-existing fabric-wire
   placeholder cache entry (`shared_ops.rs:594-628`,
@@ -2640,7 +2691,8 @@ a blind close can mark only inside the acceptance window
 observed flow state — the 1-packet-anytime cluster kill is dead. What
 Phase 1 does NOT restore is the 2 s fast-reap for synced flows after
 failover — imported entries refuse closes until churn OR until master's
-own flag-agnostic purge removes them first (the §2
+own flag-agnostic purge removes them first (never 'never reap early'
+without that exemption — v10.21.0, round-104 Codex 8) (the §2
 absorbing-state residual, bounded, delivery-safe, accepted). Phase 2 —
 carrying a trusted anchor on the HA wire so a post-failover node inherits
 a validated baseline — is a real protocol in its own right, and six
@@ -2773,7 +2825,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.20.1)
+## 11. Open questions for the convergence round (v10.21.0)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
@@ -2820,11 +2872,11 @@ this branch only if the minimal fix proves insufficient.
    deferred refresh (round-88) — is any pre-commit refresh/requeue
    path left for a probation entry (lookup, `touch_if_stale`, promote,
    materialize refresh), and does the commit-hook clear+refresh cover
-   every admission arm? (e) the v10.20.0 end-state: the §5.8 contract
-   block now specifies the six-variant outcome, the inline-vs-
-   accumulator storage split, the refusal semantics, and the
-   invalidation timing against the actual binding/batch ownership —
-   is anything left that a hostile implementer could read two ways?
+   every admission arm? (e) the v10.21.0 end-state: the two-field
+   outcome (validation verdict separate from transition result), the
+   staged placeholder OUT, the dedup/capacity-4 displaced set with
+   the promote preimage, the UpsertRefused composition — is any
+   producer/consumer combination still unspecified?
 
 4. **The emission posture:** master's `expire.rs:342-350` gate is
    UNCHANGED; the additions are the normative mark-creation rules, rule
