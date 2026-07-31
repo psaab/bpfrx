@@ -408,6 +408,32 @@ cross-chassis frames. The damage is exactly the three effects listed
 above — false readiness, a truncated fast-retry probe loop, and a
 misleading `peer_mac` log line during an HA incident.
 
+One coupling that the word "independent" above does NOT cover, and that an
+operator debugging a slow fabric bring-up needs to know. The *resolver* is
+independent, but its *refresh trigger* is not: `refreshFabricFwd` calls
+`SyncFabricState` only on its SUCCESS path, and that verb is the sole caller of
+the Rust `Coordinator::refresh_fabric_links`
+(`userspace-dp/src/afxdp/coordinator/snapshot_refresh.rs`) — i.e. the only thing
+that drives the helper's `dynamic_neighbors` late resolution outside a full
+forwarding rebuild. So when this path REFUSES an ambiguous peer, the push does
+not fire either.
+
+The one scenario where that is observable: the peer address is present in the
+helper's neighbour map but absent or NUD-invalid in the daemon's view, on an
+ambiguous segment. Before the #6554 constraint, the decoy made the refresh
+"succeed", which fired `SyncFabricState`, and Rust then resolved the CORRECT MAC
+by address. Now the push waits for the next full forwarding rebuild. This is not
+a blackhole — `resolve_fabric_redirect` returning `None` puts the packet on its
+normal non-fabric disposition, the same safe path #5686 relies on — but it is a
+real latency coupling, not an independence.
+
+Calling `SyncFabricState` on the refusal path as well is deliberately NOT done.
+This leg runs on every neighbour event plus the 30 s tick plus the 2 s
+reconcile-driven `triggerFabricRefresh`, and the control socket is shared with
+status poll, HA sync, session installs, and snapshot sync; CLAUDE.md is explicit
+that a new control-socket caller above 1/s starves session installs during bulk
+sync. The coupling is documented rather than removed.
+
 ### M13 — skipped fabric links are counted + named (was a silent `continue`)
 
 Before #3773 each pass dropped a fabric link on a bare `continue` when

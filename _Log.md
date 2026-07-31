@@ -61976,3 +61976,27 @@ would never produce.
 - **File(s)**: pkg/daemon/{daemon.go,daemon_ha_fabric.go,
     daemon_ha_fabric_peer_identity_6554_test.go},
     docs/fabric-cross-chassis-fwd.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6554 review-fold round 2 (independent hostile review MINOR 1 +
+  MINOR 2). MINOR 1: documented the `SyncFabricState` coupling in
+  `docs/fabric-cross-chassis-fwd.md`. The peer-MAC RESOLVER is independent of
+  this path, but its refresh TRIGGER is not — `refreshFabricFwd` calls
+  `SyncFabricState` only on the success path, and that verb is the sole caller
+  of the Rust `Coordinator::refresh_fabric_links`, so a #6554 refusal also
+  withholds the push until the next full forwarding rebuild. Not a blackhole
+  (`resolve_fabric_redirect` returning None takes the safe non-fabric
+  disposition, per #5686) but a real latency coupling the "resolved
+  independently" wording did not cover. Deliberately did NOT add a
+  `SyncFabricState` call on the refusal path: this leg runs per neighbour event
+  plus a 30s tick plus the 2s `triggerFabricRefresh`, and CLAUDE.md forbids a
+  new control-socket caller above 1/s (starves session installs during bulk
+  sync) — so the coupling is documented, not removed. MINOR 2 was filed as
+  issue #6605 rather than folded: `buildFabricPeerMAC`
+  (pkg/dataplane/userspace/fabric.go) accepts NUD_FAILED/NUD_INCOMPLETE
+  neighbours and any-length lladdr for the LIVE redirect MAC, while
+  `refreshFabricFwd` requires `len==6` plus the `fabricNeighValidStates` mask —
+  the live resolver is measurably weaker than the code #6554 hardened, but it
+  is address-matched and a separate surface. Codex re-review of the folded head
+  918ea0b95 returned MERGE-READY with no findings.
+- **File(s)**: docs/fabric-cross-chassis-fwd.md, _Log.md
