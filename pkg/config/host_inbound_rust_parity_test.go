@@ -239,6 +239,64 @@ func TestHostInboundRustClassifierMatchesGoSSOT(t *testing.T) {
 	rustNonJunos := rustArrayTokens(nonJunosSection)
 	assertSameSet(t, "non-Junos services (HOST_INBOUND_NON_JUNOS_SERVICES vs HostInboundNonJunosSystemServices)",
 		goKeySet(HostInboundNonJunosSystemServices), rustNonJunos)
+
+	// #3226 fold: HOST_INBOUND_UNPORTED_SERVICES = config.HostInboundUnported
+	// SystemServices — the Junos services with no platform-fixed listening port,
+	// which are recognized and stay in the `all` union but synthesize NO admit
+	// tuple. Drift here is a split-brain of the worst shape: one layer would
+	// invent a port for a service the other denies entirely, so a zone would
+	// admit on the kernel path what the AF_XDP path drops (or vice versa) on a
+	// port neither can justify.
+	unportedSection := rustSection(t, src,
+		"HOST_INBOUND_UNPORTED_SERVICES: &[&str] =", "];")
+	rustUnported := rustArrayTokens(unportedSection)
+	assertSameSet(t, "unported services (HOST_INBOUND_UNPORTED_SERVICES vs HostInboundUnportedSystemServices)",
+		goKeySet(HostInboundUnportedSystemServices), rustUnported)
+}
+
+// TestHostInboundRustUnportedServicesInsertNoPort_5715 is the cross-LANGUAGE
+// PORT contract for the #3226 unported set. TestHostInboundRustClassifierMatches
+// GoSSOT proves both layers agree on WHICH services are unported; this proves the
+// Rust classifier actually inserts nothing for them.
+//
+// Without it, the Rust arm could grow a `hi.udp_ports.insert(28762)` while the
+// const still listed `r2cp` as unported — the set assertion would stay green and
+// the AF_XDP path would open a port the kernel path denies, on a value Juniper
+// never published. The Go side is pinned by
+// TestHostInboundUnportedJunosServicesCommit_3226 and the behaviour on the Rust
+// side by `unported_services_admit_nothing_3226`; this closes the source-level
+// gap between them.
+//
+// FAIL-ON-REVERT: add any `hi.*_ports.insert(...)` / `hi.ip_protocols.insert(...)`
+// to the unported arm and this goes RED naming the token.
+func TestHostInboundRustUnportedServicesInsertNoPort_5715(t *testing.T) {
+	raw, err := os.ReadFile(hostInboundRustSource)
+	if err != nil {
+		t.Fatalf("reading Rust host-inbound classifier %s: %v", hostInboundRustSource, err)
+	}
+	src := rustStripComments(string(raw))
+	svcSection := rustSection(t, src, "fn classify_system_service(", "fn classify_protocol(")
+
+	if len(HostInboundUnportedSystemServices) == 0 {
+		t.Fatal("HostInboundUnportedSystemServices is empty — this contract would be vacuous")
+	}
+	// The arm body from each unported token's literal up to the arm's closing
+	// brace. `[^}]*` cannot cross the arm boundary, so an insert found here
+	// belongs to THIS arm.
+	insertRe := regexp.MustCompile(`(?:tcp_ports|udp_ports|udp_ports_v4|udp_ports_v6|ip_protocols|icmp_types_v4|icmp_types_v6)\.insert`)
+	for tok := range HostInboundUnportedSystemServices {
+		armRe := regexp.MustCompile(`"` + regexp.QuoteMeta(tok) + `"([^}]*)\}`)
+		m := armRe.FindStringSubmatch(svcSection)
+		if m == nil {
+			t.Errorf("no classify_system_service arm found for unported token %q — it must stay a "+
+				"recognized (empty) arm so the token-set parity contract still covers it", tok)
+			continue
+		}
+		if loc := insertRe.FindString(m[1]); loc != "" {
+			t.Errorf("the classify_system_service arm containing %q performs a %s — an unported "+
+				"service must admit NOTHING (Junos fixes no port for it, #3226)", tok, loc)
+		}
+	}
 }
 
 // TestHostInboundAllExpansionMatchesRust_3226 is the BEHAVIOURAL half of the

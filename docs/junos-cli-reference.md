@@ -571,13 +571,27 @@ From zone: guest, To zone: lan
     the expansion and must be listed explicitly: `gre` (Junos has no
     raw-IP-protocol system-service) and `r-exec`/`rexec` (Juniper's host-inbound
     list documents `rlogin` and `rsh` but not rexec, and tcp/512 is opened by no
-    other token). Conversely, the four services Juniper documents that xpf did
-    not previously recognize — `r2cp` (udp 28762), `reverse-ssh` (tcp 2901),
-    `reverse-telnet` (tcp 2900) and `rpm` (tcp+udp 7) — are now accepted at
-    commit and included in the union, so scoping `all` cannot strand a defined
-    service. `any-service` remains the packet-wide escape hatch and is
-    the one-token way to restore the pre-#3226 behaviour. Both draw a WARN-only
-    commit advisory. See `docs/host-inbound-service-matrix.md`.
+    other token). Conversely, the services in Juniper's schema that xpf did not
+    previously recognize — `r2cp`, `reverse-ssh`, `reverse-telnet`, `rpm`,
+    `lsselfping`, `tcp-encap`, `appqoe` and `high-availability` — are now
+    accepted at commit and included in the union, so scoping `all` cannot strand
+    a defined service. The union's membership is derived from Juniper's
+    published YANG schema, vendored at
+    `pkg/config/testdata/junos-24.4R2-host-inbound-system-services.txt`.
+    `any-service` remains the packet-wide escape hatch and is the one-token way
+    to restore the pre-#3226 behaviour. Both draw a WARN-only commit advisory.
+    See `docs/host-inbound-service-matrix.md`.
+  - **Junos services with no fixed port (#3226):** `r2cp`, `rpm`, `tcp-encap`,
+    `appqoe` and `high-availability` are real Junos services, so they COMMIT —
+    but Juniper fixes no listening port for any of them (the port is
+    operator-configured, derived from another stanza, or never published), so
+    xpf opens nothing rather than guessing. A guessed port would open a port
+    with no listener while still denying the port actually in use. Their traffic
+    is DENIED unless you admit the real port with a firewall filter or use
+    `any-service`; naming one explicitly draws a WARN-only commit advisory
+    saying so. Ports xpf DOES open for this group: `reverse-telnet` tcp/2900 and
+    `reverse-ssh` tcp/2901 (explicit YANG platform defaults) and `lsselfping`
+    udp/8503 (RFC 7746 — not 3503, which is `lsping`).
   - **IS-IS host-inbound (L2 no-op, #3311):** `host-inbound-traffic protocols
     isis` is now ACCEPTED at commit (vSRX parity) — before #3311 it was
     hard-rejected even though IS-IS routing is supported via FRR, a fail-closed

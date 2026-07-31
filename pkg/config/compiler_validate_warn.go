@@ -387,6 +387,48 @@ func ValidateConfig(cfg *Config) []string {
 			return // one advisory per stanza
 		}
 	}
+	// #3226 fold: several services in Juniper's `system-services` enumeration
+	// have NO platform-fixed listening port — r2cp, rpm, tcp-encap, appqoe and
+	// high-availability (config.HostInboundUnportedSystemServices). Junos would
+	// open whatever port the operator configured for them elsewhere; xpf models
+	// no such stanza and refuses to guess, because an invented port opens a port
+	// with no listener while STILL denying the port actually in use. So these
+	// tokens commit (they are real Junos services — rejecting them is the #3200
+	// parity gap) but synthesize no admit on either enforcement surface.
+	//
+	// That divergence is fail-CLOSED but it must not be SILENT: an operator who
+	// went to the trouble of naming the service plainly expects it to work.
+	// Warn at the moment they name it, and name the remedy.
+	//
+	// Gated on explicit naming only. `system-services all` also covers these
+	// tokens (contributing nothing), but warning there would fire on a large
+	// fraction of commits — including every lifeline-only HA `control` zone —
+	// while telling the operator nothing they asked about. The `all` case is
+	// documented in docs/host-inbound-service-matrix.md instead.
+	unportedAdvice := func(where string, svcs []string) {
+		var named []string
+		seen := map[string]bool{}
+		for _, svc := range svcs {
+			tok := strings.ToLower(strings.TrimSpace(svc))
+			if !HostInboundUnportedSystemServices[tok] || seen[tok] {
+				continue
+			}
+			seen[tok] = true
+			named = append(named, tok)
+		}
+		if len(named) == 0 {
+			return
+		}
+		sort.Strings(named)
+		warnings = append(warnings, fmt.Sprintf(
+			"%s: system-services [%s] accepted but NOT enforced — Junos fixes no "+
+				"listening port for these services, so xpf opens nothing rather than "+
+				"guessing (a guessed port would open an unused port while still denying "+
+				"the one actually in use). Their traffic is DENIED to the zone's local "+
+				"addresses unless you admit the real port with a firewall filter, or use "+
+				"\"any-service\".",
+			where, strings.Join(named, " ")))
+	}
 	hiZoneNames := make([]string, 0, len(cfg.Security.Zones))
 	for name := range cfg.Security.Zones {
 		hiZoneNames = append(hiZoneNames, name)
@@ -411,6 +453,7 @@ func ValidateConfig(cfg *Config) []string {
 			where := fmt.Sprintf("zone %q host-inbound-traffic", name)
 			fullAdmitAdvice(where, zone.HostInboundTraffic.SystemServices)
 			allScopingAdvice(where, zone.HostInboundTraffic.SystemServices, zoneEnforces)
+			unportedAdvice(where, zone.HostInboundTraffic.SystemServices)
 		}
 		// #3362: per-interface overrides carry the same token grammar and the
 		// same packet-wide breadth, so warn on each of them too. Iterated via
@@ -426,6 +469,7 @@ func ValidateConfig(cfg *Config) []string {
 			// interface's own lifeline status rather than the zone's.
 			allScopingAdvice(where, hi.SystemServices,
 				!HostInboundLifelineInterface(ifRef, lifelines))
+			unportedAdvice(where, hi.SystemServices)
 		}
 	}
 

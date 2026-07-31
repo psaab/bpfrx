@@ -34,6 +34,25 @@ func TestHostInboundNftMatchesKnownTokens(t *testing.T) {
 			}
 			continue
 		}
+		if config.HostInboundUnportedSystemServices[tok] {
+			// #3226 fold: a Junos service for which Juniper fixes NO listening
+			// port (r2cp, rpm, tcp-encap, appqoe, high-availability) is a
+			// recognized-but-no-op host-inbound token, the service-side analogue
+			// of the L2 protocols below. The every-token-produces-a-match rule
+			// cannot apply — there is no port to match on, and synthesizing one
+			// would open an unused port while still denying the port actually in
+			// use. So assert the inverse: BOTH families must produce NO match,
+			// which is what keeps the two enforcement surfaces consistent.
+			//
+			// Fail-on-revert: hand one of these a port in
+			// config.HostInboundServiceMatch and this goes RED.
+			if len(hostInboundServiceMatches(tok, "ip")) != 0 ||
+				len(hostInboundServiceMatches(tok, "ip6")) != 0 {
+				t.Errorf("unported system-service %q produced an nft match — Junos fixes no "+
+					"listening port for it, so any match here is a guess (#3226)", tok)
+			}
+			continue
+		}
 		if len(hostInboundServiceMatches(tok, "ip")) == 0 &&
 			len(hostInboundServiceMatches(tok, "ip6")) == 0 {
 			t.Errorf("known system-service %q produces no nft match in either family — "+

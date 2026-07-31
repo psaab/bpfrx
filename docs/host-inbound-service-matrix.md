@@ -115,10 +115,14 @@ follow-up; until it lands, surface 3 stays a hand-mirror held by the set-level
 | `r-login` / `rlogin` | tcp 513 | tcp 513 | dual | |
 | `r-sh` / `rsh` | tcp 514 | tcp 514 | dual | |
 | `r-exec` / `rexec` | tcp 512 | tcp 512 | dual | **xpf EXTENSION — excluded from `all` (#3226).** Juniper's host-inbound service list (zone-level and interface-level) documents `rlogin` and `rsh` but NOT rexec, and unlike the port-neutral xpf spellings (`webapi-*` → the http/https ports, `ssh-netconf` → ssh ∪ netconf) tcp/512 is opened by no other token — so folding it into `all` widened the union past the Junos meaning. Listed explicitly it still opens 512. Member of `config.HostInboundNonJunosSystemServices`. |
-| `r2cp` | udp 28762 | udp 28762 | dual | Radio Router Control Protocol. Port is the `server-port` default at `[edit protocols r2cp]`. Added in the #3226 fold — the token was previously unrecognized, so a valid vSRX stanza was hard-rejected at commit. |
-| `reverse-telnet` | tcp 2900 | tcp 2900 | dual | Console-server reverse Telnet; 2900 is the Junos default (`[edit system services reverse telnet]`). #3226 fold. |
-| `reverse-ssh` | tcp 2901 | tcp 2901 | dual | Console-server reverse SSH; 2901 is the Junos default (`[edit system services reverse ssh]`). #3226 fold. |
-| `rpm` | tcp 7, udp 7 | tcp 7, udp 7 | dual | Real-time Performance Monitoring probe RECEIVER. `[edit services rpm probe-server]` accepts "7 or 49160 through 65535" for each of tcp/udp; 7 (UDP-ECHO) is the only platform-fixed value and the high range is operator-chosen per probe-server, so this admits 7 alone rather than 16k ports on every `all` zone. A deployment on a high probe-server port uses a firewall filter or `any-service`. #3226 fold. |
+| `reverse-telnet` | tcp 2900 | tcp 2900 | dual | Console-server reverse Telnet. 2900 is a PLATFORM DEFAULT: `junos-es-conf-system` 24.4R2 `[edit system services reverse telnet] port` carries an explicit YANG `default "2900"`. #3226 fold. |
+| `reverse-ssh` | tcp 2901 | tcp 2901 | dual | Console-server reverse SSH. 2901 is a PLATFORM DEFAULT: same module, `[edit system services reverse ssh] port`, YANG `default "2901"`. #3226 fold. |
+| `lsselfping` | udp 8503 | udp 8503 | dual | LSP Self-Ping (RFC 7746). Port is STANDARDS-ASSIGNED: §3 "The UDP Destination Port MUST be lsp-self-ping (8503)", §6 records the IANA assignment. Distinct from `lsping` (udp 3503, MPLS echo) despite the similar name. #3226 fold. |
+| `r2cp` | *(none)* | *(none)* | dual | Radio-Router Control Protocol. NO platform-fixed port — see [Junos services with no fixed port](#junos-services-with-no-fixed-port). #3226 fold. |
+| `rpm` | *(none)* | *(none)* | dual | Real-time Performance Monitoring probe RECEIVER. NO platform-fixed port — see [Junos services with no fixed port](#junos-services-with-no-fixed-port). #3226 fold. |
+| `tcp-encap` | *(none)* | *(none)* | dual | TCP encapsulation for IPsec (Juniper Secure Connect). NO platform-fixed port — see [Junos services with no fixed port](#junos-services-with-no-fixed-port). #3226 fold. |
+| `appqoe` | *(none)* | *(none)* | dual | AppQoE ACTIVE probe (SD-WAN SLA measurement). NO platform-fixed port — see [Junos services with no fixed port](#junos-services-with-no-fixed-port). #3226 fold. |
+| `high-availability` | *(none)* | *(none)* | dual | Multinode High Availability (MNHA) inter-node control over the interchassis link. NO platform-fixed port — see [Junos services with no fixed port](#junos-services-with-no-fixed-port). #3226 fold. |
 | `xnm-clear-text` | tcp 3221 | tcp 3221 | dual | JUNOScript clear-text. |
 | `xnm-ssl` | tcp 3220 | tcp 3220 | dual | JUNOScript over SSL. |
 | `traceroute` | udp 33434-33523 | udp 33434..=33523 | dual | **UDP probe range only (L07/L16).** UDP-only per #3368; ICMP time-exceeded replies ride the global ICMP-error accept. |
@@ -182,21 +186,91 @@ mechanism: an SSOT expansion list plus a load-bearing exclusion set.
 ### The union must equal Juniper's defined-service set — both directions
 
 Scoping `all` to the recognized-token union is only Junos-correct if that union
-is neither NARROWER nor WIDER than the set Juniper documents. Both directions
-are enforced by `TestHostInboundAllExpansionMatchesJunosDocumentedSet_3226`
-(`pkg/config/host_inbound_tokens_test.go`), which carries Juniper's documented
-list verbatim.
+is neither NARROWER nor WIDER than the set Juniper defines. Both directions are
+enforced by `TestHostInboundAllUnionMatchesJunosSchema_3226`
+(`pkg/config/host_inbound_tokens_test.go`).
 
-**Narrower — the four missing services.** `r2cp`, `reverse-ssh`,
-`reverse-telnet` and `rpm` appear on both the zone-level and interface-level
-`system-services` reference pages but were absent from xpf's recognized-token
-allowlist entirely. That was a #3200-class parity gap on its own (a valid vSRX
-stanza was hard-rejected at commit), and #3226 made it load-bearing: once `all`
-is the recognized-token union, a service missing from that union is neither
-admitted by `all` NOR nameable as an escape — strict validation rejects any
-token outside the same allowlist — so its traffic is denied with no in-grammar
-remedy short of the packet-wide `any-service`. All four are now recognized and
-in the union, at the Junos default ports (see the matrix rows above).
+#### The oracle is Juniper's YANG schema, not its prose pages
+
+This union was wrong **three times** while the oracle was a list hand-copied out
+of Juniper's `system-services` reference pages. Those pages are individually
+incomplete and mutually inconsistent — between them they omit `lsping`, `sip`,
+`appqoe`, `tcp-encap`, `lsselfping` and `high-availability` — so a test that
+claimed to carry the list "verbatim" was in fact asserting against a set that had
+never been the real one.
+
+The oracle is now **derived** from Juniper's published YANG module, the schema
+the Junos CLI itself validates against, which is therefore complete by
+construction for a stated release:
+
+| | |
+|---|---|
+| Module | `junos-es-conf-security@2024-01-01.yang` (`junos-es` = the SRX/vSRX family) |
+| Revision | `2024-01-01`, description `"Junos: 24.4R2.25"` |
+| Grouping | `zone-system-services-object-type` → `leaf name` → `type enumeration` |
+| Upstream | <https://github.com/Juniper/yang> |
+| Vendored extract | `pkg/config/testdata/junos-24.4R2-host-inbound-system-services.txt` |
+
+The extract carries the module sha256 and a **verified reproducible**
+regeneration command in its header. Cross-checks recorded at extraction time:
+the sibling `interface-system-services-object-type` grouping (the per-interface
+override) enumerates the identical 37 tokens, so zone-level and interface-level
+share one oracle; 25.4R1 enumerates the same 37; 20.4R1 enumerates 36 — identical
+except that `lsselfping` had not yet been added. Nothing was ever removed.
+
+**Narrower — the missing services.** `r2cp`, `reverse-ssh`, `reverse-telnet`,
+`rpm`, `lsselfping`, `tcp-encap`, `appqoe` and `high-availability` are all in
+Juniper's enumeration but were absent from xpf's recognized-token allowlist
+entirely. That was a #3200-class parity gap on its own (a valid vSRX stanza was
+hard-rejected at commit), and #3226 made it load-bearing: once `all` is the
+recognized-token union, a service missing from that union is neither admitted by
+`all` NOR nameable as an escape — strict validation rejects any token outside the
+same allowlist — so its traffic is denied with no in-grammar remedy short of the
+packet-wide `any-service`. All eight are now recognized and in the union.
+
+The fail-OPEN direction is stated over **atomic (proto, port) openings**, not
+over token names, so it survives a rename and catches any future xpf-only token
+that opens something of its own. That is what keeps `r-exec`/`rexec` (tcp/512)
+and `gre` (IP protocol 47) out while leaving the port-neutral aliases in.
+
+### Junos services with no fixed port
+
+Five services in Juniper's enumeration have **no platform-fixed listening
+port**. xpf recognizes them (a valid vSRX stanza must commit) and keeps them in
+the `all` union, but synthesizes **no admission tuple** for them on any
+enforcement surface. `config.HostInboundUnportedSystemServices` is the SSOT;
+`HOST_INBOUND_UNPORTED_SERVICES` is the Rust mirror, held equal by the #3486
+parity test.
+
+**Why not just pick a plausible port.** An unverified port does not fail safe in
+one direction. It opens a port that in the ordinary case has no listener — real
+attack surface on every `all` zone — *and* still denies the port the service
+actually uses. Both halves are wrong, and neither is visible to the operator.
+
+**The evidence is positive, not absence-of-evidence.** Juniper's YANG records a
+`default` statement wherever a platform default exists — the sibling
+reverse-telnet / reverse-ssh port leaves carry `default "2900"` / `default
+"2901"` in the very same 24.4R2 module tree. So the absence of a `default` on
+these leaves is a schema-level statement that there is none.
+
+| Service | What it is | Why no port |
+|---|---|---|
+| `r2cp` | Radio-Router Control Protocol | `[edit protocols r2cp] server-port` (`junos-es-conf-protocols` 24.4R2) is `range "1 .. 65535"` with **no** default. Transport is UDP (the sibling `client-port port-number` is described "UDP port number for R2CP clients"), but the port is operator-chosen. udp/28762 appears only in `draft-dubois-r2cp-00`, which calls it a value prototypes *suggested*; Juniper adopts it nowhere. |
+| `rpm` | RPM probe RECEIVER | `[edit services rpm probe-server] tcp\|udp port` (`junos-es-conf-services` 24.4R2) is described "Port number 7 through 65535" with **no** default. 7 is the range FLOOR, not a default, and the `probe-server` container is `presence`-gated, so with no configuration nothing listens at all. |
+| `tcp-encap` | IPsec-in-TCP (Juniper Secure Connect) | `[edit security tcp-encap]` (`junos-es-conf-security` 24.4R2) has **no** port leaf anywhere; a profile carries only `ssl-profile` and `log`. The listener port comes from the referenced SSL termination profile, i.e. operator-configured per deployment. |
+| `appqoe` | AppQoE ACTIVE probe | The entire appqoe / advance-policy-based-routing subtree of `junos-es-conf-security` 24.4R2 contains **no** port leaf. `active-probe-params` configures data-fill, data-size, probe-interval, probe-count, burst-size, dscp-code-points; the probe TARGET is an overlay `probe-path ... ip-address` — an IP with no port. **Decoy:** udp/36000 appears in AppQoE docs but belongs to the *passive* probe, which is TRANSIT traffic that Juniper's own guidance tells operators to DISCARD inbound with a filter. |
+| `high-availability` | Multinode HA (MNHA) inter-node control | `[edit chassis high-availability]` (`junos-es-conf-chassis` 24.4R2) spans 1037 lines with **no** port leaf: peering is configured entirely by `local-ip` / `peer-ip` / `interface` / `routing-instance` / `vpn-profile`. Juniper's MNHA preparation guidance tells operators to permit the ICL path without publishing a port for it. Do not attribute udp/500+4500, ESP or tcp/22 here — MNHA examples admit those through their OWN tokens (`ike`, `ssh`) alongside this one. |
+
+**Operator consequence — a known, deliberate, fail-closed divergence from
+Junos.** A zone that actually terminates one of these services must admit it
+with an explicit firewall filter on the real port, or fall back to
+`system-services any-service`. Naming one of these tokens explicitly draws a
+commit-time advisory (`compiler_validate_warn.go`) that says exactly this, so the
+gap is announced rather than discovered as a silent blackhole. `system-services
+all` does **not** draw the advisory: it covers these services (contributing
+nothing), and warning there would fire on a large fraction of commits — every
+lifeline-only HA `control` zone included — while telling the operator nothing
+they asked about.
 
 **Wider — the two xpf-only carve-outs.** `config.HostInboundNonJunosSystemServices`
 (Rust mirror: `HOST_INBOUND_NON_JUNOS_SERVICES`) holds the tokens xpf accepts

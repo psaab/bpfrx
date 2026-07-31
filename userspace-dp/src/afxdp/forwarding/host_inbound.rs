@@ -132,15 +132,25 @@ const KNOWN_SYSTEM_SERVICE_TOKENS: &[&str] = &[
     "xnm-clear-text",
     "xnm-ssl",
     "traceroute",
-    // #3226 fold: Juniper-documented host-inbound services xpf previously did
-    // not recognize at all. Ports are the Junos defaults — r2cp udp/28762
-    // ([edit protocols r2cp] server-port), reverse-telnet tcp/2900,
-    // reverse-ssh tcp/2901, rpm tcp+udp/7 (the RPM probe-server's only fixed
-    // port). Mirror of config.KnownHostInboundSystemServices.
+    // #3226 fold: Junos host-inbound services xpf previously did not recognize
+    // at all. Membership is derived from Juniper's published YANG schema
+    // (pkg/config/testdata/junos-24.4R2-host-inbound-system-services.txt), not
+    // from prose reference pages — those were incomplete and had this set wrong
+    // three times. Mirror of config.KnownHostInboundSystemServices.
+    //
+    // Only reverse-telnet (tcp/2900) and reverse-ssh (tcp/2901) carry a
+    // PLATFORM-DEFAULT port (explicit YANG `default` statements), and
+    // lsselfping carries a STANDARDS-ASSIGNED one (RFC 7746, udp/8503). The
+    // rest are listed in HOST_INBOUND_UNPORTED_SERVICES below: recognized, but
+    // no admit tuple, because Junos fixes no port for them.
     "r2cp",
     "reverse-ssh",
     "reverse-telnet",
     "rpm",
+    "lsselfping",
+    "tcp-encap",
+    "appqoe",
+    "high-availability",
     // #3226: `gre` is an xpf EXTENSION (Junos has no raw-IP-protocol
     // system-service), so it is EXCLUDED from the `all` expansion below via
     // HOST_INBOUND_NON_JUNOS_SERVICES.
@@ -159,6 +169,30 @@ const KNOWN_SYSTEM_SERVICE_TOKENS: &[&str] = &[
 /// excluded from the expansion and must be listed explicitly. Keep in lockstep
 /// with the Go set (the #3486 parity test guards this).
 const HOST_INBOUND_NON_JUNOS_SERVICES: &[&str] = &["gre", "r-exec", "rexec"];
+
+/// Recognized JUNOS `system-services` tokens with NO platform-fixed listening
+/// port — the Rust mirror of the Go SSOT
+/// config.HostInboundUnportedSystemServices (#3226 fold). Unlike
+/// HOST_INBOUND_NON_JUNOS_SERVICES these are NOT xpf extensions: they are in
+/// Juniper's published schema, so they stay recognized and stay in the
+/// `system-services all` union. They simply contribute NO admit tuple, because
+/// Junos fixes no port for them — the port is operator-configured, derived from
+/// another stanza, or never published.
+///
+/// Synthesizing a plausible-looking port instead would not fail safe: it opens
+/// a port nothing listens on while still denying the port actually in use. The
+/// evidence is positive rather than absence-of-evidence — Juniper's YANG
+/// carries a `default` statement wherever a platform default exists (the
+/// sibling reverse-telnet / reverse-ssh port leaves do), so its absence on
+/// these leaves is a schema-level statement that there is none. Per-token
+/// provenance lives on the Go set; the operator-facing consequence is in
+/// docs/host-inbound-service-matrix.md.
+///
+/// Keep in lockstep with the Go set — the #3486 parity test asserts equality,
+/// and `unported_services_admit_nothing_3226` asserts the behavior, so this
+/// const is load-bearing rather than decorative.
+const HOST_INBOUND_UNPORTED_SERVICES: &[&str] =
+    &["r2cp", "rpm", "tcp-encap", "appqoe", "high-availability"];
 
 /// True if `token` is an xpf-only (non-Junos) system-service, and so excluded
 /// from the `system-services all` expansion. #3226.
@@ -335,29 +369,38 @@ fn classify_system_service(token: &str, hi: &mut ZoneHostInbound) {
         "r-exec" | "rexec" => {
             hi.tcp_ports.insert(512);
         }
-        // #3226 fold — Juniper-documented host-inbound services at their Junos
-        // default ports. Mirror of config.HostInboundServiceMatch; the port
-        // values are pinned on this surface by
+        // #3226 fold — Junos host-inbound services at a port Juniper actually
+        // fixes. Mirror of config.HostInboundServiceMatch; the port values are
+        // pinned on this surface by
         // system_services_all_admits_documented_junos_services_3226 and on the
         // Go side by TestHostInboundDocumentedJunosServiceTokensCommit_3226 +
         // the nft golden TestHostInboundNftRenderGoldenByteIdentical.
-        "r2cp" => {
-            hi.udp_ports.insert(28762);
-        }
+        //
+        // `[edit system services reverse telnet|ssh] port` carry explicit YANG
+        // `default` statements of 2900 / 2901 (junos-es-conf-system 24.4R2).
         "reverse-telnet" => {
             hi.tcp_ports.insert(2900);
         }
         "reverse-ssh" => {
             hi.tcp_ports.insert(2901);
         }
-        // RPM probe RECEIVER. `[edit services rpm probe-server]` accepts "7 or
-        // 49160 through 65535" for each of tcp/udp; 7 (UDP-ECHO) is the only
-        // platform-fixed value and the high range is operator-chosen per
-        // probe-server, so admit exactly 7 on both L4s rather than 16k ports.
-        "rpm" => {
-            hi.tcp_ports.insert(7);
-            hi.udp_ports.insert(7);
+        // RFC 7746 §3: "The UDP Destination Port MUST be lsp-self-ping (8503)";
+        // §6 records the IANA assignment. Distinct from `lsping` (udp/3503, the
+        // MPLS echo port) despite the similar name — they are different
+        // protocols, so this must NOT be folded into the lsping arm.
+        "lsselfping" => {
+            hi.udp_ports.insert(8503);
         }
+        // #3226 fold — recognized Junos services with NO platform-fixed port
+        // (HOST_INBOUND_UNPORTED_SERVICES). This arm must stay EMPTY: Junos
+        // fixes no port for them, so any value inserted here would be a guess
+        // that opens an unused port while still denying the one in use. They
+        // remain recognized (a valid vSRX stanza must commit, #3200) and remain
+        // in the `all` union, contributing nothing. Mirror of the
+        // config.HostInboundUnportedSystemServices gate in
+        // config.HostInboundServiceMatch; `unported_services_admit_nothing_3226`
+        // is the RED-on-revert guard.
+        "r2cp" | "rpm" | "tcp-encap" | "appqoe" | "high-availability" => {}
         "xnm-clear-text" => {
             hi.tcp_ports.insert(3221);
         }

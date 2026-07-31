@@ -62437,3 +62437,50 @@ break — `go vet` confirmed passing under every revert.
     userspace-dp/src/afxdp/forwarding/{host_inbound.rs,host_inbound_tests.rs},
     docs/host-inbound-service-matrix.md, docs/junos-cli-reference.md,
     pkg/daemon/README.md, _Log.md
+
+## 2026-07-31 — #3226 fold r3: derive the system-services union from Juniper's YANG schema
+
+- **Timestamp**: 2026-07-31
+- **Action**: Fold the Codex MAJOR on PR #6616. Replace the hand-transcribed
+  `system-services` oracle with one DERIVED from Juniper's published YANG
+  schema, add the four further missing tokens the prose pages omitted, and stop
+  synthesizing unverified ports.
+- **Findings**:
+  - Authoritative source: `junos-es-conf-security@2024-01-01.yang` (revision
+    description `"Junos: 24.4R2.25"`), grouping
+    `zone-system-services-object-type`. 37 tokens. The sibling
+    `interface-system-services-object-type` grouping is IDENTICAL, 25.4R1 is
+    identical, 20.4R1 differs only by lacking `lsselfping`.
+  - Codex named 2 missing tokens (`appqoe`, `tcp-encap`); the schema shows **4**
+    (`lsselfping` and `high-availability` too) — confirming the prose pages were
+    the wrong oracle, not just an incomplete one.
+  - `sip` IS in the schema, vindicating r2's refusal to narrow it.
+  - `r-exec`/`rexec`, `gre`, `r-login`, `r-sh`, `ssh-netconf`/`netconf-ssh`,
+    `ipsec` are NOT in the schema — the rexec/gre carve-outs stand.
+  - Ports: `reverse-telnet` tcp/2900 and `reverse-ssh` tcp/2901 carry explicit
+    YANG `default` statements; `lsselfping` is udp/8503 per RFC 7746 §3/§6.
+    `r2cp`, `rpm`, `tcp-encap`, `appqoe`, `high-availability` have NO
+    platform-fixed port — verified firsthand against the protocols/services/
+    security/chassis YANG modules. r2's udp/28762 (r2cp) and tcp+udp/7 (rpm)
+    were a draft SUGGESTION and a range FLOOR respectively; both removed.
+- **File(s)**:
+  - `pkg/config/testdata/junos-24.4R2-host-inbound-system-services.txt` (NEW —
+    vendored schema extract + provenance + verified-reproducible regen command)
+  - `pkg/config/host_inbound_tokens.go` (4 new tokens;
+    `HostInboundUnportedSystemServices` SSOT + load-bearing gate; ports)
+  - `pkg/config/host_inbound_tokens_test.go` (oracle derived from the extract;
+    fail-open direction restated over atomic (proto, port) openings)
+  - `pkg/config/host_inbound_rust_parity_test.go` (unported-set parity + a
+    source-level "the Rust unported arm inserts no port" contract)
+  - `pkg/config/compiler_validate_warn.go` (commit advisory on explicit naming)
+  - `pkg/config/host_inbound_fulladmit_warn_3226_test.go` (advisory test)
+  - `pkg/daemon/host_inbound_parity_test.go` (unported carve-out, no-op assert)
+  - `pkg/daemon/host_inbound_ssot_render_3627_test.go` (golden refresh)
+  - `pkg/dataplane/userspace/host_inbound_all_scoping_3226_test.go` (verdict)
+  - `userspace-dp/src/afxdp/forwarding/host_inbound.rs` (+tests.rs) (Rust mirror)
+  - `docs/host-inbound-service-matrix.md`, `docs/junos-cli-reference.md`,
+    `pkg/daemon/README.md`
+- **Validation**: `go test ./...` — 58 packages ok, only the known pre-existing
+  `TestHeatmapNotStale` (#6617) fails. `cargo test` — 4225+60+8+22+1 passed, 0
+  failed. gofmt clean on every changed file. Per-arm mutation proofs (Go and
+  Rust separately) run in a throwaway detached worktree.

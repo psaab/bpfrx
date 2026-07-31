@@ -442,16 +442,28 @@ fn system_services_all_excludes_non_junos_extensions() {
 
 // #3226 fold, fail-CLOSED half: scoping `all` to the recognized-token union
 // only preserves Junos semantics if that union CONTAINS every service Juniper
-// documents. Four did not exist on either surface — r2cp, reverse-ssh,
-// reverse-telnet, rpm, all listed on the zone-level AND interface-level
-// `system-services` reference pages — so an authored `all` stopped admitting
-// them with no in-grammar way to restore them (the Go strict validator rejects
-// any token outside the same allowlist).
+// defines. Several did not exist on either surface, so an authored `all`
+// stopped admitting them with no in-grammar way to restore them (the Go strict
+// validator rejects any token outside the same allowlist).
 //
-// Ports are the Junos defaults: r2cp udp/28762, reverse-telnet tcp/2900,
-// reverse-ssh tcp/2901, rpm tcp+udp/7. This is the Rust mirror of the Go
-// TestClassifyHostInboundAllAdmitsDocumentedJunosServices and the nft golden
-// TestHostInboundNftRenderGoldenByteIdentical.
+// The set is derived from Juniper's published YANG schema, extracted into
+// pkg/config/testdata/junos-24.4R2-host-inbound-system-services.txt — NOT from
+// the prose reference pages, which are individually incomplete and had this
+// union wrong three times.
+//
+// This test covers only the tokens with a port Juniper actually FIXES:
+//
+//   reverse-telnet tcp/2900, reverse-ssh tcp/2901
+//       explicit YANG `default` statements on
+//       `[edit system services reverse telnet|ssh] port`.
+//   lsselfping udp/8503
+//       RFC 7746 §3/§6 (IANA `lsp-self-ping`). NOT 3503 — that is `lsping`.
+//
+// The remaining Junos services in the union have NO platform-fixed port and are
+// covered by `unported_services_admit_nothing_3226` instead.
+//
+// Rust mirror of the Go TestClassifyHostInboundAllAdmitsDocumentedJunosServices
+// and the nft golden TestHostInboundNftRenderGoldenByteIdentical.
 //
 // FAIL-ON-REVERT: drop a token from KNOWN_SYSTEM_SERVICE_TOKENS or its
 // classify_system_service arm and its rows flip to denied.
@@ -467,11 +479,9 @@ fn system_services_all_admits_documented_junos_services_3226() {
         .insert(ZONE, zone_host_inbound_from_tokens(&["all".to_string()], &[]));
 
     for (name, token, proto, port) in [
-        ("r2cp", "r2cp", UDP, 28762u16),
-        ("reverse-telnet", "reverse-telnet", TCP, 2900),
+        ("reverse-telnet", "reverse-telnet", TCP, 2900u16),
         ("reverse-ssh", "reverse-ssh", TCP, 2901),
-        ("rpm tcp", "rpm", TCP, 7),
-        ("rpm udp", "rpm", UDP, 7),
+        ("lsselfping", "lsselfping", UDP, 8503),
     ] {
         // Reached through the `all` union, on both families.
         for v6 in [false, true] {
@@ -489,6 +499,104 @@ fn system_services_all_admits_documented_junos_services_3226() {
         assert!(
             host_inbound_admits(&named, ZONE, proto, port, false, 0),
             "an explicit `system-services {token}` must admit {name} ({proto}/{port})",
+        );
+    }
+}
+
+// #3226 fold, unverified-port half: the Junos services for which Juniper fixes
+// NO listening port (HOST_INBOUND_UNPORTED_SERVICES) must contribute NOTHING to
+// the admit set — whether reached through `all` or named explicitly.
+//
+// Earlier revisions of this fold synthesized a port for two of them from
+// circumstantial evidence: r2cp udp/28762 (a value draft-dubois-r2cp-00 merely
+// SUGGESTS for prototypes, which Juniper adopts nowhere) and rpm tcp+udp/7 (the
+// FLOOR of the configurable `[edit services rpm probe-server] port` range, not a
+// default — the container is presence-gated, so with no configuration nothing
+// listens at all). Both opened a port on every `all` zone that in the ordinary
+// case has no listener, while still failing to open whatever port the operator
+// actually configured. An unverified port is wrong in BOTH directions at once,
+// which is why the correct model is no tuple plus a commit advisory.
+//
+// The evidence is positive, not absence-of-evidence: Juniper's YANG carries a
+// `default` statement wherever a platform default exists — the sibling
+// reverse-telnet / reverse-ssh port leaves do, and are admitted above — so its
+// absence on these leaves is a schema-level statement that none exists.
+//
+// FAIL-ON-REVERT: hand any of these tokens a port (in classify_system_service or
+// by dropping it from HOST_INBOUND_UNPORTED_SERVICES while adding an insert) and
+// the sweep below flips to admitted. The two historical guesses are probed by
+// name so a literal revert of the previous revision is caught precisely.
+#[test]
+fn unported_services_admit_nothing_3226() {
+    const TCP: u8 = 6;
+    const UDP: u8 = 17;
+    const ZONE: u16 = 21;
+
+    // A representative sweep: the two historical guesses, plus ports that would
+    // plausibly be reached for these services, plus a raw IP protocol.
+    let probes: [(u8, u16); 10] = [
+        (UDP, 28762), // the r2cp guess (draft "suggested", never Junos)
+        (TCP, 7),     // the rpm guess (range floor, not a default)
+        (UDP, 7),
+        (TCP, 443),   // tcp-encap rides an operator-chosen SSL termination port
+        (TCP, 9500),  // a tcp-encap port seen in Juniper example output
+        (UDP, 36000), // the appqoe PASSIVE probe — transit, Juniper says DISCARD
+        (UDP, 500),   // MNHA examples admit IKE via its OWN `ike` token
+        (TCP, 22),    // ...and SSH via its OWN `ssh` token
+        (UDP, 3503),  // lsping's port must not leak to an unported token
+        (TCP, 830),
+    ];
+
+    for token in HOST_INBOUND_UNPORTED_SERVICES {
+        let mut named = ForwardingState::default();
+        named.zone_host_inbound.insert(
+            ZONE,
+            zone_host_inbound_from_tokens(&[(*token).to_string()], &[]),
+        );
+        for (proto, port) in probes {
+            for v6 in [false, true] {
+                assert!(
+                    !host_inbound_admits(&named, ZONE, proto, port, v6, 0),
+                    "`system-services {token}` must admit NOTHING ({proto}/{port}, v6={v6}) — \
+                     Junos fixes no listening port for it, so any admit here is a guess (#3226)",
+                );
+            }
+        }
+        // The token must still be RECOGNIZED (it is a real Junos service and a
+        // valid vSRX stanza must commit) — assert it is in the known set, so
+        // "admits nothing" can never be satisfied by deleting the token.
+        assert!(
+            KNOWN_SYSTEM_SERVICE_TOKENS.contains(token),
+            "{token} must stay a recognized system-service — the no-port model \
+             narrows what it admits, it does not remove the token",
+        );
+        // ...and it must NOT be an xpf-only extension: these are genuine Junos
+        // services, so `all` still covers them (contributing nothing).
+        assert!(
+            !HOST_INBOUND_NON_JUNOS_SERVICES.contains(token),
+            "{token} is a Junos service, not an xpf extension — it must stay in the `all` union",
+        );
+    }
+
+    // Reached through `all`, the same ports stay denied: the union inherits the
+    // no-tuple model rather than re-opening the guesses.
+    let mut all = ForwardingState::default();
+    all.zone_host_inbound
+        .insert(ZONE, zone_host_inbound_from_tokens(&["all".to_string()], &[]));
+    for (proto, port) in [(UDP, 28762u16), (TCP, 7), (UDP, 7), (UDP, 36000)] {
+        assert!(
+            !host_inbound_admits(&all, ZONE, proto, port, false, 0),
+            "`system-services all` must DENY {proto}/{port} — it expands to the Junos service \
+             union, and no service in that union fixes this port (#3226)",
+        );
+    }
+    // Guard against the sweep going vacuously green: `all` must still admit the
+    // services that DO carry a fixed port.
+    for (proto, port) in [(TCP, 2900u16), (TCP, 2901), (UDP, 8503), (TCP, 22)] {
+        assert!(
+            host_inbound_admits(&all, ZONE, proto, port, false, 0),
+            "`system-services all` must still admit {proto}/{port} — otherwise the deny \
+             assertions above prove nothing",
         );
     }
 }

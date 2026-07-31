@@ -181,3 +181,103 @@ func Test_3226_PerInterfaceFullAdmitAdvisory(t *testing.T) {
 		t.Errorf("per-interface scoping advisory must name both zone and interface, got: %q", got[0])
 	}
 }
+
+// hostInboundUnportedWarnings filters the #3226-fold advisory for Junos
+// services with no platform-fixed listening port.
+func hostInboundUnportedWarnings(cfg *Config) []string {
+	var out []string
+	for _, w := range ValidateConfig(cfg) {
+		if strings.Contains(w, "accepted but NOT enforced") {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// Test_3226_UnportedSystemServiceEmitsAdvisory is the operator-visibility guard
+// for the unverified-port half of the #3226 fold.
+//
+// r2cp / rpm / tcp-encap / appqoe / high-availability are real Junos services,
+// so they must COMMIT (rejecting them is the #3200 parity gap this fold closes).
+// But Juniper fixes no listening port for any of them, and xpf refuses to invent
+// one — an invented port opens a port with no listener while still denying the
+// port actually in use. The resulting behaviour is a deliberate fail-CLOSED
+// divergence from Junos, and an operator who explicitly NAMED the service
+// plainly expects it to work, so the divergence must be announced at commit
+// rather than discovered as a silent blackhole in production.
+//
+// FAIL-ON-REVERT: drop the unportedAdvice call (or empty
+// HostInboundUnportedSystemServices) and the advisory disappears, turning this
+// RED. The negative case pins that a fully-ported stanza stays quiet, so the
+// advisory cannot degrade into noise on every commit.
+func Test_3226_UnportedSystemServiceEmitsAdvisory(t *testing.T) {
+	compile := func(t *testing.T, cmds ...string) *Config {
+		t.Helper()
+		cfg, err := CompileConfig(buildTree(t, cmds))
+		if err != nil {
+			t.Fatalf("CompileConfig must ACCEPT the stanza (these are real Junos services): %v", err)
+		}
+		return cfg
+	}
+
+	// Every unported token draws the advisory when named explicitly.
+	for tok := range HostInboundUnportedSystemServices {
+		t.Run(tok, func(t *testing.T) {
+			cfg := compile(t,
+				"set security zones security-zone wan host-inbound-traffic system-services "+tok)
+			got := hostInboundUnportedWarnings(cfg)
+			if len(got) != 1 {
+				t.Fatalf("expected exactly one unported-service advisory for %q, got %d: %v", tok, len(got), got)
+			}
+			if !strings.Contains(got[0], tok) {
+				t.Errorf("advisory must NAME the service %q, got: %q", tok, got[0])
+			}
+			if !strings.Contains(got[0], `zone "wan"`) {
+				t.Errorf("advisory must name the zone, got: %q", got[0])
+			}
+			// It must point at a real remedy, or it is just noise.
+			if !strings.Contains(got[0], "any-service") || !strings.Contains(got[0], "firewall filter") {
+				t.Errorf("advisory must name the remedy (firewall filter / any-service), got: %q", got[0])
+			}
+		})
+	}
+
+	// Several named at once collapse into ONE advisory listing all of them,
+	// rather than N separate lines.
+	cfg := compile(t,
+		"set security zones security-zone wan host-inbound-traffic system-services rpm",
+		"set security zones security-zone wan host-inbound-traffic system-services r2cp",
+		"set security zones security-zone wan host-inbound-traffic system-services ssh")
+	got := hostInboundUnportedWarnings(cfg)
+	if len(got) != 1 {
+		t.Fatalf("expected ONE combined advisory for two unported services, got %d: %v", len(got), got)
+	}
+	if !strings.Contains(got[0], "r2cp") || !strings.Contains(got[0], "rpm") {
+		t.Errorf("combined advisory must name every unported service in the stanza, got: %q", got[0])
+	}
+
+	// Negative: a fully-ported stanza — including `all`, which COVERS the
+	// unported services but does not name them — stays quiet. Warning on `all`
+	// would fire on a large fraction of commits (every lifeline-only HA control
+	// zone included) while telling the operator nothing they asked about.
+	for _, quiet := range []string{"ssh", "all", "any-service"} {
+		cfg := compile(t,
+			"set security zones security-zone wan host-inbound-traffic system-services "+quiet)
+		if got := hostInboundUnportedWarnings(cfg); len(got) != 0 {
+			t.Errorf("`system-services %s` must NOT draw an unported-service advisory, got: %v", quiet, got)
+		}
+	}
+
+	// Per-interface overrides carry the same grammar, so they warn too and must
+	// name BOTH the zone and the interface (#3362 shape).
+	cfg = compile(t,
+		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
+		"set security zones security-zone wan interfaces ge-0/0/0.0 host-inbound-traffic system-services appqoe")
+	got = hostInboundUnportedWarnings(cfg)
+	if len(got) != 1 {
+		t.Fatalf("expected one per-interface unported advisory, got %d: %v", len(got), got)
+	}
+	if !strings.Contains(got[0], `zone "wan"`) || !strings.Contains(got[0], `interface "ge-0/0/0.0"`) {
+		t.Errorf("per-interface unported advisory must name both zone and interface, got: %q", got[0])
+	}
+}

@@ -117,20 +117,25 @@ func TestClassifyHostInboundSystemServicesAllExcludesGRE(t *testing.T) {
 // TestClassifyHostInboundAllAdmitsDocumentedJunosServices is the fail-CLOSED
 // half of the #3226 contract. Scoping `all` to the recognized-token union only
 // preserves Junos semantics if that union actually CONTAINS every service
-// Juniper documents. Four did not exist in xpf at all — `r2cp`, `reverse-ssh`,
-// `reverse-telnet`, `rpm`, all listed on both the zone-level and the
-// interface-level `system-services` reference pages — so before this fold an
+// Juniper defines. Several did not exist in xpf at all, so before this fold an
 // authored `all` stopped admitting them AND the operator could not restore them
 // by naming the service, because strict validation rejects any token outside
 // the same allowlist (validateHostInboundStanzaStrict). That is a hard
-// regression for a documented service, not an over-admit closed.
+// regression for a real service, not an over-admit closed.
 //
-// Ports are the Junos defaults: r2cp udp/28762 ([edit protocols r2cp]
-// server-port), reverse-telnet tcp/2900, reverse-ssh tcp/2901, rpm tcp+udp/7
-// (the [edit services rpm probe-server] port is "7 or 49160 through 65535", so
-// 7 is the only platform-fixed value).
+// The union is derived from Juniper's published YANG schema, vendored at
+// pkg/config/testdata/junos-24.4R2-host-inbound-system-services.txt. The prose
+// reference pages are individually incomplete and had this set wrong three
+// times.
 //
-// FAIL-ON-REVERT: drop any of the four from config.KnownHostInboundSystemServices
+// This test covers the services with a port Juniper actually FIXES:
+// reverse-telnet tcp/2900 and reverse-ssh tcp/2901 (explicit YANG `default`
+// statements on `[edit system services reverse telnet|ssh] port`), and
+// lsselfping udp/8503 (RFC 7746 §3/§6 — NOT 3503, which is `lsping`). The Junos
+// services with NO platform-fixed port are covered by
+// TestClassifyHostInboundUnportedServicesAdmitNothing below.
+//
+// FAIL-ON-REVERT: drop any of these from config.KnownHostInboundSystemServices
 // (or from config.HostInboundServiceMatch) and its rows flip to denied.
 func TestClassifyHostInboundAllAdmitsDocumentedJunosServices(t *testing.T) {
 	const (
@@ -145,11 +150,9 @@ func TestClassifyHostInboundAllAdmitsDocumentedJunosServices(t *testing.T) {
 		proto uint8
 		port  int
 	}{
-		{"r2cp udp/28762", "r2cp", UDP, 28762},
 		{"reverse-telnet tcp/2900", "reverse-telnet", TCP, 2900},
 		{"reverse-ssh tcp/2901", "reverse-ssh", TCP, 2901},
-		{"rpm tcp/7", "rpm", TCP, 7},
-		{"rpm udp/7", "rpm", UDP, 7},
+		{"lsselfping udp/8503", "lsselfping", UDP, 8503},
 	} {
 		// Reached through the `all` union.
 		if got := ClassifyHostInbound(all, "edge", tc.proto, true, tc.port, nil, "ip"); got.Status != HostInboundTokenAdmit {
@@ -160,6 +163,90 @@ func TestClassifyHostInboundAllAdmitsDocumentedJunosServices(t *testing.T) {
 		named := cfgWithHostInbound("edge", []string{tc.token}, nil)
 		if got := ClassifyHostInbound(named, "edge", tc.proto, true, tc.port, nil, "ip"); got.Status != HostInboundTokenAdmit || got.Token != tc.token {
 			t.Errorf("%s with an explicit system-services %s: got %+v, want token-admit %s", tc.name, tc.token, got, tc.token)
+		}
+	}
+}
+
+// TestClassifyHostInboundUnportedServicesAdmitNothing is the unverified-port
+// half of the #3226 fold, stated as a VERDICT: a Junos service for which
+// Juniper fixes NO listening port must admit NOTHING — whether reached through
+// `all` or named explicitly.
+//
+// An earlier revision of this fold synthesized ports for two of them:
+//
+//	r2cp udp/28762 — draft-dubois-r2cp-00 calls 28762 a value prototypes
+//	  "suggested"; Juniper adopts it in neither schema nor documentation.
+//	  `[edit protocols r2cp] server-port` is range 1..65535 with NO YANG default.
+//	rpm tcp+udp/7  — 7 is the FLOOR of the `[edit services rpm probe-server]
+//	  port` range ("Port number 7 through 65535"), not a default; the
+//	  probe-server container is presence-gated, so nothing listens at all
+//	  without explicit configuration.
+//
+// An unverified port does not fail safe in one direction — it opens a port with
+// no listener on every `all` zone AND still denies the port actually in use.
+// The evidence for "no default" is positive rather than absence-of-evidence:
+// the same 24.4R2 module tree carries `default "2900"` / `default "2901"` on
+// the reverse-telnet / reverse-ssh port leaves, so the schema does record
+// platform defaults where they exist.
+//
+// FAIL-ON-REVERT: restore a synthesized port (add a case arm in
+// config.HostInboundServiceMatch, or drop the token from
+// config.HostInboundUnportedSystemServices) and the matching row flips to
+// admitted.
+func TestClassifyHostInboundUnportedServicesAdmitNothing(t *testing.T) {
+	const (
+		TCP = uint8(6)
+		UDP = uint8(17)
+	)
+	all := cfgWithHostInbound("edge", []string{"all"}, nil)
+
+	// The two historical guesses, plus ports these services plausibly reach.
+	probes := []struct {
+		name  string
+		proto uint8
+		port  int
+	}{
+		{"the r2cp draft-suggested udp/28762", UDP, 28762},
+		{"the rpm range-floor tcp/7", TCP, 7},
+		{"the rpm range-floor udp/7", UDP, 7},
+		{"the appqoe PASSIVE-probe udp/36000 (transit; Juniper says DISCARD it inbound)", UDP, 36000},
+	}
+	for _, tc := range probes {
+		for _, family := range []string{"ip", "ip6"} {
+			if got := ClassifyHostInbound(all, "edge", tc.proto, true, tc.port, nil, family); got.Status != HostInboundDenied {
+				t.Errorf("%s with system-services all (%s): got %+v, want DENIED — no service in "+
+					"Juniper's enumeration fixes this port (#3226)", tc.name, family, got)
+			}
+		}
+	}
+
+	// Naming an unported service explicitly admits nothing either: there is no
+	// port to admit, so the stanza is a documented no-op rather than a guess.
+	for _, token := range []string{"r2cp", "rpm", "tcp-encap", "appqoe", "high-availability"} {
+		named := cfgWithHostInbound("edge", []string{token}, nil)
+		for _, tc := range probes {
+			if got := ClassifyHostInbound(named, "edge", tc.proto, true, tc.port, nil, "ip"); got.Status != HostInboundDenied {
+				t.Errorf("explicit `system-services %s`: %s got %+v, want DENIED — Junos fixes no "+
+					"listening port for this service (#3226)", token, tc.name, got)
+			}
+		}
+	}
+
+	// Anti-vacuity: `all` must still admit the services that DO carry a fixed
+	// port, or every deny above would prove nothing.
+	for _, tc := range []struct {
+		name  string
+		proto uint8
+		port  int
+	}{
+		{"reverse-telnet tcp/2900", TCP, 2900},
+		{"reverse-ssh tcp/2901", TCP, 2901},
+		{"lsselfping udp/8503", UDP, 8503},
+		{"ssh tcp/22", TCP, 22},
+	} {
+		if got := ClassifyHostInbound(all, "edge", tc.proto, true, tc.port, nil, "ip"); got.Status != HostInboundTokenAdmit {
+			t.Errorf("%s with system-services all: got %+v, want token-admit — otherwise the deny "+
+				"assertions above are vacuous", tc.name, got)
 		}
 	}
 }

@@ -1342,11 +1342,22 @@ never lock an operator out of a remote box it manages.
   a fail-OPEN. No-op on every shipped config (each puts `all` on the
   lifeline-only `control` zone, which contributes no host-inbound addresses).
   The union must equal Juniper's DEFINED-service set in both directions, so the
-  same change adds the four documented services xpf did not recognize at all —
-  `r2cp` (udp 28762), `reverse-ssh` (tcp 2901), `reverse-telnet` (tcp 2900),
-  `rpm` (tcp+udp 7). Without them a scoped `all` denied a defined service AND
+  same change adds the services xpf did not recognize at all — `r2cp`,
+  `reverse-ssh`, `reverse-telnet`, `rpm`, `lsselfping`, `tcp-encap`, `appqoe`,
+  `high-availability`. Without them a scoped `all` denied a defined service AND
   the operator could not name it (strict validation rejects tokens outside the
   same allowlist), a fail-CLOSED regression rather than an over-admit closed.
+  The union's membership is DERIVED from Juniper's published YANG schema
+  (vendored extract: `pkg/config/testdata/junos-24.4R2-host-inbound-system-
+  services.txt`), not from the prose reference pages, which are individually
+  incomplete and had this set wrong three times.
+  Of those, only `reverse-telnet` (tcp 2900), `reverse-ssh` (tcp 2901) and
+  `lsselfping` (udp 8503) render a match: the first two carry explicit YANG
+  platform defaults, the third is RFC 7746 / IANA. The rest are in
+  `config.HostInboundUnportedSystemServices` — recognized, in the `all` union,
+  but rendering NOTHING, because Juniper fixes no listening port for them and a
+  guessed port would open an unused port while still denying the one actually in
+  use. Naming one explicitly draws a WARN-only commit advisory.
   Full write-up: `docs/host-inbound-service-matrix.md`.
   **Counted drops + scrape (#3361):** each per-zone/family catch-all drop is
   `<fam> daddr <addrs> counter name "<n>" drop`, where `<n>` =

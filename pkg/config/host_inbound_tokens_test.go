@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -128,36 +130,222 @@ func TestHostInboundRoutingProtocolTokensCommit(t *testing.T) {
 	}
 }
 
-// TestHostInboundDocumentedJunosServiceTokensCommit_3226 asserts the four
-// Juniper-documented `system-services` tokens xpf did not recognize —
-// `r2cp`, `reverse-ssh`, `reverse-telnet`, `rpm` — are ACCEPTED at commit and
-// carry their Junos-default L4 tuple on both families.
+// junosSchemaOracle is the vendored extract of Juniper's PUBLISHED YANG
+// enumeration for `security zones ... host-inbound-traffic system-services`.
+// See the file header for provenance and the (verified reproducible)
+// regeneration command.
 //
-// All four appear on the zone-level AND interface-level `system-services`
-// reference pages, so before this they were a #3200-class parity gap of the
-// same shape as #3341/#3311: a valid vSRX stanza was HARD-REJECTED at commit.
-// #3226 made the gap load-bearing rather than cosmetic — once `all` is scoped
-// to the recognized-token union, a service missing from that union is neither
-// admitted by `all` NOR nameable as an escape, so its traffic is denied with
-// no in-grammar way to restore it short of the packet-wide `any-service`.
+// It exists because the `system-services all` union was wrong THREE times while
+// the oracle was a hand-transcribed list copied out of Juniper's prose
+// reference pages. Those pages are individually incomplete and mutually
+// inconsistent — between them they omit `lsping`, `sip`, `appqoe`,
+// `tcp-encap`, `lsselfping` and `high-availability` — so a test that claimed to
+// carry the list "verbatim" was asserting against a set that had never been the
+// real one. The YANG module is the schema the Junos CLI validates against, so
+// it is complete by construction for a stated release, and deriving the oracle
+// from a vendored copy of it removes the hand-transcription step entirely.
+const junosSchemaOracle = "testdata/junos-24.4R2-host-inbound-system-services.txt"
+
+// junosSchemaSystemServices parses the vendored oracle and returns the CONCRETE
+// service tokens (the enumeration minus the two meta tokens `all` /
+// `any-service`, which name no single service).
 //
-// Ports are the Junos defaults: r2cp udp/28762 ([edit protocols r2cp]
-// server-port), reverse-telnet tcp/2900, reverse-ssh tcp/2901, rpm tcp+udp/7
-// (the [edit services rpm probe-server] tcp/udp port is "7 or 49160 through
-// 65535"; 7 is the only platform-fixed value, and admitting the 16k high range
-// on every `all` zone would trade one over-admit for a larger one).
+// It fails loudly on a short/garbled parse: a silently-empty oracle would make
+// every "the union covers Juniper's set" assertion pass vacuously, which is the
+// same class of false-green the hand-typed list produced.
+func junosSchemaSystemServices(t *testing.T) []string {
+	t.Helper()
+	raw, err := os.ReadFile(junosSchemaOracle)
+	if err != nil {
+		t.Fatalf("reading the Junos schema oracle %s: %v", junosSchemaOracle, err)
+	}
+	var concrete []string
+	meta := map[string]bool{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		tok := strings.TrimSpace(line)
+		if tok == "" || strings.HasPrefix(tok, "#") {
+			continue
+		}
+		if tok == "all" || tok == "any-service" {
+			meta[tok] = true
+			continue
+		}
+		concrete = append(concrete, tok)
+	}
+	// Anti-vacuity: the 24.4R2 enumeration has 37 entries (35 concrete + 2
+	// meta). Allow the count to grow with a future release bump, but never let a
+	// truncated or mis-parsed file through.
+	if len(concrete) < 30 {
+		t.Fatalf("%s parsed only %d concrete tokens (%v) — oracle truncated or parser broken; "+
+			"every union assertion built on it would pass vacuously",
+			junosSchemaOracle, len(concrete), concrete)
+	}
+	for _, m := range []string{"all", "any-service"} {
+		if !meta[m] {
+			t.Fatalf("%s is missing the meta token %q — the extract is not the full enumeration", junosSchemaOracle, m)
+		}
+	}
+	return concrete
+}
+
+// hiOpeningKeys decomposes one L4Match into the ATOMIC openings it grants — one
+// key per (proto, port), per (proto, icmp-type), or the bare protocol number —
+// so two token sets can be compared by WHAT THEY OPEN rather than by token
+// spelling or by how the matches happen to be grouped.
 //
-// Fail-on-revert: drop any of the four from KnownHostInboundSystemServices and
-// its commit subtest goes RED; move a port and the tuple assertion goes RED.
-func TestHostInboundDocumentedJunosServiceTokensCommit_3226(t *testing.T) {
+// Decomposition is what makes the comparison correct as well as rename-proof.
+// An alias may bundle openings differently from the tokens it aliases:
+// `ssh-netconf` emits ONE tcp match carrying {22, 830}, while `ssh` and
+// `netconf` emit two matches of one port each. Compared as whole matches those
+// look like a tuple no Junos token opens; compared as atomic openings they are
+// exactly tcp/22 ∪ tcp/830, which is the truth. Grouping is an nft-rendering
+// detail; the security-relevant question is only which (proto, port) pairs
+// become reachable.
+func hiOpeningKeys(m L4Match) []string {
+	prefix := ""
+	if m.Reject {
+		prefix = "reject:"
+	}
+	proto := strconv.Itoa(int(m.Proto))
+	if m.ICMPType != nil {
+		return []string{prefix + proto + "/type" + strconv.Itoa(int(*m.ICMPType))}
+	}
+	if len(m.Ports) == 0 {
+		// A bare IP protocol number (gre=47, ospf=89, ...): the protocol itself
+		// is the opening.
+		return []string{prefix + proto}
+	}
+	var out []string
+	for _, p := range m.Ports {
+		for port := int(p.Lo); port <= int(p.Hi); port++ {
+			out = append(out, prefix+proto+"/"+strconv.Itoa(port))
+		}
+	}
+	return out
+}
+
+// TestHostInboundAllUnionMatchesJunosSchema_3226 is the bidirectional statement
+// of the `system-services all` contract, with BOTH directions derived from
+// Juniper's published schema rather than from a hand-typed list:
+//
+//	fail-CLOSED direction — every concrete service in Juniper's enumeration must
+//	be recognized at commit AND be in the `all` union. A service missing from
+//	the union is denied by `all` and (because strict validation rejects any
+//	token outside the allowlist) cannot be restored by naming it either, so its
+//	traffic has no in-grammar escape short of the packet-wide `any-service`.
+//	This is the #3200-class parity gap that recurred three times.
+//
+//	fail-OPEN direction — the union may open no (proto, port) tuple that
+//	Juniper's own set does not already open. Stated over TUPLES, not names, so
+//	it cannot be satisfied by renaming a token, and so a future xpf-only service
+//	with a port of its own is caught automatically.
+//
+// The second direction is what keeps `r-exec`/`rexec` (tcp/512) and `gre` (IP
+// protocol 47) out: Juniper's enumeration has neither, and unlike the
+// port-neutral xpf spellings (`webapi-clear-text`/`webapi-ssl` resolve to the
+// http/https ports, `ssh-netconf`/`netconf-ssh` to ssh ∪ netconf, `ipsec` to
+// ike's) each opens something no Junos token opens.
+//
+// FAIL-ON-REVERT: drop a schema token from KnownHostInboundSystemServices and
+// the fail-closed direction names it; put `r-exec` or `gre` back in the
+// expansion and the fail-open direction names the exact tuple it added.
+func TestHostInboundAllUnionMatchesJunosSchema_3226(t *testing.T) {
+	schema := junosSchemaSystemServices(t)
+
+	inExpansion := map[string]bool{}
+	for _, tok := range HostInboundAllExpansionServices() {
+		inExpansion[tok] = true
+	}
+
+	// --- fail-CLOSED: Juniper's set ⊆ recognized, and ⊆ the `all` union. -----
+	for _, tok := range schema {
+		if !KnownHostInboundSystemServices[tok] {
+			t.Errorf("Junos schema service %q is not recognized at commit — a valid vSRX "+
+				"`system-services %s` is HARD-REJECTED (#3200 parity gap)", tok, tok)
+			continue
+		}
+		if !inExpansion[tok] {
+			t.Errorf("Junos schema service %q is missing from the `system-services all` union — "+
+				"`all` must cover the services Juniper defines (#3226)", tok)
+		}
+		if HostInboundNonJunosSystemServices[tok] {
+			t.Errorf("%q is in Juniper's schema, so it is NOT an xpf-only extension; "+
+				"HostInboundNonJunosSystemServices must not exclude it from `all`", tok)
+		}
+	}
+
+	// --- fail-OPEN: the union opens no tuple Juniper's set does not. ---------
+	for _, family := range []string{"ip", "ip6"} {
+		schemaOpens := map[string]string{} // opening -> the token that grants it
+		for _, tok := range schema {
+			for _, m := range HostInboundServiceMatch(tok, family) {
+				for _, k := range hiOpeningKeys(m) {
+					schemaOpens[k] = tok
+				}
+			}
+		}
+		if len(schemaOpens) == 0 {
+			t.Fatalf("(%s) Juniper's schema set opens ZERO tuples — the subset check below "+
+				"would pass vacuously", family)
+		}
+		for _, m := range HostInboundServiceMatch("all", family) {
+			for _, k := range hiOpeningKeys(m) {
+				if _, ok := schemaOpens[k]; !ok {
+					t.Errorf("`system-services all` (%s) opens %s (from %+v), which NO service in "+
+						"Juniper's enumeration opens — the union is wider than Junos's `all` (#3226)",
+						family, k, m)
+				}
+			}
+		}
+	}
+
+	// The two known-excluded tokens stay RECOGNIZED: the carve-out narrows
+	// `all`, it does not remove the service. (Stated by name because this is a
+	// claim about the tokens themselves, not about ports.)
+	for _, tok := range []string{"r-exec", "rexec", "gre"} {
+		if !KnownHostInboundSystemServices[tok] {
+			t.Errorf("%q must stay a recognized token — listing it explicitly must still work", tok)
+		}
+		if inExpansion[tok] {
+			t.Errorf("%q is absent from Juniper's schema and opens a tuple no Junos token opens; "+
+				"it must be excluded from the `all` union (HostInboundNonJunosSystemServices)", tok)
+		}
+	}
+	// Port-level restatement of the rexec exclusion, which survives a rename.
+	for _, family := range []string{"ip", "ip6"} {
+		for _, m := range HostInboundServiceMatch("all", family) {
+			if m.Proto != HostInboundProtoTCP {
+				continue
+			}
+			for _, p := range m.Ports {
+				if p.Lo <= 512 && 512 <= p.Hi {
+					t.Errorf("`system-services all` (%s) opens tcp/512 via %+v — Junos's `all` never opens the rexec port (#3226)", family, m)
+				}
+			}
+		}
+	}
+}
+
+// TestHostInboundFixedPortJunosServicesCommit_3226 pins the Junos services this
+// fold added that have a port Juniper actually FIXES: they commit, and they
+// carry exactly that tuple on both families.
+//
+//	reverse-telnet TCP/2900, reverse-ssh TCP/2901 — junos-es-conf-system 24.4R2
+//	  `[edit system services reverse telnet|ssh] port` carry explicit YANG
+//	  `default` statements. This is the strongest evidence class available: a
+//	  machine-readable platform default in the schema the CLI validates against.
+//	lsselfping UDP/8503 — RFC 7746 §3 ("The UDP Destination Port MUST be
+//	  lsp-self-ping (8503)") and §6 (IANA assignment). Deliberately NOT 3503:
+//	  that is `lsping` (MPLS echo), a different protocol with a similar name,
+//	  and conflating them would open the wrong port for both.
+//
+// FAIL-ON-REVERT: drop one from KnownHostInboundSystemServices and its commit
+// subtest goes RED; move a port and the tuple assertion names the drift.
+func TestHostInboundFixedPortJunosServicesCommit_3226(t *testing.T) {
 	want := map[string][]L4Match{
-		"r2cp":           {{Proto: HostInboundProtoUDP, Ports: []PortRange{{Lo: 28762, Hi: 28762}}}},
 		"reverse-telnet": {{Proto: HostInboundProtoTCP, Ports: []PortRange{{Lo: 2900, Hi: 2900}}}},
 		"reverse-ssh":    {{Proto: HostInboundProtoTCP, Ports: []PortRange{{Lo: 2901, Hi: 2901}}}},
-		"rpm": {
-			{Proto: HostInboundProtoTCP, Ports: []PortRange{{Lo: 7, Hi: 7}}},
-			{Proto: HostInboundProtoUDP, Ports: []PortRange{{Lo: 7, Hi: 7}}},
-		},
+		"lsselfping":     {{Proto: HostInboundProtoUDP, Ports: []PortRange{{Lo: 8503, Hi: 8503}}}},
 	}
 	for tok, tuples := range want {
 		t.Run(tok, func(t *testing.T) {
@@ -165,15 +353,13 @@ func TestHostInboundDocumentedJunosServiceTokensCommit_3226(t *testing.T) {
 				"set security zones security-zone mgmt host-inbound-traffic system-services " + tok,
 			})
 			if _, err := CompileConfig(tree); err != nil {
-				t.Fatalf("strict commit rejected `host-inbound-traffic system-services %s` (documented vSRX service, #3226): %v", tok, err)
+				t.Fatalf("strict commit rejected `host-inbound-traffic system-services %s` (Junos schema service, #3226): %v", tok, err)
 			}
 			if !KnownHostInboundSystemServices[tok] {
 				t.Fatalf("%s must be in KnownHostInboundSystemServices so commit accepts it", tok)
 			}
-			// Junos-documented, so it must be part of the `all` union — that is
-			// the whole point of the token being defined.
-			if HostInboundNonJunosSystemServices[tok] {
-				t.Fatalf("%s is a documented Junos system-service; it must NOT be an xpf-only extension excluded from `all`", tok)
+			if HostInboundUnportedSystemServices[tok] {
+				t.Fatalf("%s has a platform-fixed port; it must NOT be in HostInboundUnportedSystemServices", tok)
 			}
 			// Dual-family (absent from the family map), like ssh/telnet.
 			if fam, scoped := HostInboundServiceFamily[tok]; scoped {
@@ -193,67 +379,93 @@ func TestHostInboundDocumentedJunosServiceTokensCommit_3226(t *testing.T) {
 			}
 		})
 	}
+	// lsping and lsselfping are different protocols on different ports; a fold
+	// of one into the other would silently open the wrong port for both.
+	a := hiOpeningKeys(HostInboundServiceMatch("lsping", "ip")[0])
+	b := hiOpeningKeys(HostInboundServiceMatch("lsselfping", "ip")[0])
+	if len(a) != 1 || len(b) != 1 || a[0] == b[0] {
+		t.Errorf("lsping (%v) and lsselfping (%v) must open exactly one, DIFFERENT port each: "+
+			"lsping is MPLS echo udp/3503, lsselfping is RFC 7746 udp/8503", a, b)
+	}
 }
 
-// TestHostInboundAllExpansionMatchesJunosDocumentedSet_3226 is the set-level
-// statement of the same contract, in both directions: every service Juniper
-// documents for `host-inbound-traffic system-services` must be IN the `all`
-// expansion, and no token outside that documented set may contribute a port the
-// documented set does not already open.
+// TestHostInboundUnportedJunosServicesCommit_3226 pins the other half: the Junos
+// services for which Juniper fixes NO listening port. They must COMMIT (they are
+// real vSRX services — rejecting them is the #3200 gap) and must synthesize NO
+// admission tuple on either family (any port would be a guess).
 //
-// The second direction is what removes `r-exec`/`rexec` (tcp/512) from the
-// union. Juniper documents `rlogin` and `rsh` but not rexec, and unlike the
-// port-neutral xpf spellings (`webapi-clear-text`/`webapi-ssl` resolve to the
-// http/https ports, `ssh-netconf`/`netconf-ssh` to ssh ∪ netconf) 512 is opened
-// by no other token — so leaving it in made `all` wider than the Junos `all`.
-// `sip` is deliberately retained: it is a vSRX ALG service with its own #3619
-// disposition and a fail-on-revert port pin in pkg/daemon.
-func TestHostInboundAllExpansionMatchesJunosDocumentedSet_3226(t *testing.T) {
-	// Verbatim from Juniper's `system-services (Security Zones Host Inbound
-	// Traffic)` / `(Security Zones Interfaces)` reference pages, minus the two
-	// meta tokens (`all`, `any-service`) which are not per-service members.
-	junosDocumented := []string{
-		"bootp", "dhcp", "dhcpv6", "dns", "finger", "ftp", "http", "https",
-		"ident-reset", "ike", "lsping", "netconf", "ntp", "ping", "r2cp",
-		"reverse-ssh", "reverse-telnet", "rlogin", "rpm", "rsh", "snmp",
-		"snmp-trap", "ssh", "telnet", "tftp", "traceroute", "xnm-clear-text",
-		"xnm-ssl",
+// Two of these carried a synthesized port in an earlier revision of this fold:
+//
+//	r2cp udp/28762 — draft-dubois-r2cp-00 calls 28762 a value prototypes
+//	  "suggested"; Juniper adopts it nowhere. `[edit protocols r2cp] server-port`
+//	  is range 1..65535 with NO YANG default.
+//	rpm tcp+udp/7  — 7 is the FLOOR of the `[edit services rpm probe-server]
+//	  port` range ("Port number 7 through 65535"), not a default, and the
+//	  probe-server container is presence-gated so nothing listens without
+//	  explicit configuration.
+//
+// The evidence is POSITIVE rather than absence-of-evidence: the same 24.4R2
+// module tree carries `default "2900"` / `default "2901"` on the reverse-telnet
+// / reverse-ssh port leaves, so the schema does record platform defaults where
+// they exist, and their absence here is a statement that none does.
+//
+// FAIL-ON-REVERT: give any of these a tuple (add a case arm, or drop it from
+// HostInboundUnportedSystemServices) and the no-tuple assertion goes RED naming
+// the port that reappeared.
+func TestHostInboundUnportedJunosServicesCommit_3226(t *testing.T) {
+	schema := map[string]bool{}
+	for _, tok := range junosSchemaSystemServices(t) {
+		schema[tok] = true
 	}
-	inExpansion := map[string]bool{}
-	for _, tok := range HostInboundAllExpansionServices() {
-		inExpansion[tok] = true
+	if len(HostInboundUnportedSystemServices) == 0 {
+		t.Fatal("HostInboundUnportedSystemServices is empty — the subtests below would be vacuous")
 	}
-	for _, tok := range junosDocumented {
-		if !KnownHostInboundSystemServices[tok] {
-			t.Errorf("Junos-documented system-service %q is not recognized at commit (#3200 parity gap)", tok)
-			continue
-		}
-		if !inExpansion[tok] {
-			t.Errorf("Junos-documented system-service %q is missing from the `system-services all` expansion — `all` must be the union of the DEFINED services (#3226)", tok)
-		}
+	for tok := range HostInboundUnportedSystemServices {
+		t.Run(tok, func(t *testing.T) {
+			tree := buildTree(t, []string{
+				"set security zones security-zone mgmt host-inbound-traffic system-services " + tok,
+			})
+			if _, err := CompileConfig(tree); err != nil {
+				t.Fatalf("strict commit rejected `host-inbound-traffic system-services %s` — it is a "+
+					"Junos service, so rejecting it is the #3200 parity gap: %v", tok, err)
+			}
+			if !KnownHostInboundSystemServices[tok] {
+				t.Fatalf("%s must stay recognized — the no-port model narrows what it admits, "+
+					"it does not remove the token", tok)
+			}
+			// It is a genuine Junos service, so it must be in the schema oracle
+			// and must NOT be treated as an xpf-only extension.
+			if !schema[tok] {
+				t.Errorf("%s is not in the Junos schema oracle — an unported token must still be a "+
+					"real Junos service, otherwise it belongs in HostInboundNonJunosSystemServices", tok)
+			}
+			if HostInboundNonJunosSystemServices[tok] {
+				t.Errorf("%s is a Junos service, not an xpf extension — it must stay in the `all` union", tok)
+			}
+			// The load-bearing assertion: NO tuple, either family.
+			for _, family := range []string{"ip", "ip6"} {
+				if got := HostInboundServiceMatch(tok, family); len(got) != 0 {
+					t.Errorf("%s (%s) synthesized %d admission tuple(s) %+v — Junos fixes no "+
+						"listening port for this service, so any port here is a guess that opens an "+
+						"unused port while still denying the one actually in use (#3226)",
+						tok, family, len(got), got)
+				}
+			}
+		})
 	}
-
-	// `r-exec`/`rexec` is the xpf-only spelling with a port of its own; it must
-	// be excluded so the union opens no port Juniper's list does not.
-	for _, tok := range []string{"r-exec", "rexec"} {
-		if inExpansion[tok] {
-			t.Errorf("%q is absent from Juniper's documented host-inbound service list and uniquely opens tcp/512; it must be excluded from the `all` expansion (HostInboundNonJunosSystemServices)", tok)
-		}
-		if !KnownHostInboundSystemServices[tok] {
-			t.Errorf("%q must stay a recognized token — the carve-out narrows `all`, it does not remove the service", tok)
-		}
-	}
-
-	// The union must open no tcp/512 at all, on either family: the port-level
-	// statement of the exclusion, which survives a rename of the token.
+	// The two historical guesses, restated at the union level: `all` must not
+	// open them. This is the precise RED-on-revert for a literal revert of the
+	// previous revision of this fold.
 	for _, family := range []string{"ip", "ip6"} {
 		for _, m := range HostInboundServiceMatch("all", family) {
-			if m.Proto != HostInboundProtoTCP {
-				continue
-			}
 			for _, p := range m.Ports {
-				if p.Lo <= 512 && 512 <= p.Hi {
-					t.Errorf("`system-services all` (%s) opens tcp/512 via %+v — Juniper's `all` never opens the rexec port (#3226)", family, m)
+				if m.Proto == HostInboundProtoUDP && p.Lo <= 28762 && 28762 <= p.Hi {
+					t.Errorf("`system-services all` (%s) opens udp/28762 — the r2cp port is a draft "+
+						"SUGGESTION, not a Junos default (#3226)", family)
+				}
+				if p.Lo <= 7 && 7 <= p.Hi {
+					t.Errorf("`system-services all` (%s) opens proto %d port 7 — the RPM probe-server "+
+						"range FLOOR is not a platform default (#3226)", family, m.Proto)
 				}
 			}
 		}
