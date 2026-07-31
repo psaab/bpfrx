@@ -62260,3 +62260,72 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/dhcprelay/{pending.go,relay.go,README.md,
     relay_binding_6562_test.go,delivery_test.go,relay_test.go},
     pkg/cli/show_services_dhcp.go, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6562 / PR #6603 re-review fold — Codex MAJOR (a config reload
+  destroyed every live binding) + 4 MINORs.
+
+  MAJOR. Every field in relaySpec participates in equal(), so ANY day-2 change
+  to a relay group stops the relay and builds a replacement with a brand-new
+  pending table. The replacement rebinds the SAME giaddr:67, so replies for
+  pre-reload requests still ARRIVE and were then dropped by the binding gate —
+  pre-#6562 they were forwarded, so a straight availability regression. It is
+  sharpest for maximum-packet-rate, whose documented remedy is to raise it on a
+  busy segment: an operator following the docs DURING a boot storm would flush
+  every in-flight binding and cause the retry storm the table exists to
+  prevent. PROVENANCE NOTE: this was NOT introduced by the previous fold — the
+  first commit (1c071c18c:903) also built a fresh table per session; the fold
+  made it reachable via the newly-documented remedy. Fixed for ALL five spec
+  fields, not just rate. FIX: pendingTable.snapshot()/adopt() plus a phase-2.5
+  loop in Apply that runs AFTER the old relay's goroutines are joined (snapshot
+  complete, table quiescent) and BEFORE the replacement launches (nothing races
+  the destination). Adopted entries keep their ORIGINAL expiry — a reload must
+  not refresh the TTL, which would widen the xid-guessing window on every
+  commit. A SMALLER replacement (rate lowered) drops the oldest excess and
+  COUNTS them in PendingEvicted rather than discarding silently.
+
+  MINOR 1. popHeadLocked used expiry equality as slot identity. Two inserts of
+  the same key can share an expiry (time.Now() is not guaranteed to advance
+  between calls; a frozen test clock never does), so popping the OLDER slot
+  matched the map entry the NEWER slot owned and deleted a live binding. My
+  duplicate test had DODGED this by advancing the clock 1ms with a comment
+  claiming a real clock guarantees distinctness — it does not. Replaced with an
+  explicit monotonic generation counter (pendingEntry.gen / pendingSlot.gen);
+  new test uses a FROZEN clock so equal expiries are the case under test.
+
+  MINOR 2. size() returned len(entries) but capacity pressure is governed by
+  ring count. Diverges BOTH ways: expired entries linger in the map on an idle
+  relay (reads high), and duplicate inserts consume slots without adding keys
+  (reads low — a cap-4 ring holding A,B,B,B reports 2/4 yet the next insert
+  evicts live A). Split into occupancy() (ring count, drives PendingSize) and
+  liveEntries() (map count, diagnostic). Fixed the stale "pending-evicted is
+  the early warning" comment still in pkg/cli/show_services_dhcp.go.
+
+  MINOR 3. The strict "O(1) at capacity" claim was false: the reclaim loop can
+  pop up to `capacity` slots on the first insert after a long idle. Documented
+  the real bound (amortized O(1); worst case one full drain, at most once per
+  idle period) in both pending.go and README rather than adding a special-case
+  reset.
+
+  MINOR 4. The overflow test passed the untyped constant 1<<40, which fails to
+  COMPILE under GOARCH=386 ("overflows"). Verified firsthand, changed to 1<<30.
+  Added GOARCH=386 go vet to the gate.
+
+  Also added the reviewer's memory note to the README (48 B/slot -> 6 MiB ring,
+  ~18 MiB/interface at the ceiling, multiplicative across interfaces).
+
+  VALIDATION — four revert probes, each in a THROWAWAY detached worktree at the
+  branch HEAD (removed after; never the PR worktree), each build+vet CLEAN so
+  every red is an ASSERTION: (1) drop the phase-2.5 migration -> BOTH
+  RateChangePreservesBindings ("the outstanding binding was destroyed by the
+  rate change") and its _EndToEnd sibling RED; (2) slot identity back to expiry
+  equality -> EqualExpiriesDoNotLoseBinding RED; (3) occupancy back to
+  len(entries) -> OccupancyTracksRingNotMap RED ("occupancy = 2, want 4") plus
+  the EqualExpiries precondition. The end-to-end reload test needed a tracking
+  conn factory: a restart opens FRESH conns, so the original harness pair
+  belongs to the dead session, and the new pair is opened ASYNCHRONOUSLY from
+  the supervisor goroutine (hence pairAfter(t, n) rather than "latest").
+  Suites: pkg/dhcprelay -race -count=5 PASS; pkg/dhcp, pkg/dhcpserver, pkg/cli
+  -race PASS; go build ./... , gofmt, vet, GOARCH=386 vet clean.
+- **File(s)**: pkg/dhcprelay/{pending.go,relay.go,README.md,
+    relay_binding_6562_test.go}, pkg/cli/show_services_dhcp.go, _Log.md

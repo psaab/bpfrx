@@ -179,9 +179,11 @@ func (c *CLI) showDHCPRelay() error {
 			// a reply must also answer a request the relay actually forwarded.
 			// "no-request" counts replies that did not bind — an injection
 			// attempt, OR a legitimate reply that missed the binding window,
-			// which is a client-visible DHCP failure. "pending-evicted" is the
-			// early warning: the table is at capacity under a request flood, so
-			// legitimate bindings are being lost. "forcerenew" counts
+			// which is a client-visible DHCP failure. "Pending" (occupancy /
+			// capacity) is the LEADING indicator — approaching capacity means
+			// bindings are about to be evicted. "pending-evicted" is
+			// COINCIDENT, not leading: it rises only once bindings are already
+			// being lost. "forcerenew" counts
 			// DHCPFORCERENEW refused (RFC 3203 §6 requires RFC 3118 auth that a
 			// relay cannot verify).
 			// "Pending" is occupancy/capacity — the LEADING indicator. When it

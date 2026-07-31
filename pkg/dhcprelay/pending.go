@@ -196,6 +196,17 @@ func pendingKeyFor(pkt *dhcpv4.DHCPv4) pendingKey {
 type pendingSlot struct {
 	key pendingKey
 	exp time.Time
+	// gen identifies WHICH insertion of this key the slot represents. When a
+	// key is re-inserted, the map moves to the new generation and every older
+	// slot becomes stale. See pendingEntry.gen.
+	gen uint64
+}
+
+// pendingEntry is the live state for one key: its expiry, and the generation
+// of the ring slot that owns it.
+type pendingEntry struct {
+	exp time.Time
+	gen uint64
 }
 
 // pendingTable is a bounded, expiring set of outstanding relayed requests.
@@ -225,12 +236,21 @@ type pendingSlot struct {
 // either structure past the cap.
 type pendingTable struct {
 	mu      sync.Mutex
-	entries map[pendingKey]time.Time // key -> expiry
-	ring    []pendingSlot            // fixed length == capacity; expiry-ordered
-	head    int                      // index of the oldest slot
-	count   int                      // slots in use
+	entries map[pendingKey]pendingEntry // key -> expiry + owning generation
+	ring    []pendingSlot               // fixed length == capacity; expiry-ordered
+	head    int                         // index of the oldest slot
+	count   int                         // slots in use
 	ttl     time.Duration
 	now     func() time.Time
+
+	// nextGen hands out slot generations. It makes slot identity EXACT rather
+	// than inferring it from the expiry: two inserts of the same key can
+	// receive the SAME expiry (time.Now() is not guaranteed to advance between
+	// two calls, and a frozen test clock never does), and comparing expiries
+	// would then treat the older slot as the live one — popping it at capacity
+	// would delete a binding that a newer slot still owns, silently losing a
+	// legitimate reply. Generations cannot collide.
+	nextGen uint64
 
 	// evicted counts entries removed by CAP PRESSURE (not by ordinary expiry).
 	// It is surfaced through interfaceRelay.pendingEvicted; a nonzero value
@@ -260,7 +280,7 @@ func newPendingTable(capacity int, ttl time.Duration, now func() time.Time) *pen
 		ttl = pendingTTL
 	}
 	return &pendingTable{
-		entries: make(map[pendingKey]time.Time),
+		entries: make(map[pendingKey]pendingEntry),
 		ring:    make([]pendingSlot, capacity),
 		ttl:     ttl,
 		now:     now,
@@ -285,8 +305,14 @@ func (t *pendingTable) insert(k pendingKey) {
 	now := t.now()
 
 	// Reclaim expired slots from the head. The ring is expiry-ordered, so this
-	// stops at the first unexpired slot — amortized O(1), since every slot is
-	// popped at most once.
+	// stops at the first unexpired slot.
+	//
+	// COST: amortized O(1) — every slot is pushed once and popped once — but
+	// the WORST CASE for a single call is one full drain of up to `capacity`
+	// slots, when the first insert after a long idle period finds everything
+	// expired. That is bounded, happens at most once per idle period (the next
+	// insert finds an empty ring), and is not the per-packet repeat the
+	// pre-ring implementation had. It is NOT strict O(1); do not claim it is.
 	for t.count > 0 && !now.Before(t.ring[t.head].exp) {
 		t.popHeadLocked()
 	}
@@ -315,24 +341,37 @@ func (t *pendingTable) insert(k pendingKey) {
 		}
 	}
 
-	exp := now.Add(t.ttl)
-	t.entries[k] = exp
-	t.ring[(t.head+t.count)%len(t.ring)] = pendingSlot{key: k, exp: exp}
+	t.pushLocked(k, now.Add(t.ttl))
+}
+
+// pushLocked records one key with an explicit expiry, assigning it a fresh
+// generation. Callers MUST push in non-decreasing expiry order so the ring
+// stays expiry-ordered, and MUST have already made room. Caller holds mu.
+func (t *pendingTable) pushLocked(k pendingKey, exp time.Time) {
+	gen := t.nextGen
+	t.nextGen++
+	t.entries[k] = pendingEntry{exp: exp, gen: gen}
+	t.ring[(t.head+t.count)%len(t.ring)] = pendingSlot{key: k, exp: exp, gen: gen}
 	t.count++
 }
 
 // popHeadLocked removes the oldest ring slot and reports whether it removed a
 // LIVE map entry. A slot is stale (and its removal frees nothing in the map)
-// when the key was re-inserted after it: the map then holds a LATER expiry than
-// the slot, so the expiry comparison identifies the live slot exactly. Caller
-// holds mu.
+// when the key was re-inserted after it: the map then holds a LATER GENERATION
+// than the slot.
+//
+// Identity is the generation, NOT the expiry. Two inserts of the same key can
+// carry identical expiries (nothing guarantees time.Now() advances between two
+// calls, and a frozen test clock never does); comparing expiries would then
+// match the OLDER slot and delete a binding the newer slot still owns — a
+// silently lost reply. Caller holds mu.
 func (t *pendingTable) popHeadLocked() bool {
 	s := t.ring[t.head]
 	t.ring[t.head] = pendingSlot{} // drop the time.Time reference
 	t.head = (t.head + 1) % len(t.ring)
 	t.count--
 	t.slotScans++
-	if exp, ok := t.entries[s.key]; ok && exp.Equal(s.exp) {
+	if e, ok := t.entries[s.key]; ok && e.gen == s.gen {
 		delete(t.entries, s.key)
 		return true
 	}
@@ -361,11 +400,77 @@ func (t *pendingTable) matches(k pendingKey) bool {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	exp, ok := t.entries[k]
+	e, ok := t.entries[k]
 	if !ok {
 		return false
 	}
-	return t.now().Before(exp)
+	return t.now().Before(e.exp)
+}
+
+// snapshot returns the live, unexpired bindings in expiry order (oldest
+// first), for migration into a replacement table.
+//
+// WHY THIS EXISTS (#6603 re-review). maxPacketRate — and every other field in
+// relaySpec — participates in relaySpec.equal(), so ANY day-2 config change to
+// a relay group stops the relay and builds a replacement with a brand-new
+// table. Without migration every outstanding binding is destroyed at that
+// instant, and because the replacement rebinds the SAME giaddr:67, replies for
+// pre-reload requests still arrive — and are then dropped by the binding gate.
+// Pre-#6562 those replies were forwarded, so that is a straight availability
+// regression.
+//
+// It is sharpest for maximum-packet-rate: raising it is the documented remedy
+// for a busy segment, so an operator following the docs DURING a boot storm
+// would flush every in-flight binding and trigger the retry storm this file
+// exists to prevent.
+//
+// Expired entries are excluded, and each entry keeps its ORIGINAL expiry when
+// adopted — a config reload must not extend the binding window, which would
+// hand an attacker a longer guessing window for free.
+func (t *pendingTable) snapshot() []pendingSlot {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := t.now()
+	live := make([]pendingSlot, 0, t.count)
+	for i := 0; i < t.count; i++ {
+		s := t.ring[(t.head+i)%len(t.ring)]
+		// Skip stale slots (a newer generation owns the key) and expired ones.
+		if e, ok := t.entries[s.key]; !ok || e.gen != s.gen {
+			continue
+		}
+		if !now.Before(s.exp) {
+			continue
+		}
+		live = append(live, s)
+	}
+	return live
+}
+
+// adopt installs migrated bindings into a freshly-built table, preserving each
+// one's original expiry. Slots MUST arrive in expiry order (snapshot's output
+// is), which keeps the ring's expiry ordering intact.
+//
+// If the replacement is SMALLER — the operator lowered maximum-packet-rate —
+// the excess cannot be kept. The OLDEST are dropped (the same policy the
+// steady-state path uses, and the ones closest to expiry anyway) and each is
+// COUNTED as an eviction, so a shrink shows up in PendingEvicted instead of
+// silently discarding bindings.
+func (t *pendingTable) adopt(slots []pendingSlot) {
+	if t == nil || len(slots) == 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if capacity := len(t.ring); len(slots) > capacity {
+		t.evicted += uint64(len(slots) - capacity)
+		slots = slots[len(slots)-capacity:] // keep the NEWEST (longest-lived)
+	}
+	for _, s := range slots {
+		t.pushLocked(s.key, s.exp)
+	}
 }
 
 // evictions returns the cap-pressure eviction count.
@@ -378,13 +483,38 @@ func (t *pendingTable) evictions() uint64 {
 	return t.evicted
 }
 
-// size returns the current entry count. Expired entries are reclaimed on the
-// next insert (the ring head is drained first), so on an idle relay this can
-// briefly include entries past their expiry; they are inert either way because
-// matches re-checks the expiry. Surfaced as RelayStats.PendingSize — occupancy
-// approaching capacity is the LEADING indicator that bindings are about to
-// start being evicted (#6603 review F3).
-func (t *pendingTable) size() int {
+// occupancy returns the number of RING SLOTS in use — the quantity that is
+// actually compared against capacity, and therefore the one that predicts
+// eviction. Surfaced as RelayStats.PendingSize.
+//
+// It is deliberately NOT len(entries), which diverges from ring pressure in
+// both directions and would make the gauge lie:
+//
+//   - too HIGH on an idle relay: expired entries are reclaimed lazily, on the
+//     next insert, so len(entries) can sit above the real live set for as long
+//     as the relay is quiet;
+//   - too LOW under ordinary duplicate inserts: a retransmission consumes a
+//     ring slot without adding a map entry, so a capacity-4 ring holding
+//     A,B,B,B reports len(entries)==2 while the very next insert must evict
+//     live A. Eviction would begin while the displayed ratio still looked
+//     comfortable — the exact opposite of the documented contract.
+//
+// Use liveEntries for the count of distinct bindable keys.
+func (t *pendingTable) occupancy() int {
+	if t == nil {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.count
+}
+
+// liveEntries returns the number of distinct keys currently in the map. Expired
+// entries are reclaimed lazily (on the next insert), so on an idle relay this
+// can include entries past their expiry; they are inert either way because
+// matches re-checks the expiry. Diagnostic/test accessor — the operator-facing
+// gauge is occupancy.
+func (t *pendingTable) liveEntries() int {
 	if t == nil {
 		return 0
 	}

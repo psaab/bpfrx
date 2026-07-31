@@ -358,21 +358,59 @@ the oldest degrades gracefully, and the choice trades away no security, because
 eviction can only cause a legitimate reply to be *dropped*, never an unsolicited
 reply to be *accepted*. Every eviction bumps `PendingEvicted`.
 
-**O(1) at capacity.** Expiry and eviction go through a fixed-size ring of
-insertions, not a scan. This works because every entry carries the *same* TTL,
-so insertion order **is** expiry order and the oldest is always at the ring
+**Amortized O(1) at capacity.** Expiry and eviction go through a fixed-size ring
+of insertions, not a scan. This works because every entry carries the *same*
+TTL, so insertion order **is** expiry order and the oldest is always at the ring
 head. The original implementation ranged the whole map for the minimum expiry —
 two full `O(capacity)` scans per admitted packet once full, on the single
-client-facing read goroutine, which saturates a core in exactly the overload
-the table is meant to survive. A key re-inserted before its old slot expires
-(a retransmission, or the SELECTING REQUEST reusing the DISCOVER's xid) simply
-gets a new slot; the older one is stale (the map holds a later expiry) and is
-discarded for free at the head. Because a slot is always freed before a push,
+client-facing read goroutine, which saturates a core in exactly the overload the
+table is meant to survive.
+
+The bound is **amortized** O(1), not strict: each slot is pushed once and popped
+once, but the *worst case for one call* is a full drain of up to `capacity`
+slots, when the first insert after a long idle period finds everything expired.
+That is bounded, happens at most once per idle period (the next insert finds an
+empty ring), and is not the per-packet repeat the pre-ring code had.
+
+A key re-inserted before its old slot expires (a retransmission, or the
+SELECTING REQUEST reusing the DISCOVER's xid) simply gets a new slot; the older
+one is stale and is discarded for free at the head. Slot identity is an explicit
+**generation counter**, not the expiry: two inserts of the same key can carry
+identical expiries (nothing guarantees `time.Now()` advances between two calls),
+and matching on expiry would pop the older slot and delete a binding the newer
+slot still owns. Because a slot is always freed before a push,
 `len(entries) ≤ count ≤ capacity` — the ring bounds the map, so duplicate
 inserts cannot grow either structure.
-`TestPendingTable_AtCapInsertIsConstantTime` pins this by counting ring slots
-examined (deterministic, no timing), with a **lower** bound as well as an upper
-one so an implementation that bypasses the ring cannot pass by reporting zero.
+`TestPendingTable_AtCapInsertIsConstantTime` pins the cost by counting ring
+slots examined (deterministic, no timing), with a **lower** bound as well as an
+upper one so an implementation that bypasses the ring cannot pass by reporting
+zero.
+
+**Memory.** A `pendingSlot` is 48 bytes on amd64, so the ring is a fixed
+`48 × capacity` (6 MiB at the 131072 ceiling) plus the Go map, ~18 MiB per
+interface at full occupancy on a ceiling-sized table. That is bounded per
+interface but **multiplicative across relay interfaces**: a chassis with many
+high-rate relay segments should size `maximum-packet-rate` per segment rather
+than setting it high everywhere.
+
+**Bindings survive a config reload.** Every field in `relaySpec` — servers,
+always-broadcast, hop count, trust-option-82, packet rate — participates in
+`equal()`, so any day-2 change to a group stops the relay and builds a
+replacement. The replacement rebinds the *same* `giaddr:67`, so replies for
+pre-reload requests still arrive; without migration they would hit the binding
+gate and be dropped, which pre-#6562 would have been forwarded. `Apply` therefore
+snapshots the old table's live bindings and adopts them into the replacement,
+**after** the old relay's goroutines are joined (so the snapshot is complete)
+and **before** the new one launches (so nothing races the destination).
+
+This matters most for `maximum-packet-rate`, whose documented remedy is to raise
+it on a busy segment: without migration, an operator following that advice
+*during* a boot storm would flush every in-flight binding and cause the retry
+storm this table exists to prevent. Adopted entries keep their **original
+expiry** — a reload must not refresh the TTL, which would widen the attacker's
+xid-guessing window every time the config was touched. If the replacement is
+*smaller* (the rate was lowered), the oldest excess bindings are dropped and
+**counted** in `PendingEvicted` rather than discarded silently.
 
 **TTL — 30s.** This bounds the window in which a guessed xid would be accepted,
 while covering realistic server latency. RFC 2131 §4.1's retransmission schedule
@@ -400,6 +438,14 @@ leading — an eviction is what *causes* the subsequent drop, so its lead time i
 one server RTT (tens of ms to a couple of seconds). Alert on the
 size/capacity ratio; treat a rising `PendingEvicted` as damage already in
 progress.
+
+`PendingSize` reports **ring slots in use**, not the map's key count, because
+ring pressure is what triggers eviction. The two diverge in both directions: on
+an idle relay expired entries linger in the map until the next insert reclaims
+them (map count reads *high*), and duplicate inserts consume ring slots without
+adding keys (map count reads *low* — a capacity-4 ring holding `A,B,B,B` has two
+keys but evicts live `A` on the very next insert). Reporting the map count would
+show a comfortable `2/4` at the exact moment eviction began.
 
 These counters are currently surfaced only by the **on-box console CLI**
 (`show services dhcp relay`) — there is no gRPC RPC or Prometheus collector for

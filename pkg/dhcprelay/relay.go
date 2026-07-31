@@ -870,6 +870,11 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.DHCPRelayConfig) {
 	m.mu.Lock()
 
 	var toStop []*interfaceRelay // removed or changed: tear down
+	// replaced maps an interface name to the relay being torn down BECAUSE ITS
+	// SPEC CHANGED (not one being removed). Its outstanding-request bindings
+	// are migrated into the replacement once it has fully stopped (#6562) —
+	// see the phase-2.5 loop below.
+	replaced := make(map[string]*interfaceRelay)
 	// Remove relays that are no longer desired, or whose spec changed. A
 	// changed relay is removed here and re-added in the start loop below.
 	for name, ir := range m.relays {
@@ -884,6 +889,7 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.DHCPRelayConfig) {
 		if !ir.spec.equal(d.spec) {
 			toStop = append(toStop, ir)
 			delete(m.relays, name)
+			replaced[name] = ir
 			slog.Info("dhcp-relay: restarting (config changed)",
 				"interface", name,
 				"old_servers", ir.spec.servers, "new_servers", d.spec.servers,
@@ -949,6 +955,37 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.DHCPRelayConfig) {
 		<-ir.done
 	}
 
+	// Phase 2.5 (outside lock, AFTER the join): migrate outstanding-request
+	// bindings from each replaced relay into its replacement (#6562).
+	//
+	// Ordering is load-bearing. The old relay's goroutines are fully joined
+	// above, so its table is quiescent and the snapshot is complete; and the
+	// replacement has not been launched yet, so nothing is concurrently
+	// inserting into the destination. Snapshotting in phase 1 instead would
+	// miss every request relayed between the decision and the actual stop.
+	//
+	// Without this, ANY day-2 change to a relay group (servers,
+	// always-broadcast, hop count, trust-option-82, packet rate) destroys every
+	// in-flight binding, and because the replacement rebinds the SAME
+	// giaddr:67, replies for pre-reload requests still arrive and are then
+	// dropped — an availability regression against pre-#6562 behavior. It bites
+	// hardest for maximum-packet-rate, whose documented remedy is to raise it
+	// on a busy segment: doing that mid-boot-storm would flush every binding.
+	for _, s := range toStart {
+		old, ok := replaced[s.ir.ifaceName]
+		if !ok {
+			continue
+		}
+		carried := old.pending.snapshot()
+		s.ir.pending.adopt(carried)
+		if len(carried) > 0 {
+			slog.Info("dhcp-relay: carried outstanding request bindings across restart",
+				"interface", s.ir.ifaceName,
+				"bindings", len(carried),
+				"new_capacity", s.ir.pending.capacity())
+		}
+	}
+
 	// Phase 3 (outside lock): launch the new/restarted relays.
 	for _, s := range toStart {
 		go func(relay *interfaceRelay, rctx context.Context, servers []*net.UDPAddr) {
@@ -997,7 +1034,7 @@ func (m *Manager) Stats() []RelayStats {
 			RepliesDroppedNoRequest:      ir.repliesDroppedNoRequest.Load(),
 			RepliesDroppedForceRenew:     ir.repliesDroppedForceRenew.Load(),
 			PendingEvicted:               ir.pending.evictions(),
-			PendingSize:                  uint64(ir.pending.size()),
+			PendingSize:                  uint64(ir.pending.occupancy()),
 			PendingCapacity:              uint64(ir.pending.capacity()),
 			RepliesL2Unicast:             ir.repliesL2Unicast.Load(),
 			RepliesUnicastCiaddr:         ir.repliesUnicastCiaddr.Load(),

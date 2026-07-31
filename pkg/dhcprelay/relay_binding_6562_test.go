@@ -3,6 +3,7 @@ package dhcprelay
 import (
 	"context"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -421,8 +422,8 @@ func TestPendingTable_CapEvictsOldestNotNewest(t *testing.T) {
 		tbl.insert(key(i))
 		now = now.Add(time.Second)
 	}
-	if tbl.size() != capacity {
-		t.Fatalf("size = %d, want %d after filling to capacity", tbl.size(), capacity)
+	if tbl.occupancy() != capacity {
+		t.Fatalf("occupancy = %d, want %d after filling to capacity", tbl.occupancy(), capacity)
 	}
 	if got := tbl.evictions(); got != 0 {
 		t.Fatalf("evictions = %d, want 0 before the cap is exceeded", got)
@@ -438,8 +439,8 @@ func TestPendingTable_CapEvictsOldestNotNewest(t *testing.T) {
 	if tbl.matches(key(1)) {
 		t.Error("the OLDEST entry survived; eviction did not pick it")
 	}
-	if tbl.size() != capacity {
-		t.Errorf("size = %d, want %d (the table must stay bounded)", tbl.size(), capacity)
+	if tbl.occupancy() != capacity {
+		t.Errorf("occupancy = %d, want %d (the table must stay bounded)", tbl.occupancy(), capacity)
 	}
 	if got := tbl.evictions(); got != 1 {
 		t.Errorf("evictions = %d, want 1 — cap pressure MUST be observable", got)
@@ -490,7 +491,7 @@ func TestPendingTable_NilFailsClosed(t *testing.T) {
 	if tbl.matches(k) {
 		t.Error("a nil pending table admitted a reply — the binding would be silently disabled")
 	}
-	if tbl.evictions() != 0 || tbl.size() != 0 {
+	if tbl.evictions() != 0 || tbl.occupancy() != 0 {
 		t.Error("nil table reported nonzero counters")
 	}
 }
@@ -671,8 +672,11 @@ func TestPendingCapacity_Derivation(t *testing.T) {
 		t.Errorf("effective window at the ceiling = %v, want < nominal %v", w, pendingTTL)
 	}
 
-	// A nonsense rate from a hand-edited active.json must not overflow.
-	if c, cl := pendingCapacityFor(1 << 40); !cl || c != pendingCapMax {
+	// A nonsense rate from a hand-edited active.json must not overflow. Use a
+	// value representable in a 32-bit int: an untyped constant that overflows
+	// int on GOARCH=386 fails to COMPILE, which would break 32-bit builds
+	// rather than test the guard.
+	if c, cl := pendingCapacityFor(1 << 30); !cl || c != pendingCapMax {
 		t.Errorf("absurd rate: capacity=%d clamped=%v, want %d/true", c, cl, pendingCapMax)
 	}
 	// Unset/negative falls back to the default rate, not to zero capacity.
@@ -737,8 +741,8 @@ func TestPendingTable_AtCapInsertIsConstantTime(t *testing.T) {
 	for i := 0; i < capacity; i++ {
 		tbl.insert(key(i))
 	}
-	if tbl.size() != capacity {
-		t.Fatalf("size = %d, want %d", tbl.size(), capacity)
+	if tbl.occupancy() != capacity {
+		t.Fatalf("occupancy = %d, want %d", tbl.occupancy(), capacity)
 	}
 
 	// Now every insert is at capacity and must evict exactly one entry.
@@ -773,8 +777,8 @@ func TestPendingTable_AtCapInsertIsConstantTime(t *testing.T) {
 	if got := tbl.evictions(); got != atCapInserts {
 		t.Errorf("evictions = %d, want %d (one per at-cap insert)", got, atCapInserts)
 	}
-	if tbl.size() != capacity {
-		t.Errorf("size = %d, want %d — the table must stay bounded", tbl.size(), capacity)
+	if tbl.occupancy() != capacity {
+		t.Errorf("occupancy = %d, want %d — the table must stay bounded", tbl.occupancy(), capacity)
 	}
 }
 
@@ -794,7 +798,7 @@ func TestPendingTable_DuplicateKeyDoesNotGrowRing(t *testing.T) {
 		tbl.insert(dup)
 		now = now.Add(time.Millisecond) // distinct expiries, as a real clock gives
 	}
-	if got := tbl.size(); got != 1 {
+	if got := tbl.liveEntries(); got != 1 {
 		t.Errorf("size = %d, want 1 — a repeated key must not accumulate entries", got)
 	}
 	if !tbl.matches(dup) {
@@ -809,5 +813,345 @@ func TestPendingTable_DuplicateKeyDoesNotGrowRing(t *testing.T) {
 	tbl.insert(fresh)
 	if !tbl.matches(fresh) || !tbl.matches(dup) {
 		t.Error("a fresh key evicted the live duplicate, or was not admitted")
+	}
+}
+
+// TestRelay_RateChangePreservesBindings is the fail-on-revert guard for the
+// #6603 re-review MAJOR: a day-2 config change must NOT destroy outstanding
+// request bindings.
+//
+// maxPacketRate participates in relaySpec.equal(), so changing it stops the
+// relay and builds a replacement with a brand-new table. Because the
+// replacement rebinds the SAME giaddr:67, replies for pre-reload requests still
+// arrive — and without migration they are then dropped by the binding gate,
+// which pre-#6562 would have been forwarded.
+//
+// It bites hardest for exactly this knob: raising maximum-packet-rate is the
+// documented remedy for a busy segment, so an operator following the docs
+// DURING a boot storm would flush every in-flight binding and trigger the retry
+// storm the binding table exists to prevent.
+//
+// Removing the phase-2.5 snapshot/adopt migration in Apply makes this RED as an
+// assertion: the OFFER is no longer delivered after the reload.
+func TestRelay_RateChangePreservesBindings(t *testing.T) {
+	h := newBindingHarness(t)
+	defer h.stop()
+
+	chaddr := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x5A}
+
+	// A client's DISCOVER goes upstream and arms a binding.
+	discover := newRequest(t, dhcpv4.MessageTypeDiscover, chaddr, nil)
+	h.relayUp(discover)
+
+	before := h.relay()
+	if !before.pending.matches(pendingKeyFor(discover)) {
+		t.Fatal("precondition: the relayed DISCOVER did not arm a binding")
+	}
+
+	// The operator raises maximum-packet-rate mid-storm — the documented
+	// remedy. This restarts the relay with a larger table.
+	cfg := singleInterfaceConfig()
+	cfg.Groups["g"].MaximumPacketRate = 3000
+	h.m.Apply(context.Background(), cfg)
+
+	after := h.relay()
+	if after == before {
+		t.Fatal("precondition: the rate change did not restart the relay, so this " +
+			"test is not exercising the migration path")
+	}
+	if got, want := after.pending.capacity(), mustCapacity(3000); got != want {
+		t.Fatalf("precondition: replacement capacity = %d, want %d", got, want)
+	}
+
+	// The binding must have survived into the replacement table.
+	if !after.pending.matches(pendingKeyFor(discover)) {
+		t.Error("the outstanding binding was destroyed by the rate change — the " +
+			"server's OFFER will now be dropped, turning the boot storm the " +
+			"operator was mitigating into a retry storm")
+	}
+
+	if got := after.repliesDroppedNoRequest.Load(); got != 0 {
+		t.Errorf("repliesDroppedNoRequest = %d, want 0 — a legitimate pre-reload "+
+			"reply must not be dropped by the reload", got)
+	}
+}
+
+// TestRelay_RateChangePreservesBindings_EndToEnd is the same MAJOR guard driven
+// all the way through the sockets: the server's OFFER for a PRE-reload DISCOVER
+// must still be delivered to the client after the relay restarts on a rate
+// change.
+//
+// It cannot use bindingHarness, because the restart opens FRESH conns from the
+// factory — the harness's original pair belongs to the dead session. A tracking
+// factory hands out a new fakeConn per open and exposes the latest pair, so the
+// test can drive the post-restart session.
+func TestRelay_RateChangePreservesBindings_EndToEnd(t *testing.T) {
+	tr := &connTracker{}
+	m := testManager(tr.factory)
+	m.Apply(context.Background(), singleInterfaceConfig())
+	defer m.Stop()
+
+	chaddr := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x6B}
+	yiaddr := net.IPv4(10, 0, 0, 92)
+
+	// Pre-reload: relay a DISCOVER through the FIRST session.
+	client, server := tr.pairAfter(t, 2)
+	discover := newRequest(t, dhcpv4.MessageTypeDiscover, chaddr, nil)
+	before := server.writeCount()
+	client.push(discover.ToBytes())
+	if !waitFor(func() bool { return server.writeCount() > before }) {
+		t.Fatal("precondition: the DISCOVER was not relayed upstream")
+	}
+
+	// The operator raises maximum-packet-rate: the relay restarts.
+	cfg := singleInterfaceConfig()
+	cfg.Groups["g"].MaximumPacketRate = 3000
+	m.Apply(context.Background(), cfg)
+
+	// Post-reload: the OFFER arrives on the NEW server socket (same giaddr:67).
+	client2, server2 := tr.pairAfter(t, 4)
+	if server2 == server {
+		t.Fatal("precondition: the restart did not open a new server conn")
+	}
+	offer := serverReply(t, discover, dhcpv4.MessageTypeOffer, yiaddr, nil, true)
+	server2.push(offer.ToBytes())
+
+	if !waitFor(func() bool { return client2.writeCount() > 0 }) {
+		t.Fatal("the OFFER answering a PRE-reload DISCOVER was not delivered to the " +
+			"client after the rate change — the reload destroyed the binding, so " +
+			"the boot storm the operator was mitigating becomes a retry storm")
+	}
+}
+
+// connTracker is a packetConnFactory that returns a fresh fakeConn per open and
+// remembers them, so a test can reach the conns of the CURRENT session after a
+// relay restart. Conns are opened client-first then server, so the latest pair
+// is the last two.
+type connTracker struct {
+	mu    sync.Mutex
+	conns []*fakeConn
+}
+
+func (ct *connTracker) factory(ctx context.Context, ifaceName string,
+	reusePort, broadcast bool, bindAddr *net.UDPAddr) (net.PacketConn, error) {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	c := newFakeConn()
+	// Odd opens are the server-facing conn; report a CONFIGURED server source so
+	// replies pass the #4163 check.
+	if len(ct.conns)%2 == 1 {
+		c.srcAddr = &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: relayPort}
+	}
+	ct.conns = append(ct.conns, c)
+	return c, nil
+}
+
+// pairAfter returns the (client, server) conns of the most recent session,
+// waiting until at least want conns have been opened in total. The count is
+// explicit because a restarted relay opens its conns ASYNCHRONOUSLY from its
+// supervisor goroutine — Apply returns before they exist, so "latest" without a
+// floor would hand back the DEAD session's pair.
+func (ct *connTracker) pairAfter(t *testing.T, want int) (*fakeConn, *fakeConn) {
+	t.Helper()
+	var client, server *fakeConn
+	ok := waitFor(func() bool {
+		ct.mu.Lock()
+		defer ct.mu.Unlock()
+		if len(ct.conns) < want || len(ct.conns)%2 != 0 {
+			return false
+		}
+		client, server = ct.conns[len(ct.conns)-2], ct.conns[len(ct.conns)-1]
+		return true
+	})
+	if !ok {
+		t.Fatalf("relay never opened %d conns (client+server per session)", want)
+	}
+	return client, server
+}
+
+// mustCapacity is pendingCapacityFor's capacity, for test preconditions.
+func mustCapacity(rate int) int {
+	c, _ := pendingCapacityFor(rate)
+	return c
+}
+
+// TestPendingTable_AdoptShrinkEvictsOldestAndCounts pins the other direction of
+// the migration: LOWERING maximum-packet-rate gives a smaller table, so some
+// bindings cannot be carried. The excess must be dropped oldest-first (the same
+// policy the steady-state path uses) and COUNTED, so a shrink is visible in
+// PendingEvicted rather than silently discarding bindings.
+func TestPendingTable_AdoptShrinkEvictsOldestAndCounts(t *testing.T) {
+	now := time.Unix(9000, 0)
+	clock := func() time.Time { return now }
+	old := newPendingTable(8, time.Hour, clock)
+
+	key := func(n byte) pendingKey {
+		return pendingKey{xid: dhcpv4.TransactionID{0, 0, 0, n}, hlen: 6}
+	}
+	for i := byte(1); i <= 8; i++ {
+		old.insert(key(i))
+		now = now.Add(time.Second)
+	}
+
+	live := old.snapshot()
+	if len(live) != 8 {
+		t.Fatalf("snapshot returned %d live bindings, want 8", len(live))
+	}
+
+	// Replacement holds only 3.
+	small := newPendingTable(3, time.Hour, clock)
+	small.adopt(live)
+
+	if got := small.occupancy(); got != 3 {
+		t.Errorf("occupancy = %d, want 3 (the replacement's capacity)", got)
+	}
+	if got := small.evictions(); got != 5 {
+		t.Errorf("evictions = %d, want 5 — a shrink must COUNT the bindings it "+
+			"cannot carry, not discard them silently", got)
+	}
+	// The NEWEST three (6,7,8) survive — they have the longest remaining life.
+	for _, n := range []byte{6, 7, 8} {
+		if !small.matches(key(n)) {
+			t.Errorf("binding %d did not survive the shrink; the newest must be kept", n)
+		}
+	}
+	for _, n := range []byte{1, 2, 3, 4, 5} {
+		if small.matches(key(n)) {
+			t.Errorf("binding %d survived; the OLDEST must be evicted first", n)
+		}
+	}
+}
+
+// TestPendingTable_SnapshotExcludesExpiredAndPreservesExpiry pins two migration
+// invariants: an already-expired binding is not resurrected by a reload, and a
+// carried binding keeps its ORIGINAL expiry. Refreshing the TTL on reload would
+// silently extend the attacker's xid-guessing window every time the operator
+// touched the config.
+func TestPendingTable_SnapshotExcludesExpiredAndPreservesExpiry(t *testing.T) {
+	now := time.Unix(9500, 0)
+	clock := func() time.Time { return now }
+	old := newPendingTable(16, 30*time.Second, clock)
+
+	stale := pendingKey{xid: dhcpv4.TransactionID{1, 0, 0, 0}, hlen: 6}
+	fresh := pendingKey{xid: dhcpv4.TransactionID{2, 0, 0, 0}, hlen: 6}
+	old.insert(stale)
+	now = now.Add(25 * time.Second)
+	old.insert(fresh) // 25s newer
+
+	now = now.Add(6 * time.Second) // stale is now 31s old (expired); fresh is 6s old
+
+	live := old.snapshot()
+	if len(live) != 1 || live[0].key != fresh {
+		t.Fatalf("snapshot = %d entries, want just the unexpired one", len(live))
+	}
+
+	replacement := newPendingTable(16, 30*time.Second, clock)
+	replacement.adopt(live)
+
+	if replacement.matches(stale) {
+		t.Error("an EXPIRED binding was resurrected by the migration")
+	}
+	if !replacement.matches(fresh) {
+		t.Fatal("the live binding did not survive the migration")
+	}
+	// Original expiry preserved: fresh was inserted 6s ago with a 30s TTL, so it
+	// must lapse 24s from now — NOT 30s (which would mean the reload refreshed
+	// it and widened the guessing window).
+	now = now.Add(25 * time.Second)
+	if replacement.matches(fresh) {
+		t.Error("the carried binding outlived its ORIGINAL expiry — a config reload " +
+			"must not refresh the TTL and extend the binding window")
+	}
+}
+
+// TestPendingTable_EqualExpiriesDoNotLoseBinding is the fail-on-revert guard for
+// the #6603 re-review MINOR 1: slot identity must be the generation counter, not
+// the expiry timestamp.
+//
+// Two inserts of the same key can receive the SAME expiry — nothing guarantees
+// time.Now() advances between two calls. With expiry-as-identity, popping the
+// OLDER slot at capacity matches the map entry the NEWER slot owns and deletes
+// it, silently losing a live binding. The clock here is FROZEN so equal
+// expiries are the case under test rather than the case avoided.
+//
+// Reverting popHeadLocked to compare expiries makes this RED.
+func TestPendingTable_EqualExpiriesDoNotLoseBinding(t *testing.T) {
+	frozen := time.Unix(10000, 0)
+	clock := func() time.Time { return frozen } // never advances
+	const capacity = 4
+	tbl := newPendingTable(capacity, time.Hour, clock)
+
+	dup := pendingKey{xid: dhcpv4.TransactionID{3, 3, 3, 3}, hlen: 6}
+	other := func(n byte) pendingKey {
+		return pendingKey{xid: dhcpv4.TransactionID{9, 9, 9, n}, hlen: 6}
+	}
+
+	// Two inserts of the same key under a frozen clock => identical expiries,
+	// two ring slots, one map entry.
+	tbl.insert(dup)
+	tbl.insert(dup)
+	if got := tbl.liveEntries(); got != 1 {
+		t.Fatalf("precondition: liveEntries = %d, want 1", got)
+	}
+	if got := tbl.occupancy(); got != 2 {
+		t.Fatalf("precondition: occupancy = %d, want 2 (two ring slots)", got)
+	}
+
+	// Fill the rest, then push past capacity so the OLDER duplicate slot is
+	// popped. It is stale, so the binding must survive.
+	tbl.insert(other(1))
+	tbl.insert(other(2))
+	tbl.insert(other(3)) // at capacity: pops the older dup slot
+
+	if !tbl.matches(dup) {
+		t.Error("the binding was lost when its STALE duplicate slot was popped — " +
+			"slot identity is being inferred from the expiry, which two inserts " +
+			"can share")
+	}
+}
+
+// TestPendingTable_OccupancyTracksRingNotMap is the fail-on-revert guard for the
+// #6603 re-review MINOR 2: the operator-facing gauge must report RING pressure,
+// because that is what governs eviction.
+//
+// Duplicate inserts consume ring slots without adding map entries, so
+// len(entries) under-reports: a capacity-4 ring holding A,B,B,B has
+// len(entries)==2 while the very next insert must evict live A. Reporting
+// len(entries) would show a comfortable 2/4 at the exact moment eviction
+// begins — the opposite of the documented contract.
+//
+// Pointing PendingSize back at len(entries) makes this RED.
+func TestPendingTable_OccupancyTracksRingNotMap(t *testing.T) {
+	now := time.Unix(11000, 0)
+	clock := func() time.Time { return now }
+	const capacity = 4
+	tbl := newPendingTable(capacity, time.Hour, clock)
+
+	a := pendingKey{xid: dhcpv4.TransactionID{0xA, 0, 0, 0}, hlen: 6}
+	b := pendingKey{xid: dhcpv4.TransactionID{0xB, 0, 0, 0}, hlen: 6}
+
+	tbl.insert(a)
+	for i := 0; i < 3; i++ {
+		tbl.insert(b) // three slots, one entry
+		now = now.Add(time.Millisecond)
+	}
+
+	if got := tbl.liveEntries(); got != 2 {
+		t.Fatalf("precondition: liveEntries = %d, want 2 (A and B)", got)
+	}
+	if got := tbl.occupancy(); got != capacity {
+		t.Errorf("occupancy = %d, want %d — the gauge must report RING slots. "+
+			"Reporting the %d map entries would show a comfortable %d/%d at the "+
+			"exact moment the next insert evicts live A.",
+			got, capacity, tbl.liveEntries(), tbl.liveEntries(), capacity)
+	}
+
+	// Confirm the premise: the next insert really does evict.
+	tbl.insert(pendingKey{xid: dhcpv4.TransactionID{0xC, 0, 0, 0}, hlen: 6})
+	if got := tbl.evictions(); got == 0 {
+		t.Error("premise failed: the table was full but the next insert did not evict")
+	}
+	if tbl.matches(a) {
+		t.Error("premise failed: A should have been the evicted (oldest) entry")
 	}
 }
