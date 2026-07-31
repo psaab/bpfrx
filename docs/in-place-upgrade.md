@@ -885,6 +885,36 @@ candidate boot, `xpf-kernel-promote.service` runs the kernel-space
 `/var/lib/xpf/kernel-upgrade.state` makes the trial crash-safe and
 idempotent across the reboot.
 
+**The gate execs xpfd by EXPLICIT path, never `$PATH` (#6541).** The
+promotion gate runs as root on the candidate boot and its exit status
+decides promote-vs-rollback, so a `$PATH` entry ordered ahead of the real
+location must not be able to author that decision — and even with no
+attacker, a stale `xpfd` left in another directory would verify the wrong
+build against the candidate kernel. Both hops resolve explicitly:
+
+- *Outer hop* — `scripts/image/xpf-kernel-promote` tests
+  `/var/lib/xpf/versions/current/xpfd` then `/usr/local/sbin/xpfd` (the
+  #1917 version-multiplexed runtime pointer, then the managed sbin entry
+  point, which a raw deploy may leave as a regular file). Neither is
+  `$PATH`-resolved. With neither present the gate SKIPs (exit 0), the
+  same behaviour as before on a box with no xpfd installed.
+- *Inner hop* — `realKernelSystem.VerifyDataplane`
+  (`resolveVerifyGateBin`, `pkg/upgrade/kernel_linux.go`) prefers
+  `os.Executable()` — the running process IS `xpfd upgrade kernel
+  promote`, and on Linux `/proc/self/exe` resolves the
+  sbin→`current`→`versions/<ver>/xpfd` chain down to the concrete
+  versioned artifact — falling back to `versions/current/xpfd`.
+
+If no explicit path resolves, the gate returns an error rather than
+falling back to `$PATH`; `verifyAndPromote` turns any Gate-3 error into
+`revert()` — restore the known-good `BootOrder` and reboot to the
+known-good slot. On an A/B kernel promote that is the safe direction. A
+lint test (`TestNoBareXpfArtifactExec`) enumerates every shell-out under
+`pkg/upgrade` from the AST and fails on any *bare* xpf-artifact command
+name; artifact names come from `pkg/upgrade/manifest` (the SSOT), and
+system binaries (`systemctl`, `apt-get`, `efibootmgr`, …) are
+deliberately out of scope — PATH resolution is correct for those.
+
 **Fail-closed on ambiguous boot/watchdog state (#4872).** The gate never
 treats an unreadable observation as a definite safe state:
 

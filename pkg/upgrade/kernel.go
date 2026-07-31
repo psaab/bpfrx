@@ -265,7 +265,11 @@ type KernelSystem interface {
 
 	// BootCurrent returns the Boot#### id the firmware actually booted.
 	BootCurrent() (string, error)
-	// VerifyDataplane runs `xpfd verify-dataplane` (0 PASS / 3 REJECT).
+	// VerifyDataplane runs `<xpfd> verify-dataplane` (0 PASS / 3 REJECT). The
+	// production implementation execs an EXPLICIT, version-resolved xpfd path
+	// and NEVER a PATH-resolved bare name (#6541); if no explicit path
+	// resolves it returns an error rather than falling back to PATH, and the
+	// caller reverts (see verifyAndPromote's Gate 3).
 	VerifyDataplane() (bool, error)
 	// ForwardBeacon runs a bounded forward health probe to a stable target
 	// and reports whether the dataplane actually forwards.

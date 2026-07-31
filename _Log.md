@@ -62336,3 +62336,65 @@ break — `go vet` confirmed passing under every revert.
   is address-matched and a separate surface. Codex re-review of the folded head
   918ea0b95 returned MERGE-READY with no findings.
 - **File(s)**: docs/fabric-cross-chassis-fwd.md, _Log.md
+- **Timestamp**: 2026-07-31 (fix/6541-kernel-gate-explicit-path)
+- **Action**: #6541 — the A/B kernel promote/rollback gate PATH-resolved a bare
+  `xpfd`. `realKernelSystem.VerifyDataplane` ran `exec.Command("xpfd",
+  "verify-dataplane")` while every sibling xpfd invocation in the package
+  builds an explicit path (`realSystem.VerifyDataplane`/`BinaryVersion` take an
+  explicit `bin`; cutover.go, flip.go, runtime/seed.go all `filepath.Join` it
+  out of the version dir). That gate runs as root on a candidate boot and its
+  exit status decides promote-vs-rollback, so a PATH entry ordered ahead of the
+  real location got to author that decision — and with no attacker at all, a
+  stale xpfd in another PATH directory would verify the wrong build against the
+  candidate kernel.
+  Added `resolveVerifyGateBin`: prefers `os.Executable()` (the gate IS `xpfd
+  upgrade kernel promote`, so the running process is by construction the live
+  xpfd, and /proc/self/exe resolves sbin -> current -> versions/<ver>/xpfd down
+  to the concrete versioned artifact — the same version-multiplexed shape
+  `realSystem.VerifyDataplane` is handed), falling back to
+  `<VersionsDir>/current/xpfd`. Each candidate is validated absolute + existing
+  + regular + executable. A hardcoded /usr/local/sbin/xpfd was deliberately NOT
+  used: it is a PATH directory itself and pinning a literal would defeat the A/B
+  version multiplexing this channel exists to serve.
+  FAIL-CLOSED, not a PATH fallback: with no explicit candidate the resolver
+  errors, `VerifyDataplane` propagates, and `verifyAndPromote` turns any Gate-3
+  error into `revert()` — restore the known-good BootOrder and reboot to the
+  known-good slot. On an A/B kernel promote that is the safe direction.
+  SECOND BARE SITE, found by re-deriving the enumeration rather than trusting
+  the issue's "exactly one site": `scripts/image/xpf-kernel-promote`, the shell
+  wrapper systemd runs as the OUTER hop of this same gate, did `command -v
+  xpfd` + bare `xpfd upgrade kernel promote`. Now tests
+  /var/lib/xpf/versions/current/xpfd then /usr/local/sbin/xpfd; neither is
+  PATH-resolved, and with neither present it SKIPs (exit 0) exactly as before.
+  Enumeration (re-derived from the AST, all 9 direct exec.* sites +
+  24 wrapper call sites in pkg/upgrade): 1 bare xpf artifact (this one),
+  3 explicit `bin`, 3 system binaries (systemctl x2, apt-get) where PATH
+  resolution is correct by design, 2 parameterized helpers; every one of the
+  24 runCmd/captureCmd literal call sites names a system binary. The issue's
+  count was right for pkg/upgrade. `runCmd("systemctl","is-active","xpfd")` is
+  NOT a finding — that "xpfd" is a systemd UNIT name, resolved by systemd.
+  Tests: `kernel_verify_explicit_path_6541_test.go` asserts on the RESOLVED
+  ARGV (not a side effect) — cmd.Path alone would not be revert-proof, since
+  `exec.Command("xpfd",...)` LookPaths to an absolute Path on a host that has
+  xpfd on PATH, whereas cmd.Args[0] is always verbatim what exec.Command was
+  given. `exec_bare_artifact_lint_6541_test.go` ENUMERATES every shell-out
+  under pkg/upgrade from the AST (so a new bare invocation is caught with no
+  edit), derives the package's own exec wrappers structurally (a func that
+  hands its own first string param to exec.Command — closing the
+  runCmd/captureCmd hole), and takes artifact names from pkg/upgrade/manifest
+  (the SSOT). Scoped precisely so it cannot false-positive into being disabled:
+  only the command-NAME argument, only string literals, only xpf's own
+  artifacts, only bare (separator-free) names.
+  Validation: RED-on-revert confirmed for both halves — reverting the Go site
+  to `exec.Command("xpfd", ...)` BUILDS CLEAN and fails 4 tests on assertions
+  (including one that shows a hostile PATH stub reporting a false PASS);
+  reverting the shell site fails 8 of 9 python cases. Full pkg/upgrade +
+  cmd/... suites green, `go build ./...` clean, `make selftest` 48/48 with the
+  new leg and with xpf-kernel-promote added to the shell-syntax/shellcheck
+  lists. No cluster smoke: this touches no forwarding, HA, or session-sync
+  code.
+- **File(s)**: pkg/upgrade/{kernel_linux.go,kernel.go,
+    kernel_verify_explicit_path_6541_test.go,
+    exec_bare_artifact_lint_6541_test.go},
+    scripts/image/{xpf-kernel-promote,test_kernel_promote_explicit_path.py},
+    scripts/run-selftests.sh, docs/in-place-upgrade.md, _Log.md

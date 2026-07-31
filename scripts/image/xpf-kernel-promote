@@ -26,12 +26,37 @@
 set -u
 log() { echo "xpf-kernel-promote: $*" >&2; }
 
-if ! command -v xpfd >/dev/null 2>&1; then
-    log "xpfd not found; skipping promotion gate"
+# Resolve xpfd by EXPLICIT path, never through $PATH (#6541). This is the OUTER
+# hop of the promote gate: it runs as root from a systemd oneshot on a candidate
+# boot and its exit status decides promote-vs-rollback, so a $PATH entry ordered
+# ahead of the real location must not be able to author that decision — and even
+# absent an attacker, a stale xpfd left in another PATH directory would verify
+# the wrong build against the candidate kernel. (The inner hop, xpfd's own
+# `verify-dataplane` exec, is resolved explicitly by resolveVerifyGateBin in
+# pkg/upgrade/kernel_linux.go.)
+#
+# Candidate order mirrors the #1917 versioned-runtime layout:
+#   1. versions/current/xpfd — the version-multiplexed runtime path the sbin
+#      links point through (pkg/upgrade/runtime.Seed step 4).
+#   2. /usr/local/sbin/xpfd — the managed sbin entry point. Normally a symlink
+#      to (1); a raw deploy (#2176) can leave a regular file here instead, so
+#      this keeps a non-versioned install working.
+# Neither is $PATH-resolved. If neither exists we SKIP the gate (exit 0), the
+# same behaviour as before for a box with no xpfd installed.
+XPFD=""
+for candidate in /var/lib/xpf/versions/current/xpfd /usr/local/sbin/xpfd; do
+    if [ -x "$candidate" ]; then
+        XPFD="$candidate"
+        break
+    fi
+done
+
+if [ -z "$XPFD" ]; then
+    log "xpfd not found at /var/lib/xpf/versions/current/xpfd or /usr/local/sbin/xpfd; skipping promotion gate"
     exit 0
 fi
 
-xpfd upgrade kernel promote
+"$XPFD" upgrade kernel promote
 rc=$?
 
 case "$rc" in
