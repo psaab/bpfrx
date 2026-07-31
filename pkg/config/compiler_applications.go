@@ -190,19 +190,42 @@ func applicationDirectLeaves(appNode *Node) (leaves []*Node, unknown []string) {
 					// `description` is a TAIL leaf, not an `args: 1` value leaf:
 					// Junos takes its text to the end of the statement, so an
 					// unquoted multi-word description is legal config. Joining
-					// the run keeps `description my web app` intact instead of
-					// recording "web"/"app" as unknown content — which would
-					// hard-reject at commit a spelling master accepted, over a
-					// METADATA leaf with no bearing on what the application
-					// matches. It also stops a description from poisoning the
-					// rest of the run.
+					// the run keeps the text intact instead of recording the
+					// second and later words as unknown content and
+					// hard-rejecting the line at commit, over a METADATA leaf
+					// with no bearing on what the application matches. It also
+					// stops a description from poisoning the rest of the run.
 					//
-					// The `scalar: true` arity the schema enforces for this leaf
-					// (validateScalarValueLeaf / #3332) is unchanged and still
-					// rejects the SIBLING spelling at strict commit; it simply
-					// never sees the chained one, and the compiler does not
-					// invent a second, broader arity rule for a leaf that cannot
-					// affect enforcement.
+					// Which spellings this actually reaches is worth stating
+					// exactly, because the surrounding gates cover the rest and
+					// an over-broad claim here would invite someone to loosen a
+					// gate master also held. A multi-word description occupies
+					// one of three positions:
+					//
+					//   - SIBLING (hierarchical, or its own `set` line):
+					//     `description "my web app";` arrives quoted as one
+					//     token, or unquoted as this node's own Keys run. The
+					//     schema's `scalar: true` arity (validateScalarValueLeaf
+					//     / #3332) is untouched and still governs it.
+					//   - HEAD of a flat-set chain: `set ... description my web
+					//     app [protocol tcp]` parks the tail in a CHILD node, so
+					//     the run this branch joins is just ["my"] and the child
+					//     opens with "web". SchemaValidate DOES see that shape
+					//     and rejects it ("unexpected trailing token \"web\""),
+					//     exactly as it did on master — so the line stays a
+					//     commit error, and the join below is not what decides
+					//     it.
+					//   - PACKED TAIL of a flat-set chain: `set ... protocol tcp
+					//     description my web app` packs the whole description
+					//     onto ONE node's Keys, BELOW the depth SchemaValidate
+					//     walks (it returns nil). This is the only position the
+					//     join actually rescues, and the only one where a
+					//     spelling master committed would otherwise become a new
+					//     hard reject.
+					//
+					// So the compiler does not invent a second, broader arity
+					// rule for a leaf that cannot affect enforcement; it covers
+					// the one position no existing gate reaches.
 					leaves = append(leaves, &Node{Keys: []string{kw, strings.Join(vals, " ")}})
 					continue
 				}

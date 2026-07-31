@@ -62291,3 +62291,61 @@ break — `go vet` confirmed passing under every revert.
     compiler_application_chained_leaves_6524_test.go},
     pkg/policymatch/app_unknown_recovery_6524_test.go,
     docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6524 / PR 6604 — third fold pass. Audited the previous fold
+  against the Codex verdict firsthand rather than trusting its self-report, and
+  found the MAJOR correctly closed but the MINOR's JUSTIFICATION still false in
+  the same way Codex had flagged the original.
+  Codex's MINOR said the claim "scalar validation already enforces this" was
+  false. The fold replaced it with "the schema never sees the chained one" —
+  which is ALSO false. Dumped the real AST for every spelling and found a
+  multi-word description occupies THREE positions, not two:
+    - sibling / hierarchical            -> schema scalar:true governs it
+    - HEAD of a flat-set chain          -> `set ... description my web app ...`
+      builds [description my] -> [web app ...]; the tail is a CHILD node, so
+      the joined run is only ["my"] and "web" opens a fresh run.
+      SchemaValidate DOES fire here: `unexpected trailing token "web"`.
+    - PACKED chain tail                 -> `set ... protocol tcp description my
+      web app` packs the whole description onto ONE node's Keys, below the
+      depth the schema walk reaches (SchemaValidate returns nil).
+  So the tail-join rescues exactly ONE position (the packed tail), which is
+  also the only position where a spelling master COMMITTED would otherwise
+  have become a new hard reject. The head-of-chain spelling stays a commit
+  error — and that is PARITY, because master rejected it through the same
+  untouched schema gate. Codex tested the packed-tail spelling and generalized;
+  the fold generalized in the opposite direction. Both overshot.
+  Corrected the claim at all three sites that carried it (the `description`
+  branch in compiler_applications.go, the UnknownDirectLeaves doc on
+  types_security.go, and the docs/config-schema.md bullet) to enumerate the
+  three positions and say exactly which one the join covers. This is not
+  cosmetic: an over-broad "the schema never sees the chained one" invites a
+  future change to loosen a gate master also held.
+  Added the missing coverage — TestDescriptionIsATailLeaf previously exercised
+  ONLY the packed-tail position, so a reader would conclude `description my web
+  app` commits, which it does not. The new subtest pins the head-of-chain
+  position AND asserts the MECHANISM that makes it parity (SchemaValidate still
+  fires), because asserting only "commit fails" cannot distinguish a
+  pre-existing gate from one this PR introduced.
+  Verification, all in a THROWAWAY detached worktree (/dev/shm/probe-6604d,
+  build+vet CLEAN there, removed after):
+    - MAJOR RED at pre-fold head 4e132ced5, VERDICT level, BOTH orderings:
+      "tcp/22 was PERMITTED by an application whose body contains
+      unrepresentable content" for `bogus value protocol tcp` AND for
+      `destination-port [ 22 23 ] protocol tcp`.
+    - MINOR RED at the same head: `chained multi-word description commits`
+      failed on the hard reject of "web".
+    - New subtest RED there too, as an assertion: `Protocol="tcp", want ""`.
+    - Over-reach guards PASS at the pre-fold head (they do not co-vary):
+      StrayStatementDoesNotDisarmSiblingLeaves,
+      UnknownTokenDoesNotPoisonSiblingLeaves, ApplicationDirectLeafArityIsOne.
+  Also probed and cleared two shapes I suspected: a `term` at mid-run inside a
+  packed tail carries NO Children (so a term's token stream is never split
+  across Keys and Children), and the hierarchical shape still compiles as
+  siblings, byte-identical to master.
+  Full pkg/config + pkg/policymatch green; vet clean; gofmt clean on every file
+  this PR touches (the three gofmt-dirty files under pkg/config are dirty on
+  origin/master too — pre-existing, not this PR's).
+- **File(s)**: pkg/config/{compiler_applications.go,types_security.go,
+    compiler_application_chained_leaves_6524_test.go},
+    docs/config-schema.md, _Log.md

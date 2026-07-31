@@ -1293,20 +1293,29 @@ type Application struct {
 	//
 	// `description` never contributes to this list from its own token run. It is
 	// a TAIL leaf (Junos takes its text to the end of the statement), so
-	// applicationDirectLeaves joins the run into the description text: both
+	// applicationDirectLeaves joins the run into the description text rather
+	// than recording the second and later words here. That covers
 	// `description destination-port` (text that happens to spell a keyword —
-	// the leaf's value slot is reserved before the keyword scan resumes) and
-	// `description my web app` compile as written rather than being recorded
-	// here. Rejecting a METADATA leaf that cannot affect what the application
-	// matches would be pure friction, and the chained spelling committed on
-	// master.
+	// the leaf's value slot is reserved before the keyword scan resumes) and a
+	// multi-word description PACKED onto one node's Keys. Rejecting a METADATA
+	// leaf that cannot affect what the application matches would be pure
+	// friction, and that spelling committed on master.
+	//
+	// The join is deliberately NOT a claim that every multi-word description
+	// now commits. A description that HEADS a flat-set chain
+	// (`set ... description my web app ...`) parks its tail in a CHILD node, so
+	// "web" opens a fresh run and IS recorded here — and SchemaValidate rejects
+	// the same line independently ("unexpected trailing token"). Master
+	// rejected it by that same schema gate, so this is parity, not a new
+	// refusal; see TestDescriptionIsATailLeaf, which pins both positions.
 	//
 	// The `scalar: true` arity the schema enforces for `description`
-	// (validateScalarValueLeaf / #3332) is untouched and still rejects the
-	// SIBLING spelling at strict commit — it simply never sees the chained one,
-	// where the leaf is nested under a value node. So no config that was
-	// committable on master is newly refused: master's own commit path already
-	// rejected the sibling spelling via SchemaValidate.
+	// (validateScalarValueLeaf / #3332) is untouched. It governs the SIBLING
+	// spelling and the head-of-chain spelling; the only position it does not
+	// reach is a description packed into a chain TAIL, below the depth the
+	// schema walk descends to — which is exactly the position the join above
+	// exists to cover. So no config that was committable on master is newly
+	// refused.
 	//
 	// Mirroring UnknownTermLeaves, the offending token is recorded here and the
 	// deferred gate (validateApplicationSyntaxStrict) hard-rejects the first one

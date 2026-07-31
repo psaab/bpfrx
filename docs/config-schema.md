@@ -1076,12 +1076,24 @@ Two properties of that scan are load-bearing and easy to get wrong:
   WIDER than master. Sibling leaves are unaffected — they are separate nodes,
   so a stray line does not poison its neighbours.
 - **`description` is a TAIL leaf, not `args: 1`.** Junos takes its text to the
-  end of the statement, so the walk joins the run rather than flagging the tail:
-  `description my web app` and `description destination-port` both compile as
-  written. Rejecting a metadata leaf that cannot affect matching would be pure
-  friction, and the chained spelling committed on master. The `scalar: true`
-  arity the schema enforces for that leaf (#3332) is untouched and still rejects
-  the SIBLING spelling at strict commit — it simply never sees the chained one.
+  end of the statement, so the walk joins the run rather than flagging the tail;
+  `description destination-port` keeps its keyword-spelling text intact, and a
+  multi-word description packed onto one node's Keys compiles as written.
+  Rejecting a metadata leaf that cannot affect matching would be pure friction,
+  and that spelling committed on master. Note the join covers ONE of the three
+  positions a multi-word description can occupy, and it is worth being exact
+  about which, so nobody later loosens a gate master also held:
+  - *sibling* (hierarchical or its own `set` line) — governed by the leaf's
+    `scalar: true` arity (#3332), untouched;
+  - *head of a chain* (`set ... description my web app protocol tcp`) — the
+    tail is parked in a CHILD node, so `web` opens a fresh run;
+    `SchemaValidate` rejects the line with `unexpected trailing token "web"`,
+    exactly as on master, and it stays a commit error;
+  - *packed chain tail* (`set ... protocol tcp description my web app`) — the
+    whole description lands on one node's Keys, below the depth the schema walk
+    reaches (`SchemaValidate` returns nil). **This is the only position the
+    join rescues**, and the only one where a spelling master committed would
+    otherwise have become a new hard reject.
 
 **Known limitation — the chained spelling is enforced but not individually
 editable.** Because the leaves are nested rather than siblings,

@@ -719,4 +719,67 @@ func TestDescriptionIsATailLeaf(t *testing.T) {
 			t.Fatalf("term Description=%q, want %q", term.Description, "doc")
 		}
 	})
+
+	// The tail-join covers exactly ONE of the positions a multi-word description
+	// can occupy, and the review-fold comment that justifies it must not claim
+	// more than that. When the description HEADS a flat-set chain, SetPath
+	// consumes its args:1 value and parks the REST in a CHILD node —
+	//
+	//	set applications application myapp description my web app protocol tcp
+	//	  -> [description my] -> [web app protocol tcp]
+	//
+	// — so the run this branch joins is just ["my"], and "web" opens a fresh run
+	// that the walk records as unknown content. That line therefore stays a
+	// commit error.
+	//
+	// This is PARITY, not a regression, and the assertion pins the mechanism
+	// that makes it parity: the schema's own arity gate rejects the same line
+	// independently. That gate predates this PR and is untouched by it, so
+	// master refused this spelling too — asserting the schema still fires is a
+	// durable proof of that, where asserting only "commit fails" would not
+	// distinguish a pre-existing gate from one this PR introduced.
+	t.Run("head-of-chain multi-word description stays a commit error", func(t *testing.T) {
+		tree := setTree6524(t,
+			"set applications application myapp description my web app protocol tcp")
+
+		lenient, err := CompileConfigLenient(tree)
+		if err != nil {
+			t.Fatalf("CompileConfigLenient: %v", err)
+		}
+		schemaErr := SchemaValidate(tree, lenient)
+		if schemaErr == nil {
+			t.Fatalf("SchemaValidate returned nil — the head-of-chain spelling is " +
+				"supposed to be caught by the leaf's own untouched arity gate " +
+				"(#3332), which is what makes leaving it rejected PARITY with " +
+				"master rather than a new refusal. If the shape changed so the " +
+				"schema no longer sees it, the tail-join must grow to cover this " +
+				"position too, or the line silently becomes a compiler-only reject")
+		}
+		if !strings.Contains(schemaErr.Error(), "web") {
+			t.Fatalf("SchemaValidate error %q does not name the trailing token", schemaErr)
+		}
+
+		if _, err := CompileConfig(tree); err == nil {
+			t.Fatalf("CompileConfig accepted the head-of-chain spelling; master " +
+				"rejected it via SchemaValidate, and the compiler records the " +
+				"tail as unknown direct content")
+		}
+
+		// Fail-closed on the tolerant path for the same reason master was: the
+		// trailing `protocol tcp` sits behind unrepresentable content, so it is
+		// poisoned rather than recovered and the application stays protocol-less.
+		app := lenient.Applications.Applications["myapp"]
+		if app == nil {
+			t.Fatalf("application myapp missing")
+		}
+		if app.Protocol != "" {
+			t.Fatalf("Protocol=%q, want \"\" — the `protocol tcp` after the "+
+				"description tail must be POISONED, not recovered (#6524 MAJOR)",
+				app.Protocol)
+		}
+		if len(app.UnknownDirectLeaves) == 0 {
+			t.Fatalf("UnknownDirectLeaves empty, want the trailing description word " +
+				"recorded so the deferred gate rejects/warns")
+		}
+	})
 }
