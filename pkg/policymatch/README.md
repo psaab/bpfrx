@@ -284,7 +284,22 @@ with **no** transit default fallback (and the transit `to-zone any` / `from-zone
 any to-zone any` wildcards are NOT pulled onto the host path; only a global
 explicitly scoped `to-zone junos-host` is). An unmatched host-bound flow returns
 `Result.HostInboundUnmatched` — no security *policy* governs it, never an
-inherited transit verdict. Local delivery is instead gated by
+inherited transit verdict.
+
+**Non-first fragments on the host path (#6576).** The host gate applies the
+same #4569 fragment-associated deny the transit walk does — it learned this in
+the dataplane in #6465 (PR #6505) and the simulator followed in #6576. Both
+walks share one `fragDenyTracker`, so a future host-gate change cannot silently
+diverge again (that drift is exactly what #6576 was: #6505 touched five files,
+none of them this package, and the simulator then reported PERMIT / "local
+delivery" for a host-bound fragment the box DROPS). The host fall-through is
+additionally **permit-like** — an unmatched host-bound flow is delivered — so a
+fragment that skipped an overlapping port-bearing DENY fails closed against it
+even when nothing matched at all, mirroring the post-walk arm in
+`evaluate_junos_host_policy`. An ordinary L4 query never records a candidate, so
+the management lifeline is unchanged.
+
+Local delivery is instead gated by
 host-inbound-traffic service admission, which post-#3405 DEFAULT-DENIES a zone
 with no host-inbound-traffic stanza, so an unmatched result does **not** mean
 the packet is delivered (#3627 — the earlier "local delivery proceeds" wording
@@ -455,14 +470,18 @@ override EXACTLY:
   match — while a PROTOCOL-ONLY / `application any` term still matches on the L3
   identity + known IP protocol the fragment carries (mirror of
   `CompiledApplications::matches`);
-- while walking the transit tiers in first-match precedence order,
+- while walking the tiers in first-match precedence order — the transit tiers in
+  `Match` and, since #6576, the three host tiers in `matchJunosHost`, both
+  driving the shared `fragDenyTracker` —
   `isSkippedFragDeny` (the mirror of `rule_is_skipped_frag_ambiguous_deny`)
   remembers the FIRST port-bearing DENY/REJECT whose L4-constrained term is
   inapplicable to the fragment (`hasL4ConstrainedTerm`), that does NOT match
   flowlessly, and whose source+destination ADDRESS overlaps the fragment (the
   zone is fixed by the tier);
-- if the walk then lands on a PERMIT — a matched permit OR a default-permit —
-  `matchOr` / the default arm OVERRIDE it to that deny
+- if the walk then lands on a PERMIT — a matched permit, a transit
+  default-permit, or (host path, #6576) the permit-like unmatched
+  fall-through — `fragDenyTracker.override` /
+  `fragDenyTracker.overridePermissiveTerminal` OVERRIDE it to that deny
   (`Result.FragmentAssociatedDeny`, attributed to the enforcing policy so
   `PolicyName`/`PolicyID`/`RuleID` name the real rule), and
   `Result.FragmentDenyNote()` renders the SSOT over-drop advisory.

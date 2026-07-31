@@ -304,9 +304,16 @@ type Query struct {
 	//     same DROP + enforcing policy the dataplane applies rather than a
 	//     fabricated port-0 permit.
 	//
-	// This is the transit-path gate only; a `to-zone junos-host` fragment takes
-	// the host gate, which has no #4569 override (it still fails port-bearing
-	// terms closed). See the #4569 override in Match.
+	// BOTH walks apply the override. The transit walk (Match) has since #5572;
+	// the host walk (matchJunosHost) since #6576, mirroring #6465 in policy.rs.
+	// They share one fragDenyTracker so the two cannot drift again — this
+	// comment previously asserted the host gate had NO override, which stopped
+	// being true the moment #6505 shipped and made the simulator report PERMIT
+	// for a host-bound fragment the dataplane DROPS.
+	//
+	// On the host path the fall-through itself is permit-like (an unmatched
+	// host-bound flow is DELIVERED — the management lifeline), so a skipped
+	// overlapping port-bearing DENY fails the fragment closed there too.
 	NonFirstFragment bool
 
 	// FeedOverlay is the dynamic-address feed-prefix overlay (#2049): an
@@ -1130,24 +1137,13 @@ func Match(cfg *config.Config, q Query) (res Result) {
 	// overlapping deny is OVERRIDDEN to that deny. For a normal (L4-present)
 	// query q.NonFirstFragment is false, so both are inert and the walk is
 	// byte-identical to before.
-	var fragDeny *fragDenyCandidate
-	noteFrag := func(pol *config.Policy, global bool, fromZone, toZone string, setIdx, sliceIdx int) {
-		if !q.NonFirstFragment || fragDeny != nil {
-			return
-		}
-		if isSkippedFragDeny(cfg, q, pol) {
-			fragDeny = &fragDenyCandidate{
-				pol: pol, global: global, fromZone: fromZone, toZone: toZone,
-				setIdx: setIdx, sliceIdx: sliceIdx,
-			}
-		}
-	}
-	matchOr := func(res Result) Result {
-		if q.NonFirstFragment && fragDeny != nil && res.Action == config.PolicyPermit {
-			return fragDenyResult(ids, *fragDeny)
-		}
-		return res
-	}
+	//
+	// #6576: the machinery now lives on the shared fragDenyTracker so the host
+	// walk (matchJunosHost) uses the SAME implementation instead of silently
+	// lacking one.
+	frag := newFragDenyTracker(cfg, q, ids)
+	noteFrag := frag.note
+	matchOr := frag.override
 
 	// Tier 1: exact zone-pair policies, in config order (first match wins).
 	// q.FromZone/q.ToZone are concrete zone names; a wildcard set
@@ -1247,8 +1243,8 @@ func Match(cfg *config.Config, q Query) (res Result) {
 	// is PERMIT — mirroring the dataplane's post-walk #4569 override. A
 	// default-DENY/REJECT already drops, so the override only matters for
 	// default-permit; when no deny was skipped this is inert.
-	if q.NonFirstFragment && fragDeny != nil && cfg.Security.DefaultPolicy == config.PolicyPermit {
-		return fragDenyResult(ids, *fragDeny)
+	if cfg.Security.DefaultPolicy == config.PolicyPermit {
+		return frag.overridePermissiveTerminal(Result{DefaultUsed: true, Action: cfg.Security.DefaultPolicy})
 	}
 	return Result{DefaultUsed: true, Action: cfg.Security.DefaultPolicy}
 }
@@ -1288,15 +1284,26 @@ func matchJunosHost(cfg *config.Config, q Query, ids map[[2]uint32]uint32) Resul
 	if !zoneKnown(cfg, q.FromZone) {
 		return withHI(Result{HostInboundUnmatched: true})
 	}
+
+	// #6576: track a port-bearing DENY/REJECT this walk SKIPS because a
+	// non-first fragment carries no L4 header, exactly as the transit walk
+	// does — the host gate learned this in #6465 (policy.rs) and the Go mirror
+	// did not follow.
+	frag := newFragDenyTracker(cfg, q, ids)
+
 	// Exact ingress -> junos-host.
 	for setIdx, zpp := range cfg.Security.Policies {
 		if zpp == nil || zpp.ToZone != JunosHostZone || zpp.FromZone != q.FromZone {
 			continue
 		}
 		for sliceIdx, pol := range zpp.Policies {
-			if pol != nil && ruleMatches(cfg, q, pol) {
-				return withHI(matchedResult(ids, pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx))
+			if pol == nil {
+				continue
 			}
+			if ruleMatches(cfg, q, pol) {
+				return withHI(frag.override(matchedResult(ids, pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx)))
+			}
+			frag.note(pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx)
 		}
 	}
 	// from-zone any -> junos-host.
@@ -1305,9 +1312,13 @@ func matchJunosHost(cfg *config.Config, q Query, ids map[[2]uint32]uint32) Resul
 			continue
 		}
 		for sliceIdx, pol := range zpp.Policies {
-			if pol != nil && ruleMatches(cfg, q, pol) {
-				return withHI(matchedResult(ids, pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx))
+			if pol == nil {
+				continue
 			}
+			if ruleMatches(cfg, q, pol) {
+				return withHI(frag.override(matchedResult(ids, pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx)))
+			}
+			frag.note(pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx)
 		}
 	}
 	// #3639 / #3611 Piece B: a GLOBAL policy `match to-zone junos-host`
@@ -1331,16 +1342,22 @@ func matchJunosHost(cfg *config.Config, q Query, ids map[[2]uint32]uint32) Resul
 		if !globalScopeSetMatches(cfg, pol.Match.FromZones, q.FromZone) {
 			continue
 		}
+		gFrom := reportedScopeZone(pol.Match.FromZones, q.FromZone)
+		gTo := reportedScopeZone(pol.Match.ToZones, q.ToZone)
 		if ruleMatches(cfg, q, pol) {
-			return withHI(matchedResult(ids, pol, true,
-				reportedScopeZone(pol.Match.FromZones, q.FromZone),
-				reportedScopeZone(pol.Match.ToZones, q.ToZone),
-				globalSetIdx, sliceIdx))
+			return withHI(frag.override(matchedResult(ids, pol, true, gFrom, gTo, globalSetIdx, sliceIdx)))
 		}
+		frag.note(pol, true, gFrom, gTo, globalSetIdx, sliceIdx)
 	}
 	// No host-bound rule matched: local delivery proceeds. Do NOT fall through
 	// to the transit default — the dataplane host gate returns None here.
-	return withHI(Result{HostInboundUnmatched: true})
+	//
+	// #6576: that delivery is PERMIT-LIKE, so a non-first fragment that skipped
+	// an overlapping port-bearing DENY fails closed against it instead —
+	// mirroring the #6465 post-walk arm in evaluate_junos_host_policy. Inert
+	// for an ordinary L4 query, which never records a candidate, so the
+	// management lifeline is unchanged.
+	return withHI(frag.overridePermissiveTerminal(Result{HostInboundUnmatched: true}))
 }
 
 // hostInboundAdmission classifies the ingress zone's host-inbound-traffic
@@ -2176,6 +2193,72 @@ func fragDenyResult(ids map[[2]uint32]uint32, c fragDenyCandidate) Result {
 	r.Action = config.PolicyDeny
 	r.FragmentAssociatedDeny = true
 	return r
+}
+
+// fragDenyTracker reproduces the dataplane's #4569 note_skipped_frag_deny /
+// apply_frag_deny_override pair for ONE policy walk, and is shared by BOTH the
+// transit walk (Match) and the host walk (matchJunosHost).
+//
+// #6576: sharing it is the point. #6505 taught policy.rs's junos-host gate to
+// fail closed on a skipped fragment deny, but the Go host walk kept its
+// pre-#6465 permissive terminal because the transit walk owned the machinery
+// as local closures that matchJunosHost — which returns before they are even
+// declared — could not reach. The simulator then reported PERMIT / "local
+// delivery" for a fragment the box DROPS, in the package whose whole contract
+// is dataplane parity. One tracker, two callers: a future host-gate change
+// cannot silently diverge again.
+//
+// For an ordinary L4 query q.NonFirstFragment is false, so every method is
+// inert and both walks are byte-identical to before.
+type fragDenyTracker struct {
+	cfg  *config.Config
+	q    Query
+	ids  map[[2]uint32]uint32
+	cand *fragDenyCandidate
+}
+
+func newFragDenyTracker(cfg *config.Config, q Query, ids map[[2]uint32]uint32) *fragDenyTracker {
+	return &fragDenyTracker{cfg: cfg, q: q, ids: ids}
+}
+
+// note remembers the FIRST port-bearing DENY/REJECT this walk SKIPPED because
+// the fragment carries no L4 header (overlapping L3, L4-constrained term
+// inapplicable) — the mirror of note_skipped_frag_deny.
+func (f *fragDenyTracker) note(pol *config.Policy, global bool, fromZone, toZone string, setIdx, sliceIdx int) {
+	if !f.q.NonFirstFragment || f.cand != nil || pol == nil {
+		return
+	}
+	if isSkippedFragDeny(f.cfg, f.q, pol) {
+		f.cand = &fragDenyCandidate{
+			pol: pol, global: global, fromZone: fromZone, toZone: toZone,
+			setIdx: setIdx, sliceIdx: sliceIdx,
+		}
+	}
+}
+
+// override converts a matched PERMIT into the remembered deny —
+// apply_frag_deny_override.
+func (f *fragDenyTracker) override(res Result) Result {
+	if f.q.NonFirstFragment && f.cand != nil && res.Action == config.PolicyPermit {
+		return fragDenyResult(f.ids, *f.cand)
+	}
+	return res
+}
+
+// overridePermissiveTerminal converts a PERMIT-LIKE fall-through into the
+// remembered deny. The junos-host fall-through is "no implicit default-deny" —
+// an unmatched host-bound flow is DELIVERED (the management lifeline), which is
+// a permit-like posture, so a fragment that skipped an overlapping port-bearing
+// DENY must fail closed exactly as it does against a transit default-PERMIT.
+// This is the Go mirror of the #6465 post-walk arm in
+// evaluate_junos_host_policy (`if let Some(deny) = skipped_frag_deny { return
+// Some(frag_associated_deny_result(deny)) }`). Inert when no deny was skipped,
+// and the L4 path never records one — so the lifeline is unchanged there.
+func (f *fragDenyTracker) overridePermissiveTerminal(res Result) Result {
+	if f.q.NonFirstFragment && f.cand != nil {
+		return fragDenyResult(f.ids, *f.cand)
+	}
+	return res
 }
 
 // isSkippedFragDeny mirrors the dataplane's rule_is_skipped_frag_ambiguous_deny

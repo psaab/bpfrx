@@ -61494,3 +61494,38 @@ top.
     userspace-dp/src/afxdp/poll_descriptor/mod.rs,
     userspace-dp/src/afxdp/tests_fabric_zone_stamp.rs,
     docs/fabric-cross-chassis-fwd.md, _Log.md
+
+## 2026-07-31 — policymatch dataplane-parity fixes (#6576, #6577)
+
+- **Timestamp**: 2026-07-31
+- **Action**: Fix two simulator-vs-dataplane divergences in `pkg/policymatch`,
+  both found by the `claude-opus-review-001` campaign and both missed by that
+  campaign's own triage (it filed from the report's suggested issue split
+  rather than walking every sub-report finding).
+- **File(s)**: `pkg/policymatch/policymatch.go`,
+  `pkg/policymatch/README.md`,
+  `pkg/policymatch/mapped_ipv6_contains_6577_test.go` (new),
+  `pkg/policymatch/junos_host_fragment_6576_test.go` (new)
+
+**#6577** — `net.IPNet.Contains` folds an IPv4-mapped IPv6 address via `To4()`
+and then fails its own length guard against every 16-byte v6 prefix, so a
+mapped address could never match ANY concrete v6 prefix (`::/0` included) while
+the dataplane's unfolded 128-bit mask matched it. New `containsAnyV6` does the
+16-byte masked compare; the v4 branch deliberately KEEPS the folding form
+(`net.ParseIP` returns a 4-in-6 slice for a dotted quad).
+
+**#6576** — PR #6505 taught `policy.rs`'s junos-host gate the #4569
+fragment-associated deny (#6465) but touched no Go file, so `matchJunosHost`
+kept reporting PERMIT / local delivery for a host-bound fragment the box drops.
+The transit walk's local closures moved onto a shared `fragDenyTracker` now
+used by BOTH walks, plus `overridePermissiveTerminal` for the host
+fall-through (permit-like → must fail closed), mirroring the #6465 post-walk
+arm.
+
+**Validation**: both fixes are fail-on-revert, verified as ASSERTION failures
+(not build breaks) — #6577 reverts to "got 0 via policy allow-rest"; #6576
+reverts to `PolicyName:permit-host-all` and `HostInboundUnmatched:true`, i.e.
+both halves of the bug. Two over-reach guards per fix stay GREEN under revert
+(v4 containment unaffected; the L4 management lifeline and non-overlapping
+fragments still delivered). Full `pkg/policymatch` suite green, plus the three
+consumer surfaces `pkg/cli`, `pkg/grpcapi`, `pkg/api`.
