@@ -1,6 +1,6 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.20.0 — THE TERMINAL CUT, round-103 folds (the
+**Status: DRAFT v10.20.1 — THE TERMINAL CUT, round-103 folds (+ round-103 AGY folds: the §5.6 EMPTY-set straggler and the bullet-(i) UpsertRefused enumeration) (the
 full six-variant `MaterializeOutcome` with `ValidatorRefused`/
 `UpsertRefused` defined against the actual code — the synced upsert's
 refusal is the NON-PEER-predecessor refusal, not capacity;
@@ -1442,8 +1442,11 @@ substitution discards the placeholder's key/decision,
 `install.rs:295-322`) — so every site-2c transition result carries a
 BOUNDED SET of displaced identities: the new S2 alias family PLUS any
 removed canonical predecessor's full old alias family PLUS any
-shadowed placeholder's key family (a refusal or an `OverdueSkipped`
-transition carries the EMPTY set — nothing was displaced).
+shadowed placeholder's key family (v10.20.0, round-103 Codex 3: the
+EMPTY set applies ONLY to a no-predecessor refusal or an overdue skip
+with NO shadowed placeholder — a shadowed placeholder's identity rides
+the set even on `OverdueSkipped`, and a `ValidatorRefused` install can
+displace a canonical predecessor whose family also rides the set).
 **Timing:** the current binding's cache invalidation of the displaced
 set runs IMMEDIATELY after resolution and BEFORE every early exit,
 the cache-insert point, and the next descriptor (materialization has
@@ -1722,8 +1725,11 @@ adopting the shared decision/metadata, §5.6).
     dispatch context.
   - **Consumers (all five, normative):** (i) the terminal teardown at
     ALL THREE sites (`poll_descriptor/mod.rs:698-714`, `:768-784`,
-    `:824-840`) is SKIPPED for `OverdueSkipped` (the dispatch
-    installed and changed nothing; teardown would otherwise derive
+    `:824-840`) is SKIPPED for `OverdueSkipped` AND for `UpsertRefused`
+    (v10.20.1, round-103 AGY 2 — for the skip the dispatch installed
+    and changed nothing; for the refusal the surviving non-peer
+    predecessor and S2's identity diverge — in both cases teardown
+    would otherwise derive
     companions, remove state, release NAT, and publish deletes under
     S2's identity, `session_glue/mod.rs:477-581`); (ii) the anchor
     commit hook does NOT write; (iii) the flow-cache insert
@@ -2767,7 +2773,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.20.0)
+## 11. Open questions for the convergence round (v10.20.1)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
