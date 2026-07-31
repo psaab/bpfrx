@@ -893,11 +893,17 @@ attacker, a stale `xpfd` left in another directory would verify the wrong
 build against the candidate kernel. Both hops resolve explicitly:
 
 - *Outer hop* — `scripts/image/xpf-kernel-promote` asks the kernel and
-  systemd where `xpfd.service` runs from — `/proc/<MainPID>/exe`, then
-  `ExecStart` — and only then considers `/usr/local/sbin/xpfd` and
-  `/var/lib/xpf/versions/current/xpfd`. None is `$PATH`-resolved. With
-  nothing resolvable it **refuses loudly** (see below). The unit also
-  pins `Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin`: the gate does
+  systemd where `xpfd.service` runs from. Its **authority order** is
+  exactly three steps, and there is deliberately no fourth:
+
+  1. `/proc/<MainPID>/exe` for `xpfd.service`, with the pid bound back
+     to the unit;
+  2. a strictly-parsed `ExecStart` for `xpfd.service`;
+  3. a **loud refusal**.
+
+  Nothing is `$PATH`-resolved and nothing is inferred from the
+  filesystem. The unit also pins
+  `Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin`: the gate does
   `$PATH`-resolve `systemctl`/`readlink`/`reboot` on purpose, and
   systemd's *default* `PATH` ranks the operator-writable
   `/usr/local/sbin` and `/usr/local/bin` first.
@@ -920,6 +926,48 @@ outcome, because the candidate kernel then runs unverified with nothing
 in the journal to say the gate never ran — or, with leftover artifacts at
 the default paths, **exec a stale build** that can reject a healthy
 candidate and trigger a needless revert/reboot.
+
+**There is no inference fallback, by construction (#6601).** Earlier
+revisions of this gate did consult `/usr/local/sbin/xpfd` and
+`/var/lib/xpf/versions/current/xpfd` when systemd could not answer, first
+as a ranked list and then as an "unambiguous set". Both are wrong, and
+not because of a missing case — because the question they try to answer
+(*which of these files is the live xpfd?*) is not answerable from the
+filesystem once a root has been relocated. `--sbin-dir` and
+`--versions-dir` move **independently**, and neither relocation removes
+what it left behind, so every shape such a fallback could recognise has a
+relocation that makes it the stale build:
+
+| leftover shape | why it looks decisive | why it is not |
+|---|---|---|
+| two usable defaults, **different files** | one must be stale | nothing on the box says which |
+| two usable defaults, **same inode** | looks like the healthy `flip` 6b layout (`<SbinDir>/xpfd` → `<VersionsDir>/current/xpfd`) | a box that relocated **both** roots leaves exactly that pair behind, symlink still pointing at its own stale runtime — bit-identical, and `-ef` cannot tell them apart |
+| **exactly one** usable default | "the only candidate" | it is the surviving half of a partial relocation just as often as it is a live install |
+
+So the gate has no filesystem-derived candidate at all, rather than a
+cleverer test over one. A stale `xpfd` here is silent and expensive: it
+verifies the **candidate kernel** against a dataplane build nobody chose,
+and its exit 0 *authorizes* the promotion. Refusing costs nothing by
+comparison — the armed candidate simply stays un-promoted.
+
+**The `MainPID` hop binds the pid back to the unit.** A pid is a number,
+and a number is not an identity. If `xpfd.service` exits and the kernel
+recycles its pid onto an unrelated process, `/proc/<pid>/exe` names *that*
+binary — and a basename check only requires the impostor to be called
+`xpfd`. So before the answer is believed, and **after** the `readlink` so
+that a recycle *during* the sequence is caught rather than raced past, the
+gate requires both:
+
+- membership in `xpfd.service`'s own control group — systemd reports it
+  as the structured `ControlGroup` property, the kernel reports each
+  process's in `/proc/<pid>/cgroup`, and the gate matches the **path
+  field** exactly (or as the parent of a delegated subgroup), never as a
+  substring, so a same-prefix sibling cannot stand in for the unit;
+- `MainPID` re-read and still the same positive pid.
+
+A pid that cannot be bound this way yields nothing, and `ExecStart` gets
+its turn — availability is preserved by the *next authority*, never by a
+guess.
 
 `xpfd.service` answers this directly, in two forms. `MainPID` +
 `/proc/<pid>/exe` is the **kernel's** answer for the binary the live
@@ -954,26 +1002,11 @@ exit 0 *authorizes* the promotion. Two consequences worth stating
   `Type=oneshot` unit can have several and the first need not be xpfd, so
   more than one line yields nothing rather than "take the first".
 
-**Why the two compiled defaults are a set, not a ranking.** `--sbin-dir`
-and `--versions-dir` relocate **independently**, and each partial move
-inverts which default is the live one:
-
-| relocation | `/usr/local/sbin/xpfd` | `/var/lib/xpf/versions/current/xpfd` |
-|---|---|---|
-| neither | live (symlink to the versioned runtime) | live |
-| `--versions-dir` only | **live** — `flip` 6b repoints it into the configured root | stale leftover |
-| `--sbin-dir` only | **stale leftover** — `flip` maintains the *configured* sbin dir | **live** |
-| both | stale leftover | stale leftover |
-
-No fixed rank is right for both middle rows, so the gate does not rank.
-It takes a default only when the two name the **same file** (`-ef`: the
-ordinary layout, where `flip` 6b left `<SbinDir>/xpfd` as a symlink to
-`<VersionsDir>/current/xpfd`, so the two "candidates" are one inode), or
-when only one of them is usable at all — which covers the `#2176`
-dangling-symlink and directory cases, where the unusable one drops out on
-the `-f` regular-file test. Two usable defaults that are **different
-files** mean one is stale with nothing on the box to say which, so the
-gate refuses loudly instead of flipping a coin.
+**Admission test.** Whatever a source names must be an existing,
+**regular**, executable file (`-f` *and* `-x`). `test -x` alone is true
+for a searchable **directory**, and the inner hop's `validateGateBin`
+rejects a non-regular target, so both hops apply the same test rather
+than only claiming to; `-f` also rejects the `#2176` dangling symlink.
 
 **Refusing loudly beats skipping quietly.** The gate logs an explicit
 `ERROR: … REFUSING to promote` and takes the non-rebooting infra-error
@@ -984,8 +1017,7 @@ xpf-free:
   installed here;
 - nothing resolved and `systemctl` could not be consulted at all
   (missing, erroring, empty answer) — that proves nothing about whether
-  xpf is installed, so it must not be laundered into the benign skip;
-- the two compiled defaults are both usable but are different files.
+  xpf is installed, so it must not be laundered into the benign skip.
 
 Note that "known to systemd" means known/**loadable** — a `masked` or
 disabled-but-loadable unit still answers — not enabled and not running.

@@ -9,11 +9,23 @@ ahead of the real location author that decision — or, with no attacker at all,
 lets a stale xpfd from some other directory verify the wrong build against the
 candidate kernel.
 
-This asserts the script never PATH-resolves the artifact, and exercises the
-resolution end to end against a fake filesystem root.
+The gate's authority order is (#6601 r5):
 
-FAIL-ON-REVERT: restore `command -v xpfd` / bare `xpfd upgrade kernel promote`
-and both test classes below fail.
+    1. /proc/<MainPID>/exe for xpfd.service, bound back to the unit
+    2. a strictly-parsed ExecStart for xpfd.service
+    3. a LOUD refusal
+
+with **no inference fallback**. That third step is the point of this file. Three
+earlier revisions guessed from the filesystem when systemd could not answer, and
+each one closed a single ambiguous case and left another, because a runtime left
+behind by `--versions-dir`/`--sbin-dir` relocation is indistinguishable from a
+live one — Codex reproduced a both-roots-relocated box whose two leftover
+defaults are the SAME INODE, so even a same-file test called them unambiguous
+and the gate executed the stale build. The class of bug is closed by removing
+the guess, not by patching one more case.
+
+FAIL-ON-REVERT: restore `command -v xpfd` / bare `xpfd upgrade kernel promote`,
+or reintroduce a compiled-default fallback, and this file fails.
 """
 
 import os
@@ -29,28 +41,31 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SCRIPT = HERE / "xpf-kernel-promote"
 
-# The two compiled-default candidates. They are consulted as an UNAMBIGUOUS
-# SET, not as a ranked list, because no fixed rank is right for both partial
-# relocations (#6601 r4 MAJOR-2): `--sbin-dir` and `--versions-dir` move
-# INDEPENDENTLY, and each partial move inverts which default is the live one.
+# The two paths a compiled-default fallback used to consult. They are named
+# here ONLY so the tests can plant leftovers at them and prove the gate never
+# reaches for either: `--sbin-dir` and `--versions-dir` relocate INDEPENDENTLY
+# and neither relocation removes what it left behind, so every shape a
+# defaults fallback could recognise —
 #
-#   --versions-dir only : flip step 6b repoints <SbinDir>/<bin> ->
-#                         <VersionsDir>/current/<bin> on every cut, so the sbin
-#                         entry is LIVE; the default versions root is a stale
-#                         leftover that relocation does not remove.
-#   --sbin-dir only     : flip maintains the CONFIGURED sbin dir, so the default
-#                         versions root is LIVE and the leftover
-#                         /usr/local/sbin/xpfd is the STALE one.
+#   both usable, DIFFERENT files : one is stale, nothing says which
+#   both usable, SAME inode      : the healthy default layout AND a
+#                                  both-roots-relocated box's leftovers
+#                                  (#6601 r4 Codex MAJOR-1)
+#   exactly one usable           : the surviving half of a partial relocation
 #
-# A default is therefore usable only when the two name the SAME file (the
-# ordinary layout, where the sbin entry is a symlink to the versioned runtime),
-# or when only one of them is usable at all.
+# — has a relocation shape that makes it the stale build.
 SBIN = "/usr/local/sbin/xpfd"
 VERSIONED = "/var/lib/xpf/versions/current/xpfd"
 
 
 def script_text() -> str:
     return SCRIPT.read_text()
+
+
+def code_lines():
+    """The script's lines with comments stripped."""
+    for lineno, line in enumerate(script_text().splitlines(), start=1):
+        yield lineno, line.split("#", 1)[0]
 
 
 class TestNoPathResolution(unittest.TestCase):
@@ -67,10 +82,10 @@ class TestNoPathResolution(unittest.TestCase):
         )
 
     def test_discovers_configured_path_from_systemd(self):
-        # The compiled defaults cannot cover a box that relocated BOTH
-        # --versions-dir and --sbin-dir; the gate must ASK rather than add a
-        # third guess. systemd's ExecStart for xpfd.service is what the cut
-        # writes (flip step 6c) and is a concrete absolute path.
+        # The gate must ASK systemd rather than guess. `--versions-dir` and
+        # `--sbin-dir` are both real operator options and the cut maintains
+        # whatever was configured, so a box that relocated BOTH has a perfectly
+        # intact xpfd at a path no hardcoded list contains.
         text = script_text()
         self.assertIn(
             "ExecStart",
@@ -80,21 +95,69 @@ class TestNoPathResolution(unittest.TestCase):
             "(#6541 fold r3)",
         )
         self.assertIn("xpfd.service", text)
-        # Both discovery sources must be consulted BEFORE the compiled
-        # defaults, or a stale leftover at a default path wins over the live
-        # binary. Index the CALL SITES (unique literals), not the definitions.
-        defaults_call = text.index("\ntry_compiled_defaults\n")
         for call in (
             'try_candidate "$(unit_main_pid_exe)"',
             'try_candidate "$(unit_exec_start)"',
         ):
             self.assertIn(call, text, f"the gate never calls {call} (#6601 r4)")
-            self.assertLess(
-                text.index(call),
-                defaults_call,
-                "systemd/kernel discovery must be tried before the compiled "
-                "defaults",
-            )
+        # Order matters: the kernel's answer for the LIVE process outranks the
+        # declared one.
+        self.assertLess(
+            text.index('try_candidate "$(unit_main_pid_exe)"'),
+            text.index('try_candidate "$(unit_exec_start)"'),
+        )
+
+    def test_no_compiled_default_inference_fallback(self):
+        # #6601 r5, the class-closing invariant. NO code path may select a
+        # binary from an inference that a leftover file can satisfy. The
+        # filesystem cannot answer "which of these is the live xpfd" once a
+        # root has been relocated — leftovers are indistinguishable from a
+        # healthy layout, in EVERY shape (different files, same inode, only one
+        # survivor) — so the gate must have no filesystem-derived candidate at
+        # all, not a cleverer test over one.
+        offenders = []
+        for lineno, code in code_lines():
+            for lit in (SBIN, VERSIONED):
+                if lit in code:
+                    offenders.append(f"{SCRIPT.name}:{lineno}: {code.strip()}")
+            if re.search(r"(?:^|\s)-ef(?:\s|$)", code):
+                offenders.append(
+                    f"{SCRIPT.name}:{lineno}: same-inode test: {code.strip()}"
+                )
+        self.assertEqual(
+            offenders,
+            [],
+            "the gate reintroduced a compiled-default fallback. A leftover at a "
+            "default path is byte-for-byte indistinguishable from a live one, "
+            "and `-ef` cannot tell a healthy default layout from a "
+            "both-roots-relocated box whose leftover symlink still points at "
+            "its leftover runtime (#6601 r4 MAJOR-1). Refuse instead:\n  "
+            + "\n  ".join(offenders),
+        )
+
+    def test_main_pid_candidate_is_bound_to_the_unit(self):
+        # #6601 r4 MAJOR-2. A pid is a number, and a number is not an identity.
+        # If xpfd.service exits and the kernel recycles its pid onto an
+        # unrelated process, /proc/<pid>/exe names THAT binary — and a basename
+        # check only requires the impostor to be called `xpfd`. The pid must be
+        # bound back to the unit.
+        text = script_text()
+        self.assertIn(
+            "ControlGroup",
+            text,
+            "the MainPID hop never checks that the pid belongs to "
+            "xpfd.service's own control group, so a recycled pid running an "
+            "unrelated binary named `xpfd` can author the promotion decision "
+            "(#6601 r4 MAJOR-2)",
+        )
+        self.assertIn("/cgroup", text)
+        self.assertEqual(
+            len(re.findall(r"--property=MainPID", text)),
+            2,
+            "MainPID must be read AGAIN after the readlink and required to be "
+            "the same pid, so a recycle DURING the sequence is caught rather "
+            "than raced past (#6601 r4 MAJOR-2)",
+        )
 
     def test_execstart_is_parsed_at_systemds_real_field_delimiter(self):
         # MAJOR (#6601 r4). `systemctl show -p ExecStart --value` renders
@@ -133,40 +196,12 @@ class TestNoPathResolution(unittest.TestCase):
     def test_no_bare_xpfd_invocation(self):
         # Any line that starts a command with a bare `xpfd` word (not a
         # quoted variable, not an absolute path) is the bug.
-        for lineno, line in enumerate(script_text().splitlines(), start=1):
-            code = line.split("#", 1)[0]
+        for lineno, code in code_lines():
             self.assertIsNone(
                 re.search(r"(?:^|[;&|]|\bthen\b|\bdo\b)\s*xpfd\s", code),
                 f"{SCRIPT.name}:{lineno} invokes a BARE, $PATH-resolved xpfd "
-                f"(#6541): {line.strip()!r}",
+                f"(#6541): {code.strip()!r}",
             )
-
-    def test_consults_both_explicit_candidates(self):
-        text = script_text()
-        for want in (VERSIONED, SBIN):
-            self.assertIn(
-                want,
-                text,
-                f"xpf-kernel-promote does not consult the explicit path {want} "
-                "(#6541)",
-            )
-        # The two defaults must be compared for SAME-FILE identity, not ranked.
-        # `-ef` (same device+inode) is what makes the ordinary layout -- where
-        # flip 6b left <SbinDir>/xpfd as a symlink to <VersionsDir>/current/xpfd
-        # -- resolve, while two genuinely different files refuse loudly.
-        compare = None
-        for line in text.splitlines():
-            code = line.split("#", 1)[0]
-            if VERSIONED in code and SBIN in code and "-ef" in code:
-                compare = code
-                break
-        self.assertIsNotNone(
-            compare,
-            "no line compares the two compiled defaults with `-ef`. Without a "
-            "same-file test the gate must RANK them, and no fixed rank is "
-            "right for both `--sbin-dir`-only and `--versions-dir`-only "
-            "relocation (#6601 r4 MAJOR-2)",
-        )
 
 
 class TestResolutionBehaviour(unittest.TestCase):
@@ -190,7 +225,12 @@ class TestResolutionBehaviour(unittest.TestCase):
         # discovery is exercised hermetically; anything else (reboot) is
         # recorded. systemctl is legitimately $PATH-resolved -- it is a
         # distribution binary, unlike xpfd.
+        #
+        # MainPID reads are COUNTED so a test can model a pid that changes
+        # mid-sequence (the recycle race): with STUB_MAINPID2 set, the second
+        # and later reads answer differently from the first.
         self.systemctl_ran = self.tmp / "systemctl.ran"
+        self.mainpid_seq = self.tmp / "mainpid.seq"
         (self.path_dir / "systemctl").write_text(
             "#!/bin/sh\n"
             'if [ "$1" = "show" ]; then\n'
@@ -198,7 +238,17 @@ class TestResolutionBehaviour(unittest.TestCase):
             # (missing, erroring, or a query it does not understand).
             '  [ -n "${STUB_SHOW_FAIL-}" ] && exit 1\n'
             '  case "$*" in\n'
-            '    *MainPID*) printf \'%s\\n\' "${STUB_MAINPID-0}" ;;\n'
+            "    *MainPID*)\n"
+            f'      n=$(cat "{self.mainpid_seq}" 2>/dev/null || echo 0)\n'
+            "      n=$((n + 1))\n"
+            f'      echo "$n" > "{self.mainpid_seq}"\n'
+            '      if [ "$n" -ge 2 ] && [ -n "${STUB_MAINPID2-}" ]; then\n'
+            "        printf '%s\\n' \"$STUB_MAINPID2\"\n"
+            "      else\n"
+            "        printf '%s\\n' \"${STUB_MAINPID-0}\"\n"
+            "      fi\n"
+            "      ;;\n"
+            '    *ControlGroup*) printf \'%s\\n\' "${STUB_CONTROLGROUP-}" ;;\n'
             '    *ExecStart*) printf \'%s\\n\' "${STUB_EXECSTART-}" ;;\n'
             '    *LoadState*) printf \'%s\\n\' "${STUB_LOADSTATE-not-found}" ;;\n'
             "  esac\n"
@@ -208,15 +258,20 @@ class TestResolutionBehaviour(unittest.TestCase):
             "exit 0\n"
         )
         (self.path_dir / "systemctl").chmod(0o755)
-        # Default: systemd knows nothing, so the compiled-default chain runs.
+        # Default: systemd knows nothing, so nothing resolves.
         self.stub_execstart = ""
         self.stub_loadstate = "not-found"
         self.stub_mainpid = "0"
+        self.stub_mainpid2 = ""
+        self.stub_controlgroup = ""
         self.stub_show_fail = ""
         self._stub_seq = 0
 
-        # A rewritten copy of the script whose candidate paths are re-rooted
-        # into the temp tree, so the test never touches the real filesystem.
+        # A rewritten copy of the script whose HISTORICAL compiled-default
+        # paths are re-rooted into the temp tree. The current gate names
+        # neither, so this is a no-op for it -- it exists so that a revision
+        # which reintroduces a defaults fallback is caught HERE, resolving
+        # into the fake root, instead of touching the real filesystem.
         self.fake_root = self.tmp / "root"
         self.script_copy = self.tmp / "xpf-kernel-promote"
         text = script_text()
@@ -224,6 +279,8 @@ class TestResolutionBehaviour(unittest.TestCase):
         text = text.replace(SBIN, str(self.fake_root) + SBIN)
         self.script_copy.write_text(text)
         self.script_copy.chmod(0o755)
+
+    # ---------------------------------------------------------------- helpers
 
     def _write_stub(self, path: Path, exit_code: int, marker: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -240,6 +297,8 @@ class TestResolutionBehaviour(unittest.TestCase):
         env["STUB_EXECSTART"] = self.stub_execstart
         env["STUB_LOADSTATE"] = self.stub_loadstate
         env["STUB_MAINPID"] = self.stub_mainpid
+        env["STUB_MAINPID2"] = self.stub_mainpid2
+        env["STUB_CONTROLGROUP"] = self.stub_controlgroup
         env["STUB_SHOW_FAIL"] = self.stub_show_fail
         return subprocess.run(
             ["/bin/sh", str(self.script_copy)],
@@ -250,6 +309,7 @@ class TestResolutionBehaviour(unittest.TestCase):
         )
 
     def _install(self, rel: str, exit_code: int) -> Path:
+        """Install a recording stub at a re-rooted historical default path."""
         marker = self.tmp / (rel.replace("/", "_") + ".ran")
         self._write_stub(Path(str(self.fake_root) + rel), exit_code, marker)
         return marker
@@ -261,149 +321,216 @@ class TestResolutionBehaviour(unittest.TestCase):
         self._write_stub(abs_path, exit_code, marker)
         return marker
 
-    def test_disagreeing_compiled_defaults_refuse_instead_of_guessing(self):
-        # MAJOR (#6601 r4). `--sbin-dir` and `--versions-dir` relocate
-        # INDEPENDENTLY, so NO fixed rank over the two compiled defaults is
-        # right for both partial relocations:
+    def _sbin_symlink_to_versioned(self):
+        """The `flip` 6b layout: <SbinDir>/xpfd -> <VersionsDir>/current/xpfd.
+
+        This is what a HEALTHY default-rooted box looks like — and, verbatim,
+        what a box that relocated BOTH roots leaves behind (relocation removes
+        neither), which is why a same-inode test cannot tell them apart.
+        """
+        sbin_path = Path(str(self.fake_root) + SBIN)
+        sbin_path.parent.mkdir(parents=True, exist_ok=True)
+        sbin_path.symlink_to(str(self.fake_root) + VERSIONED)
+
+    def _assert_refused(self, res, why: str):
+        self.assertEqual(
+            res.returncode,
+            0,
+            "the refusal must stay on the non-rebooting infra-error path; a "
+            f"non-zero exit trips OnFailure= and reboots: {res.stderr}",
+        )
+        self.assertIn("ERROR", res.stderr, f"the refusal was not loud ({why}): {res.stderr}")
+        self.assertIn("REFUSING to promote", res.stderr, why)
+        self.assertFalse(
+            self.systemctl_ran.exists(),
+            f"the refusal rebooted the box ({why})",
+        )
+        self.assertFalse(
+            self.marker.exists(),
+            f"the gate executed the xpfd it found on $PATH ({why}) (#6541)",
+        )
+
+    def _spawn_fake_daemon(self, subdir: str, basename: str = "xpfd", unlink: bool = False):
+        """Run a real process from a real file; return (proc, path, cgroup)."""
+        sleep_bin = shutil.which("sleep")
+        if not sleep_bin:
+            self.skipTest("no sleep(1) to model a running daemon")
+        target = self.tmp / subdir / basename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(sleep_bin, target)
+        if not os.access(target, os.X_OK):
+            self.skipTest("could not stage an executable copy")
+        proc = subprocess.Popen(
+            [str(target), "60"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        if unlink:
+            # Models a binary REPLACED on disk while the daemon runs: the
+            # kernel then renders /proc/<pid>/exe as "<path> (deleted)".
+            target.unlink()
+        try:
+            first = Path(f"/proc/{proc.pid}/cgroup").read_text().splitlines()[0]
+        except (OSError, IndexError):
+            self.skipTest("no readable /proc/<pid>/cgroup on this kernel")
+        # "<hierarchy-id>:<controllers>:<path>" — cgroup v2 renders "0::<path>".
+        # The path field is exactly what systemd reports as the unit's
+        # ControlGroup for a unit whose main process is this one (verified
+        # firsthand against cron/dbus/incus on a live systemd host).
+        fields = first.split(":", 2)
+        if len(fields) != 3 or not fields[2].startswith("/"):
+            self.skipTest(f"unrecognised /proc/<pid>/cgroup rendering: {first!r}")
+        return proc, target, fields[2]
+
+    # ------------------------------------------------- no inference fallback
+
+    def test_relocated_roots_with_same_inode_leftovers_are_never_executed(self):
+        # #6601 r4 Codex MAJOR-1, reproduced exactly. Both roots relocated, so
+        # the LIVE xpfd is at neither default — and relocation removed neither
+        # leftover, so the old sbin symlink still points at the old versioned
+        # runtime. The two leftovers are therefore ONE INODE, which is
+        # bit-identical to what a HEALTHY default-rooted box looks like: `-ef`
+        # calls it unambiguous and hands the promotion decision to a STALE
+        # build (Codex: live_ran False / stale_ran True).
         #
-        #   --versions-dir only : sbin entry LIVE, default versions root stale
-        #   --sbin-dir only     : default versions root LIVE, sbin entry STALE
+        # Neither systemd source can rescue it here: the daemon is not running
+        # (MainPID 0) and the ExecStart cannot be parsed, because the live
+        # path legally contains the literal " ; argv[]=" that is systemd's own
+        # field delimiter — so no textual parse can find the field boundary.
+        # `<tmp>/opt/relocated`, where cutting at the FIRST delimiter lands, is
+        # itself a real executable, so a parse that gives up on the count rule
+        # does not fail to resolve: it resolves to a THIRD binary.
         #
-        # Two usable defaults that are DIFFERENT files therefore mean one of
-        # them is stale with nothing on the box to say which. The previous
-        # revision ranked sbin first unconditionally and so executed the STALE
-        # leftover on every `--sbin-dir`-only box whose systemd could not
-        # answer -- verifying the candidate kernel against the wrong dataplane,
-        # or rejecting a healthy candidate into a needless revert/reboot. Refuse
-        # LOUDLY instead of flipping a coin.
+        # There is nothing left that is an ANSWER, so the gate must REFUSE.
+        live_dir = self.tmp / "opt" / "relocated ; argv[]=x"
+        live = live_dir / "xpfd"
+        live_ran = self._install_abs(live)
+        truncated = self.tmp / "opt" / "relocated"
+        truncated_ran = self._install_abs(truncated)
+
+        stale_ran = self._install(VERSIONED, 0)
+        self._sbin_symlink_to_versioned()
+
+        self.stub_mainpid = "0"
+        self.stub_execstart = f"{{ path={live} ; argv[]={live} ; ignore_errors=no }}"
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self.assertFalse(
+            stale_ran.exists(),
+            "the gate executed the STALE leftover left behind by relocating "
+            "BOTH roots. Its sbin symlink still points at its versioned "
+            "runtime, so the pair is a single inode and looks exactly like a "
+            "healthy default layout -- no filesystem test can tell them apart, "
+            f"which is why there must be no filesystem fallback at all: {res.stderr}",
+        )
+        self.assertFalse(
+            live_ran.exists(),
+            "the gate parsed an ExecStart whose path contains systemd's own "
+            f"field delimiter: {res.stderr}",
+        )
+        self.assertFalse(
+            truncated_ran.exists(),
+            "the gate cut the ExecStart at the FIRST field delimiter and "
+            f"executed {truncated} -- a shorter, different, and real binary "
+            f"(#6601 r4 MAJOR-1): {res.stderr}",
+        )
+        self._assert_refused(res, "both roots relocated, same-inode leftovers")
+
+    def test_disagreeing_leftover_defaults_are_never_executed(self):
+        # The `--sbin-dir`-only / `--versions-dir`-only shapes: two usable
+        # defaults that are DIFFERENT files. One is stale and nothing on the
+        # box says which, so no ranking is right for both.
         sbin_ran = self._install(SBIN, 0)
         versioned_ran = self._install(VERSIONED, 0)
         self.stub_show_fail = "1"  # systemd cannot answer
 
         res = self._run()
-        self.assertEqual(
-            res.returncode,
-            0,
-            "the refusal must stay on the non-rebooting infra-error path: "
-            f"{res.stderr}",
-        )
+        self.assertFalse(sbin_ran.exists(), f"the gate executed {SBIN}: {res.stderr}")
         self.assertFalse(
-            sbin_ran.exists(),
-            f"the gate executed {SBIN} while {VERSIONED} named a DIFFERENT file "
-            "and systemd could not say which one is live. On a `--sbin-dir`-only "
-            "relocated box that leftover is the STALE build (#6601 r4 MAJOR-2): "
-            f"{res.stderr}",
+            versioned_ran.exists(), f"the gate executed {VERSIONED}: {res.stderr}"
         )
-        self.assertFalse(
-            versioned_ran.exists(),
-            f"the gate executed {VERSIONED} while {SBIN} named a DIFFERENT file; "
-            "one of the two is stale and nothing says which (#6601 r4 MAJOR-2): "
-            f"{res.stderr}",
-        )
-        self.assertIn("ERROR", res.stderr, f"the refusal was not loud: {res.stderr}")
-        self.assertIn("REFUSING to promote", res.stderr)
-        self.assertFalse(
-            self.marker.exists(),
-            "the gate executed the xpfd it found on $PATH (#6541)",
-        )
+        self._assert_refused(res, "two different usable defaults")
 
-    def test_agreeing_compiled_defaults_still_resolve(self):
-        # ANTI-OVER-REACH for the test above. On an ORDINARY default-rooted box
-        # flip step 6b leaves <SbinDir>/xpfd as a symlink to
-        # <VersionsDir>/current/xpfd, so both defaults are usable and they are
-        # ONE file. There is nothing ambiguous about that -- refusing here would
-        # strand the promotion gate on a perfectly healthy box, which is its own
-        # outage.
+    def test_a_single_surviving_default_is_never_executed(self):
+        # The remaining shape a defaults fallback would accept: exactly one
+        # default is usable, so "the only usable default" looks decisive. It is
+        # not — it is precisely the surviving half of a partial relocation, and
+        # relocation leaves the STALE half behind just as readily as the live
+        # one.
         versioned_ran = self._install(VERSIONED, 0)
-        sbin_path = Path(str(self.fake_root) + SBIN)
-        sbin_path.parent.mkdir(parents=True, exist_ok=True)
-        sbin_path.symlink_to(str(self.fake_root) + VERSIONED)
         self.stub_show_fail = "1"
 
         res = self._run()
+        self.assertFalse(
+            versioned_ran.exists(),
+            "the gate executed the ONLY usable compiled default. That is the "
+            "surviving leftover of a `--versions-dir`-only relocation just as "
+            f"often as it is a live install (#6601 r5): {res.stderr}",
+        )
+        self._assert_refused(res, "exactly one usable default")
+
+    # ---------------------------------------------- anti-over-reach: it works
+
+    def test_healthy_default_rooted_box_resolves_via_execstart(self):
+        # ANTI-OVER-REACH. Removing the guess must not strand the gate on an
+        # ordinary box. A default-rooted install has not relocated anything, so
+        # systemd answers: the shipped base unit carries
+        # ExecStart=/usr/local/sbin/xpfd before the first cut, and `flip` 6c
+        # templates ExecStart=<VersionsDir>/<ver>/xpfd after every cut. The
+        # binary it names is reached DIRECTLY, through the sbin->versioned
+        # symlink `flip` 6b leaves.
+        versioned_ran = self._install(VERSIONED, 0)
+        self._sbin_symlink_to_versioned()
+        sbin = str(self.fake_root) + SBIN
+        self.stub_execstart = f"{{ path={sbin} ; argv[]={sbin} ; ignore_errors=no }}"
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertTrue(
             versioned_ran.exists(),
-            "the gate refused on an ORDINARY default layout where the sbin "
-            "entry is merely a symlink to the versioned runtime -- the two "
-            f"defaults are the same file: {res.stderr}",
+            "the gate refused on an ORDINARY, healthy default-rooted box whose "
+            "systemd names the binary outright -- removing the compiled-default "
+            f"guess must not cost availability: {res.stderr}",
         )
         self.assertNotIn("REFUSING", res.stderr)
-        self.assertFalse(
-            self.marker.exists(),
-            "the gate executed the xpfd it found on $PATH (#6541)",
-        )
+        self.assertIn("ExecStart", res.stderr)
+        self.assertFalse(self.marker.exists(), "the gate used $PATH (#6541)")
 
-    def test_falls_back_to_versioned_runtime_when_no_sbin_entry(self):
-        versioned_ran = self._install(VERSIONED, 0)
-
-        res = self._run()
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertTrue(
-            versioned_ran.exists(),
-            f"the versioned-runtime xpfd did not run: {res.stderr}",
-        )
-        self.assertFalse(
-            self.marker.exists(),
-            "the gate executed the xpfd it found on $PATH (#6541)",
-        )
-
-    def test_dangling_sbin_symlink_falls_through_to_versioned_runtime(self):
-        # #2176 leaves a sbin symlink pointing into a removed versions dir. It
-        # must not shadow the versioned-runtime fallback — that is the whole
-        # reason the second candidate still exists. `-f` is what rejects it.
-        versioned_ran = self._install(VERSIONED, 0)
-        sbin_path = Path(str(self.fake_root) + SBIN)
-        sbin_path.parent.mkdir(parents=True, exist_ok=True)
-        sbin_path.symlink_to(str(self.fake_root) + "/removed/versions/v1/xpfd")
+    def test_healthy_default_rooted_box_resolves_via_main_pid(self):
+        # The other half of anti-over-reach, and the ordinary case on a box
+        # where the gate runs while xpfd is UP (the unit is After=xpfd.service).
+        # Verified firsthand on a live systemd host as root: `systemctl show
+        # -p MainPID --value` + `readlink /proc/<pid>/exe` yields the real
+        # binary, and `-p ControlGroup --value` is exactly the path field of
+        # that pid's /proc/<pid>/cgroup line.
+        proc, target, cgroup = self._spawn_fake_daemon("opt-live")
+        self.stub_mainpid = str(proc.pid)
+        self.stub_controlgroup = cgroup
+        self.stub_loadstate = "loaded"
+        stale_sbin = self._install(SBIN, 0)
+        stale_versioned = self._install(VERSIONED, 0)
 
         res = self._run()
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertTrue(
-            versioned_ran.exists(),
-            f"a DANGLING {SBIN} symlink shadowed the {VERSIONED} fallback "
-            f"instead of falling through: {res.stderr}",
+        self.assertIn(
+            f"using {target} (",
+            res.stderr,
+            "the gate did not resolve xpfd through xpfd.service's MainPID and "
+            f"/proc/<pid>/exe: {res.stderr}",
         )
-        self.assertFalse(
-            self.marker.exists(),
-            "the gate executed the xpfd it found on $PATH (#6541)",
-        )
-
-    def test_directory_candidate_is_not_treated_as_the_binary(self):
-        # `test -x` alone is TRUE for a searchable DIRECTORY. The inner hop's
-        # validateGateBin rejects a non-regular target, so the outer hop must
-        # too — otherwise the two hops' admission tests are not actually
-        # symmetric.
-        #
-        # The directory MUST be placed at the candidate that is examined FIRST,
-        # or the test is vacuous. An earlier revision put it at VERSIONED while
-        # also installing a valid SBIN; since SBIN is checked first the
-        # directory was never examined and reverting `[ -f ]` left the test
-        # green. Place it at SBIN and require the fall-through to VERSIONED.
-        sbin_dir_path = Path(str(self.fake_root) + SBIN)
-        sbin_dir_path.mkdir(parents=True)
-        versioned_ran = self._install(VERSIONED, 0)
-
-        res = self._run()
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertTrue(
-            versioned_ran.exists(),
-            f"a DIRECTORY at {SBIN} — the FIRST compiled-default candidate — "
-            f"was accepted as the gate binary instead of falling through to "
-            f"{VERSIONED}: {res.stderr}",
-        )
-        self.assertFalse(
-            self.marker.exists(),
-            "the gate executed the xpfd it found on $PATH (#6541)",
-        )
+        self.assertIn("MainPID", res.stderr)
+        self.assertFalse(stale_sbin.exists(), f"ran a leftover: {res.stderr}")
+        self.assertFalse(stale_versioned.exists(), f"ran a leftover: {res.stderr}")
 
     def test_discovers_relocated_roots_via_systemd_execstart(self):
-        # MAJOR (fold r3). `--versions-dir` AND `--sbin-dir` are both real
-        # operator options, and the cut maintains whatever was configured. On a
-        # box that relocated BOTH — e.g. --versions-dir=/opt/xpf/versions with
-        # --sbin-dir=/usr/sbin — NEITHER compiled default exists, yet the live
-        # binary is perfectly intact. Systemd knows where it is, because that is
-        # the ExecStart the cut templated (flip step 6c).
+        # MAJOR (fold r3). With `--versions-dir=/opt/xpf/versions
+        # --sbin-dir=/usr/sbin`, NEITHER compiled default exists yet the live
+        # binary is perfectly intact. Systemd knows where it is, because that
+        # is the ExecStart the cut templated (flip step 6c).
         relocated = self.tmp / "opt-xpf" / "versions" / "v7" / "xpfd"
         relocated_ran = self.tmp / "relocated.ran"
         self._write_stub(relocated, 0, relocated_ran)
@@ -416,19 +543,13 @@ class TestResolutionBehaviour(unittest.TestCase):
         self.assertTrue(
             relocated_ran.exists(),
             "the gate did not run the relocated xpfd that systemd's ExecStart "
-            f"names. With both roots relocated no compiled default exists, so "
-            f"an ExecStart-blind gate skips an ARMED promotion: {res.stderr}",
+            f"names, so an ARMED promotion is skipped: {res.stderr}",
         )
-        self.assertFalse(
-            self.marker.exists(),
-            "the gate executed the xpfd it found on $PATH (#6541)",
-        )
+        self.assertFalse(self.marker.exists(), "the gate used $PATH (#6541)")
 
-    def test_systemd_execstart_outranks_stale_compiled_defaults(self):
-        # The other half of the MAJOR: with both roots relocated, leftover
-        # artifacts at the compiled defaults are STALE. Executing one can reject
-        # a healthy candidate and trigger a needless revert/reboot, or validate
-        # the wrong embedded dataplane build. Discovery must win over both.
+    def test_systemd_execstart_outranks_leftover_defaults(self):
+        # Discovery must win over leftovers even when leftovers exist and are
+        # perfectly usable.
         relocated = self.tmp / "opt-xpf" / "versions" / "v7" / "xpfd"
         relocated_ran = self.tmp / "relocated.ran"
         self._write_stub(relocated, 0, relocated_ran)
@@ -442,15 +563,174 @@ class TestResolutionBehaviour(unittest.TestCase):
         res = self._run()
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertTrue(relocated_ran.exists(), f"the live binary did not run: {res.stderr}")
-        self.assertFalse(
-            stale_sbin.exists(),
-            f"ran the STALE leftover at {SBIN} instead of the live binary "
-            "systemd's ExecStart names",
+        self.assertFalse(stale_sbin.exists(), f"ran the STALE leftover at {SBIN}")
+        self.assertFalse(stale_versioned.exists(), f"ran the STALE leftover at {VERSIONED}")
+
+    # ------------------------------------------------- MainPID -> unit binding
+
+    def test_main_pid_outside_the_unit_cgroup_is_rejected(self):
+        # #6601 r4 MAJOR-2. The recycle race, made concrete: MainPID names a
+        # live process running a binary CALLED `xpfd`, but that process is not
+        # in xpfd.service's control group — it is an unrelated program that
+        # inherited the pid after the daemon exited. The basename guard alone
+        # accepts it and hands it the promote-vs-rollback decision.
+        proc, target, real_cgroup = self._spawn_fake_daemon("impostor")
+        unit_cgroup = "/system.slice/xpfd.service"
+        if real_cgroup == unit_cgroup or real_cgroup.startswith(unit_cgroup + "/"):
+            self.skipTest("test process really is inside /system.slice/xpfd.service")
+        impostor_ran = self.tmp / "impostor-would-have-run"
+
+        self.stub_mainpid = str(proc.pid)
+        self.stub_controlgroup = unit_cgroup
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self.assertNotIn(
+            f"using {target} (",
+            res.stderr,
+            "the gate accepted a process that is NOT a member of "
+            "xpfd.service's control group as the promotion authority. A "
+            "recycled pid running any binary named `xpfd` then decides "
+            f"promote-vs-rollback (#6601 r4 MAJOR-2): {res.stderr}",
         )
-        self.assertFalse(
-            stale_versioned.exists(),
-            f"ran the STALE leftover at {VERSIONED} instead of the live binary",
+        self.assertFalse(impostor_ran.exists())
+        self._assert_refused(res, "MainPID outside the unit cgroup")
+
+    def test_main_pid_that_changes_mid_sequence_is_rejected(self):
+        # The narrower half of the same race: the association held when it was
+        # first read, but systemd's MainPID moved on while the gate was
+        # resolving. Re-read and require the SAME pid.
+        proc, target, cgroup = self._spawn_fake_daemon("racing")
+        self.stub_mainpid = str(proc.pid)
+        self.stub_mainpid2 = str(proc.pid + 1)
+        self.stub_controlgroup = cgroup
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self.assertNotIn(
+            f"using {target} (",
+            res.stderr,
+            "the gate believed a MainPID that had already changed by the time "
+            "it finished resolving, so /proc/<pid>/exe may name a recycled "
+            f"process's binary (#6601 r4 MAJOR-2): {res.stderr}",
         )
+        self._assert_refused(res, "MainPID changed mid-sequence")
+
+    def test_main_pid_naming_a_non_xpfd_binary_is_rejected(self):
+        # The basename guard. Every layout this gate supports names the
+        # artifact `xpfd` (the manifest basename), so a MainPID whose
+        # /proc/<pid>/exe names something else is not a layout the gate
+        # understands — it is an override, a wrapper, or a mis-association, and
+        # a wrong answer here authorizes the promotion.
+        proc, target, cgroup = self._spawn_fake_daemon("wrapper", basename="xpfd-wrapper")
+        self.stub_mainpid = str(proc.pid)
+        self.stub_controlgroup = cgroup
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self.assertNotIn(
+            f"using {target} (",
+            res.stderr,
+            "the gate accepted a MainPID whose executable is not named `xpfd` "
+            f"as the promotion authority: {res.stderr}",
+        )
+        self._assert_refused(res, "MainPID names a non-xpfd binary")
+
+    def test_main_pid_whose_binary_was_replaced_on_disk_is_rejected(self):
+        # A binary replaced (or removed) under a running daemon reads back as
+        # "<path> (deleted)". That string is not a path — it cannot be
+        # re-executed, and the file it once named is gone — so the MainPID hop
+        # must yield nothing. Asserted as an OUTCOME: three independent things
+        # reject it (the "(deleted)" case, the basename guard, and the
+        # regular-file admission test), so no single one of them is claimed to
+        # be the sole rejector (#6601 r4 MINOR).
+        proc, target, cgroup = self._spawn_fake_daemon("replaced", unlink=True)
+        self.stub_mainpid = str(proc.pid)
+        self.stub_controlgroup = cgroup
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self.assertNotIn(
+            str(target),
+            res.stderr,
+            "the gate adopted a MainPID whose executable was replaced on disk; "
+            f'its /proc/<pid>/exe reads "<path> (deleted)": {res.stderr}',
+        )
+        self._assert_refused(res, "MainPID binary deleted on disk")
+
+    def test_prefix_sibling_cgroup_does_not_satisfy_membership(self):
+        # The membership test matches the PATH FIELD of a /proc/<pid>/cgroup
+        # line, not a substring of the line. A substring test would let a
+        # same-prefix sibling stand in for the unit — `/system.slice/xpfd.serv`
+        # for `/system.slice/xpfd.service`, or the unit's cgroup for a
+        # DIFFERENT unit whose name merely extends it — which is the whole
+        # association silently going away again.
+        proc, target, real_cgroup = self._spawn_fake_daemon("prefixy")
+        if len(real_cgroup) < 2:
+            self.skipTest(f"cgroup path too short to truncate: {real_cgroup!r}")
+        # A strict prefix of the real path: contained in the line, but not the
+        # path field and not a parent directory of it.
+        self.stub_controlgroup = real_cgroup[:-1]
+        self.stub_mainpid = str(proc.pid)
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self.assertNotIn(
+            f"using {target} (",
+            res.stderr,
+            "a cgroup path that merely OCCURS in the process's "
+            "/proc/<pid>/cgroup line was accepted as unit membership "
+            f"(#6601 r4 MAJOR-2): {res.stderr}",
+        )
+        self._assert_refused(res, "prefix-sibling cgroup")
+
+    def test_delegated_subgroup_still_satisfies_membership(self):
+        # OVER-REACH GUARD on the same matcher. systemd may place a unit's
+        # processes in a subgroup of the unit's own cgroup (delegation), so a
+        # process UNDER the reported ControlGroup is still a member. Requiring
+        # an exact equality would reject a legitimately delegated unit and
+        # strand the gate.
+        proc, target, real_cgroup = self._spawn_fake_daemon("delegated")
+        parent = real_cgroup.rsplit("/", 1)[0]
+        if not parent.startswith("/") or parent == real_cgroup:
+            self.skipTest(f"cgroup path has no parent to delegate from: {real_cgroup!r}")
+        self.stub_controlgroup = parent
+        self.stub_mainpid = str(proc.pid)
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(
+            f"using {target} (",
+            res.stderr,
+            "a process in a DELEGATED SUBGROUP of the unit's control group was "
+            f"not recognised as a member: {res.stderr}",
+        )
+
+    def test_unreported_control_group_falls_through_to_execstart(self):
+        # OVER-REACH GUARD on the binding: a systemd that cannot report
+        # ControlGroup (or a /proc the gate cannot correlate) must not strand
+        # the gate — the MainPID source simply yields nothing and ExecStart
+        # gets its turn. Availability is preserved by the NEXT authority, never
+        # by a guess.
+        proc, _target, _cgroup = self._spawn_fake_daemon("live-unbindable")
+        declared = self.tmp / "declared" / "xpfd"
+        declared_ran = self._install_abs(declared)
+
+        self.stub_mainpid = str(proc.pid)
+        self.stub_controlgroup = ""  # systemd did not answer
+        self.stub_execstart = f"{{ path={declared} ; argv[]={declared} }}"
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue(
+            declared_ran.exists(),
+            "an unbindable MainPID stranded the gate instead of falling "
+            f"through to the declared ExecStart: {res.stderr}",
+        )
+
+    # ---------------------------------------------------- ExecStart strictness
 
     def test_execstart_path_containing_a_space_is_not_truncated(self):
         # MAJOR (#6601 r4). systemd PERMITS an executable path containing a
@@ -484,13 +764,9 @@ class TestResolutionBehaviour(unittest.TestCase):
         )
         self.assertTrue(
             live_ran.exists(),
-            f"the gate did not run the xpfd systemd's ExecStart names: "
-            f"{res.stderr}",
+            f"the gate did not run the xpfd systemd's ExecStart names: {res.stderr}",
         )
-        self.assertFalse(
-            self.marker.exists(),
-            "the gate executed the xpfd it found on $PATH (#6541)",
-        )
+        self.assertFalse(self.marker.exists(), "the gate used $PATH (#6541)")
 
     def test_execstart_path_containing_a_semicolon_is_not_truncated(self):
         # The other half of MAJOR-1: `;` is legal in a path too, and the
@@ -513,8 +789,7 @@ class TestResolutionBehaviour(unittest.TestCase):
         )
         self.assertTrue(
             live_ran.exists(),
-            f"the gate did not run the xpfd systemd's ExecStart names: "
-            f"{res.stderr}",
+            f"the gate did not run the xpfd systemd's ExecStart names: {res.stderr}",
         )
 
     def test_multiple_execstart_entries_are_not_reduced_to_the_first(self):
@@ -523,13 +798,16 @@ class TestResolutionBehaviour(unittest.TestCase):
         # validly carry more than one, but an operator-overridden Type=oneshot
         # can -- and its FIRST entry need not be xpfd at all. Taking it
         # unconditionally hands the promote-vs-rollback decision to an arbitrary
-        # command. Ambiguous input must yield NOTHING so the compiled defaults
-        # still get their turn.
+        # command.
+        #
+        # NOTE (#6601 r4 MINOR): on a REAL multi-entry render each entry brings
+        # its own " ; argv[]=", so the delimiter-COUNT rule already rejects this
+        # value; the newline guard is defence in depth here, not the sole
+        # rejector. The test below covers what only the newline guard rejects.
         foreign = self.tmp / "prep" / "install"
         foreign_ran = self._install_abs(foreign)
         entry = self.tmp / "opt" / "xpfd"
-        self._install_abs(entry)
-        sbin_ran = self._install(SBIN, 0)
+        entry_ran = self._install_abs(entry)
 
         self.stub_execstart = (
             f"{{ path={foreign} ; argv[]={foreign} -d ; ignore_errors=no }}\n"
@@ -538,65 +816,110 @@ class TestResolutionBehaviour(unittest.TestCase):
         self.stub_loadstate = "loaded"
 
         res = self._run()
-        self.assertEqual(res.returncode, 0, res.stderr)
         self.assertFalse(
             foreign_ran.exists(),
             f"the gate executed {foreign}, the FIRST of several ExecStart "
-            "entries, which need not be xpfd (#6601 r4 MAJOR-1): "
-            f"{res.stderr}",
+            f"entries, which need not be xpfd (#6601 r4 MAJOR-1): {res.stderr}",
         )
-        self.assertTrue(
-            sbin_ran.exists(),
-            "an ambiguous multi-entry ExecStart must yield nothing and let the "
-            f"compiled defaults resolve: {res.stderr}",
-        )
+        self.assertFalse(entry_ran.exists(), "the gate picked an entry out of an ambiguous list")
+        self._assert_refused(res, "multi-entry ExecStart")
 
-    def test_discovers_the_running_binary_via_main_pid_proc_exe(self):
-        # #6601 r4: the structured, un-parsed discovery source. MainPID is an
-        # integer property and /proc/<pid>/exe is a kernel symlink, so this hop
-        # reads the path of the binary the live daemon is ACTUALLY executing
-        # without parsing systemd's lossy textual render at all. It must outrank
-        # stale leftovers at both compiled defaults.
-        sleep_bin = shutil.which("sleep")
-        if not sleep_bin:
-            self.skipTest("no sleep(1) to model a running daemon")
-        target = self.tmp / "opt-live" / "xpfd"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(sleep_bin, target)
-        if not os.access(target, os.X_OK):
-            self.skipTest("could not stage an executable copy")
-        proc = subprocess.Popen(
-            [str(target), "60"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        self.addCleanup(proc.wait)
-        self.addCleanup(proc.kill)
+    def test_multiline_execstart_with_one_delimiter_is_rejected(self):
+        # The case the newline guard alone rejects, so that guard carries its
+        # own weight (#6601 r4 MINOR: the delimiter-count rule subsumes it for
+        # ordinary multi-entry renders). One delimiter, several lines: the
+        # count rule passes and, without the newline guard, the parse silently
+        # adopts the first entry -- a REAL, usable binary here, so the mutation
+        # is not merely a failed resolve but a wrong execution.
+        first = self.tmp / "first" / "xpfd"
+        first_ran = self._install_abs(first)
+        second = self.tmp / "second" / "xpfd"
+        second_ran = self._install_abs(second)
 
-        self.stub_mainpid = str(proc.pid)
+        self.stub_execstart = f"{{ path={first} ; argv[]={first} }}\n{{ path={second} }}"
         self.stub_loadstate = "loaded"
-        stale_sbin = self._install(SBIN, 0)
-        stale_versioned = self._install(VERSIONED, 0)
+
+        res = self._run()
+        self.assertFalse(
+            first_ran.exists(),
+            "the gate adopted the first of a MULTI-LINE ExecStart render that "
+            f"carries only one field delimiter: {res.stderr}",
+        )
+        self.assertFalse(second_ran.exists())
+        self._assert_refused(res, "multi-line ExecStart with one delimiter")
+
+    def test_bare_execstart_with_a_tab_is_rejected(self):
+        # #6601 r4 audit note. The bare (unstructured) rendering is accepted
+        # only when the WHOLE value is one absolute path. Rejecting just spaces
+        # and semicolons does not make that true: a tab separates a path from
+        # its arguments equally well, and the value here names a real,
+        # executable file, so tolerating it is a wrong execution rather than a
+        # failed resolve.
+        tabbed = self.tmp / "tabbed" / "xpfd\t--flag"
+        tabbed_ran = self._install_abs(tabbed)
+
+        self.stub_execstart = str(tabbed)
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self.assertFalse(
+            tabbed_ran.exists(),
+            "the gate accepted a bare ExecStart rendering containing a TAB. "
+            "`path<TAB>--flag` is indistinguishable from a path plus an "
+            f"argument, so it is not a whole path (#6601 r4): {res.stderr}",
+        )
+        self._assert_refused(res, "bare ExecStart containing a tab")
+
+    def test_bare_absolute_execstart_is_accepted(self):
+        # OVER-REACH GUARD on the whitespace tightening: an ordinary bare
+        # rendering (a single absolute path, no arguments) must still resolve.
+        plain = self.tmp / "plain" / "xpfd"
+        plain_ran = self._install_abs(plain)
+
+        self.stub_execstart = str(plain)
+        self.stub_loadstate = "loaded"
 
         res = self._run()
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn(
-            f"using {target} (",
+        self.assertTrue(
+            plain_ran.exists(),
+            f"a plain absolute bare ExecStart did not resolve: {res.stderr}",
+        )
+
+    # --------------------------------------------------- admission + refusals
+
+    def test_directory_candidate_is_not_treated_as_the_binary(self):
+        # `test -x` alone is TRUE for a searchable DIRECTORY. The inner hop's
+        # validateGateBin rejects a non-regular target, so the outer hop must
+        # too — otherwise the two hops' admission tests are not actually
+        # symmetric, and the gate execs a directory (rc=126) which then reads
+        # as an infra error rather than the refusal it is.
+        candidate = self.tmp / "isadir" / "xpfd"
+        candidate.mkdir(parents=True)
+
+        self.stub_execstart = f"{{ path={candidate} ; argv[]={candidate} }}"
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self.assertNotIn(
+            "infra error",
             res.stderr,
-            "the gate did not resolve xpfd through xpfd.service's MainPID and "
-            f"/proc/<pid>/exe: {res.stderr}",
+            f"a DIRECTORY named by ExecStart was exec'd as the gate binary "
+            f"instead of being rejected by the `-f` regular-file test: {res.stderr}",
         )
-        self.assertIn("MainPID", res.stderr)
-        self.assertFalse(
-            stale_sbin.exists(),
-            f"ran the leftover at {SBIN} instead of the binary the live daemon "
-            f"is executing: {res.stderr}",
-        )
-        self.assertFalse(
-            stale_versioned.exists(),
-            f"ran the leftover at {VERSIONED} instead of the binary the live "
-            f"daemon is executing: {res.stderr}",
-        )
+        self._assert_refused(res, "ExecStart names a directory")
+
+    def test_dangling_symlink_candidate_is_rejected(self):
+        # #2176 leaves a symlink pointing into a removed versions dir.
+        dangling = self.tmp / "dangle" / "xpfd"
+        dangling.parent.mkdir(parents=True, exist_ok=True)
+        dangling.symlink_to(self.tmp / "removed" / "versions" / "v1" / "xpfd")
+
+        self.stub_execstart = f"{{ path={dangling} ; argv[]={dangling} }}"
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self._assert_refused(res, "ExecStart names a dangling symlink")
 
     def test_unqueryable_systemd_refuses_loudly_rather_than_skipping(self):
         # #6601 r4 audit note. The quiet "xpf is not on this box" skip is only
@@ -607,35 +930,29 @@ class TestResolutionBehaviour(unittest.TestCase):
         self.stub_show_fail = "1"
 
         res = self._run()
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn(
-            "ERROR",
+        self.assertNotIn(
+            "skipping promotion gate",
             res.stderr,
             "an unqueryable systemd was treated as proof that xpf is absent "
             f"(#6601 r4): {res.stderr}",
         )
-        self.assertIn("REFUSING to promote", res.stderr)
-        self.assertNotIn("skipping promotion gate", res.stderr)
-        self.assertFalse(
-            self.marker.exists(),
-            "the gate executed the xpfd it found on $PATH (#6541)",
-        )
+        self._assert_refused(res, "systemctl cannot be consulted")
 
-    def test_unusable_execstart_falls_through_to_compiled_defaults(self):
-        # Over-reach guard: discovery must not become a single point of failure.
-        # A unit whose ExecStart names a path that no longer exists (mid-cut,
-        # GC'd version dir) must fall through, not strand the gate.
+    def test_unusable_execstart_refuses_rather_than_guessing(self):
+        # A unit whose ExecStart names a path that no longer exists (mid-cut, a
+        # GC'd version dir). Earlier revisions fell through to the compiled
+        # defaults here -- which is exactly the wrong instinct: an ExecStart
+        # pointing into a relocated//GC'd root is the STRONGEST signal that a
+        # leftover at a default path is stale.
+        stale_sbin = self._install(SBIN, 0)
+        stale_versioned = self._install(VERSIONED, 0)
         self.stub_execstart = f"{{ path={self.tmp}/gone/xpfd ; argv[]={self.tmp}/gone/xpfd }}"
         self.stub_loadstate = "loaded"
-        sbin_ran = self._install(SBIN, 0)
 
         res = self._run()
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertTrue(
-            sbin_ran.exists(),
-            f"an unusable ExecStart stranded the gate instead of falling "
-            f"through to {SBIN}: {res.stderr}",
-        )
+        self.assertFalse(stale_sbin.exists(), f"ran a leftover: {res.stderr}")
+        self.assertFalse(stale_versioned.exists(), f"ran a leftover: {res.stderr}")
+        self._assert_refused(res, "ExecStart names a path that is gone")
 
     def test_refuses_loudly_when_installed_but_unlocatable(self):
         # FAIL LOUD, not quiet. xpfd.service is installed but nothing resolves:
@@ -645,29 +962,12 @@ class TestResolutionBehaviour(unittest.TestCase):
         self.stub_loadstate = "loaded"
 
         res = self._run()
-        self.assertEqual(
-            res.returncode,
-            0,
-            "the refusal must exit 0 (the non-rebooting infra-error path); a "
-            f"non-zero exit trips OnFailure= and reboots: {res.stderr}",
-        )
-        self.assertIn("ERROR", res.stderr, f"the refusal was not loud: {res.stderr}")
-        self.assertIn("REFUSING to promote", res.stderr)
-        self.assertFalse(
-            self.marker.exists(),
-            "the gate executed the xpfd it found on $PATH (#6541)",
-        )
-        self.assertFalse(
-            self.systemctl_ran.exists(),
-            f"the refusal rebooted the box: {self.systemctl_ran.read_text()}"
-            if self.systemctl_ran.exists()
-            else "",
-        )
+        self._assert_refused(res, "installed but unlocatable")
 
     def test_skips_rather_than_falling_back_to_path(self):
-        # NEITHER explicit candidate exists, but a perfectly good xpfd is
-        # sitting on $PATH. The gate must SKIP (exit 0, the pre-existing
-        # not-installed behaviour), never reach for $PATH.
+        # systemd ANSWERED not-found: the one honest "xpf is not on this box"
+        # case. Skip quietly — and never reach for the perfectly good xpfd
+        # sitting on $PATH.
         res = self._run()
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertFalse(
@@ -676,32 +976,38 @@ class TestResolutionBehaviour(unittest.TestCase):
         )
         self.assertIn("skipping promotion gate", res.stderr)
 
+    # ------------------------------------------------------ contract preserved
+
     def test_revert_exit_3_still_reboots(self):
         # OVER-REACH GUARD: the explicit-path change must not disturb the
         # revert contract. An xpfd exiting 3 (REVERT) must still drive the
         # reboot branch. `systemctl` is stubbed on PATH — it is a system
         # binary and is legitimately PATH-resolved.
-        self._install(VERSIONED, 3)
-        systemctl_ran = self.systemctl_ran
+        live = self.tmp / "live" / "xpfd"
+        self._install_abs(live, exit_code=3)
+        self.stub_execstart = f"{{ path={live} ; argv[]={live} }}"
+        self.stub_loadstate = "loaded"
 
         res = self._run()
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("REVERT", res.stderr)
         self.assertTrue(
-            systemctl_ran.exists(),
+            self.systemctl_ran.exists(),
             f"exit 3 did not trigger the recovery reboot: {res.stderr}",
         )
-        self.assertIn("reboot", systemctl_ran.read_text())
+        self.assertIn("reboot", self.systemctl_ran.read_text())
 
     def test_infra_error_does_not_reboot(self):
         # OVER-REACH GUARD: a non-0/non-3 rc stays a non-rebooting infra error.
-        self._install(VERSIONED, 1)
-        systemctl_ran = self.systemctl_ran
+        live = self.tmp / "live" / "xpfd"
+        self._install_abs(live, exit_code=1)
+        self.stub_execstart = f"{{ path={live} ; argv[]={live} }}"
+        self.stub_loadstate = "loaded"
 
         res = self._run()
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("infra error", res.stderr)
-        self.assertFalse(systemctl_ran.exists(), "an infra error triggered a reboot")
+        self.assertFalse(self.systemctl_ran.exists(), "an infra error triggered a reboot")
 
 
 if __name__ == "__main__":

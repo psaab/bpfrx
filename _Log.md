@@ -62678,3 +62678,78 @@ break — `go vet` confirmed passing under every revert.
   verified to fail identically at origin/master 1aa1d38c2.
 - **File(s)**: scripts/image/{xpf-kernel-promote,xpf-kernel-promote.service,
     test_kernel_promote_explicit_path.py}, docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6541 / PR #6601 fold r5 — CLOSE THE CLASS: delete the kernel
+  promote gate's compiled-defaults fallback outright, and bind the MainPID hop
+  to the unit. Codex r4 verdict MERGE-NEEDS-MAJOR (2 MAJOR + 1 MINOR).
+  MAJOR-1: `-ef` cannot distinguish a HEALTHY default layout from BOTH-ROOTS-
+  RELOCATED, where the leftover sbin symlink still points at the leftover
+  versioned runtime, so the pair is ONE INODE either way. Codex reproduced it
+  end to end (live_ran False / stale_ran True). Root cause is not that case:
+  it is that the gate was INFERRING which xpfd is live from filesystem
+  evidence, and filesystem evidence is inherently ambiguous once a root has
+  been relocated — relocation removes nothing, so leftovers are
+  indistinguishable from a healthy install and there is always one more case
+  (r1 $PATH → r2 wrong rank → r3 parse → r4 same-inode).
+  Fix (option A of the two the brief offered — delete, not a daemon-written
+  state file): the authority order is now exactly (1) /proc/<MainPID>/exe,
+  (2) a strictly-parsed ExecStart, (3) a LOUD REFUSAL, with no fourth step.
+  `try_compiled_defaults`, `DEFAULTS_AMBIGUOUS`, the `-ef` test and both
+  hardcoded default paths are gone from the script. Chose delete over a state
+  file because refusal is already a correct, safe terminal outcome here — it
+  takes the non-rebooting infra-error path, leaves the armed candidate
+  un-promoted, and the next plain reboot falls back through the
+  firmware-cleared BootNext to the known-good slot — whereas a state file adds
+  a new on-disk artifact that can itself go stale, i.e. the same class again.
+  Nothing real needs the fallback: an armed candidate boot runs the gate
+  After=xpfd.service, so MainPID answers; if xpfd is down, ExecStart still
+  answers (systemd knows a unit's ExecStart whether or not it is running); and
+  a box where neither answers is broken in a way a guess cannot fix.
+  MAJOR-2 (PID recycle): the MainPID hop read the pid once and accepted
+  /proc/<pid>/exe on a basename check alone, so a recycled pid running any
+  binary named `xpfd` could author promote-vs-rollback. Now the pid is bound
+  back to the unit AFTER the readlink — membership in xpfd.service's own
+  ControlGroup (matched against the PATH FIELD of /proc/<pid>/cgroup, exactly
+  or as the parent of a delegated subgroup, never as a substring) plus a
+  MainPID re-read requiring the same positive pid. Verified the mechanism
+  firsthand as root on a live systemd host (cron/dbus/incus): MainPID →
+  readlink /proc/<pid>/exe yields the real binary and ControlGroup is exactly
+  the path field of that pid's cgroup line.
+  MINOR (false mutation-sensitivity claim): the multi-line ExecStart guard was
+  claimed per-element sensitive but the delimiter-count rule independently
+  rejects a real multi-entry render. Rather than manufacture sensitivity, the
+  claim was corrected in both script and test comments, and a case only the
+  newline guard rejects (several lines carrying ONE delimiter, first entry a
+  real binary) was added so the guard now carries its own weight. Same
+  treatment for the "(deleted)" guard: documented as defence in depth, since
+  the basename guard and the regular-file admission test also reject it —
+  asserted as an OUTCOME instead. Also folded the audit note that the bare
+  ExecStart rendering rejected only spaces and semicolons: it now rejects ALL
+  whitespace via `[[:space:]]` (honoured by dash and busybox sh), so "whole
+  path only" is true rather than approximately true.
+  Validation: 9 of the 35 python cases verified RED at the pre-fix head
+  4f2d2b814 in a THROWAWAY detached worktree (/dev/shm/probe-6601h, removed
+  after), including Codex's exact reproduction — the pre-fix gate logs
+  `using .../usr/local/sbin/xpfd (compiled defaults (both name the same file))`
+  then `promotion gate: clean`, i.e. the stale build authorized the promotion.
+  Per-element mutation sweep over 11 guards: 10 are killed by exactly the case
+  that names them (newline guard, whitespace class, `-f` admission, cgroup
+  binding, cgroup exact-tail vs substring, cgroup parent-arm vs exact-only,
+  MainPID re-read, delimiter count, basename guard, ControlGroup absolute-path
+  guard); the "(deleted)" guard is provably subsumed and is documented as such
+  rather than claimed. Anti-over-reach kept and retargeted per the brief: a
+  healthy default-rooted box now resolves via ExecStart AND via MainPID (two
+  tests), a delegated subgroup still counts as membership, an unreportable
+  ControlGroup falls through to ExecStart rather than stranding the gate, and
+  a plain bare absolute ExecStart still resolves. `go test ./pkg/upgrade/...`
+  green, all 7 scripts/image/test_*.py green (including
+  test_validate_scenarios.py, which passed here), `make selftest` 48 pass /
+  0 fail, `sh -n` + `dash -n` + `busybox sh -n` clean, shellcheck clean,
+  `git diff --check` clean, gofmt clean on the branch's Go files (the repo-wide
+  `gofmt -l` hits are pre-existing at origin/master and touch no file in this
+  PR). Residual noted, NOT folded (out of the verdict and out of scope): the
+  INNER hop's resolveVerifyGateBin still falls back to <SbinDir>/xpfd and
+  <VersionsDir>/current/xpfd when os.Executable fails.
+- **File(s)**: scripts/image/{xpf-kernel-promote,
+    test_kernel_promote_explicit_path.py}, docs/in-place-upgrade.md, _Log.md
