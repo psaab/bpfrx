@@ -1,20 +1,22 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.23.0 — THE TERMINAL CUT, round-106 folds (the
-producer is now ONE typed `MaterializeReport` — site/validation/
-transition/displaced — with product normalization AT the producer
-before promotion (the out-of-product fail-closed rule is thus
-mechanically enforceable, and the `site` discriminator lets consumers
-tell an erroneous site-2c `(None,None)` from a valid local hit); the
-promote preimage capture threads OUT through the full
-update_session → promote chain; the uniqueness proof corrected
-(promotion CAN change NAT/orientation — K's preimage and S2 are two
-separately recorded families); §9 gained the normalization/seed-
-block/cardinality tests; site 2b correctly described as outside the
-report; the policy-counter fallback scoped exactly; the last §5.6/
-§10.6.1 stragglers). Round-106: Codex NO (1B/2H/4M/1L — transport
-completeness and proof precision); AGY r105 SOUND (v10.22.0); SMR
-r106 YES (fold verification). Ship
+**Status: DRAFT v10.24.0 — THE TERMINAL CUT, round-107 folds (the
+product is now valid BY CONSTRUCTION — the materialize computes the
+validation verdict and the overdue check BEFORE the state-changing
+upsert and selects the transition action first, so out-of-product
+combinations are unreachable rather than normalized-after; the
+consumer-side fail-closed fallback is scoped to `Some(Site2c)` (an
+impossible non-materializing report follows master — treating a
+purged retained lookup as OverdueSkipped would replay a released
+tuple); the promotion path gains the explicit
+`transition == OverdueSkipped` gate independent of the probation
+flag; `displaced` has exactly one carrier (the report) and one drain
+description; the §9 empty-case corrected for the no-op-promote
+refusal; the remaining terminology stragglers). Round-107: Codex NO
+(2B/2H/2M — normalization-after-the-upsert could not undo mutations,
+the generic fallback was unsafe on purge paths, the two-carrier/two-
+drain contradiction, the §9 empty-case, the terminology remnants —
+all folded); AGY r106 SOUND (v10.23.0); SMR r107 YES. Ship
 candidate = the Part-A dataplane demote gate plus the wire-free local HA
 rules. The RG-incarnation/retirement/fence-ledger protocol that rounds
 13–82 grew is KILLED (not deferred): its two customers are re-scoped —
@@ -1445,9 +1447,9 @@ substitution discards the placeholder's key/decision,
 BOUNDED SET of displaced identities: the new S2 alias family PLUS any
 removed canonical predecessor's full old alias family PLUS any
 shadowed placeholder's key family (the complete semantics — the
-two-field outcome, the ValidatorRefused/UpsertRefused carriage, the
+report fields, the refusal-class carriage, the
 dedup proof, and the invalidation timing — live in the §5.8 contract
-SSOT, v10.19.0-v10.22.0; this paragraph is the §5.6 summary).
+SSOT, v10.19.0-v10.24.0; this paragraph is the §5.6 summary).
 **Timing:** the current binding's cache invalidation of the displaced
 set runs IMMEDIATELY after resolution and BEFORE every early exit,
 the cache-insert point, and the next descriptor (materialization has
@@ -1693,7 +1695,7 @@ adopting the shared decision/metadata, §5.6).
   propagation skips probation targets (v10.7.0, round-90 Codex 4) and
   the accepted-mark rule skips a probation MATCHED entry (v10.8.0,
   round-91 Codex 3).
-- **`MaterializeOutcome` / `OverdueSkipped` — the full normative
+- **`MaterializeReport` / `OverdueSkipped` — the full normative
   contract (v10.19.0, rounds 98-102 Codex; this bullet is the SSOT —
   every earlier summary paragraph is superseded):**
   - **Type (v10.21.0, round-104 Codex 1 — two FIELDS, no precedence
@@ -1748,12 +1750,29 @@ adopting the shared decision/metadata, §5.6).
     from the site-2c materialize; `None` on every non-materializing
     path) — consumers can therefore distinguish an erroneous site-2c
     `(None, None)` from a valid local hit (round-106 Codex 2). The
-    producer NORMALIZES the product while the branch is still known
-    (before any promotion): any combination outside the legal product
-    is mapped to `(site preserved, validation preserved,
-    transition := OverdueSkipped)` at the materialize site — the
-    fail-closed rule thus cannot arrive downstream as a post-hoc
-    interpretation that could not undo earlier mutations. The
+    consumer-side fail-closed fallback (invalid → OverdueSkipped
+    semantics) applies ONLY to `Some(Site2c)` reports (v10.24.0,
+    round-107 Codex 2): an impossible non-materializing report
+    (`site=None`) follows master's own dispatch — treating it as
+    `OverdueSkipped` would force a purged retained lookup's
+    MissingNeighbor into the buffer-only arm and replay a RELEASED
+    tuple (`poll_descriptor/mod.rs:5057-5068`,
+    `neighbor_dispatch.rs:272-292`). **The product is valid BY
+    CONSTRUCTION, not normalized after the fact (v10.24.0, round-107
+    Codex 1):** the materialize computes the validation verdict (from
+    the packet + anchor) and the overdue check (from K's timing)
+    BEFORE calling the state-changing upsert (`install.rs:310-322`,
+    `:345-400` may remove K, install S2, seed flags, rebuild indexes)
+    and selects the transition action from the verdict+overdue
+    decision first — out-of-product combinations are unreachable
+    because the producer cannot create them, not because anything is
+    rewritten later. And the promotion path gains an explicit gate:
+    `report.transition == OverdueSkipped` (or the site-2c
+    `ValidatorRefused` class per §5.5) suppresses the promote and the
+    commit-time refresh INDEPENDENTLY of K's probation flag
+    (`promote.rs:86-107` gates only on origin/disposition today —
+    a normalized-invalid report with a non-probation K must not
+    overwrite/publish/replicate, round-107 Codex 1). The
     promotion preimage capture threads OUT through the whole chain:
     `update_session` captures the pre-overwrite identity
     (`session/mod.rs:1344-1348`, `:1393-1396`) into an OUT parameter;
@@ -1879,14 +1898,15 @@ adopting the shared decision/metadata, §5.6).
     to the displaced set only on the site-2c materialization branch
     and DISCARDED for the purge path and the non-materializing callers
     (`icmp_embed/nat_match_v4.rs:78-95`, `nat_match_v6.rs:100-125`,
-    `return_resolution.rs:20-28`). The resolved result
-    (`ResolvedFlowSessionDecision`, `shared_ops.rs:563-578`) gains
-    `displaced: DisplacedSet` initialized EMPTY at BOTH constructors
-    (`session_glue/mod.rs:1254-1261`, `:1330-1344`) and accumulated
+    `return_resolution.rs:20-28`). The set rides the report
+    (`MaterializeReport.displaced`; `ResolvedFlowSessionDecision`
+    carries the whole report initialized `MaterializeReport::NONE` at
+    both constructors — there is NO separate `displaced` field,
+    v10.24.0, round-107 Codex 3) and is accumulated
     from the producers. **Storage split (round-103 Codex 4):** the
-    per-descriptor INLINE set on the resolved result feeds the
+    per-descriptor INLINE set in the resolved report feeds the
     CURRENT-binding drain (the poller drains exactly the current
-    descriptor's set after its resolution, before every early exit,
+    descriptor's `report.displaced` after its resolution, before every early exit,
     the cache insert, and the next descriptor — so descriptor 2 never
     re-invalidates descriptor 1's freshly inserted S2 alias); a
     SEPARATE preallocated batch accumulator on `WorkerScratch`
@@ -2470,10 +2490,15 @@ values (probabilistic sprays can legitimately hit the admitted interval):
 - **Invalidation lifecycle (v10.18.0, round-101 Codex 3/4):** the
   displaced-identity SET (new S2 family + any removed canonical
   predecessor's old family + any shadowed placeholder's key family;
-  EMPTY only for an `OverdueSkipped` with no shadowed placeholder —
-  v10.21.0, round-104 Codex 5: `UpsertRefused` necessarily HAS a
-  non-peer predecessor (`install.rs:310-315`), and a no-predecessor
-  `ValidatorRefused` successfully installs the probation S2 and
+  EMPTY only for an `OverdueSkipped` with no shadowed placeholder OR
+  an `UpsertRefused` whose promotion no-ops (v10.24.0, round-107
+  Codex 4: the v10.21.0 text said `UpsertRefused` necessarily records
+  K — wrong: with no shadowed P, an upsert refusal on non-peer K
+  (`install.rs:310-315`) plus a no-op promote (non-ForwardCandidate,
+  `promote.rs:86-90`) displaces NOTHING, and K's aliases remain valid;
+  K's family enters the set ONLY when the promote actually overwrites
+  it) — and a no-predecessor
+  `(Refused, Installed)` successfully installs the probation S2 and
   therefore carries the new S2 family) is asserted
   across: (i)
   initial probation construction with a pre-existing fabric-wire
@@ -2509,8 +2534,10 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   identity is in the set, so a later ACK cannot refresh it from
   cache, `flow_cache_hit.rs:295-317`).
 - **OverdueSkipped propagation (v10.17.0, round-100 Codex 2/3):** the
-  outcome is initialized `None` on every resolve path and set only by
-  the overdue-materialize skip; the poller hoists it at
+  report is initialized `MaterializeReport::NONE` on every resolve
+  path and set from the materializer's OUT report (all four
+  transitions, not only the overdue skip — v10.24.0, round-107
+  Codex 6); the poller hoists it at
   `poll_descriptor/mod.rs:509` and carries it past the `:883`
   reduction; assert each of the five consumers honors it (teardown
   suppressed at all three sites — `:698-714`, `:768-784`, `:824-840`;
@@ -2913,7 +2940,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.23.0)
+## 11. Open questions for the convergence round (v10.24.0)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
@@ -2960,11 +2987,11 @@ this branch only if the minimal fix proves insufficient.
    deferred refresh (round-88) — is any pre-commit refresh/requeue
    path left for a probation entry (lookup, `touch_if_stale`, promote,
    materialize refresh), and does the commit-hook clear+refresh cover
-   every admission arm? (e) the v10.23.0 end-state: the single typed
-   `MaterializeReport` with producer-side normalization, the named
-   preimage OUT chain, the corrected uniqueness proof, and the full
-   straggler sweep — is any transport hop or proof step still
-   two-readable?
+   every admission arm? (e) the v10.24.0 end-state: the product is
+   valid by construction (pre-upsert verdict/overdue computation),
+   the fallback is site-scoped, the promote gate is explicit, and the
+   set has one carrier and one drain — is any state transition's
+   ordering or ownership still ambiguous?
 
 4. **The emission posture:** master's `expire.rs:342-350` gate is
    UNCHANGED; the additions are the normative mark-creation rules, rule

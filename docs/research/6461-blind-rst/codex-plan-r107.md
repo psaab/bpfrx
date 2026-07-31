@@ -1,0 +1,28 @@
+# Codex hostile plan-review — round 107 (v10.23.0)
+
+Reviewer: Codex (fresh thread, job task-ms9cf3g4-jh1w6q, 2026-07-31). Verdict: PLAN NO (2B/2H/2M). Headline: producer normalization came too late to undo the upsert's mutations and did not gate promotion; the generic fail-closed fallback was unsafe on non-materializing purge paths (would replay a released tuple); displaced had two carriers and two incompatible drain descriptions. r106-3/r106-7 RESOLVED.
+
+## Verbatim review
+
+PLAN NO 1. **BLOCKER — Producer normalization remains too late and does not gate promotion.**...
+
+[2026-07-31T19:45:20.062Z] Assistant message
+PLAN NO
+
+1. **BLOCKER — Producer normalization remains too late and does not gate promotion.** `materialize_shared_session_hit` performs the upsert before returning its report (`userspace-dp/src/afxdp/session_glue/mod.rs:1098-1119`); that upsert may remove K, install S2, seed flags, and rebuild indexes (`userspace-dp/src/session/install.rs:310-322`, `:345-400`). Normalizing an invalid product afterward to `OverdueSkipped` cannot undo those mutations, despite the claim at `docs/research/6461-blind-rst/plan.md:1751-1756`.
+
+   Promotion then runs immediately (`userspace-dp/src/afxdp/session_glue/mod.rs:1235-1253`), while its code gates only on origin/disposition (`userspace-dp/src/afxdp/session_glue/promote.rs:86-107`). The contract instead relies on K’s probation flag (`plan.md:1811-1813`). A normalized-invalid report with a non-probation K can therefore still overwrite, publish, and replicate. Require product validation before any state-changing upsert and an explicit `report.transition == OverdueSkipped` gate for promotion and commit-time refresh.
+
+2. **HIGH — The generic consumer-side fail-closed interpretation is unsafe on non-materializing purge paths.** The contract maps every invalid combination to `OverdueSkipped` (`plan.md:1774-1784`), but `site=None` covers both harmless local hits and purged retained lookups. Purge deletes the entry and releases its NAT reservation (`userspace-dp/src/afxdp/session_glue/promote.rs:181-207`) while retaining the decision for dispatch (`userspace-dp/src/afxdp/session_glue/mod.rs:1194-1196`). Treating an invalid purge report as `OverdueSkipped` forces MissingNeighbor into the live-backed buffer-only arm (`plan.md:1821-1830`), storing and later replaying that released tuple (`userspace-dp/src/afxdp/poll_descriptor/mod.rs:5057-5068`; `userspace-dp/src/afxdp/neighbor_dispatch.rs:272-292`). Restrict this fallback to `Some(Site2c)` or carry backing provenance and drop/follow master for impossible non-materializing reports.
+
+3. **BLOCKER — `displaced` still has two carriers and two incompatible drain descriptions.** The SSOT embeds `DisplacedSet` in `MaterializeReport` and carries only `report` on `ResolvedFlowSessionDecision` (`plan.md:1736-1742`, `:1767-1773`), but later says the resolved result separately gains `displaced: DisplacedSet` (`:1882-1886`). It also correctly separates a per-descriptor current-binding set from the batch-wide `WorkerScratch` sibling union (`:1886-1900`), then says the set accumulated on `WorkerScratch` is used for each current-binding drain (`:1905-1916`). Following the latter can re-invalidate descriptor 1’s freshly inserted S2 aliases while processing descriptor 2. Descriptor processing owns only the current binding (`userspace-dp/src/afxdp/poll_descriptor/mod.rs:110-131`); sibling access exists at the outer binding split (`userspace-dp/src/afxdp/worker/lifecycle.rs:53-55`, `:209-225`).
+
+   The promotion capture point itself is now sound: the old NAT/orientation are available before overwrite (`userspace-dp/src/session/mod.rs:1344-1348`, `:1393-1396`) and can be threaded through the current boolean wrapper (`:1673-1675`).
+
+4. **HIGH — Section 9 would invalidate a surviving K incorrectly.** The SSOT says refusal-K enters `displaced` only if promotion overwrites it (`plan.md:1763-1766`), but §9 says only overdue-without-P can produce an empty set because `UpsertRefused` necessarily has K (`:2470-2477`). With no P, upsert can refuse on non-peer K (`userspace-dp/src/session/install.rs:310-315`) and promotion can no-op for MissingNeighbor/non-ForwardCandidate (`userspace-dp/src/afxdp/session_glue/promote.rs:86-90`). Nothing was displaced, so the set must be empty and K’s aliases must remain valid.
+
+5. **MEDIUM — Site 2b is still mislabeled as reporting validation.** The SSOT says `reverse_installed`/`install_failed` report acceptance/refusal (`plan.md:1778-1781`). They report installation success only: validator refusal and accepted-but-capacity-refused both yield `reverse_installed=false`, `install_failed=true` (`userspace-dp/src/afxdp/shared_ops.rs:824-895`; `userspace-dp/src/afxdp/session_glue/mod.rs:1264-1284`, `:1330-1344`). Site 2b is correctly outside `MaterializeReport`, but this claimed fold did not land.
+
+6. **MEDIUM — The consistency sweep still contains obsolete normative/test shapes.** Section 5.6 retains `ValidatorRefused` and “two-field outcome” (`plan.md:1447-1450`); the SSOT heading still says `MaterializeOutcome` (`:1696-1707`); §9 again names `ValidatorRefused` (`:2476`) and says a singular outcome is set only for overdue materialization (`:2511-2514`), contradicting the `Installed`, `AdoptedPreservingDeadline`, and `UpsertRefused` transitions. The new normalization, MissingNeighbor, cardinality, and 192-family tests did land at `:2501-2507`.
+
+Round-106 dispositions: r106-1 **UNRESOLVED**; r106-2 **UNRESOLVED**; r106-3 **RESOLVED**; r106-4 **UNRESOLVED**; r106-5 **UNRESOLVED**; r106-6 **UNRESOLVED**; r106-7 **RESOLVED**.
