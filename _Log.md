@@ -61639,3 +61639,30 @@ would never produce.
     is retuned, and replaced test 2's false subsumption claim with an honest
     accounting.
   - **File(s)**: pkg/dataplane/userspace/routes_6467_crossfamily_test.go
+- **Timestamp**: 2026-07-31
+- **Action**: #6523 quoteKey re-lex predicate: `quoteKey` emitted a key
+  BARE whenever every byte satisfied `isIdentChar`, which is the LEXER'S
+  ident set (it admits `/`, `*`, `:`) and not the set of texts that
+  survive a serialize/re-parse cycle. A key of `//x`, `/*x*/`, `/*x` or
+  `inactive:` went out unquoted and was re-read as a comment or as the
+  parser's deactivation marker, with zero parse errors — silently
+  emptying a security-zone or widening a policy on HA config sync,
+  rollback, archive and rescue. Replaced the predicate with
+  `bareKeySafe`: all-identChars (retained so the change is monotone —
+  output only gains quotes, never loses them) AND the text must re-lex
+  through the REAL lexer as exactly one identifier equal to itself
+  followed by EOF, AND must not be `inactiveMarker`. Deferring to the
+  lexer means a comment syntax added later is covered the day it lands.
+  Allocation-free (the Lexer does not escape; pinned by a zero-alloc
+  test). Independently re-derived the hazard set by brute force rather
+  than trusting the issue: exhaustive 1-3 byte sweep over the full
+  74-byte ident alphabet plus a 5-byte punctuation sweep found 0 hazards
+  beyond leading `//`, leading `/*`, and exactly `inactive:`. Also
+  covered the `| display set` serializer (joinQuotedKeys ->
+  ParseSetVerb), which drives the same lexer. Fail-on-revert: all 9
+  tests go RED with assertions. Full pkg/config + pkg/configstore
+  suites green.
+- **File(s)**: pkg/config/ast.go, pkg/config/freetext.go,
+    pkg/config/quotekey_relex_6523_test.go,
+    pkg/config/quotekey_roundtrip_3854_test.go,
+    docs/config-schema.md, _Log.md

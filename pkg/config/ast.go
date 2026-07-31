@@ -85,19 +85,82 @@ func (n *Node) QuotedKeyPath() string {
 // round-trip would over-escape and diverge.
 var keyEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
 
-// quoteKey wraps a key in double quotes if it contains characters that
-// are not valid in bare Junos identifiers, escaping backslash, quote, and
-// newline so the quoted form round-trips symmetrically through the lexer.
+// quoteKey renders one AST key as configuration text, wrapping it in double
+// quotes unless the bare text is guaranteed to read back as exactly this key
+// (bareKeySafe). Quoted output escapes backslash, quote, and newline so it
+// round-trips symmetrically through the lexer (#3854).
 func quoteKey(s string) string {
-	if s == "" {
-		return `""`
+	if bareKeySafe(s) {
+		return s
 	}
+	return `"` + keyEscaper.Replace(s) + `"`
+}
+
+// bareKeySafe reports whether s may be emitted WITHOUT surrounding quotes and
+// still be read back, by the next Parse, as exactly this one key.
+//
+// The predicate this replaced was "every byte satisfies isIdentChar". That is
+// the LEXER'S IDENT-CHAR SET, which is not the same thing as the set of texts
+// that survive a serialize/re-parse cycle: isIdentChar admits `/`, `*` and
+// `:`, and three ident-char-only texts are re-interpreted STRUCTURALLY on the
+// way back in (#6523) — with no parse error and no warning:
+//
+//   - a key starting `//` — skipWhitespaceAndComments consumes it to
+//     end-of-line, so the key AND every key after it on that line silently
+//     VANISH;
+//   - a key starting `/*` — opens a block comment: `/*x*/` swallows itself
+//     silently, `/*x` swallows the remainder of the config;
+//   - a key equal to `inactive:` — the parser's deactivation marker: leading,
+//     it sets Node.Inactive on an unrelated statement; inline, it TRUNCATES
+//     the key list at that point (parser.go).
+//
+// Every path that serializes then re-parses is affected — HA config sync,
+// rollback, archive, rescue — i.e. the paths an operator leans on when
+// something has already gone wrong. Demonstrated end states on the receiving
+// side include a security-zone that compiles with zero interfaces and a
+// `permit junos-http` widened to `permit any any any`.
+//
+// The replacement asks the real lexer rather than a hand-maintained character
+// table: does this text re-lex as exactly one identifier token whose value is
+// the text itself, and nothing after it? That question is answered by the same
+// code that will read the config back, so a comment syntax or lexer special
+// case added later is covered the day it lands — not the day someone
+// remembers to update a denylist here.
+//
+// The isIdentChar scan is retained as a NECESSARY pre-condition, not as the
+// decision. It keeps the change monotone (output only ever gains quotes, never
+// loses them): the lexer round-trip alone would newly emit a bracketed IPv6
+// endpoint such as `[2001:db8::1]:51820` bare, because tryBracketedEndpointLiteral
+// (#5182) hands it back as one identifier equal to itself. That is round-trip
+// safe but would churn every archived config carrying a WireGuard endpoint for
+// no benefit, and would make the emitted form depend on a narrow lexer special
+// case.
+func bareKeySafe(s string) bool {
+	if s == "" {
+		return false // "" must be emitted as the empty string literal
+	}
+	// Necessary condition: bare text can only ever be identifier bytes.
 	for i := 0; i < len(s); i++ {
 		if !isIdentChar(s[i]) {
-			return `"` + keyEscaper.Replace(s) + `"`
+			return false
 		}
 	}
-	return s
+	// Lexer authority: the bare text must yield exactly one identifier token
+	// carrying the whole value, then EOF. A comment introducer at the start
+	// fails here — either by producing no identifier at all (`//x`, `/*x*/`
+	// lex to EOF) or an error token (`/*x` is an unterminated block comment).
+	l := NewLexer(s)
+	if tok := l.Next(); tok.Type != TokenIdentifier || tok.Value != s {
+		return false
+	}
+	if l.Next().Type != TokenEOF {
+		return false
+	}
+	// Parser authority: a handful of bare identifiers carry structural meaning
+	// to the PARSER, which the lexer cannot see. `inactive:` is the only one
+	// (parser.go); quoting it makes the re-parsed token a TokenString, which
+	// parseStatement already refuses to treat as a marker (#4348).
+	return s != inactiveMarker
 }
 
 // FindChild returns the first child whose first key matches name.

@@ -2522,8 +2522,8 @@ single-block unchanged).
 
 ### Quoted-value escape round-trip contract (#3854)
 
-When a key or value contains a character that is not a bare Junos identifier
-byte (`isIdentChar` in `lexer.go` — anything outside letters/digits/`-_./:*+%=,<>`),
+When a key or value is not safe to emit bare (see the next section for the
+predicate — historically "contains a byte outside `isIdentChar`"),
 `Format`/`FormatSet` wrap it in double quotes via `quoteKey` (`ast.go`). The set
 of characters `quoteKey` escapes MUST exactly match the set the lexer's
 `readString` un-escapes on parse, or the config does not round-trip. The lexer
@@ -2544,6 +2544,74 @@ for characters the lexer does not interpret (e.g. `\t`) — that would over-esca
 and break the symmetry in the other direction. Pinned by
 `pkg/config/quotekey_roundtrip_3854_test.go` (`TestQuoteKeyLexerSymmetry3854`,
 `TestFormatParseRoundTrip3854`, `TestFormatParseIdempotent3854`).
+
+### What may be emitted BARE — the re-lex predicate (#6523)
+
+`quoteKey` decides bare-vs-quoted through `bareKeySafe` (`ast.go`). The rule is
+**not** "every byte is an `isIdentChar`". `isIdentChar` is the LEXER'S ident set
+— it admits `/`, `*` and `:` — and is not the set of texts that survive a
+serialize/re-parse cycle. Three ident-char-only texts are re-interpreted
+**structurally** on the way back in, with zero parse errors and zero warnings:
+
+| Value | What the re-read does |
+|---|---|
+| `//…` | `skipWhitespaceAndComments` consumes to end-of-line. The key **and every key after it on that line** silently vanish. |
+| `/*…*/` | Terminated block comment — swallowed silently. |
+| `/*…` | Unterminated block comment — swallows the rest of the config; `Parse` errors. |
+| `inactive:` | The parser's deactivation marker. **Leading**, it sets `Node.Inactive` on an unrelated statement; **inline**, it TRUNCATES the key list at that point. |
+
+Every path that serializes then re-parses is affected — HA config sync,
+rollback, archive, rescue — i.e. the paths an operator leans on when something
+has already gone wrong. Demonstrated end states on the receiving side: a
+`security-zone` that compiles with **zero interfaces**, a `permit junos-http`
+widened to **`permit any any any`**, and an IKE pre-shared-key that becomes the
+literal string `ascii-text` (the `//…` / `inactive:` forms eat the value and
+leave the preceding `ascii-text` key as the trailing one). Reachable from the
+plain `set` CLI (`set … description inactive:`), not only hierarchical ingest.
+Both serializers are affected: hierarchical `Format` (via `QuotedKeyPath`) and
+`| display set` (via `joinQuotedKeys`), the latter replayed through
+`ParseSetVerb`, which drives the same lexer.
+
+`bareKeySafe` therefore asks the **real lexer** instead of a hand-maintained
+character table:
+
+1. every byte is an `isIdentChar` (retained as a NECESSARY pre-condition, so the
+   change is monotone — output only ever gains quotes, never loses them; without
+   it a bracketed endpoint `[2001:db8::1]:51820` would newly go bare, since
+   `tryBracketedEndpointLiteral` (#5182) hands it back as one identifier equal to
+   itself);
+2. the bare text re-lexes as **exactly one `TokenIdentifier` whose value is the
+   text itself**, followed by `TokenEOF`;
+3. it is not a parser-level marker (`inactiveMarker`, `parser.go` — the lexer
+   cannot see this one).
+
+Because step 2 defers to the code that will actually read the config back, a
+comment syntax or lexer special case added later is covered the day it lands
+rather than the day someone remembers to update a denylist.
+
+Quoting is also what makes the parser's existing marker defence work: a quoted
+`"inactive:"` arrives as a `TokenString`, and `parseStatement` already refuses
+to treat a string token as a marker (#4348).
+
+**Do not widen this predicate for speed.** `bareKeySafe` is allocation-free
+(the `Lexer` does not escape), pinned by
+`TestQuoteKeyBareEmissionIsZeroAlloc6523`.
+
+Pinned by `pkg/config/quotekey_relex_6523_test.go`:
+`TestQuoteKeyStructuralHazards6523` (each hazard in leading/inline/trailing key
+position), `TestQuoteKeyHazardsAreQuoted6523`, `TestQuoteKeySetFormHazards6523`
+(the `| display set` path), `TestQuoteKeyZoneInterfaceHazard6523` (the
+zero-interface zone end state), `TestBareKeySafeAgreesWithRoundTrip6523`, and
+`TestQuoteKeyRelexProperty6523` — a brute-force sweep over the lexer's own
+ident alphabet (all 1- and 2-byte texts, every 2-byte prefix with tails, all
+3-byte punctuation texts, each in three key positions) that re-derives the
+hazard set instead of trusting a fixed list. The over-reach guard
+`TestQuoteKeyNoOverReach6523` asserts ordinary values (`10.0.0.0/24`,
+`ge-0/0/0`, `<*>`, `ascii-text`, `00:00:00`, `1024-65535`, and the near-misses
+`a//b`, `a/*b`, `*/`, `/x`, `inactive`, `inactive:x`) still emit **unquoted** —
+`/` is legitimate and common, so a predicate that rejected any value containing
+`/` would be wrong and would churn every archived config and HA config-sync
+diff.
 
 ### `firewall ... from flexible-match-range` — at most ONE range per term (#5823)
 

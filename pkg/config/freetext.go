@@ -46,10 +46,21 @@ import (
 // same footing (a stray open would swallow following statements as an
 // unterminated comment). The strict commit path REJECTS a comment
 // delimiter in an annotation; the lenient load/peer-sync path scrubs it
-// in place (breaking the pair with a space). Config VALUES are immune —
-// they are emitted quoted (quoteKey), and the lexer never starts a
-// comment inside a quoted string — so the comment-delimiter guard is
-// applied to annotations only.
+// in place (breaking the pair with a space). The comment-delimiter guard
+// is applied to annotations only, because config VALUES are emitted
+// quoted and the lexer never starts a comment inside a quoted string.
+//
+// #6523 corrected the second half of that reasoning. Values are NOT
+// unconditionally quoted: quoteKey emitted a value bare whenever every
+// byte satisfied isIdentChar, and isIdentChar admits `/`, `*` and `:` —
+// so a value of `//x`, `/*x*/` or `inactive:` went out unquoted and was
+// re-read as a comment or as the parser's deactivation marker on the
+// next Parse. The premise now holds because quoteKey's predicate was
+// tightened (bareKeySafe, ast.go): bare emission requires that the text
+// re-lex through the REAL lexer as exactly one identifier equal to
+// itself, and that it not be a parser-level marker. Values still need no
+// scrubbing here — the serializer quotes what is unsafe — but the reason
+// is the re-lex predicate, not "all values are quoted".
 
 // hasControlChars reports whether s contains any ASCII control
 // character: the full C0 set (0x00–0x1F, which includes \n, \r and \t)
