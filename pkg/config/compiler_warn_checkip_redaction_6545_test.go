@@ -33,6 +33,12 @@ func TestCheckIPURLWarningRedactsCredential(t *testing.T) {
 		{"key lands in the port (missing @)", "http://user:" + checkIPWarnCredential + ".example/"},
 		// Credential inside a malformed IP-literal host.
 		{"key in an IP-literal host", "http://user:pass@[" + checkIPWarnCredential + "]/"},
+		// PARSE-SUCCESS shapes that RedactURL returns UNCHANGED: a
+		// scheme-relative authority (no "://" for its scan to anchor on) and a
+		// fragment (never redacted). Only omitting the URL closes these.
+		{"scheme-relative authority (parses)", "//user:" + checkIPWarnCredential + "@checkip.example/"},
+		{"key in the fragment (parses)", "ftp://checkip.example/#apikey=" + checkIPWarnCredential},
+		{"key in the fragment, no host (parses)", "http:///path#" + checkIPWarnCredential},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tree := buildTree(t, []string{

@@ -66,6 +66,17 @@ func TestCheckIPProbeWarnRedactsCredential(t *testing.T) {
 			"http://user:pass@[" + checkIPWarnSentinel + "]/"},
 		{"unparseable, key after a bad percent-escape",
 			"http://user:%" + checkIPWarnSentinel + "@checkip.example/"},
+		// PARSE-SUCCESS shapes. config.RedactURL returns each of these
+		// UNCHANGED — a scheme-relative authority has no "://" for its scan to
+		// anchor on, and a fragment is never redacted — so these leak through
+		// any "redact once it parsed" rule and are caught only by omitting the
+		// URL from the scheme/host refusals too.
+		{"scheme-relative authority, key in userinfo (parses)",
+			"//user:" + checkIPWarnSentinel + "@checkip.example/"},
+		{"key in the fragment, bad scheme (parses)",
+			"ftp://checkip.example/#apikey=" + checkIPWarnSentinel},
+		{"key in the fragment, no host (parses)",
+			"http:///path#" + checkIPWarnSentinel},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			buf := captureRenderedWarnings(t)

@@ -203,18 +203,30 @@ distinct surfaces had to be closed, and the split between them is structural:
   without `%w` yields `*errors.errorString`, the same type as the safe
   `errors.New` causes. `urlParseCause` therefore uses an exact-match allowlist
   of the fixed sentences plus class detection for the four input-bearing shapes,
-  and **every return path is a compile-time constant** — that invariant, not the
-  enumeration, is the safety property, and an unrecognised cause fails CLOSED to
-  `malformed URL`. `TestURLParseCauseAlwaysReturnsAConstant` pins it.
-- **The URL display itself.** `config.RedactURL` is only sound on a string that
-  actually parsed. Its scan is authority-bounded and finds userinfo via `@`, so
-  the commonest credentialed typo — omitting the `@`, as in
-  `https://user:s3cr3t.example/` — passes through it **completely unredacted**.
-  So the parse-failure branch prints no part of the input at all; the provider
-  name (a separate log attribute, and named by the commit warning) carries the
-  diagnosis. Once `url.Parse` has SUCCEEDED, `RedactURL` is sound: the authority
-  is well-formed, userinfo is `@`-delimited, and `net/url` rejects a non-numeric
-  port, so nothing can hide in `host:port`.
+  and **every return names one of the `cause*` constants** — that invariant, not
+  the enumeration, is the safety property, and an unrecognised cause fails CLOSED
+  to `malformed URL`. `TestURLParseCauseAlwaysReturnsAConstant` pins it, and is
+  MUTATION-VERIFIED: it derives its allowed set independently (a literal list in
+  the test file, never ranged over a production variable) and feeds synthetic
+  `*url.Error` values whose inner cause is not any recognised `net/url` message,
+  so a pass-through surfaces the sentinel. Making the fallback, the class
+  branches, or the allowlist branches return the input-derived string each turns
+  it RED.
+- **The URL display itself.** No refusal prints ANY part of the URL, from any
+  branch. Redacting instead of omitting is not enough, because `config.RedactURL`
+  is a best-effort string scrubber rather than a parser and has at least three
+  holes a refusal walks into: a **missing `@`** defeats its userinfo scan
+  entirely (`https://user:s3cr3t.example/` comes back unchanged); a
+  **scheme-relative authority** (`//user:SECRET@host/`) has no `://` for the scan
+  to anchor on, so it takes the authority to be empty and never finds the
+  userinfo; and a **fragment** is never redacted at all
+  (`ftp://host/#apikey=SECRET`). The last two **parse cleanly**, so a
+  "redact only once `url.Parse` succeeded" gate does not help — that gate was an
+  earlier iteration of this fix and it was wrong. Omitting costs nothing: the
+  daemon carries `provider` as its own log attribute, the commit warning names
+  the provider and leaf, and the operator is looking at the value they typed.
+  (The general `RedactURL` weakness is tracked as #6609; this validator
+  deliberately does not depend on it either way.)
 
 `scrubURLError` is not reusable in any of this because it recovers a safe URL by
 RE-PARSING, and this is precisely the URL that does not parse. The commit-time

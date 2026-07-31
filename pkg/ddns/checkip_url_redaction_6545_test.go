@@ -3,8 +3,10 @@ package ddns
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -46,11 +48,33 @@ var malformedCredentialedURLs = []struct {
 	{
 		name: "bad scheme, credential in query",
 		url:  "ftp://checkip.example/?apikey=" + checkIPCredential,
-		want: "checkip.example",
+		want: "must be http(s)",
 	},
 	{
 		name: "no host, credential in query",
 		url:  "http://?apikey=" + checkIPCredential,
+		want: "has no host",
+	},
+	// PARSE-SUCCESS leaks. These are the shapes that disprove any
+	// "redact once url.Parse has succeeded" rule: all three parse cleanly, and
+	// config.RedactURL returns each of them UNCHANGED.
+	{
+		name: "scheme-relative authority, credential in userinfo (parses)",
+		// No "://", so RedactURL's scan starts at index 0, meets the leading
+		// '/' immediately and takes the authority to be empty — the userinfo is
+		// never found. url.Parse, by contrast, populates User just fine.
+		url:  "//user:" + checkIPCredential + "@checkip.example/",
+		want: "must be http(s)",
+	},
+	{
+		name: "credential in the fragment, bad scheme (parses)",
+		// RedactURL only ever drops the query; a fragment is never touched.
+		url:  "ftp://checkip.example/#apikey=" + checkIPCredential,
+		want: "must be http(s)",
+	},
+	{
+		name: "credential in the fragment, no host (parses)",
+		url:  "http:///path#" + checkIPCredential,
 		want: "has no host",
 	},
 	{
@@ -64,7 +88,7 @@ var malformedCredentialedURLs = []struct {
 	{
 		name: "bad scheme, credential in userinfo",
 		url:  "ftp://user:" + checkIPCredential + "@checkip.example/",
-		want: "checkip.example",
+		want: "must be http(s)",
 	},
 	{
 		name: "unparseable, credential in userinfo",
@@ -104,34 +128,52 @@ var malformedCredentialedURLs = []struct {
 	},
 }
 
-// TestValidateCheckIPURLOmitsUnparseableURL pins the structural rule the cases
-// above rely on: when url.Parse FAILS there is no authority to bound and no
-// structure to trust, so NO part of the input may appear in the message —
-// RedactURL is only sound on a string that actually parsed. Asserting on a
-// benign, highly legible host keeps this independent of any credential
-// sentinel: if the host survives, so would a password in the same position.
-func TestValidateCheckIPURLOmitsUnparseableURL(t *testing.T) {
+// TestValidateCheckIPURLOmitsTheURLInEveryBranch pins the structural rule all of
+// the above rests on: NO refusal, from ANY branch, may echo ANY part of the
+// input. Not the parse-failure branch, and not the scheme/host branches either —
+// the earlier "RedactURL is sound once url.Parse succeeded" carve-out was FALSE,
+// because scheme-relative and fragment-bearing URLs parse cleanly and RedactURL
+// returns them unchanged.
+//
+// Asserting on a benign, highly legible host rather than a credential sentinel
+// is deliberate: it makes the test independent of where a secret happens to sit.
+// If the host survives into the message, so would a password in the same
+// position — which is precisely how the scheme-relative hole was missed.
+func TestValidateCheckIPURLOmitsTheURLInEveryBranch(t *testing.T) {
 	const host = "checkip.example"
-	// Parse-FAILING inputs whose host is plainly legible in the raw string.
-	for _, bad := range []string{
-		"http://user:pw." + host + ":notaport/",
-		"http://" + host + ":notaport/",
-		"http://[" + host + "]/",
-		"http://%zz@" + host + "/",
-	} {
-		if _, perr := url.Parse(bad); perr == nil {
-			t.Fatalf("%q parses cleanly; this case cannot exercise the parse-failure "+
-				"branch and the assertion below would be vacuous", bad)
+	cases := []struct {
+		url        string
+		wantParses bool // documents which branch this exercises
+	}{
+		// Parse FAILURES.
+		{"http://user:pw." + host + ":notaport/", false},
+		{"http://" + host + ":notaport/", false},
+		{"http://[" + host + "]/", false},
+		{"http://%zz@" + host + "/", false},
+		// Parse SUCCESSES that must still be refused (bad scheme / no host).
+		{"ftp://" + host + "/", true},
+		{"//user:pw@" + host + "/", true},
+		{"ftp://" + host + "/#tag-" + host, true},
+		{"http:///path#" + host, true},
+		{"ftp://" + host + "/?q=" + host, true},
+	}
+	for _, tc := range cases {
+		_, perr := url.Parse(tc.url)
+		if (perr == nil) != tc.wantParses {
+			t.Fatalf("%q: url.Parse parses=%v, case declares parses=%v; the case no longer "+
+				"exercises the branch it was written for", tc.url, perr == nil, tc.wantParses)
 		}
-		err := validateCheckIPURL(bad)
+		err := validateCheckIPURL(tc.url)
 		if err == nil {
-			t.Fatalf("validateCheckIPURL(%q) = nil, want a refusal", bad)
+			t.Fatalf("validateCheckIPURL(%q) = nil, want a refusal; the assertion below "+
+				"would be vacuous", tc.url)
 		}
 		if strings.Contains(err.Error(), host) {
-			t.Errorf("validateCheckIPURL(%q) = %q: the parse-failure branch echoed part of "+
-				"an unparseable input. RedactURL cannot be trusted here — it is "+
-				"authority-bounded and keys on '@', so a missing-'@' credential typo passes "+
-				"through it verbatim. Omit the URL entirely on a parse failure.", bad, err)
+			t.Errorf("validateCheckIPURL(%q) = %q: the refusal echoed part of the input "+
+				"(parses=%v). config.RedactURL is a best-effort scrubber, not a parser — it "+
+				"misses a missing-'@' credential, a scheme-relative authority, and anything "+
+				"in a fragment — so no branch may print the URL at all.",
+				tc.url, err, tc.wantParses)
 		}
 	}
 }
@@ -197,30 +239,63 @@ func TestCheckIPMalformedURLErrorRedactsCredentials(t *testing.T) {
 	}
 }
 
-// TestURLParseCauseAlwaysReturnsAConstant is the structural gate under the
-// case table above: urlParseCause must return one of a CLOSED set of
-// compile-time literals, whatever it is handed. That property — not the
-// particular net/url causes enumerated today — is what makes the helper safe to
-// reuse (the other DDNS URL validators inherit it, #6606), and it is what a
-// stdlib rewording or a brand-new cause must not be able to break: an
-// unrecognized cause has to fail CLOSED to "malformed URL", never pass through.
+// urlParseCauseAllowed is the closed set of reasons urlParseCause may return,
+// declared HERE as literals and deliberately NOT derived from anything in the
+// production file.
 //
-// The corpus plants the sentinel in every position that can end up inside a
-// parse failure, including the ones RedactURL cannot reach.
+// The previous version of this gate built its allowed set by ranging over the
+// production slice, which made it circular: whatever the function returned from
+// that slice was admissible by definition, and a mutation swapping the returned
+// constant for the input-derived string still passed. Copying the values by hand
+// is the point — if production adds a reason, this list must be edited too, and
+// that edit is exactly the review moment the gate exists to create.
+var urlParseCauseAllowed = map[string]bool{
+	"malformed URL":                                  true,
+	"missing protocol scheme":                        true,
+	"invalid control character in URL":               true,
+	"empty url":                                      true,
+	"invalid URI for request":                        true,
+	"first path segment in URL cannot contain colon": true,
+	"invalid userinfo":                               true,
+	"invalid IP-literal":                             true,
+	"missing ']' in host":                            true,
+	"invalid port after host":                        true,
+	"invalid host":                                   true,
+	"invalid percent-escape":                         true,
+	"invalid character in host":                      true,
+}
+
+// TestURLParseCauseAlwaysReturnsAConstant is the structural gate: urlParseCause
+// must return one of a CLOSED set of literals, whatever it is handed. That
+// property — not the particular net/url causes enumerated today — is what makes
+// the helper safe to reuse (the other DDNS URL validators inherit it, #6606),
+// and it is what a stdlib rewording or a brand-new cause must not be able to
+// break: an unrecognized cause has to fail CLOSED, never pass through.
+//
+// MUTATION-VERIFIED. The gate is only meaningful if it can fail for the reason
+// it exists, so it is built to detect a pass-through directly: alongside real
+// url.Parse errors it feeds SYNTHETIC *url.Error values whose inner cause is a
+// hostile string that is NOT any recognised net/url message. Any implementation
+// that returns its input — including one that returns the compared string rather
+// than the matched constant — surfaces that sentinel and fails here. Changing
+// production's fallback to return the raw cause makes this test RED.
 func TestURLParseCauseAlwaysReturnsAConstant(t *testing.T) {
-	allowed := map[string]bool{
-		causeMalformedURL: true,
-		causeInvalidPort:  true,
-		causeInvalidHost:  true,
-		causeBadEscape:    true,
-		causeBadHostChar:  true,
-	}
-	for _, c := range urlParseSafeCauses {
-		allowed[c] = true
+	check := func(t *testing.T, label string, err error) {
+		t.Helper()
+		got := urlParseCause(err)
+		if !urlParseCauseAllowed[got] {
+			t.Errorf("urlParseCause for %s returned %q, which is NOT one of the reasons "+
+				"declared in this test file; the helper must never return a string derived "+
+				"from its input", label, got)
+		}
+		if strings.Contains(got, checkIPCredential) {
+			t.Errorf("urlParseCause leaked the credential for %s: %q", label, got)
+		}
 	}
 
-	corpus := []string{
-		// Sentinel inside the malformed token.
+	// (a) Real url.Parse failures, sentinel planted in every position that can
+	// end up inside one.
+	for _, in := range []string{
 		"http://user:" + checkIPCredential + ".example/",
 		"http://checkip.example:" + checkIPCredential + "/",
 		"http://user:pass@[" + checkIPCredential + "]/",
@@ -230,32 +305,60 @@ func TestURLParseCauseAlwaysReturnsAConstant(t *testing.T) {
 		"http://h\x7f" + checkIPCredential + "/",
 		"http://[::1/?apikey=" + checkIPCredential,
 		"http://user:" + checkIPCredential + "@[::1/",
-		// Sentinel elsewhere, still a parse failure.
 		"ht tp://x/?apikey=" + checkIPCredential,
 		"://nohost/?apikey=" + checkIPCredential,
-		// Degenerate inputs.
 		"", "%", ":", "//", "http://[", string([]byte{0x00}),
-	}
-	for _, in := range corpus {
-		_, err := url.Parse(in)
-		if err == nil {
-			continue // parses fine; urlParseCause is never consulted
-		}
-		got := urlParseCause(err)
-		if !allowed[got] {
-			t.Errorf("urlParseCause for input %q returned %q, which is NOT one of the "+
-				"declared constants; the helper must never return a string derived from "+
-				"its input", in, got)
-		}
-		if strings.Contains(got, checkIPCredential) {
-			t.Errorf("urlParseCause leaked the credential for input %q: %q", in, got)
+	} {
+		if _, err := url.Parse(in); err != nil {
+			check(t, "input "+strconv.Quote(in), err)
 		}
 	}
 
-	// A non-*url.Error must fail closed rather than render its own text.
+	// (b) SYNTHETIC causes. These are what make the gate non-circular: none of
+	// them is a recognised net/url message, so a correct implementation must
+	// funnel every one to the generic reason, while ANY pass-through returns the
+	// sentinel and fails. They also model the realistic future in which the
+	// stdlib rewords a message or adds a new one.
+	for _, tc := range []struct {
+		label string
+		inner error
+	}{
+		{"unknown stdlib message", errors.New("brand new net/url message " + checkIPCredential)},
+		{"reworded invalid-port", errors.New("bad port \"" + checkIPCredential + "\" after the host")},
+		{"escape error", url.EscapeError("%" + checkIPCredential[:2])},
+		{"invalid host char", url.InvalidHostError(checkIPCredential[:1])},
+		{"wrapped host error", fmt.Errorf("invalid host: %w",
+			errors.New("ParseAddr(\""+checkIPCredential+"\"): unable to parse IP"))},
+		{"raw sentinel", errors.New(checkIPCredential)},
+		{"empty inner", errors.New("")},
+	} {
+		check(t, tc.label, &url.Error{Op: "parse", URL: "http://" + checkIPCredential + "/", Err: tc.inner})
+	}
+
+	// (c) The recognised fixed sentences must still map to a declared reason —
+	// so the allowlist half is exercised, not just the fallback.
+	for _, fixed := range []string{
+		"missing protocol scheme",
+		"net/url: invalid control character in URL",
+		"empty url",
+		"invalid URI for request",
+		"first path segment in URL cannot contain colon",
+		"net/url: invalid userinfo",
+		"invalid IP-literal",
+		"missing ']' in host",
+	} {
+		check(t, "fixed sentence "+strconv.Quote(fixed),
+			&url.Error{Op: "parse", URL: "http://" + checkIPCredential + "/", Err: errors.New(fixed)})
+	}
+
+	// (d) A non-*url.Error must fail closed rather than render its own text.
 	if got := urlParseCause(errors.New("boom " + checkIPCredential)); got != causeMalformedURL {
 		t.Errorf("urlParseCause(non-url.Error) = %q, want %q; an unaudited error must fail "+
 			"closed to the fixed reason, not be passed through", got, causeMalformedURL)
+	}
+	// (e) A *url.Error with a nil inner cause must not panic or pass through.
+	if got := urlParseCause(&url.Error{Op: "parse", URL: "http://" + checkIPCredential + "/"}); got != causeMalformedURL {
+		t.Errorf("urlParseCause(nil inner) = %q, want %q", got, causeMalformedURL)
 	}
 }
 

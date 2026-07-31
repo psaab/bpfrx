@@ -62377,3 +62377,59 @@ break — `go vet` confirmed passing under every revert.
     pkg/config/{compiler_validate_warn_ddns.go,
     compiler_warn_checkip_redaction_6545_test.go},
     pkg/daemon/daemon_ddns_checkip_warn_redaction_6545_test.go, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6545 review fold round 3 (Codex re-gate, MAJOR) — round 2's
+  parse-first split rested on a FALSE premise and its invariant test was
+  circular. Both confirmed firsthand before folding.
+  (1) FALSE PREMISE. Round 2 claimed config.RedactURL is "provably sound once
+  url.Parse has SUCCEEDED". It is not. RedactURL is a best-effort string
+  scrubber, not a parser, and two PARSE-SUCCESS shapes defeat it: a
+  scheme-relative authority ("//user:SECRET@checkip.example/") parses with
+  populated userinfo, but with no "://" the scan starts at index 0, hits the
+  leading '/' immediately, takes the authority to be empty and never finds the
+  userinfo — returned UNCHANGED; and a FRAGMENT is never redacted at all, so
+  "ftp://checkip.example/#apikey=SECRET" and "http:///path#SECRET" both parse
+  and both keep the secret. Verified with a direct probe against a verbatim
+  mirror of RedactURL. Both reached the scheme/host refusals, hence the log
+  attribute AND the process-lifetime dedup key, and the commit warning too.
+  (2) INVARIANT NOT IMPLEMENTED. The "every return path is a compile-time
+  constant" claim was asserted in a comment while the code declared a MUTABLE
+  []string and returned a range variable over it.
+  (3) CIRCULAR TEST. TestURLParseCauseAlwaysReturnsAConstant built its allowed
+  set by ranging over that same production slice, so whatever the function
+  returned from it was admissible by definition; it also skipped every
+  parse-SUCCESS input. Codex proved the circularity by mutation — swapping the
+  returned constant for the input-derived string still PASSED.
+  **Fix**: (a) NO refusal in validateCheckIPURL prints any part of the URL now —
+  parse-failure, bad-scheme and no-host branches alike; the config commit
+  warning does the same, and the parse-split it grew in round 2 is gone (one
+  message again). RedactURL is no longer called from either validator, so
+  neither depends on #6609 being fixed. The provider name (its own log
+  attribute, and named by the warning) keeps every refusal attributable.
+  (b) urlParseCause is now a switch over the fixed sentences where EVERY return
+  names one of thirteen declared cause* CONSTANTS — the claim is implemented in
+  the language rather than asserted in prose. (c) The invariant test derives its
+  allowed set from a literal list IN THE TEST FILE, never from production, and
+  additionally feeds SYNTHETIC *url.Error values whose inner cause is not any
+  recognised net/url message, so any pass-through surfaces the sentinel.
+  **Validation**: the rebuilt gate is MUTATION-VERIFIED three ways, each run in
+  a throwaway worktree with go vet clean so the red is an assertion:
+  M1 fallback returns the input-derived cause -> FAIL naming the sentinel (this
+  is the exact mutation that PASSED against the old circular test); M2 the four
+  class branches pass through -> FAIL in both the invariant test and the
+  validator test; M3 Codex's original mutation, allowlist branches return the
+  compared string -> FAIL, detected because two constants deliberately differ
+  from the stdlib text (the "net/url: " prefix is stripped). Parse-SUCCESS
+  sentinels (scheme-relative userinfo, fragment with bad scheme, fragment with
+  no host) added to the package test, the rendered-daemon test and the
+  commit-warning test. TestValidateCheckIPURLOmitsTheURLInEveryBranch asserts on
+  a benign legible host across BOTH parse-failure and parse-success inputs and
+  declares per case which branch it exercises, failing loudly if a case stops
+  exercising it. gofmt -l clean on every touched file; go build ./..., go vet on
+  the three packages, and the FULL go test ./... suite green (59 packages ok,
+  exit 0). No cluster smoke: control-plane logging hygiene only.
+- **File(s)**: pkg/ddns/{checkip.go,checkip_url_redaction_6545_test.go,README.md},
+    pkg/config/{compiler_validate_warn_ddns.go,
+    compiler_warn_checkip_redaction_6545_test.go},
+    pkg/daemon/daemon_ddns_checkip_warn_redaction_6545_test.go, _Log.md
