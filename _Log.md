@@ -61494,3 +61494,30 @@ top.
     userspace-dp/src/afxdp/poll_descriptor/mod.rs,
     userspace-dp/src/afxdp/tests_fabric_zone_stamp.rs,
     docs/fabric-cross-chassis-fwd.md, _Log.md
+
+## 2026-07-31 — bind the #6467 cross-family next-table cap invariant
+
+- **Timestamp**: 2026-07-31
+- **Action**: Add the missing test binding for the SHARED (v4+v6) next-table
+  rule window. Test-only; no production change.
+- **File(s)**: `pkg/dataplane/userspace/routes_6467_crossfamily_test.go` (new)
+
+The kernel applier advances ONE priority counter across v4 then v6, so the
+100-entry window is shared. `buildRouteSnapshots` mirrors that by declaring
+`nextTableLeakCount` outside the `addRoutes` closure — but every #6467 fixture
+was v4-only, so the shared-ness was never asserted. Verified by mutation:
+moving the counter into the closure leaves all four shipped #6467 tests GREEN
+while a 60 v4 + 60 v6 config publishes 120 FIB leaks against the kernel's 100.
+The new test asserts the per-family SPLIT (60 inet + 40 inet6), not merely a
+total of 100 — a total-only assertion also passes for a 50/50 split the kernel
+would never produce.
+
+- **Timestamp**: 2026-07-31 03:12
+  - **Action**: Fold hostile-review findings into the #6467 cross-family cap test —
+    corrected two inaccurate provenance comments (the v4-before-v6 ORDER is set by
+    the caller in pkg/daemon/daemon_apply_routing.go, not by a family loop in
+    pkg/routing Apply, which has none), added a straddle precondition so the
+    fixture cannot silently lose its mutation sensitivity if NextTableRuleWindow
+    is retuned, and replaced test 2's false subsumption claim with an honest
+    accounting.
+  - **File(s)**: pkg/dataplane/userspace/routes_6467_crossfamily_test.go
