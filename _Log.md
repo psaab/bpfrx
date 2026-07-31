@@ -61645,7 +61645,9 @@ would never produce.
   ident set (it admits `/`, `*`, `:`) and not the set of texts that
   survive a serialize/re-parse cycle. A key of `//x`, `/*x*/`, `/*x` or
   `inactive:` went out unquoted and was re-read as a comment or as the
-  parser's deactivation marker, with zero parse errors — silently
+  parser's deactivation marker. Two of the three classes are entirely
+  silent (`//x`, `/*x*/`, `inactive:`); the unterminated `/*x` returns a
+  TokenError, so it corrupts loudly rather than quietly — silently
   emptying a security-zone or widening a policy on HA config sync,
   rollback, archive and rescue. Replaced the predicate with
   `bareKeySafe`: all-identChars (retained so the change is monotone —
@@ -61677,7 +61679,9 @@ would never produce.
   full alphabet and no 5-byte punctuation sweep.
   Fail-on-revert audit (bareKeySafe reverted to the all-identChars scan
   via edit; `go vet` clean on the reverted tree, so every RED below is
-  an ASSERTION, not a build break). 9 BINDERS go RED:
+  an ASSERTION, not a build break). 10 BINDERS go RED — the 9 original
+  binders plus TestParserMarkerVocabulary6523, the anti-rot binder added
+  in the fold:
   TestQuoteKeyStructuralHazards6523 (24/24 subtests),
   TestQuoteKeyHazardsAreQuoted6523 (8/8),
   TestQuoteKeyZoneInterfaceHazard6523 (4/4),
@@ -61695,7 +61699,9 @@ would never produce.
   which claimed a round-trip it never performed), and
   TestQuoteKeyLexerSymmetry3854 (3/4 new values, same reason).
   TestParserMarkerVocabulary6523 binds on its registered-marker leg
-  (`inactive:` RED on revert) and guards on the other 17.
+  (`inactive:` RED on revert) and guards on the other 18 — the
+  vocabulary carries 19 candidates: `inactive:` goes RED, the other 18
+  stay green.
   2 tests are GUARDS and correctly stay GREEN under revert:
   TestQuoteKeyNoOverReach6523 (over-reach — it must stay green, since
   the pre-fix predicate also emitted those bare; it catches the
@@ -61718,3 +61724,17 @@ would never produce.
     pkg/config/freetext.go, pkg/config/quotekey_relex_6523_test.go,
     pkg/config/quotekey_roundtrip_3854_test.go,
     docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-31 04:12
+  - **Action**: Fold the Codex re-gate MINORs on #6523 — corrected the RED
+    accounting (10 binders, not 9: the new anti-rot binder counts; and the
+    marker vocabulary guards 18 candidates, not 17), removed the residual
+    "zero parse errors" contradiction from all four sites that still grouped
+    the unterminated `/*x` with the silent classes, corrected the freetext.go
+    sentence that still said values "are emitted quoted" (most are bare — it is
+    specifically the unsafe ones that get quoted), and recorded the LIMIT of
+    the parserMarkers registry: parseStatement and ast_format.go still compare
+    inactiveMarker directly, so it is a contract, not mechanically-enforced
+    single-source recognition.
+  - **File(s)**: pkg/config/ast.go, pkg/config/parser.go, pkg/config/freetext.go,
+    pkg/config/quotekey_relex_6523_test.go, docs/config-schema.md

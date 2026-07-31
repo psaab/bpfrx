@@ -2550,8 +2550,11 @@ and break the symmetry in the other direction. Pinned by
 `quoteKey` decides bare-vs-quoted through `bareKeySafe` (`ast.go`). The rule is
 **not** "every byte is an `isIdentChar`". `isIdentChar` is the LEXER'S ident set
 — it admits `/`, `*` and `:` — and is not the set of texts that survive a
-serialize/re-parse cycle. Three ident-char-only texts are re-interpreted
-**structurally** on the way back in, with zero parse errors and zero warnings:
+serialize/re-parse cycle. Three ident-char-only **classes** are re-interpreted
+**structurally** on the way back in. Two of them are entirely silent — zero
+parse errors, zero warnings. The unterminated block comment is the exception:
+it returns a `TokenError`, so it corrupts loudly, which makes it the least
+dangerous of the three (the table's last row states this):
 
 | Value | What the re-read does |
 |---|---|

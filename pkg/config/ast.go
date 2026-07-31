@@ -102,8 +102,10 @@ func quoteKey(s string) string {
 // The predicate this replaced was "every byte satisfies isIdentChar". That is
 // the LEXER'S IDENT-CHAR SET, which is not the same thing as the set of texts
 // that survive a serialize/re-parse cycle: isIdentChar admits `/`, `*` and
-// `:`, and three ident-char-only texts are re-interpreted STRUCTURALLY on the
-// way back in (#6523) — with no parse error and no warning:
+// `:`, and three ident-char-only CLASSES are re-interpreted STRUCTURALLY on
+// the way back in (#6523). Two of the three are SILENT — no parse error, no
+// warning; the unterminated block comment is the exception and does surface a
+// TokenError, which is why it is the least dangerous of the set:
 //
 //   - a key starting `//` — skipWhitespaceAndComments consumes it to
 //     end-of-line, so the key AND every key after it on that line silently

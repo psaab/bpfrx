@@ -114,9 +114,13 @@ func ValidateAnnotationText(annotation string) error {
 // hasCommentDelim reports whether s contains a block-comment delimiter
 // (`*/` or `/*`). Annotations are emitted verbatim between `/* */`, so
 // either sequence lets annotation text escape the comment on the next
-// Format→Parse round-trip (#3900). Values never need this check — they
-// are emitted quoted and the lexer does not start comments inside a
-// quoted string — so the guard is used on annotations only.
+// Format→Parse round-trip (#3900). Values never need this check — a value
+// carrying a comment delimiter is emitted QUOTED by quoteKey/bareKeySafe
+// (#6523), and the lexer does not start a comment inside a quoted string, so
+// the delimiter cannot escape. Most values are still emitted BARE; it is
+// specifically the unsafe ones that get quoted. The guard is therefore used on
+// annotations only, which are emitted verbatim between `/* */` and so have no
+// equivalent protection.
 func hasCommentDelim(s string) bool {
 	for i := 0; i+1 < len(s); i++ {
 		if s[i] == '*' && s[i+1] == '/' {

@@ -290,6 +290,15 @@ const inactiveMarker = "inactive:"
 // candidate is listed here and gets quoted, OR that the parser still treats it
 // as an ordinary key. A parser change that promotes one of those words without
 // updating this slice fails the second leg.
+//
+// LIMIT OF ENFORCEMENT — this is a CONTRACT, not mechanical single-source
+// recognition. parseStatement still compares inactiveMarker directly (see the
+// two comparisons below), and ast_format.go emits it directly, so the slice is
+// not the only place the marker is known; it is the place bareKeySafe consults.
+// The vocabulary test therefore only catches a promotion of a word it already
+// enumerates. A marker OUTSIDE that candidate list — an unforeseen word — still
+// depends on whoever adds it honouring this contract. Widening the candidate
+// vocabulary is the cheap way to widen the net.
 var parserMarkers = []string{inactiveMarker}
 
 // parseStatement parses one statement: keys followed by ; or { block }.

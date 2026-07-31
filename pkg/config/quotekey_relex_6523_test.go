@@ -5,8 +5,10 @@ package config
 // quoteKey used to emit a key bare whenever every byte satisfied isIdentChar.
 // isIdentChar is the LEXER'S ident set — it admits `/`, `*` and `:` — and is
 // not the set of texts that survive a serialize/re-parse cycle. Three
-// ident-char-only texts are re-interpreted STRUCTURALLY on the way back in,
-// with no parse error and no warning:
+// ident-char-only CLASSES are re-interpreted STRUCTURALLY on the way back in.
+// Two are SILENT — no parse error, no warning. The unterminated block comment
+// is the exception: it returns a TokenError, so it corrupts loudly rather than
+// quietly, which makes it the least dangerous of the three:
 //
 //	//x        line comment  -> the key and everything after it on that line
 //	                            silently VANISH
