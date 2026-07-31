@@ -66,7 +66,8 @@ func permitPolicy(name string, matches ...string) *config.Policy {
 }
 
 // applyMatches is a tiny DSL: "src:bad-host", "srcx:bad-net" (excluded),
-// "app:junos-ssh", "app:any".
+// "dst:wan-ip", "dstx:wan-ip" (destination-address-excluded), "app:junos-ssh",
+// "app:any".
 func applyMatches(m *config.PolicyMatch, matches ...string) {
 	for _, spec := range matches {
 		kind, val, _ := strings.Cut(spec, ":")
@@ -76,6 +77,11 @@ func applyMatches(m *config.PolicyMatch, matches ...string) {
 		case "srcx":
 			m.SourceAddresses = append(m.SourceAddresses, val)
 			m.SourceAddressExcluded = true
+		case "dst":
+			m.DestinationAddresses = append(m.DestinationAddresses, val)
+		case "dstx":
+			m.DestinationAddresses = append(m.DestinationAddresses, val)
+			m.DestinationAddressExcluded = true
 		case "app":
 			m.Applications = append(m.Applications, val)
 		}
@@ -144,8 +150,12 @@ func TestJunosHostDenyRendersDropScopedByIifname(t *testing.T) {
 	if !strings.Contains(payload, "counter "+cn+" {") {
 		t.Fatalf("payload missing junos-host counter declaration for %q:\n%s", cn, payload)
 	}
-	// A junos-host DROP must never be scoped by destination address (daddr
-	// under-/over-denies across zones — plan §3.2).
+	// The ZONE scope is `iifname`, never `daddr` (a daddr-only zone scope both
+	// under- and over-denies across zones — plan §3.2). This policy matches
+	// `destination-address any`, so no daddr predicate may appear at all. (An
+	// EXPLICIT `match destination-address` does render a narrowing daddr — see
+	// host_inbound_junos_host_dst_4146_test.go — but it is always ON TOP of the
+	// iifname scope, never a replacement for it.)
 	sec := junosHostSection(payload)
 	for _, l := range sec {
 		if strings.Contains(l, "daddr") {
