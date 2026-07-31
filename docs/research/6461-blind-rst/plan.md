@@ -1,19 +1,12 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.16.0 — THE TERMINAL CUT, round-99 folds (the
-parity claim is scoped exactly: the purge DECISION and dispatch are
-master-identical; the ONE deliberate delta is the demote gate's
-refusal of the closing-mark on anchorless peer-synced entries, whose
-replica-lifetime cost is the documented absorbing-state residual;
-`OverdueSkipped` gains its transport (a `ResolvedFlowSessionDecision`
-field), its ExistingResolved composition for cold dispositions, and
-its full five-consumer set with accounting explicitly allowed; the
-probation reap/adopt invalidates the FULL alias set (canonical,
-reverse companion, reverse-translated, forward-wire, reply-match
-tuples) with S1's aliases invalidated at adopt time; the conceded
-chain's rationale is corrected (constructor-side state creation; the
-closing-flag variant stated); saturating arithmetic throughout).
-Ship
+**Status: DRAFT v10.17.0 — THE TERMINAL CUT, round-100 folds
+(`OverdueSkipped` gains its field definition, poller carriage, and
+teardown-site guards; the invalidation lifecycle is specified —
+immediate current-binding plus sibling fan-out at EVERY site-2c state
+transition; the remaining cache-suppression/clean-miss stragglers and
+parity overclaims are corrected; the refused-close inertness is scoped
+to mark/refresh/re-queue effects). Ship
 candidate = the Part-A dataplane demote gate plus the wire-free local HA
 rules. The RG-incarnation/retirement/fence-ledger protocol that rounds
 13–82 grew is KILLED (not deferred): its two customers are re-scoped —
@@ -701,9 +694,13 @@ request-build stage:
   resolve-time transient purge fires, master's own machinery keeps the
   packet in the HIT branch on the retained lookup
   (`session_glue/mod.rs:1194-1196` — `resolved = hit.lookup.clone()`),
-  and this plan keeps that dispatch master-split with NO delta at all
-  (v10.15.0 — the close-retained marker and its cache suppression are
-  retracted, round-98 Codex 1-3; byte-parity):
+  and this plan keeps that dispatch master-split with no DISPATCH
+  delta (v10.15.0 — the close-retained marker and its cache
+  suppression are retracted, round-98 Codex 1-3; the ONE deliberate
+  remaining delta is the demote gate's refusal of the closing-mark on
+  anchorless peer-synced entries upstream of the purge, with the
+  replica-lifetime cost documented below — round-99 Codex 2 /
+  round-100 Codex 5):
   with a WARM next
   hop the packet forwards on the retained decision with no install;
   with a COLD next hop it takes master's own MissingNeighbor seed
@@ -1406,7 +1403,26 @@ an S1→S2 adoption can change NAT/orientation while `ExpiredSession`
 carries only the final S2 identity (`entry.rs:337-343`), EVERY
 adoption additionally invalidates the PRIOR identity's full alias set
 AT ADOPT TIME (the adopt has both identities in hand) — a cached S1
-alias can never survive its own adoption. NO Close delta (as
+alias can never survive its own adoption. The invalidation lifecycle
+(v10.17.0, round-100 Codex 4): caches are per-binding and exact-key
+(`flow_cache.rs:203-218`, `:1105-1120`), descriptor processing owns
+only the current binding and processes a whole RX batch
+(`poll_descriptor/mod.rs:110-131`), and the existing reap path
+iterates ALL bindings (`worker/loop_body/mod.rs:1467-1520`) — so
+every site-2c state transition (initial probation construction, an
+S1→S2 adoption, AND any successful site-2c replacement of a
+non-probation peer-synced predecessor — the upsert guard protects
+only locally-owned rows, `install.rs:310-322`) invalidates the PRIOR
+identity's full alias set in the CURRENT binding's cache IMMEDIATELY
+(before this dispatch's cache-insert point and before the next
+descriptor is processed — a deferred invalidation would let
+descriptor 2 consume S1 after descriptor 1 adopts S2) AND fans the
+invalidation out to sibling bindings via the same fan-out the reap
+path uses. Initial construction covers the fabric-placeholder corner
+(lookup can substitute a shared entry for a differently-keyed live
+fabric-wire placeholder, `shared_ops.rs:594-628`,
+`session_glue/tests.rs:704-759` — a pre-existing placeholder cache
+entry must not survive the construction). NO Close delta (as
 before), NO
 `release_source_nat_allocation`/`release_nat64_allocation`
 (`worker/loop_body/mod.rs:1491-1504`), and NO BPF session-map family-key
@@ -1524,9 +1540,11 @@ decline-delivery precedent; LocalDelivery consumes no SNAT
 allocation, `poll_descriptor/mod.rs:1967`).
 The victim flow's next legitimate NON-close packets dispatch
 the master split: the first purges and — warm — forwards with the retained
-lookup (no derivation/allocation/install — v10.11.0); the second
-resolves as a clean miss and installs with Open — master's two-packet
-shape exactly. A genuinely-new
+lookup (no derivation/allocation/install — v10.11.0); a follow-up
+cache-eligible packet may cache-hit (master's own behavior,
+v10.17.0), and the ForwardFlow install with Open happens on the next
+cache-missing packet's genuine clean miss — master's sequence
+exactly. A genuinely-new
 tuple (no peer-synced
 provenance this dispatch) keeps master's raw-flags seed exactly —
 site-3 master parity stands for invented tuples. The installer returns
@@ -1609,8 +1627,8 @@ adopting the shared decision/metadata, §5.6).
   cache-eligible and is inserted normally, `flow_cache.rs:352-394`,
   `poll_descriptor/mod.rs:3900-3959` — full parity, v10.15.0); cold:
   master's own seed transaction; the ForwardFlow install/Open happen
-  on the next packet's clean-miss dispatch with a fresh derivation
-  (master's two-packet shape exactly).
+  on the next cache-missing packet's genuine clean-miss dispatch with
+  a fresh derivation (master's sequence exactly, v10.17.0).
 - Expiry/HA: the probation deadline fence (v10.6.0, round-89 Codex 3 —
   §5.6) touches `expire.rs`'s retention gate (probation bypass) and
   `refresh_for_ha_transition` (deadline preserved); companion
@@ -1937,9 +1955,14 @@ untouched.
     master today (data packets included); the v10.8.0 buffered close
     inherits exactly that pre-existing exposure and adds none. Filed as
     #6600. With the close-aware gate retracted (v10.15.0, round-98
-    Codex 1-3), the plan changes NOTHING on this path: master's
+    Codex 1-3), the plan changes nothing in the purge DECISION or
+    dispatch on this path: master's
     flag-agnostic purge self-cleans a conflicted row on any packet,
-    closing packets included, and every retention-extension concern
+    closing packets included (the one deliberate delta remains the
+    demote gate's refusal upstream of the purge — the conflicted
+    companion replica then lingers on its ordinary trajectory instead
+    of the 2 s/30 s closing window, the §2 absorbing-state residual
+    applied here, round-100 Codex 5); every retention-extension concern
     from rounds 93-97 (the no-deadline shared row, the cache corner,
     the RG-activation crossover) attached to the retention and is
     dissolved with it. The pre-existing corners remain documented for
@@ -2126,8 +2149,11 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   wholesale (v10.14.0 — no remove/recreate, no restamp, no re-queue,
   NO removal — the v10.13.0 remove-locally ran pre-admission and broke
   the commit-hook clear path; the v10.12.0 in-place adopt needed
-  machinery to keep alive an already-due entry): assert K's fields are
-  bit-identical, the packet forwards with the materialized S2
+  machinery to keep alive an already-due entry): assert K's timing,
+  probation, and closing/reset fields are bit-identical (the #2501
+  accounting fields — counters, observed_tos, observed_tcp_flags — MAY
+  advance on the forwarded packet, the explicitly-allowed consumer,
+  round-100 Codex 3), the packet forwards with the materialized S2
   decision, the commit-hook clear+refresh NEVER fires on an overdue
   entry (no S1-for-a-full-timeout resurrection, round-94 Codex 5),
   the GC reaps K on its existing wheel slot under one-per-tick
@@ -2151,6 +2177,24 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   the probation row R (validated against the live forward family's
   anchor) skips the matched-entry mark/restamp/recompute/re-queue on R
   while the propagation marks the live F normally (round-91 Codex 3).
+- **OverdueSkipped propagation (v10.17.0, round-100 Codex 2/3):** the
+  outcome is initialized `None` on every resolve path and set only by
+  the overdue-materialize skip; the poller hoists it at
+  `poll_descriptor/mod.rs:509` and carries it past the `:883`
+  reduction; assert each of the five consumers honors it (teardown
+  suppressed at all three sites — `:698-714`, `:768-784`, `:824-840`;
+  no anchor write; no cache insert; no clear+refresh; no promote) and
+  the MissingNeighbor composition lands on the live-backed
+  ExistingResolved buffer-only arm with NOTHING derived/allocated/
+  installed/published (`:4662-4829` untouched); accounting still runs
+  (#2501 semantics on the packet query tuple).
+- **Pre-purge companion delta (v10.16.0, round-99 Codex 2):** a close
+  on an anchorless peer-synced translated-forward entry: the demote
+  gate refuses the mark (no closing/reset, no propagation) AND the
+  flag-agnostic purge proceeds exactly as master — assert the local
+  reverse companion survives on its ordinary peer-synced trajectory
+  (NOT the 2 s/30 s closing window master would have set), the
+  documented absorbing-state delta for this path.
 - **Transient-purge master parity (v10.15.0, round-98 Codex 1-3):**
   a closing packet on the transient-purge class purges and dispatches
   EXACTLY as master — assert the purge runs flag-agnostic
@@ -2206,14 +2250,18 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   exactly one Close delta (or zero when the marked entry is a transient
   `MissingNeighborSeed` — the `is_transient_local_seed` emission gate,
   `expire.rs:342`, per the seed-class bullet below); (c) the purged
-  class is MASTER-SPLIT plus one hardening delta (v10.13.0, rounds
-  95-96 Codex): with a WARM next hop the purged packet forwards on
+  class is MASTER-SPLIT with FULL cache parity (v10.17.0, rounds
+  95-100 Codex): with a WARM next hop the purged packet forwards on
   the retained lookup (`session_glue/mod.rs:1194-1196`) — assert NO
   derivation, NO allocation, NO install, NO publication, NO seed, and
-  the flow-cache insert SUPPRESSED for the purging dispatch (the
-  hardening delta: the retained tuple was just released; caching it
-  pins a released tuple — master's ACK-first pin is the pre-existing
-  family, §7); with a COLD next hop the packet runs master's own seed
+  master's own cache behavior (a purged pure-ACK is cache-eligible and
+  inserted normally, `flow_cache.rs:352-394`,
+  `poll_descriptor/mod.rs:3900-3959`; a follow-up cache-eligible
+  packet cache-hits before session resolution, `:298-327` — the
+  ForwardFlow install then happens on the next cache-MISSING packet,
+  not necessarily packet two; the v10.13-14 suppression shapes are
+  retracted, rounds 97-98); with a COLD next hop the packet runs
+  master's own seed
   transaction — assert the seed carries master's merge semantics
   (`NatDecision::merge` prefers the retained P1 fields,
   `nat/mod.rs:123-133` — the purge-aftermath released-tuple family is
@@ -2235,7 +2283,7 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   cold: transient seeds only on both); the close→ACK cold corner
   delta (non-closing ~300 s seed vs master's closing 2 s/30 s seed)
   is a transient-placeholder timeout-class difference only; (d) a
-  genuine top-level(d) a genuine top-level
+  genuine top-level
   MISS with a bare
   close still drops at the #4400 guard before the arm (`SeedRefused`);
   (e) a miss with SYN|close combo on a genuinely-new tuple still seeds
@@ -2278,7 +2326,7 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   install, master's own cache behavior (a purged pure-ACK is cached
   normally — full parity, v10.15.0); cold next hop: master's own seed transaction
   (transient, no Open; master's merge-keeps-P1 purge-aftermath is
-  pre-existing and documented, §7); the NEXT packet's
+  pre-existing and documented, §7); the next cache-missing packet's
   genuine clean-miss dispatch installs the
   seed/aliases with the OWNED `P2` and later cleanup releases
   `P2` (no collision with `P1`'s new owner, no leak);
@@ -2453,9 +2501,12 @@ this branch only if the minimal fix proves insufficient.
   from two packets to one, is retracted). The fix is sync-layer
   identity (fenced provenance on Open/Close deltas, or
   provenance-aware purge) — Phase-2-adjacent (§10.5) and in any case
-  its own issue; this plan's gate neither worsens nor can engage the
-  class (the state creation is constructor-side, not a demote on a
-  live anchor-carrying entry). Tracked as #6599.
+  its own issue; this plan's gate neither worsens the class nor can
+  prevent it — the gate DOES engage on the first close's pre-purge
+  lookup (refusing the mark on the anchorless entry, the deliberate
+  delta), but the harm's mechanism is the later constructor-side
+  Open, which no demote gate can reach (round-100 Codex 5). Tracked
+  as #6599.
 - **Import-window reservation race (v10.9.0, round-92 Codex 2):** the
   shared-publish → worker-upsert → P1-reservation ordering leaves a
   window where a local allocation can claim P1 first; the reservation
@@ -2509,7 +2560,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.16.0)
+## 11. Open questions for the convergence round (v10.17.0)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
@@ -2556,17 +2607,14 @@ this branch only if the minimal fix proves insufficient.
    deferred refresh (round-88) — is any pre-commit refresh/requeue
    path left for a probation entry (lookup, `touch_if_stale`, promote,
    materialize refresh), and does the commit-hook clear+refresh cover
-   every admission arm? (e) the v10.16.0 end-state: the purge path is
-   master-identical except the demote gate's deliberate refusal on
-   anchorless peer-synced entries (the replica-lifetime delta,
-   documented); the surviving Part-B rules are the gate, rule 5, the
-   2b/2c constructor gates with the probation discipline (typed
-   OverdueSkipped with its five-consumer set and ExistingResolved
-   composition; alias-complete invalidation at adopt AND reap), the
-   ReplacedSyncedLocal skip, and the site-9 typed outcomes — is any
-   close-class state mutation on peer-synced provenance left that is
-   neither master-identical nor a documented deliberate delta, and is
-   the OverdueSkipped transport/composition/consumer set complete?
+   every admission arm? (e) the v10.17.0 end-state: the purge path is
+   master-identical except the demote gate's deliberate documented
+   refusal; `OverdueSkipped` carries its field definition, poller
+   carriage, five-consumer set with the ExistingResolved composition,
+   and the teardown-site guards; the invalidation lifecycle covers
+   every site-2c transition with immediate current-binding + sibling
+   fan-out — is any consumer, alias shape, or dispatch sequence left
+   unspecified?
 
 4. **The emission posture:** master's `expire.rs:342-350` gate is
    UNCHANGED; the additions are the normative mark-creation rules, rule
