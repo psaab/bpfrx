@@ -1,24 +1,21 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.31.1 — THE TERMINAL CUT, round-115 folds (+ round-115 AGY folds: the reverse entry gains `fwd_companion_epoch: u64` — the hop's epoch compare has no other source, install.rs:152 — taking SessionEntry to 48 B with the cost statements updated; the closing-SYN-ACK-at-2b corner is stated explicitly) (the
-site-2b reverse synth gains the strong OPENING proof for SYN-ACK-driven
-synths — the installer was treating every non-initial-SYN TCP packet as
-established with no proof, so an unproven spoofed reverse SYN-ACK could
-synthesize an established reverse entry and pin the OPENING forward half
-through companion retention; a proof-failing SYN-ACK skips the install
-entirely per the site-2b refuse precedent, and non-SYN-ACK synths keep
-master's #3152 pickup behavior; the token gains its complete producer
-contract — every successful install/adopt path returns its FINAL token,
-and the resolved result carries the FINAL post-promotion identity; the
-re-probe is a dedicated atomic compare-then-mutate helper also covering
-touch_if_stale; the token binds the FAMILY — the reverse→forward hop
-re-verifies the forward entry's identity before writing the anchor
-sample; a cache-hit token mismatch EVICTS and falls through to a fresh
-resolution; §8 carries the token's footprint). Round-115: Codex NO
-(7B/1H/1M — the site-2b OPENING-proof bypass was the round's real new
-attack surface; the rest were the token's producer/binding contract);
-AGY r114 UNSOUND (2 stragglers, folded v10.30.1); SMR r115 YES (fold
-verification). Ship
+**Status: DRAFT v10.32.0 — THE TERMINAL CUT, round-116 folds (the
+site-2b proof now keys on the FORWARD ENTRY'S STATE, not the packet's
+flags — any non-closing reverse synth against an OPENING forward
+requires the proof (a bare ACK/PSH-ACK has none to give and skips the
+install), while an ESTABLISHED forward keeps master's pickup behavior
+verbatim; the family token binds both directions' identities with the
+companion epoch recorded at install; one per-descriptor matched_token
+slot carries the token from the final resolved result OR the fresh
+forward install into cache construction; the cache-hit identity check
+runs immediately after cache validity and BEFORE any cached-decision
+consumer; the proof-passing site-2b SYN-ACK applies the forward
+companion's flag-only establishment update; the §8 footprint is
+corrected per-binding; §9 gained the full matrix). Round-116: Codex NO
+(4B/2H/2M — the state-keyed proof rule was the round's real
+correction); AGY r115 UNSOUND (2 substantive findings, folded v10.31.1);
+SMR r116 YES (fold verification). Ship
 candidate = the Part-A dataplane demote gate plus the wire-free local HA
 rules. The RG-incarnation/retirement/fence-ledger protocol that rounds
 13–82 grew is KILLED (not deferred): its two customers are re-scoped —
@@ -1258,23 +1255,31 @@ hygiene, Junos reaps idle flows too).
 
 **Reverse-NAT synth (site 2b):** `install_reverse_session_from_forward_match`
 (`shared_ops.rs:857-865`) holds the `forward_match` in hand. **A
-SYN-ACK-driven synth must pass the strong OPENING proof (v10.31.0,
-round-115 Codex 1):** the synth installer treats every non-initial-SYN
+reverse synth against an OPENING forward entry must pass the strong
+OPENING proof — keyed on the FORWARD ENTRY'S STATE, not the packet's
+flags (v10.31.0, round-115 Codex 1; corrected v10.32.0, round-116
+Codex 1):** the synth installer treats every non-initial-SYN
 TCP packet as established at install (`install.rs:157-180`,
 `established = !(PROTO_TCP && is_initial_syn)`) — WITHOUT any proof —
-so an unproven spoofed reverse SYN-ACK that misses the normal lookup
-and matches the forward NAT entry would synthesize an ESTABLISHED
+so an unproven spoofed reverse packet (SYN-ACK OR a bare ACK/PSH-ACK)
+that misses the normal lookup and matches the forward NAT entry would
+synthesize an ESTABLISHED
 reverse entry and pin the OPENING forward half through companion
-retention (`expire.rs:296-320`, `:468-523`). The rule: when the
-driving packet is a SYN-ACK, the synth runs the same strong OPENING
-proof the §5.5 promote uses (the SYN-ACK's ack must match the forward
-SYN's interval); a proof-FAILING SYN-ACK SKIPS the install entirely
-(the site-2b refuse precedent: `created=false, install_failed=true`,
-no cache insert, the packet still forwarded, the next legitimate
-packet re-synthesizes). Non-SYN-ACK synths keep master's #3152
-mid-stream-pickup behavior (a data-first pickup's established seed is
-deliberate asymmetric-routing preservation; its blind-spoof residual
-is pre-existing master behavior, unchanged). **The match
+retention (`expire.rs:296-320`, `:468-523`) — the exact
+bare-reverse-ACK pin normal lookup explicitly prevents
+(`lookup.rs:129-146`, `tcp_flags.rs:83-107`). The rule: a NON-CLOSING
+reverse synth against an OPENING forward entry runs the strong
+OPENING proof regardless of the driving packet's flags (a SYN-ACK
+proves by its ack against the forward SYN's interval; a non-SYN-ACK
+has no proof to give against an OPENING forward, so it SKIPS the
+install entirely — the site-2b refuse precedent: `created=false,
+install_failed=true`, no cache insert, the packet still forwarded,
+the next legitimate packet re-synthesizes). When the forward entry is
+already ESTABLISHED (incl. a #3152 pickup or an import), the synth
+keeps master's behavior verbatim (no proof required — the pickup
+preservation; an already-established forward has no OPENING proof
+interval and the legitimate-repair case must not be rejected, both
+stated). **The match
 carries explicit scope and identity (v10.2.0, round-84 Codex 4):**
 `lookup_forward_nat_across_scopes` returns the same `ForwardSessionMatch`
 shape for both scopes today (`shared_ops.rs:638`), and the type carries
@@ -1313,7 +1318,20 @@ skips the install entirely per the round-115 fold, so no zombie class
 arises from blind sprays.) The accept/refuse split:
 
 - **Accept** → install with `closing`/`reset` seeded as today, AND the
-  mark is applied to the FORWARD family in the same resolve — two
+  mark is applied to the FORWARD family in the same resolve — and a
+  PROOF-PASSING SYN-ACK synth additionally applies the forward
+  companion's flag-only establishment update (v10.32.0, round-116
+  Codex 5: the synth installs/publishes only the reverse entry and
+  the ownership promote is ineffective for `ReverseFlow`,
+  `shared_ops.rs:824-895`, `session_glue/mod.rs:1313-1344`, so without
+  this the matched forward entry would never establish here; the
+  update is the `session/mod.rs:1243-1252` companion semantics —
+  `established` flag only, the absolute opening deadline preserved).
+  A capacity-REFUSED reverse install (`install.rs:123-125`) still
+  applies the forward update (the proof passed; the reverse entry
+  re-synths on the next packet). A SYN-ACK+FIN/RST validates the
+  close (§5.4) but NEVER establishment-promotes (rule 5 — the
+  conjunction stated). The mark itself: two
   sequential same-worker writes: install the reverse companion, then
   re-probe and mark the local forward entry (the `forward_match` in hand
   is a CLONE, `shared_ops.rs:638-665`; worker-owned tables have no
@@ -1927,11 +1945,28 @@ adopting the shared decision/metadata, §5.6).
     `:85-102`, `:194-219`,
     today discarded on return); the fresh ForwardFlow install gains an
     OUT token (it returns only `bool` and creates its epoch internally
-    today, `install.rs:139-152`, `poll_descriptor/mod.rs:2449-2458`);
+    today, `install.rs:139-152`, `poll_descriptor/mod.rs:2449-2458`)
+    — and ONE per-descriptor `matched_token` slot (v10.32.0,
+    round-116 Codex 3) on the dispatch context carries it from the
+    producer to the cache construction: initialized EMPTY per
+    descriptor, set from EITHER the final resolved token (hit/
+    materialize paths) OR the fresh forward install's OUT (the
+    fresh-miss path has no `ResolvedFlowSessionDecision`,
+    `poll_descriptor/mod.rs:2449-2458`, `:3900-3959`), and a later
+    reverse-companion install's token NEVER overwrites it;
     the reverse synthesis returns it (currently `(SessionLookup,
     bool)`, `shared_ops.rs:824-895`); the forward-wire match carries
     the MATCHED entry's epoch (`lookup.rs:258-292`, `entry.rs:208-213`);
-    the materialize returns the installed identity; and the RESOLVED
+    the materialize returns the installed identity; a FORWARD-WIRE
+    match's token carries the no-anchor-learn marker (v10.32.0,
+    round-116 Codex 6: that class's anchors advance from the reverse
+    mutable-alias direction only — the commit hook's anchor write is
+    suppressed for forward-wire-produced tokens while the
+    clear/refresh/mutation semantics stay; the resolution currently
+    collapses a forward-wire hit into ordinary `Canonical` resolution
+    without retaining a source discriminator, `lookup.rs:253-292`,
+    `shared_ops.rs:507-560`, `:594-635`, so the token carries the
+    match provenance explicitly); and the RESOLVED
     RESULT carries the FINAL post-promotion identity (the promotion
     advances `install_epoch` and can change NAT/orientation,
     `session/mod.rs:1344-1397`, and runs before the resolved result is
@@ -1953,20 +1988,40 @@ adopting the shared decision/metadata, §5.6).
     returning (`lookup.rs:105-218`), and the existing
     `touch_if_stale` (`flow_cache_hit.rs:295-301`,
     `session/mod.rs:1118-1133`) is covered by the same guard. The
+    cache-hit ORDERING is specified (v10.32.0, round-116 Codex 4): an
+    identity-ONLY check runs immediately after the existing cache
+    validity evaluation (which ends around `flow_cache_hit.rs:133`)
+    and BEFORE any cached-decision consumer (TTL handling,
+    filter/policy counters, policers, logs, reject synthesis, the
+    terminal drop — `:94-180`, `:189-271`) — a mismatch EVICTS and
+    falls through to a fresh resolution there (never double-accounts,
+    never consumes a stale decision); the atomic compare-then-mutate
+    then runs at final admission. The `None` class (purged/
+    sessionless) keeps master's query-key `touch_if_stale` refresh
+    behavior, and every authority mutation (probation clear, anchor
+    write, promote) requires `Some(token)` with identity agreement. The
     token binds the FAMILY (v10.31.0, round-115 Codex 5; the epoch
-    source made precise v10.31.1, round-115 AGY 2): the
+    source made precise v10.31.1, round-115 AGY 2; the ABA gap closed
+    v10.32.0, round-116 Codex 2): the
     reverse→forward `account_packet`-style hop derives a forward key
     and mutates whichever entry currently occupies it
     (`session/mod.rs:1177-1205`), so the hop RE-VERIFIES the forward
     entry's identity (key AND NAT AND epoch) before writing the
     anchor sample — the reverse entry gains
-    `fwd_companion_epoch: u64` (recorded at the entry's own install
-    and refreshed at each committed packet's hop; the reverse entry
+    `fwd_companion_epoch: u64` (recorded at the entry's own install —
+    the `ForwardSessionMatch`/`SessionInstall` carries the forward
+    entry's epoch, `entry.rs:208-213` gains it — and refreshed at each
+    committed packet's hop; the reverse entry
     does NOT otherwise store the forward entry's epoch,
     `install.rs:152`, and a same-key+NAT replacement K2 would pass a
     key+NAT-only check, so the epoch compare is what stops R1's
-    sample landing on K2) — in the stale-R1/replacement-K2 state, R1's sample
-    can never land on K2. A token MISMATCH at the cache-hit path
+    sample landing on K2; forward and reverse installs each allocate
+    their OWN epoch, so the compare is always against the RECORDED
+    companion epoch, never the reverse entry's own) — in the stale-R1/replacement-K2 state, R1's sample
+    can never land on K2. (§5.5's "exact tuple+NAT reuse needs no
+    generation token" statement is qualified, round-116 Codex 2: the
+    reciprocity identity check stands for the mark-propagation target;
+    the epoch binding covers the ABA replacement case.) A token MISMATCH at the cache-hit path
     EVICTS the descriptor and falls through to a fresh resolution
     (round-115 Codex 6 — suppression alone would leave a stale active
     descriptor forwarding while the replacement never refreshes;
@@ -2521,7 +2576,7 @@ untouched.
 |---|---|---|
 | Behavioral regression | MED | Gate only withholds demotion, never blocks delivery; refuse on missing/untrusted baseline. Residuals (stated in §2/§5.2/§7): soft-refused legit close after unobserved stretches or both-direction path switches → entry idles ≤ established timeout; imported entries never validate closes until churn (bounded lingering; §10.5 wire-anchor restores); tuple stays busy meanwhile — pre-existing semantics for silently-dead flows. Restart-RST covered by the union rule. OPENING covered by SEG.LEN-aware ack check against the FORWARD entry's state. |
 | Lifetime / borrow-checker | LOW | Anchor is `Copy` POD on an existing entry; marking restructured into the existing post-borrow propagation phase; no new cross-boundary borrows. |
-| Performance regression | LOW-MED | ~41 B/entry slab growth (~5.4 MiB/worker at cap); one TCP-header view compute (seq/ack/wnd/flags/seg_len) + ≤2 gated stores per committed TCP data packet (closing segments skip updates entirely); one extra probe per closing segment. Must be measured at minimum-frame rates (§9) — the 23 Gbit/s MTU-sized iperf run alone is insufficient (≈37 Mpps at 25 Gbit/s small-frame is the real gate; `iperf3 -l 64` is a proxy, not a demonstrated line-rate generator — gate on pps, not bandwidth). |
+| Performance regression | LOW-MED | ~49 B/entry slab growth (v10.31.1: 40 B anchor/proof + 1 B probation + 8 B `fwd_companion_epoch`; ~6.3 MiB/worker at cap) plus the cache's optional token field (~48 B on the ~96 B entry × the 4,096-entry cache PER BINDING, ≈ +192 KiB per binding, owned per binding not per worker — `flow_cache.rs:5-14`, `:201-224`, `worker/flow_cache_state.rs:26-35`, `worker/mod.rs:196-201`; the larger four-way set scan is noted); one TCP-header view compute (seq/ack/wnd/flags/seg_len) + ≤2 gated stores per committed TCP data packet (closing segments skip updates entirely); one extra probe per closing segment. Must be measured at minimum-frame rates (§9) — the 23 Gbit/s MTU-sized iperf run alone is insufficient (≈37 Mpps at 25 Gbit/s small-frame is the real gate; `iperf3 -l 64` is a proxy, not a demonstrated line-rate generator — gate on pps, not bandwidth). |
 | Architectural mismatch | LOW | No new subsystem; anchors at the existing #2501/#3706 chokepoints; #4400-style always-on gate. No pipeline restructure. No distributed protocol. |
 | HA / rolling upgrade | LOW | No wire change; mixed-version pair behaves as same-version (a pre-upgrade node keeps master's demote behavior for its own table; the upgraded node simply refuses blind demotes on its own). Pre-upgrade and imported entries sit in the absorbing zero-trust state — closes refuse until churn (strictly more conservative than master; bounded lingering, §2; Phase 2 §10.5 closes it for synced flows). The replica no-Close invariant + the SharedPromote refuse trace are regression-tested. |
 | Pending-neighbor behavior | LOW | Master's buffered-decision retry is UNCHANGED (v10.2.0 retreat): no re-resolution, no hold, no new drop class, no stale-transmit change — the admitted-close delivery is master-parity, and the pre-existing stale-decision window is documented (§7 race d, follow-up §10.6.2). Buffered packets never move the anchor — a fail-toward-refuse residual (anchors lag behind long ARP stalls; closes soft-refuse; entries idle out normally), never a walk/poison channel. |
@@ -2698,7 +2753,22 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   arm); (ix-b) `UpsertRefused +
   MissingNeighbor` never enters the seed block (which would replace K
   via `install.rs:139`); (ix-c) the P+K+S2 maximum-cardinality case
-  and a full 64-descriptor/192-family batch; (ix-d0) the
+  and a full 64-descriptor/192-family batch; (ix-c9) the site-2b
+  proof matrix and token regressions (v10.32.0, round-116 Codex 5/8):
+  the OPENING/ESTABLISHED-forward matrix (a non-closing reverse synth
+  against an OPENING forward requires the proof — a SYN-ACK proves, a
+  bare ACK/PSH-ACK skips the install; against an ESTABLISHED forward,
+  master's behavior verbatim); the proof-pass forward companion
+  flag-only establishment update (absolute opening deadline
+  preserved) and the capacity-refused reverse install still applying
+  the forward update; the SYN-ACK+FIN/RST conjunction (validates the
+  close, never establishment-promotes); the token carriage cases
+  (canonical, translated, forward-wire with the no-anchor-learn
+  marker, fresh-install and final-promotion tokens, reverse/forward
+  ABA via the recorded companion epoch); the early identity-only
+  check on a cached terminal decision (mismatch evicts before any
+  cached-decision consumer) and the `None`-class touch parity;
+  (ix-d0) the
   phase-shifted DIRECT-LOCAL-HIT overdue regression (v10.28.0,
   round-112 Codex 1): probation K installed; K crosses its deadline
   ahead of the periodic GC; a canonical packet finds K LOCALLY (no
@@ -3168,7 +3238,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.31.1)
+## 11. Open questions for the convergence round (v10.32.0)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
@@ -3215,11 +3285,10 @@ this branch only if the minimal fix proves insufficient.
    deferred refresh (round-88) — is any pre-commit refresh/requeue
    path left for a probation entry (lookup, `touch_if_stale`, promote,
    materialize refresh), and does the commit-hook clear+refresh cover
-   every admission arm? (e) the v10.31.0 end-state: the site-2b
-   OPENING proof, the complete token producer contract with the
-   final-identity rule, the atomic compare-then-mutate helper, the
-   family binding, and the mismatch eviction — is any install/adopt
-   path still tokenless and any hop still unverified?
+   every admission arm? (e) the v10.32.0 end-state: the state-keyed
+   2b proof, the two-direction identity binding, the single token
+   carrier, the early identity check, and the §9 matrix — is any
+   producer path or consumer ordering still two-readable?
 
 4. **The emission posture:** master's `expire.rs:342-350` gate is
    UNCHANGED; the additions are the normative mark-creation rules, rule
