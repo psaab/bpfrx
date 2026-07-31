@@ -122,11 +122,25 @@ const KNOWN_SYSTEM_SERVICE_TOKENS: &[&str] = &[
     "rlogin",
     "r-sh",
     "rsh",
+    // #3226: `r-exec`/`rexec` (tcp/512) is an xpf-only spelling — Juniper's
+    // host-inbound service list documents rlogin and rsh but NOT rexec — and
+    // unlike the other xpf spellings it is not a port-neutral alias, so it is
+    // EXCLUDED from the `all` expansion below via
+    // HOST_INBOUND_NON_JUNOS_SERVICES.
     "r-exec",
     "rexec",
     "xnm-clear-text",
     "xnm-ssl",
     "traceroute",
+    // #3226 fold: Juniper-documented host-inbound services xpf previously did
+    // not recognize at all. Ports are the Junos defaults — r2cp udp/28762
+    // ([edit protocols r2cp] server-port), reverse-telnet tcp/2900,
+    // reverse-ssh tcp/2901, rpm tcp+udp/7 (the RPM probe-server's only fixed
+    // port). Mirror of config.KnownHostInboundSystemServices.
+    "r2cp",
+    "reverse-ssh",
+    "reverse-telnet",
+    "rpm",
     // #3226: `gre` is an xpf EXTENSION (Junos has no raw-IP-protocol
     // system-service), so it is EXCLUDED from the `all` expansion below via
     // HOST_INBOUND_NON_JUNOS_SERVICES.
@@ -137,11 +151,14 @@ const KNOWN_SYSTEM_SERVICE_TOKENS: &[&str] = &[
 /// config.HostInboundNonJunosSystemServices (#3226). Junos scopes
 /// `system-services all` to the DEFINED system services, and its service list
 /// carries no raw IP protocol; xpf additionally accepts `gre` (IP protocol 47)
-/// because operator configs list it there. Folding an xpf-only token into the
-/// `all` expansion would make `all` open a protocol Junos's `all` never opens,
-/// so these are excluded from the expansion and must be listed explicitly.
-/// Keep in lockstep with the Go set (the #3486 parity test guards this).
-const HOST_INBOUND_NON_JUNOS_SERVICES: &[&str] = &["gre"];
+/// because operator configs list it there, and `r-exec`/`rexec` (tcp/512),
+/// which Juniper's host-inbound list does not document at all and which — unlike
+/// the port-neutral xpf spellings webapi-*/netconf-ssh — opens a port no other
+/// token opens. Folding an xpf-only token into the `all` expansion would make
+/// `all` open a protocol or port Junos's `all` never opens, so these are
+/// excluded from the expansion and must be listed explicitly. Keep in lockstep
+/// with the Go set (the #3486 parity test guards this).
+const HOST_INBOUND_NON_JUNOS_SERVICES: &[&str] = &["gre", "r-exec", "rexec"];
 
 /// True if `token` is an xpf-only (non-Junos) system-service, and so excluded
 /// from the `system-services all` expansion. #3226.
@@ -317,6 +334,29 @@ fn classify_system_service(token: &str, hi: &mut ZoneHostInbound) {
         }
         "r-exec" | "rexec" => {
             hi.tcp_ports.insert(512);
+        }
+        // #3226 fold — Juniper-documented host-inbound services at their Junos
+        // default ports. Mirror of config.HostInboundServiceMatch; the port
+        // values are pinned on this surface by
+        // system_services_all_admits_documented_junos_services_3226 and on the
+        // Go side by TestHostInboundDocumentedJunosServiceTokensCommit_3226 +
+        // the nft golden TestHostInboundNftRenderGoldenByteIdentical.
+        "r2cp" => {
+            hi.udp_ports.insert(28762);
+        }
+        "reverse-telnet" => {
+            hi.tcp_ports.insert(2900);
+        }
+        "reverse-ssh" => {
+            hi.tcp_ports.insert(2901);
+        }
+        // RPM probe RECEIVER. `[edit services rpm probe-server]` accepts "7 or
+        // 49160 through 65535" for each of tcp/udp; 7 (UDP-ECHO) is the only
+        // platform-fixed value and the high range is operator-chosen per
+        // probe-server, so admit exactly 7 on both L4s rather than 16k ports.
+        "rpm" => {
+            hi.tcp_ports.insert(7);
+            hi.udp_ports.insert(7);
         }
         "xnm-clear-text" => {
             hi.tcp_ports.insert(3221);

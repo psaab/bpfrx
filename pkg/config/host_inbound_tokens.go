@@ -96,7 +96,28 @@ var KnownHostInboundSystemServices = map[string]bool{
 	"xnm-clear-text":    true,
 	"xnm-ssl":           true,
 	"traceroute":        true,
-	"gre":               true,
+	// #3226 fold: four services Juniper documents on BOTH host-inbound
+	// reference pages (`system-services (Security Zones Host Inbound Traffic)`
+	// and `system-services (Security Zones Interfaces)`) that xpf did not
+	// recognize at all. Their absence was a #3200-class parity gap on its own —
+	// a valid vSRX `system-services r2cp` was hard-rejected at commit — and
+	// #3226 made it load-bearing: scoping `all` to the recognized set meant an
+	// authored `all` stopped admitting them AND the operator could not restore
+	// them by naming the service, because strict validation rejects any token
+	// outside this map. Ports are the Juniper-documented defaults:
+	//   r2cp           — Radio Router Control Protocol, UDP 28762 (the
+	//                    `server-port` default at [edit protocols r2cp]).
+	//   reverse-telnet — console-server reverse Telnet, TCP 2900.
+	//   reverse-ssh    — console-server reverse SSH, TCP 2901.
+	//   rpm            — Real-time Performance Monitoring probe RECEIVER; the
+	//                    `[edit services rpm probe-server]` tcp/udp port is
+	//                    "7 or 49160 through 65535", so 7 (UDP-ECHO) is the
+	//                    only fixed port and is what this admits on both L4s.
+	"r2cp":           true,
+	"reverse-ssh":    true,
+	"reverse-telnet": true,
+	"rpm":            true,
+	"gre":            true,
 }
 
 // KnownHostInboundProtocols is the canonical set of recognized
@@ -204,6 +225,18 @@ func HostInboundAllExpansionProtocols() []string {
 // `all` never opens — precisely the over-admit #3226 set out to close. The
 // token stays fully usable; it just has to be listed EXPLICITLY.
 //
+// `r-exec`/`rexec` (TCP/512) is here for the same reason. Juniper's
+// host-inbound service list — zone-level AND interface-level — documents
+// `rlogin` and `rsh` but NOT rexec, so a Junos-correct `all` never opens
+// TCP/512. Unlike the other xpf spellings the token is not a port-neutral
+// alias: `webapi-clear-text`/`webapi-ssl` resolve to the same ports as
+// `http`/`https`, and `ssh-netconf`/`netconf-ssh` to `ssh` ∪ `netconf`, so
+// including them in the expansion widens nothing, whereas 512 is opened by no
+// other token. (`sip` is NOT reclassified: it is a documented vSRX ALG service
+// with its own #3619 disposition and a fail-on-revert port pin in
+// pkg/daemon/host_inbound_parity_test.go.) Listing `r-exec` explicitly still
+// opens 512 — the carve-out narrows `all`, it does not remove the token.
+//
 // This mirrors the HostInboundL2Protocols exclusion on the `protocols all`
 // side (#3311): the set is load-bearing, not decorative — adding an xpf-only
 // service token here (and to KnownHostInboundSystemServices) is the ONLY edit
@@ -211,7 +244,9 @@ func HostInboundAllExpansionProtocols() []string {
 // The Rust classifier mirrors it via HOST_INBOUND_NON_JUNOS_SERVICES and the
 // #3486 parity test asserts the two sets are equal.
 var HostInboundNonJunosSystemServices = map[string]bool{
-	"gre": true,
+	"gre":    true,
+	"r-exec": true,
+	"rexec":  true,
 }
 
 // HostInboundAllExpansionServices returns the `system-services` tokens that
@@ -234,9 +269,13 @@ var HostInboundNonJunosSystemServices = map[string]bool{
 //
 // Aliases (http/webapi-clear-text, ike/ipsec, rlogin/r-login, ...) are all
 // included; they resolve to the same L4 tuples and both enforcement surfaces
-// dedup. `ident-reset` is included and keeps its Junos RESET semantics (#3310)
-// rather than becoming an admit. The result is sorted so the expansion — and
-// therefore the rendered nft rule order — is deterministic.
+// dedup. The one exception is `r-exec`/`rexec`, which is an xpf-only spelling
+// with a port of its OWN (TCP/512, opened by no other token) rather than a
+// port-neutral alias — it is therefore in HostInboundNonJunosSystemServices and
+// excluded, so the expansion opens exactly the ports Juniper's documented
+// service list opens. `ident-reset` is included and keeps its Junos RESET
+// semantics (#3310) rather than becoming an admit. The result is sorted so the
+// expansion — and therefore the rendered nft rule order — is deterministic.
 func HostInboundAllExpansionServices() []string {
 	out := make([]string, 0, len(KnownHostInboundSystemServices))
 	for tok := range KnownHostInboundSystemServices {
@@ -499,6 +538,25 @@ func HostInboundServiceMatch(token, family string) []L4Match {
 		return []L4Match{hiTCP(514)}
 	case "r-exec", "rexec":
 		return []L4Match{hiTCP(512)}
+	// #3226 fold — Juniper-documented host-inbound services xpf previously did
+	// not recognize. Ports are the Junos defaults (see the
+	// KnownHostInboundSystemServices comment for provenance).
+	case "r2cp":
+		return []L4Match{hiUDP(28762)}
+	case "reverse-telnet":
+		return []L4Match{hiTCP(2900)}
+	case "reverse-ssh":
+		return []L4Match{hiTCP(2901)}
+	case "rpm":
+		// The RPM probe RECEIVER (`[edit services rpm probe-server]`) takes a
+		// tcp and a udp port, each "7 or 49160 through 65535". Port 7
+		// (UDP-ECHO) is the only value fixed by the platform — the high range
+		// is operator-chosen per probe-server and xpf models no such stanza —
+		// so `rpm` admits exactly tcp/7 + udp/7. A deployment using a high
+		// probe-server port lists that port via a firewall filter or uses
+		// `any-service`; admitting 49160-65535 here would open 16k ports on
+		// every `all` zone.
+		return []L4Match{hiTCP(7), hiUDP(7)}
 	case "xnm-clear-text":
 		return []L4Match{hiTCP(3221)}
 	case "xnm-ssl":

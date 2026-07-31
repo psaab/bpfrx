@@ -114,6 +114,85 @@ func TestClassifyHostInboundSystemServicesAllExcludesGRE(t *testing.T) {
 	}
 }
 
+// TestClassifyHostInboundAllAdmitsDocumentedJunosServices is the fail-CLOSED
+// half of the #3226 contract. Scoping `all` to the recognized-token union only
+// preserves Junos semantics if that union actually CONTAINS every service
+// Juniper documents. Four did not exist in xpf at all — `r2cp`, `reverse-ssh`,
+// `reverse-telnet`, `rpm`, all listed on both the zone-level and the
+// interface-level `system-services` reference pages — so before this fold an
+// authored `all` stopped admitting them AND the operator could not restore them
+// by naming the service, because strict validation rejects any token outside
+// the same allowlist (validateHostInboundStanzaStrict). That is a hard
+// regression for a documented service, not an over-admit closed.
+//
+// Ports are the Junos defaults: r2cp udp/28762 ([edit protocols r2cp]
+// server-port), reverse-telnet tcp/2900, reverse-ssh tcp/2901, rpm tcp+udp/7
+// (the [edit services rpm probe-server] port is "7 or 49160 through 65535", so
+// 7 is the only platform-fixed value).
+//
+// FAIL-ON-REVERT: drop any of the four from config.KnownHostInboundSystemServices
+// (or from config.HostInboundServiceMatch) and its rows flip to denied.
+func TestClassifyHostInboundAllAdmitsDocumentedJunosServices(t *testing.T) {
+	const (
+		TCP = uint8(6)
+		UDP = uint8(17)
+	)
+	all := cfgWithHostInbound("edge", []string{"all"}, nil)
+
+	for _, tc := range []struct {
+		name  string
+		token string
+		proto uint8
+		port  int
+	}{
+		{"r2cp udp/28762", "r2cp", UDP, 28762},
+		{"reverse-telnet tcp/2900", "reverse-telnet", TCP, 2900},
+		{"reverse-ssh tcp/2901", "reverse-ssh", TCP, 2901},
+		{"rpm tcp/7", "rpm", TCP, 7},
+		{"rpm udp/7", "rpm", UDP, 7},
+	} {
+		// Reached through the `all` union.
+		if got := ClassifyHostInbound(all, "edge", tc.proto, true, tc.port, nil, "ip"); got.Status != HostInboundTokenAdmit {
+			t.Errorf("%s with system-services all: got %+v, want token-admit — %q is a documented Junos system-service and `all` is the union of them", tc.name, got, tc.token)
+		}
+		// And reachable by NAMING the service, which is what makes the union
+		// restorable rather than a dead end.
+		named := cfgWithHostInbound("edge", []string{tc.token}, nil)
+		if got := ClassifyHostInbound(named, "edge", tc.proto, true, tc.port, nil, "ip"); got.Status != HostInboundTokenAdmit || got.Token != tc.token {
+			t.Errorf("%s with an explicit system-services %s: got %+v, want token-admit %s", tc.name, tc.token, got, tc.token)
+		}
+	}
+}
+
+// TestClassifyHostInboundSystemServicesAllExcludesRexec pins the second
+// xpf-extension carve-out. Juniper's host-inbound service list — zone-level and
+// interface-level — documents `rlogin` and `rsh` but NOT rexec, so a
+// Junos-correct `all` never opens TCP/512. Unlike the other xpf-only spellings
+// (`webapi-clear-text`/`webapi-ssl` → the http/https ports,
+// `ssh-netconf`/`netconf-ssh` → ssh ∪ netconf) `r-exec` is not a port-neutral
+// alias: 512 is opened by no other token, so including it in the expansion
+// widened `all` past the Junos meaning #3226 exists to restore.
+//
+// FAIL-ON-REVERT: drop "r-exec"/"rexec" from
+// config.HostInboundNonJunosSystemServices and the first row flips to admitted.
+func TestClassifyHostInboundSystemServicesAllExcludesRexec(t *testing.T) {
+	const TCP = uint8(6)
+
+	if got := ClassifyHostInbound(cfgWithHostInbound("edge", []string{"all"}, nil),
+		"edge", TCP, true, 512, nil, "ip"); got.Status != HostInboundDenied {
+		t.Errorf("rexec tcp/512 with system-services all: got %+v, want DENIED (rexec is an xpf extension, absent from Juniper's documented service list)", got)
+	}
+
+	// Both spellings stay fully usable when listed EXPLICITLY — the carve-out
+	// narrows `all`, it does not remove the token.
+	for _, tok := range []string{"r-exec", "rexec"} {
+		if got := ClassifyHostInbound(cfgWithHostInbound("edge", []string{tok}, nil),
+			"edge", TCP, true, 512, nil, "ip"); got.Status != HostInboundTokenAdmit || got.Token != tok {
+			t.Errorf("rexec tcp/512 with an explicit system-services %s: got %+v, want token-admit %s", tok, got, tok)
+		}
+	}
+}
+
 // TestClassifyHostInboundAnyServiceStillFullAdmit pins the other half of the
 // #3226 contract: `any-service` REMAINS the packet-wide escape hatch. Junos
 // defines it as "all system services on an entire port range including the

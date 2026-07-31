@@ -24,15 +24,22 @@ import (
 func TestHostInboundNftRenderGoldenByteIdentical(t *testing.T) {
 	svc := map[string][2][]string{
 		// #3226: `all` renders the union of the named system-services (the
-		// xpf-only `gre` extension excluded), in HostInboundAllExpansionServices
-		// order. Before #3226 it rendered NOTHING here because it took the
-		// hostInboundAllowsAll blanket-accept branch instead. `tcp dport 113`
-		// appears via the expanded ident-reset and carries the `reject with tcp
-		// reset` VERDICT (verdicts are asserted separately — this golden pins
-		// the match FRAGMENTS).
+		// xpf-only `gre` and `r-exec`/`rexec` extensions excluded), in
+		// HostInboundAllExpansionServices order. Before #3226 it rendered
+		// NOTHING here because it took the hostInboundAllowsAll blanket-accept
+		// branch instead. `tcp dport 113` appears via the expanded ident-reset
+		// and carries the `reject with tcp reset` VERDICT (verdicts are
+		// asserted separately — this golden pins the match FRAGMENTS).
+		//
+		// FAIL-ON-REVERT, both directions of the #3226 fold: `tcp dport 512`
+		// must be ABSENT (Juniper's host-inbound service list documents rlogin
+		// and rsh but not rexec, so a Junos-correct `all` never opens 512), and
+		// the four Juniper-documented services xpf previously did not recognize
+		// must be PRESENT — udp 28762 (r2cp), tcp 2901 (reverse-ssh), tcp 2900
+		// (reverse-telnet), tcp+udp 7 (rpm).
 		"all": {
-			{"udp dport { 67, 68 }", "udp dport { 67, 68 }", "udp dport 53", "tcp dport 53", "tcp dport 79", "tcp dport 21", "tcp dport 80", "tcp dport 443", "tcp dport 113", "udp dport { 500, 4500 }", "udp dport { 500, 4500 }", "udp dport 3503", "tcp dport 830", "tcp dport { 22, 830 }", "udp dport 123", "icmp type echo-request", "tcp dport 512", "tcp dport 513", "tcp dport 514", "tcp dport 512", "tcp dport 513", "tcp dport 514", "udp dport 5060", "tcp dport 5060", "udp dport 161", "udp dport 162", "tcp dport 22", "tcp dport { 22, 830 }", "tcp dport 23", "udp dport 69", "udp dport 33434-33523", "tcp dport 80", "tcp dport 443", "tcp dport 3221", "tcp dport 3220"},
-			{"udp dport { 546, 547 }", "udp dport 53", "tcp dport 53", "tcp dport 79", "tcp dport 21", "tcp dport 80", "tcp dport 443", "tcp dport 113", "udp dport { 500, 4500 }", "udp dport { 500, 4500 }", "udp dport 3503", "tcp dport 830", "tcp dport { 22, 830 }", "udp dport 123", "icmpv6 type echo-request", "tcp dport 512", "tcp dport 513", "tcp dport 514", "tcp dport 512", "tcp dport 513", "tcp dport 514", "udp dport 5060", "tcp dport 5060", "udp dport 161", "udp dport 162", "tcp dport 22", "tcp dport { 22, 830 }", "tcp dport 23", "udp dport 69", "udp dport 33434-33523", "tcp dport 80", "tcp dport 443", "tcp dport 3221", "tcp dport 3220"},
+			{"udp dport { 67, 68 }", "udp dport { 67, 68 }", "udp dport 53", "tcp dport 53", "tcp dport 79", "tcp dport 21", "tcp dport 80", "tcp dport 443", "tcp dport 113", "udp dport { 500, 4500 }", "udp dport { 500, 4500 }", "udp dport 3503", "tcp dport 830", "tcp dport { 22, 830 }", "udp dport 123", "icmp type echo-request", "tcp dport 513", "tcp dport 514", "udp dport 28762", "tcp dport 2901", "tcp dport 2900", "tcp dport 513", "tcp dport 7", "udp dport 7", "tcp dport 514", "udp dport 5060", "tcp dport 5060", "udp dport 161", "udp dport 162", "tcp dport 22", "tcp dport { 22, 830 }", "tcp dport 23", "udp dport 69", "udp dport 33434-33523", "tcp dport 80", "tcp dport 443", "tcp dport 3221", "tcp dport 3220"},
+			{"udp dport { 546, 547 }", "udp dport 53", "tcp dport 53", "tcp dport 79", "tcp dport 21", "tcp dport 80", "tcp dport 443", "tcp dport 113", "udp dport { 500, 4500 }", "udp dport { 500, 4500 }", "udp dport 3503", "tcp dport 830", "tcp dport { 22, 830 }", "udp dport 123", "icmpv6 type echo-request", "tcp dport 513", "tcp dport 514", "udp dport 28762", "tcp dport 2901", "tcp dport 2900", "tcp dport 513", "tcp dport 7", "udp dport 7", "tcp dport 514", "udp dport 5060", "tcp dport 5060", "udp dport 161", "udp dport 162", "tcp dport 22", "tcp dport { 22, 830 }", "tcp dport 23", "udp dport 69", "udp dport 33434-33523", "tcp dport 80", "tcp dport 443", "tcp dport 3221", "tcp dport 3220"},
 		},
 		"any-service":       {nil, nil},
 		"bootp":             {{"udp dport { 67, 68 }"}, nil},
@@ -55,8 +62,12 @@ func TestHostInboundNftRenderGoldenByteIdentical(t *testing.T) {
 		"r-exec":            {{"tcp dport 512"}, {"tcp dport 512"}},
 		"r-login":           {{"tcp dport 513"}, {"tcp dport 513"}},
 		"r-sh":              {{"tcp dport 514"}, {"tcp dport 514"}},
+		"r2cp":              {{"udp dport 28762"}, {"udp dport 28762"}},
+		"reverse-ssh":       {{"tcp dport 2901"}, {"tcp dport 2901"}},
+		"reverse-telnet":    {{"tcp dport 2900"}, {"tcp dport 2900"}},
 		"rexec":             {{"tcp dport 512"}, {"tcp dport 512"}},
 		"rlogin":            {{"tcp dport 513"}, {"tcp dport 513"}},
+		"rpm":               {{"tcp dport 7", "udp dport 7"}, {"tcp dport 7", "udp dport 7"}},
 		"rsh":               {{"tcp dport 514"}, {"tcp dport 514"}},
 		"sip":               {{"udp dport 5060", "tcp dport 5060"}, {"udp dport 5060", "tcp dport 5060"}},
 		"snmp":              {{"udp dport 161"}, {"udp dport 161"}},

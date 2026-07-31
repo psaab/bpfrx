@@ -567,9 +567,15 @@ From zone: guest, To zone: lan
     system-service tokens, so the zone keeps its catch-all host-inbound drop.
     It does NOT admit raw IP protocols (GRE/ESP/AH/OSPF/PIM/VRRP or future
     protocol numbers) or unlisted TCP/UDP ports; list those explicitly under
-    `system-services` / `protocols`. The xpf-only `gre` token is excluded from
-    the expansion (Junos has no raw-IP-protocol system-service) and must be
-    listed explicitly. `any-service` remains the packet-wide escape hatch and is
+    `system-services` / `protocols`. The two xpf-only tokens are excluded from
+    the expansion and must be listed explicitly: `gre` (Junos has no
+    raw-IP-protocol system-service) and `r-exec`/`rexec` (Juniper's host-inbound
+    list documents `rlogin` and `rsh` but not rexec, and tcp/512 is opened by no
+    other token). Conversely, the four services Juniper documents that xpf did
+    not previously recognize — `r2cp` (udp 28762), `reverse-ssh` (tcp 2901),
+    `reverse-telnet` (tcp 2900) and `rpm` (tcp+udp 7) — are now accepted at
+    commit and included in the union, so scoping `all` cannot strand a defined
+    service. `any-service` remains the packet-wide escape hatch and is
     the one-token way to restore the pre-#3226 behaviour. Both draw a WARN-only
     commit advisory. See `docs/host-inbound-service-matrix.md`.
   - **IS-IS host-inbound (L2 no-op, #3311):** `host-inbound-traffic protocols

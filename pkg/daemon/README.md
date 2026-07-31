@@ -1331,7 +1331,8 @@ never lock an operator out of a remote box it manages.
 
   **`system-services all` scoping (#3226):** `all` is no longer a full admit. It
   expands to the union of the named system-services (excluding the xpf-only
-  `gre` extension) via `config.HostInboundAllExpansionServices`, exactly as
+  `gre` and `r-exec`/`rexec` extensions, which Juniper's service list does not
+  define) via `config.HostInboundAllExpansionServices`, exactly as
   #3199 scoped `protocols all` to the routing set, so an `all` zone now renders
   per-service accepts PLUS the catch-all drop instead of a bare
   `<fam> daddr <addrs> accept` with no deny. `hostInboundAllowsAll` therefore
@@ -1340,6 +1341,12 @@ never lock an operator out of a remote box it manages.
   no raw IP protocol, so the pre-#3226 blanket admit of GRE/ESP/OSPF/PIM/VRRP was
   a fail-OPEN. No-op on every shipped config (each puts `all` on the
   lifeline-only `control` zone, which contributes no host-inbound addresses).
+  The union must equal Juniper's DEFINED-service set in both directions, so the
+  same change adds the four documented services xpf did not recognize at all —
+  `r2cp` (udp 28762), `reverse-ssh` (tcp 2901), `reverse-telnet` (tcp 2900),
+  `rpm` (tcp+udp 7). Without them a scoped `all` denied a defined service AND
+  the operator could not name it (strict validation rejects tokens outside the
+  same allowlist), a fail-CLOSED regression rather than an over-admit closed.
   Full write-up: `docs/host-inbound-service-matrix.md`.
   **Counted drops + scrape (#3361):** each per-zone/family catch-all drop is
   `<fam> daddr <addrs> counter name "<n>" drop`, where `<n>` =

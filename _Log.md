@@ -62377,3 +62377,63 @@ break — `go vet` confirmed passing under every revert.
     userspace-dp/src/afxdp/types/forwarding.rs,
     docs/host-inbound-service-matrix.md, docs/junos-cli-reference.md,
     pkg/daemon/README.md, plus tests + retargeted admit-all fixtures, _Log.md
+
+- **Timestamp**: 2026-07-31 (fix/3226-system-services-all-scoping, Codex
+  MERGE-NEEDS-MAJOR fold on PR #6616)
+- **Action**: #3226 fold — make the `system-services all` union EQUAL Juniper's
+  defined-service set in BOTH directions, and correct the privileged netlink
+  expectation. Codex round 2 found the scoping was derived from xpf's historical
+  recognized-token list, which is not the same set as Junos's.
+  (1) HIGH, fail-CLOSED: `r2cp`, `reverse-ssh`, `reverse-telnet` and `rpm` are
+  documented on BOTH Juniper host-inbound reference pages (zone-level and
+  interface-level) but were absent from `KnownHostInboundSystemServices`
+  entirely. Scoping `all` therefore stopped admitting four DEFINED services AND
+  left no in-grammar remedy: strict validation
+  (`validateHostInboundStanzaStrict`) rejects any token outside the same
+  allowlist, so an operator could not restore them by naming the service, and
+  `any-service` is materially broader than the one service wanted. All four are
+  now recognized and in the union, at their Junos default ports — r2cp udp/28762
+  (`[edit protocols r2cp] server-port`), reverse-telnet tcp/2900, reverse-ssh
+  tcp/2901 (the `[edit system services reverse]` defaults), rpm tcp+udp/7 (the
+  RPM probe-server port is "7 or 49160 through 65535"; 7 is the only
+  platform-fixed value, and admitting the 16k high range on every `all` zone
+  would trade one over-admit for a larger one).
+  (2) The inverse over-admit: `r-exec`/`rexec` (tcp/512) is NOT on either
+  Juniper page, so a Junos-correct `all` never opens 512. Unlike the other
+  xpf-only spellings it is not a port-neutral alias — `webapi-clear-text`/
+  `webapi-ssl` resolve to the http/https ports and `ssh-netconf`/`netconf-ssh`
+  to ssh union netconf, so including THEM widens nothing, whereas 512 is opened
+  by no other token. It joins `gre` in `HostInboundNonJunosSystemServices` and
+  is excluded from the expansion; listed explicitly it still opens 512. `sip`
+  was deliberately NOT reclassified despite also being absent from the fetched
+  reference pages: it is a vSRX ALG service with a reviewed #3619 disposition
+  and a fail-on-revert port pin, and the fetched pages are demonstrably partial
+  (they also omit `lsping`, which Juniper does define), so narrowing on that
+  evidence would be a fail-CLOSED change on unreliable grounds.
+  (3) MEDIUM: `pkg/nftables/netlink_kernel_test.go` still asserted `mgmt/ip`
+  (a `system-services all` zone) must NOT have a deny counter — the pre-#3226
+  full-admit shape. Under CAP_NET_ADMIN that now FAILS; it passed only because
+  the private-netns tests skip without the capability. Flipped to REQUIRE
+  `mgmt/ip`, and the construct-complete scenario gained an `admin`
+  (`any-service`, dual-stack) view so the bare-accept/no-counter path — now
+  reachable by `any-service` alone — keeps live coverage, with its own
+  must-NOT-have-a-counter assertion.
+- **Validation**: full Go suite green apart from the pre-existing
+  `TestHeatmapNotStale` (fails identically on clean origin/master, issue #6617);
+  full Rust suite green — 4224 + 60 + 8 + 22 + 1 passed, 0 failed; gofmt clean
+  on every touched file; `go vet` clean. The PRIVILEGED netlink leg was actually
+  EXECUTED (`unshare -rn ./nft.test -test.run
+  TestCounterReadbackThroughExistingReaders`) rather than left to CI: PASS with
+  the flipped assertions, and RED with the old `mgmt/ip`-absent assertion
+  restored — direct proof the Codex finding was real, not theoretical.
+  Mutation-probed per-arm in a throwaway detached worktree
+  (`/dev/shm/probe-6616b`), Go and Rust independently, build+vet clean each time
+  so every red is an ASSERTION.
+- **File(s)**: pkg/config/host_inbound_tokens.go,
+    pkg/config/host_inbound_tokens_test.go,
+    pkg/dataplane/userspace/host_inbound_all_scoping_3226_test.go,
+    pkg/daemon/host_inbound_ssot_render_3627_test.go,
+    pkg/nftables/{netlink_kernel_test.go,netlink_scenario_test.go},
+    userspace-dp/src/afxdp/forwarding/{host_inbound.rs,host_inbound_tests.rs},
+    docs/host-inbound-service-matrix.md, docs/junos-cli-reference.md,
+    pkg/daemon/README.md, _Log.md

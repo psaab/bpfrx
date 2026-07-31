@@ -440,6 +440,96 @@ fn system_services_all_excludes_non_junos_extensions() {
     }
 }
 
+// #3226 fold, fail-CLOSED half: scoping `all` to the recognized-token union
+// only preserves Junos semantics if that union CONTAINS every service Juniper
+// documents. Four did not exist on either surface — r2cp, reverse-ssh,
+// reverse-telnet, rpm, all listed on the zone-level AND interface-level
+// `system-services` reference pages — so an authored `all` stopped admitting
+// them with no in-grammar way to restore them (the Go strict validator rejects
+// any token outside the same allowlist).
+//
+// Ports are the Junos defaults: r2cp udp/28762, reverse-telnet tcp/2900,
+// reverse-ssh tcp/2901, rpm tcp+udp/7. This is the Rust mirror of the Go
+// TestClassifyHostInboundAllAdmitsDocumentedJunosServices and the nft golden
+// TestHostInboundNftRenderGoldenByteIdentical.
+//
+// FAIL-ON-REVERT: drop a token from KNOWN_SYSTEM_SERVICE_TOKENS or its
+// classify_system_service arm and its rows flip to denied.
+#[test]
+fn system_services_all_admits_documented_junos_services_3226() {
+    const TCP: u8 = 6;
+    const UDP: u8 = 17;
+    const ZONE: u16 = 14;
+
+    let mut state = ForwardingState::default();
+    state
+        .zone_host_inbound
+        .insert(ZONE, zone_host_inbound_from_tokens(&["all".to_string()], &[]));
+
+    for (name, token, proto, port) in [
+        ("r2cp", "r2cp", UDP, 28762u16),
+        ("reverse-telnet", "reverse-telnet", TCP, 2900),
+        ("reverse-ssh", "reverse-ssh", TCP, 2901),
+        ("rpm tcp", "rpm", TCP, 7),
+        ("rpm udp", "rpm", UDP, 7),
+    ] {
+        // Reached through the `all` union, on both families.
+        for v6 in [false, true] {
+            assert!(
+                host_inbound_admits(&state, ZONE, proto, port, v6, 0),
+                "`system-services all` must admit {name} ({proto}/{port}, v6={v6}) — it is a documented Junos system-service",
+            );
+        }
+        // And reachable by NAMING the service, which is what makes the union
+        // restorable rather than a dead end.
+        let mut named = ForwardingState::default();
+        named
+            .zone_host_inbound
+            .insert(ZONE, zone_host_inbound_from_tokens(&[token.to_string()], &[]));
+        assert!(
+            host_inbound_admits(&named, ZONE, proto, port, false, 0),
+            "an explicit `system-services {token}` must admit {name} ({proto}/{port})",
+        );
+    }
+}
+
+// #3226 fold, over-admit half: `r-exec`/`rexec` (tcp/512) is absent from
+// Juniper's documented host-inbound service list — zone-level and
+// interface-level both document rlogin and rsh but not rexec — so a
+// Junos-correct `all` never opens 512. Unlike the port-neutral xpf spellings
+// (webapi-* resolve to the http/https ports, ssh-netconf to ssh ∪ netconf) 512
+// is opened by no other token, so including it widened `all` past the meaning
+// #3226 restores.
+//
+// FAIL-ON-REVERT: remove "r-exec"/"rexec" from HOST_INBOUND_NON_JUNOS_SERVICES
+// and the first assertion flips to admitted.
+#[test]
+fn system_services_all_excludes_rexec_3226() {
+    const TCP: u8 = 6;
+    const ZONE: u16 = 15;
+
+    let mut state = ForwardingState::default();
+    state
+        .zone_host_inbound
+        .insert(ZONE, zone_host_inbound_from_tokens(&["all".to_string()], &[]));
+    assert!(
+        !host_inbound_admits(&state, ZONE, TCP, 512, false, 0),
+        "`system-services all` must DENY rexec tcp/512 — it is not a documented Junos system-service (#3226)",
+    );
+
+    // Both spellings stay fully usable when listed EXPLICITLY.
+    for token in ["r-exec", "rexec"] {
+        let mut named = ForwardingState::default();
+        named
+            .zone_host_inbound
+            .insert(ZONE, zone_host_inbound_from_tokens(&[token.to_string()], &[]));
+        assert!(
+            host_inbound_admits(&named, ZONE, TCP, 512, false, 0),
+            "an explicit `system-services {token}` must still admit tcp/512 — the carve-out narrows `all`, it does not remove the token",
+        );
+    }
+}
+
 // #3226: an EXPLICIT `system-services gre` still admits IP protocol 47. The
 // carve-out narrows the `all` meta-token; it does not remove the token. Without
 // this the exclusion above could be "fixed" by deleting the gre arm entirely.

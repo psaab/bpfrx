@@ -90,7 +90,7 @@ follow-up; until it lands, surface 3 stays a hand-mirror held by the set-level
 
 | Token (aliases) | nft match (`daemon_nft.go`) | Rust admit (`host_inbound.rs`) | Family | Notes |
 |---|---|---|---|---|
-| `all` | union of every row in this table EXCEPT `gre` | same union (`system_service_all_expansion`) | per expanded token | **#3226:** expands to the named system-services — NOT a packet-wide admit and NOT a full-admit boolean. The zone keeps its catch-all drop, so raw IP protocols (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) and unlisted ports are DENIED unless listed explicitly. The expanded `ident-reset` keeps its RESET verdict. See [`system-services all` is the named-service union](#system-services-all-is-the-named-service-union-3226). |
+| `all` | union of every row in this table EXCEPT `gre` and `r-exec`/`rexec` | same union (`system_service_all_expansion`) | per expanded token | **#3226:** expands to the named system-services — NOT a packet-wide admit and NOT a full-admit boolean. The zone keeps its catch-all drop, so raw IP protocols (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) and unlisted ports are DENIED unless listed explicitly. The expanded `ident-reset` keeps its RESET verdict. See [`system-services all` is the named-service union](#system-services-all-is-the-named-service-union-3226). |
 | `any-service` | full admit | `all_services = true` | dual | Blanket accept for the zone — a **packet-wide** admit of EVERY IP protocol/port. Junos defines `any-service` as "all system services on an entire port range including the system services that are not defined"; xpf reads it as the (wider) packet-wide superset. `config.HostInboundFullAdmitService` is the SSOT; `ValidateConfig` emits a commit-time advisory naming the zone/interface. See [`system-services all` is the named-service union](#system-services-all-is-the-named-service-union-3226). |
 | `ssh` | tcp 22 | tcp 22 | dual | |
 | `telnet` | tcp 23 | tcp 23 | dual | |
@@ -114,7 +114,11 @@ follow-up; until it lands, surface 3 stays a hand-mirror held by the set-level
 | `sip` | udp 5060, tcp 5060 | udp 5060, tcp 5060 | dual | **UDP+TCP 5060 only (M07). SIP-over-TLS (TCP 5061) is NOT admitted — matches vSRX.** See disposition. |
 | `r-login` / `rlogin` | tcp 513 | tcp 513 | dual | |
 | `r-sh` / `rsh` | tcp 514 | tcp 514 | dual | |
-| `r-exec` / `rexec` | tcp 512 | tcp 512 | dual | |
+| `r-exec` / `rexec` | tcp 512 | tcp 512 | dual | **xpf EXTENSION — excluded from `all` (#3226).** Juniper's host-inbound service list (zone-level and interface-level) documents `rlogin` and `rsh` but NOT rexec, and unlike the port-neutral xpf spellings (`webapi-*` → the http/https ports, `ssh-netconf` → ssh ∪ netconf) tcp/512 is opened by no other token — so folding it into `all` widened the union past the Junos meaning. Listed explicitly it still opens 512. Member of `config.HostInboundNonJunosSystemServices`. |
+| `r2cp` | udp 28762 | udp 28762 | dual | Radio Router Control Protocol. Port is the `server-port` default at `[edit protocols r2cp]`. Added in the #3226 fold — the token was previously unrecognized, so a valid vSRX stanza was hard-rejected at commit. |
+| `reverse-telnet` | tcp 2900 | tcp 2900 | dual | Console-server reverse Telnet; 2900 is the Junos default (`[edit system services reverse telnet]`). #3226 fold. |
+| `reverse-ssh` | tcp 2901 | tcp 2901 | dual | Console-server reverse SSH; 2901 is the Junos default (`[edit system services reverse ssh]`). #3226 fold. |
+| `rpm` | tcp 7, udp 7 | tcp 7, udp 7 | dual | Real-time Performance Monitoring probe RECEIVER. `[edit services rpm probe-server]` accepts "7 or 49160 through 65535" for each of tcp/udp; 7 (UDP-ECHO) is the only platform-fixed value and the high range is operator-chosen per probe-server, so this admits 7 alone rather than 16k ports on every `all` zone. A deployment on a high probe-server port uses a firewall filter or `any-service`. #3226 fold. |
 | `xnm-clear-text` | tcp 3221 | tcp 3221 | dual | JUNOScript clear-text. |
 | `xnm-ssl` | tcp 3220 | tcp 3220 | dual | JUNOScript over SSL. |
 | `traceroute` | udp 33434-33523 | udp 33434..=33523 | dual | **UDP probe range only (L07/L16).** UDP-only per #3368; ICMP time-exceeded replies ride the global ICMP-error accept. |
@@ -175,17 +179,47 @@ This mirrors exactly what #3199 did to the sibling `protocols all` (scoped to
 the routing-protocol set rather than a blanket accept), and reuses the same
 mechanism: an SSOT expansion list plus a load-bearing exclusion set.
 
-### The `gre` carve-out
+### The union must equal Juniper's defined-service set — both directions
 
-`gre` is an **xpf extension**, not a Junos system-service — xpf accepts it under
-`system-services` because operator configs list it there, mapping it to IP
-protocol 47. Folding it into the `all` expansion would make `all` open a raw IP
-protocol that Junos's `all` never opens, so it is excluded via
-`config.HostInboundNonJunosSystemServices` (Rust mirror:
-`HOST_INBOUND_NON_JUNOS_SERVICES`). The token stays fully usable — it just has
-to be listed **explicitly**. This is the service-side twin of
-`HostInboundL2Protocols` excluding `isis` from `protocols all` (#3311), and the
-#3486 parity test asserts the Go and Rust exclusion sets are equal.
+Scoping `all` to the recognized-token union is only Junos-correct if that union
+is neither NARROWER nor WIDER than the set Juniper documents. Both directions
+are enforced by `TestHostInboundAllExpansionMatchesJunosDocumentedSet_3226`
+(`pkg/config/host_inbound_tokens_test.go`), which carries Juniper's documented
+list verbatim.
+
+**Narrower — the four missing services.** `r2cp`, `reverse-ssh`,
+`reverse-telnet` and `rpm` appear on both the zone-level and interface-level
+`system-services` reference pages but were absent from xpf's recognized-token
+allowlist entirely. That was a #3200-class parity gap on its own (a valid vSRX
+stanza was hard-rejected at commit), and #3226 made it load-bearing: once `all`
+is the recognized-token union, a service missing from that union is neither
+admitted by `all` NOR nameable as an escape — strict validation rejects any
+token outside the same allowlist — so its traffic is denied with no in-grammar
+remedy short of the packet-wide `any-service`. All four are now recognized and
+in the union, at the Junos default ports (see the matrix rows above).
+
+**Wider — the two xpf-only carve-outs.** `config.HostInboundNonJunosSystemServices`
+(Rust mirror: `HOST_INBOUND_NON_JUNOS_SERVICES`) holds the tokens xpf accepts
+that Juniper's list does not define, and excludes them from the expansion:
+
+- **`gre`** — xpf accepts it under `system-services` because operator configs
+  list it there, mapping it to IP protocol 47. Junos has no raw-IP-protocol
+  system-service, so folding it into `all` would open a protocol Junos's `all`
+  never opens.
+- **`r-exec` / `rexec`** — Juniper documents `rlogin` and `rsh` but not rexec.
+  Unlike the other xpf-only spellings this one is not a port-neutral alias:
+  `webapi-clear-text`/`webapi-ssl` resolve to the http/https ports and
+  `ssh-netconf`/`netconf-ssh` to ssh ∪ netconf, so including them widens
+  nothing, whereas tcp/512 is opened by no other token.
+
+`sip` is deliberately NOT in this set: it is a vSRX ALG service with its own
+#3619 disposition and a fail-on-revert port pin
+(`TestHostInboundSipTftpNarrowPortSet`).
+
+Both carve-out tokens stay fully usable — they just have to be listed
+**explicitly**. This is the service-side twin of `HostInboundL2Protocols`
+excluding `isis` from `protocols all` (#3311), and the #3486 parity test asserts
+the Go and Rust exclusion sets are equal.
 
 ### `ident-reset` inside the expansion
 
