@@ -61795,3 +61795,25 @@ would never produce.
     pkg/dhcp/dhcpv6_iapd_prefixlen_6531_test.go,
     pkg/ra/sender_prefixlen_6531_test.go,
     pkg/daemon/ra_pd_prefixlen_6531_test.go, _Log.md
+- **Action**: #6549 range-gate + clamp the chassis-cluster interface-monitor
+  weight. `interface-monitor <if> weight <w>` had no bound at any layer:
+  the leaf packs its tokens onto one node key so it has no typed schema
+  leaf, and compileChassis Atoi'd it unbounded. The weight is the debt
+  subtracted from the RG weight (`255 - totalLost`, floor-only), so a
+  NEGATIVE weight pushed rg.Weight above 255 — read raw by the local
+  election but advertised through the single-byte HeartbeatGroup.Weight,
+  so `weight -100` left the local node at 355 while the peer received 99
+  and both elected primary. Four layers: (1) commit gate on the compiled
+  *Config in validateChassisClusterStrict (0..255, strict reject / lenient
+  warn, covers both parser shapes); (2) config.ClampInterfaceMonitorWeight
+  at the pkg/cluster read sites, which also closes a second fail-open — a
+  negative weight credited debt BACK and cancelled a sibling monitor's
+  real link failure; (3) rgWeightFromDebt closing the rg.Weight domain at
+  all three recompute sites; (4) saturating clampWireWeight at the marshal
+  boundary. Fail-on-revert verified separately for each of the four.
+- **File(s)**: pkg/config/{compiler_validate_strict_chassis.go,
+    compiler_uniformgates_cluster_zone.go, schema_chassis.go,
+    compiler_validate_strict_chassis_ifmon_6549_test.go},
+    pkg/cluster/{election.go,failover.go,monitor.go,heartbeat_manager.go,
+    ifmon_weight_divergence_6549_test.go},
+    docs/config-schema.md, _Log.md

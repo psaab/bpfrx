@@ -3361,7 +3361,26 @@ reserved for whole-dataplane selection where a rewrite shim
   bypasses — pinned by `compiler_chassis_identity_5694_test.go`),
   `interface-monitor <if> weight <n>` (tokens pack inline into a
   `children==nil` leaf; typing the weight needs a children map, which
-  would flip SetPath grouping), `control-ports` (not compiled), and the
+  would flip SetPath grouping — so **#6549** range-gates the weight the
+  same way #4434/#4880 gate the RG id and node priority: on the COMPILED
+  `*Config` in `validateChassisClusterStrict`, `0..255`, strict-reject at
+  commit / warn on the tolerant load / peer-sync path. Running on the
+  compiled int covers BOTH parser shapes at once. It is a wire-width gate
+  like its siblings: the weight is the debt subtracted from the RG weight,
+  which the heartbeat advertises through a single byte
+  (`HeartbeatGroup.Weight`, `uint8(rg.Weight)`) while the local election
+  reads the raw int — `weight -100` on a down monitor left the local node
+  at 355 and the peer receiving 99, so both nodes elected primary from
+  identical state. `pkg/cluster` carries the matching runtime belts so a
+  leniently-loaded value still cannot diverge:
+  `config.ClampInterfaceMonitorWeight` where the configured weight is read
+  (`pollInterfaceMonitors`, `reconcileMonitorDebtsLocked` — a NEGATIVE
+  weight there also credited debt BACK and cancelled a sibling monitor's
+  real link failure) and `rgWeightFromDebt` closing the `rg.Weight` domain
+  at every recompute site. Pinned by
+  `compiler_validate_strict_chassis_ifmon_6549_test.go` (config) and
+  `ifmon_weight_divergence_6549_test.go` (cluster)), `control-ports` (not
+  compiled), and the
   address/interface string leaves (IP value types arrive with the
   interfaces PR). Known residual: the hierarchical packed one-liner
   `node 0 priority <v>;` bypasses the gate (identity-token rule) even

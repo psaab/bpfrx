@@ -472,6 +472,15 @@ func (mon *Monitor) pollInterfaceMonitors(rg *config.RedundancyGroup, statuses [
 	for _, im := range rg.InterfaceMonitors {
 		key := monitorKey{rgID: rg.ID, iface: im.Interface}
 
+		// #6549: bound the configured weight to the [0,255] domain the
+		// heartbeat weight fields can carry. The strict commit path already
+		// rejected an out-of-range weight; the tolerant load / peer-sync path
+		// only warns (#1960 no-brick), so a persisted or peer-pushed config
+		// can still reach this poll. Deliberately NOT logged here — this loop
+		// runs every poll tick; reconcileMonitorDebtsLocked emits the
+		// config-apply-frequency warning.
+		weight, _ := config.ClampInterfaceMonitorWeight(im.Weight)
+
 		// Translate Junos name (ge-0/0/0) to Linux name (ge-0-0-0).
 		linuxName := config.LinuxIfName(im.Interface)
 		link, err := nlh.LinkByName(linuxName)
@@ -503,7 +512,7 @@ func (mon *Monitor) pollInterfaceMonitors(rg *config.RedundancyGroup, statuses [
 		// Track local interface status for heartbeat propagation.
 		statuses = append(statuses, InterfaceMonitorInfo{
 			Interface:       im.Interface,
-			Weight:          im.Weight,
+			Weight:          weight,
 			Up:              up,
 			RedundancyGroup: rg.ID,
 		})
@@ -515,17 +524,17 @@ func (mon *Monitor) pollInterfaceMonitors(rg *config.RedundancyGroup, statuses [
 		}
 
 		if mon.evaluateTransition(state, !up) {
-			mon.mgr.SetMonitorWeight(rg.ID, im.Interface, state.down, im.Weight)
+			mon.mgr.SetMonitorWeight(rg.ID, im.Interface, state.down, weight)
 			if state.down {
 				mon.mgr.RecordEvent(EventMonitor, rg.ID, fmt.Sprintf(
-					"Interface %s state changed to down, weight %d", im.Interface, im.Weight))
+					"Interface %s state changed to down, weight %d", im.Interface, weight))
 			} else {
 				mon.mgr.RecordEvent(EventMonitor, rg.ID, fmt.Sprintf(
 					"Interface %s state changed to up", im.Interface))
 			}
 			slog.Info("cluster monitor: interface state changed",
 				"rg", rg.ID, "interface", im.Interface,
-				"up", up, "weight", im.Weight)
+				"up", up, "weight", weight)
 		}
 	}
 	return statuses

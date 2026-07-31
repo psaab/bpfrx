@@ -460,10 +460,7 @@ func (m *Manager) manualFailoverRestoreWeightLocked(rg *RedundancyGroupState) {
 		key := monitorKey{rgID: rg.GroupID, iface: iface}
 		totalLost += m.monitorWeights[key]
 	}
-	rg.Weight = 255 - totalLost
-	if rg.Weight < 0 {
-		rg.Weight = 0
-	}
+	rg.Weight = rgWeightFromDebt(totalLost)
 }
 
 // FinalizePeerTransferOut completes a previously acknowledged transfer-out
