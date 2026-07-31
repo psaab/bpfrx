@@ -1,19 +1,21 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.28.0 — THE TERMINAL CUT, round-112 folds (the
-commit hook gains the DIRECT matched-entry overdue test —
-`entry.probation && last_seen_ns.saturating_add(expires_after_ns) <=
-now_ns` — because an overdue probation entry can be reached through an
-ordinary LOCAL hit that never materializes; the establishment promote
-fires at the ADMISSION commit point — for a buffered packet the
-pending-queue enqueue — so a buffered proof-passing SYN-ACK promotes
-at enqueue and the forward half never lingers OPENING because the
-next packet is not `is_syn_ack`; the raw/effective pair gains its
-total invariant; the broad anchor-update claims carry the
-OverdueSkipped/UpsertRefused suppression). Round-112: Codex NO
-(1B/1H/2M — the direct-local-hit hole was the round's real catch);
-AGY r111 SOUND (v10.27.2, no findings); SMR r112 YES (fold
-verification). Ship
+**Status: DRAFT v10.29.0 — THE TERMINAL CUT, round-113 folds (the
+v10.28.0 admission-point promote is RETRACTED — the enqueue is not a
+commit-to-deliver point and no producer/carrier exists for an
+enqueue-time apply; the §5.5 post-borrow establishment promote fires
+during the arrival dispatch's LOOKUP phase, after the borrow ends and
+before any disposition/buffering decision — master's in-borrow timing
+modulo the borrow boundary, plus the proof gate — so a cold-neighbor
+SYN-ACK promotes at arrival exactly as master's does and no token or
+carrier is needed; the establishment promote is the SIXTH consumer,
+consuming the effective transition with OverdueSkipped/UpsertRefused
+suppression; the canonical matched key now rides the resolution
+result and the flow-cache entry, so the commit hook's
+clear/refresh/overdue evaluation always targets the canonical entry;
+the refusal promotion gate is site-qualified). Round-113: Codex NO
+(3B/1H/2M); AGY r112 SOUND (v10.28.0, no findings); SMR r113 YES
+(fold verification). Ship
 candidate = the Part-A dataplane demote gate plus the wire-free local HA
 rules. The RG-incarnation/retirement/fence-ledger protocol that rounds
 13–82 grew is KILLED (not deferred): its two customers are re-scoped —
@@ -648,12 +650,12 @@ request-build stage:
   stale) that is OUTSIDE this issue's blast radius. What the gate
   actually needs here is only: (i) **a buffered packet never moves the
   anchor and never drives post-borrow state on the retry path** (no
-  anchor update, no probation clear — the
-  retry has no `SessionTable`; the establishment promote is the
-  exception that fires at ADMISSION: for a buffered packet the
-  pending-queue enqueue is the commit-to-deliver point, so a buffered
-  proof-passing SYN-ACK promotes at enqueue, v10.28.0 round-112
-  Codex 2; the anchor update and probation clear still wait for the
+  anchor update, no probation clear, no promote ON THE RETRY PATH —
+  the retry has no `SessionTable`; the establishment promote already
+  fired at the ARRIVAL dispatch's lookup phase, before any buffering
+  decision — master's in-borrow timing modulo the borrow boundary,
+  v10.29.0 round-113 Codex 2/4; the anchor update and probation clear
+  still wait for the
   next unbuffered packet PROVIDED its effective transition is not
   `OverdueSkipped`,
   v10.27.0, round-110 Codex 2). The consequence is a documented residual, not a channel: a
@@ -662,10 +664,10 @@ request-build stage:
   out on its ordinary timeout, the same bounded class as the
   unobserved-stretch residual (§2), always fail-toward-refuse (a
   skipped update can never walk or poison an anchor). A buffered
-  SYN-ACK that delivers without its promote leaves the entry OPENING
-  exactly as on master (the promote fires on the next unbuffered
-  packet; if none comes, the 20 s opening window reaps — master
-  parity). (ii) **the buffered stale-decision transmit window is
+  SYN-ACK promotes at its arrival lookup phase (master's in-borrow
+  timing, v10.29.0) — no packet lingers OPENING for want of a promote;
+  the earlier "delivers without its promote" framing is retracted.
+  (ii) **the buffered stale-decision transmit window is
   documented as PRE-EXISTING** (§7 races): master today can transmit a
   pending packet with a NAT/egress decision whose entry expired (or was
   transient-purged, `promote.rs:167`) during the ARP wait — including
@@ -1782,8 +1784,12 @@ adopting the shared decision/metadata, §5.6).
     Some(OverdueSkipped)`
     suppresses the promote and the commit-time refresh INDEPENDENTLY
     of K's probation flag (`promote.rs:86-107` gates only on
-    origin/disposition today), and a `(validation == Some(Refused))`
-    site-2c report suppresses the promote per §5.5's rule 5.
+    origin/disposition today), and a `(report.site == Some(Site2c) &&
+    validation == Some(Refused))` report suppresses the promote per
+    §5.5's rule 5 (the refusal gate is site-qualified, v10.29.0,
+    round-113 Codex 6 — a malformed `site=None, validation=
+    Some(Refused)` report follows master's own dispatch and never
+    reaches the site-2c gates).
     `site` is the materialization discriminator (`Some(Site2c)` only
     from the site-2c materialize; `None` on every non-materializing
     path) — consumers can therefore distinguish an erroneous site-2c
@@ -1845,7 +1851,8 @@ adopting the shared decision/metadata, §5.6).
     placeholder substitution, `shared_ops.rs:614-626`, it can miss
     the survivor and use S2's positional counter instead — still
     telemetry-only, no authority change).
-  - **Consumers (all five, normative):** (i) the terminal teardown at
+  - **Consumers (six, normative — the establishment promote is the
+    sixth, v10.29.0, round-113 Codex 3):** (i) the terminal teardown at
     ALL THREE sites (`poll_descriptor/mod.rs:698-714`, `:768-784`,
     `:824-840`) is SKIPPED for `OverdueSkipped` AND for `UpsertRefused`
     (for the skip the dispatch installed and changed nothing; for the
@@ -1868,14 +1875,32 @@ adopting the shared decision/metadata, §5.6).
     entry.last_seen_ns.saturating_add(entry.expires_after_ns) <=
     now_ns` suppresses the clear+refresh on ANY path (v10.28.0,
     round-112 Codex 1; the phase-shifted direct-local-hit regression
-    is in §9)
+    is in §9). The matched-entry identity is alias-safe (v10.29.0,
+    round-113 Codex 1): `lookup_with_origin` resolves a
+    reverse-translated alias and captures the canonical `actual_key`
+    (`lookup.rs:62-68`, `:85-102`, `:194-219`) — the canonical
+    matched key now RIDES the resolution result (the current code
+    discards it on return) and the flow-cache entry (cache entries
+    currently retain the QUERY key, `flow_cache.rs:201-224`,
+    `:578-581`), so the commit hook's clear/refresh/overdue
+    evaluation always targets the canonical entry
+    (table mutation requires the canonical key,
+    `session/mod.rs:1022-1051`); §9 tests canonical, translated, and
+    cache-alias hits
     (not only the
     probation flag, round-108 Codex 3); (v) the ownership promote is
     suppressed by the explicit `report.effective_transition ==
     Some(OverdueSkipped)`
-    gate AND by the rule-5 `validation == Some(Refused)` gate (the
+    gate AND by the rule-5 `(report.site == Some(Site2c) &&
+    validation == Some(Refused))` gate (the
     §5.5 probation flag on K is the third, independent suppression —
-    K remains installed). Accounting is an explicitly ALLOWED
+    K remains installed); (vi) the ESTABLISHMENT promote (the §5.5
+    post-borrow promote at the lookup phase) consumes the effective
+    transition and is suppressed for `OverdueSkipped` AND
+    `UpsertRefused` (a shadowed-placeholder / divergent-identity
+    dispatch must not mutate the surviving K or its companion) and
+    for a probation-flagged matched entry — alongside the refusal/
+    closing and identity gates. Accounting is an explicitly ALLOWED
     consumer (#2501 semantics, `poll_descriptor/mod.rs:3494-3503`,
     `session/mod.rs:1177-1210`); delivery/buffering/replay/
     reinjection/telemetry consume S2 (the buffer stores S2's decision
@@ -2653,26 +2678,34 @@ values (probabilistic sprays can legitimately hit the admitted interval):
 - **Pending-neighbor (v10.2.0 posture):** master's buffered-decision
   retry is byte-identical (an admitted close transmits on the buffered
   decision even after an interim expiry — delivery parity); a buffered
-  packet NEVER moves the anchor, NEVER drives the establishment promote,
-  NEVER clears probation (the next unbuffered packet does all three
+  packet NEVER moves the anchor, NEVER clears probation, and never
+  RE-runs the establishment promote on the retry path (the promote
+  already fired at the arrival dispatch's lookup phase — master's
+  timing, v10.29.0, round-113 Codex 2/4; the anchor update and
+  probation clear wait for the next unbuffered packet
   when its effective transition is not `OverdueSkipped`, v10.27.1);
-  a buffered SYN-ACK promotes at its ADMISSION commit point
-  (v10.28.0, round-112 Codex 2): the establishment promote fires at
-  the packet's admission — for a buffered packet that is the
-  pending-queue ENQUEUE (the commit-to-deliver event), not the
-  transmit — because the retry path carries no `SessionTable` and the
-  next packet (a forward ACK/data) is not `is_syn_ack` and could
-  never perform the promote (`lookup.rs:129`-class predicate; an
-  arbitrary-ACK promote would reintroduce the #4109 half-open pin).
-  The proof is evaluated at arrival (the strong non-closing reverse
-  SYN-ACK), so the buffered SYN-ACK promotes at enqueue and the
-  forward half does NOT linger OPENING on the short timeout
-  (`session/mod.rs:2135`). The consequence stated: a SYN-ACK dropped
-  BEFORE admission (input filter, TTL) never promotes — stricter
-  than master (master's in-borrow promote precedes the TTL check),
-  fail-conservative, and the flow recovers on the SYN-ACK retransmit
-  (a retransmitted SYN-ACK IS `is_syn_ack` and promotes at its own
-  admission).
+  a buffered SYN-ACK promotes AT ITS LOOKUP-PHASE post-borrow point
+  (v10.29.0, round-113 Codex 2/4 — the v10.28.0 admission-point
+  framing is RETRACTED: the pending-queue enqueue is not a
+  commit-to-deliver point — an inserted packet can time out
+  untransmitted, `neighbor_dispatch.rs:208-232`, and can still fail
+  frame access, output-filter/CoS, rewrite, or target dispatch after
+  resolution, `:294-325`, `:344-404`; and no producer/carrier exists
+  for an enqueue-time apply, `shared_ops.rs:563-578`,
+  `poll_descriptor/mod.rs:883`, `:5017-5069`): the §5.5 post-borrow
+  establishment promote fires during the arrival dispatch's lookup
+  phase, AFTER the borrow ends and BEFORE any disposition/buffering
+  decision — master's in-borrow timing (`lookup.rs:129-149`,
+  `:173-218`) preserved modulo the borrow boundary, plus the proof
+  gate. A cold-neighbor SYN-ACK therefore promotes at arrival exactly
+  as master's does (master's promote also fires at lookup, before
+  buffering), the forward half never lingers OPENING
+  (`session/mod.rs:2135`), and the retry path never re-runs anything
+  (unchanged). Master's pre-filter timing is kept: a filter-dropped
+  but PROVEN SYN-ACK can promote (master-identical; stated) — and the
+  companion promote deliberately sets only `established`, preserving
+  the short opening deadline until the forward ACK
+  (`session/mod.rs:1243-1252`).
 - **Site-9 typed outcomes (round-83 Codex 1 + round-84 Codex 1 +
   round-85 Codex 1):**
   (a) `ExistingResolved` on a validator-REFUSED close with a cold next
@@ -3011,7 +3044,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.28.0)
+## 11. Open questions for the convergence round (v10.29.0)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
@@ -3058,10 +3091,11 @@ this branch only if the minimal fix proves insufficient.
    deferred refresh (round-88) — is any pre-commit refresh/requeue
    path left for a probation entry (lookup, `touch_if_stale`, promote,
    materialize refresh), and does the commit-hook clear+refresh cover
-   every admission arm? (e) the v10.28.0 end-state: the commit hook's
-   direct matched-entry overdue test, the admission-point promote,
-   the total invariant, and the qualified anchor claims — is any
-   reachable state transition still ungated?
+   every admission arm? (e) the v10.29.0 end-state: the lookup-phase
+   promote (master's timing, no token), the sixth consumer, the
+   canonical matched token on the resolution result and cache entry,
+   and the site-qualified gates — is any transport or timing claim
+   still two-readable?
 
 4. **The emission posture:** master's `expire.rs:342-350` gate is
    UNCHANGED; the additions are the normative mark-creation rules, rule
