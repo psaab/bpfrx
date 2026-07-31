@@ -360,28 +360,222 @@ func TestSiblingFlatSetAppBodyUnchanged(t *testing.T) {
 	}
 }
 
-// TestApplicationDirectLeafKeywordsCoverCompilerSwitch is a drift canary: every
-// keyword the direct-body switch in compileApplications handles must also be in
-// applicationDirectLeafKeywords. A keyword added to the switch but missed here
-// would be classified as garbage and hard-rejected at commit — a fail-CLOSED
-// regression on valid config.
-func TestApplicationDirectLeafKeywordsCoverCompilerSwitch(t *testing.T) {
-	// The cases of the direct-body switch, kept in sync by this test.
-	switchCases := []string{
-		"protocol", "destination-port", "source-port",
-		"inactivity-timeout", "timeout", "icmp-type", "icmp-code",
-		"alg", "description", "term",
+// TestApplicationDirectLeafKeywordsMatchSchema is a drift canary against the
+// AUTHORITATIVE source rather than a restatement of it. `setSchema`
+// (schema_security.go) declares which statements an `applications application
+// <name>` body accepts; applicationDirectLeaves classifies anything outside its
+// own map as operator garbage and the strict gate then hard-rejects it. So a
+// leaf ADDED to the schema but missed in the map becomes a fail-CLOSED
+// regression on valid config — and a hardcoded expected-list here could never
+// catch that, because the same hand cranks both. Enumerate the schema instead.
+func TestApplicationDirectLeafKeywordsMatchSchema(t *testing.T) {
+	appNode := schemaApplications.children["application"]
+	if appNode == nil || len(appNode.children) == 0 {
+		t.Fatalf("schemaApplications has no `application` children to enumerate — " +
+			"this canary has lost its authoritative source")
 	}
-	for _, kw := range switchCases {
+	for kw := range appNode.children {
 		if !applicationDirectLeafKeywords[kw] {
-			t.Fatalf("compileApplications handles %q but applicationDirectLeaves "+
-				"does not recognize it — a valid statement would be recorded as "+
-				"unknown and hard-rejected at commit", kw)
+			t.Errorf("schema declares `applications application <name> %s` but "+
+				"applicationDirectLeafKeywords omits it — the statement would be "+
+				"recorded as an unknown leaf and HARD-REJECTED at commit "+
+				"(fail-closed on valid config)", kw)
 		}
 	}
-	if len(applicationDirectLeafKeywords) != len(switchCases) {
-		t.Fatalf("applicationDirectLeafKeywords has %d entries, the compiler switch "+
-			"has %d — an entry here with no switch case is silently ignored "+
-			"rather than rejected", len(applicationDirectLeafKeywords), len(switchCases))
+	for kw := range applicationDirectLeafKeywords {
+		if _, ok := appNode.children[kw]; !ok {
+			t.Errorf("applicationDirectLeafKeywords accepts %q but the schema does "+
+				"not declare it — the token would be silently accepted by the walk "+
+				"instead of rejected", kw)
+		}
 	}
+}
+
+// TestApplicationTermEnumerationSharedWithCollisionGate pins the #6524 MAJOR
+// contract at the seam: compileApplications and collectApplicationCollisions
+// must enumerate terms through the SAME walk, or the compiler mints
+// `<parent>-<term>` applications the namespace gates cannot see.
+func TestApplicationTermEnumerationSharedWithCollisionGate(t *testing.T) {
+	// A term reachable ONLY through a flat-set chain (nested under the
+	// `description` value node).
+	tree := setTree6524(t,
+		"set applications application myapp description doc term t1 protocol udp")
+	appsNode := tree.FindChild("applications")
+	if appsNode == nil {
+		t.Fatalf("applications node missing")
+	}
+	inst := namedInstances(appsNode.FindChildren("application"))
+	if len(inst) != 1 {
+		t.Fatalf("expected 1 application instance, got %d", len(inst))
+	}
+	// The enumeration helper the collision gate uses must find the chained term.
+	terms := applicationTermNodes(inst[0].node)
+	if len(terms) != 1 {
+		t.Fatalf("applicationTermNodes found %d terms, want 1 — the collision gate "+
+			"would be blind to a chained term the compiler still mints (#6524)",
+			len(terms))
+	}
+	// And it must reassemble the same tokens the compiler feeds
+	// parseApplicationTerms, so the predicted name matches what gets written.
+	gen := parseApplicationTerms("myapp", applicationTermKeys(terms[0]))
+	if len(gen) != 1 || gen[0].Name != "myapp-t1" {
+		t.Fatalf("predicted generated apps = %+v, want exactly one named myapp-t1", gen)
+	}
+}
+
+// TestChainedTermCannotClobberAuthoredApp is the #6524 review-fold MAJOR: once
+// the compiler follows the flat-set chain it also reaches `term` nodes nested
+// down that chain and mints `<parent>-<term>` applications from them. The
+// collision gate (collectApplicationCollisions) enumerated the application
+// node's immediate Children, so those generated names were invisible to EVERY
+// gate guarding the flat Junos namespace — H01 authored-app overwrite, H02
+// cross-namespace, H03 cross-parent, M08 duplicate term name, M03 predefined
+// shadow.
+//
+// The consequence is a silent fail-open: a generated name overwrites an
+// AUTHORED application, so a deny referencing that authored name is erased and
+// the traffic falls through to a later permit. `description` is the entry route
+// on the STRICT path because it deliberately does not set hasDirectBody
+// (#3366), so MixedDirectTermApps never engages.
+//
+// RED-on-revert: point the collision gate's loop back at
+// `inst.node.Children` and the commit succeeds with myapp-t1 silently redefined
+// as protocol udp / no port.
+func TestChainedTermCannotClobberAuthoredApp(t *testing.T) {
+	tree := setTree6524(t,
+		"set applications application myapp-t1 protocol tcp",
+		"set applications application myapp-t1 destination-port 22",
+		"set applications application myapp description doc term t1 protocol udp",
+	)
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("expected commit to REJECT a chained term whose generated name " +
+			"collides with the authored application myapp-t1 — it silently " +
+			"overwrites it and erases any deny referencing it (#6524)")
+	}
+	if !strings.Contains(err.Error(), "myapp-t1") {
+		t.Fatalf("reject must name the colliding generated application, got: %v", err)
+	}
+}
+
+// TestChainedTermClobberIsSurfacedOnLenientPath covers the tolerant load / HA
+// SyncApply variant. There MixedDirectTermApps is only a warning, so the
+// `description` prefix is not needed at all — a plain `protocol udp term t1 ...`
+// chain reaches the same clobber. The lenient path must still SURFACE the
+// collision; before the fold its only warning was the unrelated mixed
+// direct+term one, which never mentions that an authored application was
+// redefined.
+func TestChainedTermClobberIsSurfacedOnLenientPath(t *testing.T) {
+	cfg, err := CompileConfigLenient(setTree6524(t,
+		"set applications application myapp-t1 protocol tcp",
+		"set applications application myapp-t1 destination-port 22",
+		"set applications application myapp protocol udp term t1 protocol udp",
+	))
+	if err != nil {
+		t.Fatalf("lenient path must not hard-fail: %v", err)
+	}
+	var warned bool
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "myapp-t1") && strings.Contains(w, "collides") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Fatalf("lenient path must warn that the generated myapp-t1 collides with "+
+			"the authored application, got %v", cfg.Warnings)
+	}
+}
+
+// TestSiblingTermClobberStillRejected is the GREEN control for the two tests
+// above: the one-leaf-per-line term spelling was always caught by the #3472
+// gate and must stay caught. It passes on master and on every revision of this
+// branch, proving the chained cases above fail for the chain-specific reason
+// rather than because the gate is broken generally.
+func TestSiblingTermClobberStillRejected(t *testing.T) {
+	_, err := CompileConfig(setTree6524(t,
+		"set applications application myapp-t1 protocol tcp",
+		"set applications application myapp-t1 destination-port 22",
+		"set applications application myapp term t1 protocol udp",
+	))
+	if err == nil {
+		t.Fatal("the sibling term spelling must still hard-reject on the #3472 " +
+			"authored-name collision")
+	}
+}
+
+// TestLeafValueSlotReservedAgainstKeywordText covers the review-fold MINOR: a
+// leaf declared `args: 1` consumes exactly ONE token as its value even when
+// that token happens to spell a grammar keyword. Without the reservation the
+// chain scan synthesized a PHANTOM valueless leaf that reset an
+// already-assigned field.
+//
+// The `description destination-port` case is the security-relevant one: the
+// phantom drove DestinationPort back to "", which on the tolerant path means
+// the application matches EVERY port — the exact widening #6524 exists to
+// close, reintroduced by another route. It also produced a FALSE strict reject
+// ("conflicting duplicate"), and the phantom's unconditional hasDirectBody
+// falsely tripped the #3366 mixed direct+term gate on a term-only application.
+func TestLeafValueSlotReservedAgainstKeywordText(t *testing.T) {
+	t.Run("description text spelling a match keyword", func(t *testing.T) {
+		cfg, err := CompileConfig(setTree6524(t,
+			"set applications application myapp protocol tcp destination-port 8080",
+			"set applications application myapp description destination-port",
+		))
+		if err != nil {
+			t.Fatalf("CompileConfig: %v (a description whose TEXT is a keyword must "+
+				"not synthesize a phantom leaf)", err)
+		}
+		app := cfg.Applications.Applications["myapp"]
+		if app == nil {
+			t.Fatalf("application myapp missing")
+		}
+		if app.DestinationPort != "8080" {
+			t.Fatalf("DestinationPort=%q, want 8080 — a phantom `destination-port` "+
+				"leaf reset the assigned port, so the application matches EVERY port",
+				app.DestinationPort)
+		}
+		if app.Description != "destination-port" {
+			t.Fatalf("Description=%q, want %q", app.Description, "destination-port")
+		}
+	})
+
+	t.Run("description text spelling protocol", func(t *testing.T) {
+		cfg, err := CompileConfig(setTree6524(t,
+			"set applications application myapp protocol tcp destination-port 8080",
+			"set applications application myapp description protocol",
+		))
+		if err != nil {
+			t.Fatalf("CompileConfig: %v", err)
+		}
+		app := cfg.Applications.Applications["myapp"]
+		if app == nil || app.Protocol != "tcp" {
+			t.Fatalf("Protocol=%v, want tcp — a phantom `protocol` leaf wiped it, "+
+				"which fails the whole snapshot closed at runtime (#3323)", app)
+		}
+	})
+
+	t.Run("term-only app with keyword-text description", func(t *testing.T) {
+		cfg, err := CompileConfig(setTree6524(t,
+			"set applications application myapp term t1 protocol tcp destination-port 80",
+			"set applications application myapp description timeout",
+		))
+		if err != nil {
+			t.Fatalf("CompileConfig: %v — the phantom leaf set hasDirectBody and "+
+				"falsely tripped the #3366 mixed direct+term gate", err)
+		}
+		if app := cfg.Applications.Applications["myapp-t1"]; app == nil ||
+			app.Protocol != "tcp" || app.DestinationPort != "80" {
+			t.Fatalf("term app myapp-t1 = %+v, want tcp/80", app)
+		}
+	})
+
+	t.Run("bracket tail still caught after the reservation", func(t *testing.T) {
+		// The reservation must not blind the bracket-list gate: the SECOND
+		// value token is still an unrepresentable tail.
+		_, err := CompileConfig(setTree6524(t,
+			"set applications application myapp protocol tcp destination-port [ 22 23 ]"))
+		if err == nil || !strings.Contains(err.Error(), "23") {
+			t.Fatalf("bracket tail must still reject naming 23, got: %v", err)
+		}
+	})
 }

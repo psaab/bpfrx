@@ -1284,14 +1284,26 @@ type Application struct {
 	//   - a typo'd leaf keyword (`destination-poort 8080`), silently dropped
 	//     along with its value.
 	//
-	// Either way the application ends up matching MORE than authored (a
-	// dropped port constraint matches every port — pkg/policymatch
-	// portMatches treats an empty DestinationPort as match-any), so a policy
-	// referencing it over-permits, or a deny under-matches. Mirroring
-	// UnknownTermLeaves, the offending token is recorded here and the deferred
-	// gate (validateApplicationSyntaxStrict) hard-rejects the first one on the
-	// strict commit path / warns on the tolerant load / peer-sync path (#1960
-	// no-brick).
+	// Either way the dropped token changes what the application matches, in
+	// whichever DIRECTION the dropped constraint pointed: losing a port or
+	// icmp-type WIDENS it (pkg/policymatch treats an empty DestinationPort as
+	// match-any, so a permit over-permits), while losing an alternative from a
+	// bracketed protocol list NARROWS it to the first value (so a deny
+	// under-matches). Both are wrong; neither is uniformly "widening".
+	//
+	// A `description` whose text happens to spell a grammar keyword is NOT
+	// recorded here — applicationDirectLeaves reserves each `args: 1` leaf's
+	// value slot before resuming its keyword scan, so `description
+	// destination-port` is a description reading "destination-port", not a
+	// phantom port statement. An unquoted MULTI-word description tail
+	// (`description my web app`) IS recorded, matching the `scalar: true` arity
+	// the schema already enforces for that leaf at commit (schema_security.go,
+	// validateScalarValueLeaf / #3332).
+	//
+	// Mirroring UnknownTermLeaves, the offending token is recorded here and the
+	// deferred gate (validateApplicationSyntaxStrict) hard-rejects the first one
+	// on the strict commit path / warns on the tolerant load / peer-sync path
+	// (#1960 no-brick).
 	UnknownDirectLeaves []string
 }
 

@@ -62177,3 +62177,64 @@ break — `go vet` confirmed passing under every revert.
     testdata/golden_4406.json},
     pkg/policymatch/app_chained_leaves_6524_test.go,
     docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6524 / PR 6604 hostile-review fold (MERGE-NEEDS-MAJOR) — close a
+  fail-open the PR itself INTRODUCED, plus a phantom-leaf widening.
+  MAJOR: teaching the compiler to follow the flat-set chain also let it reach
+  `term` nodes nested down that chain, so it minted `<parent>-<term>`
+  applications that the collision gate could not see —
+  compiler_applications_collision.go:225 still enumerated `inst.node.Children`
+  while compiler_applications.go had moved to applicationDirectLeaves. The two
+  walks diverged, so a generated name was invisible to every flat-namespace gate
+  (#3472 H01/H02/H03, M08, M03) and silently OVERWROTE an authored application,
+  erasing a deny that referenced it. Verified firsthand on both sides: on my
+  head `set applications application myapp description doc term t1 protocol udp`
+  clobbered an authored `myapp-t1` (tcp/22 -> udp/"") with err=nil and ZERO
+  warnings; on pristine origin/master (detached worktree) `myapp-t1` stayed
+  tcp/22. `description` is the strict-path entry route because it deliberately
+  does not set hasDirectBody (#3366) so MixedDirectTermApps never fires; on the
+  tolerant path that gate is only a warning so no description prefix is needed.
+  The SIBLING spelling was always caught — only the chained shape evaded it.
+  Fixed by extracting applicationTermNodes + applicationTermKeys and routing
+  BOTH the compiler and the collision gate through them, making the "single
+  source of truth" doc claim actually true instead of softening it. The shared
+  helper also always COPIES, removing a latent aliasing hazard: the compiler
+  previously sliced `prop.Keys[1:]` and appended child keys onto it, which can
+  write into the node's own backing array when that slice has spare capacity.
+  MINOR: the chain scan did not reserve the leaf's value slot, so a value token
+  that happens to spell a grammar keyword synthesized a PHANTOM valueless leaf
+  that RESET an assigned field. `description destination-port` drove
+  DestinationPort back to "" — match-every-port on the tolerant path, the exact
+  widening this PR exists to close, reintroduced by another route — plus a FALSE
+  strict "conflicting duplicate" reject; `description protocol` wiped Protocol;
+  and the phantom's unconditional hasDirectBody falsely tripped #3366 on a
+  term-only app. Every `args:1` leaf now consumes exactly one token as its value
+  before the keyword scan resumes. Bracket-tail detection is unaffected (the
+  SECOND value token is still flagged).
+  PUSHED BACK on MINOR 3: the premise "master committed an unquoted multi-word
+  description" is wrong for the real commit path — SchemaValidate on pristine
+  master already rejects it via the #3332 scalar gate ("unexpected trailing
+  token \"web\""), because schema_security.go:1273 marks `description`
+  scalar:true. Only CompileConfig in isolation accepted it. Kept the reject
+  (agreeing with the schema rather than contradicting a prior explicit
+  decision); fixed the message misattribution instead — it no longer claims
+  "widening", which is wrong for a dropped protocol alternative (that NARROWS)
+  and meaningless for a description token.
+  MINOR 2 (chained spelling not individually deletable) documented rather than
+  fixed: it is pre-existing SetPath/DeletePath behaviour for EVERY chained leaf,
+  and addressing a leaf nested under a value node changes path resolution for
+  every `children: nil` leaf in the schema.
+  NIT: the keyword canary was list==copy-of-list; it now enumerates
+  schemaApplications.children["application"].children in BOTH directions.
+  Fail-on-revert verified in a THROWAWAY detached worktree (never the PR
+  worktree), build+vet CLEAN there so each red is an ASSERTION: reverting only
+  the collision-gate enumeration turns the 2 clobber tests RED while the sibling
+  baseline, both over-reach guards and all MINOR tests stay GREEN; reverting only
+  the value-slot reservation turns the 3 phantom subtests RED while the
+  bracket-tail subtest and both over-reach guards stay GREEN.
+  Full pkg/config + pkg/policymatch green; build, vet, gofmt clean.
+- **File(s)**: pkg/config/{compiler_applications.go,
+    compiler_applications_collision.go,compiler_validate_strict_application.go,
+    types_security.go,compiler_application_chained_leaves_6524_test.go},
+    docs/config-schema.md, _Log.md

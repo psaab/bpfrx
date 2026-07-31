@@ -145,10 +145,25 @@ func applicationDirectLeaves(appNode *Node) (leaves []*Node, unknown []string) {
 					}
 					break
 				}
-				// This leaf's value tokens run until the next known keyword.
+				// RESERVE the value slot before resuming the keyword scan.
+				// Every one of these leaves is `args: 1`, so it consumes
+				// exactly ONE token as its value even when that token happens
+				// to spell a grammar keyword — `description destination-port`
+				// is a description whose text is "destination-port", not a
+				// description followed by a port statement. Without the
+				// reservation the scan synthesized a PHANTOM valueless
+				// `destination-port` leaf that reset an already-assigned field
+				// back to "" (an unset port matches EVERY port on the tolerant
+				// path — the exact widening this change exists to close) and
+				// unconditionally set hasDirectBody, falsely tripping the
+				// #3366 mixed direct+term gate on a term-only application.
 				start := i
 				i++
 				valStart := i
+				if i < len(n.Keys) {
+					i++
+				}
+				// Any FURTHER non-keyword tokens are a bracket-list tail.
 				for i < len(n.Keys) && !applicationDirectLeafKeywords[n.Keys[i]] {
 					i++
 				}
@@ -185,6 +200,50 @@ func applicationDirectLeaves(appNode *Node) (leaves []*Node, unknown []string) {
 	}
 	walk(appNode.Children)
 	return leaves, unknown
+}
+
+// applicationTermKeys reassembles the token stream of an inline `term` node
+// across both AST shapes — hierarchical packs every value onto prop.Keys, the
+// flat-set path splits them across prop.Keys and prop.Children — and returns
+// nil for a term with no name token.
+//
+// It is the shared reader for the two places that must agree on what a term
+// generates: compileApplications (which WRITES `<parent>-<term>` into
+// apps.Applications) and collectApplicationCollisions (which must PREDICT those
+// same names to guard the flat Junos namespace). Before #6524 both open-coded
+// the reassembly; the collision gate additionally enumerated the application
+// node's immediate Children while the compiler moved to applicationDirectLeaves,
+// so a CHAINED `term` was compiled but invisible to every namespace gate (see
+// collectApplicationCollisions).
+//
+// The returned slice is always a fresh copy. The compiler previously sliced
+// `prop.Keys[1:]` and appended child keys onto it, which can write into the
+// node's own backing array whenever that slice has spare capacity — a latent
+// AST-corruption hazard the copy removes.
+func applicationTermKeys(prop *Node) []string {
+	if prop == nil || len(prop.Keys) < 2 {
+		return nil
+	}
+	allKeys := append([]string(nil), prop.Keys[1:]...)
+	for _, c := range prop.Children {
+		allKeys = append(allKeys, c.Keys...)
+	}
+	return allKeys
+}
+
+// applicationTermNodes returns the inline `term` leaves of an `applications
+// application <name>` body, walking the direct body with applicationDirectLeaves
+// so a term reached through a flat-set CHAIN is found in both AST shapes. It is
+// the enumeration half of the term contract shared with applicationTermKeys.
+func applicationTermNodes(appNode *Node) []*Node {
+	leaves, _ := applicationDirectLeaves(appNode)
+	var terms []*Node
+	for _, leaf := range leaves {
+		if leaf.Name() == "term" {
+			terms = append(terms, leaf)
+		}
+	}
+	return terms
 }
 
 func compileApplications(node *Node, apps *ApplicationsConfig) error {
@@ -328,14 +387,9 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 			case "term":
 				// Inline term: "term <name> [alg <a>] protocol <p> [source-port <sp>]
 				//               [destination-port <dp>] [inactivity-timeout <t>];"
-				if len(prop.Keys) < 2 {
+				allKeys := applicationTermKeys(prop)
+				if len(allKeys) == 0 {
 					continue
-				}
-				// Hierarchical: all values in prop.Keys (inline statement)
-				// Flat set: values split across prop.Keys and prop.Children
-				allKeys := prop.Keys[1:]
-				for _, c := range prop.Children {
-					allKeys = append(allKeys, c.Keys...)
 				}
 				termApps := parseApplicationTerms(appName, allKeys)
 				terms = append(terms, termApps...)

@@ -1033,6 +1033,49 @@ application body holds ONE protocol and ONE port (`Application.Protocol` /
 sub-blocks are for), so the bracket tail is unrepresentable rather than merely
 mis-read.
 
+Two properties of that scan are load-bearing and easy to get wrong:
+
+- **Reserve the value slot before resuming the keyword scan.** These leaves are
+  `args: 1`, so each consumes exactly ONE token as its value *even when that
+  token spells a grammar keyword*. `description destination-port` is a
+  description whose text is `destination-port`, not a description followed by a
+  port statement. Without the reservation the scan synthesizes a phantom
+  valueless leaf that RESETS an already-assigned field — driving
+  `DestinationPort` back to `""` (match-every-port on the tolerant path, the
+  very widening this section is about), wiping `Protocol` to `""` (a
+  config-wide fail-closed via #3323), and setting `hasDirectBody`
+  unconditionally, which falsely trips the #3366 mixed direct+term gate on a
+  term-only application. `description` is the only realistic vector — no
+  protocol name/alias, `junosServicePorts` entry, ALG name, or numeric
+  timeout/ICMP value collides with a grammar keyword.
+- **Every consumer of the body must share this walk.** The chain reaches `term`
+  nodes too, so `compileApplications` mints `<parent>-<term>` applications from
+  a chained term. `collectApplicationCollisions`
+  (`compiler_applications_collision.go`) predicts those same generated names to
+  guard the flat Junos namespace (#3472/#3339); while it enumerated
+  `inst.node.Children` directly it could not see a chained term, so a generated
+  name silently OVERWROTE an authored application and erased any deny
+  referencing it — with no commit error. Both sides now go through
+  `applicationTermNodes` + `applicationTermKeys`. Adding a third reader of the
+  application body means routing it through the same helpers, not open-coding a
+  fourth traversal.
+
+**Known limitation — the chained spelling is enforced but not individually
+editable.** Because the leaves are nested rather than siblings,
+`delete applications application myapp destination-port 8080` (and the bare
+`... destination-port`) fail with `path not found`: the node lives under
+`protocol tcp`, not at application level. Re-setting a different port adds a
+second sibling, which the #5574 conflicting-duplicate gate then rejects, and
+that gate's remediation text ("split conflicting values into separate `term`
+sub-blocks") is aimed at a genuine conflict rather than at "I want to change the
+port". The escape is to delete the head of the chain (`delete applications
+application myapp protocol tcp`), which drops the whole line, and re-author it.
+This is pre-existing `SetPath`/`DeletePath` behaviour for every chained leaf,
+not specific to applications — fixing it means teaching the AST editor to
+address a leaf nested under a value node, which changes path resolution for
+every `children: nil` leaf in the schema and is deliberately out of scope here.
+Prefer the one-leaf-per-line spelling when authoring config you expect to edit.
+
 **Why the fix is in the COMPILER, not the schema.** Typing the three leaves (or
 tagging them `scalar: true`) would reject the chained form at commit-check, but
 `CompileConfigLenient` — the boot-load and HA `SyncApply` path — downgrades a

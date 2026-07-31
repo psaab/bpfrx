@@ -444,12 +444,14 @@ func validateApplicationSyntaxStrict(cfg *Config) error {
 				"application %q: unknown statement %q in the application body; a "+
 					"custom application accepts only protocol / source-port / "+
 					"destination-port / inactivity-timeout / timeout / icmp-type / "+
-					"icmp-code / alg / description / term, each taking a SINGLE value "+
-					"(an unrecognized token — including the tail of a bracketed list "+
-					"such as `protocol [ tcp udp ]`, which a direct application body "+
-					"cannot represent — is silently dropped, widening the application "+
-					"to match more than intended; use separate `term` sub-blocks for "+
-					"multiple protocols or ports)",
+					"icmp-code / alg / description / term, each taking a SINGLE value. "+
+					"The token is silently dropped, which changes what the application "+
+					"matches: dropping a port or icmp-type constraint WIDENS it (an "+
+					"unset port matches every port), while dropping an alternative from "+
+					"a bracketed list such as `protocol [ tcp udp ]` NARROWS it to the "+
+					"first value — a direct application body holds one protocol and one "+
+					"port, so use separate `term` sub-blocks for multiple protocols or "+
+					"ports",
 				name, app.UnknownDirectLeaves[0])
 		}
 		// #4337: a per-application `alg <name>` outside the four xpf implements
