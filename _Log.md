@@ -1,3 +1,289 @@
+## 2026-07-31 — #6532 round-4 fold: stopped patching callee shapes, changed the approach
+
+- **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact, PR #6602)
+- **Action**: Codex found two more escapes on db5162267 — `[](byte)(x.PSK)` and
+  `([](byte))(x.PSK)` (the callee was de-parenthesized but `arr.Elt` was still
+  required to be an immediate Ident), and `string(x.PSK[:])` (trailingIdent did
+  not traverse SliceExpr). It also named the escape that ends the approach:
+  `type Clear string; Clear(x.PSK)` unwraps the secret and NO builtin-name
+  matching can ever see it, because a conversion's callee is a type expression
+  whose grammar is open.
+  Per the team-lead directive, stopped patching outward and changed the design:
+  the conversion check NO LONGER INSPECTS THE CALLEE AT ALL. It now fires on a
+  one-argument call whose argument names a Secret-bearing field. Every
+  conversion — builtin, parenthesized at any depth, aliased, or a named string
+  type declared anywhere — is a one-argument call, so the whole callee-shape
+  dimension collapses to zero code. One argument is a deliberate line, not an
+  oversight: the SAFE idiom `fmt.Fprintf(buf, "%s", x.PSK)` is multi-argument
+  and redacts correctly, so flagging it would fire on every correct render.
+  `secretUnwrapConversionName` and `unwrapParens` were deleted outright.
+  The remaining gated dimension — the argument's wrapper chain — is closed by
+  ENUMERATING go/ast node kinds rather than source shapes: secretExprTail now
+  handles Paren, Star, Index, IndexList, Slice, TypeAssert and address-of Unary.
+  Harvest gaps Codex flagged also fixed: typeMentionsSecret now strips parens
+  (`PSK (Secret)` is legal) and follows ChanType; structTypeOf follows map KEYS
+  as well as values (an anonymous struct is a legal comparable map key).
+  Added TestSecretFieldHarvestShapes — 13 synthetic declaration shapes plus a
+  negative control — because the harvest had been widened in prose and code but
+  never tested, the same gap that let the scanner ship blind twice.
+  STATED THE HARD LIMIT, which is the substantive answer rather than another
+  near-miss: this guard is syntactic and fires where a field is NAMED, so it
+  cannot follow a value into a local, a parameter, a helper return, an
+  out-of-package field or a multi-argument handoff, nor see append/copy/range/
+  reflection. Closing those needs go/types (x/tools is only an INDIRECT
+  dependency today) or an explicit-allowlist inversion over all 42 conversions
+  in pkg/grpcapi (measured, not estimated). Named the clean upstream fix:
+  making config.Secret a struct instead of a named string type would make
+  `string(s)` fail to COMPILE and collapse the entire shape space to the single
+  Reveal accessor — a pkg/config-wide change (Secret is comparable and used as
+  a map key), so it belongs in its own issue, not this PR.
+  Also corrected the remaining false claims: the file header no longer says
+  "the TWO ways to defeat"; the Reveal false positive is now stated as EVERY
+  selector named Reveal (package members and fields, not merely methods); and
+  the residual list no longer claims named-type conversions escape, because
+  after the redesign they do not.
+  Validation — 10 mutations, each in a throwaway detached worktree with
+  build+vet CLEAN so every red is an assertion:
+    M1 drop ParenExpr from secretExprTail   -> parenthesized_conversion_argument
+    M2 drop SliceExpr                       -> sliced_field, sliced_field_with_bounds
+    M3 drop StarExpr                        -> pointer_deref, address-of_field,
+                                               pointer_deref_of_indexed_collection
+    M4 drop IndexExpr                       -> indexed_collection_field, +deref
+    M5 drop TypeAssertExpr                  -> type-asserted_field
+    M6 drop ParenExpr from typeMentionsSecret -> parenthesized_type
+    M7 drop ChanType                        -> channel_of_Secret
+    M8 stop following map KEY               -> map_KEY_anonymous_struct
+    M9 drop embedded-field handling         -> embedded_Secret
+    M10 RESTORE callee-shape gating         -> 13 subtests RED, including both
+        named-string-type cases — the empirical proof that the redesign, not
+        another shape patch, was the necessary fix.
+  Meta-tests now run 42 subtests. Probe worktree removed; the PR worktree was
+  never used for a probe. gofmt clean, go build ./... and go vet ./... clean,
+  pkg/grpcapi + pkg/api + pkg/config + pkg/cli green.
+- **File(s)**: pkg/grpcapi/server_fabric_secret_render_6532_test.go,
+    docs/architecture.md, _Log.md
+
+## 2026-07-31 — #6532 round-3 fold: parenthesized callees escaped the scanner
+
+- **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact, PR #6602)
+- **Action**: Codex found the round-2 scanner still missed shapes it claimed to
+  cover, and it was right. `(x.PSK.Reveal)()`, `(string)(x.PSK)`,
+  `([]byte)(x.PSK)` and `((string))(x.PSK)` are legal Go that gofmt leaves
+  untouched, and every one presents `call.Fun` as an `*ast.ParenExpr` — proved
+  firsthand with a standalone go/ast program: all four print
+  `Fun=*ast.ParenExpr selector=false ident=false arraytype=false PAREN=true`,
+  so neither the Reveal check nor the conversion check saw them. A method VALUE
+  (`reveal := x.PSK.Reveal`) escaped too: its call site is `reveal()` with no
+  selector at all.
+  Same failure mode as the round-2 MAJOR, one level up — the check was correct
+  for the shapes it was tested against, and the meta-test only fed shapes the
+  scanner already handled. A meta-test that exercises only what already works
+  proves nothing.
+  Fix, and the AST program pointed at a better one than paren-unwrapping the
+  Reveal callee: `ast.Inspect` reaches every `.Reveal` SelectorExpr regardless
+  of parenthesization AND when it is never called (verified — it printed the
+  selector for both the paren-called form and the method-value binding). So
+  Reveal detection now matches the SELECTION rather than the call, covering all
+  three shapes uniformly with no paren logic. The conversion check gets
+  recursive `unwrapParens` on the callee (single-level is not enough —
+  `((string))(x)` is legal).
+  MINOR 1 — architecture.md said "exactly two escape hatches" while the test
+  itself listed append/index/range/reflection; that contradiction is resolved
+  by saying two DETECTED forms and enumerating the residuals, now including
+  `copy(dst, secret)`. `collectSecretFieldNames` recursed only when the
+  immediate expression was a StructType, missing `[]struct{...}`,
+  `*struct{...}`, `map[K]struct{...}` and embedded unnamed Secret fields; it
+  now looks through slice/array/pointer/map via structTypeOf and harvests an
+  embedded Secret under its type name. Harvest still resolves the same 13 live
+  names (no live nested-struct Secret exists today — the widening is for the
+  next one).
+  MINOR 2 — completed the false-positive disclosure: ANY method named Reveal is
+  flagged whatever its receiver (no type resolution); the conversion check
+  matches a trailing IDENTIFIER so unrelated locals and parameters named
+  Password/PSK are flagged too, not merely fields; shadowing applies to rune,
+  uint8 and int32 as well as string and byte.
+  Validation — per-shape mutation, each in a throwaway detached worktree with
+  build+vet CLEAN so every red is an assertion:
+    A. drop unwrapParens from the conversion callee -> RED on
+       parenthesized_string_conversion, parenthesized_byte_slice_conversion,
+       doubly_parenthesized_conversion.
+    B. revert Reveal to CallExpr-anchored matching -> RED on
+       parenthesized_Reveal_callee, Reveal_bound_as_a_method_value.
+    C. drop ParenExpr from trailingIdent -> RED on
+       parenthesized_conversion_argument.
+  That is all six newly-covered shapes, each proven to fail without its fix.
+  Meta-test now runs 15 shapes plus the negative control. Probe worktree
+  removed; the PR worktree was never used for a probe. gofmt clean, go build
+  ./... and go vet ./... clean, pkg/grpcapi + pkg/api + pkg/config + pkg/cli
+  green.
+- **File(s)**: pkg/grpcapi/server_fabric_secret_render_6532_test.go,
+    docs/architecture.md, _Log.md
+
+## 2026-07-31 — #6532 round-2 fold: my previous fold BROKE the guard it widened
+
+- **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact, PR #6602)
+- **Action**: Codex re-gate found a MAJOR in the round-1 fold, and it was
+  correct. Widening the structural guard from a Reveal() line-grep to an AST
+  scan, I put `if !ok || len(call.Args) != 1 { return true }` ahead of the
+  Reveal check. A zero-argument method call has len(Args)==0 — the receiver
+  lives in CallExpr.Fun, not Args — so the Reveal branch became UNREACHABLE
+  DEAD CODE. Net effect: I added conversion detection and silently deleted the
+  original protection, on exactly the paths (wireguard / ipsec-statistics /
+  bfd-peers, which short-circuit on a nil dataplane) where this guard is the
+  ONLY net. Proved firsthand with a standalone go/ast program:
+  `CallExpr Reveal(): len(Args)=0 -> gate returns early: true`.
+  Root cause of it shipping: my round-1 mutation probe for the Reveal branch
+  injected `var _ = "x.Reveal()"` — a STRING LITERAL. That matched the old
+  line-grep, but a string literal is not a CallExpr, so the probe was never
+  valid against the AST implementation, and I never re-ran it after the
+  rewrite. I proved the NEW detection fired and never re-proved the OLD one.
+  Fix: extracted the scan into a pure function (scanSecretUnwraps) returning
+  findings, with the two detections INDEPENDENT — Reveal is matched before any
+  argument-count gate, and neither shares a precondition with the other.
+  Added TestSecretUnwrapScannerDetectsBothForms, a meta-test that feeds the
+  scanner synthetic sources and asserts it REPORTS each shape it claims: the
+  Reveal accessor, string/[]byte/[]rune/[]uint8 conversions, a conversion
+  nested in a call argument, through a pointer deref, and of an indexed
+  collection field — plus a negative control that a plain %s render of a
+  Secret is NOT flagged.
+  MINOR 1 — widened the harvest. `APIKeys []Secret` (types_system.go:377) is
+  REAL, not hypothetical, and the old `field.Type == Ident("Secret")` match
+  missed it, so `string(...APIKeys[i])` went undetected. typeMentionsSecret now
+  walks slice/array/pointer/map/qualified shapes and recurses into nested
+  anonymous structs; harvest went 12 -> 13 names, gaining APIKeys. Confirmed
+  the real WireGuard names ARE covered (PresharedKeyHex, WgLocalPrivkeyHex).
+  Rewrote the scope block to state the residuals COMPLETELY — aliased locals,
+  parameters, helper returns, out-of-package fields, type aliases, and
+  non-conversion unwrapping (append/index/range/reflection) — and to record
+  that name-based matching false-positives on unrelated fields named
+  Password/PSK and on shadowed string/byte identifiers, which is the correct
+  bias on a network-exposed surface.
+  MINOR 2 — corrected three false doc claims: architecture.md no longer says
+  the surface is safe "because no Reveal() call exists" (both escape hatches
+  now named, with the residuals and the meta-test); the test file header no
+  longer names the old test or the Reveal-only rationale; system-login.md no
+  longer groups `show snmp v3` with the masked community path (the snmp-v3
+  topic renders no community and no placeholder) and now states that remote
+  `cli show system services` uses the `system-services` topic, whose renderer
+  omits SNMP entirely (verified: zero SNMP references in
+  pkg/grpcapi/server_show_system.go).
+  Validation: the meta-test was proven to CATCH this exact MAJOR — in a
+  throwaway detached worktree, reintroducing `len(call.Args) != 1` ahead of
+  the Reveal check makes TestSecretUnwrapScannerDetectsBothForms/Reveal_accessor
+  go RED with build+vet CLEAN, while TestGRPCAPINeverUnwrapsSecretCleartext
+  stays GREEN — demonstrating the real guard structurally cannot detect its own
+  breakage and the meta-test is load-bearing. Probe worktree removed; the PR
+  worktree was never used for a probe. gofmt clean, go build ./... and
+  go vet ./... clean, pkg/grpcapi + pkg/api + pkg/config + pkg/cli green.
+- **File(s)**: pkg/grpcapi/server_fabric_secret_render_6532_test.go,
+    docs/{architecture.md,system-login.md}, _Log.md
+
+## 2026-07-31 — #6532 review fold: three MINORs, all about artifacts overstating coverage
+
+- **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact, PR #6602)
+- **Action**: Hostile review returned MERGE-NEEDS-MINOR with no code-correctness
+  defect. All three MINORs were artifacts claiming more than they delivered;
+  each is now either corrected or actually delivered.
+  MINOR 1 — the "#4111 behaviour is unchanged / super-user still reads
+  cleartext" claim is FALSE for the remote `cli` binary. `cmd/cli/show.go`
+  routes `show snmp` straight to the RPC via `c.showText("snmp")`, and
+  `cmd/cli` has zero login-class awareness (verified: no userClass/LoginClass/
+  PermAll/showConfigRedacted hits), so a super-user on `cli` now gets
+  `##SECRET-DATA##`. Kept the posture — threading a class into pkg/grpcapi is
+  impossible today and meaningless on the fabric listener where the caller is
+  the peer chassis, and `cli show configuration snmp` was ALREADY masked for
+  every class by #4051, so the two remote read-back paths now agree instead of
+  contradicting. Amended docs/system-login.md: the #4111 paragraph now scopes
+  its allowance to the CONSOLE CLI, and a new callout states the remote-CLI
+  masking plus the operational consequence (no remote read-back; recover from
+  console as super-user or the DR archive, noting a redacted export is
+  deliberately not restorable per #4060).
+  MINOR 2 — the MonitorInterface audit-register entry was factually wrong on
+  all three counts. It streams pre-formatted TEXT frames of counter snapshots
+  (RenderTrafficSummary/RenderSingleInterface), it DOES render configuration
+  (interface set + display names from the active config), and there is no pcap
+  anywhere in server_diag_monitor.go. Rather than just restate it, promoted it
+  to a REAL probe: a monitorFrameSink mock stream captures the first frame and
+  aborts, so it is now driven with a nil dataplane like the seven unary probes.
+  MINOR 3 — `TestGRPCAPINeverRevealsSecretCleartext` claimed "the ONE way to
+  defeat String() is Reveal()". False: config.Secret is `type Secret string`,
+  so `string(x.PSK)` / `[]byte(x.PSK)` yields cleartext and a Reveal() grep
+  misses it. Replaced the line-grep with an AST scan covering BOTH paths,
+  matching conversions against the Secret-typed field names parsed from
+  FILE-SCOPE declarations in pkg/config (12 unique names; the function-local
+  `Name Secret` alias fields in the SNMPCommunity marshallers are correctly
+  excluded). Renamed to TestGRPCAPINeverUnwrapsSecretCleartext and stated the
+  real residual instead of overclaiming again: a conversion applied to a local
+  variable previously assigned from a secret field is not caught.
+  NIT 4 — delivered the determinism parity rather than scoping the claim.
+  gRPC showSNMP now sorts trap groups and USM users as well as communities
+  (shared sortedMapKeys helper), and both pkg/cli community loops sort via
+  sortedSNMPCommunityNames. This matters most under redaction: every displayed
+  key is the same placeholder, so an unsorted map printed N indistinguishable
+  lines with shuffling authorization modes.
+  NIT 5 — documented that the interceptor source scan is textual and reads only
+  the function bodies, so hoisting a method-name constant into a helper would
+  silently drop it from the audited set; added a canary that fails if the scan
+  stops finding SystemAction (reachable ONLY via the scan — it is in neither
+  allowlist map).
+  Validation: the widened scan was proven firsthand in a THROWAWAY detached
+  worktree, twice. Injecting `string(u.AuthPassword)` into showSNMP: build+vet
+  CLEAN, scan FAILS as an assertion. Then the reviewer's actual scenario —
+  `string(u.PrivPassword)` injected BEHIND a nil-dataplane short-circuit: the
+  empirical sweep PASSES (blind to that path) while the structural guard FAILS,
+  proving it is the only net there. Probe worktree removed; PR worktree never
+  used for a revert probe. New determinism test mutation-tested (reverting the
+  community sort goes RED at attempt 4). gofmt clean, go build ./... and
+  go vet ./... clean, pkg/grpcapi + pkg/api + pkg/config + pkg/cli +
+  pkg/refactoraudit green.
+- **File(s)**: pkg/grpcapi/{server_fabric_secret_render_6532_test.go,
+    server_show_snmp_community_redaction_6532_test.go,
+    server_show_dhcp_lldp_snmp.go},
+    pkg/cli/{show_services_snmp.go,cli_show_system.go},
+    docs/system-login.md, _Log.md
+
+## 2026-07-31 — #6532: redact the SNMP community on the fabric-reachable gRPC ShowText
+
+- **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact)
+- **Action**: gRPC `ShowText{Topic:"snmp"}` rendered the SNMPv1/v2c community
+  string — which IS the authenticator for v1/v2c — in cleartext. The usual
+  loopback bound does not apply: `ShowText` is on the cluster-fabric allowlist
+  (#4122), so the render is reachable from the peer chassis over the fabric IP.
+  Both sibling surfaces had already been hardened (REST #5315, CLI #4111) and
+  this one was left behind. The community is the ONE operator secret the
+  `config.Secret` newtype does not protect — it stays a plain string because it
+  is the `Communities` map key — so every manual renderer must mask it by hand,
+  which is exactly how three independent copies of the rule let one drift.
+  Fixed by masking unconditionally on the gRPC path (gRPC carries no login
+  class to gate on, matching REST and the sibling `ShowConfig` #4051), and by
+  collapsing all four render sites onto one shared helper,
+  `config.SNMPCommunityDisplayName(name, redact)`. The CLI keeps its per-class
+  predicate (`showConfigRedacted()`), so #4111 behaviour is unchanged:
+  view-only masked, super-user cleartext.
+  Audited the whole fabric allowlist as the issue asked. Empirical sweep: one
+  config staging every secret leaf in the redaction SSOT, driven through all
+  ~115 ShowText topics and every allowlisted RPC — the SNMP community was the
+  only leak. Structural reason: every other secret is `config.Secret` (its
+  `String()` masks under %s/%v, #2053) and `pkg/grpcapi` never calls the
+  `Reveal()` cleartext accessor. Both facts are now asserted, along with a
+  completeness gate that enumerates the allowlist maps AND the method names the
+  interceptor source special-cases (so `SystemAction` is covered too), and a
+  ShowText topic-coverage gate derived from the dispatcher source.
+  Validation: RED-on-revert verified as an assertion failure (not a build
+  break) on the community mask; all four new gates mutation-tested individually
+  (drop the mask / drop a probe / drop a topic / inject a `Reveal()`), each RED,
+  all restore GREEN. A staging-is-real test asserts all 21 secret sentinels
+  actually reach the committed active config, so the "no secret appeared"
+  scans cannot pass vacuously. Full pkg/grpcapi, pkg/api, pkg/cli, pkg/config,
+  pkg/daemon, pkg/dataplane/userspace suites green (the event-stream socket
+  tests need TMPDIR=/tmp — sun_path 108). Heatmap regenerated
+  (types_system.go 1645 -> 1684).
+- **File(s)**: pkg/config/types_system.go, pkg/grpcapi/server_show_dhcp_lldp_snmp.go,
+    pkg/api/show_text.go, pkg/cli/{show_services_snmp.go,cli_show_system.go},
+    pkg/grpcapi/{server_show_snmp_community_redaction_6532_test.go,
+    server_fabric_secret_render_6532_test.go},
+    docs/{architecture.md,system-login.md,refactoring-audit-current.txt}, _Log.md
+
 ## 2026-07-26 — #6474: re-NAT outbound ICMP errors through source NAT
 
 - **Timestamp**: 2026-07-26 (fix/6474-snat-outbound-icmp-error, stacked on
@@ -62362,3 +62648,297 @@ break — `go vet` confirmed passing under every revert.
   TCP/22 under the MAJOR revert with every named over-reach guard green, and
   confirmed collision enumeration and compilation still share the one walk.
 - **File(s)**: pkg/config/compiler_validate_strict_application.go, _Log.md
+- **Action**: #4146 destination slice — enforce a `to-zone junos-host` DENY that
+  carries an explicit `match destination-address` on the DIRECT host-bound path.
+  #4932 shipped the kernel-nft projection of the representable junos-host DENY
+  class, but `junosHostProjectTerm` marked ANY term with a scoped destination
+  un-representable. Because the representability gate is WHOLE-PROGRAM, a single
+  `match destination-address <fw-ip>` deny not only went unenforced itself — it
+  silently disabled kernel enforcement of EVERY other junos-host deny on that
+  ingress zone. Reproduced firsthand before touching code: the projection
+  returned `representable=false`, zero programs, empty `RenderedPolicyKeys`,
+  while `policymatch.Match` (the Go mirror of Rust
+  `evaluate_junos_host_policy`, which already matched destination via
+  `rule_l3_matches(rule, state, src_ip, dst_ip)`) returned DENY — a fail-open on
+  the only surface that actually sees the packet.
+  Fix: project the destination dimension onto the rule (`Dst` / `DstExcluded` /
+  `DstAny`) and render `<fam> daddr <set>` / `daddr != <set>` AFTER the source
+  predicate, on BOTH nft surfaces (the exec-nft oracle in `daemon_nft.go` and
+  the production netlink installer in `pkg/nftables`). The ZONE scope stays
+  `iifname` — the daddr predicate only NARROWS on top of it, so a
+  destination-scoped deny on a data zone can never suppress management ingress
+  on a lifeline. Source and destination now route through ONE shared projection
+  formula (`junosHostProjectAddrMatch`) so the #5828 degenerate `any`+excluded
+  case ("every address EXCEPT every address" = the empty set => project NO rule,
+  never an unconditional drop) cannot be fixed on one dimension and regress on
+  the other. A destination-scoped PERMIT stays un-representable: a permit is
+  projected only as a `saddr !=` subtraction of later denies, which cannot
+  express a destination-dimension carve — the whole program then emits nothing
+  and every policy keeps the #4168 warning.
+  Validation: full `go test ./...` green (58 pkgs; the refactoring-audit heatmap
+  canary was regenerated for the +25 LOC in daemon_nft.go). The T1 nft-vs-netlink
+  ruleset-parity gate RAN (not skipped) under `unshare -rn` with the new
+  positive/negated daddr constructs added to its fixture, and all six of its
+  mutation-sensitivity sub-cases still diverge. Mutation-probed in a throwaway
+  detached worktree.
+- **File(s)**: pkg/config/{junos_host_deny.go,junos_host_deny_dst_4146_test.go},
+    pkg/daemon/{daemon_nft.go,daemon_nft_netlink.go,daemon_nft_netlink_parity_test.go,
+    host_inbound_junos_host_4146_test.go,host_inbound_junos_host_dst_4146_test.go},
+    pkg/nftables/{netlink_spec.go,netlink_hostinbound.go},
+    pkg/dataplane/userspace/junos_host_deny.go,
+    docs/host-inbound-service-matrix.md, docs/refactoring-audit-current.txt, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #4146 review-fold (independent hostile review, MERGE-NEEDS-MINOR).
+  (1) `junosHostProjectAddrMatch` classified an `*-excluded` whose resolved set
+  is empty as match-ALL. That is correct when the OTHER family carries a prefix
+  (the intended match-all-of-opposite-family arm) but wrong when the set is
+  empty across BOTH families: Rust's `rule_l3_matches` fails CLOSED there
+  (`!(v4_empty && v6_empty)`), so the projection widened the authored scope to
+  every firewall address while the dataplane denied nothing — with
+  `application any` a whole-zone host-inbound blackhole. Cross-family emptiness
+  is now computed by the caller (which has both families) and passed in; the
+  excluded arm fails closed on it. Strict commit already rejects an
+  empty/dangling address-set, but the LENIENT load / peer-sync path does not, so
+  a config persisted by an older binary reaches the projection. Note the same
+  class already ships on the SOURCE axis; both axes are fixed by one formula.
+  (2) The T1 nft-vs-netlink parity gate — self-described as the security merge
+  gate that MUST NOT silently skip — used a bare `exec.LookPath("nft")` while
+  `nft` ships in /usr/sbin here, so a non-root PATH made it SKIP while `make
+  test` still reported green. Switched to the existing `findNft()` helper.
+  IMPORTANT: fixing only the presence check turned the silent skip into a FALSE
+  FAILURE, because the oracle execs bare `"nft"` at five sites which also
+  resolve through PATH; all five now use the resolved binary. Verified the gate
+  RUNS and PASSES with nft absent from PATH.
+- **File(s)**: pkg/config/junos_host_deny.go,
+    pkg/config/junos_host_deny_dst_4146_test.go,
+    pkg/daemon/daemon_nft_netlink_parity_test.go, _Log.md
+- **Action**: #6532 review-fold round 5 (Codex MERGE-NEEDS-MINOR). Codex confirmed
+  the argument-gating inversion CLOSES the conversion-callee shape class and the
+  production redaction is correct; all three findings were claim-accuracy plus one
+  small harvest gap. (1) `collectSecretFieldNames` now recurses into BOTH map
+  halves explicitly — `structTypeOf` can only return one struct, so
+  `map[struct{ Key Secret }]struct{ Value Secret }` harvested `Key` and silently
+  never visited `Value` while the doc claimed both sides were followed. (2)
+  Replaced the "TWO independent ways to defeat" framing with "TWO DETECTED
+  SHAPES", since Go's expression grammar is open and enumerating defeat
+  mechanisms is not something a syntactic guard can claim. (3) Added an explicit
+  RESIDUALS block naming what is NOT flagged: a COMPUTED argument
+  (`Clear(x.PSK + "")`, `Clear([]config.Secret{x.PSK}[0])`, `Clear(<-ch)`) which
+  passes the arity gate but does not resolve to a harvested field name;
+  `copy(dst, secret)` / `append(dst, secret...)` which are two-argument; and
+  reflection / interface-value unwraps. No production code changed. Full
+  `go test ./pkg/grpcapi/` green.
+- **File(s)**: pkg/grpcapi/server_fabric_secret_render_6532_test.go, _Log.md
+- **Action**: #6551 — bound the SNMP GETBULK grid AT the response ceiling instead
+  of expanding it fully and trimming afterwards.
+  Reproduced first. With 50 interfaces, a 4094-byte v2c GETBULK carrying 580
+  minimal repeater OIDs and max-repetitions >= 100 built 58,000 varbinds (405 ms
+  inside buildBulkVarbinds) to return 116, and answered in 667 ms end to end
+  against a ~2.5 us single-varbind poll — ~1.5 req/s saturates the single serial
+  SNMP goroutine permanently. The issue's ~36,900 / ~300 ms figures are an
+  undercount; the extra ~260 ms beyond the build is trimToFit binary-searching
+  ~16 full re-encodes of the 58,000-varbind list. repeaterCount = len(oids) -
+  nonRepeaters is capped nowhere on the decode path; only maxRepetitions was
+  clamped (100).
+  Fix: buildBulkVarbinds now takes the same maxBytes ceiling its caller trims to
+  and accumulates the EXACT encoded size of each emitted varbind (bulkBudget /
+  varbindEncodedLen), returning as soon as the varbinds built exceed it. Both
+  call sites — handleGetBulk (v2c, effectiveMaxSize(maxPacketSize)) and the v3
+  dispatcher (effectiveMaxSize(msgMaxSize)) — hand it the ceiling they already
+  computed for trimToFit. Output-neutral: the accumulated varbind bytes are a
+  strict lower bound on any message carrying them, so every dropped cell is one
+  trimToFit would have discarded; RFC 3416 4.2.3 removes surplus bindings from
+  the END of the ordered set, which is exactly the prefix preserved, so #5065
+  repetition-major order and per-column endOfMibView placement are untouched.
+  Post-fix the same request builds 118 varbinds in 48 us and answers in 1.0 ms
+  with a byte-identical 4092-byte / 116-varbind response.
+  Fail-on-revert (neutralize bulkBudget.add to `return false` — compiles clean,
+  no build break): TestGetBulkBuildBounded_6551 RED at 58,000 built vs a 683
+  structural cap, TestGetBulkBuildBoundedV3_6551 RED at 56,400. Neutralizing the
+  CALL SITE instead (math.MaxInt budget) leaves those green, so
+  TestGetBulkCostDoesNotScaleWithMaxRepetitions_6551 covers it end to end —
+  1.4x M=1-vs-M=100 cost ratio with the fix, 309.7x without, threshold 10x.
+  Over-reach guard TestGetBulkBoundedMatchesUnbounded_6551 (9 shapes: small,
+  non-repeaters, MIB-exhausted columns, oversized) compares byte-for-byte
+  against a math.MaxInt-budget build — i.e. against the pre-fix expansion — and
+  stays GREEN under both neutralizations.
+  Sibling check: plain GETNEXT has NO equivalent amplification. RFC 3416
+  4.2.1/4.2.2 bind it to one response varbind per request varbind, so its walk is
+  O(len(oids)) with no max-repetitions multiplier and every varbind built is
+  returned — a max-size 239-deep-OID GETNEXT costs ~33 ms and returns all 239 in
+  a full 4095-byte response. That residual is findNextOIDSnap being a linear MIB
+  scan, not unbounded expansion; scoped out and reported.
+  Full pkg/snmp suite green, plain and -race.
+- **File(s)**: pkg/snmp/{agent.go,v3.go,README.md},
+    pkg/snmp/getbulk_work_bound_6551_test.go, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6551 / PR #6596 — fold the two Codex MERGE-NEEDS-MINOR findings.
+  Both were gaps between what the tests and docs CLAIMED and what they actually
+  BOUND; the bound itself and the over-reach oracle were sound and are unchanged.
+  Finding 1 — the v3 CALL SITE was not guarded.
+  TestGetBulkCostDoesNotScaleWithMaxRepetitions_6551 said it guarded both call
+  sites but drove only handlePacket (v2c), and TestGetBulkBuildBoundedV3_6551
+  calls buildBulkVarbinds itself with the real ceiling, so its built-count
+  assertions hold no matter what budget v3.go passes. Everything else it checks
+  about the response — size, error-status, varbind count — is identical bounded
+  or not, because the fix is output-neutral, so only a COST assertion can see
+  the difference. Codex proved it: unbounding ONLY the v3 production call left
+  every #6551 test green. Added
+  TestGetBulkCostDoesNotScaleWithMaxRepetitionsV3_6551, a separate end-to-end
+  guard on the real v3 dispatcher (v3MaxRepeaterBulkRequest ->
+  handlePacketFrom), deliberately NOT sharing a helper with the v2c sibling so
+  the two surfaces stay independently covered. It measures work as ALLOCATIONS
+  rather than wall time (testing.AllocsPerRun): every grid cell allocates a
+  walked OID and an encoded value, so the count tracks cells walked, and unlike
+  a duration it cannot be moved by machine load. Pinned property is the v2c
+  sibling's — M=1 and M=100 must cost the same once the ceiling is reached.
+  Also corrected the v2c test's comment, which claimed both call sites.
+  Finding 2 — the byte-count proof was not true of wire-decoded input. The
+  minVarbindEncodedBytes = 6 floor needs an EMPTY encoded OID, but berDecodeOID
+  rejects an empty body and turns any non-empty one into >= 2 components, so a
+  varbind built from a wire OID re-encodes to >= 7 bytes and 6 is unreachable
+  from the wire. Conversely decodePDUFields does NOT require a request varbind
+  to carry a value TLV, so the densest ACCEPTED request packing is 5 bytes, not
+  7. Rewrote the constant's comment: 6 stays as the floor (the structural cap
+  only needs a valid lower bound, and a loose floor makes it conservative, never
+  unsound), with the wire minimum of 7 stated explicitly and the cap's scope
+  narrowed to CELL COUNT, not "the response fits". Rewrote the GETNEXT scope
+  paragraph in pkg/snmp/README.md to lead with the OPERATION COUNT argument,
+  which is the real reason — one findNextOIDSnap/getOIDValueSnap pair per
+  decoded request OID, no max-repetitions multiplier — and derived the
+  per-datagram ceiling from the true 5-byte minimum. Added
+  TestWireVarbindByteFloors_6551 to bind all of it as fact instead of prose:
+  berDecodeOID rejects an empty body and always yields >= 2 components, a
+  wire-derived varbind is >= 7 bytes, the 6-byte floor is still attainable
+  through the encoder, a value-less 5-byte request varbind is accepted and its
+  OID delivered, and a max-size GETNEXT carries 812 value-less OIDs vs 580
+  well-formed (measured, matching the ~800 the README now documents).
+  Validation. Fail-on-revert probes in a THROWAWAY detached worktree
+  (/dev/shm/probe-6596), never in the PR worktree, one call site at a time,
+  go build ./... and go vet ./... CLEAN in both so neither red is a build break:
+  unbound v3 only -> ONLY TestGetBulkCostDoesNotScaleWithMaxRepetitionsV3_6551
+  fails, 18,419 allocs at M=1 vs 3,446,385 at M=100 (187.1x, threshold 10x),
+  while the v2c cost test still passes at 1.1x and TestGetBulkBuildBoundedV3_6551
+  still passes — reproducing Codex's result exactly. Unbound v2c only -> ONLY
+  TestGetBulkCostDoesNotScaleWithMaxRepetitions_6551 fails, 1.33 ms vs 513.32 ms
+  (385.1x), while the new v3 test stays green at 1.0x. Each revert takes exactly
+  one test red, which is what proves the two call sites are covered separately
+  rather than by one test that re-masks the split. Over-reach oracle
+  TestGetBulkBoundedMatchesUnbounded_6551 stayed GREEN under BOTH reverts. Full
+  pkg/snmp suite green; the #6551 set run 5x for flake. gofmt clean on both
+  touched files (pkg/snmp/v3_auth_test.go is gofmt-unclean at origin/master too
+  — pre-existing, untouched here).
+- **File(s)**: pkg/snmp/getbulk_work_bound_6551_test.go, pkg/snmp/README.md,
+    _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6551 review-fold round 3 — two documentation inaccuracies from the
+  Codex re-gate of `3f9358151`. No production or test-coverage change. (1)
+  `pkg/snmp/README.md` listed the v2c cost test as guarding "the call sites" and
+  omitted the new v3 cost test; the inventory now names one cost guard per call
+  site (v2c in `agent.go`, v3 in `v3.go`) and records why one test cannot bind
+  both — unbounding v3 alone once left every test green, which is the gap this
+  round closed. (2) The GET/GETNEXT paragraph claimed both perform a
+  `findNextOIDSnap` + `getOIDValueSnap` PAIR per decoded request OID. Verified
+  firsthand against `pkg/snmp/agent.go`: GET calls only `getOIDValueSnap`
+  (:1218), and GETNEXT calls `findNextOIDSnap` (:1242) then `getOIDValueSnap`
+  only when a successor exists (:1247). Reworded to the claim that is actually
+  true and actually load-bearing — a CONSTANT bound of snapshot operations per
+  request OID, i.e. O(1) with no request-controlled multiplier. The
+  amplification conclusion is unchanged; only the arithmetic describing it was
+  wrong. Codex re-gate otherwise confirmed the split is real (half-grid M=50
+  probe still 54.9x, so fixed overhead does not mask a partial regression) and
+  `AllocsPerRun` stable at exactly 8199 over five runs.
+- **File(s)**: pkg/snmp/README.md, _Log.md
+- **Action**: #6554 — constrain the fabric peer-MAC IPv6-NDP fallback to the
+  peer's identity. `refreshFabricFwd`'s last-resort leg swept the fabric
+  parent's IPv6 NDP table (deliberately seeded by the `ff02::1` all-nodes probe
+  in `probeFabricNeighbor`) and took the FIRST non-self link-local neighbour,
+  so on a shared fabric segment any IPv6-speaking adjacent host was accepted as
+  the peer chassis. Added `selectFabricPeerLinkLocalMAC`: accept only the
+  cached ADDRESS-MATCHED peer MAC when one is known, else the sole eligible
+  neighbour, refusing an ambiguous segment. The identity cache
+  (`d.fabricPeerMAC`/`fabricPeerMAC1`) is written only by address-matched
+  resolutions — never by the fallback, so a bad guess cannot self-confirm — and
+  is dropped when the configured peer address changes. Refusal is fail-closed
+  onto the pre-existing "peer neighbour missing" path.
+  IMPACT CORRECTION vs the issue text: the misdelivery claim is NOT reachable
+  on today's forwarding path. `FabricFwdInfo.PeerMAC` is written into the
+  `fabric_fwd` pinned array and read by nobody post-#1476 (the retained
+  `userspace-xdp` shim never references the map; `userspace-dp` never reads it;
+  no Go reader). The dataplane's actual redirect dst-MAC comes from
+  `FabricSnapshot.peer_mac` via `buildFabricPeerMAC`, which is address-matched.
+  The live defect is a FALSE-SUCCESS health signal: a decoy made the refresh
+  report success, latch `fabricPopulated` (which feeds the RG
+  takeover-readiness gate in `daemon_ha.go`), end the fast-retry probe loop
+  early, and log a stranger's MAC as the fabric peer during an HA incident.
+  Also rejected the issue's suggested RETH virtual-MAC-prefix constraint:
+  fabric members (`ge-0/0/0`) carry no `redundant-parent`, so they never get a
+  `02:bf:72:…` MAC and that constraint would reject the real peer.
+  Added `d.neighListFn` seam so the fail-on-revert test drives the real
+  `refreshFabricFwd` and asserts on the MAC handed to `SetFabricForwarding`.
+  Verified RED-on-revert is an ASSERTION failure (decoy programmed), with both
+  over-reach guards GREEN under revert. Full Go suite green.
+- **File(s)**: pkg/daemon/{daemon.go,daemon_ha_fabric.go,
+    daemon_ha_fabric_peer_identity_6554_test.go},
+    docs/fabric-cross-chassis-fwd.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6554 review-fold (Codex MERGE-NEEDS-MINOR on PR #6595). Three
+  findings, all folded. (1) `populateFabricFwd` / `populateFabricFwd1` checked
+  `ctx.Done()` only inside the `i > 0` sleep arm, so iteration 0 ran
+  unconditionally — an already-cancelled caller still reached
+  `probeFabricNeighbor`, which dumps the kernel neighbour table and, on a miss,
+  transmits a raw ICMP probe plus an `ff02::1` solicitation on a live NIC.
+  Hoisted a `ctx.Err()` check to the top of both retry loops and pinned it with
+  `TestPopulateFabricFwdHonoursCancelledContextBeforeFirstProbe`, which asserts
+  ZERO netlink touches under a cancelled context (both siblings). (2)
+  `probeFabricNeighbor` called `netlink.LinkByName` / `netlink.NeighList`
+  directly, bypassing the `fabricLinkByName` / `fabricNeighList` seams the rest
+  of the refresh uses; routed both through the seams and made
+  `TestFabricPeerIdentityClearedOnPeerChange` hermetic by pinning the seams to
+  hard errors, so the test's safety no longer depends on the cancellation guard
+  surviving. The residual transmit hazard (a seam returning a synthetic link
+  with no matching neighbour still falls through to the probe transmits) is
+  documented at the function rather than papered over — the read seams are set
+  to the real netlink calls by the constructor, so seam-presence cannot gate the
+  transmit. (3) Corrected a disproven impact claim in the test message and in
+  `docs/fabric-cross-chassis-fwd.md`: verified firsthand that the MAC this path
+  programs lands in the retired-eBPF `fabric_fwd` map (`UpdateFabricFwd`,
+  pkg/dataplane/maps_fabric.go) while the live Rust redirect takes
+  `neighbor_mac` from `FabricSnapshot.PeerMAC`, which
+  `pkg/dataplane/userspace/fabric.go` re-derives with its own address-matched
+  `buildFabricPeerMAC` (no link-local fallback). A mis-identified peer therefore
+  never becomes an L2 destination — the damage is false readiness, a truncated
+  fast-retry probe loop, and a misleading `peer_mac` log line. Also ran
+  `gofmt -w pkg/daemon/daemon.go` (the PR's added struct fields broke the
+  comment alignment; master was clean).
+- **File(s)**: pkg/daemon/{daemon.go,daemon_ha_fabric.go,
+    daemon_ha_fabric_peer_identity_6554_test.go},
+    docs/fabric-cross-chassis-fwd.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6554 review-fold round 2 (independent hostile review MINOR 1 +
+  MINOR 2). MINOR 1: documented the `SyncFabricState` coupling in
+  `docs/fabric-cross-chassis-fwd.md`. The peer-MAC RESOLVER is independent of
+  this path, but its refresh TRIGGER is not — `refreshFabricFwd` calls
+  `SyncFabricState` only on the success path, and that verb is the sole caller
+  of the Rust `Coordinator::refresh_fabric_links`, so a #6554 refusal also
+  withholds the push until the next full forwarding rebuild. Not a blackhole
+  (`resolve_fabric_redirect` returning None takes the safe non-fabric
+  disposition, per #5686) but a real latency coupling the "resolved
+  independently" wording did not cover. Deliberately did NOT add a
+  `SyncFabricState` call on the refusal path: this leg runs per neighbour event
+  plus a 30s tick plus the 2s `triggerFabricRefresh`, and CLAUDE.md forbids a
+  new control-socket caller above 1/s (starves session installs during bulk
+  sync) — so the coupling is documented, not removed. MINOR 2 was filed as
+  issue #6605 rather than folded: `buildFabricPeerMAC`
+  (pkg/dataplane/userspace/fabric.go) accepts NUD_FAILED/NUD_INCOMPLETE
+  neighbours and any-length lladdr for the LIVE redirect MAC, while
+  `refreshFabricFwd` requires `len==6` plus the `fabricNeighValidStates` mask —
+  the live resolver is measurably weaker than the code #6554 hardened, but it
+  is address-matched and a separate surface. Codex re-review of the folded head
+  918ea0b95 returned MERGE-READY with no findings.
+- **File(s)**: docs/fabric-cross-chassis-fwd.md, _Log.md
