@@ -1,6 +1,6 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.30.0 — THE TERMINAL CUT, round-114 folds (the
+**Status: DRAFT v10.30.1 — THE TERMINAL CUT, round-114 folds (+ round-114 AGY straggler folds: the consumer-count header and the §9 OverdueSkipped propagation assertion now read five consumers with the mutual-exclusion note) (the
 establishment promote is REMOVED from the report consumers — the
 mutual-exclusion proof: an establishment candidate is a local reverse
 hit, while the fabric-placeholder substitution requires `!is_reverse`
@@ -1853,8 +1853,10 @@ adopting the shared decision/metadata, §5.6).
     placeholder substitution, `shared_ops.rs:614-626`, it can miss
     the survivor and use S2's positional counter instead — still
     telemetry-only, no authority change).
-  - **Consumers (six, normative — the establishment promote is the
-    sixth, v10.29.0, round-113 Codex 3):** (i) the terminal teardown at
+  - **Consumers (five, normative — the establishment promote was the
+    sixth only in v10.29.x and is REMOVED in v10.30.0 via the
+    round-114 Codex 1 mutual-exclusion proof in bullet (vi) below):
+    (i) the terminal teardown at
     ALL THREE sites (`poll_descriptor/mod.rs:698-714`, `:768-784`,
     `:824-840`) is SKIPPED for `OverdueSkipped` AND for `UpsertRefused`
     (for the skip the dispatch installed and changed nothing; for the
@@ -2649,13 +2651,14 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   transitions, not only the overdue skip — v10.24.0, round-107
   Codex 6); the poller hoists it at
   `poll_descriptor/mod.rs:509` and carries it past the `:883`
-  reduction; assert each of the SIX consumers honors it (teardown
+  reduction; assert each of the FIVE consumers honors it (teardown
   suppressed at all three sites — `:698-714`, `:768-784`, `:824-840`;
   no anchor write; no cache insert; no clear+refresh; no ownership
-  promote; AND no establishment-promote apply — the candidate is
-  computed post-borrow and the apply is deferred to the end of the
-  resolve, after the materialize produces the report, v10.29.1
-  round-113 AGY) and
+  promote) — the establishment promote is NOT a report consumer
+  (v10.30.0, round-114 Codex 1: the mutual exclusion — an
+  establishment candidate is a local reverse hit, the placeholder
+  substitution requires `!is_reverse`, `shared_ops.rs:583-590` — so
+  no dispatch ever has both; §9 asserts the exclusion directly) and
   the MissingNeighbor composition lands on the live-backed
   ExistingResolved buffer-only arm with NOTHING derived/allocated/
   installed/published (`:4662-4829` untouched); accounting still runs
@@ -3090,7 +3093,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.30.0)
+## 11. Open questions for the convergence round (v10.30.1)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
