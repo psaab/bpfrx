@@ -1,21 +1,21 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.29.1 — THE TERMINAL CUT, round-113 folds (+ round-113 AGY folds: the establishment promote is now COMPUTED at the post-borrow lookup phase and APPLIED at the end of the resolve after the materialize produces the report — the lookup-phase fire point would otherwise precede the outcome it consumes; §9's consumer count is six) (the
-v10.28.0 admission-point promote is RETRACTED — the enqueue is not a
-commit-to-deliver point and no producer/carrier exists for an
-enqueue-time apply; the §5.5 post-borrow establishment promote fires
-during the arrival dispatch's LOOKUP phase, after the borrow ends and
-before any disposition/buffering decision — master's in-borrow timing
-modulo the borrow boundary, plus the proof gate — so a cold-neighbor
-SYN-ACK promotes at arrival exactly as master's does and no token or
-carrier is needed; the establishment promote is the SIXTH consumer,
-consuming the effective transition with OverdueSkipped/UpsertRefused
-suppression; the canonical matched key now rides the resolution
-result and the flow-cache entry, so the commit hook's
-clear/refresh/overdue evaluation always targets the canonical entry;
-the refusal promotion gate is site-qualified). Round-113: Codex NO
-(3B/1H/2M); AGY r112 SOUND (v10.28.0, no findings); SMR r113 YES
-(fold verification). Ship
+**Status: DRAFT v10.30.0 — THE TERMINAL CUT, round-114 folds (the
+establishment promote is REMOVED from the report consumers — the
+mutual-exclusion proof: an establishment candidate is a local reverse
+hit, while the fabric-placeholder substitution requires `!is_reverse`
+(`shared_ops.rs:583-590`), and a live local non-placeholder hit wins
+over the shared map, so no dispatch ever has both; the commit hook's
+matched token is now identity-BOUND (canonical key + NAT + orientation
++ install_epoch — a same-key replacement without flow-cache
+invalidation could otherwise let a stale cache hit mutate a
+replacement family) riding a DISTINCT optional field (the query key
+stays the cache key); the promote apply is the full atomic transaction
+(flag + established/per-app timeout + last_seen_ns + wheel re-queue);
+the pre-filter split is stated (proof may change established/timing
+only; anchor samples adopt only at commit); the pending-path wording
+is exact). Round-114: Codex NO (3B/3M); AGY r113 UNSOUND (2 findings,
+folded v10.29.1); SMR r114 YES (fold verification). Ship
 candidate = the Part-A dataplane demote gate plus the wire-free local HA
 rules. The RG-incarnation/retirement/fence-ledger protocol that rounds
 13–82 grew is KILLED (not deferred): its two customers are re-scoped —
@@ -656,8 +656,10 @@ request-build stage:
   decision — master's in-borrow timing modulo the borrow boundary,
   v10.29.0 round-113 Codex 2/4; the anchor update and probation clear
   still wait for the
-  next unbuffered packet PROVIDED its effective transition is not
-  `OverdueSkipped`,
+  next SUCCESSFULLY COMMITTED unbuffered non-close whose effective
+  transition is NEITHER `OverdueSkipped` NOR `UpsertRefused`
+  (v10.30.0, round-114 Codex 7 — a closing packet never updates or
+  clears, and a packet failing final admission updates nothing),
   v10.27.0, round-110 Codex 2). The consequence is a documented residual, not a channel: a
   flow whose traffic is mostly buffered (long ARP stalls) lets its
   anchor lag the stream — later closes soft-refuse and the entry idles
@@ -1875,18 +1877,38 @@ adopting the shared decision/metadata, §5.6).
     entry.last_seen_ns.saturating_add(entry.expires_after_ns) <=
     now_ns` suppresses the clear+refresh on ANY path (v10.28.0,
     round-112 Codex 1; the phase-shifted direct-local-hit regression
-    is in §9). The matched-entry identity is alias-safe (v10.29.0,
-    round-113 Codex 1): `lookup_with_origin` resolves a
-    reverse-translated alias and captures the canonical `actual_key`
-    (`lookup.rs:62-68`, `:85-102`, `:194-219`) — the canonical
-    matched key now RIDES the resolution result (the current code
-    discards it on return) and the flow-cache entry (cache entries
-    currently retain the QUERY key, `flow_cache.rs:201-224`,
-    `:578-581`), so the commit hook's clear/refresh/overdue
-    evaluation always targets the canonical entry
-    (table mutation requires the canonical key,
-    `session/mod.rs:1022-1051`); §9 tests canonical, translated, and
-    cache-alias hits
+    is in §9). The matched-entry identity is alias-safe AND
+    replacement-safe (v10.30.0, round-114 Codex 2/3): the commit hook
+    receives an OPTIONAL identity-bound matched-session token
+    `Option<(SessionKey /*canonical*/, NatDecision, bool
+    /*is_reverse*/, u64 /*install_epoch*/)>` — a DISTINCT field, never
+    a replacement of the packet-query key
+    (`FlowCacheEntry.key`/`flow.forward_key` must stay the query key:
+    hashing, lookup, and dedup all use it, `flow_cache.rs:578-581`,
+    `:962-989`, `:1046-1065`). Producers: the lookup return carries
+    the token (the lookup resolves the alias and captures the
+    canonical `actual_key`, `lookup.rs:62-68`, `:85-102`, `:194-219`,
+    today discarded on return); the resolution result and the
+    flow-cache entry each gain the optional field (§6's
+    'no FlowCacheEntry change' claim is corrected — the field is
+    additive and cache-internal); the poller hoists it past the
+    `resolved.decision` reduction (`poll_descriptor/mod.rs:509`,
+    `:883`). Purged/sessionless resolves carry `None`. The commit
+    hook (and the cache-hit re-probe, `lookup.rs:48-53`,
+    `:194-219`) verifies IDENTITY AGREEMENT — canonical key AND NAT
+    AND orientation AND install_epoch — and SUPPRESSES every
+    authority mutation (clear/refresh/anchor/overdue handling) on
+    mismatch: a same-key synced upsert removes/reinstalls with a new
+    epoch (`install.rs:310-351`), `update_session` can change
+    NAT/orientation and epoch while retaining the key
+    (`session/mod.rs:1344-1397`), and worker `UpsertSynced` performs
+    that replacement WITHOUT flow-cache invalidation
+    (`session_glue/commands/upsert_synced.rs:64-120`), while cache
+    lookup validates config/FIB/RG stamps, not session identity
+    (`flow_cache.rs:991-1021`) — so without the identity binding a
+    stale cache hit could clear/refresh/anchor-update a REPLACEMENT
+    family. §9 tests canonical, translated, cache-alias, sessionless
+    `None`, and same-key-replacement-mismatch hits
     (not only the
     probation flag, round-108 Codex 3); (v) the ownership promote is
     suppressed by the explicit `report.effective_transition ==
@@ -1894,24 +1916,23 @@ adopting the shared decision/metadata, §5.6).
     gate AND by the rule-5 `(report.site == Some(Site2c) &&
     validation == Some(Refused))` gate (the
     §5.5 probation flag on K is the third, independent suppression —
-    K remains installed); (vi) the ESTABLISHMENT promote consumes the
-    effective transition — and the pipeline ordering is specified
-    (v10.29.1, round-113 AGY 1): the §5.5 post-borrow phase COMPUTES
-    the promote candidate at the lookup phase (the proof verdict and
-    the matched entry's canonical identity captured there), and the
-    APPLY is deferred to the END of the resolve, AFTER
-    `materialize_shared_session_hit` has produced the
-    `MaterializeReport` (`session_glue/mod.rs:1092-1121` runs inside
-    the resolve, after the local lookup at `shared_ops.rs:602`) —
-    because the lookup-phase fire point would otherwise precede the
-    outcome it must consume (a placeholder K promoted at lookup
-    before an `OverdueSkipped`/`UpsertRefused` materialize could not
-    be unsuppressed). The apply is suppressed for `OverdueSkipped`
-    AND `UpsertRefused`
-    (a shadowed-placeholder / divergent-identity
-    dispatch must not mutate the surviving K or its companion) and
-    for a probation-flagged matched entry — alongside the refusal/
-    closing and identity gates. Accounting is an explicitly ALLOWED
+    K remains installed); (vi) the ESTABLISHMENT promote is REMOVED
+    from the report consumers (v10.30.0, round-114 Codex 1 — the
+    v10.29.x consumer-gating was unnecessary, and the carrier-free
+    proof is the mutual exclusion: an establishment candidate is a
+    LOCAL REVERSE hit (`is_syn_ack && entry.metadata.is_reverse`,
+    `lookup.rs:129-149`), while the fabric-placeholder substitution
+    that feeds the site-2c materialize machinery requires
+    `!is_reverse` (`is_fabric_wire_placeholder`,
+    `shared_ops.rs:583-590`), and a live local non-placeholder hit
+    wins over the shared map (no materialize runs) — so a dispatch
+    with an establishment candidate NEVER produces an
+    `OverdueSkipped`/`UpsertRefused` report, and a dispatch producing
+    one never has an establishment candidate; §9 tests the exclusion).
+    The promote therefore needs no report — its own gates (the §5.5
+    proof gate, rule 5's closing check, the probation flag on the
+    matched entry) are all available at its lookup-phase fire point.
+    Accounting is an explicitly ALLOWED
     consumer (#2501 semantics, `poll_descriptor/mod.rs:3494-3503`,
     `session/mod.rs:1177-1210`); delivery/buffering/replay/
     reinjection/telemetry consume S2 (the buffer stores S2's decision
@@ -2717,9 +2738,19 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   buffering), the forward half never lingers OPENING
   (`session/mod.rs:2135`), and the retry path never re-runs anything
   (unchanged). Master's pre-filter timing is kept: a filter-dropped
-  but PROVEN SYN-ACK can promote (master-identical; stated) — and the
-  companion promote deliberately sets only `established`, preserving
-  the short opening deadline until the forward ACK
+  but PROVEN SYN-ACK can promote (master-identical; stated) — with
+  the pre-filter split stated exactly (v10.30.0, round-114 Codex 5):
+  the pre-filter proof may change ONLY `established`/timing; anchor
+  samples adopt ONLY at a successful commit hook (the commit-point
+  discipline is unchanged). The promote's apply on the matched
+  reverse entry is the FULL transaction, atomic (v10.30.0, round-114
+  Codex 4): set `established`, recompute the established/per-app
+  timeout, `last_seen_ns = now_ns`, and re-queue the canonical wheel
+  key — master sets the flag BEFORE selecting its timeout and pushes
+  the wheel (`lookup.rs:146-171`, `:214-218`), so a flag-only move
+  would strand the entry on its freshly computed OPENING deadline.
+  The forward companion correctly remains flag-only with its absolute
+  opening deadline unchanged
   (`session/mod.rs:1243-1252`).
 - **Site-9 typed outcomes (round-83 Codex 1 + round-84 Codex 1 +
   round-85 Codex 1):**
@@ -3059,7 +3090,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.29.1)
+## 11. Open questions for the convergence round (v10.30.0)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
@@ -3106,11 +3137,11 @@ this branch only if the minimal fix proves insufficient.
    deferred refresh (round-88) — is any pre-commit refresh/requeue
    path left for a probation entry (lookup, `touch_if_stale`, promote,
    materialize refresh), and does the commit-hook clear+refresh cover
-   every admission arm? (e) the v10.29.0 end-state: the lookup-phase
-   promote (master's timing, no token), the sixth consumer, the
-   canonical matched token on the resolution result and cache entry,
-   and the site-qualified gates — is any transport or timing claim
-   still two-readable?
+   every admission arm? (e) the v10.30.0 end-state: five consumers
+   again (the establishment promote never needs the report — the
+   mutual-exclusion proof is stated and tested), the identity-bound
+   matched token, the full atomic promote transaction, and the
+   pre-filter split — is anything left?
 
 4. **The emission posture:** master's `expire.rs:342-350` gate is
    UNCHANGED; the additions are the normative mark-creation rules, rule
