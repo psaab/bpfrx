@@ -62122,3 +62122,58 @@ break — `go vet` confirmed passing under every revert.
   22.7 Gbps) and needs no re-run for a comment-only change.
 - **File(s)**: pkg/cluster/{election.go,ifmon_weight_daemon_apply_6549_test.go},
     pkg/routing/monitor.go, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6524 fix — a chained flat-set custom application compiled
+  PROTOCOL-ONLY, so a policy matching it permitted ALL TCP.
+  `set applications application myapp protocol tcp destination-port 8080`
+  builds a CHAIN of single-key nodes (SetPath parks the rest of the line under
+  the node it just created, because these leaves declare `children: nil`), so
+  `destination-port` nests under the VALUE node `tcp` and is never a sibling of
+  `protocol`. compileApplications iterated only `inst.node.Children`, saw just
+  `protocol`, and never assigned DestinationPort; an empty port term matches
+  ANY port (pkg/policymatch), so the referencing policy over-permitted. Nothing
+  caught it: protocol / destination-port / source-port were the only
+  `applications application` match leaves neither typed nor `scalar: true`, so
+  no arity gate engaged and the chained form validated clean at BOTH
+  SchemaValidate and strict commit. The REVERSE order was caught only
+  incidentally by the #3109 protocol-less gate — that asymmetry hid it.
+  Verified firsthand before coding (ParseSetCommand + SetPath, never
+  NewParser): dumped the chain AST, confirmed DestinationPort=="" with
+  SchemaValidate CLEAN, then confirmed a permit policy admitted tcp/22.
+  Fixed in the COMPILER, not the schema, and said why: CompileConfigLenient
+  (boot load + HA SyncApply) downgrades a schema rejection to a WARNING and
+  keeps compiling, so a schema-only reject would leave a persisted or
+  peer-pushed config still protocol-only and still permitting all TCP — exactly
+  where no operator sees the warning. It would also mint a new
+  commit-vs-load split for a spelling that now has well-defined semantics (the
+  divergence class #3606 calls out). New `applicationDirectLeaves` walks the
+  chain across BOTH AST shapes and splits each node's PACKED Keys into one leaf
+  per recognized keyword — a three-leaf line collapses to
+  `protocol tcp -> Keys=[source-port 5000 destination-port 8080]`, so a
+  Keys[2:]-is-garbage rule was wrong and the scan is keyword-delimited, the same
+  shape parseApplicationTerms uses. Tokens it cannot map to a known leaf land on
+  the new Application.UnknownDirectLeaves and are hard-rejected by
+  validateApplicationSyntaxStrict (lenient-warn), which is what makes
+  `protocol [ tcp udp ]` and `destination-port [ 22 23 ]` operator-visible: a
+  DIRECT body holds ONE protocol and ONE port, so a bracket tail is
+  unrepresentable, not merely mis-read. The record is carried onto generated
+  term applications too, since the parent struct is discarded on that branch.
+  `term` is emitted but not descended into (its subtree is opaque and
+  parseApplicationTerms already guards it with UnknownTermLeaves).
+  Fail-on-revert asserts the POLICY OUTCOME, not the struct: with the walk
+  reverted, tcp/22 is PERMITTED by an app declared `protocol tcp
+  destination-port 8080` and the 4 pkg/policymatch tests go RED, while the two
+  over-reach guards (hierarchical + sibling flat-set spellings) stay GREEN.
+  Golden 4406 shifted by exactly 3 leaves — its own fixture uses the chained
+  form, so appA's DestinationPort went ""->"80" (the bug was sitting in the
+  project's own corpus) — plus the new struct field key; regenerated.
+  Full pkg/config + pkg/policymatch green. pkg/dataplane/userspace has 7
+  event-stream failures, verified IDENTICAL on pristine origin/master
+  (detached worktree, diffed failure lists) — pre-existing, zero regressions.
+- **File(s)**: pkg/config/{compiler_applications.go,types_security.go,
+    compiler_validate_strict_application.go,
+    compiler_application_chained_leaves_6524_test.go,
+    testdata/golden_4406.json},
+    pkg/policymatch/app_chained_leaves_6524_test.go,
+    docs/config-schema.md, _Log.md

@@ -40,6 +40,153 @@ func parseAppTimeout(raw string) (int, bool) {
 	return n, true
 }
 
+// applicationDirectLeafKeywords is the set of statements Junos allows directly
+// inside an `applications application <name>` body. It is the SINGLE source of
+// truth shared by applicationDirectLeaves (which classifies a token as a leaf
+// or as garbage) and the direct-body switch in compileApplications, so the two
+// cannot drift: a keyword added to the switch but not here would be recorded as
+// unknown and hard-rejected at commit.
+var applicationDirectLeafKeywords = map[string]bool{
+	"protocol":           true,
+	"destination-port":   true,
+	"source-port":        true,
+	"inactivity-timeout": true,
+	"timeout":            true,
+	"icmp-type":          true,
+	"icmp-code":          true,
+	"alg":                true,
+	"description":        true,
+	"term":               true,
+}
+
+// applicationDirectLeaves flattens the DIRECT match body of an `applications
+// application <name>` node into its recognized leaf nodes (in document order),
+// plus every token that is not a recognized leaf keyword.
+//
+// #6524: the flat-set grammar does NOT produce one sibling node per leaf. Only
+// the FIRST leaf on a `set` line becomes a child of the application node; each
+// subsequent leaf is parked as a child of the PREVIOUS leaf's value node,
+// because SetPath descends into the node it just created and these leaves
+// declare `children: nil` (schema_security.go). So
+//
+//	set applications application myapp protocol tcp destination-port 8080
+//
+// builds a CHAIN — application myapp -> `protocol tcp` -> `destination-port
+// 8080` — not two siblings. compileApplications iterated only
+// inst.node.Children, saw just `protocol`, and never assigned
+// DestinationPort; the application compiled protocol-only and a policy
+// matching it permitted ALL TCP (pkg/policymatch: an empty DestinationPort
+// matches any port). Nothing caught it: `protocol` / `destination-port` /
+// `source-port` are the only application match leaves that are neither typed
+// nor `scalar: true`, so no arity gate engages and the chained form validates
+// clean at both SchemaValidate and strict commit.
+//
+// This is the direct-body instance of the dual-AST-shape class already fixed
+// next door for application-SET members (applicationSetMemberValues, #5181),
+// address-set members (addressSetMemberValues, #4791) and firewall match
+// values (firewallMatchValues, #2419) — the direct application body never
+// received the same treatment.
+//
+// Both AST shapes are covered. In the hierarchical / one-leaf-per-set-line
+// shape the leaves are already siblings, so the walk emits them in order and
+// finds nothing to descend into — byte-identical to the pre-#6524
+// inst.node.Children iteration. In the chained flat-set shape it follows each
+// leaf's value node down the chain.
+//
+// Only the FIRST link of a flat-set chain gets a node of its own. Because these
+// leaves declare `children: nil`, SetPath stops modelling at that point and
+// PACKS every remaining token of the line onto ONE child node, so
+//
+//	protocol tcp source-port 5000 destination-port 8080
+//
+// becomes `protocol tcp` -> a single child whose Keys are the flat run
+// ["source-port","5000","destination-port","8080"]. Each node's Keys are
+// therefore split into one leaf per recognized keyword, the tokens between two
+// keywords forming that leaf's value — the same keyword-delimited scan
+// parseApplicationTerms performs over an inline term's token stream. A leaf that
+// is not the node's own first token is re-emitted as a synthesized `keyword
+// value` node so the caller sees a uniform shape.
+//
+// A token that is neither a recognized leaf keyword nor the single value of the
+// leaf it follows is returned in unknown rather than silently dropped. That is
+// how a bracketed list on a single-valued leaf is caught: `protocol [ tcp udp ]`
+// collapses per #2419 onto ONE leaf (the lexer strips the brackets), landing the
+// tail either in the packed Keys or as a child value node, and a direct
+// application body has room for exactly one protocol and one port.
+//
+// `term` is emitted as a leaf and terminates the scan: the rest of the run is
+// the term's own opaque token stream, which parseApplicationTerms flattens (and
+// guards with UnknownTermLeaves, #3352).
+func applicationDirectLeaves(appNode *Node) (leaves []*Node, unknown []string) {
+	var walk func(nodes []*Node)
+	walk = func(nodes []*Node) {
+		for _, n := range nodes {
+			if n == nil || len(n.Keys) == 0 || n.Keys[0] == "" {
+				continue
+			}
+			descend := true
+			for i := 0; i < len(n.Keys); {
+				kw := n.Keys[i]
+				if !applicationDirectLeafKeywords[kw] {
+					// Either a typo'd statement or a stray value token; both
+					// carry a constraint the compiler cannot honor.
+					unknown = append(unknown, kw)
+					i++
+					continue
+				}
+				if kw == "term" {
+					if i == 0 {
+						// The node IS the term: hand it over untouched so
+						// parseApplicationTerms still sees its Children.
+						leaves = append(leaves, n)
+						descend = false
+					} else {
+						leaves = append(leaves, &Node{Keys: append([]string(nil), n.Keys[i:]...)})
+					}
+					break
+				}
+				// This leaf's value tokens run until the next known keyword.
+				start := i
+				i++
+				valStart := i
+				for i < len(n.Keys) && !applicationDirectLeafKeywords[n.Keys[i]] {
+					i++
+				}
+				vals := n.Keys[valStart:i]
+				if len(vals) > 1 {
+					// A single-valued leaf carrying a bracket-list tail.
+					unknown = append(unknown, vals[1:]...)
+				}
+				if start == 0 {
+					// nodeVal reads this node's own Keys[1], so pass it through
+					// unchanged — byte-identical to the pre-#6524
+					// sibling/hierarchical path.
+					leaves = append(leaves, n)
+					continue
+				}
+				syn := &Node{Keys: []string{kw}}
+				if len(vals) > 0 {
+					syn.Keys = append(syn.Keys, vals[0])
+				}
+				leaves = append(leaves, syn)
+			}
+			if !descend || len(n.Children) == 0 {
+				continue
+			}
+			if len(n.Keys) < 2 {
+				// Value-in-child shape (nodeVal's Children[0] fallback): the
+				// first child IS this leaf's value, so only the rest continue
+				// the chain.
+				walk(n.Children[1:])
+				continue
+			}
+			walk(n.Children)
+		}
+	}
+	walk(appNode.Children)
+	return leaves, unknown
+}
+
 func compileApplications(node *Node, apps *ApplicationsConfig) error {
 	for _, inst := range namedInstances(node.FindChildren("application")) {
 		appName := inst.name
@@ -82,7 +229,13 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 			timeoutVal                                   int
 			itypeVal, icodeVal                           uint8
 		)
-		for _, prop := range inst.node.Children {
+		// #6524: walk the direct body across BOTH AST shapes. In the flat-set
+		// shape the leaves form a CHAIN (`protocol tcp` -> `destination-port
+		// 8080`), not siblings, so iterating inst.node.Children alone saw only
+		// the first leaf and compiled the application protocol-only.
+		directLeaves, unknownDirect := applicationDirectLeaves(inst.node)
+		app.UnknownDirectLeaves = unknownDirect
+		for _, prop := range directLeaves {
 			switch prop.Name() {
 			case "protocol":
 				hasDirectBody = true
@@ -223,6 +376,14 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 			implicitSet := &ApplicationSet{Name: appName}
 			for _, t := range terms {
 				t.Description = app.Description
+				// #6524: the parent `app` struct is DISCARDED on this branch,
+				// so an unrecognized token sitting directly on a term-bearing
+				// application body would take its UnknownDirectLeaves record
+				// with it and escape the strict gate. Carry it onto every
+				// generated term application — the only survivors — exactly as
+				// Description is carried, mirroring how parseApplicationTerms
+				// already lands UnknownTermLeaves on each term (#3352).
+				t.UnknownDirectLeaves = app.UnknownDirectLeaves
 				apps.Applications[t.Name] = t
 				implicitSet.Applications = append(implicitSet.Applications, t.Name)
 			}

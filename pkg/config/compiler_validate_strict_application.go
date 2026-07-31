@@ -358,8 +358,9 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 // validateApplicationSyntaxStrict hard-rejects SYNTACTIC errors in a
 // user-defined application definition that the typed-schema walk cannot reach:
 // an unrecognized leaf inside an opaque inline `term { ... }` (#3352), an
-// `alg` name xpf does not support (#3353), and an unrecognized member statement
-// inside an opaque `application-set { ... }` body (#3890).
+// `alg` name xpf does not support (#3353), an unrecognized token directly on
+// the application body (#6524), and an unrecognized member statement inside an
+// opaque `application-set { ... }` body (#3890).
 //
 // Unlike validateApplicationSpecsStrict — whose port / protocol / icmp / timeout
 // checks are SEMANTIC and deliberately scoped to REFERENCED applications (an
@@ -415,6 +416,41 @@ func validateApplicationSyntaxStrict(cfg *Config) error {
 					"icmp-code / alg (an unrecognized leaf is silently dropped along "+
 					"with its value, widening the term to match more than intended)",
 				name, app.UnknownTermLeaves[0])
+		}
+		// #6524: an unrecognized token directly on the application body. The
+		// application body is an opaque `args:1` schema leaf whose three match
+		// leaves (protocol / destination-port / source-port) are the only ones
+		// neither typed nor `scalar: true`, so no arity gate engages and the
+		// SchemaValidate walk accepts any trailing token. Two forms reach here,
+		// both of which were silently dropped before #6524 and both of which
+		// WIDEN the application (an unset port matches EVERY port, so a permit
+		// over-permits and a deny under-matches):
+		//
+		//   - a bracketed list on a single-valued leaf (`protocol [ tcp udp ]`,
+		//     `destination-port [ 22 23 ]`) — a direct application body takes
+		//     one protocol and one port, and Application.Protocol /
+		//     .DestinationPort are single fields; multi-valued matching is what
+		//     `term` sub-blocks are for;
+		//   - a typo'd leaf keyword (`destination-poort 8080`).
+		//
+		// applicationDirectLeaves records the offending token on
+		// UnknownDirectLeaves (mirroring UnknownTermLeaves / UnknownMembers);
+		// reject the first one so the silent widening becomes an
+		// operator-visible commit error. Strict on the commit / commit-check
+		// path; the call site downgrades it to a warning on the tolerant load /
+		// peer-sync path (#1960 no-brick).
+		if len(app.UnknownDirectLeaves) > 0 {
+			return fmt.Errorf(
+				"application %q: unknown statement %q in the application body; a "+
+					"custom application accepts only protocol / source-port / "+
+					"destination-port / inactivity-timeout / timeout / icmp-type / "+
+					"icmp-code / alg / description / term, each taking a SINGLE value "+
+					"(an unrecognized token — including the tail of a bracketed list "+
+					"such as `protocol [ tcp udp ]`, which a direct application body "+
+					"cannot represent — is silently dropped, widening the application "+
+					"to match more than intended; use separate `term` sub-blocks for "+
+					"multiple protocols or ports)",
+				name, app.UnknownDirectLeaves[0])
 		}
 		// #4337: a per-application `alg <name>` outside the four xpf implements
 		// (dns/ftp/sip/tftp) is NO LONGER hard-rejected here. The #3353 commit

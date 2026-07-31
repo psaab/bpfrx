@@ -1261,6 +1261,38 @@ type Application struct {
 	// hard-rejects the first one on the strict commit path / warns on the tolerant
 	// load / peer-sync path (#5574).
 	DuplicateDirectLeaves []string
+	// UnknownDirectLeaves records the raw tokens directly under an
+	// `applications application <name>` body that are NOT a recognized direct
+	// match leaf (protocol / destination-port / source-port /
+	// inactivity-timeout / timeout / icmp-type / icmp-code / alg / description /
+	// term) — the DIRECT-body analogue of UnknownTermLeaves.
+	//
+	// #6524: the flat-set grammar builds `set a b c d` as a CHAIN of single-key
+	// nodes, so `set applications application myapp protocol tcp
+	// destination-port 8080` nests `destination-port` UNDER the value node
+	// `tcp` rather than beside `protocol`. applicationDirectLeaves now follows
+	// that chain, so a token it cannot map to a known leaf keyword is real
+	// operator garbage rather than a shape the walk failed to reach. Two forms
+	// land here:
+	//
+	//   - a bracketed list on a single-valued leaf — `protocol [ tcp udp ]`,
+	//     `destination-port [ 22 23 ]`. Junos gives a direct application body
+	//     ONE protocol and ONE port (multi-valued matching is what `term`
+	//     sub-blocks are for), and Application.Protocol / .DestinationPort are
+	//     single fields that cannot represent the set, so every value past the
+	//     first was silently dropped;
+	//   - a typo'd leaf keyword (`destination-poort 8080`), silently dropped
+	//     along with its value.
+	//
+	// Either way the application ends up matching MORE than authored (a
+	// dropped port constraint matches every port — pkg/policymatch
+	// portMatches treats an empty DestinationPort as match-any), so a policy
+	// referencing it over-permits, or a deny under-matches. Mirroring
+	// UnknownTermLeaves, the offending token is recorded here and the deferred
+	// gate (validateApplicationSyntaxStrict) hard-rejects the first one on the
+	// strict commit path / warns on the tolerant load / peer-sync path (#1960
+	// no-brick).
+	UnknownDirectLeaves []string
 }
 
 // IPsecConfig holds IPsec VPN configuration.

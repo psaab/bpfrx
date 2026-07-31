@@ -993,6 +993,58 @@ a SetPath container, so the fanout cannot touch them). The two multi-member-body
 cases assert current option-1 behavior only; an options-2/3 fix intentionally
 updates those two expectations.
 
+**Sibling leaves on ONE flat-set line also collapse into a NESTED chain, not
+siblings — the third collapse pattern (#6524).** The two patterns above cover a
+bracket LIST (one leaf, many values). This one is about several DISTINCT leaves
+written on a single `set` line. When a schema leaf declares `children: nil` and
+is neither `multi` nor a wildcard container, `SetPath` consumes its `args`
+tokens and then — having no sub-schema to descend — parks the REST of the line
+under the node it just created. So
+
+```
+set applications application myapp protocol tcp destination-port 8080
+```
+
+does NOT build two siblings; it builds a chain
+`application myapp -> protocol tcp -> destination-port 8080`, and only the
+FIRST link gets a node of its own — every token after it is PACKED flat onto
+one child (`protocol tcp -> Keys=[source-port 5000 destination-port 8080]` for
+a three-leaf line). A compiler iterating the container's immediate `Children`
+therefore sees only the first leaf and silently drops the rest.
+
+That was the #6524 fail-open: `compileApplications` saw only `protocol`, never
+assigned `DestinationPort`, and an empty port term matches ANY port
+(`pkg/policymatch`), so a policy matching the application permitted **all TCP**.
+Nothing caught it — `protocol` / `destination-port` / `source-port` were the
+only `applications application` match leaves that were neither typed nor
+`scalar: true`, so no arity gate engaged and the chained form validated clean at
+BOTH `SchemaValidate` and strict commit. The REVERSE token order was caught only
+incidentally (the chain drops `protocol` instead, tripping the #3109
+protocol-less gate) — that asymmetry hid it.
+
+`applicationDirectLeaves` (`compiler_applications.go`) is the canonical reader:
+it walks the chain, splits each node's packed Keys into one leaf per recognized
+keyword (a keyword-delimited scan, the same shape `parseApplicationTerms` uses),
+and returns every token it cannot map to a known leaf so the deferred strict
+gate rejects it. That last part is what makes `protocol [ tcp udp ]` and
+`destination-port [ 22 23 ]` an operator-visible commit error: a DIRECT
+application body holds ONE protocol and ONE port (`Application.Protocol` /
+`.DestinationPort` are single fields — multi-valued matching is what `term`
+sub-blocks are for), so the bracket tail is unrepresentable rather than merely
+mis-read.
+
+**Why the fix is in the COMPILER, not the schema.** Typing the three leaves (or
+tagging them `scalar: true`) would reject the chained form at commit-check, but
+`CompileConfigLenient` — the boot-load and HA `SyncApply` path — downgrades a
+schema rejection to a WARNING and keeps compiling. A schema-only fix therefore
+leaves a persisted or peer-pushed config still compiling protocol-only and still
+permitting all TCP, precisely where no operator sees the warning. Making the
+compiler consume the chain fixes every path at once. It also avoids minting a
+new commit-vs-load split for a spelling that now has well-defined semantics —
+the same divergence class #3606 calls out for ports. Covered by
+`pkg/config/compiler_application_chained_leaves_6524_test.go` and the
+policy-OUTCOME suite `pkg/policymatch/app_chained_leaves_6524_test.go`.
+
 **`multi: true` ALSO prevents single-value REPLACE for repeated keyed-list
 leaves (#3984).** The `#2419` discussion above is about ONE statement with a
 bracket list. The SAME `multi: true` marker fixes a second, distinct shape:
