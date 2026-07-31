@@ -34,7 +34,11 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -42,6 +46,7 @@ import (
 	"testing"
 
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"google.golang.org/grpc"
 )
 
 // fabricSecretConfig stages one instance of every secret leaf the redaction
@@ -216,17 +221,55 @@ func fabricRPCProbes() map[string]fabricRPCProbe {
 			},
 		},
 		pb.BpfrxService_MonitorInterface_FullMethodName: {
-			// Streams live pcap frames captured off a kernel interface; it
-			// renders no configuration, and driving it in-process would exec a
-			// real capture. Its config reads are interface-name resolution
-			// (ResolveReth / LookupInterface), which touch no secret leaf.
-			// Covered structurally by TestGRPCAPINeverRevealsSecretCleartext:
-			// a secret can only escape a config.Secret field via Reveal(), and
-			// this package has no such call.
-			structuralOnly: "streams kernel pcap frames; renders no config. " +
-				"Covered by TestGRPCAPINeverRevealsSecretCleartext.",
+			// The one streaming RPC on the allowlist. It streams pre-formatted
+			// TEXT frames of per-interface counter snapshots
+			// (monitoriface.RenderTrafficSummary / RenderSingleInterface), and
+			// it DOES read configuration: the interface set comes from the
+			// active config (TrafficSummaryInterfaces, else
+			// cfg.Interfaces.Interfaces) and the display names it prints come
+			// from ResolveReth / LookupInterface. So it is audited like any
+			// other renderer, not excused.
+			//
+			// Driving it is straightforward with a nil dataplane, exactly like
+			// the unary probes above: the snapshot reads fail, the interface
+			// NAMES still render, and monitorFrameSink aborts the stream after
+			// the first frame so the 1s ticker loop returns at once.
+			render: func(t *testing.T, s *Server) []string {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				sink := &monitorFrameSink{ctx: ctx}
+				err := s.MonitorInterface(&pb.MonitorInterfaceRequest{}, sink)
+				if err != nil && !errors.Is(err, errMonitorProbeDone) {
+					t.Fatalf("MonitorInterface: %v", err)
+				}
+				if len(sink.frames) == 0 {
+					t.Fatal("MonitorInterface rendered no frame — the probe is " +
+						"vacuous; it must actually exercise the renderer")
+				}
+				return sink.frames
+			},
 		},
 	}
+}
+
+// errMonitorProbeDone aborts MonitorInterface's stream after one frame.
+var errMonitorProbeDone = errors.New("monitor probe: one frame captured")
+
+// monitorFrameSink is a minimal grpc.ServerStreamingServer that records the
+// frames MonitorInterface emits and then ends the stream. Only Context and
+// Send are exercised; the embedded nil ServerStream satisfies the rest of the
+// interface and would panic loudly if the handler ever reached for more.
+type monitorFrameSink struct {
+	grpc.ServerStream
+	ctx    context.Context
+	frames []string
+}
+
+func (m *monitorFrameSink) Context() context.Context { return m.ctx }
+
+func (m *monitorFrameSink) Send(resp *pb.MonitorInterfaceResponse) error {
+	m.frames = append(m.frames, resp.GetFrame())
+	return errMonitorProbeDone
 }
 
 // newFabricSecretServer commits fabricSecretConfig and returns a Server over
@@ -253,6 +296,15 @@ func newFabricSecretServer(t *testing.T) *Server {
 // special-cases by name (today: SystemAction, via isFabricSafeSystemAction).
 // Reading the interceptor source closes the hole a map-only enumeration would
 // leave — a second special-cased admission would otherwise escape the audit.
+//
+// LIMIT, and why the canary below exists: the source scan is TEXTUAL and reads
+// only the two interceptor function BODIES. It finds SystemAction because
+// `pb.BpfrxService_SystemAction_FullMethodName` is written inline in
+// fabricAllowlistUnaryInterceptor. Hoisting that constant into a helper — the
+// way isFabricSafeSystemAction already holds the predicate — would silently
+// drop the method from the audited set. Keep the method-name constants IN the
+// interceptor bodies; if a refactor must move one, extend
+// methodsNamedInInterceptors to follow it.
 func fabricAdmittedMethods(t *testing.T) map[string]bool {
 	t.Helper()
 	admitted := map[string]bool{}
@@ -264,6 +316,21 @@ func fabricAdmittedMethods(t *testing.T) map[string]bool {
 	}
 	for _, m := range methodsNamedInInterceptors(t) {
 		admitted[m] = true
+	}
+
+	// Canary for the limit above. SystemAction is known to be fabric-admitted
+	// (isFabricSafeSystemAction), and it is reachable ONLY via the source scan
+	// — it is in neither allowlist map. If the scan stops finding it, the scan
+	// itself broke; failing here is what keeps that from being silent. This is
+	// a floor on the enumeration, not a substitute for it: the audited set is
+	// still derived, so a NEW special-cased method is still picked up.
+	if !admitted[pb.BpfrxService_SystemAction_FullMethodName] {
+		t.Fatalf("the interceptor source scan no longer finds SystemAction, which "+
+			"IS fabric-admitted via isFabricSafeSystemAction (%s:%s). The "+
+			"method-name constant was probably hoisted out of the interceptor "+
+			"body — follow it in methodsNamedInInterceptors, or this audit "+
+			"silently stops covering it.", interceptorSrc,
+			"fabricAllowlistUnaryInterceptor")
 	}
 	return admitted
 }
@@ -457,17 +524,37 @@ func dispatcherTopics(t *testing.T) []string {
 	return topics
 }
 
-// TestGRPCAPINeverRevealsSecretCleartext pins the structural property the audit
+// TestGRPCAPINeverUnwrapsSecretCleartext pins the structural property the audit
 // above rests on. Every operator secret in the config tree except the SNMP
 // community is a config.Secret, whose String() renders "<redacted>" under
-// %s/%v (#2053) — so a text renderer cannot leak one by accident. The ONE way
-// to defeat that is Reveal(), the explicit cleartext accessor. This package,
-// which serves the network-exposed fabric listener, must never call it.
+// %s/%v/%q/%x (#2053) — so a text renderer cannot leak one by accident.
 //
-// This also covers the renderers the in-process sweep cannot fully drive
-// (wireguard / ipsec-statistics / bfd-peers short-circuit on a nil dataplane,
-// IPsec manager or FRR before formatting anything).
-func TestGRPCAPINeverRevealsSecretCleartext(t *testing.T) {
+// There are TWO ways to defeat that, and this guard checks both:
+//
+//  1. Reveal(), the explicit cleartext accessor.
+//  2. A plain CONVERSION. config.Secret is `type Secret string`
+//     (pkg/config/secret.go), so `string(x.PSK)`, `[]byte(x.PSK)` or
+//     `"p " + string(x.PSK)` yields the raw value without ever reaching
+//     String(). A scan for Reveal() alone misses this entirely.
+//
+// Both matter most for the renderers the in-process sweep cannot fully drive:
+// wireguard / ipsec-statistics / bfd-peers short-circuit on a nil dataplane,
+// IPsec manager or FRR before formatting anything, so for those paths this
+// guard is the only net. A conversion inside one of them would otherwise be
+// invisible to BOTH tests.
+//
+// Scope, stated honestly rather than overclaimed: the conversion check is
+// syntactic. It resolves the converted expression to its final identifier and
+// matches that against the Secret-typed FIELD names declared at file scope in
+// pkg/config, so it catches the direct field conversions above. It does NOT
+// catch a conversion applied to a local variable that was assigned from a
+// secret field first (`s := gw.PSK; _ = string(s)`) — that needs full type
+// resolution. Closing the direct-field path closes the realistic renderer
+// mistake; the aliased path remains a known residual.
+func TestGRPCAPINeverUnwrapsSecretCleartext(t *testing.T) {
+	secretFields := secretTypedFieldNames(t)
+	fset := token.NewFileSet()
+
 	files, err := filepath.Glob("*.go")
 	if err != nil {
 		t.Fatalf("glob package sources: %v", err)
@@ -477,23 +564,152 @@ func TestGRPCAPINeverRevealsSecretCleartext(t *testing.T) {
 		if strings.HasSuffix(f, "_test.go") {
 			continue
 		}
-		b, err := os.ReadFile(f)
+		file, err := parser.ParseFile(fset, f, nil, 0)
 		if err != nil {
-			t.Fatalf("read %s: %v", f, err)
+			t.Fatalf("parse %s: %v", f, err)
 		}
 		scanned++
-		for i, line := range strings.Split(string(b), "\n") {
-			if strings.Contains(line, ".Reveal()") {
+
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok || len(call.Args) != 1 {
+				return true
+			}
+			pos := fset.Position(call.Pos())
+
+			// (1) x.Reveal()
+			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Reveal" {
 				t.Errorf("%s:%d calls the config.Secret cleartext accessor Reveal() "+
 					"on the gRPC surface. pkg/grpcapi serves the network-exposed "+
 					"cluster-fabric listener (#4122); revealing a secret here risks "+
-					"rendering it to the peer chassis (#6532). If a cleartext secret "+
-					"is genuinely required, keep it off every render path and "+
-					"document it here:\n\t%s", f, i+1, strings.TrimSpace(line))
+					"rendering it to the peer chassis (#6532). Keep it off every "+
+					"render path and document why here.", f, pos.Line)
+				return true
 			}
-		}
+
+			// (2) string(<secret field>) / []byte(<secret field>)
+			if !isStringOrByteSliceConversion(call.Fun) {
+				return true
+			}
+			name := trailingIdent(call.Args[0])
+			if name != "" && secretFields[name] {
+				t.Errorf("%s:%d converts the config.Secret field %q with %s(...), "+
+					"which yields the CLEARTEXT secret: config.Secret is a named "+
+					"string type, so a conversion bypasses the String() redaction "+
+					"that protects every %%s/%%v render (#2053). pkg/grpcapi serves "+
+					"the network-exposed cluster-fabric listener (#4122) — this can "+
+					"put an operator credential on the wire to the peer chassis "+
+					"(#6532). Format the Secret directly, or justify the conversion "+
+					"here.", f, pos.Line, name, conversionName(call.Fun))
+			}
+			return true
+		})
 	}
 	if scanned == 0 {
 		t.Fatal("scanned no package sources — the glob is wrong and this guard is vacuous")
 	}
+	// Floor against a silently-broken extraction (a parse change, a moved
+	// package). It is well below the true count because field NAMES dedupe —
+	// AuthKey alone is declared four times — so the set is 12 today, not the
+	// ~24 declaration sites: APIToken AWSSecretAccessKey AuthKey AuthPassword
+	// ControlLinkAuthKey EncryptedPassword PSK Password PresharedKeyHex
+	// PrivPassword TSIGSecret WgLocalPrivkeyHex.
+	if len(secretFields) < 10 {
+		t.Fatalf("resolved only %d config.Secret field names; the extraction broke "+
+			"and the conversion half of this guard is near-vacuous", len(secretFields))
+	}
+}
+
+// isStringOrByteSliceConversion reports whether fun is the `string` or
+// `[]byte` conversion target.
+func isStringOrByteSliceConversion(fun ast.Expr) bool {
+	if id, ok := fun.(*ast.Ident); ok {
+		return id.Name == "string"
+	}
+	if arr, ok := fun.(*ast.ArrayType); ok && arr.Len == nil {
+		el, ok := arr.Elt.(*ast.Ident)
+		return ok && el.Name == "byte"
+	}
+	return false
+}
+
+func conversionName(fun ast.Expr) string {
+	if isStringOrByteSliceConversion(fun) {
+		if id, ok := fun.(*ast.Ident); ok {
+			return id.Name
+		}
+		return "[]byte"
+	}
+	return "?"
+}
+
+// trailingIdent returns the final identifier of a selector/index chain —
+// "PSK" for `cfg.Security.IKE.Policies[n].PSK` — or "" if the expression has
+// no such tail.
+func trailingIdent(e ast.Expr) string {
+	for {
+		switch x := e.(type) {
+		case *ast.SelectorExpr:
+			return x.Sel.Name
+		case *ast.Ident:
+			return x.Name
+		case *ast.IndexExpr:
+			e = x.X
+		case *ast.StarExpr:
+			e = x.X
+		case *ast.ParenExpr:
+			e = x.X
+		default:
+			return ""
+		}
+	}
+}
+
+// secretTypedFieldNames returns the names of every struct field declared as
+// config.Secret at FILE SCOPE in pkg/config. File scope matters: the
+// SNMPCommunity MarshalJSON/MarshalYAML bodies declare local alias structs
+// with a `Name Secret` field, and folding that generic name into the set would
+// flag `string(x.Name)` all over the package.
+func secretTypedFieldNames(t *testing.T) map[string]bool {
+	t.Helper()
+	out := map[string]bool{}
+	files, err := filepath.Glob(filepath.Join("..", "config", "*.go"))
+	if err != nil {
+		t.Fatalf("glob pkg/config: %v", err)
+	}
+	fset := token.NewFileSet()
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, f, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", f, err)
+		}
+		for _, decl := range file.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				ts, ok := spec.(*ast.TypeSpec)
+				if !ok {
+					continue
+				}
+				st, ok := ts.Type.(*ast.StructType)
+				if !ok {
+					continue
+				}
+				for _, field := range st.Fields.List {
+					if id, ok := field.Type.(*ast.Ident); !ok || id.Name != "Secret" {
+						continue
+					}
+					for _, n := range field.Names {
+						out[n.Name] = true
+					}
+				}
+			}
+		}
+	}
+	return out
 }

@@ -55,26 +55,27 @@ func (s *Server) showSNMP(cfg *config.Config, buf *strings.Builder) {
 		// Iteration runs over the real (sorted) keys so the render stays
 		// deterministic once every displayed key is the same placeholder
 		// (mirrors #4712 on the REST sibling).
-		names := make([]string, 0, len(snmpCfg.Communities))
-		for name := range snmpCfg.Communities {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		for _, name := range names {
+		for _, name := range sortedMapKeys(snmpCfg.Communities) {
 			comm := snmpCfg.Communities[name]
 			fmt.Fprintf(buf, "  %s: %s\n",
 				config.SNMPCommunityDisplayName(name, true), comm.Authorization)
 		}
 	}
+	// #6532: the remaining map iterations sort too, completing the #4712
+	// determinism parity with the REST sibling (pkg/api/show_text.go, which
+	// sorts communities AND trap groups). Go randomizes map iteration, so
+	// these lines reordered between two identical requests.
 	if len(snmpCfg.TrapGroups) > 0 {
 		buf.WriteString("Trap groups:\n")
-		for name, tg := range snmpCfg.TrapGroups {
+		for _, name := range sortedMapKeys(snmpCfg.TrapGroups) {
+			tg := snmpCfg.TrapGroups[name]
 			fmt.Fprintf(buf, "  %s: %s\n", name, strings.Join(tg.Targets, ", "))
 		}
 	}
 	if len(snmpCfg.V3Users) > 0 {
 		buf.WriteString("SNMPv3 USM users:\n")
-		for name, u := range snmpCfg.V3Users {
+		for _, name := range sortedMapKeys(snmpCfg.V3Users) {
+			u := snmpCfg.V3Users[name]
 			auth := u.AuthProtocol
 			if auth == "" {
 				auth = "none"
@@ -86,6 +87,18 @@ func (s *Server) showSNMP(cfg *config.Config, buf *strings.Builder) {
 			fmt.Fprintf(buf, "  %s: auth=%s priv=%s\n", name, auth, priv)
 		}
 	}
+}
+
+// sortedMapKeys returns a string-keyed map's keys in ascending order, so a
+// config map renders deterministically across requests (Go randomizes map
+// iteration order — #4712).
+func sortedMapKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // showSNMPv3 renders the SNMPv3 USM user table.

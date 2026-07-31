@@ -1,3 +1,67 @@
+## 2026-07-31 — #6532 review fold: three MINORs, all about artifacts overstating coverage
+
+- **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact, PR #6602)
+- **Action**: Hostile review returned MERGE-NEEDS-MINOR with no code-correctness
+  defect. All three MINORs were artifacts claiming more than they delivered;
+  each is now either corrected or actually delivered.
+  MINOR 1 — the "#4111 behaviour is unchanged / super-user still reads
+  cleartext" claim is FALSE for the remote `cli` binary. `cmd/cli/show.go`
+  routes `show snmp` straight to the RPC via `c.showText("snmp")`, and
+  `cmd/cli` has zero login-class awareness (verified: no userClass/LoginClass/
+  PermAll/showConfigRedacted hits), so a super-user on `cli` now gets
+  `##SECRET-DATA##`. Kept the posture — threading a class into pkg/grpcapi is
+  impossible today and meaningless on the fabric listener where the caller is
+  the peer chassis, and `cli show configuration snmp` was ALREADY masked for
+  every class by #4051, so the two remote read-back paths now agree instead of
+  contradicting. Amended docs/system-login.md: the #4111 paragraph now scopes
+  its allowance to the CONSOLE CLI, and a new callout states the remote-CLI
+  masking plus the operational consequence (no remote read-back; recover from
+  console as super-user or the DR archive, noting a redacted export is
+  deliberately not restorable per #4060).
+  MINOR 2 — the MonitorInterface audit-register entry was factually wrong on
+  all three counts. It streams pre-formatted TEXT frames of counter snapshots
+  (RenderTrafficSummary/RenderSingleInterface), it DOES render configuration
+  (interface set + display names from the active config), and there is no pcap
+  anywhere in server_diag_monitor.go. Rather than just restate it, promoted it
+  to a REAL probe: a monitorFrameSink mock stream captures the first frame and
+  aborts, so it is now driven with a nil dataplane like the seven unary probes.
+  MINOR 3 — `TestGRPCAPINeverRevealsSecretCleartext` claimed "the ONE way to
+  defeat String() is Reveal()". False: config.Secret is `type Secret string`,
+  so `string(x.PSK)` / `[]byte(x.PSK)` yields cleartext and a Reveal() grep
+  misses it. Replaced the line-grep with an AST scan covering BOTH paths,
+  matching conversions against the Secret-typed field names parsed from
+  FILE-SCOPE declarations in pkg/config (12 unique names; the function-local
+  `Name Secret` alias fields in the SNMPCommunity marshallers are correctly
+  excluded). Renamed to TestGRPCAPINeverUnwrapsSecretCleartext and stated the
+  real residual instead of overclaiming again: a conversion applied to a local
+  variable previously assigned from a secret field is not caught.
+  NIT 4 — delivered the determinism parity rather than scoping the claim.
+  gRPC showSNMP now sorts trap groups and USM users as well as communities
+  (shared sortedMapKeys helper), and both pkg/cli community loops sort via
+  sortedSNMPCommunityNames. This matters most under redaction: every displayed
+  key is the same placeholder, so an unsorted map printed N indistinguishable
+  lines with shuffling authorization modes.
+  NIT 5 — documented that the interceptor source scan is textual and reads only
+  the function bodies, so hoisting a method-name constant into a helper would
+  silently drop it from the audited set; added a canary that fails if the scan
+  stops finding SystemAction (reachable ONLY via the scan — it is in neither
+  allowlist map).
+  Validation: the widened scan was proven firsthand in a THROWAWAY detached
+  worktree, twice. Injecting `string(u.AuthPassword)` into showSNMP: build+vet
+  CLEAN, scan FAILS as an assertion. Then the reviewer's actual scenario —
+  `string(u.PrivPassword)` injected BEHIND a nil-dataplane short-circuit: the
+  empirical sweep PASSES (blind to that path) while the structural guard FAILS,
+  proving it is the only net there. Probe worktree removed; PR worktree never
+  used for a revert probe. New determinism test mutation-tested (reverting the
+  community sort goes RED at attempt 4). gofmt clean, go build ./... and
+  go vet ./... clean, pkg/grpcapi + pkg/api + pkg/config + pkg/cli +
+  pkg/refactoraudit green.
+- **File(s)**: pkg/grpcapi/{server_fabric_secret_render_6532_test.go,
+    server_show_snmp_community_redaction_6532_test.go,
+    server_show_dhcp_lldp_snmp.go},
+    pkg/cli/{show_services_snmp.go,cli_show_system.go},
+    docs/system-login.md, _Log.md
+
 ## 2026-07-31 — #6532: redact the SNMP community on the fabric-reachable gRPC ShowText
 
 - **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact)

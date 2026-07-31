@@ -135,6 +135,56 @@ func TestShowTextSNMPv3KeepsProtocolsAndMasksPasswords(t *testing.T) {
 	}
 }
 
+// TestShowTextSNMPRenderIsDeterministic pins the #4712 determinism parity the
+// mask makes load-bearing. Once every displayed community key is the SAME
+// placeholder, an unsorted map iteration prints N indistinguishable lines
+// whose authorization modes shuffle between two identical requests — the
+// operator cannot tell which mode belongs to which community, and a diff of
+// two captures is noise. Sorting over the real keys fixes the pairing.
+// Trap groups and USM users sort for the same reason (REST sorts trap groups
+// too, pkg/api/show_text.go).
+func TestShowTextSNMPRenderIsDeterministic(t *testing.T) {
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
+	if err := store.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure(): %v", err)
+	}
+	// Distinct authorization modes per community so a mispairing is visible,
+	// and several trap groups / USM users so their order is exercised too.
+	multi := []string{
+		"set snmp community ZZZ-COMMUNITY-C authorization read-write",
+		"set snmp community AAA-COMMUNITY-A authorization read-only",
+		"set snmp community MMM-COMMUNITY-B authorization read-only",
+		"set snmp trap-group tg-z targets 10.0.0.3",
+		"set snmp trap-group tg-a targets 10.0.0.1",
+		"set snmp v3 usm local-engine user zeta authentication-sha256 authentication-password pw1",
+		"set snmp v3 usm local-engine user alpha authentication-md5 authentication-password pw2",
+	}
+	if _, err := store.LoadSet(strings.Join(multi, "\n")); err != nil {
+		t.Fatalf("LoadSet(): %v", err)
+	}
+	if _, err := store.Commit(); err != nil {
+		t.Fatalf("Commit(): %v", err)
+	}
+	s := &Server{store: store}
+
+	first := showTextOutput(t, s, "snmp")
+	// Go randomizes map iteration per range, so repeated renders of an
+	// unsorted map diverge within a handful of attempts.
+	for i := 0; i < 32; i++ {
+		if got := showTextOutput(t, s, "snmp"); got != first {
+			t.Fatalf("ShowText{snmp} render is NOT deterministic (attempt %d) — an "+
+				"unsorted map iteration reorders lines between identical requests "+
+				"(#4712/#6532).\n--- first ---\n%s\n--- attempt %d ---\n%s",
+				i, first, i, got)
+		}
+	}
+	// Guard against the render collapsing to nothing, which would make the
+	// equality above vacuously true.
+	if n := strings.Count(first, config.SecretDataPlaceholder); n != 3 {
+		t.Errorf("expected 3 masked community lines, got %d:\n%s", n, first)
+	}
+}
+
 // TestSNMPCommunityDisplayNameSemantics pins the shared helper's contract
 // directly: it is the ONE implementation of the masking rule, and it is
 // privilege-parameterised so the CLI can keep its per-login-class behaviour

@@ -2,10 +2,26 @@ package cli
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
 )
+
+// sortedSNMPCommunityNames returns the community map keys in ascending order.
+// Deterministic ordering matters most precisely WHEN the names are redacted
+// (#6532): every displayed key is then the same placeholder, so an unsorted
+// map iteration prints N identical lines whose authorization modes shuffle
+// between two runs of the same command. Iteration runs over the real keys; the
+// masking happens at the render site.
+func sortedSNMPCommunityNames(m map[string]*config.SNMPCommunity) []string {
+	names := make([]string, 0, len(m))
+	for name := range m {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
 
 func (c *CLI) showSNMP() error {
 	cfg := c.store.ActiveConfig()
@@ -35,7 +51,8 @@ func (c *CLI) showSNMP() error {
 		// helper; the per-class PREDICATE stays here, since only the CLI has a
 		// login class to gate on.
 		redactCommunity := c.showConfigRedacted()
-		for name, comm := range snmpCfg.Communities {
+		for _, name := range sortedSNMPCommunityNames(snmpCfg.Communities) {
+			comm := snmpCfg.Communities[name]
 			fmt.Printf("  %s: %s\n",
 				config.SNMPCommunityDisplayName(name, redactCommunity), comm.Authorization)
 		}

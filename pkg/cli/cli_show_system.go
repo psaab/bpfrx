@@ -317,8 +317,12 @@ func (c *CLI) showSystemServices() error {
 		// #6532: the mask itself now comes from the shared
 		// config.SNMPCommunityDisplayName helper (one implementation across
 		// CLI/REST/gRPC); the per-class predicate stays local to the CLI.
+		// Sorted iteration for the same reason as `show snmp` — under
+		// redaction every displayed key is the same placeholder, so an
+		// unsorted map shuffles otherwise-identical lines between runs.
 		redactCommunity := c.showConfigRedacted()
-		for name, comm := range cfg.System.SNMP.Communities {
+		for _, name := range sortedSNMPCommunityNames(cfg.System.SNMP.Communities) {
+			comm := cfg.System.SNMP.Communities[name]
 			fmt.Printf("    Community:    %s (%s)\n",
 				config.SNMPCommunityDisplayName(name, redactCommunity), comm.Authorization)
 		}

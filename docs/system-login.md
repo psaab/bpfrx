@@ -521,8 +521,9 @@ reuse the same `CLI.showConfigRedacted()` predicate: for any class without
 `PermAll` the community **name** is masked to `##SECRET-DATA##` while the
 authorization **mode** (`read-only` / `read-write`) stays visible; `super-user`
 and the unset/legacy class still read the cleartext name (parity with the #4099
-config-render decision above). The TSIG key already showed `(secret redacted)`
-and SNMPv3 renders auth/priv protocol names only, so the community name was the
+config-render decision above) — **on the in-process console CLI only; see the
+next paragraph for `cli`**. The TSIG key already showed `(secret redacted)` and
+SNMPv3 renders auth/priv protocol names only, so the community name was the
 last cleartext SNMP secret on these two surfaces.
 
 **The same masking on the REST and gRPC surfaces (#5315, #6532).** The CLI is
@@ -547,6 +548,30 @@ at each site: the community is the **one** operator secret not covered by the
 string because it is the `Communities` map key — so every manual renderer has
 to remember to mask it, and three independent copies of that one-line rule are
 exactly how the gRPC surface stayed in the clear through two hardening passes.
+
+> [!IMPORTANT]
+> **`cli show snmp` is masked for EVERY caller, including `super-user`
+> (#6532).** The #4111 super-user cleartext allowance above survives only on
+> the **in-process console CLI** (`pkg/cli`, which knows the login class). The
+> remote `cli` binary — the primary operator interface — dispatches `show snmp`
+> and `show snmp v3` straight to the gRPC RPC (`cmd/cli/show.go`,
+> `c.showText("snmp")`), and `cmd/cli` has no login-class awareness at all, so
+> there is no class to exempt: it renders `##SECRET-DATA##` for everyone.
+>
+> This is a deliberate posture change, not an oversight. Threading a login
+> class into `pkg/grpcapi` is not possible today (the package has no class
+> plumbing) and would be actively wrong on the fabric listener, where the
+> caller is the peer chassis rather than a user. Masking unconditionally is
+> also what the sibling `ShowConfig` already does (#4051), so `cli show
+> configuration snmp` was ALREADY masked for every class before #6532 — the
+> two remote read-back paths now agree instead of contradicting each other.
+>
+> Operational consequence to be aware of: an operator has **no remote
+> read-back path** for a configured community. Recover it from the console
+> CLI as `super-user`, or from the DR archive (`request system configuration
+> rescue`) — note that a redacted export is deliberately not restorable
+> (#4060). The community remains fully functional on the wire; only its
+> display is masked.
 
 ### Generating a hash
 
