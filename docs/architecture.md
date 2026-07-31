@@ -199,19 +199,23 @@ editing cmdtree.
     one class of leak is that every operator secret except the SNMP
     community is a `config.Secret`, whose `String()` masks it under
     `%s`/`%v`/`%q`/`%x` (#2053) — the community is a plain string because it
-    is the `Communities` map key. That protection has exactly two escape
-    hatches, and `TestGRPCAPINeverUnwrapsSecretCleartext` asserts neither is
-    used here: the `Reveal()` cleartext accessor, and a plain
-    `string(...)`/`[]byte(...)` **conversion**, which works because `Secret`
-    is a named string type and therefore never reaches `String()`. The
-    conversion check is syntactic and its residuals (a conversion of a local
-    previously assigned from a secret field, a Secret-bearing field declared
-    outside `pkg/config`, non-conversion unwrapping) are enumerated on the
-    test. A companion meta-test feeds the scanner synthetic sources and
-    asserts it REPORTS each shape — without it, an all-clear from a broken
-    scan is indistinguishable from an all-clear from a clean package, which
-    is how the `Reveal()` branch was once disabled while the suite stayed
-    green.
+    is the `Communities` map key. `TestGRPCAPINeverUnwrapsSecretCleartext`
+    asserts the two **detected** unwrapping forms are absent here: the
+    `Reveal()` cleartext accessor, and a plain
+    `string(...)`/`[]byte(...)`/`[]rune(...)`/`[]uint8(...)` **conversion**,
+    which works because `Secret` is a named string type and so never reaches
+    `String()`. Two detected forms is NOT the same as two possible forms —
+    `append(dst, secret...)`, `copy(dst, secret)`, indexing, ranging,
+    reflection, and any conversion routed through a local, a parameter or an
+    out-of-package field all remain **known residuals** that would need type
+    resolution to catch. They are enumerated on the test alongside its
+    deliberate false positives. A companion meta-test feeds the scanner
+    synthetic sources — including parenthesized callees such as
+    `(string)(x.PSK)` and `(x.PSK.Reveal)()`, which are legal Go that gofmt
+    preserves — and asserts it REPORTS each one. That meta-test is
+    load-bearing, not decorative: an all-clear from a broken scan is
+    indistinguishable from an all-clear from a clean package, and this scan
+    has twice shipped with a silently unreachable branch.
 - **HTTP REST** on `127.0.0.1:8080` — health, Prometheus `/metrics`,
   config endpoints, full gRPC parity.
   - **Listener lifecycle is all-or-nothing (#5058).** `Server.Run` may

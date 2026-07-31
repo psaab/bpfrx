@@ -560,26 +560,41 @@ func dispatcherTopics(t *testing.T) []string {
 // revision of this file became unreachable dead code while still reporting
 // PASS.
 //
-// SCOPE — stated in full, because a guard that overstates its reach is worse
-// than one that admits its limits. The conversion half is SYNTACTIC: it
+// SCOPE — these are the two DETECTED forms, not an exhaustive list of ways a
+// Secret can be unwrapped. Stating it that way matters: a guard that
+// overstates its reach is worse than one that admits its limits, because it
+// reads as covered.
+//
+// The Reveal half is name-based and shape-independent (it matches the
+// selection, so calls, parenthesized calls and method values all register).
+// The conversion half is SYNTACTIC: it de-parenthesizes the callee, then
 // resolves the converted expression to its trailing identifier and matches
 // that against the Secret-bearing field names declared at file scope in
-// pkg/config. It therefore does NOT catch:
+// pkg/config.
+//
+// NOT DETECTED — known residuals, each of which would need type resolution:
 //
 //   - a conversion of a local variable assigned from a secret field earlier
 //     (`s := gw.PSK; _ = string(s)`), a function parameter, or a helper return;
 //   - a Secret-bearing field declared outside pkg/config, or reached through a
 //     type alias;
-//   - non-conversion unwrapping: `append(dst, secret...)`, indexing or ranging
-//     the string, or reflection.
+//   - non-conversion unwrapping: `append(dst, secret...)`, `copy(dst, secret)`,
+//     indexing or ranging the string, or reflection.
 //
-// It also FALSE-POSITIVES by design, which is the right bias on a
-// network-exposed surface: an unrelated field that merely shares a name with a
-// Secret field (`Password`, `PSK`) is flagged, as is a conversion using a
-// locally shadowed `string`/`byte` identifier. Both are cheap to justify in
-// review; a missed credential is not. Closing the direct-field path closes the
-// realistic renderer mistake — the rest is a documented residual, not a claim
-// of completeness.
+// FALSE POSITIVES — by design, and the right bias on a network-exposed
+// surface, but disclosed rather than discovered:
+//
+//   - ANY method named Reveal is flagged, whatever its receiver type — this
+//     guard does not resolve types, so an unrelated Reveal() would register;
+//   - the conversion check matches a trailing IDENTIFIER, so an unrelated
+//     local, parameter or field that merely shares a name with a Secret field
+//     (`Password`, `PSK`) is flagged too — it is not limited to real fields;
+//   - a conversion using a locally shadowed `string`, `byte`, `rune`, `uint8`
+//     or `int32` identifier is flagged as if it were the builtin.
+//
+// All three are cheap to justify in review; a missed credential is not.
+// Closing the direct-field path closes the realistic renderer mistake — the
+// rest is a documented residual, not a claim of completeness.
 func TestGRPCAPINeverUnwrapsSecretCleartext(t *testing.T) {
 	secretFields := secretTypedFieldNames(t)
 
@@ -678,6 +693,45 @@ func TestSecretUnwrapScannerDetectsBothForms(t *testing.T) {
 			src:  "package p\nfunc f(x T) { _ = string(x.APIKeys[i]) }\n",
 			want: `"APIKeys"`,
 		},
+
+		// Parenthesized callees. All of these are legal Go that gofmt leaves
+		// untouched, and every one of them put an *ast.ParenExpr where an
+		// earlier revision looked for the callee directly — so all four
+		// produced NO finding while the scanner claimed to cover them.
+		{
+			name: "parenthesized Reveal callee",
+			src:  "package p\nfunc f(x T) { _ = (x.PSK.Reveal)() }\n",
+			want: "Reveal()",
+		},
+		{
+			name: "parenthesized string conversion",
+			src:  "package p\nfunc f(x T) { _ = (string)(x.PSK) }\n",
+			want: `"PSK" with string(...)`,
+		},
+		{
+			name: "parenthesized byte slice conversion",
+			src:  "package p\nfunc f(x T) { _ = ([]byte)(x.PSK) }\n",
+			want: `"PSK" with []byte(...)`,
+		},
+		{
+			name: "doubly parenthesized conversion",
+			src:  "package p\nfunc f(x T) { _ = ((string))(x.PSK) }\n",
+			want: `"PSK" with string(...)`,
+		},
+		{
+			name: "parenthesized conversion argument",
+			src:  "package p\nfunc f(x T) { _ = string((x.PSK)) }\n",
+			want: `"PSK"`,
+		},
+
+		// A method VALUE binds the accessor without calling it at the binding
+		// site. Detecting the selection covers this; a CallExpr-anchored check
+		// cannot, because the call is `reveal()` with no selector at all.
+		{
+			name: "Reveal bound as a method value",
+			src:  "package p\nfunc f(x T) { reveal := x.PSK.Reveal; _ = reveal() }\n",
+			want: "Reveal()",
+		},
 	}
 
 	for _, tc := range cases {
@@ -726,8 +780,18 @@ type secretUnwrap struct {
 // scanSecretUnwraps reports every cleartext unwrapping of a config.Secret in
 // one file. The two detections are deliberately INDEPENDENT — neither shares a
 // precondition with the other — because coupling them is what silently killed
-// the Reveal() branch once already: a zero-argument method call never has
-// exactly one Arg, so an arg-count gate placed ahead of it disabled it.
+// the Reveal branch once already: a zero-argument method call never has exactly
+// one Arg, so an arg-count gate placed ahead of it disabled it.
+//
+// Both detections are also written against the SHAPE OF THE AST rather than
+// the shape of the source a reviewer pictures. Go lets a callee be
+// parenthesized — `(x.PSK.Reveal)()`, `(string)(x.PSK)`, `((string))(x.PSK)`
+// are all legal and survive gofmt — which puts an *ast.ParenExpr where the
+// naive check looks for the callee. That is why the Reveal detection matches
+// the SELECTOR rather than the call (ast.Inspect reaches the selector however
+// the call is written, and even when it is never called — a `reveal :=
+// x.PSK.Reveal` method value binds the same cleartext accessor), and why the
+// conversion detection unwraps parentheses before inspecting the callee.
 func scanSecretUnwraps(fset *token.FileSet, file *ast.File, filename string, secretFields map[string]bool) []secretUnwrap {
 	var out []secretUnwrap
 	at := func(n ast.Node) string {
@@ -735,18 +799,15 @@ func scanSecretUnwraps(fset *token.FileSet, file *ast.File, filename string, sec
 	}
 
 	ast.Inspect(file, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-
-		// (1) x.Secret.Reveal() — the explicit cleartext accessor. A method
-		// call carries its receiver in Fun, NOT in Args, so this must never be
-		// gated on len(Args).
-		if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Reveal" {
+		// (1) The Reveal cleartext accessor, matched on the SELECTION itself.
+		// This covers `x.PSK.Reveal()`, the parenthesized `(x.PSK.Reveal)()`,
+		// and a method VALUE (`reveal := x.PSK.Reveal`) uniformly — binding the
+		// accessor is as much a cleartext path as calling it, and none of the
+		// three depends on how the call is parenthesized.
+		if sel, ok := n.(*ast.SelectorExpr); ok && sel.Sel.Name == "Reveal" {
 			out = append(out, secretUnwrap{
-				Where: at(call),
-				Detail: "calls the config.Secret cleartext accessor Reveal(), " +
+				Where: at(sel),
+				Detail: "references the config.Secret cleartext accessor Reveal(), " +
 					"which returns the raw secret",
 			})
 			return true
@@ -755,7 +816,8 @@ func scanSecretUnwraps(fset *token.FileSet, file *ast.File, filename string, sec
 		// (2) string(x.Secret) / []byte(...) / []rune(...) / []uint8(...) —
 		// config.Secret is a named string type, so a conversion yields the
 		// cleartext without ever reaching the String() redaction.
-		if len(call.Args) != 1 {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || len(call.Args) != 1 {
 			return true
 		}
 		conv := secretUnwrapConversionName(call.Fun)
@@ -777,9 +839,24 @@ func scanSecretUnwraps(fset *token.FileSet, file *ast.File, filename string, sec
 	return out
 }
 
+// unwrapParens strips any number of parenthesis layers. `((string))(x)` is
+// legal Go and gofmt leaves it alone, so a single-level unwrap is not enough.
+func unwrapParens(e ast.Expr) ast.Expr {
+	for {
+		p, ok := e.(*ast.ParenExpr)
+		if !ok {
+			return e
+		}
+		e = p.X
+	}
+}
+
 // secretUnwrapConversionName returns the name of the conversion fun performs if
-// it is one that unwraps a string-kinded value, else "".
+// it is one that unwraps a string-kinded value, else "". The callee is
+// de-parenthesized first: `(string)(x.PSK)` and `([]byte)(x.PSK)` are ordinary
+// conversions that present their callee as an *ast.ParenExpr.
 func secretUnwrapConversionName(fun ast.Expr) string {
+	fun = unwrapParens(fun)
 	if id, ok := fun.(*ast.Ident); ok && id.Name == "string" {
 		return "string"
 	}
@@ -863,20 +940,54 @@ func secretTypedFieldNames(t *testing.T) map[string]bool {
 	return out
 }
 
-// collectSecretFieldNames adds every field of typ (recursing into nested
-// anonymous structs) whose type mentions Secret.
+// collectSecretFieldNames adds every field of typ whose type mentions Secret,
+// recursing into nested anonymous structs. It looks THROUGH slice, array,
+// pointer and map shapes on the way down, so a Secret carried inside
+// `[]struct{ Token Secret }` or `map[string]*struct{ PSK Secret }` is
+// harvested rather than skipped — a bare `typ.(*ast.StructType)` assertion
+// stops at the first such wrapper.
+//
+// An EMBEDDED Secret (`struct { Secret }`) has no name in the AST but is
+// selected as `x.Secret`, so it is harvested under that name.
 func collectSecretFieldNames(typ ast.Expr, out map[string]bool) {
-	st, ok := typ.(*ast.StructType)
-	if !ok || st.Fields == nil {
+	st := structTypeOf(typ)
+	if st == nil || st.Fields == nil {
 		return
 	}
 	for _, field := range st.Fields.List {
 		if typeMentionsSecret(field.Type) {
+			if len(field.Names) == 0 {
+				// Embedded field: selected by its type name.
+				if n := trailingIdent(field.Type); n != "" {
+					out[n] = true
+				}
+			}
 			for _, n := range field.Names {
 				out[n.Name] = true
 			}
 		}
 		collectSecretFieldNames(field.Type, out)
+	}
+}
+
+// structTypeOf looks through slice/array/pointer/map wrappers to the struct
+// type underneath, or nil if there is none.
+func structTypeOf(e ast.Expr) *ast.StructType {
+	for {
+		switch x := e.(type) {
+		case *ast.StructType:
+			return x
+		case *ast.ArrayType:
+			e = x.Elt
+		case *ast.StarExpr:
+			e = x.X
+		case *ast.MapType:
+			e = x.Value
+		case *ast.ParenExpr:
+			e = x.X
+		default:
+			return nil
+		}
 	}
 }
 

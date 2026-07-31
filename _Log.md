@@ -1,3 +1,59 @@
+## 2026-07-31 — #6532 round-3 fold: parenthesized callees escaped the scanner
+
+- **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact, PR #6602)
+- **Action**: Codex found the round-2 scanner still missed shapes it claimed to
+  cover, and it was right. `(x.PSK.Reveal)()`, `(string)(x.PSK)`,
+  `([]byte)(x.PSK)` and `((string))(x.PSK)` are legal Go that gofmt leaves
+  untouched, and every one presents `call.Fun` as an `*ast.ParenExpr` — proved
+  firsthand with a standalone go/ast program: all four print
+  `Fun=*ast.ParenExpr selector=false ident=false arraytype=false PAREN=true`,
+  so neither the Reveal check nor the conversion check saw them. A method VALUE
+  (`reveal := x.PSK.Reveal`) escaped too: its call site is `reveal()` with no
+  selector at all.
+  Same failure mode as the round-2 MAJOR, one level up — the check was correct
+  for the shapes it was tested against, and the meta-test only fed shapes the
+  scanner already handled. A meta-test that exercises only what already works
+  proves nothing.
+  Fix, and the AST program pointed at a better one than paren-unwrapping the
+  Reveal callee: `ast.Inspect` reaches every `.Reveal` SelectorExpr regardless
+  of parenthesization AND when it is never called (verified — it printed the
+  selector for both the paren-called form and the method-value binding). So
+  Reveal detection now matches the SELECTION rather than the call, covering all
+  three shapes uniformly with no paren logic. The conversion check gets
+  recursive `unwrapParens` on the callee (single-level is not enough —
+  `((string))(x)` is legal).
+  MINOR 1 — architecture.md said "exactly two escape hatches" while the test
+  itself listed append/index/range/reflection; that contradiction is resolved
+  by saying two DETECTED forms and enumerating the residuals, now including
+  `copy(dst, secret)`. `collectSecretFieldNames` recursed only when the
+  immediate expression was a StructType, missing `[]struct{...}`,
+  `*struct{...}`, `map[K]struct{...}` and embedded unnamed Secret fields; it
+  now looks through slice/array/pointer/map via structTypeOf and harvests an
+  embedded Secret under its type name. Harvest still resolves the same 13 live
+  names (no live nested-struct Secret exists today — the widening is for the
+  next one).
+  MINOR 2 — completed the false-positive disclosure: ANY method named Reveal is
+  flagged whatever its receiver (no type resolution); the conversion check
+  matches a trailing IDENTIFIER so unrelated locals and parameters named
+  Password/PSK are flagged too, not merely fields; shadowing applies to rune,
+  uint8 and int32 as well as string and byte.
+  Validation — per-shape mutation, each in a throwaway detached worktree with
+  build+vet CLEAN so every red is an assertion:
+    A. drop unwrapParens from the conversion callee -> RED on
+       parenthesized_string_conversion, parenthesized_byte_slice_conversion,
+       doubly_parenthesized_conversion.
+    B. revert Reveal to CallExpr-anchored matching -> RED on
+       parenthesized_Reveal_callee, Reveal_bound_as_a_method_value.
+    C. drop ParenExpr from trailingIdent -> RED on
+       parenthesized_conversion_argument.
+  That is all six newly-covered shapes, each proven to fail without its fix.
+  Meta-test now runs 15 shapes plus the negative control. Probe worktree
+  removed; the PR worktree was never used for a probe. gofmt clean, go build
+  ./... and go vet ./... clean, pkg/grpcapi + pkg/api + pkg/config + pkg/cli
+  green.
+- **File(s)**: pkg/grpcapi/server_fabric_secret_render_6532_test.go,
+    docs/architecture.md, _Log.md
+
 ## 2026-07-31 — #6532 round-2 fold: my previous fold BROKE the guard it widened
 
 - **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact, PR #6602)
