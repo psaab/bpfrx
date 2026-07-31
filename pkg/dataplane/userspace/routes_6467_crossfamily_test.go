@@ -11,9 +11,19 @@ import (
 // #6467 cross-family cap binding.
 //
 // The kernel programs global next-table leaks as ip rules from a SINGLE shared
-// priority counter: pkg/routing nextTableManager.Apply iterates v4 then v6 and
-// advances one `prio` across both families, so the 100-entry window is shared,
-// not per-family. buildRouteSnapshots mirrors that by declaring
+// priority counter. Note where each half of that invariant actually lives:
+// pkg/routing nextTableManager.Apply has NO family loop — it walks one flat
+// []*config.StaticRoute, derives the family per route from the destination
+// CIDR, and advances one `prio` across the whole slice against a family-blind
+// cap. The v4-before-v6 ORDER is established by the caller, which concatenates
+// the v4 statics then the v6 statics into that one slice:
+//
+//	pkg/daemon/daemon_apply_routing.go
+//	  allRoutes = append(allRoutes, cfg.RoutingOptions.StaticRoutes...)      // v4 FIRST
+//	  allRoutes = append(allRoutes, cfg.RoutingOptions.Inet6StaticRoutes...) // v6 SECOND
+//
+// So the 100-entry window is shared, not per-family, and it is drawn down
+// v4-first. buildRouteSnapshots mirrors that by declaring
 // `nextTableLeakCount` OUTSIDE the addRoutes closure (routes.go), so the two
 // global calls — inet then inet6 — draw down the same budget.
 //
@@ -40,6 +50,19 @@ func TestBuildRouteSnapshotsNextTableCapIsSharedAcrossFamilies_6467(t *testing.T
 	const v6Count = 60
 	const wantV4 = v4Count                              // 60 — fits, filled first
 	const wantV6 = config.NextTableRuleWindow - v4Count // 40 — the remainder
+
+	// Straddle precondition. v4Count/v6Count are literals while the window is an
+	// SSOT that types_system.go explicitly invites tuning. If the window ever
+	// moves past v4Count+v6Count, NOTHING is capped, wantV6 collapses to v6Count,
+	// and every assertion below becomes a tautology that passes even with the
+	// per-family-counter regression applied — the test would lose 100% of its
+	// mutation sensitivity SILENTLY, while staying green. Fail loudly instead.
+	if v4Count+v6Count <= config.NextTableRuleWindow || v4Count >= config.NextTableRuleWindow {
+		t.Fatalf("fixture no longer straddles the next-table window (%d): %d v4 + %d v6. "+
+			"Re-derive the counts from config.NextTableRuleWindow so this test keeps "+
+			"exercising the cap instead of silently asserting nothing",
+			config.NextTableRuleWindow, v4Count, v6Count)
+	}
 
 	cfg := &config.Config{}
 	cfg.RoutingInstances = []*config.RoutingInstanceConfig{{Name: "blue", TableID: 100}}
@@ -92,16 +115,25 @@ func TestBuildRouteSnapshotsNextTableCapIsSharedAcrossFamilies_6467(t *testing.T
 	// from what the kernel actually installs.
 	if gotV4 != wantV4 || gotV6 != wantV6 {
 		t.Fatalf("shared window must be drawn down v4-first like the kernel applier "+
-			"(pkg/routing nextTableManager.Apply iterates v4 then v6 on one prio counter): "+
-			"want %d inet + %d inet6, got %d inet + %d inet6",
+			"(pkg/daemon/daemon_apply_routing.go concatenates v4 statics then v6 statics "+
+			"into ONE slice; pkg/routing nextTableManager.Apply walks it on a single "+
+			"family-blind prio counter): want %d inet + %d inet6, got %d inet + %d inet6",
 			wantV4, wantV6, gotV4, gotV6)
 	}
 }
 
-// TestBuildRouteSnapshotsV6OnlyNextTableCapped_6467 covers the mirror case the
-// v4-only fixtures also leave unbound: a v6-only over-window config must be
-// capped too. Without it, a regression that caps only the first addRoutes call
-// would still pass the cross-family test above (v4 fills the window there).
+// TestBuildRouteSnapshotsV6OnlyNextTableCapped_6467 documents the mirror case
+// the v4-only fixtures also leave unbound: a v6-only over-window config must be
+// capped too.
+//
+// Honest accounting of its value: it is SUBSUMED by the cross-family test above
+// for every mutation tried (counter-inside-closure, cap-only-first-call,
+// cap-v4-leg-only, cap-v6-leg-only, off-by-one) — no mutation was found that
+// this catches and the cross-family test misses. It is kept for two reasons
+// that are not mutation coverage: it runs in 0.00s, and unlike its sibling it
+// derives its fixture size from config.NextTableRuleWindow, so it stays
+// sensitive at ANY window value rather than depending on a straddle
+// precondition.
 func TestBuildRouteSnapshotsV6OnlyNextTableCapped_6467(t *testing.T) {
 	orig := ruleListFn
 	t.Cleanup(func() { ruleListFn = orig })

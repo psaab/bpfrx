@@ -61511,3 +61511,13 @@ while a 60 v4 + 60 v6 config publishes 120 FIB leaks against the kernel's 100.
 The new test asserts the per-family SPLIT (60 inet + 40 inet6), not merely a
 total of 100 — a total-only assertion also passes for a 50/50 split the kernel
 would never produce.
+
+- **Timestamp**: 2026-07-31 03:12
+  - **Action**: Fold hostile-review findings into the #6467 cross-family cap test —
+    corrected two inaccurate provenance comments (the v4-before-v6 ORDER is set by
+    the caller in pkg/daemon/daemon_apply_routing.go, not by a family loop in
+    pkg/routing Apply, which has none), added a straddle precondition so the
+    fixture cannot silently lose its mutation sensitivity if NextTableRuleWindow
+    is retuned, and replaced test 2's false subsumption claim with an honest
+    accounting.
+  - **File(s)**: pkg/dataplane/userspace/routes_6467_crossfamily_test.go
