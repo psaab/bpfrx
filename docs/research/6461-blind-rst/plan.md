@@ -1,17 +1,20 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.22.0 — THE TERMINAL CUT, round-105 folds (the
-two-field split propagated through the producer/fields/carriage with
-the legal Phase-1 product stated and a fail-closed default for
-out-of-product combinations; the second MissingNeighbor outcome list
-gained the `UpsertRefused` composition; the capacity-3 uniqueness
-proof replaces the capacity-4 rule and the promote preimage capture
-point is named inside `update_session`; the `UpsertRefused`
-forwarding-only phrasing scoped; the pre-hoist policy-counter
-fallback explicitly accepted; the last §5.6/§7/§10.6.1 stragglers).
-Round-105: Codex NO (2B/4M/1L — propagation and stragglers; the
-uniqueness proof supplied by Codex itself); AGY r104 SOUND (v10.21.0,
-full combination walk); SMR r105 YES (fold verification). Ship
+**Status: DRAFT v10.23.0 — THE TERMINAL CUT, round-106 folds (the
+producer is now ONE typed `MaterializeReport` — site/validation/
+transition/displaced — with product normalization AT the producer
+before promotion (the out-of-product fail-closed rule is thus
+mechanically enforceable, and the `site` discriminator lets consumers
+tell an erroneous site-2c `(None,None)` from a valid local hit); the
+promote preimage capture threads OUT through the full
+update_session → promote chain; the uniqueness proof corrected
+(promotion CAN change NAT/orientation — K's preimage and S2 are two
+separately recorded families); §9 gained the normalization/seed-
+block/cardinality tests; site 2b correctly described as outside the
+report; the policy-counter fallback scoped exactly; the last §5.6/
+§10.6.1 stragglers). Round-106: Codex NO (1B/2H/4M/1L — transport
+completeness and proof precision); AGY r105 SOUND (v10.22.0); SMR
+r106 YES (fold verification). Ship
 candidate = the Part-A dataplane demote gate plus the wire-free local HA
 rules. The RG-incarnation/retirement/fence-ledger protocol that rounds
 13–82 grew is KILLED (not deferred): its two customers are re-scoped —
@@ -1451,11 +1454,14 @@ the cache-insert point, and the next descriptor (materialization has
 no cache handle, `session_glue/mod.rs:1092-1143` — the invalidation
 runs at the poller, which owns the binding and the batch,
 `poll_descriptor/mod.rs:110-131`); every transition in the batch is
-accumulated; the SIBLING fan-out runs once per batch via the reap
-path's iteration EXCLUDING the current binding (already handled —
-re-running it post-batch could miss a same-batch descriptor or evict
-the newly inserted correct S2 entry where old and new aliases
-overlap, `poll_descriptor/mod.rs:3900-3959`). NO Close delta (as
+accumulated; the SIBLING fan-out runs once per batch at the
+`poll_binding` level over `left + right` (`worker/lifecycle.rs:53-55`,
+`:209-225`) BEFORE the next RX batch — explicitly NOT via the reap
+routine (which includes the current binding and does NAT/BPF teardown,
+`worker/loop_body/mod.rs:1481-1521`; v10.19.0, round-102 Codex 5) — so
+no same-batch descriptor is missed and no freshly inserted correct S2
+entry is evicted where old and new aliases overlap,
+`poll_descriptor/mod.rs:3900-3959`. NO Close delta (as
 before), NO
 `release_source_nat_allocation`/`release_nat64_allocation`
 (`worker/loop_body/mod.rs:1491-1504`), and NO BPF session-map family-key
@@ -1727,20 +1733,44 @@ adopting the shared decision/metadata, §5.6).
     (the materializer currently ignores the upsert's false and
     returns S2 anyway, `session_glue/mod.rs:1098-1119`) is what the
     outcome makes explicit.
-  - **Producer (v10.22.0, round-105 Codex 1):**
-    `materialize_shared_session_hit`
+  - **Producer (v10.23.0, round-106 Codex 1/2 — ONE typed report, not
+    a bare tuple):** `materialize_shared_session_hit`
     (`session_glue/mod.rs:1092-1121`) returns
-    `(SessionLookup, Option<CloseValidation>, TransitionResult)` —
+    `(SessionLookup, MaterializeReport)` where
+    `MaterializeReport { site: Option<MaterializeSite>,
+    validation: Option<CloseValidation>,
+    transition: TransitionResult, displaced: DisplacedSet }` —
     computed AT the
     materialize site, so the outcome is available BEFORE the
     promotion attempt (`session_glue/mod.rs:1235-1253` runs
     immediately after materialization; `promote.rs:99-139`).
+    `site` is the materialization discriminator (`Some(Site2c)` only
+    from the site-2c materialize; `None` on every non-materializing
+    path) — consumers can therefore distinguish an erroneous site-2c
+    `(None, None)` from a valid local hit (round-106 Codex 2). The
+    producer NORMALIZES the product while the branch is still known
+    (before any promotion): any combination outside the legal product
+    is mapped to `(site preserved, validation preserved,
+    transition := OverdueSkipped)` at the materialize site — the
+    fail-closed rule thus cannot arrive downstream as a post-hoc
+    interpretation that could not undo earlier mutations. The
+    promotion preimage capture threads OUT through the whole chain:
+    `update_session` captures the pre-overwrite identity
+    (`session/mod.rs:1344-1348`, `:1393-1396`) into an OUT parameter;
+    `promote_synced_with_origin` (`session/mod.rs:1673-1675`) and
+    `maybe_promote_synced_session` (`promote.rs:99-140`) thread it
+    outward (replacing today's bool → bool → metadata chain). On
+    `UpsertRefused` the surviving non-peer predecessor K rides
+    `displaced` ONLY when a later promote actually overwrites it —
+    an upsert refusal with a no-op promote displaces nothing
+    (K survives intact; its aliases stay valid).
   - **Fields:** `ResolvedFlowSessionDecision`
-    (`shared_ops.rs:563-578`) gains BOTH
-    `validation: Option<CloseValidation>` and
-    `transition: TransitionResult`, initialized `(None, None)` at BOTH
+    (`shared_ops.rs:563-578`) gains the whole
+    `report: MaterializeReport` (site/validation/transition/displaced),
+    initialized `MaterializeReport::NONE` (site None, validation None,
+    transition None, displaced empty) at BOTH
     constructors (`session_glue/mod.rs:1254-1261` and `:1330-1344`)
-    and set from the materializer's OUT results.
+    and set from the materializer's OUT report.
   - **The legal Phase-1 product (normative):** `(None, None)` for
     non-materializing paths; `(None, T)` for a non-close site-2c
     materialization; `(Refused, T)` for a closing site-2c
@@ -1752,17 +1782,22 @@ adopting the shared decision/metadata, §5.6).
     and `(*, None)`-on-a-materializing-path are unreachable; any
     consumer reading a combination outside the legal product treats
     it as `OverdueSkipped` (fail-closed).
-  - **Carriage:** the poller reads `resolved.validation` /
-    `resolved.transition` at the
+  - **Carriage:** the poller reads `resolved.report` at the
     `install_failed` hoist (`poll_descriptor/mod.rs:509`) and stores
-    them on the per-descriptor dispatch context that survives the
+    it on the per-descriptor dispatch context that survives the
     `resolved.decision` reduction (`:883`); consumers read the
     dispatch context. The pre-hoist policy-counter fallback
     (`poll_descriptor/mod.rs:487-509`, `lookup.rs:345-354`) attributes
     the packet to the SURVIVING entry's rule when S2 lacks a bound
     counter — master's own fallback semantics, explicitly ACCEPTED
     for the divergent transitions (round-105 Codex 5: telemetry-only;
-    the surviving entry is the table's notion of the flow).
+    the surviving entry is the table's notion of the flow; stated
+    exactly, round-106 Codex 7: `bound_policy_counter_for`
+    deliberately does not mirror forward-wire matching,
+    `lookup.rs:335-354`, so on a forward-wire placeholder
+    substitution, `shared_ops.rs:614-626`, it can miss the survivor
+    and use S2's positional counter instead — still telemetry-only,
+    no authority change).
   - **Consumers (all five, normative):** (i) the terminal teardown at
     ALL THREE sites (`poll_descriptor/mod.rs:698-714`, `:768-784`,
     `:824-840`) is SKIPPED for `OverdueSkipped` AND for `UpsertRefused`
@@ -1803,10 +1838,14 @@ adopting the shared decision/metadata, §5.6).
     predecessor K, and the newly installed S2 are the only families;
     the promote step's preimage DEDUPLICATES into them — after a
     successful upsert the preimage IS the installed S2, and after a
-    refused upsert it is K, because promotion changes
-    resolution/owner/fabric state but NOT (key, NAT, orientation),
-    `session_glue/mod.rs:1200-1234`, `promote.rs:92-107`,
-    `session/mod.rs:1344-1378`; the batch accumulator is sized
+    refused upsert it is K (v10.23.0, round-106 Codex 3: the v10.22.0
+    proof text said promotion cannot change NAT/orientation — FALSE,
+    `update_session` explicitly detects, reindexes, and overwrites
+    those fields, `session/mod.rs:1344-1348`, `:1373-1381`,
+    `:1393-1396`; the sound statement is that K's pre-image family and
+    the resulting S2 family are BOTH separately recorded members of
+    the same ≤3-family set — P + K-preimage + S2);
+    the batch accumulator is sized
     3 × 64, `afxdp/mod.rs:278-281`; no allocation). The set
     DEDUPLICATES by alias-family
     inputs (key, NAT decision, orientation) — a repeat contribution
@@ -2449,12 +2488,23 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   (v) a multi-transition batch (accumulated sets); (vi) the
   new-current-S2-survives case (the fan-out must not evict a freshly
   inserted S2 entry where old and new aliases overlap); (vii) a
-  `ValidatorRefused` WITH a canonical predecessor (the set carries the
+  `(Refused, Installed)` WITH a canonical predecessor (the set carries the
   predecessor's family); (viii) an `UpsertRefused` (non-peer
   predecessor, `install.rs:310-315`) — assert the predecessor survives
-  unmodified, the dispatch forwards with S2, and the teardown/cache/
+  unmodified AT THE FAILED-UPSERT INSTANT (the recorded same-resolve
+  promotion attempt and the allowed accounting may still mutate it —
+  the fixture asserts the RESULTING state, round-105 Codex 4 /
+  round-106 Codex 4), the dispatch forwards with S2, and the
+  teardown/cache/
   commit consumers are all gated; (ix) the upsert-refused→promotion
   case (the promote records its displacement into the inline set);
+  (ix-a) the legal-product normalization: an out-of-product
+  combination is normalized to OverdueSkipped-semantics AT the
+  producer BEFORE the promotion attempt (round-106 Codex 2), plus a
+  consumer-side fail-closed read; (ix-b) `UpsertRefused +
+  MissingNeighbor` never enters the seed block (which would replace K
+  via `install.rs:139`); (ix-c) the P+K+S2 maximum-cardinality case
+  and a full 64-descriptor/192-family batch;
   (x) an overdue skip WITH a shadowed placeholder (the placeholder's
   identity is in the set, so a later ACK cannot refresh it from
   cache, `flow_cache_hit.rs:295-317`).
@@ -2776,7 +2826,10 @@ issue (#6522). It is NOT shipped by this plan: the holder-lifetime
 machinery the plan grew for it is exactly the protocol that 70 rounds
 proved non-convergent in plan-doc form, and the bug is orthogonal to this
 issue's gate — Part A creates no replicas, changes no reap/release
-ordering, and REDUCES reap rate (refused closes never reap early), so it
+ordering, and REDUCES reap rate (refused closes never reap early FROM
+THE GATE'S OWN EFFECTS — master's independent flag-agnostic purge of a
+transient-purge-class entry still deletes the row,
+`promote.rs:48-59`, `:167-207`; v10.23.0, round-106 Codex 6), so it
 neither fixes nor worsens #6522. **Recommendation: drive #6522 as its own
 `/engineer` effort with the minimal fix first** (a per-allocation replica
 refcount or an owner-only release rule — the refcount is a local
@@ -2860,7 +2913,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.22.0)
+## 11. Open questions for the convergence round (v10.23.0)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
@@ -2907,11 +2960,11 @@ this branch only if the minimal fix proves insufficient.
    deferred refresh (round-88) — is any pre-commit refresh/requeue
    path left for a probation entry (lookup, `touch_if_stale`, promote,
    materialize refresh), and does the commit-hook clear+refresh cover
-   every admission arm? (e) the v10.22.0 end-state: the two-field
-   outcome with its legal-product enumeration and fail-closed default,
-   the capacity-3 uniqueness proof, the named preimage capture point,
-   and the full straggler sweep — is any producer/consumer
-   combination or sequence claim still two-readable?
+   every admission arm? (e) the v10.23.0 end-state: the single typed
+   `MaterializeReport` with producer-side normalization, the named
+   preimage OUT chain, the corrected uniqueness proof, and the full
+   straggler sweep — is any transport hop or proof step still
+   two-readable?
 
 4. **The emission posture:** master's `expire.rs:342-350` gate is
    UNCHANGED; the additions are the normative mark-creation rules, rule
