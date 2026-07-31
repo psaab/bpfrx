@@ -1,6 +1,6 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.27.0 — THE TERMINAL CUT, round-110 folds
+**Status: DRAFT v10.27.1 — THE TERMINAL CUT, round-110 folds (+ round-110 AGY consistency folds: `effective_transition` is in the struct declaration with its explicit `Option<TransitionResult>` type; every consumer gate reads it; the last two stragglers)
 (`effective_transition` is now a carried struct field initialized in
 `MaterializeReport::NONE` and named at EVERY consumer — promotion,
 poller carriage, the MissingNeighbor composition, the teardown
@@ -1400,7 +1400,8 @@ ordinary refresh. A non-probation existing entry takes today's upsert
 unchanged. The probation entry carries
 an explicit `probation: bool` that (a) suppresses ownership promotion,
 Open emission, and replication (§5.5), and (b) clears on the first
-COMMITTED non-close packet whose transition is NOT `OverdueSkipped`
+COMMITTED non-close packet whose effective transition is NOT
+  `OverdueSkipped`
 (the explicit overdue guard, v10.26.0 round-109 Codex 4), which also
 refreshes the entry to its
 ordinary established timeout. **The clear+refresh runs at the MATCHED
@@ -1738,7 +1739,14 @@ adopting the shared decision/metadata, §5.6).
     `(SessionLookup, MaterializeReport)` where
     `MaterializeReport { site: Option<MaterializeSite>,
     validation: Option<CloseValidation>,
-    transition: TransitionResult, displaced: DisplacedSet }`. The
+    transition: TransitionResult, displaced: DisplacedSet,
+    effective_transition: Option<TransitionResult> }` (v10.27.1,
+    round-110 AGY 1/3 — the field is in the declaration with its
+    explicit `Option` type: `transition`'s `None` is the
+    `TransitionResult` enum variant, while `effective_transition`'s
+    unset state is `Option::None`; `MaterializeReport::NONE` sets
+    `transition = TransitionResult::None` and
+    `effective_transition = None`). The
     materialize computes the validation verdict (from the packet +
     anchor) and the overdue check (from K's timing) BEFORE calling the
     state-changing upsert (`install.rs:310-322`, `:345-400` may remove
@@ -1749,7 +1757,8 @@ adopting the shared decision/metadata, §5.6).
     mutations). The report is available BEFORE the promotion attempt
     (`session_glue/mod.rs:1235-1253` runs immediately after
     materialization; `promote.rs:99-139`), and the promotion path
-    gains an explicit gate: `report.transition == OverdueSkipped`
+    gains an explicit gate: `report.effective_transition ==
+    Some(OverdueSkipped)`
     suppresses the promote and the commit-time refresh INDEPENDENTLY
     of K's probation flag (`promote.rs:86-107` gates only on
     origin/disposition today), and a `(validation == Some(Refused))`
@@ -1826,9 +1835,11 @@ adopting the shared decision/metadata, §5.6).
     commit hook does NOT write; (iii) the flow-cache insert
     (`:3900-3959`) is suppressed; (iv) the probation clear+refresh
     NEVER fires on an overdue entry AND the commit-time refresh checks
-    `report.transition == OverdueSkipped` explicitly (not only the
+    `report.effective_transition == Some(OverdueSkipped)` explicitly
+    (not only the
     probation flag, round-108 Codex 3); (v) the ownership promote is
-    suppressed by the explicit `report.transition == OverdueSkipped`
+    suppressed by the explicit `report.effective_transition ==
+    Some(OverdueSkipped)`
     gate AND by the rule-5 `validation == Some(Refused)` gate (the
     §5.5 probation flag on K is the third, independent suppression —
     K remains installed). Accounting is an explicitly ALLOWED
@@ -2577,7 +2588,7 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   fresh-install refusal at `install.rs:113` asserted in the test); (b)
   a blind non-close that COMMITS:
   probation clears exactly once AT THE MATCHED ENTRY (never on an
-  `OverdueSkipped` transition — the explicit overdue guard,
+  `OverdueSkipped` effective transition — the explicit overdue guard,
   v10.26.0) (forward-key AND
   reverse-key materialized entries each covered — the clear is not
   routed through the anchor's forward hop) AND the ordinary established
@@ -2938,7 +2949,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.27.0)
+## 11. Open questions for the convergence round (v10.27.1)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
