@@ -12,8 +12,11 @@ import (
 // lifeline-excluded and free of any cross-zone-ambiguous shared parent), and is
 // reused by the #4168 commit warning so the warning can never be suppressed for
 // a deny that produced no kernel rule. This wrapper only forwards the already-
-// resolved IngressNetdevs (the `iifname` scope — NOT destination address, which
-// under-/over-denies across zones, plan §3.2) and the rendered DROP rules.
+// resolved IngressNetdevs (the ZONE scope is always `iifname` — a daddr-derived
+// zone scope under-/over-denies across zones, plan §3.2) and the rendered DROP
+// rules. A rule may additionally carry a `daddr` predicate when the policy
+// authored an explicit `match destination-address`; that NARROWS the deny on top
+// of the iifname scope and never replaces it.
 //
 // The direct host-bound packet is delivered by the Linux kernel, so enforcement
 // is Go-only in the nft `xpf_hostinbound` chain: no Rust, no shim, no verifier

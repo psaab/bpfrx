@@ -281,7 +281,7 @@ next-hops, preference 0). The wire specimen lives in
       (fabric removed, not replaced) is not a supersession, so the working link
       survives. The prune runs in both `refresh_fabric_links` (SyncFabricState)
       and `refresh_runtime_snapshot_inner` (config apply); the pruned set is
-      stored into BOTH the full `ha.forwarding` Arc AND the worker fast-path
+      stored into BOTH the full `ha.runtime` view's forwarding Arc AND the worker fast-path
       `ha.fabrics` Arc so no reader retains the stale peer.
 
 ## Session identity is NOT VRF-aware — single forwarding domain (#2387)

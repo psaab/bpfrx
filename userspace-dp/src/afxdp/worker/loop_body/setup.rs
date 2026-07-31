@@ -68,8 +68,7 @@ pub(super) struct WorkerLoopSetup {
 pub(super) fn worker_loop_setup(
     worker_id: u32,
     binding_plans: Vec<BindingPlan>,
-    shared_validation: &ArcSwap<ValidationState>,
-    shared_forwarding: &ArcSwap<ForwardingState>,
+    shared_runtime: &RuntimeViewReader,
     shared_cos_owner_worker_by_queue: &ArcSwap<BTreeMap<(i32, u8), u32>>,
     shared_cos_owner_live_by_queue: &ArcSwap<BTreeMap<(i32, u8), Arc<BindingLiveState>>>,
     shared_cos_root_leases: &ArcSwap<BTreeMap<i32, Arc<SharedCoSRootLease>>>,
@@ -119,8 +118,16 @@ pub(super) fn worker_loop_setup(
     );
     let ha_startup_grace_until_secs =
         (monotonic_nanos() / 1_000_000_000).saturating_add(TUNNEL_HA_STARTUP_GRACE_SECS);
-    let validation = **shared_validation.load();
-    let forwarding = shared_forwarding.load_full();
+    // #6592: seed BOTH halves from ONE view load, exactly as the per-tick
+    // refresh does (`refresh_runtime_view`, loop_body/mod.rs). Two separate
+    // loads here would let a coordinator publish land between them and seed a
+    // brand-new worker with a torn pair — in either orientation — before it
+    // has processed a single packet. The CoS `load_full`s below still follow
+    // this load per #5166.
+    let (validation, forwarding) = {
+        let view = shared_runtime.load();
+        (view.validation(), view.forwarding().clone())
+    };
     let cos_owner_worker_by_queue = shared_cos_owner_worker_by_queue.load_full();
     let cos_owner_live_by_queue = shared_cos_owner_live_by_queue.load_full();
     let cos_shared_root_leases = shared_cos_root_leases.load_full();

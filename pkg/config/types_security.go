@@ -1261,6 +1261,67 @@ type Application struct {
 	// hard-rejects the first one on the strict commit path / warns on the tolerant
 	// load / peer-sync path (#5574).
 	DuplicateDirectLeaves []string
+	// UnknownDirectLeaves records the raw tokens directly under an
+	// `applications application <name>` body that are NOT a recognized direct
+	// match leaf (protocol / destination-port / source-port /
+	// inactivity-timeout / timeout / icmp-type / icmp-code / alg / description /
+	// term) — the DIRECT-body analogue of UnknownTermLeaves.
+	//
+	// #6524: the flat-set grammar builds `set a b c d` as a CHAIN of single-key
+	// nodes, so `set applications application myapp protocol tcp
+	// destination-port 8080` nests `destination-port` UNDER the value node
+	// `tcp` rather than beside `protocol`. applicationDirectLeaves now follows
+	// that chain, so a token it cannot map to a known leaf keyword is real
+	// operator garbage rather than a shape the walk failed to reach. Two forms
+	// land here:
+	//
+	//   - a bracketed list on a single-valued leaf — `protocol [ tcp udp ]`,
+	//     `destination-port [ 22 23 ]`. Junos gives a direct application body
+	//     ONE protocol and ONE port (multi-valued matching is what `term`
+	//     sub-blocks are for), and Application.Protocol / .DestinationPort are
+	//     single fields that cannot represent the set, so every value past the
+	//     first was silently dropped;
+	//   - a typo'd leaf keyword (`destination-poort 8080`), silently dropped
+	//     along with its value.
+	//
+	// Either way the dropped token changes what the application matches, in
+	// whichever DIRECTION the dropped constraint pointed: losing a port or
+	// icmp-type WIDENS it (pkg/policymatch treats an empty DestinationPort as
+	// match-any, so a permit over-permits), while losing an alternative from a
+	// bracketed protocol list NARROWS it to the first value (so a deny
+	// under-matches). Both are wrong; neither is uniformly "widening".
+	//
+	// `description` never contributes to this list from its own token run. It is
+	// a TAIL leaf (Junos takes its text to the end of the statement), so
+	// applicationDirectLeaves joins the run into the description text rather
+	// than recording the second and later words here. That covers
+	// `description destination-port` (text that happens to spell a keyword —
+	// the leaf's value slot is reserved before the keyword scan resumes) and a
+	// multi-word description PACKED onto one node's Keys. Rejecting a METADATA
+	// leaf that cannot affect what the application matches would be pure
+	// friction, and that spelling committed on master.
+	//
+	// The join is deliberately NOT a claim that every multi-word description
+	// now commits. A description that HEADS a flat-set chain
+	// (`set ... description my web app ...`) parks its tail in a CHILD node, so
+	// "web" opens a fresh run and IS recorded here — and SchemaValidate rejects
+	// the same line independently ("unexpected trailing token"). Master
+	// rejected it by that same schema gate, so this is parity, not a new
+	// refusal; see TestDescriptionIsATailLeaf, which pins both positions.
+	//
+	// The `scalar: true` arity the schema enforces for `description`
+	// (validateScalarValueLeaf / #3332) is untouched. It governs the SIBLING
+	// spelling and the head-of-chain spelling; the only position it does not
+	// reach is a description packed into a chain TAIL, below the depth the
+	// schema walk descends to — which is exactly the position the join above
+	// exists to cover. So no config that was committable on master is newly
+	// refused.
+	//
+	// Mirroring UnknownTermLeaves, the offending token is recorded here and the
+	// deferred gate (validateApplicationSyntaxStrict) hard-rejects the first one
+	// on the strict commit path / warns on the tolerant load / peer-sync path
+	// (#1960 no-brick).
+	UnknownDirectLeaves []string
 }
 
 // IPsecConfig holds IPsec VPN configuration.

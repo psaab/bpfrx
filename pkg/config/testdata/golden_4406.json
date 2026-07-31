@@ -13485,7 +13485,7 @@
           "appA": {
             "Name": "appA",
             "Protocol": "udp",
-            "DestinationPort": "",
+            "DestinationPort": "80",
             "SourcePort": "",
             "InactivityTimeout": 0,
             "ALG": "",
@@ -13498,7 +13498,8 @@
             "DuplicateTermLeaves": null,
             "DuplicateDirectLeaves": [
               "protocol"
-            ]
+            ],
+            "UnknownDirectLeaves": null
           }
         },
         "ApplicationSets": {},
@@ -13758,7 +13759,7 @@
           "appA": {
             "Name": "appA",
             "Protocol": "udp",
-            "DestinationPort": "",
+            "DestinationPort": "80",
             "SourcePort": "",
             "InactivityTimeout": 0,
             "ALG": "",
@@ -13771,7 +13772,8 @@
             "DuplicateTermLeaves": null,
             "DuplicateDirectLeaves": [
               "protocol"
-            ]
+            ],
+            "UnknownDirectLeaves": null
           }
         },
         "ApplicationSets": {},
@@ -14031,7 +14033,7 @@
           "appA": {
             "Name": "appA",
             "Protocol": "udp",
-            "DestinationPort": "",
+            "DestinationPort": "80",
             "SourcePort": "",
             "InactivityTimeout": 0,
             "ALG": "",
@@ -14044,7 +14046,8 @@
             "DuplicateTermLeaves": null,
             "DuplicateDirectLeaves": [
               "protocol"
-            ]
+            ],
+            "UnknownDirectLeaves": null
           }
         },
         "ApplicationSets": {},

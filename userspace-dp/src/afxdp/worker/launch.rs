@@ -96,8 +96,12 @@ pub(crate) struct WorkerSharedSessions {
 /// Every field is a `coord.*.clone()`, so [`WorkerSharedDataplane::from_coord`]
 /// is the single, testable wiring site.
 pub(crate) struct WorkerSharedDataplane {
-    pub(in crate::afxdp) validation: Arc<ArcSwap<ValidationState>>,
-    pub(in crate::afxdp) forwarding: Arc<ArcSwap<ForwardingState>>,
+    /// #6592: validation AND forwarding as ONE `ArcSwap`. They were two
+    /// independent fields (`validation` / `forwarding`) until #6592; a worker
+    /// loading them separately could pair them across generations in either
+    /// direction. One `Arc` means one load and no pair to tear — see
+    /// `types/runtime_view.rs`.
+    pub(in crate::afxdp) runtime: RuntimeViewReader,
     pub(in crate::afxdp) ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     pub(in crate::afxdp) local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>>,
     pub(in crate::afxdp) fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
@@ -125,8 +129,7 @@ impl WorkerSharedDataplane {
     /// performed inline before.
     pub(in crate::afxdp) fn from_coord(coord: &Coordinator) -> Self {
         Self {
-            validation: coord.shared_validation.clone(),
-            forwarding: coord.ha.forwarding.clone(),
+            runtime: coord.ha.runtime_reader(),
             ha_state: coord.ha.rg_runtime.clone(),
             local_tunnel_deliveries: coord.local_tunnel_deliveries.clone(),
             fabrics: coord.ha.fabrics.clone(),
@@ -326,8 +329,9 @@ mod tests {
 
         // A representative sample of the remaining shared-dataplane
         // fields, including the nested neighbors sub-bundle.
-        assert!(Arc::ptr_eq(&bundle.validation, &coord.shared_validation));
-        assert!(Arc::ptr_eq(&bundle.forwarding, &coord.ha.forwarding));
+        // #6592: one field, not two — validation and forwarding now travel in
+        // the single `RuntimeView` ArcSwap.
+        assert!(bundle.runtime.same_channel(&coord.ha.runtime_reader()));
         assert!(Arc::ptr_eq(&bundle.ha_state, &coord.ha.rg_runtime));
         assert!(Arc::ptr_eq(&bundle.fabrics, &coord.ha.fabrics));
         assert!(Arc::ptr_eq(&bundle.mirror_targets, &coord.mirror_targets));
