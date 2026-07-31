@@ -46,7 +46,10 @@ func TestNftNetlinkParity(t *testing.T) {
 		runNftNetlinkParityInner(t)
 		return
 	}
-	if _, err := exec.LookPath("nft"); err != nil {
+	// #6613: use findNft, not a bare LookPath — nft ships in /usr/sbin on this
+	// distro and a non-root PATH omits it, so the bare lookup made THE SECURITY
+	// MERGE GATE silently SKIP while still reporting a green `make test`.
+	if findNft() == "" {
 		t.Skip("T1 ruleset-parity gate SKIPPED: `nft` binary not found in PATH — " +
 			"this gate MUST run where nft exists (the parent runs it); it proves the " +
 			"netlink installer is bit-equivalent to the exec-nft oracle")
@@ -134,7 +137,7 @@ func runNftNetlinkParityInner(t *testing.T) {
 
 		// Oracle side: nft must REJECT the unresolvable token.
 		oracle := buildLo0FilterPayload(badCfg, "badf", "")
-		cmd := exec.Command("nft", "-f", "-")
+		cmd := exec.Command(findNft(), "-f", "-")
 		cmd.Stdin = strings.NewReader(oracle)
 		if out, err := cmd.CombinedOutput(); err == nil {
 			nftDeleteTableBestEffort(xnft.Lo0TableName)
@@ -149,7 +152,7 @@ func runNftNetlinkParityInner(t *testing.T) {
 			nftDeleteTableBestEffort(xnft.Lo0TableName)
 			t.Fatal("netlink FAIL-CLOSED expected: InstallLo0 returned nil on an unresolvable port token (fail-open: the accept widened to match-all)")
 		}
-		if out, err := exec.Command("nft", "list", "table", "inet", xnft.Lo0TableName).CombinedOutput(); err == nil {
+		if out, err := exec.Command(findNft(), "list", "table", "inet", xnft.Lo0TableName).CombinedOutput(); err == nil {
 			nftDeleteTableBestEffort(xnft.Lo0TableName)
 			t.Fatalf("netlink left a PARTIAL ruleset after a fail-closed build (should have installed nothing):\n%s", out)
 		}
@@ -280,7 +283,7 @@ func parityCheck(t *testing.T, table, oracleText string, install func() error) {
 
 func nftLoad(t *testing.T, payload string) {
 	t.Helper()
-	cmd := exec.Command("nft", "-f", "-")
+	cmd := exec.Command(findNft(), "-f", "-")
 	cmd.Stdin = strings.NewReader(payload)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("nft -f - failed: %v\npayload:\n%s\noutput: %s", err, payload, out)
@@ -289,7 +292,7 @@ func nftLoad(t *testing.T, payload string) {
 
 func nftListNormalized(t *testing.T, table string) string {
 	t.Helper()
-	out, err := exec.Command("nft", "list", "table", "inet", table).CombinedOutput()
+	out, err := exec.Command(findNft(), "list", "table", "inet", table).CombinedOutput()
 	if err != nil {
 		t.Fatalf("nft list table inet %s failed: %v\n%s", table, err, out)
 	}
@@ -297,7 +300,7 @@ func nftListNormalized(t *testing.T, table string) string {
 }
 
 func nftDeleteTableBestEffort(table string) {
-	_ = exec.Command("nft", "delete", "table", "inet", table).Run()
+	_ = exec.Command(findNft(), "delete", "table", "inet", table).Run()
 }
 
 var handleRe = regexp.MustCompile(`\s*#\s*handle\s+\d+\s*$`)
@@ -475,12 +478,23 @@ func parityHostInboundInputs() (views []dpuserspace.ZoneHostInboundView, unzoned
 			IKEExemptNetdevs:  []string{"ge-0-0-2", "ge-0-0-2.50"},
 			IdentResetNetdevs: []string{"ge-0-0-2"},
 			RulesV4: []config.JunosHostDenyRule{
-				{Family: "ip", Src: []string{"192.0.2.0/24", "198.51.100.7"}, PermitSubtract: []string{"192.0.2.10"}},
-				{Family: "ip", SrcExcluded: true, Src: []string{"203.0.113.0/24"}, L4: []config.JunosHostDenyL4{{Proto: config.HostInboundProtoTCP, Ports: []config.PortRange{{Lo: 22, Hi: 22}}}}},
-				{Family: "ip", SrcAny: true, L4: []config.JunosHostDenyL4{{Proto: config.HostInboundProtoICMP, ICMPType: ptrU8(8), ICMPCode: ptrU8(0)}}},
+				{Family: "ip", Src: []string{"192.0.2.0/24", "198.51.100.7"}, PermitSubtract: []string{"192.0.2.10"}, DstAny: true},
+				{Family: "ip", SrcExcluded: true, Src: []string{"203.0.113.0/24"}, DstAny: true, L4: []config.JunosHostDenyL4{{Proto: config.HostInboundProtoTCP, Ports: []config.PortRange{{Lo: 22, Hi: 22}}}}},
+				{Family: "ip", SrcAny: true, DstAny: true, L4: []config.JunosHostDenyL4{{Proto: config.HostInboundProtoICMP, ICMPType: ptrU8(8), ICMPCode: ptrU8(0)}}},
+				// #4146 destination slice: a POSITIVE `match destination-address`
+				// (multi-element set) and a NEGATED one. Both must render the same
+				// `daddr` / `daddr !=` expressions on the netlink path as the oracle,
+				// in the same order (after the source predicate) — a dropped daddr
+				// predicate here would widen the deny to every firewall address.
+				{Family: "ip", Src: []string{"198.51.100.0/24"}, Dst: []string{"10.0.7.1/32", "10.0.8.1/32"},
+					L4: []config.JunosHostDenyL4{{Proto: config.HostInboundProtoTCP, Ports: []config.PortRange{{Lo: 443, Hi: 443}}}}},
+				{Family: "ip", SrcAny: true, DstExcluded: true, Dst: []string{"10.0.9.1/32"},
+					L4: []config.JunosHostDenyL4{{Proto: config.HostInboundProtoUDP, Ports: []config.PortRange{{Lo: 161, Hi: 161}}}}},
 			},
 			RulesV6: []config.JunosHostDenyRule{
-				{Family: "ip6", Src: []string{"2001:db8:a::/48"}, L4: []config.JunosHostDenyL4{{Proto: 47}}},
+				{Family: "ip6", Src: []string{"2001:db8:a::/48"}, DstAny: true, L4: []config.JunosHostDenyL4{{Proto: 47}}},
+				{Family: "ip6", SrcAny: true, Dst: []string{"2001:db8:5::1/128"},
+					L4: []config.JunosHostDenyL4{{Proto: config.HostInboundProtoTCP, Ports: []config.PortRange{{Lo: 22, Hi: 22}}}}},
 			},
 		},
 	}
