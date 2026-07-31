@@ -543,7 +543,9 @@ func dispatcherTopics(t *testing.T) []string {
 // community is a config.Secret, whose String() renders "<redacted>" under
 // %s/%v/%q/%x (#2053) — so a text renderer cannot leak one by accident.
 //
-// There are TWO independent ways to defeat that, and the scan checks both:
+// This guard detects TWO SHAPES. That is NOT the same as enumerating every way
+// to defeat the redaction — Go's expression grammar is open and the RESIDUALS
+// listed below are real. The two DETECTED shapes are:
 //
 //  1. Reveal(), the explicit cleartext accessor.
 //  2. A CONVERSION. config.Secret is `type Secret string`
@@ -562,6 +564,17 @@ func dispatcherTopics(t *testing.T) []string {
 // from a broken scan, which is exactly how the Reveal() branch of an earlier
 // revision of this file became unreachable dead code while still reporting
 // PASS.
+//
+// RESIDUALS — shapes this guard does NOT flag, stated so the coverage claim
+// above is not read as completeness:
+//   - a COMPUTED argument. secretExprTail walks a DIRECT wrapper chain
+//     (index / slice / deref / paren / selector) and returns "" for anything
+//     else, so `Clear(x.PSK + "")`, `Clear([]config.Secret{x.PSK}[0])` and
+//     `Clear(<-x.SecretChan)` pass the arity gate but do not resolve to a
+//     harvested field name.
+//   - `copy(dst, x.PSK)` and `append(dst, x.PSK...)` — two arguments, so the
+//     arity gate does not reach them.
+//   - reflection, and any unwrap through an interface value.
 //
 // SCOPE, and the HARD LIMIT.
 //
@@ -1144,6 +1157,23 @@ func secretTypedFieldNames(t *testing.T) map[string]bool {
 // An EMBEDDED Secret (`struct { Secret }`) has no name in the AST but is
 // selected as `x.Secret`, so it is harvested under that name.
 func collectSecretFieldNames(typ ast.Expr, out map[string]bool) {
+	// A map carries a struct on EITHER side, and `structTypeOf` can only
+	// return one. Recurse into both halves explicitly so
+	// `map[struct{ Key Secret }]struct{ Value Secret }` harvests BOTH — the
+	// previous shape returned the key's struct and silently never visited the
+	// value, while the doc claimed both sides were followed.
+	for {
+		p, ok := typ.(*ast.ParenExpr)
+		if !ok {
+			break
+		}
+		typ = p.X
+	}
+	if mt, ok := typ.(*ast.MapType); ok {
+		collectSecretFieldNames(mt.Key, out)
+		collectSecretFieldNames(mt.Value, out)
+		return
+	}
 	st := structTypeOf(typ)
 	if st == nil || st.Fields == nil {
 		return

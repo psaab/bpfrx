@@ -62408,3 +62408,22 @@ break — `go vet` confirmed passing under every revert.
   22.7 Gbps) and needs no re-run for a comment-only change.
 - **File(s)**: pkg/cluster/{election.go,ifmon_weight_daemon_apply_6549_test.go},
     pkg/routing/monitor.go, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6532 review-fold round 5 (Codex MERGE-NEEDS-MINOR). Codex confirmed
+  the argument-gating inversion CLOSES the conversion-callee shape class and the
+  production redaction is correct; all three findings were claim-accuracy plus one
+  small harvest gap. (1) `collectSecretFieldNames` now recurses into BOTH map
+  halves explicitly — `structTypeOf` can only return one struct, so
+  `map[struct{ Key Secret }]struct{ Value Secret }` harvested `Key` and silently
+  never visited `Value` while the doc claimed both sides were followed. (2)
+  Replaced the "TWO independent ways to defeat" framing with "TWO DETECTED
+  SHAPES", since Go's expression grammar is open and enumerating defeat
+  mechanisms is not something a syntactic guard can claim. (3) Added an explicit
+  RESIDUALS block naming what is NOT flagged: a COMPUTED argument
+  (`Clear(x.PSK + "")`, `Clear([]config.Secret{x.PSK}[0])`, `Clear(<-ch)`) which
+  passes the arity gate but does not resolve to a harvested field name;
+  `copy(dst, secret)` / `append(dst, secret...)` which are two-argument; and
+  reflection / interface-value unwraps. No production code changed. Full
+  `go test ./pkg/grpcapi/` green.
+- **File(s)**: pkg/grpcapi/server_fabric_secret_render_6532_test.go, _Log.md
