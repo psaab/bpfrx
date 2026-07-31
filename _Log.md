@@ -58661,6 +58661,170 @@ top.
   manifest via cmd/shim-manifest. Verified: fsatomic+dataplane green;
   editing xpf_common.h now trips the freshness test; src-edit coverage intact.
 
+## 2026-07-22 — #6291 torn validation/forwarding publish ordering (userspace-dp)
+- **Action**: Fix the sibling of #5166 — worker could transiently observe
+  OLD validation + NEW forwarding in the same-plan snapshot refresh.
+- **File(s)**: userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/coordinator/snapshot_refresh.rs,
+  userspace-dp/src/afxdp/coordinator/README.md
+- Root cause: coordinator stores `shared_validation` BEFORE `ha.forwarding`
+  and the worker READ validation before forwarding — store order matched
+  read order, so a publish between the two worker loads paired new-forwarding
+  with old-validation. classify_metadata() would then let a packet stamped at
+  the old generation pass and be forwarded under new state.
+- Fix (option b — forwarding must stay stored last for #5166 CoS): reorder
+  the WORKER reads to forwarding-FIRST, validation-SECOND via a new inlined
+  `refresh_forwarding_then_validation` helper (keeps #1188 short-circuit).
+  Now observing new forwarding implies new-or-newer validation. The mirror
+  residual (new-validation, old-forwarding) SURVIVES and is NOT benign —
+  see the 2026-07-31 correction block below and #6592. Coordinator store
+  order unchanged (already correct); added a load-bearing comment + module doc.
+- Test: `snapshot_refresh_no_old_validation_with_new_forwarding_6291`
+  (renamed 2026-07-31; deterministic,
+  publish injected between the two acquire-loads via the `between` seam).
+  RED-on-revert verified (swap the two loads → RED). Full cargo suite green
+  (4153+ passed, exit 0); named test 3x ok.
+- **Review fold (2026-07-31, PR #6333 hostile review MERGE-READY-WITH-MINORS,
+  no BLOCK/MAJOR)**: the core reorder and the `between` seam were verified
+  sound and are UNCHANGED. Folded:
+  - MINOR-3 — the invariant is two-sided but only the CONSUMER half was
+    RED-guarded; swapping the two coordinator stores left the whole suite
+    green. Added the producer-side `#[cfg(test)]
+    validation_at_forwarding_publish` seam (twin of the #5166
+    `cos_owner_at_forwarding_publish`), captured immediately above the
+    `ha.forwarding` store, asserted by
+    `refresh_runtime_snapshot_publishes_validation_before_forwarding`. The
+    seam also retains the worker-visible forwarding Arc AT THAT INSTANT and
+    the test asserts it is not the post-refresh Arc, so hoisting the
+    forwarding store above the capture — which would satisfy the validation
+    assert vacuously — is RED too. Retaining the Arc (not a raw pointer)
+    keeps the old allocation alive so `Arc::ptr_eq` cannot be fooled by
+    address reuse.
+  - MINOR-1 — the worker STARTUP SEED (`loop_body/setup.rs`) still read
+    validation before forwarding, i.e. the exact order this fix calls the
+    bug, making the new module doc/README false as written at one of the two
+    worker-side read sites. Not live (the seed is consumed only by
+    `poll_binding`, and iteration 1 repairs validation before any packet is
+    classified), swapped anyway.
+  - MINOR-2 — `stop_inner` stored forwarding before validation, contradicting
+    the doc's categorical rule. Not live (`stop_and_clear` joins every worker
+    thread ~35 lines earlier) and not a regression, but swapped for
+    uniformity with a comment naming the join.
+  - NITs: `loop_body/mod.rs` header no longer claims "no call was added to
+    the per-tick path" (it records the `#[inline]` carve-out and the release
+    `nm` evidence instead); the `!torn` assert now comes FIRST so a future RED
+    names the invariant; this log block gained its missing blank line.
+- **Fold validation**: BOTH producer-side revert forms fail by ASSERTION, not
+  a build break — exchanging the two stores in place gives `left:
+  ValidationState { snapshot_installed: false, config_generation: 0,
+  fib_generation: 0 } right: ... config_generation: 7 ...`; hoisting the
+  forwarding store above the capture gives "the validation capture must be
+  taken BEFORE the ha.forwarding store, or the ordering assert above proves
+  nothing". Production file restored + diff-verified after each. Full cargo
+  suite re-run green; all three ordering test NAMES confirmed present in the
+  run output (stale-binary guard).
+- **Honest sizing**: this is an invariant tightening, NOT a traffic win.
+  Nobody should expect a measurable effect. (The "at most one tick of extra
+  `config_gen_mismatch` drops" characterisation this bullet originally
+  carried was too generous — corrected in the 2026-07-31 block below.)
+
+## 2026-07-31 — #6333 claim correction: the surviving pair is NOT benign (#6592)
+- **Action**: Correct an overstated safety claim in PR #6333. The fix itself
+  is UNCHANGED — no production behaviour change in this commit. Only docs,
+  comments, one test doc/name, and one added assertion.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/snapshot_refresh.rs,
+  userspace-dp/src/afxdp/coordinator/README.md,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs, _Log.md
+- **What was wrong**: #6333 documented the surviving `(new-validation,
+  old-forwarding)` pair as benign — "the generation guard errs toward a
+  one-tick `ConfigGenerationMismatch` drop, never a stale forward". It is
+  not drop-only. Chain: `worker/loop_body/mod.rs` installs validation
+  UNCONDITIONALLY on difference but updates forwarding ONLY when the Arc
+  rotated, so a worker whose forwarding load returned `None` (pre-publish)
+  and whose validation load landed post-publish holds new validation + old
+  forwarding. The coordinator then returns the new generation to Go
+  (`server/handlers/snapshot.rs`), Go writes it to `userspace_ctrl`
+  (`manager_compile.go` / `maps_sync.go`), and the shim stamps subsequent
+  packets NEW (`userspace-xdp/src/lib.rs`). Those packets match the new
+  validation, classify `Valid` (`forwarding/fib.rs`), and are forwarded
+  under the OLD forwarding state — a withdrawn route or a new deny is not
+  applied. Nothing orders the Go control-map update after every worker's
+  next forwarding load; a worker can simply be descheduled in between.
+- **Why the earlier analysis was not wrong, just scoped differently**: the
+  PR-#6333 review reasoned about the window DURING publish, where the shim
+  provably cannot stamp the new generation —
+  `status.last_snapshot_generation` advances only inside `apply_snapshot`,
+  under the `ServerState` mutex held across `refresh_runtime_snapshot`.
+  That is correct for that window. This defect lives in the window AFTER
+  publish completes and before the worker's next forwarding load. Both
+  analyses hold for the window each describes.
+- **Still a strict improvement, and why**: both orientations were reachable
+  on master; this eliminates one and adds none. The eliminated orientation
+  `(old-validation, new-forwarding)` needed NO additional condition to
+  forward across generations — old-stamped packets (the traffic in flight
+  during the window) passed the still-old validation and were forwarded
+  under the new state immediately. The surviving orientation needs Go to
+  complete a control-socket round trip AND the worker to still be behind at
+  that point, which at 10K-100K ticks/s means a descheduled or stalled
+  worker. Real reduction in exposure, not a closure. Filed as **#6592**
+  (fix: pair validation with a specific forwarding snapshot atomically —
+  one `ArcSwap` holding both, or generation fields in `ForwardingState`).
+- **Corrections made** (every site that called the residual benign):
+  - `snapshot_refresh.rs` module header — replaced the "residual ... is
+    benign" clause with a "# The mirror window survives and is NOT benign
+    (#6592)" section spelling out both phases (drop-only while the shim
+    stamps OLD; stale forward once Go advances the stamp).
+  - `snapshot_refresh.rs` inline comment above the `shared_validation`
+    store — added the scope note + #6592 pointer.
+  - `refresh_forwarding_then_validation` doc comment
+    (`worker/loop_body/mod.rs`) — same replacement, plus the exposure
+    comparison between the eliminated and surviving orientations.
+  - `coordinator/README.md` #6291 bullet — replaced the benign sentence
+    with a bolded scope paragraph.
+  - `coordinator/tests.rs` producer-half test doc — added a scope note that
+    the two tests together exclude ONE orientation only.
+  - `_Log.md` — the original entry's "residual ... is benign" and the
+    "at most one tick of extra drops" sizing bullet.
+- **Mislabeled test — relabelled, not deleted**: the worker test constructed
+  the surviving pair and its doc called the result "the benign
+  (new-validation, old-forwarding) residual". Its two ASSERTIONS were
+  correct and are kept unchanged — they assert the `(old-validation,
+  new-forwarding)` orientation is impossible, which is true and is the
+  invariant this PR establishes. Only the surrounding claim was false. So:
+  (a) the doc comment gained a "# Scope" section stating the outcome state
+  is the #6592 KNOWN GAP and must not be read as a coherence proof;
+  (b) renamed `snapshot_refresh_no_torn_validation_forwarding_6291` →
+  `snapshot_refresh_no_old_validation_with_new_forwarding_6291`, because
+  the old name itself asserted the overbroad claim ("no torn
+  validation/forwarding") at all five citation sites; (c) added a third
+  assertion recording the residual as an executable fact rather than prose
+  — it asserts the worker did NOT adopt forwarding here, with a message
+  naming #6592 and directing whoever changes the pairing to revisit the
+  test and the ordering docs instead of deleting the assertion. When #6592
+  lands this assertion is expected to go RED; that is deliberate.
+- **Also recorded, NOT implemented**: the pre-existing #5166 seam captures
+  only the CoS owner map, so it does not prove its own placement the way
+  the #6291 seam does (hoisting the `ha.forwarding` store above it would
+  satisfy its assert vacuously), and six sibling publications riding the
+  same gate — CoS owner-live, root leases, exact backlogs, queue leases,
+  vtime floors, and `ha.fabrics` — have no individual ordering assertion at
+  all. Pointer added in `snapshot_refresh.rs` and `coordinator/README.md`;
+  filed as **#6593**; the work is out of scope for this PR.
+- **Validation**: full `cargo test --release` on the final tree — 4219 + 60
+  + 8 + 22 + 1 passed, 0 failed, 2 ignored, exit 0. Affected test NAMES
+  confirmed present in `-v`/`--exact` output under the RENAMED name
+  (stale-binary guard): `snapshot_refresh_no_old_validation_with_new_
+  forwarding_6291`, `refresh_runtime_snapshot_publishes_validation_before_
+  forwarding`, `refresh_runtime_snapshot_publishes_cos_owner_map_before_
+  forwarding`. The new #6592 assertion was proven to BIND, by ASSERTION not
+  a build break: seeding the test's `cached_forwarding` with a foreign Arc
+  so `load_arc_if_changed` returns `Some` makes the worker adopt forwarding
+  and the assertion fires with its #6592 message (the two pre-existing
+  asserts still pass in that mutation, so it is the new one that catches
+  it). Production file restored and diff-verified identical; the test is
+  green again. No production code path changed in this commit.
+
 ## #6310 — CoS cross-worker prepared-redirect allocation-free (eng6310)
 - **Timestamp**: 2026-07-22
 - **Action**: Eliminate per-packet `frame.to_vec()` at the two cross-binding
@@ -62409,6 +62573,376 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/cluster/{election.go,ifmon_weight_daemon_apply_6549_test.go},
     pkg/routing/monitor.go, _Log.md
 
+- **Timestamp**: 2026-07-31 05:20
+  - **Action**: Fold the final-review MINOR-1 on #6291 — the sizing narrative had
+    been corrected from "the residual is benign" into an overstatement in the
+    OPPOSITE direction. Per occurrence the eliminated orientation was the worse
+    one, but by RATE it was the rarer one (it needed a whole FIB-clone publish
+    window to nest inside a nanosecond gap between two adjacent acquire-loads —
+    a stalled worker), while the survivor needs only the forwarding load to land
+    anywhere in that window, near-certain for at least one per-VF worker on
+    every apply. Recorded both directions so the record is not left overstated
+    either way.
+  - **File(s)**: userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+    userspace-dp/src/afxdp/coordinator/README.md
+
+- **Timestamp**: 2026-07-31 07:05
+  - **Action**: #6592 — pair validation and forwarding ATOMICALLY so a worker can
+    never hold one half from generation N and the other from N-1, in EITHER
+    orientation. `shared_validation` (an `ArcSwap<ValidationState>`) and
+    `ha.forwarding` (an `ArcSwap<ForwardingState>`) are replaced by a single
+    `ha.runtime: ArcSwap<RuntimeView>` where `RuntimeView { validation,
+    forwarding: Arc<ForwardingState> }`. The worker's per-tick refresh
+    (`refresh_runtime_view`) and its startup seed both take BOTH halves out of
+    ONE `ArcSwap` load, so whichever view is observed, its two halves were
+    published together. #6291's read-order flip could only ever exclude ONE
+    orientation — an acquire/release pair is directional — and the one it left,
+    `(new validation, old forwarding)`, is the COMMON one and is not drop-only:
+    after Go writes the new generation into `userspace_ctrl` the shim stamps
+    NEW, those packets classify Valid against the worker's new validation, and
+    they forward under the STALE tables.
+    DESIGN: the forwarding half stays a NESTED `Arc` rather than being inlined
+    into a single flat snapshot, because `bump_fib_generation` advances
+    validation with NO table change and Go fires it repeatedly during route
+    convergence. `republish_runtime_validation` reuses the published forwarding
+    `Arc`, so the worker's #1188 `Arc::ptr_eq` short-circuit still hits and the
+    expensive rotation branch is not taken. Measured
+    (`benches/runtime_view_refresh.rs`): validation-only publish 214 ns (reuse)
+    vs 14.2 us (inlined rebuild) at 1K routes — 66x — and 239 ns vs 62.5 us at
+    10K routes — 262x. The per-tick worker refresh went from 45.97 ns (two
+    ArcSwap loads) to 22.57 ns (one), so the hot path got cheaper, not dearer.
+    Every publish site now funnels through one choke point
+    (`Coordinator::publish_runtime_view` / `republish_runtime_validation`), which
+    builds the view from `self.validation` AT the store — so coherence is
+    structural at every site instead of depending on store order. `stop_inner`
+    needed `self.validation` defaulted BEFORE its publish (it used to be reset
+    after the stores, which was harmless with two independent Arcs but would now
+    publish a default forwarding paired with the outgoing validation). #5166 is
+    unchanged: the CoS maps + `ha.fabrics` still store before the view, and the
+    worker still reads the view before the CoS Arcs.
+    GATES: the consumer test
+    (`snapshot_refresh_runtime_view_pair_is_atomic_6592`) drives the refresh with
+    a coordinator publish injected through the `between` seam and asserts the
+    returned pair is coherent — splitting it back into two `ArcSwap` loads goes
+    RED in EITHER order and the message names which orientation was
+    reintroduced. The producer test
+    (`refresh_runtime_snapshot_publishes_a_coherent_view_pair`) asserts the pair a
+    worker observes IS the pair the choke point intended, via the
+    `runtime_view_at_publish` seam, which retains the PREVIOUS view so it proves
+    its own position (hoisting the store above the capture is RED too). #1188 is
+    pinned by `bump_fib_generation_publishes_new_stamps_without_rotating_forwarding`.
+    Release symbol check: `refresh_runtime_view` is absent from `nm` on the
+    release binary while `worker_loop` is present — the seam leaves no call
+    boundary. Full `cargo test --release` green (4220 + 60 + 8 + 22 + 1); all
+    five new/updated test names confirmed in the release `-v` output.
+  - **File(s)**: userspace-dp/src/afxdp/types/{runtime_view.rs,mod.rs},
+    userspace-dp/src/afxdp/coordinator/{mod.rs,ha_state.rs,snapshot_refresh.rs,
+    tunnel_supervision.rs,tests.rs,README.md},
+    userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
+    userspace-dp/src/afxdp/worker/{launch.rs,loop_body/mod.rs,loop_body/setup.rs},
+    userspace-dp/src/afxdp/tunnel.rs,
+    userspace-dp/src/afxdp/forwarding/README.md,
+    userspace-dp/benches/runtime_view_refresh.rs, userspace-dp/Cargo.toml,
+    docs/userspace-dataplane-architecture.md, docs/fabric-cross-chassis-fwd.md,
+    _Log.md
+
+- **Timestamp**: 2026-07-31 09:40
+  - **Action**: Fold the independent hostile review of PR #6608 (#6592) —
+    MERGE-NEEDS-MINOR, two MINORs plus four NITs, no MAJOR.
+    MINOR-1: the "single choke point" was a CONVENTION, not an invariant.
+    `HaState::runtime` was `pub(in crate::afxdp)`, so any module under
+    `crate::afxdp` could `ha.runtime.store(...)` and bypass
+    `store_runtime_view` — and the PR's own `seed_published_validation` did
+    exactly that, proving the path open rather than theoretical. Both
+    RED-on-revert seams sit inside or behind the choke point, so a future site
+    publishing `RuntimeView::new(older_validation, fwd)` directly would
+    reintroduce the #6592 mirror on the WRITER side with the suite green. Took
+    BOTH offered remedies, because neither alone is an invariant: narrowed the
+    field to `pub(super)` (removes the reach from worker/, tunnel.rs, ha/,
+    forwarding/ and every other afxdp module; readers now take a handle via the
+    new `HaState::runtime_reader`), AND added
+    `tests/runtime_view_publish_canary.rs`. The visibility cannot close it — a
+    new site inside `coordinator/` still compiles and the reader handle is a
+    storable `Arc<ArcSwap<..>>` by construction — so the canary is what makes
+    the remaining paths mechanical. It pins three rules: exactly one
+    `.runtime.store(` (the choke point); no `RuntimeView` CONSTRUCTED outside
+    the choke point without an explicit `runtime-view-canary: test-local`
+    marker (construction is the rule that catches a bypass storing through a
+    cloned handle, which the textual store rule cannot see); and one
+    runtime-view load per production reader, with a per-file table — which is
+    also what covers NIT-4's "a second load elsewhere in the tick" hole.
+    `seed_published_validation` now routes through
+    `republish_runtime_validation` so the tree has exactly ONE store with no
+    cfg(test) exemption to reason about.
+    MINOR-2: a doc comment on `published_validation` claimed `self.validation`
+    may be "left unpublished" by a mid-apply abort. #3766 made that
+    unreachable, and the claim is actively dangerous now: this PR NEWLY routes
+    `update_neighbors` and `refresh_fabric_links` through
+    `publish_runtime_view`, which carries `self.validation`; if the claim were
+    true, a `SyncFabricState` or neighbor push after an aborted apply would
+    publish (stranded new validation, old forwarding) — the mirror bug moved
+    writer-side. Verified the property firsthand rather than taking it on
+    report: the assignment-to-publish windows are 131 lines
+    (`refresh_runtime_snapshot_inner`) and 51 lines (`apply_snapshot`), and a
+    scan of both for `return` / `?` / `unwrap` / `expect` / `panic!` / `todo!`
+    / `unreachable!` returns EMPTY. Replaced the parenthetical with the
+    property stated positively and marked LOAD-BEARING for the two new call
+    sites.
+    NIT-3: stale `ha.forwarding` names in two live comments
+    (forwarding_build/mod.rs, coordinator/tests.rs).
+    NIT-4: gave the consumer seam a COMPILE-TIME position proof — `between`
+    now takes the just-read `ValidationState`, so it cannot be hoisted above
+    the load (which would let the injected publish land before any read and
+    pass vacuously on an old-old pair). This is the analogue of the producer
+    seam's previous-view assert. The residual limit (the test drives
+    `refresh_runtime_view`, not the real `worker_loop`) is now stated in the
+    doc and covered mechanically by the canary's load count. Re-verified the
+    seam still compiles away after the signature change: `worker_loop`'s
+    release disassembly is BYTE-IDENTICAL to the pre-change baseline (9404
+    instructions), `refresh_runtime_view` still absent from `nm`, zero
+    closure/`call_once` calls.
+    NIT-5: one sentence at the `stop_inner` publish explaining the
+    clone-a-just-defaulted-state cost as deliberate (teardown-only; uniformity
+    of one publish path beats skipping ~20 empty-collection clones).
+    NIT-6: bench head now states what G1 does NOT prove — it measures the SHAPE
+    change, not the production symbol, and the compile-away property rests on
+    the separate release-binary checks.
+    Canary hardening worth recording: the first run fired FIVE violations, two
+    of which were the canary counting its own PROSE (the #6592 docs quote
+    `ha.runtime.store(`, `RuntimeView::default()` and `shared_runtime.load()`).
+    Comment-only lines are now skipped — a trailing comment on a code line is
+    still counted, so a construction cannot hide behind one — and `->
+    RuntimeView {` is excluded as a return type rather than a construction.
+    Both hardenings carry their own self-tests so they cannot silently rot.
+    A THIRD hardening came out of the fire-probe itself and is the important
+    one: the probe's bypass was written as a rustfmt-wrapped chain
+    (`self.ha` / `.runtime` / `.store(...)` on three lines), so the substring
+    `.runtime.store(` appeared on NO single line and the line-based rule 1 did
+    not fire — the exact "canary that cannot fire" failure mode. (Rule 2 caught
+    that bypass on its construction, which is why construction is the
+    load-bearing rule, but rule 1 was still broken.) Rules 1 and 3 now count
+    over comment-stripped, whitespace-REMOVED code so a wrapped chain matches
+    however it is formatted, with self-tests for both wrapped shapes.
+    GATES: `cargo test --release --bins --tests -- --test-threads=1` green
+    (4220 + 60 + 8 + 22 + 13 + 1, exit 0). Canary fire-probes run in a
+    THROWAWAY detached worktree.
+  - **File(s)**: userspace-dp/tests/runtime_view_publish_canary.rs,
+    userspace-dp/src/afxdp/coordinator/{ha_state.rs,mod.rs,tests.rs},
+    userspace-dp/src/afxdp/worker/{launch.rs,loop_body/mod.rs},
+    userspace-dp/src/afxdp/types/runtime_view.rs,
+    userspace-dp/src/afxdp/forwarding_build/mod.rs,
+    userspace-dp/benches/runtime_view_refresh.rs, _Log.md
+
+- **Timestamp**: 2026-07-31 11:15
+  - **Action**: Fold the Codex re-gate on PR #6608 (#6592) — MERGE-NEEDS-MINOR:
+    the source canary was demonstrably FAIL-OPEN, and the fix is to move the
+    write capability into the type system rather than keep enumerating
+    bypasses.
+    REPRODUCED FIRST, before changing anything. Codex's injection, verbatim,
+    into `refresh_fabric_links`:
+      let runtime_writer_alias = self.ha.runtime_reader();
+      let mut torn = runtime_writer_alias.load_full().as_ref().clone();
+      torn.validation.fib_generation =
+          torn.validation.fib_generation.wrapping_add(1);
+      runtime_writer_alias.store(Arc::new(torn));
+    On head 6d066d203 that COMPILED, published the exact (new validation, old
+    forwarding) tear, and all 15 canary tests PASSED (exit 0). My fold report
+    had argued rule 2 was the backstop because "a publish needs a view VALUE" —
+    that reasoning is exactly what fails, because a value can be obtained by
+    CLONING one out of a load instead of constructing one. Third enumeration
+    failure on this canary (after the rustfmt-wrapped chain), which is the
+    argument for stopping.
+    FIX — type-level, three independent compile errors on that injection:
+    (1) `RuntimeViewReader` (new): private `ArcSwap` field, sole method
+    `load()`. `runtime_reader()` returns it instead of
+    `Arc<ArcSwap<RuntimeView>>`, so a consumer cannot obtain a writer —
+    `.store(..)` and `.load_full()` do not exist on it.
+    (2) `RuntimeView` is no longer `Clone` — `.as_ref().clone()` does not
+    compile, which makes `RuntimeView::new` the ONLY way to obtain a view value
+    anywhere and turns "a publish needs a CONSTRUCTED view" from an
+    enumeration into a true statement.
+    (3) `RuntimeView`'s fields are private with `validation()` / `forwarding()`
+    accessors — `torn.validation.fib_generation = ..` does not compile.
+    Also `RuntimeViewChannel` (new) wraps the coordinator's `ArcSwap` in a
+    private field exposing only `publish`/`load`/`load_full`/`reader`, so
+    `swap`, `rcu`, `compare_and_swap` and `Deref` are unreachable rather than
+    merely unmatched by a regex — Codex's other named evasion.
+    CANARY, now defence in depth rather than the boundary: rule 1 counts
+    `.runtime.publish(` (the only mutation left); NEW rule 1b fires if any file
+    outside `types/runtime_view.rs` so much as names `ArcSwap<RuntimeView>`,
+    which is precisely the capability escape the probe used; rule 2's
+    `test-local` marker is now honoured ONLY in a file's test half (Codex:
+    unconstrained, it silenced production code too); and a truncation-heuristic
+    guard fires if a COUNTED reader file grows `#[cfg(not(test))]` past its
+    first top-level `#[cfg(test)]`, which is the only way production code lands
+    in the discarded half. 20 canary tests including self-tests for each new
+    rule. Deliberately NOT chased: distinguishing test from production loads
+    past the truncation point needs region tracking; the early warning is
+    enough while the count is zero, and that limit is written down rather than
+    implied.
+    CORRECTED MY OWN RECORD: my earlier "zero closure/call_once calls in
+    worker_loop" was an artefact — `dumpwl.py` normalises `<...>` to `<SYM>`
+    BEFORE the grep, so the check could never have matched. On raw objdump
+    `worker_loop` contains exactly 2 `call_once` calls, both a shared
+    `.llvm.`-deduplicated lazy-init thunk (`xor %edi,%edi` then a NULL-test on
+    the returned pointer), present identically with and without the seam call.
+    Codex was right and the corrected instrument is the call/lock-count
+    isolation, not a symbol grep.
+    GATES: `cargo test --release --bins --tests -- --test-threads=1` green
+    (4220 + 60 + 8 + 22 + 20 + 1, exit 0).
+  - **File(s)**: userspace-dp/src/afxdp/types/runtime_view.rs,
+    userspace-dp/src/afxdp/coordinator/{ha_state.rs,mod.rs,tests.rs,
+    tunnel_supervision.rs,snapshot_refresh.rs,README.md},
+    userspace-dp/src/afxdp/worker/{launch.rs,loop_body/mod.rs,loop_body/setup.rs},
+    userspace-dp/src/afxdp/tunnel.rs,
+    userspace-dp/tests/runtime_view_publish_canary.rs, _Log.md
+
+- **Timestamp**: 2026-07-31 14:33
+  - **Action**: Fold the Codex re-gate on PR #6608 (#6592) — the canary's
+    test-region heuristic was fail-open, and the file it was blind to is the
+    one file it most needs to watch.
+    REPRODUCED FIRST, on head 3b2151aa3, in a throwaway detached worktree.
+    Codex's finding: production_half truncated a file at its FIRST top-level
+    cfg(test), and in coordinator/mod.rs that attribute sits on a test-only
+    `use` at line 35 — so 1200+ lines, INCLUDING the publish choke point at
+    line 1117, were discarded from the scan. Its words: "unconditional
+    production items after the first cfg(test) are discarded". Injected an
+    explicit construct-and-publish below line 35, spelled to dodge rule 1 by
+    rebinding the channel and carrying the test-local marker (honoured in the
+    "test half", which truncation had made the whole file):
+      fn probe_torn_publish(&mut self, stale: ValidationState,
+                            forwarding: Arc<ForwardingState>) {
+          let torn = Arc::new(RuntimeView::new(stale, forwarding)); // marker
+          let channel = &self.ha.runtime;
+          channel.publish(torn);
+      }
+    That COMPILED, published the (stale validation, live forwarding) tear, and
+    all 20 canary tests PASSED (exit 0). This is the residue the type system
+    explicitly cannot express — the one thing the canary is now the sole
+    guard for — so the blind spot sat exactly on top of the remaining risk.
+    Fourth enumeration/heuristic failure on this canary, after the
+    rustfmt-wrapped chain and the cloned-view bypass.
+    FIX — region tracking, not a wider heuristic. A top-level cfg(test) on an
+    ITEM hides only that item; only the brace-delimited forms (mod, impl,
+    macro!) introduce a region. `test_regions` skips the attributed item —
+    consuming the whole attribute run, so `#[cfg(test)] #[path = "x_tests.rs"]
+    mod tests;` ends at its semicolon — and CONTINUES scanning. Brace tracking
+    runs over comment- and literal-masked text (`mask_non_code`: nested block
+    comments, raw/byte strings, char literals incl. '{' and '\u{...}'), because
+    a single "{" in a string would otherwise desync the depth counter for the
+    rest of the file, and desync decides which half a line lands in. The halves
+    are line-aligned and elided regions are filled with a NUL rather than a
+    blank, so the whitespace-stripped blob (which is what makes the
+    rustfmt-wrapped-chain rule work) cannot splice two lines across a gap and
+    manufacture a match present in neither.
+    Deleted `scan_truncation_heuristic` — the cfg(not(test))-past-truncation
+    early warning — rather than keep it: with region tracking there is no
+    truncation point, so the rule could never fire again, and this file's own
+    doctrine is that a canary that cannot fire is worse than no canary. It is
+    strictly subsumed: that production code is now simply scanned.
+    5 new self-tests, each verified NON-VACUOUS by neutralizing split_halves
+    back to truncation (all 5 RED, 18 pass). Two of them initially passed
+    under truncation for the wrong reason — their fixture STARTED with
+    cfg(test), so `find("\n#[cfg(test)]")` found nothing and scanned the whole
+    file; both now carry a leading production line so a truncating
+    implementation really does truncate. MUTATION: same injected tree, fixed
+    canary — rule 2 fires, "src/afxdp/coordinator/mod.rs: 2 RuntimeView
+    construction(s), expected 1", exit 101.
+    The corrected scan is much wider (coordinator/mod.rs goes from 34 scanned
+    lines to 1276; ~100 files across the tree gain production code that the
+    truncation had discarded) and the tree is clean under it — no table entry
+    needed relaxing.
+    Docs: coordinator/README.md claimed the canary covers "a new publish site
+    inside coordinator/". That claim was false for most of that file; the
+    README now records why and what replaced it.
+    GATES: cargo test --release --bins --tests -- --test-threads=1 green
+    (60 + 4220 + 8 + 22 + 23 + 1, exit 0; canary 20 -> 23 tests). Type-level
+    containment re-verified firsthand, unchanged by this fold: Codex's
+    aliased-writer injection still fails to build with 2x E0599 (no `load_full`
+    / no `store` on RuntimeViewReader), and routing the same injection through
+    the coordinator's own channel to unmask the other two legs fails with 2x
+    E0616 (private field `validation`) plus E0308 (RuntimeView is not Clone, so
+    `.as_ref().clone()` yields a reference). All probes in a throwaway detached
+    worktree, removed after.
+  - **File(s)**: userspace-dp/tests/runtime_view_publish_canary.rs,
+    userspace-dp/src/afxdp/coordinator/README.md, _Log.md
+
+- **Timestamp**: 2026-07-31 13:05
+  - **Action**: Fold the Codex re-gate of 93c87076a on PR #6608 (#6592) — two
+    REAL fail-opens in the canary's region tracker, both confirmed by Codex
+    with compiling fixtures, both the same class the tracker was already fixed
+    for once.
+    BUG 1 — raw C strings unrecognized. `raw_string_open` accepted the `r`,
+    `br` prefixes but not `cr`; the match arm did not even admit `b'c'`. Codex's
+    fixture `#[cfg(test)] const S: &CStr = cr#""{"#;` compiles under rustc 1.96
+    in BOTH modes, and its `{` desynced brace tracking so `production_half`
+    returned the following production fn as elided NULs — its
+    `shared_runtime.load()` invisible to rule 3.
+    BUG 2 — a brace-delimited item closed without checking `aux == 0`, so
+    `#[cfg(test)] swallow!({} #[cfg(test)] garbage);` "ended" at the INNER `{}`,
+    the trailing attribute-shaped tokens read as top level, and the production
+    fn after them was elided.
+    FIX, made STRUCTURAL rather than additive per the review: the raw-literal
+    prefix set is now derived from the grammar (`r` / `br` / `cr`, any hash
+    count) instead of from the shapes this tree happens to contain; and an item
+    body brace is recognized ONLY at `aux == 0`, so a brace inside `()`/`[]` is
+    a macro argument / array / struct-literal-in-call and never mistaken for the
+    item's own body.
+    COVERAGE, enumerated from Rust's literal grammar rather than accumulated:
+    a `LITERAL_SHAPES` table drives one self-test per shape that can legally
+    hide an unbalanced `{` — line comment, block comment, NESTED block comment,
+    char literal, `'\u{7b}'` escape, byte char, string, string with escaped
+    quote, byte string, C string, raw string (0/1/2 hashes), raw byte string,
+    raw C string — 15 rows. Plus both of Codex's fixtures verbatim, a
+    lifetime-tick test (`'a` must NOT mask as a char literal), and a test that
+    `#[cfg(test)]` appearing inside a string or doc comment opens no region.
+    LIMITS written down as an executable test rather than assumed:
+    `#[cfg(all(test, ..))]`, `#[cfg_attr(.., cfg(test))]`, and attributes
+    GENERATED by `macro_rules!` are NOT recognized. None can hide a `{` — they
+    are limits of the ATTRIBUTE matching, not the literal grammar — and each
+    fails CLOSED: the region goes unrecognized so its lines stay in the
+    PRODUCTION half and are scanned MORE, never less.
+    Fixture-template bug caught while writing the matrix: the single-line
+    template `fn t() { // { }` put the closing brace inside the line comment,
+    making the FIXTURE invalid Rust rather than testing the masker. Body now
+    spans lines.
+    MUTATION MATRIX — 10/10 RED, and building it caught THREE self-tests that
+    did not actually bind their fix (the whole point of mutation over
+    assertion-counting):
+      * nested block comment: the row's brace sat BEFORE the inner `*/`, so a
+        NON-nesting masker covered it by accident. Moved the brace after the
+        inner close.
+      * raw byte / raw C string: `br#"{"#` is masked by the plain-string arm
+        anyway, so the prefix handling was never exercised. Content must START
+        with a quote (`br#""{"#`) — then a masker that misses the prefix closes
+        at the inner quote and leaves the brace bare. Same shape Codex used.
+      * the two `aux == 0` gates are DUAL: removing either alone is masked by
+        the other, so each individually mutated GREEN. Recorded as ONE mutation
+        (remove both) rather than pretending to two independent rows.
+    GATES: `cargo test --release --bins --tests -- --test-threads=1` green
+    (4220 + 60 + 8 + 22 + 29 + 1, exit 0). Type-probe regressions re-confirmed:
+    aliased writer still 2x E0599, coordinator-channel variant still 2x E0616 +
+    E0308. Matrix and probes run in a throwaway detached worktree, removed.
+  - **File(s)**: userspace-dp/tests/runtime_view_publish_canary.rs, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6592 review-fold (Codex MERGE-NEEDS-MINOR, one residual). The
+  canary's `mask_non_code` did not mask a Rust SHEBANG. rustc strips `#!` before
+  tokenization, so its bytes are not code — but the tracker counted its
+  delimiters, and a legal `#!/usr/bin/env rust-script }` set brace depth to -1;
+  the following `struct S {` returned it to zero, making a FIELD's nested
+  `#[cfg(test)]` look top-level. A field has neither a semicolon nor its own
+  body, so `attributed_item_end` then ran to EOF and elided the production
+  function. Masked the leading `#!` line, explicitly NOT `#![`, which is an
+  inner attribute and IS code.
+  NOTE ON THE TEST: my first fixture used a plain struct field and was VACUOUS —
+  neutering the mask left it GREEN, because without the nested `#[cfg(test)]`
+  nothing was elided. Caught by mutation, not by reading. Corrected to the
+  reviewer's exact shape (attribute on the field) and re-verified: the mask
+  mutation now reds `hostile_fixture_shebang_is_not_code` while
+  `inner_attribute_is_not_mistaken_for_a_shebang` stays green — an exact
+  partition. Full gate green: 4220 + 60 + 8 + 22 + 31 + 1, 0 failed.
+- **File(s)**: userspace-dp/tests/runtime_view_publish_canary.rs, _Log.md
 - **Timestamp**: 2026-07-31
 - **Action**: #6524 fix — a chained flat-set custom application compiled
   PROTOCOL-ONLY, so a policy matching it permitted ALL TCP.

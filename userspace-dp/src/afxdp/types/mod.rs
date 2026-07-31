@@ -34,6 +34,11 @@ pub(in crate::afxdp) use tx::*;
 mod runtime;
 pub(in crate::afxdp) use runtime::*;
 
+// #6592: the atomically-paired worker-visible (validation, forwarding) view.
+// Declared AFTER `runtime` and `forwarding` so it can name both halves.
+mod runtime_view;
+pub(in crate::afxdp) use runtime_view::*;
+
 pub(super) type FastMap<K, V> = FxHashMap<K, V>;
 pub(super) type FastSet<T> = FxHashSet<T>;
 pub(super) type OwnerRgSessionIndex = FastMap<i32, FastSet<SessionKey>>;
