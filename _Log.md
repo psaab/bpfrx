@@ -61603,3 +61603,13 @@ yet the committed heatmap disagrees). This PR additionally grew
 pre-existing master red. The three commits this branch is behind touch only
 `_Log.md` and a test file, so the regenerated snapshot stays accurate after a
 rebase.
+
+- **Timestamp**: 2026-07-31 03:50
+  - **Action**: Fold the Codex re-gate MINOR on the #6577 README — the section
+    intro described BOTH folding surfaces as "reach the V6 branch and then match
+    nothing", which is true only of the query-containment half. The
+    classification half failed in the opposite direction (a mapped prefix routed
+    into the V4 set, where the fold degraded it to a /0 matching every IPv4
+    address). The body already said this correctly; only the intro contradicted
+    it.
+  - **File(s)**: pkg/policymatch/README.md

@@ -634,8 +634,12 @@ gRPC-text arm makes the (V4 src, V6 dst) topic fall back to the fabricated
 ### Colon-strict family — containment and prefix classification (#6577, resolved)
 
 #6377 above fixed **which** family's rules a mapped address is tested against.
-It left two surfaces where `net.IP.To4()` still folded, so a mapped address
-could reach the V6 branch and then match nothing at all. #6577 closed both.
+It left two independent surfaces where `net.IP.To4()` still folded: **V6 query
+containment** and **address-set family classification**. The two failed in
+OPPOSITE directions — the query side let a mapped address reach the V6 branch
+and match nothing at all, while the classification side routed a mapped
+*prefix* into the V4 set, where the fold degraded it to a `/0` that matched
+every IPv4 address (see below). #6577 closed both.
 
 **The query side — containment.** `net.IPNet.Contains` opens with the same
 `if x := ip.To4(); x != nil { ip = x }` narrowing, so a mapped address folded to
