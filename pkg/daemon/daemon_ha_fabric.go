@@ -212,6 +212,15 @@ func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, overlay, peerA
 
 	// Fast initial population: attempt immediately, then 500ms retries.
 	for i := 0; i < 10; i++ {
+		// Honour cancellation before EVERY attempt, including the first. The
+		// probe below dials the overlay and transmits a neighbour solicitation
+		// (ff02::1) / ARP request, so a caller whose context is ALREADY
+		// cancelled — shutdown, or a superseded fabric epoch — must not put one
+		// more frame on the wire. Before this the check lived inside the
+		// `i > 0` sleep arm, so iteration 0 probed unconditionally.
+		if ctx.Err() != nil {
+			return
+		}
 		if i > 0 {
 			select {
 			case <-ctx.Done():
@@ -252,7 +261,20 @@ func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, overlay, peerA
 // if no neighbor entry exists. Uses ping (not arping) because arping's
 // PF_PACKET raw sockets don't populate the kernel ARP table with XDP attached.
 func (d *Daemon) probeFabricNeighbor(ctx context.Context, fabIface string, peerIP net.IP) {
-	link, err := netlink.LinkByName(fabIface)
+	// Route the reads through the Daemon seams like the rest of the fabric
+	// refresh. These were direct netlink calls, which meant a test that
+	// reached this function bypassed both seams and hit the real kernel —
+	// dumping neighbours and, on a miss, transmitting a raw ICMP probe and an
+	// ff02::1 solicitation on a live NIC (#6595).
+	//
+	// NOTE for future tests: seaming the reads makes the LOOKUP hermetic, not
+	// the whole function. A seam that returns a synthetic link with no matching
+	// neighbour still falls through to the sendICMPProbe / sendIPv6MulticastProbe
+	// transmits below, which are real sockets on a real interface name. A test
+	// that must exercise this path should make fabricLinkByName return an error
+	// (as TestFabricPeerIdentityClearedOnPeerChange does) so it returns before
+	// any transmit.
+	link, err := d.fabricLinkByName(fabIface)
 	if err != nil {
 		return
 	}
@@ -261,7 +283,7 @@ func (d *Daemon) probeFabricNeighbor(ctx context.Context, fabIface string, peerI
 	if peerIP.To4() == nil {
 		neighFamily = netlink.FAMILY_V6
 	}
-	neighs, _ := netlink.NeighList(link.Attrs().Index, neighFamily)
+	neighs, _ := d.fabricNeighList(link.Attrs().Index, neighFamily)
 	for _, n := range neighs {
 		if n.IP.Equal(peerIP) && len(n.HardwareAddr) == 6 &&
 			(n.State&(netlink.NUD_REACHABLE|netlink.NUD_STALE|netlink.NUD_PERMANENT|netlink.NUD_DELAY|netlink.NUD_PROBE)) != 0 {
@@ -784,6 +806,11 @@ func (d *Daemon) populateFabricFwd1(ctx context.Context, fabIface, overlay, peer
 
 	// Fast initial population: attempt immediately, then 500ms retries.
 	for i := 0; i < 10; i++ {
+		// Same pre-probe cancellation check as populateFabricFwd — iteration 0
+		// must not transmit when the context is already cancelled.
+		if ctx.Err() != nil {
+			return
+		}
 		if i > 0 {
 			select {
 			case <-ctx.Done():

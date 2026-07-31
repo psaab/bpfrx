@@ -675,11 +675,11 @@ type Daemon struct {
 	fabricIface      string // physical parent (XDP attachment point)
 	fabricOverlay    string // IPVLAN overlay for neighbor resolution (#129)
 	fabricPeerIP     net.IP
-	fabricIface1     string        // secondary fabric parent
-	fabricOverlay1   string        // secondary fabric overlay (#129)
-	fabricPeerIP1    net.IP        // secondary fabric peer IP
-	fabricPopulated  bool          // true after first successful fab0 write
-	fabric1Populated bool          // true after first successful fab1 write
+	fabricIface1     string // secondary fabric parent
+	fabricOverlay1   string // secondary fabric overlay (#129)
+	fabricPeerIP1    net.IP // secondary fabric peer IP
+	fabricPopulated  bool   // true after first successful fab0 write
+	fabric1Populated bool   // true after first successful fab1 write
 	// fabricPeerMAC / fabricPeerMAC1 cache the last peer MAC that was learned
 	// from an ADDRESS-MATCHED neighbour entry for the configured fabric peer
 	// (#6554). They are the identity the IPv6-NDP link-local fallback is
@@ -689,8 +689,8 @@ type Daemon struct {
 	// let a bad guess self-confirm) and cleared when the configured peer
 	// address changes, so a re-pointed fabric cannot be pinned to the old
 	// peer's MAC.
-	fabricPeerMAC  net.HardwareAddr
-	fabricPeerMAC1 net.HardwareAddr
+	fabricPeerMAC    net.HardwareAddr
+	fabricPeerMAC1   net.HardwareAddr
 	fabricRefreshCh  chan struct{} // wakes the fab0 populateFabricFwd loop
 	fabricRefreshCh1 chan struct{} // wakes the fab1 populateFabricFwd1 loop (#4038)
 	lastFabricProbe  time.Time     // rate-limit active fab0 neighbor probes

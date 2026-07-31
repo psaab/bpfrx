@@ -61942,3 +61942,37 @@ would never produce.
 - **File(s)**: pkg/daemon/{daemon.go,daemon_ha_fabric.go,
     daemon_ha_fabric_peer_identity_6554_test.go},
     docs/fabric-cross-chassis-fwd.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6554 review-fold (Codex MERGE-NEEDS-MINOR on PR #6595). Three
+  findings, all folded. (1) `populateFabricFwd` / `populateFabricFwd1` checked
+  `ctx.Done()` only inside the `i > 0` sleep arm, so iteration 0 ran
+  unconditionally — an already-cancelled caller still reached
+  `probeFabricNeighbor`, which dumps the kernel neighbour table and, on a miss,
+  transmits a raw ICMP probe plus an `ff02::1` solicitation on a live NIC.
+  Hoisted a `ctx.Err()` check to the top of both retry loops and pinned it with
+  `TestPopulateFabricFwdHonoursCancelledContextBeforeFirstProbe`, which asserts
+  ZERO netlink touches under a cancelled context (both siblings). (2)
+  `probeFabricNeighbor` called `netlink.LinkByName` / `netlink.NeighList`
+  directly, bypassing the `fabricLinkByName` / `fabricNeighList` seams the rest
+  of the refresh uses; routed both through the seams and made
+  `TestFabricPeerIdentityClearedOnPeerChange` hermetic by pinning the seams to
+  hard errors, so the test's safety no longer depends on the cancellation guard
+  surviving. The residual transmit hazard (a seam returning a synthetic link
+  with no matching neighbour still falls through to the probe transmits) is
+  documented at the function rather than papered over — the read seams are set
+  to the real netlink calls by the constructor, so seam-presence cannot gate the
+  transmit. (3) Corrected a disproven impact claim in the test message and in
+  `docs/fabric-cross-chassis-fwd.md`: verified firsthand that the MAC this path
+  programs lands in the retired-eBPF `fabric_fwd` map (`UpdateFabricFwd`,
+  pkg/dataplane/maps_fabric.go) while the live Rust redirect takes
+  `neighbor_mac` from `FabricSnapshot.PeerMAC`, which
+  `pkg/dataplane/userspace/fabric.go` re-derives with its own address-matched
+  `buildFabricPeerMAC` (no link-local fallback). A mis-identified peer therefore
+  never becomes an L2 destination — the damage is false readiness, a truncated
+  fast-retry probe loop, and a misleading `peer_mac` log line. Also ran
+  `gofmt -w pkg/daemon/daemon.go` (the PR's added struct fields broke the
+  comment alignment; master was clean).
+- **File(s)**: pkg/daemon/{daemon.go,daemon_ha_fabric.go,
+    daemon_ha_fabric_peer_identity_6554_test.go},
+    docs/fabric-cross-chassis-fwd.md, _Log.md

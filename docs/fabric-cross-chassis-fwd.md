@@ -392,8 +392,21 @@ latched readiness, ended the fast-retry probe loop early, and logged a
 peer MAC belonging to an unrelated host during an HA incident.
 
 Distinct from #6458, which validates the **receive** side (zone-encoded
-fabric-ingress stamps); this constrains the **daemon-side setup** that
-chooses the destination MAC.
+fabric-ingress stamps); this constrains the **daemon-side identity check**
+that decides when the fabric is declared ready.
+
+Scope limit, stated precisely because it bounds the severity: the MAC this
+path programs lands in the retired-eBPF `fabric_fwd` map
+(`UpdateFabricFwd`, `pkg/dataplane/maps_fabric.go`). The live Rust redirect
+does **not** read it — `resolve_fabric_redirect_from_list` takes
+`neighbor_mac` from `FabricSnapshot.PeerMAC`, which
+`pkg/dataplane/userspace/fabric.go` re-derives with its own
+**address-matched** neighbour lookup (`buildFabricPeerMAC`, which matches
+on `neigh.IP.Equal(peer)` and has no link-local fallback). So a
+mis-identified peer accepted here never becomes an L2 destination for
+cross-chassis frames. The damage is exactly the three effects listed
+above — false readiness, a truncated fast-retry probe loop, and a
+misleading `peer_mac` log line during an HA incident.
 
 ### M13 — skipped fabric links are counted + named (was a silent `continue`)
 

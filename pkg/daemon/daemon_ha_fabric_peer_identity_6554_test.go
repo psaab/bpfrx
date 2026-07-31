@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -183,8 +184,16 @@ func TestFabricPeerNDPFallbackRejectsDecoyWithKnownPeerMAC(t *testing.T) {
 		t.Fatalf("expected exactly one programmed fabric entry, got %d (%v)", len(got), got)
 	}
 	if got[0] == fabPeerTestDecoyMAC {
-		t.Fatalf("DECOY MAC %s was programmed as the fabric peer — cross-chassis "+
-			"frames would be L2-delivered to an unrelated adjacent host (#6554)",
+		// Scope note: the MAC this path programs goes into the retired-eBPF
+		// `fabric_fwd` map (pkg/dataplane/maps_fabric.go). The LIVE Rust
+		// redirect re-derives FabricSnapshot.PeerMAC with its own
+		// address-matched neighbour lookup (buildFabricPeerMAC,
+		// pkg/dataplane/userspace/fabric.go), so a decoy accepted here never
+		// becomes an L2 destination. The damage is false readiness, not
+		// misdelivery — assert on that, not on a forwarding claim.
+		t.Fatalf("DECOY MAC %s was programmed as the fabric peer — the node would "+
+			"latch fabricPopulated, end the fast-retry probe loop early, and log an "+
+			"unrelated host's MAC as the fabric peer during an HA incident (#6554)",
 			fabPeerTestDecoyMAC)
 	}
 	if got[0] != fabPeerTestPeerMAC {
@@ -320,6 +329,19 @@ func TestFabricPeerAddressMatchRecordsIdentity(t *testing.T) {
 // the old one would refuse the new peer forever.
 func TestFabricPeerIdentityClearedOnPeerChange(t *testing.T) {
 	d := &Daemon{}
+	// Hermetic by construction (#6595). populateFabricFwd now checks ctx before
+	// the first probe, so a cancelled context returns without touching netlink —
+	// but do not let this test's SAFETY depend on that check surviving. Pin the
+	// netlink seams to hard errors so a regression in the cancellation guard
+	// fails as an assertion here rather than dumping the kernel neighbour table
+	// and transmitting an ICMP / ff02::1 probe on whatever real interface
+	// happens to be named ge-0-0-0 on the machine running the suite.
+	d.linkByNameFn = func(string) (netlink.Link, error) {
+		return nil, errors.New("hermetic test: netlink disabled")
+	}
+	d.neighListFn = func(int, int) ([]netlink.Neigh, error) {
+		return nil, errors.New("hermetic test: netlink disabled")
+	}
 	d.fabricPeerIP = net.ParseIP("10.99.13.2")
 	d.rememberFabricPeerMAC(0, mustMAC(t, fabPeerTestPeerMAC))
 	d.fabricPeerIP1 = net.ParseIP("10.99.14.2")
@@ -342,6 +364,64 @@ func TestFabricPeerIdentityClearedOnPeerChange(t *testing.T) {
 	d.populateFabricFwd1(ctx, "ge-0-0-0", "fab1", "10.99.14.3", nil)
 	if hint := d.fabricPeerMACHint(1); hint != nil {
 		t.Fatalf("stale fab1 peer identity %v retained across a peer change", hint)
+	}
+}
+
+// TestPopulateFabricFwdHonoursCancelledContextBeforeFirstProbe pins the #6595
+// cancellation guard. The retry loop used to check ctx.Done() only inside its
+// `i > 0` sleep arm, so iteration 0 ran unconditionally: an already-cancelled
+// caller still reached probeFabricNeighbor, which dumps the kernel neighbour
+// table and — on a miss — transmits a raw ICMP probe plus an ff02::1
+// solicitation on a live interface. A cancelled context must put nothing on the
+// wire and read nothing from netlink.
+//
+// The assertion is a netlink-touch count rather than a packet capture: both
+// populateFabricFwd's probe and its refreshFabricFwd call reach the kernel
+// through fabricLinkByName, so ZERO calls is the only state in which neither
+// can have run. Reverting the guard makes this count non-zero.
+func TestPopulateFabricFwdHonoursCancelledContextBeforeFirstProbe(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(d *Daemon, ctx context.Context)
+	}{
+		{"fab0", func(d *Daemon, ctx context.Context) {
+			d.populateFabricFwd(ctx, "ge-0-0-0", "fab0", "10.99.13.2", nil)
+		}},
+		{"fab1", func(d *Daemon, ctx context.Context) {
+			d.populateFabricFwd1(ctx, "ge-0-0-0", "fab1", "10.99.14.2", nil)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			netlinkTouches := 0
+			d := &Daemon{}
+			d.linkByNameFn = func(string) (netlink.Link, error) {
+				mu.Lock()
+				netlinkTouches++
+				mu.Unlock()
+				return nil, errors.New("hermetic test: netlink disabled")
+			}
+			d.neighListFn = func(int, int) ([]netlink.Neigh, error) {
+				mu.Lock()
+				netlinkTouches++
+				mu.Unlock()
+				return nil, errors.New("hermetic test: netlink disabled")
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			tc.run(d, ctx)
+
+			mu.Lock()
+			got := netlinkTouches
+			mu.Unlock()
+			if got != 0 {
+				t.Fatalf("cancelled context still performed %d netlink read(s) — "+
+					"the pre-probe ctx.Err() guard is not holding, so a cancelled "+
+					"caller can still transmit an ICMP/ff02::1 probe on a live NIC "+
+					"(#6595)", got)
+			}
+		})
 	}
 }
 
