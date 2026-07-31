@@ -197,6 +197,16 @@ fn mask_non_code(content: &str) -> String {
     let n = b.len();
     let mut out = vec![b' '; n];
     let mut i = 0usize;
+    // A leading `#!` line is a SHEBANG: rustc strips it before tokenization, so
+    // its bytes are not code and its delimiters must not be counted. Only at
+    // offset 0, and only when not `#![`, which is an inner attribute and IS
+    // code. Missing this let a legal `#!/usr/bin/env rust-script }` desync the
+    // depth counter for the whole file.
+    if n >= 2 && b[0] == b'#' && b[1] == b'!' && !(n >= 3 && b[2] == b'[') {
+        while i < n && b[i] != b'\n' {
+            i += 1;
+        }
+    }
     while i < n {
         match b[i] {
             b'/' if i + 1 < n && b[i + 1] == b'/' => {
@@ -875,6 +885,43 @@ mod self_tests {
         assert!(
             production.contains("shared_runtime.load("),
             "the raw C string must not desync brace tracking; production half was:\n{production}"
+        );
+    }
+
+    #[test]
+    fn hostile_fixture_shebang_is_not_code() {
+        // Verbatim from the review that found it. rustc strips a shebang before
+        // tokenization, so its `}` is not a delimiter -- but the tracker was
+        // counting it, desyncing depth for the whole file. `#![...]` is an INNER
+        // ATTRIBUTE and must still be treated as code; the sibling row below
+        // pins that direction.
+        // The attribute must sit on a FIELD: a field has neither a semicolon nor
+        // its own body, so once the stray `}` makes it look top-level,
+        // attributed_item_end runs to EOF and elides `prod`. A plain field does
+        // not reproduce -- the row would pass with the mask removed.
+        let fixture = "#!/usr/bin/env rust-script }\n\
+                       struct S {\n\
+                           #[cfg(test)]\n\
+                           test_only: u8,\n\
+                       }\n\
+                       fn prod() { let v = shared_runtime.load(); }\n";
+        let production = production_half(fixture);
+        assert!(
+            production.contains("shared_runtime.load("),
+            "a shebang must not desync brace tracking; production half was:\n{production}"
+        );
+    }
+
+    #[test]
+    fn inner_attribute_is_not_mistaken_for_a_shebang() {
+        // The over-reach direction: `#![...]` at offset 0 is code, not a
+        // shebang. Masking it would swallow a real line.
+        let fixture = "#![allow(dead_code)]\n\
+                       fn prod() { let v = shared_runtime.load(); }\n";
+        let production = production_half(fixture);
+        assert!(
+            production.contains("shared_runtime.load("),
+            "an inner attribute must not be masked as a shebang; production half was:\n{production}"
         );
     }
 

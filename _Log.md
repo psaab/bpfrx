@@ -62638,3 +62638,22 @@ break — `go vet` confirmed passing under every revert.
     aliased writer still 2x E0599, coordinator-channel variant still 2x E0616 +
     E0308. Matrix and probes run in a throwaway detached worktree, removed.
   - **File(s)**: userspace-dp/tests/runtime_view_publish_canary.rs, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6592 review-fold (Codex MERGE-NEEDS-MINOR, one residual). The
+  canary's `mask_non_code` did not mask a Rust SHEBANG. rustc strips `#!` before
+  tokenization, so its bytes are not code — but the tracker counted its
+  delimiters, and a legal `#!/usr/bin/env rust-script }` set brace depth to -1;
+  the following `struct S {` returned it to zero, making a FIELD's nested
+  `#[cfg(test)]` look top-level. A field has neither a semicolon nor its own
+  body, so `attributed_item_end` then ran to EOF and elided the production
+  function. Masked the leading `#!` line, explicitly NOT `#![`, which is an
+  inner attribute and IS code.
+  NOTE ON THE TEST: my first fixture used a plain struct field and was VACUOUS —
+  neutering the mask left it GREEN, because without the nested `#[cfg(test)]`
+  nothing was elided. Caught by mutation, not by reading. Corrected to the
+  reviewer's exact shape (attribute on the field) and re-verified: the mask
+  mutation now reds `hostile_fixture_shebang_is_not_code` while
+  `inner_attribute_is_not_mistaken_for_a_shebang` stays green — an exact
+  partition. Full gate green: 4220 + 60 + 8 + 22 + 31 + 1, 0 failed.
+- **File(s)**: userspace-dp/tests/runtime_view_publish_canary.rs, _Log.md
