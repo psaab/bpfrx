@@ -1,21 +1,24 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.30.1 — THE TERMINAL CUT, round-114 folds (+ round-114 AGY straggler folds: the consumer-count header and the §9 OverdueSkipped propagation assertion now read five consumers with the mutual-exclusion note) (the
-establishment promote is REMOVED from the report consumers — the
-mutual-exclusion proof: an establishment candidate is a local reverse
-hit, while the fabric-placeholder substitution requires `!is_reverse`
-(`shared_ops.rs:583-590`), and a live local non-placeholder hit wins
-over the shared map, so no dispatch ever has both; the commit hook's
-matched token is now identity-BOUND (canonical key + NAT + orientation
-+ install_epoch — a same-key replacement without flow-cache
-invalidation could otherwise let a stale cache hit mutate a
-replacement family) riding a DISTINCT optional field (the query key
-stays the cache key); the promote apply is the full atomic transaction
-(flag + established/per-app timeout + last_seen_ns + wheel re-queue);
-the pre-filter split is stated (proof may change established/timing
-only; anchor samples adopt only at commit); the pending-path wording
-is exact). Round-114: Codex NO (3B/3M); AGY r113 UNSOUND (2 findings,
-folded v10.29.1); SMR r114 YES (fold verification). Ship
+**Status: DRAFT v10.31.0 — THE TERMINAL CUT, round-115 folds (the
+site-2b reverse synth gains the strong OPENING proof for SYN-ACK-driven
+synths — the installer was treating every non-initial-SYN TCP packet as
+established with no proof, so an unproven spoofed reverse SYN-ACK could
+synthesize an established reverse entry and pin the OPENING forward half
+through companion retention; a proof-failing SYN-ACK skips the install
+entirely per the site-2b refuse precedent, and non-SYN-ACK synths keep
+master's #3152 pickup behavior; the token gains its complete producer
+contract — every successful install/adopt path returns its FINAL token,
+and the resolved result carries the FINAL post-promotion identity; the
+re-probe is a dedicated atomic compare-then-mutate helper also covering
+touch_if_stale; the token binds the FAMILY — the reverse→forward hop
+re-verifies the forward entry's identity before writing the anchor
+sample; a cache-hit token mismatch EVICTS and falls through to a fresh
+resolution; §8 carries the token's footprint). Round-115: Codex NO
+(7B/1H/1M — the site-2b OPENING-proof bypass was the round's real new
+attack surface; the rest were the token's producer/binding contract);
+AGY r114 UNSOUND (2 stragglers, folded v10.30.1); SMR r115 YES (fold
+verification). Ship
 candidate = the Part-A dataplane demote gate plus the wire-free local HA
 rules. The RG-incarnation/retirement/fence-ledger protocol that rounds
 13–82 grew is KILLED (not deferred): its two customers are re-scoped —
@@ -1253,7 +1256,24 @@ hygiene, Junos reaps idle flows too).
 ### 5.6 Constructor gating (sites 2b + 2c)
 
 **Reverse-NAT synth (site 2b):** `install_reverse_session_from_forward_match`
-(`shared_ops.rs:857-865`) holds the `forward_match` in hand. **The match
+(`shared_ops.rs:857-865`) holds the `forward_match` in hand. **A
+SYN-ACK-driven synth must pass the strong OPENING proof (v10.31.0,
+round-115 Codex 1):** the synth installer treats every non-initial-SYN
+TCP packet as established at install (`install.rs:157-180`,
+`established = !(PROTO_TCP && is_initial_syn)`) — WITHOUT any proof —
+so an unproven spoofed reverse SYN-ACK that misses the normal lookup
+and matches the forward NAT entry would synthesize an ESTABLISHED
+reverse entry and pin the OPENING forward half through companion
+retention (`expire.rs:296-320`, `:468-523`). The rule: when the
+driving packet is a SYN-ACK, the synth runs the same strong OPENING
+proof the §5.5 promote uses (the SYN-ACK's ack must match the forward
+SYN's interval); a proof-FAILING SYN-ACK SKIPS the install entirely
+(the site-2b refuse precedent: `created=false, install_failed=true`,
+no cache insert, the packet still forwarded, the next legitimate
+packet re-synthesizes). Non-SYN-ACK synths keep master's #3152
+mid-stream-pickup behavior (a data-first pickup's established seed is
+deliberate asymmetric-routing preservation; its blind-spoof residual
+is pre-existing master behavior, unchanged). **The match
 carries explicit scope and identity (v10.2.0, round-84 Codex 4):**
 `lookup_forward_nat_across_scopes` returns the same `ForwardSessionMatch`
 shape for both scopes today (`shared_ops.rs:638`), and the type carries
@@ -1887,30 +1907,62 @@ adopting the shared decision/metadata, §5.6).
     a replacement of the packet-query key
     (`FlowCacheEntry.key`/`flow.forward_key` must stay the query key:
     hashing, lookup, and dedup all use it, `flow_cache.rs:578-581`,
-    `:962-989`, `:1046-1065`). Producers: the lookup return carries
-    the token (the lookup resolves the alias and captures the
-    canonical `actual_key`, `lookup.rs:62-68`, `:85-102`, `:194-219`,
-    today discarded on return); the resolution result and the
+    `:962-989`, `:1046-1065`). Producers (v10.31.0, round-115 Codex
+    2/3 — EVERY successful install/adopt path returns its FINAL
+    token): the lookup return carries the token (the lookup resolves
+    the alias and captures the canonical `actual_key`, `lookup.rs:62-68`,
+    `:85-102`, `:194-219`,
+    today discarded on return); the fresh ForwardFlow install gains an
+    OUT token (it returns only `bool` and creates its epoch internally
+    today, `install.rs:139-152`, `poll_descriptor/mod.rs:2449-2458`);
+    the reverse synthesis returns it (currently `(SessionLookup,
+    bool)`, `shared_ops.rs:824-895`); the forward-wire match carries
+    the MATCHED entry's epoch (`lookup.rs:258-292`, `entry.rs:208-213`);
+    the materialize returns the installed identity; and the RESOLVED
+    RESULT carries the FINAL post-promotion identity (the promotion
+    advances `install_epoch` and can change NAT/orientation,
+    `session/mod.rs:1344-1397`, and runs before the resolved result is
+    constructed, `session_glue/mod.rs:1157-1261` — the promote's OUT
+    reports the final identity and the constructor uses THAT, so the
+    current packet's commit hook and newly cached entry never fail
+    their own validation). The resolution result and the
     flow-cache entry each gain the optional field (§6's
     'no FlowCacheEntry change' claim is corrected — the field is
-    additive and cache-internal); the poller hoists it past the
+    additive and cache-internal; the footprint is stated in §8); the
+    poller hoists it past the
     `resolved.decision` reduction (`poll_descriptor/mod.rs:509`,
     `:883`). Purged/sessionless resolves carry `None`. The commit
-    hook (and the cache-hit re-probe, `lookup.rs:48-53`,
-    `:194-219`) verifies IDENTITY AGREEMENT — canonical key AND NAT
-    AND orientation AND install_epoch — and SUPPRESSES every
-    authority mutation (clear/refresh/anchor/overdue handling) on
-    mismatch: a same-key synced upsert removes/reinstalls with a new
+    hook (and the cache-hit re-probe) runs a DEDICATED ATOMIC
+    compare-then-mutate helper (v10.31.0, round-115 Codex 4): FIRST
+    compare (canonical key, NAT, orientation, epoch), mutate only on
+    agreement — the plain `lookup_with_origin` mutates close state,
+    timestamps, timeout, companion state, and the wheel before
+    returning (`lookup.rs:105-218`), and the existing
+    `touch_if_stale` (`flow_cache_hit.rs:295-301`,
+    `session/mod.rs:1118-1133`) is covered by the same guard. The
+    token binds the FAMILY (v10.31.0, round-115 Codex 5): the
+    reverse→forward `account_packet`-style hop derives a forward key
+    and mutates whichever entry currently occupies it
+    (`session/mod.rs:1177-1205`), so the hop RE-VERIFIES the forward
+    entry's identity (key AND NAT AND epoch) before writing the
+    anchor sample — in the stale-R1/replacement-K2 state, R1's sample
+    can never land on K2. A token MISMATCH at the cache-hit path
+    EVICTS the descriptor and falls through to a fresh resolution
+    (round-115 Codex 6 — suppression alone would leave a stale active
+    descriptor forwarding while the replacement never refreshes;
+    `flow_cache.rs:962-1021`, `:767-780`); the intentional `None`
+    (purged/sessionless) parity class stays distinct and keeps
+    master's behavior. The replacement races this guards against: a
+    same-key synced upsert removes/reinstalls with a new
     epoch (`install.rs:310-351`), `update_session` can change
     NAT/orientation and epoch while retaining the key
     (`session/mod.rs:1344-1397`), and worker `UpsertSynced` performs
     that replacement WITHOUT flow-cache invalidation
     (`session_glue/commands/upsert_synced.rs:64-120`), while cache
     lookup validates config/FIB/RG stamps, not session identity
-    (`flow_cache.rs:991-1021`) — so without the identity binding a
-    stale cache hit could clear/refresh/anchor-update a REPLACEMENT
-    family. §9 tests canonical, translated, cache-alias, sessionless
-    `None`, and same-key-replacement-mismatch hits
+    (`flow_cache.rs:991-1021`). §9 tests canonical, translated,
+    cache-alias, sessionless `None`, same-key-replacement-mismatch,
+    and mismatch-evict-and-fall-through hits
     (not only the
     probation flag, round-108 Codex 3); (v) the ownership promote is
     suppressed by the explicit `report.effective_transition ==
@@ -2721,8 +2773,10 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   RE-runs the establishment promote on the retry path (the promote
   already fired at the arrival dispatch's lookup phase — master's
   timing, v10.29.0, round-113 Codex 2/4; the anchor update and
-  probation clear wait for the next unbuffered packet
-  when its effective transition is not `OverdueSkipped`, v10.27.1);
+  probation clear wait for the next SUCCESSFULLY COMMITTED unbuffered
+  non-close whose effective transition is NEITHER `OverdueSkipped`
+  NOR `UpsertRefused`, v10.30.0 round-114 Codex 7 / round-115
+  Codex 8);
   a buffered SYN-ACK promotes AT ITS LOOKUP-PHASE post-borrow point
   (v10.29.0, round-113 Codex 2/4 — the v10.28.0 admission-point
   framing is RETRACTED: the pending-queue enqueue is not a
@@ -3093,7 +3147,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.30.1)
+## 11. Open questions for the convergence round (v10.31.0)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
@@ -3140,11 +3194,11 @@ this branch only if the minimal fix proves insufficient.
    deferred refresh (round-88) — is any pre-commit refresh/requeue
    path left for a probation entry (lookup, `touch_if_stale`, promote,
    materialize refresh), and does the commit-hook clear+refresh cover
-   every admission arm? (e) the v10.30.0 end-state: five consumers
-   again (the establishment promote never needs the report — the
-   mutual-exclusion proof is stated and tested), the identity-bound
-   matched token, the full atomic promote transaction, and the
-   pre-filter split — is anything left?
+   every admission arm? (e) the v10.31.0 end-state: the site-2b
+   OPENING proof, the complete token producer contract with the
+   final-identity rule, the atomic compare-then-mutate helper, the
+   family binding, and the mismatch eviction — is any install/adopt
+   path still tokenless and any hop still unverified?
 
 4. **The emission posture:** master's `expire.rs:342-350` gate is
    UNCHANGED; the additions are the normative mark-creation rules, rule
