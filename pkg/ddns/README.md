@@ -186,6 +186,26 @@ indistinguishable, permanent "transient observation failure" with no operator
 signal at all, the class #2773/#3737 closed for the publish path.
 `TestCheckIPNoAddressIsNotAnError` is the over-reach guard on that split.
 
+**The reported reason is credential-free.** Making the failure operator-visible
+also made it operator-LOGGED: the daemon writes the error as a `slog.Warn`
+attribute AND retains its text as the `checkIPProbeWarned` dedup map key. A
+`checkip-url` routinely carries an API key in its query or userinfo, so
+`validateCheckIPURL` renders the URL through `config.RedactURL` in all three
+refusal branches instead of interpolating the raw value. The parse-failure
+branch additionally does NOT `%w`-wrap `url.Parse`'s error: `*url.Error.Error()`
+re-embeds the full raw input, query included, which would defeat the redaction —
+only the inner cause is rendered (`urlParseCause`), which is a fixed sentence or
+at most the offending authority fragment. `scrubURLError` is not reusable here
+because it recovers a safe URL by RE-PARSING, and this is precisely the URL that
+does not parse. The commit-time mirror
+(`config.validateSurfaceADDNSWarnings`) redacts the same way.
+`TestValidateCheckIPURLRedactsCredentials` /
+`TestCheckIPProbeWarnRedactsCredential` (which asserts on rendered log bytes and
+on the dedup map keys) are the fail-on-revert gates;
+`TestCheckIPValidURLStillAccepted` is the over-reach guard — a credentialed but
+VALID `checkip-url` must still be accepted, since redacting before parsing would
+refuse every keyed endpoint.
+
 ### Withdraw (DeleteLease) semantics per backend (#2772)
 
 A withdraw is triggered when a Surface A scope shrinks, a binding is removed, or

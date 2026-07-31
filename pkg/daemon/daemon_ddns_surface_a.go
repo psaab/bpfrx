@@ -99,6 +99,14 @@ type surfaceAState struct {
 	// dual-stack miss (endpoint answered, no address of this family), which
 	// stays silent. Keyed by "<provider>\x00<probe-error>" so a corrected
 	// commit — or a different failure — re-arms the warning.
+	//
+	// SECURITY: the probe error is both LOGGED and used as this map's KEY, so
+	// every error pkg/ddns can return on the checkip path must already be
+	// credential-free — a checkip-url routinely carries an API key in its query.
+	// pkg/ddns holds that end up: validateCheckIPURL redacts through
+	// config.RedactURL, doRequest renders transport errors through
+	// scrubURLError, and the redirect refusals name only hostnames. Never build
+	// this key (or any log attr) from a raw provider URL.
 	checkIPProbeWarned sync.Map
 	// checkIPNoURLWarned dedups the once-per-provider runtime log emitted when a
 	// binding selects `address-source checkip` but the referenced provider

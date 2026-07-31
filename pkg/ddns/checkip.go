@@ -2,6 +2,7 @@ package ddns
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/netip"
@@ -78,7 +79,13 @@ func CheckIP(ctx context.Context, client *http.Client, urlStr string, wantV4 boo
 	}
 	req, err := http.NewRequest(http.MethodGet, urlStr, nil)
 	if err != nil {
-		return netip.Addr{}, false, fmt.Errorf("ddns checkip: build request: %w", err)
+		// Unreachable in practice — validateCheckIPURL above already parsed this
+		// exact string and the method is a constant — but http.NewRequest fails
+		// by returning url.Parse's *url.Error VERBATIM, raw query and all, so
+		// render it through the same redaction rather than leaving a %w that
+		// would leak a checkip-url API key if the branch ever did fire.
+		return netip.Addr{}, false, fmt.Errorf("ddns checkip: build request for url %q: %s",
+			config.RedactURL(urlStr), urlParseCause(err))
 	}
 	req.Header.Set("User-Agent", "xpf-ddns/1.0")
 	code, body, err := doRequest(ctx, client, req)
@@ -315,16 +322,53 @@ const AddressSourceCheckIP AddressSource = "checkip"
 // case-INSENSITIVE per RFC 3986 §3.1 ("HTTPS://host" is valid), so it parses
 // first and compares the parsed scheme with EqualFold rather than a
 // case-sensitive HasPrefix on the raw string (#2842).
+//
+// SECURITY: the error NEVER embeds the raw URL. Since #6545 the daemon observer
+// (pkg/daemon/daemon_ddns_surface_a.go) LOGS this error and uses its text as a
+// dedup map key, and a checkip-url routinely carries an API key in its query
+// ("https://checkip.example/?apikey=SECRET") or its userinfo. Every message
+// below therefore renders the URL through config.RedactURL, which strips the
+// userinfo and the whole query while keeping scheme/host/path so the line stays
+// diagnostic. That is the same discipline backend_generic.go applies to
+// url-template and doRequest applies to transport errors.
 func validateCheckIPURL(u string) error {
+	safe := config.RedactURL(u)
 	parsed, err := url.Parse(u)
 	if err != nil {
-		return fmt.Errorf("ddns checkip: url %q is not a valid URL: %w", u, err)
+		// Render the parse failure's CAUSE as a plain string and drop the %w
+		// wrap: url.Parse returns a *url.Error whose Error() re-embeds the FULL
+		// raw input, query included, so wrapping it (with %w or %v) would put
+		// the credential straight back into the message the redaction above just
+		// cleaned. scrubURLError is deliberately not reused here — it recovers a
+		// safe URL by RE-PARSING ue.URL, and this URL is precisely the one that
+		// does not parse, so it would fall through to the raw string.
+		return fmt.Errorf("ddns checkip: url %q is not a valid URL: %s", safe, urlParseCause(err))
 	}
 	if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
-		return fmt.Errorf("ddns checkip: url %q must be http(s)", u)
+		return fmt.Errorf("ddns checkip: url %q must be http(s)", safe)
 	}
 	if parsed.Host == "" {
-		return fmt.Errorf("ddns checkip: url %q has no host", u)
+		return fmt.Errorf("ddns checkip: url %q has no host", safe)
 	}
 	return nil
+}
+
+// urlParseCause renders WHY url.Parse rejected an input without the *url.Error
+// wrapper that carries the raw input string. url.Parse always fails with a
+// *url.Error{Op: "parse", URL: <raw input>, Err: <cause>}, and only the wrapper
+// holds the input: the causes are fixed sentences ("missing protocol scheme",
+// "first path segment in URL cannot contain colon", "net/url: invalid control
+// character in URL") or quote at most the offending fragment from the authority
+// ("invalid URL escape \"%zz\"", "invalid character \"x\" in host name") — never
+// the query string where the credential lives.
+//
+// A non-*url.Error cannot come from url.Parse, so the fallback is unreachable
+// today; it returns a fixed phrase rather than err.Error() so a future stdlib
+// error shape cannot silently reintroduce the leak this function exists to stop.
+func urlParseCause(err error) string {
+	var ue *url.Error
+	if errors.As(err, &ue) && ue.Err != nil {
+		return ue.Err.Error()
+	}
+	return "malformed URL"
 }

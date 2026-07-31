@@ -62246,3 +62246,72 @@ break — `go vet` confirmed passing under every revert.
     backend_http_sourcebind_2846_test.go,redirect_crosshost_6545_test.go,
     README.md}, pkg/daemon/{daemon_ddns_surface_a.go,
     daemon_ddns_checkip_probe_warn_6545_test.go}, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6545 review fold (security MINOR) — a malformed `checkip-url`
+  wrote its credential to the journal in cleartext. #6545 made
+  `CheckIP`/`CheckIPBound` RETURN the reason a probe failed so a permanently
+  misconfigured `checkip-url` stops masquerading as a transient miss; the daemon
+  observer logs that reason as a `slog.Warn` attribute AND retains its text as
+  the `checkIPProbeWarned` dedup map key. `validateCheckIPURL` built all three
+  refusal messages by interpolating the RAW url with `%q`, so the new
+  operator-visible signal emitted e.g. `ddns checkip: url
+  "ftp://checkip.example/?apikey=SECRET" must be http(s)` — a per-account API key
+  in journald (and in any configured remote syslog), plus the same string
+  resident in daemon memory as a map key for the process lifetime. A keyed
+  checkip endpoint is ordinary, and every sibling in this package already
+  redacts: `backend_generic.go` runs `url-template` through `config.RedactURL`,
+  `doRequest` runs transport errors through `scrubURLError`,
+  `DDNSProvider.String()` redacts `checkip-url` itself. The validator was the
+  hole. Verified firsthand before folding: `pkg/ddns/checkip.go` 321/324/327
+  interpolated `u`; `CheckIP` returned it at :77; `CheckIPBound` forwarded it at
+  :131; `pkg/daemon/daemon_ddns_surface_a.go` :467 built the key from
+  `cerr.Error()` and :468 logged `"err", cerr`.
+  **Fix**: all three branches now render `config.RedactURL(u)` (strips userinfo
+  and the entire query, keeps scheme/host/path so the line stays diagnostic).
+  The parse-failure branch additionally DROPS the `%w` wrap — `url.Parse` fails
+  with a `*url.Error` whose `Error()` re-embeds the full raw input, query
+  included, so wrapping it would have defeated the redaction; a new
+  `urlParseCause` helper renders only the inner cause, which is a fixed sentence
+  ("missing protocol scheme", "net/url: invalid control character in URL") or at
+  most the offending authority fragment (`invalid URL escape "%zz"`), never the
+  query. Verified that shape firsthand against the stdlib rather than assuming
+  it. `scrubURLError` is deliberately NOT reused: it recovers a safe URL by
+  RE-PARSING `ue.URL`, and this is precisely the URL that does not parse, so it
+  would have fallen through to the raw string. The adjacent unreachable
+  `http.NewRequest` error (same leak class — `http.NewRequest` returns
+  `url.Parse`'s `*url.Error` verbatim) is redacted the same way rather than left
+  as a latent `%w`. The dedup map key is fixed at the source (it is derived from
+  the error text); a comment on `checkIPProbeWarned` states the invariant that
+  every checkip-path error must be credential-free before it can be a key. Also
+  redacted the pre-existing commit-time twin at
+  `pkg/config/compiler_validate_warn_ddns.go` :408, which interpolated raw
+  `p.CheckIPURL` while the `url-template` warning three lines above it already
+  used `RedactURL`.
+  **Validation**: RED-on-revert proven in a THROWAWAY detached worktree
+  (`/dev/shm/probe-6594`, never the PR worktree — a reviewer is reading it) with
+  ONLY the production redaction reverted and the new tests kept:
+  `go build ./...` and `go vet ./...` stayed CLEAN (so the red is an assertion,
+  not a build break), and all three new tests failed by assertion naming the
+  leaked sentinel. Over-reach guards stayed GREEN under that revert —
+  `TestCheckIPValidURLStillAccepted` (a credentialed but VALID checkip-url must
+  still be accepted; redacting before parsing would refuse every keyed
+  endpoint), plus the PR's existing `TestCheckIPProbeFailureIsWarnedOnce`,
+  `TestCheckIPProbeWarnReArmsOnDifferentError`, `TestCheckIPNoAddressDoesNotWarn`,
+  `TestCheckIPRejectsMalformedURL`, `TestValidateCheckIPURL`,
+  `TestP3CheckIPURLMalformedWarns`. New tests plant a distinctive sentinel in the
+  position an operator's key occupies and cover ALL THREE refusal branches in
+  both the query and userinfo shapes: the daemon one renders the WHOLE slog
+  record through a real `slog.NewTextHandler` (the sibling
+  `recordingSlogHandler` records only `Record.Message`, so it cannot see the
+  leak, which lives in the attrs) and separately walks `checkIPProbeWarned` to
+  assert no KEY carries the sentinel. Each asserts the warning actually fired
+  first, so a zero-hit is never vacuous. `gofmt -l` clean on every touched file;
+  `go build ./...`, `go vet ./pkg/ddns/ ./pkg/config/ ./pkg/daemon/`, and the
+  FULL `go test ./...` suite green (59 packages ok, exit 0). No cluster smoke:
+  control-plane logging hygiene only, no dataplane or HA path touched.
+- **File(s)**: pkg/ddns/{checkip.go,checkip_url_redaction_6545_test.go,README.md},
+    pkg/config/{compiler_validate_warn_ddns.go,
+    compiler_warn_checkip_redaction_6545_test.go},
+    pkg/daemon/{daemon_ddns_surface_a.go,
+    daemon_ddns_checkip_warn_redaction_6545_test.go}, _Log.md
