@@ -110,10 +110,12 @@ const (
 	// constant per call buys nothing and only lengthens the time the mutex is
 	// held on the client-facing packet path. Leftover expired slots are inert
 	// (matches re-checks the expiry, occupancy excludes them) and are reclaimed
-	// by subsequent inserts: each drains up to this many while the eviction
-	// loop frees one more, so a backlog clears at ~65 slots per admitted
-	// packet — a full 131072-slot ring inside a few seconds at the default
-	// rate, without ever stalling a single packet.
+	// by subsequent inserts: each drains up to this many and then adds one, so
+	// the raw ring count falls by 63 per admitted packet. (NOT 65 — after any
+	// positive drain `count < capacity`, so the eviction loop below cannot run
+	// and frees nothing; see its early return.) A full 131072-slot ring still
+	// clears inside a few seconds at the default rate, without ever stalling a
+	// single packet.
 	maxDrainPerInsert = 64
 )
 

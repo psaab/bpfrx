@@ -382,8 +382,9 @@ cover different cases:
 
 `insert` needs exactly one free slot, so reclaiming more per call buys nothing.
 Leftover expired slots are inert — `matches` re-checks the expiry and
-`PendingSize` excludes them — and later inserts clear the backlog at ~65 slots
-per admitted packet. `TestPendingTable_FullDrainIsConstantTime` and
+`PendingSize` excludes them — and later inserts clear the backlog at a net 63
+slots per admitted packet (64 drained, one added; the eviction loop cannot run
+after a positive drain, because `count < capacity` by then). `TestPendingTable_FullDrainIsConstantTime` and
 `TestPendingTable_PartialDrainIsBounded` pin the two cases by counting slots
 examined; the latter must **stagger** expiries, because a frozen clock makes
 every slot expire together and the mixed case unconstructible.
