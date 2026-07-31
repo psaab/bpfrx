@@ -26,19 +26,21 @@
 //   - TestGRPCAPINeverUnwrapsSecretCleartext pins the structural reason the
 //     sweep finds only one class of leak: every operator secret except the SNMP
 //     community is a config.Secret, whose String() masks it under %s/%v/%q/%x
-//     (#2053). It checks the TWO ways to defeat that — the Reveal() accessor
-//     and a plain string()/[]byte() CONVERSION, which works because Secret is a
-//     named string type — and covers the render paths the sweep cannot drive
-//     in-process (a nil dataplane / IPsec manager / FRR short-circuits some
-//     renderers before they format anything). Its scope and its residuals are
-//     documented in full on the test itself; it does not claim completeness.
+//     (#2053). It reports two things a renderer can do to get past that — name
+//     the Reveal accessor, or hand a Secret field to a one-argument call — and
+//     covers the render paths the sweep cannot drive in-process (a nil
+//     dataplane / IPsec manager / FRR short-circuits some renderers before they
+//     format anything). It is SYNTACTIC and therefore has a hard limit, stated
+//     on the test itself; it does not claim completeness.
 //
-//   - TestSecretUnwrapScannerDetectsBothForms proves that guard can FAIL. A
-//     structural scan reporting "no violations" is worthless until someone has
-//     shown it fires, and an earlier revision of this file demonstrated exactly
-//     that: the Reveal() branch sat behind an argument-count gate that a
-//     zero-argument method call never satisfies, so it was unreachable dead
-//     code while the suite stayed green.
+//   - TestSecretUnwrapScannerDetectsBothForms and TestSecretFieldHarvestShapes
+//     prove that guard can FAIL, for the scan and the field harvest
+//     respectively. A structural check reporting "no violations" is worthless
+//     until someone has shown it fires. That is not hypothetical here: this
+//     scan shipped twice with shapes it claimed to cover producing no finding —
+//     once with the Reveal branch behind an argument-count gate a zero-argument
+//     method call never satisfies, and once blind to every parenthesized
+//     callee. Both times the suite was green.
 package grpcapi
 
 import (
@@ -48,6 +50,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -560,41 +563,76 @@ func dispatcherTopics(t *testing.T) []string {
 // revision of this file became unreachable dead code while still reporting
 // PASS.
 //
-// SCOPE — these are the two DETECTED forms, not an exhaustive list of ways a
-// Secret can be unwrapped. Stating it that way matters: a guard that
-// overstates its reach is worse than one that admits its limits, because it
-// reads as covered.
+// SCOPE, and the HARD LIMIT.
 //
-// The Reveal half is name-based and shape-independent (it matches the
-// selection, so calls, parenthesized calls and method values all register).
-// The conversion half is SYNTACTIC: it de-parenthesizes the callee, then
-// resolves the converted expression to its trailing identifier and matches
-// that against the Secret-bearing field names declared at file scope in
-// pkg/config.
+// This guard is SYNTACTIC. It reads the AST; it does not resolve types. That
+// is not a temporary state to be patched away — it is a ceiling, and four
+// review rounds were spent discovering it one shape at a time. The honest
+// statement of what it can and cannot do follows, and the ceiling is the
+// important half.
 //
-// NOT DETECTED — known residuals, each of which would need type resolution:
+// WHAT IT DETECTS
 //
-//   - a conversion of a local variable assigned from a secret field earlier
-//     (`s := gw.PSK; _ = string(s)`), a function parameter, or a helper return;
-//   - a Secret-bearing field declared outside pkg/config, or reached through a
-//     type alias;
-//   - non-conversion unwrapping: `append(dst, secret...)`, `copy(dst, secret)`,
-//     indexing or ranging the string, or reflection.
+//  1. Any SELECTION named Reveal. Matching the selection rather than the call
+//     covers `x.PSK.Reveal()`, `(x.PSK.Reveal)()`, a method value
+//     `reveal := x.PSK.Reveal`, a method expression, an interface call and a
+//     promoted embedded method, uniformly and without shape enumeration.
+//
+//  2. A ONE-ARGUMENT call whose argument names a Secret-bearing field. It does
+//     NOT inspect the callee. Earlier revisions matched callee shapes —
+//     `string`, `(string)`, `((string))`, `[]byte`, `[](byte)`, `([](byte))` —
+//     and each fix was blind to one more, because the callee of a conversion
+//     is a TYPE EXPRESSION whose grammar is open: `type Clear string;
+//     Clear(x.PSK)` unwraps the secret and no builtin-name matching ever sees
+//     it. Ignoring the callee closes that whole dimension at once.
+//
+// Two dimensions ARE closed exhaustively, by enumerating go/ast node kinds
+// rather than source shapes: parenthesization (nothing about the callee is
+// examined) and the argument's wrapper chain (secretExprTail enumerates every
+// expression node that designates the same value — paren, star, index, index
+// list, slice, type assertion, address-of).
+//
+// # THE HARD LIMIT — INDIRECTION THROUGH A VALUE
+//
+// The check fires on the SYNTAX at the point of use, so it sees a secret only
+// where the field is named. It cannot follow a value:
+//
+//   - `s := gw.PSK; _ = string(s)` — a local, a parameter, or a helper return;
+//   - a Secret-bearing field declared outside pkg/config, or behind a type
+//     alias, so the harvest never learns its name;
+//   - a handoff to a MULTI-argument call (`leak(ctx, x.PSK)`). One argument is
+//     a deliberate line, not an oversight: the safe idiom
+//     `fmt.Fprintf(buf, "%s", x.PSK)` is multi-argument and redacts correctly,
+//     so flagging it would fire on every correct render and be tuned out. A
+//     helper that unwraps internally is caught at ITS unwrap site if it lives
+//     in this package, and is out of scope if it does not;
+//   - `append(dst, secret...)`, `copy(dst, secret)`, ranging or reflection.
+//
+// Closing these needs real type resolution (go/types via
+// golang.org/x/tools/go/packages, today only an INDIRECT dependency), or
+// inverting the check to flag every conversion in the package against an
+// explicit allowlist — 42 conversions in pkg/grpcapi as of this commit, so
+// feasible but it puts test scaffolding into production source. The clean
+// structural fix is upstream: making config.Secret a struct rather than a
+// named string type would make `string(s)` fail to COMPILE and collapse this
+// entire shape space to the single Reveal accessor. That is a pkg/config-wide
+// change (Secret is currently comparable and used as a map key), so it belongs
+// in its own issue, not here.
 //
 // FALSE POSITIVES — by design, and the right bias on a network-exposed
-// surface, but disclosed rather than discovered:
+// surface, but disclosed rather than left to be discovered:
 //
-//   - ANY method named Reveal is flagged, whatever its receiver type — this
-//     guard does not resolve types, so an unrelated Reveal() would register;
-//   - the conversion check matches a trailing IDENTIFIER, so an unrelated
+//   - EVERY selector named Reveal is flagged, whatever it selects — a method
+//     on an unrelated type, a package member, even a struct field called
+//     Reveal. No type resolution, so no way to tell them apart;
+//   - the one-argument check matches a trailing IDENTIFIER, so an unrelated
 //     local, parameter or field that merely shares a name with a Secret field
-//     (`Password`, `PSK`) is flagged too — it is not limited to real fields;
-//   - a conversion using a locally shadowed `string`, `byte`, `rune`, `uint8`
-//     or `int32` identifier is flagged as if it were the builtin.
+//     (`Password`, `PSK`) is flagged — it is not limited to real fields;
+//   - any one-argument call is flagged, including provably harmless ones such
+//     as `len(x.PSK)`, which cannot carry a secret in its int result.
 //
-// All three are cheap to justify in review; a missed credential is not.
-// Closing the direct-field path closes the realistic renderer mistake — the
-// rest is a documented residual, not a claim of completeness.
+// All are cheap to justify in review; a missed credential is not. There are
+// zero such sites in pkg/grpcapi today.
 func TestGRPCAPINeverUnwrapsSecretCleartext(t *testing.T) {
 	secretFields := secretTypedFieldNames(t)
 
@@ -661,22 +699,22 @@ func TestSecretUnwrapScannerDetectsBothForms(t *testing.T) {
 		{
 			name: "string conversion",
 			src:  "package p\nfunc f(x T) { _ = string(x.PSK) }\n",
-			want: `converts the config.Secret field "PSK" with string(...)`,
+			want: `field "PSK" to string(...)`,
 		},
 		{
 			name: "byte slice conversion",
 			src:  "package p\nfunc f(x T) { _ = []byte(x.PSK) }\n",
-			want: `"PSK" with []byte(...)`,
+			want: `"PSK" to []byte(...)`,
 		},
 		{
 			name: "rune slice conversion",
 			src:  "package p\nfunc f(x T) { _ = []rune(x.PSK) }\n",
-			want: `"PSK" with []rune(...)`,
+			want: `"PSK" to []rune(...)`,
 		},
 		{
 			name: "uint8 slice conversion",
 			src:  "package p\nfunc f(x T) { _ = []uint8(x.PSK) }\n",
-			want: `"PSK" with []uint8(...)`,
+			want: `"PSK" to []uint8(...)`,
 		},
 		{
 			name: "conversion nested in a call argument",
@@ -706,17 +744,17 @@ func TestSecretUnwrapScannerDetectsBothForms(t *testing.T) {
 		{
 			name: "parenthesized string conversion",
 			src:  "package p\nfunc f(x T) { _ = (string)(x.PSK) }\n",
-			want: `"PSK" with string(...)`,
+			want: `"PSK" to (string)(...)`,
 		},
 		{
 			name: "parenthesized byte slice conversion",
 			src:  "package p\nfunc f(x T) { _ = ([]byte)(x.PSK) }\n",
-			want: `"PSK" with []byte(...)`,
+			want: `"PSK" to ([]byte)(...)`,
 		},
 		{
 			name: "doubly parenthesized conversion",
 			src:  "package p\nfunc f(x T) { _ = ((string))(x.PSK) }\n",
-			want: `"PSK" with string(...)`,
+			want: `"PSK" to ((string))(...)`,
 		},
 		{
 			name: "parenthesized conversion argument",
@@ -731,6 +769,72 @@ func TestSecretUnwrapScannerDetectsBothForms(t *testing.T) {
 			name: "Reveal bound as a method value",
 			src:  "package p\nfunc f(x T) { reveal := x.PSK.Reveal; _ = reveal() }\n",
 			want: "Reveal()",
+		},
+
+		// Callee shapes. Since the check no longer inspects the callee, these
+		// all take one code path — but they are enumerated anyway because they
+		// are the contract, and four review rounds were lost to exactly these
+		// shapes escaping one at a time.
+		{
+			name: "slice element type parenthesized",
+			src:  "package p\nfunc f(x T) { _ = [](byte)(x.PSK) }\n",
+			want: `"PSK"`,
+		},
+		{
+			name: "slice type and element both parenthesized",
+			src:  "package p\nfunc f(x T) { _ = ([](byte))(x.PSK) }\n",
+			want: `"PSK"`,
+		},
+		{
+			name: "parenthesized rune element",
+			src:  "package p\nfunc f(x T) { _ = [](rune)(x.PSK) }\n",
+			want: `"PSK"`,
+		},
+		{
+			name: "parenthesized uint8 element",
+			src:  "package p\nfunc f(x T) { _ = [](uint8)(x.PSK) }\n",
+			want: `"PSK"`,
+		},
+		// The escape no callee-shape matching can ever close: a conversion to
+		// a named string type declared anywhere. This is why the check stopped
+		// inspecting the callee.
+		{
+			name: "conversion to a named string type (type Clear string)",
+			src:  "package p\nfunc f(x T) { _ = Clear(x.PSK) }\n",
+			want: `"PSK"`,
+		},
+		{
+			name: "conversion to a package-qualified named type",
+			src:  "package p\nfunc f(x T) { _ = other.Clear(x.PSK) }\n",
+			want: `"PSK"`,
+		},
+
+		// Argument shapes — the dimension that IS still gated, on
+		// secretExprTail's exhaustive wrapper enumeration.
+		{
+			name: "sliced field",
+			src:  "package p\nfunc f(x T) { _ = string(x.PSK[:]) }\n",
+			want: `"PSK"`,
+		},
+		{
+			name: "sliced field with bounds",
+			src:  "package p\nfunc f(x T) { _ = string(x.PSK[1:2]) }\n",
+			want: `"PSK"`,
+		},
+		{
+			name: "address-of field",
+			src:  "package p\nfunc f(x T) { _ = string(*&x.PSK) }\n",
+			want: `"PSK"`,
+		},
+		{
+			name: "type-asserted field",
+			src:  "package p\nfunc f(x T) { _ = string(x.PSK.(S)) }\n",
+			want: `"PSK"`,
+		},
+		{
+			name: "pointer deref of an indexed collection field",
+			src:  "package p\nfunc f(x T) { _ = []byte(*x.APIKeys[i]) }\n",
+			want: `"APIKeys"`,
 		},
 	}
 
@@ -755,18 +859,111 @@ func TestSecretUnwrapScannerDetectsBothForms(t *testing.T) {
 		})
 	}
 
-	// Negative control: a clean render must NOT be flagged, or the guard is a
-	// blanket alarm that reviewers learn to ignore.
-	t.Run("clean render is not flagged", func(t *testing.T) {
+	// Negative controls. Without these the scanner could pass every case above
+	// by flagging unconditionally, and a guard that fires on correct code is
+	// one reviewers learn to ignore.
+	for _, tc := range []struct {
+		name string
+		src  string
+	}{
+		{
+			// THE canonical safe render: multi-argument, and String() redacts.
+			name: "formatted with %s is safe",
+			src:  "package p\nfunc f(x T) { fmt.Fprintf(buf, \"psk %s\\n\", x.PSK) }\n",
+		},
+		{
+			name: "unrelated single-argument conversion",
+			src:  "package p\nfunc f(x T) { _ = string(x.Hostname) }\n",
+		},
+		{
+			name: "presence check is not an unwrap",
+			src:  "package p\nfunc f(x T) bool { return x.PSK != \"\" }\n",
+		},
+	} {
+		t.Run("SAFE: "+tc.name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "synthetic.go", tc.src, 0)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if finds := scanSecretUnwraps(fset, file, "synthetic.go", secretFields); len(finds) != 0 {
+				t.Errorf("%s must NOT be flagged; got %d finding(s): %v",
+					tc.name, len(finds), finds)
+			}
+		})
+	}
+}
+
+// TestSecretFieldHarvestShapes proves the harvest half of the guard finds
+// Secret-bearing fields through the declaration shapes it claims to cover. The
+// live pkg/config tree exercises only a few of these today, so without
+// synthetic sources the widened harvest would be asserted but untested — the
+// same gap that let the scanner's parenthesized shapes ship unnoticed.
+func TestSecretFieldHarvestShapes(t *testing.T) {
+	cases := []struct {
+		name string
+		decl string
+		want string
+	}{
+		{"plain field", "type A struct{ PSK Secret }", "PSK"},
+		{"parenthesized type", "type A struct{ PSK (Secret) }", "PSK"},
+		{"slice of Secret", "type A struct{ APIKeys []Secret }", "APIKeys"},
+		{"array of Secret", "type A struct{ Keys [4]Secret }", "Keys"},
+		{"pointer to Secret", "type A struct{ PSK *Secret }", "PSK"},
+		{"map value Secret", "type A struct{ M map[string]Secret }", "M"},
+		{"channel of Secret", "type A struct{ C chan Secret }", "C"},
+		{"embedded Secret", "type A struct{ Secret }", "Secret"},
+		{"nested anonymous struct", "type A struct{ Inner struct{ Token Secret } }", "Token"},
+		{"slice of anonymous struct", "type A struct{ Rows []struct{ Token Secret } }", "Token"},
+		{"pointer to anonymous struct", "type A struct{ P *struct{ Token Secret } }", "Token"},
+		{"map value anonymous struct", "type A struct{ M map[string]struct{ Token Secret } }", "Token"},
+		{"map KEY anonymous struct", "type A struct{ M map[struct{ Token Secret }]bool }", "Token"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "s.go", "package config\n"+tc.decl+"\n", 0)
+			if err != nil {
+				t.Fatalf("parse %q: %v", tc.decl, err)
+			}
+			got := map[string]bool{}
+			for _, decl := range file.Decls {
+				gen, ok := decl.(*ast.GenDecl)
+				if !ok || gen.Tok != token.TYPE {
+					continue
+				}
+				for _, spec := range gen.Specs {
+					if ts, ok := spec.(*ast.TypeSpec); ok {
+						collectSecretFieldNames(ts.Type, got)
+					}
+				}
+			}
+			if !got[tc.want] {
+				t.Errorf("harvest missed %q in %s — a Secret declared this way "+
+					"would not be matched by the conversion check, so unwrapping "+
+					"it would go unreported. Got: %v", tc.want, tc.decl, got)
+			}
+		})
+	}
+
+	// Negative control: a plain string field must NOT be harvested, or the
+	// conversion check degenerates into flagging every field name.
+	t.Run("SAFE: plain string field is not harvested", func(t *testing.T) {
 		fset := token.NewFileSet()
-		src := "package p\nfunc f(x T) { fmt.Fprintf(buf, \"psk %s\\n\", x.PSK) }\n"
-		file, err := parser.ParseFile(fset, "synthetic.go", src, 0)
-		if err != nil {
-			t.Fatalf("parse: %v", err)
+		file, _ := parser.ParseFile(fset, "s.go",
+			"package config\ntype A struct{ Name string }\n", 0)
+		got := map[string]bool{}
+		for _, decl := range file.Decls {
+			if gen, ok := decl.(*ast.GenDecl); ok {
+				for _, spec := range gen.Specs {
+					if ts, ok := spec.(*ast.TypeSpec); ok {
+						collectSecretFieldNames(ts.Type, got)
+					}
+				}
+			}
 		}
-		if finds := scanSecretUnwraps(fset, file, "synthetic.go", secretFields); len(finds) != 0 {
-			t.Errorf("formatting a Secret with %%s is SAFE (String() redacts) and "+
-				"must not be flagged; got %d finding(s): %v", len(finds), finds)
+		if got["Name"] {
+			t.Errorf("a plain string field must not be harvested; got %v", got)
 		}
 	})
 }
@@ -813,83 +1010,80 @@ func scanSecretUnwraps(fset *token.FileSet, file *ast.File, filename string, sec
 			return true
 		}
 
-		// (2) string(x.Secret) / []byte(...) / []rune(...) / []uint8(...) —
-		// config.Secret is a named string type, so a conversion yields the
-		// cleartext without ever reaching the String() redaction.
+		// (2) A single-argument call applied to a Secret field.
+		//
+		// This deliberately does NOT inspect the callee. Four rounds of review
+		// were spent patching callee SHAPES — `(string)(x)`, `((string))(x)`,
+		// `[](byte)(x)`, `([](byte))(x)` — and each fix was blind to one more,
+		// because the callee of a conversion is a TYPE EXPRESSION and the
+		// grammar of type expressions is open: `type Clear string;
+		// Clear(x.PSK)` unwraps the secret just as effectively and no amount of
+		// builtin-name matching sees it.
+		//
+		// So the callee is not the discriminator. What matters is that a
+		// Secret-typed field is handed to a one-argument call at all. Every
+		// conversion — builtin, parenthesized, aliased, or a named string type
+		// declared anywhere — is a one-argument call, so all of them land here
+		// with no shape enumeration.
+		//
+		// One argument is the right line: the SAFE and idiomatic render,
+		// `fmt.Fprintf(buf, "%s", x.PSK)`, is multi-argument and passes through
+		// String()'s redaction. Flagging it too would make this guard fire on
+		// every correct render and be tuned out.
 		call, ok := n.(*ast.CallExpr)
 		if !ok || len(call.Args) != 1 {
 			return true
 		}
-		conv := secretUnwrapConversionName(call.Fun)
-		if conv == "" {
-			return true
-		}
-		name := trailingIdent(call.Args[0])
+		name := secretExprTail(call.Args[0])
 		if name == "" || !secretFields[name] {
 			return true
 		}
 		out = append(out, secretUnwrap{
 			Where: at(call),
-			Detail: fmt.Sprintf("converts the config.Secret field %q with %s(...), "+
-				"which yields the CLEARTEXT secret (config.Secret is a named "+
-				"string type, so a conversion bypasses String())", name, conv),
+			Detail: fmt.Sprintf("passes the config.Secret field %q to %s(...). "+
+				"config.Secret is a named string type, so a conversion yields "+
+				"the CLEARTEXT secret without ever reaching the String() "+
+				"redaction", name, types.ExprString(call.Fun)),
 		})
 		return true
 	})
 	return out
 }
 
-// unwrapParens strips any number of parenthesis layers. `((string))(x)` is
-// legal Go and gofmt leaves it alone, so a single-level unwrap is not enough.
-func unwrapParens(e ast.Expr) ast.Expr {
-	for {
-		p, ok := e.(*ast.ParenExpr)
-		if !ok {
-			return e
-		}
-		e = p.X
-	}
-}
-
-// secretUnwrapConversionName returns the name of the conversion fun performs if
-// it is one that unwraps a string-kinded value, else "". The callee is
-// de-parenthesized first: `(string)(x.PSK)` and `([]byte)(x.PSK)` are ordinary
-// conversions that present their callee as an *ast.ParenExpr.
-func secretUnwrapConversionName(fun ast.Expr) string {
-	fun = unwrapParens(fun)
-	if id, ok := fun.(*ast.Ident); ok && id.Name == "string" {
-		return "string"
-	}
-	arr, ok := fun.(*ast.ArrayType)
-	if !ok || arr.Len != nil {
-		return ""
-	}
-	el, ok := arr.Elt.(*ast.Ident)
-	if !ok {
-		return ""
-	}
-	switch el.Name {
-	case "byte", "rune", "uint8", "int32":
-		return "[]" + el.Name
-	}
-	return ""
-}
-
-// trailingIdent returns the final identifier of a selector/index chain —
-// "PSK" for `cfg.Security.IKE.Policies[n].PSK`, "APIKeys" for
-// `cfg.....APIKeys[i]` — or "" if the expression has no such tail.
-func trailingIdent(e ast.Expr) string {
+// secretExprTail resolves an expression to the identifier it ultimately names —
+// "PSK" for `cfg.Security.IKE.Policies[n].PSK`, `(x.PSK)`, `*x.PSK`,
+// `x.PSK[:]` or `x.APIKeys[i]` — or "" if it names none.
+//
+// The wrapper cases below are an EXHAUSTIVE enumeration of the go/ast
+// expression nodes that wrap another expression while still designating the
+// same underlying value. That exhaustiveness is the point: this is one of the
+// two dimensions of this guard that CAN be closed completely, and enumerating
+// the node kinds closes it, whereas matching source shapes one at a time did
+// not. The default case returns "" — an expression kind that is not a wrapper
+// (a call, a composite literal, a binary expression) does not name a field.
+func secretExprTail(e ast.Expr) string {
 	for {
 		switch x := e.(type) {
 		case *ast.SelectorExpr:
 			return x.Sel.Name
 		case *ast.Ident:
 			return x.Name
-		case *ast.IndexExpr:
+		case *ast.ParenExpr: // (x.PSK)
 			e = x.X
-		case *ast.StarExpr:
+		case *ast.StarExpr: // *x.PSK
 			e = x.X
-		case *ast.ParenExpr:
+		case *ast.IndexExpr: // x.APIKeys[i]
+			e = x.X
+		case *ast.IndexListExpr: // generic instantiation x.F[A, B]
+			e = x.X
+		case *ast.SliceExpr: // x.PSK[:]
+			e = x.X
+		case *ast.TypeAssertExpr: // x.PSK.(T)
+			e = x.X
+		case *ast.UnaryExpr: // &x.PSK
+			if x.Op != token.AND {
+				return ""
+			}
 			e = x.X
 		default:
 			return ""
@@ -958,7 +1152,7 @@ func collectSecretFieldNames(typ ast.Expr, out map[string]bool) {
 		if typeMentionsSecret(field.Type) {
 			if len(field.Names) == 0 {
 				// Embedded field: selected by its type name.
-				if n := trailingIdent(field.Type); n != "" {
+				if n := secretExprTail(field.Type); n != "" {
 					out[n] = true
 				}
 			}
@@ -971,7 +1165,10 @@ func collectSecretFieldNames(typ ast.Expr, out map[string]bool) {
 }
 
 // structTypeOf looks through slice/array/pointer/map wrappers to the struct
-// type underneath, or nil if there is none.
+// type underneath, or nil if there is none. A map is followed on BOTH sides:
+// an anonymous struct is a legal comparable map KEY, so
+// `map[struct{ PSK Secret }]bool` carries a Secret just as
+// `map[string]struct{ PSK Secret }` does.
 func structTypeOf(e ast.Expr) *ast.StructType {
 	for {
 		switch x := e.(type) {
@@ -981,10 +1178,13 @@ func structTypeOf(e ast.Expr) *ast.StructType {
 			e = x.Elt
 		case *ast.StarExpr:
 			e = x.X
-		case *ast.MapType:
-			e = x.Value
 		case *ast.ParenExpr:
 			e = x.X
+		case *ast.MapType:
+			if st := structTypeOf(x.Key); st != nil {
+				return st
+			}
+			e = x.Value
 		default:
 			return nil
 		}
@@ -992,17 +1192,24 @@ func structTypeOf(e ast.Expr) *ast.StructType {
 }
 
 // typeMentionsSecret reports whether a type expression names Secret anywhere —
-// `Secret`, `[]Secret`, `[4]Secret`, `*Secret`, `map[string]Secret`.
+// `Secret`, `(Secret)`, `[]Secret`, `[4]Secret`, `*Secret`,
+// `map[string]Secret`, `chan Secret`. Parentheses are legal in a type
+// expression (`PSK (Secret)` is a valid field declaration that gofmt
+// preserves), so they are stripped here like everywhere else in this file.
 func typeMentionsSecret(e ast.Expr) bool {
 	switch x := e.(type) {
 	case *ast.Ident:
 		return x.Name == "Secret"
+	case *ast.ParenExpr:
+		return typeMentionsSecret(x.X)
 	case *ast.ArrayType:
 		return typeMentionsSecret(x.Elt)
 	case *ast.StarExpr:
 		return typeMentionsSecret(x.X)
 	case *ast.MapType:
 		return typeMentionsSecret(x.Value) || typeMentionsSecret(x.Key)
+	case *ast.ChanType:
+		return typeMentionsSecret(x.Value)
 	case *ast.SelectorExpr:
 		return x.Sel.Name == "Secret"
 	}

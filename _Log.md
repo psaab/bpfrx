@@ -1,3 +1,68 @@
+## 2026-07-31 — #6532 round-4 fold: stopped patching callee shapes, changed the approach
+
+- **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact, PR #6602)
+- **Action**: Codex found two more escapes on db5162267 — `[](byte)(x.PSK)` and
+  `([](byte))(x.PSK)` (the callee was de-parenthesized but `arr.Elt` was still
+  required to be an immediate Ident), and `string(x.PSK[:])` (trailingIdent did
+  not traverse SliceExpr). It also named the escape that ends the approach:
+  `type Clear string; Clear(x.PSK)` unwraps the secret and NO builtin-name
+  matching can ever see it, because a conversion's callee is a type expression
+  whose grammar is open.
+  Per the team-lead directive, stopped patching outward and changed the design:
+  the conversion check NO LONGER INSPECTS THE CALLEE AT ALL. It now fires on a
+  one-argument call whose argument names a Secret-bearing field. Every
+  conversion — builtin, parenthesized at any depth, aliased, or a named string
+  type declared anywhere — is a one-argument call, so the whole callee-shape
+  dimension collapses to zero code. One argument is a deliberate line, not an
+  oversight: the SAFE idiom `fmt.Fprintf(buf, "%s", x.PSK)` is multi-argument
+  and redacts correctly, so flagging it would fire on every correct render.
+  `secretUnwrapConversionName` and `unwrapParens` were deleted outright.
+  The remaining gated dimension — the argument's wrapper chain — is closed by
+  ENUMERATING go/ast node kinds rather than source shapes: secretExprTail now
+  handles Paren, Star, Index, IndexList, Slice, TypeAssert and address-of Unary.
+  Harvest gaps Codex flagged also fixed: typeMentionsSecret now strips parens
+  (`PSK (Secret)` is legal) and follows ChanType; structTypeOf follows map KEYS
+  as well as values (an anonymous struct is a legal comparable map key).
+  Added TestSecretFieldHarvestShapes — 13 synthetic declaration shapes plus a
+  negative control — because the harvest had been widened in prose and code but
+  never tested, the same gap that let the scanner ship blind twice.
+  STATED THE HARD LIMIT, which is the substantive answer rather than another
+  near-miss: this guard is syntactic and fires where a field is NAMED, so it
+  cannot follow a value into a local, a parameter, a helper return, an
+  out-of-package field or a multi-argument handoff, nor see append/copy/range/
+  reflection. Closing those needs go/types (x/tools is only an INDIRECT
+  dependency today) or an explicit-allowlist inversion over all 42 conversions
+  in pkg/grpcapi (measured, not estimated). Named the clean upstream fix:
+  making config.Secret a struct instead of a named string type would make
+  `string(s)` fail to COMPILE and collapse the entire shape space to the single
+  Reveal accessor — a pkg/config-wide change (Secret is comparable and used as
+  a map key), so it belongs in its own issue, not this PR.
+  Also corrected the remaining false claims: the file header no longer says
+  "the TWO ways to defeat"; the Reveal false positive is now stated as EVERY
+  selector named Reveal (package members and fields, not merely methods); and
+  the residual list no longer claims named-type conversions escape, because
+  after the redesign they do not.
+  Validation — 10 mutations, each in a throwaway detached worktree with
+  build+vet CLEAN so every red is an assertion:
+    M1 drop ParenExpr from secretExprTail   -> parenthesized_conversion_argument
+    M2 drop SliceExpr                       -> sliced_field, sliced_field_with_bounds
+    M3 drop StarExpr                        -> pointer_deref, address-of_field,
+                                               pointer_deref_of_indexed_collection
+    M4 drop IndexExpr                       -> indexed_collection_field, +deref
+    M5 drop TypeAssertExpr                  -> type-asserted_field
+    M6 drop ParenExpr from typeMentionsSecret -> parenthesized_type
+    M7 drop ChanType                        -> channel_of_Secret
+    M8 stop following map KEY               -> map_KEY_anonymous_struct
+    M9 drop embedded-field handling         -> embedded_Secret
+    M10 RESTORE callee-shape gating         -> 13 subtests RED, including both
+        named-string-type cases — the empirical proof that the redesign, not
+        another shape patch, was the necessary fix.
+  Meta-tests now run 42 subtests. Probe worktree removed; the PR worktree was
+  never used for a probe. gofmt clean, go build ./... and go vet ./... clean,
+  pkg/grpcapi + pkg/api + pkg/config + pkg/cli green.
+- **File(s)**: pkg/grpcapi/server_fabric_secret_render_6532_test.go,
+    docs/architecture.md, _Log.md
+
 ## 2026-07-31 — #6532 round-3 fold: parenthesized callees escaped the scanner
 
 - **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact, PR #6602)

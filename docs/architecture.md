@@ -200,22 +200,31 @@ editing cmdtree.
     community is a `config.Secret`, whose `String()` masks it under
     `%s`/`%v`/`%q`/`%x` (#2053) — the community is a plain string because it
     is the `Communities` map key. `TestGRPCAPINeverUnwrapsSecretCleartext`
-    asserts the two **detected** unwrapping forms are absent here: the
-    `Reveal()` cleartext accessor, and a plain
-    `string(...)`/`[]byte(...)`/`[]rune(...)`/`[]uint8(...)` **conversion**,
-    which works because `Secret` is a named string type and so never reaches
-    `String()`. Two detected forms is NOT the same as two possible forms —
-    `append(dst, secret...)`, `copy(dst, secret)`, indexing, ranging,
-    reflection, and any conversion routed through a local, a parameter or an
-    out-of-package field all remain **known residuals** that would need type
-    resolution to catch. They are enumerated on the test alongside its
-    deliberate false positives. A companion meta-test feeds the scanner
-    synthetic sources — including parenthesized callees such as
-    `(string)(x.PSK)` and `(x.PSK.Reveal)()`, which are legal Go that gofmt
-    preserves — and asserts it REPORTS each one. That meta-test is
-    load-bearing, not decorative: an all-clear from a broken scan is
-    indistinguishable from an all-clear from a clean package, and this scan
-    has twice shipped with a silently unreachable branch.
+    asserts two things are absent here: any selection named `Reveal` (the
+    cleartext accessor), and any **one-argument call** handed a
+    Secret-bearing field. The second deliberately ignores the callee —
+    matching conversion shapes (`string`, `(string)`, `[]byte`,
+    `[](byte)`, …) failed across four review rounds because a conversion's
+    callee is a type expression with open grammar, and `type Clear string;
+    Clear(x.PSK)` unwraps the secret just as well. One argument is the line
+    because the safe idiom `fmt.Fprintf(buf, "%s", x.PSK)` is
+    multi-argument and redacts correctly.
+    **This guard is syntactic and has a ceiling**, stated on the test
+    itself: it fires where a field is NAMED, so it cannot follow a value
+    into a local, a parameter, a helper return, an out-of-package field, or
+    a multi-argument handoff, nor see `append`/`copy`/ranging/reflection.
+    Closing those needs `go/types` resolution, or inverting to an
+    explicit-allowlist over all 42 conversions in the package. The clean
+    structural fix is upstream — making `config.Secret` a struct instead of
+    a named string type would make `string(s)` fail to **compile** and
+    collapse the whole shape space to the single accessor — but that is a
+    `pkg/config`-wide change (`Secret` is comparable and used as a map key)
+    and belongs in its own issue.
+    Two companion meta-tests feed the scanner and the field harvest
+    synthetic sources and assert each REPORTS every shape it claims. They
+    are load-bearing, not decorative: an all-clear from a broken check is
+    indistinguishable from an all-clear from a clean package, and this
+    check has twice shipped blind while the suite stayed green.
 - **HTTP REST** on `127.0.0.1:8080` — health, Prometheus `/metrics`,
   config endpoints, full gRPC parity.
   - **Listener lifecycle is all-or-nothing (#5058).** `Server.Run` may
