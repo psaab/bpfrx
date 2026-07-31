@@ -457,6 +457,9 @@ type fakeConn struct {
 	// the #4163 source-validation tests drive a reply from a non-configured
 	// source without disturbing the existing reply-path tests.
 	srcAddr net.Addr
+	// wake signals a blocked ReadFrom that push() queued a new datagram.
+	// Buffered depth 1; see push.
+	wake chan struct{}
 }
 
 type fakeWrite struct {
@@ -465,30 +468,58 @@ type fakeWrite struct {
 }
 
 func newFakeConn() *fakeConn {
-	return &fakeConn{closeCh: make(chan struct{})}
+	return &fakeConn{closeCh: make(chan struct{}), wake: make(chan struct{}, 1)}
 }
 
 func (f *fakeConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	f.readCalls.Add(1)
-	f.mu.Lock()
-	if len(f.pending) > 0 {
-		d := f.pending[0]
-		f.pending = f.pending[1:]
-		src := f.srcAddr
-		f.mu.Unlock()
-		n := copy(p, d)
-		if src == nil {
-			src = &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 68}
+	// Loop rather than recurse after a wake: a push that is consumed by a
+	// racing reader leaves this reader to block again, and iteration keeps
+	// that bounded by the stack the caller already has.
+	for {
+		f.mu.Lock()
+		if len(f.pending) > 0 {
+			d := f.pending[0]
+			f.pending = f.pending[1:]
+			src := f.srcAddr
+			f.mu.Unlock()
+			n := copy(p, d)
+			if src == nil {
+				src = &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 68}
+			}
+			return n, src, nil
 		}
-		return n, src, nil
+		rerr := f.readErr
+		f.mu.Unlock()
+		if rerr != nil {
+			return 0, nil, rerr
+		}
+		// Nothing queued: block until Close (the pre-existing behavior every
+		// pre-seeding test relies on) OR until push() queues a datagram
+		// mid-flight. The wake path exists for the #6562 end-to-end exchange
+		// test, which must inject a server reply only AFTER the request it
+		// answers has been relayed — a reply pre-seeded before the session
+		// starts would race the binding.
+		select {
+		case <-f.closeCh:
+			return 0, nil, net.ErrClosed
+		case <-f.wake:
+		}
 	}
-	rerr := f.readErr
+}
+
+// push queues a datagram for a subsequent ReadFrom and wakes a reader that is
+// already blocked. The wake channel is buffered depth 1 and the send is
+// non-blocking, so a push that races a reader already draining pending cannot
+// deadlock: the queued datagram is picked up by the next read either way.
+func (f *fakeConn) push(d []byte) {
+	f.mu.Lock()
+	f.pending = append(f.pending, d)
 	f.mu.Unlock()
-	if rerr != nil {
-		return 0, nil, rerr
+	select {
+	case f.wake <- struct{}{}:
+	default:
 	}
-	<-f.closeCh
-	return 0, nil, net.ErrClosed
 }
 
 func (f *fakeConn) WriteTo(p []byte, addr net.Addr) (int, error) {

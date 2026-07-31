@@ -62573,6 +62573,337 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/cluster/{election.go,ifmon_weight_daemon_apply_6549_test.go},
     pkg/routing/monitor.go, _Log.md
 
+- **Timestamp**: 2026-07-31
+- **Action**: #6562 (dhcprelay security) — bind every relayed reply to an
+  outstanding request, and REFUSE DHCPFORCERENEW. Two defects, two gates.
+
+  DEFECT 1: `handleServerResponses` forwarded any well-formed BOOTREPLY that
+  passed the #4163 source-IP allow-list. A source IP is spoofable, so an
+  off-path attacker forging a configured server's address could inject an
+  OFFER/ACK (hostile gateway/DNS) or a NAK (forced client restart). FIX: new
+  `pending.go` — a bounded, expiring table of outstanding transactions. The
+  client loop inserts a key BEFORE the upstream write (the reply loop is a
+  different goroutine; a post-send insert races a fast server's OFFER); the
+  reply loop forwards OFFER/ACK/NAK only on a match. Key is xid + chaddr:
+  RFC 2131 §4.3.1 Table 3 requires a server to copy BOTH from the client's
+  message, and the relay's own mutations (hops/giaddr/Option 82) touch
+  neither. Option 61 deliberately NOT keyed — RFC 2131 told servers they MUST
+  NOT echo it and only RFC 6842 §3 reversed that, so keying on it would drop
+  every reply from a pre-6842 server. Cap 8192, TTL 30s, evict-OLDEST (not
+  drop-new: drop-new lets an attacker who fills the table lock out every new
+  client; eviction can only cause a drop, never an accept, so it trades away
+  no security). A match does NOT consume the entry — the relay fans out to
+  every server in the group, so one DISCOVER draws N OFFERs, and RFC 2131
+  §4.4.1 has the SELECTING REQUEST reuse the OFFER's xid. Table lives on
+  interfaceRelay so a #2347/#3960 session rebuild does not strand a client.
+
+  DEFECT 2: FORCERENEW was forwarded unauthenticated (#2645 reasoned RFC 3118
+  auth is end-to-end and out of scope for a relay). REVERSED. RFC 3203 §6 —
+  NOT §5, which is IANA Considerations; the issue and a stale code comment
+  both mis-cited it — makes authentication a MUST precisely because
+  "FORCERENEW can be used to snoop and spoof traffic". A relay cannot
+  discharge that MUST: RFC 3118 §5.2 puts the secret between source and
+  destination, §3 casts the relay as a transparent mutator excluded from the
+  hash, and §5.3 assigns validation to the receiver. An Option-90 PRESENCE
+  check would be theater — the same spoofing attacker supplies the option.
+  Refusal is a handled condition, not an outage: RFC 3203 §2.2 defines server
+  retransmission on loss, and T1/T2 renewal is untouched. No opt-in knob.
+
+  OBSERVABILITY (the fail direction matters more than usual here — an
+  over-strict binding silently breaks DHCP for real clients): three new
+  counters on RelayStats + `show services dhcp relay` —
+  RepliesDroppedNoRequest, PendingEvicted (early warning that the table is at
+  capacity and legitimate bindings are being lost), RepliesDroppedForceRenew.
+  Both new drop paths log warn-once-then-Debug. A nil table fails CLOSED,
+  matching the #4163 empty-allow-set posture.
+
+  VALIDATION: fail-on-revert proven SEPARATELY for both defects, each an
+  ASSERTION failure with `go vet` clean (no build break). Disabling only the
+  binding gate → NoOutstandingRequestDropped + WrongChaddrDropped RED,
+  ForceRenewRefused GREEN. Restoring the FORCERENEW forward → ForceRenewRefused
+  RED, binding tests GREEN. OVER-REACH GUARD
+  TestRelay_NormalExchange_EndToEndStillRelays drives DISCOVER/OFFER,
+  REQUEST/ACK, RENEW and REBIND through the LIVE manager (bindings created by
+  production code, not a test helper) and stayed GREEN under both reverts.
+  Required a `fakeConn.push()` wake path so a reply can be injected only after
+  the request it answers was relayed. #2645's two tests were updated: the
+  forwarded-assert became ForceRenewRefused (armed for the xid, so the refusal
+  is pinned to the message TYPE, not to a missing binding), and the
+  deliverReply-level FORCERENEW test was removed as unreachable (the matrix
+  test already covers the ciaddr row). Suites: pkg/dhcprelay, pkg/dhcp,
+  pkg/dhcpserver all PASS incl. -race; pkg/cli PASS; go build ./... clean;
+  gofmt/vet clean.
+- **File(s)**: pkg/dhcprelay/{pending.go,relay.go,README.md,
+    relay_binding_6562_test.go,delivery_test.go,relay_test.go},
+    pkg/cli/show_services_dhcp.go, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6562 / PR #6603 review fold — F1 MAJOR (pending-table capacity
+  did not track maximum-packet-rate) + F2/F3/F4/F5 MINORs.
+
+  F1 (MAJOR). `pendingCap` was a hardcoded 8192 while the fill rate is the
+  configurable #5670 `maxPacketRate` (schema 1..1000000, default 100). Steady
+  occupancy is rate x TTL, so above ~273 pps the table was CAP-BOUND and the
+  reply-binding window silently collapsed from 30s to 8192/rate seconds — and
+  README.md recommends raising maximum-packet-rate on a busy segment, steering
+  operators straight into it. At 3000 pps the window is 2.7s; a boot storm
+  against a server whose RTT exceeds that has every reply dropped at the relay,
+  turning a completing storm into a permanent retry storm. Compounding it, the
+  at-cap path did TWO full O(cap) map scans per admitted packet (reap sweep +
+  minimum-expiry scan) on the single client-facing read goroutine.
+
+  REMEDIATION: took BOTH reviewer shapes (b)+(a), not (c). (b) alone leaves the
+  window collapse — the actual availability regression — unfixed; (c) only
+  warns about it. (b) O(1) ring: every entry carries the SAME ttl, so insertion
+  order IS expiry order and the oldest is always at the ring head — no scan.
+  Duplicate inserts get a new slot; the old one is stale (map holds a later
+  expiry) and is discarded free at the head. A slot is always freed before a
+  push, so len(entries) <= count <= capacity — the ring bounds the map. (a)
+  capacity = rate*pendingTTL + relayBurstFor(rate), clamped [4096, 131072]. The
+  ceiling is mandatory: 1e6 pps x 30s is ~3e7 entries (GBs), i.e. the
+  memory-exhaustion vector the table exists not to be. Above ~4096 pps the
+  ceiling binds; that is unavoidable (window x rate IS memory) but is now
+  EXPLICIT — pendingCapacityFor reports the clamp and Apply logs a startup Warn
+  naming the effective window.
+
+  F2. Cap comment claimed "well past the default"; the real threshold was 273
+  pps = 2.73x default. Moot now that capacity is derived, but the README's
+  #5670 section gained the actual ~4096 pps ceiling threshold and a
+  cross-reference in both places that recommend raising the rate.
+
+  F3. PendingEvicted is COINCIDENT, not leading — an eviction causes the
+  subsequent drop, lead time one server RTT. Plumbed the already-existing
+  size() through as PendingSize + PendingCapacity (gauges) into RelayStats,
+  Stats() and the CLI as "Pending N/M"; corrected the README claim.
+
+  F4 (text only). The "handled condition" argument rested on RFC 3203 §2.2's
+  retransmission sentence, which describes TRANSIENT loss — here the loss is
+  PERMANENT and §2.2 itself says "The amount of retransmissions should be
+  limited", so the backoff never converges. Replaced in relay.go + README with
+  the dispositive §2.2 sentence, verified verbatim at rfc3203.txt:71: "The DHCP
+  server sends a unicast FORCERENEW message to the client." A conformant
+  unicast to the client's leased IP never lands on the relay's giaddr:67
+  socket, so refusal costs a conformant deployment NOTHING and the only
+  FORCERENEW reaching this arm is non-conformant or hostile. Also recorded that
+  the arm is belt-and-braces (a server-chosen xid matches no outstanding
+  request, so the binding gate would drop it anyway) — it buys a distinct
+  counter and log. Scoped the "must be visible" claim to the console CLI:
+  RelayStats has no gRPC/Prometheus surface (pre-existing, filed separately).
+
+  F5. fakeConn.ReadFrom no longer self-recurses after a wake; plain for loop.
+
+  VALIDATION — three revert probes, each in a THROWAWAY detached worktree at
+  the branch HEAD (never the PR worktree), each build+vet CLEAN so the red is
+  an ASSERTION: (1) capacity back to fixed 8192 -> TracksMaxPacketRate RED
+  ("a reply arriving 3s after its request no longer binds at 3000 pps
+  (capacity 8192, 9000 intervening requests, evictions 809)") + Derivation RED;
+  (2) eviction back to the O(n) minimum-expiry map scan -> AtCapInsertIsConstant
+  Time RED; (3) relay.go un-wired to a constant while pendingCapacityFor stays
+  correct -> PendingCapacityFollowsOverride RED ("capacity = 8192, want 96000").
+  Probe (2) initially PASSED — the reverted code bypasses the ring so slotScans
+  stayed 0 and sailed under the upper bound. Added a LOWER bound (>= 1 scan per
+  at-cap insert) which makes the counter's liveness part of the contract; probe
+  re-run then went RED. Over-reach guard NormalExchange_EndToEndStillRelays and
+  ForceRenewRefused stayed GREEN under all three. Suites: pkg/dhcprelay
+  -race -count=5 PASS; pkg/dhcp, pkg/dhcpserver, pkg/cli -race PASS; build,
+  gofmt, vet clean.
+- **File(s)**: pkg/dhcprelay/{pending.go,relay.go,README.md,
+    relay_binding_6562_test.go,delivery_test.go,relay_test.go},
+    pkg/cli/show_services_dhcp.go, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6562 / PR #6603 re-review fold — Codex MAJOR (a config reload
+  destroyed every live binding) + 4 MINORs.
+
+  MAJOR. Every field in relaySpec participates in equal(), so ANY day-2 change
+  to a relay group stops the relay and builds a replacement with a brand-new
+  pending table. The replacement rebinds the SAME giaddr:67, so replies for
+  pre-reload requests still ARRIVE and were then dropped by the binding gate —
+  pre-#6562 they were forwarded, so a straight availability regression. It is
+  sharpest for maximum-packet-rate, whose documented remedy is to raise it on a
+  busy segment: an operator following the docs DURING a boot storm would flush
+  every in-flight binding and cause the retry storm the table exists to
+  prevent. PROVENANCE NOTE: this was NOT introduced by the previous fold — the
+  first commit (1c071c18c:903) also built a fresh table per session; the fold
+  made it reachable via the newly-documented remedy. Fixed for ALL five spec
+  fields, not just rate. FIX: pendingTable.snapshot()/adopt() plus a phase-2.5
+  loop in Apply that runs AFTER the old relay's goroutines are joined (snapshot
+  complete, table quiescent) and BEFORE the replacement launches (nothing races
+  the destination). Adopted entries keep their ORIGINAL expiry — a reload must
+  not refresh the TTL, which would widen the xid-guessing window on every
+  commit. A SMALLER replacement (rate lowered) drops the oldest excess and
+  COUNTS them in PendingEvicted rather than discarding silently.
+
+  MINOR 1. popHeadLocked used expiry equality as slot identity. Two inserts of
+  the same key can share an expiry (time.Now() is not guaranteed to advance
+  between calls; a frozen test clock never does), so popping the OLDER slot
+  matched the map entry the NEWER slot owned and deleted a live binding. My
+  duplicate test had DODGED this by advancing the clock 1ms with a comment
+  claiming a real clock guarantees distinctness — it does not. Replaced with an
+  explicit monotonic generation counter (pendingEntry.gen / pendingSlot.gen);
+  new test uses a FROZEN clock so equal expiries are the case under test.
+
+  MINOR 2. size() returned len(entries) but capacity pressure is governed by
+  ring count. Diverges BOTH ways: expired entries linger in the map on an idle
+  relay (reads high), and duplicate inserts consume slots without adding keys
+  (reads low — a cap-4 ring holding A,B,B,B reports 2/4 yet the next insert
+  evicts live A). Split into occupancy() (ring count, drives PendingSize) and
+  liveEntries() (map count, diagnostic). Fixed the stale "pending-evicted is
+  the early warning" comment still in pkg/cli/show_services_dhcp.go.
+
+  MINOR 3. The strict "O(1) at capacity" claim was false: the reclaim loop can
+  pop up to `capacity` slots on the first insert after a long idle. Documented
+  the real bound (amortized O(1); worst case one full drain, at most once per
+  idle period) in both pending.go and README rather than adding a special-case
+  reset.
+
+  MINOR 4. The overflow test passed the untyped constant 1<<40, which fails to
+  COMPILE under GOARCH=386 ("overflows"). Verified firsthand, changed to 1<<30.
+  Added GOARCH=386 go vet to the gate.
+
+  Also added the reviewer's memory note to the README (48 B/slot -> 6 MiB ring,
+  ~18 MiB/interface at the ceiling, multiplicative across interfaces).
+
+  VALIDATION — four revert probes, each in a THROWAWAY detached worktree at the
+  branch HEAD (removed after; never the PR worktree), each build+vet CLEAN so
+  every red is an ASSERTION: (1) drop the phase-2.5 migration -> BOTH
+  RateChangePreservesBindings ("the outstanding binding was destroyed by the
+  rate change") and its _EndToEnd sibling RED; (2) slot identity back to expiry
+  equality -> EqualExpiriesDoNotLoseBinding RED; (3) occupancy back to
+  len(entries) -> OccupancyTracksRingNotMap RED ("occupancy = 2, want 4") plus
+  the EqualExpiries precondition. The end-to-end reload test needed a tracking
+  conn factory: a restart opens FRESH conns, so the original harness pair
+  belongs to the dead session, and the new pair is opened ASYNCHRONOUSLY from
+  the supervisor goroutine (hence pairAfter(t, n) rather than "latest").
+  Suites: pkg/dhcprelay -race -count=5 PASS; pkg/dhcp, pkg/dhcpserver, pkg/cli
+  -race PASS; go build ./... , gofmt, vet, GOARCH=386 vet clean.
+- **File(s)**: pkg/dhcprelay/{pending.go,relay.go,README.md,
+    relay_binding_6562_test.go}, pkg/cli/show_services_dhcp.go, _Log.md
+
+- **Timestamp**: 2026-07-31 14:55 PDT
+- **Action**: #6603 re-review fold, residual pass. Verified the previous fold
+  commit (e98510a6b) against the Codex verdict finding by finding, reproduced
+  its fail-on-revert claims independently in a throwaway detached worktree, and
+  closed the three gaps it left.
+
+  Independent revert probes (worktree /dev/shm/probe-6603g at e98510a6b, build
+  and vet CLEAN in each so every red is an assertion, worktree removed after):
+    * Neutralizing the phase-2.5 snapshot/adopt migration in Apply reds BOTH
+      TestRelay_RateChangePreservesBindings ("the outstanding binding was
+      destroyed by the rate change") and its _EndToEnd sibling, the latter
+      logging the exact predicted "dropping server reply with no outstanding
+      request" WARN. MAJOR gate confirmed.
+    * Reverting popHeadLocked slot identity from the generation counter back to
+      e.exp.Equal(s.exp) reds TestPendingTable_EqualExpiriesDoNotLoseBinding.
+    * Pointing occupancy() back at len(t.entries) reds
+      TestPendingTable_OccupancyTracksRingNotMap ("occupancy = 2, want 4").
+
+  Gaps closed in this commit:
+    * MINOR 4 was only half-folded. The previous commit made the README's O(1)
+      claim honest but added neither remedy Codex asked for. insert() now takes
+      the pathological case in CONSTANT time: the ring is expiry-ordered, so one
+      probe of the newest slot proves the whole ring is dead, and head/count
+      reset to zero with the map replaced wholesale. Previously that call popped
+      up to 131072 slots, each with a map lookup and delete, under the mutex on
+      the client-facing packet path.
+    * adopt() bounded migration by raw capacity, ignoring the destination's
+      existing count. That breaks pushLocked's documented "caller has already
+      made room" contract for a non-empty destination: count runs past the ring
+      length and the modular index overwrites live slots. Now bounded by
+      REMAINING room; identical on the production path (a fresh table), correct
+      for any caller.
+    * The CLI comment fold replaced the stale "pending-evicted is the early
+      warning" sentence but left the pre-existing paragraph that already said
+      the same thing, so the block stated the leading-indicator point twice with
+      a ragged wrap. Collapsed to one statement.
+
+  New fail-on-revert binders: TestPendingTable_FullDrainIsConstantTime (counts
+  slots examined, not time, so it cannot flake; also asserts the drain is REAL
+  and is not miscounted as a cap-pressure eviction) and
+  TestPendingTable_AdoptRespectsRemainingRoom (occupancy must not exceed
+  capacity; pre-existing destination bindings must not be clobbered).
+
+  Suites: pkg/dhcprelay -race -count=5 PASS; pkg/cli -race PASS; go build ./...,
+  vet, gofmt (dhcprelay + cli), and GOARCH=386 build+vet all clean. The repo-wide
+  gofmt -l hits are pre-existing files in other packages, none touched here.
+- **File(s)**: pkg/dhcprelay/{pending.go,README.md,relay_binding_6562_test.go},
+    pkg/cli/show_services_dhcp.go, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6562 / PR #6603 third review round — three Codex MINORs on the
+  pending ring (bounded reclaim, adopt precondition, occupancy gauge).
+
+  MINOR 1. The constant-time fast path only covers EVERY slot being expired.
+  The adjacent case — capacity-1 expired with the newest still live, i.e. a
+  quiet period then one late request — failed the probe and fell into an
+  unbounded loop popping ~131071 slots one at a time under the mutex on the
+  packet path: the same stall, narrower trigger. The guard added for the fast
+  path FROZE the clock, so every slot shared one expiry and the mixed ring was
+  unconstructible — the case could not be exercised. FIX: head drain capped at
+  maxDrainPerInsert (64). insert needs exactly ONE free slot, so more buys
+  nothing; leftovers are inert (matches re-checks expiry, occupancy excludes
+  them) and clear at ~65 slots/packet. New guard staggers expiries 1ms apart
+  and asserts the ring is MIXED as a precondition.
+
+  MINOR 2. adopt appended without merging, so migrated expiries could land
+  after a destination's later ones and break the expiry ordering every other
+  operation depends on — the full-drain probe would read a newer-but-expired
+  tail slot, conclude the ring was dead and wipe live bindings. Production
+  adopts into an empty table so this was not a live-path defect, but the doc
+  claimed correctness "for any destination", which was false. FIX: require an
+  empty destination and PANIC otherwise (a programmer-error assertion,
+  unreachable from the sole caller); doc claim corrected in pending.go and
+  README. Chose the assertion over an ordered merge: no caller needs the
+  general case and it is not worth the complexity on a security-relevant path.
+
+  MINOR 3. occupancy() returned the raw ring count, which includes the expired
+  prefix, so an idle full table reported capacity/capacity even though the next
+  insert reclaims the lot and evicts nothing — the same false-HIGH the previous
+  round fixed for len(entries), reintroduced. FIX: report unexpired slots; the
+  expired ones are a contiguous prefix (ring is expiry-ordered), so the
+  boundary is a binary search, O(log capacity) under the mutex.
+
+  SELF-CAUGHT, WORTH RECORDING: while fixing MINOR 1 I added evictHeadLocked so
+  the at-cap eviction loop would not count an expired pop as cap pressure, plus
+  a test asserting it. Mutation-testing the change showed the test could NOT
+  fail. Reachability analysis proved why: the loop needs count >= capacity, but
+  the fast path leaves count 0 and any drain leaves count = cap-d < cap, so
+  whenever the loop runs the head is unexpired BY CONSTRUCTION (d == 64 would
+  need cap-64 >= cap). The defensive check was dead logic and the test was
+  vacuous — exactly the guard-cannot-fire pattern flagged this round. REMOVED
+  both; the proof now lives in a comment in insert(), and the test was reframed
+  to pin the reachable operator-facing property (an idle relay reports no
+  evictions) with an explicit scope note that it does not bind an unreachable
+  expiry re-check.
+
+  VALIDATION — mutation proof per finding in a THROWAWAY detached worktree
+  (/dev/shm/probe-6603i, removed after), build+vet CLEAN in each so every red
+  is an ASSERTION: (1) drain bound removed -> PartialDrainIsBounded RED
+  ("examined 4095 slots (capacity 4096); per-insert reclaim must be bounded by
+  ~68"); (2) empty-destination precondition removed -> AdoptRequiresEmpty
+  Destination RED (no panic); (3) occupancy back to raw count ->
+  OccupancyExcludesExpired RED ("occupancy = 64, want 32" and "= 64, want 0"
+  wholly expired) plus PartialDrainIsBounded's mixed-ring precondition. All
+  re-verified after removing evictHeadLocked. Suites: pkg/dhcprelay
+  -race -count=5 PASS; pkg/dhcp, pkg/dhcpserver, pkg/cli -race PASS; build,
+  vet, gofmt clean.
+- **File(s)**: pkg/dhcprelay/{pending.go,README.md,relay_binding_6562_test.go},
+    _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6562 review-fold round 4 (Codex MERGE-NEEDS-MINOR, one residual —
+  the data-structure correction is CONFIRMED closed: mixed-case reclaim bounded
+  at 64 pops still leaving room for the new binding, and the fixture now
+  staggers expiries by 1ms and reaches one-live/4095-expired, failing with 4095
+  scans when the bound is removed). The residual was a documentation math error
+  in two places: `pending.go` and `README.md` both claimed a backlog clears at
+  ~65 slots per admitted packet, on the reasoning that the drain removes 64 and
+  the eviction loop frees one more. The eviction loop cannot run — after any
+  POSITIVE drain `count < capacity`, which the early return in the eviction path
+  proves. The real figure is a NET 63: 64 drained, one added. Corrected in both
+  places and stated with the reason, since the wrong number was arrived at by a
+  plausible-but-false chain that a reader would otherwise re-derive.
+- **File(s)**: pkg/dhcprelay/pending.go, pkg/dhcprelay/README.md, _Log.md
 - **Timestamp**: 2026-07-31 05:20
   - **Action**: Fold the final-review MINOR-1 on #6291 — the sizing narrative had
     been corrected from "the residual is benign" into an overstatement in the

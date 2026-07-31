@@ -137,10 +137,17 @@ func relayBurstFor(rate int) int {
 // maximum so the buffer is never the truncation point (#3012).
 const readBufSize = 65535
 
-// messageTypeForceRenew is the DHCPFORCERENEW message type (RFC 3203, §3.1).
-// The insomniacslk/dhcp library only enumerates message types 1-8, so the
-// type-9 value is defined locally. A server sends FORCERENEW to a client that
-// already holds a lease to force it back into the RENEWING state.
+// messageTypeForceRenew is the DHCPFORCERENEW message type. RFC 3203 §4
+// (Message layout) defines it — "DHCP option 53 (DHCP message type) is extended
+// with a new value: DHCPFORCERENEW (9)" — and §5 (IANA Considerations) records
+// the assignment. (An earlier comment here cited "§3.1"; §3 is the extended
+// DHCP state diagram and has no §3.1.) The insomniacslk/dhcp library only
+// enumerates message types 1-8, so the type-9 value is defined locally.
+//
+// A server sends FORCERENEW to a client that already holds a lease to force it
+// back into the RENEWING state. This relay recognizes the type in order to
+// REFUSE it (#6562) — see the reply switch in handleServerResponses for the
+// RFC 3203 §6 / RFC 3118 rationale.
 const messageTypeForceRenew = dhcpv4.MessageType(9)
 
 // startupRetryInterval is how long runRelay waits between attempts to resolve
@@ -242,6 +249,50 @@ type RelayStats struct {
 	// an unlisted source IP — either way it MUST be visible, not silent.
 	RepliesDroppedUnknownServer uint64
 
+	// RepliesDroppedNoRequest counts server replies dropped because they do not
+	// bind to an outstanding relayed request (#6562). The #4163 source-IP
+	// allow-list is spoofable, so a reply must additionally match a request the
+	// relay actually forwarded (xid + chaddr, see pending.go). A nonzero value
+	// means either an injection attempt that guessed/spoofed its way past the
+	// source check, or a LEGITIMATE reply that arrived outside the binding
+	// window — the second is a client-visible DHCP failure, so this counter
+	// MUST be watched, not assumed hostile.
+	RepliesDroppedNoRequest uint64
+
+	// RepliesDroppedForceRenew counts DHCPFORCERENEW messages refused by the
+	// relay (#6562). RFC 3203 §6 makes RFC 3118 authentication of FORCERENEW a
+	// MUST, and a relay holds no RFC 3118 key material, so it cannot discharge
+	// that MUST — it refuses rather than forwarding an unverifiable
+	// reconfigure command at its clients. A nonzero value means a server (or a
+	// spoofer) is sending FORCERENEW to relayed clients; leases still renew
+	// normally at T1/T2, and RFC 3203 §2.2 defines the server's retransmission
+	// behavior when a FORCERENEW is not answered.
+	RepliesDroppedForceRenew uint64
+
+	// PendingEvicted counts outstanding-request entries dropped by CAP PRESSURE
+	// on the #6562 pending table (not by ordinary expiry). Capacity is derived
+	// from the interface's maximum-packet-rate, so under a correctly-sized
+	// relay this stays 0; a nonzero value means the table filled anyway (the
+	// rate limiter's burst allowance, or a rate high enough that the memory
+	// ceiling clamped capacity) and legitimate replies may now be dropped for
+	// want of a binding.
+	//
+	// NOTE it is a COINCIDENT signal, not a leading one: an eviction is what
+	// CAUSES the subsequent drop, so the lead time is one server RTT. Use
+	// PendingSize/PendingCapacity for advance warning.
+	PendingEvicted uint64
+
+	// PendingSize is the CURRENT occupancy of the #6562 outstanding-request
+	// table, and PendingCapacity its ceiling. This pair is the genuine LEADING
+	// indicator (#6603 review F3): occupancy climbing toward capacity means the
+	// relay is about to start evicting bindings and dropping legitimate
+	// replies, and it is observable BEFORE any reply is lost. Alert on the
+	// ratio; PendingEvicted only rises once the damage has begun.
+	//
+	// These are gauges (instantaneous), not monotonic counters.
+	PendingSize     uint64
+	PendingCapacity uint64
+
 	// Reply-delivery breakdown (#2076). These distinguish WHY a reply was
 	// broadcast vs L2-unicast so an L2/CAP_NET_RAW/driver/MTU regression is
 	// observable in operations. RepliesBroadcastL2Fallback is the one to
@@ -336,6 +387,32 @@ type interfaceRelay struct {
 	// (#4163). It is the observability signal for a rogue-reply injection
 	// attempt (or a multi-homed server unicasting from an unlisted source IP).
 	repliesDroppedUnknownServer atomic.Uint64
+
+	// pending is the bounded outstanding-request table (#6562): the
+	// client-facing loop records every request it forwards upstream, and the
+	// server-facing loop forwards a reply only if it binds to one. It lives
+	// here rather than on the session so a session rebuild (#2347 ifindex
+	// drift / #3960 re-address) does NOT wipe in-flight bindings and strand a
+	// client mid-transaction. Always non-nil in production (set where this
+	// struct is built); a nil table fails CLOSED — see pendingTable.matches.
+	// Its capacity is derived from maxPacketRate (pendingCapacityFor).
+	pending *pendingTable
+
+	// pendingClamped records that pendingCapacityFor hit the memory ceiling,
+	// so the effective reply-binding window is shorter than pendingTTL. Set
+	// once at start; read-only thereafter. Drives the startup Warn in Apply.
+	pendingClamped bool
+
+	// repliesDroppedNoRequest counts server replies dropped because they bind
+	// to no outstanding request (#6562). Observability for a spoofed-source
+	// injection that got past #4163 — and, just as importantly, for an
+	// over-strict binding dropping legitimate replies.
+	repliesDroppedNoRequest atomic.Uint64
+
+	// repliesDroppedForceRenew counts DHCPFORCERENEW messages refused (#6562).
+	// A relay cannot perform the RFC 3118 validation RFC 3203 §6 requires, so
+	// it does not forward an unverifiable reconfigure command at its clients.
+	repliesDroppedForceRenew atomic.Uint64
 
 	// spec is the desired-config snapshot this relay was started with. Apply
 	// (#2348) compares it against the new desired spec to detect a changed
@@ -793,6 +870,11 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.DHCPRelayConfig) {
 	m.mu.Lock()
 
 	var toStop []*interfaceRelay // removed or changed: tear down
+	// replaced maps an interface name to the relay being torn down BECAUSE ITS
+	// SPEC CHANGED (not one being removed). Its outstanding-request bindings
+	// are migrated into the replacement once it has fully stopped (#6562) —
+	// see the phase-2.5 loop below.
+	replaced := make(map[string]*interfaceRelay)
 	// Remove relays that are no longer desired, or whose spec changed. A
 	// changed relay is removed here and re-added in the start loop below.
 	for name, ir := range m.relays {
@@ -807,6 +889,7 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.DHCPRelayConfig) {
 		if !ir.spec.equal(d.spec) {
 			toStop = append(toStop, ir)
 			delete(m.relays, name)
+			replaced[name] = ir
 			slog.Info("dhcp-relay: restarting (config changed)",
 				"interface", name,
 				"old_servers", ir.spec.servers, "new_servers", d.spec.servers,
@@ -831,6 +914,14 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.DHCPRelayConfig) {
 			continue
 		}
 		rctx, cancel := context.WithCancel(ctx)
+		// #6562: size the outstanding-request table from THIS interface's
+		// ingress packet-rate limit. A fixed capacity would be cap-bound (and
+		// the reply-binding window would silently collapse) on any segment
+		// whose `overrides maximum-packet-rate` is raised — which the relay's
+		// own docs recommend for a busy segment. pendingCapacityFor reports
+		// when the memory ceiling clamps it; that case is logged below.
+		rate := resolveMaxPacketRate(d.spec.maxPacketRate)
+		pendingCapacity, pendingClamped := pendingCapacityFor(rate)
 		ir := &interfaceRelay{
 			ifaceName:       d.ifaceName,
 			cancel:          cancel,
@@ -839,7 +930,12 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.DHCPRelayConfig) {
 			alwaysBroadcast: d.spec.alwaysBroadcast,
 			maxHopCount:     resolveMaxHopCount(d.spec.maxHopCount),
 			trustOption82:   d.spec.trustOption82,
-			maxPacketRate:   resolveMaxPacketRate(d.spec.maxPacketRate),
+			maxPacketRate:   rate,
+			// The table is built here, with the relay, so it survives session
+			// rebuilds; it shares the manager clock seam with the #5670 token
+			// bucket so tests drive expiry deterministically.
+			pending:        newPendingTable(pendingCapacity, pendingTTL, m.now),
+			pendingClamped: pendingClamped,
 		}
 		m.relays[name] = ir
 		toStart = append(toStart, struct {
@@ -859,6 +955,37 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.DHCPRelayConfig) {
 		<-ir.done
 	}
 
+	// Phase 2.5 (outside lock, AFTER the join): migrate outstanding-request
+	// bindings from each replaced relay into its replacement (#6562).
+	//
+	// Ordering is load-bearing. The old relay's goroutines are fully joined
+	// above, so its table is quiescent and the snapshot is complete; and the
+	// replacement has not been launched yet, so nothing is concurrently
+	// inserting into the destination. Snapshotting in phase 1 instead would
+	// miss every request relayed between the decision and the actual stop.
+	//
+	// Without this, ANY day-2 change to a relay group (servers,
+	// always-broadcast, hop count, trust-option-82, packet rate) destroys every
+	// in-flight binding, and because the replacement rebinds the SAME
+	// giaddr:67, replies for pre-reload requests still arrive and are then
+	// dropped — an availability regression against pre-#6562 behavior. It bites
+	// hardest for maximum-packet-rate, whose documented remedy is to raise it
+	// on a busy segment: doing that mid-boot-storm would flush every binding.
+	for _, s := range toStart {
+		old, ok := replaced[s.ir.ifaceName]
+		if !ok {
+			continue
+		}
+		carried := old.pending.snapshot()
+		s.ir.pending.adopt(carried)
+		if len(carried) > 0 {
+			slog.Info("dhcp-relay: carried outstanding request bindings across restart",
+				"interface", s.ir.ifaceName,
+				"bindings", len(carried),
+				"new_capacity", s.ir.pending.capacity())
+		}
+	}
+
 	// Phase 3 (outside lock): launch the new/restarted relays.
 	for _, s := range toStart {
 		go func(relay *interfaceRelay, rctx context.Context, servers []*net.UDPAddr) {
@@ -870,6 +997,22 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.DHCPRelayConfig) {
 			"interface", s.ir.ifaceName,
 			"group", s.group,
 			"servers", s.ir.spec.servers)
+
+		// #6562: the reply-binding window is nominally pendingTTL, but at a
+		// high `overrides maximum-packet-rate` the memory ceiling on the
+		// outstanding-request table binds first and the real window is
+		// capacity/rate. Say so at startup with the actual number — an
+		// operator who raised the rate must not have to infer a shortened
+		// binding window from a rising PendingEvicted later.
+		if s.ir.pendingClamped {
+			slog.Warn("dhcp-relay: reply-binding window reduced by the pending-table "+
+				"memory ceiling at this packet rate",
+				"interface", s.ir.ifaceName,
+				"max_packet_rate", s.ir.maxPacketRate,
+				"pending_capacity", s.ir.pending.capacity(),
+				"nominal_window", pendingTTL,
+				"effective_window", pendingWindow(s.ir.pending.capacity(), s.ir.maxPacketRate))
+		}
 	}
 }
 
@@ -888,6 +1031,11 @@ func (m *Manager) Stats() []RelayStats {
 			RequestsUntrustedGiaddrReset: ir.requestsUntrustedGiaddrReset.Load(),
 			RequestsDroppedRateLimit:     ir.requestsDroppedRateLimit.Load(),
 			RepliesDroppedUnknownServer:  ir.repliesDroppedUnknownServer.Load(),
+			RepliesDroppedNoRequest:      ir.repliesDroppedNoRequest.Load(),
+			RepliesDroppedForceRenew:     ir.repliesDroppedForceRenew.Load(),
+			PendingEvicted:               ir.pending.evictions(),
+			PendingSize:                  uint64(ir.pending.occupancy()),
+			PendingCapacity:              uint64(ir.pending.capacity()),
 			RepliesL2Unicast:             ir.repliesL2Unicast.Load(),
 			RepliesUnicastCiaddr:         ir.repliesUnicastCiaddr.Load(),
 			RepliesBroadcastFlag1:        ir.repliesBroadcastFlag1.Load(),
@@ -1406,6 +1554,23 @@ func (m *Manager) runRelaySession(ctx context.Context,
 				addOption82(pkt, ifaceName)
 			}
 
+			// #6562: record this transaction as outstanding BEFORE writing it
+			// upstream. handleServerResponses runs in a DIFFERENT goroutine on
+			// the same session, so a server on a fast local segment can deliver
+			// its OFFER before a post-send insert had run — which would drop
+			// the legitimate first reply of every exchange. Recording first
+			// costs nothing and closes that race.
+			//
+			// The key is taken from the fully-stamped packet, but the relay's
+			// mutations (hops, giaddr, Option 82) do not touch xid or chaddr,
+			// so it is identical either side of the stamping.
+			//
+			// Only requests that are actually forwarded are recorded: this sits
+			// AFTER the rate limiter, the #2456 HA master gate and the #4309
+			// hop-limit drop, so a request the relay refused upstream never
+			// arms a binding for a reply it should not receive.
+			ir.pending.insert(pendingKeyFor(pkt))
+
 			// Unicast the modified packet to each server in the active group.
 			relayData := pkt.ToBytes()
 			for _, srv := range servers {
@@ -1490,6 +1655,13 @@ func (m *Manager) resolveGIAddrWithRetry(ctx context.Context, ifaceName string) 
 // IP with net.IP.Equal (the source port is not load-bearing); an empty server
 // set admits nothing (fail-closed — a session is only started with a non-empty
 // set, so this cannot black-hole a legitimately-configured relay).
+//
+// Outstanding-request binding (#6562): a source IP is spoofable, so passing the
+// #4163 check is necessary but NOT sufficient. Each OFFER/ACK/NAK must also
+// bind to a request this relay forwarded (xid + chaddr, ir.pending — see
+// pending.go). DHCPFORCERENEW is refused outright: RFC 3203 §6 makes RFC 3118
+// authentication a MUST, and a relay holds none of the key material RFC 3118
+// §5.2/§5.3 puts between the client and the server, so it cannot verify one.
 func handleServerResponses(ctx context.Context, serverConn, clientConn net.PacketConn,
 	ir *interfaceRelay, l2 l2Replier, srcIP net.IP, servers []*net.UDPAddr) {
 	ifaceName := ir.ifaceName
@@ -1508,6 +1680,11 @@ func handleServerResponses(ctx context.Context, serverConn, clientConn net.Packe
 	// durable signal, so a flood of forged replies cannot spam the log. Mirrors
 	// the resolveGIAddrWithRetry warn-once pattern.
 	warnedUnknownSrc := false
+	// #6562: the same warn-once-then-Debug discipline for the two new drop
+	// paths. Both are reachable in a flood (a spoofing attacker, or a
+	// FORCERENEW-emitting server), so neither may log per packet.
+	warnedNoRequest := false
+	warnedForceRenew := false
 	buf := make([]byte, readBufSize)
 	for {
 		n, srcAddr, err := serverConn.ReadFrom(buf)
@@ -1552,18 +1729,111 @@ func handleServerResponses(ctx context.Context, serverConn, clientConn net.Packe
 
 		msgType := pkt.MessageType()
 		switch msgType {
-		case dhcpv4.MessageTypeOffer, dhcpv4.MessageTypeAck, dhcpv4.MessageTypeNak,
-			messageTypeForceRenew:
-			// Forward to the client. NAK rejects the client's request
-			// (RFC 2131 §4.3.2); dropping it makes the client hang until
-			// its retransmission timeout instead of restarting with a
-			// fresh DISCOVER. FORCERENEW (RFC 3203, type 9) tells a client
-			// that already holds a lease to re-enter RENEWING; dropping it
-			// means a server can never force a relayed client to renew.
-			// Unlike NAK it carries the client's current address in ciaddr,
-			// so deliverReply unicasts it (the ciaddr row) rather than
-			// broadcasting.
+		case dhcpv4.MessageTypeOffer, dhcpv4.MessageTypeAck, dhcpv4.MessageTypeNak:
+			// Forward to the client, subject to the #6562 binding below. NAK
+			// rejects the client's request (RFC 2131 §4.3.2); dropping it makes
+			// the client hang until its retransmission timeout instead of
+			// restarting with a fresh DISCOVER.
+
+		case messageTypeForceRenew:
+			// #6562: REFUSE. This reverses #2645, which forwarded FORCERENEW on
+			// the reasoning that RFC 3118 authentication is end-to-end
+			// client<->server and therefore "out of scope for the relay".
+			//
+			// RFC 3203 §6 (Security Considerations — NOT §5, which is IANA
+			// Considerations) is a MUST, and it is a MUST precisely because of
+			// this attack: "As in some network environments FORCERENEW can be
+			// used to snoop and spoof traffic, the FORCERENEW message MUST be
+			// authenticated using the procedures as described in [DHCP-AUTH].
+			// FORCERENEW messages failing the authentication should be silently
+			// discarded by the client."
+			//
+			// A relay structurally CANNOT discharge that MUST. RFC 3118 §5.2
+			// defines the key as "K - a secret value shared between the source
+			// and destination of the message" and notes that "Delayed
+			// authentication requires a shared secret key for each client on
+			// each DHCP server"; RFC 3118 §3 casts the relay agent purely as a
+			// transparent mutator whose giaddr/hops/Option-82 changes are
+			// EXCLUDED from the hash, and §5.3 assigns validation to the
+			// receiver ("If the MAC computed by the receiver does not match the
+			// MAC contained in the authentication option, the receiver MUST
+			// discard the DHCP message"). The relay is neither source,
+			// destination, nor receiver, and holds no secret or secret-ID
+			// mapping. It cannot verify the MAC.
+			//
+			// Checking merely that option 90 is PRESENT would be theater: the
+			// off-path attacker in this threat model already forges the
+			// server's source IP, so they can equally attach a well-formed
+			// option 90 with a bogus MAC. Since the relay cannot check the MAC,
+			// a presence test admits exactly the attacker it is meant to stop —
+			// while most real clients do not implement RFC 3118 at all and
+			// would never catch it downstream.
+			//
+			// Refusing costs a CONFORMANT deployment nothing, because a
+			// conformant FORCERENEW never reaches this socket. RFC 3203 §2.2
+			// opens: "The DHCP server sends a unicast FORCERENEW message to
+			// the client." A unicast to the client's own leased address routes
+			// as ordinary traffic and is never delivered to the relay's
+			// giaddr:67 server socket at all. The only FORCERENEW that can
+			// arrive HERE is one deliberately addressed to giaddr:67 — a
+			// non-conformant server, or the attacker §6 is about. Normal
+			// leasing is untouched either way: clients still renew at T1/T2.
+			//
+			// (Do NOT justify this by §2.2's retransmission sentence. That
+			// describes recovery from TRANSIENT loss; the loss here is
+			// PERMANENT — every retransmission hits this same arm — and §2.2
+			// itself bounds the attempts: "The amount of retransmissions should
+			// be limited." The backoff never converges, so it cannot carry the
+			// argument.)
+			//
+			// This arm is also belt-and-braces: FORCERENEW is server-initiated,
+			// so its xid matches no outstanding request and the #6562 binding
+			// below would drop it regardless. The dedicated arm exists to give
+			// the refusal its OWN counter and log, so an operator can tell it
+			// apart from an ordinary unbound reply.
+			ir.repliesDroppedForceRenew.Add(1)
+			if !warnedForceRenew {
+				slog.Warn("dhcp-relay: refusing to forward DHCPFORCERENEW "+
+					"(RFC 3203 §6 requires RFC 3118 authentication a relay cannot verify)",
+					"interface", ifaceName, "src", srcAddr,
+					"client_mac", pkt.ClientHWAddr)
+				warnedForceRenew = true
+			} else {
+				slog.Debug("dhcp-relay: refusing to forward DHCPFORCERENEW",
+					"interface", ifaceName, "src", srcAddr)
+			}
+			continue
+
 		default:
+			continue
+		}
+
+		// #6562: bind the reply to an outstanding request. The #4163 source-IP
+		// check above is spoofable — an off-path attacker who forges a
+		// configured server's address passes it — so a reply must ALSO answer a
+		// request this relay actually forwarded. The key is xid + chaddr, both
+		// of which RFC 2131 §4.3.1 Table 3 requires the server to copy from the
+		// client's message into OFFER/ACK/NAK (see pending.go for why option 61
+		// is deliberately excluded).
+		//
+		// FAIL DIRECTION: this gate can silently break DHCP for real clients if
+		// it is too strict, which is a worse outage than the injection it
+		// prevents. Every drop is therefore counted (repliesDroppedNoRequest,
+		// surfaced in `show services dhcp relay`) and logged warn-once-then-
+		// Debug, so an operator sees a mis-binding immediately instead of
+		// debugging an invisible black hole.
+		if !ir.pending.matches(pendingKeyFor(pkt)) {
+			ir.repliesDroppedNoRequest.Add(1)
+			if !warnedNoRequest {
+				slog.Warn("dhcp-relay: dropping server reply with no outstanding request",
+					"interface", ifaceName, "src", srcAddr, "type", msgType,
+					"xid", pkt.TransactionID, "client_mac", pkt.ClientHWAddr)
+				warnedNoRequest = true
+			} else {
+				slog.Debug("dhcp-relay: dropping server reply with no outstanding request",
+					"interface", ifaceName, "src", srcAddr, "type", msgType,
+					"xid", pkt.TransactionID, "client_mac", pkt.ClientHWAddr)
+			}
 			continue
 		}
 

@@ -175,6 +175,28 @@ func (c *CLI) showDHCPRelay() error {
 			for _, s := range stats {
 				fmt.Printf("  %-16s %d\n", s.Interface, s.RepliesDroppedUnknownServer)
 			}
+			// Outstanding-request binding (#6562). A source IP is spoofable, so
+			// a reply must also answer a request the relay actually forwarded.
+			// "no-request" counts replies that did not bind — an injection
+			// attempt, OR a legitimate reply that missed the binding window,
+			// which is a client-visible DHCP failure. "Pending" is
+			// occupancy/capacity — the LEADING indicator: as it approaches
+			// capacity the relay is about to evict bindings and drop legitimate
+			// replies. "pending-evicted" is COINCIDENT, not leading — it only
+			// rises once bindings are already being lost. "forcerenew" counts
+			// DHCPFORCERENEW refused (RFC 3203 §6 requires RFC 3118 auth that a
+			// relay cannot verify).
+			fmt.Println("\nReply request binding (#6562):")
+			fmt.Printf("  %-16s %-14s %-22s %-16s %s\n",
+				"Interface", "Pending", "Dropped (no-request)", "Pending evicted",
+				"Refused (forcerenew)")
+			for _, s := range stats {
+				fmt.Printf("  %-16s %-14s %-22d %-16d %d\n",
+					s.Interface,
+					fmt.Sprintf("%d/%d", s.PendingSize, s.PendingCapacity),
+					s.RepliesDroppedNoRequest, s.PendingEvicted,
+					s.RepliesDroppedForceRenew)
+			}
 		}
 	}
 	return nil
