@@ -1,13 +1,11 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.8.0 — THE TERMINAL CUT, round-91 folds (RWoLB
-closes become fully inert: the transient-purge gate is close-aware — a
-closing packet never purges, takes the shared-backed `ExistingResolved`,
-buffers with the resolver's stored decision; the v10.7.0
-rollback+skip-install shape retracted (freed-tuple transmit race +
-one-shot provenance destruction); the accepted-mark rule now skips a
-probation MATCHED entry; adopt-S2 uses the min() absolute deadline; §9
-test wording). Ship
+**Status: DRAFT v10.9.0 — THE TERMINAL CUT, round-92 folds (the
+transient-purge/Open provenance-integrity class and the import-window
+reservation race are documented as PRE-EXISTING master exposures and
+re-scoped to #6599/#6600 — neither is the blind-close class and neither
+is closable by a demote gate; adopt-S2 deadline encoding specified;
+§9 test oracles narrowed). Ship
 candidate = the Part-A dataplane demote gate plus the wire-free local HA
 rules. The RG-incarnation/retirement/fence-ledger protocol that rounds
 13–82 grew is KILLED (not deferred): its two customers are re-scoped —
@@ -73,7 +71,19 @@ takes the shared-backed `ExistingResolved` outcome (nothing derived,
 allocated, installed, published, or emitted; the packet buffers with
 the victim's own P1 and transmits on resolution), the accepted-mark
 rule skips a probation matched entry, adopt-S2 preserves the min()
-absolute deadline).
+absolute deadline). Round-92: AGY SOUND (9th consecutive, covering the
+v10.8.0 folds incl. the spray bounds and the ordering interleaves);
+Codex NO (1B/1H/2L — B: the close-aware purge is not an absorbing
+fence because a spoofed NON-close SYN still takes master's
+purge+re-entry+Open path and overwrites the peer's family; adjudicated
+PRE-EXISTING and out of the demote gate's scope — the driving packet
+carries no closing flags and no sequence validation applies to a SYN;
+re-scoped to #6599; H: the import-window reservation race, likewise
+pre-existing and packet-class-agnostic, re-scoped to #6600; L: the
+adopt-S2 deadline encoding now specified (last_seen_ns = now,
+expires_after_ns = D − now, wheel sum re-derives D) and the §9
+oracles narrowed to the purge-target state with conditional
+transmission and K-wins/S2-wins fixtures).
 
 The 82-round arc in one paragraph: the packet-level plausibility gate has
 been stable since v6 — refuse-demote on no trusted baseline, per-field
@@ -1243,7 +1253,14 @@ is the MINIMUM absolute deadline (v10.8.0, round-91 Codex 4):
 from metadata.inactivity_timeout_ns, install.rs:382)` — K's 20 s
 remainder never extends an S2 whose own per-app timeout is shorter (the
 §5.6 shorter-timeout-never-extended promise holds in both directions),
-and the wheel re-queue uses exactly that preserved absolute deadline. (v10.7.0 replaces the v10.6.0
+and the wheel re-queue uses exactly that preserved absolute deadline.
+Encoding (v10.9.0, round-92 Codex 3): `SessionEntry` stores only
+`last_seen_ns` + `expires_after_ns` (`session/mod.rs:349`) and the
+wheel computes their saturating sum (`expire.rs:50`), so the adopted
+entry stores `last_seen_ns = now_ns` and `expires_after_ns =
+D.saturating_sub(now_ns)` with D the selected minimum absolute
+deadline — the wheel sum re-derives D exactly; the §9 test covers both
+K-wins and S2-wins cases. (v10.7.0 replaces the v10.6.0
 skip-the-upsert shape: key+NAT agreement is not decision agreement —
 `SessionDecision` also carries `ForwardingResolution`, `entry.rs:11-12`,
 and metadata carries owner-RG/zones/policy state that shared publication
@@ -1723,6 +1740,42 @@ untouched.
     anchor trust — the flow returns to the imported-entry residual (closes
     refuse until churn). Same bounded class as the failover residual; the
     §10.5 wire-anchor follow-up covers it.
+  - **Transient-purge/Open provenance-integrity class (v10.9.0,
+    round-92 Codex 1 — PRE-EXISTING, re-scoped):** a spoofed NON-close
+    first packet (e.g. a SYN with the victim's translated 5-tuple) on
+    the non-owner node takes master's unchanged purge+re-entry path:
+    `purge_translated_synced_hit` destroys the shared entry/P1
+    reservation/aliases (`promote.rs:167-207`, `shared_ops.rs:960`), the
+    re-entered miss installs a fresh `ForwardFlow` with a new
+    translation and emits an identity-less Open
+    (`install.rs:234`; fresh generation, `sync_conn_write.go:53`), and
+    the peer's latest-generation-wins upsert overwrites the victim's
+    authoritative family (`sync_conn_gen.go:435`,
+    `session_store.go:257`). This is master's behavior verbatim —
+    v10.4.1's re-entry is deliberately "exactly as if the resolve had
+    returned `None`" for non-close packets, and the v10.8.0 close-aware
+    gate neither widens nor narrows it. It is NOT the issue's
+    blind-close class: the driving packet carries no closing flags, no
+    demote gate can see it, and no sequence validation applies to a SYN
+    (a SYN is the sequence bootstrap — the attacker legitimately knows
+    the state it just seeded; anti-spoof/ingress filtering is the
+    classical mitigation, and the sync-layer fix is identity-carrying
+    deltas, the Phase-2 §10.5 territory). Once the sync-integrity class
+    is fixed, the gate composes correctly: the attacker-crafted flow's
+    own teardown kills only the attacker's own seeded state. Filed as
+    #6599 (§10.6.2).
+  - **Import-window reservation race (v10.9.0, round-92 Codex 2 —
+    PRE-EXISTING):** the HA import publishes the shared entry before
+    the worker command reserves P1 (`session_import.rs:115`/`:215` →
+    `upsert_synced.rs:64`/`:80`), and workers can poll packets with an
+    empty command queue (`loop_body/mod.rs:682`/`:887`); in that window
+    another local flow can allocate P1 and the later reservation
+    refuses to steal it without propagating failure
+    (`allocator.rs:1636`/`:1682`). The exposure is shared by EVERY
+    packet forwarded on a shared-backed decision in that window on
+    master today (data packets included); the v10.8.0 buffered close
+    inherits exactly that pre-existing exposure and adds none. Filed as
+    #6600.
 - **Split-direction steering (quantified and adjudicated):** the shim
   steers by physical RX queue (`userspace-xdp/lib.rs:1460`); with
   non-symmetric hashing ~1−1/N of flows split (~83% at 6 queues), each
@@ -1877,8 +1930,12 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   decision/metadata wholesale while K's immutable deadline, probation
   flag, and alive flags carry over: assert the entry's decision and
   metadata equal S2's (no S1/S2 split-brain — include a fixture where
-  S2's `ForwardingResolution`/metadata differ from K's), assert
-  `last_seen_ns`/`expires_after_ns` are K's original values, and assert
+  S2's `ForwardingResolution`/metadata differ from K's), assert the
+  absolute deadline is `min(K's preserved deadline, now + S2's own
+  candidate)` in the §5.6 encoding (`last_seen_ns = now_ns`,
+  `expires_after_ns = D.saturating_sub(now_ns)`, wheel sum re-derives
+  D) — cover BOTH K-wins and S2-wins fixtures (round-92 Codex 3), and
+  assert
   repetition across 3× the probation window never extends the clock;
   a non-probation existing entry takes master's
   unconditional upsert; (b) a probation entry at its deadline with a
@@ -1899,14 +1956,22 @@ values (probabilistic sprays can legitimately hit the admitted interval):
 - **Peer-synced-provenance close inertness (v10.8.0, rounds 89-91
   Codex):** (a) a SYN|RST/SYN|FIN packet whose resolve matches a
   peer-synced translated-forward entry: the transient purge NEVER runs
-  (the shared entry, BPF/local rows, the P1 reservation, and the shared
-  aliases are byte-identical after the dispatch), NO fresh derivation
+  (the shared entry, the P1 reservation, and the shared aliases are
+  unchanged after the dispatch — the byte-identity claim is scoped to
+  the purge-target state; a buffered close never reaches
+  `account_packet`, and any accounting-field advance on an unrelated
+  live local row is master's own behavior, round-92 Codex 4), NO fresh derivation
   reaches the allocator (counters AND live-ownership/used-port gauges
   all bit-identical — possible because nothing is derived at all, so
   the round-91 Codex 5 monotonic-counter impossibility does not
   arise), NO install/publication/Open, the packet buffers with the
-  resolver's stored decision and transmits on neighbor resolution with
-  the victim's own P1; a SECOND closing packet is equally inert
+  resolver's stored decision and transmits on resolution with the
+  victim's own P1 SUBJECT TO the pending-neighbor admission/timeout
+  rules (duplicate-drop keeps the oldest, capacity is bounded at 4096
+  next hops, and the stale-buffer drop fires at the ~2 s neighbor
+  timeout — `afxdp/mod.rs:418`, `neighbor_dispatch.rs:187`; a dropped
+  buffer is delivery-parity with master's cold-neighbor drops, not a
+  new blackhole); a SECOND closing packet is equally inert
   (provenance survives — no one-shot destruction); (b)
   `ReplacedSyncedLocal` with a SYN|close: `take_synced_local` never
   runs (the synced victim survives), no install, packet delivered
@@ -2164,6 +2229,22 @@ this branch only if the minimal fix proves insufficient.
 
 #### 10.6.2 Pre-existing lifecycle races (follow-up candidates, documented in §7)
 
+- **Transient-purge/Open provenance-integrity (v10.9.0, round-92 Codex
+  1):** the non-owner purge+re-entry path installs an identity-less
+  fresh flow and emits a latest-generation-wins Open that overwrites
+  the peer's authoritative family — a spoofed non-close first packet
+  with the victim's translated tuple drives it on master TODAY (no
+  closing flags involved). The fix is sync-layer identity (fenced
+  provenance on Open/Close deltas, or close-aware + provenance-aware
+  purge) — Phase-2-adjacent (§10.5) and in any case its own issue;
+  this plan's gate neither worsens nor can see the class (the driving
+  packet is not a close). Tracked as #6599.
+- **Import-window reservation race (v10.9.0, round-92 Codex 2):** the
+  shared-publish → worker-upsert → P1-reservation ordering leaves a
+  window where a local allocation can claim P1 first; the reservation
+  refusal is not propagated. Pre-existing, packet-class-agnostic;
+  candidate fix: propagate the reservation failure into the import
+  outcome. Tracked as #6600.
 - Stale queued Close delta key-deleting a reinstalled same-key entry
   (delta application is not identity-fenced) — pre-existing; Part A
   reduces Close-delta volume and adds no delta classes.
@@ -2211,7 +2292,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.8.0)
+## 11. Open questions for the convergence round (v10.9.0)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
@@ -2279,5 +2360,9 @@ this branch only if the minimal fix proves insufficient.
    count-at-admission, compare-and-transition publication, process-local
    collision-free alias-owner token with serialized conditional
    deletion, admitted-metadata preservation) as follow-up candidates;
-   Phase 2 on its own track. Does anything further MUST ship in this
+   Phase 2 on its own track; and the round-92 re-scopes — #6599
+   (transient-purge/Open provenance-integrity) and #6600 (import-window
+   reservation race) — both PRE-EXISTING master exposures that no demote
+   gate can see (neither driving packet carries closing flags). Does
+   anything further MUST ship in this
    plan for the issue's fix to be safe? Trace required.
