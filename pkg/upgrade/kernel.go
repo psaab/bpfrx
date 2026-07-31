@@ -162,6 +162,30 @@ type KernelJournal struct {
 	// fresh ArmNonce is unique across attempts even under a stuck test clock
 	// (#5847).
 	ArmAttempts int `json:"arm_attempts,omitempty"`
+
+	// PromoteBinary is the ABSOLUTE path of the xpfd the promotion gate must
+	// run on the candidate boot, recorded BY THE ARMING (#6601 r6).
+	//
+	// Every prior design derived this from ambient state the system happened to
+	// expose — $PATH, then compiled defaults, then inode identity, then a unit
+	// name, then that unit's LoadState — and each one could be stale after a
+	// relocation or a unit switch. The last of those is what broke: a disabled
+	// unit still reports LoadState=loaded with MainPID=0 (verified firsthand),
+	// so a leftover default unit whose drop-in still pointed at an OLD version
+	// satisfied the arm-time check, and on the candidate boot its stale
+	// ExecStart was accepted and the stale binary authorized the promotion.
+	//
+	// The arming does not have to infer anything: it IS an xpfd process, so
+	// os.Executable() names the live binary by construction, and it knows that
+	// at the moment it arms. Recording it converts the question from "which
+	// xpfd is live?" (unanswerable from ambient state) into "which xpfd armed
+	// this candidate?" (a fact). The record cannot drift from the arming
+	// because re-arming rewrites it and there is exactly one gate run per
+	// arming, and it is cleared with the journal on promote/revert.
+	//
+	// The gate REFUSES when this is present but unusable, and never falls back
+	// to inference. See armRecordPath / the outer hop's sidecar.
+	PromoteBinary string `json:"promote_binary,omitempty"`
 }
 
 // ErrKernelChannelUnavailable marks a pre-assert failure that means LANE 1

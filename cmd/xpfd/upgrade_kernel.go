@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -99,16 +98,6 @@ func runUpgradeKernelSubcommand(args []string) {
 
 	switch verb {
 	case "arm":
-		// Refuse BEFORE any mutation on a host whose promotion gate could never
-		// run: the boot-time gate derives the live xpfd from the DEFAULT unit
-		// specifically and does not infer which unit is the xpf one, so a box
-		// cut with `--unit <name>` would boot the candidate UNVERIFIED and
-		// never promote it (#6601 r5). Only a DEFINITE not-found refuses; an
-		// unreachable systemctl proves nothing and is allowed through.
-		if err := upgrade.CheckKernelPromotionUnit(context.Background()); err != nil {
-			fmt.Fprintf(os.Stderr, "upgrade kernel arm: %v\n", err)
-			os.Exit(2)
-		}
 		// Arity validated up-front by validateKernelVerbArgs (exactly one
 		// operand: the target kernel version).
 		if err := r.Arm(fs.Args()[0]); err != nil {

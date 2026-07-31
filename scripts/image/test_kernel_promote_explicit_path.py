@@ -55,6 +55,9 @@ SCRIPT = HERE / "xpf-kernel-promote"
 #
 # — has a relocation shape that makes it the stale build.
 SBIN = "/usr/local/sbin/xpfd"
+# The arm record: written by `xpfd upgrade kernel arm`, read by the gate. Its
+# path is asserted against Go by TestPromoteScriptArmRecordPathMatchesGo.
+ARM_RECORD = "/var/lib/xpf/kernel-promote-binary"
 VERSIONED = "/var/lib/xpf/versions/current/xpfd"
 
 
@@ -295,6 +298,12 @@ class _GateBase(unittest.TestCase):
         # Which shell runs the gate. Overridden by the busybox leg (NIT-1); the
         # script is POSIX sh and must behave identically under both.
         self.shell_argv = ["/bin/sh"]
+        # The arm record. None => _run() derives it from a well-formed
+        # stub_execstart, so a test that models a HEALTHY box expresses
+        # "record agrees with the unit" without restating the path. Set it
+        # explicitly to model a disagreement, a stale record, or no arming.
+        self.armed = None
+        self.arm_explicitly_absent = False
         self.stub_mainpid = "0"
         self.stub_mainpid2 = ""
         self.stub_controlgroup = ""
@@ -311,6 +320,7 @@ class _GateBase(unittest.TestCase):
         text = script_text()
         text = text.replace(VERSIONED, str(self.fake_root) + VERSIONED)
         text = text.replace(SBIN, str(self.fake_root) + SBIN)
+        text = text.replace(ARM_RECORD, str(self.fake_root) + ARM_RECORD)
         self.script_copy.write_text(text)
         self.script_copy.chmod(0o755)
 
@@ -325,7 +335,37 @@ class _GateBase(unittest.TestCase):
         )
         path.chmod(0o755)
 
+    def _derive_armed(self):
+        """The binary a well-formed ExecStart names, parsed the way the gate does.
+
+        This MUST use the gate's own delimiter rule (` ; argv[]=`), not a
+        naive cut at the first space. Parsing it more loosely here arms a
+        TRUNCATED path, the gate resolves the correct longer one, and the
+        cross-check fires -- which is the harness disagreeing with itself, not
+        a finding. (That is exactly what happened when this helper cut at the
+        first space: the #6601 r4 space-in-path fixtures started refusing.)
+        """
+        raw = self.stub_execstart
+        cand = ""
+        if "\n" in raw.strip():
+            return ""   # multi-line render: ambiguous, exactly as the gate treats it
+        if "path=" in raw:
+            rest = raw.split("path=", 1)[1]
+            if rest.count(" ; argv[]=") == 1:
+                cand = rest.split(" ; argv[]=", 1)[0]
+        elif raw.strip().startswith("/"):
+            stripped = raw.strip()
+            if not re.search(r"[\s;]", stripped):
+                cand = stripped
+        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+        return ""
+
     def _run(self):
+        if not self.arm_explicitly_absent:
+            armed = self.armed if self.armed is not None else self._derive_armed()
+            if armed:
+                self._arm(armed)
         env = dict(os.environ)
         env["PATH"] = str(self.path_dir) + os.pathsep + env.get("PATH", "")
         env["STUB_EXECSTART"] = self.stub_execstart
@@ -341,6 +381,13 @@ class _GateBase(unittest.TestCase):
             text=True,
             timeout=60,
         )
+
+    def _arm(self, binary) -> Path:
+        """Write the arm record the way `xpfd upgrade kernel arm` does."""
+        rec = Path(str(self.fake_root) + ARM_RECORD)
+        rec.parent.mkdir(parents=True, exist_ok=True)
+        rec.write_text(f"{binary}\n")
+        return rec
 
     def _install(self, rel: str, exit_code: int) -> Path:
         """Install a recording stub at a re-rooted historical default path."""
@@ -373,8 +420,35 @@ class _GateBase(unittest.TestCase):
             "the refusal must stay on the non-rebooting infra-error path; a "
             f"non-zero exit trips OnFailure= and reboots: {res.stderr}",
         )
-        self.assertIn("ERROR", res.stderr, f"the refusal was not loud ({why}): {res.stderr}")
-        self.assertIn("REFUSING to promote", res.stderr, why)
+        # DID NOT ADOPT AN INFERRED BINARY. Under the r7 arm-record design there
+        # are two correct non-promotion outcomes, and which one applies depends
+        # on whether a candidate was armed at all:
+        #
+        #   * a candidate IS armed and something contradicts or invalidates the
+        #     record -> loud ERROR + REFUSING;
+        #   * nothing is armed -> "nothing to promote", which is not a failure
+        #     to diagnose but a definitive statement (the record is written by
+        #     arming and removed with the journal).
+        #
+        # Both mean the gate did not let an inferred binary authorize a
+        # promotion, which is what every caller of this helper is testing. The
+        # per-test assertNotIn("using <impostor>") above pins that the specific
+        # bad candidate was not adopted.
+        refused = "REFUSING to promote" in res.stderr
+        nothing_armed = "nothing to promote" in res.stderr
+        self.assertTrue(
+            refused or nothing_armed,
+            f"the gate neither refused nor reported nothing-armed ({why}); it "
+            f"may have adopted an inferred binary: {res.stderr}",
+        )
+        if refused:
+            self.assertIn("ERROR", res.stderr, f"the refusal was not loud ({why}): {res.stderr}")
+        self.assertNotIn(
+            "promotion gate: clean",
+            res.stderr,
+            f"the gate reported a CLEAN promotion ({why}) — an inferred binary "
+            f"authorized it: {res.stderr}",
+        )
         self.assertFalse(
             self.systemctl_ran.exists(),
             f"the refusal rebooted the box ({why})",

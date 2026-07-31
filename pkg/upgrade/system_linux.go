@@ -233,29 +233,3 @@ func runCmd(name string, args ...string) error {
 	}
 	return nil
 }
-
-// unitLoadStateProbeCtx reports systemd's LoadState for <unit>.service, bounded
-// by ctx. A package var so a test can force it, mirroring unitActiveProbeCtx.
-//
-// Returns the RAW LoadState ("loaded", "not-found", "masked", "bad-setting",
-// ...). `systemctl show` exits 0 and prints "not-found" for an unknown unit, so
-// an error here means systemctl itself could not be consulted — which is NOT
-// evidence that the unit is absent, and callers must not collapse the two.
-var unitLoadStateProbeCtx = func(ctx context.Context, unit string) (string, error) {
-	out, err := exec.CommandContext(ctx, "systemctl",
-		"show", "--property=LoadState", "--value", unit+".service").Output()
-	if err != nil {
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
-		return "", fmt.Errorf("systemctl show LoadState %s: %w", unit, err)
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-// UnitLoadState is the exported, ctx-bounded LoadState probe so callers share
-// ONE implementation rather than each shelling out with its own timeout
-// behavior (the #5808 unification rule, applied to this property too).
-func UnitLoadState(ctx context.Context, unit string) (string, error) {
-	return unitLoadStateProbeCtx(ctx, unit)
-}
