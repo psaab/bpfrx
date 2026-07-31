@@ -1623,7 +1623,7 @@ func matchAddr(cfg *config.Config, overlay map[string][]string, addrs []string, 
 				rawMatched = true
 			}
 		} else {
-			if anyV6 || containsAny(v6nets, ip) {
+			if anyV6 || containsAnyV6(v6nets, ip) {
 				rawMatched = true
 			}
 		}
@@ -1649,9 +1649,60 @@ func matchAddr(cfg *config.Config, overlay map[string][]string, addrs []string, 
 	return !rawMatched
 }
 
+// containsAny reports whether ip falls inside any of the V4 nets. It keeps
+// net.IPNet.Contains, whose leading `if x := ip.To4(); x != nil { ip = x }`
+// narrowing is CORRECT here: net.ParseIP hands back a 16-byte 4-in-6 slice for
+// a plain dotted quad, and addCIDRValue stores v4 prefixes 4-byte, so the fold
+// is what makes the two widths meet.
 func containsAny(nets []*net.IPNet, ip net.IP) bool {
 	for _, n := range nets {
 		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsAnyV6 is the v6 counterpart and deliberately does NOT use
+// net.IPNet.Contains.
+//
+// #6577: Contains opens with the same `ip.To4()` narrowing, so an IPv4-MAPPED
+// IPv6 address (`::ffff:a.b.c.d`) is folded to 4 bytes and then fails the
+// `len(ip) != len(nn)` length guard against EVERY 16-byte v6 prefix — `::/0`
+// included. The dataplane compares UNFOLDED 128-bit values
+// (`userspace-dp/src/prefix.rs`: `(u128::from(ip) & self.mask) == self.network`),
+// so a mapped destination matched a v6 DENY there while falling through to a
+// later PERMIT here — the simulator reported PERMIT where the box DENIES, in
+// the package whose contract is dataplane parity.
+//
+// This is the untested half of #6377: that issue fixed WHICH family's rules a
+// mapped address is tested against (the unsupported-tuple gate); this is HOW
+// containment is performed once the address lands in the v6 branch.
+//
+// Every net reaching a v6 set is a genuine 16-byte prefix — addCIDRValue routes
+// a value here only when `ipnet.IP.To4() == nil` — so a straight 16-byte masked
+// compare mirrors the Rust mask exactly. Written explicitly rather than through
+// netip (the #6327 preference) because netip.Prefix.Contains keys family off
+// Addr.BitLen(), and the 4-in-6 slice net.ParseIP returns for a dotted quad
+// would make an implicit-family form silently stop matching v4.
+func containsAnyV6(nets []*net.IPNet, ip net.IP) bool {
+	ip16 := ip.To16()
+	if ip16 == nil {
+		return false
+	}
+	for _, n := range nets {
+		nip := n.IP.To16()
+		if nip == nil || len(n.Mask) != net.IPv6len {
+			continue
+		}
+		matched := true
+		for i := 0; i < net.IPv6len; i++ {
+			if ip16[i]&n.Mask[i] != nip[i]&n.Mask[i] {
+				matched = false
+				break
+			}
+		}
+		if matched {
 			return true
 		}
 	}
