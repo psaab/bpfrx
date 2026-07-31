@@ -18,8 +18,31 @@ import (
 // self.network`), so a mapped destination matched a v6 DENY on the box while
 // the simulator fell through to a later PERMIT.
 //
-// RED on revert: change `containsAnyV6(v6nets, ip)` back to
-// `containsAny(v6nets, ip)` in matchAddr. Every assertion below flips.
+// There are TWO independent levers here, and each test binds exactly one — the
+// earlier "every assertion flips on the call-site revert" claim was wrong:
+//
+//	Lever A, the CALL SITE: change `containsAnyV6(v6nets, ip)` back to
+//	`containsAny(v6nets, ip)` in matchAddr.
+//	  TestMappedIPv6DestMatchesV6DenyPrefix_6577   -> FAIL (assertion:
+//	                                                  got permit via "allow-rest")
+//	  TestMappedIPv6ContainmentMirrorsRustMask_6577 -> PASS (it calls the helper
+//	                                                  directly, so the call site
+//	                                                  is not in its path)
+//	  TestV4ContainmentUnaffectedByMappedFix_6577   -> PASS (over-reach guard)
+//
+//	Lever B, the HELPER BODY: reintroduce the fold inside containsAnyV6 (e.g.
+//	`return containsAny(nets, ip)`). This is a strict superset of A — it removes
+//	the fix's substance, so both binders fail.
+//	  TestMappedIPv6ContainmentMirrorsRustMask_6577 -> FAIL (assertion:
+//	                                                  `containsAnyV6(::/0,
+//	                                                  198.51.100.9) = false, want
+//	                                                  true`)
+//	  TestMappedIPv6DestMatchesV6DenyPrefix_6577    -> FAIL (assertion)
+//	  TestV4ContainmentUnaffectedByMappedFix_6577   -> PASS (over-reach guard)
+//
+// The address-SET half of #6577 — which family bucket a mapped LITERAL is filed
+// into — has its own lever and its own artifacts in
+// mapped_ipv6_prefix_6577_test.go.
 
 // TestMappedIPv6DestMatchesV6DenyPrefix_6577 is the operator-visible shape: a
 // DENY scoped to a v6 prefix, followed by a permit-all. The mapped destination
@@ -106,7 +129,13 @@ func TestMappedIPv6ContainmentMirrorsRustMask_6577(t *testing.T) {
 	}{
 		{"::/0", mapped, true, "mask 0 contains every address, mapped included (Rust: u128 & 0 == 0)"},
 		{"::/0", genuine, true, "mask 0 contains a genuine v6 address"},
+		// Reachable in production since #6577's address-set half: addCIDRValue
+		// classifies on the literal's colon-strict TEXT family, so a mapped
+		// prefix now really does land in a v6 set. The end-to-end shape is
+		// TestMappedIPv6PrefixMatchesMappedDestination_6577; this row pins the
+		// helper's boundary arithmetic for it.
 		{"::ffff:0:0/96", mapped, true, "the mapped range itself covers the address"},
+		{"::ffff:0:0/96", genuine, false, "a genuine v6 address is OUTSIDE the mapped range"},
 		{"2001:db8::/32", mapped, false, "a disjoint prefix must NOT match — no over-matching"},
 		{"2001:db8::/32", genuine, true, "a covering prefix still matches (no regression)"},
 	}

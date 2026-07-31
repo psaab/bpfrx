@@ -20,46 +20,30 @@ import (
 // RED on revert: drop the frag tracking from matchJunosHost (remove the
 // frag.override / frag.note calls and the overridePermissiveTerminal on the
 // final return). Both fragment assertions below flip to permit / unmatched.
+//
+// matchJunosHost walks THREE tiers and each has its own `frag.note` call site,
+// so each is pinned separately — deleting any ONE of the three must be RED:
+//
+//	exact  `from-zone <ingress> to-zone junos-host` -> junosHostFragmentCfg
+//	from-any `from-zone any to-zone junos-host`     -> junosHostFragmentFromAnyCfg
+//	global   `match to-zone junos-host` (#3639)     -> junosHostFragmentGlobalCfg
+//
+// plus TestJunosHostFragmentCarriesCandidateAcrossTiers_6576, which notes the
+// candidate in the exact tier and matches the permit in the GLOBAL tier, so the
+// accumulator really is shared across the whole walk rather than per-tier.
 
 // junosHostFragmentCfg mirrors fragmentDenyCfg onto the HOST path: an earlier
 // source-scoped port-bearing `deny junos-ssh` to junos-host, then a permit-any.
 // The deny is source-scoped so overlap vs non-overlap is exercisable.
 func junosHostFragmentCfg(withPermit bool) *config.Config {
-	pols := []*config.Policy{
-		{
-			Name:   "block-host-ssh",
-			Action: config.PolicyDeny,
-			Match: config.PolicyMatch{
-				SourceAddresses:      []string{"trust-net"},
-				DestinationAddresses: []string{"any"},
-				Applications:         []string{"junos-ssh"},
-			},
-		},
-	}
-	if withPermit {
-		pols = append(pols, &config.Policy{
-			Name:   "permit-host-all",
-			Action: config.PolicyPermit,
-			Match: config.PolicyMatch{
-				SourceAddresses:      []string{"any"},
-				DestinationAddresses: []string{"any"},
-				Applications:         []string{"any"},
-			},
-		})
-	}
-	sec := config.SecurityConfig{
+	return cfgWith(config.SecurityConfig{
 		DefaultPolicy: config.PolicyDeny,
 		Zones:         zones("trust", "untrust"),
-		AddressBook: &config.AddressBook{
-			Addresses: map[string]*config.Address{
-				"trust-net": {Name: "trust-net", Value: "10.0.0.0/8"},
-			},
-		},
+		AddressBook:   hostFragAddressBook(),
 		Policies: []*config.ZonePairPolicies{
-			{FromZone: "trust", ToZone: JunosHostZone, Policies: pols},
+			{FromZone: "trust", ToZone: JunosHostZone, Policies: hostFragPolicies(withPermit)},
 		},
-	}
-	return cfgWith(sec, config.ApplicationsConfig{})
+	}, config.ApplicationsConfig{})
 }
 
 func hostFragQuery() Query {
@@ -150,5 +134,148 @@ func TestJunosHostFragmentNonOverlappingStillDelivers_6576(t *testing.T) {
 	}
 	if res.FragmentAssociatedDeny {
 		t.Fatalf("no deny was skipped, so no fragment-associated deny may be reported; got %+v", res)
+	}
+}
+
+// hostFragPolicies builds the shared two-rule body: a source-scoped
+// port-bearing DENY followed by an optional permit-any.
+func hostFragPolicies(withPermit bool) []*config.Policy {
+	pols := []*config.Policy{
+		{
+			Name:   "block-host-ssh",
+			Action: config.PolicyDeny,
+			Match: config.PolicyMatch{
+				SourceAddresses:      []string{"trust-net"},
+				DestinationAddresses: []string{"any"},
+				Applications:         []string{"junos-ssh"},
+			},
+		},
+	}
+	if withPermit {
+		pols = append(pols, &config.Policy{
+			Name:   "permit-host-all",
+			Action: config.PolicyPermit,
+			Match: config.PolicyMatch{
+				SourceAddresses:      []string{"any"},
+				DestinationAddresses: []string{"any"},
+				Applications:         []string{"any"},
+			},
+		})
+	}
+	return pols
+}
+
+func hostFragAddressBook() *config.AddressBook {
+	return &config.AddressBook{
+		Addresses: map[string]*config.Address{
+			"trust-net": {Name: "trust-net", Value: "10.0.0.0/8"},
+		},
+	}
+}
+
+// junosHostFragmentFromAnyCfg puts the SAME deny/permit pair in the
+// `from-zone any to-zone junos-host` WILDCARD tier — the second of the three
+// tiers, and the very wildcard whose omission from the host path was the #3018
+// silent fail-open. junosHostFragmentCfg's deny sits in the exact tier only, so
+// without this fixture the from-any `frag.note` call site is unpinned.
+func junosHostFragmentFromAnyCfg(withPermit bool) *config.Config {
+	return cfgWith(config.SecurityConfig{
+		DefaultPolicy: config.PolicyDeny,
+		Zones:         zones("trust", "untrust"),
+		AddressBook:   hostFragAddressBook(),
+		Policies: []*config.ZonePairPolicies{
+			{FromZone: "any", ToZone: JunosHostZone, Policies: hostFragPolicies(withPermit)},
+		},
+	}, config.ApplicationsConfig{})
+}
+
+// junosHostFragmentGlobalCfg puts the SAME pair in a host-scoped GLOBAL tier
+// (`match to-zone junos-host`, #3639 / #3611 Piece B) — the third tier, and the
+// last `frag.note` call site.
+func junosHostFragmentGlobalCfg(withPermit bool) *config.Config {
+	pols := hostFragPolicies(withPermit)
+	for _, p := range pols {
+		p.Match.ToZones = []string{JunosHostZone}
+	}
+	return cfgWith(config.SecurityConfig{
+		DefaultPolicy:  config.PolicyDeny,
+		Zones:          zones("trust", "untrust"),
+		AddressBook:    hostFragAddressBook(),
+		GlobalPolicies: pols,
+	}, config.ApplicationsConfig{})
+}
+
+// TestJunosHostFragmentFromAnyTierNotesCandidate_6576 pins the from-any tier's
+// frag.note. Both arms are exercised: the later permit in the same tier
+// (override) and the permit-like fall-through (overridePermissiveTerminal).
+func TestJunosHostFragmentFromAnyTierNotesCandidate_6576(t *testing.T) {
+	res := Match(junosHostFragmentFromAnyCfg(true), hostFragQuery())
+	if res.Action != config.PolicyDeny || res.PolicyName != "block-host-ssh" || !res.FragmentAssociatedDeny {
+		t.Fatalf("a deny skipped in the `from-zone any to-zone junos-host` tier must still override "+
+			"the later permit — that wildcard governs the host path (#3018); got %+v", res)
+	}
+
+	res = Match(junosHostFragmentFromAnyCfg(false), hostFragQuery())
+	if res.HostInboundUnmatched || res.Action != config.PolicyDeny || !res.FragmentAssociatedDeny {
+		t.Fatalf("a from-any-tier skipped deny must also beat the permit-like fall-through; got %+v", res)
+	}
+	if res.PolicyName != "block-host-ssh" {
+		t.Fatalf("want the skipped deny attributed, got %q", res.PolicyName)
+	}
+}
+
+// TestJunosHostFragmentGlobalTierNotesCandidate_6576 pins the host-scoped
+// global tier's frag.note, the third and last call site.
+func TestJunosHostFragmentGlobalTierNotesCandidate_6576(t *testing.T) {
+	res := Match(junosHostFragmentGlobalCfg(true), hostFragQuery())
+	if res.Action != config.PolicyDeny || res.PolicyName != "block-host-ssh" || !res.FragmentAssociatedDeny {
+		t.Fatalf("a deny skipped in the host-scoped GLOBAL tier must override the later permit; got %+v", res)
+	}
+
+	res = Match(junosHostFragmentGlobalCfg(false), hostFragQuery())
+	if res.HostInboundUnmatched || res.Action != config.PolicyDeny || !res.FragmentAssociatedDeny {
+		t.Fatalf("a global-tier skipped deny must also beat the permit-like fall-through; got %+v", res)
+	}
+	if res.PolicyName != "block-host-ssh" {
+		t.Fatalf("want the skipped deny attributed, got %q", res.PolicyName)
+	}
+}
+
+// TestJunosHostFragmentCarriesCandidateAcrossTiers_6576 pins that the tracker
+// is ONE accumulator for the whole host walk, not a per-tier one: the candidate
+// is noted in the EXACT tier (which has no permit) and the permit that must be
+// overridden is matched two tiers later, in the GLOBAL tier. A per-tier
+// accumulator would report permit-global here.
+func TestJunosHostFragmentCarriesCandidateAcrossTiers_6576(t *testing.T) {
+	cfg := cfgWith(config.SecurityConfig{
+		DefaultPolicy: config.PolicyDeny,
+		Zones:         zones("trust", "untrust"),
+		AddressBook:   hostFragAddressBook(),
+		Policies: []*config.ZonePairPolicies{
+			// Exact tier: the port-bearing deny ONLY — the fragment skips it and
+			// falls through to the next tier.
+			{FromZone: "trust", ToZone: JunosHostZone, Policies: hostFragPolicies(false)},
+		},
+		GlobalPolicies: []*config.Policy{
+			{
+				Name:   "permit-host-global",
+				Action: config.PolicyPermit,
+				Match: config.PolicyMatch{
+					ToZones:              []string{JunosHostZone},
+					SourceAddresses:      []string{"any"},
+					DestinationAddresses: []string{"any"},
+					Applications:         []string{"any"},
+				},
+			},
+		},
+	}, config.ApplicationsConfig{})
+
+	res := Match(cfg, hostFragQuery())
+	if res.Action != config.PolicyDeny || !res.FragmentAssociatedDeny {
+		t.Fatalf("a candidate noted in the EXACT tier must still override a permit matched in the "+
+			"GLOBAL tier — the fragDenyTracker spans the whole host walk; got %+v", res)
+	}
+	if res.PolicyName != "block-host-ssh" {
+		t.Fatalf("want the cross-tier skipped deny attributed to the enforcing rule, got %q", res.PolicyName)
 	}
 }

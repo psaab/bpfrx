@@ -284,7 +284,10 @@ with **no** transit default fallback (and the transit `to-zone any` / `from-zone
 any to-zone any` wildcards are NOT pulled onto the host path; only a global
 explicitly scoped `to-zone junos-host` is). An unmatched host-bound flow returns
 `Result.HostInboundUnmatched` — no security *policy* governs it, never an
-inherited transit verdict.
+inherited transit verdict. One exception since #6576: an unmatched host walk
+that SKIPPED an overlapping port-bearing DENY returns that deny instead (the
+fall-through is permit-like, so the fragment fails closed against it) — see the
+next paragraph.
 
 **Non-first fragments on the host path (#6576).** The host gate applies the
 same #4569 fragment-associated deny the transit walk does — it learned this in
@@ -498,10 +501,14 @@ only keeps the deny-vs-reject label in parity with the wire.
 Scoped narrowly, mirroring the dataplane: a fragment a real (protocol-only /
 `any`) deny matches directly is a normal deny (not flagged as an override); a
 deny for a DIFFERENT protocol (`hasL4ConstrainedTerm` false) or a
-NON-overlapping source/destination leaves the fragment on its forward path. The
-transit path only carries the override — a `to-zone junos-host` fragment takes
-the host gate, which has no #4569 override (it still fails port-bearing terms
-closed).
+NON-overlapping source/destination leaves the fragment on its forward path.
+
+BOTH walks carry the override. A `to-zone junos-host` fragment takes the host
+gate, which learned the same #4569 override in the dataplane in #6465 (PR
+#6505) and in this package in #6576 — see "Non-first fragments on the host
+path" above. (Before #6505 the host gate had no override; a doc sentence
+asserting that outlived the code and is exactly the stale-assertion trap #6576
+was, so it is called out rather than silently deleted.)
 
 Every operator surface threads the discriminator: the valueless
 `non-first-fragment` CLI selector (local + remote `show security match-policies`
@@ -623,6 +630,68 @@ never take effect. The render-side fail-on-revert artifact is
 `server_show_testpolicy_unsupported_tuple_5720_test.go`: dropping the
 gRPC-text arm makes the (V4 src, V6 dst) topic fall back to the fabricated
 `no matching policy` line.
+
+### Colon-strict family — containment and prefix classification (#6577, resolved)
+
+#6377 above fixed **which** family's rules a mapped address is tested against.
+It left two surfaces where `net.IP.To4()` still folded, so a mapped address
+could reach the V6 branch and then match nothing at all. #6577 closed both.
+
+**The query side — containment.** `net.IPNet.Contains` opens with the same
+`if x := ip.To4(); x != nil { ip = x }` narrowing, so a mapped address folded to
+4 bytes and then failed Contains' `len(ip) != len(nn)` guard against **every**
+16-byte v6 prefix — `::/0` included. A mapped destination could therefore never
+match ANY concrete v6 prefix, while the dataplane's `PrefixV6::contains`
+(`userspace-dp/src/prefix.rs`) compares unfolded 128-bit values
+(`(u128::from(ip) & self.mask) == self.network`) and matched it. A v6 DENY that
+drops the packet on the box fell through to a later PERMIT in the simulator.
+`matchAddr`'s v6 branch now uses `containsAnyV6`, an explicit 16-byte masked
+compare that mirrors the Rust mask exactly. The v4 branch deliberately KEEPS
+`Contains`: `net.ParseIP` returns a 16-byte 4-in-6 slice for a dotted quad while
+v4 prefixes are stored 4-byte, so the fold is what makes those widths meet.
+
+**The address-set side — prefix classification.** `addCIDRValue` classified a
+parsed value with `ipnet.IP.To4() != nil`, which folds the same way, so
+`::ffff:0:0/96`, every mapped `/97`-`/128` prefix, and a bare
+`::ffff:a.b.c.d` landed in the **V4** set. That is not benign misfiling:
+`Contains` then folds the 16-byte network through `To4()` and slices the 16-byte
+mask down to its TRAILING four bytes (`net.networkNumberAndMask`), so
+`::ffff:0:0/96` degrades to an IPv4 **/0 matching every IPv4 address** and a
+mapped `/120` aliases to the embedded IPv4 `/24`. Rust does the opposite:
+`parse_address` runs `prefix.parse::<IpNet>()` and `Ipv4Addr::from_str` REJECTS
+a colon-bearing literal, so the arm taken is `Ok(IpNet::V6(net))`. On a DENY the
+simulator therefore claimed the rule covered all of IPv4 — a false sense of
+protection for traffic the box does not filter — while reporting no coverage for
+the mapped addresses it actually denies. `addCIDRValue` now classifies from the
+literal's TEXT via `addrValueFamily` (`config.NATAddrFamily` on
+`config.NATCIDRIPPart`), the same colon-strict SSOT #6377 uses. Ordinary
+literals are unaffected: a dotted quad has no colon, a genuine v6 literal has
+one, and both classify exactly as `To4()` did — only the mapped forms move.
+`net.ParseCIDR` accepts these tokens at commit
+(`policyMatchAddressTokenRecognized`), so the shape is reachable, not
+theoretical.
+
+One caveat worth knowing: on the address-BOOK path `pkg/dataplane/userspace`
+still pre-splits book values into the wire v4/v6 buckets with the folding
+`isV4CIDR`, and Rust's `parse_book_prefix_into` enforces the declared family and
+REJECTS the whole snapshot for a mapped prefix filed under v4
+(`UnrepresentableAddressBookPrefix`). That path fails closed at config push and
+programs nothing, so classifying the literal v6 here is strictly closer to the
+dataplane either way; the exact Go/Rust agreement is on the DIRECT policy
+literal, which `classifyPolicyAddresses` passes through unchanged.
+
+Fail-on-revert artifacts: `mapped_ipv6_contains_6577_test.go` (query side) and
+`mapped_ipv6_prefix_6577_test.go` (address-set side). The latter drives the real
+`resolveToken`/`addCIDRValue` construction path rather than calling the helper
+directly, and carries the over-reach guards —
+`TestAddressFamilyClassificationUnchanged_6577` (ordinary v4/v6 prefixes, bare
+IPs, `any`/`any-ipv4`/`any-ipv6`, and sub-`/96` mapped prefixes that were
+already v6) and `TestOrdinaryV4PolicyUnaffectedByPrefixFix_6577` both stay GREEN
+under the revert. Note `containsAnyV6` cannot itself distinguish a dotted quad
+from its mapped form (`net.ParseIP` returns byte-identical values for both), so
+the colon-strict family hint is the SOLE guard against a v4 address being tested
+against `::/0`; every production call site derives that hint from the same raw
+string it parses the IP from.
 
 ## Not modeled
 

@@ -695,10 +695,21 @@ type Result struct {
 	// layer and NO transit global/default fallback. Local delivery is instead
 	// gated by host-inbound-traffic service admission, which post-#3405
 	// DEFAULT-DENIES a zone that has no host-inbound-traffic stanza — so
-	// "unmatched" does NOT mean the packet is delivered (#3627). Matched is
-	// false and DefaultUsed is false; callers must render this as "host-inbound,
-	// subject to host-inbound-traffic service admission (no stanza => default
-	// deny), not governed by transit/global/default policy", NOT as the
+	// "unmatched" does NOT mean the packet is delivered (#3627).
+	//
+	// #6576 NARROWED this flag: an unmatched host walk that recorded a SKIPPED
+	// overlapping port-bearing frag-deny candidate returns that deny
+	// (FragmentAssociatedDeny) instead of setting this — the host fall-through
+	// is permit-like, so the fragment fails closed against the rule it skipped,
+	// mirroring the post-walk arm in evaluate_junos_host_policy. The flag now
+	// means "unmatched AND no frag candidate", which for every ordinary L4
+	// query (which never records a candidate) is the unchanged pre-#6576
+	// contract — the management lifeline is untouched.
+	//
+	// Matched is false and DefaultUsed is false; callers must render this as
+	// "host-inbound, subject to host-inbound-traffic service admission (no
+	// stanza => default deny), not governed by transit/global/default
+	// policy", NOT as the
 	// default-policy verdict. Action is unset (PolicyPermit zero value) and
 	// carries no meaning in this case.
 	HostInboundUnmatched bool
@@ -822,7 +833,9 @@ type Result struct {
 	// a RST/ICMP: it can only silently DROP, and the Rust
 	// frag_associated_deny_result hardcodes PolicyAction::Deny to match (see
 	// fragDenyResult). It is set ONLY for a Query with NonFirstFragment == true
-	// whose transit walk would otherwise have permitted; a fragment that a real
+	// whose walk would otherwise have permitted — the TRANSIT walk, or (since
+	// #6576, mirroring #6465/#6505) the junos-host walk, whose permit-like
+	// unmatched fall-through counts as a permit here; a fragment that a real
 	// (protocol-only / `any`) deny matched directly, or that permits with no
 	// overlapping skipped deny, does not carry it. Callers surface FragmentDenyNote
 	// so an operator reads WHY the fragment is denied (the security-over-
@@ -1671,6 +1684,13 @@ func matchAddr(cfg *config.Config, overlay map[string][]string, addrs []string, 
 // narrowing is CORRECT here: net.ParseIP hands back a 16-byte 4-in-6 slice for
 // a plain dotted quad, and addCIDRValue stores v4 prefixes 4-byte, so the fold
 // is what makes the two widths meet.
+//
+// The fold is only safe because addCIDRValue routes a value into a v4 set on
+// the COLON-STRICT text family (addrValueFamily), so every net here came from a
+// colonless literal and is a genuine 4-byte IPv4 prefix. Before #6577 the
+// routing used ipnet.IP.To4(), which filed a mapped `::ffff:0:0/96` here — and
+// Contains then sliced its 16-byte mask to the trailing four ZERO bytes,
+// degrading it to an IPv4 /0 that matched every IPv4 address.
 func containsAny(nets []*net.IPNet, ip net.IP) bool {
 	for _, n := range nets {
 		if n.Contains(ip) {
@@ -1696,12 +1716,26 @@ func containsAny(nets []*net.IPNet, ip net.IP) bool {
 // mapped address is tested against (the unsupported-tuple gate); this is HOW
 // containment is performed once the address lands in the v6 branch.
 //
-// Every net reaching a v6 set is a genuine 16-byte prefix — addCIDRValue routes
-// a value here only when `ipnet.IP.To4() == nil` — so a straight 16-byte masked
-// compare mirrors the Rust mask exactly. Written explicitly rather than through
-// netip (the #6327 preference) because netip.Prefix.Contains keys family off
-// Addr.BitLen(), and the 4-in-6 slice net.ParseIP returns for a dotted quad
-// would make an implicit-family form silently stop matching v4.
+// Every net reaching a v6 set carries a 16-byte IP AND a 16-byte mask —
+// addCIDRValue routes a value here on the COLON-STRICT text family
+// (addrValueFamily), and net.ParseCIDR of a colon-bearing literal yields a
+// 16-byte network plus a CIDRMask(n, 128), while the bare-IP branch stores
+// To16() plus CIDRMask(128, 128). That holds for an IPv4-MAPPED prefix too
+// (`::ffff:0:0/96` -> 16-byte `::ffff:0.0.0.0` + a 16-byte /96 mask), which is
+// what lets the straight 16-byte masked compare below mirror the Rust
+// `PrefixV6` mask exactly for the mapped forms #6577 is about. Written
+// explicitly rather than through netip (the #6327 preference) because
+// netip.Prefix.Contains keys family off Addr.BitLen(), and the 4-in-6 slice
+// net.ParseIP returns for a dotted quad would make an implicit-family form
+// silently stop matching v4.
+//
+// The caller supplies the PACKET family colon-strictly too (queryTupleFamily
+// off config.NATAddrFamily on the raw operator text). That hint is the SOLE
+// guard against a plain dotted quad reaching this branch: net.ParseIP("10.0.1.5")
+// and net.ParseIP("::ffff:10.0.1.5") are BYTE-IDENTICAL, so containsAnyV6
+// cannot itself tell them apart and would happily match a v4 address against
+// `::/0`. Every production call site derives the family from the same raw
+// string it parses the IP from, so the case is unreachable there.
 func containsAnyV6(nets []*net.IPNet, ip net.IP) bool {
 	ip16 := ip.To16()
 	if ip16 == nil {
@@ -1766,6 +1800,10 @@ func resolveToken(cfg *config.Config, overlay map[string][]string, tok string) (
 
 // addCIDRValue parses one address value (CIDR, bare IP, "any", or a family
 // wildcard) and appends it to the appropriate family set / wildcard flag.
+//
+// The family is classified COLON-STRICTLY from the value's TEXT
+// (config.NATAddrFamily on config.NATCIDRIPPart), never from the parsed
+// net.IP's To4() — see addrValueFamily.
 func addCIDRValue(val string, v4nets, v6nets *[]*net.IPNet, anyV4, anyV6 *bool) {
 	switch val {
 	case "":
@@ -1787,7 +1825,7 @@ func addCIDRValue(val string, v4nets, v6nets *[]*net.IPNet, anyV4, anyV6 *bool) 
 		return
 	}
 	if _, ipnet, err := net.ParseCIDR(val); err == nil {
-		if ipnet.IP.To4() != nil {
+		if addrValueFamily(val) == "v4" {
 			*v4nets = append(*v4nets, ipnet)
 		} else {
 			*v6nets = append(*v6nets, ipnet)
@@ -1795,12 +1833,45 @@ func addCIDRValue(val string, v4nets, v6nets *[]*net.IPNet, anyV4, anyV6 *bool) 
 		return
 	}
 	if ip := net.ParseIP(val); ip != nil {
-		if ip4 := ip.To4(); ip4 != nil {
-			*v4nets = append(*v4nets, &net.IPNet{IP: ip4, Mask: net.CIDRMask(32, 32)})
+		if addrValueFamily(val) == "v4" {
+			*v4nets = append(*v4nets, &net.IPNet{IP: ip.To4(), Mask: net.CIDRMask(32, 32)})
 		} else {
-			*v6nets = append(*v6nets, &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)})
+			*v6nets = append(*v6nets, &net.IPNet{IP: ip.To16(), Mask: net.CIDRMask(128, 128)})
 		}
 	}
+}
+
+// addrValueFamily classifies one address-book / policy address literal into
+// "v4" or "v6" from its TEXT, mirroring the Rust `parse_address` /
+// `parse_book_prefix_into` dispatch in userspace-dp/src/policy.rs
+// (`prefix.parse::<IpNet>()` tries `Ipv4Net` first, and Rust's
+// `Ipv4Addr::from_str` REJECTS anything containing a colon, so a colon-bearing
+// literal is always `IpNet::V6`). config.NATAddrFamily is the colon-strict
+// SSOT for exactly this Go/Rust divergence and config.NATCIDRIPPart strips the
+// mask so the classification runs on the ORIGINAL text.
+//
+// #6577 (prefix half): the previous `ipnet.IP.To4() != nil` / `ip.To4() != nil`
+// test FOLDS an IPv4-mapped literal, so `::ffff:0:0/96` and every mapped
+// `/97`-`/128` prefix landed in the V4 set. That is not a cosmetic
+// misfiling — once a mapped prefix is in the v4 set, net.IPNet.Contains folds
+// the 16-byte network through To4() and slices the 16-byte mask down to its
+// TRAILING four bytes (net.networkNumberAndMask), so `::ffff:0:0/96` degrades
+// to an IPv4 /0 that matches EVERY IPv4 address, and a mapped `/120` aliases
+// to the embedded IPv4 `/24`. On a DENY rule the simulator therefore reported
+// the rule covering all of IPv4 while the dataplane holds it as a `PrefixV6`
+// that no plain IPv4 packet is ever tested against — the opposite verdict, in
+// the package whose contract is dataplane parity. The bare-IP branch had the
+// identical defect: `::ffff:10.0.0.1` became a v4 /32 while Rust's `Err(_)`
+// arm parses it as an `Ipv6Addr` and stores a v6 /128.
+//
+// This is the address-SET half of the same defect the containsAnyV6 fix closes
+// on the query side. Ordinary literals are unaffected: a dotted quad / v4 CIDR
+// has no colon ("v4") and a genuine v6 literal has one ("v6"), so both classify
+// exactly as the To4() test did — only the mapped forms move, which is the fix.
+// See README "Colon-strict family — containment and prefix classification
+// (#6577)" for the address-BOOK path, which fails closed separately.
+func addrValueFamily(val string) string {
+	return config.NATAddrFamily(config.NATCIDRIPPart(val))
 }
 
 func isBookName(cfg *config.Config, overlay map[string][]string, tok string) bool {
