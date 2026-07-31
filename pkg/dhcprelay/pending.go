@@ -304,15 +304,35 @@ func (t *pendingTable) insert(k pendingKey) {
 
 	now := t.now()
 
+	// FULL-DRAIN FAST PATH. The ring is expiry-ordered, so if even the NEWEST
+	// slot has expired then EVERY slot has. Without this, the loop below would
+	// pop the whole ring one slot at a time — up to pendingCapMax (131072)
+	// iterations, each with a map lookup and delete, all under the mutex and on
+	// the client-facing packet path — on the first insert after an idle period.
+	// That is a ~10ms stall that also blocks the reply loop. Detecting it costs
+	// one slot read, and the reset itself is O(1): head/count go to zero and the
+	// map is replaced wholesale rather than deleted key by key.
+	//
+	// Slots at or beyond count are never read (pushLocked overwrites a slot
+	// before count covers it, and snapshot bounds its walk by count), so leaving
+	// the stale contents in place is safe and keeps this genuinely constant-time.
+	if t.count > 0 && !now.Before(t.ring[(t.head+t.count-1)%len(t.ring)].exp) {
+		t.slotScans++ // the one probe read above
+		t.head = 0
+		t.count = 0
+		t.entries = make(map[pendingKey]pendingEntry)
+	}
+
 	// Reclaim expired slots from the head. The ring is expiry-ordered, so this
 	// stops at the first unexpired slot.
 	//
-	// COST: amortized O(1) — every slot is pushed once and popped once — but
-	// the WORST CASE for a single call is one full drain of up to `capacity`
-	// slots, when the first insert after a long idle period finds everything
-	// expired. That is bounded, happens at most once per idle period (the next
-	// insert finds an empty ring), and is not the per-packet repeat the
-	// pre-ring implementation had. It is NOT strict O(1); do not claim it is.
+	// COST: amortized O(1) — every slot is pushed once and popped once. The
+	// worst case for a single call used to be a full drain of up to `capacity`
+	// slots; the fast path above now takes that case in constant time, so what
+	// remains here is a PARTIAL drain, bounded by the number of slots that
+	// expired while at least one newer slot did not. It is still not STRICT
+	// O(1) — do not claim it is — but there is no longer an unbounded-looking
+	// stall on the packet path.
 	for t.count > 0 && !now.Before(t.ring[t.head].exp) {
 		t.popHeadLocked()
 	}
@@ -458,15 +478,27 @@ func (t *pendingTable) snapshot() []pendingSlot {
 // steady-state path uses, and the ones closest to expiry anyway) and each is
 // COUNTED as an eviction, so a shrink shows up in PendingEvicted instead of
 // silently discarding bindings.
+//
+// The bound is the REMAINING room, not the raw capacity. Production always
+// adopts into a table built moments earlier, so the two are the same; but
+// pushLocked's contract is that the caller has already made room, and bounding
+// by capacity alone would silently break it for a non-empty destination —
+// count would run past the ring length and the modular index would overwrite
+// live slots. Bounding by room makes adopt correct for any destination at no
+// cost to the production path.
 func (t *pendingTable) adopt(slots []pendingSlot) {
 	if t == nil || len(slots) == 0 {
 		return
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if capacity := len(t.ring); len(slots) > capacity {
-		t.evicted += uint64(len(slots) - capacity)
-		slots = slots[len(slots)-capacity:] // keep the NEWEST (longest-lived)
+	room := len(t.ring) - t.count
+	if room < 0 {
+		room = 0 // unreachable while count <= capacity holds; never slice past len
+	}
+	if len(slots) > room {
+		t.evicted += uint64(len(slots) - room)
+		slots = slots[len(slots)-room:] // keep the NEWEST (longest-lived)
 	}
 	for _, s := range slots {
 		t.pushLocked(s.key, s.exp)

@@ -62329,3 +62329,52 @@ break — `go vet` confirmed passing under every revert.
   -race PASS; go build ./... , gofmt, vet, GOARCH=386 vet clean.
 - **File(s)**: pkg/dhcprelay/{pending.go,relay.go,README.md,
     relay_binding_6562_test.go}, pkg/cli/show_services_dhcp.go, _Log.md
+
+- **Timestamp**: 2026-07-31 14:55 PDT
+- **Action**: #6603 re-review fold, residual pass. Verified the previous fold
+  commit (e98510a6b) against the Codex verdict finding by finding, reproduced
+  its fail-on-revert claims independently in a throwaway detached worktree, and
+  closed the three gaps it left.
+
+  Independent revert probes (worktree /dev/shm/probe-6603g at e98510a6b, build
+  and vet CLEAN in each so every red is an assertion, worktree removed after):
+    * Neutralizing the phase-2.5 snapshot/adopt migration in Apply reds BOTH
+      TestRelay_RateChangePreservesBindings ("the outstanding binding was
+      destroyed by the rate change") and its _EndToEnd sibling, the latter
+      logging the exact predicted "dropping server reply with no outstanding
+      request" WARN. MAJOR gate confirmed.
+    * Reverting popHeadLocked slot identity from the generation counter back to
+      e.exp.Equal(s.exp) reds TestPendingTable_EqualExpiriesDoNotLoseBinding.
+    * Pointing occupancy() back at len(t.entries) reds
+      TestPendingTable_OccupancyTracksRingNotMap ("occupancy = 2, want 4").
+
+  Gaps closed in this commit:
+    * MINOR 4 was only half-folded. The previous commit made the README's O(1)
+      claim honest but added neither remedy Codex asked for. insert() now takes
+      the pathological case in CONSTANT time: the ring is expiry-ordered, so one
+      probe of the newest slot proves the whole ring is dead, and head/count
+      reset to zero with the map replaced wholesale. Previously that call popped
+      up to 131072 slots, each with a map lookup and delete, under the mutex on
+      the client-facing packet path.
+    * adopt() bounded migration by raw capacity, ignoring the destination's
+      existing count. That breaks pushLocked's documented "caller has already
+      made room" contract for a non-empty destination: count runs past the ring
+      length and the modular index overwrites live slots. Now bounded by
+      REMAINING room; identical on the production path (a fresh table), correct
+      for any caller.
+    * The CLI comment fold replaced the stale "pending-evicted is the early
+      warning" sentence but left the pre-existing paragraph that already said
+      the same thing, so the block stated the leading-indicator point twice with
+      a ragged wrap. Collapsed to one statement.
+
+  New fail-on-revert binders: TestPendingTable_FullDrainIsConstantTime (counts
+  slots examined, not time, so it cannot flake; also asserts the drain is REAL
+  and is not miscounted as a cap-pressure eviction) and
+  TestPendingTable_AdoptRespectsRemainingRoom (occupancy must not exceed
+  capacity; pre-existing destination bindings must not be clobbered).
+
+  Suites: pkg/dhcprelay -race -count=5 PASS; pkg/cli -race PASS; go build ./...,
+  vet, gofmt (dhcprelay + cli), and GOARCH=386 build+vet all clean. The repo-wide
+  gofmt -l hits are pre-existing files in other packages, none touched here.
+- **File(s)**: pkg/dhcprelay/{pending.go,README.md,relay_binding_6562_test.go},
+    pkg/cli/show_services_dhcp.go, _Log.md

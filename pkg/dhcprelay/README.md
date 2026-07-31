@@ -367,10 +367,17 @@ client-facing read goroutine, which saturates a core in exactly the overload the
 table is meant to survive.
 
 The bound is **amortized** O(1), not strict: each slot is pushed once and popped
-once, but the *worst case for one call* is a full drain of up to `capacity`
-slots, when the first insert after a long idle period finds everything expired.
-That is bounded, happens at most once per idle period (the next insert finds an
-empty ring), and is not the per-packet repeat the pre-ring code had.
+once, but a single call can pop more than one slot when several expired
+together. The pathological case — the first insert after a long idle period,
+where *everything* has expired — is taken in **constant time** by a fast path:
+because the ring is expiry-ordered, one probe of the newest slot proves the
+whole ring is dead, so `head`/`count` reset to zero and the map is replaced
+wholesale instead of being deleted key by key. Without it that call popped up to
+`capacity` (131072) slots, each with a map lookup and delete, under the mutex on
+the client-facing packet path — a multi-millisecond stall that also blocked the
+reply loop. What remains is a *partial* drain, bounded by the number of slots
+that expired while at least one newer slot had not.
+`TestPendingTable_FullDrainIsConstantTime` pins this by counting slots examined.
 
 A key re-inserted before its old slot expires (a retransmission, or the
 SELECTING REQUEST reusing the DISCOVER's xid) simply gets a new slot; the older
@@ -410,7 +417,11 @@ storm this table exists to prevent. Adopted entries keep their **original
 expiry** — a reload must not refresh the TTL, which would widen the attacker's
 xid-guessing window every time the config was touched. If the replacement is
 *smaller* (the rate was lowered), the oldest excess bindings are dropped and
-**counted** in `PendingEvicted` rather than discarded silently.
+**counted** in `PendingEvicted` rather than discarded silently. The migration is
+bounded by the destination's *remaining room*, not its raw capacity: production
+always adopts into a table built moments earlier, so the two coincide, but
+bounding by capacity alone would overrun the ring of a non-empty destination and
+overwrite live slots.
 
 **TTL — 30s.** This bounds the window in which a guessed xid would be accepted,
 while covering realistic server latency. RFC 2131 §4.1's retransmission schedule
