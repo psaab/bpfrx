@@ -19,6 +19,7 @@ import (
 	"github.com/psaab/xpf/pkg/frr"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/routing"
+	"github.com/psaab/xpf/pkg/termsafe"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -538,7 +539,10 @@ func (s *Server) showRouteMap(cfg *config.Config, buf *strings.Builder) error {
 		if output == "" {
 			buf.WriteString("No route-maps configured\n")
 		} else {
-			buf.WriteString(output)
+			// #6468 D2: raw vtysh stdout into the ShowText buffer the remote
+			// `cli` prints verbatim — the mirror of showRouteMap in
+			// pkg/cli/cli_show_routing.go.
+			buf.WriteString(termsafe.SanitizeBlockForDisplay(output))
 		}
 	}
 	return nil
@@ -555,7 +559,10 @@ func (s *Server) showBFDPeers(buf *strings.Builder) error {
 		if output == "" {
 			buf.WriteString("No BFD peers\n")
 		} else {
-			buf.WriteString(output)
+			// #6468 D2: raw vtysh stdout into the ShowText buffer the remote
+			// `cli` prints verbatim — the mirror of showBFD in
+			// pkg/cli/cli_show_routing.go.
+			buf.WriteString(termsafe.SanitizeBlockForDisplay(output))
 		}
 	}
 	return nil

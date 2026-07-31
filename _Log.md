@@ -61795,6 +61795,220 @@ would never produce.
     pkg/dhcp/dhcpv6_iapd_prefixlen_6531_test.go,
     pkg/ra/sender_prefixlen_6531_test.go,
     pkg/daemon/ra_pd_prefixlen_6531_test.go, _Log.md
+
+## 2026-07-31 — close the two #6468 residual terminal-escape surfaces
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6468 fixed the DHCP lease fields it named, but two other
+  device/remote-supplied strings still reached an operator terminal unescaped.
+- **File(s)**: `pkg/termsafe/termsafe.go`, `pkg/termsafe/block_6468_test.go`
+  (new), `pkg/cli/show_services_ddns.go`,
+  `pkg/grpcapi/server_show_dhcp_lldp_snmp.go`, `pkg/cli/cli_show_routing.go`
+
+**D1 — DDNS `LastError`.** Safe for dyndns2/duckdns/generic (they wrap the
+provider response in `%q`) but NOT for Cloudflare
+(`backend_cloudflare.go:166`) or Route 53 (`backend_route53.go:195,277`),
+which embed provider message text with `%s`. Sanitized at the two display
+sites so the class is covered regardless of backend.
+
+**D2 — raw `vtysh` stdout.** All 12 `fmt.Print(output)` sites in
+`cli_show_routing.go` print unmodified vtysh output carrying remote-advertised
+text (BGP hostname capability, IS-IS dynamic hostname TLVs, OSPF router IDs).
+
+New `termsafe.SanitizeBlockForDisplay` preserves LF/TAB so a table is not
+collapsed — `SanitizeForDisplay` escapes those too, correctly for a
+single-line field but destructively for a block. CR is deliberately NOT
+preserved (line-overwrite forgery).
+
+## 2026-07-31 — fold the #6579 hostile-review findings (both renderers + call-site tests)
+
+- **Timestamp**: 2026-07-31
+- **Action**: The first pass fixed the vtysh class on the LOCAL CLI only. Every
+  one of those 12 sites has a byte-for-byte mirror in `pkg/grpcapi` feeding the
+  remote `cli`'s verbatim `fmt.Print(resp.Output)`, and it was left raw — the
+  more common operator posture kept exactly the pre-fix behavior. Nothing in
+  the suite noticed, because the diff had zero call-site tests.
+- **File(s)**: `pkg/grpcapi/server_routing.go`,
+  `pkg/grpcapi/server_show_routes_text.go`, `pkg/cli/cli_request.go`,
+  `pkg/termsafe/termsafe.go`, `pkg/termsafe/block_6468_test.go`,
+  `pkg/grpcapi/server_routing_escape_6468_test.go` (new),
+  `pkg/grpcapi/server_show_ddns_escape_6468_test.go` (new),
+  `pkg/cli/cli_residual_escape_6468_test.go` (new), `pkg/cli/README.md`
+
+**MAJOR-1 — gRPC mirror.** All 12 sites sanitized. On `GetOSPFStatus` /
+`GetISISStatus` / `GetBGPStatus` the guard sits on the RESPONSE rather than on
+each vtysh branch, so a later `case` is covered by construction; the structured
+branches take the allocation-free fast path. `showBFDPeers` / `showRouteMap`
+guard their `buf.WriteString`.
+
+**MAJOR-2 — call-site tests, both renderers.** 15 revert cases, each reverted
+via Edit one hunk at a time (so the `termsafe` import stays used and the RED is
+an assertion, never a build break). Every one produced an assertion failure.
+Two of them are WRONG-VARIANT reverts: swapping the block sanitizer for the
+single-line one on a vtysh site trips the line-count assertion, and swapping
+the single-line one for the block variant on `LastError` trips the `\x0a`
+assertion.
+
+**MINOR-1** — `cli_request.go` OSPF/BGP clear now sanitize their vtysh stdout.
+
+**MINOR-3** — `SanitizeBlockForDisplay` now escapes U+2028/U+2029. They are
+Zl/Zp, so `unicode.IsControl` misses them and the single-line variant's
+documented bidi/Cf out-scope let them through. A terminal that honors U+2028 as
+a break lets a peer hostname add a row to the very table the function is
+keeping printable. Same argument that escapes CR. Rendered as
+` ` (a `\xHH` escape cannot represent a rune above U+00FF);
+`blockDisplaySafe` rejects them so the fast path cannot bypass.
+
+## 2026-07-31 — fold the Codex round on #6579 (parsed FRR cells + %q correction)
+
+- **Timestamp**: 2026-07-31
+- **Action**: Codex found the class definition itself was incomplete. Both the
+  earlier sweep and the Claude review defined the class over RAW COMMAND
+  OUTPUT; a field that is PARSED out of that output and reprinted into a
+  caller-formatted row is invisible to that framing.
+- **File(s)**: `pkg/termsafe/termsafe.go`, `pkg/termsafe/row_6468_test.go`
+  (new), `pkg/frr/status_parse.go`, `pkg/cli/cli_show_routing.go`,
+  `pkg/grpcapi/server_routing.go`, `pkg/cli/cli_residual_escape_6468_test.go`,
+  `pkg/grpcapi/server_routing_escape_6468_test.go`,
+  `pkg/cli/show_services_ddns.go`,
+  `pkg/grpcapi/server_show_dhcp_lldp_snmp.go`,
+  `pkg/termsafe/block_6468_test.go`, `pkg/cli/README.md`
+
+**Proven case — `ISISAdjacency.SystemID`.** FRR substitutes the hostname the
+peer advertised in its Dynamic Hostname TLV (RFC 5301) for the numeric system
+ID, so column 1 of `show isis neighbor` is peer-controlled text.
+`GetISISAdjacency` reaches it through `strings.Fields`, which splits on
+`unicode.IsSpace` ONLY — measured: ESC/DEL/BEL/C1-CSI/NUL are all
+`IsSpace=false` and ride inside the token untouched. Tokenizing is not
+sanitizing.
+
+**Extension the review did not have.** Sanitizing only `SystemID` would still
+be wrong: `strings.Fields` means a hostname containing a SPACE shifts
+Interface/Level/State/HoldTime one column right and puts peer bytes in each.
+The guard has to cover the WHOLE row. New `termsafe.SanitizeRowForDisplay`
+makes that unskippable, and the same guard went on the other four parsed FRR
+tables (OSPF neighbors, BGP summary, BGP routes, RIP routes) on both
+renderers — free on clean text, and "this column is numeric" is a property of
+the current FRR rather than of the protocol.
+
+**Row guard is NOT redundant with the response-boundary block guard.** Proven,
+not assumed: reverting the gRPC IS-IS row guard alone leaves the raw-ESC test
+green because the block guard catches it. The isolating case is a JSON-decoded
+BGP-summary cell carrying a real LF — the block variant preserves LF by design
+and renders a forged peer row; only the per-cell field guard escapes it. Both
+renderers now have that test, and the gRPC IS-IS test is documented as
+defense-in-depth rather than a binder. (Superseded by the next entry: the gRPC
+IS-IS per-cell call IS bindable, via column alignment rather than content.)
+
+**Factual correction.** The earlier comments said dyndns2/duckdns/**generic**
+wrap the provider body in `%q`. Verified wrong: generic does not quote the body,
+it OMITS it entirely (`backend_generic.go:242` formats the configured
+`okTokens` with `%v`, never the response). Correct tally: two embed it
+unquoted (Cloudflare `:166`, Route 53 `:195,277`), two quote it (dyndns2,
+duckdns), generic omits it, rfc2136 reports a fixed rcode string. The fix is
+unaffected — the two unsafe backends are the two already identified.
+
+Scoped out, verified: `frr.FormatRouteDetail` (JSON-typed, no free-text cell),
+`routing.RouteEntry` (netlink, not peer-sourced), the `pkg/api` REST renderers
+(JSON, no shipped terminal consumer). The `slog`/remote-syslog sink Codex
+raised is a different sink and a package-wide policy question; filed separately
+by the parent, deliberately NOT folded here.
+
+## 2026-07-31 — fold the Codex re-review of #6579 (claim narrowing + row-site binders)
+
+- **Timestamp**: 2026-07-31
+- **Action**: Codex re-reviewed the folded head at `83aba402d` and returned
+  MERGE-NEEDS-MAJOR. The MAJOR is real and is filed as **#6590**, deliberately
+  NOT fixed here: it is a different bug class at a different layer (parsing),
+  while this PR closes escape-injection at the display layer. What this fold
+  does about it is make sure the PR, the docs and the code comments do not
+  CLAIM more than they deliver. The three MINORs are folded.
+- **File(s)**: `pkg/termsafe/termsafe.go`, `pkg/termsafe/row_6468_test.go`,
+  `pkg/termsafe/block_6468_test.go`, `pkg/frr/status_parse.go`,
+  `pkg/frr/bgp_summary_hostname_6468_test.go` (new),
+  `pkg/cli/cli_row_escape_6579_test.go` (new),
+  `pkg/grpcapi/server_row_escape_6579_test.go` (new),
+  `pkg/grpcapi/server_routing_escape_6468_test.go`, `pkg/cli/README.md`
+
+**MAJOR (#6590) — narrowed every claim instead of overstating the fix.** Codex
+is right that escaping a row does not prevent SEMANTIC spoofing: `strings.Fields`
+splits on whitespace, so a peer hostname containing a space shifts every later
+column and `SanitizeRowForDisplay` — which preserves plausible printable text —
+cannot tell a genuine `State=Up` from a peer-supplied token. **A row can be
+terminal-safe and materially false.** Narrowed in five places: the `pkg/termsafe`
+package doc, the `SanitizeRowForDisplay` doc (new "What this does NOT fix"
+section, ending "do not cite a call to this function as evidence that a rendered
+row is trustworthy"), the `SanitizeBlockForDisplay` doc, the `ISISAdjacency` doc
+in `pkg/frr`, and the `pkg/cli/README.md` guard contract (new "What the guard
+does NOT do — do not overstate this in a review"). Also dropped two "keeps the
+table honest" phrasings, in the block doc and a test message, for "keeping it
+printable". Every narrowing points at #6590.
+
+**MINOR-2 — `SanitizeForDisplay` now escapes U+2028/U+2029 too.** The first fold
+gave the BLOCK variant line-separator escaping and left the field variant
+passing them, which became incoherent once cells started going through the
+field variant: that variant already escapes LF, so passing the Unicode line
+break while escaping the ASCII one made the STRICTER variant the more permissive
+one for exactly the row-forgery vector. `DisplaySafe` moved in lockstep — it
+gates the allocation-free return, so leaving it behind would have made the new
+escaping dead code, and there is a test that says so. Blast radius on already-
+merged #6468 surfaces (DHCP lease `Hostname`/`HWAddress`, DDNS `FQDN`,
+`LastError`): judged a strict improvement — all are single-line fields padded
+into a row, where a line separator has no legitimate use. `DisplaySafe` has no
+callers outside the package.
+
+**MINOR-3 — corrected the false cost claim, kept the API.** Codex measured ~96 B
+/ 4 allocs per clean 3-cell row "versus zero for direct formatting". The 96 B / 4
+allocs reproduce; the zero-alloc baseline does not — it is an artifact of
+benchmarking string CONSTANTS, which the compiler boxes into read-only statics.
+Measured with production-shaped values (struct fields), 10k 3-cell rows:
+
+| path | allocs | bytes |
+|---|---|---|
+| no sanitizer at all | 30,034 | 3.73 MB |
+| per-cell `SanitizeForDisplay`, no helper | 30,035 | 3.73 MB |
+| `SanitizeRowForDisplay(...)...` | 40,037 | 4.21 MB |
+
+So the helper's real cost is ONE allocation and 48 bytes per row (the `[]any`);
+the 3-per-row boxing is inherent to `fmt`'s variadic `any` and is paid by the
+unguarded path too. The per-cell sanitize is genuinely free — that was the
+substantive claim and it holds. Accepted rather than restructured: these are
+`show` render loops already gated by a `vtysh` fork/exec and a whole-table
+string materialization, not a packet path. The doc now carries the table, names
+the escape hatch (hoist a scratch `[]any`), and `BenchmarkSanitizedRow{Unguarded,
+Inline,Helper}` plus a `testing.AllocsPerRun` pin keep it checkable.
+
+**MINOR-4 — closed all three coverage gaps.**
+
+- *Missing call-site binders.* OSPF neighbors, BGP routes and RIP routes had no
+  binder on either renderer. Added, with per-parser fixtures. All **10**
+  parsed-row sites (5 per renderer) are now individually bound: reverting any
+  one produces a build-clean assertion failure naming that site.
+- *The masked IS-IS binder.* Codex was right that reverting the inner gRPC IS-IS
+  row guard still passed — the response-boundary block guard neutralizes the ESC
+  either way. Codex's suggested fix (the JSON-decoded LF shape) is **not**
+  reachable for this row: `strings.Fields` splits on `unicode.IsSpace`, which
+  includes LF, TAB, NEL, NBSP *and* U+2028/U+2029, so no whitespace rune can
+  survive into an IS-IS cell. The discriminator that does survive the mask is
+  COLUMN ALIGNMENT: `%-20s` pads whatever it is handed, so guarding the cell
+  pads the 17-char escaped text to 20, while guarding only the response pads the
+  14-byte raw text and *then* expands the escape — the next column shifts right
+  by exactly 3. Reverting now fails with "the next column starts at 26 instead
+  of 23 — exactly the 3 bytes the ESC grows by when escaped". This also binds a
+  real property: the guard must precede the width format or a hostile cell
+  displaces every column after it.
+- *The `encoding/json` declared-field-set claim.* Documented as a load-bearing
+  security boundary, previously unpinned. Two tests in `pkg/frr`: a hostile
+  `hostname` key must not reach ANY string field of `BGPPeerSummary` (reflective
+  sweep, so a future field addition is caught), and `bgpPeerJSON` must declare
+  no hostname field and no catch-all decode target (map/interface/slice) that
+  would defeat "undeclared keys are dropped".
+
+**Validation.** `pkg/cli`, `pkg/grpcapi`, `pkg/termsafe`, `pkg/frr`, `pkg/api`,
+`pkg/ddns` all green; `go build ./...` and `go vet ./pkg/...` clean. Revert
+battery: 10 row sites + the U+2028 escaping + both JSON-boundary tests, each
+reverted via Edit one hunk at a time so RED is an assertion and never a build
+break — `go vet` confirmed passing under every revert.
 - **Action**: #6549 range-gate + clamp the chassis-cluster interface-monitor
   weight. `interface-monitor <if> weight <w>` had no bound at any layer:
   the leaf packs its tokens onto one node key so it has no typed schema
