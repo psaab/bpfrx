@@ -38,19 +38,44 @@ func (s *Server) showSNMP(cfg *config.Config, buf *strings.Builder) {
 	}
 	if len(snmpCfg.Communities) > 0 {
 		buf.WriteString("Communities:\n")
-		for name, comm := range snmpCfg.Communities {
-			fmt.Fprintf(buf, "  %s: %s\n", name, comm.Authorization)
+		// #6532: the SNMPv1/v2c community string IS the authenticator, and it
+		// is the Communities map KEY — a plain string that the Secret newtype's
+		// String() redaction does not cover (config.SNMPCommunity). Printing
+		// the raw key leaked the cleartext credential on an RPC that is NOT
+		// loopback-bound: ShowText is on the cluster-fabric allowlist (#4122),
+		// so this render is reachable from the peer chassis over the fabric.
+		// Both sibling surfaces were already hardened — pkg/cli `show snmp`
+		// (#4111) and the pkg/api show-text handler (#5315); this one was left
+		// in the clear.
+		//
+		// The mask is unconditional, matching pkg/api and the sibling gRPC
+		// ShowConfig raw-AST redaction (#4051): gRPC carries no login class to
+		// gate on, so unlike pkg/cli there is no privileged caller to exempt.
+		// The authorization mode stays visible; only the secret is masked.
+		// Iteration runs over the real (sorted) keys so the render stays
+		// deterministic once every displayed key is the same placeholder
+		// (mirrors #4712 on the REST sibling).
+		for _, name := range sortedMapKeys(snmpCfg.Communities) {
+			comm := snmpCfg.Communities[name]
+			fmt.Fprintf(buf, "  %s: %s\n",
+				config.SNMPCommunityDisplayName(name, true), comm.Authorization)
 		}
 	}
+	// #6532: the remaining map iterations sort too, completing the #4712
+	// determinism parity with the REST sibling (pkg/api/show_text.go, which
+	// sorts communities AND trap groups). Go randomizes map iteration, so
+	// these lines reordered between two identical requests.
 	if len(snmpCfg.TrapGroups) > 0 {
 		buf.WriteString("Trap groups:\n")
-		for name, tg := range snmpCfg.TrapGroups {
+		for _, name := range sortedMapKeys(snmpCfg.TrapGroups) {
+			tg := snmpCfg.TrapGroups[name]
 			fmt.Fprintf(buf, "  %s: %s\n", name, strings.Join(tg.Targets, ", "))
 		}
 	}
 	if len(snmpCfg.V3Users) > 0 {
 		buf.WriteString("SNMPv3 USM users:\n")
-		for name, u := range snmpCfg.V3Users {
+		for _, name := range sortedMapKeys(snmpCfg.V3Users) {
+			u := snmpCfg.V3Users[name]
 			auth := u.AuthProtocol
 			if auth == "" {
 				auth = "none"
@@ -62,6 +87,18 @@ func (s *Server) showSNMP(cfg *config.Config, buf *strings.Builder) {
 			fmt.Fprintf(buf, "  %s: auth=%s priv=%s\n", name, auth, priv)
 		}
 	}
+}
+
+// sortedMapKeys returns a string-keyed map's keys in ascending order, so a
+// config map renders deterministically across requests (Go randomizes map
+// iteration order — #4712).
+func sortedMapKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // showSNMPv3 renders the SNMPv3 USM user table.

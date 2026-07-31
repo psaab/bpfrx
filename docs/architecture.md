@@ -181,6 +181,50 @@ editing cmdtree.
   removing the ~1-window replay horizon (mTLS with per-node certs) and
   HMAC-authenticating the session-sync stream (#4107 F23) — remain deferred
   (see `pkg/cluster/README.md`).
+  - **No allowlisted RPC may render a configured secret (#6532).** Being on
+    this allowlist means being reachable from the peer chassis over the
+    fabric IP, so the usual "loopback only" mitigation does not apply to
+    anything listed above. `ShowText{Topic:"snmp"}` rendered the SNMPv1/v2c
+    community — the v1/v2c authenticator — in cleartext there long after the
+    REST (#5315) and CLI (#4111) siblings were hardened. The property is now
+    asserted across the surface as a whole by
+    `pkg/grpcapi/server_fabric_secret_render_6532_test.go`, which stages a
+    config carrying every secret leaf in the redaction SSOT
+    (`pkg/config/ast_redact.go` `secretIndices`), drives every allowlisted
+    RPC and scans the rendered responses. The method set is **enumerated**
+    from the live allowlist maps plus the method names the interceptor
+    source special-cases, so allowlisting a new RPC fails the completeness
+    gate until it is audited; the ShowText topic set is likewise derived
+    from the dispatcher source. The structural reason the sweep finds only
+    one class of leak is that every operator secret except the SNMP
+    community is a `config.Secret`, whose `String()` masks it under
+    `%s`/`%v`/`%q`/`%x` (#2053) — the community is a plain string because it
+    is the `Communities` map key. `TestGRPCAPINeverUnwrapsSecretCleartext`
+    asserts two things are absent here: any selection named `Reveal` (the
+    cleartext accessor), and any **one-argument call** handed a
+    Secret-bearing field. The second deliberately ignores the callee —
+    matching conversion shapes (`string`, `(string)`, `[]byte`,
+    `[](byte)`, …) failed across four review rounds because a conversion's
+    callee is a type expression with open grammar, and `type Clear string;
+    Clear(x.PSK)` unwraps the secret just as well. One argument is the line
+    because the safe idiom `fmt.Fprintf(buf, "%s", x.PSK)` is
+    multi-argument and redacts correctly.
+    **This guard is syntactic and has a ceiling**, stated on the test
+    itself: it fires where a field is NAMED, so it cannot follow a value
+    into a local, a parameter, a helper return, an out-of-package field, or
+    a multi-argument handoff, nor see `append`/`copy`/ranging/reflection.
+    Closing those needs `go/types` resolution, or inverting to an
+    explicit-allowlist over all 42 conversions in the package. The clean
+    structural fix is upstream — making `config.Secret` a struct instead of
+    a named string type would make `string(s)` fail to **compile** and
+    collapse the whole shape space to the single accessor — but that is a
+    `pkg/config`-wide change (`Secret` is comparable and used as a map key)
+    and belongs in its own issue.
+    Two companion meta-tests feed the scanner and the field harvest
+    synthetic sources and assert each REPORTS every shape it claims. They
+    are load-bearing, not decorative: an all-clear from a broken check is
+    indistinguishable from an all-clear from a clean package, and this
+    check has twice shipped blind while the suite stayed green.
 - **HTTP REST** on `127.0.0.1:8080` — health, Prometheus `/metrics`,
   config endpoints, full gRPC parity.
   - **Listener lifecycle is all-or-nothing (#5058).** `Server.Run` may
