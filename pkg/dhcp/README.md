@@ -274,6 +274,38 @@ External only: `github.com/insomniacslk/dhcp`, `github.com/vishvananda/netlink`.
   is an acquisition failure and is retried, never settled into an empty
   1h lease — counted regardless of `wantNA` so a PD-only client cannot
   fall through. Pinned by `dhcp_lease_expiry_4874_test.go`.
+- **DHCPv6 IA_PD prefix-length is validated at the DECODER** (#6531). The
+  wire prefix-length is a single byte, and insomniacslk/dhcp decodes it
+  as `net.CIDRMask(int(length), 128)` — which returns a **nil** mask for
+  any length > 128. `net.IPMask(nil).Size()` is `(0, 0)`, so
+  `extractDelegatedPrefixes` reading only `ones` and discarding `bits`
+  turned a crafted length of 129..255 into a `<ip>/0`. That `/0` survived
+  `IsValid()` and `DeriveSubPrefix` and reached `pkg/ra`, which applies
+  no sanity floor of its own and advertised `PrefixInformation{PrefixLength:
+  0, OnLink, Autonomous}` to the downstream LAN — a hostile or buggy
+  upstream WAN server hijacking every SLAAC host's on-link determination
+  with one crafted option. The guard is `bits != 128 || ones == 0`
+  (`bits` is the load-bearing arm: a nil mask and a non-contiguous mask
+  both report `bits` 0; `ones == 0` is belt-and-braces for a genuine
+  all-zero 128-bit mask that only an in-process constructor can build,
+  since the decoder maps a wire length of 0 to a nil `Prefix`). The
+  offending IAPREFIX is **skipped**, not the whole reply: an IA_PD is a
+  multi-element container, matching the option-121 classless-route loop
+  below (which likewise skips an entry whose mask reports `bits != 32`),
+  whereas `leaseFromACKv4` refuses the entire v4 message only because an
+  ACK carries exactly one address+mask and there is nothing to salvage.
+  A skipped entry enters neither the live nor the withdrawn set, so a
+  hostile server gains nothing by pairing a malformed prefix with a
+  well-formed one; if the skip empties both sets the reply is treated as
+  unusable and retried. `/128` is ACCEPTED (a legal single-address
+  delegation — the bound is inclusive). Pinned by
+  `dhcpv6_iapd_prefixlen_6531_test.go`, which drives hand-rolled option
+  BYTES through `dhcpv6.MessageFromBytes`; the older IA_PD tests build
+  `OptIAPrefix` structs directly and cannot reach this path, which is how
+  the bug survived (`OptIAPrefix.ToBytes` derives the wire length from
+  `Mask.Size()`, so the library's own marshaller cannot emit > 128
+  either). `pkg/ra/sender_prefixlen_6531_test.go` pins the blast radius
+  from the consumer side.
 - **RFC 3442 classless static routes (option 121 / legacy 249, #4118).**
   `leaseFromACKv4` parses option 121 (the standard `ClasslessStaticRoute`
   accessor) and falls back to the legacy Microsoft option 249 (raw

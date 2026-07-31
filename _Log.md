@@ -61521,3 +61521,22 @@ would never produce.
     is retuned, and replaced test 2's false subsumption claim with an honest
     accounting.
   - **File(s)**: pkg/dataplane/userspace/routes_6467_crossfamily_test.go
+- **Timestamp**: 2026-07-31
+- **Action**: #6531 guard the DHCPv6 IA_PD prefix-length at the wire
+  decoder. insomniacslk/dhcp decodes the IAPREFIX length byte as
+  net.CIDRMask(length, 128), which returns a NIL mask for any length
+  > 128; net.IPMask(nil).Size() is (0,0), so extractDelegatedPrefixes
+  reading only `ones` and discarding `bits` turned a crafted length of
+  129..255 into a <ip>/0 that reached pkg/ra and was advertised on-link
+  + autonomous to the LAN. Added `bits != 128 || ones == 0`, skipping
+  the offending IAPREFIX (an IA_PD is a multi-element container, so this
+  matches the option-121 classless-route loop rather than
+  leaseFromACKv4's whole-message refusal for a single-valued v4 ACK).
+  Verified firsthand that the library produces a nil mask for > 128 and
+  a nil Prefix for 0 (the latter already skipped). RED-on-revert
+  confirmed: the 129/130/255 rows, the good+bad sibling test, and the
+  withdrawal test all fail with a live /0; the 0/1/48/56/64/128
+  over-reach rows and both pkg/ra tests stay green.
+- **File(s)**: pkg/dhcp/dhcpv6.go,
+    pkg/dhcp/dhcpv6_iapd_prefixlen_6531_test.go,
+    pkg/ra/sender_prefixlen_6531_test.go, pkg/dhcp/README.md, _Log.md

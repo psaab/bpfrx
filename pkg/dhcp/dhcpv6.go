@@ -673,6 +673,11 @@ func (m *Manager) buildDHCPv6Modifiers(ifaceName string, opts *DHCPv6Options) []
 // (per-prefix, so a co-held prefix the reply merely omitted is retained)
 // rather than keeping it and re-granting it at the RA sender's 30-day
 // defaults (#4874 B).
+//
+// An IAPREFIX whose decoded mask is degenerate (wire prefix-length 0 or
+// > 128, or a non-contiguous mask) is dropped and enters NEITHER set — a
+// > 128 length otherwise decodes to a /0 that would be advertised on-link
+// to the LAN (#6531).
 func extractDelegatedPrefixes(msg *dhcpv6.Message, ifaceName string, now time.Time) (live, withdrawn []DelegatedPrefix) {
 	for _, opt := range msg.Options.Options {
 		iapdOpt, ok := opt.(*dhcpv6.OptIAPD)
@@ -683,7 +688,45 @@ func extractDelegatedPrefixes(msg *dhcpv6.Message, ifaceName string, now time.Ti
 			if prefix.Prefix == nil {
 				continue
 			}
-			ones, _ := prefix.Prefix.Mask.Size()
+			// Reject a degenerate IAPREFIX mask (untrusted input — the
+			// upstream WAN server, hostile or merely buggy). The library
+			// decodes the wire prefix-length byte as
+			// net.CIDRMask(length, 128), which returns a NIL mask for any
+			// length > 128, and net.IPMask(nil).Size() is (0, 0). Reading
+			// only `ones` and discarding `bits` therefore turned a crafted
+			// length of 129..255 into a <ip>/0, which survives IsValid() and
+			// DeriveSubPrefix and reaches the RA sender — advertising a /0 to
+			// the downstream LAN as on-link + autonomous and hijacking every
+			// SLAAC host's on-link determination (#6531).
+			//
+			// `bits != 128` is the arm that catches it: a nil mask and a
+			// non-contiguous mask both report bits 0. `ones == 0` is
+			// belt-and-braces for a genuine all-zero 128-bit mask, which the
+			// wire decoder cannot currently produce (it maps a length of 0 to
+			// a nil Prefix, skipped above) but an in-process constructor can.
+			//
+			// Skip the offending IAPREFIX rather than refusing the whole
+			// reply: an IA_PD is a multi-element container, so this matches
+			// the RFC 3442 classless-route loop in leaseFromACKv4's sibling
+			// (which likewise skips a route whose mask reports bits != 32).
+			// leaseFromACKv4 itself refuses the entire message only because a
+			// v4 ACK carries exactly one address+mask, so there is nothing to
+			// salvage. Skipping cannot smuggle the bad prefix through — it
+			// never becomes a DelegatedPrefix, so it reaches neither the live
+			// set, the withdrawn set, nor the RA sender — while a sibling
+			// prefix in the same IA_PD is exactly what a correct server would
+			// have sent on its own. If the skip empties both sets, the caller
+			// treats the reply as unusable and retries rather than settling
+			// into an empty lease.
+			ones, bits := prefix.Prefix.Mask.Size()
+			if bits != 128 || ones == 0 {
+				slog.Warn("DHCPv6: refusing IA_PD prefix with invalid mask",
+					"interface", ifaceName,
+					"ip", prefix.Prefix.IP,
+					"mask", prefix.Prefix.Mask,
+					"detail", "wire prefix-length 0 or > 128, or non-contiguous mask")
+				continue
+			}
 			ip, ok := netip.AddrFromSlice(prefix.Prefix.IP)
 			if !ok {
 				continue
