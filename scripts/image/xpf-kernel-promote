@@ -35,19 +35,39 @@ log() { echo "xpf-kernel-promote: $*" >&2; }
 # `verify-dataplane` exec, is resolved explicitly by resolveVerifyGateBin in
 # pkg/upgrade/kernel_linux.go.)
 #
-# Candidate order mirrors the #1917 versioned-runtime layout:
-#   1. versions/current/xpfd — the version-multiplexed runtime path the sbin
-#      links point through (pkg/upgrade/runtime.Seed step 4).
-#   2. /usr/local/sbin/xpfd — the managed sbin entry point. Normally a symlink
-#      to (1); a raw deploy (#2176) can leave a regular file here instead, so
-#      this keeps a non-versioned install working.
-# Neither is $PATH-resolved. If neither exists we SKIP the gate (exit 0), the
-# same behaviour as before for a box with no xpfd installed.
+# INVARIANT: the managed sbin entry point is the AUTHORITY; the default
+# versioned path is only a degraded-box fallback.
+#
+#   1. /usr/local/sbin/xpfd — the entry point the cut maintains. flip step 6b
+#      repoints <SbinDir>/<bin> -> <VersionsDir>/current/<bin> on every cut
+#      (pkg/upgrade/flip.go), so this ONE pointer tracks the live version even
+#      when the operator relocated the runtime with `--versions-dir`. Following
+#      it lands on the same concrete versions/<ver>/xpfd the daemon runs.
+#   2. /var/lib/xpf/versions/current/xpfd — the DEFAULT runtime root only.
+#      Consulted solely when (1) is missing or dangling (#2176 leaves a broken
+#      sbin symlink, which fails the -f test below).
+#
+# Order matters, and getting it backwards is a live hazard rather than a style
+# point. `--versions-dir` is a real option (cmd/xpfd/upgrade.go) and relocating
+# the runtime does NOT remove an older /var/lib/xpf/versions/current. Checking
+# the hardcoded default FIRST would therefore select a STALE build on a
+# relocated install and verify the candidate kernel against the wrong dataplane
+# — strictly worse than the bare `xpfd` this replaced, which at least resolved
+# to the live sbin entry via systemd's default PATH.
+#
+# Residual, stated rather than hidden: `--sbin-dir` is relocatable too, so a box
+# that moved BOTH and then lost its sbin entry falls through to a default that
+# may be stale. That is a double relocation plus a broken link; correctness for
+# ordinary relocation rests on (1), which needs no configured root at all.
+#
+# Neither candidate is $PATH-resolved. If neither exists we SKIP the gate
+# (exit 0), the same behaviour as before for a box with no xpfd installed.
 # `-f` as well as `-x`: `test -x` is TRUE for a searchable DIRECTORY, and the
 # inner hop's validateGateBin rejects a non-regular target, so both hops apply
-# the same admission test rather than only claiming to.
+# the same admission test rather than only claiming to. `-f` also rejects a
+# DANGLING symlink, which is exactly the #2176 case that hands over to (2).
 XPFD=""
-for candidate in /var/lib/xpf/versions/current/xpfd /usr/local/sbin/xpfd; do
+for candidate in /usr/local/sbin/xpfd /var/lib/xpf/versions/current/xpfd; do
     if [ -f "$candidate" ] && [ -x "$candidate" ]; then
         XPFD="$candidate"
         break
@@ -55,7 +75,7 @@ for candidate in /var/lib/xpf/versions/current/xpfd /usr/local/sbin/xpfd; do
 done
 
 if [ -z "$XPFD" ]; then
-    log "xpfd not found at /var/lib/xpf/versions/current/xpfd or /usr/local/sbin/xpfd; skipping promotion gate"
+    log "xpfd not found at /usr/local/sbin/xpfd or /var/lib/xpf/versions/current/xpfd; skipping promotion gate"
     exit 0
 fi
 

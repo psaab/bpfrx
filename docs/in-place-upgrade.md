@@ -893,27 +893,55 @@ attacker, a stale `xpfd` left in another directory would verify the wrong
 build against the candidate kernel. Both hops resolve explicitly:
 
 - *Outer hop* — `scripts/image/xpf-kernel-promote` tests
-  `/var/lib/xpf/versions/current/xpfd` then `/usr/local/sbin/xpfd` (the
-  #1917 version-multiplexed runtime pointer, then the managed sbin entry
-  point, which a raw deploy may leave as a regular file). Neither is
-  `$PATH`-resolved. With neither present the gate SKIPs (exit 0), the
-  same behaviour as before on a box with no xpfd installed.
+  `/usr/local/sbin/xpfd` then `/var/lib/xpf/versions/current/xpfd`.
+  Neither is `$PATH`-resolved. With neither present the gate SKIPs
+  (exit 0), the same behaviour as before on a box with no xpfd installed.
 - *Inner hop* — `realKernelSystem.VerifyDataplane`
   (`resolveVerifyGateBin`, `pkg/upgrade/kernel_linux.go`) prefers
   `os.Executable()` — the running process IS `xpfd upgrade kernel
   promote`, and on Linux `/proc/self/exe` resolves the
   sbin→`current`→`versions/<ver>/xpfd` chain down to the concrete
-  versioned artifact — falling back to `versions/current/xpfd`.
+  versioned artifact — then `<SbinDir>/xpfd`, then
+  `<VersionsDir>/current/xpfd`.
+
+**Why the managed sbin entry outranks the versioned path.** `flip` step
+6b repoints `<SbinDir>/<bin>` → `<VersionsDir>/current/<bin>` on every
+cut, so that single pointer tracks the live version *even when the
+operator relocated the runtime with `--versions-dir`*. Relocating does
+**not** remove an older `/var/lib/xpf/versions/current`, so consulting
+the hardcoded default root first would select a **stale** build and
+verify the candidate kernel against the wrong dataplane — strictly worse
+than the bare `xpfd` this replaced, which at least resolved to the live
+sbin entry through systemd's default `PATH`. The versioned path stays as
+a last resort for a box whose sbin entry is missing or dangling (#2176,
+where a broken symlink fails the `-f` / regular-file test). Residual,
+stated rather than hidden: `--sbin-dir` is relocatable too, so a box that
+moved **both** and then lost its sbin entry falls through to a default
+that may be stale; correctness for ordinary relocation rests on
+`os.Executable`, which needs no configured root at all. `KernelConfig`
+carries neither directory, so the kernel gate uses the compiled-in
+defaults for its two fallbacks — which is exactly why their order
+matters.
 
 If no explicit path resolves, the gate returns an error rather than
 falling back to `$PATH`; `verifyAndPromote` turns any Gate-3 error into
 `revert()` — restore the known-good `BootOrder` and reboot to the
-known-good slot. On an A/B kernel promote that is the safe direction. A
-lint test (`TestNoBareXpfArtifactExec`) enumerates every shell-out under
-`pkg/upgrade` from the AST and fails on any *bare* xpf-artifact command
-name; artifact names come from `pkg/upgrade/manifest` (the SSOT), and
-system binaries (`systemctl`, `apt-get`, `efibootmgr`, …) are
-deliberately out of scope — PATH resolution is correct for those.
+known-good slot. On an A/B kernel promote that is the safe direction.
+
+A lint test (`TestNoBareOrRelativeXpfArtifactExec`) enumerates every
+shell-out under `pkg/upgrade` from the AST — direct `exec.*`, calls
+through the package's own exec wrappers, and calls through *methods* such
+as `System.VerifyDataplane` — and fails on any xpf-artifact command name
+that is not an ABSOLUTE path. Bare names resolve against `$PATH` and
+relative ones against the process CWD, so both are rejected, matching
+`validateGateBin`. Artifact names come from `pkg/upgrade/manifest` (the
+SSOT). The check applies to command names that evaluate at compile time
+(a literal, a string const, or a `+` chain of those); a run-time value
+such as `exec.Command(filepath.Join(dir, bin), …)` is the correct pattern
+and is deliberately not classified. System binaries (`systemctl`,
+`apt-get`, `efibootmgr`, …) are out of scope — PATH resolution is correct
+for those, since they are distribution-owned and move between `/bin`,
+`/usr/bin`, `/sbin`, and `/usr/sbin` across distributions.
 
 **Fail-closed on ambiguous boot/watchdog state (#4872).** The gate never
 treats an unreadable observation as a definite safe state:

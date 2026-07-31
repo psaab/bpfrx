@@ -29,11 +29,19 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SCRIPT = HERE / "xpf-kernel-promote"
 
-# The two explicit candidates the script must consult, in order. Both are
-# version-multiplexed (versions/current is the #1917 runtime pointer; the sbin
-# path is normally a symlink onto it).
-VERSIONED = "/var/lib/xpf/versions/current/xpfd"
+# The two explicit candidates the script must consult, IN THIS ORDER.
+#
+# SBIN first is load-bearing, not cosmetic. flip step 6b repoints
+# <SbinDir>/<bin> -> <VersionsDir>/current/<bin> on every cut
+# (pkg/upgrade/flip.go), so the sbin entry tracks the live version even when the
+# operator relocated the runtime with `--versions-dir`. Relocating does NOT
+# remove an older /var/lib/xpf/versions/current, so consulting the hardcoded
+# default root first would select a STALE build on a relocated install --
+# strictly worse than the bare `xpfd` this replaced, which at least resolved to
+# the live sbin entry through systemd's default PATH.
 SBIN = "/usr/local/sbin/xpfd"
+VERSIONED = "/var/lib/xpf/versions/current/xpfd"
+CANDIDATES_IN_ORDER = [SBIN, VERSIONED]
 
 
 def script_text() -> str:
@@ -82,10 +90,9 @@ class TestNoPathResolution(unittest.TestCase):
                 f"xpf-kernel-promote does not consult the explicit path {want} "
                 "(#6541)",
             )
-        # Versioned runtime first: it is the authoritative #1917 pointer, and
-        # the sbin path is only a fallback for a non-versioned (raw-deploy)
-        # install. Assert the order on the CANDIDATE LIST itself, not on the
-        # file as a whole — the prose above it names the paths too.
+        # SBIN first, VERSIONED second. Assert the order on the CANDIDATE LIST
+        # itself, not on the file as a whole — the prose above it names the
+        # paths too.
         candidates = None
         for line in text.splitlines():
             code = line.split("#", 1)[0]
@@ -97,10 +104,15 @@ class TestNoPathResolution(unittest.TestCase):
             "no single line enumerates both explicit candidates; the "
             "resolution order is not assertable (#6541)",
         )
-        self.assertLess(
-            candidates.index(VERSIONED),
-            candidates.index(SBIN),
-            f"{VERSIONED} must be consulted before {SBIN} (#6541)",
+        positions = [candidates.index(c) for c in CANDIDATES_IN_ORDER]
+        self.assertEqual(
+            positions,
+            sorted(positions),
+            "candidate order is wrong. It must be "
+            f"{CANDIDATES_IN_ORDER!r}: the sbin entry is repointed by every cut "
+            "and so tracks the live version even under `--versions-dir` "
+            "relocation, while the hardcoded default root is NOT removed on "
+            "relocation and would select a STALE build (#6541 fold r2)",
         )
 
 
@@ -156,28 +168,62 @@ class TestResolutionBehaviour(unittest.TestCase):
         self._write_stub(Path(str(self.fake_root) + rel), exit_code, marker)
         return marker
 
-    def test_prefers_versioned_runtime_over_sbin_and_path(self):
+    def test_prefers_sbin_entry_over_default_versions_root(self):
+        # RELOCATED-INSTALL regression guard. Both candidates exist, as they do
+        # on a box that was cut with `--versions-dir` while an older default
+        # runtime was left behind: the sbin entry points at the LIVE build, the
+        # default root holds the STALE one. The sbin entry must win.
         versioned_ran = self._install(VERSIONED, 0)
         sbin_ran = self._install(SBIN, 0)
 
         res = self._run()
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertTrue(
-            versioned_ran.exists(),
-            f"the versioned-runtime xpfd was not the one executed: {res.stderr}",
+            sbin_ran.exists(),
+            f"the managed sbin entry was not the one executed: {res.stderr}",
         )
-        self.assertFalse(sbin_ran.exists(), "the sbin fallback ran instead")
+        self.assertFalse(
+            versioned_ran.exists(),
+            f"the gate ran {VERSIONED} instead of {SBIN}. On a `--versions-dir` "
+            "relocated install that path holds a STALE build and the candidate "
+            "kernel would be verified against the wrong dataplane "
+            "(#6541 fold r2)",
+        )
         self.assertFalse(
             self.marker.exists(),
             "the gate executed the xpfd it found on $PATH (#6541)",
         )
 
-    def test_falls_back_to_sbin_when_no_versioned_runtime(self):
-        sbin_ran = self._install(SBIN, 0)
+    def test_falls_back_to_versioned_runtime_when_no_sbin_entry(self):
+        versioned_ran = self._install(VERSIONED, 0)
 
         res = self._run()
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertTrue(sbin_ran.exists(), f"the sbin xpfd did not run: {res.stderr}")
+        self.assertTrue(
+            versioned_ran.exists(),
+            f"the versioned-runtime xpfd did not run: {res.stderr}",
+        )
+        self.assertFalse(
+            self.marker.exists(),
+            "the gate executed the xpfd it found on $PATH (#6541)",
+        )
+
+    def test_dangling_sbin_symlink_falls_through_to_versioned_runtime(self):
+        # #2176 leaves a sbin symlink pointing into a removed versions dir. It
+        # must not shadow the versioned-runtime fallback — that is the whole
+        # reason the second candidate still exists. `-f` is what rejects it.
+        versioned_ran = self._install(VERSIONED, 0)
+        sbin_path = Path(str(self.fake_root) + SBIN)
+        sbin_path.parent.mkdir(parents=True, exist_ok=True)
+        sbin_path.symlink_to(str(self.fake_root) + "/removed/versions/v1/xpfd")
+
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue(
+            versioned_ran.exists(),
+            f"a DANGLING {SBIN} symlink shadowed the {VERSIONED} fallback "
+            f"instead of falling through: {res.stderr}",
+        )
         self.assertFalse(
             self.marker.exists(),
             "the gate executed the xpfd it found on $PATH (#6541)",

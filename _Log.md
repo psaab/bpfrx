@@ -62474,3 +62474,78 @@ break — `go vet` confirmed passing under every revert.
     exec_bare_artifact_lint_6541_test.go},
     scripts/image/{xpf-kernel-promote,test_kernel_promote_explicit_path.py},
     _Log.md
+
+- **Timestamp**: 2026-07-31 (fix/6541-kernel-gate-explicit-path, review fold r2)
+- **Action**: #6541 fold of a Codex re-gate on 07a08baaf (MERGE-NEEDS-MINOR).
+  Both MINORs verified firsthand and both are CORRECT.
+  MINOR 1 — MY FOLD r1 INTRODUCED A SELECTION REGRESSION, not just a skip gap.
+  Verified: `--versions-dir` and `--sbin-dir` are both real operator options
+  (cmd/xpfd/upgrade.go:247/250); flip step 6b repoints
+  `filepath.Join(cfg.SbinDir, b)` -> `filepath.Join(cfg.VersionsDir, currentLink, b)`
+  (flip.go:43-45), so the sbin entry tracks the CONFIGURED runtime root; and
+  nothing removes an older default `/var/lib/xpf/versions/current` on relocation
+  (the only RemoveAll calls in flip/seed are for partials and temp paths). My
+  outer gate checked the hardcoded default versioned path FIRST, so on a
+  relocated install it would select a STALE build and verify the candidate
+  kernel against the wrong dataplane — strictly WORSE than the bare `xpfd` it
+  replaced, which resolved to the live sbin entry via systemd's default PATH.
+  Chose the REORDER option (sbin-first) over deriving the service executable or
+  declaring relocation unsupported, and extended it to the Go hop so NIT 3's
+  root is DISSOLVED rather than merely commented. New order, both hops:
+  os.Executable (Go only) -> <SbinDir>/xpfd -> <VersionsDir>/current/xpfd. The
+  invariant is stated at both sites and in the doc: the managed sbin entry is
+  the AUTHORITY because the cut repoints it and it therefore needs no configured
+  root; the versioned path is a degraded-box fallback (#2176 dangling symlink,
+  which `-f` rejects) and is correct only on a default-rooted box. Residual
+  stated rather than hidden: `--sbin-dir` is relocatable too, so a double
+  relocation plus a broken link can still reach a stale default — ordinary
+  relocation is covered by os.Executable, which needs no configured root.
+  Repointed both regression guards to the NEW order and added coverage for the
+  hazard itself: `TestResolveVerifyGateBinPrefersSbinOverDefaultVersionsRoot`
+  (leftover stale default root + live sbin entry into a relocated root — sbin
+  must win), `TestResolveVerifyGateBinSkipsDanglingSbinEntry`, and python
+  `test_prefers_sbin_entry_over_default_versions_root` +
+  `test_dangling_sbin_symlink_falls_through_to_versioned_runtime`. The python
+  order assertion now pins CANDIDATES_IN_ORDER instead of the old ordering.
+  MINOR 2 — the AST lint claimed more coverage than it provided.
+  (a) METHOD-WRAPPER NAME MISMATCH, the one that silently dropped real call
+  paths: `execWrapperNames` records a bare declaration name (`VerifyDataplane`)
+  while enumeration used `selectorName`, which renders a call receiver-qualified
+  (`s.VerifyDataplane`) or returns "" outright for a nested receiver
+  (`r.cfg.Sys.VerifyDataplane`). So every call through System.VerifyDataplane /
+  System.BinaryVersion — both of which take an explicit `bin` first param and
+  exec it — was invisible. Added `calleeFinalName` (final selector segment) for
+  wrapper lookup, and asserted the closure against REAL code:
+  TestExecEnumerationCoversKnownSites now requires cutover.go to be reached and
+  at least one method-wrapper site to be enumerated.
+  (b) `stringConsts` took only package-level consts whose initializer was a
+  direct literal, so `const command = "./" + verifyGateBin` and function-local
+  consts were skipped while the test claimed compile-time constant-expression
+  coverage. Now collects package-level AND local consts and iterates to a
+  fixpoint. Ambiguous names (one identifier, two const bindings, no scope
+  resolution here) are DROPPED rather than guessed — same conservative default
+  already applied to variables. Three new subtests pin all three shapes.
+  (c) Documented every remaining blind spot where the coverage is claimed —
+  run-time values (deliberate: it is the CORRECT pattern and chasing variables
+  would flag every correct site), ambiguous consts, final-name method matching,
+  and package scope.
+  (d) `docs/in-place-upgrade.md` named the REMOVED `TestNoBareXpfArtifactExec`
+  and claimed it rejects "any bare" invocation. Rewritten to the current name
+  and the actual non-absolute rule; also updated for the new candidate order,
+  with the sbin-outranks-versioned rationale. Swept the tree: no surviving
+  reference to any removed identifier outside historical _Log narrative, and
+  every Test name referenced in docs exists.
+  NOT FOLDED: the pre-existing `exec.LookPath("xpf-userspace-dp")` at
+  pkg/dataplane/userspace/process.go:191 — outside this Gate-3 change. It is a
+  last-resort fallback after explicit candidates are stat'd, but it is the same
+  class (a bare xpf-owned artifact PATH-resolved by a root daemon) and warrants
+  its own issue.
+  Validation: gofmt clean on all touched Go files, go vet ./... clean,
+  go build ./... clean, full pkg/upgrade suite green, all 7
+  scripts/image/test_*.py green (this one 11 cases). Fail-on-revert re-probed in
+  a THROWAWAY detached worktree.
+- **File(s)**: pkg/upgrade/{kernel_linux.go,
+    kernel_verify_explicit_path_6541_test.go,
+    exec_bare_artifact_lint_6541_test.go},
+    scripts/image/{xpf-kernel-promote,test_kernel_promote_explicit_path.py},
+    docs/in-place-upgrade.md, _Log.md

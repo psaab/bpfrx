@@ -498,19 +498,25 @@ func (s *realKernelSystem) BootCurrent() (string, error) {
 // os.Executable is the TEST binary, which is not an xpfd).
 var osExecutable = os.Executable
 
-// gateVersionsDir is the #1917 versioned-runtime root resolveVerifyGateBin
-// falls back to. A package var so a test can point it at a temp tree.
+// gateSbinDir and gateVersionsDir are the two configured-layout roots
+// resolveVerifyGateBin falls back to, in that order. Package vars so a test can
+// point them at a temp tree.
 //
-// KNOWN DIVERGENCE: the binary-cut channel lets an operator relocate this root
-// with `--versions-dir` (cmd/xpfd/upgrade.go, cmd/xpfd/seed_runtime.go), but
-// KernelConfig carries no VersionsDir to thread through, so the kernel gate
-// always uses the compiled-in default. The consequence is bounded and safe: on
-// a relocated install the fallback candidate simply does not exist, candidate
-// (1) — os.Executable, which needs no configured root — still resolves, and if
-// even that fails the resolver fail-closes into revert() rather than guessing.
-// Threading the flag down means widening KernelConfig; do that if a relocated
-// root ever becomes a supported production layout rather than a test knob.
-var gateVersionsDir = DefaultVersionsDir
+// RELOCATION: `--versions-dir` and `--sbin-dir` are both real operator options
+// (cmd/xpfd/upgrade.go), and KernelConfig carries neither to thread through, so
+// these are the compiled-in defaults. That is why the ORDER of the fallbacks
+// matters: <SbinDir>/xpfd is the pointer the cut maintains — flip step 6b
+// repoints it to <VersionsDir>/current/<bin> on every cut (flip.go) — so
+// following it stays correct when the runtime root moved, whereas
+// <VersionsDir>/current/xpfd is right only on a default-rooted box AND is not
+// removed when the operator relocates, so consulting it first would select a
+// STALE build. Correctness for ordinary relocation rests on candidate (1),
+// os.Executable, which needs no configured root at all; a relocated --sbin-dir
+// on top of that is a double relocation and is called out in the gate's doc.
+var (
+	gateSbinDir     = DefaultSbinDir
+	gateVersionsDir = DefaultVersionsDir
+)
 
 // verifyGateBin is the basename of the daemon artifact the promotion gate
 // execs. It matches the versions/<ver>/xpfd basename the cut writes (flip.go,
@@ -547,16 +553,24 @@ const verifyGateBin = "xpfd"
 //     lock (cmd/xpfd/upgrade_kernel.go) serializes this against a binary cut,
 //     and either way the exec target stays explicit, which is the property
 //     this function exists to guarantee.
-//  2. <VersionsDir>/current/xpfd — the #1917 version-multiplexed runtime path
-//     the sbin links point through (pkg/upgrade/runtime.Seed step 4). Reached
-//     when (1) is unavailable: os.Executable errored (no /proc), or it returned
-//     a path that no longer resolves. The latter is how an UNLINKED running
-//     binary lands here, and it is worth being precise about the mechanism: Go
-//     TRIMS the " (deleted)" suffix Readlink appends and returns the original
-//     path with a nil error (src/os/executable_procfs.go), so the fallback is
-//     driven by os.Stat returning ENOENT on that path — never by inspecting a
-//     suffix. Code or tests keying on a "(deleted)" string would be testing an
-//     input the API cannot produce.
+//  2. <SbinDir>/xpfd — the managed entry point the cut maintains. flip step 6b
+//     repoints <SbinDir>/<bin> -> <VersionsDir>/current/<bin> on every cut
+//     (flip.go), so this ONE pointer tracks the live version even when the
+//     operator relocated the runtime with `--versions-dir`. Reached when (1) is
+//     unavailable: os.Executable errored (no /proc), or it returned a path that
+//     no longer resolves. The latter is how an UNLINKED running binary lands
+//     here, and it is worth being precise about the mechanism: Go TRIMS the
+//     " (deleted)" suffix Readlink appends and returns the original path with a
+//     nil error (src/os/executable_procfs.go), so the fallback is driven by
+//     os.Stat returning ENOENT on that path — never by inspecting a suffix.
+//     Code or tests keying on a "(deleted)" string would be testing an input
+//     the API cannot produce.
+//  3. <VersionsDir>/current/xpfd — the #1917 runtime pointer, LAST because it
+//     is correct only on a default-rooted box. Relocating with `--versions-dir`
+//     does not remove an older /var/lib/xpf/versions/current, so consulting it
+//     before (2) would select a STALE build on a relocated install. It earns
+//     its place only for a box whose sbin entry is missing or dangling (#2176),
+//     which is precisely when (2) fails.
 //
 // A hardcoded /usr/local/sbin/xpfd is deliberately NOT the primary: it is a
 // PATH directory itself and, more importantly, pinning the gate to a fixed
@@ -581,6 +595,13 @@ func resolveVerifyGateBin() (string, error) {
 		errs = append(errs, fmt.Sprintf("running binary %q: %v", self, verr))
 	} else {
 		return self, nil
+	}
+
+	sbin := filepath.Join(gateSbinDir, verifyGateBin)
+	if verr := validateGateBin(sbin); verr != nil {
+		errs = append(errs, fmt.Sprintf("managed sbin entry %q: %v", sbin, verr))
+	} else {
+		return sbin, nil
 	}
 
 	current := filepath.Join(gateVersionsDir, currentLink, verifyGateBin)

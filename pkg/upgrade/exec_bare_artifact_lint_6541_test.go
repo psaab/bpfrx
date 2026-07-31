@@ -57,7 +57,27 @@ import (
 //
 // The call sites are ENUMERATED from the AST rather than compared against a
 // checked-in list, so a NEW bare or relative invocation added anywhere under
-// pkg/upgrade fails this test the moment it lands.
+// pkg/upgrade fails this test the moment it lands. Both plain functions and
+// METHODS are traced (calleeFinalName), so a call through System.VerifyDataplane
+// or System.BinaryVersion is checked like a direct exec.Command.
+//
+// WHAT THIS DOES NOT COVER — stated so the guard is not read as stronger than
+// it is:
+//
+//   - Run-time values. `exec.Command(bin, ...)` where bin came from
+//     filepath.Join, a struct field, or any variable is NOT classified. That is
+//     deliberate and load-bearing: it is the CORRECT pattern, and chasing
+//     variables would flag every correct site. A hostile or mistaken run-time
+//     path is out of reach of a static check here; resolveVerifyGateBin's
+//     validateGateBin is what defends the one call that matters at run time.
+//   - An identifier declared as a const in more than one place is dropped
+//     rather than guessed (no scope resolution here), so such a site is simply
+//     not classified.
+//   - Method matching is by final name, so a same-named method on an unrelated
+//     type also matches. Erring toward MORE enumeration is the right direction
+//     for a guard.
+//   - Only pkg/upgrade is walked. This is a package-scoped guard, not a
+//     repo-wide one.
 //
 // FAIL-ON-REVERT: restore `exec.Command("xpfd", "verify-dataplane")` in
 // kernel_linux.go and TestNoBareOrRelativeXpfArtifactExec fails, naming the
@@ -130,6 +150,34 @@ func selectorName(fn ast.Expr) string {
 	return ""
 }
 
+// calleeFinalName returns the FUNCTION or METHOD name of a call's callee,
+// discarding any receiver/package qualifier: Fn -> "Fn", pkg.Fn -> "Fn",
+// s.Method -> "Method", a.b.c.Method -> "Method".
+//
+// This exists because wrapper discovery and call enumeration were keyed
+// differently, and the mismatch silently dropped real call paths.
+// execWrapperNames records a declaration's BARE name (realSystem's method is
+// "VerifyDataplane"), while selectorName renders a call receiver-qualified
+// ("s.VerifyDataplane") or, for a nested receiver like r.cfg.Sys.VerifyDataplane,
+// gives up entirely and returns "". So every call THROUGH a method wrapper —
+// System.VerifyDataplane and BinaryVersion, both of which take an explicit `bin`
+// as their first parameter and exec it — was invisible to the lint.
+//
+// Matching on the final segment is an approximation: a same-named method on an
+// unrelated type would also match. That is the right direction to err for a
+// guard — the only way to trip it is to pass a literal xpf-artifact name as the
+// first argument to something named like an exec wrapper, which is itself worth
+// a look.
+func calleeFinalName(fn ast.Expr) string {
+	switch e := fn.(type) {
+	case *ast.Ident:
+		return e.Name
+	case *ast.SelectorExpr:
+		return e.Sel.Name
+	}
+	return ""
+}
+
 // stringLit returns the value of a plain string literal, and whether e was one.
 func stringLit(e ast.Expr) (string, bool) {
 	bl, ok := e.(*ast.BasicLit)
@@ -143,30 +191,83 @@ func stringLit(e ast.Expr) (string, bool) {
 	return v, true
 }
 
-// stringConsts collects package-level `const x = "..."` declarations so
-// constFoldString can resolve an identifier operand.
+// stringConsts collects string constants so constFoldString can resolve an
+// identifier operand.
+//
+// It covers both PACKAGE-LEVEL and FUNCTION-LOCAL `const` declarations, and it
+// iterates to a fixpoint so a const whose initializer is ITSELF an expression
+// resolves:
+//
+//	const command = "./" + verifyGateBin
+//
+// An earlier version took only initializers that were direct string literals,
+// which meant the lint claimed compile-time constant-expression coverage while
+// silently skipping both of those shapes.
+//
+// AMBIGUITY IS TREATED AS UNRESOLVABLE. The map is flat, so a local const that
+// shadows a package const of the same name has no scope to disambiguate it.
+// Rather than guess — and risk folding to a string the exec never sees — a name
+// bound to two different values is DROPPED, so the site is simply not
+// classified. Not classifying is the same conservative default the lint already
+// applies to variables.
 func stringConsts(files map[string]*ast.File) map[string]string {
-	consts := map[string]string{}
-	for _, f := range files {
-		for _, decl := range f.Decls {
-			gd, ok := decl.(*ast.GenDecl)
-			if !ok || gd.Tok != token.CONST {
+	type binding struct {
+		expr ast.Expr
+		seen int
+	}
+	// Collect every const spec, package-level and local.
+	raw := map[string]*binding{}
+	record := func(vs *ast.ValueSpec) {
+		for i, name := range vs.Names {
+			if i >= len(vs.Values) || name.Name == "_" {
 				continue
 			}
+			if b, dup := raw[name.Name]; dup {
+				b.seen++
+				continue
+			}
+			raw[name.Name] = &binding{expr: vs.Values[i], seen: 1}
+		}
+	}
+	for _, f := range files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			gd, ok := n.(*ast.GenDecl)
+			if !ok || gd.Tok != token.CONST {
+				return true
+			}
 			for _, spec := range gd.Specs {
-				vs, ok := spec.(*ast.ValueSpec)
-				if !ok {
-					continue
-				}
-				for i, name := range vs.Names {
-					if i >= len(vs.Values) {
-						continue
-					}
-					if v, ok := stringLit(vs.Values[i]); ok {
-						consts[name.Name] = v
-					}
+				if vs, ok := spec.(*ast.ValueSpec); ok {
+					record(vs)
 				}
 			}
+			return true
+		})
+	}
+
+	consts := map[string]string{}
+	// Fixpoint: each pass resolves consts whose operands became known in the
+	// previous one. Bounded by the number of bindings.
+	for range len(raw) + 1 {
+		progress := false
+		for name, b := range raw {
+			if _, done := consts[name]; done {
+				continue
+			}
+			if v, ok := constFoldString(b.expr, consts); ok {
+				consts[name] = v
+				progress = true
+			}
+		}
+		if !progress {
+			break
+		}
+	}
+
+	// Drop ambiguous names: an identifier declared as a const in more than one
+	// place has no scope here to disambiguate it, so it is not classified.
+	for name, b := range raw {
+		if b.seen > 1 {
+			delete(consts, name)
 		}
 	}
 	return consts
@@ -320,9 +421,14 @@ func enumerateExecCallSites(fset *token.FileSet, files map[string]*ast.File, wra
 			nameArg, ok := commandNameArg(callee, call)
 			if !ok {
 				// A call to one of the package's own exec wrappers: its first
-				// argument is the command name.
-				if !wrappers[callee] || len(call.Args) == 0 {
+				// argument is the command name. Keyed on the FINAL name so a
+				// method call (s.VerifyDataplane, r.cfg.Sys.VerifyDataplane)
+				// matches the declaration's bare name.
+				if !wrappers[calleeFinalName(call.Fun)] || len(call.Args) == 0 {
 					return true
+				}
+				if callee == "" {
+					callee = calleeFinalName(call.Fun)
 				}
 				nameArg = call.Args[0]
 			}
@@ -541,6 +647,76 @@ func TestConstFoldClosesTheConcatenationHole(t *testing.T) {
 		})
 	}
 
+	// A const whose initializer is itself an expression must resolve. The
+	// literal-initializer-only version of stringConsts skipped these while the
+	// lint claimed compile-time constant-expression coverage.
+	t.Run("const with expression initializer", func(t *testing.T) {
+		src := `package p
+const gateBin = "xpfd"
+const relCommand = "./" + gateBin
+const absCommand = "/usr/local/sbin/" + gateBin
+`
+		f, err := parser.ParseFile(token.NewFileSet(), "x.go", src, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		got := stringConsts(map[string]*ast.File{"x.go": f})
+		if got["relCommand"] != "./xpfd" {
+			t.Fatalf("relCommand = %q, want %q — a const whose initializer is a "+
+				"concatenation must fold", got["relCommand"], "./xpfd")
+		}
+		if got["absCommand"] != "/usr/local/sbin/xpfd" {
+			t.Fatalf("absCommand = %q, want /usr/local/sbin/xpfd", got["absCommand"])
+		}
+		if isNonAbsoluteXpfArtifact(got["relCommand"], artifacts) != true {
+			t.Fatal("the folded relative const was not flagged")
+		}
+		if isNonAbsoluteXpfArtifact(got["absCommand"], artifacts) != false {
+			t.Fatal("the folded absolute const was wrongly flagged")
+		}
+	})
+
+	// FUNCTION-LOCAL consts must resolve too — package-level-only collection
+	// was another silently-uncovered shape.
+	t.Run("function-local const", func(t *testing.T) {
+		src := `package p
+const gateBin = "xpfd"
+func f() {
+	const localCommand = "./" + gateBin
+	_ = localCommand
+}
+`
+		f, err := parser.ParseFile(token.NewFileSet(), "x.go", src, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if got := stringConsts(map[string]*ast.File{"x.go": f}); got["localCommand"] != "./xpfd" {
+			t.Fatalf("localCommand = %q, want %q — a function-local const must fold",
+				got["localCommand"], "./xpfd")
+		}
+	})
+
+	// AMBIGUOUS names must be dropped, not guessed. Two bindings for one
+	// identifier and no scope to tell them apart: not classifying is the
+	// conservative answer, matching how variables are handled.
+	t.Run("ambiguous const dropped", func(t *testing.T) {
+		src := `package p
+const dup = "xpfd"
+func f() {
+	const dup = "/usr/local/sbin/xpfd"
+	_ = dup
+}
+`
+		f, err := parser.ParseFile(token.NewFileSet(), "x.go", src, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if v, ok := stringConsts(map[string]*ast.File{"x.go": f})["dup"]; ok {
+			t.Fatalf("dup resolved to %q; an identifier with two const bindings "+
+				"must be dropped rather than guessed", v)
+		}
+	})
+
 	// MUST NOT fold: a run-time value. `exec.Command(bin, ...)` where bin came
 	// from filepath.Join is the correct pattern; folding it (or guessing) would
 	// flag every correct site and the rule would be disabled within a week.
@@ -639,6 +815,32 @@ func TestExecEnumerationCoversKnownSites(t *testing.T) {
 		if !seenFiles[want] {
 			t.Errorf("enumeration never reached %s (walked files: %v)", want, sortedKeys(seenFiles))
 		}
+	}
+
+	// METHOD-wrapper call sites must be enumerated. System.VerifyDataplane and
+	// System.BinaryVersion both take an explicit `bin` first parameter and exec
+	// it, so they ARE exec wrappers — but wrapper discovery records a bare
+	// declaration name while selectorName renders a call receiver-qualified
+	// (and returns "" outright for a nested receiver like r.cfg.Sys.X). That
+	// mismatch made every call through them invisible. calleeFinalName closes
+	// it; this asserts the closure against real code rather than a fixture.
+	if !seenFiles["cutover.go"] {
+		t.Errorf("enumeration never reached cutover.go, whose r.cfg.Sys.VerifyDataplane / "+
+			"r.cfg.Sys.BinaryVersion calls are the method-wrapper call paths the "+
+			"receiver-qualification mismatch used to drop (walked files: %v)",
+			sortedKeys(seenFiles))
+	}
+	var methodWrapperSites int
+	for _, s := range sites {
+		switch s.callee {
+		case "VerifyDataplane", "BinaryVersion":
+			methodWrapperSites++
+		}
+	}
+	if methodWrapperSites == 0 {
+		t.Error("no METHOD-wrapper call site enumerated; a literal artifact name " +
+			"passed to System.VerifyDataplane / System.BinaryVersion would go " +
+			"unchecked")
 	}
 	if direct == 0 {
 		t.Error("enumerated no direct exec.* constructors")

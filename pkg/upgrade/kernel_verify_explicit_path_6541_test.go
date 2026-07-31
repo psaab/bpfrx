@@ -43,18 +43,29 @@ func fakeXpfd(t *testing.T, dir string, exitCode int) string {
 	return p
 }
 
-// withGateSeams points the resolver's two seams at test-controlled values and
+// withGateSeams points the resolver's three seams at test-controlled values and
 // restores them afterwards. selfPath == "" makes os.Executable report an error
-// (driving the versioned-runtime fallback).
+// (driving the fallback chain). sbinDir is pointed at a non-existent path so a
+// caller that only cares about candidates 1 and 3 gets candidate 2 out of the
+// way; withGateSeamsSbin sets it explicitly.
 func withGateSeams(t *testing.T, selfPath, versionsDir string) {
 	t.Helper()
-	origExe, origVer := osExecutable, gateVersionsDir
-	t.Cleanup(func() { osExecutable, gateVersionsDir = origExe, origVer })
+	withGateSeamsSbin(t, selfPath, filepath.Join(t.TempDir(), "no-such-sbin"), versionsDir)
+}
+
+// withGateSeamsSbin is withGateSeams with the managed-sbin candidate (2) set.
+func withGateSeamsSbin(t *testing.T, selfPath, sbinDir, versionsDir string) {
+	t.Helper()
+	origExe, origSbin, origVer := osExecutable, gateSbinDir, gateVersionsDir
+	t.Cleanup(func() {
+		osExecutable, gateSbinDir, gateVersionsDir = origExe, origSbin, origVer
+	})
 	if selfPath == "" {
 		osExecutable = func() (string, error) { return "", os.ErrNotExist }
 	} else {
 		osExecutable = func() (string, error) { return selfPath, nil }
 	}
+	gateSbinDir = sbinDir
 	gateVersionsDir = versionsDir
 }
 
@@ -152,13 +163,14 @@ func TestResolveVerifyGateBinPrefersRunningBinary(t *testing.T) {
 }
 
 // TestResolveVerifyGateBinFallsBackToVersionedRuntime: when os.Executable is
-// unusable (no /proc, or a deleted running binary), the resolver falls back to
-// the #1917 version-multiplexed path — still explicit, still never PATH.
+// unusable (no /proc, or a deleted running binary) AND there is no managed sbin
+// entry, the resolver falls back to the #1917 version-multiplexed path — still
+// explicit, still never PATH.
 func TestResolveVerifyGateBinFallsBackToVersionedRuntime(t *testing.T) {
 	root := t.TempDir()
 	versions := filepath.Join(root, "versions")
 	want := fakeXpfd(t, filepath.Join(versions, "current"), 0)
-	withGateSeams(t, "", versions) // os.Executable fails
+	withGateSeams(t, "", versions) // os.Executable fails, no sbin entry
 
 	got, err := resolveVerifyGateBin()
 	if err != nil {
@@ -166,6 +178,83 @@ func TestResolveVerifyGateBinFallsBackToVersionedRuntime(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("resolved %q, want the versioned-runtime path %q", got, want)
+	}
+}
+
+// TestResolveVerifyGateBinPrefersSbinOverDefaultVersionsRoot is the
+// RELOCATED-INSTALL regression guard.
+//
+// `--versions-dir` and `--sbin-dir` are real operator options, and flip step 6b
+// repoints <SbinDir>/<bin> -> <VersionsDir>/current/<bin> on every cut
+// (flip.go), so the sbin entry tracks the live version wherever the runtime
+// lives. Relocating does NOT remove an older /var/lib/xpf/versions/current, so a
+// resolver that consulted the hardcoded default root first would pick a STALE
+// build and verify the candidate kernel against the wrong dataplane.
+//
+// This models exactly that: a leftover default-root runtime AND a live sbin
+// entry pointing into a relocated root. The sbin entry must win.
+func TestResolveVerifyGateBinPrefersSbinOverDefaultVersionsRoot(t *testing.T) {
+	root := t.TempDir()
+
+	// The leftover, STALE default runtime.
+	staleDefault := fakeXpfd(t, filepath.Join(root, "default-versions", "current"), 0)
+
+	// The LIVE relocated runtime, with the managed sbin entry pointing at it
+	// the way flip 6b leaves it.
+	live := fakeXpfd(t, filepath.Join(root, "relocated", "versions", "v2"), 0)
+	sbinDir := filepath.Join(root, "sbin")
+	if err := os.MkdirAll(sbinDir, 0o755); err != nil {
+		t.Fatalf("mkdir sbin: %v", err)
+	}
+	sbinEntry := filepath.Join(sbinDir, verifyGateBin)
+	if err := os.Symlink(live, sbinEntry); err != nil {
+		t.Fatalf("symlink sbin entry: %v", err)
+	}
+
+	// os.Executable unusable, so the fallback ORDER is what decides.
+	withGateSeamsSbin(t, "", sbinDir, filepath.Join(root, "default-versions"))
+
+	got, err := resolveVerifyGateBin()
+	if err != nil {
+		t.Fatalf("resolveVerifyGateBin: %v", err)
+	}
+	if got == staleDefault {
+		t.Fatalf("resolved the STALE default-root runtime %q on a relocated "+
+			"install; the managed sbin entry %q tracks the live version and must "+
+			"be consulted first (#6541 fold r2)", got, sbinEntry)
+	}
+	if got != sbinEntry {
+		t.Fatalf("resolved %q, want the managed sbin entry %q", got, sbinEntry)
+	}
+}
+
+// TestResolveVerifyGateBinSkipsDanglingSbinEntry: the sbin entry earns its
+// priority only while it resolves. A #2176 dangling symlink (points into a
+// removed versions dir) must NOT shadow the versioned-runtime fallback — that
+// is the whole reason candidate 3 still exists.
+func TestResolveVerifyGateBinSkipsDanglingSbinEntry(t *testing.T) {
+	root := t.TempDir()
+	versions := filepath.Join(root, "versions")
+	want := fakeXpfd(t, filepath.Join(versions, "current"), 0)
+
+	sbinDir := filepath.Join(root, "sbin")
+	if err := os.MkdirAll(sbinDir, 0o755); err != nil {
+		t.Fatalf("mkdir sbin: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(root, "removed", "xpfd"),
+		filepath.Join(sbinDir, verifyGateBin)); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	withGateSeamsSbin(t, "", sbinDir, versions)
+
+	got, err := resolveVerifyGateBin()
+	if err != nil {
+		t.Fatalf("resolveVerifyGateBin: %v", err)
+	}
+	if got != want {
+		t.Fatalf("resolved %q, want the versioned-runtime fallback %q (a dangling "+
+			"sbin symlink must not shadow it)", got, want)
 	}
 }
 
@@ -383,11 +472,16 @@ func TestValidateGateBinRejectsNonExplicitTargets(t *testing.T) {
 // through versions/current and not some test-only path. It must stay GREEN
 // under revert of the #6541 fix.
 func TestGateResolutionDefaultsToProductionVersionsDir(t *testing.T) {
+	if gateSbinDir != DefaultSbinDir {
+		t.Fatalf("gateSbinDir = %q, want DefaultSbinDir %q", gateSbinDir, DefaultSbinDir)
+	}
 	if gateVersionsDir != DefaultVersionsDir {
 		t.Fatalf("gateVersionsDir = %q, want DefaultVersionsDir %q", gateVersionsDir, DefaultVersionsDir)
 	}
-	want := filepath.Join(DefaultVersionsDir, currentLink, verifyGateBin)
-	if want != "/var/lib/xpf/versions/current/xpfd" {
-		t.Fatalf("fallback candidate = %q, want /var/lib/xpf/versions/current/xpfd", want)
+	if got := filepath.Join(DefaultSbinDir, verifyGateBin); got != "/usr/local/sbin/xpfd" {
+		t.Fatalf("candidate 2 = %q, want /usr/local/sbin/xpfd", got)
+	}
+	if got := filepath.Join(DefaultVersionsDir, currentLink, verifyGateBin); got != "/var/lib/xpf/versions/current/xpfd" {
+		t.Fatalf("candidate 3 = %q, want /var/lib/xpf/versions/current/xpfd", got)
 	}
 }
