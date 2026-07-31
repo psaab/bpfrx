@@ -1297,14 +1297,19 @@ func (a *Agent) handleGetBulk(community []byte, pduBody []byte) []byte {
 	// netlink LinkList dumps (findNextOID + getOIDValue) per varbind — an
 	// O(N)/O(N²) RTM_GETLINK storm. The snapshot bounds it to one dump per PDU.
 	snap := a.newIfSnapshot()
-	varbinds := a.buildBulkVarbinds(oids, nonRepeaters, maxRepetitions, snap)
 
 	// Bound the response to maxPacketSize (RFC 3416 §4.2.3). v2c carries no
-	// per-request msgMaxSize, so the local maximum is the only ceiling. Trim
-	// trailing varbinds until the encoded message fits; the manager continues
-	// the walk from the last returned OID. Only if nothing fits do we fall
-	// back to tooBig with an empty varbind list.
-	resp, ok := trimToFit(varbinds, effectiveMaxSize(maxPacketSize), func(vbs []varbind) []byte {
+	// per-request msgMaxSize, so the local maximum is the only ceiling. The
+	// SAME ceiling is handed to buildBulkVarbinds so the grid stops expanding
+	// once it has produced more bytes than the response can carry (#6551) —
+	// the work is bounded before it is done, not trimmed after.
+	maxSize := effectiveMaxSize(maxPacketSize)
+	varbinds := a.buildBulkVarbinds(oids, nonRepeaters, maxRepetitions, snap, maxSize)
+
+	// Trim trailing varbinds until the encoded message fits; the manager
+	// continues the walk from the last returned OID. Only if nothing fits do we
+	// fall back to tooBig with an empty varbind list.
+	resp, ok := trimToFit(varbinds, maxSize, func(vbs []varbind) []byte {
 		return a.buildResponse(community, requestID, errNoError, 0, vbs)
 	})
 	if !ok {
@@ -1335,17 +1340,55 @@ func (a *Agent) handleGetBulk(community []byte, pduBody []byte) []byte {
 // that column's terminal OID) in its own cell for that repetition and every
 // later repetition, so the row*R+col index stays aligned to the originating
 // column instead of collapsing the grid.
-func (a *Agent) buildBulkVarbinds(oids [][]int, nonRepeaters, maxRepetitions int, snap *ifSnapshot) []varbind {
+//
+// maxBytes is the response ceiling the caller will bound the encoded message to
+// (effectiveMaxSize of the local maximum for v2c, of the advertised msgMaxSize
+// for v3). Expansion STOPS as soon as the varbinds produced so far already
+// encode to more than that (#6551): the grid is repeaters*maxRepetitions cells
+// and every cell costs a findNextOIDSnap MIB walk plus a getOIDValueSnap, while
+// repeaterCount = len(oids)-nonRepeaters is bounded only by how many varbinds
+// the manager can pack into one request datagram. A 4094-byte v2c GETBULK with
+// 580 minimal repeater OIDs and max-repetitions >= 100 built 58,000 varbinds to
+// return 116 — ~0.67 s of MIB walking on the single serial SNMP goroutine per
+// datagram, against a ~2.5 us baseline poll, so a handful of requests per second
+// saturates SNMP permanently (monitoring blindness).
+//
+// The stop is output-neutral. bulkBudget accumulates the EXACT encoded size of
+// each emitted varbind, which is a strict lower bound on the size of the
+// response message carrying it: the message only ADDS bytes on top — the
+// varbind-list SEQUENCE header, the PDU fields, the version/community or
+// USM/scopedPDU envelope, and for authPriv the CBC block padding around the
+// encrypted scopedPDU. So once the accumulated varbind bytes exceed maxBytes,
+// every message built
+// from that prefix — and from any longer one — is already over the ceiling and
+// would be discarded by the caller's trimToFit. Dropping those cells therefore
+// yields a byte-identical response while never performing the walk. RFC 3416
+// §4.2.3 explicitly sanctions returning fewer varbinds than requested: "If the
+// size of the message encapsulating the Response-PDU containing the requested
+// number of variable bindings would be greater than either a local constraint
+// or the maximum message size of the originator, then the response is generated
+// with a lesser number of variable bindings. [...] Note that the number of
+// variable bindings removed has no relationship to the values of N, M, or R."
+// The removal is from the END of the ordered set, which is exactly the prefix
+// this stop preserves, so the repetition-major order and the per-column
+// endOfMibView placement of #5065 are untouched.
+func (a *Agent) buildBulkVarbinds(oids [][]int, nonRepeaters, maxRepetitions int, snap *ifSnapshot, maxBytes int) []varbind {
 	var varbinds []varbind
+	budget := bulkBudget{max: maxBytes}
 
 	// Non-repeaters: a single GETNEXT for each of the first nonRepeaters OIDs.
 	for i := 0; i < nonRepeaters && i < len(oids); i++ {
+		var vb varbind
 		nextOID := a.findNextOIDSnap(oids[i], snap)
 		if nextOID == nil {
-			varbinds = append(varbinds, varbind{oid: oids[i], tag: tagEndOfMibView, value: nil})
+			vb = varbind{oid: oids[i], tag: tagEndOfMibView, value: nil}
 		} else {
 			val, valTag := a.getOIDValueSnap(nextOID, snap)
-			varbinds = append(varbinds, varbind{oid: nextOID, tag: valTag, value: val})
+			vb = varbind{oid: nextOID, tag: valTag, value: val}
+		}
+		varbinds = append(varbinds, vb)
+		if budget.add(vb) {
+			return varbinds
 		}
 	}
 
@@ -1362,24 +1405,67 @@ func (a *Agent) buildBulkVarbinds(oids [][]int, nonRepeaters, maxRepetitions int
 	}
 	for rep := 0; rep < maxRepetitions; rep++ {
 		for c := 0; c < repeaterCount; c++ {
-			if exhausted[c] {
+			var vb varbind
+			nextOID := []int(nil)
+			if !exhausted[c] {
+				nextOID = a.findNextOIDSnap(cursors[c], snap)
+			}
+			switch {
+			case exhausted[c]:
 				// Column already ran off the end of the MIB view; keep its cell
 				// filled with endOfMibView so the row*R+col mapping holds.
-				varbinds = append(varbinds, varbind{oid: cursors[c], tag: tagEndOfMibView, value: nil})
-				continue
-			}
-			nextOID := a.findNextOIDSnap(cursors[c], snap)
-			if nextOID == nil {
-				varbinds = append(varbinds, varbind{oid: cursors[c], tag: tagEndOfMibView, value: nil})
+				vb = varbind{oid: cursors[c], tag: tagEndOfMibView, value: nil}
+			case nextOID == nil:
+				vb = varbind{oid: cursors[c], tag: tagEndOfMibView, value: nil}
 				exhausted[c] = true
-				continue
+			default:
+				val, valTag := a.getOIDValueSnap(nextOID, snap)
+				vb = varbind{oid: nextOID, tag: valTag, value: val}
+				cursors[c] = nextOID
 			}
-			val, valTag := a.getOIDValueSnap(nextOID, snap)
-			varbinds = append(varbinds, varbind{oid: nextOID, tag: valTag, value: val})
-			cursors[c] = nextOID
+			varbinds = append(varbinds, vb)
+			if budget.add(vb) {
+				return varbinds
+			}
 		}
 	}
 	return varbinds
+}
+
+// bulkBudget tracks how many encoded bytes the varbinds of an in-progress
+// GETBULK grid already occupy, so expansion can stop at the response ceiling
+// instead of materializing the whole repeaters*maxRepetitions grid and trimming
+// afterwards (#6551).
+type bulkBudget struct {
+	used int // exact encoded size of the varbinds accounted so far
+	max  int // response ceiling in bytes (effectiveMaxSize of the caller's max)
+}
+
+// add accounts vb against the budget and reports whether the ceiling has been
+// passed — i.e. whether the caller must stop expanding the grid. It returns
+// true only once the accumulated varbind bytes STRICTLY exceed max, so the
+// varbind that trips it is still emitted and the caller never stops one cell
+// short of a prefix that would have fit.
+func (b *bulkBudget) add(vb varbind) bool {
+	b.used += varbindEncodedLen(vb)
+	return b.used > b.max
+}
+
+// varbindEncodedLen returns the exact number of bytes vb contributes to the
+// varbind list of an encoded response. It MUST stay in step with the per-varbind
+// encoding in buildResponseVersion / buildV3Response — an overestimate would
+// stop a GETBULK grid short of varbinds that would have fit and shrink the
+// response. TestVarbindEncodedLenMatchesEncoder_6551 pins the two together.
+func varbindEncodedLen(vb varbind) int {
+	oidBytes := berEncodeTLV(tagObjectIdentifier, berEncodeOID(vb.oid))
+	var valBytes []byte
+	if vb.tag == tagNoSuchObject || vb.tag == tagNoSuchInstance || vb.tag == tagEndOfMibView {
+		valBytes = berEncodeTLV(vb.tag, nil)
+	} else {
+		valBytes = berEncodeValue(vb.tag, vb.value)
+	}
+	body := len(oidBytes) + len(valBytes)
+	return 1 + len(berEncodeLength(body)) + body
 }
 
 // getCommunity returns the configured community matching the given string, or
