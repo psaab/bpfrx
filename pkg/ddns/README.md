@@ -21,7 +21,7 @@ moved with its assertions intact.
 | `backend_rfc2136.go` | The LIVE RFC 2136 backend (`rfc2136Updater`): exact-RR adds/deletes, TSIG, RFC 4701 DHCID + RFC 4703 replace-owned two-attempt, the `errDDNSConflictRefused` / `errDDNSPTRPending` sentinels — moved from `dhcpserver/ddns_rfc2136.go`. `sendRemoveForward(..., keepDHCID)` keeps a shared DHCID on a partial dual-stack teardown (#2700); `dnsCanonicalFQDN` mirrors the DHCID FQDN canonicalization. |
 | `hostname.go` | Deterministic hostname → DNS-label normalization (pure) — moved from `dhcpserver/ddns_hostname.go`. |
 | `surface_a.go` | Surface A router/interface-address publish engine (`SurfaceAManager`): change-detection, forced-refresh wire floor, the `ForceRefresh()` operator force-now latch (#3276), per-scope error backoff, per-RG HA gate, the backend factory `productionSurfaceABackend` (#2691 P2/P3). **Operator-hostname intent (#2779):** the publish path (`surfaceAName` → `sanitizeFQDN`) lower-cases + strips non-LDH characters + drops empty-sanitizing labels. For a *router-owned* Surface A record the hostname is operator intent (the operator types the exact public name), so a name that sanitization would STRUCTURALLY change is now a **commit error** (`config.ValidateDDNSHostname` on the typed `interfaces … dynamic-dns hostname` leaf) instead of a silent rewrite to a different DNS name — e.g. `wan_1.example.net` is rejected at commit rather than published as `wan1.example.net`. Case-folding and a single trailing dot are accepted (benign DNS canonicalizations). Every name that PASSES the commit check is a fixed point of `sanitizeFQDN` (cross-package contract test `surface_a_hostname_2779_test.go`), so the published name equals operator intent. |
-| `backend_http.go` | Shared HTTP-backend discipline (#2691 P3): hardened `http.Client` (TLS-verified, bounded timeout), capped body read, `classifyHTTPStatus`, `queryEscape`, the `errHTTPAuth`/`errHTTPRateLimited` verdicts. **Source binding (#2846):** `newHTTPClientBound(bindConfig)` installs the SAME `backend_bind.go` source/interface/VRF `Dialer` (via `Transport.DialContext`) so the HTTP backends + checkip egress from the operator-configured `source-address` / `destination-interface` / `routing-instance` — not the kernel default route. `newHTTPClient()` is the no-bind alias (unbound default, behaviour unchanged). `resolveProviderBindConfig`/`newProviderHTTPClient` adapt a `config.DDNSProvider`'s leaves onto `resolveBindConfig`; a malformed `source-address` is a hard error so the backend constructor degrades to no-op (fail-open, mirrors rfc2136). |
+| `backend_http.go` | Shared HTTP-backend discipline (#2691 P3): hardened `http.Client` (TLS-verified, bounded timeout), capped body read, `classifyHTTPStatus`, `queryEscape`, the `errHTTPAuth`/`errHTTPRateLimited` verdicts. **Source binding (#2846):** `newHTTPClientBound(bindConfig)` installs the SAME `backend_bind.go` source/interface/VRF `Dialer` (via `Transport.DialContext`) so the HTTP backends + checkip egress from the operator-configured `source-address` / `destination-interface` / `routing-instance` — not the kernel default route. `newHTTPClient()` is the no-bind alias (unbound default, behaviour unchanged). `resolveProviderBindConfig`/`newProviderHTTPClient` adapt a `config.DDNSProvider`'s leaves onto `resolveBindConfig`; a malformed `source-address` is a hard error so the backend constructor degrades to no-op (fail-open, mirrors rfc2136). **Redirect policy (#4861, #6545):** `guardRedirect` is the single `CheckRedirect` every DDNS HTTP client carries. It refuses a scheme downgrade (HTTPS→HTTP) AND any cross-host hop, strips `Referer` from every redirect it does follow, and re-implements the 10-hop cap that setting `CheckRedirect` removes. The cross-host half closes a real credential disclosure: Go's `refererForURL` puts the FULL previous URL — query string included — in `Referer` on an HTTPS→HTTPS hop (the DuckDNS/`generic`/`checkip-url` token), and `shouldCopyHeaderOnRedirect` forwards `Authorization`/`Cookie` to any SUBDOMAIN of the original host (the dyndns2/`generic` Basic credential, the Cloudflare bearer token). Same-host redirects still work. See “Redirect policy” below. |
 | `backend_dyndns2.go` | dyndns2 backend (#2691 P3): one impl behind many provider names (`dyndns2Endpoints`), `good`/`nochg`/`badauth`/`abuse`/`911`/`nohost` verdict parsing. |
 | `backend_cloudflare.go` | Cloudflare API backend (#2691 P3): Bearer token, zone-id resolve → list → PATCH/POST/DELETE record. **Upsert is value-specific (#3739 H11):** `UpsertLease` lists EVERY A/AAAA at the name and touches ONLY xpf's own row — a row already carrying the new value is a no-op, else the row carrying xpf's PREVIOUS value (`rec.PrevAddr`) is PATCHed in place, else a new record is POSTed. It NEVER PATCHes `recs[0]` (an API-ordering artifact), so a co-resident FOREIGN A/AAAA a human set on the same name is never rewritten to xpf's address. **Withdraw is content-scoped (#2770):** `DeleteLease` lists EVERY record for the FQDN+type and deletes only the rows whose `content` equals the owned address (`rec.Addr.Unmap().String()`), removing ALL such duplicates. It never deletes a row with a different value (a human/automation changed it after xpf published — an ownership conflict that is a success no-op), honouring the Surface A sole-delete-authority boundary that RFC 2136 also enforces (Route 53 now preserves co-resident foreign members via a read-modify-write — #5389, see the P2 note). `recs[0]` is an API-ordering artifact, not ownership. **Record listing paginates (#4909):** `listRecords` walks every page of the dns_records list (driven by `result_info.total_pages`, with a short-page fallback and a 1000-page runaway cap), so an xpf-owned row past the first 100-row page is never hidden — the pre-fix single unpaginated GET could drive a duplicate create (owned row unseen) or a false "already absent" delete. |
 | `backend_dyndns2.go` | dyndns2 backend (#2691 P3): one impl behind many provider names (`dyndns2Endpoints`), `good`/`nochg`/`badauth`/`abuse`/`911`/`nohost` verdict parsing. **Withdraw (#2772):** `DeleteLease` issues the same update GET with `offline=YES` (the de-facto dyndns2 withdraw verb) and parses the body verdict; a provider failure returns a non-nil error so the engine keeps ownership for retry (was a silent no-op that orphaned the public record). **Dual-stack sibling guard (#3738):** `offline=YES` is HOSTNAME-level (both A and AAAA); when the engine sets `LeaseDNSRecord.SiblingFamilyOwned` (a sibling family is still published at this name/provider) `DeleteLease` SKIPS the offline so the live sibling is preserved (see "Dual-stack same-name withdraw" below). **DuckDNS is NOT here (#2960):** DuckDNS is not dyndns2-protocol-compatible, so it has its own `backend_duckdns.go`; `duckdns` was removed from `dyndns2Endpoints`. **Server validation (#3737):** `resolveDyndns2Endpoint` decides full-URL vs bare-host on the `://` delimiter, parses the URL with `url.Parse`, compares the scheme with `strings.EqualFold` (case-INSENSITIVE per RFC 3986 §3.1, so `HTTPS://host` is accepted — the old case-sensitive `HasPrefix` misclassified it as a bare host and produced a doubly-suffixed malformed URL), and requires a non-empty `Hostname()` in BOTH cases so a hostless value (`http://`, `https:///nic/update`, `:8080`) fails at construction (manager falls back to no-op) instead of only at the first publish. This is the SAME discipline as checkip's `validateCheckIPURL` (#2842) and generic's `validateGenericURLTemplate` (#2841). A malformed `server` is also warned at commit by `config.validateSurfaceADDNSWarnings` (mirror `ddnsDyndns2ServerValid`, RedactURL'd in the message). |
@@ -71,6 +71,70 @@ diagnostics (#2781). A construction failure
 (missing credential) degrades to the no-op backend (logged; the commit warning
 already fired) — fail-open, matching the rfc2136 posture. Live-provider verify
 is the deferred lab gate; the mock-server tests are the merge gate.
+
+### Redirect policy — no downgrade, no cross-host (#4861, #6545)
+
+Every HTTP DDNS client is built at ONE site (`newHTTPClientBound`) and every
+request goes through ONE `Do()` (`doRequest`), so a single
+`http.Client.CheckRedirect` — `guardRedirect` in `backend_http.go` — covers all
+six request-building paths: `dyndns2`, `duckdns`, `cloudflare`, `route53`,
+`generic`, and the `checkip-url` probe (which builds its own request rather than
+going through a backend). The daemon never constructs its own client; it obtains
+one from `SurfaceAManager.CheckIPClient`, so there is no bypass.
+
+`guardRedirect` refuses a 30x Location that **downgrades the scheme**
+(HTTPS→HTTP, #4861 — a credentialed update must never be walked onto a plaintext
+connection) **or changes the host** (#6545), strips `Referer` from every redirect
+it does follow, and re-implements the 10-hop cap that setting `CheckRedirect`
+otherwise removes (same arithmetic as `net/http`'s `defaultCheckRedirect`: 10
+requests total, the 10th redirect refused).
+
+The cross-host half exists because the scheme guard alone left an HTTPS→HTTPS hop
+to a different host wide open, and Go discloses real secrets across it:
+
+- **`Referer` carries the full previous URL including the query string.**
+  `net/http`'s `refererForURL` strips only the userinfo and suppresses the header
+  only for HTTPS→HTTP; on an HTTPS→HTTPS hop the redirect target receives e.g.
+  `https://www.duckdns.org/update?domains=h&token=<TOKEN>`. That is a live
+  credential for `duckdns` (the token is a QUERY param, not Basic), for `generic`
+  (a `%p`-expanded password or a literal `?token=` in `url-template`), and for a
+  `checkip-url` carrying an API key. For every backend it also discloses the FQDN
+  and the public address being published.
+- **Go forwards `Authorization`/`Cookie` to any SUBDOMAIN of the original host**
+  (`shouldCopyHeaderOnRedirect` → `isDomainOrSubdomain`), so a Location pointing
+  at `sub.<configured-host>` hands over the dyndns2/generic Basic credential and
+  the Cloudflare bearer token. Stripping `Referer` would not have closed this
+  half — only refusing the hop does.
+
+Refusing rather than sanitizing-and-following is deliberate. These are
+machine-to-machine callers of an endpoint the operator PINNED (a built-in
+provider constant, or a `server` / `url-template` / `checkip-url` leaf); there is
+no discovery step that needs to land elsewhere, and following a Location to an
+unconfigured host is itself the trust violation — it ships the update payload,
+and on a 307/308 the whole request body (a Route 53 change batch), to a host the
+operator never named. The realistic trigger is a mistyped or hostile `server`
+leaf, and fail-closed is this package's posture everywhere else (bind error,
+malformed `checkip-url`, unrecognized response body). A provider that genuinely
+moves to a new host is served by pointing the leaf at the final host; the error
+names both hosts so the operator can do exactly that. **Same-host redirects — the
+common real case, a path or API-version move — are still followed.**
+
+Host comparison is by HOSTNAME only: case-insensitive (RFC 4343), one trailing
+root dot normalized away, and deliberately PORT-INDEPENDENT. The trust anchor is
+the DNS name and the TLS certificate identity bound to it — what the operator
+configured and what cert verification pins — so a port move stays inside that
+identity, while a port-strict rule would falsely refuse the plain
+`https://prov.example:443/x` → `https://prov.example/x` default-port
+normalization. A Unicode (non-punycode) Location host compares unequal to its
+A-label spelling and is refused; that is the conservative direction (a false
+refusal, never a false allow) and no in-tree provider uses an IDN host.
+
+Fail-on-revert coverage is `redirect_crosshost_6545_test.go`, which drives two
+TLS servers on real DNS names through the production client and asserts on what
+the SECOND server actually received.
+`TestCrossHostRedirectWouldLeakWithoutHostGuard` is the mutation-sensitivity
+control: the identical harness under the pre-#6545 scheme-only policy, asserting
+the token DOES arrive in `Referer`.
 
 ### Withdraw (DeleteLease) semantics per backend (#2772)
 

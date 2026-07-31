@@ -40,7 +40,7 @@ func TestRefuseSchemeDowngrade(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			via := []*http.Request{mkReq(t, tc.prev)}
-			err := refuseSchemeDowngrade(mkReq(t, tc.next), via)
+			err := guardRedirect(mkReq(t, tc.next), via)
 			if tc.wantErr && err == nil {
 				t.Fatalf("expected the redirect to be refused, got nil")
 			}
@@ -55,7 +55,7 @@ func TestRefuseSchemeDowngrade(t *testing.T) {
 	for i := range via {
 		via[i] = mkReq(t, "https://prov.example/upd")
 	}
-	if err := refuseSchemeDowngrade(mkReq(t, "https://prov.example/upd"), via); err == nil {
+	if err := guardRedirect(mkReq(t, "https://prov.example/upd"), via); err == nil {
 		t.Fatalf("expected the 10-redirect cap to fire, got nil")
 	}
 }

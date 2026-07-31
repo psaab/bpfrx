@@ -62122,3 +62122,49 @@ break — `go vet` confirmed passing under every revert.
   22.7 Gbps) and needs no re-run for a comment-only change.
 - **File(s)**: pkg/cluster/{election.go,ifmon_weight_daemon_apply_6549_test.go},
     pkg/routing/monitor.go, _Log.md
+
+## 2026-07-31 — #6545 ddns: refuse cross-host redirects (query-param credential leak via Referer)
+
+- **Timestamp**: 2026-07-31
+- **Action**: Closed the cross-host half of the DDNS redirect guard (#4861
+  residual). `refuseSchemeDowngrade` checked only the SCHEME, so an
+  https->https 30x to a DIFFERENT host was followed, and Go's `refererForURL`
+  puts the FULL previous URL — query string included — in `Referer`. That
+  discloses the DuckDNS token (a QUERY param, not Basic), the `generic`
+  backend's `%p`-expanded password / literal `?token=`, and a
+  credential-bearing `checkip-url` API key to the redirect target. Verified
+  firsthand with a two-TLS-server probe before writing the fix, which also
+  turned up a second vector the issue did not mention: Go's
+  `shouldCopyHeaderOnRedirect`/`isDomainOrSubdomain` FORWARDS
+  `Authorization`/`Cookie` to any SUBDOMAIN of the original host, handing over
+  the dyndns2/generic Basic credential and the Cloudflare bearer token —
+  stripping `Referer` alone would not have closed that.
+  Renamed the policy to `guardRedirect` and made it refuse any cross-host hop,
+  strip `Referer` from every followed redirect, and keep the 10-hop cap
+  (`maxRedirects`, same arithmetic as `net/http` `defaultCheckRedirect`).
+  Chose REFUSE over sanitize-and-follow: these are machine-to-machine callers
+  of an operator-PINNED endpoint, and following a Location to an unconfigured
+  host ships the update payload (and on 307/308 the whole request body, e.g. a
+  Route 53 change batch) to a host the operator never named. Host comparison is
+  hostname-only — case-insensitive, root-dot-normalized, PORT-INDEPENDENT (the
+  trust anchor is the DNS name + its TLS identity; a port-strict rule would
+  falsely refuse `https://h:443/x` -> `https://h/x`).
+  Coverage audit: the package has exactly ONE `http.Client` construction site
+  (`newHTTPClientBound`) and ONE `Do()` (`doRequest`), so the single policy
+  covers all six request-building paths — dyndns2, duckdns, cloudflare,
+  route53, generic, and the `checkip-url` probe (which builds its own request).
+  The daemon does not construct its own client (it calls
+  `SurfaceAManager.CheckIPClient`), so there is no bypass;
+  `TestAllHTTPBackendsShareTheGuard` pins all five constructor entry points.
+- **Validation**: RED-on-revert proven twice as ASSERTION failures, not build
+  breaks — neutralizing the cross-host branch fails 5 test functions (incl. the
+  end-to-end "collector received 1 request(s) it must never have seen"), and
+  neutralizing the `Referer` strip fails 2. `TestCrossHostRedirectWouldLeak`
+  `WithoutHostGuard` is the mutation-sensitivity control: the identical harness
+  under the pre-#6545 scheme-only policy, asserting the token DOES arrive in
+  `Referer`. Over-reach guards (same-host redirect still publishes, plain
+  non-redirecting update, hop cap) stay GREEN under revert. Full `pkg/ddns`,
+  `pkg/daemon`, `pkg/config` suites green; `go build ./...` + `go vet` clean.
+  No cluster smoke: control-plane-only change, no dataplane or HA path touched.
+- **File(s)**: pkg/ddns/{backend_http.go,redirect_crosshost_6545_test.go,
+    redirect_downgrade_4861_test.go,README.md}, docs/config-schema.md, _Log.md

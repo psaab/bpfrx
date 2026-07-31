@@ -114,21 +114,88 @@ func newHTTPClientBound(b bindConfig) *http.Client {
 	return &http.Client{
 		Timeout:       httpClientTimeout,
 		Transport:     tr,
-		CheckRedirect: refuseSchemeDowngrade,
+		CheckRedirect: guardRedirect,
 	}
 }
 
-// refuseSchemeDowngrade is the shared *http.Client.CheckRedirect for every HTTP
-// DDNS backend. It refuses an HTTPS->HTTP redirect downgrade (#4861): a
-// credentialed backend (dyndns2 Basic auth, DuckDNS/Cloudflare query/bearer
-// token, Route 53 SigV4) that started over TLS must never be walked onto a
-// plaintext connection by a 30x Location, which would put the update credential
-// on the wire in cleartext for an on-path attacker. Same-scheme redirects and
-// an HTTP->HTTPS upgrade are still followed. The default 10-redirect cap is
-// re-implemented here because setting CheckRedirect replaces Go's built-in cap.
-func refuseSchemeDowngrade(req *http.Request, via []*http.Request) error {
-	if len(via) >= 10 {
-		return errors.New("ddns http: stopped after 10 redirects")
+// maxRedirects re-implements Go's built-in redirect cap. Setting CheckRedirect
+// REPLACES http.Client's default 10-hop limit, so the cap has to be restored by
+// the policy itself or a redirect loop would spin forever inside one request.
+const maxRedirects = 10
+
+// guardRedirect is the shared *http.Client.CheckRedirect for every HTTP DDNS
+// backend. It enforces three things on a 30x Location, and restores the hop cap
+// the default policy would otherwise have provided.
+//
+//  1. NO SCHEME DOWNGRADE (#4861). A credentialed backend (dyndns2 Basic auth,
+//     DuckDNS/Cloudflare query/bearer token, Route 53 SigV4) that started over
+//     TLS must never be walked onto a plaintext connection, which would put the
+//     update credential on the wire for an on-path attacker. An HTTP->HTTPS
+//     upgrade is still followed.
+//
+//  2. NO CROSS-HOST REDIRECT (#6545). The scheme guard alone left an
+//     https->https hop to a DIFFERENT host wide open, and Go discloses real
+//     secrets across exactly that hop — verified firsthand against the stdlib,
+//     not assumed:
+//
+//     - Referer carries the FULL previous URL INCLUDING the query string.
+//     net/http refererForURL() strips only the userinfo and suppresses the
+//     header only for https->http; on an https->https hop to any host the
+//     redirect target receives e.g.
+//     "https://www.duckdns.org/update?domains=h&token=<TOKEN>". That is a
+//     live provider credential for DuckDNS (token is a QUERY param, not
+//     Basic — see backend_duckdns.go), for the generic backend (a %p-expanded
+//     password or a literal ?token= in url-template), and for a checkip-url
+//     that carries an API key. It also discloses the FQDN and the public
+//     address being published for every backend.
+//
+//     - Go forwards Authorization/Cookie to any SUBDOMAIN of the original
+//     host (net/http shouldCopyHeaderOnRedirect -> isDomainOrSubdomain).
+//     So a redirect to sub.<configured-host> hands the dyndns2/generic Basic
+//     credential and the Cloudflare bearer token to a host the operator never
+//     configured. Stripping Referer would NOT have closed that half.
+//
+//     Refusing outright, rather than sanitizing and following, is the choice
+//     because these clients are machine-to-machine callers of an endpoint the
+//     operator PINNED (a built-in provider constant, or a `server` /
+//     `url-template` / `checkip-url` leaf). There is no discovery step that
+//     needs to land somewhere else, and following a Location to an unconfigured
+//     host is itself the trust violation: it sends the update payload (which
+//     FQDN, which public address) — and on a 307/308 the whole request body,
+//     e.g. a Route 53 change batch — to a host the operator never named. The
+//     realistic trigger is a mistyped or hostile `server` leaf, and fail-closed
+//     is this package's posture everywhere else (bind error, malformed
+//     checkip-url, unrecognized response body). A provider that genuinely moves
+//     to a new host is served by pointing the leaf at the final host; the error
+//     names both hosts so the operator can do exactly that. SAME-host
+//     redirects — the common real case, a path or API-version move — are still
+//     followed.
+//
+//  3. NO Referer ON ANY FOLLOWED REDIRECT. Defense in depth on top of (2): the
+//     hop we do allow is same-host, so the target already holds the credential
+//     it is being sent, but there is no reason for a DDNS API call to echo its
+//     own query string back into a header that provider access logs record
+//     separately. Go sets Referer on the new request BEFORE calling
+//     CheckRedirect precisely so a policy can override it (see the comment on
+//     Client.do), so deleting it here is the supported seam. Deleting from a nil
+//     header map is a defined no-op, so a synthetic request needs no guard.
+//
+// Host comparison is by HOSTNAME only — case-insensitive per RFC 4343, with one
+// trailing root dot normalized away, and deliberately PORT-INDEPENDENT. The
+// trust anchor is the DNS name and the TLS certificate identity bound to it,
+// which is what the operator configured and what cert verification pins; a port
+// move stays inside that identity, and a port-strict rule would falsely refuse
+// the plain "https://prov.example:443/x" -> "https://prov.example/x" default-port
+// normalization. A Unicode (non-punycode) Location host compares unequal to its
+// A-label spelling and is refused; that is the conservative direction (a false
+// refusal, never a false allow) and no in-tree provider uses an IDN host.
+//
+// The comparison is against the PREVIOUS hop, matching the scheme guard. Under
+// exact equality that is equivalent to comparing against the original request:
+// every hop must equal its predecessor, so by induction every hop equals hop 0.
+func guardRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRedirects {
+		return fmt.Errorf("ddns http: stopped after %d redirects", maxRedirects)
 	}
 	if len(via) > 0 {
 		prev := via[len(via)-1].URL
@@ -136,8 +203,26 @@ func refuseSchemeDowngrade(req *http.Request, via []*http.Request) error {
 			return fmt.Errorf("ddns http: refusing HTTPS->%s redirect downgrade to %s "+
 				"(would expose update credentials in cleartext)", req.URL.Scheme, req.URL.Host)
 		}
+		if !strings.EqualFold(redirectHost(prev), redirectHost(req.URL)) {
+			return fmt.Errorf("ddns http: refusing cross-host redirect from %s to %s "+
+				"(would disclose the update credentials and payload to a host that is not "+
+				"the configured endpoint); point the provider endpoint at the final host instead",
+				redirectHost(prev), redirectHost(req.URL))
+		}
 	}
+	// Followed (same-host) hop: never echo the previous URL's query string —
+	// which carries the DuckDNS/generic/checkip credential — into Referer.
+	req.Header.Del("Referer")
 	return nil
+}
+
+// redirectHost normalizes a URL's host for guardRedirect's same-host test:
+// the hostname with the port dropped (URL.Hostname also unwraps an IPv6 literal
+// from its brackets) and one trailing root dot removed, so "prov.example." and
+// "prov.example" are the one name they actually are. Case folding is left to the
+// EqualFold comparison at the call site.
+func redirectHost(u *url.URL) string {
+	return strings.TrimSuffix(u.Hostname(), ".")
 }
 
 // httpClientCache caches the hardened *http.Client (and its underlying
