@@ -1,7 +1,9 @@
 package upgrade
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -167,16 +169,30 @@ func TestResolveVerifyGateBinFallsBackToVersionedRuntime(t *testing.T) {
 	}
 }
 
-// TestResolveVerifyGateBinFallsBackWhenRunningBinaryDeleted models the
-// os.Executable "(deleted)" report: the returned path does not stat, so the
-// resolver must move on to the versioned runtime rather than exec a
-// non-existent path or reach for PATH.
-func TestResolveVerifyGateBinFallsBackWhenRunningBinaryDeleted(t *testing.T) {
+// TestResolveVerifyGateBinFallsBackWhenRunningBinaryPathIsGone covers the
+// SECOND way candidate (1) can be unusable, distinct from the error branch
+// above: os.Executable SUCCEEDS and returns a plausible path, but that path no
+// longer resolves. This is what an unlinked running binary actually looks like.
+//
+// Be precise about the mechanism, because the obvious guess is wrong: Readlink
+// on /proc/self/exe appends " (deleted)" for an unlinked binary, but Go TRIMS
+// that suffix and returns the original path with a nil error
+// (src/os/executable_procfs.go). So there is no suffix to detect, and a test
+// seeding a "(deleted)"-suffixed string would be feeding the resolver an input
+// the real API cannot produce. The fallback is driven purely by os.Stat
+// returning ENOENT — which is exactly what this seeds.
+func TestResolveVerifyGateBinFallsBackWhenRunningBinaryPathIsGone(t *testing.T) {
 	root := t.TempDir()
 	versions := filepath.Join(root, "versions")
 	want := fakeXpfd(t, filepath.Join(versions, "current"), 0)
-	deleted := filepath.Join(versions, "v1", "xpfd (deleted)")
-	withGateSeams(t, deleted, versions)
+
+	// A real-shaped path (versions/<ver>/xpfd) that was created and then
+	// unlinked — os.Executable would still report it verbatim.
+	unlinked := fakeXpfd(t, filepath.Join(versions, "v1.2.3"), 0)
+	if err := os.Remove(unlinked); err != nil {
+		t.Fatalf("unlink %s: %v", unlinked, err)
+	}
+	withGateSeams(t, unlinked, versions)
 
 	got, err := resolveVerifyGateBin()
 	if err != nil {
@@ -184,6 +200,89 @@ func TestResolveVerifyGateBinFallsBackWhenRunningBinaryDeleted(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("resolved %q, want %q", got, want)
+	}
+}
+
+// unlinkProbeEnv puts this test file's binary into "child" mode: unlink our own
+// executable and report what os.Executable() says afterwards.
+const unlinkProbeEnv = "XPF_6541_UNLINK_PROBE"
+
+// TestOsExecutableTrimsDeletedSuffix pins the toolchain behaviour that
+// resolveVerifyGateBin's doc comment (and TestResolveVerifyGateBinFallsBack-
+// WhenRunningBinaryPathIsGone) assert as fact: on Linux, Readlink of
+// /proc/self/exe appends " (deleted)" for an unlinked binary, and Go TRIMS that
+// suffix before returning (src/os/executable_procfs.go). If a future release
+// stopped trimming, the resolver would still fall back correctly (the suffixed
+// path stats to ENOENT) but the documented rationale would silently rot.
+//
+// This has to actually unlink a running binary to mean anything — asserting
+// against the undeleted test binary would be a tautology. So the parent copies
+// this test binary to a temp path and re-execs the copy; the child removes its
+// own path and prints what os.Executable() returns.
+func TestOsExecutableTrimsDeletedSuffix(t *testing.T) {
+	if os.Getenv(unlinkProbeEnv) == "1" {
+		self, err := os.Executable()
+		if err != nil {
+			fmt.Printf("PROBE-ERR executable: %v\n", err)
+			return
+		}
+		if err := os.Remove(self); err != nil {
+			fmt.Printf("PROBE-ERR unlink: %v\n", err)
+			return
+		}
+		after, err := os.Executable()
+		fmt.Printf("PROBE-RESULT %q err=%v\n", after, err)
+		return
+	}
+
+	src, err := os.Executable()
+	if err != nil {
+		t.Skipf("os.Executable unavailable: %v", err)
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Skipf("cannot read test binary %s: %v", src, err)
+	}
+	copyPath := filepath.Join(t.TempDir(), "probe.test")
+	if err := os.WriteFile(copyPath, data, 0o755); err != nil {
+		t.Skipf("cannot stage test-binary copy: %v", err)
+	}
+
+	cmd := exec.Command(copyPath, "-test.run", "^TestOsExecutableTrimsDeletedSuffix$")
+	cmd.Env = append(os.Environ(), unlinkProbeEnv+"=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Skipf("probe child failed (%v): %s", err, out)
+	}
+
+	line := ""
+	for _, l := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(l, "PROBE-RESULT ") || strings.HasPrefix(l, "PROBE-ERR ") {
+			line = l
+			break
+		}
+	}
+	if line == "" {
+		t.Skipf("probe child produced no result line: %s", out)
+	}
+	if strings.HasPrefix(line, "PROBE-ERR ") {
+		t.Skipf("probe could not run: %s", line)
+	}
+
+	if strings.Contains(line, "(deleted)") {
+		t.Fatalf("after unlinking its own binary, os.Executable() reported a "+
+			"\" (deleted)\"-suffixed path: %s\n"+
+			"The toolchain no longer trims the suffix. resolveVerifyGateBin's "+
+			"doc comment and the ENOENT-driven fallback rationale are now wrong "+
+			"and must be rewritten (the fallback itself still works).", line)
+	}
+	if !strings.Contains(line, strconv.Quote(copyPath)) {
+		t.Fatalf("probe reported %s, want the original (untrimmed-away) path %q",
+			line, copyPath)
+	}
+	if !strings.Contains(line, "err=<nil>") {
+		t.Fatalf("probe reported %s, want a nil error — the doc comment claims "+
+			"os.Executable SUCCEEDS for an unlinked binary", line)
 	}
 }
 

@@ -500,6 +500,16 @@ var osExecutable = os.Executable
 
 // gateVersionsDir is the #1917 versioned-runtime root resolveVerifyGateBin
 // falls back to. A package var so a test can point it at a temp tree.
+//
+// KNOWN DIVERGENCE: the binary-cut channel lets an operator relocate this root
+// with `--versions-dir` (cmd/xpfd/upgrade.go, cmd/xpfd/seed_runtime.go), but
+// KernelConfig carries no VersionsDir to thread through, so the kernel gate
+// always uses the compiled-in default. The consequence is bounded and safe: on
+// a relocated install the fallback candidate simply does not exist, candidate
+// (1) — os.Executable, which needs no configured root — still resolves, and if
+// even that fails the resolver fail-closes into revert() rather than guessing.
+// Threading the flag down means widening KernelConfig; do that if a relocated
+// root ever becomes a supported production layout rather than a test knob.
 var gateVersionsDir = DefaultVersionsDir
 
 // verifyGateBin is the basename of the daemon artifact the promotion gate
@@ -529,12 +539,24 @@ const verifyGateBin = "xpfd"
 //     /proc/self/exe, which resolves the /usr/local/sbin/xpfd ->
 //     versions/current -> versions/<ver>/xpfd chain down to the concrete
 //     versioned artifact — the same version-multiplexed path
-//     realSystem.VerifyDataplane is handed. It is also the only candidate that
-//     is exactly the running build, with no window for a concurrent flip.
+//     realSystem.VerifyDataplane is handed. It is also the CLOSEST available
+//     handle on the running build: it names the path the kernel loaded this
+//     process from. Note it is a PATH, not the inode — an overwrite of that
+//     path (a #2176-shape raw deploy) would leave it stat'ing to a NEWER file
+//     while this process still runs the old one. The `upgrade kernel promote`
+//     lock (cmd/xpfd/upgrade_kernel.go) serializes this against a binary cut,
+//     and either way the exec target stays explicit, which is the property
+//     this function exists to guarantee.
 //  2. <VersionsDir>/current/xpfd — the #1917 version-multiplexed runtime path
-//     the sbin links point through (pkg/upgrade/runtime.Seed step 4). Used only
-//     when (1) is unavailable (no /proc, or a running binary that has been
-//     unlinked, which makes os.Executable report a "(deleted)" path).
+//     the sbin links point through (pkg/upgrade/runtime.Seed step 4). Reached
+//     when (1) is unavailable: os.Executable errored (no /proc), or it returned
+//     a path that no longer resolves. The latter is how an UNLINKED running
+//     binary lands here, and it is worth being precise about the mechanism: Go
+//     TRIMS the " (deleted)" suffix Readlink appends and returns the original
+//     path with a nil error (src/os/executable_procfs.go), so the fallback is
+//     driven by os.Stat returning ENOENT on that path — never by inspecting a
+//     suffix. Code or tests keying on a "(deleted)" string would be testing an
+//     input the API cannot produce.
 //
 // A hardcoded /usr/local/sbin/xpfd is deliberately NOT the primary: it is a
 // PATH directory itself and, more importantly, pinning the gate to a fixed

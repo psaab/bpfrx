@@ -183,6 +183,27 @@ class TestResolutionBehaviour(unittest.TestCase):
             "the gate executed the xpfd it found on $PATH (#6541)",
         )
 
+    def test_directory_candidate_is_not_treated_as_the_binary(self):
+        # `test -x` alone is TRUE for a searchable DIRECTORY. The inner hop's
+        # validateGateBin rejects a non-regular target, so the outer hop must
+        # too — otherwise the two hops' admission tests are not actually
+        # symmetric. A directory at the primary candidate must be skipped and
+        # the sbin fallback used, NOT exec'd and not resolved via $PATH.
+        Path(str(self.fake_root) + VERSIONED).mkdir(parents=True)
+        sbin_ran = self._install(SBIN, 0)
+
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue(
+            sbin_ran.exists(),
+            f"a DIRECTORY at {VERSIONED} was accepted as the gate binary "
+            f"instead of falling through to {SBIN}: {res.stderr}",
+        )
+        self.assertFalse(
+            self.marker.exists(),
+            "the gate executed the xpfd it found on $PATH (#6541)",
+        )
+
     def test_skips_rather_than_falling_back_to_path(self):
         # NEITHER explicit candidate exists, but a perfectly good xpfd is
         # sitting on $PATH. The gate must SKIP (exit 0, the pre-existing

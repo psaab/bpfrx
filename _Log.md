@@ -62398,3 +62398,79 @@ break — `go vet` confirmed passing under every revert.
     exec_bare_artifact_lint_6541_test.go},
     scripts/image/{xpf-kernel-promote,test_kernel_promote_explicit_path.py},
     scripts/run-selftests.sh, docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-31 (fix/6541-kernel-gate-explicit-path, review fold r1)
+- **Action**: #6541 fold of an independent hostile review (MERGE-NEEDS-MINOR).
+  All four findings verified firsthand and all four are CORRECT — nothing
+  pushed back on.
+  MINOR 1 — the lint was MORE PERMISSIVE than the production validator it
+  guards, and the disagreement was codified in two assertions pointing opposite
+  ways: `isBareXpfArtifact` returned "not a finding" for any literal containing
+  a separator (so `./xpfd` passed), while `validateGateBin` rejects every
+  non-absolute path and its test pinned `./xpfd` as an ERROR. A guard laxer than
+  its subject blesses the next variant: `exec.Command("./"+verifyGateBin, ...)`
+  in a helper that chdirs, then a later refactor drops the chdir, and the
+  root-run gate resolves against systemd's WorkingDirectory (/) and errors Gate 3
+  into a spurious revert — with the lint green throughout. flip.go's header
+  records a real past incident of this CWD-resolution class. Renamed to
+  `isNonAbsoluteXpfArtifact`, switched to `!filepath.IsAbs(lit)` +
+  `filepath.Base(lit)` for the artifact match, flipped the `./xpfd` case to
+  flagged, added parent-relative / bare-relative-subdir / relative-helper cases,
+  and renamed the tests to say what they now enforce
+  (`TestNoBareOrRelativeXpfArtifactExec`,
+  `TestNonAbsoluteXpfArtifactDetectorScoping`). Added
+  `TestLintAgreesWithProductionValidator`, which asserts the invariant directly
+  — for any xpf-artifact literal the lint flags it EXACTLY when validateGateBin
+  rejects it as non-absolute — so the two cannot drift apart again. It is
+  one-directional by design: validateGateBin also rejects missing/non-regular/
+  non-executable absolute paths, which a static lint cannot judge.
+  MINOR 2 — the `(deleted)` rationale was factually WRONG. Verified against the
+  toolchain on this box: `/usr/lib/go-1.26/src/os/executable_procfs.go:27` is
+  `return stringslite.TrimSuffix(path, " (deleted)"), err`, so Go TRIMS the
+  suffix and returns the original path with a nil error. `os.Executable` cannot
+  produce a `(deleted)`-suffixed string, which made
+  `TestResolveVerifyGateBinFallsBackWhenRunningBinaryDeleted` feed the resolver
+  an impossible input while its NAME promised a guarantee it did not test. The
+  real mechanism is ENOENT on `os.Stat`. Corrected the doc comment to describe
+  that, and re-pointed the test at the real reachable scenario (create
+  `versions/v1.2.3/xpfd`, unlink it, seed that path) — it still covers a branch
+  distinct from the os.Executable-errored test, so it was kept rather than
+  folded away. Renamed to
+  `TestResolveVerifyGateBinFallsBackWhenRunningBinaryPathIsGone`. Added
+  `TestOsExecutableTrimsDeletedSuffix` to PIN the toolchain claim the comment
+  now rests on; it actually unlinks a running binary (copies the test binary to
+  a temp path, re-execs the copy, child removes its own path and reports
+  os.Executable) rather than asserting against the undeleted test binary, which
+  would have been a tautology and would have repeated the very defect the
+  reviewer flagged. Also softened the "only candidate that is exactly the
+  running build, with no window for a concurrent flip" claim at the same site:
+  os.Executable yields a PATH, not an inode, so a #2176-shape overwrite leaves
+  it stat'ing to a NEWER file while the process runs the old one. The promote
+  lock serializes this against a binary cut, and the exec target stays explicit
+  either way — which is the property the function exists to guarantee.
+  NIT 3 — recorded the `--versions-dir` divergence at `gateVersionsDir`
+  (the flag is real: cmd/xpfd/upgrade.go:247, cmd/xpfd/seed_runtime.go:65;
+  KernelConfig carries no VersionsDir to thread, confirmed by grep). Bounded and
+  safe: on a relocated install the fallback simply does not exist, os.Executable
+  still resolves, and total failure fail-closes into revert.
+  NIT 4 — `[ -x "$candidate" ]` is TRUE for a searchable DIRECTORY while
+  validateGateBin rejects non-regular targets, so the two hops were not the
+  symmetric pair the PR body claimed. Now `[ -f ] && [ -x ]`, with a new python
+  case asserting a directory at the primary candidate falls through to the sbin
+  path and never to $PATH.
+  Also scoped the PR body's "Over-reach guards, GREEN under revert" bullet: the
+  shell exit-3 and infra-error cases are green under the GO revert but red under
+  the SHELL revert.
+  Validation: gofmt clean on all four touched Go files (the 4 remaining
+  `gofmt -l` hits under pkg/upgrade — cutover_refuse_test.go, lock/lock.go,
+  version.go, version_test.go — are PRE-EXISTING on origin/master and untouched
+  by this PR, verified by `git show origin/master:<f> | gofmt`). go vet clean,
+  `go build ./...` clean, full pkg/upgrade suite green, python selftest 10/10.
+  MINOR 1 red-probe run in a THROWAWAY DETACHED worktree (never in the PR
+  worktree): a relative-path exec added there keeps build+vet CLEAN and fails
+  the lint on an assertion.
+- **File(s)**: pkg/upgrade/{kernel_linux.go,
+    kernel_verify_explicit_path_6541_test.go,
+    exec_bare_artifact_lint_6541_test.go},
+    scripts/image/{xpf-kernel-promote,test_kernel_promote_explicit_path.py},
+    _Log.md

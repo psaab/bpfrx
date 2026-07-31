@@ -43,9 +43,12 @@ log() { echo "xpf-kernel-promote: $*" >&2; }
 #      this keeps a non-versioned install working.
 # Neither is $PATH-resolved. If neither exists we SKIP the gate (exit 0), the
 # same behaviour as before for a box with no xpfd installed.
+# `-f` as well as `-x`: `test -x` is TRUE for a searchable DIRECTORY, and the
+# inner hop's validateGateBin rejects a non-regular target, so both hops apply
+# the same admission test rather than only claiming to.
 XPFD=""
 for candidate in /var/lib/xpf/versions/current/xpfd /usr/local/sbin/xpfd; do
-    if [ -x "$candidate" ]; then
+    if [ -f "$candidate" ] && [ -x "$candidate" ]; then
         XPFD="$candidate"
         break
     fi
