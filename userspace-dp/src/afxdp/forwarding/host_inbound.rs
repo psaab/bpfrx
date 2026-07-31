@@ -83,6 +83,89 @@ pub(in crate::afxdp) fn zone_host_inbound_from_tokens(
     hi
 }
 
+/// Every recognized `system-services` token that names a CONCRETE service
+/// (mirror of the Go SSOT config.KnownHostInboundSystemServices minus the two
+/// meta tokens `all` and `any-service`). The `system-services all` expansion is
+/// derived from this list MINUS the xpf-only extension set
+/// (HOST_INBOUND_NON_JUNOS_SERVICES) — see `system_service_all_expansion`.
+/// Listing `gre` here (and excluding it via the non-Junos set) is what makes
+/// that set load-bearing on this surface (#3226), mirroring how listing `isis`
+/// in KNOWN_ROUTING_PROTOCOL_TOKENS makes HOST_INBOUND_L2_PROTOCOLS
+/// load-bearing for `protocols all` (#3311).
+const KNOWN_SYSTEM_SERVICE_TOKENS: &[&str] = &[
+    "ssh",
+    "telnet",
+    "ftp",
+    "http",
+    "webapi-clear-text",
+    "https",
+    "webapi-ssl",
+    "ping",
+    "dns",
+    "dhcp",
+    "bootp",
+    "dhcpv6",
+    "ntp",
+    "snmp",
+    "snmp-trap",
+    "ike",
+    "ipsec",
+    "tftp",
+    "netconf",
+    "ssh-netconf",
+    "netconf-ssh",
+    "finger",
+    "ident-reset",
+    "lsping",
+    "sip",
+    "r-login",
+    "rlogin",
+    "r-sh",
+    "rsh",
+    "r-exec",
+    "rexec",
+    "xnm-clear-text",
+    "xnm-ssl",
+    "traceroute",
+    // #3226: `gre` is an xpf EXTENSION (Junos has no raw-IP-protocol
+    // system-service), so it is EXCLUDED from the `all` expansion below via
+    // HOST_INBOUND_NON_JUNOS_SERVICES.
+    "gre",
+];
+
+/// xpf-only `system-services` tokens — the Rust mirror of the Go SSOT
+/// config.HostInboundNonJunosSystemServices (#3226). Junos scopes
+/// `system-services all` to the DEFINED system services, and its service list
+/// carries no raw IP protocol; xpf additionally accepts `gre` (IP protocol 47)
+/// because operator configs list it there. Folding an xpf-only token into the
+/// `all` expansion would make `all` open a protocol Junos's `all` never opens,
+/// so these are excluded from the expansion and must be listed explicitly.
+/// Keep in lockstep with the Go set (the #3486 parity test guards this).
+const HOST_INBOUND_NON_JUNOS_SERVICES: &[&str] = &["gre"];
+
+/// True if `token` is an xpf-only (non-Junos) system-service, and so excluded
+/// from the `system-services all` expansion. #3226.
+fn is_non_junos_system_service(token: &str) -> bool {
+    HOST_INBOUND_NON_JUNOS_SERVICES.contains(&token)
+}
+
+/// The system-service tokens that `system-services all` expands to (#3226),
+/// derived from KNOWN_SYSTEM_SERVICE_TOKENS MINUS the xpf-only extension set.
+/// In Junos `host-inbound-traffic system-services all` admits "traffic from the
+/// defined system services available on the Routing Engine" — NOT every IP
+/// protocol and NOT a blanket bypass. Expanding to a concrete admit set (rather
+/// than the pre-#3226 `all_services` short-circuit) keeps an `all` zone from
+/// accepting GRE/ESP/AH/OSPF/PIM/VRRP and arbitrary future protocol numbers on
+/// its local addresses, and re-arms the per-zone default deny for everything
+/// the named set does not cover. Aliases (http/webapi-clear-text, ike/ipsec,
+/// ...) resolve to the same ports; the admit sets dedup.
+fn system_service_all_expansion() -> impl Iterator<Item = &'static str> {
+    KNOWN_SYSTEM_SERVICE_TOKENS
+        .iter()
+        .copied()
+        .filter(|t| !is_non_junos_system_service(t))
+}
+
 /// Classify one Junos `system-services` token into the admission set.
 /// Unrecognised tokens are intentionally ignored (fail-closed: they do not
 /// broaden admit). Covers the common Junos service set; the repo configs use
@@ -96,7 +179,29 @@ pub(in crate::afxdp) fn zone_host_inbound_from_tokens(
 /// vice versa) turns that test RED.
 fn classify_system_service(token: &str, hi: &mut ZoneHostInbound) {
     match token {
-        "all" | "any-service" => hi.all_services = true,
+        // #3226: `system-services all` admits only the DEFINED system-service
+        // set (Junos: "traffic from the defined system services available on
+        // the Routing Engine") — it expands to every recognized service EXCEPT
+        // the xpf-only extensions (gre), via system_service_all_expansion
+        // (= KNOWN_SYSTEM_SERVICE_TOKENS minus HOST_INBOUND_NON_JUNOS_SERVICES),
+        // NOT a blanket accept. The expansion never yields "all", so this
+        // recursion terminates. Mirrors the Go SSOT `all` case in
+        // config.HostInboundServiceMatch, which derives the same exclusion from
+        // config.HostInboundAllExpansionServices().
+        "all" => {
+            for tok in system_service_all_expansion() {
+                classify_system_service(tok, hi);
+            }
+        }
+        // `any-service` REMAINS the packet-wide full admit (#3226): Junos
+        // defines it as "all system services on an entire port range including
+        // the system services that are not defined", i.e. the explicit escape
+        // hatch for traffic the named set does not cover. xpf reads it as a
+        // superset (every IP protocol, not just the TCP/UDP port range) — the
+        // fail-safe direction for a token whose purpose is to over-admit, and
+        // the one-token migration for a config that relied on the pre-#3226
+        // breadth of `all`. Commit-warned in compiler_validate_warn.go.
+        "any-service" => hi.all_services = true,
         "ssh" => {
             hi.tcp_ports.insert(22);
         }

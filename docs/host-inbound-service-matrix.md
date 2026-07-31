@@ -90,7 +90,8 @@ follow-up; until it lands, surface 3 stays a hand-mirror held by the set-level
 
 | Token (aliases) | nft match (`daemon_nft.go`) | Rust admit (`host_inbound.rs`) | Family | Notes |
 |---|---|---|---|---|
-| `all` / `any-service` | full admit | `all_services = true` | dual | Blanket accept for the zone — a **packet-wide** admit of EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers), a superset of the Junos meaning (`all` = union of the *named* system-services). Deliberate & documented (#3199); `ValidateConfig` emits a commit-time advisory naming the zone/interface (#3226). See [`system-services all` / `any-service` is a packet-wide admit](#system-services-all--any-service-is-a-packet-wide-admit-3226). |
+| `all` | union of every row in this table EXCEPT `gre` | same union (`system_service_all_expansion`) | per expanded token | **#3226:** expands to the named system-services — NOT a packet-wide admit and NOT a full-admit boolean. The zone keeps its catch-all drop, so raw IP protocols (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) and unlisted ports are DENIED unless listed explicitly. The expanded `ident-reset` keeps its RESET verdict. See [`system-services all` is the named-service union](#system-services-all-is-the-named-service-union-3226). |
+| `any-service` | full admit | `all_services = true` | dual | Blanket accept for the zone — a **packet-wide** admit of EVERY IP protocol/port. Junos defines `any-service` as "all system services on an entire port range including the system services that are not defined"; xpf reads it as the (wider) packet-wide superset. `config.HostInboundFullAdmitService` is the SSOT; `ValidateConfig` emits a commit-time advisory naming the zone/interface. See [`system-services all` is the named-service union](#system-services-all-is-the-named-service-union-3226). |
 | `ssh` | tcp 22 | tcp 22 | dual | |
 | `telnet` | tcp 23 | tcp 23 | dual | |
 | `ftp` | tcp 21 | tcp 21 | dual | Control port only; FTP data is an ALG/transit concern. |
@@ -143,52 +144,85 @@ follow-up; until it lands, surface 3 stays a hand-mirror held by the set-level
 | `isis` | (none) | (none) | **L2/none** | Recognized but no IP match on either surface (L2/OSI-CLNP). Kernel hands IS-IS PDUs to FRR's isisd via an LLC socket, outside the IP host-inbound filter. Excluded from `protocols all` (#3311). |
 | `router-discovery` | v4: `icmp type { 9, 10 }`; **v6: (none)** | v4 ICMP types 9, 10 | v4 per-zone; **v6 global** | **L02:** on IPv6, RS/RA (133/134) ride the always-accepted ND global set, so this token carries NOTHING on v6 — correct kernel parity, but a CLI/doc trap. |
 
-## `system-services all` / `any-service` is a packet-wide admit (#3226)
+## `system-services all` is the named-service union (#3226)
 
-`system-services all` and its `any-service` alias are the ONLY two
-`system-services` tokens that are NOT a per-tuple match. Both set one boolean
-(`all_services` in `host_inbound.rs`; `hostInboundAllowsAll` in `daemon_nft.go`)
-that short-circuits admission to accept EVERY IP protocol and port destined to
-the zone's local firewall addresses — GRE, ESP/AH, OSPF, PIM, VRRP, and any
-future protocol number — with **no** catch-all drop. `config.HostInboundFullAdmitService`
-(`pkg/config/host_inbound_tokens.go`) is the SSOT for which tokens are full-admit.
+`system-services any-service` is now the ONLY `system-services` token that is
+not a per-tuple match. It sets one boolean (`all_services` in `host_inbound.rs`;
+`hostInboundAllowsAll` in `daemon_nft.go`) that short-circuits admission to
+accept EVERY IP protocol and port destined to the zone's local firewall
+addresses — GRE, ESP/AH, OSPF, PIM, VRRP, and any future protocol number — with
+**no** catch-all drop. `config.HostInboundFullAdmitService`
+(`pkg/config/host_inbound_tokens.go`) is the SSOT for which tokens are
+full-admit; since #3226 it matches `any-service` alone.
 
-This is a **superset of the Junos meaning.** In Junos, `system-services all` is
-naturally "all system-service *names*" (the union of the named tokens in the
-matrix above), and `any-service` is "the entire TCP/UDP port range" — neither
-opens arbitrary non-TCP/UDP IP protocols. xpf aliases both to the broader
-packet-wide admit. The breadth is **deliberate and documented** (#3199 kept these
-two tokens as a full-admit while scoping the sibling `protocols all` to the
-routing-protocol set — see the protocols matrix note above) and is relied on by
-the canonical HA control zone (`system-services { all }` on em0/fab* — though
-there the lifeline exclusion, not the token, is the real protection; see
-#3277 / `pkg/dataplane/userspace/zones.go`).
+### What `all` means now
 
-### Commit-time advisory (#3226 — shipped)
+Junos defines the two tokens differently, and xpf follows that split:
 
-Because the breadth is easy to reach for and materially wider than Junos,
-`ValidateConfig` (`pkg/config/compiler_validate_warn.go`) emits a WARN-only
-commit-time advisory for each zone-level `host-inbound-traffic` stanza AND each
-per-interface override (#3362) whose `system-services` set contains a full-admit
-token. The advisory names the zone (and interface), states that the token
-accepts every IP protocol/port to the zone's local addresses, and suggests
-listing specific services if that is the intent. It is **never a hard reject** —
-`system-services all` is legal Junos and a reject would brick previously
-committed configs; the message only surfaces the breadth. This directly answers
-the issue's Direction: "If `any-service` must remain a non-Junos full-admit
-escape hatch, document it as such with an explicit commit warning."
+| Token | Junos definition (`system-services`, Security Zones Host Inbound Traffic) | xpf behaviour |
+|---|---|---|
+| `all` | "Traffic from the defined system services available on the Routing Engine." | Expands to the union of the **named** system-services in the matrix above (`config.HostInboundAllExpansionServices` / Rust `system_service_all_expansion`), then falls through to the per-match path — so the zone keeps its **catch-all drop**. |
+| `any-service` | "All system services on an entire port range including the system services that are not defined." | Packet-wide full admit (a superset of the Junos entire-port-range reading — the fail-safe direction for a token whose purpose is to over-admit). |
 
-### The admission-narrowing posture (A vs B) remains deferred
+Junos's documented system-service list contains **no raw IP protocol**:
+GRE/OSPF/PIM/VRRP are reached through `protocols`, or not at all. So a
+Junos-correct `all` never opens a bare protocol number. Before #3226 xpf aliased
+`all` to the packet-wide admit, which accepted every IP protocol to a zoned
+firewall address and emitted no deny at all — a fail-OPEN relative to Junos that
+could mask a missing explicit `protocols` entry.
 
-Whether to keep the documented broad alias (Option A, zero-surprise-on-upgrade)
-or scope `all` to the union of named services + a catch-all drop and split
-`any-service` off as an entire-port-range / escape-hatch (Option B, Junos-strict)
-is a **security/product posture decision**, not an engineer-fixable bug. It stays
-open on #3226 (`plan-deferred-operator`); the converged /research plan-of-action
-lives on the `research/3226-system-services` branch
-(`docs/research/3226-system-services/plan.md`). The commit-time advisory above is
-independent of that decision — it makes the current behavior visible without
-changing any forwarding.
+This mirrors exactly what #3199 did to the sibling `protocols all` (scoped to
+the routing-protocol set rather than a blanket accept), and reuses the same
+mechanism: an SSOT expansion list plus a load-bearing exclusion set.
+
+### The `gre` carve-out
+
+`gre` is an **xpf extension**, not a Junos system-service — xpf accepts it under
+`system-services` because operator configs list it there, mapping it to IP
+protocol 47. Folding it into the `all` expansion would make `all` open a raw IP
+protocol that Junos's `all` never opens, so it is excluded via
+`config.HostInboundNonJunosSystemServices` (Rust mirror:
+`HOST_INBOUND_NON_JUNOS_SERVICES`). The token stays fully usable — it just has
+to be listed **explicitly**. This is the service-side twin of
+`HostInboundL2Protocols` excluding `isis` from `protocols all` (#3311), and the
+#3486 parity test asserts the Go and Rust exclusion sets are equal.
+
+### `ident-reset` inside the expansion
+
+`all` expands to a set that includes `ident-reset`, whose Junos semantics are to
+**RESET** inbound ident (TCP/113), not to admit it (#3310). Both nft builders
+(`hostInboundMatchSet` in `pkg/daemon/daemon_nft.go` and
+`hostInboundMatchFragments` in `pkg/nftables/netlink_hostinbound.go`) therefore
+take the verdict from the **expanded** token via
+`config.HostInboundServiceTokenExpansion`, never from the authored one — keying
+it on the authored token would render `tcp dport 113 accept` and silently admit
+ident probes that the per-token form resets. The Rust classifier keeps the
+documented #3310 divergence (its `ident-reset` arm is a no-op, so the rare
+AF_XDP-reached ident packet is dropped rather than reset).
+
+### Upgrade behaviour and the commit-time advisory
+
+The narrowing is a **no-op on every shipped config**: each one places
+`system-services all` on the lifeline-only `control` zone
+(`docs/ha-cluster-userspace.conf`, `examples/deploy/ha-pair.conf`,
+`test/incus/xpf-cluster-fw0.conf`), and lifeline interfaces are excluded from
+the host-inbound deny address sets by `BuildZoneHostInboundViews` (#3277), so
+such a zone emits no rules at all and `all` vs the expansion is
+indistinguishable there. HA heartbeat / session-sync / config-sync / fabric ride
+strictly the control + fabric interfaces and never reach this filter.
+
+`ValidateConfig` (`pkg/config/compiler_validate_warn.go`) emits two WARN-only
+advisories, for each zone-level stanza AND each per-interface override (#3362):
+
+- **`any-service`** → the packet-wide-full-admit breadth advisory.
+- **`all`** → a scoping/upgrade advisory naming what is now denied and pointing
+  at `any-service` as the one-token way to restore the previous behaviour. It is
+  **gated on the zone (or overridden interface) owning at least one non-lifeline
+  interface**, because the narrowing cannot change enforcement anywhere else —
+  without the gate every cluster commit would warn forever about a guaranteed
+  no-op.
+
+Neither is ever a hard reject: both tokens are legal Junos.
 
 ## Host-bound routing multicast is admitted packet-wide (#4455)
 
@@ -916,7 +950,10 @@ helper never sees it, so a helper crash cannot lock management out).
   ND/PMTUD) are dropped — matching Rust's per-hit re-eval/teardown. ESP/AH (proto
   50/51) are always exempt; IKE 500/4500 is shielded when the ingress interface
   coarse-admits `ike`; ident-reset TCP/113 keeps its RST when the interface's
-  effective coarse verdict is the RST (ident-reset set AND not `all`/`any-service`).
+  effective coarse verdict is the RST (ident-reset set AND not `any-service`).
+  #3226: `all` no longer shadows ident-reset — it EXPANDS to a set containing
+  ident-reset, so the kernel chain really does emit the reject rule and the
+  shield must carve TCP/113 out (`HostInboundServiceTokenExpansion`).
   - **Per-interface scope of the IKE / ident shield (#5565).** The shield is
     scoped to the SPECIFIC netdevs whose EFFECTIVE per-interface host-inbound set
     (`InterfaceHostInboundEffective`, zone-level ∪ interface override) admits the

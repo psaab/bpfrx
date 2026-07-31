@@ -296,3 +296,164 @@ fn protocols_all_admits_ip_routing_not_l2() {
         "`protocols all` must not admit IS-IS (proto 124) — L2/OSI, handled by FRR",
     );
 }
+
+// #3226: `system-services all` is the union of the DEFINED system services
+// (Junos: "traffic from the defined system services available on the Routing
+// Engine"), NOT a packet-wide admit. Before #3226 the `all` arm set
+// `all_services = true`, which short-circuits `ZoneHostInbound::admits` to
+// `true` for EVERY protocol/port — so an `all` zone accepted GRE/ESP/AH/OSPF/
+// PIM/VRRP and any future protocol number on its local addresses. This asserts
+// the per-packet VERDICT on the AF_XDP classifier, the mirror of the Go
+// TestClassifyHostInboundSystemServicesAllScopedToNamedServices and the nft
+// TestHostInboundNftSystemServicesAllIsScopedNotBlanket.
+//
+// FAIL-ON-REVERT: fold `all` back into the `any-service` arm (or make
+// system_service_all_expansion yield nothing) and the DENIED assertions flip.
+#[test]
+fn system_services_all_is_scoped_not_packet_wide() {
+    const TCP: u8 = 6;
+    const UDP: u8 = 17;
+    const ZONE: u16 = 11;
+
+    let mut state = ForwardingState::default();
+    state
+        .zone_host_inbound
+        .insert(ZONE, zone_host_inbound_from_tokens(&["all".to_string()], &[]));
+
+    // ADMITTED: the named system-service union `all` stands for.
+    for (name, proto, port) in [
+        ("ssh", TCP, 22u16),
+        ("https", TCP, 443),
+        ("telnet", TCP, 23),
+        ("snmp", UDP, 161),
+        ("ntp", UDP, 123),
+        ("ike", UDP, 500),
+        ("netconf", TCP, 830),
+    ] {
+        assert!(
+            host_inbound_admits(&state, ZONE, proto, port, false, 0),
+            "`system-services all` must admit {name} ({proto}/{port}) — it expands to the named service union",
+        );
+    }
+
+    // DENIED: raw IP protocols Junos's `all` never opens. ESP(50)/AH(51) are
+    // deliberately omitted — they carry an unconditional host-terminated-IPsec
+    // accept upstream of this classifier, so they prove nothing here.
+    for (name, proto) in [
+        ("ospf", 89u8),
+        ("gre", 47),
+        ("vrrp", 112),
+        ("pim", 103),
+        ("nhrp", 54),
+        ("future-proto-253", 253),
+    ] {
+        assert!(
+            !host_inbound_admits(&state, ZONE, proto, 0, false, 0),
+            "`system-services all` must DENY raw IP protocol {name} ({proto}) — it is not a packet-wide admit (#3226)",
+        );
+    }
+
+    // DENIED: an unlisted TCP port — the per-zone default deny is re-armed.
+    assert!(
+        !host_inbound_admits(&state, ZONE, TCP, 9999, false, 0),
+        "`system-services all` must DENY an unlisted tcp/9999 (#3226)",
+    );
+
+    // The v6 family behaves identically for the dual-family services.
+    assert!(
+        host_inbound_admits(&state, ZONE, TCP, 22, true, 0),
+        "`system-services all` must admit ssh on IPv6 too",
+    );
+    assert!(
+        !host_inbound_admits(&state, ZONE, 89, 0, true, 0),
+        "`system-services all` must DENY ospf3/proto-89 on IPv6 too (#3226)",
+    );
+}
+
+// #3226 over-reach guard: `any-service` REMAINS the packet-wide escape hatch
+// (Junos: "all system services on an entire port range including the system
+// services that are not defined"). If the narrowing were mistakenly applied to
+// `any-service` as well, every assertion here flips.
+#[test]
+fn any_service_remains_full_admit() {
+    const ZONE: u16 = 12;
+
+    let mut state = ForwardingState::default();
+    state.zone_host_inbound.insert(
+        ZONE,
+        zone_host_inbound_from_tokens(&["any-service".to_string()], &[]),
+    );
+
+    for (name, proto, port) in [
+        ("ospf", 89u8, 0u16),
+        ("gre", 47, 0),
+        ("vrrp", 112, 0),
+        ("unlisted tcp/9999", 6, 9999),
+    ] {
+        assert!(
+            host_inbound_admits(&state, ZONE, proto, port, false, 0),
+            "`any-service` must remain a full admit for {name} — it is the documented escape hatch (#3226)",
+        );
+    }
+}
+
+// #3226: the `system-services all` expansion EXCLUDES the xpf-only extension
+// tokens (HOST_INBOUND_NON_JUNOS_SERVICES) — the load-bearing job of that set
+// on this surface, mirroring HOST_INBOUND_L2_PROTOCOLS for `protocols all`.
+// `gre` is a recognized xpf system-service (so the exclusion is meaningful) but
+// is NOT a Junos system service, so folding it into `all` would make `all` open
+// IP protocol 47 that Junos's `all` never opens.
+//
+// FAIL-ON-REVERT: remove "gre" from HOST_INBOUND_NON_JUNOS_SERVICES and it
+// reappears in the expansion, turning the exclusion assertion RED.
+#[test]
+fn system_services_all_excludes_non_junos_extensions() {
+    let expansion: Vec<&str> = system_service_all_expansion().collect();
+
+    for x in HOST_INBOUND_NON_JUNOS_SERVICES {
+        assert!(
+            !expansion.contains(x),
+            "xpf-only service {x:?} must be excluded from the `system-services all` expansion",
+        );
+    }
+    assert!(
+        KNOWN_SYSTEM_SERVICE_TOKENS.contains(&"gre"),
+        "gre must be a recognized system-service token (so the exclusion is meaningful)",
+    );
+    assert!(
+        !expansion.contains(&"gre"),
+        "gre (xpf extension) must not appear in the `system-services all` expansion",
+    );
+    // The two meta tokens must never appear — `all` would recurse forever.
+    for meta in ["all", "any-service"] {
+        assert!(
+            !expansion.contains(&meta),
+            "meta token {meta:?} must not appear in the `system-services all` expansion (recursion / semantics)",
+        );
+    }
+    // Sanity: real Junos system services still expand.
+    for s in ["ssh", "https", "snmp", "ping", "ntp", "ident-reset"] {
+        assert!(
+            expansion.contains(&s),
+            "Junos system service {s:?} must remain in the `system-services all` expansion",
+        );
+    }
+}
+
+// #3226: an EXPLICIT `system-services gre` still admits IP protocol 47. The
+// carve-out narrows the `all` meta-token; it does not remove the token. Without
+// this the exclusion above could be "fixed" by deleting the gre arm entirely.
+#[test]
+fn explicit_gre_service_still_admits_proto_47() {
+    const ZONE: u16 = 13;
+
+    let mut state = ForwardingState::default();
+    state
+        .zone_host_inbound
+        .insert(ZONE, zone_host_inbound_from_tokens(&["gre".to_string()], &[]));
+
+    assert!(
+        host_inbound_admits(&state, ZONE, 47, 0, false, 0),
+        "an explicit `system-services gre` must still admit IP protocol 47",
+    );
+}

@@ -1591,10 +1591,21 @@ func hostInboundMatchSet(v dpuserspace.ZoneHostInboundView, family string) []hos
 		seen[m] = true
 		out = append(out, hostInboundRule{match: m, action: action})
 	}
+	// #3226: expand each authored token to the concrete services it stands for
+	// (`all` → the named-service union; everything else → itself) and take the
+	// verdict from the CONCRETE token. The verdict must not be keyed on the
+	// AUTHORED token: `all` expands to a set that includes `ident-reset`, whose
+	// rule is `reject with tcp reset`, and hostInboundServiceAction("all") is a
+	// plain accept — so keying on the authored token would render
+	// `tcp dport 113 accept` and ADMIT ident probes that the per-token form
+	// resets. Expanding here makes `system-services all` render byte-identically
+	// to the operator having listed the expansion explicitly.
 	for _, s := range v.SystemServices {
-		action := hostInboundServiceAction(s)
-		for _, m := range hostInboundServiceMatches(s, family) {
-			add(m, action)
+		for _, sub := range config.HostInboundServiceTokenExpansion(s) {
+			action := hostInboundServiceAction(sub)
+			for _, m := range hostInboundServiceMatches(sub, family) {
+				add(m, action)
+			}
 		}
 	}
 	for _, p := range v.Protocols {

@@ -561,6 +561,17 @@ From zone: guest, To zone: lan
     accepting `SSH` would itself reintroduce a split-brain). Recognized tokens
     (`ssh`, `ping`, `all`, `any-service`, `ipsec`/`ike`, `protocols all`
     routing-scoped per #3199, …) are unaffected.
+  - **`system-services all` is the named-service union (#3226):** `all` follows
+    the Junos definition — "traffic from the defined system services available
+    on the Routing Engine" — and expands to the union of the named
+    system-service tokens, so the zone keeps its catch-all host-inbound drop.
+    It does NOT admit raw IP protocols (GRE/ESP/AH/OSPF/PIM/VRRP or future
+    protocol numbers) or unlisted TCP/UDP ports; list those explicitly under
+    `system-services` / `protocols`. The xpf-only `gre` token is excluded from
+    the expansion (Junos has no raw-IP-protocol system-service) and must be
+    listed explicitly. `any-service` remains the packet-wide escape hatch and is
+    the one-token way to restore the pre-#3226 behaviour. Both draw a WARN-only
+    commit advisory. See `docs/host-inbound-service-matrix.md`.
   - **IS-IS host-inbound (L2 no-op, #3311):** `host-inbound-traffic protocols
     isis` is now ACCEPTED at commit (vSRX parity) — before #3311 it was
     hard-rejected even though IS-IS routing is supported via FRR, a fail-closed

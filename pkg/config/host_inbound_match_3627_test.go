@@ -41,8 +41,9 @@ func TestHostInboundServiceMatchTuples(t *testing.T) {
 		{"gre", "ip", []L4Match{{Proto: 47}}},
 		// ident-reset carries the Reject marker (resets, does NOT admit).
 		{"ident-reset", "ip", []L4Match{{Proto: HostInboundProtoTCP, Ports: single(113), Reject: true}}},
-		// full-admit and unknown tokens are not per-tuple matches.
-		{"all", "ip", nil},
+		// the `any-service` full-admit and unknown tokens are not per-tuple
+		// matches. #3226: `all` IS one now — it expands to the named-service
+		// union, asserted separately below.
 		{"any-service", "ip", nil},
 		{"sssh", "ip", nil},
 	}
@@ -53,8 +54,51 @@ func TestHostInboundServiceMatchTuples(t *testing.T) {
 		}
 	}
 
-	if !HostInboundFullAdmitService("all") || !HostInboundFullAdmitService("any-service") {
-		t.Errorf("all/any-service must be full-admit services")
+	// #3226: `any-service` is the ONLY full-admit token. `all` expands to the
+	// named-service union (HostInboundAllExpansionServices) — it is a per-tuple
+	// match set, so treating it as a full admit would restore the packet-wide
+	// over-admit the issue closed.
+	if !HostInboundFullAdmitService("any-service") {
+		t.Errorf("any-service must be a full-admit service")
+	}
+	if HostInboundFullAdmitService("all") {
+		t.Errorf("all must NOT be a full-admit service (#3226 — it expands to the named system-service union)")
+	}
+	// `HostInboundServiceMatch("all", fam)` must equal the concatenation of the
+	// expansion's per-token matches, in expansion order — the SSOT contract the
+	// nft renderer, the netlink builder and the match-policies classifier all
+	// inherit. Derived independently from the per-token table, so this is a real
+	// cross-check rather than a restatement of the implementation.
+	for _, fam := range []string{"ip", "ip6"} {
+		var want []L4Match
+		for _, tok := range HostInboundAllExpansionServices() {
+			want = append(want, HostInboundServiceMatch(tok, fam)...)
+		}
+		if got := HostInboundServiceMatch("all", fam); !equalL4(got, want) {
+			t.Errorf("HostInboundServiceMatch(\"all\",%q) = %s, want the named-service union %s", fam, showL4(got), showL4(want))
+		}
+		// The expansion must carry at least one real service, or the assertion
+		// above would be a vacuous nil==nil.
+		if len(want) == 0 {
+			t.Fatalf("`all` expansion produced no matches for family %q — contract would be vacuous", fam)
+		}
+	}
+	// The expansion excludes the meta tokens and the xpf-only extensions.
+	for _, tok := range HostInboundAllExpansionServices() {
+		if tok == "all" || tok == "any-service" {
+			t.Errorf("`all` expansion must not contain the meta token %q (recursion / semantics)", tok)
+		}
+		if HostInboundNonJunosSystemServices[tok] {
+			t.Errorf("`all` expansion must not contain the xpf-only token %q (#3226)", tok)
+		}
+	}
+	// gre is a recognized token that is nonetheless excluded — the exclusion set
+	// is load-bearing, not decorative.
+	if !KnownHostInboundSystemServices["gre"] {
+		t.Errorf("gre must stay a recognized system-service (so the `all` exclusion is meaningful)")
+	}
+	if got := HostInboundServiceMatch("gre", "ip"); len(got) == 0 {
+		t.Errorf("an EXPLICIT `system-services gre` must still match IP protocol 47")
 	}
 	if HostInboundFullAdmitService("ssh") {
 		t.Errorf("ssh must NOT be a full-admit service")

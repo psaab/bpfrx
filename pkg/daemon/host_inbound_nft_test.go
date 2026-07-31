@@ -293,7 +293,7 @@ func TestHostInboundFilterLifelineNeverDenied(t *testing.T) {
 // TestHostInboundFilterAllOpensZoneNoDeny verifies `system-services { all }`
 // fully opens a zone (accept all to its addresses, no deny). Uses a config
 // whose `all` zone is NOT a lifeline so it actually emits a rule.
-func TestHostInboundFilterAllOpensZoneNoDeny(t *testing.T) {
+func TestHostInboundFilterAnyServiceOpensZoneNoDeny(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
 		"reth0": {Name: "reth0", Units: map[int]*config.InterfaceUnit{
@@ -304,16 +304,16 @@ func TestHostInboundFilterAllOpensZoneNoDeny(t *testing.T) {
 		"trust": {
 			Name:               "trust",
 			Interfaces:         []string{"reth0.0"},
-			HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"all"}},
+			HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"any-service"}},
 		},
 	}
 	views := buildAndCheckViews(t, cfg)
 	payload := buildHostInboundFilterPayload(views, nil, nil, nil, nil)
 	if !strings.Contains(payload, "ip daddr 10.1.1.1 accept") {
-		t.Errorf("`all` zone must accept everything to its addr:\n%s", payload)
+		t.Errorf("`any-service` zone must accept everything to its addr:\n%s", payload)
 	}
 	if strings.Contains(payload, "ip daddr 10.1.1.1 drop") {
-		t.Errorf("`all` zone must NOT emit a deny:\n%s", payload)
+		t.Errorf("`any-service` zone must NOT emit a deny:\n%s", payload)
 	}
 }
 
@@ -729,7 +729,7 @@ func TestHostInboundFilterIdentResetEmitsReset(t *testing.T) {
 // reject and NO catch-all drop — matching the Rust classifier, where
 // `all_services` short-circuits `admits` to true. This pins the precedence the
 // plan §5b/§6 calls out: `all` wins over ident-reset.
-func TestHostInboundFilterAllSuppressesIdentReset(t *testing.T) {
+func TestHostInboundFilterAnyServiceSuppressesIdentReset(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
 		"reth0": {Name: "reth0", Units: map[int]*config.InterfaceUnit{
@@ -740,20 +740,20 @@ func TestHostInboundFilterAllSuppressesIdentReset(t *testing.T) {
 		"trust": {
 			Name:               "trust",
 			Interfaces:         []string{"reth0.0"},
-			HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"all", "ident-reset"}},
+			HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"any-service", "ident-reset"}},
 		},
 	}
 	views := buildAndCheckViews(t, cfg)
 	payload := buildHostInboundFilterPayload(views, nil, nil, nil, nil)
 
 	if !strings.Contains(payload, "ip daddr 10.1.1.1 accept") {
-		t.Errorf("`all` zone must accept everything to its addr:\n%s", payload)
+		t.Errorf("`any-service` zone must accept everything to its addr:\n%s", payload)
 	}
 	if strings.Contains(payload, "reject with tcp reset") {
-		t.Errorf("`all` precedence must suppress the ident-reset reject rule:\n%s", payload)
+		t.Errorf("`any-service` precedence must suppress the ident-reset reject rule:\n%s", payload)
 	}
 	if strings.Contains(payload, "tcp dport 113") {
-		t.Errorf("`all` zone must not emit any per-token 113 rule:\n%s", payload)
+		t.Errorf("`any-service` zone must not emit any per-token 113 rule:\n%s", payload)
 	}
 }
 

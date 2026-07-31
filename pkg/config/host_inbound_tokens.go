@@ -189,6 +189,86 @@ func HostInboundAllExpansionProtocols() []string {
 	return out
 }
 
+// HostInboundNonJunosSystemServices is the set of recognized `system-services`
+// tokens that are an xpf EXTENSION rather than a Junos system service, and are
+// therefore excluded from the `system-services all` expansion (#3226).
+//
+// Junos scopes `all` to "traffic from the DEFINED system services available on
+// the Routing Engine" (Juniper, `system-services (Security Zones Host Inbound
+// Traffic)`), and its documented service list contains no raw IP protocol —
+// GRE/ESP/OSPF/PIM/VRRP are reached through `protocols` (or not at all), never
+// through `system-services`. xpf additionally accepts `system-services gre`
+// because some operator configs list it there (see the repo ha-cluster wan
+// zone), mapping it to IP protocol 47. Folding that xpf-only token into the
+// `all` expansion would make `all` silently open a raw IP protocol that Junos's
+// `all` never opens — precisely the over-admit #3226 set out to close. The
+// token stays fully usable; it just has to be listed EXPLICITLY.
+//
+// This mirrors the HostInboundL2Protocols exclusion on the `protocols all`
+// side (#3311): the set is load-bearing, not decorative — adding an xpf-only
+// service token here (and to KnownHostInboundSystemServices) is the ONLY edit
+// needed to keep it out of the `all` expansion on BOTH enforcement surfaces.
+// The Rust classifier mirrors it via HOST_INBOUND_NON_JUNOS_SERVICES and the
+// #3486 parity test asserts the two sets are equal.
+var HostInboundNonJunosSystemServices = map[string]bool{
+	"gre": true,
+}
+
+// HostInboundAllExpansionServices returns the `system-services` tokens that
+// `host-inbound-traffic system-services all` expands to (#3226): every
+// recognized service (KnownHostInboundSystemServices) EXCEPT the two meta
+// tokens (`all` itself and the `any-service` full-admit escape hatch) and
+// EXCEPT any xpf-only extension token (HostInboundNonJunosSystemServices).
+//
+// Before #3226 `all` was a packet-wide admit on both enforcement surfaces: the
+// nft mirror emitted a bare `<fam> daddr <addrs> accept` with NO catch-all
+// drop and the Rust classifier short-circuited `admits()` to true, so a zone
+// with `system-services all` accepted EVERY IP protocol and port to its local
+// addresses — GRE/ESP/AH/OSPF/PIM/VRRP and any future protocol number
+// included. Junos scopes `all` to the defined system services, so the blanket
+// admit was a superset of the Junos meaning that could mask a missing explicit
+// `protocols` entry. Expanding to a concrete service set (exactly how #3199
+// scoped the sibling `protocols all`) restores the Junos semantics and, because
+// the zone now falls through to the per-match path, re-arms the catch-all
+// host-inbound drop for anything the expansion does not cover.
+//
+// Aliases (http/webapi-clear-text, ike/ipsec, rlogin/r-login, ...) are all
+// included; they resolve to the same L4 tuples and both enforcement surfaces
+// dedup. `ident-reset` is included and keeps its Junos RESET semantics (#3310)
+// rather than becoming an admit. The result is sorted so the expansion — and
+// therefore the rendered nft rule order — is deterministic.
+func HostInboundAllExpansionServices() []string {
+	out := make([]string, 0, len(KnownHostInboundSystemServices))
+	for tok := range KnownHostInboundSystemServices {
+		if HostInboundFullAdmitService(tok) || tok == "all" ||
+			HostInboundNonJunosSystemServices[tok] {
+			continue
+		}
+		out = append(out, tok)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// HostInboundServiceTokenExpansion returns the CONCRETE `system-services`
+// tokens a single authored token stands for: the `all` meta-token expands to
+// HostInboundAllExpansionServices (#3226); every other token — including the
+// `any-service` full-admit, which is not a per-service union at all — stands
+// only for itself.
+//
+// Consumers that ask "does this authored service set contain token X?" MUST go
+// through this helper rather than comparing strings, or they will miss the
+// tokens `all` now covers. The #4146 junos-host shield is the load-bearing
+// caller: it has to know that `system-services all` still coarse-admits
+// IKE/NAT-T and still RSTs ident, which before #3226 fell out of the
+// full-admit short-circuit and now falls out of the expansion.
+func HostInboundServiceTokenExpansion(token string) []string {
+	if strings.ToLower(strings.TrimSpace(token)) == "all" {
+		return HostInboundAllExpansionServices()
+	}
+	return []string{token}
+}
+
 // Address-family scoping for host-inbound tokens (#3225). Several Junos
 // host-inbound tokens are family-SPECIFIC in intent: a `system-services dhcp`
 // is DHCPv4 (udp 67/68 over IPv4), `dhcpv6` is DHCPv6 (udp 546/547 over IPv6);
@@ -343,6 +423,21 @@ func HostInboundServiceMatch(token, family string) []L4Match {
 		return nil
 	}
 	switch token {
+	case "all":
+		// #3226: `system-services all` is the union of the DEFINED system
+		// services (Junos: "traffic from the defined system services available
+		// on the Routing Engine"), NOT a packet-wide admit. It expands here —
+		// exactly as `protocols all` does above — so every consumer of this
+		// SSOT (the nft kernel mirror, the netlink builder, the match-policies
+		// classifier) inherits the scoped set with no per-consumer edit, and
+		// the zone falls through to the per-match path that re-arms the
+		// catch-all drop. The expansion never yields `all` (it is filtered out
+		// by HostInboundAllExpansionServices), so this recursion terminates.
+		var out []L4Match
+		for _, s := range HostInboundAllExpansionServices() {
+			out = append(out, HostInboundServiceMatch(s, family)...)
+		}
+		return out
 	case "ssh":
 		return []L4Match{hiTCP(22)}
 	case "telnet":
@@ -483,23 +578,37 @@ func HostInboundProtocolMatch(token, family string) []L4Match {
 }
 
 // HostInboundFullAdmitService reports whether a `system-services` token opens
-// the zone to EVERY host-bound service (Junos `all` / `any-service`). Such a
-// token is not a per-tuple L4Match (HostInboundServiceMatch returns nil for it);
-// the nft builder emits a bare `accept` and the classifier reports admission
-// regardless of the tuple. `protocols all` is deliberately NOT a full admit
-// (#3199) — it expands to the routing-protocol set via HostInboundProtocolMatch.
+// the zone to EVERY host-bound packet regardless of service — since #3226 that
+// is `any-service` ALONE. Such a token is not a per-tuple L4Match
+// (HostInboundServiceMatch returns nil for it); the nft builder emits a bare
+// `accept` with NO catch-all drop and the classifier reports admission
+// regardless of the tuple.
+//
+// `all` is NO LONGER a full admit (#3226). Junos scopes it to "traffic from the
+// defined system services available on the Routing Engine", so it expands to
+// the named-service union via HostInboundAllExpansionServices — the same shape
+// #3199 gave the sibling `protocols all`. Before #3226 both tokens
+// short-circuited here, so a `system-services all` zone accepted every IP
+// protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP and arbitrary future protocol
+// numbers) to its local addresses and emitted no deny at all.
+//
+// `any-service` deliberately stays a full admit: Junos defines it as "all
+// system services on an entire port range INCLUDING the system services that
+// are not defined", i.e. the explicit escape hatch for traffic the named set
+// does not cover. xpf keeps it as the documented (and commit-warned, see
+// compiler_validate_warn.go) packet-wide admit, which also gives operators who
+// relied on the pre-#3226 `all` breadth a one-token migration. Treating it as a
+// SUPERSET of the Junos entire-port-range meaning is the fail-safe direction: it
+// can only over-admit on a token whose whole purpose is to over-admit, never
+// silently deny.
 //
 // The token match is case-insensitive to stay in lockstep with enforcement: the
 // dataplane snapshot (unionHostInboundTokens / lowerTokens in
 // pkg/dataplane/userspace) and the Rust classifier
 // (classify_system_service, host_inbound.rs) both lower-case every token before
-// admitting. A predicate that only matched lower-case `all` would let a
-// lenient-loaded upper-case `ALL` slip past this SSOT while enforcement still
-// full-admits — the #5557 coarse-shield / commit-warning drift.
+// admitting. A predicate that only matched lower-case `any-service` would let a
+// lenient-loaded upper-case `ANY-SERVICE` slip past this SSOT while enforcement
+// still full-admits — the #5557 coarse-shield / commit-warning drift.
 func HostInboundFullAdmitService(token string) bool {
-	switch strings.ToLower(strings.TrimSpace(token)) {
-	case "all", "any-service":
-		return true
-	}
-	return false
+	return strings.ToLower(strings.TrimSpace(token)) == "any-service"
 }

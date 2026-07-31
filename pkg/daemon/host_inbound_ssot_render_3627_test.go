@@ -23,7 +23,17 @@ import (
 // with the recognized-token SSOT and the Rust classifier.
 func TestHostInboundNftRenderGoldenByteIdentical(t *testing.T) {
 	svc := map[string][2][]string{
-		"all":               {nil, nil},
+		// #3226: `all` renders the union of the named system-services (the
+		// xpf-only `gre` extension excluded), in HostInboundAllExpansionServices
+		// order. Before #3226 it rendered NOTHING here because it took the
+		// hostInboundAllowsAll blanket-accept branch instead. `tcp dport 113`
+		// appears via the expanded ident-reset and carries the `reject with tcp
+		// reset` VERDICT (verdicts are asserted separately — this golden pins
+		// the match FRAGMENTS).
+		"all": {
+			{"udp dport { 67, 68 }", "udp dport { 67, 68 }", "udp dport 53", "tcp dport 53", "tcp dport 79", "tcp dport 21", "tcp dport 80", "tcp dport 443", "tcp dport 113", "udp dport { 500, 4500 }", "udp dport { 500, 4500 }", "udp dport 3503", "tcp dport 830", "tcp dport { 22, 830 }", "udp dport 123", "icmp type echo-request", "tcp dport 512", "tcp dport 513", "tcp dport 514", "tcp dport 512", "tcp dport 513", "tcp dport 514", "udp dport 5060", "tcp dport 5060", "udp dport 161", "udp dport 162", "tcp dport 22", "tcp dport { 22, 830 }", "tcp dport 23", "udp dport 69", "udp dport 33434-33523", "tcp dport 80", "tcp dport 443", "tcp dport 3221", "tcp dport 3220"},
+			{"udp dport { 546, 547 }", "udp dport 53", "tcp dport 53", "tcp dport 79", "tcp dport 21", "tcp dport 80", "tcp dport 443", "tcp dport 113", "udp dport { 500, 4500 }", "udp dport { 500, 4500 }", "udp dport 3503", "tcp dport 830", "tcp dport { 22, 830 }", "udp dport 123", "icmpv6 type echo-request", "tcp dport 512", "tcp dport 513", "tcp dport 514", "tcp dport 512", "tcp dport 513", "tcp dport 514", "udp dport 5060", "tcp dport 5060", "udp dport 161", "udp dport 162", "tcp dport 22", "tcp dport { 22, 830 }", "tcp dport 23", "udp dport 69", "udp dport 33434-33523", "tcp dport 80", "tcp dport 443", "tcp dport 3221", "tcp dport 3220"},
+		},
 		"any-service":       {nil, nil},
 		"bootp":             {{"udp dport { 67, 68 }"}, nil},
 		"dhcp":              {{"udp dport { 67, 68 }"}, nil},
@@ -134,19 +144,43 @@ func TestHostInboundNftRenderGoldenByteIdentical(t *testing.T) {
 // would make the classifier report "not admitted" while the nft chain still
 // admits (or vice versa).
 func TestHostInboundIdentResetRejectMarkerMatchesNftVerdict(t *testing.T) {
+	// #3226: the builder assigns the verdict per EXPANDED token
+	// (hostInboundMatchSet walks config.HostInboundServiceTokenExpansion), so
+	// the marker/verdict agreement is a property of the CONCRETE tokens. Walking
+	// the expansion covers every authored token including `all`, whose expansion
+	// contains ident-reset.
 	for tok := range config.KnownHostInboundSystemServices {
-		reject := false
-		for _, fam := range []string{"ip", "ip6"} {
-			for _, m := range config.HostInboundServiceMatch(tok, fam) {
-				if m.Reject {
-					reject = true
+		for _, sub := range config.HostInboundServiceTokenExpansion(tok) {
+			reject := false
+			for _, fam := range []string{"ip", "ip6"} {
+				for _, m := range config.HostInboundServiceMatch(sub, fam) {
+					if m.Reject {
+						reject = true
+					}
 				}
 			}
+			wantReject := hostInboundServiceAction(sub) == hostInboundReject
+			if reject != wantReject {
+				t.Errorf("service %q (via authored token %q): SSOT Reject marker = %v but nft verdict reject = %v — the marker and the nft verdict must agree", sub, tok, reject, wantReject)
+			}
 		}
-		wantReject := hostInboundServiceAction(tok) == hostInboundReject
-		if reject != wantReject {
-			t.Errorf("service %q: SSOT Reject marker = %v but nft verdict reject = %v — the marker and the nft verdict must agree", tok, reject, wantReject)
+	}
+
+	// #3226 fail-open guard: `all` MUST expand to a set containing a Reject
+	// tuple, and the builder must not flatten it to an accept. If
+	// hostInboundMatchSet went back to keying the verdict on the AUTHORED token,
+	// `all`'s tcp/113 fragment would render `accept` and ADMIT ident probes the
+	// per-token form resets.
+	sawReject := false
+	for _, sub := range config.HostInboundServiceTokenExpansion("all") {
+		for _, m := range config.HostInboundServiceMatch(sub, "ip") {
+			if m.Reject {
+				sawReject = true
+			}
 		}
+	}
+	if !sawReject {
+		t.Errorf("`system-services all` expansion must contain the ident-reset Reject tuple (#3226)")
 	}
 }
 

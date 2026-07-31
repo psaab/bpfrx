@@ -371,11 +371,22 @@ pub(in crate::afxdp) struct ForwardingState {
 /// matching no listed service/protocol is denied.
 #[derive(Clone, Debug, Default)]
 pub(in crate::afxdp) struct ZoneHostInbound {
-    /// `system-services { all }` / `any-service` — admit every host-bound
-    /// packet regardless of service. Operators use `all` as the catch-all
-    /// "let everything in"; treating it as a full admit (slightly broader than
-    /// Junos, which scopes `all` to service traffic) keeps a `host-inbound { all }`
-    /// control/heartbeat zone fully open and is the safe direction.
+    /// `system-services { any-service }` — admit every host-bound packet
+    /// regardless of service. Junos defines `any-service` as "all system
+    /// services on an entire port range including the system services that are
+    /// not defined", the explicit escape hatch for traffic the named set does
+    /// not cover; xpf reads it as a superset (every IP protocol, not just the
+    /// TCP/UDP port range), which is the fail-safe direction for a token whose
+    /// purpose is to over-admit.
+    ///
+    /// #3226: `system-services { all }` NO LONGER sets this. Junos scopes `all`
+    /// to "traffic from the defined system services available on the Routing
+    /// Engine", so it now EXPANDS at classify time to the named-service
+    /// signatures (`system_service_all_expansion`, host_inbound.rs) exactly as
+    /// `protocols { all }` expands to the routing-protocol set (#3199).
+    /// Previously `all` short-circuited here, so an `all` zone admitted every
+    /// IP protocol — GRE/ESP/AH/OSPF/PIM/VRRP and arbitrary future protocol
+    /// numbers — to its local addresses with no default deny.
     pub(in crate::afxdp) all_services: bool,
     /// Admitted TCP destination ports (ssh=22, https=443, bgp=179, ...).
     pub(in crate::afxdp) tcp_ports: FastSet<u16>,
@@ -429,11 +440,14 @@ impl ZoneHostInbound {
         is_v6: bool,
         icmp_type: u8,
     ) -> bool {
-        // Only `system-services { all }` / `any-service` is a full admit.
-        // `protocols { all }` is NOT a blanket bypass (#3199): it expands to the
-        // routing-protocol signatures at classify time and is matched below via
-        // tcp/udp/ip_protocols, so it can never admit a system service (SSH,
-        // HTTPS, SNMP, ...) that was not separately permitted.
+        // Only `system-services { any-service }` is a full admit. NEITHER
+        // `system-services { all }` (#3226) NOR `protocols { all }` (#3199) is
+        // a blanket bypass: each expands to its concrete signatures at classify
+        // time and is matched below via tcp/udp/icmp/ip_protocols, so a
+        // `system-services all` zone can never admit a raw IP protocol
+        // (GRE/ESP/OSPF/PIM/VRRP/...) that was not separately permitted, and a
+        // `protocols all` zone can never admit a system service (SSH, HTTPS,
+        // SNMP, ...) that was not separately permitted.
         if self.all_services {
             return true;
         }

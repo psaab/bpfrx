@@ -1311,15 +1311,36 @@ never lock an operator out of a remote box it manages.
   inbound ident (auth/TCP-113) probes. Its nft verdict
   (`hostInboundServiceAction`) is `reject with tcp reset` (the first `reject`
   rule in `xpf_hostinbound`), emitted before the catch-all drop, so the kernel
-  synthesizes an RFC-correct RST and 113 is NEVER opened to the host. `all` /
+  synthesizes an RFC-correct RST and 113 is NEVER opened to the host.
   `any-service` precedence wins (a fully-open zone admits 113 and emits no
-  ident-reset reject). The Rust AF_XDP secondary path does NOT reset — it simply
-  drops 113 (the classifier ident-reset arm contributes nothing to the admit
-  set), a documented divergence on the near-nonexistent DNAT/static-NAT-to-113
-  path. Tests: `host_inbound_nft_test.go` (accept-listed / deny-rest
-  fail-on-revert, no-stanza-no-deny, lifeline-never-denied, `all`-opens-zone,
-  ident-reset emits-reset / `all`-suppresses-reset / nft-parse-check),
+  ident-reset reject). **#3226:** `all` does NOT shadow it — `all` expands to a
+  named-service set that CONTAINS ident-reset, so the chain emits the reject
+  rule. The verdict is taken from the EXPANDED token
+  (`config.HostInboundServiceTokenExpansion` in `hostInboundMatchSet`); keying it
+  on the authored token would render `tcp dport 113 accept` and admit the very
+  probes the per-token form resets. The Rust AF_XDP secondary path does NOT
+  reset — it simply drops 113 (the classifier ident-reset arm contributes nothing
+  to the admit set), a documented divergence on the near-nonexistent
+  DNAT/static-NAT-to-113 path. Tests: `host_inbound_nft_test.go` (accept-listed /
+  deny-rest fail-on-revert, no-stanza-no-deny, lifeline-never-denied,
+  `any-service`-opens-zone, ident-reset emits-reset /
+  `any-service`-suppresses-reset / nft-parse-check),
+  `host_inbound_all_scoping_3226_test.go` (`all` scoped-not-blanket, `all`
+  renders the ident-reset RESET verdict, `any-service` still blanket),
   `host_inbound_parity_test.go` (ident-reset reject-verdict parity).
+
+  **`system-services all` scoping (#3226):** `all` is no longer a full admit. It
+  expands to the union of the named system-services (excluding the xpf-only
+  `gre` extension) via `config.HostInboundAllExpansionServices`, exactly as
+  #3199 scoped `protocols all` to the routing set, so an `all` zone now renders
+  per-service accepts PLUS the catch-all drop instead of a bare
+  `<fam> daddr <addrs> accept` with no deny. `hostInboundAllowsAll` therefore
+  matches `any-service` alone. Junos scopes `all` to "traffic from the defined
+  system services available on the Routing Engine" and its service list carries
+  no raw IP protocol, so the pre-#3226 blanket admit of GRE/ESP/OSPF/PIM/VRRP was
+  a fail-OPEN. No-op on every shipped config (each puts `all` on the
+  lifeline-only `control` zone, which contributes no host-inbound addresses).
+  Full write-up: `docs/host-inbound-service-matrix.md`.
   **Counted drops + scrape (#3361):** each per-zone/family catch-all drop is
   `<fam> daddr <addrs> counter name "<n>" drop`, where `<n>` =
   `nftables.HostInboundDenyCounterName(zone, family)` (encoding

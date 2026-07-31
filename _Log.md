@@ -62336,3 +62336,44 @@ break — `go vet` confirmed passing under every revert.
   is address-matched and a separate surface. Codex re-review of the folded head
   918ea0b95 returned MERGE-READY with no findings.
 - **File(s)**: docs/fabric-cross-chassis-fwd.md, _Log.md
+- **Action**: #3226 — scope `host-inbound-traffic system-services all` to the
+  named system-service union (Junos parity); keep `any-service` as the
+  packet-wide escape hatch. Junos defines `all` as "traffic from the defined
+  system services available on the Routing Engine" and its documented
+  system-service list carries NO raw IP protocol, so the pre-#3226 blanket
+  admit (nft `hostInboundAllowsAll` -> bare `<fam> daddr <addrs> accept` with
+  NO catch-all drop; Rust `all_services` short-circuiting `admits()`) accepted
+  GRE/ESP/AH/OSPF/PIM/VRRP and arbitrary future protocol numbers to any zoned
+  firewall address — a fail-OPEN vs the spec that could mask a missing explicit
+  `protocols` entry. `all` now expands via the SSOT exactly as #3199 scoped
+  `protocols all`, so the zone falls through to the per-match path and the
+  catch-all deny is re-armed. The xpf-only `gre` token is excluded from the
+  expansion (mirroring how HostInboundL2Protocols excludes `isis` from
+  `protocols all`, #3311) and must be listed explicitly. `any-service` keeps
+  the full admit — Junos's own "including the system services that are not
+  defined" escape hatch, and a one-token migration for anyone who relied on the
+  old breadth. Two verdict bugs found and fixed while wiring the expansion:
+  BOTH nft builders keyed the rule verdict on the AUTHORED token, so `all`'s
+  expanded ident-reset tuple would have rendered `tcp dport 113 accept` and
+  ADMITTED ident probes the per-token form resets — the verdict now comes from
+  the expanded token (`HostInboundServiceTokenExpansion`), which is also what
+  keeps the junos-host shield's IKE exemption (fail-CLOSED risk: dropping the
+  IKE it exists to exempt) and its ident carve-out correct for `all`.
+  No-op on every shipped config: each puts `system-services all` on the
+  lifeline-only `control` zone, which contributes no host-inbound addresses
+  (#3277) — independently confirmed by the #4406 compile golden, whose only
+  diff is 12 removals of the now-inapplicable full-admit advisory with ZERO
+  structural change. The commit advisory split accordingly: `any-service` keeps
+  the breadth warning, `all` gets a scoping/upgrade notice gated on the zone
+  owning a non-lifeline interface (ungated it would fire on every cluster
+  commit forever about a guaranteed no-op).
+  Validation: full Go suite green (only the pre-existing, master-identical
+  `TestHeatmapNotStale` fails); full Rust suite 4221 passed; gofmt/clippy clean;
+  mutation-probed on a throwaway detached worktree (Go + Rust arms separately).
+- **File(s)**: pkg/config/{host_inbound_tokens.go,compiler_validate_warn.go,
+    junos_host_deny.go}, pkg/daemon/daemon_nft.go,
+    pkg/nftables/netlink_hostinbound.go,
+    userspace-dp/src/afxdp/forwarding/host_inbound.rs,
+    userspace-dp/src/afxdp/types/forwarding.rs,
+    docs/host-inbound-service-matrix.md, docs/junos-cli-reference.md,
+    pkg/daemon/README.md, plus tests + retargeted admit-all fixtures, _Log.md
