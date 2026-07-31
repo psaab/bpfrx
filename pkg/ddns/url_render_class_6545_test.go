@@ -2,16 +2,20 @@ package ddns
 
 import (
 	"context"
+	"crypto/x509"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -38,8 +42,21 @@ import (
 //   - STRUCTURALLY — TestDDNSURLErrorRendersGoThroughScrubber walks the AST of
 //     every production file in the package and fails any site that takes an
 //     error from http.NewRequest / url.Parse / client.Do and renders it without
-//     the scrubber. That is what catches the SIXTH call site nobody has written
-//     yet, which is the only way this stops recurring.
+//     the scrubber, and TestClientDoHasExactlyOneCallSite denies the move that
+//     would put a round trip somewhere the walk cannot see.
+//
+// WHAT THE STRUCTURAL HALF IS AND IS NOT (round 7). It is a TRIPWIRE on the
+// shapes this leak has actually taken six times running. It is NOT a proof. A
+// reviewer walked round 6's version with an aliased import, a `do := client.Do`
+// method value, a non-adjacent guard, and an errors.As extraction; those four
+// are closed now (importAliases, the .Do site count, reach-based sites,
+// extraction taint) but the underlying limit stands — an AST walk cannot follow
+// a value through a helper's return, and nothing here claims otherwise. The
+// count gate is what makes that limit bite: you cannot introduce the helper
+// without failing it.
+//
+// The BEHAVIOURAL half is the load-bearing one, and it is the half to extend
+// first when a new leak shape turns up.
 //
 // The two MAJORs of round 6, both closed here:
 //
@@ -68,6 +85,27 @@ const poisonedServer = "https://prov.example/#%" + buildURLSentinel
 // position scrubURLError used to preserve.
 const pathSentinel = "PATH-CREDENTIAL-MUST-NOT-LOG"
 
+// hostSentinel sits where round 7 found the credential could still reach: INSIDE
+// url.URL.Host. It is deliberately spelled with only characters that are legal
+// in a hostname label and in an RFC 6874 zone id, so a URL carrying it PARSES
+// and reaches the render path — a sentinel that made the URL invalid would test
+// the withhold-unparseable branch instead and prove nothing about the host.
+const hostSentinel = "ZONE-PASSWORD-MUST-NOT-LOG"
+
+// The fixed notes scrubURLError appends when it withholds part of the target.
+// Written out as literals, not built by calling the code under test, so a change
+// to the rendering has to be made HERE too rather than tracking itself.
+const (
+	zoneNote   = " (link-local zone id withheld)"
+	hostNote   = " (host withheld: not a plain host name)"
+	schemeNote = " (url withheld: scheme is not http or https)"
+)
+
+// wantSyntheticRender is how the classifier renders errSyntheticTransport: an
+// error whose CLASS it cannot recognise is withheld down to its Go type. Again a
+// literal, so this pins the contract instead of restating the implementation.
+const wantSyntheticRender = "transport error withheld (*errors.errorString)"
+
 // TestScrubURLErrorRendersOnlySchemeAndHost pins the scrub by EXACT EQUALITY.
 //
 // This is deliberately not a "does the output contain my sentinel" test. Those
@@ -80,28 +118,55 @@ func TestScrubURLErrorRendersOnlySchemeAndHost(t *testing.T) {
 		name string
 		url  string
 		want string // the ONLY URL text allowed out
+		note string // the fixed note naming whatever was withheld
 	}{
-		{"plain", "https://prov.example", "https://prov.example"},
-		{"path", "https://prov.example/update/" + pathSentinel, "https://prov.example"},
+		{"plain", "https://prov.example", "https://prov.example", ""},
+		{"path", "https://prov.example/update/" + pathSentinel, "https://prov.example", ""},
 		{"generic %p expanded into the path", "https://prov.example/update/" + pathSentinel + "?x=1",
-			"https://prov.example"},
-		{"query", "https://prov.example/upd?token=" + pathSentinel, "https://prov.example"},
-		{"fragment", "https://prov.example/upd#token=" + pathSentinel, "https://prov.example"},
-		{"userinfo", "https://user:" + pathSentinel + "@prov.example/upd", "https://prov.example"},
+			"https://prov.example", ""},
+		{"query", "https://prov.example/upd?token=" + pathSentinel, "https://prov.example", ""},
+		{"fragment", "https://prov.example/upd#token=" + pathSentinel, "https://prov.example", ""},
+		{"userinfo", "https://user:" + pathSentinel + "@prov.example/upd", "https://prov.example", ""},
 		{"everything at once", "https://user:" + pathSentinel + "@prov.example:8443/a/" +
-			pathSentinel + "?q=" + pathSentinel + "#f=" + pathSentinel, "https://prov.example:8443"},
-		{"host and port retained", "https://prov.example:8443/x", "https://prov.example:8443"},
-		{"opaque", "mailto:" + pathSentinel + "@prov.example", "mailto:"},
+			pathSentinel + "?q=" + pathSentinel + "#f=" + pathSentinel, "https://prov.example:8443", ""},
+		{"host and port retained", "https://prov.example:8443/x", "https://prov.example:8443", ""},
+
+		// --- round 7: Host is not credential-free -----------------------------
+		// Each of these reaches Host through a SUPPORTED generic template or a
+		// provider Location, and each was rendered verbatim before the grammar.
+		{"ipv6 zone id", "https://[fe80::1%25" + hostSentinel + "]/upd",
+			"https://[fe80::1]", zoneNote},
+		{"ipv6 zone id with port", "https://[fe80::1%25" + hostSentinel + "]:8443/upd",
+			"https://[fe80::1]:8443", zoneNote},
+		{"raw non-ascii byte decoded into host", "https://ex%FFample.com/upd", "https:", hostNote},
+		{"percent-decoded utf8 host", "https://ex%C3%A9mple.com/upd", "https:", hostNote},
+		{"empty label", "https://prov..example/upd", "https:", hostNote},
+		// A port outside 1..65535 is dropped on its own: the host still fits the
+		// grammar, and erasing it would cost diagnosis for nothing.
+		{"port out of range", "https://prov.example:99999/upd", "https://prov.example", ""},
+		{"opaque", "mailto:" + pathSentinel + "@prov.example", "", schemeNote},
+		{"non-http scheme with a host", "ftp://" + hostSentinel + ".example/upd", "", schemeNote},
+
+		// Over-reach floor: legitimate hosts must still be identifiable.
+		{"ipv4 literal", "https://192.0.2.7:8443/upd", "https://192.0.2.7:8443", ""},
+		{"ipv6 literal, no zone", "https://[2001:db8::1]:8443/upd", "https://[2001:db8::1]:8443", ""},
+		{"underscore label", "https://ddns_v2.prov.example/upd", "https://ddns_v2.prov.example", ""},
+		{"trailing root dot", "https://prov.example./upd", "https://prov.example.", ""},
+		{"mixed case preserved", "https://Prov.EXAMPLE/upd", "https://Prov.EXAMPLE", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := scrubURLError(&url.Error{Op: "Get", URL: tc.url, Err: errSyntheticTransport})
-			want := fmt.Sprintf("Get %q: %v", tc.want, errSyntheticTransport)
+			want := fmt.Sprintf("Get %q%s: %s", tc.want, tc.note, wantSyntheticRender)
 			if got != want {
 				t.Fatalf("scrubURLError(%q):\n  got  = %q\n  want = %q\n"+
-					"The safe URL must be rebuilt by ALLOWLIST — a fresh url.URL carrying only "+
-					"Scheme and Host — so User, Path, RawPath, RawQuery, Fragment, RawFragment, "+
+					"The safe URL must be rebuilt by ALLOWLIST at BOTH levels. Field level: a "+
+					"fresh scheme+host, so User, Path, RawPath, RawQuery, Fragment, RawFragment, "+
 					"Opaque and anything net/url adds later are absent by construction. Clearing "+
-					"fields one at a time is a blocklist and it already missed Path once.",
+					"fields one at a time is a blocklist and it already missed Path once.\n"+
+					"CHARACTER level (round 7): Host is NOT credential-free — it carries an IPv6 "+
+					"zone id, a reg-name label, decoded non-ASCII bytes and a port, all of which "+
+					"a supported generic template can put a %%p-expanded password into. Render it "+
+					"through safeHostText's closed grammar, not verbatim.",
 					tc.url, got, want)
 			}
 		})
@@ -192,6 +257,192 @@ func TestGenericTransportFailureRedactsPasswordInPath(t *testing.T) {
 		t.Fatalf("the %%p-expanded password leaked from the URL PATH on transport failure:\n"+
 			"  error = %q\n"+
 			"A generic template may place %%p anywhere; only scheme://host may be rendered.", err)
+	}
+}
+
+// TestGenericTransportFailureRedactsPasswordInHost is Codex's round-7 repro,
+// driven end to end through the SAME path he used: a supported generic
+// url-template that expands %p inside an IPv6 zone id.
+//
+// RFC 6874 lets a zone id use "basically any %-encoding it likes" and net/url
+// honours that, so "https://[fe80::1%25%p]/update" parses cleanly and lands the
+// expanded password in url.URL.Host. The round-6 fix allowlisted the url.URL
+// FIELDS and admitted Host whole, so this walked straight through it: a field
+// allowlist is only as good as the safety of the fields it admits.
+//
+// u.Hostname() is not the fix either — it unwraps the brackets and KEEPS the
+// zone. Only re-rendering the address from netip with the zone dropped removes
+// it structurally.
+func TestGenericTransportFailureRedactsPasswordInHost(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errSyntheticTransport
+	})}
+	b, err := newGenericBackend(&config.DDNSProvider{
+		Name:        "gen",
+		Backend:     "generic",
+		URLTemplate: "https://[fe80::1%25%p]/update",
+		Username:    "u",
+		Password:    config.Secret(hostSentinel),
+	}, client)
+	if err != nil {
+		t.Fatalf("newGenericBackend: %v; the template must be ACCEPTED or this test is vacuous", err)
+	}
+	err = b.UpsertLease(context.Background(), LeaseDNSRecord{
+		FQDN: "host.example.com", Addr: netip.MustParseAddr("192.0.2.7"), TTL: 60, ForwardType: "A",
+	})
+	if err == nil {
+		t.Fatal("a synthetic transport failure must surface an error")
+	}
+	// NON-VACUITY: the failure must be the TRANSPORT, not a rejected template or
+	// a build error, or the sentinel check below proves nothing about Host.
+	if !strings.Contains(err.Error(), "request failed") {
+		t.Fatalf("generic UpsertLease err = %q, want the transport failure. If this is a "+
+			"build/parse error the template never reached url.URL.Host and the assertion "+
+			"below is vacuous.", err)
+	}
+	if strings.Contains(err.Error(), hostSentinel) {
+		t.Fatalf("the %%p-expanded password leaked from the IPv6 ZONE ID inside url.URL.Host:\n"+
+			"  error = %q\n"+
+			"Host is not credential-free. Render it through safeHostText, which re-renders an "+
+			"IP literal from netip with WithZone(\"\") — copying u.Host, or even u.Hostname(), "+
+			"keeps the zone.", err)
+	}
+}
+
+// TestScrubInnerErrorWithholdsURLFromArbitraryTransportError is Codex's round-7
+// repro for the INNER error. scrubInnerError used to return any non-*url.Error
+// verbatim, reasoning that transport errors name a host, never a URL. CheckIP
+// takes a caller-supplied *http.Client, so that reasoning does not hold: a
+// RoundTripper that mentions req.URL put the complete path credential through.
+//
+// The wrapped form is covered too. The round-6 handling of net/http's
+// Location-parse message was an exact PREFIX match on the top-level text, so the
+// same message one wrap deep walked past it.
+func TestScrubInnerErrorWithholdsURLFromArbitraryTransportError(t *testing.T) {
+	urlStr := "https://checkip.example/v1/" + pathSentinel + "/myip"
+	for _, tc := range []struct {
+		name string
+		make func(req *http.Request) error
+	}{
+		{"roundtripper embeds the request URL", func(req *http.Request) error {
+			return fmt.Errorf("request %s failed: %w", req.URL, context.DeadlineExceeded)
+		}},
+		{"roundtripper embeds only the query", func(req *http.Request) error {
+			return fmt.Errorf("upstream rejected %q", req.URL.RequestURI())
+		}},
+		{"wrapped Location-header echo", func(req *http.Request) error {
+			return fmt.Errorf("while following redirect: %w",
+				fmt.Errorf("failed to parse Location header %q: bad escape", req.URL.String()))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return nil, tc.make(req)
+			})}
+			_, ok, err := CheckIP(context.Background(), client, urlStr, true, nil)
+			if ok {
+				t.Fatal("a failing transport must not yield an observation")
+			}
+			if err == nil {
+				t.Fatal("a transport failure must be reported; got nil, so this test is vacuous")
+			}
+			if !strings.Contains(err.Error(), "request failed") {
+				t.Fatalf("CheckIP err = %q, want the transport-failure error; the test is not "+
+					"exercising doRequest/scrubURLError", err)
+			}
+			if strings.Contains(err.Error(), pathSentinel) {
+				t.Fatalf("the inner transport error leaked the URL PATH credential:\n"+
+					"  error = %q\n"+
+					"scrubInnerError must be TOTAL: render an error's text only when its "+
+					"provenance is known (our own refusals, a syscall.Errno, a recognised "+
+					"stdlib class). A caller-supplied RoundTripper can return anything.", err)
+			}
+		})
+	}
+}
+
+// TestScrubInnerErrorKeepsRecognisedDiagnostics is the over-reach floor for the
+// totality fix above. Withholding everything would satisfy the leak test and
+// destroy the package's diagnostics, so the classes an operator actually reads
+// must still come out — including, above all, the cross-host redirect refusal,
+// which is the very thing #6545 exists to produce.
+func TestScrubInnerErrorKeepsRecognisedDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"errno", syscall.ECONNREFUSED, "connection refused"},
+		{"errno wrapped by net.OpError", &net.OpError{
+			Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED,
+		}, "connection refused"},
+		{"context deadline", context.DeadlineExceeded, "context deadline exceeded"},
+		{"dns not found", &net.DNSError{Err: "x", Name: hostSentinel, IsNotFound: true},
+			"dns lookup failed: no such host"},
+		{"unknown authority", x509.UnknownAuthorityError{},
+			"tls: certificate signed by unknown authority"},
+		{"our own redirect refusal", fmt.Errorf("%w: refusing cross-host redirect from a to b",
+			errRedirectRefused), "refusing cross-host redirect from a to b"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := scrubInnerError(tc.err)
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("scrubInnerError(%T) = %q, want it to contain %q.\n"+
+					"Making the classifier total must not make it useless — these are the "+
+					"classes an operator diagnoses from.", tc.err, got, tc.want)
+			}
+		})
+	}
+	// And the classifier must not smuggle host text out of a class it recognises:
+	// net.DNSError.Name is the request host.
+	if got := scrubInnerError(&net.DNSError{Err: "x", Name: hostSentinel, IsNotFound: true}); strings.Contains(got, hostSentinel) {
+		t.Fatalf("scrubInnerError rendered net.DNSError.Name: %q\n"+
+			"Recognised classes must be read STRUCTURALLY (IsNotFound/IsTimeout), never by "+
+			"their message text — DNSError.Name and OpError.Addr are the request host.", got)
+	}
+}
+
+// TestGuardRedirectRefusalBoundsProviderSuppliedHost covers the half of round 7
+// that is remote-controlled rather than operator-controlled: the refusal message
+// names the redirect TARGET, and that target comes from the provider's Location
+// header. A provider echoing our own credential back as a hostname got the hop
+// refused — correctly — and the credential written to the log.
+//
+// The host is bounded by the same grammar, not withheld: naming the host you
+// refused to follow is the entire diagnostic.
+func TestGuardRedirectRefusalBoundsProviderSuppliedHost(t *testing.T) {
+	prev := httptest.NewRequest(http.MethodGet, "https://prov.example/upd", nil)
+	for _, tc := range []struct {
+		name     string
+		location string
+		wantOut  string // must NOT appear
+		wantIn   string // must appear
+	}{
+		{"zone id in a cross-host Location",
+			"https://[fe80::1%25" + hostSentinel + "]/next", hostSentinel, "[fe80::1]"},
+		{"non-ascii bytes in a cross-host Location",
+			"https://ex%FFample.com/next", "\xff", "withheld"},
+		{"downgrade to a zoned host",
+			"http://[fe80::1%25" + hostSentinel + "]/next", hostSentinel, "cleartext"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			next := httptest.NewRequest(http.MethodGet, tc.location, nil)
+			err := guardRedirect(next, []*http.Request{prev})
+			if err == nil {
+				t.Fatal("a cross-host / downgrade hop must be refused; got nil, so this " +
+					"test is vacuous")
+			}
+			if strings.Contains(err.Error(), tc.wantOut) {
+				t.Fatalf("the refusal leaked provider-supplied host text:\n  error = %q\n"+
+					"The Location header is attacker-influenced; render its host through "+
+					"safeHostText, and remember the refusal reaches the log via "+
+					"scrubInnerError's errRedirectRefused branch.", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantIn) {
+				t.Fatalf("refusal = %q, want it to still contain %q — bounding the host "+
+					"must not erase which hop was refused", err, tc.wantIn)
+			}
+		})
 	}
 }
 
@@ -413,14 +664,23 @@ func TestDDNSURLErrorRendersGoThroughScrubber(t *testing.T) {
 			if !isFunc || fn.Body == nil {
 				continue
 			}
+			aliases := importAliases(file)
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				for _, site := range urlErrorHandlers(n) {
+				for _, site := range urlErrorHandlers(n, aliases) {
 					sites++
+					bad := unscrubbedUses(fset, site.stmts, site.errVar, aliases)
 					if name == issue6606Exemption.file && fn.Name.Name == issue6606Exemption.fn {
-						exemptionHit = true
+						// The exemption is only HIT when the site is still
+						// UNSAFE. Recording the hit merely because a handler
+						// exists here (the round-6 form) meant sanitizing the
+						// site left the exemption standing and green — the exact
+						// opposite of self-expiring.
+						if len(bad) > 0 {
+							exemptionHit = true
+						}
 						continue
 					}
-					for _, pos := range unscrubbedUses(fset, site.body, site.errVar) {
+					for _, pos := range bad {
 						t.Errorf("%s: %s renders the error from a URL-bearing call (%q) without "+
 							"the scrubber.\n"+
 							"A *url.Error's Error() embeds the COMPLETE request URL — userinfo, "+
@@ -449,11 +709,81 @@ func TestDDNSURLErrorRendersGoThroughScrubber(t *testing.T) {
 	}
 }
 
-// handlerSite is one place a URL-bearing error is handled: the error
-// variable's name and the block that handles it.
+// TestClientDoHasExactlyOneCallSite is the second axis, added in round 7.
+//
+// The walk above matches CALL SHAPES, and a reviewer walked past it by moving
+// the round trip behind a helper: the helper's own error is a plain `error`, so
+// nothing downstream looks like a URL-bearing handler and the gate sees an empty
+// package. No amount of shape-widening fixes that — it is a dataflow question.
+//
+// What DOES fix it is denying the move. `client.Do` is the only way a URL
+// reaches an error in this package that is not a build-time url.Parse, and every
+// caller is meant to go through doRequest, which scrubs. So this pins the count:
+// ONE mention of a `.Do` selector on an HTTP client, in doRequest. A wrapper
+// helper, a `do := client.Do` method value, or a second backend calling Do
+// directly each ADD a site and fail here — no shape-matching involved.
+func TestClientDoHasExactlyOneCallSite(t *testing.T) {
+	type site struct{ file, fn string }
+	var found []site
+
+	forEachProductionFunc(t, func(name string, file *ast.File, fn *ast.FuncDecl) {
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			// A SELECTOR, not a call: `do := client.Do` never calls anything.
+			sel, isSel := n.(*ast.SelectorExpr)
+			if isSel && sel.Sel.Name == "Do" {
+				found = append(found, site{name, fn.Name.Name})
+			}
+			return true
+		})
+	})
+
+	want := site{"backend_http.go", "doRequest"}
+	if len(found) != 1 || found[0] != want {
+		t.Errorf("`.Do` sites in pkg/ddns = %v, want exactly one: %v.\n"+
+			"Every HTTP round trip in this package must go through doRequest, which renders "+
+			"the resulting *url.Error through scrubURLError. A new call site — a helper "+
+			"wrapping client.Do, a `do := client.Do` method value, a backend calling Do "+
+			"itself — reintroduces the #6545 leak class in a shape the AST walk next door "+
+			"cannot see, because the error it hands back is a plain `error`.\n"+
+			"Route it through doRequest. If a new site is genuinely unavoidable, it must "+
+			"scrub, and this expectation must be widened DELIBERATELY.", found, want)
+	}
+}
+
+// forEachProductionFunc walks every function declared in a non-test .go file of
+// the package. Both source gates share it so they cannot drift over which files
+// count as production.
+func forEachProductionFunc(t *testing.T, visit func(name string, file *ast.File, fn *ast.FuncDecl)) {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	fset := token.NewFileSet()
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, perr := parser.ParseFile(fset, filepath.Clean(name), nil, parser.SkipObjectResolution)
+		if perr != nil {
+			t.Fatalf("parse %s: %v", name, perr)
+		}
+		for _, decl := range file.Decls {
+			fn, isFunc := decl.(*ast.FuncDecl)
+			if !isFunc || fn.Body == nil {
+				continue
+			}
+			visit(name, file, fn)
+		}
+	}
+}
+
+// handlerSite is one place a URL-bearing error is handled: the error variable's
+// name and every statement the value can still be read from.
 type handlerSite struct {
 	errVar string
-	body   *ast.BlockStmt
+	stmts  []ast.Stmt
 }
 
 // urlErrorHandlers recognises the two shapes in which a URL-bearing error is
@@ -463,19 +793,43 @@ type handlerSite struct {
 //	v, err := url.Parse(s)          |  if v, err := url.Parse(s); err != nil {
 //	if err != nil { ... }           |      ...
 //	                                |  }
-func urlErrorHandlers(n ast.Node) []handlerSite {
+//
+// ROUND 7 WIDENED SHAPE 1. It used to require the `if err != nil` to be the very
+// NEXT statement and inspected only that if's body, so an intervening statement,
+// or a render that never used an `if` at all
+//
+//	resp, err := client.Do(req)
+//	return nil, fmt.Errorf("request failed: %w", err)
+//
+// walked past it. The site is now the whole REACH of the value: every statement
+// after the assignment until the identifier is reassigned. That subsumes both
+// bypasses, and the reassignment cut is what keeps
+//
+//	req, err := http.NewRequest(...)   // tainted
+//	...
+//	code, body, err := doRequest(...)  // a DIFFERENT, already-scrubbed value
+//	if err != nil { return fmt.Errorf("...: %w", err) }
+//
+// from reading as a leak.
+func urlErrorHandlers(n ast.Node, aliases map[string]string) []handlerSite {
 	switch node := n.(type) {
 	case *ast.BlockStmt:
 		// Shape 1: the assignment is a preceding statement in the same block.
 		var sites []handlerSite
 		for i := 0; i+1 < len(node.List); i++ {
-			errVar := producedErrVar(node.List[i])
+			errVar := producedErrVar(node.List[i], aliases)
 			if errVar == "" {
 				continue
 			}
-			next, nextIsIf := node.List[i+1].(*ast.IfStmt)
-			if nextIsIf && testsErrVar(next.Cond, errVar) {
-				sites = append(sites, handlerSite{errVar: errVar, body: next.Body})
+			reach := node.List[i+1:]
+			for j, stmt := range reach {
+				if assignsVar(stmt, errVar) {
+					reach = reach[:j]
+					break
+				}
+			}
+			if len(reach) > 0 {
+				sites = append(sites, handlerSite{errVar: errVar, stmts: reach})
 			}
 		}
 		return sites
@@ -484,24 +838,24 @@ func urlErrorHandlers(n ast.Node) []handlerSite {
 		if node.Init == nil {
 			return nil
 		}
-		errVar := producedErrVar(node.Init)
+		errVar := producedErrVar(node.Init, aliases)
 		if errVar == "" || !testsErrVar(node.Cond, errVar) {
 			return nil
 		}
-		return []handlerSite{{errVar: errVar, body: node.Body}}
+		return []handlerSite{{errVar: errVar, stmts: node.Body.List}}
 	}
 	return nil
 }
 
 // producedErrVar returns the name of the error variable assigned from a
 // URL-bearing call, or "" if the statement is not such an assignment.
-func producedErrVar(stmt ast.Stmt) string {
+func producedErrVar(stmt ast.Stmt, aliases map[string]string) string {
 	assign, isAssign := stmt.(*ast.AssignStmt)
 	if !isAssign || len(assign.Rhs) != 1 || len(assign.Lhs) == 0 {
 		return ""
 	}
 	call, isCall := assign.Rhs[0].(*ast.CallExpr)
-	if !isCall || !urlErrorProducers[calleeName(call.Fun)] {
+	if !isCall || !urlErrorProducers[calleeName(call.Fun, aliases)] {
 		return ""
 	}
 	last, isIdent := assign.Lhs[len(assign.Lhs)-1].(*ast.Ident)
@@ -509,6 +863,45 @@ func producedErrVar(stmt ast.Stmt) string {
 		return ""
 	}
 	return last.Name
+}
+
+// assignsVar reports whether stmt assigns to name, which ends the reach of the
+// value the identifier held before it.
+func assignsVar(stmt ast.Stmt, name string) bool {
+	assign, isAssign := stmt.(*ast.AssignStmt)
+	if !isAssign {
+		return false
+	}
+	for _, lhs := range assign.Lhs {
+		if id, isIdent := lhs.(*ast.Ident); isIdent && id.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// importAliases maps each file-local package name onto the canonical last
+// element of its import path, so an ALIASED import cannot dodge the walk:
+//
+//	import nh "net/http"
+//	req, err := nh.NewRequest(...)   // resolves to "http.NewRequest"
+//
+// Round 6 matched the receiver's spelling directly and this walked past it.
+func importAliases(file *ast.File) map[string]string {
+	aliases := map[string]string{}
+	for _, spec := range file.Imports {
+		path := strings.Trim(spec.Path.Value, `"`)
+		canonical := path
+		if i := strings.LastIndex(path, "/"); i >= 0 {
+			canonical = path[i+1:]
+		}
+		local := canonical
+		if spec.Name != nil {
+			local = spec.Name.Name
+		}
+		aliases[local] = canonical
+	}
+	return aliases
 }
 
 // testsErrVar reports whether cond is (or begins with) `errVar != nil`.
@@ -528,45 +921,115 @@ func testsErrVar(cond ast.Expr, errVar string) bool {
 	return isIdent && isNil && x.Name == errVar && y.Name == "nil"
 }
 
-// unscrubbedUses returns the position of every occurrence of errVar inside body
+// unscrubbedUses returns the position of every occurrence of errVar inside stmts
 // that is NOT a direct argument to one of the sanctioned renderers. A bare
 // `return err`, a `%w` wrap, and a `%v` interpolation all land here.
-func unscrubbedUses(fset *token.FileSet, body *ast.BlockStmt, errVar string) []token.Position {
-	sanctioned := map[*ast.Ident]bool{}
-	ast.Inspect(body, func(n ast.Node) bool {
-		call, isCall := n.(*ast.CallExpr)
-		if !isCall || !urlErrorRenderers[calleeName(call.Fun)] {
-			return true
-		}
-		for _, arg := range call.Args {
-			if id, isIdent := arg.(*ast.Ident); isIdent && id.Name == errVar {
-				sanctioned[id] = true
+//
+// ROUND 7 ADDED EXTRACTION TAINT. errors.As is sanctioned because it INSPECTS
+// rather than renders — but it also hands the caller a fresh variable holding
+// the same URL:
+//
+//	var ue *url.Error
+//	if errors.As(err, &ue) { return fmt.Errorf("%w", ue) }   // walked past
+//
+// so whatever errors.As extracts inherits errVar's taint and is checked too.
+func unscrubbedUses(fset *token.FileSet, stmts []ast.Stmt, errVar string, aliases map[string]string) []token.Position {
+	tainted := map[string]bool{errVar: true}
+	for _, stmt := range stmts {
+		ast.Inspect(stmt, func(n ast.Node) bool {
+			call, isCall := n.(*ast.CallExpr)
+			if !isCall || calleeName(call.Fun, aliases) != "errors.As" || len(call.Args) != 2 {
+				return true
 			}
-		}
-		return true
-	})
-	var bad []token.Position
-	ast.Inspect(body, func(n ast.Node) bool {
-		id, isIdent := n.(*ast.Ident)
-		if !isIdent || id.Name != errVar || sanctioned[id] {
+			src, isIdent := call.Args[0].(*ast.Ident)
+			if !isIdent || !tainted[src.Name] {
+				return true
+			}
+			unary, isUnary := call.Args[1].(*ast.UnaryExpr)
+			if !isUnary || unary.Op != token.AND {
+				return true
+			}
+			if dst, isDstIdent := unary.X.(*ast.Ident); isDstIdent {
+				tainted[dst.Name] = true
+			}
 			return true
-		}
-		bad = append(bad, fset.Position(id.Pos()))
-		return true
-	})
+		})
+	}
+
+	sanctioned := map[*ast.Ident]bool{}
+	for _, stmt := range stmts {
+		// `err != nil` / `err == nil` TESTS the value, it does not render it.
+		// Widening the site to the value's whole reach (round 7) brought the
+		// guard condition itself into view, which the body-only walk never saw.
+		ast.Inspect(stmt, func(n ast.Node) bool {
+			bin, isBin := n.(*ast.BinaryExpr)
+			if !isBin || (bin.Op != token.NEQ && bin.Op != token.EQL) {
+				return true
+			}
+			for _, side := range [2]ast.Expr{bin.X, bin.Y} {
+				other := bin.Y
+				if side == bin.Y {
+					other = bin.X
+				}
+				id, isIdent := side.(*ast.Ident)
+				nilIdent, isNil := other.(*ast.Ident)
+				if isIdent && isNil && tainted[id.Name] && nilIdent.Name == "nil" {
+					sanctioned[id] = true
+				}
+			}
+			return true
+		})
+		ast.Inspect(stmt, func(n ast.Node) bool {
+			call, isCall := n.(*ast.CallExpr)
+			if !isCall || !urlErrorRenderers[calleeName(call.Fun, aliases)] {
+				return true
+			}
+			for _, arg := range call.Args {
+				if id, isIdent := arg.(*ast.Ident); isIdent && tainted[id.Name] {
+					sanctioned[id] = true
+				}
+				// `errors.As(err, &ue)` — the destination is inspected, not
+				// rendered, so its mention here is not a use.
+				if unary, isUnary := arg.(*ast.UnaryExpr); isUnary && unary.Op == token.AND {
+					if id, isIdent := unary.X.(*ast.Ident); isIdent {
+						sanctioned[id] = true
+					}
+				}
+			}
+			return true
+		})
+	}
+
+	var bad []token.Position
+	for _, stmt := range stmts {
+		ast.Inspect(stmt, func(n ast.Node) bool {
+			id, isIdent := n.(*ast.Ident)
+			if !isIdent || !tainted[id.Name] || sanctioned[id] {
+				return true
+			}
+			bad = append(bad, fset.Position(id.Pos()))
+			return true
+		})
+	}
 	return bad
 }
 
 // calleeName renders a call's callee as "fn", "pkg.Fn", or ".Method" (for a
 // method on an arbitrary receiver expression, which is how client.Do is
-// matched regardless of what holds the client).
-func calleeName(fun ast.Expr) string {
+// matched regardless of what holds the client). The receiver is resolved
+// through the file's import aliases, so `nh.NewRequest` on `import nh
+// "net/http"` still reads as "http.NewRequest".
+func calleeName(fun ast.Expr, aliases map[string]string) string {
 	switch f := fun.(type) {
 	case *ast.Ident:
 		return f.Name
 	case *ast.SelectorExpr:
 		if x, isIdent := f.X.(*ast.Ident); isIdent {
-			if name := x.Name + "." + f.Sel.Name; urlErrorProducers[name] || urlErrorRenderers[name] {
+			pkg := x.Name
+			if canonical, isImport := aliases[pkg]; isImport {
+				pkg = canonical
+			}
+			if name := pkg + "." + f.Sel.Name; urlErrorProducers[name] || urlErrorRenderers[name] {
 				return name
 			}
 		}

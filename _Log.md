@@ -62534,3 +62534,90 @@ break — `go vet` confirmed passing under every revert.
     url_render_class_6545_test.go,checkip_cause_structural_6545_test.go,
     checkip_url_redaction_6545_test.go,README.md},
     pkg/daemon/daemon_ddns_surface_a.go, _Log.md
+
+- **Timestamp**: 2026-07-31 16:05 UTC
+- **Action**: #6545 round 7 (Codex MAJOR fold on PR #6594) — close the
+  credential class inside `url.URL.Host`, make `scrubInnerError` total, and
+  repair the structural gate's self-expiry.
+
+  **MAJOR 1 — `Host` is not credential-free.** Round 6 replaced a blocklist of
+  field clears with a field ALLOWLIST (`url.URL{Scheme, Host}`). That was the
+  right move and it closed the field-expansion class, but an allowlist is only
+  as good as the safety of what it admits, and `Host` was admitted without
+  being shown credential-free. Verified against Go 1.26 `net/url`, `Host` can
+  legally carry after generic-template substitution: an **IPv6 zone id** (RFC
+  6874 lets a zone use "basically any %-encoding", so the supported template
+  `https://[fe80::1%25%p]/update` parses to `Host = "[fe80::1%<password>]"` —
+  Codex's repro; `u.Hostname()` strips only the brackets and KEEPS the zone);
+  an ordinary **reg-name label** (`https://%p.example.com/`); **raw non-ASCII
+  bytes** (`%FF` decodes in place to a literal 0xFF — log-injection material as
+  well); and a digits-only **port**. Userinfo was never in this list —
+  `url.Parse` splits `user:pass@host` into `u.User`. Space, backslash, control
+  characters, `%`-escapes below 0x80 and IPvFuture literals are rejected by
+  `url.Parse` itself. Fix: `safeHostText`/`safeHostName`/`safeRegName`/
+  `safePort`/`safeScheme` rebuild the target from a CLOSED GRAMMAR — an IP
+  literal re-rendered from `netip` with `WithZone("")` (structural drop, not a
+  text trim), a reg-name of dot-separated `[A-Za-z0-9_-]` labels (≤63 each,
+  ≤253 total, one optional root dot) or nothing, a port in 1..65535, and a
+  scheme reduced to `http`/`https` so the guarantee does not depend on any
+  upstream validator having run. **The rendered error is now guaranteed to
+  contain, for the URL, at most**: `http`/`https`, `://`, a zone-free IP
+  literal or an `[A-Za-z0-9._-]` reg-name, optionally `:` + 1–5 decimal digits,
+  plus one of three FIXED notes naming what was withheld. Stated residual: a
+  template that puts the password in the DNS NAME has already published it to
+  the resolver, the wire and TLS SNI — that is a config error the logging
+  boundary cannot repair, and hiding it would make it less likely to be
+  noticed. Codex's second half (a valid cross-host `Location` echoing the
+  credential as its hostname, refused but logged) is closed at
+  `guardRedirect`, whose refusal hosts/scheme now render through
+  `refusalHost`/`safeScheme`; the same-host DECISION still compares raw values
+  via `redirectHost`.
+
+  **MAJOR 2 — `scrubInnerError` was not total.** It returned any
+  non-`*url.Error` verbatim on the reasoning that transport errors name a host,
+  never a URL. `CheckIP` takes a caller-supplied `*http.Client`, so a
+  RoundTripper returning `fmt.Errorf("request %s failed: %w", req.URL, …)` put
+  the whole path credential through, and the round-6 Location-header guard was
+  an exact PREFIX match that the same message one wrap deep bypassed. Now
+  provenance-based: text is rendered only for our own `errRedirectRefused`
+  refusals (built here from fixed prose + grammar-bounded hosts), a
+  `syscall.Errno` (fixed kernel table — the one sanctioned conversion), or a
+  recognised stdlib class collapsed onto the closed `transportReason`
+  enumeration, following the `parseReason` precedent so a bare pass-through
+  does not COMPILE. Classes are read STRUCTURALLY (`net.Error.Timeout`,
+  `DNSError.IsNotFound`, `OpError.Op`/`.Net` against net's own vocabularies)
+  and never by message text — `DNSError.Name` and `OpError.Addr` are the
+  request host, x509 errors quote provider-supplied certificate fields.
+  Everything else is withheld to its Go TYPE, a compile-time symbol. The
+  Location-header match is now prefix-at-any-wrapping-depth and fails CLOSED.
+
+  **MAJOR 3 — the structural gate.** The concrete defect: `exemptionHit` was
+  recorded merely because a URL-bearing handler existed in
+  `resolveDyndns2Endpoint`, BEFORE checking whether it was still unsafe — so
+  fixing #6606 would have left the exemption standing and green, the opposite
+  of self-expiring. The hit is now conditional on the site still being unsafe.
+  Four of Codex's five bypasses closed: aliased `net/http` imports
+  (`importAliases` canonicalizes the receiver), `do := client.Do` method values
+  and helper-wrapped round trips (`TestClientDoHasExactlyOneCallSite` pins `.Do`
+  to exactly one site — `doRequest`), a non-adjacent guard or a render with no
+  `if` at all (a site is now the value's whole REACH, cut at reassignment so a
+  later already-scrubbed `err` is not a false positive; `err != nil` tests are
+  sanctioned), and `errors.As(err, &ue)` followed by rendering `ue` (extraction
+  taint). The fifth is inherent — an AST walk cannot follow a value through a
+  helper's return — so the doc no longer claims exhaustiveness and says plainly
+  that the `.Do` count gate is what makes the limit bite.
+
+  **Validation**: mutation-proven in a THROWAWAY detached worktree
+  (`/dev/shm/probe-6594j`), build + vet CLEAN there so every red is an
+  ASSERTION, sentinel planted in the exact slot under test via the real
+  template-substitution path. Over-reach floors green:
+  `TestScrubInnerErrorKeepsRecognisedDiagnostics` (connection refused, DNS,
+  x509, and above all the cross-host refusal still render) and the
+  IPv4/IPv6/underscore/root-dot/mixed-case rows of the exact-equality table (a
+  valid credentialed URL is still accepted and its host still identifiable).
+  `TestDDNSURLErrorRendersGoThroughScrubber` still passes and its
+  `minURLErrorSites` floor still holds. gofmt clean on every touched file; go
+  vet clean; full `go test ./...` green. No cluster smoke: control-plane
+  logging hygiene only.
+- **File(s)**: pkg/ddns/{backend_http.go,url_render_class_6545_test.go,README.md},
+    _Log.md

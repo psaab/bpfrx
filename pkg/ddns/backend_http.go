@@ -3,13 +3,18 @@ package ddns
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -58,6 +63,23 @@ var errHTTPAuth = errors.New("ddns http: authentication/authorization refused")
 // 911/dnserr, HTTP 429). The engine backs off; this lets the backend log it as
 // a ban-avoidance signal rather than a generic failure.
 var errHTTPRateLimited = errors.New("ddns http: provider rate-limited")
+
+// errRedirectRefused tags every refusal guardRedirect returns. It is a
+// PROVENANCE marker, not decoration: an *http.Client wraps a CheckRedirect
+// failure into the *url.Error it returns, so the refusal text reaches
+// scrubInnerError, which renders an error verbatim only when it can prove the
+// text is credential-free (see scrubInnerError). This sentinel is that proof
+// for our own refusals — the sentences are built HERE, from fixed prose plus
+// host/scheme tokens that have already been through safeHostText/safeScheme.
+//
+// Which matters because the redirect target is PROVIDER-supplied: a provider
+// that answers with `Location: https://<our-own-password>.evil.example/` gets
+// the hop refused (that is the point of the guard) but would, without the
+// grammar, put the echoed credential into the refusal message and thence into
+// the daemon log. Anything added to a refusal string here must be
+// grammar-bounded the same way, or this sentinel starts vouching for text
+// nobody bounded.
+var errRedirectRefused = errors.New("ddns http")
 
 // newHTTPClient builds the shared, hardened HTTP client for every HTTP backend
 // with NO source binding (the default route / kernel-chosen source). TLS
@@ -195,25 +217,45 @@ const maxRedirects = 10
 // every hop must equal its predecessor, so by induction every hop equals hop 0.
 func guardRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= maxRedirects {
-		return fmt.Errorf("ddns http: stopped after %d redirects", maxRedirects)
+		return fmt.Errorf("%w: stopped after %d redirects", errRedirectRefused, maxRedirects)
 	}
 	if len(via) > 0 {
 		prev := via[len(via)-1].URL
 		if strings.EqualFold(prev.Scheme, "https") && !strings.EqualFold(req.URL.Scheme, "https") {
-			return fmt.Errorf("ddns http: refusing HTTPS->%s redirect downgrade to %s "+
-				"(would expose update credentials in cleartext)", req.URL.Scheme, req.URL.Host)
+			// The scheme AND the host here come from the provider's Location
+			// header, so both are rendered through the safe grammar — see
+			// errRedirectRefused.
+			return fmt.Errorf("%w: refusing HTTPS->%s redirect downgrade to %s "+
+				"(would expose update credentials in cleartext)",
+				errRedirectRefused, safeScheme(req.URL.Scheme), refusalHost(req.URL))
 		}
 		if !strings.EqualFold(redirectHost(prev), redirectHost(req.URL)) {
-			return fmt.Errorf("ddns http: refusing cross-host redirect from %s to %s "+
+			return fmt.Errorf("%w: refusing cross-host redirect from %s to %s "+
 				"(would disclose the update credentials and payload to a host that is not "+
 				"the configured endpoint); point the provider endpoint at the final host instead",
-				redirectHost(prev), redirectHost(req.URL))
+				errRedirectRefused, refusalHost(prev), refusalHost(req.URL))
 		}
 	}
 	// Followed (same-host) hop: never echo the previous URL's query string —
 	// which carries the DuckDNS/generic/checkip credential — into Referer.
 	req.Header.Del("Referer")
 	return nil
+}
+
+// refusalHost renders a host inside a guardRedirect refusal sentence: the safe
+// grammar, or a fixed placeholder when the host does not fit it. It differs from
+// safeHostText only in never returning "" — an empty slot mid-sentence ("refusing
+// cross-host redirect from prov.example to ") reads as a bug rather than as a
+// withheld value.
+//
+// This is a RENDERING helper only. guardRedirect's same-host DECISION still uses
+// redirectHost on the raw values; a host that fails the grammar must be refused,
+// not compared loosely.
+func refusalHost(u *url.URL) string {
+	if h := safeHostText(u); h != "" {
+		return h
+	}
+	return "(host withheld: not a plain host name)"
 }
 
 // redirectHost normalizes a URL's host for guardRedirect's same-host test:
@@ -433,22 +475,50 @@ func doRequest(ctx context.Context, client *http.Client, req *http.Request) (int
 // an explicit, self-expiring exemption in the source gate
 // (url_render_class_6545_test.go).
 //
-// WHAT IT RENDERS: at most SCHEME://HOST, built by ALLOWLIST. The safe URL is a
-// FRESH url.URL carrying only Scheme and Host, so User, Path, RawPath,
-// RawQuery, Fragment, RawFragment, Opaque, OmitHost — and any field net/url
-// adds later — are absent by construction, not by a clear somebody has to
-// remember. The previous form was a blocklist of field clears and it MISSED:
-// it preserved Path, and the generic backend accepts %p ANYWHERE in its
-// template, so a supported template like
+// WHAT IT RENDERS: at most SCHEME://HOST[:PORT], built by ALLOWLIST — and the
+// allowlist is over the CHARACTERS, not just over the url.URL fields. Round 7
+// found that field-level allowlisting was not enough: an allowlist is only as
+// good as the safety of what it admits, and `Host` is NOT credential-free.
 //
-//	https://prov.example/update/%p
+// Field-level allowlisting (a fresh url.URL carrying only Scheme and Host)
+// closed the field-expansion class — User, Path, RawPath, RawQuery, Fragment,
+// RawFragment, Opaque, OmitHost and anything net/url adds later are absent by
+// construction. It did not close the credential class, because `Host` is a
+// container for substituted template text, not a name. What url.Parse will
+// legally leave in `Host` (verified against Go 1.26 net/url):
 //
-// put the expanded password straight into the transport error. A checkip-url
-// with an API key in its path had the same exposure, and the Surface A observer
-// both LOGS that string and retains it as the process-lifetime
-// checkIPProbeWarned dedup key. Only the host is structurally non-secret — it
-// is on the wire in DNS and TLS SNI regardless; path, query, userinfo and
-// fragment are all operator-supplied opaque bytes and are treated as secret.
+//   - AN IPv6 ZONE ID. RFC 6874 lets a zone use "basically any %-encoding it
+//     likes", and net/url honours that: "https://[fe80::1%25%p]/update" is a
+//     SUPPORTED generic template and parses to Host = "[fe80::1%<password>]".
+//     u.Hostname() does not help — it strips the brackets and keeps the zone.
+//   - A REG-NAME LABEL. "https://%p.example.com/" parses to
+//     Host = "<password>.example.com" whenever the password is host-safe.
+//   - RAW NON-ASCII BYTES. %-escapes above 0x7F are decoded in place, so
+//     "ex%FFample.com" reaches Host as a literal 0xFF — log-injection material
+//     on top of everything else.
+//   - A PORT, which is digits-only (net/url's validOptionalPort) but is still
+//     a place a numeric password can land.
+//   - ANY OF THE ABOVE FROM THE PROVIDER. A cross-host Location echoing our own
+//     credential as its hostname is refused by guardRedirect — correctly — and
+//     the refusal named the host.
+//
+// Userinfo is NOT in this list: url.Parse splits "user:pass@host" into u.User,
+// so an ordinary credentialed URL was already safe.
+//
+// So the host is rebuilt from a CLOSED GRAMMAR rather than copied (safeHostText):
+// an IP literal is re-rendered from netip with its ZONE DROPPED, and a reg-name
+// must be ASCII letters/digits/'-'/'_' in dot-separated labels or it is withheld
+// entirely. The scheme is likewise reduced to the two values this package ever
+// legitimately uses. What survives is exactly the network identity that is on
+// the wire in the DNS query, the TCP SYN and the TLS SNI regardless; path,
+// query, userinfo, fragment and zone id are all operator- or provider-supplied
+// opaque bytes and are treated as secret.
+//
+// The residual is stated rather than papered over: an operator whose template
+// puts the password in the DNS NAME ITSELF ("https://%p.example.com/") has
+// already published it to their resolver and to every on-path observer, and it
+// will appear in this error. That is a configuration error the logging boundary
+// cannot repair, and hiding it would make the operator less likely to notice.
 //
 // The diagnostic cost of dropping the path is deliberate and small: the
 // caller's own prefix already names the backend and the operation ("ddns
@@ -465,20 +535,14 @@ func doRequest(ctx context.Context, client *http.Client, req *http.Request) (int
 //
 // THE INNER ERROR is rendered too, because that is the entire diagnostic value
 // ("connection refused", "i/o timeout", "certificate signed by unknown
-// authority"), and transport errors name a host/IP, never a URL. One stdlib
-// message is the exception and is handled explicitly: net/http builds
-// fmt.Errorf("failed to parse Location header %q: %v", loc, err) BEFORE
-// CheckRedirect runs, so a provider that 3xx-es to a malformed Location echoing
-// our own query would put the credential in ue.Err, past the URL scrub above.
-// That one is replaced with a fixed sentence. If the stdlib rewords it the
-// prefix stops matching, which is why the gate for it drives a real
-// http.Client redirect rather than asserting on the constant.
+// authority") — but by CLASSIFICATION, never verbatim. See scrubInnerError.
 //
-// A non-*url.Error is returned verbatim: it never carries the URL.
+// A non-*url.Error goes through the same classifier: it is not automatically
+// URL-free just because it is not a *url.Error (round 7).
 func scrubURLError(err error) string {
 	var ue *url.Error
 	if !errors.As(err, &ue) {
-		return err.Error()
+		return scrubInnerError(err)
 	}
 	u, perr := url.Parse(ue.URL)
 	if perr != nil {
@@ -486,19 +550,210 @@ func scrubURLError(err error) string {
 		// even the host. Report the sanitized reason and no part of the input.
 		return fmt.Sprintf("url is not a valid URL: %s", urlParseCause(perr))
 	}
-	safe := (&url.URL{Scheme: u.Scheme, Host: u.Host}).String()
-	return fmt.Sprintf("%s %q: %s", ue.Op, safe, scrubInnerError(ue.Err))
+	target, note := safeURLTarget(u)
+	return fmt.Sprintf("%s %q%s: %s", ue.Op, target, note, scrubInnerError(ue.Err))
 }
 
-// locationHeaderPrefix is the invariant head of net/http's Location-parse
-// failure (net/http/client.go), which quotes the raw header value.
-const locationHeaderPrefix = `failed to parse Location header `
+// safeURLTarget renders the largest part of u that the closed grammar admits,
+// plus a fixed NOTE naming anything withheld (empty when nothing was). Splitting
+// the note out keeps the target a well-formed URL instead of stuffing a
+// parenthetical inside it.
+func safeURLTarget(u *url.URL) (target, note string) {
+	scheme := safeScheme(u.Scheme)
+	if scheme == "" {
+		// Nothing downstream of an unrecognised scheme can be trusted to be a
+		// host at all, so nothing is rendered. This package only ever issues
+		// http(s), so no legitimate diagnostic is lost.
+		return "", " (url withheld: scheme is not http or https)"
+	}
+	host := safeHostText(u)
+	if host == "" {
+		return scheme + ":", " (host withheld: not a plain host name)"
+	}
+	target = scheme + "://" + host
+	if zoneOf(u.Hostname()) != "" {
+		note = " (link-local zone id withheld)"
+	}
+	return target, note
+}
 
-// scrubInnerError renders the error nested inside a *url.Error. It exists for
-// the one transport-layer message known to embed a URL — see scrubURLError.
+// safeScheme reduces a URL scheme to the two values this package legitimately
+// uses, or "" for anything else. url.Parse constrains a scheme's CHARACTERS but
+// not its content, so a template that expanded a credential into the scheme
+// position would otherwise be rendered; the allowlist makes that impossible
+// without depending on any upstream validator having run.
+func safeScheme(s string) string {
+	switch strings.ToLower(s) {
+	case "http":
+		return "http"
+	case "https":
+		return "https"
+	}
+	return ""
+}
+
+// safeHostText renders u's authority under the closed grammar, or "" if it does
+// not fit. The result is one of exactly three shapes:
+//
+//   - an IP literal re-rendered by netip WITH ANY ZONE ID DROPPED, bracketed
+//     when it is v6 ("[2001:db8::1]", "192.0.2.7");
+//   - a reg-name of dot-separated labels drawn from ASCII letters, digits, '-'
+//     and '_', at most 63 bytes per label and 253 total, with at most one
+//     trailing root dot;
+//
+// each optionally followed by ":" and 1..5 decimal digits in 1..65535.
+//
+// Everything else — a raw non-ASCII byte, a '%', an empty label, an
+// over-long name, a non-numeric or out-of-range port — yields "". The point is
+// that the OUTPUT CHARACTER SET is closed, so no amount of template
+// substitution or provider-supplied Location text can put arbitrary bytes into
+// a log line through this path.
+func safeHostText(u *url.URL) string {
+	host := safeHostName(u.Hostname())
+	if host == "" {
+		return ""
+	}
+	if port := safePort(u.Port()); port != "" {
+		return host + ":" + port
+	}
+	return host
+}
+
+// safeHostName applies the grammar to a bare hostname (no port, no brackets).
+func safeHostName(h string) string {
+	if h == "" {
+		return ""
+	}
+	if addr, err := netip.ParseAddr(h); err == nil {
+		// An IP literal is re-rendered from the PARSED value, which is how the
+		// zone id is dropped: netip holds it as a separate field, so
+		// WithZone("") removes it structurally rather than by trimming text.
+		addr = addr.WithZone("")
+		if addr.Is6() {
+			return "[" + addr.String() + "]"
+		}
+		return addr.String()
+	}
+	return safeRegName(h)
+}
+
+// zoneOf reports the IPv6 zone id on a hostname, or "" when there is none. It is
+// used only to decide whether to say a zone was withheld — the zone itself is
+// never rendered.
+func zoneOf(h string) string {
+	addr, err := netip.ParseAddr(h)
+	if err != nil {
+		return ""
+	}
+	return addr.Zone()
+}
+
+// safeRegName returns h when it is a plain DNS-shaped name under the grammar
+// documented on safeHostText, "" otherwise.
+func safeRegName(h string) string {
+	if len(h) > 253 {
+		return ""
+	}
+	labels := strings.TrimSuffix(h, ".")
+	if labels == "" {
+		return ""
+	}
+	for _, label := range strings.Split(labels, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return ""
+		}
+		for i := 0; i < len(label); i++ {
+			switch c := label[i]; {
+			case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-', c == '_':
+			default:
+				return ""
+			}
+		}
+	}
+	return h
+}
+
+// safePort returns p when it is a decimal port in 1..65535, "" otherwise.
+// net/url already rejects a non-numeric port, so this is a second, local proof
+// rather than a first line of defence.
+func safePort(p string) string {
+	if p == "" || len(p) > 5 {
+		return ""
+	}
+	n, err := strconv.Atoi(p)
+	if err != nil || n < 1 || n > 65535 {
+		return ""
+	}
+	return p
+}
+
+// transportReason is a CLOSED enumeration of what scrubInnerError may report,
+// following the parseReason precedent in checkip.go: because the classifier
+// returns transportReason, a bare pass-through of an error's text — "return
+// text" — does not COMPILE. Reintroducing the leak requires an explicit
+// transportReason(...) conversion, which is a deliberate, greppable edit rather
+// than a plausible-looking slip.
+//
+// There is exactly ONE sanctioned conversion, errnoReason, and its argument
+// space is the kernel's fixed errno table.
+type transportReason string
+
+// The COMPLETE set of reasons scrubInnerError can report, errno aside.
+const (
+	transportNil            transportReason = "<nil>"
+	transportWithheld       transportReason = "transport error withheld"
+	transportTimeout        transportReason = "network timeout"
+	transportDeadline       transportReason = "context deadline exceeded"
+	transportCanceled       transportReason = "context canceled"
+	transportEOF            transportReason = "connection closed before a complete response"
+	transportDNS            transportReason = "dns lookup failed"
+	transportDNSNotFound    transportReason = "dns lookup failed: no such host"
+	transportDNSTimeout     transportReason = "dns lookup failed: timed out"
+	transportTLSVerify      transportReason = "tls: certificate verification failed"
+	transportTLSHostname    transportReason = "tls: certificate is not valid for the requested host"
+	transportTLSAuthority   transportReason = "tls: certificate signed by unknown authority"
+	transportTLSInvalid     transportReason = "tls: certificate is invalid"
+	transportTLSHandshake   transportReason = "tls: handshake failed"
+	transportSchemeMismatch transportReason = "server gave an HTTP response to an HTTPS client"
+	transportLocationEcho   transportReason = "failed to parse redirect Location header " +
+		"(withheld: it echoes provider-supplied URL text)"
+)
+
+// scrubInnerError renders the error nested inside a *url.Error.
+//
+// ROUND 7 MADE THIS TOTAL. It previously returned any non-*url.Error VERBATIM
+// on the reasoning that "transport errors name a host/IP, never a URL". That
+// held for the transports this package builds itself, but CheckIP takes a
+// caller-supplied *http.Client, and a RoundTripper returning
+//
+//	fmt.Errorf("request %s failed: %w", req.URL, context.DeadlineExceeded)
+//
+// put the complete path credential straight through. The old special case for
+// net/http's Location-parse message was an exact PREFIX match, so the same
+// message wrapped one layer deep also walked past it.
+//
+// The rule now is provenance, not pattern-matching: an error's text is rendered
+// only when we can point at what generates it.
+//
+//   - OUR OWN refusals (errRedirectRefused) — built from fixed prose plus
+//     grammar-bounded host tokens, here in this file.
+//   - A syscall.Errno — the kernel's fixed table ("connection refused", "no
+//     route to host"), which is where nearly all real transport diagnosis
+//     lives.
+//   - Recognised stdlib SENTINELS and TYPES, each collapsed onto a constant
+//     above. Structure is read (net.Error.Timeout, DNSError.IsNotFound,
+//     OpError.Op/Net against an allowlist); embedded STRINGS never are —
+//     DNSError.Name and OpError.Addr are the request host, and x509 errors
+//     quote provider-supplied certificate fields.
+//
+// Anything else is withheld, naming only its Go TYPE, which is a compile-time
+// symbol from this repository or the stdlib and carries no operator data. That
+// costs some of net/http's internal prose; the type name still says where to
+// look, and an unrecognised error is exactly the case where we cannot say what
+// it contains.
 func scrubInnerError(err error) string {
 	if err == nil {
-		return "<nil>"
+		return string(transportNil)
 	}
 	// A nested *url.Error would re-embed a full URL in its own Error(); recurse
 	// through the same scrub instead of printing it.
@@ -506,12 +761,134 @@ func scrubInnerError(err error) string {
 	if errors.As(err, &nested) {
 		return scrubURLError(nested)
 	}
-	text := err.Error()
-	if strings.HasPrefix(text, locationHeaderPrefix) {
-		return "failed to parse redirect Location header (withheld: it echoes provider-supplied URL text)"
+	// Our own refusals carry their provenance, so their text is known-safe.
+	// Rendering them matters: the cross-host refusal IS the diagnostic this
+	// guard exists to produce.
+	if errors.Is(err, errRedirectRefused) {
+		return err.Error()
 	}
-	return text
+	return string(classifyTransportError(err))
 }
+
+// classifyTransportError maps an arbitrary transport error onto the closed
+// transportReason set. Every branch reads TYPE or STRUCTURE; none reads an
+// error's message text.
+func classifyTransportError(err error) transportReason {
+	// net/http builds fmt.Errorf("failed to parse Location header %q: %v", ...)
+	// BEFORE CheckRedirect runs, so a provider that 3xx-es to a malformed
+	// Location echoing our own query lands the credential here. It has no
+	// distinguishing type, so it is matched on the invariant prefix — at any
+	// wrapping depth, unlike the round-6 exact match. Anything the match misses
+	// falls through to "withheld", so a stdlib rewording fails CLOSED.
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		if strings.HasPrefix(e.Error(), locationHeaderPrefix) {
+			return transportLocationEcho
+		}
+	}
+
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return transportDeadline
+	case errors.Is(err, context.Canceled):
+		return transportCanceled
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return transportEOF
+	case errors.Is(err, http.ErrSchemeMismatch):
+		return transportSchemeMismatch
+	}
+
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		switch {
+		case dnsErr.IsNotFound:
+			return transportDNSNotFound
+		case dnsErr.IsTimeout:
+			return transportDNSTimeout
+		}
+		return transportDNS
+	}
+
+	if reason, ok := classifyTLSError(err); ok {
+		return reason
+	}
+
+	// An errno is the single most useful thing in the whole chain and its text
+	// comes from a fixed kernel table, so it is the ONE sanctioned conversion
+	// out of free text into transportReason.
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errnoReason(errno)
+	}
+
+	// A *net.OpError with no errno underneath still says what stage failed. Its
+	// Op and Net come from net's own fixed vocabulary, but a caller-supplied
+	// RoundTripper can forge one, so both are checked against an allowlist and
+	// the Addr/Source fields (the request host) are dropped.
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		if safeTransportOps[opErr.Op] && safeTransportNets[opErr.Net] {
+			return transportReason(opErr.Op + " " + opErr.Net + " failed")
+		}
+		return transportWithheld
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return transportTimeout
+	}
+
+	return transportReason(fmt.Sprintf("%s (%T)", transportWithheld, err))
+}
+
+// classifyTLSError collapses the TLS/x509 failures worth naming. The x509 types
+// all quote provider-supplied certificate fields in their Error(), so only the
+// TYPE is read.
+func classifyTLSError(err error) (transportReason, bool) {
+	var hostErr x509.HostnameError
+	if errors.As(err, &hostErr) {
+		return transportTLSHostname, true
+	}
+	var authErr x509.UnknownAuthorityError
+	if errors.As(err, &authErr) {
+		return transportTLSAuthority, true
+	}
+	var invalidErr x509.CertificateInvalidError
+	if errors.As(err, &invalidErr) {
+		return transportTLSInvalid, true
+	}
+	var verifyErr *tls.CertificateVerificationError
+	if errors.As(err, &verifyErr) {
+		return transportTLSVerify, true
+	}
+	var recErr tls.RecordHeaderError
+	if errors.As(err, &recErr) {
+		return transportTLSHandshake, true
+	}
+	return "", false
+}
+
+// errnoReason is the ONE place free text becomes a transportReason. It is sound
+// because syscall.Errno.Error() is a table lookup over the kernel's fixed error
+// list ("connection refused", "no route to host", "connection reset by peer") —
+// a closed vocabulary that cannot contain operator or provider data.
+func errnoReason(e syscall.Errno) transportReason { return transportReason(e.Error()) }
+
+// safeTransportOps / safeTransportNets are net's own vocabularies for
+// net.OpError.Op and .Net. A value outside them means the OpError did not come
+// from package net, so nothing about it is known.
+var safeTransportOps = map[string]bool{
+	"dial": true, "read": true, "write": true, "close": true, "accept": true,
+	"listen": true, "set": true, "readfrom": true, "writeto": true,
+}
+
+var safeTransportNets = map[string]bool{
+	"tcp": true, "tcp4": true, "tcp6": true, "udp": true, "udp4": true, "udp6": true,
+	"ip": true, "ip4": true, "ip6": true, "unix": true, "unixgram": true, "unixpacket": true,
+}
+
+// locationHeaderPrefix is the invariant head of net/http's Location-parse
+// failure (net/http/client.go), which quotes the raw header value.
+const locationHeaderPrefix = `failed to parse Location header `
 
 // queryEscape URL-query-escapes a value for safe insertion into a generic
 // template URL (%u/%p/%h/%i expansion).
