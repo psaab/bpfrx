@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/psaab/xpf/pkg/termsafe"
 )
 
 // rejectScopedClear returns the error for a global-only `request ... clear`
@@ -110,7 +112,10 @@ func (c *CLI) handleRequestProtocols(args []string) error {
 			return fmt.Errorf("clear OSPF: %w", err)
 		}
 		if output != "" {
-			fmt.Print(output)
+			// #6468 D2: raw vtysh stdout to the operator terminal. `clear`
+			// normally prints nothing, but the guard belongs on the print,
+			// not on an assumption about what FRR chooses to emit.
+			fmt.Print(termsafe.SanitizeBlockForDisplay(output))
 		}
 		fmt.Println("OSPF process cleared")
 		return nil
@@ -133,7 +138,8 @@ func (c *CLI) handleRequestProtocols(args []string) error {
 			return fmt.Errorf("clear BGP: %w", err)
 		}
 		if output != "" {
-			fmt.Print(output)
+			// #6468 D2: see the OSPF clear above — same guard, same reason.
+			fmt.Print(termsafe.SanitizeBlockForDisplay(output))
 		}
 		fmt.Println("BGP sessions cleared (soft reset)")
 		return nil

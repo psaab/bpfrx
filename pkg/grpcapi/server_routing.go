@@ -10,9 +10,25 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/termsafe"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+// #6468 D2: the routing show RPCs return captured `vtysh` stdout, and the
+// remote `cli` prints resp.Output VERBATIM (cmd/cli/show_protocols.go:
+// fmt.Print(resp.Output)) — the same terminal the in-process CLI writes to,
+// reached over a different transport. That stdout carries text a REMOTE PEER
+// advertised: the BGP hostname capability, IS-IS dynamic hostname TLVs, OSPF
+// router IDs. Every Output on these handlers therefore passes through
+// termsafe.SanitizeBlockForDisplay, the mirror of the fmt.Print guards in
+// pkg/cli/cli_show_routing.go.
+//
+// The guard sits on the RESPONSE, not on each vtysh branch, so a case added to
+// one of these switches later is covered by construction — the fail-open
+// direction is what left this half of the class unfixed to begin with. The
+// branches that build a structured table instead of returning raw stdout pay
+// nothing: clean text takes the sanitizer's allocation-free fast path.
 
 func (s *Server) GetRoutes(_ context.Context, _ *pb.GetRoutesRequest) (*pb.GetRoutesResponse, error) {
 	if s.routing == nil {
@@ -90,7 +106,7 @@ func (s *Server) GetOSPFStatus(_ context.Context, req *pb.GetOSPFStatusRequest) 
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
-	return &pb.GetOSPFStatusResponse{Output: output}, nil
+	return &pb.GetOSPFStatusResponse{Output: termsafe.SanitizeBlockForDisplay(output)}, nil
 }
 
 func (s *Server) GetBGPStatus(_ context.Context, req *pb.GetBGPStatusRequest) (*pb.GetBGPStatusResponse, error) {
@@ -164,7 +180,7 @@ func (s *Server) GetBGPStatus(_ context.Context, req *pb.GetBGPStatusRequest) (*
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "%v", err)
 			}
-			return &pb.GetBGPStatusResponse{Output: output}, nil
+			return &pb.GetBGPStatusResponse{Output: termsafe.SanitizeBlockForDisplay(output)}, nil
 		}
 		// "advertised-routes:<ip>" for neighbor advertised routes
 		if strings.HasPrefix(req.Type, "advertised-routes:") {
@@ -176,7 +192,7 @@ func (s *Server) GetBGPStatus(_ context.Context, req *pb.GetBGPStatusRequest) (*
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "%v", err)
 			}
-			return &pb.GetBGPStatusResponse{Output: output}, nil
+			return &pb.GetBGPStatusResponse{Output: termsafe.SanitizeBlockForDisplay(output)}, nil
 		}
 		// "neighbor" or "neighbor:<ip>" for detailed neighbor info.
 		// An empty ip selects every neighbor (legal); a non-empty ip must
@@ -193,7 +209,7 @@ func (s *Server) GetBGPStatus(_ context.Context, req *pb.GetBGPStatusRequest) (*
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "%v", err)
 			}
-			return &pb.GetBGPStatusResponse{Output: output}, nil
+			return &pb.GetBGPStatusResponse{Output: termsafe.SanitizeBlockForDisplay(output)}, nil
 		}
 		peers, err := s.frr.GetBGPSummary()
 		if err != nil {
@@ -206,7 +222,7 @@ func (s *Server) GetBGPStatus(_ context.Context, req *pb.GetBGPStatusRequest) (*
 				p.Neighbor, p.AddressFamily, p.AS, p.MsgRcvd, p.MsgSent, p.UpDown, p.State, p.PfxRcd)
 		}
 	}
-	return &pb.GetBGPStatusResponse{Output: b.String()}, nil
+	return &pb.GetBGPStatusResponse{Output: termsafe.SanitizeBlockForDisplay(b.String())}, nil
 }
 
 func (s *Server) GetRIPStatus(_ context.Context, _ *pb.GetRIPStatusRequest) (*pb.GetRIPStatusResponse, error) {
@@ -269,7 +285,7 @@ func (s *Server) GetISISStatus(_ context.Context, req *pb.GetISISStatusRequest) 
 			}
 		}
 	}
-	return &pb.GetISISStatusResponse{Output: b.String()}, nil
+	return &pb.GetISISStatusResponse{Output: termsafe.SanitizeBlockForDisplay(b.String())}, nil
 }
 
 func (s *Server) GetIPsecSA(_ context.Context, _ *pb.GetIPsecSARequest) (*pb.GetIPsecSAResponse, error) {

@@ -9,12 +9,32 @@
 // table is displayed — clipboard hijack and output spoofing (a forged "commit
 // complete" line, or a rogue lease row erased from view).
 //
+// The same class covers more than lease data. A DDNS provider's response body
+// reaches the operator through the `show services dynamic-dns` LastError column
+// (Cloudflare and Route 53 embed the provider message with %s), and captured
+// `vtysh` stdout carries text a BGP or IS-IS peer advertised — the BGP hostname
+// capability, IS-IS dynamic hostname TLVs. Anything a remote party can put
+// bytes into and an operator then reads on a terminal belongs here.
+//
+// Two entry points, chosen by the SHAPE of the value, not by its source:
+//
+//   - SanitizeForDisplay for a single-line FIELD rendered into a row the caller
+//     formats. LF and TAB are escaped along with everything else, because an
+//     embedded newline in a field is itself a forgery vector — it fakes a row.
+//   - SanitizeBlockForDisplay for a MULTI-LINE blob whose own line structure is
+//     the output (vtysh stdout). LF and TAB are preserved so the table survives;
+//     CR and the Unicode line/paragraph separators are not, because they forge
+//     or overwrite rows.
+//
 // This is a leaf package (it imports only the standard library) so BOTH the
 // in-process CLI renderer (pkg/cli) and the gRPC text renderer that feeds the
 // remote `cli`'s verbatim terminal print (pkg/grpcapi) can guard the same
-// device-originated fields with one implementation. Sanitizing happens at the
-// display boundary only: stored lease data and the gRPC/JSON structs are
-// unchanged, so machine consumers still receive the raw value. See #6468.
+// device-originated values with one implementation. Every guarded surface must
+// be applied on BOTH renderers — the remote `cli` is the more common operator
+// posture, and a fix on one alone leaves the other at pre-fix behavior.
+// Sanitizing happens at the display boundary only: stored lease data, the
+// DDNS status views, and the gRPC/JSON structs are unchanged, so machine
+// consumers still receive the raw value. See #6468.
 package termsafe
 
 import (
@@ -88,6 +108,23 @@ func SanitizeForDisplay(s string) string {
 // cursor and lets later text overwrite a line the operator has already read —
 // the same class of display forgery the ESC escaping defends against, and not
 // something a legitimate line-oriented blob needs.
+//
+// U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are escaped too, and
+// this is where the block variant deliberately diverges from SanitizeForDisplay
+// rather than inheriting its rationale. Neither is Unicode category Cc, so
+// unicode.IsControl does not catch them and the single-line sanitizer — whose
+// doc out-scopes bidi/Cf display-order spoofing — lets them through. That is
+// defensible for a single-line field, where the caller's own format string
+// bounds the row. It is NOT defensible here: the whole premise of this variant
+// is that the blob's LINE STRUCTURE is meaningful output, and terminals and
+// pagers that honor U+2028 as a break let a peer-advertised hostname forge a
+// row in exactly the table this function exists to keep honest. Escaping them
+// is the same argument that escapes CR. They render as the visible escapes
+// \u2028 / \u2029 (a \xHH byte escape cannot represent a rune above U+00FF).
+//
+// Bidi overrides and other Cf runes remain out of scope here, as in
+// SanitizeForDisplay: they can reorder characters WITHIN a line but cannot
+// forge or erase a row, so they are a different, lower-severity class.
 func SanitizeBlockForDisplay(s string) string {
 	if blockDisplaySafe(s) {
 		return s
@@ -111,14 +148,21 @@ func SanitizeBlockForDisplay(s string) string {
 			i += size
 			continue
 		}
+		if isLineSeparator(r) {
+			writeUnicodeEscape(&b, r)
+			i += size
+			continue
+		}
 		b.WriteRune(r)
 		i += size
 	}
 	return b.String()
 }
 
-// blockDisplaySafe is DisplaySafe with LF and TAB treated as printable, so a
-// clean multi-line blob keeps the allocation-free fast path.
+// blockDisplaySafe is DisplaySafe with LF and TAB treated as printable and the
+// Unicode line/paragraph separators treated as unsafe, so a clean multi-line
+// blob keeps the allocation-free fast path while a row-forging separator does
+// not slip past it.
 func blockDisplaySafe(s string) bool {
 	for i := 0; i < len(s); {
 		r, size := utf8.DecodeRuneInString(s[i:])
@@ -128,9 +172,19 @@ func blockDisplaySafe(s string) bool {
 		if r != '\n' && r != '\t' && unicode.IsControl(r) {
 			return false
 		}
+		if isLineSeparator(r) {
+			return false
+		}
 		i += size
 	}
 	return true
+}
+
+// isLineSeparator reports whether r is a Unicode line/paragraph separator —
+// category Zl/Zp, which unicode.IsControl does not cover. Only the block
+// sanitizer treats these as unsafe; see SanitizeBlockForDisplay.
+func isLineSeparator(r rune) bool {
+	return r == '\u2028' || r == '\u2029'
 }
 
 // DisplaySafe reports whether s can be printed to a terminal verbatim: it holds
@@ -155,4 +209,15 @@ func writeHexEscape(b *strings.Builder, c byte) {
 	b.WriteString(`\x`)
 	b.WriteByte(hexDigits[c>>4])
 	b.WriteByte(hexDigits[c&0x0f])
+}
+
+// writeUnicodeEscape appends a \uHHHH escape for a rune in the Basic
+// Multilingual Plane. The \xHH form writeHexEscape emits cannot represent a
+// rune above U+00FF, so the line/paragraph separators the block sanitizer
+// escapes need this wider form.
+func writeUnicodeEscape(b *strings.Builder, r rune) {
+	b.WriteString(`\u`)
+	for shift := 12; shift >= 0; shift -= 4 {
+		b.WriteByte(hexDigits[(r>>uint(shift))&0x0f])
+	}
 }

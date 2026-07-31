@@ -167,26 +167,57 @@ presenter's rendered output is byte-identical:
   when the daemon hookups are absent (test/standalone).
 - `fwdSampler` (forwarding CPU stats) can be `nil` — every show handler
   null-checks it.
-- Device-originated strings printed to the operator's terminal MUST pass
-  through `termsafe.SanitizeForDisplay` (`pkg/termsafe`, #6468). A DHCP lease
-  hostname (option 12) and client hardware address are supplied by a device on
-  a served segment and stored opaque by Kea; the DHCP-DDNS forward record name
-  is built from that same hostname. Printed raw they can smuggle terminal
+- Device- or remote-originated strings printed to the operator's terminal MUST
+  pass through `pkg/termsafe` (#6468). Printed raw they can smuggle terminal
   escape sequences (OSC 52 clipboard write, CSI erase/redraw) that the terminal
-  acts on — clipboard hijack and output spoofing. The helper backslash-escapes
+  acts on — clipboard hijack and output spoofing. Both helpers backslash-escape
   C0/DEL/C1 control bytes and invalid UTF-8 while passing legitimate multibyte
-  UTF-8 through unchanged. `show dhcp server leases` runs on BOTH the local and
-  the remote CLI, so the guard is applied on BOTH terminal-facing renderers:
-  `pkg/cli` (`show_services_dhcp.go` lease `Hostname`/`HWAddress`,
-  `show_services_ddns.go` owned-record `FQDN`) AND the gRPC text renderer that
-  feeds the remote `cli`'s verbatim `fmt.Print(resp.Output)`
-  (`pkg/grpcapi/server_show_dhcp_lldp_snmp.go`, same fields). The sanitizer
-  lives in the leaf package `pkg/termsafe` (stdlib-only) because `pkg/cli`
-  imports `pkg/grpcapi`, so a helper in `pkg/cli` could not be shared upward.
-  LLDP neighbor fields are already sanitized at the ingest boundary
-  (`lldp.sanitizeTLVString`); the DHCPv6 DUID view and the Surface A DDNS name
-  are firewall-self/operator-authored, not device-controlled, so they are left
-  raw.
+  UTF-8 through unchanged.
+
+  **Pick the variant by the SHAPE of the value, not by its source.**
+  `SanitizeForDisplay` is for a single-line FIELD the caller formats into a row:
+  it escapes LF and TAB along with everything else, because an embedded newline
+  in a field is itself a forgery vector — it fakes a table row.
+  `SanitizeBlockForDisplay` is for a MULTI-LINE blob whose own line structure is
+  the output: it PRESERVES LF and TAB so a BGP table is not collapsed into one
+  `\x0a`-laden line, and escapes CR plus U+2028/U+2029 because those forge or
+  overwrite rows rather than carry structure. Using the single-line variant on a
+  block mangles the output; using the block variant on a field re-opens the
+  row-forgery hole. The tests assert both directions.
+
+  **The guard goes on BOTH terminal-facing renderers.** Every one of these
+  commands runs on the local CLI *and* the remote `cli`, which prints
+  `resp.Output` verbatim (`cmd/cli`: `fmt.Print(resp.Output)`); a fix on one
+  renderer alone leaves the other at pre-fix behavior, and the remote `cli` is
+  the more common operator posture. Guarded surfaces:
+
+  | Value | Variant | `pkg/cli` | `pkg/grpcapi` |
+  |---|---|---|---|
+  | DHCP lease `Hostname` / `HWAddress` | field | `show_services_dhcp.go` | `server_show_dhcp_lldp_snmp.go` |
+  | DHCP-DDNS owned-record `FQDN` | field | `show_services_ddns.go` | `server_show_dhcp_lldp_snmp.go` |
+  | Surface A DDNS `LastError` (provider response body — Cloudflare / Route 53 embed it with `%s`) | field | `show_services_ddns.go` | `server_show_dhcp_lldp_snmp.go` |
+  | Raw `vtysh` stdout (BGP hostname capability, IS-IS dynamic hostname TLVs, OSPF router IDs) | block | `cli_show_routing.go` (OSPF ×4, BGP ×3, IS-IS ×3, BFD, route-map), `cli_request.go` (OSPF/BGP clear) | `server_routing.go` (OSPF/BGP/IS-IS response boundary), `server_show_routes_text.go` (BFD peers, route-map) |
+
+  On the gRPC routing handlers the guard sits on the RESPONSE rather than on
+  each vtysh branch, so a `case` added to one of those switches later is covered
+  by construction — the fail-open direction is exactly what left this class half
+  fixed after the first pass. The structured branches pay nothing: clean text
+  takes the sanitizer's allocation-free fast path.
+
+  The sanitizer lives in the leaf package `pkg/termsafe` (stdlib-only) because
+  `pkg/cli` imports `pkg/grpcapi`, so a helper in `pkg/cli` could not be shared
+  upward. Fail-on-revert guards for every call site live in
+  `cli_residual_escape_6468_test.go` / `cli_show_dhcp_escape_6468_test.go` and
+  their `pkg/grpcapi` mirrors.
+
+  Not guarded, deliberately: LLDP neighbor fields are already sanitized at the
+  ingest boundary (`lldp.sanitizeTLVString`); the DHCPv6 DUID view and the
+  Surface A DDNS *name* are firewall-self/operator-authored, not
+  device-controlled. (The Surface A `LastError` in the table above is a
+  different field on the same view — its bytes come from the provider, not from
+  us.) Sanitizing happens at the display boundary only, so machine consumers —
+  the status views, the REST `TextResponse`, the gRPC structs — still get the
+  raw value.
 - Session filters (`session_filter.go`) serve BOTH show and clear. The
   clear path must call `validate()` (unknown zone/pool names are
   command errors — an inert filter degrades into clear-nothing or, via

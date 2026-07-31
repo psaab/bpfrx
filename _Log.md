@@ -61819,3 +61819,43 @@ New `termsafe.SanitizeBlockForDisplay` preserves LF/TAB so a table is not
 collapsed — `SanitizeForDisplay` escapes those too, correctly for a
 single-line field but destructively for a block. CR is deliberately NOT
 preserved (line-overwrite forgery).
+
+## 2026-07-31 — fold the #6579 hostile-review findings (both renderers + call-site tests)
+
+- **Timestamp**: 2026-07-31
+- **Action**: The first pass fixed the vtysh class on the LOCAL CLI only. Every
+  one of those 12 sites has a byte-for-byte mirror in `pkg/grpcapi` feeding the
+  remote `cli`'s verbatim `fmt.Print(resp.Output)`, and it was left raw — the
+  more common operator posture kept exactly the pre-fix behavior. Nothing in
+  the suite noticed, because the diff had zero call-site tests.
+- **File(s)**: `pkg/grpcapi/server_routing.go`,
+  `pkg/grpcapi/server_show_routes_text.go`, `pkg/cli/cli_request.go`,
+  `pkg/termsafe/termsafe.go`, `pkg/termsafe/block_6468_test.go`,
+  `pkg/grpcapi/server_routing_escape_6468_test.go` (new),
+  `pkg/grpcapi/server_show_ddns_escape_6468_test.go` (new),
+  `pkg/cli/cli_residual_escape_6468_test.go` (new), `pkg/cli/README.md`
+
+**MAJOR-1 — gRPC mirror.** All 12 sites sanitized. On `GetOSPFStatus` /
+`GetISISStatus` / `GetBGPStatus` the guard sits on the RESPONSE rather than on
+each vtysh branch, so a later `case` is covered by construction; the structured
+branches take the allocation-free fast path. `showBFDPeers` / `showRouteMap`
+guard their `buf.WriteString`.
+
+**MAJOR-2 — call-site tests, both renderers.** 15 revert cases, each reverted
+via Edit one hunk at a time (so the `termsafe` import stays used and the RED is
+an assertion, never a build break). Every one produced an assertion failure.
+Two of them are WRONG-VARIANT reverts: swapping the block sanitizer for the
+single-line one on a vtysh site trips the line-count assertion, and swapping
+the single-line one for the block variant on `LastError` trips the `\x0a`
+assertion.
+
+**MINOR-1** — `cli_request.go` OSPF/BGP clear now sanitize their vtysh stdout.
+
+**MINOR-3** — `SanitizeBlockForDisplay` now escapes U+2028/U+2029. They are
+Zl/Zp, so `unicode.IsControl` misses them and the single-line variant's
+documented bidi/Cf out-scope let them through. That is defensible for a field
+but not for a BLOCK sanitizer whose whole premise is line structure: a terminal
+that honors U+2028 as a break lets a peer hostname forge a row in the very
+table the function protects. Same argument that escapes CR. Rendered as
+` ` (a `\xHH` escape cannot represent a rune above U+00FF);
+`blockDisplaySafe` rejects them so the fast path cannot bypass.
