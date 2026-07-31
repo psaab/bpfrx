@@ -2582,12 +2582,22 @@ character table:
    itself);
 2. the bare text re-lexes as **exactly one `TokenIdentifier` whose value is the
    text itself**, followed by `TokenEOF`;
-3. it is not a parser-level marker (`inactiveMarker`, `parser.go` — the lexer
-   cannot see this one).
+3. it is not a parser-level marker — enumerated in `parserMarkers`
+   (`parser.go`), today just `inactive:`.
 
 Because step 2 defers to the code that will actually read the config back, a
 comment syntax or lexer special case added later is covered the day it lands
 rather than the day someone remembers to update a denylist.
+
+**Step 3 is the half that cannot be derived**, and it is the one to be careful
+with. A parser marker is invisible to the lexer — `inactive:` comes back as an
+ordinary identifier — so the predicate has to be told. `parserMarkers` carries
+that contract: **teaching `parseStatement` to treat a new bare identifier
+structurally requires adding it to `parserMarkers`**, or the serializer emits
+that text unquoted and the next `Format`→`Parse` reads it back as structure.
+Each marker's semantics stay in `parseStatement`; `parserMarkers` records only
+which texts are load-bearing, since a future merge directive would not share
+`inactive:`'s deactivation behaviour.
 
 Quoting is also what makes the parser's existing marker defence work: a quoted
 `"inactive:"` arrives as a `TokenString`, and `parseStatement` already refuses
@@ -2597,21 +2607,48 @@ to treat a string token as a marker (#4348).
 (the `Lexer` does not escape), pinned by
 `TestQuoteKeyBareEmissionIsZeroAlloc6523`.
 
-Pinned by `pkg/config/quotekey_relex_6523_test.go`:
+Pinned by `pkg/config/quotekey_relex_6523_test.go`. The **binders** (each fails
+with an assertion if the predicate is reverted) are
 `TestQuoteKeyStructuralHazards6523` (each hazard in leading/inline/trailing key
-position), `TestQuoteKeyHazardsAreQuoted6523`, `TestQuoteKeySetFormHazards6523`
-(the `| display set` path), `TestQuoteKeyZoneInterfaceHazard6523` (the
-zero-interface zone end state), `TestBareKeySafeAgreesWithRoundTrip6523`, and
-`TestQuoteKeyRelexProperty6523` — a brute-force sweep over the lexer's own
-ident alphabet (all 1- and 2-byte texts, every 2-byte prefix with tails, all
-3-byte punctuation texts, each in three key positions) that re-derives the
-hazard set instead of trusting a fixed list. The over-reach guard
+position — the primary one), `TestQuoteKeyHazardsAreQuoted6523`,
+`TestQuoteKeySetFormHazards6523` (the `| display set` path — comment forms
+only; see below), `TestQuoteKeyZoneInterfaceHazard6523` (the zero-interface
+zone end state), `TestBareKeySafeAgreesWithLexer6523` (lexer-level only — see
+below), and `TestQuoteKeyRelexProperty6523`, a brute-force sweep over the
+lexer's own ident alphabet that re-derives the hazard set instead of trusting a
+fixed list. Its coverage is **every** 1- and 2-byte text over the full 74-byte
+alphabet, every 2-byte prefix followed by each of four tails, every 3-byte text
+over a 14-byte punctuation subset plus embedded/trailing punctuation pairs, and
+every registered `parserMarkers` entry — each in three key positions, ~91.8k
+round-trips. There is no exhaustive 3-byte sweep over the full alphabet.
+
+Two **guards** are green under revert by design and must stay that way:
 `TestQuoteKeyNoOverReach6523` asserts ordinary values (`10.0.0.0/24`,
-`ge-0/0/0`, `<*>`, `ascii-text`, `00:00:00`, `1024-65535`, and the near-misses
-`a//b`, `a/*b`, `*/`, `/x`, `inactive`, `inactive:x`) still emit **unquoted** —
-`/` is legitimate and common, so a predicate that rejected any value containing
-`/` would be wrong and would churn every archived config and HA config-sync
-diff.
+`ge-0/0/0`, `<*>`, `ascii-text`, `00:11:22:33:44:55`, `junos-ssh`, `00:00:00`,
+`1024-65535`, and the near-misses `a//b`, `a/*b`, `*/`, `/x`, `inactive`,
+`inactive:x`) still emit **unquoted** — `/` is legitimate and common, so a
+predicate that rejected any value containing `/` would be wrong and would churn
+every archived config and HA config-sync diff — and
+`TestQuoteKeyBareEmissionIsZeroAlloc6523` is a performance guard (it also fails
+under `-gcflags=all=-l`, which disables the escape analysis the zero depends
+on; the default build and `-race` both report 0).
+
+`TestParserMarkerVocabulary6523` gates the `parserMarkers` contract over the
+realistic vocabulary of word-shaped markers (`replace:`, `protect:`,
+`delete:`, …): each candidate must either be registered and quoted, or still
+round-trip as an ordinary key. A parser change that promotes one of those words
+without registering it fails the second leg. This is the anti-rot device for
+step 3, and its scope is that enumerated vocabulary — the alphabet sweep cannot
+cover it, because its candidates are short and punctuation-shaped, not words.
+
+Two scope caveats worth knowing before trusting a green run. The set-form
+`inactive:` case in `TestQuoteKeySetFormHazards6523` is a **consistency** case,
+not a binder: `ParseSetVerb` reads a structural verb from the first token only,
+so a later `inactive:` is appended to the path literally and even unquoted
+output round-trips in set form. Only the comment forms bite there. And
+`TestBareKeySafeAgreesWithLexer6523` asserts a **lexer-level** property, so its
+`inactive:` case is likewise green under revert — the marker bites one layer
+up, at the parser, where `TestQuoteKeyStructuralHazards6523` covers it.
 
 ### `firewall ... from flexible-match-range` — at most ONE range per term (#5823)
 

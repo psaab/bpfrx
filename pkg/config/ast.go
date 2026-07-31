@@ -127,6 +127,12 @@ func quoteKey(s string) string {
 // case added later is covered the day it lands — not the day someone
 // remembers to update a denylist here.
 //
+// That derivation reaches LEXER-level hazards only. A PARSER-level marker is
+// invisible to the lexer (it hands `inactive:` back as an ordinary
+// identifier), so that half stays enumerated — parserMarkers in parser.go,
+// which carries the obligation to extend it, gated by
+// TestParserMarkerVocabulary6523.
+//
 // The isIdentChar scan is retained as a NECESSARY pre-condition, not as the
 // decision. It keeps the change monotone (output only ever gains quotes, never
 // loses them): the lexer round-trip alone would newly emit a bracketed IPv6
@@ -157,10 +163,17 @@ func bareKeySafe(s string) bool {
 		return false
 	}
 	// Parser authority: a handful of bare identifiers carry structural meaning
-	// to the PARSER, which the lexer cannot see. `inactive:` is the only one
-	// (parser.go); quoting it makes the re-parsed token a TokenString, which
-	// parseStatement already refuses to treat as a marker (#4348).
-	return s != inactiveMarker
+	// to the PARSER, which the lexer cannot see, so they cannot be derived the
+	// way step 2 derives comment syntax — they are enumerated in parserMarkers
+	// (parser.go), today just `inactive:`. Quoting one makes the re-parsed
+	// token a TokenString, which parseStatement already refuses to treat as a
+	// marker (#4348).
+	for _, marker := range parserMarkers {
+		if s == marker {
+			return false
+		}
+	}
+	return true
 }
 
 // FindChild returns the first child whose first key matches name.

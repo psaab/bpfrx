@@ -80,31 +80,6 @@ var roundTripValues = []struct {
 	{"inactive-marker-value", "inactive:"},
 }
 
-// bareKeyValues are values that MUST keep being emitted WITHOUT quotes. The
-// #6523 predicate tightened what may go bare, and over-quoting is its own
-// regression: it would churn every archived config and every HA config-sync
-// diff for values that were never at risk. Note that `/` is legitimate and
-// common here (prefixes, interface names, wildcards) — a predicate that
-// rejected any value containing `/` would be wrong, and this slice is what
-// catches it.
-var bareKeyValues = []string{
-	// Structural keys.
-	"security", "zones", "security-zone", "pre-shared-key", "ascii-text",
-	// Prefixes and addresses — `/` mid-value.
-	"10.0.0.0/24", "192.168.1.1", "2001:db8::1", "2001:db8::/32", "::/0",
-	// Interface names — `/` and `-`.
-	"ge-0/0/0", "ge-0/0/0.100", "reth0.50", "xe-1/0/0:3", "fxp0",
-	// Wildcards and group syntax — `*`, `<`, `>`.
-	"*", "<*>", "<ge-*>", "any", "any-ipv4",
-	// Times, ranges, numbers, percentages, equals — the rest of isIdentChar.
-	"00:00:00", "1024-65535", "3600", "50%", "a=b", "a,b",
-	// `/` and `*` present but NOT as a leading comment introducer. `/` alone
-	// and `/x` are safe: the introducer needs `/` followed by `/` or `*`.
-	"a//b", "a/*b", "a*/b", "*/", "*/x", "x//", "/x", "/", "/-", "/0",
-	// Near-misses on the parser marker: only the exact text is a marker.
-	"inactive", "inactive::", ":inactive:", "Inactive:", "inactive:x",
-}
-
 // leafValueTree wraps a value as the trailing key of a single hierarchical
 // leaf, mirroring how a real config value (e.g. an IKE pre-shared-key) is
 // stored in the AST.

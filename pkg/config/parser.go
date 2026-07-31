@@ -272,6 +272,26 @@ func (p *Parser) skipToBlockClose() {
 // marker checks on the parallel token-kind slice from parseKeys (#4348).
 const inactiveMarker = "inactive:"
 
+// parserMarkers enumerates every bare identifier this parser interprets as
+// STRUCTURE rather than as a key. It exists because such a marker is invisible
+// to the lexer — it hands the text back as an ordinary identifier — so
+// bareKeySafe (ast.go), which otherwise defers to the lexer, cannot discover
+// one by re-lexing and must be told (#6523).
+//
+// CONTRACT: teaching parseStatement to treat a new bare identifier
+// structurally REQUIRES adding it here, or the serializer will emit that text
+// unquoted and the next Format→Parse will read it back as structure instead of
+// as the key it was. Each marker's SEMANTICS stay in parseStatement — this is a
+// registry of which texts are load-bearing, not of what they do, because a
+// future merge directive would not share `inactive:`'s deactivation behaviour.
+//
+// TestParserMarkerVocabulary6523 gates the obligation over the realistic
+// marker vocabulary: for each candidate word it asserts EITHER that the
+// candidate is listed here and gets quoted, OR that the parser still treats it
+// as an ordinary key. A parser change that promotes one of those words without
+// updating this slice fails the second leg.
+var parserMarkers = []string{inactiveMarker}
+
 // parseStatement parses one statement: keys followed by ; or { block }.
 // A leading `inactive:` marker is stripped from the keys and recorded on
 // the returned Node so the statement's real identity (Keys) is unchanged

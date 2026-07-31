@@ -61651,18 +61651,70 @@ would never produce.
   `bareKeySafe`: all-identChars (retained so the change is monotone —
   output only gains quotes, never loses them) AND the text must re-lex
   through the REAL lexer as exactly one identifier equal to itself
-  followed by EOF, AND must not be `inactiveMarker`. Deferring to the
-  lexer means a comment syntax added later is covered the day it lands.
+  followed by EOF, AND must not be a registered `parserMarkers` entry.
+  Deferring to the lexer means a comment syntax or lexer special case
+  added later is covered the day it lands; the PARSER-marker half
+  cannot be derived that way (the lexer hands `inactive:` back as an
+  ordinary identifier) and stays enumerated — see the hardening below.
   Allocation-free (the Lexer does not escape; pinned by a zero-alloc
-  test). Independently re-derived the hazard set by brute force rather
-  than trusting the issue: exhaustive 1-3 byte sweep over the full
-  74-byte ident alphabet plus a 5-byte punctuation sweep found 0 hazards
-  beyond leading `//`, leading `/*`, and exactly `inactive:`. Also
-  covered the `| display set` serializer (joinQuotedKeys ->
-  ParseSetVerb), which drives the same lexer. Fail-on-revert: all 9
-  tests go RED with assertions. Full pkg/config + pkg/configstore
-  suites green.
-- **File(s)**: pkg/config/ast.go, pkg/config/freetext.go,
-    pkg/config/quotekey_relex_6523_test.go,
+  test). Note `/*x` is the ONE hazard that is not silent: the lexer
+  returns TokenError ("unterminated block comment"), so Parse errors
+  rather than mis-reading. The other three (`//x`, `/*x*/`,
+  `inactive:`) produce zero parse errors, which is what makes them
+  dangerous. Also covered the `| display set` serializer
+  (joinQuotedKeys -> ParseSetVerb), which drives the same lexer.
+  Independently re-derived the hazard set by brute force rather than
+  trusting the issue, and found 0 hazards beyond leading `//`, leading
+  `/*`, and exactly `inactive:`. Sweep coverage, precisely: EVERY 1- and
+  2-byte text over the full 74-byte ident alphabet (so every possible
+  two-byte introducer, exhaustively); every 2-byte alphabet prefix
+  followed by each of four tails (`abc`, `*/`, `x*/y`, `inactive:`) —
+  exhaustive in the prefix, NOT in the resulting length; every 3-byte
+  text over a 14-byte PUNCTUATION subset (not the full alphabet), plus
+  each punctuation pair embedded mid-value and at the tail; and every
+  registered parserMarkers entry. Each candidate in three key positions
+  = 91,773 round-trips. There is no exhaustive 3-byte sweep over the
+  full alphabet and no 5-byte punctuation sweep.
+  Fail-on-revert audit (bareKeySafe reverted to the all-identChars scan
+  via edit; `go vet` clean on the reverted tree, so every RED below is
+  an ASSERTION, not a build break). 9 BINDERS go RED:
+  TestQuoteKeyStructuralHazards6523 (24/24 subtests),
+  TestQuoteKeyHazardsAreQuoted6523 (8/8),
+  TestQuoteKeyZoneInterfaceHazard6523 (4/4),
+  TestQuoteKeyRelexProperty6523, TestFormatParseRoundTrip3854 (4/4 new
+  values), TestFormatParseIdempotent3854 (4/4 new), and three that bind
+  PARTIALLY — TestQuoteKeySetFormHazards6523 (7/8: the `inactive:`
+  subtest PASSES on revert, because ParseSetVerb recognizes a
+  structural verb in the FIRST token only, so a later `inactive:` is
+  appended to the path literally and even the old bare output
+  round-trips in set form — only the comment forms bite there; it is
+  asserted anyway so both serializers agree on what gets quoted),
+  TestBareKeySafeAgreesWithLexer6523 (7/… : same `inactive:`
+  exception, because that test's assertion is LEXER-level and the
+  marker bites at the PARSER — renamed from …AgreesWithRoundTrip6523,
+  which claimed a round-trip it never performed), and
+  TestQuoteKeyLexerSymmetry3854 (3/4 new values, same reason).
+  TestParserMarkerVocabulary6523 binds on its registered-marker leg
+  (`inactive:` RED on revert) and guards on the other 17.
+  2 tests are GUARDS and correctly stay GREEN under revert:
+  TestQuoteKeyNoOverReach6523 (over-reach — it must stay green, since
+  the pre-fix predicate also emitted those bare; it catches the
+  opposite regression) and TestQuoteKeyBareEmissionIsZeroAlloc6523
+  (performance; also escape-analysis dependent — reports 41 allocs and
+  FAILS under `-gcflags=all=-l`, passes on the default build and under
+  `-race`).
+  Hardened the one obligation the lexer cannot derive: promoted the
+  marker to a package-level `parserMarkers` registry (parser.go) that
+  bareKeySafe and the sweep both enumerate, and added
+  TestParserMarkerVocabulary6523 over the realistic word-shaped marker
+  vocabulary (`replace:`, `protect:`, `delete:`, `rename:`, …): each
+  candidate must EITHER be registered and quoted, OR still round-trip
+  as an ordinary key. Verified the gate both fires and is satisfiable —
+  teaching parseStatement to treat `replace:` structurally without
+  registering it fails with `"replace:" at inline position corrupted
+  … add it to parserMarkers`; adding it to parserMarkers turns both
+  legs green. Full pkg/config + pkg/configstore suites green.
+- **File(s)**: pkg/config/ast.go, pkg/config/parser.go,
+    pkg/config/freetext.go, pkg/config/quotekey_relex_6523_test.go,
     pkg/config/quotekey_roundtrip_3854_test.go,
     docs/config-schema.md, _Log.md

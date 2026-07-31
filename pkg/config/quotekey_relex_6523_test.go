@@ -18,10 +18,19 @@ package config
 // Every serialize-then-reparse path is affected: HA config sync, rollback,
 // archive, rescue. This file pins the fix at three levels — the predicate
 // itself, the hierarchical Format->Parse path, and the `| display set`
-// Format->ParseSetVerb path — plus an over-reach guard (ordinary values must
-// keep emitting bare) and a brute-force property sweep that re-derives the
-// hazard set from the real lexer so a comment syntax added later cannot
-// quietly reopen the hole.
+// Format->ParseSetVerb path — plus two anti-rot devices: a brute-force
+// property sweep that re-derives the hazard set from the real lexer, so a
+// comment syntax added later cannot quietly reopen the hole, and
+// TestParserMarkerVocabulary6523, which covers the half the lexer cannot
+// derive (a word-shaped parser marker).
+//
+// Not every test here is a fail-on-revert BINDER, and the ones that are not
+// say so in their own doc comment. TestQuoteKeyNoOverReach6523 and
+// TestQuoteKeyBareEmissionIsZeroAlloc6523 are GUARDS — green under revert by
+// design. TestQuoteKeySetFormHazards6523 and TestBareKeySafeAgreesWithLexer6523
+// bind only PARTIALLY: their `inactive:` cases pass under revert, because that
+// hazard bites at the PARSER and those two assertions stop short of it. The
+// parse-level binder for `inactive:` is TestQuoteKeyStructuralHazards6523.
 
 import (
 	"fmt"
@@ -142,8 +151,13 @@ func TestQuoteKeyHazardsAreQuoted6523(t *testing.T) {
 	}
 }
 
-// TestQuoteKeyNoOverReach6523 is the over-reach guard. Tightening the
-// predicate must not start quoting values that were never at risk: doing so
+// TestQuoteKeyNoOverReach6523 is the over-reach GUARD. It is deliberately not
+// a fail-on-revert binder: it stays GREEN under a revert of bareKeySafe, which
+// is exactly what an over-reach guard must do, because the pre-#6523 predicate
+// also emitted all of these bare. What it catches is the opposite regression —
+// a predicate tightened too far.
+//
+// Tightening must not start quoting values that were never at risk: doing so
 // would churn every archived config and every HA config-sync diff, and would
 // show up as spurious noise in `show | compare`.
 //
@@ -174,8 +188,17 @@ func TestQuoteKeyNoOverReach6523(t *testing.T) {
 // TestQuoteKeySetFormHazards6523 covers the second serializer. `show
 // configuration | display set` renders through joinQuotedKeys (ast_format.go)
 // and is replayed through ParseSetVerb, which drives the same Lexer — so the
-// same three texts are re-read as comments or markers there too. configstore
-// LoadSet / LoadMerge replay this form.
+// COMMENT forms are re-read as comments there too. configstore LoadSet /
+// LoadMerge replay this form.
+//
+// The `inactive:` subtest is a consistency case, not a binder: it stays GREEN
+// under a revert of bareKeySafe. ParseSetVerb reads a structural verb from the
+// FIRST token only (parser.go); a later `inactive:` identifier is appended to
+// the path literally, so even the old bare output round-trips in set form. It
+// is asserted anyway because both serializers must agree on what gets quoted —
+// a text quoted in hierarchical output and bare in set output would make `show
+// | compare` and `| display set` disagree about the same tree. The parse-level
+// binder for `inactive:` is TestQuoteKeyStructuralHazards6523.
 func TestQuoteKeySetFormHazards6523(t *testing.T) {
 	for _, hz := range structuralHazards {
 		t.Run(hz.name, func(t *testing.T) {
@@ -249,6 +272,110 @@ func TestQuoteKeyZoneInterfaceHazard6523(t *testing.T) {
 	}
 }
 
+// parserMarkerCandidates is the realistic vocabulary of WORD-shaped texts a
+// future parser might promote to a structural marker: the Junos configuration
+// verbs and edit directives, plus `inactive:`'s obvious siblings. Every entry
+// is made entirely of isIdentChar bytes, so each one is emitted bare today.
+var parserMarkerCandidates = []string{
+	inactiveMarker,
+	"active:", "replace:", "protect:", "unprotect:", "delete:", "rename:",
+	"insert:", "annotate:", "deactivate:", "activate:", "apply:", "set:",
+	"copy:", "edit:", "update:", "load:", "merge:", "override:",
+}
+
+// TestParserMarkerVocabulary6523 gates the one obligation bareKeySafe cannot
+// derive from the lexer. A parser-level marker is handed back by the lexer as
+// an ordinary identifier, so the predicate has to be TOLD about it
+// (parserMarkers, parser.go) — and the sweep in
+// TestQuoteKeyRelexProperty6523 cannot discover an unregistered one either,
+// because its candidates are short and punctuation-shaped, not words.
+//
+// For each candidate word this asserts exactly one of two things holds:
+//
+//   - it IS registered in parserMarkers -> quoteKey must quote it, and the
+//     quoted form must survive Format->Parse in every key position. (A binder:
+//     the `inactive:` leg goes RED on a revert of bareKeySafe.)
+//   - it is NOT registered -> the parser must still treat it as an ordinary
+//     key, i.e. bare emission round-trips unchanged. (A guard: green today,
+//     green under revert.)
+//
+// The point is the pairing. If a future parseStatement change gives one of
+// these words structural meaning and nobody adds it to parserMarkers, the
+// second leg goes RED — the word stops round-tripping as an ordinary key.
+// That is the anti-rot device for the marker half of the predicate, and its
+// scope is exactly this list: a marker outside this vocabulary is still
+// caught only by whoever honours the parserMarkers contract.
+func TestParserMarkerVocabulary6523(t *testing.T) {
+	registered := make(map[string]bool, len(parserMarkers))
+	for _, m := range parserMarkers {
+		registered[m] = true
+	}
+
+	for _, cand := range parserMarkerCandidates {
+		t.Run(cand, func(t *testing.T) {
+			emitted := quoteKey(cand)
+			if registered[cand] && emitted == cand {
+				t.Fatalf("quoteKey(%q) = %s — a registered parser marker MUST be "+
+					"quoted, or the next Parse reads it back as structure", cand, emitted)
+			}
+			if !registered[cand] && emitted != cand {
+				t.Fatalf("quoteKey(%q) = %s — %q is not in parserMarkers, so quoting "+
+					"it is over-reach", cand, emitted, cand)
+			}
+			// Whichever branch applied, the text must survive Format->Parse as
+			// exactly this key. For an UNREGISTERED candidate this is the
+			// gate: it goes RED if the parser starts treating the word
+			// structurally without parserMarkers being extended.
+			for _, shape := range hazardKeyShapes {
+				want := shape.keys(cand)
+				got, inactive, err := formatParseKeys(want)
+				if err != nil {
+					t.Fatalf("%q at %s position did not round-trip: %v", cand, shape.name, err)
+				}
+				if inactive {
+					t.Fatalf("%q at %s position set Node.Inactive — the parser now treats "+
+						"it as a marker; add it to parserMarkers (parser.go)", cand, shape.name)
+				}
+				if len(got) != len(want) || got[shape.idx] != cand {
+					t.Fatalf("%q at %s position corrupted: want %q, got %q — if the parser "+
+						"now treats it structurally, add it to parserMarkers (parser.go)",
+						cand, shape.name, want, got)
+				}
+			}
+		})
+	}
+}
+
+// bareKeyValues are values that MUST keep being emitted WITHOUT quotes. The
+// #6523 predicate tightened what may go bare, and over-quoting is its own
+// regression: it would churn every archived config and every HA config-sync
+// diff for values that were never at risk. Note that `/` is legitimate and
+// common here (prefixes, interface names, wildcards) — a predicate that
+// rejected any value containing `/` would be wrong, and this slice is what
+// catches it.
+var bareKeyValues = []string{
+	// Structural keys.
+	"security", "zones", "security-zone", "pre-shared-key", "ascii-text",
+	// Prefixes and addresses — `/` mid-value.
+	"10.0.0.0/24", "192.168.1.1", "2001:db8::1", "2001:db8::/32", "::/0",
+	// Interface names — `/` and `-`.
+	"ge-0/0/0", "ge-0/0/0.100", "reth0.50", "xe-1/0/0:3", "fxp0",
+	// MAC addresses — all-`:`, the same byte that makes `inactive:` a marker.
+	"00:11:22:33:44:55", "02:bf:72:00:00:01",
+	// Application and policy names — the operand of the `permit junos-http`
+	// widening this issue demonstrated.
+	"junos-http", "junos-ssh", "my-app", "allow-trust-to-untrust",
+	// Wildcards and group syntax — `*`, `<`, `>`.
+	"*", "<*>", "<ge-*>", "any", "any-ipv4",
+	// Times, ranges, numbers, percentages, equals — the rest of isIdentChar.
+	"00:00:00", "1024-65535", "3600", "50%", "a=b", "a,b",
+	// `/` and `*` present but NOT as a leading comment introducer. `/` alone
+	// and `/x` are safe: the introducer needs `/` followed by `/` or `*`.
+	"a//b", "a/*b", "a*/b", "*/", "*/x", "x//", "/x", "/", "/-", "/0",
+	// Near-misses on the parser marker: only the exact text is a marker.
+	"inactive", "inactive::", ":inactive:", "Inactive:", "inactive:x",
+}
+
 // relexAlphabet is every byte the lexer accepts inside a bare identifier —
 // read from isIdentChar itself, so it tracks the lexer rather than a copy.
 var relexAlphabet = func() []byte {
@@ -271,14 +398,31 @@ var relexPunctuation = []byte{'%', '*', '+', ',', '-', '.', '/', ':', '<', '=', 
 // alphabet and asserts the round-trip invariant for every candidate: whatever
 // quoteKey emits must read back as exactly the key it was given.
 //
-// A comment syntax, an ident-char addition, or a new parser marker introduced
-// later reopens this hole the moment it lands, and this sweep goes RED then —
-// not when someone remembers to extend a denylist.
+// SCOPE — what this does and does not catch. A comment syntax or an ident-char
+// addition is punctuation-shaped and short, so the sweep below sees it the
+// moment it lands and goes RED. A WORD-shaped parser marker (a future
+// `replace:` / `protect:`) is NOT in the swept space and would not be caught
+// here; that obligation lives on parserMarkers (parser.go) and is gated
+// separately by TestParserMarkerVocabulary6523. The parserMarkers leg below
+// only asserts that the markers already registered survive — it cannot
+// discover an unregistered one.
 //
-// Coverage: all 1- and 2-byte texts over the full alphabet (every possible
-// two-byte introducer), every 2-byte prefix followed by a tail (introducers
-// that need trailing text to bite), and all 3-byte texts over the punctuation
-// subset. Each candidate is checked in all three key positions.
+// Coverage, exactly:
+//
+//   - every 1-byte and every 2-byte text over the full ident alphabet — i.e.
+//     every possible two-byte introducer, exhaustively;
+//   - every 2-byte alphabet prefix followed by each of four tails (`abc`,
+//     `*/`, `x*/y`, `inactive:`), for introducers that need trailing text to
+//     bite. Exhaustive in the 2-byte prefix, NOT in the resulting length;
+//   - every 3-byte text over the 14-byte punctuation subset (structural
+//     meaning only ever comes from punctuation), plus each punctuation pair
+//     embedded mid-value (`abc??def`) and at the tail (`abcd??`), which must
+//     NOT trigger;
+//   - every registered parserMarkers entry at full length.
+//
+// There is no exhaustive 3-byte sweep over the FULL alphabet and no 5-byte
+// punctuation sweep. Each candidate is checked in all three key positions;
+// the total round-trip count is logged.
 func TestQuoteKeyRelexProperty6523(t *testing.T) {
 	checked := 0
 	check := func(t *testing.T, v string) {
@@ -330,15 +474,32 @@ func TestQuoteKeyRelexProperty6523(t *testing.T) {
 			}
 		}
 	}
-	t.Logf("swept %d round-trips over %d ident bytes", checked, len(relexAlphabet))
+	// Every registered parser marker at full length. The sweep's own candidates
+	// never reach `inactive:` unprefixed (the marker only appears there as a
+	// TAIL after two alphabet bytes), so without this leg a marker added to
+	// parserMarkers would be swept only in prefixed form.
+	for _, m := range parserMarkers {
+		check(t, m)
+	}
+	t.Logf("swept %d round-trips over %d ident bytes and %d parser markers",
+		checked, len(relexAlphabet), len(parserMarkers))
 }
 
-// TestBareKeySafeAgreesWithRoundTrip6523 asserts the predicate is not merely
-// sufficient but honest: every text bareKeySafe accepts must round-trip when
-// emitted bare, and every text it rejects must round-trip when emitted quoted.
-// This is what keeps a future "optimization" from widening the predicate
-// without widening what actually survives a re-parse.
-func TestBareKeySafeAgreesWithRoundTrip6523(t *testing.T) {
+// TestBareKeySafeAgreesWithLexer6523 asserts two things about the predicate:
+// that it agrees with quoteKey (accepting a text iff quoteKey emits it bare),
+// and that whatever quoteKey emitted re-LEXES back to exactly that text. This
+// is what keeps a future "optimization" from widening the predicate without
+// widening what actually survives a re-lex.
+//
+// The assertion is LEXER-level, which is why this test is not named for a
+// round-trip: its `inactive:` case stays GREEN under a revert of bareKeySafe,
+// because bare `inactive:` lexes to an identifier equal to itself — the marker
+// bites at the PARSER, one layer up, where this test does not look.
+// Format→Parse coverage for the same corpus already exists and is where that
+// case binds: TestQuoteKeyStructuralHazards6523 (the hazards) and
+// TestQuoteKeyNoOverReach6523 (bareKeyValues) both run formatParseKeys over
+// it, so a parse leg here would duplicate rather than add.
+func TestBareKeySafeAgreesWithLexer6523(t *testing.T) {
 	cases := []string{}
 	for _, hz := range structuralHazards {
 		cases = append(cases, hz.value)
@@ -375,6 +536,16 @@ func TestBareKeySafeAgreesWithRoundTrip6523(t *testing.T) {
 // candidate configuration on each commit, archive, rollback slot write and HA
 // config sync. Asking the real lexer is only affordable because the Lexer does
 // not escape; this fails if a future edit makes it allocate.
+//
+// This is a PERFORMANCE guard, not a correctness binder: it stays GREEN under
+// a revert of bareKeySafe to the old identifier scan (that predicate does not
+// allocate either).
+//
+// It is also escape-analysis dependent by construction — the zero comes from
+// the Lexer being stack-allocated. Under `-gcflags=all=-l` (inlining off) it
+// reports 41 allocs, one NewLexer per bareKeyValues entry, and FAILS. That is
+// the disabled optimizer, not a regression: the default build and `-race` both
+// report 0, and neither CI nor `make test` passes `-l`.
 func TestQuoteKeyBareEmissionIsZeroAlloc6523(t *testing.T) {
 	avg := testing.AllocsPerRun(1000, func() {
 		for _, v := range bareKeyValues {
