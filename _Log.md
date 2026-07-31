@@ -62122,3 +62122,54 @@ break — `go vet` confirmed passing under every revert.
   22.7 Gbps) and needs no re-run for a comment-only change.
 - **File(s)**: pkg/cluster/{election.go,ifmon_weight_daemon_apply_6549_test.go},
     pkg/routing/monitor.go, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #2387 — land the VRF session-identity decision record on master,
+  correct the shipped README's superseded "HA wire bump" cost claim, and add a
+  guard binding both to the code they describe.
+  `userspace-dp/src/afxdp/forwarding/README.md` documents the #2387
+  single-forwarding-domain session-identity limitation and cites
+  `docs/research/2387-vrf-flow-identity/plan.md` as the decision record for the
+  deferred real fix. That plan lived ONLY on the unmerged
+  `research/2387-vrf-flow-identity` branch, so the shipped citation dangled —
+  the exact failure `pkg/api/zone_counter_doc_ref_test.go` was written to
+  prevent after it happened once for #3643.
+  Landed the plan plus its six reviewer files, and added a v5 §0 addendum
+  recording three first-hand findings that change the deferral calculus:
+  (0a) plan §4d is WRONG that Track B needs an HA wire break — §4d is right
+  that the wire KEY block is fixed-width, but the routing-domain does not have
+  to live there. It rides as a length-gated trailing VALUE field exactly like
+  #2170 Generation / #3301 AppTimeout+PolicyCounterIdx / #4565 Nat64SnatV4 /
+  #5274 ConfigEpoch / #5212 RTFlowSessionID, and the repo states the rule at
+  sync_protocol.go:930 ("does NOT bump SessionSyncWireVersion"); interning
+  domain 0 = the default routing-instance makes a legacy peer's omitted field
+  decode to the default VRF, so CurrentHAProtocolVersion never moves and the
+  #1930 mixed-base ISSU gate is never tripped. This was plan §11 Q5, called
+  there "the single biggest lever on B-min's cost".
+  (0b) "decline the cross-domain hit and fall through to the session-miss path"
+  is NOT a viable cheap middle: install_with_protocol_with_origin opens with an
+  unconditional remove_entry(&key) (session/install.rs:139), so two colliding
+  flows would evict each other per packet (per-packet SNAT re-allocation breaks
+  both). Only DENY (fail-closed drop) and ISOLATE (widened identity) are
+  coherent end-states.
+  (0c) corner inventory the plan lacked: GRE decap is SAFE (gre.rs:760 rebinds
+  the inner ingress_ifindex to the tunnel logical ifindex, so a decapped flow's
+  domain is stable); fabric ingress needs an explicit exemption; the §7
+  inter-VRF route-leaked corner is CHEAP if the ingress+egress domain live in
+  SessionMetadata (which already stores and swaps the zone pair) rather than in
+  the key.
+  Also recorded that Track A is COMPLETE (A.1 #4327, A.2 42bc6bc88, A.3 docs),
+  so the conntrack table is now the SOLE collision surface, and narrowed the
+  open maintainer question from "is overlapping-subnet VRF in scope" to the
+  single binary DENY-vs-ISOLATE choice.
+  No dataplane behaviour change — the #2387 bug itself is untouched and the
+  issue stays open pending that call.
+  Validation: new `userspace-dp/tests/vrf_session_identity_doc_guard.rs` (2
+  tests) green under `cargo test --release`; RED-on-revert proven by mutation in
+  a throwaway detached worktree (see review notes) with the crate still building
+  clean; `cargo fmt --check` and `cargo clippy` clean on the touched test.
+- **File(s)**: docs/research/2387-vrf-flow-identity/{plan.md,agy-plan-r1.md,
+    agy-plan-r2.md,claude-smr-plan-r1.md,claude-smr-plan-r2.md,codex-plan-r1.md,
+    codex-plan-r2.md,reviewer-ids.md},
+    userspace-dp/src/afxdp/forwarding/README.md,
+    userspace-dp/tests/vrf_session_identity_doc_guard.rs, _Log.md
