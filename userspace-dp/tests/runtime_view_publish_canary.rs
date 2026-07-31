@@ -220,7 +220,7 @@ fn mask_non_code(content: &str) -> String {
                     }
                 }
             }
-            b'r' | b'b' if raw_string_open(b, i).is_some() => {
+            b'r' | b'b' | b'c' if raw_string_open(b, i).is_some() => {
                 let (quote, hashes) = raw_string_open(b, i).expect("just checked");
                 i = quote + 1;
                 while i < n {
@@ -275,14 +275,24 @@ fn mask_non_code(content: &str) -> String {
 }
 
 /// If a raw string literal opens at `at`, its opening quote offset and hash
-/// count. Handles `r"..."`, `r#"..."#` and the `br` byte-string forms.
+/// count.
+///
+/// Covers every raw form in the language: `r"..."` / `r#"..."#` / `r##"..."##`,
+/// the byte-string `br` forms, and the C-string `cr` forms. The `cr` prefix was
+/// MISSING and a hostile review used exactly that: `cr#""{"#` desynchronised
+/// brace tracking, `production_half` then returned the following production
+/// function as elided NULs, and its `shared_runtime.load()` became invisible to
+/// rule 3. The prefix set is now enumerated from the grammar rather than from
+/// the shapes that happened to appear in this tree — see `LITERAL_SHAPES` in
+/// the self-tests for the full matrix and for what is deliberately not covered.
 fn raw_string_open(b: &[u8], at: usize) -> Option<(usize, usize)> {
     // Must be the start of a token, or this is the `r` in `for`.
     if at > 0 && (b[at - 1].is_ascii_alphanumeric() || b[at - 1] == b'_') {
         return None;
     }
     let mut k = at;
-    if b[k] == b'b' {
+    // `b` (byte string) or `c` (C string) may prefix the `r`.
+    if b[k] == b'b' || b[k] == b'c' {
         k += 1;
     }
     if k >= b.len() || b[k] != b'r' {
@@ -413,12 +423,21 @@ fn attributed_item_end(masked: &[u8], at: usize) -> usize {
     while i < n {
         match masked[i] {
             b'{' => {
+                // Only a brace at `aux == 0` can be the ITEM's own body. A brace
+                // inside `()`/`[]` belongs to a macro argument, an array, or a
+                // struct literal in a call — counting it as the body is how a
+                // hostile review got `#[cfg(test)] swallow!({} #[cfg(test)]
+                // garbage);` to "end" at its inner `{}`, leaving the trailing
+                // attribute-shaped tokens to be read as top level and eliding
+                // the production function after them.
+                if aux == 0 {
+                    saw_brace = true;
+                }
                 brace += 1;
-                saw_brace = true;
             }
             b'}' => {
                 brace -= 1;
-                if saw_brace && brace == 0 {
+                if saw_brace && brace == 0 && aux == 0 {
                     let mut k = i + 1;
                     while k < n && masked[k].is_ascii_whitespace() {
                         k += 1;
@@ -737,6 +756,216 @@ fn runtime_view_publish_and_read_sites_are_pinned() {
 #[cfg(test)]
 mod self_tests {
     use super::*;
+
+    /// Every token shape in Rust's literal/comment grammar that can legally
+    /// contain an unbalanced `{`, as `(name, token, why it matters)`.
+    ///
+    /// The masking pass exists so brace tracking cannot be desynchronised by a
+    /// brace that is not code. This table is the grammar-derived enumeration of
+    /// what that means, replacing the previous approach of extending the pass
+    /// one shape at a time as reviews found them — which failed twice: first on
+    /// a rustfmt-wrapped chain, then on `cr#""{"#`, the raw C string.
+    ///
+    /// Each entry is exercised by `every_literal_shape_that_can_hide_a_brace`
+    /// below, and each has been verified by MUTATION: with that shape's
+    /// handling removed from `mask_non_code`, its row — and only its row —
+    /// turns RED. See the matrix in the PR description.
+    const LITERAL_SHAPES: &[(&str, &str, &str)] = &[
+        ("line comment", "// {", "`//` runs to end of line"),
+        ("block comment", "/* { */", "`/* */` spans lines"),
+        (
+            "nested block comment",
+            "/* /* */ { */",
+            "Rust block comments NEST, unlike C. The brace sits after the INNER \
+             close on purpose: with the brace before it, a non-nesting masker \
+             still covers the brace by accident and the row cannot fail.",
+        ),
+        ("char literal", "let _ = '{';", "a brace as a char value"),
+        (
+            "char escape with braces",
+            r"let _ = '\u{7b}';",
+            "the unicode escape form itself contains braces",
+        ),
+        ("byte char literal", "let _ = b'{';", "`b'..'` byte form"),
+        ("string", "let _ = \"{\";", "the ordinary form"),
+        (
+            "string with escaped quote",
+            "let _ = \"\\\"{\";",
+            "an escaped quote must not end the literal early",
+        ),
+        ("byte string", "let _ = b\"{\";", "`b\"..\"`"),
+        ("C string", "let _ = c\"{\";", "`c\"..\"`, Rust 1.77+"),
+        ("raw string", "let _ = r\"{\";", "no escapes, no hashes"),
+        ("raw string, 1 hash", "let _ = r#\"{\"#;", "`r#\"..\"#`"),
+        (
+            "raw string, 2 hashes",
+            "let _ = r##\"{\"##;",
+            "the hash count must be matched exactly",
+        ),
+        (
+            "raw byte string",
+            "let _ = br#\"\"{\"#;",
+            "`br#\"..\"#` whose content STARTS with a quote. Without that the \
+             plain-string arm masks the brace by accident and the `b` prefix is \
+             never exercised; with it, a masker that misses the prefix closes \
+             the literal at the inner quote and leaves the brace bare.",
+        ),
+        (
+            "raw C string",
+            "let _ = cr#\"\"{\"#;",
+            "`cr#\"..\"#` whose content starts with a quote — the shape a \
+             hostile review used to blind rule 3, and discriminating for the \
+             same reason as the byte form above",
+        ),
+    ];
+
+    /// Build a fixture where `token` sits inside a `#[cfg(test)]` item and a
+    /// production function follows it.
+    fn shape_fixture(token: &str) -> String {
+        // The item body spans lines so a LINE comment token cannot swallow the
+        // closing brace and make the fixture itself invalid Rust.
+        format!(
+            "fn before() {{}}\n\
+             #[cfg(test)]\n\
+             fn t() {{\n\
+             \x20   {token}\n\
+             }}\n\
+             fn prod() {{ let v = shared_runtime.load(); }}\n"
+        )
+    }
+
+    #[test]
+    fn every_literal_shape_that_can_hide_a_brace() {
+        for (name, token, why) in LITERAL_SHAPES {
+            let fixture = shape_fixture(token);
+            let (production, test) = split_halves(&fixture);
+            assert!(
+                production.contains("shared_runtime.load("),
+                "[{name}] production code after the test item was ELIDED — the \
+                 `{{` inside `{token}` desynchronised brace tracking ({why}). \
+                 A load down there would be invisible to rule 3."
+            );
+            assert!(
+                test.contains("fn t()"),
+                "[{name}] the #[cfg(test)] item must land in the TEST half"
+            );
+            assert!(
+                !production.contains("fn t()"),
+                "[{name}] the #[cfg(test)] item must NOT land in the production half"
+            );
+            // And the canary agrees end to end.
+            let mut v = Vec::new();
+            scan_reader_loads("src/afxdp/ha/somewhere.rs", &production, &mut v);
+            assert_eq!(
+                v.len(),
+                1,
+                "[{name}] rule 3 must see the production load in an unlisted file"
+            );
+        }
+    }
+
+    #[test]
+    fn hostile_fixture_raw_c_string_desync() {
+        // Verbatim from the review that found it. Compiles under rustc 1.96 in
+        // both production and test modes.
+        let fixture = "#[cfg(test)]\n\
+                       const S: &CStr = cr#\"\"{\"#;\n\
+                       fn prod() { let v = shared_runtime.load(); }\n";
+        let production = production_half(fixture);
+        assert!(
+            production.contains("shared_runtime.load("),
+            "the raw C string must not desync brace tracking; production half was:\n{production}"
+        );
+    }
+
+    #[test]
+    fn hostile_fixture_macro_arg_brace_is_not_the_item_body() {
+        // Verbatim from the review that found it. The item must end at the `;`,
+        // not at the `{}` inside the macro's parentheses — otherwise the
+        // trailing attribute-shaped tokens read as top level and elide `prod`.
+        // Spans lines deliberately. With the whole invocation on ONE line a
+        // mis-detected end lands on that same line, elides nothing extra, and
+        // the row passes even with the `aux == 0` guard removed — the fixture
+        // would not bind the fix.
+        let fixture = "#[cfg(test)]\n\
+                       swallow!({}\n\
+                       \x20   #[cfg(test)]\n\
+                       \x20   garbage);\n\
+                       fn prod() { let v = shared_runtime.load(); }\n";
+        let production = production_half(fixture);
+        assert!(
+            production.contains("shared_runtime.load("),
+            "a brace inside `()` is a macro argument, not the item body; \
+             production half was:\n{production}"
+        );
+    }
+
+    #[test]
+    fn a_lifetime_tick_is_not_a_char_literal() {
+        // `'a` must stay ordinary code. Treating it as a literal would mask
+        // forward to the next tick and swallow the parens in between, which
+        // desyncs `aux` and therefore the top-level test.
+        let fixture = "fn before() {}\n\
+                       #[cfg(test)]\n\
+                       fn t<'a>(x: &'a u8) -> &'a u8 { x }\n\
+                       fn prod() { let v = shared_runtime.load(); }\n";
+        let production = production_half(fixture);
+        assert!(
+            production.contains("shared_runtime.load("),
+            "lifetimes must not be masked as char literals; production half was:\n{production}"
+        );
+    }
+
+    #[test]
+    fn cfg_test_inside_a_literal_does_not_open_a_region() {
+        // The attribute text itself can appear in a string or a doc comment.
+        // Masking is what stops that from eliding real code.
+        for hider in [
+            "const S: &str = \"#[cfg(test)]\";",
+            "const S: &str = r#\"#[cfg(test)]\"#;",
+            "/// #[cfg(test)]",
+            "// #[cfg(test)]",
+        ] {
+            let fixture = format!("{hider}\nfn prod() {{ let v = shared_runtime.load(); }}\n");
+            let production = production_half(&fixture);
+            assert!(
+                production.contains("shared_runtime.load("),
+                "`{hider}` must not open a test region; production half was:\n{production}"
+            );
+        }
+    }
+
+    /// Shapes this pass deliberately does NOT handle, recorded as executable
+    /// facts so the limits are known rather than assumed.
+    ///
+    /// None of them can hide a `{` from the masker — they are limits of the
+    /// ATTRIBUTE matching, not of the literal grammar — and each fails CLOSED
+    /// in the safe direction: the region is not recognised, so its lines stay
+    /// in the PRODUCTION half and get scanned MORE, never less.
+    #[test]
+    fn documented_limits_fail_closed_not_open() {
+        for (form, why) in [
+            (
+                "#[cfg(all(test, feature = \"x\"))]\nfn t() { let v = shared_runtime.load(); }\n",
+                "only the literal `#[cfg(test)]` spelling opens a region",
+            ),
+            (
+                "#[cfg_attr(unix, cfg(test))]\nfn t() { let v = shared_runtime.load(); }\n",
+                "cfg_attr is not expanded",
+            ),
+            (
+                "macro_rules! m { () => { #[cfg(test)] fn t() {} }; }\nfn prod() { let v = shared_runtime.load(); }\n",
+                "macros are not expanded, so attributes they GENERATE are invisible",
+            ),
+        ] {
+            let production = production_half(form);
+            assert!(
+                production.contains("shared_runtime.load("),
+                "unhandled form `{why}` must leave the code in the PRODUCTION \
+                 half (scanned more, never less); production half was:\n{production}"
+            );
+        }
+    }
 
     #[test]
     fn detects_a_second_publish_in_the_choke_point_file() {
