@@ -37,10 +37,32 @@ var ipAddrRe = regexp.MustCompile(
 // even if otherwise valid — the embedded-resolver case). The shared hardened
 // HTTP client (TLS-verified, bounded timeout, capped body) is used.
 //
-// Returns (addr, true) on success; (zero, false) when no usable address of the
-// requested family is found (the engine then treats it as a transient
-// observation failure and leaves the scope untouched — never a withdraw).
-func CheckIP(ctx context.Context, client *http.Client, urlStr string, wantV4 bool, allowlist []netip.Addr) (netip.Addr, bool) {
+// Returns (addr, true, nil) on success. On a miss ok is false and the scope is
+// left untouched by the engine — never a withdraw — but the third return
+// DISTINGUISHES why:
+//
+//   - (zero, false, err) — the probe FAILED: a malformed checkip-url, an
+//     unreachable/refused endpoint, a non-2xx status, or a refused redirect
+//     (a cross-host Location, #6545). err carries the operator-facing reason.
+//   - (zero, false, nil) — the probe SUCCEEDED but the body carried no usable
+//     address of the requested family. That is the ordinary dual-stack case (a
+//     v4-only endpoint queried for AAAA) and is deliberately not an error.
+//
+// The error return exists because several of the failure causes are PERMANENT
+// configuration errors — this package's own doctrine, stated at
+// validateCheckIPURL below, is that a malformed URL "is a configuration error,
+// not a transient". Collapsing them into a bare ok=false made a misconfigured
+// checkip-url an indistinguishable, undiagnosable, forever-transient
+// observation failure — exactly the class #2773/#3737 were filed to eliminate.
+// The daemon call site (pkg/daemon/daemon_ddns_surface_a.go) logs it once per
+// (provider, error).
+//
+// Note the error is NOT wrapped-sentinel-inspectable: doRequest deliberately
+// renders transport errors through scrubURLError into a STRING (breaking the
+// %w chain) so a URL query — which for the generic backend carries the
+// %p-expanded password — can never reach a log. Match on the message, or add a
+// typed pre-transport error, but do not re-plumb %w through doRequest.
+func CheckIP(ctx context.Context, client *http.Client, urlStr string, wantV4 bool, allowlist []netip.Addr) (netip.Addr, bool, error) {
 	if client == nil {
 		client = newHTTPClient()
 	}
@@ -52,18 +74,22 @@ func CheckIP(ctx context.Context, client *http.Client, urlStr string, wantV4 boo
 	// (the commit-time validateSurfaceADDNSWarnings warning is the operator-facing
 	// half; this is the runtime backstop for a URL that slipped past commit).
 	if err := validateCheckIPURL(urlStr); err != nil {
-		return netip.Addr{}, false
+		return netip.Addr{}, false, err
 	}
 	req, err := http.NewRequest(http.MethodGet, urlStr, nil)
 	if err != nil {
-		return netip.Addr{}, false
+		return netip.Addr{}, false, fmt.Errorf("ddns checkip: build request: %w", err)
 	}
 	req.Header.Set("User-Agent", "xpf-ddns/1.0")
 	code, body, err := doRequest(ctx, client, req)
-	if err != nil || classifyHTTPStatus(code) != nil {
-		return netip.Addr{}, false
+	if err != nil {
+		return netip.Addr{}, false, err
 	}
-	return parseCheckIPBody(string(body), wantV4, allowlist)
+	if serr := classifyHTTPStatus(code); serr != nil {
+		return netip.Addr{}, false, serr
+	}
+	a, ok := parseCheckIPBody(string(body), wantV4, allowlist)
+	return a, ok, nil
 }
 
 // CheckIPBound runs the checkip probe through a source-bound HTTP client while
@@ -90,11 +116,17 @@ func CheckIP(ctx context.Context, client *http.Client, urlStr string, wantV4 boo
 // interface / VRF that is down, surfaces later as a DIAL error inside CheckIP,
 // which already returns ok=false (fail-closed) on its own — so this gate is the
 // one residual fall-open the bind-error branch left open.
-func CheckIPBound(ctx context.Context, client *http.Client, urlStr string, wantV4 bool, allowlist []netip.Addr, bindErr error) (netip.Addr, bool) {
+//
+// The third return mirrors CheckIP's: non-nil means the probe FAILED for a
+// stated reason (here, bindErr itself when the source could not be honored),
+// nil with ok=false means the probe ran and simply found no address of the
+// requested family. Callers that already surface bindErr themselves should not
+// log it twice.
+func CheckIPBound(ctx context.Context, client *http.Client, urlStr string, wantV4 bool, allowlist []netip.Addr, bindErr error) (netip.Addr, bool, error) {
 	if bindErr != nil {
 		// Source requested but not honored: fail closed, never probe via the
 		// default route (would return the wrong WAN's public IP).
-		return netip.Addr{}, false
+		return netip.Addr{}, false, bindErr
 	}
 	return CheckIP(ctx, client, urlStr, wantV4, allowlist)
 }

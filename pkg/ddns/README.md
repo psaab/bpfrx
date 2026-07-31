@@ -119,6 +119,37 @@ moves to a new host is served by pointing the leaf at the final host; the error
 names both hosts so the operator can do exactly that. **Same-host redirects — the
 common real case, a path or API-version move — are still followed.**
 
+#### The concrete break: an APEX `server` leaf (apex → `www`)
+
+No SHIPPED default endpoint redirects at all — `www.duckdns.org/update`,
+`api.cloudflare.com/client/v4`, `route53.amazonaws.com`,
+`members.dyndns.org/v3/update`, `dynupdate.no-ip.com/nic/update`,
+`api.dynu.com/nic/update`, `api.cp.easydns.com/dyn/generic.php` and
+`updates.dnsomatic.com/nic/update` were each probed and return no `Location`.
+The configuration that DOES break is an **apex host** the operator writes by
+hand, because the bare-host forms resolve to the apex over HTTPS
+(`backend_duckdns.go` → `https://<host>/update`, `resolveDyndns2Endpoint` →
+`https://<host>/nic/update`) and the apex 301s to `www`:
+
+```
+set … dynamic-dns provider duck server duckdns.org
+  → https://duckdns.org/update   301 → https://www.duckdns.org/update   REFUSED
+```
+
+Same shape for `cloudflare.com` → `www.cloudflare.com` and `amazonaws.com` →
+`aws.amazon.com`. The failure is loud and the error names both hosts. **The fix
+is to configure the FINAL host** — `server www.duckdns.org` — not the apex.
+There is no commit-time check for this: detecting it requires a network call.
+
+**Do NOT "fix" this by allowing same-registrable-domain redirects.** `www.<host>`
+IS a subdomain of `<host>`, and a subdomain hop is exactly where Go forwards
+`Authorization`/`Cookie` (the second vector above). Relaxing the guard to make
+`duckdns.org` → `www.duckdns.org` work would re-open the dyndns2/generic Basic
+credential and the Cloudflare bearer token to any host that can answer for a
+subdomain of the configured name. The ergonomic goal and the security goal are in
+direct conflict here; refusing is the resolution, and documentation is the only
+available lever.
+
 Host comparison is by HOSTNAME only: case-insensitive (RFC 4343), one trailing
 root dot normalized away, and deliberately PORT-INDEPENDENT. The trust anchor is
 the DNS name and the TLS certificate identity bound to it — what the operator
@@ -131,10 +162,29 @@ refusal, never a false allow) and no in-tree provider uses an IDN host.
 
 Fail-on-revert coverage is `redirect_crosshost_6545_test.go`, which drives two
 TLS servers on real DNS names through the production client and asserts on what
-the SECOND server actually received.
-`TestCrossHostRedirectWouldLeakWithoutHostGuard` is the mutation-sensitivity
-control: the identical harness under the pre-#6545 scheme-only policy, asserting
-the token DOES arrive in `Referer`.
+the SECOND server actually received. Both vectors get an end-to-end test AND a
+mutation-sensitivity control that drives the identical harness under the
+pre-#6545 scheme-only policy and asserts the credential DOES arrive:
+
+| vector | credential carrier | end-to-end gate | mutation control |
+|---|---|---|---|
+| cross-host `Referer` | DuckDNS token in the QUERY | `TestCrossHostRedirectDoesNotLeakCredential` | `TestCrossHostRedirectWouldLeakWithoutHostGuard` |
+| subdomain header copy | dyndns2 Basic in `Authorization` | `TestSubdomainRedirectReceivesNothingWithGuard` | `TestSubdomainRedirectWouldLeakBasicAuthWithoutHostGuard` |
+
+The subdomain pair drives a real apex → `sub.<apex>` hop — the apex→`www` shape
+above in miniature — and the control decodes the Basic header to assert it
+carries the CONFIGURED password, so the gate cannot pass for a reason unrelated
+to the guard.
+
+`checkip-url` failures are REPORTED, not silent. `CheckIP`/`CheckIPBound` return
+`(addr, ok, err)`: a refused redirect, a malformed URL, an unreachable endpoint
+or a non-2xx status come back with a stated reason, while the ordinary
+dual-stack miss (endpoint answered, no address of the requested family) stays
+`ok=false, err=nil`. The daemon logs the failure once per (provider, error)
+— a `checkip-url` that redirects cross-host would otherwise be an
+indistinguishable, permanent "transient observation failure" with no operator
+signal at all, the class #2773/#3737 closed for the publish path.
+`TestCheckIPNoAddressIsNotAnError` is the over-reach guard on that split.
 
 ### Withdraw (DeleteLease) semantics per backend (#2772)
 

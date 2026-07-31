@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"math/big"
@@ -92,6 +93,7 @@ type recordedHop struct {
 	rawURL  string
 	referer string
 	auth    string
+	cookie  string
 }
 
 func (l *hopLog) add(server string, r *http.Request) {
@@ -103,6 +105,12 @@ func (l *hopLog) add(server string, r *http.Request) {
 		rawURL:  r.URL.String(),
 		referer: r.Header.Get("Referer"),
 		auth:    r.Header.Get("Authorization"),
+		// Cookie is recorded for completeness because it is the OTHER header
+		// net/http forwards across a subdomain hop. No in-tree DDNS backend sets
+		// one and the shared client has a nil Jar, so Authorization is the live
+		// carrier the assertions key on; this field exists so a future backend
+		// that does set a Cookie is covered by the same assertions.
+		cookie: r.Header.Get("Cookie"),
 	})
 }
 
@@ -286,6 +294,12 @@ func TestCrossHostRedirectWouldLeakWithoutHostGuard(t *testing.T) {
 // sub.<configured-host> would hand over the dyndns2/generic Basic credential and
 // the Cloudflare bearer token. Stripping Referer alone would not have closed
 // this; refusing the cross-host hop does.
+//
+// This is the unit-level half. The end-to-end half — a real dyndns2 backend
+// driven through a real apex -> subdomain hop, asserting on what the SUBDOMAIN
+// SERVER received, plus its mutation control — is
+// TestSubdomainRedirectReceivesNothingWithGuard /
+// TestSubdomainRedirectWouldLeakBasicAuthWithoutHostGuard below.
 func TestCrossHostRedirectSubdomainRefused(t *testing.T) {
 	via := []*http.Request{mkReq(t, "https://prov.example/upd")}
 	err := guardRedirect(mkReq(t, "https://sub.prov.example/upd"), via)
@@ -322,11 +336,202 @@ func TestCheckIPCrossHostRedirectRefused(t *testing.T) {
 		collHost + ":" + collPort: "127.0.0.1:" + collPort,
 	})
 	urlStr := "https://" + provHost + ":" + provPort + "/whatismyip?apikey=" + leakToken
-	addr, ok := CheckIP(context.Background(), cl, urlStr, true, nil)
+	addr, ok, err := CheckIP(context.Background(), cl, urlStr, true, nil)
 	if ok {
 		t.Fatalf("CheckIP followed a cross-host redirect and returned %v; want a miss", addr)
 	}
 	assertNoTokenAt(t, log, "collector")
+
+	// The refusal must be REPORTABLE, not a silent ok=false. A checkip-url whose
+	// endpoint redirects cross-host is a permanent CONFIGURATION error — exactly
+	// what this package's own doctrine (validateCheckIPURL, "a malformed URL is a
+	// configuration error, not a transient") says must not masquerade as a
+	// transient observation failure. Without the error return the daemon has no
+	// signal at all and the operator sees publishing stop for no stated reason,
+	// forever — the #2773/#3737 class. The publish path already names this
+	// failure; the checkip path must too.
+	if err == nil {
+		t.Fatal("CheckIP swallowed the cross-host refusal (err=nil); a permanently " +
+			"misconfigured checkip-url must be distinguishable from an ordinary " +
+			"no-address miss, or it is undiagnosable forever")
+	}
+	if !strings.Contains(err.Error(), "cross-host") {
+		t.Fatalf("want the cross-host refusal reason in the error, got: %v", err)
+	}
+	// ... and reporting it must not undo the scrub: the API key rides in the
+	// checkip-url QUERY, which is precisely what scrubURLError strips.
+	if strings.Contains(err.Error(), leakToken) {
+		t.Fatalf("the reported error leaked the checkip API key: %v", err)
+	}
+}
+
+// TestCheckIPNoAddressIsNotAnError is the counterpart over-reach guard for the
+// error return: an endpoint that ANSWERS but carries no address of the requested
+// family is the ordinary dual-stack miss (a v4-only checkip service queried for
+// AAAA), not a failure. It must stay ok=false, err=nil so the daemon does not
+// warn once per (provider, error) for every v6-less deployment on every family
+// probe.
+func TestCheckIPNoAddressIsNotAnError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "93.184.216.34\n")
+	}))
+	defer srv.Close()
+	// wantV4=false against a v4-only body: a legitimate miss.
+	a, ok, err := CheckIP(context.Background(), srv.Client(), srv.URL, false, nil)
+	if ok {
+		t.Fatalf("CheckIP(wantV4=false) returned %v; the body has no AAAA", a)
+	}
+	if err != nil {
+		t.Fatalf("a no-address-of-this-family miss must NOT be an error (it is the "+
+			"ordinary dual-stack case and would warn on every probe), got: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 1b. vector 2 end-to-end — Authorization forwarded to a SUBDOMAIN
+// ---------------------------------------------------------------------------
+
+// subdomainHarness drives a real apex -> subdomain hop end to end through a
+// dyndns2 backend, whose credential is Basic auth in the AUTHORIZATION HEADER —
+// a different carrier from the DuckDNS query-param harness above, and the one Go
+// actually forwards across a subdomain hop (shouldCopyHeaderOnRedirect ->
+// isDomainOrSubdomain). prov.example 302s to sub.prov.example; the hop log
+// records what the SUBDOMAIN server received.
+//
+// This is the apex->www shape in miniature, which is why it is the hop that
+// cannot be re-allowed for ergonomics: www.<host> IS a subdomain of <host>.
+func subdomainHarness(t *testing.T, policy func(*http.Request, []*http.Request) error) (error, *hopLog) {
+	t.Helper()
+	const provHost, subHost = "prov.example", "sub.prov.example"
+	cert, pool := redirectTestCA(t, provHost, subHost)
+	log := &hopLog{}
+
+	_, subPort := startTLSProbe(t, cert, func(w http.ResponseWriter, r *http.Request) {
+		log.add("subdomain", r)
+		fmt.Fprint(w, "good 203.0.113.7")
+	})
+	loc := ""
+	_, provPort := startTLSProbe(t, cert, func(w http.ResponseWriter, r *http.Request) {
+		log.add("provider", r)
+		http.Redirect(w, r, loc, http.StatusFound)
+	})
+	loc = "https://" + subHost + ":" + subPort + "/nic/update"
+
+	cl := hardenedClientFor(t, pool, map[string]string{
+		provHost + ":" + provPort: "127.0.0.1:" + provPort,
+		subHost + ":" + subPort:   "127.0.0.1:" + subPort,
+	})
+	if policy != nil {
+		cl.CheckRedirect = policy
+	}
+	b, err := newDyndns2Backend(&config.DDNSProvider{
+		Name: "dd", Backend: "dyndns2",
+		Server:   "https://" + provHost + ":" + provPort + "/nic/update",
+		Username: "ddnsuser",
+		Password: config.Secret(leakBasicPassword),
+	}, cl)
+	if err != nil {
+		t.Fatalf("newDyndns2Backend: %v", err)
+	}
+	return b.UpsertLease(context.Background(), hostRecord(t, "myhost.example.net", "203.0.113.7")), log
+}
+
+// leakBasicPassword is the sentinel dyndns2 Basic credential. It must never
+// reach the subdomain server, and must never appear in a refusal error.
+const leakBasicPassword = "BASIC-MUST-NOT-LEAK"
+
+// TestSubdomainRedirectWouldLeakBasicAuthWithoutHostGuard is the
+// mutation-sensitivity control for vector 2. Under the pre-#6545 scheme-only
+// policy the SUBDOMAIN server really does receive the dyndns2 Basic credential
+// in an Authorization header — Go copies it because isDomainOrSubdomain says
+// sub.prov.example is inside prov.example. Without this control,
+// TestSubdomainRedirectReceivesNothingWithGuard could pass for a reason
+// unrelated to the guard (servers never wired, backend never built the auth).
+func TestSubdomainRedirectWouldLeakBasicAuthWithoutHostGuard(t *testing.T) {
+	schemeOnly := func(req *http.Request, via []*http.Request) error {
+		if len(via) >= maxRedirects {
+			return errors.New("stopped after 10 redirects")
+		}
+		if len(via) > 0 {
+			prev := via[len(via)-1].URL
+			if strings.EqualFold(prev.Scheme, "https") && !strings.EqualFold(req.URL.Scheme, "https") {
+				return errors.New("downgrade")
+			}
+		}
+		return nil
+	}
+	_, log := subdomainHarness(t, schemeOnly)
+	hops := log.forServer("subdomain")
+	if len(hops) != 1 {
+		t.Fatalf("control: subdomain hops = %d, want 1 (%+v)", len(hops), hops)
+	}
+	if hops[0].auth == "" {
+		t.Fatalf("control: the subdomain received NO Authorization header — the "+
+			"vector-2 claim (Go forwards Authorization across a subdomain hop) is "+
+			"not being exercised; got hop %+v", hops[0])
+	}
+	// Decoded, that header IS the configured password.
+	if !basicAuthCarries(t, hops[0].auth, leakBasicPassword) {
+		t.Fatalf("control: subdomain Authorization %q does not carry the configured "+
+			"password; the harness is not exercising the real credential", hops[0].auth)
+	}
+}
+
+// TestSubdomainRedirectReceivesNothingWithGuard is the #6545 fail-on-revert gate
+// for vector 2, end to end through the production policy: the subdomain server
+// must receive NOTHING AT ALL — no Authorization, no Cookie, no Referer, no
+// request. Asserted on what the second server actually received, not on
+// client-side state.
+//
+// RED on revert: drop the cross-host branch from guardRedirect and the client
+// follows the Location, handing sub.prov.example the Basic credential (the
+// control above proves that is what happens).
+func TestSubdomainRedirectReceivesNothingWithGuard(t *testing.T) {
+	err, log := subdomainHarness(t, nil)
+	if err == nil {
+		t.Fatal("UpsertLease followed a redirect to a SUBDOMAIN and reported success; " +
+			"Go forwards Authorization/Cookie across that hop")
+	}
+	if !strings.Contains(err.Error(), "cross-host") {
+		t.Fatalf("want a cross-host refusal error, got: %v", err)
+	}
+	if strings.Contains(err.Error(), leakBasicPassword) {
+		t.Fatalf("refusal error leaked the Basic credential: %v", err)
+	}
+	hops := log.forServer("subdomain")
+	if len(hops) != 0 {
+		t.Fatalf("subdomain received %d request(s) it must never have seen: %+v", len(hops), hops)
+	}
+	// Redundant at zero hops today, but it states the invariant the refusal is
+	// FOR: should anyone ever swap refuse-the-hop for sanitize-and-follow, this
+	// fires on the credential carriers rather than only on the hop count.
+	for _, h := range hops {
+		if h.auth != "" || h.cookie != "" || h.referer != "" {
+			t.Fatalf("subdomain hop carried a credential: auth=%q cookie=%q referer=%q",
+				h.auth, h.cookie, h.referer)
+		}
+	}
+	// The operator-configured apex host was still reached exactly once.
+	if got := log.forServer("provider"); len(got) != 1 {
+		t.Fatalf("provider hops: want 1, got %d (%+v)", len(got), got)
+	}
+}
+
+// basicAuthCarries reports whether an Authorization header value is Basic auth
+// whose decoded password is want — so the control asserts on the REAL credential
+// rather than on the mere presence of a header.
+func basicAuthCarries(t *testing.T, authHeader, want string) bool {
+	t.Helper()
+	const prefix = "Basic "
+	if !strings.HasPrefix(authHeader, prefix) {
+		return false
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(authHeader, prefix))
+	if err != nil {
+		t.Fatalf("decode Authorization %q: %v", authHeader, err)
+	}
+	_, pass, found := strings.Cut(string(raw), ":")
+	return found && pass == want
 }
 
 // ---------------------------------------------------------------------------

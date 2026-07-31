@@ -62168,3 +62168,81 @@ break — `go vet` confirmed passing under every revert.
   No cluster smoke: control-plane-only change, no dataplane or HA path touched.
 - **File(s)**: pkg/ddns/{backend_http.go,redirect_crosshost_6545_test.go,
     redirect_downgrade_4861_test.go,README.md}, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6545 review fold — name the apex→www break in the docs, bind the
+  subdomain `Authorization` vector end to end, and stop the checkip path from
+  failing silently. Folds all three MINORs from the hostile review of PR #6594
+  (`CLAUDE-REVIEW-6594.md`, verdict MERGE-READY). Each was re-verified firsthand
+  before acting.
+  **MINOR-1 (docs).** Confirmed against the real internet:
+  `https://duckdns.org/update` 301s to `https://www.duckdns.org/update`,
+  `https://cloudflare.com/client/v4` to `www.cloudflare.com`, and
+  `https://amazonaws.com/` to `aws.amazon.com`. No SHIPPED default endpoint
+  redirects, but the bare-host `server` forms resolve to the APEX over HTTPS
+  (`backend_duckdns.go` → `https://<host>/update`, `resolveDyndns2Endpoint` →
+  `https://<host>/nic/update`), so an operator-authored `server duckdns.org`
+  worked before this PR and hard-fails after it. The docs only described that
+  abstractly ("point the leaf at the final host"), which no operator will connect
+  to `server duckdns.org`. `pkg/ddns/README.md` and `docs/config-schema.md` now
+  name the case, show the resolved URL and the 301, and give the fix
+  (`server www.duckdns.org`). Both also state explicitly that this must NOT be
+  "fixed" by allowing same-registrable-domain hops: `www.<host>` IS a subdomain
+  of `<host>`, which is exactly the hop Go forwards `Authorization`/`Cookie`
+  across, so relaxing the guard for ergonomics re-opens the credential
+  disclosure it exists to close. No commit-time detection is possible (it needs
+  a network call), so documentation is the only lever.
+  **MINOR-2 (test).** Vector 2 — the more severe half, and the one NOT in the
+  issue — had only a 12-line unit call to `guardRedirect`. Added an END-TO-END
+  pair driving a real apex → `sub.<apex>` hop through a **dyndns2** backend
+  (Basic auth in the AUTHORIZATION HEADER — a credential carrier the file never
+  exercised end to end; the existing harness is DuckDNS query-param).
+  `TestSubdomainRedirectWouldLeakBasicAuthWithoutHostGuard` is the mutation
+  control: under the pre-#6545 scheme-only policy the subdomain server really
+  does receive the Basic header, and the control base64-DECODES it to assert it
+  carries the CONFIGURED password, so the gate cannot pass for an unrelated
+  reason. `TestSubdomainRedirectReceivesNothingWithGuard` asserts the subdomain
+  server received nothing at all — on what the SECOND server got, not
+  client-side state. `recordedHop` now records `Cookie` too (no in-tree backend
+  sets one and the shared client has a nil `Jar`, so `Authorization` is the live
+  carrier; the field covers a future backend that does).
+  **MINOR-3 (silent checkip failure).** `CheckIP` discarded every failure and
+  the daemon mapped `ok=false` to an empty observation with NO log line, so a
+  `checkip-url` that redirects cross-host — or is malformed, unreachable, or
+  non-2xx — became an indistinguishable, PERMANENT "transient observation
+  failure" with zero operator diagnostic. That is the #2773/#3737 class, and it
+  contradicts the package's own doctrine at `validateCheckIPURL` ("a malformed
+  URL is a configuration error, not a transient") while the publish path
+  surfaces the same causes by name. `CheckIP`/`CheckIPBound` now return
+  `(addr, ok, err)`; the daemon logs it once per `(provider, error)` via a new
+  `checkIPProbeWarned` sync.Map, mirroring `checkIPSourceBindWarned` (and
+  skipping when `berr != nil`, which that branch already logged). The ordinary
+  dual-stack miss — endpoint answered, no address of the requested family —
+  stays `ok=false, err=nil` and silent, or every v6-less deployment would warn
+  on every probe. The error is deliberately NOT `errors.Is`-inspectable:
+  `doRequest` renders transport errors through `scrubURLError` into a STRING so
+  a URL query (the generic backend's `%p`-expanded password) can never reach a
+  log; a code comment says so, so nobody re-plumbs `%w` through it.
+  `TestCheckIPCrossHostRedirectRefused` no longer pins the silence — it asserts
+  the refusal is reported, names `cross-host`, and does not leak the API key.
+  **Validation**: RED-on-revert proven FOUR times, all ASSERTION failures with
+  `go vet` clean (no build breaks), reverts applied via Edit and restored via
+  Edit. (C) neutralize the cross-host branch → `TestSubdomainRedirect`
+  `ReceivesNothingWithGuard` "UpsertLease followed a redirect to a SUBDOMAIN and
+  reported success" + 2 pre-existing. (D) neutralize `CheckIP`'s error return →
+  `CheckIP swallowed the cross-host refusal (err=nil)`, `a malformed URL must
+  report WHY it failed`, and both daemon warn tests at "logged 0 times".
+  (E) neutralize the daemon warn → both daemon warn tests at 0. (F) neutralize
+  the LoadOrStore dedup → "logged 3 times over 3 passes; the
+  once-per-(provider,error) dedup is gone". Over-reach guards stay GREEN under
+  every revert: `TestCheckIPNoAddressIsNotAnError`,
+  `TestCheckIPNoAddressDoesNotWarn`, `TestCheckIPThroughMockServer`, and the
+  vector-2 control (which uses its own scheme-only policy). Full `pkg/ddns`,
+  `pkg/daemon`, `pkg/config` suites green on a FRESH GOCACHE with every new
+  subtest NAME confirmed present in `-v`; `go build ./...` + `go vet` clean.
+  No cluster smoke: control-plane-only, no dataplane or HA path touched.
+- **File(s)**: pkg/ddns/{checkip.go,checkip_test.go,
+    checkip_sourcebind_failclosed_3733_test.go,
+    backend_http_sourcebind_2846_test.go,redirect_crosshost_6545_test.go,
+    README.md}, pkg/daemon/{daemon_ddns_surface_a.go,
+    daemon_ddns_checkip_probe_warn_6545_test.go}, docs/config-schema.md, _Log.md

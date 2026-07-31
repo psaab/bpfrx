@@ -89,6 +89,17 @@ type surfaceAState struct {
 	// persistent misconfig must not log every tick. Keyed by
 	// "<provider>\x00<bind-error>" so a corrected commit re-arms the warning.
 	checkIPSourceBindWarned sync.Map
+	// checkIPProbeWarned dedups the once-per-(provider,probe-error) runtime log
+	// emitted when the checkip probe itself FAILS — a malformed checkip-url, an
+	// unreachable/refused endpoint, a non-2xx status, or a redirect the shared
+	// policy refuses (a cross-host Location, #6545). Before this the failure
+	// collapsed into a bare ok=false with NO log line, so a permanently
+	// misconfigured checkip-url was an indistinguishable "transient observation
+	// failure" forever (the #2773/#3737 class). Distinct from the ordinary
+	// dual-stack miss (endpoint answered, no address of this family), which
+	// stays silent. Keyed by "<provider>\x00<probe-error>" so a corrected
+	// commit — or a different failure — re-arms the warning.
+	checkIPProbeWarned sync.Map
 	// checkIPNoURLWarned dedups the once-per-provider runtime log emitted when a
 	// binding selects `address-source checkip` but the referenced provider
 	// carries no checkip-url (#4423 H08). Before the fix the runtime silently
@@ -433,8 +444,32 @@ func (d *Daemon) surfaceAObserver(cfg *config.Config) ddns.AddressObserver {
 						"provider", scope.Provider.Name, "err", berr)
 				}
 			}
-			a, ok := ddns.CheckIPBound(ctx, client, scope.Provider.CheckIPURL, af4, allow, berr)
+			a, ok, cerr := ddns.CheckIPBound(ctx, client, scope.Provider.CheckIPURL, af4, allow, berr)
 			if !ok {
+				// A probe FAILURE (cerr != nil) is not the same thing as "the
+				// endpoint answered but carried no address of this family"
+				// (cerr == nil — the ordinary dual-stack miss, correctly
+				// silent). Several failure causes are PERMANENT configuration
+				// errors: a malformed checkip-url, an endpoint that 30x's to a
+				// DIFFERENT host (refused since #6545), a checkip-url whose
+				// host no longer resolves. Collapsing those into a bare
+				// ok=false made them indistinguishable, undiagnosable, forever
+				// "transient" observation failures with no operator-visible
+				// signal at all — the class #2773/#3737 were filed to
+				// eliminate, and the publish path already surfaces the same
+				// causes by name. Log once per (provider, error) so a
+				// persistent misconfig surfaces without flooding the per-tick
+				// observer, matching checkIPSourceBindWarned above. berr is
+				// skipped here because that branch has already logged it with
+				// its own (more specific, fail-closed) message.
+				if cerr != nil && berr == nil {
+					key := scope.Provider.Name + "\x00" + cerr.Error()
+					if _, dup := d.surfaceA.checkIPProbeWarned.LoadOrStore(key, struct{}{}); !dup {
+						slog.Warn("ddns surface-a: checkip probe failed; no address observed "+
+							"(publishing is suppressed until it succeeds)",
+							"provider", scope.Provider.Name, "err", cerr)
+					}
+				}
 				return ddns.AddressObservation{}, false
 			}
 			return ddns.AddressObservation{Addr: a, Source: ddns.AddressSourceCheckIP}, true
