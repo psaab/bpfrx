@@ -200,6 +200,13 @@ func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, overlay, peerA
 	d.fabricMu.Lock()
 	d.fabricIface = fabIface
 	d.fabricOverlay = overlay
+	// A re-pointed fabric is a DIFFERENT peer chassis, so the cached
+	// address-matched MAC no longer identifies it. Drop it rather than let the
+	// NDP fallback keep pinning the old peer's MAC (#6554) — the same
+	// same-parent peer-REPLACEMENT hazard the Rust link merge guards (#5686).
+	if !d.fabricPeerIP.Equal(peerIP) {
+		d.fabricPeerMAC = nil
+	}
 	d.fabricPeerIP = peerIP
 	d.fabricMu.Unlock()
 
@@ -363,6 +370,167 @@ func (d *Daemon) fabricEntryPopulated(slot int) bool {
 	return d.fabricPopulated
 }
 
+// fabricLinkByName / fabricNeighList route the fabric refresh's netlink reads
+// through the Daemon seams so a test can drive resolution against a synthetic
+// link + neighbour table (#6554). Both fall back to the real netlink call when
+// the seam is unset (a Daemon built by a path that does not run the
+// constructor).
+func (d *Daemon) fabricLinkByName(name string) (netlink.Link, error) {
+	if d.linkByNameFn != nil {
+		return d.linkByNameFn(name)
+	}
+	return netlink.LinkByName(name)
+}
+
+func (d *Daemon) fabricNeighList(ifindex, family int) ([]netlink.Neigh, error) {
+	if d.neighListFn != nil {
+		return d.neighListFn(ifindex, family)
+	}
+	return netlink.NeighList(ifindex, family)
+}
+
+// fabricNeighValidStates is the NUD mask of neighbour states whose hardware
+// address is usable for forwarding. INCOMPLETE/FAILED/NONE carry no (or a
+// stale-zero) MAC and are excluded.
+const fabricNeighValidStates = netlink.NUD_REACHABLE | netlink.NUD_STALE |
+	netlink.NUD_PERMANENT | netlink.NUD_DELAY | netlink.NUD_PROBE
+
+// fabricPeerMACHint returns the last address-matched peer MAC observed for the
+// given fabric slot, or nil if the peer's fabric address has never resolved
+// since this daemon started (or since the configured peer last changed).
+func (d *Daemon) fabricPeerMACHint(slot int) net.HardwareAddr {
+	d.fabricMu.RLock()
+	defer d.fabricMu.RUnlock()
+	if slot == 1 {
+		return d.fabricPeerMAC1
+	}
+	return d.fabricPeerMAC
+}
+
+// rememberFabricPeerMAC records a peer MAC learned from an ADDRESS-MATCHED
+// neighbour entry — i.e. the MAC that actually answered for the configured
+// fabric peer address. This is the identity the NDP link-local fallback is
+// later constrained to (#6554). It is deliberately NOT called from the
+// fallback: a fallback result must never promote itself into the identity it
+// is checked against, or one bad selection would pin every later refresh.
+// An address-matched observation always overwrites, so a legitimately changed
+// peer MAC (NIC replacement, RETH member swap) self-heals on the next
+// successful ARP/NDP resolution rather than being locked out.
+func (d *Daemon) rememberFabricPeerMAC(slot int, mac net.HardwareAddr) {
+	if len(mac) != 6 {
+		return
+	}
+	stored := make(net.HardwareAddr, 6)
+	copy(stored, mac)
+	d.fabricMu.Lock()
+	defer d.fabricMu.Unlock()
+	if slot == 1 {
+		d.fabricPeerMAC1 = stored
+		return
+	}
+	d.fabricPeerMAC = stored
+}
+
+// selectFabricPeerLinkLocalMAC picks the fabric peer's MAC out of the fabric
+// PARENT's IPv6 neighbour table when the peer's configured fabric address
+// itself failed to resolve (#6554).
+//
+// This is the last-resort leg of peer-MAC resolution: probeFabricNeighbor
+// deliberately seeds the parent's NDP table by pinging ff02::1 (all-nodes
+// link-local multicast), so EVERY IPv6-speaking host on the fabric segment
+// answers and lands in that table. The pre-#6554 code then took the first
+// non-self link-local entry it saw. On a correctly-cabled back-to-back fabric
+// the only other host is the peer chassis, but the fabric is not always a
+// private point-to-point link, and picking a stranger's MAC is silent: the
+// refresh reports success, latches fabricPopulated (which feeds the RG
+// takeover-readiness gate), and logs a peer MAC that belongs to an unrelated
+// adjacent host.
+//
+// The selection is therefore constrained to the peer's identity, strongest
+// constraint first:
+//
+//   - expected != nil — an address-matched resolution has been seen before, so
+//     the MAC that answered for the configured peer address is known. Accept
+//     ONLY that MAC. A decoy cannot match it.
+//   - expected == nil — nothing address-matched has ever been observed (cold
+//     start / crash recovery, the case this fallback exists for). Fall back to
+//     the point-to-point fabric assumption, but CHECK it instead of assuming
+//     it: accept the sole eligible neighbour, and REFUSE when the segment
+//     presents more than one. An ambiguous segment is exactly the topology the
+//     permissive form mis-resolved on.
+//
+// Refusal is fail-closed by design: it returns no MAC, which leaves the caller
+// on the existing "peer neighbour missing" path (retain a previously-good
+// entry, else clear). That is the same state the node already occupies whenever
+// the peer genuinely does not resolve, and it does NOT blackhole cross-chassis
+// traffic — the userspace dataplane's redirect takes its destination MAC from
+// FabricSnapshot.peer_mac, which is resolved independently and strictly by
+// peer address in pkg/dataplane/userspace/fabric.go (buildFabricPeerMAC).
+// Silently keeping the permissive behaviour would leave the defect reachable
+// exactly on the shared segment where it matters.
+//
+// Candidates are deduplicated by MAC so a peer that owns several link-local
+// addresses on the same NIC (EUI-64 plus a stable-privacy or manually
+// configured address) still counts as one host and does not trip the
+// ambiguity refusal.
+//
+// reason is empty on success and carries an operator-facing explanation on
+// refusal. peerLL is the accepted neighbour's link-local address, for logging.
+func selectFabricPeerLinkLocalMAC(
+	neighs []netlink.Neigh,
+	localMAC, expected net.HardwareAddr,
+) (mac net.HardwareAddr, peerLL net.IP, candidates int, reason string) {
+	type candidate struct {
+		mac net.HardwareAddr
+		ip  net.IP
+	}
+	var eligible []candidate
+	seen := make(map[string]struct{}, len(neighs))
+	for _, n := range neighs {
+		if len(n.HardwareAddr) != 6 || (n.State&fabricNeighValidStates) == 0 {
+			continue
+		}
+		if !n.IP.IsLinkLocalUnicast() {
+			continue
+		}
+		// A group-bit MAC is a multicast/broadcast destination, never a
+		// unicast peer NIC — it can only be a mis-parsed or synthetic entry.
+		if n.HardwareAddr[0]&0x01 != 0 {
+			continue
+		}
+		if bytes.Equal(n.HardwareAddr, localMAC) {
+			continue
+		}
+		key := n.HardwareAddr.String()
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		eligible = append(eligible, candidate{mac: n.HardwareAddr, ip: n.IP})
+	}
+
+	if len(expected) == 6 {
+		for _, c := range eligible {
+			if bytes.Equal(c.mac, expected) {
+				return c.mac, c.ip, len(eligible), ""
+			}
+		}
+		return nil, nil, len(eligible),
+			"no link-local neighbour carries the known fabric peer MAC"
+	}
+
+	switch len(eligible) {
+	case 0:
+		return nil, nil, 0, "no eligible link-local neighbour on the fabric parent"
+	case 1:
+		return eligible[0].mac, eligible[0].ip, 1, ""
+	default:
+		return nil, nil, len(eligible),
+			"ambiguous fabric segment: multiple link-local neighbours and no " +
+				"address-matched peer MAC to identify the peer chassis"
+	}
+}
+
 func (d *Daemon) retainFabricFwdOnNeighborMiss(slot int, peerIP net.IP, overlay string, logWaiting bool) bool {
 	if !d.fabricEntryPopulated(slot) {
 		if logWaiting {
@@ -399,7 +567,7 @@ func (d *Daemon) retainFabricFwdOnNeighborMiss(slot int, peerIP net.IP, overlay 
 // fabIface is the physical parent (for ifindex/MAC); overlay is the IPVLAN
 // child where the sync IP lives (for neighbor resolution, #129).
 func (d *Daemon) refreshFabricFwd(ctx context.Context, fabIface, overlay string, peerIP net.IP, logWaiting bool) bool {
-	link, err := netlink.LinkByName(fabIface)
+	link, err := d.fabricLinkByName(fabIface)
 	if err != nil {
 		d.logFabricRefreshFailure(0, "cluster: fabric refresh failed (link not found)",
 			"interface", fabIface, "err", err)
@@ -436,7 +604,7 @@ func (d *Daemon) refreshFabricFwd(ctx context.Context, fabIface, overlay string,
 	// are associated with the overlay's ifindex, not the parent's.
 	neighLink := link
 	if overlay != fabIface {
-		if ol, err := netlink.LinkByName(overlay); err == nil {
+		if ol, err := d.fabricLinkByName(overlay); err == nil {
 			neighLink = ol
 		}
 	}
@@ -445,9 +613,9 @@ func (d *Daemon) refreshFabricFwd(ctx context.Context, fabIface, overlay string,
 		neighFamily = netlink.FAMILY_V6
 	}
 
-	validState := netlink.NUD_REACHABLE | netlink.NUD_STALE | netlink.NUD_PERMANENT | netlink.NUD_DELAY | netlink.NUD_PROBE
+	validState := fabricNeighValidStates
 
-	neighs, err := netlink.NeighList(neighLink.Attrs().Index, neighFamily)
+	neighs, err := d.fabricNeighList(neighLink.Attrs().Index, neighFamily)
 	if err != nil {
 		d.logFabricRefreshFailure(0, "cluster: fabric refresh failed (neighbor list)",
 			"overlay", neighLink.Attrs().Name, "peer", peerIP, "err", err)
@@ -462,6 +630,12 @@ func (d *Daemon) refreshFabricFwd(ctx context.Context, fabIface, overlay string,
 			break
 		}
 	}
+	// An address-matched hit is a real identity binding: this MAC answered for
+	// the CONFIGURED peer address. Remember it so the link-local fallback below
+	// has a peer identity to check against on a later refresh (#6554).
+	if peerMAC != nil {
+		d.rememberFabricPeerMAC(0, peerMAC)
+	}
 
 	// Fallback: if overlay ARP failed, try the parent interface's neighbor
 	// tables (both IPv4 and IPv6). After crash recovery, the IPVLAN overlay
@@ -473,33 +647,38 @@ func (d *Daemon) refreshFabricFwd(ctx context.Context, fabIface, overlay string,
 			parentIdx = link.Attrs().Index // use fabric parent directly
 		}
 		// Check parent IPv4 neighbors for the peer IP.
-		parentNeighs, _ := netlink.NeighList(parentIdx, neighFamily)
+		parentNeighs, _ := d.fabricNeighList(parentIdx, neighFamily)
 		for _, n := range parentNeighs {
 			if n.IP.Equal(peerIP) && len(n.HardwareAddr) == 6 &&
 				(n.State&validState) != 0 {
 				peerMAC = n.HardwareAddr
+				// Still address-matched — same identity binding as above.
+				d.rememberFabricPeerMAC(0, peerMAC)
 				slog.Info("cluster: fabric peer MAC resolved via parent ARP",
 					"peer_mac", peerMAC, "overlay", overlay)
 				break
 			}
 		}
-		// Check parent IPv6 NDP neighbors (populated via ff02::1 probe).
+		// Check parent IPv6 NDP neighbors (populated via the ff02::1 probe).
+		// This leg has NO peer address to match on, so it is constrained to the
+		// peer's identity by selectFabricPeerLinkLocalMAC and fails closed when
+		// the segment cannot be shown to hold exactly the peer (#6554).
 		if peerMAC == nil {
-			v6Neighs, _ := netlink.NeighList(parentIdx, netlink.FAMILY_V6)
-			for _, n := range v6Neighs {
-				if len(n.HardwareAddr) != 6 || (n.State&validState) == 0 {
-					continue
-				}
-				if !n.IP.IsLinkLocalUnicast() {
-					continue
-				}
-				if bytes.Equal(n.HardwareAddr, localMAC) {
-					continue
-				}
-				peerMAC = n.HardwareAddr
+			v6Neighs, _ := d.fabricNeighList(parentIdx, netlink.FAMILY_V6)
+			mac, peerLL, nCandidates, reason := selectFabricPeerLinkLocalMAC(
+				v6Neighs, localMAC, d.fabricPeerMACHint(0))
+			switch {
+			case mac != nil:
+				peerMAC = mac
 				slog.Info("cluster: fabric peer MAC resolved via parent IPv6 NDP",
-					"peer_mac", peerMAC, "peer_ll", n.IP, "overlay", overlay)
-				break
+					"peer_mac", peerMAC, "peer_ll", peerLL, "overlay", overlay)
+			case nCandidates > 0:
+				// Candidates existed but none could be attributed to the peer.
+				// Throttled: this runs on every neighbour event plus the 30s tick.
+				d.logFabricRefreshFailure(0,
+					"cluster: fabric peer MAC NDP fallback refused (unidentified neighbour)",
+					"reason", reason, "candidates", nCandidates,
+					"peer", peerIP, "overlay", overlay)
 			}
 		}
 	}
@@ -596,6 +775,10 @@ func (d *Daemon) populateFabricFwd1(ctx context.Context, fabIface, overlay, peer
 	d.fabricMu.Lock()
 	d.fabricIface1 = fabIface
 	d.fabricOverlay1 = overlay
+	// Peer replacement invalidates the cached identity — see populateFabricFwd.
+	if !d.fabricPeerIP1.Equal(peerIP) {
+		d.fabricPeerMAC1 = nil
+	}
 	d.fabricPeerIP1 = peerIP
 	d.fabricMu.Unlock()
 
@@ -644,7 +827,7 @@ func (d *Daemon) populateFabricFwd1(ctx context.Context, fabIface, overlay, peer
 // the fabric_fwd BPF map at key=1. Returns true on success.
 // fabIface is the physical parent; overlay is the IPVLAN child (#129).
 func (d *Daemon) refreshFabricFwd1(ctx context.Context, fabIface, overlay string, peerIP net.IP, logWaiting bool) bool {
-	link, err := netlink.LinkByName(fabIface)
+	link, err := d.fabricLinkByName(fabIface)
 	if err != nil {
 		d.logFabricRefreshFailure(1, "cluster: fabric1 refresh failed (link not found)",
 			"interface", fabIface, "err", err)
@@ -679,7 +862,7 @@ func (d *Daemon) refreshFabricFwd1(ctx context.Context, fabIface, overlay string
 	// Resolve peer MAC from overlay interface (#129).
 	neighLink := link
 	if overlay != fabIface {
-		if ol, err := netlink.LinkByName(overlay); err == nil {
+		if ol, err := d.fabricLinkByName(overlay); err == nil {
 			neighLink = ol
 		}
 	}
@@ -687,7 +870,7 @@ func (d *Daemon) refreshFabricFwd1(ctx context.Context, fabIface, overlay string
 	if peerIP.To4() == nil {
 		neighFamily = netlink.FAMILY_V6
 	}
-	neighs, err := netlink.NeighList(neighLink.Attrs().Index, neighFamily)
+	neighs, err := d.fabricNeighList(neighLink.Attrs().Index, neighFamily)
 	if err != nil {
 		d.logFabricRefreshFailure(1, "cluster: fabric1 refresh failed (neighbor list)",
 			"overlay", neighLink.Attrs().Name, "peer", peerIP, "err", err)
@@ -697,10 +880,16 @@ func (d *Daemon) refreshFabricFwd1(ctx context.Context, fabIface, overlay string
 	var peerMAC net.HardwareAddr
 	for _, n := range neighs {
 		if n.IP.Equal(peerIP) && len(n.HardwareAddr) == 6 &&
-			(n.State&(netlink.NUD_REACHABLE|netlink.NUD_STALE|netlink.NUD_PERMANENT|netlink.NUD_DELAY|netlink.NUD_PROBE)) != 0 {
+			(n.State&fabricNeighValidStates) != 0 {
 			peerMAC = n.HardwareAddr
 			break
 		}
+	}
+	// fab1 has no link-local fallback leg — its only resolution is
+	// address-matched — but record the identity anyway so the two slots keep
+	// the same contract if a fallback is ever added here (#6554).
+	if peerMAC != nil {
+		d.rememberFabricPeerMAC(1, peerMAC)
 	}
 	if peerMAC == nil {
 		if d.retainFabricFwdOnNeighborMiss(1, peerIP, overlay, logWaiting) {

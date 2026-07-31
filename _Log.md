@@ -61908,3 +61908,37 @@ would never produce.
   22.7 Gbps) and needs no re-run for a comment-only change.
 - **File(s)**: pkg/cluster/{election.go,ifmon_weight_daemon_apply_6549_test.go},
     pkg/routing/monitor.go, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6554 — constrain the fabric peer-MAC IPv6-NDP fallback to the
+  peer's identity. `refreshFabricFwd`'s last-resort leg swept the fabric
+  parent's IPv6 NDP table (deliberately seeded by the `ff02::1` all-nodes probe
+  in `probeFabricNeighbor`) and took the FIRST non-self link-local neighbour,
+  so on a shared fabric segment any IPv6-speaking adjacent host was accepted as
+  the peer chassis. Added `selectFabricPeerLinkLocalMAC`: accept only the
+  cached ADDRESS-MATCHED peer MAC when one is known, else the sole eligible
+  neighbour, refusing an ambiguous segment. The identity cache
+  (`d.fabricPeerMAC`/`fabricPeerMAC1`) is written only by address-matched
+  resolutions — never by the fallback, so a bad guess cannot self-confirm — and
+  is dropped when the configured peer address changes. Refusal is fail-closed
+  onto the pre-existing "peer neighbour missing" path.
+  IMPACT CORRECTION vs the issue text: the misdelivery claim is NOT reachable
+  on today's forwarding path. `FabricFwdInfo.PeerMAC` is written into the
+  `fabric_fwd` pinned array and read by nobody post-#1476 (the retained
+  `userspace-xdp` shim never references the map; `userspace-dp` never reads it;
+  no Go reader). The dataplane's actual redirect dst-MAC comes from
+  `FabricSnapshot.peer_mac` via `buildFabricPeerMAC`, which is address-matched.
+  The live defect is a FALSE-SUCCESS health signal: a decoy made the refresh
+  report success, latch `fabricPopulated` (which feeds the RG
+  takeover-readiness gate in `daemon_ha.go`), end the fast-retry probe loop
+  early, and log a stranger's MAC as the fabric peer during an HA incident.
+  Also rejected the issue's suggested RETH virtual-MAC-prefix constraint:
+  fabric members (`ge-0/0/0`) carry no `redundant-parent`, so they never get a
+  `02:bf:72:…` MAC and that constraint would reject the real peer.
+  Added `d.neighListFn` seam so the fail-on-revert test drives the real
+  `refreshFabricFwd` and asserts on the MAC handed to `SetFabricForwarding`.
+  Verified RED-on-revert is an ASSERTION failure (decoy programmed), with both
+  over-reach guards GREEN under revert. Full Go suite green.
+- **File(s)**: pkg/daemon/{daemon.go,daemon_ha_fabric.go,
+    daemon_ha_fabric_peer_identity_6554_test.go},
+    docs/fabric-cross-chassis-fwd.md, _Log.md

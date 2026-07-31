@@ -680,6 +680,17 @@ type Daemon struct {
 	fabricPeerIP1    net.IP        // secondary fabric peer IP
 	fabricPopulated  bool          // true after first successful fab0 write
 	fabric1Populated bool          // true after first successful fab1 write
+	// fabricPeerMAC / fabricPeerMAC1 cache the last peer MAC that was learned
+	// from an ADDRESS-MATCHED neighbour entry for the configured fabric peer
+	// (#6554). They are the identity the IPv6-NDP link-local fallback is
+	// constrained to: only a neighbour bearing this MAC may be accepted when
+	// the peer's fabric address itself does not resolve. Written only by an
+	// address-matched resolution (never by the fallback itself, which would
+	// let a bad guess self-confirm) and cleared when the configured peer
+	// address changes, so a re-pointed fabric cannot be pinned to the old
+	// peer's MAC.
+	fabricPeerMAC  net.HardwareAddr
+	fabricPeerMAC1 net.HardwareAddr
 	fabricRefreshCh  chan struct{} // wakes the fab0 populateFabricFwd loop
 	fabricRefreshCh1 chan struct{} // wakes the fab1 populateFabricFwd1 loop (#4038)
 	lastFabricProbe  time.Time     // rate-limit active fab0 neighbor probes
@@ -881,6 +892,12 @@ type Daemon struct {
 	// linkByNameFn resolves a network interface by name. Defaults to
 	// netlink.LinkByName; overridden in tests.
 	linkByNameFn func(string) (netlink.Link, error)
+
+	// neighListFn dumps the kernel neighbour table for an (ifindex, family).
+	// Defaults to netlink.NeighList; overridden in tests (#6554) so the
+	// fabric peer-MAC resolution can be driven against a synthetic
+	// neighbour table.
+	neighListFn func(int, int) ([]netlink.Neigh, error)
 
 	// userspaceSessionIDs allocates synthetic session IDs for sessions
 	// learned from the userspace dataplane helper before they enter the
@@ -1130,6 +1147,7 @@ func New(opts Options) (*Daemon, error) {
 		ipsecSANudgeCh:             make(chan struct{}, 1),
 		syncReadyTimeout:           5 * time.Second,
 		linkByNameFn:               netlink.LinkByName,
+		neighListFn:                netlink.NeighList,
 		directAnnounceSchedule:     []time.Duration{0, 250 * time.Millisecond, 1 * time.Second, 2 * time.Second, 4 * time.Second, 6 * time.Second},
 		directVIPOwned:             make(map[int]bool),
 		localFailoverCommitReady:   make(map[int]bool),
