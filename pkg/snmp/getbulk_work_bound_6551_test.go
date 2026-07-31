@@ -33,11 +33,29 @@ import (
 // always ~116, so a test that only checked the response would pass on the
 // unfixed code.
 
-// minVarbindEncodedBytes is the smallest number of bytes any varbind can
-// occupy in an encoded varbind list: a SEQUENCE header (tag + 1 length byte)
-// wrapping an empty-bodied OID TLV and an empty-bodied value TLV. berEncodeOID
-// returns a nil body for an OID with fewer than two components, so 2+2+2 is
-// actually reachable and this is a true floor, not an estimate.
+// minVarbindEncodedBytes is a lower bound on the bytes any varbind can occupy
+// in an encoded varbind list: a SEQUENCE header (tag + 1 length byte, a minimal
+// body being far below 128) wrapping an OID TLV and a value TLV, each at least
+// a bare tag + length byte. 2+2+2.
+//
+// It is used for one thing only — capping how many cells a build that stops at
+// the response ceiling could possibly have produced — and for that a valid
+// floor is all that is required. The floor is attained only by the degenerate
+// shape berEncodeOID emits a nil body for (an OID with fewer than two
+// components), which TestVarbindEncodedLenMatchesEncoder_6551 exercises as
+// "short-oid-no-body". buildBulkVarbinds cannot produce one from a real
+// request: its OIDs are either walked out of the MIB or echoed from the
+// request, and berDecodeOID rejects an empty body while turning any non-empty
+// one into at least two components, so every varbind reachable from the wire
+// re-encodes to at least 7 bytes. A floor of 6 therefore makes the cap
+// CONSERVATIVE, never unsound. TestWireVarbindByteFloors_6551 pins both halves
+// of that.
+//
+// The cap bounds the CELL COUNT of the build. It says nothing about whether the
+// response fits: real returned varbinds carry full OIDs and values and are far
+// larger than any floor. Fitting is trimToFit's job, and the equality oracle
+// TestGetBulkBoundedMatchesUnbounded_6551 is what proves the stop does not
+// disturb it.
 const minVarbindEncodedBytes = 6
 
 // varbindListEncodedLen sums the exact encoded size of a varbind list.
@@ -183,13 +201,17 @@ func TestGetBulkBuildBounded_6551(t *testing.T) {
 		grid, len(built), len(returned), len(resp))
 }
 
-// TestGetBulkCostDoesNotScaleWithMaxRepetitions_6551 guards the CALL SITES.
-// The assertions above drive buildBulkVarbinds directly with the real ceiling,
-// so they would still pass if handleGetBulk (or the v3 dispatcher) started
-// handing it an effectively infinite budget. This one goes through
+// TestGetBulkCostDoesNotScaleWithMaxRepetitions_6551 guards the v2c CALL SITE
+// (handleGetBulk, agent.go). The assertions above drive buildBulkVarbinds
+// directly with the real ceiling, so they would still pass if handleGetBulk
+// started handing it an effectively infinite budget. This one goes through
 // handlePacket and pins the property that actually matters end to end: once the
 // response ceiling is reached, answering a GETBULK must cost the same whether
 // the manager asked for 1 repetition or 100.
+//
+// It covers v2c ONLY. The v3 dispatcher is a separate call site that computes
+// its own ceiling, and unbounding it leaves every assertion here green —
+// TestGetBulkCostDoesNotScaleWithMaxRepetitionsV3_6551 below is its guard.
 //
 // It is a ratio between two measurements of the same magnitude on the same
 // machine, not an absolute deadline, so machine load cancels out. Pre-fix the
@@ -283,6 +305,103 @@ func TestGetBulkBuildBoundedV3_6551(t *testing.T) {
 	}
 	t.Logf("v3: grid %d cells -> built %d -> returned %d (%d-byte response)",
 		len(oids)*100, len(built), len(returned), len(resp))
+}
+
+// v3MaxRepeaterBulkRequest builds the largest SNMPv3 authNoPriv GETBULK
+// datagram that still fits in maxPacketSize, packing as many minimal repeater
+// OIDs as the USM envelope leaves room for. It returns the datagram and the
+// repeater count R that multiplies max-repetitions in the grid.
+func v3MaxRepeaterBulkRequest(t *testing.T, engineID, authKey []byte, boots, tm, maxReps int) (req []byte, repeaters int) {
+	t.Helper()
+	var oids [][]int
+	for {
+		cand := append(oids, []int{1, 3})
+		next := buildV3GetBulkRequest(t, "sha", "alice", engineID, authKey, boots, tm,
+			maxPacketSize, 0, maxReps, cand)
+		if len(next) > maxPacketSize {
+			break
+		}
+		oids, req = cand, next
+	}
+	if len(oids) == 0 {
+		t.Fatalf("no v3 repeater OID fits in %d bytes", maxPacketSize)
+	}
+	return req, len(oids)
+}
+
+// v3GetBulkAllocs returns the mean number of heap allocations the agent
+// performs answering req end to end through the real v3 dispatcher.
+//
+// Allocations are the work proxy here rather than wall time. Every grid cell
+// allocates — findNextOIDSnap returns a freshly built OID and getOIDValueSnap a
+// freshly encoded value — and every trimToFit rebuild re-encodes the surviving
+// prefix under USM, so the count rises with the number of cells actually
+// walked. Unlike a duration it is a count: it cannot be moved by machine load,
+// so the comparison below is deterministic rather than a timing race.
+func v3GetBulkAllocs(t *testing.T, a *Agent, req []byte) float64 {
+	t.Helper()
+	return testing.AllocsPerRun(3, func() {
+		if a.handlePacketFrom(req, nil) == nil {
+			t.Fatal("nil v3 response")
+		}
+	})
+}
+
+// TestGetBulkCostDoesNotScaleWithMaxRepetitionsV3_6551 guards the SNMPv3 CALL
+// SITE. It is deliberately NOT shared with the v2c sibling: the two entry
+// points are separate surfaces that each compute and pass their own ceiling
+// (handleGetBulk passes effectiveMaxSize(maxPacketSize), the v3 dispatcher
+// effectiveMaxSize(msgMaxSize)), so a regression that unbounds one leaves the
+// other correct and a single shared test re-masks the split.
+//
+// TestGetBulkBuildBoundedV3_6551 above cannot cover this: it calls
+// buildBulkVarbinds itself with the real ceiling, so its built-count assertions
+// hold no matter what budget v3.go passes. Everything it checks about the
+// handlePacketFrom response — size, error-status, varbind count — is identical
+// bounded or not, because trimToFit produces the same bytes either way. That is
+// the whole point of the fix being output-neutral, and it is why only a COST
+// assertion can see the difference.
+//
+// The pinned property is the v2c sibling's: once the response ceiling is
+// reached, answering a GETBULK must cost the same whether the manager asked for
+// 1 repetition or 100. With R repeaters filling the datagram, an unbounded grid
+// walks R cells at M=1 and R*100 at M=100, while a bounded one stops at the
+// same ~120 cells in both. The 10x threshold sits an order of magnitude below
+// the ~100x an unbounded v3 call site produces and an order of magnitude above
+// the ~1x a bounded one does.
+func TestGetBulkCostDoesNotScaleWithMaxRepetitionsV3_6551(t *testing.T) {
+	a, authKey, engineID, boots, tm := v3GetBulkAgent(t, manyIfData(50))
+	oneRep, _ := v3MaxRepeaterBulkRequest(t, engineID, authKey, boots, tm, 1)
+	manyRep, repeaters := v3MaxRepeaterBulkRequest(t, engineID, authKey, boots, tm, 100)
+	if repeaters < 100 {
+		t.Fatalf("test is not exercising the defect: only %d v3 repeaters fit", repeaters)
+	}
+
+	// Both requests must actually be answered; a v3 auth/timeliness reject
+	// would make this a comparison of two report PDUs and prove nothing.
+	for name, req := range map[string][]byte{"max-repetitions=1": oneRep, "max-repetitions=100": manyRep} {
+		resp := a.handlePacketFrom(req, nil)
+		if resp == nil {
+			t.Fatalf("%s: nil v3 response", name)
+		}
+		if errStatus, returned := v3ResponseErrorStatus(t, resp); errStatus != errNoError || len(returned) == 0 {
+			t.Fatalf("%s: error-status = %d with %d varbinds; want noError with a non-empty walk",
+				name, errStatus, len(returned))
+		}
+	}
+
+	one, many := v3GetBulkAllocs(t, a, oneRep), v3GetBulkAllocs(t, a, manyRep)
+	if one <= 0 {
+		t.Fatalf("no allocations measured at max-repetitions=1 (%v); the probe is not measuring the walk", one)
+	}
+
+	ratio := many / one
+	t.Logf("v3 %d repeaters: max-repetitions=1 %.0f allocs, max-repetitions=100 %.0f allocs (ratio %.1fx)",
+		repeaters, one, many, ratio)
+	if ratio > 10 {
+		t.Fatalf("v3 GETBULK cost scales with max-repetitions: %.0f allocs at M=1 vs %.0f at M=100 (%.1fx); "+
+			"the v3 call site is not handing buildBulkVarbinds the response ceiling", one, many, ratio)
+	}
 }
 
 // TestGetBulkBoundedMatchesUnbounded_6551 is the over-reach guard. Stopping the
@@ -471,6 +590,126 @@ func onlyVarbindEncodedLen(t *testing.T, resp []byte) int {
 		t.Fatalf("resp: varbind length %d out of range (list body %d)", n, len(vbListBody))
 	}
 	return n
+}
+
+// TestWireVarbindByteFloors_6551 binds the two wire-level facts the size
+// arithmetic around minVarbindEncodedBytes rests on, so neither can decay into
+// prose the decoder no longer supports.
+//
+//  1. RESPONSE side: a varbind whose OID came off the wire cannot reach the
+//     6-byte floor. berDecodeOID rejects an empty body and turns any non-empty
+//     one into at least two components, which berEncodeOID re-encodes to at
+//     least one content byte, so 7 is the true minimum for a wire-derived
+//     varbind. 6 remains a valid floor — that is why the structural cap is
+//     sound — but it is a conservative one, not the reachable minimum.
+//
+//  2. REQUEST side: decodePDUFields does NOT require a varbind to carry a value
+//     TLV, so the densest packing it accepts is a 5-byte varbind, not the
+//     7-byte well-formed one. Any bound on how many OIDs a single datagram can
+//     deliver — and therefore on how many GET/GETNEXT operations one request
+//     can buy — has to use 5.
+func TestWireVarbindByteFloors_6551(t *testing.T) {
+	// (1) Every single-content-byte OID body decodes to two components and
+	// re-encodes to a varbind of at least 7 bytes.
+	for _, b := range []byte{0x00, 0x2b, 0x7f, 0xff} {
+		oid, err := berDecodeOID([]byte{b})
+		if err != nil {
+			t.Fatalf("berDecodeOID(%#02x): %v", b, err)
+		}
+		if len(oid) < 2 {
+			t.Fatalf("berDecodeOID(%#02x) = %v; a wire OID always yields >= 2 components", b, oid)
+		}
+		if n := varbindEncodedLen(varbind{oid: oid, tag: tagEndOfMibView}); n < 7 {
+			t.Fatalf("wire-derived varbind for %v encodes to %d bytes; want >= 7 "+
+				"(the %d-byte floor is only reachable with an empty OID body)",
+				oid, n, minVarbindEncodedBytes)
+		}
+	}
+	if _, err := berDecodeOID(nil); err == nil {
+		t.Fatalf("berDecodeOID accepted an empty body; the %d-byte floor would then be wire-reachable",
+			minVarbindEncodedBytes)
+	}
+	// The floor itself stays attainable through the encoder, which is what
+	// keeps it a floor rather than an overestimate.
+	if n := varbindEncodedLen(varbind{oid: []int{1}, tag: tagEndOfMibView}); n != minVarbindEncodedBytes {
+		t.Fatalf("short-OID varbind encodes to %d bytes, floor is %d", n, minVarbindEncodedBytes)
+	}
+
+	// (2) A request varbind carrying no value TLV at all is accepted, and its
+	// OID is delivered to the handler exactly like a well-formed one's.
+	valueless := []byte{tagSequence, 0x03, tagObjectIdentifier, 0x01, 0x2b}
+	wellFormed := berEncodeTLV(tagSequence,
+		append(berEncodeTLV(tagObjectIdentifier, berEncodeOID([]int{1, 3})),
+			berEncodeTLV(tagNull, nil)...))
+	if len(valueless) != 5 || len(wellFormed) != 7 {
+		t.Fatalf("varbind sizes changed: valueless %d bytes, well-formed %d bytes; want 5 and 7",
+			len(valueless), len(wellFormed))
+	}
+	for name, vb := range map[string][]byte{"valueless": valueless, "well-formed": wellFormed} {
+		pduBody := berEncodeIntegerTLV(1)                           // request-id
+		pduBody = append(pduBody, berEncodeIntegerTLV(0)...)        // non-repeaters
+		pduBody = append(pduBody, berEncodeIntegerTLV(0)...)        // max-repetitions
+		pduBody = append(pduBody, berEncodeTLV(tagSequence, vb)...) // varbind list
+		_, _, _, oids, err := decodePDUFields(pduBody)
+		if err != nil {
+			t.Fatalf("%s varbind: decodePDUFields: %v", name, err)
+		}
+		if len(oids) != 1 || !oidEqual(oids[0], []int{1, 3}) {
+			t.Fatalf("%s varbind decoded to %v; want exactly one OID [1 3] "+
+				"(a value TLV is not required, so 5 bytes is the densest accepted packing)",
+				name, oids)
+		}
+	}
+
+	// (3) The GET/GETNEXT operation ceiling that follows from (2): one
+	// operation per decoded request OID, so the most a single datagram can buy
+	// is however many varbinds fit the maxPacketSize read buffer. Packed with
+	// value-less varbinds that is materially more than the well-formed packing,
+	// which is exactly why the ceiling has to be derived from 5 bytes.
+	valuelessOIDs := densestGetNextOIDs(t, valueless)
+	wellFormedOIDs := densestGetNextOIDs(t, wellFormed)
+	if valuelessOIDs <= wellFormedOIDs {
+		t.Fatalf("value-less packing delivered %d OIDs, well-formed %d; the denser packing must win",
+			valuelessOIDs, wellFormedOIDs)
+	}
+	if valuelessOIDs < 700 || valuelessOIDs > 900 {
+		t.Fatalf("densest GETNEXT datagram delivers %d OIDs; README documents ~800 operations "+
+			"as the per-datagram ceiling", valuelessOIDs)
+	}
+	t.Logf("max-size GETNEXT delivers %d OIDs packed value-less (%d bytes each) vs %d well-formed (%d bytes each)",
+		valuelessOIDs, len(valueless), wellFormedOIDs, len(wellFormed))
+}
+
+// densestGetNextOIDs packs copies of one encoded request varbind into the
+// largest v2c GETNEXT datagram that still fits maxPacketSize and returns how
+// many OIDs the agent's decoder actually delivers from it — i.e. how many
+// findNextOIDSnap operations that one datagram buys.
+func densestGetNextOIDs(t *testing.T, vb []byte) int {
+	t.Helper()
+	var packed []byte
+	for {
+		cand := append(packed, vb...)
+		pdu := berEncodeIntegerTLV(1)                         // request-id
+		pdu = append(pdu, berEncodeIntegerTLV(0)...)          // error-status
+		pdu = append(pdu, berEncodeIntegerTLV(0)...)          // error-index
+		pdu = append(pdu, berEncodeTLV(tagSequence, cand)...) // varbind list
+		msg := berEncodeIntegerTLV(snmpVersion2c)
+		msg = append(msg, berEncodeTLV(tagOctetString, []byte("public"))...)
+		msg = append(msg, berEncodeTLV(pduGetNextRequest, pdu)...)
+		if len(berEncodeTLV(tagSequence, msg)) > maxPacketSize {
+			break
+		}
+		packed = cand
+	}
+	pdu := berEncodeIntegerTLV(1)
+	pdu = append(pdu, berEncodeIntegerTLV(0)...)
+	pdu = append(pdu, berEncodeIntegerTLV(0)...)
+	pdu = append(pdu, berEncodeTLV(tagSequence, packed)...)
+	_, _, _, oids, err := decodePDUFields(pdu)
+	if err != nil {
+		t.Fatalf("densest GETNEXT PDU: decodePDUFields: %v", err)
+	}
+	return len(oids)
 }
 
 // TestGetBulkTrimmedTailIsWellFormed_6551 checks the truncated response is one a

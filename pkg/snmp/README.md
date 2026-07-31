@@ -535,13 +535,27 @@ packet handlers, and MIB view that call into them.
   Equivalence-vs-unbounded and encoder-parity guards:
   `TestGetBulkBoundedMatchesUnbounded_6551`,
   `TestVarbindEncodedLenMatchesEncoder_6551`.
-  **GET/GETNEXT have no equivalent amplification**: RFC 3416 §4.2.1/§4.2.2 bind
-  them to exactly one response varbind per request varbind, so their walk is
-  O(`len(oids)`) — linear in the request datagram, with no `max-repetitions`
-  multiplier — and every varbind built is a varbind the manager asked for. A
-  max-size GETNEXT (239 deep ifXTable OIDs) costs ~33 ms and returns all 239
-  varbinds in a full 4095-byte response; that cost is `findNextOIDSnap` being a
-  linear MIB scan, not unbounded expansion, and is not addressed here.
+  **GET/GETNEXT have no equivalent amplification.** The argument is an
+  OPERATION COUNT, not a byte count: RFC 3416 §4.2.1/§4.2.2 bind them to exactly
+  one response varbind per request varbind, so the work is one
+  `findNextOIDSnap` + `getOIDValueSnap` pair per DECODED REQUEST OID and every
+  varbind built is one the manager asked for. There is no `max-repetitions`
+  field and nothing else a request can set to make a single OID cost more than
+  one operation — that is the whole difference from GETBULK, whose `R*M` grid is
+  a request-controlled multiplier on top of the OID count. The only lever left
+  is how many OIDs one datagram can carry, and that is a fixed ceiling: the read
+  buffer is `maxPacketSize` (4096 bytes) and `decodePDUFields` does not require
+  a request varbind to carry a value TLV at all, so the densest packing it
+  accepts is a five-byte varbind (`30 03 06 01 2B`) — on the order of 800 OIDs
+  per datagram, not the ~580 a well-formed seven-byte varbind allows.
+  `TestWireVarbindByteFloors_6551` pins that five-byte minimum, and the
+  companion fact on the response side: `berDecodeOID` rejects an empty body and
+  yields at least two components, so a varbind built from a wire OID re-encodes
+  to at least seven bytes and the six-byte `minVarbindEncodedBytes` floor used
+  for the structural cap is conservative rather than reachable. A max-size
+  GETNEXT (239 deep ifXTable OIDs) costs ~33 ms and returns all 239 varbinds in
+  a full 4095-byte response; that cost is `findNextOIDSnap` being a linear MIB
+  scan, not unbounded expansion, and is not addressed here.
 - **GETBULK varbind order is repetition-major (RFC 3416 §4.2.3, #5065).** For
   `R` repeater columns and `M` repetitions the response interleaves by
   repetition — `rep0-col0, rep0-col1, …, rep1-col0, …` (varbind index

@@ -62166,3 +62166,63 @@ break — `go vet` confirmed passing under every revert.
   Full pkg/snmp suite green, plain and -race.
 - **File(s)**: pkg/snmp/{agent.go,v3.go,README.md},
     pkg/snmp/getbulk_work_bound_6551_test.go, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6551 / PR #6596 — fold the two Codex MERGE-NEEDS-MINOR findings.
+  Both were gaps between what the tests and docs CLAIMED and what they actually
+  BOUND; the bound itself and the over-reach oracle were sound and are unchanged.
+  Finding 1 — the v3 CALL SITE was not guarded.
+  TestGetBulkCostDoesNotScaleWithMaxRepetitions_6551 said it guarded both call
+  sites but drove only handlePacket (v2c), and TestGetBulkBuildBoundedV3_6551
+  calls buildBulkVarbinds itself with the real ceiling, so its built-count
+  assertions hold no matter what budget v3.go passes. Everything else it checks
+  about the response — size, error-status, varbind count — is identical bounded
+  or not, because the fix is output-neutral, so only a COST assertion can see
+  the difference. Codex proved it: unbounding ONLY the v3 production call left
+  every #6551 test green. Added
+  TestGetBulkCostDoesNotScaleWithMaxRepetitionsV3_6551, a separate end-to-end
+  guard on the real v3 dispatcher (v3MaxRepeaterBulkRequest ->
+  handlePacketFrom), deliberately NOT sharing a helper with the v2c sibling so
+  the two surfaces stay independently covered. It measures work as ALLOCATIONS
+  rather than wall time (testing.AllocsPerRun): every grid cell allocates a
+  walked OID and an encoded value, so the count tracks cells walked, and unlike
+  a duration it cannot be moved by machine load. Pinned property is the v2c
+  sibling's — M=1 and M=100 must cost the same once the ceiling is reached.
+  Also corrected the v2c test's comment, which claimed both call sites.
+  Finding 2 — the byte-count proof was not true of wire-decoded input. The
+  minVarbindEncodedBytes = 6 floor needs an EMPTY encoded OID, but berDecodeOID
+  rejects an empty body and turns any non-empty one into >= 2 components, so a
+  varbind built from a wire OID re-encodes to >= 7 bytes and 6 is unreachable
+  from the wire. Conversely decodePDUFields does NOT require a request varbind
+  to carry a value TLV, so the densest ACCEPTED request packing is 5 bytes, not
+  7. Rewrote the constant's comment: 6 stays as the floor (the structural cap
+  only needs a valid lower bound, and a loose floor makes it conservative, never
+  unsound), with the wire minimum of 7 stated explicitly and the cap's scope
+  narrowed to CELL COUNT, not "the response fits". Rewrote the GETNEXT scope
+  paragraph in pkg/snmp/README.md to lead with the OPERATION COUNT argument,
+  which is the real reason — one findNextOIDSnap/getOIDValueSnap pair per
+  decoded request OID, no max-repetitions multiplier — and derived the
+  per-datagram ceiling from the true 5-byte minimum. Added
+  TestWireVarbindByteFloors_6551 to bind all of it as fact instead of prose:
+  berDecodeOID rejects an empty body and always yields >= 2 components, a
+  wire-derived varbind is >= 7 bytes, the 6-byte floor is still attainable
+  through the encoder, a value-less 5-byte request varbind is accepted and its
+  OID delivered, and a max-size GETNEXT carries 812 value-less OIDs vs 580
+  well-formed (measured, matching the ~800 the README now documents).
+  Validation. Fail-on-revert probes in a THROWAWAY detached worktree
+  (/dev/shm/probe-6596), never in the PR worktree, one call site at a time,
+  go build ./... and go vet ./... CLEAN in both so neither red is a build break:
+  unbound v3 only -> ONLY TestGetBulkCostDoesNotScaleWithMaxRepetitionsV3_6551
+  fails, 18,419 allocs at M=1 vs 3,446,385 at M=100 (187.1x, threshold 10x),
+  while the v2c cost test still passes at 1.1x and TestGetBulkBuildBoundedV3_6551
+  still passes — reproducing Codex's result exactly. Unbound v2c only -> ONLY
+  TestGetBulkCostDoesNotScaleWithMaxRepetitions_6551 fails, 1.33 ms vs 513.32 ms
+  (385.1x), while the new v3 test stays green at 1.0x. Each revert takes exactly
+  one test red, which is what proves the two call sites are covered separately
+  rather than by one test that re-masks the split. Over-reach oracle
+  TestGetBulkBoundedMatchesUnbounded_6551 stayed GREEN under BOTH reverts. Full
+  pkg/snmp suite green; the #6551 set run 5x for flake. gofmt clean on both
+  touched files (pkg/snmp/v3_auth_test.go is gofmt-unclean at origin/master too
+  — pre-existing, untouched here).
+- **File(s)**: pkg/snmp/getbulk_work_bound_6551_test.go, pkg/snmp/README.md,
+    _Log.md
