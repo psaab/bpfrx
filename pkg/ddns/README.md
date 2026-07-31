@@ -205,13 +205,18 @@ distinct surfaces had to be closed, and the split between them is structural:
   of the fixed sentences plus class detection for the four input-bearing shapes,
   and **every return names one of the `cause*` constants** — that invariant, not
   the enumeration, is the safety property, and an unrecognised cause fails CLOSED
-  to `malformed URL`. `TestURLParseCauseAlwaysReturnsAConstant` pins it, and is
-  MUTATION-VERIFIED: it derives its allowed set independently (a literal list in
-  the test file, never ranged over a production variable) and feeds synthetic
-  `*url.Error` values whose inner cause is not any recognised `net/url` message,
-  so a pass-through surfaces the sentinel. Making the fallback, the class
-  branches, or the allowlist branches return the input-derived string each turns
-  it RED.
+  to `malformed URL`. It is enforced two ways, because neither alone is enough.
+  The return type is a closed `parseReason` enum, so a bare `return cause` does
+  not COMPILE; and `TestURLParseCauseReturnsOnlyDeclaredConstants` walks
+  `urlParseCause`'s AST asserting every return is a bare identifier naming a
+  declared constant, which also rejects the `parseReason(cause)` conversion form
+  (that one compiles and vets clean) and covers branches no test input reaches.
+  `TestURLParseCauseAlwaysReturnsAConstant` remains as the VALUE check — it
+  derives its allowed set from a literal list in the test file, never from a
+  production variable, and feeds synthetic `*url.Error` values whose inner cause
+  is no recognised `net/url` message. It is a coverage check by nature: a
+  selective pass-through on an unexercised branch slips past it, which is exactly
+  why the AST gate exists.
 - **The URL display itself.** No refusal prints ANY part of the URL, from any
   branch. Redacting instead of omitting is not enough, because `config.RedactURL`
   is a best-effort string scrubber rather than a parser and has at least three
@@ -228,7 +233,27 @@ distinct surfaces had to be closed, and the split between them is structural:
   (The general `RedactURL` weakness is tracked as #6609; this validator
   deliberately does not depend on it either way.)
 
-`scrubURLError` is not reusable in any of this because it recovers a safe URL by
+**The TRANSPORT path needed the same treatment.** All of the above guards the
+VALIDATOR — the paths that refuse a malformed `checkip-url`. A perfectly VALID
+`checkip-url` is accepted and handed to `doRequest`, which renders a transport
+failure through `scrubURLError`; that helper cleared `RawQuery` and `User` but
+**not** `Fragment`, and `url.URL.Redacted()` renders the fragment. So
+`https://checkip.example/p#apikey=SECRET` — a completely valid URL — put the
+token in the journal and in the dedup key on every failed probe. `scrubURLError`
+now clears `Fragment`/`RawFragment` too, which fixes it for every HTTP backend at
+once (all six request paths share `doRequest`). Note this makes **two**
+independent URL scrubbers in the tree that both dropped the query and both kept
+the fragment — `config.RedactURL` has the same blind spot, tracked as #6609; do
+not assume one is safe because the other is.
+`TestCheckIPTransportFailureRedactsFragment` (injected RoundTripper),
+`TestScrubURLErrorClearsFragment` (the shared helper, covering fragment-only,
+query+fragment and userinfo+fragment) and
+`TestCheckIPTransportFailureWarnRedactsFragment` (daemon-level: a real listener
+bound then closed, asserting on rendered log bytes and the dedup map) are the
+gates. They are the only tests here that reach transport at all — every other
+test in this area feeds an INVALID URL that is refused first.
+
+`scrubURLError` is not reusable in the VALIDATOR paths because it recovers a safe URL by
 RE-PARSING, and this is precisely the URL that does not parse. The commit-time
 mirror (`config.validateSurfaceADDNSWarnings`) applies the same parse-first
 split. `TestValidateCheckIPURLRedactsCredentials`,

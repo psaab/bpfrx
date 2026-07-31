@@ -425,10 +425,27 @@ func doRequest(ctx context.Context, client *http.Client, req *http.Request) (int
 }
 
 // scrubURLError renders an HTTP-client error without leaking secrets carried in
-// the request URL's userinfo/query. A *url.Error embeds the full URL in its
-// Error() string; we replace it with the same URL stripped of userinfo and query
-// (the host+path are not sensitive). Any other error is returned verbatim (it
-// never carries the URL).
+// the request URL's userinfo, query or fragment. A *url.Error embeds the full
+// URL in its Error() string; we replace it with the same URL stripped of all
+// three (the host+path are not sensitive). Any other error is returned verbatim
+// (it never carries the URL).
+//
+// The FRAGMENT clear is not cosmetic (#6545 review). A fragment carries an auth
+// token exactly as routinely as a query does, url.URL.Redacted() renders it, and
+// this string is the one the Surface A observer both LOGS and retains as its
+// checkIPProbeWarned dedup map key — so a valid checkip-url of the shape
+// "https://checkip.example/p#apikey=SECRET" put an operator token in journald on
+// every transport failure. Nothing upstream catches it either: a URL like that
+// is entirely VALID, so validateCheckIPURL accepts it and the request is built
+// and attempted. Note this is the SECOND scrubber in the tree with that blind
+// spot — config.RedactURL drops the query and keeps the fragment the same way
+// (tracked as #6609); do not assume the other one is safe because this one is.
+//
+// A URL that fails to re-parse keeps ue.URL verbatim. That is unreachable from
+// the DDNS paths (every request URL parsed on the way in) and left as-is
+// deliberately: this helper renders errors for URLs the client already accepted,
+// unlike checkip's validateCheckIPURL, whose whole job is the unparseable case
+// and which therefore prints no URL at all.
 func scrubURLError(err error) string {
 	var ue *url.Error
 	if !errors.As(err, &ue) {
@@ -438,6 +455,8 @@ func scrubURLError(err error) string {
 	if u, perr := url.Parse(ue.URL); perr == nil {
 		u.RawQuery = ""
 		u.User = nil
+		u.Fragment = ""
+		u.RawFragment = ""
 		safe = u.Redacted()
 	}
 	return fmt.Sprintf("%s %q: %v", ue.Op, safe, ue.Err)

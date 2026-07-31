@@ -249,7 +249,7 @@ func TestCheckIPMalformedURLErrorRedactsCredentials(t *testing.T) {
 // constant for the input-derived string still passed. Copying the values by hand
 // is the point — if production adds a reason, this list must be edited too, and
 // that edit is exactly the review moment the gate exists to create.
-var urlParseCauseAllowed = map[string]bool{
+var urlParseCauseAllowed = map[parseReason]bool{
 	"malformed URL":                                  true,
 	"missing protocol scheme":                        true,
 	"invalid control character in URL":               true,
@@ -288,7 +288,7 @@ func TestURLParseCauseAlwaysReturnsAConstant(t *testing.T) {
 				"declared in this test file; the helper must never return a string derived "+
 				"from its input", label, got)
 		}
-		if strings.Contains(got, checkIPCredential) {
+		if strings.Contains(string(got), checkIPCredential) {
 			t.Errorf("urlParseCause leaked the credential for %s: %q", label, got)
 		}
 	}

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -121,5 +123,66 @@ func TestCheckIPProbeWarnRedactsCredential(t *testing.T) {
 					leaked)
 			}
 		})
+	}
+}
+
+// TestCheckIPTransportFailureWarnRedactsFragment covers the TRANSPORT path, which
+// every other test in this file misses (#6545 review, security MAJOR).
+//
+// The cases above all feed INVALID checkip-urls, which pkg/ddns refuses before a
+// request is ever built — so none of them reaches doRequest/scrubURLError. A
+// perfectly VALID checkip-url that merely fails to connect takes that other
+// route, and scrubURLError used to clear the query and userinfo but not the
+// FRAGMENT. A fragment carries an auth token as routinely as a query does, so
+// "https://host/p#apikey=SECRET" put the token in the journal AND in the
+// process-lifetime dedup key on every failed probe.
+//
+// The failure is injected by binding a real listener and closing it, so the
+// probe gets a deterministic connection-refused against localhost — no network,
+// no timeout, and a genuinely VALID URL end to end.
+func TestCheckIPTransportFailureWarnRedactsFragment(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	base := srv.URL
+	srv.Close() // port now refuses: a transport failure, not a validation refusal
+
+	checkIPURL := base + "/path#apikey=" + checkIPWarnSentinel
+
+	buf := captureRenderedWarnings(t)
+	d := newCheckIPObserverDaemon(t)
+	obs := d.surfaceAObserver(&config.Config{})
+	scope := checkIPScope(&config.DDNSProvider{
+		Name: "prov", Backend: "duckdns", CheckIPURL: checkIPURL,
+	})
+
+	if _, ok := obs(context.Background(), scope); ok {
+		t.Fatal("a checkip probe against a closed port must not yield an observation")
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "checkip probe failed") {
+		t.Fatalf("the checkip probe warning did not fire; captured log:\n%s", out)
+	}
+	// Prove we took the TRANSPORT path, not a validation refusal — otherwise
+	// this test would silently degrade into a duplicate of the ones above.
+	if !strings.Contains(out, "request failed") {
+		t.Fatalf("the warning is not a transport failure; captured log:\n%s\n"+
+			"this test must exercise doRequest/scrubURLError, not validateCheckIPURL", out)
+	}
+	if strings.Contains(out, checkIPWarnSentinel) {
+		t.Fatalf("a transport failure on a VALID checkip-url wrote the fragment credential "+
+			"to the log:\n%s\nit must contain %q nowhere — scrubURLError must clear the "+
+			"fragment alongside the query and userinfo.", out, checkIPWarnSentinel)
+	}
+
+	var leaked []string
+	d.surfaceA.checkIPProbeWarned.Range(func(k, _ any) bool {
+		if s, isStr := k.(string); isStr && strings.Contains(s, checkIPWarnSentinel) {
+			leaked = append(leaked, s)
+		}
+		return true
+	})
+	if len(leaked) > 0 {
+		t.Fatalf("the checkIPProbeWarned dedup map retains the fragment credential as a KEY "+
+			"for the lifetime of the process: %q", leaked)
 	}
 }

@@ -62433,3 +62433,51 @@ break — `go vet` confirmed passing under every revert.
     pkg/config/{compiler_validate_warn_ddns.go,
     compiler_warn_checkip_redaction_6545_test.go},
     pkg/daemon/daemon_ddns_checkip_warn_redaction_6545_test.go, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6545 review fold round 4 (Codex re-gate, MAJOR + MINOR). The
+  validator work was confirmed clean; the leak had moved to a path this PR had
+  not touched, and the invariant guard was weaker than claimed. Both verified
+  firsthand.
+  (1) MAJOR — TRANSPORT-path fragment leak. Every redaction test so far fed an
+  INVALID checkip-url, which pkg/ddns refuses before a request is built, so
+  none of them reached doRequest at all. A perfectly VALID checkip-url takes
+  the other route: CheckIP accepts it, doRequest renders any transport failure
+  through scrubURLError, and scrubURLError cleared RawQuery and User but NOT
+  Fragment while url.URL.Redacted() renders it. So
+  "https://checkip.example/path#apikey=SECRET" — valid by every rule — emitted
+  the token on every failed probe, into BOTH the journal attribute and the
+  process-lifetime checkIPProbeWarned dedup key. Reproduced by writing the test
+  FIRST and confirming RED on the pre-fix head; the query+fragment case is the
+  clearest evidence (query scrubbed, fragment intact). Fixed by clearing
+  Fragment and RawFragment alongside RawQuery and User, which repairs it for
+  all six HTTP request paths at once since they share doRequest. Worth naming:
+  this is the SECOND scrubber in the tree with that exact blind spot —
+  config.RedactURL drops the query and keeps the fragment the same way (#6609)
+  — so neither should be assumed safe from the other.
+  (2) MINOR — the invariant test was a coverage check, not a structural gate,
+  and the doc claimed otherwise. Codex inserted a selective pass-through behind
+  an unexercised prefix and the test still passed, because it only checks the
+  causes it invokes. Fixed two ways, since neither alone suffices: urlParseCause
+  now returns a CLOSED parseReason enum type, so a bare "return cause" does not
+  COMPILE; and a new AST gate walks the function's return statements asserting
+  each is a bare identifier naming a declared parseReason constant, which also
+  rejects the parseReason(cause) CONVERSION form (that compiles and vets clean)
+  and covers branches no input reaches. The value-based test is kept and its
+  doc now states plainly that it is a coverage check.
+  **Validation**: transport tests proven RED on the pre-fix head before the fix
+  existed. Invariant hardening mutation-proven in a throwaway worktree: Codex's
+  EXACT pass-through now fails to COMPILE ("cannot use cause (variable of type
+  string) as parseReason value in return statement"); the conversion form, which
+  builds and vets cleanly, is caught by the AST gate at checkip.go:508 — and
+  running the two gates separately against that mutation shows the value-based
+  one PASSING while the structural one FAILS, which is precisely the hole that
+  was reported. Revert probe for the fragment fix run in a throwaway detached
+  worktree with build+vet clean. gofmt clean on every touched file; go build,
+  go vet on the three packages, and the FULL go test ./... suite green (59
+  packages ok, exit 0). No cluster smoke: control-plane logging hygiene only.
+- **File(s)**: pkg/ddns/{backend_http.go,checkip.go,
+    checkip_transport_fragment_6545_test.go,
+    checkip_cause_structural_6545_test.go,
+    checkip_url_redaction_6545_test.go,README.md},
+    pkg/daemon/daemon_ddns_checkip_warn_redaction_6545_test.go, _Log.md

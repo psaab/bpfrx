@@ -376,25 +376,36 @@ func validateCheckIPURL(u string) error {
 	return nil
 }
 
-// The COMPLETE set of reasons urlParseCause can return. Every one is a Go
-// constant, and every return in urlParseCause names one of them — that is the
-// safety property, and unlike the previous []string-plus-range-variable version
-// it is now actually enforced by the language rather than merely asserted in a
-// comment. Adding a return that is not one of these is a visible edit here.
+// parseReason is a CLOSED enumeration of the reasons urlParseCause may report.
+// It exists to move the no-leak property out of prose and into the type system:
+// urlParseCause returns parseReason, so a bare pass-through of the underlying
+// error text — "return cause" — does not COMPILE. Reintroducing the leak now
+// requires an explicit parseReason(...) conversion, which is a deliberate,
+// greppable edit rather than a plausible-looking slip.
+//
+// Being honest about the limit: within this package a conversion is still
+// legal, so the type is a barrier against the accidental form, not a proof.
+// TestURLParseCauseReturnsOnlyDeclaredConstants supplies the proof — it walks
+// urlParseCause's AST and asserts every return statement is a bare identifier
+// naming one of the constants below, which rejects the conversion form too and,
+// unlike a value-based check, covers branches no test input reaches.
+type parseReason string
+
+// The COMPLETE set of reasons urlParseCause can return.
 const (
-	causeMalformedURL   = "malformed URL"
-	causeMissingScheme  = "missing protocol scheme"
-	causeControlChar    = "invalid control character in URL"
-	causeEmptyURL       = "empty url"
-	causeInvalidURI     = "invalid URI for request"
-	causePathColon      = "first path segment in URL cannot contain colon"
-	causeBadUserinfo    = "invalid userinfo"
-	causeInvalidIPLit   = "invalid IP-literal"
-	causeMissingBracket = "missing ']' in host"
-	causeInvalidPort    = "invalid port after host"
-	causeInvalidHost    = "invalid host"
-	causeBadEscape      = "invalid percent-escape"
-	causeBadHostChar    = "invalid character in host"
+	causeMalformedURL   parseReason = "malformed URL"
+	causeMissingScheme  parseReason = "missing protocol scheme"
+	causeControlChar    parseReason = "invalid control character in URL"
+	causeEmptyURL       parseReason = "empty url"
+	causeInvalidURI     parseReason = "invalid URI for request"
+	causePathColon      parseReason = "first path segment in URL cannot contain colon"
+	causeBadUserinfo    parseReason = "invalid userinfo"
+	causeInvalidIPLit   parseReason = "invalid IP-literal"
+	causeMissingBracket parseReason = "missing ']' in host"
+	causeInvalidPort    parseReason = "invalid port after host"
+	causeInvalidHost    parseReason = "invalid host"
+	causeBadEscape      parseReason = "invalid percent-escape"
+	causeBadHostChar    parseReason = "invalid character in host"
 )
 
 // urlParseCause renders WHY url.Parse rejected an input, guaranteeing the result
@@ -404,9 +415,15 @@ const (
 // above. Nothing derived from the argument is ever returned — not even after
 // inspection, and not via a variable that merely happens to hold a literal.
 // That, not any particular enumeration below, is what makes this safe, and it
-// holds no matter how net/url's messages change. An earlier version claimed
-// this while returning a range variable over a mutable []string; the switch
-// below is the claim actually implemented.
+// holds no matter how net/url's messages change.
+//
+// Two earlier versions of this comment overstated things, so the enforcement is
+// spelled out: the parseReason return type makes a bare pass-through fail to
+// COMPILE, and TestURLParseCauseReturnsOnlyDeclaredConstants walks this
+// function's AST to assert every return is a bare constant identifier. The
+// value-based test alongside it only covers causes it invokes, which is why the
+// AST check exists — a selective pass-through on an unexercised branch is
+// invisible to input-driven testing.
 //
 // The enumeration exists only to keep the message useful. It is NOT sufficient
 // on its own, and two things make that concrete:
@@ -440,7 +457,7 @@ const (
 // #6606.) It is an ALLOWLIST, never a blocklist: anything unmatched falls
 // through to causeMalformedURL, so a stdlib rewording or a brand-new cause
 // degrades the diagnostic instead of opening a leak.
-func urlParseCause(err error) string {
+func urlParseCause(err error) parseReason {
 	var ue *url.Error
 	if !errors.As(err, &ue) || ue.Err == nil {
 		// Not a url.Parse failure at all (unreachable via url.Parse, which
