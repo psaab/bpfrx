@@ -103,6 +103,18 @@ const (
 	// the clamp, Apply logs a startup Warn naming the reduced window, and
 	// PendingSize/PendingEvicted expose the runtime truth.
 	pendingCapMax = 131072
+
+	// maxDrainPerInsert bounds how many expired slots one insert reclaims.
+	//
+	// insert needs exactly ONE free slot, so draining more than a small
+	// constant per call buys nothing and only lengthens the time the mutex is
+	// held on the client-facing packet path. Leftover expired slots are inert
+	// (matches re-checks the expiry, occupancy excludes them) and are reclaimed
+	// by subsequent inserts: each drains up to this many while the eviction
+	// loop frees one more, so a backlog clears at ~65 slots per admitted
+	// packet — a full 131072-slot ring inside a few seconds at the default
+	// rate, without ever stalling a single packet.
+	maxDrainPerInsert = 64
 )
 
 // pendingCapacityFor sizes the outstanding-request table from the interface's
@@ -323,18 +335,25 @@ func (t *pendingTable) insert(k pendingKey) {
 		t.entries = make(map[pendingKey]pendingEntry)
 	}
 
-	// Reclaim expired slots from the head. The ring is expiry-ordered, so this
-	// stops at the first unexpired slot.
+	// Reclaim expired slots from the head, BOUNDED. The ring is expiry-ordered,
+	// so this stops at the first unexpired slot — but the fast path above only
+	// covers the case where EVERY slot has expired. The adjacent case it does
+	// not cover is the expensive one: capacity-1 slots expired with the newest
+	// still live (a quiet period followed by a single late request). There the
+	// probe fails and an unbounded loop would pop ~131071 slots one at a time,
+	// each with a map lookup and delete, under the mutex on the packet path —
+	// the same multi-millisecond stall, just behind a narrower trigger.
 	//
-	// COST: amortized O(1) — every slot is pushed once and popped once. The
-	// worst case for a single call used to be a full drain of up to `capacity`
-	// slots; the fast path above now takes that case in constant time, so what
-	// remains here is a PARTIAL drain, bounded by the number of slots that
-	// expired while at least one newer slot did not. It is still not STRICT
-	// O(1) — do not claim it is — but there is no longer an unbounded-looking
-	// stall on the packet path.
-	for t.count > 0 && !now.Before(t.ring[t.head].exp) {
+	// insert needs exactly ONE free slot, so reclaiming more than a small
+	// constant per call buys nothing. Whatever is left stays expired-but-inert
+	// (matches re-checks the expiry, occupancy excludes it) and is reclaimed by
+	// later inserts, which drain maxDrainPerInsert each while the eviction loop
+	// below frees one more. Per-call work is therefore bounded by a constant,
+	// and the backlog still clears promptly.
+	drained := 0
+	for t.count > 0 && drained < maxDrainPerInsert && !now.Before(t.ring[t.head].exp) {
 		t.popHeadLocked()
+		drained++
 	}
 
 	// Make room if still full. EVICTION POLICY — evict the OLDEST, do not
@@ -355,6 +374,21 @@ func (t *pendingTable) insert(k pendingKey) {
 	//
 	// This loop pops exactly one slot (count is at most the ring length, and
 	// one pop drops it below), so the at-cap path stays O(1).
+	//
+	// Every pop here displaces an UNEXPIRED binding, so counting each one as a
+	// cap-pressure eviction is exact — no expiry re-check is needed, and adding
+	// one would be dead code. Proof, given the two reclaim steps above:
+	//
+	//	this loop needs count >= capacity to run at all
+	//	  - fast path fired      -> count == 0            -> loop is a no-op
+	//	  - drain popped d > 0   -> count = cap-d < cap   -> loop is a no-op
+	//	  - drain popped d == 0  -> the head is UNEXPIRED (that is why it stopped)
+	//
+	// The bound cannot change this: stopping at d == maxDrainPerInsert would
+	// need cap-64 >= cap. So whenever this loop runs, the head is unexpired by
+	// construction. If either reclaim step above is ever removed, that ceases to
+	// hold and PendingEvicted — an alarm an operator is told to read as damage
+	// in progress — would start firing on a merely idle relay.
 	for t.count >= len(t.ring) {
 		if t.popHeadLocked() {
 			t.evicted++
@@ -479,26 +513,39 @@ func (t *pendingTable) snapshot() []pendingSlot {
 // COUNTED as an eviction, so a shrink shows up in PendingEvicted instead of
 // silently discarding bindings.
 //
-// The bound is the REMAINING room, not the raw capacity. Production always
-// adopts into a table built moments earlier, so the two are the same; but
-// pushLocked's contract is that the caller has already made room, and bounding
-// by capacity alone would silently break it for a non-empty destination —
-// count would run past the ring length and the modular index would overwrite
-// live slots. Bounding by room makes adopt correct for any destination at no
-// cost to the production path.
+// The destination MUST be empty — see the assertion in the body. adopt appends
+// rather than merging, so it cannot preserve expiry ordering against
+// pre-existing entries, and every other operation depends on that ordering.
 func (t *pendingTable) adopt(slots []pendingSlot) {
 	if t == nil || len(slots) == 0 {
 		return
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	room := len(t.ring) - t.count
-	if room < 0 {
-		room = 0 // unreachable while count <= capacity holds; never slice past len
+	// PRECONDITION: the destination must be EMPTY.
+	//
+	// adopt appends; it does not merge. Migrated expiries are whatever the old
+	// table held, so appending them onto a non-empty ring can place an EARLIER
+	// expiry after a later one and break the expiry ordering every other
+	// operation depends on — the full-drain probe would read a stale-but-newer
+	// tail slot and wrongly conclude the whole ring had expired, wiping live
+	// destination bindings, and both the head drain and occupancy's binary
+	// search would mis-locate the boundary.
+	//
+	// This is a programmer-error assertion, not a runtime condition: the sole
+	// production caller (Apply's phase-2.5 migration) adopts into a table built
+	// moments earlier and never launched, so it cannot fire. Failing loudly
+	// here is deliberate — the alternative is silent corruption of the
+	// structure that decides which replies reach clients. An ordered merge
+	// would make the general case work, but no caller needs it and it is not
+	// worth the complexity on a security-relevant path.
+	if t.count != 0 {
+		panic("dhcprelay: pendingTable.adopt requires an empty destination " +
+			"(appending would break the ring's expiry ordering)")
 	}
-	if len(slots) > room {
-		t.evicted += uint64(len(slots) - room)
-		slots = slots[len(slots)-room:] // keep the NEWEST (longest-lived)
+	if capacity := len(t.ring); len(slots) > capacity {
+		t.evicted += uint64(len(slots) - capacity)
+		slots = slots[len(slots)-capacity:] // keep the NEWEST (longest-lived)
 	}
 	for _, s := range slots {
 		t.pushLocked(s.key, s.exp)
@@ -522,14 +569,23 @@ func (t *pendingTable) evictions() uint64 {
 // It is deliberately NOT len(entries), which diverges from ring pressure in
 // both directions and would make the gauge lie:
 //
-//   - too HIGH on an idle relay: expired entries are reclaimed lazily, on the
-//     next insert, so len(entries) can sit above the real live set for as long
-//     as the relay is quiet;
 //   - too LOW under ordinary duplicate inserts: a retransmission consumes a
 //     ring slot without adding a map entry, so a capacity-4 ring holding
 //     A,B,B,B reports len(entries)==2 while the very next insert must evict
 //     live A. Eviction would begin while the displayed ratio still looked
 //     comfortable — the exact opposite of the documented contract.
+//   - too HIGH on an idle relay: expired entries are reclaimed lazily.
+//
+// The raw ring `count` is not right either, and for the SAME false-high
+// reason: expired slots stay counted until some later insert reclaims them, so
+// an idle full table would report capacity/capacity even though the very next
+// insert reclaims the lot and evicts nothing. An operator told to alert on the
+// ratio would be paged by a relay that is simply quiet.
+//
+// So: unexpired ring slots. The expired ones form a contiguous PREFIX (the ring
+// is expiry-ordered), so the boundary is a binary search rather than a walk —
+// O(log capacity) under the mutex, which matters because this is read by
+// Stats() while the packet path is running.
 //
 // Use liveEntries for the count of distinct bindable keys.
 func (t *pendingTable) occupancy() int {
@@ -538,7 +594,23 @@ func (t *pendingTable) occupancy() int {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.count
+	return t.count - t.expiredPrefixLocked(t.now())
+}
+
+// expiredPrefixLocked returns how many slots at the head have expired. The ring
+// is expiry-ordered, so expired slots are a contiguous prefix and the first
+// unexpired index can be found by binary search. Caller holds mu.
+func (t *pendingTable) expiredPrefixLocked(now time.Time) int {
+	lo, hi := 0, t.count
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if now.Before(t.ring[(t.head+mid)%len(t.ring)].exp) {
+			hi = mid // unexpired: the boundary is at or before mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	return lo
 }
 
 // liveEntries returns the number of distinct keys currently in the map. Expired

@@ -366,18 +366,32 @@ two full `O(capacity)` scans per admitted packet once full, on the single
 client-facing read goroutine, which saturates a core in exactly the overload the
 table is meant to survive.
 
-The bound is **amortized** O(1), not strict: each slot is pushed once and popped
-once, but a single call can pop more than one slot when several expired
-together. The pathological case — the first insert after a long idle period,
-where *everything* has expired — is taken in **constant time** by a fast path:
-because the ring is expiry-ordered, one probe of the newest slot proves the
-whole ring is dead, so `head`/`count` reset to zero and the map is replaced
-wholesale instead of being deleted key by key. Without it that call popped up to
-`capacity` (131072) slots, each with a map lookup and delete, under the mutex on
-the client-facing packet path — a multi-millisecond stall that also blocked the
-reply loop. What remains is a *partial* drain, bounded by the number of slots
-that expired while at least one newer slot had not.
-`TestPendingTable_FullDrainIsConstantTime` pins this by counting slots examined.
+Per-insert reclaim work is **bounded by a constant**, via two mechanisms that
+cover different cases:
+
+- The *wholly expired* ring — the first insert after a long idle period — is
+  taken in constant time by a fast path: because the ring is expiry-ordered, one
+  probe of the newest slot proves the whole ring is dead, so `head`/`count` reset
+  to zero and the map is replaced wholesale rather than deleted key by key.
+- The *mixed* ring — most slots expired but the newest still live, which is a
+  quiet period followed by a single late request — cannot use that probe, so the
+  head drain is capped at `maxDrainPerInsert` (64) slots per call. Without the
+  cap this case popped ~`capacity` (up to 131071) slots one at a time, each with
+  a map lookup and delete, under the mutex on the client-facing packet path: the
+  same multi-millisecond stall as before, just behind a narrower trigger.
+
+`insert` needs exactly one free slot, so reclaiming more per call buys nothing.
+Leftover expired slots are inert — `matches` re-checks the expiry and
+`PendingSize` excludes them — and later inserts clear the backlog at ~65 slots
+per admitted packet. `TestPendingTable_FullDrainIsConstantTime` and
+`TestPendingTable_PartialDrainIsBounded` pin the two cases by counting slots
+examined; the latter must **stagger** expiries, because a frozen clock makes
+every slot expire together and the mixed case unconstructible.
+
+Because both reclaim steps always free room before the at-capacity eviction loop
+can run, that loop only ever displaces an *unexpired* binding — so counting each
+pop as cap pressure is exact, and `PendingEvicted` cannot fire on a relay that is
+merely idle. `insert` carries the proof.
 
 A key re-inserted before its old slot expires (a retransmission, or the
 SELECTING REQUEST reusing the DISCOVER's xid) simply gets a new slot; the older
@@ -417,11 +431,18 @@ storm this table exists to prevent. Adopted entries keep their **original
 expiry** — a reload must not refresh the TTL, which would widen the attacker's
 xid-guessing window every time the config was touched. If the replacement is
 *smaller* (the rate was lowered), the oldest excess bindings are dropped and
-**counted** in `PendingEvicted` rather than discarded silently. The migration is
-bounded by the destination's *remaining room*, not its raw capacity: production
-always adopts into a table built moments earlier, so the two coincide, but
-bounding by capacity alone would overrun the ring of a non-empty destination and
-overwrite live slots.
+**counted** in `PendingEvicted` rather than discarded silently.
+
+`adopt` **requires an empty destination**, and asserts it. It appends rather than
+merging, so migrated expiries landing after a destination's later ones would
+destroy the expiry ordering everything else depends on: the full-drain probe
+would read a newer-but-expired tail slot, conclude the whole ring was dead, and
+wipe live bindings, while the head drain and `PendingSize`'s binary search would
+mis-locate the boundary. The sole production caller adopts into a table built
+moments earlier and never launched, so the assertion cannot fire in the live
+path — it exists so a future second caller fails loudly instead of silently
+corrupting the structure that decides which replies reach clients. An ordered
+merge would generalise it, but no caller needs one.
 
 **TTL — 30s.** This bounds the window in which a guessed xid would be accepted,
 while covering realistic server latency. RFC 2131 §4.1's retransmission schedule
@@ -450,13 +471,21 @@ one server RTT (tens of ms to a couple of seconds). Alert on the
 size/capacity ratio; treat a rising `PendingEvicted` as damage already in
 progress.
 
-`PendingSize` reports **ring slots in use**, not the map's key count, because
-ring pressure is what triggers eviction. The two diverge in both directions: on
-an idle relay expired entries linger in the map until the next insert reclaims
-them (map count reads *high*), and duplicate inserts consume ring slots without
-adding keys (map count reads *low* — a capacity-4 ring holding `A,B,B,B` has two
-keys but evicts live `A` on the very next insert). Reporting the map count would
-show a comfortable `2/4` at the exact moment eviction began.
+`PendingSize` reports **unexpired ring slots**. Neither of the two obvious
+alternatives is correct:
+
+- the map's key count reads *low*, because duplicate inserts consume ring slots
+  without adding keys — a capacity-4 ring holding `A,B,B,B` has two keys but
+  evicts live `A` on the very next insert, so the gauge would show a comfortable
+  `2/4` at the exact moment eviction began;
+- the raw ring count reads *high*, because expired slots stay counted until some
+  later insert reclaims them — an idle full table would report
+  `capacity/capacity` even though the next insert reclaims the lot and evicts
+  nothing, paging an operator over a relay that is simply quiet.
+
+Expired slots form a contiguous prefix (the ring is expiry-ordered), so the
+boundary is found by binary search — `O(log capacity)` under the mutex, which
+matters because `Stats()` reads this while the packet path is running.
 
 These counters are currently surfaced only by the **on-box console CLI**
 (`show services dhcp relay`) — there is no gRPC RPC or Prometheus collector for

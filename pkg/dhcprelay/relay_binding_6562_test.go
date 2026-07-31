@@ -1226,67 +1226,217 @@ func TestPendingTable_FullDrainIsConstantTime(t *testing.T) {
 	}
 }
 
-// TestPendingTable_AdoptRespectsRemainingRoom pins adopt's bound: it is the
-// REMAINING room, not the raw capacity.
+// TestPendingTable_AdoptRequiresEmptyDestination pins the precondition that
+// makes adopt safe.
 //
-// pushLocked's contract is that the caller has already made room. Bounding by
-// capacity alone breaks it for a non-empty destination — count runs past the
-// ring length and the modular index silently overwrites live slots. Production
-// always adopts into a freshly built table, so this guards the invariant
-// against a future second caller rather than a live path.
-func TestPendingTable_AdoptRespectsRemainingRoom(t *testing.T) {
+// adopt APPENDS; it does not merge. Migrated slots carry the old table's
+// expiries, so appending them onto a non-empty ring can place an EARLIER expiry
+// after a later one and destroy the expiry ordering that every other operation
+// depends on. The concrete corruption: a ring of
+// dst(+4s), dst(+4s), migrated(+2s), migrated(+3s) is no longer ordered, so at
+// t=+3.5s the full-drain probe reads the NEWEST slot (migrated, +3s), finds it
+// expired, concludes the whole ring has expired, and wipes the two destination
+// bindings that are live until +4s. The head drain and occupancy's binary
+// search would mis-locate the boundary the same way.
+//
+// The sole production caller adopts into a table built moments earlier, so this
+// cannot fire in the live path; the assertion exists so a future second caller
+// fails loudly instead of silently corrupting the structure that decides which
+// replies reach clients.
+func TestPendingTable_AdoptRequiresEmptyDestination(t *testing.T) {
 	now := time.Unix(13000, 0)
 	clock := func() time.Time { return now }
-
 	key := func(n byte) pendingKey {
 		return pendingKey{xid: dhcpv4.TransactionID{0, 0, 0, n}, hlen: 6}
 	}
 
-	// Source: four live bindings.
-	src := newPendingTable(8, time.Hour, clock)
-	for i := byte(1); i <= 4; i++ {
-		src.insert(key(i))
-		now = now.Add(time.Second)
-	}
+	src := newPendingTable(8, 2*time.Second, clock)
+	src.insert(key(1))
+	now = now.Add(time.Second)
+	src.insert(key(2))
 	live := src.snapshot()
-	if len(live) != 4 {
-		t.Fatalf("precondition: snapshot = %d, want 4", len(live))
+	if len(live) != 2 {
+		t.Fatalf("precondition: snapshot = %d, want 2", len(live))
 	}
 
-	// Destination: capacity 4, but already holding two of its own.
+	// Destination already holds bindings with LATER expiries than the migrated
+	// ones — exactly the ordering-breaking case.
 	dst := newPendingTable(4, time.Hour, clock)
 	dst.insert(key(0xE1))
 	dst.insert(key(0xE2))
 
+	defer func() {
+		if recover() == nil {
+			t.Error("adopt into a NON-EMPTY destination did not panic; appending " +
+				"migrated expiries onto existing ones breaks the ring's expiry " +
+				"ordering, after which the full-drain probe can wipe live bindings")
+		}
+	}()
 	dst.adopt(live)
+}
 
-	if got := dst.occupancy(); got > dst.capacity() {
-		t.Fatalf("occupancy = %d exceeds capacity %d — adopt overran the ring and "+
-			"overwrote live slots", got, dst.capacity())
-	}
-	if got := dst.occupancy(); got != 4 {
-		t.Errorf("occupancy = %d, want 4 (the ring is full)", got)
-	}
-	// Only two slots were free, so only the two NEWEST carried bindings fit and
-	// the two oldest are counted as evictions.
-	if got := dst.evictions(); got != 2 {
-		t.Errorf("evictions = %d, want 2 — bindings that did not fit must be "+
-			"counted, not silently dropped", got)
-	}
-	for _, n := range []byte{3, 4} {
-		if !dst.matches(key(n)) {
-			t.Errorf("carried binding %d is missing; the newest must be kept", n)
+// TestPendingTable_PartialDrainIsBounded is the binder for the adjacent case the
+// full-drain fast path does NOT cover: MOST slots expired with the newest still
+// live.
+//
+// The failing input is STAGGERED expiries. The previous guard froze the clock,
+// so every slot shared one expiry and the ring was always either wholly expired
+// (fast path) or wholly live — the mixed case could not be constructed, and the
+// unbounded loop it exercises was invisible. Here the clock advances during the
+// fill, then stops just short of the newest slot's expiry: the probe reads a
+// LIVE newest slot, the fast path declines, and an unbounded drain would pop
+// capacity-1 slots one at a time under the mutex on the packet path.
+//
+// Removing the maxDrainPerInsert bound makes this RED.
+func TestPendingTable_PartialDrainIsBounded(t *testing.T) {
+	base := time.Unix(14000, 0)
+	now := base
+	clock := func() time.Time { return now }
+	const capacity = 4096
+	const ttl = 30 * time.Second
+	tbl := newPendingTable(capacity, ttl, clock)
+
+	key := func(i int) pendingKey {
+		return pendingKey{
+			xid:  dhcpv4.TransactionID{byte(i), byte(i >> 8), byte(i >> 16), byte(i >> 24)},
+			hlen: 6,
 		}
 	}
-	for _, n := range []byte{1, 2} {
-		if dst.matches(key(n)) {
-			t.Errorf("carried binding %d was kept; the oldest must be dropped first", n)
-		}
+	// Stagger: one insert per millisecond, so expiries are strictly increasing.
+	for i := 0; i < capacity; i++ {
+		tbl.insert(key(i))
+		now = now.Add(time.Millisecond)
 	}
-	// The destination's pre-existing bindings must not have been clobbered.
-	for _, n := range []byte{0xE1, 0xE2} {
-		if !dst.matches(key(n)) {
-			t.Errorf("pre-existing binding %#x was overwritten by adopt", n)
-		}
+	// Advance so that every slot EXCEPT the newest handful has expired. The
+	// newest slot was inserted at base+(capacity-1)ms and expires at
+	// +ttl; stop one millisecond short of that.
+	now = base.Add(ttl).Add(time.Duration(capacity-2) * time.Millisecond)
+
+	// Precondition: the ring is in the MIXED state, not wholly expired.
+	if got := tbl.occupancy(); got == 0 || got == capacity {
+		t.Fatalf("precondition: occupancy = %d, want a mixed ring (0 < n < %d) — "+
+			"this test is meaningless if the ring is wholly expired or wholly live",
+			got, capacity)
+	}
+
+	before := tbl.scans()
+	tbl.insert(key(capacity)) // the late request after the quiet period
+	scans := tbl.scans() - before
+
+	// An unbounded drain would examine ~capacity slots. The bound is
+	// maxDrainPerInsert plus the single eviction pop.
+	if maxScans := uint64(maxDrainPerInsert + 4); scans > maxScans {
+		t.Errorf("a single insert into a mostly-expired ring examined %d slots "+
+			"(capacity %d); per-insert reclaim must be bounded by ~%d, or one "+
+			"late packet stalls the relay under the mutex",
+			scans, capacity, maxScans)
+	}
+	// The new binding must still be present — bounding the drain must not have
+	// cost correctness.
+	if !tbl.matches(key(capacity)) {
+		t.Error("the newly inserted binding is missing after a bounded drain")
+	}
+}
+
+// TestPendingTable_OccupancyExcludesExpired is the binder for the false-HIGH
+// gauge.
+//
+// The failing input is simply TIME PASSING WITHOUT AN INSERT: expired slots stay
+// counted in the raw ring `count` until some later insert reclaims them, so an
+// idle full table reported capacity/capacity even though the very next insert
+// reclaims the lot and evicts nothing. An operator following the documented
+// advice to alert on the occupancy ratio would be paged by a relay that is
+// merely quiet.
+//
+// Reverting occupancy to return the raw count makes this RED.
+func TestPendingTable_OccupancyExcludesExpired(t *testing.T) {
+	now := time.Unix(15000, 0)
+	clock := func() time.Time { return now }
+	const capacity = 64
+	const ttl = 30 * time.Second
+	tbl := newPendingTable(capacity, ttl, clock)
+
+	key := func(i int) pendingKey {
+		return pendingKey{xid: dhcpv4.TransactionID{byte(i), byte(i >> 8), 0, 0}, hlen: 6}
+	}
+	// Fill the first half, then pause, then fill the second half, so the two
+	// halves expire at clearly different times.
+	for i := 0; i < capacity/2; i++ {
+		tbl.insert(key(i))
+	}
+	now = now.Add(20 * time.Second)
+	for i := capacity / 2; i < capacity; i++ {
+		tbl.insert(key(i))
+	}
+	if got := tbl.occupancy(); got != capacity {
+		t.Fatalf("precondition: occupancy = %d, want %d (ring full, all live)",
+			got, capacity)
+	}
+
+	// Idle past the FIRST half's expiry only. No insert happens, so nothing is
+	// reclaimed — the raw count is still `capacity`.
+	now = now.Add(15 * time.Second)
+
+	if got, want := tbl.occupancy(), capacity/2; got != want {
+		t.Errorf("occupancy = %d, want %d — the gauge must exclude the expired "+
+			"prefix. Reporting the raw ring count shows %d/%d on a relay that is "+
+			"merely idle, and the next insert would reclaim them with no eviction.",
+			got, want, capacity, capacity)
+	}
+
+	// And once everything has expired it must read empty, not full.
+	now = now.Add(time.Hour)
+	if got := tbl.occupancy(); got != 0 {
+		t.Errorf("occupancy on a wholly expired idle table = %d, want 0", got)
+	}
+}
+
+// TestPendingTable_IdleRelayReportsNoEvictions pins the operator-facing
+// property that the two reclaim paths exist to protect: a relay that is merely
+// IDLE must never report cap-pressure evictions.
+//
+// PendingEvicted is documented as damage already in progress, so it must not
+// fire just because a quiet period left the ring full of expired slots. What
+// keeps that true is that the fast path and the bounded drain always free room
+// before the eviction loop can run — see the proof in insert().
+//
+// Scope note, stated because the distinction cost a round here: this does NOT
+// bind an expiry check inside the eviction loop. Such a check is unreachable
+// (whenever the loop runs the head is unexpired by construction), so a mutation
+// that removed it could not be caught by any test — which is precisely why the
+// code carries the proof instead of a defensive re-check. This test binds the
+// reachable property: remove BOTH reclaim steps and expired slots reach the
+// eviction loop and are counted, turning an idle relay into a false alarm.
+func TestPendingTable_IdleRelayReportsNoEvictions(t *testing.T) {
+	base := time.Unix(16000, 0)
+	now := base
+	clock := func() time.Time { return now }
+	const capacity = maxDrainPerInsert * 4
+	const ttl = 30 * time.Second
+	tbl := newPendingTable(capacity, ttl, clock)
+
+	key := func(i int) pendingKey {
+		return pendingKey{xid: dhcpv4.TransactionID{byte(i), byte(i >> 8), 0, 0}, hlen: 6}
+	}
+	for i := 0; i < capacity; i++ {
+		tbl.insert(key(i))
+		now = now.Add(time.Millisecond)
+	}
+	// Expire everything except the newest slot: a mixed ring with a long
+	// expired prefix, which is the state a quiet period leaves behind.
+	now = base.Add(ttl).Add(time.Duration(capacity-2) * time.Millisecond)
+
+	tbl.insert(key(capacity))
+
+	if got := tbl.evictions(); got != 0 {
+		t.Errorf("evictions = %d, want 0 — the slots reclaimed here had EXPIRED, "+
+			"so an idle relay must not look like it is shedding load under cap "+
+			"pressure", got)
+	}
+	// And the reclaim must have actually freed room, which is what makes the
+	// eviction loop unreachable in this state.
+	if got := tbl.occupancy(); got >= capacity {
+		t.Errorf("occupancy = %d, want < capacity %d — the reclaim did not free "+
+			"room, so the eviction loop would run against an expired head", got, capacity)
 	}
 }

@@ -62378,3 +62378,64 @@ break — `go vet` confirmed passing under every revert.
   gofmt -l hits are pre-existing files in other packages, none touched here.
 - **File(s)**: pkg/dhcprelay/{pending.go,README.md,relay_binding_6562_test.go},
     pkg/cli/show_services_dhcp.go, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6562 / PR #6603 third review round — three Codex MINORs on the
+  pending ring (bounded reclaim, adopt precondition, occupancy gauge).
+
+  MINOR 1. The constant-time fast path only covers EVERY slot being expired.
+  The adjacent case — capacity-1 expired with the newest still live, i.e. a
+  quiet period then one late request — failed the probe and fell into an
+  unbounded loop popping ~131071 slots one at a time under the mutex on the
+  packet path: the same stall, narrower trigger. The guard added for the fast
+  path FROZE the clock, so every slot shared one expiry and the mixed ring was
+  unconstructible — the case could not be exercised. FIX: head drain capped at
+  maxDrainPerInsert (64). insert needs exactly ONE free slot, so more buys
+  nothing; leftovers are inert (matches re-checks expiry, occupancy excludes
+  them) and clear at ~65 slots/packet. New guard staggers expiries 1ms apart
+  and asserts the ring is MIXED as a precondition.
+
+  MINOR 2. adopt appended without merging, so migrated expiries could land
+  after a destination's later ones and break the expiry ordering every other
+  operation depends on — the full-drain probe would read a newer-but-expired
+  tail slot, conclude the ring was dead and wipe live bindings. Production
+  adopts into an empty table so this was not a live-path defect, but the doc
+  claimed correctness "for any destination", which was false. FIX: require an
+  empty destination and PANIC otherwise (a programmer-error assertion,
+  unreachable from the sole caller); doc claim corrected in pending.go and
+  README. Chose the assertion over an ordered merge: no caller needs the
+  general case and it is not worth the complexity on a security-relevant path.
+
+  MINOR 3. occupancy() returned the raw ring count, which includes the expired
+  prefix, so an idle full table reported capacity/capacity even though the next
+  insert reclaims the lot and evicts nothing — the same false-HIGH the previous
+  round fixed for len(entries), reintroduced. FIX: report unexpired slots; the
+  expired ones are a contiguous prefix (ring is expiry-ordered), so the
+  boundary is a binary search, O(log capacity) under the mutex.
+
+  SELF-CAUGHT, WORTH RECORDING: while fixing MINOR 1 I added evictHeadLocked so
+  the at-cap eviction loop would not count an expired pop as cap pressure, plus
+  a test asserting it. Mutation-testing the change showed the test could NOT
+  fail. Reachability analysis proved why: the loop needs count >= capacity, but
+  the fast path leaves count 0 and any drain leaves count = cap-d < cap, so
+  whenever the loop runs the head is unexpired BY CONSTRUCTION (d == 64 would
+  need cap-64 >= cap). The defensive check was dead logic and the test was
+  vacuous — exactly the guard-cannot-fire pattern flagged this round. REMOVED
+  both; the proof now lives in a comment in insert(), and the test was reframed
+  to pin the reachable operator-facing property (an idle relay reports no
+  evictions) with an explicit scope note that it does not bind an unreachable
+  expiry re-check.
+
+  VALIDATION — mutation proof per finding in a THROWAWAY detached worktree
+  (/dev/shm/probe-6603i, removed after), build+vet CLEAN in each so every red
+  is an ASSERTION: (1) drain bound removed -> PartialDrainIsBounded RED
+  ("examined 4095 slots (capacity 4096); per-insert reclaim must be bounded by
+  ~68"); (2) empty-destination precondition removed -> AdoptRequiresEmpty
+  Destination RED (no panic); (3) occupancy back to raw count ->
+  OccupancyExcludesExpired RED ("occupancy = 64, want 32" and "= 64, want 0"
+  wholly expired) plus PartialDrainIsBounded's mixed-ring precondition. All
+  re-verified after removing evictHeadLocked. Suites: pkg/dhcprelay
+  -race -count=5 PASS; pkg/dhcp, pkg/dhcpserver, pkg/cli -race PASS; build,
+  vet, gofmt clean.
+- **File(s)**: pkg/dhcprelay/{pending.go,README.md,relay_binding_6562_test.go},
+    _Log.md
