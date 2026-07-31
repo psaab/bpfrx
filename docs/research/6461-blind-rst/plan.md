@@ -1,6 +1,6 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.26.0 — THE TERMINAL CUT, round-109 folds (the
+**Status: DRAFT v10.26.1 — THE TERMINAL CUT, round-109 folds (+ round-109 AGY consistency folds: `effective_transition` joined the struct declaration and every consumer gate reads it; the last two unqualified probation-clear statements qualified) (the
 post-state S2 family is a first-class producer — without it a
 no-P/no-predecessor `(Refused, Installed)` would produce an empty set
 and a surviving older cache entry would keep serving the tuple; the
@@ -1223,7 +1223,8 @@ non-closing promoting packet's ownership promote keeps MASTER's timing
 cut (§10.6); the probation suppression below is the only new promote
 rule. **Probation entries additionally SUPPRESS ownership promotion, Open
 emission, and replication until a committed non-close packet clears the
-flag** (the refused-close → probation-zombie → blind-promote chain,
+flag** (never when the effective transition is `OverdueSkipped`,
+v10.26.1, round-109 AGY 2) (the refused-close → probation-zombie → blind-promote chain,
 resolved precisely: a blind non-close that is FILTERED/TTL-dropped
 neither promotes nor refreshes anything; a blind non-close that COMMITS
 clears the flag and may promote exactly once — and that is not a kill:
@@ -1527,7 +1528,8 @@ likewise skips probation entries (a cache-hit packet that drops at
 MTU/egress after the touch must not refresh). Only the matched entry's
 SUCCESSFUL final-admission commit hook — the same commit arms the
 anchor hooks ride — clears `probation` AND applies the ordinary
-established refresh (stamp `last_seen_ns`, recompute the ordinary
+established refresh (only when the effective transition is not
+`OverdueSkipped`, v10.26.1, round-109 AGY 2) (stamp `last_seen_ns`, recompute the ordinary
 established/per-app timeout, wheel push) in one write; a packet that
 drops anywhere before final admission (input filter, TTL, output
 filter/CoS, redirect-inbox capacity, cache-tail) never clears and
@@ -2915,7 +2917,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.26.0)
+## 11. Open questions for the convergence round (v10.26.1)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
