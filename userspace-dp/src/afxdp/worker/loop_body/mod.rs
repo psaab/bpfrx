@@ -80,7 +80,20 @@ mod debug_report;
 /// So the eliminated orientation needed no extra condition to forward across
 /// generations; the surviving one needs the worker to still be behind after a
 /// control-socket round trip. That is a real reduction in exposure, not a
-/// closure. The fix is to pair validation with a specific forwarding snapshot
+/// closure.
+///
+/// Size it honestly in BOTH directions, though: per occurrence the eliminated
+/// orientation was the worse one, but by RATE it was the rarer one. It needed
+/// the entire publish window — a full `ForwardingState` clone, 69 fields with
+/// ~20 heap-owning collections including the FIB — to nest inside the
+/// nanosecond-scale gap between two adjacent acquire-loads, i.e. a stalled
+/// worker. The survivor needs only the forwarding load to land anywhere inside
+/// that same publish window, which is near-certain for at least one of the
+/// per-VF workers on every apply. This removes the rarer orientation and keeps
+/// the common one; the net exposure reduction is real but smaller than the
+/// preceding paragraph reads on its own.
+///
+/// The fix is to pair validation with a specific forwarding snapshot
 /// atomically (one `ArcSwap` holding both, or generation fields embedded in
 /// `ForwardingState`) — tracked as #6592, deliberately out of scope here.
 ///

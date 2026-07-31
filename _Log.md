@@ -62286,3 +62286,16 @@ break — `go vet` confirmed passing under every revert.
   22.7 Gbps) and needs no re-run for a comment-only change.
 - **File(s)**: pkg/cluster/{election.go,ifmon_weight_daemon_apply_6549_test.go},
     pkg/routing/monitor.go, _Log.md
+
+- **Timestamp**: 2026-07-31 05:20
+  - **Action**: Fold the final-review MINOR-1 on #6291 — the sizing narrative had
+    been corrected from "the residual is benign" into an overstatement in the
+    OPPOSITE direction. Per occurrence the eliminated orientation was the worse
+    one, but by RATE it was the rarer one (it needed a whole FIB-clone publish
+    window to nest inside a nanosecond gap between two adjacent acquire-loads —
+    a stalled worker), while the survivor needs only the forwarding load to land
+    anywhere in that window, near-certain for at least one per-VF worker on
+    every apply. Recorded both directions so the record is not left overstated
+    either way.
+  - **File(s)**: userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+    userspace-dp/src/afxdp/coordinator/README.md

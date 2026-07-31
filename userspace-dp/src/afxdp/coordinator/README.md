@@ -273,7 +273,20 @@ Differences that matter (#1881):
   forwarding load. The eliminated orientation needed no extra condition to
   forward across generations; the surviving one needs the worker to still
   be behind after a control-socket round trip — a real reduction in
-  exposure, not a closure. Closing it needs validation tied atomically to a
+  exposure, not a closure.
+
+  Size that in both directions. Per occurrence the eliminated orientation
+  was the worse one, but by RATE it was the rarer one: it needed the whole
+  publish window (a full `ForwardingState` clone — 69 fields, ~20
+  heap-owning collections, the FIB among them) to nest inside the
+  nanosecond-scale gap between two adjacent acquire-loads, i.e. a stalled
+  worker. The survivor needs only the forwarding load to land anywhere in
+  that same window, which is near-certain for at least one per-VF worker on
+  every apply. So this removes the rarer orientation and keeps the common
+  one — a genuine reduction, but a smaller one than the sentence above
+  reads alone.
+
+  Closing it needs validation tied atomically to a
   specific forwarding snapshot (one `ArcSwap` holding both, or generation
   fields in `ForwardingState`): tracked as **#6592**.
 
