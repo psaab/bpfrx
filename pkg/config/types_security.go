@@ -1291,14 +1291,22 @@ type Application struct {
 	// bracketed protocol list NARROWS it to the first value (so a deny
 	// under-matches). Both are wrong; neither is uniformly "widening".
 	//
-	// A `description` whose text happens to spell a grammar keyword is NOT
-	// recorded here — applicationDirectLeaves reserves each `args: 1` leaf's
-	// value slot before resuming its keyword scan, so `description
-	// destination-port` is a description reading "destination-port", not a
-	// phantom port statement. An unquoted MULTI-word description tail
-	// (`description my web app`) IS recorded, matching the `scalar: true` arity
-	// the schema already enforces for that leaf at commit (schema_security.go,
-	// validateScalarValueLeaf / #3332).
+	// `description` never contributes to this list from its own token run. It is
+	// a TAIL leaf (Junos takes its text to the end of the statement), so
+	// applicationDirectLeaves joins the run into the description text: both
+	// `description destination-port` (text that happens to spell a keyword —
+	// the leaf's value slot is reserved before the keyword scan resumes) and
+	// `description my web app` compile as written rather than being recorded
+	// here. Rejecting a METADATA leaf that cannot affect what the application
+	// matches would be pure friction, and the chained spelling committed on
+	// master.
+	//
+	// The `scalar: true` arity the schema enforces for `description`
+	// (validateScalarValueLeaf / #3332) is untouched and still rejects the
+	// SIBLING spelling at strict commit — it simply never sees the chained one,
+	// where the leaf is nested under a value node. So no config that was
+	// committable on master is newly refused: master's own commit path already
+	// rejected the sibling spelling via SchemaValidate.
 	//
 	// Mirroring UnknownTermLeaves, the offending token is recorded here and the
 	// deferred gate (validateApplicationSyntaxStrict) hard-rejects the first one

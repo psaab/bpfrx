@@ -62238,3 +62238,56 @@ break — `go vet` confirmed passing under every revert.
     compiler_applications_collision.go,compiler_validate_strict_application.go,
     types_security.go,compiler_application_chained_leaves_6524_test.go},
     docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6524 / PR 6604 Codex re-gate fold (MERGE-NEEDS-MAJOR) — stop the
+  chain walk RECOVERING a keyword after unrepresentable content, and give
+  `description` tail handling.
+  MAJOR: applicationDirectLeaves recorded an unknown token, advanced one slot
+  and CONTINUED, so a later recognized keyword was compiled normally. Verified
+  at the VERDICT level on both sides. My head, tolerant path:
+  `set applications application myapp bogus value protocol tcp` compiled
+  protocol=tcp and tcp/22 came back matched=true action=PolicyPermit
+  contentRejected=false — an all-TCP permit. Pristine origin/master (detached
+  worktree, same probe): protocol-less, tcp/22 matched=false action=PolicyDeny
+  contentRejected=true. So the PR converted an inert fail-closed residual into
+  an ACTIVE permit on boot / HA SyncApply, where the strict reject is only a
+  warning. Same root via the other ordering:
+  `destination-port [ 22 23 ] protocol tcp` skipped `23` then recovered
+  `protocol tcp`. Fixed by POISONING the remainder of a node's run and its
+  subtree on the first unrepresentable token — both the unknown-keyword branch
+  and the bracket-tail branch. Sibling leaves are deliberately unaffected
+  (separate nodes), so a stray `bogus value` line still leaves a neighbouring
+  `protocol tcp` line compiled exactly as master compiled it; that is pinned by
+  a paired over-reach guard at the verdict level, because over-poisoning would
+  silently fail-close a whole working config.
+  MINOR (`description`): Codex was RIGHT that my justification was false. I had
+  claimed the schema's scalar:true arity already enforced this at commit; it
+  does so only for the SIBLING spelling — verified firsthand that in the CHAINED
+  spelling SchemaValidate returns nil while my compiler gate rejected, so the
+  chained form WAS a new hard-reject over a metadata leaf. Rather than justify
+  it, made `description` a TAIL leaf (Junos takes its text to end-of-statement):
+  the run is joined, so `description my web app` and `description
+  destination-port` both compile as written, and a description can no longer
+  poison the rest of the run. The run still stops at the next recognized
+  keyword, so the chained-`term` reproducer keeps working. The schema's
+  scalar:true gate is untouched and still rejects the sibling spelling, which
+  master's own commit path also rejected — so no master-COMMITTABLE config is
+  newly refused (master's CompileConfig accepted it in isolation, but
+  SchemaValidate did not).
+  Also: corrected the docs claim that "both sides go through
+  applicationTermNodes" (the compiler consumes applicationDirectLeaves directly;
+  only the collision gate goes through applicationTermNodes — both derive from
+  the same walk), and added an arity pin + scope note to the schema canary,
+  which guards the KEY SET but not `args` drift.
+  Fail-on-revert in a THROWAWAY detached worktree, build+vet CLEAN there:
+  restoring `i++; continue` turns BOTH orderings RED as verdict assertions
+  ("tcp/22 was PERMITTED ..."), while every guard stays GREEN —
+  TestChainedApp{DestPort,SourcePort,ICMPType,Deny}, SiblingAppSpelling,
+  StrayStatementDoesNotDisarmSiblingLeaves, HierarchicalAppBody,
+  SiblingFlatSetAppBody, SiblingTermClobber, DescriptionIsATail.
+  Full pkg/config + pkg/policymatch green; build, vet, gofmt clean.
+- **File(s)**: pkg/config/{compiler_applications.go,types_security.go,
+    compiler_application_chained_leaves_6524_test.go},
+    pkg/policymatch/app_unknown_recovery_6524_test.go,
+    docs/config-schema.md, _Log.md

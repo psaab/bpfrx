@@ -1055,10 +1055,33 @@ Two properties of that scan are load-bearing and easy to get wrong:
   guard the flat Junos namespace (#3472/#3339); while it enumerated
   `inst.node.Children` directly it could not see a chained term, so a generated
   name silently OVERWROTE an authored application and erased any deny
-  referencing it — with no commit error. Both sides now go through
-  `applicationTermNodes` + `applicationTermKeys`. Adding a third reader of the
-  application body means routing it through the same helpers, not open-coding a
-  fourth traversal.
+  referencing it — with no commit error. Both sides now derive from the same
+  walk: the compiler consumes `applicationDirectLeaves` directly, and the
+  collision gate reaches it through `applicationTermNodes`, with both
+  reassembling the term's tokens via `applicationTermKeys` so the predicted
+  name always equals the written one. Adding a third reader of the application
+  body means routing it through those helpers, not open-coding a fourth
+  traversal.
+- **An unrepresentable token POISONS the rest of its run and subtree — it must
+  not be skipped so a later keyword can be recovered.** This is the direction
+  that matters on the tolerant path: master ignored an unrecognized child node
+  whole, so `bogus value protocol tcp` left the application PROTOCOL-LESS and
+  therefore unrepresentable (fail-closed — `pkg/policymatch` reports
+  `ContentRejected`, and the #2124 gate refuses to arm). Skipping `bogus` and
+  compiling the `protocol tcp` that follows converts an inert residual into an
+  ACTIVE all-TCP permit on boot / HA `SyncApply`, where the strict reject is
+  only a warning. The same applies to a bracket tail:
+  `destination-port [ 22 23 ] protocol tcp` must not drop `23` and then recover
+  `protocol tcp`. Unknown direct-body content must leave the application NO
+  WIDER than master. Sibling leaves are unaffected — they are separate nodes,
+  so a stray line does not poison its neighbours.
+- **`description` is a TAIL leaf, not `args: 1`.** Junos takes its text to the
+  end of the statement, so the walk joins the run rather than flagging the tail:
+  `description my web app` and `description destination-port` both compile as
+  written. Rejecting a metadata leaf that cannot affect matching would be pure
+  friction, and the chained spelling committed on master. The `scalar: true`
+  arity the schema enforces for that leaf (#3332) is untouched and still rejects
+  the SIBLING spelling at strict commit — it simply never sees the chained one.
 
 **Known limitation — the chained spelling is enforced but not individually
 editable.** Because the leaves are nested rather than siblings,

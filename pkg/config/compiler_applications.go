@@ -130,9 +130,27 @@ func applicationDirectLeaves(appNode *Node) (leaves []*Node, unknown []string) {
 				if !applicationDirectLeafKeywords[kw] {
 					// Either a typo'd statement or a stray value token; both
 					// carry a constraint the compiler cannot honor.
+					//
+					// POISON the remainder of this run and this node's subtree
+					// rather than skipping the token and RECOVERING the next
+					// recognized keyword. The tokens after an unparsable one
+					// belong to the same statement the parser could not model,
+					// so compiling them yields an application the operator never
+					// authored — and, critically, one that is WIDER than what
+					// master produced. Master ignored an unrecognized child node
+					// whole, so `bogus value protocol tcp` left the application
+					// PROTOCOL-LESS and therefore unrepresentable (fail-closed:
+					// pkg/policymatch reports ContentRejected, the #2124 gate
+					// refuses to arm). Recovering `protocol tcp` out of that same
+					// line turns an inert residual into an ACTIVE all-TCP permit
+					// on the boot / HA SyncApply paths, where the strict reject is
+					// only a warning. Sibling leaves are unaffected: they are
+					// separate nodes, so a stray `bogus value` line still leaves a
+					// neighbouring `protocol tcp` line compiled exactly as master
+					// compiled it.
 					unknown = append(unknown, kw)
-					i++
-					continue
+					descend = false
+					break
 				}
 				if kw == "term" {
 					if i == 0 {
@@ -168,22 +186,53 @@ func applicationDirectLeaves(appNode *Node) (leaves []*Node, unknown []string) {
 					i++
 				}
 				vals := n.Keys[valStart:i]
+				if kw == "description" {
+					// `description` is a TAIL leaf, not an `args: 1` value leaf:
+					// Junos takes its text to the end of the statement, so an
+					// unquoted multi-word description is legal config. Joining
+					// the run keeps `description my web app` intact instead of
+					// recording "web"/"app" as unknown content — which would
+					// hard-reject at commit a spelling master accepted, over a
+					// METADATA leaf with no bearing on what the application
+					// matches. It also stops a description from poisoning the
+					// rest of the run.
+					//
+					// The `scalar: true` arity the schema enforces for this leaf
+					// (validateScalarValueLeaf / #3332) is unchanged and still
+					// rejects the SIBLING spelling at strict commit; it simply
+					// never sees the chained one, and the compiler does not
+					// invent a second, broader arity rule for a leaf that cannot
+					// affect enforcement.
+					leaves = append(leaves, &Node{Keys: []string{kw, strings.Join(vals, " ")}})
+					continue
+				}
+				poisoned := false
 				if len(vals) > 1 {
-					// A single-valued leaf carrying a bracket-list tail.
+					// A single-valued leaf carrying a bracket-list tail. Record
+					// the surplus and poison the rest of the run for the same
+					// reason as an unknown keyword above: `destination-port
+					// [ 22 23 ] protocol tcp` must not drop `23` and then
+					// RECOVER `protocol tcp`, which would arm a TCP permit where
+					// master left the application protocol-less.
 					unknown = append(unknown, vals[1:]...)
+					poisoned = true
 				}
 				if start == 0 {
 					// nodeVal reads this node's own Keys[1], so pass it through
 					// unchanged — byte-identical to the pre-#6524
 					// sibling/hierarchical path.
 					leaves = append(leaves, n)
-					continue
+				} else {
+					syn := &Node{Keys: []string{kw}}
+					if len(vals) > 0 {
+						syn.Keys = append(syn.Keys, vals[0])
+					}
+					leaves = append(leaves, syn)
 				}
-				syn := &Node{Keys: []string{kw}}
-				if len(vals) > 0 {
-					syn.Keys = append(syn.Keys, vals[0])
+				if poisoned {
+					descend = false
+					break
 				}
-				leaves = append(leaves, syn)
 			}
 			if !descend || len(n.Children) == 0 {
 				continue

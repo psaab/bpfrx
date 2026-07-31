@@ -368,6 +368,13 @@ func TestSiblingFlatSetAppBodyUnchanged(t *testing.T) {
 // leaf ADDED to the schema but missed in the map becomes a fail-CLOSED
 // regression on valid config — and a hardcoded expected-list here could never
 // catch that, because the same hand cranks both. Enumerate the schema instead.
+//
+// Scope note: this guards the KEY SET only. It does not catch `args` drift — the
+// walk assumes every one of these leaves takes exactly one value token (with
+// `description` handled as a tail). A future schema leaf declared `args: 2`, or
+// an existing one widened, would need applicationDirectLeaves updated to match;
+// TestApplicationDirectLeafArityIsOne below pins today's assumption so such a
+// change cannot land silently.
 func TestApplicationDirectLeafKeywordsMatchSchema(t *testing.T) {
 	appNode := schemaApplications.children["application"]
 	if appNode == nil || len(appNode.children) == 0 {
@@ -576,6 +583,140 @@ func TestLeafValueSlotReservedAgainstKeywordText(t *testing.T) {
 			"set applications application myapp protocol tcp destination-port [ 22 23 ]"))
 		if err == nil || !strings.Contains(err.Error(), "23") {
 			t.Fatalf("bracket tail must still reject naming 23, got: %v", err)
+		}
+	})
+}
+
+// TestApplicationDirectLeafArityIsOne pins the arity assumption the chain scan
+// is built on: every direct-body leaf takes exactly ONE value token, so the walk
+// can reserve a single value slot and treat everything after it as either the
+// next statement or unrepresentable surplus. `description` is the deliberate
+// exception — it is a TAIL leaf whose run is joined — but it is still declared
+// args:1 in the schema, so it is included here. If a leaf is ever widened to
+// args:2, applicationDirectLeaves must learn to consume that many tokens; this
+// pin makes such a schema change fail loudly instead of silently truncating.
+func TestApplicationDirectLeafArityIsOne(t *testing.T) {
+	appNode := schemaApplications.children["application"]
+	if appNode == nil {
+		t.Fatalf("schemaApplications has no `application` node")
+	}
+	for kw, leaf := range appNode.children {
+		if leaf.args != 1 {
+			t.Errorf("schema leaf %q declares args:%d — applicationDirectLeaves "+
+				"reserves exactly ONE value token per leaf and would truncate or "+
+				"mis-split this statement", kw, leaf.args)
+		}
+	}
+}
+
+// TestUnknownTokenDoesNotRecoverLaterKeywords is the #6524 review-fold MAJOR-2
+// structural half: an unrepresentable token must poison the rest of its run,
+// not be skipped so a later keyword can be compiled. See
+// pkg/policymatch/app_unknown_recovery_6524_test.go for the VERDICT-level half,
+// which is the assertion that actually matters.
+func TestUnknownTokenDoesNotRecoverLaterKeywords(t *testing.T) {
+	cases := []struct {
+		name    string
+		set     string
+		wantDst string
+	}{
+		{"unknown statement then protocol",
+			"set applications application myapp bogus value protocol tcp", ""},
+		{"bracket tail then protocol",
+			"set applications application myapp destination-port [ 22 23 ] protocol tcp", "22"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg, err := CompileConfigLenient(setTree6524(t, c.set))
+			if err != nil {
+				t.Fatalf("lenient compile: %v", err)
+			}
+			app := cfg.Applications.Applications["myapp"]
+			if app == nil {
+				t.Fatalf("application myapp missing")
+			}
+			if app.Protocol != "" {
+				t.Fatalf("Protocol=%q, want \"\" — the token after unrepresentable "+
+					"content was RECOVERED, arming a protocol the operator never "+
+					"authored. Master left this application protocol-less and "+
+					"therefore unrepresentable (fail-closed); recovering it makes "+
+					"the tolerant path WIDER than master (#6524)", app.Protocol)
+			}
+			if app.DestinationPort != c.wantDst {
+				t.Fatalf("DestinationPort=%q, want %q", app.DestinationPort, c.wantDst)
+			}
+		})
+	}
+}
+
+// TestUnknownTokenDoesNotPoisonSiblingLeaves is the paired over-reach guard:
+// poisoning is scoped to the NODE that carries the unparsable token. A stray
+// statement on its own `set` line must NOT suppress a neighbouring leaf, which
+// master compiled normally.
+func TestUnknownTokenDoesNotPoisonSiblingLeaves(t *testing.T) {
+	cfg, err := CompileConfigLenient(setTree6524(t,
+		"set applications application myapp protocol tcp",
+		"set applications application myapp destination-port 8080",
+		"set applications application myapp bogus value",
+	))
+	if err != nil {
+		t.Fatalf("lenient compile: %v", err)
+	}
+	app := cfg.Applications.Applications["myapp"]
+	if app == nil || app.Protocol != "tcp" || app.DestinationPort != "8080" {
+		t.Fatalf("app=%+v, want tcp/8080 — a stray SIBLING statement must not "+
+			"suppress leaves master compiled normally", app)
+	}
+}
+
+// TestDescriptionIsATailLeaf covers the review-fold MINOR. Junos takes a
+// description's text to the end of the statement, so an unquoted multi-word
+// description is legal config that master committed in the chained spelling.
+// Treating it as `args: 1` turned it into a hard commit error over a METADATA
+// leaf that cannot affect what the application matches.
+func TestDescriptionIsATailLeaf(t *testing.T) {
+	t.Run("chained multi-word description commits", func(t *testing.T) {
+		cfg, err := CompileConfig(setTree6524(t,
+			"set applications application myapp protocol tcp description my web app"))
+		if err != nil {
+			t.Fatalf("CompileConfig: %v — an unquoted multi-word description is "+
+				"legal Junos and committed on master in this spelling", err)
+		}
+		app := cfg.Applications.Applications["myapp"]
+		if app == nil || app.Description != "my web app" || app.Protocol != "tcp" {
+			t.Fatalf("app=%+v, want protocol tcp and description %q", app, "my web app")
+		}
+	})
+
+	t.Run("description text spelling a keyword is kept whole", func(t *testing.T) {
+		cfg, err := CompileConfig(setTree6524(t,
+			"set applications application myapp protocol tcp description destination-port"))
+		if err != nil {
+			t.Fatalf("CompileConfig: %v", err)
+		}
+		app := cfg.Applications.Applications["myapp"]
+		if app == nil || app.Description != "destination-port" || app.DestinationPort != "" {
+			t.Fatalf("app=%+v, want description %q and NO destination-port",
+				app, "destination-port")
+		}
+	})
+
+	t.Run("description does not swallow a following statement", func(t *testing.T) {
+		// The run stops at the next recognized keyword, so a chained `term`
+		// after a description is still parsed (this is the shape the #6524
+		// collision reproducer uses).
+		cfg, err := CompileConfig(setTree6524(t,
+			"set applications application myapp description doc term t1 protocol udp"))
+		if err != nil {
+			t.Fatalf("CompileConfig: %v", err)
+		}
+		term := cfg.Applications.Applications["myapp-t1"]
+		if term == nil || term.Protocol != "udp" {
+			t.Fatalf("term app myapp-t1 = %+v, want protocol udp — the description "+
+				"tail must stop at the next recognized keyword", term)
+		}
+		if term.Description != "doc" {
+			t.Fatalf("term Description=%q, want %q", term.Description, "doc")
 		}
 	})
 }
