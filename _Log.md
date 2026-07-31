@@ -62124,6 +62124,128 @@ break — `go vet` confirmed passing under every revert.
     pkg/routing/monitor.go, _Log.md
 
 - **Timestamp**: 2026-07-31
+- **Action**: #6551 — bound the SNMP GETBULK grid AT the response ceiling instead
+  of expanding it fully and trimming afterwards.
+  Reproduced first. With 50 interfaces, a 4094-byte v2c GETBULK carrying 580
+  minimal repeater OIDs and max-repetitions >= 100 built 58,000 varbinds (405 ms
+  inside buildBulkVarbinds) to return 116, and answered in 667 ms end to end
+  against a ~2.5 us single-varbind poll — ~1.5 req/s saturates the single serial
+  SNMP goroutine permanently. The issue's ~36,900 / ~300 ms figures are an
+  undercount; the extra ~260 ms beyond the build is trimToFit binary-searching
+  ~16 full re-encodes of the 58,000-varbind list. repeaterCount = len(oids) -
+  nonRepeaters is capped nowhere on the decode path; only maxRepetitions was
+  clamped (100).
+  Fix: buildBulkVarbinds now takes the same maxBytes ceiling its caller trims to
+  and accumulates the EXACT encoded size of each emitted varbind (bulkBudget /
+  varbindEncodedLen), returning as soon as the varbinds built exceed it. Both
+  call sites — handleGetBulk (v2c, effectiveMaxSize(maxPacketSize)) and the v3
+  dispatcher (effectiveMaxSize(msgMaxSize)) — hand it the ceiling they already
+  computed for trimToFit. Output-neutral: the accumulated varbind bytes are a
+  strict lower bound on any message carrying them, so every dropped cell is one
+  trimToFit would have discarded; RFC 3416 4.2.3 removes surplus bindings from
+  the END of the ordered set, which is exactly the prefix preserved, so #5065
+  repetition-major order and per-column endOfMibView placement are untouched.
+  Post-fix the same request builds 118 varbinds in 48 us and answers in 1.0 ms
+  with a byte-identical 4092-byte / 116-varbind response.
+  Fail-on-revert (neutralize bulkBudget.add to `return false` — compiles clean,
+  no build break): TestGetBulkBuildBounded_6551 RED at 58,000 built vs a 683
+  structural cap, TestGetBulkBuildBoundedV3_6551 RED at 56,400. Neutralizing the
+  CALL SITE instead (math.MaxInt budget) leaves those green, so
+  TestGetBulkCostDoesNotScaleWithMaxRepetitions_6551 covers it end to end —
+  1.4x M=1-vs-M=100 cost ratio with the fix, 309.7x without, threshold 10x.
+  Over-reach guard TestGetBulkBoundedMatchesUnbounded_6551 (9 shapes: small,
+  non-repeaters, MIB-exhausted columns, oversized) compares byte-for-byte
+  against a math.MaxInt-budget build — i.e. against the pre-fix expansion — and
+  stays GREEN under both neutralizations.
+  Sibling check: plain GETNEXT has NO equivalent amplification. RFC 3416
+  4.2.1/4.2.2 bind it to one response varbind per request varbind, so its walk is
+  O(len(oids)) with no max-repetitions multiplier and every varbind built is
+  returned — a max-size 239-deep-OID GETNEXT costs ~33 ms and returns all 239 in
+  a full 4095-byte response. That residual is findNextOIDSnap being a linear MIB
+  scan, not unbounded expansion; scoped out and reported.
+  Full pkg/snmp suite green, plain and -race.
+- **File(s)**: pkg/snmp/{agent.go,v3.go,README.md},
+    pkg/snmp/getbulk_work_bound_6551_test.go, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6551 / PR #6596 — fold the two Codex MERGE-NEEDS-MINOR findings.
+  Both were gaps between what the tests and docs CLAIMED and what they actually
+  BOUND; the bound itself and the over-reach oracle were sound and are unchanged.
+  Finding 1 — the v3 CALL SITE was not guarded.
+  TestGetBulkCostDoesNotScaleWithMaxRepetitions_6551 said it guarded both call
+  sites but drove only handlePacket (v2c), and TestGetBulkBuildBoundedV3_6551
+  calls buildBulkVarbinds itself with the real ceiling, so its built-count
+  assertions hold no matter what budget v3.go passes. Everything else it checks
+  about the response — size, error-status, varbind count — is identical bounded
+  or not, because the fix is output-neutral, so only a COST assertion can see
+  the difference. Codex proved it: unbounding ONLY the v3 production call left
+  every #6551 test green. Added
+  TestGetBulkCostDoesNotScaleWithMaxRepetitionsV3_6551, a separate end-to-end
+  guard on the real v3 dispatcher (v3MaxRepeaterBulkRequest ->
+  handlePacketFrom), deliberately NOT sharing a helper with the v2c sibling so
+  the two surfaces stay independently covered. It measures work as ALLOCATIONS
+  rather than wall time (testing.AllocsPerRun): every grid cell allocates a
+  walked OID and an encoded value, so the count tracks cells walked, and unlike
+  a duration it cannot be moved by machine load. Pinned property is the v2c
+  sibling's — M=1 and M=100 must cost the same once the ceiling is reached.
+  Also corrected the v2c test's comment, which claimed both call sites.
+  Finding 2 — the byte-count proof was not true of wire-decoded input. The
+  minVarbindEncodedBytes = 6 floor needs an EMPTY encoded OID, but berDecodeOID
+  rejects an empty body and turns any non-empty one into >= 2 components, so a
+  varbind built from a wire OID re-encodes to >= 7 bytes and 6 is unreachable
+  from the wire. Conversely decodePDUFields does NOT require a request varbind
+  to carry a value TLV, so the densest ACCEPTED request packing is 5 bytes, not
+  7. Rewrote the constant's comment: 6 stays as the floor (the structural cap
+  only needs a valid lower bound, and a loose floor makes it conservative, never
+  unsound), with the wire minimum of 7 stated explicitly and the cap's scope
+  narrowed to CELL COUNT, not "the response fits". Rewrote the GETNEXT scope
+  paragraph in pkg/snmp/README.md to lead with the OPERATION COUNT argument,
+  which is the real reason — one findNextOIDSnap/getOIDValueSnap pair per
+  decoded request OID, no max-repetitions multiplier — and derived the
+  per-datagram ceiling from the true 5-byte minimum. Added
+  TestWireVarbindByteFloors_6551 to bind all of it as fact instead of prose:
+  berDecodeOID rejects an empty body and always yields >= 2 components, a
+  wire-derived varbind is >= 7 bytes, the 6-byte floor is still attainable
+  through the encoder, a value-less 5-byte request varbind is accepted and its
+  OID delivered, and a max-size GETNEXT carries 812 value-less OIDs vs 580
+  well-formed (measured, matching the ~800 the README now documents).
+  Validation. Fail-on-revert probes in a THROWAWAY detached worktree
+  (/dev/shm/probe-6596), never in the PR worktree, one call site at a time,
+  go build ./... and go vet ./... CLEAN in both so neither red is a build break:
+  unbound v3 only -> ONLY TestGetBulkCostDoesNotScaleWithMaxRepetitionsV3_6551
+  fails, 18,419 allocs at M=1 vs 3,446,385 at M=100 (187.1x, threshold 10x),
+  while the v2c cost test still passes at 1.1x and TestGetBulkBuildBoundedV3_6551
+  still passes — reproducing Codex's result exactly. Unbound v2c only -> ONLY
+  TestGetBulkCostDoesNotScaleWithMaxRepetitions_6551 fails, 1.33 ms vs 513.32 ms
+  (385.1x), while the new v3 test stays green at 1.0x. Each revert takes exactly
+  one test red, which is what proves the two call sites are covered separately
+  rather than by one test that re-masks the split. Over-reach oracle
+  TestGetBulkBoundedMatchesUnbounded_6551 stayed GREEN under BOTH reverts. Full
+  pkg/snmp suite green; the #6551 set run 5x for flake. gofmt clean on both
+  touched files (pkg/snmp/v3_auth_test.go is gofmt-unclean at origin/master too
+  — pre-existing, untouched here).
+- **File(s)**: pkg/snmp/getbulk_work_bound_6551_test.go, pkg/snmp/README.md,
+    _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6551 review-fold round 3 — two documentation inaccuracies from the
+  Codex re-gate of `3f9358151`. No production or test-coverage change. (1)
+  `pkg/snmp/README.md` listed the v2c cost test as guarding "the call sites" and
+  omitted the new v3 cost test; the inventory now names one cost guard per call
+  site (v2c in `agent.go`, v3 in `v3.go`) and records why one test cannot bind
+  both — unbounding v3 alone once left every test green, which is the gap this
+  round closed. (2) The GET/GETNEXT paragraph claimed both perform a
+  `findNextOIDSnap` + `getOIDValueSnap` PAIR per decoded request OID. Verified
+  firsthand against `pkg/snmp/agent.go`: GET calls only `getOIDValueSnap`
+  (:1218), and GETNEXT calls `findNextOIDSnap` (:1242) then `getOIDValueSnap`
+  only when a successor exists (:1247). Reworded to the claim that is actually
+  true and actually load-bearing — a CONSTANT bound of snapshot operations per
+  request OID, i.e. O(1) with no request-controlled multiplier. The
+  amplification conclusion is unchanged; only the arithmetic describing it was
+  wrong. Codex re-gate otherwise confirmed the split is real (half-grid M=50
+  probe still 54.9x, so fixed overhead does not mask a partial regression) and
+  `AllocsPerRun` stable at exactly 8199 over five runs.
+- **File(s)**: pkg/snmp/README.md, _Log.md
 - **Action**: #6554 — constrain the fabric peer-MAC IPv6-NDP fallback to the
   peer's identity. `refreshFabricFwd`'s last-resort leg swept the fabric
   parent's IPv6 NDP table (deliberately seeded by the `ff02::1` all-nodes probe

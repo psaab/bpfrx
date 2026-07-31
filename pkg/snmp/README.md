@@ -492,17 +492,80 @@ packet handlers, and MIB view that call into them.
   `min(request msgMaxSize, 4096)` with `msgMaxSize` clamped up to the RFC
   484-byte floor (a bogus/tiny advertised value cannot starve the response);
   v2c carries no per-request `msgMaxSize` on the wire, so the effective size is
-  the local 4096-byte maximum. During expansion the response is built and then
-  trimmed: the largest leading prefix of varbinds whose encoded message
-  (including the v3 USM/scopedPDU and any auth/priv overhead) fits is kept.
-  `trimToFit` finds that prefix by **binary search** — the encoded length is
-  monotonic in the number of leading varbinds — so it costs O(log n) rebuilds,
-  not the O(n) decrement-and-rebuild it replaced (#4918, which for v3 re-ran
-  USM framing/HMAC/encryption on every dropped varbind). Trimming — not
-  `tooBig` — is the normal outcome; the manager continues the walk with a
-  follow-up GETBULK from the last returned OID. `tooBig` (with an empty varbind
-  list) is returned only in the pathological case where not even a single
-  varbind fits. See `effectiveMaxSize` / `trimToFit` in `agent.go`.
+  the local 4096-byte maximum. The response is trimmed to the largest leading
+  prefix of varbinds whose encoded message (including the v3 USM/scopedPDU and
+  any auth/priv overhead) fits. `trimToFit` finds that prefix by **binary
+  search** — the encoded length is monotonic in the number of leading varbinds —
+  so it costs O(log n) rebuilds, not the O(n) decrement-and-rebuild it replaced
+  (#4918, which for v3 re-ran USM framing/HMAC/encryption on every dropped
+  varbind). Trimming — not `tooBig` — is the normal outcome; the manager
+  continues the walk with a follow-up GETBULK from the last returned OID.
+  `tooBig` (with an empty varbind list) is returned only in the pathological
+  case where not even a single varbind fits. See `effectiveMaxSize` /
+  `trimToFit` in `agent.go`.
+- **The GETBULK grid stops expanding AT the ceiling, it is not expanded and
+  then trimmed (#6551).** `buildBulkVarbinds` takes the same `maxBytes` the
+  caller will trim to and accumulates the exact encoded size of every varbind it
+  emits (`bulkBudget` / `varbindEncodedLen`), stopping the moment the varbinds
+  built already exceed it. Without that stop the whole
+  `repeaters x max-repetitions` grid was materialized first, and
+  `repeaterCount = len(oids) - nonRepeaters` is capped only by how many varbinds
+  a manager can pack into one request datagram — nothing on the decode path
+  bounds it. Every grid cell costs a `findNextOIDSnap` MIB walk plus a
+  `getOIDValueSnap`. Measured with 50 interfaces: a 4094-byte v2c GETBULK with
+  580 minimal repeater OIDs and `max-repetitions >= 100` built **58,000**
+  varbinds to return **116**, ~0.67 s on the single serial SNMP goroutine
+  against a ~2.5 us single-varbind poll — roughly 1.5 requests per second
+  saturate SNMP permanently (a community-gated management-plane availability
+  defect: a community with no `clients` list is allow-all, #4289). With the stop
+  the same request builds 118 varbinds in ~48 us and answers in ~1.0 ms with a
+  byte-identical response. The stop is output-neutral because the accumulated
+  varbind bytes are a strict lower bound on the size of any message carrying
+  them, so every dropped cell is one `trimToFit` would have discarded anyway;
+  RFC 3416 §4.2.3 removes surplus bindings from the END of the ordered set
+  ("Note that the number of variable bindings removed has no relationship to the
+  values of N, M, or R"), which is exactly the prefix this preserves — the
+  repetition-major order and per-column `endOfMibView` placement below are
+  untouched. `varbindEncodedLen` MUST stay in step with the per-varbind encoding
+  in `buildResponseVersion`: an overestimate would stop the grid short of
+  varbinds that would have fit and silently shrink large responses.
+  Fail-on-revert guards, one cost guard per CALL SITE — the two sites are
+  separate surfaces and a single test cannot bind both (unbounding v3 alone once
+  left every test green):
+  `TestGetBulkBuildBounded_6551` (v2c construction),
+  `TestGetBulkBuildBoundedV3_6551` (v3 construction),
+  `TestGetBulkCostDoesNotScaleWithMaxRepetitions_6551` (v2c call site,
+  `agent.go`), and
+  `TestGetBulkCostDoesNotScaleWithMaxRepetitionsV3_6551` (v3 call site,
+  `v3.go`). The v3 cost guard measures ALLOCATIONS rather than wall time, so
+  machine load cannot move it.
+  Equivalence-vs-unbounded and encoder-parity guards:
+  `TestGetBulkBoundedMatchesUnbounded_6551`,
+  `TestVarbindEncodedLenMatchesEncoder_6551`.
+  **GET/GETNEXT have no equivalent amplification.** The argument is an
+  OPERATION COUNT, not a byte count: RFC 3416 §4.2.1/§4.2.2 bind them to exactly
+  one response varbind per request varbind, so the work is BOUNDED BY a constant
+  number of snapshot operations per DECODED REQUEST OID and every varbind built
+  is one the manager asked for. Precisely: GET performs `getOIDValueSnap` only;
+  GETNEXT performs `findNextOIDSnap`, then `getOIDValueSnap` only when a
+  successor exists. Neither is a pair-per-OID in general — the bound is what
+  matters, and it is O(1) per request OID either way. There is no `max-repetitions`
+  field and nothing else a request can set to make a single OID cost more than
+  one operation — that is the whole difference from GETBULK, whose `R*M` grid is
+  a request-controlled multiplier on top of the OID count. The only lever left
+  is how many OIDs one datagram can carry, and that is a fixed ceiling: the read
+  buffer is `maxPacketSize` (4096 bytes) and `decodePDUFields` does not require
+  a request varbind to carry a value TLV at all, so the densest packing it
+  accepts is a five-byte varbind (`30 03 06 01 2B`) — on the order of 800 OIDs
+  per datagram, not the ~580 a well-formed seven-byte varbind allows.
+  `TestWireVarbindByteFloors_6551` pins that five-byte minimum, and the
+  companion fact on the response side: `berDecodeOID` rejects an empty body and
+  yields at least two components, so a varbind built from a wire OID re-encodes
+  to at least seven bytes and the six-byte `minVarbindEncodedBytes` floor used
+  for the structural cap is conservative rather than reachable. A max-size
+  GETNEXT (239 deep ifXTable OIDs) costs ~33 ms and returns all 239 varbinds in
+  a full 4095-byte response; that cost is `findNextOIDSnap` being a linear MIB
+  scan, not unbounded expansion, and is not addressed here.
 - **GETBULK varbind order is repetition-major (RFC 3416 §4.2.3, #5065).** For
   `R` repeater columns and `M` repetitions the response interleaves by
   repetition — `rep0-col0, rep0-col1, …, rep1-col0, …` (varbind index
