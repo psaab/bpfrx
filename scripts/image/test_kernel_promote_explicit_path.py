@@ -62,6 +62,25 @@ def script_text() -> str:
     return SCRIPT.read_text()
 
 
+def shell_function_body(text: str, name: str) -> str:
+    """Return the body of `name() { ... }` from a POSIX sh source.
+
+    Used to scope source assertions to one function, so an unrelated query
+    elsewhere in the script cannot mask a deletion inside it.
+    """
+    start = text.index(f"{name}() {{")
+    depth, i = 0, start
+    while i < len(text):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+        i += 1
+    raise AssertionError(f"unterminated shell function {name}")
+
+
 def code_lines():
     """The script's lines with comments stripped."""
     for lineno, line in enumerate(script_text().splitlines(), start=1):
@@ -151,12 +170,19 @@ class TestNoPathResolution(unittest.TestCase):
             "(#6601 r4 MAJOR-2)",
         )
         self.assertIn("/cgroup", text)
+        # Count within the DISCOVERY FUNCTION, not the whole file. The refusal
+        # path also queries MainPID (to print it as a fact), and a whole-file
+        # count would silently absorb the re-read being deleted: 1 discovery +
+        # 1 diagnostic still totals 2. Scoping keeps the revert-detection exact
+        # (#6601 r5).
+        body = shell_function_body(text, "unit_main_pid_exe")
         self.assertEqual(
-            len(re.findall(r"--property=MainPID", text)),
+            len(re.findall(r"--property=MainPID", body)),
             2,
-            "MainPID must be read AGAIN after the readlink and required to be "
-            "the same pid, so a recycle DURING the sequence is caught rather "
-            "than raced past (#6601 r4 MAJOR-2)",
+            "MainPID must be read AGAIN after the readlink, inside "
+            "unit_main_pid_exe, and required to be the same pid, so a recycle "
+            "DURING the sequence is caught rather than raced past "
+            "(#6601 r4 MAJOR-2)",
         )
 
     def test_execstart_is_parsed_at_systemds_real_field_delimiter(self):
@@ -204,8 +230,13 @@ class TestNoPathResolution(unittest.TestCase):
             )
 
 
-class TestResolutionBehaviour(unittest.TestCase):
-    """Run the script against a fake root, with a hostile xpfd on $PATH."""
+class _GateBase(unittest.TestCase):
+    """Shared harness: runs the gate against a fake root, hostile xpfd on $PATH.
+
+    Holds setUp and the helpers only -- no test methods, so unittest does not
+    collect it. Subclassed by every behavioural class below so the systemctl
+    stub, the re-rooting and the $PATH trap are defined ONCE.
+    """
 
     def setUp(self):
         if not shutil.which("sh"):
@@ -261,6 +292,9 @@ class TestResolutionBehaviour(unittest.TestCase):
         # Default: systemd knows nothing, so nothing resolves.
         self.stub_execstart = ""
         self.stub_loadstate = "not-found"
+        # Which shell runs the gate. Overridden by the busybox leg (NIT-1); the
+        # script is POSIX sh and must behave identically under both.
+        self.shell_argv = ["/bin/sh"]
         self.stub_mainpid = "0"
         self.stub_mainpid2 = ""
         self.stub_controlgroup = ""
@@ -301,7 +335,7 @@ class TestResolutionBehaviour(unittest.TestCase):
         env["STUB_CONTROLGROUP"] = self.stub_controlgroup
         env["STUB_SHOW_FAIL"] = self.stub_show_fail
         return subprocess.run(
-            ["/bin/sh", str(self.script_copy)],
+            self.shell_argv + [str(self.script_copy)],
             env=env,
             capture_output=True,
             text=True,
@@ -383,6 +417,10 @@ class TestResolutionBehaviour(unittest.TestCase):
         if len(fields) != 3 or not fields[2].startswith("/"):
             self.skipTest(f"unrecognised /proc/<pid>/cgroup rendering: {first!r}")
         return proc, target, fields[2]
+
+
+class TestResolutionBehaviour(_GateBase):
+    """Resolution behaviour of the gate itself."""
 
     # ------------------------------------------------- no inference fallback
 
@@ -974,7 +1012,21 @@ class TestResolutionBehaviour(unittest.TestCase):
             self.marker.exists(),
             "with no explicit candidate the gate fell back to $PATH (#6541)",
         )
-        self.assertIn("skipping promotion gate", res.stderr)
+        # MINOR-1 (#6601 r5): this must NOT read like a benign skip. The deb
+        # that installs this script also installs xpfd.service, so a not-found
+        # means the unit was removed or renamed -- and on such a box an armed
+        # candidate goes unverified. The line has to say the gate did not run
+        # and name what it looked for.
+        self.assertIn("WARNING", res.stderr)
+        self.assertIn("did NOT run", res.stderr)
+        self.assertIn("xpfd.service", res.stderr)
+        self.assertNotIn(
+            "skipping promotion gate",
+            res.stderr,
+            "the not-found branch still reads like a routine skip; on a box cut "
+            "with `--unit <name>` that line hides an UNVERIFIED armed candidate "
+            "(#6601 r5 MINOR-1)",
+        )
 
     # ------------------------------------------------------ contract preserved
 
@@ -1008,6 +1060,183 @@ class TestResolutionBehaviour(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("infra error", res.stderr)
         self.assertFalse(self.systemctl_ran.exists(), "an infra error triggered a reboot")
+
+
+class TestRenamedUnitIsNotLaundered(_GateBase):
+    """#6601 r5 MINOR-1 — `--unit <name>` boxes must not get a benign skip.
+
+    `xpfd upgrade cut --unit myxpf` is a SUPPORTED standalone selector
+    (cmd/xpfd/upgrade.go). On such a host flip maintains myxpf.service, and the
+    deb-installed xpfd.service may have been removed. The gate queries
+    xpfd.service specifically -- deliberately, since inferring which unit is the
+    xpf one would resolve a leftover from a renamed unit as readily as the live
+    one -- so it finds not-found and cannot resolve a binary.
+
+    That state must NOT be reported as a routine skip: an armed candidate would
+    boot, run UNVERIFIED, never be promoted, and the only journal line would read
+    like everything was fine. Two defences, both asserted here:
+
+      * `xpfd upgrade kernel arm` REFUSES this layout up front
+        (CheckKernelPromotionUnit, pkg/upgrade -- Go-side tests).
+      * the boot-time gate says loudly that it did not run, and names what it
+        looked for.
+    """
+
+    def test_renamed_unit_does_not_read_as_a_benign_skip(self):
+        # The whole scenario: the default unit is GONE (renamed to myxpf), and a
+        # perfectly good xpfd is on $PATH for a PATH-resolving gate to find.
+        self.stub_loadstate = "not-found"
+        self.stub_mainpid = "0"
+        self.stub_execstart = ""
+
+        res = self._run()
+        self.assertEqual(
+            res.returncode,
+            0,
+            "must stay exit 0 -- a non-zero exit trips OnFailure= and reboots "
+            f"the box: {res.stderr}",
+        )
+        self.assertFalse(
+            self.marker.exists(),
+            "the gate executed the xpfd it found on $PATH (#6541)",
+        )
+
+        # The load-bearing assertion. A line that reads like a routine skip is
+        # exactly what launders an unverified candidate.
+        self.assertNotIn(
+            "skipping promotion gate",
+            res.stderr,
+            "a renamed-unit box still gets a reassuring 'skipping' line while an "
+            "armed candidate goes UNVERIFIED (#6601 r5 MINOR-1)",
+        )
+        for want in ("WARNING", "did NOT run", "xpfd.service", "UNVERIFIED"):
+            self.assertIn(
+                want,
+                res.stderr,
+                f"the not-found line does not say {want!r}; an operator cannot "
+                f"tell the gate silently did not run: {res.stderr}",
+            )
+        # It must name what it looked for, so the operator can act.
+        self.assertIn("LoadState=[not-found]", res.stderr)
+        self.assertIn("--unit", res.stderr)
+
+
+class TestRefusalCarriesFacts(_GateBase):
+    """#6601 r5 MINOR-2 — the refusal is the only signal, so it must carry data.
+
+    exit 0 keeps the unit `active`, so `systemctl status xpf-kernel-promote`
+    reads SUCCESS. The journal line is all an operator gets, and policy prose
+    without the facts systemd returned is not actionable. Its advice must also
+    branch on which of the two named causes fired: telling someone to fix
+    ExecStart when systemctl could not be consulted points at the wrong system.
+    """
+
+    def test_refusal_echoes_what_systemd_returned(self):
+        self.stub_loadstate = "loaded"
+        self.stub_mainpid = "0"
+        self.stub_execstart = "{ path=/nonexistent/xpfd ; argv[]=/nonexistent/xpfd ; ignore_errors=no }"
+
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("ERROR", res.stderr)
+        self.assertIn("REFUSING to promote", res.stderr)
+
+        for want in (
+            "LoadState=[loaded]",
+            "MainPID=[0]",
+            "/nonexistent/xpfd",
+        ):
+            self.assertIn(
+                want,
+                res.stderr,
+                f"the refusal omits {want!r}. With exit 0 keeping the unit "
+                "active, this line is the ONLY operator signal and it must "
+                "carry what systemd actually returned (#6601 r5 MINOR-2)",
+            )
+
+    def test_advice_branches_on_the_cause_installed(self):
+        # xpf IS installed; the actionable advice is to fix the unit.
+        self.stub_loadstate = "loaded"
+        self.stub_mainpid = "0"
+        self.stub_execstart = "garbage-not-a-path"
+
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("IS known to systemd", res.stderr)
+        self.assertIn("Fix xpfd.service", res.stderr)
+        self.assertNotIn("systemd-availability problem", res.stderr)
+
+    def test_advice_branches_on_the_cause_systemctl_unreachable(self):
+        # systemctl could not be consulted. Telling the operator to fix
+        # ExecStart here is actively WRONG -- there is no evidence about the
+        # unit at all.
+        self.stub_show_fail = "1"
+
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("ERROR", res.stderr)
+        self.assertIn("could not be consulted", res.stderr)
+        self.assertIn("systemd-availability problem", res.stderr)
+        self.assertNotIn(
+            "Fix xpfd.service so its ExecStart",
+            res.stderr,
+            "the refusal tells the operator to fix ExecStart even though "
+            "systemctl could not be consulted at all -- that points at the "
+            "wrong system (#6601 r5 MINOR-2)",
+        )
+
+
+class TestBusyboxParity(_GateBase):
+    """NIT-1 (#6601 r5) — the portability claim was asserted but never bound.
+
+    The `[[:space:]]` note claims dash and busybox both honour the class, and
+    the suite only ever ran /bin/sh. Re-run the state matrix under busybox sh so
+    the claim is tested rather than trusted. SKIPs when busybox is absent.
+    """
+
+    def setUp(self):
+        busybox = shutil.which("busybox")
+        if not busybox:
+            self.skipTest("busybox not installed")
+        super().setUp()
+        self.shell_argv = [busybox, "sh"]
+
+    def test_parses_and_resolves_under_busybox(self):
+        live = self.tmp / "opt" / "versions" / "v9" / "xpfd"
+        ran = self._install_abs(live)
+        self.stub_loadstate = "loaded"
+        self.stub_mainpid = "0"
+        self.stub_execstart = f"{{ path={live} ; argv[]={live} ; ignore_errors=no }}"
+
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue(ran.exists(), f"busybox sh did not resolve+run: {res.stderr}")
+
+    def test_whitespace_rejection_holds_under_busybox(self):
+        # The bare-rendering branch must reject a TAB as well as a space. This
+        # is the specific claim the comment makes about [[:space:]].
+        for ws, label in ((" ", "space"), ("\t", "tab")):
+            with self.subTest(label):
+                self.stub_loadstate = "loaded"
+                self.stub_mainpid = "0"
+                self.stub_execstart = f"/opt/xpfd{ws}--flag"
+                res = self._run()
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertIn(
+                    "REFUSING to promote",
+                    res.stderr,
+                    f"busybox sh accepted a bare ExecStart containing a {label}; "
+                    "the [[:space:]] portability claim is false there",
+                )
+
+    def test_renamed_unit_warning_holds_under_busybox(self):
+        self.stub_loadstate = "not-found"
+        self.stub_mainpid = "0"
+        self.stub_execstart = ""
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("WARNING", res.stderr)
+        self.assertNotIn("skipping promotion gate", res.stderr)
 
 
 if __name__ == "__main__":

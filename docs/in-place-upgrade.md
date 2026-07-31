@@ -1025,7 +1025,47 @@ Every one of these deliberately still exits 0: a non-zero exit would trip
 `OnFailure=` and reboot the box over what may be a transient packaging
 window, whereas an un-promoted candidate is already safe — the firmware
 cleared `BootNext`, so the next plain reboot falls back to the known-good
-slot. Only a box where systemd **answered** `not-found` skips quietly.
+slot.
+
+**The refusal carries the facts, not just the policy.** Because `exit 0`
+keeps the unit `active` — `systemctl status xpf-kernel-promote` reads
+SUCCESS — that journal line is the *only* operator-visible signal, so it
+echoes what systemd actually returned (`LoadState=[…] MainPID=[…]
+ExecStart=[…]`) and branches its advice on which cause fired. Telling an
+operator to fix `ExecStart` when `systemctl` could not be consulted at
+all points at the wrong system, so that case says so explicitly instead.
+
+**The promotion unit is pinned, at both ends.** The gate derives the live
+xpfd from `xpfd.service` *specifically*, and deliberately does not infer
+which unit is the xpf one: scanning for a
+`<something>.service.d/10-xpf-version.conf` would resolve a leftover from
+a renamed or removed unit exactly as readily as the live one — the same
+indistinguishable-leftover problem that removed the filesystem fallbacks
+— and there is no authoritative record to read instead, since `flip`
+writes its drop-in *under* `<unit>.service.d/` without recording the unit
+name anywhere.
+
+But `xpfd upgrade cut --unit <name>` is a supported standalone selector,
+and on such a host `flip` maintains `<name>.service` while
+`<SbinDir>/xpfd` is still repointed by step 6b. The gate would then query
+a unit that does not exist. Rather than guess, the channel says so at the
+*operator's terminal*: `xpfd upgrade kernel arm` **refuses** when systemd
+definitively reports `xpfd.service` absent
+(`CheckKernelPromotionUnit`, exit 2), so a candidate is never armed into
+a layout whose gate cannot run. Only a definite `not-found` refuses — an
+unreachable `systemctl` proves nothing and is allowed through. This
+mirrors the #1983 precedent, where `NewCLICluster` likewise refuses a
+non-default `--unit` rather than drive control against the wrong daemon.
+A cross-language drift canary (`TestPromoteScriptUnitMatchesDefaultUnit`)
+keeps the shell script's pinned unit equal to `upgrade.DefaultUnit`.
+
+If a box still reaches boot in that state — renamed after arming, or
+armed by an older build — the gate does **not** print a reassuring
+"skipping" line. It logs a `WARNING` saying the gate did not run, naming
+the unit it looked for and the facts it got, and states that any armed
+candidate is running **unverified** and will not be promoted. The deb
+that installs this script also installs `xpfd.service`, so `not-found`
+means the unit was removed or renamed — it is never the benign case.
 
 `KernelConfig` carries neither directory, so the *inner* hop's two
 fallbacks are the compiled defaults; by then the outer hop has already

@@ -26,6 +26,34 @@
 set -u
 log() { echo "xpf-kernel-promote: $*" >&2; }
 
+# PROMOTE_UNIT is the systemd unit this gate derives the live xpfd from. It is
+# PINNED to the default, not inferred, and that pinning is enforced at BOTH
+# ends (#6601 r5):
+#
+#   * Here, because inferring "which unit is the xpf one" is exactly the class
+#     of guess this gate exists to eliminate. Scanning for
+#     <something>.service.d/10-xpf-version.conf would resolve a leftover from a
+#     renamed/removed unit just as readily as the live one -- the same
+#     indistinguishable-leftover problem that removed the filesystem fallbacks.
+#     There is no authoritative record to read instead: flip writes its drop-in
+#     UNDER <unit>.service.d/ without recording the unit name anywhere.
+#
+#   * At ARM time, where `xpfd upgrade kernel arm` REFUSES when systemd
+#     definitively reports this unit absent (CheckKernelPromotionUnit,
+#     pkg/upgrade). That is the honest place to fail: the operator sees it at
+#     their terminal instead of discovering at the next boot that an armed
+#     candidate went unverified.
+#
+# `xpfd upgrade cut --unit <name>` is a supported standalone selector, and on
+# such a box flip maintains <name>.service instead. The kernel channel does not
+# support that layout; it says so at arm time rather than guessing here. This
+# mirrors the #1983 precedent, where NewCLICluster refuses a non-default --unit
+# rather than drive control against the wrong daemon.
+#
+# The name is kept in sync with upgrade.DefaultUnit by a drift canary
+# (TestPromoteScriptUnitMatchesDefaultUnit, pkg/upgrade).
+PROMOTE_UNIT="xpfd.service"
+
 # Resolve xpfd by EXPLICIT path, never through $PATH (#6541). This is the OUTER
 # hop of the promote gate: it runs as root from a systemd oneshot on a candidate
 # boot and its exit status decides promote-vs-rollback, so a $PATH entry ordered
@@ -149,7 +177,7 @@ pid_in_unit_cgroup() {
 #     unrelated same-numbered process seen through a mismatched /proc.
 #   * MainPID re-read and still the SAME positive pid.
 unit_main_pid_exe() {
-    pid=$(systemctl show --property=MainPID --value xpfd.service 2>/dev/null) || return 0
+    pid=$(systemctl show --property=MainPID --value "$PROMOTE_UNIT" 2>/dev/null) || return 0
     case "$pid" in
         '' | *[!0-9]*) return 0 ;;
     esac
@@ -171,14 +199,14 @@ unit_main_pid_exe() {
         *) return 0 ;;
     esac
 
-    unitcg=$(systemctl show --property=ControlGroup --value xpfd.service 2>/dev/null) || return 0
+    unitcg=$(systemctl show --property=ControlGroup --value "$PROMOTE_UNIT" 2>/dev/null) || return 0
     case "$unitcg" in
         /*) ;;
         *) return 0 ;;
     esac
     pid_in_unit_cgroup "$pid" "$unitcg" || return 0
 
-    pid2=$(systemctl show --property=MainPID --value xpfd.service 2>/dev/null) || return 0
+    pid2=$(systemctl show --property=MainPID --value "$PROMOTE_UNIT" 2>/dev/null) || return 0
     [ "$pid2" = "$pid" ] || return 0
 
     printf '%s\n' "$exe"
@@ -213,7 +241,7 @@ unit_main_pid_exe() {
 # one delimiter across several lines, where the count rule passes and the parse
 # would silently adopt the first entry.
 unit_exec_start() {
-    raw=$(systemctl show --property=ExecStart --value xpfd.service 2>/dev/null) || return 0
+    raw=$(systemctl show --property=ExecStart --value "$PROMOTE_UNIT" 2>/dev/null) || return 0
     [ -n "$raw" ] || return 0
     case "$raw" in
         *"$NL"*) return 0 ;;
@@ -264,7 +292,7 @@ unit_exec_start() {
 #              be laundered into the benign skip: an armed candidate would sail
 #              past the gate behind a reassuring log line.
 xpfd_unit_state() {
-    state=$(systemctl show --property=LoadState --value xpfd.service 2>/dev/null) || {
+    state=$(systemctl show --property=LoadState --value "$PROMOTE_UNIT" 2>/dev/null) || {
         echo unknown
         return 0
     }
@@ -305,8 +333,41 @@ try_candidate "$(unit_exec_start)" "systemd ExecStart for xpfd.service"
 # non-zero exit would trip OnFailure= and reboot the box over what may be a
 # transient packaging window.
 if [ -z "$XPFD" ]; then
-    if [ "$(xpfd_unit_state)" = absent ]; then
-        log "xpfd not found and no xpfd.service is installed; skipping promotion gate"
+    # Gather the FACTS before deciding what to say. The refusal is now the only
+    # operator-visible signal this gate produces -- exit 0 keeps the unit
+    # `active` and `systemctl status xpf-kernel-promote` reads SUCCESS -- so the
+    # journal line has to carry what systemd actually returned, not just policy
+    # (#6601 r5 MINOR-2). Facts are captured with the SAME queries the discovery
+    # functions used, so what is printed is what was decided on.
+    unit_state=$(xpfd_unit_state)
+    mainpid_raw=$(systemctl show --property=MainPID --value "$PROMOTE_UNIT" 2>/dev/null) || mainpid_raw="<systemctl failed>"
+    loadstate_raw=$(systemctl show --property=LoadState --value "$PROMOTE_UNIT" 2>/dev/null) || loadstate_raw="<systemctl failed>"
+    execstart_raw=$(systemctl show --property=ExecStart --value "$PROMOTE_UNIT" 2>/dev/null) || execstart_raw="<systemctl failed>"
+    facts="unit=$PROMOTE_UNIT LoadState=[${loadstate_raw}] MainPID=[${mainpid_raw}] ExecStart=[${execstart_raw}]"
+
+    if [ "$unit_state" = absent ]; then
+        # NOT a reassuring "skipping" line. The deb that installs THIS script
+        # also installs xpfd.service (debian/rules), so systemd reporting it
+        # not-found on a box running this gate means it was removed or renamed
+        # -- e.g. a standalone box cut with `xpfd upgrade cut --unit myxpf`,
+        # where flip maintains myxpf.service instead. On such a box an ARMED
+        # candidate would otherwise sail past unverified behind a log line that
+        # read like everything was fine (#6601 r5 MINOR-1).
+        #
+        # Arming is refused up front on this layout (CheckKernelPromotionUnit),
+        # so reaching here means the unit was renamed or removed AFTER arming,
+        # or the candidate was armed by an older build. Either way, say plainly
+        # that the gate did not run and name exactly what was looked for.
+        log "WARNING: the promotion gate did NOT run. It derives the live xpfd" \
+            "from the systemd unit ${PROMOTE_UNIT} specifically, and systemd" \
+            "reports that unit not-found ($facts). This gate does NOT infer" \
+            "which unit is the xpf one -- that guess is the failure class it" \
+            "exists to eliminate. If this host runs xpfd under a different unit" \
+            "(\`xpfd upgrade cut --unit <name>\`), the kernel channel does not" \
+            "support that layout and \`xpfd upgrade kernel arm\` refuses it. If" \
+            "a candidate kernel IS armed right now it is running UNVERIFIED and" \
+            "will NOT be promoted; the next plain reboot falls back to the" \
+            "known-good slot."
         exit 0
     fi
     # FAIL LOUD, do not fail silent. Either xpf IS installed here or systemd
@@ -314,17 +375,32 @@ if [ -z "$XPFD" ]; then
     # Being unable to locate the binary means the gate cannot run, and an armed
     # candidate would otherwise sail past unverified with nothing in the journal
     # to say so.
-    log "ERROR: cannot locate the xpfd binary -- xpfd.service's MainPID does not" \
-        "resolve to an xpfd this unit owns, and its ExecStart does not name one" \
-        "unambiguously -- and systemd did not report xpfd.service absent, so" \
-        "either xpf IS installed here or systemctl could not be consulted at" \
-        "all. REFUSING to promote: this gate does NOT fall back to guessing a" \
-        "path, because a runtime left behind by --versions-dir/--sbin-dir" \
-        "relocation is indistinguishable from a live one and executing the" \
-        "stale half would verify the candidate kernel against the wrong" \
-        "dataplane. The armed candidate stays un-promoted and the next plain" \
-        "reboot falls back to the known-good slot. Fix xpfd.service so its" \
-        "ExecStart names the live binary, then re-arm."
+    # Branch the ADVICE on which cause actually fired. Telling an operator to
+    # "fix ExecStart" when systemctl could not be consulted at all is worse
+    # than useless -- it points at the wrong system (#6601 r5 MINOR-2).
+    if [ "$unit_state" = unknown ]; then
+        cause="systemctl could not be consulted at all (missing, errored, or it"
+        cause="$cause returned nothing), so NOTHING is known about whether xpf is"
+        cause="$cause installed here"
+        advice="Check that systemd is running and systemctl works in this boot"
+        advice="$advice (\`systemctl show --property=LoadState ${PROMOTE_UNIT}\`);"
+        advice="$advice this is a systemd-availability problem, NOT an"
+        advice="$advice xpfd.service configuration problem"
+    else
+        cause="${PROMOTE_UNIT} IS known to systemd (LoadState=${loadstate_raw}),"
+        cause="$cause so xpf IS installed here, but its MainPID does not resolve"
+        cause="$cause to an xpfd this unit owns and its ExecStart does not name"
+        cause="$cause one unambiguously"
+        advice="Fix ${PROMOTE_UNIT} so its ExecStart names the live xpfd as a"
+        advice="$advice single unambiguous absolute path, then re-arm"
+    fi
+    log "ERROR: cannot locate the xpfd binary. $cause. FACTS: $facts." \
+        "REFUSING to promote: this gate does NOT fall back to guessing a path," \
+        "because a runtime left behind by --versions-dir/--sbin-dir relocation" \
+        "is indistinguishable from a live one and executing the stale half" \
+        "would verify the candidate kernel against the wrong dataplane. The" \
+        "armed candidate stays un-promoted and the next plain reboot falls back" \
+        "to the known-good slot. $advice."
     exit 0
 fi
 

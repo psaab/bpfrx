@@ -62753,3 +62753,71 @@ break — `go vet` confirmed passing under every revert.
   <VersionsDir>/current/xpfd when os.Executable fails.
 - **File(s)**: scripts/image/{xpf-kernel-promote,
     test_kernel_promote_explicit_path.py}, docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-31 (fix/6541-kernel-gate-explicit-path, review fold r5)
+- **Action**: #6601 r5 fold — two MINORs + NIT-1 from an independent hostile
+  review of 7b17c6429 (Codex MERGE-READY no findings; AGY MERGE-READY). Both
+  MINORs verified firsthand; both correct.
+  MINOR-1 — the quiet-skip branch hardcoded `xpfd.service`, so a standalone box
+  cut with `xpfd upgrade cut --unit myxpf` (a SUPPORTED selector,
+  cmd/xpfd/upgrade.go:253) got LoadState=not-found -> `absent` -> "skipping
+  promotion gate" -> exit 0, with an armed candidate running UNVERIFIED behind a
+  reassuring line. That is exactly the laundering the `unknown` branch comment
+  was written to forbid, and a regression against both master and 4f2d2b814.
+  CHOSE OPTION (b) + (c), NOT (a). Verified (a) is impossible: `grep Unit
+  pkg/upgrade/state.go pkg/upgrade/kernel.go` returns NOTHING — there is no
+  authoritative record of the unit name; flip writes its drop-in UNDER
+  <unit>.service.d/ without recording which unit. Deriving it by scanning for
+  */10-xpf-version.conf is precisely the "infer which unit" the reviewer forbids
+  and reopens the indistinguishable-leftover class this PR closed. So (b): pin
+  the channel and REFUSE at arm time — new `CheckKernelPromotionUnit`
+  (pkg/upgrade/kernel_promote_unit.go) probing systemd's LoadState for
+  DefaultUnit, wired into `xpfd upgrade kernel arm` before any mutation, exit 2.
+  Direct in-repo precedent: `NewCLICluster` (#1983) already refuses a
+  non-default --unit rather than drive control against the wrong daemon, same
+  reasoning shape. TRI-STATE: only a DEFINITE not-found refuses; a probe error
+  means systemctl could not be consulted and proves nothing, so it is allowed
+  through (collapsing them would block arming whenever systemd blipped). masked/
+  bad-setting are allowed — the unit EXISTS so its ExecStart is still readable.
+  Plus (c) for defence in depth: the boot-time absent branch is now a WARNING
+  that says the gate did NOT run, names the unit it looked for and the facts,
+  and states any armed candidate is UNVERIFIED. Justified by debian/rules:62 —
+  the same deb that installs this script generates and enables xpfd.service, so
+  not-found on a box running this gate is never the benign case.
+  Added a CROSS-LANGUAGE drift canary: the shell now carries one
+  `PROMOTE_UNIT="xpfd.service"` constant (all systemctl queries parameterised)
+  and `TestPromoteScriptUnitMatchesDefaultUnit` asserts it equals
+  upgrade.DefaultUnit + ".service"; `TestPromoteScriptQueriesOnlyThePinnedUnit`
+  stops a stray literal from escaping the canary. Without this the arm-time
+  guard could clear a host the boot-time gate cannot service.
+  MINOR-2 — the refusal was ~90 words of policy and zero facts, and with exit 0
+  keeping the unit `active` (systemctl status reads SUCCESS) that line is the
+  ONLY operator signal. It now echoes LoadState/MainPID/raw ExecStart captured
+  with the SAME queries discovery used, and BRANCHES its advice: the
+  systemctl-unreachable half no longer tells the operator to "fix xpfd.service's
+  ExecStart", which pointed at the wrong system.
+  NIT-1 — the `[[:space:]]` portability claim was asserted but never bound (the
+  suite only ever exec'd /bin/sh). Parameterised the harness shell and added
+  TestBusyboxParity: resolve+run, whitespace AND tab rejection, and the renamed-
+  unit warning, all under busybox sh; SKIPs when busybox is absent. Verified
+  they actually RAN here (busybox present), not skipped.
+  Also fixed a test my own change would have made vacuous:
+  `test_main_pid_candidate_is_bound_to_the_unit` counted `--property=MainPID`
+  across the WHOLE FILE and expected 2; the new diagnostic query made it 3. A
+  naive `>= 2` would have been vacuous (deleting the re-read leaves 1 discovery
+  + 1 diagnostic = 2, still passing), so the count is now scoped to the
+  `unit_main_pid_exe` function body via a new `shell_function_body` helper,
+  preserving exact revert-detection. Extracted the harness into a `_GateBase`
+  class (setUp + helpers, no test methods) so the three new classes share the
+  systemctl stub and $PATH trap rather than duplicating them.
+  NIT-2 (no durable record of a refusal) is being filed separately — NOT folded.
+  Validation: gofmt clean on all touched files (the 4 remaining pkg/upgrade
+  gofmt hits are PRE-EXISTING on origin/master and untouched), go vet ./...
+  clean, go build ./... clean, full pkg/upgrade + cmd suites green, all 7
+  scripts/image python selftests green (this one 42 cases), sh -n + dash -n +
+  busybox sh -n + shellcheck clean. RED-on-revert verified in a THROWAWAY
+  detached worktree.
+- **File(s)**: scripts/image/{xpf-kernel-promote,test_kernel_promote_explicit_path.py},
+    pkg/upgrade/{kernel_promote_unit.go,kernel_promote_unit_6601_test.go,
+    system_linux.go}, cmd/xpfd/upgrade_kernel.go, docs/in-place-upgrade.md,
+    _Log.md
