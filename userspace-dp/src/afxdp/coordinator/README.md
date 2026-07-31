@@ -233,7 +233,13 @@ Differences that matter (#1881):
   `#[cfg(test)] cos_owner_at_forwarding_publish` seam records the CoS
   owner map at the forwarding-publish instant so the ordering regression
   test (`refresh_runtime_snapshot_publishes_cos_owner_map_before_forwarding`)
-  goes RED if the reorder is reverted.
+  goes RED if the reorder is reverted. That seam captures only the owner
+  map, so — unlike the #6291 seam below — it does not prove its own
+  placement: hoisting the `ha.forwarding` store above it would satisfy the
+  assert vacuously. The other publications riding the same gate (CoS
+  owner-live, root leases, exact backlogs, queue leases, vtime floors, and
+  `ha.fabrics`) have no individual ordering assertion at all. Tracked as
+  **#6593**.
 - **Validation is published BEFORE forwarding becomes worker-visible
   (#6291).** The sibling of the #5166 CoS pair. The same-plan refresh
   stores `shared_validation` BEFORE `ha.forwarding` (both already in this
@@ -250,15 +256,35 @@ Differences that matter (#1881):
   classified/forwarded under the new forwarding state. Pre-#6291 the store
   order (validation-then-forwarding) MATCHED the read order
   (validation-then-forwarding), so new-forwarding could pair with
-  old-validation. The residual `(new-validation, old-forwarding)` window is
-  benign: the generation guard errs toward a one-tick
-  `ConfigGenerationMismatch` drop, never a stale forward. The deterministic
-  regression test
-  (`snapshot_refresh_no_torn_validation_forwarding_6291`, worker/loop_body)
-  drives `refresh_forwarding_then_validation` with a coordinator publish
-  injected between the two acquire-loads and asserts the worker never
-  adopts new forwarding with old validation; swapping the two loads back
-  makes it RED. The invariant is two-sided, so BOTH halves are
+  old-validation.
+
+  **Scope — the mirror window survives and is NOT benign (#6592).** This
+  closes ONE of the two torn orientations. `(new-validation,
+  old-forwarding)` remains reachable, and it is exactly what the reorder
+  produces when a publish lands between the two worker loads: validation
+  installs unconditionally on difference, forwarding only on Arc rotation.
+  While the shim still stamps the OLD generation that pair only DROPS
+  (`ConfigGenerationMismatch`, or `FibGenerationMismatch` when only the FIB
+  generation moved — for as many packets as the RX sweep touches, not one).
+  But once Go writes the new generation to `userspace_ctrl` the shim stamps
+  NEW, and a worker still holding the old forwarding classifies those
+  packets `Valid` and forwards them under the STALE forwarding state.
+  Nothing orders the Go control-map update after every worker's next
+  forwarding load. The eliminated orientation needed no extra condition to
+  forward across generations; the surviving one needs the worker to still
+  be behind after a control-socket round trip — a real reduction in
+  exposure, not a closure. Closing it needs validation tied atomically to a
+  specific forwarding snapshot (one `ArcSwap` holding both, or generation
+  fields in `ForwardingState`): tracked as **#6592**.
+
+  The deterministic regression test
+  (`snapshot_refresh_no_old_validation_with_new_forwarding_6291`,
+  worker/loop_body) drives `refresh_forwarding_then_validation` with a
+  coordinator publish injected between the two acquire-loads and asserts
+  the worker never adopts new forwarding with old validation; swapping the
+  two loads back makes it RED. Its final assertion records the #6592
+  residual explicitly, so the surviving gap is executable rather than
+  prose. The invariant is two-sided, so BOTH halves are
   RED-on-revert guarded: the producer half has its own per-instance
   `#[cfg(test)] validation_at_forwarding_publish` seam (the twin of the
   #5166 CoS seam) recording the WORKER-VISIBLE `shared_validation` at the

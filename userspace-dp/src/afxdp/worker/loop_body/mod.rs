@@ -57,11 +57,32 @@ mod debug_report;
 /// ArcSwap acquire/release ordering — also observing the NEW (or newer)
 /// validation. The torn `(old-validation, new-forwarding)` state, in which a
 /// packet stamped at the old generation passes `classify_metadata`
-/// (`forwarding/mod.rs`) and is then classified/forwarded under the new
-/// forwarding state, becomes impossible. The only residual torn state,
-/// `(new-validation, old-forwarding)`, is benign: the generation guard errs
-/// toward a one-tick `ConfigGenerationMismatch` drop rather than forwarding a
-/// stale-stamped packet under new state.
+/// (`forwarding/fib.rs`) and is then classified/forwarded under the new
+/// forwarding state, becomes impossible.
+///
+/// # The mirror orientation survives and is NOT benign (#6592)
+///
+/// This closes ONE orientation. `(new-validation, old-forwarding)` remains
+/// reachable — indeed it is what this reorder produces when a publish lands
+/// between the two loads — and it is not drop-only. Its two phases:
+/// - While the shim is still stamping the OLD generation, old-stamped packets
+///   miss the new validation and DROP (`ConfigGenerationMismatch`, or
+///   `FibGenerationMismatch` when only the FIB generation moved) — for as many
+///   packets as the RX sweep touches, not just one.
+/// - Once the coordinator's reply reaches Go and Go writes the new generation
+///   to `userspace_ctrl`, the shim stamps NEW. A worker still holding the old
+///   forwarding classifies those packets `Valid` against its new validation and
+///   forwards them under the STALE forwarding state — a withdrawn route or a
+///   new deny is not applied. Nothing orders the Go control-map update after
+///   every worker's next forwarding load, and a worker can be descheduled in
+///   between.
+///
+/// So the eliminated orientation needed no extra condition to forward across
+/// generations; the surviving one needs the worker to still be behind after a
+/// control-socket round trip. That is a real reduction in exposure, not a
+/// closure. The fix is to pair validation with a specific forwarding snapshot
+/// atomically (one `ArcSwap` holding both, or generation fields embedded in
+/// `ForwardingState`) — tracked as #6592, deliberately out of scope here.
 ///
 /// This preserves both the #1188 short-circuit (forwarding is loaded via
 /// `load_arc_if_changed`, returning `None` when the Arc did not rotate) and
@@ -2207,12 +2228,28 @@ mod snapshot_refresh_ordering_tests {
     /// reproducing the ≤1-tick interleaving with NO thread race. With the fix
     /// (forwarding loaded first) the forwarding load returns `None` (the Arc
     /// had not rotated at load time), so the worker keeps its old forwarding
-    /// and pairs it with the freshly-loaded new validation → the benign
-    /// `(new-validation, old-forwarding)` residual. Swapping the two loads
-    /// back (validation first) makes the worker adopt the NEW forwarding Arc
-    /// while still reading the OLD validation → both assertions fire RED.
+    /// and pairs it with the freshly-loaded new validation. Swapping the two
+    /// loads back (validation first) makes the worker adopt the NEW forwarding
+    /// Arc while still reading the OLD validation → both assertions fire RED.
+    ///
+    /// # Scope — this test asserts ONE orientation is impossible, not that the
+    /// # pair is coherent
+    ///
+    /// The state this test leaves the worker in — NEW validation paired with
+    /// the OLD forwarding Arc — is the MIRROR orientation, and it is a KNOWN
+    /// GAP tracked by **#6592**, not a safe resting state. Do not read the
+    /// assertions below as a coherence proof. While the shim is still stamping
+    /// the old generation the mirror pair only drops
+    /// (`ConfigGenerationMismatch` / `FibGenerationMismatch`, for as many
+    /// packets as the sweep touches). But once Go writes the new generation to
+    /// `userspace_ctrl` and the shim starts stamping it, a worker still holding
+    /// the old forwarding classifies those new-stamped packets `Valid` and
+    /// forwards them under the STALE forwarding state — nothing orders the Go
+    /// control-map update after every worker's next forwarding load. The final
+    /// assertion below records that residual explicitly so it is executable,
+    /// not just prose.
     #[test]
-    fn snapshot_refresh_no_torn_validation_forwarding_6291() {
+    fn snapshot_refresh_no_old_validation_with_new_forwarding_6291() {
         const OLD_GEN: u64 = 1;
         const NEW_GEN: u64 = 2;
 
@@ -2271,6 +2308,24 @@ mod snapshot_refresh_ordering_tests {
             observed_validation.config_generation, NEW_GEN,
             "the injected coordinator publish must be observed (validation is \
              loaded after it when forwarding is read first)"
+        );
+
+        // #6592 KNOWN GAP, recorded as an executable fact rather than a
+        // comment: the state this test just produced is the MIRROR torn pair —
+        // NEW validation with the OLD forwarding Arc. It is NOT drop-only.
+        // Once Go reprograms `userspace_ctrl` with the new generation, packets
+        // stamped NEW classify `Valid` against this validation and are
+        // forwarded under the stale forwarding state. The real fix is to pair
+        // validation and forwarding atomically (one ArcSwap snapshot, or
+        // generation fields in `ForwardingState`) — out of scope for #6291.
+        // When #6592 lands this assertion SHOULD go RED; that is the point.
+        assert!(
+            !adopted_new_forwarding,
+            "#6592: this test's outcome state is the mirror residual (new \
+             validation, old forwarding). If the worker now adopts forwarding \
+             here, #6592 has changed the pairing — revisit this test and the \
+             ordering docs in coordinator/snapshot_refresh.rs rather than \
+             deleting the assertion",
         );
     }
 }

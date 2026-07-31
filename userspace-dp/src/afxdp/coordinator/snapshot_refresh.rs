@@ -27,9 +27,27 @@
 //!   forwarding implies observing new-or-newer validation, so a worker can
 //!   NEVER see old-validation + new-forwarding — which would let a packet
 //!   stamped at the old generation pass `classify_metadata` and then be
-//!   forwarded under the new state. The residual `(new-validation,
-//!   old-forwarding)` window is benign (the generation guard errs toward a
-//!   one-tick `ConfigGenerationMismatch` drop, not a stale forward).
+//!   forwarded under the new state.
+//!
+//! # The mirror window survives and is NOT benign (#6592)
+//! The ordering above excludes ONE of the two torn orientations. The mirror,
+//! `(new-validation, old-forwarding)`, remains reachable — it is in fact what
+//! the reorder produces when a publish straddles the worker's two loads. Such a
+//! worker's forwarding load landed before the `ha.forwarding` store and its
+//! validation load after the `shared_validation` store, so it installs the new
+//! validation (unconditionally, on difference) but keeps its old forwarding Arc
+//! (updated only on rotation). While the shim is still stamping the OLD
+//! generation that pair only DROPS — `ConfigGenerationMismatch`, or
+//! `FibGenerationMismatch` when only the FIB generation moved, for as many
+//! packets as the sweep touches, not just one.
+//! But once this refresh's generation is returned to Go and Go writes
+//! it to `userspace_ctrl`, the shim stamps NEW; a worker still holding the old
+//! forwarding classifies those packets `Valid` and forwards them under the
+//! STALE forwarding state. Nothing orders the Go control-map update after every
+//! worker's next forwarding load. Closing it needs validation tied atomically
+//! to a specific forwarding snapshot (one `ArcSwap` holding both, or generation
+//! fields embedded in `ForwardingState`) — tracked as #6592, out of scope for
+//! the ordering fix documented here.
 //!
 //! Both invariants are load-bearing: do NOT reorder the `shared_validation`
 //! / CoS stores to AFTER the `ha.forwarding` store, and do NOT move the
@@ -38,8 +56,16 @@
 //! `#[cfg(test)] cos_owner_at_forwarding_publish` /
 //! `validation_at_forwarding_publish` seams captured immediately above the
 //! `ha.forwarding` store (`coordinator/tests.rs`), the consumer side by
-//! `snapshot_refresh_no_torn_validation_forwarding_6291`
+//! `snapshot_refresh_no_old_validation_with_new_forwarding_6291`
 //! (`worker/loop_body/mod.rs`).
+//!
+//! Coverage is uneven across the publications riding this gate: only the CoS
+//! owner map (#5166) and validation (#6291) have an individual ordering
+//! assertion. The other pre-forwarding publications — CoS owner-live, root
+//! leases, exact backlogs, queue leases, vtime floors, and `ha.fabrics` — are
+//! held in place by comment alone, and the #5166 seam captures only the owner
+//! map so it does not prove its own placement the way the #6291 seam does.
+//! Tracked as #6593.
 //!
 //! The rule is site-wide, not refresh-local: the worker's STARTUP SEED
 //! (`worker/loop_body/setup.rs`) reads forwarding then validation, and
@@ -443,6 +469,12 @@ impl super::Coordinator {
         // forwarding — that reintroduces the torn window. This also composes
         // with the #5166 CoS-then-forwarding order above (CoS + validation are
         // both published before forwarding, the single worker-visible gate).
+        //
+        // Scope: this excludes ONE orientation. The mirror, (new-validation,
+        // old-forwarding), is still reachable and is NOT drop-only — after Go
+        // reprograms `userspace_ctrl` a new-stamped packet can be forwarded
+        // under stale forwarding state. See the "mirror window" section in the
+        // module header; tracked as #6592.
         self.shared_validation.store(Arc::new(self.validation));
         // #6291 test seam — the producer-side twin of the #5166 CoS capture
         // above. Records the WORKER-VISIBLE `shared_validation` (not

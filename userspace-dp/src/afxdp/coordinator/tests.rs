@@ -677,7 +677,7 @@ fn refresh_runtime_snapshot_publishes_cos_owner_map_before_forwarding() {
 ///
 /// The invariant is two-sided. The consumer half — the worker acquire-loads
 /// forwarding FIRST, validation SECOND — is guarded by
-/// `snapshot_refresh_no_torn_validation_forwarding_6291`
+/// `snapshot_refresh_no_old_validation_with_new_forwarding_6291`
 /// (worker/loop_body/mod.rs). Without this test the producer half is protected
 /// by a comment alone: swapping the two coordinator stores reintroduces the
 /// torn `(old-validation, new-forwarding)` window in full while every other
@@ -691,6 +691,11 @@ fn refresh_runtime_snapshot_publishes_cos_owner_map_before_forwarding() {
 /// value under either order). With the fix the seam already carries the new
 /// generation; swapping the two stores captures the stale one and this test
 /// goes RED.
+///
+/// Scope: together the two tests exclude the `(old-validation,
+/// new-forwarding)` orientation only. The mirror pair — new validation with a
+/// worker's old forwarding — survives and is NOT drop-only; see the "mirror
+/// window" section in `snapshot_refresh.rs` and #6592.
 #[test]
 fn refresh_runtime_snapshot_publishes_validation_before_forwarding() {
     const NEW_GEN: u64 = 7;

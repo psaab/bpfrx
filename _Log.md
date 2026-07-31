@@ -58389,10 +58389,12 @@ top.
 - Fix (option b — forwarding must stay stored last for #5166 CoS): reorder
   the WORKER reads to forwarding-FIRST, validation-SECOND via a new inlined
   `refresh_forwarding_then_validation` helper (keeps #1188 short-circuit).
-  Now observing new forwarding implies new-or-newer validation; residual
-  (new-validation, old-forwarding) is benign. Coordinator store order
-  unchanged (already correct); added a load-bearing comment + module doc.
-- Test: `snapshot_refresh_no_torn_validation_forwarding_6291` (deterministic,
+  Now observing new forwarding implies new-or-newer validation. The mirror
+  residual (new-validation, old-forwarding) SURVIVES and is NOT benign —
+  see the 2026-07-31 correction block below and #6592. Coordinator store
+  order unchanged (already correct); added a load-bearing comment + module doc.
+- Test: `snapshot_refresh_no_old_validation_with_new_forwarding_6291`
+  (renamed 2026-07-31; deterministic,
   publish injected between the two acquire-loads via the `between` seam).
   RED-on-revert verified (swap the two loads → RED). Full cargo suite green
   (4153+ passed, exit 0); named test 3x ok.
@@ -58435,11 +58437,107 @@ top.
   nothing". Production file restored + diff-verified after each. Full cargo
   suite re-run green; all three ordering test NAMES confirmed present in the
   run output (stale-binary guard).
-- **Honest sizing**: this is an invariant tightening, NOT a traffic win. In
-  the torn state the OLD code FORWARDED packets the converged state drops
-  (the shim keeps stamping the old generation until Go reprograms
-  `userspace_ctrl`), so the user-visible delta is at most one tick of extra
-  `config_gen_mismatch` drops. Nobody should expect a measurable effect.
+- **Honest sizing**: this is an invariant tightening, NOT a traffic win.
+  Nobody should expect a measurable effect. (The "at most one tick of extra
+  `config_gen_mismatch` drops" characterisation this bullet originally
+  carried was too generous — corrected in the 2026-07-31 block below.)
+
+## 2026-07-31 — #6333 claim correction: the surviving pair is NOT benign (#6592)
+- **Action**: Correct an overstated safety claim in PR #6333. The fix itself
+  is UNCHANGED — no production behaviour change in this commit. Only docs,
+  comments, one test doc/name, and one added assertion.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/snapshot_refresh.rs,
+  userspace-dp/src/afxdp/coordinator/README.md,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs, _Log.md
+- **What was wrong**: #6333 documented the surviving `(new-validation,
+  old-forwarding)` pair as benign — "the generation guard errs toward a
+  one-tick `ConfigGenerationMismatch` drop, never a stale forward". It is
+  not drop-only. Chain: `worker/loop_body/mod.rs` installs validation
+  UNCONDITIONALLY on difference but updates forwarding ONLY when the Arc
+  rotated, so a worker whose forwarding load returned `None` (pre-publish)
+  and whose validation load landed post-publish holds new validation + old
+  forwarding. The coordinator then returns the new generation to Go
+  (`server/handlers/snapshot.rs`), Go writes it to `userspace_ctrl`
+  (`manager_compile.go` / `maps_sync.go`), and the shim stamps subsequent
+  packets NEW (`userspace-xdp/src/lib.rs`). Those packets match the new
+  validation, classify `Valid` (`forwarding/fib.rs`), and are forwarded
+  under the OLD forwarding state — a withdrawn route or a new deny is not
+  applied. Nothing orders the Go control-map update after every worker's
+  next forwarding load; a worker can simply be descheduled in between.
+- **Why the earlier analysis was not wrong, just scoped differently**: the
+  PR-#6333 review reasoned about the window DURING publish, where the shim
+  provably cannot stamp the new generation —
+  `status.last_snapshot_generation` advances only inside `apply_snapshot`,
+  under the `ServerState` mutex held across `refresh_runtime_snapshot`.
+  That is correct for that window. This defect lives in the window AFTER
+  publish completes and before the worker's next forwarding load. Both
+  analyses hold for the window each describes.
+- **Still a strict improvement, and why**: both orientations were reachable
+  on master; this eliminates one and adds none. The eliminated orientation
+  `(old-validation, new-forwarding)` needed NO additional condition to
+  forward across generations — old-stamped packets (the traffic in flight
+  during the window) passed the still-old validation and were forwarded
+  under the new state immediately. The surviving orientation needs Go to
+  complete a control-socket round trip AND the worker to still be behind at
+  that point, which at 10K-100K ticks/s means a descheduled or stalled
+  worker. Real reduction in exposure, not a closure. Filed as **#6592**
+  (fix: pair validation with a specific forwarding snapshot atomically —
+  one `ArcSwap` holding both, or generation fields in `ForwardingState`).
+- **Corrections made** (every site that called the residual benign):
+  - `snapshot_refresh.rs` module header — replaced the "residual ... is
+    benign" clause with a "# The mirror window survives and is NOT benign
+    (#6592)" section spelling out both phases (drop-only while the shim
+    stamps OLD; stale forward once Go advances the stamp).
+  - `snapshot_refresh.rs` inline comment above the `shared_validation`
+    store — added the scope note + #6592 pointer.
+  - `refresh_forwarding_then_validation` doc comment
+    (`worker/loop_body/mod.rs`) — same replacement, plus the exposure
+    comparison between the eliminated and surviving orientations.
+  - `coordinator/README.md` #6291 bullet — replaced the benign sentence
+    with a bolded scope paragraph.
+  - `coordinator/tests.rs` producer-half test doc — added a scope note that
+    the two tests together exclude ONE orientation only.
+  - `_Log.md` — the original entry's "residual ... is benign" and the
+    "at most one tick of extra drops" sizing bullet.
+- **Mislabeled test — relabelled, not deleted**: the worker test constructed
+  the surviving pair and its doc called the result "the benign
+  (new-validation, old-forwarding) residual". Its two ASSERTIONS were
+  correct and are kept unchanged — they assert the `(old-validation,
+  new-forwarding)` orientation is impossible, which is true and is the
+  invariant this PR establishes. Only the surrounding claim was false. So:
+  (a) the doc comment gained a "# Scope" section stating the outcome state
+  is the #6592 KNOWN GAP and must not be read as a coherence proof;
+  (b) renamed `snapshot_refresh_no_torn_validation_forwarding_6291` →
+  `snapshot_refresh_no_old_validation_with_new_forwarding_6291`, because
+  the old name itself asserted the overbroad claim ("no torn
+  validation/forwarding") at all five citation sites; (c) added a third
+  assertion recording the residual as an executable fact rather than prose
+  — it asserts the worker did NOT adopt forwarding here, with a message
+  naming #6592 and directing whoever changes the pairing to revisit the
+  test and the ordering docs instead of deleting the assertion. When #6592
+  lands this assertion is expected to go RED; that is deliberate.
+- **Also recorded, NOT implemented**: the pre-existing #5166 seam captures
+  only the CoS owner map, so it does not prove its own placement the way
+  the #6291 seam does (hoisting the `ha.forwarding` store above it would
+  satisfy its assert vacuously), and six sibling publications riding the
+  same gate — CoS owner-live, root leases, exact backlogs, queue leases,
+  vtime floors, and `ha.fabrics` — have no individual ordering assertion at
+  all. Pointer added in `snapshot_refresh.rs` and `coordinator/README.md`;
+  filed as **#6593**; the work is out of scope for this PR.
+- **Validation**: full `cargo test --release` on the final tree — 4219 + 60
+  + 8 + 22 + 1 passed, 0 failed, 2 ignored, exit 0. Affected test NAMES
+  confirmed present in `-v`/`--exact` output under the RENAMED name
+  (stale-binary guard): `snapshot_refresh_no_old_validation_with_new_
+  forwarding_6291`, `refresh_runtime_snapshot_publishes_validation_before_
+  forwarding`, `refresh_runtime_snapshot_publishes_cos_owner_map_before_
+  forwarding`. The new #6592 assertion was proven to BIND, by ASSERTION not
+  a build break: seeding the test's `cached_forwarding` with a foreign Arc
+  so `load_arc_if_changed` returns `Some` makes the worker adopt forwarding
+  and the assertion fires with its #6592 message (the two pre-existing
+  asserts still pass in that mutation, so it is the new one that catches
+  it). Production file restored and diff-verified identical; the test is
+  green again. No production code path changed in this commit.
 
 ## #6310 — CoS cross-worker prepared-redirect allocation-free (eng6310)
 - **Timestamp**: 2026-07-22
