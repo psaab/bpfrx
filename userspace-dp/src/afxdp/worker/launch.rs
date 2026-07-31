@@ -129,7 +129,7 @@ impl WorkerSharedDataplane {
     /// performed inline before.
     pub(in crate::afxdp) fn from_coord(coord: &Coordinator) -> Self {
         Self {
-            runtime: coord.ha.runtime.clone(),
+            runtime: coord.ha.runtime_reader(),
             ha_state: coord.ha.rg_runtime.clone(),
             local_tunnel_deliveries: coord.local_tunnel_deliveries.clone(),
             fabrics: coord.ha.fabrics.clone(),
@@ -331,7 +331,7 @@ mod tests {
         // fields, including the nested neighbors sub-bundle.
         // #6592: one field, not two — validation and forwarding now travel in
         // the single `RuntimeView` ArcSwap.
-        assert!(Arc::ptr_eq(&bundle.runtime, &coord.ha.runtime));
+        assert!(Arc::ptr_eq(&bundle.runtime, &coord.ha.runtime_reader()));
         assert!(Arc::ptr_eq(&bundle.ha_state, &coord.ha.rg_runtime));
         assert!(Arc::ptr_eq(&bundle.fabrics, &coord.ha.fabrics));
         assert!(Arc::ptr_eq(&bundle.mirror_targets, &coord.mirror_targets));

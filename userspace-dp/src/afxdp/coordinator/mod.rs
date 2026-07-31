@@ -723,6 +723,12 @@ impl Coordinator {
         // "every published view is the intended pair" invariant true at every
         // site, including this one.
         self.validation = ValidationState::default();
+        // Publishing through the choke point clones `self.forwarding`, which the
+        // line above just defaulted — ~20 empty-collection clones rather than a
+        // direct `RuntimeView::default()` construction. Semantically identical
+        // and teardown-only (once per stop / reconcile), so the uniformity of
+        // one publish path is worth more here than skipping a handful of empty
+        // `Vec::new`s.
         self.publish_runtime_view();
         self.ha.fabrics.store(Arc::new(Vec::new()));
         self.neighbors.generation.store(0, Ordering::Relaxed);
@@ -1154,25 +1160,46 @@ impl Coordinator {
     /// #6592 test accessor: the WORKER-VISIBLE validation — the validation half
     /// of the currently published [`RuntimeView`]. Replaces the reads of the
     /// former `shared_validation` `ArcSwap` in tests that assert what a worker
-    /// would observe, as distinct from `self.validation` (the coordinator's own
-    /// value, which a mid-apply abort may have left unpublished).
+    /// would observe.
+    ///
+    /// It is distinct from `self.validation` only in WHERE it is read from, not
+    /// in value: since #3766 there is no reachable state in which the two
+    /// disagree. Every site that assigns `self.validation` publishes it before
+    /// the function can return — `refresh_runtime_snapshot_inner` and
+    /// `apply_snapshot` both do the whole fallible build BEFORE the assignment,
+    /// leaving no `return` / `?` / panic between assignment and publish;
+    /// `bump_fib_generation` refuses a rollback before writing anything; and
+    /// `stop_inner` defaults both halves adjacently. That property is
+    /// LOAD-BEARING for this PR: `update_neighbors` and `refresh_fabric_links`
+    /// now publish through `publish_runtime_view`, which carries
+    /// `self.validation` along with the forwarding they came to update. On
+    /// master those sites stored forwarding only and never touched validation,
+    /// so if an abort COULD strand a bumped `self.validation`, a later
+    /// `SyncFabricState` or neighbor push would publish that stranded
+    /// generation against old forwarding — the #6592 mirror, moved to the
+    /// writer side. It cannot, and that must stay true.
     #[cfg(test)]
     pub(crate) fn published_validation(&self) -> ValidationState {
         self.ha.runtime.load().validation
     }
 
-    /// #6592 test fixture: seed the worker-visible validation half, keeping the
-    /// published forwarding `Arc`. Replaces the former
-    /// `shared_validation.store(...)` fixture calls that stand in for "a prior
-    /// generation was successfully published and workers are running on it".
-    /// Callers normally set `self.validation` to the same value so the seeded
-    /// state is coherent.
+    /// #6592 test fixture: stand in for "a prior generation was successfully
+    /// published and workers are running on it". Replaces the former
+    /// `shared_validation.store(...)` fixture calls.
+    ///
+    /// It sets `self.validation` and publishes through the SAME choke point the
+    /// production paths use, rather than storing a view directly. Two reasons:
+    /// the seeded state is coherent by construction (a fixture cannot
+    /// accidentally seed a validation the coordinator does not hold), and the
+    /// tree is left with exactly ONE `ha.runtime.store(` — so
+    /// `tests/runtime_view_publish_canary.rs` can pin that count with no
+    /// cfg(test) exemption to reason about. Callers may still assign
+    /// `self.validation` themselves first; that is now redundant but reads as
+    /// the intent.
     #[cfg(test)]
     pub(crate) fn seed_published_validation(&mut self, validation: ValidationState) {
-        let forwarding = self.ha.runtime.load().forwarding.clone();
-        self.ha
-            .runtime
-            .store(Arc::new(RuntimeView::new(validation, forwarding)));
+        self.validation = validation;
+        self.republish_runtime_validation();
     }
 
     /// Bump just the FIB generation counter without a full snapshot rebuild.

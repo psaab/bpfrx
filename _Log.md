@@ -62359,3 +62359,90 @@ break — `go vet` confirmed passing under every revert.
     userspace-dp/benches/runtime_view_refresh.rs, userspace-dp/Cargo.toml,
     docs/userspace-dataplane-architecture.md, docs/fabric-cross-chassis-fwd.md,
     _Log.md
+
+- **Timestamp**: 2026-07-31 09:40
+  - **Action**: Fold the independent hostile review of PR #6608 (#6592) —
+    MERGE-NEEDS-MINOR, two MINORs plus four NITs, no MAJOR.
+    MINOR-1: the "single choke point" was a CONVENTION, not an invariant.
+    `HaState::runtime` was `pub(in crate::afxdp)`, so any module under
+    `crate::afxdp` could `ha.runtime.store(...)` and bypass
+    `store_runtime_view` — and the PR's own `seed_published_validation` did
+    exactly that, proving the path open rather than theoretical. Both
+    RED-on-revert seams sit inside or behind the choke point, so a future site
+    publishing `RuntimeView::new(older_validation, fwd)` directly would
+    reintroduce the #6592 mirror on the WRITER side with the suite green. Took
+    BOTH offered remedies, because neither alone is an invariant: narrowed the
+    field to `pub(super)` (removes the reach from worker/, tunnel.rs, ha/,
+    forwarding/ and every other afxdp module; readers now take a handle via the
+    new `HaState::runtime_reader`), AND added
+    `tests/runtime_view_publish_canary.rs`. The visibility cannot close it — a
+    new site inside `coordinator/` still compiles and the reader handle is a
+    storable `Arc<ArcSwap<..>>` by construction — so the canary is what makes
+    the remaining paths mechanical. It pins three rules: exactly one
+    `.runtime.store(` (the choke point); no `RuntimeView` CONSTRUCTED outside
+    the choke point without an explicit `runtime-view-canary: test-local`
+    marker (construction is the rule that catches a bypass storing through a
+    cloned handle, which the textual store rule cannot see); and one
+    runtime-view load per production reader, with a per-file table — which is
+    also what covers NIT-4's "a second load elsewhere in the tick" hole.
+    `seed_published_validation` now routes through
+    `republish_runtime_validation` so the tree has exactly ONE store with no
+    cfg(test) exemption to reason about.
+    MINOR-2: a doc comment on `published_validation` claimed `self.validation`
+    may be "left unpublished" by a mid-apply abort. #3766 made that
+    unreachable, and the claim is actively dangerous now: this PR NEWLY routes
+    `update_neighbors` and `refresh_fabric_links` through
+    `publish_runtime_view`, which carries `self.validation`; if the claim were
+    true, a `SyncFabricState` or neighbor push after an aborted apply would
+    publish (stranded new validation, old forwarding) — the mirror bug moved
+    writer-side. Verified the property firsthand rather than taking it on
+    report: the assignment-to-publish windows are 131 lines
+    (`refresh_runtime_snapshot_inner`) and 51 lines (`apply_snapshot`), and a
+    scan of both for `return` / `?` / `unwrap` / `expect` / `panic!` / `todo!`
+    / `unreachable!` returns EMPTY. Replaced the parenthetical with the
+    property stated positively and marked LOAD-BEARING for the two new call
+    sites.
+    NIT-3: stale `ha.forwarding` names in two live comments
+    (forwarding_build/mod.rs, coordinator/tests.rs).
+    NIT-4: gave the consumer seam a COMPILE-TIME position proof — `between`
+    now takes the just-read `ValidationState`, so it cannot be hoisted above
+    the load (which would let the injected publish land before any read and
+    pass vacuously on an old-old pair). This is the analogue of the producer
+    seam's previous-view assert. The residual limit (the test drives
+    `refresh_runtime_view`, not the real `worker_loop`) is now stated in the
+    doc and covered mechanically by the canary's load count. Re-verified the
+    seam still compiles away after the signature change: `worker_loop`'s
+    release disassembly is BYTE-IDENTICAL to the pre-change baseline (9404
+    instructions), `refresh_runtime_view` still absent from `nm`, zero
+    closure/`call_once` calls.
+    NIT-5: one sentence at the `stop_inner` publish explaining the
+    clone-a-just-defaulted-state cost as deliberate (teardown-only; uniformity
+    of one publish path beats skipping ~20 empty-collection clones).
+    NIT-6: bench head now states what G1 does NOT prove — it measures the SHAPE
+    change, not the production symbol, and the compile-away property rests on
+    the separate release-binary checks.
+    Canary hardening worth recording: the first run fired FIVE violations, two
+    of which were the canary counting its own PROSE (the #6592 docs quote
+    `ha.runtime.store(`, `RuntimeView::default()` and `shared_runtime.load()`).
+    Comment-only lines are now skipped — a trailing comment on a code line is
+    still counted, so a construction cannot hide behind one — and `->
+    RuntimeView {` is excluded as a return type rather than a construction.
+    Both hardenings carry their own self-tests so they cannot silently rot.
+    A THIRD hardening came out of the fire-probe itself and is the important
+    one: the probe's bypass was written as a rustfmt-wrapped chain
+    (`self.ha` / `.runtime` / `.store(...)` on three lines), so the substring
+    `.runtime.store(` appeared on NO single line and the line-based rule 1 did
+    not fire — the exact "canary that cannot fire" failure mode. (Rule 2 caught
+    that bypass on its construction, which is why construction is the
+    load-bearing rule, but rule 1 was still broken.) Rules 1 and 3 now count
+    over comment-stripped, whitespace-REMOVED code so a wrapped chain matches
+    however it is formatted, with self-tests for both wrapped shapes.
+    GATES: `cargo test --release --bins --tests -- --test-threads=1` green
+    (4220 + 60 + 8 + 22 + 13 + 1, exit 0). Canary fire-probes run in a
+    THROWAWAY detached worktree.
+  - **File(s)**: userspace-dp/tests/runtime_view_publish_canary.rs,
+    userspace-dp/src/afxdp/coordinator/{ha_state.rs,mod.rs,tests.rs},
+    userspace-dp/src/afxdp/worker/{launch.rs,loop_body/mod.rs},
+    userspace-dp/src/afxdp/types/runtime_view.rs,
+    userspace-dp/src/afxdp/forwarding_build/mod.rs,
+    userspace-dp/benches/runtime_view_refresh.rs, _Log.md

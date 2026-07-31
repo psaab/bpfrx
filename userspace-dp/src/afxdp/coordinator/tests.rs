@@ -591,7 +591,7 @@ fn refresh_runtime_snapshot_rebuilds_cos_owner_worker_map_from_identities() {
 /// seam) at the exact instant just before the forwarding store. With the fix
 /// the CoS owner map is already populated with the new queue there; reverting
 /// the reorder (moving `refresh_cos_owner_worker_map_from_identities` back
-/// after `ha.forwarding.store`) captures the stale empty map and this test
+/// after the `ha.runtime` store) captures the stale empty map and this test
 /// goes RED.
 #[test]
 fn refresh_runtime_snapshot_publishes_cos_owner_map_before_forwarding() {

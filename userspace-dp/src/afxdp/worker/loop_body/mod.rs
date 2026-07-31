@@ -108,21 +108,37 @@ mod debug_report;
 /// into two `ArcSwap` loads — in EITHER order — makes an injected publish tear
 /// the pair, which is exactly what
 /// `snapshot_refresh_runtime_view_pair_is_atomic_6592` asserts against.
-/// Production passes `|| {}`: a ZST whose `call_once` body is empty, so
+/// Production passes `|_| {}`: a ZST whose `call_once` body is empty, so
 /// `#[inline]` collapses this to the single load in release builds — no
 /// per-tick call boundary or cost (the loop deliberately stays inline; see the
 /// module header).
+///
+/// It takes the just-read `ValidationState` as an argument for one reason: that
+/// makes the seam's POSITION a compile-time fact. The producer-side seam proves
+/// its own position by retaining the pre-store view (a hoist above the store is
+/// RED); the consumer seam needs the same defence, because a `between` hoisted
+/// above the load would let the injected publish land before ANY read and the
+/// test would pass vacuously on an old-old pair. Passing a value that only
+/// exists after the load makes that hoist fail to compile rather than pass
+/// silently. The argument is unused in production (`|_| {}`).
+///
+/// LIMIT, stated rather than left implicit: this seam pins the ordering INSIDE
+/// this function, and the test drives this function rather than the real
+/// `worker_loop`. A SECOND `shared_runtime.load()` added elsewhere in the tick
+/// would pair halves across generations without tripping the test. That hole is
+/// covered mechanically instead, by the reader-load count in
+/// `tests/runtime_view_publish_canary.rs`.
 #[inline]
 fn refresh_runtime_view(
     forwarding: &Arc<ForwardingState>,
     shared_runtime: &ArcSwap<RuntimeView>,
-    between: impl FnOnce(),
+    between: impl FnOnce(ValidationState),
 ) -> (Option<Arc<ForwardingState>>, ValidationState) {
     // ONE acquire-load. Everything below reads out of `view`, so the two
     // halves are from the same publish no matter what runs concurrently.
     let view = shared_runtime.load();
     let validation = view.validation;
-    between();
+    between(validation);
     // #1188: adopt the forwarding Arc only when it actually rotated.
     let new_forwarding = if Arc::ptr_eq(forwarding, &view.forwarding) {
         None
@@ -565,7 +581,7 @@ pub(crate) fn worker_loop(
         // still #1188-short-circuited on the forwarding Arc — see
         // `refresh_runtime_view`.
         let (new_forwarding_opt, live_validation) =
-            refresh_runtime_view(&forwarding, &shared_runtime, || {});
+            refresh_runtime_view(&forwarding, &shared_runtime, |_| {});
         if live_validation != validation {
             validation = live_validation;
         }
@@ -2242,7 +2258,7 @@ mod snapshot_refresh_ordering_tests {
         fn mint(&mut self, generation: u64) -> RuntimeView {
             let forwarding = Arc::new(ForwardingState::default());
             self.views.push((generation, forwarding.clone()));
-            RuntimeView::new(
+            RuntimeView::new(  // runtime-view-canary: test-local
                 ValidationState {
                     snapshot_installed: true,
                     config_generation: generation,
@@ -2331,7 +2347,7 @@ mod snapshot_refresh_ordering_tests {
         let cached = shared_runtime.load().forwarding.clone();
         let view2 = published.mint(2);
         let (new_forwarding_opt, observed) =
-            refresh_runtime_view(&cached, &shared_runtime, || {
+            refresh_runtime_view(&cached, &shared_runtime, |_| {
                 shared_runtime.store(Arc::new(view2));
             });
         assert_coherent(
@@ -2348,7 +2364,7 @@ mod snapshot_refresh_ordering_tests {
         // satisfiable by simply never adopting anything.
         let view3 = published.mint(3);
         let (new_forwarding_opt, observed) =
-            refresh_runtime_view(&cached, &shared_runtime, || {
+            refresh_runtime_view(&cached, &shared_runtime, |_| {
                 shared_runtime.store(Arc::new(view3));
             });
         assert!(
@@ -2369,7 +2385,7 @@ mod snapshot_refresh_ordering_tests {
         // the injected publishes were real and reachable, they just were not
         // observable by a load that had already happened.
         let (new_forwarding_opt, observed) =
-            refresh_runtime_view(&cached, &shared_runtime, || {});
+            refresh_runtime_view(&cached, &shared_runtime, |_| {});
         let adopted = new_forwarding_opt
             .clone()
             .expect("the worker must adopt the latest published forwarding");
@@ -2396,7 +2412,7 @@ mod snapshot_refresh_ordering_tests {
         // forwarding-rotation branch. The pair stays coherent because it is
         // still one view.
         let unrotated = shared_runtime.load().forwarding.clone();
-        shared_runtime.store(Arc::new(RuntimeView::new(
+        shared_runtime.store(Arc::new(RuntimeView::new(  // runtime-view-canary: test-local
             ValidationState {
                 snapshot_installed: true,
                 config_generation: 3,
@@ -2405,7 +2421,7 @@ mod snapshot_refresh_ordering_tests {
             unrotated.clone(),
         )));
         let (new_forwarding_opt, observed) =
-            refresh_runtime_view(&adopted, &shared_runtime, || {});
+            refresh_runtime_view(&adopted, &shared_runtime, |_| {});
         assert!(
             new_forwarding_opt.is_none(),
             "#1188: a validation-only publish must NOT rotate the worker's \

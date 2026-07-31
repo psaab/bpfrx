@@ -107,9 +107,9 @@ impl RuntimeView {
 #[inline]
 pub(in crate::afxdp) fn load_forwarding_if_changed(
     cached: &Arc<ForwardingState>,
-    shared: &ArcSwap<RuntimeView>,
+    shared_runtime: &ArcSwap<RuntimeView>,
 ) -> Option<Arc<ForwardingState>> {
-    let view = shared.load();
+    let view = shared_runtime.load();
     if Arc::ptr_eq(cached, &view.forwarding) {
         None
     } else {

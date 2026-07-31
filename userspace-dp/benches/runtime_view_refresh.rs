@@ -34,6 +34,17 @@
 //   G2  Validation-only publish: reusing the nested forwarding Arc must be at
 //       least 10x cheaper than deep-cloning the forwarding state, at a
 //       moderate config size. This is the #1188 preservation argument.
+//
+// ── What G1 does NOT prove ──────────────────────────────────────────────────
+//
+// Because the shapes are reimplemented here, G1 measures the SHAPE change —
+// one ArcSwap load versus two — not the production `refresh_runtime_view`
+// symbol. In particular it says nothing about whether the `between` test seam
+// compiles away: this bench has no seam. That property is established
+// separately, by checking the release binary itself — `refresh_runtime_view`
+// absent from `nm` while `worker_loop` is present, no closure/`call_once` call
+// anywhere in `worker_loop`'s disassembly, and identical `call` / `lock`-prefix
+// counts with the seam call removed. Do not read a green G1 as covering it.
 
 use std::collections::BTreeMap;
 use std::hint::black_box;
