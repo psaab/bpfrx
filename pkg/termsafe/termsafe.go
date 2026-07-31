@@ -73,6 +73,66 @@ func SanitizeForDisplay(s string) string {
 	return b.String()
 }
 
+// SanitizeBlockForDisplay is SanitizeForDisplay for a MULTI-LINE device- or
+// remote-supplied blob — captured `vtysh` stdout, a provider response body, any
+// text whose own line structure is part of the output.
+//
+// It neutralizes the same terminal-protocol control bytes but PRESERVES the two
+// layout controls that carry the block's shape: LF (0x0A) and TAB (0x09).
+// SanitizeForDisplay escapes those too — correctly, for a single-field value
+// where an embedded newline is itself a forgery vector (it can fake a new table
+// row) — but applying it to a table would collapse the whole thing into one
+// `\x0a`-laden line, which is a display regression rather than a fix.
+//
+// CR (0x0D) is deliberately NOT preserved. A bare carriage return re-homes the
+// cursor and lets later text overwrite a line the operator has already read —
+// the same class of display forgery the ESC escaping defends against, and not
+// something a legitimate line-oriented blob needs.
+func SanitizeBlockForDisplay(s string) string {
+	if blockDisplaySafe(s) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			writeHexEscape(&b, s[i])
+			i++
+			continue
+		}
+		if r == '\n' || r == '\t' {
+			b.WriteRune(r)
+			i += size
+			continue
+		}
+		if unicode.IsControl(r) {
+			writeHexEscape(&b, byte(r))
+			i += size
+			continue
+		}
+		b.WriteRune(r)
+		i += size
+	}
+	return b.String()
+}
+
+// blockDisplaySafe is DisplaySafe with LF and TAB treated as printable, so a
+// clean multi-line blob keeps the allocation-free fast path.
+func blockDisplaySafe(s string) bool {
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			return false
+		}
+		if r != '\n' && r != '\t' && unicode.IsControl(r) {
+			return false
+		}
+		i += size
+	}
+	return true
+}
+
 // DisplaySafe reports whether s can be printed to a terminal verbatim: it holds
 // no control rune and no invalid UTF-8 byte, so SanitizeForDisplay would return
 // it unchanged. Splitting this out keeps the common (clean) path allocation-free.

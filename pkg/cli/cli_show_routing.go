@@ -9,6 +9,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/frr"
 	"github.com/psaab/xpf/pkg/routing"
+	"github.com/psaab/xpf/pkg/termsafe"
 	"github.com/psaab/xpf/pkg/vrrp"
 	"github.com/vishvananda/netlink"
 )
@@ -287,7 +288,7 @@ func (c *CLI) showOSPF(args []string) error {
 			if err != nil {
 				return fmt.Errorf("OSPF neighbor detail: %w", err)
 			}
-			fmt.Print(output)
+			fmt.Print(termsafe.SanitizeBlockForDisplay(output))
 			return nil
 		}
 		neighbors, err := c.frr.GetOSPFNeighbors()
@@ -311,7 +312,7 @@ func (c *CLI) showOSPF(args []string) error {
 		if err != nil {
 			return fmt.Errorf("OSPF database: %w", err)
 		}
-		fmt.Print(output)
+		fmt.Print(termsafe.SanitizeBlockForDisplay(output))
 		return nil
 
 	case "interface":
@@ -319,7 +320,7 @@ func (c *CLI) showOSPF(args []string) error {
 		if err != nil {
 			return fmt.Errorf("OSPF interface: %w", err)
 		}
-		fmt.Print(output)
+		fmt.Print(termsafe.SanitizeBlockForDisplay(output))
 		return nil
 
 	case "routes":
@@ -327,7 +328,7 @@ func (c *CLI) showOSPF(args []string) error {
 		if err != nil {
 			return fmt.Errorf("OSPF routes: %w", err)
 		}
-		fmt.Print(output)
+		fmt.Print(termsafe.SanitizeBlockForDisplay(output))
 		return nil
 
 	default:
@@ -392,14 +393,14 @@ func (c *CLI) showBGP(args []string) error {
 				if err != nil {
 					return fmt.Errorf("BGP received routes: %w", err)
 				}
-				fmt.Print(output)
+				fmt.Print(termsafe.SanitizeBlockForDisplay(output))
 				return nil
 			case "advertised-routes":
 				output, err := c.frr.GetBGPNeighborAdvertisedRoutes(ip)
 				if err != nil {
 					return fmt.Errorf("BGP advertised routes: %w", err)
 				}
-				fmt.Print(output)
+				fmt.Print(termsafe.SanitizeBlockForDisplay(output))
 				return nil
 			}
 		}
@@ -407,7 +408,7 @@ func (c *CLI) showBGP(args []string) error {
 		if err != nil {
 			return fmt.Errorf("BGP neighbor: %w", err)
 		}
-		fmt.Print(output)
+		fmt.Print(termsafe.SanitizeBlockForDisplay(output))
 		return nil
 
 	default:
@@ -454,7 +455,7 @@ func (c *CLI) showISIS(args []string) error {
 			if err != nil {
 				return fmt.Errorf("IS-IS adjacency detail: %w", err)
 			}
-			fmt.Print(output)
+			fmt.Print(termsafe.SanitizeBlockForDisplay(output))
 			return nil
 		}
 		adjs, err := c.frr.GetISISAdjacency()
@@ -478,7 +479,7 @@ func (c *CLI) showISIS(args []string) error {
 		if err != nil {
 			return fmt.Errorf("IS-IS database: %w", err)
 		}
-		fmt.Print(output)
+		fmt.Print(termsafe.SanitizeBlockForDisplay(output))
 		return nil
 
 	case "routes":
@@ -486,7 +487,7 @@ func (c *CLI) showISIS(args []string) error {
 		if err != nil {
 			return fmt.Errorf("IS-IS routes: %w", err)
 		}
-		fmt.Print(output)
+		fmt.Print(termsafe.SanitizeBlockForDisplay(output))
 		return nil
 
 	default:
@@ -512,7 +513,7 @@ func (c *CLI) showBFD(args []string) error {
 			fmt.Println("No BFD peers")
 			return nil
 		}
-		fmt.Print(output)
+		fmt.Print(termsafe.SanitizeBlockForDisplay(output))
 		return nil
 	}
 	return fmt.Errorf("unknown show protocols bfd target: %s", args[0])
@@ -752,7 +753,7 @@ func (c *CLI) showRouteMap() error {
 		fmt.Println("No route-maps configured")
 		return nil
 	}
-	fmt.Print(output)
+	fmt.Print(termsafe.SanitizeBlockForDisplay(output))
 	return nil
 }
 

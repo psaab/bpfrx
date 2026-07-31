@@ -61795,3 +61795,27 @@ would never produce.
     pkg/dhcp/dhcpv6_iapd_prefixlen_6531_test.go,
     pkg/ra/sender_prefixlen_6531_test.go,
     pkg/daemon/ra_pd_prefixlen_6531_test.go, _Log.md
+
+## 2026-07-31 — close the two #6468 residual terminal-escape surfaces
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6468 fixed the DHCP lease fields it named, but two other
+  device/remote-supplied strings still reached an operator terminal unescaped.
+- **File(s)**: `pkg/termsafe/termsafe.go`, `pkg/termsafe/block_6468_test.go`
+  (new), `pkg/cli/show_services_ddns.go`,
+  `pkg/grpcapi/server_show_dhcp_lldp_snmp.go`, `pkg/cli/cli_show_routing.go`
+
+**D1 — DDNS `LastError`.** Safe for dyndns2/duckdns/generic (they wrap the
+provider response in `%q`) but NOT for Cloudflare
+(`backend_cloudflare.go:166`) or Route 53 (`backend_route53.go:195,277`),
+which embed provider message text with `%s`. Sanitized at the two display
+sites so the class is covered regardless of backend.
+
+**D2 — raw `vtysh` stdout.** All 12 `fmt.Print(output)` sites in
+`cli_show_routing.go` print unmodified vtysh output carrying remote-advertised
+text (BGP hostname capability, IS-IS dynamic hostname TLVs, OSPF router IDs).
+
+New `termsafe.SanitizeBlockForDisplay` preserves LF/TAB so a table is not
+collapsed — `SanitizeForDisplay` escapes those too, correctly for a
+single-line field but destructively for a block. CR is deliberately NOT
+preserved (line-overwrite forgery).
