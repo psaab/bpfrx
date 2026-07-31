@@ -1,6 +1,6 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.29.0 — THE TERMINAL CUT, round-113 folds (the
+**Status: DRAFT v10.29.1 — THE TERMINAL CUT, round-113 folds (+ round-113 AGY folds: the establishment promote is now COMPUTED at the post-borrow lookup phase and APPLIED at the end of the resolve after the materialize produces the report — the lookup-phase fire point would otherwise precede the outcome it consumes; §9's consumer count is six) (the
 v10.28.0 admission-point promote is RETRACTED — the enqueue is not a
 commit-to-deliver point and no producer/carrier exists for an
 enqueue-time apply; the §5.5 post-borrow establishment promote fires
@@ -1894,10 +1894,21 @@ adopting the shared decision/metadata, §5.6).
     gate AND by the rule-5 `(report.site == Some(Site2c) &&
     validation == Some(Refused))` gate (the
     §5.5 probation flag on K is the third, independent suppression —
-    K remains installed); (vi) the ESTABLISHMENT promote (the §5.5
-    post-borrow promote at the lookup phase) consumes the effective
-    transition and is suppressed for `OverdueSkipped` AND
-    `UpsertRefused` (a shadowed-placeholder / divergent-identity
+    K remains installed); (vi) the ESTABLISHMENT promote consumes the
+    effective transition — and the pipeline ordering is specified
+    (v10.29.1, round-113 AGY 1): the §5.5 post-borrow phase COMPUTES
+    the promote candidate at the lookup phase (the proof verdict and
+    the matched entry's canonical identity captured there), and the
+    APPLY is deferred to the END of the resolve, AFTER
+    `materialize_shared_session_hit` has produced the
+    `MaterializeReport` (`session_glue/mod.rs:1092-1121` runs inside
+    the resolve, after the local lookup at `shared_ops.rs:602`) —
+    because the lookup-phase fire point would otherwise precede the
+    outcome it must consume (a placeholder K promoted at lookup
+    before an `OverdueSkipped`/`UpsertRefused` materialize could not
+    be unsuppressed). The apply is suppressed for `OverdueSkipped`
+    AND `UpsertRefused`
+    (a shadowed-placeholder / divergent-identity
     dispatch must not mutate the surviving K or its companion) and
     for a probation-flagged matched entry — alongside the refusal/
     closing and identity gates. Accounting is an explicitly ALLOWED
@@ -2617,9 +2628,13 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   transitions, not only the overdue skip — v10.24.0, round-107
   Codex 6); the poller hoists it at
   `poll_descriptor/mod.rs:509` and carries it past the `:883`
-  reduction; assert each of the five consumers honors it (teardown
+  reduction; assert each of the SIX consumers honors it (teardown
   suppressed at all three sites — `:698-714`, `:768-784`, `:824-840`;
-  no anchor write; no cache insert; no clear+refresh; no promote) and
+  no anchor write; no cache insert; no clear+refresh; no ownership
+  promote; AND no establishment-promote apply — the candidate is
+  computed post-borrow and the apply is deferred to the end of the
+  resolve, after the materialize produces the report, v10.29.1
+  round-113 AGY) and
   the MissingNeighbor composition lands on the live-backed
   ExistingResolved buffer-only arm with NOTHING derived/allocated/
   installed/published (`:4662-4829` untouched); accounting still runs
@@ -3044,7 +3059,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.29.0)
+## 11. Open questions for the convergence round (v10.29.1)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
