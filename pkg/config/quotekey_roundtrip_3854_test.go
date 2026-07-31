@@ -58,6 +58,26 @@ var roundTripValues = []struct {
 	{"kitchen-sink", "a\\b\"c\nd{e}f;g"},
 	// Empty value must stay empty ("" <-> "").
 	{"empty", ""},
+
+	// #6523: values made ENTIRELY of lexer ident chars that nonetheless carry
+	// structural meaning when re-read. quoteKey's old predicate ("all bytes
+	// are isIdentChar") emitted every one of these BARE, so Format->Parse
+	// re-read them as a comment or a deactivation marker. Each fails
+	// differently on revert, which is why all four are listed:
+	//
+	//   //x     -> line comment: the value and the `ascii-text` key before it
+	//              are swallowed to end-of-line. Recovered value becomes the
+	//              literal "ascii-text" (the issue's PSK example).
+	//   /*x*/   -> terminated block comment: swallowed silently, same result.
+	//   /*x     -> unterminated block comment: the rest of the config is eaten
+	//              and Parse returns an error.
+	//   inactive: -> the parser's deactivation marker. Inline (as here) it
+	//              TRUNCATES the key list at the marker; leading, it would set
+	//              Node.Inactive on an unrelated statement.
+	{"line-comment-value", "//x"},
+	{"block-comment-value", "/*x*/"},
+	{"unterminated-block-comment-value", "/*x"},
+	{"inactive-marker-value", "inactive:"},
 }
 
 // leafValueTree wraps a value as the trailing key of a single hierarchical

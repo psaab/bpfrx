@@ -125,9 +125,14 @@ func (c *CLI) buildInterfacesInput() cluster.InterfacesInput {
 			}
 		} else {
 			for _, mon := range rg.InterfaceMonitors {
+				// #6549: render the weight the election would APPLY, not the
+				// raw configured one. An out-of-range weight survives the
+				// tolerant load / peer-sync compile (#1960 no-brick) and the
+				// runtime bounds it to [0,255].
+				w, _ := config.ClampInterfaceMonitorWeight(mon.Weight)
 				input.Monitors = append(input.Monitors, cluster.InterfaceMonitorInfo{
 					Interface:       mon.Interface,
-					Weight:          mon.Weight,
+					Weight:          w,
 					Up:              true,
 					RedundancyGroup: rg.ID,
 				})
@@ -151,9 +156,12 @@ func (c *CLI) buildInterfacesInput() cluster.InterfacesInput {
 				if peerMap[mon.Interface] {
 					continue
 				}
+				// #6549: the peer bounds this weight the same way we do, so
+				// render the effective value rather than the raw config one.
+				w, _ := config.ClampInterfaceMonitorWeight(mon.Weight)
 				input.PeerMonitors = append(input.PeerMonitors, cluster.InterfaceMonitorInfo{
 					Interface:       mon.Interface,
-					Weight:          mon.Weight,
+					Weight:          w,
 					Up:              false,
 					RedundancyGroup: rg.ID,
 				})

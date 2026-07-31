@@ -2522,8 +2522,8 @@ single-block unchanged).
 
 ### Quoted-value escape round-trip contract (#3854)
 
-When a key or value contains a character that is not a bare Junos identifier
-byte (`isIdentChar` in `lexer.go` — anything outside letters/digits/`-_./:*+%=,<>`),
+When a key or value is not safe to emit bare (see the next section for the
+predicate — historically "contains a byte outside `isIdentChar`"),
 `Format`/`FormatSet` wrap it in double quotes via `quoteKey` (`ast.go`). The set
 of characters `quoteKey` escapes MUST exactly match the set the lexer's
 `readString` un-escapes on parse, or the config does not round-trip. The lexer
@@ -2544,6 +2544,114 @@ for characters the lexer does not interpret (e.g. `\t`) — that would over-esca
 and break the symmetry in the other direction. Pinned by
 `pkg/config/quotekey_roundtrip_3854_test.go` (`TestQuoteKeyLexerSymmetry3854`,
 `TestFormatParseRoundTrip3854`, `TestFormatParseIdempotent3854`).
+
+### What may be emitted BARE — the re-lex predicate (#6523)
+
+`quoteKey` decides bare-vs-quoted through `bareKeySafe` (`ast.go`). The rule is
+**not** "every byte is an `isIdentChar`". `isIdentChar` is the LEXER'S ident set
+— it admits `/`, `*` and `:` — and is not the set of texts that survive a
+serialize/re-parse cycle. Three ident-char-only **classes** are re-interpreted
+**structurally** on the way back in. Two of them are entirely silent — zero
+parse errors, zero warnings. The unterminated block comment is the exception:
+it returns a `TokenError`, so it corrupts loudly, which makes it the least
+dangerous of the three (the table's last row states this):
+
+| Value | What the re-read does |
+|---|---|
+| `//…` | `skipWhitespaceAndComments` consumes to end-of-line. The key **and every key after it on that line** silently vanish. |
+| `/*…*/` | Terminated block comment — swallowed silently. |
+| `/*…` | Unterminated block comment — swallows the rest of the config; `Parse` errors. |
+| `inactive:` | The parser's deactivation marker. **Leading**, it sets `Node.Inactive` on an unrelated statement; **inline**, it TRUNCATES the key list at that point. |
+
+Every path that serializes then re-parses is affected — HA config sync,
+rollback, archive, rescue — i.e. the paths an operator leans on when something
+has already gone wrong. Demonstrated end states on the receiving side: a
+`security-zone` that compiles with **zero interfaces**, a `permit junos-http`
+widened to **`permit any any any`**, and an IKE pre-shared-key that becomes the
+literal string `ascii-text` (the `//…` / `inactive:` forms eat the value and
+leave the preceding `ascii-text` key as the trailing one). Reachable from the
+plain `set` CLI (`set … description inactive:`), not only hierarchical ingest.
+Both serializers are affected: hierarchical `Format` (via `QuotedKeyPath`) and
+`| display set` (via `joinQuotedKeys`), the latter replayed through
+`ParseSetVerb`, which drives the same lexer.
+
+`bareKeySafe` therefore asks the **real lexer** instead of a hand-maintained
+character table:
+
+1. every byte is an `isIdentChar` (retained as a NECESSARY pre-condition, so the
+   change is monotone — output only ever gains quotes, never loses them; without
+   it a bracketed endpoint `[2001:db8::1]:51820` would newly go bare, since
+   `tryBracketedEndpointLiteral` (#5182) hands it back as one identifier equal to
+   itself);
+2. the bare text re-lexes as **exactly one `TokenIdentifier` whose value is the
+   text itself**, followed by `TokenEOF`;
+3. it is not a parser-level marker — enumerated in `parserMarkers`
+   (`parser.go`), today just `inactive:`.
+
+Because step 2 defers to the code that will actually read the config back, a
+comment syntax or lexer special case added later is covered the day it lands
+rather than the day someone remembers to update a denylist.
+
+**Step 3 is the half that cannot be derived**, and it is the one to be careful
+with. A parser marker is invisible to the lexer — `inactive:` comes back as an
+ordinary identifier — so the predicate has to be told. `parserMarkers` carries
+that contract: **teaching `parseStatement` to treat a new bare identifier
+structurally requires adding it to `parserMarkers`**, or the serializer emits
+that text unquoted and the next `Format`→`Parse` reads it back as structure.
+Each marker's semantics stay in `parseStatement`; `parserMarkers` records only
+which texts are load-bearing, since a future merge directive would not share
+`inactive:`'s deactivation behaviour.
+
+Quoting is also what makes the parser's existing marker defence work: a quoted
+`"inactive:"` arrives as a `TokenString`, and `parseStatement` already refuses
+to treat a string token as a marker (#4348).
+
+**Do not widen this predicate for speed.** `bareKeySafe` is allocation-free
+(the `Lexer` does not escape), pinned by
+`TestQuoteKeyBareEmissionIsZeroAlloc6523`.
+
+Pinned by `pkg/config/quotekey_relex_6523_test.go`. The **binders** (each fails
+with an assertion if the predicate is reverted) are
+`TestQuoteKeyStructuralHazards6523` (each hazard in leading/inline/trailing key
+position — the primary one), `TestQuoteKeyHazardsAreQuoted6523`,
+`TestQuoteKeySetFormHazards6523` (the `| display set` path — comment forms
+only; see below), `TestQuoteKeyZoneInterfaceHazard6523` (the zero-interface
+zone end state), `TestBareKeySafeAgreesWithLexer6523` (lexer-level only — see
+below), and `TestQuoteKeyRelexProperty6523`, a brute-force sweep over the
+lexer's own ident alphabet that re-derives the hazard set instead of trusting a
+fixed list. Its coverage is **every** 1- and 2-byte text over the full 74-byte
+alphabet, every 2-byte prefix followed by each of four tails, every 3-byte text
+over a 14-byte punctuation subset plus embedded/trailing punctuation pairs, and
+every registered `parserMarkers` entry — each in three key positions, ~91.8k
+round-trips. There is no exhaustive 3-byte sweep over the full alphabet.
+
+Two **guards** are green under revert by design and must stay that way:
+`TestQuoteKeyNoOverReach6523` asserts ordinary values (`10.0.0.0/24`,
+`ge-0/0/0`, `<*>`, `ascii-text`, `00:11:22:33:44:55`, `junos-ssh`, `00:00:00`,
+`1024-65535`, and the near-misses `a//b`, `a/*b`, `*/`, `/x`, `inactive`,
+`inactive:x`) still emit **unquoted** — `/` is legitimate and common, so a
+predicate that rejected any value containing `/` would be wrong and would churn
+every archived config and HA config-sync diff — and
+`TestQuoteKeyBareEmissionIsZeroAlloc6523` is a performance guard (it also fails
+under `-gcflags=all=-l`, which disables the escape analysis the zero depends
+on; the default build and `-race` both report 0).
+
+`TestParserMarkerVocabulary6523` gates the `parserMarkers` contract over the
+realistic vocabulary of word-shaped markers (`replace:`, `protect:`,
+`delete:`, …): each candidate must either be registered and quoted, or still
+round-trip as an ordinary key. A parser change that promotes one of those words
+without registering it fails the second leg. This is the anti-rot device for
+step 3, and its scope is that enumerated vocabulary — the alphabet sweep cannot
+cover it, because its candidates are short and punctuation-shaped, not words.
+
+Two scope caveats worth knowing before trusting a green run. The set-form
+`inactive:` case in `TestQuoteKeySetFormHazards6523` is a **consistency** case,
+not a binder: `ParseSetVerb` reads a structural verb from the first token only,
+so a later `inactive:` is appended to the path literally and even unquoted
+output round-trips in set form. Only the comment forms bite there. And
+`TestBareKeySafeAgreesWithLexer6523` asserts a **lexer-level** property, so its
+`inactive:` case is likewise green under revert — the marker bites one layer
+up, at the parser, where `TestQuoteKeyStructuralHazards6523` covers it.
 
 ### `firewall ... from flexible-match-range` — at most ONE range per term (#5823)
 
@@ -3253,7 +3361,62 @@ reserved for whole-dataplane selection where a rewrite shim
   bypasses — pinned by `compiler_chassis_identity_5694_test.go`),
   `interface-monitor <if> weight <n>` (tokens pack inline into a
   `children==nil` leaf; typing the weight needs a children map, which
-  would flip SetPath grouping), `control-ports` (not compiled), and the
+  would flip SetPath grouping — so **#6549** range-gates the weight the
+  same way #4434/#4880 gate the RG id and node priority: on the COMPILED
+  `*Config` in `validateChassisClusterStrict`, `0..255`, strict-reject at
+  commit / warn on the tolerant load / peer-sync path. Running on the
+  compiled int covers the flat-set and container-hierarchical shapes with
+  one gate (the PACKED one-liner `interface-monitor <if> weight <n>;`
+  written directly under `redundancy-group` is a separate matter — it
+  compiles to ZERO monitors, so the gate never sees it and no debt is
+  installed either; tracked as **#6588**). It is a wire-width gate like
+  its siblings: the weight is the debt subtracted from the RG weight,
+  which the heartbeat advertises through a single byte
+  (`HeartbeatGroup.Weight`, `uint8(rg.Weight)`) while the local election
+  reads the raw int — `weight -100` on a down monitor left the local node
+  at 355 and the peer receiving 99, so both nodes elected primary from
+  identical state. Because the gate is DOWNGRADED on the tolerant paths,
+  the runtime — not the commit gate — is what actually holds the domain
+  closed, and it does so at the point debt is INSTALLED rather than at
+  each producer:
+  - `cluster.Manager.SetMonitorWeight` (`election.go`) clamps every debt
+    on the way in. With `reconcileMonitorDebtsLocked` it owns both of the
+    only two writes into `monitorWeights`, so the domain is closed against
+    EVERY producer — including `pkg/daemon`'s config-apply tail, which
+    feeds `pkg/routing`'s monitor statuses straight in on every commit /
+    boot Load / peer SyncApply and would otherwise OVERWRITE the clamp
+    `UpdateConfig` had just applied.
+  - `config.ClampInterfaceMonitorWeight` bounds the configured weight
+    where each producer reads it: `pollInterfaceMonitors`,
+    `reconcileMonitorDebtsLocked`, and `pkg/routing`'s
+    `monitorManager.Apply` (a NEGATIVE weight is negative DEBT — it
+    credits weight BACK and cancels a sibling monitor's real link
+    failure).
+  - `Monitor.ipTargetWeight` and the aggregate branch of
+    `desiredRGIPDebts` bound the ip-monitoring weights. This one is NOT
+    redundant with the chokepoint: in global-threshold mode a negative
+    target weight SUBTRACTS from the cumulative failure sum, so a second
+    genuinely unreachable target pushes the sum back below the threshold
+    and drops the aggregate debt the first failure installed — more
+    failures produce LESS demotion, and no `SetMonitorWeight` call happens
+    at all for the chokepoint to catch.
+  - `rgWeightFromDebt` closes the `rg.Weight` domain at every recompute
+    site, and `clampWireWeight` saturates rather than wraps at the
+    marshal boundary.
+  The display fills route through the same clamp
+  (`pkg/grpcapi/server_cluster.go`, `pkg/cli/cli_helpers.go`) so
+  `show chassis cluster interfaces` never reports a weight the election
+  does not apply. Note the ip-monitoring sibling leaves below are gated
+  ONLY by their schema `ValidateInteger(0, 255)`, which
+  `compileTreeLenient` downgrades to a warning — they carry no compiled-int
+  commit gate, so this stanza's posture is STRONGER than theirs, not
+  merely consistent with it. Pinned by
+  `compiler_validate_strict_chassis_ifmon_6549_test.go` (config),
+  `ifmon_weight_divergence_6549_test.go` +
+  `ifmon_weight_daemon_apply_6549_test.go` (cluster),
+  `monitor_weight_6549_test.go` (routing) and
+  `cluster_monitor_weight_6549_test.go` (grpcapi + cli)), `control-ports`
+  (not compiled), and the
   address/interface string leaves (IP value types arrive with the
   interfaces PR). Known residual: the hierarchical packed one-liner
   `node 0 priority <v>;` bypasses the gate (identity-token rule) even

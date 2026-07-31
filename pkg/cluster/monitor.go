@@ -472,6 +472,15 @@ func (mon *Monitor) pollInterfaceMonitors(rg *config.RedundancyGroup, statuses [
 	for _, im := range rg.InterfaceMonitors {
 		key := monitorKey{rgID: rg.ID, iface: im.Interface}
 
+		// #6549: bound the configured weight to the [0,255] domain the
+		// heartbeat weight fields can carry. The strict commit path already
+		// rejected an out-of-range weight; the tolerant load / peer-sync path
+		// only warns (#1960 no-brick), so a persisted or peer-pushed config
+		// can still reach this poll. Deliberately NOT logged here — this loop
+		// runs every poll tick; reconcileMonitorDebtsLocked emits the
+		// config-apply-frequency warning.
+		weight, _ := config.ClampInterfaceMonitorWeight(im.Weight)
+
 		// Translate Junos name (ge-0/0/0) to Linux name (ge-0-0-0).
 		linuxName := config.LinuxIfName(im.Interface)
 		link, err := nlh.LinkByName(linuxName)
@@ -503,7 +512,7 @@ func (mon *Monitor) pollInterfaceMonitors(rg *config.RedundancyGroup, statuses [
 		// Track local interface status for heartbeat propagation.
 		statuses = append(statuses, InterfaceMonitorInfo{
 			Interface:       im.Interface,
-			Weight:          im.Weight,
+			Weight:          weight,
 			Up:              up,
 			RedundancyGroup: rg.ID,
 		})
@@ -515,17 +524,17 @@ func (mon *Monitor) pollInterfaceMonitors(rg *config.RedundancyGroup, statuses [
 		}
 
 		if mon.evaluateTransition(state, !up) {
-			mon.mgr.SetMonitorWeight(rg.ID, im.Interface, state.down, im.Weight)
+			mon.mgr.SetMonitorWeight(rg.ID, im.Interface, state.down, weight)
 			if state.down {
 				mon.mgr.RecordEvent(EventMonitor, rg.ID, fmt.Sprintf(
-					"Interface %s state changed to down, weight %d", im.Interface, im.Weight))
+					"Interface %s state changed to down, weight %d", im.Interface, weight))
 			} else {
 				mon.mgr.RecordEvent(EventMonitor, rg.ID, fmt.Sprintf(
 					"Interface %s state changed to up", im.Interface))
 			}
 			slog.Info("cluster monitor: interface state changed",
 				"rg", rg.ID, "interface", im.Interface,
-				"up", up, "weight", im.Weight)
+				"up", up, "weight", weight)
 		}
 	}
 	return statuses
@@ -623,11 +632,35 @@ launch:
 // or the RG global-weight when the per-target weight is unset (0). This is the
 // value the target contributes both as an independent debt (no global-threshold)
 // and to the cumulative failure sum (with global-threshold).
+//
+// #6549: bounded to the [0,255] weight domain. ip-monitoring weights have NO
+// compiled-int commit gate (validateChassisClusterStrict covers interface-monitor
+// weights, RG ids and node priorities — not these), so their only commit-side
+// defense is the schema's ValidateInteger(0,255), which compileTreeLenient
+// downgrades to a warning on Store.Load / Store.SyncApply (#1960 no-brick). An
+// out-of-range weight is therefore reachable at runtime, and it breaks BOTH
+// consumers of this value:
+//
+//   - independent mode: a negative weight is negative DEBT — it credits weight
+//     back and cancels a sibling target's real unreachability.
+//   - global-threshold mode: a negative weight SUBTRACTS from the cumulative
+//     failure sum, so a second genuinely unreachable target can push the sum
+//     back BELOW global-threshold and drop the aggregate debt that the first
+//     failure correctly installed. More failures then produce LESS demotion —
+//     the group returns to full weight and PRIMARY with every target dead.
+//
+// The Manager.SetMonitorWeight chokepoint cannot close the second case: when
+// the threshold is masked no debt is desired at all, so SetMonitorWeight is
+// never called. Bounding here — the single place both consumers read — is what
+// closes it, and it also keeps the weight reported in the RecordEvent /
+// ipDebts bookkeeping equal to the weight actually applied.
 func (mon *Monitor) ipTargetWeight(rg *config.RedundancyGroup, target *config.IPMonitorTarget) int {
-	if target.Weight != 0 {
-		return target.Weight
+	raw := target.Weight
+	if raw == 0 {
+		raw = rg.IPMonitoring.GlobalWeight
 	}
-	return rg.IPMonitoring.GlobalWeight
+	w, _ := config.ClampInterfaceMonitorWeight(raw)
+	return w
 }
 
 // updateIPTargetDampenedState folds one target's reachability into its dampened
@@ -696,7 +729,14 @@ func (mon *Monitor) desiredRGIPDebts(rg *config.RedundancyGroup) map[string]int 
 			}
 		}
 		if cumulative >= rg.IPMonitoring.GlobalThreshold {
-			desired[ipAggregateMonitorName] = rg.IPMonitoring.GlobalWeight
+			// #6549: same bound as ipTargetWeight — the aggregate debt is the
+			// raw configured global-weight, and an out-of-range one reaches
+			// runtime on the tolerant load / peer-sync path. Clamping here
+			// (not only at the SetMonitorWeight chokepoint) keeps the weight
+			// recorded in ipDebts and reported in the RecordEvent equal to the
+			// weight the election actually applies.
+			w, _ := config.ClampInterfaceMonitorWeight(rg.IPMonitoring.GlobalWeight)
+			desired[ipAggregateMonitorName] = w
 		}
 		return desired
 	}

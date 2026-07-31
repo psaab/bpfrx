@@ -67,6 +67,24 @@ func (m *Manager) GetRIPRoutes() ([]RIPRouteEntry, error) {
 }
 
 // ISISAdjacency represents an IS-IS adjacency.
+//
+// SystemID is PEER-CONTROLLED TEXT, not a numeric system ID (#6468). FRR
+// substitutes the hostname the peer advertised in its Dynamic Hostname TLV
+// (RFC 5301, `hostname dynamic` — on by default) for the dotted system ID
+// whenever that mapping is known, so the first column of `show isis neighbor`
+// is whatever the neighbour called itself. Every OTHER field inherits the same
+// taint: GetISISAdjacency splits the row with strings.Fields, so a hostname
+// containing a SPACE shifts Interface/Level/State/HoldTime one column right and
+// puts peer bytes in each of them. Display sites must sanitize the WHOLE row —
+// see termsafe.SanitizeRowForDisplay.
+//
+// Sanitizing does NOT repair that shift. It keeps the row safe to print; the
+// VALUES remain positionally derived from peer-controlled text, so a shifted
+// row can display a State the peer chose and no display guard can detect it.
+// Fixing that needs this parse to change — FRR's IS-IS JSON output, or
+// right-anchored columns with malformed rows reported rather than rendered.
+// Tracked as #6590. Do not cite the display guard as making this struct
+// trustworthy.
 type ISISAdjacency struct {
 	SystemID  string
 	Interface string
@@ -76,6 +94,11 @@ type ISISAdjacency struct {
 }
 
 // GetISISAdjacency queries FRR for IS-IS adjacencies.
+//
+// strings.Fields splits on unicode.IsSpace ONLY, so ESC, DEL, BEL and the C1
+// controls ride inside a token untouched — tokenizing is not sanitizing. The
+// guard belongs at the display sites (see the ISISAdjacency doc); the values
+// here stay raw for machine consumers.
 func (m *Manager) GetISISAdjacency() ([]ISISAdjacency, error) {
 	output, err := m.executor().Vtysh("show isis neighbor")
 	if err != nil {
@@ -186,6 +209,15 @@ type bgpSummaryFamilyJSON struct {
 // summary instead overloads a single "State/PfxRcd" column, which the
 // old scraper misread (it stored the pfxRcd digit as the State and never
 // populated PfxRcd). #3942.
+// The declared field set is also a load-bearing security boundary (#6468).
+// With `bgp default show-hostname` configured, FRR adds a "hostname" key to
+// each peer object carrying the name the PEER advertised via the BGP hostname
+// capability — attacker-controlled free text. encoding/json drops undeclared
+// keys, so not declaring it is what keeps that text out of BGPPeerSummary and
+// off the operator's terminal today. If a future change needs the hostname,
+// the display sites in pkg/cli and pkg/grpcapi must already be sanitizing (they
+// are, via termsafe.SanitizeRowForDisplay) — do not add the field on the
+// assumption that this row is numeric.
 type bgpPeerJSON struct {
 	RemoteAs   int64  `json:"remoteAs"`
 	MsgRcvd    int64  `json:"msgRcvd"`

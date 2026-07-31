@@ -222,18 +222,37 @@ var schemaChassis = &schemaNode{desc: "Chassis configuration", children: map[str
 				children:      nil,
 			},
 			"preempt": {desc: "Allow a higher-priority node to preempt the primary role", children: nil},
-			// interface-monitor weight is NOT typed in PR 2: the
+			// interface-monitor weight is NOT typed here: the
 			// `<ifname> weight <n>` tokens pack inline into one leaf
 			// (children==nil here); typing the weight would require a
 			// children/wildcard map, which flips SetPath's
 			// replace-vs-container grouping — forbidden by the
-			// fields-only rule. Deferred (docs/config-schema.md).
+			// fields-only rule. Its 0..255 range is instead enforced on
+			// the COMPILED *Config by validateChassisClusterStrict
+			// (compiler_validate_strict_chassis.go, #6549), the same
+			// place the #4434 RG-id and #4880 node-priority wire-width
+			// gates live — which covers BOTH parser shapes at once
+			// rather than only the flat-set one a typed leaf would see.
+			// Mirrors the vrrp `priority-cost` deferral
+			// (schema_interfaces.go). See docs/config-schema.md.
 			"interface-monitor": {desc: "Deduct weight from the redundancy group while a monitored interface is down", children: nil},
 			"ip-monitoring": {desc: "Probe monitored IPs and deduct weight on failure", children: map[string]*schemaNode{
 				// Junos vSRX: 0..255. Weight subtracted from the RG
 				// weight, which starts at 255 (group_state.go:29,
 				// SetMonitorWeight election.go:324); heartbeat monitor
 				// entries carry weight as uint8.
+				//
+				// #6549: unlike interface-monitor weight, these leaves
+				// have NO compiled-int gate in
+				// validateChassisClusterStrict — this ValidateInteger is
+				// their only commit-side defense, and compileTreeLenient
+				// downgrades it to a warning on Store.Load /
+				// Store.SyncApply (#1960 no-brick). An out-of-range value
+				// therefore REACHES runtime, where pkg/cluster bounds it:
+				// Monitor.ipTargetWeight and the aggregate branch of
+				// desiredRGIPDebts (which also protects the cumulative
+				// global-threshold sum a negative weight would otherwise
+				// mask), plus the Manager.SetMonitorWeight chokepoint.
 				"global-weight": {
 					desc:          "Default weight deducted when a monitored IP fails (0..255)",
 					args:          1,
