@@ -29,19 +29,24 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SCRIPT = HERE / "xpf-kernel-promote"
 
-# The two explicit candidates the script must consult, IN THIS ORDER.
+# The two compiled-default candidates. They are consulted as an UNAMBIGUOUS
+# SET, not as a ranked list, because no fixed rank is right for both partial
+# relocations (#6601 r4 MAJOR-2): `--sbin-dir` and `--versions-dir` move
+# INDEPENDENTLY, and each partial move inverts which default is the live one.
 #
-# SBIN first is load-bearing, not cosmetic. flip step 6b repoints
-# <SbinDir>/<bin> -> <VersionsDir>/current/<bin> on every cut
-# (pkg/upgrade/flip.go), so the sbin entry tracks the live version even when the
-# operator relocated the runtime with `--versions-dir`. Relocating does NOT
-# remove an older /var/lib/xpf/versions/current, so consulting the hardcoded
-# default root first would select a STALE build on a relocated install --
-# strictly worse than the bare `xpfd` this replaced, which at least resolved to
-# the live sbin entry through systemd's default PATH.
+#   --versions-dir only : flip step 6b repoints <SbinDir>/<bin> ->
+#                         <VersionsDir>/current/<bin> on every cut, so the sbin
+#                         entry is LIVE; the default versions root is a stale
+#                         leftover that relocation does not remove.
+#   --sbin-dir only     : flip maintains the CONFIGURED sbin dir, so the default
+#                         versions root is LIVE and the leftover
+#                         /usr/local/sbin/xpfd is the STALE one.
+#
+# A default is therefore usable only when the two name the SAME file (the
+# ordinary layout, where the sbin entry is a symlink to the versioned runtime),
+# or when only one of them is usable at all.
 SBIN = "/usr/local/sbin/xpfd"
 VERSIONED = "/var/lib/xpf/versions/current/xpfd"
-CANDIDATES_IN_ORDER = [SBIN, VERSIONED]
 
 
 def script_text() -> str:
@@ -75,12 +80,45 @@ class TestNoPathResolution(unittest.TestCase):
             "(#6541 fold r3)",
         )
         self.assertIn("xpfd.service", text)
-        # Discovery must be consulted BEFORE the compiled defaults, or a stale
-        # leftover at a default path wins over the live binary.
-        self.assertLess(
-            text.index("unit_exec_start"),
-            text.index('try_candidate /usr/local/sbin/xpfd'),
-            "systemd discovery must be tried before the compiled defaults",
+        # Both discovery sources must be consulted BEFORE the compiled
+        # defaults, or a stale leftover at a default path wins over the live
+        # binary. Index the CALL SITES (unique literals), not the definitions.
+        defaults_call = text.index("\ntry_compiled_defaults\n")
+        for call in (
+            'try_candidate "$(unit_main_pid_exe)"',
+            'try_candidate "$(unit_exec_start)"',
+        ):
+            self.assertIn(call, text, f"the gate never calls {call} (#6601 r4)")
+            self.assertLess(
+                text.index(call),
+                defaults_call,
+                "systemd/kernel discovery must be tried before the compiled "
+                "defaults",
+            )
+
+    def test_execstart_is_parsed_at_systemds_real_field_delimiter(self):
+        # MAJOR (#6601 r4). `systemctl show -p ExecStart --value` renders
+        #   { path=/x ; argv[]=/x ... ; ignore_errors=no ; ... }
+        # and the property printer substitutes the stored path RAW ("path=%s"),
+        # with no escaping. systemd PERMITS an executable path containing a
+        # space or a ';', so a parser that stops at the first one does not fail
+        # to resolve -- it resolves to a SHORTER, DIFFERENT path, suppresses
+        # every remaining candidate, and lets that binary's exit 0 authorize the
+        # promotion. Cut at the real field delimiter instead.
+        text = script_text()
+        self.assertIn(
+            " ; argv[]=",
+            text,
+            "the ExecStart parse does not cut at systemd's real field "
+            "delimiter, so a path containing a space or a ';' truncates into a "
+            "different executable (#6601 r4 MAJOR-1)",
+        )
+        self.assertNotIn(
+            "[^ ;]",
+            text,
+            "a `[^ ;]` character class still terminates the ExecStart path at "
+            "the first space or semicolon -- both are legal in a systemd "
+            "executable path (#6601 r4 MAJOR-1)",
         )
 
     def test_no_command_v_probe_for_xpfd(self):
@@ -112,29 +150,22 @@ class TestNoPathResolution(unittest.TestCase):
                 f"xpf-kernel-promote does not consult the explicit path {want} "
                 "(#6541)",
             )
-        # SBIN first, VERSIONED second. Assert the order on the CANDIDATE LIST
-        # itself, not on the file as a whole — the prose above it names the
-        # paths too.
-        candidates = None
+        # The two defaults must be compared for SAME-FILE identity, not ranked.
+        # `-ef` (same device+inode) is what makes the ordinary layout -- where
+        # flip 6b left <SbinDir>/xpfd as a symlink to <VersionsDir>/current/xpfd
+        # -- resolve, while two genuinely different files refuse loudly.
+        compare = None
         for line in text.splitlines():
             code = line.split("#", 1)[0]
-            if VERSIONED in code and SBIN in code:
-                candidates = code
+            if VERSIONED in code and SBIN in code and "-ef" in code:
+                compare = code
                 break
         self.assertIsNotNone(
-            candidates,
-            "no single line enumerates both explicit candidates; the "
-            "resolution order is not assertable (#6541)",
-        )
-        positions = [candidates.index(c) for c in CANDIDATES_IN_ORDER]
-        self.assertEqual(
-            positions,
-            sorted(positions),
-            "candidate order is wrong. It must be "
-            f"{CANDIDATES_IN_ORDER!r}: the sbin entry is repointed by every cut "
-            "and so tracks the live version even under `--versions-dir` "
-            "relocation, while the hardcoded default root is NOT removed on "
-            "relocation and would select a STALE build (#6541 fold r2)",
+            compare,
+            "no line compares the two compiled defaults with `-ef`. Without a "
+            "same-file test the gate must RANK them, and no fixed rank is "
+            "right for both `--sbin-dir`-only and `--versions-dir`-only "
+            "relocation (#6601 r4 MAJOR-2)",
         )
 
 
@@ -163,7 +194,11 @@ class TestResolutionBehaviour(unittest.TestCase):
         (self.path_dir / "systemctl").write_text(
             "#!/bin/sh\n"
             'if [ "$1" = "show" ]; then\n'
+            # STUB_SHOW_FAIL models a systemctl that cannot answer at all
+            # (missing, erroring, or a query it does not understand).
+            '  [ -n "${STUB_SHOW_FAIL-}" ] && exit 1\n'
             '  case "$*" in\n'
+            '    *MainPID*) printf \'%s\\n\' "${STUB_MAINPID-0}" ;;\n'
             '    *ExecStart*) printf \'%s\\n\' "${STUB_EXECSTART-}" ;;\n'
             '    *LoadState*) printf \'%s\\n\' "${STUB_LOADSTATE-not-found}" ;;\n'
             "  esac\n"
@@ -176,6 +211,9 @@ class TestResolutionBehaviour(unittest.TestCase):
         # Default: systemd knows nothing, so the compiled-default chain runs.
         self.stub_execstart = ""
         self.stub_loadstate = "not-found"
+        self.stub_mainpid = "0"
+        self.stub_show_fail = ""
+        self._stub_seq = 0
 
         # A rewritten copy of the script whose candidate paths are re-rooted
         # into the temp tree, so the test never touches the real filesystem.
@@ -201,6 +239,8 @@ class TestResolutionBehaviour(unittest.TestCase):
         env["PATH"] = str(self.path_dir) + os.pathsep + env.get("PATH", "")
         env["STUB_EXECSTART"] = self.stub_execstart
         env["STUB_LOADSTATE"] = self.stub_loadstate
+        env["STUB_MAINPID"] = self.stub_mainpid
+        env["STUB_SHOW_FAIL"] = self.stub_show_fail
         return subprocess.run(
             ["/bin/sh", str(self.script_copy)],
             env=env,
@@ -214,27 +254,81 @@ class TestResolutionBehaviour(unittest.TestCase):
         self._write_stub(Path(str(self.fake_root) + rel), exit_code, marker)
         return marker
 
-    def test_prefers_sbin_entry_over_default_versions_root(self):
-        # RELOCATED-INSTALL regression guard. Both candidates exist, as they do
-        # on a box that was cut with `--versions-dir` while an older default
-        # runtime was left behind: the sbin entry points at the LIVE build, the
-        # default root holds the STALE one. The sbin entry must win.
-        versioned_ran = self._install(VERSIONED, 0)
+    def _install_abs(self, abs_path: Path, exit_code: int = 0) -> Path:
+        """Install a recording stub at an ABSOLUTE path outside the fake root."""
+        self._stub_seq += 1
+        marker = self.tmp / f"stub{self._stub_seq}.ran"
+        self._write_stub(abs_path, exit_code, marker)
+        return marker
+
+    def test_disagreeing_compiled_defaults_refuse_instead_of_guessing(self):
+        # MAJOR (#6601 r4). `--sbin-dir` and `--versions-dir` relocate
+        # INDEPENDENTLY, so NO fixed rank over the two compiled defaults is
+        # right for both partial relocations:
+        #
+        #   --versions-dir only : sbin entry LIVE, default versions root stale
+        #   --sbin-dir only     : default versions root LIVE, sbin entry STALE
+        #
+        # Two usable defaults that are DIFFERENT files therefore mean one of
+        # them is stale with nothing on the box to say which. The previous
+        # revision ranked sbin first unconditionally and so executed the STALE
+        # leftover on every `--sbin-dir`-only box whose systemd could not
+        # answer -- verifying the candidate kernel against the wrong dataplane,
+        # or rejecting a healthy candidate into a needless revert/reboot. Refuse
+        # LOUDLY instead of flipping a coin.
         sbin_ran = self._install(SBIN, 0)
+        versioned_ran = self._install(VERSIONED, 0)
+        self.stub_show_fail = "1"  # systemd cannot answer
+
+        res = self._run()
+        self.assertEqual(
+            res.returncode,
+            0,
+            "the refusal must stay on the non-rebooting infra-error path: "
+            f"{res.stderr}",
+        )
+        self.assertFalse(
+            sbin_ran.exists(),
+            f"the gate executed {SBIN} while {VERSIONED} named a DIFFERENT file "
+            "and systemd could not say which one is live. On a `--sbin-dir`-only "
+            "relocated box that leftover is the STALE build (#6601 r4 MAJOR-2): "
+            f"{res.stderr}",
+        )
+        self.assertFalse(
+            versioned_ran.exists(),
+            f"the gate executed {VERSIONED} while {SBIN} named a DIFFERENT file; "
+            "one of the two is stale and nothing says which (#6601 r4 MAJOR-2): "
+            f"{res.stderr}",
+        )
+        self.assertIn("ERROR", res.stderr, f"the refusal was not loud: {res.stderr}")
+        self.assertIn("REFUSING to promote", res.stderr)
+        self.assertFalse(
+            self.marker.exists(),
+            "the gate executed the xpfd it found on $PATH (#6541)",
+        )
+
+    def test_agreeing_compiled_defaults_still_resolve(self):
+        # ANTI-OVER-REACH for the test above. On an ORDINARY default-rooted box
+        # flip step 6b leaves <SbinDir>/xpfd as a symlink to
+        # <VersionsDir>/current/xpfd, so both defaults are usable and they are
+        # ONE file. There is nothing ambiguous about that -- refusing here would
+        # strand the promotion gate on a perfectly healthy box, which is its own
+        # outage.
+        versioned_ran = self._install(VERSIONED, 0)
+        sbin_path = Path(str(self.fake_root) + SBIN)
+        sbin_path.parent.mkdir(parents=True, exist_ok=True)
+        sbin_path.symlink_to(str(self.fake_root) + VERSIONED)
+        self.stub_show_fail = "1"
 
         res = self._run()
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertTrue(
-            sbin_ran.exists(),
-            f"the managed sbin entry was not the one executed: {res.stderr}",
-        )
-        self.assertFalse(
             versioned_ran.exists(),
-            f"the gate ran {VERSIONED} instead of {SBIN}. On a `--versions-dir` "
-            "relocated install that path holds a STALE build and the candidate "
-            "kernel would be verified against the wrong dataplane "
-            "(#6541 fold r2)",
+            "the gate refused on an ORDINARY default layout where the sbin "
+            "entry is merely a symlink to the versioned runtime -- the two "
+            f"defaults are the same file: {res.stderr}",
         )
+        self.assertNotIn("REFUSING", res.stderr)
         self.assertFalse(
             self.marker.exists(),
             "the gate executed the xpfd it found on $PATH (#6541)",
@@ -356,6 +450,175 @@ class TestResolutionBehaviour(unittest.TestCase):
         self.assertFalse(
             stale_versioned.exists(),
             f"ran the STALE leftover at {VERSIONED} instead of the live binary",
+        )
+
+    def test_execstart_path_containing_a_space_is_not_truncated(self):
+        # MAJOR (#6601 r4). systemd PERMITS an executable path containing a
+        # space, and `systemctl show -p ExecStart` substitutes the stored path
+        # RAW into `path=%s` -- there is no escaping. A parse that stops at the
+        # first space therefore does not merely fail to resolve: it resolves to
+        # a SHORTER, DIFFERENT path. Here `<tmp>/relocated` is itself a valid
+        # executable, so the truncated read is ACCEPTED, every remaining
+        # candidate is suppressed, and that binary's exit 0 authorizes the
+        # promotion -- the candidate kernel gets verified against a build nobody
+        # chose.
+        live = self.tmp / "relocated live" / "xpfd"
+        live_ran = self._install_abs(live)
+        truncated = self.tmp / "relocated"
+        truncated_ran = self._install_abs(truncated)
+
+        self.stub_execstart = (
+            f"{{ path={live} ; argv[]={live} ; ignore_errors=no ; "
+            "start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; "
+            "status=0/0 }"
+        )
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertFalse(
+            truncated_ran.exists(),
+            f"the gate TRUNCATED systemd's ExecStart at the first space and "
+            f"executed {truncated} -- a DIFFERENT binary from the "
+            f"{live} systemd actually launches (#6601 r4 MAJOR-1): {res.stderr}",
+        )
+        self.assertTrue(
+            live_ran.exists(),
+            f"the gate did not run the xpfd systemd's ExecStart names: "
+            f"{res.stderr}",
+        )
+        self.assertFalse(
+            self.marker.exists(),
+            "the gate executed the xpfd it found on $PATH (#6541)",
+        )
+
+    def test_execstart_path_containing_a_semicolon_is_not_truncated(self):
+        # The other half of MAJOR-1: `;` is legal in a path too, and the
+        # property printer does not escape it either.
+        live = self.tmp / "reloc;ated" / "xpfd"
+        live_ran = self._install_abs(live)
+        truncated = self.tmp / "reloc"
+        truncated_ran = self._install_abs(truncated)
+
+        self.stub_execstart = f"{{ path={live} ; argv[]={live} ; ignore_errors=no }}"
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertFalse(
+            truncated_ran.exists(),
+            f"the gate TRUNCATED systemd's ExecStart at the first ';' and "
+            f"executed {truncated} instead of {live} (#6601 r4 MAJOR-1): "
+            f"{res.stderr}",
+        )
+        self.assertTrue(
+            live_ran.exists(),
+            f"the gate did not run the xpfd systemd's ExecStart names: "
+            f"{res.stderr}",
+        )
+
+    def test_multiple_execstart_entries_are_not_reduced_to_the_first(self):
+        # MAJOR-1, second shape. systemd renders one ExecStart entry per LINE
+        # (verified against man-db.service). The shipped Type=simple unit cannot
+        # validly carry more than one, but an operator-overridden Type=oneshot
+        # can -- and its FIRST entry need not be xpfd at all. Taking it
+        # unconditionally hands the promote-vs-rollback decision to an arbitrary
+        # command. Ambiguous input must yield NOTHING so the compiled defaults
+        # still get their turn.
+        foreign = self.tmp / "prep" / "install"
+        foreign_ran = self._install_abs(foreign)
+        entry = self.tmp / "opt" / "xpfd"
+        self._install_abs(entry)
+        sbin_ran = self._install(SBIN, 0)
+
+        self.stub_execstart = (
+            f"{{ path={foreign} ; argv[]={foreign} -d ; ignore_errors=no }}\n"
+            f"{{ path={entry} ; argv[]={entry} ; ignore_errors=no }}"
+        )
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertFalse(
+            foreign_ran.exists(),
+            f"the gate executed {foreign}, the FIRST of several ExecStart "
+            "entries, which need not be xpfd (#6601 r4 MAJOR-1): "
+            f"{res.stderr}",
+        )
+        self.assertTrue(
+            sbin_ran.exists(),
+            "an ambiguous multi-entry ExecStart must yield nothing and let the "
+            f"compiled defaults resolve: {res.stderr}",
+        )
+
+    def test_discovers_the_running_binary_via_main_pid_proc_exe(self):
+        # #6601 r4: the structured, un-parsed discovery source. MainPID is an
+        # integer property and /proc/<pid>/exe is a kernel symlink, so this hop
+        # reads the path of the binary the live daemon is ACTUALLY executing
+        # without parsing systemd's lossy textual render at all. It must outrank
+        # stale leftovers at both compiled defaults.
+        sleep_bin = shutil.which("sleep")
+        if not sleep_bin:
+            self.skipTest("no sleep(1) to model a running daemon")
+        target = self.tmp / "opt-live" / "xpfd"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(sleep_bin, target)
+        if not os.access(target, os.X_OK):
+            self.skipTest("could not stage an executable copy")
+        proc = subprocess.Popen(
+            [str(target), "60"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+
+        self.stub_mainpid = str(proc.pid)
+        self.stub_loadstate = "loaded"
+        stale_sbin = self._install(SBIN, 0)
+        stale_versioned = self._install(VERSIONED, 0)
+
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(
+            f"using {target} (",
+            res.stderr,
+            "the gate did not resolve xpfd through xpfd.service's MainPID and "
+            f"/proc/<pid>/exe: {res.stderr}",
+        )
+        self.assertIn("MainPID", res.stderr)
+        self.assertFalse(
+            stale_sbin.exists(),
+            f"ran the leftover at {SBIN} instead of the binary the live daemon "
+            f"is executing: {res.stderr}",
+        )
+        self.assertFalse(
+            stale_versioned.exists(),
+            f"ran the leftover at {VERSIONED} instead of the binary the live "
+            f"daemon is executing: {res.stderr}",
+        )
+
+    def test_unqueryable_systemd_refuses_loudly_rather_than_skipping(self):
+        # #6601 r4 audit note. The quiet "xpf is not on this box" skip is only
+        # honest when systemd ANSWERED not-found. A systemctl that is missing or
+        # erroring proves NOTHING about whether xpf is installed -- laundering
+        # that into the benign skip lets an ARMED candidate sail past the gate
+        # behind a reassuring log line.
+        self.stub_show_fail = "1"
+
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(
+            "ERROR",
+            res.stderr,
+            "an unqueryable systemd was treated as proof that xpf is absent "
+            f"(#6601 r4): {res.stderr}",
+        )
+        self.assertIn("REFUSING to promote", res.stderr)
+        self.assertNotIn("skipping promotion gate", res.stderr)
+        self.assertFalse(
+            self.marker.exists(),
+            "the gate executed the xpfd it found on $PATH (#6541)",
         )
 
     def test_unusable_execstart_falls_through_to_compiled_defaults(self):

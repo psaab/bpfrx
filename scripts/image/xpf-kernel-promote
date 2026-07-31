@@ -35,16 +35,26 @@ log() { echo "xpf-kernel-promote: $*" >&2; }
 # `verify-dataplane` exec, is resolved explicitly by resolveVerifyGateBin in
 # pkg/upgrade/kernel_linux.go.)
 #
-# DISCOVERY, then compiled defaults, then a LOUD refusal. Never $PATH.
+# Every source below obeys one rule: UNAMBIGUOUS OR NOTHING. A source that
+# cannot prove WHICH executable it is naming stays silent so the next source
+# gets its turn, because here a wrong answer is far worse than no answer -- it
+# suppresses every remaining candidate and that binary's exit 0 AUTHORIZES the
+# promotion (#6601 r4).
 #
-#   1. The ExecStart systemd has for xpfd.service. This is the authority: it is
-#      the path systemd actually launches the live daemon from, and it is
-#      exactly what the cut writes -- flip step 6c templates
-#      ExecStart=<VersionsDir>/<ver>/xpfd into 10-xpf-version.conf on every cut
-#      (pkg/upgrade/flip.go), and the shipped base unit carries
-#      ExecStart=/usr/local/sbin/xpfd before the first cut. So it names the live
-#      binary both pre- and post-cut, and it is a CONCRETE ABSOLUTE PATH that
-#      depends on no compiled-in root.
+# DISCOVERY, then the compiled defaults, then a LOUD refusal. Never $PATH.
+#
+#   1. /proc/<MainPID>/exe for xpfd.service -- the KERNEL's answer for the
+#      binary the live daemon is ACTUALLY executing, reached through a
+#      structured integer property plus a kernel symlink. No rendered path text
+#      is parsed at all, so a runtime root containing a space or a ';' cannot be
+#      truncated into some other executable.
+#
+#   2. The ExecStart systemd has for xpfd.service. This is what the cut writes:
+#      flip step 6c templates ExecStart=<VersionsDir>/<ver>/xpfd into
+#      10-xpf-version.conf on every cut (pkg/upgrade/flip.go), and the shipped
+#      base unit carries ExecStart=/usr/local/sbin/xpfd before the first cut. So
+#      it names the live binary both pre- and post-cut, and it is a CONCRETE
+#      ABSOLUTE PATH that depends on no compiled-in root.
 #
 #      That last property is the point. `--versions-dir` AND `--sbin-dir` are
 #      both real operator options (cmd/xpfd/upgrade.go) and the cut maintains
@@ -56,15 +66,31 @@ log() { echo "xpf-kernel-promote: $*" >&2; }
 #      build that can reject a healthy candidate and trigger a needless revert.
 #      Asking systemd removes the guesswork instead of adding a third guess.
 #
-#   2. /usr/local/sbin/xpfd -- compiled-default managed entry point.
-#   3. /var/lib/xpf/versions/current/xpfd -- compiled-default runtime root.
+#   3. The compiled defaults /usr/local/sbin/xpfd and
+#      /var/lib/xpf/versions/current/xpfd, for a box where systemd cannot answer
+#      (no unit yet, a systemctl that does not understand the query, an empty
+#      ExecStart during a packaging window). They are consulted as an
+#      UNAMBIGUOUS SET, not as a ranked list, because NO fixed rank is right
+#      (#6601 r4): `--sbin-dir` and `--versions-dir` relocate INDEPENDENTLY, and
+#      the two partial relocations invert which default is the live one --
 #
-#      (2) and (3) are for a box where systemd cannot answer (no unit yet, a
-#      systemctl that does not understand the query). (2) outranks (3) because
-#      the cut repoints the sbin entry to the CONFIGURED runtime root, so it
-#      stays right under `--versions-dir` relocation, whereas (3) is correct
-#      only on a default-rooted box AND is not removed when the operator
-#      relocates -- consulting it first would select a stale build.
+#        --versions-dir only : flip 6b repoints the sbin entry into the
+#                              CONFIGURED runtime root, so the sbin entry is
+#                              LIVE; the default versions root is a stale
+#                              leftover that relocation does not remove.
+#        --sbin-dir only     : flip maintains the CONFIGURED sbin dir, so the
+#                              default versions root is LIVE and the leftover
+#                              /usr/local/sbin/xpfd is the STALE one.
+#
+#      Ranking sbin first is therefore right for the first row and wrong for the
+#      second. So: take a default only when the two name the SAME file -- the
+#      ordinary layout, where flip 6b left <SbinDir>/xpfd as a symlink to
+#      <VersionsDir>/current/xpfd and the two "candidates" are one inode -- or
+#      when only one of them is usable at all. Two usable defaults that are
+#      DIFFERENT files mean one of them is stale with nothing on the box to say
+#      which; refuse loudly rather than flip a coin.
+#
+#   4. Otherwise a LOUD refusal (see below).
 #
 # `-f` as well as `-x`: `test -x` is TRUE for a searchable DIRECTORY, and the
 # inner hop's validateGateBin rejects a non-regular target, so both hops apply
@@ -72,65 +98,202 @@ log() { echo "xpf-kernel-promote: $*" >&2; }
 # DANGLING symlink, the #2176 case that hands over to the next candidate.
 #
 # systemctl itself is $PATH-resolved, which is correct: it is a
-# distribution-owned binary, unlike xpfd.
+# distribution-owned binary, unlike xpfd -- and the unit pins $PATH to the
+# distribution directories, so operator-writable /usr/local/{s,}bin (which
+# systemd's DEFAULT PATH ranks FIRST) cannot supply it.
 
-# unit_exec_start prints the absolute path systemd launches xpfd.service from,
-# or nothing. `systemctl show -p ExecStart` renders a structured value
-# (`{ path=/x ; argv[]=... }`); older/newer renderings are tolerated by pulling
-# the first `path=` field, with a bare-absolute-path fallback.
-unit_exec_start() {
-    raw=$(systemctl show --property=ExecStart --value xpfd.service 2>/dev/null) || return 0
-    path=$(printf '%s\n' "$raw" | sed -n 's/.*path=\([^ ;]*\).*/\1/p' | head -n 1)
-    if [ -z "$path" ]; then
-        path=$(printf '%s\n' "$raw" | sed -n 's/^\(\/[^ ;]*\).*/\1/p' | head -n 1)
-    fi
-    [ -n "$path" ] && printf '%s\n' "$path"
+NL='
+'
+# systemd's REAL field delimiter after `path=` in the ExecStart rendering.
+ARGV_SEP=' ; argv[]='
+
+# unit_main_pid_exe prints the absolute path of the binary xpfd.service is
+# actually running, or nothing. MainPID is a structured integer property and
+# /proc/<pid>/exe is a kernel symlink, so nothing here parses a rendered path.
+unit_main_pid_exe() {
+    pid=$(systemctl show --property=MainPID --value xpfd.service 2>/dev/null) || return 0
+    case "$pid" in
+        '' | *[!0-9]*) return 0 ;;
+    esac
+    [ "$pid" -gt 0 ] || return 0
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || return 0
+    case "$exe" in
+        # A binary replaced on disk reads back as "<path> (deleted)". It cannot
+        # be re-executed, so yield nothing rather than a mangled path.
+        *' (deleted)') return 0 ;;
+    esac
+    case "$exe" in
+        # Basename guard. Every layout this gate supports names the artifact
+        # `xpfd` (the manifest basename; flip writes <VersionsDir>/<ver>/xpfd
+        # and <SbinDir>/xpfd), so this costs nothing -- and it closes the
+        # window where the daemon exits between the MainPID read and the
+        # readlink and the pid has been recycled by an unrelated process.
+        /*/xpfd) printf '%s\n' "$exe" ;;
+    esac
 }
 
-# xpfd_unit_known reports whether systemd knows an xpfd.service at all. Used
-# only to decide how LOUD to be when nothing resolves: a loaded unit means xpf
-# is installed and an unlocatable binary is an operator-visible fault, not the
-# benign "xpf is not on this box" case.
-xpfd_unit_known() {
-    state=$(systemctl show --property=LoadState --value xpfd.service 2>/dev/null) || return 1
-    [ -n "$state" ] && [ "$state" != "not-found" ]
+# unit_exec_start prints the absolute path systemd launches xpfd.service from,
+# or NOTHING.
+#
+# `systemctl show --property=ExecStart --value` renders each entry as
+#
+#     { path=/usr/sbin/sshd ; argv[]=/usr/sbin/sshd -D $OPTS ; ignore_errors=no ; ... }
+#
+# and the property printer substitutes the stored path RAW (`path=%s`), with no
+# escaping. systemd PERMITS an executable path containing a space or a ';', so a
+# parse that stops at the first one does not merely fail to resolve -- it
+# resolves to a SHORTER, DIFFERENT path (#6601 r4: `path=/opt/relocated live/xpfd`
+# yielded `/opt/relocated`, which the gate then executed as the promotion
+# authority). Cut at the literal " ; argv[]=" systemd emits immediately after
+# the field instead, and give up unless it occurs EXACTLY ONCE -- a second
+# occurrence means the path (or an argument) contains the delimiter itself and
+# no textual parse can recover the boundary.
+#
+# Multiple ExecStart entries render one per LINE. The shipped Type=simple unit
+# cannot validly carry more than one, but an operator-overridden Type=oneshot
+# can, and its FIRST entry need not be xpfd -- so more than one line is
+# ambiguous, not "take the first".
+unit_exec_start() {
+    raw=$(systemctl show --property=ExecStart --value xpfd.service 2>/dev/null) || return 0
+    [ -n "$raw" ] || return 0
+    case "$raw" in
+        *"$NL"*) return 0 ;;
+    esac
+    case "$raw" in
+        '{ path='*"$ARGV_SEP"*)
+            rest=${raw#'{ path='}
+            case "${rest#*"$ARGV_SEP"}" in
+                *"$ARGV_SEP"*) return 0 ;;
+            esac
+            path=${rest%%"$ARGV_SEP"*}
+            ;;
+        /*)
+            # A bare (unstructured) rendering. Accepted ONLY when the whole
+            # value is a single absolute path; arguments, or an @ / - / + / !
+            # exec prefix, leave the executable unidentifiable. A prefix also
+            # fails the `/*` match above and lands in the catch-all.
+            case "$raw" in
+                *' '* | *';'*) return 0 ;;
+            esac
+            path=$raw
+            ;;
+        *) return 0 ;;
+    esac
+    case "$path" in
+        /*) printf '%s\n' "$path" ;;
+    esac
+}
+
+# xpfd_unit_state echoes exactly one of:
+#
+#   known   -- systemd has an xpfd.service. Note this means known/LOADABLE
+#              (LoadState loaded, masked, bad-setting, ...), NOT enabled and NOT
+#              running -- which is the right test here: it says xpf IS installed
+#              on this box, so an unlocatable binary is an operator-visible
+#              fault.
+#   absent  -- systemd answered "not-found". The benign "xpf is not on this box"
+#              case, and the ONLY one that skips quietly.
+#   unknown -- systemctl is missing, errored, or returned nothing. That proves
+#              NOTHING about whether xpf is installed (#6601 r4), so it must not
+#              be laundered into the benign skip: an armed candidate would sail
+#              past the gate behind a reassuring log line.
+xpfd_unit_state() {
+    state=$(systemctl show --property=LoadState --value xpfd.service 2>/dev/null) || {
+        echo unknown
+        return 0
+    }
+    case "$state" in
+        '') echo unknown ;;
+        not-found) echo absent ;;
+        *) echo known ;;
+    esac
 }
 
 XPFD=""
 XPFD_SRC=""
+DEFAULTS_AMBIGUOUS=0
+
+# usable: the admission test, applied identically to every candidate -- an
+# existing, REGULAR, executable file (see the -f/-x note above).
+usable() {
+    [ -n "$1" ] && [ -f "$1" ] && [ -x "$1" ]
+}
+
 try_candidate() {
     [ -z "$XPFD" ] || return 0
-    [ -n "$1" ] || return 0
-    if [ -f "$1" ] && [ -x "$1" ]; then
-        XPFD="$1"
-        XPFD_SRC="$2"
+    usable "$1" || return 0
+    XPFD="$1"
+    XPFD_SRC="$2"
+}
+
+try_compiled_defaults() {
+    [ -z "$XPFD" ] || return 0
+    sbin_ok=0
+    ver_ok=0
+    usable /usr/local/sbin/xpfd && sbin_ok=1
+    usable /var/lib/xpf/versions/current/xpfd && ver_ok=1
+    if [ "$sbin_ok" = 1 ] && [ "$ver_ok" = 1 ]; then
+        if [ /usr/local/sbin/xpfd -ef /var/lib/xpf/versions/current/xpfd ]; then
+            # The ordinary layout: flip 6b made the sbin entry a symlink to the
+            # versioned runtime, so the two candidates are the same inode and
+            # there is nothing to disambiguate.
+            XPFD=/usr/local/sbin/xpfd
+            XPFD_SRC="compiled defaults (both name the same file)"
+        else
+            DEFAULTS_AMBIGUOUS=1
+        fi
+    elif [ "$sbin_ok" = 1 ]; then
+        XPFD=/usr/local/sbin/xpfd
+        XPFD_SRC="compiled-default sbin entry (the only usable default)"
+    elif [ "$ver_ok" = 1 ]; then
+        XPFD=/var/lib/xpf/versions/current/xpfd
+        XPFD_SRC="compiled-default versioned runtime (the only usable default)"
     fi
 }
 
+try_candidate "$(unit_main_pid_exe)" "systemd MainPID -> /proc/<pid>/exe for xpfd.service"
 try_candidate "$(unit_exec_start)" "systemd ExecStart for xpfd.service"
-try_candidate /usr/local/sbin/xpfd "compiled-default sbin entry"
-try_candidate /var/lib/xpf/versions/current/xpfd "compiled-default versioned runtime"
+try_compiled_defaults
 
+# Every refusal below exits 0 DELIBERATELY: it takes the same non-rebooting
+# infra-error path as an rc=1 from the gate, because the firmware already
+# cleared BootNext and the next plain reboot falls back to known-good. A
+# non-zero exit would trip OnFailure= and reboot the box over what may be a
+# transient packaging window.
 if [ -z "$XPFD" ]; then
-    if xpfd_unit_known; then
-        # FAIL LOUD, do not fail silent. xpf IS installed here, so being unable
-        # to locate its binary means the gate cannot run -- and an armed
-        # candidate would otherwise sail past unverified with nothing in the
-        # journal to say so. Exit 0 deliberately: this takes the same
-        # non-rebooting infra-error path as an rc=1 from the gate, because the
-        # firmware already cleared BootNext and the next plain reboot falls back
-        # to known-good. A non-zero exit would trip OnFailure= and reboot the
-        # box over what may be a transient packaging window.
-        log "ERROR: cannot locate the xpfd binary (systemd ExecStart for" \
-            "xpfd.service, /usr/local/sbin/xpfd, /var/lib/xpf/versions/current/xpfd" \
-            "all unusable) but xpfd.service IS installed. REFUSING to promote:" \
-            "an armed candidate stays un-promoted and the next plain reboot" \
-            "falls back to the known-good slot. If this host relocated its" \
-            "runtime with --versions-dir/--sbin-dir, ensure xpfd.service's" \
-            "ExecStart names the live binary."
+    if [ "$DEFAULTS_AMBIGUOUS" = 1 ]; then
+        # FAIL LOUD. Both compiled defaults hold a usable xpfd but they are
+        # DIFFERENT files, and systemd could not say which one it runs, so one
+        # of them is stale and nothing on the box says which. Executing either
+        # is a coin flip that can verify the candidate kernel against the wrong
+        # dataplane, or reject a healthy candidate into a needless revert.
+        log "ERROR: /usr/local/sbin/xpfd and /var/lib/xpf/versions/current/xpfd" \
+            "are BOTH usable but are DIFFERENT files, and systemd could not say" \
+            "which one it runs -- so one of them is STALE and nothing on this" \
+            "box says which. REFUSING to promote rather than guess: an armed" \
+            "candidate stays un-promoted and the next plain reboot falls back to" \
+            "the known-good slot. Fix xpfd.service's ExecStart, or remove the" \
+            "runtime left behind by --versions-dir/--sbin-dir relocation, then" \
+            "re-arm."
         exit 0
     fi
-    log "xpfd not found and no xpfd.service is installed; skipping promotion gate"
+    if [ "$(xpfd_unit_state)" = absent ]; then
+        log "xpfd not found and no xpfd.service is installed; skipping promotion gate"
+        exit 0
+    fi
+    # FAIL LOUD, do not fail silent. Either xpf IS installed here or systemd
+    # could not be consulted at all -- and neither proves this box is xpf-free.
+    # Being unable to locate the binary means the gate cannot run, and an armed
+    # candidate would otherwise sail past unverified with nothing in the journal
+    # to say so.
+    log "ERROR: cannot locate the xpfd binary (systemd MainPID and ExecStart for" \
+        "xpfd.service, /usr/local/sbin/xpfd, /var/lib/xpf/versions/current/xpfd" \
+        "all unusable) and systemd did not report xpfd.service absent -- either" \
+        "it IS installed here, or systemctl could not be consulted at all."\
+        "REFUSING to promote: an armed candidate stays un-promoted and the next" \
+        "plain reboot falls back to the known-good slot. If this host relocated" \
+        "its runtime with --versions-dir/--sbin-dir, ensure xpfd.service's" \
+        "ExecStart names the live binary."
     exit 0
 fi
 

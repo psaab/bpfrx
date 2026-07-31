@@ -62619,3 +62619,62 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: scripts/image/{xpf-kernel-promote,test_kernel_promote_explicit_path.py},
     pkg/upgrade/{kernel_linux.go,exec_bare_artifact_lint_6541_test.go},
     docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6541 / PR #6601 fold r4 — Codex MERGE-NEEDS-MAJOR on the kernel
+  promote gate. Two paths still executed the WRONG verifier.
+  MAJOR 1 — the ExecStart parse could silently truncate and exec a different
+  binary. `sed -n 's/.*path=\([^ ;]*\).*/\1/p'` treated space and `;` as
+  terminators, but systemd PERMITS both in an executable path and the property
+  printer substitutes it raw (`path=%s`, no escaping). `path=/opt/relocated
+  live/xpfd` therefore yielded `/opt/relocated` — a DIFFERENT executable — and
+  a truncated read that happens to be executable suppresses every remaining
+  candidate and its exit 0 AUTHORIZES the promotion. The greedy `.*path=` also
+  took the LAST match, and `| head -n 1` took the FIRST of several ExecStart
+  entries without proving uniqueness (an operator-overridden `Type=oneshot`
+  can have several and the first need not be xpfd).
+  Fold: added `/proc/<MainPID>/exe` as the FIRST discovery hop — MainPID is a
+  structured integer and `/proc/<pid>/exe` a kernel symlink, so no rendered
+  path text is parsed at all (rejects a `… (deleted)` readback and a non-`xpfd`
+  basename, which also closes the pid-recycle window). The ExecStart parse is
+  now anchored on `{ path=` and cuts at systemd's REAL delimiter, the literal
+  `" ; argv[]="` (verified against live systemd renderings, incl. a no-arg
+  unit and multi-entry man-db.service), gives up unless that delimiter occurs
+  exactly once, and refuses any multi-LINE value. The bare-rendering tolerance
+  now accepts only a whole-value absolute path, so an `@`/`-`/`+`/`!` prefix
+  yields nothing instead of a guess. UNAMBIGUOUS OR NOTHING.
+  MAJOR 2 — the compiled-default ORDER was wrong for `--sbin-dir`-only
+  relocation. `--sbin-dir` and `--versions-dir` relocate independently and each
+  partial move inverts which default is live: versions-only leaves the sbin
+  entry LIVE, sbin-only leaves `/usr/local/sbin/xpfd` a STALE leftover while
+  `/var/lib/xpf/versions/current/xpfd` is live. Ranking sbin first ran the
+  stale build whenever systemd could not answer — and a stale default also
+  pre-empted the loud-refusal branch entirely on a both-roots-relocated box.
+  Fold: the defaults are now an UNAMBIGUOUS SET, not a ranked list. Take one
+  only when the two are the SAME file (`-ef` — the ordinary layout where flip
+  6b left the sbin entry a symlink to the versioned runtime is ONE inode) or
+  when only one is usable at all (`-f`/`-x` still drops the #2176 dangling
+  symlink and the directory case). Two usable-but-different defaults mean one
+  is stale with nothing on the box to say which → refuse LOUDLY.
+  Audit notes folded: `xpfd_unit_known` became tri-state `xpfd_unit_state`
+  (known/absent/unknown) — a systemctl that is missing or erroring proves
+  NOTHING about whether xpf is installed, so it no longer launders into the
+  benign quiet skip; only an actual `not-found` answer skips. Documented that
+  "known" means known/LOADABLE (masked counts), not enabled. The unit now pins
+  `Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin` — the gate PATH-resolves
+  systemctl/readlink/reboot on purpose, and systemd's default PATH ranks the
+  operator-writable /usr/local/{s,}bin FIRST.
+  Validation: 9 new/rewritten python cases verified RED at the pre-fix head
+  46707e4db in a THROWAWAY detached worktree (8 failures + 1 error), then green
+  (23 cases). Per-element mutation sensitivity confirmed: reverting the
+  delimiter cut, the multi-line guard, the `-ef` same-file test, the MainPID
+  hop, or the unknown-state loudness each reds its own case and nothing else.
+  Anti-over-reach `test_agreeing_compiled_defaults_still_resolve` pins that an
+  ordinary default-rooted box (sbin symlink → versioned runtime) still resolves
+  rather than refusing. `go test ./pkg/upgrade/...` green, gofmt clean on the
+  branch's Go files, `sh -n` + `busybox sh -n` clean, `git diff --check` clean,
+  `make selftest` 47 pass / 1 fail where the single failure
+  (scripts/image/test_validate_scenarios.py, xorriso extract exit 5) was
+  verified to fail identically at origin/master 1aa1d38c2.
+- **File(s)**: scripts/image/{xpf-kernel-promote,xpf-kernel-promote.service,
+    test_kernel_promote_explicit_path.py}, docs/in-place-upgrade.md, _Log.md

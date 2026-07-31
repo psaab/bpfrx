@@ -892,10 +892,15 @@ location must not be able to author that decision — and even with no
 attacker, a stale `xpfd` left in another directory would verify the wrong
 build against the candidate kernel. Both hops resolve explicitly:
 
-- *Outer hop* — `scripts/image/xpf-kernel-promote` asks systemd for
-  `xpfd.service`'s `ExecStart`, then falls back to `/usr/local/sbin/xpfd`
-  and `/var/lib/xpf/versions/current/xpfd`. None is `$PATH`-resolved.
-  With nothing resolvable it **refuses loudly** (see below).
+- *Outer hop* — `scripts/image/xpf-kernel-promote` asks the kernel and
+  systemd where `xpfd.service` runs from — `/proc/<MainPID>/exe`, then
+  `ExecStart` — and only then considers `/usr/local/sbin/xpfd` and
+  `/var/lib/xpf/versions/current/xpfd`. None is `$PATH`-resolved. With
+  nothing resolvable it **refuses loudly** (see below). The unit also
+  pins `Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin`: the gate does
+  `$PATH`-resolve `systemctl`/`readlink`/`reboot` on purpose, and
+  systemd's *default* `PATH` ranks the operator-writable
+  `/usr/local/sbin` and `/usr/local/bin` first.
 - *Inner hop* — `realKernelSystem.VerifyDataplane`
   (`resolveVerifyGateBin`, `pkg/upgrade/kernel_linux.go`) prefers
   `os.Executable()` — the running process IS `xpfd upgrade kernel
@@ -916,34 +921,79 @@ in the journal to say the gate never ran — or, with leftover artifacts at
 the default paths, **exec a stale build** that can reject a healthy
 candidate and trigger a needless revert/reboot.
 
-`systemctl show -p ExecStart xpfd.service` answers this directly. It is
-the path systemd actually launches the live daemon from, it is a concrete
-absolute path that depends on no compiled-in root, and it is exactly what
-the cut writes: `flip` step 6c templates
+`xpfd.service` answers this directly, in two forms. `MainPID` +
+`/proc/<pid>/exe` is the **kernel's** answer for the binary the live
+daemon is actually executing; `ExecStart` is the **declared** one, and it
+is exactly what the cut writes — `flip` step 6c templates
 `ExecStart=<VersionsDir>/<ver>/xpfd` into `10-xpf-version.conf` on every
 cut, and the shipped base unit carries `ExecStart=/usr/local/sbin/xpfd`
 before the first cut. So it names the live binary both pre- and post-cut.
 `systemctl` itself is `$PATH`-resolved, which is correct — it is a
 distribution-owned binary, unlike xpfd.
 
-**Why the sbin default outranks the versioned default.** Among the two
-fallbacks, `flip` step 6b repoints `<SbinDir>/<bin>` →
-`<VersionsDir>/current/<bin>` on every cut, so the sbin entry stays right
-under `--versions-dir` relocation. Relocating does **not** remove an
-older `/var/lib/xpf/versions/current`, so consulting that first would
-select a stale build. The versioned path is the last resort, for a box
-whose sbin entry is missing or dangling (#2176, where a broken symlink
-fails the `-f` regular-file test).
+**Unambiguous or nothing.** Every discovery source obeys one rule: a
+source that cannot prove *which* executable it is naming must yield
+nothing and let the next one try. A wrong answer here is far worse than
+no answer — it suppresses every remaining candidate and that binary's
+exit 0 *authorizes* the promotion. Two consequences worth stating
+(#6601):
 
-**Refusing loudly beats skipping quietly.** If nothing resolves *and*
-`xpfd.service` is known to systemd, the gate logs an explicit
-`ERROR: … REFUSING to promote` naming every candidate it tried, and takes
-the existing non-rebooting infra-error path. It deliberately still exits
-0: a non-zero exit would trip `OnFailure=` and reboot the box over what
-may be a transient packaging window, whereas an un-promoted candidate is
-already safe — the firmware cleared `BootNext`, so the next plain reboot
-falls back to the known-good slot. Only a box where no `xpfd.service`
-exists at all still skips quietly.
+- `MainPID` is a structured integer and `/proc/<pid>/exe` is a kernel
+  symlink, so this hop parses **no rendered path text at all**. It is
+  tried first for exactly that reason. It yields nothing for a
+  `… (deleted)` readback (a binary replaced on disk cannot be
+  re-executed) or for a basename that is not `xpfd`.
+- `systemctl show -p ExecStart --value` renders
+  `{ path=/x ; argv[]=/x … }` and substitutes the stored path **raw**
+  (`path=%s`, no escaping) — while systemd *permits* an executable path
+  containing a space or a `;`. Stopping at the first space/semicolon does
+  not fail to resolve, it resolves to a **shorter, different** path. The
+  parse therefore cuts at systemd's real field delimiter, the literal
+  `" ; argv[]="`, and gives up unless that occurs exactly once. Multiple
+  `ExecStart` entries render one per **line**; an operator-overridden
+  `Type=oneshot` unit can have several and the first need not be xpfd, so
+  more than one line yields nothing rather than "take the first".
+
+**Why the two compiled defaults are a set, not a ranking.** `--sbin-dir`
+and `--versions-dir` relocate **independently**, and each partial move
+inverts which default is the live one:
+
+| relocation | `/usr/local/sbin/xpfd` | `/var/lib/xpf/versions/current/xpfd` |
+|---|---|---|
+| neither | live (symlink to the versioned runtime) | live |
+| `--versions-dir` only | **live** — `flip` 6b repoints it into the configured root | stale leftover |
+| `--sbin-dir` only | **stale leftover** — `flip` maintains the *configured* sbin dir | **live** |
+| both | stale leftover | stale leftover |
+
+No fixed rank is right for both middle rows, so the gate does not rank.
+It takes a default only when the two name the **same file** (`-ef`: the
+ordinary layout, where `flip` 6b left `<SbinDir>/xpfd` as a symlink to
+`<VersionsDir>/current/xpfd`, so the two "candidates" are one inode), or
+when only one of them is usable at all — which covers the `#2176`
+dangling-symlink and directory cases, where the unusable one drops out on
+the `-f` regular-file test. Two usable defaults that are **different
+files** mean one is stale with nothing on the box to say which, so the
+gate refuses loudly instead of flipping a coin.
+
+**Refusing loudly beats skipping quietly.** The gate logs an explicit
+`ERROR: … REFUSING to promote` and takes the non-rebooting infra-error
+path whenever it cannot resolve xpfd and cannot *prove* the box is
+xpf-free:
+
+- nothing resolved and `xpfd.service` is known to systemd — xpf is
+  installed here;
+- nothing resolved and `systemctl` could not be consulted at all
+  (missing, erroring, empty answer) — that proves nothing about whether
+  xpf is installed, so it must not be laundered into the benign skip;
+- the two compiled defaults are both usable but are different files.
+
+Note that "known to systemd" means known/**loadable** — a `masked` or
+disabled-but-loadable unit still answers — not enabled and not running.
+Every one of these deliberately still exits 0: a non-zero exit would trip
+`OnFailure=` and reboot the box over what may be a transient packaging
+window, whereas an un-promoted candidate is already safe — the firmware
+cleared `BootNext`, so the next plain reboot falls back to the known-good
+slot. Only a box where systemd **answered** `not-found` skips quietly.
 
 `KernelConfig` carries neither directory, so the *inner* hop's two
 fallbacks are the compiled defaults; by then the outer hop has already
