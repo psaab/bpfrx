@@ -1,17 +1,16 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.25.0 — THE TERMINAL CUT, round-108 folds (the
-contract block is REWRITTEN WHOLESALE as one coherent specification —
-the accumulated splice generations had left mutually contradictory
-sub-bullets; the single-carrier/single-drain description, the
-site-scoped fallback in every clause, the explicit transition gate in
-the consumer list, and the removed-terminology remnants are all
-resolved by the rewrite). Round-108: Codex NO (1B/2H/2M — all
-text-level contradictions between partial edits: the second drain
-paragraph, the unscoped fallback in the legal-product paragraph and
-the composition clauses, the consumer list's promote/refresh guards,
-and terminology my own v10.24 fold reintroduced); AGY r107 SOUND
-(v10.24.0); SMR r108 YES (fold verification). Ship
+**Status: DRAFT v10.26.0 — THE TERMINAL CUT, round-109 folds (the
+post-state S2 family is a first-class producer — without it a
+no-P/no-predecessor `(Refused, Installed)` would produce an empty set
+and a surviving older cache entry would keep serving the tuple; the
+producer writes ONE derived `effective_transition` that every
+consumer including the pre-resolved-result promotion reads; the
+second composition clause is site-qualified; every unconditional
+clear/install claim outside the SSOT now carries the
+`transition != OverdueSkipped` qualification). Round-109: Codex NO
+(1B/2H/1M — precise residuals); AGY r108 SOUND (v10.25.0, no
+findings); SMR r109 YES (fold verification). Ship
 candidate = the Part-A dataplane demote gate plus the wire-free local HA
 rules. The RG-incarnation/retirement/fence-ledger protocol that rounds
 13–82 grew is KILLED (not deferred): its two customers are re-scoped —
@@ -1397,15 +1396,19 @@ ordinary refresh. A non-probation existing entry takes today's upsert
 unchanged. The probation entry carries
 an explicit `probation: bool` that (a) suppresses ownership promotion,
 Open emission, and replication (§5.5), and (b) clears on the first
-COMMITTED non-close packet, which also refreshes the entry to its
+COMMITTED non-close packet whose transition is NOT `OverdueSkipped`
+(the explicit overdue guard, v10.26.0 round-109 Codex 4), which also
+refreshes the entry to its
 ordinary established timeout. **The clear+refresh runs at the MATCHED
 entry's own commit arm — the entry the packet hit — independent of the
 anchor's reverse→forward hop** (the probation flag lives on the
 materialized entry, which may be a reverse-key entry; wiring the clear
 through the anchor hook would clear the wrong store and strand a live
 flow on 20 s probation churn). Unlike site 2b the install cannot be
-skipped — the packet needs its decision and the entry must own the flow
-going forward — so the seed is suppressed instead. **A probation entry's
+skipped EXCEPT by the overdue rule (the packet needs its decision and
+the entry must own the flow going forward — so the seed is suppressed
+instead; an overdue entry's materialize IS skipped wholesale per the
+contract, v10.26.0 round-109 Codex 4). **A probation entry's
 reap is LOCAL-ONLY (v10.1.0, round-83 Codex 2; alias amendment
 v10.15.0, round-98 Codex 5):** `ExpiredSession`
 carries the probation flag, and a probation expiry removes ONLY the
@@ -1748,7 +1751,15 @@ adopting the shared decision/metadata, §5.6).
     `site` is the materialization discriminator (`Some(Site2c)` only
     from the site-2c materialize; `None` on every non-materializing
     path) — consumers can therefore distinguish an erroneous site-2c
-    `(None, None)` from a valid local hit.
+    `(None, None)` from a valid local hit. The producer additionally
+    writes ONE derived `effective_transition` (v10.26.0, round-109
+    Codex 2): the validated transition after the by-construction
+    invariant — every consumer, INCLUDING the pre-resolved-result
+    promotion, reads the effective transition, never the raw fields
+    (an invalid `(Some(Site2c), Accepted, Installed)` would otherwise
+    satisfy neither the transition gate nor the rule-5 gate and could
+    reach promotion, `promote.rs:86-139`; the effective transition of
+    an invalid site-2c report is `OverdueSkipped`).
   - **Fields:** `ResolvedFlowSessionDecision`
     (`shared_ops.rs:563-578`) gains the whole
     `report: MaterializeReport`, initialized `MaterializeReport::NONE`
@@ -1840,7 +1851,20 @@ adopting the shared decision/metadata, §5.6).
     family are BOTH separately recorded members of the same
     ≤3-family set). The set DEDUPLICATES by alias-family inputs (key,
     NAT decision, orientation) — a repeat contribution merges.
-    Producers, each contributing at most one family per transition:
+    Producers, each contributing at most one family per transition
+    (v10.26.0, round-109 Codex 1 — the post-state S2 family is a
+    FIRST-CLASS producer, without which a no-P/no-predecessor
+    `(Refused, Installed)` would produce an empty set and a surviving
+    older cache entry would keep serving the tuple: FIN/RST skips the
+    cache lookup, `flow_cache.rs:352-358`, so a close can materialize
+    S2 while an older cache entry survives, and the following ACK
+    consults the cache before session resolution,
+    `poll_descriptor/mod.rs:298-327`; the invalidation is exact-key,
+    `flow_cache.rs:1105-1120`): the NEW S2 alias family, added by the
+    materialize/upsert on ANY successful install/adopt (the
+    materializer has S2 in hand, `session_glue/mod.rs:1098-1119`) and
+    by a successful promotion (which can contribute both the preimage
+    K and the resulting S2 — total capacity remains 3);
     the placeholder substitution (`shared_ops.rs:602-628`, an OUT
     parameter — and the placeholder identity is STAGED, committed to
     the set only on the site-2c materialization branch, DISCARDED for
@@ -1919,8 +1943,10 @@ adopting the shared decision/metadata, §5.6).
   before the seed block (`poll_descriptor/mod.rs:4634-4656`), so
   `SeedInstalled`/`SeedRefused` are RESULTS, not arm-head outcomes.
   An `OverdueSkipped` OR `UpsertRefused` transition outcome (the
-  contract bullet above) COMPOSES to the live-backed
-  `ExistingResolved` buffer-only
+  contract bullet above — both exist only on `report.site ==
+  Some(Site2c)`, v10.26.0 round-109 Codex 3; an impossible
+  `site=None` report follows master's own dispatch) COMPOSES to the
+  live-backed `ExistingResolved` buffer-only
   arm regardless of the disposition's eligibility — it never enters
   the seed block (normative, v10.19.0, round-102 Codex 2;
   UpsertRefused added v10.21.0 round-104 Codex 2, propagated here
@@ -2527,7 +2553,9 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   unextended clock; synced-upsert cap bypass at `install.rs:294` vs
   fresh-install refusal at `install.rs:113` asserted in the test); (b)
   a blind non-close that COMMITS:
-  probation clears exactly once AT THE MATCHED ENTRY (forward-key AND
+  probation clears exactly once AT THE MATCHED ENTRY (never on an
+  `OverdueSkipped` transition — the explicit overdue guard,
+  v10.26.0) (forward-key AND
   reverse-key materialized entries each covered — the clear is not
   routed through the anchor's forward hop) AND the ordinary established
   refresh (stamp + recompute + wheel push) lands in the same write at
@@ -2887,7 +2915,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.25.0)
+## 11. Open questions for the convergence round (v10.26.0)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
@@ -2934,10 +2962,11 @@ this branch only if the minimal fix proves insufficient.
    deferred refresh (round-88) — is any pre-commit refresh/requeue
    path left for a probation entry (lookup, `touch_if_stale`, promote,
    materialize refresh), and does the commit-hook clear+refresh cover
-   every admission arm? (e) the v10.25.0 end-state: the contract
-   block is now a single coherent specification written fresh (not
-   spliced) — read it top to bottom as an implementer would and find
-   any two sentences that contradict.
+   every admission arm? (e) the v10.26.0 end-state: the contract is a
+   single coherent block with the S2 producer, the effective
+   transition, the site-qualified compositions, and the qualified
+   clear/install claims — read it as an implementer and find any
+   remaining contradiction.
 
 4. **The emission posture:** master's `expire.rs:342-350` gate is
    UNCHANGED; the additions are the normative mark-creation rules, rule
