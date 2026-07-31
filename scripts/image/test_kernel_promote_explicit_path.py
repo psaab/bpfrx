@@ -61,6 +61,28 @@ class TestNoPathResolution(unittest.TestCase):
             "xpf-kernel-promote must stay a POSIX sh script (early boot)",
         )
 
+    def test_discovers_configured_path_from_systemd(self):
+        # The compiled defaults cannot cover a box that relocated BOTH
+        # --versions-dir and --sbin-dir; the gate must ASK rather than add a
+        # third guess. systemd's ExecStart for xpfd.service is what the cut
+        # writes (flip step 6c) and is a concrete absolute path.
+        text = script_text()
+        self.assertIn(
+            "ExecStart",
+            text,
+            "the gate never consults systemd's ExecStart for xpfd.service, so a "
+            "box with both runtime roots relocated has no resolvable candidate "
+            "(#6541 fold r3)",
+        )
+        self.assertIn("xpfd.service", text)
+        # Discovery must be consulted BEFORE the compiled defaults, or a stale
+        # leftover at a default path wins over the live binary.
+        self.assertLess(
+            text.index("unit_exec_start"),
+            text.index('try_candidate /usr/local/sbin/xpfd'),
+            "systemd discovery must be tried before the compiled defaults",
+        )
+
     def test_no_command_v_probe_for_xpfd(self):
         # `command -v xpfd` is a $PATH lookup. The presence check must stat the
         # explicit candidates instead.
@@ -133,6 +155,28 @@ class TestResolutionBehaviour(unittest.TestCase):
         self.marker = self.tmp / "hostile-ran"
         self._write_stub(self.path_dir / "xpfd", exit_code=0, marker=self.marker)
 
+        # systemctl stub. `show` answers from env vars the test sets, so unit
+        # discovery is exercised hermetically; anything else (reboot) is
+        # recorded. systemctl is legitimately $PATH-resolved -- it is a
+        # distribution binary, unlike xpfd.
+        self.systemctl_ran = self.tmp / "systemctl.ran"
+        (self.path_dir / "systemctl").write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "show" ]; then\n'
+            '  case "$*" in\n'
+            '    *ExecStart*) printf \'%s\\n\' "${STUB_EXECSTART-}" ;;\n'
+            '    *LoadState*) printf \'%s\\n\' "${STUB_LOADSTATE-not-found}" ;;\n'
+            "  esac\n"
+            "  exit 0\n"
+            "fi\n"
+            f'echo "$0 $*" >> "{self.systemctl_ran}"\n'
+            "exit 0\n"
+        )
+        (self.path_dir / "systemctl").chmod(0o755)
+        # Default: systemd knows nothing, so the compiled-default chain runs.
+        self.stub_execstart = ""
+        self.stub_loadstate = "not-found"
+
         # A rewritten copy of the script whose candidate paths are re-rooted
         # into the temp tree, so the test never touches the real filesystem.
         self.fake_root = self.tmp / "root"
@@ -155,6 +199,8 @@ class TestResolutionBehaviour(unittest.TestCase):
     def _run(self):
         env = dict(os.environ)
         env["PATH"] = str(self.path_dir) + os.pathsep + env.get("PATH", "")
+        env["STUB_EXECSTART"] = self.stub_execstart
+        env["STUB_LOADSTATE"] = self.stub_loadstate
         return subprocess.run(
             ["/bin/sh", str(self.script_copy)],
             env=env,
@@ -233,21 +279,126 @@ class TestResolutionBehaviour(unittest.TestCase):
         # `test -x` alone is TRUE for a searchable DIRECTORY. The inner hop's
         # validateGateBin rejects a non-regular target, so the outer hop must
         # too — otherwise the two hops' admission tests are not actually
-        # symmetric. A directory at the primary candidate must be skipped and
-        # the sbin fallback used, NOT exec'd and not resolved via $PATH.
-        Path(str(self.fake_root) + VERSIONED).mkdir(parents=True)
+        # symmetric.
+        #
+        # The directory MUST be placed at the candidate that is examined FIRST,
+        # or the test is vacuous. An earlier revision put it at VERSIONED while
+        # also installing a valid SBIN; since SBIN is checked first the
+        # directory was never examined and reverting `[ -f ]` left the test
+        # green. Place it at SBIN and require the fall-through to VERSIONED.
+        sbin_dir_path = Path(str(self.fake_root) + SBIN)
+        sbin_dir_path.mkdir(parents=True)
+        versioned_ran = self._install(VERSIONED, 0)
+
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue(
+            versioned_ran.exists(),
+            f"a DIRECTORY at {SBIN} — the FIRST compiled-default candidate — "
+            f"was accepted as the gate binary instead of falling through to "
+            f"{VERSIONED}: {res.stderr}",
+        )
+        self.assertFalse(
+            self.marker.exists(),
+            "the gate executed the xpfd it found on $PATH (#6541)",
+        )
+
+    def test_discovers_relocated_roots_via_systemd_execstart(self):
+        # MAJOR (fold r3). `--versions-dir` AND `--sbin-dir` are both real
+        # operator options, and the cut maintains whatever was configured. On a
+        # box that relocated BOTH — e.g. --versions-dir=/opt/xpf/versions with
+        # --sbin-dir=/usr/sbin — NEITHER compiled default exists, yet the live
+        # binary is perfectly intact. Systemd knows where it is, because that is
+        # the ExecStart the cut templated (flip step 6c).
+        relocated = self.tmp / "opt-xpf" / "versions" / "v7" / "xpfd"
+        relocated_ran = self.tmp / "relocated.ran"
+        self._write_stub(relocated, 0, relocated_ran)
+
+        self.stub_execstart = f"{{ path={relocated} ; argv[]={relocated} ; ignore_errors=no }}"
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue(
+            relocated_ran.exists(),
+            "the gate did not run the relocated xpfd that systemd's ExecStart "
+            f"names. With both roots relocated no compiled default exists, so "
+            f"an ExecStart-blind gate skips an ARMED promotion: {res.stderr}",
+        )
+        self.assertFalse(
+            self.marker.exists(),
+            "the gate executed the xpfd it found on $PATH (#6541)",
+        )
+
+    def test_systemd_execstart_outranks_stale_compiled_defaults(self):
+        # The other half of the MAJOR: with both roots relocated, leftover
+        # artifacts at the compiled defaults are STALE. Executing one can reject
+        # a healthy candidate and trigger a needless revert/reboot, or validate
+        # the wrong embedded dataplane build. Discovery must win over both.
+        relocated = self.tmp / "opt-xpf" / "versions" / "v7" / "xpfd"
+        relocated_ran = self.tmp / "relocated.ran"
+        self._write_stub(relocated, 0, relocated_ran)
+
+        stale_sbin = self._install(SBIN, 0)
+        stale_versioned = self._install(VERSIONED, 0)
+
+        self.stub_execstart = f"{{ path={relocated} ; argv[]={relocated} }}"
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue(relocated_ran.exists(), f"the live binary did not run: {res.stderr}")
+        self.assertFalse(
+            stale_sbin.exists(),
+            f"ran the STALE leftover at {SBIN} instead of the live binary "
+            "systemd's ExecStart names",
+        )
+        self.assertFalse(
+            stale_versioned.exists(),
+            f"ran the STALE leftover at {VERSIONED} instead of the live binary",
+        )
+
+    def test_unusable_execstart_falls_through_to_compiled_defaults(self):
+        # Over-reach guard: discovery must not become a single point of failure.
+        # A unit whose ExecStart names a path that no longer exists (mid-cut,
+        # GC'd version dir) must fall through, not strand the gate.
+        self.stub_execstart = f"{{ path={self.tmp}/gone/xpfd ; argv[]={self.tmp}/gone/xpfd }}"
+        self.stub_loadstate = "loaded"
         sbin_ran = self._install(SBIN, 0)
 
         res = self._run()
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertTrue(
             sbin_ran.exists(),
-            f"a DIRECTORY at {VERSIONED} was accepted as the gate binary "
-            f"instead of falling through to {SBIN}: {res.stderr}",
+            f"an unusable ExecStart stranded the gate instead of falling "
+            f"through to {SBIN}: {res.stderr}",
         )
+
+    def test_refuses_loudly_when_installed_but_unlocatable(self):
+        # FAIL LOUD, not quiet. xpfd.service is installed but nothing resolves:
+        # an armed candidate would otherwise sail past unverified with nothing
+        # in the journal to say so. The refusal must be explicit AND must stay
+        # exit 0 — a non-zero exit trips OnFailure= and reboots the box.
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self.assertEqual(
+            res.returncode,
+            0,
+            "the refusal must exit 0 (the non-rebooting infra-error path); a "
+            f"non-zero exit trips OnFailure= and reboots: {res.stderr}",
+        )
+        self.assertIn("ERROR", res.stderr, f"the refusal was not loud: {res.stderr}")
+        self.assertIn("REFUSING to promote", res.stderr)
         self.assertFalse(
             self.marker.exists(),
             "the gate executed the xpfd it found on $PATH (#6541)",
+        )
+        self.assertFalse(
+            self.systemctl_ran.exists(),
+            f"the refusal rebooted the box: {self.systemctl_ran.read_text()}"
+            if self.systemctl_ran.exists()
+            else "",
         )
 
     def test_skips_rather_than_falling_back_to_path(self):
@@ -268,8 +419,7 @@ class TestResolutionBehaviour(unittest.TestCase):
         # reboot branch. `systemctl` is stubbed on PATH — it is a system
         # binary and is legitimately PATH-resolved.
         self._install(VERSIONED, 3)
-        systemctl_ran = self.tmp / "systemctl.ran"
-        self._write_stub(self.path_dir / "systemctl", 0, systemctl_ran)
+        systemctl_ran = self.systemctl_ran
 
         res = self._run()
         self.assertEqual(res.returncode, 0, res.stderr)
@@ -283,8 +433,7 @@ class TestResolutionBehaviour(unittest.TestCase):
     def test_infra_error_does_not_reboot(self):
         # OVER-REACH GUARD: a non-0/non-3 rc stays a non-rebooting infra error.
         self._install(VERSIONED, 1)
-        systemctl_ran = self.tmp / "systemctl.ran"
-        self._write_stub(self.path_dir / "systemctl", 0, systemctl_ran)
+        systemctl_ran = self.systemctl_ran
 
         res = self._run()
         self.assertEqual(res.returncode, 0, res.stderr)

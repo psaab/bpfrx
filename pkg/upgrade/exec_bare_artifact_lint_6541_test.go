@@ -204,12 +204,26 @@ func stringLit(e ast.Expr) (string, bool) {
 // which meant the lint claimed compile-time constant-expression coverage while
 // silently skipping both of those shapes.
 //
-// AMBIGUITY IS TREATED AS UNRESOLVABLE. The map is flat, so a local const that
-// shadows a package const of the same name has no scope to disambiguate it.
-// Rather than guess — and risk folding to a string the exec never sees — a name
-// bound to two different values is DROPPED, so the site is simply not
-// classified. Not classifying is the same conservative default the lint already
-// applies to variables.
+// AMBIGUITY IS TREATED AS UNRESOLVABLE, AND IT POISONS ITS DEPENDENTS. The map
+// is flat, so a local const that shadows a package const of the same name has no
+// scope to disambiguate it. Rather than guess — and risk folding to a string the
+// exec never sees — an identifier with more than one const binding is excluded
+// BEFORE the fixpoint runs, not deleted after it.
+//
+// Ordering is the whole point, and getting it wrong inverts the guard. Deleting
+// afterwards leaves anything DERIVED from the ambiguous name still folded to
+// whichever binding happened to win:
+//
+//	const base = "/usr/local/sbin/"   // package level
+//	func f() {
+//	    const base = "./"             // shadows it
+//	    const command = base + "xpfd" // folds to the ABSOLUTE package value
+//	    exec.Command(command, ...)    // actually runs ./xpfd — silently blessed
+//	}
+//
+// Excluding first means `base` never resolves, so `command` never folds, so the
+// site is simply not classified — a false negative in the sense of "not
+// checked", never a false negative in the sense of "checked and approved".
 func stringConsts(files map[string]*ast.File) map[string]string {
 	type binding struct {
 		expr ast.Expr
@@ -244,6 +258,15 @@ func stringConsts(files map[string]*ast.File) map[string]string {
 		})
 	}
 
+	// Exclude ambiguous names BEFORE folding, so nothing derived from one can
+	// resolve either. Deleting them afterwards would leave dependents holding a
+	// value picked from whichever binding won the race.
+	for name, b := range raw {
+		if b.seen > 1 {
+			delete(raw, name)
+		}
+	}
+
 	consts := map[string]string{}
 	// Fixpoint: each pass resolves consts whose operands became known in the
 	// previous one. Bounded by the number of bindings.
@@ -260,14 +283,6 @@ func stringConsts(files map[string]*ast.File) map[string]string {
 		}
 		if !progress {
 			break
-		}
-	}
-
-	// Drop ambiguous names: an identifier declared as a const in more than one
-	// place has no scope here to disambiguate it, so it is not classified.
-	for name, b := range raw {
-		if b.seen > 1 {
-			delete(consts, name)
 		}
 	}
 	return consts
@@ -714,6 +729,36 @@ func f() {
 		if v, ok := stringConsts(map[string]*ast.File{"x.go": f})["dup"]; ok {
 			t.Fatalf("dup resolved to %q; an identifier with two const bindings "+
 				"must be dropped rather than guessed", v)
+		}
+	})
+
+	// AMBIGUITY MUST POISON ITS DEPENDENTS. Dropping the ambiguous name AFTER
+	// the fixpoint leaves anything derived from it folded to whichever binding
+	// won — and here that inverts the verdict: `command` really executes
+	// "./xpfd" but would be blessed as the absolute package value. The
+	// exclusion has to happen BEFORE folding.
+	t.Run("ambiguous const poisons dependents", func(t *testing.T) {
+		src := `package p
+const base = "/usr/local/sbin/"
+func f() {
+	const base = "./"
+	const command = base + "xpfd"
+	_ = command
+}
+`
+		f, err := parser.ParseFile(token.NewFileSet(), "x.go", src, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		got := stringConsts(map[string]*ast.File{"x.go": f})
+		if v, ok := got["base"]; ok {
+			t.Fatalf("ambiguous base resolved to %q", v)
+		}
+		if v, ok := got["command"]; ok {
+			t.Fatalf("command folded to %q from an AMBIGUOUS operand. The real "+
+				"exec target is %q, so classifying it as %q would BLESS a "+
+				"relative artifact exec. A const derived from an ambiguous name "+
+				"must not resolve at all.", v, "./xpfd", v)
 		}
 	})
 

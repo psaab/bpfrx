@@ -62549,3 +62549,73 @@ break — `go vet` confirmed passing under every revert.
     exec_bare_artifact_lint_6541_test.go},
     scripts/image/{xpf-kernel-promote,test_kernel_promote_explicit_path.py},
     docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-31 (fix/6541-kernel-gate-explicit-path, review fold r3)
+- **Action**: #6541 fold of a Codex MERGE-NEEDS-MAJOR on c5eae360d. All three
+  findings verified firsthand; all three correct. NO pushback — I had drafted a
+  "pre-existing gap, not a regression" rebuttal and it is WRONG, refuted by
+  Codex's own concrete config.
+  MAJOR — relocating BOTH runtime roots defeats the outer gate. `--versions-dir`
+  AND `--sbin-dir` are real options (cmd/xpfd/upgrade.go:247/250) and the cut
+  maintains the CONFIGURED paths (flip.go), but the outer hop knew only the two
+  compiled defaults. My drafted rebuttal was that a relocated sbin dir would not
+  be on systemd's PATH either, so old==new. Codex's config kills that:
+  `--sbin-dir=/usr/sbin`, and `systemd-path search-binaries-default` on this box
+  returns `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin` — /usr/sbin IS on
+  it, so the OLD `command -v xpfd` found the live entry and MY replacement
+  ignored it. That is a genuine regression I introduced, and the r2 "residual"
+  note was false: the configured sbin entry need not be lost, it can be intact
+  and merely not one of the hardcoded defaults. Two bad outcomes: with no
+  leftovers the gate SKIPS an armed promotion (worst case — the candidate kernel
+  runs unverified with nothing in the journal saying the gate never ran); with
+  leftovers it execs a STALE build that can reject a healthy candidate and
+  trigger a needless revert/reboot.
+  CHOSE DISCOVERY VIA SYSTEMD ExecStart (the reviewer's first option), plus the
+  loud-refusal backstop (their second) — they are complementary, not
+  alternatives. `systemctl show -p ExecStart --value xpfd.service` is literally
+  "the same source flip writes": flip step 6c templates
+  ExecStart=<VersionsDir>/<ver>/xpfd into 10-xpf-version.conf on every cut, and
+  the shipped base unit (test/incus/xpfd.service:8) carries
+  ExecStart=/usr/local/sbin/xpfd pre-cut, so it names the live binary in both
+  states. It needs no new verb, no new state file, no new format to keep in
+  sync; it is a CONCRETE ABSOLUTE PATH independent of every compiled default, so
+  it covers both relocations at once; and it cannot select a stale build because
+  it is the path systemd actually launches. systemctl is $PATH-resolved, which
+  is correct and consistent with the lint's own scoping (distribution-owned
+  binary). Compiled defaults are retained BELOW discovery for a box where
+  systemd cannot answer. When nothing resolves AND xpfd.service is known to
+  systemd, the gate now logs `ERROR: ... REFUSING to promote` naming every
+  candidate tried, and takes the existing non-rebooting infra-error path —
+  deliberately still exit 0, because a non-zero exit trips OnFailure= and
+  REBOOTS the box over what may be a transient packaging window, while an
+  un-promoted candidate is already safe (firmware cleared BootNext). Only a box
+  with no xpfd.service at all still skips quietly.
+  MINOR 2 — ambiguous constants POISONED their dependents. My r2 fixpoint folded
+  first and deleted duplicate names after, so a const derived from an ambiguous
+  name kept whichever binding won: package `base="/usr/local/sbin/"` shadowed
+  locally by `base="./"`, then local `command=base+"xpfd"`, folded to the
+  ABSOLUTE package value and BLESSED an exec that really runs ./xpfd. That
+  inverts the guard — a false negative in the "checked and approved" sense, not
+  the "not checked" sense. Fixed by excluding ambiguous names BEFORE the
+  fixpoint, so dependents never resolve at all. New subtest
+  `ambiguous_const_poisons_dependents` pins it.
+  MINOR 3 — my directory regression test was VACUOUS after the r2 reorder: it
+  placed the directory at VERSIONED (now the fallback) while installing a valid
+  SBIN, so the directory was never examined and reverting `[ -f ]` left it
+  green. Moved the directory to SBIN (the first compiled-default candidate) and
+  assert the fall-through to VERSIONED.
+  New python coverage for the MAJOR: systemctl stub driven by env vars
+  (STUB_EXECSTART/STUB_LOADSTATE) so discovery is exercised hermetically;
+  `test_discovers_relocated_roots_via_systemd_execstart` (both roots relocated,
+  no compiled default exists), `test_systemd_execstart_outranks_stale_compiled_defaults`,
+  `test_unusable_execstart_falls_through_to_compiled_defaults` (over-reach guard
+  — discovery must not become a single point of failure),
+  `test_refuses_loudly_when_installed_but_unlocatable` (asserts exit 0 AND that
+  no reboot was issued), and a static `test_discovers_configured_path_from_systemd`.
+  Validation: gofmt clean, go vet ./... clean, go build ./... clean, full
+  pkg/upgrade suite green, all 7 scripts/image python selftests green (this one
+  16 cases), sh -n + shellcheck clean. RED-pre-fix verified in a THROWAWAY
+  detached worktree.
+- **File(s)**: scripts/image/{xpf-kernel-promote,test_kernel_promote_explicit_path.py},
+    pkg/upgrade/{kernel_linux.go,exec_bare_artifact_lint_6541_test.go},
+    docs/in-place-upgrade.md, _Log.md

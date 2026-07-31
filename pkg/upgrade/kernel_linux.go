@@ -510,9 +510,17 @@ var osExecutable = os.Executable
 // following it stays correct when the runtime root moved, whereas
 // <VersionsDir>/current/xpfd is right only on a default-rooted box AND is not
 // removed when the operator relocates, so consulting it first would select a
-// STALE build. Correctness for ordinary relocation rests on candidate (1),
-// os.Executable, which needs no configured root at all; a relocated --sbin-dir
-// on top of that is a double relocation and is called out in the gate's doc.
+// STALE build.
+//
+// A box that relocated BOTH roots matches neither default. That case is handled
+// where it has to be — at the OUTER hop, scripts/image/xpf-kernel-promote, which
+// asks systemd for xpfd.service's ExecStart (the concrete absolute path the cut
+// templates in flip step 6c) before falling back to these defaults. By the time
+// this function runs, the outer hop has already exec'd the right binary, so
+// candidate (1) below — os.Executable, which needs no configured root at all —
+// is that binary. These two fallbacks only matter when /proc is unreadable,
+// where a wrong pick still cannot be silent: nothing validating fails CLOSED
+// into revert().
 var (
 	gateSbinDir     = DefaultSbinDir
 	gateVersionsDir = DefaultVersionsDir
