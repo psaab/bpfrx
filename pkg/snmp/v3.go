@@ -446,20 +446,24 @@ func (a *Agent) handleV3Packet(msgBody []byte) []byte {
 			}
 			break
 		}
-		// Repetition-major, per-column-cursor GETBULK order (RFC 3416 §4.2.3),
-		// shared verbatim with the v2c handler so both paths encode identically
-		// (#5065).
-		respVarbinds = a.buildBulkVarbinds(oids, nonRepeaters, maxRepetitions, snap)
-
 		// Bound the response to the effective maximum size (RFC 3416 §4.2.3):
 		// the smaller of the manager's advertised msgMaxSize and our own
-		// maxPacketSize, with msgMaxSize clamped up to the RFC floor. Trim
-		// trailing varbinds until the fully-encoded message (USM + scopedPDU,
-		// including any auth/priv overhead) fits; the manager continues the
-		// walk from the last returned OID. Only if nothing fits do we return
-		// tooBig with an empty varbind list rather than emit an oversized
-		// datagram.
+		// maxPacketSize, with msgMaxSize clamped up to the RFC floor.
 		maxSize := effectiveMaxSize(msgMaxSize)
+
+		// Repetition-major, per-column-cursor GETBULK order (RFC 3416 §4.2.3),
+		// shared verbatim with the v2c handler so both paths encode identically
+		// (#5065). The same ceiling bounds the grid expansion itself (#6551) so
+		// the repeaters*maxRepetitions MIB walk never outruns what the response
+		// can carry — on v3 an unbounded grid is worse than on v2c, because
+		// every trimToFit rebuild re-runs USM framing/HMAC/encryption over it.
+		respVarbinds = a.buildBulkVarbinds(oids, nonRepeaters, maxRepetitions, snap, maxSize)
+
+		// Trim trailing varbinds until the fully-encoded message (USM +
+		// scopedPDU, including any auth/priv overhead) fits; the manager
+		// continues the walk from the last returned OID. Only if nothing fits
+		// do we return tooBig with an empty varbind list rather than emit an
+		// oversized datagram.
 		resp, ok := trimToFit(respVarbinds, maxSize, func(vbs []varbind) []byte {
 			return a.buildV3Response(msgID, msgFlags, user, echoContext, requestID, errNoError, 0, vbs)
 		})

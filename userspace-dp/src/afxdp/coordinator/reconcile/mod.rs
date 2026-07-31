@@ -299,7 +299,7 @@ impl Coordinator {
             // NPTv6 overlap / unresolvable-zone faults; NAT64 is fail-scoped
             // per #3888 and no longer aborts) used to surface inside
             // `apply_snapshot` — AFTER teardown stopped the workers and reset
-            // `coord.validation` / `shared_validation`, stranding the helper
+            // `coord.validation` and republished the default view, stranding the helper
             // with no forwarding and no workers (residual fail-open). Building
             // here aborts on such a fault with the prior generation + workers
             // still live, mirroring the map-FD hoist #2440 added.

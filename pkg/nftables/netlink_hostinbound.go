@@ -177,6 +177,7 @@ func emitJunosHostDropRuleNetlink(p *nlPlan, prog JunosHostProgram, r JunosHostD
 	cn := HostInboundJunosHostDenyCounterName(prog.Zone, r.Family)
 	finish := func(a *ruleAsm) {
 		applyJunosHostSrcPredicate(a, f, r)
+		applyJunosHostDstPredicate(a, f, r)
 		a.counterRef(cn)
 		a.emit(verdictDrop()...)
 	}
@@ -238,6 +239,24 @@ func applyJunosHostSrcPredicate(a *ruleAsm, f nlFamily, r JunosHostDenyRule) {
 	}
 	if len(r.PermitSubtract) > 0 {
 		a.saddr(f, r.PermitSubtract, true)
+	}
+}
+
+// applyJunosHostDstPredicate mirrors junosHostDstPredicate: the positive /
+// excluded / any destination match from an explicit `match destination-address`.
+// Emitted AFTER the source predicate so the expression order matches the
+// exec-nft oracle byte for byte (the T1 parity gate diffs kernel rule dumps,
+// which preserve expression order).
+func applyJunosHostDstPredicate(a *ruleAsm, f nlFamily, r JunosHostDenyRule) {
+	switch {
+	case r.DstExcluded && len(r.Dst) > 0:
+		a.daddr(f, r.Dst, true)
+	case r.DstAny || (r.DstExcluded && len(r.Dst) == 0):
+		// match every destination (no positive daddr predicate)
+	default:
+		if len(r.Dst) > 0 {
+			a.daddr(f, r.Dst, false)
+		}
 	}
 }
 
