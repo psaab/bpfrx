@@ -1,16 +1,18 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.15.1 — THE TERMINAL CUT, round-98 folds (+ round-98 AGY specification-completeness folds: the reverse companion key named in the alias-complete invalidation; the five-consumer OverdueSkipped enumeration; the §11 accounting phrasing) (THE
-PURGE-PATH RETRACTION: the close-aware purge gate, the close-retained
-marker, and the marker-conditioned cache suppression are ALL retracted
-— the marker's identity-safe lifecycle, cross-worker topology, and
-cache-fencing requirements are the #6599 sync-identity fix in disguise
-and do not belong in this plan; the transient-purge path is full
-master parity, closing packets included, and the
-close-on-purged-provenance chain is documented as master's own
-#6599-family behavior; the overdue-materialize skip gains the typed
-`OverdueSkipped` outcome honored by teardown/anchor/cache consumers,
-and the probation reap invalidates the flow cache alias-completely).
+**Status: DRAFT v10.16.0 — THE TERMINAL CUT, round-99 folds (the
+parity claim is scoped exactly: the purge DECISION and dispatch are
+master-identical; the ONE deliberate delta is the demote gate's
+refusal of the closing-mark on anchorless peer-synced entries, whose
+replica-lifetime cost is the documented absorbing-state residual;
+`OverdueSkipped` gains its transport (a `ResolvedFlowSessionDecision`
+field), its ExistingResolved composition for cold dispositions, and
+its full five-consumer set with accounting explicitly allowed; the
+probation reap/adopt invalidates the FULL alias set (canonical,
+reverse companion, reverse-translated, forward-wire, reply-match
+tuples) with S1's aliases invalidated at adopt time; the conceded
+chain's rationale is corrected (constructor-side state creation; the
+closing-flag variant stated); saturating arithmetic throughout).
 Ship
 candidate = the Part-A dataplane demote gate plus the wire-free local HA
 rules. The RG-incarnation/retirement/fence-ledger protocol that rounds
@@ -427,7 +429,7 @@ exhaustive inventory, re-verified against this branch's master base:
 | 2 | `session/mod.rs:1396-1432` `update_session` via `promote_synced_with_origin` (HA shared-promote, `session_glue/promote.rs:86-107`) | wire packet flags on the promoting packet | closing packets never reach this path (rule 5 — the ownership promote is skipped wholesale); a non-closing promote threads the seg view for anchor purposes |
 | 2b | **reverse-NAT companion synthesizer** — `session_glue/mod.rs:1262-1284` → `shared_ops.rs:857-865` → `install_with_protocol_with_origin` (seeds at `install.rs:179-180`) | wire packet flags on a reverse-tuple miss with a live forward match; runs at resolve time, BEFORE the #4400 guard | gate the seed with the validator against the in-hand forward entry's anchor; refused close → **skip the install entirely** (§5.6); a SHARED `ForwardSessionMatch` carries no anchor (`entry.rs:209`) → no-baseline → refuse → skip-install |
 | 2c | **reactive shared materialize** — `materialize_shared_session_hit` (`session_glue/mod.rs:1092-1118`) threads the current packet's `tcp_flags` into `upsert_synced_with_origin` (seeds at `install.rs:399-400`) | wire packet flags on a shared-map hit | gate the flag seed with the validator; an imported entry has no anchor → no-baseline → refuse → install the copy **alive** (`closing=false, reset=false`) at the bounded probation timeout (§5.6); re-materialization against an existing probation entry atomically ADOPTS the shared S2 decision/metadata while preserving only the probation deadline/flag — no decision split-brain, no clock restart (§5.6, v10.7.0) |
-| 3 | `install.rs:179-180` primary miss installs | creating packet flags | unreachable for bare closes on TRANSIT dispositions (#4400) and LocalDelivery caches TCP only with SYN (`local_delivery.rs:20`). The actual residual: a SYN|RST/SYN|FIN new-flow packet passes the #4400 guard (it has SYN, `session_admission.rs:82-87`) and seeds closing/reset from raw flags — a self-anchoring invented-tuple entry (attacker kills only a flow it created — no victim impact, master parity); malformed SYN+close combos are screen-owned where screened. **Provenance bound (v10.8.0, rounds 89-91 Codex):** the invented-tuple harmlessness holds ONLY when the tuple is genuinely new in this dispatch; when the tuple carries peer-synced provenance (the transient-purge class — the v10.4.1 re-entry is retracted v10.11.0 — or `ReplacedSyncedLocal` displacement) it is a REAL victim's — a closing-flagged packet (SYN-bearing included) never triggers the transient purge (it takes the shared-backed `ExistingResolved` outcome: buffer with the resolver's stored decision, no derivation/allocation/install/publication/emission) and never displaces the synced victim (`ReplacedSyncedLocal`: deliver locally, no install) — §5.6 site-3 supplement |
+| 3 | `install.rs:179-180` primary miss installs | creating packet flags | unreachable for bare closes on TRANSIT dispositions (#4400) and LocalDelivery caches TCP only with SYN (`local_delivery.rs:20`). The actual residual: a SYN|RST/SYN|FIN new-flow packet passes the #4400 guard (it has SYN, `session_admission.rs:82-87`) and seeds closing/reset from raw flags — a self-anchoring invented-tuple entry (attacker kills only a flow it created — no victim impact, master parity); malformed SYN+close combos are screen-owned where screened. **Provenance bound (v10.15.0, rounds 89-98 Codex):** the invented-tuple harmlessness holds ONLY when the tuple is genuinely new in this dispatch; when the tuple carries peer-synced provenance (the transient-purge class or `ReplacedSyncedLocal` displacement) it is a REAL victim's — a closing-flagged packet on the transient-purge class purges and dispatches EXACTLY as master (the close-aware gate line is retracted v10.15.0; the master's-own follow-through is the documented #6599-family exposure, §7) and never displaces the synced victim (`ReplacedSyncedLocal`: deliver locally, no install) — §5.6 site-3 supplement |
 | 4 | HA wire re-import — eventstream `UpsertSynced` → `upsert_synced_with_origin` (no packet exists) | peer delta | validation-free by design (the peer validated before reaping and emitting the Close); distinct from site 2c, which HAS a packet |
 | 5 | tunnel `UpsertLocal` (`tunnel.rs:563-615` → `session_glue/mod.rs:786-800`) | locally generated packets (firewall-originated tunnel TX) | trusted-local class, documented; not wire-attacker-controllable. Inbound tunnel closes land on site 1 with whatever anchor the inbound stream built — none if the flow is outbound-only → refuse-demote; local blast radius |
 | 6 | fabric-return reverse seed (`cluster_peer_return_fast_path` install) — **REMOVED on master by #6478; the row below is the branch-base analysis, retained for the record** | fabric-ingress packet flags | bare closes already excluded (#4453); SYN|ACK|RST/FIN combos pass the guards (`fabric.rs:404`) and seed raw flags — an unvalidated constructor, harmless-by-class (the seed is `is_reverse` → silent at reap; the non-owner's forward import validates closes at site 1 with no anchor in Phase 1 → refuse → no mark). The seed bypasses the commit hooks so it carries no anchor — a later close on it is REFUSED (missing-forward/no-baseline, §5.1); documented. On current master the site no longer exists: #6478 deleted the fast path and its seed install, so the residual is closed by deletion |
@@ -743,7 +745,24 @@ request-build stage:
   The purge path is FULL MASTER PARITY (v10.15.0 — the close-aware
   purge gate, the close-retained marker, and the cache suppression
   are all retracted, round-98 Codex 1-3; §5.6 site-3 supplement
-  carries the retraction rationale).
+  carries the retraction rationale) with ONE deliberate exception,
+  stated exactly (round-99 Codex 2): the local lookup runs BEFORE the
+  purge decision (`shared_ops.rs:594-635`,
+  `session_glue/mod.rs:1157-1196`), so master's close marks the
+  matched entry and propagates the shortened lifetime to its
+  companion before the purge — and the demote gate REFUSES that mark
+  on an anchorless peer-synced entry (the gate's purpose on a HIT).
+  The purge then deletes only the matched local key + forward shared
+  aliases (`promote.rs:181-207`, `shared_ops.rs:960-1013`), not the
+  local reverse companion, which HA import fans to every worker
+  (`session_import.rs:104-115`, `:187-223`): master leaves the
+  current-worker reverse replica closing (2 s/30 s); the plan leaves
+  it on its ordinary peer-synced trajectory. That replica-lifetime
+  delta is the §2 absorbing-state residual (imported entries refuse
+  closes and linger to their inactivity timeout) applied to this
+  path — it lengthens stale/conflicted-P1 companion exposure for the
+  #6599/#6600 class and is documented and tested as a real Part-A
+  delta, not asserted away.
 - **Residual (documented):** TX-completion failure (driver/UMEM ring
   after final admission) is the irreducible unobserved tail — not
   per-packet steerable in any sequence-targeted way. **Runtime-capacity
@@ -1298,8 +1317,11 @@ S2's decision and metadata
 wholesale, while from K only `probation=true`, the alive `closing=false,
 reset=false` state, and the timing carry over — and the carried timing
 is the MINIMUM absolute deadline (v10.8.0, round-91 Codex 4):
-`min(K.last_seen_ns + K.expires_after_ns, now_ns + S2's own candidate
-from metadata.inactivity_timeout_ns, install.rs:382)` — K's 20 s
+`min(K.last_seen_ns.saturating_add(K.expires_after_ns),
+now_ns.saturating_add(S2's own candidate from
+metadata.inactivity_timeout_ns, install.rs:382))` — saturating
+throughout (v10.16.0, round-99 Codex 6; the wheel derives its target
+with `saturating_add`, `expire.rs:50-57`) — K's 20 s
 remainder never extends an S2 whose own per-app timeout is shorter (the
 §5.6 shorter-timeout-never-extended promise holds in both directions),
 and the wheel re-queue uses exactly that preserved absolute deadline.
@@ -1370,9 +1392,21 @@ reap is LOCAL-ONLY (v10.1.0, round-83 Codex 2; alias amendment
 v10.15.0, round-98 Codex 5):** `ExpiredSession`
 carries the probation flag, and a probation expiry removes ONLY the
 worker's local table entry PLUS invalidates the flow-cache entries
-for ALL of the entry's keys (canonical, the reverse companion key
-`reverse_session_key(key, decision.nat)`, and forward-wire aliases —
-`flow_cache.rs:578-580` vs `entry.rs:337-343`) — NO Close delta (as
+for the entry's FULL alias set (v10.16.0, round-99 Codex 4 — the
+complete set, since lookup accepts reverse-translated aliases for
+reverse entries and forward-wire aliases for forward entries, and
+reply matching accepts reverse-wire/reverse-canonical tuples,
+`lookup.rs:62-100`, `:222-250`, `:253-315`, `key.rs:19-26`,
+`flow_cache.rs:1105-1120`'s invalidation is exact-key only): the
+canonical key, the reverse companion
+`reverse_session_key(key, decision.nat)`, the reverse-translated
+aliases, the forward-wire aliases, and the reply-match tuples — all
+derived from the entry's own decision/metadata at reap. And because
+an S1→S2 adoption can change NAT/orientation while `ExpiredSession`
+carries only the final S2 identity (`entry.rs:337-343`), EVERY
+adoption additionally invalidates the PRIOR identity's full alias set
+AT ADOPT TIME (the adopt has both identities in hand) — a cached S1
+alias can never survive its own adoption. NO Close delta (as
 before), NO
 `release_source_nat_allocation`/`release_nat64_allocation`
 (`worker/loop_body/mod.rs:1491-1504`), and NO BPF session-map family-key
@@ -1571,7 +1605,9 @@ adopting the shared decision/metadata, §5.6).
   (v10.13.0, rounds 94-96 Codex — the v10.4.1 re-entry is retracted):
   the packet continues the HIT branch on the retained lookup
   (`session_glue/mod.rs:1194-1196`) — warm next hop: forward, no
-  install, cache-insert suppressed (the one hardening delta); cold:
+  install, master's own cache behavior (a purged pure-ACK remains
+  cache-eligible and is inserted normally, `flow_cache.rs:352-394`,
+  `poll_descriptor/mod.rs:3900-3959` — full parity, v10.15.0); cold:
   master's own seed transaction; the ForwardFlow install/Open happen
   on the next packet's clean-miss dispatch with a fresh derivation
   (master's two-packet shape exactly).
@@ -1871,8 +1907,17 @@ untouched.
     one (round-93 Codex 1) — with the retraction the plan is
     packet-for-packet master-identical here, and the v10.8.0
     close-aware gate neither widens nor narrows it. It is NOT the issue's
-    blind-close class: the driving packet carries no closing flags, no
-    demote gate can see it, and no sequence validation applies to a SYN
+    blind-close class, stated precisely (v10.16.0, round-99 Codex 5):
+    the harm flows through the identity-less Open overwrite (the sync
+    layer), and the chain's state creation is CONSTRUCTOR-side — the
+    follow-up packet (SYN or SYN|close) hits a clean miss and seeds a
+    FreshPrimary entry (site 3), where a closing flag only accelerates
+    the fresh entry's own reap; the demote gate engages on live
+    anchor-carrying entries and a fresh constructor seed is out of its
+    scope. (The conceded chain needs a warm next hop or a lapsed seed
+    for packet two to clean-miss; with a cold next hop packet two hits
+    the transient seed instead — stated, round-99 Codex 5.) No
+    sequence validation applies to a SYN
     (a SYN is the sequence bootstrap — the attacker legitimately knows
     the state it just seeded; anti-spoof/ingress filtering is the
     classical mitigation, and the sync-layer fix is identity-carrying
@@ -2230,8 +2275,8 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   re-entry is retracted, rounds 94-96 Codex):** the purged packet
   continues the HIT-branch dispatch on the retained lookup
   (`session_glue/mod.rs:1194-1196`) — warm next hop: forward, no
-  install, flow-cache insert suppressed (the one hardening delta,
-  round-96 Codex 2); cold next hop: master's own seed transaction
+  install, master's own cache behavior (a purged pure-ACK is cached
+  normally — full parity, v10.15.0); cold next hop: master's own seed transaction
   (transient, no Open; master's merge-keeps-P1 purge-aftermath is
   pre-existing and documented, §7); the NEXT packet's
   genuine clean-miss dispatch installs the
@@ -2264,12 +2309,12 @@ values (probabilistic sprays can legitimately hit the admitted interval):
 - **Probation local-only reap (round-83 Codex 2; alias amendment
   v10.15.0, round-98 Codex 5):** a probation expiry
   removes only the local table entry AND invalidates the flow-cache
-  entries for ALL of the entry's keys (canonical, the reverse
-  companion key `reverse_session_key(key, decision.nat)`, and
-  forward-wire aliases — the cache keys by `flow.forward_key`,
-  `flow_cache.rs:578-580`, while the expiry carries the canonical key,
-  `entry.rs:337-343`; alias-complete invalidation keeps no cached S2
-  alias alive past the reap, round-98 AGY 2) — assert NO `release_flow` call, NO
+  entries for the entry's FULL alias set (canonical, reverse
+  companion, reverse-translated aliases, forward-wire aliases, and
+  reply-match tuples — `lookup.rs:62-100`/`:222-250`/`:253-315`,
+  `key.rs:19-26`; exact-key invalidation, `flow_cache.rs:1105-1120`),
+  and every adoption invalidates the PRIOR identity's full alias set
+  at adopt time (round-99 Codex 4) — assert NO `release_flow` call, NO
   NAT64 release, NO BPF family-key delete, NO delta; the owner/live
   entry's own later reap performs the family's authoritative global
   cleanup; a
@@ -2397,16 +2442,20 @@ this branch only if the minimal fix proves insufficient.
 - **Transient-purge/Open provenance-integrity (v10.9.0, round-92 Codex
   1):** the non-owner purge path lets a LATER clean-miss packet install
   an identity-less fresh flow and emit a latest-generation-wins Open
-  that overwrites the peer's authoritative family — a spoofed non-close
-  first packet with the victim's translated tuple drives it on master
-  TODAY (no closing flags involved), and v10.11.0 keeps the plan's
-  dispatch here packet-for-packet master-identical (the v10.4.1
-  same-dispatch re-entry, which had collapsed the class from two
-  packets to one, is retracted). The fix is sync-layer identity (fenced
-  provenance on Open/Close deltas, or close-aware + provenance-aware
-  purge) — Phase-2-adjacent (§10.5) and in any case its own issue;
-  this plan's gate neither worsens nor can see the class (the driving
-  packet is not a close). Tracked as #6599.
+  that overwrites the peer's authoritative family — a spoofed first
+  packet with the victim's translated tuple drives it on master
+  TODAY (the driving packet is a SYN; a SYN-bearing CLOSE variant —
+  close purges, SYN|close clean-misses and installs with closing
+  seeded + Open — is the same class with a closing second packet,
+  warm-or-lapsed-seed only, v10.16.0 round-99 Codex 5), and v10.15.0
+  keeps the plan's dispatch here packet-for-packet master-identical
+  (the v10.4.1 same-dispatch re-entry, which had collapsed the class
+  from two packets to one, is retracted). The fix is sync-layer
+  identity (fenced provenance on Open/Close deltas, or
+  provenance-aware purge) — Phase-2-adjacent (§10.5) and in any case
+  its own issue; this plan's gate neither worsens nor can engage the
+  class (the state creation is constructor-side, not a demote on a
+  live anchor-carrying entry). Tracked as #6599.
 - **Import-window reservation race (v10.9.0, round-92 Codex 2):** the
   shared-publish → worker-upsert → P1-reservation ordering leaves a
   window where a local allocation can claim P1 first; the reservation
@@ -2460,7 +2509,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.15.1)
+## 11. Open questions for the convergence round (v10.16.0)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
@@ -2488,12 +2537,12 @@ this branch only if the minimal fix proves insufficient.
    pre-existing, (ii) the zero-producer case carrying no HA consequence,
    and (iii) two reviewed attempts producing cascades? Trace the
    ISSUE-class harm, or the retreats stand.
-3. **Round-86..96 fold verification:** (a) the purged class dispatches
-   MASTER-SPLIT (v10.13.0): warm — retained-lookup forward, no
-   install, cache-insert suppressed; cold — master's own seed
-   transaction (merge-keeps-P1 included, documented pre-existing);
-   the ForwardFlow install lands on the later clean miss with a fresh
-   derivation. (The v10.4.1 same-dispatch re-entry this question once
+3. **Round-86..99 fold verification:** (a) the purged class dispatches
+   MASTER-SPLIT with full cache parity (v10.15.0): warm — retained-
+   lookup forward, no install, master's own cache behavior; cold —
+   master's own seed transaction (merge-keeps-P1 included, documented
+   pre-existing); the ForwardFlow install lands on the later clean
+   miss with a fresh derivation. (The v10.4.1 same-dispatch re-entry this question once
    referenced is retracted — the sole-decision and DNAT port-remap
    concerns it addressed now land at the clean-miss install, §5.2 (iv).)
    (b) propagation-target reciprocity
@@ -2507,16 +2556,17 @@ this branch only if the minimal fix proves insufficient.
    deferred refresh (round-88) — is any pre-commit refresh/requeue
    path left for a probation entry (lookup, `touch_if_stale`, promote,
    materialize refresh), and does the commit-hook clear+refresh cover
-   every admission arm? (e) the v10.15.0 end-state: the purge path is
-   full master parity (closing packets included) with the
-   close-on-purged-provenance chain documented as #6599-family; the
-   surviving Part-B rules are the demote gate, rule 5, the 2b/2c
-   constructor gates with the probation discipline (now including the
-   typed OverdueSkipped outcome and alias-complete cache invalidation
-   at reap), the ReplacedSyncedLocal close skip, and the site-9 typed
-   outcomes — is any close-class state mutation on peer-synced
-   provenance left that is NOT master-identical, and does the
-   OverdueSkipped consumer set cover every downstream state consumer?
+   every admission arm? (e) the v10.16.0 end-state: the purge path is
+   master-identical except the demote gate's deliberate refusal on
+   anchorless peer-synced entries (the replica-lifetime delta,
+   documented); the surviving Part-B rules are the gate, rule 5, the
+   2b/2c constructor gates with the probation discipline (typed
+   OverdueSkipped with its five-consumer set and ExistingResolved
+   composition; alias-complete invalidation at adopt AND reap), the
+   ReplacedSyncedLocal skip, and the site-9 typed outcomes — is any
+   close-class state mutation on peer-synced provenance left that is
+   neither master-identical nor a documented deliberate delta, and is
+   the OverdueSkipped transport/composition/consumer set complete?
 
 4. **The emission posture:** master's `expire.rs:342-350` gate is
    UNCHANGED; the additions are the normative mark-creation rules, rule
@@ -2534,7 +2584,9 @@ this branch only if the minimal fix proves insufficient.
    deletion, admitted-metadata preservation) as follow-up candidates;
    Phase 2 on its own track; and the round-92 re-scopes — #6599
    (transient-purge/Open provenance-integrity) and #6600 (import-window
-   reservation race) — both PRE-EXISTING master exposures that no demote
-   gate can see (neither driving packet carries closing flags). Does
+   reservation race) — both PRE-EXISTING master exposures the demote
+   gate cannot engage (the state creation is constructor-side; the
+   SYN-bearing-close variant's closing flag only accelerates the fresh
+   entry's own reap — v10.16.0, round-99 Codex 5). Does
    anything further MUST ship in this
    plan for the issue's fix to be safe? Trace required.
