@@ -303,7 +303,8 @@ func (c *CLI) showOSPF(args []string) error {
 			"Neighbor ID", "Priority", "State", "Address", "Interface")
 		for _, n := range neighbors {
 			fmt.Printf("  %-18s %-10s %-16s %-18s %s\n",
-				n.NeighborID, n.Priority, n.State, n.Address, n.Interface)
+				termsafe.SanitizeRowForDisplay(
+					n.NeighborID, n.Priority, n.State, n.Address, n.Interface)...)
 		}
 		return nil
 
@@ -361,7 +362,8 @@ func (c *CLI) showBGP(args []string) error {
 			"Neighbor", "AF", "AS", "MsgRcvd", "MsgSent", "Up/Down", "State", "PfxRcd")
 		for _, p := range peers {
 			fmt.Printf("  %-20s %-13s %-8s %-9s %-9s %-11s %-12s %s\n",
-				p.Neighbor, p.AddressFamily, p.AS, p.MsgRcvd, p.MsgSent, p.UpDown, p.State, p.PfxRcd)
+				termsafe.SanitizeRowForDisplay(
+					p.Neighbor, p.AddressFamily, p.AS, p.MsgRcvd, p.MsgSent, p.UpDown, p.State, p.PfxRcd)...)
 		}
 		return nil
 
@@ -376,7 +378,8 @@ func (c *CLI) showBGP(args []string) error {
 		}
 		fmt.Printf("  %-24s %-20s %s\n", "Network", "Next-hop", "Path")
 		for _, r := range routes {
-			fmt.Printf("  %-24s %-20s %s\n", r.Network, r.NextHop, r.Path)
+			fmt.Printf("  %-24s %-20s %s\n",
+				termsafe.SanitizeRowForDisplay(r.Network, r.NextHop, r.Path)...)
 		}
 		return nil
 
@@ -432,7 +435,8 @@ func (c *CLI) showRIP() error {
 	}
 	fmt.Printf("  %-20s %-18s %-8s %s\n", "Network", "Next Hop", "Metric", "Interface")
 	for _, r := range routes {
-		fmt.Printf("  %-20s %-18s %-8s %s\n", r.Network, r.NextHop, r.Metric, r.Interface)
+		fmt.Printf("  %-20s %-18s %-8s %s\n",
+			termsafe.SanitizeRowForDisplay(r.Network, r.NextHop, r.Metric, r.Interface)...)
 	}
 	return nil
 }
@@ -470,7 +474,8 @@ func (c *CLI) showISIS(args []string) error {
 			"System ID", "Interface", "Level", "State", "Hold Time")
 		for _, a := range adjs {
 			fmt.Printf("  %-20s %-14s %-10s %-10s %s\n",
-				a.SystemID, a.Interface, a.Level, a.State, a.HoldTime)
+				termsafe.SanitizeRowForDisplay(
+					a.SystemID, a.Interface, a.Level, a.State, a.HoldTime)...)
 		}
 		return nil
 

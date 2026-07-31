@@ -78,12 +78,16 @@ func (c *CLI) showServicesDynamicDNS(detail bool) error {
 				if v.Family == 6 {
 					fam = "inet6"
 				}
-				// #6468 D1: LastError can embed a DDNS PROVIDER response body. The
-				// dyndns2/duckdns/generic backends wrap it in %q, but Cloudflare
-				// (backend_cloudflare.go) and Route 53 (backend_route53.go) embed the
-				// provider message with %s, so a hostile or compromised provider can
-				// land raw ESC bytes on the operator terminal. Sanitize at the display
-				// site so the whole class is covered regardless of backend.
+				// #6468 D1: LastError can embed a DDNS PROVIDER response body.
+				// Cloudflare (backend_cloudflare.go:166) and Route 53
+				// (backend_route53.go:195,277) embed the provider's own message with
+				// %s, so a hostile or compromised provider can land raw ESC bytes on
+				// the operator terminal. The other backends do not: dyndns2 and
+				// duckdns wrap the response token in %q, generic OMITS the body
+				// entirely (it reports only the configured success tokens), and
+				// rfc2136 reports a fixed rcode string. Sanitizing at the display site
+				// covers the class regardless of which backend produced the string,
+				// and survives a backend changing its format verb.
 				lastErr := termsafe.SanitizeForDisplay(v.LastError)
 				if lastErr == "" {
 					lastErr = "-"

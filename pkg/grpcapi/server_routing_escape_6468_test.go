@@ -34,14 +34,52 @@ const evilVtyshBlock6468 = "BGP neighbor is 10.0.0.1, remote AS 65001\n" +
 	"  Hostname: rtr1\x1b[2Kforged-peer\n" +
 	"  BGP state = Established, up for 00:12:34\n"
 
-// vtyshEscapeExecutor6468 is an frr executor double whose Vtysh returns the
-// hostile block for every command. It satisfies pkg/frr's package-private
-// frrExecutor (all four methods are exported names, so an out-of-package type
-// can implement it) and is handed to frr.NewForTest, which is the seam that
-// lets a show RPC run its real wiring without shelling out to vtysh.
+// evilISISNeighborTable6468 is a `show isis neighbor` table whose FIRST column
+// carries a CSI erase-line escape. That column is not a numeric system ID: FRR
+// substitutes the hostname the peer advertised in its Dynamic Hostname TLV
+// (RFC 5301), so it is peer-controlled text — and GetISISAdjacency reaches it
+// through strings.Fields, which splits on whitespace and leaves ESC/DEL/C1
+// inside the token untouched. Tokenizing is not sanitizing.
+//
+// The header row must survive the parser's own skips: it drops lines starting
+// with "Area" and rows whose first field is "System".
+const evilISISNeighborTable6468 = "Area 1:\n" +
+	" System Id           Interface   L  State        Holdtime SNPA\n" +
+	" rtr1\x1b[2Kforged     ge-0-0-1    2  Up           27       2020.2020.2020\n"
+
+// evilBGPSummaryJSON6468 is a `show bgp summary json` reply whose peer "state"
+// string carries an embedded NEWLINE plus a complete fake peer row. It is the
+// case that ISOLATES the per-cell row guard from the response-boundary block
+// guard: SanitizeBlockForDisplay PRESERVES LF by design (that is what keeps a
+// vtysh table from collapsing), so it cannot catch this — only the single-line
+// cell guard escapes the newline and stops the forged row.
+//
+// This cell is reachable in a way a strings.Fields-scraped cell is not: JSON
+// decoding turns \n into a real newline, and the split that would have
+// consumed it never happens.
+const evilBGPSummaryJSON6468 = `{"ipv4Unicast":{"peers":{"10.0.0.1":{` +
+	`"remoteAs":65001,"msgRcvd":10,"msgSent":11,"peerUptime":"00:12:34",` +
+	`"state":"Established\n  10.0.0.99             ipv4-unicast  65099    0         0         never       Idle         0",` +
+	`"pfxRcd":5,"pfxSnt":5}}}}`
+
+// vtyshEscapeExecutor6468 is an frr executor double that returns hostile
+// stdout. It satisfies pkg/frr's package-private frrExecutor (all four methods
+// are exported names, so an out-of-package type can implement it) and is handed
+// to frr.NewForTest, which is the seam that lets a show RPC run its real wiring
+// without shelling out to vtysh.
+//
+// `show isis neighbor` gets a PARSED-table fixture because that command feeds
+// GetISISAdjacency rather than being printed verbatim; every other command gets
+// the raw block.
 type vtyshEscapeExecutor6468 struct{}
 
-func (vtyshEscapeExecutor6468) Vtysh(string) (string, error) {
+func (vtyshEscapeExecutor6468) Vtysh(cmd string) (string, error) {
+	switch cmd {
+	case "show isis neighbor":
+		return evilISISNeighborTable6468, nil
+	case "show bgp summary json":
+		return evilBGPSummaryJSON6468, nil
+	}
 	return evilVtyshBlock6468, nil
 }
 
@@ -133,6 +171,74 @@ func TestGetISISStatus_RemoteCLIEscapesVtyshOutput_6468(t *testing.T) {
 		}
 		assertVtyshOutputSanitized6468(t, "GetISISStatus type="+typ, resp.Output)
 	}
+}
+
+// TestGetISISStatus_RemoteCLIEscapesParsedAdjacencyRow_6468 covers the surface
+// the "raw vtysh output" sweep could not see: a PARSED field (the peer's IS-IS
+// dynamic hostname) reprinted into a caller-formatted row.
+//
+// On THIS renderer the row is now covered TWICE — by the per-cell row guard and
+// by the response-boundary block guard — so reverting either one alone leaves
+// this test green. That is stated rather than hidden: it is a defense-in-depth
+// end-to-end assertion, not the binder for the row guard. The binders are
+// TestShowISIS_LocalCLIEscapesParsedAdjacencyRow_6468 (the local CLI has no
+// response boundary, so the row guard is the only thing standing there) and
+// TestGetBGPStatus_RemoteCLIEscapesParsedSummaryRow_6468 (a JSON-decoded cell
+// carrying a real LF, which the block guard preserves by design and cannot
+// catch). The combined-revert case in the fail-on-revert gate covers this one.
+func TestGetISISStatus_RemoteCLIEscapesParsedAdjacencyRow_6468(t *testing.T) {
+	s := escapeVtyshServer6468(t)
+	resp, err := s.GetISISStatus(context.Background(), &pb.GetISISStatusRequest{Type: ""})
+	if err != nil {
+		t.Fatalf("GetISISStatus(adjacency): %v", err)
+	}
+	out := resp.Output
+
+	if !strings.Contains(out, "ge-0-0-1") {
+		t.Fatalf("the adjacency row must render (else the guard is vacuous):\n%q", out)
+	}
+	if hasRawTermControl6468(out) {
+		t.Fatalf("emitted raw terminal control bytes — the peer-advertised IS-IS dynamic "+
+			"hostname reaches the remote cli through the PARSED SystemID field, which the "+
+			"raw-output sweep does not cover (#6468):\n%q", out)
+	}
+	if !strings.Contains(out, `\x1b`) {
+		t.Fatalf("expected the escaped ESC (\\x1b) to render, proving the parsed cell was "+
+			"sanitized rather than dropped:\n%q", out)
+	}
+}
+
+// assertBGPSummaryRowSanitized6468 is the shared verdict for the rendered BGP
+// summary. hasRawTermControl6468 deliberately tolerates \n and \t (a rendered
+// table needs them), so a surviving newline would slip past it — the line-count
+// and \x0a assertions are what actually bind this case.
+func assertBGPSummaryRowSanitized6468(t *testing.T, surface, out string) {
+	t.Helper()
+	if !strings.Contains(out, "10.0.0.1") {
+		t.Fatalf("%s: the peer row must render (else the guard is vacuous):\n%q", surface, out)
+	}
+	if !strings.Contains(out, `\x0a`) {
+		t.Fatalf("%s: the newline embedded in the peer's state cell must render as \\x0a. "+
+			"The response-boundary block sanitizer PRESERVES LF by design, so only the "+
+			"per-cell row guard catches this (#6468):\n%q", surface, out)
+	}
+	// Header + exactly one peer row. A third line means the JSON cell forged one.
+	if n := strings.Count(strings.TrimRight(out, "\n"), "\n"); n != 1 {
+		t.Fatalf("%s: want header + exactly 1 peer row (1 interior newline), got %d — "+
+			"the provider-controlled cell forged a table row:\n%q", surface, n, out)
+	}
+	if strings.Contains(out, "\n  10.0.0.99") {
+		t.Fatalf("%s: a forged peer row reached the terminal:\n%q", surface, out)
+	}
+}
+
+func TestGetBGPStatus_RemoteCLIEscapesParsedSummaryRow_6468(t *testing.T) {
+	s := escapeVtyshServer6468(t)
+	resp, err := s.GetBGPStatus(context.Background(), &pb.GetBGPStatusRequest{Type: ""})
+	if err != nil {
+		t.Fatalf("GetBGPStatus(summary): %v", err)
+	}
+	assertBGPSummaryRowSanitized6468(t, "GetBGPStatus summary", resp.Output)
 }
 
 func TestShowBFDPeers_RemoteCLIEscapesVtyshOutput_6468(t *testing.T) {

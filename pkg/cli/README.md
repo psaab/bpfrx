@@ -195,14 +195,41 @@ presenter's rendered output is byte-identical:
   |---|---|---|---|
   | DHCP lease `Hostname` / `HWAddress` | field | `show_services_dhcp.go` | `server_show_dhcp_lldp_snmp.go` |
   | DHCP-DDNS owned-record `FQDN` | field | `show_services_ddns.go` | `server_show_dhcp_lldp_snmp.go` |
-  | Surface A DDNS `LastError` (provider response body — Cloudflare / Route 53 embed it with `%s`) | field | `show_services_ddns.go` | `server_show_dhcp_lldp_snmp.go` |
+  | Surface A DDNS `LastError` (provider response body — Cloudflare / Route 53 embed it with `%s`; dyndns2 / duckdns wrap it in `%q`, generic omits it, rfc2136 uses fixed rcode strings) | field | `show_services_ddns.go` | `server_show_dhcp_lldp_snmp.go` |
   | Raw `vtysh` stdout (BGP hostname capability, IS-IS dynamic hostname TLVs, OSPF router IDs) | block | `cli_show_routing.go` (OSPF ×4, BGP ×3, IS-IS ×3, BFD, route-map), `cli_request.go` (OSPF/BGP clear) | `server_routing.go` (OSPF/BGP/IS-IS response boundary), `server_show_routes_text.go` (BFD peers, route-map) |
+  | **Parsed** FRR table rows — every cell, via `termsafe.SanitizeRowForDisplay` (OSPF neighbors, BGP summary, BGP routes, RIP routes, IS-IS adjacency) | field (per cell) | `cli_show_routing.go` ×5 | `server_routing.go` ×5 |
 
-  On the gRPC routing handlers the guard sits on the RESPONSE rather than on
-  each vtysh branch, so a `case` added to one of those switches later is covered
-  by construction — the fail-open direction is exactly what left this class half
-  fixed after the first pass. The structured branches pay nothing: clean text
-  takes the sanitizer's allocation-free fast path.
+  On the gRPC routing handlers the block guard sits on the RESPONSE rather than
+  on each vtysh branch, so a `case` added to one of those switches later is
+  covered by construction — the fail-open direction is exactly what left this
+  class half fixed after the first pass. The structured branches pay nothing:
+  clean text takes the sanitizer's allocation-free fast path.
+
+  **A parsed field is not covered by a raw-output sweep.** The last row of that
+  table is a distinct class, and it is the one a "sanitize the raw output"
+  framing structurally cannot see. `frr.GetISISAdjacency` scrapes
+  `show isis neighbor` with `strings.Fields` and reprints the cells into a
+  caller-formatted row; FRR puts the hostname the peer advertised in its Dynamic
+  Hostname TLV (RFC 5301) in the first column, so `SystemID` is peer-controlled
+  text — and `strings.Fields` splits on whitespace ONLY, so ESC/DEL/BEL/C1 ride
+  inside the token untouched. **Tokenizing is not sanitizing.**
+
+  Guard the WHOLE row, never the one column you believe is device-controlled:
+
+  - Column identity is not stable. A value carrying a space in an early column
+    shifts every later column, so peer bytes land in cells a per-column analysis
+    marked safe.
+  - "This column is numeric" is a property of the current FRR, not of the
+    protocol. `bgp default show-hostname` already makes FRR emit a peer-supplied
+    hostname in the BGP summary; today the only thing keeping it out is that
+    `frr.bgpPeerJSON` does not declare the field, which is a load-bearing
+    invariant documented at its definition.
+
+  The block and field variants are observationally identical for a
+  `strings.Fields`-derived cell (the split already consumed every whitespace
+  rune), but NOT for a JSON-decoded one — a BGP-summary cell can carry a real
+  LF, which the block variant preserves by design and would render as a forged
+  table row. That case is the isolating test for the row guard.
 
   The sanitizer lives in the leaf package `pkg/termsafe` (stdlib-only) because
   `pkg/cli` imports `pkg/grpcapi`, so a helper in `pkg/cli` could not be shared
@@ -215,9 +242,14 @@ presenter's rendered output is byte-identical:
   Surface A DDNS *name* are firewall-self/operator-authored, not
   device-controlled. (The Surface A `LastError` in the table above is a
   different field on the same view — its bytes come from the provider, not from
-  us.) Sanitizing happens at the display boundary only, so machine consumers —
-  the status views, the REST `TextResponse`, the gRPC structs — still get the
-  raw value.
+  us.) `frr.FormatRouteDetail` is JSON-typed with no free-text cell (prefix,
+  protocol enum, local interface name, integer distance/metric), and
+  `routing.RouteEntry` comes from netlink rather than from a peer. The
+  `pkg/api` REST handlers render the same FRR tables into a JSON
+  `TextResponse`, which is a machine surface with no shipped terminal consumer.
+  Sanitizing happens at the display boundary only, so machine consumers — the
+  status views, the REST `TextResponse`, the gRPC structs — still get the raw
+  value.
 - Session filters (`session_filter.go`) serve BOTH show and clear. The
   clear path must call `validate()` (unknown zone/pool names are
   command errors — an inert filter degrades into clear-nothing or, via

@@ -99,7 +99,8 @@ func (s *Server) GetOSPFStatus(_ context.Context, req *pb.GetOSPFStatusRequest) 
 		var b strings.Builder
 		for _, n := range neighbors {
 			fmt.Fprintf(&b, "%-18s %-10s %-16s %-18s %s\n",
-				n.NeighborID, n.Priority, n.State, n.Address, n.Interface)
+				termsafe.SanitizeRowForDisplay(
+					n.NeighborID, n.Priority, n.State, n.Address, n.Interface)...)
 		}
 		output = b.String()
 	}
@@ -121,7 +122,8 @@ func (s *Server) GetBGPStatus(_ context.Context, req *pb.GetBGPStatusRequest) (*
 			return nil, status.Errorf(codes.Internal, "%v", err)
 		}
 		for _, r := range routes {
-			fmt.Fprintf(&b, "%-24s %-20s %s\n", r.Network, r.NextHop, r.Path)
+			fmt.Fprintf(&b, "%-24s %-20s %s\n",
+				termsafe.SanitizeRowForDisplay(r.Network, r.NextHop, r.Path)...)
 		}
 	case "groups":
 		cfg := s.store.ActiveConfig()
@@ -219,7 +221,8 @@ func (s *Server) GetBGPStatus(_ context.Context, req *pb.GetBGPStatusRequest) (*
 			"Neighbor", "AF", "AS", "MsgRcvd", "MsgSent", "Up/Down", "State", "PfxRcd")
 		for _, p := range peers {
 			fmt.Fprintf(&b, "%-20s %-13s %-8s %-9s %-9s %-11s %-12s %s\n",
-				p.Neighbor, p.AddressFamily, p.AS, p.MsgRcvd, p.MsgSent, p.UpDown, p.State, p.PfxRcd)
+				termsafe.SanitizeRowForDisplay(
+					p.Neighbor, p.AddressFamily, p.AS, p.MsgRcvd, p.MsgSent, p.UpDown, p.State, p.PfxRcd)...)
 		}
 	}
 	return &pb.GetBGPStatusResponse{Output: termsafe.SanitizeBlockForDisplay(b.String())}, nil
@@ -239,7 +242,8 @@ func (s *Server) GetRIPStatus(_ context.Context, _ *pb.GetRIPStatusRequest) (*pb
 	} else {
 		fmt.Fprintf(&b, "  %-20s %-18s %-8s %s\n", "Network", "Next Hop", "Metric", "Interface")
 		for _, r := range routes {
-			fmt.Fprintf(&b, "  %-20s %-18s %-8s %s\n", r.Network, r.NextHop, r.Metric, r.Interface)
+			fmt.Fprintf(&b, "  %-20s %-18s %-8s %s\n",
+				termsafe.SanitizeRowForDisplay(r.Network, r.NextHop, r.Metric, r.Interface)...)
 		}
 	}
 	return &pb.GetRIPStatusResponse{Output: b.String()}, nil
@@ -281,7 +285,8 @@ func (s *Server) GetISISStatus(_ context.Context, req *pb.GetISISStatusRequest) 
 				"System ID", "Interface", "Level", "State", "Hold Time")
 			for _, a := range adjs {
 				fmt.Fprintf(&b, "  %-20s %-14s %-10s %-10s %s\n",
-					a.SystemID, a.Interface, a.Level, a.State, a.HoldTime)
+					termsafe.SanitizeRowForDisplay(
+						a.SystemID, a.Interface, a.Level, a.State, a.HoldTime)...)
 			}
 		}
 	}

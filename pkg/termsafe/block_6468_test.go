@@ -8,9 +8,11 @@ import (
 // #6468 residual surfaces. Two device/remote-supplied strings still reached an
 // operator terminal unescaped after the lease-field fix:
 //
-//   - the DDNS LastError column, which can carry a PROVIDER response body —
-//     safe for dyndns2/duckdns/generic (they wrap it in %q) but not for
-//     Cloudflare / Route 53, which embed the provider message with %s;
+//   - the DDNS LastError column, which can carry a PROVIDER response body.
+//     Cloudflare and Route 53 embed the provider's message with %s; the other
+//     backends do not reach the terminal with raw bytes (dyndns2 and duckdns
+//     wrap the response token in %q, generic omits the body entirely, rfc2136
+//     reports a fixed rcode string);
 //   - raw `vtysh` stdout, which carries remote-advertised text: the BGP peer's
 //     hostname capability, IS-IS dynamic hostname TLVs, OSPF router IDs.
 //

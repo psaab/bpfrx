@@ -159,6 +159,46 @@ func SanitizeBlockForDisplay(s string) string {
 	return b.String()
 }
 
+// SanitizeRowForDisplay sanitizes every cell of ONE table row and returns them
+// ready to spread into a fmt.Printf / fmt.Fprintf argument list:
+//
+//	fmt.Printf("  %-20s %-14s %-10s %-10s %s\n",
+//		termsafe.SanitizeRowForDisplay(a.SystemID, a.Interface, a.Level, a.State, a.HoldTime)...)
+//
+// It exists to make the WHOLE-ROW rule unskippable. The tempting alternative is
+// to guard only the one column believed to carry device text — and that is
+// wrong twice over for a table scraped out of a command's stdout:
+//
+//   - Column identity is not stable. A value carrying whitespace in an EARLY
+//     column shifts every later column, so peer bytes land in cells the
+//     per-column analysis marked safe. `strings.Fields` splits on whitespace
+//     only, so an ESC, DEL, C1 or BEL rides INSIDE a token untouched while a
+//     space in the same value splits it — the attacker picks which.
+//   - "This column is numeric" is a property of the current upstream, not of
+//     the protocol. FRR already substitutes a peer-advertised IS-IS dynamic
+//     hostname for the numeric system ID, and `bgp default show-hostname` does
+//     the same for BGP; a column that is an address today can be free text
+//     after an upstream bump.
+//
+// Sanitizing a clean cell costs nothing — SanitizeForDisplay returns the input
+// string itself on the allocation-free fast path — so the uniform guard is
+// strictly cheaper than maintaining a per-column ledger of what is currently
+// attacker-reachable.
+//
+// Cells are single-line FIELDS of a caller-formatted row, so this uses
+// SanitizeForDisplay, not the block variant: an embedded newline here forges a
+// table row rather than carrying structure. (For a cell produced by
+// `strings.Fields` the two variants happen to agree, because every whitespace
+// rune was already consumed by the split; for a cell decoded out of JSON a
+// newline can survive, and there the distinction is load-bearing.)
+func SanitizeRowForDisplay(cells ...string) []any {
+	out := make([]any, len(cells))
+	for i, c := range cells {
+		out[i] = SanitizeForDisplay(c)
+	}
+	return out
+}
+
 // blockDisplaySafe is DisplaySafe with LF and TAB treated as printable and the
 // Unicode line/paragraph separators treated as unsafe, so a clean multi-line
 // blob keeps the allocation-free fast path while a row-forging separator does

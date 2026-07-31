@@ -61859,3 +61859,57 @@ that honors U+2028 as a break lets a peer hostname forge a row in the very
 table the function protects. Same argument that escapes CR. Rendered as
 ` ` (a `\xHH` escape cannot represent a rune above U+00FF);
 `blockDisplaySafe` rejects them so the fast path cannot bypass.
+
+## 2026-07-31 — fold the Codex round on #6579 (parsed FRR cells + %q correction)
+
+- **Timestamp**: 2026-07-31
+- **Action**: Codex found the class definition itself was incomplete. Both the
+  earlier sweep and the Claude review defined the class over RAW COMMAND
+  OUTPUT; a field that is PARSED out of that output and reprinted into a
+  caller-formatted row is invisible to that framing.
+- **File(s)**: `pkg/termsafe/termsafe.go`, `pkg/termsafe/row_6468_test.go`
+  (new), `pkg/frr/status_parse.go`, `pkg/cli/cli_show_routing.go`,
+  `pkg/grpcapi/server_routing.go`, `pkg/cli/cli_residual_escape_6468_test.go`,
+  `pkg/grpcapi/server_routing_escape_6468_test.go`,
+  `pkg/cli/show_services_ddns.go`,
+  `pkg/grpcapi/server_show_dhcp_lldp_snmp.go`,
+  `pkg/termsafe/block_6468_test.go`, `pkg/cli/README.md`
+
+**Proven case — `ISISAdjacency.SystemID`.** FRR substitutes the hostname the
+peer advertised in its Dynamic Hostname TLV (RFC 5301) for the numeric system
+ID, so column 1 of `show isis neighbor` is peer-controlled text.
+`GetISISAdjacency` reaches it through `strings.Fields`, which splits on
+`unicode.IsSpace` ONLY — measured: ESC/DEL/BEL/C1-CSI/NUL are all
+`IsSpace=false` and ride inside the token untouched. Tokenizing is not
+sanitizing.
+
+**Extension the review did not have.** Sanitizing only `SystemID` would still
+be wrong: `strings.Fields` means a hostname containing a SPACE shifts
+Interface/Level/State/HoldTime one column right and puts peer bytes in each.
+The guard has to cover the WHOLE row. New `termsafe.SanitizeRowForDisplay`
+makes that unskippable, and the same guard went on the other four parsed FRR
+tables (OSPF neighbors, BGP summary, BGP routes, RIP routes) on both
+renderers — free on clean text, and "this column is numeric" is a property of
+the current FRR rather than of the protocol.
+
+**Row guard is NOT redundant with the response-boundary block guard.** Proven,
+not assumed: reverting the gRPC IS-IS row guard alone leaves the test green
+because the block guard catches it. The isolating case is a JSON-decoded
+BGP-summary cell carrying a real LF — the block variant preserves LF by design
+and renders a forged peer row; only the per-cell field guard escapes it. Both
+renderers now have that test, and the gRPC IS-IS test is documented as
+defense-in-depth rather than a binder.
+
+**Factual correction.** The earlier comments said dyndns2/duckdns/**generic**
+wrap the provider body in `%q`. Verified wrong: generic does not quote the body,
+it OMITS it entirely (`backend_generic.go:242` formats the configured
+`okTokens` with `%v`, never the response). Correct tally: two embed it
+unquoted (Cloudflare `:166`, Route 53 `:195,277`), two quote it (dyndns2,
+duckdns), generic omits it, rfc2136 reports a fixed rcode string. The fix is
+unaffected — the two unsafe backends are the two already identified.
+
+Scoped out, verified: `frr.FormatRouteDetail` (JSON-typed, no free-text cell),
+`routing.RouteEntry` (netlink, not peer-sourced), the `pkg/api` REST renderers
+(JSON, no shipped terminal consumer). The `slog`/remote-syslog sink Codex
+raised is a different sink and a package-wide policy question; filed separately
+by the parent, deliberately NOT folded here.
