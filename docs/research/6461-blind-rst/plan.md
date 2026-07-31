@@ -1,6 +1,6 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.15.0 — THE TERMINAL CUT, round-98 folds (THE
+**Status: DRAFT v10.15.1 — THE TERMINAL CUT, round-98 folds (+ round-98 AGY specification-completeness folds: the reverse companion key named in the alias-complete invalidation; the five-consumer OverdueSkipped enumeration; the §11 accounting phrasing) (THE
 PURGE-PATH RETRACTION: the close-aware purge gate, the close-retained
 marker, and the marker-conditioned cache suppression are ALL retracted
 — the marker's identity-safe lifecycle, cross-worker topology, and
@@ -1370,7 +1370,8 @@ reap is LOCAL-ONLY (v10.1.0, round-83 Codex 2; alias amendment
 v10.15.0, round-98 Codex 5):** `ExpiredSession`
 carries the probation flag, and a probation expiry removes ONLY the
 worker's local table entry PLUS invalidates the flow-cache entries
-for ALL of the entry's keys (canonical + forward-wire aliases —
+for ALL of the entry's keys (canonical, the reverse companion key
+`reverse_session_key(key, decision.nat)`, and forward-wire aliases —
 `flow_cache.rs:578-580` vs `entry.rs:337-343`) — NO Close delta (as
 before), NO
 `release_source_nat_allocation`/`release_nat64_allocation`
@@ -1581,10 +1582,15 @@ adopting the shared decision/metadata, §5.6).
   the accepted-mark rule skips a probation MATCHED entry (v10.8.0,
   round-91 Codex 3). The overdue-materialize skip produces a typed
   `OverdueSkipped` outcome (v10.15.0, round-98 Codex 4) honored by
-  the terminal teardown (suppressed — the dispatch installed nothing),
-  the anchor commit hook (no write), and the flow-cache insert
-  (suppressed); the probation reap invalidates the flow cache
-  alias-completely (v10.15.0, round-98 Codex 5).
+  ALL FIVE downstream state consumers (round-98 AGY 3): the terminal
+  teardown (suppressed — the dispatch installed nothing), the anchor
+  commit hook (no write), the flow-cache insert (suppressed), the
+  probation clear+refresh (never fires on an overdue entry — no stale
+  resurrection for a full timeout), and the ownership promote
+  (cannot engage — no local entry is installed or returned); the
+  probation reap invalidates the flow cache
+  alias-completely (canonical + reverse companion + forward-wire
+  aliases; v10.15.0, round-98 Codex 5 + round-98 AGY 2).
 - `retry_pending_neigh` is **UNCHANGED** (master's buffered-decision
   transmit; the v10.1 re-resolve/hold design is retracted, §5.2). A
   buffered packet never runs the anchor hook, the promote, or the
@@ -2258,11 +2264,12 @@ values (probabilistic sprays can legitimately hit the admitted interval):
 - **Probation local-only reap (round-83 Codex 2; alias amendment
   v10.15.0, round-98 Codex 5):** a probation expiry
   removes only the local table entry AND invalidates the flow-cache
-  entries for ALL of the entry's keys (canonical + forward-wire
-  aliases — the cache keys by `flow.forward_key`,
+  entries for ALL of the entry's keys (canonical, the reverse
+  companion key `reverse_session_key(key, decision.nat)`, and
+  forward-wire aliases — the cache keys by `flow.forward_key`,
   `flow_cache.rs:578-580`, while the expiry carries the canonical key,
   `entry.rs:337-343`; alias-complete invalidation keeps no cached S2
-  alias alive past the reap) — assert NO `release_flow` call, NO
+  alias alive past the reap, round-98 AGY 2) — assert NO `release_flow` call, NO
   NAT64 release, NO BPF family-key delete, NO delta; the owner/live
   entry's own later reap performs the family's authoritative global
   cleanup; a
@@ -2453,7 +2460,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.15.0)
+## 11. Open questions for the convergence round (v10.15.1)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
@@ -2494,9 +2501,9 @@ this branch only if the minimal fix proves insufficient.
    occupant B dead in both directions, with positive coverage for
    SNAT/hairpin/NPTv6/NAT64 families? (c) the `account_packet` wording
    (counters/flags advance per the pre-existing #2501 accounting —
-   including on a retained close, the round-95 Codex 6 telemetry-only
-   carve-out; the anchor rides the distinct post-admission hook)
-   — consistent everywhere now (§5.2, §5.8, §7, §9)? (d) the probation
+   on a purge-dispatched close exactly as master, the round-95 Codex 6
+   telemetry-only note; the anchor rides the distinct post-admission
+   hook) — consistent everywhere now (§5.2, §5.8, §7, §9)? (d) the probation
    deferred refresh (round-88) — is any pre-commit refresh/requeue
    path left for a probation entry (lookup, `touch_if_stale`, promote,
    materialize refresh), and does the commit-hook clear+refresh cover
