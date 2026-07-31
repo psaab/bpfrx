@@ -1,16 +1,18 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.27.2 — THE TERMINAL CUT, round-110/111 folds (v10.27.1 folded the AGY r110 struct/consumer/type findings; v10.27.2 folds Codex r111's residual: the last three categorical overdue-contradicting claims — the site-2c refuse-install summary, the §9 install-ALIVE test, and the retry-path all-three claim — now carry the OverdueSkipped qualification) (+ round-110 AGY consistency folds: `effective_transition` is in the struct declaration with its explicit `Option<TransitionResult>` type; every consumer gate reads it; the last two stragglers)
-(`effective_transition` is now a carried struct field initialized in
-`MaterializeReport::NONE` and named at EVERY consumer — promotion,
-poller carriage, the MissingNeighbor composition, the teardown
-guards, the cache-insert suppression, and the commit hooks; the
-remaining categorical install/clear claims outside the SSOT are
-qualified; §9 gained the end-to-end stale-cache regression).
-Round-110: Codex NO (1B/1M/1L — the effective transition was not yet
-a carried field named at every consumer; the outside-SSOT
-contradictions; the missing e2e fixture — all folded); AGY r109
-SOUND (2 textual findings, folded v10.26.1); SMR r110 YES (fold
+**Status: DRAFT v10.28.0 — THE TERMINAL CUT, round-112 folds (the
+commit hook gains the DIRECT matched-entry overdue test —
+`entry.probation && last_seen_ns.saturating_add(expires_after_ns) <=
+now_ns` — because an overdue probation entry can be reached through an
+ordinary LOCAL hit that never materializes; the establishment promote
+fires at the ADMISSION commit point — for a buffered packet the
+pending-queue enqueue — so a buffered proof-passing SYN-ACK promotes
+at enqueue and the forward half never lingers OPENING because the
+next packet is not `is_syn_ack`; the raw/effective pair gains its
+total invariant; the broad anchor-update claims carry the
+OverdueSkipped/UpsertRefused suppression). Round-112: Codex NO
+(1B/1H/2M — the direct-local-hit hole was the round's real catch);
+AGY r111 SOUND (v10.27.2, no findings); SMR r112 YES (fold
 verification). Ship
 candidate = the Part-A dataplane demote gate plus the wire-free local HA
 rules. The RG-incarnation/retirement/fence-ledger protocol that rounds
@@ -645,10 +647,15 @@ request-build stage:
   fix added local machinery to defend an improvement (never-transmit-
   stale) that is OUTSIDE this issue's blast radius. What the gate
   actually needs here is only: (i) **a buffered packet never moves the
-  anchor and never drives post-borrow state** (no anchor update, no
-  establishment promote, no probation clear on the retry path — the
-  retry has no `SessionTable`; the next unbuffered packet does all
-  three PROVIDED its effective transition is not `OverdueSkipped`,
+  anchor and never drives post-borrow state on the retry path** (no
+  anchor update, no probation clear — the
+  retry has no `SessionTable`; the establishment promote is the
+  exception that fires at ADMISSION: for a buffered packet the
+  pending-queue enqueue is the commit-to-deliver point, so a buffered
+  proof-passing SYN-ACK promotes at enqueue, v10.28.0 round-112
+  Codex 2; the anchor update and probation clear still wait for the
+  next unbuffered packet PROVIDED its effective transition is not
+  `OverdueSkipped`,
   v10.27.0, round-110 Codex 2). The consequence is a documented residual, not a channel: a
   flow whose traffic is mostly buffered (long ARP stalls) lets its
   anchor lag the stream — later closes soft-refuse and the entry idles
@@ -811,7 +818,10 @@ request-build stage:
   §5.1).
 - **`lookup_with_origin` does NO anchor updates:** the lookup path
   validates and marks only. Closing segments never update (rule 1);
-  committed non-close packets update at the dispatch arms above.
+  committed non-close packets update at the dispatch arms above —
+  EXCEPT on an `OverdueSkipped` or `UpsertRefused` effective
+  transition (the anchor commit hook is suppressed for both,
+  v10.28.0, round-112 Codex 4).
 - **Install-time seeds** are applied at the constructors (rule 4's
   provenance matrix).
 
@@ -1748,7 +1758,16 @@ adopting the shared decision/metadata, §5.6).
     `TransitionResult` enum variant, while `effective_transition`'s
     unset state is `Option::None`; `MaterializeReport::NONE` sets
     `transition = TransitionResult::None` and
-    `effective_transition = None`). The
+    `effective_transition = None`). **The total invariant (normative,
+    v10.28.0, round-112 Codex 3):** `site=None →
+    effective_transition=None`; legal site-2c `T →
+    effective_transition=Some(T)`; invalid site-2c →
+    `Some(OverdueSkipped)`; `Some(TransitionResult::None)` never
+    occurs (the effective value is either unset or a real
+    transition); and the refusal promotion gate is site-qualified
+    (a malformed `site=None, validation=Some(Refused)` report follows
+    master's own dispatch and never reaches the site-2c gates).
+    §9 tests the invariant. The
     materialize computes the validation verdict (from the packet +
     anchor) and the overdue check (from K's timing) BEFORE calling the
     state-changing upsert (`install.rs:310-322`, `:345-400` may remove
@@ -1836,8 +1855,20 @@ adopting the shared decision/metadata, §5.6).
     S2's identity, `session_glue/mod.rs:477-581`); (ii) the anchor
     commit hook does NOT write; (iii) the flow-cache insert
     (`:3900-3959`) is suppressed; (iv) the probation clear+refresh
-    NEVER fires on an overdue entry AND the commit-time refresh checks
-    `report.effective_transition == Some(OverdueSkipped)` explicitly
+    NEVER fires on an overdue entry; the commit-time refresh checks
+    `report.effective_transition == Some(OverdueSkipped)` AND —
+    independently, because an overdue probation entry can be reached
+    through an ordinary LOCAL hit that never materializes (the
+    canonical packet finds K locally, no `shared_entry`, no
+    materialization, `MaterializeReport::NONE`,
+    `shared_ops.rs:594-635`, `session_glue/mod.rs:1092-1121`;
+    reachable because expiry is strict and the GC is periodic,
+    `expire.rs:130-168`) — the commit hook ALSO checks the MATCHED
+    ENTRY directly: `entry.probation &&
+    entry.last_seen_ns.saturating_add(entry.expires_after_ns) <=
+    now_ns` suppresses the clear+refresh on ANY path (v10.28.0,
+    round-112 Codex 1; the phase-shifted direct-local-hit regression
+    is in §9)
     (not only the
     probation flag, round-108 Codex 3); (v) the ownership promote is
     suppressed by the explicit `report.effective_transition ==
@@ -2427,7 +2458,10 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   capacity-discarded does NOT move the anchor (the endpoint's next legit
   close still validates); selective no-learn arms (NoRoute /
   NextTableUnsupported / MissingNeighbor reinjection / ForwardCandidate
-  build-failure) skip updates; a COMMITTED packet updates exactly once.
+  build-failure) skip updates; a COMMITTED packet updates exactly once
+  UNLESS the effective transition is `OverdueSkipped` or
+  `UpsertRefused` (the anchor commit hook is suppressed for both,
+  v10.28.0, round-112 Codex 4).
 - **Constructor gating:** site 2b accept → companion installed with the
   seed AND the forward family marked atomically (exactly one producer;
   #4380 retention semantics asserted, not an idealized 2 s whole-flow
@@ -2532,7 +2566,15 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   arm); (ix-b) `UpsertRefused +
   MissingNeighbor` never enters the seed block (which would replace K
   via `install.rs:139`); (ix-c) the P+K+S2 maximum-cardinality case
-  and a full 64-descriptor/192-family batch; (ix-d) the r109-1
+  and a full 64-descriptor/192-family batch; (ix-d0) the
+  phase-shifted DIRECT-LOCAL-HIT overdue regression (v10.28.0,
+  round-112 Codex 1): probation K installed; K crosses its deadline
+  ahead of the periodic GC; a canonical packet finds K LOCALLY (no
+  `shared_entry`, no materialization — `MaterializeReport::NONE`); a
+  committed non-close must NOT clear/restamp K — the commit hook's
+  direct matched-entry test (`entry.probation &&
+  last_seen_ns.saturating_add(expires_after_ns) <= now_ns`)
+  suppresses the clear+refresh, and K reaps on schedule; (ix-d) the r109-1
   end-to-end stale-cache regression (v10.27.0, round-110 Codex 3):
   pre-seed an OLD cache descriptor for the tuple; process a
   cache-ineligible close (FIN/RST bypasses the lookup,
@@ -2614,8 +2656,23 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   packet NEVER moves the anchor, NEVER drives the establishment promote,
   NEVER clears probation (the next unbuffered packet does all three
   when its effective transition is not `OverdueSkipped`, v10.27.1);
-  a buffered SYN-ACK delivering without its promote leaves the entry
-  OPENING exactly as master (20 s window if no further packet).
+  a buffered SYN-ACK promotes at its ADMISSION commit point
+  (v10.28.0, round-112 Codex 2): the establishment promote fires at
+  the packet's admission — for a buffered packet that is the
+  pending-queue ENQUEUE (the commit-to-deliver event), not the
+  transmit — because the retry path carries no `SessionTable` and the
+  next packet (a forward ACK/data) is not `is_syn_ack` and could
+  never perform the promote (`lookup.rs:129`-class predicate; an
+  arbitrary-ACK promote would reintroduce the #4109 half-open pin).
+  The proof is evaluated at arrival (the strong non-closing reverse
+  SYN-ACK), so the buffered SYN-ACK promotes at enqueue and the
+  forward half does NOT linger OPENING on the short timeout
+  (`session/mod.rs:2135`). The consequence stated: a SYN-ACK dropped
+  BEFORE admission (input filter, TTL) never promotes — stricter
+  than master (master's in-borrow promote precedes the TTL check),
+  fail-conservative, and the flow recovers on the SYN-ACK retransmit
+  (a retransmitted SYN-ACK IS `is_syn_ack` and promotes at its own
+  admission).
 - **Site-9 typed outcomes (round-83 Codex 1 + round-84 Codex 1 +
   round-85 Codex 1):**
   (a) `ExistingResolved` on a validator-REFUSED close with a cold next
@@ -2954,7 +3011,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.27.2)
+## 11. Open questions for the convergence round (v10.28.0)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
@@ -3001,10 +3058,10 @@ this branch only if the minimal fix proves insufficient.
    deferred refresh (round-88) — is any pre-commit refresh/requeue
    path left for a probation entry (lookup, `touch_if_stale`, promote,
    materialize refresh), and does the commit-hook clear+refresh cover
-   every admission arm? (e) the v10.27.0 end-state: the effective
-   transition is a carried field read by every consumer, every
-   clear/install claim is qualified, and the e2e stale-cache
-   regression is tested — is anything left?
+   every admission arm? (e) the v10.28.0 end-state: the commit hook's
+   direct matched-entry overdue test, the admission-point promote,
+   the total invariant, and the qualified anchor claims — is any
+   reachable state transition still ungated?
 
 4. **The emission posture:** master's `expire.rs:342-350` gate is
    UNCHANGED; the additions are the normative mark-creation rules, rule
