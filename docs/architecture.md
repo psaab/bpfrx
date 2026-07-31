@@ -195,12 +195,23 @@ editing cmdtree.
     from the live allowlist maps plus the method names the interceptor
     source special-cases, so allowlisting a new RPC fails the completeness
     gate until it is audited; the ShowText topic set is likewise derived
-    from the dispatcher source. Structurally the surface is safe because
-    every operator secret except the SNMP community is a `config.Secret`,
-    whose `String()` masks it under `%s`/`%v` (#2053) — the community is a
-    plain string because it is the `Communities` map key — and because
-    `pkg/grpcapi` never calls the `Reveal()` cleartext accessor that would
-    opt out of that (also asserted).
+    from the dispatcher source. The structural reason the sweep finds only
+    one class of leak is that every operator secret except the SNMP
+    community is a `config.Secret`, whose `String()` masks it under
+    `%s`/`%v`/`%q`/`%x` (#2053) — the community is a plain string because it
+    is the `Communities` map key. That protection has exactly two escape
+    hatches, and `TestGRPCAPINeverUnwrapsSecretCleartext` asserts neither is
+    used here: the `Reveal()` cleartext accessor, and a plain
+    `string(...)`/`[]byte(...)` **conversion**, which works because `Secret`
+    is a named string type and therefore never reaches `String()`. The
+    conversion check is syntactic and its residuals (a conversion of a local
+    previously assigned from a secret field, a Secret-bearing field declared
+    outside `pkg/config`, non-conversion unwrapping) are enumerated on the
+    test. A companion meta-test feeds the scanner synthetic sources and
+    asserts it REPORTS each shape — without it, an all-clear from a broken
+    scan is indistinguishable from an all-clear from a clean package, which
+    is how the `Reveal()` branch was once disabled while the suite stayed
+    green.
 - **HTTP REST** on `127.0.0.1:8080` — health, Prometheus `/metrics`,
   config endpoints, full gRPC parity.
   - **Listener lifecycle is all-or-nothing (#5058).** `Server.Run` may

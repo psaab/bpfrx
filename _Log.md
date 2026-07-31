@@ -1,3 +1,62 @@
+## 2026-07-31 — #6532 round-2 fold: my previous fold BROKE the guard it widened
+
+- **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact, PR #6602)
+- **Action**: Codex re-gate found a MAJOR in the round-1 fold, and it was
+  correct. Widening the structural guard from a Reveal() line-grep to an AST
+  scan, I put `if !ok || len(call.Args) != 1 { return true }` ahead of the
+  Reveal check. A zero-argument method call has len(Args)==0 — the receiver
+  lives in CallExpr.Fun, not Args — so the Reveal branch became UNREACHABLE
+  DEAD CODE. Net effect: I added conversion detection and silently deleted the
+  original protection, on exactly the paths (wireguard / ipsec-statistics /
+  bfd-peers, which short-circuit on a nil dataplane) where this guard is the
+  ONLY net. Proved firsthand with a standalone go/ast program:
+  `CallExpr Reveal(): len(Args)=0 -> gate returns early: true`.
+  Root cause of it shipping: my round-1 mutation probe for the Reveal branch
+  injected `var _ = "x.Reveal()"` — a STRING LITERAL. That matched the old
+  line-grep, but a string literal is not a CallExpr, so the probe was never
+  valid against the AST implementation, and I never re-ran it after the
+  rewrite. I proved the NEW detection fired and never re-proved the OLD one.
+  Fix: extracted the scan into a pure function (scanSecretUnwraps) returning
+  findings, with the two detections INDEPENDENT — Reveal is matched before any
+  argument-count gate, and neither shares a precondition with the other.
+  Added TestSecretUnwrapScannerDetectsBothForms, a meta-test that feeds the
+  scanner synthetic sources and asserts it REPORTS each shape it claims: the
+  Reveal accessor, string/[]byte/[]rune/[]uint8 conversions, a conversion
+  nested in a call argument, through a pointer deref, and of an indexed
+  collection field — plus a negative control that a plain %s render of a
+  Secret is NOT flagged.
+  MINOR 1 — widened the harvest. `APIKeys []Secret` (types_system.go:377) is
+  REAL, not hypothetical, and the old `field.Type == Ident("Secret")` match
+  missed it, so `string(...APIKeys[i])` went undetected. typeMentionsSecret now
+  walks slice/array/pointer/map/qualified shapes and recurses into nested
+  anonymous structs; harvest went 12 -> 13 names, gaining APIKeys. Confirmed
+  the real WireGuard names ARE covered (PresharedKeyHex, WgLocalPrivkeyHex).
+  Rewrote the scope block to state the residuals COMPLETELY — aliased locals,
+  parameters, helper returns, out-of-package fields, type aliases, and
+  non-conversion unwrapping (append/index/range/reflection) — and to record
+  that name-based matching false-positives on unrelated fields named
+  Password/PSK and on shadowed string/byte identifiers, which is the correct
+  bias on a network-exposed surface.
+  MINOR 2 — corrected three false doc claims: architecture.md no longer says
+  the surface is safe "because no Reveal() call exists" (both escape hatches
+  now named, with the residuals and the meta-test); the test file header no
+  longer names the old test or the Reveal-only rationale; system-login.md no
+  longer groups `show snmp v3` with the masked community path (the snmp-v3
+  topic renders no community and no placeholder) and now states that remote
+  `cli show system services` uses the `system-services` topic, whose renderer
+  omits SNMP entirely (verified: zero SNMP references in
+  pkg/grpcapi/server_show_system.go).
+  Validation: the meta-test was proven to CATCH this exact MAJOR — in a
+  throwaway detached worktree, reintroducing `len(call.Args) != 1` ahead of
+  the Reveal check makes TestSecretUnwrapScannerDetectsBothForms/Reveal_accessor
+  go RED with build+vet CLEAN, while TestGRPCAPINeverUnwrapsSecretCleartext
+  stays GREEN — demonstrating the real guard structurally cannot detect its own
+  breakage and the meta-test is load-bearing. Probe worktree removed; the PR
+  worktree was never used for a probe. gofmt clean, go build ./... and
+  go vet ./... clean, pkg/grpcapi + pkg/api + pkg/config + pkg/cli green.
+- **File(s)**: pkg/grpcapi/server_fabric_secret_render_6532_test.go,
+    docs/{architecture.md,system-login.md}, _Log.md
+
 ## 2026-07-31 — #6532 review fold: three MINORs, all about artifacts overstating coverage
 
 - **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact, PR #6602)

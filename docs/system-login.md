@@ -554,9 +554,22 @@ exactly how the gRPC surface stayed in the clear through two hardening passes.
 > (#6532).** The #4111 super-user cleartext allowance above survives only on
 > the **in-process console CLI** (`pkg/cli`, which knows the login class). The
 > remote `cli` binary — the primary operator interface — dispatches `show snmp`
-> and `show snmp v3` straight to the gRPC RPC (`cmd/cli/show.go`,
-> `c.showText("snmp")`), and `cmd/cli` has no login-class awareness at all, so
-> there is no class to exempt: it renders `##SECRET-DATA##` for everyone.
+> straight to the gRPC RPC (`cmd/cli/show.go`, `c.showText("snmp")`), and
+> `cmd/cli` has no login-class awareness at all, so there is no class to
+> exempt: it renders `##SECRET-DATA##` for every caller.
+>
+> Scope, precisely — the two sibling commands do **not** behave this way,
+> because neither renders a community at all:
+>
+> - `cli show snmp v3` uses the `snmp-v3` topic, which prints only the USM
+>   user table (user, auth protocol, privacy protocol). No community, so no
+>   placeholder. The USM auth/privacy PASSWORDS were never rendered by it —
+>   they are `config.Secret`-typed and masked by the newtype (#2053).
+> - `cli show system services` uses the `system-services` topic, whose
+>   renderer omits SNMP entirely (it lists the gRPC/REST endpoints). The
+>   community masking described for #4111's `show system services` therefore
+>   applies to the **console** CLI only; the remote command never showed a
+>   community in the first place.
 >
 > This is a deliberate posture change, not an oversight. Threading a login
 > class into `pkg/grpcapi` is not possible today (the package has no class
