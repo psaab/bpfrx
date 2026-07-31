@@ -1,7 +1,10 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.5.1 — THE TERMINAL CUT, round-89 (SMR YES) +
-master-drift fold (doc-only; no design rule changed). Ship
+**Status: DRAFT v10.6.0 — THE TERMINAL CUT, round-89 folds (RWoLB/
+ReplacedSyncedLocal constructor suppression incl. SYN-bearing closes;
+materialize preserves an identity-agreeing probation entry; probation
+deadline fenced from HA/GC retention; §3.1 table corrections;
+editorials). Ship
 candidate = the Part-A dataplane demote gate plus the wire-free local HA
 rules. The RG-incarnation/retirement/fence-ledger protocol that rounds
 13–82 grew is KILLED (not deferred): its two customers are re-scoped —
@@ -24,7 +27,7 @@ zombies; the in-borrow refresh/recompute/wheel now skips probation
 entries and the clear+refresh rides the matched entry's commit hook;
 folded v10.5.0). Round-89: SMR YES (the arc's first). v10.5.1:
 master-drift fold, doc-only — origin/master advanced from the citation
-base `023f17a606d8` to `fff7a4ab5` (+25 commits); #6478 REMOVED the
+base `023f17a606d8` to `fff7a4ab5` (+19 commits); #6478 REMOVED the
 cluster-peer return fast path (site 6 and the #4453 guard are gone —
 the site-6 residual is closed by deletion, not by this plan); #6432
 wrapped the MissingNeighbor arm in the StageOutcome ownership enum;
@@ -32,7 +35,15 @@ wrapped the MissingNeighbor arm in the StageOutcome ownership enum;
 numbers. Every inline `file:line` citation below cites the worktree
 branch base `023f17a606d8` (where each was re-verified this round); the
 master-side deltas are tabulated in §3.1 for `/engineer`. No design
-rule changed.**
+rule changed.** Round-89: SMR YES (the arc's first); Codex NO (3B/2L —
+B1: a SYN-bearing close under `ResolvedWithoutLocalBacking`/
+`ReplacedSyncedLocal` provenance passes #4400 and would seed closing on
+a REAL victim tuple + emit Open; B2: reactive re-materialization
+bypasses the probation fold pre-admission; B3: the probation deadline
+was not fenced from expire.rs SelfHeal/Hold/companion retention or
+`refresh_for_ha_transition`; L: §3.1 table corrections + two editorial
+stragglers — all folded v10.6.0); AGY r89 pending at fold time
+(infra: quota-saturated retries documented in reviewer-ids.md).
 
 The 82-round arc in one paragraph: the packet-level plausibility gate has
 been stable since v6 — refuse-demote on no trusted baseline, per-field
@@ -70,8 +81,8 @@ Part B is a small set of local rules (§5.5–§5.6, §5.8): closing packets
 never promote (either promote), constructor gating with a bounded
 probation and a local-only probation reap, normative mark-creation with
 master's emission gate UNCHANGED, the MissingNeighbor typed-outcome
-gate, the seed-lifecycle completion, and the 2b scope/identity
-discipline.
+gate, and the 2b scope/identity discipline (the seed-lifecycle
+completion was retreated to a §10.6.2 follow-up at v10.4.0).
 
 Research branch: `research/6461-blind-rst`. Plan-only deliverable; no
 production code is changed by this branch. Implementation begins only after
@@ -343,8 +354,8 @@ exhaustive inventory, re-verified against this branch's master base:
 | 1 | `session/lookup.rs:105-128` HIT path (real endpoint FIN/RST) | wire packet flags | gate via pre-packet anchor validation, marking moved to post-borrow phase (§5.5); closing packets never promote (§5.5) |
 | 2 | `session/mod.rs:1396-1432` `update_session` via `promote_synced_with_origin` (HA shared-promote, `session_glue/promote.rs:86-107`) | wire packet flags on the promoting packet | closing packets never reach this path (rule 5 — the ownership promote is skipped wholesale); a non-closing promote threads the seg view for anchor purposes |
 | 2b | **reverse-NAT companion synthesizer** — `session_glue/mod.rs:1262-1284` → `shared_ops.rs:857-865` → `install_with_protocol_with_origin` (seeds at `install.rs:179-180`) | wire packet flags on a reverse-tuple miss with a live forward match; runs at resolve time, BEFORE the #4400 guard | gate the seed with the validator against the in-hand forward entry's anchor; refused close → **skip the install entirely** (§5.6); a SHARED `ForwardSessionMatch` carries no anchor (`entry.rs:209`) → no-baseline → refuse → skip-install |
-| 2c | **reactive shared materialize** — `materialize_shared_session_hit` (`session_glue/mod.rs:1092-1118`) threads the current packet's `tcp_flags` into `upsert_synced_with_origin` (seeds at `install.rs:399-400`) | wire packet flags on a shared-map hit | gate the flag seed with the validator; an imported entry has no anchor → no-baseline → refuse → install the copy **alive** (`closing=false, reset=false`) at the bounded probation timeout (§5.6) |
-| 3 | `install.rs:179-180` primary miss installs | creating packet flags | unreachable for bare closes on TRANSIT dispositions (#4400) and LocalDelivery caches TCP only with SYN (`local_delivery.rs:20`). The actual residual: a SYN|RST/SYN|FIN new-flow packet passes the #4400 guard (it has SYN, `session_admission.rs:53`) and seeds closing/reset from raw flags — a self-anchoring invented-tuple entry (attacker kills only a flow it created — no victim impact, master parity); malformed SYN+close combos are screen-owned where screened |
+| 2c | **reactive shared materialize** — `materialize_shared_session_hit` (`session_glue/mod.rs:1092-1118`) threads the current packet's `tcp_flags` into `upsert_synced_with_origin` (seeds at `install.rs:399-400`) | wire packet flags on a shared-map hit | gate the flag seed with the validator; an imported entry has no anchor → no-baseline → refuse → install the copy **alive** (`closing=false, reset=false`) at the bounded probation timeout (§5.6); re-materialization against an identity-agreeing existing probation entry preserves that entry's immutable deadline/state — the upsert is skipped (§5.6, v10.6.0) |
+| 3 | `install.rs:179-180` primary miss installs | creating packet flags | unreachable for bare closes on TRANSIT dispositions (#4400) and LocalDelivery caches TCP only with SYN (`local_delivery.rs:20`). The actual residual: a SYN|RST/SYN|FIN new-flow packet passes the #4400 guard (it has SYN, `session_admission.rs:53`) and seeds closing/reset from raw flags — a self-anchoring invented-tuple entry (attacker kills only a flow it created — no victim impact, master parity); malformed SYN+close combos are screen-owned where screened. **Provenance bound (v10.6.0, round-89 Codex 1):** the invented-tuple harmlessness holds ONLY when the tuple is genuinely new in this dispatch; when the install runs under peer-synced provenance (`ResolvedWithoutLocalBacking` re-entry or `ReplacedSyncedLocal` displacement) the tuple is a REAL victim's and the constructor suppresses the closing seed for SYN-bearing closes too and emits no Open (§5.6 site-3 supplement) |
 | 4 | HA wire re-import — eventstream `UpsertSynced` → `upsert_synced_with_origin` (no packet exists) | peer delta | validation-free by design (the peer validated before reaping and emitting the Close); distinct from site 2c, which HAS a packet |
 | 5 | tunnel `UpsertLocal` (`tunnel.rs:563-615` → `session_glue/mod.rs:786-800`) | locally generated packets (firewall-originated tunnel TX) | trusted-local class, documented; not wire-attacker-controllable. Inbound tunnel closes land on site 1 with whatever anchor the inbound stream built — none if the flow is outbound-only → refuse-demote; local blast radius |
 | 6 | fabric-return reverse seed (`cluster_peer_return_fast_path` install) — **REMOVED on master by #6478; the row below is the branch-base analysis, retained for the record** | fabric-ingress packet flags | bare closes already excluded (#4453); SYN|ACK|RST/FIN combos pass the guards (`fabric.rs:404`) and seed raw flags — an unvalidated constructor, harmless-by-class (the seed is `is_reverse` → silent at reap; the non-owner's forward import validates closes at site 1 with no anchor in Phase 1 → refuse → no mark). The seed bypasses the commit hooks so it carries no anchor — a later close on it is REFUSED (missing-forward/no-baseline, §5.1); documented. On current master the site no longer exists: #6478 deleted the fast path and its seed install, so the residual is closed by deletion |
@@ -356,7 +367,7 @@ exhaustive inventory, re-verified against this branch's master base:
 
 ## 3.1 Master drift since the citation base (v10.5.1; verified `023f17a606d8` → `fff7a4ab5`)
 
-origin/master advanced 25 commits while this plan iterated. Re-verified
+origin/master advanced 19 commits while this plan iterated. Re-verified
 this round; **no design rule in §5–§9 changes**. Implementation
 (`/engineer 6461`) branches from the then-current master and applies
 these deltas:
@@ -366,9 +377,10 @@ these deltas:
 | **#6478** (`7b7119db1` + docs `fff7a4ab5`) removed `cluster_peer_return_fast_path`, its reverse-seed install, and the #4453 bare-close guard (`fabric.rs:389-492`, the call at `poll_descriptor/mod.rs:928`) | Site 6 no longer exists — its residual is closed by deletion. §3's fast-path bullet, the #4453 bullet, site row 6, and the §5/§5.6/§7 fabric-seed mentions are branch-base record. Fabric-ingress return traffic now takes the ordinary session pipeline, so it runs `account_packet` and the site-1 lookup gate like any other packet — strictly *more* covered than the branch-base analysis assumed |
 | **#6432** wrapped the MissingNeighbor arm in the `poll_stages::StageOutcome` ownership enum (arm head now `poll_descriptor/mod.rs:4015`; seed install `:4792`/`:4816`) | Site 9's "branch on the resolve outcome AT THE ARM HEAD" composes: the typed resolve-outcome branch becomes the arm's first StageOutcome-producing stage. No rule change |
 | **#6433** extracted the flow-cache seed path | Editorial; the §5.6 constructor sites are unchanged |
-| **#6458** added the fabric zone-stamp owner-RG gate (`gate_fabric_zone_override_on_owner_rg`, `fabric.rs:~331-342`) | §5.4's "no transport-based authority" bullet stands verbatim — the stamp proves even less post-#6458 |
+| **#6458** added the fabric zone-stamp owner-RG gate (`gate_fabric_zone_override_on_owner_rg`, master `fabric.rs:289-307`; the worktree's `fabric.rs:331` is `redirect_via_fabric_if_needed`, a different function) | §5.4's "no transport-based authority" bullet stands verbatim — the stamp proves even less post-#6458 |
 | **#6474** re-NATs outbound ICMP errors through SNAT | Orthogonal (ICMP error path, not TCP closing); shifted `poll_descriptor/mod.rs` line numbers |
-| Line drift (verified) | `account_packet` call sites: `flow_cache_hit.rs:312-317`→`:318`, `poll_descriptor/mod.rs:3494-3503`→`:3556`; strict-syn guard `:1634-1644`→`:1646`; input filter `:592`→`:612`; TTL check `:846`→`:866`; `materialize_shared_session_hit` `session_glue/mod.rs:1092-1118`→`:1122`; transient purge `:1178-1193`→`:1208-1211`; `touch_if_stale` call `flow_cache_hit.rs:295`→`:307`; `build_reject_rst_frame` `frame/tcp.rs:328-385`→`:347+`; `parse_session_flow_from_bytes` `frame/inspect.rs:1455-1470`→`:1424+`; `is_cacheable` `types/forwarding.rs:948-952`→`:959`; tunnel `UpsertLocal` push `tunnel.rs:563-615`→`:760-767`; LocalDelivery SYN gate `local_delivery.rs:20`→`:39-44`; `live_by_flow` `nat/source.rs:1548`→`nat/allocator.rs:481` (field moved files) |
+| **#6473** flipped inbound NAT to static-first (static NAT now evaluated before DNAT rules) | Non-fatal for this plan: the site-9 `ResolvedWithoutLocalBacking` re-entry derives DNAT/routing/zone/policy/SNAT fresh from the packet against current config through the full pipeline, so the reorder is composed automatically (round-89 Codex 4 confirmed) |
+| Line drift (verified) | `account_packet` call sites: `flow_cache_hit.rs:312-317`→`:318`, `poll_descriptor/mod.rs:3494-3503`→`:3556`; strict-syn guard `:1634-1644`→`:1646`; input filter `:592`→`:612`; TTL check `:846`→`:866`; `materialize_shared_session_hit` `session_glue/mod.rs:1092-1118`→`:1122`; transient purge `:1178-1193`→`:1208-1211`; `touch_if_stale` call `flow_cache_hit.rs:295`→`:307`; `build_reject_rst_frame` `frame/tcp.rs:328-385`→`:347+`; `parse_session_flow_from_bytes` `frame/inspect.rs:1455-1470`→`:1424+`; `is_cacheable` `types/forwarding.rs:948-952`→`:959`; tunnel `UpsertLocal` push `tunnel.rs:739/:741`→`:765-767`; LocalDelivery SYN gate `local_delivery.rs:20`→`:39-44`; `live_by_flow` correction: the field sits at `nat/allocator.rs:481` in BOTH revisions (no move) — the plan's `nat/source.rs:1548` cite is the `allocate_translation` CALL site, which is the unowned-allocation leak site itself and stands as cited |
 | Unchanged on master (re-verified exact) | The issue site itself — `lookup.rs:105-128` (`do_close`/`closing`/`reset`) and `:151-156`; `session/mod.rs:1232` `propagate_tcp_state_to_companion`, `:1118` `touch_if_stale`, `:1299`+`1396-1432` `update_session` head + sticky-RST body; `expire.rs:342-350` Close-delta gate; `entry.rs:209` `ForwardSessionMatch`; `install.rs:113`/`:139`/`:179-180`/`:295`/`:399-400`; `shared_ops.rs:614`/`:857`; `lookup.rs:258` `find_forward_wire_match_with_origin`; `session_admission.rs:53`; `schema_security.go:798`; `compiler_security_flow.go:527-528` |
 
 ---
@@ -1165,7 +1177,26 @@ obsolete non-NAT permit indefinitely with periodic blind closes — each
 materialize re-installs and each zombie lives 300 s; probation bounds the
 zombie to ≤20 s and the sustain cost to 1 packet/20 s — the same pinning
 cost an attacker already pays on master to keep any entry alive with
-ordinary traffic, so no new pin primitive). The probation entry carries
+ordinary traffic, so no new pin primitive). **Re-materialization
+preserves probation (v10.6.0, round-89 Codex 2):** master's
+materialize is unconditional — the shared canonical deliberately wins
+over a surviving fabric placeholder (`shared_ops.rs:594`; coexistence
+pinned by `session_glue/tests.rs:704`), the upsert `remove_entry`s the
+existing local row and restamps `last_seen_ns`/timeout/wheel
+(`install.rs:295`, `:345-400`, `:427-433`), and it runs BEFORE the
+input filter/TTL/output admission — so without a guard, each packet
+that reaches a materialize after a refused close created probation K
+would replace K (restarting its clock or substituting a full-timeout
+row) and repetition would pin the uncapped synced-upsert slot. The
+rule: `materialize_shared_session_hit` first probes for an existing
+local entry under the same canonical key AND the same NAT decision
+(the site-2b identity-agreement discipline); if that entry is a
+probation entry, the upsert is SKIPPED — the packet is forwarded with
+the materialized decision as today, K's immutable deadline, probation
+flag, and flags are preserved, and only K's own successful
+final-admission commit hook (a committed non-close packet) clears
+probation and applies the ordinary refresh. A non-probation existing
+entry takes today's upsert unchanged. The probation entry carries
 an explicit `probation: bool` that (a) suppresses ownership promotion,
 Open emission, and replication (§5.5), and (b) clears on the first
 COMMITTED non-close packet, which also refreshes the entry to its
@@ -1182,7 +1213,23 @@ carries the probation flag, and a probation expiry removes ONLY the
 worker's local table entry — NO Close delta (as before), NO
 `release_source_nat_allocation`/`release_nat64_allocation`
 (`worker/loop_body/mod.rs:1491-1504`), and NO BPF session-map family-key
-delete (`bpf_map/mod.rs:633, :704`). Those keys and the NAT reservation
+delete (`bpf_map/mod.rs:633, :704`). **The probation deadline is fenced
+from HA/GC retention (v10.6.0, round-89 Codex 3):** master's expiry
+evaluates the standby retention gate BEFORE removal (`expire.rs:168`),
+and a `SharedMaterialize` entry is peer-synced (`entry.rs:245`), so
+without a fence a probation entry at its deadline could SelfHeal-restamp
+(`expire.rs:213-237`), Hold-rebucket (`expire.rs:239-273` — ceiling 3×
+the entry timeout, `session/mod.rs:103-121`), or ride companion
+freshness (`expire.rs:296-320`, `:490-523`) — each a `continue`
+upstream of the `ExpiredSession` probation flag, silently breaking the
+≤20 s promise. The rule: at expiry evaluation a probation entry whose
+immutable deadline has passed BYPASSES SelfHeal, Hold, and
+companion-freshness retention and proceeds straight to the local-only
+removal above; `refresh_for_ha_transition` (`session/mod.rs:1594` —
+owner-RG refresh and demotion both call it) PRESERVES a probation
+entry's deadline (no `last_seen_ns` restamp, no timeout recompute; any
+wheel re-queue uses the unexpired probation deadline). HA transitions
+neither extend nor shorten probation. Those keys and the NAT reservation
 are process-global and serve the LIVE family's owner entry (the zombie
 is a non-owner copy of it); the unconditional master cleanup path is the
 #6522 class, and the probation constructor must not multiply its trigger
@@ -1230,8 +1277,37 @@ provenance is `(origin, FreshPrimary)` — the `LocalMiss` installer can
 displace a peer-synced LocalDelivery entry (`local_delivery.rs:75-113` +
 `take_synced_local`, `lookup.rs:407-418`); a `ReplacedSyncedLocal` install
 adopts untrusted only, so a driving SYN can never reclassify a synced
-victim as a fresh self-authenticating flow. The installer returns the
-displacement outcome; a mandatory unit test covers the replacement branch.
+victim as a fresh self-authenticating flow. **Constructor closing-seed
+suppression under peer-synced provenance (v10.6.0, round-89 Codex 1):**
+the site-3 invented-tuple harmlessness holds ONLY when the tuple is
+genuinely new in this dispatch. Two constructor contexts carry
+peer-synced provenance for the SAME tuple — the
+`ResolvedWithoutLocalBacking` full-pipeline re-entry (the resolve
+matched a real peer-synced translated victim, classified at
+`promote.rs:48`, backing purged at `promote.rs:167-207`) and the
+`ReplacedSyncedLocal` displacement above — and in both, a closing-flagged
+packet that survives #4400 ONLY because it also carries SYN
+(`strict_syn_check_drops_new_flow` rejects closes without SYN,
+`session_admission.rs:83`) would otherwise reach the raw
+`ForwardFlow`/LocalDelivery install, seed `closing`/`reset` from the
+packet (`install.rs:179-180`), and emit Open (`install.rs:234-260`) —
+the fresh entry's 2 s reap then emits Close (`expire.rs:342-377`, the
+fresh origin passes the emission gate) and the peer's helper delete
+executes unconditionally (`delete_synced.rs:16-17`), killing the
+victim's authoritative entry and companions on the peer. The rule: in
+RWoLB-re-entry and `ReplacedSyncedLocal` provenance the constructor
+(a) suppresses the `closing`/`reset` seed for EVERY closing-flagged
+packet including SYN-bearing combinations (the entry installs ALIVE at
+the bounded probation timeout, `probation=true`, anchor untrusted —
+site-2c discipline), and (b) emits NO Open delta (the peer still holds
+the authoritative family; a raw-flags Open upsert would anchor-wipe it).
+The packet itself is forwarded/delivered exactly as the re-entered
+pipeline dictates (never-drop is preserved — only the state seed and
+the replication are suppressed). A genuinely-new tuple (no peer-synced
+provenance this dispatch) keeps master's raw-flags seed exactly —
+site-3 master parity stands for invented tuples. The installer returns
+the displacement outcome; a mandatory unit test covers the replacement
+branch.
 
 The fabric-return seed (site 6) is already close-free (#4453) at the
 branch base and **deleted outright on master by #6478** (§3.1); primary
@@ -1249,7 +1325,9 @@ and would let refused packets extend an already-running 2s/30s closing
 window forever. Not refreshing does not accelerate natural expiry — the
 entry ages exactly as if the refused packet had never arrived. Ordinary
 data/ACK packets continue to refresh normally through the unchanged
-non-close path.
+non-close path — with the §5.6 probation exception: a probation entry is
+refreshed ONLY by a committed non-close packet at its commit hook (and a
+pre-admission materialize against it is skipped wholesale, §5.6).
 
 ### 5.8 Signature/signature-shape changes (all crate-internal)
 
@@ -1270,13 +1348,26 @@ non-close path.
   seg view — a discarded packet never reaches them, so it never moves
   the anchor.
 - `lookup_with_origin` — close-path restructure per §5.5 (in-borrow
-  capture, post-borrow validate+mark); non-close path byte-identical.
+  capture, post-borrow validate+mark); non-close path byte-identical
+  for NON-PROBATION entries (probation entries take the §5.6
+  deferred-refresh path).
 - `install_reverse_session_from_forward_match` (site 2b) and
   `materialize_shared_session_hit` (site 2c) thread the `TcpSegView` to
   the constructor gate; `install_with_protocol_with_origin` /
   `upsert_synced_with_origin` gain a seed-suppression input (validated
   vs refused) replacing today's raw `tcp_flags` seed at
-  `install.rs:179-180/399-400` for the gated paths.
+  `install.rs:179-180/399-400` for the gated paths. The site-2c
+  materialize additionally probes for an identity-agreeing existing
+  probation entry first and SKIPS the upsert when one is found
+  (v10.6.0, round-89 Codex 2 — §5.6).
+- The RWoLB-re-entry and `ReplacedSyncedLocal` constructors gain the
+  peer-synced-provenance closing-seed suppression + no-Open rule
+  (v10.6.0, round-89 Codex 1 — §5.6 site-3 supplement): the
+  suppression input covers SYN-bearing closes, which #4400 does not
+  reject.
+- Expiry/HA: the probation deadline fence (v10.6.0, round-89 Codex 3 —
+  §5.6) touches `expire.rs`'s retention gate (probation bypass) and
+  `refresh_for_ha_transition` (deadline preserved).
 - `retry_pending_neigh` is **UNCHANGED** (master's buffered-decision
   transmit; the v10.1 re-resolve/hold design is retracted, §5.2). A
   buffered packet never runs the anchor hook, the promote, or the
@@ -1297,7 +1388,10 @@ non-close path.
   derive fresh from the packet against current config; the
   miss-derived decision is the SOLE decision object for install,
   publication, buffering, replay, and reinjection; the purged stored
-  decision is used for nothing but provenance),
+  decision is used for nothing but provenance — and that provenance
+  arms the §5.6 site-3 constructor suppression at the re-entry install:
+  closing seeds suppressed for EVERY closing-flagged packet incl.
+  SYN-bearing closes, and no Open emitted, v10.6.0 round-89 Codex 1),
   `SeedInstalled` (genuine miss: today's full seed transaction),
   `SeedRefused` (miss refused: today's drop). Mechanically the resolve
   layer returns the provenance alongside the decision (including the
@@ -1439,6 +1533,14 @@ untouched.
   cleanup event for the family (master's unrefcounted sibling cleanup
   calls are the pre-existing #6522 class, §10.6.1) — and the probation
   constructor must not multiply its trigger rate.
+- **Probation deadline integrity (v10.6.0, round-89 Codex 2/3):** a
+  probation entry's immutable deadline is preserved end-to-end — the
+  in-borrow lookup and `touch_if_stale` skip the refresh (v10.5.0), a
+  pre-admission re-materialize against an identity-agreeing probation
+  entry skips the upsert, the expire-time standby retention gate
+  (SelfHeal/Hold/companion-freshness) is bypassed at the deadline, and
+  `refresh_for_ha_transition` never restamps it. No packet, materialize,
+  retention path, or HA transition can extend or reset the ≤20 s clock.
 - **Hot-path discipline:** zero new allocations; zero new atomics; the
   per-TCP-data-packet cost at the commit-arm anchor hook (a DISTINCT
   final-admission apply point from the pre-admission #2501 accounting
@@ -1634,6 +1736,24 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   reply re-synthesizes and revalidates); site 2c refuse → install ALIVE
   at the probation timeout with `closing=false, reset=false`; site 2c
   with a non-close attacker packet → untrusted samples only.
+- **Materialize preservation + retention fence (v10.6.0, round-89 Codex
+  2/3):** (a) with a probation entry K installed (refused-close
+  materialize), a second packet that reaches
+  `materialize_shared_session_hit` for the same canonical key AND NAT
+  decision BEFORE any admission (placeholder/shared coexistence per
+  `session_glue/tests.rs:704`) — the upsert is SKIPPED: K's immutable
+  deadline, probation flag, and flags are bit-identical, the packet is
+  still forwarded with the materialized decision; repetition across
+  3× the probation window never extends K (no pin via re-upsert); an
+  identity-DISAGREEING or non-probation existing entry takes master's
+  unconditional upsert; (b) a probation entry at its deadline with a
+  LIVE companion and an HA-active posture: the standby retention gate
+  does NOT SelfHeal-restamp, Hold-rebucket, or companion-retain it —
+  the local-only removal runs (assert no `continue` is taken at
+  `expire.rs:168`'s gate for probation entries); (c)
+  `refresh_for_ha_transition` (owner-RG refresh AND demotion) leaves a
+  probation entry's deadline unchanged (no `last_seen_ns` restamp, no
+  timeout recompute).
 - **Probation two-branch (both directions, all drop classes — v10.5.0,
   round-88 Codex 1):** (a) a blind non-close
   packet that is FILTERED (input), TTL-dropped, output-filter/CoS-
@@ -1675,7 +1795,9 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   packet buffers with the resolver's stored decision; (b)
   `ExistingResolved` on an ACCEPTED marked close: the marked entry is
   never replaced, the sole producer survives to its 2 s reap and emits
-  exactly one Close delta; (c) `ResolvedWithoutLocalBacking`
+  exactly one Close delta (or zero when the marked entry is a transient
+  `MissingNeighborSeed` — the `is_transient_local_seed` emission gate,
+  `expire.rs:342`, per the seed-class bullet below); (c) `ResolvedWithoutLocalBacking`
   (transient-purged backing, `session_glue/mod.rs:1178-1193`): a bare
   close DROPS at the #4400 guard (no install, no seed); a SYN/data
   packet re-enters the post-resolve miss-decision pipeline — DNAT port
@@ -1696,8 +1818,12 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   `P1` leaks `P2`); (d) a genuine top-level
   MISS with a bare
   close still drops at the #4400 guard before the arm (`SeedRefused`);
-  (e) a miss with SYN|close combo still seeds from raw flags
-  (`SeedInstalled`, site-3 residual, self-anchoring invented tuple);
+  (e) a miss with SYN|close combo on a genuinely-new tuple still seeds
+  from raw flags (`SeedInstalled`, site-3 residual, self-anchoring
+  invented tuple) — and the same SYN|close under RWoLB/
+  `ReplacedSyncedLocal` provenance installs ALIVE (no closing/reset
+  seed, probation timeout) with NO Open delta (v10.6.0, round-89
+  Codex 1 — the tuple is a real victim's, not invented);
   (f) a config-update pool-SNAT-matching live no-SNAT flow HIT with a
   cold next hop: `ExistingResolved` — allocator state bit-identical
   (round-84 Codex 1's pool-exhaustion trace).
@@ -1923,7 +2049,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.5.0)
+## 11. Open questions for the convergence round (v10.6.0)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
@@ -1967,7 +2093,15 @@ this branch only if the minimal fix proves insufficient.
    deferred refresh (round-88) — is any pre-commit refresh/requeue
    path left for a probation entry (lookup, `touch_if_stale`, promote,
    materialize refresh), and does the commit-hook clear+refresh cover
-   every admission arm?
+   every admission arm? (e) the v10.6.0 round-89 folds: does the
+   materialize preservation probe (identity-agreeing existing
+   probation entry → skip upsert) close the pre-admission re-upsert
+   pin; does the retention fence (probation bypasses SelfHeal/Hold/
+   companion-freshness at its deadline; `refresh_for_ha_transition`
+   preserves it) close every retention-path extension; and does the
+   RWoLB/`ReplacedSyncedLocal` constructor suppression (closing seeds
+   refused incl. SYN-bearing closes; no Open) close the authoritative
+   HA kill without breaking a legitimate same-tuple re-seed?
 4. **The emission posture:** master's `expire.rs:342-350` gate is
    UNCHANGED; the additions are the normative mark-creation rules, rule
    5, the reverse-synth forward-family mark, the site-9 producer-

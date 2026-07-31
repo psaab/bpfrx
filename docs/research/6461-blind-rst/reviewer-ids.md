@@ -98,3 +98,15 @@ dispositions every open finding each round).
 | r81 | PLAN NO (6B/2H) — atomic domain, active-copy overwrite, RootRef scope, predecessor totality, floor ACK id, CONFIG_APPLIED_ACK; mint linearization | PLAN NO (2xUNSOUND: frame size bound + digest canonicalization; preflight lease ambiguity; backfill adoption ambiguity + 3 new traces) | v9.9.54.36 |
 | r81 SMR | — | — | claude-smr-plan-r82.md: PLAN NO for v9.9.54.36 — 7 nits, none LOW (third consecutive all-nit SMR round) |
 | r82 | (terminal-cut decision round — no fold) | (terminal-cut decision round — no fold) | **v10.0.0 — THE TERMINAL CUT**: plan restructured from 9,603 lines to the Part-A gate + wire-free Part-B rules; the RG-incarnation/retirement/fence protocol KILLED (§10.6); #6522 re-scoped to its own issue; Phase 2 remains split (phase2-brief.md). Rationale: 70 rounds (r13-r82) of non-convergence, ALL findings in the machinery layer, none in the gate (stable since v6, "substantially converged" per Codex r12) |
+
+## Rounds 83-89 (v10.x terminal-cut arc)
+
+| Round | Codex verdict | AGY verdict | SMR verdict | Plan version folded to |
+|---|---|---|---|---|
+| r83 | PLAN NO (3B/1M/2L) | PLAN YES | PLAN NO (1L/5nit) | v10.0.2/v10.1.x |
+| r84 | PLAN NO (4B/1H/1M) — pending-neighbor RETREAT | PLAN YES | PLAN NO (2nit) | v10.1.1/v10.2.0 |
+| r85 | PLAN NO (4B) | PLAN YES | PLAN NO (2nit) | v10.3.0 |
+| r86 | PLAN NO (5B/1H/1L) — seed-lifecycle RETREAT | PLAN YES | PLAN NO (2nit) | v10.4.0 |
+| r87 | PLAN NO (2B/1L + editorials) | PLAN YES | PLAN NO (2nit) | v10.4.1 |
+| r88 | PLAN NO (1B/1L + editorials) — probation pre-filter refresh pins zombies | PLAN YES (6th consecutive) | PLAN NO (3nit) | v10.5.0 |
+| r89 | PLAN NO (3B/2L) — RWoLB/ReplacedSyncedLocal SYN-close constructor gap; materialize re-upsert bypass; probation retention fence; §3.1 table corrections (thread 019fa3e0-cef9-7ef2-876f-3686dfc22ddf, job task-ms8s878t-chbkk4) | infra-blocked this session: MCP agy_rescue headless command-denial (attempt 1); safety refusal on adversarial framing (attempt 2) and on defensive framing (attempt 3); backend stall x2 (attempts 4-5); RESOURCE_EXHAUSTED 429 x2 (attempts 6-7) — retries continue next round per feedback_codex_infra_must_retry; AGY r83-r88 were 6 consecutive PLAN YES | PLAN YES (r89, v10.5.0 — the arc's first SMR YES) | v10.5.1 (master-drift fold) + v10.6.0 (Codex r89 folds) |
