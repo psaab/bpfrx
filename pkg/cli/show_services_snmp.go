@@ -30,14 +30,14 @@ func (c *CLI) showSNMP() error {
 		// #4111: mask the secret community name for any non-super-user login
 		// class (reuse the #4099/#4106 showConfigRedacted predicate). The
 		// authorization mode stays visible; only the community credential is
-		// masked. Super-user / unset class reads cleartext.
+		// masked. Super-user / unset class reads cleartext. #6532 routed the
+		// mask itself through the shared config.SNMPCommunityDisplayName
+		// helper; the per-class PREDICATE stays here, since only the CLI has a
+		// login class to gate on.
 		redactCommunity := c.showConfigRedacted()
 		for name, comm := range snmpCfg.Communities {
-			shown := name
-			if redactCommunity {
-				shown = config.SecretDataPlaceholder
-			}
-			fmt.Printf("  %s: %s\n", shown, comm.Authorization)
+			fmt.Printf("  %s: %s\n",
+				config.SNMPCommunityDisplayName(name, redactCommunity), comm.Authorization)
 		}
 	}
 

@@ -181,6 +181,26 @@ editing cmdtree.
   removing the ~1-window replay horizon (mTLS with per-node certs) and
   HMAC-authenticating the session-sync stream (#4107 F23) — remain deferred
   (see `pkg/cluster/README.md`).
+  - **No allowlisted RPC may render a configured secret (#6532).** Being on
+    this allowlist means being reachable from the peer chassis over the
+    fabric IP, so the usual "loopback only" mitigation does not apply to
+    anything listed above. `ShowText{Topic:"snmp"}` rendered the SNMPv1/v2c
+    community — the v1/v2c authenticator — in cleartext there long after the
+    REST (#5315) and CLI (#4111) siblings were hardened. The property is now
+    asserted across the surface as a whole by
+    `pkg/grpcapi/server_fabric_secret_render_6532_test.go`, which stages a
+    config carrying every secret leaf in the redaction SSOT
+    (`pkg/config/ast_redact.go` `secretIndices`), drives every allowlisted
+    RPC and scans the rendered responses. The method set is **enumerated**
+    from the live allowlist maps plus the method names the interceptor
+    source special-cases, so allowlisting a new RPC fails the completeness
+    gate until it is audited; the ShowText topic set is likewise derived
+    from the dispatcher source. Structurally the surface is safe because
+    every operator secret except the SNMP community is a `config.Secret`,
+    whose `String()` masks it under `%s`/`%v` (#2053) — the community is a
+    plain string because it is the `Communities` map key — and because
+    `pkg/grpcapi` never calls the `Reveal()` cleartext accessor that would
+    opt out of that (also asserted).
 - **HTTP REST** on `127.0.0.1:8080` — health, Prometheus `/metrics`,
   config endpoints, full gRPC parity.
   - **Listener lifecycle is all-or-nothing (#5058).** `Server.Run` may

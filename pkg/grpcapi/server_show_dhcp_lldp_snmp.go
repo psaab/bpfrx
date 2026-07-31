@@ -38,8 +38,32 @@ func (s *Server) showSNMP(cfg *config.Config, buf *strings.Builder) {
 	}
 	if len(snmpCfg.Communities) > 0 {
 		buf.WriteString("Communities:\n")
-		for name, comm := range snmpCfg.Communities {
-			fmt.Fprintf(buf, "  %s: %s\n", name, comm.Authorization)
+		// #6532: the SNMPv1/v2c community string IS the authenticator, and it
+		// is the Communities map KEY — a plain string that the Secret newtype's
+		// String() redaction does not cover (config.SNMPCommunity). Printing
+		// the raw key leaked the cleartext credential on an RPC that is NOT
+		// loopback-bound: ShowText is on the cluster-fabric allowlist (#4122),
+		// so this render is reachable from the peer chassis over the fabric.
+		// Both sibling surfaces were already hardened — pkg/cli `show snmp`
+		// (#4111) and the pkg/api show-text handler (#5315); this one was left
+		// in the clear.
+		//
+		// The mask is unconditional, matching pkg/api and the sibling gRPC
+		// ShowConfig raw-AST redaction (#4051): gRPC carries no login class to
+		// gate on, so unlike pkg/cli there is no privileged caller to exempt.
+		// The authorization mode stays visible; only the secret is masked.
+		// Iteration runs over the real (sorted) keys so the render stays
+		// deterministic once every displayed key is the same placeholder
+		// (mirrors #4712 on the REST sibling).
+		names := make([]string, 0, len(snmpCfg.Communities))
+		for name := range snmpCfg.Communities {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			comm := snmpCfg.Communities[name]
+			fmt.Fprintf(buf, "  %s: %s\n",
+				config.SNMPCommunityDisplayName(name, true), comm.Authorization)
 		}
 	}
 	if len(snmpCfg.TrapGroups) > 0 {

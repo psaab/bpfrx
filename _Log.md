@@ -1,3 +1,45 @@
+## 2026-07-31 — #6532: redact the SNMP community on the fabric-reachable gRPC ShowText
+
+- **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact)
+- **Action**: gRPC `ShowText{Topic:"snmp"}` rendered the SNMPv1/v2c community
+  string — which IS the authenticator for v1/v2c — in cleartext. The usual
+  loopback bound does not apply: `ShowText` is on the cluster-fabric allowlist
+  (#4122), so the render is reachable from the peer chassis over the fabric IP.
+  Both sibling surfaces had already been hardened (REST #5315, CLI #4111) and
+  this one was left behind. The community is the ONE operator secret the
+  `config.Secret` newtype does not protect — it stays a plain string because it
+  is the `Communities` map key — so every manual renderer must mask it by hand,
+  which is exactly how three independent copies of the rule let one drift.
+  Fixed by masking unconditionally on the gRPC path (gRPC carries no login
+  class to gate on, matching REST and the sibling `ShowConfig` #4051), and by
+  collapsing all four render sites onto one shared helper,
+  `config.SNMPCommunityDisplayName(name, redact)`. The CLI keeps its per-class
+  predicate (`showConfigRedacted()`), so #4111 behaviour is unchanged:
+  view-only masked, super-user cleartext.
+  Audited the whole fabric allowlist as the issue asked. Empirical sweep: one
+  config staging every secret leaf in the redaction SSOT, driven through all
+  ~115 ShowText topics and every allowlisted RPC — the SNMP community was the
+  only leak. Structural reason: every other secret is `config.Secret` (its
+  `String()` masks under %s/%v, #2053) and `pkg/grpcapi` never calls the
+  `Reveal()` cleartext accessor. Both facts are now asserted, along with a
+  completeness gate that enumerates the allowlist maps AND the method names the
+  interceptor source special-cases (so `SystemAction` is covered too), and a
+  ShowText topic-coverage gate derived from the dispatcher source.
+  Validation: RED-on-revert verified as an assertion failure (not a build
+  break) on the community mask; all four new gates mutation-tested individually
+  (drop the mask / drop a probe / drop a topic / inject a `Reveal()`), each RED,
+  all restore GREEN. A staging-is-real test asserts all 21 secret sentinels
+  actually reach the committed active config, so the "no secret appeared"
+  scans cannot pass vacuously. Full pkg/grpcapi, pkg/api, pkg/cli, pkg/config,
+  pkg/daemon, pkg/dataplane/userspace suites green (the event-stream socket
+  tests need TMPDIR=/tmp — sun_path 108). Heatmap regenerated
+  (types_system.go 1645 -> 1684).
+- **File(s)**: pkg/config/types_system.go, pkg/grpcapi/server_show_dhcp_lldp_snmp.go,
+    pkg/api/show_text.go, pkg/cli/{show_services_snmp.go,cli_show_system.go},
+    pkg/grpcapi/{server_show_snmp_community_redaction_6532_test.go,
+    server_fabric_secret_render_6532_test.go},
+    docs/{architecture.md,system-login.md,refactoring-audit-current.txt}, _Log.md
+
 ## 2026-07-26 — #6474: re-NAT outbound ICMP errors through source NAT
 
 - **Timestamp**: 2026-07-26 (fix/6474-snat-outbound-icmp-error, stacked on

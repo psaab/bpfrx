@@ -314,13 +314,13 @@ func (c *CLI) showSystemServices() error {
 		// The authorization mode (read-only/read-write) stays visible; only the
 		// secret community string is masked. Super-user / unset class reads
 		// cleartext (console operator parity with #4057/#4106).
+		// #6532: the mask itself now comes from the shared
+		// config.SNMPCommunityDisplayName helper (one implementation across
+		// CLI/REST/gRPC); the per-class predicate stays local to the CLI.
 		redactCommunity := c.showConfigRedacted()
 		for name, comm := range cfg.System.SNMP.Communities {
-			shown := name
-			if redactCommunity {
-				shown = config.SecretDataPlaceholder
-			}
-			fmt.Printf("    Community:    %s (%s)\n", shown, comm.Authorization)
+			fmt.Printf("    Community:    %s (%s)\n",
+				config.SNMPCommunityDisplayName(name, redactCommunity), comm.Authorization)
 		}
 	}
 
