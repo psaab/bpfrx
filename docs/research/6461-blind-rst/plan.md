@@ -1,6 +1,6 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.10.0 — THE TERMINAL CUT, round-93 folds (the RWoLB
+**Status: DRAFT v10.10.1 — THE TERMINAL CUT, round-93 folds (+ round-93 AGY editorial folds: two stale same-dispatch-install stragglers in §5.2/§9 re-scoped to the deferred install) (the RWoLB
 re-entry becomes INSTALL-FREE — master's post-purge packet stays in the
 HIT branch on the retained lookup and installs only on a later clean
 miss, so the same-dispatch install+Open would have collapsed the
@@ -107,7 +107,11 @@ bare-close-RWoLB oracle relabeled defense-in-depth (unreachable once
 closes never purge) and the producer invariant scoped to the prompt
 marked producer (the cross-worker SharedPromote second emitter is
 §5.6's documented caveat); L: #4400 citation fixes +
-the fabric-seed provenance row scoped branch-base-only).
+the fabric-seed provenance row scoped branch-base-only). AGY's
+round-93 review (fresh eyes on the fold) returned UNSOUND with exactly
+two editorial findings — the §5.2 (iv) and §9 RWoLB test bullets still
+described the same-dispatch install as live; both re-scoped to the
+deferred install in v10.10.1.
 
 The 82-round arc in one paragraph: the packet-level plausibility gate has
 been stable since v6 — refuse-demote on no trusted baseline, per-field
@@ -687,7 +691,8 @@ request-build stage:
   entry — §3 site 9) and the `ResolvedWithoutLocalBacking` cold/miss
   re-entry (below); both stay.
   (iv) **`ResolvedWithoutLocalBacking` RE-ENTERS the cold/miss pipeline
-  from the packet (v10.4.1, round-86 Codex 1 + round-87 Codex 1/2):**
+  from the packet (v10.4.1, round-86 Codex 1 + round-87 Codex 1/2;
+  install-free correction v10.10.0, round-93 Codex 1):**
   the purged class is treated as a genuine miss END-TO-END in the
   strongest sense: the packet goes through the POST-RESOLVE
   miss-decision pipeline exactly as if the resolve had returned `None`
@@ -697,8 +702,15 @@ request-build stage:
   lookup side effect double-fires) — pre-routing DNAT,
   routing, zone, policy, and SNAT all derive FRESH from the packet
   against CURRENT config, and the resulting miss-derived decision is
-  the SOLE decision object for install, publication, buffering, replay,
-  and reinjection. The purged flow's stored decision is used for
+  the SOLE decision object for THIS packet's forwarding, buffering,
+  replay, and reinjection — with install and publication DEFERRED to
+  the next packet's genuine clean-miss dispatch (v10.10.0: the
+  re-entry itself installs/publishes/caches NOTHING — master keeps the
+  purged packet in the HIT branch on the retained lookup,
+  `session_glue/mod.rs:1194-1196`, and installs only on a later packet,
+  so a same-dispatch install+Open would collapse the pre-existing
+  #6599 class from two packets to one). The purged flow's stored
+  decision is used for
   NOTHING except the provenance answer ("this packet once belonged to
   a synced flow"). Two v10.4.0 defects die by construction: (a) the
   released `P1` can no longer split the transaction — v10.4.0's
@@ -2173,9 +2185,12 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   a raw-NAT equality mistake that would skip a valid translated
   companion fails these tests.
 - **`ResolvedWithoutLocalBacking` cold/miss re-entry (round-86 Codex 1
-  + round-87 Codex 1/2):** the purged class re-enters the post-resolve
+  + round-87 Codex 1/2; install-free correction v10.10.0, round-93
+  Codex 1):** the purged class re-enters the post-resolve
   miss-decision pipeline from the packet: `P2 != P1` case — the
-  seed/aliases install with the OWNED `P2` and later cleanup releases
+  re-entered packet itself installs/publishes NOTHING (install-free,
+  v10.10.0); the NEXT packet's genuine clean-miss dispatch installs the
+  seed/aliases with the OWNED `P2` and later cleanup releases
   `P2` (no collision with `P1`'s new owner, no leak);
   current-rule-no-longer-matches case — no translation; DNAT
   same-address port remap (`K.dst:443 → same-IP:8443`,
