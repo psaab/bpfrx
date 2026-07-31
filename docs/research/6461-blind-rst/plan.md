@@ -1,7 +1,7 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.5.0 — THE TERMINAL CUT, round-88 folds (probation
-lookup defers refresh to the commit hook; editorials). Ship
+**Status: DRAFT v10.5.1 — THE TERMINAL CUT, round-89 (SMR YES) +
+master-drift fold (doc-only; no design rule changed). Ship
 candidate = the Part-A dataplane demote gate plus the wire-free local HA
 rules. The RG-incarnation/retirement/fence-ledger protocol that rounds
 13–82 grew is KILLED (not deferred): its two customers are re-scoped —
@@ -22,7 +22,17 @@ v10.4.1). Round-88: AGY YES (6th consecutive); Codex NO (1B/1L +
 editorials — the probation lookup's pre-filter refresh would pin
 zombies; the in-borrow refresh/recompute/wheel now skips probation
 entries and the clear+refresh rides the matched entry's commit hook;
-folded v10.5.0).**
+folded v10.5.0). Round-89: SMR YES (the arc's first). v10.5.1:
+master-drift fold, doc-only — origin/master advanced from the citation
+base `023f17a606d8` to `fff7a4ab5` (+25 commits); #6478 REMOVED the
+cluster-peer return fast path (site 6 and the #4453 guard are gone —
+the site-6 residual is closed by deletion, not by this plan); #6432
+wrapped the MissingNeighbor arm in the StageOutcome ownership enum;
+#6433 extracted the flow-cache seed path; #6458/#6474 shifted line
+numbers. Every inline `file:line` citation below cites the worktree
+branch base `023f17a606d8` (where each was re-verified this round); the
+master-side deltas are tabulated in §3.1 for `/engineer`. No design
+rule changed.**
 
 The 82-round arc in one paragraph: the packet-level plausibility gate has
 been stable since v6 — refuse-demote on no trusted baseline, per-field
@@ -80,8 +90,10 @@ path:
   `do_close = is_tcp && is_closing(tcp_flags)` and, on a FIN/RST-bearing
   segment, sets `entry.closing = true` (sticky, #3489) and
   `entry.reset |= has_rst(...)` (sticky, #3046). `SessionEntry` carries no
-  sequence state at all. (Verified on this branch's master base
-  `fff7a4ab5`.)
+  sequence state at all. (All inline `file:line` citations in this plan
+  reference the worktree branch base `023f17a606d8`; re-verified there at
+  v10.5.1. origin/master has since advanced to `fff7a4ab5` — the deltas,
+  including one site removal, are tabulated in §3.1.)
 - `lookup.rs:151-156` — subsequent hits recompute `expires_after_ns` to
   `TCP_RST_TIMEOUT_NS` (2 s) or `TCP_CLOSING_TIMEOUT_NS` (30 s).
 - `userspace-dp/src/session/mod.rs:1232-1278`
@@ -283,7 +295,8 @@ in §1.*
   (`poll_descriptor/mod.rs:1634-1644`). Always-on, no knob — the precedent
   for always-on hardening on this boundary.
 - **#4453** — same predicate excludes bare RST/FIN from the fabric return
-  fast path (`forwarding/fabric.rs:426-431`).
+  fast path (`forwarding/fabric.rs:426-431`). **REMOVED on master by
+  #6478** together with the fast path itself (§3.1).
 - **#4539/#4487/#2151** — host-inbound LocalDelivery session caching only
   off the handshake; declined first packets still delivered locally.
 - **#2344** — `parse_session_flow_from_bytes` refuses non-first IP
@@ -310,7 +323,11 @@ in §1.*
   `account_packet` or a session lookup per packet. The affected entries are
   non-authoritative (reverse seeds / synced copies on the non-owner node);
   see §7's coverage residuals for why a later close there kills nothing
-  authoritative.
+  authoritative. **REMOVED on master by #6478** (merged `7b7119db1`): the
+  fast path, its reverse-seed install, and its #4453 guard are gone —
+  fabric-ingress return traffic now takes the ordinary session pipeline.
+  The site-6 residual below is therefore closed by deletion on current
+  master; the branch-base analysis is retained for the record (§3.1).
 - **#2008 M9 / #2078** — `no-sequence-check` parsed, unenforced.
   `rst-invalidate-session` parsed (schema + compiler, see §1).
   `rst-sequence-check` and `fin-invalidate-session` are NOT in the xpf
@@ -330,10 +347,29 @@ exhaustive inventory, re-verified against this branch's master base:
 | 3 | `install.rs:179-180` primary miss installs | creating packet flags | unreachable for bare closes on TRANSIT dispositions (#4400) and LocalDelivery caches TCP only with SYN (`local_delivery.rs:20`). The actual residual: a SYN|RST/SYN|FIN new-flow packet passes the #4400 guard (it has SYN, `session_admission.rs:53`) and seeds closing/reset from raw flags — a self-anchoring invented-tuple entry (attacker kills only a flow it created — no victim impact, master parity); malformed SYN+close combos are screen-owned where screened |
 | 4 | HA wire re-import — eventstream `UpsertSynced` → `upsert_synced_with_origin` (no packet exists) | peer delta | validation-free by design (the peer validated before reaping and emitting the Close); distinct from site 2c, which HAS a packet |
 | 5 | tunnel `UpsertLocal` (`tunnel.rs:563-615` → `session_glue/mod.rs:786-800`) | locally generated packets (firewall-originated tunnel TX) | trusted-local class, documented; not wire-attacker-controllable. Inbound tunnel closes land on site 1 with whatever anchor the inbound stream built — none if the flow is outbound-only → refuse-demote; local blast radius |
-| 6 | fabric-return reverse seed (`cluster_peer_return_fast_path` install) | fabric-ingress packet flags | bare closes already excluded (#4453); SYN|ACK|RST/FIN combos pass the guards (`fabric.rs:404`) and seed raw flags — an unvalidated constructor, harmless-by-class (the seed is `is_reverse` → silent at reap; the non-owner's forward import validates closes at site 1 with no anchor in Phase 1 → refuse → no mark). The seed bypasses the commit hooks so it carries no anchor — a later close on it is REFUSED (missing-forward/no-baseline, §5.1); documented |
+| 6 | fabric-return reverse seed (`cluster_peer_return_fast_path` install) — **REMOVED on master by #6478; the row below is the branch-base analysis, retained for the record** | fabric-ingress packet flags | bare closes already excluded (#4453); SYN|ACK|RST/FIN combos pass the guards (`fabric.rs:404`) and seed raw flags — an unvalidated constructor, harmless-by-class (the seed is `is_reverse` → silent at reap; the non-owner's forward import validates closes at site 1 with no anchor in Phase 1 → refuse → no mark). The seed bypasses the commit hooks so it carries no anchor — a later close on it is REFUSED (missing-forward/no-baseline, §5.1); documented. On current master the site no longer exists: #6478 deleted the fast path and its seed install, so the residual is closed by deletion |
 | 7 | CLI/control deletes, GC/reaper, screens/SYN-cookie | — | consumers / unaffected |
 | 8 | **forward-wire immutable match** — `find_forward_wire_match_with_origin` (`lookup.rs:258-293` via `shared_ops.rs:614-628`): NAT64 forward direction, hairpin, non-bijective NAT | wire packet on the forward-wire tuple | The match itself never marks (cloned decision/metadata — no `&mut`, today or after). But it is not demote-free: a promotable-origin forward-wire hit reaches `maybe_promote_synced_session` → `update_session`, which marks closing/reset from the packet's flags on master — gated by §5.5's rule 5 like every other promote (closing packets never promote → never reach `update_session`). The anchor for these flows advances from the reverse (mutable alias) direction only; pre-existing forward-direction accounting/refresh asymmetry (NAT64) is out of scope — filed as a follow-up candidate |
 | 9 | **MissingNeighbor disposition arm** — `poll_descriptor/mod.rs:4034-4798`: a packet (HIT or MISS) whose disposition is MissingNeighbor reaches the common arm, which runs seed-only NAT derivation/allocation (:4680, :4745), metadata/counters, and installs `MissingNeighborSeed(..., meta.tcp_flags)` at :4787 — `install_with_protocol_with_origin` `remove_entry`s any existing key (`install.rs:140`) and seeds `closing`/`reset`/timeout from the raw flags (`install.rs:179-180`) | any closing-flagged packet with a cold next hop; the #4400 guard at :1640 covers only the ForwardCandidate/MissingNeighbor MISS path | **gated by typed provenance (v10.4.1, rounds 83-87 Codex):** the arm branches on the resolve outcome AT THE ARM HEAD — before ANY seed-only work (NAT/NPT derivation or allocation, metadata, counters, install, rollback, publication): `ExistingResolved` (a live local or shared resolve-time entry backs the resolve — incl. a validator-REFUSED close, a 2b REFUSE, or an accepted marked close) buffers the packet with the RESOLVER's stored decision and does NOTHING else (allocator state, metadata, counters, install, publication all untouched — an unowned `live_by_flow` allocation can never leak, `nat/source.rs:1548`); `ResolvedWithoutLocalBacking` (the resolve returned `Some` but its backing was transient-purged, `session_glue/mod.rs:1178-1193` → `promote.rs:181` — `Some(resolved)` does NOT prove live backing) RE-ENTERS the cold/miss pipeline from the packet exactly as if the resolve had returned `None` (pre-routing DNAT, routing, zone, policy, SNAT all derive fresh from the packet against current config; the miss-derived decision is the SOLE decision object for install, publication, buffering, replay, and reinjection; the #4400 guard applies — a bare close DROPS; the deterministic persistent reacquire at `allocator.rs:1265` still reacquires through the allocator, the owned path); `SeedInstalled` (genuine top-level miss, #4400-passed) runs the full seed transaction as today; `SeedRefused` (miss, refused) drops as today. The gated verdict is terminal across dispatch; a live/marked entry can never be replaced by a transient raw-flags seed; the accepted close's sole producer survives (§5.5/§5.6) |
+
+---
+
+## 3.1 Master drift since the citation base (v10.5.1; verified `023f17a606d8` → `fff7a4ab5`)
+
+origin/master advanced 25 commits while this plan iterated. Re-verified
+this round; **no design rule in §5–§9 changes**. Implementation
+(`/engineer 6461`) branches from the then-current master and applies
+these deltas:
+
+| Change on master | Consequence for this plan |
+|---|---|
+| **#6478** (`7b7119db1` + docs `fff7a4ab5`) removed `cluster_peer_return_fast_path`, its reverse-seed install, and the #4453 bare-close guard (`fabric.rs:389-492`, the call at `poll_descriptor/mod.rs:928`) | Site 6 no longer exists — its residual is closed by deletion. §3's fast-path bullet, the #4453 bullet, site row 6, and the §5/§5.6/§7 fabric-seed mentions are branch-base record. Fabric-ingress return traffic now takes the ordinary session pipeline, so it runs `account_packet` and the site-1 lookup gate like any other packet — strictly *more* covered than the branch-base analysis assumed |
+| **#6432** wrapped the MissingNeighbor arm in the `poll_stages::StageOutcome` ownership enum (arm head now `poll_descriptor/mod.rs:4015`; seed install `:4792`/`:4816`) | Site 9's "branch on the resolve outcome AT THE ARM HEAD" composes: the typed resolve-outcome branch becomes the arm's first StageOutcome-producing stage. No rule change |
+| **#6433** extracted the flow-cache seed path | Editorial; the §5.6 constructor sites are unchanged |
+| **#6458** added the fabric zone-stamp owner-RG gate (`gate_fabric_zone_override_on_owner_rg`, `fabric.rs:~331-342`) | §5.4's "no transport-based authority" bullet stands verbatim — the stamp proves even less post-#6458 |
+| **#6474** re-NATs outbound ICMP errors through SNAT | Orthogonal (ICMP error path, not TCP closing); shifted `poll_descriptor/mod.rs` line numbers |
+| Line drift (verified) | `account_packet` call sites: `flow_cache_hit.rs:312-317`→`:318`, `poll_descriptor/mod.rs:3494-3503`→`:3556`; strict-syn guard `:1634-1644`→`:1646`; input filter `:592`→`:612`; TTL check `:846`→`:866`; `materialize_shared_session_hit` `session_glue/mod.rs:1092-1118`→`:1122`; transient purge `:1178-1193`→`:1208-1211`; `touch_if_stale` call `flow_cache_hit.rs:295`→`:307`; `build_reject_rst_frame` `frame/tcp.rs:328-385`→`:347+`; `parse_session_flow_from_bytes` `frame/inspect.rs:1455-1470`→`:1424+`; `is_cacheable` `types/forwarding.rs:948-952`→`:959`; tunnel `UpsertLocal` push `tunnel.rs:563-615`→`:760-767`; LocalDelivery SYN gate `local_delivery.rs:20`→`:39-44`; `live_by_flow` `nat/source.rs:1548`→`nat/allocator.rs:481` (field moved files) |
+| Unchanged on master (re-verified exact) | The issue site itself — `lookup.rs:105-128` (`do_close`/`closing`/`reset`) and `:151-156`; `session/mod.rs:1232` `propagate_tcp_state_to_companion`, `:1118` `touch_if_stale`, `:1299`+`1396-1432` `update_session` head + sticky-RST body; `expire.rs:342-350` Close-delta gate; `entry.rs:209` `ForwardSessionMatch`; `install.rs:113`/`:139`/`:179-180`/`:295`/`:399-400`; `shared_ops.rs:614`/`:857`; `lookup.rs:258` `find_forward_wire_match_with_origin`; `session_admission.rs:53`; `schema_security.go:798`; `compiler_security_flow.go:527-528` |
 
 ---
 
@@ -696,7 +732,8 @@ nor attacker-seedable nor attacker-poisonable):**
      first authenticated ACK-bearing segment).
    - **Never self-authenticating:** `SyncImport`, `SharedMaterialize`,
      `WorkerLocalImport`, reverse-companion synthesis, fabric-return
-     seeds, tunnel `UpsertLocal` refreshes, `ReplacedSyncedLocal`
+     seeds (branch-base class — the fast path was removed on master by
+     #6478, §3.1), tunnel `UpsertLocal` refreshes, `ReplacedSyncedLocal`
      installs, and any re-import/upsert (which `remove_entry`s the prior
      record — an anchor wipe, §7). Their packets' samples adopt
      `valid`+**untrusted** only.
@@ -1196,7 +1233,8 @@ adopts untrusted only, so a driving SYN can never reclassify a synced
 victim as a fresh self-authenticating flow. The installer returns the
 displacement outcome; a mandatory unit test covers the replacement branch.
 
-The fabric-return seed (site 6) is already close-free (#4453); primary
+The fabric-return seed (site 6) is already close-free (#4453) at the
+branch base and **deleted outright on master by #6478** (§3.1); primary
 miss installs (site 3) are #4400-guarded; tunnel UpsertLocal (site 5) is
 trusted-local; wire re-import (site 4) carries no packet; the forward-wire
 immutable match (site 8) never marks directly (its promote-mediated marks
@@ -1430,7 +1468,8 @@ untouched.
     REDIRECT/publish transition the entry sits in the absorbing
     zero-trust state — closes refuse until churn (§2); Phase 2 §10.5
     restores validation for the synced class.
-  - **fabric-return reverse seeds** bypass the commit hooks; a later
+  - **fabric-return reverse seeds** (branch-base class, removed on master
+    by #6478 — §3.1) bypass the commit hooks; a later
     close on such a seed is refused (no anchor), the seed ages on its
     ordinary timeout, and `is_reverse` suppresses any Close delta — no
     owner kill.
