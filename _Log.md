@@ -62410,6 +62410,244 @@ break — `go vet` confirmed passing under every revert.
     pkg/routing/monitor.go, _Log.md
 
 - **Timestamp**: 2026-07-31
+- **Action**: #6524 fix — a chained flat-set custom application compiled
+  PROTOCOL-ONLY, so a policy matching it permitted ALL TCP.
+  `set applications application myapp protocol tcp destination-port 8080`
+  builds a CHAIN of single-key nodes (SetPath parks the rest of the line under
+  the node it just created, because these leaves declare `children: nil`), so
+  `destination-port` nests under the VALUE node `tcp` and is never a sibling of
+  `protocol`. compileApplications iterated only `inst.node.Children`, saw just
+  `protocol`, and never assigned DestinationPort; an empty port term matches
+  ANY port (pkg/policymatch), so the referencing policy over-permitted. Nothing
+  caught it: protocol / destination-port / source-port were the only
+  `applications application` match leaves neither typed nor `scalar: true`, so
+  no arity gate engaged and the chained form validated clean at BOTH
+  SchemaValidate and strict commit. The REVERSE order was caught only
+  incidentally by the #3109 protocol-less gate — that asymmetry hid it.
+  Verified firsthand before coding (ParseSetCommand + SetPath, never
+  NewParser): dumped the chain AST, confirmed DestinationPort=="" with
+  SchemaValidate CLEAN, then confirmed a permit policy admitted tcp/22.
+  Fixed in the COMPILER, not the schema, and said why: CompileConfigLenient
+  (boot load + HA SyncApply) downgrades a schema rejection to a WARNING and
+  keeps compiling, so a schema-only reject would leave a persisted or
+  peer-pushed config still protocol-only and still permitting all TCP — exactly
+  where no operator sees the warning. It would also mint a new
+  commit-vs-load split for a spelling that now has well-defined semantics (the
+  divergence class #3606 calls out). New `applicationDirectLeaves` walks the
+  chain across BOTH AST shapes and splits each node's PACKED Keys into one leaf
+  per recognized keyword — a three-leaf line collapses to
+  `protocol tcp -> Keys=[source-port 5000 destination-port 8080]`, so a
+  Keys[2:]-is-garbage rule was wrong and the scan is keyword-delimited, the same
+  shape parseApplicationTerms uses. Tokens it cannot map to a known leaf land on
+  the new Application.UnknownDirectLeaves and are hard-rejected by
+  validateApplicationSyntaxStrict (lenient-warn), which is what makes
+  `protocol [ tcp udp ]` and `destination-port [ 22 23 ]` operator-visible: a
+  DIRECT body holds ONE protocol and ONE port, so a bracket tail is
+  unrepresentable, not merely mis-read. The record is carried onto generated
+  term applications too, since the parent struct is discarded on that branch.
+  `term` is emitted but not descended into (its subtree is opaque and
+  parseApplicationTerms already guards it with UnknownTermLeaves).
+  Fail-on-revert asserts the POLICY OUTCOME, not the struct: with the walk
+  reverted, tcp/22 is PERMITTED by an app declared `protocol tcp
+  destination-port 8080` and the 4 pkg/policymatch tests go RED, while the two
+  over-reach guards (hierarchical + sibling flat-set spellings) stay GREEN.
+  Golden 4406 shifted by exactly 3 leaves — its own fixture uses the chained
+  form, so appA's DestinationPort went ""->"80" (the bug was sitting in the
+  project's own corpus) — plus the new struct field key; regenerated.
+  Full pkg/config + pkg/policymatch green. pkg/dataplane/userspace has 7
+  event-stream failures, verified IDENTICAL on pristine origin/master
+  (detached worktree, diffed failure lists) — pre-existing, zero regressions.
+- **File(s)**: pkg/config/{compiler_applications.go,types_security.go,
+    compiler_validate_strict_application.go,
+    compiler_application_chained_leaves_6524_test.go,
+    testdata/golden_4406.json},
+    pkg/policymatch/app_chained_leaves_6524_test.go,
+    docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6524 / PR 6604 hostile-review fold (MERGE-NEEDS-MAJOR) — close a
+  fail-open the PR itself INTRODUCED, plus a phantom-leaf widening.
+  MAJOR: teaching the compiler to follow the flat-set chain also let it reach
+  `term` nodes nested down that chain, so it minted `<parent>-<term>`
+  applications that the collision gate could not see —
+  compiler_applications_collision.go:225 still enumerated `inst.node.Children`
+  while compiler_applications.go had moved to applicationDirectLeaves. The two
+  walks diverged, so a generated name was invisible to every flat-namespace gate
+  (#3472 H01/H02/H03, M08, M03) and silently OVERWROTE an authored application,
+  erasing a deny that referenced it. Verified firsthand on both sides: on my
+  head `set applications application myapp description doc term t1 protocol udp`
+  clobbered an authored `myapp-t1` (tcp/22 -> udp/"") with err=nil and ZERO
+  warnings; on pristine origin/master (detached worktree) `myapp-t1` stayed
+  tcp/22. `description` is the strict-path entry route because it deliberately
+  does not set hasDirectBody (#3366) so MixedDirectTermApps never fires; on the
+  tolerant path that gate is only a warning so no description prefix is needed.
+  The SIBLING spelling was always caught — only the chained shape evaded it.
+  Fixed by extracting applicationTermNodes + applicationTermKeys and routing
+  BOTH the compiler and the collision gate through them, making the "single
+  source of truth" doc claim actually true instead of softening it. The shared
+  helper also always COPIES, removing a latent aliasing hazard: the compiler
+  previously sliced `prop.Keys[1:]` and appended child keys onto it, which can
+  write into the node's own backing array when that slice has spare capacity.
+  MINOR: the chain scan did not reserve the leaf's value slot, so a value token
+  that happens to spell a grammar keyword synthesized a PHANTOM valueless leaf
+  that RESET an assigned field. `description destination-port` drove
+  DestinationPort back to "" — match-every-port on the tolerant path, the exact
+  widening this PR exists to close, reintroduced by another route — plus a FALSE
+  strict "conflicting duplicate" reject; `description protocol` wiped Protocol;
+  and the phantom's unconditional hasDirectBody falsely tripped #3366 on a
+  term-only app. Every `args:1` leaf now consumes exactly one token as its value
+  before the keyword scan resumes. Bracket-tail detection is unaffected (the
+  SECOND value token is still flagged).
+  PUSHED BACK on MINOR 3: the premise "master committed an unquoted multi-word
+  description" is wrong for the real commit path — SchemaValidate on pristine
+  master already rejects it via the #3332 scalar gate ("unexpected trailing
+  token \"web\""), because schema_security.go:1273 marks `description`
+  scalar:true. Only CompileConfig in isolation accepted it. Kept the reject
+  (agreeing with the schema rather than contradicting a prior explicit
+  decision); fixed the message misattribution instead — it no longer claims
+  "widening", which is wrong for a dropped protocol alternative (that NARROWS)
+  and meaningless for a description token.
+  MINOR 2 (chained spelling not individually deletable) documented rather than
+  fixed: it is pre-existing SetPath/DeletePath behaviour for EVERY chained leaf,
+  and addressing a leaf nested under a value node changes path resolution for
+  every `children: nil` leaf in the schema.
+  NIT: the keyword canary was list==copy-of-list; it now enumerates
+  schemaApplications.children["application"].children in BOTH directions.
+  Fail-on-revert verified in a THROWAWAY detached worktree (never the PR
+  worktree), build+vet CLEAN there so each red is an ASSERTION: reverting only
+  the collision-gate enumeration turns the 2 clobber tests RED while the sibling
+  baseline, both over-reach guards and all MINOR tests stay GREEN; reverting only
+  the value-slot reservation turns the 3 phantom subtests RED while the
+  bracket-tail subtest and both over-reach guards stay GREEN.
+  Full pkg/config + pkg/policymatch green; build, vet, gofmt clean.
+- **File(s)**: pkg/config/{compiler_applications.go,
+    compiler_applications_collision.go,compiler_validate_strict_application.go,
+    types_security.go,compiler_application_chained_leaves_6524_test.go},
+    docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6524 / PR 6604 Codex re-gate fold (MERGE-NEEDS-MAJOR) — stop the
+  chain walk RECOVERING a keyword after unrepresentable content, and give
+  `description` tail handling.
+  MAJOR: applicationDirectLeaves recorded an unknown token, advanced one slot
+  and CONTINUED, so a later recognized keyword was compiled normally. Verified
+  at the VERDICT level on both sides. My head, tolerant path:
+  `set applications application myapp bogus value protocol tcp` compiled
+  protocol=tcp and tcp/22 came back matched=true action=PolicyPermit
+  contentRejected=false — an all-TCP permit. Pristine origin/master (detached
+  worktree, same probe): protocol-less, tcp/22 matched=false action=PolicyDeny
+  contentRejected=true. So the PR converted an inert fail-closed residual into
+  an ACTIVE permit on boot / HA SyncApply, where the strict reject is only a
+  warning. Same root via the other ordering:
+  `destination-port [ 22 23 ] protocol tcp` skipped `23` then recovered
+  `protocol tcp`. Fixed by POISONING the remainder of a node's run and its
+  subtree on the first unrepresentable token — both the unknown-keyword branch
+  and the bracket-tail branch. Sibling leaves are deliberately unaffected
+  (separate nodes), so a stray `bogus value` line still leaves a neighbouring
+  `protocol tcp` line compiled exactly as master compiled it; that is pinned by
+  a paired over-reach guard at the verdict level, because over-poisoning would
+  silently fail-close a whole working config.
+  MINOR (`description`): Codex was RIGHT that my justification was false. I had
+  claimed the schema's scalar:true arity already enforced this at commit; it
+  does so only for the SIBLING spelling — verified firsthand that in the CHAINED
+  spelling SchemaValidate returns nil while my compiler gate rejected, so the
+  chained form WAS a new hard-reject over a metadata leaf. Rather than justify
+  it, made `description` a TAIL leaf (Junos takes its text to end-of-statement):
+  the run is joined, so `description my web app` and `description
+  destination-port` both compile as written, and a description can no longer
+  poison the rest of the run. The run still stops at the next recognized
+  keyword, so the chained-`term` reproducer keeps working. The schema's
+  scalar:true gate is untouched and still rejects the sibling spelling, which
+  master's own commit path also rejected — so no master-COMMITTABLE config is
+  newly refused (master's CompileConfig accepted it in isolation, but
+  SchemaValidate did not).
+  Also: corrected the docs claim that "both sides go through
+  applicationTermNodes" (the compiler consumes applicationDirectLeaves directly;
+  only the collision gate goes through applicationTermNodes — both derive from
+  the same walk), and added an arity pin + scope note to the schema canary,
+  which guards the KEY SET but not `args` drift.
+  Fail-on-revert in a THROWAWAY detached worktree, build+vet CLEAN there:
+  restoring `i++; continue` turns BOTH orderings RED as verdict assertions
+  ("tcp/22 was PERMITTED ..."), while every guard stays GREEN —
+  TestChainedApp{DestPort,SourcePort,ICMPType,Deny}, SiblingAppSpelling,
+  StrayStatementDoesNotDisarmSiblingLeaves, HierarchicalAppBody,
+  SiblingFlatSetAppBody, SiblingTermClobber, DescriptionIsATail.
+  Full pkg/config + pkg/policymatch green; build, vet, gofmt clean.
+- **File(s)**: pkg/config/{compiler_applications.go,types_security.go,
+    compiler_application_chained_leaves_6524_test.go},
+    pkg/policymatch/app_unknown_recovery_6524_test.go,
+    docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6524 / PR 6604 — third fold pass. Audited the previous fold
+  against the Codex verdict firsthand rather than trusting its self-report, and
+  found the MAJOR correctly closed but the MINOR's JUSTIFICATION still false in
+  the same way Codex had flagged the original.
+  Codex's MINOR said the claim "scalar validation already enforces this" was
+  false. The fold replaced it with "the schema never sees the chained one" —
+  which is ALSO false. Dumped the real AST for every spelling and found a
+  multi-word description occupies THREE positions, not two:
+    - sibling / hierarchical            -> schema scalar:true governs it
+    - HEAD of a flat-set chain          -> `set ... description my web app ...`
+      builds [description my] -> [web app ...]; the tail is a CHILD node, so
+      the joined run is only ["my"] and "web" opens a fresh run.
+      SchemaValidate DOES fire here: `unexpected trailing token "web"`.
+    - PACKED chain tail                 -> `set ... protocol tcp description my
+      web app` packs the whole description onto ONE node's Keys, below the
+      depth the schema walk reaches (SchemaValidate returns nil).
+  So the tail-join rescues exactly ONE position (the packed tail), which is
+  also the only position where a spelling master COMMITTED would otherwise
+  have become a new hard reject. The head-of-chain spelling stays a commit
+  error — and that is PARITY, because master rejected it through the same
+  untouched schema gate. Codex tested the packed-tail spelling and generalized;
+  the fold generalized in the opposite direction. Both overshot.
+  Corrected the claim at all three sites that carried it (the `description`
+  branch in compiler_applications.go, the UnknownDirectLeaves doc on
+  types_security.go, and the docs/config-schema.md bullet) to enumerate the
+  three positions and say exactly which one the join covers. This is not
+  cosmetic: an over-broad "the schema never sees the chained one" invites a
+  future change to loosen a gate master also held.
+  Added the missing coverage — TestDescriptionIsATailLeaf previously exercised
+  ONLY the packed-tail position, so a reader would conclude `description my web
+  app` commits, which it does not. The new subtest pins the head-of-chain
+  position AND asserts the MECHANISM that makes it parity (SchemaValidate still
+  fires), because asserting only "commit fails" cannot distinguish a
+  pre-existing gate from one this PR introduced.
+  Verification, all in a THROWAWAY detached worktree (/dev/shm/probe-6604d,
+  build+vet CLEAN there, removed after):
+    - MAJOR RED at pre-fold head 4e132ced5, VERDICT level, BOTH orderings:
+      "tcp/22 was PERMITTED by an application whose body contains
+      unrepresentable content" for `bogus value protocol tcp` AND for
+      `destination-port [ 22 23 ] protocol tcp`.
+    - MINOR RED at the same head: `chained multi-word description commits`
+      failed on the hard reject of "web".
+    - New subtest RED there too, as an assertion: `Protocol="tcp", want ""`.
+    - Over-reach guards PASS at the pre-fold head (they do not co-vary):
+      StrayStatementDoesNotDisarmSiblingLeaves,
+      UnknownTokenDoesNotPoisonSiblingLeaves, ApplicationDirectLeafArityIsOne.
+  Also probed and cleared two shapes I suspected: a `term` at mid-run inside a
+  packed tail carries NO Children (so a term's token stream is never split
+  across Keys and Children), and the hierarchical shape still compiles as
+  siblings, byte-identical to master.
+  Full pkg/config + pkg/policymatch green; vet clean; gofmt clean on every file
+  this PR touches (the three gofmt-dirty files under pkg/config are dirty on
+  origin/master too — pre-existing, not this PR's).
+- **File(s)**: pkg/config/{compiler_applications.go,types_security.go,
+    compiler_application_chained_leaves_6524_test.go},
+    docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6524 review-fold round 4 (Codex MERGE-NEEDS-MINOR, one residual).
+  The strict-path diagnostic listed every direct leaf as "each taking a SINGLE
+  value", which contradicted the packed multi-word `description` tail this PR
+  deliberately accepts. An operator hitting the message would be told the
+  opposite of the behaviour. Reworded to exempt `description` explicitly. No
+  code change; Codex reproduced all three description AST shapes and their
+  SchemaValidate outcomes, confirmed tolerant poisoning preserves
+  master-enforced sibling leaves, confirmed both recovery orderings permit
+  TCP/22 under the MAJOR revert with every named over-reach guard green, and
+  confirmed collision enumeration and compilation still share the one walk.
+- **File(s)**: pkg/config/compiler_validate_strict_application.go, _Log.md
 - **Action**: #4146 destination slice — enforce a `to-zone junos-host` DENY that
   carries an explicit `match destination-address` on the DIRECT host-bound path.
   #4932 shipped the kernel-nft projection of the representable junos-host DENY
