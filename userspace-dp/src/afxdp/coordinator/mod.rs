@@ -374,7 +374,7 @@ pub struct Coordinator {
     ///
     /// Absent from release builds; per-instance so parallel tests never race.
     #[cfg(test)]
-    pub(crate) runtime_view_at_publish: Option<(RuntimeView, Arc<RuntimeView>)>,
+    pub(crate) runtime_view_at_publish: Option<(Arc<RuntimeView>, Arc<RuntimeView>)>,
     /// #6244: typed reconcile progress + failure identity. Replaces the
     /// former free-form `String` side-channel; the legacy operator string is
     /// rendered only at the `reconcile_debug` / `debug_reconcile_stage` wire
@@ -1114,7 +1114,7 @@ impl Coordinator {
     /// publishes everything committed before it, so the #5166 CoS-map /
     /// `ha.fabrics` stores must also already have happened.
     fn store_runtime_view(&mut self, forwarding: Arc<ForwardingState>) {
-        let view = RuntimeView::new(self.validation, forwarding);
+        let view = Arc::new(RuntimeView::new(self.validation, forwarding));
         // #6592 test seam — records the INTENDED pair and the still-visible
         // PREVIOUS view, so the regression test can assert both that a worker
         // observes exactly this pair and that the capture sits BEFORE the
@@ -1123,7 +1123,7 @@ impl Coordinator {
         {
             self.runtime_view_at_publish = Some((view.clone(), self.ha.runtime.load_full()));
         }
-        self.ha.runtime.store(Arc::new(view));
+        self.ha.runtime.publish(view);
     }
 
     /// #6592: publish the current `self.forwarding` paired with the current
@@ -1153,7 +1153,7 @@ impl Coordinator {
     /// `self.forwarding`: republishing means "same tables, newer stamps", and
     /// the published `Arc` is by definition the tables workers already hold.
     pub(crate) fn republish_runtime_validation(&mut self) {
-        let forwarding = self.ha.runtime.load().forwarding.clone();
+        let forwarding = self.ha.runtime.load().forwarding().clone();
         self.store_runtime_view(forwarding);
     }
 
@@ -1180,7 +1180,7 @@ impl Coordinator {
     /// writer side. It cannot, and that must stay true.
     #[cfg(test)]
     pub(crate) fn published_validation(&self) -> ValidationState {
-        self.ha.runtime.load().validation
+        self.ha.runtime.load().validation()
     }
 
     /// #6592 test fixture: stand in for "a prior generation was successfully

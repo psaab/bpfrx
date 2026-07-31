@@ -218,7 +218,7 @@ impl super::Coordinator {
         // runtime ArcSwap handle (`ha.runtime`, #6592) instead of a
         // frozen clone — every store on the refresh/reconcile/fabric
         // paths reaches it on its next iteration.
-        let shared_runtime = self.ha.runtime.clone();
+        let shared_runtime = self.ha.runtime_reader();
         let ha_state = self.ha.rg_runtime.clone();
         let dynamic_neighbors = self.neighbors.dynamic.clone();
         let live = self.workers.live.clone();

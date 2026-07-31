@@ -235,7 +235,7 @@ pub(super) fn local_tunnel_source_loop(
     tunnel_name: String,
     tunnel_endpoint_id: u16,
     spawned_logical_ifindex: i32,
-    shared_runtime: Arc<ArcSwap<RuntimeView>>,
+    shared_runtime: RuntimeViewReader,
     ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     dynamic_neighbors: Arc<ShardedNeighborMap>,
     live: BTreeMap<u32, Arc<BindingLiveState>>,
@@ -290,7 +290,7 @@ pub(super) fn local_tunnel_source_loop(
     // not match shim generation stamps), so it reads through
     // `load_forwarding_if_changed`. A validation-only publish rotates the view
     // but not the inner forwarding Arc, so it correctly sees no change here.
-    let mut forwarding: Arc<ForwardingState> = shared_runtime.load().forwarding.clone();
+    let mut forwarding: Arc<ForwardingState> = shared_runtime.load().forwarding().clone();
     let mut endpoint_attached = endpoint_attachment_valid(
         &forwarding,
         tunnel_endpoint_id,

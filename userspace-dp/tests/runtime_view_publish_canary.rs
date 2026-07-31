@@ -1,43 +1,67 @@
-//! #6592 publish/read canary — source-scanning guard over the atomic
+//! #6592 publish/read canary — defence in depth over the atomic
 //! `(validation, forwarding)` pairing.
 //!
-//! # Why a source canary and not only types
+//! # The type system is the boundary; this file is the backstop
 //!
-//! #6592 made validation and forwarding travel in ONE `Arc` (`RuntimeView`), so
-//! a reader can never pair them across generations. Two RED-on-revert tests
-//! guard that: `snapshot_refresh_runtime_view_pair_is_atomic_6592` (consumer)
-//! and `refresh_runtime_snapshot_publishes_a_coherent_view_pair` (producer).
+//! An earlier version of this canary WAS the write-capability boundary, and a
+//! review probe showed that was fail-open. `HaState::runtime_reader` returned
+//! the writable `Arc<ArcSwap<RuntimeView>>` and `RuntimeView` was `Clone` with
+//! reachable fields, so production code could do:
 //!
-//! Neither can see a NEW site that bypasses the choke point. The producer test
-//! drives `refresh_runtime_snapshot`, which publishes through
-//! `Coordinator::store_runtime_view`; a future HA or fabric path writing
-//! `self.ha.runtime.store(Arc::new(RuntimeView::new(older_validation, fwd)))`
-//! directly would reintroduce the torn pair on the WRITER side with the whole
-//! suite green. Likewise the consumer test drives `refresh_runtime_view` rather
-//! than the real `worker_loop`, so a SECOND `shared_runtime.load()` added
-//! elsewhere in the tick would pair halves across generations untested.
+//! ```ignore
+//! let alias = self.ha.runtime_reader();
+//! let mut torn = alias.load_full().as_ref().clone();
+//! torn.validation.fib_generation = torn.validation.fib_generation.wrapping_add(1);
+//! alias.store(Arc::new(torn));
+//! ```
 //!
-//! Field visibility narrows the first hole — `HaState::runtime` is `pub(super)`,
-//! so nothing outside the `coordinator` module tree can reach the `ArcSwap` at
-//! all — but it cannot close it, because a new site inside `coordinator/` still
-//! compiles, and a holder of the reader handle (`HaState::runtime_reader`) has
-//! a storable `Arc<ArcSwap<..>>` by construction. This canary is what makes the
-//! remaining paths mechanical rather than conventional.
+//! That compiled, published the exact `(new validation, old forwarding)` tear,
+//! and every rule below passed: the store was not the choke point's literal
+//! spelling, and the view came from a CLONE, not a construction — so the
+//! "a publish needs a constructed view" argument was simply false. Enumerating
+//! bypasses had by then failed twice on this canary (the first was a
+//! rustfmt-wrapped method chain).
+//!
+//! The capability is now enforced by types, and each of those three lines is
+//! independently a COMPILE error:
+//!
+//! - `runtime_reader()` returns [`RuntimeViewReader`], whose `ArcSwap` is a
+//!   private field and whose only method is `load()`. No consumer can obtain a
+//!   writer, so `alias.store(..)` and `alias.load_full()` do not exist.
+//! - `RuntimeView` is not `Clone`, so `.as_ref().clone()` does not compile —
+//!   `RuntimeView::new` is now the ONLY way to obtain a view value anywhere.
+//! - `RuntimeView`'s fields are private, so `torn.validation.x = ..` does not
+//!   compile.
+//! - The coordinator's own handle is [`RuntimeViewChannel`], which likewise
+//!   hides the `ArcSwap`: `publish` is the only mutation, so `swap`, `rcu`,
+//!   `compare_and_swap` and `Deref` are unreachable rather than merely
+//!   unmentioned by a regex.
+//!
+//! What remains for this file is the residue types cannot express: a NEW site
+//! inside `coordinator/` calling `self.ha.runtime.publish(RuntimeView::new(
+//! stale_validation, fwd))`, and a second view load inside one worker tick.
+//! Because `RuntimeView` is no longer `Clone`, "a publish needs a CONSTRUCTED
+//! view" is now a true statement rather than an enumeration, which is what
+//! makes rule 2 meaningful.
 //!
 //! # What it pins
 //!
-//! 1. **One publish.** Exactly one `.runtime.store(` in the tree, at the choke
-//!    point. Test fixtures publish through `seed_published_validation`, which
-//!    routes to `republish_runtime_validation` — so there is no cfg(test)
-//!    exemption to reason about here.
-//! 2. **No view built outside the choke point.** Any publish needs a
-//!    `RuntimeView` VALUE, so pinning CONSTRUCTION catches a bypass even if it
-//!    stores through a cloned handle the textual rule (1) cannot see. Sites
-//!    outside the type's own module must be the choke point, or carry the
-//!    marker `runtime-view-canary: test-local` on the construction line.
+//! 1. **One publish, and the writer stays inside its type.** Exactly one
+//!    `.runtime.publish(` in the tree, at the choke point; and no file outside
+//!    the type's own module may name `ArcSwap<RuntimeView>` — that spelling
+//!    reappearing means the raw writer has escaped again, which is precisely
+//!    how the probe got in.
+//! 2. **No view constructed outside the choke point.** Sites outside the type's
+//!    own module must be the choke point, or carry the marker
+//!    `runtime-view-canary: test-local` — which is honoured ONLY in a file's
+//!    test half, so it cannot silence production code.
 //! 3. **One load per reader.** Each production reader takes BOTH halves from a
-//!    single `ArcSwap` load. The expected count per file is listed explicitly;
-//!    adding a load anywhere fires this with the reason.
+//!    single `load()`. Residual, stated rather than papered over: the count
+//!    keys on the `shared_runtime.load(` spelling, so a future reader that
+//!    binds its handle to another name evades the COUNT (it fails closed for
+//!    any file that does use the spelling). The type system covers the worse
+//!    half of that: every `load()` yields one coherent view, so a single call
+//!    can never tear a pair — only two calls in one tick can.
 //!
 //! Adding a legitimate site is meant to be possible — update the table below
 //! and say why in the PR. Silently growing one is not.
@@ -46,10 +70,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Marker that exempts a `RuntimeView` construction line (rule 2). Test-local
-/// views built for a test-local `ArcSwap` never reach a worker.
+/// views built for a test-local channel never reach a worker.
+///
+/// Honoured ONLY in a file's TEST half (after the first top-level
+/// `#[cfg(test)]`). A reviewer pointed out that an unconstrained marker
+/// silences production code just as happily — so a production line carrying it
+/// still counts.
 const TEST_LOCAL_MARKER: &str = "runtime-view-canary: test-local";
 
-/// Rule 1: the only file+substring allowed to store into the runtime `ArcSwap`.
+/// Rule 1: the only file allowed to publish into the runtime channel.
 const PUBLISH_CHOKE_POINT: &str = "src/afxdp/coordinator/mod.rs";
 
 /// Rule 2: the module that DEFINES `RuntimeView` may construct it freely (its
@@ -64,11 +93,6 @@ const ALLOWED_CONSTRUCTION: &[(&str, usize, &str)] = &[
         1,
         "Coordinator::store_runtime_view — THE choke point; builds the view from \
          self.validation at the store",
-    ),
-    (
-        "src/afxdp/coordinator/ha_state.rs",
-        1,
-        "HaState::new — the initial default view the ArcSwap is created from",
     ),
 ];
 
@@ -179,26 +203,33 @@ fn code_blob_no_whitespace(content: &str) -> String {
 /// Does this line CONSTRUCT a `RuntimeView` (as opposed to naming the type in a
 /// signature)? `-> RuntimeView {` is a return type, not a construction.
 fn constructs_runtime_view(line: &str) -> bool {
-    if line.contains(TEST_LOCAL_MARKER) {
-        return false;
-    }
     if line.contains("RuntimeView::new(") || line.contains("RuntimeView::default()") {
         return true;
     }
     line.contains("RuntimeView {") && !line.contains("-> RuntimeView {")
 }
 
+/// Rule 1b: does this line name the raw `ArcSwap<RuntimeView>`?
+///
+/// Outside the type's own module that spelling means the write capability has
+/// escaped its wrapper — exactly what let a review probe alias the writer and
+/// publish a torn pair. Whitespace is already stripped by the caller so a
+/// wrapped generic (`ArcSwap<\n    RuntimeView>`) still matches.
+fn names_raw_runtime_arcswap(code_no_whitespace: &str) -> usize {
+    code_no_whitespace.matches("ArcSwap<RuntimeView>").count()
+}
+
 /// Rule 1 + rule 2, over one file's full content.
 fn scan_publish(rel: &str, content: &str, violations: &mut Vec<Violation>) {
     let stores = code_blob_no_whitespace(content)
-        .matches(".runtime.store(")
+        .matches(".runtime.publish(")
         .count();
     if rel == PUBLISH_CHOKE_POINT {
         if stores != 1 {
             violations.push(Violation {
                 rule: "1 (one publish)",
                 detail: format!(
-                    "{rel}: found {stores} `.runtime.store(` — expected exactly 1 \
+                    "{rel}: found {stores} `.runtime.publish(` — expected exactly 1 \
                      (Coordinator::store_runtime_view). Every publish must go \
                      through the choke point so the view is built from \
                      self.validation AT the store; a second store site can pair a \
@@ -211,7 +242,7 @@ fn scan_publish(rel: &str, content: &str, violations: &mut Vec<Violation>) {
         violations.push(Violation {
             rule: "1 (one publish)",
             detail: format!(
-                "{rel}: {stores} `.runtime.store(` outside the choke point \
+                "{rel}: {stores} `.runtime.publish(` outside the choke point \
                  ({PUBLISH_CHOKE_POINT}). Publish via \
                  Coordinator::publish_runtime_view or \
                  republish_runtime_validation instead."
@@ -219,10 +250,41 @@ fn scan_publish(rel: &str, content: &str, violations: &mut Vec<Violation>) {
         });
     }
 
+    // Rule 1b: the raw writable `ArcSwap<RuntimeView>` must not be nameable
+    // outside the type's own module. Its escape is how the probe got in.
+    if rel != RUNTIME_VIEW_DEFINITION {
+        let raw = names_raw_runtime_arcswap(&code_blob_no_whitespace(content));
+        if raw != 0 {
+            violations.push(Violation {
+                rule: "1b (writer stays inside its type)",
+                detail: format!(
+                    "{rel}: names `ArcSwap<RuntimeView>` {raw} time(s). The raw \
+                     writable ArcSwap must not leave `{RUNTIME_VIEW_DEFINITION}` \
+                     — anything holding it can `store`/`swap`/`rcu` a torn pair \
+                     past the choke point, which is exactly the bypass this \
+                     canary previously missed. Take a `RuntimeViewReader` (read \
+                     only) or use the coordinator's `RuntimeViewChannel`."
+                ),
+            });
+        }
+    }
+
     if rel == RUNTIME_VIEW_DEFINITION {
         return;
     }
-    let constructions = code_lines(content).filter(|line| constructs_runtime_view(line)).count();
+    // The `test-local` marker is honoured ONLY in a file's TEST half. Left
+    // unconstrained it silences PRODUCTION code — a reviewer flagged that the
+    // marker's mere presence on any line suppressed the rule.
+    let production = production_half(content);
+    let test_half = &content[production.len()..];
+    let constructions = code_lines(production)
+        .filter(|line| constructs_runtime_view(line))
+        .count()
+        + code_lines(test_half)
+            .filter(|line| {
+                constructs_runtime_view(line) && !line.contains(TEST_LOCAL_MARKER)
+            })
+            .count();
     let expected = ALLOWED_CONSTRUCTION
         .iter()
         .find(|(file, _, _)| *file == rel)
@@ -238,15 +300,58 @@ fn scan_publish(rel: &str, content: &str, violations: &mut Vec<Violation>) {
             rule: "2 (no view built outside the choke point)",
             detail: format!(
                 "{rel}: {constructions} RuntimeView construction(s), expected \
-                 {expected} ({why}). A publish needs a view VALUE, so this rule \
-                 catches a bypass that stores through a cloned handle too. If the \
-                 site is a test-local view for a test-local ArcSwap, put \
-                 `{TEST_LOCAL_MARKER}` on the construction line; otherwise \
-                 publish through the choke point."
+                 {expected} ({why}). `RuntimeView` is not Clone, so construction \
+                 is the ONLY way to obtain a view value — which makes this the \
+                 rule that catches a publish however it reaches the channel. If \
+                 the site is a test-local view for a test-local channel, put \
+                 `{TEST_LOCAL_MARKER}` on the construction line IN THE FILE'S \
+                 TEST HALF; otherwise publish through the choke point."
             ),
         });
     }
 }
+
+/// Rule 3's truncation heuristic assumes everything after a file's first
+/// top-level `#[cfg(test)]` is test code. A `#[cfg(not(test))]` block down
+/// there would be PRODUCTION code silently excluded from the load count, so say
+/// so loudly rather than let the heuristic rot into a blind spot. No file in
+/// the tree does this today; this fires the day one does.
+fn scan_truncation_heuristic(rel: &str, content: &str, violations: &mut Vec<Violation>) {
+    let production = production_half(content);
+    if production.len() == content.len() {
+        return;
+    }
+    let discarded = &content[production.len()..];
+
+    // Scoped to the files rule 3 actually counts. A load past the truncation
+    // point is NOT by itself a finding — a file's own test module legitimately
+    // has several — so the signal is `#[cfg(not(test))]`, which is the only way
+    // PRODUCTION code gets down there. Zero occurrences today; this fires the
+    // day the heuristic stops holding rather than letting it rot into a blind
+    // spot. Distinguishing test from production loads precisely would need
+    // region tracking, which is more machinery than the risk warrants while the
+    // count stays at zero.
+    if !ALLOWED_READER_LOADS.iter().any(|(file, _, _)| *file == rel) {
+        return;
+    }
+    let cfg_not_test = code_lines(discarded)
+        .filter(|line| line.contains("#[cfg(not(test))]"))
+        .count();
+    if cfg_not_test != 0 {
+        violations.push(Violation {
+            rule: "3 (one load per reader)",
+            detail: format!(
+                "{rel} is a counted runtime-view reader and has {cfg_not_test} \
+                 `#[cfg(not(test))]` after the first top-level `#[cfg(test)]`. \
+                 Rule 3 treats everything past that point as test code, so a \
+                 load added in that production block would go uncounted. Move it \
+                 above the test module, or teach `production_half` to skip only \
+                 the test module's braces."
+            ),
+        });
+    }
+}
+
 
 /// Rule 3, over one file's PRODUCTION half.
 fn scan_reader_loads(rel: &str, production: &str, violations: &mut Vec<Violation>) {
@@ -291,6 +396,7 @@ fn runtime_view_publish_and_read_sites_are_pinned() {
         let content = fs::read_to_string(&path)
             .unwrap_or_else(|err| panic!("cannot read {} — {err}", path.display()));
         scan_publish(&rel, &content, &mut violations);
+        scan_truncation_heuristic(&rel, &content, &mut violations);
         scan_reader_loads(&rel, production_half(&content), &mut violations);
     }
 
@@ -328,7 +434,7 @@ mod self_tests {
         let mut v = Vec::new();
         scan_publish(
             PUBLISH_CHOKE_POINT,
-            "self.ha.runtime.store(a);\nself.ha.runtime.store(b);\n\
+            "self.ha.runtime.publish(a);\nself.ha.runtime.publish(b);\n\
              let x = RuntimeView::new(1, 2);\n",
             &mut v,
         );
@@ -341,12 +447,12 @@ mod self_tests {
         let mut v = Vec::new();
         scan_publish(
             "src/afxdp/ha/somewhere.rs",
-            "self.ha.runtime.store(Arc::new(view));\n",
+            "self.ha.runtime.publish(view);\n",
             &mut v,
         );
         assert!(
             v.iter().any(|x| x.rule.starts_with('1')),
-            "a store outside the choke point must fire: {v:?}"
+            "a publish outside the choke point must fire: {v:?}"
         );
     }
 
@@ -369,10 +475,14 @@ mod self_tests {
         let mut v = Vec::new();
         scan_publish(
             "src/afxdp/ha/somewhere.rs",
-            "let view = RuntimeView::new(a, b); // runtime-view-canary: test-local\n",
+            "fn production() {}\n#[cfg(test)]\nmod t {\n\
+             let view = RuntimeView::new(a, b); // runtime-view-canary: test-local\n}\n",
             &mut v,
         );
-        assert!(v.is_empty(), "marked construction must be tolerated: {v:?}");
+        assert!(
+            v.is_empty(),
+            "a marked construction in the TEST half must be tolerated: {v:?}"
+        );
     }
 
     #[test]
@@ -380,8 +490,8 @@ mod self_tests {
         let mut v = Vec::new();
         scan_publish(
             PUBLISH_CHOKE_POINT,
-            "let view = RuntimeView::new(self.validation, forwarding);\n\
-             self.ha.runtime.store(Arc::new(view));\n",
+            "let view = Arc::new(RuntimeView::new(self.validation, forwarding));\n\
+             self.ha.runtime.publish(view);\n",
             &mut v,
         );
         assert!(v.is_empty(), "the real shape must be clean: {v:?}");
@@ -423,6 +533,44 @@ mod self_tests {
             &mut v,
         );
         assert!(v.is_empty(), "test-module loads must not count: {v:?}");
+    }
+
+    #[test]
+    fn detects_production_code_hidden_after_the_test_module() {
+        let mut v = Vec::new();
+        scan_truncation_heuristic(
+            "src/afxdp/worker/loop_body/mod.rs",
+            "fn prod() {}\n#[cfg(test)]\nmod t {}\n#[cfg(not(test))]\n\
+             fn also_prod() { let v = shared_runtime.load(); }\n",
+            &mut v,
+        );
+        assert_eq!(
+            v.len(),
+            1,
+            "a counted reader with cfg(not(test)) past the truncation point must \
+             be reported: {v:?}"
+        );
+
+        // An unrelated file with cfg(not(test)) but no runtime-view load is NOT
+        // a finding — the tree has several and they are harmless.
+        let mut v = Vec::new();
+        scan_truncation_heuristic(
+            "src/filter/mod.rs",
+            "fn prod() {}\n#[cfg(test)]\nmod t {}\n#[cfg(not(test))]\nfn x() {}\n",
+            &mut v,
+        );
+        assert!(v.is_empty(), "unrelated cfg(not(test)) must be quiet: {v:?}");
+    }
+
+    #[test]
+    fn truncation_heuristic_is_quiet_on_a_normal_file() {
+        let mut v = Vec::new();
+        scan_truncation_heuristic(
+            "src/afxdp/worker/loop_body/mod.rs",
+            "fn prod() {}\n#[cfg(test)]\nmod t { fn a() {} }\n",
+            &mut v,
+        );
+        assert!(v.is_empty(), "a normal file must not fire: {v:?}");
     }
 
     #[test]
@@ -477,7 +625,7 @@ mod self_tests {
         let mut v = Vec::new();
         scan_publish(
             "src/afxdp/coordinator/snapshot_refresh.rs",
-            "        self.ha\n            .runtime\n            .store(Arc::new(view));\n",
+            "        self.ha\n            .runtime\n            .publish(view);\n",
             &mut v,
         );
         assert!(
@@ -496,6 +644,56 @@ mod self_tests {
         );
         assert_eq!(v.len(), 1, "a wrapped second load must still fire rule 3");
         assert!(v[0].rule.starts_with('3'), "got {:?}", v[0]);
+    }
+
+    #[test]
+    fn the_marker_does_not_silence_production_code() {
+        // The marker used to suppress rule 2 wherever it appeared, including in
+        // production. It is now honoured only in a file's TEST half.
+        let mut v = Vec::new();
+        scan_publish(
+            "src/afxdp/coordinator/snapshot_refresh.rs",
+            "let view = RuntimeView::new(stale, fwd); // runtime-view-canary: test-local\n",
+            &mut v,
+        );
+        assert!(
+            v.iter().any(|x| x.rule.starts_with('2')),
+            "a marker on a PRODUCTION line must not exempt it: {v:?}"
+        );
+    }
+
+    #[test]
+    fn detects_the_raw_writable_arcswap_escaping_its_type() {
+        // Rule 1b. Holding `ArcSwap<RuntimeView>` outside its module is the
+        // capability escape a review probe used to publish a torn pair.
+        let mut v = Vec::new();
+        scan_publish(
+            "src/afxdp/coordinator/ha_state.rs",
+            "    pub(super) runtime: Arc<ArcSwap<RuntimeView>>,\n",
+            &mut v,
+        );
+        assert!(
+            v.iter().any(|x| x.rule.starts_with("1b")),
+            "a raw ArcSwap<RuntimeView> outside the type's module must fire: {v:?}"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_generic_still_counts_as_the_raw_arcswap() {
+        assert_eq!(
+            names_raw_runtime_arcswap(&code_blob_no_whitespace(
+                "fn f(x: Arc<ArcSwap<\n    RuntimeView,\n>>) {}"
+            )),
+            0,
+            "a trailing comma is a different spelling; documented limit"
+        );
+        assert_eq!(
+            names_raw_runtime_arcswap(&code_blob_no_whitespace(
+                "fn f(x: Arc<ArcSwap<\n    RuntimeView>>) {}"
+            )),
+            1,
+            "a plain wrapped generic must still match"
+        );
     }
 
     #[test]

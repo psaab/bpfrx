@@ -272,6 +272,23 @@ Differences that matter (#1881):
   same publish. There is no pair to tear and no ordering discipline to get
   wrong; both orientations are structurally impossible.
 
+  **The choke point is enforced by TYPES, not convention.** The coordinator
+  holds a `RuntimeViewChannel` and consumers hold a `RuntimeViewReader`
+  (`types/runtime_view.rs`); both wrap the `ArcSwap` in a private field, so
+  `publish` is the only mutation that exists anywhere and a consumer cannot
+  obtain a writer at all. `RuntimeView` itself has private fields and is NOT
+  `Clone`, so a loaded view cannot be mutated, and `RuntimeView::new` is the
+  only way to obtain a view value in the tree. That combination came from a
+  review probe: while `runtime_reader()` still returned the raw
+  `Arc<ArcSwap<RuntimeView>>` and the view was cloneable, production code could
+  clone a loaded view, bump its `fib_generation`, and store it — publishing the
+  exact torn pair while every source-canary rule passed. Each of those three
+  lines is now a compile error.
+  `tests/runtime_view_publish_canary.rs` remains as defence in depth for the
+  residue types cannot express: a new publish site inside `coordinator/`, the
+  raw `ArcSwap<RuntimeView>` escaping its module again, and a second view load
+  in one worker tick.
+
   **Holding an OLD view stays possible and is SAFE** — new-stamped packets
   mismatch the old validation and DROP, the intended fail-closed
   behaviour. The defect is an INCOHERENT pair, not a stale coherent one;

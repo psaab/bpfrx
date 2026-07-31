@@ -101,7 +101,7 @@ pub(crate) struct WorkerSharedDataplane {
     /// loading them separately could pair them across generations in either
     /// direction. One `Arc` means one load and no pair to tear — see
     /// `types/runtime_view.rs`.
-    pub(in crate::afxdp) runtime: Arc<ArcSwap<RuntimeView>>,
+    pub(in crate::afxdp) runtime: RuntimeViewReader,
     pub(in crate::afxdp) ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     pub(in crate::afxdp) local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>>,
     pub(in crate::afxdp) fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
@@ -331,7 +331,7 @@ mod tests {
         // fields, including the nested neighbors sub-bundle.
         // #6592: one field, not two — validation and forwarding now travel in
         // the single `RuntimeView` ArcSwap.
-        assert!(Arc::ptr_eq(&bundle.runtime, &coord.ha.runtime_reader()));
+        assert!(bundle.runtime.same_channel(&coord.ha.runtime_reader()));
         assert!(Arc::ptr_eq(&bundle.ha_state, &coord.ha.rg_runtime));
         assert!(Arc::ptr_eq(&bundle.fabrics, &coord.ha.fabrics));
         assert!(Arc::ptr_eq(&bundle.mirror_targets, &coord.mirror_targets));

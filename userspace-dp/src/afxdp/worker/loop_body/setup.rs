@@ -68,7 +68,7 @@ pub(super) struct WorkerLoopSetup {
 pub(super) fn worker_loop_setup(
     worker_id: u32,
     binding_plans: Vec<BindingPlan>,
-    shared_runtime: &ArcSwap<RuntimeView>,
+    shared_runtime: &RuntimeViewReader,
     shared_cos_owner_worker_by_queue: &ArcSwap<BTreeMap<(i32, u8), u32>>,
     shared_cos_owner_live_by_queue: &ArcSwap<BTreeMap<(i32, u8), Arc<BindingLiveState>>>,
     shared_cos_root_leases: &ArcSwap<BTreeMap<i32, Arc<SharedCoSRootLease>>>,
@@ -126,7 +126,7 @@ pub(super) fn worker_loop_setup(
     // this load per #5166.
     let (validation, forwarding) = {
         let view = shared_runtime.load();
-        (view.validation, view.forwarding.clone())
+        (view.validation(), view.forwarding().clone())
     };
     let cos_owner_worker_by_queue = shared_cos_owner_worker_by_queue.load_full();
     let cos_owner_live_by_queue = shared_cos_owner_live_by_queue.load_full();

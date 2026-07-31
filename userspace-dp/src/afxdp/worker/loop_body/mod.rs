@@ -131,19 +131,19 @@ mod debug_report;
 #[inline]
 fn refresh_runtime_view(
     forwarding: &Arc<ForwardingState>,
-    shared_runtime: &ArcSwap<RuntimeView>,
+    shared_runtime: &RuntimeViewReader,
     between: impl FnOnce(ValidationState),
 ) -> (Option<Arc<ForwardingState>>, ValidationState) {
     // ONE acquire-load. Everything below reads out of `view`, so the two
     // halves are from the same publish no matter what runs concurrently.
     let view = shared_runtime.load();
-    let validation = view.validation;
+    let validation = view.validation();
     between(validation);
     // #1188: adopt the forwarding Arc only when it actually rotated.
-    let new_forwarding = if Arc::ptr_eq(forwarding, &view.forwarding) {
+    let new_forwarding = if Arc::ptr_eq(forwarding, view.forwarding()) {
         None
     } else {
-        Some(view.forwarding.clone())
+        Some(view.forwarding().clone())
     };
     (new_forwarding, validation)
 }
@@ -2255,17 +2255,17 @@ mod snapshot_refresh_ordering_tests {
 
         /// Mint a fresh forwarding allocation stamped with `generation`, and
         /// return the `RuntimeView` the coordinator would publish for it.
-        fn mint(&mut self, generation: u64) -> RuntimeView {
+        fn mint(&mut self, generation: u64) -> Arc<RuntimeView> {
             let forwarding = Arc::new(ForwardingState::default());
             self.views.push((generation, forwarding.clone()));
-            RuntimeView::new(  // runtime-view-canary: test-local
+            Arc::new(RuntimeView::new(  // runtime-view-canary: test-local
                 ValidationState {
                     snapshot_installed: true,
                     config_generation: generation,
                     fib_generation: generation as u32,
                 },
                 forwarding,
-            )
+            ))
         }
 
         /// The generation `forwarding` was published with.
@@ -2312,8 +2312,13 @@ mod snapshot_refresh_ordering_tests {
     fn snapshot_refresh_runtime_view_pair_is_atomic_6592() {
         let mut published = PublishedGenerations::new();
 
-        let view1 = published.mint(1);
-        let shared_runtime = ArcSwap::from_pointee(view1);
+        // Drive the REAL publish/read split: a coordinator-side channel and a
+        // worker-side read-only handle. The worker literally cannot publish
+        // here — `RuntimeViewReader` has no store — so the test exercises the
+        // same capability boundary production does.
+        let channel = RuntimeViewChannel::default();
+        channel.publish(published.mint(1));
+        let shared_runtime = channel.reader();
 
         // Assert the returned pair is internally coherent, and report which
         // torn orientation a failure represents so a revert names its own bug.
@@ -2344,11 +2349,11 @@ mod snapshot_refresh_ordering_tests {
         // Its cached forwarding is the currently-published one, so with a
         // single load nothing rotates (#1188 short-circuit) and it keeps the
         // whole old pair — coherent, and safe.
-        let cached = shared_runtime.load().forwarding.clone();
+        let cached = shared_runtime.load().forwarding().clone();
         let view2 = published.mint(2);
         let (new_forwarding_opt, observed) =
             refresh_runtime_view(&cached, &shared_runtime, |_| {
-                shared_runtime.store(Arc::new(view2));
+                channel.publish(view2);
             });
         assert_coherent(
             &published,
@@ -2365,7 +2370,7 @@ mod snapshot_refresh_ordering_tests {
         let view3 = published.mint(3);
         let (new_forwarding_opt, observed) =
             refresh_runtime_view(&cached, &shared_runtime, |_| {
-                shared_runtime.store(Arc::new(view3));
+                channel.publish(view3);
             });
         assert!(
             new_forwarding_opt.is_some(),
@@ -2401,7 +2406,7 @@ mod snapshot_refresh_ordering_tests {
             "a quiescent refresh must converge on the newest published pair",
         );
         assert!(
-            Arc::ptr_eq(&adopted, &shared_runtime.load().forwarding),
+            Arc::ptr_eq(&adopted, shared_runtime.load().forwarding()),
             "the adopted forwarding must be the published allocation",
         );
 
@@ -2411,8 +2416,8 @@ mod snapshot_refresh_ordering_tests {
         // sees the new validation with no rotation and skips its expensive
         // forwarding-rotation branch. The pair stays coherent because it is
         // still one view.
-        let unrotated = shared_runtime.load().forwarding.clone();
-        shared_runtime.store(Arc::new(RuntimeView::new(  // runtime-view-canary: test-local
+        let unrotated = shared_runtime.load().forwarding().clone();
+        channel.publish(Arc::new(RuntimeView::new(  // runtime-view-canary: test-local
             ValidationState {
                 snapshot_installed: true,
                 config_generation: 3,

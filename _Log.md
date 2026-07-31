@@ -62446,3 +62446,67 @@ break — `go vet` confirmed passing under every revert.
     userspace-dp/src/afxdp/types/runtime_view.rs,
     userspace-dp/src/afxdp/forwarding_build/mod.rs,
     userspace-dp/benches/runtime_view_refresh.rs, _Log.md
+
+- **Timestamp**: 2026-07-31 11:15
+  - **Action**: Fold the Codex re-gate on PR #6608 (#6592) — MERGE-NEEDS-MINOR:
+    the source canary was demonstrably FAIL-OPEN, and the fix is to move the
+    write capability into the type system rather than keep enumerating
+    bypasses.
+    REPRODUCED FIRST, before changing anything. Codex's injection, verbatim,
+    into `refresh_fabric_links`:
+      let runtime_writer_alias = self.ha.runtime_reader();
+      let mut torn = runtime_writer_alias.load_full().as_ref().clone();
+      torn.validation.fib_generation =
+          torn.validation.fib_generation.wrapping_add(1);
+      runtime_writer_alias.store(Arc::new(torn));
+    On head 6d066d203 that COMPILED, published the exact (new validation, old
+    forwarding) tear, and all 15 canary tests PASSED (exit 0). My fold report
+    had argued rule 2 was the backstop because "a publish needs a view VALUE" —
+    that reasoning is exactly what fails, because a value can be obtained by
+    CLONING one out of a load instead of constructing one. Third enumeration
+    failure on this canary (after the rustfmt-wrapped chain), which is the
+    argument for stopping.
+    FIX — type-level, three independent compile errors on that injection:
+    (1) `RuntimeViewReader` (new): private `ArcSwap` field, sole method
+    `load()`. `runtime_reader()` returns it instead of
+    `Arc<ArcSwap<RuntimeView>>`, so a consumer cannot obtain a writer —
+    `.store(..)` and `.load_full()` do not exist on it.
+    (2) `RuntimeView` is no longer `Clone` — `.as_ref().clone()` does not
+    compile, which makes `RuntimeView::new` the ONLY way to obtain a view value
+    anywhere and turns "a publish needs a CONSTRUCTED view" from an
+    enumeration into a true statement.
+    (3) `RuntimeView`'s fields are private with `validation()` / `forwarding()`
+    accessors — `torn.validation.fib_generation = ..` does not compile.
+    Also `RuntimeViewChannel` (new) wraps the coordinator's `ArcSwap` in a
+    private field exposing only `publish`/`load`/`load_full`/`reader`, so
+    `swap`, `rcu`, `compare_and_swap` and `Deref` are unreachable rather than
+    merely unmatched by a regex — Codex's other named evasion.
+    CANARY, now defence in depth rather than the boundary: rule 1 counts
+    `.runtime.publish(` (the only mutation left); NEW rule 1b fires if any file
+    outside `types/runtime_view.rs` so much as names `ArcSwap<RuntimeView>`,
+    which is precisely the capability escape the probe used; rule 2's
+    `test-local` marker is now honoured ONLY in a file's test half (Codex:
+    unconstrained, it silenced production code too); and a truncation-heuristic
+    guard fires if a COUNTED reader file grows `#[cfg(not(test))]` past its
+    first top-level `#[cfg(test)]`, which is the only way production code lands
+    in the discarded half. 20 canary tests including self-tests for each new
+    rule. Deliberately NOT chased: distinguishing test from production loads
+    past the truncation point needs region tracking; the early warning is
+    enough while the count is zero, and that limit is written down rather than
+    implied.
+    CORRECTED MY OWN RECORD: my earlier "zero closure/call_once calls in
+    worker_loop" was an artefact — `dumpwl.py` normalises `<...>` to `<SYM>`
+    BEFORE the grep, so the check could never have matched. On raw objdump
+    `worker_loop` contains exactly 2 `call_once` calls, both a shared
+    `.llvm.`-deduplicated lazy-init thunk (`xor %edi,%edi` then a NULL-test on
+    the returned pointer), present identically with and without the seam call.
+    Codex was right and the corrected instrument is the call/lock-count
+    isolation, not a symbol grep.
+    GATES: `cargo test --release --bins --tests -- --test-threads=1` green
+    (4220 + 60 + 8 + 22 + 20 + 1, exit 0).
+  - **File(s)**: userspace-dp/src/afxdp/types/runtime_view.rs,
+    userspace-dp/src/afxdp/coordinator/{ha_state.rs,mod.rs,tests.rs,
+    tunnel_supervision.rs,snapshot_refresh.rs,README.md},
+    userspace-dp/src/afxdp/worker/{launch.rs,loop_body/mod.rs,loop_body/setup.rs},
+    userspace-dp/src/afxdp/tunnel.rs,
+    userspace-dp/tests/runtime_view_publish_canary.rs, _Log.md

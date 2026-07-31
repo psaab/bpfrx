@@ -732,7 +732,7 @@ fn refresh_runtime_snapshot_publishes_a_coherent_view_pair() {
     // site that built its view from a stale `validation`, or that stored
     // forwarding through some path other than the choke point, breaks this.
     assert_eq!(
-        published.validation,
+        published.validation(),
         ValidationState {
             snapshot_installed: true,
             config_generation: NEW_GEN,
@@ -741,12 +741,12 @@ fn refresh_runtime_snapshot_publishes_a_coherent_view_pair() {
         "the published view must carry this refresh's generation",
     );
     assert_eq!(
-        intended.validation, published.validation,
+        intended.validation(), published.validation(),
         "the published validation must be the one the choke point intended \
          (#6592 coherent publish)",
     );
     assert!(
-        Arc::ptr_eq(&intended.forwarding, &published.forwarding),
+        Arc::ptr_eq(intended.forwarding(), published.forwarding()),
         "the published forwarding must be the exact allocation the choke point \
          paired with that validation — a second store would decouple them",
     );
@@ -763,12 +763,12 @@ fn refresh_runtime_snapshot_publishes_a_coherent_view_pair() {
     // Not vacuous: the fixture really did rotate the generation, so the
     // published value could have differed from the pre-refresh default.
     assert_ne!(
-        published.validation, before,
+        published.validation(), before,
         "the fixture must actually rotate the generation, or the asserts above \
          are vacuous",
     );
     assert_eq!(
-        previous_view.validation, before,
+        previous_view.validation(), before,
         "the retained previous view is the pre-refresh one",
     );
 }
@@ -805,7 +805,7 @@ fn bump_fib_generation_publishes_new_stamps_without_rotating_forwarding() {
         .expect("refresh_runtime_snapshot must succeed");
 
     let before = coordinator.ha.runtime.load_full();
-    assert_eq!(before.validation.fib_generation, 9);
+    assert_eq!(before.validation().fib_generation, 9);
 
     assert!(
         coordinator.bump_fib_generation(10),
@@ -816,18 +816,18 @@ fn bump_fib_generation_publishes_new_stamps_without_rotating_forwarding() {
 
     // The stamps advanced and are worker-visible...
     assert_eq!(
-        after.validation.fib_generation, 10,
+        after.validation().fib_generation, 10,
         "the bump must be published to workers"
     );
     assert_eq!(
-        after.validation.config_generation, 4,
+        after.validation().config_generation, 4,
         "a FIB bump must not disturb the config generation"
     );
     // ...paired with the SAME forwarding allocation, so the worker's #1188
     // `Arc::ptr_eq` short-circuit still short-circuits and the rotation branch
     // is not taken.
     assert!(
-        Arc::ptr_eq(&before.forwarding, &after.forwarding),
+        Arc::ptr_eq(before.forwarding(), after.forwarding()),
         "#1188: a validation-only publish must REUSE the published forwarding \
          Arc — rotating it forces every worker through the expensive \
          forwarding-rotation branch for a change that touched no table",

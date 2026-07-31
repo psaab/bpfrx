@@ -30,7 +30,11 @@
 //!   structurally impossible. Every publish site goes through the single choke
 //!   point `Coordinator::publish_runtime_view` (or
 //!   `republish_runtime_validation` for a validation-only change), which builds
-//!   the view from `self.validation` at the store.
+//!   the view from `self.validation` at the store. That choke point is enforced
+//!   by TYPES: `RuntimeViewChannel` / `RuntimeViewReader` hide the `ArcSwap`, so
+//!   `publish` is the only mutation and consumers cannot obtain a writer, and
+//!   `RuntimeView` has private fields and no `Clone`, so a loaded view can be
+//!   neither mutated nor copied-and-tweaked.
 //! - **CoS maps ↔ forwarding (#5166) — still an ordering pair.** The CoS
 //!   owner/live/lease/backlog/vtime maps + `ha.fabrics` are stored BEFORE the
 //!   `RuntimeView`; the worker reads the view FIRST, then the CoS maps.

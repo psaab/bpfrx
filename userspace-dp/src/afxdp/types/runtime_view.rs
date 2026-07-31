@@ -63,16 +63,39 @@ use super::*;
 /// The worker-visible `(validation, forwarding)` pair, published as ONE
 /// `Arc` so the two can never be observed from different generations.
 ///
-/// Cheap to clone: `ValidationState` is `Copy` (24 bytes) and `forwarding` is
-/// an `Arc` refcount bump. Publishing a view that reuses the current
-/// forwarding costs one small allocation and no table copying.
-#[derive(Clone, Debug)]
+/// # Immutable and non-`Clone` on purpose
+///
+/// The fields are PRIVATE to this module and the type deliberately does NOT
+/// implement `Clone`. That is the language-level half of the invariant, and it
+/// exists because a review probe defeated the earlier source-canary version:
+///
+/// ```ignore
+/// let mut torn = channel.load_full().as_ref().clone();
+/// torn.validation.fib_generation = torn.validation.fib_generation.wrapping_add(1);
+/// channel.store(Arc::new(torn));      // published a torn pair
+/// ```
+///
+/// That compiled, published exactly the `(new validation, old forwarding)`
+/// tear, and every textual canary rule passed — the store was not the choke
+/// point's literal spelling, and the value came from a CLONE rather than a
+/// construction, so "a publish needs a constructed view" was simply false.
+///
+/// With private fields the mutation line does not compile, and without `Clone`
+/// the clone line does not compile. [`RuntimeView::new`] becomes the only way
+/// to obtain a view value anywhere in the tree, which is what makes the
+/// canary's construction rule a true statement rather than an enumeration of
+/// the spellings someone happened to think of.
+///
+/// Cheap to publish: `ValidationState` is `Copy` and `forwarding` is an `Arc`
+/// refcount bump, so a view reusing the current forwarding costs one small
+/// allocation and no table copying.
+#[derive(Debug)]
 pub(in crate::afxdp) struct RuntimeView {
     /// Generation stamps a packet's shim metadata is matched against
     /// (`classify_metadata`).
-    pub(in crate::afxdp) validation: ValidationState,
+    validation: ValidationState,
     /// The policy / FIB / NAT tables a `Valid` packet is forwarded under.
-    pub(in crate::afxdp) forwarding: Arc<ForwardingState>,
+    forwarding: Arc<ForwardingState>,
 }
 
 impl Default for RuntimeView {
@@ -89,16 +112,117 @@ impl RuntimeView {
     /// `Arc` (refcount bump, no table copy). Used by the validation-only
     /// publish path (`bump_fib_generation`) so the forwarding `Arc` identity —
     /// and with it the worker's #1188 short-circuit — is preserved.
-    pub(in crate::afxdp) fn new(validation: ValidationState, forwarding: Arc<ForwardingState>) -> Self {
+    ///
+    /// THE only way to obtain a `RuntimeView` value (the type is not `Clone`).
+    pub(in crate::afxdp) fn new(
+        validation: ValidationState,
+        forwarding: Arc<ForwardingState>,
+    ) -> Self {
         Self {
             validation,
             forwarding,
         }
     }
+
+    /// The generation stamps half. `Copy`, so a caller gets a value it cannot
+    /// write back.
+    #[inline]
+    pub(in crate::afxdp) fn validation(&self) -> ValidationState {
+        self.validation
+    }
+
+    /// The forwarding half, by reference. A caller may clone the `Arc` (that is
+    /// how a worker adopts it) but cannot swap this view's field.
+    #[inline]
+    pub(in crate::afxdp) fn forwarding(&self) -> &Arc<ForwardingState> {
+        &self.forwarding
+    }
 }
 
-/// #1188 short-circuit over a [`RuntimeView`] `ArcSwap` for readers that need
-/// ONLY the forwarding half (the GRE local-origin / WG control threads).
+/// The WRITE side of the runtime-view channel — the coordinator's handle.
+///
+/// Wraps the `ArcSwap` with a PRIVATE field and exposes exactly three
+/// operations. Nothing hands out the `ArcSwap` itself, so `swap`, `rcu`,
+/// `compare_and_swap`, `Deref` and every other mutation route `ArcSwap`
+/// provides are simply not reachable — [`RuntimeViewChannel::publish`] is the
+/// only way to change what workers see. That closes the "enumerate the
+/// mutation spellings" failure mode a textual canary cannot.
+pub(in crate::afxdp) struct RuntimeViewChannel {
+    inner: Arc<ArcSwap<RuntimeView>>,
+}
+
+impl Default for RuntimeViewChannel {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(RuntimeView::default())),
+        }
+    }
+}
+
+impl RuntimeViewChannel {
+    /// Hand a READ-ONLY handle to a worker or aux thread. The returned type
+    /// cannot publish, so no consumer can become a writer by aliasing.
+    pub(in crate::afxdp) fn reader(&self) -> RuntimeViewReader {
+        RuntimeViewReader {
+            inner: self.inner.clone(),
+        }
+    }
+
+    /// Acquire-load the current view (coordinator side).
+    #[inline]
+    pub(in crate::afxdp) fn load(&self) -> arc_swap::Guard<Arc<RuntimeView>> {
+        self.inner.load()
+    }
+
+    /// Acquire-load and retain the current view (the `#[cfg(test)]` publish
+    /// seam keeps the previous view alive with this, so `Arc::ptr_eq` cannot be
+    /// fooled by a freed allocation being reused).
+    pub(in crate::afxdp) fn load_full(&self) -> Arc<RuntimeView> {
+        self.inner.load_full()
+    }
+
+    /// Make `view` worker-visible. THE single mutation on this channel; the
+    /// coordinator funnels every publish through
+    /// `Coordinator::store_runtime_view` so the view is always built from
+    /// `self.validation` at the store.
+    pub(in crate::afxdp) fn publish(&self, view: Arc<RuntimeView>) {
+        self.inner.store(view);
+    }
+}
+
+/// The READ side of the runtime-view channel — what workers, the GRE
+/// local-origin threads, and every other consumer hold.
+///
+/// The `ArcSwap` is a private field and the only method is [`load`]. There is
+/// no `Deref`, no accessor returning the `ArcSwap`, and no publish method, so a
+/// consumer cannot obtain a writer at all — the earlier
+/// `runtime_reader() -> Arc<ArcSwap<RuntimeView>>` handed one out and a review
+/// probe used exactly that to publish a torn pair from `refresh_fabric_links`.
+///
+/// [`load`]: RuntimeViewReader::load
+#[derive(Clone)]
+pub(in crate::afxdp) struct RuntimeViewReader {
+    inner: Arc<ArcSwap<RuntimeView>>,
+}
+
+impl RuntimeViewReader {
+    /// THE single-load primitive. Both halves of the pair must come out of one
+    /// call: two loads in a tick can observe two different views and pair
+    /// halves across generations, which is the defect #6592 closed.
+    #[inline]
+    pub(in crate::afxdp) fn load(&self) -> arc_swap::Guard<Arc<RuntimeView>> {
+        self.inner.load()
+    }
+
+    /// Do two handles address the SAME channel? For the launch-wiring test
+    /// only — it replaces an `Arc::ptr_eq` on the formerly-exposed `ArcSwap`.
+    pub(in crate::afxdp) fn same_channel(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+/// #1188 short-circuit over a [`RuntimeViewReader`] for readers that need ONLY
+/// the forwarding half (the GRE local-origin / WG control threads).
 ///
 /// Returns `Some(new_arc)` when the published forwarding `Arc` differs from
 /// `cached`, `None` when it is the same allocation. A validation-only publish
@@ -107,12 +231,12 @@ impl RuntimeView {
 #[inline]
 pub(in crate::afxdp) fn load_forwarding_if_changed(
     cached: &Arc<ForwardingState>,
-    shared_runtime: &ArcSwap<RuntimeView>,
+    shared_runtime: &RuntimeViewReader,
 ) -> Option<Arc<ForwardingState>> {
     let view = shared_runtime.load();
-    if Arc::ptr_eq(cached, &view.forwarding) {
+    if Arc::ptr_eq(cached, view.forwarding()) {
         None
     } else {
-        Some(view.forwarding.clone())
+        Some(view.forwarding().clone())
     }
 }
