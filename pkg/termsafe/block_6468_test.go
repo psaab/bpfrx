@@ -106,8 +106,9 @@ func TestSanitizeBlockEscapesUnicodeLineSeparators(t *testing.T) {
 		in := "Hostname: rtr1" + tc.sep + "  BGP state = Established\n"
 		got := SanitizeBlockForDisplay(in)
 		if strings.Contains(got, tc.sep) {
-			t.Fatalf("%s: must be escaped — it can forge a row in the very table the block "+
-				"sanitizer exists to keep honest; got %q", tc.name, got)
+			t.Fatalf("%s: must be escaped — a terminal or pager that honors it as a break can "+
+				"add a row to the very table the block sanitizer is keeping printable; got %q",
+				tc.name, got)
 		}
 		if !strings.Contains(got, tc.want) {
 			t.Fatalf("%s: must render as the visible escape %s (a \\xHH byte escape cannot "+

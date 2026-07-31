@@ -77,6 +77,14 @@ func (m *Manager) GetRIPRoutes() ([]RIPRouteEntry, error) {
 // containing a SPACE shifts Interface/Level/State/HoldTime one column right and
 // puts peer bytes in each of them. Display sites must sanitize the WHOLE row —
 // see termsafe.SanitizeRowForDisplay.
+//
+// Sanitizing does NOT repair that shift. It keeps the row safe to print; the
+// VALUES remain positionally derived from peer-controlled text, so a shifted
+// row can display a State the peer chose and no display guard can detect it.
+// Fixing that needs this parse to change — FRR's IS-IS JSON output, or
+// right-anchored columns with malformed rows reported rather than rendered.
+// Tracked as #6590. Do not cite the display guard as making this struct
+// trustworthy.
 type ISISAdjacency struct {
 	SystemID  string
 	Interface string

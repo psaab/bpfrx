@@ -91,3 +91,149 @@ func TestSanitizeRowLeavesCleanCellsIdentical(t *testing.T) {
 		t.Fatalf("an empty row must produce an empty argument list")
 	}
 }
+
+// --- U+2028/U+2029 in a CELL (#6579 fold) -----------------------------------
+//
+// The first pass gave SanitizeBlockForDisplay line-separator escaping and left
+// SanitizeForDisplay passing them through, on the reasoning that a single-line
+// field is bounded by the caller's format string. Expanding the guard to
+// per-cell row rendering made that gap reachable in exactly the path the row
+// helper feeds: a cell IS a single-line field, so it now takes the single-line
+// variant, and a U+2028 in it can break the row on a terminal or pager that
+// honors it. Escaping LF but not U+2028 was incoherent — this variant is the
+// STRICTER of the two about line breaks.
+
+func TestSanitizeFieldEscapesUnicodeLineSeparators(t *testing.T) {
+	for _, tc := range []struct {
+		name, in, want string
+	}{
+		{"line separator", "peer\u2028forged-row", `\u2028`},
+		{"paragraph separator", "peer\u2029forged-row", `\u2029`},
+	} {
+		got := SanitizeForDisplay(tc.in)
+		if strings.ContainsAny(got, "\u2028\u2029") {
+			t.Fatalf("%s: a Unicode line separator inside a single-line FIELD forges a row "+
+				"and must be escaped; got %q", tc.name, got)
+		}
+		if !strings.Contains(got, tc.want) {
+			t.Fatalf("%s: want the visible %s escape (a \\xHH byte escape cannot represent "+
+				"a rune above U+00FF); got %q", tc.name, tc.want, got)
+		}
+		if !strings.HasPrefix(got, "peer") || !strings.HasSuffix(got, "forged-row") {
+			t.Fatalf("%s: the surrounding text must survive; got %q", tc.name, got)
+		}
+	}
+}
+
+func TestDisplaySafeRejectsUnicodeLineSeparators(t *testing.T) {
+	// DisplaySafe is SanitizeForDisplay's fast-path guard: anything it calls
+	// safe is returned UNSANITIZED. If it drifts out of lockstep with the
+	// escaping rules, that escaping is dead code.
+	for _, in := range []string{"peer\u2028x", "peer\u2029x"} {
+		if DisplaySafe(in) {
+			t.Fatalf("DisplaySafe(%q) must be false - it gates SanitizeForDisplay's "+
+				"allocation-free return, so calling this safe skips the escaping entirely", in)
+		}
+	}
+	if !DisplaySafe("rtr1.example.net") {
+		t.Fatalf("a clean field must still take the fast path")
+	}
+}
+
+func TestSanitizeRowEscapesUnicodeLineSeparatorInACell(t *testing.T) {
+	// The row helper is why this matters: a cell IS a single-line field, so it
+	// takes the single-line variant, and the gap was reachable per cell in the
+	// very path #6579 expanded.
+	got := SanitizeRowForDisplay("peer\u2028forged-row", "clean")
+	first := got[0].(string)
+	if strings.ContainsAny(first, "\u2028\u2029") {
+		t.Fatalf("a Unicode line separator must not survive in a rendered cell; got %q", first)
+	}
+	if !strings.Contains(first, `\u2028`) {
+		t.Fatalf("want the visible \\u2028 escape; got %q", first)
+	}
+	if got[1].(string) != "clean" {
+		t.Fatalf("a clean sibling cell must pass through byte-identical; got %q", got[1])
+	}
+}
+
+// --- cost (#6579 fold, MINOR-3) ---------------------------------------------
+
+func TestSanitizeCleanFieldIsAllocationFree(t *testing.T) {
+	// The substantive claim in SanitizeRowForDisplay's doc: the per-cell guard
+	// itself is free, so guarding every column instead of a hand-picked subset
+	// costs nothing at the cell. (The helper's own []any is a separate,
+	// measured cost — see the benchmarks below.)
+	clean := "10.0.0.1" + strings.Repeat("", 0) // defeat constant folding
+	if n := testing.AllocsPerRun(200, func() { _ = SanitizeForDisplay(clean) }); n != 0 {
+		t.Fatalf("SanitizeForDisplay must not allocate for a clean field, got %.0f allocs/op — "+
+			"the whole-row guard is justified by this fast path being free", n)
+	}
+	block := "line one\n\tindented\n"
+	if n := testing.AllocsPerRun(200, func() { _ = SanitizeBlockForDisplay(block) }); n != 0 {
+		t.Fatalf("SanitizeBlockForDisplay must not allocate for a clean block, got %.0f allocs/op", n)
+	}
+}
+
+// benchRoute mirrors the production shape: cells are STRUCT FIELDS, not string
+// constants. Benchmarking constants understates the unguarded baseline, because
+// the compiler boxes a constant into a read-only static and reports ~0 allocs
+// for a path that allocates 3/row in production.
+type benchRoute struct{ Network, NextHop, Path string }
+
+var benchRoutes = func() []benchRoute {
+	out := make([]benchRoute, 1000)
+	for i := range out {
+		out[i] = benchRoute{
+			Network: fmt.Sprintf("10.%d.%d.0/24", i/256, i%256),
+			NextHop: fmt.Sprintf("10.0.0.%d", i%256),
+			Path:    "65001 65002 65003",
+		}
+	}
+	return out
+}()
+
+var benchSink string
+
+// BenchmarkSanitizedRowUnguarded is the honest baseline: the same render with
+// NO sanitizer. Compare against BenchmarkSanitizedRowHelper to attribute cost.
+func BenchmarkSanitizedRowUnguarded(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var sb strings.Builder
+		for _, r := range benchRoutes {
+			fmt.Fprintf(&sb, "%-24s %-20s %s\n", r.Network, r.NextHop, r.Path)
+		}
+		benchSink = sb.String()
+	}
+}
+
+// BenchmarkSanitizedRowInline isolates the per-cell guard from the helper. It
+// lands on the unguarded baseline, which is the measurement behind "sanitizing
+// a clean cell is genuinely free".
+func BenchmarkSanitizedRowInline(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var sb strings.Builder
+		for _, r := range benchRoutes {
+			fmt.Fprintf(&sb, "%-24s %-20s %s\n",
+				SanitizeForDisplay(r.Network), SanitizeForDisplay(r.NextHop), SanitizeForDisplay(r.Path))
+		}
+		benchSink = sb.String()
+	}
+}
+
+// BenchmarkSanitizedRowHelper is the shipped path. The delta against
+// BenchmarkSanitizedRowUnguarded is one allocation and 48 bytes per row: the
+// returned []any. Everything else is fmt's own boxing, paid either way.
+func BenchmarkSanitizedRowHelper(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var sb strings.Builder
+		for _, r := range benchRoutes {
+			fmt.Fprintf(&sb, "%-24s %-20s %s\n",
+				SanitizeRowForDisplay(r.Network, r.NextHop, r.Path)...)
+		}
+		benchSink = sb.String()
+	}
+}

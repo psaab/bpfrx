@@ -180,10 +180,17 @@ presenter's rendered output is byte-identical:
   in a field is itself a forgery vector — it fakes a table row.
   `SanitizeBlockForDisplay` is for a MULTI-LINE blob whose own line structure is
   the output: it PRESERVES LF and TAB so a BGP table is not collapsed into one
-  `\x0a`-laden line, and escapes CR plus U+2028/U+2029 because those forge or
-  overwrite rows rather than carry structure. Using the single-line variant on a
-  block mangles the output; using the block variant on a field re-opens the
+  `\x0a`-laden line, and escapes CR because a bare carriage return overwrites a
+  line rather than carrying structure. Using the single-line variant on a block
+  mangles the output; using the block variant on a field re-opens the
   row-forgery hole. The tests assert both directions.
+
+  **Both** variants escape U+2028/U+2029. Neither is Unicode category Cc, so
+  `unicode.IsControl` does not reach them, but a terminal or pager that honors
+  either as a break can forge a row with it — in a block whose line structure is
+  the output, and equally in a single-line field the caller pads into a row.
+  Escaping LF but passing U+2028 in the field variant would be incoherent: that
+  variant is the stricter of the two about line breaks.
 
   **The guard goes on BOTH terminal-facing renderers.** Every one of these
   commands runs on the local CLI *and* the remote `cli`, which prints
@@ -223,19 +230,60 @@ presenter's rendered output is byte-identical:
     protocol. `bgp default show-hostname` already makes FRR emit a peer-supplied
     hostname in the BGP summary; today the only thing keeping it out is that
     `frr.bgpPeerJSON` does not declare the field, which is a load-bearing
-    invariant documented at its definition.
+    invariant documented at its definition and pinned by
+    `pkg/frr/bgp_summary_hostname_6468_test.go`.
+
+  Guard the cells **before** the caller's width format, not the finished row.
+  `%-20s` pads whatever it is handed, so escaping afterwards pads the RAW cell
+  and then expands each escape, pushing every later column right by the
+  expansion. `assertCellGuardRanBeforeWidthFormat6579` binds that ordering.
+
+  **What the guard does NOT do — do not overstate this in a review.** It makes
+  a row safe to **print**. It does not make the row **correct**, and a call to
+  `SanitizeRowForDisplay` is not evidence that a displayed value is genuine:
+
+  - The column shift above is the *reason* to guard every cell. It is not
+    something guarding every cell *repairs*. A peer hostname containing a space
+    still shifts `strings.Fields`, so `State` can end up displaying a token the
+    peer chose, and `SanitizeForDisplay` preserves plausible printable text —
+    it cannot tell a real `Up` from an attacker-supplied one. **A row can be
+    terminal-safe and materially false.**
+  - Fixing *that* needs the parse to change (FRR's JSON output, or
+    right-anchored column parsing that reports malformed rows instead of
+    rendering them silently). That is tracked as **#6590** and is deliberately
+    out of scope for the display guard.
+  - Bidi overrides and other Cf runes are also out of scope: they reorder
+    characters within a line but cannot forge or erase a row.
 
   The block and field variants are observationally identical for a
   `strings.Fields`-derived cell (the split already consumed every whitespace
   rune), but NOT for a JSON-decoded one — a BGP-summary cell can carry a real
   LF, which the block variant preserves by design and would render as a forged
-  table row. That case is the isolating test for the row guard.
+  table row.
+
+  That matters for testing, because on the gRPC handlers the response-boundary
+  block guard **masks** a dropped per-cell guard: the ESC is neutralized either
+  way, so a raw-control-byte assertion cannot tell the two apart. Two shapes see
+  through the mask, and every row binder uses one:
+
+  - a real LF in a JSON-decoded cell (BGP summary), which the block variant
+    preserves by design;
+  - **column alignment**, which works even where the LF shape is unreachable —
+    for a `strings.Fields`-derived cell such as IS-IS `SystemID`, the split
+    already consumed every whitespace rune, so alignment is the only
+    discriminator left.
+
+  `pkg/grpcapi/GetRIPStatus` has no response-boundary guard (it has no
+  raw-`vtysh` branch for one to protect), so its per-cell guard is isolated by
+  construction; the local CLI row paths print directly and are likewise
+  unmasked.
 
   The sanitizer lives in the leaf package `pkg/termsafe` (stdlib-only) because
   `pkg/cli` imports `pkg/grpcapi`, so a helper in `pkg/cli` could not be shared
   upward. Fail-on-revert guards for every call site live in
-  `cli_residual_escape_6468_test.go` / `cli_show_dhcp_escape_6468_test.go` and
-  their `pkg/grpcapi` mirrors.
+  `cli_residual_escape_6468_test.go` / `cli_row_escape_6579_test.go` /
+  `cli_show_dhcp_escape_6468_test.go` and their `pkg/grpcapi` mirrors; all ten
+  parsed-row sites (five per renderer) are individually bound.
 
   Not guarded, deliberately: LLDP neighbor fields are already sanitized at the
   ingest boundary (`lldp.sanitizeTLVString`); the DHCPv6 DUID view and the

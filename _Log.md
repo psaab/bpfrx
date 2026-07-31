@@ -61853,10 +61853,9 @@ assertion.
 
 **MINOR-3** — `SanitizeBlockForDisplay` now escapes U+2028/U+2029. They are
 Zl/Zp, so `unicode.IsControl` misses them and the single-line variant's
-documented bidi/Cf out-scope let them through. That is defensible for a field
-but not for a BLOCK sanitizer whose whole premise is line structure: a terminal
-that honors U+2028 as a break lets a peer hostname forge a row in the very
-table the function protects. Same argument that escapes CR. Rendered as
+documented bidi/Cf out-scope let them through. A terminal that honors U+2028 as
+a break lets a peer hostname add a row to the very table the function is
+keeping printable. Same argument that escapes CR. Rendered as
 ` ` (a `\xHH` escape cannot represent a rune above U+00FF);
 `blockDisplaySafe` rejects them so the fast path cannot bypass.
 
@@ -61893,12 +61892,13 @@ renderers — free on clean text, and "this column is numeric" is a property of
 the current FRR rather than of the protocol.
 
 **Row guard is NOT redundant with the response-boundary block guard.** Proven,
-not assumed: reverting the gRPC IS-IS row guard alone leaves the test green
-because the block guard catches it. The isolating case is a JSON-decoded
+not assumed: reverting the gRPC IS-IS row guard alone leaves the raw-ESC test
+green because the block guard catches it. The isolating case is a JSON-decoded
 BGP-summary cell carrying a real LF — the block variant preserves LF by design
 and renders a forged peer row; only the per-cell field guard escapes it. Both
 renderers now have that test, and the gRPC IS-IS test is documented as
-defense-in-depth rather than a binder.
+defense-in-depth rather than a binder. (Superseded by the next entry: the gRPC
+IS-IS per-cell call IS bindable, via column alignment rather than content.)
 
 **Factual correction.** The earlier comments said dyndns2/duckdns/**generic**
 wrap the provider body in `%q`. Verified wrong: generic does not quote the body,
@@ -61913,3 +61913,99 @@ Scoped out, verified: `frr.FormatRouteDetail` (JSON-typed, no free-text cell),
 (JSON, no shipped terminal consumer). The `slog`/remote-syslog sink Codex
 raised is a different sink and a package-wide policy question; filed separately
 by the parent, deliberately NOT folded here.
+
+## 2026-07-31 — fold the Codex re-review of #6579 (claim narrowing + row-site binders)
+
+- **Timestamp**: 2026-07-31
+- **Action**: Codex re-reviewed the folded head at `83aba402d` and returned
+  MERGE-NEEDS-MAJOR. The MAJOR is real and is filed as **#6590**, deliberately
+  NOT fixed here: it is a different bug class at a different layer (parsing),
+  while this PR closes escape-injection at the display layer. What this fold
+  does about it is make sure the PR, the docs and the code comments do not
+  CLAIM more than they deliver. The three MINORs are folded.
+- **File(s)**: `pkg/termsafe/termsafe.go`, `pkg/termsafe/row_6468_test.go`,
+  `pkg/termsafe/block_6468_test.go`, `pkg/frr/status_parse.go`,
+  `pkg/frr/bgp_summary_hostname_6468_test.go` (new),
+  `pkg/cli/cli_row_escape_6579_test.go` (new),
+  `pkg/grpcapi/server_row_escape_6579_test.go` (new),
+  `pkg/grpcapi/server_routing_escape_6468_test.go`, `pkg/cli/README.md`
+
+**MAJOR (#6590) — narrowed every claim instead of overstating the fix.** Codex
+is right that escaping a row does not prevent SEMANTIC spoofing: `strings.Fields`
+splits on whitespace, so a peer hostname containing a space shifts every later
+column and `SanitizeRowForDisplay` — which preserves plausible printable text —
+cannot tell a genuine `State=Up` from a peer-supplied token. **A row can be
+terminal-safe and materially false.** Narrowed in five places: the `pkg/termsafe`
+package doc, the `SanitizeRowForDisplay` doc (new "What this does NOT fix"
+section, ending "do not cite a call to this function as evidence that a rendered
+row is trustworthy"), the `SanitizeBlockForDisplay` doc, the `ISISAdjacency` doc
+in `pkg/frr`, and the `pkg/cli/README.md` guard contract (new "What the guard
+does NOT do — do not overstate this in a review"). Also dropped two "keeps the
+table honest" phrasings, in the block doc and a test message, for "keeping it
+printable". Every narrowing points at #6590.
+
+**MINOR-2 — `SanitizeForDisplay` now escapes U+2028/U+2029 too.** The first fold
+gave the BLOCK variant line-separator escaping and left the field variant
+passing them, which became incoherent once cells started going through the
+field variant: that variant already escapes LF, so passing the Unicode line
+break while escaping the ASCII one made the STRICTER variant the more permissive
+one for exactly the row-forgery vector. `DisplaySafe` moved in lockstep — it
+gates the allocation-free return, so leaving it behind would have made the new
+escaping dead code, and there is a test that says so. Blast radius on already-
+merged #6468 surfaces (DHCP lease `Hostname`/`HWAddress`, DDNS `FQDN`,
+`LastError`): judged a strict improvement — all are single-line fields padded
+into a row, where a line separator has no legitimate use. `DisplaySafe` has no
+callers outside the package.
+
+**MINOR-3 — corrected the false cost claim, kept the API.** Codex measured ~96 B
+/ 4 allocs per clean 3-cell row "versus zero for direct formatting". The 96 B / 4
+allocs reproduce; the zero-alloc baseline does not — it is an artifact of
+benchmarking string CONSTANTS, which the compiler boxes into read-only statics.
+Measured with production-shaped values (struct fields), 10k 3-cell rows:
+
+| path | allocs | bytes |
+|---|---|---|
+| no sanitizer at all | 30,034 | 3.73 MB |
+| per-cell `SanitizeForDisplay`, no helper | 30,035 | 3.73 MB |
+| `SanitizeRowForDisplay(...)...` | 40,037 | 4.21 MB |
+
+So the helper's real cost is ONE allocation and 48 bytes per row (the `[]any`);
+the 3-per-row boxing is inherent to `fmt`'s variadic `any` and is paid by the
+unguarded path too. The per-cell sanitize is genuinely free — that was the
+substantive claim and it holds. Accepted rather than restructured: these are
+`show` render loops already gated by a `vtysh` fork/exec and a whole-table
+string materialization, not a packet path. The doc now carries the table, names
+the escape hatch (hoist a scratch `[]any`), and `BenchmarkSanitizedRow{Unguarded,
+Inline,Helper}` plus a `testing.AllocsPerRun` pin keep it checkable.
+
+**MINOR-4 — closed all three coverage gaps.**
+
+- *Missing call-site binders.* OSPF neighbors, BGP routes and RIP routes had no
+  binder on either renderer. Added, with per-parser fixtures. All **10**
+  parsed-row sites (5 per renderer) are now individually bound: reverting any
+  one produces a build-clean assertion failure naming that site.
+- *The masked IS-IS binder.* Codex was right that reverting the inner gRPC IS-IS
+  row guard still passed — the response-boundary block guard neutralizes the ESC
+  either way. Codex's suggested fix (the JSON-decoded LF shape) is **not**
+  reachable for this row: `strings.Fields` splits on `unicode.IsSpace`, which
+  includes LF, TAB, NEL, NBSP *and* U+2028/U+2029, so no whitespace rune can
+  survive into an IS-IS cell. The discriminator that does survive the mask is
+  COLUMN ALIGNMENT: `%-20s` pads whatever it is handed, so guarding the cell
+  pads the 17-char escaped text to 20, while guarding only the response pads the
+  14-byte raw text and *then* expands the escape — the next column shifts right
+  by exactly 3. Reverting now fails with "the next column starts at 26 instead
+  of 23 — exactly the 3 bytes the ESC grows by when escaped". This also binds a
+  real property: the guard must precede the width format or a hostile cell
+  displaces every column after it.
+- *The `encoding/json` declared-field-set claim.* Documented as a load-bearing
+  security boundary, previously unpinned. Two tests in `pkg/frr`: a hostile
+  `hostname` key must not reach ANY string field of `BGPPeerSummary` (reflective
+  sweep, so a future field addition is caught), and `bgpPeerJSON` must declare
+  no hostname field and no catch-all decode target (map/interface/slice) that
+  would defeat "undeclared keys are dropped".
+
+**Validation.** `pkg/cli`, `pkg/grpcapi`, `pkg/termsafe`, `pkg/frr`, `pkg/api`,
+`pkg/ddns` all green; `go build ./...` and `go vet ./pkg/...` clean. Revert
+battery: 10 row sites + the U+2028 escaping + both JSON-boundary tests, each
+reverted via Edit one hunk at a time so RED is an assertion and never a build
+break — `go vet` confirmed passing under every revert.

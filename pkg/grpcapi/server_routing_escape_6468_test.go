@@ -177,15 +177,19 @@ func TestGetISISStatus_RemoteCLIEscapesVtyshOutput_6468(t *testing.T) {
 // the "raw vtysh output" sweep could not see: a PARSED field (the peer's IS-IS
 // dynamic hostname) reprinted into a caller-formatted row.
 //
-// On THIS renderer the row is now covered TWICE — by the per-cell row guard and
-// by the response-boundary block guard — so reverting either one alone leaves
-// this test green. That is stated rather than hidden: it is a defense-in-depth
-// end-to-end assertion, not the binder for the row guard. The binders are
-// TestShowISIS_LocalCLIEscapesParsedAdjacencyRow_6468 (the local CLI has no
-// response boundary, so the row guard is the only thing standing there) and
-// TestGetBGPStatus_RemoteCLIEscapesParsedSummaryRow_6468 (a JSON-decoded cell
-// carrying a real LF, which the block guard preserves by design and cannot
-// catch). The combined-revert case in the fail-on-revert gate covers this one.
+// On THIS renderer the row is covered TWICE — by the per-cell row guard and by
+// the response-boundary block guard — so reverting either one alone still
+// produces safe output HERE. This test is therefore the end-to-end
+// defense-in-depth assertion, not the binder for the per-cell call.
+//
+// The per-cell call IS bound, by
+// TestGetISISStatus_RemoteCLICellGuardPrecedesWidthFormat_6579 in
+// server_row_escape_6579_test.go: the guard must run BEFORE the %-20s width
+// format, so dropping it pads the RAW cell and shifts every later column right
+// by the escape expansion. That discriminator survives the outer block guard,
+// which the raw-control-byte assertion below does not. The LF shape that
+// isolates BGP summary is unreachable for this row because strings.Fields
+// consumed every whitespace rune before the cell existed.
 func TestGetISISStatus_RemoteCLIEscapesParsedAdjacencyRow_6468(t *testing.T) {
 	s := escapeVtyshServer6468(t)
 	resp, err := s.GetISISStatus(context.Background(), &pb.GetISISStatusRequest{Type: ""})

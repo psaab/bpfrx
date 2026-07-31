@@ -26,6 +26,18 @@
 //     CR and the Unicode line/paragraph separators are not, because they forge
 //     or overwrite rows.
 //
+// Both escape U+2028/U+2029. Neither is Unicode category Cc, so unicode.IsControl
+// does not reach them, but a terminal or pager that honors either as a break can
+// forge a row with it — the same argument that escapes CR in the block variant
+// and LF in the field variant.
+//
+// What this package does NOT do: it makes device text safe to PRINT, not
+// trustworthy to READ. It neutralizes terminal-protocol control bytes; it leaves
+// every printable rune alone, so it cannot tell a genuine field value from a
+// plausible-looking one a peer supplied. A row whose columns were derived by
+// splitting peer-controlled text on whitespace stays terminal-safe and can still
+// display materially false values — see #6590 and SanitizeRowForDisplay.
+//
 // This is a leaf package (it imports only the standard library) so BOTH the
 // in-process CLI renderer (pkg/cli) and the gRPC text renderer that feeds the
 // remote `cli`'s verbatim terminal print (pkg/grpcapi) can guard the same
@@ -55,14 +67,23 @@ const hexDigits = "0123456789abcdef"
 // including legitimate multibyte UTF-8, so an international hostname is not
 // corrupted — passes through unchanged.
 //
-// Scope is deliberately narrow. This neutralizes exactly the C0/DEL/C1
-// terminal-protocol control bytes and invalid UTF-8 that drive escape-sequence
-// injection (OSC clipboard writes, CSI cursor/erase) — unicode.IsControl covers
-// only Unicode category Cc. It does NOT address Unicode display-order spoofing:
-// bidirectional overrides (U+200E, U+202A-U+202E), line/paragraph separators
-// (U+2028/U+2029), and zero-width format (Cf) characters are printable runes and
-// pass through unchanged. Defending against Trojan-Source-style bidi reordering
-// is a separate, lower-severity concern and out of scope here.
+// U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are escaped too, as
+// \u2028 / \u2029 (a \xHH byte escape cannot represent a rune above U+00FF).
+// Neither is Unicode category Cc, so unicode.IsControl does not reach them; they
+// are escaped because this variant's whole premise is that the value occupies ONE
+// line of a row the caller formats, and a rune a terminal or pager may honor as a
+// line break forges a row exactly as an embedded LF does. Escaping LF but passing
+// U+2028 would be incoherent: this variant is the STRICTER of the two about line
+// breaks, and SanitizeBlockForDisplay — which preserves LF — already escapes them.
+//
+// Scope is otherwise deliberately narrow. This neutralizes the terminal-protocol
+// control bytes and invalid UTF-8 that drive escape-sequence injection (OSC
+// clipboard writes, CSI cursor/erase), plus the two line separators. It does NOT
+// address Unicode display-order spoofing: bidirectional overrides (U+200E,
+// U+202A-U+202E) and zero-width format (Cf) characters are printable runes and
+// pass through unchanged. They can reorder characters WITHIN a line but cannot
+// forge or erase a row, so Trojan-Source-style bidi reordering is a separate,
+// lower-severity concern and out of scope here.
 func SanitizeForDisplay(s string) string {
 	// Fast path: the overwhelming majority of names are already clean, so
 	// return the input without allocating a builder.
@@ -84,6 +105,11 @@ func SanitizeForDisplay(s string) string {
 			// Control runes (Unicode category Cc) are all <= U+009F, so a
 			// single \xHH byte escape represents each one exactly.
 			writeHexEscape(&b, byte(r))
+			i += size
+			continue
+		}
+		if isLineSeparator(r) {
+			writeUnicodeEscape(&b, r)
 			i += size
 			continue
 		}
@@ -109,22 +135,24 @@ func SanitizeForDisplay(s string) string {
 // the same class of display forgery the ESC escaping defends against, and not
 // something a legitimate line-oriented blob needs.
 //
-// U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are escaped too, and
-// this is where the block variant deliberately diverges from SanitizeForDisplay
-// rather than inheriting its rationale. Neither is Unicode category Cc, so
-// unicode.IsControl does not catch them and the single-line sanitizer — whose
-// doc out-scopes bidi/Cf display-order spoofing — lets them through. That is
-// defensible for a single-line field, where the caller's own format string
-// bounds the row. It is NOT defensible here: the whole premise of this variant
-// is that the blob's LINE STRUCTURE is meaningful output, and terminals and
-// pagers that honor U+2028 as a break let a peer-advertised hostname forge a
-// row in exactly the table this function exists to keep honest. Escaping them
-// is the same argument that escapes CR. They render as the visible escapes
+// U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are escaped. Neither is
+// Unicode category Cc, so unicode.IsControl does not reach them; they are
+// escaped because the whole premise of this variant is that the blob's LINE
+// STRUCTURE is meaningful output, and a terminal or pager that honors U+2028 as
+// a break lets a peer-advertised hostname forge a row in the same table this
+// function is keeping printable. Escaping them is the same argument that
+// escapes CR. SanitizeForDisplay escapes them too, for the mirror-image reason:
+// a line break of any kind inside a single-line FIELD forges a row. They render
+// as the visible escapes
 // \u2028 / \u2029 (a \xHH byte escape cannot represent a rune above U+00FF).
 //
 // Bidi overrides and other Cf runes remain out of scope here, as in
 // SanitizeForDisplay: they can reorder characters WITHIN a line but cannot
 // forge or erase a row, so they are a different, lower-severity class.
+//
+// This makes the blob safe to PRINT; it does not make its contents true. The
+// text is rendered faithfully, so whatever a remote party put in it is still
+// what the operator reads.
 func SanitizeBlockForDisplay(s string) string {
 	if blockDisplaySafe(s) {
 		return s
@@ -180,10 +208,18 @@ func SanitizeBlockForDisplay(s string) string {
 //     the same for BGP; a column that is an address today can be free text
 //     after an upstream bump.
 //
-// Sanitizing a clean cell costs nothing — SanitizeForDisplay returns the input
-// string itself on the allocation-free fast path — so the uniform guard is
-// strictly cheaper than maintaining a per-column ledger of what is currently
-// attacker-reachable.
+// # What this does NOT fix
+//
+// The column shift above is the REASON to guard every cell; it is not something
+// guarding every cell REPAIRS. This makes the row safe to print. It does not
+// make the row correct. A peer hostname containing a space still shifts the
+// split, so `State` can end up holding a token the peer chose, and every value
+// here stays plausible printable text that no sanitizer can tell apart from a
+// genuine one. A displayed row can be terminal-safe and materially false.
+// Fixing THAT needs the parse to change — structured JSON, or right-anchored
+// columns with malformed rows reported rather than rendered — which is #6590,
+// deliberately not this helper's job. Do not cite a call to this function as
+// evidence that a rendered row is trustworthy.
 //
 // Cells are single-line FIELDS of a caller-formatted row, so this uses
 // SanitizeForDisplay, not the block variant: an embedded newline here forges a
@@ -191,6 +227,33 @@ func SanitizeBlockForDisplay(s string) string {
 // `strings.Fields` the two variants happen to agree, because every whitespace
 // rune was already consumed by the split; for a cell decoded out of JSON a
 // newline can survive, and there the distinction is load-bearing.)
+//
+// Call this on the CELLS, before the caller's width format — not on the
+// finished row. `%-20s` pads whatever it is handed, so sanitizing afterwards
+// pads the RAW cell and then expands each escape, pushing every later column
+// right by the expansion. Guarding per cell is what keeps the widths honest.
+//
+// # Cost
+//
+// Sanitizing a clean cell is genuinely free: SanitizeForDisplay returns the
+// input string on an allocation-free fast path. The HELPER is not free — it
+// allocates the returned []any. Measured over a 10k-row 3-cell render (values
+// from struct fields, as production has them, not the string constants a naive
+// microbenchmark constant-folds):
+//
+//	no sanitizer at all                    30,034 allocs   3.73 MB
+//	per-cell SanitizeForDisplay, no helper 30,035 allocs   3.73 MB
+//	SanitizeRowForDisplay(...)...          40,037 allocs   4.21 MB
+//
+// So the cost is ONE extra allocation and 48 bytes per row — the []any itself.
+// The 3-per-row boxing is inherent to fmt's variadic any and is paid by the
+// unguarded path too; it is not attributable to this helper. That is accepted
+// here: these are `show`-command render loops already gated by a vtysh
+// fork/exec and a whole-table string materialization, not a packet path. If a
+// future renderer ever needs it back, the fix is for the caller to hoist a
+// scratch []any out of the loop and refill it per row — not to revert to
+// guarding a hand-picked subset of columns. BenchmarkSanitizedRow* in
+// row_6468_test.go keeps these numbers checkable.
 func SanitizeRowForDisplay(cells ...string) []any {
 	out := make([]any, len(cells))
 	for i, c := range cells {
@@ -221,15 +284,21 @@ func blockDisplaySafe(s string) bool {
 }
 
 // isLineSeparator reports whether r is a Unicode line/paragraph separator —
-// category Zl/Zp, which unicode.IsControl does not cover. Only the block
-// sanitizer treats these as unsafe; see SanitizeBlockForDisplay.
+// category Zl/Zp, which unicode.IsControl does not cover. BOTH sanitizers treat
+// these as unsafe: they forge a row in a block whose line structure is the
+// output, and equally in a single-line field the caller formats into a row.
 func isLineSeparator(r rune) bool {
 	return r == '\u2028' || r == '\u2029'
 }
 
 // DisplaySafe reports whether s can be printed to a terminal verbatim: it holds
-// no control rune and no invalid UTF-8 byte, so SanitizeForDisplay would return
-// it unchanged. Splitting this out keeps the common (clean) path allocation-free.
+// no control rune, no Unicode line/paragraph separator, and no invalid UTF-8
+// byte, so SanitizeForDisplay would return it unchanged. Splitting this out
+// keeps the common (clean) path allocation-free.
+//
+// This predicate MUST stay in lockstep with SanitizeForDisplay's escaping rules
+// — it is that function's fast-path guard, so anything it calls safe is returned
+// unsanitized.
 func DisplaySafe(s string) bool {
 	for i := 0; i < len(s); {
 		r, size := utf8.DecodeRuneInString(s[i:])
@@ -237,6 +306,9 @@ func DisplaySafe(s string) bool {
 			return false
 		}
 		if unicode.IsControl(r) {
+			return false
+		}
+		if isLineSeparator(r) {
 			return false
 		}
 		i += size
