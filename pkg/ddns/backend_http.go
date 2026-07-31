@@ -424,42 +424,93 @@ func doRequest(ctx context.Context, client *http.Client, req *http.Request) (int
 	return resp.StatusCode, body, nil
 }
 
-// scrubURLError renders an HTTP-client error without leaking secrets carried in
-// the request URL's userinfo, query or fragment. A *url.Error embeds the full
-// URL in its Error() string; we replace it with the same URL stripped of all
-// three (the host+path are not sensitive). Any other error is returned verbatim
-// (it never carries the URL).
+// scrubURLError is the SINGLE renderer in this package for an error that may
+// carry a request URL. Every DDNS site that fails while BUILDING or while
+// ISSUING a request routes through it, so "no credential reaches a log" is a
+// property of the package rather than of each call site remembering to redact
+// (#6545 review). The one deliberate exception is the dyndns2 raw-`server`
+// render in resolveDyndns2Endpoint, tracked separately as #6606 and pinned by
+// an explicit, self-expiring exemption in the source gate
+// (url_render_class_6545_test.go).
 //
-// The FRAGMENT clear is not cosmetic (#6545 review). A fragment carries an auth
-// token exactly as routinely as a query does, url.URL.Redacted() renders it, and
-// this string is the one the Surface A observer both LOGS and retains as its
-// checkIPProbeWarned dedup map key — so a valid checkip-url of the shape
-// "https://checkip.example/p#apikey=SECRET" put an operator token in journald on
-// every transport failure. Nothing upstream catches it either: a URL like that
-// is entirely VALID, so validateCheckIPURL accepts it and the request is built
-// and attempted. Note this is the SECOND scrubber in the tree with that blind
-// spot — config.RedactURL drops the query and keeps the fragment the same way
-// (tracked as #6609); do not assume the other one is safe because this one is.
+// WHAT IT RENDERS: at most SCHEME://HOST, built by ALLOWLIST. The safe URL is a
+// FRESH url.URL carrying only Scheme and Host, so User, Path, RawPath,
+// RawQuery, Fragment, RawFragment, Opaque, OmitHost — and any field net/url
+// adds later — are absent by construction, not by a clear somebody has to
+// remember. The previous form was a blocklist of field clears and it MISSED:
+// it preserved Path, and the generic backend accepts %p ANYWHERE in its
+// template, so a supported template like
 //
-// A URL that fails to re-parse keeps ue.URL verbatim. That is unreachable from
-// the DDNS paths (every request URL parsed on the way in) and left as-is
-// deliberately: this helper renders errors for URLs the client already accepted,
-// unlike checkip's validateCheckIPURL, whose whole job is the unparseable case
-// and which therefore prints no URL at all.
+//	https://prov.example/update/%p
+//
+// put the expanded password straight into the transport error. A checkip-url
+// with an API key in its path had the same exposure, and the Surface A observer
+// both LOGS that string and retains it as the process-lifetime
+// checkIPProbeWarned dedup key. Only the host is structurally non-secret — it
+// is on the wire in DNS and TLS SNI regardless; path, query, userinfo and
+// fragment are all operator-supplied opaque bytes and are treated as secret.
+//
+// The diagnostic cost of dropping the path is deliberate and small: the
+// caller's own prefix already names the backend and the operation ("ddns
+// cloudflare: build request", "ddns route53: build list request"), so what is
+// lost is the API sub-path, not the ability to tell which call failed.
+//
+// A URL THAT DOES NOT RE-PARSE yields NO URL at all — only the sanitized
+// urlParseCause reason. The old code fell back to ue.URL VERBATIM, which was
+// survivable only while this helper was reachable exclusively from the
+// transport path, where the URL had necessarily parsed on the way in. It is now
+// also the renderer for BUILD-request failures, whose DEFINING input is a URL
+// that does not parse, so that fallback would have been a direct leak of the
+// whole raw string.
+//
+// THE INNER ERROR is rendered too, because that is the entire diagnostic value
+// ("connection refused", "i/o timeout", "certificate signed by unknown
+// authority"), and transport errors name a host/IP, never a URL. One stdlib
+// message is the exception and is handled explicitly: net/http builds
+// fmt.Errorf("failed to parse Location header %q: %v", loc, err) BEFORE
+// CheckRedirect runs, so a provider that 3xx-es to a malformed Location echoing
+// our own query would put the credential in ue.Err, past the URL scrub above.
+// That one is replaced with a fixed sentence. If the stdlib rewords it the
+// prefix stops matching, which is why the gate for it drives a real
+// http.Client redirect rather than asserting on the constant.
+//
+// A non-*url.Error is returned verbatim: it never carries the URL.
 func scrubURLError(err error) string {
 	var ue *url.Error
 	if !errors.As(err, &ue) {
 		return err.Error()
 	}
-	safe := ue.URL
-	if u, perr := url.Parse(ue.URL); perr == nil {
-		u.RawQuery = ""
-		u.User = nil
-		u.Fragment = ""
-		u.RawFragment = ""
-		safe = u.Redacted()
+	u, perr := url.Parse(ue.URL)
+	if perr != nil {
+		// Nothing can be recovered safely from a URL that does not parse — not
+		// even the host. Report the sanitized reason and no part of the input.
+		return fmt.Sprintf("url is not a valid URL: %s", urlParseCause(perr))
 	}
-	return fmt.Sprintf("%s %q: %v", ue.Op, safe, ue.Err)
+	safe := (&url.URL{Scheme: u.Scheme, Host: u.Host}).String()
+	return fmt.Sprintf("%s %q: %s", ue.Op, safe, scrubInnerError(ue.Err))
+}
+
+// locationHeaderPrefix is the invariant head of net/http's Location-parse
+// failure (net/http/client.go), which quotes the raw header value.
+const locationHeaderPrefix = `failed to parse Location header `
+
+// scrubInnerError renders the error nested inside a *url.Error. It exists for
+// the one transport-layer message known to embed a URL — see scrubURLError.
+func scrubInnerError(err error) string {
+	if err == nil {
+		return "<nil>"
+	}
+	// A nested *url.Error would re-embed a full URL in its own Error(); recurse
+	// through the same scrub instead of printing it.
+	var nested *url.Error
+	if errors.As(err, &nested) {
+		return scrubURLError(nested)
+	}
+	text := err.Error()
+	if strings.HasPrefix(text, locationHeaderPrefix) {
+		return "failed to parse redirect Location header (withheld: it echoes provider-supplied URL text)"
+	}
+	return text
 }
 
 // queryEscape URL-query-escapes a value for safe insertion into a generic

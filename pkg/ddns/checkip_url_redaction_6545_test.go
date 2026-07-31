@@ -265,8 +265,16 @@ var urlParseCauseAllowed = map[parseReason]bool{
 	"invalid character in host":                      true,
 }
 
-// TestURLParseCauseAlwaysReturnsAConstant is the structural gate: urlParseCause
-// must return one of a CLOSED set of literals, whatever it is handed. That
+// TestURLParseCauseAlwaysReturnsAConstant is the VALUE-based gate, NOT the
+// structural one — the structural gate lives in
+// checkip_cause_structural_6545_test.go and walks urlParseCause's AST. (An
+// earlier revision of this comment called this one "the structural gate", which
+// was exactly backwards and mattered: this test is a COVERAGE check by nature
+// and cannot see a pass-through on a branch its inputs never reach, which is
+// the entire reason the AST gate exists alongside it.)
+//
+// What it pins: urlParseCause must return one of a CLOSED set of literals,
+// whatever it is handed. That
 // property — not the particular net/url causes enumerated today — is what makes
 // the helper safe to reuse (the other DDNS URL validators inherit it, #6606),
 // and it is what a stdlib rewording or a brand-new cause must not be able to

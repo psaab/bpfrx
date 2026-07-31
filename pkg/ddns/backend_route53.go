@@ -180,7 +180,9 @@ func (b *route53Backend) listRRSet(ctx context.Context, name, rtype string) (r53
 	path := "/" + route53APIVersion + "/hostedzone/" + b.zoneID + "/rrset"
 	req, err := http.NewRequest(http.MethodGet, b.endpoint+path+"?"+q.Encode(), nil)
 	if err != nil {
-		return r53LiveRRSet{}, fmt.Errorf("ddns route53: build list request: %w", err)
+		// SECURITY: endpoint comes from the `server` leaf UNPARSED, so %w would
+		// print whatever credential it carries (#6545).
+		return r53LiveRRSet{}, fmt.Errorf("ddns route53: build list request: %s", scrubURLError(err))
 	}
 	req.Header.Set("User-Agent", "xpf-ddns/1.0")
 	signRequest(req, b.creds, nil, b.now())
@@ -260,7 +262,9 @@ func (b *route53Backend) change(ctx context.Context, action, name, rtype string,
 	path := "/" + route53APIVersion + "/hostedzone/" + b.zoneID + "/rrset/"
 	req, err := http.NewRequest(http.MethodPost, b.endpoint+path, bytes.NewReader(body))
 	if err != nil {
-		return "", "", fmt.Errorf("ddns route53: build request: %w", err)
+		// SECURITY: endpoint comes from the `server` leaf UNPARSED, so %w would
+		// print whatever credential it carries (#6545).
+		return "", "", fmt.Errorf("ddns route53: build request: %s", scrubURLError(err))
 	}
 	req.Header.Set("Content-Type", "application/xml")
 	req.Header.Set("User-Agent", "xpf-ddns/1.0")

@@ -62481,3 +62481,56 @@ break — `go vet` confirmed passing under every revert.
     checkip_cause_structural_6545_test.go,
     checkip_url_redaction_6545_test.go,README.md},
     pkg/daemon/daemon_ddns_checkip_warn_redaction_6545_test.go, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: fix(ddns): render every URL-bearing error through one scrubber
+  (#6545, PR #6594 review round 6 — MERGE-NEEDS-MAJOR fold)
+  **Reason**: five prior rounds each closed ONE leak surface and left the next
+  one standing. Round 6 found two MAJORs of exactly that shape. (1) Path:
+  scrubURLError cleared userinfo/query/fragment but deliberately KEPT
+  Path/RawPath, and the generic backend permits %p ANYWHERE in its template, so
+  the supported "https://prov.example/update/%p" put the expanded password into
+  the transport error — which the Surface A observer both LOGS and retains as
+  its process-lifetime checkIPProbeWarned dedup key. A checkip-url with an API
+  key in its path had the identical exposure. (2) Four build-request paths never
+  reached the scrubber at all: DuckDNS, Cloudflare and BOTH Route 53 request
+  constructors %w-wrapped the raw *url.Error, whose Error() re-embeds the
+  COMPLETE offending URL, and all three take their endpoint from the `server`
+  leaf UNPARSED (dyndns2's update() had the same shape).
+  **Implementation**: stopped patching fields. scrubURLError is now the SINGLE
+  renderer for any error that may carry a URL, and it builds the safe URL by
+  ALLOWLIST — a fresh url.URL carrying only Scheme and Host — so User, Path,
+  RawPath, RawQuery, Fragment, RawFragment, Opaque, OmitHost and anything
+  net/url adds later are absent by CONSTRUCTION rather than by a clear someone
+  has to remember. Only the host is structurally non-secret (DNS + TLS SNI carry
+  it anyway). A URL that does not re-parse now yields NO URL at all, only the
+  sanitized urlParseCause reason — the old verbatim ue.URL fallback was
+  survivable only while the helper was reachable from the transport path alone,
+  and a build-request failure's defining input is a URL that does not parse.
+  Every build site now routes through it: duckdns (bad endpoint + build
+  request), cloudflare, route53 (list + change), dyndns2 (bad endpoint + build
+  request), generic, checkip. scrubInnerError additionally withholds net/http's
+  "failed to parse Location header %q", which quotes the RAW header BEFORE
+  CheckRedirect runs, so a provider 3xx-ing to a malformed Location echoing our
+  own query would have landed the credential in ue.Err past the URL scrub.
+  The AST gate was rebuilt on go/types after the reviewer walked through its
+  name-matching with a SHADOW (causeMalformedURL := parseReason(cause); return
+  causeMalformedURL — compiles, vets, passed both gates, returned the raw
+  cause). It now type-checks checkip.go hermetically (non-resolving importer +
+  swallowing Config.Error, no go/packages or module graph) and requires each
+  return to RESOLVE to a package-scope *types.Const whose VALUE is in the
+  independent literal set; it also refuses to descend into ast.FuncLit so a
+  closure cannot satisfy the non-vacuity floor, and pins the result type.
+  **Validation**: mutation-proven in a THROWAWAY detached worktree, build+vet
+  clean so every red is an ASSERTION: reinstating Path/RawPath, restoring the
+  verbatim ue.URL fallback, reverting any of the four %w build sites, dropping
+  the Location-header guard, and re-applying the reviewer's shadow mutation each
+  fail by named assertion. Over-reach guards green (a credentialed but VALID
+  checkip-url is still accepted; the host is still named; the invalid-URL
+  diagnosis is still reported). gofmt clean; go vet clean; full go test ./...
+  green. No cluster smoke: control-plane logging hygiene only.
+- **File(s)**: pkg/ddns/{backend_http.go,backend_duckdns.go,backend_cloudflare.go,
+    backend_route53.go,backend_dyndns2.go,backend_generic.go,checkip.go,
+    url_render_class_6545_test.go,checkip_cause_structural_6545_test.go,
+    checkip_url_redaction_6545_test.go,README.md},
+    pkg/daemon/daemon_ddns_surface_a.go, _Log.md

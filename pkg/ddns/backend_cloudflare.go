@@ -145,7 +145,9 @@ func (b *cloudflareBackend) do(ctx context.Context, method, path string, body an
 	}
 	req, err := http.NewRequest(method, b.apiBase+path, rdr)
 	if err != nil {
-		return cfEnvelope{}, fmt.Errorf("ddns cloudflare: build request: %w", err)
+		// SECURITY: apiBase comes from the `server` leaf UNPARSED, so %w would
+		// print whatever credential it carries (#6545).
+		return cfEnvelope{}, fmt.Errorf("ddns cloudflare: build request: %s", scrubURLError(err))
 	}
 	req.Header.Set("Authorization", "Bearer "+b.token)
 	req.Header.Set("Content-Type", "application/json")

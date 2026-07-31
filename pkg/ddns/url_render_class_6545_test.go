@@ -1,0 +1,576 @@
+package ddns
+
+import (
+	"context"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"net/http"
+	"net/netip"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/psaab/xpf/pkg/config"
+)
+
+// url_render_class_6545_test.go: the CLASS gate for URL rendering in pkg/ddns
+// (#6545 review round 6).
+//
+// The first five rounds of this PR each closed ONE surface and left another
+// standing — the parse-failure branch, then the validator refusals, then the
+// fragment on the transport path. Each fix was correct and each time the next
+// review found the same bug one call site over. This file stops that by
+// asserting the PROPERTY rather than the instances:
+//
+//	No error leaving pkg/ddns renders more of a URL than SCHEME://HOST,
+//	and every URL-bearing error goes through scrubURLError.
+//
+// It is enforced from both ends:
+//
+//   - BEHAVIOURALLY — scrubURLError's output is pinned by EXACT EQUALITY, not by
+//     probing for a sentinel, so a field that is neither dropped nor expected
+//     fails the gate whether or not anyone thought to plant a secret in it. Plus
+//     end-to-end drives through every backend's build-request path.
+//   - STRUCTURALLY — TestDDNSURLErrorRendersGoThroughScrubber walks the AST of
+//     every production file in the package and fails any site that takes an
+//     error from http.NewRequest / url.Parse / client.Do and renders it without
+//     the scrubber. That is what catches the SIXTH call site nobody has written
+//     yet, which is the only way this stops recurring.
+//
+// The two MAJORs of round 6, both closed here:
+//
+//  1. scrubURLError preserved Path. The generic backend accepts %p ANYWHERE in
+//     its template, so the supported template "https://prov.example/update/%p"
+//     put the expanded password into the transport error — which the Surface A
+//     observer logs AND keeps as its process-lifetime dedup key. A checkip-url
+//     with an API key in its path had the same exposure.
+//  2. The DuckDNS, Cloudflare and both Route 53 build-request paths %w-wrapped
+//     the raw *url.Error, which re-embeds the complete offending URL. All three
+//     take their endpoint from the `server` leaf UNPARSED, so a credentialed,
+//     malformed server value was rendered verbatim.
+
+// buildURLSentinel sits where an operator credential would in a `server` leaf.
+// It deliberately begins with a NON-hex byte pair after the '%' so that a URL
+// carrying it as "#%<sentinel>" fails url.Parse with an escape error — the
+// build-request failure these paths are reached by.
+const buildURLSentinel = "BUILD-URL-MUST-NOT-LOG"
+
+// poisonedServer is a `server` value that is credential-bearing AND unparseable:
+// url.Parse rejects the fragment's "%BU" escape, and (*url.Error).Error() then
+// re-embeds the WHOLE string, sentinel included.
+const poisonedServer = "https://prov.example/#%" + buildURLSentinel
+
+// pathSentinel sits where an operator credential would in a URL PATH — the
+// position scrubURLError used to preserve.
+const pathSentinel = "PATH-CREDENTIAL-MUST-NOT-LOG"
+
+// TestScrubURLErrorRendersOnlySchemeAndHost pins the scrub by EXACT EQUALITY.
+//
+// This is deliberately not a "does the output contain my sentinel" test. Those
+// only find the leak you already thought of, and that is precisely how Path
+// survived three rounds of fragment/query/userinfo fixes. Asserting the whole
+// rendered string means any field that starts surviving — a new net/url field,
+// a reinstated Path clear, an Opaque pass-through — fails here.
+func TestScrubURLErrorRendersOnlySchemeAndHost(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		url  string
+		want string // the ONLY URL text allowed out
+	}{
+		{"plain", "https://prov.example", "https://prov.example"},
+		{"path", "https://prov.example/update/" + pathSentinel, "https://prov.example"},
+		{"generic %p expanded into the path", "https://prov.example/update/" + pathSentinel + "?x=1",
+			"https://prov.example"},
+		{"query", "https://prov.example/upd?token=" + pathSentinel, "https://prov.example"},
+		{"fragment", "https://prov.example/upd#token=" + pathSentinel, "https://prov.example"},
+		{"userinfo", "https://user:" + pathSentinel + "@prov.example/upd", "https://prov.example"},
+		{"everything at once", "https://user:" + pathSentinel + "@prov.example:8443/a/" +
+			pathSentinel + "?q=" + pathSentinel + "#f=" + pathSentinel, "https://prov.example:8443"},
+		{"host and port retained", "https://prov.example:8443/x", "https://prov.example:8443"},
+		{"opaque", "mailto:" + pathSentinel + "@prov.example", "mailto:"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := scrubURLError(&url.Error{Op: "Get", URL: tc.url, Err: errSyntheticTransport})
+			want := fmt.Sprintf("Get %q: %v", tc.want, errSyntheticTransport)
+			if got != want {
+				t.Fatalf("scrubURLError(%q):\n  got  = %q\n  want = %q\n"+
+					"The safe URL must be rebuilt by ALLOWLIST — a fresh url.URL carrying only "+
+					"Scheme and Host — so User, Path, RawPath, RawQuery, Fragment, RawFragment, "+
+					"Opaque and anything net/url adds later are absent by construction. Clearing "+
+					"fields one at a time is a blocklist and it already missed Path once.",
+					tc.url, got, want)
+			}
+		})
+	}
+}
+
+// TestScrubURLErrorWithholdsUnparseableURL covers the input the build-request
+// paths are DEFINED by: a URL that does not parse. The old helper fell back to
+// ue.URL verbatim in that case, which was survivable only while the helper was
+// reachable from the transport path alone.
+func TestScrubURLErrorWithholdsUnparseableURL(t *testing.T) {
+	got := scrubURLError(&url.Error{
+		Op:  "parse",
+		URL: poisonedServer,
+		Err: fmt.Errorf("invalid URL escape %q", "%BU"),
+	})
+	if strings.Contains(got, buildURLSentinel) {
+		t.Fatalf("scrubURLError leaked an unparseable URL verbatim:\n  in  = %q\n  out = %q\n"+
+			"Nothing can be recovered safely from a URL that does not parse — not even the "+
+			"host. Report the sanitized urlParseCause reason and no part of the input.",
+			poisonedServer, got)
+	}
+	if !strings.Contains(got, "not a valid URL") {
+		t.Fatalf("scrubURLError(%q) = %q; want it to still SAY the URL is invalid — "+
+			"withholding the URL must not withhold the diagnosis too", poisonedServer, got)
+	}
+}
+
+// TestCheckIPTransportFailureRedactsPath is the fail-on-revert gate for MAJOR 1
+// on the checkip path: a VALID checkip-url carrying an API key in its PATH must
+// not leak it when the probe fails at transport. Restore Path/RawPath in
+// scrubURLError and this fails by assertion naming the leaked sentinel.
+func TestCheckIPTransportFailureRedactsPath(t *testing.T) {
+	urlStr := "https://checkip.example/v1/" + pathSentinel + "/myip"
+	if err := validateCheckIPURL(urlStr); err != nil {
+		t.Fatalf("validateCheckIPURL(%q) = %v; this URL must be ACCEPTED or the test "+
+			"never reaches the transport path it exists to cover", urlStr, err)
+	}
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errSyntheticTransport
+	})}
+
+	_, ok, err := CheckIP(context.Background(), client, urlStr, true, nil)
+	if ok {
+		t.Fatal("a failing transport must not yield an observation")
+	}
+	if err == nil {
+		t.Fatal("a transport failure must be reported (#6545); got err=nil, so the " +
+			"assertion below would be vacuous")
+	}
+	if !strings.Contains(err.Error(), "request failed") {
+		t.Fatalf("CheckIP err = %q, want the transport-failure error; the test is not "+
+			"exercising doRequest/scrubURLError", err)
+	}
+	if strings.Contains(err.Error(), pathSentinel) {
+		t.Fatalf("a transport failure on a VALID checkip-url leaked the PATH credential:\n"+
+			"  error = %q\n"+
+			"scrubURLError cleared userinfo, query and fragment but deliberately preserved "+
+			"Path. The daemon copies this string into the checkIPProbeWarned dedup key and "+
+			"the journal attribute, so an API key in the path reaches both.", err)
+	}
+}
+
+// TestGenericTransportFailureRedactsPasswordInPath is Codex's exact round-6
+// repro: %p is permitted ANYWHERE in a generic url-template, including the
+// path, so the transport error rendered the expanded password.
+func TestGenericTransportFailureRedactsPasswordInPath(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errSyntheticTransport
+	})}
+	b, err := newGenericBackend(&config.DDNSProvider{
+		Name:        "gen",
+		Backend:     "generic",
+		URLTemplate: "https://prov.example/update/%p",
+		Username:    "u",
+		Password:    config.Secret(pathSentinel),
+	}, client)
+	if err != nil {
+		t.Fatalf("newGenericBackend: %v; the template must be ACCEPTED or this test is vacuous", err)
+	}
+	err = b.UpsertLease(context.Background(), LeaseDNSRecord{
+		FQDN: "host.example.com", Addr: netip.MustParseAddr("192.0.2.7"), TTL: 60, ForwardType: "A",
+	})
+	if err == nil {
+		t.Fatal("a synthetic transport failure must surface an error")
+	}
+	if strings.Contains(err.Error(), pathSentinel) {
+		t.Fatalf("the %%p-expanded password leaked from the URL PATH on transport failure:\n"+
+			"  error = %q\n"+
+			"A generic template may place %%p anywhere; only scheme://host may be rendered.", err)
+	}
+}
+
+// TestScrubURLErrorWithholdsLocationHeaderEcho covers the one transport-layer
+// message that embeds a URL: net/http quotes the RAW Location header when it
+// fails to parse it, and it builds that message BEFORE CheckRedirect runs — so
+// the cross-host refusal does not cover it. A provider that 3xx-es to a
+// malformed Location echoing our own credential back at us would land it in
+// ue.Err, nested past the URL scrub.
+//
+// The echo must sit in the Location's PATH (or fragment), not its query:
+// url.Parse does not unescape RawQuery, so "?token=X%ZZ" parses CLEANLY and no
+// Location-parse error is produced at all. An earlier revision of this test
+// used the query form; it "passed" against a deliberately neutralized guard
+// because the request instead died on the 10-hop redirect cap. The assertion
+// below that the error really IS the Location failure is what caught that, and
+// is why it stays.
+//
+// This drives a REAL http.Client redirect rather than asserting on the literal
+// prefix constant, so if the stdlib rewords the message the gate goes RED
+// instead of silently fail-opening.
+func TestScrubURLErrorWithholdsLocationHeaderEcho(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusFound,
+			// Unparseable AND echoing the caller's credential back at us.
+			Header: http.Header{"Location": []string{"/retry/" + pathSentinel + "%ZZ"}},
+			Body:   http.NoBody,
+		}, nil
+	})}
+	req, err := http.NewRequest(http.MethodGet, "https://prov.example/upd", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	_, _, derr := doRequest(context.Background(), client, req)
+	if derr == nil {
+		t.Fatal("an unparseable Location must fail the request; got nil, so this test is vacuous")
+	}
+	// NON-VACUITY: the failure must be the Location parse, not the redirect cap
+	// or a transport error, or the sentinel check below proves nothing.
+	if !strings.Contains(derr.Error(), "Location") {
+		t.Fatalf("doRequest err = %q, want the Location-header parse failure. If this says "+
+			"\"stopped after 10 redirects\", the Location is PARSING and the test is not "+
+			"exercising the path it exists to cover — put the bad escape in the Location's "+
+			"PATH, not its query.", derr)
+	}
+	if strings.Contains(derr.Error(), pathSentinel) {
+		t.Fatalf("the provider-echoed Location header leaked a credential:\n  error = %q\n"+
+			"net/http renders `failed to parse Location header %%q` with the RAW header, and "+
+			"that string is nested in ue.Err where the URL scrub does not reach.", derr)
+	}
+}
+
+// TestBackendBuildRequestErrorsWithholdCredentials is MAJOR 2's fail-on-revert
+// gate. Each backend is driven with a credential-bearing, unparseable endpoint
+// and the resulting build error must name no part of it.
+//
+// dyndns2 is constructed as a struct literal on purpose: resolveDyndns2Endpoint
+// refuses a malformed `server` at construction (and renders it raw — that is
+// #6606, out of scope here), so the ctor never yields a backend whose update()
+// build path can be reached. The struct literal exercises the update() path the
+// source gate below also covers.
+func TestBackendBuildRequestErrorsWithholdCredentials(t *testing.T) {
+	ctx := context.Background()
+	rec := LeaseDNSRecord{
+		FQDN: "host.example.com", Addr: netip.MustParseAddr("192.0.2.7"), TTL: 60, ForwardType: "A",
+	}
+	// Every transport below must be UNREACHED: the failure is in building the
+	// request, before any I/O. A round trip means the test is not exercising
+	// what it claims to.
+	tripped := false
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		tripped = true
+		return nil, errSyntheticTransport
+	})}
+
+	for _, tc := range []struct {
+		name string
+		run  func() error
+	}{
+		{"duckdns", func() error {
+			b, err := newDuckDNSBackend(&config.DDNSProvider{
+				Name: "duck", Backend: "duckdns", Server: poisonedServer,
+				APIToken: config.Secret("tok"),
+			}, client)
+			if err != nil {
+				return err
+			}
+			return b.UpsertLease(ctx, rec)
+		}},
+		{"cloudflare", func() error {
+			b, err := newCloudflareBackend(&config.DDNSProvider{
+				Name: "cf", Backend: "cloudflare", Server: poisonedServer,
+				Zone: "example.com", APIToken: config.Secret("tok"),
+			}, client)
+			if err != nil {
+				return err
+			}
+			return b.UpsertLease(ctx, rec)
+		}},
+		{"route53", func() error {
+			b, err := newRoute53Backend(&config.DDNSProvider{
+				Name: "r53", Backend: "route53", Server: poisonedServer,
+				HostedZoneID: "Z123", AWSAccessKeyID: "AKID",
+				AWSSecretAccessKey: config.Secret("sek"), AWSRegion: "us-east-1",
+			}, client)
+			if err != nil {
+				return err
+			}
+			return b.UpsertLease(ctx, rec)
+		}},
+		{"dyndns2", func() error {
+			b := &dyndns2Backend{name: "dd2", endpoint: poisonedServer, client: client}
+			return b.UpsertLease(ctx, rec)
+		}},
+		{"generic", func() error {
+			b, err := newGenericBackend(&config.DDNSProvider{
+				Name: "gen", Backend: "generic",
+				URLTemplate: "https://prov.example/upd#%" + buildURLSentinel,
+			}, client)
+			if err != nil {
+				return err
+			}
+			return b.UpsertLease(ctx, rec)
+		}},
+		{"checkip", func() error {
+			_, _, err := CheckIP(ctx, client, poisonedServer, true, nil)
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tripped = false
+			err := tc.run()
+			if err == nil {
+				t.Fatal("a credential-bearing, unparseable endpoint must fail; got nil, so " +
+					"the assertion below would be vacuous")
+			}
+			if tripped {
+				t.Fatalf("the transport was reached; this test must exercise the BUILD path, "+
+					"not a round trip (err = %v)", err)
+			}
+			if strings.Contains(err.Error(), buildURLSentinel) {
+				t.Fatalf("the build-request error rendered the raw endpoint:\n  error = %q\n"+
+					"%%w-wrapping a *url.Error re-embeds the COMPLETE offending URL, and the "+
+					"`server` leaf reaches this constructor unparsed. Render through "+
+					"scrubURLError, which withholds a URL that does not parse.", err)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The structural half: no NEW call site can reintroduce the class.
+// ---------------------------------------------------------------------------
+
+// urlErrorProducers are the calls whose error may embed a request URL.
+// http.NewRequest returns url.Parse's *url.Error VERBATIM; client.Do returns a
+// *url.Error whose Error() embeds the full request URL.
+var urlErrorProducers = map[string]bool{
+	"http.NewRequest":            true,
+	"http.NewRequestWithContext": true,
+	"url.Parse":                  true,
+	"url.ParseRequestURI":        true,
+	".Do":                        true, // any client.Do / b.client.Do
+}
+
+// urlErrorRenderers are the ONLY things such an error may be handed to. The
+// first two sanitize; errors.As/Is inspect without rendering.
+var urlErrorRenderers = map[string]bool{
+	"scrubURLError": true,
+	"urlParseCause": true,
+	"errors.As":     true,
+	"errors.Is":     true,
+}
+
+// issue6606Exemption is the ONE knowingly-unfixed site, kept explicit rather
+// than tuned out of the gate: resolveDyndns2Endpoint renders a malformed
+// `server` (and its %w-wrapped parse error) raw. That is tracked as #6606 and
+// was declared out of scope for #6545.
+//
+// It is written to SELF-EXPIRE: the gate asserts the exemption is actually HIT,
+// so when #6606 lands this test goes red and forces the stale exemption out
+// instead of quietly widening the hole for whatever moves in next.
+var issue6606Exemption = struct{ file, fn string }{"backend_dyndns2.go", "resolveDyndns2Endpoint"}
+
+// minURLErrorSites is the non-vacuity floor. If a refactor renames the
+// producers or restructures the error handling, the walk must not silently
+// find nothing and report success.
+const minURLErrorSites = 12
+
+// TestDDNSURLErrorRendersGoThroughScrubber is the class gate. It walks every
+// production file in pkg/ddns, finds each place an error from a URL-bearing
+// call is handled, and fails any that renders that error other than through
+// scrubURLError / urlParseCause.
+//
+// This is the check that generalises: rounds 1-5 each fixed the instance a
+// reviewer found, and round 6 found three more of the same shape in backends
+// nobody had touched. A site added tomorrow fails HERE, before review.
+func TestDDNSURLErrorRendersGoThroughScrubber(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	fset := token.NewFileSet()
+	sites := 0
+	exemptionHit := false
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, perr := parser.ParseFile(fset, filepath.Clean(name), nil, parser.SkipObjectResolution)
+		if perr != nil {
+			t.Fatalf("parse %s: %v", name, perr)
+		}
+		for _, decl := range file.Decls {
+			fn, isFunc := decl.(*ast.FuncDecl)
+			if !isFunc || fn.Body == nil {
+				continue
+			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				for _, site := range urlErrorHandlers(n) {
+					sites++
+					if name == issue6606Exemption.file && fn.Name.Name == issue6606Exemption.fn {
+						exemptionHit = true
+						continue
+					}
+					for _, pos := range unscrubbedUses(fset, site.body, site.errVar) {
+						t.Errorf("%s: %s renders the error from a URL-bearing call (%q) without "+
+							"the scrubber.\n"+
+							"A *url.Error's Error() embeds the COMPLETE request URL — userinfo, "+
+							"path, query and fragment — and every DDNS endpoint reaches these "+
+							"call sites from an operator `server` / `url-template` / `checkip-url` "+
+							"leaf that may carry a credential in any of them. The resulting string "+
+							"is logged by the daemon and retained as a process-lifetime dedup key.\n"+
+							"Render it as: fmt.Errorf(\"...: %%s\", scrubURLError(%s)).",
+							pos, fn.Name.Name, site.errVar, site.errVar)
+					}
+				}
+				return true
+			})
+		}
+	}
+
+	if sites < minURLErrorSites {
+		t.Errorf("found only %d URL-bearing error handlers in pkg/ddns, want at least %d; "+
+			"the walk is probably not matching the code it is supposed to check, and a gate "+
+			"that matches nothing passes vacuously", sites, minURLErrorSites)
+	}
+	if !exemptionHit {
+		t.Errorf("the #6606 exemption for %s/%s was never hit. If that site was fixed, DELETE "+
+			"the exemption — leaving it standing silently exempts whatever occupies that "+
+			"function next.", issue6606Exemption.file, issue6606Exemption.fn)
+	}
+}
+
+// handlerSite is one place a URL-bearing error is handled: the error
+// variable's name and the block that handles it.
+type handlerSite struct {
+	errVar string
+	body   *ast.BlockStmt
+}
+
+// urlErrorHandlers recognises the two shapes in which a URL-bearing error is
+// handled. A block may contain SEVERAL (duckdns's update() has both a
+// url.Parse and an http.NewRequest), so every one is returned:
+//
+//	v, err := url.Parse(s)          |  if v, err := url.Parse(s); err != nil {
+//	if err != nil { ... }           |      ...
+//	                                |  }
+func urlErrorHandlers(n ast.Node) []handlerSite {
+	switch node := n.(type) {
+	case *ast.BlockStmt:
+		// Shape 1: the assignment is a preceding statement in the same block.
+		var sites []handlerSite
+		for i := 0; i+1 < len(node.List); i++ {
+			errVar := producedErrVar(node.List[i])
+			if errVar == "" {
+				continue
+			}
+			next, nextIsIf := node.List[i+1].(*ast.IfStmt)
+			if nextIsIf && testsErrVar(next.Cond, errVar) {
+				sites = append(sites, handlerSite{errVar: errVar, body: next.Body})
+			}
+		}
+		return sites
+	case *ast.IfStmt:
+		// Shape 2: `if v, err := url.Parse(s); err != nil {`
+		if node.Init == nil {
+			return nil
+		}
+		errVar := producedErrVar(node.Init)
+		if errVar == "" || !testsErrVar(node.Cond, errVar) {
+			return nil
+		}
+		return []handlerSite{{errVar: errVar, body: node.Body}}
+	}
+	return nil
+}
+
+// producedErrVar returns the name of the error variable assigned from a
+// URL-bearing call, or "" if the statement is not such an assignment.
+func producedErrVar(stmt ast.Stmt) string {
+	assign, isAssign := stmt.(*ast.AssignStmt)
+	if !isAssign || len(assign.Rhs) != 1 || len(assign.Lhs) == 0 {
+		return ""
+	}
+	call, isCall := assign.Rhs[0].(*ast.CallExpr)
+	if !isCall || !urlErrorProducers[calleeName(call.Fun)] {
+		return ""
+	}
+	last, isIdent := assign.Lhs[len(assign.Lhs)-1].(*ast.Ident)
+	if !isIdent || last.Name == "_" {
+		return ""
+	}
+	return last.Name
+}
+
+// testsErrVar reports whether cond is (or begins with) `errVar != nil`.
+func testsErrVar(cond ast.Expr, errVar string) bool {
+	bin, isBin := cond.(*ast.BinaryExpr)
+	if !isBin {
+		return false
+	}
+	if bin.Op == token.LOR || bin.Op == token.LAND {
+		return testsErrVar(bin.X, errVar)
+	}
+	if bin.Op != token.NEQ {
+		return false
+	}
+	x, isIdent := bin.X.(*ast.Ident)
+	y, isNil := bin.Y.(*ast.Ident)
+	return isIdent && isNil && x.Name == errVar && y.Name == "nil"
+}
+
+// unscrubbedUses returns the position of every occurrence of errVar inside body
+// that is NOT a direct argument to one of the sanctioned renderers. A bare
+// `return err`, a `%w` wrap, and a `%v` interpolation all land here.
+func unscrubbedUses(fset *token.FileSet, body *ast.BlockStmt, errVar string) []token.Position {
+	sanctioned := map[*ast.Ident]bool{}
+	ast.Inspect(body, func(n ast.Node) bool {
+		call, isCall := n.(*ast.CallExpr)
+		if !isCall || !urlErrorRenderers[calleeName(call.Fun)] {
+			return true
+		}
+		for _, arg := range call.Args {
+			if id, isIdent := arg.(*ast.Ident); isIdent && id.Name == errVar {
+				sanctioned[id] = true
+			}
+		}
+		return true
+	})
+	var bad []token.Position
+	ast.Inspect(body, func(n ast.Node) bool {
+		id, isIdent := n.(*ast.Ident)
+		if !isIdent || id.Name != errVar || sanctioned[id] {
+			return true
+		}
+		bad = append(bad, fset.Position(id.Pos()))
+		return true
+	})
+	return bad
+}
+
+// calleeName renders a call's callee as "fn", "pkg.Fn", or ".Method" (for a
+// method on an arbitrary receiver expression, which is how client.Do is
+// matched regardless of what holds the client).
+func calleeName(fun ast.Expr) string {
+	switch f := fun.(type) {
+	case *ast.Ident:
+		return f.Name
+	case *ast.SelectorExpr:
+		if x, isIdent := f.X.(*ast.Ident); isIdent {
+			if name := x.Name + "." + f.Sel.Name; urlErrorProducers[name] || urlErrorRenderers[name] {
+				return name
+			}
+		}
+		return "." + f.Sel.Name
+	}
+	return ""
+}

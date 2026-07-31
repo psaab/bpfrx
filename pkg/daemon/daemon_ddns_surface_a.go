@@ -102,11 +102,14 @@ type surfaceAState struct {
 	//
 	// SECURITY: the probe error is both LOGGED and used as this map's KEY, so
 	// every error pkg/ddns can return on the checkip path must already be
-	// credential-free — a checkip-url routinely carries an API key in its query.
-	// pkg/ddns holds that end up: validateCheckIPURL redacts through
-	// config.RedactURL, doRequest renders transport errors through
-	// scrubURLError, and the redirect refusals name only hostnames. Never build
-	// this key (or any log attr) from a raw provider URL.
+	// credential-free — a checkip-url routinely carries an API key in its query,
+	// its PATH, its userinfo or its fragment. pkg/ddns holds that end up:
+	// validateCheckIPURL prints NO part of the URL (it does NOT rely on
+	// config.RedactURL, which has known holes — #6609), every URL-bearing error
+	// renders through scrubURLError, which emits at most scheme://host, and the
+	// redirect refusals name only hostnames. The invariant is gated in
+	// pkg/ddns/url_render_class_6545_test.go. Never build this key (or any log
+	// attr) from a raw provider URL.
 	checkIPProbeWarned sync.Map
 	// checkIPNoURLWarned dedups the once-per-provider runtime log emitted when a
 	// binding selects `address-source checkip` but the referenced provider

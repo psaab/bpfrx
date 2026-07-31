@@ -82,9 +82,10 @@ func CheckIP(ctx context.Context, client *http.Client, urlStr string, wantV4 boo
 		// Unreachable in practice — validateCheckIPURL above already parsed this
 		// exact string and the method is a constant — but http.NewRequest fails
 		// by returning url.Parse's *url.Error VERBATIM, raw query and all, so
-		// apply the same discipline (no URL, sanitized cause) rather than
-		// leaving a %w that would leak a checkip-url API key if it ever fired.
-		return netip.Addr{}, false, fmt.Errorf("ddns checkip: build request: %s", urlParseCause(err))
+		// apply the same discipline as every other build-request site: render
+		// through scrubURLError, which withholds a URL that does not parse and
+		// reports only the sanitized urlParseCause reason (#6545).
+		return netip.Addr{}, false, fmt.Errorf("ddns checkip: build request: %s", scrubURLError(err))
 	}
 	req.Header.Set("User-Agent", "xpf-ddns/1.0")
 	code, body, err := doRequest(ctx, client, req)
