@@ -1,16 +1,25 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.18.0 — THE TERMINAL CUT, round-101 folds
-(`OverdueSkipped` gains its full producer/transport contract — the
-`MaterializeOutcome` type, the materializer's OUT result computed
-before the promotion attempt, the `ResolvedFlowSessionDecision` field
-with its construction-site initialization, and the dispatch-context
-carriage with named read points; the composition and teardown guards
-are normative in §5.8; the invalidation lifecycle carries the bounded
-displaced-identity SET and the after-resolution/before-exit/
-before-next-descriptor timing with per-batch sibling fan-out; the
-cold-seed timeout-delta artifact and the last inertness/engagement
-phrasing stragglers are corrected). Ship
+**Status: DRAFT v10.19.0 — THE TERMINAL CUT, round-102 folds (the
+full normative `MaterializeOutcome`/`OverdueSkipped` contract block is
+now the §5.8 SSOT — enum, producer computed before the promotion
+attempt, field initialized at both constructors, poller carriage,
+five-consumer gates, the normative composition, the bounded
+displaced-identity SET with its typed producers and the zero-alloc
+scratch sizing, and the realizable invalidation timing with the
+poll_binding-level sibling fan-out; the ValidatorRefused/UpsertRefused
+distinction with promote-time displacement capture; the remaining
+close→close-chain qualifications; the last unscoped inertness/parity
+claims). Round-102: AGY SOUND (v10.18.0); Codex NO (5B/2H/2M — the
+contract was absent as a NORMATIVE block: the v10.17/18 edits had
+landed in summary paragraphs while the §5.8 outcome list itself never
+gained the field/enum/composition, two constructor sites and the
+pre-promotion ordering were unspecified, 'refusal carries the EMPTY
+set' was unsound in both refusal meanings, the invalidation timing
+needed the WorkerScratch accumulator + poll_binding-level left+right
+fan-out, and the batch set needed the zero-alloc capacity contract —
+all folded v10.19.0 as the single normative contract block); SMR r102
+YES (fold verification). Ship
 candidate = the Part-A dataplane demote gate plus the wire-free local HA
 rules. The RG-incarnation/retirement/fence-ledger protocol that rounds
 13–82 grew is KILLED (not deferred): its two customers are re-scoped —
@@ -138,7 +147,10 @@ emission correct behind it. The issue's HA teeth are closed by the gate
 alone, stated precisely: a blind close can mark ONLY inside the
 acceptance window (~1/2^12–1/2^14 per blind packet) and every such mark
 was validated against observed flow state; a REFUSED (out-of-window or
-no-baseline) close can never mark, never reaps early, never emits a Close
+no-baseline) close can never mark, never reaps early FROM THE GATE'S
+OWN EFFECTS (mark/refresh/re-queue — master's independent flag-agnostic
+purge of a transient-purge-class entry still runs, v10.19.0 round-102
+Codex 9), never emits a Close
 delta — the 1-packet-anytime cluster kill is dead, and what remains is
 the documented sustained-spray capability at window probability, whose
 every successful mark is one the endpoints' own RFC 5961 handling also
@@ -312,7 +324,10 @@ What the fix buys, at absolute scale:
   state is absorbing until the entry churns. Every such flow's closes
   (legit included) refuse demotion for the entry's remaining life:
   entries linger to their inactivity timeout (300 s default; per-app
-  values up to 86,400 s) instead of the 2 s/30 s fast reap. Delivery is
+  values up to 86,400 s) instead of the 2 s/30 s fast reap — UNLESS
+  master's own flag-agnostic transient purge removes the entry first
+  (a purge-class hit is deleted by master machinery on both versions,
+  not by the gate; v10.19.0, round-102 Codex 9). Delivery is
   never blocked; endpoints tear down normally. Slot pressure: bounded by
   the synced-flow count at the event; note honestly that synced upserts
   bypass the local admission cap (`install.rs:295-323`) so 131,072 is an
@@ -450,7 +465,7 @@ these deltas:
 | **#6433** extracted the flow-cache seed path | Editorial; the §5.6 constructor sites are unchanged |
 | **#6458** added the fabric zone-stamp owner-RG gate (`gate_fabric_zone_override_on_owner_rg`, master `fabric.rs:289-307`; the worktree's `fabric.rs:331` is `redirect_via_fabric_if_needed`, a different function) | §5.4's "no transport-based authority" bullet stands verbatim — the stamp proves even less post-#6458 |
 | **#6474** re-NATs outbound ICMP errors through SNAT | Orthogonal (ICMP error path, not TCP closing); shifted `poll_descriptor/mod.rs` line numbers |
-| **#6473** flipped inbound NAT to static-first (static NAT now evaluated before DNAT rules) | Non-fatal for this plan: the clean-miss install dispatch (the only install point for the purged class, v10.11.0) derives DNAT/routing/zone/policy/SNAT fresh from the packet against current config through the full pipeline, so the reorder is composed automatically (round-89 Codex 4 confirmed) |
+| **#6473** flipped inbound NAT to static-first (static NAT now evaluated before DNAT rules) | Non-fatal for this plan: the clean-miss install dispatch (the purged class's ForwardFlow install point, v10.11.0 — the cold path's transient seed install is master's own and unchanged, round-102 Codex 7) derives DNAT/routing/zone/policy/SNAT fresh from the packet against current config through the full pipeline, so the reorder is composed automatically (round-89 Codex 4 confirmed) |
 | Line drift (verified; round-90 Codex 5 corrections applied) | `account_packet` call sites: `flow_cache_hit.rs:312-317`→`:318`, `poll_descriptor/mod.rs:3494-3503`→`:3556`; strict-syn guard call statement `:1642-1650` (guard expression `:1646`) in BOTH revisions; the predicate body is `session_admission.rs:82-87` in both (the plan's `:53`/`:1634-1644` cites were the doc-comment/comment blocks — round-93 Codex 6); input filter `:592`→`:612`; TTL check `:846`→`:866`; `materialize_shared_session_hit` `session_glue/mod.rs:1092-1118`→`:1122`; transient-purge call block `:1178-1193`→`:1208-1223`; `touch_if_stale` call `flow_cache_hit.rs:301`→`:307`; `build_reject_rst_frame` at `frame/tcp.rs:347` in BOTH revisions (no drift); `parse_session_flow_from_bytes` `frame/inspect.rs:1455-1470`→`:1424+`; `is_cacheable` `types/forwarding.rs:948-952`→`:959`; tunnel `UpsertLocal` push `tunnel.rs:739/:741`→`:765-767`; LocalDelivery gate fn `local_delivery.rs:20` in BOTH revisions (master's `:39-44` is the predicate's doc comment, not the fn); `live_by_flow` correction: the field sits at `nat/allocator.rs:481` in BOTH revisions (no move) — the plan's `nat/source.rs:1548` cite is the `allocate_translation` CALL site, which is the unowned-allocation leak site itself and stands as cited |
 | Unchanged on master (re-verified exact) | The issue site itself — `lookup.rs:105-128` (`do_close`/`closing`/`reset`) and `:151-156`; `session/mod.rs:1232` `propagate_tcp_state_to_companion`, `:1118` `touch_if_stale`, `:1299`+`1396-1432` `update_session` head + sticky-RST body; `expire.rs:342-350` Close-delta gate; `entry.rs:209` `ForwardSessionMatch`; `install.rs:113`/`:139`/`:179-180`/`:295`/`:399-400`; `shared_ops.rs:614`/`:857`; `lookup.rs:258` `find_forward_wire_match_with_origin`; `session_admission.rs:82-87`; `schema_security.go:798`; `compiler_security_flow.go:527-528` |
 
@@ -1541,7 +1556,10 @@ transient-purge class purges and dispatches EXACTLY as master
 (flag-agnostic purge, retained-lookup forward, master's seed
 transaction when cold — including the pre-existing purge-aftermath
 family, §7), and the close-on-purged-provenance kill chain (close #1
-purges; a SYN-bearing close #2 clean-misses and FreshPrimary-installs
+purges; a SYN-bearing close #2 — WITH a warm next hop or a lapsed
+transient seed, since a live cold seed captures the follow-up,
+`shared_ops.rs:594-613`, round-102 Codex 7 — clean-misses and
+FreshPrimary-installs
 with closing seeded + Open, overwriting the peer's family) is
 master's own behavior, documented in §7 as part of the #6599 class —
 the harm vector is the identity-less Open, not the demote. The
@@ -1652,21 +1670,95 @@ adopting the shared decision/metadata, §5.6).
   `refresh_for_ha_transition` (deadline preserved); companion
   propagation skips probation targets (v10.7.0, round-90 Codex 4) and
   the accepted-mark rule skips a probation MATCHED entry (v10.8.0,
-  round-91 Codex 3). The overdue-materialize skip produces a typed
-  `OverdueSkipped` outcome (v10.15.0, round-98 Codex 4) honored by
-  ALL FIVE downstream state consumers (round-98 AGY 3): the terminal
-  teardown (suppressed at all three sites — the dispatch installed
-  nothing), the anchor commit hook (no write), the flow-cache insert
-  (suppressed), the probation clear+refresh (never fires on an
-  overdue entry — no stale resurrection for a full timeout), and the
-  ownership promote (the guard is the §5.5 probation flag on K — K
-  REMAINS installed; the earlier nonexistence phrasing was wrong,
-  round-100/101 Codex); the probation reap invalidates the flow cache
-  for the FULL alias set (canonical, reverse companion
-  `reverse_session_key(key, decision.nat)`, reverse-translated
-  aliases, forward-wire aliases, reply-match tuples — `lookup.rs:
-  62-100`/`:222-250`/`:253-315`, `key.rs:19-26`; v10.16.0, round-99
-  Codex 4) with S1's set invalidated at adopt time.
+  round-91 Codex 3).
+- **`MaterializeOutcome` / `OverdueSkipped` — the full normative
+  contract (v10.19.0, rounds 98-102 Codex; this bullet is the SSOT —
+  every earlier summary paragraph is superseded):**
+  - **Type:** `MaterializeOutcome ::= None | Installed |
+    AdoptedPreservingDeadline | OverdueSkipped` (defined in
+    `session_glue/`).
+  - **Producer:** `materialize_shared_session_hit`
+    (`session_glue/mod.rs:1092-1121`) returns
+    `(SessionLookup, MaterializeOutcome)` — computed AT the
+    materialize site, so the outcome is available BEFORE the
+    promotion attempt (`session_glue/mod.rs:1235-1253` runs
+    immediately after materialization; `promote.rs:99-139`).
+  - **Field:** `ResolvedFlowSessionDecision`
+    (`shared_ops.rs:563-578`) gains
+    `materialization: MaterializeOutcome`, initialized `None` at BOTH
+    constructors (`session_glue/mod.rs:1254-1261` and `:1330-1344`)
+    and set from the materializer's OUT result.
+  - **Carriage:** the poller reads `resolved.materialization` at the
+    `install_failed` hoist (`poll_descriptor/mod.rs:509`) and stores
+    it on the per-descriptor dispatch context that survives the
+    `resolved.decision` reduction (`:883`); consumers read the
+    dispatch context.
+  - **Consumers (all five, normative):** (i) the terminal teardown at
+    ALL THREE sites (`poll_descriptor/mod.rs:698-714`, `:768-784`,
+    `:824-840`) is SKIPPED for `OverdueSkipped` (the dispatch
+    installed and changed nothing; teardown would otherwise derive
+    companions, remove state, release NAT, and publish deletes under
+    S2's identity, `session_glue/mod.rs:477-581`); (ii) the anchor
+    commit hook does NOT write; (iii) the flow-cache insert
+    (`:3900-3959`) is suppressed; (iv) the probation clear+refresh
+    NEVER fires on an overdue entry; (v) the ownership promote is
+    guarded by the §5.5 probation flag on K (K remains installed).
+    Accounting is an explicitly ALLOWED consumer (#2501 semantics,
+    `poll_descriptor/mod.rs:3494-3503`, `session/mod.rs:1177-1210`);
+    delivery/buffering/replay/reinjection/telemetry consume S2 (the
+    buffer stores S2's decision and the retry consumes it without
+    another SessionTable lookup, `:5057-5068`,
+    `neighbor_dispatch.rs:272-405`); the deferred RST teardown cannot
+    engage (`session_glue/mod.rs:863-875`).
+  - **Composition (normative, part of the MissingNeighbor outcome
+    list below):** an `OverdueSkipped` result with a MissingNeighbor
+    disposition takes the live-backed `ExistingResolved` buffer-only
+    arm — it NEVER enters the common seed block
+    (`poll_descriptor/mod.rs:4662-4829`).
+  - **The displaced-identity set (producer + carrier):** every site-2c
+    transition result carries
+    `displaced: BoundedIdentitySet` — a fixed-capacity,
+    construction-time-preallocated scratch structure (the
+    `WorkerScratch` `with_capacity` pattern, `worker/scratch.rs:19-32`;
+    bounded at 3 identity families per transition × the
+    64-descriptor batch, `afxdp/mod.rs:278-281` — the zero-hot-path-
+    allocation invariant holds) — containing the new S2 alias family
+    PLUS any removed canonical predecessor's full old alias family
+    PLUS any shadowed placeholder's key family. The placeholder
+    substitution (`shared_ops.rs:602-628`) and the upsert
+    (`install.rs:295-322`, which currently discards `_previous` and
+    returns `bool`) gain OUT parameters recording the displaced
+    identities; the resolved result carries the accumulated set to
+    the poller. A validator REFUSAL is NOT set-empty by fiat
+    (round-102 Codex 4): the site-2c refuse-install (alive
+    probation entry) CAN displace a canonical predecessor, so a
+    `ValidatorRefused` outcome carries that predecessor's family; an
+    `UpsertRefused` (capacity) outcome displaces nothing AT INSTALL,
+    but the same resolve's promotion attempt can still overwrite a
+    non-peer predecessor (`SharedPromote` is non-peer,
+    `entry.rs:245-253`; `update_session` accepts the local→local
+    update and reindexes, `session/mod.rs:1350-1370`,
+    `:1373-1475`) — so the promote step also records the identity it
+    displaces into the same set (only `OverdueSkipped` and a
+    no-predecessor refusal carry the EMPTY set).
+  - **Invalidation timing (the realizable API):** the displaced set
+    accumulates on `WorkerScratch` across the batch; the CURRENT
+    binding's cache invalidation of the set runs at the poller
+    immediately after each descriptor's resolution, before every
+    early exit, the cache insert, and the next descriptor
+    (descriptor processing owns only the current binding,
+    `poll_descriptor/mod.rs:110-131`); the SIBLING fan-out runs once
+    per batch at the `poll_binding` level over `left + right`
+    (`worker/lifecycle.rs:53-55`, `:209-225`) BEFORE the next RX
+    batch — NOT via the reap routine (which includes the current
+    binding and does NAT/BPF teardown,
+    `worker/loop_body/mod.rs:1481-1521`).
+  - **The probation reap** invalidates the flow cache for the FULL
+    alias set of the final identity (canonical, reverse companion
+    `reverse_session_key(key, decision.nat)`, reverse-translated
+    aliases, forward-wire aliases, reply-match tuples — `lookup.rs:
+    62-100`/`:222-250`/`:253-315`, `key.rs:19-26`), with each prior
+    identity's set already invalidated at its adopt/replace time.
 - `retry_pending_neigh` is **UNCHANGED** (master's buffered-decision
   transmit; the v10.1 re-resolve/hold design is retracted, §5.2). A
   buffered packet never runs the anchor hook, the promote, or the
@@ -1703,7 +1795,11 @@ adopting the shared decision/metadata, §5.6).
   `ExistingResolved` / `PurgedRetained` / `SeedEligible` — install can
   still refuse at capacity (`install.rs:123-125`) and NAT64 drops
   before the seed block (`poll_descriptor/mod.rs:4634-4656`), so
-  `SeedInstalled`/`SeedRefused` are RESULTS, not arm-head outcomes. A
+  `SeedInstalled`/`SeedRefused` are RESULTS, not arm-head outcomes.
+  An `OverdueSkipped` materialization outcome (the contract bullet
+  above) COMPOSES to the live-backed `ExistingResolved` buffer-only
+  arm regardless of the disposition's eligibility — it never enters
+  the seed block (normative, v10.19.0, round-102 Codex 2). A
   genuine clean miss on a LATER packet installs the ForwardFlow with
   Open exactly as master. Closing packets take the purge EXACTLY as
   master (v10.15.0 — the close-aware gate is retracted, round-98
@@ -1785,7 +1881,9 @@ untouched.
   agreement (§5.6) — no close can validate against, mark, or propagate
   to a DIFFERENT flow generation anywhere.
 - **Pre-packet validation:** a closing segment never updates the anchor
-  (rule 1), never promotes (rule 5), and on refuse mutates nothing at all.
+  (rule 1), never promotes (rule 5), and on refuse mutates nothing
+  (gate-effects scope: no mark/refresh/re-queue; master's own purge is
+  not a gate effect — v10.19.0, round-102 Codex 9).
 - **Plausibility-gated slides:** the anchor cannot jump more than
   `FWD_SLACK` per accepted sample; seq slides require `seg_len > 0`; ack
   slides require `has_ack`; a `const _` assert pins each leg's interval
@@ -1826,7 +1924,10 @@ untouched.
   (the site-9 typed-outcome gate, §3/§5.8) — the accepted close's sole
   producer survives to its reap**; a refused
   close leaves no mark anywhere, so master's ordinary-timeout emission
-  semantics apply unchanged (locally-born entries emit at natural reap;
+  semantics apply unchanged FOR THE GATE'S OWN EFFECTS (a purged
+  entry is removed by master's own flag-agnostic purge on both
+  versions — no emission either way, master-identical; v10.19.0,
+  round-102 Codex 9) (locally-born entries emit at natural reap;
   unmarked import-class reaps stay silent exactly as master). **Carve-out
   (pre-existing, master-parity — v10.4.0):** an accepted close whose
   mark lands on a transient `MissingNeighborSeed` — the hit path's
@@ -1942,11 +2043,13 @@ untouched.
     the peer's latest-generation-wins upsert overwrites the victim's
     authoritative family (`sync_conn_gen.go:435`,
     `session_store.go:257`). This is master's behavior verbatim, and
-    v10.11.0 retracts the plan's one divergence: the v10.4.1
+    v10.11.0 retracts the plan's first divergence (the v10.4.1
     same-dispatch re-entry had collapsed the class from two packets to
-    one (round-93 Codex 1) — with the retraction the plan is
-    packet-for-packet master-identical here, and the v10.8.0
-    close-aware gate neither widens nor narrows it. It is NOT the issue's
+    one, round-93 Codex 1) and v10.15.0 retracts the second (the
+    close-aware purge-gate line, round-98 Codex 1-3) — with both
+    retractions the plan's dispatch here is packet-for-packet
+    master-identical, closing packets included; the ONE remaining
+    delta is the demote gate's pre-purge refusal (§5.2 (iv)). It is NOT the issue's
     blind-close class, stated precisely (v10.16.0, round-99 Codex 5):
     the harm flows through the identity-less Open overwrite (the sync
     layer), and the chain's state creation is CONSTRUCTOR-side — the
@@ -2336,7 +2439,10 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   invented tuple) — and the same SYN|close under peer-synced provenance
   purges and dispatches EXACTLY as master (v10.15.0 — the close-aware
   gate is retracted; the master's-own FreshPrimary/Open follow-through
-  is the documented #6599-family exposure, §7) and
+  is the documented #6599-family exposure, §7 — the clean miss
+  requires a WARM next hop or a lapsed transient seed; a live cold
+  seed captures the follow-up, `shared_ops.rs:594-613`, round-102
+  Codex 7) and
   never displaces a synced local victim (the `ReplacedSyncedLocal`
   skip stands, v10.8.0);
   (f) a config-update pool-SNAT-matching live no-SNAT flow HIT with a
@@ -2424,7 +2530,8 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   peer copy exists to orphan); reverse-synth
   accept → forward family marked → forward emits at 2 s (same
   transient-seed carve-out); refused close
-  → master's ordinary-timeout emission semantics bit-identical.
+  → master's ordinary-timeout emission semantics bit-identical for the
+  gate's own effects (the purge path is master-identical, v10.19.0).
 - **Observability:** `tcp_close_seq_rejected` visible via the worker
   statistics surface (production build); the rate-limited structured
   record fires at the configured rate cap and never per-packet.
@@ -2546,12 +2653,14 @@ this branch only if the minimal fix proves insufficient.
   from two packets to one, is retracted). The fix is sync-layer
   identity (fenced provenance on Open/Close deltas, or
   provenance-aware purge) — Phase-2-adjacent (§10.5) and in any case
-  its own issue; this plan's gate neither worsens the class nor can
-  prevent it — the gate DOES engage on the first close's pre-purge
-  lookup (refusing the mark on the anchorless entry, the deliberate
-  delta), but the harm's mechanism is the later constructor-side
-  Open, which no demote gate can reach (round-100 Codex 5). Tracked
-  as #6599.
+  its own issue; this plan's gate leaves the class's Open-overwrite
+  mechanism master-identical but DOES engage on the first close's
+  pre-purge lookup — the deliberate delta (refusing the mark on the
+  anchorless entry) LENGTHENS the conflicted companion's exposure on
+  its ordinary trajectory where master would have set the 2 s/30 s
+  closing window (rounds 99-102 Codex; §5.2 (iv)); the harm's
+  mechanism is the later constructor-side Open, which no demote gate
+  can reach. Tracked as #6599.
 - **Import-window reservation race (v10.9.0, round-92 Codex 2):** the
   shared-publish → worker-upsert → P1-reservation ordering leaves a
   window where a local allocation can claim P1 first; the reservation
@@ -2605,7 +2714,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.18.0)
+## 11. Open questions for the convergence round (v10.19.0)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
@@ -2652,12 +2761,14 @@ this branch only if the minimal fix proves insufficient.
    deferred refresh (round-88) — is any pre-commit refresh/requeue
    path left for a probation entry (lookup, `touch_if_stale`, promote,
    materialize refresh), and does the commit-hook clear+refresh cover
-   every admission arm? (e) the v10.18.0 end-state: every surviving
-   mechanism now carries its full mechanical specification —
-   `OverdueSkipped`'s producer/transport/consumer contract, the
-   displaced-identity set, the invalidation timing — and every
-   parity/delta claim is scoped. Is any mechanism left whose
-   specification a competent implementer could read two ways?
+   every admission arm? (e) the v10.19.0 end-state: the §5.8 contract
+   block is the single SSOT for the `MaterializeOutcome`/
+   `OverdueSkipped` producer/transport/consumer contract, the
+   displaced-identity set with its typed producers, the
+   ValidatorRefused/UpsertRefused distinction, the zero-alloc scratch
+   sizing, and the invalidation timing — is anything in that contract
+   still ambiguous to a hostile implementer, and does any claim
+   outside it still contradict a documented delta?
 
 4. **The emission posture:** master's `expire.rs:342-350` gate is
    UNCHANGED; the additions are the normative mark-creation rules, rule
