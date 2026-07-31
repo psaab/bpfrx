@@ -355,6 +355,29 @@ pub struct Coordinator {
     /// parallel tests never race.
     #[cfg(test)]
     pub(crate) cos_owner_at_forwarding_publish: Option<BTreeMap<(i32, u8), u32>>,
+    /// #6291 test seam (per-instance, NOT a process-global): the twin of
+    /// `cos_owner_at_forwarding_publish` for the validation half of the
+    /// publish pair. Under `cfg(test)`, `refresh_runtime_snapshot_inner`
+    /// records the WORKER-VISIBLE `shared_validation` value here at the exact
+    /// instant just before it makes the new `ForwardingState` worker-visible
+    /// (`ha.forwarding` store). The ordering-regression test asserts this
+    /// already carries the new generation — i.e. validation is published
+    /// BEFORE forwarding. Swapping the two coordinator stores captures the
+    /// STALE validation and the test goes RED, which is the producer-side half
+    /// of the invariant the worker-side `refresh_forwarding_then_validation`
+    /// test guards. Absent from release builds; per-instance so parallel tests
+    /// never race.
+    ///
+    /// The second tuple element is the worker-visible forwarding Arc AT THE
+    /// SAME INSTANT, and it makes the seam guard its own placement: the test
+    /// asserts it is NOT the post-refresh Arc, so a future edit that hoists
+    /// the `ha.forwarding` store above this capture — leaving the capture
+    /// reading an already-published validation and silently defeating the
+    /// first assert — goes RED too. Holding the Arc (not a raw pointer) keeps
+    /// the old allocation alive, so `Arc::ptr_eq` cannot be fooled by the new
+    /// allocation reusing a freed address.
+    #[cfg(test)]
+    pub(crate) validation_at_forwarding_publish: Option<(ValidationState, Arc<ForwardingState>)>,
     /// #6244: typed reconcile progress + failure identity. Replaces the
     /// former free-form `String` side-channel; the legacy operator string is
     /// rendered only at the `reconcile_debug` / `debug_reconcile_stage` wire
@@ -423,6 +446,8 @@ impl Coordinator {
             synced_import_cap_override: 0,
             #[cfg(test)]
             cos_owner_at_forwarding_publish: None,
+            #[cfg(test)]
+            validation_at_forwarding_publish: None,
             last_reconcile_stage: ReconcileStage::Idle,
             poll_mode: crate::PollMode::BusyPoll,
             event_stream: None,
@@ -687,11 +712,19 @@ impl Coordinator {
         self.bpf_maps.dnat_table_fd = None;
         self.bpf_maps.dnat_table_v6_fd = None;
         self.forwarding = ForwardingState::default();
+        // #6291: validation BEFORE forwarding here too, matching the
+        // snapshot-refresh publish order. `self.workers.stop_and_clear(...)`
+        // above already joined every worker thread, so this teardown has no
+        // live readers and either order is correct TODAY — but one order
+        // across every publish site keeps the invariant documented in
+        // snapshot_refresh.rs true everywhere, so a future refactor that moves
+        // state-clearing ahead of the join cannot silently resurrect the torn
+        // (old-validation, new-forwarding) window.
+        self.shared_validation
+            .store(Arc::new(ValidationState::default()));
         self.ha
             .forwarding
             .store(Arc::new(ForwardingState::default()));
-        self.shared_validation
-            .store(Arc::new(ValidationState::default()));
         self.ha.fabrics.store(Arc::new(Vec::new()));
         self.neighbors.generation.store(0, Ordering::Relaxed);
         // #949: clear all shards atomically vs readers.

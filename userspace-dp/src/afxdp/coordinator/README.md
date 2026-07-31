@@ -258,7 +258,18 @@ Differences that matter (#1881):
   drives `refresh_forwarding_then_validation` with a coordinator publish
   injected between the two acquire-loads and asserts the worker never
   adopts new forwarding with old validation; swapping the two loads back
-  makes it RED.
+  makes it RED. The invariant is two-sided, so BOTH halves are
+  RED-on-revert guarded: the producer half has its own per-instance
+  `#[cfg(test)] validation_at_forwarding_publish` seam (the twin of the
+  #5166 CoS seam) recording the WORKER-VISIBLE `shared_validation` at the
+  forwarding-publish instant, asserted by
+  `refresh_runtime_snapshot_publishes_validation_before_forwarding` —
+  swapping the two coordinator stores makes THAT one RED. The worker's
+  startup seed (`worker/loop_body/setup.rs`) reads in the same
+  forwarding-then-validation order, and `stop_inner`'s teardown stores use
+  the same validation-then-forwarding order (no live readers there — the
+  worker threads are already joined — but one order everywhere keeps the
+  rule true at every site).
 - **A POST-teardown worker-spawn failure fails closed (#4952).** The
   #2440/#2484/#3789 fail-closed legs above all abort BEFORE `tear_down`,
   so the prior workers stay live. `bring_up_workers` runs AFTER teardown:

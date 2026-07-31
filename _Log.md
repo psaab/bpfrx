@@ -58396,6 +58396,51 @@ top.
   publish injected between the two acquire-loads via the `between` seam).
   RED-on-revert verified (swap the two loads → RED). Full cargo suite green
   (4153+ passed, exit 0); named test 3x ok.
+- **Review fold (2026-07-31, PR #6333 hostile review MERGE-READY-WITH-MINORS,
+  no BLOCK/MAJOR)**: the core reorder and the `between` seam were verified
+  sound and are UNCHANGED. Folded:
+  - MINOR-3 — the invariant is two-sided but only the CONSUMER half was
+    RED-guarded; swapping the two coordinator stores left the whole suite
+    green. Added the producer-side `#[cfg(test)]
+    validation_at_forwarding_publish` seam (twin of the #5166
+    `cos_owner_at_forwarding_publish`), captured immediately above the
+    `ha.forwarding` store, asserted by
+    `refresh_runtime_snapshot_publishes_validation_before_forwarding`. The
+    seam also retains the worker-visible forwarding Arc AT THAT INSTANT and
+    the test asserts it is not the post-refresh Arc, so hoisting the
+    forwarding store above the capture — which would satisfy the validation
+    assert vacuously — is RED too. Retaining the Arc (not a raw pointer)
+    keeps the old allocation alive so `Arc::ptr_eq` cannot be fooled by
+    address reuse.
+  - MINOR-1 — the worker STARTUP SEED (`loop_body/setup.rs`) still read
+    validation before forwarding, i.e. the exact order this fix calls the
+    bug, making the new module doc/README false as written at one of the two
+    worker-side read sites. Not live (the seed is consumed only by
+    `poll_binding`, and iteration 1 repairs validation before any packet is
+    classified), swapped anyway.
+  - MINOR-2 — `stop_inner` stored forwarding before validation, contradicting
+    the doc's categorical rule. Not live (`stop_and_clear` joins every worker
+    thread ~35 lines earlier) and not a regression, but swapped for
+    uniformity with a comment naming the join.
+  - NITs: `loop_body/mod.rs` header no longer claims "no call was added to
+    the per-tick path" (it records the `#[inline]` carve-out and the release
+    `nm` evidence instead); the `!torn` assert now comes FIRST so a future RED
+    names the invariant; this log block gained its missing blank line.
+- **Fold validation**: BOTH producer-side revert forms fail by ASSERTION, not
+  a build break — exchanging the two stores in place gives `left:
+  ValidationState { snapshot_installed: false, config_generation: 0,
+  fib_generation: 0 } right: ... config_generation: 7 ...`; hoisting the
+  forwarding store above the capture gives "the validation capture must be
+  taken BEFORE the ha.forwarding store, or the ordering assert above proves
+  nothing". Production file restored + diff-verified after each. Full cargo
+  suite re-run green; all three ordering test NAMES confirmed present in the
+  run output (stale-binary guard).
+- **Honest sizing**: this is an invariant tightening, NOT a traffic win. In
+  the torn state the OLD code FORWARDED packets the converged state drops
+  (the shim keeps stamping the old generation until Go reprograms
+  `userspace_ctrl`), so the user-visible delta is at most one tick of extra
+  `config_gen_mismatch` drops. Nobody should expect a measurable effect.
+
 ## #6310 — CoS cross-worker prepared-redirect allocation-free (eng6310)
 - **Timestamp**: 2026-07-22
 - **Action**: Eliminate per-packet `frame.to_vec()` at the two cross-binding

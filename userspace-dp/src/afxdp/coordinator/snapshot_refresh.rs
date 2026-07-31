@@ -33,7 +33,20 @@
 //!
 //! Both invariants are load-bearing: do NOT reorder the `shared_validation`
 //! / CoS stores to AFTER the `ha.forwarding` store, and do NOT move the
-//! worker's forwarding load to after its validation / CoS loads.
+//! worker's forwarding load to after its validation / CoS loads. Both HALVES
+//! of both pairs are RED-on-revert guarded — the producer side by the
+//! `#[cfg(test)] cos_owner_at_forwarding_publish` /
+//! `validation_at_forwarding_publish` seams captured immediately above the
+//! `ha.forwarding` store (`coordinator/tests.rs`), the consumer side by
+//! `snapshot_refresh_no_torn_validation_forwarding_6291`
+//! (`worker/loop_body/mod.rs`).
+//!
+//! The rule is site-wide, not refresh-local: the worker's STARTUP SEED
+//! (`worker/loop_body/setup.rs`) reads forwarding then validation, and
+//! `Coordinator::stop_inner`'s teardown stores validation then forwarding.
+//! Teardown runs after every worker thread has been joined, so it has no
+//! live readers — it follows the order for uniformity, so that no site in
+//! the tree contradicts this section.
 use super::*;
 
 impl super::Coordinator {
@@ -431,6 +444,25 @@ impl super::Coordinator {
         // with the #5166 CoS-then-forwarding order above (CoS + validation are
         // both published before forwarding, the single worker-visible gate).
         self.shared_validation.store(Arc::new(self.validation));
+        // #6291 test seam — the producer-side twin of the #5166 CoS capture
+        // above. Records the WORKER-VISIBLE `shared_validation` (not
+        // `self.validation`, which is already the new value either way) at the
+        // instant just before forwarding becomes worker-visible. With the
+        // validation-then-forwarding order it already carries the new
+        // generation; swapping the two stores captures the STALE one and
+        // `refresh_runtime_snapshot_publishes_validation_before_forwarding`
+        // goes RED. The forwarding Arc captured alongside it pins this
+        // capture's POSITION: the test asserts it is not the post-refresh Arc,
+        // so hoisting the `ha.forwarding` store above this block (which would
+        // otherwise make the validation assert pass vacuously) is RED as well.
+        // Absent from release builds.
+        #[cfg(test)]
+        {
+            self.validation_at_forwarding_publish = Some((
+                **self.shared_validation.load(),
+                self.ha.forwarding.load_full(),
+            ));
+        }
         self.ha.forwarding.store(Arc::new(self.forwarding.clone()));
         // #1432 S2a (Copilot C1): reconcile WG control threads on every
         // runtime-snapshot refresh, not just initial bring-up, so a

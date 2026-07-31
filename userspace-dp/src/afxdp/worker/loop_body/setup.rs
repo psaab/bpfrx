@@ -119,8 +119,15 @@ pub(super) fn worker_loop_setup(
     );
     let ha_startup_grace_until_secs =
         (monotonic_nanos() / 1_000_000_000).saturating_add(TUNNEL_HA_STARTUP_GRACE_SECS);
-    let validation = **shared_validation.load();
+    // #6291: forwarding FIRST, validation SECOND — the same publish-safe order
+    // the per-tick refresh uses (`refresh_forwarding_then_validation`,
+    // loop_body/mod.rs). The coordinator stores validation before forwarding,
+    // so acquiring forwarding first makes the torn (old-validation,
+    // new-forwarding) seed impossible. The CoS `load_full`s below already
+    // follow forwarding per #5166; this brings the startup seed in line with
+    // both invariants instead of leaving one worker-side read site inverted.
     let forwarding = shared_forwarding.load_full();
+    let validation = **shared_validation.load();
     let cos_owner_worker_by_queue = shared_cos_owner_worker_by_queue.load_full();
     let cos_owner_live_by_queue = shared_cos_owner_live_by_queue.load_full();
     let cos_shared_root_leases = shared_cos_root_leases.load_full();

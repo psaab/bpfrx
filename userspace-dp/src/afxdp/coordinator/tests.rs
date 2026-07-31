@@ -671,6 +671,102 @@ fn refresh_runtime_snapshot_publishes_cos_owner_map_before_forwarding() {
     );
 }
 
+/// #6291 ordering regression, PRODUCER half: the in-place
+/// `refresh_runtime_snapshot` must store `shared_validation` BEFORE it makes
+/// the new `ForwardingState` worker-visible (`ha.forwarding` store).
+///
+/// The invariant is two-sided. The consumer half — the worker acquire-loads
+/// forwarding FIRST, validation SECOND — is guarded by
+/// `snapshot_refresh_no_torn_validation_forwarding_6291`
+/// (worker/loop_body/mod.rs). Without this test the producer half is protected
+/// by a comment alone: swapping the two coordinator stores reintroduces the
+/// torn `(old-validation, new-forwarding)` window in full while every other
+/// test stays green, because for a producer/consumer pair the acquire/release
+/// message-passing only works when the two sides run in OPPOSITE orders.
+///
+/// The coordinator records `validation_at_forwarding_publish` (a `cfg(test)`
+/// seam, the twin of the #5166 `cos_owner_at_forwarding_publish`) at the exact
+/// instant just before the forwarding store, reading the WORKER-VISIBLE
+/// `shared_validation` rather than `self.validation` (which is already the new
+/// value under either order). With the fix the seam already carries the new
+/// generation; swapping the two stores captures the stale one and this test
+/// goes RED.
+#[test]
+fn refresh_runtime_snapshot_publishes_validation_before_forwarding() {
+    const NEW_GEN: u64 = 7;
+    const NEW_FIB_GEN: u32 = 3;
+
+    let mut coordinator = Coordinator::new();
+
+    // Sanity: a fresh coordinator has published nothing yet, and the
+    // worker-visible validation is still the default (old) generation.
+    assert!(
+        coordinator.validation_at_forwarding_publish.is_none(),
+        "no snapshot applied yet",
+    );
+    let before = **coordinator.shared_validation.load();
+    assert_eq!(
+        before,
+        ValidationState::default(),
+        "the worker-visible validation starts at the default (old) generation",
+    );
+
+    let snapshot = ConfigSnapshot {
+        generation: NEW_GEN,
+        fib_generation: NEW_FIB_GEN,
+        ..Default::default()
+    };
+
+    coordinator
+        .refresh_runtime_snapshot(&snapshot)
+        .expect("refresh_runtime_snapshot must succeed");
+
+    let (captured, forwarding_at_capture) = coordinator
+        .validation_at_forwarding_publish
+        .clone()
+        .expect("refresh must record the validation at the forwarding-publish point");
+
+    // THE INVARIANT: at the instant forwarding became worker-visible, the
+    // worker-visible validation already carried the NEW generation. Otherwise
+    // a worker that observes the new forwarding Arc can still read the old
+    // validation, and a packet stamped at the old generation passes
+    // `classify_metadata` and is then forwarded under the new state.
+    assert_eq!(
+        captured,
+        ValidationState {
+            snapshot_installed: true,
+            config_generation: NEW_GEN,
+            fib_generation: NEW_FIB_GEN,
+        },
+        "validation must be published BEFORE forwarding becomes worker-visible \
+         (#6291 ordering)",
+    );
+
+    // The capture is positioned BEFORE the `ha.forwarding` store — without
+    // this the assert above could be satisfied vacuously by hoisting the
+    // forwarding store above the seam. The captured Arc is retained by the
+    // seam, so its allocation cannot be recycled into the new one and
+    // `ptr_eq` cannot be fooled.
+    assert!(
+        !Arc::ptr_eq(&forwarding_at_capture, &coordinator.ha.forwarding.load_full()),
+        "the validation capture must be taken BEFORE the ha.forwarding store, \
+         or the ordering assert above proves nothing",
+    );
+
+    // Not vacuous: the fixture really did rotate the generation, so the
+    // captured value could have differed from the pre-refresh default.
+    assert_eq!(
+        **coordinator.shared_validation.load(),
+        captured,
+        "post-refresh the worker-visible validation is the captured one",
+    );
+    assert_ne!(
+        captured, before,
+        "the fixture must actually rotate the generation, or the assert above \
+         is vacuous",
+    );
+}
+
 #[test]
 fn build_shared_cos_root_leases_uses_active_workers_per_interface() {
     let mut forwarding = ForwardingState::default();

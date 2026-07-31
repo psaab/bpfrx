@@ -13,7 +13,18 @@
 // round-1 plan review (Codex r1-4) established that an
 // #[inline(never)] call boundary in front of the per-tick
 // `load_arc_if_changed` path risks regressing the 10K-100K ticks/s
-// loop, so no call was added to the per-tick path.
+// loop.
+//
+// #6291 carve-out: the per-tick path does now call one helper,
+// `refresh_forwarding_then_validation`, which exists to pin the
+// forwarding-then-validation acquire order and to expose a
+// controlled-interleaving test seam. It is `#[inline]` and its
+// production `between` argument is `|| {}` (a ZST whose `call_once`
+// body is empty), so it leaves NO call boundary in release: the
+// symbol is absent from `nm` on a `cargo build --release` binary
+// while its caller `worker_loop` is present, and the seam emits no
+// instructions. The no-inline-boundary constraint above still binds
+// for anything that would survive as a real call.
 //
 // `use super::*;` brings every type, helper, and sibling-submodule
 // item from worker/mod.rs into scope — the same pattern lifecycle.rs
@@ -2235,21 +2246,13 @@ mod snapshot_refresh_ordering_tests {
             publish,
         );
 
-        // Not vacuous: with forwarding read first, validation is loaded AFTER
-        // the injected publish, so the worker always observes the new
-        // generation here. (Reverting to validation-first observes OLD_GEN and
-        // trips this assert too.)
-        assert_eq!(
-            observed_validation.config_generation, NEW_GEN,
-            "the injected coordinator publish must be observed (validation is \
-             loaded after it when forwarding is read first)"
-        );
-
-        // THE INVARIANT: the worker must never adopt the NEW forwarding Arc
-        // while still holding OLD validation. Forwarding-first makes the load
-        // return None here (Arc not yet rotated), so nothing is adopted;
-        // validation-first returns Some(new Arc) while observed_validation is
-        // still OLD_GEN — the torn (old-validation, new-forwarding) state.
+        // THE INVARIANT, asserted FIRST so a revert reports the invariant
+        // itself rather than the bookkeeping check below: the worker must
+        // never adopt the NEW forwarding Arc while still holding OLD
+        // validation. Forwarding-first makes the load return None here (Arc
+        // not yet rotated), so nothing is adopted; validation-first returns
+        // Some(new Arc) while observed_validation is still OLD_GEN — the torn
+        // (old-validation, new-forwarding) state.
         let adopted_new_forwarding = new_forwarding_opt.is_some();
         let torn = adopted_new_forwarding && observed_validation.config_generation < NEW_GEN;
         assert!(
@@ -2258,6 +2261,16 @@ mod snapshot_refresh_ordering_tests {
              (config_generation={}) — the torn (old-validation, new-forwarding) \
              window must be impossible",
             observed_validation.config_generation,
+        );
+
+        // Not vacuous: with forwarding read first, validation is loaded AFTER
+        // the injected publish, so the worker always observes the new
+        // generation here. (Reverting to validation-first observes OLD_GEN and
+        // trips this assert too.)
+        assert_eq!(
+            observed_validation.config_generation, NEW_GEN,
+            "the injected coordinator publish must be observed (validation is \
+             loaded after it when forwarding is read first)"
         );
     }
 }
