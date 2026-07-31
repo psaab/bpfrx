@@ -46,7 +46,10 @@ func TestNftNetlinkParity(t *testing.T) {
 		runNftNetlinkParityInner(t)
 		return
 	}
-	if _, err := exec.LookPath("nft"); err != nil {
+	// #6613: use findNft, not a bare LookPath — nft ships in /usr/sbin on this
+	// distro and a non-root PATH omits it, so the bare lookup made THE SECURITY
+	// MERGE GATE silently SKIP while still reporting a green `make test`.
+	if findNft() == "" {
 		t.Skip("T1 ruleset-parity gate SKIPPED: `nft` binary not found in PATH — " +
 			"this gate MUST run where nft exists (the parent runs it); it proves the " +
 			"netlink installer is bit-equivalent to the exec-nft oracle")
@@ -134,7 +137,7 @@ func runNftNetlinkParityInner(t *testing.T) {
 
 		// Oracle side: nft must REJECT the unresolvable token.
 		oracle := buildLo0FilterPayload(badCfg, "badf", "")
-		cmd := exec.Command("nft", "-f", "-")
+		cmd := exec.Command(findNft(), "-f", "-")
 		cmd.Stdin = strings.NewReader(oracle)
 		if out, err := cmd.CombinedOutput(); err == nil {
 			nftDeleteTableBestEffort(xnft.Lo0TableName)
@@ -149,7 +152,7 @@ func runNftNetlinkParityInner(t *testing.T) {
 			nftDeleteTableBestEffort(xnft.Lo0TableName)
 			t.Fatal("netlink FAIL-CLOSED expected: InstallLo0 returned nil on an unresolvable port token (fail-open: the accept widened to match-all)")
 		}
-		if out, err := exec.Command("nft", "list", "table", "inet", xnft.Lo0TableName).CombinedOutput(); err == nil {
+		if out, err := exec.Command(findNft(), "list", "table", "inet", xnft.Lo0TableName).CombinedOutput(); err == nil {
 			nftDeleteTableBestEffort(xnft.Lo0TableName)
 			t.Fatalf("netlink left a PARTIAL ruleset after a fail-closed build (should have installed nothing):\n%s", out)
 		}
@@ -280,7 +283,7 @@ func parityCheck(t *testing.T, table, oracleText string, install func() error) {
 
 func nftLoad(t *testing.T, payload string) {
 	t.Helper()
-	cmd := exec.Command("nft", "-f", "-")
+	cmd := exec.Command(findNft(), "-f", "-")
 	cmd.Stdin = strings.NewReader(payload)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("nft -f - failed: %v\npayload:\n%s\noutput: %s", err, payload, out)
@@ -289,7 +292,7 @@ func nftLoad(t *testing.T, payload string) {
 
 func nftListNormalized(t *testing.T, table string) string {
 	t.Helper()
-	out, err := exec.Command("nft", "list", "table", "inet", table).CombinedOutput()
+	out, err := exec.Command(findNft(), "list", "table", "inet", table).CombinedOutput()
 	if err != nil {
 		t.Fatalf("nft list table inet %s failed: %v\n%s", table, err, out)
 	}
@@ -297,7 +300,7 @@ func nftListNormalized(t *testing.T, table string) string {
 }
 
 func nftDeleteTableBestEffort(table string) {
-	_ = exec.Command("nft", "delete", "table", "inet", table).Run()
+	_ = exec.Command(findNft(), "delete", "table", "inet", table).Run()
 }
 
 var handleRe = regexp.MustCompile(`\s*#\s*handle\s+\d+\s*$`)

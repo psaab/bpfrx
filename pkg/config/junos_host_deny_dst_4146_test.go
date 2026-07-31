@@ -216,6 +216,7 @@ func TestJunosHostProjectAddrMatchIsOneFormula(t *testing.T) {
 		name              string
 		set               []string
 		anyFam, excluded  bool
+		emptyBoth         bool
 		wantAny, wantExcl bool
 		wantSet           []string
 		wantOK            bool
@@ -230,10 +231,16 @@ func TestJunosHostProjectAddrMatchIsOneFormula(t *testing.T) {
 		{name: "excluded constrained set", set: []string{"10.0.0.0/8"}, excluded: true,
 			wantExcl: true, wantSet: []string{"10.0.0.0/8"}, wantOK: true},
 		{name: "excluded set with no family prefix matches all", excluded: true, wantAny: true, wantOK: true},
+		// #6613: "everything except nothing" resolved in BOTH families is the
+		// degenerate form Rust fails CLOSED on (rule_l3_matches requires
+		// !(v4_empty && v6_empty)). Projecting the match-all arm would widen the
+		// authored scope to every firewall address while the dataplane denies
+		// nothing. Reachable on the LENIENT load / peer-sync path only.
+		{name: "excluded empty in BOTH families fails closed", excluded: true, emptyBoth: true, wantOK: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			gotAny, gotExcl, gotSet, ok := junosHostProjectAddrMatch(tc.set, tc.anyFam, tc.excluded)
+			gotAny, gotExcl, gotSet, ok := junosHostProjectAddrMatch(tc.set, tc.anyFam, tc.excluded, tc.emptyBoth)
 			if ok != tc.wantOK {
 				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
 			}

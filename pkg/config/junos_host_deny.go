@@ -531,13 +531,25 @@ func junosHostBuildRule(family string, t junosHostTerm, permit []string, permitA
 		// ICMPv6 app on the inet chain) -> matches nothing here.
 		return JunosHostDenyRule{}, false
 	}
+	// #6613: an `*-excluded` whose resolved set is empty in BOTH families is not
+	// "match everything" — Rust's rule_l3_matches fails CLOSED on it
+	// (`!(v4_empty && v6_empty)`, userspace-dp/src/policy.rs), so projecting the
+	// match-all arm here would widen the authored scope to every firewall
+	// address while the dataplane denies nothing. The per-family helper cannot
+	// see the other family, so the cross-family emptiness is computed here and
+	// passed in. Strict commit already rejects an empty/dangling address-set,
+	// but the LENIENT load / peer-sync path does not, so a config persisted by
+	// an older binary reaches this projection.
+	srcEmptyBoth := !t.srcAnyV4 && !t.srcAnyV6 && len(t.srcV4) == 0 && len(t.srcV6) == 0
+	dstEmptyBoth := !t.dstAnyV4 && !t.dstAnyV6 && len(t.dstV4) == 0 && len(t.dstV6) == 0
+
 	rule := JunosHostDenyRule{Family: family, L4: l4}
-	matchAny, matchExcluded, set, ok := junosHostProjectAddrMatch(src, srcAny, t.srcExcluded)
+	matchAny, matchExcluded, set, ok := junosHostProjectAddrMatch(src, srcAny, t.srcExcluded, srcEmptyBoth)
 	if !ok {
 		return JunosHostDenyRule{}, false
 	}
 	rule.SrcAny, rule.SrcExcluded, rule.Src = matchAny, matchExcluded, set
-	matchAny, matchExcluded, set, ok = junosHostProjectAddrMatch(dst, dstAny, t.dstExcluded)
+	matchAny, matchExcluded, set, ok = junosHostProjectAddrMatch(dst, dstAny, t.dstExcluded, dstEmptyBoth)
 	if !ok {
 		return JunosHostDenyRule{}, false
 	}
@@ -570,10 +582,24 @@ func junosHostBuildRule(family string, t junosHostTerm, permit []string, permitA
 //   - wildcard, not excluded: match everything, with no predicate rendered.
 //   - constrained positive with no prefix of this family: matches nothing
 //     (Junos empty-positive-set semantic).
-func junosHostProjectAddrMatch(set []string, anyFam, excluded bool) (matchAny, matchExcluded bool, out []string, ok bool) {
+//
+// emptyBothFamilies reports that the authored match resolved to NO prefix in
+// EITHER family and carries no wildcard. Combined with `excluded` that is the
+// degenerate "everything except nothing" form, which Rust fails CLOSED on
+// (rule_l3_matches requires !(v4_empty && v6_empty)); projecting the match-all
+// arm for it would silently widen the authored scope to every firewall address
+// while the dataplane denies nothing. It is unreachable via strict commit — the
+// address-set member gate rejects an empty/dangling set — but reachable on the
+// lenient load / peer-sync path from a config an older binary persisted.
+func junosHostProjectAddrMatch(set []string, anyFam, excluded, emptyBothFamilies bool) (matchAny, matchExcluded bool, out []string, ok bool) {
 	switch {
 	case excluded:
 		if anyFam {
+			return false, false, nil, false
+		}
+		if emptyBothFamilies {
+			// Fail CLOSED, matching Rust: project no rule at all rather than an
+			// unconditional drop.
 			return false, false, nil, false
 		}
 		return len(set) == 0, len(set) > 0, append([]string(nil), set...), true
