@@ -586,11 +586,11 @@ pub(super) fn apply_snapshot(
     // semantics per AGY code r4).
     super::super::filter_replayed_synced_sessions(preserved_synced_sessions, &tunnel_purge_ids);
     coord.forwarding = new_forwarding;
-    coord.shared_validation.store(Arc::new(coord.validation));
-    coord
-        .ha
-        .forwarding
-        .store(Arc::new(coord.forwarding.clone()));
+    // #6592: ONE worker-visible store carrying both halves. `coord.validation`
+    // was assigned at the head of this function and `coord.forwarding` is the
+    // reconciled table, so this publishes the new generation's coherent pair
+    // through the single choke point — see `types/runtime_view.rs`.
+    coord.publish_runtime_view();
     coord.slow_path = if let Some(slow_path) = preserved_slow_path {
         // #5801: the preserved reinjector kept the MTU its TUN was created
         // with. A day-2 config MTU change updates the accepted snapshot but

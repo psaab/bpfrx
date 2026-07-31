@@ -86,9 +86,16 @@ func (s *Server) showTextHandler(w http.ResponseWriter, r *http.Request) {
 				// boundary. The authorization mode stays visible; only the
 				// secret is masked. Iteration still runs over the real (sorted)
 				// keys so ordering stays deterministic (#4712).
+				//
+				// #6532 routed the mask through the shared
+				// config.SNMPCommunityDisplayName helper so this surface, the
+				// pkg/cli status commands and the gRPC ShowText topic cannot
+				// drift apart again. redact=true is unconditional here: REST
+				// show-text carries no login class to gate on.
 				for _, name := range sortedKeys(snmpCfg.Communities) {
 					comm := snmpCfg.Communities[name]
-					fmt.Fprintf(&buf, "  %s: %s\n", config.SecretDataPlaceholder, comm.Authorization)
+					fmt.Fprintf(&buf, "  %s: %s\n",
+						config.SNMPCommunityDisplayName(name, true), comm.Authorization)
 				}
 			}
 			if len(snmpCfg.TrapGroups) > 0 {

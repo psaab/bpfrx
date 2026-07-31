@@ -993,6 +993,136 @@ a SetPath container, so the fanout cannot touch them). The two multi-member-body
 cases assert current option-1 behavior only; an options-2/3 fix intentionally
 updates those two expectations.
 
+**Sibling leaves on ONE flat-set line also collapse into a NESTED chain, not
+siblings — the third collapse pattern (#6524).** The two patterns above cover a
+bracket LIST (one leaf, many values). This one is about several DISTINCT leaves
+written on a single `set` line. When a schema leaf declares `children: nil` and
+is neither `multi` nor a wildcard container, `SetPath` consumes its `args`
+tokens and then — having no sub-schema to descend — parks the REST of the line
+under the node it just created. So
+
+```
+set applications application myapp protocol tcp destination-port 8080
+```
+
+does NOT build two siblings; it builds a chain
+`application myapp -> protocol tcp -> destination-port 8080`, and only the
+FIRST link gets a node of its own — every token after it is PACKED flat onto
+one child (`protocol tcp -> Keys=[source-port 5000 destination-port 8080]` for
+a three-leaf line). A compiler iterating the container's immediate `Children`
+therefore sees only the first leaf and silently drops the rest.
+
+That was the #6524 fail-open: `compileApplications` saw only `protocol`, never
+assigned `DestinationPort`, and an empty port term matches ANY port
+(`pkg/policymatch`), so a policy matching the application permitted **all TCP**.
+Nothing caught it — `protocol` / `destination-port` / `source-port` were the
+only `applications application` match leaves that were neither typed nor
+`scalar: true`, so no arity gate engaged and the chained form validated clean at
+BOTH `SchemaValidate` and strict commit. The REVERSE token order was caught only
+incidentally (the chain drops `protocol` instead, tripping the #3109
+protocol-less gate) — that asymmetry hid it.
+
+`applicationDirectLeaves` (`compiler_applications.go`) is the canonical reader:
+it walks the chain, splits each node's packed Keys into one leaf per recognized
+keyword (a keyword-delimited scan, the same shape `parseApplicationTerms` uses),
+and returns every token it cannot map to a known leaf so the deferred strict
+gate rejects it. That last part is what makes `protocol [ tcp udp ]` and
+`destination-port [ 22 23 ]` an operator-visible commit error: a DIRECT
+application body holds ONE protocol and ONE port (`Application.Protocol` /
+`.DestinationPort` are single fields — multi-valued matching is what `term`
+sub-blocks are for), so the bracket tail is unrepresentable rather than merely
+mis-read.
+
+Two properties of that scan are load-bearing and easy to get wrong:
+
+- **Reserve the value slot before resuming the keyword scan.** These leaves are
+  `args: 1`, so each consumes exactly ONE token as its value *even when that
+  token spells a grammar keyword*. `description destination-port` is a
+  description whose text is `destination-port`, not a description followed by a
+  port statement. Without the reservation the scan synthesizes a phantom
+  valueless leaf that RESETS an already-assigned field — driving
+  `DestinationPort` back to `""` (match-every-port on the tolerant path, the
+  very widening this section is about), wiping `Protocol` to `""` (a
+  config-wide fail-closed via #3323), and setting `hasDirectBody`
+  unconditionally, which falsely trips the #3366 mixed direct+term gate on a
+  term-only application. `description` is the only realistic vector — no
+  protocol name/alias, `junosServicePorts` entry, ALG name, or numeric
+  timeout/ICMP value collides with a grammar keyword.
+- **Every consumer of the body must share this walk.** The chain reaches `term`
+  nodes too, so `compileApplications` mints `<parent>-<term>` applications from
+  a chained term. `collectApplicationCollisions`
+  (`compiler_applications_collision.go`) predicts those same generated names to
+  guard the flat Junos namespace (#3472/#3339); while it enumerated
+  `inst.node.Children` directly it could not see a chained term, so a generated
+  name silently OVERWROTE an authored application and erased any deny
+  referencing it — with no commit error. Both sides now derive from the same
+  walk: the compiler consumes `applicationDirectLeaves` directly, and the
+  collision gate reaches it through `applicationTermNodes`, with both
+  reassembling the term's tokens via `applicationTermKeys` so the predicted
+  name always equals the written one. Adding a third reader of the application
+  body means routing it through those helpers, not open-coding a fourth
+  traversal.
+- **An unrepresentable token POISONS the rest of its run and subtree — it must
+  not be skipped so a later keyword can be recovered.** This is the direction
+  that matters on the tolerant path: master ignored an unrecognized child node
+  whole, so `bogus value protocol tcp` left the application PROTOCOL-LESS and
+  therefore unrepresentable (fail-closed — `pkg/policymatch` reports
+  `ContentRejected`, and the #2124 gate refuses to arm). Skipping `bogus` and
+  compiling the `protocol tcp` that follows converts an inert residual into an
+  ACTIVE all-TCP permit on boot / HA `SyncApply`, where the strict reject is
+  only a warning. The same applies to a bracket tail:
+  `destination-port [ 22 23 ] protocol tcp` must not drop `23` and then recover
+  `protocol tcp`. Unknown direct-body content must leave the application NO
+  WIDER than master. Sibling leaves are unaffected — they are separate nodes,
+  so a stray line does not poison its neighbours.
+- **`description` is a TAIL leaf, not `args: 1`.** Junos takes its text to the
+  end of the statement, so the walk joins the run rather than flagging the tail;
+  `description destination-port` keeps its keyword-spelling text intact, and a
+  multi-word description packed onto one node's Keys compiles as written.
+  Rejecting a metadata leaf that cannot affect matching would be pure friction,
+  and that spelling committed on master. Note the join covers ONE of the three
+  positions a multi-word description can occupy, and it is worth being exact
+  about which, so nobody later loosens a gate master also held:
+  - *sibling* (hierarchical or its own `set` line) — governed by the leaf's
+    `scalar: true` arity (#3332), untouched;
+  - *head of a chain* (`set ... description my web app protocol tcp`) — the
+    tail is parked in a CHILD node, so `web` opens a fresh run;
+    `SchemaValidate` rejects the line with `unexpected trailing token "web"`,
+    exactly as on master, and it stays a commit error;
+  - *packed chain tail* (`set ... protocol tcp description my web app`) — the
+    whole description lands on one node's Keys, below the depth the schema walk
+    reaches (`SchemaValidate` returns nil). **This is the only position the
+    join rescues**, and the only one where a spelling master committed would
+    otherwise have become a new hard reject.
+
+**Known limitation — the chained spelling is enforced but not individually
+editable.** Because the leaves are nested rather than siblings,
+`delete applications application myapp destination-port 8080` (and the bare
+`... destination-port`) fail with `path not found`: the node lives under
+`protocol tcp`, not at application level. Re-setting a different port adds a
+second sibling, which the #5574 conflicting-duplicate gate then rejects, and
+that gate's remediation text ("split conflicting values into separate `term`
+sub-blocks") is aimed at a genuine conflict rather than at "I want to change the
+port". The escape is to delete the head of the chain (`delete applications
+application myapp protocol tcp`), which drops the whole line, and re-author it.
+This is pre-existing `SetPath`/`DeletePath` behaviour for every chained leaf,
+not specific to applications — fixing it means teaching the AST editor to
+address a leaf nested under a value node, which changes path resolution for
+every `children: nil` leaf in the schema and is deliberately out of scope here.
+Prefer the one-leaf-per-line spelling when authoring config you expect to edit.
+
+**Why the fix is in the COMPILER, not the schema.** Typing the three leaves (or
+tagging them `scalar: true`) would reject the chained form at commit-check, but
+`CompileConfigLenient` — the boot-load and HA `SyncApply` path — downgrades a
+schema rejection to a WARNING and keeps compiling. A schema-only fix therefore
+leaves a persisted or peer-pushed config still compiling protocol-only and still
+permitting all TCP, precisely where no operator sees the warning. Making the
+compiler consume the chain fixes every path at once. It also avoids minting a
+new commit-vs-load split for a spelling that now has well-defined semantics —
+the same divergence class #3606 calls out for ports. Covered by
+`pkg/config/compiler_application_chained_leaves_6524_test.go` and the
+policy-OUTCOME suite `pkg/policymatch/app_chained_leaves_6524_test.go`.
+
 **`multi: true` ALSO prevents single-value REPLACE for repeated keyed-list
 leaves (#3984).** The `#2419` discussion above is about ONE statement with a
 bracket list. The SAME `multi: true` marker fixes a second, distinct shape:
