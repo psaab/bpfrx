@@ -244,6 +244,17 @@ func TestClassifyTransportErrorReturnsOnlyConstants(t *testing.T) {
 			t.Fatalf("%s returns %v, want the closed transportReason type", fn.Name.Name,
 				fn.Type.Results.List[0].Type)
 		}
+		// A NAMED result admits a naked `return`, which carries whatever the body
+		// last assigned to that name — attacker text included — and presents NO
+		// expression for the walk below to inspect. Requiring the result to be
+		// unnamed makes that shape a COMPILE error instead of one more form this
+		// gate has to recognise.
+		if len(fn.Type.Results.List[0].Names) != 0 {
+			t.Fatalf("%s declares a NAMED result; it must be unnamed. A named result "+
+				"permits a bare `return` whose value never appears as an expression, "+
+				"so no amount of return-inspection can see what it carries.",
+				fn.Name.Name)
+		}
 
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
 			// Do NOT descend into a closure: its returns are the closure's, and
@@ -253,16 +264,44 @@ func TestClassifyTransportErrorReturnsOnlyConstants(t *testing.T) {
 				return false
 			}
 			ret, isReturn := n.(*ast.ReturnStmt)
-			if !isReturn || len(ret.Results) != 1 {
+			if !isReturn {
+				return true
+			}
+			pos := fset.Position(ret.Pos())
+			// SKIPPING a return that is not exactly one expression is how a gate
+			// stops binding: the unnamed-result check above makes the zero-result
+			// form uncompilable, and this makes the skip itself impossible to
+			// reintroduce silently if that check is ever relaxed.
+			if len(ret.Results) != 1 {
+				t.Errorf("%s: %s returns %d expressions, want exactly 1. A return "+
+					"this gate does not inspect is a return that carries anything.",
+					pos, fn.Name.Name, len(ret.Results))
 				return true
 			}
 			checked[fn.Name.Name]++
-			pos := fset.Position(ret.Pos())
 
 			// Form (ii): a direct call to a sibling classifier, itself gated.
 			if call, isCall := ret.Results[0].(*ast.CallExpr); isCall {
 				callee, isCalleeIdent := call.Fun.(*ast.Ident)
 				if isCalleeIdent && transportClassifiers[callee.Name] {
+					// The NAME is not the function. A local closure
+					// `errnoReason := func(e error) transportReason { return
+					// transportReason(e.Error()) }` spells a gated classifier
+					// exactly, and its body is skipped above as a FuncLit — so
+					// spelling alone would wave through the one shape the FuncLit
+					// skip cannot see. Resolve the identifier through go/types and
+					// require it to BE the package-scope func of that name.
+					obj := info.Uses[callee]
+					declared, isFuncObj := obj.(*types.Func)
+					if isFuncObj && pkg.Scope().Lookup(callee.Name) == declared {
+						return true
+					}
+					t.Errorf("%s: %s returns a call to %q, which go/types resolves "+
+						"to %T rather than the package-scope classifier of that "+
+						"name. A local closure or variable that merely SPELLS a "+
+						"gated classifier shadows it, and its body is skipped as a "+
+						"FuncLit — so its return is never inspected at all.",
+						pos, fn.Name.Name, callee.Name, obj)
 					return true
 				}
 				t.Errorf("%s: %s returns a call that is not a gated classifier. "+
