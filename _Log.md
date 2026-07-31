@@ -61560,3 +61560,206 @@ top.
     userspace-dp/src/afxdp/poll_descriptor/mod.rs,
     userspace-dp/src/afxdp/tests_fabric_zone_stamp.rs,
     docs/fabric-cross-chassis-fwd.md, _Log.md
+
+## 2026-07-31 — policymatch dataplane-parity fixes (#6576, #6577)
+
+- **Timestamp**: 2026-07-31
+- **Action**: Fix two simulator-vs-dataplane divergences in `pkg/policymatch`,
+  both found by the `claude-opus-review-001` campaign and both missed by that
+  campaign's own triage (it filed from the report's suggested issue split
+  rather than walking every sub-report finding).
+- **File(s)**: `pkg/policymatch/policymatch.go`,
+  `pkg/policymatch/README.md`,
+  `pkg/policymatch/mapped_ipv6_contains_6577_test.go` (new),
+  `pkg/policymatch/junos_host_fragment_6576_test.go` (new)
+
+**#6577** — `net.IPNet.Contains` folds an IPv4-mapped IPv6 address via `To4()`
+and then fails its own length guard against every 16-byte v6 prefix, so a
+mapped address could never match ANY concrete v6 prefix (`::/0` included) while
+the dataplane's unfolded 128-bit mask matched it. New `containsAnyV6` does the
+16-byte masked compare; the v4 branch deliberately KEEPS the folding form
+(`net.ParseIP` returns a 4-in-6 slice for a dotted quad).
+
+**#6576** — PR #6505 taught `policy.rs`'s junos-host gate the #4569
+fragment-associated deny (#6465) but touched no Go file, so `matchJunosHost`
+kept reporting PERMIT / local delivery for a host-bound fragment the box drops.
+The transit walk's local closures moved onto a shared `fragDenyTracker` now
+used by BOTH walks, plus `overridePermissiveTerminal` for the host
+fall-through (permit-like → must fail closed), mirroring the #6465 post-walk
+arm.
+
+**Validation**: both fixes are fail-on-revert, verified as ASSERTION failures
+(not build breaks) — #6577 reverts to "got 0 via policy allow-rest"; #6576
+reverts to `PolicyName:permit-host-all` and `HostInboundUnmatched:true`, i.e.
+both halves of the bug. Two over-reach guards per fix stay GREEN under revert
+(v4 containment unaffected; the L4 management lifeline and non-overlapping
+fragments still delivered). Full `pkg/policymatch` suite green, plus the three
+consumer surfaces `pkg/cli`, `pkg/grpcapi`, `pkg/api`.
+
+## 2026-07-31 — #6578 review fold: prefix-side #6577 + tier pinning + doc contract
+
+- **Timestamp**: 2026-07-31
+- **Action**: fold the Codex MERGE-NEEDS-MAJOR and Claude CHANGES-REQUESTED
+  findings on PR #6578
+- **File(s)**: `pkg/policymatch/policymatch.go`,
+  `pkg/policymatch/README.md`,
+  `pkg/policymatch/mapped_ipv6_prefix_6577_test.go` (new),
+  `pkg/policymatch/mapped_ipv6_contains_6577_test.go`,
+  `pkg/policymatch/junos_host_fragment_6576_test.go`
+
+**MAJOR (Codex; the parent adjudicated in Codex's favour)** — `addCIDRValue`
+classified a parsed address literal with `ipnet.IP.To4() != nil` / `ip.To4() !=
+nil`, which FOLDS an IPv4-mapped form. `::ffff:0:0/96`, every mapped
+`/97`-`/128` prefix and a bare `::ffff:a.b.c.d` therefore landed in the V4 set,
+where `net.IPNet.Contains` folds the 16-byte network through `To4()` and slices
+the 16-byte mask to its trailing four bytes — degrading `::ffff:0:0/96` to an
+IPv4 /0 that matches EVERY IPv4 address (measured: 8.8.8.8, 203.0.113.99,
+10.0.0.1). Rust's `parse_address` takes the `Ok(IpNet::V6(net))` arm for any
+colon-bearing literal (`Ipv4Addr::from_str` rejects colons), so the box matches
+only mapped-form v6 destinations. On a DENY the simulator claimed coverage of
+all IPv4 the dataplane does not enforce. Now classified colon-strictly from the
+literal TEXT via `addrValueFamily` = `config.NATAddrFamily` +
+`config.NATCIDRIPPart`, the same SSOT #6377 uses. This is the address-SET half
+of the same defect the `containsAnyV6` fix closes on the query side.
+
+**Reviewer error corrected**: the Claude review called this a NIT and asserted
+"the Rust side parses the v4 literal list as `Ipv4Net` and would drop it". Read
+firsthand — `policy.rs` `parse_address` pushes a `PrefixV6` and `prefix.rs`
+`PrefixV6::contains` compares unfolded `u128`. Rust holds it as V6.
+
+**MINOR/NIT folds**: README stated the INVERTED fragment contract at the
+canonical fragment section (host gate "has no #4569 override") 28 lines from
+the PR's own correction — fixed, plus the unconditional `HostInboundUnmatched`
+claim, the `FragmentAssociatedDeny` transit-only code comment, the
+`HostInboundUnmatched` field doc (narrowed by #6576), and a new README section
+for the #6577 behavior. Two of the three new `frag.note` call sites
+(from-any tier, host-scoped global tier) were provably unpinned — added
+per-tier fixtures plus a cross-tier carry test. Corrected the #6577 test file's
+wrong revert recipe to an honest two-lever per-test accounting, and promoted
+the synthetic `::ffff:0:0/96` boundary row to a real policy-level test that now
+reaches `addCIDRValue`.
+
+**Validation**: every revert verified BUILD+VET clean first, so each RED is an
+ASSERTION, never a false red. `addCIDRValue` revert → 4 assertion failures
+(`got 1 via "block-mapped-range"` for the plain-IPv4 over-match; `got 0 via
+"allow-rest"` for the mapped destination; `resolveToken("::ffff:0:0/96") = v4:1
+v6:0 ... want v4:0 v6:1`). Deleting each `frag.note` individually → exact tier
+3 RED, from-any tier 1 RED, global tier 1 RED. Over-reach guards
+(`TestAddressFamilyClassificationUnchanged_6577` — ordinary v4/v6 prefixes,
+bare IPs, `any`/`any-ipv4`/`any-ipv6`, sub-`/96` mapped prefixes;
+`TestOrdinaryV4PolicyUnaffectedByPrefixFix_6577`) stay GREEN under every
+revert. `pkg/policymatch`, `pkg/dataplane/userspace` and `pkg/config` all green.
+
+**Follow-up filed as an observation, NOT changed here**: the address-BOOK path
+in `pkg/dataplane/userspace` (`isV4CIDR`/`isV6CIDR` in `policies.go`, and the
+bare-IP `ip.To4()` split in `policies_addrbook.go`) has the same folding
+classification and files a mapped prefix under the wire v4 bucket. Rust's
+`parse_book_prefix_into` enforces the declared family and REJECTS the whole
+snapshot for it (`UnrepresentableAddressBookPrefix`), so that path fails CLOSED
+at config push rather than mis-programming the box. Changing it would alter
+what is programmed, so it belongs in its own issue with its own smoke.
+
+**Heatmap canary**: `TestHeatmapNotStale` (`pkg/refactoraudit`) was RED. Verified
+in a detached worktree that it ALSO fails at `origin/master` (a680161ca) — the
+Rust rows drifted on master independently of this PR (`policy.rs`,
+`nat64.rs`, `poll_descriptor/mod.rs` are byte-identical at master/HEAD/worktree
+yet the committed heatmap disagrees). This PR additionally grew
+`pkg/policymatch/policymatch.go` 2257 -> 2462, so
+`docs/refactoring-audit-current.txt` is regenerated here; that also clears the
+pre-existing master red. The three commits this branch is behind touch only
+`_Log.md` and a test file, so the regenerated snapshot stays accurate after a
+rebase.
+
+- **Timestamp**: 2026-07-31 03:50
+  - **Action**: Fold the Codex re-gate MINOR on the #6577 README — the section
+    intro described BOTH folding surfaces as "reach the V6 branch and then match
+    nothing", which is true only of the query-containment half. The
+    classification half failed in the opposite direction (a mapped prefix routed
+    into the V4 set, where the fold degraded it to a /0 matching every IPv4
+    address). The body already said this correctly; only the intro contradicted
+    it.
+  - **File(s)**: pkg/policymatch/README.md
+## 2026-07-31 — bind the #6467 cross-family next-table cap invariant
+
+- **Timestamp**: 2026-07-31
+- **Action**: Add the missing test binding for the SHARED (v4+v6) next-table
+  rule window. Test-only; no production change.
+- **File(s)**: `pkg/dataplane/userspace/routes_6467_crossfamily_test.go` (new)
+
+The kernel applier advances ONE priority counter across v4 then v6, so the
+100-entry window is shared. `buildRouteSnapshots` mirrors that by declaring
+`nextTableLeakCount` outside the `addRoutes` closure — but every #6467 fixture
+was v4-only, so the shared-ness was never asserted. Verified by mutation:
+moving the counter into the closure leaves all four shipped #6467 tests GREEN
+while a 60 v4 + 60 v6 config publishes 120 FIB leaks against the kernel's 100.
+The new test asserts the per-family SPLIT (60 inet + 40 inet6), not merely a
+total of 100 — a total-only assertion also passes for a 50/50 split the kernel
+would never produce.
+
+- **Timestamp**: 2026-07-31 03:12
+  - **Action**: Fold hostile-review findings into the #6467 cross-family cap test —
+    corrected two inaccurate provenance comments (the v4-before-v6 ORDER is set by
+    the caller in pkg/daemon/daemon_apply_routing.go, not by a family loop in
+    pkg/routing Apply, which has none), added a straddle precondition so the
+    fixture cannot silently lose its mutation sensitivity if NextTableRuleWindow
+    is retuned, and replaced test 2's false subsumption claim with an honest
+    accounting.
+  - **File(s)**: pkg/dataplane/userspace/routes_6467_crossfamily_test.go
+- **Timestamp**: 2026-07-31
+- **Action**: #6531 guard the DHCPv6 IA_PD prefix-length at the wire
+  decoder. insomniacslk/dhcp decodes the IAPREFIX length byte as
+  net.CIDRMask(length, 128), which returns a NIL mask for any length
+  > 128; net.IPMask(nil).Size() is (0,0), so extractDelegatedPrefixes
+  reading only `ones` and discarding `bits` turned a crafted length of
+  129..255 into a <ip>/0 that reached pkg/ra and was advertised on-link
+  + autonomous to the LAN. Added `bits != 128 || ones == 0`, skipping
+  the offending IAPREFIX (an IA_PD is a multi-element container, so this
+  matches the option-121 classless-route loop rather than
+  leaseFromACKv4's whole-message refusal for a single-valued v4 ACK).
+  Verified firsthand that the library produces a nil mask for > 128 and
+  a nil Prefix for 0 (the latter already skipped). RED-on-revert
+  confirmed: the 129/130/255 rows, the good+bad sibling test, and the
+  withdrawal test all fail with a live /0; the 0/1/48/56/64/128
+  over-reach rows and both pkg/ra tests stay green.
+- **File(s)**: pkg/dhcp/dhcpv6.go,
+    pkg/dhcp/dhcpv6_iapd_prefixlen_6531_test.go,
+    pkg/ra/sender_prefixlen_6531_test.go, pkg/dhcp/README.md, _Log.md
+- **Timestamp**: 2026-07-31
+- **Action**: #6531 / PR #6581 review fold — three documentation-accuracy
+  defects from the Codex review (no logic change; the guard block in
+  extractDelegatedPrefixes is byte-identical to the pre-fold commit).
+  (1) The "empty after skip is unusable and retried" claim in
+  pkg/dhcp/README.md and the extractDelegatedPrefixes comment was FALSE
+  for a mixed ia-na + ia-pd client: parseV6Reply's rejection requires
+  BOTH no IA_NA address and no live PD, so a valid IA_NA lets parsing
+  succeed with zero PDs, and reconcileDelegatedPDs then reads empty
+  live+withdrawn as SILENCE and RETAINS the prior delegation
+  (apply=false, #1844). Verified no /0 is reintroduced on either branch;
+  corrected both statements and bound them with
+  TestIAPDPrefixLen6531_MixedIANAReplyStaysUsable, which drives the real
+  parseV6Reply over hand-rolled IA_NA + IA_PD wire bytes.
+  (2) Two tests over-claimed end-to-end RA coverage. Extended where the
+  seams allowed and renamed where they did not: pkg/ra's prefixInfoFor
+  now MARSHALS the RA and asserts on the RE-PARSED wire bytes instead of
+  buildRA's in-memory option; a new pkg/daemon/ra_pd_prefixlen_6531_test.go
+  calls the real Daemon.buildRAConfigs over a seeded PD (and pins that
+  daemon_ra.go's !subPrefix.IsValid() check does NOT stop a /0);
+  NormalDelegationStillReachesRA renamed to
+  NormalDelegationSurvivesSubPrefixDerivation and re-commented to claim
+  only its leg.
+  (3) The comment "RFC 8415 has no zero-length delegation" was wrong.
+  Verified against the RFC text firsthand: §21.22 says only that a
+  CLIENT "SHOULD NOT send an IA Prefix option with 0 in the
+  'prefix-length' field (and an unspecified value (::) in the
+  'IPv6-prefix' field)" — a hint rule, no delegation floor — and RFC
+  4861 §4.6.2 says a PIO prefix length "ranges from 0 to 128". Restated
+  the row as an xpf policy choice about what is safe to advertise.
+  RED-on-revert re-audited with the guard reverted via Edit: go build +
+  go vet CLEAN (no false red), 6 pre-existing gates plus the new mixed
+  IA_NA test fail on ASSERTIONS naming the live /0, every over-reach row
+  and both consumer-side test pairs stay green. Full pkg/dhcp, pkg/ra
+  and pkg/daemon suites pass.
+- **File(s)**: pkg/dhcp/dhcpv6.go, pkg/dhcp/README.md,
+    pkg/dhcp/dhcpv6_iapd_prefixlen_6531_test.go,
+    pkg/ra/sender_prefixlen_6531_test.go,
+    pkg/daemon/ra_pd_prefixlen_6531_test.go, _Log.md

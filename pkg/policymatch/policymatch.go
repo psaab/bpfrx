@@ -304,9 +304,16 @@ type Query struct {
 	//     same DROP + enforcing policy the dataplane applies rather than a
 	//     fabricated port-0 permit.
 	//
-	// This is the transit-path gate only; a `to-zone junos-host` fragment takes
-	// the host gate, which has no #4569 override (it still fails port-bearing
-	// terms closed). See the #4569 override in Match.
+	// BOTH walks apply the override. The transit walk (Match) has since #5572;
+	// the host walk (matchJunosHost) since #6576, mirroring #6465 in policy.rs.
+	// They share one fragDenyTracker so the two cannot drift again — this
+	// comment previously asserted the host gate had NO override, which stopped
+	// being true the moment #6505 shipped and made the simulator report PERMIT
+	// for a host-bound fragment the dataplane DROPS.
+	//
+	// On the host path the fall-through itself is permit-like (an unmatched
+	// host-bound flow is DELIVERED — the management lifeline), so a skipped
+	// overlapping port-bearing DENY fails the fragment closed there too.
 	NonFirstFragment bool
 
 	// FeedOverlay is the dynamic-address feed-prefix overlay (#2049): an
@@ -688,10 +695,21 @@ type Result struct {
 	// layer and NO transit global/default fallback. Local delivery is instead
 	// gated by host-inbound-traffic service admission, which post-#3405
 	// DEFAULT-DENIES a zone that has no host-inbound-traffic stanza — so
-	// "unmatched" does NOT mean the packet is delivered (#3627). Matched is
-	// false and DefaultUsed is false; callers must render this as "host-inbound,
-	// subject to host-inbound-traffic service admission (no stanza => default
-	// deny), not governed by transit/global/default policy", NOT as the
+	// "unmatched" does NOT mean the packet is delivered (#3627).
+	//
+	// #6576 NARROWED this flag: an unmatched host walk that recorded a SKIPPED
+	// overlapping port-bearing frag-deny candidate returns that deny
+	// (FragmentAssociatedDeny) instead of setting this — the host fall-through
+	// is permit-like, so the fragment fails closed against the rule it skipped,
+	// mirroring the post-walk arm in evaluate_junos_host_policy. The flag now
+	// means "unmatched AND no frag candidate", which for every ordinary L4
+	// query (which never records a candidate) is the unchanged pre-#6576
+	// contract — the management lifeline is untouched.
+	//
+	// Matched is false and DefaultUsed is false; callers must render this as
+	// "host-inbound, subject to host-inbound-traffic service admission (no
+	// stanza => default deny), not governed by transit/global/default
+	// policy", NOT as the
 	// default-policy verdict. Action is unset (PolicyPermit zero value) and
 	// carries no meaning in this case.
 	HostInboundUnmatched bool
@@ -815,7 +833,9 @@ type Result struct {
 	// a RST/ICMP: it can only silently DROP, and the Rust
 	// frag_associated_deny_result hardcodes PolicyAction::Deny to match (see
 	// fragDenyResult). It is set ONLY for a Query with NonFirstFragment == true
-	// whose transit walk would otherwise have permitted; a fragment that a real
+	// whose walk would otherwise have permitted — the TRANSIT walk, or (since
+	// #6576, mirroring #6465/#6505) the junos-host walk, whose permit-like
+	// unmatched fall-through counts as a permit here; a fragment that a real
 	// (protocol-only / `any`) deny matched directly, or that permits with no
 	// overlapping skipped deny, does not carry it. Callers surface FragmentDenyNote
 	// so an operator reads WHY the fragment is denied (the security-over-
@@ -1130,24 +1150,13 @@ func Match(cfg *config.Config, q Query) (res Result) {
 	// overlapping deny is OVERRIDDEN to that deny. For a normal (L4-present)
 	// query q.NonFirstFragment is false, so both are inert and the walk is
 	// byte-identical to before.
-	var fragDeny *fragDenyCandidate
-	noteFrag := func(pol *config.Policy, global bool, fromZone, toZone string, setIdx, sliceIdx int) {
-		if !q.NonFirstFragment || fragDeny != nil {
-			return
-		}
-		if isSkippedFragDeny(cfg, q, pol) {
-			fragDeny = &fragDenyCandidate{
-				pol: pol, global: global, fromZone: fromZone, toZone: toZone,
-				setIdx: setIdx, sliceIdx: sliceIdx,
-			}
-		}
-	}
-	matchOr := func(res Result) Result {
-		if q.NonFirstFragment && fragDeny != nil && res.Action == config.PolicyPermit {
-			return fragDenyResult(ids, *fragDeny)
-		}
-		return res
-	}
+	//
+	// #6576: the machinery now lives on the shared fragDenyTracker so the host
+	// walk (matchJunosHost) uses the SAME implementation instead of silently
+	// lacking one.
+	frag := newFragDenyTracker(cfg, q, ids)
+	noteFrag := frag.note
+	matchOr := frag.override
 
 	// Tier 1: exact zone-pair policies, in config order (first match wins).
 	// q.FromZone/q.ToZone are concrete zone names; a wildcard set
@@ -1247,8 +1256,8 @@ func Match(cfg *config.Config, q Query) (res Result) {
 	// is PERMIT — mirroring the dataplane's post-walk #4569 override. A
 	// default-DENY/REJECT already drops, so the override only matters for
 	// default-permit; when no deny was skipped this is inert.
-	if q.NonFirstFragment && fragDeny != nil && cfg.Security.DefaultPolicy == config.PolicyPermit {
-		return fragDenyResult(ids, *fragDeny)
+	if cfg.Security.DefaultPolicy == config.PolicyPermit {
+		return frag.overridePermissiveTerminal(Result{DefaultUsed: true, Action: cfg.Security.DefaultPolicy})
 	}
 	return Result{DefaultUsed: true, Action: cfg.Security.DefaultPolicy}
 }
@@ -1288,15 +1297,26 @@ func matchJunosHost(cfg *config.Config, q Query, ids map[[2]uint32]uint32) Resul
 	if !zoneKnown(cfg, q.FromZone) {
 		return withHI(Result{HostInboundUnmatched: true})
 	}
+
+	// #6576: track a port-bearing DENY/REJECT this walk SKIPS because a
+	// non-first fragment carries no L4 header, exactly as the transit walk
+	// does — the host gate learned this in #6465 (policy.rs) and the Go mirror
+	// did not follow.
+	frag := newFragDenyTracker(cfg, q, ids)
+
 	// Exact ingress -> junos-host.
 	for setIdx, zpp := range cfg.Security.Policies {
 		if zpp == nil || zpp.ToZone != JunosHostZone || zpp.FromZone != q.FromZone {
 			continue
 		}
 		for sliceIdx, pol := range zpp.Policies {
-			if pol != nil && ruleMatches(cfg, q, pol) {
-				return withHI(matchedResult(ids, pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx))
+			if pol == nil {
+				continue
 			}
+			if ruleMatches(cfg, q, pol) {
+				return withHI(frag.override(matchedResult(ids, pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx)))
+			}
+			frag.note(pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx)
 		}
 	}
 	// from-zone any -> junos-host.
@@ -1305,9 +1325,13 @@ func matchJunosHost(cfg *config.Config, q Query, ids map[[2]uint32]uint32) Resul
 			continue
 		}
 		for sliceIdx, pol := range zpp.Policies {
-			if pol != nil && ruleMatches(cfg, q, pol) {
-				return withHI(matchedResult(ids, pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx))
+			if pol == nil {
+				continue
 			}
+			if ruleMatches(cfg, q, pol) {
+				return withHI(frag.override(matchedResult(ids, pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx)))
+			}
+			frag.note(pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx)
 		}
 	}
 	// #3639 / #3611 Piece B: a GLOBAL policy `match to-zone junos-host`
@@ -1331,16 +1355,22 @@ func matchJunosHost(cfg *config.Config, q Query, ids map[[2]uint32]uint32) Resul
 		if !globalScopeSetMatches(cfg, pol.Match.FromZones, q.FromZone) {
 			continue
 		}
+		gFrom := reportedScopeZone(pol.Match.FromZones, q.FromZone)
+		gTo := reportedScopeZone(pol.Match.ToZones, q.ToZone)
 		if ruleMatches(cfg, q, pol) {
-			return withHI(matchedResult(ids, pol, true,
-				reportedScopeZone(pol.Match.FromZones, q.FromZone),
-				reportedScopeZone(pol.Match.ToZones, q.ToZone),
-				globalSetIdx, sliceIdx))
+			return withHI(frag.override(matchedResult(ids, pol, true, gFrom, gTo, globalSetIdx, sliceIdx)))
 		}
+		frag.note(pol, true, gFrom, gTo, globalSetIdx, sliceIdx)
 	}
 	// No host-bound rule matched: local delivery proceeds. Do NOT fall through
 	// to the transit default — the dataplane host gate returns None here.
-	return withHI(Result{HostInboundUnmatched: true})
+	//
+	// #6576: that delivery is PERMIT-LIKE, so a non-first fragment that skipped
+	// an overlapping port-bearing DENY fails closed against it instead —
+	// mirroring the #6465 post-walk arm in evaluate_junos_host_policy. Inert
+	// for an ordinary L4 query, which never records a candidate, so the
+	// management lifeline is unchanged.
+	return withHI(frag.overridePermissiveTerminal(Result{HostInboundUnmatched: true}))
 }
 
 // hostInboundAdmission classifies the ingress zone's host-inbound-traffic
@@ -1623,7 +1653,7 @@ func matchAddr(cfg *config.Config, overlay map[string][]string, addrs []string, 
 				rawMatched = true
 			}
 		} else {
-			if anyV6 || containsAny(v6nets, ip) {
+			if anyV6 || containsAnyV6(v6nets, ip) {
 				rawMatched = true
 			}
 		}
@@ -1649,9 +1679,81 @@ func matchAddr(cfg *config.Config, overlay map[string][]string, addrs []string, 
 	return !rawMatched
 }
 
+// containsAny reports whether ip falls inside any of the V4 nets. It keeps
+// net.IPNet.Contains, whose leading `if x := ip.To4(); x != nil { ip = x }`
+// narrowing is CORRECT here: net.ParseIP hands back a 16-byte 4-in-6 slice for
+// a plain dotted quad, and addCIDRValue stores v4 prefixes 4-byte, so the fold
+// is what makes the two widths meet.
+//
+// The fold is only safe because addCIDRValue routes a value into a v4 set on
+// the COLON-STRICT text family (addrValueFamily), so every net here came from a
+// colonless literal and is a genuine 4-byte IPv4 prefix. Before #6577 the
+// routing used ipnet.IP.To4(), which filed a mapped `::ffff:0:0/96` here — and
+// Contains then sliced its 16-byte mask to the trailing four ZERO bytes,
+// degrading it to an IPv4 /0 that matched every IPv4 address.
 func containsAny(nets []*net.IPNet, ip net.IP) bool {
 	for _, n := range nets {
 		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsAnyV6 is the v6 counterpart and deliberately does NOT use
+// net.IPNet.Contains.
+//
+// #6577: Contains opens with the same `ip.To4()` narrowing, so an IPv4-MAPPED
+// IPv6 address (`::ffff:a.b.c.d`) is folded to 4 bytes and then fails the
+// `len(ip) != len(nn)` length guard against EVERY 16-byte v6 prefix — `::/0`
+// included. The dataplane compares UNFOLDED 128-bit values
+// (`userspace-dp/src/prefix.rs`: `(u128::from(ip) & self.mask) == self.network`),
+// so a mapped destination matched a v6 DENY there while falling through to a
+// later PERMIT here — the simulator reported PERMIT where the box DENIES, in
+// the package whose contract is dataplane parity.
+//
+// This is the untested half of #6377: that issue fixed WHICH family's rules a
+// mapped address is tested against (the unsupported-tuple gate); this is HOW
+// containment is performed once the address lands in the v6 branch.
+//
+// Every net reaching a v6 set carries a 16-byte IP AND a 16-byte mask —
+// addCIDRValue routes a value here on the COLON-STRICT text family
+// (addrValueFamily), and net.ParseCIDR of a colon-bearing literal yields a
+// 16-byte network plus a CIDRMask(n, 128), while the bare-IP branch stores
+// To16() plus CIDRMask(128, 128). That holds for an IPv4-MAPPED prefix too
+// (`::ffff:0:0/96` -> 16-byte `::ffff:0.0.0.0` + a 16-byte /96 mask), which is
+// what lets the straight 16-byte masked compare below mirror the Rust
+// `PrefixV6` mask exactly for the mapped forms #6577 is about. Written
+// explicitly rather than through netip (the #6327 preference) because
+// netip.Prefix.Contains keys family off Addr.BitLen(), and the 4-in-6 slice
+// net.ParseIP returns for a dotted quad would make an implicit-family form
+// silently stop matching v4.
+//
+// The caller supplies the PACKET family colon-strictly too (queryTupleFamily
+// off config.NATAddrFamily on the raw operator text). That hint is the SOLE
+// guard against a plain dotted quad reaching this branch: net.ParseIP("10.0.1.5")
+// and net.ParseIP("::ffff:10.0.1.5") are BYTE-IDENTICAL, so containsAnyV6
+// cannot itself tell them apart and would happily match a v4 address against
+// `::/0`. Every production call site derives the family from the same raw
+// string it parses the IP from, so the case is unreachable there.
+func containsAnyV6(nets []*net.IPNet, ip net.IP) bool {
+	ip16 := ip.To16()
+	if ip16 == nil {
+		return false
+	}
+	for _, n := range nets {
+		nip := n.IP.To16()
+		if nip == nil || len(n.Mask) != net.IPv6len {
+			continue
+		}
+		matched := true
+		for i := 0; i < net.IPv6len; i++ {
+			if ip16[i]&n.Mask[i] != nip[i]&n.Mask[i] {
+				matched = false
+				break
+			}
+		}
+		if matched {
 			return true
 		}
 	}
@@ -1698,6 +1800,10 @@ func resolveToken(cfg *config.Config, overlay map[string][]string, tok string) (
 
 // addCIDRValue parses one address value (CIDR, bare IP, "any", or a family
 // wildcard) and appends it to the appropriate family set / wildcard flag.
+//
+// The family is classified COLON-STRICTLY from the value's TEXT
+// (config.NATAddrFamily on config.NATCIDRIPPart), never from the parsed
+// net.IP's To4() — see addrValueFamily.
 func addCIDRValue(val string, v4nets, v6nets *[]*net.IPNet, anyV4, anyV6 *bool) {
 	switch val {
 	case "":
@@ -1719,7 +1825,7 @@ func addCIDRValue(val string, v4nets, v6nets *[]*net.IPNet, anyV4, anyV6 *bool) 
 		return
 	}
 	if _, ipnet, err := net.ParseCIDR(val); err == nil {
-		if ipnet.IP.To4() != nil {
+		if addrValueFamily(val) == "v4" {
 			*v4nets = append(*v4nets, ipnet)
 		} else {
 			*v6nets = append(*v6nets, ipnet)
@@ -1727,12 +1833,45 @@ func addCIDRValue(val string, v4nets, v6nets *[]*net.IPNet, anyV4, anyV6 *bool) 
 		return
 	}
 	if ip := net.ParseIP(val); ip != nil {
-		if ip4 := ip.To4(); ip4 != nil {
-			*v4nets = append(*v4nets, &net.IPNet{IP: ip4, Mask: net.CIDRMask(32, 32)})
+		if addrValueFamily(val) == "v4" {
+			*v4nets = append(*v4nets, &net.IPNet{IP: ip.To4(), Mask: net.CIDRMask(32, 32)})
 		} else {
-			*v6nets = append(*v6nets, &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)})
+			*v6nets = append(*v6nets, &net.IPNet{IP: ip.To16(), Mask: net.CIDRMask(128, 128)})
 		}
 	}
+}
+
+// addrValueFamily classifies one address-book / policy address literal into
+// "v4" or "v6" from its TEXT, mirroring the Rust `parse_address` /
+// `parse_book_prefix_into` dispatch in userspace-dp/src/policy.rs
+// (`prefix.parse::<IpNet>()` tries `Ipv4Net` first, and Rust's
+// `Ipv4Addr::from_str` REJECTS anything containing a colon, so a colon-bearing
+// literal is always `IpNet::V6`). config.NATAddrFamily is the colon-strict
+// SSOT for exactly this Go/Rust divergence and config.NATCIDRIPPart strips the
+// mask so the classification runs on the ORIGINAL text.
+//
+// #6577 (prefix half): the previous `ipnet.IP.To4() != nil` / `ip.To4() != nil`
+// test FOLDS an IPv4-mapped literal, so `::ffff:0:0/96` and every mapped
+// `/97`-`/128` prefix landed in the V4 set. That is not a cosmetic
+// misfiling — once a mapped prefix is in the v4 set, net.IPNet.Contains folds
+// the 16-byte network through To4() and slices the 16-byte mask down to its
+// TRAILING four bytes (net.networkNumberAndMask), so `::ffff:0:0/96` degrades
+// to an IPv4 /0 that matches EVERY IPv4 address, and a mapped `/120` aliases
+// to the embedded IPv4 `/24`. On a DENY rule the simulator therefore reported
+// the rule covering all of IPv4 while the dataplane holds it as a `PrefixV6`
+// that no plain IPv4 packet is ever tested against — the opposite verdict, in
+// the package whose contract is dataplane parity. The bare-IP branch had the
+// identical defect: `::ffff:10.0.0.1` became a v4 /32 while Rust's `Err(_)`
+// arm parses it as an `Ipv6Addr` and stores a v6 /128.
+//
+// This is the address-SET half of the same defect the containsAnyV6 fix closes
+// on the query side. Ordinary literals are unaffected: a dotted quad / v4 CIDR
+// has no colon ("v4") and a genuine v6 literal has one ("v6"), so both classify
+// exactly as the To4() test did — only the mapped forms move, which is the fix.
+// See README "Colon-strict family — containment and prefix classification
+// (#6577)" for the address-BOOK path, which fails closed separately.
+func addrValueFamily(val string) string {
+	return config.NATAddrFamily(config.NATCIDRIPPart(val))
 }
 
 func isBookName(cfg *config.Config, overlay map[string][]string, tok string) bool {
@@ -2125,6 +2264,72 @@ func fragDenyResult(ids map[[2]uint32]uint32, c fragDenyCandidate) Result {
 	r.Action = config.PolicyDeny
 	r.FragmentAssociatedDeny = true
 	return r
+}
+
+// fragDenyTracker reproduces the dataplane's #4569 note_skipped_frag_deny /
+// apply_frag_deny_override pair for ONE policy walk, and is shared by BOTH the
+// transit walk (Match) and the host walk (matchJunosHost).
+//
+// #6576: sharing it is the point. #6505 taught policy.rs's junos-host gate to
+// fail closed on a skipped fragment deny, but the Go host walk kept its
+// pre-#6465 permissive terminal because the transit walk owned the machinery
+// as local closures that matchJunosHost — which returns before they are even
+// declared — could not reach. The simulator then reported PERMIT / "local
+// delivery" for a fragment the box DROPS, in the package whose whole contract
+// is dataplane parity. One tracker, two callers: a future host-gate change
+// cannot silently diverge again.
+//
+// For an ordinary L4 query q.NonFirstFragment is false, so every method is
+// inert and both walks are byte-identical to before.
+type fragDenyTracker struct {
+	cfg  *config.Config
+	q    Query
+	ids  map[[2]uint32]uint32
+	cand *fragDenyCandidate
+}
+
+func newFragDenyTracker(cfg *config.Config, q Query, ids map[[2]uint32]uint32) *fragDenyTracker {
+	return &fragDenyTracker{cfg: cfg, q: q, ids: ids}
+}
+
+// note remembers the FIRST port-bearing DENY/REJECT this walk SKIPPED because
+// the fragment carries no L4 header (overlapping L3, L4-constrained term
+// inapplicable) — the mirror of note_skipped_frag_deny.
+func (f *fragDenyTracker) note(pol *config.Policy, global bool, fromZone, toZone string, setIdx, sliceIdx int) {
+	if !f.q.NonFirstFragment || f.cand != nil || pol == nil {
+		return
+	}
+	if isSkippedFragDeny(f.cfg, f.q, pol) {
+		f.cand = &fragDenyCandidate{
+			pol: pol, global: global, fromZone: fromZone, toZone: toZone,
+			setIdx: setIdx, sliceIdx: sliceIdx,
+		}
+	}
+}
+
+// override converts a matched PERMIT into the remembered deny —
+// apply_frag_deny_override.
+func (f *fragDenyTracker) override(res Result) Result {
+	if f.q.NonFirstFragment && f.cand != nil && res.Action == config.PolicyPermit {
+		return fragDenyResult(f.ids, *f.cand)
+	}
+	return res
+}
+
+// overridePermissiveTerminal converts a PERMIT-LIKE fall-through into the
+// remembered deny. The junos-host fall-through is "no implicit default-deny" —
+// an unmatched host-bound flow is DELIVERED (the management lifeline), which is
+// a permit-like posture, so a fragment that skipped an overlapping port-bearing
+// DENY must fail closed exactly as it does against a transit default-PERMIT.
+// This is the Go mirror of the #6465 post-walk arm in
+// evaluate_junos_host_policy (`if let Some(deny) = skipped_frag_deny { return
+// Some(frag_associated_deny_result(deny)) }`). Inert when no deny was skipped,
+// and the L4 path never records one — so the lifeline is unchanged there.
+func (f *fragDenyTracker) overridePermissiveTerminal(res Result) Result {
+	if f.q.NonFirstFragment && f.cand != nil {
+		return fragDenyResult(f.ids, *f.cand)
+	}
+	return res
 }
 
 // isSkippedFragDeny mirrors the dataplane's rule_is_skipped_frag_ambiguous_deny
