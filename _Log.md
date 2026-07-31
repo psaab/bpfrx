@@ -62226,3 +62226,23 @@ break — `go vet` confirmed passing under every revert.
   — pre-existing, untouched here).
 - **File(s)**: pkg/snmp/getbulk_work_bound_6551_test.go, pkg/snmp/README.md,
     _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6551 review-fold round 3 — two documentation inaccuracies from the
+  Codex re-gate of `3f9358151`. No production or test-coverage change. (1)
+  `pkg/snmp/README.md` listed the v2c cost test as guarding "the call sites" and
+  omitted the new v3 cost test; the inventory now names one cost guard per call
+  site (v2c in `agent.go`, v3 in `v3.go`) and records why one test cannot bind
+  both — unbounding v3 alone once left every test green, which is the gap this
+  round closed. (2) The GET/GETNEXT paragraph claimed both perform a
+  `findNextOIDSnap` + `getOIDValueSnap` PAIR per decoded request OID. Verified
+  firsthand against `pkg/snmp/agent.go`: GET calls only `getOIDValueSnap`
+  (:1218), and GETNEXT calls `findNextOIDSnap` (:1242) then `getOIDValueSnap`
+  only when a successor exists (:1247). Reworded to the claim that is actually
+  true and actually load-bearing — a CONSTANT bound of snapshot operations per
+  request OID, i.e. O(1) with no request-controlled multiplier. The
+  amplification conclusion is unchanged; only the arithmetic describing it was
+  wrong. Codex re-gate otherwise confirmed the split is real (half-grid M=50
+  probe still 54.9x, so fixed overhead does not mask a partial regression) and
+  `AllocsPerRun` stable at exactly 8199 over five runs.
+- **File(s)**: pkg/snmp/README.md, _Log.md

@@ -529,17 +529,27 @@ packet handlers, and MIB view that call into them.
   untouched. `varbindEncodedLen` MUST stay in step with the per-varbind encoding
   in `buildResponseVersion`: an overestimate would stop the grid short of
   varbinds that would have fit and silently shrink large responses.
-  Fail-on-revert guards: `TestGetBulkBuildBounded_6551` (v2c),
-  `TestGetBulkBuildBoundedV3_6551` (v3),
-  `TestGetBulkCostDoesNotScaleWithMaxRepetitions_6551` (the call sites).
+  Fail-on-revert guards, one cost guard per CALL SITE — the two sites are
+  separate surfaces and a single test cannot bind both (unbounding v3 alone once
+  left every test green):
+  `TestGetBulkBuildBounded_6551` (v2c construction),
+  `TestGetBulkBuildBoundedV3_6551` (v3 construction),
+  `TestGetBulkCostDoesNotScaleWithMaxRepetitions_6551` (v2c call site,
+  `agent.go`), and
+  `TestGetBulkCostDoesNotScaleWithMaxRepetitionsV3_6551` (v3 call site,
+  `v3.go`). The v3 cost guard measures ALLOCATIONS rather than wall time, so
+  machine load cannot move it.
   Equivalence-vs-unbounded and encoder-parity guards:
   `TestGetBulkBoundedMatchesUnbounded_6551`,
   `TestVarbindEncodedLenMatchesEncoder_6551`.
   **GET/GETNEXT have no equivalent amplification.** The argument is an
   OPERATION COUNT, not a byte count: RFC 3416 §4.2.1/§4.2.2 bind them to exactly
-  one response varbind per request varbind, so the work is one
-  `findNextOIDSnap` + `getOIDValueSnap` pair per DECODED REQUEST OID and every
-  varbind built is one the manager asked for. There is no `max-repetitions`
+  one response varbind per request varbind, so the work is BOUNDED BY a constant
+  number of snapshot operations per DECODED REQUEST OID and every varbind built
+  is one the manager asked for. Precisely: GET performs `getOIDValueSnap` only;
+  GETNEXT performs `findNextOIDSnap`, then `getOIDValueSnap` only when a
+  successor exists. Neither is a pair-per-OID in general — the bound is what
+  matters, and it is O(1) per request OID either way. There is no `max-repetitions`
   field and nothing else a request can set to make a single OID cost more than
   one operation — that is the whole difference from GETBULK, whose `R*M` grid is
   a request-controlled multiplier on top of the OID count. The only lever left
