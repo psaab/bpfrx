@@ -874,6 +874,14 @@ func junosHostParsePorts(spec string) ([]PortRange, bool) {
 // token or a full admit.
 func junosHostSvcAdmitsIKE(svc []string) bool {
 	for _, s := range svc {
+		// Match enforcement, which lower-cases every token before admitting
+		// (unionHostInboundTokens/lowerTokens in pkg/dataplane/userspace, the
+		// Rust classify_system_service). The sibling protocol path in this file
+		// already normalizes (junosHostReduceApp, line ~776); the service path must
+		// too or a lenient-loaded upper-case `IKE`/`IPSEC`/`ALL` is admitted by
+		// enforcement yet missed here, so the coarse `application any` shield
+		// drops the very IKE/NAT-T it was supposed to exempt (#5557).
+		s = strings.ToLower(strings.TrimSpace(s))
 		if s == "ike" || s == "ipsec" || HostInboundFullAdmitService(s) {
 			return true
 		}
@@ -930,6 +938,11 @@ func junosHostZoneExemptNetdevs(cfg *Config, zoneName string, zone *ZoneConfig, 
 			v.ike = true
 		}
 		for _, s := range svc {
+			// Case-fold to match enforcement (see junosHostSvcAdmitsIKE): a
+			// lenient-loaded upper-case `ALL`/`IDENT-RESET` must set the same
+			// coarse verdict here as the dataplane/Rust classifier reaches, or
+			// the shield diverges from what is actually admitted (#5557).
+			s = strings.ToLower(strings.TrimSpace(s))
 			if HostInboundFullAdmitService(s) {
 				v.fullAdmit = true
 			}

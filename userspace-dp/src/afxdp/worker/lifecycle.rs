@@ -33,6 +33,7 @@ pub(super) fn poll_binding(
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
+    ike_exchanges: &crate::afxdp::forwarding::SharedIkeExchangeTable,
     slow_path: Option<&Arc<SlowPathReinjector>>,
     event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
     local_tunnel_deliveries: &Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>>,
@@ -174,7 +175,7 @@ pub(super) fn poll_binding(
             .as_ref()
             .expect("identity initialized when RX has work");
 
-        // #945: WorkerContext groups 16 shared/passed-through references
+        // #945: WorkerContext groups the shared/passed-through references
         // (interior mutability via locks is preserved). TelemetryContext
         // groups the two mutable counter sinks. Named-field shorthand
         // ensures the compiler verifies field name == local-variable
@@ -192,6 +193,7 @@ pub(super) fn poll_binding(
             shared_nat_sessions,
             shared_forward_wire_sessions,
             shared_owner_rg_indexes,
+            ike_exchanges,
             slow_path,
             event_stream,
             local_tunnel_deliveries,

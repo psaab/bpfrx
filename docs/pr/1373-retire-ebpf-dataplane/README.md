@@ -278,11 +278,15 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | `pkg/cluster/runtime.go` | `clusterRuntime` interface still names `dataplane.SessionStore`/`Telemetry` domain types from `pkg/dataplane`; no longer references `dataplane.DataPlane` after #1518. |
 | `pkg/cluster/sync.go` | Session sync still installs sessions through the legacy bridge (deprecated `SetDataPlane` alias retained one cycle per #1518; constructors now take the narrow `clusterRuntime` instead of `dataplane.DataPlane`). |
 | `pkg/cluster/sync_bulk.go` | Bulk sync still serializes legacy session entries. |
-| `pkg/cluster/sync_conn.go` | Sync connection code still references legacy session types. |
+| `pkg/cluster/sync_conn_gen.go` | #5661 pure-motion split of `sync_conn.go` — session-gen guards still reference legacy session types. |
+| `pkg/cluster/sync_conn_read.go` | #5661 pure-motion split of `sync_conn.go` — receive/dispatch path still references legacy session types. |
+| `pkg/cluster/sync_conn_sweep.go` | #5661 pure-motion split of `sync_conn.go` — incremental sync sweep still references legacy session types. |
+| `pkg/cluster/sync_conn_write.go` | #5661 pure-motion split of `sync_conn.go` — send/queue/journal path still references legacy session types. |
 | `pkg/cluster/sync_protocol.go` | Wire protocol still carries legacy session records. |
 | `pkg/conntrack/gc.go` | GC still uses root package session-domain types until those move out of `pkg/dataplane`; constructors no longer accept `DataPlane`. |
 | `pkg/daemon/daemon.go` | Daemon owns `dataplane.RuntimeDataPlane`; `legacyDP()` accessor was deleted in #1519 (sub-#1451 S4). Only the `RuntimeDataPlane` field and `LastApplyResultOf` adapter remain. |
-| `pkg/daemon/daemon_apply.go` | Apply path still adapts legacy compile/apply metadata. |
+| `pkg/daemon/daemon_apply_dataplane.go` | #5661 pure-motion split of `daemon_apply.go` — dataplane+HA core apply still adapts legacy compile/apply metadata. |
+| `pkg/daemon/daemon_apply_tail.go` | #5661 pure-motion split of `daemon_apply.go` — tail reconcile still names legacy dataplane types. |
 | `pkg/daemon/daemon_policy_invalidate.go` | #4234 commit-time deletion-clear names root dataplane session types (`SessionEntryV4/V6`, `DeleteReasonPolicyDeleted`) to invalidate a deleted policy's live sessions via `SessionStore.DeleteBatchKnown*`; control-plane session lifecycle, no legacy enforcement path. |
 | `pkg/daemon/daemon_proxyarp.go` | #2197: extracted proxy-ARP/NDP reconcile + periodic re-assert call `dataplane.ReconcileProxyARP` (control-plane kernel responder reconcile relocated from `daemon_apply.go`). |
 | `pkg/daemon/daemon_flow.go` | Flow logging still names legacy `dataplane.GlobalCtr*` counter indices read via `dataplane.Telemetry`. |
@@ -293,8 +297,12 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | `pkg/daemon/daemon_ha_userspace_readiness.go` | #4659 split of `daemon_ha_userspace.go` by concern — userspace HA readiness gate reads `dataplane.EffectiveType`/`TypeUserspace` to confirm the runtime forwarding path. |
 | `pkg/daemon/daemon_ha_userspace_stream.go` | #4659 split of `daemon_ha_userspace.go` by concern — userspace HA session-delta streaming names `dataplane.AFInet`/`AFInet6` address-family constants when crossing the legacy bridge. |
 | `pkg/daemon/daemon_run.go` | Runtime wiring still uses the legacy `dataplane.ErrDPDKBackendRetired` sentinel and constructs `api`/`grpcapi`/`cli` configs against the daemon-local probes in `runtime_probes.go` (#1519 capstone). |
+| `pkg/daemon/daemon_run_bringup.go` | #5661 pure-motion split of `daemon_run.go` — manager/config bring-up names `dataplane.ErrDPDKBackendRetired`/`ErrEBPFBackendRetired`/`Manager`. |
+| `pkg/daemon/daemon_run_naming.go` | #5661 pure-motion split of `daemon_run.go` — interface naming reads `dataplane.EffectiveType`/`TypeUserspace`. |
+| `pkg/daemon/daemon_run_routehelpers.go` | #5661 pure-motion split of `daemon_run.go` — applied-tunnel/route helpers read `dataplane.EffectiveType`/`TypeUserspace`. |
 | `pkg/daemon/runtime_probes.go` | #1519 daemon-local typed probes (`apiDataPlane`/`grpcDataPlane`/`cliDataPlane`/`dataplaneReadyProbe`/`natSeeder`/`fibSyncStarter`) mirror downstream package-private interfaces; still name root `pkg/dataplane` types (`SessionKey`, `CounterValue`, etc.) until those move to a domain package. |
 | `pkg/logging/ringbuf.go` | #3057 — RT_FLOW policy-name resolution references the shared wire-contract constants `dataplane.DefaultPolicySentinelID` + `dataplane.DefaultPolicyName` (the implicit default-policy sentinel ID, kept in lockstep with `userspace-dp/src/policy.rs`). Display-only; no legacy enforcement path. |
+| `pkg/nftables/netlink_lo0.go` | #6387 PR-2 — the additive netlink lo0-filter builder resolves DSCP names through the `dataplane.DSCPValues` SSOT to emit numeric nft-equivalent matches (mirrors `daemon_nft.go`'s #3436 resolution). Ruleset-generation-only; no legacy enforcement path. |
 | `pkg/policymatch/zone_detail_summary.go` | #3684 — the shared `show security zones detail` policy-summary presenter renders the same wire-contract constants `dataplane.DefaultPolicyName` + `dataplane.DefaultPolicySentinelID` on the default-policy catch-all row (M13). Display-only; no legacy enforcement path (peer of `pkg/logging/ringbuf.go`). |
 | `pkg/grpcapi/apply_result.go` | gRPC apply metadata still adapts legacy apply results. |
 | `pkg/grpcapi/server_nat.go` | #2218 — `GetNATRuleStats` keys NAT translation-hit counters with `dataplane.NATCounterKey` (type-namespaced `ruleset/rule`) so same-named SNAT/DNAT/static rules do not collide; shares the compiler's single key formatter. |

@@ -19,6 +19,7 @@
 use super::*;
 
 mod builders;
+mod nat64_match;
 mod nat_match_v4;
 mod nat_match_v6;
 mod parse;
@@ -51,6 +52,17 @@ pub(super) struct EmbeddedIcmpMatch {
     pub(super) resolution: ForwardingResolution,
     /// Session metadata (zones, RG).
     pub(super) metadata: SessionMetadata,
+    /// #6474: this match is an OUTBOUND ICMP error through source NAT — the
+    /// internal host emitted the error about the session's REPLY packet, so
+    /// the quote carries the PRE-NAT tuple and the session-fallback matched
+    /// the FORWARD session via the quote's reply key (`is_reverse == false`,
+    /// `rewrite_src` set, no destination NAT). The caller must re-NAT the
+    /// outer source and the embedded quote to the session's external
+    /// identity (RFC 5508 §4) with the `build_snat_outbound_icmp_error_*`
+    /// builders — NOT the #5690 reversal, which would consume the
+    /// descriptor with the internal (pre-NAT) source on the wire and an
+    /// unassociable quote. `false` on every inbound match.
+    pub(super) outbound_snat: bool,
 }
 
 /// Borrow bundle threaded through both v4/v6 NAT-match paths and the
@@ -161,12 +173,63 @@ pub(super) fn try_embedded_icmp_nat_match_from_frame(
     }
 }
 
+pub(super) use nat64_match::Nat64IcmpErrorMatch;
+
+/// #6472: NAT64 flowless ICMP-error session match, operating on a frame
+/// slice. Builds the `NatMatchCtx` borrow bundle exactly like
+/// [`try_embedded_icmp_nat_match_from_frame`] and dispatches to the
+/// cross-family matcher; the poll-side caller translates + forwards per
+/// the returned direction. `None` = not a NAT64 session error (the
+/// same-family reversal and normal flowless enforcement run unchanged).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn try_nat64_icmp_error_match_from_frame(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    sessions: &mut SessionTable,
+    forwarding: &ForwardingState,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    now_ns: u64,
+) -> Option<Nat64IcmpErrorMatch> {
+    let mut ctx = NatMatchCtx {
+        sessions,
+        forwarding,
+        dynamic_neighbors,
+        shared_sessions,
+        shared_nat_sessions,
+        shared_forward_wire_sessions,
+    };
+    nat64_match::try_nat64_icmp_error_match(frame, meta, &mut ctx, now_ns)
+}
+
 pub(super) fn build_nat_reversed_icmp_error_v4(
     frame: &[u8],
     meta: UserspaceDpMeta,
     icmp_match: &EmbeddedIcmpMatch,
 ) -> Option<Vec<u8>> {
     builders::build_nat_reversed_icmp_error_v4(frame, meta, icmp_match)
+}
+
+/// #6474: OUTBOUND ICMP error through source NAT — rewrite the outer
+/// source and the embedded quote to the session's external identity
+/// (RFC 5508 §4). See [`builders::build_snat_outbound_icmp_error_v4`].
+pub(super) fn build_snat_outbound_icmp_error_v4(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    icmp_match: &EmbeddedIcmpMatch,
+) -> Option<Vec<u8>> {
+    builders::build_snat_outbound_icmp_error_v4(frame, meta, icmp_match)
+}
+
+/// #6474: IPv6 twin of [`build_snat_outbound_icmp_error_v4`].
+pub(super) fn build_snat_outbound_icmp_error_v6(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    icmp_match: &EmbeddedIcmpMatch,
+) -> Option<Vec<u8>> {
+    builders::build_snat_outbound_icmp_error_v6(frame, meta, icmp_match)
 }
 
 pub(super) fn build_nat_reversed_icmp_error_v6(
@@ -190,5 +253,27 @@ pub(super) fn finalize_embedded_icmp_resolution(
         now_secs,
         ingress_ifindex,
         icmp_match,
+    )
+}
+
+/// #6472: (resolution, ingress-zone) form of the embedded-ICMP resolution
+/// finalizer for the NAT64 flowless arm (its match is not an
+/// [`EmbeddedIcmpMatch`]). See
+/// [`builders::finalize_embedded_icmp_resolution_parts`].
+pub(super) fn finalize_embedded_icmp_resolution_parts(
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    now_secs: u64,
+    ingress_ifindex: i32,
+    resolution: ForwardingResolution,
+    ingress_zone: u16,
+) -> ForwardingResolution {
+    builders::finalize_embedded_icmp_resolution_parts(
+        forwarding,
+        ha_state,
+        now_secs,
+        ingress_ifindex,
+        resolution,
+        ingress_zone,
     )
 }

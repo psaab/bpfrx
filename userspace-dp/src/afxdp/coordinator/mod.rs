@@ -19,6 +19,7 @@ pub(crate) use bpf_maps::BpfMaps;
 // (`reconcile_status_bindings`) and the control-socket handler can name
 // the fallible return type.
 pub(crate) use reconcile::ReconcileError;
+pub(crate) use reconcile::{MandatoryPin, ReconcileStage, WorkerBindShortfall};
 // #1890: re-import the split-out CoS builders at coordinator scope so
 // pre-split references keep resolving unchanged — `status.rs` and
 // `tests.rs` reach them through `use super::*`, and
@@ -51,6 +52,10 @@ pub(in crate::afxdp) use neighbor_manager::{
 pub(in crate::afxdp) use session_manager::SessionManager;
 use supervisor::spawn_supervised_aux;
 pub(in crate::afxdp) use worker_manager::WorkerManager;
+// #6242: the per-worker transactional runtime record. Named by `bringup.rs`
+// (construction), `status.rs` / HA control fan-out (cold reads), and the test
+// modules (`status_tests.rs`, `ha_tests.rs`, `tests.rs`) that seed workers.
+pub(in crate::afxdp) use worker_manager::WorkerRuntimeRecord;
 
 /// #1866 D3: canonical `id:port@ifindex` summary of a forwarding
 /// state's WireGuard endpoint set, for transition logging.
@@ -251,6 +256,14 @@ pub struct Coordinator {
     pub(crate) shared_validation: Arc<ArcSwap<ValidationState>>,
     pub(crate) neighbors: NeighborManager,
     pub(in crate::afxdp) sessions: SessionManager,
+    /// #6471: node-shared live-IKE-exchange table backing the Stage-11
+    /// established-vs-forged discriminator on the IPsec secondary path.
+    /// Runtime state (NOT config): lives outside `ForwardingState` so a
+    /// snapshot apply does not wipe the seeds, and outside `SessionManager`
+    /// (it is IKE admission state, not an HA-synced session map). Shared
+    /// with every packet worker (via `WorkerSharedDataplane`) and the GRE
+    /// local-origin threads (via the tunnel-spawn site).
+    pub(in crate::afxdp) ike_exchanges: crate::afxdp::forwarding::SharedIkeExchangeTable,
     pub(in crate::afxdp) workers: WorkerManager,
     pub(crate) mirror_targets: Arc<ArcSwap<MirrorTargetMap>>,
     pub(crate) forwarding: ForwardingState,
@@ -303,6 +316,26 @@ pub struct Coordinator {
     /// Always 0 in release builds; per-instance so parallel tests never race.
     #[cfg(test)]
     pub(crate) force_worker_bind_incomplete: u32,
+    /// #6242 test seam: number of worker spawns to let SUCCEED before the
+    /// `force_worker_spawn_fail` failure fires. `force_worker_spawn_fail` alone
+    /// always fails the FIRST planned worker, so it cannot characterise
+    /// PARTIAL-success rollback (workers `0..K-1` launched, worker `K` fails).
+    /// With `force_worker_spawn_fail = 1` and `force_worker_spawn_fail_skip = K`
+    /// the first `K` workers spawn and the `(K+1)`th fails — proving the #4952
+    /// differential preserves the already-launched workers' records. Counts
+    /// DOWN as workers are let through; the forced failure only fires once it
+    /// reaches 0. Always 0 in release builds; per-instance.
+    #[cfg(test)]
+    pub(crate) force_worker_spawn_fail_skip: u32,
+    /// #6242 test seam: when true, EVERY worker whose spawn is not force-failed
+    /// launches a benign STUB thread (reports its FULL planned bound set so the
+    /// readiness barrier passes, then heartbeats until stopped) instead of the
+    /// real `worker_loop`, which cannot bind a real XSK in-process. Lets a
+    /// MULTI-worker test drive partial-success spawn rollback without running
+    /// the real dataplane body on the already-launched workers. Always false in
+    /// release builds; per-instance.
+    #[cfg(test)]
+    pub(crate) force_worker_healthy_stub: bool,
     /// #5674 test seam (per-instance, NOT a process-global): when nonzero,
     /// `synced_import_cap()` returns this value INSTEAD of the real
     /// `worker_count * DEFAULT_MAX_SESSIONS` aggregate ceiling. Lets a test
@@ -322,7 +355,13 @@ pub struct Coordinator {
     /// parallel tests never race.
     #[cfg(test)]
     pub(crate) cos_owner_at_forwarding_publish: Option<BTreeMap<(i32, u8), u32>>,
-    pub(crate) last_reconcile_stage: String,
+    /// #6244: typed reconcile progress + failure identity. Replaces the
+    /// former free-form `String` side-channel; the legacy operator string is
+    /// rendered only at the `reconcile_debug` / `debug_reconcile_stage` wire
+    /// boundary and inside `ReconcileError`'s `Display`. Written on the cold
+    /// reconcile / status boundary, read at ~1 Hz status polls — never on the
+    /// packet path.
+    pub(crate) last_reconcile_stage: ReconcileStage,
     pub(crate) poll_mode: crate::PollMode,
     pub(crate) event_stream: Option<crate::event_stream::EventStreamSender>,
     pub(crate) cos_owner_worker_by_queue: BTreeMap<(i32, u8), u32>,
@@ -331,23 +370,14 @@ pub struct Coordinator {
     /// Per-RG epoch counters for O(1) flow cache invalidation on demotion.
     /// Shared with all worker threads; bumped atomically on demotion/activation.
     pub(crate) rg_epochs: Arc<[AtomicU32; MAX_RG_EPOCHS]>,
-    /// #925 Phase 1: panic-payload slot per worker, keyed by `worker_id`.
-    /// `BTreeMap` (not `Vec`) so non-contiguous or reused worker IDs map
-    /// stably; written exactly once when the worker dies, read at most
-    /// once per gRPC status poll (~1 Hz). Not on the packet hot path.
-    pub(crate) worker_panics: BTreeMap<u32, Arc<Mutex<Option<String>>>>,
-    /// #5289: per-worker exception rings, keyed by `worker_id`. Each worker
-    /// owns one `Arc<Mutex<ExceptionEventRing>>` (inserted at bring-up,
-    /// removed on teardown/reset) and pushes compact POD events into it on
-    /// the terminal-packet path — no process-global mutex, no per-packet
-    /// `String`/`Utc::now`. The status thread (`recent_exceptions`) drains
-    /// all rings + `self.recent_exceptions` (the control-thread ring) at
-    /// ~1 Hz and formats them there. Mirrors `worker_panics`.
-    pub(crate) worker_exception_rings: BTreeMap<u32, Arc<Mutex<ExceptionEventRing>>>,
-    /// #5289: per-worker last-forwarding-resolution slots, keyed by
-    /// `worker_id`. Replaces the shared `last_resolution` mutex on the
-    /// packet path; the status thread picks the newest across all workers.
-    pub(crate) worker_last_resolution: BTreeMap<u32, Arc<Mutex<Option<ResolutionEvent>>>>,
+    // #6242: the former horizontal per-worker owners `worker_panics` (#925),
+    // `worker_exception_rings` and `worker_last_resolution` (#5289) — three
+    // `BTreeMap<u32, Arc<...>>` keyed by `worker_id` in parallel with
+    // `WorkerManager.handles` — are consolidated into
+    // `WorkerManager.records: BTreeMap<u32, WorkerRuntimeRecord>`. One worker's
+    // panic slot + exception ring + last-resolution slot now live on its
+    // record (`rec.panic` / `rec.exception_ring` / `rec.last_resolution`),
+    // registered and rolled back as a single unit alongside its handle.
 }
 
 impl Coordinator {
@@ -365,6 +395,7 @@ impl Coordinator {
             shared_validation: Arc::new(ArcSwap::from_pointee(ValidationState::default())),
             neighbors: NeighborManager::new(),
             sessions: SessionManager::new(),
+            ike_exchanges: Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new()),
             workers: WorkerManager::new(),
             mirror_targets: Arc::new(ArcSwap::from_pointee(MirrorTargetMap::default())),
             forwarding: ForwardingState::default(),
@@ -385,23 +416,31 @@ impl Coordinator {
             #[cfg(test)]
             force_worker_bind_incomplete: 0,
             #[cfg(test)]
+            force_worker_spawn_fail_skip: 0,
+            #[cfg(test)]
+            force_worker_healthy_stub: false,
+            #[cfg(test)]
             synced_import_cap_override: 0,
             #[cfg(test)]
             cos_owner_at_forwarding_publish: None,
-            last_reconcile_stage: "idle".to_string(),
+            last_reconcile_stage: ReconcileStage::Idle,
             poll_mode: crate::PollMode::BusyPoll,
             event_stream: None,
             cos_owner_worker_by_queue: BTreeMap::new(),
             last_cache_flush_at: Arc::new(AtomicU64::new(0)),
             rg_epochs: Arc::new(std::array::from_fn(|_| AtomicU32::new(0))),
-            worker_panics: BTreeMap::new(),
-            worker_exception_rings: BTreeMap::new(),
-            worker_last_resolution: BTreeMap::new(),
+            // #6242: per-worker panic / exception-ring / last-resolution slots
+            // now live on `WorkerManager.records` (initialised by
+            // `WorkerManager::new`), not on three sibling Coordinator maps.
         }
     }
 
     pub fn stop(&mut self) {
         self.stop_inner(true);
+        // #6244: an explicit stop records the terminal lifecycle stage (the
+        // "stopped" write moved out of `stop_inner`, which is also called
+        // mid-reconcile where the caller sets its own stage).
+        self.last_reconcile_stage = ReconcileStage::Stopped;
         // NOTE: Do NOT tear down event_stream here. The event stream must
         // survive across XSK bind/unbind cycles (e.g. when forwarding_armed
         // is temporarily false during startup). Use stop_with_event_stream()
@@ -411,6 +450,8 @@ impl Coordinator {
     /// Full shutdown including the event stream. Called only on process exit.
     pub fn stop_with_event_stream(&mut self) {
         self.stop_inner(true);
+        // #6244: explicit stop -> terminal lifecycle stage (see `stop`).
+        self.last_reconcile_stage = ReconcileStage::Stopped;
         if let Some(mut es) = self.event_stream.take() {
             es.stop();
         }
@@ -542,13 +583,15 @@ impl Coordinator {
         // the monitor's 500ms SO_RCVTIMEO) is the real no-mutation-after-stop
         // guard, mirroring the resolver join below.
         self.neighbors.stop_and_join_monitor();
-        // #1636: stop the neighbor warmer and drop the producer handle so
-        // the worker's recv side disconnects and it exits cleanly. The
-        // 500ms recv timeout bounds the join latency.
-        if let Some(warm_stop) = self.neighbors.warm_stop.take() {
-            warm_stop.store(true, Ordering::Relaxed);
-        }
-        self.neighbors.warm_queue = None;
+        // #1636 / #6314: stop the neighbor warmer, drop the producer handle so
+        // the worker's recv side disconnects, and JOIN it — mirroring the
+        // monitor (above) and resolver (below) siblings. Signalling + dropping
+        // the queue alone left the warmer detached (the pre-#5165 odd-one-out):
+        // a warmer blocked in recv_timeout could fire one stray ARP/NDP solicit
+        // or mutate `last_probed_at` after this teardown cleared the dataplane.
+        // Joining (bounded by the warmer's 500ms recv timeout) is the real
+        // no-mutation-after-stop guard.
+        self.neighbors.stop_and_join_warmer();
         // #1769: stop the on-demand resolver. Signal stop, drop the
         // producer handle so the recv side disconnects promptly, then
         // JOIN the worker before returning. Joining (not just signalling)
@@ -614,14 +657,11 @@ impl Coordinator {
         );
         self.mirror_targets
             .store(Arc::new(MirrorTargetMap::default()));
-        // #925 Phase 1: drop the per-worker panic slots alongside the
-        // workers themselves so a long-running daemon that reconciles
-        // through many worker-id sets doesn't accumulate stale slots.
-        self.worker_panics.clear();
-        // #5289: drop per-worker exception rings + last-resolution slots
-        // alongside the workers, mirroring `worker_panics`.
-        self.worker_exception_rings.clear();
-        self.worker_last_resolution.clear();
+        // #6242: the per-worker panic slots (#925) + exception rings +
+        // last-resolution slots (#5289) are dropped by `stop_and_clear` above
+        // as part of `records.clear()` — one drop per worker record, not three
+        // separate `Coordinator.*.clear()` calls followed by the dead
+        // content-clear loops the old layout ran (see below).
         self.cos_owner_worker_by_queue.clear();
         self.cos
             .owner_worker_by_queue
@@ -690,19 +730,14 @@ impl Coordinator {
         if let Ok(mut recent) = self.recent_exceptions.lock() {
             recent.clear();
         }
-        // #5289: clear per-worker exception rings + last-resolution slots too,
-        // so a stop/clear does not leave stale samples behind for the status
-        // reader to surface.
-        for ring in self.worker_exception_rings.values() {
-            if let Ok(mut ring) = ring.lock() {
-                ring.clear();
-            }
-        }
-        for slot in self.worker_last_resolution.values() {
-            if let Ok(mut slot) = slot.lock() {
-                *slot = None;
-            }
-        }
+        // #6242: the pre-#6242 layout ALSO ran two per-worker content-clear
+        // loops here (`worker_exception_rings` / `worker_last_resolution`
+        // `.lock().clear()`), but `stop_and_clear` above already emptied the
+        // maps via `.clear()`, so those loops iterated an empty map and never
+        // executed a body — dead since #5289. Dropping each record's ring +
+        // slot `Arc` in `records.clear()` frees the underlying storage; there
+        // is nothing left to content-clear. The loops are removed, not
+        // duplicated onto `records`.
         if let Ok(mut recent) = self.recent_session_deltas.lock() {
             recent.clear();
         }
@@ -713,7 +748,15 @@ impl Coordinator {
         self.workers.last_planned_workers = 0;
         self.workers.last_planned_bindings = 0;
         self.workers.last_planned_worker_slots = 0;
-        self.last_reconcile_stage = "stopped".to_string();
+        // #6244: `stop_inner` no longer writes `last_reconcile_stage`. It is
+        // called mid-reconcile by `tear_down` (which then records its own
+        // progress) and by the bring-up fail-closed path (which records the
+        // preserved failure identity right after) — in both the "stopped"
+        // write was a transient the caller immediately overwrote, and in
+        // bring-up it forced an overwrite-then-restore dance. An EXPLICIT stop
+        // records `ReconcileStage::Stopped` in `stop` / `stop_with_event_stream`
+        // instead, so a terminal failure identity is never clobbered by a
+        // teardown that is part of the same reconcile attempt.
     }
 
     pub(crate) fn snapshot_shared_session_entries(&self) -> Vec<SyncedSessionEntry> {
@@ -1106,7 +1149,12 @@ impl Coordinator {
             cold_path_atomics: Arc::new(super::cold_path_hist::WorkerColdPathAtomics::new()),
             join: None,
         };
-        self.workers.handles.insert(worker_id, handle);
+        // #6242: register the whole runtime record (handle + empty
+        // observability slots) as one op — the export test only drives the
+        // handle's `session_export_ack`.
+        self.workers
+            .records
+            .insert(worker_id, WorkerRuntimeRecord::for_test(handle));
         ack
     }
 }

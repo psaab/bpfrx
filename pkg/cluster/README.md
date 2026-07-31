@@ -99,7 +99,12 @@ locating any symbol below is now a matter of opening the named file.
   `SendGratuitousARPBurst` / `SendGratuitousIPv6Burst` are thin wrappers that
   pass a nil predicate (ungated, run-to-completion) for callers with no
   per-instance epoch/state to gate against (direct-mode re-announce, tests).
-- `SessionSync` — `sync.go`, `sync_conn.go`, `sync_bulk.go`, `runtime.go`. HA
+- `SessionSync` — `sync.go`, `sync_conn.go` (connection lifecycle:
+  dial/accept/install/start/stop/disconnect), `sync_conn_gen.go` (session
+  generation guards + synced-session apply), `sync_conn_read.go`
+  (receive/dispatch), `sync_conn_write.go` (send/queue/delete-journal),
+  `sync_conn_sweep.go` (incremental sync sweep), `sync_conn_config.go`
+  (config replication), `sync_bulk.go`, `runtime.go`. HA
   session replication. After #1518, `NewSessionSync`, `NewDualSessionSync`,
   and `SetRuntime` accept the narrow `clusterRuntime` (see `runtime.go`) —
   `Sessions() dataplane.SessionStore` plus `Telemetry() dataplane.Telemetry`.
@@ -702,12 +707,19 @@ outside the monitor loop:
   already rides the failover request/commit payloads), so no mixed-base
   compatibility concern, and it defends against requester death/partition that an
   abort frame could not. Only a REMOTE transfer-out arms a lease; `ManualFailover`
-  / `ManualFailoverBatch` / `ForceSecondary` clear any stale entry at the demotion
-  site so a deliberate operator or ISSU hold is never auto-restored. The lease
+  / `ManualFailoverBatch` / `ForceSecondary` / `ResetFailover` clear any stale
+  entry at their demotion/reset site so a deliberate operator or ISSU hold is
+  never auto-restored (`ResetFailover` clears it for map hygiene — its restore is
+  already gated on `ManualFailover`, which the reset clears; #6301). The lease
   duration (`SetRemoteTransferOutLeaseDuration`, default
   `DefaultRemoteTransferOutLease` = 30s, floored at 15s) is sized above the
   requester's worst-case post-ACK commit latency (local commit-ready settle +
-  commit round-trip) so a legitimate slow commit never trips it. reqID is threaded
+  commit round-trip) so a legitimate slow commit never trips it. The upstream 20s
+  failover-ACK cap (`failoverAckTimeout`, `sync.go`) further bounds this: if the
+  owner's actuation barrier delays the applied-ack past 20s the requester times
+  out and sends NO commit — the exact stranded case the lease-expiry restore
+  handles — so a large `failoverActuateTimeout` cannot delay a real commit past
+  the lease. reqID is threaded
   into `OnRemoteFailover`/`OnRemoteFailoverBatch`/`OnRemoteFailoverCommit`/
   `OnRemoteFailoverCommitBatch` (`sync.go`) to arm/clear it.
 - HA delete-sync callbacks fire from the GC loop. They must not block, and
@@ -723,7 +735,7 @@ outside the monitor loop:
   `m.mu`. This mirrors the `hbStartMu` discipline `StartHeartbeat` uses for the
   same reason (#4033). Any future method that both takes `m.mu` and joins a
   goroutine that re-enters the manager must follow the same split.
-- The incremental sync sweep (`sync_conn.go`) re-syncs a session ONLY on
+- The incremental sync sweep (`sync_conn_sweep.go`) re-syncs a session ONLY on
   `val.Created >= threshold` — it deliberately does NOT re-publish an
   established flow on `LastSeen` activity (#270 narrowed this; #131's
   `|| val.LastSeen >= threshold` clause was removed on purpose to keep the
@@ -744,7 +756,7 @@ outside the monitor loop:
 - **Install-generation delete guard (#2170, #2221)**: every session install and
   every delete carries a per-`(sender,key)` monotonic install generation as a
   length-gated trailing `uint64` (see `docs/sync-protocol.md`). The sender
-  (`sync_conn.go`/`sync_bulk.go`) stamps installs from a single boot-seeded
+  (`sync_conn_gen.go`/`sync_bulk.go`) stamps installs from a single boot-seeded
   counter. A delete draws a **fresh, strictly-greater** generation
   (`takeDeleteGenV4/V6` → `nextInstallGen`) rather than echoing the install's
   stamp, so a delete always out-ranks the install it cancels — this is what makes
@@ -800,6 +812,19 @@ outside the monitor loop:
   *local* commit counter (`Manager.bumpGeneration`) that is not cross-node
   comparable, so the receiver rejects the stale install BEFORE forwarding it to
   the helper, and no config-epoch field or guard is added on the Rust side.
+  **Apply-in-progress fence (#6284, item 2):** the bare `epoch <
+  lastAppliedConfigGen` compare closes the gap only once the high-water has
+  advanced, but the high-water advances AFTER `OnConfigReceived` returns while
+  the `clearSessionsForDeletedPolicies` sweep runs INSIDE it — leaving a sub-µs
+  window where a racing install is admitted against the stale high-water.
+  `configApplyLoop` raises `applyingConfigGen` to the generation it is applying
+  BEFORE the apply and lowers it only AFTER the high-water advances (success) or
+  the apply fails; `configEpochStale` refuses against `max(applyingConfigGen,
+  lastAppliedConfigGen)` (fence read first), so an older-epoch install racing the
+  window is refused against the applying generation instead of admitted. The
+  guard still covers only the config-authority → peer direction; the reverse
+  active/active direction stays a documented fail-OPEN residual on #6284 (item 1,
+  needs a bidirectional config-gen namespace #5274 scoped out).
 - **RT_FLOW session id (#5212)**: distinct from BOTH the synthesized BPF-ABI
   `SessionID` (`now<<16|slot`, node-local) AND the per-key install generation,
   every session install carries the ORIGINATING node's stable RT_FLOW session id

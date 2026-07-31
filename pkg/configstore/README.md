@@ -34,7 +34,7 @@ re-created 0600 on the next commit.
 | `master.key` | `.configdb/master.key` | 0600 | `crypto.go readOrCreateMasterKey` |
 | Text rollback slots | `<config>.N` (e.g. `xpf.conf.1`) | 0600 | `store_commit.go saveRollbackFiles` |
 | Rescue config | `rescue.conf` | 0600 | `store_persist.go SaveRescueConfig` |
-| Config archives | `<archive-dir>/config-*.conf` | 0600 | `store_persist.go writeArchive` |
+| Config archives | `<archive-dir>/config-<ts>.<seq>.conf` | 0600 | `store_persist.go writeArchive` |
 | Audit journal (#4579 A4-02, migrate #5188) | `.config.journal`(+`.N`) | 0600 | `journal/journal.go Log` / `migratePermsLocked` |
 
 The `.configdb` and archive directories are created **0700** (they hold
@@ -110,19 +110,32 @@ inline archive-site passwords).
   `CommitCheck`, `CommitConfirmed`, `Rollback`, `ListHistory`,
   `EnterConfigure`, `EnterConfigureSession`,
   `EnterConfigureExclusive`, `ExitConfigure`, `SyncApply`,
-  `MarkActiveApplied`, `ActiveApplied`. (See
+  `MarkActiveApplied`, `ActiveApplied`, `ActiveDigest`,
+  `MarkAppliedDigest`. (See
   `store.go` for the full surface — there's no shorthand
   `Candidate()` or `History()`; use the `Show*` / `List*` forms.)
-- `MarkActiveApplied` / `ActiveApplied` — the #4957 applied-config marker.
+- `MarkActiveApplied` / `MarkAppliedDigest` / `ActiveApplied` / `ActiveDigest` —
+  the #4957 applied-config marker (+ the #6296 capture/replay pair).
   `SyncApply` (and `Commit`/`Load`) promote `s.active` BEFORE the daemon runs
   the apply and, under the #1799 degrade-not-fail doctrine, do NOT roll it back
   on an apply failure — so a config can be the active tree yet never have
-  converged on the dataplane. The daemon calls `MarkActiveApplied` after a
+  converged on the dataplane. The daemon stamps the marker after a
   fully-successful `applyConfigLocked` (boot, commit, config-sync); `ActiveApplied`
   reports whether the CURRENT active text matches that last-applied digest.
   `pkg/daemon` `handleConfigSync` ANDs its active-text convergence shortcut with
   `ActiveApplied()` so a promoted-but-unapplied synced config is not treated as
-  converged (the HA config high-water then stays pinned until a retry lands). The
+  converged (the HA config high-water then stays pinned until a retry lands).
+  Two ways to stamp: `MarkActiveApplied` re-reads `s.active` at call time (the
+  boot/commit paths use it while holding the apply semaphore, when active is
+  stable); `MarkAppliedDigest` stamps a digest the caller CAPTURED earlier via
+  `ActiveDigest`, for the exact config it applied. The config-sync receive path
+  (`daemon.syncAndApply`) uses the capture/replay pair (#6296): it captures the
+  digest right after `SyncApply` promotes the peer config and replays it on full
+  success, both under the apply semaphore — so a concurrent secondary-side
+  promoter (a local commit / commit-confirmed rollback) mutating `s.active` in
+  what used to be a post-semaphore-release window can no longer make the marker
+  key a different, never-applied tree. `ActiveDigest` returns exactly the value
+  `ActiveApplied` compares against (`configTextDigest(s.active.Format())`). The
   marker is keyed on config text, so a stale value can only cause an idempotent
   re-apply, never a false convergence.
 - `MaxConfigSize` (16 MiB) + `checkConfigSize` — `store.go`. The
@@ -1068,7 +1081,70 @@ owned by the `journal/` subpackage.
   guarantees no archive is ever overwritten while the leading timestamp
   keeps rotation's lexical sort chronological. `ArchiveConfig` captures
   the text, timestamp AND seq together under the lock (no after-unlock
-  `time.Now()` race). The rollback/archive writers
+  `time.Now()` race). Rotation prunes by the parsed seq, and
+  `SetArchiveConfig` seeds the per-process counter from the highest seq on
+  disk so it stays globally monotonic across restarts (#5523 C179-060).
+  The SYNCHRONOUS mirror `ArchiveConfig` writes to a dir passed as a
+  PARAMETER (decoupled from the active `archiveDir`), so the shared counter —
+  seeded from whatever dir `SetArchiveConfig` last activated — can sit BELOW
+  that dir's on-disk max. #6403: it now holds the WRITE lock (not `RLock`)
+  across the seed scan + seq claim and seeds the counter from ITS target dir's
+  on-disk max (monotonic-up, mirroring the commit path's
+  `ensureArchiveSeededLocked`) BEFORE claiming, so its archive always outranks
+  the dir's existing contents. Claiming under the write lock also makes the
+  seed+claim mutually exclusive with a concurrent `SetArchiveConfig` reseed, so
+  the process-global counter cannot be bumped between its seed and its claim in
+  the off-lock write window. Only the WRITE itself stays off-lock (a long
+  archival I/O must not block reconcile/`QuiesceArchival`, #6185); the seed scan
+  is a bounded `ReadDir` under the lock, exactly what the commit path already
+  does. A genuine seed scan error (mount/permission — the on-disk max unknown)
+  fails the synchronous call rather than write a below-max archive; a
+  nonexistent dir is confirmed-empty, seq 0, and the write path's `MkdirAll`
+  creates it.
+  These monotonicity / no-overwrite guarantees hold **once the target
+  archive dir has been successfully scanned** — the reseed is retried on
+  every archiving commit until that scan succeeds (#6404), and while the
+  scan is still failing (the on-disk max unknown) an archiving commit
+  SKIPS its archive rather than write a below-max seq that rotation would
+  prune, archiving normally on the next commit after the scan recovers —
+  see the #6396/#6404 hardening note below.
+  Two #6396 residual hardenings: `parseArchiveSeq` requires the current
+  two-dot `config-<ts>.<seq>.conf` shape (the ts's own
+  seconds.nanoseconds dot PLUS the seq dot), so a legacy pre-#3441
+  `config-<ts>.conf` — whose trailing nanoseconds would otherwise be
+  mis-read as a huge seq — is treated as unparseable (oldest, pruned
+  first) in a mixed legacy+current dir; and `SetArchiveConfig` re-seeds on
+  a target dir that DIFFERS from the last successfully-seeded one
+  (monotonic-up only), not just at process start, so a runtime switch to a
+  previously-used dir cannot let that dir's higher-seq archives outrank the
+  ones this process is about to write. The re-seed keys off `archiveSeedDir`
+  (the last successfully-scanned dir), and `maxArchiveSeq` distinguishes a
+  directory READ error from a legitimately empty dir: a transient scan failure
+  leaves the counter unchanged and the dir un-seeded so the next call retries,
+  rather than pinning the counter at 0 below the on-disk max and pruning every
+  fresh archive as stale (#6396 Codex MINOR 4). #6404 closed the remaining
+  reseed windows the #6396 retry left open, all via the shared
+  `ensureArchiveSeededLocked` helper (called under the write lock; it returns
+  whether the counter is CONFIRMED relative to the active dir):
+  the archiving commit path re-attempts the reseed BEFORE it captures its seq,
+  so a commit that lands after a failed `SetArchiveConfig` scan but before the
+  next explicit retry re-scans the dir instead of writing a still-low seq that
+  rotation would prune as stale (edge 1). If that commit-time rescan ALSO fails
+  (a persistent scan error), the counter is still unconfirmed, so the commit
+  SKIPS its archive entirely rather than write a below-max seq — skipping one
+  archive during the failure window is strictly safer than writing a mis-seq'd
+  one that rotation prunes out of order; the next commit after the scan recovers
+  archives normally (Codex round-2 MAJOR). A nonexistent dir (first use,
+  `os.ErrNotExist`) is treated as a CONFIRMED-empty dir, not a scan failure:
+  there are no pre-existing archives to outrank, so seq 0 is correct and the
+  write path's `MkdirAll` creates it. Disabling archival (`SetArchiveConfig("")`)
+  INVALIDATES `archiveSeedDir`, so a disable→re-enable to the SAME dir
+  (`A`→`""`→`A`) re-scans `A` and accounts for any on-disk max that advanced
+  while archival was off (edge 2); likewise a genuine scan FAILURE clears
+  `archiveSeedDir`, so navigating away to a dir that fails to scan and back
+  (`A`→failed-`B`→`A`) re-scans `A` rather than trusting the stale marker (Codex
+  adjacent). The
+  rollback/archive writers
   route through package-var seams (`rbWriteFileDurable`,
   `rbWriteFileAtomic`, `rbSyncDir`, `rbRemove`) so tests can pin the
   durability call and inject failures (#1916 pattern).

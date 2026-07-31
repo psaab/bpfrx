@@ -16,6 +16,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dhcpserver"
+	"github.com/psaab/xpf/pkg/termsafe"
 )
 
 // showSNMP renders `cli show snmp` — community/trap-group/USM-user
@@ -108,15 +109,20 @@ func (s *Server) showDHCPServer(buf *strings.Builder) {
 		fmt.Fprintf(buf, "  %-18s %-20s %-15s %-12s %s\n", "Address", "MAC", "Hostname", "Lifetime", "Expires")
 		for _, l := range leases4 {
 			fmt.Fprintf(buf, "  %-18s %-20s %-15s %-12s %s\n",
-				l.Address, l.HWAddress, l.Hostname, l.ValidLife, l.ExpireTime)
+				l.Address, termsafe.SanitizeForDisplay(l.HWAddress), termsafe.SanitizeForDisplay(l.Hostname), l.ValidLife, l.ExpireTime)
 		}
 	}
 	if len(leases6) > 0 {
 		buf.WriteString("DHCPv6 Leases:\n")
-		fmt.Fprintf(buf, "  %-40s %-20s %-15s %-12s %s\n", "Address", "DUID", "Hostname", "Lifetime", "Expires")
+		// #5328 (A8-b2-F6): label the column "HWAddress", not "DUID". Kea's
+		// GetLeases6 populates Lease.HWAddress (the link-layer address), not the
+		// client DUID/IAID, so a "DUID" header mislabeled the rendered value.
+		// This mirrors the pkg/cli fix (#4908) that the remote gRPC renderer,
+		// reached by `cmd/cli`, previously missed.
+		fmt.Fprintf(buf, "  %-40s %-20s %-15s %-12s %s\n", "Address", "HWAddress", "Hostname", "Lifetime", "Expires")
 		for _, l := range leases6 {
 			fmt.Fprintf(buf, "  %-40s %-20s %-15s %-12s %s\n",
-				l.Address, l.HWAddress, l.Hostname, l.ValidLife, l.ExpireTime)
+				l.Address, termsafe.SanitizeForDisplay(l.HWAddress), termsafe.SanitizeForDisplay(l.Hostname), l.ValidLife, l.ExpireTime)
 		}
 	}
 }
@@ -192,15 +198,16 @@ func (s *Server) showDHCPServerDetail(cfg *config.Config, buf *strings.Builder) 
 			fmt.Fprintf(buf, "  %-18s %-20s %-15s %-10s %-12s %s\n", "Address", "MAC", "Hostname", "Subnet", "Lifetime", "Expires")
 			for _, l := range leases4 {
 				fmt.Fprintf(buf, "  %-18s %-20s %-15s %-10s %-12s %s\n",
-					l.Address, l.HWAddress, l.Hostname, l.SubnetID, l.ValidLife, l.ExpireTime)
+					l.Address, termsafe.SanitizeForDisplay(l.HWAddress), termsafe.SanitizeForDisplay(l.Hostname), l.SubnetID, l.ValidLife, l.ExpireTime)
 			}
 		}
 		if len(leases6) > 0 {
 			fmt.Fprintf(buf, "DHCPv6 Leases (%d active):\n", len(leases6))
-			fmt.Fprintf(buf, "  %-40s %-20s %-15s %-10s %-12s %s\n", "Address", "DUID", "Hostname", "Subnet", "Lifetime", "Expires")
+			// #5328 (A8-b2-F6): "HWAddress", not "DUID" — see showDHCPServer.
+			fmt.Fprintf(buf, "  %-40s %-20s %-15s %-10s %-12s %s\n", "Address", "HWAddress", "Hostname", "Subnet", "Lifetime", "Expires")
 			for _, l := range leases6 {
 				fmt.Fprintf(buf, "  %-40s %-20s %-15s %-10s %-12s %s\n",
-					l.Address, l.HWAddress, l.Hostname, l.SubnetID, l.ValidLife, l.ExpireTime)
+					l.Address, termsafe.SanitizeForDisplay(l.HWAddress), termsafe.SanitizeForDisplay(l.Hostname), l.SubnetID, l.ValidLife, l.ExpireTime)
 			}
 		}
 	} else {
@@ -290,7 +297,7 @@ func (s *Server) showDHCPDynamicDNS(cfg *config.Config, buf *strings.Builder, de
 					pending = "PTR"
 				}
 				fmt.Fprintf(buf, "    %-32s %-6s %-39s %-26s %s\n",
-					r.FQDN, r.ForwardType, r.Address, r.PTRName, pending)
+					termsafe.SanitizeForDisplay(r.FQDN), r.ForwardType, r.Address, r.PTRName, pending)
 			}
 		}
 	}

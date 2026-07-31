@@ -306,6 +306,62 @@ non-authority's sessions carry the authority-independent seed epoch and the
 guard is inert for them (no false reject), which is acceptable because config
 changes originate on the authority.
 
+#### Apply-in-progress fence — sweep-vs-advance window (#6284, item 2)
+
+The bare epoch compare above (`ConfigEpoch < lastAppliedConfigGen`) closes the
+gap only once `lastAppliedConfigGen` has advanced — but the high-water advances
+**after** `OnConfigReceived` returns, while the deleted-policy sweep
+(`clearSessionsForDeletedPolicies`) runs **inside** it. That leaves a residual
+sub-µs window on the receiver: the moment between the sweep completing and the
+high-water advancing. A session install racing on the `receiveLoop` in that
+window is compared against the STALE high-water and wrongly admitted — reviving
+exactly the permit the just-run sweep invalidated.
+
+The apply-in-progress fence (`applyingConfigGen`) closes it. The single-consumer
+`configApplyLoop` raises the fence to the generation it is about to apply
+**before** calling `OnConfigReceived` (so it covers the whole apply, including
+the sweep) and lowers it to 0 only **after** the high-water advances on success
+(or immediately on an apply failure). `configEpochStale` refuses against
+`max(applyingConfigGen, lastAppliedConfigGen)`, reading the fence **first** so
+that on the success release order (high-water stored, then fence cleared) a
+reader observing `fence == 0` has necessarily already observed the advanced
+high-water — the effective refusal threshold never dips across the window.
+
+Ordering and correctness:
+
+- **No stale permit.** From before the sweep starts until the high-water
+  advances, an install stamped with an epoch older than the applying generation
+  is refused, so it can never land after the sweep against a stale high-water.
+- **No false reject.** The fence refuses only STRICTLY-older epochs. A session
+  the peer stamped with the CURRENT generation (equal to the one being applied)
+  is still admitted, exactly like the post-advance steady state; a transiently
+  refused older session is re-sent by the peer's next sweep.
+- **Apply failure.** The high-water deliberately stays put (M-2/#4151) and the
+  fence simply drops, restoring the pre-apply admission posture — the fence is
+  never held against a generation that never took effect.
+- **Bulk re-prime.** `resetRecvGen` clears the fence alongside the high-water so
+  a rebooted peer's lower-generation re-prime is accepted (the same
+  accept-everything reset the high-water already performs).
+
+**Item 1 (deferred, documented residual).** The guard still covers only the
+config-authority → peer direction (the primary that admits the session is also
+the RG0 config-sync authority). A non-authority's sessions carry the
+authority-independent seed epoch, so the guard is inert for the reverse
+direction in an active/active deployment (fail-OPEN). Closing it requires a
+bidirectional config-generation namespace that #5274 deliberately scoped out (a
+design-heavy change, not part of #6284 item 2). #6284's residual-COVERAGE gap
+is closed (item 2 by #6366, item 1 by #6418); the substantive hardening of this
+inert direction is tracked separately as a future enhancement on #6419.
+
+Both halves of this directional correctness are regression-pinned by
+`sync_config_epoch_active_active_6284_test.go`: the SAME frozen non-authority
+epoch is REFUSED at a receiver that applied a newer config (the protected
+config-authority → peer direction) and ADMITTED at the config authority (whose
+receive high-water never advances — the inert fail-OPEN reverse direction), and
+the sender-side root cause is pinned too (`recordAppliedConfigGen` advances the
+receive high-water but never the send-stamp `configGenCounter`, so a
+non-authority stamps its synced-out sessions with the frozen boot-seed epoch).
+
 ### RT_FLOW Session Id (#5212)
 
 The dataplane assigns each session a STABLE id (`SessionTable::alloc_session_id`)
@@ -722,7 +778,7 @@ pre-computed NAT decision over the fabric — so before #4393 the standby held n
 could not steer the inbound embedded-ICMP error into the helper, so PMTUD
 blackholed for exactly the flows that survived the failover.
 
-- **Publish site:** `Coordinator::upsert_synced_session` (`afxdp/ha.rs`) calls
+- **Publish site:** `Coordinator::upsert_synced_session` (`afxdp/ha/session_import.rs`) calls
   `publish_dnat_table_entry` for every forward peer-synced entry, immediately
   after the `publish_shared_session` that populates the (also process-global)
   `shared_nat_sessions` reverse-NAT map. `dnat_table` is a **single shared BPF
@@ -734,7 +790,7 @@ blackholed for exactly the flows that survived the failover.
   node becomes active, and inbound SNAT-return traffic never reaches the standby,
   so an early entry is inert until failover. A reverse companion carries no
   source rewrite and publishes nothing.
-- **Release site:** `Coordinator::delete_synced_session_gen` (`afxdp/ha.rs`)
+- **Release site:** `Coordinator::delete_synced_session_gen` (`afxdp/ha/session_import.rs`)
   calls `delete_dnat_table_entry` alongside the session-map delete, keyed on the
   same `dnat_v4_key_bytes` / `dnat_v6_key_bytes` SSOT the publish used, so the
   delete byte-matches the insert. The maps are non-LRU `HASH`

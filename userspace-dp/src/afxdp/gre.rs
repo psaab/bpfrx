@@ -137,7 +137,7 @@ pub(in crate::afxdp) static GRE_DECAP_ECN_ILLEGAL_DROPS: AtomicU64 = AtomicU64::
 /// captures the outer ECN out-of-band (the kernel UDP socket strips the
 /// outer IP header before userspace, so the bits arrive as `IP_RECVTOS`
 /// / `IPV6_RECVTCLASS` ancillary data on `recvmsg` — see
-/// `coordinator/wg_control.rs`) and feeds it into the SAME
+/// `coordinator/wg_control/sock.rs`) and feeds it into the SAME
 /// `apply_decap_ecn_combine` below. A nonzero value means a misbehaving
 /// WG ingress / congested path CE-marked the outer of a Not-ECT inner.
 pub(in crate::afxdp) static WG_DECAP_ECN_ILLEGAL_DROPS: AtomicU64 = AtomicU64::new(0);

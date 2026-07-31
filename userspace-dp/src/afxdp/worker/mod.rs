@@ -85,6 +85,17 @@ use cos::{
 mod loop_body;
 pub(crate) use loop_body::worker_loop;
 
+// #6241: typed worker-launch bundles that replace the 38-parameter
+// positional `worker_loop` protocol. Grouped named fields (constructed
+// via `from_coord` / `new` builders) eliminate the positional
+// silent-swap hazard; `worker_loop` destructures them back into the
+// same locals at entry, so the hot loop body is unchanged.
+mod launch;
+pub(crate) use launch::{
+    WorkerControlChannels, WorkerCoSState, WorkerLaunchPlan, WorkerNeighbors,
+    WorkerPublishedTelemetry, WorkerSharedDataplane, WorkerSharedSessions,
+};
+
 // #956 Phase 4-5: explicit imports for items that moved out of tx.rs into
 // cos/token_bucket.rs (Phase 4) and cos/queue_ops.rs (Phase 5). Without
 // this, neither the local `use super::*;` glob nor afxdp.rs's
@@ -1136,7 +1147,18 @@ fn create_shared_binding_group(
     Ok(created.into_iter().map(|(binding, _)| binding).collect())
 }
 
-fn fallback_shared_group_to_private(err: SharedGroupBindError, bindings: &mut Vec<BindingWorker>) {
+// #6245: `binding_failures` / `recovered_fallbacks` accumulate the EXPLICIT
+// per-slot terminal failures and the recovered-degradation record so the
+// WorkerStartupReport can carry the cause. A shared-group bind that FAILS but
+// whose private fallback fully recovers is a `BindingRecoveredFallback` (all
+// slots rebound, readiness unaffected); a slot whose private fallback ALSO
+// fails is a terminal `BindingSetupFailure { phase: SharedFallback }`.
+fn fallback_shared_group_to_private(
+    err: SharedGroupBindError,
+    bindings: &mut Vec<BindingWorker>,
+    binding_failures: &mut Vec<BindingSetupFailure>,
+    recovered_fallbacks: &mut Vec<BindingRecoveredFallback>,
+) {
     let SharedGroupBindError {
         group_key,
         plans,
@@ -1145,8 +1167,13 @@ fn fallback_shared_group_to_private(err: SharedGroupBindError, bindings: &mut Ve
     let fallback_reason =
         format!("shared UMEM group {group_key} failed; using private UMEM: {reason}");
     eprintln!("xpf-userspace-dp: {fallback_reason}");
+    // #6245: track whether EVERY member slot recovered — only a fully recovered
+    // group is a `BindingRecoveredFallback` (a partially-recovered group has its
+    // failed slots recorded as terminal failures below, so it is not "recovered").
+    let mut all_slots_recovered = true;
     for mut plan in plans {
         let live = plan.live.clone();
+        let slot = plan.status.slot;
         let mode = plan.shared_umem.mode;
         plan.shared_umem = SharedUmemBindingPlan::disabled(mode, fallback_reason.clone());
         publish_shared_umem_plan_to_binding_status(&mut plan.status, &plan.shared_umem);
@@ -1155,9 +1182,21 @@ fn fallback_shared_group_to_private(err: SharedGroupBindError, bindings: &mut Ve
             Err(err) => {
                 let msg = format!("private fallback after shared UMEM failure failed: {err}");
                 eprintln!("xpf-userspace-dp: {msg}");
-                live.set_error(msg);
+                live.set_error(msg.clone());
+                binding_failures.push(BindingSetupFailure {
+                    slot,
+                    phase: BindingSetupPhase::SharedFallback,
+                    reason: msg,
+                });
+                all_slots_recovered = false;
             }
         }
+    }
+    if all_slots_recovered {
+        recovered_fallbacks.push(BindingRecoveredFallback {
+            group: group_key,
+            reason,
+        });
     }
 }
 
@@ -1463,6 +1502,12 @@ pub(crate) struct BindingLiveSnapshot {
     /// from BindingLiveState (an incoming IPv6 packet whose source lies within a
     /// configured Pref64 — the RFC 6146 §3.5 mandatory hairpin/source drop).
     pub(crate) nat64_ineligible_source: u64,
+    /// #6475: cumulative fail-closed NAT64 destination-ineligibility drops
+    /// snapshotted from BindingLiveState (a NAT64-prefix-matched destination
+    /// embedding a non-global IPv4 per RFC 6052 §2.2 — e.g.
+    /// `64:ff9b::127.0.0.1`, which would otherwise LocalDeliver to the
+    /// localhost-only control plane).
+    pub(crate) nat64_ineligible_dest: u64,
     /// #5625: cumulative fail-closed NAT64 ext-header ineligibility drops
     /// snapshotted from BindingLiveState (a v6→v4 forward translation rejected
     /// because the IPv6 packet carried an Authentication Header, an active

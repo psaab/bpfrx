@@ -86,6 +86,25 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 		return nil, status.Errorf(codes.InvalidArgument, "invalid offset %d", req.Offset)
 	}
 
+	// #5557: reject a negative page_size for symmetry with Offset above.
+	// req.PageSize is a signed int32; a negative value silently fell
+	// through the `PageSize > 0` guard below into the legacy limit/offset
+	// path — surfacing bad input as a full page returned as success
+	// rather than InvalidArgument.
+	if req.PageSize < 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid page_size %d", req.PageSize)
+	}
+
+	// #5557: reject a negative limit for symmetry with Offset and PageSize.
+	// req.Limit is a signed int32 consumed only by the legacy path, where
+	// `limit <= 0` collapses to the default page of 100 — so a NEGATIVE limit
+	// silently behaved like the default rather than surfacing bad input.
+	// limit == 0 is preserved as the legitimate default-100 sentinel; only a
+	// strictly negative limit is an error.
+	if req.Limit < 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid limit %d", req.Limit)
+	}
+
 	// Cursor-based pagination: when page_size > 0, use cursor path.
 	if req.PageSize > 0 {
 		return s.getSessionsCursor(ctx, req)
@@ -1829,8 +1848,20 @@ func encodePageTokenV6Start() string {
 	return base64.RawURLEncoding.EncodeToString([]byte("v6start"))
 }
 
+// maxPageTokenLen caps the encoded page_token before any base64/hex decode
+// (#5649, C181-C11). The longest legitimate token is "v6:" plus the hex of a
+// SessionKeyV6 (base64 of ~83 bytes, under 128); anything larger is
+// noncanonical. Without this cap a caller could send a token near the 16 MiB
+// gRPC receive limit and force transient base64/hex allocations many times the
+// key size before the ABI prefix decode discards the excess. 256 leaves ample
+// headroom for the real formats while rejecting the amplification.
+const maxPageTokenLen = 256
+
 // parsePageToken returns kind ("v4", "v6", "v6start") and raw key bytes.
 func parsePageToken(token string) (kind string, keyBytes []byte, err error) {
+	if len(token) > maxPageTokenLen {
+		return "", nil, fmt.Errorf("page_token too long: %d bytes", len(token))
+	}
 	raw, err := base64.RawURLEncoding.DecodeString(token)
 	if err != nil {
 		return "", nil, fmt.Errorf("invalid page_token encoding: %w", err)
@@ -1858,8 +1889,12 @@ func parsePageToken(token string) (kind string, keyBytes []byte, err error) {
 
 func decodeSessionKeyV4(b []byte) (dataplane.SessionKey, error) {
 	var key dataplane.SessionKey
-	if len(b) < binary.Size(key) {
-		return key, fmt.Errorf("v4 key too short: %d", len(b))
+	// #5649 (C181-C11): require the EXACT ABI key length. A `<` check accepted
+	// trailing bytes, so many distinct oversized tokens hex-decoded to the same
+	// cursor (a noncanonical opaque token) and amplified allocations. The
+	// encoder always emits exactly binary.Size(key) bytes.
+	if len(b) != binary.Size(key) {
+		return key, fmt.Errorf("v4 key wrong length: %d (want %d)", len(b), binary.Size(key))
 	}
 	copy(key.SrcIP[:], b[0:4])
 	copy(key.DstIP[:], b[4:8])
@@ -1871,8 +1906,9 @@ func decodeSessionKeyV4(b []byte) (dataplane.SessionKey, error) {
 
 func decodeSessionKeyV6(b []byte) (dataplane.SessionKeyV6, error) {
 	var key dataplane.SessionKeyV6
-	if len(b) < binary.Size(key) {
-		return key, fmt.Errorf("v6 key too short: %d", len(b))
+	// #5649 (C181-C11): exact ABI key length — see decodeSessionKeyV4.
+	if len(b) != binary.Size(key) {
+		return key, fmt.Errorf("v6 key wrong length: %d (want %d)", len(b), binary.Size(key))
 	}
 	copy(key.SrcIP[:], b[0:16])
 	copy(key.DstIP[:], b[16:32])

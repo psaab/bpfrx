@@ -110,7 +110,15 @@ func (s *Server) Ping(req *pb.PingRequest, stream grpc.ServerStreamingServer[pb.
 func buildPingArgv(req *pb.PingRequest, count int) []string {
 	size := ""
 	if req.Size > 0 {
-		size = fmt.Sprintf("%d", req.Size)
+		// Clamp the payload to the max valid ICMP echo data (#5250 A8-b1
+		// F4): an operator-supplied -s above diagcmd.MaxPingSize could never
+		// yield a valid probe, so cap it here rather than hand the ping child
+		// a value it would reject. Mirrors the REST buildPingArgv.
+		s := req.Size
+		if s > diagcmd.MaxPingSize {
+			s = diagcmd.MaxPingSize
+		}
+		size = fmt.Sprintf("%d", s)
 	}
 	return diagcmd.PingArgv(diagcmd.PingOptions{
 		Target:          req.Target,

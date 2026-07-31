@@ -763,7 +763,18 @@ func canonicalizeHTTPTarget(target string) (string, error) {
 		return "", fmt.Errorf("no target specified")
 	}
 	if !strings.Contains(target, "://") {
-		return "http://" + target, nil
+		// Schemeless: prepend the default scheme. C179-042: reject a
+		// canonicalized target with no host (a schemeless ":8080") here so a
+		// dead probe surfaces as a setup failure that HOLDS the test state,
+		// rather than http.NewRequestWithContext failing per attempt and the
+		// permanent no-run being counted as path loss. Stay lenient on a
+		// url.Parse failure (unchanged behavior) — that path is handled
+		// downstream exactly as before.
+		canon := "http://" + target
+		if u, err := url.Parse(canon); err == nil && u.Hostname() == "" {
+			return "", fmt.Errorf("http-get target %q has no host", target)
+		}
+		return canon, nil
 	}
 	u, err := url.Parse(target)
 	if err != nil {
@@ -771,10 +782,15 @@ func canonicalizeHTTPTarget(target string) (string, error) {
 	}
 	switch u.Scheme {
 	case "http", "https":
-		return target, nil
+		// supported
 	default:
 		return "", fmt.Errorf("unsupported http-get target scheme %q (want http or https): %q", u.Scheme, target)
 	}
+	// C179-042: reject a scheme'd target with no host ("http://").
+	if u.Hostname() == "" {
+		return "", fmt.Errorf("http-get target %q has no host", target)
+	}
+	return target, nil
 }
 
 func (m *Manager) probeHTTP(ctx context.Context, test *config.RPMTest, opts probeSockOpts) (time.Duration, error) {

@@ -275,7 +275,7 @@ type SyslogStream struct {
 	Name          string
 	Host          string
 	Port          int    // default 514
-	Severity      string // "error", "warning", "info", or "" (no filter)
+	Severity      string // any|emergency|alert|critical|error|warning|notice|info|debug|none, or "" (no filter) — full logging.ParseSeverity domain (#5523 C179-046)
 	Facility      string // "local0".."local7", "user", "daemon", or "" (default: local0)
 	Format        string // per-stream format override
 	Category      string // "all", or specific category
@@ -973,6 +973,44 @@ type StaticNATRule struct {
 	// outbound return SNAT un-translates it back to MatchDestinationPort.
 	// #2491.
 	MappedPort int
+	// MappedPortRaw records the raw `then static-nat prefix <ip> mapped-port
+	// <token>` value as authored ("" when the keyword is absent OR present
+	// with no operand). The token rides inside the children:nil static-nat
+	// leaf and bypasses the schema value validator; MappedPortRaw lets the
+	// strict gate name the offending token when the parsed MappedPort is not
+	// a valid 1-65535 port. Compile-only (`json:"-"`): it is a Go-internal
+	// diagnostic artifact and must NOT cross the control-socket / REST /
+	// ConfigSnapshot wire — the Rust dataplane reads only MappedPort.
+	MappedPortRaw string `json:"-"`
+	// MappedPortPresent is true whenever a `then static-nat mapped-port`
+	// keyword appears, EVEN with no operand or an empty/zero/garbage operand.
+	// It is the explicit presence signal that breaks the sentinel collision
+	// the string/int fields alone could not: MappedPort==0 means BOTH "absent"
+	// and "present-but-malformed" (non-numeric, empty, bare, or the literal
+	// "0"), and MappedPortRaw=="" means BOTH "absent" and "present-but-empty".
+	// The strict gate (validateNATHostMaskStrict, C179-038) rejects a PRESENT
+	// mapped-port whose parsed value is not a valid 1-65535 port; an ABSENT
+	// mapped-port (Present==false) is never rejected. Compile-only (`json:"-"`)
+	// — it is never serialized, so the dataplane never sees it and the lenient
+	// load / peer-sync path (#1960 no-brick) keeps MappedPort==0 (plain 1:1,
+	// no bogus port).
+	MappedPortPresent bool `json:"-"`
+	// ThenTargetCount is how many mutually-exclusive translation TARGETS the
+	// winning `then {}` block declares (prefix / prefix-name / nptv6-prefix /
+	// inet), counted from the AST during compile by staticNATThenTargetCount
+	// (#6483). A well-formed rule declares EXACTLY ONE. Because prefix / inet /
+	// nptv6-prefix all land in the shared Then field (a later target overwrites an
+	// earlier one), the final field state cannot reveal a multi-target rule; this
+	// count, taken before the fields collapse, can. validateStaticNATSingleTarget-
+	// Strict rejects a rule with >1 (both a prefix AND a prefix-name, an inet
+	// sibling plus a prefix sibling, two prefixes, …) — invalid Junos the compiler
+	// otherwise silently accepted by honoring one target and dropping the rest,
+	// which also let a malformed mapped-port on a dropped target slip through (the
+	// #6479/C179-038 residual). A zero-target rule is the empty-target gate's
+	// domain (#4290); this gates only the >1 case. Compile-only (`json:"-"`):
+	// derived state recomputed on every compile (last `then` block wins, #3850),
+	// never serialized to the dataplane / peer-sync wire.
+	ThenTargetCount int `json:"-"`
 }
 
 // LimitSessionScreen configures per-IP session limiting.

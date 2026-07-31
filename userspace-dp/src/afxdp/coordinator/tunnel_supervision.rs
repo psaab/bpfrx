@@ -5,7 +5,7 @@
 //! sweep → tombstone, stale prune, spawn with backoff — see the
 //! "Aux tunnel threads" section of this directory's README.md for
 //! the family differences that matter. The thread BODIES live
-//! elsewhere (`wg_control.rs` for WG, `afxdp/tunnel.rs` for GRE);
+//! elsewhere (`wg_control/` for WG, `afxdp/tunnel.rs` for GRE);
 //! this file owns the coordinator-side lifecycle only. The entry
 //! maps themselves (`tunnel_sources`, `wg_control_threads`) stay on
 //! `Coordinator` in mod.rs, and `stop_inner` keeps its own inline
@@ -92,7 +92,7 @@ impl super::Coordinator {
         // Spawn pass (apply-time only; the periodic liveness sweep
         // respawns tombstones but never creates entries).
         let mut spawned = false;
-        if !self.workers.handles.is_empty() {
+        if !self.workers.records.is_empty() {
             let now = monotonic_nanos();
             let desired: Vec<u16> = self
                 .forwarding
@@ -227,11 +227,16 @@ impl super::Coordinator {
         let shared_nat_sessions = self.sessions.nat.clone();
         let shared_forward_wire_sessions = self.sessions.forward_wire.clone();
         let shared_owner_rg_indexes = self.sessions.owner_rg_indexes.clone();
+        // #6471: the loop seeds the shared IKE exchange table when the
+        // firewall INITIATES IKE through this tunnel, so the peer's replies
+        // (Responder SPI set, no inbound seed) are recognized as established
+        // at Stage 11 instead of facing the host-inbound gate as forgeries.
+        let ike_exchanges = self.ike_exchanges.clone();
         let worker_commands = self
             .workers
-            .handles
+            .records
             .values()
-            .map(|handle| handle.commands.clone())
+            .map(|rec| rec.handle.commands.clone())
             .collect::<Vec<_>>();
         let recent_exceptions = self.recent_exceptions.clone();
         let thread_tunnel_name = tunnel_name.clone();
@@ -293,6 +298,7 @@ impl super::Coordinator {
                     shared_nat_sessions,
                     shared_forward_wire_sessions,
                     shared_owner_rg_indexes,
+                    ike_exchanges,
                     worker_commands,
                     delivery_rx,
                     thread_wake,
@@ -430,7 +436,7 @@ impl super::Coordinator {
         let swept = self.sweep_finished_local_tunnel_sources();
         let mut spawned = false;
         if let Some(snapshot) = latest_snapshot {
-            if !self.workers.handles.is_empty() {
+            if !self.workers.records.is_empty() {
                 let now = monotonic_nanos();
                 let tombstones: Vec<u16> = self
                     .tunnel_sources

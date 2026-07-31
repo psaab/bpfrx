@@ -128,6 +128,24 @@ func (r *Runner) rollback(j *Journal) error {
 			"version %s is unhealthy and there is no prior runtime version — "+
 			"operator intervention required", j.TargetVersion)
 	}
+	// PRE-ROLLBACK PREFLIGHT (#6374): the rollback is destructive — it stops
+	// the (failed) new daemon, restores the config DB from the pre-upgrade
+	// snapshot, then re-flips to PreviousVersion. If PreviousVersion's dir is
+	// missing / non-directory / lockstep-incomplete (storage damage, a stale
+	// pre-#6374 journal that recorded a dangling `current`, or a raced GC), the
+	// re-flip at step 3 would fail AFTER the DB was already rolled back and the
+	// unit stopped — turning a recoverable new-version failure into a
+	// control-plane outage. Validate the target BEFORE any destructive step so
+	// we surface a clear operator-actionable error and leave the pre-rollback
+	// state (the new daemon, still running) untouched.
+	if verr := r.validateRestorableVersion(j.PreviousVersion); verr != nil {
+		return fmt.Errorf("refuse-rollback: previous version %s is not restorable "+
+			"(%w); refusing to stop the daemon and roll back the config DB to a "+
+			"missing/incomplete runtime, which would strand the control plane "+
+			"offline. The new version %s is unhealthy — operator intervention "+
+			"required (re-seed the versioned runtime, then retry)",
+			j.PreviousVersion, verr, j.TargetVersion)
+	}
 	// Journal the rollback so a crash mid-rollback resumes the rollback,
 	// NOT the failed forward cut. Codex r1 Critical#1: an auto-rollback
 	// that re-flips to PreviousVersion but leaves the journal at FLIPPED

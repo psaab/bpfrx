@@ -378,6 +378,24 @@ func (s *Server) natPoolStatsHandler(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "iterate sessions: "+err.Error())
 			return
 		}
+		// #5328 (A8-b1-F6): interface-mode SNAT usage must count IPv6 sessions
+		// too. The v4 walk above alone systematically under-reports usage on a
+		// dual-stack firewall — the gRPC/CLI NAT helpers count both families, so
+		// a REST-only v4 tally is a silent parity gap. Reuse the SAME admission
+		// lease/context acquired above (no second AcquireCtx) and the same zone
+		// map; the v6 session value carries identical IsReverse/Flags/zone fields.
+		if err := s.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+			if walkCtx.Err() != nil {
+				return false // client gone / lease cancelled — stop the walk
+			}
+			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 && zoneByID != nil {
+				ruleSetUsed[[2]string{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+			}
+			return true
+		}); err != nil {
+			writeError(w, http.StatusInternalServerError, "iterate sessions v6: "+err.Error())
+			return
+		}
 	}
 	for _, rs := range cfg.Security.NAT.Source {
 		for _, rule := range rs.Rules {

@@ -18,10 +18,17 @@ package config
 //     event mode; anything else is stream mode).
 //   - syslogLogFormats: pkg/logging (syslog.go "sd-syslog" timestamp branch,
 //     ringbuf.go "binary"/"structured" branches; "syslog"/"" => RFC 3164).
-//   - syslogSeverities: pkg/logging ParseSeverity (all ten Junos severities
-//     map to a MinSeverity threshold — emergency/alert/critical/error/warning/
-//     notice/info/debug plus any=>send-all and none=>send-nothing, #5314; an
-//     unknown token stays 0 = no floor).
+//   - syslogSeverities: aliases junosSyslogSeverities (schema_system.go) —
+//     the full logging.ParseSeverity domain the runtime applies to a
+//     `security log stream ... severity` via SyslogClient.MinSeverity
+//     (daemon_system.go): emergency/alert/critical/error/warning/notice/
+//     info/debug map to a MinSeverity threshold, plus any=>send-all and
+//     none=>send-nothing (#5314). The two severity surfaces (this stream
+//     leaf and the system-syslog `<facility> <severity>` leaf) MUST share
+//     the one SSOT; before this the stream leaf carried a truncated
+//     error/warning/info list that rejected critical/notice/debug/
+//     emergency/alert/any/none — every one of which the runtime honors
+//     (commit-rejects-valid, codex-179 C179-046).
 //   - syslogFacilities: pkg/logging ParseFacility (recognized names; every
 //     other name silently remaps to local0).
 //   - syslogCategories: pkg/logging ParseCategory (all/session/policy/screen/
@@ -29,7 +36,10 @@ package config
 var (
 	syslogLogModes   = []string{"event", "stream"}
 	syslogLogFormats = []string{"binary", "sd-syslog", "structured", "syslog"}
-	syslogSeverities = []string{"error", "info", "warning"}
+	// syslogSeverities aliases the shared junosSyslogSeverities SSOT so the
+	// stream-severity validator accepts exactly the logging.ParseSeverity
+	// domain the runtime applies (C179-046). Do NOT re-list the tokens here.
+	syslogSeverities = junosSyslogSeverities
 	syslogFacilities = []string{
 		"auth", "change-log", "daemon", "kern",
 		"local0", "local1", "local2", "local3",
@@ -668,9 +678,9 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			// value has two AST locations the declarative schema walker cannot
 			// express, the same dual-location rationale as tcp-mss.
 			"port": {desc: "Syslog server port (default 514)", args: 1, placeholder: "<port>", children: nil},
-			"severity": {desc: "Severity filter (error|warning|info)", args: 1, placeholder: "<severity>",
+			"severity": {desc: "Severity filter (any|emergency|alert|critical|error|warning|notice|info|debug|none)", args: 1, placeholder: "<severity>",
 				valueType: ValueEnumOf, valueDesc: "syslog severity floor",
-				valueExamples: []string{"error", "warning", "info"},
+				valueExamples: []string{"critical", "error", "warning", "info"},
 				validator:     ValidateEnum(syslogSeverities), children: nil},
 			"facility": {desc: "Syslog facility (e.g. local0; default local0)", args: 1, placeholder: "<facility>",
 				valueType: ValueEnumOf, valueDesc: "syslog facility",
@@ -1127,7 +1137,19 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				valueType: ValueSecureTunnelIf, valueDesc: "IPsec secure-tunnel interface (st<N> or st<N>.<unit>)",
 				valueExamples: []string{"st0", "st0.1"},
 				validator:     ValidateSecureTunnelBindInterface, children: nil},
-			"df-bit": {desc: "Outer-header DF bit handling (copy|set|clear)", args: 1, placeholder: "<mode>", children: nil},
+			// #5649 (C181-M22): type the enum so a typo (`cler`) fails closed at
+			// commit instead of storing verbatim and silently becoming
+			// strongSwan's copy-DF default. The renderer at pkg/ipsec/policy.go
+			// only emits copy_df for copy/set/clear and OMITS the directive for
+			// anything else, so `df-bit cler` would leave the outer DF copied
+			// (the opposite of an intended `clear`) and blackhole oversized
+			// encapsulated packets via PMTUD while commit reported success.
+			// Mirrors the #4301 establish-tunnels pattern; the copy/set/clear
+			// set matches the renderer's switch exactly.
+			"df-bit": {desc: "Outer-header DF bit handling (copy|set|clear)", args: 1, placeholder: "<mode>",
+				valueType: ValueEnumOf, valueDesc: "outer-header DF bit mode",
+				valueExamples: []string{"copy", "set", "clear"},
+				validator:     ValidateEnum([]string{"copy", "set", "clear"}), children: nil},
 			// #4301 (V-5): type the enum so a typo (`on-tarffic`) fails closed
 			// at commit instead of storing verbatim and silently degrading to
 			// on-traffic. Only `immediately` is acted on (start_action =

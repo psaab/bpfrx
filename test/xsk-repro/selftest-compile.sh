@@ -16,23 +16,48 @@ set -u
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$HERE" || { echo "FATAL: cannot cd to $HERE" >&2; exit 1; }
 
+# Honor $CC (defaulting to cc) like the Makefile's `CC ?= cc`, so the SKIP
+# probe and `make check` use the SAME compiler/toolchain. The #6289 M2 gate
+# test drives this by pointing CC at a fake compiler.
+CC=${CC:-cc}
+
+# $CC may be a multi-token wrapper ("ccache gcc", "env cc", "gcc -flag") — the
+# Makefile's $(CC) word-splits, so `make check` runs the first token as the
+# executable with the rest as arguments. The `command -v` existence check below
+# and the trial-link probe must therefore split $CC the same way, or a wrapper
+# CC that `make check` accepts would false-SKIP here (#6355). Extract the first
+# word for the tool gate; word-split the whole string for the link/build.
+CC_BIN=${CC%% *}
+
 # --- tool gate ---
-for tool in cc make xxd; do
+for tool in "$CC_BIN" make xxd; do
 	command -v "$tool" >/dev/null 2>&1 || {
 		echo "SKIP: $tool not installed"
 		exit 77
 	}
 done
-# Header gate: probe the two headers the reproducers include.
+# Link gate (#6289 M2): probe a trial LINK against the SAME static archives
+# `make check` links, not just header syntax. The static build recipe
+# (Makefile LIBS_SHARED) links `-Wl,-Bstatic -lxdp -lbpf -lelf -lz -lzstd`; a
+# host with the dev HEADERS present but a static archive MISSING (e.g. no
+# libzstd.a) passed the old header-only -fsyntax-only probe and then FAILed the
+# `make check` static link → a false-RED for this leg. Probing the actual link
+# makes such a host SKIP cleanly. -o /dev/null discards the trial binary.
+# $CC is intentionally unquoted so a multi-token wrapper CC word-splits exactly
+# like the Makefile's $(CC) (#6355). Quoting it would exec the whole string as a
+# single binary and false-SKIP a wrapper `make check` would accept.
+# shellcheck disable=SC2086
 if ! printf '#include <bpf/bpf.h>\n#include <xdp/xsk.h>\nint main(void){return 0;}\n' \
-	| cc -x c -fsyntax-only - >/dev/null 2>&1; then
-	echo "SKIP: libbpf-dev / libxdp-dev headers not available"
+	| $CC -x c - -o /dev/null \
+		-Wl,-Bstatic -lxdp -lbpf -lelf -lz -lzstd -Wl,-Bdynamic -lpthread \
+		>/dev/null 2>&1; then
+	echo "SKIP: libbpf-dev / libxdp-dev headers or static archives not available"
 	exit 77
 fi
 
 # --- the actual gate: strict-warning build must succeed ---
 rc=0
-if out=$(make -s check 2>&1); then
+if out=$(make -s check CC="$CC" 2>&1); then
 	echo "PASS: xsk-repro strict-warning build"
 else
 	rc=1

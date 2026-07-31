@@ -190,17 +190,20 @@ func validateRPMLinkLocalZoneStrict(cfg *Config) error {
 }
 
 // validateRPMHTTPGetSchemeStrict rejects an http-get RPM test whose
-// target carries an unsupported URL scheme (#2495). The runtime probe
-// canonicalizes a schemeless target (bare hostname / IP / host:port) by
-// prepending "http://", and accepts an explicit "http://" or "https://"
-// target as-is; any other scheme (ftp://, gopher://, …) is meaningless
-// for an http-get probe and makes http.NewRequestWithContext error
-// before a packet is sent — the probe never runs and publishes a
-// permanent FAIL into event-options / ip-monitoring failover. A scheme
-// is only present when the target contains the "://" separator; a bare
-// "host:port" (no "://") is NOT a scheme and is left for the runtime to
-// prefix with http://. Only the literal target is inspected (no DNS at
-// commit).
+// target carries an unsupported URL scheme (#2495) OR canonicalizes to a
+// hostless URL (C179-042). The runtime probe canonicalizes a schemeless
+// target (bare hostname / IP / host:port) by prepending "http://", and
+// accepts an explicit "http://" or "https://" target as-is; any other
+// scheme (ftp://, gopher://, …) is meaningless for an http-get probe and
+// makes http.NewRequestWithContext error before a packet is sent — the
+// probe never runs and publishes a permanent FAIL into event-options /
+// ip-monitoring failover. A scheme is only present when the target
+// contains the "://" separator; a bare "host:port" (no "://") is NOT a
+// scheme and is left for the runtime to prefix with http://. Either form
+// is then host-checked: a target with no host ("http://", "https://", a
+// schemeless ":8080") produces a URL the client cannot dial, so the
+// probe would be dead in exactly the same way — reject it too. Only the
+// literal target is inspected (no DNS at commit).
 //
 // Strict on commit / commit-check (hard reject so the operator sees the
 // bad scheme immediately); lenient on load / peer-sync (warn — #1960
@@ -223,9 +226,30 @@ func validateRPMHTTPGetSchemeStrict(cfg *Config) error {
 			if test.EffectiveProbeType() != "http-get" {
 				continue
 			}
+			// C179-042: a hostless target ("http://", "https://", a
+			// schemeless ":8080") canonicalizes to a URL http.NewRequest /
+			// the client cannot dial — the probe never sends a packet and its
+			// permanent no-run is counted as path loss into event-options /
+			// ip-monitoring failover. Reject the empty host at commit so the
+			// operator sees it instead of a silently dead probe. hostErr is
+			// the shared message for both target forms below.
+			hostErr := func() error {
+				return fmt.Errorf(
+					"services rpm probe %q test %q: http-get target %q has no host "+
+						"(an http-get probe needs a hostname or IP address to connect to)",
+					probe.Name, test.Name, test.Target)
+			}
 			// A scheme is present only with the "://" separator; a bare
 			// host:port is schemeless (the runtime prepends http://).
 			if !strings.Contains(test.Target, "://") {
+				// Schemeless: host-check the canonicalized "http://"+target.
+				// Stay lenient on a url.Parse failure (unchanged pre-C179-042
+				// behavior) so this ADDS only the empty-host rejection — a
+				// malformed schemeless target still falls through to the
+				// runtime, which handles it exactly as before.
+				if u, err := url.Parse("http://" + test.Target); err == nil && u.Hostname() == "" {
+					return hostErr()
+				}
 				continue
 			}
 			u, err := url.Parse(test.Target)
@@ -241,6 +265,9 @@ func validateRPMHTTPGetSchemeStrict(cfg *Config) error {
 					"services rpm probe %q test %q: http-get target %q uses unsupported scheme %q "+
 						"(only http and https are valid for an http-get probe)",
 					probe.Name, test.Name, test.Target, u.Scheme)
+			}
+			if u.Hostname() == "" {
+				return hostErr()
 			}
 		}
 	}

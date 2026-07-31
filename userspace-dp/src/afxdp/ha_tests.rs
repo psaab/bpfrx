@@ -253,10 +253,10 @@ fn update_ha_state_prewarms_split_rg_reverse_sessions_on_activation() {
     let mut coordinator = Coordinator::new();
     coordinator.forwarding = test_forwarding_state_split_rgs();
     let worker_commands = Arc::new(Mutex::new(VecDeque::new()));
-    coordinator
-        .workers
-        .handles
-        .insert(0, test_worker_handle(worker_commands.clone()));
+    coordinator.workers.records.insert(
+        0,
+        WorkerRuntimeRecord::for_test(test_worker_handle(worker_commands.clone())),
+    );
 
     let entry = SyncedSessionEntry {
         key: test_key(),
@@ -358,10 +358,10 @@ fn update_ha_state_demotion_recovers_from_poisoned_worker_command_mutex() {
         .map(|_| Arc::new(Mutex::new(VecDeque::new())))
         .collect();
     for (worker_id, queue) in worker_queues.iter().enumerate() {
-        coordinator
-            .workers
-            .handles
-            .insert(worker_id as u32, test_worker_handle(queue.clone()));
+        coordinator.workers.records.insert(
+            worker_id as u32,
+            WorkerRuntimeRecord::for_test(test_worker_handle(queue.clone())),
+        );
     }
 
     // Locally-owned (non-peer-synced) shared session in RG 1. The
@@ -755,10 +755,10 @@ fn upsert_synced_session_rejects_over_ceiling_import_and_does_not_fan_out() {
     const LOGICAL_CEILING: u16 = 3;
     coordinator.synced_import_cap_override = LOGICAL_CEILING as usize;
     let commands = Arc::new(Mutex::new(VecDeque::new()));
-    coordinator
-        .workers
-        .handles
-        .insert(0, test_worker_handle(commands.clone()));
+    coordinator.workers.records.insert(
+        0,
+        WorkerRuntimeRecord::for_test(test_worker_handle(commands.clone())),
+    );
 
     let before = coordinator.synced_import_cap_drops_total();
 
@@ -1051,7 +1051,10 @@ fn kick_owner_rg_export_enqueues_command_then_wait_completes_on_ack() {
     let commands = Arc::new(Mutex::new(VecDeque::new()));
     let handle = test_worker_handle(commands.clone());
     let ack = handle.session_export_ack.clone();
-    coordinator.workers.handles.insert(0, handle);
+    coordinator
+        .workers
+        .records
+        .insert(0, WorkerRuntimeRecord::for_test(handle));
 
     let wait = coordinator.kick_owner_rg_export(&[1, 2], 0);
 

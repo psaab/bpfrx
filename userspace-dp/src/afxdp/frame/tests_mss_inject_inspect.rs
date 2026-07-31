@@ -34,12 +34,14 @@ fn local_origin_tunnel_tx_request_follows_supplied_state_destination() {
         64,
     );
     // Outer IPv6 destination: eth(14) + vlan(4) + 24 = offset 42..58.
+    let ike_exchanges = crate::afxdp::forwarding::IkeExchangeTable::new();
     let plan_old = build_local_origin_tunnel_tx_request(
         &packet[14..],
         1,
         &state_old,
         &ha_state,
         &dynamic_neighbors,
+        &ike_exchanges,
     )
     .expect("old-state plan");
     assert_eq!(plan_old.tx_request.bytes[57], 0x07, "old outer destination");
@@ -49,6 +51,7 @@ fn local_origin_tunnel_tx_request_follows_supplied_state_destination() {
         &state_new,
         &ha_state,
         &dynamic_neighbors,
+        &ike_exchanges,
     )
     .expect("new-state plan");
     assert_eq!(

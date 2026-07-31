@@ -117,6 +117,7 @@
     "mirrored_packets": 0,
     "nat64_exthdr_ineligible": 0,
     "nat64_frag_dropped": 0,
+    "nat64_ineligible_dest": 0,
     "nat64_ineligible_source": 0,
     "nat64_no_source_pool": 0,
     "nat64_pool_exhausted": 0,
@@ -531,6 +532,7 @@
   },
   "firewall_term_snapshot": {
     "action": "",
+    "address_unrepresentable": false,
     "count": "",
     "destination_addresses": [],
     "destination_constrained": false,
@@ -551,6 +553,7 @@
     "name": "",
     "next_term": false,
     "policer": "",
+    "ports_unrepresentable": false,
     "protocols": [],
     "routing_instance": "",
     "source_addresses": [],

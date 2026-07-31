@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,6 +22,19 @@ type listenerLeg struct {
 	ln       net.Listener
 	stopCh   chan struct{}
 	stopOnce sync.Once
+	// dead is set when the leg's serve loop exits UNEXPECTEDLY — the listener
+	// terminated on its own, not via a requested shutdown (stopLegLocked /
+	// rootCtx). EffectiveHTTPAddr treats a dead leg as not-serving so `show
+	// system services` reports the HTTP listener Failed rather than Listening on
+	// a dead socket, symmetric with the gRPC serve-exit clear (#6401).
+	//
+	// It is an atomic (NOT lifeMu-guarded): the serve goroutine still holds its
+	// wg count when it sets this on exit, and Server.Wait holds lifeMu ACROSS
+	// wg.Wait — so if the marker needed lifeMu, an exit racing a shutdown Wait
+	// would deadlock (Wait holds lifeMu waiting on the goroutine's wg.Done; the
+	// goroutine waits on lifeMu before it can return -> Done). Storing atomically
+	// with no lock breaks that lock-ordering cycle (#6401 round-3 fix).
+	dead atomic.Bool
 }
 
 // serveLegLocked launches srv on ln in a background goroutine registered on the
@@ -58,6 +72,17 @@ func (s *Server) serveLegLocked(srv *http.Server, ln net.Listener, isTLS bool) *
 			if err != nil && err != http.ErrServerClosed {
 				slog.Error("API listener terminated unexpectedly", "addr", srv.Addr, "tls", isTLS, "err", err)
 			}
+			// #6401: an UNEXPECTED serve exit means this leg is no longer
+			// serving. Mark it dead ATOMICALLY — NOT under lifeMu: the goroutine
+			// still holds its wg count here, and Server.Wait holds lifeMu across
+			// wg.Wait, so acquiring lifeMu here would deadlock a shutdown that
+			// raced this exit (round-3 fix). EffectiveHTTPAddr then stops
+			// reporting the dead listener's address and `show system services`
+			// renders the HTTP listener Failed, mirroring the gRPC serve-exit
+			// clear. A leg already retired/replaced by a reconcile takes the
+			// stopCh path below instead, so this only fires on a genuine
+			// self-termination.
+			leg.dead.Store(true)
 			return
 		case <-leg.stopCh:
 		case <-rootDone:
@@ -123,6 +148,25 @@ func (s *Server) Wait() {
 	s.wg.Wait()
 }
 
+// EffectiveHTTPAddr returns the ACTUAL bound address of the live HTTP leg, or ""
+// when no HTTP leg is serving. It reads the listener's own Addr, so an ephemeral
+// `:0` request resolves to its concrete port and a wildcard/hostname bind is
+// normalized — the address the socket is truly on, not the requested one. The
+// #6385/#6401 `show system services` effective-listener snapshot reads it (via
+// managementReconciler.effectiveHTTPListener), mirroring the grpcapi.Server
+// EffectiveListener pattern.
+func (s *Server) EffectiveHTTPAddr() string {
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+	// httpLeg / ln are swapped only under lifeMu, so read them here; dead is
+	// atomic (set without lifeMu by the serve goroutine to avoid a shutdown
+	// lock-ordering deadlock — see listenerLeg.dead).
+	if s.httpLeg == nil || s.httpLeg.ln == nil || s.httpLeg.dead.Load() {
+		return ""
+	}
+	return s.httpLeg.ln.Addr().String()
+}
+
 // ReconcileHTTP make-before-break rebinds ONLY the HTTP listener to addr (#5866),
 // leaving the HTTPS leg untouched. A same-addr call is a no-op. The new listener
 // is bound and serving BEFORE the old is retired (no unreachable HTTP window). A
@@ -152,10 +196,11 @@ func (s *Server) ReconcileHTTP(addr string) error {
 // listener (#5866), leaving the live HTTP listener untouched — this is the fix
 // for the whole-server rebuild that re-bound the still-held HTTP socket on a
 // TLS-enable (EADDRINUSE). useTLS=false or addr=="" disables HTTPS. A same-addr
-// enabled call is a no-op. On enable/rebind the new HTTPS listener (with a fresh
-// self-signed cert) is bound and serving BEFORE any old one is retired. A cert
-// or bind failure retains the previous HTTPS state (fail-closed) and returns the
-// error for retry debt.
+// enabled call is a no-op. On enable/rebind the new HTTPS listener (with its
+// durable self-signed cert — loaded AS-IS from disk on a rebind, freshly minted
+// only when no on-disk pair exists, #1916 D6) is bound and serving BEFORE any
+// old one is retired. A cert or bind failure retains the previous HTTPS state
+// (fail-closed) and returns the error for retry debt.
 func (s *Server) ReconcileHTTPS(useTLS bool, addr string) error {
 	s.lifeMu.Lock()
 	defer s.lifeMu.Unlock()

@@ -19,6 +19,14 @@ pub(in crate::afxdp) use generated::generated_reply_session_key;
 // against (the `mod wg` submodule itself is private to `frame`).
 pub(in crate::afxdp) use wg::wg_endpoint_physical_outer_mtu;
 
+// #6308: the WG transit-egress DISPATCH physical-egress SSOT, re-exported so
+// the forward-request builder (`forward_request.rs`) selects the same physical
+// underlay NIC (the peer route) for the egress binding that #5292 selects for
+// the frame bytes — otherwise a specific-peer-route + no-default-route WG flow
+// resolves the egress binding to the logical wgN ifindex (no XSK binding) and
+// the TX dispatcher NO_EGRESS_BINDING-drops it.
+pub(in crate::afxdp) use wg::wg_transit_egress_physical_egress_ifindex;
+
 // #1440 consolidated outer-header serializers. Re-exported at
 // `frame::write_eth_header`, `frame::write_eth_header_slice`, and
 // `frame::headers::*` to keep existing call sites in icmp.rs,
@@ -66,6 +74,15 @@ pub(in crate::afxdp) use checksum::{
 // so `crate::nat64`'s private ext-header walkers share the single
 // canonical bound instead of hardcoding a stale 6.
 pub(crate) use inspect::MAX_IPV6_EXT_HEADERS;
+// #6435: the single shared IPv6 extension-header walk and its verdict
+// enum, re-exported `pub(crate)` (same channel as the bound above) so
+// `crate::nat64`'s L4/fragment walkers fold the canonical walk instead of
+// hand-mirroring it. The embedded-ICMP walker
+// (`afxdp/icmp_embed/parse.rs`) reaches the same items through the
+// `crate::afxdp` re-export + `use super::*` chain. The `ExtChainWalk` /
+// `ExtChainFragment` container types stay inspect-local — callers read
+// their fields, never name them.
+pub(crate) use inspect::{ExtChainOutcome, walk_ipv6_ext_chain};
 pub(super) use inspect::{
     frame_is_non_first_fragment, frame_l3_offset, frame_l4_offset,
     live_frame_ports, live_frame_ports_bytes, live_frame_ports_from_meta_bytes,
@@ -83,7 +100,7 @@ pub(in crate::afxdp) use inspect::{
     l2_dst_is_group_or_broadcast, meta_icmp_identifier_bearing, neighbor_ip_is_learnable,
     parse_session_flow,
     source_is_invalid_for_icmp_error,
-    src_is_directed_broadcast, term_match_extra_from_frame, term_match_extra_from_frame_fwd,
+    src_is_directed_broadcast, term_match_extra_from_frame,
     term_match_extra_from_meta,
     try_parse_metadata,
 };
@@ -1996,6 +2013,9 @@ mod tests_ttl_descriptor_dscp;
 #[cfg(test)]
 #[path = "tests_fragment_term_extra.rs"]
 mod tests_fragment_term_extra;
+#[cfg(test)]
+#[path = "tests_ipv6_ext_walk.rs"]
+mod tests_ipv6_ext_walk;
 #[cfg(test)]
 #[path = "tests_mss_inject_inspect.rs"]
 mod tests_mss_inject_inspect;

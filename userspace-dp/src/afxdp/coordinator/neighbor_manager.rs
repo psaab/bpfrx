@@ -68,6 +68,17 @@ pub(crate) struct NeighborManager {
     pub(crate) warm_queue: Option<SyncSender<WarmItem>>,
     /// Stop flag for the warmer worker thread.
     pub(crate) warm_stop: Option<Arc<AtomicBool>>,
+    /// #6314: join handle for the neighbor-warmer thread. Retained (like the
+    /// sibling `monitor_join` / `resolver_join`, no longer discarded via
+    /// `.ok()`) so `stop_inner` can JOIN the warmer after signalling `warm_stop`
+    /// and dropping the producer — joining is what enforces the
+    /// no-mutation-after-stop invariant the bare stop store cannot: a detached
+    /// warmer blocked in `recv_timeout` could otherwise fire one stray ARP/NDP
+    /// solicit or mutate `last_probed_at` AFTER a reconcile tore the dataplane
+    /// down. Join latency is bounded by the warmer loop's 500ms recv timeout
+    /// (the same bound the monitor's `SO_RCVTIMEO` and the resolver's recv
+    /// timeout provide).
+    pub(crate) warm_join: Option<std::thread::JoinHandle<()>>,
     /// Bumped on each admitted warm sweep; items tagged with a stale
     /// generation are dropped on dequeue (generation collapse).
     pub(crate) warm_generation: Arc<AtomicU64>,
@@ -109,13 +120,13 @@ pub(crate) struct NeighborManager {
     pub(crate) pending_max_depth: Arc<AtomicU64>,
     /// Stop flag for the resolver worker thread.
     pub(crate) resolver_stop: Option<Arc<AtomicBool>>,
-    /// Join handle for the resolver worker thread. Retained (unlike the
-    /// monitor/warmer, whose mutations are authoritative) so `stop_inner`
-    /// can JOIN it after signalling stop — this enforces the no-mutation-
-    /// after-stop invariant the bare stop re-check cannot (a detached
-    /// resolver could otherwise mutate `dynamic_neighbors` after a
-    /// reconcile spawned a fresh one). Join latency is bounded by the
-    /// 500ms recv timeout + the 200ms GET timeout.
+    /// Join handle for the resolver worker thread. Retained (like the sibling
+    /// `monitor_join` (#5165) and `warm_join` (#6314) — all three neighbor aux
+    /// threads are now retained + joined) so `stop_inner` can JOIN it after
+    /// signalling stop — this enforces the no-mutation-after-stop invariant the
+    /// bare stop re-check cannot (a detached resolver could otherwise mutate
+    /// `dynamic_neighbors` after a reconcile spawned a fresh one). Join latency
+    /// is bounded by the 500ms recv timeout + the 200ms GET timeout.
     pub(crate) resolver_join: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -131,6 +142,7 @@ impl NeighborManager {
             last_probed_at: Arc::new(Mutex::new(FastMap::default())),
             warm_queue: None,
             warm_stop: None,
+            warm_join: None,
             warm_generation: Arc::new(AtomicU64::new(0)),
             last_warm_sweep_ns: Arc::new(AtomicU64::new(0)),
             warm_drops: Arc::new(AtomicU64::new(0)),
@@ -166,6 +178,27 @@ impl NeighborManager {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         if let Some(join) = self.monitor_join.take() {
+            let _ = join.join();
+        }
+    }
+
+    /// #6314: signal the neighbor-warmer thread to stop, drop the producer
+    /// handle so its recv side disconnects, and JOIN it — mirroring the sibling
+    /// `stop_and_join_monitor` and the resolver teardown in `stop_inner`.
+    /// Signalling + dropping the queue alone is a check-then-act race (the loop
+    /// only re-checks `warm_stop` around its `recv_timeout`); JOINING is what
+    /// guarantees the retired warmer has exited BEFORE the caller proceeds, so a
+    /// detached warmer can never fire a stray ARP/NDP solicit or mutate
+    /// `last_probed_at` after teardown. Idempotent: a warmer that was never
+    /// spawned (all fields `None`, e.g. a spawn failure that installed none) is
+    /// a no-op. Join latency is bounded by the warmer loop's 500ms recv timeout.
+    pub(crate) fn stop_and_join_warmer(&mut self) {
+        if let Some(warm_stop) = self.warm_stop.take() {
+            warm_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Drop the producer so the warmer's recv side disconnects and it exits.
+        self.warm_queue = None;
+        if let Some(join) = self.warm_join.take() {
             let _ = join.join();
         }
     }
@@ -221,5 +254,75 @@ mod monitor_join_tests_5165 {
         let mut mgr = NeighborManager::new();
         mgr.stop_and_join_monitor();
         assert!(mgr.monitor_stop.is_none() && mgr.monitor_join.is_none());
+    }
+}
+
+#[cfg(test)]
+mod warmer_join_tests_6314 {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// #6314 FAIL-ON-REVERT (join): the neighbor WARMER is the odd-one-out among
+    /// the three neighbor aux threads — the monitor and resolver were hardened by
+    /// #5165 to retain a `JoinHandle` and be deterministically JOINED at
+    /// teardown, but the warmer was still spawned with the pre-#5165 pattern (its
+    /// handle discarded via `.ok()`, teardown signalling `warm_stop` + dropping
+    /// the producer but never joining). `stop_and_join_warmer` must JOIN the
+    /// warmer thread (wait for it to finish), not merely signal stop + drop the
+    /// queue: joining is what enforces no-mutation-after-stop — a detached warmer
+    /// could otherwise fire a stray ARP/NDP solicit / mutate `last_probed_at`
+    /// after teardown. A stand-in thread performs a bounded unit of work AFTER
+    /// observing stop; a real JOIN makes `stop_and_join_warmer` block until it
+    /// finishes (`done == true`). Reverting to the pre-#6314 drop-only teardown
+    /// (no `warm_join`, no `join()`) returns immediately with `done == false` ->
+    /// RED (assertion, not a build break — mirrors #5165's monitor test).
+    #[test]
+    fn neighbor_warmer_joined_at_teardown_6314() {
+        let mut mgr = NeighborManager::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let (s, d) = (stop.clone(), done.clone());
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WarmItem>(WARM_QUEUE_DEPTH);
+        let handle = std::thread::spawn(move || {
+            // Mirror a warmer blocked in recv_timeout when stop is signalled:
+            // wake, then perform one final bounded unit of work before exiting.
+            // Hold `rx` so the producer drop alone does not race the timing —
+            // the exit is gated on the stop flag, exactly like the real loop's
+            // top-of-iteration and post-dequeue `stop` re-checks.
+            let _rx = rx;
+            while !s.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            std::thread::sleep(Duration::from_millis(40));
+            d.store(true, Ordering::Relaxed);
+        });
+        mgr.warm_queue = Some(tx);
+        mgr.warm_stop = Some(stop);
+        mgr.warm_join = Some(handle);
+
+        mgr.stop_and_join_warmer();
+
+        assert!(
+            done.load(Ordering::Relaxed),
+            "stop_and_join_warmer must JOIN the retired warmer (wait for it), not just signal stop",
+        );
+        assert!(mgr.warm_stop.is_none(), "warm_stop must be taken");
+        assert!(mgr.warm_join.is_none(), "warm_join must be taken");
+        assert!(
+            mgr.warm_queue.is_none(),
+            "warm_queue producer must be dropped so the warmer's recv side disconnects",
+        );
+    }
+
+    /// A warmer that was never spawned (all handles `None`, e.g. a spawn failure
+    /// that installed none) is a safe no-op.
+    #[test]
+    fn stop_and_join_warmer_no_warmer_is_noop() {
+        let mut mgr = NeighborManager::new();
+        mgr.stop_and_join_warmer();
+        assert!(
+            mgr.warm_stop.is_none() && mgr.warm_join.is_none() && mgr.warm_queue.is_none()
+        );
     }
 }

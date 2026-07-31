@@ -135,6 +135,18 @@ type Daemon struct {
 	ipsecRebindMu          sync.Mutex
 	ipsecRebindPending     atomic.Bool // health signal: local_addrs stale, rebind not yet reconverged
 	ipsecRebindRetryActive bool        // single-flight guard for the retry loop (guarded by ipsecRebindMu)
+	// #5523 C179-093: cancel + join for the retry loop at shutdown. The loop
+	// used to bind directly to d.daemonCtx (the RAW background context that is
+	// NEVER cancelled in production, #5807), so it leaked past shutdown and a
+	// 30s rebind tick could run a swanctl reapply while teardown was in flight.
+	// It now binds to a cancellable child (ipsecRebindCancel) and is tracked on
+	// ipsecRebindWg so stopIPsecRebindLoop can cancel + join it, mirroring the
+	// #5308 stopPinRetryLoop. ipsecRebindStopped latches the stop so a late
+	// armIPsecRebind after shutdown never starts a new loop (that Add would race
+	// ipsecRebindWg.Wait). All three are guarded by ipsecRebindMu.
+	ipsecRebindCancel  context.CancelFunc
+	ipsecRebindWg      sync.WaitGroup
+	ipsecRebindStopped bool
 	// ipsecRebindRetryEvery overrides the retry cadence (tests); 0 =
 	// ipsecRebindRetryInterval.
 	ipsecRebindRetryEvery time.Duration
@@ -456,6 +468,16 @@ type Daemon struct {
 	aggSig     aggregatorSig
 	aggCBOnce  sync.Once
 	aggReconMu sync.Mutex
+	// #5523 C179-093: the aggregator's Run goroutine binds to context.Background
+	// (cancelled only via aggCancel), so shutdown used to leak it and skip its
+	// #5313 ctx.Done final flush — up to a full ~5 min window of SESSION_CLOSE
+	// counters was dropped on every daemon stop. aggWg tracks every started
+	// generation (current + any still-flushing retired one) so stopAggregator
+	// can cancel + JOIN them at shutdown; aggStopped latches the stop so a late
+	// applyAggregator after shutdown never starts a new generation (that Add
+	// would race aggWg.Wait). Both guarded by aggReconMu.
+	aggWg      sync.WaitGroup
+	aggStopped bool
 	vrrpMgr    *vrrp.Manager
 	gc         *conntrack.GC
 	startTime  time.Time // daemon start time; used to suppress stale config sync
@@ -570,6 +592,40 @@ type Daemon struct {
 	// hostInboundFailOpen maps; a nil/empty map means "nothing retained is known to
 	// be covered" (cold boot).
 	hostInboundCoveredAddrs map[string]struct{}
+
+	// lo0Enforced records whether the currently-loaded xpf_lo0 table is a REAL
+	// operator filter (the #6476 lo0 cold-boot fence gate). It means EXACTLY that:
+	// it is set true ONLY by a successful real InstallLo0. A cold-boot FENCE
+	// deliberately does NOT set it — a fence is NOT a real filter (its chain is
+	// `policy accept` and drops only the firewall-local addresses present in the
+	// snapshot it was rendered from, so a later-appearing address is not covered), so
+	// lo0Enforced stays false across a fence. A successful no-filter TEARDOWN Stores
+	// false (the table is deleted); a teardown FAILURE (a table may still be
+	// installed) does NOT clear it.
+	//
+	// It gates the day-2 fence-skip in applyLo0Filter: a failed InstallLo0 installs
+	// a fence UNLESS a real filter is currently loaded. This must key on real-filter-
+	// loaded, NOT "any protecting table exists" (#6489). The earlier design set a
+	// single flag true on BOTH a real load AND a scoped fence, conflating the two —
+	// so a fence -> new-address -> real-install-fails sequence SKIPPED re-fencing and
+	// left the newly-appeared address reachable through the stale fence's
+	// `policy accept` (fail-open). Because a fence no longer sets lo0Enforced, the
+	// gate stays open after a fence and RE-RENDERS the whole-table fence from the
+	// current snapshot on every day-2 failure while no real filter is loaded
+	// (covering the new address); a retained REAL filter (true) is trusted to govern
+	// every local address so no fence is installed — the intended divergence from the
+	// host-inbound per-address gap fence (#5789), which lo0 does not need because the
+	// operator's hand-authored filter is not per-destination-address scoped.
+	//
+	// Residuals (pre-existing, NOT introduced or addressed here — tracked in #6492):
+	// a retained REAL lo0 filter with no catch-all term (a valid config,
+	// compiler_filter_nocatchall_3295_test) need not itself cover a new day-2 address
+	// (the lo0 filter's own coverage semantics, independent of this boot fence); and
+	// the shared BuildZoneHostInboundViews / fence body carries a management-IP-on-
+	// non-lifeline and a zone-less-router behaviour that affect the host-inbound
+	// #5644 fence identically. Production access is serialized under applySem (via
+	// applyLo0Filter); atomic.Bool matches the hostInboundEnforced type.
+	lo0Enforced atomic.Bool
 
 	// mgmtVRFInterfaces tracks interfaces bound to the management VRF (vrf-mgmt).
 	// Used by collectDHCPRoutes to exclude management routes from FRR.

@@ -101,84 +101,13 @@ func quarantineCollidingZones(snap *ConfigSnapshot) []ZoneIDCollision {
 	// Scrub quarantined zones out of policies so the snapshot carries no dangling
 	// policy->zone reference (which the Rust UnresolvableZoneReference preflight
 	// would reject wholesale — a whole-snapshot brick on a fresh boot, the exact
-	// failure this quarantine exists to prevent). Two cases, treated differently:
-	//
-	//  1. A STRUCTURALLY-REQUIRED zone is quarantined -> DROP the whole rule. This
-	//     is the singular FromZone/ToZone of a zone-pair policy (a rule from/to a
-	//     quarantined zone can no longer be applied), OR a scoped-global match side
-	//     that is CONFIGURED but has NO surviving member after pruning (every
-	//     member collided — leaving the side empty would silently BROADEN the rule
-	//     to all zones, a fail-open in the opposite direction). Empty ("" — the
-	//     zone-pair case) and "junos-global" are never quarantine keys.
-	//
-	//  2. A scoped-GLOBAL policy's match-zone context is a zone SET (#4626 M03,
-	//     plural MatchFromZones/MatchToZones; singular kept for back-compat). When
-	//     only SOME members collide, PRUNE the quarantined member(s) and KEEP the
-	//     rule scoped to the survivors. Dropping the whole rule because one member
-	//     collides is FAIL-OPEN: a global deny scoped from [z174, z214] where only
-	//     z214 collides would vanish entirely, so still-valid z174 traffic no
-	//     longer hits the deny and reaches a later/default permit while the
-	//     snapshot publishes successfully (#5577). Unzoning z214 makes that member
-	//     irrelevant; it does not make retained-z174 traffic irrelevant. After
-	//     pruning we regenerate the SINGULAR MatchFromZone/MatchToZone from the
-	//     surviving set (config.ScopeSingular) so an old Rust helper that reads
-	//     only the singular field also sees a surviving, non-quarantined zone —
-	//     never the dropped one (which would re-introduce the dangling reference).
-	if len(snap.Policies) > 0 {
-		isQuarantined := func(z string) bool {
-			_, drop := quarantined[z]
-			return drop
-		}
-		// pruneQuarantined returns a NEW slice with quarantined names removed. It
-		// must not compact in place: MatchFromZones/MatchToZones alias the source
-		// config's pol.Match slices (policies_lower.go), so in-place mutation would
-		// corrupt the live config. This path is a cold fail-closed backstop, so the
-		// per-rule allocation is immaterial.
-		pruneQuarantined := func(zs []string) []string {
-			out := make([]string, 0, len(zs))
-			for _, z := range zs {
-				if !isQuarantined(z) {
-					out = append(out, z)
-				}
-			}
-			return out
-		}
-		keptPol := snap.Policies[:0]
-		for _, p := range snap.Policies {
-			// Case 1a: a zone-pair rule's required endpoint is quarantined.
-			if isQuarantined(p.FromZone) || isQuarantined(p.ToZone) {
-				continue
-			}
-			drop := false
-			// Case 2 / 1b: prune each configured scoped-global match side; drop the
-			// rule only if a configured side is emptied by the prune.
-			if from := p.effectiveMatchFromZones(); len(from) > 0 {
-				kept := pruneQuarantined(from)
-				if len(kept) == 0 {
-					drop = true
-				} else {
-					p.MatchFromZones = kept
-					p.MatchFromZone = config.ScopeSingular(kept)
-				}
-			}
-			if !drop {
-				if to := p.effectiveMatchToZones(); len(to) > 0 {
-					kept := pruneQuarantined(to)
-					if len(kept) == 0 {
-						drop = true
-					} else {
-						p.MatchToZones = kept
-						p.MatchToZone = config.ScopeSingular(kept)
-					}
-				}
-			}
-			if drop {
-				continue
-			}
-			keptPol = append(keptPol, p)
-		}
-		snap.Policies = keptPol
-	}
+	// failure this quarantine exists to prevent). The scrub is shared with the
+	// scheduler-only / route-overlay republish paths (#6480) via
+	// scrubPoliciesForQuarantinedZones — whose doc comment documents the two
+	// drop/prune cases — because those paths rebuild next.Policies from raw cfg
+	// and must re-establish this SAME invariant against the already-reduced
+	// next.Zones they inherit.
+	snap.Policies = scrubPoliciesForQuarantinedZones(snap.Policies, quarantined)
 	sort.Slice(collisions, func(i, j int) bool {
 		if collisions[i].ID != collisions[j].ID {
 			return collisions[i].ID < collisions[j].ID
@@ -186,4 +115,115 @@ func quarantineCollidingZones(snap *ConfigSnapshot) []ZoneIDCollision {
 		return collisions[i].Quarantined < collisions[j].Quarantined
 	})
 	return collisions
+}
+
+// scrubPoliciesForQuarantinedZones is the policy half of quarantineCollidingZones,
+// factored out (#6480) so the partial-republish paths that rebuild next.Policies
+// from raw cfg — PublishRouteOverlaySnapshot (route-overlay) and
+// UpdatePolicyScheduleState (scheduler-only) — re-establish the SAME
+// zone-isolation invariant against the already-reduced next.Zones they inherit.
+// Both rebuild the FULL policy set (the raw builder has no knowledge of the
+// StableZoneID quarantine), so a policy referencing a quarantined zone is
+// reintroduced; leaving it in next.Policies while next.Zones stays reduced ships
+// a dangling policy->zone reference that the Rust UnresolvableZoneReference
+// preflight (userspace-dp/src/policy.rs) rejects wholesale — a whole-snapshot
+// brick. quarantined is the set of dropped zone names (config.QuarantinedZoneNames
+// over the FULL zone-name set); "" and "junos-global" are never members (not real
+// zone names), so global/zone-pair sentinels are preserved.
+//
+// Two cases, treated differently:
+//
+//  1. A STRUCTURALLY-REQUIRED zone is quarantined -> DROP the whole rule. This is
+//     the singular FromZone/ToZone of a zone-pair policy (a rule from/to a
+//     quarantined zone can no longer be applied), OR a scoped-global match side
+//     that is CONFIGURED but has NO surviving member after pruning (every member
+//     collided — leaving the side empty would silently BROADEN the rule to all
+//     zones, a fail-open in the opposite direction).
+//
+//  2. A scoped-GLOBAL policy's match-zone context is a zone SET (#4626 M03, plural
+//     MatchFromZones/MatchToZones; singular kept for back-compat). When only SOME
+//     members collide, PRUNE the quarantined member(s) and KEEP the rule scoped to
+//     the survivors — dropping the whole rule for one colliding member is
+//     FAIL-OPEN (#5577). After pruning we regenerate the SINGULAR
+//     MatchFromZone/MatchToZone from the surviving set (config.ScopeSingular) so an
+//     old Rust helper reading only the singular field also sees a surviving,
+//     non-quarantined zone — never the dropped one.
+//
+// It compacts in place (policies[:0]); the caller must own the slice (a freshly
+// built or snapshot-owned slice), never an alias of the live config. The per-rule
+// prune allocates a NEW slice so it never mutates an aliased config.Match slice
+// (policies_lower.go). A nil/empty quarantined set returns policies unchanged, so
+// callers may invoke it unconditionally.
+func scrubPoliciesForQuarantinedZones(policies []PolicyRuleSnapshot, quarantined map[string]struct{}) []PolicyRuleSnapshot {
+	if len(policies) == 0 || len(quarantined) == 0 {
+		return policies
+	}
+	isQuarantined := func(z string) bool {
+		_, drop := quarantined[z]
+		return drop
+	}
+	pruneQuarantined := func(zs []string) []string {
+		out := make([]string, 0, len(zs))
+		for _, z := range zs {
+			if !isQuarantined(z) {
+				out = append(out, z)
+			}
+		}
+		return out
+	}
+	keptPol := policies[:0]
+	for _, p := range policies {
+		// Case 1a: a zone-pair rule's required endpoint is quarantined.
+		if isQuarantined(p.FromZone) || isQuarantined(p.ToZone) {
+			continue
+		}
+		drop := false
+		// Case 2 / 1b: prune each configured scoped-global match side; drop the
+		// rule only if a configured side is emptied by the prune.
+		if from := p.effectiveMatchFromZones(); len(from) > 0 {
+			kept := pruneQuarantined(from)
+			if len(kept) == 0 {
+				drop = true
+			} else {
+				p.MatchFromZones = kept
+				p.MatchFromZone = config.ScopeSingular(kept)
+			}
+		}
+		if !drop {
+			if to := p.effectiveMatchToZones(); len(to) > 0 {
+				kept := pruneQuarantined(to)
+				if len(kept) == 0 {
+					drop = true
+				} else {
+					p.MatchToZones = kept
+					p.MatchToZone = config.ScopeSingular(kept)
+				}
+			}
+		}
+		if drop {
+			continue
+		}
+		keptPol = append(keptPol, p)
+	}
+	return keptPol
+}
+
+// quarantinedZoneNamesForConfig computes the StableZoneID quarantine set — the
+// zone names quarantineCollidingZones drops — directly from a config's zone-name
+// set, WITHOUT building a full snapshot. The partial-republish paths use it to
+// re-scrub a freshly rebuilt policy slice against the SAME quarantine the full
+// build applied (#6480). The name set is exactly buildZoneSnapshots' source
+// (cfg.Security.Zones keys), so the computed set matches the full build's
+// quarantine by construction; the inherited next.Zones (reduced by the full
+// build) is therefore full(cfg) minus this set, and scrubbing the rebuilt
+// policies against it leaves no reference to a zone absent from next.Zones.
+func quarantinedZoneNamesForConfig(cfg *config.Config) map[string]struct{} {
+	if cfg == nil || len(cfg.Security.Zones) < 2 {
+		return nil
+	}
+	names := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		names = append(names, name)
+	}
+	return config.QuarantinedZoneNames(names)
 }

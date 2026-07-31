@@ -1,0 +1,69 @@
+package api
+
+import "github.com/prometheus/client_golang/prometheus"
+
+func (c *xpfCollector) initNATDescriptors() {
+	c.natPoolUsedPorts = prometheus.NewDesc(
+		"xpf_nat_pool_used_ports",
+		"Number of used ports in a NAT pool.",
+		[]string{"pool"}, nil,
+	)
+	c.natPoolTotalPorts = prometheus.NewDesc(
+		"xpf_nat_pool_total_ports",
+		"Total available ports in a NAT pool.",
+		[]string{"pool"}, nil,
+	)
+	c.natPoolDeterministicInfo = prometheus.NewDesc(
+		"xpf_nat_pool_deterministic_info",
+		"Deterministic NAT pool configuration (1 = enabled).",
+		[]string{"pool", "block_size", "host_count"}, nil,
+	)
+	c.natPoolDetBlocksTotal = prometheus.NewDesc(
+		"xpf_nat_deterministic_pool_blocks_total",
+		"Total per-subscriber port-block capacity of a deterministic NAT "+
+			"pool (pool addresses x floor(port-range / block-size)). The "+
+			"denominator for deterministic-pool block utilization; the "+
+			"pool-wide xpf_nat_pool_used_ports metric is meaningless for a "+
+			"deterministic pool (#4752).",
+		[]string{"pool"}, nil,
+	)
+	c.natPoolDetBlocksAllocated = prometheus.NewDesc(
+		"xpf_nat_deterministic_pool_blocks_allocated",
+		"Port blocks statically allocated to the provisioned subscriber "+
+			"range of a deterministic NAT pool (one block per subscriber). "+
+			"The numerator for block utilization: divide by "+
+			"xpf_nat_deterministic_pool_blocks_total and alarm as it "+
+			"approaches 1.0 (#4752).",
+		[]string{"pool"}, nil,
+	)
+	c.userspaceSNATPoolLiveFlows = prometheus.NewDesc(
+		"xpf_userspace_source_nat_pool_live_flows",
+		"Live source NAT pool flow allocations tracked by the userspace dataplane.",
+		[]string{"pool", "rule"}, nil,
+	)
+	c.userspaceSNATPoolUsedPorts = prometheus.NewDesc(
+		"xpf_userspace_source_nat_pool_used_ports",
+		"Source NAT pool translated ports currently owned by the userspace dataplane allocator.",
+		[]string{"pool", "rule"}, nil,
+	)
+	c.userspaceSNATPoolPersistentLeases = prometheus.NewDesc(
+		"xpf_userspace_source_nat_pool_persistent_leases",
+		"Persistent source NAT leases retained by the userspace dataplane allocator.",
+		[]string{"pool", "rule"}, nil,
+	)
+	c.userspaceSNATPoolAllocationsTotal = prometheus.NewDesc(
+		"xpf_userspace_source_nat_pool_allocations_total",
+		"Total new source NAT pool translated tuple allocations by the userspace dataplane.",
+		[]string{"pool", "rule"}, nil,
+	)
+	c.userspaceSNATPoolReusesTotal = prometheus.NewDesc(
+		"xpf_userspace_source_nat_pool_reuses_total",
+		"Total source NAT pool live or persistent lease reuses by the userspace dataplane.",
+		[]string{"pool", "rule"}, nil,
+	)
+	c.userspaceSNATPoolExhaustionsTotal = prometheus.NewDesc(
+		"xpf_userspace_source_nat_pool_exhaustions_total",
+		"Total source NAT pool allocator exhaustion events in the userspace dataplane.",
+		[]string{"pool", "rule"}, nil,
+	)
+}

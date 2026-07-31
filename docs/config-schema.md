@@ -385,6 +385,196 @@ both-views-valid + standalone over-reject guards, node0/node1 symmetry) and
 `pkg/configstore/peer_effective_snat_5876_test.go` (store-gate wiring), each RED
 on revert of the peer gate (node0 accepts the peer-only SNAT error).
 
+### Source-NAT / NAT64 external-tuple overlap (#5144)
+
+The Rust dataplane keys the source-NAT `PortAllocator` by pool name + address
+vector (`userspace-dp/src/nat/source.rs`) and the NAT64 allocator by
+`(prefix_bytes, pool_v4)` (`userspace-dp/src/nat64.rs`). Nothing tied those
+independent allocators together, so four config shapes each gave two allocators
+an overlapping claim on the same translated IPv4/IPv6 address: differently-named
+source pools with overlapping addresses; a source pool that also backs a NAT64
+`source-pool`; two NAT64 rule-sets sharing one pool under DIFFERENT prefixes; and
+duplicate/overlapping members WITHIN one pool. Independent occupancy bitmaps
+share no ownership word, so two flows to the same remote endpoint can be handed
+the same `(family, translated IP, translated port)` and the reverse (1:N) NAT
+index cannot disambiguate the return packet — it is misdelivered. The only
+pre-existing NAT overlap gate was NPTv6 static-prefix (#2241); this is its
+source-NAT / NAT64 analog.
+
+`validateNATPoolExternalTupleOverlapStrict(cfg, lenient)`
+(`compiler_validate_strict_nat.go`, wired into `runTailGates` right after the
+NPTv6 / NAT64 gates) rejects the overlap at commit. It enumerates one allocator
+"owner" per the exact keys the helper uses — one per DISTINCT source-NAT
+pool a pool-mode `then source-nat pool` rule references, and one per DISTINCT
+`(canonical prefix, source-pool)` a `nat64 rule-set` references (unreferenced
+pools build no allocator and are out of scope, mirroring the #5877 aggregate
+gate). A NAT64 rule-set is an owner ONLY when its prefix would build a live
+allocator — `nat64PrefixOwnerKey` mirrors the Rust `nat64.rs` build condition and
+`validateNAT64PrefixStrict`'s accept set exactly (split on `/` into two parts, the
+mask a decimal 96, the address IPv6 by the colon-strict rule) and returns the
+CANONICAL /96 network (the Rust 12-byte identity) via `netip … Masked()`. An
+empty / malformed / non-/96 prefix builds no allocator (Rust skips it; the strict
+gate rejects a non-empty malformed prefix and *skips* an empty one), so it is
+dropped from the owner set — never enumerated as a phantom owner that would
+falsely report an overlap (two empty-prefix rule-sets sharing a pool, or an
+empty-prefix rule-set vs a live source-NAT owner). The canonical key means two
+rule-sets naming one pool under the SAME /96 in different valid spellings —
+`64:ff9b::/96` vs `0064:ff9b:0:0:0:0:0:0/96` vs a leading-zero `64:ff9b::/096`
+(which `validateNAT64PrefixStrict` and Rust's numeric mask parse both accept, but
+a raw `netip.ParsePrefix` rejects) — are ONE runtime allocator, so keying on raw
+text would FALSELY reject them. Each owner's members (`pool.Address` +
+`pool.Addresses`, ranges already expanded to /32s) become family-scoped numeric
+intervals — v4 vs v6 bucketed by the colon-strict textual family
+(`natAddrFamily(natCIDRIPPart(...))`, the Go/Rust parity rule, so an IPv4-mapped
+IPv6 literal never compares against a real v4 member) — and an O(n log n)
+sort-and-sweep per family reports the first overlapping pair. Two members of the
+SAME owner is a within-pool duplicate/overlap; two owners is the cross-pool /
+cross-feature collision.
+
+The gate is ALSO carried in the #5876 peer-effective source-NAT view
+(`validateSourceNATStrictView`, `compiler_peer_effective_snat.go`): a
+`${node}`/groups rewrite whose PEER resolution produces an overlapping pool set
+while the origin's is disjoint would otherwise commit green on the origin and let
+the standby lenient-load the vulnerable independent allocators — the same
+divergent-commit fail-open #5876 closes for the other source-NAT gates. Run
+strict there (`lenient=false`), it rejects the node1-only overlap at a node0
+commit.
+
+This is the commit-time DETECTION half of #5144 (material choice **S1**: reject
+independently-owned overlap). It does NOT introduce the deferred packet-path
+global cross-domain allocator (the R2 design, gated on user signoff and
+#2387/#5338/#5698) — rejecting the overlap at commit forecloses the runtime
+collision because the vulnerable config never reaches the dataplane. Strict
+(commit / commit-check): hard-reject naming both allocators and the overlapping
+members. Lenient (load / peer-sync): warn via `opts.lenientNATPoolOverlap`
+(#1960 no-brick) so a config committed before this gate existed still boots —
+but UNLIKE NPTv6 / NAT64 the dataplane does NOT reject the overlapping snapshot,
+so the latent reverse-index collision persists until corrected and the warning
+says so. Covered by `pkg/config/compiler_nat_pool_overlap_5144_test.go`
+(exact-duplicate / partial-overlap / source-NAT-vs-source-NAT /
+source-NAT-vs-NAT64 same-and-distinct-pool / NAT64-different-prefix /
+within-pool-duplicate / IPv6-overlap / IPv6-nesting / IPv6-bare-vs-/128 reject
+cases; a peer-only-`${node}`-overlap reject through the #5876 peer gate; plus
+distinct-pool / shared-pool / cross-family / same-prefix-dedup /
+NAT64-equivalent-prefix-spelling / NAT64-leading-zero-`/096`-mask /
+NAT64-empty-prefix-not-an-owner / adjacent-v4 / adjacent-v6 /
+mapped-v6-vs-genuine-v4 / unreferenced accept guards), RED on revert of the gate
+(the overlap is accepted) — and separately RED on revert of the canonical NAT64
+key (equivalent + leading-zero spellings wrongly rejected), of the empty-prefix
+owner skip (an inert NAT64 rule-set falsely reported as an overlap), and of the
+peer-view wiring (node0 accepts the peer-only overlap). The shipped `test/incus/xpf-test.conf` and
+`test/incus/xpf-cluster-fw0.conf` each carried the cross-feature overlap (one
+pool drawn by both NAT64 and a source-NAT rule) and were separated into distinct
+pools + proxy-ARP as part of this change.
+
+### Duplicate NAT rule name (#5649, C181-M18)
+
+NAT rule-sets are ordered, first-match tables keyed by rule name, so a rule's
+CONFIG identity is `natType/ruleset/rule`. Two rules authored with the SAME
+name in one rule-set are NOT reduced to last-writer-wins like a #5180
+hierarchical block — they BOTH survive: `namedInstances` (the rule loop in
+`compiler_nat_source.go` / `compiler_nat_destination.go` /
+`compiler_nat_static.go`) appends each as a separate first-match entry sharing
+that one config identity. For source / destination / ordinary static NAT that
+identity is also the shared `natType/ruleset/rule` hit counter (so `show` /
+counter surfaces cannot tell the rows apart); for a counter-less NPTv6 (RFC
+6296) static rule they are two snapshots (`buildNptv6Snapshots`). Either way the
+duplicate name is a config error — the harm is type-independent (the shared
+config identity), which is why the gate's diagnostic is type-agnostic (below).
+
+`validateDuplicateNATRuleNamesAST(tree, lenient)`
+(`pkg/config/dup_nat_rule_names.go`, wired beside the #5180 duplicate-named-block
+gate in both `compileConfigWithOpts` and `compileConfigForNodeWithOpts`) rejects
+this at commit. It runs **pre-expansion** on top-level `security` stanzas only —
+apply-groups DEEP-MERGES a same-named rule rather than duplicating it, and the
+flat `set` form reuses the rule node, so only a directly-authored hierarchical
+duplicate reaches the gate. The seen-set is keyed by `(natType, rule-set, rule)`
+and unioned across repeated `security` / `nat` / `source|destination|static`
+blocks (compileNAT merges those, #3915), so a rule name split across two
+`source {}` blocks is caught too. The same rule name in two DIFFERENT rule-sets
+(a distinct identity) is accepted. Strict (commit / commit-check) hard-rejects;
+lenient (load / peer-sync) warns via `opts.lenientDuplicateNATRuleName` (#1960
+no-brick) and keeps the historical two-row behavior.
+
+The reason line is deliberately **type-agnostic** — it states the genuine,
+type-independent defect (a rule-set is keyed by rule name, so the same name
+authored twice is a config error) and never claims a per-rule hit counter.
+NPTv6 (RFC 6296) static rules are COUNTER-LESS — `compileStaticNAT` skips
+`rule.IsNPTv6` before `assignNATCounterID`, and `buildNptv6Snapshots`
+(`pkg/dataplane/userspace/nat_nptv6.go`) appends each rule as its own snapshot —
+so a counter-specific diagnostic would be false for them. The #2241 NPTv6
+overlap gate (`compiler_validate_strict_nat.go`) also deliberately SKIPS
+same-`(rule-set, rule)` pairs (#4339, so a single multi-`from`-scope rule is not
+flagged against itself), so it never compares two same-named NPTv6 rules — this
+duplicate-name gate is the ONLY one that catches them, and it does so with the
+same name-identity reason it uses for every other NAT type.
+
+Covered by `pkg/config/dup_nat_rule_names_5649_test.go` (source / destination /
+static reject, NPTv6 counter-less reject, lenient warn, and distinct-name /
+different-rule-set / flat-set-merge accept guards), RED on revert of the gate
+(the duplicate is accepted) and, separately, RED if the diagnostic reintroduces
+a per-rule counter claim (false for a counter-less NPTv6 rule).
+
+The quoted-empty rule name this gate once skipped is now rejected as an
+authoring error (#6455, see the subsection below). The other limitation it
+shares with its #5180 sibling — a duplicate authored entirely inside an applied
+group — is DEFERRED (#6455 Finding 1): a pre-expansion per-group-body scan
+false-rejects a legitimate apply-groups fragment config that coalesces
+post-expansion.
+
+### Duplicate NAT rule-SET name (#6454, C181-M18 sibling)
+
+The #5649 gate above closes the rule-NAME axis; #6454 closes the rule-SET-name
+axis one level up. A rule-set name is its operational identity — the from/to
+scope binding and the CLI show key. It is UNIQUE per nat type but reusable
+ACROSS nat types (Junos gives source / destination / static / nat64 independent
+name spaces; `NATCounterKey` in `pkg/dataplane/compiler_nat.go` is natType-
+prefixed for the counted types). Two rule-sets authored with the SAME name
+WITHIN one nat type are NOT reduced to last-writer-wins like a #5180
+hierarchical block — they BOTH survive: `compileNATSource` /
+`compileNATDestination` / `compileNATStatic` / `compileNAT64` each APPEND the
+rule-set (`sec.NAT.Source` / `Destination.RuleSets` / `Static` / `NAT64`), never
+merging by name, so both compile as separate first-match tables sharing one
+name. The operator authored what they read as one rule-set; it compiles to two,
+evaluated in sequence. The CLI named-rule-set show lookup
+(`showNATSourceRuleSet` in `pkg/cli/cli_show_nat.go`) returns on the FIRST name
+match, so the second same-named rule-set — and its rules — is invisible on that
+surface and the operator cannot disambiguate the two. This is NOT a per-rule
+counter merge: `NATCounterKey` includes the rule name, so the disjoint rules
+this gate uniquely catches get distinct counter keys (a SAME rule name in both
+is caught first by the #5649 gate); a nat64 rule-set (prefix / source-pool, no
+`rule` nodes — correctly excluded from the #5649 rule-name gate) is counter-less
+anyway. The harm is type-independent (the shared rule-set NAME identity), which
+is why the diagnostic is type-agnostic and never claims a per-rule counter.
+
+`validateDuplicateNATRuleSetNamesAST(tree, lenient)`
+(`pkg/config/dup_nat_ruleset_names.go`, wired beside the #5649 duplicate-rule-name
+gate in both `compileConfigWithOpts` and `compileConfigForNodeWithOpts`) rejects
+this at commit. It runs **pre-expansion** on top-level `security` stanzas only,
+for the same reasons as #5649 — apply-groups DEEP-MERGES a same-named rule-set
+rather than duplicating it, and the flat `set` form reuses the rule-set node
+(`tree.SetPath` merges), so only a directly-authored hierarchical duplicate
+reaches the gate. The seen-set is keyed by `(natType, rule-set)` and unioned
+across repeated `security` / `nat` / sub-block stanzas (compileNAT merges those,
+#3915), so a rule-set name split across two `source {}` blocks is caught too.
+The same rule-set name in two DIFFERENT nat types (a distinct
+natType-prefixed namespace) is accepted. Crucially the dedup is at the AST
+rule-set-INSTANCE level, NOT the compiled level: a single authored rule-set
+carrying a bracket list of from/to scopes Cartesian-expands into MULTIPLE
+same-named `NATRuleSet` objects downstream (#3096) — that is one AST instance
+and is NOT flagged (a compiled-level dedup would false-positive here). Strict
+(commit / commit-check) hard-rejects; lenient (load / peer-sync) warns via
+`opts.lenientDuplicateNATRuleSetName` (#1960 no-brick) and keeps the historical
+two-table behavior.
+
+Covered by `pkg/config/dup_nat_ruleset_names_6454_test.go` (source / destination
+/ static / nat64 reject, nat64 counter-less-diagnostic guard, lenient warn, and
+distinct-name / different-nat-type / bracket-list-scope-expansion / flat-set-merge
+accept guards), RED on revert of the gate (the duplicate is accepted). The
+quoted-empty rule-set name it once skipped is now rejected (#6455, this gate
+owns the empty rule-set name); the applied-group limitation it shares with its
+#5649 / #5180 siblings is deferred (see the subsection below).
+
 **Phase 2 (#5878) — reference-binder canonicalization.** Phase 1 (above) closes
 the divergent-commit fail-open by rejecting a duplicate-spelling collision at
 commit. The second, subtler half of #5878 is that a cross-subsystem reference
@@ -447,6 +637,55 @@ unit name, so each binder now stores its map key on the canonical unit:
   a two-zone `.01`/`.1` duplicate-membership reject), and
   `pkg/daemon/ri_member_canonical_5878_test.go` (netlink `.01`→canonical device
   via both the tunnel-device and LinuxIfName paths, RED on revert).
+
+### Quoted-empty names + group-authored duplicates (family-wide, #6455)
+
+The three pre-expansion duplicate-name gates — `validateDuplicateNamedBlockAST`
+(#5180: groups / interfaces / screen ids-option), `validateDuplicateNATRuleNamesAST`
+(#5649: NAT rule names), and `validateDuplicateNATRuleSetNamesAST` (#6454: NAT
+rule-set names) — shared two limitations. #6455 closes the quoted-empty-name half
+here (shared helpers in `pkg/config/dup_names_6455.go`) and DEFERS the
+group-authored half (below).
+
+**Closed — quoted-empty names.** The gates `continue` on an empty name, so a
+quoted-empty name (`rule ""`, `rule-set ""`, `group ""`, `interface ""`,
+`ids-option ""`) was neither rejected as a duplicate nor rejected as empty. An
+empty name is not a valid operational identity for any of these containers — the
+object cannot be referenced or shown by name — so it is an authoring error
+regardless of duplication (mirroring the #5636 empty-credential rejection). Each
+gate now rejects it: strict commit / commit-check hard-rejects (`empty <kind>
+name … (#6455)`), tolerant load / peer-sync (#1960) warns and keeps booting.
+Duplicates keep first-error priority, so a config with no empty name produces
+byte-identical pre-#6455 diagnostics. The empty **rule-set** name is owned by the
+#6454 gate — the #5649 rule-name gate skips an empty rule-set — so the lenient
+warning fires exactly once, not double-reported.
+
+**Deferred — group-authored duplicates (#6455 Finding 1).** A duplicate authored
+entirely inside an applied group body (no inline peer) survives `ExpandGroups()`
+and reaches the compiler, but no gate catches it because the gates scan only the
+top level. The tempting fix — a pre-expansion per-group-body scan — is WRONG: it
+false-rejects a legitimate apply-groups FRAGMENT config. Fragments of one named
+object authored across repeated group roots (two `interfaces` roots each
+contributing a `ge-0/0/0` unit; a screen profile split into an ICMP fragment + a
+TCP fragment; a NAT rule split into complementary `match` / `then` fragments)
+COALESCE into a SINGLE object under `mergeNodes` during `ExpandGroups`, but a
+pre-expansion sibling-scan cannot model that same-pass coalescing and rejects a
+config that compiles to one object. The correct detection point is AFTER
+`ExpandGroups` (the coalesced tree) but before the #3096 Cartesian bracket-list
+expansion in `compileExpanded` (`compiler_nat_source.go`), AND — to stay
+HA-symmetric like the sibling tunnel / zone / unit-alias gates — it must union the
+node0 and node1 expansions rather than scan a single node's view. That is a design
+pass tracked as the group-authored half of #6455, not shipped here.
+
+Covered by `pkg/config/dup_names_6455_test.go`: quoted-empty reject for all five
+containers (RED on revert of the empty-name recording), a lenient warns-EXACTLY-
+once guard for the empty rule-set, and — the load-bearing regression guard for the
+deferral — `TestDup6455GroupFragmentCoalescingAccepted` locks the four fragment-
+coalescing configs (interface / screen / NAT-rule fragments, group-siblings +
+inline peer) as ACCEPT so a future group-authored detector cannot reintroduce the
+false-reject. Plus the top-level no-false-positive accepts (apply-groups
+deep-merge carrying both rules, cross-group coalescing, #3096 bracket-list
+expansion).
 
 ### Non-numeric logical-unit identity fail-closed (#5829)
 
@@ -695,12 +934,64 @@ therefore the WRONG helper here — it reads one node's `Keys[1:]` + immediate
 children and would still see only the first member. `compileZones`
 (`compiler_security_zones.go`) flattens the nested chain with the recursive
 `zoneInterfaceMembers`, which reads every key at each level and skips a
-`host-inbound-traffic` body (a bracketed member is bare membership — it cannot
-carry a per-interface host-inbound stanza). Before #5248 the reader took only
+`host-inbound-traffic` body (a bracketed member is bare membership in flat-set /
+canonical `set` syntax — it cannot carry a per-interface host-inbound stanza
+there; the `[ a b ] { host-inbound-traffic ... }` shape documented below is
+reachable only via a raw-hierarchical `load override` parse). Before #5248 the
+reader took only
 `iface.Name()` and silently dropped every member after the first — a zone-
 membership (security boundary) loss that also hid the dropped interface from
 the strict `validateZoneInterfaceDefinedStrict` gate. Covered by
 `pkg/config/compiler_zone_interfaces_bracket_5248_test.go`.
+
+**A per-interface `host-inbound-traffic` override is scoped to the SINGLE
+interface it is written under — it NEVER fans out to bracket siblings
+(#6391).** The `zoneInterfaceMembers` flatten above is for zone MEMBERSHIP
+only. Host-inbound is compiled separately and keyed strictly on the direct
+child the stanza hangs under (`iface.Name()` in `compileZones`), never across
+the flattened member set. This matters because the flat-set single-scoped case
+and a hierarchical multi-member `load override` block compile to the SAME AST:
+`interfaces [ ge-0/0/0 ge-0/0/1 ]` followed by
+`interfaces ge-0/0/0 host-inbound-traffic system-services ssh` reuses the FIRST
+member's SetPath container, so the `ge-0/0/0` node carries BOTH the `ge-0/0/1`
+membership leaf AND the host-inbound body — structurally identical to a
+hand-authored `interfaces { ge-0/0/0 { ge-0/0/1; host-inbound-traffic {...} } }`.
+A fanout keyed on the compiled AST alone therefore cannot tell "scope ssh to
+`ge-0/0/0` only" from "apply to every bracket member", so fanning the override
+across `zoneInterfaceMembers` (attempted in PR #6389, closed unmerged) OPENS ssh
+on `ge-0/0/1`, which the operator never configured — an over-permission /
+host-inbound leak.
+
+Two properties, do NOT conflate them:
+
+- **Individually-scoped isolation (UNCONDITIONAL invariant).** A service
+  authored under ONE named interface via its own `set` statement
+  (`interfaces ge-0/0/0 host-inbound-traffic system-services ssh`) is
+  single-scoped by definition and must NEVER appear on a sibling — under every
+  design option. This holds today and must keep holding after any future fix.
+
+- **Multi-member body (CURRENT fail-safe, pending a design call).** A
+  host-inbound BODY hanging off a bracket membership itself
+  (`interfaces [ ge-0/0/0 ge-0/0/1 ] { host-inbound-traffic { ... } }`, or the
+  `ge-0/0/0 { ge-0/0/1; host-inbound-traffic { ... } }` load-override artifact)
+  currently applies to the first member ONLY. That is the issue's **option 1**
+  (fail-safe): the override stays on the single named interface and a bracketed
+  multi-member intent UNDER-applies (a sibling falls back to the zone-level
+  host-inbound) rather than over-admitting. This is the current default, NOT the
+  final multi-member semantics — making the multi-member intent apply to every
+  member without the flat-set leak needs parse-time scope disambiguation
+  (options 2/3), still an OPEN design call on #6391.
+
+Both properties are pinned by
+`pkg/config/compiler_zone_iface_hostinbound_sibling_6391_test.go`, which asserts
+the FULL per-interface host-inbound map (every interface, both system-services
+AND protocols). Re-introducing the #6389 fanout turns the CONTAINER-SHARING
+cases RED — first-member, three-member, multi-service, protocols, and the two
+hierarchical multi-member-body cases — while the later-member and
+no-shared-backing-store cases stay GREEN CONTROLS (their interfaces do not share
+a SetPath container, so the fanout cannot touch them). The two multi-member-body
+cases assert current option-1 behavior only; an options-2/3 fix intentionally
+updates those two expectations.
 
 **`multi: true` ALSO prevents single-value REPLACE for repeated keyed-list
 leaves (#3984).** The `#2419` discussion above is about ONE statement with a
@@ -880,6 +1171,32 @@ display-set round-trip, policy match `source-address`, block-shape
 `system-services` member toggle, single-value-leaf and keyed-entry
 non-regression).
 
+**Scoped display-set parent prefix: use `navigatePath`'s TRUE consumed width,
+not a key-token heuristic (#5717).** `FormatPathSet` (`ast_format.go`, the
+`show configuration <path> | display set` renderer) reconstructs the leading
+prefix for each emitted `set` line by removing the matched terminal node's tokens
+from the scoped path. Two heuristics both failed on legal repeated names:
+searching the path left-to-right for the FIRST token equal to the matched node's
+first key dropped an ancestor token when an ANCESTOR argument equaled that key (a
+security zone NAMED `interfaces` holding an `interfaces` stanza rendered
+`set security zones security-zone interfaces ge-0/0/9.0`, one `interfaces`
+missing); suffix-aligning the node's WHOLE keys against the path over-stripped
+when an ancestor value repeated the node's keys (a firewall filter NAMED `term`
+holding a term NAMED `term`, `... filter term term term`, scoped to
+`... filter term term` — the `term term` node matched by only its first key, but
+the path tail `["term","term"]` also equalled its full keys). The robust fix
+exposes the exact number of trailing path tokens `navigatePath` consumed into the
+terminal node — `navigatePathWidth` (`ast.go`) returns `(matches, width)`, and
+`navigatePath` is now a thin wrapper — so the parent prefix is
+`path[:len(path)-width]` from the TRUE width (a single-key bare-keyword terminal
+consumes ONE token even when its full Keys are longer). This is the display-side
+twin of the copy-side #5822 fix (`CopyPath` first-keyword `insertNode`); both are
+the codex-182 A3-b00-C001 AST path-identity cohort. Covered by
+`pkg/config/ast_format_pathset_ancestor_5717_test.go` (zone-named-`interfaces`
+round-trip, policy-named-`then` prefix, and every scoped depth of the
+filter-`term`/term-`term` chain; fail-on-revert restores the token-heuristic and
+drops a token).
+
 **Rename-side contract: resolve the SPECIFIC named sibling by full identity
 (#3982).** `rename <old> to <new>` (`RenamePath`, `ast_edit.go`) is the same
 read-all-siblings class as the delete/deactivate fixes above, but on a
@@ -1029,6 +1346,22 @@ nat.go`) expand the union — one DNAT entry per protocol, one app term per
 resolved application (an application-set still expands to its members). Coverage:
 `compiler_nat_match_multivalue_3431_test.go` (both AST shapes, all axes) and
 `nat_match_multivalue_3431_test.go` (snapshot expansion).
+
+**A protocol-less `match destination-port` matches tcp AND udp (#6462).** When a
+DNAT rule pins a `match destination-port` but NO `match protocol`, Junos matches
+BOTH TCP and UDP (ports exist only for those two L4s). `buildDestinationNATSnapshots`
+(`pkg/dataplane/userspace/nat_destination.go`) therefore emits one entry under
+`tcp` AND one under `udp` — not a single `tcp` default (the pre-#6462 bug, which
+left UDP to the VIP:port silently untranslated), and not a single `PROTO_ANY`
+entry (that would wrongly translate ICMP/other, and the Rust `DnatTable` lookup
+probes `(proto,dst_ip,dst_port) -> (proto,dst_ip,0) -> (PROTO_ANY,dst_ip,0)` but
+never `(PROTO_ANY,dst_ip,dst_port)`, so a UDP packet could not find a
+`PROTO_ANY`+port row anyway). The two rows are identical except the protocol key
+and share the rule's single counter id, exactly like an explicit `match protocol
+[ tcp udp ]`: a packet is tcp or udp, so it hits exactly one row and the counter
+increments once. An explicit `match protocol` is honored verbatim (no synthetic
+second protocol); a protocol-less rule with NO port stays a single match-any
+(empty-protocol) entry. Coverage: `nat_destination_6462_test.go`.
 
 **A source-NAT pool `address` is multi-value (#4521).** A source pool's
 `address` value carries EVERY IP the SNAT allocator may draw from, in four
@@ -1734,6 +2067,75 @@ above (`buildNAT64Snapshots` from `cfg.Security.NAT.NAT64`), which is unaffected
 Tests: `static_nat_inet_failclosed_5859_test.go` (both `pkg/config` and
 `pkg/dataplane/userspace`).
 
+**A static-NAT rule has EXACTLY ONE translation target (#6483).** A Junos
+`then static-nat` maps to exactly one of `prefix <ip>` | `prefix-name <name>`
+(#4290) | `nptv6-prefix <p6>` | `inet` (#5859). Authoring two or more — both a
+`prefix` and a `prefix-name`, an `inet` sibling alongside a `prefix` sibling, two
+`prefix` targets — is invalid Junos, but the compiler silently accepted it: the
+`compileNATStatic` child loop honors the FIRST target it matches by a fixed
+priority (`nptv6-prefix` > `prefix-name` > `prefix` > `inet`) and drops the rest,
+and because `prefix` / `inet` / `nptv6-prefix` all land in the shared `Then`
+field a later target simply overwrites an earlier one. The rule compiled to one
+arbitrary target with no operator feedback — `inet` + `prefix` even installed as
+a plain prefix rule, EVADING the #5859 `inet` reject. Dropping a target this way
+also dropped any `mapped-port` that rode ONLY on the discarded target (the #6479
+/ C179-038 residual), because that target's node was never the one whose modifier
+the mapped-port fold read. `validateStaticNATSingleTargetStrict` now counts the
+DISTINCT translation targets a rule declares — from the AST during compile
+(`staticNATThenTargetCount`, recorded as `StaticNATRule.ThenTargetCount`), BEFORE
+the fields collapse — and hard-rejects a rule declaring more than one. The count
+is a GRAMMAR-ROLE-AWARE FULL TRAVERSAL (#6484), the SAME slot-classification walk
+the #6479 mapped-port scan uses (`staticNATCollectTargetIdentsFromKeys` mirrors
+`staticNATMappedPortOperandsFromKeys`): it walks the ENTIRE key stream of the
+`static-nat` node AND every child, plus the grandchild values of a bare keyword,
+classifying each position as a KEYWORD slot or a consumed VALUE slot. Reading only
+the FIRST `(keyword, value)` pair per node — the pre-#6484 `Keys[1]`/`Keys[2]` /
+`Children[0]` read — undercounted a rule whose two targets COLLAPSE onto one
+node/child and let it escape: the free-form `static-nat` leaf packs a one-line
+`prefix <ip> prefix-name POOL` / `prefix <ip> inet` / `prefix <ip> prefix <ip2>`
+onto a SINGLE child's Keys, and a hierarchical `prefix { <ip>; <ip2>; }` carries
+two prefix values as grandchildren of ONE `prefix` keyword — all counted 1 and
+ACCEPTED on master (the #6484 MAJOR). The full traversal registers every distinct
+`(keyword, value)` identity across the whole leaf, so these now count 2 and
+reject. A **lexer-collapsed bracketed list** `prefix [ X Y ]` / `prefix-name
+[ A B ]` / `nptv6-prefix [ P6a P6b ]` (#2419 strips the brackets onto one leaf's
+Keys — `["prefix","X","Y"]`) is the same escape in packed form: the round-2
+counter registers EVERY packed value after a target keyword as a distinct target,
+not just the first, so a two-value bracketed list rejects (the round-1 walk
+consumed only the first value and let the rest fall through — a residual #6484
+escape). Two role subtleties make the walk correct: (1) a `prefix-name` value is
+an OPAQUE address-book name that is ALWAYS its value — so `prefix-name mapped-port`
+(a pool literally NAMED "mapped-port") registers a genuine target, not a modifier
+carrier (the pre-#6484 counter wrongly pre-filtered a value equal to a modifier
+keyword and DISCARDED that target). For a packed prefix-name the FIRST token is
+always consumed as the name; only a FOLLOWING keyword lexeme ends the packed-name
+run. (2) a `prefix` / `nptv6-prefix` value is an IP that can never be a modifier
+keyword, so a FOLLOWING `mapped-port` / `routing-instance` IS a modifier carrier
+(the canonical separate-set-line `prefix mapped-port <port>` form) and registers
+no second target. The grandchild walk applies the SAME slot classification: for a
+bare hierarchical `prefix-name { POOL; mapped-port 8080; }` the FIRST grandchild
+is the opaque name (`POOL`) and a LATER modifier grandchild (`mapped-port` /
+`routing-instance`) is skipped — so the rule counts ONE target, not two. The
+round-1 grandchild walk registered EVERY grandchild of a name-valued bare keyword
+as a target, counting `POOL` and `mapped-port` as two and FALSE-REJECTING a valid
+single-target rule that origin/master accepted (the round-2 second finding).
+Counting DISTINCT identities (not occurrences) keeps the canonical "restate the
+target to attach a mapped-port" form — `then static-nat prefix-name N` + `then
+static-nat prefix-name N mapped-port 8080` — a single target (both restatements
+share identity `prefix-name\x00N`). Rejecting the multi-target rule
+outright is the Junos-faithful closure and FORECLOSES the #6479 dropped-target
+mapped-port residual as a side effect (the rule never compiles, so no
+dropped-target modifier can slip). The gate runs in `runTailGates` AFTER the
+host-mask (#2173) and NPTv6 (#2240/#5818) gates, so a rule that ALSO carries a
+malformed `mapped-port` or a bad nptv6 prefix reports that concrete token first
+(the multi-target defect is still caught on the next compile once the token is
+fixed — never masked). Strict on commit / commit-check (hard reject); the
+tolerant load / peer-sync path downgrades to a warning (#1960 no-brick) — the
+compiler still lowers the single honored target, so a leniently-loaded config is
+no worse than before the gate. A well-formed single-target rule (any of the four,
+in any authoring shape, with or without a `mapped-port` / `routing-instance`
+modifier) is unaffected. Tests: `static_nat_multitarget_6483_test.go`.
+
 **The systematic per-subtree closure continues (#4313).** Each of the flips
 above (destination-NAT then, the three IPsec option containers, master-password,
 the Phase-1 IKE proposal, now the Phase-2 IPsec proposal and the two
@@ -1779,7 +2181,25 @@ rather than silently dropped:
 - disjunction (`|`, e.g. `"ack | rst"`) — not a single required/forbidden pair;
 - a negated parenthesized group (`!(...)`) — a disjunction by De Morgan;
 - an unrecognized flag token;
-- a flag that is both required and forbidden (the term could never match).
+- a flag that is both required and forbidden (the term could never match);
+- an operator-only / empty-operand / dangling-`&` or dangling-`!` expression
+  that sets no flag bits (`"&"`, `"()"`, `"syn &"`, `"syn & !"`) — it would
+  otherwise match every TCP segment (#4714/#5455, fail-open);
+- an unbalanced or reversed parenthesis (`"(syn"`, `"syn)"`, `"syn)("`) — the
+  grouping parens are redundant, so before C180-024 they were stripped
+  unconditionally and a malformed value committed as if they were absent.
+  Balanced groups, including nested ones (`"((syn & !ack))"`), stay accepted;
+- a misordered group — an operand directly juxtaposed against another operand
+  with no `&` between them. Both directions are now rejected symmetrically: a
+  closed group followed by an operand (`"(syn)ack"`, `"(syn)(ack)"`,
+  `"(syn)!ack"`) **and** the mirror, a flag followed by a `(` group
+  (`"syn(ack)"`, `"ack(syn)"`, `"syn (ack)"`, `"syn(&ack)"`). A group is an
+  operand, so it must be joined to a preceding flag with `&` (`"syn & (ack)"`).
+  Before the mirror guard the flag-then-group forms parsed as a plain
+  conjunction and committed; `"syn(&ack)"` additionally leaked the outer flag's
+  presence into the inner group and let its leading `&` pass. A group that
+  itself leads with `&`/`)` (`"(&ack)"`, `"(&)"`, `"((&syn))"`) stays rejected
+  by the empty-left-operand checks.
 
 This is the #3076 fix: before it, the schema accepted any `tcp-flags` token
 (the leaf is `multi: true` with no value validator) and the snapshot builder's
@@ -1827,6 +2247,35 @@ Fail-on-revert: `TestFilterICMPTypeNameResolves{V4,V6}_3205`,
 `TestFilterUnknown{ICMPType,Port}Rejected_3205`,
 `TestFilterNamedPortExceptResolves_3205` in
 `pkg/config/firewall_symbolic_match_3205_test.go`.
+
+The #3205 kept-verbatim channel had a residual fail-open (#6459/#6463): on the
+tolerant path the Rust filter compiler dropped an unresolvable port token (or
+a malformed literal address token) PER-TOKEN, so a PARTIALLY-bad list still
+built a matcher over the surviving subset — a `then discard`/`reject` term
+silently enforced a NARROWER set than the operator wrote (the rest fell
+through to the implicit accept). The all-unresolvable case already failed
+closed at match-time (#2400/#3205); the partial case now carries fail-closed
+wire markers, same shape as the #3406 ICMP/DSCP family: the snapshot builder
+sets `ports_unrepresentable` from `UnknownPorts` and
+`address_unrepresentable` from `UnknownAddresses` (recorded by
+`recordFilterAddrTokens` via the shared `classifyFilterAddrFamily`), and the
+Rust `parse_term` rejects the WHOLE snapshot
+(`SnapshotIntegrityError::UnrepresentableFilterPorts` /
+`UnrepresentableFilterAddress`). The strict gates
+(`validateFilterMatchValuesStrict`, `validateFilterAddressLiteralsStrict`)
+remain the primary defense; the markers guard the lenient / peer-synced /
+hand-built / version-drifted snapshot. Sibling parser alignment (#6477): the
+Rust filter-side `parse_port_spec` now routes through the shared digit-only
+`parse_port_u16` (#3606), so all four port parsers (Go commit gate, Go
+capability gate, policy-side Rust, filter-side Rust) reject the same
+non-canonical tokens (e.g. `+80`). Fail-on-revert:
+`TestFilterSnapshot*Unrepresentable*` /
+`TestFilterSnapshotLenientPartial{Port,Address}List*` (Go,
+`pkg/dataplane/userspace/filters_snapshot_integrity_6459_test.go`),
+`TestFilterMalformedAddressRecorded_6463` (Go,
+`pkg/config/firewall_address_unknown_6463_test.go`), and
+`ports_unrepresentable_marker_*` / `address_unrepresentable_marker_*` /
+`filter_parse_port_spec_rejects_signed_6477` (Rust).
 
 ### `firewall ... from` cross-field satisfiability — port/tcp-flags/icmp must match the protocol (#3723)
 
@@ -3253,6 +3702,18 @@ reserved for whole-dataplane selection where a rewrite shim
     The accepted sets are EXACTLY the generator-recognized values (a value the
     generator handles but the enum omitted would be a false-reject regression).
     A typo is now rejected at commit with an error naming the bad value.
+  - **#5649 (IPsec VPN `df-bit` enum, codex-181 C181-M22):** the `security
+    ipsec vpn <v> df-bit` leaf was untyped free-form (`args:1`, no validator),
+    so a typo committed clean and was then silently dropped by the swanctl
+    generator — the same MEDIUM footgun class as #3896. `df-bit` is now
+    `ValidateEnum([copy, set, clear])`, matching the `pkg/ipsec/policy.go`
+    renderer switch EXACTLY: it emits `copy_df = yes` for `copy`/`set` and
+    `copy_df = no` for `clear`, and OMITS `copy_df` for any other spelling.
+    An intended `clear` typed as `cler` therefore left strongSwan's copy-DF
+    default in force (the opposite of `clear`) and could blackhole oversized
+    encapsulated packets via PMTUD while commit reported success. This is the
+    input-domain gate the #4015 valid-token `set`/`clear` mapping fix and the
+    #4301 `establish-tunnels` enum did not cover.
   - **#2404 (responder-only / dynamic-IP peer):** the `security ike gateway
     <g> dynamic` node now declares a `hostname <fqdn>` child (it was a
     `children: nil` leaf in both the `ike` and `ipsec` stanza copies of the
@@ -3281,15 +3742,116 @@ reserved for whole-dataplane selection where a rewrite shim
     `... routing-instance <ri>` (#4292) all collapse onto ONE leaf node and
     SetPath grouping is preserved); the
     `mapped-port` token therefore bypasses the schema value validator and
-    is range-checked in the compiler (`validateNATHostMaskStrict`,
-    `compiler_nat.go`), which ALSO rejects a `mapped-port` with no
-    matching `match destination-port` (the reverse SNAT could not recover
-    the original port) AND the mirror half-config — a `match
-    destination-port` with no `mapped-port` (#2769). The port-match-without-
+    is validated in the compiler (`validateNATHostMaskStrict`,
+    `compiler_nat.go`): the compiler records an explicit presence signal
+    (`StaticNATRule.MappedPortPresent`) alongside the parsed port and the
+    raw token, and a PRESENT mapped-port whose value is not a valid
+    1..65535 port is rejected as malformed (C179-038 + fold). One gate
+    covers every sentinel-collision sibling: a non-numeric token
+    (`notaport`), an empty operand (`mapped-port ""`), a bare `mapped-port`
+    with no operand, the literal `0`, and an out-of-range number
+    (`70000`). Before the presence signal these all collapsed silently to
+    `MappedPort==0`/"no port translation" (the int/string sentinels could
+    not tell "absent" from "present-but-malformed"), so a garbage token was
+    accepted even though a well-formed value in the same position without a
+    `match destination-port` is rejected. The strict error names the
+    offending token from `MappedPortRaw` (or `(missing value)` when the
+    operand is empty/bare); `MappedPortRaw` and `MappedPortPresent` are
+    compile-only (`json:"-"`) and never cross the dataplane wire. A valid
+    in-range mapped-port is still rejected when it has no matching `match
+    destination-port` (the reverse SNAT could not recover the original
+    port), AND the mirror half-config — a `match destination-port` with no
+    `mapped-port` (#2769) — is rejected. The port-match-without-
     mapped-port form is a port-scoped 1:1 (no port translation); rejecting
     it at strict commit-check forces the operator to either drop the port
-    match (a whole-address 1:1) or add a `mapped-port` (a port forward). If
-    such a rule slips through the lenient load / peer-sync path, the Rust
+    match (a whole-address 1:1) or add a `mapped-port` (a port forward).
+    Two refinements land in the #6479 fold. First,
+    `staticNATMappedPortForNode` gathers every `mapped-port` operand
+    attached to a `then static-nat` node across EVERY Junos AST shape, into
+    ONE list folded through `combineMappedPortOperands` exactly once:
+      - the collapsed one-line `prefix <ip> mapped-port <port>` leaf;
+      - the CANONICAL separate-set-line form — Juniper documents mapped-port
+        as a sub-statement of `prefix`, authored as two set lines
+        (`... prefix 10.0.0.5/32` + `... prefix mapped-port 8080`) that
+        SetPath collapses to a distinct leaf `Keys=["prefix","mapped-port",
+        "8080"]`, mapped-port immediately following the literal `prefix`;
+      - the CANONICAL hierarchical nested form — `prefix <ip> { mapped-port
+        P; }` / `prefix { <ip>; mapped-port P; }`, where mapped-port is a
+        CHILD of the `prefix` node (a grandchild of `static-nat`), scanned
+        via the target child's `Children`, not just its `Keys`;
+      - a `prefix-name <name> mapped-port <port>` target (#4290) — the
+        prefix-name compile branch feeds `staticNATMappedPortForNode` too,
+        so a prefix-name-scoped mapped-port is gated identically;
+      - a hierarchical `static-nat { prefix X; mapped-port P; }` sibling,
+        scanning ALL operands of a packed `mapped-port a mapped-port b`
+        child (not just the first);
+      - AND every child of a duplicate split across two
+        `then static-nat prefix <ip> mapped-port <p>` set lines.
+    Duplicate operands are last-wins ONLY when they are all valid in-range
+    numbers (`mapped-port 8080 mapped-port 9090` → 9090); a contradictory
+    duplicate in ANY shape or ACROSS nodes (e.g. `mapped-port 8080
+    mapped-port notaport`) fails closed — any malformed occurrence zeroes
+    the port and the strict gate names the bad token, with no first-wins
+    gate that could let a later malformed duplicate slip past an earlier
+    valid one. Across MULTIPLE `static-nat` sibling targets in ONE `then`
+    block (the hierarchical `then { static-nat {…} static-nat {…} }` shape,
+    which Junos merges into one action), each sibling's reading folds
+    through `mergeMappedPortState`, which OR-accumulates presence and
+    LATCHES fail-closed on any malformed operand — so a later clean sibling
+    can no longer overwrite an earlier sibling's presence/malformed stamp
+    back to false (the #6479 multi-block silent-accept, closed in BOTH the
+    nptv6 and the prefix/prefix-name branches). A MODIFIER-ONLY `static-nat`
+    sibling (a `static-nat {…}` block carrying ONLY a `mapped-port`, with no
+    `prefix`/`prefix-name`/`nptv6-prefix`/`inet` target) is routed through the
+    same accumulator by a catch-all `else` branch in `compileNATStatic`, so
+    its malformed operand fails closed in either sibling order and even when a
+    co-sibling is a clean nptv6 target — previously it matched no target
+    branch and reached no validator (the #6479 modifier-only silent-accept).
+    This sibling accumulation is
+    scoped WITHIN one `then` block; SEPARATE `then {}` blocks remain #3850
+    last-then-block-wins (a whole superseded block is dead config, not part
+    of the effective action). NOTE on duplicate resolution: the all-valid
+    duplicate last-wins (`mapped-port 8080 mapped-port 9090` → 9090) is the
+    INTENTIONAL disposition of a contradictory duplicate and DIFFERS from
+    origin/master's first-wins (8080). It is not a working-config
+    regression — a duplicate mapped-port on one target is malformed
+    authoring, defensible either way — and last-wins is chosen for
+    consistency with the Junos duplicate-stanza rule the rest of this fold
+    already follows. The scan is grammar-ROLE-aware
+    (`staticNATMappedPortOperandsFromKeys`): it walks the collapsed key
+    stream tracking whether each position is a KEYWORD slot or a consumed
+    VALUE slot, and a `mapped-port` counts as the modifier ONLY in a keyword
+    slot. A NAME-valued keyword (`mappedPortNameValuedKeywords`:
+    `routing-instance`, `prefix-name`) CONSUMES its following token as an
+    opaque name, so a `mapped-port` in that consumed slot is the name — a
+    translation-target routing-instance NAMED `mapped-port`
+    (`... routing-instance mapped-port`, #4292) or a prefix-name entry NAMED
+    `mapped-port` compiles clean instead of being falsely rejected as a bare
+    mapped-port. Because it is the SLOT (keyword vs value) that decides, never
+    the neighbouring text, a target whose NAME is itself literally
+    `prefix-name` or `routing-instance`
+    (`prefix-name prefix-name mapped-port <bad>`) no longer fools the scan:
+    the earlier LEXEME-only lookbehind saw the preceding token `prefix-name`
+    and wrongly skipped the real modifier, silently accepting a malformed
+    port (the #6479 root cause); the role-aware walk consumes that name as the
+    prefix-name VALUE and reads the following `mapped-port` as the
+    keyword-slot modifier. `prefix` and `nptv6-prefix` are deliberately NOT
+    name-valued: their value is ALWAYS an IP and can never be the string
+    `mapped-port`, so the scan does not consume-and-shadow the token after
+    them and `prefix mapped-port <port>` / `nptv6-prefix mapped-port <port>`
+    (the canonical separate-set-line modifiers) are recovered. A round-4
+    over-defensive addition of `prefix` to the name-valued set — and its
+    `nptv6-prefix` sibling — broke those canonical forms (false-rejecting the
+    clean rule and reopening the C179-038 fail-open, the nptv6 one so
+    `validateNPTv6Strict` never fired); #6479 keeps both out. Second, the
+    port-match-without-mapped-port (#2769) gate is guarded on
+    `!MappedPortPresent` so it fires ONLY on a
+    true absence: a present-but-malformed mapped-port that also carries a
+    `match destination-port` is owned solely by the presence gate (which
+    names the token), never double-reported by the absence gate — which,
+    emitting first, would otherwise mask the accurate "not a valid port
+    number" message in strict mode and add a second warning in lenient mode.
+    If such a rule slips through the lenient load / peer-sync path, the Rust
     dataplane backstop (`static_nat.rs from_snapshots`) keys the reverse
     SNAT on `(internal_ip, Some(match_dst_port))` rather than
     `(internal_ip, None)`, keeping the source translation scoped to the one
@@ -3301,6 +3863,42 @@ reserved for whole-dataplane selection where a rewrite shim
     plus a port-less whole-address 1:1 rule (the dataplane keys the
     static-NAT tables by `(IP, Option<port>)` and falls back to the
     port-less entry).
+    The #5523/#6479 shape-completeness fold closes the last authoring
+    shapes a mapped-port could take. **NPTv6 + mapped-port is rejected on
+    PRESENCE.** NPTv6 (RFC 6296) translates the IPv6 address prefix and has
+    no transport-port concept, and the host-mask loop
+    (`validateNATHostMaskStrict`) skips nptv6 rules entirely, so a
+    `then static-nat nptv6-prefix <p6> mapped-port <p>` in ANY shape
+    (collapsed keys, hierarchical nptv6-prefix child, or a distinct
+    `mapped-port` sibling) previously reached NO validator — a malformed
+    operand was silently accepted and a well-formed one silently ignored.
+    `recordNPTv6MappedPortPresence` (`compiler_nat_static.go`) now stamps
+    `MappedPortPresent` on the nptv6 branches while keeping `MappedPort==0`
+    (no bogus port on the port-less nptv6 path), and `validateNPTv6Strict`
+    rejects a present mapped-port on an nptv6 rule regardless of value (even
+    a well-formed 1-65535 port is meaningless on nptv6) — strict error,
+    lenient warning, with the nptv6 prefix translation itself still applied.
+    The remaining flagged shapes are fail-safe without new code: the
+    modifier-first ordering `... prefix mapped-port <p>` authored BEFORE the
+    `... prefix <ip>` set line makes the modifier line's `prefix` keyword
+    take the value `mapped-port`, so the target resolves to the literal
+    `"mapped-port"` (not an IP) and the rule fails closed on the target;
+    a `prefix-name` mapped-port must RESTATE the name on the same statement
+    (`prefix-name N mapped-port P`) — the non-restated two-line form
+    `prefix-name N` + `prefix-name mapped-port P` parses `mapped-port` into
+    the name slot (name-valued skip), recovering no port and installing none
+    (a plain prefix-name 1:1, matching origin/master); and a range operand
+    (`mapped-port 8080-8090`) is a single non-numeric token that
+    `combineMappedPortOperands` fails closed on. In every shape a
+    present-but-malformed mapped-port is surfaced (strict reject / lenient
+    warn), never silently accepted, and no bogus non-zero port is installed.
+    The one residual this fold could not reach — a malformed mapped-port riding
+    ONLY on a target the compiler DROPS when a rule declares more than one
+    translation target (the dropped target's node is never the one the
+    mapped-port fold reads) — is closed by the single-target cardinality gate
+    (#6483, `validateStaticNATSingleTargetStrict`): a multi-target static-nat
+    rule is rejected outright, so no dropped-target modifier can slip. See "A
+    static-NAT rule has EXACTLY ONE translation target" above.
   - `security nat source/destination rule-set rule match
     destination-address-name <book-entry>` (#3229) — the destination twin
     of the `source-address-name` leaf (#2416). It references an
@@ -5702,7 +6300,7 @@ positive port slices, both AST shapes).
 
 **Wire + dataplane.** Two additive wire fields on `FirewallTermSnapshot` —
 `source_ports_except` / `destination_ports_except` (Go
-`pkg/dataplane/userspace/protocol.go`, Rust `protocol/security.rs`,
+`pkg/dataplane/userspace/protocol_policies.go`, Rust `protocol/security.rs`,
 `serde(default)` for #1961 mixed-version parity). The Rust compiler
 (`filter/compiler.rs`) selects ONE port spec list per direction — the
 positive list if it carries real entries, otherwise the `-except` list — and

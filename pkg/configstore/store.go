@@ -215,14 +215,33 @@ type Store struct {
 	archiveDir string // local archive directory (empty = disabled)
 	archiveMax int    // max archives to keep
 
-	// archiveSeq is a monotonic per-process counter appended to every
-	// archive filename (#3441 H4, Codex MAJOR). The wall-clock timestamp
-	// alone is not a unique key: two successive (mutex-serialized) commits
-	// can format the SAME nanosecond under a coarse clock or an NTP
-	// step-back, and the later atomic write would overwrite the earlier
-	// archive. The seq always advances, so config-<ts>.<seq>.conf is unique
-	// even on an identical timestamp; the ts still gives chronological
-	// sort/prune order (it dominates the lexical compare).
+	// archiveSeedDir is the archive dir for which the archiveSeq reseed scan
+	// last SUCCEEDED (#6396 Codex MINOR 4). ensureArchiveSeededLocked scans a
+	// dir only when it differs from this. #6404: the reseed retry is driven not
+	// only by an explicit SetArchiveConfig call but by the archiving commit path
+	// itself (edge 1), which re-scans before capturing its seq; and if that scan
+	// is still failing the commit SKIPS its archive (the counter is unconfirmed)
+	// rather than write a below-max seq rotation would prune. This marker is
+	// CLEARED on every genuine scan failure (so a stale marker is never trusted
+	// after navigating to a dir that fails to scan — A→failed-B→A re-scans A) and
+	// on disable (SetArchiveConfig("") — so a disable→re-enable to the same dir
+	// re-scans to pick up any on-disk max that advanced while archival was off,
+	// edge 2). A nonexistent dir (first use) is recorded here as CONFIRMED-empty,
+	// not a failure — seq 0 is correct and the write path creates the dir.
+	archiveSeedDir string
+
+	// archiveSeq is a monotonic counter appended to every archive filename
+	// (#3441 H4, Codex MAJOR). The wall-clock timestamp alone is not a unique
+	// key: two successive (mutex-serialized) commits can format the SAME
+	// nanosecond under a coarse clock or an NTP step-back, and the later atomic
+	// write would overwrite the earlier archive. The seq always advances, so
+	// config-<ts>.<seq>.conf is unique even on an identical timestamp; the seq
+	// (not the ts) is the retention/prune key rotateArchives uses (#5523
+	// C179-060). It is a per-PROCESS counter that restarts at 0, so
+	// SetArchiveConfig seeds it from the highest seq on disk at startup, making
+	// it globally monotonic across restarts — otherwise a fresh process's
+	// low-seq archives would be pruned in favor of a prior process's stale
+	// high-seq ones.
 	archiveSeq atomic.Uint64
 
 	// archiveWG tracks the in-flight async auto-archive writer goroutines
@@ -788,4 +807,43 @@ func (s *Store) ActiveApplied() bool {
 		return false
 	}
 	return s.appliedDigest == configTextDigest(s.active.Format())
+}
+
+// ActiveDigest returns the convergence digest of the CURRENT active config
+// text — exactly the value ActiveApplied() compares appliedDigest against
+// (configTextDigest(s.active.Format()), the ShowActive render). It lets a
+// caller CAPTURE the digest of the config it is about to apply, under its own
+// apply serialization, and stamp that captured value later via
+// MarkAppliedDigest — instead of re-reading s.active at stamp time. A concurrent
+// promoter (a local commit / commit-confirmed rollback) that mutated s.active
+// between the apply and a post-serialization stamp would otherwise make
+// MarkActiveApplied key the marker to a different, never-applied tree (the #6296
+// TOCTOU). Empty when active is nil (nothing to have applied).
+func (s *Store) ActiveDigest() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.active == nil {
+		return ""
+	}
+	return configTextDigest(s.active.Format())
+}
+
+// MarkAppliedDigest records that the config whose convergence digest is
+// `digest` has completed a full apply to the dataplane/kernel (#6296). Unlike
+// MarkActiveApplied — which re-reads s.active at call time — it stamps a digest
+// the caller captured earlier (via ActiveDigest) for the exact tree it applied.
+// So a stamp taken after the apply serialization is released, or one racing a
+// concurrent promoter that mutated s.active in that window, cannot key the
+// marker to a different, never-applied tree. The cluster config-sync path
+// (daemon.syncAndApply) captures the digest right after SyncApply promotes the
+// peer config — while still holding the apply semaphore — and replays it here on
+// full success. An empty digest is a no-op (nothing was captured / applied); it
+// deliberately does NOT clear a prior digest.
+func (s *Store) MarkAppliedDigest(digest string) {
+	if digest == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.appliedDigest = digest
 }

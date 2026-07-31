@@ -135,12 +135,19 @@ pub(crate) struct FirewallFilterSnapshot {
 //       lookup. File a tracker issue against session/key.rs.
 //
 //   (b) NOT in cache key (cache-sensitive) — wire the #1430
-//       runbook: per-interface FilterState.iface_filter_v{4,6}_has_<X>_match
-//       set, Filter.has_<X>_match_terms aggregate flag, flow-cache
-//       insertion gate at afxdp/flow_cache.rs:297-309, established-
-//       session re-evaluation at afxdp/poll_descriptor/mod.rs:217-244,
-//       forwarding rotation purge at afxdp/worker/loop_body/mod.rs:295-330,
-//       and tests at afxdp/flow_cache_tests.rs.
+//       runbook: Filter.has_<X>_match_terms flag (read per-interface
+//       off FilterState.iface_filter_v{4,6}_fast via the
+//       interface_input_filter_has_<X>_match accessor — the parallel
+//       per-interface has_<X>_match sets were deleted in #6236 PR-2B),
+//       flow-cache insertion gate at afxdp/flow_cache.rs (per-flag,
+//       input + output direction), established-session re-evaluation at
+//       afxdp/poll_descriptor/filter.rs (the DSCP + per-packet-L4
+//       prechecks fold to ONE lookup of
+//       interface_input_filter_varies_per_packet — the
+//       Filter.varies_per_packet_within_flow() OR core — since #6236
+//       PR-2C), forwarding rotation purge at
+//       afxdp/worker/loop_body/mod.rs, and tests at
+//       afxdp/flow_cache_tests.rs.
 //
 // Skipping this classification SILENTLY breaks flow-cache: a
 // first-packet decision gets reused for later packets that can
@@ -299,6 +306,35 @@ pub(crate) struct FirewallTermSnapshot {
     // keeps wire parity with an older control plane that omits the field (#1961).
     #[serde(rename = "dscp_match_unrepresentable", default)]
     pub dscp_match_unrepresentable: bool,
+    // ports_unrepresentable (#6459) is set by the Go control plane when the
+    // term carried a `from {source,destination}-port[-except]` token it could
+    // not resolve to a number (an unknown service name, a malformed range, or
+    // a non-canonical token such as "+80"; recorded on term.UnknownPorts). The
+    // token is kept VERBATIM in the wire port lists, and the pre-fix filter
+    // compiler dropped it PER-TOKEN (`filter_map(parse_port_spec)`): a
+    // PARTIALLY-unresolvable list then built a matcher over only the surviving
+    // subset — a `then discard`/`reject` term silently enforced a NARROWER
+    // port set than the operator wrote (fail-OPEN via fall-through to the
+    // implicit accept). With this flag the filter compiler raises
+    // SnapshotIntegrityError::UnrepresentableFilterPorts and rejects the whole
+    // snapshot. serde(default) keeps wire parity with an older control plane
+    // that omits the field (#1961).
+    #[serde(rename = "ports_unrepresentable", default)]
+    pub ports_unrepresentable: bool,
+    // address_unrepresentable (#6463) is set by the Go control plane when the
+    // term carried a literal `from source-address` / `destination-address`
+    // token that is not a parseable IP/CIDR (classifyFilterAddrFamily rejects
+    // it; recorded on term.UnknownAddresses). The pre-fix `parse_address`
+    // dropped such a token PER-TOKEN (its `Err(_)` arm pushed nothing): a
+    // PARTIALLY-malformed list then matched only the surviving prefixes — a
+    // `then discard`/`reject` term silently enforced a NARROWER address set
+    // than the operator wrote (fail-OPEN via fall-through to the implicit
+    // accept). With this flag the filter compiler raises
+    // SnapshotIntegrityError::UnrepresentableFilterAddress and rejects the
+    // whole snapshot. serde(default) keeps wire parity with an older control
+    // plane that omits the field (#1961).
+    #[serde(rename = "address_unrepresentable", default)]
+    pub address_unrepresentable: bool,
     // flex_match is the Junos `from flexible-match-range` byte-offset match
     // (#3077). It was parsed + compiled for the retired legacy dataplane but
     // dropped on the userspace wire, so the byte-offset constraint vanished and

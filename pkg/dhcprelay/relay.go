@@ -725,6 +725,18 @@ func computeDesired(cfg *config.DHCPRelayConfig) map[string]desiredRelay {
 					"group", group.Name, "server", s)
 				continue
 			}
+			// The relay listener binds udp4 (ListenPacket "udp4" above), so
+			// a helper server address MUST be IPv4. net.ParseIP happily
+			// accepts an IPv6 literal, which would then be handed to a
+			// udp4 socket and fail silently per-packet at forward time.
+			// Reject it here — consistent with the invalid-IP path — so a
+			// misconfigured IPv6 server is dropped loudly at build time
+			// rather than blackholing relayed DISCOVERs (#5557).
+			if ip.To4() == nil {
+				slog.Warn("dhcp-relay: ignoring non-IPv4 server (DHCPv4 relay binds udp4)",
+					"group", group.Name, "server", s)
+				continue
+			}
 			serverIPs = append(serverIPs, s)
 			serverAddrs = append(serverAddrs, &net.UDPAddr{IP: ip, Port: relayPort})
 		}

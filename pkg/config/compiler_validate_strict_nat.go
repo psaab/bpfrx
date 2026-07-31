@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math"
 	"net"
@@ -1412,7 +1413,15 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			// forward). The dataplane backstop (static_nat.rs) keeps the
 			// reverse SNAT scoped to the matched port if the rule slips through
 			// the lenient load / peer-sync path.
-			if rule.MatchDestinationPort != 0 && rule.MappedPort == 0 {
+			//
+			// #6479 fold: guard on !MappedPortPresent so this fires ONLY on a
+			// TRUE absence. A PRESENT-but-malformed mapped-port (`mapped-port
+			// 0`/``/bare/`notaport`) also lands at MappedPort==0, but it is the
+			// presence gate below that owns that case (naming the bad token).
+			// Without this guard both gates fire — two warnings in lenient mode,
+			// and in strict the misleading "requires a mapped-port" message
+			// (emitted first) wins over the accurate "not a valid port number".
+			if rule.MatchDestinationPort != 0 && rule.MappedPort == 0 && !rule.MappedPortPresent {
 				if err := emitSuffix(fmt.Sprintf(
 					"security nat static rule-set %q rule %q match destination-port %d requires a matching `then static-nat mapped-port` (a port match without a port translation either broadens or scopes the reverse source-NAT in a non-obvious way; drop the port match for a whole-address 1:1, or add a mapped-port for a port forward)",
 					rs.Name, rule.Name, rule.MatchDestinationPort),
@@ -1420,22 +1429,50 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 					return nil, err
 				}
 			}
-			if rule.MappedPort != 0 {
-				if rule.MappedPort < 1 || rule.MappedPort > 65535 {
-					if err := emitSuffix(fmt.Sprintf(
-						"security nat static rule-set %q rule %q then static-nat mapped-port %d is out of range (1-65535)",
-						rs.Name, rule.Name, rule.MappedPort),
-						" (ignored: port translation dropped by dataplane until corrected)"); err != nil {
-						return nil, err
-					}
+			// C179-038 + fold: a PRESENT `then static-nat mapped-port <token>`
+			// rides inside the children:nil static-nat leaf, bypassing the
+			// schema value validator. The compiler records an explicit presence
+			// signal (MappedPortPresent) plus the parsed port (MappedPort, 0
+			// when absent OR malformed) and the raw token (MappedPortRaw). This
+			// ONE gate rejects every present-but-not-1-65535 sibling the earlier
+			// string/int sentinels let slip: a non-numeric token ("notaport"),
+			// an empty operand (`mapped-port ""`), a bare keyword with no
+			// operand, the literal "0", and an out-of-range number ("70000").
+			// All previously collapsed to MappedPort==0-or-out-of-range with no
+			// diagnostic under the old `MappedPortRaw != ""` / `MappedPort != 0`
+			// gates (MappedPort==0 conflated "absent" with "present-but-
+			// malformed"; MappedPortRaw=="" conflated "absent" with "present-
+			// but-empty"), so the value silently degraded to "no port
+			// translation" even though a WELL-FORMED value in the same position
+			// without a `match destination-port` IS rejected. The lenient load /
+			// peer-sync path (#1960 no-brick) downgrades this to a warning and
+			// the dataplane installs a plain 1:1 (MappedPort==0, no bogus port).
+			// MappedPortPresent is compile-only (json:"-") and never reaches the
+			// dataplane.
+			if rule.MappedPortPresent && (rule.MappedPort < 1 || rule.MappedPort > 65535) {
+				token := "(missing value)"
+				if rule.MappedPortRaw != "" {
+					token = fmt.Sprintf("%q", rule.MappedPortRaw)
 				}
-				if rule.MatchDestinationPort == 0 {
-					if err := emitSuffix(fmt.Sprintf(
-						"security nat static rule-set %q rule %q then static-nat mapped-port %d requires a matching `match destination-port`",
-						rs.Name, rule.Name, rule.MappedPort),
-						" (ignored: port translation dropped by dataplane until corrected)"); err != nil {
-						return nil, err
-					}
+				if err := emitSuffix(fmt.Sprintf(
+					"security nat static rule-set %q rule %q then static-nat mapped-port %s is not a valid port number (1-65535)",
+					rs.Name, rule.Name, token),
+					" (ignored: port translation dropped by dataplane until corrected)"); err != nil {
+					return nil, err
+				}
+			}
+			// A VALID in-range mapped-port still requires a matching `match
+			// destination-port`: without an external port to match, the port
+			// rewrite has no inbound trigger and the reverse SNAT cannot recover
+			// the original port. Guarded on MappedPort != 0 so it does not
+			// double-fire on a malformed mapped-port (MappedPort==0), which the
+			// presence gate above already rejected.
+			if rule.MappedPort != 0 && rule.MatchDestinationPort == 0 {
+				if err := emitSuffix(fmt.Sprintf(
+					"security nat static rule-set %q rule %q then static-nat mapped-port %d requires a matching `match destination-port`",
+					rs.Name, rule.Name, rule.MappedPort),
+					" (ignored: port translation dropped by dataplane until corrected)"); err != nil {
+					return nil, err
 				}
 			}
 		}
@@ -1553,6 +1590,35 @@ func validateNPTv6Strict(cfg *Config, lenient bool) ([]string, error) {
 		for _, rule := range rs.Rules {
 			if rule == nil || !rule.IsNPTv6 {
 				continue
+			}
+
+			// #5523/#6479: NPTv6 (RFC 6296) translates the IPv6 address prefix
+			// and has NO transport-port concept, so a `then static-nat
+			// nptv6-prefix <p6> mapped-port <p>` is invalid in EVERY shape
+			// (collapsed keys, hierarchical nptv6-prefix child, or a distinct
+			// `mapped-port` sibling). The host-mask loop skips nptv6 rules
+			// entirely (`IsNPTv6` continue), so WITHOUT this gate a mapped-port
+			// on an nptv6 rule reached no validator at all: a malformed operand
+			// was silently accepted (the C179-038 class for the nptv6 shape) and
+			// a well-formed one was silently ignored. recordNPTv6MappedPort-
+			// Presence stamps MappedPortPresent whenever the keyword appears, so
+			// reject on PRESENCE alone — the value is irrelevant on nptv6, even a
+			// well-formed 1-65535 port is meaningless. This runs BEFORE the
+			// prefix-parse/length checks so it fires even when the prefixes are
+			// otherwise valid (the pure silent-accept case). No `continue`: on the
+			// lenient no-brick path the prefix diagnostics still accumulate, and
+			// the nptv6 prefix translation itself still applies (MappedPort==0),
+			// so this warning is scoped to the dropped mapped-port, not the rule.
+			if rule.MappedPortPresent {
+				msg := fmt.Sprintf(
+					"security nat static rule-set %q rule %q then static-nat nptv6-prefix does not support mapped-port (NPTv6 translates the address prefix per RFC 6296, not transport ports); remove the mapped-port",
+					rs.Name, rule.Name)
+				if lenient {
+					warnings = append(warnings, msg+
+						" (ignored: mapped-port dropped by dataplane; the nptv6 prefix translation still applies)")
+				} else {
+					return nil, fmt.Errorf("%s", msg)
+				}
 			}
 
 			// External prefix = `match destination-address`. The family is
@@ -2074,6 +2140,69 @@ func validateStaticNATInetTargetStrict(cfg *Config) error {
 	return nil
 }
 
+// validateStaticNATSingleTargetStrict (#6483) hard-rejects a static-NAT rule
+// that declares MORE THAN ONE translation target. A Junos static-nat rule maps
+// to EXACTLY ONE of `prefix <ip>` | `prefix-name <name>` | `nptv6-prefix <p6>` |
+// `inet`; authoring two or more (e.g. `then static-nat prefix <ip>` plus `then
+// static-nat prefix-name <pool>`, or an `inet` sibling alongside a `prefix`
+// sibling) is invalid.
+//
+// The compiler otherwise silently ACCEPTED such a rule: the compileNATStatic
+// child loop honors the FIRST target it matches by a fixed priority
+// (nptv6-prefix > prefix-name > prefix > inet) and drops the rest, and because
+// prefix / inet / nptv6-prefix all land in the shared Then field a later target
+// simply overwrites an earlier one — so the rule compiled to a single arbitrary
+// target with no operator feedback (`inet` + `prefix` even installs as a plain
+// prefix rule, evading the #5859 inet reject). Dropping a target this way also
+// dropped any `mapped-port` that rode ONLY on the discarded target — the
+// #6479/C179-038 residual — because that target's node was never the one whose
+// modifier the mapped-port fold read. Rejecting the multi-target rule outright is
+// the correct Junos-faithful closure and forecloses that residual as a side
+// effect (the rule never compiles, so no dropped-target modifier can slip).
+//
+// ThenTargetCount is taken from the AST during compile (staticNATThenTargetCount)
+// BEFORE the fields collapse, so it sees every declared target regardless of
+// shape (flat-set targets collapse onto one static-nat node's children; the
+// hierarchical `then { static-nat {…} static-nat {…} }` shape spreads them across
+// siblings) and regardless of the last-wins overwrite. A count of exactly one is
+// the well-formed case; zero is the empty-target gate's domain
+// (validateStaticNATThenTargetStrict, #4290) and is not re-diagnosed here.
+//
+// Strict on commit / commit-check (hard reject so the malformed rule is
+// operator-visible); the call site downgrades to a warning on the tolerant load
+// / peer-sync path (opts.lenientFirewallRefs, #1960 no-brick) — a config an older
+// binary persisted, or a peer authored, before this gate existed still boots, and
+// the dataplane is no worse off than before the gate (the compiler still lowers
+// the single honored target). Rule-sets are walked in slice order for a
+// deterministic first-reported offender, mirroring the sibling static-NAT target
+// gates.
+func validateStaticNATSingleTargetStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	for _, rs := range cfg.Security.NAT.Static {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil {
+				continue
+			}
+			if rule.ThenTargetCount > 1 {
+				return fmt.Errorf(
+					"static NAT rule-set %q rule %q declares %d static-nat "+
+						"translation targets (prefix/prefix-name/nptv6-prefix/inet); a "+
+						"static-nat rule has exactly one — the compiler would otherwise "+
+						"honor one target and silently drop the rest (and any mapped-port "+
+						"riding only on a dropped target, the #6479 residual). Keep a "+
+						"single target per rule",
+					rs.Name, rule.Name, rule.ThenTargetCount)
+			}
+		}
+	}
+	return nil
+}
+
 // natThenTerminalActionCount returns how many mutually-exclusive NAT-terminal
 // translation actions a resolved NATThen carries: source-nat `interface`,
 // `off`, or a `pool <name>` for source NAT; `off` or a `pool <name>` for
@@ -2391,4 +2520,409 @@ func validateSourceNATAggregateCardinalityStrict(cfg *Config) error {
 			totalPortCap, MaxSourceNATAggregatePortCapacity)
 	}
 	return nil
+}
+
+// natAllocOwner names one INDEPENDENT source-NAT / NAT64 allocator for a #5144
+// external-tuple-overlap diagnostic. Each owner draws its translated addresses
+// from `pool`; two DISTINCT owners whose expanded members intersect can each
+// hand out the same (family, translated IP, port), and the reverse (1:N) NAT
+// index cannot tell the two flows apart (reply misdelivery).
+type natAllocOwner struct {
+	// desc is the operator-facing identity, e.g. `source-nat pool "wan"` or
+	// `nat64 rule-set "r1" (prefix 64:ff9b::/96) source-pool "wan"`.
+	desc string
+	// pool is the resolved source pool whose addresses this allocator draws from.
+	pool *NATPool
+}
+
+// natV4Interval / natV6Interval is one expanded pool member as an inclusive
+// numeric address interval within a single family, tagged with the owning
+// allocator (index into the owners slice) and the original member text for the
+// diagnostic. v4 endpoints are big-endian uint32 values widened to uint64 (so a
+// /0 broadcast 0xFFFFFFFF+... never wraps); v6 endpoints are netip.Addr for
+// 16-byte ordered comparison.
+type natV4Interval struct {
+	lo, hi uint64
+	inst   int
+	member string
+}
+
+type natV6Interval struct {
+	lo, hi netip.Addr
+	inst   int
+	member string
+}
+
+// validateNATPoolExternalTupleOverlapStrict (#5144) rejects a config in which
+// two INDEPENDENT source-NAT / NAT64 allocators can mint the same external
+// tuple. The Rust dataplane keys the source-NAT PortAllocator by pool name +
+// address vector (userspace-dp/src/nat/source.rs) and the NAT64 allocator by
+// (prefix_bytes, pool_v4) (userspace-dp/src/nat64.rs) — so differently-named
+// overlapping source pools, a source pool that also backs a NAT64 rule-set, two
+// NAT64 rule-sets sharing a pool under different prefixes, and duplicate members
+// WITHIN one pool each own a SEPARATE occupancy bitmap. Independent bitmaps
+// share no ownership word, so two flows can be handed the same (family,
+// translated IP, translated port) to the same remote endpoint; the reverse
+// conntrack index (1:N) then cannot disambiguate the return packet and
+// misdelivers it. The only pre-existing NAT overlap gate was NPTv6 static-prefix
+// (#2241); this is its source-NAT / NAT64 analog.
+//
+// This is the commit-time DETECTION half of #5144 (material choice S1: reject
+// independently-owned overlap). It does NOT introduce the deferred packet-path
+// global cross-domain allocator (the R2 design, gated on user signoff and
+// #2387/#5338/#5698). Rejecting the overlap at commit forecloses the runtime
+// collision because the vulnerable config never reaches the dataplane.
+//
+// Allocator instances (owners) are enumerated exactly as the Rust helper keys
+// its allocators, so Go and the dataplane agree on what is "one allocator":
+//
+//   - source-NAT: one owner per DISTINCT pool a pool-mode `then source-nat pool
+//     <name>` rule references (all such rules share the pool-name-keyed
+//     allocator). Unreferenced pools build no allocator and are out of scope
+//     (mirrors validateSourceNATAggregateCardinalityStrict's scoping).
+//   - NAT64: one owner per DISTINCT (prefix, source-pool) pair a `nat64
+//     rule-set` references. Two rule-sets differing only in name share one
+//     allocator (one owner); two sharing a pool under different prefixes are
+//     independent (two owners).
+//
+// Every owner's pool members (pool.Address + pool.Addresses, ranges already
+// expanded to /32s by appendPoolAddresses) are turned into family-scoped numeric
+// intervals — v4 vs v6 bucketed by the colon-strict textual family
+// (natAddrFamily(natCIDRIPPart(...)), the Go/Rust parity rule) so an IPv4-mapped
+// IPv6 literal is never compared against a real v4 member. An O(n log n)
+// sort-and-sweep over each family's intervals finds the first overlapping pair.
+// An overlap between two members of the SAME owner is a within-pool
+// duplicate/overlap; between two owners it is the cross-pool / cross-feature
+// collision.
+//
+// Strict on commit / commit-check (hard-reject naming both allocators and the
+// overlapping members); lenient on load / peer-sync (warn — #1960 no-brick: a
+// config committed before this gate existed still boots. Unlike NPTv6/NAT64 the
+// dataplane does NOT reject the snapshot — the overlap installs with a LATENT
+// collision — so the warning tells the operator the risk persists until
+// corrected). Uses its own opts.lenientNATPoolOverlap flag, mirroring
+// validateNPTv6Strict. Placed next to the NPTv6 overlap gate (the #2241
+// precedent the issue cites) in runTailGates.
+func validateNATPoolExternalTupleOverlapStrict(cfg *Config, lenient bool) ([]string, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	pools := cfg.Security.NAT.SourcePools
+	if len(pools) == 0 {
+		return nil, nil
+	}
+
+	var owners []natAllocOwner
+
+	// Source-NAT allocator instances: one per DISTINCT pool a pool-mode rule
+	// references. Walk rule-sets in sorted name order and collect referenced pool
+	// names into a sorted, deduped list for a deterministic owner order.
+	srcRuleSets := append([]*NATRuleSet(nil), cfg.Security.NAT.Source...)
+	sort.SliceStable(srcRuleSets, func(i, j int) bool {
+		if srcRuleSets[i] == nil || srcRuleSets[j] == nil {
+			return srcRuleSets[i] != nil
+		}
+		return srcRuleSets[i].Name < srcRuleSets[j].Name
+	})
+	var srcPoolNames []string
+	srcSeen := make(map[string]bool)
+	for _, rs := range srcRuleSets {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil || rule.Then.PoolName == "" || srcSeen[rule.Then.PoolName] {
+				continue
+			}
+			srcSeen[rule.Then.PoolName] = true
+			srcPoolNames = append(srcPoolNames, rule.Then.PoolName)
+		}
+	}
+	sort.Strings(srcPoolNames)
+	for _, name := range srcPoolNames {
+		if pool := pools[name]; pool != nil {
+			owners = append(owners, natAllocOwner{
+				desc: fmt.Sprintf("source-nat pool %q", name),
+				pool: pool,
+			})
+		}
+	}
+
+	// NAT64 allocator instances: one per DISTINCT (prefix, source-pool) pair.
+	// Walk rule-sets in sorted name order and dedup on the (prefix, pool) key that
+	// the Rust nat64 allocator uses.
+	nat64RuleSets := append([]*NAT64RuleSet(nil), cfg.Security.NAT.NAT64...)
+	sort.SliceStable(nat64RuleSets, func(i, j int) bool {
+		if nat64RuleSets[i] == nil || nat64RuleSets[j] == nil {
+			return nat64RuleSets[i] != nil
+		}
+		return nat64RuleSets[i].Name < nat64RuleSets[j].Name
+	})
+	nat64Seen := make(map[string]bool)
+	for _, rs := range nat64RuleSets {
+		if rs == nil || rs.SourcePool == "" {
+			continue
+		}
+		pool := pools[rs.SourcePool]
+		if pool == nil {
+			continue
+		}
+		// Only a rule-set whose prefix builds a LIVE NAT64 allocator is an owner,
+		// keyed on the CANONICAL (prefix, pool) identity the Rust nat64 allocator
+		// uses (12 network bytes + pool_v4). An empty / malformed / non-/96 prefix
+		// builds no allocator and is dropped (ok=false) so it cannot false-report
+		// an overlap; two rule-sets naming one pool under equivalent /96 spellings
+		// (`64:ff9b::/96` vs `64:ff9b::/096` vs `0064:ff9b:0:0:0:0:0:0/96`) dedup to
+		// one owner rather than false-rejecting. See nat64PrefixOwnerKey.
+		prefixKey, ok := nat64PrefixOwnerKey(rs.Prefix)
+		if !ok {
+			continue
+		}
+		key := prefixKey + "\x00" + rs.SourcePool
+		if nat64Seen[key] {
+			continue
+		}
+		nat64Seen[key] = true
+		owners = append(owners, natAllocOwner{
+			desc: fmt.Sprintf("nat64 rule-set %q (prefix %s) source-pool %q",
+				rs.Name, rs.Prefix, rs.SourcePool),
+			pool: pool,
+		})
+	}
+
+	if len(owners) == 0 {
+		return nil, nil
+	}
+
+	// Expand every owner's pool members into family-scoped numeric intervals.
+	var v4 []natV4Interval
+	var v6 []natV6Interval
+	for idx := range owners {
+		for _, m := range poolMemberTexts(owners[idx].pool) {
+			n := parsePoolAddr(m)
+			if n == nil {
+				continue
+			}
+			switch natAddrFamily(natCIDRIPPart(m)) {
+			case "v4":
+				if lo, hi, ok := natV4IntervalOf(n); ok {
+					v4 = append(v4, natV4Interval{lo: lo, hi: hi, inst: idx, member: m})
+				}
+			case "v6":
+				if lo, hi, ok := natV6IntervalOf(n); ok {
+					v6 = append(v6, natV6Interval{lo: lo, hi: hi, inst: idx, member: m})
+				}
+			}
+		}
+	}
+
+	if msg := sweepNATV4Overlap(owners, v4); msg != "" {
+		return emitNATOverlap(lenient, msg)
+	}
+	if msg := sweepNATV6Overlap(owners, v6); msg != "" {
+		return emitNATOverlap(lenient, msg)
+	}
+	return nil, nil
+}
+
+// emitNATOverlap renders a #5144 overlap finding as a strict error or a lenient
+// warning, mirroring validateNPTv6Strict's emit helper.
+func emitNATOverlap(lenient bool, msg string) ([]string, error) {
+	if lenient {
+		return []string{msg +
+			" (the config still installs on the tolerant load / peer-sync path, but " +
+			"the two allocators remain independent, so a return packet for a colliding " +
+			"external tuple can be misdelivered until the overlap is corrected)"}, nil
+	}
+	return nil, fmt.Errorf("%s", msg)
+}
+
+// nat64PrefixOwnerKey returns the canonical allocator key for a NAT64 rule-set
+// prefix, and ok=false when the prefix would NOT build a live NAT64 allocator.
+//
+// It mirrors the Rust nat64.rs build condition — and validateNAT64PrefixStrict's
+// accept set — EXACTLY: the prefix must split on '/' into exactly two parts, the
+// mask must parse as a decimal 96 (so a leading-zero `/096` — which the strict
+// gate and Rust's numeric parse both accept — is honored, unlike a raw
+// netip.ParsePrefix which rejects it), and the address part must be IPv6 by the
+// colon-strict family rule. Only such a rule-set mints external tuples at
+// runtime, so only it is an allocator "owner" for the #5144 overlap gate. An
+// empty / malformed / non-/96 prefix builds no allocator (nat64.rs skips it; the
+// strict gate rejects a non-empty malformed prefix on commit and skips an empty
+// one) — enumerating it as an owner would FALSELY report an overlap (two
+// empty-prefix rule-sets sharing a pool, or an empty-prefix rule-set vs a live
+// source-NAT owner), so ok=false drops it from the owner set on both paths.
+//
+// The key is the CANONICAL /96 network (the Rust 12-byte prefix identity) via
+// netip Masked(), so equivalent spellings — a leading-zero `/096`, an expanded
+// `0064:ff9b:0:0:0:0:0:0`, or host bits beyond /96 — dedup to one owner and never
+// false-reject.
+func nat64PrefixOwnerKey(prefix string) (string, bool) {
+	parts := strings.Split(prefix, "/")
+	if len(parts) != 2 {
+		return "", false
+	}
+	if m, err := strconv.ParseUint(parts[1], 10, 8); err != nil || m != 96 {
+		return "", false
+	}
+	if natAddrFamily(parts[0]) != "v6" {
+		return "", false
+	}
+	addr, err := netip.ParseAddr(parts[0])
+	if err != nil {
+		// natAddrFamily classified it v6 but netip disagrees (should not happen
+		// for a genuine IPv6 literal) — fall back to a stable normalized text key
+		// so it still dedups by (address text, /96) rather than crashing.
+		return parts[0] + "/96", true
+	}
+	return netip.PrefixFrom(addr, 96).Masked().String(), true
+}
+
+// poolMemberTexts returns a source pool's translated-address members: the single
+// DNAT-compat Address (empty for source pools) followed by the expanded
+// Addresses list. Mirrors nat64.go / SourceNATPoolNets member enumeration.
+func poolMemberTexts(pool *NATPool) []string {
+	if pool == nil {
+		return nil
+	}
+	out := make([]string, 0, len(pool.Addresses)+1)
+	if pool.Address != "" {
+		out = append(out, pool.Address)
+	}
+	return append(out, pool.Addresses...)
+}
+
+// natV4IntervalOf returns the inclusive [lo,hi] big-endian uint32 range (widened
+// to uint64) an IPv4 pool member covers. A bare IP / /32 is [x,x]; a CIDR spans
+// its whole prefix. ok is false when the net is not v4-representable.
+func natV4IntervalOf(n *net.IPNet) (lo, hi uint64, ok bool) {
+	ip4 := n.IP.To4()
+	if ip4 == nil {
+		return 0, 0, false
+	}
+	lo = uint64(binary.BigEndian.Uint32(ip4))
+	ones, bits := n.Mask.Size()
+	if bits != 32 {
+		// Non-canonical / zero mask — treat the address as a host so it still
+		// participates in exact-duplicate detection.
+		return lo, lo, true
+	}
+	hostBits := uint(32 - ones)
+	return lo, lo + (uint64(1) << hostBits) - 1, true
+}
+
+// natV6IntervalOf returns the inclusive [lo,hi] 16-byte range an IPv6 pool member
+// covers, as netip.Addr values ordered by Compare. lo is the masked network
+// address; hi is that address OR the inverted mask (the all-ones host suffix). ok
+// is false when the net is not 16-byte-representable.
+func natV6IntervalOf(n *net.IPNet) (lo, hi netip.Addr, ok bool) {
+	ip16 := n.IP.To16()
+	if ip16 == nil {
+		return netip.Addr{}, netip.Addr{}, false
+	}
+	loAddr, ok1 := netip.AddrFromSlice(ip16)
+	if !ok1 {
+		return netip.Addr{}, netip.Addr{}, false
+	}
+	mask := n.Mask
+	if len(mask) != 16 {
+		// A non-16-byte (e.g. v4-mapped /32) mask has no 128-bit host span; treat
+		// the address as a single host.
+		return loAddr, loAddr, true
+	}
+	hib := make([]byte, 16)
+	for i := 0; i < 16; i++ {
+		hib[i] = ip16[i] | ^mask[i]
+	}
+	hiAddr, ok2 := netip.AddrFromSlice(hib)
+	if !ok2 {
+		return netip.Addr{}, netip.Addr{}, false
+	}
+	return loAddr, hiAddr, true
+}
+
+// sweepNATV4Overlap sorts the v4 intervals by (lo,hi) and reports the first
+// overlapping pair via a running max-hi sweep (O(n log n)). Returns "" when no
+// two intervals intersect.
+func sweepNATV4Overlap(owners []natAllocOwner, ivs []natV4Interval) string {
+	if len(ivs) < 2 {
+		return ""
+	}
+	sort.Slice(ivs, func(i, j int) bool {
+		if ivs[i].lo != ivs[j].lo {
+			return ivs[i].lo < ivs[j].lo
+		}
+		if ivs[i].hi != ivs[j].hi {
+			return ivs[i].hi < ivs[j].hi
+		}
+		if ivs[i].inst != ivs[j].inst {
+			return ivs[i].inst < ivs[j].inst
+		}
+		return ivs[i].member < ivs[j].member
+	})
+	maxHi, maxInst, maxMember := ivs[0].hi, ivs[0].inst, ivs[0].member
+	for _, iv := range ivs[1:] {
+		if iv.lo <= maxHi {
+			return natOverlapMessage(owners, maxInst, maxMember, iv.inst, iv.member)
+		}
+		if iv.hi > maxHi {
+			maxHi, maxInst, maxMember = iv.hi, iv.inst, iv.member
+		}
+	}
+	return ""
+}
+
+// sweepNATV6Overlap is the v6 analog of sweepNATV4Overlap, comparing netip.Addr
+// endpoints with Compare.
+func sweepNATV6Overlap(owners []natAllocOwner, ivs []natV6Interval) string {
+	if len(ivs) < 2 {
+		return ""
+	}
+	sort.Slice(ivs, func(i, j int) bool {
+		if c := ivs[i].lo.Compare(ivs[j].lo); c != 0 {
+			return c < 0
+		}
+		if c := ivs[i].hi.Compare(ivs[j].hi); c != 0 {
+			return c < 0
+		}
+		if ivs[i].inst != ivs[j].inst {
+			return ivs[i].inst < ivs[j].inst
+		}
+		return ivs[i].member < ivs[j].member
+	})
+	maxHi, maxInst, maxMember := ivs[0].hi, ivs[0].inst, ivs[0].member
+	for _, iv := range ivs[1:] {
+		if iv.lo.Compare(maxHi) <= 0 {
+			return natOverlapMessage(owners, maxInst, maxMember, iv.inst, iv.member)
+		}
+		if iv.hi.Compare(maxHi) > 0 {
+			maxHi, maxInst, maxMember = iv.hi, iv.inst, iv.member
+		}
+	}
+	return ""
+}
+
+// natOverlapMessage renders the operator-facing #5144 overlap diagnostic. When
+// both members belong to the same owner it is a within-pool duplicate/overlap;
+// otherwise it names both independent allocators.
+func natOverlapMessage(owners []natAllocOwner, instA int, memberA string, instB int, memberB string) string {
+	a := owners[instA]
+	if instA == instB {
+		return fmt.Sprintf(
+			"security nat: %s has overlapping or duplicate pool members %q and %q; "+
+				"the allocator builds a separate occupancy bitmap per pool member, so "+
+				"overlapping members can each hand out the same translated (address, "+
+				"port) and the reverse NAT index cannot disambiguate the return flow — "+
+				"remove the duplicate/overlapping member (#5144)",
+			a.desc, memberA, memberB)
+	}
+	b := owners[instB]
+	return fmt.Sprintf(
+		"security nat: %s member %q overlaps %s member %q; the two are independent "+
+			"NAT allocators (keyed separately), so both can mint the same translated "+
+			"(family, address, port) external tuple and the reverse NAT index cannot "+
+			"disambiguate the return flow (reply misdelivery) — give the pools "+
+			"non-overlapping address ranges, or share a single pool so one allocator "+
+			"owns the address (#5144)",
+		a.desc, memberA, b.desc, memberB)
 }

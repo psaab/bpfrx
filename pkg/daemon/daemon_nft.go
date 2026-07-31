@@ -21,11 +21,18 @@ import (
 )
 
 // nftApplyPayload runs `nft -f -` with the supplied ruleset payload on stdin.
-// It is a package var so the host-inbound apply path's failure semantics are
-// unit-testable without invoking nft (#3333). The 5s context + WaitDelay mirror
-// the established inline apply sites (#1794): an `-f -` payload loads atomically,
-// so on failure the kernel retains the PREVIOUS table untouched rather than a
-// half-applied ruleset.
+//
+// #6387 PR-3: production NO LONGER calls this — the host-inbound / lo0 / fence
+// install and teardown go through the netlink nftInstaller seam
+// (daemon_nft_netlink.go), dropping the `nft` BINARY dependency. This var and
+// the build*Payload text builders are RETAINED as the exec-`nft` ORACLE the T1
+// ruleset-parity CI diffs the netlink build against (daemon_nft_netlink_parity_
+// test.go), plus the payload-shape tests (TestNftDeleteTable*IdempotentAddDelete).
+//
+// It is a package var so the retained-idiom tests can exercise it without a real
+// nft. The 5s context + WaitDelay mirror the established inline apply sites
+// (#1794): an `-f -` payload loads atomically, so on failure the kernel retains
+// the PREVIOUS table untouched rather than a half-applied ruleset.
 var nftApplyPayload = func(payload string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -117,29 +124,135 @@ const (
 // enforcement silently. Boot / DHCP re-applies go through applyConfig(), which
 // only logs the error, so a transient nft failure cannot brick startup; the next
 // clean commit re-renders.
+//
+// Cold-boot fail-closed fence (#6476, mirroring the host-inbound #5644 fence):
+// on COLD BOOT both nft tables are absent — there is no prior lo0 generation to
+// retain — so a failed real InstallLo0 would leave the host input path OPEN with
+// only a WARN (the boot apply only logs+discards the error), publishing host
+// services / VIP / HA-ready over an unenforced RE-protection path. The fence-skip
+// gate keys on lo0Enforced — whether a REAL operator filter is currently
+// loaded — NOT on "any protecting table exists": a fence is `policy accept` and
+// drops only its snapshot's addresses, so a retained FENCE does not cover a
+// later-appearing address (#6489). When no real filter is loaded, a failed
+// InstallLo0 (re-)installs a fail-closed fence rendered from the CURRENT
+// firewall-local snapshot (minus lifelines) — so a fence -> new-address -> real
+// install fails sequence re-fences and covers the new address instead of leaving
+// it open through the stale fence. Only on a DAY-2 failure with a REAL filter
+// loaded (lo0Enforced true) is no fence installed: the atomic replaceTable
+// retained the operator's filter, which — unlike the per-destination-address
+// host-inbound table — is not per-address scoped and still governs every local
+// address (the deliberate divergence from the #5789 gap fence).
 func (d *Daemon) applyLo0Filter(cfg *config.Config) error {
 	filterV4 := cfg.System.Lo0FilterInputV4
 	filterV6 := cfg.System.Lo0FilterInputV6
 	if filterV4 == "" && filterV6 == "" {
-		// No lo0 filter configured — remove any stale table. nftDeleteTable is
-		// idempotent (an add-then-delete payload, so no error when the table is
-		// absent — the common no-lo0-filter case), so a non-nil error here is a
-		// REAL teardown failure that left a stale lo0 input filter in the kernel:
-		// surface it so the commit fails closed rather than reporting that the lo0
-		// filter was removed when it was not.
-		if out, err := nftDeleteTable("inet", "xpf_lo0"); err != nil {
-			slog.Warn("failed to delete stale lo0 filter table", "err", err, "output", string(out))
+		// No lo0 filter configured — remove any stale table. DeleteTable is
+		// idempotent (absent -> nil, the common no-lo0-filter case), so a non-nil
+		// error here is a REAL teardown failure that left a stale lo0 input filter in
+		// the kernel: surface it so the commit fails closed rather than reporting that
+		// the lo0 filter was removed when it was not (#6387 PR-3: via netlink).
+		if err := nftInstaller.DeleteTable(xnft.Lo0TableName); err != nil {
+			// Teardown FAILED: a stale xpf_lo0 table (real filter OR a prior fence)
+			// may still be installed. Surface the failure (fail closed) and do NOT
+			// clear lo0Enforced — if a real filter was the live table it may
+			// still be there, so keep the flag (mirrors the host-inbound #5790
+			// teardown semantics).
+			err = tagNftInstallErr(err)
+			slog.Warn("failed to delete stale lo0 filter table", "err", err)
 			return fmt.Errorf("delete stale lo0 nftables table: %w", err)
 		}
+		// Teardown SUCCEEDED: no xpf_lo0 table is installed now, so no real filter is
+		// loaded. Clear the gate so a later generation whose first real load fails
+		// takes the cold-boot fence path rather than assuming a retained table
+		// (#5790 parity).
+		d.lo0Enforced.Store(false)
 		return nil
 	}
 
-	nftConf := buildLo0FilterPayload(cfg, filterV4, filterV6)
-	if out, err := nftApplyPayload(nftConf); err != nil {
-		slog.Warn("failed to apply lo0 filter", "err", err, "output", string(out))
+	// #6387 PR-3: install via netlink (the google/nftables Installer) instead of
+	// exec-`nft`. toNftLo0Spec re-derives the SAME per-term inputs buildLo0Filter
+	// Payload feeds the oracle; the netlink build is parity-proven equivalent (T1
+	// CI). An unrepresentable port/DSCP token fails the build CLOSED (the installer
+	// returns an error and installs nothing), mirroring the oracle's nft rejection.
+	spec := toNftLo0Spec(cfg, filterV4, filterV6)
+	if err := nftInstaller.InstallLo0(spec); err != nil {
+		err = tagNftInstallErr(err)
+		slog.Warn("failed to apply lo0 filter", "err", err)
+		// #6476 cold-boot fail-closed fence. Install (or re-install) a fence UNLESS a
+		// REAL operator filter is currently loaded. Keying on lo0Enforced (not
+		// "any protecting table") is the #6489 fix: a retained FENCE is `policy accept`
+		// and covers only its own snapshot, so if the live table is a fence a failed
+		// real install must RE-FENCE from the CURRENT snapshot to cover any address
+		// that appeared since — otherwise the new address falls through the stale
+		// fence's policy-accept (fail-open). Only a retained REAL filter is trusted to
+		// govern every local address (unlike the address-scoped host-inbound table), so
+		// with lo0Enforced true no fence is installed.
+		if !d.lo0Enforced.Load() {
+			views := dpuserspace.BuildZoneHostInboundViews(cfg)
+			unzonedV4, unzonedV6 := dpuserspace.BuildUnzonedHostInboundAddrs(cfg)
+			wgListenPorts := cfg.WireGuardListenPorts()
+			if fenceErr := d.installLo0ColdBootFence(views, unzonedV4, unzonedV6, wgListenPorts); fenceErr != nil {
+				return errors.Join(fmt.Errorf("apply lo0 nftables filter: %w", err), fenceErr)
+			}
+		}
 		return fmt.Errorf("apply lo0 nftables filter: %w", err)
 	}
+	// A real lo0 filter is now the live table. Record it so a later failed install
+	// retains this generation and skips the fence (the intended day-2 divergence).
+	d.lo0Enforced.Store(true)
 	slog.Info("lo0 filter applied", "v4", filterV4, "v6", filterV6)
+	return nil
+}
+
+// installLo0ColdBootFence installs the #6476 lo0 cold-boot fail-closed fence: a
+// minimal xpf_lo0 table that DENIES host-bound traffic to every firewall-local
+// address in its rendered snapshot (views + the addressed-but-unzoned set),
+// admitting only the mandatory L3 / return traffic (established/related, raw
+// ESP+AH, IPv6 ND, v4/v6 PMTUD+error, and the configured WireGuard listen
+// port(s)). It is the lo0-table analogue of installHostInboundColdBootFence and
+// shares the SAME FenceSpec + fence builder, differing only in the target table
+// (xpf_lo0 at lo0FilterPriority). It is attempted whenever a real lo0 install
+// failed and no real filter is currently loaded (lo0Enforced false).
+//
+// Safety: the fence drops only to the SAME lifeline-excluded address sets the
+// host-inbound fence uses (fxp0/em0/fab* and their addresses are subtracted by
+// BuildZoneHostInboundViews / BuildUnzonedHostInboundAddrs), so it can never
+// strand management or break HA. It carries no named counters (a fence is
+// transient).
+//
+// A fence deliberately does NOT set lo0Enforced — that flag is set true ONLY by a
+// successful real InstallLo0, so it means exactly "a real operator lo0 filter is
+// loaded". A fence is NOT a real filter (its chain is `policy accept` and drops
+// only THIS snapshot's addresses). lo0Enforced is already false whenever this runs
+// (we only reach here when the day-2 gate `!lo0Enforced` passed), so it stays
+// false and a subsequent failed real install RE-RENDERS the whole-table fence from
+// the then-current snapshot — covering any address that appeared after this fence
+// — rather than trusting the stale fence (#6489). This subsumes the zero-drop
+// case: an addressless snapshot yields a policy-accept shell, still not a real
+// filter, so a later failure re-fences from a possibly-now-addressed snapshot. On
+// failure (nft itself is broken) the error is returned and joined into the commit
+// result; the daemon has done all it can.
+func (d *Daemon) installLo0ColdBootFence(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, wgListenPorts []uint16) error {
+	fenceHasScopedDrop := hostInboundHasEnforceableView(views) || len(unzonedV4) > 0 || len(unzonedV6) > 0
+	spec := xnft.FenceSpec{Views: toNftViews(views), UnzonedV4: unzonedV4, UnzonedV6: unzonedV6, WGListenPorts: wgListenPorts}
+	if err := nftInstaller.InstallLo0ColdBootFence(spec); err != nil {
+		err = tagNftInstallErr(err)
+		slog.Error("COLD-BOOT FAIL-OPEN GUARD: lo0 install failed AND the fail-closed "+
+			"fence could not be installed; host-bound services may be reachable without "+
+			"the lo0 RE-protection filter until the next successful commit re-renders it",
+			"err", err)
+		return fmt.Errorf("install lo0 cold-boot fail-closed fence: %w", err)
+	}
+	// lo0Enforced is intentionally NOT set here (a fence is not a real filter).
+	if fenceHasScopedDrop {
+		slog.Warn("lo0 real install failed; installed an address-scoped fail-closed fence for the current snapshot (re-rendered on each later failure until a real filter loads)",
+			"fenced_zones", len(views), "fenced_unzoned_v4", len(unzonedV4),
+			"fenced_unzoned_v6", len(unzonedV6))
+	} else {
+		slog.Warn("lo0 real install failed; installed a zero-drop fence shell (no firewall-local addresses in this snapshot); re-rendered on each later failure until a real filter loads",
+			"fenced_zones", len(views), "fenced_unzoned_v4", len(unzonedV4),
+			"fenced_unzoned_v6", len(unzonedV6))
+	}
 	return nil
 }
 
@@ -307,19 +420,19 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 		// No host-inbound-configured zone with a resolvable address, no
 		// addressed-but-unzoned interface (#4420 HI-2), AND no junos-host DENY
 		// program (#4146) — nothing to enforce. Remove any stale table.
-		// nftDeleteTable is idempotent (an add-then-delete payload, so no error
-		// when the table is absent — the common case), so a non-nil error here is
-		// a REAL teardown failure that left a stale deny in the kernel: surface it
-		// so the commit fails closed rather than reporting that host-inbound was
-		// relaxed when it was not.
-		if out, err := nftDeleteTable("inet", "xpf_hostinbound"); err != nil {
+		// DeleteTable is idempotent (absent -> nil, the common case), so a non-nil
+		// error here is a REAL teardown failure that left a stale deny in the kernel:
+		// surface it so the commit fails closed rather than reporting that
+		// host-inbound was relaxed when it was not (#6387 PR-3: via netlink).
+		if err := nftInstaller.DeleteTable(xnft.HostInboundTableName); err != nil {
 			// Teardown FAILED: a stale xpf_hostinbound table may still be installed
 			// in the kernel. Surface the failure (fail closed) and — critically — do
 			// NOT clear hostInboundEnforced: the flag's meaning ("a real load or
 			// address-scoped fallback established a protecting table") may still hold
 			// for the table this delete could not remove, so a later failed install
 			// must keep retaining it rather than fencing over a live table (#5790).
-			slog.Warn("failed to delete stale host-inbound filter table", "err", err, "output", string(out))
+			err = tagNftInstallErr(err)
+			slog.Warn("failed to delete stale host-inbound filter table", "err", err)
 			return fmt.Errorf("delete stale host-inbound nftables table: %w", err)
 		}
 		// #5789: also remove any additive gap fence. With the main table gone there
@@ -328,8 +441,9 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 		// the main teardown failure above: a table the delete could not remove may
 		// still be installed, so KEEP the coverage/enforced state and surface the
 		// error (fail closed) rather than clearing state over a live gap table.
-		if out, err := nftDeleteTable("inet", "xpf_hostinbound_gap"); err != nil {
-			slog.Warn("failed to delete stale host-inbound gap fence table", "err", err, "output", string(out))
+		if err := nftInstaller.DeleteTable(xnft.HostInboundGapTableName); err != nil {
+			err = tagNftInstallErr(err)
+			slog.Warn("failed to delete stale host-inbound gap fence table", "err", err)
 			return fmt.Errorf("delete stale host-inbound gap fence nftables table: %w", err)
 		}
 		// Teardown SUCCEEDED: no xpf_hostinbound (or gap) table is installed now.
@@ -358,9 +472,14 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 	// catch-all DROP for. Compared on failure against the retained generation's
 	// covered set to detect addresses that appeared after that generation loaded.
 	desiredDrop := hostInboundDesiredDropAddrs(views, unzonedV4, unzonedV6)
-	nftConf := buildHostInboundFilterPayload(views, unzonedV4, unzonedV6, programs, wgListenPorts)
-	if out, err := nftApplyPayload(nftConf); err != nil {
-		slog.Warn("failed to apply host-inbound filter", "err", err, "output", string(out))
+	// #6387 PR-3: install via netlink. toNftHostInboundSpec re-derives the SAME
+	// inputs buildHostInboundFilterPayload feeds the oracle; the netlink build is
+	// parity-proven equivalent (T1 CI). A failed install still fails the commit
+	// closed below (invariant H7) and, at cold boot, drives the fail-closed fence.
+	spec := toNftHostInboundSpec(views, unzonedV4, unzonedV6, programs, wgListenPorts)
+	if err := nftInstaller.InstallHostInbound(spec); err != nil {
+		err = tagNftInstallErr(err)
+		slog.Warn("failed to apply host-inbound filter", "err", err)
 		// #5644 (M37) cold-boot fail-closed fence. The atomic `-f -` load leaves
 		// the exact PREVIOUS table untouched on failure, so day-2 its existing
 		// rules and destinations remain in the kernel. But on COLD BOOT both tables
@@ -422,9 +541,9 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 	// a rare real kernel fault; log it but do NOT fail the successful commit (the
 	// enforcement is correct and the next apply retries the delete — a lingering
 	// gap fences only, never opens).
-	if out, err := nftDeleteTable("inet", "xpf_hostinbound_gap"); err != nil {
+	if err := nftInstaller.DeleteTable(xnft.HostInboundGapTableName); err != nil {
 		slog.Warn("failed to delete obsolete host-inbound gap fence after successful real install",
-			"err", err, "output", string(out))
+			"err", err)
 	}
 	// #5566: reconcile Linux netfilter conntrack against the just-applied
 	// host-inbound set. The chain's leading `ct state established,related accept`
@@ -455,12 +574,15 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 // so a newly reachable local address is never silently left without a host-inbound
 // deny. Caller guarantees >=1 uncovered address (the payload has >=1 DROP).
 func (d *Daemon) installHostInboundGapFence(uncoveredV4, uncoveredV6 []string, wgListenPorts []uint16) error {
-	gap := buildHostInboundGapFencePayload(uncoveredV4, uncoveredV6, wgListenPorts)
-	if out, err := nftApplyPayload(gap); err != nil {
+	// #6387 PR-3: install via netlink (parity-proven equivalent to the exec-`nft`
+	// buildHostInboundGapFencePayload oracle).
+	spec := xnft.GapFenceSpec{UncoveredV4: uncoveredV4, UncoveredV6: uncoveredV6, WGListenPorts: wgListenPorts}
+	if err := nftInstaller.InstallGapFence(spec); err != nil {
+		err = tagNftInstallErr(err)
 		slog.Error("COVERAGE-GAP FAIL-OPEN GUARD: host-inbound real install failed AND the additive "+
 			"gap fence for newly-appeared local addresses could not be installed; those addresses "+
 			"may be reachable without host-inbound enforcement until the next successful commit",
-			"err", err, "output", string(out),
+			"err", err,
 			"uncovered_v4", len(uncoveredV4), "uncovered_v6", len(uncoveredV6))
 		return fmt.Errorf("install host-inbound coverage-gap fence: %w", err)
 	}
@@ -502,12 +624,15 @@ func (d *Daemon) installHostInboundGapFence(uncoveredV4, uncoveredV6 []string, w
 // failed rerender detect a subsequently-appeared uncovered address.
 func (d *Daemon) installHostInboundColdBootFence(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, wgListenPorts []uint16, desiredDrop map[string]struct{}) error {
 	fenceHasScopedDrop := hostInboundHasEnforceableView(views) || len(unzonedV4) > 0 || len(unzonedV6) > 0
-	fence := buildHostInboundFencePayload(views, unzonedV4, unzonedV6, wgListenPorts)
-	if out, err := nftApplyPayload(fence); err != nil {
+	// #6387 PR-3: install via netlink (parity-proven equivalent to the exec-`nft`
+	// buildHostInboundFencePayload oracle).
+	spec := xnft.FenceSpec{Views: toNftViews(views), UnzonedV4: unzonedV4, UnzonedV6: unzonedV6, WGListenPorts: wgListenPorts}
+	if err := nftInstaller.InstallColdBootFence(spec); err != nil {
+		err = tagNftInstallErr(err)
 		slog.Error("COLD-BOOT FAIL-OPEN GUARD: host-inbound install failed AND the fail-closed "+
 			"fence could not be installed; host-bound services may be reachable without "+
 			"host-inbound enforcement until the next successful commit re-renders the ruleset",
-			"err", err, "output", string(out))
+			"err", err)
 		return fmt.Errorf("install host-inbound cold-boot fail-closed fence: %w", err)
 	}
 	if fenceHasScopedDrop {
@@ -536,21 +661,45 @@ func (d *Daemon) installHostInboundColdBootFence(views []dpuserspace.ZoneHostInb
 // on any line rejects the WHOLE payload (atomic load), retaining only the exact
 // prior generation, if one exists — exactly like the real builder.
 func buildHostInboundFencePayload(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, wgListenPorts []uint16) string {
-	var rules []string
-	rules = append(rules, "add table inet xpf_hostinbound")
-	rules = append(rules, "delete table inet xpf_hostinbound")
-	rules = append(rules, "table inet xpf_hostinbound {")
-	rules = append(rules, "  chain input {")
 	// Same hook/priority as the real host-inbound chain so the fence occupies the
 	// same evaluation slot (#3364).
-	rules = append(rules, fmt.Sprintf("    type filter hook input priority %d; policy accept;", nftHostInboundPriority))
+	return buildFenceTablePayload(xnft.HostInboundTableName, nftHostInboundPriority, views, unzonedV4, unzonedV6, wgListenPorts)
+}
+
+// buildLo0FencePayload assembles the #6476 lo0 cold-boot fail-closed fence
+// payload (see installLo0ColdBootFence). It is the SAME fence body as
+// buildHostInboundFencePayload — mandatory admits then a catch-all DROP for every
+// firewall-local address the real ruleset would scope, NO per-service accepts, NO
+// named counters — but rendered into the xpf_lo0 table at the lo0 filter priority
+// (0), the same slot the real lo0 RE-protection filter occupies, so a later
+// successful InstallLo0 atomically replaces it. It shares buildFenceTablePayload
+// with the host-inbound fence so the two fence oracles can never drift. Used by
+// the T1 parity gate to prove the netlink InstallLo0ColdBootFence is
+// bit-equivalent. Empty address inputs intentionally produce a zero-drop shell.
+func buildLo0FencePayload(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, wgListenPorts []uint16) string {
+	return buildFenceTablePayload(xnft.Lo0TableName, nftLo0FilterPriority, views, unzonedV4, unzonedV6, wgListenPorts)
+}
+
+// buildFenceTablePayload renders a fail-closed cold-boot fence into the named
+// inet table at the given hook-input priority: the shared mandatory admits
+// (hostInboundFenceMandatoryAdmits) then a catch-all DROP for every firewall-local
+// address the real ruleset would scope — per host-inbound-configured zone
+// (default-deny parity, #3405) and the addressed-but-unzoned set (#4420 HI-2).
+// These sets are already lifeline-excluded, so the fence never denies management /
+// cluster-control traffic. During the fence window even a `system-services all`
+// zone is denied (maximally fail-closed); the next clean commit restores the real
+// accepts. It is the single body shared by the host-inbound fence
+// (xpf_hostinbound, priority 10, #5644) and the lo0 fence (xpf_lo0, priority 0,
+// #6476) so their admit/deny posture can never diverge. Empty address inputs
+// intentionally produce a zero-drop table shell.
+func buildFenceTablePayload(tableName string, priority int, views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, wgListenPorts []uint16) string {
+	var rules []string
+	rules = append(rules, "add table inet "+tableName)
+	rules = append(rules, "delete table inet "+tableName)
+	rules = append(rules, "table inet "+tableName+" {")
+	rules = append(rules, "  chain input {")
+	rules = append(rules, fmt.Sprintf("    type filter hook input priority %d; policy accept;", priority))
 	rules = append(rules, hostInboundFenceMandatoryAdmits(wgListenPorts)...)
-	// Catch-all DROP for every firewall-local address the real ruleset would scope
-	// — per host-inbound-configured zone (default-deny parity, #3405) and the
-	// addressed-but-unzoned set (#4420 HI-2). These sets are already
-	// lifeline-excluded, so the fence never denies management / cluster-control
-	// traffic. During the fence window even a `system-services all` zone is denied
-	// (maximally fail-closed); the next clean commit restores the real accepts.
 	for _, v := range views {
 		if len(v.V4Addrs) > 0 {
 			rules = append(rules, "    ip daddr "+nftAddrSet(v.V4Addrs)+" drop")

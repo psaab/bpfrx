@@ -43,7 +43,7 @@ func TestCut_ReadsPinnedGenerationNotTornStaged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read committed binary: %v", err)
 	}
-	if string(got) != "binary-xpf-userspace-dp-2.0.0" {
+	if string(got) != string(fakeBinContent("binary-xpf-userspace-dp-2.0.0")) {
 		t.Fatalf("cut consumed the TORN live staged/ bytes, not the pinned generation: %q", got)
 	}
 
@@ -255,7 +255,7 @@ func TestCut_SameVersionDifferentGenerationRecopies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != "binary-xpfd-2.0.0" {
+	if string(got) != string(fakeBinContent("binary-xpfd-2.0.0")) {
 		t.Fatalf("cut shipped STALE bytes (version-only skip): %q", got)
 	}
 }
@@ -361,7 +361,7 @@ func TestCut_UnstampedStaleVersionDirIsReplaced(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != "binary-xpfd-2.0.0" {
+	if string(got) != string(fakeBinContent("binary-xpfd-2.0.0")) {
 		t.Fatalf("cut REUSED a stale unstamped version dir: %q (want fresh recopy)", got)
 	}
 	// And it now carries the .srcgen stamp.
@@ -397,7 +397,7 @@ func TestCut_RepinsPreB981ResumeBeforeCopy(t *testing.T) {
 	// The committed dir must hold the CLEAN published bytes (re-pinned), not the
 	// torn live staged/ bytes.
 	got, _ := os.ReadFile(filepath.Join(cfg.VersionsDir, "2.0.0", "xpf-userspace-dp"))
-	if string(got) != "binary-xpf-userspace-dp-2.0.0" {
+	if string(got) != string(fakeBinContent("binary-xpf-userspace-dp-2.0.0")) {
 		t.Fatalf("pre-#1981 resume read torn live staged/ instead of the re-pinned generation: %q", got)
 	}
 	// The version dir carries a .srcgen stamp (the resume was re-pinned).
@@ -480,7 +480,7 @@ func TestCut_AbortedUnpackLeavesPriorGenerationValid(t *testing.T) {
 		t.Fatalf("current-gen moved to %q; an aborted unpack must leave the prior %q", cur, priorGen)
 	}
 	got, _ := os.ReadFile(filepath.Join(cfg.VersionsDir, "2.0.0", "xpfd"))
-	if string(got) != "binary-xpfd-2.0.0" {
+	if string(got) != string(fakeBinContent("binary-xpfd-2.0.0")) {
 		t.Fatalf("cut consumed torn aborted-unpack bytes: %q", got)
 	}
 }

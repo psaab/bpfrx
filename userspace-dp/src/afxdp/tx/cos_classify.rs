@@ -86,7 +86,10 @@ pub(in crate::afxdp) fn classify_generated_reply(
     // #2362 fold B: classify the generated reply on its OWN bytes — build the
     // fragment-safe per-packet match inputs from the reply frame so a
     // tcp-flags / icmp-type output-filter term matches the reply correctly.
-    let extra = crate::afxdp::frame::term_match_extra_from_frame_fwd(frame, meta);
+    // #6435: the single unified builder (the byte-identical
+    // `term_match_extra_from_frame_fwd` twin is retired; the builder now
+    // takes `impl Into<ForwardPacketMeta>`).
+    let extra = crate::afxdp::frame::term_match_extra_from_frame(frame, meta);
     let selection =
         resolve_cos_tx_selection_at(forwarding, egress_ifindex, meta, Some(&key), extra, now_ns);
     GeneratedReplyVerdict {
@@ -203,47 +206,30 @@ fn resolve_cached_cos_tx_selection_impl(
         let mut filter_log = None;
         let mut filter_counters = crate::filter::CachedFilterCounters::default();
         let mut three_color_policers = crate::filter::CachedThreeColorPolicers::default();
-        if crate::filter::interface_output_filter_needs_tx_eval(
+        // #6236 PR-2C: fold the `needs_tx_eval` precheck and the output-filter
+        // fetch into ONE lookup — `interface_output_filter_needing_tx_eval`
+        // borrows the filter gated on `Filter::needs_tx_eval()`, replacing the
+        // separate bool accessor + `.get()` + re-`filter(needs_tx_eval)`.
+        if let Some(output_filter) = crate::filter::interface_output_filter_needing_tx_eval(
             &forwarding.filter_state,
             egress_ifindex,
             is_v6,
         ) && let Some((src_ip, dst_ip)) = ForwardPacketMeta::from(meta).l3_addrs()
         {
-            let output_filter = if is_v6 {
-                forwarding
-                    .filter_state
-                    .iface_filter_out_v6_fast
-                    .get(&egress_ifindex)
-                    .map(Arc::as_ref)
-            } else {
-                forwarding
-                    .filter_state
-                    .iface_filter_out_v4_fast
-                    .get(&egress_ifindex)
-                    .map(Arc::as_ref)
-            };
-            if let Some(output_filter) = output_filter.filter(|filter| {
-                filter.affects_tx_selection
-                    || filter.has_counter_terms
-                    || filter.has_log_terms
-                    || filter.has_terminal_action_terms
-                    || filter.has_three_color_policer_terms
-            }) {
-                let output_result = crate::filter::evaluate_filter_ref_tx_selection_cached(
-                    output_filter,
-                    src_ip,
-                    dst_ip,
-                    meta.protocol,
-                    0,
-                    0,
-                    meta.dscp,
-                );
-                drop = output_result.action != crate::filter::FilterAction::Accept;
-                reject = output_result.action == crate::filter::FilterAction::Reject;
-                filter_log = output_result.log_match;
-                filter_counters = output_result.counters;
-                three_color_policers = output_result.three_color_policers;
-            }
+            let output_result = crate::filter::evaluate_filter_ref_tx_selection_cached(
+                output_filter,
+                src_ip,
+                dst_ip,
+                meta.protocol,
+                0,
+                0,
+                meta.dscp,
+            );
+            drop = output_result.action != crate::filter::FilterAction::Accept;
+            reject = output_result.action == crate::filter::FilterAction::Reject;
+            filter_log = output_result.log_match;
+            filter_counters = output_result.counters;
+            three_color_policers = output_result.three_color_policers;
         }
         return CachedTxSelectionDescriptor {
             queue_id,
@@ -271,11 +257,18 @@ fn resolve_cached_cos_tx_selection_impl(
     // OUTPUT filter). For a non-NAT flow both keys — and both families — match.
     let ingress_key = ingress_flow_key.unwrap_or(flow_key);
     let ingress_is_v6 = ingress_key.addr_family as i32 == libc::AF_INET6;
-    let has_output_tx_eval = crate::filter::interface_output_filter_needs_tx_eval(
+    // #6236 PR-2C: one lookup for both the gate and the walk. The borrow is gated
+    // on `Filter::needs_tx_eval()`, so `has_output_tx_eval` is just `.is_some()`
+    // and `output_filter` needs no second `.get()` or re-`filter(needs_tx_eval)`.
+    // The PR-2A `has_output_needs_tx_eval_*` aggregate already short-circuited the
+    // whole path upstream (`tx_selection_enabled`), so this per-interface lookup
+    // only runs when a needs-tx-eval filter exists SOMEWHERE.
+    let output_filter = crate::filter::interface_output_filter_needing_tx_eval(
         &forwarding.filter_state,
         egress_ifindex,
         is_v6,
     );
+    let has_output_tx_eval = output_filter.is_some();
     let has_input_tx_selection =
         crate::filter::filter_state_has_input_tx_selection(&forwarding.filter_state, ingress_is_v6);
     let has_input_three_color_policer =
@@ -290,31 +283,7 @@ fn resolve_cached_cos_tx_selection_impl(
     {
         return CachedTxSelectionDescriptor::default();
     }
-    let output_filter = if has_output_tx_eval {
-        if is_v6 {
-            forwarding
-                .filter_state
-                .iface_filter_out_v6_fast
-                .get(&egress_ifindex)
-                .map(Arc::as_ref)
-        } else {
-            forwarding
-                .filter_state
-                .iface_filter_out_v4_fast
-                .get(&egress_ifindex)
-                .map(Arc::as_ref)
-        }
-    } else {
-        None
-    };
     let output_result = output_filter
-        .filter(|filter| {
-            filter.affects_tx_selection
-                || filter.has_counter_terms
-                || filter.has_log_terms
-                || filter.has_terminal_action_terms
-                || filter.has_three_color_policer_terms
-        })
         .map(|filter| {
             crate::filter::evaluate_filter_ref_tx_selection_cached(
                 filter,
@@ -645,74 +614,55 @@ fn resolve_cos_tx_selection_internal(
         let mut drop = false;
         let mut reject = false;
         let mut filter_log = None;
-        if crate::filter::interface_output_filter_needs_tx_eval(
+        // #6236 PR-2C: fold the `needs_tx_eval` precheck and the output-filter
+        // fetch into ONE lookup (see the cached flowless arm above).
+        if let Some(output_filter) = crate::filter::interface_output_filter_needing_tx_eval(
             &forwarding.filter_state,
             egress_ifindex,
             is_v6,
         ) && let Some((src_ip, dst_ip)) = meta.l3_addrs()
         {
-            let output_filter = if is_v6 {
-                forwarding
-                    .filter_state
-                    .iface_filter_out_v6_fast
-                    .get(&egress_ifindex)
-                    .map(Arc::as_ref)
+            // Mirror the flow-keyed eval entry points below: ports are 0
+            // (L4 absent), `extra` carries the frame-derived is-fragment /
+            // l4-present=false predicates so port/flag/icmp-type terms fail
+            // closed. The counted variants record `then count` exactly once
+            // (this is the only output-filter walk on the flowless path).
+            let output_result = if let Some(now_ns) = now_ns {
+                crate::filter::evaluate_filter_ref_tx_selection_runtime_counted(
+                    output_filter,
+                    src_ip,
+                    dst_ip,
+                    meta.protocol,
+                    0,
+                    0,
+                    meta.dscp,
+                    extra,
+                    meta.pkt_len as u64,
+                    now_ns,
+                )
             } else {
-                forwarding
-                    .filter_state
-                    .iface_filter_out_v4_fast
-                    .get(&egress_ifindex)
-                    .map(Arc::as_ref)
+                crate::filter::evaluate_filter_ref_tx_selection_counted(
+                    output_filter,
+                    src_ip,
+                    dst_ip,
+                    meta.protocol,
+                    0,
+                    0,
+                    meta.dscp,
+                    extra,
+                    meta.pkt_len as u64,
+                )
             };
-            if let Some(output_filter) = output_filter.filter(|filter| {
-                filter.affects_tx_selection
-                    || filter.has_counter_terms
-                    || filter.has_log_terms
-                    || filter.has_terminal_action_terms
-                    || filter.has_three_color_policer_terms
-            }) {
-                // Mirror the flow-keyed eval entry points below: ports are 0
-                // (L4 absent), `extra` carries the frame-derived is-fragment /
-                // l4-present=false predicates so port/flag/icmp-type terms fail
-                // closed. The counted variants record `then count` exactly once
-                // (this is the only output-filter walk on the flowless path).
-                let output_result = if let Some(now_ns) = now_ns {
-                    crate::filter::evaluate_filter_ref_tx_selection_runtime_counted(
-                        output_filter,
-                        src_ip,
-                        dst_ip,
-                        meta.protocol,
-                        0,
-                        0,
-                        meta.dscp,
-                        extra,
-                        meta.pkt_len as u64,
-                        now_ns,
-                    )
-                } else {
-                    crate::filter::evaluate_filter_ref_tx_selection_counted(
-                        output_filter,
-                        src_ip,
-                        dst_ip,
-                        meta.protocol,
-                        0,
-                        0,
-                        meta.dscp,
-                        extra,
-                        meta.pkt_len as u64,
-                    )
-                };
-                // Same collapse as the flow-keyed path: any non-`Accept`
-                // terminal action or a three-color-policer drop sets `drop`;
-                // `reject` isolates the `then reject` subset. A flowless deny
-                // is always a SILENT drop downstream (a fragment has no L4
-                // header to synthesize a reply from, #3615) — the caller
-                // gates the active reject reply on a real L4 flow.
-                drop = output_result.policer_drop
-                    || output_result.action != crate::filter::FilterAction::Accept;
-                reject = output_result.action == crate::filter::FilterAction::Reject;
-                filter_log = output_result.log_match;
-            }
+            // Same collapse as the flow-keyed path: any non-`Accept`
+            // terminal action or a three-color-policer drop sets `drop`;
+            // `reject` isolates the `then reject` subset. A flowless deny
+            // is always a SILENT drop downstream (a fragment has no L4
+            // header to synthesize a reply from, #3615) — the caller
+            // gates the active reject reply on a real L4 flow.
+            drop = output_result.policer_drop
+                || output_result.action != crate::filter::FilterAction::Accept;
+            reject = output_result.action == crate::filter::FilterAction::Reject;
+            filter_log = output_result.log_match;
         }
         return CoSTxSelection {
             queue_id,
@@ -730,11 +680,15 @@ fn resolve_cos_tx_selection_internal(
     // and both families — match, so this is a no-op there.
     let ingress_key = ingress_flow_key.unwrap_or(flow_key);
     let ingress_is_v6 = ingress_key.addr_family as i32 == libc::AF_INET6;
-    let has_output_tx_eval = crate::filter::interface_output_filter_needs_tx_eval(
+    // #6236 PR-2C: one lookup for both the gate and the walk (see the cached
+    // flow-keyed arm above). The PR-2A `has_output_needs_tx_eval_*` aggregate
+    // (`tx_selection_enabled`) already short-circuited the whole path upstream.
+    let output_filter = crate::filter::interface_output_filter_needing_tx_eval(
         &forwarding.filter_state,
         egress_ifindex,
         is_v6,
     );
+    let has_output_tx_eval = output_filter.is_some();
     let has_input_tx_selection =
         crate::filter::filter_state_has_input_tx_selection(&forwarding.filter_state, ingress_is_v6);
     let has_input_three_color_policer =
@@ -755,23 +709,6 @@ fn resolve_cos_tx_selection_internal(
             filter_log: None,
         };
     }
-    let output_filter = if has_output_tx_eval {
-        if is_v6 {
-            forwarding
-                .filter_state
-                .iface_filter_out_v6_fast
-                .get(&egress_ifindex)
-                .map(Arc::as_ref)
-        } else {
-            forwarding
-                .filter_state
-                .iface_filter_out_v4_fast
-                .get(&egress_ifindex)
-                .map(Arc::as_ref)
-        }
-    } else {
-        None
-    };
     // #hb166 T-3: evaluate the INGRESS input filter for its forwarding-class /
     // dscp-rewrite whenever an input tx-selection filter (or an input
     // three-color policer) exists — INCLUDING when an OUTPUT filter is also
@@ -810,13 +747,9 @@ fn resolve_cos_tx_selection_internal(
     } else {
         None
     };
-    let output_result = if let Some(output_filter) = output_filter.filter(|filter| {
-        filter.affects_tx_selection
-            || filter.has_counter_terms
-            || filter.has_log_terms
-            || filter.has_terminal_action_terms
-            || filter.has_three_color_policer_terms
-    }) {
+    // #6236 PR-2C: `output_filter` is already gated on `needs_tx_eval()` by
+    // `interface_output_filter_needing_tx_eval`, so no second `.filter()`.
+    let output_result = if let Some(output_filter) = output_filter {
         if let Some(now_ns) = now_ns {
             crate::filter::evaluate_filter_ref_tx_selection_runtime_counted(
                 output_filter,

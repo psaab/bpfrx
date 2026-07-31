@@ -28,9 +28,10 @@ each cluster has a clear ownership boundary.
 
 | File | Purpose |
 |------|---------|
-| `mod.rs` | `BindingWorker` struct + shared-binding helpers + `pub(crate) use loop_body::worker_loop` re-export. |
-| `loop_body/mod.rs` | `worker_loop` body (extracted in #1326 Phase 1; decomposed in #1776). Per-tick orchestrator — all per-tick logic stays inline here. |
-| `loop_body/setup.rs` | #1776 — one-shot cold setup (`worker_loop_setup`): thread pin via `pin_current_thread` (defined in `afxdp/neighbor.rs`), TSC calibration, binding construction, BPF-map-FD cache; returns `WorkerLoopSetup`. |
+| `mod.rs` | `BindingWorker` struct + shared-binding helpers + `pub(crate) use loop_body::worker_loop` re-export + `pub(crate) use launch::{…}` bundle re-exports (#6241). |
+| `loop_body/mod.rs` | `worker_loop` body (extracted in #1326 Phase 1; decomposed in #1776). Per-tick orchestrator — all per-tick logic stays inline here. #6241: `worker_loop` now takes 5 typed launch bundles (see `launch.rs`) and destructures them at entry into the same locals used today, so the setup call and the steady loop body are textually unchanged. |
+| `launch.rs` | #6241 — the 5 typed worker-launch bundles (`WorkerLaunchPlan`, `WorkerSharedDataplane`, `WorkerControlChannels`, `WorkerCoSState`, `WorkerPublishedTelemetry`) + 2 nested (`WorkerNeighbors`, `WorkerSharedSessions`) that replace the old 38-parameter positional `worker_loop` protocol. `WorkerSharedDataplane::from_coord` / `WorkerCoSState::from_coord` (coordinator-published state) and the `::new` builders (per-worker slots) are the single named construction sites; `Arc::ptr_eq` wiring tests bind them (fail-on-revert for the session-map and heartbeat/export-ack silent-swap hazards). |
+| `loop_body/setup.rs` | #1776 — one-shot cold setup (`worker_loop_setup`): thread pin via `pin_current_thread` (defined in `afxdp/neighbor.rs`), TSC calibration, binding construction, BPF-map-FD cache; returns `WorkerLoopSetup`. #6245: binding construction now accumulates EXPLICIT per-slot terminal failures (`binding_failures`) + recovered shared-group fallbacks (`recovered_fallbacks`), sorted deterministically and carried through `WorkerLoopSetup` into `WorkerStartupReport` (the failed slot is no longer signalled only by OMISSION from `bindings`). See `coordinator/README.md` #6245. |
 | `loop_body/debug_report.rs` | #1776 — cfg(debug-log)-only `DbgCounters` + per-second verbose report (`emit_periodic_report`) + stall dump (`check_and_dump_stall`). Compiled out of release builds. |
 | `lifecycle.rs` | `poll_binding` — the per-poll RX/TX orchestrator. The "central function" extracted in Issue 73 step 2. |
 | `cos.rs` | Per-worker CoS runtime helpers + shared-exact threshold (the empirical sustained per-worker exact throughput ceiling — see comment block in the file for the evidence basis). |
@@ -85,6 +86,22 @@ each cluster has a clear ownership boundary.
   authoritative after worker start, so a bind path that only logs the
   kernel role but does not update live status will make the CLI report
   `Shared UMEM bindings: 0/N` even when the sockets are actually shared.
+- `worker_loop`'s launch protocol is the 5 typed bundles in `launch.rs`
+  (#6241), destructured at entry into the EXACT same locals the loop body
+  used before. This is behavior-preserving (Refactor class A): the bundles
+  are MOVED in and consumed once at entry — zero added clone / alloc /
+  reference-indirection, and nothing bundle-shaped survives into the hot
+  10K–100K-tick/s loop (the #1776 no-inline-boundary constraint). Do not
+  add a per-tick `self.shared.*` field access; keep the entry-destructure
+  shape. `WorkerPublishedTelemetry.recent_exceptions` and `.last_resolution`
+  carry a #6242 lifecycle contract that is now INTEGRATED: they are the SAME
+  `Arc`s the worker's per-worker `WorkerRuntimeRecord`
+  (`coordinator/worker_manager.rs`, keyed by `worker_id` in `workers.records`)
+  owns. `bring_up_workers` allocates each once, retains one clone for the
+  record and moves the original into this bundle — one shared allocation, no
+  re-allocation. The record is registered as ONE `records.insert` AFTER the
+  spawn succeeds, so the live worker and the record share the alloc for the
+  worker's lifetime.
 - `BindingWorker::new_for_cos_drain_test` is test-only scaffolding for
   hermetic CoS service-path tests. It uses in-memory AF_XDP ring fixtures
   and must not become a production construction path; production workers

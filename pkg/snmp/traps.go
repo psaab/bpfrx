@@ -390,17 +390,40 @@ func (a *Agent) enqueueTrap(job trapJob) {
 		a.trapWG.Add(1)
 		go a.trapWorker(a.trapQueue, a.trapStop)
 	})
-	q := a.trapQueue
-	a.mu.Unlock()
-
+	// C180-026: publish under the SAME a.mu that Stop takes to set stopped /
+	// close trapStop, so an enqueue and a Stop are strictly serialized. This
+	// makes shutdown accounting EXACT (accepted == delivered + trapsDropped
+	// with no residual):
+	//
+	//   - If this enqueue wins the lock, it sends into the buffered queue (or
+	//     counts a queue-full drop) BEFORE Stop can close trapStop. The worker
+	//     only drains on stop, so close(trapStop) happens-after this send, and
+	//     the worker's shutdown drain (countAbandonedTraps) counts the buffered
+	//     job — it cannot have exited before the job was queued.
+	//   - If Stop wins the lock, it sets stopped and closes trapStop first; this
+	//     enqueue then observes stopped above and drops+counts.
+	//
+	// Either way the job is delivered or counted exactly once. Before this the
+	// send ran AFTER unlocking, so an enqueue that passed the stopped check
+	// could buffer into an orphaned queue after the worker had already drained
+	// and exited — a job neither sent nor counted. The send is NON-BLOCKING (a
+	// buffered channel + default), and the worker never takes a.mu, so holding
+	// the lock across the send cannot deadlock on a slow/absent reader: a full
+	// queue drops immediately.
+	sent := false
 	select {
-	case q <- job:
+	case a.trapQueue <- job:
+		sent = true
 	default:
-		dropped := a.trapsDropped.Add(1)
-		slog.Warn("SNMP trap queue full, dropping trap",
-			"target", job.target, "group", job.group,
-			"event", job.event, "iface", job.iface, "dropped_total", dropped)
 	}
+	a.mu.Unlock()
+	if sent {
+		return
+	}
+	dropped := a.trapsDropped.Add(1)
+	slog.Warn("SNMP trap queue full, dropping trap",
+		"target", job.target, "group", job.group,
+		"event", job.event, "iface", job.iface, "dropped_total", dropped)
 }
 
 // trapWorker drains the trap queue, performing the blocking dial/write for each
@@ -414,6 +437,15 @@ func (a *Agent) enqueueTrap(job trapJob) {
 // revoked) and the goroutine always exits — no leak per disable/re-enable
 // cycle. The queue and stop channel are passed in (rather than read from the
 // struct) so the worker never races Stop's field access. Stop waits on trapWG.
+//
+// C180-026: the abandoned backlog is ACCOUNTED for — the worker counts
+// every dequeued-but-unsent job (Stop raced the re-check) plus every job left
+// buffered in the queue into trapsDropped exactly once before exiting. Before
+// this, Stop discarded the queued link-state traps (during SNMP disable /
+// target rotation / shutdown) while trapsDropped omitted them, so the drop
+// total under-reported — it reflected only queue-full and post-Stop-enqueue
+// drops. The worker is the SOLE reader of the queue, so the drain removes each
+// job once and no other goroutine can double-count it.
 func (a *Agent) trapWorker(queue chan trapJob, stop chan struct{}) {
 	defer a.trapWG.Done()
 	// Snapshot the sender once at worker start. It is set at construction
@@ -427,6 +459,9 @@ func (a *Agent) trapWorker(queue chan trapJob, stop chan struct{}) {
 	for {
 		select {
 		case <-stop:
+			// Stop fired with no job in hand: account for whatever remains
+			// buffered in the queue, then exit.
+			a.countAbandonedTraps(queue)
 			return
 		case job, ok := <-queue:
 			if !ok {
@@ -437,6 +472,14 @@ func (a *Agent) trapWorker(queue chan trapJob, stop chan struct{}) {
 			// concurrently with Stop must not be sent after Stop.
 			select {
 			case <-stop:
+				// This job was dequeued but must not be sent (Stop raced the
+				// outer select). Count it, then account for the rest of the
+				// buffered backlog, then exit.
+				dropped := a.trapsDropped.Add(1)
+				slog.Warn("SNMP trap abandoned on stop, dropping trap",
+					"target", job.target, "group", job.group,
+					"event", job.event, "iface", job.iface, "dropped_total", dropped)
+				a.countAbandonedTraps(queue)
 				return
 			default:
 			}
@@ -449,6 +492,37 @@ func (a *Agent) trapWorker(queue chan trapJob, stop chan struct{}) {
 					"target", job.target, "group", job.group,
 					"event", job.event, "iface", job.iface, "ifindex", job.ifindex)
 			}
+		}
+	}
+}
+
+// countAbandonedTraps drains the trap queue without blocking, counting every
+// buffered-but-undelivered job into trapsDropped exactly once. It runs only
+// from the trap worker at shutdown (after stop was observed); the worker is the
+// sole reader of the queue, so no other goroutine removes jobs concurrently and
+// no job is double-counted. The non-blocking default terminates the drain when
+// the buffer is empty.
+//
+// C180-026: this drain now counts EVERY buffered job, not just the common
+// backlog. enqueueTrap publishes to the queue under the same a.mu that Stop
+// takes to close trapStop, so any job admitted to the queue is buffered strictly
+// before close(trapStop) is observable — the worker cannot have drained and
+// exited before the job was queued. Combined with the dequeued-but-unsent count
+// in trapWorker, shutdown accounting is exact: accepted == delivered +
+// trapsDropped, with no post-drain residual.
+func (a *Agent) countAbandonedTraps(queue chan trapJob) {
+	for {
+		select {
+		case job, ok := <-queue:
+			if !ok {
+				return
+			}
+			dropped := a.trapsDropped.Add(1)
+			slog.Warn("SNMP trap abandoned on stop, dropping trap",
+				"target", job.target, "group", job.group,
+				"event", job.event, "iface", job.iface, "dropped_total", dropped)
+		default:
+			return
 		}
 	}
 }

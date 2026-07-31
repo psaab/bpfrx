@@ -14,7 +14,7 @@ use crate::afxdp::tx::recycle_prepared_immediately_with_shared;
 use crate::afxdp::types::{
     PreparedTxRequest, TxRequest, WorkerCoSInterfaceFastPath, WorkerCoSQueueFastPath, WorkerCommand,
 };
-use crate::afxdp::umem::BindingLiveState;
+use crate::afxdp::binding_state::BindingLiveState;
 use crate::afxdp::worker::BindingWorker;
 
 /// #780: Step 1 action variants. Mirrors the action taken inside
@@ -192,11 +192,16 @@ pub(in crate::afxdp) fn redirect_prepared_cos_request_to_owner(
     if owner_worker_id == current_worker_id {
         return Err(req);
     }
+    // #6310: reuse a per-worker pooled buffer for the cross-worker copy
+    // instead of a per-packet `frame.to_vec()`. The bytes MUST be owned
+    // (the source frame is recycled below, before the owner worker
+    // consumes them on its own thread); the pool only changes the
+    // allocation strategy, not the bytes. See `cos::redirect_pool`.
     let Some(frame) = binding
         .umem
         .area()
         .slice(req.offset as usize, req.len as usize)
-        .map(|frame| frame.to_vec())
+        .map(crate::afxdp::cos::redirect_pool::checkout)
     else {
         return Err(req);
     };
@@ -240,11 +245,14 @@ pub(in crate::afxdp) fn redirect_prepared_cos_request_to_owner_binding(
     if Arc::ptr_eq(owner_live, &binding.live) {
         return Err(req);
     }
+    // #6310: reuse a per-worker pooled buffer for the cross-worker copy
+    // instead of a per-packet `frame.to_vec()` (owned copy is required —
+    // the source frame is recycled below). See `cos::redirect_pool`.
     let Some(frame) = binding
         .umem
         .area()
         .slice(req.offset as usize, req.len as usize)
-        .map(|frame| frame.to_vec())
+        .map(crate::afxdp::cos::redirect_pool::checkout)
     else {
         return Err(req);
     };

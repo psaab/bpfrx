@@ -579,14 +579,14 @@ func (d *Daemon) handleConfigSync(configText string) error {
 		slog.Error("cluster: config sync apply failed", "err", err)
 		return err
 	}
-	// #4957: the sync applied to completion (syncAndApply returned nil, so both
-	// the dataplane apply and the session invalidation succeeded). Record the
-	// active config as applied so a duplicate re-push takes the converged
-	// shortcut above — and, conversely, so a config that only PROMOTED active but
-	// failed to apply does NOT, keeping the high-water pinned until a retry lands.
-	if d.store != nil {
-		d.store.MarkActiveApplied()
-	}
+	// #4957/#6296: on full success syncAndApply itself stamps the applied marker
+	// — from a digest captured for the config it applied, while still holding
+	// applySem — so a duplicate re-push takes the converged shortcut above, and a
+	// config that only PROMOTED active but failed to apply does NOT (keeping the
+	// high-water pinned until a retry lands). The stamp moved INTO syncAndApply
+	// (from a post-applySem-release MarkActiveApplied here) so a concurrent
+	// secondary-side promoter mutating s.active in the release window can no
+	// longer make the marker key the wrong, unapplied active digest (#6296).
 	slog.Info("cluster: config sync applied successfully")
 	return nil
 }
@@ -912,6 +912,17 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				return d.handleConfigSync(configText)
 			}
 
+			// #6387: surface a persistent config-sync APPLY failure as a
+			// node-global CF monitor-failure / degraded health. configApplyLoop
+			// fires this on the time-based stale-duration edge (raise) and on
+			// the first post-failure success (clear); the cluster manager stores
+			// it as a diagnostic-only annotation. This never gates failover —
+			// manual failover stays gated solely by ConfigStale(); crash
+			// takeover stays ungated.
+			ss.OnConfigApplyHealth = func(failing bool, reason string) {
+				d.cluster.SetConfigSyncHealth(failing, reason)
+			}
+
 			// Wire peer connected callback: reconcile config to the returning
 			// peer. #5863: the push is level-triggered, not a one-shot connect
 			// edge — reconcileConfigSyncToPeer re-evaluates the RG0-authority +
@@ -1067,7 +1078,11 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// #5079: size the owner-side transfer-out lease above the requester's
 			// worst-case post-ACK commit latency — the local commit-ready settle
 			// window (localFailoverCommitTimeout) plus the commit round-trip — so
-			// a legitimate slow commit never trips it. The cluster floors it.
+			// a legitimate slow commit never trips it. The cluster floors it. The
+			// upstream 20s failover-ACK cap (failoverAckTimeout, sync.go) bounds
+			// the actuation-barrier contribution: if the owner takes longer than
+			// 20s to ack, the requester times out and sends NO commit, so a large
+			// failoverActuateTimeout cannot delay a real commit past this lease.
 			d.cluster.SetRemoteTransferOutLeaseDuration(2*d.localFailoverCommitTimeout + 20*time.Second)
 			d.cluster.SetTransferReadinessFunc(d.userspaceTransferReadiness)
 			d.cluster.SetPeerTimeoutGuard(d.shouldSuppressPeerHeartbeatTimeout)

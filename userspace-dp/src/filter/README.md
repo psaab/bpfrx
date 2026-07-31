@@ -40,7 +40,9 @@ Mirrors the BPF firewall-filter pipeline in userspace.
     protocol esp; then discard` term matched EVERY protocol — a
     fail-wide security bug. The Go gate is the primary defense; this is
     the helper-boundary backstop against version/snapshot drift.
-- `engine.rs` — per-term evaluation, first-match-wins. It carries the
+- `engine/` — per-term evaluation, first-match-wins (the #1546 split of
+  the monolithic `engine.rs` into `mod.rs` / `eval.rs` / `matching.rs` /
+  `policer.rs` / `tx_selection.rs` / `cache_sensitive*.rs`). It carries the
   matched `then policer ...` name in the filter result. Routing-instance
   evaluation can also return log/action/filter/term metadata so AF_XDP
   can emit PBR RT_FLOW filter-log events without re-evaluating the term
@@ -501,13 +503,16 @@ exactly one of these two classes:
 | `is_fragment` (#2362) | NO — cache-sensitive | Junos `is-fragment`: matches ANY fragment (IPv4 MF set OR offset != 0; IPv6 fragment header present). Computed by `is_any_fragment` |
 | (future) `ihl_match` / IP options | NO — cache-sensitive | IHL varies per packet |
 | `icmp_type` / `icmp_code` (#2362) | NO — cache-sensitive | exact match on the ICMP/ICMPv6 type/code byte; non-ICMP packets never match. Could later be promoted to cache-key by adding (type, code) to `SessionKey` |
-| `flex_match` (#3077, #3232) | NO — cache-sensitive | Junos `from flexible-match-range`: reads `length` bytes (1..4) at `offset` from the START of the base header selected by `flex_match_start` (#3232) — `Layer3` (match-start layer-3, the default) reads from `TermMatchExtra::flex_l3` (the L3/IP header); `Layer4` (match-start layer-4) reads from `TermMatchExtra::flex_l4` (the transport header at `meta.l4_offset`); `Unsupported` (any other match-start, e.g. `payload`, that the Go commit gate rejects but the tolerant peer-sync path could still deliver) always FAILS CLOSED. The chosen bytes are ANDed with `mask` and required to `== value`. Byte-offset read, fully per-packet. The base slice being `None` (no frame / deferred CoS path; or, for layer-4, a non-first fragment whose post-IP bytes are payload) or a packet too short for the window FAILS CLOSED (no match, no OOB). **#5150: both base slices end at the IP-DECLARED datagram end (`l3_offset + IPv4 total-length`, or `l3_offset + 40 + IPv6 payload-length`), CLAMPED to `frame.len()` — NOT the physical frame end.** So attacker-controlled bytes in Ethernet slack (padding beyond the declared IP length) are excluded (a byte-match can only see the logical IP datagram), and a lying oversized IP length can never over-read past the frame. Before #5150 the slices extended to `frame.len()`, letting a flex term match padding bytes (match-on-padding / filter-evasion). Compiled from `FlexMatchSnapshot`; before #3077 the constraint was parsed but dropped on the wire (matched too broadly, fail-open); before #3232 a layer-4/payload match-start was silently evaluated at the L3 base (wrong-offset match — security evasion). **#5293: all six `flex_*` fields (`flex_enabled`, `flex_offset`, `flex_length`, `flex_value`, `flex_mask`, `flex_match_start`) are now compared in `filter_term_semantics_match` (`engine/cache_sensitive.rs`) — before #5293 they were omitted from the forwarding-rotation change detector, so a rotation touching only a flex field skipped the session purge and stranded established sessions on their stale routing-instance / forwarding decision (cross-VRF policy-coherency failure)** |
+| `flex_match` (#3077, #3232) | NO — cache-sensitive | Junos `from flexible-match-range`: reads `length` bytes (1..4) at `offset` from the START of the base header selected by `flex_match_start` (#3232) — `Layer3` (match-start layer-3, the default) reads from `TermMatchExtra::flex_l3` (the L3/IP header); `Layer4` (match-start layer-4) reads from `TermMatchExtra::flex_l4` (the transport header at `meta.l4_offset`); `Unsupported` (any other match-start, e.g. `payload`, that the Go commit gate rejects but the tolerant peer-sync path could still deliver) always FAILS CLOSED. The chosen bytes are ANDed with `mask` and required to `== value`. Byte-offset read, fully per-packet. The base slice being `None` (no frame / deferred CoS path; or, for layer-4, a non-first fragment whose post-IP bytes are payload) or a packet too short for the window FAILS CLOSED (no match, no OOB). **#5150: both base slices end at the IP-DECLARED datagram end (`l3_offset + IPv4 total-length`, or `l3_offset + 40 + IPv6 payload-length`), CLAMPED to `frame.len()` — NOT the physical frame end.** So attacker-controlled bytes in Ethernet slack (padding beyond the declared IP length) are excluded (a byte-match can only see the logical IP datagram), and a lying oversized IP length can never over-read past the frame. Before #5150 the slices extended to `frame.len()`, letting a flex term match padding bytes (match-on-padding / filter-evasion). Compiled from `FlexMatchSnapshot`; before #3077 the constraint was parsed but dropped on the wire (matched too broadly, fail-open); before #3232 a layer-4/payload match-start was silently evaluated at the L3 base (wrong-offset match — security evasion). **#5293: all six `flex_*` fields (`flex_enabled`, `flex_offset`, `flex_length`, `flex_value`, `flex_mask`, `flex_match_start`) are now compared in `filter_term_semantics_match` (`engine/cache_sensitive/rotation.rs`) — before #5293 they were omitted from the forwarding-rotation change detector, so a rotation touching only a flex field skipped the session purge and stranded established sessions on their stale routing-instance / forwarding decision (cross-VRF policy-coherency failure)** |
 
 The `tcp_flags_mask` / `tcp_flags_forbidden` / `is_fragment` / `icmp_type` /
 `icmp_code` inputs (and the #3077 `flex_match` L3 slice, `flex_l3`) are
 carried in a small `TermMatchExtra` built once per packet at the filter-eval
-call sites (`term_match_extra_from_frame` and its `ForwardPacketMeta` /
-meta-only variants). `flex_l3` borrows the live frame's L3 header, so
+call sites (`term_match_extra_from_frame` — one unified builder since #6435,
+generic over `impl Into<ForwardPacketMeta>` so the input-filter
+`UserspaceDpMeta` and TX-selection `ForwardPacketMeta` callers share it, the
+byte-identical `_fwd` twin retired — and the meta-only
+`term_match_extra_from_meta`). `flex_l3` borrows the live frame's L3 header, so
 `TermMatchExtra` is parameterized by a lifetime; the deferred CoS/TX-selection
 snapshot drops the borrow (`to_static()` → `flex_l3 = None`) and the flex term
 fails closed there (the frame may be recycled). The builder is fragment-safe:
@@ -538,7 +543,8 @@ than spuriously matching `icmp-type 0` / `icmp-code 0`.
 **#5568 (SCALAR declared-length bound).** #2449 keyed the ICMP presence test on
 the physical `frame.len()`; #5568 keys EVERY scalar L4/fragment input on the
 IP-DECLARED datagram end (`ip_declared_end` — the same SSOT that bounds the
-#5150 flex slices), computed FIRST in both frame builders. The shim stamps
+#5150 flex slices), computed FIRST in the frame builder (one unified builder
+for both metadata flavors since #6435). The shim stamps
 `l3_offset`/`l4_offset` from the raw frame, so without this, attacker-controlled
 Ethernet padding beyond the declared IP length manufactures a scalar match out of
 slack. Concretely: (a) the fragment walkers (`is_any_fragment` /
@@ -607,7 +613,7 @@ DNAT). A bare-host address (`203.0.113.7`, no `/32`) is handled by
 `parse_address`'s bare-IP fallback (`IpNet::parse` rejects a bare IP). The flags
 are DERIVED from the existing snapshot lists, so there is NO new wire field
 (`protocol_wire_v1.json` is unchanged). The flags are also compared in
-`filter_term_semantics_match` (`engine/cache_sensitive.rs`) because the
+`filter_term_semantics_match` (`engine/cache_sensitive/rotation.rs`) because the
 unscoped↔all-malformed transition flips match semantics WITHOUT changing the
 parsed vecs/matcher, so a flow-cache rebuild must catch it.
 
@@ -632,7 +638,7 @@ per-direction wire flags on `FirewallTermSnapshot` — `source_except` /
 `FilterTerm.source_except` / `dest_except`, and the matcher
 (`engine/matching.rs` `nets_match_v4` / `nets_match_v6`) evaluates
 `nets.iter().any(contains) ^ except`. The except flags are compared in
-`filter_term_semantics_match` (`engine/cache_sensitive.rs`) — they flip the
+`filter_term_semantics_match` (`engine/cache_sensitive/rotation.rs`) — they flip the
 address decision without changing the parsed vecs, so a flow-cache rebuild must
 catch a toggle.
 
@@ -707,6 +713,114 @@ peer-sync path. An EMPTY reference (no filter on the hook) is the legitimate
 both lo0 input families. Tests: `missing_filter_ref_3296_*` /
 `defined_filter_ref_3296_compiles_cleanly` in `filter/tests.rs` (fail-on-revert).
 
+The fail-closed contract keys off the RETAINED per-interface fast maps
+(`iface_filter_*_fast`) — the structures the per-interface hot path consults —
+and the FAMILY-WIDE global TX gate keys off the `has_output_needs_tx_eval_*`
+aggregate (#6236 PR-2A; see "Output-filter TX-eval predicate and aggregates"
+below). #6236 PR-2B deleted the parallel per-interface property sets
+(`iface_filter_v{4,6}_affects_route_lookup` / `_has_dscp_match` /
+`_has_per_packet_l4_match` and `iface_filter_out_{v4,v6}_needs_tx_eval`); every
+capability accessor now reads the mirrored `Filter` flag off the fast-map entry,
+so a single `.get()` returns the filter and every derived flag. #6236 PR-1
+removed the dead parallel bookkeeping that shadowed these:
+the four `"family:name"` name maps (`iface_filter_v4`/`iface_filter_v6`/
+`iface_filter_out_v4`/`iface_filter_out_v6`), the two input
+`iface_filter_v{4,6}_affects_tx_selection` sets (their only reader was a
+test-only helper; production reads the family-wide `has_input_tx_selection_*`
+aggregate), and the two `lo0_filter_v{4,6}` qualified-key Strings (now compiler
+locals used only to look up `lo0_filter_v{4,6}_fast`). The `MissingFilterRef`
+guards are byte-for-byte unchanged — deleting a name-map `.insert` never touched
+the `filters.get()` presence check that precedes it. `FilterState` drops from 31
+to 23 fields with zero live-dataplane behavior change.
+
+### Output-filter TX-eval predicate and aggregates (#6236 PR-2A/2B)
+
+An output filter must still be walked on the TX path when it can change or
+observe the packet: CoS/DSCP tx-selection, a `then count`, a `then log`, a
+terminal (non-`accept`) action, or a three-color policer. That five-flag OR is
+now the **single** `Filter::needs_tx_eval()` method (`filter/mod.rs`), the SOLE
+definition. Every consumer routes through it — the
+`interface_output_filter_needs_tx_eval` accessor (fast-map backed since PR-2B),
+the `has_output_needs_tx_eval_*` aggregates, and all four `cos_classify` TX arms
+(cached/runtime × flow-keyed/flowless) — so the composite can never drift
+between the compile path and the hot path.
+
+**Capability accessors read the fast map (#6236 PR-2B).** The four hot
+per-interface capability prechecks — `interface_filter_affects_route_lookup`,
+`interface_input_filter_has_dscp_match`,
+`interface_input_filter_has_per_packet_l4_match`, and
+`interface_output_filter_needs_tx_eval` — read the mirrored `Filter` flag off
+`iface_filter_*_fast.get(&ifindex)` (e.g. `.is_some_and(|f| f.has_dscp_match_terms)`)
+rather than a parallel `FxHashSet<i32>`. PR-2B deleted those eight property sets
+(`iface_filter_v{4,6}_affects_route_lookup` / `_has_dscp_match` /
+`_has_per_packet_l4_match` and `iface_filter_out_{v4,v6}_needs_tx_eval`). For a
+unique ifindex the fast-map read is bit-identical to the old `set.contains`
+(the set was populated iff the same `Filter` flag was set); for a duplicate
+ifindex the fast map is the last-wins canonical source, so the precheck now
+agrees with the filter the evaluator that follows actually walks. `FilterState`
+drops from 25 to 15 fields.
+
+**Co-located lookups fold to one (#6236 PR-2C).** After PR-2B a call site that
+checks N flags of the same ifindex paid N separate `iface_filter_*_fast.get()`
+lookups. PR-2C folds each co-located multi-flag check into ONE `.get()` that
+borrows `Option<&Arc<Filter>>` and evaluates every needed flag off that single
+borrow, through shared pure `&Filter` evaluator cores so the folded site and the
+per-flag accessor can never drift:
+
+- **Route-lookup / PBR precheck** (`afxdp/forwarding/pbr.rs`): the
+  `affects_route_lookup` precheck and the routing-instance evaluator used to look
+  the same ingress ifindex up twice on the input fast map. The SOLE lookup+gate
+  is now `interface_filter_route_lookup_affecting` (returns the borrowed
+  route-lookup-affecting `&Filter`); the bool `interface_filter_affects_route_lookup`
+  is `.is_some()` of it, and the PBR site feeds the borrow straight into the new
+  `&Filter` core `evaluate_filter_ref_routing_instance_event_counted`. One lookup.
+- **Session-hit DSCP/L4 re-eval gate** (`afxdp/poll_descriptor/filter.rs`): the
+  `has_dscp_match` + `has_per_packet_l4_match` prechecks fold to one lookup of
+  `interface_input_filter_varies_per_packet`, which reads the SOLE OR core
+  `Filter::varies_per_packet_within_flow()`. The flow-cache decline gate
+  (`afxdp/flow_cache.rs`) still consults the two per-flag accessors individually
+  (input **and** output directions), so they stay live.
+- **CoS TX-selection output arms** (`afxdp/tx/cos_classify.rs`, all four
+  cached/runtime × flow-keyed/flowless): the `needs_tx_eval` bool precheck + the
+  separate output-filter `.get()` + a redundant `.filter(needs_tx_eval)` fold to
+  one `interface_output_filter_needing_tx_eval` borrow (gated on
+  `Filter::needs_tx_eval()`; the bool `interface_output_filter_needs_tx_eval` is
+  `.is_some()` of it). The PR-2A family-wide `has_output_needs_tx_eval_*`
+  aggregate still short-circuits the whole TX path (`tx_selection_enabled_*`)
+  BEFORE any per-interface lookup — that fast branch is unchanged.
+
+The fold is behavior-preserving: for a unique ifindex the single borrow is the
+same `Arc<Filter>` the second lookup would have returned; the fast map is the
+last-wins SSOT for a duplicate. Anti-drift invariant: the accessor is
+`map.get(&if).is_some_and(|f| core(f))` and the folded site evaluates `core(f)`
+off the borrow — BOTH through the same `&Filter` core
+(`affects_route_lookup` field / `varies_per_packet_within_flow()` /
+`needs_tx_eval()`), pinned by `pr2c_folded_single_lookup_equals_two_lookup_path`
+in `filter/tests.rs`.
+
+**Aggregate-from-final-map rule.** Every retained family-wide `FilterState`
+aggregate (`has_input_tx_selection_*`, `has_input_three_color_policer_*`, and
+`has_output_needs_tx_eval_*`) is recomputed **after** the interface loop from the
+FINAL fast maps via `iface_filter_*_fast.values().any(..)`, NOT accumulated
+monotonically inside the loop. The fast maps overwrite last-wins on a duplicate
+ifindex, so a positive filter followed by a non-sensitive filter at the same
+ifindex must not leave a stale-true aggregate; deriving each aggregate from the
+final map makes it agree with the filter the hot path actually evaluates. For the
+common unique-ifindex case this is bit-identical to the old in-loop OR (only the
+duplicate-ifindex drift case changes, and it changes to the correct value).
+
+**Global TX gate.** `forwarding_build` computes the family-wide
+`tx_selection_enabled_v{4,6}` gate that short-circuits the entire `cos_classify`
+TX path. Its output clause is the single `has_output_needs_tx_eval_*` aggregate,
+which SUBSUMES both the old `has_output_tx_selection_*` clause AND the old
+`!iface_filter_out_*_needs_tx_eval.is_empty()` clause (because
+`needs_tx_eval ⊇ affects_tx_selection`, also covering counter/log/terminal/
+policer). This is behavior-equivalent — a counter/log/terminal/policer-only
+output filter keeps the gate armed, so its enforcement never fails open — and
+cannot be tricked by a duplicate-ifindex overwrite. PR-2A rewired the gate onto
+this aggregate; PR-2B then deleted the now-unread `has_output_tx_selection_*`
+fields and their production-dead accessor `filter_state_has_output_tx_selection`.
+
 Unparseable tcp-flags backstop (#3367): a term whose Junos `tcp-flags`
 expression the Go control plane could not parse into required/forbidden masks
 (disjunction, negated groups, unknown flags) is marked with the
@@ -780,6 +894,49 @@ Tests: `icmp_type_unrepresentable_marker_*`, `icmp_code_unrepresentable_marker_*
 `TestFilterSnapshot{ICMP,DSCPMatch,DSCPRewrite,FlexMatchOversizedWidth,MixedPortExcept}*`
 (Go) (fail-on-revert).
 
+Partially-unresolvable port/address list backstops (#6459/#6463): the same
+fail-closed family, a different failure MECHANISM. The #3406 markers cover the
+case where a dropped token leaves an EMPTY match vector (which the matcher
+reads as "no constraint" = WIDENING). A partially-unresolvable
+`from {source,destination}-port[-except]` list or literal
+`from {source,destination}-address` list fails the OTHER way: the surviving
+tokens still build a matcher, so the term silently enforces a NARROWER set
+than the operator wrote — a `then discard`/`reject` term drops only the
+surviving subset and the rest falls through to the implicit accept (fail-OPEN
+for the deny). The all-unresolvable case was already covered at match-time
+(`constrained && PortMatcher::Any` / `constrained && empty`, #2400/#3205);
+the partial case was not. Two wire bools close it, same shape as the #3406
+markers (Go builder sets, `parse_term` rejects the whole snapshot; strict
+commit gates `validateFilterMatchValuesStrict` /
+`validateFilterAddressLiteralsStrict` are the primary defense):
+
+- **`ports_unrepresentable` (#6459):** set when compileFilterFrom records any
+  unresolvable port token on `term.UnknownPorts`; `parse_term` raises
+  `SnapshotIntegrityError::UnrepresentableFilterPorts`.
+- **`address_unrepresentable` (#6463):** set when compileFilterFrom records
+  any literal address token `classifyFilterAddrFamily` rejects on
+  `term.UnknownAddresses`; `parse_term` raises
+  `SnapshotIntegrityError::UnrepresentableFilterAddress`.
+
+Sibling parser-alignment fix (#6477): the filter-side `parse_port_spec`
+(compiler.rs) now routes every numeric token through the SHARED digit-only
+`crate::policy::parse_port_u16` (#3606) instead of Rust's u16 `FromStr`, which
+accepts a leading `+` ("+80" → 80). One of four port parsers (Go commit gate,
+Go capability gate, policy-side Rust, filter-side Rust) was more lenient than
+the rest — the #3606 agreement-invariant residual; a tolerant-path `from
+destination-port +80` survived verbatim and was enforced as port 80 HERE only.
+A rejected token yields zero ranges on a constrained direction, so the term
+fails closed (matches nothing) rather than enforcing a token the other three
+parsers reject.
+
+Tests: `ports_unrepresentable_marker_*`, `address_unrepresentable_marker_*`,
+`filter_parse_port_spec_rejects_signed_6477`,
+`firewall_term_snapshot_unrepresentable_marker_wire_keys_6459_6463` (Rust) and
+`TestFilterSnapshot{Ports,Address}Unrepresentable*`,
+`TestFilterSnapshotLenientPartial{Port,Address}List*`,
+`TestFirewallTermSnapshotUnrepresentableMarkerWireKeys_6459_6463`,
+`TestFilterMalformedAddressRecorded_6463` (Go) (fail-on-revert).
+
 ### Negated port match — `source-port-except` / `destination-port-except` (#2622)
 
 Junos `from source-port-except` / `from destination-port-except` matches every
@@ -849,7 +1006,7 @@ implementation (#1430); use it as the template:
    `iface_filter_v{4,6}_has_dscp_match` fields in
    `userspace-dp/src/filter/mod.rs`.
 3. **Lookup helpers** in
-   `userspace-dp/src/filter/engine/cache_sensitive.rs` —
+   `userspace-dp/src/filter/engine/cache_sensitive/rotation.rs` —
    `interface_input_filter_has_<X>_match` and
    `interface_output_filter_has_<X>_match` (or thread the new
    flag through one general helper if the DSCP-specific
@@ -865,7 +1022,7 @@ implementation (#1430); use it as the template:
    `userspace-dp/src/afxdp/worker/loop_body/mod.rs:295-330`
    uses `input_dscp_filter_families_changed` to decide whether
    to purge sessions. Extend the semantics-match comparison in
-   `userspace-dp/src/filter/engine/cache_sensitive.rs`
+   `userspace-dp/src/filter/engine/cache_sensitive/rotation.rs`
    (`filter_term_semantics_match`) to cover the new match
    field's aggregate flag and per-term content. **Compare by
    content, never by compiler-positional filter/term IDs** —
@@ -884,7 +1041,7 @@ implementation (#1430); use it as the template:
    its per-packet-L4 session purge, and an established session
    stranded on its stale (pre-rotation) routing-instance /
    forwarding decision until timeout. Regression test:
-   `filter/engine/cache_sensitive.rs`
+   `filter/engine/cache_sensitive/rotation.rs`
    ::`flex_field_change_is_not_cache_equal`.
 7. **Tests** in `userspace-dp/src/afxdp/flow_cache_tests.rs`
    following the DSCP runbook pattern in

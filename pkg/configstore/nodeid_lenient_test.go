@@ -1,8 +1,6 @@
 package configstore
 
 import (
-	"bytes"
-	"log/slog"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -18,10 +16,10 @@ import (
 // wrong FPC naming with no diagnostic. RED-on-revert: without the lenient
 // warn, no "node identity mismatch" line is logged.
 func TestLenientNodeIDMismatchWarnsNotRejects(t *testing.T) {
-	var buf bytes.Buffer
-	old := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
-	t.Cleanup(func() { slog.SetDefault(old) })
+	// captureWarnLogs installs a mutex-guarded slog sink (syncBuffer): a
+	// persistRetryLoop goroutine leaked from an earlier test races the read
+	// of a raw buffer otherwise (#6446).
+	buf := captureWarnLogs(t)
 
 	s, err := New(filepath.Join(t.TempDir(), "config.db"))
 	if err != nil {

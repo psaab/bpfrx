@@ -359,7 +359,12 @@ func applyDeterministicKeys(det *DeterministicNATConfig, keys []string) {
 		switch keys[i] {
 		case "block-size":
 			if i+1 < len(keys) {
-				if n, err := strconv.Atoi(keys[i+1]); err == nil {
+				// A deterministic CGNAT block-size must be positive; the
+				// strict commit gate rejects <= 0, but the lenient/tolerant
+				// load path (#1960) would otherwise retain a negative Atoi
+				// result. Guard the parse so a non-positive value is ignored
+				// rather than stored (#5250 A3-b1 b1-F1).
+				if n, err := strconv.Atoi(keys[i+1]); err == nil && n > 0 {
 					det.BlockSize = n
 				}
 			}
@@ -391,7 +396,9 @@ func applyDeterministicChildren(det *DeterministicNATConfig, detNode *Node) {
 		switch c.Name() {
 		case "block-size":
 			if v := nodeVal(c); v != "" {
-				if n, err := strconv.Atoi(v); err == nil {
+				// See applyDeterministicKeys: reject a non-positive block-size
+				// on the lenient path rather than storing it (#5250 A3-b1 b1-F1).
+				if n, err := strconv.Atoi(v); err == nil && n > 0 {
 					det.BlockSize = n
 				}
 			}

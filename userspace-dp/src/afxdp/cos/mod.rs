@@ -6,6 +6,7 @@ pub(super) mod fairness;
 pub(super) mod flow_hash;
 pub(super) mod queue_ops;
 pub(super) mod queue_service;
+pub(super) mod redirect_pool;
 pub(super) mod token_bucket;
 pub(super) mod tx_completion;
 

@@ -41,6 +41,66 @@ the primary compile/apply gate.
 - `CompileHealth` — `daemon.go`. Snapshot of the most recent compile
   outcome; `pkg/api` consumes it for the `/health` endpoint.
 
+### Config-apply file layout (#5661)
+
+The config-apply path was carved out of the former ~3095-line
+`daemon_apply.go` monolith into responsibility-scoped siblings (pure code
+motion, no behavior/ordering/locking change — apply step and side-effect
+sequence are load-bearing and unchanged). `daemon_apply.go` now retains
+only the apply entrypoints and core orchestrator:
+
+- `daemon_apply.go` — apply entrypoints (`applyConfig`,
+  `applyConfigResult`, `applyCancelCtx`), the core `applyConfigLocked`
+  orchestrator, the procfs knob helpers (`setRethIPv6Knobs`,
+  `setVLANSubAddrGenMode`), and `compileErrorMustAbortApply`.
+- `daemon_apply_commit.go` — commit/sync/rollback drivers
+  (`commitAndApply`, `syncAndApply`, `commitConfirmedAndApply`,
+  `executeConfirmedRollback`, peer config push) plus first-boot
+  `bootstrapFromFile`.
+- `daemon_apply_reset.go` — factory-reset (zeroize) generation guard and
+  `factoryReset` (#5281).
+- `daemon_apply_hostauth.go` — host-authorization closeout owners and
+  their bounded runner (#5874).
+- `daemon_apply_dataplane.go` — dataplane/HA core apply
+  (`applyDataplaneAndHACore`) and deferred-worker-arm bookkeeping.
+- `daemon_apply_routing.go` — services (ip-monitoring), routing-rule, and
+  route-leak snapshot reconcile.
+- `daemon_apply_interfaces.go` — fabric IPVLAN, VRF, management-VRF
+  rebind, and interface reconcile.
+- `daemon_apply_tail.go` — the `applyTailReconciles` orchestrator and its
+  LLDP / DHCP-relay / event-engine / initial policy-scheduler reconcile
+  helpers.
+### `daemon_run.go` file layout (#5661)
+
+`Run` and its startup/shutdown machinery were split out of a single
+~2820-LOC `daemon_run.go` into cohesive sibling files in `package daemon`
+— pure code motion, no rename/reorder/logic change, so the load-bearing
+startup-phase and shutdown ordering is untouched:
+
+- `daemon_run.go` — the core lifecycle: `buildRuntimeDataPlane`, `Run`,
+  and the startup-phase orchestration (`startupSignalContext`,
+  `startupPhase`, `runStartupPhases`, `runStartupOrAbort`,
+  `startReconcileRGStateLoop`). `buildRuntimeDataPlane` **must stay here**:
+  the retirement-boundary canary
+  (`TestDaemonRuntimeEntryPointUsesRuntimeDataPlane`,
+  `pkg/dataplane/retirement_boundary_canary_test.go`) parses this file and
+  requires a `dataplane.NewRuntimeDataPlane` call in it.
+- `daemon_run_bringup.go` — startup bring-up phases: `initManagers`,
+  `loadAndBootstrapConfig`, `setupDataplaneAndInitialConfig`,
+  `enableForwarding`.
+- `daemon_run_naming.go` — startup interface naming/enumeration:
+  `setupInterfaceNaming`, `namingParamsFromConfig`,
+  `applyStartupNamingForConfig`, `maybeReapplyConfigArrivalNaming`,
+  `runBootstrapExitStartup`.
+- `daemon_run_servers.go` — API-surface bring-up and the #5054/#5961
+  per-transport commit-wiring seams: the six `*CommitFn`/`*CommitConfirmedFn`
+  methods, `startGRPCServer`, `startHTTPServer`, `resolveAPIBinds`.
+- `daemon_run_shutdown.go` — ordered teardown: `applyCloseoutDrainTimeout`,
+  `runShutdownSequence`, `runHAShutdownUpdate`.
+- `daemon_run_routehelpers.go` — route/tunnel inference helpers:
+  `riMemberLinuxName`, `collectAppliedTunnels`, `linkLocalV6Net`,
+  `inferIPv6StaticNextHopInterfaces`.
+
 ### Struct decomposition (#4407, in progress)
 
 The `Daemon` struct historically fused 150+ flat fields spanning ~15
@@ -196,6 +256,47 @@ credential revocation is enforced even on an apply that returns early
   applied to a retained non-loopback listener — no fail-open). The reconcile is
   serialized by its mutex and the apply semaphore, so a newer generation never
   completes behind an older one.
+
+#### Effective-listener snapshot for `show system services` (#6385/#6401)
+
+`show system services` reports the EFFECTIVE STATE of each management listener,
+not the requested/config-declared addresses. `Daemon.effectiveListeners`
+(`daemon_run_servers.go`) builds one `sysservices.Listeners` snapshot. Each row
+is a `sysservices.Listener{Addr, State}` where `State` ∈ {`Listening`, `Failed`,
+`Disabled`} (#6401) — so a CONFIGURED-but-FAILED bind is reported as
+`addr (bind failed)`, distinct from a genuinely-off listener's `disabled` and
+from a serving listener's bare address:
+
+- **gRPC** — `grpcSrv.EffectiveListener()`. The gRPC server records its own
+  lifecycle (`grpcListenState`): `Listening` with the actual bound address
+  (`lis.Addr()`, post-#5035 loopback clamp), `Failed` on a `net.Listen` error or
+  once the serve loop exits (the bound address is CLEARED so a dead server never
+  reports a stale bind), and — in the brief pre-bind startup window — `Listening`
+  on the requested `--grpc-addr`. gRPC is always configured, so it is never
+  `Disabled`. Before the server is even constructed, `effectiveListeners`
+  synthesizes pre-bind `Listening` on `--grpc-addr`.
+- **HTTP REST** — `d.mgmt.effectiveHTTPListener()`. `Disabled` when the
+  reconciler is absent (empty `--api-addr`, listener never started); `Failed`
+  (reporting the attempted `lastHTTPAttempt`) when it was configured but the boot
+  bind never converged (`curSet` false); `Failed` ALSO when a converged leg's
+  serve loop later exits UNEXPECTEDLY — `api.Server.EffectiveHTTPAddr()` returns
+  `""` for a leg the serve goroutine marked `dead` (listener.go), symmetric with
+  the gRPC serve-exit clear, so a dead HTTP listener is never reported
+  `Listening`; else `Listening` on the ACTUAL bound address read from the live
+  server (`EffectiveHTTPAddr()` → `httpLeg.ln.Addr()`, so an ephemeral `:0`
+  resolves to its concrete port and a wildcard/hostname bind is normalized). A
+  day-2 rebind failure RETAINS the old serving leg (its socket stays live →
+  `EffectiveHTTPAddr` non-empty), so this reports the address still serving, not
+  the failed new bind.
+
+BOTH render surfaces read this ONE snapshot: the remote gRPC renderer via
+`grpcapi.Config.ListenersFn` and the local console CLI via `cli.SetListenersFn`,
+both formatting through `sysservices.Listeners.Lines`, so the two surfaces can
+never disagree. Before #6385 both renderers hardcoded
+`127.0.0.1:50051 / 127.0.0.1:8080 (always on)`, so a relocated, clamped, failed,
+or disabled listener was reported wrong; the remote gRPC path (the common
+operator path) was the one a local-only fix left unfixed (the dropped #6384
+A10-b2-F5).
 
 ## Cluster mode
 
@@ -660,6 +761,55 @@ never lock an operator out of a remote box it manages.
     in `Run`, so an early-error return (or an embedded library caller whose ctx
     cancels) that never reaches the shutdown sequence still cancels + joins both
     loops instead of leaking them.
+  - **Two MORE background loops are cancelled + joined the same way (#5523
+    C179-093):** the session-aggregation flush goroutine (`applyAggregator` →
+    `agg.Run`, which binds to `context.Background()` and was previously cancelled
+    only on a config replace/disable — never at shutdown, so its `#5313`
+    `ctx.Done` final flush was skipped and up to a full ~5 min window of
+    `SESSION_CLOSE` counters was dropped on every stop) and the IPsec
+    DHCP-rebind retry loop (`ipsecRebindRetryLoop`, which bound directly to
+    `d.daemonCtx` so a 30s rebind tick could run a `swanctl` reapply while
+    teardown was in flight). `stopAggregator()` / `stopIPsecRebindLoop()` run
+    immediately after `stopPinRetryLoop()` — the aggregator BEFORE the
+    flow/feeds/event teardown so its final flush still has a live
+    `SetLogFunc → er.ForwardLogMsg` path, the rebind loop BEFORE FRR/IPsec
+    teardown. Each mirrors the #5308 shape: a cancellable child of
+    `d.daemonCtx` (rebind loop) or the existing `aggCancel` (aggregator), a
+    `WaitGroup` join (`aggWg` / `ipsecRebindWg`), the lock (`aggReconMu` /
+    `ipsecRebindMu`) released before the join, an `aggStopped` /
+    `ipsecRebindStopped` latch against a late restart, and a matching `defer` in
+    `Run`. Other still-`daemonCtx`-bound goroutines (VRRP/cluster/fabric HA
+    watchers) are intentionally left for a separate HA-scoped change.
+  - **BOTH shutdown joins are BOUNDED because both can block on a
+    context-insensitive downstream before the HA takeover fence (#6395 / #6397).**
+    `stopAggregator()` and `stopIPsecRebindLoop()` both run in
+    `runShutdownSequence` BEFORE the fence, so a plain `WaitGroup.Wait()` on
+    either could push the whole stop past the systemd 20s `TimeoutStopSec` and get
+    the process SIGKILLed before the peer takeover fence runs.
+    - **The aggregator join is bounded by `aggregatorFlushJoinTimeout` (3s,
+      #6395).** The `#5313` final flush forwards the pending report SYNCHRONOUSLY
+      through the syslog client (`logFn → er.ForwardLogMsg`), and a stream-syslog
+      sink allows up to `defaultWriteTimeout` (~4s) PER line — a stalled or
+      unreachable collector could block `aggWg.Wait()` for many seconds.
+    - **The IPsec DHCP-rebind join is bounded by `ipsecRebindJoinTimeout` (3s,
+      #6397).** The loop's `cancel` IS observed at its `ctx.Done` / ticker select
+      and at `applySem.Acquire(ctx, …)` — but NOT inside a `swanctl` apply already
+      in flight. `tryIPsecRebindRetry`'s re-render+reload shells out under
+      `context.WithTimeout(context.Background(), swanctlTimeout=15s)`
+      (`pkg/ipsec/manager.go` `runSwanctl`) — a BACKGROUND context the loop's
+      cancel does not interrupt — plus a 5s `WaitDelay`, so a rebind that is
+      MID-APPLY when shutdown fires blocks a plain `ipsecRebindWg.Wait()` for up
+      to ~20s. (The earlier "left unbounded on purpose / same safe shape as the
+      #5308 pin/scheduler joins" note was WRONG: those loops do no
+      background-context shell-out on cancel; this one does.)
+
+    Each `stop*` therefore joins on a `done` channel with a `time.After(<budget>)`
+    fallback: the happy path returns in microseconds (aggregator flush completes
+    in ms; the rebind loop is normally parked on its ticker / `ctx.Done`, not
+    mid-apply), and on a stalled downstream we log a warning and PROCEED to
+    teardown — the aggregator drops the partial report, the rebind loop leaves its
+    in-flight `swanctl` shell-out to finish in the background as the process exits.
+    A missed fence is worse than either.
   - **The RG-state reconcile safety-net loop IS run-`WaitGroup`-registered so
     `wg.Wait()` joins it BEFORE HA ownership relinquish (#5681 / M23).**
     `reconcileRGStateLoop` (the periodic safety net that corrects `rg_active` /
@@ -685,11 +835,40 @@ never lock an operator out of a remote box it manages.
   runtime HA controller under one daemon-owned deadline. Controller
   implementations may have their own RPC deadlines, but daemon shutdown does
   not wait past the outer deadline for those calls to return.
+  **Netlink installer migration (#6387, COMPLETE).** PR-2 added an ADDITIVE
+  `pkg/nftables` netlink `Installer` (no `nft` binary) that renders the
+  host-inbound / lo0 / fence rulesets bit-for-bit equivalent to the
+  `build*Payload` text, plus a non-skippable kernel ruleset-parity CI
+  (`daemon_nft_netlink_parity_test.go`) that diffs the oracle `nft -f -` dump
+  vs the netlink dump in a private netns. **PR-3 (the CUTOVER) is done:**
+  production now installs and tears down every host-inbound / lo0 /
+  cold-boot-fence / gap-fence table through the netlink `nftInstaller` seam
+  (`daemon_nft_netlink.go`), so a node needs only the kernel `nf_tables`
+  MODULE — never the `nft` BINARY (the #6387 fw1 config-sync trap). The
+  daemon dpuserspace views / junos-host programs / lo0 terms are copied into
+  the `pkg/nftables` input specs by the promoted converters (`toNft*` in
+  `daemon_nft_netlink.go`). The 14+ fail-closed regression tests inject an
+  install/teardown failure through the single `fakeNftInstaller` seam
+  (replacing the pre-PR-3 `nftApplyPayload` / `nftDeleteTable` stubs); a
+  netlink install failure still returns its error into the `errors.Join`
+  fail-closed tail (invariant H7), a failed teardown still keeps
+  `hostInboundEnforced` (#5790), and the cold-boot / coverage-gap fences still
+  install fail-closed (#5644/#5789). When the netlink install fails because the
+  kernel `nf_tables` subsystem is UNAVAILABLE, the returned error is tagged
+  `xnft.ErrNFTablesUnavailable` (a one-time distinct operator log +
+  Config-Sync `CF` monitor-failure reason, §12.5) without ever downgrading
+  fail-closed. The `nftApplyPayload` / `nftDeleteTable` package vars and the
+  `build*Payload` text builders are RETAINED as the parity-CI ORACLE (and the
+  `TestNftDeleteTable*IdempotentAddDelete` payload-shape tests) — do NOT delete
+  them while the parity CI depends on them; production no longer calls them.
+
 - lo0 input filters (`interfaces lo0 unit 0 family inet[6] filter input
   <name>`) lock down host-bound/control-plane traffic via an nftables table
-  `inet xpf_lo0`. `daemon_nft.go:applyLo0Filter` builds the table with
-  `buildLo0FilterPayload` and feeds it to `nft -f -` (via the `nftApplyPayload`
-  seam). nft parses an `-f -` payload **atomically** — a syntax error on any
+  `inet xpf_lo0`. `daemon_nft.go:applyLo0Filter` installs the table via the
+  netlink `nftInstaller` (`toNftLo0Spec` → `InstallLo0`) since #6387 PR-3; the
+  `buildLo0FilterPayload` text below is now the parity-CI ORACLE (the netlink
+  build is proven bit-equivalent to it), not the production path. nft parses an
+  `-f -` payload **atomically** — a syntax error on any
   line rejects the ENTIRE payload (the kernel keeps the PREVIOUS table
   untouched, not a half-applied ruleset). The payload MUST therefore reset the
   prior table with the valid atomic idiom: `table inet xpf_lo0`
@@ -720,10 +899,10 @@ never lock an operator out of a remote box it manages.
   `applyConfigLocked` joins it (`lo0Err`) into the commit result alongside
   `networkdErr`/`dhcpServerErr`/`hostInboundErr`, so a committed lo0 filter that
   did not reach the kernel reports commit FAILURE rather than silent success.
-  The teardown (no filter bound) uses the idempotent `add table; delete table`
-  payload via `nftDeleteTable` (universal verbs — NOT the unpinned `nft
-  destroy`), so the benign absent-table case is a no-op while a genuine teardown
-  failure (stale filter left in the kernel) still surfaces. Boot / DHCP
+  The teardown (no filter bound) calls the netlink `nftInstaller.DeleteTable`
+  (#6387 PR-3), which lists-then-deletes: the benign absent-table case is a
+  no-op (nil), while a genuine teardown failure (stale filter left in the
+  kernel) still surfaces fail-closed. Boot / DHCP
   re-applies go through `applyConfig`, which only LOGS the error, so a transient
   nft failure cannot brick startup; the next clean commit re-renders. Tests:
   `lo0_filter_test.go` (apply/teardown failure-surfaced fail-on-revert,

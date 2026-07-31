@@ -326,6 +326,67 @@ under the daemon's errgroup. Nothing else imports this package.
     re-enable, HTTPS-bind-only change, HTTP-change-keeps-HTTPS, auth swap,
     bind-failure retain-old). `Run`/`serveBound` remain the single-lifecycle test
     entry point.
+  - `EffectiveHTTPAddr()` (#6385/#6401) returns the live HTTP leg's ACTUAL bound
+    address (`httpLeg.ln.Addr()`) — an ephemeral `:0` request resolves to its
+    concrete port, a wildcard/hostname bind is normalized — or `""` when no HTTP
+    leg is serving OR the live leg's serve loop exited UNEXPECTEDLY (the serve
+    goroutine marks the leg `dead` — an ATOMIC store, NOT under `lifeMu`, so a
+    serve-exit racing a shutdown `Wait()` cannot deadlock: the goroutine still
+    holds its `wg` count when it marks dead and `Wait()` holds `lifeMu` across
+    `wg.Wait()`, so a lifeMu-guarded marker would form a lock-ordering cycle; a
+    requested shutdown via `stopLegLocked`/`rootCtx` does NOT mark dead). The
+    daemon's `show system services`
+    effective-listener snapshot reads it
+    (`managementReconciler.effectiveHTTPListener`) and renders a dead leg
+    `Failed`, symmetric with the gRPC serve-exit clear.
+  - The auto-generated HTTPS cert (`generateSelfSignedCertAt`, used when no
+    operator cert is provisioned) carries Subject Alternative Names, not just a
+    CommonName (#5719, codex-review-182 C-API TLS hygiene). Every modern TLS
+    client (Go's own client since 1.15, browsers, curl) rejects a SAN-less
+    cert for hostname verification, so a CN-only cert broke `curl
+    https://localhost:8443` / health probes even though the bind succeeded.
+    What the SANs cover, precisely:
+    - **Always present:** the loopback IP SANs `127.0.0.1` / `::1` and the DNS
+      SAN `localhost` — so a **loopback-bound** HTTPS API (the default) always
+      verifies. These can never fail to encode.
+    - **Best-effort:** the kernel hostname. A valid ASCII hostname is added as
+      a DNS SAN; an IP-literal hostname is added to the IP SANs (a DNS SAN of
+      an IP never verifies as an IP). A **non-ASCII / malformed** hostname
+      (e.g. a `café` kernel hostname) is DROPPED, not appended — x509 marshals
+      DNS SANs as an IA5String and HARD-FAILS on non-ASCII, which under the
+      #5058 all-or-nothing management-server lifecycle would abort cert
+      generation and tear down the entire HTTP+HTTPS server. The cert degrades
+      to loopback-only SANs (`isDNSSANSafeHostname` guard) instead of failing.
+    - **HTTPS bind host (#5719 C001 residual, now closed):** the listener's
+      bind host is threaded from the resolved `web-management https interface`
+      address into cert generation (`buildHTTPSServer` → `net.SplitHostPort` →
+      `certGen(bindHost)`). A non-loopback management IP lands in the IP SANs
+      and a DNS-safe bind hostname in the DNS SANs, so
+      remote-verification-by-mgmt-IP (`https://<mgmt-ip>:8443` with strict
+      verification) succeeds. A loopback / unspecified (`0.0.0.0`/`::`) /
+      wildcard (`:8443` → empty) / non-encodable bind host is skipped, and a
+      value already present is coalesced. Like the hostname path this only ever
+      ADDS an encodable SAN, so it never aborts generation.
+    - **Re-mint STILL deferred, but no longer SILENT (#5719 C001 residual):** a
+      later `set system host-name` (or a bind-address change) does NOT re-mint
+      an already-persisted cert, so its DNS/IP SANs can go stale. Re-minting is
+      deferred (it needs a mint-ordering / invalidation hook and a decision on
+      churning the durable TOFU pin). What WAS a silent failure is now
+      diagnosed: on the load-success path `generateSelfSignedCertAt` parses the
+      loaded leaf and, when the current bind host is a concrete non-loopback
+      management host (`bindHostWarnable`) that the leaf's SANs do NOT cover
+      (`certCoversHost` — the same strict check a remote client applies), emits
+      a `slog.Warn` naming the bind host and the cert's SANs, so an operator
+      re-mints (remove `/etc/xpf/tls`) instead of chasing a silent
+      verification failure.
+    An already-persisted cert is NOT auto-regenerated — the #1916 D6
+    durable-cert contract keeps the on-disk pair stable so remote clients' TOFU
+    pins survive a power loss; only freshly generated certs gain SANs (delete
+    `cert.pem`/`key.pem` to force a regenerate). Pinned by
+    `tls_san_5719_test.go` (SAN presence, hostname classification, the
+    non-ASCII no-abort guard, the bind-host mgmt-IP/DNS threading +
+    `buildHTTPSServer` host-extraction, and the stale-cert-on-rebind
+    mismatch warning), fail-on-revert.
 - The status-poll path (1 Hz) shares the userspace dataplane control socket
   with HA sync, session installs, snapshot sync, and forwarding sync.
   Adding a new caller at >1 Hz here will starve session installs during
@@ -674,6 +735,14 @@ under the daemon's errgroup. Nothing else imports this package.
   security nat source pool` renders the gRPC value directly. Pinned by
   `TestNATPoolStatsHandlerInterfaceModePerRuleSet` (REST) and
   `TestGetNATPoolStatsInterfaceModePerRuleSet` (gRPC), both fail-on-revert.
+- The gRPC `GetNATRuleStats` `nat_type` selector fails CLOSED (#5719,
+  codex-review-182 C-API). Only `""` (default = source), `"source"`, and
+  `"destination"` select a rule family; any other value (a typo like `"src"`
+  or `"static"`) is rejected with `codes.InvalidArgument` rather than falling
+  through both branches to an empty "no NAT rules" response — a false-empty
+  diagnostic indistinguishable from a firewall with no rules. Same discipline
+  as the show routing/zones/firewall unknown-selector diagnostics. Pinned by
+  `TestGetNATRuleStatsRejectsUnknownSelector` (gRPC), fail-on-revert.
 - Query-filter parsing fails CLOSED, matching the gRPC contract
   (#2934/#2935/#2939). A filter sentinel of `0`/`""` means "no filter",
   so a *malformed* filter value must error rather than silently fall

@@ -32,6 +32,7 @@ import (
 	"github.com/psaab/xpf/pkg/natpoolalarm"
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/rpm"
+	"github.com/psaab/xpf/pkg/sysservices"
 	"github.com/psaab/xpf/pkg/vrrp"
 )
 
@@ -83,11 +84,19 @@ type CLI struct {
 	// write-health for `show flow-monitoring statistics` (#2464). Nil
 	// leaves the show reporting "no flow export configured".
 	flowCollectorHealthFn func() []flowexport.ExporterCollectorHealth
-	hostname              string
-	username              string
-	userClass             string
-	version               string
-	startTime             time.Time
+	// listenersFn returns the EFFECTIVE (post-clamp, post-bind) management
+	// listener addresses `show system services` reports (#6385). The daemon
+	// wires it to Daemon.effectiveListeners — the SAME snapshot the remote gRPC
+	// renderer reads — so the local console and the remote `cli` can never
+	// disagree. Nil when the CLI is spawned outside the daemon (offline recovery
+	// / unit test): showSystemServices falls back to the documented loopback
+	// defaults.
+	listenersFn func() sysservices.Listeners
+	hostname    string
+	username    string
+	userClass   string
+	version     string
+	startTime   time.Time
 
 	vrrpMgr *vrrp.Manager
 
@@ -259,6 +268,15 @@ func (c *CLI) SetDDNSStatsFn(fn func() *dhcpserver.DDNSStats) {
 // `show flow-monitoring statistics` reporting "no flow export configured".
 func (c *CLI) SetFlowCollectorHealthFn(fn func() []flowexport.ExporterCollectorHealth) {
 	c.flowCollectorHealthFn = fn
+}
+
+// SetListenersFn wires the effective management-listener snapshot source for
+// `show system services` (#6385). The daemon passes Daemon.effectiveListeners —
+// the SAME snapshot the remote gRPC renderer reads — so the local console and
+// the remote `cli` report identical, post-bind listener addresses. Nil leaves
+// showSystemServices on the documented loopback defaults (offline / unit test).
+func (c *CLI) SetListenersFn(fn func() sysservices.Listeners) {
+	c.listenersFn = fn
 }
 
 // SetDDNSOwnedRecordsFn sets a callback for retrieving the DHCP
@@ -542,7 +560,11 @@ func (c *CLI) Run() error {
 		// changes (failover) are reflected immediately.
 		c.refreshPrompt()
 	}
-	return nil
+	// The read loop above never falls through — every exit is a `return`
+	// (exitCh, io.EOF at operational level, Readline error, or errExit from
+	// dispatch). A trailing `return nil` here was unreachable and tripped
+	// `go vet` (codex-182 A10-b00-C02); Go accepts the infinite `for {}` as
+	// the function's terminating statement, so no return is needed.
 }
 
 func (c *CLI) refreshPrompt() {

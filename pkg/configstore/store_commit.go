@@ -274,30 +274,51 @@ func (s *Store) commitWithDescriptionLocked(description string) (*config.Config,
 	// same lock before it Wait()s — so no Add can start after the fence, and the
 	// WaitGroup counter never rises from zero concurrently with Wait.
 	if s.archiveDir != "" && !s.archiveFenced.Load() {
-		dir := s.archiveDir
-		max := s.archiveMax
-		if max <= 0 {
-			max = 10
+		// #6404: re-attempt the archive-seq reseed if a prior SetArchiveConfig
+		// scan of this dir failed (archiveSeedDir != archiveDir).
+		// commitWithDescriptionLocked runs under s.mu.Lock (write), so
+		// ensureArchiveSeededLocked may safely store archiveSeedDir. Edge 1: a
+		// commit that lands in the window between a failed scan and the next
+		// SetArchiveConfig retry re-scans here instead of capturing the still-low
+		// seq. When the dir is already seeded the readiness check is a cheap
+		// string compare — no per-commit ReadDir.
+		if !s.ensureArchiveSeededLocked() {
+			// Codex round-2 MAJOR: the commit-time rescan ALSO failed
+			// (persistent scan error), so the on-disk max is unknown and the
+			// counter is unconfirmed. Writing at the low counter would drop a
+			// below-max archive that rotateArchives prunes as stale once the
+			// scan recovers, LOSING this config version's archive. Skip this
+			// commit's archive entirely — the next commit after the scan
+			// recovers archives correctly. Skipping one archive during a
+			// scan-failure window is strictly safer than writing a mis-seq'd one.
+			slog.Warn("archive seq unconfirmed after scan failure; skipping this commit's archive, will archive on the next successful commit",
+				"dir", s.archiveDir)
+		} else {
+			dir := s.archiveDir
+			max := s.archiveMax
+			if max <= 0 {
+				max = 10
+			}
+			data := s.active.Format()
+			ts := time.Now()
+			seq := s.archiveSeq.Add(1)
+			s.archiveWG.Add(1)
+			go func() {
+				defer s.archiveWG.Done()
+				// #5869: re-check the fence inside the goroutine. A writer that
+				// observes it (a factory reset began after this commit launched the
+				// writer, before it reached the write) MUST NOT recreate the archive
+				// directory the wipe is about to erase — that would resurrect the
+				// prior tenant's config secrets on a re-tenanted device.
+				if s.archiveFenced.Load() {
+					return
+				}
+				archiveWriteBarrier()
+				if err := writeArchive(dir, max, data, ts, seq); err != nil {
+					slog.Warn("auto-archive failed", "err", err)
+				}
+			}()
 		}
-		data := s.active.Format()
-		ts := time.Now()
-		seq := s.archiveSeq.Add(1)
-		s.archiveWG.Add(1)
-		go func() {
-			defer s.archiveWG.Done()
-			// #5869: re-check the fence inside the goroutine. A writer that
-			// observes it (a factory reset began after this commit launched the
-			// writer, before it reached the write) MUST NOT recreate the archive
-			// directory the wipe is about to erase — that would resurrect the
-			// prior tenant's config secrets on a re-tenanted device.
-			if s.archiveFenced.Load() {
-				return
-			}
-			archiveWriteBarrier()
-			if err := writeArchive(dir, max, data, ts, seq); err != nil {
-				slog.Warn("auto-archive failed", "err", err)
-			}
-		}()
 	}
 
 	return compiled, nil
@@ -1235,6 +1256,20 @@ func (s *Store) loadRollbackHistory() {
 			// rollbackEntry() rejects a tombstone with a clear error
 			// instead of ever returning the wrong generation.
 			slog.Warn("error reading rollback file, continuing", "path", path, "err", err)
+			entries = append(entries, &HistoryEntry{Timestamp: time.Now()})
+			continue
+		}
+		// #5557: bound a rollback slot the same way every other parse
+		// entry point is bounded (LoadOverride/LoadMerge/LoadSet/SyncApply
+		// via checkConfigSize). loadRollbackHistory reads straight off disk
+		// and would otherwise hand an unbounded payload to the parser at
+		// boot — a local-root-planted or corrupt oversized slot could
+		// exhaust memory before the daemon even finishes starting. Tombstone
+		// the slot (preserving later slots' `rollback N` positions, per the
+		// #4810 invariant above) rather than parse it.
+		if len(data) > MaxConfigSize {
+			slog.Warn("rollback file exceeds max config size, skipping",
+				"path", path, "bytes", len(data), "max", MaxConfigSize)
 			entries = append(entries, &HistoryEntry{Timestamp: time.Now()})
 			continue
 		}

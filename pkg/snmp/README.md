@@ -359,6 +359,27 @@ worker. Without this, each disable/re-enable cycle leaked a goroutine pair and
 the trap worker could keep sending a stale backlog with the old community to
 the old target.
 
+The abandoned backlog is ACCOUNTED for, not silently discarded (C180-026): on
+stop the worker (the sole queue reader) counts every dequeued-but-unsent job
+plus every job still buffered in the queue into `trapsDropped` exactly once via
+`countAbandonedTraps`, so the drop total covers shutdown-abandoned link-state
+traps — not just queue-full and post-Stop-enqueue drops. Before this,
+`trapsDropped` reported zero for a shutdown that discarded a queued backlog.
+Fail-on-revert guard: `TestStop_CountsAbandonedTrapBacklog`.
+
+This accounting is **exact** — `accepted == delivered + trapsDropped` with no
+residual — because `enqueueTrap` publishes to the queue under the same `a.mu`
+that `Stop` takes to set `stopped` / close `trapStop`. Enqueue and Stop are
+therefore strictly serialized: a job admitted to the queue is buffered before
+`close(trapStop)` is observable (so the shutdown drain counts it), and a job
+that loses the race sees `stopped` and drops+counts. The send is non-blocking
+(buffered channel + `default`) and the worker never takes `a.mu`, so publishing
+under the lock cannot deadlock. Before the send was moved under the lock, an
+enqueue that passed the stopped check could buffer into an orphaned queue after
+the worker had already drained and exited — a job neither delivered nor
+counted, breaking the invariant. Concurrent-accounting guard:
+`TestStop_AccountingExactUnderConcurrentEnqueue`.
+
 The reconcile runs **early** in `applyConfigLocked` — before the dataplane
 apply, which can abort the reconcile pipeline early (it returns on
 `ErrPolicySchedulerProtocolIncompatible`). `Store.Commit()` has already
@@ -393,6 +414,17 @@ authorization surface: every request is dropped because no community matches.
   interface data. The daemon wires `buildSNMPIfData`, which does a full
   netlink `LinkList` (RTM_GETLINK dump) per call — so the request path must
   invoke it at most once per PDU (see the per-PDU snapshot gotcha below).
+  The callback contract is `func() []IfData` (no error channel), so
+  `buildSNMPIfData` returns an empty slice when the netlink dump fails — but it
+  LOGS the failure (`slog.Warn`, #5523 C179-123) so an empty ifTable caused by a
+  transient netlink error is diagnosable and not mistaken for a genuine
+  no-interface box; the next poll re-reads netlink and self-heals. The warning
+  is rate-limited to at most once per minute (`warnThrottle`, #6396): the
+  callback runs once per SNMP poll and a manager may poll several times a
+  second, so a PERSISTENT failure would otherwise write one line per poll and
+  drown the journal — the first failure logs immediately, subsequent ones in the
+  window are counted and reported with the next emitted line, and a successful
+  read logs a one-time recovery.
 
 ### IF-MIB class-counter semantics (#5050)
 
@@ -427,6 +459,13 @@ double-count when summing the class columns.
 `pkg/config`.
 
 ## ASN.1 specifics
+
+The BER wire codec — every `berEncode*` / `berDecode*` helper, the OID
+comparison helpers (`oidHasPrefix`, `oidEqual`, `oidCompare`), and
+`decodePDUFields` — lives in `agent_ber.go` (#5661 code-motion split of
+the over-threshold `agent.go`). They are pure, `Agent`-independent
+package-level functions; `agent.go` retains the agent state machine,
+packet handlers, and MIB view that call into them.
 
 - Tag constants used: Counter32 (0x41), Gauge32 (0x42), TimeTicks (0x43),
   Counter64 (0x46).

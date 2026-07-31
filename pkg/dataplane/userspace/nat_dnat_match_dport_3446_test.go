@@ -72,7 +72,10 @@ func TestBuildDNATSnapshotNonNumericPortFailsClosed_3446(t *testing.T) {
 func TestBuildDNATSnapshotPartialValidPortKeepsGood_3446(t *testing.T) {
 	// A mixed [80, 70000] list keeps the valid port and drops the bad one (the
 	// strict commit gate rejects the whole rule; this is the lenient backstop).
+	// #6462: pin `match protocol tcp` so the count isolates port validity from
+	// the bare-dest-port tcp+udp dual-emit (covered in nat_destination_6462_test).
 	cfg := dnatPortConfig(config.NATMatch{
+		Protocol:         "tcp",
 		DestinationPorts: []int{80, 70000},
 		DestinationPort:  80,
 	})
@@ -99,7 +102,10 @@ func TestBuildDNATSnapshotNoPortIsWildcard_3446(t *testing.T) {
 }
 
 func TestBuildDNATSnapshotValidPortInstalled_3446(t *testing.T) {
+	// #6462: pin `match protocol tcp` so a single valid port yields exactly one
+	// entry; the protocol-less tcp+udp dual-emit is covered separately.
 	cfg := dnatPortConfig(config.NATMatch{
+		Protocol:         "tcp",
 		DestinationPorts: []int{8080},
 		DestinationPort:  8080,
 	})

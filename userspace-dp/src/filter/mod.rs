@@ -13,7 +13,8 @@ use crate::prefix::{PrefixV4, PrefixV6};
 // referenced by both compiler.rs and the tests module. Importing here makes
 // them visible to all submodules via `use super::*;`.
 use crate::{
-    FirewallFilterSnapshot, FirewallTermSnapshot, PolicerSnapshot, ThreeColorPolicerSnapshot,
+    FirewallFilterSnapshot, FirewallTermSnapshot, FlexMatchSnapshot, PolicerSnapshot,
+    ThreeColorPolicerSnapshot,
 };
 use ipnet::IpNet;
 #[cfg(not(test))]
@@ -74,12 +75,19 @@ pub(crate) enum FilterAction {
 //       lookup. File a tracker issue against session/key.rs.
 //
 //   (b) NOT in cache key (cache-sensitive) — wire the #1430
-//       runbook: per-interface FilterState.iface_filter_v{4,6}_has_<X>_match
-//       set, Filter.has_<X>_match_terms aggregate flag, flow-cache
-//       insertion gate at afxdp/flow_cache.rs:297-309, established-
-//       session re-evaluation at afxdp/poll_descriptor/mod.rs:217-244,
-//       forwarding rotation purge at afxdp/worker/loop_body/mod.rs:295-330,
-//       and tests at afxdp/flow_cache_tests.rs.
+//       runbook: Filter.has_<X>_match_terms flag (read per-interface
+//       off FilterState.iface_filter_v{4,6}_fast via the
+//       interface_input_filter_has_<X>_match accessor — the parallel
+//       per-interface has_<X>_match sets were deleted in #6236 PR-2B),
+//       flow-cache insertion gate at afxdp/flow_cache.rs (per-flag,
+//       input + output direction), established-session re-evaluation at
+//       afxdp/poll_descriptor/filter.rs (the DSCP + per-packet-L4
+//       prechecks fold to ONE lookup of
+//       interface_input_filter_varies_per_packet — the
+//       Filter.varies_per_packet_within_flow() OR core — since #6236
+//       PR-2C), forwarding rotation purge at
+//       afxdp/worker/loop_body/mod.rs, and tests at
+//       afxdp/flow_cache_tests.rs.
 //
 // Skipping this classification SILENTLY breaks flow-cache: a
 // first-packet decision gets reused for later packets that can
@@ -407,6 +415,47 @@ pub(crate) struct Filter {
     /// `has_dscp_match_terms`: the flow-cache must decline for these filters.
     pub(crate) has_per_packet_l4_match_terms: bool,
     pub(crate) has_three_color_policer_terms: bool,
+}
+
+impl Filter {
+    /// #6236 PR-2A: the canonical "the output filter must still be walked on the
+    /// TX path" predicate. An output filter earns a TX-path evaluation when it
+    /// can change or observe the packet: CoS/DSCP tx-selection, a `then count`,
+    /// a `then log`, a terminal (non-`accept`) action, or a three-color policer.
+    ///
+    /// This is the SOLE definition of the five-flag OR. The compiler's
+    /// `iface_filter_out_*_needs_tx_eval` set-insert, the
+    /// `has_output_needs_tx_eval_*` aggregates, and every `cos_classify` TX arm
+    /// call through here so the composite can never drift between the compile
+    /// path and the hot path (#2620-adjacent invariant).
+    #[inline]
+    pub(crate) fn needs_tx_eval(&self) -> bool {
+        self.affects_tx_selection
+            || self.has_counter_terms
+            || self.has_log_terms
+            || self.has_terminal_action_terms
+            || self.has_three_color_policer_terms
+    }
+
+    /// #6236 PR-2C: the #1430/#2362 "this filter's per-packet verdict is NOT a
+    /// pure function of the flow-cache 5-tuple" predicate. A DSCP match term
+    /// (#1430) or a per-packet L4 match term (#2362: tcp-flags / is-fragment /
+    /// icmp-type / icmp-code) keys off a field outside the 5-tuple, so a
+    /// first-packet decision must not be replayed: the flow-cache declines and
+    /// the session-hit path re-evaluates.
+    ///
+    /// This is the SOLE definition of the `has_dscp_match_terms ||
+    /// has_per_packet_l4_match_terms` OR. The single-lookup accessor
+    /// `interface_input_filter_varies_per_packet` and the folded session-hit
+    /// re-eval gate (`afxdp/poll_descriptor/filter.rs`) both evaluate it off ONE
+    /// borrowed `&Filter`, so they cannot drift from the per-flag accessors
+    /// (`interface_input_filter_has_dscp_match` /
+    /// `interface_input_filter_has_per_packet_l4_match`) that the flow-cache
+    /// decline gate (`afxdp/flow_cache.rs`) still consults individually.
+    #[inline]
+    pub(crate) fn varies_per_packet_within_flow(&self) -> bool {
+        self.has_dscp_match_terms || self.has_per_packet_l4_match_terms
+    }
 }
 
 #[derive(Debug, Default)]
@@ -751,61 +800,49 @@ pub(crate) struct FilterState {
         rustc_hash::FxHashMap<String, Arc<ThreeColorPolicerRuntime>>,
     /// Name-derived ID-indexed three-color policer runtimes.
     pub(crate) three_color_policers: Vec<Arc<ThreeColorPolicerRuntime>>,
-    /// Per-interface (ifindex) input filter key for inet.
-    pub(crate) iface_filter_v4: rustc_hash::FxHashMap<i32, String>,
     /// Direct per-interface inet filter reference for packet hot-path evaluation.
     pub(crate) iface_filter_v4_fast: rustc_hash::FxHashMap<i32, Arc<Filter>>,
-    /// Per-interface inet input filters that can affect CoS TX selection.
-    pub(crate) iface_filter_v4_affects_tx_selection: rustc_hash::FxHashSet<i32>,
     /// Whether any inet input filter can affect CoS TX selection.
     pub(crate) has_input_tx_selection_v4: bool,
     /// Whether any inet input filter contains a three-color policer.
     pub(crate) has_input_three_color_policer_v4: bool,
-    /// Per-interface inet input filters that can affect route-table selection.
-    pub(crate) iface_filter_v4_affects_route_lookup: rustc_hash::FxHashSet<i32>,
-    /// Per-interface inet input filters with DSCP match terms.
-    pub(crate) iface_filter_v4_has_dscp_match: rustc_hash::FxHashSet<i32>,
-    /// Per-interface inet input filters with per-packet L4 match terms (#2362:
-    /// tcp-flags / is-fragment / icmp-type / icmp-code). Cache-sensitive.
-    pub(crate) iface_filter_v4_has_per_packet_l4_match: rustc_hash::FxHashSet<i32>,
-    /// Per-interface (ifindex) input filter key for inet6.
-    pub(crate) iface_filter_v6: rustc_hash::FxHashMap<i32, String>,
+    // #6236 PR-2B: the per-interface inet input capability sets
+    // (`iface_filter_v4_affects_route_lookup`, `iface_filter_v4_has_dscp_match`,
+    // `iface_filter_v4_has_per_packet_l4_match`) are deleted — every accessor now
+    // reads the mirrored `Filter` flag off `iface_filter_v4_fast`.
     /// Direct per-interface inet6 filter reference for packet hot-path evaluation.
     pub(crate) iface_filter_v6_fast: rustc_hash::FxHashMap<i32, Arc<Filter>>,
-    /// Per-interface inet6 input filters that can affect CoS TX selection.
-    pub(crate) iface_filter_v6_affects_tx_selection: rustc_hash::FxHashSet<i32>,
     /// Whether any inet6 input filter can affect CoS TX selection.
     pub(crate) has_input_tx_selection_v6: bool,
     /// Whether any inet6 input filter contains a three-color policer.
     pub(crate) has_input_three_color_policer_v6: bool,
-    /// Per-interface inet6 input filters that can affect route-table selection.
-    pub(crate) iface_filter_v6_affects_route_lookup: rustc_hash::FxHashSet<i32>,
-    /// Per-interface inet6 input filters with DSCP match terms.
-    pub(crate) iface_filter_v6_has_dscp_match: rustc_hash::FxHashSet<i32>,
-    /// Per-interface inet6 input filters with per-packet L4 match terms (#2362).
-    pub(crate) iface_filter_v6_has_per_packet_l4_match: rustc_hash::FxHashSet<i32>,
-    /// Per-interface (ifindex) output filter key for inet.
-    pub(crate) iface_filter_out_v4: rustc_hash::FxHashMap<i32, String>,
+    // #6236 PR-2B: the per-interface inet6 input capability sets are deleted —
+    // the accessors read the mirrored `Filter` flag off `iface_filter_v6_fast`
+    // (same as the inet input block above).
     /// Direct per-interface inet output filter reference for packet hot-path evaluation.
     pub(crate) iface_filter_out_v4_fast: rustc_hash::FxHashMap<i32, Arc<Filter>>,
-    /// Per-interface inet output filters that must still be evaluated in the TX path.
-    pub(crate) iface_filter_out_v4_needs_tx_eval: rustc_hash::FxHashSet<i32>,
-    /// Whether any inet output filter can affect CoS TX selection.
-    pub(crate) has_output_tx_selection_v4: bool,
-    /// Per-interface (ifindex) output filter key for inet6.
-    pub(crate) iface_filter_out_v6: rustc_hash::FxHashMap<i32, String>,
+    // #6236 PR-2B: `iface_filter_out_v4_needs_tx_eval` (the former per-interface FxHashSet) and
+    // `has_output_tx_selection_v4` (aggregate) are deleted. The
+    // `interface_output_filter_needs_tx_eval` accessor reads
+    // `Filter::needs_tx_eval()` off `iface_filter_out_v4_fast`, and the global TX
+    // gate reads the `has_output_needs_tx_eval_v4` aggregate (PR-2A) which
+    // subsumes the deleted `affects_tx_selection`-only aggregate.
+    /// #6236 PR-2A: whether any inet output filter needs a TX-path walk
+    /// (`Filter::needs_tx_eval` — CoS/DSCP tx-selection, counter, log, terminal
+    /// action, or three-color policer). Recomputed from the FINAL output fast map
+    /// so a duplicate-ifindex last-wins overwrite cannot leave a stale-true
+    /// aggregate. It is the SOLE output clause of the global TX gate: it subsumes
+    /// both the old `affects_tx_selection`-only aggregate and the old
+    /// per-interface needs-tx-eval set non-emptiness (both deleted in PR-2B).
+    pub(crate) has_output_needs_tx_eval_v4: bool,
     /// Direct per-interface inet6 output filter reference for packet hot-path evaluation.
     pub(crate) iface_filter_out_v6_fast: rustc_hash::FxHashMap<i32, Arc<Filter>>,
-    /// Per-interface inet6 output filters that must still be evaluated in the TX path.
-    pub(crate) iface_filter_out_v6_needs_tx_eval: rustc_hash::FxHashSet<i32>,
-    /// Whether any inet6 output filter can affect CoS TX selection.
-    pub(crate) has_output_tx_selection_v6: bool,
-    /// lo0 inet input filter key.
-    pub(crate) lo0_filter_v4: String,
+    // #6236 PR-2B: `iface_filter_out_v6_needs_tx_eval` and
+    // `has_output_tx_selection_v6` are deleted (see the inet output block above).
+    /// #6236 PR-2A: inet6 mirror of `has_output_needs_tx_eval_v4`.
+    pub(crate) has_output_needs_tx_eval_v6: bool,
     /// Direct lo0 inet filter reference for packet hot-path evaluation.
     pub(crate) lo0_filter_v4_fast: Option<Arc<Filter>>,
-    /// lo0 inet6 input filter key.
-    pub(crate) lo0_filter_v6: String,
     /// Direct lo0 inet6 filter reference for packet hot-path evaluation.
     pub(crate) lo0_filter_v6_fast: Option<Arc<Filter>>,
 }

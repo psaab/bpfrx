@@ -3,11 +3,13 @@ package configstore
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -464,11 +466,184 @@ func (s *Store) persistRetryLoop(backoff, maxBackoff time.Duration) {
 }
 
 // SetArchiveConfig configures automatic archival on commit.
+//
+// #5523 C179-060: it also SEEDS the monotonic archive sequence from the highest
+// seq already present on disk, so config-<ts>.<seq>.conf filenames stay
+// GLOBALLY monotonic across daemon restarts. archiveSeq is otherwise a fresh
+// per-process counter that restarts at 0; because rotateArchives now prunes by
+// seq (not lexical/ts order), a restart that reset seq to 0 would let a stale
+// high-seq archive from the PRIOR process outrank — and evict — the fresh
+// low-seq archives of the NEW process. Seeding to max(existing seq) keeps the
+// newest commit's seq strictly highest so retention order is correct across
+// restarts. The scan runs whenever the target dir differs from the one last
+// successfully seeded (archiveSeedDir) — process start (archiveSeedDir=="") and
+// a runtime dir switch both qualify (#6396: a switch to a previously-used dir
+// must re-seed from that dir's existing max, else this process's lower counter
+// would let the pre-existing archives outrank the new ones). A scan that fails
+// to READ the dir does NOT mark the dir seeded — it leaves archiveSeedDir unset
+// (#6404 clears it on a genuine error) so the next attempt rescans, rather than
+// pinning the counter below the on-disk max (#6396 Codex MINOR 4); and while the
+// counter is unconfirmed the readiness gate makes an archiving commit SKIP its
+// archive rather than write a below-max seq (see ensureArchiveSeededLocked).
+//
+// #6404 edge 2: disabling archival (dir=="") INVALIDATES archiveSeedDir, so a
+// later re-enable to the SAME dir re-scans it. Without the invalidation
+// A→""→A left archiveSeedDir==A and the re-enable skipped the rescan; if the
+// on-disk max in A advanced while archival was off (another process/tenant
+// wrote there), the counter would stay low and every fresh archive would be
+// pruned as stale. The seed retry the commit path performs (#6404 edge 1,
+// ensureArchiveSeededLocked) rests on the same invariant: archiveSeedDir names
+// a dir this process has actually scanned, never a stale disabled one.
 func (s *Store) SetArchiveConfig(dir string, max int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.archiveDir = dir
 	s.archiveMax = max
+	if dir == "" {
+		// #6404 edge 2: archival disabled. Clear archiveSeedDir so a later
+		// re-enable to a previously-seeded dir re-scans it (the on-disk max may
+		// have advanced while archival was off). A disabled store writes no
+		// archives, so clearing the marker only forces the rescan the re-enable
+		// must do — it never rewinds the monotonic counter itself.
+		s.archiveSeedDir = ""
+		return
+	}
+	// Seed the monotonic archive seq from the highest seq already on disk in
+	// the target dir (see ensureArchiveSeededLocked for the full rationale).
+	s.ensureArchiveSeededLocked()
+}
+
+// ensureArchiveSeededLocked seeds the monotonic archive counter (archiveSeq)
+// from the highest seq present in the active archive dir, when that dir has not
+// yet been SUCCESSFULLY scanned (archiveSeedDir != archiveDir). It returns
+// whether the counter is CONFIRMED relative to the active dir — true when
+// seeding is moot or succeeded, false only when a genuine scan failure leaves
+// the on-disk max UNKNOWN. The caller MUST hold s.mu for WRITING — it may store
+// archiveSeedDir.
+//
+// Switching to a previously-used directory whose existing archives carry HIGHER
+// seqs than this process's counter would otherwise let those pre-existing
+// archives outrank — and evict — the archives this process is about to write,
+// the same across-restart hazard #5523 C179-060 closed but reached via a live
+// dir switch (#6396). The seed is monotonic-up only (max of the current counter
+// and the on-disk max), so switching to an empty or lower-seq dir never rewinds
+// the counter.
+//
+// Readiness (#6404 Codex MAJOR round 2): the archiving commit path calls this
+// BEFORE it captures a seq and SKIPS the archive when it returns false. A commit
+// that lands in the window AFTER a failed SetArchiveConfig scan re-attempts the
+// reseed here (edge 1); if that rescan ALSO fails the on-disk max is still
+// unknown, so writing at the low counter would drop a below-max archive that
+// rotateArchives prunes as stale — skipping this commit's archive (it archives
+// on the next successful commit) is strictly safer than writing a mis-seq'd one.
+//
+// Result cases:
+//   - dir=="" (archival off) or archiveSeedDir==dir (already confirmed): ready,
+//     no scan (the common case is a cheap string compare — no per-commit ReadDir).
+//   - dir does not exist yet (first use, os.ErrNotExist): CONFIRMED empty —
+//     there are no pre-existing archives to outrank, so seq 0 is correct and the
+//     write path's MkdirAll creates the dir. Recorded as seeded, ready.
+//   - scan succeeds (including a readable empty dir → seed 0): seeded, ready.
+//   - genuine READ error (mount/permission): UNCONFIRMED. archiveSeedDir is
+//     CLEARED (#6404 adjacent) so we never retain confidence in a dir we have
+//     navigated away from — A→failed-B→A then re-scans A — and a later call
+//     retries. Returns false so the commit path skips this archive.
+func (s *Store) ensureArchiveSeededLocked() bool {
+	dir := s.archiveDir
+	if dir == "" || s.archiveSeedDir == dir {
+		return true
+	}
+	seed, err := maxArchiveSeq(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// First use: the archive dir does not exist yet. This is NOT a scan
+			// failure — a nonexistent dir holds no pre-existing archives, so seq
+			// 0 is confirmed-correct and the write path's MkdirAll creates it.
+			// Treat exactly like a readable empty dir: record as seeded, ready.
+			s.archiveSeedDir = dir
+			return true
+		}
+		// #6396 Codex MINOR 4 + #6404: a genuine scan failure (mount/permission)
+		// must NOT reseed the counter to 0. The on-disk max is UNKNOWN, so the
+		// counter is unconfirmed. Clear archiveSeedDir (#6404 adjacent) so a
+		// stale marker for a previously-confirmed dir is not trusted after we
+		// navigate to a new dir, and so the next call retries. Return false so
+		// the commit path skips this archive rather than writing a below-max seq
+		// that rotateArchives would prune as stale.
+		slog.Warn("archive seq reseed scan failed; counter unconfirmed, will retry",
+			"dir", dir, "err", err)
+		s.archiveSeedDir = ""
+		return false
+	}
+	if seed > s.archiveSeq.Load() {
+		s.archiveSeq.Store(seed)
+	}
+	s.archiveSeedDir = dir
+	return true
+}
+
+// parseArchiveSeq extracts the monotonic sequence number from an archive
+// filename of the form config-<ts>.<seq>.conf. The ts itself embeds a dot
+// (seconds.nanoseconds), so the seq is the LAST dot-delimited field before the
+// .conf suffix. Returns (0, false) for any name that is not a well-formed
+// archive filename (a legacy or foreign file) so callers can order it as oldest.
+func parseArchiveSeq(name string) (uint64, bool) {
+	if !strings.HasPrefix(name, "config-") || !strings.HasSuffix(name, ".conf") {
+		return 0, false
+	}
+	core := strings.TrimSuffix(name, ".conf")
+	dot := strings.LastIndexByte(core, '.')
+	if dot < 0 {
+		return 0, false
+	}
+	// #6396: a current-format archive is config-<ts>.<seq>.conf where <ts>
+	// itself embeds a dot (seconds.nanoseconds), so core has TWO dots and the
+	// portion before the seq dot still contains one. A legacy pre-#3441
+	// config-<ts>.conf name has only the ts's single dot, whose trailing
+	// nanoseconds ("20240101-120000.123456789") would otherwise be mis-read as
+	// a huge sequence — corrupting the seq-ordered retention of a MIXED
+	// legacy+current archive dir. Require the ts dot to be present so a legacy
+	// name is treated as unparseable (oldest, pruned first, lexical-by-ts among
+	// its peers), matching a config-<ts>.conf with no subsecond ts (which has
+	// no dot in core and already returns false).
+	if strings.IndexByte(core[:dot], '.') < 0 {
+		return 0, false
+	}
+	seq, err := strconv.ParseUint(core[dot+1:], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return seq, true
+}
+
+// archiveDirReader reads an archive directory. It is a package-level seam
+// (defaulting to os.ReadDir) so a test can drive the reseed scan-failure path
+// deterministically (#6396 Codex MINOR 4) — a live os.ReadDir cannot be
+// reliably forced to fail from a unit test, least of all when tests run as root.
+var archiveDirReader = os.ReadDir
+
+// maxArchiveSeq returns the highest config-<ts>.<seq>.conf sequence number
+// present in dir. It returns a non-nil error when the directory is UNREADABLE,
+// distinct from a readable directory that holds no well-formed archive (which
+// returns 0, nil). The caller MUST NOT treat a scan error as an empty
+// directory: seeding the monotonic counter to 0 on a transient failure would
+// pin it below the on-disk max and prune every fresh archive as stale
+// (#6396 Codex MINOR 4). Used by SetArchiveConfig to seed archiveSeq.
+func maxArchiveSeq(dir string) (uint64, error) {
+	entries, err := archiveDirReader(dir)
+	if err != nil {
+		return 0, err
+	}
+	var maxSeq uint64
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if seq, ok := parseArchiveSeq(e.Name()); ok && seq > maxSeq {
+			maxSeq = seq
+		}
+	}
+	return maxSeq, nil
 }
 
 // QuiesceArchival fences and drains the async auto-archive writers so a
@@ -537,31 +712,80 @@ func (s *Store) ResumeArchival() {
 // concurrent QuiesceArchival JOINs an in-flight synchronous write before the
 // wipe — the fence alone cannot close the write-after-wipe window.
 func (s *Store) ArchiveConfig(archiveDir string, maxArchives int) error {
-	// Capture the fence check, the text, timestamp, the monotonic seq AND the
-	// writer registration (archiveWG.Add) together under the lock. The seq/ts
-	// capture matches the commit path (#3441 H4, Codex MAJOR): the previous
-	// code called time.Now() AFTER releasing the lock, an ordering race that
-	// could mislabel the archive relative to a concurrent commit.
+	// Capture the fence check, the seed scan, the text, timestamp, the monotonic
+	// seq AND the writer registration (archiveWG.Add) together under the store
+	// WRITE lock. The seq/ts capture matches the commit path (#3441 H4, Codex
+	// MAJOR): the previous code called time.Now() AFTER releasing the lock, an
+	// ordering race that could mislabel the archive relative to a concurrent
+	// commit.
+	//
+	// #6403: hold the WRITE lock (not RLock) across the seed scan + seq claim,
+	// and seed the shared monotonic counter from THIS dir's on-disk max BEFORE
+	// claiming a seq, so the archive we write always outranks every pre-existing
+	// archive in the same dir. Two coupled hazards this closes:
+	//
+	//   1. Off-lock reseed overtakes the claimed seq. Under the old RLock the
+	//      seq was claimed and the lock released, then the actual write ran
+	//      off-lock. A concurrent SetArchiveConfig (write lock) that switched to
+	//      a dir with a higher on-disk max reseeds archiveSeq UPWARD; because
+	//      the shared counter is process-global, a subsequent writer to THIS dir
+	//      would then claim a seq far above ours, and rotateArchives (#5523
+	//      seq-ordered retention) prunes our fresh-but-low-seq archive as stale.
+	//      Claiming under the write lock makes the seed+claim mutually exclusive
+	//      with that reseed — the counter cannot be bumped between our seed and
+	//      our claim, and two concurrent ArchiveConfig calls no longer race the
+	//      Load→Store→Add seed as they could under a shared RLock.
+	//   2. Stale shared counter vs THIS dir. archiveSeq tracks whatever dir
+	//      SetArchiveConfig last seeded (possibly a different or empty dir), so
+	//      it can sit BELOW the on-disk max of the dir passed here — which is a
+	//      PARAMETER, decoupled from s.archiveDir. Writing at that low seq drops
+	//      a below-max archive that rotateArchives immediately prunes as stale.
+	//      Seeding from archiveDir here — monotonic-up, mirroring
+	//      ensureArchiveSeededLocked / #6404 for the commit path — guarantees the
+	//      claimed seq outranks the dir's existing contents.
+	//
+	// The seed scan is a bounded ReadDir under the lock, exactly what the commit
+	// path already does via ensureArchiveSeededLocked; only the WRITE stays
+	// off-lock (below), so a long archival I/O still never blocks
+	// reconcile/QuiesceArchival (#6185) — the lock-widening #6403 warns against
+	// is holding s.mu across the WRITE, not this scan+claim.
 	//
 	// #6185: the fence read and the Add(1) run under s.mu guarded by
 	// !archiveFenced, exactly like the async launch guard, so the Add/Wait
 	// ordering stays race-free: QuiesceArchival sets archiveFenced under s.mu
 	// (write lock) before it Wait()s, and that write lock is mutually exclusive
-	// with this RLock — so a concurrent QuiesceArchival either observes this
-	// writer in archiveWG and JOINs it (we Added before it took the write lock)
-	// or sets the fence first and we no-op (we read fenced=true and never Add).
-	// The counter can never rise from zero concurrently with Wait.
-	s.mu.RLock()
+	// with the lock we hold here — so a concurrent QuiesceArchival either
+	// observes this writer in archiveWG and JOINs it (we Added before it took
+	// the lock) or sets the fence first and we no-op (we read fenced=true and
+	// never Add). The counter can never rise from zero concurrently with Wait.
+	s.mu.Lock()
 	if s.archiveFenced.Load() {
 		// A factory reset is erasing the archive directory; do not recreate it.
-		s.mu.RUnlock()
+		s.mu.Unlock()
 		return nil
+	}
+	// #6403: seed the shared counter from THIS dir before claiming the seq.
+	if seed, err := maxArchiveSeq(archiveDir); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			// A genuine scan error (mount/permission) leaves the on-disk max
+			// UNKNOWN, so a claimed seq cannot be guaranteed to outrank the
+			// dir's contents; writing anyway could drop a below-max archive that
+			// rotateArchives prunes as stale. Fail the SYNCHRONOUS call so the
+			// caller learns it could not safely archive, and register NO writer
+			// in archiveWG (none runs). A nonexistent dir is NOT an error — first
+			// use holds no pre-existing archives, so seq 0 is correct and
+			// writeArchive's MkdirAll creates the dir.
+			s.mu.Unlock()
+			return fmt.Errorf("archive seq reseed scan of %s: %w", archiveDir, err)
+		}
+	} else if seed > s.archiveSeq.Load() {
+		s.archiveSeq.Store(seed)
 	}
 	data := s.active.Format()
 	ts := time.Now()
 	seq := s.archiveSeq.Add(1)
 	s.archiveWG.Add(1)
-	s.mu.RUnlock()
+	s.mu.Unlock()
 	// The write happens off-lock (writeArchive never touches s.mu, so a
 	// concurrent QuiesceArchival Wait()ing on archiveWG cannot deadlock on the
 	// store lock), and Done fires only after it completes so the JOIN covers
@@ -587,9 +811,10 @@ func (s *Store) ArchiveConfig(archiveDir string, maxArchives int) error {
 // can still format the SAME wall-clock nanosecond under a coarse clock or
 // an NTP step-back, and the later atomic write would overwrite the earlier
 // archive. The seq always advances, so the filename is unique even on an
-// identical timestamp. The ts is kept first so the lexical sort
-// rotateArchives uses stays chronological (ts dominates; the 20-digit
-// zero-padded seq only breaks same-ts ties, in monotonic commit order).
+// identical timestamp. The ts is kept first so a human `ls` reads
+// chronologically; retention order does NOT rely on that lexical order —
+// rotateArchives prunes by the parsed seq (#5523 C179-060), which is robust
+// to a backward wall-clock step that a ts-lexical sort would mis-order.
 func writeArchive(archiveDir string, maxArchives int, data string, ts time.Time, seq uint64) error {
 	// Owner-only 0700 (#4056): the archive directory holds only timestamped
 	// copies of the full config text (each with cleartext secrets), so it
@@ -652,8 +877,29 @@ func rotateArchives(dir string, maxArchives int) {
 		return
 	}
 
-	// Sort alphabetically (timestamps sort naturally)
-	sort.Strings(archives)
+	// Sort by the monotonic per-filename SEQ (#5523 C179-060), NOT lexically by
+	// filename. The name is config-<ts>.<seq>.conf with the ts FIRST, so a
+	// lexical sort is ts-dominated: a backward wall-clock step (an NTP
+	// correction) makes the NEWEST commit format an EARLIER ts and sort first,
+	// so the ts-lexical prune would evict that newest archive as if it were the
+	// oldest. The seq always advances in commit order — and SetArchiveConfig
+	// seeds it across restarts, so it is globally monotonic — hence seq order is
+	// the true retention order. A filename with no parseable seq (legacy or
+	// foreign) sorts as oldest (pruned first), with a lexical tiebreak among
+	// such files and among equal seqs.
+	sort.Slice(archives, func(i, j int) bool {
+		si, oki := parseArchiveSeq(archives[i])
+		sj, okj := parseArchiveSeq(archives[j])
+		if oki != okj {
+			// A parseable seq always outranks an unparseable name, so the
+			// unparseable (legacy/foreign) one sorts first as oldest.
+			return okj
+		}
+		if oki && okj && si != sj {
+			return si < sj
+		}
+		return archives[i] < archives[j]
+	})
 
 	// Remove oldest.
 	for i := 0; i < len(archives)-maxArchives; i++ {

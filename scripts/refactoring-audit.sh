@@ -25,30 +25,17 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
-# Skip:
-#  - target/, vendor/ (build artifacts)
-#  - generated bpf2go output (*_bpfel.go, *_bpfeb.go, also
-#    *_x86_bpfel.go via the parent pattern)
-#  - generated protobuf (*.pb.go, *_grpc.pb.go)
-#  - generated zz_generated_*
-#  - relocated/colocated tests (#1034): tests.rs, *_tests.rs, *_test.go
-#  - test_support.rs (test-only helpers)
-#  - plan retrospectives marked KILLED / WITHDRAWN
-#  - findings docs (large evidence artifacts under docs/pr/*/)
-#  - lockfiles
-SKIP_RE='(^|/)(target|vendor)/'
-SKIP_RE+='|/zz_generated'
-SKIP_RE+='|_bpfel\.go$|_bpfeb\.go$'
-SKIP_RE+='|\.pb\.go$|_grpc\.pb\.go$'
-SKIP_RE+='|(^|/)tests\.rs$|_tests\.rs$|_test\.go$'
-SKIP_RE+='|(^|/)test_support\.rs$'
-# #1208 PR review (Codex MED-3): test_fixtures.rs and test_zone_ids.rs
-# are #[cfg(test)] modules (afxdp/mod.rs:94, main.rs:14) — exclude by
-# name even though they're under src/.
-SKIP_RE+='|(^|/)test_fixtures\.rs$|(^|/)test_zone_ids\.rs$'
-SKIP_RE+='|/_KILLED|/_WITHDRAWN'
-SKIP_RE+='|docs/pr/[^/]+/findings'
-SKIP_RE+='|\.lock$'
+# Classifier (exclusion regex) and LOC measurement live in the shared
+# library so the generator, the `make audit-check` diff, and the
+# enforcement fixtures (pkg/refactoraudit) classify every path the same
+# way. Sourcing defines $AUDIT_SKIP_RE + audit_loc() with no side
+# effects. See scripts/refactoring-audit-lib.sh for the full skip list
+# (target/vendor, generated code, Go/Rust test filename shapes — #6232
+# added the tests_*.rs / test_*.rs sibling-test-module shapes — retired
+# plan retrospectives, findings docs, lockfiles).
+# shellcheck source=scripts/refactoring-audit-lib.sh
+. "$ROOT/scripts/refactoring-audit-lib.sh"
+SKIP_RE="$AUDIT_SKIP_RE"
 
 categorize() {
     local loc=$1
@@ -94,7 +81,7 @@ audit_rust() {
     find $dirs -name '*.rs' 2>/dev/null \
         | grep -vE "$SKIP_RE" \
         | while read -r f; do
-            loc=$(wc -l < "$f")
+            loc=$(audit_loc "$f")
             if [ "$loc" -ge 1500 ]; then
                 printf "%s  %5d  %s\n" "$(categorize "$loc")" "$loc" "$f"
             fi
@@ -109,7 +96,7 @@ audit_go() {
     find $dirs -name '*.go' 2>/dev/null \
         | grep -vE "$SKIP_RE" \
         | while read -r f; do
-            loc=$(wc -l < "$f")
+            loc=$(audit_loc "$f")
             if [ "$loc" -ge 1500 ]; then
                 printf "%s  %5d  %s\n" "$(categorize "$loc")" "$loc" "$f"
             fi
@@ -135,7 +122,7 @@ audit_bpf() {
     # shellcheck disable=SC2086 # see audit_rust.
     find $dirs -name '*.c' 2>/dev/null \
         | while read -r f; do
-            loc=$(wc -l < "$f")
+            loc=$(audit_loc "$f")
             if [ "$loc" -ge 1500 ]; then
                 printf "%s  %5d  %s\n" "$(categorize "$loc")" "$loc" "$f"
             fi

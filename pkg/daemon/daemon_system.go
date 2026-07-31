@@ -242,6 +242,14 @@ func (d *Daemon) applyAggregator(er *logging.EventReader, cfg *config.Config) {
 	d.aggReconMu.Lock()
 	defer d.aggReconMu.Unlock()
 
+	// #5523 C179-093: once stopAggregator has run at shutdown, a late commit
+	// (e.g. a racing apply) must NOT start a new aggregator generation — that
+	// aggWg.Add would race the shutdown join. Mirrors the pinRetryStopped /
+	// schedulerStopped latches (#5308).
+	if d.aggStopped {
+		return
+	}
+
 	desired := aggregatorSig{
 		enabled:       cfg.Security.Log.Report,
 		flushInterval: aggregatorFlushInterval,
@@ -300,8 +308,81 @@ func (d *Daemon) applyAggregator(er *logging.EventReader, cfg *config.Config) {
 		er.AddCallback(d.aggregationCallback)
 	})
 
-	go agg.Run(ctx)
+	// Track the flush goroutine on aggWg so stopAggregator can JOIN it at
+	// shutdown (#5523 C179-093). A retired generation (cancel+replace above)
+	// stays tracked until its ctx.Done final flush returns, so the shutdown join
+	// covers both the live generation and any still-flushing retired one.
+	d.aggWg.Add(1)
+	go func() {
+		defer d.aggWg.Done()
+		agg.Run(ctx)
+	}()
 	slog.Info("session aggregation reporting enabled (5 min interval)")
+}
+
+// aggregatorFlushJoinTimeout bounds how long stopAggregator waits for the
+// session-aggregation final flush to complete before proceeding to teardown
+// (#6395). The cancel below triggers SessionAggregator.Run's #5313 ctx.Done
+// final flush, which forwards the pending report SYNCHRONOUSLY through the
+// syslog client (logFn -> er.ForwardLogMsg); a stream-syslog sink allows up to
+// defaultWriteTimeout (~4s) PER line (pkg/logging/syslog.go), so a stalled or
+// unreachable collector could otherwise block this join for many seconds. Since
+// stopAggregator runs BEFORE the HA takeover fence in runShutdownSequence, an
+// unbounded wait can push the whole stop past the systemd 20s TimeoutStopSec
+// (test/incus/xpfd.service) and get the process SIGKILLed before the peer
+// takeover fence runs. 3s is comfortably under a single write timeout and well
+// under both the #5643 applyCloseoutDrainTimeout (5s) and the fence's share of
+// the stop budget, so a stalled sink can never starve the fence.
+const aggregatorFlushJoinTimeout = 3 * time.Second
+
+// stopAggregator cancels the live session-aggregation generation and JOINS its
+// flush goroutine (and any still-flushing retired generation) at shutdown. The
+// cancel triggers SessionAggregator.Run's #5313 ctx.Done final flush, so the
+// pending ~5 min window is emitted as a partial report instead of being dropped
+// when the daemon stops. It latches aggStopped so a late applyAggregator cannot
+// start a new generation after the join. Idempotent / nil-safe: with reporting
+// never enabled there is no cancel and the WaitGroup is empty.
+//
+// The join is BOUNDED by aggregatorFlushJoinTimeout (#6395): the final flush
+// forwards synchronously through the syslog client, so a stalled/unreachable
+// sink would otherwise block this wait — which precedes the HA takeover fence —
+// long enough to blow the systemd stop budget and get SIGKILLed before the
+// fence runs. On the happy path the flush completes in milliseconds and the
+// select returns immediately; on a stalled sink we log a warning and PROCEED to
+// teardown, dropping the partial report (the acceptable fallback — a missed
+// fence is worse). The join goroutine is left to finish late: the process is
+// exiting, so leaking the flush's remaining lifetime is harmless.
+//
+// aggReconMu is held only to latch the flag and read+clear the handles, then
+// RELEASED before the join: SessionAggregator.Run does not take aggReconMu, so
+// releasing avoids holding the commit-path lock across the flush. Called from
+// runShutdownSequence BEFORE the syslog/event teardown so the final flush still
+// has a live forwarding path (SetLogFunc -> er.ForwardLogMsg). Mirrors the
+// #5308 stopPinRetryLoop shape.
+func (d *Daemon) stopAggregator() {
+	d.aggReconMu.Lock()
+	d.aggStopped = true
+	cancel := d.aggCancel
+	d.aggCancel = nil
+	d.aggregatorPtr.Store(nil)
+	d.aggSig = aggregatorSig{}
+	d.aggReconMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		d.aggWg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(aggregatorFlushJoinTimeout):
+		slog.Warn("shutdown: timed out waiting for session-aggregation final "+
+			"flush; proceeding to teardown (partial report dropped)",
+			"timeout", aggregatorFlushJoinTimeout)
+	}
 }
 
 // applyHostname sets the system hostname from system { host-name } config.

@@ -506,6 +506,62 @@ reintroduced on the *receiver* by the #3931 ordering guard). This preserves the
 (nil = store promoted + applied; error = not applied) is exactly what gates the
 mark, so the high-water always reflects the config actually in effect.
 
+**Config-sync apply-failure health surfacing (`CF`, #6387).** Leaving the
+high-water pinned on a persistent apply failure is correct for convergence but
+made the failure *invisible*: a standby whose apply hard-fails every time (e.g.
+the host-inbound enforcement step cannot install because a dependency is
+missing) is stuck `Transfer ready: no`, `applied gen=0` forever, yet reports as
+"healthy" in `show chassis cluster status`. `configApplyLoop` now drives a
+**time-based** config-sync monitor-failure (`CF`) off that failure edge. On the
+FIRST apply failure of an un-applied streak it stamps a monotonic timestamp
+**and arms an independent grace-expiry timer** (`armConfigApplyGraceTimerLocked`
+→ `time.AfterFunc`, overridable in tests via `SessionSync.afterFuncFn`). The
+timer is the primary trigger because the loop only runs on a RECEIVED config and
+the config sender pushes a generation **at most once per connection/generation**
+(the daemon's level-triggered `reconcileConfigSyncToPeer` is idempotent after
+the first push) — so a *stable* connection with one persistent apply failure
+receives **no second delivery**, and any gate keyed on a re-delivery edge (an "N
+consecutive failures" count, or the original elapsed-check that only re-ran on
+another failure) could never fire and would strand the standby silently forever.
+When the timer fires — grace elapsed, `DefaultConfigApplyFailGrace` 30s,
+comfortably longer than a transient RG0-primary rejection so it never flaps — it
+fires `OnConfigApplyHealth(true)` regardless of whether any further config
+arrived. If a re-delivery *does* arrive after the streak has persisted
+**strictly** longer than the grace (`>`, not `>=`), an on-edge fast path raises
+immediately; both paths are idempotent and **epoch-guarded** so CF raises at
+most once per streak and a success that cancels a timer already past its
+`Stop()` cannot raise a stale CF (the cancelled-but-already-firing race).
+Every `OnConfigApplyHealth` publish — the timer raise, the on-edge raise, and
+the success clear — is delivered **while still holding `configApplyMu`** (#6398).
+The epoch guard alone only covers *decision-time* staleness (the timer acquiring
+the lock after a success); it does not order the two callback *deliveries*.
+Publishing both edges under the one mutex serializes them, so a timer raise
+callback preempted between deciding-to-raise and delivering cannot land *after* a
+concurrent success has already cleared CF — the reorder that would otherwise
+leave the manager stuck `configSyncFailing=true` after a successful apply. The
+callback runs `SetConfigSyncHealth`, a cheap two-field setter under the manager's
+`m.mu`, so the lock order is fixed `configApplyMu → m.mu` with no inverse
+(nothing takes `m.mu` then calls back into a `configApplyMu` path). The
+daemon translates `OnConfigApplyHealth` into `cluster.Manager.SetConfigSyncHealth`.
+A successful apply cancels the timer, resets the streak, and clears CF
+**unconditionally** — not gated on the instance's own local raised flag —
+because a comms transport change tears down the `SessionSync` but **keeps the
+`cluster.Manager`**: the replacement instance must be able to clear a CF the
+prior instance raised, so an idempotent clear on the first success of *any*
+instance re-converges the annotation (gating it on a local flag left the manager
+CF stuck raised forever across a comms restart). The timer is also stopped on
+`SessionSync.Stop()` so none leaks across reconnects.
+The manager stores this as a **dedicated node-global field**
+(`configSyncFailing` / bounded `configSyncFailReason`), NOT an
+`rg.MonitorFails` sentinel — `reconcileMonitorDebtsLocked` would wipe any
+non-interface/non-IP `MonitorFails` entry on the next `UpdateConfig`. It renders
+as `CF` in the `Monitor-failures` column of every RG row, flips `Node health` →
+`degraded`, and adds a `Config sync: failing (<reason>)` line beside the
+`Configs apply-failed:` counter. It is **diagnostic only**: it never perturbs
+`Weight`/`monitorWeights`/readiness/election, and it is **not** a second failover
+gate — manual failover stays gated solely by `ConfigStale()`
+(`ReadyForManualFailover`), and crash takeover stays intentionally ungated.
+
 **Applied-not-just-active convergence shortcut (#4957).** `handleConfigSync`
 short-circuits a re-push whose text already matches the active config so a
 duplicate does not re-run the whole reconcile. That shortcut is gated on
@@ -518,11 +574,16 @@ finished applying (a transient networkd/nft/IPsec tail error) as converged: the
 primary's same-generation re-push would take the fast path, return `nil`, and
 advance the high-water past a config whose dataplane never converged — a standby
 that acks a generation it never applied and can expose stale/disarmed forwarding
-at failover. `ActiveApplied()` is a config-text digest the daemon stamps
-(`MarkActiveApplied`) ONLY after a fully-successful apply — the boot apply
-(`applyConfig`), a committed config (`applyAndSyncCommitted`), and a peer
-config-sync (`handleConfigSync` after `syncAndApply` returns nil). It is FALSE in
-the window between promotion and a successful apply, so a re-push of a
+at failover. `ActiveApplied()` is a config-text digest the daemon stamps ONLY
+after a fully-successful apply — the boot apply (`applyConfig`) and a committed
+config (`applyAndSyncCommitted`) stamp `MarkActiveApplied` while holding the
+apply semaphore, and a peer config-sync stamps it from INSIDE `syncAndApply`
+(#6296): it captures the digest of the tree `SyncApply` promoted via
+`ActiveDigest` and replays it via `MarkAppliedDigest` on full success, both under
+the apply semaphore, rather than re-reading `s.active` after the semaphore is
+released (where a concurrent secondary-side promoter could have mutated it into a
+different, never-applied tree). It is FALSE in the window between promotion and a
+successful apply, so a re-push of a
 promoted-but-unapplied config falls through to `syncAndApply` and RE-ATTEMPTS the
 apply (reconcile retry) instead of being swallowed as converged. Because the
 marker is keyed on the config text, a stale value can only make the shortcut MORE
@@ -604,8 +665,9 @@ daemon-stop context abort (#2926) — where the config is not live-forwarding an
 the invalidators are correctly skipped; on those `syncAndApply` returns a nil
 config plus the error. Any other tail error is surfaced (joined with any partial
 #5578 invalidation error) AFTER the invalidators run, so the high-water mark does
-not advance. On such a non-fatal tail error the daemon does NOT stamp
-`MarkActiveApplied` (that runs only when `syncAndApply` returns nil), so
+not advance. On such a non-fatal tail error `syncAndApply` does NOT stamp the
+applied marker (`MarkAppliedDigest` runs only when its deferred sees `retErr ==
+nil` — no fatal or non-fatal apply error and no partial invalidation; #6296), so
 `ActiveApplied()` stays false and the primary's re-push does NOT take the
 active-text fast path (#4957): it re-enters `syncAndApply` and RE-ATTEMPTS the
 apply and the invalidators, completing the reconcile/finalization the tail error

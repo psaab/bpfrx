@@ -3,7 +3,7 @@
 
 use std::sync::atomic::Ordering;
 
-use crate::afxdp::umem::{
+use crate::afxdp::binding_state::{
     bucket_index_for_ns, OwnerProfileOwnerWrites,
     TX_SIDECAR_UNSTAMPED, TX_SUBMIT_LAT_BUCKETS,
 };
@@ -12,7 +12,7 @@ use crate::afxdp::UMEM_FRAME_SHIFT;
 /// #812 Codex round-1 MED + Rust round-1 MED-2: replaced the former
 /// `canonical_submit_stamp` in-band mapping of `ts == 0 → sentinel`
 /// with an early-return in `stamp_submits`. The sentinel is
-/// `u64::MAX` (see `umem.rs::TX_SIDECAR_UNSTAMPED`); a legitimate
+/// `u64::MAX` (see `binding_state/latency.rs::TX_SIDECAR_UNSTAMPED`); a legitimate
 /// monotonic timestamp cannot reach it (~585 years at ns granularity).
 /// Previously, the Rust reviewer flagged the `ts == 0` branch as
 /// in-band signalling on a u64. We now skip all sidecar writes on
@@ -39,7 +39,7 @@ use crate::afxdp::UMEM_FRAME_SHIFT;
 ///
 /// Single-writer: the owner worker is the only thread that touches
 /// this sidecar (see plan §3.3 file citations: `WorkerUmem` is `Rc`
-/// at `umem.rs:16-18`, `free_tx_frames` is plain `VecDeque` at
+/// at `umem/mod.rs`, `free_tx_frames` is plain `VecDeque` at
 /// `worker.rs:16`). Plain slice-indexed store — no atomic, no grow.
 #[inline]
 pub(in crate::afxdp) fn stamp_submits<I>(sidecar: &mut [u64], offsets: I, ts_submit: u64)
@@ -76,7 +76,7 @@ where
         // resize up) corrupt an unrelated slot — `get_mut` returns
         // None on out-of-range, which keeps the hot path sound.
         // Pinned by the `tx_latency_hist_shared_umem_oob_offset_*`
-        // tests in `umem.rs::tests` (canonical pin location after
+        // tests in `binding_state/tests` (canonical pin location after
         // #984 P2a — these tests reach this fn via
         // `crate::afxdp::tx::stamp_submits` through the load-bearing
         // re-export in `tx/mod.rs`).

@@ -1,5 +1,7 @@
 package config
 
+import "fmt"
+
 // runTailGates runs the P7 "tail gates" phase of config compilation — the
 // contiguous trailing validation / finalization gate sequence extracted from
 // compileExpanded as step 3 of the #4406 god-orchestrator decomposition
@@ -162,6 +164,34 @@ func runTailGates(cfg *Config, opts compileOpts) error {
 	}
 	cfg.Warnings = append(cfg.Warnings, nptv6ScopeWarnings...)
 
+	// #6483: static-NAT single-translation-target cardinality gate. A Junos
+	// static-nat rule maps to EXACTLY ONE of `prefix`/`prefix-name`/
+	// `nptv6-prefix`/`inet`; authoring two or more (both a prefix and a
+	// prefix-name, an inet sibling plus a prefix sibling, two prefixes, …) is
+	// invalid but the compiler silently accepted it by honoring one target (by a
+	// fixed priority) and dropping the rest into the shared Then field — which
+	// also let a malformed `mapped-port` riding on a dropped target slip through
+	// (the #6479/C179-038 residual). Runs AFTER the host-mask (#2173) and NPTv6
+	// (#2240/#5818) gates so a rule that ALSO carries a malformed mapped-port or a
+	// bad nptv6 prefix reports that concrete token first (the multi-target defect
+	// is still caught on the next compile once the token is fixed — never masked);
+	// a rule whose ONLY defect is the extra target — or one whose dropped-target
+	// mapped-port those earlier gates never saw (the residual) — is caught here.
+	// Strict (commit / commit-check): hard-reject so the multi-target rule is
+	// operator-visible. Lenient (load / peer-sync): warn (opts.lenientFirewallRefs,
+	// the same opt the sibling static-NAT target gates use) so a config persisted
+	// before this gate existed still boots (#1960 no-brick); the compiler still
+	// lowers the single honored target, so a leniently-loaded config is no worse
+	// than before the gate.
+	if err := validateStaticNATSingleTargetStrict(cfg); err != nil {
+		if opts.lenientFirewallRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("static NAT translation-target cardinality (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #3886: NAT64 prefix commit gate. A NAT64 rule-set `prefix` is read
 	// verbatim into the wire snapshot and parsed at dataplane apply by the Rust
 	// Nat64State::try_from_snapshots /96-integrity check. A non-/96 or malformed
@@ -178,6 +208,29 @@ func runTailGates(cfg *Config, opts compileOpts) error {
 		return err
 	}
 	cfg.Warnings = append(cfg.Warnings, nat64PrefixWarnings...)
+
+	// #5144: source-NAT / NAT64 external-tuple overlap gate — the source-NAT
+	// analog of the #2241 NPTv6 overlap check above. Differently-named
+	// overlapping source pools, a source pool that also backs a NAT64 rule-set,
+	// two NAT64 rule-sets sharing a pool under different prefixes, and duplicate
+	// members within one pool each own an INDEPENDENT PortAllocator/occupancy
+	// bitmap in the Rust dataplane (source.rs keys by pool-name+addresses, nat64.rs
+	// by (prefix, pool_v4)). Independent bitmaps can each mint the same translated
+	// (family, address, port) external tuple, and the reverse (1:N) NAT index then
+	// misdelivers the return packet. Reject the overlap at commit (material choice
+	// S1 — the commit-time detection half of #5144; the deferred packet-path global
+	// cross-domain allocator is NOT implemented here). Strict (commit /
+	// commit-check): hard-reject naming both allocators and the overlapping members.
+	// Lenient (load / peer-sync): warn so a config committed before this gate
+	// existed still boots (#1960 no-brick) — unlike NPTv6/NAT64 the dataplane does
+	// NOT reject the overlapping snapshot, so the latent collision persists until
+	// corrected and the warning says so. Runs AFTER the NAT64 prefix gate so a
+	// malformed-prefix error still wins the first-error slot.
+	natOverlapWarnings, err := validateNATPoolExternalTupleOverlapStrict(cfg, opts.lenientNATPoolOverlap)
+	if err != nil {
+		return err
+	}
+	cfg.Warnings = append(cfg.Warnings, natOverlapWarnings...)
 
 	// #1434 multi-peer WireGuard: per-tunnel commit gate. Strict (commit /
 	// commit-check): hard-reject a WG tunnel with a missing/invalid

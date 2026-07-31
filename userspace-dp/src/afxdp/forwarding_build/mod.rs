@@ -231,6 +231,9 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
         &excluded_local_v6,
     )?;
     interfaces::populate_egress(snapshot, &mut state, &iface_ctx)?;
+    // #6458: zone -> RG-bound-member map for the fabric-ingress zone-stamp
+    // validation; needs both ifindex_to_zone_id and egress final.
+    interfaces::populate_zone_to_rgs(&mut state);
 
     fib::sort_connected(&mut state);
     // #3771: fail the snapshot CLOSED on a route whose `family` contradicts its
@@ -417,22 +420,21 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     // (pre-fix: silently skipped → a partially-installed scheduler).
     state.cos = cos::build_cos_state(snapshot)?;
     let has_cos_interfaces = !state.cos.interfaces.is_empty();
+    // #6236 PR-2A: the output clause is now the single `has_output_needs_tx_eval`
+    // aggregate. It subsumes BOTH the old `has_output_tx_selection` clause AND the
+    // old `iface_filter_out_*_needs_tx_eval` set non-emptiness, because
+    // `needs_tx_eval ⊇ affects_tx_selection` (it also covers counter/log/terminal/
+    // policer). Recomputed from the FINAL output fast map, so it cannot fail open
+    // on a duplicate-ifindex last-wins overwrite and cannot drop enforcement for a
+    // counter/log/terminal/policer-only output filter.
     state.tx_selection_enabled_v4 = has_cos_interfaces
         || state.filter_state.has_input_tx_selection_v4
-        || state.filter_state.has_output_tx_selection_v4
         || state.filter_state.has_input_three_color_policer_v4
-        || !state
-            .filter_state
-            .iface_filter_out_v4_needs_tx_eval
-            .is_empty();
+        || state.filter_state.has_output_needs_tx_eval_v4;
     state.tx_selection_enabled_v6 = has_cos_interfaces
         || state.filter_state.has_input_tx_selection_v6
-        || state.filter_state.has_output_tx_selection_v6
         || state.filter_state.has_input_three_color_policer_v6
-        || !state
-            .filter_state
-            .iface_filter_out_v6_needs_tx_eval
-            .is_empty();
+        || state.filter_state.has_output_needs_tx_eval_v6;
     // #2130: flow export (NetFlow v9 / IPFIX) is owned entirely by the
     // Go control plane (pkg/flowexport), driven by SESSION_CLOSE events.
     // The dataplane never emitted flow records; the Rust FlowExporter and

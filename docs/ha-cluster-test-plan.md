@@ -383,8 +383,15 @@ protocols {
 ```
 
 Flags: M (managed) tells clients to use DHCPv6 for address, O (other) for DNS/domain,
-A (autonomous) allows SLAAC as well. radvd resolves RETH names to physical member
-interfaces via `ResolveReth()` + `LinuxIfName()`.
+A (autonomous) allows SLAAC as well. The embedded RA sender resolves RETH names to
+physical member interfaces via `cfg.ResolveKernelIfName()` in `buildRAConfigs`.
+That resolver maps a logical unit to its configured `vlan-id` for the kernel VLAN
+sub-interface suffix (`reth0 unit 80 vlan-id 180` → `member.180`) — the identity
+chain is logical unit → configured vlan-id → kernel suffix. The earlier
+`ResolveReth()` + `LinuxIfName()` pair preserved the UNIT number as the suffix
+(`member.80`) and bound RA to a nonexistent netdev whenever unit# != vlan-id, and
+it desynced from `rethInterfacesForRG` (which already suffixes by `unit.VlanID`) so
+the cluster RA owner match silently dropped the sender (#5107).
 
 ### DHCP Server (on reth1)
 

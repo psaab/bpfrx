@@ -381,6 +381,100 @@ fn inbound_dnat_reverse_session_key_uses_public_facing_tuple() {
     assert_eq!(reverse.dst_port, 54321, "reverse dst port = original src port");
 }
 
+/// #6473 fail-on-revert: static NAT takes precedence over a destination-NAT
+/// pool rule covering the SAME external address (Junos first-packet order:
+/// static NAT → destination NAT — "static NAT rules take precedence over
+/// destination NAT rules"). The packet below matches BOTH:
+///   - static rule `web-static`: 172.16.80.8 ↔ 10.0.61.50 (plain 1:1)
+///   - DNAT pool  `web-dnat`:   dst 172.16.80.8:443 → 10.0.61.102:8443
+/// The installed session MUST carry the STATIC translation (rewrite_dst =
+/// 10.0.61.50, no port rewrite). On the pre-fix DNAT-first evaluation the
+/// pool shadows the static mapping (rewrite_dst = 10.0.61.102, port 8443)
+/// and this test goes RED.
+#[test]
+fn static_nat_precedes_overlapping_dnat_pool_6473() {
+    let mut snapshot = inbound_dnat_snapshot(wan_to_lan_permit("any", "permit-any"));
+    // Static 1:1 on the SAME external IP as the DNAT pool rule, pointing at
+    // a DIFFERENT internal host.
+    snapshot.static_nat_rules = vec![StaticNATRuleSnapshot {
+        source_addresses: Vec::new(),
+        counter_id: 0,
+        name: "web-static".to_string(),
+        from_zone: "wan".to_string(),
+        from_interface: String::new(),
+        from_routing_instance: String::new(),
+        external_ip: "172.16.80.8".to_string(),
+        internal_ip: "10.0.61.50".to_string(),
+        match_destination_port: 0,
+        mapped_port: 0,
+    }];
+    snapshot.neighbors.push(NeighborSnapshot {
+        interface: "reth1.0".to_string(),
+        ifindex: 24,
+        family: "inet".to_string(),
+        ip: "10.0.61.50".to_string(),
+        mac: "02:aa:bb:cc:dd:50".to_string(),
+        state: "reachable".to_string(),
+        router: false,
+        link_local: false,
+    });
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 12, 0);
+    binding.interface = Arc::<str>::from("reth0.80");
+    let mut sessions = SessionTable::new();
+
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(198, 51, 100, 10),
+        Ipv4Addr::new(172, 16, 80, 8),
+        54333,
+        443,
+        TCP_FLAG_SYN,
+    );
+    let meta = txn_meta_v4(12, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+    assert!(
+        dbg.tx >= 1,
+        "sanity: the overlapped flow is permitted and forwards either way"
+    );
+
+    let pool_internal = IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102));
+    let static_internal = IpAddr::V4(Ipv4Addr::new(10, 0, 61, 50));
+    let mut pool_wins = 0u32;
+    let mut static_wins = 0u32;
+    let mut pool_port_wins = 0u32;
+    sessions.iter_with_origin(|_key, decision, _metadata, _origin| {
+        if decision.nat.rewrite_dst == Some(pool_internal) {
+            pool_wins += 1;
+        }
+        if decision.nat.rewrite_dst == Some(static_internal) {
+            static_wins += 1;
+        }
+        if decision.nat.rewrite_dst_port == Some(8443) {
+            pool_port_wins += 1;
+        }
+    });
+    assert!(
+        static_wins >= 1,
+        "Junos order: the static 1:1 mapping must win the overlap"
+    );
+    assert_eq!(
+        pool_wins, 0,
+        "the DNAT pool must NOT shadow the static rule (pre-#6473 behavior)"
+    );
+    assert_eq!(
+        pool_port_wins, 0,
+        "a plain static 1:1 rewrites no port (the pool's :443→:8443 must NOT apply)"
+    );
+}
+
 // =====================================================================
 // #2345 MissingNeighbor (neighbor-ABSENT) cold-path coverage.
 //

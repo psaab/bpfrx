@@ -32,8 +32,24 @@
 package natshow
 
 import (
+	"fmt"
+	"io"
+
 	"github.com/psaab/xpf/pkg/dataplane"
 )
+
+// noteSessionScanError emits a caveat line when a dataplane session scan
+// that backs the per-rule / per-binding "active session" counts failed.
+// The detail renderers scan the conntrack table to tally sessions; a
+// transient read error (map busy, dataplane reload) otherwise left the
+// counts silently understated — a zero that reads as "no sessions"
+// rather than "could not read". Surfacing the error tells the operator
+// the displayed counts are partial (#5557).
+func noteSessionScanError(w io.Writer, err error) {
+	if err != nil {
+		fmt.Fprintf(w, "Warning: active session counts may be incomplete: %v\n", err)
+	}
+}
 
 // Reader is the narrow dataplane surface the NAT renderers need. Both
 // the gRPC grpcRuntime (pkg/grpcapi/runtime.go) and the CLI cliRuntime

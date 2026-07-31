@@ -60,8 +60,9 @@ func RenderPersistentDetail(w io.Writer, dp Reader) {
 		port uint16
 	}
 	sessionCounts := make(map[natKey]int)
+	var scanErr error
 	if dp.IsLoaded() {
-		_ = dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if err := dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
 			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
 				// SessionValue.NATSrcIP is a `uint32` holding the IP's
 				// network-order bytes in native-endian word form (the
@@ -75,8 +76,10 @@ func RenderPersistentDetail(w io.Writer, dp Reader) {
 				sessionCounts[natKey{netip.AddrFrom4(ip4), val.NATSrcPort}]++
 			}
 			return true
-		})
-		_ = dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		}); err != nil {
+			scanErr = err
+		}
+		if err := dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
 				// Match conntrack/gc.go:397 — no Unmap, the binding
 				// stores the 16-byte form for v6 NAT.
@@ -84,9 +87,12 @@ func RenderPersistentDetail(w io.Writer, dp Reader) {
 				sessionCounts[natKey{addr, val.NATSrcPort}]++
 			}
 			return true
-		})
+		}); err != nil && scanErr == nil {
+			scanErr = err
+		}
 	}
 
+	noteSessionScanError(w, scanErr)
 	fmt.Fprintf(w, "Total persistent NAT bindings: %d\n\n", len(bindings))
 	for i, b := range bindings {
 		if i > 0 {

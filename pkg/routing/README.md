@@ -25,7 +25,10 @@ which makes each domain unit-testable with a fake (see `rules_test.go`'s
 | `vrf.go` | `vrfManager` | VRF lifecycle + `BindInterfaceToVRF`; own `mu` + tracked set |
 | `routes.go` | `routeReader` | kernel routing-table reads (`routeLister`) |
 | `routeformat.go` | free fns | Junos `show route` formatters |
-| `tunnel.go` | `tunnelManager` | GRE/IPIP tunnels + keepalive goroutines; own `mu` |
+| `tunnel.go` | `tunnelManager` | GRE/IPIP + AnchorOnly TUN reconcile, VRF-claim, address, `Clear`/`GetStatus`; own `mu`. WireGuard and the keepalive runner are split into siblings below (#5661) |
+| `tunnel_wireguard.go` | (part of `tunnelManager`) | WireGuard persistent-TUN lifecycle: `applyWireguardTunLocked`, inner-MTU cap (`wgTunMTUForEndpoint`, WG overhead consts), `errWGIncompatibleLinkRetained` sentinel, `closeTuntapFiles` |
+| `tunnel_keepalive.go` | free fns | keepalive **prober** primitives (#1918): `tunnelProber`/`icmpProber`, `ProbeResult`, `UnsupportedKind`, ICMP-echo probe + errno classification |
+| `tunnel_keepalive_runner.go` | (part of `tunnelManager`) | keepalive **runner** half (#5661): `KeepaliveState`/`keepaliveRunner`, `startKeepalive`/`stopAll`, `keepaliveLoop`/`keepaliveTick`, `GetKeepaliveState` |
 | `xfrm.go` | `xfrmManager` | XFRM/IPsec interface lifecycle; own `mu` + tracked `name→if_id` set. `Apply` reconciles **differentially** against the tracked set (keep unchanged / create new / delete removed / recreate on `if_id` change) — it does NOT clear-all-then-rebuild, so an unrelated config commit leaves active xfrmi interfaces untouched (#2546). Refuses to create either of two distinct devices that derive the same `if_id` — fail-closed collision guard (#2909) |
 | `rules.go` | `nextTableManager` / `ribGroupManager` / `pbrManager` | policy-routing ip-rule reconcilers (`ruleOps`, stateless) |
 | `probe_pin.go` | `probePinManager` | RPM probe next-hop pin reconciler (#1827): fwmark rules in band 50-99 + pinned host routes in reserved tables 7000-7049 (`probePinOps`, stateless). `Apply` returns per-test install failures (keyed by TestKey) and rolls back the fwmark rule when the pinned route fails (best-effort — a failed rollback is swept by the next band clear; the pin reports failed either way); callers thread the failed map into `pkg/rpm` so affected tests hold state instead of probing unpinned (#1895) |
@@ -106,6 +109,93 @@ path already draws (see the WireGuard/tunnel removal notes below and
   retained entry rather than nil-ing the map). The #4901 hardening only
   covered a failed `LinkDel` **after** a successful lookup; this closes the
   predating `LinkByName`-error branch.
+
+**Identity re-assertion on every post-create readback (#5523 C179-104 +
+#6396).** `LinkAdd` and the `LinkByName` readback that follows it are two
+syscalls. A device is adopted only after confirming the readback is the
+INTENDED type — and, for xfrm and VRF, carrying the desired discriminator
+too — never by name alone. The discriminator checked is per-manager: **xfrm
+rejects type + `Ifid` + `ParentIndex==0`, VRF rejects type + table, and bond
+rejects TYPE (`*netlink.Bond`) on ALL THREE of its create-path (#6396),
+adopt-path (#6402), and KEEP-path (#6402) readbacks** (only a mode/MTU residual
+remains — see the bond bullet). So a same-name foreign link (or, for xfrm/VRF, a
+right-type link with the wrong discriminator) substituted by a concurrent
+external actor in the add→readback window — or, for the bond adopt/KEEP paths, a
+foreign link already wearing a fabric/RETH bond's name at steady state — is
+rejected: it is not brought up or adopted, the name is reclaimed via
+delete+recreate (or the commit fails closed on a create-path substitute), and no
+foreign device is tracked as a satisfied device. This invariant now holds across
+all three netlink-device managers:
+
+- **xfrm** (`xfrm.go`) — the readback must be an `*netlink.Xfrmi` whose
+  `Ifid` matches. Enforced on BOTH the adopt path (a kernel link outliving
+  in-memory tracking; a non-xfrmi or stale-`if_id` link is delete+recreated,
+  #5523 C179-104) and the post-create readback (#6396).
+- **VRF** (`vrf.go` `createLinkedVRF`) — the readback must be an
+  `*netlink.Vrf` whose `Table` matches (#6396). `added` stays true so the
+  caller records ownership; the reconcile adopt path (`vrfTable` →
+  recreate on table mismatch) reclaims a substitute on the next cycle.
+- **bond** (`bond.go`) — ALL THREE readbacks that can bring a link up and track
+  it as a satisfied bond must first re-assert `*netlink.Bond` — the **create
+  path** (`createLocked` post-`LinkAdd`), the **adopt path** (`createLocked`
+  steady-state reconcile branch), and the **KEEP path** (`Apply`'s
+  tracked-and-unchanged fast path). `LinkByName` resolves the NAME, not the
+  type, so any of the three, left ungated, would bring a same-name foreign link
+  up and report convergence while NO bond carries the fabric/RETH members.
+    - **create-path** gate (#6396) re-asserts the type after `LinkAdd`:
+      `enslaveMembers` only surfaces a substitute via a real-netlink
+      `LinkSetMaster` failure when a member is actually enslavable, so a bond
+      whose configured members are all currently absent (the #4823 soft-error
+      case) would otherwise adopt a foreign link; the explicit type check closes
+      that hole for every member state.
+    - **adopt-path** gate (#6402) re-asserts the type at the top of the
+      steady-state reconcile branch (`if existing, err := LinkByName(name); err
+      == nil`): a same-name foreign link already wearing a fabric/RETH bond's
+      name — an external actor's device, or a leftover of a different type after
+      a name collision — is reclaimed via `deleteLocked` + fall-through to the
+      create path (mirroring the xfrm #5523 adopt gate and the
+      `vrfTable`→recreate adopt path) rather than adopted. A `deleteLocked`
+      failure leaves the foreign link present, so the recreate is skipped this
+      cycle and the delete error is surfaced (commit fails closed, next reconcile
+      retries the delete) — the #5119 / xfrm #5310 recreate discipline.
+    - **KEEP-path** gate (#6402) re-asserts the type in `Apply`'s
+      tracked-and-unchanged fast path (`if trackedSig == sig` → `LinkByName` →
+      `LinkSetUp`). A tracked bond can be replaced by a same-name foreign link,
+      and — because a failed `deleteLocked` retains tracking (#4901) — the
+      adopt-gate delete-fail transition leaves `b.bonds[name]` still == desired
+      sig with a foreign link present. Without the KEEP-path gate the next
+      reconcile would bring that foreign link up and `continue`, never
+      re-entering `createLocked`, never retrying the delete → false convergence
+      forever. The gate falls a non-bond link through to the recreate path
+      (which re-enters `createLocked`, whose adopt gate reclaims it or fails
+      closed again), so `b.bonds[name]` is never presented as satisfied by a
+      foreign link: `createLocked` is re-entered every reconcile until the delete
+      succeeds.
+
+  **Bond adopt/KEEP are HA-touching** (a fabric/RETH LAG reconcile change), so
+  #6402 carries a loss-cluster `make test-failover` smoke; in the healthy case
+  every gate is a pure pass-through (the link IS a `*netlink.Bond`), so
+  steady-state reconcile of a real fabric bond is bit-identical and never
+  flapped.
+
+  The bond identity gate is now the TYPE assertion on all three readbacks. One
+  narrower residual remains OPEN as further hardening (pre-existing — master
+  never validated it; NOT a #6396/#6402 regression), a distinct concern from the
+  type/identity-assertion readback family #6402 closed:
+    1. **mode/MTU (all paths)** — the guards check the `*netlink.Bond` type
+       only, then track the DESIRED `bondSig` (`sigWithMembers(sig, …)`), not the
+       readback's observed mode/MTU. An `*netlink.Bond` with the wrong bond mode
+       (802.3ad vs active-backup) or MTU passes and is tracked as satisfied.
+  (xfrm and VRF adopt paths ARE fully gated — xfrm.go asserts type + `Ifid` +
+  `ParentIndex==0`, and `vrfTable`→recreate asserts type + table. Bond now gates
+  TYPE on create + adopt + KEEP; only the mode/MTU residual above remains.)
+
+Without the check the name is tracked as satisfied while **no** device
+carries the desired identity, silently blackholing the VPN / leaked routes
+/ fabric LAG bound to it. (The tunnel/WireGuard manager reaches its reuse
+path through a distinct anchor-reuse gate that already type-checks
+`*netlink.Tuntap` — see the reuse notes below — so it is not part of this
+readback family.)
 
 ### Bond (fabric/ae LAG) reconcile (#5119)
 
@@ -202,7 +292,7 @@ delegate to the owning domain. Exported types:
 
 - `Manager` — `routing.go` (façade).
 - `VRFSpec` — `vrf.go`.
-- `KeepaliveState` — `tunnel.go`. Per-tunnel probe status.
+- `KeepaliveState` — `tunnel_keepalive_runner.go`. Per-tunnel probe status.
 - `TunnelStatus` — `tunnel.go`.
 - `RouteEntry`, `NextHop`, `TableRoutes` — `routes.go`. `RouteEntry.NextHops`
   lists every leg of a kernel ECMP route (see "Multipath / ECMP routes" below).

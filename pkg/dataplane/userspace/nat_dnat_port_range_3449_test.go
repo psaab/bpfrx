@@ -10,6 +10,12 @@
 //
 // RED-on-revert: restore the per-port `for _, dstPort := range dstPorts` emit
 // and a 10 001-port range yields 10 001 snapshots, failing the len==1 assert.
+//
+// #6462: these configs pin `match protocol tcp` so the range-expansion
+// invariant is measured in isolation. A protocol-less port rule now emits BOTH
+// a tcp- and a udp-keyed entry (Junos bare-dest-port semantics), which would
+// double every count here for reasons orthogonal to per-port expansion. The
+// dual-protocol behavior has its own coverage in nat_destination_6462_test.go.
 package userspace
 
 import (
@@ -29,7 +35,7 @@ func expandPorts(lo, hi int) []int {
 func TestBuildDNATSnapshotWideRangeNotExpanded_3449(t *testing.T) {
 	// `destination-port 20000 to 30000` — the parser hands the builder the
 	// expanded 10 001-port list; the builder must collapse it to ONE entry.
-	cfg := dnatPortConfig(config.NATMatch{DestinationPorts: expandPorts(20000, 30000), DestinationPort: 20000})
+	cfg := dnatPortConfig(config.NATMatch{Protocol: "tcp", DestinationPorts: expandPorts(20000, 30000), DestinationPort: 20000})
 	snaps := buildDestinationNATSnapshots(cfg, nil)
 	if len(snaps) != 1 {
 		t.Fatalf("a 10 001-port range expanded into %d snapshots, want 1 (range, not per-port)", len(snaps))
@@ -42,14 +48,14 @@ func TestBuildDNATSnapshotWideRangeNotExpanded_3449(t *testing.T) {
 		t.Fatalf("MatchDestinationPorts = %+v, want [{20000 30000}]", s.MatchDestinationPorts)
 	}
 	if s.Protocol != "tcp" {
-		t.Fatalf("Protocol = %q, want \"tcp\" (port-based DNAT default)", s.Protocol)
+		t.Fatalf("Protocol = %q, want \"tcp\" (explicit match protocol tcp)", s.Protocol)
 	}
 }
 
 func TestBuildDNATSnapshotFullPortSpaceNotExpanded_3449(t *testing.T) {
 	// The worst case from the issue: `destination-port 1 to 65535`. Must be ONE
 	// entry, never 65 535.
-	cfg := dnatPortConfig(config.NATMatch{DestinationPorts: expandPorts(1, 65535), DestinationPort: 1})
+	cfg := dnatPortConfig(config.NATMatch{Protocol: "tcp", DestinationPorts: expandPorts(1, 65535), DestinationPort: 1})
 	snaps := buildDestinationNATSnapshots(cfg, nil)
 	if len(snaps) != 1 {
 		t.Fatalf("a 65 535-port range expanded into %d snapshots, want 1", len(snaps))
@@ -62,7 +68,7 @@ func TestBuildDNATSnapshotFullPortSpaceNotExpanded_3449(t *testing.T) {
 func TestBuildDNATSnapshotSinglePortKeepsExactFastPath_3449(t *testing.T) {
 	// A single port must NOT regress to the wildcard+range form — it keeps the
 	// exact-port key with no range constraint (the O(1) DnatKey fast path).
-	cfg := dnatPortConfig(config.NATMatch{DestinationPorts: []int{8080}, DestinationPort: 8080})
+	cfg := dnatPortConfig(config.NATMatch{Protocol: "tcp", DestinationPorts: []int{8080}, DestinationPort: 8080})
 	snaps := buildDestinationNATSnapshots(cfg, nil)
 	if len(snaps) != 1 {
 		t.Fatalf("len(snaps) = %d, want 1", len(snaps))
@@ -80,7 +86,7 @@ func TestBuildDNATSnapshotDiscreteAndRangeMix_3449(t *testing.T) {
 	// (80, 443) plus one range (20000-20002) — three entries, not 80/443 + 3
 	// per-port entries.
 	ports := append([]int{80, 443}, expandPorts(20000, 20002)...)
-	cfg := dnatPortConfig(config.NATMatch{DestinationPorts: ports, DestinationPort: 80})
+	cfg := dnatPortConfig(config.NATMatch{Protocol: "tcp", DestinationPorts: ports, DestinationPort: 80})
 	snaps := buildDestinationNATSnapshots(cfg, nil)
 	if len(snaps) != 3 {
 		t.Fatalf("len(snaps) = %d, want 3 (80, 443, [20000-20002])", len(snaps))

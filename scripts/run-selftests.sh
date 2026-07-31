@@ -148,6 +148,15 @@ run_shell scripts/dist/selftest.sh
 # (HC-081 uninitialized-counter false PASS). SKIPs on a host without a C
 # toolchain / libbpf-dev / libxdp-dev / xxd.
 run_shell test/xsk-repro/selftest-compile.sh
+# #6289 M2: the selftest-compile.sh SKIP gate must probe a trial LINK (static
+# archives), not just header syntax, so a headers-present/static-missing host
+# SKIPs cleanly instead of false-RED. Hermetic (fake cc); SKIPs without make/xxd.
+run_shell test/xsk-repro/selftest-skipgate_6289.sh
+# #6355: selftest-compile.sh must WORD-SPLIT $CC like the Makefile's $(CC) so a
+# multi-token wrapper CC (`ccache gcc`, `env cc`) that `make check` accepts runs
+# through instead of false-SKIPping. Hermetic (fake cc via `env`); SKIPs without
+# make/xxd/env.
+run_shell test/xsk-repro/selftest-multitoken-cc_6355.sh
 
 # ── summary ──
 printf '\n\033[1m== selftest summary ==\033[0m\n'

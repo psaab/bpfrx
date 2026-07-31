@@ -15,6 +15,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -300,10 +302,17 @@ type Server struct {
 	// port change could never converge — the bug this replaces. sharedBase is the
 	// pre-auth mux+collector+CSRF handler both legs wrap (per-listener auth gate
 	// via listenerHandler), so the #4162 shared scrape limiter / session cache is
-	// preserved across a rebind. certGen mints a fresh self-signed cert on each
-	// HTTPS (re)bind.
+	// preserved across a rebind. certGen resolves the HTTPS cert for a (re)bind:
+	// the self-signed cert is DURABLE (#1916 D6), so an existing on-disk pair is
+	// LOADED AS-IS and a fresh cert is minted ONLY when no on-disk pair exists —
+	// a rebind does not re-mint (that would churn remote clients' TOFU pins).
+	// bindHost is the listener's host (net.SplitHostPort of the bind addr); at
+	// FIRST mint it lands a non-loopback management IP in the cert SANs (#5719).
+	// A later bind change is NOT re-minted — a loaded cert whose SANs miss the
+	// new bind host is warned about (generateSelfSignedCertAt), not re-served
+	// silently.
 	sharedBase http.Handler
-	certGen    func() (tls.Certificate, error)
+	certGen    func(bindHost string) (tls.Certificate, error)
 	lifeMu     sync.Mutex      // guards httpLeg/httpsLeg/rootCtx across reconciles
 	rootCtx    context.Context // daemon lifetime; every leg drains on its cancel
 	wg         sync.WaitGroup  // joins EVERY serve goroutine (live + retiring legs)
@@ -618,11 +627,22 @@ func (s *Server) buildHTTPServer(addr string) *http.Server {
 	}
 }
 
-// buildHTTPSServer constructs a fresh HTTPS *http.Server bound-for addr with a
-// newly generated self-signed certificate (#5866). A cert-generation failure is
-// returned so the caller retains the previous leg (fail-closed).
+// buildHTTPSServer constructs a fresh HTTPS *http.Server bound-for addr with
+// its durable self-signed certificate (#5866): certGen LOADS the existing
+// on-disk pair AS-IS and mints a fresh cert ONLY when no on-disk pair exists (a
+// rebind does not re-mint — #1916 D6). A cert-resolution failure is returned so
+// the caller retains the previous leg (fail-closed).
 func (s *Server) buildHTTPSServer(addr string) (*http.Server, error) {
-	tlsCert, err := s.certGen()
+	// Thread the listener's host into cert generation so a non-loopback
+	// management bind IP (e.g. `web-management https interface 10.0.0.1`)
+	// lands in the cert's SANs and a remote client verifies under strict
+	// hostname checking (#5719 C001 residual). A wildcard/empty host
+	// (":8443") yields "" and is ignored by the SAN builder.
+	bindHost := ""
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		bindHost = h
+	}
+	tlsCert, err := s.certGen(bindHost)
 	if err != nil {
 		return nil, err
 	}
@@ -706,13 +726,15 @@ func (s *Server) ReplaceAuth(a *AuthConfig) {
 func (s *Server) AuthSnapshotForTest() *AuthConfig { return s.auth.Load() }
 
 // HTTPSCertForTest returns the served TLS leaf certificate, or nil when the
-// server is HTTP-only (#5866). Test-only: lets a cross-package test assert that a
-// TLS-material reconcile rebuilds the listener with a FRESH certificate.
+// server is HTTP-only (#5866). Test-only: lets a cross-package test read the cert
+// the LIVE HTTPS leg is serving after a reconcile, to assert that the durable
+// self-signed pair is reloaded AS-IS across a rebind (#1916 D6 / #6381) rather
+// than re-minted.
 func (s *Server) HTTPSCertForTest() *tls.Certificate {
 	s.lifeMu.Lock()
 	defer s.lifeMu.Unlock()
 	// Read the LIVE HTTPS leg (post-reconcile), not the construction template, so
-	// a TLS-material rebind's fresh cert is observed (#5866).
+	// the cert the rebound listener actually serves is observed (#5866).
 	srv := s.httpsServer
 	if s.httpsLeg != nil {
 		srv = s.httpsLeg.srv
@@ -721,6 +743,24 @@ func (s *Server) HTTPSCertForTest() *tls.Certificate {
 		return nil
 	}
 	return &srv.TLSConfig.Certificates[0]
+}
+
+// SetTLSCertDirForTest points the server's HTTPS certificate generator at dir
+// instead of the production /etc/xpf/tls paths (#6381). Test-only: it lets a
+// cross-package test (pkg/daemon managementReconciler) exercise the DURABLE
+// self-signed-cert path (#1916 D6) against a WRITABLE temp dir, so an HTTPS
+// rebind LOADS the persisted pair AS-IS (the shipping behavior) instead of
+// failing to persist and re-minting a fresh in-memory cert on every reconcile
+// (the CI-only artifact — an unwritable /etc/xpf/tls — that the old
+// TestMgmtReconcileTLSChange_5866 assertion silently depended on). It routes
+// through the real production generateSelfSignedCertAt, so the durable
+// load-as-is path is genuinely bound.
+func (s *Server) SetTLSCertDirForTest(dir string) {
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+	s.certGen = func(bindHost string) (tls.Certificate, error) {
+		return generateSelfSignedCertAt(dir, filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"), bindHost)
+	}
 }
 
 // dynamicAuthMiddleware wraps next with the LIVE auth snapshot (#5866): it reads
@@ -812,18 +852,98 @@ const (
 )
 
 // TLS persistence test seams (#1916 injected-failure tests). Production
-// code must never mutate these.
+// code must never mutate these. tlsHostname is the SAN-source seam (#5719):
+// tests drive the non-ASCII / IP-shaped hostname branches deterministically
+// without mutating the machine's real hostname.
 var (
 	tlsMkdirAllDurable  = fsatomic.MkdirAllDurable
 	tlsRemove           = os.Remove
 	tlsSyncDir          = fsatomic.SyncDir
 	tlsWriteFileDurable = fsatomic.WriteFileDurable
+	tlsHostname         = os.Hostname
 )
+
+// isDNSSANSafeHostname reports whether h is safe to place in a certificate DNS
+// SAN. It must be non-empty, contain only ASCII letters, digits, hyphen, and
+// dot (the characters x509 can encode as an IA5String and that make a
+// well-formed DNS name), and not be an IP literal (an IP-shaped hostname
+// belongs in IPAddresses, not DNSNames). A hostname that fails this check is
+// dropped from the SAN set rather than fed to x509.CreateCertificate, which
+// HARD-FAILS on a non-ASCII DNS name and — under the #5058 all-or-nothing
+// management-server lifecycle — would abort cert generation and tear down the
+// entire HTTP+HTTPS server.
+func isDNSSANSafeHostname(h string) bool {
+	if h == "" {
+		return false
+	}
+	if net.ParseIP(h) != nil {
+		return false // IP literal → belongs in IPAddresses
+	}
+	for _, r := range h {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9', r == '-', r == '.':
+		default:
+			return false
+		}
+	}
+	return true
+}
 
 // generateSelfSignedCert creates or loads a self-signed TLS certificate
 // using the production /etc/xpf/tls paths. See generateSelfSignedCertAt.
-func generateSelfSignedCert() (tls.Certificate, error) {
-	return generateSelfSignedCertAt(tlsDir, certPath, keyPath)
+func generateSelfSignedCert(bindHost string) (tls.Certificate, error) {
+	return generateSelfSignedCertAt(tlsDir, certPath, keyPath, bindHost)
+}
+
+// ipSANsContain reports whether ip is already present in sans. net.IP.Equal
+// normalizes the 4-byte / 16-byte-mapped forms so a v4 SAN never duplicates.
+func ipSANsContain(sans []net.IP, ip net.IP) bool {
+	for _, s := range sans {
+		if s.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// dnsSANsContain reports whether name is already present in names. DNS names
+// are case-insensitive (RFC 4343), so a comparison uses strings.EqualFold —
+// "MGMT.example.com" and "mgmt.example.com" name the same host and must not be
+// double-encoded as distinct SANs.
+func dnsSANsContain(names []string, name string) bool {
+	for _, n := range names {
+		if strings.EqualFold(n, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// bindHostWarnable reports whether bindHost is a concrete management host worth
+// warning about when a loaded on-disk cert does not cover it. An empty host, a
+// wildcard bind (0.0.0.0/::), a loopback host, or "localhost" is NOT warnable:
+// the durable cert always carries the loopback SANs, and a wildcard bind names
+// no single host. Only a non-loopback, non-unspecified management bind can be
+// left uncovered by an older cert.
+func bindHostWarnable(bindHost string) bool {
+	if bindHost == "" || bindHost == "localhost" {
+		return false
+	}
+	if ip := net.ParseIP(bindHost); ip != nil {
+		return !ip.IsLoopback() && !ip.IsUnspecified()
+	}
+	return true
+}
+
+// certCoversHost reports whether leaf's SANs cover host under the SAME strict
+// hostname check a remote TLS client applies: an IP-literal host must appear in
+// the cert's IPAddresses SANs, any other host in its DNSNames SANs (a CN-only
+// or SAN-mismatched cert is not covered). x509.Certificate.VerifyHostname
+// implements exactly that classification, so a false result means a client
+// verifying the connection by host will reject the served cert.
+func certCoversHost(leaf *x509.Certificate, host string) bool {
+	return leaf.VerifyHostname(host) == nil
 }
 
 // generateSelfSignedCertAt creates or loads a self-signed TLS certificate
@@ -850,11 +970,29 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 // only the disk write failed, so HTTPS still installs (the caller binds
 // httpsServer on the nil-error path). A non-nil error is returned ONLY for
 // a true generation failure (no usable cert at all).
-func generateSelfSignedCertAt(dir, certPath, keyPath string) (tls.Certificate, error) {
+func generateSelfSignedCertAt(dir, certPath, keyPath, bindHost string) (tls.Certificate, error) {
 	// Try loading an existing on-disk pair. LoadX509KeyPair reads the cert
 	// first and errors on a key-only / mismatched state → falls through to
 	// regen, which restores a matching pair.
 	if cert, err := tls.LoadX509KeyPair(certPath, keyPath); err == nil {
+		// The on-disk cert is DURABLE (#1916 D6) and served AS-IS: bindHost is
+		// deliberately NOT baked into a reload, so an A→B management-IP rebind
+		// keeps the original cert rather than churning remote clients' TOFU
+		// pins. But if the loaded cert's SANs do not cover the current bind
+		// host, strict remote verification by that host will silently fail —
+		// warn loudly (naming the bind host and the cert's SANs) so an operator
+		// can re-mint (remove /etc/xpf/tls) instead of chasing a silent
+		// verification failure. Re-minting here would violate the durable
+		// contract, so this is diagnostic only (#5719 C001 residual).
+		if bindHostWarnable(bindHost) {
+			if leaf, perr := x509.ParseCertificate(cert.Certificate[0]); perr == nil &&
+				!certCoversHost(leaf, bindHost) {
+				slog.Warn("loaded management TLS cert does not cover bind host; remote clients verifying by it will fail — remove /etc/xpf/tls to re-mint",
+					"bind_host", bindHost,
+					"cert_dns_sans", leaf.DNSNames,
+					"cert_ip_sans", leaf.IPAddresses)
+			}
+		}
 		return cert, nil
 	}
 
@@ -865,18 +1003,74 @@ func generateSelfSignedCertAt(dir, certPath, keyPath string) (tls.Certificate, e
 		return tls.Certificate{}, err
 	}
 
-	hostname, _ := os.Hostname()
-	if hostname == "" {
-		hostname = "xpf"
+	hostname, _ := tlsHostname()
+	cn := hostname
+	if cn == "" {
+		cn = "xpf"
+	}
+
+	// Subject Alternative Names. A cert that carries only a CommonName and no
+	// SANs is rejected for hostname verification by every modern TLS client
+	// (Go's own client since 1.15, browsers, curl) — "x509: certificate is
+	// not valid for any names". Always include the loopback names/addresses:
+	// the HTTPS API binds loopback (127.0.0.1/::1) by default and these can
+	// never fail to encode (codex-review-182 C-API TLS hygiene). This covers
+	// a loopback-bound API and local hostname/localhost verification; the
+	// configured management-interface bind IP is added below from bindHost so
+	// remote verification by management IP also succeeds (#5719 C001 residual).
+	dnsNames := []string{"localhost"}
+	ipSANs := []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback}
+
+	// Add the kernel hostname as a SAN only when it is safe to encode. A valid
+	// ASCII DNS hostname goes in DNSNames; an IP-literal hostname goes in
+	// IPAddresses (a DNS SAN of an IP never verifies as an IP). A non-ASCII or
+	// otherwise malformed hostname is DROPPED, not appended: x509.Create-
+	// Certificate marshals DNSNames as an IA5String and HARD-FAILS on a
+	// non-ASCII name (e.g. a "café" kernel hostname). Under the #5058 all-or-
+	// nothing management-server lifecycle that abort would tear down the whole
+	// HTTP+HTTPS server, so degrade to loopback-only SANs instead of failing
+	// cert generation.
+	if ip := net.ParseIP(hostname); ip != nil {
+		if !ip.IsLoopback() { // loopback IPs already present above
+			ipSANs = append(ipSANs, ip)
+		}
+	} else if hostname != "localhost" && isDNSSANSafeHostname(hostname) {
+		dnsNames = append(dnsNames, hostname)
+	}
+
+	// Thread the HTTPS listener's bind host into the SANs so a non-loopback
+	// management bind (e.g. `web-management https interface 10.0.0.1`) verifies
+	// under strict hostname checking from a remote client (#5719 C001 residual).
+	// An IP-literal bind host goes in IPAddresses; a DNS-safe hostname goes in
+	// DNSNames. A loopback, unspecified (0.0.0.0/::), empty, or non-encodable
+	// bind host is skipped (loopback SANs are already present, and a wildcard
+	// bind names no single host); a value already added above is coalesced.
+	// Like the hostname path this can only ADD an encodable SAN, so it never
+	// aborts generation under the #5058 all-or-nothing management lifecycle.
+	//
+	// The bind IP is baked at FIRST generation only: the cert is durable
+	// (#1916 D6) and deliberately NOT re-minted when the bind address later
+	// changes — auto-regenerating would churn remote clients' TOFU pins. That
+	// re-mint-on-change concern is a separate tracked #5719 C001 residual.
+	if bindHost != "" {
+		if ip := net.ParseIP(bindHost); ip != nil {
+			if !ip.IsLoopback() && !ip.IsUnspecified() && !ipSANsContain(ipSANs, ip) {
+				ipSANs = append(ipSANs, ip)
+			}
+		} else if bindHost != "localhost" && isDNSSANSafeHostname(bindHost) && !dnsSANsContain(dnsNames, bindHost) {
+			dnsNames = append(dnsNames, bindHost)
+		}
 	}
 
 	template := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: hostname, Organization: []string{"xpf"}},
+		Subject:      pkix.Name{CommonName: cn, Organization: []string{"xpf"}},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(10 * 365 * 24 * time.Hour), // 10 years
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     dnsNames,
+		IPAddresses:  ipSANs,
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)

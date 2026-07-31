@@ -55,6 +55,33 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, ove
 		seen[key] = struct{}{}
 		out = append(out, snap)
 	}
+	// #6467: the kernel programs GLOBAL next-table leaks as ip rules capped at
+	// config.NextTableRuleWindow entries (pkg/routing nextTableManager.Apply
+	// iterates v4 then v6 with a single shared priority counter). The two global
+	// addRoutes calls below (v4 then v6) share this counter so the userspace FIB
+	// mirror truncates the SAME tail the kernel drops — otherwise leak #101+
+	// would resolve into the target VRF on the AF_XDP fast path while a slow-path
+	// (XDP_PASS / IPsec-reinjected / non-native-XDP fabric) packet resolves in
+	// the main table, a kernel/dataplane verdict split for the same flow.
+	nextTableLeakCount := 0
+	// #6467 fold: the applier (pkg/routing nextTableManager.Apply) only installs
+	// an ip rule — and only advances its window counter (prio++) — for a global
+	// next-table route whose target names a DEFINED routing instance AND whose
+	// destination parses as a CIDR; it `continue`s otherwise. The FIB mirror MUST
+	// apply the SAME eligibility. Otherwise a dangling (unknown-instance) or
+	// unparseable route consumes a FIB window slot and publishes a ghost leak the
+	// kernel never installs — squeezing a valid leak out of the window (FIB
+	// missing a leak the kernel HAS) while carrying a ghost the kernel LACKS.
+	// Build the defined-instance name set once, mirroring the applier's tableIDs
+	// map (keyed by instance name, membership-only — a TableID value is not
+	// required, matching `tableIDs[sr.NextTable]` returning ok for any defined
+	// instance).
+	definedInstances := make(map[string]struct{}, len(cfg.RoutingInstances))
+	for _, inst := range cfg.RoutingInstances {
+		if inst != nil {
+			definedInstances[inst.Name] = struct{}{}
+		}
+	}
 	addRoutes := func(table, family string, routes []*config.StaticRoute, perInstance bool) {
 		for _, route := range routes {
 			if route == nil {
@@ -77,6 +104,32 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, ove
 			// published so the Rust FIB can cross-reference the target table.
 			if perInstance && route.NextTable != "" {
 				continue
+			}
+			// #6467: cap the GLOBAL next-table leaks the FIB publishes at the
+			// same window the kernel applier installs (config.NextTableRuleWindow),
+			// counting v4 then v6 in the same order as ApplyNextTableRules. A
+			// route past the cap is dropped here just as the kernel drops the
+			// ip rule past prio nextTableRulePriority+maxNextTableRules, so the
+			// userspace FIB never carries a next-table leak the kernel does not.
+			// Only GLOBAL next-table routes are programmed as ip rules (the
+			// per-instance case is skipped above), so this is the only leak class
+			// that must be bounded here.
+			if !perInstance && route.NextTable != "" {
+				// Eligibility gate mirroring the applier (rules.go ~136-147): an
+				// unknown-instance target or an unparseable destination installs no
+				// kernel ip rule and consumes no window slot there, so skip it here
+				// too — no ghost snapshot, no window-slot consumption. Only an
+				// eligible route counts against and publishes into the capped window.
+				if _, ok := definedInstances[route.NextTable]; !ok {
+					continue
+				}
+				if _, _, err := net.ParseCIDR(route.Destination); err != nil {
+					continue
+				}
+				if nextTableLeakCount >= config.NextTableRuleWindow {
+					continue
+				}
+				nextTableLeakCount++
 			}
 			tableName, familyName := normalizeRouteSnapshotFamily(table, family, route.Destination)
 			base := RouteSnapshot{

@@ -46,17 +46,24 @@ func snat5877Tree(t *testing.T, cmds ...string) *ConfigTree {
 }
 
 // snat5877Pools emits, for each pool index in [0,nPools), a `security nat source
-// pool p<i>` definition carrying `addr` (and, when portRange is non-empty, a
-// `port range <portRange>`), PLUS a pool-mode rule that references it so the
-// aggregate gate (scoped to referenced pools) counts it. All references live in
-// one rule-set RS.
-func snat5877Pools(nPools int, addr, portRange string) []string {
+// pool p<i>` definition whose address is addrFor(i) (and, when portRange is
+// non-empty, a `port range <portRange>`), PLUS a pool-mode rule that references
+// it so the aggregate gate (scoped to referenced pools) counts it. All
+// references live in one rule-set RS.
+//
+// addrFor MUST return a DISTINCT, non-overlapping address per pool: these
+// fixtures exercise the AGGREGATE cardinality budgets (#5877), not overlap, and
+// the #5144 external-tuple overlap gate independently rejects two referenced
+// pools that share an address. distinctHostIP / distinctSlash16 below supply
+// per-index addresses that preserve the host-count each budget test needs while
+// staying non-overlapping.
+func snat5877Pools(nPools int, addrFor func(i int) string, portRange string) []string {
 	cmds := []string{
 		"set security nat source rule-set RS from zone trust",
 		"set security nat source rule-set RS to zone untrust",
 	}
 	for i := 0; i < nPools; i++ {
-		cmds = append(cmds, fmt.Sprintf("set security nat source pool p%d address %s", i, addr))
+		cmds = append(cmds, fmt.Sprintf("set security nat source pool p%d address %s", i, addrFor(i)))
 		if portRange != "" {
 			cmds = append(cmds, fmt.Sprintf("set security nat source pool p%d port range %s", i, portRange))
 		}
@@ -68,13 +75,27 @@ func snat5877Pools(nPools int, addr, portRange string) []string {
 	return cmds
 }
 
+// distinctHostIP returns a distinct /32-host bare IP per pool index (host count 1
+// each), so a large pool COUNT is exercised without any two pools sharing an
+// address. 10.<i/256>.<i%256>.1 stays distinct for every index these tests use.
+func distinctHostIP(i int) string {
+	return fmt.Sprintf("10.%d.%d.1", i/256, i%256)
+}
+
+// distinctSlash16 returns a distinct, non-overlapping /16 per pool index (65,536
+// hosts each) by varying the second octet, so the address- and port-capacity
+// budgets are exercised without tripping the #5144 overlap gate.
+func distinctSlash16(i int) string {
+	return fmt.Sprintf("10.%d.0.0/16", i)
+}
+
 // TestSourceNATAggregatePoolCountRejected proves the pool-COUNT budget: a config
 // referencing MaxSourceNATPoolCount+1 pools (each a single bare IP so the address
 // and port-capacity budgets stay far under) is rejected at strict commit; a
 // config referencing exactly MaxSourceNATPoolCount pools compiles clean.
 func TestSourceNATAggregatePoolCountRejected(t *testing.T) {
 	// Over budget by exactly one pool → rejected, naming the pool budget.
-	_, err := CompileConfig(snat5877Tree(t, snat5877Pools(MaxSourceNATPoolCount+1, "10.0.0.1", "")...))
+	_, err := CompileConfig(snat5877Tree(t, snat5877Pools(MaxSourceNATPoolCount+1, distinctHostIP, "")...))
 	if err == nil {
 		t.Fatalf("expected strict commit to reject %d pools (over the %d budget)",
 			MaxSourceNATPoolCount+1, MaxSourceNATPoolCount)
@@ -86,7 +107,7 @@ func TestSourceNATAggregatePoolCountRejected(t *testing.T) {
 	}
 
 	// Exactly at the budget → accepted (no false positive).
-	if _, err := CompileConfig(snat5877Tree(t, snat5877Pools(MaxSourceNATPoolCount, "10.0.0.1", "")...)); err != nil {
+	if _, err := CompileConfig(snat5877Tree(t, snat5877Pools(MaxSourceNATPoolCount, distinctHostIP, "")...)); err != nil {
 		t.Fatalf("exactly %d pools must compile clean on the strict path: %v", MaxSourceNATPoolCount, err)
 	}
 }
@@ -99,8 +120,8 @@ func TestSourceNATAggregatePoolCountRejected(t *testing.T) {
 func TestSourceNATAggregateAddressesRejected(t *testing.T) {
 	// Narrow port range (2 slots) keeps the port-capacity budget out of the way
 	// so the address budget is what trips.
-	over := snat5877Pools(17, "203.0.113.0/16", "5000 to 5001")
-	under := snat5877Pools(16, "203.0.113.0/16", "5000 to 5001")
+	over := snat5877Pools(17, distinctSlash16, "5000 to 5001")
+	under := snat5877Pools(16, distinctSlash16, "5000 to 5001")
 
 	_, err := CompileConfig(snat5877Tree(t, over...))
 	if err == nil {
@@ -123,8 +144,8 @@ func TestSourceNATAggregateAddressesRejected(t *testing.T) {
 // its own budget; two pools (≈8.46e9) sit just under.
 func TestSourceNATAggregatePortCapacityRejected(t *testing.T) {
 	// No explicit port range → defaults to the full 1024-65535 PAT range.
-	over := snat5877Pools(3, "100.64.0.0/16", "")
-	under := snat5877Pools(2, "100.64.0.0/16", "")
+	over := snat5877Pools(3, distinctSlash16, "")
+	under := snat5877Pools(2, distinctSlash16, "")
 
 	_, err := CompileConfig(snat5877Tree(t, over...))
 	if err == nil {
@@ -144,7 +165,7 @@ func TestSourceNATAggregatePortCapacityRejected(t *testing.T) {
 // warning and boots (apply builds the state it always did, and the operator is
 // warned to shrink it).
 func TestSourceNATAggregateLenientWarns(t *testing.T) {
-	cfg, err := CompileConfigLenient(snat5877Tree(t, snat5877Pools(MaxSourceNATPoolCount+1, "10.0.0.1", "")...))
+	cfg, err := CompileConfigLenient(snat5877Tree(t, snat5877Pools(MaxSourceNATPoolCount+1, distinctHostIP, "")...))
 	if err != nil {
 		t.Fatalf("lenient compile must not brick on an over-budget config: %v", err)
 	}

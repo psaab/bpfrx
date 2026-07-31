@@ -96,80 +96,26 @@ pub(super) fn stage_link_layer_classify(
     // resolve to distinct logical ifindexes (distinct (parent, vlan)
     // keys), so a same-IP-different-subnet neighbor never collides.
     //
-    // The resolve is computed ONLY inside the ARP-reply / NDP-NA learn
-    // arms below, NOT at the top of the stage. This stage runs per-packet
-    // for ALL ingress traffic (before the flow-cache fast path), so the
-    // overwhelming majority of packets (every non-ARP/non-NDP frame,
-    // including flow-cache hits) must skip the FastMap lookup entirely —
-    // they pay zero resolve cost, matching the pre-#2370 data path.
-    let learn_ifindex = || {
-        resolve_ingress_logical_ifindex(
-            worker_ctx.forwarding,
-            meta.ingress_ifindex as i32,
-            meta.ingress_vlan_id,
-        )
-        .unwrap_or(meta.ingress_ifindex as i32)
-    };
+    // #6261: the resolve is computed ONLY inside the outlined ARP-reply /
+    // NDP-NA learn-and-program handlers below, NOT at the top of the
+    // stage. This stage runs per-packet for ALL ingress traffic (before
+    // the flow-cache fast path), so the overwhelming majority of packets
+    // (every non-ARP/non-NDP frame, including flow-cache hits) must skip
+    // the FastMap lookup entirely — they pay zero resolve cost, matching
+    // the pre-#2370 data path. The rare learn-and-program work now lives
+    // in `#[cold] #[inline(never)]` handlers so it does not bloat the
+    // inline hot stage; the ordinary (non-ARP/NDP) fast path is
+    // byte-for-byte unchanged — it only classifies the EtherType and
+    // probes the ARP/NDP parsers, exactly as before.
     match parser::classify_arp(raw_frame) {
         parser::ArpClassification::Reply(arp) => {
-            // #2790: validate the advertised sender protocol address BEFORE
-            // caching it. RFC 826 — a learnable ARP reply must name a single
-            // unicast host. A reply claiming an unspecified / loopback /
-            // multicast / broadcast sender IP would otherwise pollute both
-            // the userspace `dynamic_neighbors` map and the kernel ARP table
-            // (spoofed-reply DoS / routing disruption). Fail closed: recycle
-            // the ARP frame (it never transits) but skip learning, mirroring
-            // the #2369 fail-closed-on-malformed-ARP posture and the cold
-            // neighbor warmer's unicast-only gate.
-            // #2851: anti-poisoning own-IP gate, ADDITIONAL to the #2790
-            // unicast-only gate above. Refuse to learn an ARP reply whose
-            // advertised sender IP equals one of the router's OWN configured
-            // interface IPs. A host on the local link could otherwise send an
-            // unsolicited/spoofed reply claiming our own interface address and
-            // teach us `(ifindex, our_ip) -> attacker_mac` in both
-            // `dynamic_neighbors` and the kernel ARP table (RFC 826 — do not
-            // install a neighbor entry for an address we own). This MUST run
-            // BEFORE the `insert_if_changed` below so a rejected own-IP learn
-            // neither inserts nor bumps `mac_change_epoch` (#3048/#3169).
-            // (Solicited-only learning — only caching replies to probes we
-            // actually sent — is a larger, separate concern, tracked as a
-            // follow-up; this fix is the bounded own-IP rejection.)
-            if neighbor_ip_is_learnable(arp.sender_ip)
-                && !worker_ctx.forwarding.owns_configured_ip(arp.sender_ip)
-            {
-                let ifindex = learn_ifindex();
-                // #3048: route the data-path learn through insert_if_changed
-                // so a MAC change observed directly from an ARP reply
-                // (e.g. an upstream gateway VRRP failover whose reply
-                // traverses our XSK ingress) advances the neighbor
-                // mac_change_epoch and evicts stale cached dst_macs. A plain
-                // insert would silently overwrite the userspace map with the
-                // new MAC, then SHADOW the kernel-monitor RTM_NEWNEIGH that
-                // follows add_kernel_neighbor (the monitor would see
-                // prior == new and not bump), leaving the flow cache stale.
-                let changed = worker_ctx.dynamic_neighbors.insert_if_changed(
-                    (ifindex, arp.sender_ip),
-                    NeighborEntry {
-                        mac: arp.sender_mac,
-                    },
-                );
-                // #5288: gate the kernel-neighbor program (a raw netlink
-                // socket()/sendto()/close() + Vec allocations, on this XSK
-                // worker) behind the per-worker limiter. A same-key/same-MAC
-                // repeat (`!changed`) skips the netlink work entirely — the
-                // amplification an ARP-reply flood relied on — and even a
-                // changed-flood is rate-capped, while a genuine MAC change is
-                // still programmed (retried if rate-limited, never silently
-                // lost). See neighbor_program_limiter.
-                if neigh_limiter.should_program(
-                    (ifindex, arp.sender_ip),
-                    arp.sender_mac,
-                    changed,
-                    now_ns,
-                ) {
-                    add_kernel_neighbor(ifindex, arp.sender_ip, arp.sender_mac);
-                }
-            }
+            // #6261: the accepted ARP-reply learn-and-program tail
+            // (validation gates, #2370 logical-ifindex resolve,
+            // change-detecting learn, #5288-limited kernel program) is
+            // outlined to a #[cold] #[inline(never)] handler. ARP frames
+            // never transit the firewall — recycle either way, preserving
+            // the ARP-recycle semantics.
+            outline_arp_reply_learn_and_program(arp, meta, now_ns, neigh_limiter, worker_ctx);
             return StageOutcome::RecycleAndContinue;
         }
         parser::ArpClassification::OtherArp => {
@@ -177,61 +123,175 @@ pub(super) fn stage_link_layer_classify(
         }
         parser::ArpClassification::NotArp => {}
     }
+    // #6261: the NDP parser probe (`parse_ndp_neighbor_advert`) and its
+    // Target Link-Layer Address destructure stay inline; only the accepted
+    // learn-and-program tail (unicast/own-IP gates, #2370 resolve, #4475
+    // Override=0 read-before-write, change-detecting learn, #5288-limited
+    // program) is outlined to a #[cold] #[inline(never)] handler. NDP
+    // "continue" semantics are unchanged — an NA frame still transits the
+    // firewall (we fall through to `Continue` below regardless of whether
+    // the learn happened).
     if let Some(na) = parser::parse_ndp_neighbor_advert(raw_frame)
         && let Some(mac) = na.target_mac
-        // #2790: same unicast-only gate for the NDP NA target address —
-        // an NA advertising an unspecified / loopback / multicast target
-        // IP is not a learnable neighbor (RFC 4861 §7.2.4 targets are
-        // unicast). The NA frame still transits (falls through below);
-        // only the neighbor write is suppressed.
-        && neighbor_ip_is_learnable(na.target_ip)
-        // #2851: same anti-poisoning own-IP gate as the ARP-reply arm above.
-        // An NDP NA advertising one of the router's OWN configured IPv6
-        // addresses must not be learned — a local attacker could otherwise
-        // poison `(ifindex, our_v6) -> attacker_mac` (RFC 4861: do not learn
-        // an entry for an address we own from an unsolicited advert). Runs
-        // BEFORE the `insert_if_changed` below so a rejected learn neither
-        // inserts nor bumps `mac_change_epoch`.
+    {
+        outline_ndp_na_learn_and_program(na, mac, meta, now_ns, neigh_limiter, worker_ctx);
+    }
+    StageOutcome::Continue(())
+}
+
+/// #6261 — outlined ARP-reply learn-and-program tail of
+/// [`stage_link_layer_classify`].
+///
+/// Split out of the inline pre-flow-cache RX stage into a `#[cold]
+/// #[inline(never)]` handler so the ordinary (non-ARP/NDP) packet fast
+/// path stays cache-hot: an actual ARP *reply* on the data path is rare,
+/// but the inline validation / neighbor-learn / rate-limit / synchronous
+/// kernel-neighbor socket work would otherwise bloat the hot stage.
+///
+/// Behavior is byte-for-byte identical to the pre-#6261 inline block —
+/// this is a pure codegen/layout change, not a logic change:
+///
+/// - #2790: validate the advertised sender protocol address BEFORE
+///   caching it. RFC 826 — a learnable ARP reply must name a single
+///   unicast host. A reply claiming an unspecified / loopback /
+///   multicast / broadcast sender IP would otherwise pollute both the
+///   userspace `dynamic_neighbors` map and the kernel ARP table
+///   (spoofed-reply DoS / routing disruption). Fail closed: the caller
+///   recycles the ARP frame (it never transits) but this handler skips
+///   learning, mirroring the #2369 fail-closed-on-malformed-ARP posture
+///   and the cold neighbor warmer's unicast-only gate.
+/// - #2851: anti-poisoning own-IP gate, ADDITIONAL to the #2790
+///   unicast-only gate. Refuse to learn an ARP reply whose advertised
+///   sender IP equals one of the router's OWN configured interface IPs.
+///   A host on the local link could otherwise send an unsolicited /
+///   spoofed reply claiming our own interface address and teach us
+///   `(ifindex, our_ip) -> attacker_mac` in both `dynamic_neighbors` and
+///   the kernel ARP table (RFC 826 — do not install a neighbor entry for
+///   an address we own). This MUST run BEFORE the `insert_if_changed`
+///   below so a rejected own-IP learn neither inserts nor bumps
+///   `mac_change_epoch` (#3048/#3169).
+/// - #2370: learn under the LOGICAL (L3) ifindex, resolving
+///   `(parent, vlan) -> logical` so the insert key matches the
+///   forwarder's lookup key.
+/// - #3048: route the data-path learn through `insert_if_changed` so a
+///   MAC change observed directly from an ARP reply advances the
+///   neighbor `mac_change_epoch` and evicts stale cached dst_macs.
+/// - #5288: gate the kernel-neighbor program (a raw netlink
+///   socket()/sendto()/close() + Vec allocations) behind the per-worker
+///   limiter. A same-key/same-MAC repeat (`!changed`) skips the netlink
+///   work entirely; even a changed-flood is rate-capped, while a genuine
+///   MAC change is still programmed. `#[cold]` is a layout hint, NOT a
+///   rate limiter — flood bounding stays with this limiter.
+///
+/// The generation (`mac_change_epoch`) / limiter ordering is preserved
+/// exactly: `insert_if_changed` computes `changed` first, then
+/// `should_program` consults it, then `add_kernel_neighbor` runs.
+#[cold]
+#[inline(never)]
+fn outline_arp_reply_learn_and_program(
+    arp: parser::ArpReply,
+    meta: UserspaceDpMeta,
+    now_ns: u64,
+    neigh_limiter: &mut KernelNeighborProgramLimiter,
+    worker_ctx: &WorkerContext,
+) {
+    if neighbor_ip_is_learnable(arp.sender_ip)
+        && !worker_ctx.forwarding.owns_configured_ip(arp.sender_ip)
+    {
+        let ifindex = resolve_ingress_logical_ifindex(
+            worker_ctx.forwarding,
+            meta.ingress_ifindex as i32,
+            meta.ingress_vlan_id,
+        )
+        .unwrap_or(meta.ingress_ifindex as i32);
+        let changed = worker_ctx.dynamic_neighbors.insert_if_changed(
+            (ifindex, arp.sender_ip),
+            NeighborEntry {
+                mac: arp.sender_mac,
+            },
+        );
+        if neigh_limiter.should_program((ifindex, arp.sender_ip), arp.sender_mac, changed, now_ns) {
+            add_kernel_neighbor(ifindex, arp.sender_ip, arp.sender_mac);
+        }
+    }
+}
+
+/// #6261 — outlined NDP Neighbor-Advertisement learn-and-program tail of
+/// [`stage_link_layer_classify`].
+///
+/// Split out of the inline pre-flow-cache RX stage into a `#[cold]
+/// #[inline(never)]` handler for the same reason as the ARP handler
+/// above. Called with the parsed `na` and its Target Link-Layer Address
+/// `mac` — the caller keeps the inline `parse_ndp_neighbor_advert`
+/// parser probe and the `target_mac` destructure. This handler never
+/// recycles: the NA frame still transits the firewall, so the caller
+/// always returns `StageOutcome::Continue(())`.
+///
+/// Behavior is byte-for-byte identical to the pre-#6261 inline block —
+/// pure codegen/layout change:
+///
+/// - #2790: unicast-only gate for the NA target address — an NA
+///   advertising an unspecified / loopback / multicast target IP is not
+///   a learnable neighbor (RFC 4861 §7.2.4 targets are unicast). Only
+///   the neighbor write is suppressed; the NA frame still transits.
+/// - #2851: same anti-poisoning own-IP gate as the ARP-reply handler —
+///   an NA advertising one of the router's OWN configured IPv6 addresses
+///   must not be learned. Runs BEFORE `insert_if_changed` so a rejected
+///   learn neither inserts nor bumps `mac_change_epoch`.
+/// - #2370: learn under the LOGICAL (L3) ifindex (VLAN sub-interface).
+/// - #4475 (opus-172 H-2): honor the RFC 4861 §7.2.5 Override (O) flag.
+///   An NA with Override=0 MUST NOT overwrite a cached neighbor entry
+///   that maps to a DIFFERENT link-layer address — the unsolicited-NA
+///   next-hop hijack primitive. A legitimate host announcing a
+///   link-layer-address change sets Override=1 (§7.2.6), so an Override=0
+///   NA is only allowed to create a first-time entry or refresh the same
+///   LLA; a live differing LLA is left untouched (this handler returns
+///   without learning — the NA frame still transits). This reads the
+///   per-worker `dynamic_neighbors` snapshot and the `insert_if_changed`
+///   below re-locks the shard, so it is a best-effort gate; the worker is
+///   the sole data-path writer for this key, and the kernel STALE install
+///   (see `DATA_PATH_NEIGH_STATE`) is the second line of defense.
+/// - #3048 / #5288: same change-detecting learn and bounded kernel
+///   program as the ARP handler — an NA flood for a non-owned unicast
+///   target must not storm netlink on the worker.
+///
+/// The generation (`mac_change_epoch`) / limiter ordering is preserved
+/// exactly, and the Override read happens BEFORE the `insert_if_changed`
+/// write, as before.
+#[cold]
+#[inline(never)]
+fn outline_ndp_na_learn_and_program(
+    na: parser::NdpNeighborAdvert,
+    mac: [u8; 6],
+    meta: UserspaceDpMeta,
+    now_ns: u64,
+    neigh_limiter: &mut KernelNeighborProgramLimiter,
+    worker_ctx: &WorkerContext,
+) {
+    if neighbor_ip_is_learnable(na.target_ip)
         && !worker_ctx.forwarding.owns_configured_ip(na.target_ip)
     {
-        let ifindex = learn_ifindex();
-        // #4475 (opus-172 H-2): honor the RFC 4861 §7.2.5 Override (O)
-        // flag. An NA with Override=0 MUST NOT overwrite a cached neighbor
-        // entry that maps to a DIFFERENT link-layer address — that is the
-        // unsolicited-NA next-hop hijack primitive (a local attacker
-        // claiming the WAN gateway's IPv6 with its own MAC). A legitimate
-        // host announcing a link-layer-address change sets Override=1
-        // (§7.2.6), so this blocks the poison while preserving legit
-        // MAC-change propagation (#3048): an Override=0 NA is allowed only
-        // to create a FIRST-TIME entry (no cached MAC) or refresh the SAME
-        // LLA; a live differing LLA is left untouched (the NA frame still
-        // transits — we fall through to `Continue`). This reads the
-        // per-worker `dynamic_neighbors` snapshot and the `insert_if_changed`
-        // below re-locks the shard, so it is a best-effort gate; the worker
-        // is the sole data-path writer for this key, and the kernel STALE
-        // install (see `DATA_PATH_NEIGH_STATE`) is the second line of
-        // defense for any residual race.
+        let ifindex = resolve_ingress_logical_ifindex(
+            worker_ctx.forwarding,
+            meta.ingress_ifindex as i32,
+            meta.ingress_vlan_id,
+        )
+        .unwrap_or(meta.ingress_ifindex as i32);
         if !na.override_flag
             && worker_ctx
                 .dynamic_neighbors
                 .get(&(ifindex, na.target_ip))
                 .is_some_and(|existing| existing.mac != mac)
         {
-            return StageOutcome::Continue(());
+            return;
         }
-        // #3048: same change-detecting learn for NDP NA — a target-MAC
-        // change observed on the data path must bump mac_change_epoch and
-        // evict stale cached dst_macs (see the ARP-reply arm above).
         let changed = worker_ctx
             .dynamic_neighbors
             .insert_if_changed((ifindex, na.target_ip), NeighborEntry { mac });
-        // #5288: same bounded kernel-program gate as the ARP arm — an NA flood
-        // for a non-owned unicast target must not storm netlink on the worker.
         if neigh_limiter.should_program((ifindex, na.target_ip), mac, changed, now_ns) {
             add_kernel_neighbor(ifindex, na.target_ip, mac);
         }
     }
-    StageOutcome::Continue(())
 }
 
 /// Stage 6 — native GRE decapsulation.
@@ -323,14 +383,25 @@ pub(super) fn stage_parse_flow_and_learn(
 /// `FABRIC_INGRESS_FLAG` is required to skip TTL decrement on
 /// fabric-traversed packets (the sending peer already decremented
 /// TTL when forwarding across the fabric link).
+///
+/// #6458: the zone override is the #6458-VALIDATED stamp — a frame
+/// whose zone-encoded src MAC fails the fabric-link identity (unicast
+/// dst) or RG-binding check decodes to `None` here and is treated as an
+/// ordinary unstamped fabric-ingress packet by every downstream consumer.
 #[inline]
 pub(super) fn stage_classify_fabric_ingress(
     packet_frame: &[u8],
     meta: &mut UserspaceDpMeta,
+    now_secs: u64,
     worker_ctx: &WorkerContext,
 ) -> FabricIngressOutcome {
-    let ingress_zone_override =
-        parse_zone_encoded_fabric_ingress_from_frame(packet_frame, *meta, worker_ctx.forwarding);
+    let ingress_zone_override = parse_zone_encoded_fabric_ingress_from_frame(
+        packet_frame,
+        *meta,
+        worker_ctx.forwarding,
+        worker_ctx.ha_state,
+        now_secs,
+    );
     let packet_fabric_ingress = ingress_zone_override.is_some()
         || ingress_is_fabric_overlay(worker_ctx.forwarding, meta.ingress_ifindex as i32);
     if packet_fabric_ingress {
@@ -849,18 +920,20 @@ pub(super) fn stage_screen_syn_cookie_ack_on_session_miss(
 /// GRE `local_tunnel_deliveries` channel (`tx/dispatch/slow_path.rs`),
 /// diverting it away from the generic kernel TUN injector. Carrying a
 /// real ingress ifindex here would therefore MIS-DELIVER IPsec-to-self,
-/// not enforce host-inbound — Stage 11 short-circuits with
-/// `RecycleAndContinue` before `host_inbound_admits_iface` is ever
-/// reached, so the passthrough is exempt from the per-zone host-inbound
-/// gate by design (see `forwarding/README.md`, "Host-terminated IPsec
-/// passthrough"). Telemetry carries the real ingress ifindex via `meta`
-/// on the exception record, never through this routing decision.
+/// not enforce host-inbound — the ESP/AH passthrough short-circuits with
+/// `RecycleAndContinue` before `host_inbound_admits_iface` is ever reached
+/// and stays exempt from the per-zone host-inbound gate by design (see
+/// `forwarding/README.md`, "Host-terminated IPsec passthrough"); IKE carries
+/// its own SEPARATE in-stage admit checks (#4323 / #6471, below). Telemetry
+/// carries the real ingress ifindex via `meta` on the exception record,
+/// never through this routing decision.
 ///
-/// A per-zone host-inbound gate for NEW IKE / inner-ESP at Stage 11 is
-/// deferred hardening (#3616 Option B): it must reproduce the kernel
-/// chain's `ct established,related accept`-first ordering and resolve
-/// the logical / GRE-inner ingress zone, or it drops return/established
-/// and tunnelled IPsec.
+/// A per-zone host-inbound gate for NEW IKE at Stage 11 landed as #4323
+/// (Option B), extended by #6471 to Responder-SPI-nonzero IKE with no
+/// seeded live exchange. Both run as SEPARATE admit checks BEFORE the
+/// reinject, keyed on the resolved ingress zone — never by setting a real
+/// `local_ifindex` here, which would divert the reinject into the GRE
+/// channel.
 fn ipsec_passthrough_decision() -> SessionDecision {
     SessionDecision {
         resolution: ForwardingResolution {
@@ -887,10 +960,69 @@ pub(super) enum IpsecPassthroughOutcome {
     /// recycles the UMEM frame and moves to the next descriptor.
     Passthrough,
     /// A NEW inbound IKE initiation the ingress zone's host-inbound set does
-    /// NOT permit — a silent drop (Junos host-inbound posture). The caller
-    /// recycles the frame, accounts `host_inbound_denied_packets`, and emits the
-    /// tuple-rich host-inbound deny event on `from_zone_id`.
+    /// NOT permit — OR (#6471) a Responder-SPI-nonzero IKE packet that matches
+    /// NO seeded live exchange on such a zone — a silent drop (Junos
+    /// host-inbound posture). The caller recycles the frame, accounts
+    /// `host_inbound_denied_packets`, and emits the tuple-rich host-inbound
+    /// deny event on `from_zone_id`.
     Denied { from_zone_id: u16 },
+}
+
+/// #4323/#6471: resolve the LOGICAL ingress ifindex + from-zone exactly as the
+/// local-delivery resolver does (a VLAN sub-interface keys its own unit; a
+/// fabric-ingress packet keys the override zone), then apply the per-interface
+/// / per-zone host-inbound admit check for IKE. `host_inbound_admits_iface`
+/// honours a per-interface override where one exists and otherwise falls back
+/// to the from-zone set. Returns `Some(from_zone_id)` when IKE is NOT admitted
+/// (the caller returns `Denied`), `None` when admitted.
+fn ike_host_inbound_deny_zone(
+    flow: &SessionFlow,
+    meta: UserspaceDpMeta,
+    dst_port: u16,
+    ingress_zone_override: Option<u16>,
+    now_secs: u64,
+    worker_ctx: &WorkerContext,
+) -> Option<u16> {
+    let ingress_logical = crate::afxdp::forwarding::resolve_ingress_logical_ifindex(
+        worker_ctx.forwarding,
+        meta.ingress_ifindex as i32,
+        meta.ingress_vlan_id,
+    )
+    .unwrap_or(meta.ingress_ifindex as i32);
+    // #6458 (review fold): the V1-validated stamp drives host-inbound
+    // admission only when the DESTINATION address's owner RG is
+    // forwarding-active LOCALLY — the same V2 owner binding the session-miss
+    // zone-pair sites apply, resolved for a host-destined packet from the
+    // local address (review MEDIUM: a forged stamped NEW IKE initiation to a
+    // single-primary backup's reth address was Passthrough AND seeded the
+    // #6471 live-exchange table; it now degrades to the fabric zone).
+    let ingress_zone_override = crate::afxdp::forwarding::gate_fabric_zone_override_on_local_owner_rg(
+        worker_ctx.forwarding,
+        worker_ctx.ha_state,
+        now_secs,
+        ingress_zone_override,
+        flow.dst_ip,
+    );
+    let (from_zone_id, _to_zone_id) =
+        crate::afxdp::forwarding::zone_pair_ids_for_flow_with_override(
+            worker_ctx.forwarding,
+            ingress_logical,
+            ingress_zone_override,
+            0,
+        );
+    if crate::afxdp::forwarding::host_inbound_admits_iface(
+        worker_ctx.forwarding,
+        ingress_logical,
+        from_zone_id,
+        PROTO_UDP,
+        dst_port,
+        matches!(flow.dst_ip, IpAddr::V6(_)),
+        0,
+    ) {
+        None
+    } else {
+        Some(from_zone_id)
+    }
 }
 
 /// Stage 11 — IPsec passthrough.
@@ -907,10 +1039,26 @@ pub(super) enum IpsecPassthroughOutcome {
 /// the ingress zone's host-inbound `ike`/`ipsec` admission. A zone that omits
 /// `ike` drops the unsolicited inbound IKE (`Denied`) so it never reaches the
 /// local IKE daemon; a zone that lists `ike`/`ipsec` admits it. ESP/AH, the
-/// IPsec data plane (ESP-in-UDP / NAT-T keepalive) and every established/reply
-/// IKE packet stay EXEMPT (unconditional passthrough) — the SA is the
-/// authorization, mirroring the kernel chain's global ESP/AH accept and
-/// `ct established,related accept` for return IKE.
+/// IPsec data plane (ESP-in-UDP / NAT-T keepalive) stay EXEMPT (unconditional
+/// passthrough) — the SA is the authorization, mirroring the kernel chain's
+/// global ESP/AH accept.
+///
+/// #6471: a Responder-SPI-nonzero IKE packet is NOT automatically
+/// "established" — the SPI bytes are attacker-controlled, so a forged
+/// non-zero Responder SPI otherwise rode the #4323 `Exempt` class straight
+/// to strongSwan on a zone the operator closed to IKE. Established now means
+/// MATCHING the shared live-exchange table (`IkeExchangeTable`): seeded here
+/// when a NEW initiation passes the host-inbound gate, and seeded in the
+/// native-GRE local-origin path when the firewall initiates IKE through a
+/// tunnel (its replies arrive on this stage with the Responder SPI set and
+/// no inbound seed). A non-zero-Responder IKE packet that matches a seed is
+/// admitted (and refreshes it); one that matches NOTHING is handed to the
+/// SAME host-inbound gate a NEW initiation faces — denied on a zone that
+/// omits `ike` (the forged-SPI bypass, now closed), admitted on a zone that
+/// lists `ike` (config-sanctioned openness, primary-path parity: the kernel
+/// chain admits NEW IKE there too). This mirrors the primary path's `ct
+/// established,related accept`-first ordering, with the exchange table
+/// playing the conntrack role the secondary path lacks.
 ///
 /// This SECONDARY AF_XDP path is reached by DNAT/static-NAT-to-self IKE and by
 /// native-GRE-inner local IPsec; direct IKE to a firewall interface IP / VIP is
@@ -942,6 +1090,8 @@ pub(super) fn stage_ipsec_passthrough_check(
     ingress_zone_override: Option<u16>,
     binding_live: &BindingLiveState,
     worker_ctx: &WorkerContext,
+    now_ns: u64,
+    now_secs: u64,
 ) -> IpsecPassthroughOutcome {
     let Some(flow) = flow else {
         return IpsecPassthroughOutcome::NotClaimed;
@@ -973,45 +1123,67 @@ pub(super) fn stage_ipsec_passthrough_check(
     if !worker_ctx.forwarding.owns_configured_ip(flow.dst_ip) {
         return IpsecPassthroughOutcome::NotClaimed;
     }
-    // #4323 Option B: gate ONLY a NEW inbound IKE initiation; ESP/AH and every
-    // established/related IPsec class stay unconditionally exempt.
-    if let crate::afxdp::forwarding::IpsecAdmissionClass::NewInboundIke =
-        crate::afxdp::forwarding::classify_ipsec_admission(
-            packet_frame,
-            meta.l4_offset as usize,
-            meta.protocol,
-            dst_port,
-        )
-    {
-        // Resolve the LOGICAL ingress ifindex + from-zone exactly as the
-        // local-delivery resolver does (a VLAN sub-interface keys its own unit;
-        // a fabric-ingress packet keys the override zone), then apply the
-        // per-interface / per-zone host-inbound admit check.
-        // `host_inbound_admits_iface` honours a per-interface override where one
-        // exists and otherwise falls back to the from-zone set.
-        let ingress_logical = crate::afxdp::forwarding::resolve_ingress_logical_ifindex(
-            worker_ctx.forwarding,
-            meta.ingress_ifindex as i32,
-            meta.ingress_vlan_id,
-        )
-        .unwrap_or(meta.ingress_ifindex as i32);
-        let (from_zone_id, _to_zone_id) =
-            crate::afxdp::forwarding::zone_pair_ids_for_flow_with_override(
-                worker_ctx.forwarding,
-                ingress_logical,
-                ingress_zone_override,
-                0,
-            );
-        if !crate::afxdp::forwarding::host_inbound_admits_iface(
-            worker_ctx.forwarding,
-            ingress_logical,
-            from_zone_id,
-            PROTO_UDP,
-            dst_port,
-            matches!(flow.dst_ip, IpAddr::V6(_)),
-            0,
-        ) {
-            return IpsecPassthroughOutcome::Denied { from_zone_id };
+    match crate::afxdp::forwarding::classify_ipsec_admission(
+        packet_frame,
+        meta.l4_offset as usize,
+        meta.protocol,
+        dst_port,
+    ) {
+        // #4323 Option B: gate a NEW inbound IKE initiation on host-inbound.
+        crate::afxdp::forwarding::IpsecAdmissionClass::NewInboundIke => {
+            if let Some(from_zone_id) =
+                ike_host_inbound_deny_zone(flow, meta, dst_port, ingress_zone_override, now_secs, worker_ctx)
+            {
+                return IpsecPassthroughOutcome::Denied { from_zone_id };
+            }
+            // #6471: the initiation was ADMITTED — seed the exchange so its
+            // established follow-ups (Responder SPI set) are recognized. A
+            // DENIED initiation must never seed: a forged follow-up would
+            // otherwise mint its own "established" entry and re-open the
+            // bypass on a closed zone.
+            if let Some(initiator_spi) = crate::afxdp::forwarding::ike_initiation_spi(
+                packet_frame,
+                meta.l4_offset as usize,
+                dst_port,
+            ) {
+                worker_ctx.ike_exchanges.seed(
+                    crate::afxdp::forwarding::IkeExchangeKey::new(
+                        initiator_spi,
+                        flow.src_ip,
+                        flow.dst_ip,
+                    ),
+                    now_ns,
+                );
+            }
+        }
+        crate::afxdp::forwarding::IpsecAdmissionClass::Exempt => {
+            // #6471: a Responder-SPI-nonzero IKE packet is "established" only
+            // with a matching live-exchange seed; otherwise it faces the same
+            // host-inbound gate as a NEW initiation. ESP/AH, ESP-in-UDP and
+            // NAT-T keepalives (`None`) stay unconditionally exempt.
+            if let Some(initiator_spi) = crate::afxdp::forwarding::established_ike_initiator_spi(
+                packet_frame,
+                meta.l4_offset as usize,
+                dst_port,
+            ) {
+                let key = crate::afxdp::forwarding::IkeExchangeKey::new(
+                    initiator_spi,
+                    flow.src_ip,
+                    flow.dst_ip,
+                );
+                if !worker_ctx.ike_exchanges.matches(&key, now_ns)
+                    && let Some(from_zone_id) = ike_host_inbound_deny_zone(
+                        flow,
+                        meta,
+                        dst_port,
+                        ingress_zone_override,
+                        now_secs,
+                        worker_ctx,
+                    )
+                {
+                    return IpsecPassthroughOutcome::Denied { from_zone_id };
+                }
+            }
         }
     }
     let ipsec_decision = ipsec_passthrough_decision();

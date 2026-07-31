@@ -1696,6 +1696,11 @@ pub(in crate::afxdp) fn settle_exact_local_fifo_submission(
             Some(CoSPendingTxItem::Local(req)) => {
                 sent_packets += 1;
                 sent_bytes += req.bytes.len() as u64;
+                // #6310: the committed buffer's bytes were copied into a
+                // UMEM TX frame during the drain build, so the buffer is
+                // dead here. Return it to the per-worker pool that feeds
+                // the cross-worker redirect copy (`cos::redirect_pool`).
+                super::redirect_pool::recycle(req.bytes);
             }
             Some(item) => {
                 queue.hot.items.push_front(item);
@@ -1764,6 +1769,12 @@ pub(in crate::afxdp) fn settle_exact_local_scratch_submission_flow_fair(
             queue.telemetry.sojourn.record(req.enqueue_ns, now_ns);
             sent_packets += 1;
             sent_bytes += bytes;
+            // #6310: committed buffer already copied into UMEM during the
+            // flow-fair drain build — return it to the per-worker pool
+            // for reuse by the cross-worker redirect copy. The rollback
+            // branch above keeps `req` (push_front) and never reaches
+            // here, so a re-tried packet's buffer is not recycled early.
+            super::redirect_pool::recycle(req.bytes);
         }
     }
     (sent_packets, sent_bytes)

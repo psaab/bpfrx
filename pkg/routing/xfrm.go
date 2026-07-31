@@ -182,22 +182,49 @@ func (x *xfrmManager) Apply(vpns map[string]*config.IPsecVPN) error {
 			continue
 		}
 		if err == nil {
-			// Verify the adopted kernel link's ACTUAL if_id matches the
-			// desired one before re-tracking it. A kernel xfrmi with the
-			// same NAME but a stale Ifid (e.g. a daemon restart after the
-			// VPN's derived if_id changed, or a leftover from an aborted
-			// recreate) must NOT be silently adopted — Ifid is immutable in
-			// place, so a mismatch requires delete+recreate. On match (or a
-			// non-xfrmi link of that name, which should not happen) keep the
-			// existing adopt behavior.
-			if xi, ok := link.(*netlink.Xfrmi); ok && xi.Ifid != ifID {
-				slog.Info("xfrmi has stale if_id, recreating",
-					"name", ifName, "have", xi.Ifid, "want", ifID)
-				// #5310: if the stale-if_id delete fails the kernel link is
-				// still present with the wrong if_id, so a LinkAdd below would
-				// EEXIST — skip the recreate this cycle (mirroring the #5119
-				// bond changed-signature path) and surface the delete failure so
-				// the commit fails closed; the next reconcile retries the delete.
+			// Verify the adopted kernel link is an xfrm interface whose ACTUAL
+			// if_id matches the desired one before re-tracking it. Two cases
+			// must NOT be silently adopted:
+			//
+			//   - A kernel xfrmi with the same NAME but a stale Ifid (e.g. a
+			//     daemon restart after the VPN's derived if_id changed, or a
+			//     leftover from an aborted recreate). Ifid is immutable in place,
+			//     so a mismatch requires delete+recreate.
+			//   - A link wearing the xfrmi's name that is NOT an xfrm interface
+			//     at all (a foreign/leftover dummy/veth/etc). Adopting it would
+			//     track the name as satisfied while NO xfrm interface carries
+			//     if_id, so the route-based VPN bound to it silently blackholes
+			//     (#5523 C179-104). The type guard previously gated only the
+			//     stale-if_id recreate branch, so a non-xfrmi link fell through
+			//     to the adopt path.
+			//   - An xfrmi with the same name AND if_id but bound to a NONZERO
+			//     parent link (IFLA_XFRM_LINK). xpf creates every xfrmi
+			//     PARENTLESS (LinkAttrs has no ParentIndex; the SA selects the
+			//     egress device), so a readback carrying a parent is not the
+			//     device we intend and would egress SA traffic out the wrong
+			//     interface (#6396 Codex MAJOR 1). if_id alone does not
+			//     distinguish it, so assert ParentIndex == 0 too.
+			//
+			// All cases reclaim the name via delete+recreate; only a matching
+			// parentless xfrmi with the desired if_id is adopted.
+			xi, isXfrmi := link.(*netlink.Xfrmi)
+			if !isXfrmi || xi.Ifid != ifID || xi.Attrs().ParentIndex != 0 {
+				switch {
+				case !isXfrmi:
+					slog.Info("link with xfrmi name is not an xfrm interface, recreating",
+						"name", ifName, "type", link.Type(), "want_if_id", ifID)
+				case xi.Ifid != ifID:
+					slog.Info("xfrmi has stale if_id, recreating",
+						"name", ifName, "have", xi.Ifid, "want", ifID)
+				default:
+					slog.Info("xfrmi bound to unexpected parent link, recreating",
+						"name", ifName, "if_id", ifID, "parent_index", xi.Attrs().ParentIndex)
+				}
+				// #5310: if the delete fails the kernel link is still present
+				// (wrong if_id, or wrong type), so a LinkAdd below would EEXIST —
+				// skip the recreate this cycle (mirroring the #5119 bond
+				// changed-signature path) and surface the delete failure so the
+				// commit fails closed; the next reconcile retries the delete.
 				if err := x.deleteLocked(ifName); err != nil {
 					errs = append(errs, err)
 					continue
@@ -236,6 +263,15 @@ func (x *xfrmManager) Apply(vpns map[string]*config.IPsecVPN) error {
 			// (the next reconcile retries) and fails the commit closed — a
 			// route-based VPN bound to an xfrmi that never made it into the
 			// kernel must not report a successful commit.
+			//
+			// #6396 Codex MINOR 4: to actually HONOR the "UNTRACKED" contract we
+			// must drop any PRE-EXISTING x.xfrmis entry for this name (a prior
+			// reconcile tracked it, then the kernel link vanished — that is why
+			// we are on the create path — and now the recreate failed). Leaving
+			// the stale entry would let the removal pass (deleteLocked) later act
+			// on whatever foreign link comes to wear this name. delete is a no-op
+			// when the name was never tracked.
+			delete(x.xfrmis, ifName)
 			errs = append(errs, fmt.Errorf("create xfrmi %s (if_id %d): %w", ifName, ifID, err))
 			continue
 		}
@@ -245,6 +281,38 @@ func (x *xfrmManager) Apply(vpns map[string]*config.IPsecVPN) error {
 			slog.Warn("failed to find xfrmi after creation",
 				"name", ifName, "err", err)
 			errs = append(errs, fmt.Errorf("find xfrmi %s after creation: %w", ifName, err))
+			continue
+		}
+
+		// #6396 C179-104 residual: re-assert the post-create readback is the
+		// xfrm interface we just created before adopting it. LinkAdd and this
+		// LinkByName are two syscalls; if a concurrent external actor deleted our
+		// device and substituted a same-name foreign link (a different type, a
+		// different if_id, or an xfrmi bound to a NONZERO parent link) in that
+		// window, the bare readback would bring it up and track the NAME as
+		// satisfied while no PARENTLESS device carries the desired if_id — the
+		// route-based VPN bound to it silently blackholes or egresses the wrong
+		// interface, the same failure modes the adopt path guards above. Assert
+		// concrete type + if_id + ParentIndex==0 (xpf creates every xfrmi
+		// parentless; #6396 Codex MAJOR 1). Reject the mismatch: do not bring it
+		// up or track it, DROP any stale tracking entry so a later reconcile
+		// cannot act on the foreign substitute (#6396 Codex MINOR 3), surface the
+		// error so the commit fails closed, and let the next reconcile's adopt
+		// path reclaim the foreign link via delete+recreate.
+		if xi, ok := link.(*netlink.Xfrmi); !ok || xi.Ifid != ifID || xi.Attrs().ParentIndex != 0 {
+			have := "non-xfrmi type " + link.Type()
+			if ok {
+				have = fmt.Sprintf("if_id %d parent %d", xi.Ifid, xi.Attrs().ParentIndex)
+			}
+			slog.Warn("xfrmi readback after create is not the intended interface",
+				"name", ifName, "want_if_id", ifID, "have", have)
+			// Fail closed AND forget: if this name was already tracked (a prior
+			// reconcile adopted it), leaving the stale entry would let a later
+			// path treat the foreign substitute as a satisfied xfrmi.
+			delete(x.xfrmis, ifName)
+			errs = append(errs, fmt.Errorf(
+				"xfrmi %s readback after create mismatch (want if_id %d parentless, have %s)",
+				ifName, ifID, have))
 			continue
 		}
 

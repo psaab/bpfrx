@@ -377,11 +377,16 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 			ToZone:   toZone,
 			SrcIP:    net.ParseIP(srcIP),
 			DstIP:    net.ParseIP(dstIP),
-			Protocol: proto,
-			SrcPort:  srcPort,
-			DstPort:  dstPort,
-			ICMPType: icmpType,
-			ICMPCode: icmpCode,
+			// #6377: colon-strict text family from the RAW operator string so
+			// the unsupported-tuple gate does not fold an IPv4-mapped IPv6
+			// source to v4 (net.ParseIP has discarded the ':' above).
+			SrcFamily: config.NATAddrFamily(srcIP),
+			DstFamily: config.NATAddrFamily(dstIP),
+			Protocol:  proto,
+			SrcPort:   srcPort,
+			DstPort:   dstPort,
+			ICMPType:  icmpType,
+			ICMPCode:  icmpCode,
 			// #5572: non-first-fragment (l4_present == false) reproduces the
 			// #4569 fragment-associated deny; false is a normal L4 packet.
 			NonFirstFragment: nonFirstFrag,
@@ -443,6 +448,15 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 			if note := res.FragmentDenyNote(); note != "" {
 				fmt.Fprintf(buf, "  %s\n", note)
 			}
+		case res.UnsupportedTupleFamily:
+			// #5720 (codex-182 C-TOOLS): an IPv4 source with an IPv6 destination
+			// is an impossible tuple (NAT46 is unimplemented); the forwarding
+			// path never produces it and the runtime matcher fails closed.
+			// Surface the dedicated verdict instead of a fabricated "Default deny
+			// (no matching policy)", which would send an operator to add a permit
+			// that can never take effect. Mirrors the REST / gRPC MatchPolicies
+			// DisplayAction() render.
+			fmt.Fprintf(buf, "%s\n", res.DisplayAction())
 		default:
 			// No zone-pair or global policy matched: report the configured
 			// default-policy, NOT a hard-coded "deny" (#3103). When the

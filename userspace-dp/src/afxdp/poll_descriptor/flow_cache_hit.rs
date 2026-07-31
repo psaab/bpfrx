@@ -7,6 +7,12 @@
 // docs/pr/1327-poll-descriptor-stages/plan.md for the architectural
 // verdict on remaining stages.
 //
+// #6433: the SEED (write) half of the cache contract now lives in the
+// `flow_cache_seed.rs` sibling (`stage_flow_cache_seed`) — the #1861
+// §5.4 refused-install gate, the #3048/#3918/#5147 pre-resolve
+// shard-epoch stamp, and the #3073/#3322 policy-counter stamps review
+// against this hit path as one contract.
+//
 // HOT PATH discipline:
 //   - `#[inline(always)]` mandated by the plan (and by Codex
 //     round-2 review). The 280-LOC body has a single call site;

@@ -112,6 +112,35 @@ mod.rs for further file-level breakdown.
   its scratch at entry so a store-back that left residue (a queue-torn-down
   early return returns the deque undrained) cannot leak into the next batch.
   Mirrors the #4972 `released_queue_leases_scratch` reuse pattern.
+- **Cross-worker prepared-redirect copy pool (#6310).** The two
+  cross-binding prepared-redirect sites in `cross_binding.rs`
+  (`redirect_prepared_cos_request_to_owner{,_binding}`) must hand OWNED bytes
+  to the owner worker: the source UMEM frame is recycled the instant the
+  request is enqueued (`recycle_prepared_immediately_with_shared`) — freeing
+  the scarce frame — and the owner consumes the bytes ASYNCHRONOUSLY on its
+  own thread (it drains the per-binding `pending_tx` MPSC inbox, re-ingests
+  into a CoS queue, and only copies the bytes into a UMEM TX frame at
+  drain/settle). The copy is therefore genuinely required — a single shared
+  scratch reused per packet would be overwritten before the owner reads it.
+  Instead of a fresh `frame.to_vec()` per packet, the source worker checks a
+  buffer out of a bounded per-worker THREAD-LOCAL free-list
+  (`cos::redirect_pool`, `MAX_POOLED_BUFFERS`), copies the frame into it
+  (retained capacity → allocation-free once warm), and moves it into the
+  `TxRequest`. The pool is replenished at the exact-Local settle sites
+  (`settle_exact_local_fifo_submission` /
+  `settle_exact_local_scratch_submission_flow_fair`), which run on the owner
+  worker AFTER the committed bytes were copied into a UMEM TX frame — so a
+  recycled buffer is always dead. Thread-local pools are never shared across
+  workers, so the cross-thread hand-off stays sound by Rust move semantics
+  and the inbox single-consumer invariant alone (no locks, no aliasing, no
+  UAF). Buffers migrate from redirect sources to owners; under the symmetric
+  cross-worker CoS spread this targets (every worker both sources redirects
+  and owns shaped queues), pools stay warm and the redirect copy is
+  allocation-free after warmup. An asymmetric pattern just falls back to
+  allocating on the depleted side and caps the buffer count on the other —
+  bounded and self-healing, never incorrect. Same warmed-path allocation
+  class as #4972 / #4973 / #5189; these two sites were simply never
+  enumerated there.
 - **V_min cadence persists across drain calls (#2624).** The
   cross-worker V_min sync (`cos_queue_v_min_continue` → the expensive
   `participating_v_min_snapshot` Acquire-load scan of every peer

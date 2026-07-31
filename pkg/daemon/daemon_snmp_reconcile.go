@@ -82,11 +82,15 @@ func snmpConfigHash(cfg *config.Config) uint64 {
 			// equal, or reconcile takes the idempotent no-op path and the
 			// running agent keeps the stale (possibly allow-all) source policy
 			// while the commit reports success. Hash the allowlist in DOCUMENT
-			// order (not sorted): AllowsSource resolves ties among equal-length
-			// prefixes by first-match (strict `>` on prefix bits), so element
-			// order is authorization-significant and must participate in the
-			// fingerprint. Identical config text yields identical order, so an
-			// unchanged stanza still hashes equal (no spurious reconcile).
+			// order (not sorted): AllowsSource resolves an equal-length prefix
+			// tie as deny-wins (order-independent, #5523 C179-049), so element
+			// order is NOT authorization-significant. Hashing in document order
+			// is nonetheless retained as a CONSERVATIVE superset: it may
+			// spuriously reconcile on an order-only reshuffle of two
+			// contradictory equal-length prefixes, but it never MISSES a real
+			// authorization change. Identical config text yields identical
+			// order, so an unchanged stanza still hashes equal (no spurious
+			// reconcile).
 			write("clients")
 			for _, cl := range c.Clients {
 				write(cl.Prefix)
@@ -151,6 +155,67 @@ func snmpConfigHash(cfg *config.Config) uint64 {
 	return h.Sum64()
 }
 
+// snmpLinkLister enumerates the kernel links buildSNMPIfData turns into the
+// SNMP ifTable. It is a package-level seam (defaulting to netlink.LinkList) so a
+// test can drive the netlink-failure path — a live RTM_GETLINK dump cannot be
+// forced to fail from a unit test — and assert the failure is surfaced rather
+// than silently reported as an empty ifTable (#5523 C179-123).
+var snmpLinkLister = netlink.LinkList
+
+// snmpIfDataWarnInterval bounds how often buildSNMPIfData emits its
+// netlink-failure warning. buildSNMPIfData runs once per SNMP poll and a
+// manager may poll several times a second, so a persistently failing
+// RTM_GETLINK dump would otherwise write one warning line per poll and drown
+// the journal (#6396 C179-123 residual).
+const snmpIfDataWarnInterval = time.Minute
+
+// snmpIfDataFailThrottle rate-limits buildSNMPIfData's netlink-failure warning.
+var snmpIfDataFailThrottle warnThrottle
+
+// warnThrottle emits at most one log per interval for a repeating condition,
+// counting how many occurrences it suppressed between emitted logs. It is safe
+// for concurrent use. The zero value is ready: the first occurrence always
+// emits.
+type warnThrottle struct {
+	mu         sync.Mutex
+	logged     bool // an emit has happened and no reset since
+	lastLog    time.Time
+	suppressed int
+}
+
+// shouldLog reports whether the caller should emit its warning for an
+// occurrence at now, and how many prior occurrences were suppressed since the
+// last emitted log. It emits on the first occurrence and then at most once per
+// interval; occurrences inside the window are counted and suppressed.
+func (t *warnThrottle) shouldLog(now time.Time, interval time.Duration) (emit bool, suppressed int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.logged || now.Sub(t.lastLog) >= interval {
+		suppressed = t.suppressed
+		t.suppressed = 0
+		t.lastLog = now
+		t.logged = true
+		return true, suppressed
+	}
+	t.suppressed++
+	return false, 0
+}
+
+// reset clears the throttle after the condition clears (e.g. a successful
+// read), so the next occurrence logs immediately. It reports whether the
+// condition had been active and how many occurrences were suppressed since the
+// last emitted log, so the caller can note a recovery exactly once.
+func (t *warnThrottle) reset() (wasActive bool, suppressed int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	wasActive = t.logged
+	suppressed = t.suppressed
+	t.logged = false
+	t.suppressed = 0
+	t.lastLog = time.Time{}
+	return wasActive, suppressed
+}
+
 // buildSNMPIfData returns the live interface table for the SNMP ifTable /
 // ifXTable, read from netlink at call time. It is the SetIfDataFn callback
 // wired onto every agent the daemon starts (both the boot start and a day-2
@@ -158,9 +223,33 @@ func snmpConfigHash(cfg *config.Config) uint64 {
 // state regardless of when it was started (#3967 extracted this from the boot
 // block so the two start paths share one implementation).
 func buildSNMPIfData() []snmp.IfData {
-	links, err := netlink.LinkList()
+	links, err := snmpLinkLister()
 	if err != nil {
+		// #5523 C179-123: a transient netlink failure must NOT masquerade as a
+		// healthy 0-interface ifTable. The SetIfDataFn callback contract
+		// (func() []snmp.IfData) has no error channel, so an empty slice is the
+		// only value we can hand back — but returning it SILENTLY let a manager
+		// read the box as having no interfaces while the poll still looked
+		// successful. Log the failure so the empty table is diagnosable and
+		// distinguishable from a genuine no-interface box; the next poll
+		// re-reads netlink and self-heals a transient error.
+		//
+		// #6396: the warning is rate-limited (snmpIfDataWarnInterval) so a
+		// PERSISTENT failure — buildSNMPIfData runs once per poll, and a manager
+		// may poll several times a second — logs once per window instead of one
+		// line per poll. The first failure always logs; subsequent ones inside
+		// the window are counted and reported with the next emitted line.
+		if emit, suppressed := snmpIfDataFailThrottle.shouldLog(time.Now(), snmpIfDataWarnInterval); emit {
+			slog.Warn("SNMP ifTable read failed; reporting empty interface table",
+				"err", err, "suppressed_since_last", suppressed)
+		}
 		return nil
+	}
+	// A successful read clears the throttle so a later failure logs promptly
+	// again; note the recovery once if the table had been failing (#6396).
+	if wasActive, suppressed := snmpIfDataFailThrottle.reset(); wasActive {
+		slog.Info("SNMP ifTable read recovered",
+			"suppressed_failures", suppressed)
 	}
 	var result []snmp.IfData
 	for _, link := range links {

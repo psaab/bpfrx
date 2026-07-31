@@ -168,6 +168,14 @@ use crate::afxdp::write_eth_header_slice;
 // instead of a hardcoded 6 so a valid 7-ext-header packet is not
 // NAT64-dropped while the forwarding path accepts it.
 use crate::afxdp::MAX_IPV6_EXT_HEADERS;
+// #6435: the single canonical IPv6 extension-header WALK, shared with the
+// forwarding path (`afxdp::frame::inspect`). The NAT64 L4 / fragment
+// resolvers below fold its verdict instead of hand-mirroring the loop, so
+// the #4517 ext-header set, the AH arithmetic, and the #2292/#4435
+// fail-closed-at-the-bound posture can never drift between copies again.
+// Re-exported `pub(crate)` from `crate::afxdp` because NAT64 lives outside
+// `crate::afxdp` (same channel as the bound above).
+use crate::afxdp::{ExtChainOutcome, walk_ipv6_ext_chain};
 use crate::nat::{
     DeterministicV6, NatDecision, PortAllocator, SourceNatFailureReason, SourceNatFlowKey,
     allocate_nat64_pool_port, allocate_nat64_pool_port_deterministic_v6, release_nat64_pool_port,
@@ -696,6 +704,20 @@ pub(crate) enum Nat64Match {
     /// outside every Pref64 never reaches this arm, so eligible traffic is
     /// untouched.
     IneligibleSource,
+    /// #6475: the extracted embedded IPv4 DESTINATION is non-global per
+    /// RFC 6052 §2.2 — one of `0.0.0.0/8`, `127.0.0.0/8`, `169.254.0.0/16`,
+    /// `224.0.0.0/4`, or `240.0.0.0/4` (which subsumes `255.255.255.255/32`).
+    /// Pre-gate, `64:ff9b::127.0.0.1` classified `MatchReady(127.0.0.1)` and,
+    /// with lo0 configured, resolved LocalDelivery to the localhost-only
+    /// control plane (gRPC 50051 / REST 8080) — reachable from any NAT64
+    /// client, bidirectionally, through a minted session. The caller MUST drop
+    /// fail-closed with a distinct counter BEFORE route lookup (which precedes
+    /// the FIB walk AND the `local_v4` LocalDelivery resolution), policy, or
+    /// `allocate_source`, so no session/BIB/allocation state is minted for a
+    /// non-global embedded destination. The destination-side sibling of
+    /// [`Nat64Match::IneligibleSource`] (#5623); a global embedded destination
+    /// never reaches this arm, so eligible traffic is untouched.
+    IneligibleDestination,
 }
 
 /// Parse a NAT64 source-pool IPv4 address that may carry a canonical host
@@ -1017,6 +1039,42 @@ impl Nat64State {
             .any(|prefix| octets[..12] == prefix.prefix_bytes)
     }
 
+    /// #6475: RFC 6052 §2.2 non-global embedded-IPv4 screen. A NAT64 prefix
+    /// (the Well-Known Prefix 64:ff9b::/96 MUST, and any configured Pref64 here
+    /// is held to the same bar) MUST NOT translate an embedded IPv4 address
+    /// that is not globally routable. Pre-gate, `match_ipv6_dest` extracted the
+    /// low 32 bits unconditionally, so `64:ff9b::127.0.0.1` classified
+    /// `MatchReady(127.0.0.1)` and — with lo0 configured, whose addresses land
+    /// in `state.local_v4` (`afxdp/forwarding_build/interfaces.rs`) — resolved
+    /// LocalDelivery: a NAT64 client reached a socket bound to 127.0.0.1 on the
+    /// firewall itself (the localhost-only admin plane: gRPC 50051, REST 8080).
+    ///
+    /// The screened classes (first-octet checks, allocation-free, one short
+    /// compare chain per classified packet):
+    ///   * `0.0.0.0/8`        — "this host on this network" (RFC 1122 §3.2.1.3);
+    ///                          includes the `<prefix>::` lower boundary.
+    ///   * `127.0.0.0/8`      — loopback (RFC 1122 §3.2.1.3) — the LocalDelivery
+    ///                          exposure above.
+    ///   * `169.254.0.0/16`   — link-local (RFC 3927).
+    ///   * `224.0.0.0/4`      — multicast (RFC 5771); a translated multicast dst
+    ///                          has no unicast FIB/BIB semantics.
+    ///   * `240.0.0.0/4`      — reserved (RFC 1112 §4); subsumes
+    ///                          `255.255.255.255/32` limited broadcast and the
+    ///                          `<prefix>::ffff:ffff` upper boundary.
+    ///
+    /// RFC 6052 §2.2 also names RFC 1918 private space as non-global; the issue
+    /// scopes that screening to OPTIONAL even for the WKP (an NSP deployment may
+    /// legitimately translate to internal v4), so RFC 1918 / TEST-NET embedded
+    /// destinations still translate — pinned by the global-control test.
+    fn embedded_v4_is_non_global(v4: Ipv4Addr) -> bool {
+        let o = v4.octets();
+        o[0] == 0
+            || o[0] == 127
+            || (o[0] == 169 && o[1] == 254)
+            || (o[0] & 0xF0) == 0xE0
+            || (o[0] & 0xF0) == 0xF0
+    }
+
     /// #5623: source-eligibility-gated NAT64 classification. Runs the RFC 6146
     /// §3.5 source drop BEFORE the destination match, so a Pref64-sourced
     /// (looping/synthesized) packet returns the distinct fail-closed
@@ -1048,21 +1106,33 @@ impl Nat64State {
     /// [`Self::classify_ipv6_packet`], which calls this after clearing the
     /// source. Callers on the forward IPv6 path should use `classify_ipv6_packet`
     /// so an ineligible source is rejected before translation.
+    ///
+    /// #6475: a prefix-matched destination whose extracted embedded IPv4 is
+    /// non-global per RFC 6052 §2.2 (see [`Self::embedded_v4_is_non_global`])
+    /// now returns [`Nat64Match::IneligibleDestination`] — fail-closed with a
+    /// distinct counter — BEFORE the pool check, so input validation precedes
+    /// the capacity/config report and the packet never reaches route lookup,
+    /// policy, `allocate_source`, or the `local_v4` LocalDelivery resolution.
     pub(crate) fn classify_ipv6_dest(&self, dst: Ipv6Addr) -> Nat64Match {
         match self.match_ipv6_dest(dst) {
             None => Nat64Match::NoPrefixMatch,
-            Some((prefix_idx, dst_v4)) => match self.prefixes.get(prefix_idx) {
-                // #4381: liveness probe only — a non-empty pool means a source
-                // CAN be allocated at Permit; the actual `(snat_v4, port)`
-                // allocation is deferred to `allocate_source` so a denied flow
-                // never consumes a pool port. An empty pool fails closed.
-                Some(prefix) if !prefix.pool_v4.is_empty() => Nat64Match::MatchReady {
-                    prefix_idx,
-                    dst_v4,
-                    dst_v6: dst,
-                },
-                _ => Nat64Match::MatchUnavailable,
-            },
+            Some((prefix_idx, dst_v4)) => {
+                if Self::embedded_v4_is_non_global(dst_v4) {
+                    return Nat64Match::IneligibleDestination;
+                }
+                match self.prefixes.get(prefix_idx) {
+                    // #4381: liveness probe only — a non-empty pool means a source
+                    // CAN be allocated at Permit; the actual `(snat_v4, port)`
+                    // allocation is deferred to `allocate_source` so a denied flow
+                    // never consumes a pool port. An empty pool fails closed.
+                    Some(prefix) if !prefix.pool_v4.is_empty() => Nat64Match::MatchReady {
+                        prefix_idx,
+                        dst_v4,
+                        dst_v6: dst,
+                    },
+                    _ => Nat64Match::MatchUnavailable,
+                }
+            }
         }
     }
 
@@ -1461,87 +1531,25 @@ pub(crate) fn translate_v6_to_v4(
 /// No-Next-Header (59) and a chain that runs off the end of the packet
 /// return `None`.
 ///
-/// This is the NAT64 translator's own bounded walk. The loop LOGIC is kept
-/// local (the private walk deliberately does not call into `crate::afxdp`,
-/// which itself depends on `crate::nat64`), but the BOUND is now the single
-/// canonical `MAX_IPV6_EXT_HEADERS` (8) imported from `crate::afxdp` — the
-/// same const the forwarding/screen walkers use (#4435). Before #4435 this
-/// walker surrendered at 6, so a valid 7-ext-header packet to a NAT64 prefix
-/// was dropped here while `afxdp::frame::inspect` accepted it. #4435 aligns
-/// BOTH ends: the loop bound (`MAX_IPV6_EXT_HEADERS`) AND the post-loop
-/// return — reaching the end of the loop now fails CLOSED (`None`), exactly
-/// like the canonical `packet_rel_l4_offset_and_protocol` (#2292). Without
-/// the post-loop change the two walkers still diverged by one at exactly
-/// `MAX_IPV6_EXT_HEADERS` ext headers (nat64 resolved, canonical dropped) —
-/// the skew merely moved from the 6-bound to the 8-bound. The full
-/// walker-function unification onto one shared implementation remains
-/// tracked separately (#2292) and is not a prerequisite for this alignment.
+/// #6435: this is now a thin fold over the ONE canonical walker,
+/// `crate::afxdp::walk_ipv6_ext_chain` (`afxdp::frame::inspect`) — the same
+/// walk the forwarding path's `packet_rel_l4_offset_and_protocol` folds, so
+/// NAT64 and forwarding resolve the same L4 BY CONSTRUCTION (the #4435
+/// bound-share made the bounds agree; this makes the loop itself agree).
+/// Every non-`L4` verdict fails CLOSED (`None`), exactly like the canonical
+/// walker (#2292): a chain still on an extension header at the
+/// `MAX_IPV6_EXT_HEADERS` bound is `OverLimit`, NOT a terminal — before
+/// #4435 the post-loop fall-through resolved one header deeper than the
+/// canonical walker, a one-level parity skew at the bound.
 ///
 /// The returned offset is only the START of the L4 header; the caller is
 /// responsible for the non-first-fragment check (a non-first fragment carries
 /// NO L4 header at this offset — its bytes are payload).
 fn ipv6_l4_offset_and_protocol(packet: &[u8]) -> Option<(usize, u8)> {
-    if packet.len() < 40 {
-        return None;
+    match walk_ipv6_ext_chain(packet, 0).outcome {
+        ExtChainOutcome::L4(offset, protocol) => Some((offset, protocol)),
+        _ => None,
     }
-    let mut protocol = packet[6];
-    let mut offset = 40usize;
-    for _ in 0..MAX_IPV6_EXT_HEADERS {
-        match protocol {
-            // #4517: generic length-prefixed IPv6 extension headers —
-            // Hop-by-Hop (0) / Routing (43) / Destination Options (60) /
-            // Mobility (135) / HIP (139) / Shim6 (140) / experimental
-            // (253/254): length in 8-byte units, NOT counting the first 8
-            // bytes (RFC 8200 / 6275 / 7401 / 5533 / 3692). Kept in parity
-            // with the canonical afxdp::frame::inspect walkers so NAT64
-            // resolves the same L4 as the forwarding/screen paths. ESP (50)
-            // stays unwalked (encrypted, non-walkable).
-            0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
-                let opt = packet.get(offset..offset + 2)?;
-                protocol = opt[0];
-                offset = offset.checked_add((usize::from(opt[1]) + 1) * 8)?;
-                if packet.len() < offset {
-                    return None;
-                }
-            }
-            // Authentication Header: length in 4-byte units, "minus 2"
-            // (RFC 4302 §2.2).
-            51 => {
-                let opt = packet.get(offset..offset + 2)?;
-                protocol = opt[0];
-                offset = offset.checked_add((usize::from(opt[1]) + 2) * 4)?;
-                if packet.len() < offset {
-                    return None;
-                }
-            }
-            // Fragment header: fixed 8 bytes.
-            44 => {
-                let frag = packet.get(offset..offset + 8)?;
-                protocol = frag[0];
-                offset = offset.checked_add(8)?;
-                if packet.len() < offset {
-                    return None;
-                }
-            }
-            // No Next Header — no transport to translate.
-            59 => return None,
-            // Terminal: a real upper-layer protocol.
-            _ => return Some((offset, protocol)),
-        }
-    }
-    // #4435: fail-CLOSED at the bound, mirroring the canonical
-    // `afxdp::frame::inspect::packet_rel_l4_offset_and_protocol` (#2292).
-    // Reaching here means the chain is STILL on an extension header after
-    // `MAX_IPV6_EXT_HEADERS` iterations; `protocol` is an unconsumed
-    // ext-header type (0/43/51/60), not a real L4. The previous
-    // `Some((offset, protocol))` resolved one header deeper than the
-    // canonical walker (a chain of exactly `MAX_IPV6_EXT_HEADERS` ext
-    // headers translated here but was dropped there — a one-level parity
-    // skew moved from the old 6-bound to the 8-bound). Returning `None`
-    // gives true parity: an `> MAX_IPV6_EXT_HEADERS - 1`-header chain is
-    // dropped by BOTH walkers. A chain that DOES terminate within the
-    // bound still returns via the in-loop `_ => Some(...)` above.
-    None
 }
 
 /// RFC 7915 §5.1 translation-eligibility gate (#5625).
@@ -1695,61 +1703,22 @@ pub(crate) fn frame_is_nat64_exthdr_ineligible(frame: &[u8], addr_family: i32) -
 
 /// Is this L3-relative IPv6 packet a NON-first fragment (#2290)?
 ///
-/// Walks the (bounded) extension-header chain looking for a Fragment header
-/// (44). Returns `true` iff a fragment header is present AND its fragment
-/// offset (upper 13 bits of bytes 2-3, mask `0xFFF8`, RFC 8200 §4.5) is
-/// non-zero. A non-first fragment carries no L4 header, so its payload bytes
-/// must NOT be read as L4 — the translators fail closed on it. First/atomic
-/// fragments (offset 0) and packets without a fragment header return `false`.
-/// Mirrors `afxdp::frame::inspect::ipv6_is_non_first_fragment`.
+/// Folds the shared `walk_ipv6_ext_chain` (#6435): returns `true` iff the
+/// chain declared a Fragment header (44) whose fragment offset (upper 13
+/// bits of bytes 2-3, mask `0xFFF8`, RFC 8200 §4.5) is non-zero. A
+/// non-first fragment carries no L4 header, so its payload bytes must NOT
+/// be read as L4 — the translators fail closed on it. First/atomic
+/// fragments (offset 0) and packets without a fragment header return
+/// `false`; a declared-but-truncated Fragment header (offset bits
+/// unreadable) fails closed (`false`), exactly like the pre-#6435
+/// walker's `packet.get(offset..offset + 8)` else-return. Mirrors
+/// `afxdp::frame::inspect::ipv6_is_non_first_fragment` — literally: both
+/// fold the same recorded first-Fragment sighting.
 fn ipv6_is_non_first_fragment(packet: &[u8]) -> bool {
-    if packet.len() < 40 {
-        return false;
-    }
-    let mut protocol = packet[6];
-    let mut offset = 40usize;
-    for _ in 0..MAX_IPV6_EXT_HEADERS {
-        match protocol {
-            // #4517: generic length-prefixed EHs (see the first walker's
-            // comment) — HbH/Routing/DestOpt + Mobility/HIP/Shim6/experimental.
-            0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
-                let Some(opt) = packet.get(offset..offset + 2) else {
-                    return false;
-                };
-                protocol = opt[0];
-                let Some(next) = offset.checked_add((usize::from(opt[1]) + 1) * 8) else {
-                    return false;
-                };
-                offset = next;
-                if packet.len() < offset {
-                    return false;
-                }
-            }
-            51 => {
-                let Some(opt) = packet.get(offset..offset + 2) else {
-                    return false;
-                };
-                protocol = opt[0];
-                let Some(next) = offset.checked_add((usize::from(opt[1]) + 2) * 4) else {
-                    return false;
-                };
-                offset = next;
-                if packet.len() < offset {
-                    return false;
-                }
-            }
-            44 => {
-                let Some(frag) = packet.get(offset..offset + 8) else {
-                    return false;
-                };
-                let frag_off = u16::from_be_bytes([frag[2], frag[3]]) & 0xFFF8;
-                return frag_off != 0;
-            }
-            59 => return false,
-            _ => return false,
-        }
-    }
-    false
+    walk_ipv6_ext_chain(packet, 0)
+        .fragment
+        .and_then(|frag| frag.bytes)
+        .is_some_and(|b| (u16::from_be_bytes([b[2], b[3]]) & 0xFFF8) != 0)
 }
 
 /// Parsed IPv6 Fragment Header (next-header 44) fields, RFC 8200 §4.5.
@@ -1766,53 +1735,24 @@ struct Ipv6FragInfo {
 
 /// Parse the IPv6 Fragment Header (next-header 44) if present (#2488).
 ///
-/// Walks the bounded extension-header chain like `ipv6_l4_offset_and_protocol`
-/// and returns the Fragment Header's offset / M flag / Identification the
-/// FIRST time a Fragment Header is seen. Returns `None` for a packet that
-/// carries no Fragment Header (an ordinary, non-fragmented datagram), so the
-/// v6→v4 translator can fall back to its option-gated atomic-datagram framing.
+/// Folds the shared `walk_ipv6_ext_chain` (#6435) and reads the FIRST
+/// Fragment Header's offset / M flag / Identification from its recorded
+/// sighting. Returns `None` for a packet that carries no Fragment Header
+/// (an ordinary, non-fragmented datagram), so the v6→v4 translator can
+/// fall back to its option-gated atomic-datagram framing. A
+/// declared-but-truncated Fragment header (bytes unreadable) also returns
+/// `None`, exactly like the pre-#6435 walker's `packet.get(offset..offset
+/// + 8)?`; only the FIRST sighting is consulted, matching the pre-#6435
+/// stop-at-first-fragment walk.
 fn ipv6_fragment_header(packet: &[u8]) -> Option<Ipv6FragInfo> {
-    if packet.len() < 40 {
-        return None;
-    }
-    let mut protocol = packet[6];
-    let mut offset = 40usize;
-    for _ in 0..MAX_IPV6_EXT_HEADERS {
-        match protocol {
-            // #4517: generic length-prefixed EHs (see the first walker's
-            // comment) — HbH/Routing/DestOpt + Mobility/HIP/Shim6/experimental.
-            0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
-                let opt = packet.get(offset..offset + 2)?;
-                protocol = opt[0];
-                offset = offset.checked_add((usize::from(opt[1]) + 1) * 8)?;
-                if packet.len() < offset {
-                    return None;
-                }
-            }
-            51 => {
-                let opt = packet.get(offset..offset + 2)?;
-                protocol = opt[0];
-                offset = offset.checked_add((usize::from(opt[1]) + 2) * 4)?;
-                if packet.len() < offset {
-                    return None;
-                }
-            }
-            44 => {
-                let frag = packet.get(offset..offset + 8)?;
-                // bytes 2-3: FragmentOffset[15:3] | Res[2:1] | M[0].
-                let word = u16::from_be_bytes([frag[2], frag[3]]);
-                return Some(Ipv6FragInfo {
-                    offset_units: word >> 3,
-                    more: (word & 0x0001) != 0,
-                    ident: u32::from_be_bytes([frag[4], frag[5], frag[6], frag[7]]),
-                });
-            }
-            // No-Next-Header or a terminal upper-layer protocol: no Fragment
-            // Header on the chain.
-            _ => return None,
-        }
-    }
-    None
+    let bytes = walk_ipv6_ext_chain(packet, 0).fragment?.bytes?;
+    // bytes 2-3: FragmentOffset[15:3] | Res[2:1] | M[0].
+    let word = u16::from_be_bytes([bytes[2], bytes[3]]);
+    Some(Ipv6FragInfo {
+        offset_units: word >> 3,
+        more: (word & 0x0001) != 0,
+        ident: u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+    })
 }
 
 /// #2562: does this L3-relative IPv6 packet trigger the NAT64 v6→v4
@@ -1903,6 +1843,47 @@ pub(crate) fn write_v6_to_v4_into(
     snat_v4: Ipv4Addr,
     dst_v4: Ipv4Addr,
     no_v6_frag_header: bool,
+) -> Option<usize> {
+    write_v6_to_v4_translate(dst, packet, snat_v4, dst_v4, no_v6_frag_header, None)
+}
+
+/// #6472: flowless ICMP-error translation entry point (v6→v4). Identical to
+/// [`write_v6_to_v4_into`] except the embedded quote's L4 destination port /
+/// echo identifier is restored to the session's TRANSLATED (pool) value —
+/// the tuple the v4 server actually carries — so the server can associate
+/// the error (RFC 7915 §5.2 quote fidelity; the translators previously
+/// copied the quoted L4 verbatim, leaving the original v6 client port,
+/// which no v4 socket matches). `embedded_dst_port = None` reproduces
+/// [`write_v6_to_v4_into`] byte-for-byte.
+pub(crate) fn write_v6_to_v4_icmp_error_into(
+    dst: &mut [u8],
+    packet: &[u8],
+    snat_v4: Ipv4Addr,
+    dst_v4: Ipv4Addr,
+    no_v6_frag_header: bool,
+    embedded_dst_port: Option<u16>,
+) -> Option<usize> {
+    write_v6_to_v4_translate(
+        dst,
+        packet,
+        snat_v4,
+        dst_v4,
+        no_v6_frag_header,
+        embedded_dst_port,
+    )
+}
+
+/// Shared core of [`write_v6_to_v4_into`] and
+/// [`write_v6_to_v4_icmp_error_into`]; `embedded_dst_port` rides
+/// [`EmbeddedV6ToV4::mapped_embedded_dst_port`] into the quoted-packet
+/// translation (`None` on every data-packet caller).
+fn write_v6_to_v4_translate(
+    dst: &mut [u8],
+    packet: &[u8],
+    snat_v4: Ipv4Addr,
+    dst_v4: Ipv4Addr,
+    no_v6_frag_header: bool,
+    embedded_dst_port: Option<u16>,
 ) -> Option<usize> {
     if packet.len() < 40 {
         return None;
@@ -2041,6 +2022,7 @@ pub(crate) fn write_v6_to_v4_into(
         let embedded = EmbeddedV6ToV4 {
             mapped_embedded_src: dst_v4,
             mapped_embedded_dst: snat_v4,
+            mapped_embedded_dst_port: embedded_dst_port,
         };
         translate_icmpv6_message_to_icmpv4(&mut out[20..], l4_payload, &embedded)?
     } else {
@@ -2140,6 +2122,38 @@ pub(crate) fn write_v4_to_v6_into(
     packet: &[u8],
     src_v6: Ipv6Addr,
     dst_v6: Ipv6Addr,
+) -> Option<usize> {
+    write_v4_to_v6_translate(dst, packet, src_v6, dst_v6, None)
+}
+
+/// #6472: flowless ICMP-error translation entry point (v4→v6). Identical to
+/// [`write_v4_to_v6_into`] except the embedded quote's L4 source port /
+/// echo identifier is restored to the ORIGINAL v6 client value — the tuple
+/// the client actually sent — so the client can associate the error with
+/// its session (RFC 7915 §4.2 quote fidelity; the translators previously
+/// copied the quoted L4 verbatim, leaving the TRANSLATED pool port no
+/// client socket matches). `embedded_src_port = None` reproduces
+/// [`write_v4_to_v6_into`] byte-for-byte.
+pub(crate) fn write_v4_to_v6_icmp_error_into(
+    dst: &mut [u8],
+    packet: &[u8],
+    src_v6: Ipv6Addr,
+    dst_v6: Ipv6Addr,
+    embedded_src_port: Option<u16>,
+) -> Option<usize> {
+    write_v4_to_v6_translate(dst, packet, src_v6, dst_v6, embedded_src_port)
+}
+
+/// Shared core of [`write_v4_to_v6_into`] and
+/// [`write_v4_to_v6_icmp_error_into`]; `embedded_src_port` rides
+/// [`EmbeddedV4ToV6::mapped_embedded_src_port`] into the quoted-packet
+/// translation (`None` on every data-packet caller).
+fn write_v4_to_v6_translate(
+    dst: &mut [u8],
+    packet: &[u8],
+    src_v6: Ipv6Addr,
+    dst_v6: Ipv6Addr,
+    embedded_src_port: Option<u16>,
 ) -> Option<usize> {
     if packet.len() < 20 {
         return None;
@@ -2281,6 +2295,7 @@ pub(crate) fn write_v4_to_v6_into(
         let embedded = EmbeddedV4ToV6 {
             mapped_embedded_src: dst_v6,
             prefix_bytes,
+            mapped_embedded_src_port: embedded_src_port,
         };
         translate_icmpv4_message_to_icmpv6(l4_dst, l4_payload, &embedded)?
     } else {
@@ -2461,6 +2476,15 @@ struct EmbeddedV6ToV4 {
     mapped_embedded_src: Ipv4Addr,
     /// IPv4 the embedded IPv6 destination maps to.
     mapped_embedded_dst: Ipv4Addr,
+    /// #6472: optional L4 destination-port / ICMP-identifier rewrite for the
+    /// quoted packet, applied before the outer ICMP checksum is computed.
+    /// The NAT64 flowless ICMP-error path (v6→v4) translates an error about
+    /// the session's RETURN-direction wire packet: the quote's destination
+    /// port / echo id is the ORIGINAL v6 client value, which the v4 server
+    /// can only associate when it reads back as the TRANSLATED (pool) value
+    /// the server actually replied to. `None` leaves the quoted L4 verbatim
+    /// (the data-packet callers — byte-identical to pre-#6472).
+    mapped_embedded_dst_port: Option<u16>,
 }
 
 /// Address mapping for the embedded (quoted) packet of an ICMPv4 error being
@@ -2473,6 +2497,15 @@ struct EmbeddedV4ToV6 {
     mapped_embedded_src: Ipv6Addr,
     /// NAT64 /96 prefix the embedded IPv4 destination is composed onto.
     prefix_bytes: [u8; 12],
+    /// #6472: optional L4 source-port / ICMP-identifier rewrite for the
+    /// quoted packet, applied before the outer ICMPv6 checksum is computed.
+    /// The NAT64 flowless ICMP-error path (v4→v6) translates an error about
+    /// the session's FORWARD wire packet: the quote's source port / echo id
+    /// is the TRANSLATED (pool) value, which the v6 client can only
+    /// associate when it reads back as its ORIGINAL value. `None` leaves
+    /// the quoted L4 verbatim (the data-packet callers — byte-identical to
+    /// pre-#6472).
+    mapped_embedded_src_port: Option<u16>,
 }
 
 /// Translate a complete ICMPv6 message (`src`, starting at the ICMPv6 type
@@ -2753,6 +2786,20 @@ fn translate_embedded_v6_to_v4(
     out[16..20].copy_from_slice(&map.mapped_embedded_dst.octets());
     out[20..total].copy_from_slice(l4);
 
+    // #6472: restore the quoted L4 destination port / echo identifier to the
+    // TRANSLATED (pool) value the v4 server replied to. The quoted L4
+    // checksum is intentionally left unchanged — it is informational and a
+    // receiver does not validate it (the outer ICMP checksum below covers
+    // these bytes). A truncated quote (< the port/id bytes) skips the
+    // rewrite, exactly like the non-matching-protocol case.
+    if let Some(port) = map.mapped_embedded_dst_port {
+        if matches!(l4_protocol, PROTO_TCP | PROTO_UDP) && l4_len >= 4 {
+            out[22..24].copy_from_slice(&port.to_be_bytes());
+        } else if l4_protocol == PROTO_ICMPV6 && l4_len >= 6 {
+            out[24..26].copy_from_slice(&port.to_be_bytes());
+        }
+    }
+
     // If the embedded protocol is ICMPv6, fix the embedded ICMP type byte so the
     // quoted v4 packet is internally consistent (the quoted L4 checksum is left
     // as-is — it is not validated by a receiver). Only the leading type/code are
@@ -2817,6 +2864,21 @@ fn translate_embedded_v4_to_v6(
     out[24..36].copy_from_slice(&map.prefix_bytes);
     out[36..40].copy_from_slice(&quote_in[16..20]);
     out[40..total].copy_from_slice(l4);
+
+    // #6472: restore the quoted L4 source port / echo identifier to the
+    // ORIGINAL v6 client value. The quote carries the TRANSLATED (pool)
+    // source value; the client only associates the error with its session
+    // when the quote reads back as the original tuple it sent. The quoted
+    // L4 checksum is left unchanged (informational — same policy as the
+    // address rewrite above); the outer ICMPv6 checksum recompute covers
+    // these bytes. A truncated quote skips the rewrite.
+    if let Some(port) = map.mapped_embedded_src_port {
+        if matches!(protocol, PROTO_TCP | PROTO_UDP) && l4_len >= 2 {
+            out[40..42].copy_from_slice(&port.to_be_bytes());
+        } else if protocol == PROTO_ICMP && l4_len >= 6 {
+            out[44..46].copy_from_slice(&port.to_be_bytes());
+        }
+    }
 
     if protocol == PROTO_ICMP && l4_len >= 2 {
         if let Some((t, c)) = embedded_icmpv4_type_to_icmpv6(out[40]) {
@@ -3389,6 +3451,72 @@ pub(crate) fn build_nat64_v4_to_v6_frame(
     // #2844: SSOT Ethernet writer (see build_nat64_v6_to_v4_frame).
     write_eth_header_slice(&mut out, eth_dst, eth_src, vlan_id, 0x86dd)?;
     let written = write_v4_to_v6_into(&mut out[eth_len..], ipv4_packet, src_v6, dst_v6)?;
+    out.truncate(eth_len + written);
+    Some(out)
+}
+
+/// #6472: Ethernet + IPv4 frame for a flowless NAT64 ICMPv6 error (an error
+/// about the session's translated REPLY packet, v6→v4). Mirrors
+/// [`build_nat64_v6_to_v4_frame`] but drives
+/// [`write_v6_to_v4_icmp_error_into`] so the embedded quote's L4 destination
+/// port / echo id is restored to the session's translated (pool) value —
+/// the tuple the v4 server associates the error with.
+pub(crate) fn build_nat64_v6_to_v4_icmp_error_frame(
+    frame: &[u8],
+    snat_v4: Ipv4Addr,
+    dst_v4: Ipv4Addr,
+    embedded_dst_port: Option<u16>,
+    eth_dst: [u8; 6],
+    eth_src: [u8; 6],
+    vlan_id: u16,
+    no_v6_frag_header: bool,
+) -> Option<Vec<u8>> {
+    let l3 = frame_l3_offset(frame)?;
+    let ipv6_packet = frame.get(l3..)?;
+    let eth_len = if vlan_id > 0 { 18 } else { 14 };
+    // IPv6→IPv4 shrinks the L3 by 20 bytes, so `eth_len + ipv6_packet.len()`
+    // is a safe upper bound even with the embedded-packet shrink.
+    let mut out = vec![0u8; eth_len + ipv6_packet.len()];
+    write_eth_header_slice(&mut out, eth_dst, eth_src, vlan_id, 0x0800)?;
+    let written = write_v6_to_v4_icmp_error_into(
+        &mut out[eth_len..],
+        ipv6_packet,
+        snat_v4,
+        dst_v4,
+        no_v6_frag_header,
+        embedded_dst_port,
+    )?;
+    out.truncate(eth_len + written);
+    Some(out)
+}
+
+/// #6472: Ethernet + IPv6 frame for a flowless NAT64 ICMPv4 error (an error
+/// about the session's FORWARD wire packet, v4→v6). Mirrors
+/// [`build_nat64_v4_to_v6_frame`] but drives
+/// [`write_v4_to_v6_icmp_error_into`] so the embedded quote's L4 source
+/// port / echo id is restored to the ORIGINAL v6 client value — the tuple
+/// the client associates the error with.
+pub(crate) fn build_nat64_v4_to_v6_icmp_error_frame(
+    frame: &[u8],
+    src_v6: Ipv6Addr,
+    dst_v6: Ipv6Addr,
+    embedded_src_port: Option<u16>,
+    eth_dst: [u8; 6],
+    eth_src: [u8; 6],
+    vlan_id: u16,
+) -> Option<Vec<u8>> {
+    let l3 = frame_l3_offset(frame)?;
+    let ipv4_packet = frame.get(l3..)?;
+    let eth_len = if vlan_id > 0 { 18 } else { 14 };
+    let mut out = vec![0u8; eth_len + ipv4_packet.len().saturating_add(2 * NAT64_HEADER_DELTA as usize)];
+    write_eth_header_slice(&mut out, eth_dst, eth_src, vlan_id, 0x86dd)?;
+    let written = write_v4_to_v6_icmp_error_into(
+        &mut out[eth_len..],
+        ipv4_packet,
+        src_v6,
+        dst_v6,
+        embedded_src_port,
+    )?;
     out.truncate(eth_len + written);
     Some(out)
 }

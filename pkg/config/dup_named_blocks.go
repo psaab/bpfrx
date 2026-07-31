@@ -63,19 +63,33 @@ type dupBlock struct {
 //
 // It runs PRE-expansion on the (inactive-pruned) clone alongside the tunnel /
 // zone / routing-instance collision gates, and it walks ONLY the top-level
-// `interfaces`/`security` stanzas — never a group body — so a legitimate
+// `groups`/`interfaces`/`security` stanzas — never a group body — so a legitimate
 // apply-groups inheritance (expandGroups deep-MERGES a group's interface/screen
 // config into the target, producing no duplicate sibling) is not misreported.
-// The `groups` check is inherently top-level. Strict on commit / commit-check;
-// lenient on tolerant load / peer-sync (#1960 no-brick), where the runtime
-// keeps the historical last-writer-wins result and boots.
+// The `groups` check is inherently top-level. A quoted-empty group / interface /
+// screen-ids-option name is recorded as an empty-name defect (#6455) rather than
+// skipped. Strict on commit / commit-check; lenient on tolerant load / peer-sync
+// (#1960 no-brick), where the runtime keeps the historical last-writer-wins result
+// and boots.
+//
+// A duplicate authored ENTIRELY inside an applied group body is NOT caught here —
+// see the group-authored deferral note in dup_names_6455.go (#6455 Finding 1).
 func validateDuplicateNamedBlockAST(tree *ConfigTree, lenient bool) ([]string, error) {
 	if tree == nil {
 		return nil, nil
 	}
 	var dups []dupBlock
+	var emptyKinds []string
+	emptySeen := map[string]bool{}
+	recordEmpty := func(kind string) {
+		if !emptySeen[kind] {
+			emptyKinds = append(emptyKinds, kind)
+			emptySeen[kind] = true
+		}
+	}
 
-	// 1. groups { <name> { … } } — mirror ast_groups.go name extraction.
+	// 1. groups { <name> { … } } — mirror ast_groups.go name extraction; an empty
+	// group name is an empty-name defect.
 	seenGroup := map[string]bool{}
 	reportedGroup := map[string]bool{}
 	for _, child := range tree.Children {
@@ -85,6 +99,9 @@ func validateDuplicateNamedBlockAST(tree *ConfigTree, lenient bool) ([]string, e
 		for _, g := range child.Children {
 			name := groupDefinitionName(g)
 			if name == "" {
+				if len(g.Keys) >= 1 {
+					recordEmpty("group")
+				}
 				continue
 			}
 			if seenGroup[name] {
@@ -113,7 +130,13 @@ func validateDuplicateNamedBlockAST(tree *ConfigTree, lenient bool) ([]string, e
 				continue
 			}
 			name := ifc.Name()
-			if name == "" || nonInterfaceIfKeyword[name] {
+			if name == "" {
+				if len(ifc.Keys) >= 1 {
+					recordEmpty("interface")
+				}
+				continue
+			}
+			if nonInterfaceIfKeyword[name] {
 				continue
 			}
 			if seenIf[name] {
@@ -139,6 +162,7 @@ func validateDuplicateNamedBlockAST(tree *ConfigTree, lenient bool) ([]string, e
 		for _, screen := range child.FindChildren("screen") {
 			for _, inst := range namedInstances(screen.FindChildren("ids-option")) {
 				if inst.name == "" {
+					recordEmpty("screen ids-option")
 					continue
 				}
 				if seenProfile[inst.name] {
@@ -173,7 +197,7 @@ func validateDuplicateNamedBlockAST(tree *ConfigTree, lenient bool) ([]string, e
 		}
 	}
 
-	if len(dups) == 0 {
+	if len(dups) == 0 && len(emptyKinds) == 0 {
 		return nil, nil
 	}
 	// Deterministic order: kind, then name.
@@ -183,20 +207,29 @@ func validateDuplicateNamedBlockAST(tree *ConfigTree, lenient bool) ([]string, e
 		}
 		return dups[i].name < dups[j].name
 	})
+	sort.Strings(emptyKinds)
 
 	if !lenient {
-		d := dups[0]
-		return nil, fmt.Errorf("duplicate %s %q: a repeated hierarchical block is "+
-			"silently reduced to last-writer-wins, dropping the earlier block's "+
-			"configuration — author it once (flat `set` merges repeated "+
-			"statements automatically) (#5180)", d.kind, d.name)
+		// Duplicates keep first-error priority so the pre-#6455 messages are
+		// unchanged when no empty name is present.
+		if len(dups) > 0 {
+			d := dups[0]
+			return nil, fmt.Errorf("duplicate %s %q: a repeated hierarchical block is "+
+				"silently reduced to last-writer-wins, dropping the earlier block's "+
+				"configuration — author it once (flat `set` merges repeated "+
+				"statements automatically) (#5180)", d.kind, d.name)
+		}
+		return nil, emptyNameError(emptyKinds[0])
 	}
 
-	warnings := make([]string, 0, len(dups))
+	warnings := make([]string, 0, len(dups)+len(emptyKinds))
 	for _, d := range dups {
 		warnings = append(warnings, fmt.Sprintf("duplicate %s %q: only the LAST "+
 			"hierarchical block is kept (earlier block dropped) — author it once "+
 			"to avoid silently losing config (#5180)", d.kind, d.name))
+	}
+	for _, k := range emptyKinds {
+		warnings = append(warnings, emptyNameWarning(k))
 	}
 	return warnings, nil
 }

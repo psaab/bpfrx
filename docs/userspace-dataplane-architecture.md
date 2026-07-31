@@ -207,7 +207,8 @@ mandatory BPF map FDs**:
   `ha.forwarding`, `ha.fabrics`) or advances
   `validation.snapshot_installed` / `config_generation`.
 - If any mandatory pin is missing or its FD fails to open, the reconcile
-  aborts in the preflight: it sets `last_reconcile_stage` +
+  aborts in the preflight: it sets the typed `last_reconcile_stage`
+  (`ReconcileStage::MissingPin` / `OpenMapFailed`, #6244) +
   per-registered-binding `last_error`, and returns **without** tearing
   down the prior workers or publishing a newer generation. The previous
   (stale-but-correct) forwarding generation stays published and the
@@ -239,7 +240,8 @@ mandatory BPF map FDs**:
   workers and reset `coord.validation` / `shared_validation`. They are now
   detected by `snapshot::build_reconcile_forwarding` in the preflight: on
   an integrity `Err` the reconcile sets
-  `last_reconcile_stage = "snapshot_integrity_error"` and aborts before
+  `last_reconcile_stage = ReconcileStage::SnapshotIntegrityError` (which
+  renders `"snapshot_integrity_error"` byte-for-byte, #6244) and aborts before
   teardown/publish, so the prior generation + workers stay live. The built
   state is stashed on `ReconcileSnapshotFds::forwarding` and **reused** by
   `apply_snapshot` (build-once — no second build on the success path, and
@@ -309,7 +311,8 @@ helper) now return `Result<(), ReconcileError>`
 (`coordinator/reconcile/mod.rs`), where `ReconcileError::Integrity`
 carries the `SnapshotIntegrityError` from the policy preflight or
 `build_reconcile_forwarding`, and `ReconcileError::MapSetup` carries the
-`last_reconcile_stage` descriptor for a mandatory-pin abort. Both
+typed `ReconcileStage` failure identity for a mandatory-pin abort (#6244;
+was a cloned `last_reconcile_stage` string). Both
 handler legs now mirror #3766's pattern: install the new snapshot for the
 reconcile, and on `Err` **restore** the prior snapshot (+ the full-apply
 leg also restores `status.bindings`) and the bumped status-reporting
@@ -1049,7 +1052,7 @@ A TUN device (`xpf-usp0`) for packets that need kernel processing:
     <=1500 frames, so this is degraded — not unusable — capacity. All three
     fields (`degraded`, `live_mtu`, `mtu_dropped_packets`) cross the control
     socket (Rust `protocol/control.rs` SlowPathStatus → Go
-    `pkg/dataplane/userspace/protocol.go` SlowPathStatus, tag-matched) and
+    `pkg/dataplane/userspace/protocol_status.go` SlowPathStatus, tag-matched) and
     surface in `show ... slow path` output: a `Slow path DEGRADED: true` line,
     the live MTU, and the MTU-exceeded drop counter.
   - **Day-2 reconcile (#5801):** the MTU is programmed when the worker opens
@@ -1312,7 +1315,38 @@ Policy scheduler state is no longer a propagation gap: #1396 carries scheduler
 state into the userspace snapshot and Rust policy evaluator, and the 2026-05-19
 #1378 live artifact set validates hit-counter lifetime, strict missing-scheduler
 commit behavior, and integration/failover evidence with
-`test/incus/policy_scheduler_validate.py`.
+`test/incus/policy_scheduler_validate.py`. The **route-overlay** partial
+republish (`PublishRouteOverlaySnapshot`, the ip-monitoring actuator) co-honors
+this contract (#5328 A6-b2-F4): when the daemon hands it a live
+`scheduler.ActiveState()` it rebuilds the published snapshot's `policies` /
+`address_books` inactive bits from that map in the SAME publish — exactly as the
+dedicated policy-scheduler republish (`UpdatePolicyScheduleState`) does — so a
+route flap never ships a snapshot that reports success while the helper enforces
+a stale schedule window. Previously the overlay only cached the map and inherited
+the last-compiled policy sections, leaving the helper on stale bits until the next
+scheduler tick or full apply. Both republish paths share one core
+(`rebuildScheduledPolicySectionsLocked`), which re-applies the StableZoneID zone
+quarantine's policy scrub after rebuilding `policies` from raw config (#6480): the
+raw builder has no knowledge of the quarantine and would reintroduce a policy
+referencing a quarantined zone, while the inherited `next.Zones` stays reduced —
+a dangling policy->zone reference the Rust `UnresolvableZoneReference` preflight
+rejects wholesale. Because the ip-monitoring actuator updates FRR *before* the
+publish, that reject would strand the kernel/FRR on the new routes while userspace
+kept the old FIB, unable to converge; the shared scrub keeps both paths in
+lockstep so neither can drift. The shared core additionally **refuses the
+republish outright when the passed `cfg` content-differs from the inherited
+`m.lastSnapshot.Config`** (#6480), mirroring the route-overlay path's
+`routeOnlyPublishHybrid` skew guard (#5680). This closes a fold-introduced
+fail-open: during a config-skew window the daemon can reconcile the scheduler to
+the newly promoted config B (the store promotes B before applying, and the apply
+path continues on a transient dataplane error) while the OLD snapshot A is still
+live. Rebuilding + scrubbing the policies against B's quarantine set while
+inheriting A's `next.Zones` can drop a policy whose zone is still a live member of
+A's zones — a snapshot the preflight *accepts* but whose missing rule lets traffic
+fall through to the inherited default policy (a full Compile of B would instead
+drop the quarantined zone and stay fail-closed). Refusing on skew retains the
+prior snapshot and reconverges once B's full apply lands
+(`m.lastSnapshot.Config == cfg`), under the existing #3780 retry semantics.
 #1377 now preserves unusable pool-mode source-NAT rules in the snapshot and
 fails closed at the `poll_descriptor.rs` source-NAT call sites for missing
 pools, empty pools, invalid pool inputs, wrong-family-only pools, or allocator
@@ -1646,9 +1680,13 @@ is [`userspace-dataplane-gaps.md`](userspace-dataplane-gaps.md).
   A), but a **NEW inbound IKE initiation is GATED** on the ingress zone's
   `system-services ike`/`ipsec` (#4323 Option B). `classify_ipsec_admission`
   splits the two by the ISAKMP Responder SPI: an all-zero Responder SPI is
-  the first packet of a new exchange (gated); a set Responder SPI is an
-  established/reply packet (exempt — the stateless mirror of `ct
-  established,related accept`, so return IKE never drops). A denied NEW IKE
+  the first packet of a new exchange (gated); a set Responder SPI is only
+  admitted as a reply of a LIVE exchange — #6471: on the secondary path
+  (DNAT-to-self / GRE-inner) a set-SPI packet must match a seeded exchange
+  (Initiator SPI, peer IP, local IP), installed only AFTER the gate admits a
+  zero-Responder initiation, with a 4096 cap + 24h sliding idle reap, so a
+  forged set-SPI packet can no longer mint its own admission (the pre-#6471
+  text here called every set-SPI packet unconditionally exempt). A denied NEW IKE
   is a silent drop (`host_inbound_denied_packets` +
   `RT_FLOW_CLOSE_REASON_HOST_INBOUND`) so it never reaches the local IKE
   daemon. The PRIMARY host-inbound enforcement for direct IPsec-to-self is

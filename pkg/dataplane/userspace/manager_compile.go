@@ -441,6 +441,85 @@ func (m *Manager) publishSnapshotFailClosedLocked(publishSnap *ConfigSnapshot, s
 	return nil
 }
 
+// rebuildScheduledPolicySectionsLocked rebuilds the policy + address-book
+// sections of a partial (non-Compile) republish under a scheduler active-state
+// map and re-applies the StableZoneID zone quarantine's policy scrub so the
+// rebuilt next.Policies stays consistent with the inherited, already-reduced
+// next.Zones (#6480). It is the SHARED core of the two republish paths that
+// rebuild policies without a full Compile — PublishRouteOverlaySnapshot
+// (route-overlay) and UpdatePolicyScheduleState (scheduler-only) — so the
+// quarantine re-application can never drift between them. It mutates next in
+// place and must be called with m.mu held.
+//
+// activeState is the policy-scheduler active-state map to build the inactive
+// bits from (both callers set m.policySchedulerActive to it first, so it equals
+// m.policySchedulerActive). #2049: the cached dynamic-address feed overlay is
+// threaded through so a scheduler-state flip does not drop feed enforcement
+// until the next full apply (m.mu is held, so read m.feedOverlay directly via
+// cloneFeedOverlay rather than feedSnapshotOverlay(), which re-locks m.mu). A
+// build error is returned wrapped; both callers retain the prior snapshot
+// (fail-closed) and surface a retry.
+func (m *Manager) rebuildScheduledPolicySectionsLocked(next *ConfigSnapshot, cfg *config.Config, activeState map[string]bool) error {
+	// #6480 (config-skew fail-open guard): this helper rebuilds next.Policies
+	// from cfg and scrubs them against cfg's StableZoneID quarantine set, but
+	// next.Zones / next.Interfaces were inherited verbatim from m.lastSnapshot
+	// (the APPLIED config). If cfg's zone generation differs from that applied
+	// config, the scrub can drop a policy whose to/from zone is STILL a live
+	// member of the inherited next.Zones — shipping a snapshot the Rust
+	// UnresolvableZoneReference preflight ACCEPTS yet whose missing rule lets
+	// traffic fall through to the inherited default policy (a fail-OPEN a full
+	// Compile of cfg would instead render fail-closed by ALSO dropping the
+	// quarantined zone and unzoning its interface). The route-overlay caller
+	// already refuses this exact skew at its call site (routeOnlyPublishHybrid,
+	// #5680); the scheduler-only caller (UpdatePolicyScheduleState) had no prior
+	// guard, so enforce it HERE so BOTH partial-republish paths are protected.
+	// routeOnlyPublishHybrid is parameterized on the applied config, so it doubles
+	// as the general "cfg content-differs from applied" skew predicate. next.Config
+	// was already set to cfg by both callers, so compare cfg against the INHERITED
+	// snapshot's config (m.lastSnapshot.Config), NEVER next.Config (a cfg==cfg
+	// tautology). On divergence retain the prior snapshot; the caller surfaces a
+	// retry and the next tick reconverges once cfg's full apply lands
+	// (m.lastSnapshot.Config == cfg) — the #3780 retry semantics already handle it.
+	if m.lastSnapshot != nil && routeOnlyPublishHybrid(cfg, m.lastSnapshot.Config) {
+		return fmt.Errorf("refusing scheduled-policy republish: cfg carries a zone/policy " +
+			"generation the inherited dataplane snapshot does not reflect; rebuilding and " +
+			"scrubbing against it could drop a live-zone policy and ship a fail-open snapshot (#6480)")
+	}
+	feedOverlay := cloneFeedOverlay(m.feedOverlay)
+	// #2514: an unresolvable address-book content-ID collision must not panic the
+	// daemon — surface it as an error so the caller retains the prior snapshot.
+	policies, err := buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, activeState, feedOverlay)
+	if err != nil {
+		return fmt.Errorf("policy snapshot rebuild for scheduler republish: %w", err)
+	}
+	// #6480: the raw builder re-introduces any policy referencing a
+	// StableZoneID-quarantined zone (it has no knowledge of the quarantine),
+	// while next.Zones was inherited already reduced by quarantineCollidingZones.
+	// Re-establish the same zone-isolation invariant the full build guarantees
+	// (builder.go) so no policy references a zone absent from next.Zones —
+	// otherwise the Rust UnresolvableZoneReference preflight rejects the WHOLE
+	// snapshot, and because the ip-monitoring actuator updates FRR BEFORE this
+	// publish (daemon_ipmon.go) the kernel/FRR would sit on the new routes while
+	// userspace keeps the old FIB with retries that cannot converge.
+	policies = scrubPoliciesForQuarantinedZones(policies, quarantinedZoneNamesForConfig(cfg))
+	next.Policies = policies
+	// #3261: recompute the (feed-aware) content-rejection diagnostic from the
+	// scrubbed rules' sentinels; the copied lastSnapshot value would be stale.
+	next.Capabilities.PolicyContentRejected = collectPolicyContentRejections(policies)
+	// Keep the operator-facing count equal to what is actually published, exactly
+	// as the full build does after quarantine (builder.go): Summary.PolicyCount
+	// must equal len(next.Policies).
+	next.Summary.PolicyCount = len(policies)
+	// #1606: refresh the address-book table alongside the policies so book IDs
+	// cited by the rebuilt rules always resolve dataplane-side.
+	books, _, err := buildAddressBookTableWithFeeds(cfg, feedOverlay)
+	if err != nil {
+		return fmt.Errorf("address-book rebuild for scheduler republish: %w", err)
+	}
+	next.AddressBooks = books
+	return nil
+}
+
 // UpdatePolicyScheduleState republishes the userspace policy snapshot with one
 // coherent inactive-bit view. This shadows the embedded eBPF manager method;
 // scheduled userspace policies must not update the policy_rules BPF map.
@@ -487,41 +566,18 @@ func (m *Manager) UpdatePolicyScheduleState(cfg *config.Config, activeState map[
 	next.FIBGeneration = m.readFIBGeneration()
 	next.GeneratedAt = time.Now().UTC()
 	next.Config = cfg
-	// #2049: thread the cached dynamic-address feed overlay through the
-	// scheduler-only republish so a CoS scheduler-state change does not
-	// drop feed enforcement until the next full apply. m.mu is already
-	// held here, so read m.feedOverlay directly via cloneFeedOverlay
-	// rather than feedSnapshotOverlay() (which re-locks m.mu and would
-	// deadlock). Matches how the full snapshot build reads the overlay.
-	feedOverlay := cloneFeedOverlay(m.feedOverlay)
-	// #2514: an unresolvable address-book content-ID collision must not
-	// panic the daemon. Abort the scheduler-only republish and retain the
-	// last published snapshot (fail-closed) — the next full apply will
-	// surface the same error to the operator at commit time.
-	policies, err := buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, activeCopy, feedOverlay)
-	if err != nil {
+	// #6480: rebuild the schedule-affected policy + address-book sections
+	// (threading the cached feed overlay, #2049) and re-apply the StableZoneID
+	// zone quarantine's policy scrub via the shared helper, so this scheduler-only
+	// republish and the route-overlay republish stay in lockstep and neither ships
+	// a policy referencing a quarantined zone absent from the inherited next.Zones.
+	if err := m.rebuildScheduledPolicySectionsLocked(&next, cfg, activeCopy); err != nil {
 		slog.Warn("userspace: skipping policy-scheduler republish; retaining prior snapshot", "err", err)
-		// #3780: the prior snapshot is retained, which for a CLOSING
-		// window means the old permit stays live. Report failure so the
-		// transition is retried until the rebuild succeeds and converges.
-		return fmt.Errorf("userspace: policy snapshot rebuild for scheduler republish: %w", err)
+		// #3780: the prior snapshot is retained, which for a CLOSING window means
+		// the old permit stays live. Report failure so the transition is retried
+		// on the next scheduler tick until the rebuild succeeds and converges.
+		return fmt.Errorf("userspace: %w", err)
 	}
-	next.Policies = policies
-	// #3261: the policies were rebuilt, so recompute the (feed-aware)
-	// content-rejection diagnostic from the new rules' sentinels; the copied
-	// lastSnapshot value would be stale. Class (ii) (ForwardingSupported /
-	// UnsupportedReasons) is unchanged by a scheduler-only republish.
-	next.Capabilities.PolicyContentRejected = collectPolicyContentRejections(policies)
-	// #1606: refresh the address-book table alongside the policies
-	// so book IDs cited in the new policies always resolve on the
-	// dataplane side.
-	books, _, err := buildAddressBookTableWithFeeds(cfg, feedOverlay)
-	if err != nil {
-		slog.Warn("userspace: skipping policy-scheduler republish; retaining prior snapshot", "err", err)
-		// #3780: same fail-safe as the policy rebuild above — retry.
-		return fmt.Errorf("userspace: address-book rebuild for scheduler republish: %w", err)
-	}
-	next.AddressBooks = books
 
 	publishSnap := next
 	publishSnap.Neighbors = filterPublishableNeighbors(next.Neighbors)
