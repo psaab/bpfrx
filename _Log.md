@@ -62122,3 +62122,44 @@ break — `go vet` confirmed passing under every revert.
   22.7 Gbps) and needs no re-run for a comment-only change.
 - **File(s)**: pkg/cluster/{election.go,ifmon_weight_daemon_apply_6549_test.go},
     pkg/routing/monitor.go, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #4146 destination slice — enforce a `to-zone junos-host` DENY that
+  carries an explicit `match destination-address` on the DIRECT host-bound path.
+  #4932 shipped the kernel-nft projection of the representable junos-host DENY
+  class, but `junosHostProjectTerm` marked ANY term with a scoped destination
+  un-representable. Because the representability gate is WHOLE-PROGRAM, a single
+  `match destination-address <fw-ip>` deny not only went unenforced itself — it
+  silently disabled kernel enforcement of EVERY other junos-host deny on that
+  ingress zone. Reproduced firsthand before touching code: the projection
+  returned `representable=false`, zero programs, empty `RenderedPolicyKeys`,
+  while `policymatch.Match` (the Go mirror of Rust
+  `evaluate_junos_host_policy`, which already matched destination via
+  `rule_l3_matches(rule, state, src_ip, dst_ip)`) returned DENY — a fail-open on
+  the only surface that actually sees the packet.
+  Fix: project the destination dimension onto the rule (`Dst` / `DstExcluded` /
+  `DstAny`) and render `<fam> daddr <set>` / `daddr != <set>` AFTER the source
+  predicate, on BOTH nft surfaces (the exec-nft oracle in `daemon_nft.go` and
+  the production netlink installer in `pkg/nftables`). The ZONE scope stays
+  `iifname` — the daddr predicate only NARROWS on top of it, so a
+  destination-scoped deny on a data zone can never suppress management ingress
+  on a lifeline. Source and destination now route through ONE shared projection
+  formula (`junosHostProjectAddrMatch`) so the #5828 degenerate `any`+excluded
+  case ("every address EXCEPT every address" = the empty set => project NO rule,
+  never an unconditional drop) cannot be fixed on one dimension and regress on
+  the other. A destination-scoped PERMIT stays un-representable: a permit is
+  projected only as a `saddr !=` subtraction of later denies, which cannot
+  express a destination-dimension carve — the whole program then emits nothing
+  and every policy keeps the #4168 warning.
+  Validation: full `go test ./...` green (58 pkgs; the refactoring-audit heatmap
+  canary was regenerated for the +25 LOC in daemon_nft.go). The T1 nft-vs-netlink
+  ruleset-parity gate RAN (not skipped) under `unshare -rn` with the new
+  positive/negated daddr constructs added to its fixture, and all six of its
+  mutation-sensitivity sub-cases still diverge. Mutation-probed in a throwaway
+  detached worktree.
+- **File(s)**: pkg/config/{junos_host_deny.go,junos_host_deny_dst_4146_test.go},
+    pkg/daemon/{daemon_nft.go,daemon_nft_netlink.go,daemon_nft_netlink_parity_test.go,
+    host_inbound_junos_host_4146_test.go,host_inbound_junos_host_dst_4146_test.go},
+    pkg/nftables/{netlink_spec.go,netlink_hostinbound.go},
+    pkg/dataplane/userspace/junos_host_deny.go,
+    docs/host-inbound-service-matrix.md, docs/refactoring-audit-current.txt, _Log.md

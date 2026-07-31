@@ -475,12 +475,23 @@ func parityHostInboundInputs() (views []dpuserspace.ZoneHostInboundView, unzoned
 			IKEExemptNetdevs:  []string{"ge-0-0-2", "ge-0-0-2.50"},
 			IdentResetNetdevs: []string{"ge-0-0-2"},
 			RulesV4: []config.JunosHostDenyRule{
-				{Family: "ip", Src: []string{"192.0.2.0/24", "198.51.100.7"}, PermitSubtract: []string{"192.0.2.10"}},
-				{Family: "ip", SrcExcluded: true, Src: []string{"203.0.113.0/24"}, L4: []config.JunosHostDenyL4{{Proto: config.HostInboundProtoTCP, Ports: []config.PortRange{{Lo: 22, Hi: 22}}}}},
-				{Family: "ip", SrcAny: true, L4: []config.JunosHostDenyL4{{Proto: config.HostInboundProtoICMP, ICMPType: ptrU8(8), ICMPCode: ptrU8(0)}}},
+				{Family: "ip", Src: []string{"192.0.2.0/24", "198.51.100.7"}, PermitSubtract: []string{"192.0.2.10"}, DstAny: true},
+				{Family: "ip", SrcExcluded: true, Src: []string{"203.0.113.0/24"}, DstAny: true, L4: []config.JunosHostDenyL4{{Proto: config.HostInboundProtoTCP, Ports: []config.PortRange{{Lo: 22, Hi: 22}}}}},
+				{Family: "ip", SrcAny: true, DstAny: true, L4: []config.JunosHostDenyL4{{Proto: config.HostInboundProtoICMP, ICMPType: ptrU8(8), ICMPCode: ptrU8(0)}}},
+				// #4146 destination slice: a POSITIVE `match destination-address`
+				// (multi-element set) and a NEGATED one. Both must render the same
+				// `daddr` / `daddr !=` expressions on the netlink path as the oracle,
+				// in the same order (after the source predicate) — a dropped daddr
+				// predicate here would widen the deny to every firewall address.
+				{Family: "ip", Src: []string{"198.51.100.0/24"}, Dst: []string{"10.0.7.1/32", "10.0.8.1/32"},
+					L4: []config.JunosHostDenyL4{{Proto: config.HostInboundProtoTCP, Ports: []config.PortRange{{Lo: 443, Hi: 443}}}}},
+				{Family: "ip", SrcAny: true, DstExcluded: true, Dst: []string{"10.0.9.1/32"},
+					L4: []config.JunosHostDenyL4{{Proto: config.HostInboundProtoUDP, Ports: []config.PortRange{{Lo: 161, Hi: 161}}}}},
 			},
 			RulesV6: []config.JunosHostDenyRule{
-				{Family: "ip6", Src: []string{"2001:db8:a::/48"}, L4: []config.JunosHostDenyL4{{Proto: 47}}},
+				{Family: "ip6", Src: []string{"2001:db8:a::/48"}, DstAny: true, L4: []config.JunosHostDenyL4{{Proto: 47}}},
+				{Family: "ip6", SrcAny: true, Dst: []string{"2001:db8:5::1/128"},
+					L4: []config.JunosHostDenyL4{{Proto: config.HostInboundProtoTCP, Ports: []config.PortRange{{Lo: 22, Hi: 22}}}}},
 			},
 		},
 	}
