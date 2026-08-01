@@ -679,25 +679,34 @@ request-build stage:
   sequence-targeted poisoning channel). `push_redirect_inbox` capacity
   discard MUST be reported (`umem/mod.rs:1290`'s reporting API) and does
   not move the anchor (mandatory, not best-effort). **The per-arm apply
-  points are exact (v10.38.0, round-122 Codex 1):** on the cache-hit
-  path, the IN-PLACE rewrite arm applies at the postblock
-  (`!recycle_now` after the `pending_tx_prepared` push,
-  `flow_cache_hit.rs:444-497`, `:549-552` — the push is the admission;
-  nothing between it and the TX loop drops); the FALLBACK request arm
-  carries an optional authority payload on the
-  `PendingForwardRequest` (the validated handle + the seg summary +
-  the identity — the rare arm: cross-binding or in-place failure) and
-  the apply fires at the REQUEST's dispatch-admission success, with
-  the redirect-inbox overflow / build-failure discards reporting via
-  the mandatory API and SKIPPING the apply (the §5.2 no-learn rule,
-  unchanged); the v10.37.0 "TX-pipeline admission" redefinition is
+  points are exact (v10.38.0, round-122 Codex 1; the in-place arm
+  corrected in-revision — `bound_pending_tx_prepared` FIFO-overflow-
+  DISCARDS prepared requests under TX backpressure,
+  `tx/drain/mod.rs:56-81` (#804), so the `pending_tx_prepared` push is
+  NOT final either):** on the cache-hit path BOTH arms carry an
+  optional authority payload — the in-place arm on the
+  `PreparedTxRequest`, the fallback arm on the `PendingForwardRequest`
+  (validated handle(s) + the seg summary + the identity, ~128 B when
+  `Some`; TCP session-backed packets only, `None` for everything else)
+  — and the anchor apply fires at the REQUEST's dispatch-admission
+  success (the TX handoff in `drain_pending_tx` / the redirect-inbox
+  push success), re-validating the carried handle against the carried
+  identity at that point (a mid-batch transient purge CAN remove the
+  entry between the early check and the dispatch — the re-validation
+  is load-bearing, not belt-and-suspenders; a stale handle skips the
+  apply). EVERY discard path skips the apply: the hoisted geometry
+  checks, the build failure, the redirect-inbox overflow (reported,
+  mandatory no-learn), AND the bound-prepared overflow
+  (`tx/drain/mod.rs:56-81`).
+  The v10.37.0 "TX-pipeline admission" redefinition is
   SUPERSEDED — it conflicted with this section's wire-commit semantics
   (round-122 Codex 1's contradiction trace: plan §5.2/§9 always
   prohibited learning on the overflow path). With geometry hoisted
-  BEFORE every apply point, the round-122 walk-the-anchor trace dies
+  BEFORE every apply point and every post-admission discard skipping
+  the apply, the round-122 walk-the-anchor trace dies
   twice: attacker-chosen geometry never reaches an apply (the
-  geometric check fires first), and the residual load-driven overflow
-  neither reports success to a blind attacker nor moves the anchor —
+  geometric check fires first), and no residual class moves the anchor
+  without dispatch admission —
   and even a landed-then-dropped sample cannot be CHAINED without
   feedback (an off-path attacker never learns which guess succeeded;
   each slide requires the previous one to have landed), while an
@@ -2022,21 +2031,33 @@ adopting the shared decision/metadata, §5.6).
   filling on `MatchSource`; carried by the resolution result, the
   per-descriptor `matched_token` slot, and the cache entry.
 - The commit-side carrier (v10.35.0, round-119 Codex 1/2; the
-  two-handle shape + the postblock v10.36.0, round-120 Codex 1/2): the
+  two-handle shape v10.36.0, round-120 Codex 2; the per-arm dispatch
+  payload v10.38.0, round-122 Codex 1): the
   early identity check resolves the canonical slab HANDLE (plus the
   matched-reverse handle for a reverse-direction binding); the
   handle(s) ride
   the descriptor's existing commit scratch (`Copy`, no borrow
   crossing); every authority mutation re-validates at its own apply
   point (`entries.get` + primary-key/identity compare — the codebase's
-  own stale-handle guard pattern). The ANCHOR apply's final-admission
-  point is the COMMON SUCCESS-ONLY POSTBLOCK (`!recycle_now` at
-  `flow_cache_hit.rs:549-552`; both success arms converge there); a
-  construction failure keeps `recycle_now` set and recycles without
-  the apply. AND every session-table install/upsert/overwrite at key K
-  invalidates K's exact-query-key flow-cache slot (round-120 Codex 3 —
-  the precedence-winner rule; the existing helper
-  `flow_cache.rs:1105-1120` + the sibling fan-out accumulator).
+  own stale-handle guard pattern). The ANCHOR apply rides an optional
+  authority payload on BOTH cache-hit arms (the `PreparedTxRequest`
+  and the `PendingForwardRequest` — the payload is `Some` only for
+  TCP session-backed packets, ~128 B: handle(s) + seg summary +
+  identity) and fires at the request's dispatch-admission success
+  (the TX handoff / the redirect-inbox push), re-validating handle
+  against identity there (a mid-batch transient purge can stale the
+  handle — the skip is load-bearing); EVERY discard class skips the
+  apply: hoisted geometry checks, build failure, redirect-inbox
+  overflow (reported, `umem/mod.rs:1290`), and the bound-prepared
+  FIFO overflow (`tx/drain/mod.rs:56-81`, #804). AND every
+  session-table install/upsert/overwrite/HA-reindex
+  invalidates the FULL accepted-query alias
+  family (old AND new identities, reverse_canonical included) via the
+  table-side `pending_invalidations` buffer with the three drain
+  points (inline current-binding at the install's own dispatch —
+  invalidate-BEFORE-cache; post-batch sibling fan-out; loop-top
+  all-binding command drain) and the saturation→whole-cache-flush
+  fallback (round-120 Codex 3, round-122 Codex 2/3).
 - The capacity-corner accounting fallback (v10.35.0, round-119 Codex
   7): the close-accept path carries the validated forward handle as a
   fallback target to master's accounting chokepoint
@@ -2532,29 +2553,43 @@ adopting the shared decision/metadata, §5.6).
     occupant capture; a non-zero expectation resolves the derived
     forward key and sets `family_handle = Some` ONLY when the probed
     entry's id equals the stored expectation (plus key+NAT) — a
-    per-hop verification, not a bind). The ANCHOR APPLY runs at the COMMON SUCCESS-ONLY POSTBLOCK
-    (v10.36.0, round-120 Codex 1 — the v10.35.0 ":507-548 success arm"
-    named only the fallback request arm; the dominant in-place rewrite
+    per-hop verification, not a bind). The ANCHOR APPLY's point evolved
+    across rounds and is now exact: the v10.35.0 ":507-548 success arm"
+    named only the fallback request arm (the dominant in-place rewrite
     arm enqueues `pending_tx_prepared` and clears `recycle_now` at
-    `:444-497`, SKIPPING the fallback block): both success arms
-    converge on the `recycle_now` flag, so the apply runs iff
-    `!recycle_now` at the recycle point (`:549-552`) — a packet whose
+    `:444-497`, SKIPPING the fallback block); the v10.36.0 common
+    postblock (`!recycle_now` at `:549-552`) covered both construction
+    arms but still preceded the dispatch drops; the v10.38.0 rule
+    (round-122 Codex 1) rides the optional authority payload on BOTH
+    request types and applies at the request's dispatch-admission
+    success, with every discard class (hoisted geometry, build failure,
+    redirect-inbox overflow, bound-prepared FIFO overflow) skipping the
+    apply. A packet whose
     rewrite/request construction FAILED on both arms still has
-    `recycle_now` set, is recycled WITHOUT the apply, and never
+    `recycle_now` set, is recycled WITHOUT producing a payload at all,
+    and never
     advances the trusted anchor. The per-arm admission rule (v10.38.0,
     round-122 Codex 1 — the v10.37.0 "TX-pipeline admission"
     redefinition is SUPERSEDED; §5.2's wire-commit semantics always
-    outranked it): the IN-PLACE arm's apply runs at the postblock (the
-    `pending_tx_prepared` push IS the admission — nothing between it
-    and the TX loop drops); the FALLBACK request arm carries an
-    optional authority payload (validated handle + seg summary +
-    identity) on the `PendingForwardRequest`, and the apply fires at
-    the request's dispatch-admission success — the redirect-inbox
-    overflow and build-failure discards report via the mandatory API
-    (`umem/mod.rs:1290`) and SKIP the apply (§5.2's mandatory
-    no-learn, unchanged; the dispatch paths,
-    `worker/lifecycle.rs:209-281`, `tx/dispatch/mod.rs:512-573`,
-    `:1378-1397`, `umem/mod.rs:1257-1321`). With geometry hoisted
+    outranked it; and the in-place arm's push is NOT final either —
+    `bound_pending_tx_prepared` FIFO-overflow discards prepared
+    requests under TX backpressure, `tx/drain/mod.rs:56-81` (#804)):
+    BOTH arms carry the optional authority payload (the in-place arm
+    on the `PreparedTxRequest`, the fallback arm on the
+    `PendingForwardRequest`) and the apply fires at the request's
+    dispatch-admission success — the TX handoff in `drain_pending_tx`
+    for the prepared path, the redirect-inbox push success for the
+    redirect path — re-validating the carried handle against the
+    carried identity at that point (a mid-batch transient purge can
+    remove the entry between the early check and the dispatch; a stale
+    handle skips the apply). Every discard path skips the apply: the
+    hoisted geometry checks, the build failure, the redirect-inbox
+    overflow (reported via the mandatory API, `umem/mod.rs:1290`;
+    §5.2's mandatory no-learn), and the bound-prepared overflow. The
+    dispatch paths named by the round-121/122 traces
+    (`worker/lifecycle.rs:209-281`, `tx/dispatch/mod.rs:512-573`,
+    `:1378-1397`, `umem/mod.rs:1257-1321`) are all covered by the
+    payload-rides-the-request shape. With geometry hoisted
     before every apply point, an attacker-chosen-geometry packet never
     reaches an apply; a landed-then-dropped sample cannot be CHAINED
     (a blind attacker never learns which guess landed, and each
@@ -3209,9 +3244,10 @@ untouched.
 - **Hot-path discipline:** zero new allocations; zero new atomics; the
   per-TCP-data-packet cost at the commit-arm anchor hook (a DISTINCT
   final-admission apply point from the pre-admission #2501 accounting
-  call, §5.2 — the COMMON SUCCESS-ONLY POSTBLOCK, `!recycle_now` at
-  `flow_cache_hit.rs:549-552`, where both the in-place (`:444-497`) and
-  fallback (`:498-548`) arms converge, v10.36.0 round-120 Codex 1) is
+  call, §5.2 — the apply rides the optional authority payload on the
+  prepared/pending request and fires at the request's dispatch-
+  admission success, v10.38.0 round-122 Codex 1; every discard class
+  skips it) is
   one
   8-byte read + ≤2 gated stores against the CARRIED validated handle
   (an L1 slab index + identity compare, no re-hash, v10.35.0 round-119
@@ -3421,7 +3457,7 @@ untouched.
 |---|---|---|
 | Behavioral regression | MED | Gate only withholds demotion, never blocks delivery; refuse on missing/untrusted baseline. Residuals (stated in §2/§5.2/§7): soft-refused legit close after unobserved stretches or both-direction path switches → entry idles ≤ established timeout; imported entries never validate closes until churn (bounded lingering; §10.5 wire-anchor restores); tuple stays busy meanwhile — pre-existing semantics for silently-dead flows. Restart-RST covered by the union rule. OPENING covered by SEG.LEN-aware ack check against the FORWARD entry's state. |
 | Lifetime / borrow-checker | LOW | Anchor is `Copy` POD on an existing entry; marking restructured into the existing post-borrow propagation phase; no new cross-boundary borrows. |
-| Performance regression | LOW-MED | 49 B/entry slab growth (v10.34.0: 40 B anchor + 1 B probation + 8 B `fwd_companion_id` — the stable session id, renamed from the epoch form round-118 Codex 2, same 8 B; 49 × 131,072 = 6,422,528 B ≈ 6.1 MiB/worker at cap, ≈ 36.7 MiB at 6 workers) plus the cache's optional token field (~96 B `Option<MatchedToken>` — 40 B `SessionKey` (`key.rs:9-17`) + 44 B `NatDecision` (`nat/mod.rs:90-103`) + 8 B stable id + orientation/source/transition bytes, the `Option` niche-filling on the source enum — on the ~96 B entry × the 4,096-entry cache PER BINDING, ≈ +384 KiB per binding, owned per binding not per worker — `flow_cache.rs:5-14`, `:201-224`, `worker/flow_cache_state.rs:26-35`, `worker/mod.rs:196-201`; the ~doubled entry width and the larger four-way set scan are noted and gated by the §9 `size_of` assertions + measurement); one TCP-header view compute (seq/ack/wnd/flags/seg_len) + ≤2 gated stores per committed TCP data packet (closing segments skip updates entirely); one extra probe per closing segment; PLUS the session-table identity probe(s) per session-backed cache hit (v10.33.1 SMR r118; mechanics corrected v10.36.0 round-120 Codex 1/2/3: the early identity-only check at `flow_cache_hit.rs:~133` resolves and CARRIES the validated slab handle(s) in the descriptor's commit scratch — ONE canonical probe for a forward-direction binding, TWO for a reverse-direction binding (the canonical probe + the matched-reverse probe, the latter warm against master's own `:295-317` reverse probes); same-key/warm with master's `touch_if_stale`/`account_packet` probes ONLY for a plain non-translated forward hit; every authority mutation re-validates its carried handle at its own apply point — an L1 slab index + ~93 B of compares, NO re-hash; the anchor apply runs at the COMMON SUCCESS-ONLY POSTBLOCK (`!recycle_now` at `:549-552` — both the in-place `:444-497` and fallback `:498-548` arms converge there), so a construction-failed recycled packet never advances the trusted anchor; and every install/upsert/overwrite at key K invalidates K's exact-query-key cache slot so a precedence-changing install never leaves a stale descriptor forwarding the prior winner). Must be measured at minimum-frame rates (§9) — the 23 Gbit/s MTU-sized iperf run alone is insufficient (≈37 Mpps at 25 Gbit/s small-frame is the real gate; `iperf3 -l 64` is a proxy, not a demonstrated line-rate generator — gate on pps, not bandwidth). |
+| Performance regression | LOW-MED | 49 B/entry slab growth (v10.34.0: 40 B anchor + 1 B probation + 8 B `fwd_companion_id` — the stable session id, renamed from the epoch form round-118 Codex 2, same 8 B; 49 × 131,072 = 6,422,528 B ≈ 6.1 MiB/worker at cap, ≈ 36.7 MiB at 6 workers) plus the cache's optional token field (~96 B `Option<MatchedToken>` — 40 B `SessionKey` (`key.rs:9-17`) + 44 B `NatDecision` (`nat/mod.rs:90-103`) + 8 B stable id + orientation/source/transition bytes, the `Option` niche-filling on the source enum — on the ~96 B entry × the 4,096-entry cache PER BINDING, ≈ +384 KiB per binding, owned per binding not per worker — `flow_cache.rs:5-14`, `:201-224`, `worker/flow_cache_state.rs:26-35`, `worker/mod.rs:196-201`; the ~doubled entry width and the larger four-way set scan are noted and gated by the §9 `size_of` assertions + measurement); one TCP-header view compute (seq/ack/wnd/flags/seg_len) + ≤2 gated stores per committed TCP data packet (closing segments skip updates entirely); one extra probe per closing segment; PLUS the session-table identity probe(s) per session-backed cache hit (v10.33.1 SMR r118; mechanics corrected v10.36.0 round-120 Codex 1/2/3: the early identity-only check at `flow_cache_hit.rs:~133` resolves and CARRIES the validated slab handle(s) in the descriptor's commit scratch — ONE canonical probe for a forward-direction binding, TWO for a reverse-direction binding (the canonical probe + the matched-reverse probe, the latter warm against master's own `:295-317` reverse probes); same-key/warm with master's `touch_if_stale`/`account_packet` probes ONLY for a plain non-translated forward hit; every authority mutation re-validates its carried handle at its own apply point — an L1 slab index + ~93 B of compares, NO re-hash; the anchor apply rides the optional authority payload on the prepared/pending request and fires at dispatch-admission success (every discard class — hoisted geometry, build failure, redirect-inbox overflow, the bound-prepared FIFO overflow `tx/drain/mod.rs:56-81` — skips it); the payload itself is ~128 B when `Some` (TCP session-backed only, `None` otherwise); and every install/upsert/overwrite/HA-reindex invalidates the FULL accepted-query alias family (old and new identities) via the table-side buffer with the three drain points and the saturation→flush fallback, so a precedence-changing install never leaves a stale descriptor forwarding the prior winner). Must be measured at minimum-frame rates (§9) — the 23 Gbit/s MTU-sized iperf run alone is insufficient (≈37 Mpps at 25 Gbit/s small-frame is the real gate; `iperf3 -l 64` is a proxy, not a demonstrated line-rate generator — gate on pps, not bandwidth). |
 | Architectural mismatch | LOW | No new subsystem; anchors at the existing #2501/#3706 chokepoints; #4400-style always-on gate. No pipeline restructure. No distributed protocol. |
 | HA / rolling upgrade | LOW | No wire change; mixed-version pair behaves as same-version (a pre-upgrade node keeps master's demote behavior for its own table; the upgraded node simply refuses blind demotes on its own). Pre-upgrade and imported entries sit in the absorbing zero-trust state — closes refuse until churn (strictly more conservative than master; bounded lingering, §2; Phase 2 §10.5 closes it for synced flows). The replica no-Close invariant + the SharedPromote refuse trace are regression-tested. |
 | Pending-neighbor behavior | LOW | Master's buffered-decision retry is UNCHANGED (v10.2.0 retreat): no re-resolution, no hold, no new drop class, no stale-transmit change — the admitted-close delivery is master-parity, and the pre-existing stale-decision window is documented (§7 race d, follow-up §10.6.2). Buffered packets never move the anchor — a fail-toward-refuse residual (anchors lag behind long ARP stalls; closes soft-refuse; entries idle out normally), never a walk/poison channel. |
@@ -3918,16 +3954,28 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   zero-expectation entry is
   suppressed while forward-direction learning rides the direct
   canonical hit (fail-closed, bounded lingering, §2 posture).
-- **Cache precedence + the success postblock (v10.36.0, round-120
-  Codex 1/2/3):** an install/upsert/overwrite at key K while a
-  descriptor is cached for K → the slot is invalidated and the next
-  packet re-resolves (the direct-primary-outranks-alias trace); a
+- **Cache precedence + the dispatch payload (v10.36.0, round-120
+  Codex 1/2/3; v10.38.0 round-122 Codex 1/2/3):** an
+  install/upsert/overwrite/HA-reindex affecting identity K while a
+  descriptor is cached for any of K's accepted-query aliases → the
+  COMPLETE alias family (old and new identities, reverse_canonical
+  included) is invalidated via the table-side
+  `pending_invalidations` buffer and the next packet re-resolves (the
+  direct-primary-outranks-alias trace); the three drains are asserted
+  (inline current-binding at the install's own dispatch with
+  invalidate-BEFORE-cache ordering — descriptor N's fresh S2 cache is
+  never evicted by its own drain; post-batch sibling fan-out;
+  loop-top all-binding command drain); the saturation→whole-cache-
+  flush fallback fires only at a crafted full batch; a
   reverse-direction committed packet applies its anchor sample through
   the TWO carried handles (R for the matched-entry operations, F for
-  the anchor), each re-validated at its apply point; the anchor apply
-  fires iff `!recycle_now` — a crafted construction-failure packet
-  (both arms decline) recycles with ZERO anchor movement; the in-place
-  arm (dominant) and the fallback arm both apply.
+  the anchor — the F handle `Some` only when the per-hop expectation
+  verifies), each re-validated at its apply point; the anchor apply
+  fires ONLY at the request's dispatch-admission success — a crafted
+  construction-failure packet (both arms decline) produces no payload,
+  and a redirect-overflow or bound-prepared-overflow discard skips the
+  apply (the mandatory report fires); the in-place
+  arm (dominant) and the fallback arm both ride the payload.
 - **Capacity-corner family state (v10.34.0, round-118 Codex 4;
   v10.35.0 round-119 Codex 6/7; v10.36.0 round-120 Codex 9/10/11/12):**
   an
