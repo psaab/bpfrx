@@ -30,13 +30,83 @@ const GRE_PROTO_IPV4: u16 = 0x0800;
 const GRE_PROTO_IPV6: u16 = 0x86dd;
 const TCP_FLAG_SYN: u8 = 0x02;
 const TCP_FLAG_ACK: u8 = 0x10;
-const MAX_EXT_HDRS: usize = 6;
+/// #4555: iteration bound of the `parse_ipv6` extension-header walk.
+///
+/// This is an ITERATION count, not a header count, and the two walkers
+/// that must agree spend their iterations differently:
+///
+///   - This loop spends one iteration per extension header and exits by
+///     EXHAUSTION carrying whatever next-header value the last one
+///     declared. There is no post-loop over-limit check — `protocol`
+///     flows straight into `parse_l4`. So a chain of up to
+///     `MAX_EXT_HDRS` extension headers still resolves its L4.
+///   - `walk_ipv6_ext_chain` in `userspace-dp/src/afxdp/frame/inspect.rs`
+///     needs one further iteration to RETURN the terminal
+///     (`_ => return L4(..)`), and treats exhaustion as the fail-closed
+///     `OverLimit` verdict (#2292/#4743). So it resolves a chain of up to
+///     `MAX_IPV6_EXT_HEADERS - 1` extension headers.
+///
+/// The parity condition is therefore `MAX_EXT_HDRS == MAX_IPV6_EXT_HEADERS
+/// - 1`, NOT numeric equality: 7 here against 8 there means both walkers
+/// resolve 0..=7 extension headers and both refuse 8 or more. Setting this
+/// to 8 to "match" would make the shim resolve 8-header chains that
+/// userspace fails closed on.
+///
+/// Getting it wrong in either direction is fail-closed — the shim's only
+/// job here is to recompute the session key userspace already installed,
+/// and a chain it cannot resolve leaves the unconsumed extension-header
+/// type in `ParsedPacket::protocol` with `parse_l4`'s catch-all ports 0/0,
+/// so the key misses the session map and the packet is redirected to
+/// userspace for full policy. The cost is a permanent loss of the XDP fast
+/// path for that flow, which is what #4555 fixes: before it, this was 6
+/// against userspace's 8, so a chain of exactly 7 extension headers
+/// resolved in userspace and never in the shim.
+///
+/// The bound is capped by BPF verifier budget, not by taste — the loop is
+/// fully unrolled, so each iteration duplicates every arm body and its
+/// `read_bytes` range re-validation. Measured against the 1M processed-insn
+/// cap on the pinned toolchain (`cmd/shimverify`, kernel 7.0):
+///
+///   bound 6, narrow type set (pre-#4555):  990,796 insns  PASS
+///   bound 6, wide type set:                874,873 insns  PASS
+///   bound 7, narrow type set:                      REJECT
+///   bound 7, wide type set (this):         947,188 insns  PASS
+///   bound 8, either type set:                      REJECT
+///
+/// Note the coupling: widening the generic arm below to the full #4517
+/// type set is what makes bound 7 affordable at all — folding five more
+/// next-header values into one shared arm body prunes verifier states that
+/// the narrow set spent on the `_ => break` fallthrough. Raise neither
+/// without re-running `make generate`; the #1864 verify-then-install gate
+/// in `pkg/dataplane/build-userspace-xdp.sh` is what proves a candidate
+/// loads.
+///
+/// `tests_shim_ext_parity.rs` in userspace-dp fails if this value — or the
+/// extension-header type set below — drifts from the userspace walker.
+const MAX_EXT_HDRS: usize = 7;
 const NEXTHDR_HOP: u8 = 0;
 const NEXTHDR_ROUTING: u8 = 43;
 const NEXTHDR_FRAGMENT: u8 = 44;
 const NEXTHDR_AUTH: u8 = 51;
 const NEXTHDR_DEST: u8 = 60;
 const NEXTHDR_NONE: u8 = 59;
+// #4517/#4555: the remaining generic length-prefixed extension headers
+// (byte 0 = next header, byte 1 = HdrExtLen in 8-octet units excluding
+// the first 8 → advance `(HdrExtLen + 1) * 8`), matching the set the
+// userspace walker enumerates in `frame/inspect.rs`:
+//   135 Mobility (RFC 6275 §6.1), 139 HIP (RFC 7401 §5.1),
+//   140 Shim6 (RFC 5533 §5.1), 253/254 experimental (RFC 3692/RFC 4727).
+// #4517 added these to the userspace walkers but not here, so a chain
+// like `HOP → MOBILITY → TCP` resolved to proto=TCP in userspace and
+// stopped at proto=135 in the shim — a permanent fast-path miss for the
+// flow. ESP (50) is deliberately absent on BOTH sides: the payload is
+// encrypted and the inner next-header unreadable, so stopping there is
+// correct.
+const NEXTHDR_MOBILITY: u8 = 135;
+const NEXTHDR_HIP: u8 = 139;
+const NEXTHDR_SHIM6: u8 = 140;
+const NEXTHDR_EXP1: u8 = 253;
+const NEXTHDR_EXP2: u8 = 254;
 // The BPF-side symbol names retain FALLBACK for index/map compatibility. The
 // Go/operator surface exposes these retained-shim actions as degraded-path
 // counters.
@@ -1256,7 +1326,14 @@ fn parse_ipv6(
 
     for _ in 0..MAX_EXT_HDRS {
         match protocol {
-            NEXTHDR_HOP | NEXTHDR_ROUTING | NEXTHDR_DEST => {
+            NEXTHDR_HOP
+            | NEXTHDR_ROUTING
+            | NEXTHDR_DEST
+            | NEXTHDR_MOBILITY
+            | NEXTHDR_HIP
+            | NEXTHDR_SHIM6
+            | NEXTHDR_EXP1
+            | NEXTHDR_EXP2 => {
                 let opt = read_bytes(data, data_end, offset as usize, 2)?;
                 protocol = opt[0];
                 offset = offset.checked_add(((opt[1] as u16) + 1) * 8)?;

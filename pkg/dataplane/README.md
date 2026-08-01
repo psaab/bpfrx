@@ -329,6 +329,57 @@ authoritative list; quick recap:
 - xdp_zone fails the verifier on kernel 6.12 (NAT64 complexity); passes
   on 6.18+.
 
+### IPv6 extension-header walk: the shim's budget is nearly spent (#4555)
+
+The shim's `parse_ipv6` extension-header loop is fully unrolled, so every
+iteration duplicates each arm body and its `read_bytes` range
+re-validation. It is the single largest consumer of the 1M processed-insn
+verifier cap, and the pre-#4555 shim sat at **990,796 of 1,000,000 — under
+1% headroom**. Measured on the pinned toolchain via `cmd/shimverify`
+(kernel 7.0), varying only `MAX_EXT_HDRS` and whether the generic arm
+carries the full #4517 type set:
+
+| `MAX_EXT_HDRS` | #4517 types (135/139/140/253/254) | verdict | processed insns |
+|---|---|---|---|
+| 6 | no (pre-#4555) | PASS | 990,796 |
+| 6 | yes | PASS | 874,873 |
+| 7 | no | **REJECT** | — |
+| 7 | yes (current) | PASS | 947,188 |
+| 8 | no | **REJECT** | — |
+| 8 | yes | **REJECT** | 1,000,001 |
+
+Two things to carry away:
+
+- **8 is unreachable.** Do not "just bump it to match userspace" — the
+  candidate does not load, and `make generate` fails closed at the #1864
+  verify-then-install gate (the tracked `.o` is left untouched).
+- **The bound and the type set are coupled.** Widening the generic arm to
+  the full #4517 set is what makes bound 7 affordable: folding five more
+  next-header values into one shared arm body prunes more verifier state
+  than the five extra compares cost. Bound 7 with the narrow set is
+  rejected; with the wide set it passes with 5.3% headroom.
+
+**Parity relation.** `MAX_EXT_HDRS` (shim) and `MAX_IPV6_EXT_HEADERS`
+(`userspace-dp/src/afxdp/frame/inspect.rs`) are ITERATION counts whose
+loops exit differently, so they are deliberately NOT equal:
+
+- the shim spends one iteration per extension header and exits by
+  EXHAUSTION carrying the last declared next-header value straight into
+  `parse_l4` (no post-loop over-limit check) — it resolves chains of up to
+  `MAX_EXT_HDRS` extension headers;
+- `walk_ipv6_ext_chain` needs one FURTHER iteration to return the terminal
+  and folds exhaustion into the fail-closed `OverLimit` verdict
+  (#2292/#4743) — it resolves up to `MAX_IPV6_EXT_HEADERS - 1`.
+
+So the correct condition is `MAX_EXT_HDRS == MAX_IPV6_EXT_HEADERS - 1`
+(7 and 8): both walkers resolve 0..=7 extension headers and both refuse 8
+or more. A mismatch is fail-closed — the shim's unresolved chain leaves
+the extension-header type in `ParsedPacket::protocol` with `parse_l4`'s
+catch-all ports 0/0, so the session key misses and the packet is redirected
+to userspace for full policy — but it costs that flow the XDP fast path
+permanently. `tests_shim_ext_parity.rs` in userspace-dp fails on drift in
+either the resolvable chain length or the walked type set.
+
 ## SR-IOV / driver constraints
 
 - iavf (VF) has no native XDP — generic mode only, ~16% CPU loss.

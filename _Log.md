@@ -1,3 +1,65 @@
+## 2026-08-01 — #4555 IPv6 extension-header walk parity: shim vs userspace
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity)
+- **Action**: Closed the #4555 divergence between the AF_XDP shim's
+  `parse_ipv6` extension-header walk and userspace-dp's
+  `walk_ipv6_ext_chain`. The issue proposed bumping the shim's
+  `MAX_EXT_HDRS` 6 -> 8 to numerically match `MAX_IPV6_EXT_HEADERS`.
+  Both halves of that turned out to be wrong, and the kernel verifier
+  settled it.
+
+  (1) 8 does not load. `make generate` REJECTED the candidate at
+  `BPF program is too large. Processed 1000001 insn (limit 1000000)` —
+  the #1864 failure mode. The gate fail-closed correctly and left the
+  tracked `.o` untouched. A bisect over (bound x type-set) with a
+  throwaway `LogLevelStats` probe measured every cell: bound 6 narrow
+  990,796 PASS (master — under 1% headroom); bound 6 wide 874,873 PASS;
+  bound 7 narrow REJECT; bound 7 wide 947,188 PASS; bound 8 either
+  REJECT. Two findings: 8 is unreachable, and the bound is COUPLED to
+  the type set — widening the generic arm to the full #4517 set prunes
+  more verifier state than its five extra compares cost, which is the
+  only reason bound 7 is affordable.
+
+  (2) Numeric equality was the wrong parity condition anyway. The two
+  bounds are ITERATION counts over loops that exit differently: the shim
+  spends one iteration per extension header and exits by EXHAUSTION
+  carrying the last declared next-header straight into `parse_l4` (there
+  is no post-loop over-limit check), so it resolves up to `MAX_EXT_HDRS`
+  headers; `walk_ipv6_ext_chain` needs one FURTHER iteration to return
+  the terminal and folds exhaustion into the fail-closed `OverLimit`
+  verdict, so it resolves up to `MAX_IPV6_EXT_HEADERS - 1`. The real
+  parity point is therefore `MAX_EXT_HDRS == MAX_IPV6_EXT_HEADERS - 1`
+  = 7, and the real gap was a chain of EXACTLY 7 headers (not "7+" — at
+  8+ both sides already refused). Setting 8 would have made the shim
+  resolve chains userspace fails closed on.
+
+  Shipped: `MAX_EXT_HDRS` 6 -> 7 and the #4517 generic types
+  (135 Mobility / 139 HIP / 140 Shim6 / 253-254 experimental) added to
+  the shim's generic length-prefixed arm, matching the set #4517 gave
+  the userspace walkers. Net verifier effect is an IMPROVEMENT: headroom
+  goes from 0.92% to 5.3% while the parity gap closes. Regenerated
+  `userspace_xdp_bpfel.o` + `userspace_xdp_manifest.json` through the
+  verifier-gated `make generate` (PASS). The pre-change baseline
+  regenerate reproduced the tracked object bit-identically, so the
+  object diff is attributable to this change alone.
+
+  Guard: `tests_shim_ext_parity.rs` parses the shim's walk out of its
+  source text (bound, arm patterns resolved through the `NEXTHDR_*`
+  consts, arm bodies classified by their advance arithmetic) and compares
+  it against the userspace walker derived BEHAVIOURALLY — resolvable
+  chain length measured by walking real chains, and all 256 next-header
+  values classified by probe packet — rather than a second text parse. It
+  asserts resolvable-chain-length equality, the `- 1` relation, and
+  full type-set agreement, plus the structural property the derivation
+  rests on (no post-loop over-limit check between the walk and
+  `parse_l4`). It fails LOUDLY, never skips, on an unreadable or
+  unrecognised shim source.
+- **File(s)**: userspace-xdp/src/lib.rs,
+  userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  userspace-dp/src/afxdp/frame/mod.rs, pkg/dataplane/userspace_xdp_bpfel.o,
+  pkg/dataplane/userspace_xdp_manifest.json, pkg/dataplane/README.md,
+  _Log.md
+
 ## 2026-07-31 — #6611 review round 2: guard scoped narrower than its claim
 
 - **Timestamp**: 2026-07-31 (fix/6611-control-channel-auth, PR #6624)

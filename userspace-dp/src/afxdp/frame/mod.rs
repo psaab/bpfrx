@@ -2019,6 +2019,11 @@ mod tests_ipv6_ext_walk;
 #[cfg(test)]
 #[path = "tests_mss_inject_inspect.rs"]
 mod tests_mss_inject_inspect;
+// #4555: parity guard between the AF_XDP shim's parse_ipv6 extension-header
+// walk (userspace-xdp/src/lib.rs) and walk_ipv6_ext_chain above.
+#[cfg(test)]
+#[path = "tests_shim_ext_parity.rs"]
+mod tests_shim_ext_parity;
 
 // #1824: proptest property harness (parse no-panic/bounds, NAT
 // round-trip + descriptor-vs-generic differential, TSO reassembly).
