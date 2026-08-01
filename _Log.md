@@ -1,3 +1,44 @@
+## 2026-08-01 — #5619 PR2: commit-time advisory that IPsec plaintext is unadjudicated
+
+- **Timestamp**: 2026-08-01 (fix/5619-ipsec-plaintext-warn)
+- **Action**: Added `warnSecureTunnelPlaintextUnadjudicatedAST`, a commit-time
+  WARNING (never a rejection) that a route-based IPsec VPN's decrypted
+  plaintext is not evaluated against xpf security policies.
+
+  The sharpest part of #5619 is not the bypass, it is that the config gives an
+  affirmative FALSE signal: `set security zones security-zone vpn interfaces
+  st0.0` commits cleanly (#4515 accepts it), the compiler programs
+  iface_zone_map for the xfrmi ifindex, and the XDP shim is attached — so the
+  posture READS as enforced. An operator who zones a VPN interface and sees it
+  accepted has been told something specific and untrue. That is fixable now,
+  independently of the dataplane architecture, and this does it.
+
+  Warning, NOT rejection, and the property is STRUCTURAL: the function has no
+  error return and no `lenient` flag, so it cannot be quietly inverted by a
+  later edit. Route-based (st0/XFRM) IPsec is the ONLY IPsec model xpf supports
+  (#3114 hard-rejects policy-based), so rejecting it would be a feature removal
+  — and it would leave an operator with a working tunnel unable to commit an
+  UNRELATED change (#1960 no-brick).
+
+  Keyed off `config.IsSecureTunnelIfName`, the SAME predicate as the dataplane
+  exclusion arms added in PR1, so the advisory and the behaviour it describes
+  cannot drift apart. When the dataplane learns to own an xfrmi end-to-end, the
+  exclusions and this advisory are keyed off one name and go together.
+
+  Message names the VPN and the bind-interface, and when the tunnel interface
+  is in a security zone it additionally names that zone and states plainly that
+  the zone does not govern the decrypted traffic — the false-signal case.
+  Zone membership is read through the shared `zoneInterfaceMembers` flattener
+  so a bracketed list `interfaces [ st0.0 st0.1 ]` (which arrives
+  bracket-stripped and NESTED, #5248/#2419) does not silently lose its tail.
+  An AST pre-walk across EVERY duplicate `security`/`ipsec` block (#3562).
+
+  Validation: pkg/config, pkg/configstore, pkg/cli and pkg/dataplane/... suites
+  green (adding a warning to every IPsec config broke no existing warning-count
+  assertion); 7 new tests including a no-brick test and a negative control.
+- **File(s)**: pkg/config/compiler_ipsec_plaintext_warn.go,
+  pkg/config/compiler_ipsec_plaintext_warn_5619_test.go,
+  pkg/config/compiler_prewalk.go, _Log.md
 ## 2026-08-01 — #5619 PR1 round 3: bare `bind-interface st0` regression (MAJOR-1/2/3)
 
 - **Timestamp**: 2026-08-01 (fix/5619-ipsec-passthrough-zone-policy)
