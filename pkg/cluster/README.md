@@ -318,8 +318,11 @@ peer liveness (`lastSeen`) or drive election.
 - **Across-incarnation anti-replay — the signed boot epoch (#6169).**
   The ring can only ever be a bounded set because session ids are random and
   unordered. The frame therefore carries a **boot epoch**: a per-daemon-
-  incarnation counter that strictly increases across restarts and reboots,
-  giving the receiver a TOTAL ORDER over peer incarnations in O(1) state.
+  incarnation counter that increases across restarts and reboots, giving the
+  receiver an order over peer incarnations in O(1) state. It is **not strictly
+  increasing in every case** — the persisted term of the seed is bounded, so a
+  backward clock step larger than `bootEpochMaxSkew` regresses it even with the
+  file intact (residual 3, #6711).
   - **Receiver** (`heartbeatAuthState.admitAuthed`, floor `highEpoch` on the
     `Manager` so it survives a heartbeat restart exactly like the ring):
     `epoch < highEpoch` → REJECT (a retired incarnation); `epoch ==
@@ -330,8 +333,11 @@ peer liveness (`lastSeen`) or drive election.
     RECORDS a never-seen session as a side effect, so checking the epoch
     after it would let rejected replays keep evicting live watermarks and
     flush the ring — the bypass that failed review in #6370. The floor only
-    rises to a value the genuine peer actually signed, so replaying a
-    captured high-epoch frame cannot push it above the live peer.
+    rises to a value the genuine peer actually signed — but that does **not**
+    bound it by the live peer's *current* epoch: if the peer has since
+    regressed (residual 3, #6711), one archived frame raises the floor above
+    it and locks it out, and re-raises a cleared floor after a restart just as
+    it re-arms a cleared latch (residual 5).
   - **Sender** (`bootEpochSeed` published synchronously, then `refineBootEpoch`):
     `max(persisted+1, wall_clock_nanos)`,
     persisted atomically at `/var/lib/xpf/ha-boot-epoch` (the same durable
@@ -369,7 +375,19 @@ peer liveness (`lastSeen`) or drive election.
     ascending pass over their captures — about 60 frames across 12 retired
     incarnations — not a single frame. A replayed OLD epoch CAN set the floor low
     (the forward bound constrains only how far AHEAD an epoch may be), but it
-    cannot be sustained: the genuine frame always dominates and re-arms the latch.
+    cannot be sustained *while the peer's own epoch is still climbing*: the
+    genuine frame then dominates and re-arms the latch.
+
+    **"The genuine frame always dominates" is FALSE as an unqualified claim, and
+    this section used to make it.** It holds exactly while the sender is
+    monotonic. If the peer's epoch has REGRESSED (residual 3, #6711 — a backward
+    clock step larger than `bootEpochMaxSkew`), a replayed archived frame
+    carrying the peer's *earlier, higher* epoch raises the floor ABOVE the live
+    peer, and the live peer's genuine frames are then refused indefinitely.
+    Measured: 0/5 live frames admitted after one archived frame poisoned a fresh
+    floor, 0/5 after a sender restart at the same clock, and 0/5 again after a
+    receiver restart followed by one re-injected archived frame
+    (`TestArchivedEpochPoisonsAFreshFloor_6711`).
 
     With a LIVE peer that is ~100 ms and the trade is clearly good. With a
     **SILENT** peer the window stays open until the peer returns — and that is
@@ -409,14 +427,40 @@ peer liveness (`lastSeen`) or drive election.
     restart would no longer clear the latch and every deliberate downgrade
     would require a PSK rotation across both nodes.
 
-    The window either design closes needs a daemon restart AND a genuinely
-    absent peer AND an attacker holding pre-upgrade captures; and rotating the
-    control-link PSK — already a REQUIRED post-upgrade step — retires those
-    captures outright, closing it from the other side without any durable state.
-    Rollback recovery is now that same rotation followed by `systemctl restart
-    xpfd`, both operations operators already perform, rather than a hand-edit of
-    state. The rotation carries real weight here: without it the restart is
-    defeatable by one replayed archived frame (residual 5).
+    **The rotation does NOT retire captures made after it, and an earlier
+    revision of this section claimed it did.** A PSK rotation retires everything
+    an attacker recorded BEFORE it; a frame recorded AFTER it, under the current
+    key, still verifies. Measured: rotate K1→K2, let the peer arm the latch
+    under K2, roll it back under K2 to a build that signs but emits no epoch,
+    record the frames this receiver refuses, then let the peer go silent and
+    restart this daemon — **5/5 of those post-rotation captures are admitted**
+    against the empty state, and a durable K2-scoped latch would have refused
+    them (`TestRotationDoesNotRetirePostRotationCaptures_6669`). The durable
+    latch is still declined, but on its own merits:
+
+    - **Where it matters most, its benefit and its worst cost are the same
+      configuration.** A signed epoch-less frame under the current key can only
+      exist if the peer held that key while running a pre-#6169 build (ALWAYS-
+      EMIT means a #6169+ build always carries an epoch) — rollback, replacement
+      under the same identity and key, or a partial upgrade. While the peer is
+      still on that build a durable latch refuses the captures *and the live
+      peer*: that is the no-attacker-rollback cost above, not a separate gain.
+    - **Where the live peer is healthy again, it shuts one door with another
+      open beside it.** The latch can only have armed under this key because an
+      epoch-BEARING frame was accepted under it, so an on-link attacker holds
+      one of those too — and against empty post-restart state an archived
+      epoch-bearing frame is admitted whatever the latch says (`highEpoch` is 0,
+      the ring is empty; residual 5). Only a durable FLOOR closes that, and the
+      floor is the object priced out above.
+
+    The genuinely non-redundant residual is one narrow corner — an attacker
+    whose capture window sits strictly *inside* the rollback window, against a
+    peer that has since rolled forward and gone silent, across a receiver daemon
+    restart. It is **accepted**, not closed. Rollback recovery is a rotation
+    followed by `systemctl restart xpfd`, both operations operators already
+    perform, rather than a hand-edit of state; the rotation carries real weight
+    because without it the restart is defeatable by one replayed archived frame
+    (residual 5).
   - **ALWAYS-EMIT, and why this mechanism costs no HA availability.** The
     epoch is published SYNCHRONOUSLY from the wall clock with **no file access
     at all**, so every frame carries one from the very first send. Persistence
@@ -433,8 +477,12 @@ peer liveness (`lastSeen`) or drive election.
 
     > a keyed heartbeat carries no epoch **iff** the peer runs a pre-#6169 build.
 
-    The residual is the double fault only: storage that never completes AND a
-    clock that stepped backwards.
+    The residual here is the double fault — storage that never completes AND a
+    clock that stepped backwards. **That is the residual of THIS ordering
+    property, not of the epoch as a whole**, and an earlier revision let it
+    stand as if it were both. A single backward clock step larger than
+    `bootEpochMaxSkew` regresses the epoch on its own, with storage perfectly
+    healthy and the file intact — see residual 3 and #6711.
   - **The state lock fails CLOSED.** Nothing in xpf enforces a single daemon
     instance — no pidfile, and the gRPC listener sets `SO_REUSEPORT`
     (`pkg/grpcapi/server.go`), so a second `xpfd` does NOT fail on a port
@@ -658,8 +706,13 @@ peer liveness (`lastSeen`) or drive election.
        epoch-less captures admitted inside the window, 0/120 after a genuine
        frame lands; the attacker gets one full ascending pass (~60 frames across
        12 retired incarnations). A replayed old epoch can set the floor low but
-       cannot sustain it — the genuine frame always dominates.
-       (`TestReceiverRestartWindowIsOneHeartbeat_6169`.)
+       cannot sustain it **while the peer's own epoch is still climbing** — the
+       genuine frame then dominates. It does NOT dominate if the peer's epoch has
+       regressed (residual 3): there a replayed archived frame raises the floor
+       above the live peer and holds it out, across receiver restarts, at one
+       re-injection each.
+       (`TestReceiverRestartWindowIsOneHeartbeat_6169`,
+       `TestArchivedEpochPoisonsAFreshFloor_6711`.)
     2. **In-bound clock skew latches a bounded lockout.** A peer epoch ahead of
        us but INSIDE the skew allowance is latched, so a peer later repaired to
        real time sits below that floor. Bounded twice: the slack IS the lockout
@@ -681,10 +734,20 @@ peer liveness (`lastSeen`) or drive election.
        value more than an hour ahead of `now`. The peer had latched the earlier,
        correct epoch, so it refuses the restarted node; a later NTP correction
        does NOT repair it, since the epoch is published once per incarnation and
-       the file has by then been overwritten with the lower value. Recovery is a
-       restart on either node once the clock is right. Tracked as **#6711** — a
+       the file has by then been overwritten with the lower value.
+
+       **Recovery is narrower than "a restart on either node".** Restarting the
+       SENDER while its clock is still wrong does not help — the file now holds
+       the *lower* value, so the next incarnation re-publishes from the same bad
+       clock (measured: still below the floor). Restarting the RECEIVER does
+       clear the floor, but an attacker holding one archived frame from the
+       pre-regression incarnation re-raises it immediately, at one re-injection
+       per restart — the same shape as residual 5, and it means the floor can be
+       poisoned by a capture rather than only by the sender's own regression.
+       Reliable recovery is fixing the clock (then restarting the sender), or a
+       PSK rotation before the receiver restart. Tracked as **#6711** — a
        behavioural fix there touches persistence semantics and is deliberately
-       out of scope here.
+       out of scope here. (`TestArchivedEpochPoisonsAFreshFloor_6711`.)
     4. **PSK rotation** changes the key-derived marker; the in-memory floor and
        latch are unaffected and stay valid, since a floor is a per-peer counter
        rather than key material.
@@ -702,8 +765,11 @@ peer liveness (`lastSeen`) or drive election.
        partial upgrade. Not closed in code: a durable FLOOR re-creates the
        peer-floor file this design deliberately removed; a durable PSK-scoped
        LATCH avoids that but pays a durable write on the accept path, a
-       cross-process lock there, and a heavier no-attacker rollback, to close a
-       window the mandatory PSK rotation already closes (both priced above); and
+       cross-process lock there, and a heavier no-attacker rollback — and note
+       the rotation does **not** retire captures taken *after* it, so what the
+       durable latch closes is not "a window the rotation already closes" but
+       the narrow corner priced above, with the epoch-bearing replay path still
+       open beside it; and
        a freshness test needs a challenge-response or timestamp the wire format
        does not carry (a legitimately long-lived peer's epoch is arbitrarily
        old, so no recency test separates it from an archived one).
@@ -1219,9 +1285,23 @@ Procedure:
 > both nodes are upgraded, this node is still accepting epoch-less frames —
 > either a node is genuinely on an older build, or someone is replaying
 > captures — and the line carries an inline note saying so. Once an accepted
-> epoch-bearing frame arms the latch, the inline note flips to "epoch-less
-> frames now refused; count is historical" and the epoch-less count stops
-> climbing.
+> epoch-bearing frame arms the latch, the inline note flips to "downgrade latch
+> armed; count is historical" and the epoch-less count stops climbing.
+>
+> That note reports the LATCH, not current enforcement, and the wording is
+> deliberate. `heartbeatAuthDecision` dual-accepts everything when no local key
+> is configured, and `UpdateConfig` clears the live key without resetting
+> `hbAuth` — so a cluster that added the key under `commit confirmed`, armed the
+> latch, then let the confirmation time out back to an unkeyed config is left
+> with the latch armed and epoch-less frames admitted anyway. An armed latch
+> therefore means "this node has seen the peer emit an epoch", not "this node is
+> refusing epoch-less frames right now".
+>
+> **The latch only enforces while a PSK is configured, so read it together with
+> the `Authentication:` line** in `show chassis cluster control-plane
+> statistics`. `engaged (peer authenticated; unauthenticated frames rejected)`
+> means the latch is being applied; `dual-accept (no control-link key
+> configured)` means it is not, whatever the note says.
 >
 > `Epoch downgrades rejected:` is a SEPARATE signal and does **not** start
 > counting when the latch arms — it stays at 0 until some later epoch-less

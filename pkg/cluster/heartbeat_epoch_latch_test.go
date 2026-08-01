@@ -4,6 +4,9 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -582,6 +585,16 @@ func TestInBoundFarFutureEpochLockoutIsBounded_6169(t *testing.T) {
 // live peer's next frame carries a strictly higher epoch, which repairs the
 // floor and re-arms the latch. Sustained exposure therefore additionally
 // requires the genuine peer to be ABSENT.
+//
+// SCOPE — THIS IS A MONOTONIC-SENDER RESULT, and the qualifier is load-bearing.
+// An earlier revision of this comment generalised it to "the genuine frame
+// always dominates", which is FALSE. Everything below assumes the live peer's
+// next epoch is HIGHER than the replayed one; that is what makes it dominate.
+// When the peer's own epoch has REGRESSED (#6711 — a backward clock step larger
+// than bootEpochMaxSkew), the archived frame carries the HIGHER value, the floor
+// rises above the live peer, and no genuine frame repairs it. That case is
+// measured separately in TestArchivedEpochPoisonsAFreshFloor_6711; do not read
+// this test as covering it.
 func TestReceiverRestartWindowIsOneHeartbeat_6169(t *testing.T) {
 	e := newLatchEnv(t)
 	const liveEpoch = uint64(9_500_000_000_000_000)
@@ -811,5 +824,222 @@ func TestBackwardClockStepDoesNotKillALatchedPeer_6169(t *testing.T) {
 	}
 	if got := e.r.auth.peerEpochFloor(); got != stepped {
 		t.Fatalf("floor moved to %d, want it pinned at %d", got, stepped)
+	}
+}
+
+// senderIncarnationAt models the SENDER half at a PINNED wall clock: publish
+// the seed that clock produces, then run the real refineBootEpoch against the
+// real persisted file. It returns the epoch this incarnation would advertise
+// and the value left in the file afterwards.
+//
+// Both clocks are pinned to the SAME instant deliberately. bootEpochSeed() and
+// refineBootEpoch's judgment sample are separate reads of the wall clock in
+// production; modelling them as one instant is what lets the test state a
+// single "this node's clock reads X" premise.
+func senderIncarnationAt(t *testing.T, path string, clock int64) (published, persisted uint64) {
+	t.Helper()
+	restore := epochNowNanos
+	epochNowNanos = func() int64 { return clock }
+	defer func() { epochNowNanos = restore }()
+
+	var pub atomic.Uint64
+	pub.Store(uint64(clock)) // what bootEpochSeed() returns at this instant
+	refineBootEpoch(path, &pub)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read persisted epoch: %v", err)
+	}
+	n, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		t.Fatalf("parse persisted epoch %q: %v", data, err)
+	}
+	return pub.Load(), n
+}
+
+// TestArchivedEpochPoisonsAFreshFloor_6711 measures the #6711 residual in the
+// shape that actually determines recovery, and it is the counterexample to
+// three claims this package used to make in the unqualified form:
+//
+//   - "a captured high-epoch frame cannot push the floor above the live peer"
+//     (admitAuthed's doc, both copies);
+//   - "the genuine frame always dominates" (README residual 1, and the scope
+//     note on TestReceiverRestartWindowIsOneHeartbeat_6169);
+//   - "declining costs a lockout that any restart on either node clears"
+//     (heartbeat_epoch_test.go's chaining rationale).
+//
+// All three hold only while the SENDER IS MONOTONIC. The sender is not
+// monotonic across a backward clock step larger than bootEpochMaxSkew: the
+// persisted term of the seed is bounded, so refineBootEpoch declines to chain
+// from the intact higher value AND durably overwrites it with the lower one.
+// From then on the peer's archived frames carry a HIGHER epoch than the peer
+// itself does, and one of them is enough to raise a floor the live peer can
+// never climb back over.
+//
+// The widening this pins, over the plain #6711 sequence, is the ARCHIVED FRAME
+// ARRIVING FIRST at a receiver with FRESH state. The floor is then poisoned by
+// a CAPTURE rather than by the sender's own live traffic, so the documented
+// escape — restart the receiver, the floor is in memory — is defeated at one
+// re-injection per restart, exactly as residual 5 defeats the restart recovery
+// for the LATCH.
+//
+// THIS PINS TODAY'S BEHAVIOUR, NOT THE DESIRED BEHAVIOUR. A real #6711 fix
+// changes it, and this test is then expected to fail and be rewritten against
+// the new semantics — deliberately, so the change is visible rather than
+// silent. It is NOT a safety property to preserve.
+func TestArchivedEpochPoisonsAFreshFloor_6711(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ha-boot-epoch")
+
+	// T is a correct present-day clock; the regressed incarnation runs 2h behind,
+	// which is beyond bootEpochMaxSkew (1h) and far above epochClockSaneFloor.
+	tNow := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC).UnixNano()
+	back := tNow - int64(2*time.Hour)
+	if uint64(back) < epochClockSaneFloor {
+		t.Fatal("test setup: the regressed clock must still be credible")
+	}
+	if uint64(tNow) <= uint64(back)+bootEpochMaxSkew {
+		t.Fatal("test setup: the step must exceed bootEpochMaxSkew")
+	}
+
+	// --- SENDER 1: incarnation A at the correct time. Publishes and persists T.
+	epochA, fileA := senderIncarnationAt(t, path, tNow)
+	if epochA != uint64(tNow) || fileA != uint64(tNow) {
+		t.Fatalf("A: published=%d persisted=%d, want both %d", epochA, fileA, tNow)
+	}
+
+	// --- SENDER 2: incarnation B starts 2h behind with the file INTACT.
+	// It declines to chain from the correct T, publishes the LOWER value, and
+	// durably overwrites the intact higher one. That overwrite is what makes
+	// the regression survive a sender restart.
+	epochB, fileB := senderIncarnationAt(t, path, back)
+	if epochB != uint64(back) {
+		t.Fatalf("B: published=%d, want %d — refinement must decline to chain from the intact T", epochB, back)
+	}
+	if fileB != uint64(back) {
+		t.Fatalf("B: persisted=%d, want %d — the intact higher value must have been overwritten", fileB, back)
+	}
+
+	// --- SENDER 3: restarting B while the clock is still wrong does NOT recover.
+	epochB2, _ := senderIncarnationAt(t, path, back+int64(time.Second))
+	if epochB2 >= uint64(tNow) {
+		t.Fatalf("a sender restart at the same wrong clock published %d, which already clears floor %d; "+
+			"the premise of this test is that it does not", epochB2, tNow)
+	}
+
+	// --- RECEIVER: fresh process state, and the attacker's ARCHIVED A frame
+	// (epoch T) arrives BEFORE any live traffic.
+	e := newLatchEnv(t)
+	archived := e.captureIncarnation(0xA711, uint64(tNow), epochFramesPerIncarnation)
+	if !e.feed(archived[0]) {
+		t.Fatal("the archived frame was refused against fresh state; the premise of the sequence is that it is admitted")
+	}
+	if got := e.r.auth.peerEpochFloor(); got != uint64(tNow) {
+		t.Fatalf("floor = %d after ONE archived frame, want %d", got, tNow)
+	}
+
+	// The LIVE peer is now below a floor it never emitted. Every frame refused.
+	if admitted := feedCount(e, e.captureIncarnation(0xB711, epochB, epochFramesPerIncarnation)); admitted != 0 {
+		t.Fatalf("live peer: %d/%d frames admitted, want 0 — the archived frame must have locked it out",
+			admitted, epochFramesPerIncarnation)
+	}
+	// And its next genuine incarnation too, so this is not a within-incarnation
+	// artefact: a sender restart is not the escape.
+	if admitted := feedCount(e, e.captureIncarnation(0xB712, epochB2, epochFramesPerIncarnation)); admitted != 0 {
+		t.Fatalf("live peer after a SENDER restart: %d/%d frames admitted, want 0",
+			admitted, epochFramesPerIncarnation)
+	}
+
+	// --- THE WIDENING: a RECEIVER restart clears the floor, as documented...
+	e.restartDaemon()
+	if got := e.r.auth.peerEpochFloor(); got != 0 {
+		t.Fatalf("floor = %d after a receiver daemon restart, want 0", got)
+	}
+	// ...and the live peer WOULD be accepted in that window — the escape is real
+	// only while the attacker is not re-injecting. Assert it, so the next clause
+	// is a genuine contrast rather than a restatement.
+	if !e.feed(marshalHeartbeatAuthEpoch(samplePkt(), e.key, 0xB713, 1, epochB2)) {
+		t.Fatal("the live peer must be accepted against a genuinely cleared floor")
+	}
+
+	// ...but one re-injected archived frame re-poisons it, at one per restart.
+	e.restartDaemon()
+	if !e.feed(archived[1]) {
+		t.Fatal("the archived frame was refused after the receiver restart")
+	}
+	if got := e.r.auth.peerEpochFloor(); got != uint64(tNow) {
+		t.Fatalf("floor = %d after re-injection, want %d", got, tNow)
+	}
+	if admitted := feedCount(e, e.captureIncarnation(0xB714, epochB2, epochFramesPerIncarnation)); admitted != 0 {
+		t.Fatalf("live peer after receiver restart + re-injection: %d/%d admitted, want 0 — "+
+			"the restart escape must be defeated", admitted, epochFramesPerIncarnation)
+	}
+}
+
+// feedCount feeds every frame and reports how many were admitted.
+func feedCount(e *latchEnv, frames [][]byte) int {
+	e.t.Helper()
+	admitted := 0
+	for _, f := range frames {
+		if e.feed(f) {
+			admitted++
+		}
+	}
+	return admitted
+}
+
+// TestRotationDoesNotRetirePostRotationCaptures_6669 is the counterexample to
+// "a durable latch buys nothing the mandatory PSK rotation has not already
+// bought" — a claim the epochSeen field comment and README used to make.
+//
+// A PSK rotation retires every frame captured BEFORE it, because those frames
+// fail verifyHeartbeatMAC under the new key. It cannot retire a frame captured
+// AFTER it: that frame was signed with the key still in force, so it still
+// verifies. The whole run below happens under ONE key, which IS the post-
+// rotation key — modelling "the rotation already happened, and everything here
+// came after it".
+//
+// The sequence needs the peer to have run a build that SIGNS but emits no
+// epoch while holding the current key — rollback, replacement under the same
+// identity and key, or a partial upgrade. That precondition is the reason the
+// durable latch is still declined: in this very state a durable latch would
+// also be refusing the LIVE peer, so its benefit and its worst cost are the
+// same configuration. See the epochSeen field comment for the full pricing.
+//
+// This pins the CURRENT behaviour and the argument that rests on it, not a
+// desired behaviour.
+func TestRotationDoesNotRetirePostRotationCaptures_6669(t *testing.T) {
+	e := newLatchEnv(t)
+
+	// Post-rotation, the epoch-capable peer arms the latch under the new key.
+	const liveEpoch = uint64(9_600_000_000_000_000)
+	e.liveRun(e.captureIncarnation(0xC669, liveEpoch, epochFramesPerIncarnation),
+		"epoch-capable peer under the post-rotation key")
+	if !e.r.auth.peerEpochLatched() {
+		t.Fatal("an accepted epoch-bearing frame must arm the latch")
+	}
+
+	// The peer is rolled back under the SAME key to a signing-but-epochless
+	// build. Those frames are refused — and the attacker records them. This is
+	// the capture the rotation cannot retire, because it postdates the rotation.
+	postRotationCaptures := e.captureIncarnation(0xC66A, 0, epochFramesPerIncarnation)
+	if admitted := feedCount(e, postRotationCaptures); admitted != 0 {
+		t.Fatalf("rolled-back peer while latched: %d/%d admitted, want 0", admitted, epochFramesPerIncarnation)
+	}
+
+	// The peer goes silent and this daemon restarts: the process latch clears.
+	e.restartDaemon()
+	if e.r.auth.peerEpochLatched() {
+		t.Fatal("a daemon restart must clear the process-scoped latch")
+	}
+
+	// The post-rotation captures are admitted against the empty state. A
+	// durable, PSK-scoped latch would still be armed for this key and would
+	// refuse them — that is the benefit the rotation argument wrongly claimed
+	// was already bought.
+	admitted := feedCount(e, postRotationCaptures)
+	if admitted != epochFramesPerIncarnation {
+		t.Fatalf("post-rotation epoch-less captures after a restart: %d/%d admitted, want %d — "+
+			"the rotation cannot retire a capture taken after it",
+			admitted, epochFramesPerIncarnation, epochFramesPerIncarnation)
 	}
 }

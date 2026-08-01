@@ -29,12 +29,22 @@ import (
 //
 // The complete fix needs a total order the receiver can compare across peer
 // incarnations. Session ids are random and unordered, so the frame must carry
-// one: a per-daemon-incarnation BOOT EPOCH that strictly increases across
-// daemon restarts and reboots. The receiver keeps the highest epoch it has ever
+// one: a per-daemon-incarnation BOOT EPOCH that increases across daemon
+// restarts and reboots. The receiver keeps the highest epoch it has ever
 // accepted and rejects anything below it in O(1) state, BEFORE the session ring
 // is touched — so a retired incarnation can never be replayed once a newer one
 // has been seen, and a rejected frame never churns the ring (the bypass that
 // closed the earlier attempt in #6370).
+//
+// "INCREASES", NOT "STRICTLY INCREASES ACROSS RESTARTS" — the unqualified form
+// was in this comment and it is not what the sender guarantees. The seed is
+// max(persisted+1, wall clock), and the persisted term is BOUNDED: a value more
+// than bootEpochMaxSkew ahead of `now` is not chained from (see
+// refineBootEpoch). So a backward clock step larger than that bound regresses
+// this node's epoch even with the file perfectly intact, and refinement then
+// overwrites the file with the lower value. That is the #6711 residual, and it
+// is what keeps the receiver-side floor from being a total order in every
+// case — README residuals 3 and 5.
 //
 // TWO PROPERTIES MAKE THAT ACTUALLY CLOSE THE ATTACK, and both are easy to get
 // wrong:
@@ -445,8 +455,16 @@ func bootEpochSeed() uint64 {
 //
 // Consequently a hung disk, a blocking flock, or a wedged fsync cannot stop
 // this node emitting a valid epoch, and cannot make a latched peer see it as
-// epoch-less (and therefore dead). The residual is the double fault only:
-// storage that never completes AND a clock that stepped backwards.
+// epoch-less (and therefore dead).
+//
+// THE REMAINING REGRESSION IS NOT A DOUBLE FAULT, and an earlier revision of
+// this comment said it was ("storage that never completes AND a clock that
+// stepped backwards"). Storage failure is one way in; a SINGLE backward clock
+// step larger than bootEpochMaxSkew is another, with the file perfectly intact
+// and every write succeeding, because refineBootEpoch declines to chain from a
+// persisted value that far ahead of `now` — and then durably overwrites it with
+// the lower one, so a sender restart at the same wrong clock does not recover
+// either. That is #6711; README residual 3.
 func (m *Manager) heartbeatBootEpoch() uint64 {
 	if m == nil {
 		return 0

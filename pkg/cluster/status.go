@@ -793,10 +793,25 @@ func epochlessExposureNote(s HeartbeatStats) string {
 		// knows. An ARCHIVED epoch-bearing frame replayed after a restart arms
 		// the latch just as a live one does (README residual 5), so the latch
 		// can be armed while the peer currently on the wire is a rolled-back,
-		// epoch-less build being refused. What the operator can rely on is the
-		// consequence — epoch-less frames are refused from here on, so the count
-		// stops being live exposure — and that is what this says.
-		return "  (epoch-less frames now refused; count is historical)"
+		// epoch-less build being refused.
+		//
+		// AND IT REPORTS THE LATCH RATHER THAN ITS CONSEQUENCE, deliberately.
+		// An earlier revision said "epoch-less frames now refused", promoting
+		// the armed latch into a statement about what this node is enforcing
+		// RIGHT NOW. The latch does not survive that promotion, because it is
+		// not the last gate: heartbeatAuthDecision short-circuits to
+		// dual-accept whenever no local key is configured, and UpdateConfig
+		// clears controlAuthKey WITHOUT resetting hbAuth. So the reachable
+		// production sequence — load a legacy unkeyed config leniently, add the
+		// key under `commit confirmed`, accumulate an epoch-less count and arm
+		// the latch, then let the confirmation time out and restore the unkeyed
+		// config in the SAME daemon — leaves epochSeen true while every frame,
+		// epoch-less included, is admitted unverified. Measured: the note still
+		// read "now refused" while heartbeatAuthDecision returned accept=true.
+		//
+		// The latch being armed is a fact about this node's state; what it
+		// enforces depends on the live key. Report the fact.
+		return "  (downgrade latch armed; count is historical)"
 	}
 	return "  (peer not signing boot epochs - replay protection is ring-only; rotate the control-link PSK once both nodes are upgraded)"
 }

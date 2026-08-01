@@ -218,8 +218,11 @@ type Manager struct {
 	hbCounter   atomic.Uint64
 
 	// bootEpochOnce/bootEpoch/bootEpochReady hold this daemon incarnation's
-	// #6169 boot epoch: a persisted, strictly-increasing-across-restart counter
-	// carried in the signed heartbeat so the peer can order incarnations.
+	// #6169 boot epoch: a persisted, increasing-across-restart counter carried
+	// in the signed heartbeat so the peer can order incarnations. NOT strictly
+	// increasing in every case — the persisted term is bounded, so a backward
+	// clock step larger than bootEpochMaxSkew regresses it (#6711). See the
+	// header comment in heartbeat_epoch.go.
 	//
 	// bootEpoch is published SYNCHRONOUSLY from the wall clock on first use,
 	// before any file is touched, so it is never 0 for a node that has asked

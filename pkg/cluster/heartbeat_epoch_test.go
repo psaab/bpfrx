@@ -174,9 +174,12 @@ func TestHeartbeatBootEpochClosesSustainedReplay_6169(t *testing.T) {
 	})
 
 	// THE FIX. Same attack, same number of captured incarnations, but each
-	// incarnation now signs its own strictly-increasing boot epoch. Once the
-	// receiver has seen the newest incarnation, every captured retired one is
-	// below the floor and is rejected before it can touch the ring.
+	// incarnation now signs its own increasing boot epoch (strictly so here,
+	// where the epochs are constructed in order; the sender is not strictly
+	// increasing across a backward clock step larger than bootEpochMaxSkew —
+	// #6711). Once the receiver has seen the newest incarnation, every captured
+	// retired one is below the floor and is rejected before it can touch the
+	// ring.
 	t.Run("epoch_rejects_every_retired_incarnation", func(t *testing.T) {
 		e := newEpochEnv(t)
 		const n = heartbeatReplaySessions + 8 // comfortably past the churn threshold
@@ -454,10 +457,16 @@ func TestBootEpochMonotonic_6169(t *testing.T) {
 		}
 	})
 
-	// Restarts are STRICTLY increasing, including back-to-back ones. The
-	// wall-clock term is nanosecond-resolution so it is already unique across a
-	// process restart; a coarser seed would hand two incarnations starting in
-	// the same interval identical values.
+	// Restarts are STRICTLY increasing, including back-to-back ones, UNDER A
+	// MONOTONIC CLOCK — which is what this subtest runs (bootEpochIncarnation
+	// seeds from the real time.Now()). That scope is the whole claim: the
+	// persisted term is bounded, so a backward step larger than
+	// bootEpochMaxSkew regresses the epoch instead (#6711, and the
+	// value_beyond_the_forward_bound_is_not_chained_from subtest above). What
+	// is asserted here is that nothing ELSE breaks strictness — in particular
+	// that the wall-clock term is nanosecond-resolution and so already unique
+	// across a process restart, where a coarser seed would hand two
+	// incarnations starting in the same interval identical values.
 	t.Run("restarts_strictly_increase", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "ha-boot-epoch")
 		prev := uint64(0)
@@ -520,12 +529,23 @@ func TestBootEpochMonotonic_6169(t *testing.T) {
 	//	   needed.
 	//
 	// So the honest statement of the trade is: BOTH outcomes are lockouts, and
-	// the choice is between one that ends at the next restart and one that does
-	// not end at all. Chaining from an out-of-range value would strand this node
-	// permanently above the range its peer will ever accept, with no way back
-	// down; declining costs a lockout that any restart on either node clears.
-	// Recoverable beats unrecoverable — but it is not free, and it is not
-	// confined to a node that was already misconfigured.
+	// the choice is between one that is recoverable and one that is not.
+	// Chaining from an out-of-range value would strand this node permanently
+	// above the range its peer will ever accept, with no way back down.
+	//
+	// DECLINING IS STILL A LOCKOUT, AND NOT ONE THAT "ANY RESTART ON EITHER NODE
+	// CLEARS" — an earlier revision of this comment said that, and it is false
+	// in both directions. Restarting the SENDER while its clock is still T-2h
+	// does not clear it: step 3 above overwrote the file with T-2h, so the next
+	// incarnation re-publishes from the same bad clock and stays below floor T
+	// (measured in TestArchivedEpochPoisonsAFreshFloor_6711). Restarting the
+	// RECEIVER does clear the floor, but one archived frame from incarnation A
+	// re-raises it, at one re-injection per restart — the residual 5 shape
+	// applied to the floor instead of the latch. What actually recovers is
+	// fixing the clock (then restarting the sender), or rotating the PSK before
+	// the receiver restart. Recoverable still beats unrecoverable — but it is
+	// not free, it is not confined to a node that was already misconfigured, and
+	// it is not a one-command fix.
 	//
 	// The behavioural fix (carrying an intact persisted epoch across a larger
 	// backward step without reopening the unbounded-chain hazard) touches

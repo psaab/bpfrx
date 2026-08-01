@@ -684,10 +684,17 @@ type heartbeatAuthState struct {
 
 	// highEpoch is the #6169 across-reboot floor: the highest boot epoch ever
 	// accepted from the peer. It is O(1) state (one uint64) that gives the
-	// receiver a TOTAL ORDER over peer incarnations, which the session ring
-	// cannot provide — session ids are random and unordered, so the ring can
-	// only remember a bounded set of them and is churnable by replay once the
+	// receiver an ORDER over peer incarnations, which the session ring cannot
+	// provide — session ids are random and unordered, so the ring can only
+	// remember a bounded set of them and is churnable by replay once the
 	// attacker holds more captured sessions than it has slots.
+	//
+	// It is a total order over the VALUES, but it tracks incarnation RECENCY
+	// only while the sender is monotonic. A backward clock step larger than
+	// bootEpochMaxSkew regresses the sender's epoch (#6711), and from then on a
+	// captured OLDER frame carries the HIGHER value — so the floor can be raised
+	// above the live peer and lock it out. Do not read "total order" as a safety
+	// property; see TestArchivedEpochPoisonsAFreshFloor_6711.
 	//
 	// Anchored here (Manager lifetime, #5086/#6642) rather than on the
 	// heartbeatReceiver on purpose: a receiver-scoped floor is zeroed by every
@@ -748,22 +755,57 @@ type heartbeatAuthState struct {
 	//     PSK rotation across both nodes — the heavier procedure — even when
 	//     nothing is being replayed.
 	//
-	// And what it buys is already bought from the other side. The window is
-	// "restart while the genuine peer is silent AND an attacker holds
-	// pre-upgrade captures", and the post-upgrade PSK rotation this design
-	// already REQUIRES retires those captures outright: after it, there is
-	// nothing left to replay into the window, durable latch or not. Paying
-	// storage on the receive path and a heavier rollback procedure to
-	// re-close a window the mandatory rotation closes is not a good trade.
+	// WHAT IT BUYS IS NOT "ALREADY BOUGHT BY THE ROTATION". An earlier revision
+	// of this comment said it was, and that is false. The mandatory post-upgrade
+	// PSK rotation retires every capture made BEFORE it; it cannot retire one
+	// made AFTER it under the CURRENT key. Measured sequence: rotate K1->K2,
+	// let the epoch-capable peer arm the latch under K2, roll that peer back
+	// under K2 to a build that signs but emits no epoch, record the frames this
+	// receiver then refuses, let the peer go silent and restart this daemon —
+	// 5/5 of those POST-rotation K2 captures are admitted against the empty
+	// state (TestRotationDoesNotRetirePostRotationCaptures_6669). A durable
+	// K2-scoped latch would have refused them. So the design has to be declined
+	// on its own merits, and it still is:
 	//
-	// What process scope costs is narrow, because this state already lives on
-	// the Manager (#5086/#6642): a heartbeat restart, a DHCP-triggered VRF
-	// rebind and an HA comms restart all PRESERVE it. Only a full daemon
+	//   - IN THE STATE WHERE IT MATTERS MOST, ITS BENEFIT AND ITS WORST COST
+	//     ARE THE SAME CONFIGURATION. A signed epoch-less frame under the
+	//     current key can only exist if the peer held that key while running a
+	//     pre-#6169 build (the ALWAYS-EMIT invariant means a #6169+ build always
+	//     carries one, even under storage failure) — rollback, replacement under
+	//     the same identity and key, or a partial upgrade. While the peer is
+	//     still on that build, a durable latch refuses the attacker's captures
+	//     AND the LIVE peer, which is the "strictly worsens the no-attacker
+	//     rollback" cost above, not a separate one. It does not convert
+	//     protected into exposed; it makes an already-refused, already-alarmed
+	//     peer's liveness unforgeable while it is silent.
+	//   - WHERE THE LIVE PEER IS HEALTHY AGAIN, THE LATCH CLOSES A DOOR WITH
+	//     ANOTHER ONE OPEN BESIDE IT. The latch can only have armed under this
+	//     key because an epoch-BEARING frame was accepted under it, so an
+	//     attacker on-link at that moment holds one of those too — and against
+	//     the empty post-restart state an archived epoch-bearing frame is
+	//     admitted regardless of the latch (highEpoch is 0, the ring is empty;
+	//     TestArchivedEpochReplayReArmsLatchAfterRestart_6169). Only a durable
+	//     FLOOR closes that path, and the floor is the object with the
+	//     rollback-becomes-`rm` and lockout-outlives-reboot costs priced above.
+	//
+	// The genuinely NON-REDUNDANT residual is therefore one narrow corner: an
+	// attacker whose capture window sits strictly INSIDE the rollback window —
+	// so it holds epoch-less frames under this key but no epoch-bearing ones —
+	// against a peer that has since rolled forward and then gone silent, across
+	// a receiver daemon restart. That corner is REAL and is ACCEPTED, not
+	// closed and not explained away: paying a durable write on the accept path
+	// with no good failure policy, cross-process locking there, and a heavier
+	// procedure for every no-attacker rollback is not a good trade for it.
+	//
+	// What process scope costs is otherwise narrow, because this state already
+	// lives on the Manager (#5086/#6642): a heartbeat restart, a DHCP-triggered
+	// VRF rebind and an HA comms restart all PRESERVE it. Only a full daemon
 	// restart clears it, and a live peer re-arms it with its next heartbeat —
-	// one DefaultHeartbeatInterval, ~100ms. So the uncovered case needs a
-	// daemon restart AND a genuinely absent peer AND an attacker holding
-	// pre-upgrade captures; and rotating the control-link PSK, already a
-	// REQUIRED post-upgrade step, retires those captures outright.
+	// one DefaultHeartbeatInterval, ~100ms. So the uncovered case needs a daemon
+	// restart AND a genuinely absent peer AND an attacker holding usable
+	// captures. Rotating the control-link PSK retires everything captured before
+	// the rotation, which is what makes it the recovery step; it is not a
+	// prophylactic against captures taken after it.
 	//
 	// It also makes rollback recovery a restart, an operation operators already
 	// perform, instead of a documented rm.
@@ -823,8 +865,16 @@ type heartbeatAuthState struct {
 //     behaviour).
 //   - epoch > highEpoch — a genuinely NEWER incarnation. Let the ring vet the
 //     nonce, then raise the floor. The floor only ever rises to a value the
-//     genuine peer actually signed, so replaying a captured high-epoch frame
-//     cannot push the floor above the live peer and lock it out.
+//     genuine peer actually signed — but that does NOT mean it cannot rise
+//     above the live peer, and an earlier revision of this comment said it did.
+//     It rises above the LIVE peer whenever the peer's own epoch has REGRESSED
+//     since the archived frame was signed (#6711: a backward clock step larger
+//     than bootEpochMaxSkew makes refineBootEpoch decline the intact persisted
+//     value and durably overwrite it with the lower one). One archived frame
+//     then locks the live peer out, and because the archived frame re-raises a
+//     CLEARED floor exactly as it re-arms a cleared latch, a receiver restart
+//     does not recover while it is being replayed. Measured in
+//     TestArchivedEpochPoisonsAFreshFloor_6711.
 //
 // MIGRATION + THE DOWNGRADE LATCH (dual-accept, the #4126 VRRP-checksum /
 // heartbeatAuthDecision pattern).
@@ -886,8 +936,16 @@ type heartbeatAuthState struct {
 //     behaviour).
 //   - epoch > highEpoch — a genuinely NEWER incarnation. Let the ring vet the
 //     nonce, then raise the floor. The floor only ever rises to a value the
-//     genuine peer actually signed, so replaying a captured high-epoch frame
-//     cannot push the floor above the live peer and lock it out.
+//     genuine peer actually signed — but that does NOT mean it cannot rise
+//     above the live peer, and an earlier revision of this comment said it did.
+//     It rises above the LIVE peer whenever the peer's own epoch has REGRESSED
+//     since the archived frame was signed (#6711: a backward clock step larger
+//     than bootEpochMaxSkew makes refineBootEpoch decline the intact persisted
+//     value and durably overwrite it with the lower one). One archived frame
+//     then locks the live peer out, and because the archived frame re-raises a
+//     CLEARED floor exactly as it re-arms a cleared latch, a receiver restart
+//     does not recover while it is being replayed. Measured in
+//     TestArchivedEpochPoisonsAFreshFloor_6711.
 //
 // An epoch outside the ABSOLUTE plausibility band (epochUsableAsFloor: zero, or
 // beyond year 2200) is REFUSED. That check is clock-independent, so it is safe
@@ -1023,8 +1081,16 @@ func (s *heartbeatAuthState) peerEpochFloor() uint64 {
 	return s.highEpoch
 }
 
-// peerEpochLatched reports whether the peer has proved it emits boot epochs, so
-// an epochless frame from it is now refused. Diagnostics and tests only.
+// peerEpochLatched reports whether the peer has proved it emits boot epochs.
+// Diagnostics and tests only.
+//
+// IT IS A FACT ABOUT THIS STATE, NOT ABOUT CURRENT ENFORCEMENT, and callers
+// that render it must not promote it into one. admitAuthedLocked does refuse an
+// epochless frame while this is true — but it is not the outermost gate:
+// heartbeatAuthDecision short-circuits to dual-accept whenever no local key is
+// configured, and UpdateConfig clears the live key WITHOUT resetting hbAuth. So
+// "latched" and "epochless frames are being refused right now" come apart
+// whenever the PSK is removed from a running daemon. See epochlessExposureNote.
 func (s *heartbeatAuthState) peerEpochLatched() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
