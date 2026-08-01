@@ -1,20 +1,18 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v73 — r71 folds: Codex M1's class-2
-  synchronization rule (acquire-load before first Start-state
-  access; class-2 joins the blocked-Start overlap), Codex M2's
-  categorized partition (categories L lifecycle / F facade / G
-  ungated-Go-state + the escape-first precedence rule — total and
-  exclusive against the 157-method inventory; the `IsLoaded`
-  double-listing resolved; `Mode()`'s home corrected to
-  `userspace.Manager`), Codex M3's raw-helper nested-call rule
-  (class-3 composition preserves the pinned legacy error texts),
-  Codex m1's residual writer inventory (:534 + the honest
-  raw-`XDPLinks` hazard), Codex m2's `m.mu` comment sweep, SMR
-  r71 m1's attach-family placement with the arming-order
-  invariant; r71 verdicts: Codex PLAN-NEEDS-MAJOR (3M/2m — all in
-  A3's partition), AGY PLAN-READY, Claude SMR
-  PLAN-READY-WITH-NITS (0M/1m); pending convergence review r72
+- **Status**: DRAFT v74 — r72 folds: Codex M1's partition closure
+  (the three no-op stubs assigned; "touches" limited to DIRECT
+  access with the delegation rule; the matrix oracle honestly
+  scoped — AST enforces totality, runtime tests enforce outcomes,
+  the access audit carries correctness), Codex M2's `xdpEntryProg`
+  trio synchronization (a real Start-overlap race: the selector
+  write/write + status-read races — the field joins `m.mu`, the
+  trio joins the overlap set), Codex M3's detach reclassification
+  (category G — the neutral no-link nil path preserved), Codex
+  m1-m3 (`VlanSubInterfaces` race to §10; class-3 test-oracle
+  wording; the `ErrDataplaneNotArmed` declaration contract);
+  r72 verdicts: Codex PLAN-NEEDS-MAJOR (3M/3m), AGY PLAN-READY,
+  Claude SMR PLAN-READY; pending convergence review r73
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -3156,7 +3154,13 @@
   exclusive against the 157-method inventory; the class-3
   raw-helper nested-call rule; residual writer inventory
   + the honest XDPLinks hazard; the m.mu comment sweep;
-  the attach-family arming-order invariant).
+  the attach-family arming-order invariant). v74 (r72: the
+  no-op stubs assigned; direct-access + delegation rule; the
+  matrix oracle honestly scoped; the `xdpEntryProg` trio
+  synchronized (a real Start-overlap race found inside
+  category F); the detaches reclassified to category G;
+  the VlanSubInterfaces residual; test-oracle wording;
+  the ErrDataplaneNotArmed declaration contract).
 
 ---
 
@@ -3532,7 +3536,12 @@ class. The fold:
   the full 157-method inventory: apply.go 8, compiler.go 1, loader.go
   26, counters 11, fabric 8, filter 10, flow 2, mirror 2, NAT 30,
   policy 17, screen 8, session 18, stale 15, stats 1)**. Classification
-  is by the method's START-STATE access, in this precedence order
+  is by the method's DIRECT START-STATE access (r72 Codex M1 —
+  "touches" means DIRECT access; a method that only DELEGATES into
+  an already-classed internal is classed by that delegation target,
+  so L's `LoadUserspaceShim` populating `m.maps` inside the arming
+  path and F's `ApplyConfig` delegating to `Compile` do not collide
+  with the access predicates), in this precedence order
   (r71 Codex M2 — the precedence is what makes the classes disjoint):
   a method that ESCAPES a Start-state reference is class 4; else a
   method touching Start-state with required pre-error Go-side side
@@ -3542,12 +3551,23 @@ class. The fold:
   `m.mu`-protected Go state are category G; lifecycle and facade
   methods are categories L/F. The §9 matrix test assigns every
   exported method to exactly one class via a generated AST inventory
-  AND asserts the precedence rule's disjointness — an unassigned,
-  double-assigned, or misclassed method fails the test.
+  — an unassigned or double-assigned method fails the test. The
+  oracle split is stated honestly (r72 Codex M1): the AST manifest
+  enforces TOTALITY mechanically; the per-class OUTCOMES are
+  enforced by the runtime tests (the blocked-Start overlap drives
+  ALL entries per class, not representatives); each label's
+  CORRECTNESS (escaping-reference / side-effect / neutral-outcome
+  properties) comes from the handwritten access audit reviewed in
+  the PR — the matrix cannot prove semantic disjointness, and the
+  plan no longer claims it can.
   - **Class 1 — fallible map-required methods, no required pre-gate
     side effects** (e.g. `maps_fabric.go` `UpdateRGActive` :38,
-    `UpdateFabricFwd` :30): acquire-load `m.loaded` BEFORE THE FIRST
-    Start-state access; pre-arm return the typed `ErrDataplaneNotArmed`.
+    `UpdateFabricFwd` :30; the attach family `AttachXDP`/`AttachTC` —
+    NOT the detaches, r72 Codex M3): acquire-load `m.loaded` BEFORE THE FIRST
+    Start-state access; pre-arm return the typed `ErrDataplaneNotArmed`
+    — contract specified (r72 Codex m3): declared in `pkg/dataplane`
+    as `var ErrDataplaneNotArmed = errors.New("dataplane not armed")`,
+    wrapped with `%w` at each gate site, `errors.Is`-compatible.
     Pure validation that touches NO Start-populated state may precede
     the gate (r70 Codex m1 — `AddTxPort` validates the ifindex at
     `loader.go:982-991` before any map access, and
@@ -3612,12 +3632,14 @@ class. The fold:
     `Load` (retired sentinel), `LoadUserspaceShim`, `Start`,
     `CompileUserspaceShim`, `Close`, `Teardown` — the arming/teardown
     path itself, ungated BY CONSTRUCTION (they define armedness; the
-    attach family `AttachXDP`/`DetachXDP`/`AttachTC`/`DetachTC` is
-    class 1 with the ARMING-ORDER invariant, SMR r71 m1: the arm
-    path's attach runs strictly post-Store(true) — `LoadUserspaceShim`
-    never attaches; the attach flow is CompileUserspaceShim-driven,
-    post-Load — and the §9 matrix's pre-arm `AttachXDP` assertion
-    doubles as the reorder tripwire).
+    attach flow runs strictly post-Store(true), SMR r71 m1 —
+    `LoadUserspaceShim` never attaches; the attach flow is
+    CompileUserspaceShim-driven, post-Load — and the §9 matrix's
+    pre-arm attach assertion doubles as the reorder tripwire). The
+    retired-path no-op stubs `StartFIBSync`/`NotifyLinkCycle`/
+    `SyncFabricState` (`maps_fabric.go:72-76` — r72 Codex M1's three
+    unassigned methods) touch NO shared state and join category L
+    as documented no-ops.
   - **Category F — facade/domain accessors**: `Link`, `HA`,
     `Sessions`, `SessionDeltas`, `Telemetry`, `ApplyConfig`,
     `LastApplyResult`, `LastCompileResult`, `XDPEntryProgram`,
@@ -3640,13 +3662,29 @@ class. The fold:
     root Manager — the v72 text's placement is corrected here.
     `GetPersistentNAT` (:1146 — `New()`-allocated at :89-100 with its
     own `sync.RWMutex`, `persistent_nat.go:51-65`; pre-Start
-    test-pinned at `server_show_nat_test.go:15-20`) and
-    `XDPLinks`/`TCLinks` (:1195/:1199 — `New()`-created,
-    attach-mutated post-arm) are category G/F respectively by their
-    state; the `XDPLinks` raw-map hazard is named honestly (r71 Codex
-    m1): the 1 Hz status path ranges it at `maps_sync.go:943` while
-    Compile can mutate it before taking the userspace `m.mu` —
-    pre-existing, not worsened by PR-1, §10.
+    test-pinned at `server_show_nat_test.go:15-20`),
+    `XDPLinks`/`TCLinks` (:1195/:1199 — `New()`-created), AND the
+    detaches (r72 Codex M3: `DetachXDP` :639 / `DetachTC` :1131 read
+    only the construction-created link maps and return nil on the
+    empty map — a class-1 typed error would BREAK that preserved
+    neutral path) are category G; the `XDPLinks` raw-map hazard is
+    named honestly (r71 Codex m1): the 1 Hz status path ranges it at
+    `maps_sync.go:943` while Compile can mutate it before taking the
+    userspace `m.mu` — pre-existing, not worsened by PR-1, §10.
+  - **The `xdpEntryProg` trio SYNCHRONIZED (r72 Codex M2 — a real
+    Start-overlap race inside category F as written):
+    `XDPEntryProgram`/`SelectUserspaceXDPShimEntryProgram`/
+    `UsingUserspaceXDPShimEntryProgram` (`loader.go:105-120`) read/
+    write the plain `m.xdpEntryProg` field with no synchronization —
+    `LoadUserspaceShim` writes it during Start (`:154`, before the
+    `:164` Store), a recovered-rollback Compile calls the selector
+    pre-`m.mu` (RACE-3's window), and the 1 Hz status path reads it
+    (`maps_sync.go:481`, `:947`). v74: the field joins the
+    `m.mu`-protected set (all three accessors lock; one write per
+    load + 1 Hz reads — noise), the trio joins the §9 blocked-Start
+    overlap set, and the `loader.go:49` `m.mu` comment names it.
+    This closes the selector write/write + status-read races — the
+    last piece of the RACE-3 L2 closure.
 - **`loaded` mechanics**: `atomic.Bool` (:36 declaration; `:164`
   Store(true) — already the LAST step of the load, sequenced after
   all map population; `:458`, `:490`, `:1082` become Load; the
@@ -4316,10 +4354,14 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    pause-after-write would order the readers and need not trigger
    `-race`: (i) `TestManager_ArmedGate_BlockedStart` — class-1/class-4
    calls during the held window return `ErrDataplaneNotArmed`/nil,
-   class-2 calls return their exact neutral values (r71 Codex M1 —
-   class-2 joins the overlap: a nonconcurrent matrix cannot
-   distinguish a correct neutral gate from today's ungated lookup),
-   class-3 calls succeed via the `m.mu` path, no fatal fault; (ii)
+   class-2 calls — ALL 22 named entries, not representatives (r72
+   Codex) — return their exact neutral values (r71 Codex M1 — a
+   nonconcurrent matrix cannot distinguish a correct neutral gate
+   from today's ungated lookup), class-3 calls perform their pinned
+   side effects AND return their pinned outcomes (success OR the
+   legacy later error — r72 Codex m2 wording correction), and the
+   synchronized `xdpEntryProg` trio joins the overlap set (r72
+   Codex M2); no fatal fault; (ii)
    `TestManager_PreArmMethodMatrix` — every exported `*Manager`
    method is ASSIGNED to exactly one v73 class/category by the
    generated AST inventory, with the precedence rule's DISJOINTNESS
@@ -4386,7 +4428,12 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
   close-in-use as unsafe (`map.go:273`). The related raw-`XDPLinks`
   exposure is named honestly (r71 Codex m1): the 1 Hz status path
   ranges it at `maps_sync.go:943` while Compile can mutate it before
-  taking the userspace `m.mu` — pre-existing, not worsened by PR-1. Full lifecycle exclusion
+  taking the userspace `m.mu` — pre-existing, not worsened by PR-1.
+  The adjacent exported `VlanSubInterfaces` Go-map race joins it
+  (r72 Codex m1): the status helper reads it at `maps_sync.go:950`
+  while `CompileUserspaceShim` writes it (`loader.go:201`) before
+  acquiring the userspace `m.mu` (`manager_compile.go:213`) —
+  pre-existing, not worsened by PR-1. Full lifecycle exclusion
   (lease/refcount + drain) is a dataplane-lifecycle redesign — a
   follow-up candidate, NOT #2114. PR-1's A3 adoption of the
   `Close()`-entry Store(false) narrows the entrant window but
@@ -4805,18 +4852,21 @@ Still open:
    PLAN-READY when all three verdicts gate the PR-1 design as
    ready.
 
-7. **r68-r71 resolution (for the record)**: Codex r68 M1 (armed-state
+7. **r68-r72 resolution (for the record)**: Codex r68 M1 (armed-state
    admission gate) folded as work item A3; r69 M1/M2 falsified v70's
    universal form; r70 M1 falsified v71's four-class partition; r71
-   M1-M3 falsified v72's outcome-only class-2 (no synchronization
-   rule), its incomplete/non-exclusive partition (the 157-method
-   inventory), and its nested-call composition — v73 carries the
-   categorized partition (classes 1-4 + categories L/F/G + the
-   escape-first precedence rule), class-2's acquire-load rule with
-   the blocked-Start overlap, and the class-3 raw-helper composition
-   rule. Each reviewer: verify the v73 partition against the full
-   exported method set, the precedence rule's disjointness, and the
-   raw-helper preservation of the pinned legacy error texts.
+   M1-M3 falsified v72's outcome-only class-2, its incomplete/
+   non-exclusive partition, and its nested-call composition; r72
+   M1-M3 falsified v73's remaining gaps (three unassigned no-op
+   stubs; L/F overlap without the direct-access limitation; the
+   unsynchronized `xdpEntryProg` trio — a real Start-overlap race;
+   the misclassified detaches). v74 carries the closure: direct-
+   access + delegation classification, the honestly-scoped matrix
+   oracle, the synchronized trio, the category-G detaches, and the
+   full residual inventory. Each reviewer: verify the v74 partition
+   against the full exported method set ONE more time (totality is
+   now mechanically enforced), the trio's `m.mu` synchronization,
+   and the detach neutral path preservation.
 
 ---
 
