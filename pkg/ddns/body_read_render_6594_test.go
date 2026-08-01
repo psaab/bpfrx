@@ -212,3 +212,27 @@ func TestBoundedChainStillClassifies(t *testing.T) {
 			"withholding errors it should be classifying", got, transportEOF)
 	}
 }
+
+// nilFanoutError returns N nil children from Unwrap() []error. The budget used
+// to charge only for non-nil children, because walk(nil) returns immediately
+// without spending any — so a root handing back maxUnwrapDepth+1 nil slots
+// passed the guard, after which every stdlib traversal scanned that fanout.
+// Fanout is work whether or not the slot is nil.
+type nilFanoutError struct{ n int }
+
+func (*nilFanoutError) Error() string { return "fanout" }
+func (e *nilFanoutError) Unwrap() []error {
+	return make([]error, e.n)
+}
+
+func TestNilFanoutSpendsBudget(t *testing.T) {
+	if errTreeWithinBound(&nilFanoutError{n: maxUnwrapDepth + 1}) {
+		t.Error("a root with maxUnwrapDepth+1 NIL children passed the budget; nil " +
+			"slots must be charged or the stdlib still scans an unbounded fanout")
+	}
+	// NEGATIVE CONTROL: an ordinary small fanout must still be accepted, so the
+	// per-slot charge cannot pass by rejecting every multi-error.
+	if !errTreeWithinBound(&nilFanoutError{n: 3}) {
+		t.Error("a 3-slot nil fanout was rejected; the per-slot charge is over-broad")
+	}
+}

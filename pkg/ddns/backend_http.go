@@ -681,6 +681,19 @@ func errTreeWithinBound(err error) bool {
 				e = u.Unwrap()
 			case interface{ Unwrap() []error }:
 				for _, sub := range u.Unwrap() {
+					// Charge for the SLOT, not just for a non-nil child.
+					// walk(nil) returns immediately without spending budget, so
+					// a root handing back maxUnwrapDepth+1 nil children used to
+					// pass the guard and then make every stdlib traversal scan
+					// that fanout. Fanout is work whether or not the entry is
+					// nil.
+					if budget <= 0 {
+						return false
+					}
+					budget--
+					if sub == nil {
+						continue
+					}
 					if !walk(sub) {
 						return false
 					}
