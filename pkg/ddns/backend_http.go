@@ -100,22 +100,28 @@ const (
 // buys is a bounded CHARACTER SET on a provider-supplied host: a zone id, raw
 // non-ASCII, or anything that is not a plain reg-name is withheld.
 //
-// It does NOT bound the CONTENT, and the difference matters enough to state
-// here rather than leave a reader to infer it. A provider answering
-// `Location: https://<our-own-password>.evil.example/` gets the hop refused —
-// that is the guard doing its job — but `<password>.evil.example` is a
-// well-formed reg-name, so the refusal message renders it verbatim and the
-// credential reaches the daemon log. scrubURLError records the same residual
-// for the general case, but its justification does NOT carry over to this one:
-// it argues such a name is already in every resolver query and TLS
-// ClientHello, which holds for an operator's own `%p`-expanded template and is
-// false for a REFUSED redirect target — CheckRedirect aborts before any dial,
-// so that host is never resolved and never sent anywhere.
+// The grammar does NOT bound the CONTENT, only the character set — and that is
+// why the refused TARGET is no longer rendered at all. A provider answering
+// `Location: https://<our-own-password>.evil.example/` gets the hop refused,
+// but `<password>.evil.example` is a well-formed reg-name, so naming it printed
+// the credential into the daemon log. The general-case justification in
+// scrubURLError — that such a name is already in every resolver query and TLS
+// ClientHello — is FALSE here: CheckRedirect aborts before any dial, so a
+// refused target is never resolved and never sent anywhere.
 //
-// So this is a real residual, not a closed case. Closing it needs the refusal
-// to render a provider-supplied host by reference (a hop index, a hash) rather
-// than by name; the tests here cover only the zone-id and non-ASCII shapes,
-// which is exactly what the grammar genuinely stops.
+// It also broke deduplication, which is what forced the fix rather than another
+// paragraph of disclosure. The daemon keys a never-pruned, process-lifetime
+// sync.Map on the rendered string to warn once per (provider, error); a
+// provider redirecting to per-request hostnames therefore minted a fresh key
+// and a fresh WARN every 30s reconcile tick, forever. Exactly the unbounded
+// growth the body-read scrub was added to stop, on the OTHER of doRequest's two
+// adjacent error returns.
+//
+// So Error() now names only the FROM host (our configured endpoint, stable) and
+// describes the target by class. scrubURLErrorAt additionally suppresses its own
+// target render when the chain carries a refusal, because net/http sets
+// url.Error.URL to the provider's Location — without that, the same
+// provider-chosen value came out twice.
 type redirectRefusal struct {
 	reason redirectReason
 	from   *url.URL // previous hop; nil for the hop cap
@@ -131,14 +137,21 @@ func (r *redirectRefusal) Error() string {
 	case redirectReasonHopCap:
 		return fmt.Sprintf("ddns http: stopped after %d redirects", maxRedirects)
 	case redirectReasonDowngrade:
+		// r.to is PROVIDER-CHOSEN and therefore varies per request; r.from is
+		// our configured endpoint and is stable. Rendering r.to broke the
+		// daemon's once-per-(provider,error) dedup: a provider redirecting to
+		// per-request hostnames minted a fresh key in a never-pruned map on
+		// every 30s tick. The scheme is a closed two-value grammar, so it is
+		// safe and useful; the host is neither.
 		return "ddns http: refusing HTTPS->" + refusalScheme(r.to) +
-			" redirect downgrade to " + refusalHost(r.to) +
-			" (would expose update credentials in cleartext)"
+			" redirect downgrade from " + refusalHost(r.from) +
+			" to a provider-supplied host (would expose update credentials in " +
+			"cleartext)"
 	case redirectReasonCrossHost:
 		return "ddns http: refusing cross-host redirect from " + refusalHost(r.from) +
-			" to " + refusalHost(r.to) +
-			" (would disclose the update credentials and payload to a host that is not " +
-			"the configured endpoint); point the provider endpoint at the final host instead"
+			" to a provider-supplied host that is not the configured endpoint " +
+			"(would disclose the update credentials and payload); point the " +
+			"provider endpoint at the final host instead"
 	}
 	return errRedirectRefused.Error()
 }
@@ -729,6 +742,15 @@ func scrubURLErrorAt(err error, depth int) string {
 	var ue *url.Error
 	if !errors.As(err, &ue) {
 		return scrubInnerErrorAt(err, depth+1)
+	}
+	// A REFUSED REDIRECT is the one case where ue.URL is not ours: net/http
+	// sets it to the Location the provider chose, so rendering it as the
+	// "target" publishes a provider-controlled host — and did so a second time,
+	// since the refusal prose named it too. Two renders of a per-request value
+	// is what broke the dedup this package's own body-read fix exists to
+	// protect. Render the refusal alone; it already names the stable FROM host.
+	if r := findRedirectRefusal(err); r != nil {
+		return r.Error()
 	}
 	u, perr := url.Parse(ue.URL)
 	if perr != nil {

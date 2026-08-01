@@ -741,7 +741,12 @@ func TestScrubInnerErrorKeepsRecognisedDiagnostics(t *testing.T) {
 			reason: redirectReasonCrossHost,
 			from:   mustParseURL(t, "https://prov.example/a"),
 			to:     mustParseURL(t, "https://evil.example/b"),
-		}, "refusing cross-host redirect from prov.example to evil.example"},
+			// The TARGET is deliberately NOT named. It is provider-chosen, so
+			// rendering it both leaked a credential-shaped reg-name and varied
+			// per request, breaking the daemon's once-per-(provider,error)
+			// dedup on a never-pruned map. The FROM host is our configured
+			// endpoint and is stable, so it stays.
+		}, "refusing cross-host redirect from prov.example to a provider-supplied host"},
 		{"our own refusal, wrapped by the http client", fmt.Errorf("wrapped: %w",
 			&redirectRefusal{reason: redirectReasonHopCap}), "stopped after 10 redirects"},
 	} {
@@ -786,12 +791,19 @@ func TestGuardRedirectRefusalBoundsProviderSuppliedHost(t *testing.T) {
 		wantOut  string // must NOT appear
 		wantIn   string // must appear
 	}{
+		// wantIn is now the STABLE part of the refusal — the reason and our own
+		// endpoint — never the refused target. Round 14 stopped rendering the
+		// target at all: the grammar bounded its character SET but not its
+		// CONTENT, so a well-formed reg-name like `<password>.evil.example`
+		// came out verbatim, and being provider-chosen it also varied per
+		// request and defeated the daemon's dedup. Asserting its ABSENCE is a
+		// strictly stronger guard than asserting it was character-bounded.
 		{"zone id in a cross-host Location",
-			"https://[fe80::1%25" + hostSentinel + "]/next", hostSentinel, "[fe80::1]"},
+			"https://[fe80::1%25" + hostSentinel + "]/next", "fe80::1", "provider-supplied host"},
 		{"non-ascii bytes in a cross-host Location",
-			"https://ex%FFample.com/next", "\xff", "withheld"},
+			"https://ex%FFample.com/next", "example.com", "provider-supplied host"},
 		{"downgrade to a zoned host",
-			"http://[fe80::1%25" + hostSentinel + "]/next", hostSentinel, "cleartext"},
+			"http://[fe80::1%25" + hostSentinel + "]/next", "fe80::1", "cleartext"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			next := httptest.NewRequest(http.MethodGet, tc.location, nil)

@@ -193,11 +193,28 @@ func TestSelfUnwrappingErrorTerminates(t *testing.T) {
 // enough to matter must also be withheld rather than walked, since the budget
 // cannot tell the two apart and should not try.
 func TestDeepUnwrapChainTerminates(t *testing.T) {
-	var err error = errors.New("leaf")
+	// VACUITY TRAP, found in review: asserting only that a deep chain renders
+	// transportWithheld proves nothing, because that is ALSO
+	// classifyTransportError's ordinary fallback for an unrecognised error. With
+	// errTreeWithinBound removed from both entry points this test still passed —
+	// it just walked the whole 10k chain first and fell through to the same
+	// string.
+	//
+	// So the leaf is a RECOGNISED error. A bounded walk must refuse the tree and
+	// return withheld; an UNBOUNDED walk reaches io.ErrUnexpectedEOF and returns
+	// transportEOF. The two outcomes are now distinguishable, which is what makes
+	// this bind.
+	var err error = io.ErrUnexpectedEOF
 	for i := 0; i < 10_000; i++ {
 		err = fmt.Errorf("wrap %d: %w", i, err)
 	}
-	if got := scrubInnerError(err); got != string(transportWithheld) {
+	got := scrubInnerError(err)
+	if got == string(transportEOF) {
+		t.Fatalf("deep chain classified as %q: the traversal was NOT bounded — it "+
+			"walked 10k frames to the recognised leaf. The bound must refuse the "+
+			"tree before any errors.Is/As sees it.", got)
+	}
+	if got != string(transportWithheld) {
 		t.Errorf("deep chain: scrubInnerError = %q, want %q", got, transportWithheld)
 	}
 }
@@ -234,5 +251,47 @@ func TestNilFanoutSpendsBudget(t *testing.T) {
 	// per-slot charge cannot pass by rejecting every multi-error.
 	if !errTreeWithinBound(&nilFanoutError{n: 3}) {
 		t.Error("a 3-slot nil fanout was rejected; the per-slot charge is over-broad")
+	}
+}
+
+// TestRefusedRedirectRendersStablyAcrossHosts is the MAJOR from round 14, and
+// the fourth instance of the same shape in this file's history: doRequest has
+// two error returns four lines apart, and hardening one left the other
+// producing a per-request string.
+//
+// A refused cross-host redirect used to render the provider-chosen Location
+// TWICE — once as scrubURLError's target (net/http sets url.Error.URL to the
+// Location) and once inside the refusal prose. The daemon keys a never-pruned,
+// process-lifetime sync.Map on that string to warn once per (provider, error),
+// so a provider redirecting to per-request hostnames minted a fresh key and a
+// fresh WARN every 30s tick, forever. No adversary needed: a provider 30x-ing
+// to per-request edge hostnames does it by accident.
+func TestRefusedRedirectRendersStablyAcrossHosts(t *testing.T) {
+	const secret = "SUPERSECRET"
+	renders := make(map[string]struct{})
+	for i := 0; i < 5; i++ {
+		to := fmt.Sprintf("https://h%d.%s.evil.example/x", i, secret)
+		refusal := &redirectRefusal{
+			reason: redirectReasonCrossHost,
+			from:   mustParseURL(t, "https://prov.example/upd"),
+			to:     mustParseURL(t, to),
+		}
+		// Exactly the shape net/http produces: the refusal wrapped in a
+		// *url.Error whose URL is the refused Location.
+		got := scrubURLError(&url.Error{Op: "Get", URL: to, Err: refusal})
+		if strings.Contains(got, secret) {
+			t.Fatalf("refused redirect leaked the credential-shaped host: %s", got)
+		}
+		renders[got] = struct{}{}
+	}
+	if len(renders) != 1 {
+		keys := make([]string, 0, len(renders))
+		for k := range renders {
+			keys = append(keys, k)
+		}
+		t.Fatalf("five refused redirects to DIFFERENT provider hosts produced %d "+
+			"distinct rendered strings, want 1. The daemon keys a never-pruned "+
+			"sync.Map on this text, so each distinct string is a permanent entry "+
+			"and a fresh WARN every 30s tick:\n%s", len(renders), strings.Join(keys, "\n"))
 	}
 }
