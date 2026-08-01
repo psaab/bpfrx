@@ -176,6 +176,9 @@ reviewer (joins at /engineer on the code PR).
 | r57 | Codex | codex companion task-msa9tymi-t2gw2w (session 019fbd05-a7e8-75b0-a313-3f8dcd345406) | RULING ROUND: (A) — with the verified M4/M5 live-state safety argument (defeats (B)-pure). Folds 3/3 FOLDED. Structure confirmed |
 | r57 | AGY | agy print-mode direct (agy-plan-r57.md) | RULING ROUND: (B) — "none found" unsafe. Structure confirmed |
 | r57 | Claude SMR | in-conversation (claude-smr-plan-r57.md) | RULING ROUND: (B), revised to the HYBRID on Codex's verified M4/M5 evidence. Structure confirmed |
+| r58 | Codex | codex companion task-msab180x-ai3rrk (session 019fbd24-7763-74d0-9173-3bb499a5de2f) | NEEDS-REVISION (4 MAJOR, 1 MINOR; folds 2 PARTIAL / 2 NOT-FOLDED / 1 PARTIAL). Structure confirmed |
+| r58 | AGY | agy print-mode direct (agy-plan-r58.md) | PLAN-READY (5/5 folds FOLDED; 4 attacks FAILED; no findings). Structure confirmed |
+| r58 | Claude SMR | in-conversation (claude-smr-plan-r58.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — acceptance residual enumeration). Structure confirmed |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 

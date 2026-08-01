@@ -1,14 +1,10 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v58 — the r57 HYBRID ruling folded (Codex
-  ruled (A); AGY ruled (B); SMR ruled (B) and revised to the
-  hybrid on Codex's verified M4/M5 evidence: the live-state
-  classes — the rollback fork and the OnXSKBound stale
-  closure — are closed BY CONSTRUCTION because the digest net
-  cannot see kernel state; the config-text-visible classes are
-  named bounded residuals with detection-and-recovery; the
-  apply-level ACK is the named follow-up); pending
-  convergence review r58
+- **Status**: DRAFT v59 — r58 findings folded (Codex NEEDS-REVISION
+  4M/1m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m
+  — the acceptance residual enumeration, folded here; all
+  three confirm the §4.7 structure); pending convergence
+  review r59
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -2589,6 +2585,57 @@
   leaves live-state holes (Codex's M4/M5); (A) alone keeps
   folding digest-visible classes that the detection net
   already covers.
+  v59: r58 convergence — the dual-primary live-forwarding
+  false green is closed, the callback becomes lifecycle-total
+  and outcome-truthful, the queued-waiter window is published,
+  and the M6 contradiction is resolved by serialization (Codex
+  NEEDS-REVISION 4M/1m, folds 2 PARTIAL / 2 NOT-FOLDED /
+  1 PARTIAL, structure confirmed; AGY PLAN-READY 5/5 with 4
+  fresh attacks FAILED, structure confirmed; SMR
+  PLAN-READY-WITH-NITS 0M/1m — the acceptance residual
+  enumeration, folded here): (a) THE COMPLEMENTARY-AUTHORITY
+  CHECK (Codex M1, verified the live-state false green: a
+  receiver-primary rejection during dual-primary leaves BOTH
+  nodes holding fully-applied intended text — every digest
+  and apply-health field green — while BOTH primary
+  transitions enable live forwarding, `daemon_ha.go:273-325`,
+  `daemon_ha_sync.go:545-548`): the terminal verification
+  requires the RG0 election SETTLED with EXACTLY ONE primary
+  matching the intended mastership, read on the cluster
+  status surface, in both copies. (b) THE CALLBACK IS
+  LIFECYCLE-TOTAL AND OUTCOME-TRUTHFUL (Codex M2, both halves
+  verified: shutdown can release applySem before the detached
+  callback runs, `daemon_run_shutdown.go:50-64,214-230`; and
+  `ensureFabricIPVLAN` ignores the parent-up failure, returns
+  nil after void address reconciliation, and only logs
+  several failures, `daemon_ha_fabric.go:29-50,78-88,115-147`):
+  the callback re-checks the work-item-G `stopping` fence
+  AFTER acquiring applySem and abandons on it, and its
+  fire-time work reports its outcome INTO the arm's
+  registration — a creation/reconciliation failure retires
+  the arm FAILED, never converged. (c) THE QUEUED STATE IS
+  PUBLISHED AT ENQUEUE (Codex M3, verified the queued-waiter
+  window: a DHCP lease change precedes its applyConfig's
+  semaphore wait, and the reapply is required to rebuild the
+  address-scoped host-inbound enforcement,
+  `daemon_dhcp.go:73-90,231-260` — so after the holder
+  publishes SUCCESS and before the waiter acquires, every
+  field could read green over stale enforcement): an apply
+  attempt publishes QUEUED (not converged) at enqueue, BEFORE
+  the semaphore wait. (d) THE M6 CONTRADICTION IS RESOLVED BY
+  SERIALIZATION (Codex M4, verified the v58 fold both
+  deferred and required the single-retoken transaction, and
+  the false-green interleave: an arm self-registering between
+  the manager snapshot and the supersession could be
+  discarded, its completion then ignored — work live with the
+  predicate green): registration, completion, AND the
+  mint-boundary supersession ALL serialize through the
+  manager's `m.mu` — the transaction is part of the plan; the
+  residual (vi) stands only for the deeper cross-incarnation
+  precision follow-up. (e) §9 gains the hybrid-closure legs
+  (Codex m1): the rollback-fork legs and the stale-callback
+  legs; and the acceptance copy's residual enumeration gains
+  (iv)-(vi) plus the authority check (SMR m1).
 
 ---
 
@@ -5274,7 +5321,16 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   state-dependent reapply keeps ActiveApplied true while the
   failure count moves) —
   with the disabled-sync subclass's MANUAL re-convergence
-  performed first where it fired —
+  performed first where it fired — AND the
+  COMPLEMENTARY-AUTHORITY check (r58 Codex M1, verified the
+  live-state false green: a receiver-primary rejection during
+  dual-primary leaves BOTH nodes holding fully-applied
+  intended text — every digest and apply-health field green —
+  while BOTH primary transitions enable live forwarding,
+  `daemon_ha.go:273-325`, `daemon_ha_sync.go:545-548`): the
+  post-restart verification requires the RG0 election SETTLED
+  with EXACTLY ONE primary, matching the intended mastership
+  (read on the cluster status surface) —
   before the repair is declared done; and ONLY THEN the
   operator RE-ACTIVATES `event-options` — ON BOTH NODES, each
   commit's own success required, EXACTLY mirroring the quiesce
@@ -6403,7 +6459,21 @@ v20 history). The delivery is TWO units:
   registration set AND re-registers every still-relevant
   manager debt under the new token (the daemon queries the
   manager's outstanding debt state at the mint boundary), so
-  the predicate evaluates exactly the current attempt's arms; the signal reads CONVERGED
+  the predicate evaluates exactly the current attempt's arms;
+  and the supersession is SERIALIZED, not deferred (r58 Codex
+  M4, verified the v58 contradiction — the residual called the
+  single-retoken transaction a follow-up while §5.1 promised
+  atomic supersession — and the false-green interleave: an arm
+  self-registering between the manager snapshot and the
+  supersession could be discarded, its completion then
+  ignored, leaving work live with the predicate green,
+  `process_status.go:150-198`, `maps_sync.go:451-456`):
+  registration, completion, AND the mint-boundary
+  supersession ALL serialize through the manager's `m.mu`, so
+  no registration can interleave between the debt snapshot
+  and the supersession — the transaction is part of the plan,
+  and the residual (vi) stands only for the deeper
+  cross-incarnation precision follow-up; the signal reads CONVERGED
   only when the pipeline AND every arm's completion carry the
   CURRENT attempt token; and the state machine distinguishes
   CONVERGED / PENDING / FAILED — a PENDING arm does NOT
@@ -6595,7 +6665,20 @@ v20 history). The delivery is TWO units:
   deferred-overlay set from the CURRENT config, abandoning if
   the state it was installed for no longer stands — so a
   stale closure is a no-op by construction, with the §9
-  stale-callback leg.
+  stale-callback leg; AND the callback is lifecycle-total and
+  outcome-truthful (r58 Codex M2, both halves verified: (a)
+  shutdown can release applySem before the detached callback
+  runs, `daemon_run_shutdown.go:50-64,214-230` — so the
+  callback re-checks the work-item-G `stopping` fence AFTER
+  acquiring applySem and abandons on it, never mutating live
+  state during teardown; (b) `ensureFabricIPVLAN` itself
+  ignores the parent-up failure, returns nil after void
+  address reconciliation, and only logs several
+  address/MTU/up failures, `daemon_ha_fabric.go:29-50,78-88,
+  115-147` — so the callback's fire-time work reports its
+  outcome INTO the arm's registration: a creation or
+  reconciliation failure retires the arm as FAILED, never as
+  converged).
   The counter is
   independent of generation numbers and epoch resets
   (`sync_conn_gen.go:340-362`); exposed read-only on the cluster
@@ -7933,8 +8016,14 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      the candidate explicitly discarded) on BOTH nodes (r46
      Codex M2b — `store_commit.go:796-800`,
      `store_lock.go:334-338`, `store_command.go:304-334`) —
+     AND the RG0 election SETTLED with exactly ONE primary
+     matching the intended mastership (r58 Codex M1's
+     dual-primary live-forwarding false green,
+     `daemon_ha.go:273-325`, `daemon_ha_sync.go:545-548`) —
      before the repair is declared
-     done; and ONLY THEN the operator RE-ACTIVATES
+     done; and the residual enumeration includes the r58
+     hybrid residuals (iv)-(vi) per the normative fence
+     section (r58 SMR m1's copy alignment); and ONLY THEN the operator RE-ACTIVATES
      `event-options` — ON BOTH NODES, each commit's own success
      required, EXACTLY mirroring the quiesce (r49 Codex M2:
      with ConfigSync=false one commit cannot update the peer,
@@ -8044,6 +8133,15 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      and the re-drive overwrites it) and the MARKER-NO-OP
      REJECTION leg (a no-op pass never ticks ConfigsSent, so no
      runbook step may wait on a tick);
+     (h2k) the HYBRID-CLOSURE legs (r58 Codex m1): the
+     ROLLBACK-FORK legs (every rollback branch publishes its
+     NEUTRAL/SUCCESS/FAILURE outcome — a failed rollback's
+     session-clear failure never reads green) and the
+     STALE-CALLBACK legs (a stale OnXSKBound closure takes
+     applySem, re-derives from the current config, and
+     abandons on mismatch AND on the `stopping` fence — never
+     mutating during teardown — and a fire-time
+     creation/reconciliation failure retires the arm FAILED);
      (h2j) the v56-MECHANISM legs (r56 Codex M8): the OLD/NEW
      OnXSKBound CALLBACK INTERLEAVE (the manager's atomic
      install/register/already-bound operation can neither
