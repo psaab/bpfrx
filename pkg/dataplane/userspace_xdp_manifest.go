@@ -95,9 +95,16 @@ type shimManifestEntry struct {
 }
 
 type shimFreshnessManifest struct {
-	Comment string              `json:"_comment"`
-	Object  shimManifestEntry   `json:"object"`
-	Inputs  []shimManifestEntry `json:"inputs"`
+	Comment string            `json:"_comment"`
+	Object  shimManifestEntry `json:"object"`
+	// ShimFacts are the object's SELF-REPORTED compile-time values
+	// (#4555), read back out of the object via ReadShimFactsFromObject
+	// rather than modelled from the shim's source. Recording them here
+	// makes them travel with the artifact: a consumer of a prebuilt
+	// object (the Debian packaging path never compiles the shim crate)
+	// checks the same numbers the generator measured.
+	ShimFacts *ShimFacts          `json:"shim_facts"`
+	Inputs    []shimManifestEntry `json:"inputs"`
 }
 
 // userspaceXDPFreshnessInputPaths returns the sorted, repo-relative set
@@ -173,10 +180,16 @@ func ComputeUserspaceXDPManifest(repoRoot string) (*shimFreshnessManifest, error
 		entries = append(entries, shimManifestEntry{Path: rel, SHA256: h})
 	}
 
+	facts, err := ReadShimFactsFromObject(objAbs)
+	if err != nil {
+		return nil, fmt.Errorf("read emitted shim facts (#4555): %w", err)
+	}
+
 	return &shimFreshnessManifest{
-		Comment: userspaceXDPManifestComment,
-		Object:  shimManifestEntry{Path: userspaceXDPObjectRelPath, SHA256: objHash},
-		Inputs:  entries,
+		Comment:   userspaceXDPManifestComment,
+		Object:    shimManifestEntry{Path: userspaceXDPObjectRelPath, SHA256: objHash},
+		ShimFacts: facts,
+		Inputs:    entries,
 	}, nil
 }
 

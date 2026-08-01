@@ -1,3 +1,79 @@
+## 2026-08-01 — #4555 round 3: stop modelling the shim, have it EMIT its facts
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Round-3 review returned three MAJORs. All three converge on
+  one answer, and the answer is to invert the dependency rather than
+  refine the model a sixth time.
+
+  **MAJOR 1 — the FIFTH leak, to the most innocuous edit yet.** The
+  round-2 struct-layout resolver split fields on commas and skipped any
+  fragment starting with `//`, so a COMMENT above a field hid the field
+  with it: `identification: u32,` / `// Reserved...` / `pad: u8,` makes
+  the packed FragHdr nine bytes and the resolver returned 8. Reproduced
+  firsthand: both guard and control reported ok.
+
+  **MAJOR 2 — the override collapsed into ordinary success.** An
+  overridden run returned exit 0, identical to a measured PASS, and the
+  recipe's `0) ;;` arm installed it silently. The stale-variable note was
+  stderr-only, so exit 5 worked right up until someone had the variable
+  exported.
+
+  **MAJOR 3 — the const assert never runs on the packaging path.**
+  `debian/rules` runs `make build`, and the daemon embeds the tracked
+  object via `//go:embed`; the shim crate is never compiled, so a
+  compile-time assertion is a generation-time check, not a guard on the
+  shipped artifact.
+
+  The guard had now leaked five times — substring on arithmetic, a
+  statement outside the match, a symbolic `size_of`, and a comment —
+  each to a more ordinary edit. Every fix was a better model, and a
+  better model is still a model. So `userspace-xdp` now EMITS its
+  resolved facts: `XPF_SHIM_FACTS`, a `#[used]` static whose fields
+  rustc const-evaluates from the real types and the real classifier
+  (`MAX_EXT_HDRS`, `size_of::<FragHdr>()`, and a 256-entry class table
+  produced by the same `eh_class` const fn the walk now dispatches on).
+  `make generate` reads it back out of the object with `debug/elf`
+  (`ReadShimFactsFromObject`) into the manifest's `shim_facts` block, and
+  the parity test compares userspace's MEASURED behaviour against those
+  numbers. Deleted with the model: the arm-body literals, the token
+  normaliser, the match-arm splitter, the loop-body pin and
+  `resolve_packed_struct_size`.
+
+  Two things were measured before committing to the design, not assumed.
+  The emitted static survives bpf-linker into its own
+  `.rodata.XPF_SHIM_FACTS` section and is readable from Go; and driving
+  the walk from `eh_class` costs ZERO verifier budget — 947,188 insns
+  before and after, headroom 5.28% unchanged. That is what made this a
+  small change rather than one worth splitting into its own PR.
+
+  MAJOR 3 dissolves: the facts travel with the artifact, so a consumer of
+  a prebuilt object checks the numbers the generator measured. MAJOR 2:
+  an overridden run now exits 6, never 0, with its own recipe arm — the
+  distinction is machine-readable without parsing stderr.
+
+  **Residual, stated rather than papered over:** the walk's exit
+  semantics (exhaustion straight into `parse_l4`, no post-loop over-limit
+  check) is a shape, not a value. Any number the shim exported for it
+  would be an assertion about its own semantics rather than a
+  measurement, which is the modelling being removed.
+  `shim_walk_exits_by_exhaustion` keeps a narrow source check for that
+  one property and says so.
+
+  Validation: `make generate` PASS, headroom 5.28%. Nine-row matrix in
+  three parts — end-to-end (mutate shim, regenerate, guard reds on real
+  emitted facts), fact-comparison (perturb one emitted value in the
+  manifest; each of max_ext_hdrs / frag_hdr_size / one class byte /
+  a missing shim_facts block reds), and a FragHdr layout row which is
+  refused by the VERIFIER gate before it can be installed (its changed
+  arithmetic blows the 1M cap). Control green in all rows.
+- **File(s)**: userspace-xdp/src/lib.rs,
+  userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  pkg/dataplane/userspace_xdp_facts.go,
+  pkg/dataplane/userspace_xdp_manifest.go, cmd/shimverify/main.go,
+  pkg/dataplane/build-userspace-xdp.sh, pkg/dataplane/README.md,
+  pkg/dataplane/userspace_xdp_manifest.json,
+  pkg/dataplane/userspace_xdp_bpfel.o, _Log.md
+
 ## 2026-08-01 — #4555 round 2: two Codex MAJORs (symbolic-size hole, fail-open headroom gate)
 
 - **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)

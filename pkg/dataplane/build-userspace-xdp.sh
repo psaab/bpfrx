@@ -138,6 +138,13 @@ VERIFY_RC=$?
 set -e
 case "${VERIFY_RC}" in
 0) ;;
+6)
+	# #4555: the headroom gate was OVERRIDDEN. Install (the operator asked
+	# for it) but never silently: a distinct code exists so this is
+	# distinguishable from a measured PASS without reading stderr.
+	echo "build-userspace-xdp.sh: WARNING: installing ${OUT_FILE} with the #4555 headroom gate
+  OVERRIDDEN via XPF_SHIM_ALLOW_LOW_HEADROOM=1. See the shimverify banner above for which
+  condition was suppressed. This object ships without a satisfied headroom check." >&2 ;;
 99)
 	fail "cannot run the BPF verifier gate (need root or passwordless sudo).
   The candidate object was built at:

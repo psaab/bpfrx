@@ -34,8 +34,17 @@
 // env var away from unblocking, but installing an unmeasured object now
 // requires someone to say so.
 //
-// Exit codes: 0 PASS, 2 usage, 3 verifier REJECT, 4 loads but headroom
-// below the floor, 5 loads but headroom could not be measured, 1 other
+// An OVERRIDDEN run gets its OWN exit code (6), never 0. Returning 0
+// collapsed "measured and comfortably above the floor" into "we could not
+// check, and someone had the variable exported", which a non-interactive
+// caller cannot tell apart — and the recipe's `0) ;;` arm installed both
+// without comment. 6 still INSTALLS (the override means the operator
+// accepted the risk) but it is visible to the recipe, to CI, and in the
+// manifest without anyone parsing stderr.
+//
+// Exit codes: 0 PASS (measured, above the floor), 2 usage, 3 verifier
+// REJECT, 4 loads but headroom below the floor, 5 loads but headroom could
+// not be measured, 6 loads and INSTALLS with the gate overridden, 1 other
 // error (including insufficient privileges).
 package main
 
@@ -67,11 +76,11 @@ func main() {
 
 	if !stats.Measured() {
 		if overridden {
-			fmt.Printf("PASS %s (headroom UNMEASURED)\n", path)
+			fmt.Printf("OVERRIDDEN %s (headroom UNMEASURED)\n", path)
 			announceOverrideConsumed(path,
 				"this kernel's verifier log carried no \"processed N insns (limit M)\" line, "+
 					"so the floor could not be applied at all")
-			return
+			os.Exit(6)
 		}
 		fmt.Printf("UNMEASURED-HEADROOM %s\n", path)
 		fmt.Fprintf(os.Stderr,
@@ -95,12 +104,12 @@ func main() {
 
 	if headroom < dataplane.UserspaceShimMinVerifierHeadroomPct {
 		if overridden {
-			fmt.Printf("PASS %s (%s)\n", path, summary)
+			fmt.Printf("OVERRIDDEN %s (%s)\n", path, summary)
 			announceOverrideConsumed(path, fmt.Sprintf(
 				"headroom %.2f%% is below the floor of %.1f%%; the next change to the shim's "+
 					"hot parsing paths may not fit",
 				headroom, dataplane.UserspaceShimMinVerifierHeadroomPct))
-			return
+			os.Exit(6)
 		}
 		fmt.Printf("LOW-HEADROOM %s (%s)\n", path, summary)
 		fmt.Fprintf(os.Stderr,

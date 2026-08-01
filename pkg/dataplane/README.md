@@ -217,9 +217,13 @@ Guard layers (`build-userspace-xdp.sh`):
    (`LogLevelStats` → `processed N insns (limit M)`) and refuses a
    candidate that LOADS but leaves less than
    `UserspaceShimMinVerifierHeadroomPct` (3%) unused.
-   - **Exit codes**: `0` PASS, `3` verifier REJECT, `4` loads but below
-     the floor, `5` loads but headroom could NOT be measured, `2` usage,
-     `1` other. The recipe has an arm for each.
+   - **Exit codes**: `0` PASS (measured, above the floor), `3` verifier
+     REJECT, `4` loads but below the floor, `5` loads but headroom could
+     NOT be measured, `6` loads and INSTALLS with the gate overridden,
+     `2` usage, `1` other. The recipe has an arm for each. An overridden
+     run gets its own code rather than `0`, so a non-interactive caller
+     can tell "measured and comfortably clear" from "we could not check,
+     and someone had the variable exported" without parsing stderr.
    - **Unmeasurable is a failure, deliberately.** If the running kernel's
      log carries no recognisable stats line the floor cannot be applied,
      and passing there would switch the gate off at the one moment
@@ -422,13 +426,42 @@ behaved and how userspace-dp classifies the same chain. On the userspace
 side `meta.protocol` feeds NAT64 translation and L4 checksum recomputation
 (`frame/mod.rs`), so walk agreement matters well beyond telemetry.
 
-`tests_shim_ext_parity.rs` in userspace-dp fails on drift in either the
-resolvable chain length or the walked type set. Because it models the shim
-from source rather than executing it (the shim is `no_std`, built for
-`bpfel-unknown-none`), it pins the loop header, requires the loop body to
-contain nothing but the `match protocol` block, and compares each arm body
-by whitespace-normalised token equality — a substring test let an altered
-advance, or a prepended `if opt[1] == 0 { break; }`, pass green.
+**How parity is enforced: the shim EMITS its facts (#4555).** The shim
+cannot be executed by userspace-dp's tests — it is `no_std`, built for
+`bpfel-unknown-none`. Four successive guards MODELLED it from source text
+and every one leaked to a more ordinary edit: a substring test on the
+advance arithmetic accepted an added `+ 8`; it also accepted a prepended
+`if opt[1] == 0 { break; }` (which rejects the ordinary 8-byte
+HbH/DestOpt); pinning whole arm bodies still ignored a statement inside the
+loop but outside the `match`; pinning the TEXT `size_of::<FragHdr>()` did
+not pin its VALUE; and the struct-layout resolver written to fix that
+skipped a field hidden behind a COMMENT.
+
+So the dependency is inverted. `userspace-xdp` emits
+`XPF_SHIM_FACTS` — a `#[used]` static whose fields rustc const-evaluates
+from the real types and the real classifier: `MAX_EXT_HDRS`,
+`size_of::<FragHdr>()`, and a 256-entry table produced by the same
+`eh_class` function the walk dispatches on. It lands in its own
+`.rodata.XPF_SHIM_FACTS` section, costs **zero** verifier budget (measured:
+947,188 insns with and without it), and `make generate` reads it back out
+of the object (`ReadShimFactsFromObject`) into the `shim_facts` block of
+`userspace_xdp_manifest.json`. `tests_shim_ext_parity.rs` compares
+userspace's MEASURED behaviour against those numbers. There is no parser,
+no arm-body literal and no layout resolver left to defeat.
+
+This also fixes a scope gap a compile-time assertion could not: an
+assertion in the shim only runs when the shim crate is COMPILED, which the
+Debian packaging path never does (`debian/rules` runs `make build`, and the
+daemon embeds the tracked `.o`). Facts recorded in the manifest travel with
+the artifact and are checkable wherever a prebuilt object is consumed.
+
+**Residual, stated:** one property is still not emitted — that the shim's
+loop exits by EXHAUSTION into `parse_l4` with no post-loop over-limit
+check, which is what makes it resolve `MAX_EXT_HDRS` headers. That is a
+shape, not a value; any number the shim exported for it would be an
+assertion about its own semantics rather than a measurement.
+`shim_walk_exits_by_exhaustion` keeps a narrow source check for exactly
+that one property.
 
 ## SR-IOV / driver constraints
 

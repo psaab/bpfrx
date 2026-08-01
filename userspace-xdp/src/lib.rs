@@ -429,6 +429,67 @@ const _: () = assert!(
      userspace-dp's walk_ipv6_ext_chain advances a literal 8"
 );
 
+const EH_CLASS_TERMINAL: u8 = 0;
+const EH_CLASS_GENERIC: u8 = 1;
+const EH_CLASS_AUTH: u8 = 2;
+const EH_CLASS_FRAGMENT: u8 = 3;
+const EH_CLASS_NONEXT: u8 = 4;
+
+#[inline(always)]
+const fn eh_class(protocol: u8) -> u8 {
+    match protocol {
+        NEXTHDR_HOP
+        | NEXTHDR_ROUTING
+        | NEXTHDR_DEST
+        | NEXTHDR_MOBILITY
+        | NEXTHDR_HIP
+        | NEXTHDR_SHIM6
+        | NEXTHDR_EXP1
+        | NEXTHDR_EXP2 => EH_CLASS_GENERIC,
+        NEXTHDR_AUTH => EH_CLASS_AUTH,
+        NEXTHDR_FRAGMENT => EH_CLASS_FRAGMENT,
+        NEXTHDR_NONE => EH_CLASS_NONEXT,
+        _ => EH_CLASS_TERMINAL,
+    }
+}
+
+const fn eh_class_table() -> [u8; 256] {
+    let mut table = [EH_CLASS_TERMINAL; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        table[i] = eh_class(i as u8);
+        i += 1;
+    }
+    table
+}
+
+#[repr(C)]
+struct ShimFacts {
+    magic: u32,
+    version: u32,
+    max_ext_hdrs: u32,
+    frag_hdr_size: u32,
+    eh_classes: [u8; 256],
+}
+
+// Deliberately NOT in `.rodata`: cilium/ebpf surfaces `.rodata*` sections
+// as internal MAPS, so the facts would be created in the kernel on every
+// load and would have to be added to the retained-collection allowlist.
+// These are BUILD-TIME metadata read out of the ELF by `make generate`;
+// the BPF programs never touch them. A section the loader does not
+// recognise keeps them out of the collection entirely — zero runtime
+// cost, no map, no allowlist entry.
+#[unsafe(link_section = ".xpf_shim_facts")]
+#[unsafe(no_mangle)]
+#[used]
+static XPF_SHIM_FACTS: ShimFacts = ShimFacts {
+    magic: 0x5850_4646,
+    version: 1,
+    max_ext_hdrs: MAX_EXT_HDRS as u32,
+    frag_hdr_size: mem::size_of::<FragHdr>() as u32,
+    eh_classes: eh_class_table(),
+};
+
 #[map(name = "userspace_ctrl")]
 static USERSPACE_CTRL: Array<UserspaceCtrl> = Array::with_max_entries(1, 0);
 
@@ -1370,15 +1431,8 @@ fn parse_ipv6(
     let mut offset = l3_offset.checked_add(mem::size_of::<Ipv6Hdr>() as u16)?;
 
     for _ in 0..MAX_EXT_HDRS {
-        match protocol {
-            NEXTHDR_HOP
-            | NEXTHDR_ROUTING
-            | NEXTHDR_DEST
-            | NEXTHDR_MOBILITY
-            | NEXTHDR_HIP
-            | NEXTHDR_SHIM6
-            | NEXTHDR_EXP1
-            | NEXTHDR_EXP2 => {
+        match eh_class(protocol) {
+            EH_CLASS_GENERIC => {
                 let opt = read_bytes(data, data_end, offset as usize, 2)?;
                 protocol = opt[0];
                 offset = offset.checked_add(((opt[1] as u16) + 1) * 8)?;
@@ -1389,7 +1443,7 @@ fn parse_ipv6(
                     (offset - l3_offset) as usize,
                 )?;
             }
-            NEXTHDR_AUTH => {
+            EH_CLASS_AUTH => {
                 let opt = read_bytes(data, data_end, offset as usize, 2)?;
                 protocol = opt[0];
                 offset = offset.checked_add(((opt[1] as u16) + 2) * 4)?;
@@ -1400,12 +1454,11 @@ fn parse_ipv6(
                     (offset - l3_offset) as usize,
                 )?;
             }
-            NEXTHDR_FRAGMENT => {
+            EH_CLASS_FRAGMENT => {
                 let frag = read_bytes(data, data_end, offset as usize, 8)?;
                 protocol = frag[0];
                 offset = offset.checked_add(mem::size_of::<FragHdr>() as u16)?;
             }
-            NEXTHDR_NONE => break,
             _ => break,
         }
     }
