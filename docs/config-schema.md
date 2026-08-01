@@ -1279,10 +1279,13 @@ regardless of the predicate. A developer adds the statement, checks the packed
 spelling, sees green, and ships the fold bug. **Modelling another program's
 source text is the wrong tool for keeping two things in step; derive both from
 one table instead.** Registering a statement the ordinary way is now correct by
-construction; compiling one WITHOUT registering it is still possible, but it
-means adding ad-hoc dispatch beside a five-line loop whose only other content is
-the table lookup — a visible deviation rather than the idiomatic path it used to
-be. It must also pick the right offset
+construction, which closes two of the three routes above outright — a
+named-constant KEY registers exactly like a literal one, and no switch remains
+to nest another inside. The third is demoted, not eliminated: compiling a
+statement WITHOUT registering it still folds it, but that now means ad-hoc
+dispatch beside a five-line loop whose only other content is the table lookup —
+obvious in review, where adding a `case` to an existing switch was the
+idiomatic act and diverged silently. It must also pick the right offset
 for the shape it is handed: `namedInstances` returns EITHER the
 `redundancy-group <id>` node itself (`Keys[0]` is the keyword, body starts at
 `Keys[2]`) OR, for a bare `redundancy-group { ... }` wrapper, a child whose

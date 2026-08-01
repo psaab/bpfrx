@@ -2196,12 +2196,24 @@ func redundancyGroupBody(rgNode *Node) []*Node {
 // table removes the divergence by construction instead.
 //
 // Adding a statement means adding an entry here, which registers it with the
-// splitter in the same edit. Note what that does and does NOT guarantee: the
-// invariant is "all dispatch goes through this table", and the table being the
-// only dispatch path present is what makes the correct thing the easy thing —
-// it is not enforced. Compiling a statement from ad-hoc code beside the lookup
-// instead of from an entry here re-opens the fold bug exactly as before
-// (verified, not assumed).
+// splitter in the same edit.
+//
+// Be precise about what that does and does not guarantee, because an overstated
+// invariant is how the next person concludes they need not think about it. The
+// invariant is "ALL dispatch goes through this table", and it is made natural
+// rather than enforced. Two of the three routes above are now closed by
+// construction: a named-constant KEY registers exactly like a literal one, and
+// there is no switch left to nest another inside. The third is not. Compiling a
+// statement from ad-hoc code beside the lookup — without an entry here — still
+// re-opens the fold bug (verified, not assumed).
+//
+// What changed for that third route is which act is the natural one. With the
+// switch, adding a `case` WAS the idiomatic way to add a statement, and it
+// diverged silently. Now the idiomatic way is a table entry, which is correct by
+// construction, and diverging means putting ad-hoc dispatch beside a five-line
+// loop whose only other content is this lookup — obvious in review rather than
+// invisible. Demoted, not eliminated; Go offers no construct that would
+// eliminate it.
 var redundancyGroupStatements = map[string]func(rg *RedundancyGroup, child *Node){
 	"node":                 compileRGNodePriority,
 	"gratuitous-arp-count": compileRGGratuitousARPCount,

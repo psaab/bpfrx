@@ -1,3 +1,20 @@
+## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
+- **Action**: Round 6b corrected the overstated invariant but left the comment
+  merely accurate, not useful: it said the invariant is not enforced without
+  saying WHY the table is still worth having. Reviewer asked for the fuller
+  characterization in the comment itself. Now states, in the artifact that
+  ships: two of the three routes are closed BY CONSTRUCTION (a named-constant
+  KEY registers exactly like a literal one; no switch remains to nest another
+  inside), the third is demoted not eliminated, and what changed for it is which
+  act is natural — adding a `case` used to be the idiomatic way to add a
+  statement and diverged silently, whereas diverging now means ad-hoc dispatch
+  beside a five-line loop whose only other content is the table lookup.
+  docs/config-schema.md carried the same qualification without saying which
+  routes close; matched.
+- **File(s)**: `pkg/config/compiler_system.go`, `docs/config-schema.md`, `_Log.md`
+
 ## 2026-08-01 — #6588 round 6b: correct an overstated invariant in the table comment
 
 - **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
