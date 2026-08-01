@@ -73639,3 +73639,22 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   result was read.
 - **File(s)**: pkg/cluster/heartbeat_wiring_binders_6669_test.go,
   pkg/cluster/heartbeat_epoch.go, pkg/cluster/README.md, _Log.md
+- **Timestamp**: 2026-08-02 07:05
+- **Action**: #6673 F1 MAJOR — restore last-sibling-wins for static-NAT `match
+  destination-address`. #6659's widening changed the scalar `rule.Match` from
+  `nodeVal(m)` (assigned per sibling child, LAST wins) to `MatchAddresses[0]`
+  (FIRST wins). Invisible for the BRACKET form — one node, values on
+  Keys[1:]/Children, both selections agree — which is why every test the widening
+  shipped with stayed green. The REPEATED-`set` form makes two sibling nodes and
+  is the shape that flipped; it had zero coverage. Measured myself end-to-end
+  through buildStaticNATSnapshots on the tolerant path: ExternalIP
+  "198.51.100.1/32" (correct) vs "192.0.2.1/32" (regressed) — matching the
+  reviewer's figures. Restored `rule.Match = nodeVal(m)` alongside the
+  accumulation, so the #6659 widening (both prefixes read, neither escaping
+  validation) is kept. New test drives the repeated-set shape through
+  CompileConfigLenient AND a Format()/FormatSet() round trip, since the tolerant
+  path is reached by re-loading a persisted config. RED-on-revert: build rc=0,
+  vet rc=0 under the mutation, both new tests red with real `--- FAIL:` lines,
+  and ZERO non-6673 static-NAT failures.
+- **File(s)**: pkg/config/compiler_nat_static.go,
+  pkg/dataplane/userspace/static_nat_repeated_match_6673_test.go, _Log.md

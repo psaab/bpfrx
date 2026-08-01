@@ -741,16 +741,36 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 						// ValidateIPPrefix — a malformed prefix in any slot but
 						// the first committed clean.
 						//
-						// Match keeps the first element (unchanged dataplane
-						// lowering: StaticNATRuleSnapshot.ExternalIP is a single
-						// address). A genuinely multi-valued list is REJECTED at
-						// strict commit by
-						// validateStaticNATMatchAddressesStrict rather than
-						// silently collapsing — see MatchAddresses.
+						// Match keeps LAST-SIBLING-WINS, which is what this
+						// compiler did before #6659 and what the tolerant load
+						// path still depends on. Do not "simplify" it to
+						// MatchAddresses[0].
+						//
+						// The two differ only for the REPEATED-set shape, which
+						// is precisely the shape that had no coverage. Two
+						// sibling `destination-address` nodes give
+						// MatchAddresses = [first, second]; nodeVal per child
+						// leaves Match = second, while MatchAddresses[0] leaves
+						// it = first. Measured end-to-end through
+						// buildStaticNATSnapshots via Store.Load +
+						// CompileConfigLenient, taking [0] flipped ExternalIP
+						// from 198.51.100.1/32 to 192.0.2.1/32 — the published
+						// service silently stops being translated and an
+						// address that was never a NAT target starts DNAT'ing.
+						// tree.Format() renders both lines verbatim, so the
+						// divergence round-trips through persistence.
+						//
+						// For the BRACKET shape the two agree (one node, values
+						// on Keys[1:]/Children), which is why every existing
+						// test stayed green.
+						//
+						// A genuinely multi-valued list is REJECTED at strict
+						// commit by validateStaticNATMatchAddressesStrict rather
+						// than silently collapsing — see MatchAddresses. The
+						// tolerant path has no such gate, so it must keep the
+						// historical selection.
 						rule.MatchAddresses = append(rule.MatchAddresses, firewallMatchValues(m)...)
-						if len(rule.MatchAddresses) > 0 {
-							rule.Match = rule.MatchAddresses[0]
-						}
+						rule.Match = nodeVal(m)
 					case "source-address":
 						// #3435 (M02): support bracket / repeated lists
 						// (`source-address [ a b c ]`) — the schema declares
