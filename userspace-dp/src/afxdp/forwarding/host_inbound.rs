@@ -142,7 +142,7 @@ const KNOWN_SYSTEM_SERVICE_TOKENS: &[&str] = &[
     // PLATFORM-DEFAULT port (explicit YANG `default` statements), and
     // lsselfping carries a STANDARDS-ASSIGNED one (RFC 7746, udp/8503). The
     // rest are listed in HOST_INBOUND_UNPORTED_SERVICES below: recognized, but
-    // no admit tuple, because Junos fixes no port for them.
+    // no admit tuple, because xpf has no authoritative port to admit for them.
     "r2cp",
     "reverse-ssh",
     "reverse-telnet",
@@ -170,14 +170,15 @@ const KNOWN_SYSTEM_SERVICE_TOKENS: &[&str] = &[
 /// with the Go set (the #3486 parity test guards this).
 const HOST_INBOUND_NON_JUNOS_SERVICES: &[&str] = &["gre", "r-exec", "rexec"];
 
-/// Recognized JUNOS `system-services` tokens with NO platform-fixed listening
-/// port — the Rust mirror of the Go SSOT
+/// Recognized JUNOS `system-services` tokens xpf has no authoritative listening
+/// tuple to admit for — the Rust mirror of the Go SSOT
 /// config.HostInboundUnportedSystemServices (#3226 fold). Unlike
 /// HOST_INBOUND_NON_JUNOS_SERVICES these are NOT xpf extensions: they are in
 /// Juniper's published schema, so they stay recognized and stay in the
-/// `system-services all` union. They simply contribute NO admit tuple, because
-/// Junos fixes no port for them — the port is operator-configured, derived from
-/// another stanza, or never published.
+/// `system-services all` union. They simply contribute NO admit tuple: for rpm
+/// and r2cp Junos documents the port as operator-chosen, and for the rest xpf
+/// could not find an authoritative one. Those are DIFFERENT statements and the
+/// Go set records which applies per token.
 ///
 /// This is a deliberate CHOICE under uncertainty, not an inference. For each of
 /// these tokens xpf looked for an authoritative host-inbound listening tuple and
@@ -404,9 +405,9 @@ fn classify_system_service(token: &str, hi: &mut ZoneHostInbound) {
         "lsselfping" => {
             hi.udp_ports.insert(8503);
         }
-        // #3226 fold — recognized Junos services with NO platform-fixed port
-        // (HOST_INBOUND_UNPORTED_SERVICES). This arm must stay EMPTY: Junos
-        // fixes no port for them, so any value inserted here would be a guess
+        // #3226 fold — recognized Junos services with no authoritative tuple
+        // (HOST_INBOUND_UNPORTED_SERVICES). This arm must stay EMPTY: xpf has no
+        // authoritative port for them, so any value inserted here would be a guess
         // that opens an unused port while still denying the one in use. They
         // remain recognized (a valid vSRX stanza must commit, #3200) and remain
         // in the `all` union, contributing nothing. Mirror of the

@@ -62541,3 +62541,54 @@ break — `go vet` confirmed passing under every revert.
   per-arm mutation proofs (Go and Rust separately) in a throwaway detached
   worktree — including the exact case Codex showed passing: deleting a token from
   the vendored oracle now REDs.
+
+## 2026-07-31 — #3226 fold r5: withdraw the lo0 escape hatch (nft accept is not terminal for the hook)
+
+- **Timestamp**: 2026-07-31
+- **Action**: Fold the third Codex MAJOR round on PR #6616.
+- **Blocking finding — the r4 "kernel path only" qualification was still false.**
+  r4 reasoned that because `xpf_lo0` is hook-input priority 0 and
+  `xpf_hostinbound` is 10, an lo0 `accept` terminates before the host-inbound
+  backstop. The priorities are right; the inference is wrong. In nftables
+  `accept` ends the current BASE CHAIN, not the hook — nftables(8): "An accept
+  verdict ... ends the evaluation of the current base chain. ... The packet
+  advances to the next base chain", whereas only `drop` "immediately ends the
+  evaluation of the whole ruleset". Verified the wording firsthand against the
+  netfilter manpage. So the packet still traverses xpf_hostinbound at priority 10
+  and still hits its catch-all drop: an lo0 filter rescues NOTHING on EITHER
+  surface. Chose to WITHDRAW the remedy rather than narrow it again — the
+  alternative (a mark set in xpf_lo0 and tested in xpf_hostinbound, or merging
+  the chains) is a new security mechanism that lets an lo0 filter override the
+  zone host-inbound default-deny, needs its own threat review, and would STILL
+  not help on AF_XDP without reordering #3485.
+  - The string assertion that pinned the false statement is replaced by
+    (a) a NEGATIVE guard that the refuted remedy is ABSENT, and (b) a
+    BEHAVIOURAL bind that the remedy the advisory does name works: `any-service`
+    is a full-admit token, so no catch-all drop is emitted at all.
+- **Advisory bug**: a stanza with both `any-service` and an unported token
+  emitted a self-contradicting pair (one warning that any-service admits
+  everything, another that rpm is DENIED and to add any-service). The unported
+  advisory is now suppressed when the stanza already carries a full-admit token.
+- **MAJOR 2 residue swept**: 14 sites across Go, Rust, tests and docs still
+  asserted the stronger "NO platform-fixed port" / "Junos fixes no port", which
+  contradicts the `unsourced` class that says a fixed port may exist and we did
+  not find it. All reworded to "xpf has no authoritative listening port".
+- **X==X removed**: `host_inbound_match_3627_test.go` rebuilt the expected `all`
+  result by iterating `HostInboundAllExpansionServices()` and concatenating
+  `HostInboundServiceMatch(tok, fam)` — exactly what production's `all` branch
+  does — while its comment claimed to be "derived independently". Replaced with
+  a hard-coded literal of the atomic (proto, port) openings `all` grants, with
+  the 90-port traceroute range collapsed and asserted separately. Verified it
+  binds: moving reverse-telnet 2900 -> 2999 REDs in both directions.
+- **File(s)**: `pkg/config/compiler_validate_warn.go`,
+  `pkg/config/host_inbound_fulladmit_warn_3226_test.go`,
+  `pkg/config/host_inbound_match_3627_test.go`,
+  `pkg/config/host_inbound_tokens.go`, `pkg/config/host_inbound_tokens_test.go`,
+  `pkg/config/host_inbound_rust_parity_test.go`,
+  `pkg/daemon/host_inbound_ssot_render_3627_test.go`, `pkg/daemon/README.md`,
+  `pkg/dataplane/userspace/host_inbound_all_scoping_3226_test.go`,
+  `userspace-dp/src/afxdp/forwarding/host_inbound.rs` (+`_tests.rs`),
+  `docs/host-inbound-service-matrix.md`, `docs/junos-cli-reference.md`
+- **Validation**: `go test ./...` 58 ok, only pre-existing #6617. `cargo test`
+  4225 passed, 0 failed. gofmt clean. Per-arm mutation proofs in a throwaway
+  detached worktree.

@@ -489,7 +489,7 @@ func TestHostInboundFixedPortJunosServicesCommit_3226(t *testing.T) {
 				t.Fatalf("%s must be in KnownHostInboundSystemServices so commit accepts it", tok)
 			}
 			if HostInboundUnportedSystemServices[tok] {
-				t.Fatalf("%s has a platform-fixed port; it must NOT be in HostInboundUnportedSystemServices", tok)
+				t.Fatalf("%s has an authoritative fixed port; it must NOT be in HostInboundUnportedSystemServices", tok)
 			}
 			// Dual-family (absent from the family map), like ssh/telnet.
 			if fam, scoped := HostInboundServiceFamily[tok]; scoped {
@@ -616,9 +616,9 @@ func TestHostInboundUnportedJunosServicesCommit_3226(t *testing.T) {
 			// The load-bearing assertion: NO tuple, either family.
 			for _, family := range []string{"ip", "ip6"} {
 				if got := HostInboundServiceMatch(tok, family); len(got) != 0 {
-					t.Errorf("%s (%s) synthesized %d admission tuple(s) %+v — Junos fixes no "+
-						"listening port for this service, so any port here is a guess that opens an "+
-						"unused port while still denying the one actually in use (#3226)",
+					t.Errorf("%s (%s) synthesized %d admission tuple(s) %+v — xpf has no "+
+						"authoritative listening port for this service, so any port here is a guess "+
+						"that opens an unused port while still denying the one actually in use (#3226)",
 						tok, family, len(got), got)
 				}
 			}

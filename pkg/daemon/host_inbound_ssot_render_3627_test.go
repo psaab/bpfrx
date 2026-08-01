@@ -49,7 +49,7 @@ func TestHostInboundNftRenderGoldenByteIdentical(t *testing.T) {
 			{"udp dport { 546, 547 }", "udp dport 53", "tcp dport 53", "tcp dport 79", "tcp dport 21", "tcp dport 80", "tcp dport 443", "tcp dport 113", "udp dport { 500, 4500 }", "udp dport { 500, 4500 }", "udp dport 3503", "udp dport 8503", "tcp dport 830", "tcp dport { 22, 830 }", "udp dport 123", "icmpv6 type echo-request", "tcp dport 513", "tcp dport 514", "tcp dport 2901", "tcp dport 2900", "tcp dport 513", "tcp dport 514", "udp dport 5060", "tcp dport 5060", "udp dport 161", "udp dport 162", "tcp dport 22", "tcp dport { 22, 830 }", "tcp dport 23", "udp dport 69", "udp dport 33434-33523", "tcp dport 80", "tcp dport 443", "tcp dport 3221", "tcp dport 3220"},
 		},
 		"any-service": {nil, nil},
-		// #3226 fold: Junos services with NO platform-fixed listening port
+		// #3226 fold: Junos services xpf has no authoritative listening port for
 		// (config.HostInboundUnportedSystemServices) render NOTHING on either
 		// family. They stay recognized and stay in the `all` union above,
 		// contributing no fragment. Earlier revisions rendered "udp dport 28762"

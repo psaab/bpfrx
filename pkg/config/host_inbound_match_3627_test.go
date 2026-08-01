@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strconv"
 	"testing"
 )
@@ -64,23 +65,80 @@ func TestHostInboundServiceMatchTuples(t *testing.T) {
 	if HostInboundFullAdmitService("all") {
 		t.Errorf("all must NOT be a full-admit service (#3226 — it expands to the named system-service union)")
 	}
-	// `HostInboundServiceMatch("all", fam)` must equal the concatenation of the
-	// expansion's per-token matches, in expansion order — the SSOT contract the
-	// nft renderer, the netlink builder and the match-policies classifier all
-	// inherit. Derived independently from the per-token table, so this is a real
-	// cross-check rather than a restatement of the implementation.
+	// What `system-services all` actually OPENS, pinned against a hard-coded
+	// literal.
+	//
+	// This replaces an assertion that rebuilt the expected value by iterating
+	// HostInboundAllExpansionServices() and concatenating
+	// HostInboundServiceMatch(tok, fam) — which is character-for-character what
+	// production's `all` branch does, so it compared the implementation with
+	// itself and would have passed through any change to either. (Its comment
+	// claimed to be "derived independently"; it was not.)
+	//
+	// The oracle below is a human-maintained list of the atomic (proto, port)
+	// openings `all` grants. It is independent of how the expansion is computed,
+	// so it REDs on a token entering or leaving the union, on a port move, and on
+	// a family-scoping change — none of which the old form could see. The
+	// traceroute probe range is collapsed out and asserted separately, because 90
+	// consecutive ports would swamp the literal without adding signal.
+	const tracerouteLo, tracerouteHi = 33434, 33523
+	wantOpenings := map[string][]string{
+		// IPv4: dhcp/bootp (67,68) present, dhcpv6 absent, ping = ICMP echo type 8.
+		"ip": {
+			"1/type8", "17/123", "17/161", "17/162", "17/3503", "17/4500",
+			"17/500", "17/5060", "17/53", "17/67", "17/68", "17/69", "17/8503",
+			"6/21", "6/22", "6/23", "6/2900", "6/2901", "6/3220", "6/3221",
+			"6/443", "6/5060", "6/513", "6/514", "6/53", "6/79", "6/80", "6/830",
+			"reject:6/113",
+		},
+		// IPv6: dhcpv6 (546,547) present, dhcp/bootp absent, ping = ICMPv6 type 128.
+		"ip6": {
+			"17/123", "17/161", "17/162", "17/3503", "17/4500", "17/500",
+			"17/5060", "17/53", "17/546", "17/547", "17/69", "17/8503",
+			"58/type128", "6/21", "6/22", "6/23", "6/2900", "6/2901", "6/3220",
+			"6/3221", "6/443", "6/5060", "6/513", "6/514", "6/53", "6/79",
+			"6/80", "6/830", "reject:6/113",
+		},
+	}
 	for _, fam := range []string{"ip", "ip6"} {
-		var want []L4Match
-		for _, tok := range HostInboundAllExpansionServices() {
-			want = append(want, HostInboundServiceMatch(tok, fam)...)
+		got := map[string]bool{}
+		for _, m := range HostInboundServiceMatch("all", fam) {
+			for _, k := range hiOpeningKeys(m) {
+				got[k] = true
+			}
 		}
-		if got := HostInboundServiceMatch("all", fam); !equalL4(got, want) {
-			t.Errorf("HostInboundServiceMatch(\"all\",%q) = %s, want the named-service union %s", fam, showL4(got), showL4(want))
+		if len(got) == 0 {
+			t.Fatalf("`all` opened NOTHING for family %q — contract would be vacuous", fam)
 		}
-		// The expansion must carry at least one real service, or the assertion
-		// above would be a vacuous nil==nil.
-		if len(want) == 0 {
-			t.Fatalf("`all` expansion produced no matches for family %q — contract would be vacuous", fam)
+		// Peel off the traceroute range and assert it exactly.
+		for p := tracerouteLo; p <= tracerouteHi; p++ {
+			k := fmt.Sprintf("17/%d", p)
+			if !got[k] {
+				t.Errorf("`all` (%s) is missing traceroute probe port udp/%d", fam, p)
+			}
+			delete(got, k)
+		}
+		for _, edge := range []int{tracerouteLo - 1, tracerouteHi + 1} {
+			if got[fmt.Sprintf("17/%d", edge)] {
+				t.Errorf("`all` (%s) opens udp/%d, outside the traceroute probe range %d-%d",
+					fam, edge, tracerouteLo, tracerouteHi)
+			}
+		}
+		want := map[string]bool{}
+		for _, k := range wantOpenings[fam] {
+			want[k] = true
+		}
+		for k := range want {
+			if !got[k] {
+				t.Errorf("`system-services all` (%s) no longer opens %s — a service left the "+
+					"union, moved port, or changed family scoping", fam, k)
+			}
+		}
+		for k := range got {
+			if !want[k] {
+				t.Errorf("`system-services all` (%s) now opens %s, which the pinned union does "+
+					"NOT — a service entered the union or widened its ports (#3226)", fam, k)
+			}
 		}
 	}
 	// The expansion excludes the meta tokens and the xpf-only extensions.

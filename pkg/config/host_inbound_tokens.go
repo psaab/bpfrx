@@ -127,10 +127,12 @@ var KnownHostInboundSystemServices = map[string]bool{
 	//                    Destination Port MUST be lsp-self-ping (8503)") and §6
 	//                    (IANA assignment). Distinct from `lsping` (MPLS echo,
 	//                    UDP 3503) despite the similar name.
-	//   r2cp, rpm,     — NO platform-fixed port. Recognized at commit, but they
-	//   tcp-encap,       synthesize NO admit tuple, because any port would be a
-	//   appqoe,          guess. See HostInboundUnportedSystemServices for the
-	//   high-availability per-token evidence.
+	//   r2cp, rpm,     — NO admit tuple. Recognized at commit, but xpf opens
+	//   tcp-encap,       nothing: for r2cp/rpm Junos documents the port as
+	//   appqoe,          operator-chosen, and for the rest xpf could not find an
+	//   high-availability authoritative tuple. See
+	//                    HostInboundUnportedSystemServices for the per-token
+	//                    evidence and the two reason classes.
 	"r2cp":              true,
 	"reverse-ssh":       true,
 	"reverse-telnet":    true,
@@ -272,9 +274,12 @@ var HostInboundNonJunosSystemServices = map[string]bool{
 }
 
 // HostInboundUnportedSystemServices is the set of recognized JUNOS
-// `system-services` tokens for which xpf could not establish an authoritative
-// host-inbound listening tuple, and therefore synthesizes NO admission tuple
-// (#3226 fold).
+// `system-services` tokens for which xpf has no authoritative host-inbound
+// listening tuple to admit, and therefore synthesizes NO admission tuple
+// (#3226 fold). The two DIFFERENT reasons a token lands here are recorded in
+// HostInboundNoAdmitReason and must not be collapsed into "there is no port":
+// that is true for the operator-configured class and merely UNKNOWN for the
+// unsourced one.
 //
 // These are NOT xpf extensions — they are in Juniper's published schema (see
 // the oracle in host_inbound_tokens_test.go), so they stay in
@@ -702,8 +707,8 @@ func HostInboundServiceMatch(token, family string) []L4Match {
 	if fam, ok := HostInboundServiceFamily[token]; ok && fam != family {
 		return nil
 	}
-	// #3226 fold: a Junos service with no platform-fixed port synthesizes NO
-	// tuple on ANY surface. This gate sits BEFORE the switch deliberately, so
+	// #3226 fold: a Junos service with no authoritative tuple to admit
+	// synthesizes NO tuple on ANY surface. This gate sits BEFORE the switch deliberately, so
 	// HostInboundUnportedSystemServices is the authoritative statement rather
 	// than a comment: a future edit cannot hand one of these tokens a port
 	// without first removing it from that set (and thereby confronting the

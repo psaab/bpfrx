@@ -1357,9 +1357,10 @@ never lock an operator out of a remote box it manages.
   `lsselfping` (udp 8503) render a match: the first two carry explicit YANG
   platform defaults, the third is RFC 7746 / IANA. The rest are in
   `config.HostInboundUnportedSystemServices` — recognized, in the `all` union,
-  but rendering NOTHING, because Juniper fixes no listening port for them and a
-  guessed port would open an unused port while still denying the one actually in
-  use. Naming one explicitly draws a WARN-only commit advisory.
+  but rendering NOTHING, because xpf has no authoritative listening port to
+  admit for them (Junos documents rpm/r2cp as operator-configured; the rest are
+  simply unsourced) and a guessed port would open an unused port while still
+  denying the one actually in use. Naming one explicitly draws a WARN-only commit advisory.
   Full write-up: `docs/host-inbound-service-matrix.md`.
   **Counted drops + scrape (#3361):** each per-zone/family catch-all drop is
   `<fam> daddr <addrs> counter name "<n>" drop`, where `<n>` =

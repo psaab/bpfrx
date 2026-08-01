@@ -183,7 +183,7 @@ func Test_3226_PerInterfaceFullAdmitAdvisory(t *testing.T) {
 }
 
 // hostInboundUnportedWarnings filters the #3226-fold advisory for Junos
-// services with no platform-fixed listening port.
+// services xpf has no authoritative listening port for.
 func hostInboundUnportedWarnings(cfg *Config) []string {
 	var out []string
 	for _, w := range ValidateConfig(cfg) {
@@ -199,9 +199,11 @@ func hostInboundUnportedWarnings(cfg *Config) []string {
 //
 // r2cp / rpm / tcp-encap / appqoe / high-availability are real Junos services,
 // so they must COMMIT (rejecting them is the #3200 parity gap this fold closes).
-// But Juniper fixes no listening port for any of them, and xpf refuses to invent
-// one — an invented port opens a port with no listener while still denying the
-// port actually in use. The resulting behaviour is a deliberate fail-CLOSED
+// But xpf has no authoritative listening port to admit for any of them — for
+// rpm/r2cp because Junos documents the port as operator-chosen, for the rest
+// because we could not find it — and refuses to invent one, since an invented
+// port opens a port with no listener while still denying the port actually in
+// use. The resulting behaviour is a deliberate fail-CLOSED
 // divergence from Junos, and an operator who explicitly NAMED the service
 // plainly expects it to work, so the divergence must be announced at commit
 // rather than discovered as a silent blackhole in production.
@@ -302,12 +304,70 @@ func Test_3226_UnportedSystemServiceEmitsAdvisory(t *testing.T) {
 			default:
 				t.Errorf("%q carries no recognized no-admit reason class", tok)
 			}
-			if !strings.Contains(got[0], "kernel path only") {
-				t.Errorf("advisory must qualify the lo0 filter remedy as kernel-path-only — the "+
-					"AF_XDP path evaluates host-inbound before the filter (#3485), so an "+
-					"unconditional \"use a firewall filter\" is false, got: %q", got[0])
+			// REGRESSION GUARD on a REFUTED remedy. Two earlier revisions told
+			// operators to fix this with an lo0 firewall filter — first
+			// unconditionally, then "on the kernel path only". Both are false. On
+			// AF_XDP, #3485 runs host-inbound first and never reaches the filter
+			// after a deny. On the kernel path the priorities (xpf_lo0 0 <
+			// xpf_hostinbound 10) are right but the inference is wrong: nftables
+			// `accept` ends the current BASE CHAIN, not the hook — "The packet
+			// advances to the next base chain" — so it still traverses
+			// xpf_hostinbound and still hits the catch-all drop. Only `drop` ends
+			// the whole ruleset.
+			//
+			// This asserts the false statement is ABSENT, which is a different
+			// (and sound) thing from asserting a sentence is true: it cannot
+			// validate wording, it just stops a known-wrong remedy coming back.
+			// The remedy the advisory DOES name is bound behaviourally below.
+			for _, refuted := range []string{"firewall filter", "kernel path"} {
+				if strings.Contains(got[0], refuted) {
+					t.Errorf("advisory names the REFUTED lo0-filter remedy (%q): an lo0 accept "+
+						"cannot rescue a host-inbound deny on EITHER path — nftables `accept` "+
+						"ends the base chain, not the hook, so the packet still reaches "+
+						"xpf_hostinbound's catch-all drop. got: %q", refuted, got[0])
+				}
 			}
 		})
+	}
+
+	// The remedy the advisory NAMES must actually work — otherwise this is the
+	// same defect as before, just with different words. `any-service` is a
+	// full-admit token, which is what makes it a real escape: the nft builder
+	// emits a bare accept and NO catch-all drop for the zone, and the AF_XDP
+	// classifier short-circuits admits() to true. Assert that property directly
+	// rather than trusting the sentence.
+	for tok := range HostInboundUnportedSystemServices {
+		if !HostInboundFullAdmitService("any-service") {
+			t.Fatal("the advised remedy \"any-service\" is not a full-admit token — the " +
+				"advisory would be recommending something that does not lift the deny")
+		}
+		// The unported token itself admits nothing on either family (the deny the
+		// advisory is warning about is real)...
+		for _, family := range []string{"ip", "ip6"} {
+			if got := HostInboundServiceMatch(tok, family); len(got) != 0 {
+				t.Errorf("%s (%s) admits %+v — the advisory claims its traffic is DENIED; "+
+					"if that premise is false the whole warning is wrong", tok, family, got)
+			}
+		}
+	}
+
+	// ...and naming `any-service` alongside SUPPRESSES the advisory entirely,
+	// because with it present nothing is denied. Before this gate the two
+	// advisory passes ran independently and a stanza with both emitted a
+	// self-contradicting pair: one warning that `any-service` admits everything,
+	// another that rpm is DENIED and the operator should add `any-service`.
+	cfgBoth := compile(t,
+		"set security zones security-zone wan host-inbound-traffic system-services rpm",
+		"set security zones security-zone wan host-inbound-traffic system-services any-service")
+	if got := hostInboundUnportedWarnings(cfgBoth); len(got) != 0 {
+		t.Errorf("a stanza that already carries \"any-service\" must NOT also be told its "+
+			"unported services are DENIED and to add \"any-service\" — nothing is denied "+
+			"and the advice is already taken, got: %v", got)
+	}
+	// The full-admit advisory still fires for that stanza, so suppressing the
+	// unported one loses no signal.
+	if got := hostInboundFullAdmitWarnings(cfgBoth); len(got) != 1 {
+		t.Errorf("the any-service full-admit advisory must still fire, got %d: %v", len(got), got)
 	}
 
 	// Several named at once collapse into ONE advisory listing all of them,

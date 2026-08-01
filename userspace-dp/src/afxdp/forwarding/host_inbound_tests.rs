@@ -459,7 +459,8 @@ fn system_services_all_excludes_non_junos_extensions() {
 //   lsselfping udp/8503
 //       RFC 7746 §3/§6 (IANA `lsp-self-ping`). NOT 3503 — that is `lsping`.
 //
-// The remaining Junos services in the union have NO platform-fixed port and are
+// The remaining Junos services in the union have no authoritative tuple xpf can
+// admit and are
 // covered by `unported_services_admit_nothing_3226` instead.
 //
 // Rust mirror of the Go TestClassifyHostInboundAllAdmitsDocumentedJunosServices
@@ -503,8 +504,8 @@ fn system_services_all_admits_documented_junos_services_3226() {
     }
 }
 
-// #3226 fold, unverified-port half: the Junos services for which Juniper fixes
-// NO listening port (HOST_INBOUND_UNPORTED_SERVICES) must contribute NOTHING to
+// #3226 fold, unverified-port half: the Junos services xpf has no authoritative
+// listening port for (HOST_INBOUND_UNPORTED_SERVICES) must contribute NOTHING to
 // the admit set — whether reached through `all` or named explicitly.
 //
 // Earlier revisions of this fold synthesized a port for two of them from
@@ -561,7 +562,7 @@ fn unported_services_admit_nothing_3226() {
                 assert!(
                     !host_inbound_admits(&named, ZONE, proto, port, v6, 0),
                     "`system-services {token}` must admit NOTHING ({proto}/{port}, v6={v6}) — \
-                     Junos fixes no listening port for it, so any admit here is a guess (#3226)",
+                     xpf has no authoritative listening port for it, so any admit here is a guess (#3226)",
                 );
             }
         }

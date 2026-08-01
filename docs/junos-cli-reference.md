@@ -588,13 +588,15 @@ From zone: guest, To zone: lan
     a CHOICE under uncertainty, not an inference: a guessed port is wrong in both
     directions at once (it opens a port with no listener AND still denies the one
     in use, invisibly), whereas opening nothing is wrong in one direction and is
-    announced at commit. Their traffic is DENIED; use `system-services
-    any-service`, which is the only escape that works on BOTH enforcement
-    surfaces. An lo0 input-filter `accept` fixes it on the kernel nft path only
-    (`xpf_lo0` priority 0 runs before `xpf_hostinbound` priority 10); the AF_XDP
-    local-delivery path evaluates host-inbound FIRST (#3485) and never reaches
-    the filter after a deny. Naming one of these tokens draws a WARN-only commit
-    advisory saying exactly this. Ports xpf DOES open for this group:
+    announced at commit. Their traffic is DENIED, and `system-services
+    any-service` is the ONLY remedy — an lo0 input filter does not help on
+    either enforcement path. (On AF_XDP, #3485 evaluates host-inbound before the
+    filter and never reaches it after a deny. On the kernel path `xpf_lo0` is
+    priority 0 and `xpf_hostinbound` is 10, but nftables `accept` ends the
+    current BASE CHAIN, not the hook — the packet advances to the next base
+    chain and still hits the catch-all drop. Only `drop` is terminal for the
+    hook.) Naming one of these tokens draws a WARN-only commit advisory saying
+    exactly this. Ports xpf DOES open for this group:
     `reverse-telnet` tcp/2900 and `reverse-ssh` tcp/2901 (explicit YANG platform
     defaults) and `lsselfping` udp/8503 (RFC 7746 — not 3503, which is `lsping`).
   - **IS-IS host-inbound (L2 no-op, #3311):** `host-inbound-traffic protocols

@@ -387,42 +387,69 @@ func ValidateConfig(cfg *Config) []string {
 			return // one advisory per stanza
 		}
 	}
-	// #3226 fold: several services in Juniper's `system-services` enumeration
-	// have NO platform-fixed listening port — r2cp, rpm, tcp-encap, appqoe and
-	// high-availability (config.HostInboundUnportedSystemServices). Junos would
-	// open whatever port the operator configured for them elsewhere; xpf models
-	// no such stanza and refuses to guess, because an invented port opens a port
-	// with no listener while STILL denying the port actually in use. So these
-	// tokens commit (they are real Junos services — rejecting them is the #3200
-	// parity gap) but synthesize no admit on either enforcement surface.
+	// #3226 fold: for several services in Juniper's `system-services`
+	// enumeration xpf has no authoritative listening tuple — r2cp, rpm,
+	// tcp-encap, appqoe and high-availability
+	// (config.HostInboundUnportedSystemServices). Junos would open whatever port
+	// applies; xpf refuses to guess, because an invented port opens a port with
+	// no listener while STILL denying the port actually in use. So these tokens
+	// commit (they are real Junos services — rejecting them is the #3200 parity
+	// gap) but synthesize no admit on either enforcement surface.
 	//
 	// That divergence is fail-CLOSED but it must not be SILENT: an operator who
 	// went to the trouble of naming the service plainly expects it to work.
 	// Warn at the moment they name it, and name a remedy that ACTUALLY WORKS.
 	//
-	// The remedy wording is load-bearing and was wrong in an earlier revision,
-	// which told operators to "admit the real port with a firewall filter". That
-	// only holds on ONE of the two enforcement surfaces:
+	// `any-service` is the ONLY remedy, and the advisory names nothing else.
+	// Two earlier revisions got this wrong and the history is worth keeping:
 	//
-	//   kernel nft path — WORKS. The xpf_lo0 base chain has hook-input priority
-	//     0, strictly below xpf_hostinbound at 10, so an operator lo0 `accept`
-	//     term terminates before the host-inbound backstop ever runs.
-	//   AF_XDP local-delivery path — DOES NOT WORK. #3485 deliberately runs the
+	//   r3 told operators to "admit the real port with a firewall filter". False
+	//     on the AF_XDP local-delivery path: #3485 deliberately runs the
 	//     host-inbound gate FIRST so a denied packet incurs none of the lo0
 	//     filter's side-effects (counter, log, reject reply); on a deny the lo0
-	//     filter is never evaluated at all, so no `accept` term can rescue it.
+	//     filter is never evaluated at all.
+	//   r4 narrowed that to "kernel path only", reasoning that xpf_lo0 (hook
+	//     input priority 0) runs before xpf_hostinbound (priority 10) so an lo0
+	//     `accept` terminates first. The PRIORITIES are right and the CONCLUSION
+	//     is wrong: in nftables `accept` ends the current BASE CHAIN, not the
+	//     hook. The nftables man page is explicit — "An accept verdict ... ends
+	//     the evaluation of the current base chain. ... The packet advances to
+	//     the next base chain", whereas only drop "immediately ends the
+	//     evaluation of the whole ruleset". So the packet still traverses
+	//     xpf_hostinbound at priority 10 and still hits its catch-all drop.
+	//     There is no mark, no return-path exclusion, no bypass wiring between
+	//     the two chains.
 	//
-	// `any-service` is therefore the only escape that works on BOTH surfaces,
-	// and it is what this advisory leads with. The lo0 caveat is stated rather
-	// than omitted, because on the kernel path — which carries ordinary direct
-	// traffic to a local address — the filter genuinely is the narrower fix.
+	// So an lo0 filter accept rescues NOTHING on EITHER surface, and the remedy
+	// is withdrawn rather than narrowed. Making it work would mean building a
+	// real bypass — an explicit mark set in xpf_lo0 and tested in
+	// xpf_hostinbound, or merging the chains — which is a new security mechanism
+	// that deliberately lets an lo0 filter override the zone host-inbound
+	// default-deny. That needs its own design and threat review, and it would
+	// STILL not help on the AF_XDP path without also reordering #3485. Out of
+	// scope here; see docs/host-inbound-service-matrix.md.
 	//
 	// Gated on explicit naming only. `system-services all` also covers these
 	// tokens (contributing nothing), but warning there would fire on a large
 	// fraction of commits — including every lifeline-only HA `control` zone —
 	// while telling the operator nothing they asked about. The `all` case is
 	// documented in docs/host-inbound-service-matrix.md instead.
+	//
+	// SUPPRESSED when the same stanza already carries a full-admit token. The
+	// advisory's entire content is "this traffic is DENIED, use any-service" —
+	// but with `any-service` present nothing IS denied (the full-admit
+	// short-circuit means no catch-all drop is emitted at all, and the AF_XDP
+	// classifier admits unconditionally), so the warning would be false on its
+	// premise AND would advise adding a token the operator has already added.
+	// The two advisory passes run independently, so without this gate a stanza
+	// naming both `any-service` and `rpm` emitted one warning saying
+	// `any-service` admits everything and another saying rpm is denied.
 	unportedAdvice := func(where string, svcs []string) {
+		for _, svc := range svcs {
+			if HostInboundFullAdmitService(svc) {
+				return
+			}
+		}
 		var named []string
 		seen := map[string]bool{}
 		for _, svc := range svcs {
@@ -464,11 +491,9 @@ func ValidateConfig(cfg *Config) []string {
 		warnings = append(warnings, fmt.Sprintf(
 			"%s: system-services [%s] accepted but NOT enforced — %s (a guessed port "+
 				"opens an unused port while still denying the one actually in use). "+
-				"Their traffic is DENIED to the zone's local addresses. Use "+
-				"\"any-service\" — it is the only escape that works on BOTH enforcement "+
-				"surfaces. An lo0 input-filter accept fixes this on the kernel path only "+
-				"(xpf_lo0 runs before xpf_hostinbound); the AF_XDP local-delivery path "+
-				"evaluates host-inbound FIRST and never reaches the filter after a deny.",
+				"Their traffic is DENIED to the zone's local addresses. The only remedy "+
+				"is \"any-service\"; an lo0 input filter does NOT help, on either "+
+				"enforcement path.",
 			where, strings.Join(named, " "), strings.Join(why, "; ")))
 	}
 	hiZoneNames := make([]string, 0, len(cfg.Security.Zones))

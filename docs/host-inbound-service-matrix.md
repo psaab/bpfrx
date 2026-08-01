@@ -251,7 +251,9 @@ and `gre` (IP protocol 47) out while leaving the port-neutral aliases in.
 
 Five services in Juniper's enumeration are recognized (a valid vSRX stanza must
 commit) and stay in the `all` union, but synthesize **no admission tuple** on any
-enforcement surface. `config.HostInboundUnportedSystemServices` is the SSOT;
+enforcement surface — for two because Junos documents the port as
+operator-chosen, for three because we could not find it. Those are different
+statements and the doc keeps them apart. `config.HostInboundUnportedSystemServices` is the SSOT;
 `HOST_INBOUND_UNPORTED_SERVICES` is the Rust mirror, held equal by the #3486
 parity test.
 
@@ -312,32 +314,54 @@ the source recorded is a strict improvement and is expected.
 | `appqoe` | AppQoE ACTIVE probe | **Not sourced:** transport or port. Juniper describes the active probe only as *"custom packets are sent between spoke and hub points on all the multiple routes"*; `active-probe-params` exposes probe-count, probe-interval, data-fill, data-size, dscp-code-points, enable-sla-export, per-packet-loss-timeout, forwarding-class and loss-priority — no port, no transport — and `show … sla active-probe-statistics` reports addresses and timings with no port column. **Decoy:** udp/36000 is the only port on the AppQoE page and belongs to the *passive* probe; the Limitations section says *"An input firewall filter is required at the non-WAN interfaces to discard UDP packets with UDP destination port 36000."* That is TRANSIT traffic Juniper tells operators to DISCARD — admitting it host-inbound would be doubly wrong. |
 | `high-availability` | Multinode HA (MNHA) inter-node control over the ICL | **Juniper explicitly acknowledges a protocol and port exist and declines to publish them.** The MNHA preparation guidance says the ICL *"path uses (whether the ICL is encrypted or not) IP address, protocol, and port details. You must ensure that this communication is allowed between the nodes if any firewall or other inspection is in place."* That is the entire published statement — no numbers appear anywhere. A sweep of the full Junos High Availability User Guide found 12 config examples using this token and not one port; every TCP/UDP port in the book belongs to the generic BFD chapters, not MNHA. `show chassis high-availability information`/`peer-info` carry peer IP, interface, routing-instance and encryption state — no port field. **Do not attribute udp/500+4500 or ESP here:** those belong to the *optional* `ha-link-encryption` and are admitted through the separate `ike` token Juniper's own examples configure alongside this one. *Mitigation:* xpf does not implement MNHA. Its own inter-node HA control plane (heartbeat on the cluster control interface, session/config sync over the fabric) rides LIFELINE interfaces — `fxp0`, `em0`, `fab*`, plus any configured `control-interface` / `fabric-interface` (`HostInboundLifelineSet`, #3277) — which `BuildZoneHostInboundViews` removes before generating host-inbound deny sets. So an unported `high-availability` cannot break xpf's own HA. **Stated plainly: xpf does not implement the MNHA ICL, so naming this token is a no-op for xpf** — it governs a feature xpf does not have. It bites only an operator porting a Junos MNHA config onto a non-lifeline zone, who gets the commit advisory. |
 
-#### Which escape hatch actually works
+#### The only escape is `any-service`
 
-The commit advisory names a remedy, and the wording is load-bearing: an earlier
-revision told operators to "admit the real port with a firewall filter", which is
-only true on **one** of the two enforcement surfaces.
+`system-services any-service` is the **only** remedy, on either enforcement
+surface. An lo0 input filter does not help. Two earlier revisions of this fold
+claimed otherwise and both were wrong; the history is kept because the second
+error is easy to re-derive.
 
-| Surface | lo0 input-filter `accept` | Why |
+| Revision | Claim | Why it is false |
 |---|---|---|
-| kernel nft | **works** | `xpf_lo0` has hook-input priority 0, strictly below `xpf_hostinbound` at 10, so an operator `accept` term terminates before the host-inbound backstop runs. |
-| AF_XDP local delivery | **does not work** | #3485 deliberately runs the host-inbound gate FIRST, so a denied packet incurs none of the lo0 filter's side-effects (counter, log, reject reply). On a deny the filter is never evaluated, so no `accept` term can rescue it. |
+| r3 | "admit the real port with a firewall filter" | False on AF_XDP: #3485 deliberately runs the host-inbound gate FIRST so a denied packet incurs none of the lo0 filter's side-effects (counter, log, reject reply, session teardown). On a deny the filter is never evaluated at all. |
+| r4 | "…on the kernel path only" | The **priorities are right** — `xpf_lo0` is hook-input priority 0, `xpf_hostinbound` is 10 — but the **inference is wrong**. In nftables `accept` ends the current *base chain*, not the hook. |
 
-`system-services any-service` is therefore the only escape that works on **both**
-surfaces, and it is what the advisory leads with. The lo0 caveat is stated rather
-than omitted because on the kernel path the filter genuinely is the narrower fix
-— but do not read that as "the kernel path is the one that matters": the AF_XDP
-local-delivery arm also resolves packets destined to a firewall interface IP, so
-an operator relying on a filter alone is relying on which path a given packet
-takes. Treat `any-service` as the only escape you can reason about.
+The nftables man page is explicit:
 
-This is a real weakness in the remedy, and it is recorded rather than papered
-over. Reordering the userspace path to evaluate lo0 first is **not** the fix and
-is out of scope here: #3485 runs host-inbound first precisely so a denied packet
-incurs none of the lo0 side-effects (counter bump, filter log, synthesized TCP
-RST / ICMP-unreachable, host-bound session teardown). Reverting that reopens
-codex-review-118 M1. A targeted both-surface escape would need a new mechanism,
-not a reordering.
+> An **accept** verdict (including an implicit one via the base chain's policy)
+> ends the evaluation of the current base chain. […] The packet advances to the
+> next base chain.
+
+versus
+
+> A **drop** verdict (including an implicit one via the base chain's policy)
+> immediately ends the evaluation of the whole ruleset. No further chains of any
+> hook are consulted.
+
+So an `accept` in `xpf_lo0` at priority 0 does **not** stop the packet reaching
+`xpf_hostinbound` at priority 10, where the catch-all drop terminates it. Only
+`drop` is terminal for the hook. There is no mark, no return-path exclusion and
+no bypass wiring between the two chains:
+
+```
+xpf_lo0        priority  0 :  accept
+       |  (packet advances to the next base chain)
+       v
+xpf_hostinbound priority 10 :  catch-all drop   <- packet dies here
+```
+
+Making a filter work would mean building a **real bypass** — an explicit mark set
+in `xpf_lo0` and tested in `xpf_hostinbound`, or merging the two chains. That is
+a new security mechanism that deliberately lets an lo0 filter override the zone
+host-inbound default-deny, so it needs its own design and threat review; and it
+would still not help on the AF_XDP path without also reordering #3485, which
+would reopen codex-review-118 M1. Both are out of scope for this fold.
+
+Why `any-service` genuinely works: it is a full-admit token, so the nft builder
+emits a bare `accept` and **no catch-all drop at all** for the zone (there is
+nothing left at priority 10 to kill the packet), and the AF_XDP classifier
+short-circuits `admits()` to true. That property — not the wording of the
+advisory — is what the tests bind.
 
 **Operator consequence — a known, deliberate, fail-closed divergence from
 Junos.** A zone that actually terminates one of these services must admit it

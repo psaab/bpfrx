@@ -132,7 +132,7 @@ func TestClassifyHostInboundSystemServicesAllExcludesGRE(t *testing.T) {
 // reverse-telnet tcp/2900 and reverse-ssh tcp/2901 (explicit YANG `default`
 // statements on `[edit system services reverse telnet|ssh] port`), and
 // lsselfping udp/8503 (RFC 7746 §3/§6 — NOT 3503, which is `lsping`). The Junos
-// services with NO platform-fixed port are covered by
+// services xpf has no authoritative port for are covered by
 // TestClassifyHostInboundUnportedServicesAdmitNothing below.
 //
 // FAIL-ON-REVERT: drop any of these from config.KnownHostInboundSystemServices

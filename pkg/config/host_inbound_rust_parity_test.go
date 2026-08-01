@@ -241,9 +241,9 @@ func TestHostInboundRustClassifierMatchesGoSSOT(t *testing.T) {
 		goKeySet(HostInboundNonJunosSystemServices), rustNonJunos)
 
 	// #3226 fold: HOST_INBOUND_UNPORTED_SERVICES = config.HostInboundUnported
-	// SystemServices — the Junos services with no platform-fixed listening port,
-	// which are recognized and stay in the `all` union but synthesize NO admit
-	// tuple. Drift here is a split-brain of the worst shape: one layer would
+	// SystemServices — the Junos services xpf has no authoritative listening
+	// tuple for, which are recognized and stay in the `all` union but synthesize
+	// NO admit tuple. Drift here is a split-brain of the worst shape: one layer would
 	// invent a port for a service the other denies entirely, so a zone would
 	// admit on the kernel path what the AF_XDP path drops (or vice versa) on a
 	// port neither can justify.
@@ -294,7 +294,7 @@ func TestHostInboundRustUnportedServicesInsertNoPort_5715(t *testing.T) {
 		}
 		if loc := insertRe.FindString(m[1]); loc != "" {
 			t.Errorf("the classify_system_service arm containing %q performs a %s — an unported "+
-				"service must admit NOTHING (Junos fixes no port for it, #3226)", tok, loc)
+				"service must admit NOTHING (xpf has no authoritative port for it, #3226)", tok, loc)
 		}
 	}
 }
