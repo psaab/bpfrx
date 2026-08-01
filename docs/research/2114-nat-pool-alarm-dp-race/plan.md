@@ -1,13 +1,14 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v57 — r56 consistency findings folded (Codex
-  M7/M8/m1/m2/m3: the acceptance contract sync, the §5.1
-  authority/provider + userspace inventories, the §9
-  v56-mechanism legs, the pending-term omissions, the §6
-  signature list; the r56 M1-M6 mechanism-depth findings are
-  put to all three reviewers for an explicit engineering
-  ruling in r57 — see the v57 revision entry); pending the
-  r57 ruling round
+- **Status**: DRAFT v58 — the r57 HYBRID ruling folded (Codex
+  ruled (A); AGY ruled (B); SMR ruled (B) and revised to the
+  hybrid on Codex's verified M4/M5 evidence: the live-state
+  classes — the rollback fork and the OnXSKBound stale
+  closure — are closed BY CONSTRUCTION because the digest net
+  cannot see kernel state; the config-text-visible classes are
+  named bounded residuals with detection-and-recovery; the
+  apply-level ACK is the named follow-up); pending
+  convergence review r58
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -2544,6 +2545,50 @@
   admit+bound idiom from r29/r37/r38 — with the apply-level
   ACK named as a follow-up; or (C) SPLIT H2 further. Each
   reviewer rules explicitly.
+  v58: the r57 HYBRID ruling folded — Codex ruled (A) with the
+  decisive safety argument (verified in code): M5 defeats
+  (B)'s safe-direction premise because a stale OnXSKBound
+  closure captures configuration A, runs outside applySem, and
+  can resume after apply B to restore A's fabric
+  parent/addresses (`daemon_apply_interfaces.go:98-109`,
+  `maps_sync.go:451-456`, `daemon_ha_fabric.go:41-54,99-148`)
+  — a live-kernel-state mutation the digest bracket cannot
+  see — and M4's session-clear fork can leave traffic
+  forwarding under stale authorization
+  (`daemon_policy_invalidate.go:242-280`,
+  `daemon_apply_commit.go:645-708`) while text digests and
+  applied state read green. AGY ruled (B) ("none found"
+  unsafe); SMR ruled (B) and revises to the hybrid on Codex's
+  verified evidence. THE HYBRID: (i) the LIVE-STATE classes
+  are closed BY CONSTRUCTION — the rollback fork gains
+  explicit NEUTRAL/SUCCESS/FAILURE outcome classification
+  through the boundary (the stale-timer no-op is NEUTRAL; the
+  nil-target teardown, apply, and session-clear failures are
+  FAILURE), and the OnXSKBound callback NEVER applies captured
+  state — at fire time it takes `applySem` and re-derives the
+  deferred-overlay set from the CURRENT config, abandoning on
+  mismatch, so a stale closure is a no-op by construction;
+  (ii) the CONFIG-TEXT-VISIBLE classes are named bounded
+  residuals with detection-and-recovery — (iv) the
+  receiver-rejection / dual-primary marker suppression (the
+  bracket catches the digest divergence; the operator's
+  re-drive recovers; the post-procedure suppression tail is
+  the pre-existing #5863 semantics), (v) the
+  provider-replacement and authority-invalidation publication
+  races (at worst a stale/rejected push → digest divergence →
+  re-drive), and (vi) the exactly-once debt-transfer
+  transaction (a stranded arm holds the predicate unblessed —
+  fail-closed, the safe direction; the single-retoken
+  transaction is a precision follow-up); (iii) the named
+  FOLLOW-UP ISSUE is the apply-level config-ACK wire message
+  (the receiver ACKs acceptance; the sender's marker publishes
+  only on the ACK), hardening the #5863 safety net generally
+  (`sync.go:38-76` carries no config-ACK type today). The
+  r57-ruling question is thereby answered with the only
+  position consistent with all verified evidence: (B) alone
+  leaves live-state holes (Codex's M4/M5); (A) alone keeps
+  folding digest-visible classes that the detection net
+  already covers.
 
 ---
 
@@ -5262,7 +5307,40 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   boot, per the failure-class split above);
   deterministic closure would require a producer-pause knob
   (new machinery) — per this runbook's established admit+bound
-  idiom (r29/r37/r38) the residual is admitted and bounded. The abandoned-D
+  idiom (r29/r37/r38) the residual is admitted and bounded.
+  THE r57 HYBRID RULING'S RESIDUALS (Codex ruled (A), AGY
+  ruled (B), SMR ruled (B); the hybrid is adopted on the
+  verified evidence: the LIVE-STATE classes — the rollback
+  session-clear fork and the OnXSKBound stale closure — are
+  closed by construction above because the digest net cannot
+  see kernel state; the CONFIG-TEXT-VISIBLE classes are named
+  bounded residuals with detection-and-recovery): (iv) the
+  receiver-rejection / dual-primary marker suppression (r56
+  Codex M1: the receiver rejects a config frame when it
+  considers itself primary, `daemon_ha_sync.go:544-548`, and
+  a sender whose own authority never transitioned keeps its
+  claimed marker, suppressing same-connection retries) — the
+  peer's digest then never matches the intent, the
+  interval-bracketed double read CATCHES it, and the
+  operator's re-drive (the commit push always carries the
+  newest wire generation) recovers it; the post-procedure
+  silent-suppression tail is the PRE-EXISTING #5863
+  safety-net semantics, owned by the named follow-up (below);
+  (v) the provider-replacement-after-check and
+  authority-invalidation-after-check publication races (r56
+  Codex M2/M3) — each produces at worst a stale or rejected
+  push, a digest divergence at the bracketing reads, re-drive
+  recovery; and (vi) the exactly-once debt-transfer
+  transaction (r56 Codex M6) — a mis-registered or stranded
+  arm presents as a pending arm that never completes, holding
+  the predicate UNBLESSED (fail-closed, the safe direction);
+  the single-retoken transaction is a named precision
+  follow-up. THE NAMED FOLLOW-UP ISSUE (seeded at
+  implementation): the apply-level config-ACK wire message
+  (the receiver ACKs acceptance, the sender's marker publishes
+  only on the ACK) — hardening the #5863 safety net generally,
+  beyond this runbook (`sync.go:38-76` carries no config-ACK
+  type today, `sync_conn_config.go:325-395`). The abandoned-D
   outcome is bounded AND the offline repair shape for it is
   PINNED (r38 Codex M2, verified the conflation: a
   tombstone-SUCCESS/delete-failure leaves a `Resolved:true`
@@ -6283,7 +6361,21 @@ v20 history). The delivery is TWO units:
   528-531,332-335`, `daemon_apply.go:50-51,84-85`), with the
   outcome classified at the TERMINAL outer return (a compile
   error may still be retried by `commitWithGenBinding`,
-  `daemon_apply_commit.go:102-125`), OWNED by the daemon and
+  `daemon_apply_commit.go:102-125`), with the ROLLBACK fork's
+  outcomes EXPLICIT (r57 Codex M4, verified and accepted: a
+  stale-timer return applies nothing,
+  `daemon_apply_commit.go:645-649` — NEUTRAL; a nil rollback
+  target mutates active state but only LOGS the bootstrap
+  teardown failure, `:651-683`, `bootstrap.go:314-320,356-370`
+  — FAILURE; and the normal apply and session-clear failures
+  are likewise only logged, `:697-708` — FAILURE, and
+  load-bearing: a session-clear failure leaves traffic
+  forwarding under stale authorization,
+  `daemon_policy_invalidate.go:242-280`, invisible to any
+  config-text digest): every rollback branch publishes
+  NEUTRAL/SUCCESS/FAILURE through the same boundary, with the
+  §9 rollback-fork legs (a failed rollback's session-clear
+  failure can never read green), OWNED by the daemon and
   PUBLISHED with the configstore's versioned snapshot, THREADED
   through the manager calls that defer (the tokenless
   interfaces at `apply.go:37-40,130-134` gain it), with the
@@ -6487,7 +6579,23 @@ v20 history). The delivery is TWO units:
   `syncInterfaceAttachments` detach failures becoming a
   returned terminal error with `errors.Join` over ALL
   attempted detaches (`manager_compile.go:211-214,567-591` —
-  r56 Codex m3's attempt-all rule).
+  r56 Codex m3's attempt-all rule). PLUS the OnXSKBound
+  callback's BY-CONSTRUCTION staleness closure (r57 Codex M5,
+  verified and accepted: the closure CAPTURES the installing
+  apply's `deferredOverlays` set,
+  `daemon_apply_interfaces.go:98-109`, launches via
+  `go m.OnXSKBound()` on a one-shot flag,
+  `maps_sync.go:451-456`, and runs OUTSIDE applySem — a stale
+  closure resuming after a newer apply can create the OLDER
+  apply's fabric IPVLAN overlays,
+  `daemon_ha_fabric.go:41-54,99-148`, a live-kernel-state
+  mutation the digest net cannot see): the callback NEVER
+  applies captured state — at fire time it takes `applySem`
+  (serializing against every apply) and re-derives the
+  deferred-overlay set from the CURRENT config, abandoning if
+  the state it was installed for no longer stands — so a
+  stale closure is a no-op by construction, with the §9
+  stale-callback leg.
   The counter is
   independent of generation numbers and epoch resets
   (`sync_conn_gen.go:340-362`); exposed read-only on the cluster

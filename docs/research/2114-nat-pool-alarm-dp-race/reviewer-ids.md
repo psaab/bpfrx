@@ -170,6 +170,12 @@ reviewer (joins at /engineer on the code PR).
 | r55 | Codex | codex companion task-msa7u7aj-bk42ee (session 019fbcd2-92a0-7180-9098-570a84ffff8e; first dispatch task-msa6msxd-iwk7wv infra-failed, redispatched) | NEEDS-REVISION (9 MAJOR, 2 MINOR; folds 4 PARTIAL / 1 NOT-FOLDED). Structure confirmed |
 | r55 | AGY | agy print-mode direct, one timeout retry at 12m (agy-plan-r55.md) | PLAN-READY (5/5 folds FOLDED; 3 attacks FAILED; no findings). Structure confirmed |
 | r55 | Claude SMR | in-conversation (claude-smr-plan-r55.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — per-attempt pending-set reset, IS Codex M6). Structure confirmed |
+| r56 | Codex | codex companion task-msa8wbcm-2zstda (session 019fbced-b3ad-7d31-9380-8f9c707aa29f) | NEEDS-REVISION (8 MAJOR, 3 MINOR; folds 2 FOLDED / 5 PARTIAL / 1 NOT-FOLDED). Structure confirmed |
+| r56 | AGY | agy print-mode direct (agy-plan-r56.md) | NEEDS-REVISION (1 MAJOR — debt-query control-socket stall, IS Codex M6). Structure confirmed |
+| r56 | Claude SMR | in-conversation (claude-smr-plan-r56.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — contention-leg name, IS Codex m1). Structure confirmed |
+| r57 | Codex | codex companion task-msa9tymi-t2gw2w (session 019fbd05-a7e8-75b0-a313-3f8dcd345406) | RULING ROUND: (A) — with the verified M4/M5 live-state safety argument (defeats (B)-pure). Folds 3/3 FOLDED. Structure confirmed |
+| r57 | AGY | agy print-mode direct (agy-plan-r57.md) | RULING ROUND: (B) — "none found" unsafe. Structure confirmed |
+| r57 | Claude SMR | in-conversation (claude-smr-plan-r57.md) | RULING ROUND: (B), revised to the HYBRID on Codex's verified M4/M5 evidence. Structure confirmed |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 
