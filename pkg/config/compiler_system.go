@@ -1926,115 +1926,13 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 
 		// #6588: redundancyGroupBody, not .Children — the whole body may be
 		// packed onto the instance's own Keys.
+		// Dispatch through redundancyGroupStatements — the same table
+		// isRedundancyGroupStatement is derived from, so the set of statements
+		// compiled here and the set redundancyGroupBody splits a packed line at
+		// are one thing rather than two that must be kept in step.
 		for _, child := range redundancyGroupBody(rgInst.node) {
-			switch child.Name() {
-			case "node":
-				// node <id> priority <value>
-				nodeID := 0
-				if v := nodeVal(child); v != "" {
-					if n, err := strconv.Atoi(v); err == nil {
-						nodeID = n
-					}
-				}
-				// Look for "priority" in inline keys or children
-				for i := 2; i < len(child.Keys)-1; i++ {
-					if child.Keys[i] == "priority" {
-						if n, err := strconv.Atoi(child.Keys[i+1]); err == nil {
-							rg.NodePriorities[nodeID] = n
-						}
-					}
-				}
-				if priNode := child.FindChild("priority"); priNode != nil {
-					if v := nodeVal(priNode); v != "" {
-						if n, err := strconv.Atoi(v); err == nil {
-							rg.NodePriorities[nodeID] = n
-						}
-					}
-				}
-			case "gratuitous-arp-count":
-				if v := nodeVal(child); v != "" {
-					if n, err := strconv.Atoi(v); err == nil {
-						rg.GratuitousARPCount = n
-					}
-				}
-			case "preempt":
-				rg.Preempt = true
-			case "strict-vip-ownership":
-				rg.StrictVIPOwnership = true
-			case "interface-monitor":
-				// monitorEntryNodes (#6588): the packed one-liner
-				// `interface-monitor ge-0/0/0 weight 255;` carries the monitor
-				// on the statement's OWN Keys and has no children at all, and a
-				// bracketed `[ ge-0/0/0 ge-0/0/1 ]` collapses N monitors onto
-				// one node's Keys in EVERY spelling.
-				for _, ifChild := range monitorEntryNodes(child, 1) {
-					im := &InterfaceMonitor{
-						Interface: ifChild.Name(),
-					}
-					// monitorWeightTokens reads both value locations
-					// (`ge-0/0/0 weight 255` and `ge-0/0/0 { weight 255; }`)
-					// and is FIRST-WINS, so the compiled weight no longer
-					// depends on the spelling. A malformed or duplicated
-					// weight is rejected/warned by
-					// validateMonitorWeightTokensAST; here it leaves the
-					// pre-existing 0 default.
-					if toks := monitorWeightTokens(ifChild); len(toks) > 0 {
-						if n, err := strconv.Atoi(toks[0]); err == nil {
-							im.Weight = n
-						}
-					}
-					rg.InterfaceMonitors = append(rg.InterfaceMonitors, im)
-				}
-			case "ip-monitoring":
-				ipm := &IPMonitoring{}
-				// #6588: ip-monitoring installs redundancy-group demotion debt
-				// through the same election path as interface-monitor, and it
-				// packs the same way — `ip-monitoring global-weight 255;` and
-				// `ip-monitoring family inet 10.0.1.1 weight 100;` are leaves
-				// with no children.
-				ipmEntries := packedStatementProps(child, 1, isIPMonitoringProp)
-				if gwNode := findNamedNode(ipmEntries, "global-weight"); gwNode != nil {
-					if v := nodeVal(gwNode); v != "" {
-						if n, err := strconv.Atoi(v); err == nil {
-							ipm.GlobalWeight = n
-						}
-					}
-				}
-				if gtNode := findNamedNode(ipmEntries, "global-threshold"); gtNode != nil {
-					if v := nodeVal(gtNode); v != "" {
-						if n, err := strconv.Atoi(v); err == nil {
-							ipm.GlobalThreshold = n
-						}
-					}
-				}
-				for _, familyNode := range ipmEntries {
-					if familyNode.Name() != "family" {
-						continue
-					}
-					// Compound key "family inet" vs nested family { inet { } }.
-					// inetSkip is how many of inetNode's leading Keys name the
-					// node itself rather than a monitored address, so a packed
-					// target (`family inet 10.0.1.1 weight 100;`) is unpacked
-					// from the right offset. Shared with the #6588 weight gate.
-					inetNode, inetSkip := ipMonitoringInetNode(familyNode)
-					if inetNode == nil {
-						continue
-					}
-					for _, addrChild := range monitorEntryNodes(inetNode, inetSkip) {
-						target := &IPMonitorTarget{
-							Address: addrChild.Name(),
-						}
-						// Same FIRST-WINS dual-location weight read as the
-						// interface-monitor arm above.
-						if toks := monitorWeightTokens(addrChild); len(toks) > 0 {
-							if n, err := strconv.Atoi(toks[0]); err == nil {
-								target.Weight = n
-							}
-						}
-						ipm.Targets = append(ipm.Targets, target)
-					}
-				}
-				rg.IPMonitoring = ipm
+			if compile, ok := redundancyGroupStatements[child.Name()]; ok {
+				compile(rg, child)
 			}
 		}
 
@@ -2277,16 +2175,181 @@ func redundancyGroupBody(rgNode *Node) []*Node {
 	return packedStatementProps(rgNode, skip, isRedundancyGroupStatement)
 }
 
+// redundancyGroupStatements is the SINGLE SOURCE OF TRUTH for what a
+// `redundancy-group` body may contain: it is both the compiler's dispatch
+// table and the token set redundancyGroupBody splits a packed instance line
+// at (#6588).
+//
+// The two MUST agree. A statement the compiler honours but the splitter does
+// not know is not a loud failure — on a packed line carrying more than one
+// statement its tokens are appended to whichever statement precedes it, so it
+// silently does nothing, while the SAME statement alone on a line still works.
+// A developer therefore sees it work, and ships the fold bug.
+//
+// This was previously a hand-written token list checked by a test that parsed
+// compileChassis's source and extracted its `case "..."` literals. That guard
+// passed while the statement was still dropped in three ways: a case on a
+// named CONSTANT rather than a string literal (the idiom this very file uses
+// for monitorWeightKeyword), a statement handled by a helper called outside
+// the switch, and a nested switch inside a `default:` arm. Modelling another
+// program's source text is the wrong tool; deriving both consumers from one
+// table removes the divergence by construction instead.
+//
+// Adding a statement means adding an entry here. Doing so registers it with
+// the splitter in the same edit, and a statement NOT registered here is not
+// compiled either — so the two cannot disagree.
+var redundancyGroupStatements = map[string]func(rg *RedundancyGroup, child *Node){
+	"node":                 compileRGNodePriority,
+	"gratuitous-arp-count": compileRGGratuitousARPCount,
+	"preempt":              compileRGPreempt,
+	"strict-vip-ownership": compileRGStrictVIPOwnership,
+	"interface-monitor":    compileRGInterfaceMonitors,
+	"ip-monitoring":        compileRGIPMonitoring,
+}
+
 // isRedundancyGroupStatement reports whether tok opens a statement in a
-// `redundancy-group` body. It must list every keyword compileChassis switches
-// on, or a packed tail carrying that statement is folded into its predecessor.
+// `redundancy-group` body. Derived from the dispatch table, so it can never
+// fall behind what compileChassis actually compiles.
 func isRedundancyGroupStatement(tok string) bool {
-	switch tok {
-	case "node", "gratuitous-arp-count", "preempt", "strict-vip-ownership",
-		"interface-monitor", "ip-monitoring":
-		return true
+	_, ok := redundancyGroupStatements[tok]
+	return ok
+}
+
+// compileRGNodePriority compiles a `node` statement of a redundancy-group body.
+// Registered in redundancyGroupStatements; body moved VERBATIM from the
+// switch arm it replaced (#6588).
+func compileRGNodePriority(rg *RedundancyGroup, child *Node) {
+	// node <id> priority <value>
+	nodeID := 0
+	if v := nodeVal(child); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			nodeID = n
+		}
 	}
-	return false
+	// Look for "priority" in inline keys or children
+	for i := 2; i < len(child.Keys)-1; i++ {
+		if child.Keys[i] == "priority" {
+			if n, err := strconv.Atoi(child.Keys[i+1]); err == nil {
+				rg.NodePriorities[nodeID] = n
+			}
+		}
+	}
+	if priNode := child.FindChild("priority"); priNode != nil {
+		if v := nodeVal(priNode); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				rg.NodePriorities[nodeID] = n
+			}
+		}
+	}
+}
+
+// compileRGGratuitousARPCount compiles a `gratuitous-arp-count` statement of a redundancy-group body.
+// Registered in redundancyGroupStatements; body moved VERBATIM from the
+// switch arm it replaced (#6588).
+func compileRGGratuitousARPCount(rg *RedundancyGroup, child *Node) {
+	if v := nodeVal(child); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			rg.GratuitousARPCount = n
+		}
+	}
+}
+
+// compileRGPreempt compiles a `preempt` statement of a redundancy-group body.
+// Registered in redundancyGroupStatements; body moved VERBATIM from the
+// switch arm it replaced (#6588).
+func compileRGPreempt(rg *RedundancyGroup, child *Node) {
+	rg.Preempt = true
+}
+
+// compileRGStrictVIPOwnership compiles a `strict-vip-ownership` statement of a redundancy-group body.
+// Registered in redundancyGroupStatements; body moved VERBATIM from the
+// switch arm it replaced (#6588).
+func compileRGStrictVIPOwnership(rg *RedundancyGroup, child *Node) {
+	rg.StrictVIPOwnership = true
+}
+
+// compileRGInterfaceMonitors compiles a `interface-monitor` statement of a redundancy-group body.
+// Registered in redundancyGroupStatements; body moved VERBATIM from the
+// switch arm it replaced (#6588).
+func compileRGInterfaceMonitors(rg *RedundancyGroup, child *Node) {
+	// monitorEntryNodes (#6588): the packed one-liner
+	// `interface-monitor ge-0/0/0 weight 255;` carries the monitor
+	// on the statement's OWN Keys and has no children at all, and a
+	// bracketed `[ ge-0/0/0 ge-0/0/1 ]` collapses N monitors onto
+	// one node's Keys in EVERY spelling.
+	for _, ifChild := range monitorEntryNodes(child, 1) {
+		im := &InterfaceMonitor{
+			Interface: ifChild.Name(),
+		}
+		// monitorWeightTokens reads both value locations
+		// (`ge-0/0/0 weight 255` and `ge-0/0/0 { weight 255; }`)
+		// and is FIRST-WINS, so the compiled weight no longer
+		// depends on the spelling. A malformed or duplicated
+		// weight is rejected/warned by
+		// validateMonitorWeightTokensAST; here it leaves the
+		// pre-existing 0 default.
+		if toks := monitorWeightTokens(ifChild); len(toks) > 0 {
+			if n, err := strconv.Atoi(toks[0]); err == nil {
+				im.Weight = n
+			}
+		}
+		rg.InterfaceMonitors = append(rg.InterfaceMonitors, im)
+	}
+}
+
+// compileRGIPMonitoring compiles a `ip-monitoring` statement of a redundancy-group body.
+// Registered in redundancyGroupStatements; body moved VERBATIM from the
+// switch arm it replaced (#6588).
+func compileRGIPMonitoring(rg *RedundancyGroup, child *Node) {
+	ipm := &IPMonitoring{}
+	// #6588: ip-monitoring installs redundancy-group demotion debt
+	// through the same election path as interface-monitor, and it
+	// packs the same way — `ip-monitoring global-weight 255;` and
+	// `ip-monitoring family inet 10.0.1.1 weight 100;` are leaves
+	// with no children.
+	ipmEntries := packedStatementProps(child, 1, isIPMonitoringProp)
+	if gwNode := findNamedNode(ipmEntries, "global-weight"); gwNode != nil {
+		if v := nodeVal(gwNode); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				ipm.GlobalWeight = n
+			}
+		}
+	}
+	if gtNode := findNamedNode(ipmEntries, "global-threshold"); gtNode != nil {
+		if v := nodeVal(gtNode); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				ipm.GlobalThreshold = n
+			}
+		}
+	}
+	for _, familyNode := range ipmEntries {
+		if familyNode.Name() != "family" {
+			continue
+		}
+		// Compound key "family inet" vs nested family { inet { } }.
+		// inetSkip is how many of inetNode's leading Keys name the
+		// node itself rather than a monitored address, so a packed
+		// target (`family inet 10.0.1.1 weight 100;`) is unpacked
+		// from the right offset. Shared with the #6588 weight gate.
+		inetNode, inetSkip := ipMonitoringInetNode(familyNode)
+		if inetNode == nil {
+			continue
+		}
+		for _, addrChild := range monitorEntryNodes(inetNode, inetSkip) {
+			target := &IPMonitorTarget{
+				Address: addrChild.Name(),
+			}
+			// Same FIRST-WINS dual-location weight read as the
+			// interface-monitor arm above.
+			if toks := monitorWeightTokens(addrChild); len(toks) > 0 {
+				if n, err := strconv.Atoi(toks[0]); err == nil {
+					target.Weight = n
+				}
+			}
+			ipm.Targets = append(ipm.Targets, target)
+		}
+	}
+	rg.IPMonitoring = ipm
 }
 
 // isIPMonitoringProp reports whether tok opens an `ip-monitoring` property.

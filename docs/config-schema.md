@@ -1260,7 +1260,28 @@ elects on defaults, so the WRONG NODE can hold the group — strictly worse than
 
 `redundancyGroupBody` (`compiler_system.go`) undoes it for the chassis-cluster
 surface, splitting the tail at redundancy-group statement keywords so a
-multi-statement line yields one node each. It must also pick the right offset
+multi-statement line yields one node each. Those keywords come from
+`redundancyGroupStatements`, a `map[string]func(*RedundancyGroup, *Node)` that
+is BOTH the compiler's dispatch table and the splitter's token set — adding a
+statement means adding one entry, and a statement not in the table is not
+compiled either, so the two cannot disagree.
+
+That is deliberately not a checked hand-written list. It was one: a test parsed
+`compileChassis`'s source and extracted the `case "..."` literals of its switch.
+The guard PASSED while a 7th statement was still dropped from a packed
+multi-statement line in three ways — a `case` on a named CONSTANT rather than a
+string literal (the idiom this same file uses for `monitorWeightKeyword`), a
+statement handled by a helper called outside the switch, and a nested `switch`
+inside a `default:` arm. Worse, the failure is camouflaged: the same statement
+ALONE on a line still works, because the splitter opens the first node
+regardless of the predicate. A developer adds the statement, checks the packed
+spelling, sees green, and ships the fold bug. **Modelling another program's
+source text is the wrong tool for keeping two things in step; derive both from
+one table instead.** Registering a statement the ordinary way is now correct by
+construction; compiling one WITHOUT registering it is still possible, but it
+means adding ad-hoc dispatch beside a five-line loop whose only other content is
+the table lookup — a visible deviation rather than the idiomatic path it used to
+be. It must also pick the right offset
 for the shape it is handed: `namedInstances` returns EITHER the
 `redundancy-group <id>` node itself (`Keys[0]` is the keyword, body starts at
 `Keys[2]`) OR, for a bare `redundancy-group { ... }` wrapper, a child whose

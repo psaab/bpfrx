@@ -1,3 +1,49 @@
+## 2026-08-01 — #6588 round 6: replace the source-modelling drift guard with a dispatch table
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
+- **Action**: MAJOR-C — the round-4 drift guard PASSED while a 7th
+  redundancy-group statement was still dropped from a packed multi-statement
+  line, three different ways. Verified all three firsthand at 84f660259 before
+  writing (each: build CLEAN, guard PASS, statement DROPPED):
+    m3 `case rgHoldDownKeyword:` (a named constant, not a string literal) — the
+       guard `continue`d the non-BasicLit case silently, so len(arms) stayed 6
+       and even the `< 6` floor passed. This is the idiom THIS PR introduced
+       with `const monitorWeightKeyword = "weight"`.
+    m4 statement handled by a helper called from the loop, outside the switch —
+       the guard modelled ONE switch.
+    m7 nested `switch child.Name()` inside a `default:` arm — ast.Inspect
+       returned false after matching the outer switch so it never descended.
+  Camouflage that makes it worse than a gap: the same statement ALONE on a line
+  still works (packedStatementProps opens the first node regardless of the
+  predicate), so a developer sees three greens and ships the fold bug.
+  Took the reviewer's fix rather than hardening the guard:
+  redundancyGroupStatements, a map[string]func(*RedundancyGroup, *Node), is now
+  BOTH the compiler's dispatch and the splitter's token set;
+  isRedundancyGroupStatement is derived from it. The six switch arms were
+  extracted VERBATIM into named functions (body-identity verified
+  statement-by-statement against the pre-refactor arms: 22/5/1/1/23/49
+  statements, all identical modulo indentation; no top-level continue/break in
+  any extracted body, so leaving the switch/for changed no control flow).
+  Deleted the source-parsing guard rather than leaving a tautology, and replaced
+  it with TestRedundancyGroupStatementsSurvivePackedLine_6588, which DERIVES its
+  cases from the table: every registered statement is paired with every other on
+  one packed line, in both orders, and a table entry with no sample fails the
+  completeness check. Nothing to update when the table grows.
+- **Honest limit, not claimed closed**: re-ran all three against the table.
+  m3' (named-constant KEY) and m7' (ordinary entry — no switch remains to nest
+  inside) are now HONORED. m4' still DROPS: an ad-hoc `if` in the loop that
+  compiles a statement without registering it. The table makes the idiomatic
+  path correct by construction and converts m4 from invisible to a visible
+  deviation beside a five-line loop; it does not make it impossible, and Go
+  offers no way to. Reported as such rather than claiming three-of-three.
+- **Blast radius**: contained to compileChassis in compiler_system.go. All six
+  arms needed only (rg, child) — no arm touched ch, clusterNode or rgInst — so
+  the extraction is mechanical. No other caller. Full suite exit 0 across 59
+  packages, 116 passing 6588 subtests.
+- **File(s)**: `pkg/config/compiler_system.go`,
+  `pkg/config/compiler_chassis_packed_monitor_6588_test.go`,
+  `docs/config-schema.md`, `_Log.md`
+
 ## 2026-08-01 — #6588 round 5: a regression this PR introduced, plus a second RG node shape
 
 - **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
