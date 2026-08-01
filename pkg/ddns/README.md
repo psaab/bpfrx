@@ -363,15 +363,28 @@ Two further consequences:
   `*url.URL`s and applies the host/scheme grammar in `Error()`, so the bounding
   happens on the way out rather than being trusted to the construction site.
   Chain walks are depth-bounded (`maxUnwrapDepth`) because `Unwrap` is also the
-  caller's method. The diagnostic cost — `net/http`'s internal prose, the failing
+  caller's method — and that bound now covers the STDLIB's traversal too, not
+  just this package's own recursion. `errors.Is`/`errors.As` dispatch to the
+  caller's `Unwrap`, so an error that unwraps to itself hangs them, and an
+  `Unwrap() []error` self-cycle overflows the stack. `errTreeWithinBound` walks
+  the tree under a node budget before the first `errors.As` and withholds when
+  it blows. The diagnostic cost — `net/http`'s internal prose, the failing
   address, the unknown-error type name — is accepted: an unrecognised error is
   exactly the case where we cannot say what it contains.
-- **`guardRedirect`'s refusals are grammar-bounded too.** The redirect target is
-  *provider*-supplied: a provider answering `Location: https://<our-password>.evil.example/`
-  gets the hop refused — that is the point — and, before round 7, the echoed
-  credential written to the log. Both hosts and the downgrade scheme now render
-  through `refusalHost`/`safeScheme`. The same-host **decision** still compares
-  the raw values via `redirectHost`; only the rendering changed.
+- **`guardRedirect`'s refusals are grammar-bounded, but only in the character
+  set — NOT in the content.** Both hosts and the downgrade scheme render through
+  `refusalHost`/`safeScheme`, which withhold a zone id, raw non-ASCII, or
+  anything that is not a plain reg-name. A provider answering
+  `Location: https://<our-password>.evil.example/` gets the hop refused — that is
+  the point — but `<password>.evil.example` IS a well-formed reg-name, so the
+  refusal message renders it verbatim and the credential still reaches the log.
+  `scrubURLError` records the same residual generally, and its justification —
+  the name is already in every resolver query and TLS ClientHello — does **not**
+  transfer here: `CheckRedirect` aborts before any dial, so a refused target is
+  never resolved and never sent anywhere. Closing it needs the refusal to render
+  a provider-supplied host by reference (a hop index, a hash) rather than by
+  name. The same-host **decision** still compares the raw values via
+  `redirectHost`; only the rendering changed.
 
 Gates in `url_render_class_6545_test.go`. The behavioural half pins
 `scrubURLError` by **exact equality** rather than sentinel-probing — a field

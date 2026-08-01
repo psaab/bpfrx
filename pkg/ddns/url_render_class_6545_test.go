@@ -975,6 +975,13 @@ var urlErrorProducers = map[string]bool{
 	"url.Parse":                  true,
 	"url.ParseRequestURI":        true,
 	".Do":                        true, // any client.Do / b.client.Do
+	// xml.Unmarshal was the gap at round 12, found the same way as the one
+	// below: by asking which OTHER call can put attacker text in an error.
+	// Go's XML decoder quotes declaration values back ("xml: unsupported
+	// version %q"), and Route 53 decodes a 2xx RESPONSE BODY, so a provider
+	// chooses that string outright. It rendered with %w at
+	// backend_route53.go:203.
+	"xml.Unmarshal": true,
 	// readCappedBody was the gap this list had at round 10. doRequest has TWO
 	// adjacent error returns; .Do covered the first, and the second — four
 	// lines below it — rendered readCappedBody's error with %w and no producer

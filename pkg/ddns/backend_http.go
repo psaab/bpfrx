@@ -650,7 +650,57 @@ func doRequest(ctx context.Context, client *http.Client, req *http.Request) (int
 //
 // A non-*url.Error goes through the same classifier: it is not automatically
 // URL-free just because it is not a *url.Error (round 7).
-func scrubURLError(err error) string { return scrubURLErrorAt(err, 0) }
+// errTreeWithinBound reports whether err's Unwrap tree is small enough that the
+// STDLIB can walk it safely. Round 11 bounded this file's own recursion and
+// stopped there, which was not enough: errors.Is and errors.As do their own
+// traversal, dispatching to the error's Unwrap method, and that method belongs
+// to the caller. An error whose Unwrap returns ITSELF makes errors.As spin
+// forever, and an Unwrap() []error self-cycle recurses until the stack
+// overflows -- a `fatal error` that recover() cannot catch.
+//
+// The round-11 cyclic test missed both because its root was directly a
+// *url.Error, so errors.As matched on the first node and never followed Unwrap
+// at all. The guard has to run BEFORE the first errors.As, not inside the
+// recursion it protects.
+//
+// A NODE BUDGET, not a visited set: errors are interfaces, and comparing two
+// for identity panics when the dynamic type is not comparable. A budget is
+// sufficient anyway -- a cycle exhausts it, and so does a nest deep enough to
+// overflow. Recursion here is self-limiting because every call spends budget.
+func errTreeWithinBound(err error) bool {
+	budget := maxUnwrapDepth
+	var walk func(error) bool
+	walk = func(e error) bool {
+		for e != nil {
+			if budget <= 0 {
+				return false
+			}
+			budget--
+			switch u := e.(type) {
+			case interface{ Unwrap() error }:
+				e = u.Unwrap()
+			case interface{ Unwrap() []error }:
+				for _, sub := range u.Unwrap() {
+					if !walk(sub) {
+						return false
+					}
+				}
+				return true
+			default:
+				return true
+			}
+		}
+		return true
+	}
+	return walk(err)
+}
+
+func scrubURLError(err error) string {
+	if !errTreeWithinBound(err) {
+		return string(transportWithheld)
+	}
+	return scrubURLErrorAt(err, 0)
+}
 
 // scrubURLErrorAt carries the recursion depth that maxUnwrapDepth's comment
 // always claimed to bound. scrubURLError and scrubInnerError are MUTUALLY
@@ -941,7 +991,15 @@ const (
 // The diagnostic cost is real and accepted: net/http's internal errors.New
 // prose, the failing address, and the unknown-error type name are all gone. An
 // unrecognised error is exactly the case where we cannot say what it contains.
-func scrubInnerError(err error) string { return scrubInnerErrorAt(err, 0) }
+func scrubInnerError(err error) string {
+	// Same stdlib-traversal guard as scrubURLError: this is an entry point for
+	// a caller-supplied error, and everything below it (errors.Is, errors.As,
+	// classifyTransportError) walks the tree with the caller's own Unwrap.
+	if !errTreeWithinBound(err) {
+		return string(transportWithheld)
+	}
+	return scrubInnerErrorAt(err, 0)
+}
 
 // scrubInnerErrorAt is the depth-carrying half of the mutual recursion; see
 // scrubURLErrorAt.

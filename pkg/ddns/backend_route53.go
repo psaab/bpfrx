@@ -200,7 +200,17 @@ func (b *route53Backend) listRRSet(ctx context.Context, name, rtype string) (r53
 	}
 	var resp listRRSetsXML
 	if err := xml.Unmarshal(raw, &resp); err != nil {
-		return r53LiveRRSet{}, fmt.Errorf("ddns route53: %s: decode rrset list: %w", b.name, err)
+		// SECURITY: Go's XML decoder quotes provider-controlled declaration
+		// values back in its error text, e.g.
+		//   xml: unsupported version "<whatever the body said>"; only version
+		//   1.0 is supported
+		// and `raw` is a 2xx response body, so that string is entirely
+		// attacker-chosen. A provider echoing our own update URL there puts the
+		// credential into this error, which the daemon logs. Withhold it: the
+		// prefix already says what failed, and the decoder's detail is not worth
+		// a disclosure channel.
+		return r53LiveRRSet{}, fmt.Errorf("ddns route53: %s: decode rrset list: %s",
+			b.name, scrubInnerError(err))
 	}
 	want := strings.TrimSuffix(name, ".")
 	for _, s := range resp.ResourceRecordSets.ResourceRecordSet {

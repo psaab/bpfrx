@@ -3,6 +3,7 @@ package ddns
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -142,5 +143,72 @@ func TestDeeplyNestedURLErrorDoesNotOverflowTheStack(t *testing.T) {
 	}
 	if !strings.Contains(got, string(transportWithheld)) {
 		t.Fatalf("deeply nested *url.Error did not terminate at the depth bound; got: %s", got)
+	}
+}
+
+// --- round 12: the stdlib's own traversal ---
+//
+// Round 11 bounded this package's recursion between scrubURLError and
+// scrubInnerError and stopped there. That was not the whole walk: errors.Is and
+// errors.As traverse the tree themselves, dispatching to the error's Unwrap,
+// and Unwrap belongs to the caller. The round-11 cyclic test could not see this
+// because its root was directly a *url.Error, so errors.As matched on the first
+// node and never followed Unwrap at all.
+
+// selfUnwrapError unwraps to itself. errors.As spins on it forever.
+type selfUnwrapError struct{}
+
+func (*selfUnwrapError) Error() string   { return "hostile" }
+func (e *selfUnwrapError) Unwrap() error { return e }
+
+// selfMultiUnwrapError is the Unwrap() []error form. The stdlib walks a
+// multi-error tree RECURSIVELY, so a self-cycle here overflows the stack —
+// a fatal error, which recover() cannot catch, taking the whole daemon down.
+type selfMultiUnwrapError struct{}
+
+func (*selfMultiUnwrapError) Error() string { return "hostile-multi" }
+func (e *selfMultiUnwrapError) Unwrap() []error {
+	return []error{e}
+}
+
+func TestSelfUnwrappingErrorTerminates(t *testing.T) {
+	// The failure mode is a HANG, so the value of this test is that it returns
+	// at all; `go test` timing out is the red.
+	for name, err := range map[string]error{
+		"Unwrap() error":   &selfUnwrapError{},
+		"Unwrap() []error": &selfMultiUnwrapError{},
+	} {
+		got := scrubInnerError(err)
+		if got != string(transportWithheld) {
+			t.Errorf("%s: scrubInnerError = %q, want %q — a self-cycle must be "+
+				"withheld, not classified", name, got, transportWithheld)
+		}
+		if gotURL := scrubURLError(err); gotURL != string(transportWithheld) {
+			t.Errorf("%s: scrubURLError = %q, want %q", name, gotURL, transportWithheld)
+		}
+	}
+}
+
+// TestDeepUnwrapChainTerminates is the non-cyclic sibling: a finite chain long
+// enough to matter must also be withheld rather than walked, since the budget
+// cannot tell the two apart and should not try.
+func TestDeepUnwrapChainTerminates(t *testing.T) {
+	var err error = errors.New("leaf")
+	for i := 0; i < 10_000; i++ {
+		err = fmt.Errorf("wrap %d: %w", i, err)
+	}
+	if got := scrubInnerError(err); got != string(transportWithheld) {
+		t.Errorf("deep chain: scrubInnerError = %q, want %q", got, transportWithheld)
+	}
+}
+
+// TestBoundedChainStillClassifies is the NEGATIVE CONTROL for the budget: an
+// ordinary shallow wrap must still be classified normally, so the guard cannot
+// pass by withholding everything.
+func TestBoundedChainStillClassifies(t *testing.T) {
+	err := fmt.Errorf("outer: %w", fmt.Errorf("inner: %w", io.ErrUnexpectedEOF))
+	if got := scrubInnerError(err); got != string(transportEOF) {
+		t.Errorf("shallow wrapped EOF = %q, want %q — the depth budget is "+
+			"withholding errors it should be classifying", got, transportEOF)
 	}
 }
