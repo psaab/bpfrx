@@ -94,6 +94,7 @@ func TestEpochlessCounterIsRendered_6169(t *testing.T) {
 				t.Fatalf("%s does not mark the epoch-less count historical once the latch armed\n"+
 					"--- output ---\n%s", name, out)
 			}
+			assertLatchNoteReportsFactNotEnforcement(t, name, out)
 		})
 	}
 
@@ -119,7 +120,46 @@ func TestEpochlessCounterIsRendered_6169(t *testing.T) {
 			if !strings.Contains(out, "count is historical") {
 				t.Fatalf("%s does not mark the count historical once the latch armed\n--- output ---\n%s", name, out)
 			}
+			assertLatchNoteReportsFactNotEnforcement(t, name, out)
 		})
+	}
+}
+
+// assertLatchNoteReportsFactNotEnforcement pins the armed-latch note to a
+// statement about THIS NODE'S STATE and forbids promoting it into a claim about
+// what is being enforced right now.
+//
+// Why this exists as a separate assertion rather than a wider `Contains`: the
+// note used to read "epoch-less frames now refused; count is historical" and now
+// reads "downgrade latch armed; count is historical". BOTH spellings contain
+// "count is historical", so every pre-existing assertion in this file passes
+// identically before and after that change — the guard could not fire on the one
+// runtime-visible thing the fix changed. Asserting the surviving substring is
+// not asserting the fix.
+//
+// The claim itself is false, not merely imprecise: heartbeatAuthDecision
+// short-circuits to dual-accept whenever no local control-link key is
+// configured, and UpdateConfig clears controlAuthKey WITHOUT resetting hbAuth.
+// Load a legacy unkeyed config leniently, add the key under `commit confirmed`,
+// arm the latch, then let the confirmation lapse in the same daemon: the latch
+// stays armed while every epoch-less frame is admitted unverified.
+//
+// RED-on-revert: restore "epoch-less frames now refused" in
+// epochlessExposureNote (status.go) and both the positive and the negative arm
+// below fail.
+func assertLatchNoteReportsFactNotEnforcement(t *testing.T, name, out string) {
+	t.Helper()
+	if !strings.Contains(out, "downgrade latch armed") {
+		t.Fatalf("%s does not report the armed latch as a fact about this node's state\n"+
+			"--- output ---\n%s", name, out)
+	}
+	for _, overclaim := range []string{"now refused", "frames refused", "are refused"} {
+		if strings.Contains(out, overclaim) {
+			t.Fatalf("%s promotes the armed latch into a claim about live enforcement (%q). "+
+				"An armed latch coexists with dual-accept whenever no control-link key is "+
+				"configured, so this asserts something the node does not know.\n"+
+				"--- output ---\n%s", name, overclaim, out)
+		}
 	}
 }
 

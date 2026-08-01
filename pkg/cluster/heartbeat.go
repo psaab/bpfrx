@@ -553,11 +553,17 @@ func verifyHeartbeatMAC(data, authKey []byte) bool {
 //     (Confirmed empirically: M == heartbeatReplaySessions recordings -> all
 //     replays rejected; M == heartbeatReplaySessions+1 -> sustained admits.)
 //
-// This receiver-only map cannot close that residual by itself — it needs a
-// total order over peer incarnations, which random session ids cannot provide.
-// That order SHIPPED in #6169 as the signed boot epoch (heartbeat_epoch.go):
+// This receiver-only map cannot close that residual by itself — it needs an
+// order over peer incarnations, which random session ids cannot provide. That
+// order SHIPPED in #6169 as the signed boot epoch (heartbeat_epoch.go):
 // admitAuthedLocked consults the epoch floor BEFORE this ring, so a frame from
 // a retired incarnation never reaches admit() and therefore cannot churn it.
+//
+// It is a TOTAL order only while the sender's clock advances monotonically
+// across incarnations. A backward step larger than bootEpochMaxSkew sorts a
+// later incarnation below an earlier one — the #6711 residual. That direction
+// fails CLOSED (a genuine peer is refused, never a retired one admitted), so
+// the replay property above holds regardless; what it costs is availability.
 // The ring is retained and still owns within-incarnation replay. It does NOT
 // cause a genuine-peer lockout (an evicted live-peer watermark just makes the
 // peer's next frame never-seen -> admitted) and cannot grow memory (fixed

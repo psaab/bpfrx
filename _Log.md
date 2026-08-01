@@ -66728,3 +66728,51 @@ break — `go vet` confirmed passing under every revert.
   pkg/cluster/heartbeat_epoch_bounds_6669_test.go,
   pkg/cluster/heartbeat_epoch_rollback_recovery_6669_test.go,
   pkg/cluster/heartbeat_epoch_latch_test.go, _Log.md
+
+## 2026-08-01 — #6669 fold r7: pin the status string, finish the two missed sweep sites
+
+- **Timestamp**: 2026-08-01
+- **Action**: Fold the three MINORs the r6 hostile re-gate raised on PR #6669
+  at `846e832c0`. All three are claim/coverage defects; the executable delta
+  here is one test helper.
+- **MINOR-3 was the material one — a guard that could not fire.** The fold at
+  `846e832c0` changed the armed-latch note from
+  `"(epoch-less frames now refused; count is historical)"` to
+  `"(downgrade latch armed; count is historical)"`. Every existing assertion
+  keyed on `"count is historical"` — a substring **both** spellings contain —
+  so all six latched subtests passed identically before and after the PR's one
+  runtime-visible change. Asserting the surviving substring is not asserting
+  the fix. Added `assertLatchNoteReportsFactNotEnforcement`, called from both
+  the `_latched_before_any_downgrade` and `_after_latch` loops: positively
+  requires `"downgrade latch armed"`, negatively forbids `"now refused"` /
+  `"frames refused"` / `"are refused"`.
+- **Both arms proven to fire, independently.** Mutation A (restore the old
+  string verbatim) reds the positive arm on all 6 latched subtests; mutation B
+  (`"downgrade latch armed; epoch-less frames now refused; count is historical"`
+  — deliberately satisfies the positive arm) reds the negative arm alone,
+  naming the overclaim. Mutation A alone would NOT have proven the negative arm,
+  because the positive arm `t.Fatalf`s first. `go build` + `go vet` stayed rc=0
+  under both mutations, so neither red is a build break; the three unrelated
+  `_exposure` subtests stayed PASS under both, so the guard is scoped.
+- **MINOR-1 — two sites still carried the claim this PR disproved.**
+  `heartbeat_epoch.go:566` ("this one ends at the next restart") is a production
+  comment at the `!epochOrderable` decision site, and `README.md:578-579` said
+  "ends at the next restart on either node" while `README.md:739` in the same
+  file already spelled out the narrower truth. Restarting the SENDER with the
+  wrong clock re-publishes from the same bad clock (the file now holds the lower
+  value) and stays below the floor. Both now say RECOVERABLE and point at the
+  "Recovery is narrower" paragraph rather than restating it.
+- **MINOR-2 — "total order" was unqualified** at `heartbeat.go:557` and
+  `heartbeat_epoch_test.go:18`. The boot epoch totally orders incarnations only
+  while the sender's clock advances monotonically across boots; a backward step
+  larger than `bootEpochMaxSkew` sorts a later incarnation below an earlier one
+  (#6711). Both sites now state the qualification and that the failure direction
+  is CLOSED — a genuine peer refused, never a retired one admitted — so the
+  replay property the ring comment depends on holds regardless.
+- **Validation**: `go build ./...` rc=0, `go vet ./pkg/cluster/...` rc=0,
+  `go test -race ./pkg/cluster/` ok 12.4s, the 6 latched subtests confirmed to
+  RUN by name under `-v` (not skipped), `status.go` byte-identical to the PR
+  head after restoring the mutation.
+- **File(s)**: pkg/cluster/heartbeat_epoch_status_6169_test.go,
+  pkg/cluster/heartbeat_epoch.go, pkg/cluster/heartbeat.go,
+  pkg/cluster/heartbeat_epoch_test.go, pkg/cluster/README.md, _Log.md

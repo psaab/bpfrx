@@ -575,10 +575,13 @@ peer liveness (`lastSeen`) or drive election.
     at the RIGHT time persists `T` and its peer latches floor `T`; the next
     incarnation starts at `T-2h` (still credible, above year 2020), rejects the
     intact `T` for exceeding `now+1h`, publishes `T-2h`, and is refused by the
-    peer until a restart. Both branches of the trade are lockouts; the choice is
-    between one that ends at the next restart on either node and one that never
-    ends, because chaining from an out-of-range value strands this node
-    permanently above the range its peer will ever accept. A recoverable lockout
+    peer. Both branches of the trade are lockouts; the choice is between one
+    that is RECOVERABLE and one that never ends, because chaining from an
+    out-of-range value strands this node permanently above the range its peer
+    will ever accept. Recoverable does NOT mean "a restart on either node" — an
+    earlier revision of this paragraph said that, and it is false; see
+    "Recovery is narrower than a restart on either node" under residual 3 below
+    for what actually clears it. A recoverable lockout
     beats an unrecoverable one — but the residual is real and is tracked as
     #6711, not argued away. Pinned by
     `TestRefinementValidatesThePublishedEpochNotJustThePersistedOne_6169` and

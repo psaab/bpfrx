@@ -562,10 +562,19 @@ func refineBootEpoch(path string, published *atomic.Uint64) {
 				// here too if THIS incarnation's clock has stepped back by more
 				// than bootEpochMaxSkew while still sitting above
 				// epochClockSaneFloor. The peer latched the earlier value, so
-				// declining to chain leaves this node below its floor until a
-				// restart. Both branches are lockouts; this one ends at the next
-				// restart and chaining does not end at all, which is why it is
-				// still the right way round. Carrying an intact predecessor
+				// declining to chain leaves this node below its floor. Both
+				// branches are lockouts; this one is RECOVERABLE and chaining is
+				// not, which is why it is still the right way round. Recoverable
+				// is narrower than "ends at the next restart", which an earlier
+				// revision of this comment claimed: restarting THIS node while
+				// its clock is still wrong re-publishes from the same bad clock
+				// (the file now holds the lower value), so it stays below the
+				// floor. What recovers it is fixing the clock, or a receiver
+				// restart paired with a PSK rotation — see the "Recovery is
+				// narrower" paragraph in README.md. Chaining, by contrast, ends
+				// at no restart at all: it strands this node permanently above
+				// the range its peer will ever accept. Carrying an intact
+				// predecessor
 				// across a larger backward step needs a change to persistence
 				// semantics, so it is tracked there rather than papered over
 				// here.

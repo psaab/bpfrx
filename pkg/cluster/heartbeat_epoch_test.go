@@ -15,7 +15,11 @@ import (
 // #6169: an on-link attacker holding heartbeatReplaySessions+1 or more captured
 // authenticated peer incarnations can churn the bounded session ring by REPLAY
 // ALONE and sustain forged peer liveness indefinitely. The signed boot epoch
-// gives the receiver a total order over incarnations and closes it.
+// gives the receiver an order over incarnations and closes it. That order is
+// total only while the sender's clock advances monotonically across boots — a
+// backward step larger than bootEpochMaxSkew sorts a later incarnation below an
+// earlier one (#6711), which refuses a genuine peer rather than admitting a
+// retired one.
 //
 // These tests drive the REAL readLoop auth gate over REAL signed frames.
 
