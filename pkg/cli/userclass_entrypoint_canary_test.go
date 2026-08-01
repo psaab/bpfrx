@@ -49,7 +49,7 @@ func TestSetUserClassHasOneProductionCaller_6701(t *testing.T) {
 				return werr
 			}
 			if d.IsDir() {
-				if path != root && skipCanaryDir(d.Name()) {
+				if path != root && (skipCanaryDir(d.Name()) || isNestedModuleRoot(path)) {
 					return fs.SkipDir
 				}
 				return nil
@@ -296,7 +296,7 @@ func TestSetUserClassCallersResolveThroughTheSharedResolver_6701(t *testing.T) {
 				return werr
 			}
 			if d.IsDir() {
-				if path != root && skipCanaryDir(d.Name()) {
+				if path != root && (skipCanaryDir(d.Name()) || isNestedModuleRoot(path)) {
 					return fs.SkipDir
 				}
 				return nil
@@ -531,6 +531,25 @@ func productionRoots(t *testing.T) []string {
 			"would scan nothing", root, err)
 	}
 	return []string{root}
+}
+
+// isNestedModuleRoot reports whether path is the root of a NESTED Go module —
+// a directory carrying its own go.mod.
+//
+// `go build ./...` does not descend into these, so production code inside one is
+// not part of the module under test and must not be judged by this canary. The
+// walk was widened from pkg/+cmd/ to the module root to close a real gap (a new
+// top-level package would otherwise go unscanned), and that widening is what
+// made this necessary.
+//
+// Not hypothetical: this repository carries an in-tree checkout with its own
+// go.mod holding the pre-#6701 os.Getenv("USER"), which reddened three canaries
+// on files outside the module under test while build and vet stayed clean —
+// i.e. `make test` would have failed on a maintainer's box for code this module
+// never compiles.
+func isNestedModuleRoot(path string) bool {
+	_, err := os.Stat(filepath.Join(path, "go.mod"))
+	return err == nil
 }
 
 // skipCanaryDir reports directories the canary walks must not descend into:

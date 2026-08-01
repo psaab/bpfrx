@@ -173,9 +173,21 @@ is exactly what the standard library would have done for any uid that HAS a row
 (pure-Go `os/user` reads the same file and consults no NSS), so resolved names
 are unchanged; what changes is that a uid **without** one is now unidentified
 rather than whatever the caller put in `$USER`. A cgo-enabled developer build
-loses NSS name resolution for the CLI prompt, which is a narrowing, never a
-promotion. `TestNoOsUserInIdentityResolution_6701` keeps `os/user` out of the
-package.
+loses NSS name resolution — which affects the RBAC **class decision**, not just
+the displayed prompt: an NSS-only account (LDAP, SSSD) resolves to unidentified
+and is denied. That is a narrowing and never a promotion, so it is safe in the
+direction that matters, but it is functional rather than cosmetic. The shipped
+build is `CGO_ENABLED=0`, so production is unaffected.
+`TestNoOsUserInIdentityResolution_6701` keeps `os/user` out of the package.
+
+The same narrowing reaches a second route worth naming explicitly. Host-account
+provisioning gates `useradd` on `id -- <name>` failing
+(`pkg/daemon/daemon_system.go`), so an operator account that exists only in a
+directory service never gets a local passwd row — and therefore now resolves to
+`unauthorized` on the CLI. This is sound: before #6701 that population was
+"authenticated" by `$USER`, which is to say not authenticated at all. An
+operator who needs CLI access for such an account should be given a local
+`system login user` entry.
 
 `unauthorized` is used rather than an unset class deliberately. The empty
 string is the legacy no-RBAC mode: `checkPermission` returns `nil` (allow

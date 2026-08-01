@@ -71,6 +71,16 @@ func TestNoIdentityFromEnvironment_6701(t *testing.T) {
 				if path != root && strings.HasPrefix(d.Name(), ".") {
 					return fs.SkipDir
 				}
+				// Skip NESTED GO MODULES — a directory below the root carrying
+				// its own go.mod. `go build ./...` skips them, so code inside
+				// one is not part of the module under test and must not be
+				// judged by this canary. Not hypothetical: this repository
+				// carries an in-tree checkout with its own go.mod holding the
+				// pre-#6701 os.Getenv("USER"), which reddened this canary on
+				// code this module never builds.
+				if path != root && isNestedModuleRoot(path) {
+					return fs.SkipDir
+				}
 				switch d.Name() {
 				case "vendor", "testdata", "node_modules":
 					return fs.SkipDir
@@ -188,4 +198,21 @@ func who() string {
 		t.Fatalf("synthetic detector found %v, want exactly [USER LOGNAME] — the canary predicate "+
 			"does not actually detect the defect it claims to guard", found)
 	}
+}
+
+// isNestedModuleRoot reports whether path is the root of a NESTED Go module —
+// a directory carrying its own go.mod.
+//
+// `go build ./...` does not descend into these, so production code inside one is
+// not part of the module under test. This canary walks the module ROOT (widened
+// from pkg/+cmd/ so a new top-level package cannot go unscanned), and that
+// widening is what makes this skip necessary.
+//
+// Not hypothetical: this repository carries an in-tree checkout with its own
+// go.mod holding the pre-#6701 os.Getenv("USER"). Without this skip the canary
+// reds on files outside the module under test while build and vet stay clean —
+// i.e. `make test` fails for code this module never compiles.
+func isNestedModuleRoot(path string) bool {
+	_, err := os.Stat(filepath.Join(path, "go.mod"))
+	return err == nil
 }

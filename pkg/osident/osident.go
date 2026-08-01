@@ -43,9 +43,16 @@
 // userFile) with no NSS either, so for every uid that HAS a local row the
 // resolved name is identical. What changes is that a uid WITHOUT one now
 // resolves to "unidentified" instead of to whatever the caller put in $USER —
-// and pkg/cli fails closed on unidentified. A cgo-enabled dev build loses NSS
-// name resolution for the CLI prompt, which is a narrowing, never a
-// promotion. TestNoOsUserInIdentityResolution_6701 keeps os/user out.
+// and pkg/cli fails closed on unidentified.
+//
+// A cgo-enabled dev build loses NSS name resolution — and that affects the RBAC
+// CLASS DECISION, not merely the displayed prompt. An NSS-only account (LDAP,
+// SSSD) resolves to "unidentified" and is therefore denied, where a cgo build
+// would previously have named it. That is a narrowing and never a promotion, so
+// it is safe in the direction that matters, but it is a functional narrowing
+// rather than a cosmetic one and is worth stating as such. The shipped build is
+// CGO_ENABLED=0 (see the Makefile), so production is unaffected either way.
+// TestNoOsUserInIdentityResolution_6701 keeps os/user out.
 package osident
 
 import (
