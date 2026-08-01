@@ -437,17 +437,36 @@ loop but outside the `match`; pinning the TEXT `size_of::<FragHdr>()` did
 not pin its VALUE; and the struct-layout resolver written to fix that
 skipped a field hidden behind a COMMENT.
 
-So the dependency is inverted. `userspace-xdp` emits
+So the dependency is inverted, in two layers.
+
+**Emitted facts, for the artifact.** `userspace-xdp` emits
 `XPF_SHIM_FACTS` — a `#[used]` static whose fields rustc const-evaluates
 from the real types and the real classifier: `MAX_EXT_HDRS`,
 `size_of::<FragHdr>()`, and a 256-entry table produced by the same
 `eh_class` function the walk dispatches on. It lands in its own
-`.rodata.XPF_SHIM_FACTS` section, costs **zero** verifier budget (measured:
+`.xpf_shim_facts` section (deliberately not `.rodata*`, which cilium/ebpf
+would surface as a runtime map), costs **zero** verifier budget (measured:
 947,188 insns with and without it), and `make generate` reads it back out
 of the object (`ReadShimFactsFromObject`) into the `shim_facts` block of
-`userspace_xdp_manifest.json`. `tests_shim_ext_parity.rs` compares
-userspace's MEASURED behaviour against those numbers. There is no parser,
-no arm-body literal and no layout resolver left to defeat.
+`userspace_xdp_manifest.json`.
+
+**The executed walk, for behaviour.** Three scalars cannot witness what the
+walk DOES, and claiming otherwise was wrong: four edits to the shim — the
+generic advance to `* 16`, the AH advance to `* 8`, a statement added
+inside the loop but outside the `match`, and deleting the generic arm's
+post-advance bounds revalidation — all left the fact comparison green,
+because none of them changes `MAX_EXT_HDRS`, `FragHdr` or `eh_class`. So
+the walk itself lives in `userspace-xdp/src/ipv6_ext_walk.rs`, a module
+depending only on `core`, which `tests_shim_ext_parity.rs`
+`#[path]`-includes and RUNS on a corpus of real chains alongside
+`walk_ipv6_ext_chain`. Advance arithmetic, bounds revalidation and
+resolvable chain length are compared outcomes, not source-text claims.
+
+The two layers cover different things and both are needed: the corpus
+proves the walk behaves identically, and the emitted facts travel with the
+artifact so a consumer of a prebuilt object — the Debian packaging path
+never compiles the shim crate — can check the walk's constants without a
+Rust toolchain.
 
 This also fixes a scope gap a compile-time assertion could not: an
 assertion in the shim only runs when the shim crate is COMPILED, which the
@@ -455,13 +474,11 @@ Debian packaging path never does (`debian/rules` runs `make build`, and the
 daemon embeds the tracked `.o`). Facts recorded in the manifest travel with
 the artifact and are checkable wherever a prebuilt object is consumed.
 
-**Residual, stated:** one property is still not emitted — that the shim's
-loop exits by EXHAUSTION into `parse_l4` with no post-loop over-limit
-check, which is what makes it resolve `MAX_EXT_HDRS` headers. That is a
-shape, not a value; any number the shim exported for it would be an
-assertion about its own semantics rather than a measurement.
-`shim_walk_exits_by_exhaustion` keeps a narrow source check for exactly
-that one property.
+No source-text check remains. The exhaustion semantics that make the shim
+resolve `MAX_EXT_HDRS` headers were once argued to be unemittable — "a
+shape, not a value" — and kept as a narrow source scan. Executing the walk
+dissolves that: the corpus walks chains of 0..=10 extension headers and
+compares verdicts, so the resolvable length is measured on both sides.
 
 ## SR-IOV / driver constraints
 

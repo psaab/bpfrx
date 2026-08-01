@@ -1,3 +1,79 @@
+## 2026-08-01 — #4555 round 4: execute the shim's walk instead of emitting three scalars
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Both reviewers returned MERGE-NEEDS-MAJOR on the same finding,
+  and it is a regression I introduced in round 3. Deleting the source
+  model removed coverage the three emitted facts do not replace. Four
+  edits to the shim's walk left every parity test green: the generic
+  advance changed to `* 16`, the AH advance to `* 8`, a statement added
+  inside the loop but outside the `match` (leak #3 verbatim, which round
+  3 had deliberately closed), and — worst — DELETING the generic arm's
+  post-advance bounds revalidation. None of them touches `MAX_EXT_HDRS`,
+  `FragHdr` or `eh_class`, so the emitted facts are byte-identical and
+  only the #4977 freshness hashes move. Worse, that red's message says
+  the object may be stale and to run `make generate`; following it
+  regenerates the same facts and ships the divergence — a gate silent
+  BEHIND a red whose stated remedy ships the defect, the same shape I had
+  just found in my own empty-diff message one level up.
+
+  Fixed by making the walk OBSERVABLE rather than described. Extracted it
+  into `userspace-xdp/src/ipv6_ext_walk.rs`, a module depending only on
+  `core` (no aya, no map, no std), which the shim calls and which
+  userspace-dp's parity test `#[path]`-includes and compiles for the
+  HOST. The test then runs the shim's actual code alongside
+  `walk_ipv6_ext_chain` over a corpus of real chains — lengths across the
+  7/8 boundary, declared lengths 0/1/2/5/15, AH and Fragment arms,
+  truncated buffers where a declared length overruns the packet, chains
+  whose offset passes 200 mid-walk, and all 256 next-header values as the
+  first header. Advance arithmetic, bounds revalidation and resolvable
+  chain length stop being claims about source text and become compared
+  outcomes.
+
+  The extraction is codegen-neutral: 947,188 processed insns and 5.28%
+  headroom, identical before and after, so `#[inline(always)]` folds it
+  exactly as the inline loop did.
+
+  Also deleted `shim_walk_exits_by_exhaustion`, the last source-text
+  check. Its justification was that exhaustion semantics are "a shape,
+  not a value" and therefore unemittable — true, but executing the walk
+  dissolves the problem: the corpus measures resolvable chain length on
+  both sides. And corrected the overclaims in `pkg/dataplane/README.md`
+  and the test header that said there was "nothing left to defeat",
+  which the four mutations falsify.
+
+  The emitted facts are KEPT, for the one thing they are uniquely good
+  at: travelling with the artifact, so a consumer of a prebuilt object
+  (the Debian packaging path never compiles the shim crate) can check the
+  walk's constants without a Rust toolchain.
+
+  Two harness failures of my own along the way, both worth recording. The
+  negative control asserted the shim resolves one DestOpt at offset 48,
+  which the `* 8` → `* 16` mutation changes to 56 — so it went red
+  alongside the corpus and co-signed instead of controlling. Its
+  shim-side expectations are now restricted to cases that execute NO arm
+  body at all (a chain with no extension headers, a buffer too short for
+  the fixed header). And an acceptance run killed mid-mutation left the
+  tree mutated; the next run captured that as its "pristine" baseline and
+  reported the clean tree as failing. The harness now takes an exclusive
+  lock, restores on EXIT/INT/TERM via trap, and aborts unless a GREEN
+  baseline self-check passes before it mutates anything.
+
+  Validation: `make generate` verifier PASS at 947,188 insns / 5.28%.
+  Acceptance matrix — `cargo build --release` exit 0 in every row, so
+  every red is an assertion: all four mutations red the corpus with
+  concrete divergences (`shim=L4(56,6) userspace=L4(48,6)`;
+  `shim=L4(88,6) userspace=FailClosed`; `shim=OverLimit
+  userspace=L4(424,6)`; `shim=L4(56,6) userspace=L4(48,6)`), both
+  negative controls green in all six rows. Mutation 2 run IN ISOLATION
+  with `MAX_EXT_HDRS`/`FragHdr`/`eh_class`/both advances grep-verified
+  untouched: build exit 0, only the corpus fails, and the shim resolves
+  an L4 offset OUTSIDE the buffer where userspace fails closed.
+- **File(s)**: userspace-xdp/src/ipv6_ext_walk.rs (new),
+  userspace-xdp/src/lib.rs,
+  userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  pkg/dataplane/README.md, pkg/dataplane/userspace_xdp_manifest.json,
+  pkg/dataplane/userspace_xdp_bpfel.o, _Log.md
+
 ## 2026-08-01 — #4555: teach the freshness diff about emitted-fact drift
 
 - **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)

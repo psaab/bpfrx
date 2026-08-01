@@ -29,13 +29,31 @@
 //      the field with it.
 //
 // Five leaks, each to a more innocuous edit than the last. Every fix was a
-// better model, and a better model is still a model. So the dependency is
-// inverted: the shim EMITS its resolved facts (`XPF_SHIM_FACTS`, a
-// `#[used]` static whose fields rustc const-evaluates from the real types
-// and the real classifier), `make generate` records them in
-// `pkg/dataplane/userspace_xdp_manifest.json`, and this test compares this
-// crate's MEASURED behaviour against those numbers. There is no parser, no
-// arm-body literal and no struct-layout resolver left to defeat.
+// better model, and a better model is still a model.
+//
+// The first inversion emitted three facts (`XPF_SHIM_FACTS`: `MAX_EXT_HDRS`,
+// `size_of::<FragHdr>()`, the 256-entry class table), recorded by
+// `make generate` in `pkg/dataplane/userspace_xdp_manifest.json`. That closed
+// the tautology — a falsified manifest reds against the object — but it did NOT
+// close the coverage, and claiming "nothing left to defeat" was wrong. Three
+// scalars cannot witness the walk's BEHAVIOUR. Four edits to the shim left every
+// test here green: changing the generic advance to `* 16`, changing the AH
+// advance to `* 8`, adding `if offset > 200 { break; }` in the loop body outside
+// the `match` (leak #3, verbatim), and — worst — DELETING the generic arm's
+// post-advance bounds revalidation, the security property. Worse still, the one
+// thing that did red was the #4977 freshness hash, whose message says the object
+// may be stale and to run `make generate`; following it regenerates identical
+// facts and ships the divergence.
+//
+// So the walk itself is now EXECUTED. `userspace-xdp/src/ipv6_ext_walk.rs`
+// holds the shim's real walk in a module that depends only on `core`, the shim
+// calls it, and this file `#[path]`-includes THAT FILE and runs it on real byte
+// buffers alongside `walk_ipv6_ext_chain`. Advance arithmetic, bounds
+// revalidation and resolvable chain length are outcomes compared over a corpus,
+// not claims about source text. The emitted facts are kept for what they are
+// uniquely good at: travelling with the ARTIFACT, so a consumer of a prebuilt
+// object (the Debian packaging path never compiles the shim crate) can check
+// them without a Rust toolchain.
 //
 // It also fixes a scope problem the source model could not: a compile-time
 // assertion in the shim only runs when the shim crate is compiled, which
@@ -43,15 +61,13 @@
 // daemon embeds the tracked `.o`). Facts recorded in the manifest are
 // checkable wherever a prebuilt object is consumed.
 //
-// RESIDUAL, stated plainly. One property is still not emitted: that the
-// shim's loop exits by EXHAUSTION straight into `parse_l4` with no
-// post-loop over-limit check. That is what makes it resolve `MAX_EXT_HDRS`
-// headers where this crate resolves `MAX_IPV6_EXT_HEADERS - 1`, and it is
-// a shape, not a value — any number the shim exported for it would be an
-// assertion about its own semantics rather than a measurement of them,
-// which is the modelling this file otherwise removed.
-// `shim_walk_exits_by_exhaustion` keeps a narrow source check for exactly
-// that one property, and nothing else.
+// No source-text check remains. The exhaustion semantics that make the shim
+// resolve `MAX_EXT_HDRS` headers where this crate resolves
+// `MAX_IPV6_EXT_HEADERS - 1` used to be the one property argued to be
+// unemittable — "a shape, not a value". Executing the walk dissolves that:
+// the corpus below walks chains of 0..=10 extension headers and compares
+// verdicts, so the resolvable length is measured on both sides rather than
+// asserted about either.
 
 #![allow(unused_imports)]
 
@@ -363,65 +379,6 @@ fn shim_ipv6_ext_walk_matches_userspace_walker() {
     );
 }
 
-/// The one property the shim cannot emit as a number: that its walk loop
-/// exits by EXHAUSTION straight into `parse_l4`, with no post-loop
-/// over-limit check.
-///
-/// That shape is what makes the shim resolve `MAX_EXT_HDRS` headers where
-/// this crate resolves `MAX_IPV6_EXT_HEADERS - 1`, i.e. it is the basis of
-/// the `- 1` relation asserted above. It cannot be emitted honestly: any
-/// constant the shim exported for it would be an assertion about its own
-/// semantics, not a measurement of them — exactly the modelling this file
-/// otherwise removed. So it stays a narrow source check whose scope is
-/// deliberately ONE property, not the whole walk.
-#[test]
-fn shim_walk_exits_by_exhaustion() {
-    let path = repo_root().join("userspace-xdp").join("src").join("lib.rs");
-    let src = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read the shim source at {}: {e}", path.display()));
-
-    const LOOP_HDR: &str = "for _ in 0..MAX_EXT_HDRS {";
-    let at = src.find(LOOP_HDR).expect(
-        "shim source has no `for _ in 0..MAX_EXT_HDRS {` walk loop — the #4555 `- 1` \
-         chain-length relation is derived from this loop's exit semantics; re-derive it by hand.",
-    );
-    let open = at + LOOP_HDR.len() - 1;
-    let mut depth = 0usize;
-    let mut close = None;
-    for (i, b) in src.as_bytes().iter().enumerate().skip(open) {
-        match b {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    close = Some(i);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let close = close.expect("shim walk loop has unbalanced braces");
-    let after = &src[close + 1..];
-    let parse_l4_at = after
-        .find("parse_l4(data, data_end, offset, protocol)")
-        .expect(
-            "shim `parse_ipv6` no longer calls `parse_l4(data, data_end, offset, protocol)` after \
-             the extension-header walk — re-derive the #4555 chain-length relation by hand.",
-        );
-    let between = &after[..parse_l4_at];
-    for forbidden in ["return None", "return Err", "MAX_EXT_HDRS"] {
-        assert!(
-            !between.contains(forbidden),
-            "the shim's extension-header walk gained a post-loop {forbidden:?} between the loop \
-             and parse_l4. That changes how loop EXHAUSTION is treated, so the shim no longer \
-             resolves chains of exactly MAX_EXT_HDRS headers and the `MAX_EXT_HDRS == \
-             MAX_IPV6_EXT_HEADERS - 1` relation is no longer the right one. Re-derive it. Text \
-             between the loop and parse_l4:\n{between}"
-        );
-    }
-}
-
 /// NEGATIVE CONTROL for the mutation proof.
 ///
 /// Touches NOTHING on the shim side — no manifest, no shim source. It
@@ -471,4 +428,224 @@ fn shim_ext_parity_negative_control_unchanged_classifications() {
         8,
         "the userspace walker no longer advances 8 bytes past a Fragment header (RFC 8200 §4.5)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #4555: BEHAVIOURAL parity — the shim's real walk, executed.
+// ---------------------------------------------------------------------------
+//
+// `ipv6_ext_walk.rs` is the shim's own source. It is `#[path]`-included here and
+// compiled for the host, so what runs below is the code the BPF object is built
+// from — not a description of it. Everything the source models used to assert
+// (advance arithmetic per arm, the post-advance bounds revalidation, the
+// resolvable chain length, which types are walked) becomes an observable
+// outcome of running it.
+#[path = "../../../../userspace-xdp/src/ipv6_ext_walk.rs"]
+mod shim_walk;
+
+/// A verdict both walkers can be reduced to, so they can be compared directly.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Verdict {
+    /// Resolved a terminal upper-layer header at this offset.
+    L4(usize, u8),
+    /// No-Next-Header (59): a valid terminal with no L4.
+    NoL4,
+    /// Still on an extension header at the iteration bound.
+    OverLimit,
+    /// Truncated / declared length overran the packet / offset overflow.
+    FailClosed,
+}
+
+/// Run the SHIM's walk on `buf` exactly as `parse_ipv6` does.
+fn shim_verdict(buf: &[u8], l3: usize) -> Verdict {
+    if buf.len() < l3 + 40 {
+        return Verdict::FailClosed;
+    }
+    let data = buf.as_ptr() as usize;
+    let data_end = data + buf.len();
+    let first = buf[l3 + 6];
+    let start = (l3 + 40) as u16;
+    match shim_walk::walk_ipv6_ext_headers(data, data_end, l3 as u16, first, start) {
+        None => Verdict::FailClosed,
+        Some((off, proto)) => match shim_walk::eh_class(proto) {
+            shim_walk::EH_CLASS_NONEXT => Verdict::NoL4,
+            shim_walk::EH_CLASS_TERMINAL => Verdict::L4(off as usize, proto),
+            // Loop exhausted while still on an extension header.
+            _ => Verdict::OverLimit,
+        },
+    }
+}
+
+fn userspace_verdict(buf: &[u8], l3: usize) -> Verdict {
+    match walk_ipv6_ext_chain(buf, l3).outcome {
+        ExtChainOutcome::L4(off, proto) => Verdict::L4(off, proto),
+        ExtChainOutcome::NoNextHeader => Verdict::NoL4,
+        ExtChainOutcome::OverLimit => Verdict::OverLimit,
+        ExtChainOutcome::Truncated => Verdict::FailClosed,
+    }
+}
+
+/// Build `IPv6 || headers || 20 bytes of L4`, where each header is
+/// `(type, hdr_ext_len)` and occupies `(hdr_ext_len + 1) * 8` bytes — the
+/// generic encoding. `trailing` extra bytes may be trimmed to truncate.
+fn chain(headers: &[(u8, u8)], terminal: u8, trim: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; 40];
+    buf[0] = 0x60;
+    buf[6] = headers.first().map(|h| h.0).unwrap_or(terminal);
+    for (i, (_, len)) in headers.iter().enumerate() {
+        let next = headers.get(i + 1).map(|h| h.0).unwrap_or(terminal);
+        let size = (usize::from(*len) + 1) * 8;
+        let mut hdr = vec![0u8; size];
+        hdr[0] = next;
+        hdr[1] = *len;
+        buf.extend_from_slice(&hdr);
+    }
+    buf.extend_from_slice(&[0u8; 20]);
+    buf.truncate(buf.len().saturating_sub(trim));
+    buf
+}
+
+/// The load-bearing behavioural guard: over a corpus of real chains, the shim's
+/// executed walk and this crate's walker must reach the SAME verdict.
+///
+/// This is what replaces the deleted source models. It reds on an altered
+/// advance (the offsets diverge), on a deleted bounds revalidation (a truncated
+/// chain resolves instead of failing closed), on a statement added inside the
+/// loop but outside the `match` (the chain length diverges), and on a changed
+/// walked type set (a type resolves on one side and terminates on the other).
+#[test]
+fn shim_walk_and_userspace_walk_agree_over_a_corpus() {
+    const TCP: u8 = 6;
+    const HBH: u8 = 0;
+    const DEST: u8 = 60;
+    const AH: u8 = 51;
+    const FRAG: u8 = 44;
+    const MOBILITY: u8 = 135;
+
+    let mut cases: Vec<(String, Vec<u8>)> = Vec::new();
+
+    // Chain lengths across the 7/8 resolvable boundary, minimum-size headers.
+    for n in 0..=10usize {
+        let hdrs: Vec<(u8, u8)> = (0..n).map(|_| (DEST, 0)).collect();
+        cases.push((format!("{n} x DestOpt(len=0) -> TCP"), chain(&hdrs, TCP, 0)));
+    }
+    // Declared lengths: the generic advance is (len+1)*8, so these separate
+    // `* 8` from any other multiplier.
+    for len in [0u8, 1, 2, 5, 15] {
+        cases.push((
+            format!("HbH(len={len}) -> TCP"),
+            chain(&[(HBH, len)], TCP, 0),
+        ));
+        cases.push((
+            format!("HbH(len={len}) + DestOpt(len=1) -> TCP"),
+            chain(&[(HBH, len), (DEST, 1)], TCP, 0),
+        ));
+    }
+    // Offsets past 200 while still on an extension header — the shape a
+    // statement inside the loop but outside the match perturbs.
+    cases.push((
+        "3 x DestOpt(len=15) -> TCP (offset passes 200 mid-walk)".into(),
+        chain(&[(DEST, 15), (DEST, 15), (DEST, 15)], TCP, 0),
+    ));
+    cases.push((
+        "5 x DestOpt(len=15) -> TCP".into(),
+        chain(&[(DEST, 15); 5], TCP, 0),
+    ));
+    // Truncation: the declared length runs past the packet. Without the
+    // post-advance revalidation the walk resolves an L4 offset outside the
+    // buffer instead of failing closed.
+    for trim in [1usize, 8, 20, 21, 40] {
+        cases.push((
+            format!("HbH(len=5) -> TCP, trimmed {trim}"),
+            chain(&[(HBH, 5)], TCP, trim),
+        ));
+        cases.push((
+            format!("DestOpt(len=15) -> TCP, trimmed {trim}"),
+            chain(&[(DEST, 15)], TCP, trim),
+        ));
+    }
+    // Fragment and AH have their own advance arithmetic.
+    cases.push(("Fragment -> TCP".into(), chain(&[(FRAG, 0)], TCP, 0)));
+    cases.push((
+        "DestOpt + Fragment -> TCP".into(),
+        chain(&[(DEST, 0), (FRAG, 0)], TCP, 0),
+    ));
+    for len in [0u8, 1, 3] {
+        // AH advances (len+2)*4, which is NOT the generic size for most lens,
+        // so build these buffers generously and let both walkers land where
+        // they land.
+        let mut buf = vec![0u8; 40];
+        buf[0] = 0x60;
+        buf[6] = AH;
+        buf.extend_from_slice(&[TCP, len]);
+        buf.extend_from_slice(&[0u8; 254]);
+        cases.push((format!("AH(len={len}) -> TCP"), buf));
+    }
+    // #4517 types, and a terminal that must NOT be walked.
+    cases.push((
+        "Mobility -> TCP".into(),
+        chain(&[(MOBILITY, 0)], TCP, 0),
+    ));
+    cases.push((
+        "HbH + Mobility -> TCP".into(),
+        chain(&[(HBH, 0), (MOBILITY, 0)], TCP, 0),
+    ));
+    // Every next-header value as the first header.
+    for p in 0u16..=255 {
+        cases.push((format!("first={p}"), chain(&[(p as u8, 0)], TCP, 0)));
+    }
+
+    let mut drift: Vec<String> = Vec::new();
+    for (name, buf) in &cases {
+        let s = shim_verdict(buf, 0);
+        let u = userspace_verdict(buf, 0);
+        if s != u {
+            drift.push(format!("{name}: shim={s:?} userspace={u:?}"));
+        }
+    }
+    assert!(
+        drift.is_empty(),
+        "#4555 BEHAVIOURAL parity drift between the shim's executed IPv6 extension-header walk \
+         and this crate's walk_ipv6_ext_chain, over {} chains. These are outcomes of running \
+         both walkers on the same bytes, so a divergence here is a real packet-handling \
+         difference: the shim would compute a session key from a different L4 offset (or accept \
+         a chain the forwarding path refuses) and the flow would be mis-steered or dropped. \
+         Divergences:\n  {}",
+        cases.len(),
+        drift.join("\n  ")
+    );
+}
+
+/// NEGATIVE CONTROL for the behavioural corpus.
+///
+/// Every SHIM-side expectation here must be invariant under the mutations the
+/// corpus defends against, or this is a co-signer rather than a control. An
+/// earlier draft asserted that the shim resolves one minimum-size DestOpt at
+/// offset 48 — which the `* 8` → `* 16` mutation changes to 56, so it went red
+/// alongside the corpus and proved nothing about it. That assertion is now
+/// userspace-only.
+///
+/// What is left on the shim side executes NO arm body at all:
+///   - a chain with no extension headers never enters a `match` arm, so no
+///     advance arithmetic, no revalidation and no loop-body statement applies;
+///   - a buffer too short for the fixed 40-byte header fails closed before the
+///     walk starts.
+/// Both are fixed by RFC 8200 and unchanged by any mutation to the walk, so a
+/// red here means the corpus harness or this crate's walker broke.
+#[test]
+fn shim_walk_corpus_negative_control() {
+    const TCP: u8 = 6;
+    const DEST: u8 = 60;
+    // No extension headers: L4 sits immediately after the fixed 40-byte header.
+    let plain = chain(&[], TCP, 0);
+    assert_eq!(userspace_verdict(&plain, 0), Verdict::L4(40, TCP));
+    assert_eq!(shim_verdict(&plain, 0), Verdict::L4(40, TCP));
+    // A buffer too short for the fixed header fails closed on both sides.
+    let stub = vec![0u8; 12];
+    assert_eq!(userspace_verdict(&stub, 0), Verdict::FailClosed);
+    assert_eq!(shim_verdict(&stub, 0), Verdict::FailClosed);
+    // Userspace-only: asserting the shim's offset here would track the generic
+    // advance and co-sign mutation 1.
+    let one = chain(&[(DEST, 0)], TCP, 0);
+    assert_eq!(userspace_verdict(&one, 0), Verdict::L4(48, TCP));
 }

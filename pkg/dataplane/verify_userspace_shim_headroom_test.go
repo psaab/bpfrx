@@ -1,6 +1,7 @@
 package dataplane
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -122,14 +123,35 @@ func TestUnmeasuredStatsAreNotTreatedAsAcceptableHeadroom(t *testing.T) {
 // struct's layout; this pins the compile-time assertion that backs it, so
 // the invariant cannot be deleted from the shim without a test noticing.
 func TestShimCarriesFragHdrSizeAssertion(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join("..", "..", "userspace-xdp", "src", "lib.rs"))
+	// Searched across the whole shim source tree rather than one file: the
+	// assertion moved from lib.rs into ipv6_ext_walk.rs when the walk was
+	// extracted so userspace-dp could execute it, and a path-keyed grep
+	// false-reds on a move that changes nothing about the invariant.
+	root := filepath.Join("..", "..", "userspace-xdp", "src")
+	var found bool
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(d.Name(), ".rs") {
+			return nil
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		if strings.Contains(string(b), "mem::size_of::<FragHdr>() == 8") {
+			found = true
+		}
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("read userspace-xdp/src/lib.rs: %v", err)
+		t.Fatalf("walk %s: %v", root, err)
 	}
-	src := string(data)
-	if !strings.Contains(src, "mem::size_of::<FragHdr>() == 8") {
-		t.Error("the shim no longer asserts size_of::<FragHdr>() == 8 at compile time; " +
-			"a field added to FragHdr would make it advance 9 bytes past a Fragment header " +
-			"where userspace-dp advances 8, corrupting every fragmented-chain L4 offset (#4555)")
+	if !found {
+		t.Errorf("no file under %s asserts size_of::<FragHdr>() == 8 at compile time; "+
+			"a field added to FragHdr would make the shim advance 9 bytes past a Fragment "+
+			"header where userspace-dp advances 8, corrupting every fragmented-chain L4 "+
+			"offset (#4555)", root)
 	}
 }

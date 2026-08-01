@@ -30,108 +30,6 @@ const GRE_PROTO_IPV4: u16 = 0x0800;
 const GRE_PROTO_IPV6: u16 = 0x86dd;
 const TCP_FLAG_SYN: u8 = 0x02;
 const TCP_FLAG_ACK: u8 = 0x10;
-/// #4555: iteration bound of the `parse_ipv6` extension-header walk.
-///
-/// This is an ITERATION count, not a header count, and the two walkers
-/// that must agree spend their iterations differently:
-///
-///   - This loop spends one iteration per extension header and exits by
-///     EXHAUSTION carrying whatever next-header value the last one
-///     declared. There is no post-loop over-limit check — `protocol`
-///     flows straight into `parse_l4`. So a chain of up to
-///     `MAX_EXT_HDRS` extension headers still resolves its L4.
-///   - `walk_ipv6_ext_chain` in `userspace-dp/src/afxdp/frame/inspect.rs`
-///     needs one further iteration to RETURN the terminal
-///     (`_ => return L4(..)`), and treats exhaustion as the fail-closed
-///     `OverLimit` verdict (#2292/#4743). So it resolves a chain of up to
-///     `MAX_IPV6_EXT_HEADERS - 1` extension headers.
-///
-/// The parity condition is therefore `MAX_EXT_HDRS == MAX_IPV6_EXT_HEADERS
-/// - 1`, NOT numeric equality: 7 here against 8 there means both walkers
-/// resolve 0..=7 extension headers and both refuse 8 or more. Setting this
-/// to 8 to "match" would make the shim resolve 8-header chains that
-/// userspace fails closed on.
-///
-/// THE TWO DIRECTIONS ARE NOT SYMMETRIC. Only shim-BELOW-userspace is
-/// fail-closed: a chain the shim cannot resolve leaves the unconsumed
-/// extension-header type in `ParsedPacket::protocol` with `parse_l4`'s
-/// catch-all ports 0/0, so the key misses the session map and the packet
-/// is redirected to userspace for full policy. The cost is a permanent
-/// loss of the XDP fast path for that flow, which is what #4555 fixes:
-/// before it, this was 6 against userspace's 8, so a chain of exactly 7
-/// extension headers resolved in userspace and never in the shim.
-///
-/// Shim-ABOVE-userspace must never be taken, and it is precisely the
-/// direction a future maintainer is tempted into by the constants not
-/// looking equal. At bound 8 the shim would resolve and stamp a full
-/// 5-tuple and `l4_offset` for a chain `walk_ipv6_ext_chain` refuses
-/// with `OverLimit`, then hand that meta on to consumers that TRUST it
-/// (see the pre-session dispatch below, plus userspace-dp's NAT64
-/// translation and L4 checksum recomputation, which read
-/// `meta.protocol`). That is a different and worse story than the
-/// fail-closed one above. Independently of the argument, bound 8 does
-/// not load at all — see the verifier table below.
-///
-/// `parsed.protocol` is NOT only a session-key ingredient. It also
-/// drives PRE-SESSION dispatch that terminates in the shim, before any
-/// session lookup: ESP goes to `cpumap_or_pass` for the kernel XFRM
-/// path, non-native GRE likewise for tunnel decap, WireGuard-to-firewall
-/// is steered to the kernel by `wg_steer_to_kernel`, and ICMPv6 NDP
-/// types 133-137 take `pass_local_control`. So widening the walked type
-/// set re-routes packets between the XSK path and the kernel path, not
-/// merely their session key: `IPv6 → Mobility → ESP` reached userspace
-/// over XSK before #4555 and now goes to the kernel stack. That
-/// direction is correct — userspace-dp classifies the same chain as ESP,
-/// and `DestOpt → ESP` already behaved this way — so #4555 extends
-/// deliberate existing routing to five more header types rather than
-/// inventing a path. It does mean the blast radius is wider than
-/// "session key parity", which is why this change wants a cluster smoke.
-///
-/// The bound is capped by BPF verifier budget, not by taste — the loop is
-/// fully unrolled, so each iteration duplicates every arm body and its
-/// `read_bytes` range re-validation. Measured against the 1M processed-insn
-/// cap on the pinned toolchain (`cmd/shimverify`, kernel 7.0):
-///
-///   bound 6, narrow type set (pre-#4555):  990,796 insns  PASS
-///   bound 6, wide type set:                874,873 insns  PASS
-///   bound 7, narrow type set:                      REJECT
-///   bound 7, wide type set (this):         947,188 insns  PASS
-///   bound 8, either type set:                      REJECT
-///
-/// Note the coupling: widening the generic arm below to the full #4517
-/// type set is what makes bound 7 affordable at all — folding five more
-/// next-header values into one shared arm body prunes verifier states that
-/// the narrow set spent on the `_ => break` fallthrough. Raise neither
-/// without re-running `make generate`; the #1864 verify-then-install gate
-/// in `pkg/dataplane/build-userspace-xdp.sh` is what proves a candidate
-/// loads.
-///
-/// `tests_shim_ext_parity.rs` in userspace-dp fails if this value — or the
-/// extension-header type set below — drifts from the userspace walker.
-const MAX_EXT_HDRS: usize = 7;
-const NEXTHDR_HOP: u8 = 0;
-const NEXTHDR_ROUTING: u8 = 43;
-const NEXTHDR_FRAGMENT: u8 = 44;
-const NEXTHDR_AUTH: u8 = 51;
-const NEXTHDR_DEST: u8 = 60;
-const NEXTHDR_NONE: u8 = 59;
-// #4517/#4555: the remaining generic length-prefixed extension headers
-// (byte 0 = next header, byte 1 = HdrExtLen in 8-octet units excluding
-// the first 8 → advance `(HdrExtLen + 1) * 8`), matching the set the
-// userspace walker enumerates in `frame/inspect.rs`:
-//   135 Mobility (RFC 6275 §6.1), 139 HIP (RFC 7401 §5.1),
-//   140 Shim6 (RFC 5533 §5.1), 253/254 experimental (RFC 3692/RFC 4727).
-// #4517 added these to the userspace walkers but not here, so a chain
-// like `HOP → MOBILITY → TCP` resolved to proto=TCP in userspace and
-// stopped at proto=135 in the shim — a permanent fast-path miss for the
-// flow. ESP (50) is deliberately absent on BOTH sides: the payload is
-// encrypted and the inner next-header unreadable, so stopping there is
-// correct.
-const NEXTHDR_MOBILITY: u8 = 135;
-const NEXTHDR_HIP: u8 = 139;
-const NEXTHDR_SHIM6: u8 = 140;
-const NEXTHDR_EXP1: u8 = 253;
-const NEXTHDR_EXP2: u8 = 254;
 // The BPF-side symbol names retain FALLBACK for index/map compatibility. The
 // Go/operator surface exposes these retained-shim actions as degraded-path
 // counters.
@@ -167,6 +65,12 @@ const USERSPACE_CTRL_FLAG_STRICT: u32 = 8;
 /// already-loaded flags word restores the true zero-cost-when-absent
 /// property.
 const USERSPACE_CTRL_FLAG_WG_RX: u32 = 16;
+mod ipv6_ext_walk;
+use ipv6_ext_walk::{
+    FragHdr, MAX_EXT_HDRS, NEXTHDR_AUTH, NEXTHDR_DEST, NEXTHDR_FRAGMENT, NEXTHDR_HOP,
+    NEXTHDR_ROUTING, eh_class_table, read_bytes,
+};
+
 const BINDING_QUEUES_PER_IFACE: u32 = 16;
 // MAX_INTERFACES is threaded in from bpf/headers/xpf_common.h via the
 // pkg/dataplane/build-userspace-xdp.sh wrapper, which does
@@ -400,68 +304,7 @@ struct Ipv6OptHdr {
     hdrlen: u8,
 }
 
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct FragHdr {
-    nexthdr: u8,
-    reserved: u8,
-    frag_off: u16,
-    identification: u32,
-}
 
-// #4555: the Fragment arm of `parse_ipv6` advances by
-// `size_of::<FragHdr>()`, while userspace-dp's `walk_ipv6_ext_chain`
-// advances a literal 8 (`frame/inspect.rs`). The two must agree.
-//
-// The parity guard pins the walk's arm bodies by token equality, which
-// pins the TEXT `mem::size_of::<FragHdr>()` but NOT its VALUE — adding a
-// field here would silently make the shim advance 9 bytes and corrupt
-// every Fragment-chain L4 offset while the guard still reported ok. That
-// hole was real and demonstrated. This assertion fails the shim BUILD on
-// any layout change; the guard additionally models this struct's layout
-// so the parity test reds too, rather than relying on the build alone.
-//
-// 8 is not a tunable: it is the fixed size of the IPv6 Fragment header
-// (RFC 8200 §4.5).
-const _: () = assert!(
-    mem::size_of::<FragHdr>() == 8,
-    "FragHdr must stay 8 bytes: the IPv6 Fragment header is fixed at 8 (RFC 8200 §4.5) and \
-     userspace-dp's walk_ipv6_ext_chain advances a literal 8"
-);
-
-const EH_CLASS_TERMINAL: u8 = 0;
-const EH_CLASS_GENERIC: u8 = 1;
-const EH_CLASS_AUTH: u8 = 2;
-const EH_CLASS_FRAGMENT: u8 = 3;
-const EH_CLASS_NONEXT: u8 = 4;
-
-#[inline(always)]
-const fn eh_class(protocol: u8) -> u8 {
-    match protocol {
-        NEXTHDR_HOP
-        | NEXTHDR_ROUTING
-        | NEXTHDR_DEST
-        | NEXTHDR_MOBILITY
-        | NEXTHDR_HIP
-        | NEXTHDR_SHIM6
-        | NEXTHDR_EXP1
-        | NEXTHDR_EXP2 => EH_CLASS_GENERIC,
-        NEXTHDR_AUTH => EH_CLASS_AUTH,
-        NEXTHDR_FRAGMENT => EH_CLASS_FRAGMENT,
-        NEXTHDR_NONE => EH_CLASS_NONEXT,
-        _ => EH_CLASS_TERMINAL,
-    }
-}
-
-const fn eh_class_table() -> [u8; 256] {
-    let mut table = [EH_CLASS_TERMINAL; 256];
-    let mut i = 0usize;
-    while i < 256 {
-        table[i] = eh_class(i as u8);
-        i += 1;
-    }
-    table
-}
 
 #[repr(C)]
 struct ShimFacts {
@@ -1427,41 +1270,15 @@ fn parse_ipv6(
     if (version_priority >> 4) != 6 {
         return None;
     }
-    let mut protocol = ip6[6];
-    let mut offset = l3_offset.checked_add(mem::size_of::<Ipv6Hdr>() as u16)?;
+    let protocol = ip6[6];
+    let offset = l3_offset.checked_add(mem::size_of::<Ipv6Hdr>() as u16)?;
 
-    for _ in 0..MAX_EXT_HDRS {
-        match eh_class(protocol) {
-            EH_CLASS_GENERIC => {
-                let opt = read_bytes(data, data_end, offset as usize, 2)?;
-                protocol = opt[0];
-                offset = offset.checked_add(((opt[1] as u16) + 1) * 8)?;
-                read_bytes(
-                    data,
-                    data_end,
-                    l3_offset as usize,
-                    (offset - l3_offset) as usize,
-                )?;
-            }
-            EH_CLASS_AUTH => {
-                let opt = read_bytes(data, data_end, offset as usize, 2)?;
-                protocol = opt[0];
-                offset = offset.checked_add(((opt[1] as u16) + 2) * 4)?;
-                read_bytes(
-                    data,
-                    data_end,
-                    l3_offset as usize,
-                    (offset - l3_offset) as usize,
-                )?;
-            }
-            EH_CLASS_FRAGMENT => {
-                let frag = read_bytes(data, data_end, offset as usize, 8)?;
-                protocol = frag[0];
-                offset = offset.checked_add(mem::size_of::<FragHdr>() as u16)?;
-            }
-            _ => break,
-        }
-    }
+    // #4555: the shared walk, executed verbatim by userspace-dp's parity
+    // corpus (`ipv6_ext_walk.rs` is `#[path]`-included there and driven on real
+    // buffers), so its advance arithmetic and bounds revalidation are observed
+    // rather than asserted about the source text.
+    let (offset, protocol) =
+        ipv6_ext_walk::walk_ipv6_ext_headers(data, data_end, l3_offset, protocol, offset)?;
 
     let flow_lbl0 = ip6[1];
     let dscp = ((version_priority & 0x0f) << 2) | (flow_lbl0 >> 6);
@@ -1702,13 +1519,6 @@ fn parse_l4(
     }
 }
 
-fn read_bytes<'a>(data: usize, data_end: usize, offset: usize, len: usize) -> Option<&'a [u8]> {
-    if data.checked_add(offset)?.checked_add(len)? > data_end {
-        return None;
-    }
-    let ptr = (data + offset) as *const u8;
-    Some(unsafe { core::slice::from_raw_parts(ptr, len) })
-}
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
