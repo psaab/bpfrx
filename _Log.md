@@ -66515,6 +66515,7 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-08-01
 - **Action**: #5561 round-5 fold — close the stale-negative locality window that
   let a LOCAL caller reach the api-auth credential row. Round 4 rate-limited the
   interface-address snapshot refresh for misses as well as hits (fixing a real
