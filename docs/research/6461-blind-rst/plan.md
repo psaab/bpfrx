@@ -1,46 +1,51 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.37.0 — THE TERMINAL CUT, round-121 folds (Codex
-r121's 6B/3H/2M: the admission semantics are REDEFINED rather than
-re-mechanized — "committed" = admitted to the worker's TX pipeline at
-the `!recycle_now` postblock, NOT dispatched-on-wire; the
-dispatch-drop residual is accepted deliberately with the four-point
-argument (ingress-observation state, attacker-unreachable, strictly
-stricter than master's own pre-construction telemetry admission, and
-the request-riding alternative is machinery for zero
-attacker-observable benefit). The reverse binding simplifies to the
-STORED EXPECTATION VERIFIED PER HOP — the promote-time bind step is
-gone: `fwd_companion_id` holds the producer-supplied expected id at
-install (positional: explicit; site-2b Local: the matched id; synced:
-the synthesis-stamped `expected_fwd_id`; tunnel/Shared: 0), every
-reverse→forward hop compares the probed forward's id against it plus
-key+NAT, and 0 never verifies. The different-family discriminator is
-now the CARRIED STABLE ID on the update itself (the `(nat,
-is_reverse)` compare is replaced — an exact tuple/NAT reincarnation
-has identical values yet is the ABA case): equal ids → same-family
-in-place refresh; different or zero → remove+install with full
-authority-state reinit. The precedence invalidation covers the
-COMPLETE accepted-query alias family (old and new identities) with
-the two specified drains (the WorkerScratch accumulator drained before
-the next descriptor; the worker-command invalidation buffer drained
-across all bindings before the next RX batch). `family_handle` is an
-Option — a zero-expectation reverse suppresses all forward-family
-authority while matched-R operations proceed (never an occupant
-capture). The materialize seed is exactly the replica's stored close
-bits (a blind current RST can never upgrade an alive/FIN-only
-replica); the promote publication carries the effective stored state
-(raw flags control eligibility only). The site-2b pre-install source
-is complete (Local: the pre-install re-probe snapshot; Shared: the
-shared row's carried `tcp_flags` — the across-scopes wrapper gains
-it). The accounting fallback extends to the Local identity-agreeing
-ValidatorRefused class (never Shared/identity-mismatch). The
-`account_packet -> bool` additive return is reconciled with the
-UNCHANGED-placement text; the constructor-test and §11 labels are
-current. Round-121: Codex NO (6B/3H/2M — folded this revision;
+**Status: DRAFT v10.38.0 — THE TERMINAL CUT, round-122 folds (Codex
+r122's 8B/1H/1M: the admission rule is now PER-ARM and reconciled with
+§5.2's pre-existing wire-commit semantics — the in-place arm applies at
+the postblock (the `pending_tx_prepared` push IS the admission), the
+fallback request arm carries an optional authority payload on the
+`PendingForwardRequest` and applies at the request's dispatch-admission
+success (the redirect-inbox overflow/build-failure discards report via
+the mandatory API and SKIP the apply — §5.2's mandatory no-learn
+stands); the v10.37.0 "TX-pipeline admission" redefinition is
+superseded, and the walk-the-anchor trace dies twice (geometry checks
+are hoisted before every apply; a blind attacker cannot chain slides
+without feedback; an overrun only produces fail-closed legit-close
+refusals). The precedence drain topology is corrected — INLINE
+current-binding invalidation at the install's own dispatch
+(invalidate-BEFORE-cache ordering, so descriptor N's fresh S2 cache is
+never evicted by a delayed drain), post-batch sibling fan-out (the
+existing SSOT), and the loop-top all-binding command drain. The
+invalidated family is COMPLETE (reverse_canonical added — reply
+matching accepts both reverse shapes, both separately indexed); the OLD
+family is captured at REMOVE time (LocalDelivery removes K before
+invoking the installer); `refresh_for_ha_transition`'s reindex joins
+the producer list; the buffer capacity is fixed-inline with a
+saturation→whole-cache-flush fallback (the FlushFlowCaches precedent).
+The site-2c adoption takes S2's trusted lifecycle bits and preserves
+ONLY probation + the absolute deadline (K-alive→S2-RST never
+resurrects alive; K-closing→S2-alive never transfers stale close
+authority). The family-id transport is completed:
+`MaterializeReport.family_id`, the promote's `SessionUpdate` carries
+BOTH the incoming family id AND the incoming expected_fwd_id (the
+replacement branch seeds `fwd_companion_id` from it — never blindly
+zeroes; the shared-reverse-S2-over-K path keeps its family proof), a
+successful zero-wire-id upsert surfaces its final minted id, every
+promotion sources `closing`/`reset` from the LIVE post-transition
+entry (never raw flags, never `observed_tcp_flags`), and the
+SharedPromote republication reads the final entry's fields back. The
+accepted site-2b close RE-PUBLISHES the forward shared row's close
+state INDEPENDENT of the reverse install's success (the cross-worker
+stale-alive-F hole is closed). The accounting fallback covers every
+Local identity-agreeing refusal that forwards without R (the
+non-closing OPENING-proof refusal added). Round-122: Codex NO
+(8B/1H/1M — folded this revision; r121-8 RESOLVED); AGY r120 dispatched
+(attempt 7, compact prompt); SMR r121 YES (fold verification,
+v10.37.0). Round-121: Codex NO (6B/3H/2M — folded v10.37.0;
 r120-6/7/8/11/12/13 RESOLVED); AGY r119 attempt 6: headless
-command-permission denial (six attempts documented); SMR r121 pending
-(fold verification lands with this revision). Round-120: Codex NO
-(11B/1H/1M/1L — folded
+command-permission denial (six attempts documented); SMR r121 YES.
+Round-120: Codex NO (11B/1H/1M/1L — folded
 v10.36.0; r119-8/9 RESOLVED); AGY r119: five dispatch attempts —
 two non-review content faults, two headless command-permission denials,
 one off-topic CLI-documentation response (infra per protocol; a sixth
@@ -673,7 +678,33 @@ request-build stage:
   with any chosen sequence, so a geometric check left in the tail is a
   sequence-targeted poisoning channel). `push_redirect_inbox` capacity
   discard MUST be reported (`umem/mod.rs:1290`'s reporting API) and does
-  not move the anchor (mandatory, not best-effort). **Selective
+  not move the anchor (mandatory, not best-effort). **The per-arm apply
+  points are exact (v10.38.0, round-122 Codex 1):** on the cache-hit
+  path, the IN-PLACE rewrite arm applies at the postblock
+  (`!recycle_now` after the `pending_tx_prepared` push,
+  `flow_cache_hit.rs:444-497`, `:549-552` — the push is the admission;
+  nothing between it and the TX loop drops); the FALLBACK request arm
+  carries an optional authority payload on the
+  `PendingForwardRequest` (the validated handle + the seg summary +
+  the identity — the rare arm: cross-binding or in-place failure) and
+  the apply fires at the REQUEST's dispatch-admission success, with
+  the redirect-inbox overflow / build-failure discards reporting via
+  the mandatory API and SKIPPING the apply (the §5.2 no-learn rule,
+  unchanged); the v10.37.0 "TX-pipeline admission" redefinition is
+  SUPERSEDED — it conflicted with this section's wire-commit semantics
+  (round-122 Codex 1's contradiction trace: plan §5.2/§9 always
+  prohibited learning on the overflow path). With geometry hoisted
+  BEFORE every apply point, the round-122 walk-the-anchor trace dies
+  twice: attacker-chosen geometry never reaches an apply (the
+  geometric check fires first), and the residual load-driven overflow
+  neither reports success to a blind attacker nor moves the anchor —
+  and even a landed-then-dropped sample cannot be CHAINED without
+  feedback (an off-path attacker never learns which guess succeeded;
+  each slide requires the previous one to have landed), while an
+  anchor overrun from dropped samples can only push the window PAST
+  the peer's real position, which turns a later legitimate close into
+  a REFUSAL — fail-closed, bounded lingering, the §2 posture.
+  **Selective
   no-learn:** no anchor learning on
   `NoRoute`/`NextTableUnsupported`/`MissingNeighbor` reinjection or
   ForwardCandidate build-failure fallback (`slow_path.rs:60`) — those
@@ -1534,14 +1565,20 @@ engaged.) The accept/refuse split:
   carried-handle mechanics above) — from the accept to master's
   existing accounting chokepoint (`poll_descriptor/mod.rs:3478-3503`);
   the fallback fires ONLY when the reverse-key probe missed for
-  this packet, and its producer classes are EXACTLY two (v10.37.0,
-  round-121 Codex 10): (i) an accepted close whose reverse install
-  capacity-refused, AND (ii) a LOCAL identity-agreeing
+  this packet, and its producer classes are EXACTLY the Local
+  identity-agreeing set (v10.37.0, round-121 Codex 10; completed
+  v10.38.0, round-122 Codex 9): (i) an accepted close whose reverse install
+  capacity-refused, (ii) a LOCAL identity-agreeing
   `ValidatorRefused` close — that packet is forwarded and skips the
   reverse install, so `account_packet` misses R and returns before
   deriving F; without the fallback F loses the reverse bytes/packets
   and the `observed_tcp_flags` that feed the Close harvest
-  (`expire.rs:358-371`). Shared-scope and identity-mismatch refusals
+  (`expire.rs:358-371`) — AND (iii) a LOCAL identity-agreeing
+  NON-CLOSING OPENING-proof refusal (the proof-failing ACK/PSH-ACK is
+  forwarded without installing R; the same accounting miss applies).
+  Every Local identity-agreeing refusal that forwards without R
+  carries the fallback;
+  Shared-scope and identity-mismatch refusals
   NEVER produce a fallback target (no identity-agreeing forward
   exists to charge). The charge uses
   the re-validated forward entry's `rev` counters with
@@ -1549,7 +1586,17 @@ engaged.) The accept/refuse split:
   unchanged (the reverse-entry probe folds onto the forward entry's
   `rev` by the same derivation), so both paths end with exactly one
   `rev` charge on F at master's own chokepoint with master's own
-  inputs. A SYN-ACK+FIN/RST validates the
+  inputs. AND the cross-worker closure (v10.38.0, round-122 Codex 8):
+  the accepted-close path RE-PUBLISHES the forward family's close
+  state to the shared row (and the replication) INDEPENDENT of the
+  reverse install's success — publication rode `installed` today
+  (`shared_ops.rs:857-892`), so a capacity-refused reverse install
+  would leave the stale ALIVE shared F for another worker to match
+  and synthesize/publish an alive R from (defeating the inheritance
+  and the companion-lifetime bound, `expire.rs:296-320`, `:468-523`);
+  the re-publish rides the forward entry's identity (the carried
+  handle), so the cross-worker view of the family flips to closing
+  with the mark, not at the 2 s reap. A SYN-ACK+FIN/RST validates the
   close (§5.4) but NEVER establishment-promotes (rule 5 — the
   conjunction stated). The mark itself: the
   sequential same-worker writes are ORDERED FOR THE INHERITANCE
@@ -2120,8 +2167,39 @@ adopting the shared decision/metadata, §5.6).
   `install.rs:179-180/399-400` for the gated paths. The site-2c
   materialize against an existing probation entry under the same
   canonical key ADOPTS the shared decision/metadata wholesale while
-  preserving only `last_seen_ns`/`expires_after_ns`/`probation`/alive
-  flags (v10.7.0, round-89 Codex 2 + round-90 Codex 3 — §5.6).
+  preserving only `last_seen_ns`/`expires_after_ns`/`probation` (the
+  preserved list SHRUNK v10.38.0, round-122 Codex 4: the adopted
+  entry's `closing`/`reset` come from S2's trusted replica bits — the
+  exact-seed rule — NEVER carried over from K: K-alive→S2-RST must not
+  resurrect S2 alive, and K-closing→S2-alive must not transfer stale
+  close authority across identities; the current upsert derives
+  timeout/closing/reset entirely from the supplied flags,
+  `install.rs:382-400`, so the adopt passes S2's effective seed as
+  those flags) (v10.7.0, round-89 Codex 2 + round-90 Codex 3 — §5.6).
+- The materialize/promote family-id transport (v10.38.0, round-122
+  Codex 5/6/7): the `MaterializeReport` gains `family_id: u64` (the
+  shared entry's id — materialization consumes `resolved.shared_entry`,
+  `session_glue/mod.rs:1092-1119`, and the report previously carried
+  no family id); the promote's `SessionUpdate` carries BOTH the
+  incoming family id (= the report's `family_id`) AND, for a reverse
+  entry, the incoming `expected_fwd_id` (the shared reverse row's
+  stamped expectation) — the different-family replacement branch
+  seeds `fwd_companion_id` from the update's expectation (a forward's
+  is 0), never blindly zeroes it (the shared-reverse-S2 → refused-over-
+  K → promote path keeps its family proof, `install.rs:310-315`,
+  `session_glue/mod.rs:1235-1252`, `promote.rs:99-107`); a successful
+  zero-wire-id upsert surfaces its final freshly minted id on its
+  outcome so downstream classification never reads a stale table id;
+  and EVERY promotion sources the final trusted `closing`/`reset` from
+  the LIVE post-transition entry (in hand at promote — not from the
+  report, not from raw flags, and NOT `observed_tcp_flags`, which
+  accounting deliberately ORs refused raw closes into,
+  `session/mod.rs:1177-1210`) and publishes THAT, so a probation-
+  delayed promote of a closing replica can never republish it
+  ACK-only; raw flags govern promote eligibility/accounting only. The
+  SharedPromote republication reads the final entry's fields back
+  (expectation included) rather than constructing the replica from
+  its arguments (`promote.rs:116-140`).
 - The transient-purge DECISION and dispatch are master-identical
   (v10.15.0, round-98 Codex 1-3 — the close-aware gate, the
   close-retained marker, and
@@ -2463,27 +2541,26 @@ adopting the shared decision/metadata, §5.6).
     `!recycle_now` at the recycle point (`:549-552`) — a packet whose
     rewrite/request construction FAILED on both arms still has
     `recycle_now` set, is recycled WITHOUT the apply, and never
-    advances the trusted anchor. The admission SEMANTICS are stated
-    exactly (v10.37.0, round-121 Codex 1 — a redefinition, not the
-    request-riding machinery): "committed" = ADMITTED TO THE WORKER'S
-    TX PIPELINE (the postblock), NOT dispatched-on-wire — the fallback
-    arm's enqueued request can still drop at dispatch (missing
-    binding, frame-build failure, redirect-inbox overflow —
-    `worker/lifecycle.rs:226-281`, `tx/dispatch/mod.rs:512-573`,
-    `:1378-1397`, the silent overflow `umem/mod.rs:1257-1321`), and
-    the plan accepts that residual DELIBERATELY: (i) the anchor is
-    ingress-observation state — the packet really arrived at the
-    dataplane and passed the flow's policy, so its sample is a true
-    wire observation (a middlebox's seen-window, not the endpoint's
-    accepted-into-buffer window); (ii) the residual is not
-    attacker-reachable — an off-path attacker can neither observe nor
-    induce a dispatch drop, and the sample still had to pass the
-    in-window/proof gate; (iii) the alternative (an authority payload
-    riding every pending request to dispatch success) adds per-request
-    carriage machinery for zero attacker-observable benefit; (iv)
-    master's own telemetry (`account_packet`, `:295-317`) already
-    charges pre-construction, so the postblock is strictly STRICTER
-    than master's accounting admission.
+    advances the trusted anchor. The per-arm admission rule (v10.38.0,
+    round-122 Codex 1 — the v10.37.0 "TX-pipeline admission"
+    redefinition is SUPERSEDED; §5.2's wire-commit semantics always
+    outranked it): the IN-PLACE arm's apply runs at the postblock (the
+    `pending_tx_prepared` push IS the admission — nothing between it
+    and the TX loop drops); the FALLBACK request arm carries an
+    optional authority payload (validated handle + seg summary +
+    identity) on the `PendingForwardRequest`, and the apply fires at
+    the request's dispatch-admission success — the redirect-inbox
+    overflow and build-failure discards report via the mandatory API
+    (`umem/mod.rs:1290`) and SKIP the apply (§5.2's mandatory
+    no-learn, unchanged; the dispatch paths,
+    `worker/lifecycle.rs:209-281`, `tx/dispatch/mod.rs:512-573`,
+    `:1378-1397`, `umem/mod.rs:1257-1321`). With geometry hoisted
+    before every apply point, an attacker-chosen-geometry packet never
+    reaches an apply; a landed-then-dropped sample cannot be CHAINED
+    (a blind attacker never learns which guess landed, and each
+    continuity slide requires the previous one); and an overrun can
+    only turn a later legitimate close into a fail-closed refusal
+    (bounded lingering, §2).
     `touch_if_stale`/`account_packet` at `:295-317` stay
     MASTER-VERBATIM (#2501 telemetry, not authority state).
     Same-worker single-threaded, no
@@ -2527,29 +2604,56 @@ adopting the shared decision/metadata, §5.6).
     invalidation (`flow_cache.rs:1105-1120`) would leave a stale
     descriptor active on a NEWLY-outranked alias Q. The producer/
     carrier mechanics are specified (round-121 Codex 3; the carrier
-    made concrete v10.37.0): the `SessionTable` gains a drainable
+    made concrete v10.37.0; the drain topology corrected v10.38.0,
+    round-122 Codex 2 — `poll_binding` regains control only AFTER the
+    whole RX batch returns, `poll_descriptor/mod.rs:110-131`,
+    `worker/lifecycle.rs:209-225`, so a poll-binding-level "before the
+    next descriptor" drain cannot happen): the `SessionTable` gains a
+    drainable
     `pending_invalidations` buffer (the `drain_deltas` precedent,
     `session/mod.rs:1676-1690` — the table owns the buffer and the
     install/upsert/overwrite paths push the affected alias family into
-    it, so the `bool`-returning sites keep their signatures); (i) the
-    in-poll installs (fabric-return, LocalDelivery, ForwardFlow,
-    positional reverse, MissingNeighborSeed —
-    `poll_descriptor/mod.rs:110-131`, `:981-1008`, `:2449-2458`,
-    `:2777-2787`, `:4787-4795`, `local_delivery.rs:75-115`) drain the
-    buffer into the `WorkerScratch` accumulator at the `poll_binding`
-    level and fan out to the binding's caches IMMEDIATELY before the
-    next descriptor's processing (the v10.22.0 mechanism); (ii) the
-    worker-command
-    paths (`UpsertSynced`/`UpsertLocal` — they mutate before binding
-    polling and the handler owns no caches,
+    it, so the `bool`-returning sites keep their signatures); the
+    drain runs at THREE points: (i) INLINE, current-binding — the
+    descriptor's own dispatch drains the buffer to the CURRENT
+    binding's caches immediately after any install/upsert/overwrite
+    within that descriptor's processing (the dispatch owns the binding
+    context), and the invalidation is ordered BEFORE the descriptor's
+    own cache construction (a delayed new-family invalidation can
+    never evict the descriptor's freshly cached S2 — the
+    invalidate-first-then-cache order is asserted, §9); (ii)
+    POST-BATCH, sibling bindings — the `WorkerScratch` accumulator
+    fans out to the sibling caches after the batch (the existing SSOT,
+    v10.22.0); (iii) LOOP-TOP, command path — the worker-command
+    installs (`UpsertSynced`/`UpsertLocal`,
     `session_glue/mod.rs:649-705`, `worker/loop_body/mod.rs:682-717`)
     accumulate into the same table-side buffer during the command
-    drain, and the worker fans the buffer out across ALL of its
-    bindings (left+right, `worker/lifecycle.rs:53-55`) at loop top
-    AFTER the command drain and BEFORE the next RX batch (a
-    separately sized command drain — commands are
-    rare against packets, so the all-binding fan-out cost is bounded
-    by command rate, never packet rate). A precedence-changing install
+    drain, and the worker fans the buffer across ALL of its bindings
+    (left+right, `worker/lifecycle.rs:53-55`) at loop top AFTER the
+    command drain and BEFORE the next RX batch (command-rate-bounded,
+    never packet-rate). The invalidated FAMILY is complete (v10.38.0,
+    round-122 Codex 3): canonical, reverse-canonical (the companion),
+    reverse-wire, reverse-translated, AND forward-wire query aliases —
+    reply matching accepts both reverse shapes (`key.rs:19-26`) and
+    both are separately indexed (`session/mod.rs:1920-1933`) and
+    consumed (`lookup.rs:222-250`); the buffer records the OLD family
+    at REMOVE time (`remove_entry`/`take_synced_local` push the
+    predecessor's family — LocalDelivery removes K before invoking the
+    installer, `local_delivery.rs:90-105`, `lookup.rs:407-418`, so
+    installer-only instrumentation would miss the old family) AND the
+    NEW family at install; `refresh_for_ha_transition`'s reindex
+    (`session/mod.rs:1627-1666`) joins the producer list (HA
+    refresh/demote re-keys indexes without an upsert). The capacity
+    contract (round-122 Codex 3, zero-allocation reconciliation): the
+    buffer is a fixed inline capacity sized for the per-batch maximum
+    (one descriptor can install BOTH F and R,
+    `poll_descriptor/mod.rs:2449-2458`, `:2777-2787` — two families per
+    descriptor; the batch bound is the descriptor count × 2 families ×
+    the alias count; the command path is bounded by the command-batch
+    size); on saturation the buffer sets the binding's flush-pending
+    flag and the drain performs a whole-cache flush for the affected
+    binding (the `FlushFlowCaches` precedent — rare, bounded, no
+    allocation). A precedence-changing install
     can
     never leave an old descriptor forwarding the prior winner's
     decision, and the identity check retains the backing-identity
@@ -3416,10 +3520,15 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   `materialize_shared_session_hit` for the same canonical key BEFORE
   any admission (placeholder/shared coexistence per
   `session_glue/tests.rs:704`) — the upsert ADOPTS the shared S2
-  decision/metadata wholesale while K's immutable deadline, probation
-  flag, and alive flags carry over: assert the entry's decision and
+  decision/metadata wholesale while K's immutable deadline and probation
+  flag carry over and the close state comes from S2's TRUSTED REPLICA
+  BITS (v10.38.0, round-122 Codex 4 — the alive-flags carry-over is
+  corrected: K-alive→S2-RST must not resurrect S2 alive;
+  K-closing→S2-alive must not transfer stale close authority): assert the entry's decision and
   metadata equal S2's (no S1/S2 split-brain — include a fixture where
   S2's `ForwardingResolution`/metadata differ from K's), assert the
+  adopted `closing`/`reset` equal S2's replica bits in both
+  directions, assert the
   absolute deadline is `min(K's preserved deadline, now + S2's own
   candidate)` in the §5.6 encoding (`last_seen_ns = now_ns`,
   `expires_after_ns = D.saturating_sub(now_ns)`, wheel sum re-derives
