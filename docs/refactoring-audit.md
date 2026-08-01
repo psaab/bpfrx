@@ -127,7 +127,7 @@ touches. Under parallel merges, a PR that regenerates the artifact
 correctly at its own base still lands stale, because a sibling PR grew a
 different file in between. Measured over the 40 first-parent commits
 ending at `b4605ea9d`, `master` was byte-stale in **26** of them; #6602
-and #6613 each regenerated the artifact in their own merge commit and
+and #6613 each regenerated the artifact at their own base and
 each *still* landed red, both disagreeing only on `pkg/snmp/agent.go`, a
 file neither PR touched. A gate that fails when the author did
 everything right is noise — and the noise is what let real staleness sit

@@ -63862,21 +63862,26 @@ break — `go vet` confirmed passing under every revert.
   genuinely stale (3 rows), but it keeps going stale because the criterion was
   byte-for-byte equality against a repo-GLOBAL snapshot, which cannot hold
   under parallel merges. Measured firsthand over the 40 first-parent commits
-  ending at `b4605ea9d`: master was byte-stale in 28 of them, in two runs (21
+  ending at `b4605ea9d`: master was byte-stale in 26 of them, in two runs (19
   consecutive commits reaching 22 rows of drift, then 7 more). The decisive
-  evidence is #6602 and #6613 — both regenerated the artifact in their own
-  merge commit and both still landed RED, each disagreeing only on
+  evidence is #6602 and #6613 — both regenerated the artifact AT THEIR OWN
+  BASE and both still landed RED, each disagreeing only on
   `pkg/snmp/agent.go`, a file neither PR touched (grown by #6596, which merged
   between their base and their merge). A gate that fails when the author did
   everything right is noise, and the noise is what let the earlier 21-commit
   run go unnoticed. Regenerated the artifact and changed the criterion to the
   merge-stable audit CONTENT — which files are audited, at which tier — with
-  the LOC column kept as an advisory snapshot bounded to its tier band by
+  the LOC column kept as an advisory snapshot whose bound is ASYMMETRIC
+  ([WATCH] 1500-1999 is bounded both ways; [REFACTOR] is open above, so a
+  file past 2000 can grow unwatched) checked by
   `TestHeatmapArtifactWellFormed` (per-row LOC/tier agreement + generator sort
   order, both hand-edit detectors). Added `TestGeneratorDeterministic` (the
   issue's acceptance criterion 3). `make audit-check` now classifies its own
   diff — up-to-date / ADVISORY LOC-only (exit 0) / ERROR tier-or-membership
-  (exit 1) — so it can never contradict the canary. Of the 3 drifting rows on
+  (exit 1). It validates both artifacts before diffing, but it compares the
+  sorted (tier, path) projection, so it is deliberately blind to LOC values
+  and row order and can still be green while TestHeatmapArtifactWellFormed
+  fails — `go test ./pkg/refactoraudit/` is authoritative. Of the 3 drifting rows on
   master only `pkg/dhcprelay/relay.go` (WATCH -> REFACTOR) was real staleness,
   and the new gate names exactly that.
 - **File(s)**: pkg/refactoraudit/audit_canary_test.go, pkg/refactoraudit/doc.go,

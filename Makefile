@@ -157,6 +157,22 @@ audit-check:
 		echo "ERROR: scripts/refactoring-audit.sh failed."; \
 		exit 1; \
 	}; \
+	for f in docs/refactoring-audit-current.txt "$$tmp"; do \
+		if awk 'NF == 0 { next } \
+			NF != 3 { print "  " FILENAME ": want 3 fields, got " NF ": " $$0; bad = 1; next } \
+			$$1 != "[REFACTOR]" && $$1 != "[WATCH]" { print "  " FILENAME ": bad tier " $$1 ": " $$0; bad = 1; next } \
+			$$2 !~ /^[0-9]+$$/ { print "  " FILENAME ": non-numeric LOC " $$2 ": " $$0; bad = 1 } \
+			{ rows++ } \
+			END { if (rows == 0) { print "  " FILENAME ": zero rows"; bad = 1 } exit bad }' "$$f"; then :; else \
+			echo "ERROR: $$f is malformed."; \
+			echo "  Validated BEFORE the diff, and on BOTH the committed artifact and the"; \
+			echo "  freshly generated one. Doing it after the diff let an identically"; \
+			echo "  malformed pair pass as 'up to date', and checking only the committed"; \
+			echo "  side let a broken generator through — while the Go parser rejected"; \
+			echo "  each. This target must not report green on input the suite refuses."; \
+			exit 1; \
+		fi; \
+	done; \
 	if diff -u docs/refactoring-audit-current.txt "$$tmp"; then \
 		echo "audit-check: refactoring-audit-current.txt is up to date"; \
 		exit 0; \

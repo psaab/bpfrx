@@ -131,12 +131,15 @@ func runScript(t *testing.T, root string, args ...string) string {
 // its own base still lands stale, because a sibling PR grew a different
 // file in between. That is not hypothetical — measured over the 40
 // first-parent commits ending at b4605ea9d, master was byte-stale in 26
-// of them, and #6602 and #6613 BOTH regenerated the artifact in their own
-// merge commit and BOTH still landed red, each disagreeing only on
-// pkg/snmp/agent.go, a file neither PR touched (grown by #6596, merged
-// between their base and their merge). A gate that reds when the author
-// did everything right is noise, and the noise is what let the artifact
-// sit 22 rows stale for 21 consecutive commits in the run before that.
+// of them, and #6602 and #6613 BOTH regenerated the artifact AT THEIR OWN
+// BASE and BOTH still landed red, each disagreeing only on
+// pkg/snmp/agent.go, a file neither PR touched. The precise sequence, since
+// "regenerated in its own merge commit" was the wrong description: #6602
+// regenerated at 1737 LOC in b5a524b2e, and its sync merge aac0d60dd then
+// incorporated #6596's 1823-line file WITHOUT refreshing the artifact.
+// A gate that reds when the author did everything right is noise, and the
+// noise is what let the artifact sit 22 rows stale for 21 consecutive
+// commits in the run before that.
 //
 // Tier and membership do not have that problem: they only change when a
 // file actually crosses 1500 or 2000 LOC, which is a real, rare,
