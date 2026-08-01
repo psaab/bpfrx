@@ -1046,7 +1046,8 @@ The old access patterns SWALLOWED that poison and lost the data:
   work (a missed demotion, a dropped publish/remove, a spurious lookup
   miss) on poison.
 
-`shared_ops::lock_shared_recover` replaces all of them with poison
+`shared_ops::lock_shared_recover` replaces those `shared_ops.rs` helpers
+with poison
 RECOVERY — `into_inner()` to keep the committed map, `clear_poison()` to
 restore the fast path, and a bump of `SHARED_SESSION_POISON_RECOVERIES`
 plus a sparse journald line so operators see the underlying worker panic.
@@ -1078,10 +1079,29 @@ removed a newer live entry, and an over-ceiling import bypassed the
 admission bound. A fail-OPEN on an ordering guard, reached by a path the
 #925 supervisor is designed to survive.
 
-All three reads now use `lock_shared_recover`, and `upsert_synced_session`
-takes its stored-entry and length reads under ONE guard (they were two
-separate locks, so the ceiling could be evaluated against a map that had
-changed between them).
+Those three reads in `ha/session_import.rs` now use `lock_shared_recover`,
+and `upsert_synced_session` takes its stored-entry and length reads under
+ONE guard (they were two separate locks, so the ceiling could be evaluated
+against a map that had changed between them). Each of the three is pinned
+by a test that poisons the mutex and asserts the guard still refuses —
+including the #5674 ceiling, which the pre-existing ceiling test could not
+cover because it runs on a healthy mutex.
+
+**Scope — this is not a module-wide guarantee.** What #5154 establishes is
+narrow: the three guard reads named above. Direct accesses to these maps
+OUTSIDE `shared_ops.rs` and `ha/session_import.rs` still swallow or refuse
+poison, so the shared-session surface as a whole does NOT yet recover
+uniformly. Known remaining sites, all pre-existing and filed separately:
+
+| Site | Pattern | Consequence | Issue |
+|---|---|---|---|
+| `coordinator/mod.rs` `snapshot_shared_session_entries` | `.unwrap_or_default()` | a reconcile crossing a poisoned mutex replays ZERO sessions | #6652 |
+| `coordinator/mod.rs` teardown + `types/mod.rs` `SharedSessionOwnerRgIndexes::clear` | `if let Ok(..)` | teardown skips poisoned maps/indexes, leaving torn state that still consumes the #5674 ceiling | #6653 |
+| `ha/export.rs` `snapshot_all_sessions_export` | `.map_err(..)` — refuses | the refusal fires by lock order, not by any property of the data | #6654 |
+
+Treat the section above as describing the policy `shared_ops.rs` and
+`ha/session_import.rs` implement, not a property every accessor of
+`sessions.synced` currently has.
 
 **Direction of the fix — recover the read, do not refuse the write.**
 Refusing to mutate on poison is not a coherent alternative here:

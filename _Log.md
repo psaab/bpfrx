@@ -65643,3 +65643,33 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: userspace-dp/src/afxdp/ha/session_import.rs,
   userspace-dp/src/afxdp/ha_tests.rs, userspace-dp/src/afxdp/README.md,
   _Log.md
+
+- **Timestamp**: 2026-08-01
+- **Action**: "#5154 review fold (PR #6643). (1) The #5674 ceiling read was
+  repaired but NOT test-bound — the pre-existing ceiling test
+  (`upsert_synced_session_rejects_over_ceiling_import_and_does_not_fan_out`)
+  runs on a HEALTHY mutex, so reverting the `synced_len` read alone left all
+  27 HA tests green and a future cleanup could have silently undone it. Added
+  `over_ceiling_import_rejected_on_poisoned_shared_mutex`: fills the shared
+  map to the entry cap, poisons the mutex, and asserts a new over-ceiling
+  forward is still refused, counted in `synced_import_cap_drops`, and NOT
+  fanned out to the worker queue. Mutation proof — reverting ONLY the length
+  read to `.lock().map(|s| s.len()).unwrap_or(0)`, ORDERED BEFORE the
+  recovering read, reds ONLY the new test as an assertion with the build
+  clean at 0 errors; the ordering is load-bearing because
+  `lock_shared_recover` calls `clear_poison()`, so a swallowing read placed
+  AFTER it observes a healthy mutex and the mutation is invisible. Under the
+  full origin/master form (all three reads swallowing) the new ceiling test
+  and the stale-install test both red. (2) Narrowed the afxdp README: the
+  #5154 subsection now states explicitly that it establishes the policy for
+  the three reads in `ha/session_import.rs` only, and tabulates the three
+  remaining non-recovering accessors verified firsthand —
+  `snapshot_shared_session_entries` `.unwrap_or_default()` (#6652), the
+  teardown + `SharedSessionOwnerRgIndexes::clear` `if let Ok(..)` skips
+  (#6653), and `snapshot_all_sessions_export` refusing on poison (#6654).
+  Also scoped the pre-existing #2402 paragraph's 'replaces all of them' to
+  the `shared_ops.rs` helpers it actually swept. Those three sites are
+  pre-existing and filed; NOT fixed here. Full `cargo test --release --
+  --test-threads=1` green (4355 passed / 0 failed). No cluster smoke run."
+- **File(s)**: userspace-dp/src/afxdp/ha_tests.rs,
+  userspace-dp/src/afxdp/README.md, _Log.md

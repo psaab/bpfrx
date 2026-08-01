@@ -852,6 +852,81 @@ fn upsert_synced_session_rejects_over_ceiling_import_and_does_not_fan_out() {
     );
 }
 
+// #5154: the #5674 ceiling read must RECOVER poison too. The test above
+// exercises the ceiling on a HEALTHY mutex, so it cannot see the fail-open:
+// `upsert_synced_session` read the map length with
+// `.lock().map(|s| s.len()).unwrap_or(0)`, which on a poisoned mutex yields
+// 0 — and `0 >= synced_cap` is false for ANY nonzero cap, so the aggregate
+// admission bound was skipped entirely and the over-ceiling import was
+// admitted AND fanned out to every worker queue. Identical fail-open shape to
+// the two generation guards, in the same critical section, reached by the
+// same contained worker panic.
+//
+// PARENT-RED recipe: revert ONLY the length read to
+// `.lock().map(|s| s.len()).unwrap_or(0)`, ORDERED BEFORE the recovered
+// stored-entry read. The ordering is load-bearing: `lock_shared_recover`
+// calls `clear_poison()`, so a swallowing read placed AFTER it observes a
+// healthy mutex and the mutation is invisible. Target-count = 1 read site.
+#[test]
+fn over_ceiling_import_rejected_on_poisoned_shared_mutex() {
+    let mut coordinator = Coordinator::new();
+    const LOGICAL_CEILING: u16 = 3;
+    coordinator.synced_import_cap_override = LOGICAL_CEILING as usize;
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    coordinator.workers.records.insert(
+        0,
+        WorkerRuntimeRecord::for_test(test_worker_handle(commands.clone())),
+    );
+
+    // Fill to the ENTRY cap (2×LOGICAL_CEILING): each admitted forward
+    // publishes a forward key AND a synthesized reverse companion.
+    for i in 0..LOGICAL_CEILING {
+        let entry = synced_entry_port(1000 + i, 0);
+        let key = entry.key.clone();
+        coordinator.upsert_synced_session(entry);
+        assert!(
+            synced_generation_recovered(&coordinator, &key).is_some(),
+            "setup: forward logical session {i} within the ceiling must be \
+             admitted before the map is at its entry cap"
+        );
+    }
+
+    let before = coordinator.synced_import_cap_drops_total();
+
+    poison_shared_synced(&coordinator);
+
+    // A NEW forward key beyond the ceiling, arriving while the mutex is
+    // poisoned, must still be drop-newest REJECTED.
+    let rejected = synced_entry_port(2000, 0);
+    let rejected_key = rejected.key.clone();
+    coordinator.upsert_synced_session(rejected);
+
+    assert!(
+        synced_generation_recovered(&coordinator, &rejected_key).is_none(),
+        "a poisoned shared mutex let an over-ceiling synced import through — \
+         the #5674 admission bound read the map length as 0 via the \
+         non-recovering read, so the ceiling never evaluated while the \
+         recovering write published the entry anyway"
+    );
+    assert_eq!(
+        coordinator.synced_import_cap_drops_total(),
+        before + 1,
+        "the over-ceiling import must be REFUSED and counted on a poisoned \
+         mutex, exactly as on a healthy one"
+    );
+
+    // And it must not reach any worker queue — the #5674 per-worker
+    // multiplication bound has to hold on the poisoned path too.
+    let pending = commands.lock().expect("commands");
+    assert!(
+        !pending.iter().any(|cmd| {
+            matches!(cmd, WorkerCommand::UpsertSynced(entry) if entry.key == rejected_key)
+        }),
+        "a rejected over-ceiling import must not be fanned out to any worker \
+         command queue, even when the shared mutex was poisoned"
+    );
+}
+
 // An equal- or newer-generation upsert must apply (equality is NOT refusal).
 #[test]
 fn upsert_synced_session_applies_equal_and_newer_generation() {
