@@ -1,63 +1,67 @@
-## 2026-08-01 — #5173 shim queue mis-steer: never transform the queue coordinate
+## 2026-08-01 — #5173 SPLIT: ship the coordinate fix, defer the planner half
 
 - **Timestamp**: 2026-08-01 (fix/5173-shim-queue-mis-steer)
-- **Action**: Fixed the AF_XDP queue mis-steer. `select_userspace_queue`
-  returned `rx_queue_index % queue_count`, where `queue_count` was the
-  planner's global MINIMUM RX-queue count across interfaces. AF_XDP
-  delivery is queue-bound — the kernel's `xsk_rcv_check` drops a redirect
-  whose target socket is bound to a different (netdev, queue) than the
-  packet arrived on — so a packet arriving on a queue at or above that
-  minimum was reduced onto a different queue's socket and silently
-  dropped. The raw-queue fallback meant to catch this only fired when the
-  reduced target was ABSENT, and the planner created a binding for every
-  queue below the minimum on every interface, so the reduced target always
-  existed and the fallback was dead code.
+- **Action**: Split the change after a capacity audit and two hostile
+  reviews. The shim half ships; the planner half does not.
 
-  The comment above the defect stated the invariant the code then broke
-  ("Keep the XDP handoff on the ingress queue"), which is presumably how
-  it survived. It now describes what the code does.
+  **Why split.** Moving the planner from `min(queues) x interfaces` to
+  `sum(per-interface queues)` takes the binding count from 4 to 34 on the
+  real asymmetric topology, and each binding pins its own UMEM with
+  MAP_POPULATE — ~176 MiB to ~1.34 GiB resident, 4x that again at the
+  permitted `--ring-entries 16384`. Shared UMEM does not help; it sizes a
+  group as the SUM of members. Codex separately found the XSK and
+  heartbeat maps are hard-capped at 4096 entries while the per-interface
+  sum is uncapped, and that the resulting failure can abort an apply
+  AFTER the previous dataplane is torn down — a config that planned fine
+  under the old scheme ends with no dataplane. Six further downstream
+  assumptions depend on the old count (partial heartbeat-slot zeroing,
+  1 -> 8 busy-polling worker threads, all-or-nothing readiness barriers,
+  a wedge-recovery gate that only fires at `bound == 0`, slot-keyed state
+  carry-over that reshuffles on any queue-count change, RSS pinning RX to
+  `[0, workers)`).
 
-  Two halves. The shim stops transforming the coordinate:
-  `select_userspace_queue` is the identity, and `ctrl.queue_count` is no
-  longer read at all — the planner's aggregate queue count is a userspace
-  work-distribution concept with no business changing a packet's queue.
-  The planner plans each interface's OWN queues instead of the global
-  minimum, so every queue an interface can deliver on has a binding.
+  The shim half stands alone: it removes the mis-steer and the verifier
+  cost goes DOWN. What it does not do without the planner half is make
+  queues above the old minimum WORK — they get no binding and are dropped
+  explicitly instead of being silently mis-steered to a socket the kernel
+  then rejects. Same outcome, legible instead of silent. That is a
+  shippable increment; "make them work" needs the capacity work.
 
-  A hazard the naive fix would have introduced, caught before writing it:
-  the flat binding index is `ifindex * BINDING_QUEUES_PER_IFACE + queue`,
-  and the modulo was the ONLY thing keeping that in range. Removing it
-  would let a packet on RX queue 20 read the NEXT ifindex's slot and be
-  redirected into another interface's XSK — strictly worse than the bug
-  being fixed. There was no read-side stride guard in the shim (the
-  existing dead fallback used the raw index unguarded). Added the bound
-  check; an out-of-stride queue resolves to NO binding, never a reduction.
-  The planner is capped at the same stride so it cannot emit ids the
-  manager must reject (#4894) and take the control plane down on a
-  many-queue NIC.
+  **Two corrections, both mine, both propagated into review before being
+  caught.** The comment claimed an out-of-stride read would deliver into
+  another interface's XSK. It cannot: `xsk_rcv_check()` compares BOTH
+  `xs->dev != xdp->rxq->dev` and `xs->queue_id != xdp->rxq->queue_index`,
+  so a row belonging to a different netdev AND queue is rejected on both
+  counts and dropped. Same class of silent drop, not a cross-interface
+  leak. The bound is still worth having — it makes the refusal explicit
+  and traced where the index is formed — but it guards a hazard this
+  change itself creates by removing the modulo, not a pre-existing hole.
+  Separately, calling the raw-queue fallback "dead code" understated the
+  old behaviour in the other direction: `flags == 0` means "not
+  FORWARDING-live", not "unplanned", so during every bringup, unarmed or
+  dead worker, and RG transition a planned binding read back as absent,
+  the fallback fired, and it indexed with the raw unbounded
+  `rx_queue_index`. That read was REACHABLE, not latent.
 
-  Verifier cost, measured early as instructed: the fix REDUCES it, because
-  it deletes the modulo, the queue_count branch and the whole fallback
-  lookup — 990,796 insns (origin/master, 0.92% headroom) to 797,849
-  (20.2%). The concern about a per-interface keyed lookup being expensive
-  was inverted; the lookup was already keyed by (ifindex, queue), only the
-  queue coordinate was being reduced first.
+  **The guards were keyholes.** A hostile review proved three mutations
+  that reintroduce #5173 verbatim while leaving every guard green:
+  reducing at the call site, masking inside the lookup, and shadowing
+  `selected_queue` one line ABOVE the anchor — the old check used a
+  forward-only 400-character window, so anything behind it was invisible.
+  Replaced with four FILE-SCOPED property guards: exactly one binding-map
+  read in the file with a token-exact index; `selected_queue` bound
+  exactly once with token-exact provenance; the identity function body;
+  and the whole stride-bound statement pinned by tokens rather than a
+  directional window.
 
-  Queue-major slot ordering is preserved, so a symmetric configuration
-  plans a byte-identical layout and sees zero binding churn on upgrade.
-  `queue_planner_uses_smallest_queue_count` encoded the defect as expected
-  behaviour (4 bindings for a 4-queue + 2-queue pair) and was rewritten as
-  `queue_planner_covers_each_interfaces_own_queues`.
-
-  Validation: `make generate` verifier PASS. Four-row mutation matrix,
-  build CLEAN (exit 0) in every row so every red is an assertion:
-  restoring the modulo reds the identity guard, dropping the stride check
-  reds the bound guard, reverting the planner to min() reds the coverage
-  guard, and the negative control (symmetric config unchanged) is green in
-  all four.
-- **File(s)**: userspace-xdp/src/lib.rs,
-  userspace-dp/src/server/helpers/planning.rs,
-  userspace-dp/src/main_tests.rs, userspace-dp/src/server/README.md,
+  Validation: `make generate` verifier PASS, 797,849 insns / 20.2%
+  headroom (unchanged — the corrections are comment-only). Seven-row
+  acceptance with `cargo build --release` exit 0 in every row: all six
+  mutations red, including the three that previously passed everything,
+  and the negative control (master's own
+  `queue_planner_uses_smallest_queue_count`, restored with the planner
+  revert) green in all eight rows.
+- **File(s)**: userspace-xdp/src/lib.rs, userspace-dp/src/main_tests.rs,
   pkg/dataplane/userspace_xdp_bpfel.o,
   pkg/dataplane/userspace_xdp_manifest.json, _Log.md
 

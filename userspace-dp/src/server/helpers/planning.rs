@@ -24,17 +24,6 @@ use std::io::{self, Write};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Queue stride of the shim's flat binding array (#5173/#4894).
-///
-/// The BPF side indexes `userspace_bindings` as
-/// `ifindex * BINDING_QUEUES_PER_IFACE + queue`, so this is the exclusive
-/// upper bound on a publishable queue id — beyond it a binding would address
-/// the adjacent ifindex's slots. Mirrors `BINDING_QUEUES_PER_IFACE` in
-/// `userspace-xdp/src/lib.rs`, `bindingQueuesPerIface` in
-/// `pkg/dataplane/userspace/maps_sync.go`, and `BindingQueuesPerIface` in
-/// `pkg/dataplane/constants.go`; `binding_stride_matches_shim` pins it.
-pub(crate) const BINDING_QUEUES_PER_IFACE: usize = 16;
-
 pub(crate) fn same_plan_apply_needs_binding_reconcile(
     state: &ServerState,
     previous_defer_workers: bool,
@@ -503,47 +492,15 @@ pub(crate) fn replan_bindings_from_candidates(
     if candidates.is_empty() {
         return Vec::new();
     }
-    // #5173: plan each interface's OWN RX queues, not the global minimum.
-    //
-    // This used to be `min(rx_queues)` across every interface, so an interface
-    // with more queues than the smallest one got no binding for its higher
-    // queues. The shim then reduced such a packet's queue coordinate
-    // (`rx_queue_index % queue_count`) onto a queue that DID have a binding and
-    // redirected it there — to an XSK bound to a different queue, which the
-    // kernel's `xsk_rcv_check` drops. The shim no longer reduces the
-    // coordinate, so every queue an interface can actually deliver on needs a
-    // binding of its own or its packets have nowhere to go.
-    //
-    // The cap is the binding array's queue stride: the flat index is
-    // `ifindex * BINDING_QUEUES_PER_IFACE + queue`, so a queue id at or above
-    // the stride would address the next ifindex's slots. The publish side
-    // fail-closes on such ids (#4894) and the shim now bound-checks them on
-    // read; planning past the stride would simply produce bindings the manager
-    // must reject, so stop there. Queues above the cap are a separate,
-    // pre-existing limit (#4894), not something this change can widen.
-    let planned_queues = |rx: usize| rx.min(BINDING_QUEUES_PER_IFACE);
-    let max_queue_count = candidates
+    let queue_count = candidates.iter().map(|(_, rx)| *rx).min().unwrap_or(0);
+    let interfaces = candidates
         .iter()
-        .map(|(_, rx)| planned_queues(*rx))
-        .max()
-        .unwrap_or(0);
-    let total = candidates
-        .iter()
-        .map(|(_, rx)| planned_queues(*rx))
-        .sum::<usize>();
-    let mut out = Vec::with_capacity(total);
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let mut out = Vec::with_capacity(queue_count * interfaces.len());
     let mut slot = 0u32;
-    // Queue-major ordering is preserved deliberately: for the symmetric case
-    // (every interface the same queue count) this produces byte-for-byte the
-    // same slot assignment as the previous cross-product, so the common
-    // configuration sees zero binding churn on upgrade. Only interfaces that
-    // genuinely have extra queues gain extra slots, at the end.
-    for queue_id in 0..max_queue_count {
-        for (iface, rx_queues) in &candidates {
-            if queue_id >= planned_queues(*rx_queues) {
-                // This interface has no such hardware queue.
-                continue;
-            }
+    for queue_id in 0..queue_count {
+        for iface in &interfaces {
             let mut binding = existing_by_slot.remove(&slot).unwrap_or_default();
             let had_existing = binding.last_change.is_some()
                 || binding.registered

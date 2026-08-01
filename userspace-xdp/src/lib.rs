@@ -444,13 +444,25 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     );
     // #5173: the binding index carries the queue in a fixed-width dimension
     // (`ifindex * BINDING_QUEUES_PER_IFACE + queue`), so a queue id at or above
-    // the stride would address the NEXT ifindex's slots and redirect this
-    // interface's packets into another interface's XSK. The publish side
-    // already refuses such queue ids (#4894); this is the matching read-side
-    // bound, needed because `rx_queue_index` comes from the hardware and is not
-    // clamped by anything now that the queue coordinate is no longer reduced.
-    // Never clamp or modulo it back into range — that is precisely the
-    // mis-steer this fix removes. No binding is the correct answer.
+    // the stride addresses the NEXT ifindex's row. This bound is required
+    // BECAUSE this change removed the modulo: `rx_queue_index` comes from the
+    // hardware and nothing else clamps it.
+    //
+    // What an out-of-stride read would actually do, stated precisely because an
+    // earlier version of this comment got it wrong and the error propagated
+    // into review: it reads row `(ifindex + q/16, q%16)`, which holds a socket
+    // bound to a DIFFERENT netdev and a different queue. The kernel rejects
+    // that on both counts — `xsk_rcv_check()` in `net/xdp/xsk.c` tests
+    // `xs->dev != xdp->rxq->dev || xs->queue_id != xdp->rxq->queue_index` — so
+    // the packet is DROPPED, not delivered into another interface's XSK. It is
+    // the same class of silent drop as the mis-steer this fix removes, not a
+    // cross-interface leak and not a zone-confusion bug. The bound is still
+    // worth having: it makes the refusal explicit and traced at the point the
+    // index is formed, rather than relying on the kernel to catch a key this
+    // code should never have constructed.
+    //
+    // Never clamp or modulo the queue back into range — that reintroduces the
+    // mis-steer. No binding is the correct answer.
     let binding = if selected_queue >= BINDING_QUEUES_PER_IFACE {
         None
     } else {
@@ -1476,12 +1488,21 @@ fn is_ipv6_link_local(ip: [u8; 16]) -> bool {
 /// that sat here described the invariant above correctly and then the code
 /// broke it: on any box whose interfaces have asymmetric queue counts, a packet
 /// arriving on a queue at or above that minimum was reduced onto a DIFFERENT
-/// queue's socket and silently dropped by the kernel. The raw-queue fallback
-/// meant to catch that only fired when the reduced target was absent, and the
-/// planner created a binding for every queue below the minimum on every
-/// interface — so the reduced target always existed and the fallback was dead
-/// code. RSS restriction did not save it either: it is best-effort, mlx5-only,
-/// and skipped entirely for `workers == 1` and for `workers >= queues`.
+/// queue's socket, and `xsk_rcv_check()` dropped it for the queue mismatch.
+/// RSS restriction did not save it either: it is best-effort, mlx5-only, and
+/// skipped entirely for `workers == 1` and for `workers >= queues`.
+///
+/// The raw-queue fallback that was meant to catch this fired only when the
+/// reduced target's binding was ABSENT. Calling it dead code — as an earlier
+/// version of this comment did — is true only in steady state, and understates
+/// the old behaviour. `flags == 0` means "not FORWARDING-live", not merely
+/// "unplanned": `bindingForwardingLive` in `pkg/dataplane/userspace/maps_sync.go`
+/// requires Registered && Armed && Ready && a live worker. So during every
+/// bringup, every unarmed or dead worker, and every RG transition, a planned
+/// binding reads back as absent, the fallback fired, and it indexed with the
+/// raw unbounded `rx_queue_index`. The out-of-stride read below was therefore
+/// REACHABLE on the old code, not latent — which is why the read-side bound is
+/// part of this change rather than a nicety.
 ///
 /// The identity is kept as a named function rather than inlined at the call
 /// site so that the invariant, and the reason it is an identity, stay attached
