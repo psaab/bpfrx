@@ -5,6 +5,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -33,13 +34,25 @@ var identityEnvVars = map[string]bool{
 // sites (or add a fourth) and this test names the file, line and variable and
 // goes RED.
 //
-// Scope: every non-test .go file under pkg/ and cmd/. The allowlist is EMPTY
-// and is meant to stay that way — pkg/osident.Current() is the one supported
-// way to answer "who is running this", and it reads the kernel credential.
-// os.Getenv for anything that is not an identity (XPF_*, PATH, TMPDIR, ...) is
-// untouched: the check keys on the argument literal.
+// Scope: every non-test .go file in the REPOSITORY, walked from the module
+// root rather than from pkg/ + cmd/ (#6706 MINOR-4 — a future top-level
+// production package, `internal/` or anything else a layout change adds, was
+// previously outside the walk and could read $USER unobserved). The allowlist
+// is EMPTY and is meant to stay that way — pkg/osident.Current() is the one
+// supported way to answer "who is running this", and it reads the kernel
+// credential. os.Getenv for anything that is not an identity (XPF_*, PATH,
+// TMPDIR, ...) is untouched: the check keys on the argument literal.
 func TestNoIdentityFromEnvironment_6701(t *testing.T) {
-	roots := []string{"..", filepath.Join("..", "..", "cmd")}
+	repoRoot, absErr := filepath.Abs(filepath.Join("..", ".."))
+	if absErr != nil {
+		t.Fatalf("resolve repository root: %v", absErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(repoRoot, "go.mod")); statErr != nil {
+		t.Fatalf("repository root %q has no go.mod (%v) — the canary walk root is wrong and "+
+			"would scan nothing", repoRoot, statErr)
+	}
+	roots := []string{repoRoot}
+	var filesScanned int
 
 	type hit struct {
 		pos string
@@ -53,9 +66,13 @@ func TestNoIdentityFromEnvironment_6701(t *testing.T) {
 				return err
 			}
 			if d.IsDir() {
-				// Skip vendored / generated / VCS trees.
+				// Skip vendored / generated / VCS trees, and every dotted
+				// directory (.git, .github, agent scratch, nested worktrees).
+				if path != root && strings.HasPrefix(d.Name(), ".") {
+					return fs.SkipDir
+				}
 				switch d.Name() {
-				case ".git", "vendor", "testdata", "node_modules":
+				case "vendor", "testdata", "node_modules":
 					return fs.SkipDir
 				}
 				return nil
@@ -68,6 +85,7 @@ func TestNoIdentityFromEnvironment_6701(t *testing.T) {
 			if perr != nil {
 				return nil // not our business to police unparsable files
 			}
+			filesScanned++
 			ast.Inspect(f, func(n ast.Node) bool {
 				call, ok := n.(*ast.CallExpr)
 				if !ok || len(call.Args) != 1 {
@@ -100,6 +118,10 @@ func TestNoIdentityFromEnvironment_6701(t *testing.T) {
 		if err != nil {
 			t.Fatalf("walk %s: %v", root, err)
 		}
+	}
+
+	if filesScanned == 0 {
+		t.Fatal("scanned no production files — the walk is not reaching the source it checks")
 	}
 
 	if len(hits) > 0 {

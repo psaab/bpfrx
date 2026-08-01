@@ -86,6 +86,20 @@ func fileCallsOsidentCurrent(f *ast.File) bool {
 // so a later hardening of osident.Current (say, rejecting a uid with no passwd
 // entry differently) would reach two of three sites.
 //
+// WHAT THIS CHECKS, EXACTLY (#6706 MINOR-4). It is an ADOPTION check, not a
+// dataflow one: it requires each listed package to CONTAIN an `osident.Current()`
+// call. It does NOT verify that the value from that particular call is the one
+// feeding the RBAC decision — a package could call Current() for a log line and
+// derive the decision's identity some other way and this canary would pass.
+// Proving that end-to-end across a package boundary is not something a
+// per-directory AST scan can do, and the claim is stated at what it can see
+// rather than at what would be nice to have. The DATAFLOW half is covered one
+// layer up, inside the single package where the decision is made:
+// pkg/cli TestSetUserClassCallersResolveThroughTheSharedResolver_6701 requires
+// the value cli.ResolveLoginClass returned to be the value handed to
+// SetUserClass, and pkg/daemon's behavioural tests pin what applyCLILoginClass
+// does with the Identity it is given.
+//
 // FAIL-ON-REVERT: replace `osident.Current()` at any site with an inline
 // equivalent and this test names that site and goes RED, even though the
 // program still behaves identically.

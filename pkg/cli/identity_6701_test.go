@@ -82,7 +82,7 @@ func TestResolveLoginClass_6701(t *testing.T) {
 		{
 			name:       "unidentifiable caller (no passwd entry) is NOT promoted",
 			login:      restricted,
-			id:         osident.Identity{UID: 1500},
+			id:         osident.Identity{UID: 1500, Reason: osident.ReasonNoPasswdEntry},
 			wantClass:  ClassUnidentified,
 			reasonHas:  "has no passwd entry",
 			wantNotSup: true,
@@ -153,7 +153,7 @@ func TestResolveLoginClass_6701(t *testing.T) {
 			// config row must never match it.
 			name:       "an unresolved identity does not match an empty-named config user",
 			login:      &config.LoginConfig{Users: []*config.LoginUser{{Name: "", Class: "super-user"}}},
-			id:         osident.Identity{UID: 1000},
+			id:         osident.Identity{UID: 1000, Reason: osident.ReasonNoPasswdEntry},
 			wantClass:  ClassUnidentified,
 			reasonHas:  "has no passwd entry",
 			wantNotSup: true,
@@ -350,7 +350,8 @@ func TestUnresolvedIdentityMatchesNoConfiguredUser_6701(t *testing.T) {
 		// no empty-named entry present, an unresolved caller is denied by the
 		// `listed == false` fall-through regardless, and the !Resolved branch
 		// only chooses the wording.
-		got, reason := ResolveLoginClass(loginCfg([2]string{"bob", "read-only"}), osident.Identity{UID: 1000})
+		got, reason := ResolveLoginClass(loginCfg([2]string{"bob", "read-only"}),
+			osident.Identity{UID: 1000, Reason: osident.ReasonNoPasswdEntry})
 		if got != ClassUnidentified {
 			t.Fatalf("class = %q, want %q", got, ClassUnidentified)
 		}
@@ -495,4 +496,83 @@ func TestCLIPromptDoesNotSetAClass_6701(t *testing.T) {
 		t.Fatalf("New() seeded userClass = %q; the class must come from the daemon's "+
 			"config-driven resolution, not the constructor", c.userClass)
 	}
+}
+
+// TestAmbiguousUIDFailsClosed_6706 is the policy half of the #6706 MAJOR: a uid
+// shared by two configured accounts must not lend one account's class to the
+// other.
+//
+// The escalation is entirely between LEGITIMATE accounts, which is why "a
+// duplicate-uid passwd file is already a broken host" does not dispose of it:
+//
+//	/etc/passwd:  admin:x:2001:...    bob:x:2001:...
+//	system login user admin class super-user
+//	system login user bob   class read-only
+//
+// bob's shell has kernel uid 2001 and nothing else. Resolving that to whichever
+// passwd row comes first — os/user's behaviour — hands bob `super-user`.
+// osident now reports the uid as unresolved with ReasonAmbiguousUID, and this
+// pins that the resolver denies on it rather than matching either name.
+//
+// Provisioning mitigates but does not close it: pkg/daemon reconcileSystemUsers
+// invokes `useradd` without `-o`, so xpf never MAKES a duplicate — but a
+// pre-existing, hand-edited or directory-supplied alias is not xpf's to prevent,
+// and an authorization decision may not depend on someone else's hygiene.
+func TestAmbiguousUIDFailsClosed_6706(t *testing.T) {
+	login := loginCfg(
+		[2]string{"admin", "super-user"},
+		[2]string{"bob", "read-only"},
+	)
+
+	t.Run("a non-root ambiguous uid gets neither account's class", func(t *testing.T) {
+		got, reason := ResolveLoginClass(login,
+			osident.Identity{UID: 2001, Reason: osident.ReasonAmbiguousUID})
+		if got != ClassUnidentified {
+			t.Fatalf("class = %q, want the fail-closed %q — a uid shared by two configured "+
+				"accounts resolved to one of them (reason: %s)", got, ClassUnidentified, reason)
+		}
+		if !strings.Contains(reason, "shared by more than one passwd account") {
+			t.Errorf("reason = %q, want it to name the ambiguity — reporting this as a missing "+
+				"account sends the operator hunting for one that is present", reason)
+		}
+	})
+
+	t.Run("the reason distinguishes ambiguity from absence and from a read failure", func(t *testing.T) {
+		// All three deny identically; the operator fix differs in each case.
+		for _, tc := range []struct {
+			reason osident.Reason
+			want   string
+		}{
+			{osident.ReasonNoPasswdEntry, "has no passwd entry"},
+			{osident.ReasonAmbiguousUID, "shared by more than one passwd account"},
+			{osident.ReasonLookupFailed, "could not be read"},
+		} {
+			got, reason := ResolveLoginClass(login, osident.Identity{UID: 2001, Reason: tc.reason})
+			if got != ClassUnidentified {
+				t.Errorf("reason %v: class = %q, want %q", tc.reason, got, ClassUnidentified)
+			}
+			if !strings.Contains(reason, tc.want) {
+				t.Errorf("reason %v rendered %q, want it to contain %q", tc.reason, reason, tc.want)
+			}
+		}
+	})
+
+	t.Run("an ambiguous uid 0 still keeps the console lifeline", func(t *testing.T) {
+		// `root` + `toor` both at uid 0 is a supported layout, and uid 0 is not
+		// a boundary xpf can enforce anyway. Ambiguity must not brick the
+		// console: the literal "root" candidate still applies, so an explicit
+		// stanza wins and the omission case keeps the Junos root default.
+		got, _ := ResolveLoginClass(loginCfg([2]string{"bob", "read-only"}),
+			osident.Identity{UID: 0, Reason: osident.ReasonAmbiguousUID})
+		if got != ClassRootDefault {
+			t.Fatalf("ambiguous uid 0 resolved to %q, want %q — an aliased root must not be "+
+				"locked out of the console", got, ClassRootDefault)
+		}
+		got, reason := ResolveLoginClass(loginCfg([2]string{"root", "read-only"}),
+			osident.Identity{UID: 0, Reason: osident.ReasonAmbiguousUID})
+		if got != "read-only" {
+			t.Fatalf("ambiguous uid 0 with an EXPLICIT `user root class read-only` resolved to "+
+				"%q, want it honoured (reason: %s)", got, reason)
+		}
+	})
 }

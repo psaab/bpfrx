@@ -74110,3 +74110,49 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cli/userclass_entrypoint_canary_test.go,
   pkg/config/compiler_system_login_gates.go,
   pkg/config/compiler_system_login_packed_6662_test.go, _Log.md
+
+- **Timestamp**: 2026-08-01 (round 4 — independent Codex review folds)
+- **Action**: #6706 folds. BLOCKER-A (identity): production builds are
+  `CGO_ENABLED=0`, where `os/user.LookupId` returns the cached `user.Current()`
+  and pure-Go `current()` FABRICATES a user from `$USER` + `$HOME` with a nil
+  error whenever the passwd lookup fails — so `USER=admin HOME=/tmp cli` on a
+  box whose uid has no passwd row resolved to `admin`, reopening #6701 one layer
+  below the audited call sites. Verified firsthand in the Go 1.24 source
+  (lookup.go:48, lookup_stubs.go:23) and reproduced. Replaced the lookup with a
+  direct, environment-free `/etc/passwd` scan (equivalent to what pure-Go
+  `os/user` reads under the shipped build, minus the fallback) plus an
+  `os/user`-import canary. BLOCKER-B (gates): both login gates ran POST group
+  expansion on the single local view, so `groups node1 { system login ... }` +
+  `apply-groups "${node}"` committed green on node 0 and reached the peer only
+  through the lenient `Store.SyncApply`, live and never strict-checked. Moved
+  both gates PRE-expansion as both-node unions, following the #5878/#5879/#6178
+  precedent (the AST-layer analogue of the #5876 peer-effective SNAT replay).
+  MAJOR (duplicate uids): an ambiguous uid now fails closed with its own
+  Reason — refused the "already a compromised host" argument, since it is
+  escalation between two legitimate accounts; uid 0 stays exempt so an aliased
+  root keeps the console. MINOR-4: the canary predicate only required both
+  symbol names in one function — replaced with a real dataflow check (the
+  resolver's result must be the setter's argument) plus method-value detection,
+  and widened both canary walks from pkg/+cmd/ to the module root. MINOR-5:
+  corrected the packed-user consequence text (post-#6701 it fails closed, not
+  allow-all), and rendered every rewrite suggestion through `quoteKey` so a
+  quoted class name / deny-commands regex stays pasteable. Narrowed the osident
+  adoption canary's comment to the adoption claim it can actually see.
+  Documented the `config-viewer` shadowing break in `docs/system-login.md` and
+  annotated the vSRX excerpt that trips it.
+- **Validation**: `go build -buildvcs=false ./...` + `go vet ./...` rc 0; full
+  `go test ./...` green. Mutation-proved each fix with build+vet CLEAN first:
+  restoring `os/user.LookupId` reds 3 named osident tests under CGO_ENABLED=0
+  and 2 under cgo; restricting the node views to the committing node reds 6
+  named sub-tests of TestLoginGatesRejectPeerOnlyNodeGroupBody_6706 while both
+  false-positive guards stay PASS; dropping `quoteKey` reds exactly the two
+  quoting tests; and each canary evasion (behaviour-preserving re-derivation,
+  method value) reds TestSetUserClassCallersResolveThroughTheSharedResolver_6701
+  by name while pkg/daemon's behavioural suite stays GREEN.
+- **File(s)**: pkg/osident/osident.go, pkg/osident/passwd_6706_test.go,
+  pkg/osident/adoption_canary_test.go, pkg/osident/user_env_canary_test.go,
+  pkg/cli/identity.go, pkg/cli/identity_6701_test.go,
+  pkg/cli/userclass_entrypoint_canary_test.go, pkg/config/compiler.go,
+  pkg/config/compiler_prewalk.go, pkg/config/compiler_system_login_gates.go,
+  pkg/config/compiler_system_login_packed_6662_test.go, docs/system-login.md,
+  docs/junos-config-display-reference.md, _Log.md

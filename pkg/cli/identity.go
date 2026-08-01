@@ -61,8 +61,12 @@ const ClassRootDefault = "super-user"
 // configured (login != nil). With no `system login` stanza at all the CLI keeps
 // its legacy unset-class allow-everything mode; that is a deliberate
 // backward-compatibility contract (permissions.go) and is NOT what this
-// function is for. Called with a nil login it still fails closed rather than
-// asserting, so a future caller cannot accidentally reopen the hole.
+// function is for. Called with a nil login it does not assert: every non-root
+// uid resolves to ClassUnidentified, and uid 0 takes ClassRootDefault by
+// decision 2 below — a nil login is "nothing is configured about root", which
+// is precisely the omission case the root default exists for. So it is
+// fail-closed for every identity xpf can meaningfully contain, and unchanged
+// for the one it cannot.
 //
 // Order of decision:
 //
@@ -100,11 +104,36 @@ func ResolveLoginClass(login *config.LoginConfig, id osident.Identity) (string, 
 				"unrestricted legacy mode", id.Name)
 	}
 	if !id.Resolved() {
-		return ClassUnidentified, fmt.Sprintf(
-			"uid %d has no passwd entry, so the caller cannot be identified", id.UID)
+		return ClassUnidentified, unidentifiedReason(id)
 	}
 	return ClassUnidentified, fmt.Sprintf(
 		"OS account %q (uid %d) is not configured under `system login`", id.Name, id.UID)
+}
+
+// unidentifiedReason renders WHY the caller could not be named, from the
+// category osident recorded.
+//
+// The distinction is operator-facing, not cosmetic. All three states deny
+// identically — that is the point of failing closed — but they send the
+// operator to three different places: create the account, fix the duplicate
+// uid, or repair the passwd database. Reporting a read failure or a duplicate
+// uid as "has no passwd entry" (which is what a single hardcoded message did)
+// sends them to look for a missing account that is in fact present.
+func unidentifiedReason(id osident.Identity) string {
+	switch id.Reason {
+	case osident.ReasonAmbiguousUID:
+		return fmt.Sprintf(
+			"uid %d is shared by more than one passwd account, so the kernel credential does "+
+				"not name a single `system login user` — refusing to pick one", id.UID)
+	case osident.ReasonLookupFailed:
+		return fmt.Sprintf(
+			"the passwd database could not be read for uid %d, so the caller cannot be "+
+				"identified", id.UID)
+	case osident.ReasonNoPasswdEntry:
+		return fmt.Sprintf(
+			"uid %d has no passwd entry, so the caller cannot be identified", id.UID)
+	}
+	return fmt.Sprintf("uid %d could not be resolved to an account name", id.UID)
 }
 
 // rootOmittedClass documents why uid 0 listed with NO class gets the root
@@ -139,11 +168,15 @@ const rootOmittedClass = "see ResolveLoginClass decision 2"
 // and they resolve differently for uid 0.
 //
 // For uid 0 the literal name "root" is consulted as well as the passwd-resolved
-// name. A box may alias uid 0 to another entry (the classic `toor`), and
-// os/user.LookupId returns whichever passwd row comes first — so an operator's
-// explicit `system login user root class <c>` would otherwise be silently
-// skipped on exactly the identity it names. The resolved name is tried first so
-// a stanza written for the alias still wins where both exist.
+// name. A box may alias uid 0 to another entry (the classic `toor`), so an
+// operator's explicit `system login user root class <c>` would otherwise be
+// silently skipped on exactly the identity it names. The resolved name is tried
+// first so a stanza written for the alias still wins where both exist.
+//
+// When BOTH rows exist, osident reports the uid as ambiguous rather than
+// picking one (see osident.lookupPasswd), so the resolved name is empty and
+// only the literal "root" is consulted here — deterministic, and still the
+// console lifeline.
 func configuredClass(login *config.LoginConfig, id osident.Identity) (string, bool) {
 	if login == nil {
 		return "", false
@@ -182,6 +215,13 @@ func configuredName(login *config.LoginConfig, id osident.Identity) string {
 
 // candidateNames is the ordered set of `system login user` names that may
 // govern id: its passwd-resolved name, plus the literal "root" for uid 0.
+//
+// It is deliberately at most ONE non-root name. A uid shared by several passwd
+// accounts is reported by osident as unresolved (Name == "", ReasonAmbiguousUID)
+// rather than as one of them, so no non-root caller can inherit a class
+// configured for a different account that happens to share its uid. Enumerating
+// every name for the uid here instead would be the wrong shape: it would grant
+// the union of what those accounts may do.
 //
 // The `id.Resolved()` test is LOAD-BEARING, not a tidiness check, and this is
 // the only place that protection exists. An unidentified caller has Name == "",

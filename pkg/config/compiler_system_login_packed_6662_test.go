@@ -251,13 +251,53 @@ func TestLoginPackedRejectionNamesTheDroppedTokens_6662(t *testing.T) {
 	msg := err.Error()
 	for _, want := range []string{
 		"system login class ops",
-		`deny-commands request system zeroize`,
+		`deny-commands "request system zeroize"`,
 		"SILENTLY DROPPED",
 		"set system login class ops deny-commands",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("rejection does not contain %q:\n  %s", want, msg)
 		}
+	}
+}
+
+// TestLoginPackedRejectionPreservesQuoting_6662 pins the rewrite suggestions as
+// PASTEABLE (#6706 review MINOR-5). The message renders every instance name and
+// body token through quoteKey, the same round-trip renderer Format uses.
+//
+// Before this, `strings.Join(keys, " ")` dropped the quotes the lexer had
+// already consumed, so
+//
+//	class "noc ops" deny-commands "request system zeroize";
+//
+// produced the suggestion `class noc ops { deny-commands request system
+// zeroize; }` — neither token boundary preserved. An operator pasting that got
+// a class named `noc` with three stray tokens, i.e. a DIFFERENT configuration
+// than the one being rejected. Whitespace-bearing class names and
+// deny-commands regexes are both ordinary Junos, so this is the common case,
+// not a corner.
+func TestLoginPackedRejectionPreservesQuoting_6662(t *testing.T) {
+	_, err := compileLogin6662(t,
+		`system { login { class "noc ops" deny-commands "request system zeroize"; } }`)
+	if err == nil {
+		t.Fatal("packed class body with a quoted name compiled with no error")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		// the instance name keeps its quotes wherever it is rendered ...
+		`system login class "noc ops"`,
+		// ... including inside both rewrite suggestions,
+		"`class \"noc ops\" { deny-commands \"request system zeroize\"; }`",
+		`set system login class "noc ops" deny-commands "request system zeroize"`,
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("rejection loses quoting — missing %q:\n  %s", want, msg)
+		}
+	}
+	// A bare-token rewrite is exactly the unpasteable output this guards
+	// against; assert its absence so re-introducing strings.Join reds here.
+	if strings.Contains(msg, "class noc ops") {
+		t.Errorf("rejection renders the quoted name as bare tokens (`class noc ops`):\n  %s", msg)
 	}
 }
 
@@ -662,4 +702,173 @@ func TestLoginBlockOnlyEnumerationIsComplete_6662(t *testing.T) {
 		t.Errorf("`login %s` is a BLOCK statement in setSchema but is not listed in "+
 			"loginBlockOnlyStatements — its inline spelling drops silently (#6662)", m)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// #6706 review blocker: a `${node}`-scoped group must not smuggle a login body
+// past BOTH gates.
+// ---------------------------------------------------------------------------
+
+// peerOnlyLoginGroup wraps a `system login` body in a `groups node1` block
+// selected by `apply-groups "${node}"`, plus a benign `groups node0` so BOTH
+// node views expand cleanly. Committed on node 0 the body is stripped before
+// compilation; the peer receives it through Store.SyncApply, which is lenient.
+func peerOnlyLoginGroup(body string) string {
+	return `groups {
+	node0 { system { host-name fw0; } }
+	node1 { system { login { ` + body + ` } } }
+}
+apply-groups "${node}";
+`
+}
+
+// TestLoginGatesRejectPeerOnlyNodeGroupBody_6706 is the blocker: a login body
+// that only the PEER's `${node}` expansion renders must be rejected by the
+// commit on EITHER node.
+//
+// Before this, both gates ran post-expansion on the single local view:
+//
+//	node 0 commits -> ExpandGroupsWithVars({node: node0}) strips the node1 body
+//	              -> neither gate ever sees it -> strict commit-check PASSES
+//	node 1 ingests via Store.SyncApply -> compileTreeLenient -> WARNS only
+//	              -> `class super-user { permissions view; }` is live on node 1,
+//	                 pkg/cli resolveClassPerms returns the BUILT-IN PermAll,
+//	                 and bob holds every permission on the standby
+//
+// so the authored narrowing applied on neither node and no strict check
+// existed anywhere in the cluster. Both gates now evaluate node0 AND node1
+// effective views pre-expansion (forEachClusterNodeView), which is the same
+// doctrine as #5878/#5879/#6178 and the AST-layer analogue of the #5876
+// peer-effective source-NAT replay.
+//
+// FAIL-ON-REVERT: restrict forEachClusterNodeView to the committing node's view
+// and every strict sub-test here goes RED.
+func TestLoginGatesRejectPeerOnlyNodeGroupBody_6706(t *testing.T) {
+	strictCases := []struct {
+		name   string
+		body   string
+		marker string
+	}{
+		{
+			name:   "shadowing built-in class in a peer-only ${node} group",
+			body:   `class super-user { permissions view; } user bob { class super-user; }`,
+			marker: gate6701ShadowMarker,
+		},
+		{
+			name:   "packed user body in a peer-only ${node} group",
+			body:   `user bob class ops;`,
+			marker: gate6662Marker,
+		},
+		{
+			name:   "packed class body in a peer-only ${node} group",
+			body:   `class ops permissions view;`,
+			marker: gate6662Marker,
+		},
+		{
+			name:   "inline authentication block in a peer-only ${node} group",
+			body:   `user bob { authentication ssh-rsa "ssh-rsa AAAA k"; }`,
+			marker: gate6662StatementMarker,
+		},
+	}
+
+	for _, tc := range strictCases {
+		t.Run(tc.name, func(t *testing.T) {
+			text := peerOnlyLoginGroup(tc.body)
+			// Rejected on the node whose OWN view does not contain the body ...
+			p := NewParser(text)
+			tree, perrs := p.Parse()
+			if len(perrs) != 0 {
+				t.Fatalf("parse: %v", perrs)
+			}
+			_, err := CompileConfigForNode(tree, 0)
+			mustReject(t, err, tc.marker, "peer-only ${node} body committed on NODE 0")
+
+			// ... and on the node that does render it, so the verdict is
+			// HA-symmetric whichever node the operator happens to commit from.
+			_, err = CompileConfigForNode(tree, 1)
+			mustReject(t, err, tc.marker, "peer-only ${node} body committed on NODE 1")
+		})
+	}
+
+	t.Run("the peer body is caught even when the local ${node} group is undefined", func(t *testing.T) {
+		// No `groups node0`, so node 0's own view fails to expand entirely. The
+		// gate must still reject from the node-1 view rather than falling
+		// through to the apply-groups error (which would leave the finding
+		// unreported the moment an operator defines only the peer's group).
+		text := `groups {
+	node1 { system { login { class super-user { permissions view; } } } }
+}
+apply-groups "${node}";
+`
+		p := NewParser(text)
+		tree, perrs := p.Parse()
+		if len(perrs) != 0 {
+			t.Fatalf("parse: %v", perrs)
+		}
+		_, err := CompileConfigForNode(tree, 0)
+		mustReject(t, err, gate6701ShadowMarker, "peer-only body with no local ${node} group")
+	})
+
+	t.Run("tolerant peer-sync ingress warns rather than rejecting", func(t *testing.T) {
+		// #1960 no-brick: the standby must still boot a config an older binary
+		// accepted. CompileConfigForNodeLenient is exactly what
+		// Store.SyncApply runs.
+		text := peerOnlyLoginGroup(`class super-user { permissions view; } user bob { class super-user; }`)
+		p := NewParser(text)
+		tree, perrs := p.Parse()
+		if len(perrs) != 0 {
+			t.Fatalf("parse: %v", perrs)
+		}
+		cfg, err := CompileConfigForNodeLenient(tree, 0)
+		if err != nil {
+			t.Fatalf("tolerant peer-sync path must NOT reject (#1960 no-brick): %v", err)
+		}
+		var found bool
+		for _, w := range cfg.Warnings {
+			if strings.Contains(w, gate6701ShadowMarker) {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("tolerant path dropped the peer-only finding entirely; warnings: %v", cfg.Warnings)
+		}
+	})
+
+	t.Run("a peer-only group with a WELL-FORMED body still compiles", func(t *testing.T) {
+		// The false-positive guard. A per-node login stanza is legitimate
+		// configuration; only the packed and shadowing shapes are rejected.
+		text := peerOnlyLoginGroup(
+			`class noc-admin { permissions [ view configure ]; } user bob { class noc-admin; }`)
+		p := NewParser(text)
+		tree, perrs := p.Parse()
+		if len(perrs) != 0 {
+			t.Fatalf("parse: %v", perrs)
+		}
+		for _, nodeID := range []int{0, 1} {
+			if _, err := CompileConfigForNode(tree, nodeID); err != nil {
+				t.Fatalf("node %d rejected a well-formed peer-only login body: %v", nodeID, err)
+			}
+		}
+	})
+
+	t.Run("a body in an UNAPPLIED group stays inert on both nodes", func(t *testing.T) {
+		// The View-1 boundary: a shadowing class staged in a group that no
+		// apply-groups references renders on no node, so rejecting it would be
+		// rejecting dead config.
+		text := `groups {
+	unused { system { login { class super-user { permissions view; } } } }
+}
+system { host-name fw; }
+`
+		p := NewParser(text)
+		tree, perrs := p.Parse()
+		if len(perrs) != 0 {
+			t.Fatalf("parse: %v", perrs)
+		}
+		for _, nodeID := range []int{0, 1} {
+			if _, err := CompileConfigForNode(tree, nodeID); err != nil {
+				t.Fatalf("node %d rejected an UNAPPLIED group body: %v", nodeID, err)
+			}
+		}
+	})
 }

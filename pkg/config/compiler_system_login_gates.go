@@ -60,6 +60,41 @@ import (
 // peer-sync paths (#1960 no-brick) so a node that persisted such a config under
 // an older binary still BOOTS — leniently loaded, the stanza stays as inert as
 // it already was, now with the drop stated.
+//
+// BOTH-NODE EVALUATION (#6706 review blocker). Both gates below run
+// PRE-EXPANSION and evaluate the effective view of EVERY cluster node (the
+// node0 AND node1 `${node}`/apply-groups expansions), exactly like the sibling
+// union gates validateQinQVLANStackAST (#5879) and validateVLANMapAST (#6178).
+// Evaluating only the committing node's view left both gates fully bypassable:
+//
+//	groups {
+//	    node1 { system { login {
+//	        class super-user { permissions view; }
+//	        user bob { class super-user; }
+//	    } } }
+//	}
+//	apply-groups "${node}";
+//
+// Committed on node 0, the node-1 body is stripped by ExpandGroupsWithVars
+// before either gate sees anything, so strict commit-check passes. The peer
+// then ingests the config through Store.SyncApply, which is the TOLERANT path
+// (compileTreeLenient) and only warns. On node 1 the stanza is live, and
+// pkg/cli resolveClassPerms resolves the built-in `super-user` first — bob
+// holds PermAll, and the authored `permissions view` narrowing that the
+// operator read as restrictive never applied on either node. The origin commit
+// is the only strict check the peer view ever gets, so it has to run here; that
+// is the same argument compiler_peer_effective_snat.go makes for source NAT
+// (#5876), applied at the AST layer these gates live in rather than on a
+// compiled *Config.
+//
+// Only the two per-node effective views are unioned — deliberately NOT the
+// pre-expansion all-groups "View 1" that the COLLISION-shaped union gates
+// (validateZoneIDCollisionAST, validateInterfaceUnitAliasCollisionsAST #5878)
+// also fold in. Both login gates trip on a SINGLE property, so a View-1 union
+// would additionally reject a packed or shadowing body staged in a group that
+// no `apply-groups` references — inert dead config that renders on no node.
+// TestLoginPackedInsideAppliedGroupRejected_6662 pins that unapplied groups
+// stay inert.
 
 // loginInstanceKeywords is the set of `system login` NAMED INSTANCES, i.e. the
 // keywords under `login` that take an identity argument and a body. It is the
@@ -122,9 +157,19 @@ var loginBlockOnlyStatements = map[string]map[string]int{
 func loginPackedConsequence(keyword string) string {
 	switch keyword {
 	case "user":
-		return "the user compiles with NO login class, which routes the CLI into the " +
-			"legacy no-RBAC allow-everything mode (empty class = allow every command and " +
-			"render secrets in cleartext)"
+		// The consequence is stated as it stands AFTER #6701. A matched
+		// non-root account carrying an empty class resolves to the fail-closed
+		// `unauthorized` class (cli.ResolveLoginClass decision 3), so the drop
+		// now costs the operator the class they wrote, not a promotion. It DID
+		// promote before #6701 — an empty class is still pkg/cli's legacy
+		// no-RBAC allow-everything shortcut, reached whenever no `system login
+		// user` matches — which is why the two ship together and why the
+		// warning still names that mode as the older behaviour.
+		return "the user compiles with NO login class, so the class the operator wrote is " +
+			"silently discarded and the account resolves to the fail-closed `unauthorized` " +
+			"class instead of the one named (on a binary before #6701 it instead reached the " +
+			"legacy no-RBAC allow-everything mode: allow every command, render secrets in " +
+			"cleartext)"
 	case "class":
 		return "the class compiles with NO permissions and NO allow/deny regexes, so it " +
 			"grants nothing and the commit advisory that would flag a dropped deny-commands " +
@@ -151,62 +196,61 @@ func loginPackedConsequence(keyword string) string {
 //
 // Returns (warnings, nil) when lenient, (nil, error) on the first offender when
 // strict.
-func validateLoginPackedStatementsAST(nodes []*Node, lenient bool) ([]string, error) {
-	var warnings []string
+func validateLoginPackedStatementsAST(tree *ConfigTree, lenient bool) ([]string, error) {
+	var f loginFindings
+	forEachClusterNodeView(tree, func(view *ConfigTree) {
+		collectLoginPackedFindings(view.Children, &f)
+	})
+	return f.verdict(lenient)
+}
 
-	emit := func(msg string) error {
-		if lenient {
-			warnings = append(warnings, msg)
-			return nil
-		}
-		return fmt.Errorf("%s", msg)
-	}
-
-	walkErr := forEachChild(nodes, "system", func(sys *Node) error {
+// collectLoginPackedFindings records every packed-body offender under one
+// already-expanded node view.
+func collectLoginPackedFindings(nodes []*Node, f *loginFindings) {
+	_ = forEachChild(nodes, "system", func(sys *Node) error {
 		return forEachChild(sys.Children, "login", func(login *Node) error {
 			for _, keyword := range loginInstanceKeywords {
 				for _, container := range login.FindChildren(keyword) {
 					if len(container.Keys) >= 2 {
-						if err := checkLoginInstancePacked(
-							keyword, container.Keys[1], container, 2, emit); err != nil {
-							return err
-						}
+						checkLoginInstancePacked(keyword, container.Keys[1], container, 2, f)
 						continue
 					}
 					for _, sub := range container.Children {
-						if err := checkLoginInstancePacked(
-							keyword, sub.Name(), sub, 1, emit); err != nil {
-							return err
-						}
+						checkLoginInstancePacked(keyword, sub.Name(), sub, 1, f)
 					}
 				}
 			}
 			return nil
 		})
 	})
-	if walkErr != nil {
-		return nil, walkErr
-	}
-	return warnings, nil
 }
 
 // checkLoginInstancePacked reports the packed body of ONE login instance:
 // first the instance line itself, then any block-only body statement written
 // inline. identityKeys is how many leading Keys name the instance.
-func checkLoginInstancePacked(keyword, name string, inst *Node, identityKeys int, emit func(string) error) error {
+//
+// Every name and body token is rendered through quoteKey, the same round-trip
+// renderer Node.KeysString / Format use. The rewrite suggestions are meant to
+// be PASTED, and the lexer keeps a quoted string as one token: rendering
+// `class "noc ops" deny-commands "request system zeroize";` with a bare
+// strings.Join produced `class noc ops { deny-commands request system
+// zeroize; }`, which preserves neither token boundary and is a different
+// (invalid) configuration. Quoting restores both.
+func checkLoginInstancePacked(keyword, name string, inst *Node, identityKeys int, f *loginFindings) {
+	qname := quoteKey(name)
 	if len(inst.Keys) > identityKeys {
-		body := strings.Join(inst.Keys[identityKeys:], " ")
-		return emit(fmt.Sprintf(
-			"system login %s %s: body %q is written on the instance line, but xpf "+
+		body := quoteKeys(inst.Keys[identityKeys:])
+		f.add(fmt.Sprintf(
+			"system login %s %s: body `%s` is written on the instance line, but xpf "+
 				"compiles a `%s` body only from a nested block or a `set` statement — every "+
 				"statement written there is SILENTLY DROPPED and %s (#6662). Rewrite as "+
 				"`%s %s { %s; }` or `set system login %s %s %s`.",
-			keyword, name, body, keyword, loginPackedConsequence(keyword),
-			keyword, name, body, keyword, name, body))
+			keyword, qname, body, keyword, loginPackedConsequence(keyword),
+			keyword, qname, body, keyword, qname, body))
 	}
 	blockOnly := loginBlockOnlyStatements[keyword]
 	if blockOnly == nil {
-		return nil
+		return
 	}
 	for _, prop := range inst.Children {
 		stmt := prop.Name()
@@ -219,18 +263,83 @@ func checkLoginInstancePacked(keyword, name string, inst *Node, identityKeys int
 		if len(prop.Keys) <= 1+arity {
 			continue
 		}
-		body := strings.Join(prop.Keys[1+arity:], " ")
-		if err := emit(fmt.Sprintf(
-			"system login %s %s %s: body %q is written on the statement line, but xpf "+
+		body := quoteKeys(prop.Keys[1+arity:])
+		f.add(fmt.Sprintf(
+			"system login %s %s %s: body `%s` is written on the statement line, but xpf "+
 				"compiles `%s` only from a nested block or a `set` statement — the key or "+
 				"password written there is SILENTLY DROPPED and the account is left with no "+
 				"usable authentication method (#6662). Rewrite as `%s { %s; }` or "+
 				"`set system login %s %s %s %s`.",
-			keyword, name, stmt, body, stmt, stmt, body, keyword, name, stmt, body)); err != nil {
-			return err
-		}
+			keyword, qname, stmt, body, stmt, stmt, body, keyword, qname, stmt, body))
 	}
-	return nil
+}
+
+// quoteKeys renders a run of AST keys as pasteable configuration text, quoting
+// each token that would not read back as itself (quoteKey, ast.go).
+func quoteKeys(keys []string) string {
+	parts := make([]string, len(keys))
+	for i, k := range keys {
+		parts[i] = quoteKey(k)
+	}
+	return strings.Join(parts, " ")
+}
+
+// loginFindings accumulates gate messages across the per-node views, dropping a
+// finding already recorded by an earlier view. Insertion order is preserved so
+// the strict first-offender is the first in SOURCE order of the node-0 view —
+// identical to the pre-#6706 single-view behaviour for every non-cluster
+// config, and deterministic (node 0 then node 1) for a cluster one.
+type loginFindings struct {
+	seen  map[string]bool
+	order []string
+}
+
+func (f *loginFindings) add(msg string) {
+	if f.seen == nil {
+		f.seen = make(map[string]bool)
+	}
+	if f.seen[msg] {
+		return
+	}
+	f.seen[msg] = true
+	f.order = append(f.order, msg)
+}
+
+// verdict renders the collected findings: strict returns the first as an
+// error, lenient returns all as warnings (#1960 no-brick).
+func (f *loginFindings) verdict(lenient bool) ([]string, error) {
+	if len(f.order) == 0 {
+		return nil, nil
+	}
+	if !lenient {
+		return nil, fmt.Errorf("%s", f.order[0])
+	}
+	return f.order, nil
+}
+
+// forEachClusterNodeView calls fn with the candidate tree expanded for each
+// chassis-cluster node id, so a gate sees what EVERY node will actually render
+// — including a `groups nodeN` body that `apply-groups "${node}"` selects only
+// on the peer.
+//
+// Mirrors collectQinQFindingsForNode / collectVLANMapFindingsForNode: clone,
+// expand for the node, read the AST. It never calls CompileConfig* (which
+// would re-enter the gate). A view that fails to expand contributes nothing —
+// a config defining only `groups node1` + `${node}` does not expand for node 0,
+// and the real per-node compile path already rejects that on the affected
+// node, while the OTHER view still sees the body hidden in the group.
+func forEachClusterNodeView(tree *ConfigTree, fn func(*ConfigTree)) {
+	if tree == nil {
+		return
+	}
+	for _, nodeID := range []int{0, 1} {
+		clone := tree.Clone()
+		vars := map[string]string{"node": fmt.Sprintf("node%d", nodeID)}
+		if err := clone.ExpandGroupsWithVars(vars); err != nil {
+			continue
+		}
+		fn(clone)
+	}
 }
 
 // loginBlockOnlyStatementNames returns the flattened `<keyword> <statement>`
@@ -289,22 +398,22 @@ func loginBlockOnlyArity(keyword, stmt string) (int, bool) {
 // Strict at commit / commit-check; warn on the tolerant load / peer-sync path
 // (#1960) — leniently loaded the definition stays exactly as inert as it
 // already was, now stated.
-func validateLoginClassShadowsBuiltinAST(nodes []*Node, lenient bool) ([]string, error) {
-	var warnings []string
+func validateLoginClassShadowsBuiltinAST(tree *ConfigTree, lenient bool) ([]string, error) {
+	var f loginFindings
+	forEachClusterNodeView(tree, func(view *ConfigTree) {
+		collectLoginClassShadowFindings(view.Children, &f)
+	})
+	return f.verdict(lenient)
+}
 
-	emit := func(msg string) error {
-		if lenient {
-			warnings = append(warnings, msg)
-			return nil
-		}
-		return fmt.Errorf("%s", msg)
-	}
-
-	report := func(name string) error {
+// collectLoginClassShadowFindings records every built-in-shadowing class
+// definition under one already-expanded node view.
+func collectLoginClassShadowFindings(nodes []*Node, f *loginFindings) {
+	report := func(name string) {
 		if _, builtin := LoginClassPermissions[name]; !builtin {
-			return nil
+			return
 		}
-		return emit(fmt.Sprintf(
+		f.add(fmt.Sprintf(
 			"system login class %s: %q is a SYSTEM-DEFINED login class, and the built-in "+
 				"definition always wins at runtime (pkg/cli resolveClassPerms consults the "+
 				"built-in table first) — this definition is INERT, so any narrowing it "+
@@ -314,26 +423,18 @@ func validateLoginClassShadowsBuiltinAST(nodes []*Node, lenient bool) ([]string,
 			name, name, name, name))
 	}
 
-	walkErr := forEachChild(nodes, "system", func(sys *Node) error {
+	_ = forEachChild(nodes, "system", func(sys *Node) error {
 		return forEachChild(sys.Children, "login", func(login *Node) error {
 			for _, container := range login.FindChildren("class") {
 				if len(container.Keys) >= 2 {
-					if err := report(container.Keys[1]); err != nil {
-						return err
-					}
+					report(container.Keys[1])
 					continue
 				}
 				for _, sub := range container.Children {
-					if err := report(sub.Name()); err != nil {
-						return err
-					}
+					report(sub.Name())
 				}
 			}
 			return nil
 		})
 	})
-	if walkErr != nil {
-		return nil, walkErr
-	}
-	return warnings, nil
 }

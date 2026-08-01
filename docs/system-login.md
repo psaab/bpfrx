@@ -94,7 +94,15 @@ The decision, in order:
 | uid 0, no matching `system login user` | `super-user` (Junos root default) |
 | OS account absent from `system login` | `unauthorized` |
 | uid with no passwd entry (unidentifiable) | `unauthorized` |
+| uid shared by **several** passwd accounts (ambiguous) | `unauthorized` — see below |
+| passwd database unreadable | `unauthorized` |
 | no `system login` stanza at all | **unset** — legacy allow-everything |
+
+All three unidentifiable cases deny identically, but the journal line names
+which one it was: "has no passwd entry", "is shared by more than one passwd
+account", "the passwd database could not be read". They send the operator to
+three different fixes, and reporting one as another sends them hunting for an
+account that is in fact present.
 
 **Why uid 0 listed with no class is not denied, when a non-root account in the
 same shape is.** The two are different questions. For a non-root account
@@ -113,7 +121,61 @@ prevents accidents; it is not a containment boundary, because uid 0 can edit the
 config database directly. If uid 0 resolves through a passwd **alias** (a second
 passwd row for uid 0, the classic `toor`), the resolved name is consulted first
 and the literal `root` second, so an explicit restriction written for `root`
-still applies to the aliased identity rather than being silently skipped.
+still applies to the aliased identity rather than being silently skipped. When
+**both** rows exist the uid is ambiguous (below) and only the literal `root` is
+consulted, which is deterministic and still the console lifeline.
+
+**A uid shared by several accounts fails closed.** The kernel gives xpf a
+number, not a name. If `/etc/passwd` maps that number to more than one account —
+
+```
+admin:x:2001:2001::/home/admin:/bin/bash
+bob:x:2001:2001::/home/bob:/bin/bash
+```
+
+```
+set system login user admin class super-user
+set system login user bob   class read-only
+```
+
+— then bob's shell and admin's shell are indistinguishable to any consumer of
+the credential, and resolving the uid to "whichever passwd row comes first"
+(what `os/user` does) hands bob `super-user`. That is a privilege escalation
+**between two legitimate accounts**, so it is not disposed of by "a duplicate-uid
+passwd file is a broken host". xpf refuses to name such a caller: the identity is
+unresolved and the class is `unauthorized`. The fix is to give the accounts
+distinct uids.
+
+xpf never creates the situation itself — `reconcileSystemUsers` invokes
+`useradd` **without** `-o`, so a duplicate uid is rejected by the tool — but a
+pre-existing, hand-edited or directory-supplied alias is outside its control,
+and an authorization decision must not depend on that.
+
+uid 0 is exempt from the denial for the usual reason: `root` + `toor` is a
+supported layout, uid 0 is not a boundary xpf can enforce, and locking the
+console out over it would be the larger failure. An ambiguous uid 0 keeps the
+Junos root default and still honours an explicit `system login user root
+class <c>`.
+
+**Why the passwd database is read directly instead of through `os/user`.** The
+appliance binaries are built `CGO_ENABLED=0` (Makefile), which selects the Go
+standard library's pure-Go `os/user`. In that implementation `user.LookupId(uid)`
+returns the cached `user.Current()` when the uid matches — it always matches,
+since xpf asks about its own uid — and pure-Go `current()` **fabricates** a user
+from `$USER` and `$HOME`, with a nil error, whenever the real passwd lookup
+fails. On a box where the caller's uid has no passwd row (a minimal container,
+an NSS/LDAP outage, a deleted account, an unreadable `/etc/passwd`),
+`USER=admin HOME=/tmp cli` therefore resolved to the account name `admin` — the
+#6701 hole reopened one layer below the call sites #6701 audited.
+
+`pkg/osident` scans `/etc/passwd` itself instead. Under the shipped build that
+is exactly what the standard library would have done for any uid that HAS a row
+(pure-Go `os/user` reads the same file and consults no NSS), so resolved names
+are unchanged; what changes is that a uid **without** one is now unidentified
+rather than whatever the caller put in `$USER`. A cgo-enabled developer build
+loses NSS name resolution for the CLI prompt, which is a narrowing, never a
+promotion. `TestNoOsUserInIdentityResolution_6701` keeps `os/user` out of the
+package.
 
 `unauthorized` is used rather than an unset class deliberately. The empty
 string is the legacy no-RBAC mode: `checkPermission` returns `nil` (allow
@@ -225,6 +287,41 @@ the tolerant load / peer-sync path. Built-in-first precedence itself is
 deliberately unchanged: inverting it would let
 `class read-only permissions all` **escalate** a built-in, which is strictly
 worse. Pick a distinct class name, or reference the built-in directly.
+
+> **Compatibility break.** The system-defined names are `super-user`,
+> `operator`, `read-only`, `config-viewer` and `unauthorized`. A migrated vSRX
+> config that defines a **custom** class under one of those names — most
+> plausibly `config-viewer`, which reads like an ordinary site-defined name and
+> appears as one in this repository's own vSRX excerpt
+> (`docs/junos-config-display-reference.md`) — now fails strict import and the
+> next commit. This is intended: on Junos that definition was live, on xpf it
+> was already inert, and the old silence is exactly the defect. **Upgrade boot
+> does not brick** — the tolerant load path warns and keeps running — so the
+> break surfaces on the operator's next `commit` / `load override`, with the
+> collision named. Rename the class (`site-config-viewer`) and update the
+> `system login user <name> class <c>` references, or drop the definition and
+> reference the built-in.
+
+**Both gates are evaluated for BOTH cluster nodes.** The packed-body gate and
+the shadowing gate run **before** apply-group expansion and evaluate the
+effective view of node 0 **and** node 1. Without that, a body scoped to the peer
+
+```
+groups {
+    node1 { system { login { class super-user { permissions view; } } } }
+}
+apply-groups "${node}";
+```
+
+was stripped from node 0's view before either gate ran, so the commit passed on
+node 0; the standby then ingested the config through `Store.SyncApply`, which is
+the **tolerant** path and only warns. The stanza was live on node 1 with no
+strict check anywhere in the cluster. Now whichever node commits rejects it, and
+the verdict is identical on both. A body staged in a group that no
+`apply-groups` references stays inert and is not rejected — it renders on no
+node. (Same doctrine as the QinQ / vlan-map / unit-alias gates, and the
+AST-layer analogue of the peer-effective source-NAT replay in
+`compiler_peer_effective_snat.go`.)
 
 ### Write the body as a block or as `set` — never packed on the line (#6662)
 
