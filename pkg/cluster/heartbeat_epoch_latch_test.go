@@ -656,3 +656,74 @@ func TestInitHeartbeatEpochStateNeverBlocks_6169(t *testing.T) {
 		t.Fatal("the refine worker never completed after the lock was released")
 	}
 }
+
+// TestStartHeartbeatReturnsWithAUsableEpoch_6169 answers the question deleting
+// the wait raises: removing a bound is exactly the kind of fix that trades a
+// stall for a RACE, so this pins that StartHeartbeat cannot return before the
+// epoch is usable — and pins it under the wedged store, where the old wait
+// existed.
+//
+// The ordering that makes it safe: initHeartbeatEpochState calls
+// heartbeatBootEpoch, whose sync.Once body stores the wall-clock seed BEFORE it
+// spawns the refinement worker. sync.Once.Do does not return until that body
+// completes, so publication happens-before StartHeartbeat proceeds. Nothing in
+// that path touches the filesystem.
+//
+// RED-on-revert: move the bootEpoch.Store into the worker goroutine and the
+// epoch is 0 when StartHeartbeat returns.
+func TestStartHeartbeatReturnsWithAUsableEpoch_6169(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ha-boot-epoch")
+	orig := bootEpochPath
+	bootEpochPath = path
+	t.Cleanup(func() { bootEpochPath = orig })
+
+	// Wedge the store for the whole of StartHeartbeat.
+	lockFile, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockFile.Close()
+	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatalf("could not take the lock the test needs to hold: %v", err)
+	}
+
+	m := NewManager(0, 42)
+	m.mu.Lock()
+	m.controlAuthKey = []byte("cluster-shared-secret")
+	m.mu.Unlock()
+	t.Cleanup(m.StopHeartbeat)
+
+	start := time.Now()
+	if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", ""); err != nil {
+		t.Fatalf("StartHeartbeat: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	// No stall...
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("StartHeartbeat took %v with the store wedged; the heartbeat is down for that whole window", elapsed)
+	}
+	// ...and no race: the epoch is usable the instant it returns.
+	epoch := m.heartbeatBootEpoch()
+	if epoch == 0 {
+		t.Fatal("StartHeartbeat returned with no usable epoch — deleting the wait traded a stall for a race")
+	}
+	if !epochOrderable(epoch, time.Now().UnixNano()) {
+		t.Fatalf("epoch %d is not orderable, so a peer would refuse it", epoch)
+	}
+	// And a frame built right now carries it, so a latched peer accepts us.
+	key := m.controlLinkAuthKey()
+	frame := marshalHeartbeatAuthEpoch(m.buildHeartbeat(), key, 1, 1, m.heartbeatBootEpoch())
+	if _, present := heartbeatFrameEpoch(frame, key); !present {
+		t.Fatal("the first frame after StartHeartbeat carries no epoch")
+	}
+
+	// Release and drain so the worker cannot outlive t.TempDir.
+	_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
+	select {
+	case <-m.bootEpochReady:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the refinement worker never completed after the lock was released")
+	}
+}

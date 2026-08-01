@@ -66528,3 +66528,21 @@ break — `go vet` confirmed passing under every revert.
   grep each — so it is the one to run first next time rather than last.
 - **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/heartbeat_epoch_test.go,
   pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-02 02:25
+- **Action**: #6169 — pre-empted the three questions the re-measure was dispatched
+  to answer, since two are things I can settle myself. (1) STALL-TRADED-FOR-RACE:
+  removing a bound is exactly the shape that swaps a stall for a race, so added
+  `TestStartHeartbeatReturnsWithAUsableEpoch_6169` — drives the REAL StartHeartbeat
+  under a held flock and asserts it returns fast AND with a usable, orderable
+  epoch, AND that a frame built immediately after carries it. Safe because
+  sync.Once.Do does not return until its body has stored the seed, and that body
+  touches no filesystem. Mutation 20 (move the publish into the worker) reds it:
+  "StartHeartbeat returned with no usable epoch". (2) COVERAGE AFTER THE REPOINT:
+  diffed the subtest list at 8802c4f97 vs HEAD — ZERO removed, two added, 15->17,
+  so repointing the 9 nextBootEpoch call sites took no coverage with it. (3) The
+  async test binds — mutation 19 already showed both subtests red under a
+  refinement no-op. Re-ran the three wedged-store tests with -count=3: 9/9 pass.
+  Confirmed the durability restatement landed in both README sites and the commit
+  body, with the ascending-pass figure.
+- **File(s)**: pkg/cluster/heartbeat_epoch_latch_test.go, _Log.md
