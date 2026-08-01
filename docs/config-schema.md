@@ -944,54 +944,97 @@ membership (security boundary) loss that also hid the dropped interface from
 the strict `validateZoneInterfaceDefinedStrict` gate. Covered by
 `pkg/config/compiler_zone_interfaces_bracket_5248_test.go`.
 
-**A per-interface `host-inbound-traffic` override is scoped to the SINGLE
-interface it is written under — it NEVER fans out to bracket siblings
-(#6391).** The `zoneInterfaceMembers` flatten above is for zone MEMBERSHIP
-only. Host-inbound is compiled separately and keyed strictly on the direct
-child the stanza hangs under (`iface.Name()` in `compileZones`), never across
-the flattened member set. This matters because the flat-set single-scoped case
-and a hierarchical multi-member `load override` block compile to the SAME AST:
-`interfaces [ ge-0/0/0 ge-0/0/1 ]` followed by
-`interfaces ge-0/0/0 host-inbound-traffic system-services ssh` reuses the FIRST
-member's SetPath container, so the `ge-0/0/0` node carries BOTH the `ge-0/0/1`
-membership leaf AND the host-inbound body — structurally identical to a
-hand-authored `interfaces { ge-0/0/0 { ge-0/0/1; host-inbound-traffic {...} } }`.
-A fanout keyed on the compiled AST alone therefore cannot tell "scope ssh to
-`ge-0/0/0` only" from "apply to every bracket member", so fanning the override
-across `zoneInterfaceMembers` (attempted in PR #6389, closed unmerged) OPENS ssh
-on `ge-0/0/1`, which the operator never configured — an over-permission /
-host-inbound leak.
+**A per-interface `host-inbound-traffic` override is scoped by the KEYS of the
+node it is authored on, never by that node's CHILDREN (#6391).** The
+`zoneInterfaceMembers` flatten above is for zone MEMBERSHIP only — it recurses
+into children. Host-inbound is compiled separately and deliberately does NOT: it
+applies to every name in `iface.Keys` and stops there.
 
-Two properties, do NOT conflate them:
+That distinction exists because the two shapes below are NOT the same AST, which
+is the opposite of what this document asserted before #6391 (it claimed they were
+"structurally identical" and that no AST-keyed fan could separate them — a claim
+disproved by dumping both):
 
-- **Individually-scoped isolation (UNCONDITIONAL invariant).** A service
-  authored under ONE named interface via its own `set` statement
+| authored as | compiled AST | meaning |
+|---|---|---|
+| `interfaces { [ ge-0/0/0 ge-0/0/1 ] { host-inbound-traffic {...} } }` | ONE container `Keys=["ge-0/0/0","ge-0/0/1"]`, **no** membership child | multi-member intent → **both** members |
+| `set ... interfaces [ ge-0/0/0 ge-0/0/1 ]`<br>`set ... interfaces ge-0/0/0 host-inbound-traffic system-services ssh` | container `Keys=["ge-0/0/0"]` with membership **child leaf** `Keys=["ge-0/0/1"]` | ssh scoped to `ge-0/0/0` **only** |
+
+`SetPath` descends the wildcard for the FIRST bracket token and nests the tail
+under it, then the second `set` REUSES that same `ge-0/0/0` container — which is
+why the container ends up carrying both the `ge-0/0/1` membership leaf and the
+host-inbound body even though ssh is single-scoped. Fanning across
+`zoneInterfaceMembers` (children included) is exactly what PR #6389 did, and it
+OPENS ssh on `ge-0/0/1`, which the operator never configured — an over-permission
+/ host-inbound leak (admission is additive, `host_inbound_view.go`). #6389 closed
+unmerged.
+
+**What genuinely IS identical** — and the reason the children-fan leaks so
+broadly — is the flat-set shape above and the hand-authored
+`interfaces { ge-0/0/0 { ge-0/0/1; host-inbound-traffic {...} } }`. The latter is
+the former's SERIALIZATION: `ConfigTree.Format()` (the render `configstore`
+persists through, and the one HA config sync ships via `ShowActive()`) emits
+literally that text, and re-parsing it is byte-identical. So a fan that fires on
+that shape leaks on every RELOAD of an ordinary single-scoped config, and
+first-member-only is the permanently correct answer there — not a compromise.
+
+**Why keying on `Keys` is safe, not merely convenient.** A false positive here
+would re-open the #6389 leak, so the load-bearing property is that **no
+`set`-authored config can produce a multi-key interface container**. That holds by
+schema construction: the interface name is `schemaNode.wildcard` with `args: 0`,
+`multi: false`, `compoundKey: false` (`schema_security.go`), so `SetPath`'s
+`nodeKeyCount = 1 + childSchema.args` is ALWAYS 1 and its container branch stores
+exactly one token. Surplus bracket tokens can only land on a child LEAF, which has
+no `host-inbound-traffic` child and is therefore never read by the fan. The
+multi-key shape is reachable ONLY from a hierarchical parse (`load override`, a
+hand-authored config file). `ExpandGroups` preserves the distinction (an inherited
+multi-key node stays a separate sibling rather than merging into a single-key
+one).
+
+Scope rules that follow:
+
+- **Individually-scoped isolation (UNCONDITIONAL).** A service authored under ONE
+  named interface via its own `set` statement
   (`interfaces ge-0/0/0 host-inbound-traffic system-services ssh`) is
-  single-scoped by definition and must NEVER appear on a sibling — under every
-  design option. This holds today and must keep holding after any future fix.
+  single-scoped and must NEVER appear on a sibling.
+- **Multi-member body applies to every member.** A body authored ON a bracket
+  membership (`interfaces [ ge-0/0/0 ge-0/0/1 ] { host-inbound-traffic { ... } }`)
+  applies to both. This is an admission WIDENING relative to pre-#6391, which
+  applied it to the first member only — see the operator note in
+  `docs/host-inbound-service-matrix.md`.
+- **A nested extra membership is out of scope.**
+  `[ a b ] { c; host-inbound {...} }` fans to `a` and `b` but NOT `c`: `c` is a
+  nested membership statement, not a bracket sibling of the authored node, so it
+  is in the same position as the flat-set `b` leaf. `c` remains a zone MEMBER and
+  falls back to the zone-level host-inbound.
+- **Members do not share a backing store.** `mergeHostInbound` returns `src`
+  unchanged when `dst` is nil, so the fan clones per key (`cloneHostInbound`).
+  Without that, a later single-scoped override merged into one member would
+  mutate the value its bracket siblings point at.
 
-- **Multi-member body (CURRENT fail-safe, pending a design call).** A
-  host-inbound BODY hanging off a bracket membership itself
-  (`interfaces [ ge-0/0/0 ge-0/0/1 ] { host-inbound-traffic { ... } }`, or the
-  `ge-0/0/0 { ge-0/0/1; host-inbound-traffic { ... } }` load-override artifact)
-  currently applies to the first member ONLY. That is the issue's **option 1**
-  (fail-safe): the override stays on the single named interface and a bracketed
-  multi-member intent UNDER-applies (a sibling falls back to the zone-level
-  host-inbound) rather than over-admitting. This is the current default, NOT the
-  final multi-member semantics — making the multi-member intent apply to every
-  member without the flat-set leak needs parse-time scope disambiguation
-  (options 2/3), still an OPEN design call on #6391.
+**Round-trip limitation (#6668, pre-existing, NOT introduced by #6391).** The
+multi-key shape survives `Format()` → `NewParser` (local persistence) and HA
+config sync byte-for-byte, but it does NOT survive `show | display set`:
+`FormatSet()` emits
+`set ... interfaces ge-0/0/0 ge-0/0/1 host-inbound-traffic system-services ssh`,
+which replays into a single garbage leaf
+`Keys=["ge-0/0/1","host-inbound-traffic","system-services","ssh"]` and then fails
+to compile (`zone "trust" references interface "host-inbound-traffic"`). It fails
+CLOSED, but it means the multi-member fan is not durable through a display-set
+round-trip. Tracked separately as #6668.
 
-Both properties are pinned by
+All of the above is pinned by
 `pkg/config/compiler_zone_iface_hostinbound_sibling_6391_test.go`, which asserts
-the FULL per-interface host-inbound map (every interface, both system-services
-AND protocols). Re-introducing the #6389 fanout turns the CONTAINER-SHARING
-cases RED — first-member, three-member, multi-service, protocols, and the two
-hierarchical multi-member-body cases — while the later-member and
-no-shared-backing-store cases stay GREEN CONTROLS (their interfaces do not share
-a SetPath container, so the fanout cannot touch them). The two multi-member-body
-cases assert current option-1 behavior only; an options-2/3 fix intentionally
-updates those two expectations.
+the FULL per-interface host-inbound map (every interface, both system-services AND
+protocols). Re-introducing a children-fan turns the CONTAINER-SHARING cases RED
+(first-member, three-member, multi-service, protocols, and the
+`a { b; host-inbound }` serialization case); reverting the Keys-fan turns
+`TestHostInbound6391HierarchicalBracketBodyFansToAllMembers` RED. The later-member
+and no-shared-backing-store cases stay GREEN CONTROLS (their interfaces do not
+share a SetPath container). `TestHostInbound6391FlatSetNeverYieldsMultiKeyContainer`
+guards the negative direction — a future `SetPath` or schema change that let
+flat-set yield a multi-key container fails there rather than silently widening
+admission.
 
 **Sibling leaves on ONE flat-set line also collapse into a NESTED chain, not
 siblings — the third collapse pattern (#6524).** The two patterns above cover a
@@ -1122,6 +1165,299 @@ new commit-vs-load split for a spelling that now has well-defined semantics —
 the same divergence class #3606 calls out for ports. Covered by
 `pkg/config/compiler_application_chained_leaves_6524_test.go` and the
 policy-OUTCOME suite `pkg/policymatch/app_chained_leaves_6524_test.go`.
+
+**A PACKED hierarchical statement carries its entries on its OWN Keys — the
+fourth collapse pattern, and the only one the flat-set path never produces
+(#6588).** The three patterns above are all `SetPath` artifacts. This one comes
+from the *hierarchical* parser and therefore reaches the compiler only through a
+hand-authored config file, `load merge` / `load override`, or a peer config
+sync — never through a `set` command. A statement that groups entries can be
+written three ways, and they do NOT produce the same AST:
+
+```
+interface-monitor { ge-0/0/0 weight 255; }   # CONTAINER: Keys=[interface-monitor], one child per entry
+interface-monitor ge-0/0/0 weight 255;       # PACKED:    Keys=[interface-monitor ge-0/0/0 weight 255], NO children
+interface-monitor ge-0/0/0 { weight 255; }   # PACKED + body: Keys=[interface-monitor ge-0/0/0], children are that ENTRY's attributes
+set ... interface-monitor ge-0/0/0 weight 255   # flat-set: SetPath yields the CONTAINER shape
+```
+
+A compiler that enumerates entries by iterating the statement's `Children`
+alone sees NOTHING in the packed shape. That was the #6588 fail-open: a packed
+`chassis cluster redundancy-group <n> interface-monitor <if> weight <w>`
+compiled to ZERO interface monitors and a packed `ip-monitoring` to zero
+targets, while `commit` succeeded with no error and no warning — the operator
+had link and probe tracking configured and a redundancy group that never
+demoted on failure. The third spelling was worse than a drop: the entry name
+packs onto the statement while the attributes arrive as children, so reading
+`Children` minted a monitor for an interface literally named `weight`.
+
+`packedOrContainerEntries(cfgNode, skip)` (`compiler_system.go`) is the
+canonical reader — `skip` is how many leading Keys name the statement itself.
+Note its rule is **EITHER/OR, not accumulate**, which is the opposite of the
+`#2419` multi-value contract above and the distinction to get right: a
+multi-value leaf spreads values across Keys AND children of the same kind, so
+`firewallMatchValues` must sum both; a grouping statement with an inline tail IS
+one entry, so its children are that entry's properties, not sibling entries.
+Accumulating there mints the bogus `weight` monitor. `namedInstances`
+(`compiler_protocols.go`) already applies the same either/or rule to named
+instances. Only the outermost level is unpacked — one tail is one entry, which
+is what Junos renders (one statement per line).
+
+Consequences worth knowing when adding a reader:
+
+- **The schema walker does not see this shape at all.** `SchemaValidate` walks
+  the AST from `setSchema`, and a packed tail sits below the depth it reaches,
+  so a typed leaf's `validator` never fires on it. A range/arity gate that must
+  cover the packed spelling has to run on the COMPILED struct
+  (`validateChassisClusterStrict`), not on the schema — which is only true once
+  the packed shape actually compiles.
+- **Silently compiling to nothing is the worst of the three options.** A
+  statement whose packed spelling is genuinely unsupported must be REJECTED at
+  commit with an actionable error. `services ip-monitoring` (a different
+  stanza, `compiler_services.go`) is the fail-CLOSED example: its packed
+  `then preferred-route ...;` is likewise dropped, but a policy with zero
+  compiled routes is a hard commit error ("at least one then preferred-route
+  route is required"), so the operator is told rather than left with a silent
+  no-op.
+
+**The two collapses COMPOSE, and a monitor statement hits both.** The packed
+collapse above is orthogonal to the `#2419` bracket collapse at the top of this
+section, and `interface-monitor` is subject to each independently:
+
+```
+interface-monitor [ ge-0/0/0 ge-0/0/1 ];    # PACKED *and* bracketed
+```
+
+The lexer strips the brackets, so N interface names land on ONE node's Keys — in
+the packed statement, in a hierarchical container child, and in the flat-set
+child alike. Unpacking the statement but then treating its whole tail as a
+single entry compiles the FIRST name and silently discards the rest: the same
+failover fail-open as dropping the statement, one monitor at a time. So
+`monitorEntryNodes` splits each candidate's Keys at entry boundaries — a token
+that is neither the `weight` keyword nor the value slot reserved immediately
+after it starts a new entry. The value-slot reservation is the same rule the
+#6524 application walk needs, and for the same reason: `weight` consumes exactly
+one following token even when that token spells something else.
+
+**An inline attribute on a bracketed list is CANDIDATE-scoped, not positional.**
+`interface-monitor [ ge-0/0/0 ge-0/0/1 ] weight 255` applies 255 to BOTH names.
+Attaching the weight to the entry that precedes it — the obvious reading — left
+`ge-0/0/0` at weight ZERO: monitored, present in `show`, and deducting nothing
+when its link fails, so the group did not demote. With N names, N-1 monitors
+were inert. That is worse than reading only the first name (which at least
+protected `ge-0/0/0` at 255), and it contradicted the children-block spelling
+`[ a b ] { weight 255; }`, which already applied the weight to both. Apply-to-all
+makes the two spellings agree and is the fail-safe direction. Two inline weights
+in one bracketed statement are ambiguous about which member each belongs to and
+are REJECTED, consistent with the duplicate-weight gate.
+
+Assert compiled WEIGHTS, not just names, when testing this. A name-only
+assertion is blind to precisely the failure that matters: a monitor that exists
+with weight 0 is indistinguishable at runtime from no monitor at all, and the
+regression above shipped past a full bracket-list suite for exactly that reason.
+
+Note the two rules pull in opposite directions and both are needed:
+
+| | tail vs children | why |
+|---|---|---|
+| **entry list** (`interface-monitor`, ip-monitoring `inet` addresses) | EITHER/OR | a tail means the statement IS one entry, so children are that entry's ATTRIBUTES — accumulating mints a monitor for an interface literally named `weight` |
+| **property body** (`ip-monitoring` itself) | BOTH | properties are siblings at the same level, so a packed tail and a real block body lose nothing when combined; the tail is split only at recognized property keywords (`packedStatementProps`) so `global-weight 255` is not shredded into two |
+
+**A value that is present but UNUSABLE needs an AST gate — the compiled struct
+cannot express it.** `compileChassis` parses a monitor weight with
+`strconv.Atoi` and leaves the 0 default on failure, so by the time the
+compiled-int range gate runs, `weight nope`, `weight 0`, and no weight at all
+are indistinguishable. `interface-monitor ge-0/0/0 weight nope;` therefore
+committed clean and installed a monitor that deducts NOTHING on link-down —
+the same silent-nothing class as the dropped statement. It is rejected by
+`validateMonitorWeightTokensAST` (`compiler_chassis_monitor_weight.go`), which
+derives its entries from `monitorEntryNodes` / `monitorWeightTokens` so the gate
+and the compiler can never disagree about which token is a weight or which entry
+owns it. Strict at commit, warn on the tolerant load / peer-sync path (#1960).
+
+That gate also settles a spelling-dependent answer: a DUPLICATE weight used to
+compile to 200 inline (`weight 100 weight 200` — the inline scan overwrote) but
+to 100 in a block (`{ weight 100; weight 200; }` — `FindChild` returns the
+first). The compiler is now uniformly first-wins via `monitorWeightTokens`, and
+a duplicate is rejected outright, so no operator is relying on which form they
+happened to write.
+
+**A gate that walks ENTRY LISTS will miss the statement's own PROPERTIES.** The
+weight gate above was first written around `monitorEntryNodes`, which produces
+entries — interface names, `family inet` addresses. `ip-monitoring`'s
+`global-weight` and `global-threshold` are properties of the statement, not
+entries of a list, so nothing looked at them and
+`ip-monitoring global-weight nope;` committed clean at a compiled 0. That is the
+WORST instance of the class rather than a lesser one: a malformed per-target
+weight costs the group one target's demotion debt, whereas an unusable global
+weight is zero debt for the entire group, so no number of failing probes demotes
+it and failover never happens. `validateMonitorWeightTokensAST` now applies the
+same missing-value / non-integer / duplicate rules to both globals, through one
+shared `checkTokens` rather than a second copy. The globals' reader is
+`ipMonitoringGlobalTokens`, which walks the same `packedStatementProps` result
+the compiler dispatches from — `nodeVal(findNamedNode(props, name))` is
+`ipMonitoringGlobalTokens(props, name)[0]` whenever the property is present, so
+the gate cannot validate a token the compiler does not use. Pinned by
+`TestIPMonitoringGlobalTokensMatchesCompilerRead_6588`.
+
+**A statement that takes NO argument still needs its arity checked.** `preempt`
+and `strict-vip-ownership` compile to a bool and never read the node, so
+anything else written on them is discarded in silence:
+
+```
+redundancy-group 1 preempt weight 255;      # Preempt=true, `weight 255` gone
+redundancy-group 1 preempt delay 5;         # Preempt=true, `delay 5` gone
+redundancy-group 1 preempt { delay 5; }     # Preempt=true, the block gone
+```
+
+Unlike the value-position collision described later, this needs no implausible
+input — a stray token is ordinary typing, and `preempt delay`/`limit`/`period`
+are real Junos SRX options xpf does not implement, so accepting them silently
+tells the operator they configured a preempt delay that does not exist.
+`SchemaValidate` accepts all three (measured), and a bool has nowhere to record
+what was dropped, so `validateRGNoArgStatementsAST`
+(`compiler_chassis_rg_arity.go`) checks it on the AST through the same
+`redundancyGroupBody` splitter. The flag set is written by hand — arity is not
+recoverable from a handler's type, since every handler has the same signature
+whether or not it reads the node — and
+`TestRedundancyGroupNoArgStatementsAreRegistered_6588` keeps it from naming a
+statement the dispatch table does not have.
+
+**The packing recurses: an INSTANCE can carry its whole body on its own Keys
+too.** Everything above is about a statement inside a named instance's body.
+The instance line itself packs the same way:
+
+```
+redundancy-group 1 { interface-monitor ge-0/0/0 weight 255; }   # container
+redundancy-group 1 interface-monitor ge-0/0/0 weight 255;       # PACKED instance
+redundancy-group 1 node 0 priority 200 preempt;                 # PACKED, several statements
+```
+
+`namedInstances` (`compiler_protocols.go`) resolves the instance NAME across
+both shapes — it reads `Keys[1]` — but hands the node back with the body still
+on `Keys`, so a caller that then walks `.Children` sees an **empty instance**.
+Every statement compiled to nothing while `commit` succeeded. For a
+redundancy group that includes `node <id> priority <p>`, the election priority
+itself: the operator sets it, `show configuration` echoes it, and the cluster
+elects on defaults, so the WRONG NODE can hold the group — strictly worse than
+"the group never demotes".
+
+`redundancyGroupBody` (`compiler_system.go`) undoes it for the chassis-cluster
+surface, splitting the tail at redundancy-group statement keywords so a
+multi-statement line yields one node each. Those keywords come from
+`redundancyGroupStatements`, a `map[string]func(*RedundancyGroup, *Node)` that
+is BOTH the compiler's dispatch table and the splitter's token set — adding a
+statement means adding one entry, which registers it with the splitter in the
+same edit. The invariant is "all dispatch goes through the table", and it is
+made natural rather than enforced: see the qualification below.
+
+That is deliberately not a checked hand-written list. It was one: a test parsed
+`compileChassis`'s source and extracted the `case "..."` literals of its switch.
+The guard PASSED while a 7th statement was still dropped from a packed
+multi-statement line in three ways — a `case` on a named CONSTANT rather than a
+string literal (the idiom this same file uses for `monitorWeightKeyword`), a
+statement handled by a helper called outside the switch, and a nested `switch`
+inside a `default:` arm. Worse, the failure is camouflaged: the same statement
+ALONE on a line still works, because the splitter opens the first node
+regardless of the predicate. A developer adds the statement, checks the packed
+spelling, sees green, and ships the fold bug. **Modelling another program's
+source text is the wrong tool for keeping two things in step; derive both from
+one table instead.** Registering a statement the ordinary way is now correct by
+construction, which closes two of the three routes above outright — a
+named-constant KEY registers exactly like a literal one, and no switch remains
+to nest another inside. The third is demoted, not eliminated: compiling a
+statement WITHOUT registering it still folds it, but that now means ad-hoc
+dispatch beside a five-line loop whose only other content is the table lookup —
+obvious in review, where adding a `case` to an existing switch was the
+idiomatic act and diverged silently.
+
+**Those three routes are all the table UNDER-covering the compiler; there is a
+fourth of the opposite shape.** The splitter matches a registered keyword
+wherever the token appears in the tail, including where the token is a VALUE
+rather than a statement keyword, so a value spelled like a statement is stolen
+and compiled as that statement. Measured:
+
+```
+redundancy-group 1 interface-monitor preempt weight 255;        # InterfaceMonitors=[]              Preempt=true
+redundancy-group 1 { interface-monitor preempt weight 255; }    # InterfaceMonitors=[{preempt 255}] Preempt=false
+```
+
+The two spellings disagree — exactly what splitting the packed line exists to
+prevent. It is not fixed, because the stolen token must sit in entry-NAME
+position and no legal Junos interface name or IP address collides with a
+registered keyword (`ge-*`/`xe-*`/`et-*`, `reth*`, `fxp*`, `em*`, `lo0`, `st0`,
+`ae*`, `fab*`, `irb`, `vlan`), so it is unreachable from a real config rather
+than merely unlikely. There is deliberately no test pinning the divergence —
+that would assert the wrong answer is correct — and none asserting "keyword is
+not an interface name" either, because the project has no canonical
+interface-name predicate and inventing one in a test repeats the
+source-modelling mistake described above. What is guarded is the EDIT that would
+make the route reachable: registering a statement trips the completeness check
+in `TestRedundancyGroupStatementsSurvivePackedLine_6588`, which is where the
+collision question has to be asked. A real fix means splitting position-aware —
+a keyword opens a statement only where a statement may begin — which changes the
+splitter contract.
+
+The splitter must also pick the right offset for the shape it is handed:
+`namedInstances` returns EITHER the `redundancy-group <id>` node itself
+(`Keys[0]` is the keyword, body starts at `Keys[2]`) OR, for a bare
+`redundancy-group { ... }` wrapper, a child whose `Keys[0]` IS the id (body
+starts at `Keys[1]`). `Keys[0]` discriminates them exactly. A fixed offset of 2
+swallowed the statement keyword on the second shape and opened a node named
+after a value, matching no switch arm — the same silent-nothing outcome,
+election priority included. All FOUR readers of that body use it —
+`compileChassis` plus the three AST gates (`validateMonitorWeightTokensAST`,
+`validateChassisClusterIdentitiesAST`, `validateGratuitousARPCountAST`) —
+because teaching the compiler to see a shape the gates cannot admits, through
+the packed instance line only, exactly what those gates exist to reject.
+
+**Why this is NOT fixed inside `namedInstances`.** Making the helper synthesize
+the packed tail as a child would fix every caller at once, and it is tempting
+for that reason. It also breaks callers that already handle the tail
+themselves. `namedInstances` has ~130 call sites and 24 of them read
+`inst.node.Keys` directly; synthesizing a child double-feeds those readers, and
+`compileStaticRoutes` additionally branches on `len(node.Children) == 0` to
+detect the packed shape, so a synthetic child silently disables its packed
+path. Measured, not assumed — the experiment turns
+`TestDHCPRelayOverrides_*` red (the override tokens get swallowed into
+`Interfaces`) and `TestVRRPTrackInterface_KeysPackedDuplicateStrictReject` red
+(lenient first-wins yields an empty `TrackInterface`). A future central fix
+needs the 24 inline readers migrated first; that is its own change.
+
+**Other `namedInstances` callers are NOT all safe, and that is tracked
+separately.** Measured by direct compile: `system login class ops permissions
+view;` compiles a class with EMPTY permissions, `system login user bob class
+ops;` compiles a user with no class, and `system syslog host 10.0.0.9 any;`
+compiles a host with zero facilities. Same root cause, different stanzas, no
+security-boundary equivalence to the RG election — they are follow-up work, not
+a claim of safety.
+
+Covered by `pkg/config/compiler_chassis_packed_monitor_6588_test.go`, which
+pins all three interface-monitor spellings against each other, covers the
+bracketed / malformed / duplicate cases in each, adds the packed-instance
+spelling for every redundancy-group statement, and keeps the
+container/flat-set and single-entry cases as green controls. Its `assertMonitors`
+helper requires a weight for every name — there is no name-only variant, because
+having one meant every bracketed-list case in that file ran weight-less and the
+apply-to-all rule above was unguarded.
+
+**Two things that file learned the hard way, both worth keeping.** First, a
+refactor can delete regression coverage for a bug that is still fixed, and
+nothing goes red: the dispatch-table change dropped the bracket-inline-weight
+and bare-`redundancy-group { <id> ... }` suites along with the source-parsing
+drift guard it was deliberately replacing, leaving the apply-to-all rule and the
+`Keys[0]` offset discrimination unguarded while both behaviours still worked.
+When a refactor removes tests, account for each one: replaced, or restored.
+
+Second, a completeness check that only asserts a sample EXISTS proves nothing. A
+table entry keyed `review-placeholder` whose sample text was `preempt`, with a
+`Preempt` assertion, satisfied every check in
+`TestRedundancyGroupStatementsSurvivePackedLine_6588` while `review-placeholder`
+never appeared in the input and its handler was never dispatched. The typed
+assertions cannot catch this, because `preempt` sets `rg.Preempt` no matter
+which key the sample is filed under. The test now requires each sample to begin
+with its own statement keyword AND instruments the dispatch table so a case that
+never reaches the handler it is filed under fails.
 
 **`multi: true` ALSO prevents single-value REPLACE for repeated keyed-list
 leaves (#3984).** The `#2419` discussion above is about ONE statement with a
@@ -3578,11 +3914,21 @@ reserved for whole-dataplane selection where a rewrite shim
   same way #4434/#4880 gate the RG id and node priority: on the COMPILED
   `*Config` in `validateChassisClusterStrict`, `0..255`, strict-reject at
   commit / warn on the tolerant load / peer-sync path. Running on the
-  compiled int covers the flat-set and container-hierarchical shapes with
-  one gate (the PACKED one-liner `interface-monitor <if> weight <n>;`
-  written directly under `redundancy-group` is a separate matter — it
-  compiles to ZERO monitors, so the gate never sees it and no debt is
-  installed either; tracked as **#6588**). It is a wire-width gate like
+  compiled int covers ALL THREE spellings with one gate — flat-set,
+  container-hierarchical, and (since **#6588**) the PACKED one-liner
+  `interface-monitor <if> weight <n>;` written directly under
+  `redundancy-group`. The packed spelling used to compile to ZERO monitors,
+  so the gate never saw it and no debt was installed either; now that it
+  compiles like the other two, the gate covers it for free. Note the
+  coverage claim holds BECAUSE the gate reads the compiled int: a typed
+  schema leaf would still miss the packed shape, which sits below the depth
+  `SchemaValidate` reaches (see "A PACKED hierarchical statement carries its
+  entries on its OWN Keys"). #6588 extended the SAME compiled-int gate to the
+  ip-monitoring `global-weight` / `global-threshold` / per-target `weight`,
+  which #6549 had left to their typed schema leaves: those leaves are real, but
+  the schema walker cannot reach the packed spelling for them either, so once
+  the packed shape compiled they needed the compiled-int layer too. It is a
+  wire-width gate like
   its siblings: the weight is the debt subtracted from the RG weight,
   which the heartbeat advertises through a single byte
   (`HeartbeatGroup.Weight`, `uint8(rg.Weight)`) while the local election
@@ -6322,8 +6668,15 @@ where only `z214` collides **survives** scoped to `[z174]`. Dropping the whole
 rule there would be **fail-open**: surviving-zone (`z174`) traffic would no longer
 hit the deny and would reach a later/default permit while the snapshot publishes
 successfully. After pruning, the singular `MatchFromZone`/`MatchToZone` is
-regenerated from the surviving set (`config.ScopeSingular`) so an old Rust helper
-that reads only the singular field also sees a surviving, non-quarantined zone.
+regenerated from the surviving set (`config.ScopeSingular`) so any reader of the
+singular field sees a surviving, non-quarantined zone rather than the dropped
+one. That regeneration keeps the two shapes CONSISTENT; it is not a
+rolling-upgrade compatibility guarantee. A helper old enough to read only the
+singular field cannot receive the snapshot at all — the config-snapshot protocol
+version is `4` and both mutating verbs gate on exact equality, and a multi-zone
+scope committed against a pre-`4` helper disarms it and aborts the commit
+(`ErrScopedGlobalZoneSetProtocolIncompatible`, #5488; see
+`docs/userspace-dataplane-architecture.md` *Config-snapshot protocol version*).
 The rest of the config still loads (#1960 no-brick).
 The id→name reverse maps resolve a colliding id to the survivor deterministically
 (`config.StableZoneIDOwner`; `pkg/cli/apply.go:syslogZoneNameMap`,

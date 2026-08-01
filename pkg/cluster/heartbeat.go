@@ -509,7 +509,18 @@ func verifyHeartbeatMAC(data, authKey []byte) bool {
 // never-seen -> admitted) and cannot grow memory (fixed 64-slot array).
 //
 // 64 slots (64*16 = 1 KiB) bounds memory while forcing an attacker to have
-// captured 65+ distinct daemon incarnations before any replay is sustainable.
+// captured 65+ distinct peer SESSIONS before any replay is sustainable.
+//
+// The unit is a session id, not a daemon boot, and the two are not the same:
+// a session id is minted per heartbeatSender (see authSession below), so every
+// peer heartbeat RESTART — a DHCP-triggered VRF rebind, an HA comms restart —
+// mints a new one without the peer rebooting. Two consequences, both of which
+// only became relevant once #5086 made this ring outlive a local restart:
+// routine peer restarts now permanently consume slots, so the ring reaches
+// eviction pressure from legitimate traffic alone; and the attacker's capture
+// cost for the churn above is 65 sessions, which are cheaper to harvest than
+// 65 daemon boots. Neither is a regression — before #5086 any local restart
+// wiped the whole ring, so this worst case is a strict subset of that one.
 const heartbeatReplaySessions = 64
 
 // replaySessionMark is one remembered (session, high-water counter) pair.
@@ -582,6 +593,78 @@ func (a *heartbeatAuthReplay) admit(session, counter uint64) bool {
 	return true
 }
 
+// heartbeatAuthState is the per-PEER control-channel authentication state:
+// the anti-replay watermarks and the sticky "peer has authenticated" flag.
+//
+// #5086: this state lives on the Manager (process lifetime), NOT on the
+// heartbeatReceiver (heartbeat lifetime). Every StartHeartbeat builds a brand
+// new heartbeatReceiver, and StartHeartbeat runs on far more than a daemon
+// boot — RestartHeartbeat on a DHCP-triggered VRF rebind
+// (daemon_apply_dataplane.go), and the HA comms (re)start
+// (daemon_ha_sync.go). While the tracker was a receiver field, each of those
+// routine events discarded every retired-session watermark, so the #5477
+// A->B->A rollback re-opened in full: an attacker holding captured
+// authenticated frames from retired peer incarnations replays them into the
+// empty tracker and each one is "never-seen" -> admitted, refreshing peer
+// liveness and applying stale election state for the whole captured run. A
+// heartbeat restart is exactly the moment the local node is least able to
+// afford a peer it wrongly believes is alive.
+//
+// Anchoring the state to the Manager makes the retired-session memory span the
+// process instead of the socket. The bound is unchanged and does not grow with
+// restart count, uptime, or the number of peer incarnations observed: one
+// fixed heartbeatAuthReplay ring (heartbeatReplaySessions * 16 B = 1 KiB) plus
+// a mutex and an atomic, allocated once per Manager.
+//
+// The mutex is required now that the ring outlives a single readLoop: the
+// StartHeartbeat stop-then-start sequence joins the previous readLoop before
+// the next one runs, but the tracker is no longer confined to one goroutine's
+// lifetime and must not depend on that ordering to stay race-free.
+type heartbeatAuthState struct {
+	mu     sync.Mutex
+	replay heartbeatAuthReplay
+
+	// peerAuthSeen is sticky and READ cross-goroutine
+	// (Manager.HeartbeatPeerAuthSeen, consumed by the gRPC fabric listener to
+	// arm its downgrade-guard off the fast-arming heartbeat instead of the
+	// lazily-arming on-demand fabric RPCs), so it is an atomic rather than
+	// mu-guarded.
+	peerAuthSeen atomic.Bool
+}
+
+// admit forwards to the anti-replay tracker under the state lock. Callers must
+// invoke it only after the MAC has verified — an unauthenticated caller must
+// never mutate replay state.
+func (s *heartbeatAuthState) admit(session, counter uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.replay.admit(session, counter)
+}
+
+// peerAuthenticated reports whether the peer has ever sent a valid
+// HMAC-authenticated heartbeat (sticky for the life of the process).
+func (s *heartbeatAuthState) peerAuthenticated() bool {
+	return s.peerAuthSeen.Load()
+}
+
+// notePeerAuthenticated records that the peer proved it holds the PSK. From
+// then on an unauthenticated frame from it is a downgrade attack.
+func (s *heartbeatAuthState) notePeerAuthenticated() {
+	s.peerAuthSeen.Store(true)
+}
+
+// heartbeatAuthState returns the Manager's process-lifetime control-channel
+// auth state — the state a new heartbeatReceiver binds to so a restart does
+// not reset anti-replay (#5086). A nil Manager (unit tests constructing a
+// standalone receiver) gets a fresh private state rather than a nil deref, so
+// a test receiver behaves exactly like a never-restarted production one.
+func (m *Manager) heartbeatAuthState() *heartbeatAuthState {
+	if m == nil {
+		return &heartbeatAuthState{}
+	}
+	return &m.hbAuth
+}
+
 // heartbeatAuthDecision applies the #4107 dual-accept policy for one received
 // heartbeat and returns whether to accept it (and, when rejected, a short
 // reason for logging — never the key or packet bytes).
@@ -651,9 +734,12 @@ type heartbeatSender struct {
 	sent       atomic.Uint64
 	sendErrors atomic.Uint64
 
-	// #4107 anti-replay: a random per-process session id plus a monotonic
+	// #4107 anti-replay: a random per-SENDER session id plus a monotonic
 	// per-session counter. A new sender (StartHeartbeat/RestartHeartbeat)
 	// re-seeds authSession so the receiver re-anchors after a restart/reboot.
+	// Per-sender, NOT per-process: a heartbeat restart mints a fresh session
+	// without a daemon boot, which is what makes heartbeatReplaySessions a
+	// bound on peer SESSIONS rather than on peer daemon incarnations.
 	authSession uint64
 	authCounter atomic.Uint64
 }
@@ -671,13 +757,13 @@ type heartbeatReceiver struct {
 	recvErrors atomic.Uint64
 	startedAt  time.Time // when receiver started (for initial peer-lost detection)
 
-	// #4107 control-channel auth state. authReplay is touched only from
-	// readLoop. peerAuthSeen is written from readLoop but READ cross-goroutine
-	// (Manager.HeartbeatPeerAuthSeen, consumed by the gRPC fabric listener to
-	// arm its downgrade-guard off the fast-arming heartbeat instead of the
-	// lazily-arming on-demand fabric RPCs), so it is an atomic.
-	authReplay   heartbeatAuthReplay // per-peer anti-replay watermark
-	peerAuthSeen atomic.Bool         // sticky: peer has sent a valid authed HB
+	// auth is the #4107 control-channel auth state (anti-replay watermarks +
+	// the sticky peer-authenticated flag). It is a POINTER to state owned by
+	// the Manager, not an embedded value: the tracker must outlive this
+	// receiver so a heartbeat restart cannot discard the retired-session
+	// memory and re-open the #5086 replay. newHeartbeatReceiver always sets
+	// it; it is never nil.
+	auth *heartbeatAuthState
 }
 
 // peerAuthenticated reports whether the peer has ever sent a valid
@@ -686,7 +772,7 @@ type heartbeatReceiver struct {
 // listener reuses so its downgrade-guard engages within ~one heartbeat
 // interval of the peer coming up, not on the next on-demand fabric RPC.
 func (r *heartbeatReceiver) peerAuthenticated() bool {
-	return r.peerAuthSeen.Load()
+	return r.auth.peerAuthenticated()
 }
 
 func newHeartbeatSender(mgr *Manager, conn *net.UDPConn, peerAddr *net.UDPAddr, interval time.Duration) *heartbeatSender {
@@ -756,6 +842,14 @@ func newHeartbeatReceiver(mgr *Manager, conn *net.UDPConn, threshold int, interv
 		threshold: threshold,
 		interval:  interval,
 		stopCh:    make(chan struct{}),
+		// #5086: bind to the Manager's process-lifetime auth state so a
+		// heartbeat restart (VRF rebind, comms restart) keeps every retired
+		// peer-session watermark instead of starting from an empty tracker
+		// that re-admits captured frames. mgr is nil only in unit tests that
+		// exercise a standalone receiver; those get their own state, which is
+		// exactly the pre-#5086 per-receiver scope and is safe because such a
+		// receiver is never restarted.
+		auth: mgr.heartbeatAuthState(),
 	}
 	return r
 }
@@ -829,8 +923,8 @@ func (r *heartbeatReceiver) readLoop() {
 		key := r.mgr.controlLinkAuthKey()
 		session, counter, present := heartbeatAuthTrailer(buf[:n])
 		macOK := present && len(key) > 0 && verifyHeartbeatMAC(buf[:n], key)
-		nonceFresh := macOK && r.authReplay.admit(session, counter)
-		accept, reason := heartbeatAuthDecision(len(key) > 0, present, macOK, nonceFresh, r.peerAuthSeen.Load())
+		nonceFresh := macOK && r.auth.admit(session, counter)
+		accept, reason := heartbeatAuthDecision(len(key) > 0, present, macOK, nonceFresh, r.peerAuthenticated())
 		if !accept {
 			r.recvErrors.Add(1)
 			slog.Warn("cluster: heartbeat auth rejected",
@@ -842,7 +936,7 @@ func (r *heartbeatReceiver) readLoop() {
 			// unauthenticated frame from it is a downgrade attack. This also
 			// arms the gRPC fabric listener's downgrade-guard (via
 			// Manager.HeartbeatPeerAuthSeen).
-			r.peerAuthSeen.Store(true)
+			r.auth.notePeerAuthenticated()
 		}
 
 		r.received.Add(1)

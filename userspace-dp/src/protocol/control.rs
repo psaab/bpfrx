@@ -19,7 +19,26 @@ use super::security::{
 };
 use super::snapshot::{ConfigSnapshot, FabricSnapshot, NeighborSnapshot, UserspaceCapabilities};
 
-pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 3;
+/// The config-snapshot wire contract version, mirrored on the Go side by
+/// `userspace.ProtocolVersion` (pkg/dataplane/userspace/protocol.go). The two
+/// MUST be bumped in lockstep: both `apply_snapshot` and `bump_fib_generation`
+/// gate on EXACT equality, so a peer at a different version refuses the
+/// snapshot outright instead of decoding it under the wrong contract.
+///
+/// v4 (#5488): a scoped GLOBAL policy carries its zone SCOPE as a zone SET in
+/// the plural `match_from_zones`/`match_to_zones` fields, and those fields are
+/// AUTHORITATIVE (`effective_match_zones` prefers them). The singular
+/// `match_from_zone`/`match_to_zone` fields carry only the FIRST element.
+///
+/// #4626 added the plural fields as purely ADDITIVE JSON without bumping this
+/// constant, which made the version handshake lie: a pre-#4626 helper
+/// advertising the same version 3 ignores fields it does not know and reads
+/// ONLY the singular field, so a global `deny` scoped `[dmz trust] -> untrust`
+/// silently NARROWS to `dmz -> untrust` — a rolling-upgrade fail-OPEN for the
+/// zones dropped from the scope. A compatibility extension that changes
+/// deny/reject COVERAGE must not be silently ignorable under an unchanged
+/// protocol version.
+pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 4;
 pub(crate) const INJECT_PACKET_TUPLE_PROTOCOL_VERSION: i32 = 1;
 
 /// #3651: one per-zone traffic-volume row inside the `ProcessStatus`-level

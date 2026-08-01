@@ -3,6 +3,8 @@ package daemon
 import (
 	"encoding/binary"
 	"net"
+	"sync"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 
@@ -32,6 +34,148 @@ func daemonMonotonicSeconds() uint64 {
 	var ts unix.Timespec
 	_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
 	return uint64(ts.Sec)
+}
+
+// daemonMonotonicNanos is the full-resolution boot clock. daemonMonotonicSeconds
+// truncates to whole seconds, which is fine for session Created/LastSeen but NOT
+// for seeding an identity: two daemon incarnations whose first allocations land
+// in the same integer second would read the same value.
+func daemonMonotonicNanos() uint64 {
+	var ts unix.Timespec
+	_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
+	return uint64(ts.Sec)*1_000_000_000 + uint64(ts.Nsec)
+}
+
+// userspaceSyncedSessionIDNamespace reserves the high 16 bits of the node-local
+// BPF-ABI SessionID minted for an HA-synced session (#6198).
+//
+// The Rust dataplane's own stable id (`SessionTable::alloc_session_id`, #4915 —
+// carried across the cluster wire as the DISTINCT RTFlowSessionID, #5212) is
+// `(worker_id & 0xFFFF) << 48 | counter48`, where `worker_id` is a worker/queue
+// index (`set_worker_id`, userspace-dp/src/session/mod.rs). Reserving 0xFFFF for
+// the Go-minted ids keeps the two id spaces disjoint inside the shared BPF
+// conntrack mirror: the helper stamps its own id for sessions it owns, the
+// control plane stamps one of these for a peer-synced session it installs, and
+// neither can ever alias the other.
+const userspaceSyncedSessionIDNamespace = uint64(0xFFFF) << 48
+
+// userspaceSyncedSessionIDCounterMask is the low-48-bit counter space inside
+// that namespace — the same width the dataplane allocator uses.
+const userspaceSyncedSessionIDCounterMask = uint64(0x0000_FFFF_FFFF_FFFF)
+
+// userspaceSyncedSessionIDSeedShift is how far monotonic NANOSECONDS are shifted
+// right to seed the counter. 2^10 ns ≈ 1.024 µs of seed granularity, which sets
+// both properties that matter:
+//
+//   - Two incarnations share the same SEED only if their first allocations land
+//     in the same aligned 1.024 µs bucket. A daemon restart is milliseconds at
+//     the very least (process teardown, exec, init), so that window is
+//     unreachable by three orders of magnitude. Seeding at SECOND resolution —
+//     the first cut of this fix — left a window of up to a full second, which
+//     systemd's `RestartSec=1` lands squarely inside.
+//   - Distinct seeds are necessary but not sufficient: two incarnations can still
+//     overlap by RANGE. The seed advances ~976,562 per second, so a successor
+//     seeded t nanoseconds later starts (t >> 10) values above its predecessor,
+//     and the ranges overlap once the predecessor mints more than that many ids.
+//     At a 1 ms gap that is only ~976 ids. What makes overlap unreachable in
+//     practice is the ratio: sustaining it needs an average above ~976k synced
+//     conversions per second, far above what the dataplane produces.
+//
+// Be precise about the interval that average is taken over. Seeding is LAZY
+// (sync.Once on the first allocation), so both endpoints are FIRST ALLOCATIONS,
+// not process starts — the averaging interval begins when the predecessor first
+// minted an id, not when it booted. An incarnation that idles for a long time
+// and then mints just before being replaced gets only the teardown/restart gap
+// of headroom, not its whole lifetime. Conversely, delay before the successor's
+// first allocation widens the gap.
+//
+// The 48-bit seed space covers 2^58 ns ≈ 9.1 years of uptime before it cycles;
+// a cycle can only alias ids from an incarnation that old.
+const userspaceSyncedSessionIDSeedShift = 10
+
+// userspaceSyncedSessionIDSeed returns the counter value a daemon incarnation
+// starts from, given the monotonic nanoseconds at which it began.
+//
+// A bare counter starting at 0 would make ids REPEAT across an xpfd restart: the
+// new incarnation re-mints 1, 2, 3… while entries the peer's conntrack mirror
+// still holds from the previous incarnation (sessions this node closed while it
+// was down, whose keys the post-restart bulk re-export never overwrites) carry
+// exactly those values. The old now<<16|Slot composition did NOT have that flaw,
+// because CLOCK_MONOTONIC is system uptime and keeps increasing across a daemon
+// restart — so seeding is what keeps this change a strict improvement rather than
+// a trade.
+func userspaceSyncedSessionIDSeed(monotonicNanos uint64) uint64 {
+	return (monotonicNanos >> userspaceSyncedSessionIDSeedShift) & userspaceSyncedSessionIDCounterMask
+}
+
+// userspaceSyncedSessionIDs is the node-local monotonic allocator behind
+// nextUserspaceSyncedSessionID, seeded from the boot clock on first use.
+var (
+	userspaceSyncedSessionIDs    atomic.Uint64
+	userspaceSyncedSessionIDOnce sync.Once
+)
+
+// nextUserspaceSyncedSessionID mints the node-local BPF-ABI SessionID stamped on
+// a session converted from a userspace-helper delta (#6198).
+//
+// It replaces the previous `uint64(now)<<16 | uint64(delta.Slot&0xffff)`
+// composition, which was NOT an identity at all: `delta.Slot` is the AF_XDP
+// BINDING slot (`BindingIdentity.slot`, userspace-dp/src/afxdp/session_delta.rs
+// — one per interface/queue, a handful per node), and the binary event stream
+// that carries the primary delta path never decodes it at all
+// (`decodeSessionEvent` in pkg/dataplane/userspace/eventstream.go leaves it 0).
+// Every session converted within the same monotonic SECOND therefore collapsed
+// onto ONE id, conflating unrelated flows in `show security flow session` and in
+// the REST/gRPC session views. A monotonic counter gives every CONVERSION a
+// distinct id — see the per-conversion note below.
+//
+// The counter is seeded from the boot clock on first use
+// (userspaceSyncedSessionIDSeed) so ids do not repeat across an xpfd restart
+// either.
+//
+// The advance is a CAS rather than a bare Add so the STORED value is the one that
+// was returned. `0` is the "no id / unknown" sentinel that makes
+// `flowSessionDisplayID` fall back to the per-row ordinal, so the counter skips
+// it — and skipping it has to be committed to the atomic. A bare
+// `Add(1) & mask; if counter == 0 { counter = 1 }` corrects only the local copy:
+// at the wrap the atomic still holds the masked-zero value, so the NEXT call
+// reads 1 and returns the id just handed out. That silently breaks the one
+// property this whole change exists to establish, and unlike a plain overflow it
+// leaves the id inside the namespace, so nothing downstream looks wrong.
+//
+// The wrap itself is reachable, not theoretical: the seed consumes counter space,
+// so the distance to it depends on uptime phase. A wrap only re-mints ids this
+// incarnation issued 2^48-1 conversions ago (the ring skips the zero counter,
+// so 2^48-1 values are usable, not 2^48), or ids from an incarnation whose
+// entries are long gone — so the ring is the right behaviour. Refusing to mint
+// would be worse: this id is display-only, but the conversion that carries it
+// installs an HA-synced session, and failing that to protect a display field
+// would trade a cosmetic alias for lost sessions at failover.
+//
+// The id is per CONVERSION, not stable per session: a bulk resync re-converts
+// live sessions and re-stamps them with fresh ids, and the `close` branch of
+// queueUserspaceSessionDeltas converts purely to derive the key and discards the
+// id it mints. Both are harmless in a 48-bit space, and the old composition
+// churned the id the same way — what changed is that concurrent sessions no
+// longer SHARE one.
+//
+// This id stays NODE-LOCAL by design: the cross-node correlatable id is the
+// separate RTFlowSessionID (#5212), which rides its own wire field and is
+// adopted verbatim by the peer helper. See docs/session-sync-architecture.md.
+func nextUserspaceSyncedSessionID() uint64 {
+	userspaceSyncedSessionIDOnce.Do(func() {
+		userspaceSyncedSessionIDs.Store(userspaceSyncedSessionIDSeed(daemonMonotonicNanos()))
+	})
+	for {
+		cur := userspaceSyncedSessionIDs.Load()
+		next := (cur + 1) & userspaceSyncedSessionIDCounterMask
+		if next == 0 {
+			next = 1
+		}
+		if userspaceSyncedSessionIDs.CompareAndSwap(cur, next) {
+			return userspaceSyncedSessionIDNamespace | next
+		}
+	}
 }
 
 func userspaceSessionTimeout(proto uint8) uint32 {
@@ -183,8 +327,10 @@ func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	now := daemonMonotonicSeconds()
 	val := dataplane.SessionValue{
 		State: 4, // SESS_STATE_ESTABLISHED
-		// SessionID is the BPF-ABI conntrack id (node-local now<<16|Slot).
-		SessionID: uint64(now)<<16 | uint64(delta.Slot&0xffff),
+		// SessionID is the BPF-ABI conntrack id: node-local, and unique per
+		// converted session since #6198 (the previous now<<16|Slot composition
+		// collapsed every session converted in the same second onto one id).
+		SessionID: nextUserspaceSyncedSessionID(),
 		// #5212: the ORIGINATING node's stable RT_FLOW session id (distinct from
 		// SessionID above). Carried across the cluster sync wire so a peer-synced
 		// session adopts it and its SESSION_CREATE/CLOSE records correlate across
@@ -242,11 +388,15 @@ func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	return key, val, true
 }
 
-func userspaceForwardWireAliasFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map[string]uint16) (dataplane.SessionKey, dataplane.SessionValue, bool) {
-	key, val, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
-	if !ok {
-		return dataplane.SessionKey{}, dataplane.SessionValue{}, false
-	}
+// userspaceForwardWireAliasV4 derives the fabric-redirect forward-wire alias
+// entry from an ALREADY-CONVERTED base session.
+//
+// It takes the converted base rather than re-converting the delta because
+// nextUserspaceSyncedSessionID mints a FRESH id per conversion (#6198): a second
+// conversion of the same delta would split one logical session across two
+// SessionIDs, where the alias and its base entry must share one. It also drops a
+// redundant conversion from the delta path.
+func userspaceForwardWireAliasV4(key dataplane.SessionKey, val dataplane.SessionValue, delta dpuserspace.SessionDeltaInfo) (dataplane.SessionKey, dataplane.SessionValue, bool) {
 	wireKey := userspaceForwardWireKeyV4(key, delta)
 	if wireKey == key {
 		return dataplane.SessionKey{}, dataplane.SessionValue{}, false
@@ -284,8 +434,9 @@ func userspaceSessionFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	now := daemonMonotonicSeconds()
 	val := dataplane.SessionValueV6{
 		State: 4, // SESS_STATE_ESTABLISHED
-		// SessionID is the BPF-ABI conntrack id (node-local now<<16|Slot).
-		SessionID: uint64(now)<<16 | uint64(delta.Slot&0xffff),
+		// SessionID is the BPF-ABI conntrack id: node-local, and unique per
+		// converted session since #6198 (see the V4 converter).
+		SessionID: nextUserspaceSyncedSessionID(),
 		// #5212: the ORIGINATING node's stable RT_FLOW session id (see V4) —
 		// adopted by a peer-synced session so its RT_FLOW records correlate
 		// across HA nodes; 0 on a legacy helper => fresh local id on import.
@@ -355,11 +506,9 @@ func userspaceForwardWireKeyV6(key dataplane.SessionKeyV6, delta dpuserspace.Ses
 	return wire
 }
 
-func userspaceForwardWireAliasFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map[string]uint16) (dataplane.SessionKeyV6, dataplane.SessionValueV6, bool) {
-	key, val, ok := userspaceSessionFromDeltaV6(delta, zoneIDs)
-	if !ok {
-		return dataplane.SessionKeyV6{}, dataplane.SessionValueV6{}, false
-	}
+// userspaceForwardWireAliasV6 is the V6 twin of userspaceForwardWireAliasV4 —
+// same reason for taking the already-converted base (#6198).
+func userspaceForwardWireAliasV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, delta dpuserspace.SessionDeltaInfo) (dataplane.SessionKeyV6, dataplane.SessionValueV6, bool) {
 	wireKey := userspaceForwardWireKeyV6(key, delta)
 	if wireKey == key {
 		return dataplane.SessionKeyV6{}, dataplane.SessionValueV6{}, false

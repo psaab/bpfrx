@@ -178,8 +178,10 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	//
 	// This MUST run before any reconcile step that can abort applyConfigLocked
 	// early — specifically the dataplane apply below, which returns early on a
-	// required userspace protocol-gate error (compileErrorMustAbortApply:
-	// policy-scheduler OR persistent-source-NAT protocol incompatibility, #2138).
+	// required userspace protocol-gate error (compileErrorMustAbortApply, which
+	// delegates to userspace.IsRequiredProtocolGateError — policy-scheduler,
+	// persistent-source-NAT, or multi-zone scoped-global protocol
+	// incompatibility, #2138 / #5488).
 	// Store.Commit() has ALREADY promoted and persisted this compiled config
 	// before applyConfigLocked runs, so the committed authorization is live
 	// regardless of whether the later dataplane apply succeeds. Reconciling

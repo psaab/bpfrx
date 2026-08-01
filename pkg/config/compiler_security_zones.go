@@ -59,6 +59,35 @@ func mergeHostInbound(dst, src *HostInboundTraffic) *HostInboundTraffic {
 	return dst
 }
 
+// cloneHostInbound returns a deep copy of src (fresh backing arrays for both
+// admission dimensions), preserving the exact token multiset and order — a copy
+// is value-identical, it only breaks POINTER identity.
+//
+// Required by the #6391 multi-member fan. mergeHostInbound returns src UNCHANGED
+// when dst is nil (the deliberate #4544 no-copy fast path), so fanning one parsed
+// body across N member names would otherwise store the SAME pointer under N map
+// keys. A later mergeHostInbound into any one of them mutates dst IN PLACE, so a
+// subsequent single-scoped override on one member would silently surface on all
+// the others:
+//
+//	interfaces {
+//	    [ a b ] { host-inbound-traffic { system-services ssh; } }
+//	    a       { host-inbound-traffic { system-services ping; } }
+//	}
+//
+// With a shared pointer, merging `ping` into a mutates the value b also points
+// at, so b wrongly admits ping. Cloning per key keeps the members independent.
+// Pinned by TestHostInbound6391BracketBodyMembersDoNotShareBackingStore.
+func cloneHostInbound(src *HostInboundTraffic) *HostInboundTraffic {
+	if src == nil {
+		return nil
+	}
+	return &HostInboundTraffic{
+		SystemServices: append([]string(nil), src.SystemServices...),
+		Protocols:      append([]string(nil), src.Protocols...),
+	}
+}
+
 // dedupHostInboundTokens returns vals with duplicate entries removed, preserving
 // first-seen order. Used only on the merged (2+ block) host-inbound path (#4544)
 // so a single block keeps its exact token multiset (byte-identical behaviour).
@@ -158,7 +187,62 @@ func compileZones(node *Node, sec *SecurityConfig) error {
 						if zone.InterfaceHostInbound == nil {
 							zone.InterfaceHostInbound = make(map[string]*HostInboundTraffic)
 						}
-						zone.InterfaceHostInbound[iface.Name()] = mergeHostInbound(zone.InterfaceHostInbound[iface.Name()], hib)
+						// #6391: apply the override to every name this member
+						// node's KEYS carry, and NEVER to its CHILDREN. That
+						// distinction is the whole fix; the two shapes it
+						// separates are NOT interchangeable:
+						//
+						//   Keys=[a b], no membership child
+						//       `interfaces { [ a b ] { host-inbound {...} } }`
+						//     A body authored ON a bracket membership — the
+						//     operator's MULTI-MEMBER intent. Both a and b get it.
+						//
+						//   Keys=[a], child leaf Keys=[b]
+						//       `set ... interfaces [ a b ]`
+						//       `set ... interfaces a host-inbound-traffic ... ssh`
+						//     SetPath descends the wildcard for the FIRST token and
+						//     NESTS the bracket tail under it, then the second `set`
+						//     REUSES that same `a` container — so `a` ends up
+						//     carrying both the `b` membership leaf and the
+						//     host-inbound body even though ssh is scoped to `a`
+						//     ALONE. Fanning here is the #6389 regression: it opens
+						//     ssh on `b`, which the operator never configured
+						//     (admission is additive — host_inbound_view.go).
+						//
+						// NO `set`-authored config can reach the multi-key shape,
+						// which is what makes keying on Keys safe rather than merely
+						// convenient. The interface name is `schemaNode.wildcard`
+						// with args:0, multi:false, compoundKey:false
+						// (schema_security.go), so SetPath's
+						// `nodeKeyCount = 1 + childSchema.args` (ast_edit.go:289 —
+						// NOT the same-named local in schema_complete.go,
+						// which is the completion walker and decides
+						// nothing here) is ALWAYS 1 and its
+						// container branch stores exactly one token; surplus bracket
+						// tokens can only land on a child LEAF (which has no
+						// host-inbound child, so it is never read here). A bracket
+						// list is therefore len(Keys)==1 from `set` and len(Keys)>1
+						// ONLY from a hierarchical parse (`load override`, a
+						// hand-authored config file). Pinned by
+						// TestHostInbound6391FlatSetNeverYieldsMultiKeyContainer.
+						//
+						// A nested extra membership under a bracket body
+						// (`[ a b ] { c; host-inbound {...} }`) fans to a and b but
+						// NOT c: c is a nested membership statement, not a bracket
+						// sibling of the node the body was authored on. Deliberate
+						// (#6391), pinned by
+						// TestHostInbound6391BracketBodyNestedExtraMemberScope.
+						//
+						// cloneHostInbound per key: mergeHostInbound returns src
+						// unchanged when dst is nil, so storing `hib` directly under
+						// several keys would alias ONE value across the members and a
+						// later in-place merge on one would surface on all of them.
+						for _, name := range iface.Keys {
+							if name == "" {
+								continue
+							}
+							zone.InterfaceHostInbound[name] = mergeHostInbound(zone.InterfaceHostInbound[name], cloneHostInbound(hib))
+						}
 					}
 				}
 			case "screen":
@@ -220,8 +304,16 @@ func compileZones(node *Node, sec *SecurityConfig) error {
 // silently dropped the rest (#5248). Recursing the nested chain and reading every
 // key at each level recovers all members. A `host-inbound-traffic` body under a
 // member is NOT an interface name — it is compiled separately (#3362) and skipped
-// here; a bracketed member cannot carry one (Junos: brackets are bare
-// membership), so per-interface host-inbound stays keyed on the direct child.
+// here.
+//
+// This helper is for zone MEMBERSHIP ONLY. Do NOT reuse it to scope a
+// per-interface host-inbound override: it recurses into CHILDREN, and a flat-set
+// `interfaces [ a b ]` puts the sibling `b` in a child of `a` (see the nesting
+// above) while a subsequent `set ... interfaces a host-inbound-traffic ...`
+// reuses that same `a` container. Fanning an override across this member set
+// therefore opens the service on `b` for a config that scoped it to `a` alone —
+// the #6389 regression, closed unmerged. compileZones scopes the override on
+// `iface.Keys` instead, which separates the two shapes (#6391).
 func zoneInterfaceMembers(iface *Node) []string {
 	var names []string
 	for _, k := range iface.Keys {

@@ -214,6 +214,313 @@
   — while all nine negative-control/contract tests stay green. Cluster
   smoke still REQUIRED (this changes the packet path); not run here.
 
+## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
+- **Action**: Round 6b corrected the overstated invariant but left the comment
+  merely accurate, not useful: it said the invariant is not enforced without
+  saying WHY the table is still worth having. Reviewer asked for the fuller
+  characterization in the comment itself. Now states, in the artifact that
+  ships: two of the three routes are closed BY CONSTRUCTION (a named-constant
+  KEY registers exactly like a literal one; no switch remains to nest another
+  inside), the third is demoted not eliminated, and what changed for it is which
+  act is natural — adding a `case` used to be the idiomatic way to add a
+  statement and diverged silently, whereas diverging now means ad-hoc dispatch
+  beside a five-line loop whose only other content is the table lookup.
+  docs/config-schema.md carried the same qualification without saying which
+  routes close; matched.
+- **File(s)**: `pkg/config/compiler_system.go`, `docs/config-schema.md`, `_Log.md`
+
+## 2026-08-01 — #6588 round 6b: correct an overstated invariant in the table comment
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
+- **Action**: The redundancyGroupStatements comment claimed a statement not in
+  the table "is not compiled either — so the two cannot disagree". Review tested
+  that rather than accepting it: dispatch injected inside the loop but outside
+  the table lookup reproduces the original divergence (container form honors the
+  statement, packed multi-statement line drops it). Same m4' result I reported
+  in round 6 — but the CODE COMMENT still carried the overstatement, which is
+  where the next person reads it, so the honest version in the PR body did not
+  fix anything. Reworded to state the real property: the invariant is "all
+  dispatch goes through this table", and the table being the only dispatch path
+  present makes the correct thing the easy thing — it is NOT enforced.
+  Fixed the identical overstatement in docs/config-schema.md, which also carried
+  "so the two cannot disagree" and then contradicted itself a paragraph later.
+  An overstated invariant is how the next person concludes they need not think.
+- **File(s)**: `pkg/config/compiler_system.go`, `docs/config-schema.md`, `_Log.md`
+
+## 2026-08-01 — #6588 round 6: replace the source-modelling drift guard with a dispatch table
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
+- **Action**: MAJOR-C — the round-4 drift guard PASSED while a 7th
+  redundancy-group statement was still dropped from a packed multi-statement
+  line, three different ways. Verified all three firsthand at 84f660259 before
+  writing (each: build CLEAN, guard PASS, statement DROPPED):
+    m3 `case rgHoldDownKeyword:` (a named constant, not a string literal) — the
+       guard `continue`d the non-BasicLit case silently, so len(arms) stayed 6
+       and even the `< 6` floor passed. This is the idiom THIS PR introduced
+       with `const monitorWeightKeyword = "weight"`.
+    m4 statement handled by a helper called from the loop, outside the switch —
+       the guard modelled ONE switch.
+    m7 nested `switch child.Name()` inside a `default:` arm — ast.Inspect
+       returned false after matching the outer switch so it never descended.
+  Camouflage that makes it worse than a gap: the same statement ALONE on a line
+  still works (packedStatementProps opens the first node regardless of the
+  predicate), so a developer sees three greens and ships the fold bug.
+  Took the reviewer's fix rather than hardening the guard:
+  redundancyGroupStatements, a map[string]func(*RedundancyGroup, *Node), is now
+  BOTH the compiler's dispatch and the splitter's token set;
+  isRedundancyGroupStatement is derived from it. The six switch arms were
+  extracted VERBATIM into named functions (body-identity verified
+  statement-by-statement against the pre-refactor arms: 22/5/1/1/23/49
+  statements, all identical modulo indentation; no top-level continue/break in
+  any extracted body, so leaving the switch/for changed no control flow).
+  Deleted the source-parsing guard rather than leaving a tautology, and replaced
+  it with TestRedundancyGroupStatementsSurvivePackedLine_6588, which DERIVES its
+  cases from the table: every registered statement is paired with every other on
+  one packed line, in both orders, and a table entry with no sample fails the
+  completeness check. Nothing to update when the table grows.
+- **Honest limit, not claimed closed**: re-ran all three against the table.
+  m3' (named-constant KEY) and m7' (ordinary entry — no switch remains to nest
+  inside) are now HONORED. m4' still DROPS: an ad-hoc `if` in the loop that
+  compiles a statement without registering it. The table makes the idiomatic
+  path correct by construction and converts m4 from invisible to a visible
+  deviation beside a five-line loop; it does not make it impossible, and Go
+  offers no way to. Reported as such rather than claiming three-of-three.
+- **Blast radius**: contained to compileChassis in compiler_system.go. All six
+  arms needed only (rg, child) — no arm touched ch, clusterNode or rgInst — so
+  the extraction is mechanical. No other caller. Full suite exit 0 across 59
+  packages, 116 passing 6588 subtests.
+- **File(s)**: `pkg/config/compiler_system.go`,
+  `pkg/config/compiler_chassis_packed_monitor_6588_test.go`,
+  `docs/config-schema.md`, `_Log.md`
+
+## 2026-08-01 — #6588 round 5: a regression this PR introduced, plus a second RG node shape
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
+- **Action**: Re-review at e25cc5d0c found two MAJORs; both reproduced firsthand
+  before writing.
+  (MAJOR-A, a REGRESSION vs master) `interface-monitor [ ge-0/0/0 ge-0/0/1 ]
+  weight 255` compiled ge-0/0/0 at weight ZERO. The round-3 splitter attached a
+  weight token to the entry immediately preceding it. Master compiled ONE
+  monitor at 255; this branch compiled two, N-1 of them inert — monitored,
+  shown, deducting nothing on link-down. Worse than master, and it contradicted
+  this PR's own children-block path, where `[ a b ] { weight 255; }` already
+  applied 255 to both. Fixed by making the attribute run CANDIDATE-scoped: names
+  and `weight` tokens are separated, then every name gets the full run.
+  Apply-to-all is the fail-safe direction and is strictly better than master
+  here (no member dropped, no weight lost). Two inline weights in one bracketed
+  statement are now REJECTED as ambiguous, consistent with the round-2
+  duplicate gate — master silently took the last and dropped the rest.
+  Root cause of it shipping: assertMonitorNames compared only
+  InterfaceMonitors[i].Interface and never .Weight, so the whole bracket suite
+  was blind to weight distribution. Replaced with assertMonitors(names,
+  weights); the name-only entry point now delegates, and the helper documents
+  why a name-only assertion is not enough.
+  (MAJOR-B) redundancyGroupBody used a fixed skip of 2, correct for only ONE of
+  namedInstances' two return shapes. For a bare `redundancy-group { 1 ...; }`
+  wrapper it returns a CHILD whose Keys[0] IS the id, so skip must be 1; with 2
+  the statement keyword was swallowed and the tail opened a node named after a
+  value, matching no switch arm — every statement dropped, election priority
+  included, through all four redundancyGroupBody readers. Keys[0] is an exact
+  discriminator (shape 1 is always reached via FindChildren("redundancy-group")).
+  Fixed rather than documented despite lower reachability: the guard covers all
+  four readers, so leaving it would make the three AST gates blind here while
+  LOOKING like they covered it.
+- **Validation**: two mutation proofs, build+vet CLEAN under each. (F) attach the
+  inline weight to the last entry only -> 2 top-level FAILs, assertions naming
+  the zero-weight monitor; the three MAJOR-A controls (children-block,
+  single-name, weight-less) stayed GREEN. (G) pin skip back to 2 -> 1 FAIL, 4
+  assertions naming the lost statement; both MAJOR-B controls (bare-wrapper
+  nested block, ordinary instance shape) stayed GREEN. Restored: build+vet
+  clean, `go test ./...` exit 0 across 59 packages, 104 passing 6588 subtests.
+- **File(s)**: `pkg/config/compiler_system.go`,
+  `pkg/config/compiler_chassis_packed_monitor_6588_test.go`,
+  `docs/config-schema.md`, `_Log.md`
+
+## 2026-08-01 — #6588 round 3b: drift guard on the isRedundancyGroupStatement list
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
+- **Action**: Round 3 introduced a HAND-WRITTEN token list
+  (isRedundancyGroupStatement) that redundancyGroupBody splits a packed instance
+  tail at. A token missing from that list is not a loud failure — the
+  statement's tokens append to whichever statement precedes it on the line, so
+  it silently does nothing. Same defect class as the bug, better camouflaged.
+  Checked the list against both sources of truth rather than re-reading it:
+  it equals compileChassis's switch arms EXACTLY (node, gratuitous-arp-count,
+  preempt, strict-vip-ownership, interface-monitor, ip-monitoring), and is a
+  strict SUPERSET of setSchema's redundancy-group children — setSchema is
+  missing `strict-vip-ownership`, which the compiler DOES handle. That schema
+  gap is pre-existing and unrelated (it costs config-mode completion for that
+  leaf, not compilation); reported, not fixed here.
+  Correct today is not the property worth having, so the list is no longer
+  trusted by inspection: TestRedundancyGroupStatementPredicateCoversCompiler_6588
+  parses compileChassis's OWN source (go/ast), extracts every `case "..."` of
+  the `switch child.Name()` dispatch, and requires the predicate to accept each.
+  Adding an arm without extending the predicate now fails with the token named.
+  The guard fails loudly if it cannot find the function or the switch, and has a
+  floor of 6 arms, so it cannot silently verify an empty set.
+- **Validation**: proved the guard FIRES in both drift directions, build+vet
+  CLEAN under each. (E1) drop "preempt" from the predicate -> RED naming
+  "preempt". (E2) add `case "hold-down-interval":` to compileChassis and forget
+  the predicate — the realistic drift — -> RED naming "hold-down-interval".
+  Restored: build+vet clean, `go test ./...` exit 0 across 59 packages, 86
+  passing 6588 subtests.
+- **File(s)**: `pkg/config/compiler_chassis_packed_monitor_6588_test.go`, `_Log.md`
+
+## 2026-08-01 — #6588 round 3: the same drop ONE LEVEL UP (redundancy-group instance)
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
+- **Action**: Round-3 review found a third shape, verified firsthand at the
+  round-2 head before writing: `redundancy-group 1 <statement>;` written on the
+  INSTANCE line compiles to an empty group. namedInstances resolves the name
+  across both shapes (Keys[1]) but returns the node with the body still on
+  Keys, so compileChassis's `range rgInst.node.Children` saw nothing. All four
+  statements confirmed lost with NO error: interface-monitor, ip-monitoring,
+  preempt, and — the severe one — `node 0 priority 200`, the redundancy-group
+  ELECTION PRIORITY. Dropped, the cluster elects on defaults and the wrong node
+  can hold the group, which is a superset of "never demotes".
+  Fixed with redundancyGroupBody = packedStatementProps(rgNode, 2,
+  isRedundancyGroupStatement), so a multi-statement line
+  (`node 0 priority 200 preempt gratuitous-arp-count 8;`) splits at statement
+  keywords instead of folding into the first. Applied at ALL FOUR readers of
+  the RG body — compileChassis plus validateMonitorWeightTokensAST,
+  validateChassisClusterIdentitiesAST and validateGratuitousARPCountAST —
+  because a compiler that sees a shape its gates cannot would admit, through
+  the packed instance line only, exactly what round 2 closed elsewhere.
+- **Rejected fix direction, with evidence**: the reviewer's preferred option was
+  to make namedInstances itself synthesize the packed tail as a child, fixing
+  all ~130 callers at once. Tried it. It breaks callers that already handle the
+  tail: 24 sites read inst.node.Keys directly, and compileStaticRoutes branches
+  on `len(Children)==0` to DETECT the packed shape, so a synthetic child
+  disables its packed path. The experiment turned TestDHCPRelayOverrides_* red
+  (override tokens swallowed into Interfaces) and
+  TestVRRPTrackInterface_KeysPackedDuplicateStrictReject red (lenient
+  first-wins gave an empty TrackInterface). One prediction was wrong and is
+  recorded as such: the packed static route itself SURVIVED the experiment
+  (its next-hop arrives as a real child either way).
+- **Audit answer — other namedInstances callers are NOT all safe**: measured by
+  direct compile, `system login class ops permissions view;` yields a class with
+  empty permissions, `system login user bob class ops;` a user with no class,
+  and `system syslog host 10.0.0.9 any;` a host with zero facilities. Same root
+  cause, different stanzas. Reported as follow-up work rather than claimed safe.
+- **Validation**: mutation D — redundancyGroupBody returns rgNode.Children —
+  build+vet CLEAN, 2 top-level FAILs (PackedBody, PackedBodyReachesGates), 13
+  assertions each naming the lost statement; the container-form control stayed
+  GREEN. Restored: build+vet clean, `go test ./...` exit 0 across 59 packages,
+  85 passing 6588 subtests.
+- **File(s)**: `pkg/config/compiler_system.go`,
+  `pkg/config/compiler_chassis_monitor_weight.go`,
+  `pkg/config/compiler_chassis_identity.go`,
+  `pkg/config/compiler_chassis_garp_count.go`,
+  `pkg/config/compiler_chassis_packed_monitor_6588_test.go`,
+  `docs/config-schema.md`, `_Log.md`
+
+## 2026-08-01 — #6588 round 2: three MAJORs inside the round-1 fix
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
+- **Action**: Hostile review returned DO-NOT-MERGE with three MAJORs, all
+  inside the code round 1 touched. Each premise was re-verified by direct
+  compile before writing, and one needed correcting.
+  (MAJOR 1) ip-monitoring 0..255 was ungated for the PACKED spelling. The
+  review framed it as "the packed path bypasses the validation the container
+  path gets"; direct compile shows the real shape is narrower and the fix is
+  wider — `SchemaValidate` is called from pkg/configstore, not CompileConfig,
+  and it walks setSchema, so the PACKED statement sits below the depth it
+  reaches for BOTH ip-monitoring and interface-monitor. The typed leaf covers
+  flat-set and container; nothing covered packed. Harmless while packed
+  compiled to nothing — but round 1 made it compile. Fix: extend the #6549
+  compiled-int gate in validateChassisClusterStrict to global-weight,
+  global-threshold and per-target weight, the one layer all three spellings
+  pass through. Pinned that reasoning with a test asserting SchemaValidate
+  returns nil for a config the compiled-int gate rejects.
+  (MAJOR 2) A bracketed `interface-monitor [ a b c ]` compiled ONE monitor.
+  Confirmed pre-existing in ALL THREE spellings, not introduced by round 1 —
+  the lexer strips the brackets (#2419) so N names land on one node's Keys
+  everywhere. The round-1 helper synthesised exactly one entry from the tail,
+  so it inherited the drop. Replaced with monitorEntryNodes, which splits each
+  candidate's Keys at entry boundaries with a reserved value slot after
+  `weight` (the #6524 rule). Kept the EITHER/OR tail-vs-children rule for
+  entry lists — accumulating there mints a monitor for an interface literally
+  named `weight` — and added packedStatementProps for the ip-monitoring
+  property body, where the two ARE siblings.
+  (MAJOR 4) `weight nope` committed clean with Weight=0, so the monitor
+  deducted nothing on link-down. The compiled struct cannot express it (a
+  failed Atoi is indistinguishable from `weight 0`), so this is a new AST gate,
+  validateMonitorWeightTokensAST, deriving its entries from the same readers
+  the compiler uses. Strict at commit, warn on the tolerant path
+  (lenientChassisMonitorWeight, #1960 no-brick).
+  Duplicates were shape-dependent (`weight 100 weight 200` inline -> 200;
+  `{ weight 100; weight 200; }` -> 100). The compiler is now uniformly
+  first-wins via monitorWeightTokens and the gate rejects the duplicate, so the
+  answer no longer depends on spelling.
+- **Validation**: three separate mutation proofs, each with build+vet CLEAN
+  first so the red is an assertion. (A) drop the ip-monitoring range block ->
+  2 top-level FAILs, both MAJOR-1 tests; in-range control GREEN. (B) make
+  monitorEntryNodes return the candidate unsplit -> 2 FAILs, both bracket
+  tests; the single-non-bracketed-entry control GREEN in full. (C) unwire the
+  weight gate from runPreWalkGates -> 3 FAILs (malformed, tolerant-warn,
+  duplicate); the valid-weight control GREEN. Restored: build+vet clean,
+  `go test ./...` exit 0 across 59 packages, 69 passing 6588 subtests.
+- **Scope refused**: the review also enumerated 14 other one-sided arms across
+  pkg/config with the same nodeVal root cause. Left alone and filed separately
+  by the reviewer — #6658 stays about redundancy-group monitors.
+- **File(s)**: `pkg/config/compiler_system.go`,
+  `pkg/config/compiler_chassis_monitor_weight.go` (new),
+  `pkg/config/compiler_validate_strict_chassis.go`,
+  `pkg/config/compiler_prewalk.go`, `pkg/config/compiler_opts.go`,
+  `pkg/config/schema_chassis.go` (stale comment),
+  `pkg/config/compiler_chassis_packed_monitor_6588_test.go`,
+  `docs/config-schema.md`, `_Log.md`
+
+## 2026-08-01 — #6588 config/cluster: packed interface-monitor / ip-monitoring compiled to nothing
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf)
+- **Action**: Fixed a chassis-cluster failover FAIL-OPEN. A redundancy-group
+  monitor authored in the PACKED hierarchical spelling — one statement
+  directly under `redundancy-group`, no nested block — compiled to NOTHING.
+  The parser yields a single leaf
+  (`Keys=[interface-monitor ge-0/0/0 weight 255]`, no children) while
+  `compileChassis` enumerated monitors by iterating `child.Children` only,
+  so the operator got `rgs=1, monitors=0`: link tracking configured, commit
+  clean, and a redundancy group that never demoted on link-down.
+  Swept the whole `compileChassis` switch (6 arms) and found the same drop
+  at TWO more sites in the same loop, both fixed here: packed `ip-monitoring`
+  (`ip-monitoring global-weight 255;`, `ip-monitoring family inet <addr>
+  weight <n>;`) dropped its global weights and every probe target — the same
+  RG-demotion debt path — and a packed `family inet <addr> weight <n>;` leaf
+  written INSIDE an `ip-monitoring { ... }` block dropped the target too.
+  The `node` / `gratuitous-arp-count` / `preempt` / `strict-vip-ownership`
+  arms already handled both shapes (verified by direct compile, not by
+  reading). A third sub-shape surfaced from the new test rather than the
+  issue: `interface-monitor ge-0/0/0 { weight 255; }` packed the NAME onto
+  the statement while the attributes arrived as children, so the old reader
+  minted a monitor for an interface literally called `weight`.
+  New shared reader `packedOrContainerEntries(cfgNode, skip)` normalises all
+  shapes; its rule is EITHER/OR (an inline tail means the statement IS one
+  entry, so its children are that entry's properties) — the same rule
+  `namedInstances` already applies, and deliberately NOT the accumulate rule
+  the #2419 multi-value contract uses, since accumulating is what mints the
+  bogus `weight` monitor. `findNamedNode` is its slice-shaped `FindChild`.
+  Second-order: because the packed shape now reaches the compiled `*Config`,
+  the #6549 weight range gate (which runs on the compiled int) covers it for
+  free — a packed `weight -100` is now rejected at commit instead of
+  silently accepted.
+- **Validation**: fail-on-revert with `compiler_system.go` restored verbatim
+  from `origin/master` (test kept): `go build ./...` + `go vet ./...` CLEAN,
+  every Packed subtest RED as an assertion naming the missing monitor /
+  target, and the FlatSet / ContainerHierarchical / Control* subtests GREEN
+  as controls. Full `pkg/config` suite under mutation: 7 top-level FAILs, all
+  `*_6588`, zero others. Restored: full `go test ./...` exit 0.
+- **Scope left out**: `services ip-monitoring` (#1827, `compiler_services.go`)
+  drops its packed `then preferred-route ...;` too, but that is fail-CLOSED —
+  a policy with zero compiled routes is a hard commit error ("at least one
+  then preferred-route route is required"), verified by direct compile. It is
+  a different stanza with a loud failure, so it stays out of this PR.
+- **File(s)**: `pkg/config/compiler_system.go`,
+  `pkg/config/compiler_chassis_packed_monitor_6588_test.go` (new),
+  `docs/config-schema.md`, `_Log.md`
+
 ## 2026-07-31 — #6611 review round 2: guard scoped narrower than its claim
 
 - **Timestamp**: 2026-07-31 (fix/6611-control-channel-auth, PR #6624)
@@ -65822,3 +66129,328 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/refactoraudit/audit_canary_test.go, pkg/refactoraudit/doc.go,
   docs/refactoring-audit-current.txt, docs/refactoring-audit.md,
   scripts/refactoring-audit.sh, Makefile, _Log.md
+
+- **Timestamp**: 2026-08-01
+- **Action**: "#5154 — make the HA session-import poison policy symmetric. The
+  #2170 generation guards in `upsert_synced_session` /
+  `delete_synced_session_gen` read `sessions.synced` with `.lock().ok()`, and
+  the #5674 admission bound read its length with
+  `.lock().map(..).unwrap_or(0)`. After a CONTAINED worker panic (#925
+  supervisor) poisoned that mutex, all three reads yielded 'nothing stored,
+  empty map', so every guard fell through — while the WRITE half
+  (`publish_shared_session` / `remove_shared_session`) commits through
+  `lock_shared_recover`, which `clear_poison()`s and mutates anyway.
+  Validation and mutation applied OPPOSITE poison policies, so a stale-
+  generation install regressed the stored generation, a stale delete removed
+  a NEWER live entry, and an over-ceiling import bypassed the aggregate bound
+  — a fail-OPEN on an ordering guard, reached by a path the system is designed
+  to survive. Fixed by RECOVERING the reads (the established #2402/#1807
+  module policy) rather than refusing the writes: `lock_shared_recover` clears
+  poison, so a refuse-on-poison write would fire nondeterministically
+  depending on which thread locked first, and would wedge HA session sync
+  after a panic the supervisor already contained. `upsert_synced_session` now
+  takes its stored-entry and length reads under ONE guard, which also closes a
+  real TOCTOU (they were separate locks, so the ceiling could be evaluated
+  against a map that had changed between them). Validation: 3 new tests
+  (stale install refused, stale delete refused, negative control that a
+  current-generation install/delete still applies across poisoning);
+  two-stage mutation proof — reverting ONLY the upsert read reds ONLY the
+  install test (`left: Some(1)` right `Some(2)`, the generation regressed),
+  reverting ONLY the delete read reds ONLY the delete test (`left: None`
+  right `Some(2)`, the live entry was removed), both with `cargo build
+  --release` clean (0 errors). Full `cargo test --release --bins --tests --
+  --test-threads=1` green (4354 passed / 0 failed). Filed #6641: the
+  `SHARED_SESSION_POISON_RECOVERIES` counter is still not exported as a
+  Prometheus metric, unlike its #1807 twin. HA cluster smoke required
+  (session-sync path) — scheduled by the team lead, not run here."
+- **File(s)**: userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/afxdp/ha_tests.rs, userspace-dp/src/afxdp/README.md,
+  _Log.md
+
+- **Timestamp**: 2026-08-01
+- **Action**: "#5154 review fold (PR #6643). (1) The #5674 ceiling read was
+  repaired but NOT test-bound — the pre-existing ceiling test
+  (`upsert_synced_session_rejects_over_ceiling_import_and_does_not_fan_out`)
+  runs on a HEALTHY mutex, so reverting the `synced_len` read alone left all
+  27 HA tests green and a future cleanup could have silently undone it. Added
+  `over_ceiling_import_rejected_on_poisoned_shared_mutex`: fills the shared
+  map to the entry cap, poisons the mutex, and asserts a new over-ceiling
+  forward is still refused, counted in `synced_import_cap_drops`, and NOT
+  fanned out to the worker queue. Mutation proof — reverting ONLY the length
+  read to `.lock().map(|s| s.len()).unwrap_or(0)`, ORDERED BEFORE the
+  recovering read, reds ONLY the new test as an assertion with the build
+  clean at 0 errors; the ordering is load-bearing because
+  `lock_shared_recover` calls `clear_poison()`, so a swallowing read placed
+  AFTER it observes a healthy mutex and the mutation is invisible. Under the
+  full origin/master form (all three reads swallowing) the new ceiling test
+  and the stale-install test both red. (2) Narrowed the afxdp README: the
+  #5154 subsection now states explicitly that it establishes the policy for
+  the three reads in `ha/session_import.rs` only, and tabulates the three
+  remaining non-recovering accessors verified firsthand —
+  `snapshot_shared_session_entries` `.unwrap_or_default()` (#6652), the
+  teardown + `SharedSessionOwnerRgIndexes::clear` `if let Ok(..)` skips
+  (#6653), and `snapshot_all_sessions_export` refusing on poison (#6654).
+  Also scoped the pre-existing #2402 paragraph's 'replaces all of them' to
+  the `shared_ops.rs` helpers it actually swept. Those three sites are
+  pre-existing and filed; NOT fixed here. Full `cargo test --release --
+  --test-threads=1` green (4355 passed / 0 failed). No cluster smoke run."
+- **File(s)**: userspace-dp/src/afxdp/ha_tests.rs,
+  userspace-dp/src/afxdp/README.md, _Log.md
+- **Action**: #5488 — bump the config-snapshot protocol version to 4 and gate a
+  multi-zone scoped global policy fail-closed. #4626 gave a scoped global
+  policy a zone-SET scope in the plural `match_from_zones`/`match_to_zones`
+  snapshot fields and made them authoritative, while the singular
+  `match_from_zone`/`match_to_zone` kept only the FIRST element — but left
+  `CONFIG_SNAPSHOT_PROTOCOL_VERSION` at 3, the same value a pre-#4626 helper
+  advertises AND accepts. The version handshake therefore reported agreement
+  while the two sides disagreed about the message: an old helper ignored the
+  plural fields, read the singular one, and NARROWED a global `deny` scoped
+  `[dmz trust] -> untrust` to `dmz -> untrust`, so trust-sourced traffic the
+  operator denied fell through to lower-precedence rules (a rolling-upgrade
+  fail-OPEN). Bumped both constants to 4 in lockstep — both `apply_snapshot`
+  and `bump_fib_generation` gate on EXACT equality, so a pre-v4 helper now
+  refuses the snapshot instead of misreading it. The bump alone is not enough:
+  a refused snapshot leaves that helper ARMED on its previous-good image with
+  the new deny never installed, so it is paired with
+  `ensureScopedGlobalZoneSetProtocolLocked`, a required-protocol gate in the
+  same #2138 class as the policy-scheduler / persistent-source-NAT gates. It
+  fires only when a policy's scope holds MORE THAN ONE zone on a side (a
+  one-element scope emits `singular == the one zone`, never narrowed), disarms
+  the helper, and aborts the commit via
+  `ErrScopedGlobalZoneSetProtocolIncompatible` registered in
+  `requiredProtocolGateSentinels`. The gate is keyed on the multi-zone SHAPE,
+  not the action, so it covers narrowing a `deny`/`reject` (fail-open) and a
+  `permit` (fail-closed correctness break) alike. The #4626 singular emission
+  is deliberately UNCHANGED — the fix is that no reader which would narrow it
+  can receive the snapshot. Validation: new assertion-level parent-RED on both
+  halves independently (version-collision assert and gate assert) with
+  `go build ./...` / `go vet ./...` clean under the revert; negative control
+  (single-zone scoped deny, unscoped global, zone-pair policy) stays green
+  under the revert; full `go test ./...` and the Rust
+  `cargo test --release --bins --tests` suite green. Cluster smoke pending —
+  this changes forwarding admission.
+- **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/manager_compile.go,
+  pkg/dataplane/userspace/manager_capabilities_test.go,
+  pkg/dataplane/userspace/scoped_global_zoneset_protocol_5488_test.go,
+  userspace-dp/src/protocol/control.rs,
+  docs/userspace-dataplane-architecture.md, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-08-01
+- **Action**: #5488 review fold (PR #6644, 5 items). **F4 — guard scope narrower
+  than the claim:** `policyScopeIsMultiZone` tests `len(FromZones) > 1 ||
+  len(ToZones) > 1`, but the only test pinning the to-zone half used a zone-pair
+  policy carrying `Match.ToZones` — a shape the compiler never produces
+  (`compiler_security_policy.go` populates the scope only for globals). Added
+  `TestScopedGlobalZoneSetGateCoversBothScopeSides` with REACHABLE rows for a
+  global scoped `from-zone trust; to-zone [ dmz untrust ]` (to-side), the from
+  side, and both sides — each asserting the singular field really is narrowed
+  before asserting the gate fires. The zone-pair row is kept, relabelled as
+  defensive breadth over the emission surface. Re-ran the to-zone-half mutation:
+  the NEW reachable row reds, not just the defensive one. **F7 — ctrl fail-close
+  on a FAILED disarm:** when `disarmSnapshotProtocolFailureLocked` errors the
+  helper stays ARMED on its previous-good snapshot, and on a same-plan refresh
+  the classifier maps were already mutated in place with ctrl enabled — the
+  shim then runs maps a generation ahead of the applied snapshot (the #4959
+  fail-open). Extracted `disarmSnapshotProtocolFailClosedLocked`, which drives
+  `userspace_ctrl` to Enabled=0 via `failClosedUserspaceCtrlMapLocked` on that
+  branch. Scope was set by the codebase's own oracle: `publishSnapshotFailClosedLocked`
+  has exactly TWO callers (Compile with `samePlanRefresh`, `syncSnapshotLocked`
+  with `true`), and BOTH had the identical hazard — so the sibling
+  `process_status.go` site is fixed too rather than shipping a fix narrower
+  than the defect. The other three gate call sites (route overlay, deferred
+  worker arm, HA reconcile) use a bare `requestLocked` and mutate no maps
+  first, so they are correctly out of scope. Every
+  `failClosedUserspaceCtrlMapLocked` return path preserves `cause`, so the
+  sentinel still satisfies `IsRequiredProtocolGateError` and the commit still
+  aborts — asserted explicitly. **F5** — disclosed the node-LOCAL residual
+  (#6650): the version never crosses the cluster heartbeat, so config-sync to a
+  pre-v4 PEER still narrows the deny. **F1/F2/F3** — refreshed the stale
+  two-gate enumerations in `userspace-dp/src/server/README.md`,
+  `docs/userspace-dataplane-gaps.md`, and `pkg/daemon/daemon_apply.go`.
+  Validation: both mutations red as ASSERTIONS with `go build ./...` +
+  `go vet ./...` CLEAN; the F7 scope controls (bootstrap path, successful
+  disarm) and all pre-existing #4959 tests stay green under the F7 mutation.
+  The F7 behavioral test needs memlock privileges (like its #4959 siblings) —
+  verified under `sudo` that all three sub-tests genuinely RUN and pass, not
+  skip. Full `go test ./...` and the Rust cargo suite green.
+- **File(s)**: pkg/dataplane/userspace/manager_compile.go,
+  pkg/dataplane/userspace/process_status.go,
+  pkg/dataplane/userspace/scoped_global_zoneset_protocol_5488_test.go,
+  pkg/dataplane/userspace/scoped_global_zoneset_failclosed_5488_test.go,
+  pkg/daemon/daemon_apply.go, userspace-dp/src/server/README.md,
+  docs/userspace-dataplane-architecture.md, docs/userspace-dataplane-gaps.md,
+  _Log.md
+- **Action**: #5086 — anchor heartbeat anti-replay state to the Manager so a
+  heartbeat restart cannot reset it. #5477 gave the receiver a bounded set of
+  retired-session watermarks, but the tracker was a `heartbeatReceiver` field
+  and every `StartHeartbeat` builds a new receiver — including
+  `RestartHeartbeat` on a DHCP-triggered VRF rebind and the HA comms restart,
+  both routine. The replacement receiver started EMPTY, so captured
+  authenticated frames from retired peer incarnations were all re-admitted as
+  never-seen, refreshing peer liveness and applying stale election state; a
+  dead peer kept looking alive and the survivor never took over. Measured
+  pre-fix: 20/60 replayed frames admitted per restart (~4 s of forged liveness
+  vs the ~1 s peer-dead window), fresh on every restart. Moved the replay ring
+  + sticky `peerAuthSeen` into `Manager.hbAuth` (`heartbeatAuthState`, its own
+  mutex now that it outlives one readLoop); receivers hold a pointer.
+  `HeartbeatPeerAuthSeen` reads it directly, closing the mirror hole where
+  `StopHeartbeat` nil'd `m.hbReceiver` and silently disarmed the gRPC fabric
+  downgrade-guard for the restart window (~5 s on a VRF-rebind bind retry).
+  Memory bound unchanged and restart-independent: one fixed 64 x 16 B ring per
+  Manager. No wire change, no added failover latency. Residual (in-memory
+  state is still lost on a full daemon restart, and the >=65-recording ring
+  churn) needs the signed boot-epoch — #6169.
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/manager.go,
+  pkg/cluster/peer_state.go, pkg/cluster/heartbeat_replay_restart_5086_test.go,
+  pkg/cluster/heartbeat_auth_test.go,
+  pkg/cluster/controllink_auth_status_4484_test.go, pkg/cluster/README.md,
+  _Log.md
+
+- **Timestamp**: 2026-08-01 01:55
+- **Action**: #6642 review fold — correct the anti-replay ring's stated unit
+  (peer SESSION, not daemon incarnation) in both the code comments and the
+  cluster README, and give `heartbeatReceiver.peerAuthenticated()` a caller
+  again. Both findings were raised independently by the hostile Claude review
+  (MINOR-1, MINOR-2) and by Codex (finding 2), which converged on the doc
+  defect. A session id is minted per `heartbeatSender`, so a peer heartbeat
+  restart (VRF rebind, HA comms restart) mints one without a daemon boot: the
+  `heartbeatReplaySessions`+1 churn bound is 65 recorded SESSIONS, cheaper to
+  harvest than 65 daemon boots, and routine peer restarts now consume ring
+  slots permanently because the ring outlives a local restart. Neither is a
+  regression — pre-#5086 any local restart wiped the ring entirely, so this
+  worst case is a strict subset. `readLoop` now reaches the sticky flag through
+  `r.peerAuthenticated()` instead of `r.auth.peerAuthenticated()`, so the
+  accessor the PR orphaned has one caller and one definition again.
+  Docs-and-wiring only: no runtime behaviour change.
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 03:20
+- **Action**: #6198 — mint a real identity for the node-local BPF-ABI SessionID
+  on the HA-synced conversion path. The previous
+  `uint64(now)<<16 | uint64(delta.Slot&0xffff)` was not an identity: `delta.Slot`
+  is the AF_XDP BINDING slot (`BindingIdentity.slot`, a handful per node), the
+  binary event stream that carries the primary delta path never decodes it at
+  all (`decodeSessionEvent` leaves it 0), and `now` is CLOCK_MONOTONIC SECONDS —
+  so every session converted within one second collapsed onto ONE id (the
+  reported `&0xffff` slot aliasing is in fact unreachable; the real defect is
+  far wider). `nextUserspaceSyncedSessionID` replaces it with a monotonic
+  counter in a reserved `0xFFFF<<48` namespace, disjoint from the
+  worker-namespaced ids the Rust helper stamps into the same BPF conntrack
+  mirror field. `userspaceForwardWireAliasFromDelta{V4,V6}` become
+  `userspaceForwardWireAlias{V4,V6}` taking the already-converted base session,
+  so the fabric-redirect alias and its base still share one id instead of
+  minting two. The id stays deliberately node-local — the cross-node
+  correlatable id is the separate `RTFlowSessionID` (#5212). No wire-format
+  change (the field is already u64 on both sides) and no Rust change (the
+  helper never reads this field).
+- **File(s)**: pkg/daemon/daemon_ha_userspace_convert.go,
+  pkg/daemon/daemon_ha_userspace_stream.go, pkg/daemon/userspace_sync_test.go,
+  pkg/daemon/userspace_sync_session_id_6198_test.go, pkg/dataplane/types.go,
+  pkg/cluster/README.md, docs/session-sync-architecture.md,
+  docs/sync-protocol.md, _Log.md
+
+- **Timestamp**: 2026-08-01 03:20
+- **Action**: #6658 review fold — assert monitor WEIGHTS, not just names, on
+  bracketed lists. `assertMonitors`'s weight arm was dead code: its only caller
+  was an `assertMonitorNames` shim passing nil, so every bracketed-list case in
+  the #6588 suite ran weight-less and the apply-to-all rule in
+  `monitorEntryNodes` was unguarded. Reverting that function to the round-4
+  positional attachment left build, vet and the whole suite green. The shim is
+  deleted and weights are mandatory; name-only callers pass explicit zeros,
+  which asserts the documented #6549 default instead of skipping the check.
+  Also corrected the `redundancyGroupStatements` enumeration, which claimed
+  three drift routes (all of them the table under-covering the compiler) when a
+  probe found a fourth of the opposite shape: the splitter matches a registered
+  keyword in VALUE position, so `interface-monitor preempt weight 255` steals
+  `preempt` and the packed and container spellings disagree. Unreachable from a
+  real config (no Junos interface name collides), so documented rather than
+  fixed; splitting position-aware is #6665.
+- **File(s)**: pkg/config/compiler_chassis_packed_monitor_6588_test.go,
+  pkg/config/compiler_system.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-08-01 04:05
+- **Action**: #6658 review fold round 2 — close two silent-no-effect holes the
+  Codex xhigh review found, and restore the regression coverage the
+  dispatch-table refactor (b3158d315) deleted. (1) `ip-monitoring`'s
+  `global-weight` / `global-threshold` bypassed every gate: the weight gate
+  walked only ENTRY lists, so `global-weight nope`, `global-weight;` and
+  `global-weight 100 global-weight 200` all committed clean at a compiled 0 —
+  zero demotion debt for the WHOLE group, so no number of failing probes
+  demotes it. Now checked by the same missing-value / non-integer / duplicate
+  rules through a shared `checkTokens`, reading the globals with
+  `ipMonitoringGlobalTokens` over the same `packedStatementProps` result the
+  compiler dispatches from. (2) `preempt` and `strict-vip-ownership` compile to
+  a bool and never read the node, so `preempt delay 5` — real Junos syntax xpf
+  does not implement — was accepted and discarded silently; new
+  `validateRGNoArgStatementsAST` rejects trailing tokens and block bodies,
+  strict at commit and warning on the tolerant load path (#1960). (3)
+  `TestRedundancyGroupStatementsSurvivePackedLine_6588` was placeholder-vacuous:
+  an entry keyed `review-placeholder` with sample text `preempt` passed while
+  its handler was never dispatched. Samples must now begin with their own
+  keyword, and the dispatch table is instrumented so a case that never reaches
+  its handler fails. (4) Restored `TestChassisRedundancyGroupBareContainerShape_6588`
+  and the bracket out-of-range / ambiguous-weight cases that b3158d315 dropped.
+- **File(s)**: pkg/config/compiler_chassis_monitor_weight.go,
+  pkg/config/compiler_chassis_rg_arity.go, pkg/config/compiler_system.go,
+  pkg/config/compiler_prewalk.go, pkg/config/compiler_opts.go,
+  pkg/config/compiler_chassis_packed_monitor_6588_test.go,
+  docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-08-01 05:10
+- **Action**: #6198 review fold (MERGE-NEEDS-MINOR, four minors). (1) Seed the
+  synced-session id counter from the boot clock
+  (`userspaceSyncedSessionIDSeed`, `monotonic_seconds << 24` masked to 48 bits)
+  — an unseeded counter re-minted 1,2,3… after an xpfd restart and collided
+  with entries the peer's mirror still held from the previous incarnation, a
+  narrow axis on which the old `now<<16|Slot` was actually BETTER (CLOCK_MONOTONIC
+  keeps increasing across a daemon restart). Seeding closes the residual instead
+  of documenting it. (2) `pkg/dataplane/types.go` asserted the opposite of this
+  PR's thesis on BOTH `SessionValue` and `SessionValueV6` — "unique ID, same on
+  both cluster nodes" 87 lines above a comment calling the id node-local;
+  replaced with the node-local semantics. (3) Same false claim was the
+  operator-facing gRPC contract (`proto/xpf/v1/xpf.proto` `session_id`);
+  corrected and REGENERATED `xpf.pb.go` via `make proto` (diff ignoring
+  whitespace is the comment only — the protobuf tag is byte-identical, no wire
+  impact). (4) The `0xFFFF<<48` reservation was documented only on the Go side,
+  which does not have to obey it; recorded it on `SessionTable::set_worker_id`
+  and in `userspace-dp/src/session/README.md`, where a future minter (e.g.
+  #6311, which proposes re-partitioning those high bits) would look. Also took
+  the reviewer's NIT: the id is distinct per CONVERSION, not stable per session
+  (bulk resync re-stamps; the close branch burns one) — now stated in the code
+  comment and the architecture doc rather than implied otherwise.
+- **File(s)**: pkg/daemon/daemon_ha_userspace_convert.go,
+  pkg/daemon/userspace_sync_session_id_6198_test.go, pkg/dataplane/types.go,
+  proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  userspace-dp/src/session/mod.rs, userspace-dp/src/session/README.md,
+  docs/session-sync-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-01 07:40
+- **Action**: #6198 second review fold (MERGE-NEEDS-MAJOR — both MAJORs were in
+  the seeding added in the previous round). (1) The zero-correction emitted a
+  DUPLICATE: `Add(1) & mask; if counter == 0 { counter = 1 }` corrects only the
+  returned copy, so at the wrap the atomic still holds the masked-zero value and
+  the NEXT call returns the id just handed out — inside the namespace, so nothing
+  downstream looks wrong while uniqueness silently stops holding. Replaced with a
+  CAS advance so the STORED value is the returned one. The wrap is reachable, not
+  theoretical: the seed consumes counter space, so distance to the boundary
+  depends on uptime phase. Kept the ring rather than failing closed — the id is
+  display-only but the conversion carrying it installs an HA-synced session, so
+  refusing to mint would trade a cosmetic alias for lost sessions at failover.
+  (2) The seed was read at SECOND resolution, so two incarnations whose first
+  allocations land in the same integer second got identical seeds and repeated
+  from their first id — the common restart, since `RestartSec=1` lands in the
+  window and the sub-second phase is uniform. Added `daemonMonotonicNanos` and
+  reshifted the seed to `nanos >> 10` (~1.024 us granularity, three orders of
+  magnitude below any real teardown+exec; ~976k ids/s of rate headroom; 9.1-year
+  seed cycle). The previous test only compared `uptime` vs `uptime+1`, so it
+  could not see this — the new test drives 1ms/10ms/100ms/700ms separations
+  inside one second, with a fixture guard that fails if an offset crosses a
+  second boundary and makes the case vacuous. (3) MINOR: the `0xFFFF<<48`
+  reservation was documented but unenforced on the Rust side; added
+  `CONTROL_PLANE_SESSION_ID_WORKER_HI` and a hard `assert!` in `set_worker_id`
+  (not `debug_assert!` — release strips those and `make test-rust` is a release
+  build), plus a `#[should_panic]` guard and a negative control.
+- **File(s)**: pkg/daemon/daemon_ha_userspace_convert.go,
+  pkg/daemon/userspace_sync_session_id_6198_test.go,
+  userspace-dp/src/session/mod.rs, userspace-dp/src/session/tests.rs,
+  userspace-dp/src/session/README.md, docs/session-sync-architecture.md, _Log.md

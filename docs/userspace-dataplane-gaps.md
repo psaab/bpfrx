@@ -265,7 +265,10 @@ There are two distinct fallback boundaries:
      it relies on the helper integrity reject (previous-good retained /
      fresh-boot default-deny) so it never fails open to the kernel.
    - Required-generation protocol gates (policy schedulers, persistent
-     source NAT) that disarm forwarding on a too-old helper are ALSO
+     source NAT, and — since #5488 — a scoped-global policy whose zone scope
+     holds MORE THAN ONE zone on a side, which a pre-v4 helper would NARROW
+     to the first zone by reading only the singular `match_from_zone`/
+     `match_to_zone`) that disarm forwarding on a too-old helper are ALSO
      enforced on the explicit arm path (#5648 / M43b): `SetForwardingArmed(true)`
      re-runs `ensureRequiredSnapshotProtocolLocked` and refuses to arm a
      stale accepted image, so an operator/gRPC arm cannot undo the disarm.
