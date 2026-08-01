@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -192,6 +193,29 @@ type Manager struct {
 	// (~1 KiB), allocated once, never reset for the life of the process. Its
 	// own locking makes it safe to touch without m.mu.
 	hbAuth heartbeatAuthState
+
+	// hbNonceOnce/hbSession/hbCounter are the SENDER half of the control-channel
+	// anti-replay nonce, scoped to the Manager — i.e. to one daemon incarnation.
+	//
+	// #6169: this used to be per-heartbeatSender, so every StartHeartbeat minted
+	// a fresh random session and restarted the counter. That made the receiver's
+	// bounded ring (heartbeatReplaySessions) a bound on peer SESSIONS rather
+	// than on peer daemon incarnations, and routine events mint sessions —
+	// RestartHeartbeat on a DHCP-triggered VRF rebind, the HA comms restart. A
+	// single long-lived daemon could therefore emit more than a ringful of
+	// distinct sessions under ONE boot epoch, and an attacker could churn the
+	// ring among them without the epoch floor ever rejecting anything.
+	//
+	// One incarnation now emits exactly one session with a counter that is
+	// monotonic across heartbeat restarts, so the epoch floor leaves an attacker
+	// at most one session to replay and the ring rejects it on the watermark.
+	// Nothing regresses on the receiver: a heartbeat restart keeps the session
+	// and advances the counter, which the ring admits; a daemon restart builds a
+	// new Manager and so draws a fresh random session, which the ring admits as
+	// never-seen exactly as before.
+	hbNonceOnce sync.Once
+	hbSession   uint64
+	hbCounter   atomic.Uint64
 
 	// hbStartMu serializes StartHeartbeat's stop-previous + socket-create +
 	// install sequence so two concurrent StartHeartbeat calls (e.g. a

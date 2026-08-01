@@ -704,6 +704,18 @@ func heartbeatAuthDecision(keyConfigured, present, macOK, nonceFresh, peerAuthSe
 	return true, ""
 }
 
+// heartbeatNonce returns the next control-channel anti-replay nonce for a
+// heartbeat send: this daemon incarnation's session id (drawn once, lazily) and
+// a strictly increasing per-incarnation counter.
+//
+// #6169: Manager-scoped, NOT per-heartbeatSender — see the hbNonceOnce field
+// comment for why a per-sender session made the receiver's bounded ring
+// churnable within a single peer boot epoch.
+func (m *Manager) heartbeatNonce() (session, counter uint64) {
+	m.hbNonceOnce.Do(func() { m.hbSession = randomSessionID() })
+	return m.hbSession, m.hbCounter.Add(1)
+}
+
 // randomSessionID returns a random 64-bit anti-replay session id. On the
 // (practically impossible) crypto/rand failure it falls back to the monotonic
 // clock, which is still process-unique for the receiver's re-anchor logic.
@@ -733,15 +745,6 @@ type heartbeatSender struct {
 	wg         sync.WaitGroup
 	sent       atomic.Uint64
 	sendErrors atomic.Uint64
-
-	// #4107 anti-replay: a random per-SENDER session id plus a monotonic
-	// per-session counter. A new sender (StartHeartbeat/RestartHeartbeat)
-	// re-seeds authSession so the receiver re-anchors after a restart/reboot.
-	// Per-sender, NOT per-process: a heartbeat restart mints a fresh session
-	// without a daemon boot, which is what makes heartbeatReplaySessions a
-	// bound on peer SESSIONS rather than on peer daemon incarnations.
-	authSession uint64
-	authCounter atomic.Uint64
 }
 
 // heartbeatReceiver listens for peer heartbeat packets.
@@ -777,12 +780,11 @@ func (r *heartbeatReceiver) peerAuthenticated() bool {
 
 func newHeartbeatSender(mgr *Manager, conn *net.UDPConn, peerAddr *net.UDPAddr, interval time.Duration) *heartbeatSender {
 	return &heartbeatSender{
-		mgr:         mgr,
-		conn:        conn,
-		peerAddr:    peerAddr,
-		interval:    interval,
-		stopCh:      make(chan struct{}),
-		authSession: randomSessionID(),
+		mgr:      mgr,
+		conn:     conn,
+		peerAddr: peerAddr,
+		interval: interval,
+		stopCh:   make(chan struct{}),
 	}
 }
 
@@ -813,7 +815,8 @@ func (s *heartbeatSender) send() {
 	// without a heartbeat restart. Never logged.
 	var data []byte
 	if key := s.mgr.controlLinkAuthKey(); len(key) > 0 {
-		data = MarshalHeartbeatAuth(pkt, key, s.authSession, s.authCounter.Add(1))
+		session, counter := s.mgr.heartbeatNonce()
+		data = MarshalHeartbeatAuth(pkt, key, session, counter)
 	} else {
 		data = MarshalHeartbeat(pkt)
 	}
