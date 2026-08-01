@@ -65606,3 +65606,44 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/refactoraudit/audit_canary_test.go, pkg/refactoraudit/doc.go,
   docs/refactoring-audit-current.txt, docs/refactoring-audit.md,
   scripts/refactoring-audit.sh, Makefile, _Log.md
+
+- **Timestamp**: 2026-08-01
+- **Action**: #5488 — bump the config-snapshot protocol version to 4 and gate a
+  multi-zone scoped global policy fail-closed. #4626 gave a scoped global
+  policy a zone-SET scope in the plural `match_from_zones`/`match_to_zones`
+  snapshot fields and made them authoritative, while the singular
+  `match_from_zone`/`match_to_zone` kept only the FIRST element — but left
+  `CONFIG_SNAPSHOT_PROTOCOL_VERSION` at 3, the same value a pre-#4626 helper
+  advertises AND accepts. The version handshake therefore reported agreement
+  while the two sides disagreed about the message: an old helper ignored the
+  plural fields, read the singular one, and NARROWED a global `deny` scoped
+  `[dmz trust] -> untrust` to `dmz -> untrust`, so trust-sourced traffic the
+  operator denied fell through to lower-precedence rules (a rolling-upgrade
+  fail-OPEN). Bumped both constants to 4 in lockstep — both `apply_snapshot`
+  and `bump_fib_generation` gate on EXACT equality, so a pre-v4 helper now
+  refuses the snapshot instead of misreading it. The bump alone is not enough:
+  a refused snapshot leaves that helper ARMED on its previous-good image with
+  the new deny never installed, so it is paired with
+  `ensureScopedGlobalZoneSetProtocolLocked`, a required-protocol gate in the
+  same #2138 class as the policy-scheduler / persistent-source-NAT gates. It
+  fires only when a policy's scope holds MORE THAN ONE zone on a side (a
+  one-element scope emits `singular == the one zone`, never narrowed), disarms
+  the helper, and aborts the commit via
+  `ErrScopedGlobalZoneSetProtocolIncompatible` registered in
+  `requiredProtocolGateSentinels`. The gate is keyed on the multi-zone SHAPE,
+  not the action, so it covers narrowing a `deny`/`reject` (fail-open) and a
+  `permit` (fail-closed correctness break) alike. The #4626 singular emission
+  is deliberately UNCHANGED — the fix is that no reader which would narrow it
+  can receive the snapshot. Validation: new assertion-level parent-RED on both
+  halves independently (version-collision assert and gate assert) with
+  `go build ./...` / `go vet ./...` clean under the revert; negative control
+  (single-zone scoped deny, unscoped global, zone-pair policy) stays green
+  under the revert; full `go test ./...` and the Rust
+  `cargo test --release --bins --tests` suite green. Cluster smoke pending —
+  this changes forwarding admission.
+- **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/manager_compile.go,
+  pkg/dataplane/userspace/manager_capabilities_test.go,
+  pkg/dataplane/userspace/scoped_global_zoneset_protocol_5488_test.go,
+  userspace-dp/src/protocol/control.rs,
+  docs/userspace-dataplane-architecture.md, docs/config-schema.md, _Log.md

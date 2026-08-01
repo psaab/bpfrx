@@ -17,6 +17,20 @@ var ErrPolicySchedulerProtocolIncompatible = errors.New("userspace policy schedu
 
 var ErrPersistentSourceNATProtocolIncompatible = errors.New("userspace persistent source NAT snapshot protocol incompatible")
 
+// ErrScopedGlobalZoneSetProtocolIncompatible is the #5488 required-protocol
+// gate sentinel: the committed config carries a policy whose scoped-global zone
+// context holds MORE THAN ONE zone on a side, and the running helper's accepted
+// ConfigSnapshotProtocolVersion predates the v4 contract in which the plural
+// match_from_zones/match_to_zones snapshot fields are AUTHORITATIVE.
+//
+// Such a helper reads only the singular match_from_zone/match_to_zone, which
+// carry the FIRST element (config.ScopeSingular), so it NARROWS the rule to one
+// zone. For a `deny`/`reject` global that is a fail-OPEN — the zones dropped
+// from the scope stop being denied and fall through to lower-precedence rules.
+// For a `permit` it is a fail-closed correctness break. The gate is keyed on
+// the multi-zone SHAPE rather than the action so it covers both directions.
+var ErrScopedGlobalZoneSetProtocolIncompatible = errors.New("userspace scoped-global zone-set snapshot protocol incompatible")
+
 // requiredProtocolGateSentinels enumerates every "this config cannot be
 // committed against the helper's current ConfigSnapshotProtocolVersion"
 // sentinel produced by ensureRequiredSnapshotProtocolLocked. ApplyConfig
@@ -51,6 +65,7 @@ var ErrPersistentSourceNATProtocolIncompatible = errors.New("userspace persisten
 var requiredProtocolGateSentinels = []error{
 	ErrPolicySchedulerProtocolIncompatible,
 	ErrPersistentSourceNATProtocolIncompatible,
+	ErrScopedGlobalZoneSetProtocolIncompatible,
 }
 
 // IsRequiredProtocolGateError reports whether err is (or wraps) any
@@ -668,6 +683,89 @@ func configHasScheduledPolicy(cfg *config.Config) bool {
 	return false
 }
 
+// policyScopeIsMultiZone reports whether a policy's scoped-global zone context
+// (#4626 M03) holds more than one zone on either side — the exact shape the
+// SINGULAR MatchFromZone/MatchToZone snapshot fields cannot represent, because
+// config.ScopeSingular stamps only the first element onto them.
+//
+// A one-element scope is bit-identical in both shapes (singular == the one
+// zone), and an unscoped global has both sides empty, so neither can be
+// narrowed by a reader that ignores the plural fields. Restricting the
+// predicate to len > 1 keeps the #5488 disarm blast radius to exactly the
+// misrepresentable population.
+//
+// A set that CONTAINS the "any" wildcard alongside concrete zones is included
+// conservatively: whether the singular field happens to land on "any" depends
+// on element order, so the shape — not a coincidence of ordering — decides.
+func policyScopeIsMultiZone(pol *config.Policy) bool {
+	if pol == nil {
+		return false
+	}
+	return len(pol.Match.FromZones) > 1 || len(pol.Match.ToZones) > 1
+}
+
+// configHasMultiZoneScopedPolicy scans every policy the snapshot builder lowers
+// through buildOneRuleSnapshot — the global tier AND the zone-pair tier — for a
+// multi-zone scope. Only global policies carry a zone scope today (the compiler
+// never populates Match.FromZones/ToZones for a zone-pair policy), but the
+// emitter stamps MatchFromZone/MatchToZone from the SAME Match fields for every
+// rule, so the gate covers the whole emission surface rather than assuming the
+// compiler's current tier discipline.
+func configHasMultiZoneScopedPolicy(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	for _, pol := range cfg.Security.GlobalPolicies {
+		if policyScopeIsMultiZone(pol) {
+			return true
+		}
+	}
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if policyScopeIsMultiZone(pol) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ensureScopedGlobalZoneSetProtocolLocked is the #5488 fail-closed half of the
+// v4 protocol bump. The bump itself makes a pre-v4 helper REFUSE the snapshot
+// (both apply_snapshot and bump_fib_generation gate on exact version equality),
+// which stops it from misreading the scope — but a refused snapshot leaves that
+// helper ARMED on its previous-good image, still forwarding, with the newly
+// committed deny never installed. This gate closes that window the way the
+// project's other required-protocol gates do: the caller
+// (ensureRequiredSnapshotProtocolLocked) disarms the helper and the commit
+// aborts with an operator-visible reason, instead of reporting success against
+// a dataplane running a policy set the helper cannot represent.
+func (m *Manager) ensureScopedGlobalZoneSetProtocolLocked(cfg *config.Config) error {
+	if !configHasMultiZoneScopedPolicy(cfg) {
+		return nil
+	}
+	if m.lastStatus.ConfigSnapshotProtocolVersion >= ProtocolVersion {
+		return nil
+	}
+	var status ProcessStatus
+	if err := m.requestLocked(ControlRequest{Type: "status"}, &status); err == nil {
+		m.recordHelperStatusLocked(&status)
+		if status.ConfigSnapshotProtocolVersion >= ProtocolVersion {
+			return nil
+		}
+	}
+	return fmt.Errorf(
+		"%w: helper config snapshot protocol version %d < required %d for multi-zone scoped global policies "+
+			"(an older helper reads only the singular match from-zone/to-zone and would NARROW the scope)",
+		ErrScopedGlobalZoneSetProtocolIncompatible,
+		m.lastStatus.ConfigSnapshotProtocolVersion,
+		ProtocolVersion,
+	)
+}
+
 func (m *Manager) ensurePolicySchedulerProtocolLocked(cfg *config.Config) error {
 	if !configHasScheduledPolicy(cfg) {
 		return nil
@@ -716,7 +814,10 @@ func (m *Manager) ensureRequiredSnapshotProtocolLocked(cfg *config.Config) error
 	if err := m.ensurePolicySchedulerProtocolLocked(cfg); err != nil {
 		return err
 	}
-	return m.ensurePersistentSourceNATProtocolLocked(cfg)
+	if err := m.ensurePersistentSourceNATProtocolLocked(cfg); err != nil {
+		return err
+	}
+	return m.ensureScopedGlobalZoneSetProtocolLocked(cfg)
 }
 
 func (m *Manager) disarmSnapshotProtocolFailureLocked(protocolErr error) error {

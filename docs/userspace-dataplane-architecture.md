@@ -919,8 +919,22 @@ from-zone ∈ the from-set AND its to-zone ∈ the to-set. Such a rule keeps the
 `junos-global` sentinel on its structural zones (so it stays classified in the
 `global_indices` tier and the global config order is preserved) and carries its
 context out-of-band on ADDITIVE wire fields. The singular `match_from_zone` /
-`match_to_zone` keep the FIRST zone for rolling-upgrade compatibility with an
-old helper; the plural `match_from_zones` / `match_to_zones` carry the full set.
+`match_to_zone` keep the FIRST zone (`config.ScopeSingular`); the plural
+`match_from_zones` / `match_to_zones` are AUTHORITATIVE and carry the full set.
+
+**The singular field is a display/degradation shape, NOT a rolling-upgrade
+compatibility guarantee (#5488).** #4626 added the plural fields as purely
+ADDITIVE JSON while leaving `CONFIG_SNAPSHOT_PROTOCOL_VERSION` at 3 — the same
+value a pre-#4626 helper advertises and accepts. That made the version handshake
+say "we agree" while the two sides disagreed about what the message meant: an
+old helper ignores the plural fields it does not know, reads only the singular
+one, and NARROWS a global `deny` scoped `[dmz trust] -> untrust` to
+`dmz -> untrust`, so trust-sourced traffic the operator denied falls through to
+lower-precedence rules — a rolling-upgrade fail-OPEN. The version is now **4**
+and the two constants are pinned in lockstep (see *Config-snapshot protocol
+version* below), so a multi-zone scope can never reach a reader that would
+narrow it.
+
 `parse_policy_state` prefers the plural (falling back to `[singular]`) and
 resolves it at snapshot-build time into a `GlobalZoneScope` — `Any` for no
 constraint, `Zones(SmallVec<[u16; 2]>)` for a set of defined zone ids
@@ -1561,6 +1575,70 @@ system {
 - Ensure VM has enough vCPUs: workers + 2 (daemon + kernel headroom)
 - Ensure VM has enough RAM: `workers × bindings × 160 MB + 2 GB` base (at 16384 ring,
   mlx5 driver; 192 MB for virtio_net)
+
+### Config-snapshot protocol version (#5488)
+
+Every `apply_snapshot` and `bump_fib_generation` body carries a `version`
+field. Two constants define it and **MUST be bumped in lockstep**:
+
+- **Go emitter** — `ProtocolVersion` in
+  `pkg/dataplane/userspace/protocol.go`, stamped onto every snapshot the
+  builder produces.
+- **Rust consumer** — `CONFIG_SNAPSHOT_PROTOCOL_VERSION` in
+  `userspace-dp/src/protocol/control.rs`.
+
+Both mutating verbs gate on **EXACT equality**, not `>=`
+(`userspace-dp/src/server/handlers/snapshot.rs`, `apply` and `bump_fib`):
+a helper at any other version refuses the body before touching dataplane
+state, rather than decoding it under its own, narrower contract. The
+lockstep is pinned by `TestSnapshotProtocolVersionLockstepWithRust`,
+which parses the Rust constant rather than mirroring it in a comment.
+
+**What the version means.** It is the meaning of the snapshot message,
+not a feature inventory. Bump it whenever a change makes an older reader
+interpret the SAME bytes differently — in particular whenever a new field
+becomes authoritative over an existing one. A field that is purely
+additive *in meaning* (an old reader that ignores it still enforces
+exactly what it enforced before) does not need a bump; a field that
+changes what a rule COVERS does.
+
+**Why it is at 4.** #4626 gave a scoped global policy a zone-SET scope in
+the plural `match_from_zones`/`match_to_zones` fields, made them
+authoritative, and left the singular `match_from_zone`/`match_to_zone`
+carrying only the FIRST element — but did not bump the version. A
+pre-#4626 helper at the same advertised version 3 therefore accepted the
+snapshot, read only the singular field, and NARROWED a multi-zone global
+`deny` to one zone, letting the dropped zones' traffic reach a
+lower-precedence permit. That is the dangerous direction: a handshake
+that reports agreement while the two sides disagree about the message.
+The invariant #5488 records is that **a compatibility extension which
+changes deny/reject COVERAGE must not be silently ignorable under an
+unchanged protocol version.**
+
+**The bump is paired with a fail-closed gate.** On its own, a bump only
+makes an old helper *refuse* the snapshot — and a refused snapshot leaves
+that helper ARMED on its previous-good image, still forwarding, with the
+newly committed deny never installed. So the version bump is paired with
+`ensureScopedGlobalZoneSetProtocolLocked`
+(`pkg/dataplane/userspace/manager_compile.go`), a required-protocol gate
+in the same class as the policy-scheduler and persistent-source-NAT gates
+(#2138): when the committed config carries a policy whose scope holds
+more than one zone on a side and the running helper reports a
+`ConfigSnapshotProtocolVersion` below `ProtocolVersion`, the daemon
+DISARMS the helper (`set_forwarding_state{armed:false}`) and the commit
+ABORTS with `ErrScopedGlobalZoneSetProtocolIncompatible`, which is
+registered in `requiredProtocolGateSentinels`. The lenient-load doctrine
+(#1960) is unchanged: a boot or peer-sync apply of an already-persisted
+config disarms and logs rather than bricking the node; only the
+operator-facing commit path surfaces the abort.
+
+The gate is keyed on the multi-zone **shape**, not the action, so it
+covers both directions of misrepresentation — narrowing a `deny`/`reject`
+(fail-open) and narrowing a `permit` (a fail-closed correctness break). A
+**single-zone** scope emits `singular == the one zone` and an unscoped
+global emits neither side, so neither can be narrowed by a singular-only
+reader and neither is gated; that keeps the disarm blast radius to
+exactly the misrepresentable population.
 
 ### Control-socket request size cap (#2523, #2744)
 
