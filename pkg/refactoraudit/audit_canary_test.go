@@ -1,13 +1,79 @@
 package refactoraudit
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
+
+// Tier tags and thresholds, mirroring scripts/refactoring-audit.sh.
+// `categorize` there pads the WATCH tag for column alignment; the tag
+// itself is the unpadded token these constants hold.
+const (
+	tierRefactor = "[REFACTOR]"
+	tierWatch    = "[WATCH]"
+
+	// auditFloor is the LOC at which a file enters the heatmap at all;
+	// refactorFloor is the LOC at which it is promoted to [REFACTOR].
+	auditFloor    = 1500
+	refactorFloor = 2000
+)
+
+// auditRow is one parsed heatmap row, e.g.
+//
+//	[REFACTOR]   2448  userspace-dp/src/afxdp/worker/loop_body/mod.rs
+type auditRow struct {
+	tier string
+	loc  int
+	path string
+}
+
+// parseHeatmap parses heatmap text into rows. It fails closed: any line
+// the generator could not have produced (wrong field count, unknown tier
+// tag, non-numeric LOC) is a hard failure rather than a skipped row, so a
+// corrupted or hand-mangled artifact can never read as "no drift".
+func parseHeatmap(t *testing.T, what, text string) []auditRow {
+	t.Helper()
+	var rows []auditRow
+	for i, line := range strings.Split(text, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 3 {
+			t.Fatalf("%s line %d: want 3 fields (tier LOC path), got %d: %q", what, i+1, len(fields), line)
+		}
+		if fields[0] != tierRefactor && fields[0] != tierWatch {
+			t.Fatalf("%s line %d: unknown tier tag %q (want %q or %q)", what, i+1, fields[0], tierRefactor, tierWatch)
+		}
+		loc, err := strconv.Atoi(fields[1])
+		if err != nil {
+			t.Fatalf("%s line %d: LOC field %q is not an integer: %v", what, i+1, fields[1], err)
+		}
+		rows = append(rows, auditRow{tier: fields[0], loc: loc, path: fields[2]})
+	}
+	if len(rows) == 0 {
+		t.Fatalf("%s parsed to zero rows; this repo always has >=1500 LOC files, so an empty audit means the generator or the artifact is broken", what)
+	}
+	return rows
+}
+
+// tierByPath projects rows onto the audit's *content*: which files are
+// audited, and at which tier. This is the merge-stable part of the
+// heatmap — see TestHeatmapNotStale.
+func tierByPath(rows []auditRow) map[string]string {
+	m := make(map[string]string, len(rows))
+	for _, r := range rows {
+		m[r.path] = r.tier
+	}
+	return m
+}
 
 // repoRoot walks up from this test file's directory until it finds
 // go.mod, so the canary works regardless of the test's cwd (go test runs
@@ -49,26 +115,162 @@ func runScript(t *testing.T, root string, args ...string) string {
 }
 
 // TestHeatmapNotStale is the drift gate. It regenerates the heatmap with
-// the committed generator and asserts the output byte-for-byte matches
-// the committed docs/refactoring-audit-current.txt. A refactor that
-// resizes/adds/deletes a >=1500 LOC production file without running
+// the committed generator and asserts that the *audit content* — which
+// files are audited, and at which tier — matches the tree. A file that
+// enters the audit (crosses 1500 LOC), leaves it, or is promoted/demoted
+// across the 2000 LOC [REFACTOR] boundary without running
 // `bash scripts/refactoring-audit.sh > docs/refactoring-audit-current.txt`
-// (or `make audit-check`) fails here. FAIL-ON-REVERT: perturbing any LOC
-// number in the committed artifact makes this test RED.
+// (or `make audit-check`) fails here.
+//
+// # Why this is not a byte-for-byte compare (#6617)
+//
+// It used to be, and that criterion could not hold. The heatmap is a
+// repo-GLOBAL snapshot: its exact LOC column depends on every audited
+// file in the tree, not just the ones a PR touches. Under this project's
+// parallel-merge workflow a PR that regenerates the artifact correctly at
+// its own base still lands stale, because a sibling PR grew a different
+// file in between. That is not hypothetical — measured over the 40
+// first-parent commits ending at b4605ea9d, master was byte-stale in 28
+// of them, and #6602 and #6613 BOTH regenerated the artifact in their own
+// merge commit and BOTH still landed red, each disagreeing only on
+// pkg/snmp/agent.go, a file neither PR touched (grown by #6596, merged
+// between their base and their merge). A gate that reds when the author
+// did everything right is noise, and the noise is what let the artifact
+// sit 22 rows stale for 21 consecutive commits in the run before that.
+//
+// Tier and membership do not have that problem: they only change when a
+// file actually crosses 1500 or 2000 LOC, which is a real, rare,
+// actionable event — and it is exactly the event the project's own rules
+// key on (docs/refactoring-audit.md "When to refactor a candidate", and
+// the "regen only if it crosses a tier boundary" instruction already used
+// in docs/pr/1706 and docs/pr/1732 plans).
+//
+// The LOC column stays in the artifact for prioritisation, as an advisory
+// snapshot refreshed by `make audit-check`. It cannot drift far: a
+// recorded LOC is pinned to its tier band by TestHeatmapArtifactWellFormed,
+// and any band crossing reds this test, which forces a regeneration that
+// refreshes every number.
+//
+// FAIL-ON-REVERT: retagging any committed row's tier, deleting a row, or
+// adding a phantom row makes this test RED.
 func TestHeatmapNotStale(t *testing.T) {
 	root := repoRoot(t)
 	committedPath := filepath.Join(root, "docs", "refactoring-audit-current.txt")
-	committed, err := os.ReadFile(committedPath)
+	b, err := os.ReadFile(committedPath)
 	if err != nil {
 		t.Fatalf("read committed heatmap %s: %v", committedPath, err)
 	}
-	generated := runScript(t, root, "scripts/refactoring-audit.sh")
-	if string(committed) != generated {
-		t.Fatalf("docs/refactoring-audit-current.txt is STALE.\n"+
-			"Regenerate with:\n"+
-			"  bash scripts/refactoring-audit.sh > docs/refactoring-audit-current.txt\n"+
-			"then commit the result.\n\n--- committed ---\n%s\n--- generated ---\n%s",
-			string(committed), generated)
+	committed := tierByPath(parseHeatmap(t, "committed docs/refactoring-audit-current.txt", string(b)))
+	generated := tierByPath(parseHeatmap(t, "freshly generated heatmap", runScript(t, root, "scripts/refactoring-audit.sh")))
+
+	var entered, left, retiered []string
+	for path, tier := range generated {
+		old, ok := committed[path]
+		switch {
+		case !ok:
+			entered = append(entered, fmt.Sprintf("  %-10s %s", tier, path))
+		case old != tier:
+			retiered = append(retiered, fmt.Sprintf("  %s: %s -> %s", path, old, tier))
+		}
+	}
+	for path, tier := range committed {
+		if _, ok := generated[path]; !ok {
+			left = append(left, fmt.Sprintf("  %-10s %s", tier, path))
+		}
+	}
+	if len(entered)+len(left)+len(retiered) == 0 {
+		return
+	}
+	sort.Strings(entered)
+	sort.Strings(left)
+	sort.Strings(retiered)
+
+	var msg strings.Builder
+	msg.WriteString("docs/refactoring-audit-current.txt is STALE: the audited file set / tier\n" +
+		"assignment no longer matches the tree.\n")
+	for _, section := range []struct {
+		title string
+		rows  []string
+	}{
+		{fmt.Sprintf("entered the audit (now >=%d LOC)", auditFloor), entered},
+		{fmt.Sprintf("left the audit (now <%d LOC, or renamed/deleted)", auditFloor), left},
+		{fmt.Sprintf("changed tier (crossed %d LOC)", refactorFloor), retiered},
+	} {
+		if len(section.rows) == 0 {
+			continue
+		}
+		fmt.Fprintf(&msg, "\n%s:\n%s\n", section.title, strings.Join(section.rows, "\n"))
+	}
+	msg.WriteString("\nRegenerate with:\n" +
+		"  bash scripts/refactoring-audit.sh > docs/refactoring-audit-current.txt\n" +
+		"then commit the result. `make audit-check` shows the full diff.")
+	t.Fatal(msg.String())
+}
+
+// TestHeatmapArtifactWellFormed pins the committed artifact's internal
+// coherence, which is what makes the advisory LOC column safe to let lag
+// (see TestHeatmapNotStale). Every row must record a LOC at or above the
+// audit floor whose value agrees with its own tier tag, and the rows must
+// still be in generator order. Together with the tier/membership gate this
+// bounds LOC staleness to within a tier band: a row can never carry a
+// number that contradicts the tier it is filed under, and a real band
+// crossing reds TestHeatmapNotStale.
+//
+// These are hand-edit detectors, not drift detectors. The artifact is
+// only ever produced wholesale by scripts/refactoring-audit.sh, which
+// emits rows sorted and self-consistent by construction, so ordinary
+// staleness — the tree moving on while the artifact keeps its old
+// numbers — leaves every check here green. A row whose LOC contradicts
+// its tag, or a row out of sort position, means someone edited the
+// generated file by hand.
+func TestHeatmapArtifactWellFormed(t *testing.T) {
+	root := repoRoot(t)
+	b, err := os.ReadFile(filepath.Join(root, "docs", "refactoring-audit-current.txt"))
+	if err != nil {
+		t.Fatalf("read committed heatmap: %v", err)
+	}
+	rows := parseHeatmap(t, "committed docs/refactoring-audit-current.txt", string(b))
+
+	for _, r := range rows {
+		if r.loc < auditFloor {
+			t.Errorf("row %s records %d LOC, below the %d LOC audit floor — it should not be in the heatmap at all",
+				r.path, r.loc, auditFloor)
+		}
+		want := tierWatch
+		if r.loc >= refactorFloor {
+			want = tierRefactor
+		}
+		if r.tier != want {
+			t.Errorf("row %s: %d LOC is tagged %s, want %s (>=%d LOC is %s, %d-%d is %s)",
+				r.path, r.loc, r.tier, want, refactorFloor, tierRefactor, auditFloor, refactorFloor-1, tierWatch)
+		}
+	}
+
+	// Generator order: LOC descending, path ascending on ties
+	// (LC_ALL=C sort -k2,2nr -k3,3 in scripts/refactoring-audit.sh).
+	for i := 1; i < len(rows); i++ {
+		prev, cur := rows[i-1], rows[i]
+		if prev.loc < cur.loc || (prev.loc == cur.loc && prev.path > cur.path) {
+			t.Errorf("rows %d/%d are out of generator order (LOC desc, path asc): %s (%d) precedes %s (%d)",
+				i, i+1, prev.path, prev.loc, cur.path, cur.loc)
+		}
+	}
+}
+
+// TestGeneratorDeterministic asserts two consecutive generations are
+// byte-identical (#6617 acceptance criterion). The tier/membership gate
+// is only as trustworthy as the generator underneath it: an unstable
+// generator — unsorted `find` order leaking through, a timestamp, a
+// locale-dependent tie-break — would make the gate flap on an unchanged
+// tree and re-create the ignore-this-signal failure #6617 is about.
+func TestGeneratorDeterministic(t *testing.T) {
+	root := repoRoot(t)
+	first := runScript(t, root, "scripts/refactoring-audit.sh")
+	second := runScript(t, root, "scripts/refactoring-audit.sh")
+	if first != second {
+		t.Fatalf("scripts/refactoring-audit.sh is NOT deterministic: two consecutive runs on an\n"+
+			"unchanged tree differ. The heatmap gate cannot be trusted until this is fixed.\n\n--- run 1 ---\n%s\n--- run 2 ---\n%s",
+			first, second)
 	}
 }
 
@@ -199,22 +401,9 @@ func TestInlineTestBlockNotStripped(t *testing.T) {
 
 	out := runScript(t, root, "scripts/refactoring-audit-classify.sh", "loc", path)
 	got := strings.TrimSpace(out)
-	want := itoa(wantLOC)
+	want := strconv.Itoa(wantLOC)
 	if got != want {
 		t.Fatalf("audit_loc stripped or miscounted an inline-test fixture: got %q, want %q\n"+
 			"the measurement must count RAW LOC so a stripper cannot erase production code following a test block", got, want)
 	}
-}
-
-// itoa avoids importing strconv for a single conversion.
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var b []byte
-	for n > 0 {
-		b = append([]byte{byte('0' + n%10)}, b...)
-		n /= 10
-	}
-	return string(b)
 }

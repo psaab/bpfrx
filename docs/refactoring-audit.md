@@ -9,8 +9,10 @@ Tracking the modularity-discipline rule from `docs/engineering-style.md`:
 
 `scripts/refactoring-audit.sh` produces a deterministic, sorted list of
 `[REFACTOR]` and `[WATCH]` entries. Output is committed to
-`docs/refactoring-audit-current.txt` and regenerated periodically (and at
-PR time when adding to a flagged file).
+`docs/refactoring-audit-current.txt` and regenerated periodically — and
+at PR time whenever a file crosses a tier boundary (see [Drift
+guard](#drift-guard); in-band LOC churn does not require a
+regeneration).
 
 LOC is total file LOC for non-test, non-generated files. The script covers
 three language families:
@@ -89,31 +91,69 @@ runs produce byte-identical output.
 
 ## Drift guard
 
-The committed heatmap is enforced two ways:
+### What is gated, and what is advisory
+
+The gate is on the heatmap's **content**: which files are audited, and
+at which tier. That is what the project's rules act on, and it only
+changes when a file actually crosses 1500 or 2000 LOC — a real, rare,
+actionable event.
+
+The **LOC column is an advisory snapshot.** It is not gated, and the
+tree is expected to outrun it between regenerations. It cannot drift
+far: every recorded number is pinned to its own tier band, and any band
+crossing fails the gate, which forces a regeneration that refreshes all
+of them.
+
+**Why the LOC column cannot be gated (#6617).** It used to be — the
+canary compared the artifact byte-for-byte — and that criterion could
+not hold. The heatmap is a repo-*global* snapshot: its LOC column
+depends on every audited file in the tree, not just the ones a PR
+touches. Under parallel merges, a PR that regenerates the artifact
+correctly at its own base still lands stale, because a sibling PR grew a
+different file in between. Measured over the 40 first-parent commits
+ending at `b4605ea9d`, `master` was byte-stale in **28** of them; #6602
+and #6613 each regenerated the artifact in their own merge commit and
+each *still* landed red, both disagreeing only on `pkg/snmp/agent.go`, a
+file neither PR touched. A gate that fails when the author did
+everything right is noise — and the noise is what let real staleness sit
+22 rows deep for 21 consecutive commits before anyone looked.
+
+### The two surfaces
 
 1. **`make test` (required, automatic).** The `pkg/refactoraudit`
-   canary (`TestHeatmapNotStale`) regenerates the heatmap and asserts it
-   byte-for-byte matches the committed
+   canary (`TestHeatmapNotStale`) regenerates the heatmap and asserts
+   the audited file set and each file's tier match the committed
    `docs/refactoring-audit-current.txt`. Because it is an ordinary Go
    test it runs under `go test ./...` — part of the single pre-commit
-   aggregate `make test` — so the artifact **cannot** silently drift on
+   aggregate `make test` — so audit content **cannot** silently drift on
    `master` the way it did before #6232 (62 generated rows vs 16
-   committed). Sibling tests pin the classifier (`TestClassifierFilenameShapes`),
-   the >=2000 LOC production sentinel (`TestProductionSentinelVisible`),
-   and the raw-LOC / no-inline-strip invariant
-   (`TestInlineTestBlockNotStripped`).
+   committed). It fails with the specific files that entered, left, or
+   changed tier, not a dump of both artifacts. Sibling tests pin the
+   artifact's internal coherence (`TestHeatmapArtifactWellFormed` — every
+   row's LOC agrees with its own tier tag and the rows are still in
+   generator order, so a hand edit cannot pass), generator determinism
+   (`TestGeneratorDeterministic`), the classifier
+   (`TestClassifierFilenameShapes`), the >=2000 LOC production sentinel
+   (`TestProductionSentinelVisible`), and the raw-LOC / no-inline-strip
+   invariant (`TestInlineTestBlockNotStripped`).
 
 2. **`make audit-check` (#1661 item 8, standalone convenience).**
-   Regenerates the heatmap to a temp file and `diff`s it against the
-   committed artifact, printing the exact drift and the one-line
-   regenerate command. Run this after any change that adds, deletes, or
-   resizes a `>=1500` LOC source file to see and fix the drift *before*
-   `make test` fails, then commit the regenerated artifact.
+   Regenerates the heatmap to a temp file, prints the exact `diff`, and
+   classifies it so its verdict always agrees with the canary:
+
+   | Diff | Verdict | Exit |
+   |------|---------|------|
+   | none | up to date | 0 |
+   | LOC column only (same files, same tiers) | `ADVISORY` — refresh when convenient | 0 |
+   | a file entered / left / changed tier | `ERROR` — `TestHeatmapNotStale` will fail | 1 |
+
+   Run it after any change that adds, deletes, or resizes a `>=1500` LOC
+   source file, and regenerate when it says `ERROR`.
 
 Both paths share the classifier and measurement in
 `scripts/refactoring-audit-lib.sh`, so they can never disagree about
-what counts as production LOC. To refresh the artifact after a
-legitimate resize:
+what counts as production LOC. To refresh the artifact — after a tier
+crossing, or any time you want the numbers current:
 
 ```bash
 bash scripts/refactoring-audit.sh > docs/refactoring-audit-current.txt
@@ -156,4 +196,6 @@ out of this section; it is historical.** The committed heatmap is the
 single source of truth for which files are `[REFACTOR]`/`[WATCH]` tier.
 
 See `docs/refactoring-audit-current.txt` for the current heatmap, and
-run `make audit-check` to confirm it is in sync with the tree.
+run `make audit-check` to confirm it is in sync with the tree. Its LOC
+column is an advisory snapshot; the tier each file is filed under is
+gated and always current.
