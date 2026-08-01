@@ -367,11 +367,20 @@ naming its owner: local, unattributable, denied, and logged once per scan rather
 than dropped in silence.
 
 <a id="residuals"></a>
-**Residuals, stated rather than papered over.**
+**Residuals, stated rather than papered over.** There are FOUR, and they are not
+the same kind — an earlier version of this header said "the first two over-deny
+and grant nothing; the third is closed", which under-counted the list and
+mischaracterised it. Read the kind before the detail:
 
-One of them over-denies and grants nothing: DNAT-to-loopback. The other two are
-the same shape as each other, and it is worth naming that shape once rather than
-filing them as unrelated curiosities.
+| # | residual | kind |
+|---|---|---|
+| 1 | DNAT to loopback | over-denies; grants nothing |
+| 2 | Another network namespace | **open** — spatial |
+| 3 | A brand-new local address | **closed** |
+| 4 | Address churn between accept and adjudication | **open** — temporal |
+
+Only #1 over-denies. Only #3 is closed. #2 and #4 are open, both grant, and they
+are one shape rather than two curiosities:
 
 > The locality re-derivation answers **"is this address on this host, in my
 > namespace, right now."** The question authorization actually needs is **"was
@@ -470,8 +479,15 @@ a new hole.
   What remains is an over-denial: for at most a second, a local caller with no
   socket row is denied instead of resolved to its class.
 
-  **And the TEMPORAL case of the shape above — the direction that is NOT
-  closed.** A *successful*
+  **Bounds (of the closed direction).** It required an *off-loopback* bind (on
+  the default loopback bind
+  `couldBeLocal` short-circuits before the cache is ever consulted, so the
+  default posture was provably never exposed), a configured `api-auth` secret in
+  the caller's hands, and an address added to the host within the last second.
+  `pkg/config/compiler.go` still rejects an off-loopback bind with no `api-auth`
+  at strict commit (#4047), so those two conditions travel together.
+- **Address churn between accept and adjudication — the TEMPORAL case, and
+  the direction that is NOT closed.** A *successful*
   enumeration that finds nothing is not proof the caller is off-box — errors
   fail closed, omissions cannot. A clean no-match reads the same whether the
   caller is genuinely remote, in another namespace, or was on this host a moment
@@ -485,13 +501,6 @@ a new hole.
   notification (`RTM_NEWADDR`) rather than two point samples, and is not
   attempted here. The bound is the same one as for the namespace residual above:
   a caller this host cannot place is governed by the `api-auth` credential.
-
-  **Bounds (of the closed direction).** It required an *off-loopback* bind (on the default loopback bind
-  `couldBeLocal` short-circuits before the cache is ever consulted, so the
-  default posture was provably never exposed), a configured `api-auth` secret in
-  the caller's hands, and an address added to the host within the last second.
-  `pkg/config/compiler.go` still rejects an off-loopback bind with no `api-auth`
-  at strict commit (#4047), so those two conditions travel together.
 
 **Scoped IPv6 is refused, not guessed.** `/proc/net/tcp6` prints only the 128
 address bits, never the scope id, so two link-local callers on different

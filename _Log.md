@@ -66677,3 +66677,20 @@ break — `go vet` confirmed passing under every revert.
   pass. The forms these replaced both ADMIT that mutation: `scans != 0` passes on
   2, and `scans > callers/4` (>50) passes on 4.
 - **File(s)**: pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 (round-6c, residual header)
+- **Action**: #5561 — the residual section header still contradicted its own
+  body. Round 6b promoted the under-denial into the text but left the header
+  enumerating three items and calling the set "the first two over-deny; the third
+  is closed" — with a fourth case (address churn) buried as a sub-paragraph
+  inside the brand-new-address bullet, so an auditor counting bullets could not
+  map the header onto the list. Promoted the temporal case to its OWN bullet and
+  replaced the header with an explicit four-row table naming each residual's KIND
+  (over-denies / open-spatial / closed / open-temporal), followed by one line
+  that states the discrimination outright: only #1 over-denies, only #3 is
+  closed, #2 and #4 are open and both grant. The header now names its own prior
+  error, as the netns and localAddrTTL corrections do, so a reader who stops at
+  the header still gets the right answer — which is the whole reason this
+  mattered. Documentation only; no code change (`go build` rc=0, pkg/authz +
+  pkg/api rc=0).
+- **File(s)**: pkg/api/README.md, _Log.md
