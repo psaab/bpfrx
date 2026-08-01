@@ -63856,3 +63856,33 @@ break — `go vet` confirmed passing under every revert.
   is address-matched and a separate surface. Codex re-review of the folded head
   918ea0b95 returned MERGE-READY with no findings.
 - **File(s)**: docs/fabric-cross-chassis-fwd.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6621 fixed the reproducibly-red Rust test
+  `steady_state_drops_batch_received_after_stop_5165`. Root cause is
+  ENVIRONMENTAL, not a dataplane defect: the test drives the steady-state
+  neighbour monitor over an AF_UNIX SOCK_DGRAM socketpair and injected events
+  with `libc::send`, which compiles to the `sendto` syscall. A seccomp
+  network-egress filter (the review sandbox that reported it runs with
+  `Seccomp: 2`, one filter) denies `sendto` with EPERM while leaving `write`
+  and `recvfrom` permitted on that same socket, so the helper's `assert_eq!`
+  fired with an opaque `n == -1` before the loop under test ever saw a byte.
+  Measured firsthand inside that sandbox: `socketpair` rc=0, `send` -1
+  EPERM, `write` 48 bytes delivered, `recv` 48 bytes read. Fix is a syscall
+  swap to `write(2)` — equivalent to `send` with `flags == 0` on a connected
+  SOCK_DGRAM socket — so the test RUNS everywhere rather than skipping, with
+  no coverage lost; the assert now also prints errno so a future environment
+  failure is not opaque. Second, independent defect found while diagnosing and
+  fixed in the same change: the test could pass VACUOUSLY. Its 500ms harness
+  `SO_RCVTIMEO` raced the stop-then-inject sequence — if the timeout expired
+  first the loop exited on its TOP-of-loop check, never received event 2, and
+  `map.get(&key2).is_none()` held trivially while the post-recv re-check under
+  test was never exercised. Raised the harness timeout to 10s (production
+  stays 500ms) and added a post-join `MSG_DONTWAIT` drain asserting the
+  datagram was CONSUMED, so a run that fails to exercise the gate now reports
+  that instead of a false green. Also closed the read end, which previously
+  leaked for the lifetime of the test binary. Validated: 10/10 green on the
+  named test, full `cargo test --release` green, and the #5165 FAIL-ON-REVERT
+  property re-proved by deleting the post-recv `if stop { break }` (assertion
+  red, `cargo build --release` clean).
+- **File(s)**: userspace-dp/src/afxdp/neighbor.rs, _Log.md
