@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -298,19 +299,42 @@ func TestClassUnidentifiedIsDenyingNotLegacy_6701(t *testing.T) {
 // only WARNS (#1960), so a persisted or peer-synced config can still carry it
 // at runtime. This asserts the runtime holds regardless, through the real gates
 // rather than by inspecting precedence.
+// It drives the REAL tolerant ingress (Store.SyncApply -> compileTreeLenient),
+// not a hand-built Config, and resolves through a REAL store. The first version
+// of this test built the struct by hand and left store nil, so
+// resolveClassPerms never read the config at all — it passed for the wrong
+// reason and stayed green when built-in precedence was inverted. Mutation
+// caught that; reading it did not.
 func TestUnauthorizedClassCannotBeWidened_6701(t *testing.T) {
-	// The compiled shape a leniently-loaded `class unauthorized { permissions
-	// all; }` produces: a custom class, mapped to PermAll.
-	cfg := &config.Config{}
-	cfg.System.Login = &config.LoginConfig{
-		Classes: []*config.LoginClass{{
-			Name:              ClassUnidentified,
-			Permissions:       []string{"all"},
-			MappedPermissions: []config.LoginClassPermission{config.PermAll},
-		}},
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
+
+	// The peer-sync / persisted-config scenario: a definition that STRICT
+	// commit rejects (validateLoginClassShadowsBuiltinAST) but the tolerant path
+	// accepts with a warning, so it really can be live at runtime.
+	const peerConfig = `system {
+    login {
+        class unauthorized {
+            permissions all;
+        }
+    }
+}
+`
+	if _, err := store.SyncApply(peerConfig, nil); err != nil {
+		t.Fatalf("SyncApply(): %v — the tolerant path must ACCEPT this (that is why the "+
+			"runtime precedence has to hold)", err)
+	}
+	cfg := store.ActiveConfig()
+	if cfg == nil || cfg.System.Login == nil || len(cfg.System.Login.Classes) != 1 {
+		t.Fatalf("tolerant load did not produce the shadowing class: %+v", cfg)
+	}
+	// Premise check: the COMPILED struct really does carry the widened mapping.
+	// Without this the test could pass because the class never compiled at all.
+	if mapped := cfg.System.Login.Classes[0].MappedPermissions; len(mapped) != 1 || mapped[0] != config.PermAll {
+		t.Fatalf("compiled MappedPermissions = %v, want [PermAll] — the fixture does not "+
+			"actually express the widening it claims to test", mapped)
 	}
 
-	c := &CLI{userClass: ClassUnidentified, store: nil}
+	c := &CLI{userClass: ClassUnidentified, store: store}
 	perms, ok := c.resolveClassPerms(ClassUnidentified)
 	if !ok {
 		t.Fatalf("resolveClassPerms(%q) did not resolve", ClassUnidentified)
