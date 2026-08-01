@@ -1,10 +1,9 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v52 — r51 findings folded (Codex NEEDS-REVISION
-  4M/1m; AGY NEEDS-REVISION 1M — the tick-hang, IS Codex M4's
-  second half; Claude SMR PLAN-READY-WITH-NITS 0M/1m — the
-  witness clause, IS Codex M4; all three confirm the §4.7
-  structure); pending convergence review r52
+- **Status**: DRAFT v53 — r52 findings folded (Codex NEEDS-REVISION
+  4M/1m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/2m;
+  all three confirm the §4.7 structure); pending convergence
+  review r53
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -2251,6 +2250,59 @@
   pending-XSK rejection, the paused-outbound-claimant /
   reconnect / commit / release ordering, and marker-no-op
   rejection.
+  v53: r52 convergence — the composite reader joins the
+  snapshot, the convergence signal becomes an attempt-tokened
+  multi-arm join with a pending/failed distinction, and the
+  obsolete witness gate is struck (Codex NEEDS-REVISION 4M/1m,
+  folds 2 PARTIAL / 2 NOT-FOLDED / 1 PARTIAL, structure
+  confirmed; AGY PLAN-READY 5/5 with all fresh attacks FAILED,
+  structure confirmed; SMR PLAN-READY-WITH-NITS 0M/2m — the
+  publication-method name and the seqlock writer double-bump,
+  both folded into the §5.1 contract text): (a) THE COMPOSITE
+  READER JOINS THE SNAPSHOT (Codex M1, verified:
+  `handleConfigSync`'s #4957 converged shortcut reads
+  `ShowActive` and `ActiveApplied` in SEPARATE store lock
+  transactions, `daemon_ha_sync.go:544-568`,
+  `store_format.go:31-36`, `store.go:803-809` — an A→B
+  promotion/apply between those reads combines cached text A
+  with ActiveApplied(B)==true, returns success for incoming A,
+  and advances the receiver high-water,
+  `sync_conn_config.go:319-324,390-395`): the shortcut's
+  (text, applied) pair is read from ONE versioned snapshot;
+  §9 gains the composite-reader leg. (b) THE ATTEMPT-TOKENED
+  MULTI-ARM JOIN (Codex M2 + M3, verified: the status loop
+  runs outside applySem, `process_status.go:150-186` — an old
+  or early completion can stamp lastOK=true during a newer
+  apply; and the pending publication is not the only
+  asynchronous nil/void outcome — Compile publishes nil before
+  XSK liveness is resolved, `manager_compile.go:338-402`, with
+  the later probe able to fail closed while merely logging,
+  `maps_sync.go:461-545`, and the link-cycle rebind is a void
+  call whose failure is swallowed,
+  `daemon_apply_dataplane.go:390-401`,
+  `process_linkcycle.go:184-224`): EVERY asynchronous arm —
+  deferred-MAC, pending-XSK publication, XSK-liveness probe,
+  link-cycle rebind — carries the apply's ATTEMPT TOKEN, and
+  the signal reads CONVERGED only when the pipeline AND every
+  arm's completion carry the CURRENT attempt token; the
+  two-phase join is pipeline complete AND publication complete.
+  (c) THE PENDING/FAILED DISTINCTION (Codex m1, verified the
+  contradiction: pending was NOT-converged and every
+  non-converged return incremented the process-lifetime count,
+  while acceptance required count==0 — so even clean
+  completion could never rehabilitate the predicate): the
+  state machine distinguishes CONVERGED / PENDING / FAILED —
+  a PENDING arm holds the predicate WITHOUT moving the failure
+  count (the count moves only on a terminal failure); the
+  predicate requires count==0 AND no pending arm outstanding
+  AND lastOK. (d) THE OBSOLETE WITNESS GATE IS STRUCK (Codex
+  M4, verified the leftover: the runbook still required
+  observing the ConfigsSent tick or the marker no-op
+  immediately before admitting neither is faithful; the marker
+  is private, `daemon.go:420-424`): the interval-bracketed
+  double digest check is the ONLY join. (e) The §9 legs gain
+  the composite-reader leg, the attempt-token legs across all
+  four arms, and the pending/failed distinction leg.
 
 ---
 
@@ -4724,8 +4776,10 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   later self-heal, `daemon_ha_sync.go:479-484`): the
   re-convergence commit runs only AFTER the authority's first
   post-election post-stability reconcile pass is OBSERVED
-  complete (the `ConfigsSent` tick on the status surface —
-  monotonic, `status.go:340-356` — or the marker no-op); a
+  complete (the interval-bracketed digest check below — the
+  ONLY join; the ConfigsSent tick and the marker no-op are
+  WITHDRAWN as witnesses, r52 Codex M4: a no-op pass never
+  ticks, and the marker is private, `daemon.go:420-424`); a
   stale pass's old-text push is then OVERWRITTEN by the
   operator's commit push (newer wire generation), and every
   later pass carries the intended text — with sync DISABLED no config flows regardless of
@@ -5785,7 +5839,17 @@ v20 history). The delivery is TWO units:
   side is seqlock-style: read the version, read the snapshot,
   RE-READ the version, retry on change (the show path takes no
   applySem, so the versioned re-read is the linearization
-  point) — with the truth assignment at the
+  point) — and the COMPOSITE readers join the same publication
+  (r52 Codex M1, verified: `handleConfigSync`'s #4957 converged
+  shortcut reads `ShowActive` and `ActiveApplied` in SEPARATE
+  store lock transactions, `daemon_ha_sync.go:544-568`,
+  `store_format.go:31-36`, `store.go:803-809` — an A→B
+  promotion/apply between those reads combines cached text A
+  with ActiveApplied(B)==true, returns success for incoming A,
+  and advances the receiver high-water,
+  `sync_conn_config.go:319-324,390-395`): the shortcut's
+  (text, applied) pair is read from ONE versioned snapshot,
+  with the §9 composite-reader leg — with the truth assignment at the
   CONVERGENCE point, not the outer return (r50 Codex M2,
   verified both false-green paths: the mandatory deferred-MAC
   second `ApplyConfig` can fail while merely recording retry
@@ -5809,7 +5873,30 @@ v20 history). The delivery is TWO units:
   actual publication happens asynchronously and its rejection
   is merely logged and retried,
   `process_status.go:118-131,183-186` — the deferred
-  publication's completion/failure drives lastOK/count) — so an
+  publication's completion/failure drives lastOK/count), with
+  the convergence signal defined as an ATTEMPT-TOKENED multi-arm
+  join (r52 Codex M2/M3/m1, all verified: the status loop runs
+  OUTSIDE applySem, `process_status.go:150-186`, so an old or
+  early completion can stamp lastOK=true during a newer apply;
+  and the pending publication is not the only asynchronous
+  nil/void outcome — normal Compile publishes and returns nil
+  before XSK liveness is resolved,
+  `manager_compile.go:338-402`, with the later probe able to
+  fail closed while merely logging, `maps_sync.go:461-545`,
+  and the link-cycle rebind is a void call whose failure is
+  swallowed, `daemon_apply_dataplane.go:390-401`,
+  `process_linkcycle.go:184-224`): EVERY asynchronous arm —
+  deferred-MAC, pending-XSK publication, XSK-liveness probe,
+  link-cycle rebind — carries the apply's ATTEMPT TOKEN (a
+  monotonic per-apply generation); the signal reads CONVERGED
+  only when the pipeline AND every arm's completion carry the
+  CURRENT attempt token; and the state machine distinguishes
+  CONVERGED / PENDING / FAILED — a PENDING arm does NOT
+  increment the failure count (the count moves only on a
+  terminal failure), so a clean completion or a
+  success-after-rejection rehabilitates the predicate, while
+  the predicate requires count==0 AND no pending arm
+  outstanding AND lastOK) — so an
   in-flight or
   parked apply reads not-success (the false-green-in-flight
   window, r49 Codex M1: a DHCP/feed reapply can be mid-flight
@@ -7375,6 +7462,21 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      and the re-drive overwrites it) and the MARKER-NO-OP
      REJECTION leg (a no-op pass never ticks ConfigsSent, so no
      runbook step may wait on a tick);
+     (h2f) the COMPOSITE-READER leg (r52 Codex M1): the #4957
+     shortcut's (text, applied) pair is read from ONE versioned
+     snapshot — an A→B promotion/apply between the two reads
+     can no longer combine text A with ActiveApplied(B) —
+     exercised with the high-water advance assertion
+     (`sync_conn_config.go:319-324,390-395`);
+     (h2g) the ATTEMPT-TOKEN legs (r52 Codex M2/M3): an OLD
+     arm's completion arriving during a NEWER apply cannot
+     stamp converged (the token mismatch), exercised across the
+     deferred-MAC, pending-XSK-publication, XSK-liveness-probe,
+     and link-cycle-rebind arms; and the PENDING/FAILED
+     distinction leg (r52 Codex m1): a pending arm holds the
+     predicate without moving the failure count, a terminal
+     failure moves it, and a success-after-rejection
+     rehabilitates;
      (h) the PULSE-BETWEEN-READS leg (r45 Codex M2 + r46 Codex
      M1) — a
      dispatch that lands, applies CLEANLY, and retires between

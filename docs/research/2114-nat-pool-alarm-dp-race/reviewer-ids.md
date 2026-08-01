@@ -158,6 +158,9 @@ reviewer (joins at /engineer on the code PR).
 | r51 | Codex | codex companion task-msa3dngg-aq47j5 (session 019fbc60-4d0c-7db0-b5e3-e64e014fb991) | NEEDS-REVISION (4 MAJOR, 1 MINOR; folds 2 FOLDED / 2 PARTIAL / 1 NOT-FOLDED). Structure confirmed |
 | r51 | AGY | agy print-mode direct (agy-plan-r51.md) | NEEDS-REVISION (1 MAJOR — tick-hang on marker no-op pass, IS Codex M4's second half). Structure confirmed |
 | r51 | Claude SMR | in-conversation (claude-smr-plan-r51.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — witness clause, IS Codex M4). Structure confirmed |
+| r52 | Codex | codex companion task-msa45uoa-2vkcjv (session 019fbc74-5826-7622-b680-7b94f8a2ea9c) | NEEDS-REVISION (4 MAJOR, 1 MINOR; folds 2 PARTIAL / 2 NOT-FOLDED / 1 PARTIAL). Structure confirmed |
+| r52 | AGY | agy print-mode direct (agy-plan-r52.md) | PLAN-READY (5/5 folds FOLDED; all attacks FAILED; no findings). Structure confirmed |
+| r52 | Claude SMR | in-conversation (claude-smr-plan-r52.md) | PLAN-READY-WITH-NITS (0 MAJOR, 2 MINOR — publication-method name; seqlock writer double-bump). Structure confirmed |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 
