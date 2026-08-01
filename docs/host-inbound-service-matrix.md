@@ -974,6 +974,92 @@ address is never dropped from the deny scope.
 mirrors the same additive resolution and quarantine, so the
 `CanonicalHostInboundTokenSig` it compares equals the runtime's effective set.
 
+## Multi-member bracket body applies to every member (#6391) — UPGRADE NOTE
+
+> **This is an admission WIDENING. Read it before upgrading if any of your
+> configs are hand-authored or loaded with `load override`.**
+
+A per-interface `host-inbound-traffic` body authored ON a bracketed interface
+membership now applies to EVERY member of that bracket. Before #6391 it applied
+to the FIRST member only, and the remaining members silently fell back to the
+zone-level set.
+
+```
+security {
+    zones {
+        security-zone trust {
+            interfaces {
+                [ ge-0/0/0 ge-0/0/1 ] {
+                    host-inbound-traffic {
+                        system-services { ssh; }
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+- **Before #6391:** ssh admitted on `ge-0/0/0` only. `ge-0/0/1` fell back to the
+  zone-level host-inbound set.
+- **After #6391:** ssh admitted on `ge-0/0/0` AND `ge-0/0/1` — what the config
+  says.
+
+So on upgrade, an interface that is a non-first member of a bracket carrying a
+host-inbound body **newly admits** the services and protocols in that body. If
+you were relying on the old under-application (deliberately or not), split the
+stanza into per-interface statements before upgrading:
+
+```
+set security zones security-zone trust interfaces [ ge-0/0/0 ge-0/0/1 ]
+set security zones security-zone trust interfaces ge-0/0/0 host-inbound-traffic system-services ssh
+```
+
+That flat-set form is scoped to `ge-0/0/0` alone and is UNAFFECTED by this change
+— see below.
+
+**Who is affected: essentially no one authoring via `set`.** The multi-member
+shape is only reachable from a hierarchical parse — `load override` or a
+hand-edited config file. A `set`-authored bracket list cannot produce it (the
+schema models the interface name as a wildcard container, so `SetPath` nests the
+bracket tail under the first member rather than widening its key). **No config in
+this repository uses the shape**: the `.conf` fixtures under `docs/`,
+`test/incus/` and `examples/deploy/` contain zero bracketed zone memberships.
+
+**What did NOT change — the single-scoped guarantee.** A service authored under
+ONE named interface via its own statement is scoped to that interface and never
+appears on a sibling, including a sibling it shares a bracket with. That
+invariant is unconditional and permanently pinned; PR #6389 broke it and was
+closed unmerged. The two cases are distinguishable in the compiled AST (a
+multi-member body is one container whose `Keys` carry both names; the flat-set
+form is a container keyed on one name with the sibling as a membership CHILD),
+which is what makes applying the body to every member safe here. Full mechanism:
+`docs/config-schema.md`, "A per-interface `host-inbound-traffic` override is
+scoped by the KEYS of the node it is authored on".
+
+**Known limitation (#6668).** The multi-member shape survives config persistence
+and HA config sync, but NOT a `show | display set` round-trip — `display set`
+flattens it into a form that fails to compile on reload (it fails closed, with a
+`references interface "host-inbound-traffic"` error, rather than silently
+dropping admission). Author multi-member bodies in hierarchical form, or use
+per-interface statements, if you round-trip configs through `display set`.
+
+**Revoking a grant made this way needs care.** A bracket-body grant has no
+targeted `delete`: because the admission was authored on the multi-member node
+rather than on either interface, there is no per-interface path to remove it
+from just one member. The revocation that does work —
+`delete security zones security-zone <z> interfaces [ a b ]` — deletes the
+whole node, which also removes `a` and `b` from the zone entirely. That is
+almost never what an operator wants, and on a zone-based firewall dropping a
+zone membership is a much larger change than dropping a service.
+
+The safe pattern, and the one to prefer when a grant may later need narrowing:
+author per-interface statements instead of a bracket body. Two statements
+granting `ssh` to `a` and to `b` are individually revocable; one bracket body
+granting it to both is not. If you already have a bracket body and need to
+revoke for one member, rewrite it as per-interface statements in the same commit
+as the delete, so the zone membership is never actually lost.
+
 ## Repeated host-inbound-traffic blocks merge (#4544)
 
 Junos MERGES two literal `host-inbound-traffic { ... }` blocks authored under
