@@ -39,6 +39,32 @@ consumers. CoS queue status includes queue-scoped drain-phase counters so
 operators can separate guarantee bytes, surplus bytes, and non-exact bytes
 sent while exact queues were still backlogged.
 
+
+### Proving the shim/userspace parity guards actually bind
+
+`userspace-xdp/src/ipv6_ext_walk.rs` is guarded by
+`test/mutation/shim-ext-parity-acceptance.sh`, not by `make test` alone. The
+script mutates the walk across a 13-row matrix and requires the parity guards in
+`userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs` to red on each edit.
+
+Run it whenever you change that walk. `make test` tells you the guards are
+green; it does not tell you they still bind, and this file has a history of the
+difference mattering: an earlier build gate used `cargo build --release`, which
+never compiles the `#[cfg(test)]`-only parity module, so a deliberate syntax
+error produced `BUILD rc=0 TEST rc=101` and was scored as "the guard fired".
+
+Two preflights run first and must themselves fail when broken — one proves the
+build gate really compiles the file under test, one proves a filter matching
+nothing is scored MISSING rather than `ok` (`cargo test` exits 0 on a filter that
+matches no test). The corpus builder also carries a non-vacuity floor, because
+every assertion in that file is of the form "this collection is empty" or "this
+count equals cases * offsets", and both hold trivially on an empty corpus.
+
+Note `ipv6_ext_walk.rs` is a hashed input of `userspace_xdp_manifest.json`, so
+even a comment edit there requires `make generate` and trips
+`TestUserspaceXDPShimObjectMatchesSourceManifest` until you do. That is why this
+pointer lives here rather than in the file it describes.
+
 ## Shim artifact: pinned toolchain + verifier gates (#1864)
 
 `userspace_xdp_bpfel.o` (the retained Rust AF_XDP shim, built from

@@ -205,10 +205,15 @@ run() {
   # The controls must be untouched by every shim-side mutation, or the guard
   # columns beside them are not attributable to the mutation.
   local i
+  # Return 3, NOT 1. A moved control and a genuine guard red are different
+  # outcomes and must not share an exit code: row() maps `red:1` to success, so
+  # returning 1 here scored a row whose control had broken as a PASS while
+  # printing "not attributable" directly above it. The harness would have
+  # reported a clean matrix over a result that proved nothing.
   for i in 3 4; do
     if [ "${cols[$i]}" != "ok" ]; then
       echo "      ^^ CONTROL ${ALL_TESTS[$i]} = ${cols[$i]} — this row's guard columns are not attributable"
-      return 1
+      return 3
     fi
   done
 
@@ -352,6 +357,7 @@ row() {  # row <mutator> <red|survive> <label>
     red:0)     echo "      ^^ MUTATION SURVIVED — the guards do not bind this edit"; rc=1 ;;
     survive:1) echo "      ^^ RED ON A SEMANTICALLY NULL EDIT — this harness reds on change, not on behaviour"; rc=1 ;;
     *:2)       echo "      ^^ BUILD FAILED — this row proves nothing about the guards"; rc=1 ;;
+    *:3)       echo "      ^^ CONTROL MOVED — this row proves nothing about the guards"; rc=1 ;;
     *)         echo "      ^^ unexpected outcome ${got} for expectation ${want}"; rc=1 ;;
   esac
 }

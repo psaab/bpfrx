@@ -786,6 +786,30 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
         cases.push((format!("first={p}"), chain(&[(p as u8, 0)], TCP, 0)));
     }
 
+    // NON-VACUITY FLOOR. Every assertion in this file is of the form "this
+    // collection is empty" or "this count equals cases.len() * L3_OFFSETS.len()",
+    // and BOTH hold trivially when the corpus is empty: an empty drift list is
+    // empty, an empty permissive list is empty, and `0 == 0 * 3`. Emptying this
+    // function was measured to leave all five tests reporting `ok` in 0.00s.
+    //
+    // The floor lives here, in the single producer, rather than in each consumer:
+    // it protects the tests that exist today and any added later, which is the
+    // failure mode a per-test assertion invites. It is deliberately far below
+    // the real size (>300) so ordinary corpus edits do not trip it, and far
+    // above zero so an emptied or short-circuited builder cannot pass.
+    assert!(
+        cases.len() >= 200,
+        "the #4555 parity corpus built only {} cases; every assertion in this file passes \
+         vacuously on a short corpus, so this is a harness failure, not a parity result",
+        cases.len()
+    );
+    assert!(
+        L3_OFFSETS.len() >= 3,
+        "the #4555 corpus must run at more than one L3 offset: with a single offset the \
+         `l3_offset -> 0` mutation is invisible by construction, which is exactly how it \
+         survived three rounds"
+    );
+
     cases
 }
 
