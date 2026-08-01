@@ -138,8 +138,8 @@ func (c *Config) ResolveFab(ref string) string {
 // same as ResolveFab (which returns the fabric overlay's parent
 // physical member for BPF attachment). fab0 itself is a real kernel
 // IPVLAN device, so API queries on fab0 must look up "fab0", not
-// its parent. Similarly, st0.x is the kernel XFRM device name
-// verbatim.
+// its parent. st0.x resolves to the xfrmi device derived from the
+// AUTHORED bind-interface, which is not always the ref itself.
 //
 // Resolution semantics, in order:
 //  1. Bare refs (no "." suffix):
@@ -149,8 +149,16 @@ func (c *Config) ResolveFab(ref string) string {
 //     case.
 //  2. Dotted refs (e.g. "ge-0/0/0.80", "reth0.50", "gr-0/0/0.0",
 //     "irb.0", "st0.0"):
-//     a. st<N>.<M> short-circuit: kernel XFRM device is the full
-//     ref verbatim. Matches resolveInterfaceRef + XFRMIfNameAndID.
+//     a. st<N>.<M>: resolve the xfrmi device from the AUTHORED
+//     bind-interface via SecureTunnelNetdevForRef (#5619). A bare
+//     `bind-interface st0` and an explicit `bind-interface st0.0`
+//     derive the same if_id under DIFFERENT device names, while
+//     the unit ref is `st0.0` either way — so it is read from the
+//     config, NOT reconstructed from the ref. Falls back to the
+//     verbatim ref only when no VPN binds the unit, since no xfrmi
+//     device exists for it then. The lexical test lives in
+//     IsSecureTunnelIfName so snapshotLinuxName applies the
+//     identical rule rather than a hand-copied third instance.
 //     b. IRB: look up via IRBToBridge(cfg.BridgeDomains) and return
 //     the bridge device name (no suffix).
 //     c. Tunnel: if TunnelNameMap[ref] is set, return that name

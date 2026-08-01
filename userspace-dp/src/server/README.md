@@ -205,23 +205,50 @@ ingress-adjudication map, the AF_XDP binding plan and the RSS allowlist. Since
 state built by `populate_interfaces` / `populate_egress`
 (`afxdp/forwarding_build/interfaces.rs`), which gate on `ifindex > 0` rather
 than on this predicate — so `name_to_ifindex`, the zone map and the egress map
-all see it, and a static route `next-hop st0.0` now resolves to a real ifindex
-where `resolve_next_hop_target_v4` previously fell through to
-`.unwrap_or((0, 0))`.
+all see it. Note the resolution applies to the `<ip>@<iface>` next-hop
+encoding: an authored `next-hop st0.0` still reaches `parse_route_next_hop` as
+the bare string `"st0.0"`, which returns `(None, None)` and leaves the target at
+`(0, 0)` on both revisions. Measured — do not restate this as "a static route
+`next-hop st0.0` now resolves"; it does not.
 
-That was traced to a terminal outcome and changes no disposition. An egress
-ifindex with **no XSK binding** is dropped by the TX dispatcher as
-`missing_egress_binding` (`afxdp/tx/dispatch/mod.rs`) — and ifindex 0 had no
-binding either, so LAN→tunnel transit dropped at the same site for the same
-reason before and after. What *did* change is a strict improvement: the egress
-zone resolves, so the flow is adjudicated against the real zone pair instead of
-an unresolved one.
+**This DOES move a disposition, and the executing site is the FIB, not the TX
+dispatcher.** An earlier revision of this paragraph claimed the change was
+disposition-neutral because an egress ifindex with no XSK binding is dropped by
+the TX dispatcher as `missing_egress_binding`. That was retracted: for a
+LAN→tunnel packet **neither revision reaches the TX dispatcher** — the FIB
+claims the packet first, at `forwarding/fib.rs`'s `if ifindex <= 0` versus the
+neighbor lookup below it, gated upstream by `populate_interfaces`'
+`if iface.ifindex <= 0 { continue }`.
 
-Do **not** "fix" that by widening the exclusion into those maps. An interface
+Measured across 2 bind-interface spellings × 3 next-hops × 2 destinations:
+**4 of 12 flip, all four in the dotted spelling (4 of its 6), zero for bare
+`st0`.** Every flip is `NoRoute` (egress 0) → `MissingNeighbor` (egress 42).
+Only unit 0 collapses — unit-row ifindex merge-base→head is `st0` 42→42,
+`st0.0` **0→42**, `st10.5` 42→42, `st0.7` 42→42 — and for a bare `st0` the
+collapsed name *is* the device.
+
+This is a **correction, not a regression.** `bind-interface st0` and `st0.0` are
+one tunnel (same if_id, same unit ref `st0.0`), and before this change the same
+tunnel took different dispositions depending on how it was spelled.
+`MissingNeighbor` is not invented here: it is what master already does for this
+flow on the canonical bare spelling. The `NoRoute` was the artifact.
+
+It is also not an unconditional delivered→dropped. Both dispositions are
+`is_slow_path_eligible`. `NoRoute` falls straight to the reinject gate with zone
+policy never evaluated; `MissingNeighbor` resolves zone ids from the egress
+ifindex and evaluates policy — a permit falls through to the same reinject
+(unchanged), a deny converts to `PolicyDenied` and `break …
+RecycleAndContinue`, which skips the reinject. So delivery changes only for a
+deployment with **no** `from-zone <lan> to-zone <tunnel-zone>` permit — i.e.
+precisely the policy bypass #5619 exists to close.
+
+Do **not** "fix" this by widening the exclusion into those maps. An interface
 absent from the zone maps resolves to `zone_id = 0`, and a `from-zone any
 to-zone any permit` matches zone-pair (0, 0) with no zone guard (#6682) — that
-trades a drop that already existed for a possible policy bypass. The LAN→tunnel
-drop is the reverse-direction half of #6700, not a regression introduced here.
+would trade an adjudicated drop for a possible policy bypass. Separately,
+whether the negative-neighbor cache (3 s TTL) can fast-fail a *permitted*
+LAN→tunnel flow is tracked as #6710; it is pre-existing on master for bare
+`st0`, and this change extends its reach to the dotted spelling.
 
 The same-plan fast path in `apply_snapshot` (`handlers/snapshot.rs`) relies
 on this coupling for correctness (#2916): when `snapshot_binding_plan_key` is
