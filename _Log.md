@@ -1,3 +1,41 @@
+## 2026-08-01 — #4555: teach the freshness diff about emitted-fact drift
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Self-check on the tautology risk in the new facts pipeline —
+  can the manifest's `shim_facts` drift from the object without any test
+  failing? Probed it rather than reasoning about it.
+
+  It IS caught: `TestUserspaceXDPShimObjectMatchesSourceManifest` compares
+  the committed manifest byte-for-byte against one recomputed from the
+  working tree, and `ComputeUserspaceXDPManifest` now reads the facts
+  from the OBJECT. So a hand-edited or corrupted `shim_facts` block fails
+  even when the object hash and every input hash still match. That closes
+  the case the parity guard's own B4 row does not cover — B4 tests a
+  MISSING block, not a FALSIFIED one.
+
+  But the failure MESSAGE was wrong, and that is a gap I introduced by
+  adding a manifest field without teaching the diff builder about it: the
+  operator got the generic "the object may be STALE, run `make generate`"
+  preamble followed by an EMPTY diff, because the builder only knew how to
+  report object-hash and input-hash drift. Neither had moved. A gate that
+  fires but misdiagnoses the cause and shows nothing is barely better than
+  one that does not fire.
+
+  Added `reportFactDrift`, which names only the fields that actually
+  moved — and for the class table names the changed next-header numbers
+  rather than dumping both 512-character hex strings, which in the first
+  attempt buried a one-field difference between two walls of identical
+  hex. A falsified block now reports e.g. `max_ext_hdrs: manifest 6,
+  object 7` and `eh_classes: next-header 44: manifest class 1, object
+  class 3; next-header 135: manifest class 0, object class 1`.
+
+  Test-only change; no production behaviour touched. Verified by
+  falsifying `max_ext_hdrs` and two class bytes in the committed manifest
+  (object and inputs untouched) and reading the resulting message, then
+  restoring and confirming green. Go build, vet and full `go test ./...`
+  clean.
+- **File(s)**: pkg/dataplane/userspace_xdp_manifest_test.go, _Log.md
+
 ## 2026-08-01 — #4555 round 3: stop modelling the shim, have it EMIT its facts
 
 - **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
