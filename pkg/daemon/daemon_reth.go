@@ -119,9 +119,20 @@ func pciAddrFromPath(path string) string {
 // name is the bare enp<bus>s<slot>[f<func>]. On multi-PCI-domain hardware
 // (domain != 0, e.g. 10000:01:00.0) the domain disambiguates two NICs that sit
 // at the same bus/slot in different domains; dropping it here would collide
-// them onto one name and resolve the wrong RETH member. systemd scans the
-// sysfs address fields as hex and prints them decimal, so parse hex / render
-// decimal for every component (domain, bus, slot, func) to match.
+// them onto one name and resolve the wrong RETH member.
+//
+// The FUNCTION is decimal; domain, bus and slot are hex (#6204). That asymmetry
+// is not ours — it comes from the kernel, which formats a PCI address as
+// "%04x:%02x:%02x.%d", and systemd's net_id builtin matches it by scanning
+// "%x:%x:%x.%u" and emitting "f%u". So a sysfs address for ARI function 10
+// reads ".10", not ".a".
+//
+// Parsing the function as hex therefore agrees with systemd for functions 0-7
+// (where the two bases coincide) and silently disagrees from 8 upward: ".10"
+// parsed as hex is 16, yielding "f16" where systemd names the link "f10". The
+// RETH member's OriginalName= lookup then never matches, so that NIC is not
+// renamed or bound. Only ARI-capable multifunction devices reach function >= 10,
+// which is why this survived — the common case is function 0.
 func pciAddrToEnp(pciAddr string) string {
 	parts := strings.SplitN(pciAddr, ":", 3)
 	if len(parts) != 3 {
@@ -143,7 +154,8 @@ func pciAddrToEnp(pciAddr string) string {
 	if err != nil {
 		return ""
 	}
-	fn, err := strconv.ParseUint(sf[1], 16, 8)
+	// Base 10, NOT 16 — see the function-decimal note in the doc comment.
+	fn, err := strconv.ParseUint(sf[1], 10, 8)
 	if err != nil {
 		return ""
 	}
