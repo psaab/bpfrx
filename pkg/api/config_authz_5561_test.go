@@ -143,6 +143,16 @@ func remotePeer() func(client, server net.Addr) authz.PeerIdentity {
 	}
 }
 
+// remoteLocality restates remotePeer's premise for the re-derivation the
+// credential row performs (Server.peerIsLocalNow). A case that fabricates an
+// off-box caller over a real LOOPBACK listener has to say so in both places:
+// the production re-check enumerates the host's real interfaces and would,
+// correctly, call 127.0.0.1 one of ours and deny. Omitting it is what
+// TestBrandNewLocalAddressCannotBorrowCredential_5561 exploits deliberately.
+func remoteLocality() func(client, server net.Addr) bool {
+	return func(net.Addr, net.Addr) bool { return false }
+}
+
 // postRoute issues a mutating request against a route key ("POST /path"),
 // returning the status and the decoded `error` field.
 func postRoute(t *testing.T, base, route string, hdrs map[string]string) (int, string) {
@@ -400,10 +410,11 @@ func TestApiAuthCredentialIsAFullPowerPrincipal_5561(t *testing.T) {
 
 	t.Run("credential authorizes a caller that is not on this host", func(t *testing.T) {
 		_, base := authzServer(t, Config{
-			Addr:         "127.0.0.1:8080",
-			Store:        authzStore(t, authzTestConfig),
-			Auth:         auth,
-			PeerLookupFn: remotePeer(),
+			Addr:           "127.0.0.1:8080",
+			Store:          authzStore(t, authzTestConfig),
+			Auth:           auth,
+			PeerLookupFn:   remotePeer(),
+			PeerLocalityFn: remoteLocality(),
 		})
 		status, errMsg := postRoute(t, base, "POST /api/v1/config/enter",
 			map[string]string{"Authorization": basic})
@@ -414,10 +425,11 @@ func TestApiAuthCredentialIsAFullPowerPrincipal_5561(t *testing.T) {
 
 	t.Run("without the credential the same remote caller is refused", func(t *testing.T) {
 		_, base := authzServer(t, Config{
-			Addr:         "127.0.0.1:8080",
-			Store:        authzStore(t, authzTestConfig),
-			Auth:         auth,
-			PeerLookupFn: remotePeer(),
+			Addr:           "127.0.0.1:8080",
+			Store:          authzStore(t, authzTestConfig),
+			Auth:           auth,
+			PeerLookupFn:   remotePeer(),
+			PeerLocalityFn: remoteLocality(),
 		})
 		status, _ := postRoute(t, base, "POST /api/v1/config/enter", nil)
 		// The api-auth middleware answers first with its own 401 challenge.
@@ -574,10 +586,11 @@ func TestUnattributableLocalCallerCannotBorrowCredential_5561(t *testing.T) {
 	// would pass the subtest above and lock out every remote administrator.
 	t.Run("a remote caller with the credential is still admitted", func(t *testing.T) {
 		_, base := authzServer(t, Config{
-			Addr:         "127.0.0.1:8080",
-			Store:        authzStore(t, authzTestConfig),
-			Auth:         auth,
-			PeerLookupFn: remotePeer(),
+			Addr:           "127.0.0.1:8080",
+			Store:          authzStore(t, authzTestConfig),
+			Auth:           auth,
+			PeerLookupFn:   remotePeer(),
+			PeerLocalityFn: remoteLocality(),
 		})
 		status, errMsg := postRoute(t, base, "POST /api/v1/config/enter",
 			map[string]string{"Authorization": basic})
@@ -1181,4 +1194,90 @@ func registeredRoutes(t *testing.T, file string) []string {
 	})
 	sort.Strings(out)
 	return out
+}
+
+// TestBrandNewLocalAddressCannotBorrowCredential_5561 is the round-5 MAJOR guard
+// at the REST layer.
+//
+// The accept-time locality verdict is drawn from an interface-address snapshot
+// refreshed at most once per second, for hits AND misses. That rate limit stops
+// a connect flood from amplifying, but it caches the one answer that ADMITS: a
+// caller LookupPeer calls "not on this host" skips the socket table entirely and
+// lands on the credential row, which authorizes as a full-power principal. For
+// up to a second after any address is added to this host — a VRRP VIP on
+// failover, a DHCP lease, an RA-derived address, all of which an unprivileged
+// account can watch for with `ip monitor address` — a caller connecting from
+// that address is local yet classified off-box.
+//
+// The case reproduces exactly that state: the injected resolver supplies the
+// stale accept-time verdict ("not on this host"), while the connection is a real
+// one whose peer really is on this host. Config.PeerLocalityFn is deliberately
+// left nil so the PRODUCTION re-derivation — authz.PeerCouldBeLocalNow, a fresh
+// interface enumeration — is what answers.
+//
+// Before the fix this returns 200: the credential spoke for a local caller.
+func TestBrandNewLocalAddressCannotBorrowCredential_5561(t *testing.T) {
+	usePasswdFixture(t)
+	auth := &AuthConfig{Users: map[string]string{"webadmin": "s3cret"}}
+	basic := "Basic " + base64.StdEncoding.EncodeToString([]byte("webadmin:s3cret"))
+
+	_, base := authzServer(t, Config{
+		Addr:  "127.0.0.1:8080",
+		Store: authzStore(t, authzTestConfig),
+		Auth:  auth,
+		// The stale accept-time verdict. Note the ABSENCE of PeerLocalityFn:
+		// the real check runs, and the real caller is real-ly local.
+		PeerLookupFn: remotePeer(),
+	})
+
+	status, errMsg := postRoute(t, base, "POST /api/v1/config/enter",
+		map[string]string{"Authorization": basic})
+	if status != http.StatusForbidden {
+		t.Fatalf("a caller whose address is assigned to THIS host was admitted with %d on "+
+			"the strength of the api-auth secret — the accept-time snapshot had not caught "+
+			"up with the address, so a local account escapes its login class for as long as "+
+			"that snapshot is stale (error=%q)", status, errMsg)
+	}
+	if !strings.Contains(errMsg, "assigned to this host") {
+		t.Errorf("denial did not name the reason: %q", errMsg)
+	}
+}
+
+// TestUncredentialedCallerDrivesNoInterfaceEnumeration_5561 pins the ORDER of
+// the two checks in principal(), which is the whole cost argument for making the
+// locality re-derivation authoritative.
+//
+// The re-derivation enumerates interfaces for real. Run before the credential
+// check, it would hand every unauthenticated connection a fresh enumeration —
+// the per-connection amplification TestLocalAddrCacheRateLimitsMisses_5561
+// forbids for the accept-time cache, reintroduced one layer up and reachable by
+// anyone who can open a socket. Run after, only a request that already presented
+// a VALID credential can drive one, and such a caller is authorized anyway.
+func TestUncredentialedCallerDrivesNoInterfaceEnumeration_5561(t *testing.T) {
+	usePasswdFixture(t)
+	_, base := authzServer(t, Config{
+		Addr:  "127.0.0.1:8080",
+		Store: authzStore(t, authzTestConfig),
+		Auth:  &AuthConfig{Users: map[string]string{"webadmin": "s3cret"}},
+		// Off-box at accept, so every request reaches the credential row.
+		PeerLookupFn: remotePeer(),
+	})
+
+	before := authz.HostAddrScansForTest()
+	for i := 0; i < 25; i++ {
+		if status, _ := postRoute(t, base, "POST /api/v1/config/enter", nil); status == http.StatusOK {
+			t.Fatal("an uncredentialed, unidentifiable caller reached the handler")
+		}
+		// A WRONG credential must not buy one either.
+		bad := "Basic " + base64.StdEncoding.EncodeToString([]byte("webadmin:wrong"))
+		if status, _ := postRoute(t, base, "POST /api/v1/config/enter",
+			map[string]string{"Authorization": bad}); status == http.StatusOK {
+			t.Fatal("an invalid credential reached the handler")
+		}
+	}
+	if scans := authz.HostAddrScansForTest() - before; scans != 0 {
+		t.Fatalf("50 requests with no valid credential drove %d interface enumerations — "+
+			"the locality re-derivation runs BEFORE the credential check, so any caller "+
+			"that can open a socket can force authoritative kernel work per request", scans)
+	}
 }

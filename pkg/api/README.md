@@ -313,6 +313,16 @@ Rows 1-3 collapse to one sentence: **a local caller never reaches the credential
 check.** If a local account needs access it is given a class — that is the one
 place access is supposed to be written down.
 
+Row 4 is the only one that *admits* on the strength of a negative, so it carries
+one extra obligation: the "not on this host" verdict was drawn at accept from a
+**cached** interface-address snapshot, and the credential row **re-derives it
+from a fresh interface enumeration** (`authz.PeerCouldBeLocalNow`) before
+honoring the credential. That re-derivation can only move a caller from row 4
+into a denial, never the other way, so it closes the staleness window described
+under [residuals](#residuals) without widening anything. It runs **after** the
+credential is validated — a caller presenting none cannot drive a kernel
+enumeration.
+
 The rule has been narrowed twice, each time because a weaker version had a hole
 the claim did not admit to:
 
@@ -347,8 +357,12 @@ falls back to "is the peer one of *our* addresses", sound positively and
 carrying the residuals below negatively. An unreadable or absent socket table is
 reported local-and-unattributable, never remote.
 
-**Residuals, stated rather than papered over.** All three over-deny; none
-grants access.
+<a id="residuals"></a>
+**Residuals, stated rather than papered over.** The first two over-deny and
+grant nothing. The third — the address-snapshot lag — is the one that pointed
+the *other* way, and it is closed rather than tolerated; it is kept on this list
+because the accept-time classification still gets it wrong, and anything new
+built on that classification has to know so.
 
 - **DNAT to loopback.** If a remote connection is redirected to a loopback
   address before it reaches the listener, the delivery address is loopback, the
@@ -364,11 +378,36 @@ grants access.
   CAP_NET_ADMIN *in the host namespace* — i.e. a root-configured container
   runtime. The default loopback bind is unaffected either way, and #4047 already
   requires an api-auth credential on the surface where this applies.
-- **A brand-new local address.** The host-address snapshot is refreshed at most
-  once per second, so for up to a second after an address is added to this host,
-  a caller arriving from it is classified off-box and may present a credential.
-  It still cannot escape a class it holds: a local caller with a class is only
-  reachable through the socket table, which is not cached.
+- **A brand-new local address — direction corrected, and closed.** The
+  host-address snapshot is refreshed at most once per second, for hits *and*
+  misses, so for up to a second after an address is added to this host a caller
+  arriving from that address is classified **off-box**. An earlier version of
+  this list claimed such a caller "still cannot escape a class it holds, because
+  a local caller with a class is only reachable through the socket table, which
+  is not cached." **That was backwards.** Being classified off-box means the
+  socket table is never read at all — `LookupPeer` short-circuits on
+  `!couldBeLocal` before consulting it — so the caller lands on the credential
+  row, which authorizes as a *full-power* principal. The staleness therefore
+  granted access; it did not over-deny.
+
+  It is reachable, not theoretical: address adds are observable to any
+  unprivileged account (`ip monitor address` needs no privilege) and this box
+  adds them routinely — VRRP VIPs on failover, DHCP leases, RA-derived
+  addresses. A local `read-only` holder of the api-auth secret that connects
+  from a freshly added address inside the window reaches configure and commit.
+
+  What closes it is not the cache but the row-4 re-derivation described above:
+  the credential row asks `authz.PeerCouldBeLocalNow` for a *fresh* enumeration
+  and denies a caller that is on this host. The remaining cost of the stale
+  snapshot is an over-denial — for at most a second, a local caller from a
+  brand-new address is denied instead of resolved to its class.
+
+  **Bounds.** It required an *off-loopback* bind (on the default loopback bind
+  `couldBeLocal` short-circuits before the cache is ever consulted, so the
+  default posture was provably never exposed), a configured `api-auth` secret in
+  the caller's hands, and an address added to the host within the last second.
+  `pkg/config/compiler.go` still rejects an off-loopback bind with no `api-auth`
+  at strict commit (#4047), so those two conditions travel together.
 
 **Scoped IPv6 is refused, not guessed.** `/proc/net/tcp6` prints only the 128
 address bits, never the scope id, so two link-local callers on different
@@ -431,6 +470,18 @@ which would refuse every mutation on it after an unrelated bind change.
 `TestEveryListenerCarriesPeerIdentity_5561` enforces that across the package,
 and `TestPeerIdentityIsResolvedAtAccept_5561` pins the once-per-connection
 timing (a per-request lookup is what the caller used to be able to defeat).
+`pendingPeer` keeps the connection's own addresses for the same reason the hook
+exists — the credential row needs them for its locality re-derivation.
+
+`Config` carries two test seams, and they answer different questions at
+different moments: `PeerLookupFn` is the accept-time identity, `PeerLocalityFn`
+the authoritative locality re-check the credential row performs. Both nil in
+production. A case that fabricates an off-box caller over a real *loopback*
+listener has to state that premise in both, because the production re-check
+enumerates the host's real interfaces and would — correctly — call `127.0.0.1`
+one of ours. `TestBrandNewLocalAddressCannotBorrowCredential_5561` leaves the
+second one nil on purpose: that is precisely the "accept-time verdict says
+off-box, the caller is really on this host" state the re-check exists for.
 
 **Cost.** This is load-bearing, not tuning: the lookup runs once per accepted
 CONNECTION, and reading `/proc/net/tcp{,6}` is **not** proportional to row count
@@ -458,6 +509,18 @@ population #5561 exists to constrain. Three bounds:
   once per second for hits **and** misses — an earlier version refreshed on every
   miss, which is precisely the flooding case, so the amplification was fully
   intact while the comment claimed otherwise.
+- **The authoritative locality re-check is behind the credential.** The row-4
+  re-derivation enumerates interfaces for real (~32 µs on a box carrying 14
+  addresses, against 4.3–10.1 ms for one `/proc/net/tcp` read). It runs only for
+  a request that already presented a **valid** credential on a connection
+  classified off-box, so an unauthenticated flood — the population that can open
+  sockets without holding anything — drives **zero** enumerations, and a caller
+  that does hold the credential is authorized regardless. Concurrent
+  re-derivations collapse into one enumeration through the same
+  waiter-set-before-read batching `socketscan.go` uses, so the batch is answered
+  from an observation newer than every arrival in it.
+  `TestUncredentialedCallerDrivesNoInterfaceEnumeration_5561` pins the ordering
+  and `TestConfirmationIsSingleFlighted_5561` the batching.
 
 A *local* attacker can still make connections that each join a batched read.
 They already have a shell on the box, the cost no longer scales with connection

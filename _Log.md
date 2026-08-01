@@ -66515,3 +66515,28 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+- **Action**: #5561 round-5 fold — close the stale-negative locality window that
+  let a LOCAL caller reach the api-auth credential row. Round 4 rate-limited the
+  interface-address snapshot refresh for misses as well as hits (fixing a real
+  per-connection amplification), which made a NEGATIVE answer cacheable for up to
+  `localAddrTTL`. The negative is the one verdict that admits: `LookupPeer`
+  short-circuits on `!couldBeLocal` before reading the socket table, so a caller
+  from an address added to this host within the last second was adjudicated
+  through the shared secret instead of its login class. Address adds are watchable
+  by any unprivileged account (`ip monitor address`) and this box adds them
+  routinely (VRRP VIPs, DHCP, RA). Fixed by re-deriving locality from a FRESH,
+  single-flighted interface enumeration (`authz.PeerCouldBeLocalNow`) at the
+  credential row itself, after the credential validates — so a caller holding no
+  credential drives zero enumerations and the round-4 amplification fix is kept
+  intact, while a caller that IS local is denied regardless of how new its
+  address is. The re-check is a one-way narrowing: it can only turn an admission
+  into a denial. Corrected the comment and doc, which had argued the window was
+  safe in the OPPOSITE direction ("cannot escape a class it holds") — it granted
+  access rather than over-denying. Mutation-proved both halves: removing the
+  pkg/api call site reds only `TestBrandNewLocalAddressCannotBorrowCredential_5561`
+  (83 other assertions green), and making the re-check read the cache instead of
+  enumerating reds only `TestBrandNewLocalAddressIsNotOffBox_5561` (128 green);
+  `go build ./...` and `go vet` rc=0 in both worlds.
+- **File(s)**: pkg/authz/peer.go, pkg/authz/peer_5561_test.go, pkg/api/authz.go,
+  pkg/api/server.go, pkg/api/config_authz_5561_test.go, pkg/api/README.md,
+  docs/system-login.md, _Log.md

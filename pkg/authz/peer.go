@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -119,19 +120,39 @@ var (
 // instead of depending on the machine's interfaces.
 var localAddrsFn = net.InterfaceAddrs
 
-// localAddrTTL bounds how long a cached interface-address snapshot is reused.
+// localAddrTTL bounds how long a cached interface-address snapshot is reused by
+// the ACCEPT-time classification below.
 //
 // The snapshot exists so connection churn from a routable peer cannot force one
 // interface enumeration per connection. Refreshes are rate-limited to one per
 // TTL regardless of hit or miss, so a flood cannot amplify through it either.
 //
-// The staleness that admits is bounded and one-directional: for up to one TTL
-// after an address is ADDED to this host, a caller arriving from that brand-new
-// address is classified as off-box and may therefore present an api-auth
-// credential. It still cannot escape a class it holds — a local caller with a
-// class is only reachable through the socket table, which is not cached — and
-// the window is a second. Connections delivered on a loopback address never
-// consult this cache at all, so the default management posture is unaffected.
+// # What the staleness costs, stated correctly
+//
+// An earlier version of this comment argued the staleness was safe on its own.
+// IT IS NOT, and the direction it named was backwards. For up to one TTL after
+// an address is ADDED to this host, a caller arriving from that brand-new
+// address is classified as off-box — and "off-box" is precisely the row an
+// api-auth credential is allowed to speak for. Such a caller does not merely
+// lose its attribution: it SKIPS the socket-table read entirely (LookupPeer
+// short-circuits on !couldBeLocal before any table is consulted) and lands on
+// the credential row, which authorizes as a full-power principal. A local
+// account that watches `ip monitor address` — unprivileged — and connects from
+// a freshly added VRRP VIP, DHCP lease or RA-derived address inside that window
+// therefore escapes its login class through a shared secret. That is exactly
+// the escalation #5561 exists to prevent, not a residual of it.
+//
+// What actually makes the window harmless is NOT this cache. It is that the one
+// decision the "off-box" verdict feeds — whether a credential may speak for the
+// caller — is re-derived from an enumeration started at the moment of use, by
+// PeerCouldBeLocalNow below. With that in place a stale snapshot can cost a
+// local caller its ATTRIBUTION for at most one TTL (it is denied instead of
+// resolved to its class, an over-denial), and can never promote one to the
+// credential row.
+//
+// Connections delivered on a loopback address never consult this cache at all —
+// couldBeLocal short-circuits on the loopback clause — so the default
+// management posture is provably unaffected either way.
 const localAddrTTL = time.Second
 
 var localAddrCache struct {
@@ -150,6 +171,9 @@ var localAddrCache struct {
 // connection, exactly the amplification the cache exists to prevent. (The
 // comment claimed otherwise; the comment was wrong.)
 //
+// A NEGATIVE answer from here is therefore not authoritative; see localAddrTTL
+// for what that costs and PeerCouldBeLocalNow for the check that bounds it.
+//
 // A failure to enumerate interfaces answers true — fail closed, so an
 // unenumerable host does not classify a local caller as remote and hand it the
 // credential path.
@@ -164,7 +188,12 @@ func isLocalAddr(ip net.IP) bool {
 	if localAddrCache.err != nil {
 		return true
 	}
-	for _, a := range localAddrCache.addrs {
+	return addrsContain(localAddrCache.addrs, ip)
+}
+
+// addrsContain reports whether ip appears in an interface-address list.
+func addrsContain(addrs []net.Addr, ip net.IP) bool {
+	for _, a := range addrs {
 		switch v := a.(type) {
 		case *net.IPNet:
 			if v.IP.Equal(ip) {
@@ -186,6 +215,135 @@ func resetLocalAddrCacheForTest() {
 	defer localAddrCache.mu.Unlock()
 	localAddrCache.fetched = time.Time{}
 	localAddrCache.addrs, localAddrCache.err = nil, nil
+}
+
+// hostAddrScan is the single-flight scheduler for AUTHORITATIVE interface
+// enumerations — the ones whose answer may ADMIT a caller rather than deny one.
+//
+// It is deliberately NOT the localAddrTTL cache. That cache serves the
+// accept-time classification, where a stale answer costs at most an
+// attribution; this one serves the credential row, where a stale answer costs
+// the security property, so it never reuses an observation older than the call
+// that asked for it.
+//
+// The batching argument is socketscan.go's, applied to the address table for
+// the same reason: the waiter set is taken under the same lock it was appended
+// under, and the enumeration begins after that swap — so no caller is ever
+// answered from an observation older than its own arrival, and N concurrent
+// callers cost ONE enumeration rather than N.
+type hostAddrScanner struct {
+	mu      sync.Mutex
+	waiters []chan hostAddrs
+	running bool
+}
+
+// hostAddrs is one completed enumeration.
+type hostAddrs struct {
+	addrs []net.Addr
+	err   error
+}
+
+var hostAddrScan hostAddrScanner
+
+// hostAddrScans counts completed authoritative enumerations, so a test can
+// assert the COST property (N concurrent confirmations must not cost N
+// enumerations) rather than merely that the answer is fresh.
+var hostAddrScans atomic.Uint64
+
+// HostAddrScansForTest returns the number of authoritative interface
+// enumerations performed so far. Test-only; dep-free, so no test-only import
+// leaks into the production binary.
+func HostAddrScansForTest() uint64 { return hostAddrScans.Load() }
+
+// now returns an enumeration that STARTED after this call began.
+func (h *hostAddrScanner) now() hostAddrs {
+	ch := make(chan hostAddrs, 1)
+	h.mu.Lock()
+	h.waiters = append(h.waiters, ch)
+	if !h.running {
+		h.running = true
+		go h.run()
+	}
+	h.mu.Unlock()
+	return <-ch
+}
+
+// run drains batches until none are pending. Each iteration takes the whole
+// waiter set BEFORE enumerating, so every waiter in it arrived strictly before
+// that enumeration began.
+func (h *hostAddrScanner) run() {
+	for {
+		h.mu.Lock()
+		waiters := h.waiters
+		h.waiters = nil
+		if len(waiters) == 0 {
+			h.running = false
+			h.mu.Unlock()
+			return
+		}
+		h.mu.Unlock()
+
+		addrs, err := localAddrsFn()
+		hostAddrScans.Add(1)
+		snap := hostAddrs{addrs: addrs, err: err}
+		for _, ch := range waiters {
+			ch <- snap
+		}
+	}
+}
+
+// PeerCouldBeLocalNow re-derives couldBeLocal's verdict for an accepted
+// connection from an interface enumeration STARTED BY THIS CALL.
+//
+// # Why a second check exists at all
+//
+// LookupPeer classifies locality once, at accept, from a snapshot that lags an
+// address ADD by up to localAddrTTL. Every verdict it draws from that snapshot
+// DENIES except one: "not on this host", which is the sole row an api-auth
+// credential may speak for. A caller must therefore never be admitted through
+// that row on the strength of a cached observation — hence this call, which the
+// credential path makes at the moment the credential is about to be honored
+// (pkg/api's principal()).
+//
+// # Why it cannot itself become a bypass
+//
+// It is a ONE-WAY narrowing. LookupPeer already denied everything it classified
+// as local, so this check can only turn an admission into a denial; there is no
+// input for which it turns a denial into an admission. Its own failure modes —
+// an address pair we cannot classify, an unusable address list — answer true
+// (local, deny), so a broken enumeration costs availability, never authority.
+//
+// # Why re-checking here is sound when re-checking the SOCKET TABLE would not be
+//
+// The socket-table answer is caller-controlled: a caller can destroy its own
+// socket between accept and request (which is why LookupPeer resolves identity
+// at accept, not at request time). Host addresses are not caller-controlled —
+// adding or removing one needs CAP_NET_ADMIN, i.e. a principal that is already
+// authorized — so asking this question later cannot be gamed by the caller.
+//
+// # Cost
+//
+// Measured at ~32 µs per enumeration on a box carrying 14 addresses, against
+// 4.3-10.1 ms for one /proc/net/tcp read. It runs only for a request that
+// presented a VALID credential on a connection already classified off-box: a
+// caller with no credential — the flooding population — forces none at all, and
+// concurrent ones collapse into a single enumeration through hostAddrScan.
+func PeerCouldBeLocalNow(client, server net.Addr) bool {
+	ct, cok := client.(*net.TCPAddr)
+	st, sok := server.(*net.TCPAddr)
+	if !cok || !sok || ct.IP == nil || st.IP == nil {
+		// Not a shape we classify; LookupPeer reports every one of these as
+		// local already, so agree rather than admit.
+		return true
+	}
+	if loopbackDelivery(ct, st) {
+		return true
+	}
+	snap := hostAddrScan.now()
+	if snap.err != nil {
+		return true
+	}
+	return addrsContain(snap.addrs, ct.IP)
 }
 
 // PeerIdentity is what the kernel could tell us about the far end of an accepted
@@ -315,11 +473,22 @@ func LookupPeer(client, server net.Addr) PeerIdentity {
 // For a routable delivery address the answer falls back to "is the peer one of
 // OUR addresses", which is sound in the positive direction and admits the netns
 // residual documented in pkg/api/README.md in the negative one.
+//
+// The address fallback reads a CACHED snapshot, so its negative answer is not
+// authoritative — see localAddrTTL. PeerCouldBeLocalNow re-derives the same rule
+// from a fresh enumeration for the one caller that acts on the negative.
 func couldBeLocal(client, server *net.TCPAddr) bool {
-	if server.IP.IsLoopback() || client.IP.IsLoopback() {
+	if loopbackDelivery(client, server) {
 		return true
 	}
 	return isLocalAddr(client.IP)
+}
+
+// loopbackDelivery is the address-only half of couldBeLocal, factored out so the
+// cached classifier and the authoritative re-derivation cannot drift apart on
+// it. It depends on nothing that can go stale.
+func loopbackDelivery(client, server *net.TCPAddr) bool {
+	return server.IP.IsLoopback() || client.IP.IsLoopback()
 }
 
 // findPeerSocket looks for the row whose LOCAL address is the client and whose

@@ -100,7 +100,12 @@ identity, so it is a real boundary rather than an advisory one:
   this host (the remote administrator #4047 requires it for). Otherwise a
   restricted account that also knew the shared secret could escape its class,
   either by making its own identity unreadable or simply by not being in the
-  login model.
+  login model. That holds even for an address that appeared on this host a
+  moment ago — the "is this caller on our box" question is answered from a
+  cached snapshot for speed, but the answer that would let the credential speak
+  is re-derived from a fresh interface enumeration before it is acted on, so a
+  caller connecting from a just-added VRRP VIP or DHCP lease is still governed
+  by its class rather than by the shared secret.
 - Read-only endpoints, `/health` and `/metrics` are unaffected.
 
 ### Custom login classes (accept-with-advisory, #4304 S-2)

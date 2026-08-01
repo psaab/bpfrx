@@ -1,10 +1,13 @@
 package authz
 
 import (
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -602,5 +605,204 @@ func write(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// firstRoutableHostAddr returns a real, non-loopback IPv4 address of this host —
+// one a socket can actually be bound to, so a case can build a connection whose
+// BOTH ends are off-loopback and therefore reach the interface-address clause of
+// couldBeLocal instead of short-circuiting on the loopback one.
+func firstRoutableHostAddr(t *testing.T) net.IP {
+	t.Helper()
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Skipf("cannot enumerate interfaces: %v", err)
+	}
+	for _, a := range addrs {
+		n, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip := n.IP.To4()
+		if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+			continue
+		}
+		return ip
+	}
+	t.Skip("this host has no routable IPv4 address to build an off-loopback connection from")
+	return nil
+}
+
+// TestBrandNewLocalAddressIsNotOffBox_5561 is the round-5 MAJOR guard.
+//
+// The accept-time locality classification reads a snapshot refreshed at most
+// once per localAddrTTL, for hits AND misses. That rate limit is right for the
+// flood it exists to stop, but it caches a NEGATIVE answer — and the negative is
+// the one verdict that ADMITS: "not on this host" is the only row an api-auth
+// credential may speak for, and LookupPeer returns it without reading the socket
+// table at all. So for up to one TTL after an address is added to this host, a
+// caller arriving from that address is adjudicated through a shared secret
+// instead of through its login class. Address adds are observable to any local
+// account (`ip monitor address` needs no privilege) and this box adds them
+// routinely — VRRP VIPs on failover, DHCP leases, RA-derived addresses.
+//
+// The window is real and is asserted here as a PRECONDITION. What must not
+// happen is acting on it: PeerCouldBeLocalNow re-derives the same rule from an
+// enumeration started by the call, and the credential row consults that instead.
+func TestBrandNewLocalAddressIsNotOffBox_5561(t *testing.T) {
+	t.Run("real socket on a real host address", func(t *testing.T) {
+		host := firstRoutableHostAddr(t)
+		// Both ends off-loopback, so couldBeLocal cannot short-circuit and the
+		// verdict really does come from the interface-address snapshot.
+		server, _ := acceptedPair(t, "tcp4", (&net.TCPAddr{IP: host}).String(),
+			&net.TCPAddr{IP: host})
+		client := server.RemoteAddr().(*net.TCPAddr)
+		local := server.LocalAddr().(*net.TCPAddr)
+
+		// This caller is unambiguously ON THIS HOST: the kernel is holding its
+		// established socket and reports this process's own uid for it.
+		uid, state, found, err := findPeerSocket(client, local)
+		if err != nil || !found || state != tcpEstablished {
+			t.Fatalf("precondition: the live socket %v -> %v was not found "+
+				"(found=%v state=%d err=%v)", client, local, found, state, err)
+		}
+		if uid != uint32(os.Getuid()) {
+			t.Fatalf("precondition: live socket reported uid %d, want %d", uid, os.Getuid())
+		}
+
+		// Seed the accept-time snapshot from a moment BEFORE the address existed
+		// — the state the cache is in for up to a TTL after any address add.
+		prev := localAddrsFn
+		localAddrsFn = func() ([]net.Addr, error) { return nil, nil }
+		resetLocalAddrCacheForTest()
+		if isLocalAddr(host) {
+			t.Fatal("could not seed a pre-add snapshot")
+		}
+		// The address is now on the host (it always was — the seeded snapshot is
+		// what lagged). Restore the real enumerator WITHOUT clearing the cache,
+		// which is exactly the state a real address add leaves behind.
+		localAddrsFn = prev
+		t.Cleanup(resetLocalAddrCacheForTest)
+
+		if id := LookupPeer(client, local); id.Local || id.OK {
+			t.Fatalf("precondition: the stale-snapshot window did not reproduce (%+v); "+
+				"this case is then asserting nothing", id)
+		}
+		if !PeerCouldBeLocalNow(client, local) {
+			t.Fatalf("a caller whose ESTABLISHED socket this kernel is holding, from an " +
+				"address assigned to this very host, was confirmed OFF-BOX — the api-auth " +
+				"credential would then speak for it, so any local account that connects " +
+				"from a freshly added VIP or DHCP address escapes its login class")
+		}
+	})
+
+	t.Run("deterministic, no routable address required", func(t *testing.T) {
+		client := &net.TCPAddr{IP: net.IPv4(203, 0, 113, 5), Port: 51234}
+		local := &net.TCPAddr{IP: net.IPv4(198, 51, 100, 1), Port: 8080}
+
+		prev := localAddrsFn
+		localAddrsFn = func() ([]net.Addr, error) { return nil, nil } // pre-add snapshot
+		resetLocalAddrCacheForTest()
+		if isLocalAddr(client.IP) {
+			t.Fatal("could not seed a pre-add snapshot")
+		}
+		// The address is added to the host. The cache does not know yet.
+		localAddrsFn = func() ([]net.Addr, error) {
+			return []net.Addr{&net.IPNet{IP: client.IP, Mask: net.CIDRMask(24, 32)}}, nil
+		}
+		t.Cleanup(func() { localAddrsFn = prev; resetLocalAddrCacheForTest() })
+
+		if id := LookupPeer(client, local); id.Local {
+			// Precondition only: the stale snapshot must still be in force.
+			t.Fatalf("precondition: the cache refreshed early (%+v)", id)
+		}
+		if !PeerCouldBeLocalNow(client, local) {
+			t.Fatal("an address that IS on this host was confirmed off-box from a stale " +
+				"snapshot — the confirmation is reading the cache, not the host")
+		}
+	})
+}
+
+// TestConfirmationFailsClosed_5561 pins the direction of every failure mode of
+// the authoritative re-check. It may only ever DENY: an unusable address list or
+// a shape it cannot classify must answer "local", because the single caller of
+// this function treats false as permission to honour a shared secret.
+func TestConfirmationFailsClosed_5561(t *testing.T) {
+	tcp := &net.TCPAddr{IP: net.IPv4(203, 0, 113, 5), Port: 51234}
+	srv := &net.TCPAddr{IP: net.IPv4(198, 51, 100, 1), Port: 8080}
+
+	prev := localAddrsFn
+	localAddrsFn = func() ([]net.Addr, error) { return nil, errors.New("interfaces unreadable") }
+	t.Cleanup(func() { localAddrsFn = prev; resetLocalAddrCacheForTest() })
+	if !PeerCouldBeLocalNow(tcp, srv) {
+		t.Error("an unreadable interface list confirmed the caller OFF-BOX — an enumeration " +
+			"failure must cost availability, never authority")
+	}
+
+	localAddrsFn = func() ([]net.Addr, error) { return nil, nil }
+	for _, tc := range []struct {
+		name           string
+		client, server net.Addr
+	}{
+		{"non-TCP client", &net.UnixAddr{Name: "/run/xpf.sock", Net: "unix"}, srv},
+		{"non-TCP server", tcp, &net.UnixAddr{Name: "/run/xpf.sock", Net: "unix"}},
+		{"client has no address", &net.TCPAddr{Port: 1}, srv},
+		{"server has no address", tcp, &net.TCPAddr{Port: 8080}},
+		{"loopback client", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}, srv},
+		{"loopback delivery", tcp, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8080}},
+	} {
+		if !PeerCouldBeLocalNow(tc.client, tc.server) {
+			t.Errorf("%s: confirmed OFF-BOX; LookupPeer reports every one of these as "+
+				"local, so the confirmation must agree rather than admit", tc.name)
+		}
+	}
+}
+
+// TestConfirmationIsSingleFlighted_5561 is the cost half of the round-5 fix, and
+// the reason the confirmation could be made authoritative at all.
+//
+// A fresh enumeration per caller would be the amplification
+// TestLocalAddrCacheRateLimitsMisses_5561 exists to forbid, just moved. The
+// confirmation batches like socketscan.go instead: the waiter set is taken
+// before the enumeration starts, so N concurrent confirmations cost ONE
+// enumeration while still answering every one of them from an observation newer
+// than its own arrival.
+func TestConfirmationIsSingleFlighted_5561(t *testing.T) {
+	const callers = 200
+
+	ours := net.IPv4(10, 0, 61, 1)
+	prev := localAddrsFn
+	localAddrsFn = func() ([]net.Addr, error) {
+		time.Sleep(5 * time.Millisecond) // long enough for the batch to fill
+		return []net.Addr{&net.IPNet{IP: ours, Mask: net.CIDRMask(24, 32)}}, nil
+	}
+	t.Cleanup(func() { localAddrsFn = prev; resetLocalAddrCacheForTest() })
+
+	srv := &net.TCPAddr{IP: net.IPv4(198, 51, 100, 1), Port: 8080}
+	before := HostAddrScansForTest()
+	var wg sync.WaitGroup
+	var wrong atomic.Uint64
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// A foreign address must confirm off-box, ours must confirm local —
+			// batching may not blur one caller's answer into another's.
+			if PeerCouldBeLocalNow(&net.TCPAddr{IP: net.IPv4(198, 51, 100, 7), Port: 1}, srv) {
+				wrong.Add(1)
+			}
+			if !PeerCouldBeLocalNow(&net.TCPAddr{IP: ours, Port: 2}, srv) {
+				wrong.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if n := wrong.Load(); n != 0 {
+		t.Fatalf("%d of %d batched confirmations answered the wrong caller", n, 2*callers)
+	}
+	if scans := HostAddrScansForTest() - before; scans > callers/4 {
+		t.Fatalf("%d concurrent confirmations drove %d interface enumerations — the "+
+			"confirmation is not batched, so it reintroduces the per-connection "+
+			"amplification the accept-time cache exists to prevent", 2*callers, scans)
 	}
 }

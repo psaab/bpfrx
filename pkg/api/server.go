@@ -113,15 +113,26 @@ type Config struct {
 	// and the REST gate is covered end-to-end with no injection at all by
 	// TestProductionServerEnforcesRealPeerIdentity_5561.
 	PeerLookupFn func(client, server net.Addr) authz.PeerIdentity
-	Store        *configstore.Store
-	DP           apiRuntimeDataPlane
-	EventBuf     *logging.EventBuffer
-	GC           *conntrack.GC
-	Routing      *routing.Manager
-	FRR          *frr.Manager
-	IPsec        *ipsec.Manager
-	DHCP         *dhcp.Manager
-	VRRPMgr      *vrrp.Manager // native VRRP manager
+	// PeerLocalityFn re-derives, at the moment an api-auth credential is about
+	// to speak for a caller, whether that caller is on THIS host (#5561). nil
+	// defaults to authz.PeerCouldBeLocalNow, a fresh interface enumeration.
+	//
+	// It is a second seam rather than a re-use of PeerLookupFn because the two
+	// answer different questions at different moments: PeerLookupFn is the
+	// accept-time identity, this is the authoritative locality re-check the
+	// credential row performs. A test that fabricates an off-box peer over a
+	// real LOOPBACK listener must state that premise here too — the production
+	// re-check would otherwise, correctly, call 127.0.0.1 one of ours and deny.
+	PeerLocalityFn func(client, server net.Addr) bool
+	Store          *configstore.Store
+	DP             apiRuntimeDataPlane
+	EventBuf       *logging.EventBuffer
+	GC             *conntrack.GC
+	Routing        *routing.Manager
+	FRR            *frr.Manager
+	IPsec          *ipsec.Manager
+	DHCP           *dhcp.Manager
+	VRRPMgr        *vrrp.Manager // native VRRP manager
 	// #846: atomic commit+apply callbacks. The daemon holds its
 	// apply semaphore across configstore.Commit and applyConfig, so
 	// two concurrent committers can't interleave their commit→apply
@@ -336,7 +347,10 @@ type Server struct {
 	// binding real ports.
 	listen func(network, address string) (net.Listener, error)
 	// peerLookupFn is Config.PeerLookupFn; nil means authz.LookupPeer (#5561).
-	peerLookupFn                     func(client, server net.Addr) authz.PeerIdentity
+	peerLookupFn func(client, server net.Addr) authz.PeerIdentity
+	// peerLocalityFn is Config.PeerLocalityFn; nil means
+	// authz.PeerCouldBeLocalNow (#5561).
+	peerLocalityFn                   func(client, server net.Addr) bool
 	store                            *configstore.Store
 	dp                               apiRuntimeDataPlane
 	eventBuf                         *logging.EventBuffer
@@ -469,8 +483,11 @@ func NewServer(cfg Config) *Server {
 		s.listen = net.Listen
 	}
 	// #5561: the peer-identity resolver behind the authorization gate. nil
-	// means the real kernel socket-table lookup (authz.LookupPeer).
+	// means the real kernel socket-table lookup (authz.LookupPeer), and nil
+	// PeerLocalityFn means the real fresh enumeration
+	// (authz.PeerCouldBeLocalNow) the credential row re-derives locality with.
 	s.peerLookupFn = cfg.PeerLookupFn
+	s.peerLocalityFn = cfg.PeerLocalityFn
 
 	mux := http.NewServeMux()
 

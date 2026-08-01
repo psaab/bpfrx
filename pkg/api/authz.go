@@ -111,10 +111,15 @@ const peerLookupTimeout = 5 * time.Second
 
 // pendingPeer is a connection's peer identity, resolved once, asynchronously,
 // starting at accept.
+//
+// client and server are the connection's own addresses, kept because
+// http.Request exposes RemoteAddr only as a string and no local address at all —
+// and the credential row has to re-derive locality from them (see principal()).
 type pendingPeer struct {
-	done     chan struct{}
-	deadline time.Time
-	id       authz.PeerIdentity
+	done           chan struct{}
+	deadline       time.Time
+	client, server net.Addr
+	id             authz.PeerIdentity
 }
 
 // wait blocks until the lookup finishes, the request context is cancelled, or
@@ -169,12 +174,28 @@ func (p *pendingPeer) wait(ctx context.Context) (authz.PeerIdentity, bool) {
 // cannot be local, so the churn that motivates this is cheap on both counts.
 func (s *Server) connContext(ctx context.Context, c net.Conn) context.Context {
 	client, server := c.RemoteAddr(), c.LocalAddr()
-	p := &pendingPeer{done: make(chan struct{}), deadline: time.Now().Add(peerLookupTimeout)}
+	p := &pendingPeer{
+		done:     make(chan struct{}),
+		deadline: time.Now().Add(peerLookupTimeout),
+		client:   client,
+		server:   server,
+	}
 	go func() {
 		defer close(p.done)
 		p.id = s.lookupPeer(client, server)
 	}()
 	return context.WithValue(ctx, peerIdentityKey{}, p)
+}
+
+// peerIsLocalNow re-derives the caller's locality at the moment a credential is
+// about to speak for it — see principal(). Config.PeerLocalityFn overrides the
+// kernel-backed answer so a test can state an off-box premise its real loopback
+// listener contradicts; production leaves it nil.
+func (s *Server) peerIsLocalNow(p *pendingPeer) bool {
+	if fn := s.peerLocalityFn; fn != nil {
+		return fn(p.client, p.server)
+	}
+	return authz.PeerCouldBeLocalNow(p.client, p.server)
 }
 
 // lookupPeer resolves the peer identity through the injected resolver
@@ -246,6 +267,16 @@ func (s *Server) activeConfig() *config.Config {
 //     off-loopback bind).
 //
 // Rows 1-3 collapse to: a local caller never reaches s.credential.
+//
+// Row 4 carries one more obligation, because it is the only row that ADMITS on
+// the strength of a negative. The accept-time verdict "not on this host" is
+// drawn from a cached interface-address snapshot that lags an address ADD by up
+// to authz's localAddrTTL, so a caller connecting from an address added to this
+// host within the last second reaches row 4 while genuinely being local. The row
+// therefore re-derives locality from a fresh enumeration before honoring the
+// credential (peerIsLocalNow). That re-derivation can only move a caller from
+// row 4 to a denial — never the other way — so it closes the window without
+// widening anything.
 func (s *Server) principal(r *http.Request) authz.Principal {
 	pending, ok := peerIdentityFrom(r.Context())
 	if !ok {
@@ -269,7 +300,18 @@ func (s *Server) principal(r *http.Request) authz.Principal {
 		return authz.Unauthenticated("caller is local but could not be identified: " + id.Detail)
 	}
 	if cp, ok := s.credential(r); ok {
-		return cp // (4)
+		// (4), but only once the off-box verdict is confirmed against an
+		// enumeration started by THIS request. The verdict that got us here was
+		// cached at accept and lags an address add; a caller that is in fact on
+		// this host must be denied even holding a valid credential, which is the
+		// precedence rule this function states. Deliberately AFTER the credential
+		// check: a caller presenting none — the flooding population — must not be
+		// able to drive an enumeration.
+		if s.peerIsLocalNow(pending) {
+			return authz.Unauthenticated("caller is local but could not be identified: " +
+				"peer address is assigned to this host, so an api-auth credential may not speak for it")
+		}
+		return cp
 	}
 	return authz.Unauthenticated(id.Detail)
 }
