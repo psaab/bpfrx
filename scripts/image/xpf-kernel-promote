@@ -498,7 +498,8 @@ try_candidate() {
 #
 # Verified honoured by /bin/sh, dash and busybox sh. `readlink -f` is a fallback
 # so a shell without `-ef` degrades to canonical-path equality rather than to a
-# false refusal. Both callers pass paths that have already passed `usable`.
+# false refusal. Both ARGUMENTS are paths that have already passed `usable`
+# (there is exactly one caller, and a test asserts that).
 same_file() {
     [ "$1" = "$2" ] && return 0
     if [ "$1" -ef "$2" ] 2>/dev/null; then
