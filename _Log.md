@@ -65826,3 +65826,31 @@ break — `go vet` confirmed passing under every revert.
   pkg/daemon/userspace_sync_session_id_6198_test.go, pkg/dataplane/types.go,
   pkg/cluster/README.md, docs/session-sync-architecture.md,
   docs/sync-protocol.md, _Log.md
+
+- **Timestamp**: 2026-08-01 05:10
+- **Action**: #6198 review fold (MERGE-NEEDS-MINOR, four minors). (1) Seed the
+  synced-session id counter from the boot clock
+  (`userspaceSyncedSessionIDSeed`, `monotonic_seconds << 24` masked to 48 bits)
+  — an unseeded counter re-minted 1,2,3… after an xpfd restart and collided
+  with entries the peer's mirror still held from the previous incarnation, a
+  narrow axis on which the old `now<<16|Slot` was actually BETTER (CLOCK_MONOTONIC
+  keeps increasing across a daemon restart). Seeding closes the residual instead
+  of documenting it. (2) `pkg/dataplane/types.go` asserted the opposite of this
+  PR's thesis on BOTH `SessionValue` and `SessionValueV6` — "unique ID, same on
+  both cluster nodes" 87 lines above a comment calling the id node-local;
+  replaced with the node-local semantics. (3) Same false claim was the
+  operator-facing gRPC contract (`proto/xpf/v1/xpf.proto` `session_id`);
+  corrected and REGENERATED `xpf.pb.go` via `make proto` (diff ignoring
+  whitespace is the comment only — the protobuf tag is byte-identical, no wire
+  impact). (4) The `0xFFFF<<48` reservation was documented only on the Go side,
+  which does not have to obey it; recorded it on `SessionTable::set_worker_id`
+  and in `userspace-dp/src/session/README.md`, where a future minter (e.g.
+  #6311, which proposes re-partitioning those high bits) would look. Also took
+  the reviewer's NIT: the id is distinct per CONVERSION, not stable per session
+  (bulk resync re-stamps; the close branch burns one) — now stated in the code
+  comment and the architecture doc rather than implied otherwise.
+- **File(s)**: pkg/daemon/daemon_ha_userspace_convert.go,
+  pkg/daemon/userspace_sync_session_id_6198_test.go, pkg/dataplane/types.go,
+  proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  userspace-dp/src/session/mod.rs, userspace-dp/src/session/README.md,
+  docs/session-sync-architecture.md, _Log.md

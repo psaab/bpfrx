@@ -160,6 +160,59 @@ func TestUserspaceSyncedSessionIDNamespaceDisjointFromDataplane6198(t *testing.T
 	}
 }
 
+// TestUserspaceSyncedSessionIDSeedSurvivesRestart6198 pins the cross-restart
+// anti-reuse property.
+//
+// An unseeded counter would re-mint 1, 2, 3… after an xpfd restart and collide
+// with entries the peer's mirror still holds from the previous incarnation. The
+// old now<<16|Slot composition did NOT have that flaw (CLOCK_MONOTONIC keeps
+// increasing across a daemon restart), so seeding is what keeps this change a
+// strict improvement rather than a trade.
+func TestUserspaceSyncedSessionIDSeedSurvivesRestart6198(t *testing.T) {
+	// Two incarnations one second of uptime apart.
+	const uptime = uint64(1_000_000) // ~11.6 days, well inside the 48-bit space
+	seedA := userspaceSyncedSessionIDSeed(uptime)
+	seedB := userspaceSyncedSessionIDSeed(uptime + 1)
+
+	gap := seedB - seedA
+	if want := uint64(1) << userspaceSyncedSessionIDSeedShift; gap != want {
+		t.Fatalf("one second of uptime advances the seed by %d, want %d", gap, want)
+	}
+
+	// Incarnation A must not reach incarnation B's seed. The bound is A's average
+	// mint rate; 1M conversions/second is already far above what the dataplane can
+	// produce (MAX_SESSIONS is 10M in total).
+	const mintedInThatSecond = uint64(1) << 20
+	if seedA+mintedInThatSecond >= seedB {
+		t.Fatalf("incarnation A minting %d ids/s reaches incarnation B's seed "+
+			"(%#x + %d >= %#x) — ids would repeat across a restart",
+			mintedInThatSecond, seedA, mintedInThatSecond, seedB)
+	}
+
+	// The seed must stay inside the counter space so it can never bleed into the
+	// namespace bits.
+	if seedB&^userspaceSyncedSessionIDCounterMask != 0 {
+		t.Fatalf("seed %#x escapes the 48-bit counter mask", seedB)
+	}
+}
+
+// TestUserspaceSyncedSessionIDIsSeededFromBootClock6198 pins that the allocator
+// actually APPLIES the seed — the property above is worthless if
+// nextUserspaceSyncedSessionID never calls it. An unseeded counter would still be
+// in the low thousands after a whole test binary's worth of mints; a seeded one
+// starts at least one second of uptime (2^24) above zero.
+func TestUserspaceSyncedSessionIDIsSeededFromBootClock6198(t *testing.T) {
+	if daemonMonotonicSeconds() == 0 {
+		t.Skip("system uptime < 1s: the boot-clock seed is 0 and carries no signal")
+	}
+	counter := nextUserspaceSyncedSessionID() &^ userspaceSyncedSessionIDNamespace
+	if floor := uint64(1) << userspaceSyncedSessionIDSeedShift; counter < floor {
+		t.Fatalf("counter %d is below one second of seeded space (%d) — the "+
+			"allocator is not seeded from the boot clock, so ids repeat across a restart",
+			counter, floor)
+	}
+}
+
 // TestUserspaceForwardWireAliasSharesBaseSessionID6198 pins that the
 // fabric-redirect forward-wire alias entry carries the SAME SessionID as its
 // base entry: they are two conntrack keys for ONE logical session. Re-converting

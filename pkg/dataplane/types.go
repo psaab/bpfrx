@@ -24,7 +24,14 @@ type SessionValue struct {
 	IsReverse  uint8
 	AppTimeout uint32 // per-application inactivity timeout (seconds), 0=use default
 
-	SessionID uint64 // unique ID, same on both cluster nodes
+	// SessionID is the NODE-LOCAL conntrack id. It is a display/correlation
+	// value, never a lookup key — forwarding, installs, and deletes are all
+	// 5-tuple keyed. In userspace mode the control plane mints it per converted
+	// HA-synced session (nextUserspaceSyncedSessionID, #6198); the helper stamps
+	// its own dataplane id for sessions it owns (#4915). The two nodes do NOT
+	// agree on it: the cross-node correlatable id is RTFlowSessionID below.
+	// See "Node-Local BPF-ABI Session Id" in docs/session-sync-architecture.md.
+	SessionID uint64
 
 	Created  uint64
 	LastSeen uint64
@@ -148,7 +155,14 @@ type SessionValueV6 struct {
 	IsReverse  uint8
 	AppTimeout uint32 // per-application inactivity timeout (seconds), 0=use default
 
-	SessionID uint64 // unique ID, same on both cluster nodes
+	// SessionID is the NODE-LOCAL conntrack id. It is a display/correlation
+	// value, never a lookup key — forwarding, installs, and deletes are all
+	// 5-tuple keyed. In userspace mode the control plane mints it per converted
+	// HA-synced session (nextUserspaceSyncedSessionID, #6198); the helper stamps
+	// its own dataplane id for sessions it owns (#4915). The two nodes do NOT
+	// agree on it: the cross-node correlatable id is RTFlowSessionID below.
+	// See "Node-Local BPF-ABI Session Id" in docs/session-sync-architecture.md.
+	SessionID uint64
 
 	Created  uint64
 	LastSeen uint64

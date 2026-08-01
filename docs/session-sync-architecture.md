@@ -418,9 +418,33 @@ Until #6198 the userspace converters synthesized it as
 a reserved namespace: `0xFFFF << 48 | counter48`. The namespace keeps the
 control-plane-minted ids disjoint from the dataplane ids the helper stamps into
 the same mirror field (`(worker_id & 0xFFFF) << 48 | counter48`, worker ids being
-tiny queue indices), so the two writers can never alias. The counter never
+tiny queue indices), so the two writers can never alias. That reservation is a
+cross-language invariant: it is recorded on the Rust side too, at
+`SessionTable::set_worker_id` and in `userspace-dp/src/session/README.md`, since
+that is the allocator which has to stay out of `0xFFFF`. The counter never
 returns `0` — that is the established "unknown id" sentinel that makes
 `flowSessionDisplayID` fall back to the per-row ordinal.
+
+The counter is **seeded from the boot clock** on first use
+(`userspaceSyncedSessionIDSeed`, `monotonic_seconds << 24` masked to 48 bits).
+Without a seed, an xpfd restart would re-mint `1, 2, 3…` and collide with entries
+the peer's mirror still holds from the previous incarnation — sessions this node
+closed while it was down, whose keys the post-restart bulk re-export never
+overwrites. The old `now<<16|Slot` composition did not have that flaw, because
+CLOCK_MONOTONIC is system uptime and keeps increasing across a daemon restart, so
+seeding is what keeps the change a strict improvement rather than a trade. Each
+second of uptime claims 2^24 ≈ 16.7M ids, so a restarting incarnation starts above
+its predecessor's high-water mark unless that predecessor averaged more than
+~16.7M synced conversions per second — orders of magnitude beyond the dataplane
+(`MAX_SESSIONS` is 10M in total). The seed wraps after ~194 days of uptime, which
+can only alias ids that old.
+
+The id is distinct per **conversion**, not stable per session. A bulk resync
+re-converts live sessions and re-stamps them with fresh ids, and the `close`
+branch of `queueUserspaceSessionDeltas` converts purely to derive the key and
+discards the id it mints. Both are harmless in a 48-bit space, and the old
+composition churned the id the same way — what changed is that concurrent
+sessions no longer *share* one.
 
 The fabric-redirect forward-wire alias entry (`userspaceForwardWireAliasV4/V6`)
 takes the ALREADY-CONVERTED base session rather than re-converting the delta, so

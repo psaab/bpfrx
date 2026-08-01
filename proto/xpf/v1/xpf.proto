@@ -411,7 +411,9 @@ message SessionEntry {
   int64 idle_seconds = 19;
   string application = 20;        // resolved application name
   string policy_name = 21;        // resolved policy name
-  uint64 session_id = 22;         // unique session ID (same on both cluster nodes)
+  // Node-local dataplane session id: a display/correlation value, NOT a key,
+  // and NOT the same on both cluster nodes (#6198).
+  uint64 session_id = 22;
   string ingress_interface = 23;  // Junos-style interface name for ingress zone
   string egress_interface = 24;   // Junos-style interface name for egress zone
   string nat_src_addr = 25;       // SNAT translated source address

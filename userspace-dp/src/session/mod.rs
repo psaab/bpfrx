@@ -770,6 +770,17 @@ impl SessionTable {
     /// per-worker monotonic counter. A worker id >= 2^16 is clamped into range
     /// (never happens — a queue index is tiny) so the shift cannot alias the
     /// counter bits.
+    ///
+    /// **RESERVED: worker id `0xFFFF` belongs to the Go control plane (#6198).**
+    /// Both allocators write into the SAME BPF conntrack mirror field: this table
+    /// stamps `session_id` for sessions the helper owns, and
+    /// `nextUserspaceSyncedSessionID` (pkg/daemon/daemon_ha_userspace_convert.go)
+    /// mints `0xFFFF << 48 | counter48` for a peer-synced session the daemon
+    /// installs. Keeping `0xFFFF` out of this half is what makes the two id
+    /// spaces disjoint. It is unreachable today — `binding.worker_id` is bounded
+    /// by the worker count (`replan_bindings_from_candidates`) — but anything
+    /// that re-partitions these high bits (e.g. #6311's proposal to steal a bit
+    /// from the worker field) must preserve the reservation.
     pub fn set_worker_id(&mut self, worker_id: u32) {
         self.session_id_worker_hi = ((worker_id as u64) & 0xFFFF) << 48;
     }

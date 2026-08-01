@@ -3,6 +3,7 @@ package daemon
 import (
 	"encoding/binary"
 	"net"
+	"sync"
 	"sync/atomic"
 
 	"golang.org/x/sys/unix"
@@ -52,9 +53,41 @@ const userspaceSyncedSessionIDNamespace = uint64(0xFFFF) << 48
 // that namespace — the same width the dataplane allocator uses.
 const userspaceSyncedSessionIDCounterMask = uint64(0x0000_FFFF_FFFF_FFFF)
 
+// userspaceSyncedSessionIDSeedShift is how far the boot clock is shifted to seed
+// the counter, i.e. how much counter space each SECOND of system uptime claims:
+// 2^24 ≈ 16.7M ids.
+const userspaceSyncedSessionIDSeedShift = 24
+
+// userspaceSyncedSessionIDSeed returns the counter value a daemon incarnation
+// starts from, given the system uptime in seconds at which it began.
+//
+// A bare counter starting at 0 would make ids REPEAT across an xpfd restart: the
+// new incarnation re-mints 1, 2, 3… while entries the peer's conntrack mirror
+// still holds from the previous incarnation (sessions this node closed while it
+// was down, whose keys the post-restart bulk re-export never overwrites) carry
+// exactly those values. The old now<<16|Slot composition did NOT have that flaw,
+// because CLOCK_MONOTONIC is system uptime and keeps increasing across a daemon
+// restart — so seeding is what keeps this change a strict improvement rather than
+// a trade.
+//
+// Seeding from the same boot clock restores the property. Each second of uptime
+// advances the seed by 2^24, so a restarting incarnation starts above its
+// predecessor's high-water mark unless that predecessor averaged more than ~16.7M
+// synced-session conversions PER SECOND — orders of magnitude above what the
+// dataplane can produce (MAX_SESSIONS is 10M in total). The mask bounds the seed
+// to the 48-bit counter space; it wraps after 2^24 seconds (~194 days) of uptime,
+// and a wrap can only alias ids minted ~194 days earlier, long since aged out of
+// any mirror.
+func userspaceSyncedSessionIDSeed(monotonicSeconds uint64) uint64 {
+	return (monotonicSeconds << userspaceSyncedSessionIDSeedShift) & userspaceSyncedSessionIDCounterMask
+}
+
 // userspaceSyncedSessionIDs is the node-local monotonic allocator behind
-// nextUserspaceSyncedSessionID.
-var userspaceSyncedSessionIDs atomic.Uint64
+// nextUserspaceSyncedSessionID, seeded from the boot clock on first use.
+var (
+	userspaceSyncedSessionIDs    atomic.Uint64
+	userspaceSyncedSessionIDOnce sync.Once
+)
 
 // nextUserspaceSyncedSessionID mints the node-local BPF-ABI SessionID stamped on
 // a session converted from a userspace-helper delta (#6198).
@@ -67,18 +100,30 @@ var userspaceSyncedSessionIDs atomic.Uint64
 // (`decodeSessionEvent` in pkg/dataplane/userspace/eventstream.go leaves it 0).
 // Every session converted within the same monotonic SECOND therefore collapsed
 // onto ONE id, conflating unrelated flows in `show security flow session` and in
-// the REST/gRPC session views. A monotonic counter gives every converted session
-// a distinct id for the lifetime of the daemon.
+// the REST/gRPC session views. A monotonic counter gives every CONVERSION a
+// distinct id — see the per-conversion note below.
 //
-// The counter is masked to 48 bits and never returns 0 (`0` is the established
+// The counter is seeded from the boot clock on first use
+// (userspaceSyncedSessionIDSeed) so ids do not repeat across an xpfd restart
+// either. It is masked to 48 bits and never returns 0 (`0` is the established
 // "no id / unknown" sentinel that makes `flowSessionDisplayID` fall back to the
 // per-row ordinal), so even the unreachable wrap case stays well-formed rather
 // than aliasing the namespace bits or emitting the sentinel.
+//
+// The id is per CONVERSION, not stable per session: a bulk resync re-converts
+// live sessions and re-stamps them with fresh ids, and the `close` branch of
+// queueUserspaceSessionDeltas converts purely to derive the key and discards the
+// id it mints. Both are harmless in a 48-bit space, and the old composition
+// churned the id the same way — what changed is that concurrent sessions no
+// longer SHARE one.
 //
 // This id stays NODE-LOCAL by design: the cross-node correlatable id is the
 // separate RTFlowSessionID (#5212), which rides its own wire field and is
 // adopted verbatim by the peer helper. See docs/session-sync-architecture.md.
 func nextUserspaceSyncedSessionID() uint64 {
+	userspaceSyncedSessionIDOnce.Do(func() {
+		userspaceSyncedSessionIDs.Store(userspaceSyncedSessionIDSeed(daemonMonotonicSeconds()))
+	})
 	counter := userspaceSyncedSessionIDs.Add(1) & userspaceSyncedSessionIDCounterMask
 	if counter == 0 {
 		counter = 1
