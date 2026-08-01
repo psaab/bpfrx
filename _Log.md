@@ -1,3 +1,56 @@
+## 2026-08-01 — #5619 PR1 round 3: bare `bind-interface st0` regression (MAJOR-1/2/3)
+
+- **Timestamp**: 2026-08-01 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Hostile re-gate found the round-1 fix REGRESSED the bare
+  `bind-interface st0` spelling — the same defect it fixed, in the opposite
+  direction.
+
+  `snapshotLinuxName` synthesized `fmt.Sprintf("%s.%d", ifName, unit.Number)`,
+  but the reconciler creates `LinuxIfName(bind-interface)` VERBATIM and those
+  are equal only for the dotted spelling. pkg/routing/xfrm.go:87-89 states it
+  outright: a bare "st0" and an explicit "st0.0" derive the SAME if_id under
+  DIFFERENT device names. Measured: with `bind-interface st0` the device is
+  `st0`; PRE-round-1 snapshotLinuxName returned "st0" (correct), POST-round-1 it
+  returned "st0.0" (a name on no box).
+
+  Fix: resolve from the AUTHORED bind-interface via a new
+  `Config.SecureTunnelNetdevForRef`, joining on if_id — XFRMIfNameAndID is the
+  SSOT for both halves. Reconstructing a name another component owns is what
+  caused the original drift; the round-1 fix repeated it one level down.
+  `ResolveKernelIfName` had the SAME bug and now shares the helper, so the
+  parity guard stays meaningful instead of pinning two identically-wrong
+  resolvers. Deterministic under an if_id collision (lexicographically smallest
+  device), for the tolerant-load path.
+
+  Tests were keyholes: every case was dotted and the expected device was
+  hardcoded. Now table-driven over bare `st0`, dotted `st0.0`, multi-digit
+  `st10.5` and non-zero unit `st0.7`, with the expected device DERIVED from
+  XFRMIfNameAndID so a reconstruction bug cannot be mirrored by the test.
+
+  MAJOR-2 measured rather than argued. The "identical before and after" claim
+  was too broad and is withdrawn; what holds is the ADJUDICATION boundary.
+  Deltas, measured by resolving/not-resolving the unit through the
+  buildLinkSnapshot seam:
+    - buildLocalAddressEntries 2 -> 3: the CONFIGURED address was already
+      present pre-fix (unit rows merge configured addrs regardless of the live
+      lookup), so the delta is live-ONLY addresses (the xfrmi link-local).
+      Correct — those are genuinely firewall-local.
+    - connected-route FIB: prefixes IDENTICAL; only ifindex/MTU fields change.
+    - BuildZoneHostInboundViews: gains the live-only address in the deny scope
+      — CLOSES scope rather than opening it.
+    - AddresslessEnforcingInterfaces: no change.
+    - MonitoredInterfaceLinkIndexes / buildNeighborSnapshots: not exercisable
+      through the seam (they call netlink.LinkByName against the real kernel).
+      By inspection the tunnel link becomes monitored, which is correct — and
+      notably the bare-st0 regression would have REMOVED monitoring that
+      previously worked.
+    - UserspaceBoundLinuxInterfaces: [ge-0-0-0 st0] -> [ge-0-0-0]. Correct: it
+      is keyed by NAME with no ifindex guard, so it had been listing a device
+      that does not exist for the dotted spelling.
+- **File(s)**: pkg/config/xfrmi.go, pkg/config/types.go,
+  pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go, _Log.md
+
 ## 2026-08-01 — #5619 PR1 round 2: prove the exclusion changes nothing
 
 - **Timestamp**: 2026-08-01 (fix/5619-ipsec-passthrough-zone-policy)

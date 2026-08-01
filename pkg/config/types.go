@@ -181,11 +181,22 @@ func (c *Config) ResolveKernelIfName(ref string) string {
 		return LinuxIfName(base)
 	}
 
-	// XFRM (st<N>) is verbatim — kernel device is the full ref.
-	// #5619: the lexical test lives in IsSecureTunnelIfName (xfrmi.go) so
+	// XFRM (st<N>): the kernel device is the AUTHORED bind-interface, which
+	// is not always the ref. A bare `bind-interface st0` and an explicit
+	// `bind-interface st0.0` derive the same if_id under DIFFERENT device
+	// names ("st0" vs "st0.0", pkg/routing/xfrm.go), and the unit ref is
+	// `st0.0` either way — so resolve it from the config rather than
+	// reconstructing it from the ref (#5619). Falls back to the verbatim ref
+	// when no VPN binds this unit: no xfrmi device exists for it then, and
+	// the verbatim ref is what this returned before.
+	//
+	// The lexical test lives in IsSecureTunnelIfName (xfrmi.go) so
 	// snapshotLinuxName can apply the IDENTICAL rule instead of a
 	// hand-copied third instance of it.
 	if IsSecureTunnelIfName(base) {
+		if dev, ok := c.SecureTunnelNetdevForRef(ref); ok {
+			return dev
+		}
 		return LinuxIfName(ref)
 	}
 

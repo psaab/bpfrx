@@ -439,8 +439,27 @@ func snapshotLinuxName(cfg *config.Config, ifName string, iface *config.Interfac
 		// this one did not. Placed FIRST, matching that function's ordering
 		// (the st rule takes precedence over the tunnel-name map there too).
 		// TestSecureTunnelResolverParity pins the two together.
+		//
+		// The name is READ BACK from the authored bind-interface, never
+		// reconstructed from the unit: a bare `bind-interface st0` and an
+		// explicit `bind-interface st0.0` derive one if_id under two DIFFERENT
+		// device names ("st0" vs "st0.0", pkg/routing/xfrm.go), while the unit
+		// ref is `st0.0` in both. Synthesizing "<ifName>.<unit>" here would be
+		// right for the dotted spelling and WRONG for the bare one — the same
+		// class of defect this function is being fixed for, one level down.
+		//
+		// Only the UNIT path resolves this way. A base `st0` row keeps
+		// LinuxIfName(ifName): under `bind-interface st0` that IS the device,
+		// and under `bind-interface st0.0` there is no `st0` device at all, so
+		// resolving to nothing is the honest answer rather than aliasing the
+		// base row onto the unit's device.
 		if config.IsSecureTunnelIfName(ifName) {
-			return config.LinuxIfName(fmt.Sprintf("%s.%d", ifName, unit.Number))
+			ref := fmt.Sprintf("%s.%d", ifName, unit.Number)
+			if dev, ok := cfg.SecureTunnelNetdevForRef(ref); ok {
+				return dev
+			}
+			// No VPN binds this unit — no xfrmi device exists for it.
+			return config.LinuxIfName(ref)
 		}
 		if tunnelNames := cfg.TunnelNameMap(); len(tunnelNames) > 0 {
 			ref := fmt.Sprintf("%s.%d", ifName, unit.Number)

@@ -71,6 +71,65 @@ func IsSecureTunnelIfName(base string) bool {
 	return err == nil
 }
 
+// SecureTunnelNetdevForRef returns the Linux netdev the xfrmi reconciler
+// creates for a secure-tunnel UNIT reference (e.g. "st0.0"), resolved from the
+// AUTHORED `bind-interface` string rather than reconstructed from the ref.
+//
+// This distinction is the whole point. The reconciler creates the device as
+// `LinuxIfName(bindInterface)` VERBATIM, and a bare `st0` and an explicit
+// `st0.0` derive the SAME XFRM if_id under DIFFERENT device names — stated
+// outright in pkg/routing/xfrm.go:
+//
+//	"a bare "st0" and an explicit "st0.0" both yield if_id 1 ... under
+//	 DIFFERENT device names ("st0" vs "st0.0")"
+//
+// So the netdev name simply CANNOT be derived from the unit ref: `st0.0` is
+// the device for `bind-interface st0.0` and `st0` is the device for
+// `bind-interface st0`, and the ref is identical in both cases. It has to be
+// read back from whichever string the operator actually authored.
+//
+// The if_id is the join key that makes that lookup well-defined, and
+// XFRMIfNameAndID is the single source of truth for both halves of it.
+// Reconstructing a name that another component owns is exactly what caused the
+// #5619 drift; doing it again inside the fix would be the same mistake one
+// level down.
+//
+// Returns ("", false) when no configured VPN binds this ref's if_id — then no
+// xfrmi device exists for the unit at all and the caller keeps its own
+// fallback, rather than this inventing a name for a device nobody creates.
+//
+// Deterministic under an if_id collision (two DISTINCT bind-interface strings
+// sharing one if_id): the lexicographically smallest device name wins. Such a
+// config is rejected at commit by the #2933 gate and refused at apply by the
+// #2909 routing guard, so this only governs the tolerant-load path — but it
+// must still be a pure function of the config rather than map-order dependent.
+func (c *Config) SecureTunnelNetdevForRef(ref string) (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	_, wantID := XFRMIfNameAndID(ref)
+	if wantID == 0 {
+		return "", false
+	}
+	best := ""
+	for _, vpn := range c.Security.IPsec.VPNs {
+		if vpn == nil || vpn.BindInterface == "" {
+			continue
+		}
+		name, id := XFRMIfNameAndID(vpn.BindInterface)
+		if id != wantID || name == "" {
+			continue
+		}
+		if best == "" || name < best {
+			best = name
+		}
+	}
+	if best == "" {
+		return "", false
+	}
+	return best, true
+}
+
 // ValidateSecureTunnelBindInterface reports whether a `security ipsec vpn
 // <name> bind-interface` value is a canonical secure-tunnel interface — the
 // only shape the route-based-VPN datapath can bind. The accepted lexical form
