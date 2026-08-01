@@ -464,7 +464,12 @@ peer liveness (`lastSeen`) or drive election.
     moment refinement loads the file*. Below `epochClockSaneFloor` (2020) the
     forward bound is skipped entirely — deliberately, because a dead-RTC node
     booting near 1970 cannot distinguish its own legitimate previous epoch from
-    a corrupt future one; both sit ~56 years "ahead", and rejecting would
+    a corrupt future one. Both sit implausibly far "ahead" of a 1970 clock — a
+    legitimate 2026 epoch by ~56 years, the corrupt year-2191 fixture this
+    branch tests with by ~222 — and the node has no reference that separates
+    them, because the forward bound that WOULD discriminate is exactly what is
+    skipped. The magnitudes differ; the indistinguishability does not. Rejecting
+    would
     discard exactly the value persistence exists to carry across a backward
     clock step. Only the absolute year-2200 band applies there. So on an
     appliance whose RTC is dead and whose xpfd always starts before NTP, a
@@ -581,6 +586,14 @@ peer liveness (`lastSeen`) or drive election.
         accepts the rolled-back peer again. There is no state file to hand-edit
         and no new CLI surface to learn. Rolling BOTH nodes back needs no
         action beyond that on whichever node had latched.
+
+        **If you already did it in the wrong order, you are not stuck — restart
+        once more.** Restarting *before* rotating leaves the latch armed
+        THROUGH the rotation: the replay re-arms it after the restart, and the
+        subsequent key change cannot un-arm what is already set. Measured, one
+        rotate→restart pass recovers; restart→rotate needs a **second** restart
+        after the rotation. Nothing else is required, and no state is lost
+        either way.
 
         **The restart alone is not reliable, and the order is the reason.**
         A restart clears the floor, the latch and the ring together, and
@@ -1116,11 +1129,20 @@ Procedure:
 >
 > **This step is what makes the accepted restart residual acceptable.** The
 > downgrade latch (`epochSeen`) is process-scoped, so a full daemon restart on
-> the surviving node clears it, and while the genuine peer is ABSENT nothing
-> re-arms it — that window is exactly what a pre-upgrade epoch-less archive
-> replays into. Rotation removes the archive, so the window has nothing to
-> exploit. Skipping rotation leaves the residual live; the residual was not
-> priced as "narrow" on the assumption that nobody would.
+> the surviving node clears it. But do NOT read that as "while the genuine peer
+> is absent nothing re-arms it" — an earlier revision of this paragraph said
+> exactly that and it is false, as residual 5 below records. A single ARCHIVED
+> epoch-bearing frame, captured while the peer still ran an epoch-capable build,
+> re-arms the latch on its own: after the restart `highEpoch` is 0, so the replay
+> passes the absolute band, the forward bound and the empty ring, and arms
+> `epochSeen`. One replay per restart holds the rolled-back peer out
+> indefinitely.
+>
+> That is precisely why rotation comes FIRST. Rotation invalidates the archive,
+> so there is nothing left to replay into the window. Skipping it leaves the
+> residual live, and restarting without rotating leaves the latch armed *through*
+> a later rotation — costing a second restart. The residual was not priced as
+> "narrow" on the assumption that nobody would skip the rotation.
 >
 > **How to tell whether you are still exposed:** `show chassis cluster
 > information` / `statistics` print `Heartbeats without epoch:` in the

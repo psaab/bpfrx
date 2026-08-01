@@ -236,8 +236,13 @@ func epochOrderable(epoch uint64, nowNanos int64) bool {
 // raise path, which is asymmetric visibility, not mutual isolation.
 //
 // It cannot be closed here. Under a dead RTC a legitimate previous epoch and a
-// corrupt future one are INDISTINGUISHABLE — both sit ~56 years "ahead" of a
-// 1970 clock — so tightening the bound would reject the legitimate value, which
+// corrupt future one are INDISTINGUISHABLE: both sit implausibly far "ahead" of
+// a 1970 clock — a legitimate 2026 value by ~56 years, the corrupt year-2191
+// fixture the tests use by ~222 — and nothing on this node separates them,
+// because the forward bound that WOULD discriminate is precisely what is
+// skipped below epochClockSaneFloor. What is missing is a trustworthy
+// REFERENCE, not a magnitude gap. So tightening the bound would reject the
+// legitimate value, which
 // is precisely the case persistence exists to carry across a backward clock
 // step. The absolute year-2200 band is the only filter that survives an
 // uncredible clock, and it is already applied unconditionally. Healing after
