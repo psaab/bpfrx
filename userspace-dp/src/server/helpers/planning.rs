@@ -280,7 +280,15 @@ pub(crate) fn include_userspace_binding_interface(iface: &InterfaceSnapshot) -> 
     {
         return false;
     }
-    // #5619: an IPsec secure tunnel (st<N>) gets no AF_XDP binding.
+    // #5619: an IPsec secure tunnel gets no AF_XDP binding.
+    //
+    // EXACTLY what is matched: `base` is the interface name with any unit
+    // suffix stripped (above), and `is_secure_tunnel_ifname` accepts `st`
+    // followed by a numeric remainder. Every spelling is covered — bare `st0`,
+    // the usual `st0.0`, and a multi-digit interface AND unit like `st10.5`
+    // (base `st10`) — while `stx` / `start0` are NOT matched and keep their
+    // bindings. Over-matching here would silently strip a real data interface
+    // of its AF_XDP binding, which is worse than the gap below.
     //
     // Route-based IPsec decrypts in the kernel XFRM stack and the plaintext
     // is delivered on the xfrmi netdev; the dataplane has no path to hand a

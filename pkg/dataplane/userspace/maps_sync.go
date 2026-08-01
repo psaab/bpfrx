@@ -1679,8 +1679,21 @@ func userspaceSkipsIngressInterface(iface InterfaceSnapshot) bool {
 	case base == "lo0":
 		return true
 	case config.IsSecureTunnelIfName(base):
-		// #5619: an IPsec secure tunnel (st<N>) is NOT adjudicated by the
-		// userspace dataplane, and this arm says so out loud.
+		// #5619: an IPsec secure tunnel is NOT adjudicated by the userspace
+		// dataplane, and this arm says so out loud.
+		//
+		// EXACTLY what is matched: `base` is the row's name with any unit
+		// suffix stripped (above), and IsSecureTunnelIfName accepts `st`
+		// followed by a numeric remainder. So every spelling of a secure
+		// tunnel is covered — a bare `st0`, the usual `st0.0`, and a
+		// multi-digit interface AND unit like `st10.5` (base `st10`) — while
+		// names that merely begin with "st" are NOT matched and stay
+		// adjudicated: `stx` and `start0` have non-numeric remainders. This
+		// is a base-name match, not a whole-string match and not a bare
+		// HasPrefix("st"); over-matching here would silently drop a real data
+		// interface out of adjudication, which is worse than the gap below.
+		// TestSecureTunnelSpellingsAllExcluded and
+		// TestSecureTunnelNonTunnelStNamesStayAdjudicated pin both directions.
 		//
 		// Route-based IPsec decrypts in the KERNEL XFRM stack, which delivers
 		// the plaintext on the xfrmi netdev (xfrmi_rcv_cb sets skb->dev, then

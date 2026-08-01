@@ -1,6 +1,8 @@
 package userspace
 
 import (
+	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -242,4 +244,212 @@ func stubLinkSnapshot5619(t *testing.T, live map[string]int) func() {
 		return 0, 0, "", nil
 	}
 	return func() { buildLinkSnapshot = prev }
+}
+
+// --- review conditions -----------------------------------------------------
+
+// TestSecureTunnelAddsNothingToDataplaneSets PROVES the load-bearing claim of
+// this change: "net forwarding behaviour is identical before and after".
+//
+// It is a DIFFERENTIAL, not a fixture match. The same config is compiled twice —
+// once with the route-based VPN and its zoned secure tunnel, once with the whole
+// IPsec stanza and zone removed — and the ingress-adjudication set and the
+// AF_XDP/RSS allowlist must come out BYTE-IDENTICAL. A secure tunnel adds
+// nothing to what the dataplane claims.
+//
+// The premise assertions matter as much as the result: the tunnel row must be
+// RESOLVED (verbatim netdev name, real ifindex) in the with-tunnel run. If it
+// were unresolved, the sets would match for the pre-fix reason (ifindex 0) and
+// the test would prove nothing at all.
+func TestSecureTunnelAddsNothingToDataplaneSets(t *testing.T) {
+	restore := stubLinkSnapshot5619(t, map[string]int{"st0.0": 42, "ge-0-0-0": 11})
+	defer restore()
+
+	lan := []string{
+		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.1.1/24",
+		"set security zones security-zone trust interfaces ge-0/0/0.0",
+	}
+	withTunnel := compileForTest5619(t, append([]string{
+		"set security ipsec vpn myvpn bind-interface st0.0",
+		"set interfaces st0 unit 0 family inet address 10.5.5.1/30",
+		"set security zones security-zone vpn interfaces st0.0",
+	}, lan...)...)
+	withoutTunnel := compileForTest5619(t, lan...)
+
+	tunnelSnaps := buildInterfaceSnapshots(withTunnel)
+
+	// PREMISE: the tunnel unit resolved. Without this the comparison below is
+	// satisfied by the pre-#5619 accident rather than by the exclusion.
+	var resolved bool
+	for _, s := range tunnelSnaps {
+		if s.Name == "st0.0" {
+			if s.LinuxName != "st0.0" || s.Ifindex != 42 {
+				t.Fatalf("premise broken: st0.0 resolved to linux=%q ifindex=%d, want "+
+					"linux=\"st0.0\" ifindex=42 — this test must compare a RESOLVED "+
+					"xfrmi, not the pre-fix ifindex-0 accident", s.LinuxName, s.Ifindex)
+			}
+			resolved = true
+		}
+	}
+	if !resolved {
+		t.Fatal("premise broken: no st0.0 unit in the with-tunnel snapshot")
+	}
+
+	gotIngress := buildUserspaceIngressIfindexes(&ConfigSnapshot{Interfaces: tunnelSnaps})
+	wantIngress := buildUserspaceIngressIfindexes(&ConfigSnapshot{
+		Interfaces: buildInterfaceSnapshots(withoutTunnel),
+	})
+	if !slices.Equal(gotIngress, wantIngress) {
+		t.Errorf("adding a route-based IPsec tunnel CHANGED the ingress-adjudication set: "+
+			"with tunnel %v, without %v. The xfrmi must add nothing — the shim would "+
+			"otherwise claim it and drop the decrypted plaintext it cannot deliver to an XSK",
+			gotIngress, wantIngress)
+	}
+	// The fixture the reshape was measured against: LAN only.
+	if !slices.Equal(gotIngress, []uint32{11}) {
+		t.Errorf("ingress set = %v, want [11] (the LAN netdev alone)", gotIngress)
+	}
+
+	gotAllow := UserspaceBoundLinuxInterfaces(withTunnel)
+	wantAllow := UserspaceBoundLinuxInterfaces(withoutTunnel)
+	if !slices.Equal(gotAllow, wantAllow) {
+		t.Errorf("adding a route-based IPsec tunnel CHANGED the AF_XDP/RSS allowlist: "+
+			"with tunnel %v, without %v", gotAllow, wantAllow)
+	}
+}
+
+// TestSecureTunnelSpellingsAllExcluded scopes the exclusion claim to exactly
+// what is implemented, per review condition 4.
+//
+// The exclusion matches on the BASE name with any unit suffix stripped, so it
+// covers every spelling of a secure tunnel: a bare `st0`, the usual `st0.0`,
+// and a multi-digit interface AND unit (`st10.5`). It is a base-name match, not
+// a whole-string match and not a bare `strings.HasPrefix("st")` — `stx` and
+// `start0` are NOT secure tunnels and must stay adjudicated.
+func TestSecureTunnelSpellingsAllExcluded(t *testing.T) {
+	for _, tc := range []struct {
+		bindIface string
+		ifName    string
+		unit      int
+		wantSkip  bool
+	}{
+		{bindIface: "st0", ifName: "st0", unit: 0, wantSkip: true},
+		{bindIface: "st0.0", ifName: "st0", unit: 0, wantSkip: true},
+		{bindIface: "st10.5", ifName: "st10", unit: 5, wantSkip: true},
+	} {
+		t.Run(tc.bindIface, func(t *testing.T) {
+			unitRef := fmt.Sprintf("%s.%d", tc.ifName, tc.unit)
+			cfg := compileForTest5619(t,
+				fmt.Sprintf("set security ipsec vpn v bind-interface %s", tc.bindIface),
+				fmt.Sprintf("set interfaces %s unit %d family inet address 10.5.5.1/30", tc.ifName, tc.unit),
+				fmt.Sprintf("set security zones security-zone vpn interfaces %s", unitRef),
+				"set interfaces ge-0/0/0 unit 0 family inet address 10.0.1.1/24",
+				"set security zones security-zone trust interfaces ge-0/0/0.0",
+			)
+
+			// Resolve whichever netdev this spelling materializes, so the row
+			// under test carries a REAL ifindex rather than 0.
+			devName, ifID := config.XFRMIfNameAndID(tc.bindIface)
+			if ifID == 0 {
+				t.Fatalf("premise broken: %q resolves to if_id 0", tc.bindIface)
+			}
+			restore := stubLinkSnapshot5619(t, map[string]int{
+				devName: 42, unitRef: 42, "ge-0-0-0": 11,
+			})
+			defer restore()
+
+			var sawTunnelRow bool
+			for _, s := range buildInterfaceSnapshots(cfg) {
+				if s.Name != tc.ifName && s.Name != unitRef {
+					continue
+				}
+				sawTunnelRow = true
+				if got := userspaceSkipsIngressInterface(s); got != tc.wantSkip {
+					t.Errorf("userspaceSkipsIngressInterface(%q) = %v, want %v — the "+
+						"exclusion matches the BASE name with the unit stripped, so every "+
+						"spelling of a secure tunnel is covered", s.Name, got, tc.wantSkip)
+				}
+			}
+			if !sawTunnelRow {
+				t.Fatalf("premise broken: no row for %q / %q in the snapshot", tc.ifName, unitRef)
+			}
+			for _, ifindex := range buildUserspaceIngressIfindexes(
+				&ConfigSnapshot{Interfaces: buildInterfaceSnapshots(cfg)}) {
+				if ifindex == 42 {
+					t.Errorf("secure tunnel spelled %q entered userspace_ingress_ifaces", tc.bindIface)
+				}
+			}
+		})
+	}
+}
+
+// TestSecureTunnelNonTunnelStNamesStayAdjudicated is the counterpart scope
+// check: names that merely START with "st" are NOT secure tunnels and must keep
+// being adjudicated. Without this, "scope the claim" could be satisfied by an
+// over-broad prefix match that silently drops a real data interface out of the
+// dataplane — a far worse failure than the gap being fixed.
+func TestSecureTunnelNonTunnelStNamesStayAdjudicated(t *testing.T) {
+	for _, name := range []string{"stx", "start0"} {
+		t.Run(name, func(t *testing.T) {
+			snap := InterfaceSnapshot{
+				Name: name + ".0", LinuxName: name, Zone: "trust", Ifindex: 11,
+			}
+			if userspaceSkipsIngressInterface(snap) {
+				t.Errorf("%q was excluded from the dataplane; only st<N> with a numeric N "+
+					"is a secure tunnel, and over-matching silently drops a real data "+
+					"interface out of adjudication", snap.Name)
+			}
+		})
+	}
+}
+
+// TestSecureTunnelUnitReportsMTUAndAddresses covers the user-visible half of
+// this change, which otherwise would ride along unasserted.
+//
+// Because the unit resolved to the nonexistent netdev `st0`, buildLinkSnapshot
+// missed and the secure-tunnel unit reported MTU 0 and no live addresses in
+// every snapshot consumer (status output, the CLI, the host-inbound view). With
+// the name correct it reports what the kernel actually has.
+func TestSecureTunnelUnitReportsMTUAndAddresses(t *testing.T) {
+	prev := buildLinkSnapshot
+	defer func() { buildLinkSnapshot = prev }()
+	buildLinkSnapshot = func(name string) (int, int, string, []InterfaceAddressSnapshot) {
+		if name == "st0.0" {
+			return 42, 1400, "", []InterfaceAddressSnapshot{
+				{Family: "inet", Address: "10.5.5.1/30"},
+			}
+		}
+		return 0, 0, "", nil
+	}
+
+	cfg := compileForTest5619(t,
+		"set security ipsec vpn myvpn bind-interface st0.0",
+		"set interfaces st0 unit 0 family inet address 10.5.5.1/30",
+		"set security zones security-zone vpn interfaces st0.0",
+	)
+
+	var found bool
+	for _, s := range buildInterfaceSnapshots(cfg) {
+		if s.Name != "st0.0" {
+			continue
+		}
+		found = true
+		if s.MTU != 1400 {
+			t.Errorf("st0.0 MTU = %d, want 1400 — a secure-tunnel unit reported MTU 0 "+
+				"because it resolved to the nonexistent netdev \"st0\"", s.MTU)
+		}
+		var live bool
+		for _, addr := range s.Addresses {
+			if addr.Address == "10.5.5.1/30" {
+				live = true
+			}
+		}
+		if !live {
+			t.Errorf("st0.0 addresses = %v, want the live 10.5.5.1/30 — the unit reported "+
+				"no live addresses because buildLinkSnapshot missed on \"st0\"", s.Addresses)
+		}
+	}
+	if !found {
+		t.Fatal("premise broken: no st0.0 unit in the snapshot")
+	}
 }
