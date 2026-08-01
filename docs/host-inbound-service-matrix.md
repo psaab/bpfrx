@@ -1160,11 +1160,16 @@ helper never sees it, so a helper crash cannot lock management out).
   coarse-rejected service — Rust `poll_descriptor/mod.rs:138`). Instead each later
   deny SUBTRACTS an earlier permit's source set (`saddr != <permit-set>`), so the
   coarse host-inbound gate stays the **sole admit authority**.
-- **Ingress `iifname` scope, never `daddr`.** The DROP is scoped by the from-zone's
-  kernel netdev names (`pkg/dataplane/userspace/BuildJunosHostPrograms`), excluding
-  lifelines (fxp0/em0/fab*) — daddr scope would both under- and over-deny across
-  zones. A global-any term renders per ingress zone with that zone's netdevs, never
-  unscoped.
+- **Ingress `iifname` scope, never `daddr` as the ZONE scope.** The DROP is scoped
+  by the from-zone's kernel netdev names
+  (`pkg/dataplane/userspace/BuildJunosHostPrograms`), excluding lifelines
+  (fxp0/em0/fab*) — a daddr-derived zone scope would both under- and over-deny
+  across zones. A global-any term renders per ingress zone with that zone's
+  netdevs, never unscoped. An EXPLICIT `match destination-address` adds a
+  narrowing `daddr` predicate ON TOP of that iifname scope (see the destination
+  slice below); it never replaces it. Because the scope is the ingress netdev, a
+  destination-scoped deny on a data zone can never suppress management ingress on
+  a lifeline, whichever firewall address it names.
 - **Coarse-then-fine order (`pkg/daemon/daemon_nft.go`).** The fine DROP runs after
   ESP/AH accept + the firewall-originated reply-direction established accept, but
   BEFORE the ND/PMTUD accepts and the residual full established accept, so a denied
@@ -1213,40 +1218,63 @@ helper never sees it, so a helper crash cannot lock management out).
   the direct path retains. The userspace XSK path keeps its own attribution.
 
 **Representable subset:** action `deny`; `match source-address` /
-`source-address-excluded` resolving entirely to *static* address-book CIDRs
+`source-address-excluded` **and** `match destination-address` /
+`destination-address-excluded` resolving entirely to *static* address-book CIDRs
 (recursively feed-untainted); `match application` reducing to simple
 proto + optional dst/src port + optional ICMP type/code (application-sets
-OR-expanded to multiple rules); `match destination-address any`; **no**
-`scheduler-name`; ingress zone **not** `tcp-rst`.
+OR-expanded to multiple rules); **no** `scheduler-name`; ingress zone **not**
+`tcp-rst`.
 
-**Source-exclusion semantics (`source-address-excluded`).** The excluded arm
-projects *every source NOT in the resolved set*, per Junos `matchAddr`:
+**Address-match semantics (source AND destination).** Both dimensions route
+through ONE projection formula (`junosHostProjectAddrMatch`,
+`pkg/config/junos_host_deny.go`) so they cannot drift, and both mirror Junos
+`matchAddr`:
 - A **constrained** set (e.g. `source-address 10.0.0.0/8` + excluded) drops
   every source EXCEPT the set on the family that carries a prefix (IPv4:
   `saddr != 10.0.0.0/8`), and — because the set has no prefix of the *other*
   family — drops **ALL** of that other family (IPv6 here): "everything except
   10/8" is all IPv6. This match-all-of-opposite-family behavior is intentional.
-- The **wildcard** case `source-address any` (or the family-scoped `any-ipv4` /
-  `any-ipv6`) + excluded is the degenerate "every source EXCEPT every source" =
-  the **empty set**: it matches NOTHING and projects **no drop rule** for the
-  affected family (`junosHostBuildRule` returns `ok=false` when the family's
-  `srcAny` is set). `any` suppresses both families; `any-ipv4` / `any-ipv6`
-  suppress only their own. Emitting an unconditional all-source drop here (the
-  #5828 bug — the old `len(src)==0 => SrcAny` classification) would invert the
-  authored domain and could lock out **all** direct host-bound traffic on the
-  ingress zone. A plain `source-address any` + `then deny` with **no** exclusion
-  is unaffected — that is a legitimate drop-all deny and still emits the
-  unconditional drop.
+- The **wildcard** case `any` (or the family-scoped `any-ipv4` / `any-ipv6`) +
+  excluded is the degenerate "every address EXCEPT every address" = the **empty
+  set**: it matches NOTHING and projects **no drop rule** for the affected
+  family. `any` suppresses both families; `any-ipv4` / `any-ipv6` suppress only
+  their own. Emitting an unconditional drop here (the #5828 bug — the old
+  `len(src)==0 => SrcAny` classification) would invert the authored domain and
+  could lock out **all** direct host-bound traffic on the ingress zone. A plain
+  `source-address any` + `then deny` with **no** exclusion is unaffected — that
+  is a legitimate drop-all deny and still emits the unconditional drop.
+- A **constrained positive** set with no prefix of a family matches nothing on
+  that family and emits no rule there (Junos empty-positive-set semantic).
+
+**`match destination-address` on a DENY (#4146 destination slice).** The kernel
+`xpf_hostinbound` chain hooks the INPUT path, so every packet it evaluates is
+already host-destined; an explicit destination therefore renders as a narrowing
+`<fam> daddr <set>` / `daddr != <set>` predicate **on top of** the `iifname`
+zone scope — never as a replacement for it. A destination naming no firewall
+address simply matches nothing in the chain, exactly as the Rust /
+`policymatch` evaluation of that policy matches nothing, so the live
+firewall-local address set is **not** needed to render it. Rust already matched
+this dimension on the junos-host path (`rule_l3_matches(rule, state, src_ip,
+dst_ip)` in `evaluate_junos_host_policy_l3_aware`); the kernel projection was
+the only surface dropping it, which made a `from-zone X to-zone junos-host {
+match destination-address <fw-ip>; then deny; }` silently unenforced — and,
+because the representability gate is whole-program, silently disabled kernel
+enforcement of **every other** junos-host deny on that ingress zone.
+
+A destination-scoped **`permit`** stays un-representable: a permit is projected
+only as a `saddr !=` SUBTRACTION of later denies (see DROP-only above), which
+cannot express a carve that is also destination-scoped. The whole program then
+emits nothing and every one of its policies keeps the warning — never a deny
+widened past the permit's destination scope.
 
 **Un-representable remainder (keeps the commit warning below):** feed-tainted
-source, multi-term / ALG application, an application scoped to an IPsec/ident
-exempt tuple, an **explicit** `match destination-address` (needs the live
-firewall-local set to validate — deferred to a follow-up), a scheduler-gated
-policy, a `tcp-rst` ingress zone (silent drop would diverge from Junos's RST
-verdict class), `reject`, and the "deny non-permitted" half of a source-restricted
-`permit` (the reject and source-restricted-permit slices are tracked follow-ups
-using the identical machinery). No partial/coarsened kernel rule is ever emitted
-for the remainder.
+source **or destination**, multi-term / ALG application, an application scoped
+to an IPsec/ident exempt tuple, a **destination-scoped `permit`**, a
+scheduler-gated policy, a `tcp-rst` ingress zone (silent drop would diverge from
+Junos's RST verdict class), `reject`, and the "deny non-permitted" half of a
+source-restricted `permit` (the reject and source-restricted-permit slices are
+tracked follow-ups using the identical machinery). No partial/coarsened kernel
+rule is ever emitted for the remainder.
 
 ### Commit-time warning (direction c — shipped; now suppressed on render)
 

@@ -107,3 +107,15 @@ harness = false
 [[bench]]
 name = "snat_allocator"
 harness = false
+
+# #6592 design gate: the two costs that decided how validation and forwarding
+# are paired atomically. G1 — the worker's per-tick refresh must not regress
+# when two ArcSwap loads become one. G2 — a validation-only publish
+# (`bump_fib_generation`) must stay ~free by REUSING the nested forwarding Arc,
+# which is what preserves the #1188 short-circuit; the alternative design
+# (inlining ValidationState into ForwardingState) rebuilds the whole state per
+# FIB bump. `harness = false` with its own main: G2 is a ratio gate between two
+# designs, not a single-closure timing.
+[[bench]]
+name = "runtime_view_refresh"
+harness = false

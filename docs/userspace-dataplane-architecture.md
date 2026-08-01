@@ -203,8 +203,8 @@ mandatory BPF map FDs**:
   correctness boundary: a worker cannot serve traffic without them. They
   are opened in `snapshot::preflight_map_fds` **before** `tear_down`
   stops the running workers and **before** `apply_snapshot` publishes a
-  newer forwarding view (`coord.forwarding`, `shared_validation`,
-  `ha.forwarding`, `ha.fabrics`) or advances
+  newer forwarding view (`coord.forwarding`, the published `ha.runtime`
+  `RuntimeView`, `ha.fabrics`) or advances
   `validation.snapshot_installed` / `config_generation`.
 - If any mandatory pin is missing or its FD fails to open, the reconcile
   aborts in the preflight: it sets the typed `last_reconcile_stage`
@@ -237,7 +237,7 @@ mandatory BPF map FDs**:
   `build_forwarding_state_with_policy_counters_and_previous` (NAT64 is
   fail-scoped per #3888 and no longer aborts) — used to
   surface *inside* `apply_snapshot`, after teardown had already stopped the
-  workers and reset `coord.validation` / `shared_validation`. They are now
+  workers and reset `coord.validation` / the published view. They are now
   detected by `snapshot::build_reconcile_forwarding` in the preflight: on
   an integrity `Err` the reconcile sets
   `last_reconcile_stage = ReconcileStage::SnapshotIntegrityError` (which

@@ -145,6 +145,9 @@ func toNftDenyRules(rules []config.JunosHostDenyRule) []xnft.JunosHostDenyRule {
 			SrcExcluded:    r.SrcExcluded,
 			Src:            r.Src,
 			PermitSubtract: r.PermitSubtract,
+			DstAny:         r.DstAny,
+			DstExcluded:    r.DstExcluded,
+			Dst:            r.Dst,
 		}
 		for _, l4 := range r.L4 {
 			nr.L4 = append(nr.L4, xnft.JunosHostDenyL4{

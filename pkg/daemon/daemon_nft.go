@@ -1334,8 +1334,8 @@ func emitJunosHostDenyProgram(rules *[]string, p dpuserspace.JunosHostProgram) {
 // fragment; a single rule for `application any`).
 func emitJunosHostDropRule(rules *[]string, zone, iif string, r config.JunosHostDenyRule) {
 	cn := xnft.HostInboundJunosHostDenyCounterName(zone, r.Family)
-	srcPred := junosHostSrcPredicate(r)
-	tail := srcPred + " counter name \"" + cn + "\" drop"
+	tail := junosHostSrcPredicate(r) + junosHostDstPredicate(r) +
+		" counter name \"" + cn + "\" drop"
 	if len(r.L4) == 0 {
 		// `application any` — all protocols.
 		*rules = append(*rules, "    iifname "+iif+tail)
@@ -1371,6 +1371,31 @@ func junosHostSrcPredicate(r config.JunosHostDenyRule) string {
 		b.WriteString(" " + r.Family + " saddr != " + nftAddrSet(r.PermitSubtract))
 	}
 	return b.String()
+}
+
+// junosHostDstPredicate builds the leading-space destination predicate for a
+// DROP rule from an explicit `match destination-address` (#4146 destination
+// slice). Returns "" for `destination-address any` — the case every pre-slice
+// program rendered — so an unscoped deny is byte-identical to before.
+//
+// The chain hooks the INPUT path, so every packet it evaluates is already
+// host-destined; a `daddr` predicate here narrows the deny to the firewall
+// address(es) the operator authored. It is NEVER the zone scope — that stays
+// `iifname` (a daddr-only scope both under- and over-denies across zones, plan
+// §3.2).
+func junosHostDstPredicate(r config.JunosHostDenyRule) string {
+	switch {
+	case r.DstExcluded && len(r.Dst) > 0:
+		return " " + r.Family + " daddr != " + nftAddrSet(r.Dst)
+	case r.DstAny || (r.DstExcluded && len(r.Dst) == 0):
+		// match every destination (no daddr predicate)
+		return ""
+	default:
+		if len(r.Dst) > 0 {
+			return " " + r.Family + " daddr " + nftAddrSet(r.Dst)
+		}
+	}
+	return ""
 }
 
 // renderJunosHostL4 renders one L4 match fragment for a family. Returns "" only

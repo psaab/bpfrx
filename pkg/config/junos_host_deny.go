@@ -70,11 +70,15 @@ type JunosHostDenyL4 struct {
 // JunosHostDenyRule is one projected DROP rule for a single family. The daemon
 // renders it as
 //
-//	iifname { <zone netdevs> } [<l4>] <fam> saddr <src> [saddr != <permit-subtract>] drop
+//	iifname { <zone netdevs> } [<l4>] <fam> saddr <src> [saddr != <permit-subtract>] [<fam> daddr <dst>] drop
 //
 // SrcAny (no source constraint) and SrcExcluded (`saddr != Src`) mirror the
 // policymatch.matchAddr family semantics; a rule is only emitted for a family
 // whose positive source set is non-empty OR whose match is source-any/excluded.
+// Dst*/Dst are the SAME projection applied to an explicit `match
+// destination-address` (#4146 destination slice) — the host chain only ever sees
+// host-destined packets, so a `daddr` predicate narrows the deny to the authored
+// firewall address(es). It is NEVER the zone scope (that stays `iifname`).
 type JunosHostDenyRule struct {
 	Family      string // "ip" or "ip6"
 	SrcAny      bool   // true => match every source (no saddr predicate)
@@ -83,6 +87,13 @@ type JunosHostDenyRule struct {
 	// PermitSubtract accumulates the source CIDRs of every EARLIER permit term
 	// that carves this deny (rendered as additional `saddr != <set>` predicates).
 	PermitSubtract []string
+	// DstAny / DstExcluded / Dst mirror Src* for `match destination-address`.
+	// DstAny (the overwhelmingly common `destination-address any`) renders NO
+	// daddr predicate, so an unscoped deny is byte-identical to the pre-slice
+	// rule.
+	DstAny      bool // true => match every destination (no daddr predicate)
+	DstExcluded bool // true => `daddr != Dst` (destination-address-excluded)
+	Dst         []string
 	// L4 is the OR-expanded set of L4 fragments; the daemon emits one nft rule
 	// per fragment. Empty means `application any` (all protocols).
 	L4 []JunosHostDenyL4
@@ -164,6 +175,10 @@ type junosHostTerm struct {
 	srcV4, srcV6       []string
 	srcAnyV4, srcAnyV6 bool
 	srcExcluded        bool
+	// per-family resolved destination (`match destination-address`)
+	dstV4, dstV6       []string
+	dstAnyV4, dstAnyV6 bool
+	dstExcluded        bool
 	// resolved application L4 fragments (nil => application any)
 	l4            []JunosHostDenyL4
 	appAny        bool
@@ -352,9 +367,11 @@ func containsZone(zs []string, z string) bool {
 }
 
 // junosHostProjectTerm resolves one policy's match into a representable term. A
-// reject action, scheduler-gated policy, feed-tainted / non-static source, a
-// non-`any` destination, an un-reducible application, or an application scoped to
-// an IPsec/ident exempt tuple all mark the term un-representable.
+// reject action, scheduler-gated policy, feed-tainted / non-static source or
+// destination, an un-reducible application, or an application scoped to an
+// IPsec/ident exempt tuple all mark the term un-representable. A scoped
+// `match destination-address` is representable for a DENY (rendered as a `daddr`
+// predicate) but NOT for a permit — see the destination block below.
 func junosHostProjectTerm(cfg *Config, key string, p *Policy, feedBound map[string]bool) junosHostTerm {
 	t := junosHostTerm{key: key, action: p.Action, representable: true}
 	// Reject is the §6.5 follow-up slice; scheduler-gated policies are
@@ -369,10 +386,29 @@ func junosHostProjectTerm(cfg *Config, key string, p *Policy, feedBound map[stri
 	}
 	t.srcV4, t.srcV6, t.srcAnyV4, t.srcAnyV6 = v4, v6, anyV4, anyV6
 	t.srcExcluded = p.Match.SourceAddressExcluded
-	// Destination: only `any` (the box) is representable in this slice; an
-	// explicit destination-address requires the live firewall-local address set
-	// to validate and is left to the #4168 warning (§6.1 note in the docs).
-	if junosHostAddrScoped(p.Match.DestinationAddresses) || p.Match.DestinationAddressExcluded {
+	// Destination resolution (static-only, feed-untainted — same gate as the
+	// source). An explicit `match destination-address` on a DENY is representable:
+	// the kernel `xpf_hostinbound` chain hooks the INPUT path, so every packet it
+	// sees is already host-destined, and a `daddr` predicate simply narrows the
+	// deny to the firewall address(es) the operator authored. A destination that
+	// names no firewall address matches nothing in the chain — exactly as the
+	// Rust/policymatch evaluation of that policy matches nothing — so the live
+	// firewall-local address set is NOT needed to render it correctly.
+	//
+	// A PERMIT (or reject) with a SCOPED destination stays un-representable: a
+	// permit is projected only as a `saddr !=` SUBTRACTION of later denies
+	// (§5.1), which cannot express a carve that is also destination-scoped.
+	// Leaving it un-representable keeps the whole-program gate conservative — the
+	// zone emits nothing and every one of its policies keeps the #4168 warning —
+	// rather than silently widening a later deny past the permit.
+	dv4, dv6, dAnyV4, dAnyV6, dok := junosHostResolveAddrSet(cfg, p.Match.DestinationAddresses, feedBound)
+	if !dok {
+		t.representable = false
+	}
+	t.dstV4, t.dstV6, t.dstAnyV4, t.dstAnyV6 = dv4, dv6, dAnyV4, dAnyV6
+	t.dstExcluded = p.Match.DestinationAddressExcluded
+	if p.Action != PolicyDeny &&
+		(junosHostAddrScoped(p.Match.DestinationAddresses) || p.Match.DestinationAddressExcluded) {
 		t.representable = false
 	}
 	// Application resolution.
@@ -472,19 +508,22 @@ func junosHostHasPoison(in []string) bool {
 
 // junosHostBuildRule projects one deny term to a single-family DROP rule,
 // applying the earlier-permit source subtraction. Returns ok=false when the
-// family's match resolves to "match nothing" (a constrained positive source with
-// no prefix of this family) or when an earlier permit-all shadows it.
+// family's match resolves to "match nothing" (a constrained positive source or
+// destination with no prefix of this family, or a degenerate `any`+excluded set)
+// or when an earlier permit-all shadows it.
 func junosHostBuildRule(family string, t junosHostTerm, permit []string, permitAll bool) (JunosHostDenyRule, bool) {
 	if permitAll {
 		// Every source is permitted ahead of this deny -> nothing to drop.
 		return JunosHostDenyRule{}, false
 	}
-	var src []string
-	var srcAny bool
+	var src, dst []string
+	var srcAny, dstAny bool
 	if family == "ip" {
 		src, srcAny = t.srcV4, t.srcAnyV4
+		dst, dstAny = t.dstV4, t.dstAnyV4
 	} else {
 		src, srcAny = t.srcV6, t.srcAnyV6
+		dst, dstAny = t.dstV6, t.dstAnyV6
 	}
 	l4 := junosHostFamilyL4(family, t.l4)
 	if !t.appAny && len(l4) == 0 {
@@ -492,42 +531,85 @@ func junosHostBuildRule(family string, t junosHostTerm, permit []string, permitA
 		// ICMPv6 app on the inet chain) -> matches nothing here.
 		return JunosHostDenyRule{}, false
 	}
+	// #6613: an `*-excluded` whose resolved set is empty in BOTH families is not
+	// "match everything" — Rust's rule_l3_matches fails CLOSED on it
+	// (`!(v4_empty && v6_empty)`, userspace-dp/src/policy.rs), so projecting the
+	// match-all arm here would widen the authored scope to every firewall
+	// address while the dataplane denies nothing. The per-family helper cannot
+	// see the other family, so the cross-family emptiness is computed here and
+	// passed in. Strict commit already rejects an empty/dangling address-set,
+	// but the LENIENT load / peer-sync path does not, so a config persisted by
+	// an older binary reaches this projection.
+	srcEmptyBoth := !t.srcAnyV4 && !t.srcAnyV6 && len(t.srcV4) == 0 && len(t.srcV6) == 0
+	dstEmptyBoth := !t.dstAnyV4 && !t.dstAnyV6 && len(t.dstV4) == 0 && len(t.dstV6) == 0
+
 	rule := JunosHostDenyRule{Family: family, L4: l4}
-	if t.srcExcluded {
-		if srcAny {
-			// `any` (a family wildcard) + `source-address-excluded` is "every
-			// source EXCEPT every source" = the empty set: the term matches
-			// NOTHING for this family and MUST project no rule (#5828). This is
-			// keyed on the family-scoped srcAny, so `any` suppresses BOTH families
-			// while `any-ipv4`/`any-ipv6` suppress only their own. Falling through
-			// to the len(src)==0 => SrcAny arm below would invert this degenerate
-			// case into an unconditional all-source DROP — an over-deny that can
-			// lock out every direct host-bound flow on the ingress zone.
-			return JunosHostDenyRule{}, false
-		}
-		// A genuinely constrained excluded set: match every source NOT in the
-		// set. A family with no prefix in the excluded set therefore matches ALL
-		// of that family (mirrors matchAddr's "constrained, no F-prefix, except
-		// -> match ALL"). This is the intended match-all-of-opposite-family
-		// semantic — e.g. `source-address 10.0.0.0/8 + excluded` drops every IPv6
-		// source (no v6 prefix in the set) and every non-10/8 IPv4 source.
-		rule.SrcExcluded = len(src) > 0
-		rule.SrcAny = len(src) == 0
-		rule.Src = append([]string(nil), src...)
-	} else if srcAny {
-		rule.SrcAny = true
-	} else {
-		if len(src) == 0 {
-			// Constrained positive source with no prefix of this family -> matches
-			// nothing (Junos empty-positive-set semantic).
-			return JunosHostDenyRule{}, false
-		}
-		rule.Src = append([]string(nil), src...)
+	matchAny, matchExcluded, set, ok := junosHostProjectAddrMatch(src, srcAny, t.srcExcluded, srcEmptyBoth)
+	if !ok {
+		return JunosHostDenyRule{}, false
 	}
+	rule.SrcAny, rule.SrcExcluded, rule.Src = matchAny, matchExcluded, set
+	matchAny, matchExcluded, set, ok = junosHostProjectAddrMatch(dst, dstAny, t.dstExcluded, dstEmptyBoth)
+	if !ok {
+		return JunosHostDenyRule{}, false
+	}
+	rule.DstAny, rule.DstExcluded, rule.Dst = matchAny, matchExcluded, set
 	if permitFam := junosHostDedup(permit); len(permitFam) > 0 {
 		rule.PermitSubtract = permitFam
 	}
 	return rule, true
+}
+
+// junosHostProjectAddrMatch projects ONE family's address match — the resolved
+// per-family CIDR set, that family's wildcard bit, and the `*-excluded` flag —
+// into the rule's (any, excluded, set) predicate triple. ok=false means the
+// match resolves to "match NOTHING" for this family, so the caller must project
+// no rule at all.
+//
+// This is the SINGLE formula for BOTH the source and the destination dimension
+// so the two can never drift. In particular the #5828 degenerate case — `any`
+// (or the family-scoped `any-ipv4`/`any-ipv6`) together with `*-excluded`, i.e.
+// "every address EXCEPT every address" = the empty set — must project NO rule on
+// EITHER dimension. Classifying its empty concrete set as the "any" arm instead
+// would invert the authored domain into an UNCONDITIONAL drop and could lock out
+// all direct host-bound traffic on the ingress zone.
+//
+// The other arms mirror policymatch.matchAddr:
+//   - constrained + excluded: match every address NOT in the set. A family with
+//     no prefix in the excluded set therefore matches ALL of that family (e.g.
+//     `10.0.0.0/8` + excluded drops every IPv6 address and every non-10/8 IPv4
+//     one) — the intended match-all-of-opposite-family semantic.
+//   - wildcard, not excluded: match everything, with no predicate rendered.
+//   - constrained positive with no prefix of this family: matches nothing
+//     (Junos empty-positive-set semantic).
+//
+// emptyBothFamilies reports that the authored match resolved to NO prefix in
+// EITHER family and carries no wildcard. Combined with `excluded` that is the
+// degenerate "everything except nothing" form, which Rust fails CLOSED on
+// (rule_l3_matches requires !(v4_empty && v6_empty)); projecting the match-all
+// arm for it would silently widen the authored scope to every firewall address
+// while the dataplane denies nothing. It is unreachable via strict commit — the
+// address-set member gate rejects an empty/dangling set — but reachable on the
+// lenient load / peer-sync path from a config an older binary persisted.
+func junosHostProjectAddrMatch(set []string, anyFam, excluded, emptyBothFamilies bool) (matchAny, matchExcluded bool, out []string, ok bool) {
+	switch {
+	case excluded:
+		if anyFam {
+			return false, false, nil, false
+		}
+		if emptyBothFamilies {
+			// Fail CLOSED, matching Rust: project no rule at all rather than an
+			// unconditional drop.
+			return false, false, nil, false
+		}
+		return len(set) == 0, len(set) > 0, append([]string(nil), set...), true
+	case anyFam:
+		return true, false, nil, true
+	case len(set) == 0:
+		return false, false, nil, false
+	default:
+		return false, false, append([]string(nil), set...), true
+	}
 }
 
 // junosHostFamilyL4 keeps the L4 fragments meaningful for a family (ICMP -> v4

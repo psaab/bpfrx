@@ -119,8 +119,7 @@ test-rust:
 # item 8). Regenerates scripts/refactoring-audit.sh output to a temp
 # file and diffs it against the committed
 # docs/refactoring-audit-current.txt, printing the exact drift and the
-# one-line regenerate command. Fails if they differ OR if the generator
-# itself fails.
+# one-line regenerate command.
 #
 # The AUTHORITATIVE enforcement is the pkg/refactoraudit canary
 # (TestHeatmapNotStale), which runs under `go test ./...` inside the
@@ -130,21 +129,80 @@ test-rust:
 # the drift before `make test` fails, then commit the regenerated
 # artifact.
 #
+# This target's verdict MUST agree with that canary, or the two surfaces
+# teach opposite lessons and both get ignored — which is how the artifact
+# came to sit stale for 21 consecutive commits (#6617). The canary gates
+# audit CONTENT (which files are audited, at which tier); the LOC column
+# is an advisory snapshot that the tree outruns constantly and that no
+# gate can keep byte-exact under parallel merges. So this target
+# classifies its own diff:
+#
+#   no diff                       -> up to date, exit 0
+#   LOC-only (same files+tiers)   -> ADVISORY refresh, exit 0 (canary passes)
+#   a file entered/left/retiered  -> ERROR, exit 1 (canary WILL fail)
+#
+# The full `diff -u` is printed either way, so a refresh is still one
+# command away when you want the numbers current.
+#
 # Recipe notes: Make runs the recipe in one shell without `set -e`, so
-# the generator is `&&`-chained to `diff` to make a generator failure
-# (not just a diff mismatch) take the error path. `trap ... EXIT`
-# guarantees the temp file is removed on every exit path.
+# each step's failure is handled explicitly. `trap ... EXIT` guarantees
+# the temp files are removed on every exit path. The awk projection
+# drops the LOC column ($$2), leaving "tier path" — the canary's
+# criterion — and sorts it so row order cannot affect the verdict.
 .PHONY: audit-check
 audit-check:
-	@tmp=$$(mktemp); \
-	trap 'rm -f "$$tmp"' EXIT; \
-	bash scripts/refactoring-audit.sh > "$$tmp" && \
-	diff -u docs/refactoring-audit-current.txt "$$tmp" || { \
-		echo "ERROR: docs/refactoring-audit-current.txt is stale or the audit script failed."; \
-		echo "Run: bash scripts/refactoring-audit.sh > docs/refactoring-audit-current.txt"; \
+	@tmp=$$(mktemp); com=$$(mktemp); gen=$$(mktemp); \
+	trap 'rm -f "$$tmp" "$$com" "$$gen"' EXIT; \
+	bash scripts/refactoring-audit.sh > "$$tmp" || { \
+		echo "ERROR: scripts/refactoring-audit.sh failed."; \
 		exit 1; \
 	}; \
-	echo "audit-check: refactoring-audit-current.txt is up to date"
+	for f in docs/refactoring-audit-current.txt "$$tmp"; do \
+		if awk 'NF == 0 { next } \
+			NF != 3 { print "  " FILENAME ": want 3 fields, got " NF ": " $$0; bad = 1; next } \
+			$$1 != "[REFACTOR]" && $$1 != "[WATCH]" { print "  " FILENAME ": bad tier " $$1 ": " $$0; bad = 1; next } \
+			$$2 !~ /^[0-9]+$$/ { print "  " FILENAME ": non-numeric LOC " $$2 ": " $$0; bad = 1 } \
+			{ rows++ } \
+			END { if (rows == 0) { print "  " FILENAME ": zero rows"; bad = 1 } exit bad }' "$$f"; then :; else \
+			echo "ERROR: $$f is malformed."; \
+			echo "  Validated BEFORE the diff, and on BOTH the committed artifact and the"; \
+			echo "  freshly generated one. Doing it after the diff let an identically"; \
+			echo "  malformed pair pass as 'up to date', and checking only the committed"; \
+			echo "  side let a broken generator through — while the Go parser rejected"; \
+			echo "  each. This target must not report green on input the suite refuses."; \
+			exit 1; \
+		fi; \
+	done; \
+	if diff -u docs/refactoring-audit-current.txt "$$tmp"; then \
+		echo "audit-check: refactoring-audit-current.txt is up to date"; \
+		exit 0; \
+	fi; \
+	if awk 'NF != 3 { print "  malformed row (want 3 fields, got " NF "): " $$0; bad = 1 } \
+		END { exit bad }' docs/refactoring-audit-current.txt; then :; else \
+		echo "ERROR: docs/refactoring-audit-current.txt has malformed rows."; \
+		echo "  The Go parser requires exactly 3 fields; this target used to project"; \
+		echo "  \$$1,\$$3 and silently ignore extra ones, so a hand edit could pass here"; \
+		echo "  and fail the test suite."; \
+		exit 1; \
+	fi; \
+	awk '{print $$1, $$3}' docs/refactoring-audit-current.txt | LC_ALL=C sort > "$$com"; \
+	awk '{print $$1, $$3}' "$$tmp" | LC_ALL=C sort > "$$gen"; \
+	if cmp -s "$$com" "$$gen"; then \
+		echo "audit-check: ADVISORY — same files, same tiers; only the LOC snapshot drifted."; \
+		echo "  This target compares the (tier, path) projection SORTED, so it is blind to"; \
+		echo "  LOC values and to row order BY DESIGN — that is what makes LOC advisory."; \
+		echo "  TestHeatmapNotStale passes on this. It is NOT a statement about the whole"; \
+		echo "  suite: TestHeatmapArtifactWellFormed still checks each row's LOC against its"; \
+		echo "  tier band and checks generator sort order, and can fail while this target is"; \
+		echo "  green. Run 'go test ./pkg/refactoraudit/' for the authoritative answer."; \
+		echo "  Refresh when convenient:"; \
+		echo "    bash scripts/refactoring-audit.sh > docs/refactoring-audit-current.txt"; \
+		exit 0; \
+	fi; \
+	echo "ERROR: a file entered the audit, left it, or changed tier."; \
+	echo "  TestHeatmapNotStale WILL FAIL until the artifact is regenerated:"; \
+	echo "    bash scripts/refactoring-audit.sh > docs/refactoring-audit-current.txt"; \
+	exit 1
 
 # Upgrade/install docs canary (#2001). Fails if either of the two
 # misleading upgrade-install doc phrasings reappears: "symlinks into the

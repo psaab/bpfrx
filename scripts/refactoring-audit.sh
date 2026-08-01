@@ -20,6 +20,15 @@
 # test blocks are rare and accepting the modest over-count is
 # simpler than a brittle stripper.
 #
+#
+# Output is committed to docs/refactoring-audit-current.txt. The gate on
+# that artifact (TestHeatmapNotStale in pkg/refactoraudit) compares the
+# audited file set and each file's tier, NOT the exact bytes — the LOC
+# column is an advisory snapshot the tree is expected to outrun between
+# regenerations (#6617; see docs/refactoring-audit.md "Drift guard").
+# Output must still be byte-reproducible run to run, which
+# TestGeneratorDeterministic pins.
+#
 # Run from repo root or anywhere — uses `git rev-parse` to anchor.
 set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
