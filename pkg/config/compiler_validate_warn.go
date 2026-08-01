@@ -379,11 +379,15 @@ func ValidateConfig(cfg *Config) []string {
 			warnings = append(warnings, fmt.Sprintf(
 				"%s: system-services \"all\" now expands to the union of the "+
 					"named system-services (Junos parity, #3226) and no longer "+
-					"admits every IP protocol/port — GRE/ESP/AH/OSPF/PIM/VRRP, "+
+					"admits every IP protocol/port — GRE, OSPF/PIM/VRRP, "+
 					"unlisted TCP/UDP ports and future protocol numbers are now "+
 					"DENIED to the zone's local addresses unless listed "+
 					"explicitly under system-services / protocols; use "+
-					"\"any-service\" for the previous packet-wide admit.", where))
+					"\"any-service\" for the previous packet-wide admit. "+
+					"ESP/AH are NOT affected: they keep an unconditional "+
+					"global accept (host-terminated IPsec is decrypted by XFRM "+
+					"before any host-inbound deny), so no action is needed for "+
+					"them — and there is no esp/ah token to list in any case.", where))
 			return // one advisory per stanza
 		}
 	}

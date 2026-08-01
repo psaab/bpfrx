@@ -439,12 +439,21 @@ func TestHostInboundMatrixDocDoesNotAdviseTheRefutedRemedy(t *testing.T) {
 	}
 	lines := strings.Split(string(raw), "\n")
 
-	begin, end := -1, -1
+	// Count the markers as well as locating them. Taking the LAST BEGIN (a
+	// bare `begin = i`) let someone widen the fence to wrap the entire
+	// document, at which point "the phrasing appears only inside the fence" is
+	// trivially true and this guard passes vacuously. Exactly one pair, and the
+	// FIRST begin, so the fence stays a bounded region.
+	begin, end, nBegin, nEnd := -1, -1, 0, 0
 	for i, l := range lines {
 		if strings.Contains(l, "REFUTED-REMEDY:BEGIN") {
-			begin = i
+			nBegin++
+			if begin == -1 {
+				begin = i
+			}
 		}
 		if strings.Contains(l, "REFUTED-REMEDY:END") {
+			nEnd++
 			end = i
 		}
 	}
@@ -452,6 +461,18 @@ func TestHostInboundMatrixDocDoesNotAdviseTheRefutedRemedy(t *testing.T) {
 		t.Fatalf("%s is missing a well-formed REFUTED-REMEDY:BEGIN/END fence (begin=%d end=%d) — "+
 			"without it this guard cannot tell refutation from live advice, and would either "+
 			"pass vacuously or reject the refutation itself", hostInboundMatrixDoc, begin, end)
+	}
+	if nBegin != 1 || nEnd != 1 {
+		t.Fatalf("%s has %d REFUTED-REMEDY:BEGIN and %d END markers; want exactly one of each. "+
+			"Multiple fences let the refuted phrasing hide in whichever region this guard "+
+			"happens to bound.", hostInboundMatrixDoc, nBegin, nEnd)
+	}
+	// A fence wide enough to wrap the whole document makes "only inside the
+	// fence" vacuously true. Bound it: the refutation is a section, not the doc.
+	if span, total := end-begin, len(lines); span*2 > total {
+		t.Fatalf("%s: the REFUTED-REMEDY fence spans %d of %d lines (>50%%). A fence that wide "+
+			"makes this guard vacuous — it would accept the refuted remedy anywhere. Keep the "+
+			"fence around the refutation section only.", hostInboundMatrixDoc, span, total)
 	}
 
 	// Phrases that only make sense as ADVICE to use an lo0 filter. Kept narrow

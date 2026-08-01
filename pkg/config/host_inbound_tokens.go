@@ -699,9 +699,13 @@ func hiICMP(proto, typ uint8) L4Match {
 // hostInboundServiceMatches switch and the Rust classify_system_service admit
 // set exactly (docs/host-inbound-service-matrix.md), and applies the same family
 // gate: a family-specific token (HostInboundServiceFamily) returns nil for the
-// wrong family. Full-admit tokens (all / any-service, see
+// wrong family. The full-admit token (any-service, see
 // HostInboundFullAdmitService) and unrecognised tokens return nil — they are not
-// per-tuple matches. The nft builder renders these tuples back to byte-identical
+// per-tuple matches. `all` is NOT in that company since #3226: it returns the
+// WHOLE expansion (see the `case "all":` arm below), because it is now a union
+// of named services rather than a packet-wide admit. A caller reading the old
+// wording would conclude `all` yields no tuples and must therefore be
+// full-admit — exactly the inference this change removes. The nft builder renders these tuples back to byte-identical
 // match fragments (renderHostInboundMatches); the host-inbound classifier tests
 // each tuple against a queried packet tuple.
 func HostInboundServiceMatch(token, family string) []L4Match {

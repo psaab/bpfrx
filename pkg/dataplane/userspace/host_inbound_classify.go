@@ -132,8 +132,18 @@ type HostInboundViewVerdict struct {
 func (a HostInboundAdmission) Describe() string {
 	switch a.Status {
 	case HostInboundTokenAdmit:
-		if a.Token == "all" || a.Token == "any-service" {
-			return fmt.Sprintf("admitted by host-inbound-traffic system-services %s (all host services open)", a.Token)
+		// `all` is NOT a full admit since #3226 — it expands to the union of
+		// named services, so a zone carrying only `all` still DENIES gre/47,
+		// tcp/113 and anything else outside that union. Saying "all host
+		// services open" here contradicted the enforcement on the same zone in
+		// the same breath.
+		if a.Token == "any-service" {
+			return "admitted by host-inbound-traffic system-services any-service (all host services open)"
+		}
+		if a.Token == "all" {
+			return "admitted by host-inbound-traffic system-services all (the union of " +
+				"named system-services; NOT a packet-wide admit — see `show " +
+				"host-inbound-traffic services`)"
 		}
 		return fmt.Sprintf("admitted by host-inbound-traffic %s %s", a.Kind, a.Token)
 	case HostInboundGlobalAccept:

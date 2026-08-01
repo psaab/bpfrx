@@ -565,7 +565,7 @@ From zone: guest, To zone: lan
     the Junos definition — "traffic from the defined system services available
     on the Routing Engine" — and expands to the union of the named
     system-service tokens, so the zone keeps its catch-all host-inbound drop.
-    It does NOT admit raw IP protocols (GRE/ESP/AH/OSPF/PIM/VRRP or future
+    It does NOT admit raw IP protocols (GRE/OSPF/PIM/VRRP or future
     protocol numbers) or unlisted TCP/UDP ports; list those explicitly under
     `system-services` / `protocols`. The two xpf-only tokens are excluded from
     the expansion and must be listed explicitly: `gre` (Junos has no

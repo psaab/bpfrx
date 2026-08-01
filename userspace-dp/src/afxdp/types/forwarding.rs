@@ -361,8 +361,9 @@ pub(in crate::afxdp) struct ForwardingState {
 /// destination ports; ICMP-bearing services (ping, router-discovery) contribute
 /// the specific ICMP/ICMPv6 *types* they imply (#3201/#3240 — not the whole
 /// protocol); the raw `protocols` routing tokens contribute an IP-protocol
-/// number. `all_services` (Junos `system-services { all }` or
-/// `any-service`) short-circuits to a full admit. `protocols { all }` is NOT a
+/// number. `all_services` (Junos `any-service` ONLY — `system-services { all }`
+/// is NOT a full admit since #3226, it expands to the named service union)
+/// short-circuits to a full admit. `protocols { all }` is NOT a
 /// blanket admit (#3199): it expands at classify time to the routing-protocol
 /// signatures (ospf/bgp/rip/.../router-discovery), so it admits routing
 /// protocols but never a system service (SSH/HTTPS/SNMP/...) that was not
