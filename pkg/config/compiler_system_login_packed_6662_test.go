@@ -362,6 +362,15 @@ func TestLoginBareInstanceStillCompiles_6662(t *testing.T) {
 // The UNAPPLIED case is the false-positive half and must NOT reject: an
 // unapplied group is inert (the compiler ignores its body too), so rejecting it
 // would fail a config that does nothing.
+//
+// Scope note, so the binding is not overclaimed: only the APPLIED subtest is
+// mutation-bound. Making the gate blind to `system` reds it (M16). The UNAPPLIED
+// subtest holds STRUCTURALLY rather than by assertion — ExpandGroups DELETES the
+// whole `groups` stanza before compileExpanded runs runPreWalkGates, so the gate
+// cannot see an unapplied body no matter what it walks. An attempt to mutate the
+// gate into rejecting one was a no-op for exactly that reason. It is kept as
+// documentation of the ordering the applied case depends on, not as a guard that
+// a plausible edit could trip.
 func TestLoginPackedInsideAppliedGroupRejected_6662(t *testing.T) {
 	const groupBody = `groups { g1 { system { login { user alice class ops; } } } }`
 	const classDef = `system { login { class ops { permissions view; } } }`
