@@ -233,8 +233,12 @@ func TestClassifyHostInboundUnportedServicesAdmitNothing(t *testing.T) {
 		named := cfgWithHostInbound("edge", []string{token}, nil)
 		for _, tc := range probes {
 			if got := ClassifyHostInbound(named, "edge", tc.proto, true, tc.port, nil, "ip"); got.Status != HostInboundDenied {
-				t.Errorf("explicit `system-services %s`: %s got %+v, want DENIED — Junos fixes no "+
-					"listening port for this service (#3226)", token, tc.name, got)
+				t.Errorf("explicit `system-services %s`: %s got %+v, want DENIED — xpf has no "+
+					"authoritative listening port for this service. For rpm/r2cp the port is "+
+					"operator-configured, so none exists to restore; for tcp-encap/appqoe/"+
+					"high-availability it is UNSOURCED — a port may well exist, we could not "+
+					"source it, and inventing one would open the firewall to itself (#3226)",
+					token, tc.name, got)
 			}
 		}
 	}

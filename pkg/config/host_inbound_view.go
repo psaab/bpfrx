@@ -352,4 +352,3 @@ func (v HostInboundView) Render(l HostInboundLabels) []string {
 	}
 	return lines
 }
-

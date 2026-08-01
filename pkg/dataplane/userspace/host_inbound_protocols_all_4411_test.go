@@ -6,8 +6,9 @@ import "testing"
 // (avo-review-002): a zone carrying BOTH `host-inbound-traffic protocols all`
 // AND `system-services ssh`. `protocols all` is deliberately NOT a full admit
 // (#3199) — it expands to the routing-protocol set via HostInboundProtocolMatch,
-// NOT arbitrary L4 ports (unlike `system-services all` / `any-service`, which
-// HostInboundFullAdmitService opens wholesale). The boundary this pins:
+// NOT arbitrary L4 ports (unlike `any-service`, which
+// HostInboundFullAdmitService opens wholesale — note `system-services all` is
+// no longer in that company either, since #3226 scoped it to the named union). The boundary this pins:
 //
 //   - ssh (tcp/22) IS admitted, via the system-services token (admitted, not
 //     denied — the "ssh should be admitted-not-denied" property);

@@ -56,7 +56,8 @@ import (
 // KnownHostInboundSystemServices is the canonical set of recognized
 // host-inbound-traffic `system-services` tokens, including documented aliases
 // (`webapi-clear-text`/`http`, `netconf-ssh`/`ssh-netconf`, `rlogin`/`r-login`,
-// etc.) and the full-admit tokens `all` / `any-service`. Keep in lockstep with
+// etc.) and the full-admit token `any-service` (`all` is NOT full-admit since
+// #3226 — it expands to the named union). Keep in lockstep with
 // pkg/daemon hostInboundServiceMatches + hostInboundAllowsAll and the Rust
 // classify_system_service.
 var KnownHostInboundSystemServices = map[string]bool{

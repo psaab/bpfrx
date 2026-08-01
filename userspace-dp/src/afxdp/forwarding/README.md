@@ -389,8 +389,9 @@ RST — 113 is never opened to the host. On THIS secondary AF_XDP path the
 the admit set, so `admits()` returns false for TCP/113 and the rare
 AF_XDP-reached ident packet (DNAT/static-NAT-to-113 — an edge of an edge) is
 DROPPED rather than reset. This is a documented divergence from the kernel
-reset; both layers stop the prior plain-admit of 113. `all` / `any-service`
-precedence still wins (a fully-open zone admits 113). The token set stays in
+reset; both layers stop the prior plain-admit of 113. `any-service` precedence
+still wins (a fully-open zone admits 113); `system-services all` does not,
+since #3226 scoped it to the named union and ident is not in it. The token set stays in
 sync (ident-reset remains a recognized token on both layers); only the
 secondary-path action diverges (drop vs reset).
 
@@ -530,8 +531,9 @@ become a host-inbound bypass.
 Token
 classification covers the common Junos `system-services` (ssh, ping, dns,
 dhcp/dhcpv6, ike, ntp, snmp, ...) and `protocols` (ospf, bgp,
-router-discovery, ...) names; `system-services all` / `any-service`
-short-circuit to a full admit; an unrecognised token contributes nothing
+router-discovery, ...) names; `any-service` short-circuits to a full admit
+(`system-services all` does NOT — #3226 narrowed it to the named service
+union, so it classifies token-by-token); an unrecognised token contributes nothing
 (fail-closed). ICMP-based services admit only the specific ICMP **sub-types**
 they imply (#3201/#3240), matching the nft chain exactly — see "ICMP admission
 is sub-type specific" below.

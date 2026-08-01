@@ -48,8 +48,10 @@ func TestHostInboundNftMatchesKnownTokens(t *testing.T) {
 			// config.HostInboundServiceMatch and this goes RED.
 			if len(hostInboundServiceMatches(tok, "ip")) != 0 ||
 				len(hostInboundServiceMatches(tok, "ip6")) != 0 {
-				t.Errorf("unported system-service %q produced an nft match — Junos fixes no "+
-					"listening port for it, so any match here is a guess (#3226)", tok)
+				t.Errorf("unported system-service %q produced an nft match — xpf has no "+
+					"authoritative port for it (operator-configured for rpm/r2cp; UNSOURCED "+
+					"for tcp-encap/appqoe/high-availability, where a fixed port may exist but "+
+					"was not located), so any match here is a guess (#3226)", tok)
 			}
 			continue
 		}

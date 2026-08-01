@@ -1046,8 +1046,9 @@ func hostInboundHasEnforceableView(views []dpuserspace.ZoneHostInboundView) bool
 //     only), so it mirrors the shim's local-destination scope without touching
 //     transit UDP; only the WG port is opened, so the restricted default holds.
 //  4. Per host-inbound-configured zone, per family with addresses:
-//     - if `system-services all` / `any-service`: <fam> daddr <addrs> accept
-//     (and no deny — the operator opened the zone to all services).
+//     - if `any-service`: <fam> daddr <addrs> accept (and no deny — the
+//     operator opened the zone to all services). NOT `all`: #3226 narrowed
+//     `all` to the named union, so it flows through the per-match path below.
 //     - else: one accept per listed service/protocol scoped to the zone addrs
 //     (`protocols all` expands to the routing-protocol set — #3199, NOT a
 //     blanket accept), then a catch-all
@@ -1440,7 +1441,8 @@ func emitUnzonedHostInboundDeny(rules *[]string, family string, addrs []string) 
 // hostInboundEmitsDrop reports whether emitHostInboundZone will emit a catch-all
 // DROP (and therefore a named DROP counter) for this zone/family. A drop is
 // emitted whenever the family has at least one address AND the zone is not opened
-// to all services (`system-services all`/`any-service`). buildHostInboundFilterPayload
+// to all services (`any-service`; NOT `system-services all`, narrowed to the
+// named union by #3226). buildHostInboundFilterPayload
 // uses this to pre-declare the matching counter objects, so the two sites cannot
 // diverge on which (zone, family) pairs get a counter.
 func hostInboundEmitsDrop(v dpuserspace.ZoneHostInboundView, addrs []string) bool {
@@ -1454,8 +1456,9 @@ func emitHostInboundZone(rules *[]string, v dpuserspace.ZoneHostInboundView, fam
 		return
 	}
 	daddr := family + " daddr " + nftAddrSet(addrs)
-	// Only `system-services all` / `any-service` fully opens the zone: accept
-	// everything to its addresses, emit no deny. `protocols all` is scoped to
+	// Only `any-service` fully opens the zone: accept everything to its
+	// addresses, emit no deny. `system-services all` does NOT — #3226 scoped it
+	// to the named service union, so it takes the per-match path. `protocols all` is scoped to
 	// the routing-protocol set (#3199) and flows through the per-match path
 	// below, so it still gets a catch-all drop for non-routing traffic.
 	if hostInboundAllowsAll(v) {
@@ -1501,7 +1504,9 @@ func emitHostInboundZone(rules *[]string, v dpuserspace.ZoneHostInboundView, fam
 }
 
 // hostInboundAllowsAll reports whether the zone's system-services contains
-// `all` / `any-service` (full admit). `protocols all` is deliberately NOT a
+// `any-service` (full admit). Despite the name it does NOT match
+// `system-services all` — #3226 narrowed that to the named union; the
+// predicate is config.HostInboundFullAdmitService. `protocols all` is deliberately NOT a
 // full admit (#3199): in Junos it means all ROUTING protocols, not all
 // system-services and not a blanket accept. `protocols all` is expanded to the
 // concrete routing-protocol match set by hostInboundProtocolMatches instead, so
@@ -1617,8 +1622,10 @@ func hostInboundMatchSet(v dpuserspace.ZoneHostInboundView, family string) []hos
 }
 
 // hostInboundServiceMatches maps a Junos `system-services` token to nft match
-// fragments for the given family. Returns nil for `all` / `any-service`
-// (handled by hostInboundAllowsAll) and for unrecognised tokens (fail-closed).
+// fragments for the given family. Returns nil for `any-service` (handled by
+// hostInboundAllowsAll) and for unrecognised tokens (fail-closed). NOT for
+// `system-services all`: #3226 narrowed that to the named union, so it is
+// expanded token-by-token through this function like any other list.
 //
 // #3627 B1a: the token->tuple truth now lives in the structured SSOT
 // config.HostInboundServiceMatch (shared with the match-policies host-inbound

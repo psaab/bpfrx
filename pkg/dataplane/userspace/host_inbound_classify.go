@@ -250,7 +250,8 @@ func ClassifyHostInboundForInterface(cfg *config.Config, fromZone, ifaceRef stri
 // ordering (full-admit → global pre-accept → indeterminate short-circuits →
 // per-view token admit → default-deny) scoped to one view's token set.
 func classifyOneView(v ZoneHostInboundView, proto uint8, hasProto bool, dstPort int, icmpType *uint8, family string) HostInboundAdmission {
-	// Full-admit (`system-services all` / `any-service`) admits everything,
+	// Full-admit (`any-service` ONLY — #3226 narrowed `system-services all` to
+	// the named union) admits everything,
 	// independent of the tuple — report it even when the tuple is otherwise
 	// indeterminate.
 	for _, s := range v.SystemServices {
