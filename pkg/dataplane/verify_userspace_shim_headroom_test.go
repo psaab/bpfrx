@@ -75,14 +75,17 @@ func TestUserspaceShimHeadroomFloorBracketsKnownValues(t *testing.T) {
 
 // The recipe must handle every exit code shimverify can return, or a new
 // failure mode silently falls through the `*)` arm with a misleading
-// message. Exit 4 (#4555 low headroom) is the one added last.
+// message. Exit 4 is #4555 low headroom; exit 5 is #4555 UNMEASURABLE
+// headroom, which must fail rather than pass — a gate that switches
+// itself off when the kernel's log format changes reproduces the exact
+// blind spot it exists to close.
 func TestBuildRecipeHandlesShimverifyExitCodes(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join("build-userspace-xdp.sh"))
 	if err != nil {
 		t.Fatalf("read build-userspace-xdp.sh: %v", err)
 	}
 	recipe := string(data)
-	for _, want := range []string{"0) ;;", "99)", "3)", "4)"} {
+	for _, want := range []string{"0) ;;", "99)", "3)", "4)", "5)"} {
 		if !strings.Contains(recipe, want) {
 			t.Errorf("build-userspace-xdp.sh has no %q arm for the shimverify exit code", want)
 		}
@@ -94,5 +97,39 @@ func TestBuildRecipeHandlesShimverifyExitCodes(t *testing.T) {
 	// the sudo hop explicitly or it silently does nothing.
 	if !strings.Contains(recipe, `sudo -n env "XPF_SHIM_ALLOW_LOW_HEADROOM=`) {
 		t.Error("XPF_SHIM_ALLOW_LOW_HEADROOM is not passed through sudo — the documented override would be a no-op")
+	}
+}
+
+// #4555: an unmeasurable stats line must reach the refusal path, not the
+// pass path. This pins the decision the gate makes on that input; the
+// end-to-end exit code is exercised by the shimverify binary itself.
+func TestUnmeasuredStatsAreNotTreatedAsAcceptableHeadroom(t *testing.T) {
+	unmeasured := parseShimVerifierStats("no stats line here\n")
+	if unmeasured.Measured() {
+		t.Fatal("Measured() = true for a log with no stats line")
+	}
+	// The dangerous shape is code that compares HeadroomPct() against the
+	// floor without checking Measured() first: 0 < 3.0 would look like
+	// "below the floor" (safe by luck), but any future floor of 0 would
+	// make it read as "fine". Callers MUST branch on Measured().
+	if unmeasured.HeadroomPct() != 0 {
+		t.Errorf("HeadroomPct() = %v for unmeasured stats, want 0", unmeasured.HeadroomPct())
+	}
+}
+
+// #4555: the shim's Fragment arm advances by size_of::<FragHdr>() while
+// userspace-dp advances a literal 8. The Rust parity guard models that
+// struct's layout; this pins the compile-time assertion that backs it, so
+// the invariant cannot be deleted from the shim without a test noticing.
+func TestShimCarriesFragHdrSizeAssertion(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "userspace-xdp", "src", "lib.rs"))
+	if err != nil {
+		t.Fatalf("read userspace-xdp/src/lib.rs: %v", err)
+	}
+	src := string(data)
+	if !strings.Contains(src, "mem::size_of::<FragHdr>() == 8") {
+		t.Error("the shim no longer asserts size_of::<FragHdr>() == 8 at compile time; " +
+			"a field added to FragHdr would make it advance 9 bytes past a Fragment header " +
+			"where userspace-dp advances 8, corrupting every fragmented-chain L4 offset (#4555)")
 	}
 }

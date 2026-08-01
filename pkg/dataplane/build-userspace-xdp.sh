@@ -158,6 +158,15 @@ case "${VERIFY_RC}" in
   previously reached 0.92% headroom with every gate green, and the next edit to its
   parsing paths then hit the 1M processed-insn wall. Reduce verifier cost, or re-run
   with XPF_SHIM_ALLOW_LOW_HEADROOM=1 to install anyway with the risk understood." ;;
+5)
+	fail "the candidate LOADS but its verifier headroom could NOT be measured — the tracked
+  ${OUT_FILE} was NOT updated. This kernel's verifier log carried no
+  'processed N insns (limit M)' line, so the #4555 floor could not be applied and how
+  close this object sits to the 1M wall is UNKNOWN. Unmeasurable is refused on purpose:
+  a gate that switches itself off when the log format changes is exactly how the shim
+  crept to 0.92% headroom unnoticed in the first place. If this kernel genuinely reports
+  differently, re-run with XPF_SHIM_ALLOW_LOW_HEADROOM=1 — an explicit acknowledgement
+  that the object shipped unmeasured." ;;
 *)
 	fail "shimverify failed (rc=${VERIFY_RC}) — the tracked ${OUT_FILE} was NOT updated." ;;
 esac

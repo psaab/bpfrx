@@ -208,6 +208,32 @@ Guard layers (`build-userspace-xdp.sh`):
      a message pointing back to `make generate`.
      `TestUserspaceXDPManifestCoversTrackedShimInputs` additionally guards
      the input SET so a manifest hand-edit cannot drop or invent entries.
+6. **Verifier-headroom tripwire (#4555)** — every layer above is BINARY:
+   the object loads or it does not. That is exactly how the shim came to
+   sit at 990,796 of 1,000,000 processed insns (0.92% headroom) with all
+   five gates green, until a routine change to the IPv6 extension-header
+   walk hit the 1M wall and had to be redesigned around the budget. So
+   `shimverify` now also reads the verifier's own accounting
+   (`LogLevelStats` → `processed N insns (limit M)`) and refuses a
+   candidate that LOADS but leaves less than
+   `UserspaceShimMinVerifierHeadroomPct` (3%) unused.
+   - **Exit codes**: `0` PASS, `3` verifier REJECT, `4` loads but below
+     the floor, `5` loads but headroom could NOT be measured, `2` usage,
+     `1` other. The recipe has an arm for each.
+   - **Unmeasurable is a failure, deliberately.** If the running kernel's
+     log carries no recognisable stats line the floor cannot be applied,
+     and passing there would switch the gate off at the one moment
+     headroom is unknown — reproducing the blind spot it exists to close.
+   - **Override**: `XPF_SHIM_ALLOW_LOW_HEADROOM=1` covers both refusals,
+     mirroring `XPF_SHIM_ALLOW_UNPINNED_INSTALL`. It is threaded through
+     the `sudo` hop explicitly (sudo scrubs the environment, so it would
+     otherwise be a silent no-op). Consuming it prints a loud banner
+     naming the object and the reason; a run that did NOT need it but has
+     it set prints a staleness note, because the variable lives in the
+     ambient environment and a value exported once would otherwise
+     disarm the gate forever.
+   - 3% is a tripwire, not a performance target: it says "the next change
+     here will not fit" while there is still room to plan.
 
 **Recovery runbook** (symptom: `load Rust xdp_userspace collection:
 ... BPF program is too large. Processed 1000001 insn`, daemon in

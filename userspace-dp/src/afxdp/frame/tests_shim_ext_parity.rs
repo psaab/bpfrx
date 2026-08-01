@@ -91,6 +91,10 @@ struct ShimWalk {
     bound: usize,
     /// Classification of all 256 next-header values.
     classes: [EhClass; 256],
+    /// Bytes the Fragment arm advances, RESOLVED to a number rather than
+    /// left as the `mem::size_of::<FragHdr>()` token the arm is written
+    /// with. See `resolve_packed_struct_size` for why this matters.
+    fragment_advance: usize,
 }
 
 impl ShimWalk {
@@ -282,6 +286,104 @@ fn shim_nexthdr_consts(src: &str) -> std::collections::HashMap<String, u8> {
     out
 }
 
+/// Resolve `mem::size_of::<NAME>()` to a NUMBER by modelling the shim
+/// struct's layout, instead of trusting the token.
+///
+/// Token equality pins the TEXT of an expression, not its VALUE. The
+/// Fragment arm advances by `mem::size_of::<FragHdr>()`, so adding a
+/// field to `FragHdr` makes the shim advance 9 bytes where userspace
+/// advances a literal 8 — corrupting every Fragment-chain L4 offset —
+/// with every pinned arm literal still byte-identical. That hole was
+/// demonstrated against the previous revision of this file: both the
+/// guard and the negative control passed with a one-byte-larger
+/// `FragHdr`. This function closes it by computing the size the shim
+/// would actually get.
+///
+/// Only `#[repr(C, packed)]` structs of fixed-width scalar fields are
+/// modelled — that is what the shim's header structs are, and the naive
+/// field-size sum is exact only without padding. Anything else (a
+/// non-packed repr, an unknown field type, a missing struct) panics
+/// rather than guessing, because a wrong size here would silently
+/// re-open the hole.
+fn resolve_packed_struct_size(src: &str, name: &str) -> usize {
+    let decl = format!("struct {name} {{");
+    let at = src.find(&decl).unwrap_or_else(|| {
+        panic!(
+            "shim source has no `{decl}` — the #4555 guard resolves `mem::size_of::<{name}>()` \
+             to a byte count by modelling this struct. Re-establish the parity by hand and teach \
+             this parser the new shape."
+        )
+    });
+
+    // The repr attribute must sit in the few lines above the struct.
+    let preamble = &src[at.saturating_sub(200)..at];
+    assert!(
+        preamble.contains("#[repr(C, packed)]"),
+        "shim struct `{name}` is not `#[repr(C, packed)]`. This guard sums field widths, which is \
+         exact only without padding — with padding the shim's advance would differ from the sum \
+         and the #4555 Fragment-advance comparison below would be silently wrong. Re-establish \
+         the parity by hand and teach this parser the new shape. Preamble:\n{preamble}"
+    );
+
+    let body = braced_body(src, at + decl.len() - 1);
+    let mut size = 0usize;
+    let mut fields = 0usize;
+    for field in body.split(',') {
+        let field = field.trim();
+        if field.is_empty() || field.starts_with("//") {
+            continue;
+        }
+        let Some((_, ty)) = field.rsplit_once(':') else {
+            panic!(
+                "shim struct `{name}` has an unparseable field {field:?} — re-establish the #4555 \
+                 parity by hand and teach this parser the new shape"
+            )
+        };
+        let ty = ty.trim();
+        let width = match ty {
+            "u8" | "i8" => 1,
+            "u16" | "i16" => 2,
+            "u32" | "i32" => 4,
+            "u64" | "i64" => 8,
+            _ => {
+                // [u8; N] and friends.
+                if let Some(inner) = ty.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
+                    let Some((elem, count)) = inner.split_once(';') else {
+                        panic!("shim struct `{name}` field type {ty:?} is unmodelled")
+                    };
+                    let elem_width = match elem.trim() {
+                        "u8" | "i8" => 1,
+                        "u16" | "i16" => 2,
+                        "u32" | "i32" => 4,
+                        "u64" | "i64" => 8,
+                        other => panic!(
+                            "shim struct `{name}` array element type {other:?} is unmodelled — \
+                             re-establish the #4555 parity by hand"
+                        ),
+                    };
+                    let n: usize = count.trim().parse().unwrap_or_else(|e| {
+                        panic!("shim struct `{name}` array length {count:?}: {e}")
+                    });
+                    elem_width * n
+                } else {
+                    panic!(
+                        "shim struct `{name}` field type {ty:?} is unmodelled — this guard must \
+                         resolve every field to a byte width or the #4555 Fragment-advance \
+                         comparison is meaningless. Re-establish the parity by hand."
+                    )
+                }
+            }
+        };
+        size += width;
+        fields += 1;
+    }
+    assert!(
+        fields > 0,
+        "shim struct `{name}` parsed with no fields — re-establish the #4555 parity by hand"
+    );
+    size
+}
+
 /// Split a `match` arm list into `(pattern, body)` pairs.
 fn split_match_arms(arms_src: &str) -> Vec<(String, String)> {
     let mut arms: Vec<(String, String)> = Vec::new();
@@ -449,7 +551,45 @@ fn shim_walk_model(src: &str) -> ShimWalk {
             classes[proto] = *class;
         }
     }
-    ShimWalk { bound, classes }
+
+    // Resolve every `mem::size_of::<X>()` appearing in a walking arm to a
+    // byte count. Token equality above pins these expressions' TEXT; only
+    // this resolves their VALUE. Today the sole occurrence is
+    // `FragHdr` in the Fragment arm — the sweep is over the three pinned
+    // arm bodies, and a symbolic size introduced into any other arm would
+    // change that arm's pinned literal and red the equality check first.
+    let mut fragment_advance = 0usize;
+    for (pattern, body) in &arms {
+        if classify(pattern, body) != EhClass::Fragment {
+            continue;
+        }
+        let name = size_of_type_in(body).unwrap_or_else(|| {
+            panic!(
+                "the shim's Fragment arm no longer advances by a `mem::size_of::<..>()` — \
+                 re-establish the #4555 parity by hand and teach this parser the new shape. \
+                 Body:\n{body}"
+            )
+        });
+        fragment_advance = resolve_packed_struct_size(src, &name);
+    }
+    assert!(
+        fragment_advance > 0,
+        "the shim walk has no Fragment arm — re-establish the #4555 parity by hand"
+    );
+
+    ShimWalk {
+        bound,
+        classes,
+        fragment_advance,
+    }
+}
+
+/// Extract `NAME` from the first `mem::size_of::<NAME>()` in `body`.
+fn size_of_type_in(body: &str) -> Option<String> {
+    let at = body.find("size_of::<")?;
+    let rest = &body[at + "size_of::<".len()..];
+    let end = rest.find('>')?;
+    Some(rest[..end].trim().to_string())
 }
 
 /// Pin the structural property [`ShimWalk::max_resolvable_ext_headers`]
@@ -542,6 +682,25 @@ fn userspace_resolves_chain_of(n: usize) -> bool {
     )
 }
 
+/// Bytes THIS crate's walker advances past a Fragment header, measured by
+/// probing rather than read off the literal in `inspect.rs`. Compared
+/// against the shim's resolved `size_of::<FragHdr>()`.
+fn userspace_fragment_advance() -> usize {
+    const FRAGMENT: u8 = 44;
+    let mut buf = vec![0u8; 96];
+    buf[0] = 0x60;
+    buf[6] = FRAGMENT;
+    buf[40] = PROBE_TCP; // next header of the fragment header
+    let walk = walk_ipv6_ext_chain(&buf, 0);
+    match walk.outcome {
+        ExtChainOutcome::L4(off, PROBE_TCP) => off - 40,
+        other => panic!(
+            "the userspace fragment probe no longer resolves to TCP ({other:?}); the #4555 \
+             Fragment-advance comparison needs updating for the new walker shape"
+        ),
+    }
+}
+
 /// Longest extension-header chain whose L4 this crate's walker resolves,
 /// measured rather than read off the constant.
 fn userspace_max_resolvable_ext_headers() -> usize {
@@ -592,6 +751,25 @@ fn shim_ipv6_ext_walk_matches_userspace_walker() {
         "#4555: shim MAX_EXT_HDRS ({}) != MAX_IPV6_EXT_HEADERS - 1 ({})",
         shim.bound,
         MAX_IPV6_EXT_HEADERS - 1,
+    );
+
+    // The Fragment arm's advance compared by VALUE, not by the token the
+    // arm is written with. Pinning the text `mem::size_of::<FragHdr>()`
+    // does not pin its size: a field added to FragHdr makes the shim
+    // advance 9 bytes where this crate advances a literal 8, corrupting
+    // every Fragment-chain L4 offset with every pinned arm literal still
+    // byte-identical. That was demonstrated against the previous revision
+    // of this file — both this test and the negative control passed.
+    let userspace_frag = userspace_fragment_advance();
+    assert_eq!(
+        shim.fragment_advance, userspace_frag,
+        "#4555 Fragment-header ADVANCE drift: the AF_XDP shim advances {} bytes past a Fragment \
+         header (size_of::<FragHdr>(), resolved from its field layout) but this crate's \
+         walk_ipv6_ext_chain advances {}. Every L4 offset in a fragmented IPv6 chain would differ \
+         between the two, so the shim's session key points at the wrong bytes. The IPv6 Fragment \
+         header is fixed at 8 bytes (RFC 8200 §4.5) — if FragHdr changed, that is the bug; the \
+         shim also carries a compile-time assertion on this.",
+        shim.fragment_advance, userspace_frag,
     );
 
     let mut drift: Vec<String> = Vec::new();

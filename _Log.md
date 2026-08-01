@@ -1,3 +1,77 @@
+## 2026-08-01 — #4555 round 2: two Codex MAJORs (symbolic-size hole, fail-open headroom gate)
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Round-2 hostile review returned MERGE-NEEDS-MAJOR with two
+  findings, both proven by execution. Both are real; I reproduced each
+  firsthand before fixing.
+
+  **MAJOR 1 — a THIRD hole in the parity guard, surviving the round-1
+  equality pinning.** The shim's Fragment arm advances by
+  `mem::size_of::<FragHdr>()`. Round 1 pinned arm bodies by token
+  equality, which pins that expression's TEXT but not its VALUE. Adding
+  one byte to `FragHdr` makes the shim advance 9 where userspace
+  advances a literal 8, corrupting every L4 offset in a fragmented IPv6
+  chain — and every pinned literal stays byte-identical. Reproduced:
+  with `pad: u8` added, both the guard and the negative control passed
+  `ok`. This is the same class already closed twice (pin the value, not
+  the text), one level further down.
+
+  Fixed at two layers. In the shim, `const _: () = assert!(size_of::
+  <FragHdr>() == 8)` — the invariant belongs in the crate that owns the
+  type, and it fails the BUILD with an assertion message, not a generic
+  compile error. In the guard, `resolve_packed_struct_size` models the
+  struct's layout (requires `#[repr(C, packed)]`, sums field widths,
+  panics on any unmodelled field type rather than guessing) and the test
+  compares the RESOLVED advance against userspace's advance measured by
+  probe. Both layers fire independently on the mutation.
+
+  Search scope for the same shape: the three pinned arm bodies are the
+  only place a symbolic value can hide, and `FragHdr` is the only
+  `size_of::<..>()` among them. The generic and AH arms use literal
+  arithmetic, which token equality does pin. The resolver is written
+  generically (`size_of_type_in`) so a symbolic size introduced
+  elsewhere resolves too.
+
+  **MAJOR 2 — the headroom gate false-passed exactly when headroom was
+  unknown.** Round 1 made an unparseable stats line WARN and pass, on
+  the reasoning that "cannot measure" is not "at the wall" and blocking
+  over a kernel log-format difference guards nothing. That reasoning
+  does not survive the tripwire's purpose: the thing it exists to
+  prevent is the shim sitting at 0.92% because nothing was watching, and
+  a gate that switches itself off when the format changes reproduces
+  that failure mode — silently, and a WARN is invisible in an automated
+  build. Unmeasurable is now a refusal, `shimverify` exit 5, with its
+  own recipe arm and remediation text. Took a DISTINCT exit code from
+  the below-floor case (4) because the two need different remediation,
+  under the SAME `XPF_SHIM_ALLOW_LOW_HEADROOM=1` override so a genuine
+  kernel difference is one documented env var from unblocking.
+
+  Also hardened the override itself, which is read from the ambient
+  environment: consuming it now prints a loud banner naming the object
+  and which condition it suppressed, and a run that did NOT need it but
+  has it set prints a staleness note telling the operator to unset it.
+  Requiring it per-invocation is not implementable at the script level —
+  bash cannot distinguish an ambient export from a command-local prefix
+  — so surfacing staleness on the healthy path is the practical
+  equivalent, and it is the only place a stale export is visible.
+
+  Validation: `make generate` PASS, `processed 947188 insns (limit
+  1000000), headroom 5.28%`; the object is BIT-IDENTICAL again (a const
+  assertion emits no code), so the previously banked cluster smoke still
+  covers the shipped bytes. Full 9-row mutation matrix re-run against
+  the round-2 guard — every one of the 7 mutations reds it, the negative
+  control stays green in all 9 rows, no regression in the rows round 2
+  did not touch. Exit-5 path proven by making the stats regex
+  unmatchable (the exact "log format changed" condition): exit 5 without
+  the override, exit 0 with it plus the OVERRIDDEN banner, exit 0 after
+  restore.
+- **File(s)**: userspace-xdp/src/lib.rs,
+  userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  cmd/shimverify/main.go, pkg/dataplane/build-userspace-xdp.sh,
+  pkg/dataplane/verify_userspace_shim_headroom_test.go,
+  pkg/dataplane/README.md, pkg/dataplane/userspace_xdp_manifest.json,
+  _Log.md
+
 ## 2026-08-01 — #4555 review fold: guard scope, headroom tripwire, two doc corrections
 
 - **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)

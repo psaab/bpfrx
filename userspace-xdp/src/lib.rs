@@ -409,6 +409,26 @@ struct FragHdr {
     identification: u32,
 }
 
+// #4555: the Fragment arm of `parse_ipv6` advances by
+// `size_of::<FragHdr>()`, while userspace-dp's `walk_ipv6_ext_chain`
+// advances a literal 8 (`frame/inspect.rs`). The two must agree.
+//
+// The parity guard pins the walk's arm bodies by token equality, which
+// pins the TEXT `mem::size_of::<FragHdr>()` but NOT its VALUE — adding a
+// field here would silently make the shim advance 9 bytes and corrupt
+// every Fragment-chain L4 offset while the guard still reported ok. That
+// hole was real and demonstrated. This assertion fails the shim BUILD on
+// any layout change; the guard additionally models this struct's layout
+// so the parity test reds too, rather than relying on the build alone.
+//
+// 8 is not a tunable: it is the fixed size of the IPv6 Fragment header
+// (RFC 8200 §4.5).
+const _: () = assert!(
+    mem::size_of::<FragHdr>() == 8,
+    "FragHdr must stay 8 bytes: the IPv6 Fragment header is fixed at 8 (RFC 8200 §4.5) and \
+     userspace-dp's walk_ipv6_ext_chain advances a literal 8"
+);
+
 #[map(name = "userspace_ctrl")]
 static USERSPACE_CTRL: Array<UserspaceCtrl> = Array::with_max_entries(1, 0);
 
