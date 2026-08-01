@@ -3774,32 +3774,39 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   trace); a Local identity-agreeing match validates and marks the
   forward family in the same resolve.
 - **Companion-id binding (v10.34.0, round-118 Codex 1/2/7/9; the
-  carried expected id v10.36.0, round-120 Codex 4/5/6/7/8):** the
+  carried expected id v10.36.0, round-120 Codex 4/5/6/7/8; the per-hop
+  verify v10.37.0, round-121 Codex 4/5/8/9):** the
   positional fresh-flow reverse install records the forward entry's
   `session_id`; the site-2b Local-match synth records the matched id
-  (Shared-match synth → UNBOUND); an HA-imported reverse carries
+  and a Shared-match synth records the SHARED ROW's id (the
+  materialize-adopt adopts the same wire id, so the expectation
+  verifies once the forward materializes locally; a legacy zero-id row
+  → UNBOUND); an HA-imported reverse carries
   `expected_fwd_id` stamped at synthesis from the forward row's id
   (direct import, prewarm, AND singleton paths — all synthesize the
-  reverse from the forward row, `shared_ops.rs:750-785`) and binds
-  ONLY at its own synced→local promote by comparing the probed
-  forward's id AGAINST THE RECORDED expected id (never the bare
-  occupant — the K-capture trace; a refused forward import leaves the
-  local stranger's id ≠ expected → UNBOUND); the tunnel `UpsertLocal`
-  class carries 0 → UNBOUND-absorbing; an UNBOUND entry
-  NEVER binds on an ordinary hop (the stale-R1/stranger-K2 ABA case:
+  reverse from the forward row, `shared_ops.rs:750-785`); the
+  expectation sits in `fwd_companion_id` and EVERY reverse→forward hop
+  verifies the probed forward's id against it plus key+NAT — there is
+  NO bind step (a refused forward import leaves the
+  local stranger's id ≠ expected → the hop suppresses; the real
+  family's later arrival starts verifying immediately); the tunnel
+  `UpsertLocal`
+  class carries 0 → permanent UNBOUND; a zero-expectation entry
+  NEVER verifies on any hop (the stale-R1/stranger-K2 ABA case:
   R1's anchor sample never lands on K2 — K2 minted a distinct id) and
-  NEVER rebinds after a mismatch; a bound binding survives the forward
+  NEVER rebinds after a mismatch; a stored expectation survives the
+  forward
   entry's promotion/refresh and replication unchanged (id write-once
   for same-family refreshes; the promote-republication + local-origin
   publish + bulk-export paths populate the real id; a zero wire id
   ALWAYS fresh-mints — the flip evicts stale tokens, fail-closed);
-  the different-family overwrite promote (the (nat, is_reverse)
-  snapshot compare) runs remove+install semantics — re-minted id,
+  the different-family overwrite (the CARRIED incoming id ≠ the stored
+  id, or incoming 0) runs remove+install semantics — re-minted/adopted
+  id,
   zeroed anchor, gated seed, cleared probation/companion binding (a
   stale K-bound reverse then mismatches S2, and no close validates
-  against K's leftover anchor); reverse-direction anchor learning on
-  an
-  UNBOUND-absorbing entry is
+  against K's leftover anchor); reverse-direction anchor learning on a
+  zero-expectation entry is
   suppressed while forward-direction learning rides the direct
   canonical hit (fail-closed, bounded lingering, §2 posture).
 - **Cache precedence + the success postblock (v10.36.0, round-120
