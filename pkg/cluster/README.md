@@ -31,10 +31,11 @@ locating any symbol below is now a matter of opening the named file.
 - The #6169 across-reboot boot epoch — wire section constants, the
   key-derived marker (`heartbeatEpochMarker`), the verified-frame reader
   (`heartbeatFrameEpoch`), the plausibility bound (`epochUsableAsFloor`),
-  the monotonic seed published synchronously from the wall clock
-  (`Manager.heartbeatBootEpoch`) with its off-path persistence refinement
-  (`refineBootEpoch`, `withEpochFileLock`) and the start-time wiring
-  (`Manager.initHeartbeatEpochState`) — `heartbeat_epoch.go`. The downgrade
+  the wall-clock seed published synchronously (`Manager.heartbeatBootEpoch`,
+  increasing while the clock advances — not monotonic across a backward step,
+  residual 3) with its off-path, RE-RUNNABLE persistence refinement
+  (`refineBootEpoch`, `withEpochFileLock`, `Manager.refreshBootEpoch`) and the
+  start-time wiring (`Manager.initHeartbeatEpochState`) — `heartbeat_epoch.go`. The downgrade
   latch itself is process-scoped state on `heartbeatAuthState`; there is no
   peer-floor file.
 - Single-RG manual failover and transfer-commit protocol
@@ -325,9 +326,11 @@ peer liveness (`lastSeen`) or drive election.
   file intact (residual 3, #6711).
   - **Receiver** (`heartbeatAuthState.admitAuthed`, floor `highEpoch` on the
     `Manager` so it survives a heartbeat restart exactly like the ring):
-    `epoch < highEpoch` → REJECT (a retired incarnation); `epoch ==
-    highEpoch` → the same incarnation, fall through to the ring;
-    `epoch > highEpoch` → let the ring vet the nonce, then raise the floor.
+    `epoch < highEpoch` → REJECT (an incarnation OLDER than the highest one
+    accepted — which is a retired one only while the sender's epoch has not
+    regressed; see residual 3); `epoch == highEpoch` → normally the same
+    incarnation, fall through to the ring; `epoch > highEpoch` → let the ring
+    vet the nonce, then raise the floor.
     **The floor is tested BEFORE the ring is consulted and a rejected frame
     never reaches `ring.admit`.** That ordering is load-bearing: `admit`
     RECORDS a never-seen session as a side effect, so checking the epoch
@@ -445,22 +448,38 @@ peer liveness (`lastSeen`) or drive election.
       under the same identity and key, or a partial upgrade. While the peer is
       still on that build a durable latch refuses the captures *and the live
       peer*: that is the no-attacker-rollback cost above, not a separate gain.
-    - **Where the live peer is healthy again, it shuts one door with another
-      open beside it.** The latch can only have armed under this key because an
-      epoch-BEARING frame was accepted under it, so an on-link attacker holds
-      one of those too — and against empty post-restart state an archived
-      epoch-bearing frame is admitted whatever the latch says (`highEpoch` is 0,
-      the ring is empty; residual 5). Only a durable FLOOR closes that, and the
-      floor is the object priced out above.
 
-    The genuinely non-redundant residual is one narrow corner — an attacker
-    whose capture window sits strictly *inside* the rollback window, against a
-    peer that has since rolled forward and gone silent, across a receiver daemon
-    restart. It is **accepted**, not closed. Rollback recovery is a rotation
-    followed by `systemctl restart xpfd`, both operations operators already
-    perform, rather than a hand-edit of state; the rotation carries real weight
-    because without it the restart is defeatable by one replayed archived frame
-    (residual 5).
+    A second bullet used to read **"where the live peer is healthy again, it
+    shuts one door with another open beside it"** — the latch can only have
+    armed under this key because an epoch-BEARING frame was accepted under it,
+    so an on-link attacker holds one of those too, and against empty
+    post-restart state an archived epoch-bearing frame is admitted whatever the
+    latch says (residual 5). **That argument is wrong**, because the two doors
+    cost the attacker different things. Measured against a restarted receiver:
+    65 captured epoch-BEARING incarnations admit 325/325 on one ascending pass
+    and 0/1625 across five further rounds (the floor climbs with them and the
+    per-session watermark closes the rest — the set is spent), while 65
+    epoch-LESS incarnations captured under the CURRENT key admit 1625/1625 and
+    keep going, because nothing orders them and FIFO eviction hands back a
+    never-seen session every round. That is indefinitely sustained forged
+    liveness against a silent peer, and a durable PSK-scoped latch refuses all
+    of it.
+
+    So the benefit is real and is larger than "captures taken strictly inside a
+    rollback": it is every epoch-less capture taken under the current key. It is
+    **still declined**, on its own costs — a durable write on the accept path
+    with no good failure policy, cross-process locking there, and a strictly
+    heavier procedure for every no-attacker rollback — and the residual is
+    **accepted**, not closed. The exposure is bounded by the rollback (no
+    rollback under the current key, no epoch-less captures to replay) and is
+    metered rather than silent (`Heartbeats without epoch:`). Reconsider the
+    trade if a rollback under the current key ever becomes routine rather than
+    an incident action.
+
+    Rollback recovery is a rotation followed by `systemctl restart xpfd`, both
+    operations operators already perform, rather than a hand-edit of state; the
+    rotation carries real weight because without it the restart is defeatable by
+    one replayed archived frame (residual 5).
   - **ALWAYS-EMIT, and why this mechanism costs no HA availability.** The
     epoch is published SYNCHRONOUSLY from the wall clock with **no file access
     at all**, so every frame carries one from the very first send. Persistence
@@ -599,10 +618,31 @@ peer liveness (`lastSeen`) or drive election.
     instance: there is no pidfile, and the gRPC listener sets `SO_REUSEPORT`
     (`pkg/grpcapi/server.go`), so a second `xpfd` does NOT fail on a port
     collision the way it otherwise would. Two overlapping incarnations could
-    therefore interleave read-modify-write and publish epochs that are not
-    strictly ordered, which is the one property the whole mechanism rests on. An
-    advisory `flock` on a sidecar file (`withEpochFileLock`) serializes the whole
-    read-modify-write, not merely the write.
+    therefore interleave read-modify-write, and an interleaved one can lose the
+    update the other just made. An advisory `flock` on a sidecar file
+    (`withEpochFileLock`) serializes the whole read-modify-write, not merely the
+    write.
+
+    **It does NOT order incarnations**, and this section used to say it did
+    ("publish epochs that are not strictly ordered, which is the one property
+    the whole mechanism rests on"). It serializes by lock ACQUISITION, and
+    nothing ties that to daemon start or to survivorship — emission deliberately
+    precedes the worker that takes the lock. Older incarnation A publishes `a`
+    and is delayed; newer B publishes `b > a`, locks first, persists `b`; A locks
+    second, reads `b` and raises *itself* to `b+1`. The peer then latches the
+    OLDER incarnation and refuses the newer, surviving one. It cannot be closed
+    with this file alone — refinement only matters when the persisted value
+    exceeds our seed, and "a predecessor wrote it after a backward clock step"
+    and "a concurrent newer incarnation wrote it" leave the identical file, so
+    separating them needs a lifetime-held liveness lock or a writer identity in
+    the file. What IS closed is the unrecoverable half: refinement is re-run on
+    every later heartbeat start (`Manager.refreshBootEpoch`), so the stranded
+    incarnation climbs back above the file at the next `StartHeartbeat` — a VRF
+    rebind or an HA comms restart — instead of staying below the peer's floor
+    for the life of the process. Between the mis-ordering and that next start
+    this node is refused; there is no periodic re-check.
+    (`TestConcurrentIncarnationsAreOrderedByLockAcquisition_6669`,
+    `TestBootEpochRefreshIsIdempotent_6669`.)
 
     **It fails CLOSED — the write is SKIPPED, not run unlocked.** Proceeding
     unlocked does not trade correctness for liveness; it trades a TRANSIENT
@@ -740,9 +780,13 @@ peer liveness (`lastSeen`) or drive election.
        the file has by then been overwritten with the lower value.
 
        **Recovery is narrower than "a restart on either node".** Restarting the
-       SENDER while its clock is still wrong does not help — the file now holds
-       the *lower* value, so the next incarnation re-publishes from the same bad
-       clock (measured: still below the floor). Restarting the RECEIVER does
+       SENDER does not help *while its published reading is still below the
+       floor* — the file now holds the *lower* value, so the next incarnation
+       re-publishes from the same bad clock (measured: still below the floor).
+       The operative condition is the reading, not the clock: a clock that stays
+       two hours slow still reads past the floor two real hours later, and a
+       restart then publishes a value the peer admits at equality (`epoch ==
+       highEpoch` falls through to the ring). Restarting the RECEIVER does
        clear the floor, but an attacker holding one archived frame from the
        pre-regression incarnation re-raises it immediately, at one re-injection
        per restart — the same shape as residual 5, and it means the floor can be
@@ -768,11 +812,12 @@ peer liveness (`lastSeen`) or drive election.
        partial upgrade. Not closed in code: a durable FLOOR re-creates the
        peer-floor file this design deliberately removed; a durable PSK-scoped
        LATCH avoids that but pays a durable write on the accept path, a
-       cross-process lock there, and a heavier no-attacker rollback — and note
-       the rotation does **not** retire captures taken *after* it, so what the
-       durable latch closes is not "a window the rotation already closes" but
-       the narrow corner priced above, with the epoch-bearing replay path still
-       open beside it; and
+       cross-process lock there, and a heavier no-attacker rollback. It is
+       **not** declined as redundant: a rotation retires captures taken *before*
+       it and nothing else, and a durable latch refuses the epoch-less captures
+       taken under the CURRENT key — the ones that sustain forged liveness
+       indefinitely (1625/1625 admitted after a restart, against 0/1625 for a
+       spent epoch-bearing set). The pricing is above; and
        a freshness test needs a challenge-response or timestamp the wire format
        does not carry (a legitimately long-lived peer's epoch is arbitrarily
        old, so no recency test separates it from an archived one).
@@ -781,11 +826,14 @@ peer liveness (`lastSeen`) or drive election.
     6. **A bad persisted epoch heals only if the local clock is credible when
        refinement loads it.** Below `epochClockSaneFloor` the forward bound is
        skipped, so a wrong-but-below-2200 persisted value is chained from rather
-       than ignored; refinement runs once per `Manager`, so a later NTP
-       correction does not re-validate it. On an appliance with a dead RTC whose
-       `xpfd` always starts before time sync, the value therefore never heals,
-       and a correctly clocked peer refuses this node's epoch on its raise path
-       — asymmetric visibility, not mutual isolation. No complete close exists:
+       than ignored. On an appliance with a dead RTC whose `xpfd` starts before
+       time sync, the FIRST pass of every boot is made against an uncredible
+       clock, and a correctly clocked peer then refuses this node's epoch on its
+       raise path — asymmetric visibility, not mutual isolation. Refinement is
+       re-run at each later heartbeat start (`Manager.refreshBootEpoch`), so once
+       NTP corrects the clock the next `StartHeartbeat` heals the *file*; nothing
+       forces such an event, and the epoch this incarnation already published is
+       never lowered. No complete close exists:
        under a dead RTC a legitimate previous epoch and a corrupt future one are
        indistinguishable (nothing on the node is a trustworthy time reference),
        and healing after the fact would mean LOWERING a published epoch
@@ -804,6 +852,23 @@ peer liveness (`lastSeen`) or drive election.
        stalled read straddling an NTP correction cannot judge the file against a
        clock that no longer exists
        (`TestRefinementSamplesTheClockAfterLoadingPersistedState_6669`).
+    7. **The state lock orders lock acquisition, not incarnations.** Two
+       overlapping `xpfd` instances (no pidfile, `SO_REUSEPORT`) can publish in
+       one order and reach `withEpochFileLock` in the other: the OLDER one locks
+       second, reads the newer one's persisted value, and raises *itself* above
+       it. The peer then latches the older incarnation and refuses the newer,
+       surviving one. It cannot be closed with this file alone — a predecessor's
+       value after a backward clock step and a concurrent newer incarnation's
+       value leave the identical file — so a complete fix needs a lifetime-held
+       liveness lock, a writer identity in the file, or single-instance
+       enforcement for `xpfd`. What IS closed is the unrecoverable half:
+       refinement re-runs on every later heartbeat start
+       (`Manager.refreshBootEpoch`), so the stranded incarnation climbs back
+       above the file at the next `StartHeartbeat` instead of staying below the
+       floor for the life of the process. Until that start it is refused, and
+       there is no periodic re-check. Tracked as **#6724**.
+       (`TestConcurrentIncarnationsAreOrderedByLockAcquisition_6669`,
+       `TestBootEpochRefreshIsIdempotent_6669`.)
   - **No clone/bake requirement** (unlike the SNMPv3 engine-id, `pkg/snmp`).
     Epochs are compared per-PEER, never between the two nodes, so two chassis
     cloned from one image may hold identical persisted boot epochs harmlessly;
@@ -1314,9 +1379,12 @@ Procedure:
 > a confirmation that the latch is armed. The inline note is what reports the
 > latch.
 
-Rotation is also the **anti-replay capture-invalidation** step. Every archived
-capture an on-link sniffer holds was signed under the old key, so after a
-rotation none of it verifies.
+Rotation is also the **anti-replay capture-invalidation** step. Every capture
+an on-link sniffer took BEFORE the rotation was signed under the old key, so
+after a rotation none of it verifies. It does **not** retire a capture taken
+after the rotation: that frame was signed with the key still in force and still
+verifies (`TestRotationDoesNotRetirePostRotationCaptures_6669`). Rotation is the
+recovery step for an existing archive, not a prophylactic against a new one.
 The boot-epoch marker is key-derived (`HMAC(PSK, "xpf-ha-boot-epoch-v1")[:8]`),
 so it changes with the key automatically — no separate rollout step. The
 restart in step 3 also clears each node's in-memory epoch floor and latch; both

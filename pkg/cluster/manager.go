@@ -236,9 +236,22 @@ type Manager struct {
 	// NOTHING in production waits on it — StartHeartbeat used to, which stalled
 	// a node whose heartbeat was already stopped, and that wait was removed
 	// (initHeartbeatEpochState). Tests use it to join the worker.
-	bootEpochOnce  sync.Once
-	bootEpoch      atomic.Uint64
-	bootEpochReady chan struct{}
+	//
+	// bootEpochWrote is the epoch this incarnation last persisted, and
+	// bootEpochRefining admits one refine worker at a time. Refinement is
+	// RE-RUN on every later heartbeat start (Manager.refreshBootEpoch), because
+	// the epoch is resolved against a file other incarnations also write: one
+	// that takes withEpochFileLock after us can raise the file above what we
+	// published and park us below the peer's floor. Behind the boot-time
+	// sync.Once alone that lasted for the life of the process. bootEpochWrote is
+	// what keeps the re-run idempotent — a file still holding our own value is
+	// left alone rather than chained from, which would ratchet the epoch by one
+	// per pass.
+	bootEpochOnce     sync.Once
+	bootEpoch         atomic.Uint64
+	bootEpochReady    chan struct{}
+	bootEpochWrote    atomic.Uint64
+	bootEpochRefining atomic.Bool
 
 	// lastEpochDowngradeWarn rate-limits the epoch-downgrade rejection warning.
 	// The rejection is operator-actionable — a peer rolled back to a pre-#6169

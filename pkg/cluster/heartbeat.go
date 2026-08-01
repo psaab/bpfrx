@@ -561,9 +561,27 @@ func verifyHeartbeatMAC(data, authKey []byte) bool {
 //
 // It is a TOTAL order only while the sender's clock advances monotonically
 // across incarnations. A backward step larger than bootEpochMaxSkew sorts a
-// later incarnation below an earlier one — the #6711 residual. That direction
-// fails CLOSED (a genuine peer is refused, never a retired one admitted), so
-// the replay property above holds regardless; what it costs is availability.
+// later incarnation below an earlier one — the #6711 residual.
+//
+// THAT DIRECTION DOES NOT FAIL CLOSED. An earlier revision of this comment said
+// it did ("a genuine peer is refused, never a retired one admitted"), and that
+// is false in both halves. Once the sender regresses, the highest epoch on the
+// wire belongs to a RETIRED incarnation, so an archived frame from it is at or
+// above the floor and is ADMITTED — raising the floor, refreshing peer liveness
+// and applying its stale election state — while the genuine current incarnation
+// sits below and is refused. Measured in
+// TestArchivedEpochPoisonsAFreshFloor_6711. So the cost is availability AND one
+// admitted retired incarnation, not availability alone.
+//
+// What survives is narrower and is what the paragraph above actually needs:
+// SUSTAINED churn still requires heartbeatReplaySessions+1 captured sessions at
+// or above the floor, and since #6169 Stage 0 one incarnation emits exactly ONE
+// session (Manager.heartbeatNonce). So epoch-BEARING captures buy a finite
+// ascending pass rather than an indefinite one — measured on 65 captured
+// epoch-bearing incarnations against a fresh receiver: 325/325 admitted on the
+// ascending pass, then 0/1625 across five further rounds. It is the
+// epoch-LESS captures that stay indefinitely churnable, which is what the
+// downgrade latch exists for.
 // The ring is retained and still owns within-incarnation replay. It does NOT
 // cause a genuine-peer lockout (an evicted live-peer watermark just makes the
 // peer's next frame never-seen -> admitted) and cannot grow memory (fixed
@@ -712,8 +730,14 @@ type heartbeatAuthState struct {
 	// epoch" sentinel, so it can never be a real floor.
 	highEpoch uint64
 
-	// epochSeen is the DOWNGRADE LATCH: the peer has proved it runs a build
-	// that emits boot epochs, so an epochless frame from it is now refused.
+	// epochSeen is the DOWNGRADE LATCH: an epoch-bearing frame has been accepted
+	// from this peer, and admitAuthedLocked refuses an epochless one from now
+	// on. Two qualifications, both stated in full elsewhere: an accepted frame
+	// is normally proof the peer runs a build that emits epochs, but a REPLAYED
+	// archived one arms the latch identically (see the arming site in
+	// admitAuthedLocked); and admitAuthedLocked is not the outermost gate, so
+	// "armed" is not the same as "epochless frames are being refused right now"
+	// (see peerEpochLatched).
 	//
 	// Without this the epoch closes almost nothing. An attacker's captured
 	// incarnations are, by construction, mostly from BEFORE the upgrade and so
@@ -784,24 +808,44 @@ type heartbeatAuthState struct {
 	//     rollback" cost above, not a separate one. It does not convert
 	//     protected into exposed; it makes an already-refused, already-alarmed
 	//     peer's liveness unforgeable while it is silent.
-	//   - WHERE THE LIVE PEER IS HEALTHY AGAIN, THE LATCH CLOSES A DOOR WITH
-	//     ANOTHER ONE OPEN BESIDE IT. The latch can only have armed under this
-	//     key because an epoch-BEARING frame was accepted under it, so an
-	//     attacker on-link at that moment holds one of those too — and against
-	//     the empty post-restart state an archived epoch-bearing frame is
-	//     admitted regardless of the latch (highEpoch is 0, the ring is empty;
-	//     TestArchivedEpochReplayReArmsLatchAfterRestart_6169). Only a durable
-	//     FLOOR closes that path, and the floor is the object with the
-	//     rollback-becomes-`rm` and lockout-outlives-reboot costs priced above.
 	//
-	// The genuinely NON-REDUNDANT residual is therefore one narrow corner: an
-	// attacker whose capture window sits strictly INSIDE the rollback window —
-	// so it holds epoch-less frames under this key but no epoch-bearing ones —
-	// against a peer that has since rolled forward and then gone silent, across
-	// a receiver daemon restart. That corner is REAL and is ACCEPTED, not
-	// closed and not explained away: paying a durable write on the accept path
-	// with no good failure policy, cross-process locking there, and a heavier
-	// procedure for every no-attacker rollback is not a good trade for it.
+	// WHAT IT BUYS IS NOT BOUGHT BY THE EPOCH-BEARING DOOR EITHER, and an
+	// earlier revision of this comment argued that it was: the latch can only
+	// have armed under this key because an epoch-BEARING frame was accepted
+	// under it, so an attacker on-link then holds one of those too, and against
+	// empty post-restart state an archived epoch-bearing frame is admitted
+	// whatever the latch says (TestArchivedEpochReplayReArmsLatchAfterRestart_
+	// 6169) — therefore, the argument went, a durable latch adds nothing outside
+	// a capture window strictly inside the rollback.
+	//
+	// THE TWO DOORS ARE NOT EQUIVALENT, because what they cost the attacker in
+	// SUSTAINED liveness differs. Measured against a restarted receiver:
+	//
+	//   - 65 captured epoch-BEARING incarnations admit 325/325 on one ascending
+	//     pass and then 0/1625 across five further rounds. The floor climbs with
+	//     them and the per-session watermark closes the rest, so the capture set
+	//     is spent — one finite pass per receiver restart.
+	//   - 65 captured epoch-LESS incarnations under the CURRENT key admit
+	//     1625/1625 and keep going: nothing orders them, and FIFO eviction hands
+	//     the attacker a fresh never-seen session every round. That is forged
+	//     peer liveness sustained indefinitely against a silent peer — the exact
+	//     #6169 threat, in the one configuration #6169's floor cannot see.
+	//
+	// A durable PSK-scoped latch refuses all 1625. So the benefit is a real one
+	// and larger than "captures taken strictly inside a rollback": it is every
+	// epoch-less capture taken under the current key, which is what a peer that
+	// spent any time on a pre-#6169 build under this key hands an on-link
+	// attacker.
+	//
+	// IT IS STILL DECLINED, on the costs above and not on redundancy: a durable
+	// write on the accept path with no good failure policy, cross-process
+	// locking there, and a strictly heavier procedure (a PSK rotation across
+	// both nodes) for every no-attacker rollback. The exposure that buys is
+	// bounded by the rollback itself — no rollback under the current key, no
+	// epoch-less captures to replay — and is metered, not silent
+	// (EpochlessAdmitted, and the epoch-downgrade warning names the rotation).
+	// Reconsider the trade if a rollback under the current key ever becomes
+	// routine rather than an incident action.
 	//
 	// What process scope costs is otherwise narrow, because this state already
 	// lives on the Manager (#5086/#6642): a heartbeat restart, a DHCP-triggered
@@ -862,14 +906,22 @@ type heartbeatAuthState struct {
 //
 // The three cases:
 //
-//   - epoch < highEpoch — a RETIRED incarnation. Reject. This is the #6169
-//     close: no matter how many captured sessions the attacker churns the ring
-//     with, every one of them belongs to an incarnation at or below the highest
-//     epoch already seen, so they never reach the ring at all.
-//   - epoch == highEpoch — the SAME incarnation. Fall through to the ring,
-//     which is what handles within-incarnation replay (unchanged #6167
-//     behaviour).
-//   - epoch > highEpoch — a genuinely NEWER incarnation. Let the ring vet the
+//   - epoch < highEpoch — an incarnation OLDER than the highest one accepted.
+//     Reject. This is the #6169 close: no matter how many captured sessions the
+//     attacker churns the ring with, every one belongs to an incarnation at or
+//     below the highest epoch already seen, so they never reach the ring at all.
+//     "Older" is not the same as "retired", and the difference is #6711: once a
+//     sender's epoch has REGRESSED, the live incarnation is the one sorted
+//     below, so this branch refuses it while an archived frame from a genuinely
+//     retired one is admitted above.
+//   - epoch == highEpoch — an incarnation at the floor, normally the same one.
+//     Fall through to the ring, which is what handles within-incarnation replay
+//     (unchanged #6167 behaviour). A regressed sender that has climbed back to
+//     exactly the floor is admitted here too, which is what eventually recovers
+//     it without operator action.
+//   - epoch > highEpoch — an incarnation newer than anything accepted so far
+//     (genuinely newer while the sender's clock advances; #6711 is when it is
+//     merely a higher reading from an older one). Let the ring vet the
 //     nonce, then raise the floor. The floor only ever rises to a value the
 //     genuine peer actually signed — but that does NOT mean it cannot rise
 //     above the live peer, and an earlier revision of this comment said it did.
@@ -933,14 +985,22 @@ type heartbeatAuthState struct {
 //
 // The three epoch cases, once the peer is known to emit them:
 //
-//   - epoch < highEpoch — a RETIRED incarnation. Reject. This is the #6169
-//     close: no matter how many captured sessions the attacker churns the ring
-//     with, every one belongs to an incarnation at or below the highest epoch
-//     already seen, so they never reach the ring at all.
-//   - epoch == highEpoch — the SAME incarnation. Fall through to the ring,
-//     which is what handles within-incarnation replay (unchanged #6167
-//     behaviour).
-//   - epoch > highEpoch — a genuinely NEWER incarnation. Let the ring vet the
+//   - epoch < highEpoch — an incarnation OLDER than the highest one accepted.
+//     Reject. This is the #6169 close: no matter how many captured sessions the
+//     attacker churns the ring with, every one belongs to an incarnation at or
+//     below the highest epoch already seen, so they never reach the ring at all.
+//     "Older" is not the same as "retired", and the difference is #6711: once a
+//     sender's epoch has REGRESSED, the live incarnation is the one sorted
+//     below, so this branch refuses it while an archived frame from a genuinely
+//     retired one is admitted above.
+//   - epoch == highEpoch — an incarnation at the floor, normally the same one.
+//     Fall through to the ring, which is what handles within-incarnation replay
+//     (unchanged #6167 behaviour). A regressed sender that has climbed back to
+//     exactly the floor is admitted here too, which is what eventually recovers
+//     it without operator action.
+//   - epoch > highEpoch — an incarnation newer than anything accepted so far
+//     (genuinely newer while the sender's clock advances; #6711 is when it is
+//     merely a higher reading from an older one). Let the ring vet the
 //     nonce, then raise the floor. The floor only ever rises to a value the
 //     genuine peer actually signed — but that does NOT mean it cannot rise
 //     above the live peer, and an earlier revision of this comment said it did.
@@ -1060,9 +1120,14 @@ func (s *heartbeatAuthState) admitAuthedLocked(hasEpoch bool, epoch, session, co
 	// in-range-but-wrong epoch a lockout that outlives reboots. A durable
 	// PSK-scoped LATCH avoids both of those, and is declined for its own
 	// reasons — a durable write on the accept path with no good failure policy,
-	// cross-process locking there, a strictly heavier procedure for the
-	// no-attacker rollback, and a window the mandatory post-upgrade PSK rotation
-	// already closes. Both are priced in full at the epochSeen field comment.
+	// cross-process locking there, and a strictly heavier procedure for the
+	// no-attacker rollback. It is NOT declined as redundant with the mandatory
+	// post-upgrade PSK rotation, which an earlier revision of this comment
+	// claimed: a rotation retires captures taken BEFORE it and nothing else, and
+	// a durable latch refuses epoch-less captures taken under the CURRENT key,
+	// which are the ones that sustain forged liveness indefinitely (measured
+	// 1625/1625 admitted after a restart, against 0/1625 for a spent
+	// epoch-bearing set). Both are priced in full at the epochSeen field comment.
 	// Binding arming to freshness needs a challenge-response or a timestamp the
 	// heartbeat wire format does not carry, and cannot be approximated from the
 	// epoch itself: a legitimately long-lived peer's epoch is arbitrarily old,
@@ -1394,8 +1459,11 @@ func (r *heartbeatReceiver) readLoop() {
 		macOK := present && len(key) > 0 && verifyHeartbeatMAC(buf[:n], key)
 		// #6169: the boot epoch is read ONLY from a MAC-verified frame — only a
 		// verified frame authorises treating len-52 as the end of the signed
-		// body — and the epoch floor is applied BEFORE the session ring so a
-		// replayed retired incarnation never churns it.
+		// body — and the epoch floor is applied BEFORE the session ring, so a
+		// frame the floor REJECTS never churns it. That is an ordering property
+		// of admitAuthedLocked, not a claim that every replayed retired frame is
+		// rejected: after a sender regression (#6711) an archived frame can sit
+		// at or above the floor and reach the ring like any other.
 		var (
 			epoch    uint64
 			hasEpoch bool

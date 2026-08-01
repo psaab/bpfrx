@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // #6169: an on-link attacker holding heartbeatReplaySessions+1 or more captured
@@ -18,8 +20,16 @@ import (
 // gives the receiver an order over incarnations and closes it. That order is
 // total only while the sender's clock advances monotonically across boots — a
 // backward step larger than bootEpochMaxSkew sorts a later incarnation below an
-// earlier one (#6711), which refuses a genuine peer rather than admitting a
-// retired one.
+// earlier one (#6711).
+//
+// THAT DIRECTION IS NOT SAFE, and this header said it was ("refuses a genuine
+// peer rather than admitting a retired one"). Both halves fail together: after
+// the regression the highest epoch on the wire belongs to a RETIRED incarnation,
+// so an archived frame from it is ADMITTED and raises the floor, and the genuine
+// current incarnation is then refused. TestArchivedEpochPoisonsAFreshFloor_6711
+// measures exactly that. What the floor still buys is that one retired
+// incarnation cannot sustain the churn indefinitely — it emits one session
+// (#6169 Stage 0), so the ring's watermark closes the repeat.
 //
 // These tests drive the REAL readLoop auth gate over REAL signed frames.
 
@@ -466,11 +476,15 @@ func TestBootEpochMonotonic_6169(t *testing.T) {
 	// seeds from the real time.Now()). That scope is the whole claim: the
 	// persisted term is bounded, so a backward step larger than
 	// bootEpochMaxSkew regresses the epoch instead (#6711, and the
-	// value_beyond_the_forward_bound_is_not_chained_from subtest above). What
-	// is asserted here is that nothing ELSE breaks strictness — in particular
-	// that the wall-clock term is nanosecond-resolution and so already unique
-	// across a process restart, where a coarser seed would hand two
-	// incarnations starting in the same interval identical values.
+	// value_beyond_the_forward_bound_is_not_chained_from subtest above).
+	//
+	// IT DOES NOT ISOLATE THE WALL-CLOCK TERM, and an earlier revision of this
+	// comment claimed it pinned that term's nanosecond resolution. It cannot:
+	// every iteration here persists successfully, so `persisted+1` supplies
+	// strictness whenever the seed does not. Verified: rounding bootEpochSeed
+	// to whole seconds leaves this subtest — and the entire package — green.
+	// The seed's own resolution is pinned separately, by
+	// TestBootEpochSeedResolutionIsFinerThanARestart_6669.
 	t.Run("restarts_strictly_increase", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "ha-boot-epoch")
 		prev := uint64(0)
@@ -830,7 +844,7 @@ func TestBootEpochRefinementRaisesAfterBackwardClockStep_6169(t *testing.T) {
 	seed := uint64(time.Now().UnixNano())
 	published.Store(seed)
 
-	refineBootEpoch(path, &published)
+	refineBootEpoch(path, &published, 0)
 
 	if got := published.Load(); got != ahead+1 {
 		t.Fatalf("refined epoch = %d, want %d (persisted+1 must dominate a backward clock step)", got, ahead+1)
@@ -854,27 +868,54 @@ func TestBootEpochRefinementRaisesAfterBackwardClockStep_6169(t *testing.T) {
 // wall-clock epoch is already published and already on the wire, so all that is
 // lost is backward-clock-step protection.
 //
-// RED-on-revert: restore `fn()` on either failure path in withEpochFileLock.
+// BOTH failure branches are exercised, and the second one needs an injection
+// point. Failing the OPEN is easy — point the lock path through a regular file.
+// Failing the FLOCK is not: flock(2) on a successfully opened regular file does
+// not fail on Linux, so with the open-failure case alone a mutation that ran the
+// critical section unlocked on the flock error stayed green (verified: `go build`
+// and `go vet` rc=0, this test PASS). epochFlock exists so the guard's scope
+// matches its claim.
+//
+// RED-on-revert: restore `fn()` on either failure path in withEpochFileLock —
+// each one reds its own subtest.
 func TestEpochFileLockFailsClosed_6169(t *testing.T) {
-	// The lock file itself cannot be created: its parent component is a regular
-	// file, which fails even as root.
-	blocker := filepath.Join(t.TempDir(), "blocker")
-	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	ran := false
-	withEpochFileLock(filepath.Join(blocker, "sub", "ha-boot-epoch"), func() { ran = true })
-	if ran {
-		t.Fatal("withEpochFileLock ran the critical section UNLOCKED after failing to take the lock — " +
-			"that reinstates the concurrent-resolution race exactly when the guard cannot fire")
-	}
+	t.Run("open_failure", func(t *testing.T) {
+		// The lock file itself cannot be created: its parent component is a
+		// regular file, which fails even as root.
+		blocker := filepath.Join(t.TempDir(), "blocker")
+		if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		ran := false
+		withEpochFileLock(filepath.Join(blocker, "sub", "ha-boot-epoch"), func() { ran = true })
+		if ran {
+			t.Fatal("withEpochFileLock ran the critical section UNLOCKED after failing to OPEN the " +
+				"lock file — that reinstates the concurrent-resolution race exactly when the " +
+				"guard cannot fire")
+		}
+	})
 
-	// Sanity: the happy path still runs it.
-	ran = false
-	withEpochFileLock(filepath.Join(t.TempDir(), "ha-boot-epoch"), func() { ran = true })
-	if !ran {
-		t.Fatal("withEpochFileLock did not run the critical section when the lock was available")
-	}
+	t.Run("flock_failure", func(t *testing.T) {
+		restore := epochFlock
+		epochFlock = func(int, int) error { return unix.ENOLCK }
+		t.Cleanup(func() { epochFlock = restore })
+
+		ran := false
+		withEpochFileLock(filepath.Join(t.TempDir(), "ha-boot-epoch"), func() { ran = true })
+		if ran {
+			t.Fatal("withEpochFileLock ran the critical section UNLOCKED after flock() failed — " +
+				"an opened-but-unlocked file is not a lock, and this is the branch a filesystem " +
+				"that does not support flock actually takes")
+		}
+	})
+
+	t.Run("lock_available", func(t *testing.T) {
+		ran := false
+		withEpochFileLock(filepath.Join(t.TempDir(), "ha-boot-epoch"), func() { ran = true })
+		if !ran {
+			t.Fatal("withEpochFileLock did not run the critical section when the lock was available")
+		}
+	})
 }
 
 // TestEpochForwardSlackIsNotLockoutScale_6169 pins the SIZE of the forward
@@ -926,7 +967,7 @@ func TestEpochForwardSlackIsNotLockoutScale_6169(t *testing.T) {
 func bootEpochIncarnation(path string) (epoch uint64, persisted bool) {
 	var published atomic.Uint64
 	published.Store(bootEpochSeed())
-	refineBootEpoch(path, &published)
+	refineBootEpoch(path, &published, 0)
 	epoch = published.Load()
 	if data, err := os.ReadFile(path); err == nil {
 		if n, perr := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64); perr == nil && n == epoch {
@@ -970,7 +1011,7 @@ func TestReadErrorDoesNotRegressPersistedEpoch_6169(t *testing.T) {
 	var published atomic.Uint64
 	seed := bootEpochSeed()
 	published.Store(seed)
-	refineBootEpoch(path, &published)
+	refineBootEpoch(path, &published, 0)
 
 	// The published epoch is untouched — the wall-clock seed is still valid and
 	// still on the wire.

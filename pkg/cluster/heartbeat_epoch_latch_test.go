@@ -111,8 +111,15 @@ func TestHeartbeatEpochlessReplayRefusedOnceLatched_6169(t *testing.T) {
 // case too. Review priced that: it made a deliberate rollback require deleting
 // a state file, opened a crash window between accepting a frame and committing
 // the floor, needed cross-process locking, and let an in-range-but-wrong epoch
-// lock a peer out across reboots. The narrow window it closed is covered
-// operationally by PSK rotation.
+// lock a peer out across reboots.
+//
+// The window it closed is NOT "covered operationally by PSK rotation", which
+// this comment used to say. A rotation retires captures taken BEFORE it and
+// nothing else; captures taken under the CURRENT key survive both the rotation
+// and the restart (TestRotationDoesNotRetirePostRotationCaptures_6669, and the
+// post-rotation replay in TestRollbackRecoveryOrderingIsRotateThenRestart_6169).
+// Durability is declined on its own costs — see the epochSeen field comment —
+// not because rotation already bought it.
 func TestHeartbeatEpochLatchScopeIsTheProcess_6169(t *testing.T) {
 	e := newLatchEnv(t)
 	const liveEpoch = uint64(9_100_000_000_000_000)
@@ -844,7 +851,7 @@ func senderIncarnationAt(t *testing.T, path string, clock int64) (published, per
 
 	var pub atomic.Uint64
 	pub.Store(uint64(clock)) // what bootEpochSeed() returns at this instant
-	refineBootEpoch(path, &pub)
+	refineBootEpoch(path, &pub, 0)
 
 	data, err := os.ReadFile(path)
 	if err != nil {

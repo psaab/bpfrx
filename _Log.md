@@ -66766,9 +66766,14 @@ break — `go vet` confirmed passing under every revert.
   `heartbeat_epoch_test.go:18`. The boot epoch totally orders incarnations only
   while the sender's clock advances monotonically across boots; a backward step
   larger than `bootEpochMaxSkew` sorts a later incarnation below an earlier one
-  (#6711). Both sites now state the qualification and that the failure direction
-  is CLOSED — a genuine peer refused, never a retired one admitted — so the
-  replay property the ring comment depends on holds regardless.
+  (#6711). Both sites now state the qualification.
+  **CORRECTION (round 8): the replacement wording was itself false.** It said
+  the failure direction "is CLOSED — a genuine peer refused, never a retired one
+  admitted". Both halves fail together: once a sender regresses, the highest
+  epoch on the wire belongs to a RETIRED incarnation, so an archived frame from
+  it is ADMITTED and raises the floor while the genuine current incarnation is
+  refused. `TestArchivedEpochPoisonsAFreshFloor_6711`, on this same branch,
+  already asserted exactly that. Withdrawn and replaced in round 8 below.
 - **Validation**: `go build ./...` rc=0, `go vet ./pkg/cluster/...` rc=0,
   `go test -race ./pkg/cluster/` ok 12.4s, the 6 latched subtests confirmed to
   RUN by name under `-v` (not skipped), `status.go` byte-identical to the PR
@@ -66776,3 +66781,148 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/cluster/heartbeat_epoch_status_6169_test.go,
   pkg/cluster/heartbeat_epoch.go, pkg/cluster/heartbeat.go,
   pkg/cluster/heartbeat_epoch_test.go, pkg/cluster/README.md, _Log.md
+
+## 2026-08-01 — #6669 fold r8: withdraw the fail-closed claim, reprice the durable latch, make a lost epoch race recoverable
+
+- **Timestamp**: 2026-08-01
+- **Action**: Fold of three MAJOR and two MINOR review findings on
+  `fix/6169-heartbeat-boot-epoch-v2`. Every finding was reproduced firsthand
+  before it was fixed; none was refuted.
+- **MAJOR-1 — the fail-closed claim was FALSE and is withdrawn, not softened.**
+  `heartbeat.go` said a #6711 sender regression "fails CLOSED (a genuine peer is
+  refused, never a retired one admitted)". Measured counterexample: a fresh
+  receiver accepts the genuine current incarnation B at `T-2h`, then an archived
+  frame from RETIRED incarnation A at `T` arrives — above the floor, inside the
+  forward bound, ring-fresh — is ADMITTED, raises the floor to `T`, and B is
+  refused from then on. Both halves go the wrong way at once.
+  `TestArchivedEpochPoisonsAFreshFloor_6711` on this same branch already
+  asserted it. The replacement states the weaker true property instead: sustained
+  churn still needs `heartbeatReplaySessions+1` sessions at or above the floor
+  and one incarnation emits exactly ONE session (#6169 Stage 0), so
+  epoch-BEARING captures buy a FINITE ascending pass — measured 325/325 admitted
+  on the pass, then 0/1625 over five further rounds. Swept the current-tense
+  contradictions at `heartbeat_epoch.go` (header, `heartbeatBootEpoch`),
+  `heartbeat.go` (both `admitAuthed` three-case lists, the `readLoop` note),
+  `README.md` (the `heartbeat_epoch.go` index entry, the receiver case list) and
+  `heartbeat_epoch_test.go:18`.
+- **MAJOR-1b — the recovery wording was over-broad in the other direction.**
+  "Restarting the sender while its clock is still wrong does not help" is false
+  once the slow clock's READING reaches the floor: `epoch == highEpoch` falls
+  through to the ring and is admitted. The operative condition is "while the
+  published reading remains below the floor", now used at
+  `heartbeat_epoch.go` and `README.md`'s "Recovery is narrower" paragraph.
+- **MAJOR-2 — the durable latch was declined on a false premise; repriced.**
+  The old argument was that an epoch-bearing archived frame opens the same door,
+  so a durable latch buys nothing outside a capture window strictly inside a
+  rollback. Measured against a restarted receiver, the doors are NOT equivalent:
+  65 epoch-BEARING incarnations admit 325/325 then 0/1625 (the set is spent),
+  while 65 epoch-LESS incarnations captured under the CURRENT key admit 1625/1625
+  and keep going — indefinitely sustained forged liveness against a silent peer,
+  which a durable PSK-scoped latch would refuse entirely. The decline STANDS, on
+  its own costs (a durable write on the accept path with no good failure policy,
+  cross-process locking there, a heavier no-attacker rollback), with the benefit
+  stated honestly. Corrected the four sites carrying the old premise:
+  `heartbeat.go` (the `epochSeen` field comment and the arming site),
+  `heartbeat_epoch_latch_test.go`, `README.md` (durable-latch pricing, residual
+  5, and the rotation section's "every archived capture ... none of it
+  verifies").
+- **MAJOR-2b — the test was weaker than its comment.**
+  `TestRollbackRecoveryOrderingIsRotateThenRestart_6169/rotate_then_restart_recovers`
+  generated valid NEW-key epoch-less frames, used them only to show rotation
+  alone does not recover, then discarded them before the restart — the step that
+  makes them usable. It now keeps them and replays them after the restart: 5/5
+  admitted, asserted as the residual the process-scoped latch accepts. Proven to
+  bind by mutating `admitAuthedLocked` to refuse every epoch-less frame (0/5
+  admitted, assertion RED).
+- **MAJOR-3 — a real defect: the state lock does not order incarnations.**
+  `withEpochFileLock` claimed to stop two overlapping incarnations "publishing
+  epochs that are not strictly ordered". It serializes by lock ACQUISITION, and
+  `heartbeatBootEpoch` publishes and starts emitting BEFORE its worker reaches
+  the lock, so there is no happens-before edge from daemon start or survivorship
+  to acquisition. Reproduced: older A publishes `a`, newer B locks first and
+  persists `b > a`, A locks second, reads `b` and raises ITSELF to `b+1`; the
+  peer latches the OLDER incarnation and refuses the surviving newer one.
+  It cannot be ordered with this file alone — a predecessor's value after a
+  backward clock step and a concurrent newer incarnation's value leave the
+  identical file — so the UNRECOVERABLE half is what is fixed:
+  `Manager.refreshBootEpoch` re-runs refinement at every later heartbeat start
+  (`initHeartbeatEpochState` branches on an already-published epoch), so the
+  stranded incarnation climbs back above the file at the next `StartHeartbeat`
+  instead of being pinned below the peer's floor for the life of the process by
+  `sync.Once`. `refineBootEpoch` gained a `lastWrote` watermark
+  (`Manager.bootEpochWrote`) so a re-run over our own persisted value is a no-op
+  rather than a +1 ratchet, and `Manager.bootEpochRefining` admits one worker at
+  a time. What remains — the mis-ordering itself, and no periodic re-check
+  between it and the next heartbeat start — is stated at the lock, in README
+  residual 7, and filed as **#6724**.
+- **MINOR-4 — a status assertion narrower than its own message.**
+  `assertLatchNoteReportsFactNotEnforcement` required `"downgrade latch armed"`
+  and blacklisted three phrasings, so `"downgrade latch armed; epoch-less frames
+  currently rejected; count is historical"` — the same false enforcement claim in
+  unlisted words — PASSED (verified: build/vet rc=0, tests PASS). It now isolates
+  the note from the rendered `Heartbeats without epoch:` line and compares it by
+  EXACT EQUALITY against a literal spelled out in the test (not read back from
+  `epochlessExposureNote`, which would be `X == X`). The RED-on-revert comment
+  was also wrong — a plain revert reds the POSITIVE arm and `t.Fatalf`s before
+  the negative loop runs — and now describes the two mutations that actually
+  exercise the single assertion. Fixed the matching overclaim on the public
+  `HeartbeatStats.PeerEpochLatched` field and on `heartbeatAuthState.epochSeen`.
+- **MINOR-5 — three comments promising more than they assert.**
+  (a) `TestEpochFileLockFailsClosed_6169` claimed both lock-failure paths red;
+  only `OpenFile` failure was forced, and `flock(2)` on an opened regular file
+  does not fail on Linux, so running the critical section unlocked on the flock
+  branch stayed green (verified). Added `epochFlock`, a package var indirecting
+  `unix.Flock` for the same reason `epochNowNanos` exists, and split the test
+  into `open_failure` / `flock_failure` / `lock_available`.
+  (b) `restarts_strictly_increase` claimed to pin nanosecond seed uniqueness but
+  cannot: every iteration persists, so `persisted+1` supplies strictness
+  whenever the seed does not — rounding `bootEpochSeed` UP to whole seconds left
+  the ENTIRE package green. Comment corrected and
+  `TestBootEpochSeedResolutionIsFinerThanARestart_6669` added, asserting the
+  smallest positive gap across 2000 samples is under a millisecond.
+  (c) `heartbeat_epoch_stats_scope_6669_test.go` described the latch as
+  "refusing" during a receiver gap; with no receiver installed nothing is read,
+  so the latch is RETAINED, not enforcing. Reworded to match what it asserts.
+- **Also found, not asked about**: the MAJOR-3 fix makes residual 6 ("a bad
+  persisted epoch heals only if the local clock is credible") narrower — the
+  file now heals at the first heartbeat start after NTP corrects the clock,
+  rather than never within the process. Updated at `epochWithinForwardBound`,
+  README residual 6, and `TestPersistedEpochHealsOnlyWhenClockCredible_6169`'s
+  header, including the part that does NOT improve (the epoch this incarnation
+  already published is never lowered).
+- **RED-then-GREEN** (each mutation verified `go build ./...` rc=0 and
+  `go vet ./pkg/cluster/...` rc=0 in BOTH states, so no red is a build break):
+  drop the `refreshBootEpoch` branch in `initHeartbeatEpochState` →
+  `TestConcurrentIncarnationsAreOrderedByLockAcquisition_6669` reds on the
+  recovery assertion, the other four epoch tests stay PASS. Delete the
+  `prev == lastWrote` early return → the idempotence and watermark assertions
+  red, `TestBootEpochMonotonic_6169` stays PASS. Run `fn()` on the flock error →
+  only the `flock_failure` subtest reds. Round `bootEpochSeed` to seconds (and to
+  milliseconds) → only the new seed-resolution guard reds. Both status-note
+  mutations ("now refused" and the "currently rejected" hybrid the old blacklist
+  admitted) → the exact-equality assertion reds on all six latched subtests.
+  Refuse every epoch-less frame → the new post-rotation replay assertion reds
+  0/5 (this mutation is broad and also reds the migration tests, as expected).
+- **Also found: the PR head was shipping a RED canary.** `go test ./pkg/...`
+  failed `TestHeatmapNotStale` — this branch pushed `pkg/cluster/heartbeat.go`
+  past the 1500-LOC audit threshold without regenerating the heatmap. Verified
+  PRE-EXISTING at the PR head 37d0729b9 in a throwaway detached worktree (RED
+  there, GREEN at origin/master), so it is this PR's regression, not mine.
+  Regenerated `docs/refactoring-audit-current.txt` with
+  `scripts/refactoring-audit.sh`; the only file-set/tier change is
+  `pkg/cluster/heartbeat.go` entering [WATCH] at 1609 LOC (the rest is LOC-count
+  refresh). Well under the 2000-LOC refactor threshold, so it is a watch entry,
+  not a split obligation.
+- **Validation**: `go build ./...` rc=0, `go vet ./...` rc=0, `gofmt -l
+  pkg/cluster/` empty, `go test -race ./pkg/cluster/` ok, `go test ./pkg/...`
+  and `go test ./cmd/...` green.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/heartbeat.go,
+  pkg/cluster/manager.go, pkg/cluster/heartbeat_manager.go,
+  pkg/cluster/heartbeat_epoch_refresh_6669_test.go (new),
+  pkg/cluster/heartbeat_epoch_test.go, pkg/cluster/heartbeat_epoch_latch_test.go,
+  pkg/cluster/heartbeat_epoch_bounds_6669_test.go,
+  pkg/cluster/heartbeat_epoch_clock_sample_6669_test.go,
+  pkg/cluster/heartbeat_epoch_rollback_recovery_6669_test.go,
+  pkg/cluster/heartbeat_epoch_stats_scope_6669_test.go,
+  pkg/cluster/heartbeat_epoch_status_6169_test.go, pkg/cluster/README.md,
+  _Log.md

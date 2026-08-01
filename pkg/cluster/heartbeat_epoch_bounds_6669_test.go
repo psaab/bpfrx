@@ -80,7 +80,7 @@ func TestRefinementValidatesThePublishedEpochNotJustThePersistedOne_6169(t *test
 		var published atomic.Uint64
 		seed := uint64(1_700_000_000_000_000_000)
 		published.Store(seed)
-		refineBootEpoch(path, &published)
+		refineBootEpoch(path, &published, 0)
 
 		got := published.Load()
 		if got == epochPlausibleMax {
@@ -121,7 +121,7 @@ func TestRefinementValidatesThePublishedEpochNotJustThePersistedOne_6169(t *test
 		var published atomic.Uint64
 		seed := uint64(localNow)
 		published.Store(seed)
-		refineBootEpoch(path, &published)
+		refineBootEpoch(path, &published, 0)
 
 		got := published.Load()
 		if got == prev+1 {
@@ -149,7 +149,7 @@ func TestRefinementValidatesThePublishedEpochNotJustThePersistedOne_6169(t *test
 
 		var published atomic.Uint64
 		published.Store(uint64(localNow)) // the clock stepped back below prev
-		refineBootEpoch(path, &published)
+		refineBootEpoch(path, &published, 0)
 
 		if got := published.Load(); got != prev+1 {
 			t.Fatalf("published epoch = %d, want %d — a value inside both bounds must still "+
@@ -174,8 +174,10 @@ func TestRefinementValidatesThePublishedEpochNotJustThePersistedOne_6169(t *test
 // year-2191 fixture below by ~222) and nothing on this node separates them,
 // because the predicate that WOULD discriminate is exactly the one being
 // skipped — so this test documents a residual rather than a bug to fix.
-// Refinement runs once per Manager, so a later NTP correction does not
-// re-validate the value.
+// The FIRST pass of a boot is the one that matters here: refinement is re-run at
+// each later heartbeat start (Manager.refreshBootEpoch), so an NTP correction
+// followed by a StartHeartbeat does heal the file — but nothing forces such an
+// event, and the epoch already published by this incarnation is never lowered.
 //
 // RED-on-revert for the DOCUMENTATION: if the healing precondition is ever
 // removed from epochWithinForwardBound / the README, this test still pins the
@@ -197,7 +199,7 @@ func TestPersistedEpochHealsOnlyWhenClockCredible_6169(t *testing.T) {
 		var published atomic.Uint64
 		seed := uint64(localNow)
 		published.Store(seed)
-		refineBootEpoch(path, &published)
+		refineBootEpoch(path, &published, 0)
 
 		if got := published.Load(); got != seed {
 			t.Fatalf("published epoch = %d, want the wall-clock seed %d — a credible clock must "+
@@ -220,7 +222,7 @@ func TestPersistedEpochHealsOnlyWhenClockCredible_6169(t *testing.T) {
 
 		var published atomic.Uint64
 		published.Store(uint64(localNow))
-		refineBootEpoch(path, &published)
+		refineBootEpoch(path, &published, 0)
 
 		got := published.Load()
 		if got != bad+1 {

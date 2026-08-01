@@ -555,8 +555,17 @@ type HeartbeatStats struct {
 	EpochDowngradeRejected uint64
 
 	// PeerEpochLatched is the DOWNGRADE LATCH itself (heartbeatAuthState.
-	// epochSeen): the peer has proved it emits boot epochs, so an epoch-less
-	// frame from it is refused from now on.
+	// epochSeen): an epoch-bearing frame has been accepted from this peer.
+	//
+	// THAT IS A FACT ABOUT THIS NODE'S STATE, NOT ABOUT WHAT IS ENFORCED, and an
+	// earlier revision of this comment said "so an epoch-less frame from it is
+	// refused from now on". admitAuthedLocked does refuse one while this is
+	// true, but it is not the outermost gate: heartbeatAuthDecision
+	// short-circuits to dual-accept whenever no local control-link key is
+	// configured, and UpdateConfig clears controlAuthKey WITHOUT resetting
+	// hbAuth. So a latched node admits epoch-less frames unverified for as long
+	// as the key is absent. Renderers must report the fact — see
+	// epochlessExposureNote and peerEpochLatched.
 	//
 	// This is the state, not a proxy for it. EpochDowngradeRejected was used as
 	// one and is not equivalent: it only moves when a LATER epoch-less frame

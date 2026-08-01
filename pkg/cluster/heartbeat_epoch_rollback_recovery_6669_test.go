@@ -117,11 +117,23 @@ func rolledBackPeerRefusedUnderArchive(t *testing.T, session uint64) (*latchEnv,
 // orderings end to end.
 //
 // The two steps do different jobs and neither substitutes for the other:
-// rotation retires the attacker's archive (every captured frame fails
+// rotation retires the attacker's PRE-ROTATION archive (those frames fail
 // verifyHeartbeatMAC under the new key) but does NOT clear the in-memory latch;
 // a restart clears the latch but does NOT retire the archive. So the order is
 // the whole content of the advice, and a test that asserts one ordering in a
 // comment while executing the other proves neither.
+//
+// WHAT RECOVERY DOES NOT COVER is asserted too, in the first subtest. Rotation
+// retires captures taken BEFORE it and nothing else, so the epoch-less frames
+// the attacker records from the rolled-back peer AFTER the rotation still verify
+// under the new key — and against the cleared latch the restart produces, they
+// are admitted. An earlier revision of this test generated exactly those frames,
+// used them only to prove that rotation alone does not recover, and then threw
+// them away before the restart, which is the step that makes them usable. That
+// left "there is nothing left to re-arm it" reading as though the recovery were
+// complete. It is not; see TestRotationDoesNotRetirePostRotationCaptures_6669
+// for the same property stated as the reason a durable latch has real value, and
+// the epochSeen field comment for why it is nonetheless declined.
 //
 // RED-on-revert: swap the two operations inside either subtest.
 func TestRollbackRecoveryOrderingIsRotateThenRestart_6169(t *testing.T) {
@@ -138,14 +150,15 @@ func TestRollbackRecoveryOrderingIsRotateThenRestart_6169(t *testing.T) {
 			t.Fatal("a PSK rotation must not, by itself, clear the downgrade latch — if it did, " +
 				"the restart in the documented recovery would be pointless")
 		}
-		for i, f := range e.captureIncarnation(0x6712, 0, epochFramesPerIncarnation) {
+		postRotation := e.captureIncarnation(0x6712, 0, epochFramesPerIncarnation)
+		for i, f := range postRotation {
 			if e.feed(f) {
 				t.Fatalf("re-keyed rolled-back frame %d admitted before the restart; rotation "+
 					"alone cannot be the recovery", i)
 			}
 		}
 
-		// THEN RESTART. The latch clears, and there is nothing left to re-arm it.
+		// THEN RESTART. The latch clears, and the PRE-rotation archive is dead.
 		e.restartDaemon()
 		if e.r.auth.peerEpochLatched() {
 			t.Fatal("a daemon restart must disarm the latch")
@@ -156,6 +169,19 @@ func TestRollbackRecoveryOrderingIsRotateThenRestart_6169(t *testing.T) {
 		}
 		if e.r.auth.peerEpochLatched() {
 			t.Fatal("a frame that failed MAC verification must not arm the latch")
+		}
+
+		// BUT THE POST-ROTATION CAPTURES SURVIVE BOTH STEPS. They were signed
+		// with the key still in force, so rotation cannot retire them, and the
+		// restart is what makes them usable by clearing the latch that was
+		// refusing them. This is the residual the process-scoped latch accepts,
+		// asserted rather than left implicit.
+		admitted := feedCount(e, postRotation)
+		if admitted != epochFramesPerIncarnation {
+			t.Fatalf("post-rotation epoch-less captures after the restart: %d/%d admitted, "+
+				"want %d. If this now fails the durable-latch pricing in the epochSeen field "+
+				"comment and README residual 5 are stale — the residual they accept is closed.",
+				admitted, epochFramesPerIncarnation, epochFramesPerIncarnation)
 		}
 
 		// The rolled-back peer, re-keyed with the operator, is accepted again —

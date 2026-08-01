@@ -27,24 +27,39 @@ import (
 // by replay alone and sustain forged peer liveness indefinitely (measured: 64
 // recordings -> 0/640 replays admitted; 65 -> 650/650 admitted).
 //
-// The complete fix needs a total order the receiver can compare across peer
-// incarnations. Session ids are random and unordered, so the frame must carry
-// one: a per-daemon-incarnation BOOT EPOCH that increases across daemon
-// restarts and reboots. The receiver keeps the highest epoch it has ever
-// accepted and rejects anything below it in O(1) state, BEFORE the session ring
-// is touched — so a retired incarnation can never be replayed once a newer one
-// has been seen, and a rejected frame never churns the ring (the bypass that
-// closed the earlier attempt in #6370).
+// The fix needs an order the receiver can compare across peer incarnations.
+// Session ids are random and unordered, so the frame must carry one: a
+// per-daemon-incarnation BOOT EPOCH that increases across daemon restarts and
+// reboots. The receiver keeps the highest epoch it has ever accepted and rejects
+// anything below it in O(1) state, BEFORE the session ring is touched, so a
+// frame the floor rejects never churns the ring (the bypass that closed the
+// earlier attempt in #6370).
 //
-// "INCREASES", NOT "STRICTLY INCREASES ACROSS RESTARTS" — the unqualified form
-// was in this comment and it is not what the sender guarantees. The seed is
-// max(persisted+1, wall clock), and the persisted term is BOUNDED: a value more
-// than bootEpochMaxSkew ahead of `now` is not chained from (see
-// refineBootEpoch). So a backward clock step larger than that bound regresses
-// this node's epoch even with the file perfectly intact, and refinement then
-// overwrites the file with the lower value. That is the #6711 residual, and it
-// is what keeps the receiver-side floor from being a total order in every
-// case — README residuals 3 and 5.
+// IT IS NOT A TOTAL ORDER, AND THE FLOOR IS NOT "RETIRED INCARNATIONS CAN NEVER
+// REPLAY". An earlier revision of this comment said both. Two things break it,
+// and they are separate:
+//
+//   - The SEED "INCREASES", it does not "STRICTLY INCREASE ACROSS RESTARTS". It
+//     is max(persisted+1, wall clock), and the persisted term is BOUNDED: a
+//     value more than bootEpochMaxSkew ahead of `now` is not chained from (see
+//     refineBootEpoch). A backward clock step larger than that bound regresses
+//     this node's epoch even with the file perfectly intact, and refinement then
+//     overwrites the file with the lower value. #6711; README residuals 3 and 5.
+//   - The floor is a HIGH-WATER MARK, not a statement about which incarnation is
+//     live. Once a sender has regressed, the highest epoch on the wire is a
+//     RETIRED incarnation's, so an archived frame from it is admitted — it
+//     raises the floor, refreshes liveness and applies its stale election state
+//     — and the genuine current incarnation is refused. That is not a failure in
+//     the safe direction; both halves go the wrong way at once. Measured in
+//     TestArchivedEpochPoisonsAFreshFloor_6711, which also shows one re-injection
+//     per receiver restart sustaining it.
+//
+// What the floor DOES buy, unconditionally, is that an attacker cannot keep a
+// retired incarnation admitted indefinitely: sustained ring churn needs
+// heartbeatReplaySessions+1 sessions at or above the floor, and one incarnation
+// emits exactly one session (Manager.heartbeatNonce, #6169 Stage 0). Measured on
+// 65 captured epoch-bearing incarnations: 325/325 admitted on the ascending
+// pass, then 0/1625 across five further rounds.
 //
 // TWO PROPERTIES MAKE THAT ACTUALLY CLOSE THE ATTACK, and both are easy to get
 // wrong:
@@ -141,6 +156,15 @@ const (
 // There is deliberately NO peer-side floor file; see the DURABILITY note on
 // heartbeatAuthState.epochSeen for why the receiver latch is process-scoped.
 var bootEpochPath = "/var/lib/xpf/ha-boot-epoch"
+
+// epochFlock is the lock withEpochFileLock takes. A var for the same reason
+// epochNowNanos is one: the SECOND of its two failure branches is otherwise
+// unreachable from a test. Failing the open is easy (point the lock path
+// through a regular file), but flock(2) on a successfully opened regular file
+// does not fail on Linux, so a mutation that runs the critical section unlocked
+// on the flock error alone stayed green — the guard was scoped to one of the two
+// paths it claims. Production never replaces it.
+var epochFlock = unix.Flock
 
 // epochNowNanos is the wall clock refineBootEpoch validates persisted state
 // against. A var so a test can PIN an instant: the load-time checks are
@@ -239,11 +263,20 @@ func epochOrderable(epoch uint64, nowNanos int64) bool {
 // residual rather than an oversight. refineBootEpoch validates persisted state
 // with this predicate, so a persisted epoch that is wrong-but-below-year-2200
 // is only rejected — and the file only healed — when the LOCAL clock is
-// credible at the moment refinement loads it. Refinement runs once per Manager
-// (sync.Once), early in startup, so on an appliance whose RTC is dead and whose
-// xpfd always starts before NTP the bad value is chained from on every boot and
-// never heals; a correctly clocked peer then refuses this node's epoch on its
-// raise path, which is asymmetric visibility, not mutual isolation.
+// credible at the moment refinement loads it. On an appliance whose RTC is dead
+// and whose xpfd starts before NTP, the FIRST pass of every boot is made against
+// an uncredible clock and chains from the bad value; a correctly clocked peer
+// then refuses this node's epoch on its raise path, which is asymmetric
+// visibility, not mutual isolation.
+//
+// Refinement is RE-RUN at each later heartbeat start (Manager.refreshBootEpoch),
+// so once NTP has corrected the clock the NEXT StartHeartbeat — a VRF rebind,
+// an HA comms restart — does re-validate the file and heal it, which bounds the
+// damage to boots with no such event. It does not repair the epoch THIS
+// incarnation already published: refinement only ever raises, and lowering a
+// published epoch mid-incarnation is the one direction the design refuses. So
+// the file is healed for the next boot while this node stays high until it
+// restarts.
 //
 // It cannot be closed COMPLETELY here, and the qualifier matters — an earlier
 // revision of this comment said "cannot be closed" flat, which is too strong.
@@ -298,15 +331,40 @@ func epochWithinForwardBound(epoch uint64, nowNanos int64) bool {
 // withEpochFileLock serializes a read-modify-write of an epoch state file
 // across PROCESSES, not merely within one.
 //
-// Within a process the one file this guards has a single writer (the boot
-// epoch, behind Manager.bootEpochOnce), but nothing in xpf enforces a single
-// daemon instance: there is no pidfile, and the gRPC listener sets SO_REUSEPORT
-// (pkg/grpcapi/server.go), so a second xpfd does NOT fail on a port collision
-// the way it otherwise would. Two overlapping incarnations could therefore
-// interleave read-modify-write and publish epochs that are not strictly
-// ordered — which is precisely the property the whole mechanism rests on. An
-// advisory lock on a sidecar file is cheaper than reasoning about whether the
-// race is reachable.
+// Within a process the one file this guards has a single writer at a time
+// (Manager.startBootEpochRefine admits one refine worker), but nothing in xpf
+// enforces a single daemon instance: there is no pidfile, and the gRPC listener
+// sets SO_REUSEPORT (pkg/grpcapi/server.go), so a second xpfd does NOT fail on a
+// port collision the way it otherwise would. Two overlapping incarnations could
+// therefore interleave read-modify-write, and an interleaved one can lose the
+// update the other just made. An advisory lock on a sidecar file is cheaper than
+// reasoning about whether the race is reachable.
+//
+// IT DOES NOT ORDER INCARNATIONS, and an earlier revision of this comment said
+// it did ("publish epochs that are not strictly ordered — which is precisely the
+// property the whole mechanism rests on"). It serializes by LOCK ACQUISITION,
+// and there is no happens-before edge from daemon start, or from survivorship,
+// to that acquisition. heartbeatBootEpoch publishes the wall-clock seed and
+// starts emitting BEFORE its worker reaches this function, deliberately (a
+// storage fault must not take a healthy node off the air), so the two orders are
+// independent. Older incarnation A publishes `a` and is delayed; newer B
+// publishes `b > a`, locks first, persists `b`; A locks second, reads `b`,
+// raises itself to `b+1` and persists that. The peer then latches `b+1` from the
+// OLDER incarnation and refuses the NEWER one at `b`.
+//
+// That mis-ordering is not closed here, and it cannot be with this file alone:
+// refinement only ever matters when the persisted value exceeds our own seed,
+// and "a predecessor wrote it after a backward clock step" and "a concurrent
+// newer incarnation wrote it" produce the identical file. Separating them needs
+// state this design does not keep — a lifetime-held liveness lock, or a writer
+// identity in the file — i.e. a larger change than the epoch itself. What IS
+// closed is the unrecoverable half: refinement is re-runnable
+// (Manager.refreshBootEpoch), so the stranded incarnation raises itself above
+// the file again at its next heartbeat (re)start instead of being pinned below
+// the floor for the life of the process by a one-shot sync.Once. Between the
+// mis-ordering and that next start this node IS refused, and there is no
+// periodic re-check — tracked as #6724. See
+// TestConcurrentIncarnationsAreOrderedByLockAcquisition_6669.
 //
 // Fails CLOSED: if the lock cannot be taken, the read-modify-write is SKIPPED
 // rather than run unlocked. A lock whose failure path executes the critical
@@ -345,7 +403,7 @@ func withEpochFileLock(path string, fn func()) {
 		return
 	}
 	defer f.Close()
-	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
+	if err := epochFlock(int(f.Fd()), unix.LOCK_EX); err != nil {
 		slog.Warn("cluster: HA epoch state lock failed; SKIPPING the persist "+
 			"(the wall-clock epoch is already in use; only backward-clock-step "+
 			"protection is lost)", "path", path, "err", err)
@@ -421,6 +479,19 @@ func (m *Manager) initHeartbeatEpochState() {
 	if len(m.controlLinkAuthKey()) == 0 {
 		return
 	}
+	// A SECOND and later heartbeat start RE-RUNS the refinement rather than
+	// returning the value resolved at boot. Refinement is not a one-shot fact
+	// about this incarnation: the file is shared state, and another incarnation
+	// (or this node's own earlier one, under the withEpochFileLock ordering
+	// hazard) can raise it above what we published, which parks us below the
+	// peer's floor. sync.Once made that permanent for the life of the process;
+	// re-running it here makes it recoverable at the next heartbeat (re)start —
+	// StartHeartbeat, a DHCP-triggered VRF rebind, or the HA comms restart.
+	// StartHeartbeat holds hbStartMu, so these two branches never interleave.
+	if m.bootEpoch.Load() != 0 {
+		m.refreshBootEpoch()
+		return
+	}
 	m.heartbeatBootEpoch()
 }
 
@@ -442,10 +513,12 @@ func bootEpochSeed() uint64 {
 // returns 0 for a node that has called it, and it NEVER performs I/O.
 //
 // This ordering is the whole answer to "a storage fault must not take a healthy
-// node off the air". The epoch a peer needs is just a value that strictly
-// increases across this node's incarnations, and the wall clock already
-// provides that. So the wall-clock value is published SYNCHRONOUSLY, with no
-// file access, and every frame carries it from the very first send.
+// node off the air". The epoch a peer needs is just a value that increases
+// across this node's incarnations, and the wall clock supplies that WHILE IT
+// ADVANCES MONOTONICALLY — which is the only case persistence is not needed for,
+// and is why persistence is the refinement rather than the source. So the
+// wall-clock value is published SYNCHRONOUSLY, with no file access, and every
+// frame carries it from the very first send.
 //
 // Persistence is a REFINEMENT, not a prerequisite. Its only job is to survive a
 // backward clock step, so it runs on a worker: read the previous value and, if
@@ -463,8 +536,8 @@ func bootEpochSeed() uint64 {
 // step larger than bootEpochMaxSkew is another, with the file perfectly intact
 // and every write succeeding, because refineBootEpoch declines to chain from a
 // persisted value that far ahead of `now` — and then durably overwrites it with
-// the lower one, so a sender restart at the same wrong clock does not recover
-// either. That is #6711; README residual 3.
+// the lower one, so a sender restart does not recover while the wrong clock
+// still reads below the peer's floor. That is #6711; README residual 3.
 func (m *Manager) heartbeatBootEpoch() uint64 {
 	if m == nil {
 		return 0
@@ -473,24 +546,74 @@ func (m *Manager) heartbeatBootEpoch() uint64 {
 		// Publish immediately, before any I/O can be attempted.
 		m.bootEpoch.Store(bootEpochSeed())
 
-		// Read bootEpochPath on THIS goroutine: it is a package var tests
-		// override, and a worker reading it later would race the next test.
-		path := bootEpochPath
-		// bootEpochReady is closed when the refine attempt finishes. Nothing in
-		// production waits on it — that wait was removed, see
+		// bootEpochReady is closed when the FIRST refine attempt finishes.
+		// Nothing in production waits on it — that wait was removed, see
 		// initHeartbeatEpochState — but tests use it to join the worker so a
-		// refinement cannot race their assertions or t.TempDir cleanup.
-		ready := m.bootEpochReady
-		go func() {
-			defer func() {
-				if ready != nil {
-					close(ready)
-				}
-			}()
-			refineBootEpoch(path, &m.bootEpoch)
-		}()
+		// refinement cannot race their assertions or t.TempDir cleanup. Later
+		// refreshes do not signal it; they are joined with waitBootEpochIdle.
+		m.startBootEpochRefine(m.bootEpochReady)
 	})
 	return m.bootEpoch.Load()
+}
+
+// refreshBootEpoch re-runs the persistence refinement for an incarnation that
+// has already published, and is what keeps a lost ordering race recoverable.
+//
+// The published epoch is resolved against a SHARED file, so it can be correct
+// when it is resolved and stale afterwards: another incarnation that acquires
+// withEpochFileLock later raises the file above us and parks us below the peer's
+// floor (see withEpochFileLock's ordering note). Behind the boot-time sync.Once
+// alone, that state lasted for the life of the process — the peer refused this
+// node until a full daemon restart, even after the other incarnation exited.
+//
+// Re-running refinement lifts us back above the file. It is NOT a fix for the
+// mis-ordering itself; it bounds how long one costs us. It raises only when the
+// file has moved above us and is a no-op otherwise, so a routine restart on a
+// healthy node neither ratchets the epoch nor rewrites anything meaningful.
+func (m *Manager) refreshBootEpoch() {
+	if m == nil || m.bootEpoch.Load() == 0 {
+		// Nothing published yet: heartbeatBootEpoch owns the first resolve.
+		return
+	}
+	m.startBootEpochRefine(nil)
+}
+
+// startBootEpochRefine runs one refinement on a worker. ready, when non-nil, is
+// closed once that attempt finishes.
+//
+// ONE AT A TIME. Overlapping refines would be safe on the file (withEpochFileLock
+// serializes them) but they race on the persist watermark, whose whole job is to
+// tell "the file holds what I wrote" from "the file moved under me". A refine
+// requested while one is in flight is DROPPED, not queued. That is a deliberate
+// loss: the in-flight worker may already have read the file, so a request made
+// behind it can miss an update it was asked to pick up, and the pickup then
+// waits for the NEXT heartbeat start. Queueing would only shorten that window,
+// not close it — nothing bounds how long a daemon runs without a heartbeat
+// restart either way (#6724) — and it would put an unbounded backlog of
+// fsync-ing workers behind a call that must not block.
+func (m *Manager) startBootEpochRefine(ready chan struct{}) {
+	if !m.bootEpochRefining.CompareAndSwap(false, true) {
+		// Signal anyway: a caller joining `ready` must never block because
+		// someone else got there first. Only heartbeatBootEpoch passes a
+		// non-nil channel and only from inside bootEpochOnce, so this cannot
+		// double-close.
+		if ready != nil {
+			close(ready)
+		}
+		return
+	}
+	// Read bootEpochPath on THIS goroutine: it is a package var tests
+	// override, and a worker reading it later would race the next test.
+	path := bootEpochPath
+	go func() {
+		defer func() {
+			m.bootEpochRefining.Store(false)
+			if ready != nil {
+				close(ready)
+			}
+		}()
+		m.bootEpochWrote.Store(refineBootEpoch(path, &m.bootEpoch, m.bootEpochWrote.Load()))
+	}()
 }
 
 // refineBootEpoch is the off-path half of heartbeatBootEpoch: consult the
@@ -500,11 +623,22 @@ func (m *Manager) heartbeatBootEpoch() uint64 {
 // Every failure here is survivable and is logged rather than propagated: the
 // wall-clock epoch published synchronously is already valid and already on the
 // wire.
-func refineBootEpoch(path string, published *atomic.Uint64) {
+//
+// IT IS RE-RUNNABLE, and lastWrote is what makes re-running idempotent.
+// Refinement raises when the persisted value is at or above what we published —
+// that is how a backward clock step is carried across a restart — but after a
+// successful persist the file holds OUR OWN value, so a second pass would meet
+// that same condition and ratchet the epoch by one every time it ran.
+// lastWrote is the epoch this incarnation last persisted (0 for a first pass),
+// and a file still holding exactly that is left alone. The returned value is the
+// new watermark; a failure path returns lastWrote unchanged, since a pass that
+// did not write did not move the file either.
+func refineBootEpoch(path string, published *atomic.Uint64, lastWrote uint64) (wrote uint64) {
+	wrote = lastWrote
 	if err := fsatomic.MkdirAllDurable(filepath.Dir(path), 0o755); err != nil {
 		slog.Warn("cluster: HA boot-epoch state dir create failed; this incarnation's epoch is NOT durable "+
 			"(a backward clock step across the next restart could regress it)", "path", path, "err", err)
-		return
+		return wrote
 	}
 	withEpochFileLock(path, func() {
 		var prev uint64
@@ -566,11 +700,16 @@ func refineBootEpoch(path string, published *atomic.Uint64) {
 				// branches are lockouts; this one is RECOVERABLE and chaining is
 				// not, which is why it is still the right way round. Recoverable
 				// is narrower than "ends at the next restart", which an earlier
-				// revision of this comment claimed: restarting THIS node while
-				// its clock is still wrong re-publishes from the same bad clock
-				// (the file now holds the lower value), so it stays below the
-				// floor. What recovers it is fixing the clock, or a receiver
-				// restart paired with a PSK rotation — see the "Recovery is
+				// revision of this comment claimed: restarting THIS node
+				// re-publishes from the same bad clock (the file now holds the
+				// lower value), so it stays below the floor FOR AS LONG AS THE
+				// PUBLISHED READING REMAINS BELOW IT. That is the operative
+				// condition, not "while the clock is wrong" — a clock that stays
+				// two hours slow still reads past the floor two real hours later,
+				// and a restart then publishes a value the peer admits at
+				// equality (epoch == highEpoch falls through to the ring). What
+				// recovers it sooner is fixing the clock, or a receiver restart
+				// paired with a PSK rotation — see the "Recovery is
 				// narrower" paragraph in README.md. Chaining, by contrast, ends
 				// at no restart at all: it strands this node permanently above
 				// the range its peer will ever accept. Carrying an intact
@@ -600,16 +739,27 @@ func refineBootEpoch(path string, published *atomic.Uint64) {
 		}
 
 		epoch := published.Load()
+		if prev == lastWrote && prev != 0 {
+			// The file still holds exactly what THIS incarnation last persisted,
+			// so there is nothing to chain from and nothing to write. Without
+			// this, every re-run would meet the raise condition below (prev >=
+			// epoch, because prev IS epoch) and ratchet the epoch by one.
+			return
+		}
 		if next := prev + 1; next > epoch {
-			// The clock stepped backwards: the wall-clock seed did not clear the
-			// previous incarnation. Raise so this incarnation still strictly
-			// exceeds it.
+			// Either the clock stepped backwards — the wall-clock seed did not
+			// clear the previous incarnation — or another incarnation raised the
+			// file above us while we were running (withEpochFileLock's ordering
+			// note). Raise so this incarnation still strictly exceeds the file.
 			epoch = next
 			published.Store(epoch)
 		}
 		if err := fsatomic.WriteFileDurable(path, []byte(strconv.FormatUint(epoch, 10)+"\n"), 0o644); err != nil {
 			slog.Warn("cluster: HA boot-epoch state persist failed; this incarnation's epoch is NOT durable "+
 				"(a backward clock step across the next restart could regress it)", "path", path, "err", err)
+			return
 		}
+		wrote = epoch
 	})
+	return wrote
 }

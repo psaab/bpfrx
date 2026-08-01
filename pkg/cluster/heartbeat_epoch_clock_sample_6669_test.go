@@ -111,7 +111,7 @@ func TestRefinementSamplesTheClockAfterLoadingPersistedState_6669(t *testing.T) 
 	refined := make(chan struct{})
 	go func() {
 		defer close(refined)
-		refineBootEpoch(path, &published)
+		refineBootEpoch(path, &published, 0)
 	}()
 	select {
 	case <-refined:

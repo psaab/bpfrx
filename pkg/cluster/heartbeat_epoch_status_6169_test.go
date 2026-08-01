@@ -125,6 +125,30 @@ func TestEpochlessCounterIsRendered_6169(t *testing.T) {
 	}
 }
 
+// wantArmedLatchNote is the EXACT armed-latch note, spelled out here rather than
+// read back from epochlessExposureNote — comparing the renderer against itself
+// would pass for any string it happened to produce.
+const wantArmedLatchNote = "(downgrade latch armed; count is historical)"
+
+// latchNote isolates the note from a rendered status block: everything after the
+// epoch-less count on the "Heartbeats without epoch:" line. It returns ok=false
+// when that line is missing, so a caller cannot mistake "no line" for "no note".
+func latchNote(out string) (note string, ok bool) {
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "Heartbeats without epoch:") {
+			continue
+		}
+		rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "Heartbeats without epoch:"))
+		// rest is "<count>" or "<count>  <note>".
+		if i := strings.IndexAny(rest, " \t"); i >= 0 {
+			return strings.TrimSpace(rest[i:]), true
+		}
+		return "", true
+	}
+	return "", false
+}
+
 // assertLatchNoteReportsFactNotEnforcement pins the armed-latch note to a
 // statement about THIS NODE'S STATE and forbids promoting it into a claim about
 // what is being enforced right now.
@@ -137,29 +161,43 @@ func TestEpochlessCounterIsRendered_6169(t *testing.T) {
 // runtime-visible thing the fix changed. Asserting the surviving substring is
 // not asserting the fix.
 //
-// The claim itself is false, not merely imprecise: heartbeatAuthDecision
+// It binds by EXACT EQUALITY against the isolated note, not by a required
+// substring plus a blacklist of forbidden ones. A blacklist is only ever as good
+// as the phrasings someone thought of: the previous revision required
+// "downgrade latch armed" and forbade "now refused" / "frames refused" /
+// "are refused", which admits "downgrade latch armed; epoch-less frames
+// currently rejected; count is historical" — the same false enforcement claim in
+// words the list did not enumerate (verified: `go build` and `go vet` rc=0 and
+// this file PASS with the note changed to exactly that).
+//
+// The claim it forbids is false, not merely imprecise: heartbeatAuthDecision
 // short-circuits to dual-accept whenever no local control-link key is
 // configured, and UpdateConfig clears controlAuthKey WITHOUT resetting hbAuth.
 // Load a legacy unkeyed config leniently, add the key under `commit confirmed`,
 // arm the latch, then let the confirmation lapse in the same daemon: the latch
 // stays armed while every epoch-less frame is admitted unverified.
 //
-// RED-on-revert: restore "epoch-less frames now refused" in
-// epochlessExposureNote (status.go) and both the positive and the negative arm
-// below fail.
+// RED-on-revert, by mutation of epochlessExposureNote (status.go) — any edit to
+// the armed note reds this, which is the point of the equality. The two that
+// matter: restoring the historical "epoch-less frames now refused" spelling, and
+// the "downgrade latch armed; epoch-less frames currently rejected" hybrid that
+// the previous substring form let through. An earlier revision of this comment
+// claimed the first of those reds "both the positive and the negative arm"; it
+// did not, because the positive arm's t.Fatalf ended the subtest before the
+// negative loop ran. There is now one assertion and no such gap.
 func assertLatchNoteReportsFactNotEnforcement(t *testing.T, name, out string) {
 	t.Helper()
-	if !strings.Contains(out, "downgrade latch armed") {
-		t.Fatalf("%s does not report the armed latch as a fact about this node's state\n"+
+	note, found := latchNote(out)
+	if !found {
+		t.Fatalf("%s renders no \"Heartbeats without epoch:\" line at all\n"+
 			"--- output ---\n%s", name, out)
 	}
-	for _, overclaim := range []string{"now refused", "frames refused", "are refused"} {
-		if strings.Contains(out, overclaim) {
-			t.Fatalf("%s promotes the armed latch into a claim about live enforcement (%q). "+
-				"An armed latch coexists with dual-accept whenever no control-link key is "+
-				"configured, so this asserts something the node does not know.\n"+
-				"--- output ---\n%s", name, overclaim, out)
-		}
+	if note != wantArmedLatchNote {
+		t.Fatalf("%s renders the armed-latch note as %q, want exactly %q.\n"+
+			"The note must state a FACT about this node's state, not what it is enforcing: an "+
+			"armed latch coexists with dual-accept whenever no control-link key is configured, "+
+			"so any wording that promises epoch-less frames are being refused asserts something "+
+			"the node does not know.\n--- output ---\n%s", name, note, wantArmedLatchNote, out)
 	}
 }
 

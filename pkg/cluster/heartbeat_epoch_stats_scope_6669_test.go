@@ -14,11 +14,19 @@ import (
 // them through the installed receiver and gated them on `receiver != nil`, so
 // during every window with no receiver — StopHeartbeat, and the whole bind-retry
 // span of a failed RestartHeartbeat (up to ~5s) — it reported the latch CLEAR
-// while the process-scoped state was armed and refusing.
+// while the process-scoped state was in fact ARMED.
+//
+// RETAINED, not "armed and refusing", which an earlier revision of this header
+// said: with no receiver installed nothing is reading frames, so nothing is
+// being refused during the gap. What is asserted below is the retention and what
+// status RENDERS off it, not enforcement. Enforcement while a receiver IS
+// installed is TestHeartbeatEpochlessReplayRefusedOnceLatched_6169's job. The
+// gap matters because the latch comes back armed the instant a receiver does,
+// with no re-arming heartbeat needed.
 //
 // That is not cosmetic: epochlessExposureNote reads PeerEpochLatched, so status
 // flipped back to telling the operator "replay protection is ring-only; rotate
-// the control-link PSK" at a moment when the latch was in fact engaged.
+// the control-link PSK" at a moment when the latch was in fact armed.
 
 // TestEpochLatchSurvivesReceiverGapInStats_6669 is the fail-on-revert gate.
 //
@@ -85,7 +93,7 @@ func TestEpochLatchSurvivesReceiverGapInStats_6669(t *testing.T) {
 
 	// The OPERATOR-facing consequence, on every rendered surface: with the latch
 	// misreported as clear, status re-ran the "you are exposed, rotate the PSK"
-	// advice while the latch was actually refusing.
+	// advice about a node whose latch was in fact armed.
 	for name, render := range map[string]func() string{
 		"FormatInformation":            e.m.FormatInformation,
 		"FormatStatistics":             e.m.FormatStatistics,
@@ -95,7 +103,8 @@ func TestEpochLatchSurvivesReceiverGapInStats_6669(t *testing.T) {
 			out := render()
 			if strings.Contains(out, "rotate the control-link PSK") {
 				t.Fatalf("%s reports LIVE epoch-less exposure during a heartbeat restart gap, "+
-					"though the downgrade latch is armed and refusing\n--- output ---\n%s", name, out)
+					"though the downgrade latch is still armed and comes back with the next "+
+					"receiver\n--- output ---\n%s", name, out)
 			}
 			if !strings.Contains(out, "count is historical") {
 				t.Fatalf("%s does not mark the epoch-less count historical during the gap\n"+
