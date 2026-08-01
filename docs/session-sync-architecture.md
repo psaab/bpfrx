@@ -378,7 +378,9 @@ never rejects on it. The path is: the Rust dataplane harvests the id onto
 `SessionDelta.session_id` and writes it as the trailing field of the
 `MSG_SESSION_OPEN` event-stream frame; the daemon decodes it into
 `SessionDeltaInfo.RTFlowSessionID` and stamps `SessionValue{,V6}.RTFlowSessionID`
-(distinct from the node-local BPF-ABI `SessionID`, which stays `now<<16|Slot`);
+(distinct from the node-local BPF-ABI `SessionID`, which since #6198 is minted
+per converted session by `nextUserspaceSyncedSessionID` — see "Node-Local
+BPF-ABI Session Id" below);
 `SessionSync` carries it as the trailing wire field; the peer daemon forwards it
 on `SessionSyncRequest.session_id`; and the peer helper's
 `upsert_synced_with_origin` ADOPTS it (stamping the imported `SessionEntry`)
@@ -387,6 +389,97 @@ falls back to `alloc_session_id()` — rolling-upgrade safe. Because the id is
 worker-namespaced, adopting the peer's id verbatim keeps it unique across the
 importing node's shared-nothing worker tables. The standby's SESSION_CLOSE
 RT_FLOW then correlates with the primary's SESSION_CREATE.
+
+### Node-Local BPF-ABI Session Id (#6198)
+
+`SessionValue{,V6}.SessionID` is the *other*, node-local id: the on-map BPF
+conntrack ABI field. It is NOT a lookup key — forwarding matches the 5-tuple
+`SessionKey` — and it is NOT carried to the peer helper (`buildSessionSyncRequest`
+forwards only `RTFlowSessionID`). Its blast radius is display and correlation:
+it rides the session wire, and on the receiving node `SetClusterSyncedSessionV4/V6`
+writes it into the BPF conntrack mirror, where `show security flow session`
+(`flowSessionDisplayID`), the REST session views, and the gRPC session RPCs
+surface it.
+
+Until #6198 the userspace converters synthesized it as
+`uint64(now)<<16 | uint64(delta.Slot&0xffff)`. Both halves were wrong:
+
+- `delta.Slot` is the AF_XDP **binding** slot (`BindingIdentity.slot`, one per
+  interface/queue — a handful per node), not a session-table slot. The `&0xffff`
+  mask was therefore unreachable in practice.
+- The binary event stream that carries the primary delta path never decodes
+  `Slot` at all (`decodeSessionEvent` leaves it `0`), so the low half was a
+  constant.
+- `now` is CLOCK_MONOTONIC **seconds**. Every session converted within one
+  second collapsed onto ONE id, conflating unrelated flows wherever the id is
+  displayed.
+
+`nextUserspaceSyncedSessionID` replaces it with a node-local monotonic counter in
+a reserved namespace: `0xFFFF << 48 | counter48`. The namespace keeps the
+control-plane-minted ids disjoint from the dataplane ids the helper stamps into
+the same mirror field (`(worker_id & 0xFFFF) << 48 | counter48`, worker ids being
+tiny queue indices), so the two writers can never alias. That reservation is a
+cross-language invariant, and it is ENFORCED on the Rust side rather than merely
+recorded: `SessionTable::set_worker_id` asserts a worker id never lands on
+`CONTROL_PLANE_SESSION_ID_WORKER_HI`. A hard `assert!`, not `debug_assert!` —
+`make test-rust` and the shipped helper both build `--release`, where a debug
+assertion is stripped and would guard nothing — and worker setup is config time,
+where `docs/engineering-style.md` prefers crash-start over running with a wrong
+invariant. The counter never
+returns `0` — that is the established "unknown id" sentinel that makes
+`flowSessionDisplayID` fall back to the per-row ordinal.
+
+The counter is **seeded from the boot clock** on first use
+(`userspaceSyncedSessionIDSeed`, `monotonic_nanos >> 10` masked to 48 bits).
+Without a seed, an xpfd restart would re-mint `1, 2, 3…` and collide with entries
+the peer's mirror still holds from the previous incarnation — sessions this node
+closed while it was down, whose keys the post-restart bulk re-export never
+overwrites. The old `now<<16|Slot` composition did not have that flaw, because
+CLOCK_MONOTONIC is system uptime and keeps increasing across a daemon restart, so
+seeding is what keeps the change a strict improvement rather than a trade.
+
+The seed reads **nanoseconds, not seconds**. A second-resolution read gives two
+incarnations whose first allocations land in the same integer second an identical
+seed, and they then repeat from their very first id — and that is the common
+restart, not the exotic one: systemd's `RestartSec=1` lands inside the window, and
+the sub-second phase is uniform, so on average half of all restarts do. At
+`>> 10` the seed granularity is ~1.024 µs, three orders of magnitude below the
+teardown+exec of any real restart. The seed advances ~976,562 per second of
+uptime, so a restarting incarnation starts above its predecessor's high-water mark
+unless that predecessor *averaged* more than ~976k synced conversions per second.
+The 48-bit seed space covers ~9.1 years of uptime before it cycles, and a cycle can
+only alias ids from an incarnation that old.
+
+The counter advances by **CAS, not a bare `Add`**, so the value stored is the value
+returned. The counter must skip the reserved `0`, and the skip has to be committed:
+`Add(1) & mask; if counter == 0 { counter = 1 }` corrects only the local copy, so at
+the wrap the atomic still holds the masked-zero value and the NEXT call returns the
+id just handed out. The duplicate stays inside the namespace, so nothing downstream
+looks wrong — uniqueness just silently stops holding. The wrap is reachable rather
+than theoretical, because the seed itself consumes counter space and the distance to
+the boundary depends on uptime phase. Ringing is the right behaviour there: a wrap
+re-mints only ids this incarnation issued 2^48-1 conversions ago (the ring skips
+the zero counter, so 2^48-1 values are usable, not 2^48), or ids from an
+incarnation whose entries are long gone. Refusing to mint would be worse — the id is
+display-only, but the conversion carrying it installs an HA-synced session, so
+failing it to protect a display field would trade a cosmetic alias for lost sessions
+at failover.
+
+The id is distinct per **conversion**, not stable per session. A bulk resync
+re-converts live sessions and re-stamps them with fresh ids, and the `close`
+branch of `queueUserspaceSessionDeltas` converts purely to derive the key and
+discards the id it mints. Both are harmless in a 48-bit space, and the old
+composition churned the id the same way — what changed is that concurrent
+sessions no longer *share* one.
+
+The fabric-redirect forward-wire alias entry (`userspaceForwardWireAliasV4/V6`)
+takes the ALREADY-CONVERTED base session rather than re-converting the delta, so
+the alias and its base — two conntrack keys for one logical session — share one
+id. Re-converting would mint a second.
+
+This id stays deliberately node-local; the cross-node correlatable id is the
+separate `RTFlowSessionID` above. Regression coverage:
+`TestUserspaceSyncedSessionID*6198` in `pkg/daemon`.
 
 ## Sync Readiness and Bulk Priming
 

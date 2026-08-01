@@ -1174,7 +1174,8 @@ outside the monitor loop:
   active/active direction stays a documented fail-OPEN residual on #6284 (item 1,
   needs a bidirectional config-gen namespace #5274 scoped out).
 - **RT_FLOW session id (#5212)**: distinct from BOTH the synthesized BPF-ABI
-  `SessionID` (`now<<16|slot`, node-local) AND the per-key install generation,
+  `SessionID` (node-local, minted per converted session by
+  `nextUserspaceSyncedSessionID` since #6198) AND the per-key install generation,
   every session install carries the ORIGINATING node's stable RT_FLOW session id
   (`SessionValue{,V6}.RTFlowSessionID`, the dataplane's
   `SessionTable::alloc_session_id` value) as a length-gated trailing `uint64` on

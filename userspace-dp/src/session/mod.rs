@@ -510,6 +510,15 @@ struct SessionRecord {
     entry: SessionEntry,
 }
 
+/// The `session_id` high-16 (worker) value RESERVED for the Go control plane
+/// (#6198). `nextUserspaceSyncedSessionID`
+/// (`pkg/daemon/daemon_ha_userspace_convert.go`) mints
+/// `0xFFFF << 48 | counter48` for the peer-synced sessions the daemon installs,
+/// and those land in the SAME BPF conntrack mirror field this table stamps. A
+/// `SessionTable` must never take this as its worker id — see `set_worker_id`,
+/// which enforces it.
+pub(crate) const CONTROL_PLANE_SESSION_ID_WORKER_HI: u64 = 0xFFFF;
+
 pub(crate) struct SessionTable {
     /// #964 Step 1: slab-allocated session storage. Indexed by u32
     /// handle. Replaces the prior `sessions: FxHashMap<Key, Entry>`.
@@ -770,8 +779,35 @@ impl SessionTable {
     /// per-worker monotonic counter. A worker id >= 2^16 is clamped into range
     /// (never happens — a queue index is tiny) so the shift cannot alias the
     /// counter bits.
+    ///
+    /// **RESERVED: worker id `0xFFFF` belongs to the Go control plane (#6198).**
+    /// Both allocators write into the SAME BPF conntrack mirror field: this table
+    /// stamps `session_id` for sessions the helper owns, and
+    /// `nextUserspaceSyncedSessionID` (pkg/daemon/daemon_ha_userspace_convert.go)
+    /// mints `0xFFFF << 48 | counter48` for a peer-synced session the daemon
+    /// installs. Keeping `0xFFFF` out of this half is what makes the two id
+    /// spaces disjoint. It is unreachable today — `binding.worker_id` is bounded
+    /// by the worker count (`replan_bindings_from_candidates`) — but anything
+    /// that re-partitions these high bits (e.g. #6311's proposal to steal a bit
+    /// from the worker field) must preserve the reservation.
+    ///
+    /// The reservation is ENFORCED, not merely documented: a worker id landing on
+    /// it aborts at worker setup. This is a config-time invariant (called once per
+    /// worker, with a queue index), so per `docs/engineering-style.md` a hard
+    /// failure beats running with ids that silently alias the control plane's. A
+    /// plain `assert!` rather than `debug_assert!` because `make test-rust` and
+    /// the shipped helper both build `--release`, where a debug assertion is
+    /// stripped and would guard nothing.
     pub fn set_worker_id(&mut self, worker_id: u32) {
-        self.session_id_worker_hi = ((worker_id as u64) & 0xFFFF) << 48;
+        let worker_hi = (worker_id as u64) & 0xFFFF;
+        assert_ne!(
+            worker_hi, CONTROL_PLANE_SESSION_ID_WORKER_HI,
+            "worker id {worker_id} maps onto the session-id namespace reserved \
+             for the Go control plane (#6198): nextUserspaceSyncedSessionID mints \
+             {CONTROL_PLANE_SESSION_ID_WORKER_HI:#x} << 48 | counter into the same \
+             BPF conntrack mirror field"
+        );
+        self.session_id_worker_hi = worker_hi << 48;
     }
 
     /// #4915: allocate the next STABLE session id for a freshly-installed entry.

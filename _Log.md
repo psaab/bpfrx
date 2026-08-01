@@ -65801,3 +65801,87 @@ break — `go vet` confirmed passing under every revert.
   accessor the PR orphaned has one caller and one definition again.
   Docs-and-wiring only: no runtime behaviour change.
 - **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 03:20
+- **Action**: #6198 — mint a real identity for the node-local BPF-ABI SessionID
+  on the HA-synced conversion path. The previous
+  `uint64(now)<<16 | uint64(delta.Slot&0xffff)` was not an identity: `delta.Slot`
+  is the AF_XDP BINDING slot (`BindingIdentity.slot`, a handful per node), the
+  binary event stream that carries the primary delta path never decodes it at
+  all (`decodeSessionEvent` leaves it 0), and `now` is CLOCK_MONOTONIC SECONDS —
+  so every session converted within one second collapsed onto ONE id (the
+  reported `&0xffff` slot aliasing is in fact unreachable; the real defect is
+  far wider). `nextUserspaceSyncedSessionID` replaces it with a monotonic
+  counter in a reserved `0xFFFF<<48` namespace, disjoint from the
+  worker-namespaced ids the Rust helper stamps into the same BPF conntrack
+  mirror field. `userspaceForwardWireAliasFromDelta{V4,V6}` become
+  `userspaceForwardWireAlias{V4,V6}` taking the already-converted base session,
+  so the fabric-redirect alias and its base still share one id instead of
+  minting two. The id stays deliberately node-local — the cross-node
+  correlatable id is the separate `RTFlowSessionID` (#5212). No wire-format
+  change (the field is already u64 on both sides) and no Rust change (the
+  helper never reads this field).
+- **File(s)**: pkg/daemon/daemon_ha_userspace_convert.go,
+  pkg/daemon/daemon_ha_userspace_stream.go, pkg/daemon/userspace_sync_test.go,
+  pkg/daemon/userspace_sync_session_id_6198_test.go, pkg/dataplane/types.go,
+  pkg/cluster/README.md, docs/session-sync-architecture.md,
+  docs/sync-protocol.md, _Log.md
+
+- **Timestamp**: 2026-08-01 05:10
+- **Action**: #6198 review fold (MERGE-NEEDS-MINOR, four minors). (1) Seed the
+  synced-session id counter from the boot clock
+  (`userspaceSyncedSessionIDSeed`, `monotonic_seconds << 24` masked to 48 bits)
+  — an unseeded counter re-minted 1,2,3… after an xpfd restart and collided
+  with entries the peer's mirror still held from the previous incarnation, a
+  narrow axis on which the old `now<<16|Slot` was actually BETTER (CLOCK_MONOTONIC
+  keeps increasing across a daemon restart). Seeding closes the residual instead
+  of documenting it. (2) `pkg/dataplane/types.go` asserted the opposite of this
+  PR's thesis on BOTH `SessionValue` and `SessionValueV6` — "unique ID, same on
+  both cluster nodes" 87 lines above a comment calling the id node-local;
+  replaced with the node-local semantics. (3) Same false claim was the
+  operator-facing gRPC contract (`proto/xpf/v1/xpf.proto` `session_id`);
+  corrected and REGENERATED `xpf.pb.go` via `make proto` (diff ignoring
+  whitespace is the comment only — the protobuf tag is byte-identical, no wire
+  impact). (4) The `0xFFFF<<48` reservation was documented only on the Go side,
+  which does not have to obey it; recorded it on `SessionTable::set_worker_id`
+  and in `userspace-dp/src/session/README.md`, where a future minter (e.g.
+  #6311, which proposes re-partitioning those high bits) would look. Also took
+  the reviewer's NIT: the id is distinct per CONVERSION, not stable per session
+  (bulk resync re-stamps; the close branch burns one) — now stated in the code
+  comment and the architecture doc rather than implied otherwise.
+- **File(s)**: pkg/daemon/daemon_ha_userspace_convert.go,
+  pkg/daemon/userspace_sync_session_id_6198_test.go, pkg/dataplane/types.go,
+  proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  userspace-dp/src/session/mod.rs, userspace-dp/src/session/README.md,
+  docs/session-sync-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-01 07:40
+- **Action**: #6198 second review fold (MERGE-NEEDS-MAJOR — both MAJORs were in
+  the seeding added in the previous round). (1) The zero-correction emitted a
+  DUPLICATE: `Add(1) & mask; if counter == 0 { counter = 1 }` corrects only the
+  returned copy, so at the wrap the atomic still holds the masked-zero value and
+  the NEXT call returns the id just handed out — inside the namespace, so nothing
+  downstream looks wrong while uniqueness silently stops holding. Replaced with a
+  CAS advance so the STORED value is the returned one. The wrap is reachable, not
+  theoretical: the seed consumes counter space, so distance to the boundary
+  depends on uptime phase. Kept the ring rather than failing closed — the id is
+  display-only but the conversion carrying it installs an HA-synced session, so
+  refusing to mint would trade a cosmetic alias for lost sessions at failover.
+  (2) The seed was read at SECOND resolution, so two incarnations whose first
+  allocations land in the same integer second got identical seeds and repeated
+  from their first id — the common restart, since `RestartSec=1` lands in the
+  window and the sub-second phase is uniform. Added `daemonMonotonicNanos` and
+  reshifted the seed to `nanos >> 10` (~1.024 us granularity, three orders of
+  magnitude below any real teardown+exec; ~976k ids/s of rate headroom; 9.1-year
+  seed cycle). The previous test only compared `uptime` vs `uptime+1`, so it
+  could not see this — the new test drives 1ms/10ms/100ms/700ms separations
+  inside one second, with a fixture guard that fails if an offset crosses a
+  second boundary and makes the case vacuous. (3) MINOR: the `0xFFFF<<48`
+  reservation was documented but unenforced on the Rust side; added
+  `CONTROL_PLANE_SESSION_ID_WORKER_HI` and a hard `assert!` in `set_worker_id`
+  (not `debug_assert!` — release strips those and `make test-rust` is a release
+  build), plus a `#[should_panic]` guard and a negative control.
+- **File(s)**: pkg/daemon/daemon_ha_userspace_convert.go,
+  pkg/daemon/userspace_sync_session_id_6198_test.go,
+  userspace-dp/src/session/mod.rs, userspace-dp/src/session/tests.rs,
+  userspace-dp/src/session/README.md, docs/session-sync-architecture.md, _Log.md
