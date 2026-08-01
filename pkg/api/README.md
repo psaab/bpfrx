@@ -379,14 +379,33 @@ built on that classification has to know so.
   administrator behind such a redirect cannot use the mutation surface even with
   a valid credential. This is the most plausible of the three; bind
   `web-management` to a real address rather than DNAT-ing to loopback.
-- **Another network namespace, off-loopback bind.** A container's veth peer and
-  a real remote client are indistinguishable in the socket table, so a netns
-  caller on a routable bind reaches the credential path. It is narrower than it
-  first appears: an unprivileged user cannot get there. `unshare -Urn` yields a
-  namespace containing only `lo`, and attaching a veth to the host requires
-  CAP_NET_ADMIN *in the host namespace* — i.e. a root-configured container
-  runtime. The default loopback bind is unaffected either way, and #4047 already
-  requires an api-auth credential on the surface where this applies.
+- **Another network namespace, off-loopback bind — argument corrected.** A
+  container's veth peer and a real remote client are indistinguishable in the
+  socket table, so a netns caller on a routable bind reaches the credential path.
+  Both halves of the lookup are namespace-scoped: `findPeerSocket` reads only
+  *this* namespace's `/proc/net/tcp{,6}`, and `PeerCouldBeLocalNow` repeats the
+  same namespace-scoped `net.InterfaceAddrs()` test, so a peer in another
+  namespace produces a clean no-match in both and lands `(OK=false, Local=false)`.
+
+  An earlier version of this list argued the path was narrow because "an
+  unprivileged user cannot get there": `unshare -Urn` yields a namespace
+  containing only `lo`, and attaching a veth to the host needs CAP_NET_ADMIN in
+  the host namespace. **That reasoning does not hold, and it is the wrong thing
+  to lean on.** A caller does not have to *create* its own namespace. A process
+  inside an already-provisioned container — Docker, Kubernetes,
+  `systemd-nspawn` — is handed a veth by the runtime and needs no capability of
+  its own; possession of the shared credential is then sufficient.
+
+  The correct statement of the bound is not "nobody can get here", it is **what
+  governs a caller who does**: a peer this host cannot place is treated as
+  remote, and the `api-auth` credential is the authority for it. That is the
+  design #4047 mandates — on an off-loopback bind the credential is the sole
+  gate — not a leak in it. The operational consequence is concrete and worth
+  stating plainly: **a container on this host that holds the `api-auth` secret
+  has the same power over the mutation surface as a remote administrator
+  holding it.** If that is not wanted, do not give containers the secret, and
+  keep `web-management` on loopback where `couldBeLocal` short-circuits before
+  any of this applies.
 - **A brand-new local address — direction corrected, and closed.** The
   host-address snapshot is refreshed at most once per second, for hits *and*
   misses, so for up to a second after an address is added to this host a caller
@@ -427,6 +446,21 @@ built on that classification has to know so.
 
   What remains is an over-denial: for at most a second, a local caller with no
   socket row is denied instead of resolved to its class.
+
+  **And one under-denial, stated rather than papered over.** A *successful*
+  enumeration that finds nothing is not proof the caller is off-box — errors
+  fail closed, omissions cannot. A clean no-match reads the same whether the
+  caller is genuinely remote, in another namespace, or was on this host a moment
+  ago and is not now. The last is reachable without the caller doing anything
+  privileged, because it can ride address churn the **system** performs: on this
+  product a VRRP VIP moves on every failover, and DHCP and RA churn constantly.
+  Both observations are used rather than one — the accept-time verdict still
+  denies before the credential row is reached, and the fresh check adds denials
+  for callers that only became placeable later — but neither covers an address
+  that appeared *and* vanished between them. Closing that needs address-change
+  notification (`RTM_NEWADDR`) rather than two point samples, and is not
+  attempted here. The bound is the same one as for the namespace residual above:
+  a caller this host cannot place is governed by the `api-auth` credential.
 
   **Bounds.** It required an *off-loopback* bind (on the default loopback bind
   `couldBeLocal` short-circuits before the cache is ever consulted, so the

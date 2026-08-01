@@ -66614,3 +66614,40 @@ break — `go vet` confirmed passing under every revert.
   vet rc=0, the two "valid credential" halves red plus
   TestBrandNewLocalAddressCannotBorrowCredential_5561, 750 pass.
 - **File(s)**: pkg/api/authz.go, pkg/api/config_authz_5561_test.go, _Log.md
+
+- **Timestamp**: 2026-08-01 (round-6, Codex MERGE-NEEDS-MAJOR fold)
+- **Action**: #5561 — fold 3 MAJORs + 1 MINOR from Codex xhigh at `b1f07c07a`.
+  (MAJOR 3) TWO cost guards were near-vacuous beside the strong one the parent
+  had verified: the real-scan test asserted `scans != 0` (1, 2 or 100 all pass)
+  and the batching test allowed 50 enumerations for 400 calls while claiming
+  "N concurrent callers cost ONE". The claim was also WRONG — a waiter arriving
+  mid-scan is served by the NEXT scan, so the promise is "callers that overlap a
+  scan share the scan after it", i.e. bounded by elapsed-time/scan-duration, not
+  by caller count. Both now assert EXACT counts; the batching test is
+  deterministic (one caller held inside scan 1, the rest queued behind it,
+  release, require exactly 2) rather than timing-dependent. (MAJOR 1) The netns
+  residual's safety ARGUMENT was wrong: "an unprivileged user cannot get there"
+  fails because a process in an ALREADY-PROVISIONED container (docker/k8s/nspawn)
+  is handed a veth and needs no capability of its own. Restated the bound as what
+  it actually is — a caller this host cannot place is governed by the api-auth
+  credential, which is what #4047 makes it for — and said plainly that a
+  container holding the secret has a remote administrator's power. (MAJOR 2) A
+  SUCCESSFUL enumeration finding nothing is not proof of off-box; errors fail
+  closed, omissions cannot. Reachable by riding system address churn (VRRP VIP
+  moves every failover). Documented the semantics of `false` precisely, recorded
+  that BOTH observations are used (accept-time `id.Local` denies before the
+  credential row), named what neither covers (an address that appears and
+  vanishes between the two samples, needing RTM_NEWADDR to close), and added
+  `TestAcceptTimeVerdictIsNotDiscarded_5561` pinning that the later observation
+  may not overrule the earlier. (MINOR 4) Capped `hostAddrScan.waiters` at 4096,
+  fail-closed to "local"; corrected the batching claim in the code comment.
+  Five mutations, each build+vet rc=0 with EMPTY stderr and a named assertion:
+  non-binding waiter cap -> peer_5561_test.go:1159; batching removed ->
+  peer_5561_test.go:897; waiters answered from a scan older than their arrival ->
+  peer_5561_test.go:910 ("drove 1 enumerations, want exactly 2" — the staleness
+  direction a ceiling could never catch); re-derivation run twice per request ->
+  config_authz_5561_test.go:1416 AND :1540 (both exact-count asserts, which the
+  old `!= 0` / `> callers/4` forms would have passed); accept-time verdict
+  discarded -> config_authz_5561_test.go:1594.
+- **File(s)**: pkg/authz/peer.go, pkg/authz/peer_5561_test.go,
+  pkg/api/config_authz_5561_test.go, pkg/api/README.md, _Log.md

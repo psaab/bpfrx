@@ -806,47 +806,133 @@ func TestConfirmationFailsClosed_5561(t *testing.T) {
 //
 // A fresh enumeration per caller would be the amplification
 // TestLocalAddrCacheRateLimitsMisses_5561 exists to forbid, just moved. The
-// confirmation batches like socketscan.go instead: the waiter set is taken
-// before the enumeration starts, so N concurrent confirmations cost ONE
-// enumeration while still answering every one of them from an observation newer
-// than its own arrival.
+// confirmation batches like socketscan.go instead.
+//
+// # What the batching actually promises, and why this asserts an EXACT count
+//
+// An earlier version of this case allowed 50 enumerations for 400 calls while
+// its comment claimed "N concurrent confirmations cost ONE enumeration". A
+// ceiling 50x above the claim is not a guard: it would pass with the batching
+// removed for any batch that happened to be small, and it hid the fact that the
+// claim itself was wrong.
+//
+// The claim is now stated correctly AND pinned exactly. A waiter that arrives
+// while a scan is in flight is NOT served by it — run() took its batch before
+// the scan started — so it waits for the NEXT one. The promise is therefore not
+// "N callers cost one scan"; it is "callers that overlap a scan share the scan
+// after it", i.e. the enumeration count is bounded by elapsed time over scan
+// duration rather than by caller count.
+//
+// The case drives exactly that shape deterministically: one caller starts a scan
+// and is held inside it, every other caller then piles into the waiter queue, and
+// releasing the first scan must drain ALL of them in a SECOND scan. Two, exactly
+// — not "at most 50", and not "one", which the design does not promise.
 func TestConfirmationIsSingleFlighted_5561(t *testing.T) {
 	const callers = 200
 
 	ours := net.IPv4(10, 0, 61, 1)
+	foreign := net.IPv4(198, 51, 100, 7)
+	srv := &net.TCPAddr{IP: net.IPv4(198, 51, 100, 1), Port: 8080}
+
+	entered := make(chan struct{}, 1) // the first scan has begun
+	release := make(chan struct{})    // ... and may now finish
+	var scanNo atomic.Int64
+
 	prev := localAddrsFn
 	localAddrsFn = func() ([]net.Addr, error) {
-		time.Sleep(5 * time.Millisecond) // long enough for the batch to fill
+		if scanNo.Add(1) == 1 {
+			entered <- struct{}{}
+			<-release
+		}
 		return []net.Addr{&net.IPNet{IP: ours, Mask: net.CIDRMask(24, 32)}}, nil
 	}
 	t.Cleanup(func() { localAddrsFn = prev; resetLocalAddrCacheForTest() })
 
-	srv := &net.TCPAddr{IP: net.IPv4(198, 51, 100, 1), Port: 8080}
+	// Quiesce first: a drain goroutine left running by an earlier case would
+	// take this case's waiters and make the count meaningless.
+	waitForHostAddrScannerIdle(t)
+
 	before := HostAddrScansForTest()
 	var wg sync.WaitGroup
 	var wrong atomic.Uint64
-	for i := 0; i < callers; i++ {
+	ask := func(ip net.IP, wantLocal bool) {
+		defer wg.Done()
+		if got := PeerCouldBeLocalNow(&net.TCPAddr{IP: ip, Port: 1}, srv); got != wantLocal {
+			wrong.Add(1)
+		}
+	}
+
+	// Caller 0 alone, so it is unambiguously the one that starts scan 1.
+	wg.Add(1)
+	go ask(ours, true)
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		close(release)
+		wg.Wait()
+		t.Fatal("the first enumeration never started")
+	}
+
+	// Everyone else arrives WHILE scan 1 is in flight, so all of them must land
+	// in the waiter queue rather than being answered by the scan already running.
+	for i := 1; i < callers; i++ {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			// A foreign address must confirm off-box, ours must confirm local —
-			// batching may not blur one caller's answer into another's.
-			if PeerCouldBeLocalNow(&net.TCPAddr{IP: net.IPv4(198, 51, 100, 7), Port: 1}, srv) {
-				wrong.Add(1)
-			}
-			if !PeerCouldBeLocalNow(&net.TCPAddr{IP: ours, Port: 2}, srv) {
-				wrong.Add(1)
-			}
-		}()
+		if i%2 == 0 {
+			go ask(ours, true)
+		} else {
+			go ask(foreign, false)
+		}
 	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		hostAddrScan.mu.Lock()
+		queued := len(hostAddrScan.waiters)
+		hostAddrScan.mu.Unlock()
+		if queued == callers-1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			close(release)
+			wg.Wait()
+			t.Fatalf("only %d of %d callers queued behind the in-flight scan", queued, callers-1)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	close(release)
 	wg.Wait()
+
 	if n := wrong.Load(); n != 0 {
-		t.Fatalf("%d of %d batched confirmations answered the wrong caller", n, 2*callers)
+		t.Fatalf("%d of %d batched confirmations answered the wrong caller — batching "+
+			"blurred one caller's address into another's", n, callers)
 	}
-	if scans := HostAddrScansForTest() - before; scans > callers/4 {
-		t.Fatalf("%d concurrent confirmations drove %d interface enumerations — the "+
-			"confirmation is not batched, so it reintroduces the per-connection "+
-			"amplification the accept-time cache exists to prevent", 2*callers, scans)
+	if scans := HostAddrScansForTest() - before; scans != 2 {
+		t.Fatalf("%d callers — one holding a scan open and %d queued behind it — drove %d "+
+			"enumerations, want exactly 2. More than 2 means the queued callers were not "+
+			"batched and the confirmation amplifies per caller; fewer means they were "+
+			"answered by a scan that STARTED BEFORE THEY ARRIVED, which is the staleness "+
+			"the whole fix exists to remove", callers, callers-1, scans)
+	}
+}
+
+// waitForHostAddrScannerIdle blocks until no enumeration goroutine is live.
+// run() clears `running` under the lock and returns without releasing it in
+// between, so observing running==false under that lock proves none is between
+// iterations.
+func waitForHostAddrScannerIdle(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		hostAddrScan.mu.Lock()
+		idle := !hostAddrScan.running && len(hostAddrScan.waiters) == 0
+		hostAddrScan.mu.Unlock()
+		if idle {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the host-address scanner never went idle")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -988,5 +1074,68 @@ func TestSaturatedBatcherFailsClosed_5561(t *testing.T) {
 	batcher.mu.Unlock()
 	if n > maxPendingLookups {
 		t.Fatalf("pending queue grew to %d, past the %d cap", n, maxPendingLookups)
+	}
+}
+
+// TestSaturatedEnumerationQueueFailsClosed_5561 is the MINOR-4 guard, the
+// hostAddrScan twin of TestSaturatedBatcherFailsClosed_5561.
+//
+// Every waiter is a goroutine blocked in PeerCouldBeLocalNow, so a wedged
+// enumeration accumulates them without limit. Past the cap the caller must be
+// answered rather than queued, and the answer must land on the DENY side: this
+// function's false is what admits a credential, so saturation may only ever say
+// "local".
+func TestSaturatedEnumerationQueueFailsClosed_5561(t *testing.T) {
+	waitForHostAddrScannerIdle(t)
+
+	// Pin `running` with no goroutine behind it, so nothing dequeues. Real
+	// (keyless, buffered) channels rather than nils, so a drainer that somehow
+	// did take them could not crash on one.
+	hostAddrScan.mu.Lock()
+	prevWaiters, prevRunning := hostAddrScan.waiters, hostAddrScan.running
+	filler := make([]chan hostAddrs, maxHostAddrWaiters)
+	for i := range filler {
+		filler[i] = make(chan hostAddrs, 1)
+	}
+	hostAddrScan.waiters = filler
+	hostAddrScan.running = true
+	hostAddrScan.mu.Unlock()
+	t.Cleanup(func() {
+		hostAddrScan.mu.Lock()
+		hostAddrScan.waiters, hostAddrScan.running = prevWaiters, prevRunning
+		hostAddrScan.mu.Unlock()
+	})
+
+	defer setLocalAddrsForTest([]net.Addr{
+		&net.IPNet{IP: net.IPv4(10, 0, 61, 1), Mask: net.CIDRMask(24, 32)},
+	})()
+
+	// The property is that the call RETURNS. Without the cap it appends to a
+	// queue nothing will drain and blocks forever, so the timeout turns an
+	// unbounded queue into an assertion instead of a hang.
+	done := make(chan bool, 1)
+	go func() {
+		done <- PeerCouldBeLocalNow(
+			&net.TCPAddr{IP: net.IPv4(198, 51, 100, 7), Port: 51234},
+			&net.TCPAddr{IP: net.IPv4(10, 0, 61, 1), Port: 8080})
+	}()
+	select {
+	case local := <-done:
+		if !local {
+			t.Fatal("a saturated enumeration queue confirmed the caller OFF-BOX — that is " +
+				"the one answer that admits a credential, so saturation would let a shared " +
+				"secret speak for a caller nobody enumerated")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("PeerCouldBeLocalNow never returned with the queue at its cap — the waiter " +
+			"slice is unbounded, so a wedged enumeration accumulates goroutines without " +
+			"limit and every new caller blocks instead of being denied")
+	}
+
+	hostAddrScan.mu.Lock()
+	n := len(hostAddrScan.waiters)
+	hostAddrScan.mu.Unlock()
+	if n > maxHostAddrWaiters {
+		t.Fatalf("waiter queue grew to %d, past the %d cap", n, maxHostAddrWaiters)
 	}
 }

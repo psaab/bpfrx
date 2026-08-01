@@ -2,7 +2,9 @@ package authz
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
@@ -262,10 +264,36 @@ var hostAddrScans atomic.Uint64
 // leaks into the production binary.
 func HostAddrScansForTest() uint64 { return hostAddrScans.Load() }
 
+// maxHostAddrWaiters caps the enumeration queue, for the same reason
+// socketscan.go caps its own: every waiter is a goroutine blocked in
+// PeerCouldBeLocalNow, and a wedged enumeration would otherwise accumulate them
+// without limit. Past the cap the caller is answered with an error, which
+// PeerCouldBeLocalNow turns into "local" — a DENIAL, so saturation cannot admit.
+//
+// Reaching it requires a VALID credential (the call is made after s.credential),
+// so this is not an uncredentialed amplification; it is a bound on a queue that
+// otherwise had none.
+const maxHostAddrWaiters = 4096
+
 // now returns an enumeration that STARTED after this call began.
+//
+// A caller that arrives while a scan is in flight is NOT served by that scan —
+// run() took its batch before the scan started — so it waits for the NEXT one.
+// The promise is therefore "callers that overlap a scan share the scan after
+// it", i.e. enumerations are bounded by elapsed time over scan duration rather
+// than by caller count. It is NOT "N callers cost one scan": N callers arriving
+// one per scan really do cost N sequential scans. That is the price of the
+// freshness guarantee — an answer may never come from an observation older than
+// its own arrival — and it is why this path sits behind the credential check.
 func (h *hostAddrScanner) now() hostAddrs {
 	ch := make(chan hostAddrs, 1)
 	h.mu.Lock()
+	if len(h.waiters) >= maxHostAddrWaiters {
+		h.mu.Unlock()
+		slog.Warn("authz: refusing locality re-derivation, enumeration queue saturated",
+			"waiters", maxHostAddrWaiters)
+		return hostAddrs{err: errHostAddrQueueFull}
+	}
 	h.waiters = append(h.waiters, ch)
 	if !h.running {
 		h.running = true
@@ -274,6 +302,9 @@ func (h *hostAddrScanner) now() hostAddrs {
 	h.mu.Unlock()
 	return <-ch
 }
+
+// errHostAddrQueueFull is returned when the enumeration queue is at its cap.
+var errHostAddrQueueFull = errors.New("interface-enumeration queue is saturated")
 
 // run drains batches until none are pending. Each iteration takes the whole
 // waiter set BEFORE enumerating, so every waiter in it arrived strictly before
@@ -322,8 +353,37 @@ func (h *hostAddrScanner) run() {
 // It is a ONE-WAY narrowing. LookupPeer already denied everything it classified
 // as local, so this check can only turn an admission into a denial; there is no
 // input for which it turns a denial into an admission. Its own failure modes —
-// an address pair we cannot classify, an unusable address list — answer true
-// (local, deny), so a broken enumeration costs availability, never authority.
+// an address pair we cannot classify, an unusable address list, a saturated
+// queue — answer true (local, deny), so a broken enumeration costs availability,
+// never authority.
+//
+// # What FALSE means, and what it does NOT mean
+//
+// False means "this host is not holding that address at this instant". It is NOT
+// proof the caller is off-box, and the difference is not academic on this
+// product.
+//
+// Errors fail closed; successful OMISSIONS cannot. A clean no-match is
+// indistinguishable between "genuinely remote", "in another network namespace"
+// (both halves of the lookup are namespace-scoped — see pkg/api/README.md), and
+// "was on this host a moment ago and is not now". The last one is reachable
+// without the caller doing anything privileged: it can ride address churn the
+// SYSTEM performs. A VRRP VIP moves on every failover, DHCP renews, RAs come and
+// go. A caller need only be adjudicated while its source address is between
+// owners.
+//
+// Both observations are used rather than one. The accept-time verdict is still
+// consulted — pkg/api's principal() denies on id.Local BEFORE it reaches the
+// credential row — so a caller this host could place at accept is denied no
+// matter what a later enumeration says, and this check adds denials for callers
+// that only became placeable afterwards. What neither observation covers is an
+// address that appeared AND vanished between them; closing that would need
+// address-change notification (RTM_NEWADDR) rather than two point samples, and
+// is not attempted here.
+//
+// So the honest statement of the bound is not "a caller that gets past this is
+// off-box". It is: a caller this host cannot place is governed by the api-auth
+// credential, which is exactly what #4047 makes that credential for.
 //
 // # Why re-checking here is sound when re-checking the SOCKET TABLE would not be
 //

@@ -1532,10 +1532,16 @@ func TestOffLoopbackCredentialRowEnumeratesOnlyOnce_5561(t *testing.T) {
 		before := authz.HostAddrScansForTest()
 		status, errMsg := postRoute(t, base, "POST /api/v1/config/enter",
 			map[string]string{"Authorization": basic})
-		if scans := authz.HostAddrScansForTest() - before; scans == 0 {
-			t.Fatal("a request with a VALID credential drove NO interface enumeration — " +
-				"the credential row is not re-deriving locality, so the accept-time " +
-				"snapshot decides and a caller on this host is admitted by the secret")
+		// EXACTLY one, not "at least one". A >0 assertion is satisfied by 1, 2 or
+		// 100 alike, so it catches the check being removed but not the check
+		// being run per-something — which is the cost half of the property and
+		// the reason it was safe to make the answer authoritative at all.
+		if scans := authz.HostAddrScansForTest() - before; scans != 1 {
+			t.Fatalf("one request with a VALID credential drove %d interface enumerations, "+
+				"want exactly 1. Zero means the credential row is not re-deriving locality, "+
+				"so the accept-time snapshot decides and a caller on this host is admitted "+
+				"by the secret; more than one means the re-derivation runs more than once "+
+				"per request", scans)
 		}
 		if status != http.StatusForbidden {
 			t.Fatalf("a caller connecting FROM %v — an address assigned to this host — was "+
@@ -1546,4 +1552,57 @@ func TestOffLoopbackCredentialRowEnumeratesOnlyOnce_5561(t *testing.T) {
 			t.Errorf("denial did not name the reason: %q", errMsg)
 		}
 	})
+}
+
+// TestAcceptTimeVerdictIsNotDiscarded_5561 is the MAJOR-2 guard: the two
+// locality observations are used TOGETHER, and the later one may not overrule
+// the earlier.
+//
+// A fresh enumeration that finds nothing is not proof of off-box — a successful
+// omission reads the same whether the caller is remote or its address moved. On
+// this product that is not hypothetical: a VRRP VIP relocates on every failover,
+// so an address really can be on this host at accept and gone by the time the
+// request is adjudicated.
+//
+// The accept-time verdict is what covers that, and it must keep covering it: a
+// caller this host COULD place at accept is denied before the credential row is
+// reached, whatever a later enumeration says. This case drives exactly that
+// disagreement — accept says local, the fresh check says off-box, and a valid
+// credential is presented — and requires the denial.
+func TestAcceptTimeVerdictIsNotDiscarded_5561(t *testing.T) {
+	usePasswdFixture(t)
+	basic := "Basic " + base64.StdEncoding.EncodeToString([]byte("webadmin:s3cret"))
+
+	var rechecks atomic.Int64
+	_, base := authzServer(t, Config{
+		Addr:  "127.0.0.1:8080",
+		Store: authzStore(t, authzTestConfig),
+		Auth:  &AuthConfig{Users: map[string]string{"webadmin": "s3cret"}},
+		// Accept: the caller IS on this host, but unattributable.
+		PeerLookupFn: unattributableLocalPeer(),
+		// Request time: its address has since moved away, so a fresh enumeration
+		// finds nothing. The later observation must not rescue the credential.
+		PeerLocalityFn: func(net.Addr, net.Addr) bool {
+			rechecks.Add(1)
+			return false
+		},
+	})
+
+	status, errMsg := postRoute(t, base, "POST /api/v1/config/enter",
+		map[string]string{"Authorization": basic})
+	if status != http.StatusForbidden {
+		t.Fatalf("a caller this host placed AT ACCEPT was admitted with %d once its address "+
+			"had moved on — the accept-time verdict was discarded in favour of a later "+
+			"enumeration, so riding a VRRP VIP failover is enough to reach the credential "+
+			"row (error=%q)", status, errMsg)
+	}
+	if !strings.Contains(errMsg, "local but could not be identified") {
+		t.Errorf("denial did not name the reason: %q", errMsg)
+	}
+	// And it must be denied WITHOUT consulting the fresh check: the accept-time
+	// verdict alone settles it, so no enumeration is owed for this caller.
+	if n := rechecks.Load(); n != 0 {
+		t.Errorf("a caller denied on the accept-time verdict still drove %d locality "+
+			"re-derivations; the accept-time deny must short-circuit", n)
+	}
 }
