@@ -24,7 +24,11 @@
 //!     field and implements no arithmetic. `queue % 2`, `queue & 3`, `queue >> 1`
 //!     do not compile outside this module (E0369), and neither does the tuple
 //!     constructor (E0423). A future author who genuinely needs to transform it
-//!     must add a visible, reviewable accessor.
+//!     must add a visible, reviewable accessor. That property holds only while
+//!     the field stays private and no arithmetic impl exists, and BOTH are now
+//!     bounded by the parity tests — a hostile round added an arithmetic impl
+//!     plus a public field and nothing went red, which with one extra line
+//!     reintroduced the defect with no `unsafe` marker anywhere in it.
 //!   - **Executed.** [`binding_slot`] is host-compiled and driven over the
 //!     `(ifindex, queue)` grid the parity tests cover — queues 0..64 against a
 //!     spread of ifindexes up to 65535, so both sides of the stride boundary
@@ -38,21 +42,33 @@
 //!     ingress-interface map before reaching here, so that range is unreachable
 //!     in practice; it is also pre-existing on master, same multiply, same
 //!     absent bound.
-//!   - **NOT closed, and this list is not empty.** The constructor must accept
-//!     a bare `u32`, because the value originates in an aya `XdpContext` that
-//!     cannot cross into a `core`-only module. So (a) a reduction applied to
-//!     the integer BEFORE it is wrapped still compiles, and (b) a `transmute`
-//!     into the wrapper compiles whatever the field's visibility is. The parity
-//!     tests pin (a) by pinning the wrap statement and the lookup statement
-//!     token-for-token; NOTHING catches (b), and no type can. A third residual
-//!     is structural: [`binding_slot`] types the queue half of the index and
-//!     not the ifindex half, so reducing the ifindex is rejected only at the
-//!     pinned call site, never by the type system.
+//!   - **NOT closed by a TYPE, and that list is not empty.** The constructor
+//!     must accept a bare `u32`, because the value originates in an aya
+//!     `XdpContext` that cannot cross into a `core`-only module. So (a) a
+//!     reduction applied to the integer BEFORE it is wrapped still compiles,
+//!     and (b) so does any construction of the wrapper that goes around the
+//!     constructor entirely by fabricating it from raw bytes — a `transmute`,
+//!     `mem::zeroed`, `MaybeUninit::assume_init`, a pointer read. (b) is a
+//!     CLASS, not a symbol, and naming only `transmute` — as an earlier
+//!     revision of this comment did — invites an audit that greps for one word
+//!     and misses the rest; the field's visibility is irrelevant to all of
+//!     them. A third residual is that [`binding_slot`] types the queue half of
+//!     the index and not the ifindex half, so reducing the ifindex is never
+//!     rejected by the type system.
+//!
+//!     What bounds all three is source, in the parity tests, and it is worth
+//!     saying HOW because the obvious way does not work: not by enumerating the
+//!     fabrication symbols, which would always be one symbol behind, but by
+//!     pinning the lookup statement so both coordinates must arrive under a
+//!     fixed NAME, and then bounding each of those names to a single binding in
+//!     the whole crate. A forged or reduced value that cannot be bound to the
+//!     name is a value the pinned statement will not accept.
 //!
 //! The honest summary: the source-asserted surface cannot reach ZERO while the
-//! coordinate originates in aya-dependent code. What it can do, and now does,
-//! is make every known reintroduction of #5173 either fail to compile or fail a
-//! pinned statement.
+//! coordinate originates in aya-dependent code — a parameter of an enclosing
+//! closure or helper `fn` still shadows a name without writing a binding, which
+//! nothing here catches. What it can do, and now does, is make every known
+//! reintroduction of #5173 either fail to compile or fail a pinned statement.
 //!
 //! Nothing here may depend on `aya`, on a BPF map, or on `std` — that is what
 //! keeps it host-compilable, and it is the whole point.
@@ -79,7 +95,9 @@ impl RawRxQueue {
     /// read of `(*ctx.ctx).rx_queue_index` — is pinned token-for-token by a
     /// repo-scoped check in the parity tests, because a reduction applied to
     /// the integer before it reaches here is one of the two escapes a newtype
-    /// cannot prevent. (The other is `transmute`, which nothing prevents.)
+    /// cannot prevent. (The other is going around this constructor altogether
+    /// and fabricating the wrapper from raw bytes; no type prevents that, and
+    /// the module comment above says how source bounds it.)
     #[inline(always)]
     pub fn from_ctx_field(rx_queue_index: u32) -> Self {
         RawRxQueue(rx_queue_index)

@@ -35,11 +35,11 @@
     },
     {
       "path": "userspace-xdp/src/binding_index.rs",
-      "sha256": "e9e5b3a8640e6a8de0ab351b84ca50d92a54002de669b13075c08a7239af29cc"
+      "sha256": "058529f368db9acc9a1dc63d25f58babf4b47020b0f0566d52700abaed811f2c"
     },
     {
       "path": "userspace-xdp/src/lib.rs",
-      "sha256": "800fe2eeaf534397f1e095bf4b3094c8d8310ab92d7c0ccc25abff2b29fe8628"
+      "sha256": "38ed2e249124477a9e709b5a2dfae94ca523ebb387562ed21866a1e743640ffe"
     }
   ]
 }

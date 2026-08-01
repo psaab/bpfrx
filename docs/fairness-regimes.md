@@ -138,7 +138,9 @@ analysis), and the killed cross-worker-rebalance chain
 On the loss userspace cluster the dataplane NIC exposes **M = 6
 combined RX queues**, deterministically bound one-per-worker
 (RX queue N delivers to the worker whose AF_XDP socket is bound to
-queue N — `userspace-xdp/src/lib.rs` `select_userspace_queue()`).
+queue N — the shim resolves the binding slot straight from the
+packet's own arrival queue, `binding_slot()` in
+`userspace-xdp/src/binding_index.rs`, and never remaps it; #5173).
 RSS hashes each TCP flow's 5-tuple to one of those 6 queues, so
 `N` flows land as a **multinomial draw** over `M = 6` bins.
 

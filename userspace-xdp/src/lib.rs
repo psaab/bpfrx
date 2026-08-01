@@ -424,6 +424,12 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         return drop_degraded_transit(ctrl, USERSPACE_FALLBACK_REASON_PARSE_FAIL);
     };
 
+    // #5173: this statement is pinned token-for-token by the parity tests, and
+    // the name it binds is bounded to exactly this one binding in the crate.
+    // The interface coordinate stays a bare u32 all the way into
+    // `binding_slot`, so unlike the queue coordinate NOTHING rejects a
+    // reduction of it by type — pinning where it comes from, refusing a second
+    // binding of the name, and pinning how it is passed is the whole defence.
     let ingress_ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
     if unsafe { USERSPACE_INGRESS_IFACES.get(&ingress_ifindex) }.map_or(true, |v| *v == 0) {
         return Ok(cpumap_or_pass(ctrl));
@@ -448,7 +454,8 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         0,
         &parsed,
     );
-    let binding = binding_slot(ingress_ifindex, rx_queue).and_then(|idx| USERSPACE_BINDINGS.get(idx));
+    let binding =
+        binding_slot(ingress_ifindex, rx_queue).and_then(|idx| USERSPACE_BINDINGS.get(idx));
     let binding = match binding {
         Some(b) if b.flags != 0 => b,
         _ => {
@@ -1456,7 +1463,6 @@ fn is_ipv4_link_local(ip: u32) -> bool {
 fn is_ipv6_link_local(ip: [u8; 16]) -> bool {
     ip[0] == 0xfe && (ip[1] & 0xc0) == 0x80
 }
-
 
 fn parse_l4(
     data: usize,

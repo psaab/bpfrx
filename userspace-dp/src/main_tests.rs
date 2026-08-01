@@ -2550,11 +2550,23 @@ fn shim_binding_slot_never_leaves_its_interfaces_row() {
 /// TWO things this does NOT cover, stated because an earlier revision claimed
 /// there was only one:
 ///
-///  - a reduction applied before the wrap, which
-///    `shim_index_path_has_one_construction_and_one_lookup` pins by source;
-///  - `transmute::<u32, RawRxQueue>(..)`, which compiles and which NOTHING here
-///    catches. A private field stops the constructor, not `transmute`; saying
-///    otherwise would overstate what a newtype buys.
+///  - a reduction applied before the wrap;
+///  - a value forged out of raw bytes rather than constructed —
+///    `transmute::<u32, RawRxQueue>(..)`, `mem::zeroed()`,
+///    `MaybeUninit::assume_init()`, a pointer read. A private field stops the
+///    CONSTRUCTOR, not a fabrication, and naming `transmute` alone (as an
+///    earlier revision did) understates it: the class is open-ended and every
+///    member of it compiles.
+///
+/// Both are bounded by source instead, in
+/// `shim_index_path_has_one_construction_and_one_lookup` — not by chasing the
+/// symbols, which would always be one symbol behind, but by bounding the one
+/// NAME the pinned lookup statement will accept. Neither is bounded by a type,
+/// and no type can bound them.
+///
+/// This test itself is not decorative: `for_trace()` feeds the queue index the
+/// shim hands to the helper in `record_trace`, so corrupting it is a runtime
+/// defect and reds here.
 #[test]
 fn shim_raw_rx_queue_exposes_no_arithmetic() {
     use shim_binding_index::RawRxQueue;
@@ -2581,22 +2593,40 @@ fn shim_raw_rx_queue_exposes_no_arithmetic() {
 ///     index, and as did reinstating the deleted unbounded raw-queue fallback
 ///     with one NEWLINE before `.get(`. Coverage had regressed while the claim
 ///     strengthened. Hence whole-STATEMENT token pins.
+///  3. **A statement pin fixes SPELLING, not VALUE.** Both coordinates reach
+///     the pinned lookup by NAME, so pinning that statement says nothing about
+///     what the names are worth. Round 3 shadowed each of them one line above
+///     the pin — `% 4` on the ifindex, and an unsafe raw-bytes forgery on the
+///     queue — and all three tests stayed green. Hence the `let <name>` bounds:
+///     a value can only reach the pinned statement through a binding of that
+///     exact name, so bounding the BINDINGS is what bounds the values.
+///  4. **A compile-time claim is only true while the type still says so.**
+///     Adding `impl Rem<u32> for RawRxQueue` and a `pub` field reddened
+///     nothing, and with one shadow line reintroduced #5173 with no `unsafe`
+///     at all. Hence the trait-impl and field-privacy bounds.
 ///
 /// # What is still unbound — and it cannot be driven to zero here
 ///
 /// These are source assertions about a call site whose coordinate originates in
 /// an aya `XdpContext`, which a `core`-only module cannot see. So a residual is
-/// structural, not an oversight:
+/// structural, not an oversight. The list is SHORTER than it was, because the
+/// binding bounds subsume what used to be enumerated symbol by symbol — a
+/// forged `RawRxQueue` (`transmute`, `mem::zeroed`, `MaybeUninit::assume_init`,
+/// a pointer read: an open-ended class no symbol list could keep up with) can
+/// only be USED by binding the name the pinned lookup passes. What remains:
 ///
-///  - **`transmute`.** `unsafe { core::mem::transmute::<u32, RawRxQueue>(raw % 4) }`
-///    compiles and passes every check here. No newtype can prevent that, and no
-///    source pin below claims to — it is visible and ugly, and that is the only
-///    defence there is.
+///  - **A parameter, rather than a `let`, can shadow either name.** Wrapping
+///    the pinned lookup statement in a closure or a helper `fn` whose parameter
+///    is called `ingress_ifindex` or `rx_queue` rebinds it without writing
+///    `let`. Nothing here catches that. It is not cheap to hide: the pinned
+///    statement must appear verbatim inside the new body, and the reduced value
+///    must be passed in at a visible call site.
 ///  - **The ifindex half is a bare `u32`.** `binding_slot`'s queue argument is a
-///    newtype; its ifindex argument is not. Reducing the ifindex lands in a
-///    different interface's row — the same mis-steer through the other
-///    dimension. The statement pin below rejects it AT THIS CALL SITE, but
-///    unlike the queue coordinate nothing rejects it by TYPE.
+///    newtype; its ifindex argument is not, and it cannot be one without a
+///    second wrapper whose constructor would take a bare `u32` for the same
+///    aya-shaped reason — moving the residual, not closing it. Both of its
+///    statements and its binding count are pinned below; none of that is the
+///    type system.
 ///  - **Anything the tokenizer sees as identical text.** Comments and string
 ///    literals are tokenized like code. That direction is fail-CLOSED (a
 ///    spurious RED, never a silent pass), which is the correct polarity, but it
@@ -2644,12 +2674,35 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
     // it — a fail-open in the one dimension walking the directory exists to
     // close. Matched on TOKENS so `#[ path` does not slip past, same as
     // everything else here.
-    let offpath: Vec<String> = seq(&["[", "path"]).into_iter().chain(seq(&["include", "!"])).collect();
+    //
+    // The first version of this refusal matched only the literal spellings
+    // `[ path` and `include !`, and round 3 walked straight through it twice:
+    //
+    //   - `#[cfg_attr(all(), path = "…/evil.rs")] mod evil;` never emits the
+    //     token pair `[ path`, and rustc really does compile the off-tree file
+    //     (proven positively: a syntax error in it fails the build pointing at
+    //     the off-tree line). A second, reduced binding-map read was placed on
+    //     the packet path there with every bound below green.
+    //   - `use core::include as inc;` then `inc!("…")` never emits `include !`.
+    //
+    // So match the two capabilities, not their spellings. Any attribute form
+    // that redirects a module — bare, `cfg_attr`-wrapped, or nested to any
+    // depth — has to write the token pair `path =`. Any route to the macro,
+    // aliased or not, has to NAME `include` to import it. Both are refused
+    // outright; prose that trips them is a spurious RED, which is the polarity
+    // this whole test is built on.
+    let offpath: Vec<String> = seq(&["[", "path"])
+        .into_iter()
+        .chain(seq(&["path", "="]))
+        .chain(seq(&["include"]))
+        .collect();
     assert!(
         offpath.is_empty(),
-        "#5173: {offpath:?} uses #[path] or include!, so the shim crate is no longer confined to \
-         {}. The bounds in this test walk that directory; source pulled in from elsewhere would \
-         be invisible to them. Extend the walk before adding either.",
+        "#5173: {offpath:?} names a module-path attribute or the `include` macro, so the shim \
+         crate is no longer confined to {}. The bounds in this test walk that directory; source \
+         pulled in from elsewhere would be invisible to every one of them — the exact fail-open \
+         this refusal exists to close. Extend the walk before adding either. (Prose tripping \
+         this is a false RED; reword it.)",
         root.display()
     );
 
@@ -2758,6 +2811,109 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
          construction site is a second chance to reduce the raw integer before it is wrapped, \
          and renaming the type on import does not hide the method name.",
         ctors.len(),
+    );
+
+    // ---- The INTERFACE half of the index, pinned the same way. ------------
+    //
+    // `binding_slot` takes two coordinates and only the queue one is a
+    // newtype, so the ifindex is the half a type cannot defend. Round 3 used
+    // exactly that: the statement pin above fixes how the argument is SPELLED,
+    // not what it is WORTH, and
+    //
+    //     let ingress_ifindex = ingress_ifindex % 4;
+    //
+    // one line above the pinned lookup compiles for the real target, is #5173
+    // through the interface dimension, and left all three tests green. Pinning
+    // where the value comes FROM closes the other half of that: reducing it at
+    // the definition instead breaks this sequence.
+    #[rustfmt::skip]
+    const INGRESS_STATEMENT: &[&str] = &[
+        "let", "ingress_ifindex", "=",
+        "unsafe", "{", "(", "*", "ctx", ".", "ctx", ")", ".", "ingress_ifindex", "}", ";",
+    ];
+    let ifx_site = seq(INGRESS_STATEMENT);
+    assert_eq!(
+        ifx_site.len(),
+        1,
+        "#5173: the interface coordinate must be read by exactly this statement, once:\n  \
+         {}\nfound {} occurrence(s) {ifx_site:?}. It is a bare u32 all the way to `binding_slot`, \
+         so unlike the queue coordinate NOTHING rejects a reduction of it by type — pinning both \
+         its definition and its use is the whole defence. `let mut`, or any arithmetic applied \
+         here, changes this sequence.",
+        INGRESS_STATEMENT.join(" "),
+        ifx_site.len(),
+    );
+
+    // ---- Neither coordinate may be re-bound under its own name. -----------
+    //
+    // The two statement pins fix the definition and the use; a SHADOW between
+    // them changes neither. This is the bound that closes the gap, and it is
+    // load-bearing for three separate escapes round 3 demonstrated:
+    //
+    //   - `ingress_ifindex` rebound to `ingress_ifindex % 4` — #5173 through
+    //     the interface dimension, invisible to both statement pins;
+    //   - `rx_queue` shadowed by an unsafe forgery — `core::mem::zeroed()`,
+    //     `transmute`, `MaybeUninit::assume_init`, a pointer read. The newtype
+    //     stops the CONSTRUCTOR, never a raw-bytes fabrication, and the class
+    //     is open-ended, so bounding the class by symbol name would always be
+    //     one symbol behind. Bounding the BINDING is not: the lookup statement
+    //     is pinned to pass the identifier `rx_queue`, so a forged value is
+    //     only reachable by binding that exact name;
+    //   - `rx_queue` shadowed by arithmetic once an impl makes it legal (see
+    //     the trait bound below) — a complete #5173 reintroduction with no
+    //     `unsafe` anywhere.
+    //
+    // Matching on `let <name>` rather than `<name> =` is deliberate: a type
+    // annotation (`let rx_queue: RawRxQueue = …`) puts a token between the two
+    // and slips a `<name> =` pair, and the unsafe-forgery shadow is spelled
+    // exactly that way. Reassignment without `let` needs `mut`, which breaks
+    // whichever statement pin above declares the name. A `macro_rules!` body
+    // that expands to a rebinding must still write these tokens to define
+    // itself, and macro hygiene stops an out-of-crate one from shadowing here.
+    for name in ["ingress_ifindex", "rx_queue"] {
+        let rebinds = seq(&["let", name]);
+        assert_eq!(
+            rebinds.len(),
+            1,
+            "#5173: `{name}` must be bound exactly ONCE in the shim crate, but was bound {} times \
+             {rebinds:?}. Both statement pins above stay green when the coordinate is SHADOWED \
+             between its definition and its use, so this is the bound that sees it — a one-line \
+             `%` shadow, or a shadow whose value is forged out of raw bytes by any `unsafe` \
+             construction the newtype cannot prevent. Do not add a second binding of this name; \
+             if the value genuinely needs deriving, give the derived value a DIFFERENT name and \
+             note that the pinned lookup statement will then reject passing it.",
+            rebinds.len(),
+        );
+    }
+
+    // ---- The newtype's compile-time half, tested rather than assumed. -----
+    //
+    // `binding_index.rs` claims the coordinate cannot be reduced because
+    // `RawRxQueue` has a private field and implements no arithmetic — "enforced
+    // by the compiler rather than asserted about source text". True, but only
+    // while both remain so, and nothing tested that. Round 3 added
+    // `impl Rem<u32>` plus a `pub` field and NOTHING went red; with one shadow
+    // line that is a full #5173 reintroduction with no `unsafe` marker for a
+    // reader to catch. These two bounds are what make the compile-time claim a
+    // claim about the code that is actually there.
+    let trait_impls = seq(&["for", "RawRxQueue"]);
+    assert!(
+        trait_impls.is_empty(),
+        "#5173: `RawRxQueue` must implement NO traits — found {trait_impls:?}. An arithmetic impl \
+         (`Rem`, `BitAnd`, `Shr`) makes reducing the coordinate compile, and `Deref`/`Into` hand \
+         out the raw integer to be reduced elsewhere; either way the module's compile-time half \
+         is gone while every other check here stays green. `#[derive]`d traits are written before \
+         the type, not after it, so they do not trip this."
+    );
+    let decl = seq(&["RawRxQueue", "(", "u32", ")"]);
+    assert_eq!(
+        decl.len(),
+        1,
+        "#5173: `RawRxQueue`'s field must stay PRIVATE — expected exactly one declaration with an \
+         unqualified `u32` field, found {} {decl:?}. Marking it `pub` re-exposes the coordinate to \
+         arithmetic outside the module, which is the same defect as an arithmetic impl by another \
+         route.",
+        decl.len(),
     );
 }
 

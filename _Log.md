@@ -1,3 +1,98 @@
+## 2026-08-01 — #5173 fold: bound VALUE, not just spelling; close the off-path fail-open
+
+- **Timestamp**: 2026-08-01 (fix/5173-shim-queue-mis-steer)
+- **Action**: Round-3 hostile re-gate returned `MERGE-NEEDS-MINOR` with
+  five findings. Runtime behaviour is untouched — the object is
+  bit-identical after `make generate` — and every finding was a guard
+  scoped narrower than the claim it protected.
+
+  **F1 — the statement pin fixed argument SPELLING, not argument VALUE.**
+  Both coordinates reach the pinned lookup by NAME, so pinning the
+  statement said nothing about what the names were worth. A one-line
+  shadow immediately above the pin (`% 4` on the interface coordinate)
+  compiled for `bpfel-unknown-none` and left all three guards green —
+  literally M2's defect moved one line up, which falsified the commit
+  message's claim that "neither of its arguments is transformed". Fixed
+  by pinning the interface coordinate's DEFINITION statement as well, and
+  by bounding each coordinate to exactly ONE binding of its name in the
+  crate. Matching `let <name>` rather than `<name> =` is deliberate: a
+  type annotation slips the latter, and the unsafe-forgery shadow is
+  spelled exactly that way.
+
+  **F2 — the off-tree-source refusal was defeated by a 12-character
+  respelling.** `#[cfg_attr(all(), path = "…")]` never emits the `[ path`
+  token pair the check looked for, and `use core::include as inc` never
+  emits `include !`. The reviewer put a second, reduced binding-map read
+  on the packet path in a file outside the walk with every bound green,
+  and proved rustc really compiles it. That is the exact fail-open the
+  check's own comment says it exists to close. Now matched by CAPABILITY
+  rather than spelling: any module-redirect attribute must write `path =`
+  at any nesting depth, and any route to the macro must NAME `include` to
+  import it.
+
+  **F3 — the residual named a symbol where it meant a class.**
+  `core::mem::zeroed()` escaped everything and pinned every packet to
+  queue 0; same class as `transmute`, different symbol. Chasing the
+  symbols would always be one behind (`MaybeUninit::assume_init`, a
+  pointer read, …), so the class is bounded structurally instead: the
+  pinned lookup only accepts the coordinate under one fixed NAME, and
+  that name is bounded to one binding — a forged value that cannot be
+  bound cannot be used. `binding_index.rs` now names the class, not the
+  symbol.
+
+  **F4 — the compile-time half had no regression guard.** Adding
+  `impl Rem<u32> for RawRxQueue` plus a `pub` field reddened NOTHING, and
+  with one shadow line that is a complete #5173 reintroduction with no
+  `unsafe` anywhere for a reader to catch. Bounded: no trait impls on the
+  newtype, and the field declaration pinned so `pub` reds.
+
+  **F5 — two dangling doc citations.** `docs/fairness-regimes.md` cited
+  the deleted `select_userspace_queue()`; `docs/afxdp-packet-processing.md`
+  still located `BINDING_QUEUES_PER_IFACE` in `lib.rs` and described
+  out-of-stride handling as Go-side-only, omitting the shim read-side
+  stride bound this PR adds — the user-visible behaviour change.
+
+  Also fixed: this PR had regressed `userspace-xdp/src/lib.rs` from
+  rustfmt-clean (master is clean) — a stray double blank line left by the
+  `select_userspace_queue` deletion, and a lookup statement over the width
+  limit. Reformatting SPLIT the pinned statement across two lines, which
+  is the round-2 bypass verbatim; the pin matched anyway, so the shipped
+  source now demonstrates the tokenizer's whitespace-insensitivity instead
+  of only asserting it.
+
+  Not closed, stated plainly: a closure or helper-`fn` PARAMETER can
+  shadow either coordinate without writing a binding. Probed (row R1) and
+  confirmed green. It requires the pinned statement verbatim inside the
+  new body and a visible reduced argument at the call site. Typing the
+  interface half would move that residual rather than close it — its
+  constructor would take a bare `u32` for the same aya-shaped reason the
+  queue newtype's does — and would change the runtime object, so it was
+  evaluated and rejected for this fold.
+
+  Validation: 23-row matrix, `shimcheck` (pinned nightly-2026-05-23,
+  `bpfel-unknown-none`) and `cargo build --tests` rc=0 in EVERY row that
+  reports a test result, so every red is an ASSERTION not a build break;
+  byte-exact restore asserted per row; results read only from the
+  anchored `^test tests::<NAME> ... (ok|FAILED)$` line, because
+  `cargo test --exact` prints `test result: ok. 0 passed` and exits 0 when
+  nothing matches. All 12 prior rows reproduce. NINE escapes go
+  green-on-parent -> red-on-fold with the shim compiling: N1, N1b (F1),
+  N3, M7b (F3 — transmute now reds too), N5 cfg_attr, N6 aliased-include
+  (F2), N7, N7b, N8 (F4). Each reds on the INTENDED new assertion, not a
+  collateral break — verified by reading the panic text per row; N5 hits
+  one needle where the literal `#[path]` control hits two, discriminating
+  the new bound from the old. `make generate`: verifier PASS, object
+  sha256 `114354c9…` UNCHANGED across both regenerations, so the whole
+  fold is codegen-neutral; only the two source input hashes moved.
+  `TestUserspaceXDPShimObjectMatchesSourceManifest` ok, `go vet` and
+  `go test ./pkg/dataplane/...` ok. Rust suite: 4236 passed, 1 failed —
+  `afxdp::ha::…poisoned_shared_mutex`, the pre-existing flake filed as
+  #6712 (passes 3/3 in isolation; this diff touches zero `afxdp/` files).
+- **File(s)**: userspace-dp/src/main_tests.rs,
+  userspace-xdp/src/binding_index.rs, userspace-xdp/src/lib.rs,
+  pkg/dataplane/userspace_xdp_manifest.json,
+  docs/afxdp-packet-processing.md, docs/fairness-regimes.md, _Log.md
+
 ## 2026-08-01 — #5173 SPLIT: ship the coordinate fix, defer the planner half
 
 - **Timestamp**: 2026-08-01 (fix/5173-shim-queue-mis-steer)
