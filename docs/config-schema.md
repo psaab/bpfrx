@@ -1268,6 +1268,35 @@ Consequences worth knowing when adding a reader:
   compiled routes is a hard commit error ("at least one then preferred-route
   route is required"), so the operator is told rather than left with a silent
   no-op.
+- **`system login` is the fail-closed example with a dedicated gate (#6662).**
+  Where `ip-monitoring` gets its rejection for free (an empty policy is
+  independently invalid), an empty login class is *structurally* fine, so the
+  drop needed its own AST gate:
+  `validateLoginPackedStatementsAST` (`compiler_system_login_gates.go`), wired
+  in `runPreWalkGates`, strict at commit / warn on the tolerant path
+  (`lenientLoginPackedStatements`). It covers `login class <n>` and
+  `login user <n>` at the instance line, plus `authentication` — the one login
+  body statement the compiler reads exclusively through `.Children` — written
+  inline one level down.
+
+  It is worth stating **why** this one had to reject rather than compile
+  something. Every downstream safety net in the stanza is guarded on
+  NON-EMPTINESS, so an empty compile silences the whole belt at once: an empty
+  user class is `pkg/cli`'s deliberate legacy "no RBAC configured" shortcut
+  (allow every command, render secrets in cleartext), and the
+  `deny-commands` "MORE PERMISSIVE" advisory is guarded on
+  `lc.DenyCommands != ""` — the field the bug dropped is the field the guard
+  reads. Unpacking instead would have to be exactly right for every leaf to
+  avoid minting a wrong-but-non-empty class, which is worse than an empty one;
+  both accepted spellings already work, so the operator has a mechanical
+  rewrite. See `docs/system-login.md` for the operator-facing table.
+
+  **The gate reproduces `namedInstances`' two-shape branch rather than calling
+  it**, because it needs the number of leading IDENTITY keys and that helper
+  discards it: `len(Keys) >= 2` is the node itself (identity 2), otherwise it
+  is a child of a bare `user { }` container (identity 1). Branching on the
+  shape — rather than sniffing `Keys[0]` against the keyword — stays correct
+  for an instance literally named `user` or `class`.
 
 **The two collapses COMPOSE, and a monitor statement hits both.** The packed
 collapse above is orthogonal to the `#2419` bracket collapse at the top of this

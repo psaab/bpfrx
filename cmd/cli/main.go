@@ -21,6 +21,7 @@ import (
 	"github.com/psaab/xpf/pkg/cmdtree"
 	"github.com/psaab/xpf/pkg/configstore"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/osident"
 	"github.com/psaab/xpf/pkg/policymatch"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -57,6 +58,22 @@ func dialOpts(extra ...grpc.DialOption) []grpc.DialOption {
 // is to be available exactly when the daemon is down (recovery/bootstrap),
 // which the pre-dispatch GetStatus probe otherwise defeats (#4909). Matches the
 // canonical token form; abbreviated prefixes still take the daemon path.
+// resolveUsername returns the identity the remote CLI displays in its prompt.
+//
+// #6701: it is derived from the KERNEL (real uid -> passwd, pkg/osident), never
+// from `$USER`. `cli` is an unprivileged client — the RBAC boundary it should
+// be behind lives on the gRPC listener and does not exist yet (#5278) — so this
+// is not itself an authorization decision today. It is still fixed here for two
+// reasons: a prompt sourced from a caller-controlled environment variable
+// renders whatever the caller typed (`USER=root cli` prints a root prompt to a
+// read-only operator), and when #5278 wires per-principal auth onto the socket
+// it must find the identity already coming from the credential rather than the
+// environment. An unresolvable identity renders as `uid-<n>` rather than the
+// old fabricated "remote" placeholder, which read like a real account.
+func resolveUsername() string {
+	return osident.Current().String()
+}
+
 func isLocalOnlyCommand(cmd string) bool {
 	f := strings.Fields(cmd)
 	return len(f) == 4 &&
@@ -82,10 +99,7 @@ func main() {
 	if hostname == "" {
 		hostname = "xpf"
 	}
-	username := os.Getenv("USER")
-	if username == "" {
-		username = "remote"
-	}
+	username := resolveUsername()
 
 	// A local-only verb (the offline WireGuard key generator) runs entirely in
 	// the client with no gRPC round-trip, so it must work when xpfd is DOWN —

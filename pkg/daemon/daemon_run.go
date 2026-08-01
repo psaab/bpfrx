@@ -21,6 +21,7 @@ import (
 	"github.com/psaab/xpf/pkg/ipmon"
 	"github.com/psaab/xpf/pkg/lldp"
 	"github.com/psaab/xpf/pkg/logging"
+	"github.com/psaab/xpf/pkg/osident"
 	"github.com/psaab/xpf/pkg/rpm"
 )
 
@@ -716,21 +717,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 			return ""
 		}())
 
-		// Set RBAC login class from config (default to super-user if user not found)
-		if cfg := d.store.ActiveConfig(); cfg != nil && cfg.System.Login != nil {
-			osUser := os.Getenv("USER")
-			found := false
-			for _, u := range cfg.System.Login.Users {
-				if u.Name == osUser {
-					shell.SetUserClass(u.Class)
-					found = true
-					break
-				}
-			}
-			if !found {
-				shell.SetUserClass("super-user")
-			}
-		}
+		// Set the RBAC login class for the in-process console shell (#6701).
+		// See applyCLILoginClass (cli_rbac.go) for why identity comes from the
+		// kernel and why the default is the restrictive class, not super-user.
+		applyCLILoginClass(shell, d.store.ActiveConfig(), osident.Current())
 
 		// Run CLI in a goroutine so we can still handle signals
 		errCh := make(chan error, 1)

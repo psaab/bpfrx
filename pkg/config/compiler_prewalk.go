@@ -517,6 +517,37 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 		return nil, err
 	}
 
+	// #6662: a `system login class|user <name>` whose BODY is written on the
+	// instance line (`user alice class ops;`), or an `authentication` block
+	// written inline. namedInstances resolves the NAME across both AST shapes
+	// but leaves the body on Keys, and the login compiler walks .Children —
+	// which is empty — so the instance commits EMPTY with no error. An empty
+	// user class is pkg/cli's legacy no-RBAC allow-everything shortcut, so the
+	// operator's configured restriction goes missing in the permissive
+	// direction. The compiled struct cannot express what was dropped and the
+	// schema walker never reaches a packed tail, so it is checked on the AST.
+	// Strict at commit / commit-check; warn on the tolerant load / peer-sync
+	// path.
+	loginPackedWarnings, err := validateLoginPackedStatementsAST(
+		tree.Children, opts.lenientLoginPackedStatements)
+	if err != nil {
+		return nil, err
+	}
+
+	// #6701 (sibling found sweeping the RBAC fail-open): a `system login class
+	// <name>` that shadows a SYSTEM-DEFINED class. pkg/cli resolveClassPerms
+	// resolves the built-in first, so the custom definition is inert — a
+	// narrowed `class super-user { permissions view; }` still grants PermAll —
+	// while the commit advisory reports the narrowing as applied. The compiled
+	// struct records the custom mapping faithfully (it is the RUNTIME lookup
+	// that ignores it), so the collision has to be caught here. Strict at
+	// commit / commit-check; warn on the tolerant load / peer-sync path.
+	loginClassShadowWarnings, err := validateLoginClassShadowsBuiltinAST(
+		tree.Children, opts.lenientLoginClassShadowsBuiltin)
+	if err != nil {
+		return nil, err
+	}
+
 	var warnings []string
 	warnings = append(warnings, ctrlCharWarnings...)
 	warnings = append(warnings, trackWarnings...)
@@ -545,6 +576,8 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 	warnings = append(warnings, chassisIdentityWarnings...)
 	warnings = append(warnings, monitorWeightWarnings...)
 	warnings = append(warnings, rgArityWarnings...)
+	warnings = append(warnings, loginPackedWarnings...)
+	warnings = append(warnings, loginClassShadowWarnings...)
 	warnings = append(warnings, garpCountWarnings...)
 	return warnings, nil
 }

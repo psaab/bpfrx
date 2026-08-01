@@ -74018,3 +74018,45 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   check that the tree is intact. The `is_reverse` gating claim was re-verified
   by reading `shared_ops.rs` at this SHA rather than carried from an earlier
   round.
+
+## 2026-08-01
+
+- **Timestamp**: 2026-08-01
+- **Action**: RBAC identity + `system login` packed-body gates (#6701, #6662).
+  (1) #6701: the in-process CLI decided WHICH configured user you are from
+  `os.Getenv("USER")` and handed `super-user` on a non-match. Since #5278
+  provisions every login-class user with a real shell account, a
+  `class read-only` operator ran `USER=nobody xpf` — or unset it — and got the
+  highest class; the `!found` branch also promoted any OS account merely
+  present on the box. Added `pkg/osident` (real uid -> passwd, stdlib-only leaf
+  package), `cli.ResolveLoginClass` (fail-closed to `unauthorized`, an
+  empty-but-PRESENT permission set, with a Junos-parity uid-0 default that an
+  explicit `user root class <c>` overrides), and `daemon.applyCLILoginClass`.
+  The empty-string class stays the legacy no-RBAC allow-everything mode and is
+  reached only when there is no `system login` stanza at all. (2) #6662: a
+  packed `user alice class ops;` / `class ops permissions [ ... ];` compiled an
+  EMPTY object with a clean commit — namedInstances leaves the body on Keys and
+  the login compiler walks .Children. An empty class IS the legacy
+  allow-everything shortcut, and the `deny-commands` MORE-PERMISSIVE advisory is
+  guarded on `DenyCommands != ""`, so the bug disabled the guard by dropping the
+  field the guard reads. Added `validateLoginPackedStatementsAST` (strict at
+  commit, warn on the tolerant path) covering `login class`/`login user` at the
+  instance line plus inline `authentication` one level down. Flat-set is
+  unaffected and guarded. (3) Sibling found sweeping the #6701 fail-open: a
+  custom `class super-user { permissions view; }` is INERT (resolveClassPerms
+  consults the built-in table first) while the advisory reports the narrowing as
+  applied — added `validateLoginClassShadowsBuiltinAST`. (4) Structural (not
+  behavioural) canaries: no production code may read `$USER`/`$LOGNAME` for
+  identity; each of the three sites must CALL `osident.Current()` (an equivalent
+  inline copy fails); `SetUserClass` has one allowlisted caller. Each canary
+  ships a synthetic detector proving it is not vacuous.
+- **File(s)**: pkg/osident/osident.go, pkg/osident/osident_test.go,
+  pkg/osident/user_env_canary_test.go, pkg/osident/adoption_canary_test.go,
+  pkg/cli/identity.go, pkg/cli/identity_6701_test.go, pkg/cli/cli.go,
+  pkg/cli/userclass_entrypoint_canary_test.go, pkg/daemon/cli_rbac.go,
+  pkg/daemon/cli_rbac_6701_test.go, pkg/daemon/daemon_run.go,
+  cmd/cli/main.go, cmd/cli/identity_6701_test.go,
+  pkg/config/compiler_system_login_gates.go,
+  pkg/config/compiler_system_login_packed_6662_test.go,
+  pkg/config/compiler_opts.go, pkg/config/compiler_prewalk.go,
+  docs/system-login.md, docs/config-schema.md, _Log.md

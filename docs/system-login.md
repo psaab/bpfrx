@@ -62,7 +62,66 @@ enum is **derived from** `LoginClassPermissions`
 (`config.ValidLoginClasses()`), so the commit-time validator and the
 runtime RBAC table can never drift apart: adding a class in one place
 without the other is impossible. An empty/unset class keeps the legacy
-allow-everything behavior (no class configured = no RBAC restriction).
+allow-everything behavior (no class configured = no RBAC restriction) —
+see the next section for the narrow, and only, way that state is reached.
+
+### Which class you get: identity and the default (#6701)
+
+The CLI's class comes from the **OS credential of the invoking process**,
+never from the environment. `pkg/osident.Current()` reads the **real uid**
+(`os.Getuid`) and resolves it through the passwd database; the resolved name
+is matched against `system login user <name>`. `pkg/daemon`
+`applyCLILoginClass` performs the lookup once, at shell start, and logs the
+outcome (identity, uid, resolved class, reason) so an operator locked out by
+their own config can see why in the journal.
+
+Before #6701 the identity was `os.Getenv("USER")` and a non-match was handed
+**`super-user`**. Both halves were exploitable, and either alone sufficed:
+every `system login user` is provisioned with a real shell account
+(`useradd -m -s /bin/bash`, #5278), so an operator restricted to
+`class read-only` could run `USER=nobody xpf` — or unset the variable — and
+receive the highest class in the system. The `!found` branch also promoted any
+OS account that merely existed on the box but was absent from `system login`.
+
+The decision, in order:
+
+| Caller | Class |
+|---|---|
+| resolved name matches a `system login user` with a class | **that class** |
+| resolved name matches a user configured with **no** class | `unauthorized` |
+| uid 0, no matching `system login user` | `super-user` (Junos root default) |
+| uid 0 **with** an explicit `system login user root class <c>` | **`<c>`** — an explicit restriction is honoured |
+| OS account absent from `system login` | `unauthorized` |
+| uid with no passwd entry (unidentifiable) | `unauthorized` |
+| no `system login` stanza at all | **unset** — legacy allow-everything |
+
+`unauthorized` is used rather than an unset class deliberately. The empty
+string is the legacy no-RBAC mode: `checkPermission` returns `nil` (allow
+everything) and `showConfigRedacted` returns `false` (render PSKs, SNMP
+communities and authentication-keys in cleartext). Failing closed therefore has
+to **name** a class. `unauthorized` resolves to an empty-but-present permission
+set, so `checkPermission` denies every command by name and `showConfigRedacted`
+masks secrets.
+
+The uid-0 default is Junos parity and is the console lifeline: uid 0 already
+owns the config database, the daemon process and the on-disk secrets, so it is
+not a boundary xpf could enforce. It applies **only** when `system login` says
+nothing about root — an explicit `system login user root class <c>` wins,
+because a configured restriction silently ignored is exactly the defect class
+#6701 removes.
+
+**Scope.** This is the on-box CLI boundary. The gRPC listener
+(`127.0.0.1:50051`) still has no per-principal authentication, so a shell user
+who speaks gRPC directly bypasses `checkPermission` entirely — that is a
+separate, still-open defect (#5278) and is not addressed here. The remote `cli`
+client's prompt identity was moved to the same OS credential so that when
+#5278 wires per-principal auth it finds the identity already coming from the
+kernel, but the client is not itself an authorization boundary today.
+
+The class is resolved **once, at shell start**, and is not re-evaluated
+mid-session. That matches Junos (your class is bound at login) and is not an
+escalation path: changing `system login` requires `configure`, which none of
+the restricted classes hold.
 
 ### Custom login classes (accept-with-advisory, #4304 S-2)
 
@@ -118,6 +177,68 @@ maps and what does not:
 
 An undefined class (referenced by a user but never defined, and not a built-in)
 still **fails closed** at commit.
+
+A custom class **may not shadow a system-defined name** (#6701). At runtime
+`resolveClassPerms` consults `LoginClassPermissions` **first**, so a definition
+like
+
+```
+set system login class super-user permissions view
+```
+
+is completely **inert** — the built-in `[PermAll]` wins and the user holds every
+permission — while the compile advisory reported `mapped to xpf coarse
+permissions {view}`, i.e. told the operator the narrowing had taken effect. That
+is the same "configured restriction silently absent in the permissive direction"
+shape as the identity defect above, so a shadowing definition is now
+**hard-rejected at commit** naming the collision, and downgraded to a warning on
+the tolerant load / peer-sync path. Built-in-first precedence itself is
+deliberately unchanged: inverting it would let
+`class read-only permissions all` **escalate** a built-in, which is strictly
+worse. Pick a distinct class name, or reference the built-in directly.
+
+### Write the body as a block or as `set` — never packed on the line (#6662)
+
+Junos accepts a statement written on the instance line; xpf compiles the body
+only from a **nested block** or a flat **`set`** statement:
+
+```
+system { login { user alice { class ops; } } }      # OK — class = "ops"
+set system login user alice class ops               # OK — class = "ops"
+system { login { user alice class ops; } }          # REJECTED at commit
+```
+
+Before #6662 the third form compiled a user with an **empty class** and the
+commit **succeeded**. The mechanism is documented in
+`docs/config-schema.md` ("Packed statements"): `namedInstances` resolves the
+instance name across both AST shapes but leaves the body on `Keys`, and the
+login compiler walks `.Children`, which is empty.
+
+An empty class is precisely the legacy allow-everything mode, so a
+`class read-only` operator hand-migrating a vSRX config got a CLI that allowed
+every command and rendered secrets in cleartext — with `show configuration`
+echoing their intent back. Rejecting is load-bearing because the downstream
+safety nets are all guarded on non-emptiness, including the `deny-commands`
+"MORE PERMISSIVE" advisory above (`if lc.DenyCommands != ""`): the field the bug
+dropped is the field the guard reads.
+
+This applies to the whole stanza, at both levels:
+
+| Statement | Packed spelling | Result |
+|---|---|---|
+| `login class <n>` — `permissions`, `idle-timeout`, `allow-commands`, `deny-commands`, `allow-configuration`, `deny-configuration`, `login-alarms`, `login-tip` | `class ops permissions view;` | **rejected** |
+| `login user <n>` — `uid`, `class`, `authentication` | `user alice class ops;` | **rejected** |
+| `login user <n> authentication` (a block) written inline inside a nested user body | `user alice { authentication ssh-rsa "…"; }` | **rejected** |
+
+The tolerant load / peer-sync path **warns** instead of rejecting (#1960
+no-brick), so a node that persisted such a config under an older binary still
+boots. On that path the stanza still compiles empty — what keeps it from being
+an RBAC hole is the resolver: a matched user with an empty class resolves to
+`unauthorized`, not to the legacy allow-everything mode.
+
+`login-alarms` and `login-tip` are accepted by the grammar but have no compiler
+arm in **either** spelling — a pre-existing accept-but-ignore gap, not a packed
+drop.
 
 ### Command-to-permission mapping
 
