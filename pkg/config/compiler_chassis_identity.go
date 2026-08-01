@@ -84,7 +84,8 @@ func validateChassisClusterIdentitiesAST(nodes []*Node, lenient bool) ([]string,
 				// The RG-scoped `node <id>` identity (nested `node { ... }` or
 				// the packed one-liner `node 0 priority <v>`; compileChassis
 				// reads both via nodeVal(child) on a `node` CHILD).
-				for _, child := range rgInst.node.Children {
+				// #6588: the body may be packed onto the RG instance's own Keys.
+				for _, child := range redundancyGroupBody(rgInst.node) {
 					if child.Name() != "node" {
 						continue
 					}

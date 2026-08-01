@@ -120,7 +120,7 @@ func validateMonitorWeightTokensAST(nodes []*Node, lenient bool) ([]string, erro
 	walkErr := forEachChild(nodes, "chassis", func(chassis *Node) error {
 		return forEachChild(chassis.Children, "cluster", func(cluster *Node) error {
 			for _, rgInst := range namedInstances(cluster.FindChildren("redundancy-group")) {
-				for _, child := range rgInst.node.Children {
+				for _, child := range redundancyGroupBody(rgInst.node) {
 					switch child.Name() {
 					case "interface-monitor":
 						if err := checkEntries(rgInst.name, "interface-monitor",

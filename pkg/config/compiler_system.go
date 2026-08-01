@@ -1924,7 +1924,9 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 			NodePriorities: make(map[int]int),
 		}
 
-		for _, child := range rgInst.node.Children {
+		// #6588: redundancyGroupBody, not .Children — the whole body may be
+		// packed onto the instance's own Keys.
+		for _, child := range redundancyGroupBody(rgInst.node) {
 			switch child.Name() {
 			case "node":
 				// node <id> priority <value>
@@ -2203,6 +2205,55 @@ func packedStatementProps(cfgNode *Node, skip int, isProp func(string) bool) []*
 		}
 	}
 	return append(props, cfgNode.Children...)
+}
+
+// redundancyGroupBody returns the body statements of one `redundancy-group`
+// instance across both spellings (#6588). It is the ONE-LEVEL-UP twin of the
+// packing this file already undoes inside the body:
+//
+//	redundancy-group 1 { interface-monitor ge-0/0/0 weight 255; }
+//	  -> Keys=["redundancy-group","1"], one child per statement
+//	redundancy-group 1 interface-monitor ge-0/0/0 weight 255;
+//	  -> Keys=["redundancy-group","1","interface-monitor","ge-0/0/0","weight","255"],
+//	     NO children — the whole body is packed onto the instance's own Keys
+//
+// namedInstances resolves the instance NAME across both shapes (it reads
+// Keys[1]), but hands back the node with the body still on Keys, so a caller
+// that then walks `.Children` sees an EMPTY redundancy group. Every statement
+// was silently dropped while `commit` succeeded: not just the monitors, but
+// `node <id> priority <p>` — the election priority itself. The operator sets a
+// priority, `show configuration` echoes it, and the cluster elects on defaults,
+// so the WRONG NODE can hold the group. That is a superset of "the group never
+// demotes".
+//
+// The split is at recognized redundancy-group statement keywords, so a tail
+// carrying several statements (`node 0 priority 200 preempt;`) yields one node
+// each rather than swallowing the trailing ones. Both a packed tail and real
+// children are returned: RG statements are siblings, so nothing is lost if a
+// config somehow carries both.
+//
+// Deliberately NOT fixed inside namedInstances itself. That helper has 130 call
+// sites, and 24 of them already read the packed tail off `inst.node.Keys`
+// themselves; synthesizing a child there double-feeds those readers. Measured,
+// not assumed — making namedInstances synthesize breaks
+// TestDHCPRelayOverrides_* (the override tokens get swallowed into Interfaces)
+// and TestVRRPTrackInterface_KeysPackedDuplicateStrictReject (lenient
+// first-wins yields an empty TrackInterface). See the #6588 PR body for the
+// experiment. Other one-sided namedInstances callers are tracked separately.
+func redundancyGroupBody(rgNode *Node) []*Node {
+	return packedStatementProps(rgNode, 2, isRedundancyGroupStatement)
+}
+
+// isRedundancyGroupStatement reports whether tok opens a statement in a
+// `redundancy-group` body. It must list every keyword compileChassis switches
+// on, or a packed tail carrying that statement is folded into its predecessor.
+func isRedundancyGroupStatement(tok string) bool {
+	switch tok {
+	case "node", "gratuitous-arp-count", "preempt", "strict-vip-ownership",
+		"interface-monitor", "ip-monitoring":
+		return true
+	}
+	return false
 }
 
 // isIPMonitoringProp reports whether tok opens an `ip-monitoring` property.

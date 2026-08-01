@@ -689,3 +689,204 @@ func assertMonitorNames(t *testing.T, rg *RedundancyGroup, want []string) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// #6588 review round 3 — the same Children-only bug ONE LEVEL UP.
+// ---------------------------------------------------------------------------
+
+// packedRGConfig returns hierarchical config text carrying clusterBody directly
+// under `cluster`, so the redundancy-group statement itself can be written in
+// the packed form. Everything here is driven through the REAL parser
+// (NewParser -> CompileConfig): a hand-built AST would let the test assume the
+// node shape instead of observing it, which is exactly the mistake that let
+// this shape survive two review rounds.
+func packedRGConfig(clusterBody string) string {
+	return `chassis {
+    cluster {
+        authentication-key test-cluster-psk-6588;
+        cluster-id 1;
+` + clusterBody + `
+    }
+}`
+}
+
+func compileRGText(t *testing.T, text string) *RedundancyGroup {
+	t.Helper()
+	p := NewParser(text)
+	tree, perrs := p.Parse()
+	if len(perrs) > 0 {
+		t.Fatalf("parse: %v", perrs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	return onlyRG6588(t, cfg)
+}
+
+// TestChassisRedundancyGroupPackedBody_6588 pins the one-level-up packed
+// spelling: the whole redundancy-group body written on the instance line.
+//
+//	redundancy-group 1 interface-monitor ge-0/0/0 weight 255;
+//
+// namedInstances resolves the instance NAME across both shapes (it reads
+// Keys[1]) but returns the node with the body still on Keys, so a caller
+// walking `.Children` saw an EMPTY group and compiled every statement to
+// nothing — with no error.
+//
+// The `node <id> priority <p>` case is the severe one: it is the redundancy-
+// group election priority. Dropped, the operator sets a priority, sees it
+// echoed by `show configuration`, and the cluster elects on defaults — so the
+// WRONG NODE can hold the group, a superset of "the group never demotes".
+//
+// FAIL-ON-REVERT: change redundancyGroupBody back to rgNode.Children and every
+// Packed subtest below fails with an assertion naming the lost statement.
+func TestChassisRedundancyGroupPackedBody_6588(t *testing.T) {
+	t.Run("InterfaceMonitor", func(t *testing.T) {
+		rg := compileRGText(t, packedRGConfig(
+			"        redundancy-group 1 interface-monitor ge-0/0/0 weight 255;"))
+		if len(rg.InterfaceMonitors) != 1 {
+			t.Fatalf("packed redundancy-group body lost `interface-monitor ge-0/0/0 weight 255`: "+
+				"got %d monitors (%s)", len(rg.InterfaceMonitors), describeMonitors(rg.InterfaceMonitors))
+		}
+		if rg.InterfaceMonitors[0].Interface != "ge-0/0/0" || rg.InterfaceMonitors[0].Weight != 255 {
+			t.Fatalf("monitor = %s, want ge-0/0/0 weight 255", describeMonitors(rg.InterfaceMonitors))
+		}
+	})
+
+	t.Run("NodePriority", func(t *testing.T) {
+		rg := compileRGText(t, packedRGConfig(
+			"        redundancy-group 1 node 0 priority 200;"))
+		if got, ok := rg.NodePriorities[0]; !ok || got != 200 {
+			t.Fatalf("packed redundancy-group body lost `node 0 priority 200`: NodePriorities = %v — "+
+				"a dropped election priority means the cluster elects on defaults and the WRONG "+
+				"node can hold the group", rg.NodePriorities)
+		}
+	})
+
+	t.Run("Preempt", func(t *testing.T) {
+		rg := compileRGText(t, packedRGConfig("        redundancy-group 1 preempt;"))
+		if !rg.Preempt {
+			t.Fatal("packed redundancy-group body lost `preempt`: Preempt = false")
+		}
+	})
+
+	t.Run("StrictVIPOwnership", func(t *testing.T) {
+		rg := compileRGText(t, packedRGConfig("        redundancy-group 1 strict-vip-ownership;"))
+		if !rg.StrictVIPOwnership {
+			t.Fatal("packed redundancy-group body lost `strict-vip-ownership`")
+		}
+	})
+
+	t.Run("GratuitousARPCount", func(t *testing.T) {
+		rg := compileRGText(t, packedRGConfig("        redundancy-group 1 gratuitous-arp-count 8;"))
+		if rg.GratuitousARPCount != 8 {
+			t.Fatalf("packed redundancy-group body lost `gratuitous-arp-count 8`: got %d",
+				rg.GratuitousARPCount)
+		}
+	})
+
+	t.Run("IPMonitoring", func(t *testing.T) {
+		rg := compileRGText(t, packedRGConfig(
+			"        redundancy-group 1 ip-monitoring global-weight 255;"))
+		if rg.IPMonitoring == nil {
+			t.Fatal("packed redundancy-group body lost `ip-monitoring global-weight 255`: IPMonitoring is nil")
+		}
+		if rg.IPMonitoring.GlobalWeight != 255 {
+			t.Fatalf("global-weight = %d, want 255", rg.IPMonitoring.GlobalWeight)
+		}
+	})
+
+	// Several statements on one instance line must each survive — the tail is
+	// split at redundancy-group statement keywords, not folded into the first.
+	t.Run("MultipleStatementsOnOneLine", func(t *testing.T) {
+		rg := compileRGText(t, packedRGConfig(
+			"        redundancy-group 1 node 0 priority 200 preempt gratuitous-arp-count 8;"))
+		if got, ok := rg.NodePriorities[0]; !ok || got != 200 {
+			t.Fatalf("lost `node 0 priority 200` from a multi-statement packed body: %v", rg.NodePriorities)
+		}
+		if !rg.Preempt {
+			t.Fatal("lost `preempt` from a multi-statement packed body")
+		}
+		if rg.GratuitousARPCount != 8 {
+			t.Fatalf("lost `gratuitous-arp-count 8` from a multi-statement packed body: got %d",
+				rg.GratuitousARPCount)
+		}
+	})
+}
+
+// TestChassisRedundancyGroupContainerBodyUnchanged_6588 is the round-3 negative
+// control: the already-working container form must compile exactly as before,
+// every statement intact. It passes with and without redundancyGroupBody.
+func TestChassisRedundancyGroupContainerBodyUnchanged_6588(t *testing.T) {
+	rg := compileRGText(t, packedRGConfig(
+		"        redundancy-group 1 {\n"+
+			"            node 0 priority 200;\n"+
+			"            node 1 priority 100;\n"+
+			"            preempt;\n"+
+			"            strict-vip-ownership;\n"+
+			"            gratuitous-arp-count 8;\n"+
+			"            interface-monitor ge-0/0/0 weight 255;\n"+
+			"            ip-monitoring {\n"+
+			"                global-weight 200;\n"+
+			"                family inet {\n"+
+			"                    10.0.1.1 weight 100;\n"+
+			"                }\n"+
+			"            }\n"+
+			"        }"))
+	if rg.NodePriorities[0] != 200 || rg.NodePriorities[1] != 100 {
+		t.Fatalf("NodePriorities = %v, want {0:200, 1:100}", rg.NodePriorities)
+	}
+	if !rg.Preempt || !rg.StrictVIPOwnership {
+		t.Fatalf("preempt=%v strict-vip-ownership=%v, want both true", rg.Preempt, rg.StrictVIPOwnership)
+	}
+	if rg.GratuitousARPCount != 8 {
+		t.Fatalf("gratuitous-arp-count = %d, want 8", rg.GratuitousARPCount)
+	}
+	if len(rg.InterfaceMonitors) != 1 || rg.InterfaceMonitors[0].Weight != 255 {
+		t.Fatalf("monitors = %s, want one ge-0/0/0 weight 255", describeMonitors(rg.InterfaceMonitors))
+	}
+	if rg.IPMonitoring == nil || rg.IPMonitoring.GlobalWeight != 200 ||
+		len(rg.IPMonitoring.Targets) != 1 || rg.IPMonitoring.Targets[0].Weight != 100 {
+		t.Fatalf("ip-monitoring = %+v, want global-weight 200 with one target weight 100", rg.IPMonitoring)
+	}
+}
+
+// TestChassisRedundancyGroupPackedBodyReachesGates_6588 pins that the round-2
+// gates see the one-level-up packed shape too. Making the body compile without
+// bringing the gates along would admit, through the packed instance line
+// only, exactly what round 2 closed everywhere else.
+func TestChassisRedundancyGroupPackedBodyReachesGates_6588(t *testing.T) {
+	t.Run("MalformedWeightStillRejected", func(t *testing.T) {
+		assertErrContains(t, compileMonitorTextErr(t, packedRGConfig(
+			"        redundancy-group 1 interface-monitor ge-0/0/0 weight nope;")),
+			`weight "nope" is not an integer`)
+	})
+	t.Run("OutOfRangeWeightStillRejected", func(t *testing.T) {
+		assertErrContains(t, compileMonitorTextErr(t, packedRGConfig(
+			"        redundancy-group 1 interface-monitor ge-0/0/0 weight 300;")),
+			"weight 300 is out of range 0..255")
+	})
+	t.Run("DuplicateWeightStillRejected", func(t *testing.T) {
+		assertErrContains(t, compileMonitorTextErr(t, packedRGConfig(
+			"        redundancy-group 1 interface-monitor ge-0/0/0 weight 100 weight 200;")),
+			"weight specified 2 times with different values")
+	})
+	t.Run("BracketListStillSplits", func(t *testing.T) {
+		assertMonitorNames(t, compileRGText(t, packedRGConfig(
+			"        redundancy-group 1 interface-monitor [ ge-0/0/0 ge-0/0/1 ];")),
+			[]string{"ge-0/0/0", "ge-0/0/1"})
+	})
+	t.Run("IPMonitoringRangeStillGated", func(t *testing.T) {
+		assertErrContains(t, compileMonitorTextErr(t, packedRGConfig(
+			"        redundancy-group 1 ip-monitoring global-weight 300;")),
+			"global-weight 300 is out of range 0..255")
+	})
+	// #5694 identity gate: a malformed RG-scoped node id must still be caught
+	// when the whole body is packed onto the instance line.
+	t.Run("MalformedNodeIDStillRejected", func(t *testing.T) {
+		assertErrContains(t, compileMonitorTextErr(t, packedRGConfig(
+			"        redundancy-group 1 node bogus priority 200;")),
+			"redundancy-group node")
+	})
+}

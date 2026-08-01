@@ -1,3 +1,51 @@
+## 2026-08-01 — #6588 round 3: the same drop ONE LEVEL UP (redundancy-group instance)
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
+- **Action**: Round-3 review found a third shape, verified firsthand at the
+  round-2 head before writing: `redundancy-group 1 <statement>;` written on the
+  INSTANCE line compiles to an empty group. namedInstances resolves the name
+  across both shapes (Keys[1]) but returns the node with the body still on
+  Keys, so compileChassis's `range rgInst.node.Children` saw nothing. All four
+  statements confirmed lost with NO error: interface-monitor, ip-monitoring,
+  preempt, and — the severe one — `node 0 priority 200`, the redundancy-group
+  ELECTION PRIORITY. Dropped, the cluster elects on defaults and the wrong node
+  can hold the group, which is a superset of "never demotes".
+  Fixed with redundancyGroupBody = packedStatementProps(rgNode, 2,
+  isRedundancyGroupStatement), so a multi-statement line
+  (`node 0 priority 200 preempt gratuitous-arp-count 8;`) splits at statement
+  keywords instead of folding into the first. Applied at ALL FOUR readers of
+  the RG body — compileChassis plus validateMonitorWeightTokensAST,
+  validateChassisClusterIdentitiesAST and validateGratuitousARPCountAST —
+  because a compiler that sees a shape its gates cannot would admit, through
+  the packed instance line only, exactly what round 2 closed elsewhere.
+- **Rejected fix direction, with evidence**: the reviewer's preferred option was
+  to make namedInstances itself synthesize the packed tail as a child, fixing
+  all ~130 callers at once. Tried it. It breaks callers that already handle the
+  tail: 24 sites read inst.node.Keys directly, and compileStaticRoutes branches
+  on `len(Children)==0` to DETECT the packed shape, so a synthetic child
+  disables its packed path. The experiment turned TestDHCPRelayOverrides_* red
+  (override tokens swallowed into Interfaces) and
+  TestVRRPTrackInterface_KeysPackedDuplicateStrictReject red (lenient
+  first-wins gave an empty TrackInterface). One prediction was wrong and is
+  recorded as such: the packed static route itself SURVIVED the experiment
+  (its next-hop arrives as a real child either way).
+- **Audit answer — other namedInstances callers are NOT all safe**: measured by
+  direct compile, `system login class ops permissions view;` yields a class with
+  empty permissions, `system login user bob class ops;` a user with no class,
+  and `system syslog host 10.0.0.9 any;` a host with zero facilities. Same root
+  cause, different stanzas. Reported as follow-up work rather than claimed safe.
+- **Validation**: mutation D — redundancyGroupBody returns rgNode.Children —
+  build+vet CLEAN, 2 top-level FAILs (PackedBody, PackedBodyReachesGates), 13
+  assertions each naming the lost statement; the container-form control stayed
+  GREEN. Restored: build+vet clean, `go test ./...` exit 0 across 59 packages,
+  85 passing 6588 subtests.
+- **File(s)**: `pkg/config/compiler_system.go`,
+  `pkg/config/compiler_chassis_monitor_weight.go`,
+  `pkg/config/compiler_chassis_identity.go`,
+  `pkg/config/compiler_chassis_garp_count.go`,
+  `pkg/config/compiler_chassis_packed_monitor_6588_test.go`,
+  `docs/config-schema.md`, `_Log.md`
+
 ## 2026-08-01 — #6588 round 2: three MAJORs inside the round-1 fix
 
 - **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)

@@ -1222,9 +1222,58 @@ first). The compiler is now uniformly first-wins via `monitorWeightTokens`, and
 a duplicate is rejected outright, so no operator is relying on which form they
 happened to write.
 
+**The packing recurses: an INSTANCE can carry its whole body on its own Keys
+too.** Everything above is about a statement inside a named instance's body.
+The instance line itself packs the same way:
+
+```
+redundancy-group 1 { interface-monitor ge-0/0/0 weight 255; }   # container
+redundancy-group 1 interface-monitor ge-0/0/0 weight 255;       # PACKED instance
+redundancy-group 1 node 0 priority 200 preempt;                 # PACKED, several statements
+```
+
+`namedInstances` (`compiler_protocols.go`) resolves the instance NAME across
+both shapes — it reads `Keys[1]` — but hands the node back with the body still
+on `Keys`, so a caller that then walks `.Children` sees an **empty instance**.
+Every statement compiled to nothing while `commit` succeeded. For a
+redundancy group that includes `node <id> priority <p>`, the election priority
+itself: the operator sets it, `show configuration` echoes it, and the cluster
+elects on defaults, so the WRONG NODE can hold the group — strictly worse than
+"the group never demotes".
+
+`redundancyGroupBody` (`compiler_system.go`) undoes it for the chassis-cluster
+surface, splitting the tail at redundancy-group statement keywords so a
+multi-statement line yields one node each. All FOUR readers of that body use it
+— `compileChassis` plus the three AST gates (`validateMonitorWeightTokensAST`,
+`validateChassisClusterIdentitiesAST`, `validateGratuitousARPCountAST`) — because
+teaching the compiler to see a shape the gates cannot admits, through the packed
+instance line only, exactly what those gates exist to reject.
+
+**Why this is NOT fixed inside `namedInstances`.** Making the helper synthesize
+the packed tail as a child would fix every caller at once, and it is tempting
+for that reason. It also breaks callers that already handle the tail
+themselves. `namedInstances` has ~130 call sites and 24 of them read
+`inst.node.Keys` directly; synthesizing a child double-feeds those readers, and
+`compileStaticRoutes` additionally branches on `len(node.Children) == 0` to
+detect the packed shape, so a synthetic child silently disables its packed
+path. Measured, not assumed — the experiment turns
+`TestDHCPRelayOverrides_*` red (the override tokens get swallowed into
+`Interfaces`) and `TestVRRPTrackInterface_KeysPackedDuplicateStrictReject` red
+(lenient first-wins yields an empty `TrackInterface`). A future central fix
+needs the 24 inline readers migrated first; that is its own change.
+
+**Other `namedInstances` callers are NOT all safe, and that is tracked
+separately.** Measured by direct compile: `system login class ops permissions
+view;` compiles a class with EMPTY permissions, `system login user bob class
+ops;` compiles a user with no class, and `system syslog host 10.0.0.9 any;`
+compiles a host with zero facilities. Same root cause, different stanzas, no
+security-boundary equivalence to the RG election — they are follow-up work, not
+a claim of safety.
+
 Covered by `pkg/config/compiler_chassis_packed_monitor_6588_test.go`, which
 pins all three interface-monitor spellings against each other, covers the
-bracketed / malformed / duplicate cases in each, and keeps the
+bracketed / malformed / duplicate cases in each, adds the packed-instance
+spelling for every redundancy-group statement, and keeps the
 container/flat-set and single-entry cases as green controls.
 
 **`multi: true` ALSO prevents single-value REPLACE for repeated keyed-list
