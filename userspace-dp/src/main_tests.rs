@@ -2393,20 +2393,40 @@ fn tx_latency_hist_binding_counters_snapshot_is_static_send() {
 // arrived on. So between "which queue did this arrive on" and "which XSK do we
 // redirect to" the queue coordinate must survive unchanged.
 //
-// SCOPE, stated plainly, and it is narrower than these checks' placement
-// suggests. The shim is `no_std`, built for `bpfel-unknown-none`, so this
-// crate's tests cannot execute it; the FOUR checks below read its SOURCE.
+// SCOPE, stated plainly, because the three checks below are NOT the same kind
+// of check and that difference decides what they can catch.
 //
-// A source check can only see what it is written to look for. Making these
-// file-scoped raised the bar but did not change their kind: a hostile review
-// escaped them twice while every one stayed green — by transforming the raw
-// `rx_queue_index` BEFORE the identity call, and by adding a raw fallback
-// lookup in a DIFFERENT file, which a file-scoped check cannot see by
-// construction. They are not behavioural tests and must not be described as
-// though they were. Closing that properly means extracting the index
-// computation into a `core`-only function the shim calls and a host test
-// EXECUTES — the pattern used for the IPv6 extension-header walk in #4555 —
-// which is tracked rather than done here.
+// The shim is `no_std`, built for `bpfel-unknown-none`, so this crate cannot
+// execute the shim BINARY. What it can do — and now does — is compile the
+// shim's own index module for the host and RUN it: `binding_index.rs` is
+// `#[path]`-included below, so `shim_binding_slot_never_leaves_its_interfaces_row`
+// is a behavioural test of the exact source the BPF object is built from. The
+// mapping and the stride bound are results there, not claims about text.
+//
+// What execution cannot cover is whether the shim still CALLS that function,
+// and with what arguments. That half is unavoidably a source assertion, and a
+// source assertion only sees what it is written to look for. Two hostile rounds
+// escaped earlier versions of it with every guard green:
+//
+//   round 1 — transform the raw `rx_queue_index` before the identity call, and
+//             add a raw fallback lookup in a DIFFERENT file, which a
+//             file-scoped check cannot see by construction.
+//   round 2 — the repo-scoped rewrite that fixed round 1 replaced a token-exact
+//             index pin with a bare occurrence COUNT of the needle
+//             `USERSPACE_BINDINGS.get(` — and a count cannot see an index that
+//             has been transformed. Six mutations reintroduced #5173 green,
+//             including `.get(idx % 4)`, dropping `binding_slot` from the path
+//             entirely, and reinstating the removed unbounded raw-queue
+//             fallback with a single NEWLINE before `.get(` — which is exactly
+//             the formatting rustfmt emits for a chain of that length.
+//
+// Coverage had REGRESSED while the claim strengthened. So the source half is
+// now TOKEN-based rather than substring-based, and it pins whole STATEMENTS
+// rather than counting needles: `shim_token_vec` drops whitespace, so rustfmt
+// reflow is invisible to it while any added, removed or altered token is not.
+// What is STILL unbound is enumerated on
+// `shim_index_path_has_one_construction_and_one_lookup` — that list is not
+// empty and cannot be made empty by a source assertion.
 //
 // The planner half of #5173 was reverted from this PR (see #6702), so the
 // executable coverage that used to be cited here no longer exists in this
@@ -2415,24 +2435,20 @@ fn tx_latency_hist_binding_counters_snapshot_is_static_send() {
 // the negative control for the mutation matrix precisely because it is true in
 // both worlds.
 
-fn shim_source() -> String {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("userspace-xdp")
-        .join("src")
-        .join("lib.rs");
-    std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!(
-            "cannot read the AF_XDP shim source at {}: {e}. This guard must not be skipped — a \
-             skip would fail open on exactly the #5173 mis-steer it exists to catch.",
-            path.display()
-        )
-    })
-}
-
-/// Collapse a Rust snippet to a formatting-insensitive token stream so
-/// rustfmt reflow is invisible but any added/removed/altered token is not.
-fn shim_tokens(src: &str) -> String {
+/// Collapse a Rust snippet to a formatting-insensitive token VECTOR.
+///
+/// Identifiers (and numbers) are single tokens; every other non-whitespace
+/// character is its own token. Whitespace is dropped entirely.
+///
+/// This is the whole reason the checks below survive rustfmt AND catch what a
+/// substring count cannot. A newline is not a token here, so
+/// `USERSPACE_BINDINGS\n.get(` and `USERSPACE_BINDINGS.get(` are the SAME
+/// sequence — while as substrings they differ, and that one-character
+/// difference was the entire bypass for the reinstated raw-queue fallback in
+/// the round-2 review. Conversely `.get(idx)` and `.get(idx % 4)` are the same
+/// SUBSTRING prefix but different token sequences, which is the direction a
+/// bare needle count is blind in.
+fn shim_token_vec(src: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut chars = src.chars().peekable();
     while let Some(c) = chars.next() {
@@ -2454,7 +2470,26 @@ fn shim_tokens(src: &str) -> String {
             out.push(c.to_string());
         }
     }
-    out.join(" ")
+    out
+}
+
+/// Space-joined [`shim_token_vec`], for readable assertion messages.
+fn shim_tokens(src: &str) -> String {
+    shim_token_vec(src).join(" ")
+}
+
+/// Count occurrences of a token SEQUENCE inside a token stream.
+///
+/// Windows overlap, so a repeat that abuts its predecessor is still counted —
+/// undercounting here would be a fail-OPEN, and the whole point of these checks
+/// is that a second occurrence must be impossible to hide.
+fn shim_token_seq_count(hay: &[String], needle: &[&str]) -> usize {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return 0;
+    }
+    hay.windows(needle.len())
+        .filter(|w| w.iter().zip(needle).all(|(a, b)| a.as_str() == *b))
+        .count()
 }
 
 // #5173: the index computation is EXECUTED here, not described.
@@ -2505,12 +2540,21 @@ fn shim_binding_slot_never_leaves_its_interfaces_row() {
 ///
 /// `RawRxQueue` has a private field and no arithmetic impls, so `queue % 2`,
 /// `queue & 3` and friends do not COMPILE outside its module — enforced by the
-/// compiler rather than asserted about source text. This test records the
-/// property and the one thing it does NOT cover, verified by compiling both:
-/// reducing the newtype is rejected, reducing the raw `u32` BEFORE construction
-/// builds clean, because the constructor must accept a bare integer that
-/// originates in an aya context no `core`-only module can see. That residual is
-/// exactly what `shim_index_path_has_one_construction_and_one_lookup` pins.
+/// compiler rather than asserted about source text. Verified by compiling both
+/// directions: `rx_queue % 4` is rejected (E0369) and the tuple constructor is
+/// unreachable outside the module (E0423), while reducing the raw `u32` BEFORE
+/// construction builds clean — the constructor must accept a bare integer,
+/// because the value originates in an aya context no `core`-only module can
+/// see.
+///
+/// TWO things this does NOT cover, stated because an earlier revision claimed
+/// there was only one:
+///
+///  - a reduction applied before the wrap, which
+///    `shim_index_path_has_one_construction_and_one_lookup` pins by source;
+///  - `transmute::<u32, RawRxQueue>(..)`, which compiles and which NOTHING here
+///    catches. A private field stops the constructor, not `transmute`; saying
+///    otherwise would overstate what a newtype buys.
 #[test]
 fn shim_raw_rx_queue_exposes_no_arithmetic() {
     use shim_binding_index::RawRxQueue;
@@ -2520,13 +2564,43 @@ fn shim_raw_rx_queue_exposes_no_arithmetic() {
     assert_eq!(a.for_trace(), 3, "telemetry readback must not alter the value");
 }
 
-/// REPO-scoped, not file-scoped: the whole shim crate has exactly one binding
-/// lookup and exactly one place the coordinate is wrapped.
+/// REPO-scoped and TOKEN-exact: the whole shim crate wraps the coordinate in
+/// exactly one place and reads the binding map in exactly one place, and BOTH
+/// of those statements are pinned token-for-token.
 ///
-/// File-scoping was the previous version's residual — a reviewer escaped it by
-/// putting a raw fallback lookup in a DIFFERENT file, which a per-file check
-/// cannot see by construction. Walking the crate closes that. What remains
-/// source-asserted is one expression: the argument handed to the constructor.
+/// Two rounds of hostile review shaped this, and both lessons are load-bearing:
+///
+///  1. **File-scoped is not enough.** A reviewer escaped the per-file version by
+///     putting a raw fallback lookup in a DIFFERENT file, which a per-file check
+///     cannot see by construction. Hence the crate walk.
+///  2. **A count is not enough.** The repo-scoped rewrite that fixed (1)
+///     replaced the token-exact index pin with a bare `str::matches` count of
+///     `USERSPACE_BINDINGS.get(`. A count cannot see an index that has been
+///     transformed, so `.get(idx % 4)` — #5173 verbatim — passed, as did
+///     dropping `binding_slot` from the packet path and inlining a reduced
+///     index, and as did reinstating the deleted unbounded raw-queue fallback
+///     with one NEWLINE before `.get(`. Coverage had regressed while the claim
+///     strengthened. Hence whole-STATEMENT token pins.
+///
+/// # What is still unbound — and it cannot be driven to zero here
+///
+/// These are source assertions about a call site whose coordinate originates in
+/// an aya `XdpContext`, which a `core`-only module cannot see. So a residual is
+/// structural, not an oversight:
+///
+///  - **`transmute`.** `unsafe { core::mem::transmute::<u32, RawRxQueue>(raw % 4) }`
+///    compiles and passes every check here. No newtype can prevent that, and no
+///    source pin below claims to — it is visible and ugly, and that is the only
+///    defence there is.
+///  - **The ifindex half is a bare `u32`.** `binding_slot`'s queue argument is a
+///    newtype; its ifindex argument is not. Reducing the ifindex lands in a
+///    different interface's row — the same mis-steer through the other
+///    dimension. The statement pin below rejects it AT THIS CALL SITE, but
+///    unlike the queue coordinate nothing rejects it by TYPE.
+///  - **Anything the tokenizer sees as identical text.** Comments and string
+///    literals are tokenized like code. That direction is fail-CLOSED (a
+///    spurious RED, never a silent pass), which is the correct polarity, but it
+///    does mean a prose mention can trip the count bounds below.
 #[test]
 fn shim_index_path_has_one_construction_and_one_lookup() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2548,51 +2622,142 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
     walk(&root, &mut sources);
     assert!(!sources.is_empty(), "found no shim sources under {}", root.display());
 
-    let count = |needle: &str| -> Vec<String> {
-        sources
+    let tokens: Vec<(String, Vec<String>)> = sources
+        .iter()
+        .map(|(name, body)| (name.clone(), shim_token_vec(body)))
+        .collect();
+
+    // Files in which `needle` occurs, one entry per occurrence.
+    let seq = |needle: &[&str]| -> Vec<String> {
+        tokens
             .iter()
-            .flat_map(|(name, body)| {
-                std::iter::repeat(name.clone()).take(body.matches(needle).count())
+            .flat_map(|(name, toks)| {
+                std::iter::repeat(name.clone()).take(shim_token_seq_count(toks, needle))
             })
             .collect()
     };
 
-    let lookups = count("USERSPACE_BINDINGS.get(");
+    // ---- The walk IS the crate only while the crate IS the walk. ----------
+    //
+    // A `#[path]` module or an `include!` pulls source in from outside
+    // `userspace-xdp/src/`, and every bound below would silently stop covering
+    // it — a fail-open in the one dimension walking the directory exists to
+    // close. Matched on TOKENS so `#[ path` does not slip past, same as
+    // everything else here.
+    let offpath: Vec<String> = seq(&["[", "path"]).into_iter().chain(seq(&["include", "!"])).collect();
+    assert!(
+        offpath.is_empty(),
+        "#5173: {offpath:?} uses #[path] or include!, so the shim crate is no longer confined to \
+         {}. The bounds in this test walk that directory; source pulled in from elsewhere would \
+         be invisible to them. Extend the walk before adding either.",
+        root.display()
+    );
+
+    // ---- The binding lookup, pinned as a whole statement. -----------------
+    //
+    // This single assertion is what closes the round-2 escapes, because the
+    // sequence names every part an attacker has to touch: `binding_slot` is on
+    // the packet path, BOTH of its arguments are untransformed, and the value
+    // handed to the map read is the resolved slot with nothing applied to it.
+    #[rustfmt::skip]
+    const LOOKUP_STATEMENT: &[&str] = &[
+        "let", "binding", "=",
+        "binding_slot", "(", "ingress_ifindex", ",", "rx_queue", ")",
+        ".", "and_then", "(", "|", "idx", "|",
+        "USERSPACE_BINDINGS", ".", "get", "(", "idx", ")", ")", ";",
+    ];
+    let pinned = seq(LOOKUP_STATEMENT);
+    // Show what IS there when the pin fails. "found 0 occurrences" on its own
+    // would send the next author hunting for a needle this test already holds.
+    let actual: Vec<String> = sources
+        .iter()
+        .flat_map(|(name, body)| {
+            body.lines()
+                .filter(|l| l.contains("USERSPACE_BINDINGS"))
+                .map(move |l| format!("{name}: {}", shim_tokens(l)))
+        })
+        .collect();
+    assert_eq!(
+        pinned.len(),
+        1,
+        "#5173: the shim's binding lookup must be exactly this statement, once:\n  {}\nfound \
+         {} occurrence(s) {pinned:?}.\nLines naming the map, tokenized:\n{actual:#?}\nEvery \
+         round-2 escape is a token inside that sequence: `.get(idx % 4)` reduces the resolved \
+         slot; `binding_slot(ingress_ifindex % 4, ..)` reduces the interface coordinate; \
+         inlining the index drops `binding_slot` off the packet path so the executed stride \
+         bound no longer governs anything. A needle COUNT sees none of those — the whole \
+         statement must match.",
+        LOOKUP_STATEMENT.join(" "),
+        pinned.len(),
+    );
+
+    // ---- No second lookup, however it is spelled or wrapped. --------------
+    let lookups = seq(&["USERSPACE_BINDINGS", ".", "get", "("]);
     assert_eq!(
         lookups.len(),
         1,
-        "#5173: the shim crate must contain exactly ONE binding-map lookup; found {lookups:?}. A \
+        "#5173: the shim crate must contain exactly ONE binding-map read; found {lookups:?}. A \
          second one is how the removed raw-queue fallback returns, and it indexed with an \
-         unbounded rx_queue_index. This check is REPO-scoped because a file-scoped one was \
-         escaped by moving the extra lookup to another file."
+         unbounded rx_queue_index. This is TOKEN-matched, not substring-matched, because the \
+         predecessor check was defeated by putting a newline before `.get(` — the very \
+         formatting rustfmt produces for a chain this long."
     );
 
-    let ctors = count("RawRxQueue::from_ctx_field(");
+    // ---- …and no ALIAS that would dodge the check above. ------------------
+    //
+    // `use USERSPACE_BINDINGS as BINDS;` (or `let b = &USERSPACE_BINDINGS;`)
+    // gives a second lookup a name the sequence above cannot match. Pinning the
+    // identifier's total occurrence count is what closes that: any alias, any
+    // re-export, any local rebinding has to NAME the static to create itself.
+    const BINDINGS_MENTIONS: usize = 2; // the `static` item + the one lookup
+    let mentions = seq(&["USERSPACE_BINDINGS"]);
+    assert_eq!(
+        mentions.len(),
+        BINDINGS_MENTIONS,
+        "#5173: `USERSPACE_BINDINGS` must be named exactly {BINDINGS_MENTIONS} times in the shim \
+         crate — its `static` definition and the single lookup — but was named {} times \
+         {mentions:?}. This bound is deliberately tight: an alias, a re-export or a local \
+         rebinding is how a second, unbounded lookup gets a name the sequence checks above \
+         cannot see, and all of them have to mention the static to exist. A comment that spells \
+         the identifier trips this too; that is a spurious RED, never a silent pass. If you are \
+         adding a legitimate mention, raise the constant deliberately and say why.",
+        mentions.len(),
+    );
+
+    // ---- The wrap site, pinned the same way. ------------------------------
+    #[rustfmt::skip]
+    const CONSTRUCTION_STATEMENT: &[&str] = &[
+        "let", "rx_queue", "=",
+        "RawRxQueue", ":", ":", "from_ctx_field", "(",
+        "unsafe", "{", "(", "*", "ctx", ".", "ctx", ")", ".", "rx_queue_index", "}",
+        ")", ";",
+    ];
+    let ctor_site = seq(CONSTRUCTION_STATEMENT);
+    assert_eq!(
+        ctor_site.len(),
+        1,
+        "#5173: the coordinate must be wrapped by exactly this statement, once:\n  {}\nfound {} \
+         occurrence(s) {ctor_site:?}. The constructor takes a bare u32, so a reduction applied \
+         BEFORE the wrap is one of the two escapes the newtype cannot prevent (`transmute` is \
+         the other, and nothing here catches it) — which makes the argument spelling the \
+         load-bearing part, not just the call's existence.",
+        CONSTRUCTION_STATEMENT.join(" "),
+        ctor_site.len(),
+    );
+
+    // A second construction re-opens the pre-wrap reduction, so bound the
+    // constructor's name the same way the static's is bounded above: aliasing
+    // the TYPE (`use RawRxQueue as RQ;`) still has to name the method.
+    const CTOR_MENTIONS: usize = 2; // the `fn` item + the one call
+    let ctors = seq(&["from_ctx_field"]);
     assert_eq!(
         ctors.len(),
-        1,
-        "#5173: the coordinate must be wrapped in exactly ONE place; found {ctors:?}. The \
-         constructor takes a bare u32 — a reduction applied before it is wrapped is the one \
-         escape the newtype cannot prevent — so a second construction site reopens it."
-    );
-
-    // …and that single construction is fed the context field, unmodified.
-    let site = sources
-        .iter()
-        .find_map(|(_, b)| {
-            b.lines()
-                .find(|l| l.contains("RawRxQueue::from_ctx_field("))
-                .map(str::trim)
-        })
-        .expect("construction site not found");
-    assert_eq!(
-        shim_tokens(site),
-        "let rx_queue = RawRxQueue : : from_ctx_field ( unsafe { ( * ctx . ctx ) . rx_queue_index } ) ;",
-        "#5173: the wrapped value must be the context's RX queue index with nothing applied to \
-         it. This single expression is the entire remaining source-asserted surface — everything \
-         after the wrap is enforced by the compiler, and the mapping and bound by execution. \
-         Got: {:?}",
-        shim_tokens(site)
+        CTOR_MENTIONS,
+        "#5173: `from_ctx_field` must be named exactly {CTOR_MENTIONS} times in the shim crate — \
+         its definition and the single call — but was named {} times {ctors:?}. A second \
+         construction site is a second chance to reduce the raw integer before it is wrapped, \
+         and renaming the type on import does not hide the method name.",
+        ctors.len(),
     );
 }
 

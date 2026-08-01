@@ -8,35 +8,51 @@
 //! unchanged between "which queue did this arrive on" and "which XSK do we
 //! redirect to".
 //!
-//! WHY THIS IS A MODULE AND NOT FOUR SOURCE CHECKS. The first attempt asserted
-//! that invariant with tests that read the shim's source text. A hostile review
-//! escaped them twice with every guard green: reducing the coordinate at the
-//! CALL SITE, and adding a raw fallback lookup in a DIFFERENT file — which a
-//! file-scoped text check cannot see by construction. Source-spelling tests are
-//! the wrong tool for an invariant. Everything here that CAN be enforced by the
-//! compiler or by execution now is.
+//! WHY THIS IS A MODULE AND NOT A SET OF SOURCE CHECKS. The first attempt
+//! asserted the invariant with tests that read the shim's source TEXT. Hostile
+//! review escaped them twice with every guard green: by reducing the coordinate
+//! at the CALL SITE, and by adding a raw fallback lookup in a DIFFERENT file,
+//! which a file-scoped text check cannot see by construction. Source-spelling
+//! tests are the wrong tool for a property that can be compiled or executed
+//! instead — so the mapping moved here, where a host test RUNS it.
 //!
 //! WHAT IS ENFORCED, AND WHAT IS NOT — stated precisely, because the difference
-//! is the whole point:
+//! is the whole point and because an earlier revision of this comment
+//! overstated it:
 //!
 //!   - **Compile-time.** [`RawRxQueue`] wraps the coordinate with a PRIVATE
 //!     field and implements no arithmetic. `queue % 2`, `queue & 3`, `queue >> 1`
-//!     do not compile outside this module. A future author who genuinely needs
-//!     to transform it must add a visible, reviewable accessor.
-//!   - **Executed.** [`binding_slot`] is host-compiled and driven over every
-//!     `(ifindex, queue)` pair the tests care about, including out-of-stride
-//!     ones, so the mapping, the stride bound, and the property that a slot
+//!     do not compile outside this module (E0369), and neither does the tuple
+//!     constructor (E0423). A future author who genuinely needs to transform it
+//!     must add a visible, reviewable accessor.
+//!   - **Executed.** [`binding_slot`] is host-compiled and driven over the
+//!     `(ifindex, queue)` grid the parity tests cover — queues 0..64 against a
+//!     spread of ifindexes up to 65535, so both sides of the stride boundary
+//!     are exercised — and the mapping, the bound, and the property that a slot
 //!     never leaves its own interface's row are behavioural results rather than
-//!     claims about text.
-//!   - **NOT closed, and no type can close it.** The constructor must accept a
-//!     bare `u32`, because the value originates in an aya `XdpContext` that
-//!     cannot cross into a `core`-only module. So a reduction applied to the
-//!     integer BEFORE it is wrapped still compiles. Verified by compiling it:
-//!     reducing the newtype is rejected (2 errors), reducing the raw `u32`
-//!     before construction builds clean. That residual is one expression, and
-//!     it is what the repo-scoped source checks in the parity tests pin — a
-//!     single `RawRxQueue::from_ctx_field` call site whose argument is the
-//!     context field read, and a single `USERSPACE_BINDINGS.get` in the crate.
+//!     claims about text. NOT covered: ifindexes large enough for
+//!     `ifindex * BINDING_QUEUES_PER_IFACE` to overflow `u32` (2^28 and up).
+//!     Host and target disagree there — a debug host build PANICS on the
+//!     overflow while the release target WRAPS — so the grid deliberately stops
+//!     below it. A kernel ifindex is an `int` and the shim gates on its
+//!     ingress-interface map before reaching here, so that range is unreachable
+//!     in practice; it is also pre-existing on master, same multiply, same
+//!     absent bound.
+//!   - **NOT closed, and this list is not empty.** The constructor must accept
+//!     a bare `u32`, because the value originates in an aya `XdpContext` that
+//!     cannot cross into a `core`-only module. So (a) a reduction applied to
+//!     the integer BEFORE it is wrapped still compiles, and (b) a `transmute`
+//!     into the wrapper compiles whatever the field's visibility is. The parity
+//!     tests pin (a) by pinning the wrap statement and the lookup statement
+//!     token-for-token; NOTHING catches (b), and no type can. A third residual
+//!     is structural: [`binding_slot`] types the queue half of the index and
+//!     not the ifindex half, so reducing the ifindex is rejected only at the
+//!     pinned call site, never by the type system.
+//!
+//! The honest summary: the source-asserted surface cannot reach ZERO while the
+//! coordinate originates in aya-dependent code. What it can do, and now does,
+//! is make every known reintroduction of #5173 either fail to compile or fail a
+//! pinned statement.
 //!
 //! Nothing here may depend on `aya`, on a BPF map, or on `std` — that is what
 //! keeps it host-compilable, and it is the whole point.
@@ -59,10 +75,11 @@ pub const BINDING_QUEUES_PER_IFACE: u32 = 16;
 pub struct RawRxQueue(u32);
 
 impl RawRxQueue {
-    /// The ONLY constructor. Its single call site — the read of
-    /// `(*ctx.ctx).rx_queue_index` — is pinned by a repo-scoped check in the
-    /// parity tests, because a reduction applied to the integer before it
-    /// reaches here is the one escape a newtype cannot prevent.
+    /// The ONLY constructor reachable from `lib.rs`. Its single call site — the
+    /// read of `(*ctx.ctx).rx_queue_index` — is pinned token-for-token by a
+    /// repo-scoped check in the parity tests, because a reduction applied to
+    /// the integer before it reaches here is one of the two escapes a newtype
+    /// cannot prevent. (The other is `transmute`, which nothing prevents.)
     #[inline(always)]
     pub fn from_ctx_field(rx_queue_index: u32) -> Self {
         RawRxQueue(rx_queue_index)

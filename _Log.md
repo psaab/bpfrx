@@ -66305,3 +66305,59 @@ break — `go vet` confirmed passing under every revert.
   pkg/daemon/userspace_sync_session_id_6198_test.go,
   userspace-dp/src/session/mod.rs, userspace-dp/src/session/tests.rs,
   userspace-dp/src/session/README.md, docs/session-sync-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-01 12:20
+- **Action**: #5173 / PR #6676 fix round — close the six guard escapes a
+  hostile re-gate found at `1b9d91464`. The RUNTIME fix was verified
+  correct and is untouched; the defect was entirely in the guards, and
+  it had a single shape: the previous head replaced a token-exact index
+  pin with a bare `str::matches` COUNT of `USERSPACE_BINDINGS.get(`.
+  A count cannot see an index that has been transformed, so coverage
+  REGRESSED while the claim strengthened — `.get(idx % 4)` (#5173
+  verbatim), `binding_slot(ingress_ifindex % 4, ..)`, dropping
+  `binding_slot` off the packet path entirely, an alias
+  (`use crate::USERSPACE_BINDINGS as BINDS`), and the deleted unbounded
+  raw-queue fallback reinstated with ONE NEWLINE before `.get(` all
+  passed green. The newline is the formatting rustfmt itself emits for a
+  chain that long, so it is not an adversarial spelling.
+
+  **Remedy — the source half is now TOKEN-based, not substring-based,
+  and pins whole STATEMENTS.** `shim_tokens` split into `shim_token_vec`
+  (+ `shim_token_seq_count`) so a token SEQUENCE can be counted:
+  (1) the binding-lookup statement pinned token-for-token, exactly once
+  — one assertion closing M1/M2/M8 at a stroke because it pins that
+  `binding_slot` is on the packet path AND that neither argument nor the
+  lookup's index is transformed; (2) the map read counted as a TOKEN
+  sequence, so a newline no longer bypasses it; (3) the identifier
+  `USERSPACE_BINDINGS` bounded to exactly 2 mentions, which is what an
+  alias/re-export/local-rebinding cannot dodge — all of them must NAME
+  the static; (4) the wrap statement pinned the same way, with
+  `from_ctx_field` bounded to 2 mentions for the symmetric ctor-alias
+  hole; (5) `#[path]`/`include!` refused so the directory walk really is
+  the crate.
+
+  **Claims corrected rather than quietly fixed.** The residual is NOT
+  "one expression" and cannot be driven to zero: `transmute::<u32,
+  RawRxQueue>` compiles and passes everything (no newtype can stop it),
+  and `binding_slot` types the queue half of the index but not the
+  ifindex half. Both are now stated in `binding_index.rs` and on the
+  tests. Dead `shim_source()` deleted; `shim_tokens` repurposed into the
+  pin's failure diagnostic rather than left unused.
+
+  Validation: 12-row mutation matrix, `shimcheck` (pinned
+  nightly-2026-05-23, `bpfel-unknown-none`) and `cargo build` rc=0 in
+  every row that reports a test result, so every red is an ASSERTION not
+  a build break; byte-exact restore asserted per row. M1/M2/M3/M8/M11
+  now FAIL (previously all green); M4/M5/M9/M10 still fail; M6/M7a still
+  rejected by the compiler (E0369 / E0423). M7b (transmute) still passes
+  — documented, not claimed closed. `make generate`: verifier PASS and
+  the object is BIT-IDENTICAL (sha256 `114354c9…` unchanged), so the
+  comment edits are codegen-neutral; only the `binding_index.rs` input
+  hash moved in the manifest. Verifier counts measured firsthand under a
+  privileged load (previously INCONCLUSIVE): master `74d66ecc` = 990,796
+  insns (99.08% of the 1,000,000 cap), this head `bdade89d` = 797,849
+  (79.78%) — a 192,947-insn reduction from the runtime fix, not from
+  this commit.
+- **File(s)**: userspace-dp/src/main_tests.rs,
+  userspace-xdp/src/binding_index.rs,
+  pkg/dataplane/userspace_xdp_manifest.json, _Log.md
