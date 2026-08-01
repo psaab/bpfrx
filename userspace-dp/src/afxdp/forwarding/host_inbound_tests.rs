@@ -542,8 +542,8 @@ fn unported_services_admit_nothing_3226() {
         (UDP, 28762), // the r2cp guess (draft "suggested", never Junos)
         (TCP, 7),     // the rpm guess (range floor, not a default)
         (UDP, 7),
-        (TCP, 443),   // tcp-encap rides an operator-chosen SSL termination port
-        (TCP, 9500),  // a tcp-encap port seen in Juniper example output
+        (TCP, 443),   // a tcp-encap port in Juniper's own sample output
+        (TCP, 9500),  // another port from that sample (remote gateway side)
         (UDP, 36000), // the appqoe PASSIVE probe — transit, Juniper says DISCARD
         (UDP, 500),   // MNHA examples admit IKE via its OWN `ike` token
         (TCP, 22),    // ...and SSH via its OWN `ssh` token

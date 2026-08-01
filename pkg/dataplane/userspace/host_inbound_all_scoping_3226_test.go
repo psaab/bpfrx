@@ -168,9 +168,12 @@ func TestClassifyHostInboundAllAdmitsDocumentedJunosServices(t *testing.T) {
 }
 
 // TestClassifyHostInboundUnportedServicesAdmitNothing is the unverified-port
-// half of the #3226 fold, stated as a VERDICT: a Junos service for which
-// Juniper fixes NO listening port must admit NOTHING — whether reached through
-// `all` or named explicitly.
+// half of the #3226 fold, stated as a VERDICT: a Junos service xpf has no
+// authoritative listening port to admit for must admit NOTHING — whether
+// reached through `all` or named explicitly. Two of them (rpm, r2cp) have a
+// port Junos documents as operator-chosen; for the other three xpf simply could
+// not find it. Those are different statements — see
+// config.HostInboundNoAdmitReason — and neither licenses inventing a port.
 //
 // An earlier revision of this fold synthesized ports for two of them:
 //
@@ -223,8 +226,9 @@ func TestClassifyHostInboundUnportedServicesAdmitNothing(t *testing.T) {
 		}
 	}
 
-	// Naming an unported service explicitly admits nothing either: there is no
-	// port to admit, so the stanza is a documented no-op rather than a guess.
+	// Naming an unported service explicitly admits nothing either: xpf has no
+	// port it can justify admitting, so the stanza is a documented no-op rather
+	// than a guess.
 	for _, token := range []string{"r2cp", "rpm", "tcp-encap", "appqoe", "high-availability"} {
 		named := cfgWithHostInbound("edge", []string{token}, nil)
 		for _, tc := range probes {

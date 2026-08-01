@@ -797,9 +797,11 @@ func HostInboundServiceMatch(token, family string) []L4Match {
 	case "r-exec", "rexec":
 		return []L4Match{hiTCP(512)}
 	// #3226 fold — Junos host-inbound services xpf previously did not recognize.
-	// Only the two with a PLATFORM-DEFAULT port in Juniper's YANG get a tuple;
-	// r2cp / rpm / tcp-encap / appqoe / high-availability have no fixed port and
-	// are handled by the HostInboundUnportedSystemServices arm below.
+	// Only the ones with an authoritative port get a tuple; r2cp / rpm /
+	// tcp-encap / appqoe / high-availability have no port xpf can justify
+	// admitting (rpm/r2cp because Junos documents it as operator-chosen, the
+	// rest because it is unsourced) and are gated by
+	// HostInboundUnportedSystemServices above.
 	case "reverse-telnet":
 		// junos-es-conf-system 24.4R2, `[edit system services reverse telnet]
 		// port`: YANG `default "2900"`.

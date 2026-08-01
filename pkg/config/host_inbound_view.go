@@ -23,9 +23,21 @@ import (
 // zone-level tokens first in their authored order, then any override-only
 // tokens, with empties skipped and exact-duplicate tokens collapsed. This is
 // the display-side peer of the dataplane's unionHostInboundTokens
-// (dataplane/userspace/zones.go); it preserves the authored token case so the
-// text surfaces show tokens exactly as the structured API does (the dataplane
-// path lower-cases for map keying, a concern that does not apply to display).
+// (dataplane/userspace/zones_override.go); it preserves the authored token case
+// so the text surfaces show tokens exactly as the structured API does (the
+// dataplane path lower-cases for map keying, a concern that does not apply to
+// display — every membership predicate that consumes this, notably
+// HostInboundFullAdmitService, is case-insensitive).
+//
+// #3226 fold: the COMMIT-TIME ADVISORIES (compiler_validate_warn.go) also
+// consume this. Junos host-inbound is ADDITIVE across the zone and interface
+// levels, so this union — not the raw stanza — is the object enforcement acts
+// on, and an advisory that reasons about anything else will contradict it. It
+// did: a zone-level `any-service` with a per-interface `rpm` warned that rpm
+// traffic was DENIED even though the union full-admits it, and `any-service`
+// alongside `all` in one stanza emitted "everything is admitted" and "ports are
+// now denied" together. Those were symptoms of the two views diverging, so the
+// fix is to share the union rather than special-case each pair.
 func UnionHostInboundTokens(zone, iface []string) []string {
 	seen := make(map[string]bool, len(zone)+len(iface))
 	out := make([]string, 0, len(zone)+len(iface))
@@ -340,3 +352,4 @@ func (v HostInboundView) Render(l HostInboundLabels) []string {
 	}
 	return lines
 }
+

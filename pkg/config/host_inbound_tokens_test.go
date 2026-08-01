@@ -520,9 +520,11 @@ func TestHostInboundFixedPortJunosServicesCommit_3226(t *testing.T) {
 }
 
 // TestHostInboundUnportedJunosServicesCommit_3226 pins the other half: the Junos
-// services for which Juniper fixes NO listening port. They must COMMIT (they are
-// real vSRX services — rejecting them is the #3200 gap) and must synthesize NO
-// admission tuple on either family (any port would be a guess).
+// services xpf has no authoritative listening port to admit for. They must
+// COMMIT (they are real vSRX services — rejecting them is the #3200 gap) and
+// must synthesize NO admission tuple on either family (any port would be a
+// guess). The reason differs per token — operator-configured for rpm/r2cp,
+// unsourced for the rest — and is asserted separately below.
 //
 // Two of these carried a synthesized port in an earlier revision of this fold:
 //

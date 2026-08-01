@@ -1,6 +1,8 @@
 package config
 
 import (
+	"fmt"
+	"os"
 	"strings"
 	"testing"
 )
@@ -273,13 +275,9 @@ func Test_3226_UnportedSystemServiceEmitsAdvisory(t *testing.T) {
 				t.Errorf("advisory must name the zone, got: %q", got[0])
 			}
 			// It must point at a remedy that ACTUALLY WORKS, or it is worse than
-			// noise. An earlier revision told operators to "admit the real port
-			// with a firewall filter" full stop — but the AF_XDP local-delivery
-			// path runs host-inbound BEFORE the lo0 filter (#3485) and never
-			// evaluates the filter after a deny, so that rescue works on the
-			// kernel path only. `any-service` is the only escape that works on
-			// both surfaces, so the advisory must name it AND must carry the lo0
-			// surface caveat rather than promising an unconditional filter fix.
+			// noise. `any-service` is the ONLY remedy on either enforcement
+			// path; an lo0 filter rescues nothing (see the refuted-remedy guard
+			// below for why). So the advisory must name any-service.
 			if !strings.Contains(got[0], "any-service") {
 				t.Errorf("advisory must name the escape that works on BOTH surfaces (any-service), got: %q", got[0])
 			}
@@ -407,5 +405,265 @@ func Test_3226_UnportedSystemServiceEmitsAdvisory(t *testing.T) {
 	}
 	if !strings.Contains(got[0], `zone "wan"`) || !strings.Contains(got[0], `interface "ge-0/0/0.0"`) {
 		t.Errorf("per-interface unported advisory must name both zone and interface, got: %q", got[0])
+	}
+}
+
+// hostInboundMatrixDoc is the operator-facing host-inbound reference.
+const hostInboundMatrixDoc = "../../docs/host-inbound-service-matrix.md"
+
+// TestHostInboundMatrixDocDoesNotAdviseTheRefutedRemedy widens the
+// refuted-remedy guard from the commit advisory to the OPERATOR DOC.
+//
+// The lo0-filter remedy was withdrawn from the advisory, and a negative string
+// guard stops it returning there. But that guard is scoped to the advisory
+// string, and the claim is not: the operator guide kept telling people to
+// "admit it with an explicit firewall filter on the real port" — and to read
+// the advisory as saying so — for a full review round after the advisory itself
+// had stopped. A guard narrower than the claim it protects is how the same
+// error survives a withdrawal, which has now happened twice.
+//
+// The doc legitimately DESCRIBES the remedy in order to refute it (the
+// revision-history table, the nftables quotes, the bypass-mechanism note), so a
+// blanket grep would be a false positive. Instead the refutational material is
+// fenced with REFUTED-REMEDY:BEGIN/END and this asserts the phrasing appears
+// ONLY inside the fence. Live operator guidance outside it must name
+// `any-service`, which is the only remedy that works on either enforcement
+// path.
+//
+// FAIL-ON-REVERT: move any refuted phrasing outside the fence — or drop the
+// fence — and this goes RED naming the line.
+func TestHostInboundMatrixDocDoesNotAdviseTheRefutedRemedy(t *testing.T) {
+	raw, err := os.ReadFile(hostInboundMatrixDoc)
+	if err != nil {
+		t.Fatalf("reading %s: %v", hostInboundMatrixDoc, err)
+	}
+	lines := strings.Split(string(raw), "\n")
+
+	begin, end := -1, -1
+	for i, l := range lines {
+		if strings.Contains(l, "REFUTED-REMEDY:BEGIN") {
+			begin = i
+		}
+		if strings.Contains(l, "REFUTED-REMEDY:END") {
+			end = i
+		}
+	}
+	if begin < 0 || end < 0 || end <= begin {
+		t.Fatalf("%s is missing a well-formed REFUTED-REMEDY:BEGIN/END fence (begin=%d end=%d) — "+
+			"without it this guard cannot tell refutation from live advice, and would either "+
+			"pass vacuously or reject the refutation itself", hostInboundMatrixDoc, begin, end)
+	}
+
+	// Phrases that only make sense as ADVICE to use an lo0 filter. Kept narrow
+	// on purpose: the goal is to catch the remedy coming back, not to police
+	// every mention of the word "filter" (the doc discusses input filters
+	// legitimately elsewhere, e.g. the appqoe udp/36000 discard guidance).
+	refuted := []string{
+		"firewall filter on the real port",
+		"admit the real port with a firewall filter",
+		"lo0 input-filter accept fixes",
+		"kernel path only",
+	}
+	var offences []string
+	for i, l := range lines {
+		if i >= begin && i <= end {
+			continue // inside the fence: this is the refutation itself
+		}
+		for _, bad := range refuted {
+			if strings.Contains(l, bad) {
+				offences = append(offences, fmt.Sprintf("%s:%d contains %q: %s",
+					hostInboundMatrixDoc, i+1, bad, strings.TrimSpace(l)))
+			}
+		}
+	}
+	if len(offences) > 0 {
+		t.Errorf("the operator doc advises the REFUTED lo0-filter remedy OUTSIDE the "+
+			"REFUTED-REMEDY fence. An lo0 accept cannot rescue a host-inbound deny on "+
+			"EITHER path — nftables `accept` ends the base chain, not the hook, so the "+
+			"packet still reaches xpf_hostinbound's catch-all drop; and #3485 means AF_XDP "+
+			"never evaluates the filter after a deny. `any-service` is the only remedy.\n  %s",
+			strings.Join(offences, "\n  "))
+	}
+
+	// Anti-vacuity: the fence must actually contain the refutation, or the
+	// exclusion above would be protecting nothing.
+	fenced := strings.Join(lines[begin:end+1], "\n")
+	if !strings.Contains(fenced, "kernel path only") {
+		t.Errorf("the REFUTED-REMEDY fence does not contain the refutation it exists to "+
+			"delimit — either it moved (and is now unguarded outside the fence) or the "+
+			"fence is in the wrong place in %s", hostInboundMatrixDoc)
+	}
+	// And live guidance must still name the remedy that works.
+	if !strings.Contains(string(raw), "any-service") {
+		t.Errorf("%s no longer names `any-service` — withdrawing the false remedy must not "+
+			"leave the operator with no remedy at all", hostInboundMatrixDoc)
+	}
+}
+
+// Test_3226_AdvisoriesReasonAboutTheEffectiveTokenSet pins the STRUCTURAL fix
+// for a family of self-contradicting advisory pairs.
+//
+// Junos host-inbound is ADDITIVE across the zone and interface levels: an
+// interface admits a service when EITHER level lists it, and the dataplane
+// enforcement view is built from that union. The commit advisories used to run
+// per RAW STANZA, so they reasoned about a different object than the enforcer
+// and emitted advice that contradicted it — and contradicted each other in the
+// same commit output. Three shapes, all closed here:
+//
+//	any-service + all in ONE stanza      -> "everything is admitted" together
+//	                                        with "ports are now DENIED".
+//	zone any-service + interface rpm     -> "rpm is DENIED, add any-service"
+//	                                        when the union already full-admits.
+//	zone rpm + interface any-service     -> same, in the other direction.
+//
+// Fixing those case by case would have left the two views diverging, so the
+// advisories now consume config.UnionHostInboundTokens — the same union the
+// dataplane builder uses — and suppress the scoping / unported notices whenever
+// the EFFECTIVE set full-admits.
+//
+// FAIL-ON-REVERT: drop the effectiveFullAdmits gates, or go back to passing the
+// raw per-stanza token lists, and the contradicting pair reappears.
+func Test_3226_AdvisoriesReasonAboutTheEffectiveTokenSet(t *testing.T) {
+	compile := func(t *testing.T, cmds ...string) *Config {
+		t.Helper()
+		cfg, err := CompileConfig(buildTree(t, cmds))
+		if err != nil {
+			t.Fatalf("CompileConfig: %v", err)
+		}
+		return cfg
+	}
+
+	t.Run("any-service and all in one stanza", func(t *testing.T) {
+		cfg := compile(t,
+			"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
+			"set security zones security-zone wan interfaces ge-0/0/0.0",
+			"set security zones security-zone wan host-inbound-traffic system-services any-service",
+			"set security zones security-zone wan host-inbound-traffic system-services all")
+		if got := hostInboundAllScopingWarnings(cfg); len(got) != 0 {
+			t.Errorf("`all` alongside `any-service` must NOT draw the scoping advisory — "+
+				"any-service full-admits, so nothing `all` would have narrowed is actually "+
+				"denied, and saying so contradicts the full-admit advisory in the same "+
+				"output, got: %v", got)
+		}
+		// The full-admit notice still fires: suppressing the contradiction must
+		// not lose the signal that this zone accepts everything.
+		if got := hostInboundFullAdmitWarnings(cfg); len(got) != 1 {
+			t.Errorf("the any-service full-admit advisory must still fire, got %d: %v", len(got), got)
+		}
+	})
+
+	t.Run("zone any-service with interface rpm", func(t *testing.T) {
+		cfg := compile(t,
+			"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
+			"set security zones security-zone wan interfaces ge-0/0/0.0",
+			"set security zones security-zone wan host-inbound-traffic system-services any-service",
+			"set security zones security-zone wan interfaces ge-0/0/0.0 host-inbound-traffic system-services rpm")
+		if got := hostInboundUnportedWarnings(cfg); len(got) != 0 {
+			t.Errorf("the interface's EFFECTIVE set is zone{any-service} + iface{rpm}, which "+
+				"full-admits — rpm traffic is NOT denied there, so the unported advisory must "+
+				"not fire, got: %v", got)
+		}
+	})
+
+	t.Run("zone rpm with interface any-service", func(t *testing.T) {
+		cfg := compile(t,
+			"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
+			"set security zones security-zone wan interfaces ge-0/0/0.0",
+			"set security zones security-zone wan host-inbound-traffic system-services rpm",
+			"set security zones security-zone wan interfaces ge-0/0/0.0 host-inbound-traffic system-services any-service")
+		// The zone's ONLY interface overrides with a full-admit, so the
+		// zone-level `rpm` is unobservable everywhere in this zone.
+		if got := hostInboundUnportedWarnings(cfg); len(got) != 0 {
+			t.Errorf("every interface in the zone overrides with `any-service`, so the "+
+				"zone-level `rpm` is denied NOWHERE — the advisory must not claim it is, "+
+				"got: %v", got)
+		}
+	})
+
+	// ANTI-VACUITY: without a full-admit anywhere, the advisory still fires.
+	// Otherwise the three suppressions above could be satisfied by an advisory
+	// that never fires at all.
+	t.Run("still fires when nothing full-admits", func(t *testing.T) {
+		cfg := compile(t,
+			"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
+			"set security zones security-zone wan interfaces ge-0/0/0.0",
+			"set security zones security-zone wan host-inbound-traffic system-services rpm")
+		if got := hostInboundUnportedWarnings(cfg); len(got) != 1 {
+			t.Fatalf("a zone naming `rpm` with no full-admit anywhere MUST still draw the "+
+				"unported advisory, got %d: %v", len(got), got)
+		}
+		// And a second interface WITHOUT a full-admit override keeps the
+		// zone-level advisory alive even when another interface has one.
+		cfg = compile(t,
+			"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
+			"set interfaces ge-0/0/1 unit 0 family inet address 10.0.1.1/24",
+			"set security zones security-zone wan interfaces ge-0/0/0.0",
+			"set security zones security-zone wan interfaces ge-0/0/1.0",
+			"set security zones security-zone wan host-inbound-traffic system-services rpm",
+			"set security zones security-zone wan interfaces ge-0/0/0.0 host-inbound-traffic system-services any-service")
+		if got := hostInboundUnportedWarnings(cfg); len(got) != 1 {
+			t.Errorf("ge-0/0/1.0 has no override, so the zone-level `rpm` IS denied there and "+
+				"the advisory must still fire, got %d: %v", len(got), got)
+		}
+	})
+}
+
+// Test_3226_AdvisoryUnionIsTheEnforcementUnion binds the advisory's notion of
+// "effective token set" to the enforcer's. The contradiction class above existed
+// because the two computed it separately; a shared helper only removes the class
+// while it actually stays shared.
+//
+// config.UnionHostInboundTokens is the SSOT. The dataplane builder
+// (pkg/dataplane/userspace unionHostInboundTokens) delegates to it, differing
+// only by lower-casing for map keying — which cannot change MEMBERSHIP, because
+// every predicate the advisories apply to the union is case-insensitive.
+//
+// FAIL-ON-REVERT: give either side its own union and the additive/order/dedup
+// properties asserted here stop matching.
+func Test_3226_AdvisoryUnionIsTheEnforcementUnion(t *testing.T) {
+	cases := []struct {
+		name        string
+		zone, iface []string
+		want        []string
+	}{
+		{"additive across levels", []string{"ssh"}, []string{"rpm"}, []string{"ssh", "rpm"}},
+		{"zone tokens keep authored order first", []string{"ping", "ssh"}, []string{"rpm"}, []string{"ping", "ssh", "rpm"}},
+		{"exact duplicates collapse", []string{"ssh"}, []string{"ssh", "rpm"}, []string{"ssh", "rpm"}},
+		{"empties skipped", []string{"ssh", ""}, []string{" "}, []string{"ssh"}},
+		{"nil override is the zone set", []string{"ssh"}, nil, []string{"ssh"}},
+		{"nil zone is the override set", nil, []string{"rpm"}, []string{"rpm"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := UnionHostInboundTokens(tc.zone, tc.iface)
+			if len(got) != len(tc.want) {
+				t.Fatalf("UnionHostInboundTokens(%v,%v) = %v, want %v", tc.zone, tc.iface, got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Errorf("UnionHostInboundTokens(%v,%v)[%d] = %q, want %q",
+						tc.zone, tc.iface, i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+	// The property the advisories actually depend on: a full-admit token
+	// anywhere in EITHER level is a full-admit in the union, whatever its case.
+	for _, tc := range []struct{ zone, iface []string }{
+		{[]string{"any-service"}, []string{"rpm"}},
+		{[]string{"rpm"}, []string{"any-service"}},
+		{[]string{"rpm"}, []string{"ANY-SERVICE"}},
+	} {
+		full := false
+		for _, svc := range UnionHostInboundTokens(tc.zone, tc.iface) {
+			if HostInboundFullAdmitService(svc) {
+				full = true
+			}
+		}
+		if !full {
+			t.Errorf("union of zone %v + iface %v must be recognized as full-admit — the "+
+				"advisory suppression and the dataplane short-circuit both key on this",
+				tc.zone, tc.iface)
+		}
 	}
 }

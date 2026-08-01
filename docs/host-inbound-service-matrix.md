@@ -321,6 +321,15 @@ surface. An lo0 input filter does not help. Two earlier revisions of this fold
 claimed otherwise and both were wrong; the history is kept because the second
 error is easy to re-derive.
 
+<!-- REFUTED-REMEDY:BEGIN
+     Everything between these fences DESCRIBES the lo0-filter remedy in order to
+     REFUTE it. TestHostInboundMatrixDocDoesNotAdviseTheRefutedRemedy
+     (pkg/config) asserts the refuted phrasing appears ONLY inside this block —
+     so a future edit cannot reintroduce it as live operator advice, which is
+     exactly how it survived two withdrawals. If you are editing this block,
+     keep it refutational; if you need to state the remedy works, you first need
+     the bypass mechanism described at the end of the block. -->
+
 | Revision | Claim | Why it is false |
 |---|---|---|
 | r3 | "admit the real port with a firewall filter" | False on AF_XDP: #3485 deliberately runs the host-inbound gate FIRST so a denied packet incurs none of the lo0 filter's side-effects (counter, log, reject reply, session teardown). On a deny the filter is never evaluated at all. |
@@ -357,6 +366,8 @@ host-inbound default-deny, so it needs its own design and threat review; and it
 would still not help on the AF_XDP path without also reordering #3485, which
 would reopen codex-review-118 M1. Both are out of scope for this fold.
 
+<!-- REFUTED-REMEDY:END -->
+
 Why `any-service` genuinely works: it is a full-admit token, so the nft builder
 emits a bare `accept` and **no catch-all drop at all** for the zone (there is
 nothing left at priority 10 to kill the packet), and the AF_XDP classifier
@@ -364,9 +375,10 @@ short-circuits `admits()` to true. That property — not the wording of the
 advisory — is what the tests bind.
 
 **Operator consequence — a known, deliberate, fail-closed divergence from
-Junos.** A zone that actually terminates one of these services must admit it
-with an explicit firewall filter on the real port, or fall back to
-`system-services any-service`. Naming one of these tokens explicitly draws a
+Junos.** A zone that actually terminates one of these services must use
+`system-services any-service`. That is the only remedy: as shown above, an lo0
+input filter cannot rescue a host-inbound deny on either enforcement path.
+Naming one of these tokens explicitly draws a
 commit-time advisory (`compiler_validate_warn.go`) that says exactly this, so the
 gap is announced rather than discovered as a silent blackhole. `system-services
 all` does **not** draw the advisory: it covers these services (contributing

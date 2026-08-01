@@ -62592,3 +62592,52 @@ break — `go vet` confirmed passing under every revert.
 - **Validation**: `go test ./...` 58 ok, only pre-existing #6617. `cargo test`
   4225 passed, 0 failed. gofmt clean. Per-arm mutation proofs in a throwaway
   detached worktree.
+
+## 2026-07-31 — #3226 fold r6: finish the withdrawal, widen the guard, unify the advisory input
+
+- **Timestamp**: 2026-07-31
+- **Action**: Fold the fourth Codex round on PR #6616 (2 MAJOR + 1 MINOR).
+- **MAJOR 1 — the lo0 withdrawal was incomplete.** Two live sites survived:
+  `docs/host-inbound-service-matrix.md:366` still told operators to admit the
+  service "with an explicit firewall filter on the real port" AND claimed the
+  commit advisory said so (both false), and a test comment at
+  `host_inbound_fulladmit_warn_3226_test.go:275` still affirmed the rescue
+  "works on the kernel path only". Both fixed.
+  - ROOT CAUSE: the negative guard asserted the refuted phrasing was absent from
+    the ADVISORY STRING, but the claim lives in the operator doc too — a guard
+    narrower than the claim it protects. WIDENED: the doc's refutational
+    material is now fenced with `REFUTED-REMEDY:BEGIN/END` and a new test
+    (`TestHostInboundMatrixDocDoesNotAdviseTheRefutedRemedy`) asserts the
+    refuted phrasing appears ONLY inside the fence, with an anti-vacuity check
+    that the fence actually contains the refutation and that live guidance still
+    names `any-service`.
+- **MAJOR 2 — absolute-port sweep finished.** Six more sites flattened all five
+  tokens into the disproven "Junos fixes no port" (`host_inbound_tokens.go`,
+  two in `pkg/dataplane/userspace`, `pkg/daemon/host_inbound_parity_test.go`,
+  `host_inbound_tokens_test.go`), plus a Rust comment that actively
+  CONTRADICTED the classification by describing `tcp-encap` as using an
+  "operator-chosen SSL termination port" — the operator-configured class for a
+  token classified unsourced. All reworded.
+- **MINOR 3 — fixed structurally, not case by case.** The three advisory passes
+  ran per RAW STANZA while enforcement UNIONS zone and interface tokens
+  (additive Junos semantics), so the advisory reasoned about a different object
+  than the enforcer. Now both consume `config.UnionHostInboundTokens` — which
+  already existed as the display-side peer — and the dataplane's
+  `unionHostInboundTokens` delegates to it (keeping a local `lowerDedup` so the
+  lower-cased dedup semantics are byte-identical to before). The scoping and
+  unported advisories are suppressed whenever the EFFECTIVE set full-admits,
+  including the zone-level case where every interface overrides with a
+  full-admit. Closes `any-service + all`, zone `any-service` + interface `rpm`,
+  and the inverse.
+- **File(s)**: `docs/host-inbound-service-matrix.md`,
+  `pkg/config/compiler_validate_warn.go`, `pkg/config/host_inbound_view.go`,
+  `pkg/config/host_inbound_fulladmit_warn_3226_test.go`,
+  `pkg/config/host_inbound_tokens.go`, `pkg/config/host_inbound_tokens_test.go`,
+  `pkg/daemon/host_inbound_parity_test.go`,
+  `pkg/dataplane/userspace/zones_override.go`,
+  `pkg/dataplane/userspace/host_inbound_all_scoping_3226_test.go`,
+  `userspace-dp/src/afxdp/forwarding/host_inbound_tests.rs`
+- **Validation**: `go test ./...` 58 ok, only pre-existing #6617. `cargo test`
+  4225+60+8+22+1 passed, 0 failed — no linker SIGBUS on this host, the Rust leg
+  linked and ran normally. gofmt clean. Per-arm mutation proofs in a throwaway
+  detached worktree.

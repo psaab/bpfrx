@@ -516,11 +516,54 @@ func ValidateConfig(cfg *Config) []string {
 				break
 			}
 		}
+		// #3226 fold: every advisory below reasons about the EFFECTIVE token
+		// set — the zone-level list UNION the per-interface override, via the
+		// shared UnionHostInboundTokens — because that is what enforcement acts
+		// on (Junos host-inbound is additive across the two levels). Reasoning
+		// per RAW STANZA made the advisories contradict enforcement AND each
+		// other: a zone `any-service` with a per-interface `rpm` warned that rpm
+		// was DENIED when the union full-admits it. Sharing the union removes
+		// the whole class rather than special-casing each pair.
+		var zoneSvcs []string
+		if zone.HostInboundTraffic != nil {
+			zoneSvcs = zone.HostInboundTraffic.SystemServices
+		}
+		// A full-admit token anywhere in an effective set makes the scoping and
+		// unported advisories moot for that set: nothing is denied, so telling
+		// the operator traffic is DENIED (and to add `any-service`) would be
+		// false on its premise and would advise a change already made.
+		effectiveFullAdmits := func(svcs []string) bool {
+			for _, svc := range svcs {
+				if HostInboundFullAdmitService(svc) {
+					return true
+				}
+			}
+			return false
+		}
+		// The zone-level stanza governs every interface that does NOT override.
+		// If EVERY interface in the zone overrides with a full-admit, the
+		// zone-level narrowing is unobservable and its advisories are moot too.
+		zoneObservable := !effectiveFullAdmits(zoneSvcs)
+		if zoneObservable && len(zone.Interfaces) > 0 {
+			allCovered := true
+			for _, ifRef := range zone.Interfaces {
+				hi := zone.InterfaceHostInbound[CanonicalInterfaceUnitRef(ifRef)]
+				if hi == nil || !effectiveFullAdmits(hi.SystemServices) {
+					allCovered = false
+					break
+				}
+			}
+			if allCovered {
+				zoneObservable = false
+			}
+		}
 		if zone.HostInboundTraffic != nil {
 			where := fmt.Sprintf("zone %q host-inbound-traffic", name)
-			fullAdmitAdvice(where, zone.HostInboundTraffic.SystemServices)
-			allScopingAdvice(where, zone.HostInboundTraffic.SystemServices, zoneEnforces)
-			unportedAdvice(where, zone.HostInboundTraffic.SystemServices)
+			fullAdmitAdvice(where, zoneSvcs)
+			allScopingAdvice(where, zoneSvcs, zoneEnforces && zoneObservable)
+			if zoneObservable {
+				unportedAdvice(where, zoneSvcs)
+			}
 		}
 		// #3362: per-interface overrides carry the same token grammar and the
 		// same packet-wide breadth, so warn on each of them too. Iterated via
@@ -531,12 +574,21 @@ func ValidateConfig(cfg *Config) []string {
 				continue
 			}
 			where := fmt.Sprintf("zone %q interface %q host-inbound-traffic", name, ifRef)
+			// The EFFECTIVE set for this interface, exactly as the dataplane
+			// enforcement view builder computes it.
+			effective := UnionHostInboundTokens(zoneSvcs, hi.SystemServices)
+			// The full-admit notice stays keyed on the OVERRIDE's own tokens: it
+			// reports what this stanza declares, and a zone-level `any-service`
+			// already drew its own notice at the zone level.
 			fullAdmitAdvice(where, hi.SystemServices)
+			observable := !effectiveFullAdmits(effective)
 			// An override is scoped to ONE interface, so gate it on that
 			// interface's own lifeline status rather than the zone's.
-			allScopingAdvice(where, hi.SystemServices,
-				!HostInboundLifelineInterface(ifRef, lifelines))
-			unportedAdvice(where, hi.SystemServices)
+			allScopingAdvice(where, effective,
+				!HostInboundLifelineInterface(ifRef, lifelines) && observable)
+			if observable {
+				unportedAdvice(where, effective)
+			}
 		}
 	}
 
