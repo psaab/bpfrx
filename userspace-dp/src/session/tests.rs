@@ -379,6 +379,44 @@ fn session_id_namespaces_worker_in_high_bits() {
     );
 }
 
+// #6198: the high-16 value 0xFFFF is RESERVED for the Go control plane, which
+// mints `0xFFFF << 48 | counter48` for peer-synced sessions into the SAME BPF
+// conntrack mirror field this table stamps. Before #6198 that reservation lived
+// only in a Go comment, so nothing on this side stopped a worker id from landing
+// on it. It is unreachable today (`binding.worker_id` is bounded by the worker
+// count), but #6311 proposes re-partitioning exactly these bits — this pins the
+// invariant so such a change has to confront it rather than silently alias.
+//
+// A hard `assert!`, not `debug_assert!`: `make test-rust` and the shipped helper
+// both build `--release`, where a debug assertion is stripped and would guard
+// nothing. Worker setup is config time, where docs/engineering-style.md prefers
+// crash-start over running with a wrong invariant.
+#[test]
+#[should_panic(expected = "reserved for the Go control plane")]
+fn set_worker_id_rejects_the_control_plane_namespace_6198() {
+    let mut table = SessionTable::new();
+    table.set_worker_id(CONTROL_PLANE_SESSION_ID_WORKER_HI as u32);
+}
+
+// The paired NEGATIVE CONTROL: the highest worker id that is NOT reserved is
+// accepted and namespaces normally. This passes with and without the assertion,
+// so it proves the guard is scoped to the reserved value rather than rejecting
+// large worker ids in general.
+#[test]
+fn set_worker_id_accepts_the_value_below_the_reservation_6198() {
+    let mut table = SessionTable::new();
+    table.set_worker_id(CONTROL_PLANE_SESSION_ID_WORKER_HI as u32 - 1);
+    let t0 = 1_000_000_000u64;
+    assert!(table.install_with_protocol(key_v4(), decision(), metadata(), t0, PROTO_TCP, 0));
+    let opens = table.drain_deltas(8);
+    assert_eq!(opens.len(), 1);
+    assert_eq!(
+        opens[0].session_id >> 48,
+        CONTROL_PLANE_SESSION_ID_WORKER_HI - 1,
+        "an unreserved worker id must still namespace normally"
+    );
+}
+
 // #5212 RED-on-revert: a peer-synced import ADOPTS the originating node's stable
 // session id carried on the HA session-sync wire (SessionInstall.session_id)
 // instead of minting a fresh node-local one, so the standby's SESSION_CLOSE

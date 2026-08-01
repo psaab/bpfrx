@@ -379,7 +379,10 @@ ADOPTS it — the two nodes emit RT_FLOW records for the same session under one 
 `MSG_SESSION_OPEN` event-stream frame's trailing `session_id` u64
 (`encode_session_open`) → Go `SessionDeltaInfo.RTFlowSessionID`
 (`decodeSessionEvent`) → `SessionValue{,V6}.RTFlowSessionID`
-(`userspaceSessionFromDelta*`, distinct from the BPF-ABI `SessionID`) → this
+(`userspaceSessionFromDelta*`, distinct from the node-local BPF-ABI `SessionID`,
+which the same converters mint per session via `nextUserspaceSyncedSessionID`
+since #6198 — see "Node-Local BPF-ABI Session Id" in
+`docs/session-sync-architecture.md`) → this
 length-gated trailing wire field (`encode/decodeSessionV{4,6}Payload`) → the peer
 Go `SessionSyncRequest.session_id` (`buildSessionSyncRequest*`) → the Rust helper
 `build_synced_session_entry` → `SessionInstall::session_id`. On import,

@@ -37,7 +37,8 @@ func validateGratuitousARPCountAST(nodes []*Node) []string {
 	_ = forEachChild(nodes, "chassis", func(chassis *Node) error {
 		return forEachChild(chassis.Children, "cluster", func(cluster *Node) error {
 			for _, rgInst := range namedInstances(cluster.FindChildren("redundancy-group")) {
-				gc := rgInst.node.FindChild("gratuitous-arp-count")
+				// #6588: the body may be packed onto the RG instance's own Keys.
+				gc := findNamedNode(redundancyGroupBody(rgInst.node), "gratuitous-arp-count")
 				if gc == nil {
 					continue
 				}

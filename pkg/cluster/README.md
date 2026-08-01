@@ -228,7 +228,7 @@ peer liveness (`lastSeen`) or drive election.
   **Retired-session replays are rejected (#5477).** The pre-#5477 tracker
   held exactly ONE `(session, counter)` and RE-ANCHORED on ANY session
   change, so an on-link attacker who recorded authenticated frames from
-  two incarnations A and B could alternate A→B→A→B indefinitely — each
+  two sessions A and B could alternate A→B→A→B indefinitely — each
   switch reset the single watermark and re-admitted the SAME recorded A
   frames, refreshing peer liveness and applying their stale role/priority
   before `handlePeerHeartbeat`. HMAC blocks forging a NEW session but not
@@ -237,22 +237,66 @@ peer liveness (`lastSeen`) or drive election.
   the highest the genuine peer ever signed). Session ids are RANDOM
   (unordered), so a strictly-newer test like `fullSetSeqGuard` cannot be
   used — a bounded per-session watermark is the mechanism that separates a
-  real reboot (new id) from a replay of a retired incarnation (known id,
+  real reboot (new id) from a replay of a retired session (known id,
   no counter advance). **Bound safety and its honest limit:** the ring
-  RAISES the on-link replay attacker's cost — from 2 recorded incarnations
+  RAISES the on-link replay attacker's cost — from 2 recorded sessions
   (the pre-#5477 A→B→A loop) to `heartbeatReplaySessions`+1 — but is NOT an
   absolute bar. Eviction is FIFO and is triggered by ANY never-seen session,
   INCLUDING a REPLAYED old frame whose session is not currently in the ring:
   admit() treats it as never-seen, re-records it, and evicts the oldest.
   FIFO always leaves exactly one just-evicted session to replay back in as
   never-seen, so an attacker who captured `heartbeatReplaySessions`+1 (= 65)
-  or more distinct incarnations can churn the ring by REPLAY ALONE (no
+  or more distinct sessions can churn the ring by REPLAY ALONE (no
   reboot, no minting) and SUSTAIN the replay indefinitely; with fewer than
-  65 recordings every retired-session replay is rejected. A complete fix
+  65 recordings every retired-session replay is rejected.
+  **The unit is a peer SESSION, not a peer daemon boot.** A session id is
+  minted per `heartbeatSender`, so every peer heartbeat restart (VRF rebind,
+  HA comms restart) mints a fresh one with no reboot involved. So the 65 above
+  is 65 recorded heartbeat sessions — cheaper to harvest than 65 daemon
+  incarnations — and routine peer restarts consume ring slots permanently now
+  that the ring outlives a local restart. Neither is a regression: before
+  #5086 any local heartbeat restart wiped the ring entirely, so this worst
+  case is a strict subset of the previous one. A complete fix
   needs a boot-epoch / monotonic-across-reboot counter carried in the frame
-  (a wire change) — tracked as a follow-up. The map still causes NO
+  (a wire change) — tracked as a follow-up (#6169). The map still causes NO
   genuine-peer lockout (an evicted live watermark just makes the peer's next
   frame never-seen → admitted) and cannot grow memory (fixed 64 slots).
+- **The tracker's LIFETIME is the process, not the heartbeat (#5086).**
+  The watermarks and the sticky `peerAuthSeen` flag live in
+  `Manager.hbAuth` (`heartbeatAuthState`); a `heartbeatReceiver` holds a
+  POINTER to it. This is load-bearing, not a refactor. Every
+  `StartHeartbeat` builds a brand-new receiver, and it runs on far more
+  than a daemon boot — `RestartHeartbeat` on a DHCP-triggered VRF rebind
+  (`daemon_apply_dataplane.go`) and the HA comms (re)start
+  (`daemon_ha_sync.go`), both routine. While the tracker was a receiver
+  field, each of those DISCARDED every retired-session watermark, so the
+  #5477 protection lasted only as long as one UDP socket: after a restart
+  an attacker replaying captured frames from a retired session hit an
+  EMPTY tracker, every frame looked never-seen, and the whole captured run
+  was re-admitted — refreshing peer liveness and applying stale
+  role/priority for its full length. Measured on the pre-fix code: a
+  10-frame capture from each of two sessions yields 20 admitted frames
+  (~4 s of forged liveness at the 200 ms interval, i.e. 4× the ~1 s
+  peer-dead window) per heartbeat restart, and a fresh 20 on every
+  subsequent restart. A peer that looks alive while dead is the failure
+  that matters here: the survivor never takes over. Anchoring the state to
+  the `Manager` costs nothing on the failover path (the same integer scan,
+  now under a mutex taken ~5×/s) and does not change the memory bound —
+  one fixed ring per `Manager` (64 × 16 B = 1 KiB) plus a mutex and an
+  atomic, allocated once, never growing with restart count, uptime, or the
+  number of peer sessions observed. It also fixes the mirror-image
+  hole in `Manager.HeartbeatPeerAuthSeen`, which read the flag off
+  `m.hbReceiver`: `StopHeartbeat` nils that field, so every restart
+  silently DISARMED the gRPC fabric listener's downgrade-guard for the
+  restart window (a VRF-rebind restart retries the bind for up to ~5 s)
+  and an unsigned fabric RPC was accepted from a peer already known to
+  hold the key. It now reads the process-lifetime state.
+  **Residual, unchanged by #5086:** the state is in memory, so a full
+  daemon restart or reboot still starts with an empty tracker and a
+  captured run replays once against the restarted node. Closing that
+  needs the same signed boot-epoch as the ≥65-recording churn — both are
+  #6169. #5086 removes the vectors an attacker can reach without the
+  survivor restarting its whole daemon.
 - **Dual-accept (rolling upgrade), `heartbeatAuthDecision`.** Mirrors
   the #4126 VRRP-checksum dual-accept migration:
   - No local key → accept everything (this node cannot verify; may be
@@ -301,8 +345,9 @@ package's dual-accept posture (`fabricAuthDecision` mirrors
 The fabric downgrade-guard arms off the heartbeat, not just the fabric
 channel. This package exposes `Manager.HeartbeatPeerAuthSeen()` — true
 once the receiver accepts a valid authed heartbeat from the peer (the
-sticky `heartbeatReceiver.peerAuthSeen`, now an `atomic.Bool` because it
-is read cross-goroutine). The gRPC interceptor rejects a tokenless fabric
+sticky `peerAuthSeen` in `Manager.hbAuth`, an `atomic.Bool` because it is
+read cross-goroutine; it hangs off the Manager rather than the receiver so
+a heartbeat restart cannot disarm the guard — #5086). The gRPC interceptor rejects a tokenless fabric
 call when EITHER a prior valid fabric token OR the heartbeat has armed
 enforcement. Rationale: nothing periodically dials the fabric listener,
 so arming only off an on-demand fabric RPC would leave a window after
@@ -632,7 +677,9 @@ posture; it does not tell you whether an existing session-sync connection
 predates the key.
 
 **Rolling BACK is not symmetric.** `peerAuthSeen` is sticky in memory and
-clears only on restart, so a node that has seen its peer authenticate will
+clears only on an **xpfd restart** — since #5086 it lives on the `Manager`,
+so restarting the heartbeat (VRF rebind, comms restart) no longer clears it
+— so a node that has seen its peer authenticate will
 reject that peer's unsigned heartbeats. Returning one node to an unkeyed
 config or an older binary while the other stays armed produces the same
 split-brain described under rotation.
@@ -1127,7 +1174,8 @@ outside the monitor loop:
   active/active direction stays a documented fail-OPEN residual on #6284 (item 1,
   needs a bidirectional config-gen namespace #5274 scoped out).
 - **RT_FLOW session id (#5212)**: distinct from BOTH the synthesized BPF-ABI
-  `SessionID` (`now<<16|slot`, node-local) AND the per-key install generation,
+  `SessionID` (node-local, minted per converted session by
+  `nextUserspaceSyncedSessionID` since #6198) AND the per-key install generation,
   every session install carries the ORIGINATING node's stable RT_FLOW session id
   (`SessionValue{,V6}.RTFlowSessionID`, the dataplane's
   `SessionTable::alloc_session_id` value) as a length-gated trailing `uint64` on

@@ -107,8 +107,9 @@ func ClampInterfaceMonitorWeight(w int) (int, bool) {
 // chassis-cluster config whose redundancy-group cardinality or ids exceed
 // what the HA heartbeat wire format can encode (#4434, codex-172 C172-H02),
 // whose per-RG node priority is out of the VRRP range (#4880), or whose
-// interface-monitor weight is out of the [0,255] heartbeat weight domain
-// (#6549).
+// interface-monitor weight (#6549) or ip-monitoring global-weight /
+// global-threshold / per-target weight (#6588) is out of the [0,255] heartbeat
+// weight domain.
 //
 // The heartbeat count byte and per-group id byte are both uint8. There is
 // no schema-level value validation on the `redundancy-group <id>` instance
@@ -220,6 +221,66 @@ func validateChassisClusterStrict(cfg *Config) error {
 					rg.ID, im.Interface, im.Weight,
 					MinInterfaceMonitorWeight, MaxInterfaceMonitorWeight,
 					MinInterfaceMonitorWeight, MaxInterfaceMonitorWeight)
+			}
+		}
+
+		// #6588: the SAME compiled-int gate for the ip-monitoring weights.
+		// They carry a typed schema leaf (schema_chassis.go
+		// ValidateInteger(0,255)), which is why #6549 left them to it — but
+		// SchemaValidate walks the AST from setSchema and a PACKED statement
+		// (`ip-monitoring family inet 10.0.1.1 weight -100;`) sits BELOW the
+		// depth that walk reaches, so the typed leaf never fires on it. Before
+		// #6588 that was harmless because the packed spelling compiled to
+		// nothing at all; now that it compiles, an out-of-range packed weight
+		// would reach the runtime with no commit-side gate on ANY path.
+		// Asserting the range here — on the compiled int, exactly where the
+		// interface-monitor gate above lives — makes all three spellings
+		// (flat-set, container-hierarchical, packed) converge on one answer.
+		//
+		// The domain is the same one and for the same reason: an ip-monitoring
+		// weight is demotion DEBT subtracted from the redundancy-group weight,
+		// which the heartbeat advertises through a single wire byte while the
+		// local election reads the raw int. A negative weight is worse here
+		// than for interface-monitor: in global-threshold mode it SUBTRACTS
+		// from the cumulative failure sum, so a second genuinely unreachable
+		// target pushes the sum back BELOW the threshold and drops the debt the
+		// first failure installed — more failures produce LESS demotion.
+		if ipm := rg.IPMonitoring; ipm != nil {
+			if ipm.GlobalWeight < MinInterfaceMonitorWeight || ipm.GlobalWeight > MaxInterfaceMonitorWeight {
+				return fmt.Errorf("chassis cluster: redundancy-group %d ip-monitoring "+
+					"global-weight %d is out of range %d..%d (the weight is subtracted from "+
+					"the redundancy-group weight, which the heartbeat advertises through a "+
+					"single wire byte while the local election reads the raw value) — set a "+
+					"global-weight in %d..%d",
+					rg.ID, ipm.GlobalWeight,
+					MinInterfaceMonitorWeight, MaxInterfaceMonitorWeight,
+					MinInterfaceMonitorWeight, MaxInterfaceMonitorWeight)
+			}
+			if ipm.GlobalThreshold < MinInterfaceMonitorWeight || ipm.GlobalThreshold > MaxInterfaceMonitorWeight {
+				return fmt.Errorf("chassis cluster: redundancy-group %d ip-monitoring "+
+					"global-threshold %d is out of range %d..%d (the threshold is compared "+
+					"against the cumulative failure weight, which shares the single-byte "+
+					"heartbeat weight domain) — set a global-threshold in %d..%d",
+					rg.ID, ipm.GlobalThreshold,
+					MinInterfaceMonitorWeight, MaxInterfaceMonitorWeight,
+					MinInterfaceMonitorWeight, MaxInterfaceMonitorWeight)
+			}
+			// Targets is an AST-order slice, so the first-error message is
+			// already deterministic without sorting.
+			for _, tgt := range ipm.Targets {
+				if tgt == nil { // tolerant/HA-sync path may carry a nil entry (#3494).
+					continue
+				}
+				if tgt.Weight < MinInterfaceMonitorWeight || tgt.Weight > MaxInterfaceMonitorWeight {
+					return fmt.Errorf("chassis cluster: redundancy-group %d ip-monitoring "+
+						"family inet %s weight %d is out of range %d..%d (the weight is "+
+						"subtracted from the redundancy-group weight, and in global-threshold "+
+						"mode a negative weight cancels a sibling target's real failure so more "+
+						"failures produce LESS demotion) — set a weight in %d..%d",
+						rg.ID, tgt.Address, tgt.Weight,
+						MinInterfaceMonitorWeight, MaxInterfaceMonitorWeight,
+						MinInterfaceMonitorWeight, MaxInterfaceMonitorWeight)
+				}
 			}
 		}
 	}

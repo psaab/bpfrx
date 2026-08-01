@@ -197,7 +197,9 @@ func TestUserspaceSessionFromDeltaCarriesRTFlowSessionID5212(t *testing.T) {
 	if valV4.RTFlowSessionID != wantID {
 		t.Fatalf("v4 RTFlowSessionID = %#x, want %#x", valV4.RTFlowSessionID, wantID)
 	}
-	// The BPF-ABI SessionID stays a distinct node-local now<<16|Slot value.
+	// The BPF-ABI SessionID stays a distinct node-local value (#6198: minted by
+	// nextUserspaceSyncedSessionID in its own 0xFFFF<<48 namespace, which the
+	// dataplane's worker-namespaced RTFlowSessionID can never occupy).
 	if valV4.SessionID == wantID {
 		t.Fatal("RTFlowSessionID must be distinct from the BPF-ABI SessionID")
 	}
@@ -477,7 +479,11 @@ func TestUserspaceForwardWireAliasFromDeltaV4UsesNATTuple(t *testing.T) {
 		NATSrcPort:  39906,
 	}
 
-	key, _, ok := userspaceForwardWireAliasFromDeltaV4(delta, zoneIDs)
+	baseKey, baseVal, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
+	if !ok {
+		t.Fatal("expected v4 delta to convert")
+	}
+	key, _, ok := userspaceForwardWireAliasV4(baseKey, baseVal, delta)
 	if !ok {
 		t.Fatal("expected v4 forward-wire alias")
 	}
@@ -600,7 +606,11 @@ func TestUserspaceForwardWireAliasFromDeltaV6UsesNATTuple(t *testing.T) {
 		NATSrcPort:  50952,
 	}
 
-	key, _, ok := userspaceForwardWireAliasFromDeltaV6(delta, zoneIDs)
+	baseKey, baseVal, ok := userspaceSessionFromDeltaV6(delta, zoneIDs)
+	if !ok {
+		t.Fatal("expected v6 delta to convert")
+	}
+	key, _, ok := userspaceForwardWireAliasV6(baseKey, baseVal, delta)
 	if !ok {
 		t.Fatal("expected v6 forward-wire alias")
 	}

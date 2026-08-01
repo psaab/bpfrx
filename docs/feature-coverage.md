@@ -249,6 +249,31 @@ the userspace dataplane admission boundary is in
   (#5301). `pkg/cluster/monitor.go`.
 - **Bondless RETH**: VRRP on physical member interfaces, per-node virtual
   MAC (`02:bf:72:CC:RR:NN`), no Linux bonding required.
+- **VRRP L2 identity is a deliberate deviation from RFC 5798 (#5091).** The RFC
+  specifies a *shared* virtual-router MAC — `00-00-5E-00-01-{VRID}` for IPv4 and
+  `00-00-5E-00-02-{VRID}` for IPv6 — which both routers use, so the virtual
+  router's L2 identity survives a failover untouched. xpf instead derives a
+  **per-node** locally-administered MAC (`02:bf:72:CC:RR:NN` = cluster, RG,
+  node) and advertises from the physical member interface. Two consequences an
+  operator must plan for:
+  - **Failover changes the L2 identity**, so recovery depends on the
+    gratuitous-ARP burst (IPv4) and unsolicited neighbour advertisements
+    (IPv6) reaching peers and updating switch FDBs, rather than on the MAC
+    simply not moving. That path is engineered rather than best-effort —
+    `becomeMaster` sends GARP asynchronously with a forced burst after a MAC
+    change (#2081) — but it is still an update-the-peers mechanism, not an
+    identity-preserving one.
+  - **xpf cannot form a virtual router with a third-party VRRP speaker.** The
+    protocol is on the wire, but a standards-conformant peer expects the shared
+    MAC. Treat RETH VRRP as an xpf-to-xpf mechanism between the two chassis of
+    one cluster, not as general VRRP interop.
+
+  The reason is not oversight: on this platform both nodes' member interfaces
+  routinely share an L2 domain — SR-IOV VFs from the same PF, or two ports on
+  the same physical switch — and a genuinely shared MAC there produces FDB
+  conflicts and MAC flapping as the switch sees one address on two ports. The
+  per-node MAC trades RFC conformance for a deterministic L2 topology. See
+  `RethMAC` in `pkg/cluster/reth.go`.
 - **Session sync**: incremental 1s sweep + ring buffer + GC delete
   callbacks, TCP on fabric link.
 - **Config sync**: primary → secondary with `${node}` variable expansion,
