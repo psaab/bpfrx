@@ -287,8 +287,14 @@ func TestClassUnidentifiedIsDenyingNotLegacy_6701(t *testing.T) {
 // caller from matching a configured user (#6701 MINOR-1).
 //
 // The premise is measured, not assumed: `system login user "" { class
-// super-user; }` compiles CLEAN — the schema's username validator does not
-// reject a quoted-empty name — so such an entry really can be live. An
+// super-user; }` reaches the ACTIVE config — not because the validator is
+// missing, but despite it. `config.ValidateLoginUsername` rejects an empty
+// name and commit-check enforces it (SchemaValidate: `invalid value "": login
+// user name must not be empty`). The COMPILER does not — CompileConfig returns
+// nil and keeps the entry — and the tolerant load / peer-sync path never runs
+// SchemaValidate, so an entry arriving that way is kept SILENTLY, with no
+// warning at all. So such an entry really can be live, and on exactly the path
+// an operator never sees. An
 // unidentified caller carries Name == "". If candidateNames offered that name
 // to the match loop, `u.Name == ""` would match the entry and hand the caller
 // super-user, reopening #6701 without touching $USER.

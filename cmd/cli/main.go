@@ -50,14 +50,6 @@ func dialOpts(extra ...grpc.DialOption) []grpc.DialOption {
 	return append(opts, extra...)
 }
 
-// isLocalOnlyCommand reports whether cmd (the `-c` single-command string) is a
-// CLI verb that executes entirely in the client with NO gRPC round-trip, so it
-// must run even when xpfd is unreachable. Today the only such verb is the
-// offline WireGuard key generator (`request security wireguard
-// generate-private-key`, #1434) — a pure-Go X25519 keygen whose whole purpose
-// is to be available exactly when the daemon is down (recovery/bootstrap),
-// which the pre-dispatch GetStatus probe otherwise defeats (#4909). Matches the
-// canonical token form; abbreviated prefixes still take the daemon path.
 // resolveUsername returns the identity the remote CLI displays in its prompt.
 //
 // #6701: it is derived from the KERNEL (real uid -> passwd, pkg/osident), never
@@ -74,6 +66,14 @@ func resolveUsername() string {
 	return osident.Current().String()
 }
 
+// isLocalOnlyCommand reports whether cmd (the `-c` single-command string) is a
+// CLI verb that executes entirely in the client with NO gRPC round-trip, so it
+// must run even when xpfd is unreachable. Today the only such verb is the
+// offline WireGuard key generator (`request security wireguard
+// generate-private-key`, #1434) — a pure-Go X25519 keygen whose whole purpose
+// is to be available exactly when the daemon is down (recovery/bootstrap),
+// which the pre-dispatch GetStatus probe otherwise defeats (#4909). Matches the
+// canonical token form; abbreviated prefixes still take the daemon path.
 func isLocalOnlyCommand(cmd string) bool {
 	f := strings.Fields(cmd)
 	return len(f) == 4 &&

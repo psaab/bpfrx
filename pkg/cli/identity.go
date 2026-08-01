@@ -185,9 +185,18 @@ func configuredName(login *config.LoginConfig, id osident.Identity) string {
 //
 // The `id.Resolved()` test is LOAD-BEARING, not a tidiness check, and this is
 // the only place that protection exists. An unidentified caller has Name == "",
-// and `system login user "" { class super-user; }` COMPILES CLEAN today
-// (measured — the schema's username validator does not reject the quoted-empty
-// name). Without this test the empty name would be offered to the match loop
+// and `system login user "" { class super-user; }` can be LIVE today. The
+// reason is stronger than a missing validator, and is worth stating exactly
+// because the obvious version of it is wrong. `config.ValidateLoginUsername`
+// DOES reject an empty name, and COMMIT-CHECK enforces it — measured,
+// SchemaValidate returns `system login user: invalid value "": login user name
+// must not be empty`. The COMPILER does not: CompileConfig returns a nil error
+// and keeps the entry. And the TOLERANT load / peer-sync path never runs
+// SchemaValidate at all, so a config arriving by that route keeps the
+// empty-named super-user SILENTLY — not downgraded to a warning, no diagnostic
+// of any kind. A guard that only held on the commit path would therefore not
+// hold on the one path an operator never sees.
+// Without this test the empty name would be offered to the match loop
 // below, where `u.Name != name` succeeds against that entry and the
 // unidentifiable caller is handed super-user — the #6701 hole reopened from the
 // other side, reached without touching $USER at all.
