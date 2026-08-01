@@ -56,7 +56,8 @@ import (
 // KnownHostInboundSystemServices is the canonical set of recognized
 // host-inbound-traffic `system-services` tokens, including documented aliases
 // (`webapi-clear-text`/`http`, `netconf-ssh`/`ssh-netconf`, `rlogin`/`r-login`,
-// etc.) and the full-admit tokens `all` / `any-service`. Keep in lockstep with
+// etc.) and the full-admit token `any-service` (`all` is NOT full-admit since
+// #3226 — it expands to the named union). Keep in lockstep with
 // pkg/daemon hostInboundServiceMatches + hostInboundAllowsAll and the Rust
 // classify_system_service.
 var KnownHostInboundSystemServices = map[string]bool{
@@ -96,6 +97,51 @@ var KnownHostInboundSystemServices = map[string]bool{
 	"xnm-clear-text":    true,
 	"xnm-ssl":           true,
 	"traceroute":        true,
+	// #3226 fold: the Junos services xpf did not recognize at all. Their
+	// absence was a #3200-class parity gap on its own — a valid vSRX
+	// `system-services r2cp` was hard-rejected at commit — and #3226 made it
+	// load-bearing: scoping `all` to the recognized set meant an authored `all`
+	// stopped admitting them AND the operator could not restore them by naming
+	// the service, because strict validation rejects any token outside this map.
+	//
+	// The membership of this map is now derived from Juniper's PUBLISHED YANG
+	// SCHEMA, not from prose reference pages — see
+	// testdata/junos-es-conf-security@2024-01-01.yang.gz for the extract and
+	// its provenance, and TestHostInboundAllUnionMatchesJunosSchema_3226 for the
+	// bidirectional assertion. The prose pages were the reason this set was
+	// wrong three times: they are individually incomplete and mutually
+	// inconsistent (one omits `lsping`, another omits `sip`, several omit
+	// `appqoe` / `tcp-encap` / `lsselfping` / `high-availability`). The YANG
+	// module is the schema the Junos CLI validates against, so it is complete by
+	// construction for a stated release.
+	//
+	// Ports carry two DISTINCT evidence classes, and the distinction is
+	// load-bearing — see HostInboundUnportedSystemServices:
+	//
+	//   reverse-telnet — TCP 2900. PLATFORM DEFAULT: junos-es-conf-system
+	//                    24.4R2 `[edit system services reverse telnet] port`
+	//                    carries an explicit YANG `default "2900"`.
+	//   reverse-ssh    — TCP 2901. PLATFORM DEFAULT: same module,
+	//                    `[edit system services reverse ssh] port`,
+	//                    YANG `default "2901"`.
+	//   lsselfping     — UDP 8503. STANDARDS-ASSIGNED: RFC 7746 §3 ("The UDP
+	//                    Destination Port MUST be lsp-self-ping (8503)") and §6
+	//                    (IANA assignment). Distinct from `lsping` (MPLS echo,
+	//                    UDP 3503) despite the similar name.
+	//   r2cp, rpm,     — NO admit tuple. Recognized at commit, but xpf opens
+	//   tcp-encap,       nothing: for r2cp/rpm Junos documents the port as
+	//   appqoe,          operator-chosen, and for the rest xpf could not find an
+	//   high-availability authoritative tuple. See
+	//                    HostInboundUnportedSystemServices for the per-token
+	//                    evidence and the two reason classes.
+	"r2cp":              true,
+	"reverse-ssh":       true,
+	"reverse-telnet":    true,
+	"rpm":               true,
+	"lsselfping":        true,
+	"tcp-encap":         true,
+	"appqoe":            true,
+	"high-availability": true,
 	"gre":               true,
 }
 
@@ -187,6 +233,326 @@ func HostInboundAllExpansionProtocols() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// HostInboundNonJunosSystemServices is the set of recognized `system-services`
+// tokens that are an xpf EXTENSION rather than a Junos system service, and are
+// therefore excluded from the `system-services all` expansion (#3226).
+//
+// Junos scopes `all` to "traffic from the DEFINED system services available on
+// the Routing Engine" (Juniper, `system-services (Security Zones Host Inbound
+// Traffic)`), and its documented service list contains no raw IP protocol —
+// GRE/ESP/OSPF/PIM/VRRP are reached through `protocols` (or not at all), never
+// through `system-services`. xpf additionally accepts `system-services gre`
+// because some operator configs list it there (see the repo ha-cluster wan
+// zone), mapping it to IP protocol 47. Folding that xpf-only token into the
+// `all` expansion would make `all` silently open a raw IP protocol that Junos's
+// `all` never opens — precisely the over-admit #3226 set out to close. The
+// token stays fully usable; it just has to be listed EXPLICITLY.
+//
+// `r-exec`/`rexec` (TCP/512) is here for the same reason. Juniper's
+// host-inbound service list — zone-level AND interface-level — documents
+// `rlogin` and `rsh` but NOT rexec, so a Junos-correct `all` never opens
+// TCP/512. Unlike the other xpf spellings the token is not a port-neutral
+// alias: `webapi-clear-text`/`webapi-ssl` resolve to the same ports as
+// `http`/`https`, and `ssh-netconf`/`netconf-ssh` to `ssh` ∪ `netconf`, so
+// including them in the expansion widens nothing, whereas 512 is opened by no
+// other token. (`sip` is NOT reclassified: it is a documented vSRX ALG service
+// with its own #3619 disposition and a fail-on-revert port pin in
+// pkg/daemon/host_inbound_parity_test.go.) Listing `r-exec` explicitly still
+// opens 512 — the carve-out narrows `all`, it does not remove the token.
+//
+// This mirrors the HostInboundL2Protocols exclusion on the `protocols all`
+// side (#3311): the set is load-bearing, not decorative — adding an xpf-only
+// service token here (and to KnownHostInboundSystemServices) is the ONLY edit
+// needed to keep it out of the `all` expansion on BOTH enforcement surfaces.
+// The Rust classifier mirrors it via HOST_INBOUND_NON_JUNOS_SERVICES and the
+// #3486 parity test asserts the two sets are equal.
+var HostInboundNonJunosSystemServices = map[string]bool{
+	"gre":    true,
+	"r-exec": true,
+	"rexec":  true,
+}
+
+// HostInboundUnportedSystemServices is the set of recognized JUNOS
+// `system-services` tokens for which xpf has no authoritative host-inbound
+// listening tuple to admit, and therefore synthesizes NO admission tuple
+// (#3226 fold). The two DIFFERENT reasons a token lands here are recorded in
+// HostInboundNoAdmitReason and must not be collapsed into "there is no port":
+// that is true for the operator-configured class and merely UNKNOWN for the
+// unsourced one.
+//
+// These are NOT xpf extensions — they are in Juniper's published schema (see
+// the oracle in host_inbound_tokens_test.go), so they stay in
+// KnownHostInboundSystemServices (a valid vSRX stanza naming them must commit,
+// the #3200 parity rule) and stay in the `system-services all` union (Junos's
+// `all` covers them). They simply contribute no L4Match on any enforcement
+// surface.
+//
+// # This is a CHOICE under uncertainty, not an inference
+//
+// An earlier revision justified the empty mapping by arguing that Juniper's
+// YANG records a `default` wherever a platform default exists, so its absence
+// proved there was none. That generalization is FALSE and has been withdrawn:
+// `[edit system services telnet]` has no port leaf and no default either, yet
+// telnet plainly has a fixed wire tuple, and this very file maps it to TCP/23.
+// The absence of a configuration leaf says nothing about whether a service has
+// a fixed listening port.
+//
+// What is actually true is narrower: for each token below we looked and did not
+// find an authoritative source for a host-inbound listening tuple. That is a gap
+// in our knowledge. Faced with it there are two options, and we pick the second
+// deliberately:
+//
+//	GUESS a port. If the guess is wrong it is wrong in BOTH directions at once —
+//	  it opens a port with no listener (real attack surface on every `all` zone)
+//	  AND still denies the port actually in use. Neither half is visible to the
+//	  operator. An earlier revision did this for two tokens: r2cp udp/28762 (a
+//	  value draft-dubois-r2cp-00 says prototypes merely SUGGESTED, adopted by
+//	  Juniper nowhere) and rpm tcp+udp/7 (the FLOOR of an explicitly
+//	  operator-configured range, not a default).
+//
+//	OPEN NOTHING. Wrong in ONE direction — traffic Junos would admit is denied —
+//	  but the failure is announced at commit (compiler_validate_warn.go), is
+//	  recoverable by the operator without a code change, and never silently
+//	  widens the host's exposure.
+//
+// We choose OPEN NOTHING because its failure mode is one-directional, visible
+// and recoverable, and because a firewall is the wrong place to guess. If an
+// authoritative tuple is found for any token below, move it out of this set with
+// the source recorded — that is a strict improvement and is expected.
+//
+// # Per-token evidence, including what is NOT sourced
+//
+//	r2cp   — `[edit protocols r2cp] server-port` (junos-es-conf-protocols 24.4R2)
+//	         is `range "1 .. 65535"`, i.e. the server port is operator-chosen.
+//	         Transport is UDP by the sibling `client-port port-number`
+//	         description ("UDP port number for R2CP clients") — INDIRECT, and no
+//	         default port is documented. NOT SOURCED: a default listening port.
+//	rpm    — `[edit services rpm probe-server] tcp|udp port`
+//	         (junos-es-conf-services 24.4R2) is "Port number 7 through 65535",
+//	         and Juniper's RPM receiver documentation describes the port as
+//	         explicitly configured. The container is `presence`-gated, so with no
+//	         configuration nothing listens. This is the best-evidenced member of
+//	         the set: the port is genuinely per-deployment, not merely unfound.
+//	tcp-encap — transport is TCP (the feature is IPsec/IKE encapsulated in a TCP
+//	         connection). NOT SOURCED: the listening port. `[edit security
+//	         tcp-encap]` carries no port leaf, and the earlier claim that the
+//	         port comes from the referenced SSL termination profile was an
+//	         inference, not something Juniper documents — it has been withdrawn.
+//	appqoe — the APPQOE ACTIVE probe. NOT SOURCED: transport or port. No
+//	         authoritative host-inbound tuple was found. Note the decoy: UDP/36000
+//	         appears in AppQoE documentation but belongs to the PASSIVE probe,
+//	         which is TRANSIT traffic — Juniper's own guidance is an input filter
+//	         that DISCARDS udp/36000 on non-WAN interfaces, so admitting it
+//	         host-inbound would be doubly wrong.
+//	high-availability — Multinode High Availability (MNHA) inter-node control
+//	         over the interchassis link. NOT SOURCED: transport or port. This is
+//	         the sharpest case, because Juniper's MNHA examples explicitly place
+//	         this token on the ICL zone. MITIGATION: xpf does not implement MNHA;
+//	         its own inter-node HA control plane (heartbeat on the cluster
+//	         control interface, session/config sync over the fabric) rides
+//	         LIFELINE interfaces — fxp0, em0, fab*, plus any configured
+//	         control-interface / fabric-interface (HostInboundLifelineSet, #3277)
+//	         — which BuildZoneHostInboundViews removes before generating
+//	         host-inbound deny sets. So an unported `high-availability` cannot
+//	         break xpf's own HA. It would bite only an operator carrying a Junos
+//	         MNHA config onto a non-lifeline zone, who gets the commit advisory.
+//
+// The Rust classifier mirrors this set via HOST_INBOUND_UNPORTED_SERVICES and
+// the #3486 parity test asserts the two sets are equal, so a future edit that
+// teaches one surface a port without the other cannot go unnoticed. The
+// operator-facing consequence — including which escape hatches actually work on
+// which enforcement surface — is in docs/host-inbound-service-matrix.md.
+var HostInboundUnportedSystemServices = map[string]bool{
+	"r2cp":              true,
+	"rpm":               true,
+	"tcp-encap":         true,
+	"appqoe":            true,
+	"high-availability": true,
+}
+
+// The two REASONS a recognized Junos service ends up in
+// HostInboundUnportedSystemServices. They are epistemically different and must
+// not be conflated: one is a positive fact about how Junos defines the service,
+// the other is an admission about the limits of our sourcing. Folding them into
+// one undifferentiated set implies they were all established the same way, which
+// is the overstatement pattern this fold keeps having to correct.
+const (
+	// HostInboundNoPortOperatorConfigured: Junos DOCUMENTS the listening port as
+	// chosen by the operator, over a range, with no platform default. There is no
+	// "correct port" for xpf to admit — not because we failed to find it, but
+	// because the service does not have one until the operator configures it.
+	// Restoring a port for these services is not an available option; the only
+	// choice is between a guess and nothing.
+	HostInboundNoPortOperatorConfigured = "operator-configured port"
+
+	// HostInboundNoPortUnsourced: xpf could NOT find an authoritative
+	// host-inbound listening tuple. This is an admission of ignorance, not a
+	// finding. The service may well have a fixed port that we did not locate. If
+	// one is found, move the token out of HostInboundUnportedSystemServices with
+	// the source recorded — that is a strict improvement and is expected.
+	HostInboundNoPortUnsourced = "no authoritative tuple found"
+)
+
+// HostInboundNoAdmitReason gives the REASON class for every token in
+// HostInboundUnportedSystemServices. The two sets are held in bijection by
+// TestHostInboundUnportedJunosServicesCommit_3226, so a token cannot be added to
+// the no-admit set without stating WHY it is there.
+//
+// The distinction is operator-visible: the commit advisory words itself
+// differently for the two classes, because the operator's situation differs. For
+// an operator-configured port they know their own port and can act on it
+// directly; for an unsourced service nobody knows the port, including us.
+var HostInboundNoAdmitReason = map[string]string{
+	// Juniper's RPM receiver documentation describes the probe-server port as
+	// explicitly configured, and `[edit services rpm probe-server] tcp|udp port`
+	// (junos-es-conf-services 24.4R2) is "Port number 7 through 65535". The
+	// container is presence-gated, so with no configuration nothing listens at
+	// all. An earlier revision admitted tcp+udp/7 — the range FLOOR, not a
+	// default.
+	"rpm": HostInboundNoPortOperatorConfigured,
+	// `[edit protocols r2cp] server-port` (junos-es-conf-protocols 24.4R2) is
+	// `range "1 .. 65535"`, operator-chosen, no default. Transport is UDP by the
+	// sibling `client-port port-number` description ("UDP port number for R2CP
+	// clients") — INDIRECT evidence, and moot while no port is admitted.
+	// udp/28762, carried by an earlier revision, appears only in
+	// draft-dubois-r2cp-00, which calls it a value prototypes SUGGESTED.
+	"r2cp": HostInboundNoPortOperatorConfigured,
+	// Transport is TCP (the feature encapsulates IKE/ESP in a TCP connection).
+	// No DEFAULT listening port is documented. The closest Juniper evidence is
+	// the sample output of `show security tcp-encap connection detail`, whose
+	// "Local Gateway" (the SRX side) appears as 10.4.0.2:443 in one session and
+	// 10.4.0.2:500 in another — so the vendor's own example shows TWO different
+	// listening ports and its Output Fields table never documents the port
+	// component at all. `[edit security tcp-encap]` exposes only profile /
+	// ssl-profile / log / traceoptions, and `services ssl termination profile`
+	// has no port option and no documented default either; an earlier revision
+	// claimed the port comes from that profile, which was an inference Juniper
+	// does not state, and it is withdrawn. TCP/443 is CONVENTION — the NCP Path
+	// Finder client guide describes falling back to "TCP encapsulation of IPsec
+	// with SSL header (via port 443)", but that is the CLIENT vendor describing
+	// client behaviour, and Juniper's own Secure Connect guide never mentions
+	// 443 at all. A sample and a third-party convention are not a default, so
+	// this stays unsourced rather than being promoted to an admit.
+	//
+	// Practical note for operators: TCP/443 is ALREADY in the `all` union via
+	// `https` / `webapi-ssl`, so on an `all` zone the observable gap is
+	// narrower than it looks — it is the non-443 case (e.g. the TCP/500 the
+	// same sample shows) that is actually denied.
+	"tcp-encap": HostInboundNoPortUnsourced,
+	// The APPQOE ACTIVE probe. Neither transport nor port sourced: Juniper
+	// describes the active probe only as "custom packets are sent between spoke
+	// and hub points on all the multiple routes", and `active-probe-params`
+	// exposes probe-count / probe-interval / data-fill / data-size /
+	// dscp-code-points / enable-sla-export / per-packet-loss-timeout /
+	// forwarding-class / loss-priority — no port and no transport. The
+	// `show ... sla active-probe-statistics` output fields are addresses and
+	// timings only, with no port column.
+	//
+	// Decoy to avoid: udp/36000 is the only port on the AppQoE page, and it
+	// belongs to the PASSIVE probe — the Limitations section says "An input
+	// firewall filter is required at the non-WAN interfaces to discard UDP
+	// packets with UDP destination port 36000." That is TRANSIT traffic Juniper
+	// tells operators to DISCARD, so admitting it host-inbound would be doubly
+	// wrong.
+	"appqoe": HostInboundNoPortUnsourced,
+	// Multinode High Availability (MNHA) inter-node control over the interchassis
+	// link. Juniper EXPLICITLY ACKNOWLEDGES that a protocol and port exist and
+	// declines to publish them — the MNHA preparation guidance says the ICL
+	// "path uses (whether the ICL is encrypted or not) IP address, protocol, and
+	// port details. You must ensure that this communication is allowed between
+	// the nodes if any firewall or other inspection is in place." That is the
+	// entire published statement; no numbers appear anywhere. A sweep of the
+	// full Junos High Availability User Guide found 12 config examples using
+	// this token and not one port, and every TCP/UDP port in the book belongs to
+	// the generic BFD chapters, not to MNHA. The `show chassis high-availability
+	// information` / `peer-info` outputs carry peer IP, interface,
+	// routing-instance and encryption state — there is no port field.
+	//
+	// Do NOT attribute udp/500+4500 or ESP here. Those belong to the OPTIONAL
+	// `ha-link-encryption`, and Juniper's own MNHA examples admit them through
+	// the SEPARATE `ike` token configured alongside this one. Search summarizers
+	// volunteer that mapping readily; it is wrong.
+	//
+	// What makes it tolerable in xpf specifically: xpf does NOT implement MNHA.
+	// Its inter-node HA control plane is the chassis-cluster model — heartbeat on
+	// the control interface, session/config sync over the fabric — and those ride
+	// LIFELINE interfaces (fxp0, em0, fab*, plus any configured
+	// control-interface / fabric-interface; HostInboundLifelineSet, #3277) which
+	// BuildZoneHostInboundViews removes before generating host-inbound deny sets.
+	// So an unported `high-availability` cannot break xpf's own HA. Naming the
+	// token is, for xpf, a NO-OP: there is no MNHA ICL for it to govern. It bites
+	// only an operator porting a Junos MNHA config onto a non-lifeline zone, who
+	// gets the commit advisory.
+	"high-availability": HostInboundNoPortUnsourced,
+}
+
+// HostInboundAllExpansionServices returns the `system-services` tokens that
+// `host-inbound-traffic system-services all` expands to (#3226): every
+// recognized service (KnownHostInboundSystemServices) EXCEPT the two meta
+// tokens (`all` itself and the `any-service` full-admit escape hatch) and
+// EXCEPT any xpf-only extension token (HostInboundNonJunosSystemServices).
+//
+// Before #3226 `all` was a packet-wide admit on both enforcement surfaces: the
+// nft mirror emitted a bare `<fam> daddr <addrs> accept` with NO catch-all
+// drop and the Rust classifier short-circuited `admits()` to true, so a zone
+// with `system-services all` accepted EVERY IP protocol and port to its local
+// addresses — GRE/ESP/AH/OSPF/PIM/VRRP and any future protocol number
+// included. Junos scopes `all` to the defined system services, so the blanket
+// admit was a superset of the Junos meaning that could mask a missing explicit
+// `protocols` entry. Expanding to a concrete service set (exactly how #3199
+// scoped the sibling `protocols all`) restores the Junos semantics and, because
+// the zone now falls through to the per-match path, re-arms the catch-all
+// host-inbound drop for anything the expansion does not cover.
+//
+// Aliases (http/webapi-clear-text, ike/ipsec, rlogin/r-login, ...) are all
+// included; they resolve to the same L4 tuples and both enforcement surfaces
+// dedup. The one exception is `r-exec`/`rexec`, which is an xpf-only spelling
+// with a port of its OWN (TCP/512, opened by no other token) rather than a
+// port-neutral alias — it is therefore in HostInboundNonJunosSystemServices and
+// excluded, so the expansion opens exactly the ports Juniper's schema-documented
+// service list opens. `ident-reset` is included and keeps its Junos RESET
+// semantics (#3310) rather than becoming an admit. The result is sorted so the
+// expansion — and therefore the rendered nft rule order — is deterministic.
+//
+// The HostInboundUnportedSystemServices tokens (r2cp, rpm, tcp-encap, appqoe,
+// high-availability) ARE included here — they are genuine Junos services and
+// Junos's `all` covers them — but they contribute no L4Match, so they widen the
+// expansion by nothing. Keeping them in rather than filtering them out is what
+// lets the schema-parity test assert the plain, checkable property "every
+// concrete token in Juniper's enumeration is in xpf's `all` union", with the
+// port gap recorded once, in one place, instead of as a second exception list.
+func HostInboundAllExpansionServices() []string {
+	out := make([]string, 0, len(KnownHostInboundSystemServices))
+	for tok := range KnownHostInboundSystemServices {
+		if HostInboundFullAdmitService(tok) || tok == "all" ||
+			HostInboundNonJunosSystemServices[tok] {
+			continue
+		}
+		out = append(out, tok)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// HostInboundServiceTokenExpansion returns the CONCRETE `system-services`
+// tokens a single authored token stands for: the `all` meta-token expands to
+// HostInboundAllExpansionServices (#3226); every other token — including the
+// `any-service` full-admit, which is not a per-service union at all — stands
+// only for itself.
+//
+// Consumers that ask "does this authored service set contain token X?" MUST go
+// through this helper rather than comparing strings, or they will miss the
+// tokens `all` now covers. The #4146 junos-host shield is the load-bearing
+// caller: it has to know that `system-services all` still coarse-admits
+// IKE/NAT-T and still RSTs ident, which before #3226 fell out of the
+// full-admit short-circuit and now falls out of the expansion.
+func HostInboundServiceTokenExpansion(token string) []string {
+	if strings.ToLower(strings.TrimSpace(token)) == "all" {
+		return HostInboundAllExpansionServices()
+	}
+	return []string{token}
 }
 
 // Address-family scoping for host-inbound tokens (#3225). Several Junos
@@ -333,16 +699,47 @@ func hiICMP(proto, typ uint8) L4Match {
 // hostInboundServiceMatches switch and the Rust classify_system_service admit
 // set exactly (docs/host-inbound-service-matrix.md), and applies the same family
 // gate: a family-specific token (HostInboundServiceFamily) returns nil for the
-// wrong family. Full-admit tokens (all / any-service, see
+// wrong family. The full-admit token (any-service, see
 // HostInboundFullAdmitService) and unrecognised tokens return nil — they are not
-// per-tuple matches. The nft builder renders these tuples back to byte-identical
+// per-tuple matches. `all` is NOT in that company since #3226: it returns the
+// WHOLE expansion (see the `case "all":` arm below), because it is now a union
+// of named services rather than a packet-wide admit. A caller reading the old
+// wording would conclude `all` yields no tuples and must therefore be
+// full-admit — exactly the inference this change removes. The nft builder renders these tuples back to byte-identical
 // match fragments (renderHostInboundMatches); the host-inbound classifier tests
 // each tuple against a queried packet tuple.
 func HostInboundServiceMatch(token, family string) []L4Match {
 	if fam, ok := HostInboundServiceFamily[token]; ok && fam != family {
 		return nil
 	}
+	// #3226 fold: a Junos service with no authoritative tuple to admit
+	// synthesizes NO tuple on ANY surface. This gate sits BEFORE the switch deliberately, so
+	// HostInboundUnportedSystemServices is the authoritative statement rather
+	// than a comment: a future edit cannot hand one of these tokens a port
+	// without first removing it from that set (and thereby confronting the
+	// provenance requirement recorded there). Same load-bearing shape as
+	// HostInboundL2Protocols on the `protocols` side (#3311) — with the
+	// difference that an L2 no-op is semantically CORRECT, whereas this one is a
+	// deliberate, documented, fail-closed divergence from Junos.
+	if HostInboundUnportedSystemServices[token] {
+		return nil
+	}
 	switch token {
+	case "all":
+		// #3226: `system-services all` is the union of the DEFINED system
+		// services (Junos: "traffic from the defined system services available
+		// on the Routing Engine"), NOT a packet-wide admit. It expands here —
+		// exactly as `protocols all` does above — so every consumer of this
+		// SSOT (the nft kernel mirror, the netlink builder, the match-policies
+		// classifier) inherits the scoped set with no per-consumer edit, and
+		// the zone falls through to the per-match path that re-arms the
+		// catch-all drop. The expansion never yields `all` (it is filtered out
+		// by HostInboundAllExpansionServices), so this recursion terminates.
+		var out []L4Match
+		for _, s := range HostInboundAllExpansionServices() {
+			out = append(out, HostInboundServiceMatch(s, family)...)
+		}
+		return out
 	case "ssh":
 		return []L4Match{hiTCP(22)}
 	case "telnet":
@@ -404,6 +801,25 @@ func HostInboundServiceMatch(token, family string) []L4Match {
 		return []L4Match{hiTCP(514)}
 	case "r-exec", "rexec":
 		return []L4Match{hiTCP(512)}
+	// #3226 fold — Junos host-inbound services xpf previously did not recognize.
+	// Only the ones with an authoritative port get a tuple; r2cp / rpm /
+	// tcp-encap / appqoe / high-availability have no port xpf can justify
+	// admitting (rpm/r2cp because Junos documents it as operator-chosen, the
+	// rest because it is unsourced) and are gated by
+	// HostInboundUnportedSystemServices above.
+	case "reverse-telnet":
+		// junos-es-conf-system 24.4R2, `[edit system services reverse telnet]
+		// port`: YANG `default "2900"`.
+		return []L4Match{hiTCP(2900)}
+	case "reverse-ssh":
+		// Same module, `[edit system services reverse ssh] port`: YANG
+		// `default "2901"`.
+		return []L4Match{hiTCP(2901)}
+	case "lsselfping":
+		// RFC 7746 §3: "The UDP Destination Port MUST be lsp-self-ping (8503)";
+		// §6 records the IANA assignment. NOT 3503 — that is `lsping` (the MPLS
+		// echo / LSP ping port), a different protocol despite the similar name.
+		return []L4Match{hiUDP(8503)}
 	case "xnm-clear-text":
 		return []L4Match{hiTCP(3221)}
 	case "xnm-ssl":
@@ -483,23 +899,37 @@ func HostInboundProtocolMatch(token, family string) []L4Match {
 }
 
 // HostInboundFullAdmitService reports whether a `system-services` token opens
-// the zone to EVERY host-bound service (Junos `all` / `any-service`). Such a
-// token is not a per-tuple L4Match (HostInboundServiceMatch returns nil for it);
-// the nft builder emits a bare `accept` and the classifier reports admission
-// regardless of the tuple. `protocols all` is deliberately NOT a full admit
-// (#3199) — it expands to the routing-protocol set via HostInboundProtocolMatch.
+// the zone to EVERY host-bound packet regardless of service — since #3226 that
+// is `any-service` ALONE. Such a token is not a per-tuple L4Match
+// (HostInboundServiceMatch returns nil for it); the nft builder emits a bare
+// `accept` with NO catch-all drop and the classifier reports admission
+// regardless of the tuple.
+//
+// `all` is NO LONGER a full admit (#3226). Junos scopes it to "traffic from the
+// defined system services available on the Routing Engine", so it expands to
+// the named-service union via HostInboundAllExpansionServices — the same shape
+// #3199 gave the sibling `protocols all`. Before #3226 both tokens
+// short-circuited here, so a `system-services all` zone accepted every IP
+// protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP and arbitrary future protocol
+// numbers) to its local addresses and emitted no deny at all.
+//
+// `any-service` deliberately stays a full admit: Junos defines it as "all
+// system services on an entire port range INCLUDING the system services that
+// are not defined", i.e. the explicit escape hatch for traffic the named set
+// does not cover. xpf keeps it as the documented (and commit-warned, see
+// compiler_validate_warn.go) packet-wide admit, which also gives operators who
+// relied on the pre-#3226 `all` breadth a one-token migration. Treating it as a
+// SUPERSET of the Junos entire-port-range meaning is the fail-safe direction: it
+// can only over-admit on a token whose whole purpose is to over-admit, never
+// silently deny.
 //
 // The token match is case-insensitive to stay in lockstep with enforcement: the
 // dataplane snapshot (unionHostInboundTokens / lowerTokens in
 // pkg/dataplane/userspace) and the Rust classifier
 // (classify_system_service, host_inbound.rs) both lower-case every token before
-// admitting. A predicate that only matched lower-case `all` would let a
-// lenient-loaded upper-case `ALL` slip past this SSOT while enforcement still
-// full-admits — the #5557 coarse-shield / commit-warning drift.
+// admitting. A predicate that only matched lower-case `any-service` would let a
+// lenient-loaded upper-case `ANY-SERVICE` slip past this SSOT while enforcement
+// still full-admits — the #5557 coarse-shield / commit-warning drift.
 func HostInboundFullAdmitService(token string) bool {
-	switch strings.ToLower(strings.TrimSpace(token)) {
-	case "all", "any-service":
-		return true
-	}
-	return false
+	return strings.ToLower(strings.TrimSpace(token)) == "any-service"
 }

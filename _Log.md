@@ -63856,6 +63856,311 @@ break — `go vet` confirmed passing under every revert.
   is address-matched and a separate surface. Codex re-review of the folded head
   918ea0b95 returned MERGE-READY with no findings.
 - **File(s)**: docs/fabric-cross-chassis-fwd.md, _Log.md
+- **Action**: #3226 — scope `host-inbound-traffic system-services all` to the
+  named system-service union (Junos parity); keep `any-service` as the
+  packet-wide escape hatch. Junos defines `all` as "traffic from the defined
+  system services available on the Routing Engine" and its documented
+  system-service list carries NO raw IP protocol, so the pre-#3226 blanket
+  admit (nft `hostInboundAllowsAll` -> bare `<fam> daddr <addrs> accept` with
+  NO catch-all drop; Rust `all_services` short-circuiting `admits()`) accepted
+  GRE/ESP/AH/OSPF/PIM/VRRP and arbitrary future protocol numbers to any zoned
+  firewall address — a fail-OPEN vs the spec that could mask a missing explicit
+  `protocols` entry. `all` now expands via the SSOT exactly as #3199 scoped
+  `protocols all`, so the zone falls through to the per-match path and the
+  catch-all deny is re-armed. The xpf-only `gre` token is excluded from the
+  expansion (mirroring how HostInboundL2Protocols excludes `isis` from
+  `protocols all`, #3311) and must be listed explicitly. `any-service` keeps
+  the full admit — Junos's own "including the system services that are not
+  defined" escape hatch, and a one-token migration for anyone who relied on the
+  old breadth. Two verdict bugs found and fixed while wiring the expansion:
+  BOTH nft builders keyed the rule verdict on the AUTHORED token, so `all`'s
+  expanded ident-reset tuple would have rendered `tcp dport 113 accept` and
+  ADMITTED ident probes the per-token form resets — the verdict now comes from
+  the expanded token (`HostInboundServiceTokenExpansion`), which is also what
+  keeps the junos-host shield's IKE exemption (fail-CLOSED risk: dropping the
+  IKE it exists to exempt) and its ident carve-out correct for `all`.
+  No-op on every shipped config: each puts `system-services all` on the
+  lifeline-only `control` zone, which contributes no host-inbound addresses
+  (#3277) — independently confirmed by the #4406 compile golden, whose only
+  diff is 12 removals of the now-inapplicable full-admit advisory with ZERO
+  structural change. The commit advisory split accordingly: `any-service` keeps
+  the breadth warning, `all` gets a scoping/upgrade notice gated on the zone
+  owning a non-lifeline interface (ungated it would fire on every cluster
+  commit forever about a guaranteed no-op).
+  Validation: full Go suite green (only the pre-existing, master-identical
+  `TestHeatmapNotStale` fails); full Rust suite 4221 passed; gofmt/clippy clean;
+  mutation-probed on a throwaway detached worktree (Go + Rust arms separately).
+- **File(s)**: pkg/config/{host_inbound_tokens.go,compiler_validate_warn.go,
+    junos_host_deny.go}, pkg/daemon/daemon_nft.go,
+    pkg/nftables/netlink_hostinbound.go,
+    userspace-dp/src/afxdp/forwarding/host_inbound.rs,
+    userspace-dp/src/afxdp/types/forwarding.rs,
+    docs/host-inbound-service-matrix.md, docs/junos-cli-reference.md,
+    pkg/daemon/README.md, plus tests + retargeted admit-all fixtures, _Log.md
+
+- **Timestamp**: 2026-07-31 (fix/3226-system-services-all-scoping, Codex
+  MERGE-NEEDS-MAJOR fold on PR #6616)
+- **Action**: #3226 fold — make the `system-services all` union EQUAL Juniper's
+  defined-service set in BOTH directions, and correct the privileged netlink
+  expectation. Codex round 2 found the scoping was derived from xpf's historical
+  recognized-token list, which is not the same set as Junos's.
+  (1) HIGH, fail-CLOSED: `r2cp`, `reverse-ssh`, `reverse-telnet` and `rpm` are
+  documented on BOTH Juniper host-inbound reference pages (zone-level and
+  interface-level) but were absent from `KnownHostInboundSystemServices`
+  entirely. Scoping `all` therefore stopped admitting four DEFINED services AND
+  left no in-grammar remedy: strict validation
+  (`validateHostInboundStanzaStrict`) rejects any token outside the same
+  allowlist, so an operator could not restore them by naming the service, and
+  `any-service` is materially broader than the one service wanted. All four are
+  now recognized and in the union, at their Junos default ports — r2cp udp/28762
+  (`[edit protocols r2cp] server-port`), reverse-telnet tcp/2900, reverse-ssh
+  tcp/2901 (the `[edit system services reverse]` defaults), rpm tcp+udp/7 (the
+  RPM probe-server port is "7 or 49160 through 65535"; 7 is the only
+  platform-fixed value, and admitting the 16k high range on every `all` zone
+  would trade one over-admit for a larger one).
+  (2) The inverse over-admit: `r-exec`/`rexec` (tcp/512) is NOT on either
+  Juniper page, so a Junos-correct `all` never opens 512. Unlike the other
+  xpf-only spellings it is not a port-neutral alias — `webapi-clear-text`/
+  `webapi-ssl` resolve to the http/https ports and `ssh-netconf`/`netconf-ssh`
+  to ssh union netconf, so including THEM widens nothing, whereas 512 is opened
+  by no other token. It joins `gre` in `HostInboundNonJunosSystemServices` and
+  is excluded from the expansion; listed explicitly it still opens 512. `sip`
+  was deliberately NOT reclassified despite also being absent from the fetched
+  reference pages: it is a vSRX ALG service with a reviewed #3619 disposition
+  and a fail-on-revert port pin, and the fetched pages are demonstrably partial
+  (they also omit `lsping`, which Juniper does define), so narrowing on that
+  evidence would be a fail-CLOSED change on unreliable grounds.
+  (3) MEDIUM: `pkg/nftables/netlink_kernel_test.go` still asserted `mgmt/ip`
+  (a `system-services all` zone) must NOT have a deny counter — the pre-#3226
+  full-admit shape. Under CAP_NET_ADMIN that now FAILS; it passed only because
+  the private-netns tests skip without the capability. Flipped to REQUIRE
+  `mgmt/ip`, and the construct-complete scenario gained an `admin`
+  (`any-service`, dual-stack) view so the bare-accept/no-counter path — now
+  reachable by `any-service` alone — keeps live coverage, with its own
+  must-NOT-have-a-counter assertion.
+- **Validation**: full Go suite green apart from the pre-existing
+  `TestHeatmapNotStale` (fails identically on clean origin/master, issue #6617);
+  full Rust suite green — 4224 + 60 + 8 + 22 + 1 passed, 0 failed; gofmt clean
+  on every touched file; `go vet` clean. The PRIVILEGED netlink leg was actually
+  EXECUTED (`unshare -rn ./nft.test -test.run
+  TestCounterReadbackThroughExistingReaders`) rather than left to CI: PASS with
+  the flipped assertions, and RED with the old `mgmt/ip`-absent assertion
+  restored — direct proof the Codex finding was real, not theoretical.
+  Mutation-probed per-arm in a throwaway detached worktree
+  (`/dev/shm/probe-6616b`), Go and Rust independently, build+vet clean each time
+  so every red is an ASSERTION.
+- **File(s)**: pkg/config/host_inbound_tokens.go,
+    pkg/config/host_inbound_tokens_test.go,
+    pkg/dataplane/userspace/host_inbound_all_scoping_3226_test.go,
+    pkg/daemon/host_inbound_ssot_render_3627_test.go,
+    pkg/nftables/{netlink_kernel_test.go,netlink_scenario_test.go},
+    userspace-dp/src/afxdp/forwarding/{host_inbound.rs,host_inbound_tests.rs},
+    docs/host-inbound-service-matrix.md, docs/junos-cli-reference.md,
+    pkg/daemon/README.md, _Log.md
+
+## 2026-07-31 — #3226 fold r3: derive the system-services union from Juniper's YANG schema
+
+- **Timestamp**: 2026-07-31
+- **Action**: Fold the Codex MAJOR on PR #6616. Replace the hand-transcribed
+  `system-services` oracle with one DERIVED from Juniper's published YANG
+  schema, add the four further missing tokens the prose pages omitted, and stop
+  synthesizing unverified ports.
+- **Findings**:
+  - Authoritative source: `junos-es-conf-security@2024-01-01.yang` (revision
+    description `"Junos: 24.4R2.25"`), grouping
+    `zone-system-services-object-type`. 37 tokens. The sibling
+    `interface-system-services-object-type` grouping is IDENTICAL, 25.4R1 is
+    identical, 20.4R1 differs only by lacking `lsselfping`.
+  - Codex named 2 missing tokens (`appqoe`, `tcp-encap`); the schema shows **4**
+    (`lsselfping` and `high-availability` too) — confirming the prose pages were
+    the wrong oracle, not just an incomplete one.
+  - `sip` IS in the schema, vindicating r2's refusal to narrow it.
+  - `r-exec`/`rexec`, `gre`, `r-login`, `r-sh`, `ssh-netconf`/`netconf-ssh`,
+    `ipsec` are NOT in the schema — the rexec/gre carve-outs stand.
+  - Ports: `reverse-telnet` tcp/2900 and `reverse-ssh` tcp/2901 carry explicit
+    YANG `default` statements; `lsselfping` is udp/8503 per RFC 7746 §3/§6.
+    `r2cp`, `rpm`, `tcp-encap`, `appqoe`, `high-availability` have NO
+    platform-fixed port — verified firsthand against the protocols/services/
+    security/chassis YANG modules. r2's udp/28762 (r2cp) and tcp+udp/7 (rpm)
+    were a draft SUGGESTION and a range FLOOR respectively; both removed.
+- **File(s)**:
+  - `pkg/config/testdata/junos-24.4R2-host-inbound-system-services.txt` (NEW —
+    vendored schema extract + provenance + verified-reproducible regen command)
+  - `pkg/config/host_inbound_tokens.go` (4 new tokens;
+    `HostInboundUnportedSystemServices` SSOT + load-bearing gate; ports)
+  - `pkg/config/host_inbound_tokens_test.go` (oracle derived from the extract;
+    fail-open direction restated over atomic (proto, port) openings)
+  - `pkg/config/host_inbound_rust_parity_test.go` (unported-set parity + a
+    source-level "the Rust unported arm inserts no port" contract)
+  - `pkg/config/compiler_validate_warn.go` (commit advisory on explicit naming)
+  - `pkg/config/host_inbound_fulladmit_warn_3226_test.go` (advisory test)
+  - `pkg/daemon/host_inbound_parity_test.go` (unported carve-out, no-op assert)
+  - `pkg/daemon/host_inbound_ssot_render_3627_test.go` (golden refresh)
+  - `pkg/dataplane/userspace/host_inbound_all_scoping_3226_test.go` (verdict)
+  - `userspace-dp/src/afxdp/forwarding/host_inbound.rs` (+tests.rs) (Rust mirror)
+  - `docs/host-inbound-service-matrix.md`, `docs/junos-cli-reference.md`,
+    `pkg/daemon/README.md`
+- **Validation**: `go test ./...` — 58 packages ok, only the known pre-existing
+  `TestHeatmapNotStale` (#6617) fails. `cargo test` — 4225+60+8+22+1 passed, 0
+  failed. gofmt clean on every changed file. Per-arm mutation proofs (Go and
+  Rust separately) run in a throwaway detached worktree.
+
+## 2026-07-31 — #3226 fold r4: real YANG derivation; withdraw the invalid no-port inference
+
+- **Timestamp**: 2026-07-31
+- **Action**: Fold the second Codex MAJOR round on PR #6616 (three findings).
+- **Finding 1 — the oracle was still a hand-maintained literal.** r3 vendored only
+  the EXTRACTED TOKEN LIST; the test read it directly, never parsing the YANG,
+  never checking the recorded SHA-256. Codex showed that deleting `appqoe` from
+  both the fixture and the implementations stayed GREEN. Fixed by vendoring the
+  MODULE itself (gzipped, 97 KB) and having the test parse it under three gates:
+  a SHA-256 pin on the decompressed bytes (equal to the upstream file's hash),
+  real brace-matched grouping extraction, and an independent token-count pin.
+  The zone-vs-interface grouping agreement is now ENFORCED, not commented.
+- **Finding 2 — the "positive evidence" argument was logically invalid.** r3
+  claimed YANG records a `default` wherever a platform default exists, so its
+  absence proved there was none. Codex refuted it: `[edit system services
+  telnet]` has no port leaf either, yet telnet is TCP/23. The generalization is
+  WITHDRAWN everywhere it appeared (Go SSOT, Go tests, Rust const, Rust tests,
+  matrix doc). The five no-admit services are now justified as an explicit
+  CHOICE under uncertainty, and split into two labelled classes
+  (`HostInboundNoAdmitReason`, held in bijection with the no-admit set by test):
+    - operator-configured port (`rpm`, `r2cp`) — Junos documents the port as
+      operator-chosen over a range with no default, so there is no correct port
+      to admit and restoring one is not an available option;
+    - unsourced (`tcp-encap`, `appqoe`, `high-availability`) — we did not find
+      the tuple, which is an admission, not a finding.
+  The commit advisory now words itself differently per class.
+- **Finding 3 — the advertised escape hatch did not work.** The advisory told
+  operators to "admit the real port with a firewall filter". Verified firsthand:
+  on the kernel path `xpf_lo0` (hook-input priority 0) runs BEFORE
+  `xpf_hostinbound` (10), so a filter accept DOES rescue; but on the AF_XDP
+  local-delivery path #3485 deliberately runs host-inbound FIRST and never
+  evaluates lo0 after a deny, so a filter CANNOT rescue there. Advisory rewritten
+  to lead with `any-service` (the only both-surface escape) and to qualify the
+  lo0 remedy as kernel-path-only. Reordering the userspace path is explicitly
+  NOT the fix (it would revert codex-review-118 M1) and is recorded as such.
+- **File(s)**:
+  - `pkg/config/testdata/junos-es-conf-security@2024-01-01.yang.gz` (NEW, vendored
+    module, `gzip -9 -n` so it is byte-reproducible)
+  - `pkg/config/testdata/junos-24.4R2-host-inbound-system-services.txt` (DELETED —
+    the literal that called itself derived)
+  - `pkg/config/host_inbound_tokens.go` (withdraw the inference; add
+    `HostInboundNoAdmitReason` + the two class constants)
+  - `pkg/config/host_inbound_tokens_test.go` (gunzip + SHA-256 gate + real
+    grouping parse + count pin + enforced zone/interface agreement + reason
+    bijection)
+  - `pkg/config/compiler_validate_warn.go` (per-class advisory wording; corrected
+    escape-hatch text)
+  - `pkg/config/host_inbound_fulladmit_warn_3226_test.go` (pin both)
+  - `pkg/dataplane/userspace/host_inbound_all_scoping_3226_test.go`,
+    `userspace-dp/src/afxdp/forwarding/host_inbound.rs` (+`_tests.rs`)
+  - `docs/host-inbound-service-matrix.md`, `docs/junos-cli-reference.md`,
+    `pkg/daemon/README.md`
+- **Validation**: `go test ./...`, `cargo test`, gofmt clean on changed files,
+  per-arm mutation proofs (Go and Rust separately) in a throwaway detached
+  worktree — including the exact case Codex showed passing: deleting a token from
+  the vendored oracle now REDs.
+
+## 2026-07-31 — #3226 fold r5: withdraw the lo0 escape hatch (nft accept is not terminal for the hook)
+
+- **Timestamp**: 2026-07-31
+- **Action**: Fold the third Codex MAJOR round on PR #6616.
+- **Blocking finding — the r4 "kernel path only" qualification was still false.**
+  r4 reasoned that because `xpf_lo0` is hook-input priority 0 and
+  `xpf_hostinbound` is 10, an lo0 `accept` terminates before the host-inbound
+  backstop. The priorities are right; the inference is wrong. In nftables
+  `accept` ends the current BASE CHAIN, not the hook — nftables(8): "An accept
+  verdict ... ends the evaluation of the current base chain. ... The packet
+  advances to the next base chain", whereas only `drop` "immediately ends the
+  evaluation of the whole ruleset". Verified the wording firsthand against the
+  netfilter manpage. So the packet still traverses xpf_hostinbound at priority 10
+  and still hits its catch-all drop: an lo0 filter rescues NOTHING on EITHER
+  surface. Chose to WITHDRAW the remedy rather than narrow it again — the
+  alternative (a mark set in xpf_lo0 and tested in xpf_hostinbound, or merging
+  the chains) is a new security mechanism that lets an lo0 filter override the
+  zone host-inbound default-deny, needs its own threat review, and would STILL
+  not help on AF_XDP without reordering #3485.
+  - The string assertion that pinned the false statement is replaced by
+    (a) a NEGATIVE guard that the refuted remedy is ABSENT, and (b) a
+    BEHAVIOURAL bind that the remedy the advisory does name works: `any-service`
+    is a full-admit token, so no catch-all drop is emitted at all.
+- **Advisory bug**: a stanza with both `any-service` and an unported token
+  emitted a self-contradicting pair (one warning that any-service admits
+  everything, another that rpm is DENIED and to add any-service). The unported
+  advisory is now suppressed when the stanza already carries a full-admit token.
+- **MAJOR 2 residue swept**: 14 sites across Go, Rust, tests and docs still
+  asserted the stronger "NO platform-fixed port" / "Junos fixes no port", which
+  contradicts the `unsourced` class that says a fixed port may exist and we did
+  not find it. All reworded to "xpf has no authoritative listening port".
+- **X==X removed**: `host_inbound_match_3627_test.go` rebuilt the expected `all`
+  result by iterating `HostInboundAllExpansionServices()` and concatenating
+  `HostInboundServiceMatch(tok, fam)` — exactly what production's `all` branch
+  does — while its comment claimed to be "derived independently". Replaced with
+  a hard-coded literal of the atomic (proto, port) openings `all` grants, with
+  the 90-port traceroute range collapsed and asserted separately. Verified it
+  binds: moving reverse-telnet 2900 -> 2999 REDs in both directions.
+- **File(s)**: `pkg/config/compiler_validate_warn.go`,
+  `pkg/config/host_inbound_fulladmit_warn_3226_test.go`,
+  `pkg/config/host_inbound_match_3627_test.go`,
+  `pkg/config/host_inbound_tokens.go`, `pkg/config/host_inbound_tokens_test.go`,
+  `pkg/config/host_inbound_rust_parity_test.go`,
+  `pkg/daemon/host_inbound_ssot_render_3627_test.go`, `pkg/daemon/README.md`,
+  `pkg/dataplane/userspace/host_inbound_all_scoping_3226_test.go`,
+  `userspace-dp/src/afxdp/forwarding/host_inbound.rs` (+`_tests.rs`),
+  `docs/host-inbound-service-matrix.md`, `docs/junos-cli-reference.md`
+- **Validation**: `go test ./...` 58 ok, only pre-existing #6617. `cargo test`
+  4225 passed, 0 failed. gofmt clean. Per-arm mutation proofs in a throwaway
+  detached worktree.
+
+## 2026-07-31 — #3226 fold r6: finish the withdrawal, widen the guard, unify the advisory input
+
+- **Timestamp**: 2026-07-31
+- **Action**: Fold the fourth Codex round on PR #6616 (2 MAJOR + 1 MINOR).
+- **MAJOR 1 — the lo0 withdrawal was incomplete.** Two live sites survived:
+  `docs/host-inbound-service-matrix.md:366` still told operators to admit the
+  service "with an explicit firewall filter on the real port" AND claimed the
+  commit advisory said so (both false), and a test comment at
+  `host_inbound_fulladmit_warn_3226_test.go:275` still affirmed the rescue
+  "works on the kernel path only". Both fixed.
+  - ROOT CAUSE: the negative guard asserted the refuted phrasing was absent from
+    the ADVISORY STRING, but the claim lives in the operator doc too — a guard
+    narrower than the claim it protects. WIDENED: the doc's refutational
+    material is now fenced with `REFUTED-REMEDY:BEGIN/END` and a new test
+    (`TestHostInboundMatrixDocDoesNotAdviseTheRefutedRemedy`) asserts the
+    refuted phrasing appears ONLY inside the fence, with an anti-vacuity check
+    that the fence actually contains the refutation and that live guidance still
+    names `any-service`.
+- **MAJOR 2 — absolute-port sweep finished.** Six more sites flattened all five
+  tokens into the disproven "Junos fixes no port" (`host_inbound_tokens.go`,
+  two in `pkg/dataplane/userspace`, `pkg/daemon/host_inbound_parity_test.go`,
+  `host_inbound_tokens_test.go`), plus a Rust comment that actively
+  CONTRADICTED the classification by describing `tcp-encap` as using an
+  "operator-chosen SSL termination port" — the operator-configured class for a
+  token classified unsourced. All reworded.
+- **MINOR 3 — fixed structurally, not case by case.** The three advisory passes
+  ran per RAW STANZA while enforcement UNIONS zone and interface tokens
+  (additive Junos semantics), so the advisory reasoned about a different object
+  than the enforcer. Now both consume `config.UnionHostInboundTokens` — which
+  already existed as the display-side peer — and the dataplane's
+  `unionHostInboundTokens` delegates to it (keeping a local `lowerDedup` so the
+  lower-cased dedup semantics are byte-identical to before). The scoping and
+  unported advisories are suppressed whenever the EFFECTIVE set full-admits,
+  including the zone-level case where every interface overrides with a
+  full-admit. Closes `any-service + all`, zone `any-service` + interface `rpm`,
+  and the inverse.
+- **File(s)**: `docs/host-inbound-service-matrix.md`,
+  `pkg/config/compiler_validate_warn.go`, `pkg/config/host_inbound_view.go`,
+  `pkg/config/host_inbound_fulladmit_warn_3226_test.go`,
+  `pkg/config/host_inbound_tokens.go`, `pkg/config/host_inbound_tokens_test.go`,
+  `pkg/daemon/host_inbound_parity_test.go`,
+  `pkg/dataplane/userspace/zones_override.go`,
+  `pkg/dataplane/userspace/host_inbound_all_scoping_3226_test.go`,
+  `userspace-dp/src/afxdp/forwarding/host_inbound_tests.rs`
+- **Validation**: `go test ./...` 58 ok, only pre-existing #6617. `cargo test`
+  4225+60+8+22+1 passed, 0 failed — no linker SIGBUS on this host, the Rust leg
+  linked and ran normally. gofmt clean. Per-arm mutation proofs in a throwaway
+  detached worktree.
 - **Timestamp**: 2026-07-31 (fix/6541-kernel-gate-explicit-path)
 - **Action**: #6541 — the A/B kernel promote/rollback gate PATH-resolved a bare
   `xpfd`. `realKernelSystem.VerifyDataplane` ran `exec.Command("xpfd",

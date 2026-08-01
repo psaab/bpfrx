@@ -964,8 +964,19 @@ func junosHostSvcAdmitsIKE(svc []string) bool {
 		// enforcement yet missed here, so the coarse `application any` shield
 		// drops the very IKE/NAT-T it was supposed to exempt (#5557).
 		s = strings.ToLower(strings.TrimSpace(s))
-		if s == "ike" || s == "ipsec" || HostInboundFullAdmitService(s) {
+		if HostInboundFullAdmitService(s) {
 			return true
+		}
+		// #3226: `all` is no longer a full admit — it EXPANDS to the named
+		// system-service union, which contains `ike`/`ipsec` (udp 500/4500).
+		// Walk the expansion rather than string-comparing the authored token,
+		// or an `all` zone loses its IKE exemption here while enforcement still
+		// admits IKE, and the coarse `application any` shield drops the very
+		// IKE/NAT-T it exists to exempt — the #5565 failure mode, reopened.
+		for _, e := range HostInboundServiceTokenExpansion(s) {
+			if e == "ike" || e == "ipsec" {
+				return true
+			}
 		}
 	}
 	return false
@@ -1028,8 +1039,15 @@ func junosHostZoneExemptNetdevs(cfg *Config, zoneName string, zone *ZoneConfig, 
 			if HostInboundFullAdmitService(s) {
 				v.fullAdmit = true
 			}
-			if s == "ident-reset" {
-				v.ident = true
+			// #3226: walk the expansion so `all` — which now stands for the
+			// named-service union INCLUDING ident-reset — still marks the
+			// netdev as answering TCP/113 with a RST. Comparing the authored
+			// token alone would silently drop the ident-reset exception on
+			// every `all` zone the moment `all` stopped being a full admit.
+			for _, e := range HostInboundServiceTokenExpansion(s) {
+				if e == "ident-reset" {
+					v.ident = true
+				}
 			}
 		}
 	}

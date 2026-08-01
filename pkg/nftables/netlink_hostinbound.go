@@ -286,11 +286,18 @@ func hostInboundMatchFragments(v HostInboundZoneView, f nlFamily) []hiFragment {
 		seen[frag.key] = true
 		out = append(out, frag)
 	}
+	// #3226: mirror the oracle — expand each authored token to the concrete
+	// services it stands for (`all` → the named-service union) and take the
+	// reject verdict from the CONCRETE token. Keying `reject` on the AUTHORED
+	// token would render `all`'s expanded tcp/113 fragment as an ACCEPT, since
+	// `all` != "ident-reset", admitting ident probes the per-token form resets.
 	for _, s := range v.SystemServices {
-		reject := s == "ident-reset"
-		for _, frag := range renderHIMatchFragments(config.HostInboundServiceMatch(s, family), f) {
-			frag.reject = reject
-			add(frag)
+		for _, sub := range config.HostInboundServiceTokenExpansion(s) {
+			reject := sub == "ident-reset"
+			for _, frag := range renderHIMatchFragments(config.HostInboundServiceMatch(sub, family), f) {
+				frag.reject = reject
+				add(frag)
+			}
 		}
 	}
 	for _, prot := range v.Protocols {

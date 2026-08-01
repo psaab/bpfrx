@@ -35,10 +35,26 @@ func hostInboundScenario() HostInboundSpec {
 				V6Addrs:        []string{"2001:db8:1::1"},
 			},
 			{
-				// system-services all -> bare accept, no drop/counter.
+				// #3226: `system-services all` is the named-service UNION, not
+				// a full admit. It renders the same per-match rules any
+				// explicit service list would (tcp/udp dport sets, icmp
+				// echo-request, the ident-reset tcp/113 reject) and therefore
+				// keeps its catch-all drop + deny counter. Before #3226 this
+				// zone was the bare-accept/no-counter case — that construct
+				// moved to the `admin` (any-service) view below, which is now
+				// the ONLY full-admit token.
 				Zone:           "mgmt",
 				SystemServices: []string{"all"},
 				V4Addrs:        []string{"10.0.9.1"},
+			},
+			{
+				// system-services any-service -> bare accept, no drop/counter.
+				// Keeps the full-admit construct covered after #3226 moved
+				// `all` off it (dual-stack so both family arms are exercised).
+				Zone:           "admin",
+				SystemServices: []string{"any-service"},
+				V4Addrs:        []string{"10.0.10.1"},
+				V6Addrs:        []string{"2001:db8:10::1"},
 			},
 			{
 				// protocols all -> routing-protocol set (meta l4proto, tcp, udp).

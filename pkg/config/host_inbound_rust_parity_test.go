@@ -212,6 +212,149 @@ func TestHostInboundRustClassifierMatchesGoSSOT(t *testing.T) {
 	rustL2 := rustArrayTokens(l2Section)
 	assertSameSet(t, "L2 protocols (HOST_INBOUND_L2_PROTOCOLS vs HostInboundL2Protocols)",
 		goKeySet(HostInboundL2Protocols), rustL2)
+
+	// #3226: KNOWN_SYSTEM_SERVICE_TOKENS = KnownHostInboundSystemServices minus
+	// the two meta tokens (`all` is the recursion entry handled by the
+	// classify_system_service arm; `any-service` is the full-admit
+	// short-circuit). This list is what the Rust `system-services all`
+	// expansion is derived FROM, so a token present on only one side would make
+	// the two enforcement layers expand `all` differently — a split-brain that
+	// the arm-set assertion above cannot see, because both sides still
+	// RECOGNIZE the token.
+	knownSvcSection := rustSection(t, src,
+		"KNOWN_SYSTEM_SERVICE_TOKENS: &[&str] = &[", "];")
+	rustKnownSvc := rustArrayTokens(knownSvcSection)
+	wantSvc := goKeySet(KnownHostInboundSystemServices)
+	delete(wantSvc, "all")
+	delete(wantSvc, "any-service")
+	assertSameSet(t, "system-service tokens (KNOWN_SYSTEM_SERVICE_TOKENS vs KnownHostInboundSystemServices\\{all,any-service})",
+		wantSvc, rustKnownSvc)
+
+	// #3226: HOST_INBOUND_NON_JUNOS_SERVICES = config.HostInboundNonJunosSystem
+	// Services — the xpf-only extension set EXCLUDED from the `system-services
+	// all` expansion. Drift here means one layer's `all` opens a raw IP protocol
+	// the other's does not.
+	nonJunosSection := rustSection(t, src,
+		"HOST_INBOUND_NON_JUNOS_SERVICES: &[&str] = &[", "];")
+	rustNonJunos := rustArrayTokens(nonJunosSection)
+	assertSameSet(t, "non-Junos services (HOST_INBOUND_NON_JUNOS_SERVICES vs HostInboundNonJunosSystemServices)",
+		goKeySet(HostInboundNonJunosSystemServices), rustNonJunos)
+
+	// #3226 fold: HOST_INBOUND_UNPORTED_SERVICES = config.HostInboundUnported
+	// SystemServices — the Junos services xpf has no authoritative listening
+	// tuple for, which are recognized and stay in the `all` union but synthesize
+	// NO admit tuple. Drift here is a split-brain of the worst shape: one layer would
+	// invent a port for a service the other denies entirely, so a zone would
+	// admit on the kernel path what the AF_XDP path drops (or vice versa) on a
+	// port neither can justify.
+	unportedSection := rustSection(t, src,
+		"HOST_INBOUND_UNPORTED_SERVICES: &[&str] =", "];")
+	rustUnported := rustArrayTokens(unportedSection)
+	assertSameSet(t, "unported services (HOST_INBOUND_UNPORTED_SERVICES vs HostInboundUnportedSystemServices)",
+		goKeySet(HostInboundUnportedSystemServices), rustUnported)
+}
+
+// TestHostInboundRustUnportedServicesInsertNoPort_5715 is the cross-LANGUAGE
+// PORT contract for the #3226 unported set. TestHostInboundRustClassifierMatches
+// GoSSOT proves both layers agree on WHICH services are unported; this proves the
+// Rust classifier actually inserts nothing for them.
+//
+// Without it, the Rust arm could grow a `hi.udp_ports.insert(28762)` while the
+// const still listed `r2cp` as unported — the set assertion would stay green and
+// the AF_XDP path would open a port the kernel path denies, on a value Juniper
+// never published. The Go side is pinned by
+// TestHostInboundUnportedJunosServicesCommit_3226 and the behaviour on the Rust
+// side by `unported_services_admit_nothing_3226`; this closes the source-level
+// gap between them.
+//
+// FAIL-ON-REVERT: add any `hi.*_ports.insert(...)` / `hi.ip_protocols.insert(...)`
+// to the unported arm and this goes RED naming the token.
+func TestHostInboundRustUnportedServicesInsertNoPort_5715(t *testing.T) {
+	raw, err := os.ReadFile(hostInboundRustSource)
+	if err != nil {
+		t.Fatalf("reading Rust host-inbound classifier %s: %v", hostInboundRustSource, err)
+	}
+	src := rustStripComments(string(raw))
+	svcSection := rustSection(t, src, "fn classify_system_service(", "fn classify_protocol(")
+
+	if len(HostInboundUnportedSystemServices) == 0 {
+		t.Fatal("HostInboundUnportedSystemServices is empty — this contract would be vacuous")
+	}
+	// The arm body from each unported token's literal up to the arm's closing
+	// brace. `[^}]*` cannot cross the arm boundary, so an insert found here
+	// belongs to THIS arm.
+	insertRe := regexp.MustCompile(`(?:tcp_ports|udp_ports|udp_ports_v4|udp_ports_v6|ip_protocols|icmp_types_v4|icmp_types_v6)\.insert`)
+	for tok := range HostInboundUnportedSystemServices {
+		armRe := regexp.MustCompile(`"` + regexp.QuoteMeta(tok) + `"([^}]*)\}`)
+		m := armRe.FindStringSubmatch(svcSection)
+		if m == nil {
+			t.Errorf("no classify_system_service arm found for unported token %q — it must stay a "+
+				"recognized (empty) arm so the token-set parity contract still covers it", tok)
+			continue
+		}
+		if loc := insertRe.FindString(m[1]); loc != "" {
+			t.Errorf("the classify_system_service arm containing %q performs a %s — an unported "+
+				"service must admit NOTHING (xpf has no authoritative port for it, #3226)", tok, loc)
+		}
+	}
+}
+
+// TestHostInboundAllExpansionMatchesRust_3226 is the BEHAVIOURAL half of the
+// `system-services all` parity contract. TestHostInboundRustClassifierMatchesGo
+// SSOT proves the two layers recognize the same TOKENS; this proves they expand
+// `all` to the same SET. Without it, one layer could exclude a token from the
+// expansion (or fail to) while both still list it, so an `all` zone would admit
+// a service on the kernel path that the AF_XDP path denies — exactly the
+// split-brain #3200 exists to prevent, on the surface #3226 created.
+//
+// The Rust expansion is recomputed from its own source text
+// (KNOWN_SYSTEM_SERVICE_TOKENS minus HOST_INBOUND_NON_JUNOS_SERVICES, the
+// definition of `system_service_all_expansion`), so the two sides are derived
+// independently.
+func TestHostInboundAllExpansionMatchesRust_3226(t *testing.T) {
+	raw, err := os.ReadFile(hostInboundRustSource)
+	if err != nil {
+		t.Fatalf("reading Rust host-inbound classifier %s: %v", hostInboundRustSource, err)
+	}
+	src := rustStripComments(string(raw))
+
+	rustKnown := rustArrayTokens(rustSection(t, src,
+		"KNOWN_SYSTEM_SERVICE_TOKENS: &[&str] = &[", "];"))
+	rustNonJunos := rustArrayTokens(rustSection(t, src,
+		"HOST_INBOUND_NON_JUNOS_SERVICES: &[&str] = &[", "];"))
+	rustExpansion := map[string]bool{}
+	for tok := range rustKnown {
+		if !rustNonJunos[tok] {
+			rustExpansion[tok] = true
+		}
+	}
+
+	goExpansion := map[string]bool{}
+	for _, tok := range HostInboundAllExpansionServices() {
+		goExpansion[tok] = true
+	}
+
+	assertSameSet(t, "`system-services all` expansion (Rust system_service_all_expansion vs Go HostInboundAllExpansionServices)",
+		goExpansion, rustExpansion)
+
+	// The expansion must be non-trivial and must exclude the meta tokens, or
+	// the equality above could hold vacuously / recurse forever.
+	if len(goExpansion) < 10 {
+		t.Fatalf("`all` expansion has only %d tokens — contract looks vacuous: %v", len(goExpansion), sortedKeys(goExpansion))
+	}
+	for _, meta := range []string{"all", "any-service"} {
+		if goExpansion[meta] {
+			t.Errorf("`all` expansion must not contain the meta token %q", meta)
+		}
+	}
+	// gre is recognized on BOTH sides yet excluded from BOTH expansions — the
+	// property that makes the non-Junos set load-bearing rather than decorative.
+	if !KnownHostInboundSystemServices["gre"] || !rustKnown["gre"] {
+		t.Errorf("gre must stay a recognized system-service on both sides (so the exclusion is meaningful)")
+	}
+	if goExpansion["gre"] || rustExpansion["gre"] {
+		t.Errorf("gre must be excluded from the `all` expansion on BOTH sides (#3226)")
+	}
 }
 
 // rustArmInsertPortRe captures the tcp-port the classify_system_service arm

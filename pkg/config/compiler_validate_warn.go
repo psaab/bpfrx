@@ -317,25 +317,25 @@ func ValidateConfig(cfg *Config) []string {
 		}
 	}
 
-	// #3226: `system-services all` / `any-service` is a packet-wide host-inbound
+	// #3226: `system-services any-service` is a packet-wide host-inbound
 	// full-admit, NOT a union of the known system-service tokens. On BOTH
 	// enforcement layers (the nft kernel mirror `hostInboundAllowsAll` →
 	// `<fam> daddr <addrs> accept` with no catch-all drop, and the Rust AF_XDP
 	// classifier `all_services` short-circuit) it accepts EVERY IP protocol/port
 	// — GRE/ESP/AH/OSPF/PIM/VRRP and arbitrary future protocol numbers — to the
-	// zone's local firewall addresses. That is a SUPERSET of the Junos meaning
-	// (`all` = the union of the *named* system-services). The breadth is
-	// deliberate and documented (#3199 kept these two tokens as a full-admit
-	// while scoping the sibling `protocols all` to the routing-protocol set), so
-	// this is a WARNING, never a reject — `system-services all` is valid Junos.
-	// The A-vs-B admission-narrowing posture decision (Junos-strict scoping vs
-	// zero-surprise-on-upgrade) remains deferred (issue #3226,
-	// plan-deferred-operator); this advisory only surfaces the breadth at commit
-	// time, exactly as the issue's Direction requests ("document it as such with
-	// an explicit commit warning"). `HostInboundFullAdmitService` is the SSOT for
-	// which tokens are full-admit (pkg/config/host_inbound_tokens.go). Emitted
-	// for the zone-level stanza AND every per-interface override (#3362); one
-	// advisory per stanza is enough.
+	// zone's local firewall addresses. Junos defines `any-service` as "all system
+	// services on an entire port range including the system services that are not
+	// defined", so it IS the documented escape hatch; xpf's packet-wide reading is
+	// a superset of that. The breadth is deliberate, so this is a WARNING, never a
+	// reject. `HostInboundFullAdmitService` is the SSOT for which tokens are
+	// full-admit (pkg/config/host_inbound_tokens.go). Emitted for the zone-level
+	// stanza AND every per-interface override (#3362); one advisory per stanza.
+	//
+	// The sibling `system-services all` NO LONGER lands here: #3226 scoped it to
+	// the named-service union (HostInboundAllExpansionServices), matching the
+	// Junos definition ("traffic from the defined system services available on the
+	// Routing Engine") and the shape #3199 gave `protocols all`. It draws the
+	// separate scoping advisory below instead.
 	fullAdmitAdvice := func(where string, svcs []string) {
 		for _, svc := range svcs {
 			if !HostInboundFullAdmitService(svc) {
@@ -351,6 +351,155 @@ func ValidateConfig(cfg *Config) []string {
 			return // one advisory per stanza
 		}
 	}
+	// #3226 scoping advisory for `system-services all`. The token is valid Junos
+	// and is now enforced with the Junos meaning, so this is purely an UPGRADE
+	// notice: a deploy that leaned on the old packet-wide breadth to admit a
+	// non-named protocol/port loses that admit, and the catch-all host-inbound
+	// drop is now armed for the zone.
+	//
+	// It is gated on the stanza's zone owning at least one NON-lifeline
+	// interface, because the narrowing can only change enforcement where the
+	// zone actually contributes host-inbound addresses. Lifeline interfaces
+	// (fxp0 + the configured cluster control/fabric interfaces, #3277) are
+	// excluded from the deny address sets by BuildZoneHostInboundViews, so a
+	// lifeline-only zone emits no rules at all and `all` vs the expansion is
+	// indistinguishable there. Every shipped HA config puts `system-services
+	// all` on exactly such a zone (the lifeline-only `control` zone — see
+	// docs/ha-cluster-userspace.conf), so an ungated advisory would fire on
+	// every cluster commit forever while flagging a guaranteed no-op.
+	lifelines := HostInboundLifelineSet(cfg)
+	allScopingAdvice := func(where string, svcs []string, enforcing bool) {
+		if !enforcing {
+			return
+		}
+		for _, svc := range svcs {
+			if strings.ToLower(strings.TrimSpace(svc)) != "all" {
+				continue
+			}
+			warnings = append(warnings, fmt.Sprintf(
+				"%s: system-services \"all\" now expands to the union of the "+
+					"named system-services (Junos parity, #3226) and no longer "+
+					"admits every IP protocol/port — GRE, OSPF/PIM/VRRP, "+
+					"unlisted TCP/UDP ports and future protocol numbers are now "+
+					"DENIED to the zone's local addresses unless listed "+
+					"explicitly under system-services / protocols; use "+
+					"\"any-service\" for the previous packet-wide admit. "+
+					"ESP/AH are NOT affected: they keep an unconditional "+
+					"global accept (host-terminated IPsec is decrypted by XFRM "+
+					"before any host-inbound deny), so no action is needed for "+
+					"them — and there is no esp/ah token to list in any case.", where))
+			return // one advisory per stanza
+		}
+	}
+	// #3226 fold: for several services in Juniper's `system-services`
+	// enumeration xpf has no authoritative listening tuple — r2cp, rpm,
+	// tcp-encap, appqoe and high-availability
+	// (config.HostInboundUnportedSystemServices). Junos would open whatever port
+	// applies; xpf refuses to guess, because an invented port opens a port with
+	// no listener while STILL denying the port actually in use. So these tokens
+	// commit (they are real Junos services — rejecting them is the #3200 parity
+	// gap) but synthesize no admit on either enforcement surface.
+	//
+	// That divergence is fail-CLOSED but it must not be SILENT: an operator who
+	// went to the trouble of naming the service plainly expects it to work.
+	// Warn at the moment they name it, and name a remedy that ACTUALLY WORKS.
+	//
+	// `any-service` is the ONLY remedy, and the advisory names nothing else.
+	// Two earlier revisions got this wrong and the history is worth keeping:
+	//
+	//   r3 told operators to "admit the real port with a firewall filter". False
+	//     on the AF_XDP local-delivery path: #3485 deliberately runs the
+	//     host-inbound gate FIRST so a denied packet incurs none of the lo0
+	//     filter's side-effects (counter, log, reject reply); on a deny the lo0
+	//     filter is never evaluated at all.
+	//   r4 narrowed that to "kernel path only", reasoning that xpf_lo0 (hook
+	//     input priority 0) runs before xpf_hostinbound (priority 10) so an lo0
+	//     `accept` terminates first. The PRIORITIES are right and the CONCLUSION
+	//     is wrong: in nftables `accept` ends the current BASE CHAIN, not the
+	//     hook. The nftables man page is explicit — "An accept verdict ... ends
+	//     the evaluation of the current base chain. ... The packet advances to
+	//     the next base chain", whereas only drop "immediately ends the
+	//     evaluation of the whole ruleset". So the packet still traverses
+	//     xpf_hostinbound at priority 10 and still hits its catch-all drop.
+	//     There is no mark, no return-path exclusion, no bypass wiring between
+	//     the two chains.
+	//
+	// So an lo0 filter accept rescues NOTHING on EITHER surface, and the remedy
+	// is withdrawn rather than narrowed. Making it work would mean building a
+	// real bypass — an explicit mark set in xpf_lo0 and tested in
+	// xpf_hostinbound, or merging the chains — which is a new security mechanism
+	// that deliberately lets an lo0 filter override the zone host-inbound
+	// default-deny. That needs its own design and threat review, and it would
+	// STILL not help on the AF_XDP path without also reordering #3485. Out of
+	// scope here; see docs/host-inbound-service-matrix.md.
+	//
+	// Gated on explicit naming only. `system-services all` also covers these
+	// tokens (contributing nothing), but warning there would fire on a large
+	// fraction of commits — including every lifeline-only HA `control` zone —
+	// while telling the operator nothing they asked about. The `all` case is
+	// documented in docs/host-inbound-service-matrix.md instead.
+	//
+	// SUPPRESSED when the same stanza already carries a full-admit token. The
+	// advisory's entire content is "this traffic is DENIED, use any-service" —
+	// but with `any-service` present nothing IS denied (the full-admit
+	// short-circuit means no catch-all drop is emitted at all, and the AF_XDP
+	// classifier admits unconditionally), so the warning would be false on its
+	// premise AND would advise adding a token the operator has already added.
+	// The two advisory passes run independently, so without this gate a stanza
+	// naming both `any-service` and `rpm` emitted one warning saying
+	// `any-service` admits everything and another saying rpm is denied.
+	unportedAdvice := func(where string, svcs []string) {
+		for _, svc := range svcs {
+			if HostInboundFullAdmitService(svc) {
+				return
+			}
+		}
+		var named []string
+		seen := map[string]bool{}
+		for _, svc := range svcs {
+			tok := strings.ToLower(strings.TrimSpace(svc))
+			if !HostInboundUnportedSystemServices[tok] || seen[tok] {
+				continue
+			}
+			seen[tok] = true
+			named = append(named, tok)
+		}
+		if len(named) == 0 {
+			return
+		}
+		sort.Strings(named)
+		// The two reason classes describe different operator situations, so they
+		// get different wording. For an operator-configured port the operator
+		// KNOWS their port and can act on it; for an unsourced service nobody
+		// knows it, including xpf, and saying "the port is configurable" there
+		// would be a lie.
+		var configured, unsourced []string
+		for _, tok := range named {
+			if HostInboundNoAdmitReason[tok] == HostInboundNoPortOperatorConfigured {
+				configured = append(configured, tok)
+			} else {
+				unsourced = append(unsourced, tok)
+			}
+		}
+		var why []string
+		if len(configured) > 0 {
+			why = append(why, fmt.Sprintf(
+				"[%s] have an operator-configured port with no platform default, so there "+
+					"is no fixed port for xpf to admit", strings.Join(configured, " ")))
+		}
+		if len(unsourced) > 0 {
+			why = append(why, fmt.Sprintf(
+				"for [%s] xpf could not find an authoritative listening port and will not "+
+					"guess one", strings.Join(unsourced, " ")))
+		}
+		warnings = append(warnings, fmt.Sprintf(
+			"%s: system-services [%s] accepted but NOT enforced — %s (a guessed port "+
+				"opens an unused port while still denying the one actually in use). "+
+				"Their traffic is DENIED to the zone's local addresses. The only remedy "+
+				"is \"any-service\"; an lo0 input filter does NOT help, on either "+
+				"enforcement path.",
+			where, strings.Join(named, " "), strings.Join(why, "; ")))
+	}
 	hiZoneNames := make([]string, 0, len(cfg.Security.Zones))
 	for name := range cfg.Security.Zones {
 		hiZoneNames = append(hiZoneNames, name)
@@ -361,10 +510,64 @@ func ValidateConfig(cfg *Config) []string {
 		if zone == nil { // #3494: tolerant/HA-sync path may carry a nil zone value
 			continue
 		}
+		// True when the zone owns an interface that contributes host-inbound
+		// addresses (i.e. is not a lifeline), so the #3226 narrowing is
+		// observable on this zone.
+		zoneEnforces := false
+		for _, ifRef := range zone.Interfaces {
+			if !HostInboundLifelineInterface(ifRef, lifelines) {
+				zoneEnforces = true
+				break
+			}
+		}
+		// #3226 fold: every advisory below reasons about the EFFECTIVE token
+		// set — the zone-level list UNION the per-interface override, via the
+		// shared UnionHostInboundTokens — because that is what enforcement acts
+		// on (Junos host-inbound is additive across the two levels). Reasoning
+		// per RAW STANZA made the advisories contradict enforcement AND each
+		// other: a zone `any-service` with a per-interface `rpm` warned that rpm
+		// was DENIED when the union full-admits it. Sharing the union removes
+		// the whole class rather than special-casing each pair.
+		var zoneSvcs []string
 		if zone.HostInboundTraffic != nil {
-			fullAdmitAdvice(
-				fmt.Sprintf("zone %q host-inbound-traffic", name),
-				zone.HostInboundTraffic.SystemServices)
+			zoneSvcs = zone.HostInboundTraffic.SystemServices
+		}
+		// A full-admit token anywhere in an effective set makes the scoping and
+		// unported advisories moot for that set: nothing is denied, so telling
+		// the operator traffic is DENIED (and to add `any-service`) would be
+		// false on its premise and would advise a change already made.
+		effectiveFullAdmits := func(svcs []string) bool {
+			for _, svc := range svcs {
+				if HostInboundFullAdmitService(svc) {
+					return true
+				}
+			}
+			return false
+		}
+		// The zone-level stanza governs every interface that does NOT override.
+		// If EVERY interface in the zone overrides with a full-admit, the
+		// zone-level narrowing is unobservable and its advisories are moot too.
+		zoneObservable := !effectiveFullAdmits(zoneSvcs)
+		if zoneObservable && len(zone.Interfaces) > 0 {
+			allCovered := true
+			for _, ifRef := range zone.Interfaces {
+				hi := zone.InterfaceHostInbound[CanonicalInterfaceUnitRef(ifRef)]
+				if hi == nil || !effectiveFullAdmits(hi.SystemServices) {
+					allCovered = false
+					break
+				}
+			}
+			if allCovered {
+				zoneObservable = false
+			}
+		}
+		if zone.HostInboundTraffic != nil {
+			where := fmt.Sprintf("zone %q host-inbound-traffic", name)
+			fullAdmitAdvice(where, zoneSvcs)
+			allScopingAdvice(where, zoneSvcs, zoneEnforces && zoneObservable)
+			if zoneObservable {
+				unportedAdvice(where, zoneSvcs)
+			}
 		}
 		// #3362: per-interface overrides carry the same token grammar and the
 		// same packet-wide breadth, so warn on each of them too. Iterated via
@@ -374,9 +577,22 @@ func ValidateConfig(cfg *Config) []string {
 			if hi == nil {
 				continue
 			}
-			fullAdmitAdvice(
-				fmt.Sprintf("zone %q interface %q host-inbound-traffic", name, ifRef),
-				hi.SystemServices)
+			where := fmt.Sprintf("zone %q interface %q host-inbound-traffic", name, ifRef)
+			// The EFFECTIVE set for this interface, exactly as the dataplane
+			// enforcement view builder computes it.
+			effective := UnionHostInboundTokens(zoneSvcs, hi.SystemServices)
+			// The full-admit notice stays keyed on the OVERRIDE's own tokens: it
+			// reports what this stanza declares, and a zone-level `any-service`
+			// already drew its own notice at the zone level.
+			fullAdmitAdvice(where, hi.SystemServices)
+			observable := !effectiveFullAdmits(effective)
+			// An override is scoped to ONE interface, so gate it on that
+			// interface's own lifeline status rather than the zone's.
+			allScopingAdvice(where, effective,
+				!HostInboundLifelineInterface(ifRef, lifelines) && observable)
+			if observable {
+				unportedAdvice(where, effective)
+			}
 		}
 	}
 

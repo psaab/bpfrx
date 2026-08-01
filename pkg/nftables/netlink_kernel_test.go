@@ -108,13 +108,25 @@ func TestCounterReadbackThroughExistingReaders(t *testing.T) {
 	for _, d := range deny {
 		denySet[d.Zone+"/"+d.Family] = true
 	}
-	for _, want := range []string{"trust/ip", "trust/ip6", "core/ip", "edge/ip", "quarantine/ip", "quarantine/ip6", "junos-host/ip", "junos-host/ip6"} {
+	// #3226: `mgmt` (system-services all) is in this list because `all` is now
+	// the named-service UNION, not a full admit — the zone falls through to the
+	// per-match path and so re-arms its catch-all drop + deny counter. Before
+	// #3226 `all` short-circuited to a bare accept with NO drop and NO counter,
+	// and this test asserted mgmt's ABSENCE; that assertion would have failed
+	// under CAP_NET_ADMIN (it passed only because the private-netns tests skip
+	// without the capability), so the flip below is a real privileged-CI gate on
+	// the new behaviour, not a bookkeeping edit.
+	for _, want := range []string{"trust/ip", "trust/ip6", "core/ip", "edge/ip", "quarantine/ip", "quarantine/ip6", "mgmt/ip", "junos-host/ip", "junos-host/ip6"} {
 		if !denySet[want] {
 			t.Errorf("deny counter %q not read back; got %v", want, denySet)
 		}
 	}
-	if denySet["mgmt/ip"] {
-		t.Errorf("mgmt zone (system-services all) must NOT have a deny counter")
+	// `any-service` remains the lone full-admit token: a bare accept with no
+	// catch-all drop, and therefore no deny counter on either family.
+	for _, notWant := range []string{"admin/ip", "admin/ip6"} {
+		if denySet[notWant] {
+			t.Errorf("admin zone (system-services any-service) must NOT have a deny counter; got %v", denySet)
+		}
 	}
 
 	// Global ICMP-accept counters (aggregate).

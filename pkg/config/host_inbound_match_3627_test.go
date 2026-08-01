@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strconv"
 	"testing"
 )
@@ -41,8 +42,9 @@ func TestHostInboundServiceMatchTuples(t *testing.T) {
 		{"gre", "ip", []L4Match{{Proto: 47}}},
 		// ident-reset carries the Reject marker (resets, does NOT admit).
 		{"ident-reset", "ip", []L4Match{{Proto: HostInboundProtoTCP, Ports: single(113), Reject: true}}},
-		// full-admit and unknown tokens are not per-tuple matches.
-		{"all", "ip", nil},
+		// the `any-service` full-admit and unknown tokens are not per-tuple
+		// matches. #3226: `all` IS one now — it expands to the named-service
+		// union, asserted separately below.
 		{"any-service", "ip", nil},
 		{"sssh", "ip", nil},
 	}
@@ -53,8 +55,108 @@ func TestHostInboundServiceMatchTuples(t *testing.T) {
 		}
 	}
 
-	if !HostInboundFullAdmitService("all") || !HostInboundFullAdmitService("any-service") {
-		t.Errorf("all/any-service must be full-admit services")
+	// #3226: `any-service` is the ONLY full-admit token. `all` expands to the
+	// named-service union (HostInboundAllExpansionServices) — it is a per-tuple
+	// match set, so treating it as a full admit would restore the packet-wide
+	// over-admit the issue closed.
+	if !HostInboundFullAdmitService("any-service") {
+		t.Errorf("any-service must be a full-admit service")
+	}
+	if HostInboundFullAdmitService("all") {
+		t.Errorf("all must NOT be a full-admit service (#3226 — it expands to the named system-service union)")
+	}
+	// What `system-services all` actually OPENS, pinned against a hard-coded
+	// literal.
+	//
+	// This replaces an assertion that rebuilt the expected value by iterating
+	// HostInboundAllExpansionServices() and concatenating
+	// HostInboundServiceMatch(tok, fam) — which is character-for-character what
+	// production's `all` branch does, so it compared the implementation with
+	// itself and would have passed through any change to either. (Its comment
+	// claimed to be "derived independently"; it was not.)
+	//
+	// The oracle below is a human-maintained list of the atomic (proto, port)
+	// openings `all` grants. It is independent of how the expansion is computed,
+	// so it REDs on a token entering or leaving the union, on a port move, and on
+	// a family-scoping change — none of which the old form could see. The
+	// traceroute probe range is collapsed out and asserted separately, because 90
+	// consecutive ports would swamp the literal without adding signal.
+	const tracerouteLo, tracerouteHi = 33434, 33523
+	wantOpenings := map[string][]string{
+		// IPv4: dhcp/bootp (67,68) present, dhcpv6 absent, ping = ICMP echo type 8.
+		"ip": {
+			"1/type8", "17/123", "17/161", "17/162", "17/3503", "17/4500",
+			"17/500", "17/5060", "17/53", "17/67", "17/68", "17/69", "17/8503",
+			"6/21", "6/22", "6/23", "6/2900", "6/2901", "6/3220", "6/3221",
+			"6/443", "6/5060", "6/513", "6/514", "6/53", "6/79", "6/80", "6/830",
+			"reject:6/113",
+		},
+		// IPv6: dhcpv6 (546,547) present, dhcp/bootp absent, ping = ICMPv6 type 128.
+		"ip6": {
+			"17/123", "17/161", "17/162", "17/3503", "17/4500", "17/500",
+			"17/5060", "17/53", "17/546", "17/547", "17/69", "17/8503",
+			"58/type128", "6/21", "6/22", "6/23", "6/2900", "6/2901", "6/3220",
+			"6/3221", "6/443", "6/5060", "6/513", "6/514", "6/53", "6/79",
+			"6/80", "6/830", "reject:6/113",
+		},
+	}
+	for _, fam := range []string{"ip", "ip6"} {
+		got := map[string]bool{}
+		for _, m := range HostInboundServiceMatch("all", fam) {
+			for _, k := range hiOpeningKeys(m) {
+				got[k] = true
+			}
+		}
+		if len(got) == 0 {
+			t.Fatalf("`all` opened NOTHING for family %q — contract would be vacuous", fam)
+		}
+		// Peel off the traceroute range and assert it exactly.
+		for p := tracerouteLo; p <= tracerouteHi; p++ {
+			k := fmt.Sprintf("17/%d", p)
+			if !got[k] {
+				t.Errorf("`all` (%s) is missing traceroute probe port udp/%d", fam, p)
+			}
+			delete(got, k)
+		}
+		for _, edge := range []int{tracerouteLo - 1, tracerouteHi + 1} {
+			if got[fmt.Sprintf("17/%d", edge)] {
+				t.Errorf("`all` (%s) opens udp/%d, outside the traceroute probe range %d-%d",
+					fam, edge, tracerouteLo, tracerouteHi)
+			}
+		}
+		want := map[string]bool{}
+		for _, k := range wantOpenings[fam] {
+			want[k] = true
+		}
+		for k := range want {
+			if !got[k] {
+				t.Errorf("`system-services all` (%s) no longer opens %s — a service left the "+
+					"union, moved port, or changed family scoping", fam, k)
+			}
+		}
+		for k := range got {
+			if !want[k] {
+				t.Errorf("`system-services all` (%s) now opens %s, which the pinned union does "+
+					"NOT — a service entered the union or widened its ports (#3226)", fam, k)
+			}
+		}
+	}
+	// The expansion excludes the meta tokens and the xpf-only extensions.
+	for _, tok := range HostInboundAllExpansionServices() {
+		if tok == "all" || tok == "any-service" {
+			t.Errorf("`all` expansion must not contain the meta token %q (recursion / semantics)", tok)
+		}
+		if HostInboundNonJunosSystemServices[tok] {
+			t.Errorf("`all` expansion must not contain the xpf-only token %q (#3226)", tok)
+		}
+	}
+	// gre is a recognized token that is nonetheless excluded — the exclusion set
+	// is load-bearing, not decorative.
+	if !KnownHostInboundSystemServices["gre"] {
+		t.Errorf("gre must stay a recognized system-service (so the `all` exclusion is meaningful)")
+	}
+	if got := HostInboundServiceMatch("gre", "ip"); len(got) == 0 {
+		t.Errorf("an EXPLICIT `system-services gre` must still match IP protocol 47")
 	}
 	if HostInboundFullAdmitService("ssh") {
 		t.Errorf("ssh must NOT be a full-admit service")
