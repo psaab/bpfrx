@@ -2215,18 +2215,33 @@ mod monitor_lifecycle_tests_5165 {
         // queued — in which case `key2` being absent says nothing about the
         // re-check and this run must NOT be reported as a pass.
         let mut drained = [0u8; 128];
-        let leftover = unsafe {
-            libc::recv(
-                read_fd,
-                drained.as_mut_ptr() as *mut libc::c_void,
-                drained.len(),
-                libc::MSG_DONTWAIT,
-            )
+        // EINTR is a legitimate recv() outcome and says nothing about whether
+        // the queue is empty, so retry it rather than reporting it as a
+        // failure. Bounded so a pathological signal storm cannot spin here.
+        let (leftover, drain_errno) = {
+            let mut last = (0isize, None);
+            for _ in 0..16 {
+                let n = unsafe {
+                    libc::recv(
+                        read_fd,
+                        drained.as_mut_ptr() as *mut libc::c_void,
+                        drained.len(),
+                        libc::MSG_DONTWAIT,
+                    )
+                };
+                let e = std::io::Error::last_os_error().raw_os_error();
+                last = (n, e);
+                if !(n < 0 && e == Some(libc::EINTR)) {
+                    break;
+                }
+            }
+            last
         };
         // `leftover < 0` alone would accept ANY error as "drained" — an EBADF
-        // from a future refactor would read as success. Only EAGAIN /
-        // EWOULDBLOCK means the queue is genuinely empty.
-        let drain_errno = std::io::Error::last_os_error().raw_os_error();
+        // from a future refactor would read as success. Only EAGAIN means the
+        // queue is genuinely empty. (EWOULDBLOCK is not matched separately:
+        // Linux defines it as the same value as EAGAIN, so a second arm is an
+        // unreachable pattern; this file is Linux-only.)
         assert!(
             leftover < 0,
             "the post-stop batch must have been RECEIVED by the loop, but \
@@ -2234,11 +2249,11 @@ mod monitor_lifecycle_tests_5165 {
              top-of-loop check, so the post-recv re-check was never exercised",
         );
         assert!(
-            matches!(drain_errno, Some(libc::EAGAIN) | Some(libc::EWOULDBLOCK)),
-            "drain recv failed with errno {drain_errno:?}, not EAGAIN/EWOULDBLOCK. \
-             The queue being empty is the ONLY acceptable reason this returns \
-             <0; any other error means the fd is unusable and this assertion \
-             would otherwise have passed for the wrong reason",
+            drain_errno == Some(libc::EAGAIN),
+            "drain recv failed with errno {drain_errno:?}, not EAGAIN. The queue \
+             being empty is the ONLY acceptable reason this returns <0; any other \
+             error means the fd is unusable and this assertion would otherwise \
+             have passed for the wrong reason",
         );
 
         assert!(
