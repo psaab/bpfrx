@@ -1,3 +1,68 @@
+## 2026-07-31 — #6611 review round 2: guard scoped narrower than its claim
+
+- **Timestamp**: 2026-07-31 (fix/6611-control-channel-auth, PR #6624)
+- **Action**: Round-2 hostile review returned MERGE-NEEDS-MINOR with both
+  round-1 MAJORs confirmed closed. Five fixes, each verified firsthand first.
+  (MINOR-1a) The comment justifying dropping nodeID 1 from
+  `TestCheckTextRejectsUnkeyedCluster_6611` asserted INVERTED gate ordering.
+  `compileTreeStrict` calls `CompileConfigForNode` (store.go:402) BEFORE
+  `crossCheckNodeID` (:409), so the #6611 gate fires first and the node-1
+  reject case would have passed at every nodeID. Restored `{-1, 0, 1}` and
+  rewrote the comment. The #4185 reasoning IS true for the ACCEPT loop (a
+  keyed config clears #6611 and then hits the identity cross-check against
+  the `node 0` fixture), so it moved there.
+  (MINOR-1b, the one that mattered) The bootstrap guard built its store with
+  `configstore.New`, which sets `nodeID: -1`, so it only ever exercised the
+  STANDALONE compile — never `CompileConfigForNode`, which is what a real
+  cluster node's first boot runs. The guard was scoped narrower than the
+  verdict it claimed to pin. `bootstrapDaemon` now takes a nodeID and calls
+  `SetNodeID`; reject and accept both run at {-1, 0, 1} with the `node` leaf
+  tracking the id. Added `TestBootstrapStoreIsInClusterMode_6611`, which
+  proves the plumbing actually takes effect by feeding a KEYED config whose
+  node leaf disagrees with the store id: that clears #6611 and is refused by
+  #4185, a verdict only reachable when `nodeID >= 0`. Without it the extended
+  coverage would have been three repetitions of the standalone compile.
+  (MINOR-2) A FOURTH strict population was undocumented: `pkg/eventengine`
+  autonomous remediation (`store.CommitCheck()` + the daemon commit closure,
+  both strict). Consequence now stated in all four surfaces — on the
+  in-place-upgraded unkeyed cluster the table calls safe, every
+  `change-configuration` policy silently fails from the moment of upgrade
+  with no operator present. "The cluster keeps running" is true of traffic
+  and the dataplane, not of automation.
+  (MINOR-3) `pkg/cluster/README.md` line 358, in the PRE-EXISTING F23 design
+  section, still said "Enforcement engages only once BOTH nodes are keyed and
+  signing" — which #6628 falsifies, fifty lines above the new section saying
+  the opposite. I rewrote 172 lines of that file and left it. Now carries the
+  re-establishment clause.
+  (MINOR-4) The rollout's own step 1 leaks the PSK the same section says to
+  provision out-of-band: every shipped config sets
+  `configuration-synchronize`, and `pushConfigToPeer` sends
+  `Store.ShowActive()` = `s.active.Format()`, the RAW tree with no
+  `ast_redact.go` pass. Added the mitigation that actually works — delete
+  `configuration-synchronize`, key both nodes, restore it — and said plainly
+  that out-of-band provisioning alone does not avoid the exposure.
+  NITs: the ~1s dual-master window is the SHIPPED cluster setting (200ms x 5);
+  `DefaultHeartbeatInterval` is 100ms, so ~500ms at code defaults — both now
+  named. Dropped "the keying commit is always accepted" (it strict-compiles
+  the whole candidate, so a lenient-tolerated #1319/#4185/#4525 violation can
+  refuse it — precisely this population). Fixed the TrimSpace rationale: it
+  makes the gate STRICTER than the runtime, not in agreement with it, and
+  documented the resulting lenient-path residual (runtime len=3 for a
+  three-space key while the boot log says "no authentication-key
+  configured"). MUTATION RE-VERIFIED, three mutations, `go build ./...` and
+  `go vet ./...` clean under each: (A) removing the reject call site reds 6
+  guards including both unattended paths, with 4 negative controls green;
+  (B) disarming the strength advisories reds all 3 strength tests, control
+  green; (C) removing the `SetNodeID` plumbing reds ONLY
+  `TestBootstrapStoreIsInClusterMode_6611` — which is exactly what that guard
+  exists to detect. Validation: `go build ./...` exit 0, `go vet ./...` clean,
+  gofmt clean on every touched file, `go test ./... -count=1` green except the
+  pre-existing `TestHeatmapNotStale`.
+- **File(s)**: pkg/daemon/bootstrap_cluster_authkey_6611_test.go,
+  pkg/configstore/check_cluster_authkey_6611_test.go,
+  pkg/config/compiler_validate_strict_cluster_auth.go, pkg/cluster/README.md,
+  docs/config-schema.md, docs/architecture.md
+
 ## 2026-07-31 — #6611 review round 1: the strict-path claim was WRONG
 
 - **Timestamp**: 2026-07-31 (fix/6611-control-channel-auth, PR #6624)

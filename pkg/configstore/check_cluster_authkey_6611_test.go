@@ -38,11 +38,13 @@ const keyedClusterCheckConf = `chassis {
 // RED on revert: with the #6611 gate call site removed, CheckText returns nil
 // and xpf-deploy / the day-0 loader install an unkeyed cluster config.
 func TestCheckTextRejectsUnkeyedCluster_6611(t *testing.T) {
-	// nodeID 0 matches the fixture's `node 0` leaf; -1 is the standalone
-	// spelling day-0 validation uses when no node-id file is present. Both must
-	// refuse. (nodeID 1 is deliberately not exercised here — it would trip the
-	// unrelated #4185 node-identity gate against this fixture's `node 0`.)
-	for _, nodeID := range []int{0, -1} {
+	// Every node-id spelling day-0 validation can be invoked with: -1 when no
+	// node-id file is present, and 0/1 in cluster mode. The #6611 gate runs
+	// inside CompileConfigForNode, which compileTreeStrict calls BEFORE
+	// crossCheckNodeID (store.go), so nodeID 1 against this fixture's `node 0`
+	// leaf still fails on the missing key rather than on #4185 — the auth
+	// verdict is node-independent and all three must refuse.
+	for _, nodeID := range []int{-1, 0, 1} {
 		cfg, err := CheckText(unkeyedClusterCheckConf, nodeID)
 		if err == nil {
 			t.Fatalf("node %d: check-config ACCEPTED an unkeyed chassis cluster — "+
@@ -60,7 +62,12 @@ func TestCheckTextRejectsUnkeyedCluster_6611(t *testing.T) {
 // validation of a keyed cluster must pass for both node-id spellings, so the
 // guard cannot be passing by rejecting every cluster config.
 func TestCheckTextAcceptsKeyedCluster_6611(t *testing.T) {
-	for _, nodeID := range []int{0, -1} {
+	// nodeID 1 is genuinely not exercisable here: a keyed config CLEARS the
+	// #6611 gate and then hits the #4185 node-identity cross-check against this
+	// fixture's `node 0` leaf, which is a different gate's verdict. The
+	// per-node accept path is covered by the bootstrap guards in pkg/daemon,
+	// which build a matching `node <n>` fixture.
+	for _, nodeID := range []int{-1, 0} {
 		cfg, err := CheckText(keyedClusterCheckConf, nodeID)
 		if err != nil {
 			t.Fatalf("node %d: check-config rejected a KEYED cluster config: %v", nodeID, err)

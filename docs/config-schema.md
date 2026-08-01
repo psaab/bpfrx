@@ -1747,9 +1747,10 @@ run against real cluster traffic.
 `runUniformGatesClusterZone` so every structural cluster error still wins the
 first-error slot) **rejects on the strict path** a `chassis cluster` stanza
 whose `authentication-key` is absent or whitespace-only. The whitespace case is
-an EMPTINESS normalization so the gate agrees with the runtime's
-`len(key) > 0` test — it is not an entropy floor, and a one-character key
-passes. Key strength is a continuum and is reported by
+an EMPTINESS normalization: trimming makes the gate STRICTER than the
+runtime's `len(key) > 0` test (the runtime would treat `"   "` as a
+configured key), which is the right direction on the strict path. It is not
+an entropy floor — a one-character key passes. Key strength is a continuum and is reported by
 `ClusterAuthKeyStrengthWarnings` as a `cfg.Warnings` entry on BOTH paths
 (below `MinAdvisedControlLinkKeyLen` = 16 characters, or a key matching one of
 this repository's published `CHANGE-ME`/`EXAMPLE-ONLY` placeholders) rather
@@ -1773,6 +1774,11 @@ consequence:
   `scripts/deploy/xpf-deploy.py`, `scripts/image/make_config_drive.py` and the
   first-boot loader `scripts/image/xpf-day0-config` (which falls back to the
   factory bootstrap on reject).
+- `pkg/eventengine` — AUTONOMOUS remediation. A `change-configuration` policy
+  runs `store.CommitCheck()` and then the daemon's commit closure, both strict,
+  with no operator present. On an in-place-upgraded unkeyed cluster — the
+  population that boots leniently — every such policy silently fails from the
+  moment of upgrade until the cluster is keyed.
 
 Lenient downgrade to a `cfg.Warnings` entry on the tolerant load / peer-sync
 path (`lenientClusterAuthKey`, #1960 no-brick) — that downgrade **is** the

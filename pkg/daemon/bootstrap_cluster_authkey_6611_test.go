@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,7 +25,14 @@ import (
 
 // bootstrapDaemon builds the minimal Daemon bootstrapFromFile needs: a real
 // store over a temp DB and a config file path.
-func bootstrapDaemon(t *testing.T, conf string) (*Daemon, func() bool) {
+//
+// nodeID selects the compile the store performs, and it matters:
+// configstore.New defaults to -1 (standalone -> CompileConfig), whereas a real
+// cluster node's first boot has a /etc/xpf/node-id and runs
+// CompileConfigForNode. A guard that only ever ran at -1 would not measure the
+// verdict it claims to pin, so every case below is exercised at the cluster
+// node ids too.
+func bootstrapDaemon(t *testing.T, conf string, nodeID int) (*Daemon, func() bool) {
 	t.Helper()
 	dir := t.TempDir()
 	confPath := filepath.Join(dir, "xpf.conf")
@@ -32,36 +40,38 @@ func bootstrapDaemon(t *testing.T, conf string) (*Daemon, func() bool) {
 		t.Fatalf("write config file: %v", err)
 	}
 	store := newConfigStore(t, filepath.Join(dir, "config.db"))
+	if nodeID >= 0 {
+		store.SetNodeID(nodeID)
+	}
 	d := &Daemon{store: store, opts: Options{NoDataplane: true, ConfigFile: confPath}}
 	return d, func() bool { return store.ActiveConfig() != nil }
 }
 
-const unkeyedClusterBootstrapConf = `chassis {
+// clusterBootstrapConf renders a cluster config for a given node, optionally
+// keyed. The `node` leaf tracks nodeID so the #4185 identity cross-check is
+// satisfied and the #6611 verdict is what decides these tests.
+func clusterBootstrapConf(nodeID int, key string) string {
+	leaf := ""
+	if key != "" {
+		leaf = "        authentication-key \"" + key + "\";\n"
+	}
+	node := nodeID
+	if node < 0 {
+		node = 0
+	}
+	return fmt.Sprintf(`chassis {
     cluster {
         cluster-id 1;
-        node 0;
+        node %d;
         reth-count 2;
-        redundancy-group 1 {
+%s        redundancy-group 1 {
             node 0 priority 200;
             node 1 priority 100;
         }
     }
 }
-`
-
-const keyedClusterBootstrapConf = `chassis {
-    cluster {
-        cluster-id 1;
-        node 0;
-        reth-count 2;
-        authentication-key "bootstrap-psk-6611-long-enough";
-        redundancy-group 1 {
-            node 0 priority 200;
-            node 1 priority 100;
-        }
-    }
+`, node, leaf)
 }
-`
 
 // TestBootstrapFromFileRejectsUnkeyedCluster_6611 pins the UNATTENDED verdict:
 // a fresh node handed an unkeyed cluster config refuses to bootstrap, and — the
@@ -71,19 +81,23 @@ const keyedClusterBootstrapConf = `chassis {
 // RED on revert: with the #6611 gate call site removed, bootstrapFromFile
 // succeeds and the node comes up active with an unauthenticated control channel.
 func TestBootstrapFromFileRejectsUnkeyedCluster_6611(t *testing.T) {
-	d, hasActive := bootstrapDaemon(t, unkeyedClusterBootstrapConf)
-	err := d.bootstrapFromFile()
-	if err == nil {
-		t.Fatal("bootstrapFromFile ACCEPTED an unkeyed chassis cluster: a freshly " +
-			"provisioned node would come up running an unauthenticated cluster " +
-			"control channel")
-	}
-	if !strings.Contains(err.Error(), "authentication-key") {
-		t.Fatalf("bootstrap rejection does not name the missing leaf: %v", err)
-	}
-	// The consequence the operator doc must state: no active config, not a warning.
-	if hasActive() {
-		t.Fatal("precondition drift: a rejected bootstrap must leave NO active config")
+	for _, nodeID := range []int{-1, 0, 1} {
+		d, hasActive := bootstrapDaemon(t, clusterBootstrapConf(nodeID, ""), nodeID)
+		err := d.bootstrapFromFile()
+		if err == nil {
+			t.Fatalf("node %d: bootstrapFromFile ACCEPTED an unkeyed chassis "+
+				"cluster: a freshly provisioned node would come up running an "+
+				"unauthenticated cluster control channel", nodeID)
+		}
+		if !strings.Contains(err.Error(), "authentication-key") {
+			t.Fatalf("node %d: bootstrap rejection does not name the missing leaf: %v",
+				nodeID, err)
+		}
+		// The consequence the operator doc must state: no active config, not a
+		// warning.
+		if hasActive() {
+			t.Fatalf("node %d: a rejected bootstrap must leave NO active config", nodeID)
+		}
 	}
 }
 
@@ -93,19 +107,25 @@ func TestBootstrapFromFileRejectsUnkeyedCluster_6611(t *testing.T) {
 // mechanical proof of the documented migration order — key the running cluster
 // FIRST, then re-provision, and the provision succeeds.
 func TestBootstrapFromFileAcceptsKeyedCluster_6611(t *testing.T) {
-	d, hasActive := bootstrapDaemon(t, keyedClusterBootstrapConf)
-	if err := d.bootstrapFromFile(); err != nil {
-		t.Fatalf("bootstrapFromFile rejected a KEYED cluster config: %v", err)
-	}
-	if !hasActive() {
-		t.Fatal("keyed bootstrap did not promote an active config")
-	}
-	active := d.store.ActiveConfig()
-	if active.Chassis.Cluster == nil {
-		t.Fatal("keyed bootstrap promoted a config with no cluster stanza")
-	}
-	if got := active.Chassis.Cluster.ControlLinkAuthKey.Reveal(); got == "" {
-		t.Fatal("keyed bootstrap promoted a config whose control-link key is empty")
+	for _, nodeID := range []int{-1, 0, 1} {
+		conf := clusterBootstrapConf(nodeID, "bootstrap-psk-6611-long-enough")
+		d, hasActive := bootstrapDaemon(t, conf, nodeID)
+		if err := d.bootstrapFromFile(); err != nil {
+			t.Fatalf("node %d: bootstrapFromFile rejected a KEYED cluster config: %v",
+				nodeID, err)
+		}
+		if !hasActive() {
+			t.Fatalf("node %d: keyed bootstrap did not promote an active config", nodeID)
+		}
+		active := d.store.ActiveConfig()
+		if active.Chassis.Cluster == nil {
+			t.Fatalf("node %d: keyed bootstrap promoted a config with no cluster stanza",
+				nodeID)
+		}
+		if got := active.Chassis.Cluster.ControlLinkAuthKey.Reveal(); got == "" {
+			t.Fatalf("node %d: keyed bootstrap promoted a config whose control-link "+
+				"key is empty", nodeID)
+		}
 	}
 }
 
@@ -117,11 +137,40 @@ func TestBootstrapFromFileStandaloneUnaffected_6611(t *testing.T) {
 	d, hasActive := bootstrapDaemon(t, `system {
     host-name standalone-6611;
 }
-`)
+`, -1)
 	if err := d.bootstrapFromFile(); err != nil {
 		t.Fatalf("bootstrapFromFile rejected a standalone config: %v", err)
 	}
 	if !hasActive() {
 		t.Fatal("standalone bootstrap did not promote an active config")
+	}
+}
+
+// TestBootstrapStoreIsInClusterMode_6611 proves the node-id plumbing in
+// bootstrapDaemon actually takes effect, so the node coverage the guards above
+// claim is real rather than three repetitions of the standalone compile.
+//
+// It works by feeding a KEYED config whose `node` leaf disagrees with the
+// store's node id. That clears the #6611 gate and is then refused by the #4185
+// node-identity cross-check — a verdict only reachable when nodeID >= 0, i.e.
+// only when compileTreeStrict took the CompileConfigForNode branch.
+// crossCheckNodeID returns nil for nodeID < 0, so if SetNodeID had not taken
+// effect this config would commit clean.
+func TestBootstrapStoreIsInClusterMode_6611(t *testing.T) {
+	// Store is node 1; the config says node 0.
+	conf := clusterBootstrapConf(0, "bootstrap-psk-6611-long-enough")
+	d, hasActive := bootstrapDaemon(t, conf, 1)
+	err := d.bootstrapFromFile()
+	if err == nil {
+		t.Fatal("store node-id never took effect: a keyed config whose node leaf " +
+			"disagrees with the store node-id committed clean, which means the " +
+			"cluster-mode (CompileConfigForNode) branch was not taken")
+	}
+	if !strings.Contains(err.Error(), "node identity mismatch") {
+		t.Fatalf("expected the #4185 identity cross-check (proving cluster-mode "+
+			"compile), got: %v", err)
+	}
+	if hasActive() {
+		t.Fatal("a rejected bootstrap must leave NO active config")
 	}
 }

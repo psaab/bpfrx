@@ -42,6 +42,10 @@ import (
 //	  scripts/deploy/xpf-deploy.py, scripts/image/make_config_drive.py and the
 //	  first-boot loader scripts/image/xpf-day0-config (which falls back to the
 //	  factory bootstrap on reject).
+//	pkg/eventengine — AUTONOMOUS remediation (CommitCheck + the daemon commit
+//	  closure). On a leniently-booted unkeyed cluster every `change-configuration`
+//	  policy silently fails until the cluster is keyed; no operator is present to
+//	  see it.
 //
 // So the migration order matters and is documented in pkg/cluster/README.md:
 // key the RUNNING cluster first (that commit is accepted), and only then
@@ -61,9 +65,12 @@ func validateClusterAuthKeyStrict(cfg *Config) error {
 	if cfg == nil || cfg.Chassis.Cluster == nil {
 		return nil
 	}
-	// TrimSpace normalizes emptiness so this gate agrees with the runtime's
-	// len(key) > 0 test: a whitespace-only key is "configured" to the runtime
-	// but is not a key. This is an EMPTINESS floor, not an entropy floor — a
+	// TrimSpace normalizes emptiness: a whitespace-only key IS "configured" to
+	// the runtime's len(key) > 0 test but is not a key, so trimming here makes
+	// this gate deliberately STRICTER than the runtime rather than identical to
+	// it — the right direction on the strict path. (The difference stays
+	// observable on the tolerant path; see pkg/cluster/README.md "Key
+	// strength".) This is an EMPTINESS floor, not an entropy floor — a
 	// one-character key passes here. Key strength is a continuum and is
 	// surfaced by ClusterAuthKeyStrengthWarnings rather than rejected, so a
 	// weak-but-real key never becomes a new brick class for an operator who

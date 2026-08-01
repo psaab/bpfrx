@@ -355,7 +355,11 @@ connection is authenticated, then seals every subsequent frame.
   UNAUTHENTICATED — the stream stays legacy-compatible (no brick). The
   legacy peer's first real frame, consumed by the handshake read, is
   preserved as a `pendingFrame` and processed before the receive loop
-  starts. Enforcement engages only once BOTH nodes are keyed and signing.
+  starts. Enforcement engages only once BOTH nodes are keyed and signing —
+  and, for an ALREADY-ESTABLISHED connection, only after it is
+  re-established, because the handshake result is fixed at connect and
+  committing a key does not restart cluster comms (#6628; see "Operating
+  the control-link PSK" below).
 - **Downgrade-guard (`syncAuthDecision`, mirrors `heartbeatAuthDecision`).**
   Once the peer has authenticated on the sync channel (sticky
   `syncAuthedEver`) OR the heartbeat channel (`HeartbeatPeerAuthSeen`, arms
@@ -437,10 +441,15 @@ Strict is **not** only the operator commit — it is every caller of
 | operator commit | `Store.Commit` / `CommitCheck` / `CommitConfirmed` | **Inert for traffic.** The active config and the dataplane are untouched; the cluster keeps running while you add the key. |
 | **first-boot import** | `daemon.bootstrapFromFile` (`daemon_apply_commit.go`), taken whenever the config DB has no active config (`daemon_run_bringup.go`) | **The node comes up with NO active config** — unattended, no warning. |
 | **day-0 validation** | `configstore.CheckText` (`xpfd check-config`) | `xpf-deploy.py` dies; `make_config_drive.py` refuses; the first-boot loader `scripts/image/xpf-day0-config` falls back to the **factory bootstrap**. |
+| **autonomous remediation** | `pkg/eventengine` — `store.CommitCheck()` then the daemon's commit closure (`engine.go`) | Every `event-options` `change-configuration` policy **silently fails** until the cluster is keyed. |
 | load / peer config-sync | `Store.Load`, `SyncApply` → `compileTreeLenient` | **Warns and boots.** This is the in-place upgrade path. |
 
-So an **in-place upgrade is safe** — that population keeps its `.configdb`
-and loads leniently. What is NOT safe is provisioning a node **without** a DB
+So an **in-place upgrade** still boots — that population keeps its
+`.configdb` and loads leniently. Note the fourth row applies to exactly
+that population: from the moment of upgrade, an unkeyed cluster's
+event-driven `change-configuration` remediation stops committing, with no
+operator present to see the rejection. "The cluster keeps running" is
+true of traffic and the dataplane; it is not true of automation. What is NOT safe is provisioning a node **without** a DB
 while the cluster's config is still unkeyed: reimaging or replacing a failed
 node, restoring from an archived text config, or building a day-0 drive from
 an unkeyed config. A node in that state comes up unconfigured, and a
@@ -452,8 +461,14 @@ rescue it. This repository's own `make cluster-deploy` takes that path —
 ### Required order
 
 > **Key the RUNNING cluster first. Only then re-provision, reimage, or
-> rebuild a day-0 drive.** The keying commit itself is always accepted, so
-> this order always works. The reverse order strands the new node.
+> rebuild a day-0 drive.** The reverse order strands the new node.
+
+The keying commit strict-compiles the WHOLE candidate, so on a cluster
+whose config has never been strict-validated it can be refused for an
+unrelated reason a lenient boot tolerated — a stale typed leaf (#1319), a
+node-identity mismatch (#4185), an RA-interval violation (#4525). That is
+the same population this gate is aimed at, so expect to fix those first;
+the order above is still the right one, it just may not be a single step.
 
 ### Generating and distributing the key
 
@@ -473,9 +488,25 @@ the reference configs do.
 carry it (#6629).** Config-sync serializes the active config and writes it
 over the session-sync stream, which is HMAC-authenticated but **not
 encrypted**; during the very first rollout that stream is also still
-unauthenticated (see below). A passive observer on the control segment can
-therefore learn the PSK from the commit that installs it. Push the key to
-each node by the same trusted channel you use for any other secret.
+unauthenticated (see below). Push the key to each node by the same trusted
+channel you use for any other secret.
+
+Out-of-band provisioning alone does **not** avoid the exposure. Every
+shipped config sets `configuration-synchronize`, and the RG0 primary's
+commit calls `pushConfigToPeer`, which sends `Store.ShowActive()` — the RAW
+formatted tree, with no `ast_redact.go` pass on that path. So the cleartext
+PSK crosses the control segment at step 1 of the rollout below no matter how
+you delivered it. To actually avoid it, take config-sync out of the loop for
+the duration:
+
+```
+delete chassis cluster configuration-synchronize   # on both nodes, commit
+<key both nodes out-of-band, per the rollout below>
+set chassis cluster configuration-synchronize      # restore, commit
+```
+
+The restore commit re-synchronizes a config that both nodes already hold, so
+the key is no longer new information on the wire.
 
 ### Rolling it onto a live unkeyed cluster
 
@@ -525,8 +556,9 @@ rotation is a **planned-outage operation, not a rolling one**.
 While the two nodes hold different keys, each receives a present-but-invalid
 HMAC from the other. `handleFrame` rejects those frames and `continue`s
 **without refreshing `lastSeen`** (`heartbeat.go`), so neither node refreshes
-peer liveness: after `heartbeat-interval × heartbeat-threshold` (200 ms × 5 =
-**~1 s** at the defaults) **both** nodes declare the peer dead and **both**
+peer liveness: after `heartbeat-interval × heartbeat-threshold` — 200 ms × 5 =
+**~1 s** at the SHIPPED cluster settings, 100 ms × 5 = **~500 ms** at the code
+defaults (`DefaultHeartbeatInterval`) — **both** nodes declare the peer dead and **both**
 take over their redundancy groups — dual-master with duplicate VIPs on the
 wire for the whole window between the two commits.
 
@@ -553,6 +585,14 @@ short key would create a new brick class, including via the unattended
 `bootstrapFromFile` path, for an operator who already configured
 authentication. It warns below `MinAdvisedControlLinkKeyLen` (16 characters)
 and when the key looks like one of this repository's published placeholders.
+
+Trimming makes the gate STRICTER than the runtime, not identical to it, and
+on the tolerant path that difference is observable: a leniently-loaded
+`authentication-key "   "` warns "no authentication-key configured" at boot
+while the runtime treats the untrimmed three-space value as a real key, so
+`show chassis cluster statistics` can report `engaged` once the peer
+authenticates with the same three spaces. Pathological and pre-existing —
+noted so the two surfaces are not read as contradicting each other.
 
 ### Shipped configs
 

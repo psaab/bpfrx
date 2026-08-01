@@ -192,7 +192,9 @@ editing cmdtree.
   `configstore.CheckText` (`xpfd check-config`, behind xpf-deploy and
   the day-0 loader) also refuse — so provisioning a NEW node fails
   closed, and the migration has a required order: key the running
-  cluster first, then re-provision. Note also that session sync fixes a
+  cluster first, then re-provision. `pkg/eventengine` remediation is
+  strict too, so on a leniently-booted unkeyed cluster every
+  `change-configuration` policy silently fails until it is keyed. Note also that session sync fixes a
   connection's auth state at connect and committing the key does not
   restart cluster comms, so an established stream stays unauthenticated
   until a daemon restart (#6628); config-sync carries the PSK in the
