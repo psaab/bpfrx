@@ -65854,3 +65854,34 @@ break — `go vet` confirmed passing under every revert.
   proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
   userspace-dp/src/session/mod.rs, userspace-dp/src/session/README.md,
   docs/session-sync-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-01 07:40
+- **Action**: #6198 second review fold (MERGE-NEEDS-MAJOR — both MAJORs were in
+  the seeding added in the previous round). (1) The zero-correction emitted a
+  DUPLICATE: `Add(1) & mask; if counter == 0 { counter = 1 }` corrects only the
+  returned copy, so at the wrap the atomic still holds the masked-zero value and
+  the NEXT call returns the id just handed out — inside the namespace, so nothing
+  downstream looks wrong while uniqueness silently stops holding. Replaced with a
+  CAS advance so the STORED value is the returned one. The wrap is reachable, not
+  theoretical: the seed consumes counter space, so distance to the boundary
+  depends on uptime phase. Kept the ring rather than failing closed — the id is
+  display-only but the conversion carrying it installs an HA-synced session, so
+  refusing to mint would trade a cosmetic alias for lost sessions at failover.
+  (2) The seed was read at SECOND resolution, so two incarnations whose first
+  allocations land in the same integer second got identical seeds and repeated
+  from their first id — the common restart, since `RestartSec=1` lands in the
+  window and the sub-second phase is uniform. Added `daemonMonotonicNanos` and
+  reshifted the seed to `nanos >> 10` (~1.024 us granularity, three orders of
+  magnitude below any real teardown+exec; ~976k ids/s of rate headroom; 9.1-year
+  seed cycle). The previous test only compared `uptime` vs `uptime+1`, so it
+  could not see this — the new test drives 1ms/10ms/100ms/700ms separations
+  inside one second, with a fixture guard that fails if an offset crosses a
+  second boundary and makes the case vacuous. (3) MINOR: the `0xFFFF<<48`
+  reservation was documented but unenforced on the Rust side; added
+  `CONTROL_PLANE_SESSION_ID_WORKER_HI` and a hard `assert!` in `set_worker_id`
+  (not `debug_assert!` — release strips those and `make test-rust` is a release
+  build), plus a `#[should_panic]` guard and a negative control.
+- **File(s)**: pkg/daemon/daemon_ha_userspace_convert.go,
+  pkg/daemon/userspace_sync_session_id_6198_test.go,
+  userspace-dp/src/session/mod.rs, userspace-dp/src/session/tests.rs,
+  userspace-dp/src/session/README.md, docs/session-sync-architecture.md, _Log.md

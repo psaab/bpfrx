@@ -160,31 +160,38 @@ func TestUserspaceSyncedSessionIDNamespaceDisjointFromDataplane6198(t *testing.T
 	}
 }
 
+// oneSecondOfUptimeNanos is one second expressed in the units
+// userspaceSyncedSessionIDSeed consumes.
+const oneSecondOfUptimeNanos = uint64(1_000_000_000)
+
 // TestUserspaceSyncedSessionIDSeedSurvivesRestart6198 pins the cross-restart
-// anti-reuse property.
+// anti-reuse property across a WHOLE second of uptime.
 //
 // An unseeded counter would re-mint 1, 2, 3… after an xpfd restart and collide
 // with entries the peer's mirror still holds from the previous incarnation. The
 // old now<<16|Slot composition did NOT have that flaw (CLOCK_MONOTONIC keeps
 // increasing across a daemon restart), so seeding is what keeps this change a
 // strict improvement rather than a trade.
+//
+// This is also the NEGATIVE CONTROL for the sub-second case below: a full second
+// separates two incarnations under a second-resolution seed just as well as under
+// a nanosecond one, so this test passes in both worlds.
 func TestUserspaceSyncedSessionIDSeedSurvivesRestart6198(t *testing.T) {
-	// Two incarnations one second of uptime apart.
-	const uptime = uint64(1_000_000) // ~11.6 days, well inside the 48-bit space
+	// ~11.6 days of uptime, well inside the 48-bit seed space.
+	const uptime = uint64(1_000_000) * oneSecondOfUptimeNanos
 	seedA := userspaceSyncedSessionIDSeed(uptime)
-	seedB := userspaceSyncedSessionIDSeed(uptime + 1)
+	seedB := userspaceSyncedSessionIDSeed(uptime + oneSecondOfUptimeNanos)
 
-	gap := seedB - seedA
-	if want := uint64(1) << userspaceSyncedSessionIDSeedShift; gap != want {
-		t.Fatalf("one second of uptime advances the seed by %d, want %d", gap, want)
+	if seedB <= seedA {
+		t.Fatalf("a later incarnation seeds at %#x, not above the earlier %#x", seedB, seedA)
 	}
 
-	// Incarnation A must not reach incarnation B's seed. The bound is A's average
-	// mint rate; 1M conversions/second is already far above what the dataplane can
-	// produce (MAX_SESSIONS is 10M in total).
-	const mintedInThatSecond = uint64(1) << 20
+	// Incarnation A must not reach incarnation B's seed. The bound is A's AVERAGE
+	// mint rate over that second; 100k conversions/second is already well above
+	// what the dataplane sustains.
+	const mintedInThatSecond = uint64(100_000)
 	if seedA+mintedInThatSecond >= seedB {
-		t.Fatalf("incarnation A minting %d ids/s reaches incarnation B's seed "+
+		t.Fatalf("incarnation A averaging %d ids/s reaches incarnation B's seed "+
 			"(%#x + %d >= %#x) — ids would repeat across a restart",
 			mintedInThatSecond, seedA, mintedInThatSecond, seedB)
 	}
@@ -196,20 +203,147 @@ func TestUserspaceSyncedSessionIDSeedSurvivesRestart6198(t *testing.T) {
 	}
 }
 
+// TestUserspaceSyncedSessionIDSeedDistinctWithinOneSecond6198 drives the case the
+// whole-second test above CANNOT see: two incarnations whose first allocations
+// land inside the SAME integer monotonic second.
+//
+// That is the common restart, not the exotic one — systemd's `RestartSec=1` puts
+// a crash-restart squarely in the window, and the sub-second phase is uniform, so
+// on average half of all restarts land in it. A seed read at second resolution
+// gives both incarnations the SAME value and they repeat from their very first
+// id. Every separation below is far longer than a process teardown+exec, and
+// every one is invisible to a whole-second seed.
+func TestUserspaceSyncedSessionIDSeedDistinctWithinOneSecond6198(t *testing.T) {
+	// Uptime 1e6 s + 0.25 s: mid-second, so every offset below stays inside the
+	// same integer second.
+	const base = uint64(1_000_000)*oneSecondOfUptimeNanos + 250_000_000
+
+	for _, sep := range []struct {
+		name  string
+		nanos uint64
+	}{
+		{"1ms", 1_000_000},
+		{"10ms", 10_000_000},
+		{"100ms", 100_000_000},
+		{"700ms", 700_000_000},
+	} {
+		t.Run(sep.name, func(t *testing.T) {
+			// Guard the fixture: if the offset crossed a second boundary a
+			// second-resolution seed would legitimately differ and the test
+			// would be vacuous.
+			if base/oneSecondOfUptimeNanos != (base+sep.nanos)/oneSecondOfUptimeNanos {
+				t.Fatalf("fixture error: a %s offset from %d ns crosses a second "+
+					"boundary, so this case does not exercise the same-second window",
+					sep.name, base)
+			}
+			seedA := userspaceSyncedSessionIDSeed(base)
+			seedB := userspaceSyncedSessionIDSeed(base + sep.nanos)
+			if seedA == seedB {
+				t.Fatalf("two incarnations %s apart within one monotonic second "+
+					"share seed %#x — the restart re-mints from the same first id, "+
+					"so the new incarnation's ids collide with the previous one's "+
+					"entries still in the peer's mirror", sep.name, seedA)
+			}
+			if seedB <= seedA {
+				t.Fatalf("later incarnation seeds at %#x, not above the earlier %#x", seedB, seedA)
+			}
+		})
+	}
+}
+
 // TestUserspaceSyncedSessionIDIsSeededFromBootClock6198 pins that the allocator
-// actually APPLIES the seed — the property above is worthless if
+// actually APPLIES the seed — the properties above are worthless if
 // nextUserspaceSyncedSessionID never calls it. An unseeded counter would still be
 // in the low thousands after a whole test binary's worth of mints; a seeded one
-// starts at least one second of uptime (2^24) above zero.
+// starts at least one second of uptime above zero.
 func TestUserspaceSyncedSessionIDIsSeededFromBootClock6198(t *testing.T) {
-	if daemonMonotonicSeconds() == 0 {
-		t.Skip("system uptime < 1s: the boot-clock seed is 0 and carries no signal")
+	if daemonMonotonicNanos() < oneSecondOfUptimeNanos {
+		t.Skip("system uptime < 1s: the boot-clock seed carries no signal yet")
 	}
 	counter := nextUserspaceSyncedSessionID() &^ userspaceSyncedSessionIDNamespace
-	if floor := uint64(1) << userspaceSyncedSessionIDSeedShift; counter < floor {
+	if floor := userspaceSyncedSessionIDSeed(oneSecondOfUptimeNanos); counter < floor {
 		t.Fatalf("counter %d is below one second of seeded space (%d) — the "+
 			"allocator is not seeded from the boot clock, so ids repeat across a restart",
 			counter, floor)
+	}
+}
+
+// TestUserspaceSyncedSessionIDWrapEmitsNoDuplicate6198 drives the allocator TO
+// the 48-bit boundary, not near it.
+//
+// The counter must skip the reserved `0` — and the skip has to be COMMITTED to
+// the atomic. Correcting only the returned copy (`Add(1) & mask; if counter == 0
+// { counter = 1 }`) leaves the atomic holding the masked-zero value, so the call
+// AFTER the wrap reads 1 and returns the id just handed out. The duplicate stays
+// inside the namespace, so nothing downstream looks wrong — uniqueness just
+// silently stops holding.
+//
+// The wrap is reachable rather than theoretical: the seed consumes counter space,
+// so the distance to it depends on uptime phase.
+func TestUserspaceSyncedSessionIDWrapEmitsNoDuplicate6198(t *testing.T) {
+	// Let the lazy boot-clock seed fire first, so the Store below is not
+	// overwritten by it, then restore the allocator for any later test.
+	_ = nextUserspaceSyncedSessionID()
+	saved := userspaceSyncedSessionIDs.Load()
+	t.Cleanup(func() { userspaceSyncedSessionIDs.Store(saved) })
+
+	// One short of the last representable counter value.
+	userspaceSyncedSessionIDs.Store(userspaceSyncedSessionIDCounterMask - 1)
+
+	const mints = 4 // last-before-wrap, the wrap itself, and two past it
+	ids := make([]uint64, 0, mints)
+	seen := make(map[uint64]int, mints)
+	for i := 0; i < mints; i++ {
+		id := nextUserspaceSyncedSessionID()
+		if prev, dup := seen[id]; dup {
+			t.Fatalf("mints %d and %d across the 48-bit wrap both returned %#x — "+
+				"the zero-correction was applied to the returned copy but never "+
+				"committed to the atomic, so the id after the wrap repeats",
+				prev, i, id)
+		}
+		seen[id] = i
+		ids = append(ids, id)
+	}
+
+	for i, id := range ids {
+		if id == userspaceSyncedSessionIDNamespace {
+			t.Fatalf("mint %d returned the reserved 0 counter (%#x)", i, id)
+		}
+		if id>>48 != 0xFFFF {
+			t.Fatalf("mint %d left the namespace: %#x", i, id)
+		}
+	}
+
+	// The wrap must land on 1 and then keep climbing, not stall or repeat.
+	if got := ids[1] &^ userspaceSyncedSessionIDNamespace; got != 1 {
+		t.Fatalf("counter after the wrap = %d, want 1", got)
+	}
+	if got := ids[2] &^ userspaceSyncedSessionIDNamespace; got != 2 {
+		t.Fatalf("counter after the wrap+1 = %d, want 2 — the atomic did not "+
+			"retain the corrected value", got)
+	}
+}
+
+// TestUserspaceSyncedSessionIDDistinctAwayFromWrap6198 is the NEGATIVE CONTROL
+// for the wrap test: consecutive mints far from the boundary are distinct under
+// BOTH the CAS advance and the old Add-and-correct, because the correction branch
+// never runs there. A control that also reds would be a co-signer.
+func TestUserspaceSyncedSessionIDDistinctAwayFromWrap6198(t *testing.T) {
+	_ = nextUserspaceSyncedSessionID()
+	saved := userspaceSyncedSessionIDs.Load()
+	t.Cleanup(func() { userspaceSyncedSessionIDs.Store(saved) })
+
+	// Same distance-from-a-boundary shape as the wrap test, but at a point the
+	// counter merely passes through.
+	userspaceSyncedSessionIDs.Store(userspaceSyncedSessionIDCounterMask >> 1)
+
+	seen := make(map[uint64]int, 4)
+	for i := 0; i < 4; i++ {
+		id := nextUserspaceSyncedSessionID()
+		if prev, dup := seen[id]; dup {
+			t.Fatalf("mints %d and %d away from the wrap both returned %#x", prev, i, id)
+		}
+		seen[id] = i
 	}
 }
 

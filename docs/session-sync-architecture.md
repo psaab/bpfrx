@@ -419,25 +419,50 @@ a reserved namespace: `0xFFFF << 48 | counter48`. The namespace keeps the
 control-plane-minted ids disjoint from the dataplane ids the helper stamps into
 the same mirror field (`(worker_id & 0xFFFF) << 48 | counter48`, worker ids being
 tiny queue indices), so the two writers can never alias. That reservation is a
-cross-language invariant: it is recorded on the Rust side too, at
-`SessionTable::set_worker_id` and in `userspace-dp/src/session/README.md`, since
-that is the allocator which has to stay out of `0xFFFF`. The counter never
+cross-language invariant, and it is ENFORCED on the Rust side rather than merely
+recorded: `SessionTable::set_worker_id` asserts a worker id never lands on
+`CONTROL_PLANE_SESSION_ID_WORKER_HI`. A hard `assert!`, not `debug_assert!` —
+`make test-rust` and the shipped helper both build `--release`, where a debug
+assertion is stripped and would guard nothing — and worker setup is config time,
+where `docs/engineering-style.md` prefers crash-start over running with a wrong
+invariant. The counter never
 returns `0` — that is the established "unknown id" sentinel that makes
 `flowSessionDisplayID` fall back to the per-row ordinal.
 
 The counter is **seeded from the boot clock** on first use
-(`userspaceSyncedSessionIDSeed`, `monotonic_seconds << 24` masked to 48 bits).
+(`userspaceSyncedSessionIDSeed`, `monotonic_nanos >> 10` masked to 48 bits).
 Without a seed, an xpfd restart would re-mint `1, 2, 3…` and collide with entries
 the peer's mirror still holds from the previous incarnation — sessions this node
 closed while it was down, whose keys the post-restart bulk re-export never
 overwrites. The old `now<<16|Slot` composition did not have that flaw, because
 CLOCK_MONOTONIC is system uptime and keeps increasing across a daemon restart, so
-seeding is what keeps the change a strict improvement rather than a trade. Each
-second of uptime claims 2^24 ≈ 16.7M ids, so a restarting incarnation starts above
-its predecessor's high-water mark unless that predecessor averaged more than
-~16.7M synced conversions per second — orders of magnitude beyond the dataplane
-(`MAX_SESSIONS` is 10M in total). The seed wraps after ~194 days of uptime, which
-can only alias ids that old.
+seeding is what keeps the change a strict improvement rather than a trade.
+
+The seed reads **nanoseconds, not seconds**. A second-resolution read gives two
+incarnations whose first allocations land in the same integer second an identical
+seed, and they then repeat from their very first id — and that is the common
+restart, not the exotic one: systemd's `RestartSec=1` lands inside the window, and
+the sub-second phase is uniform, so on average half of all restarts do. At
+`>> 10` the seed granularity is ~1.024 µs, three orders of magnitude below the
+teardown+exec of any real restart. The seed advances ~976,562 per second of
+uptime, so a restarting incarnation starts above its predecessor's high-water mark
+unless that predecessor *averaged* more than ~976k synced conversions per second.
+The 48-bit seed space covers ~9.1 years of uptime before it cycles, and a cycle can
+only alias ids from an incarnation that old.
+
+The counter advances by **CAS, not a bare `Add`**, so the value stored is the value
+returned. The counter must skip the reserved `0`, and the skip has to be committed:
+`Add(1) & mask; if counter == 0 { counter = 1 }` corrects only the local copy, so at
+the wrap the atomic still holds the masked-zero value and the NEXT call returns the
+id just handed out. The duplicate stays inside the namespace, so nothing downstream
+looks wrong — uniqueness just silently stops holding. The wrap is reachable rather
+than theoretical, because the seed itself consumes counter space and the distance to
+the boundary depends on uptime phase. Ringing is the right behaviour there: a wrap
+re-mints only ids this incarnation issued 2^48 conversions ago, or ids from an
+incarnation whose entries are long gone. Refusing to mint would be worse — the id is
+display-only, but the conversion carrying it installs an HA-synced session, so
+failing it to protect a display field would trade a cosmetic alias for lost sessions
+at failover.
 
 The id is distinct per **conversion**, not stable per session. A bulk resync
 re-converts live sessions and re-stamps them with fresh ids, and the `close`

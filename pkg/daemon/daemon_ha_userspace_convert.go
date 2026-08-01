@@ -36,6 +36,16 @@ func daemonMonotonicSeconds() uint64 {
 	return uint64(ts.Sec)
 }
 
+// daemonMonotonicNanos is the full-resolution boot clock. daemonMonotonicSeconds
+// truncates to whole seconds, which is fine for session Created/LastSeen but NOT
+// for seeding an identity: two daemon incarnations whose first allocations land
+// in the same integer second would read the same value.
+func daemonMonotonicNanos() uint64 {
+	var ts unix.Timespec
+	_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
+	return uint64(ts.Sec)*1_000_000_000 + uint64(ts.Nsec)
+}
+
 // userspaceSyncedSessionIDNamespace reserves the high 16 bits of the node-local
 // BPF-ABI SessionID minted for an HA-synced session (#6198).
 //
@@ -53,13 +63,28 @@ const userspaceSyncedSessionIDNamespace = uint64(0xFFFF) << 48
 // that namespace — the same width the dataplane allocator uses.
 const userspaceSyncedSessionIDCounterMask = uint64(0x0000_FFFF_FFFF_FFFF)
 
-// userspaceSyncedSessionIDSeedShift is how far the boot clock is shifted to seed
-// the counter, i.e. how much counter space each SECOND of system uptime claims:
-// 2^24 ≈ 16.7M ids.
-const userspaceSyncedSessionIDSeedShift = 24
+// userspaceSyncedSessionIDSeedShift is how far monotonic NANOSECONDS are shifted
+// right to seed the counter. 2^10 ns ≈ 1.024 µs of seed granularity, which sets
+// both properties that matter:
+//
+//   - Two incarnations collide only if their first allocations land within the
+//     same 1.024 µs. A daemon restart is milliseconds at the very least (process
+//     teardown, exec, init), so the window is unreachable by three orders of
+//     magnitude. Seeding at SECOND resolution — the first cut of this fix — left
+//     a window of up to a full second, which systemd's `RestartSec=1` lands
+//     squarely inside.
+//   - The seed advances ~976,562 per second of uptime, so a restarting
+//     incarnation starts above its predecessor's high-water mark unless that
+//     predecessor averaged more than ~976k synced conversions per second. That is
+//     well above what the dataplane produces, and it is an AVERAGE over the
+//     predecessor's whole lifetime, not a peak.
+//
+// The 48-bit seed space covers 2^58 ns ≈ 9.1 years of uptime before it cycles;
+// a cycle can only alias ids from an incarnation that old.
+const userspaceSyncedSessionIDSeedShift = 10
 
 // userspaceSyncedSessionIDSeed returns the counter value a daemon incarnation
-// starts from, given the system uptime in seconds at which it began.
+// starts from, given the monotonic nanoseconds at which it began.
 //
 // A bare counter starting at 0 would make ids REPEAT across an xpfd restart: the
 // new incarnation re-mints 1, 2, 3… while entries the peer's conntrack mirror
@@ -69,17 +94,8 @@ const userspaceSyncedSessionIDSeedShift = 24
 // because CLOCK_MONOTONIC is system uptime and keeps increasing across a daemon
 // restart — so seeding is what keeps this change a strict improvement rather than
 // a trade.
-//
-// Seeding from the same boot clock restores the property. Each second of uptime
-// advances the seed by 2^24, so a restarting incarnation starts above its
-// predecessor's high-water mark unless that predecessor averaged more than ~16.7M
-// synced-session conversions PER SECOND — orders of magnitude above what the
-// dataplane can produce (MAX_SESSIONS is 10M in total). The mask bounds the seed
-// to the 48-bit counter space; it wraps after 2^24 seconds (~194 days) of uptime,
-// and a wrap can only alias ids minted ~194 days earlier, long since aged out of
-// any mirror.
-func userspaceSyncedSessionIDSeed(monotonicSeconds uint64) uint64 {
-	return (monotonicSeconds << userspaceSyncedSessionIDSeedShift) & userspaceSyncedSessionIDCounterMask
+func userspaceSyncedSessionIDSeed(monotonicNanos uint64) uint64 {
+	return (monotonicNanos >> userspaceSyncedSessionIDSeedShift) & userspaceSyncedSessionIDCounterMask
 }
 
 // userspaceSyncedSessionIDs is the node-local monotonic allocator behind
@@ -105,10 +121,25 @@ var (
 //
 // The counter is seeded from the boot clock on first use
 // (userspaceSyncedSessionIDSeed) so ids do not repeat across an xpfd restart
-// either. It is masked to 48 bits and never returns 0 (`0` is the established
-// "no id / unknown" sentinel that makes `flowSessionDisplayID` fall back to the
-// per-row ordinal), so even the unreachable wrap case stays well-formed rather
-// than aliasing the namespace bits or emitting the sentinel.
+// either.
+//
+// The advance is a CAS rather than a bare Add so the STORED value is the one that
+// was returned. `0` is the "no id / unknown" sentinel that makes
+// `flowSessionDisplayID` fall back to the per-row ordinal, so the counter skips
+// it — and skipping it has to be committed to the atomic. A bare
+// `Add(1) & mask; if counter == 0 { counter = 1 }` corrects only the local copy:
+// at the wrap the atomic still holds the masked-zero value, so the NEXT call
+// reads 1 and returns the id just handed out. That silently breaks the one
+// property this whole change exists to establish, and unlike a plain overflow it
+// leaves the id inside the namespace, so nothing downstream looks wrong.
+//
+// The wrap itself is reachable, not theoretical: the seed consumes counter space,
+// so the distance to it depends on uptime phase. A wrap only re-mints ids this
+// incarnation issued 2^48 conversions ago, or ids from an incarnation whose
+// entries are long gone — so the ring is the right behaviour. Refusing to mint
+// would be worse: this id is display-only, but the conversion that carries it
+// installs an HA-synced session, and failing that to protect a display field
+// would trade a cosmetic alias for lost sessions at failover.
 //
 // The id is per CONVERSION, not stable per session: a bulk resync re-converts
 // live sessions and re-stamps them with fresh ids, and the `close` branch of
@@ -122,13 +153,18 @@ var (
 // adopted verbatim by the peer helper. See docs/session-sync-architecture.md.
 func nextUserspaceSyncedSessionID() uint64 {
 	userspaceSyncedSessionIDOnce.Do(func() {
-		userspaceSyncedSessionIDs.Store(userspaceSyncedSessionIDSeed(daemonMonotonicSeconds()))
+		userspaceSyncedSessionIDs.Store(userspaceSyncedSessionIDSeed(daemonMonotonicNanos()))
 	})
-	counter := userspaceSyncedSessionIDs.Add(1) & userspaceSyncedSessionIDCounterMask
-	if counter == 0 {
-		counter = 1
+	for {
+		cur := userspaceSyncedSessionIDs.Load()
+		next := (cur + 1) & userspaceSyncedSessionIDCounterMask
+		if next == 0 {
+			next = 1
+		}
+		if userspaceSyncedSessionIDs.CompareAndSwap(cur, next) {
+			return userspaceSyncedSessionIDNamespace | next
+		}
 	}
-	return userspaceSyncedSessionIDNamespace | counter
 }
 
 func userspaceSessionTimeout(proto uint8) uint32 {

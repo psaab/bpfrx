@@ -1066,7 +1066,11 @@ to put on the wire.
   mints `0xFFFF << 48 | counter48` for the peer-synced sessions the daemon writes
   into the SAME BPF conntrack mirror field, so the two id spaces stay disjoint.
   Unreachable today (`binding.worker_id` is bounded by the worker count), but any
-  re-partition of these high bits must preserve it.
+  re-partition of these high bits must preserve it — `set_worker_id` ENFORCES the
+  reservation with a hard `assert!` (not `debug_assert!`: the helper and
+  `make test-rust` both build `--release`, where a debug assertion is stripped).
+  Pinned by `session::tests::set_worker_id_rejects_the_control_plane_namespace_6198`
+  and its negative control.
 - **Storage** — write-once on `SessionEntry.session_id`, never re-stamped, so a
   session's create and close read the same value.
 - **Wire** — harvested onto the Open/Close `SessionDelta.session_id` and encoded
