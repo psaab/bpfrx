@@ -1,3 +1,79 @@
+## 2026-08-01 — #5618 round 3: round 2 over-corrected; three reverts to mainline parity
+
+- **Timestamp**: 2026-08-01 (fix/5618-wg-plaintext-zone-authority, PR #6651)
+- **Action**: Codex round-3 review returned MERGE-NEEDS-MAJOR with 4 MAJORs.
+  Round 2 closed the fail-open but introduced correctness regressions —
+  the trade the lead flagged when sending the finding. Verified all four
+  firsthand against the mainline transit path before changing anything;
+  three of the four resolve to PARITY with that path rather than to a
+  naive fix.
+  (MAJOR 4) `NextTableUnsupported` is slow-path ELIGIBLE — its documented
+  contract in `types/forwarding.rs` is "inter-VRF next-table the helper
+  does not implement; defer to the kernel FIB", and it is produced for an
+  acyclic chain past the eight-table limit, not only for
+  discard-equivalent config. Round 2 lumped it with `DiscardRoute` and
+  blackholed kernel-routable inter-VRF traffic. Reverted to delegation.
+  (MAJOR 3) Round 2 folded EVERY "no resolvable L4" outcome into one
+  `inner_uninspectable` drop, which killed a well-formed IPv6 packet with
+  Next Header 59 (No Next Header) — a legal terminal that simply has no
+  L4. Mainline is explicit (#4743, poll_descriptor/mod.rs): drop "ONLY
+  the genuine over-limit chain; a non-first fragment / ICMPv6 / truncated
+  packet is not over-limit and keeps its existing flowless handling."
+  Narrowed to match: `OverLimit` drops; `NoNextHeader`/`Truncated` stamp
+  the post-base-header offset + the base Next Header byte and go to the
+  flowless L3 arm.
+  (MAJOR 1) Of the five delegations, `endpoint_absent` and
+  `ingress_unzoned` are NOT peer-steerable (both derive from the tunnel
+  row's fixed `logical_ifindex`). `egress_unzoned` IS — the peer picks
+  the inner destination, since AllowedIPs validates only the inner
+  SOURCE — and mainline does NOT bail on it: `zone_pair_ids_for_flow_with_override`
+  returns `to_id = 0` and hands it straight to
+  `evaluate_policy_result_l3_aware`, where #3110 falls through to the
+  default action. Fixed to do the same, using that very helper.
+  `no_egress_ifindex` (`NoRoute`) and `next_table_unsupported` are also
+  peer-steerable but are slow-path ELIGIBLE, and the mainline transit
+  policy gate runs only for `ForwardCandidate` — so dropping them in the
+  WG direction alone would diverge from `is_slow_path_eligible` AND
+  re-create the asymmetry this gate removes. Delegated for parity,
+  recorded as residuals rather than claimed closed. `local_delivery`
+  needs the host-inbound plane (admission + `to-zone junos-host`), which
+  this gate does not implement — scoped out explicitly as an open #5618
+  residual, since dropping it would break every legitimate host-bound
+  flow through the tunnel.
+  (MAJOR 2) NO code change, and the justification was corrected. A
+  port-bearing PERMIT matching only the first fragment IS the mainline
+  behaviour, stated in poll_descriptor/mod.rs as "the documented
+  fail-closed limitation" deferred to the #3291 fragment-association
+  cache; both directions call the same
+  `evaluate_policy_result_l3_aware` with `(ports = 0, l4_present =
+  false)`, so they agree by construction. The round-2 claim that #4569
+  covered it was WRONG — #4569 remembers only a skipped port-bearing
+  DENY and never recovers a skipped port-bearing PERMIT. Permitting on
+  the L3 match instead would make a port-bearing permit port-AGNOSTIC
+  for fragments and re-create the asymmetry. Pinned with a test that
+  uses a real port-bearing permit (`junos-http`, TCP/80) and asserts
+  BOTH legs — first fragment transits, non-first falls to the default —
+  so the deferred fragment-association cache reds it in both directions
+  at once rather than silently diverging them.
+- **File(s)**:
+  `userspace-dp/src/afxdp/coordinator/wg_control/{policy_gate.rs,policy_gate_tests.rs}`,
+  `userspace-dp/src/afxdp/coordinator/README.md`,
+  `docs/wireguard-interop.md`, `docs/userspace-dataplane-gaps.md`
+- **Validation**: full Rust leg green; Go build/vet/test green. 22 gate
+  tests. THREE mutation proofs, each `cargo build --release` CLEAN:
+  (C) `NextTableUnsupported` → drop reds
+  `next_table_unsupported_defers_to_the_kernel_fib` ("must be deferred to
+  the kernel FIB, not dropped", left `[]`);
+  (D) `NoNextHeader`/`Truncated` → drop reds
+  `ipv6_no_next_header_is_adjudicated_not_dropped` ("a valid IPv6
+  No-Next-Header packet must transit under a permit", left `[]`);
+  (E) restoring the `egress_unzoned` bail reds
+  `unzoned_egress_is_adjudicated_because_the_peer_selects_it` ("a
+  peer-selected unzoned egress skipped adjudication and the packet
+  reached the TUN (40 bytes escaped)").
+  Each mutation reds exactly ONE test; the other 21 stay green.
+  Cluster smoke still REQUIRED; not run.
+
 ## 2026-08-01 — #5618 round 2: two attacker-selectable fail-opens in the gate
 
 - **Timestamp**: 2026-08-01 (fix/5618-wg-plaintext-zone-authority, PR #6651)

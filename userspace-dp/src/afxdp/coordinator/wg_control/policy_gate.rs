@@ -62,59 +62,103 @@
 //! ports": `l4_present = false` is DEFINED as "ports are 0 and MUST NOT
 //! be trusted" — port-bearing application terms fail closed, while
 //! address/protocol/`any` terms still evaluate on the L3 identity the
-//! packet does carry, and #4569's fragment-association override turns a
-//! later permit into a drop when an overlapping port-bearing DENY was
-//! skipped. Dropping outright instead would break legitimate fragmented
-//! traffic and legitimate ICMP errors under a permit policy; delegating
-//! leaves the deny bypassable. Adjudicating on L3 is the answer the
-//! transit direction already settled on, so the two directions now agree
-//! by construction.
+//! packet does carry. Dropping the whole class outright instead would
+//! break legitimate flowless traffic; delegating it leaves the deny
+//! bypassable. Adjudicating on L3 is the answer the transit direction
+//! already settled on, so the two directions agree by construction —
+//! this gate calls the very same `evaluate_policy_result_l3_aware` with
+//! the same `(ports = 0, l4_present = false)` the mainline flowless
+//! transit arm passes.
+//!
+//! ### Inherited limitation: a port-bearing PERMIT and a non-first fragment
+//!
+//! Because port-bearing terms fail closed under `l4_present = false`, a
+//! `permit ... application junos-http` matches the FIRST fragment (real
+//! ports) but not the non-first fragments, which fall through to the
+//! default policy and drop. That is the mainline transit behaviour, not
+//! something this gate invents — `poll_descriptor/mod.rs` states it
+//! outright: "L4-specific-PERMITTED fragmented flows are the deferred
+//! fragment-association-cache stage of the #3291 plan; until then their
+//! non-first fragments fall to the default policy, the documented
+//! fail-closed limitation."
+//!
+//! An earlier revision of this comment claimed #4569's
+//! fragment-association override covered the case. **It does not** —
+//! #4569 remembers only a skipped port-bearing *DENY* and turns a later
+//! permit into a drop; it never recovers a skipped port-bearing
+//! *PERMIT* (`policy.rs`). The honest statement is that WireGuard inner
+//! ingress now inherits the same documented #3291 limitation as every
+//! other interface, and the same deferred fix (a fragment-association
+//! cache keyed on `(src, dst, frag-id)`) closes it in both directions at
+//! once. The alternative — permitting a fragment on the L3 match alone —
+//! would make a port-bearing permit port-AGNOSTIC for fragments and
+//! would re-create the very asymmetry this gate exists to remove (the
+//! same flow dropped LAN→WAN, permitted WG→LAN).
 //!
 //! ## Fail-CLOSED cases (`ForwardDrop`)
 //!
-//! Three dispositions are xpf verdicts in their own right, not an
-//! absence of authority, so they DROP rather than delegate:
+//! Deliberately NARROW — round 2 over-corrected here and killed valid
+//! traffic. Only three things drop:
 //!
-//!   - `DiscardRoute` / `NextTableUnsupported` — the xpf FIB said
-//!     *discard*. Handing the plaintext to the kernel after that is
-//!     incoherent, even though FRR usually installs the same blackhole.
-//!   - an UNINSPECTABLE inner packet: a truncated IP header, a declared
-//!     length overrunning the buffer, or an IPv6 extension chain still
-//!     unresolved at `MAX_IPV6_EXT_HEADERS`. The mainline forward path
-//!     fails these closed too (#2292 / #4743 `ipv6_ext_header_dropped`),
-//!     and an over-limit chain is a known IDS-evasion shape.
-//!   - a non-IPv4/IPv6 inner payload. WireGuard is an IP tunnel; the
-//!     inner version nibble is 4 or 6 by construction (a zero-length
-//!     keepalive never reaches here — it exits decap through the
-//!     `MalformedInner` arm), so anything else is malformed.
+//!   - `DiscardRoute` — the xpf FIB matched a discard/reject route
+//!     "whose entire purpose is to drop the traffic", and it is
+//!     explicitly NOT slow-path eligible. `NextTableUnsupported` is a
+//!     different animal and DELEGATES (see below).
+//!   - an OVER-LIMIT IPv6 extension chain (#4743's IDS-evasion shape).
+//!     A `NoNextHeader` terminal or an unfinished chain does NOT drop —
+//!     the L3 identity is intact, so it is adjudicated flowlessly, which
+//!     is what mainline does.
+//!   - a non-IPv4/IPv6 inner payload, or one too short to carry an L3
+//!     header. WireGuard is an IP tunnel; the inner version nibble is 4
+//!     or 6 by construction (a zero-length keepalive never reaches here —
+//!     it exits decap through the `MalformedInner` arm), so there is no
+//!     identity to adjudicate.
 //!
 //! ## Where the kernel delegation genuinely REMAINS (`Unadjudicated`)
 //!
-//! Only where xpf cannot compute a zone pair at all: the tunnel
-//! interface is not in a security zone, the routed egress interface is
-//! not in a security zone, the FIB resolves no egress interface, or the
-//! inner destination is host-bound (`LocalDelivery` — a
-//! `host-inbound-traffic` / `to-zone junos-host` question, a DIFFERENT
-//! policy plane, not a transit zone pair). Enforcing a DENY in those
-//! cases would drop traffic on the basis of a zone pair xpf could not
-//! actually compute, which is a worse failure than the bug.
+//! Three cases, and their steerability differs — which matters, because
+//! a delegation a peer can select on demand is a bypass while one fixed
+//! by operator config is not:
 //!
-//! The `LocalDelivery` residual is **attacker-reachable on demand** —
-//! AllowedIPs constrains the inner source, not the inner destination, so
-//! a peer may freely address any firewall-local IP. That is unchanged
-//! from master and belongs to the host-inbound plane (#5618's full-fix
-//! scope), but it is not an incidental corner and the docs say so.
+//!   - `endpoint_absent` / `ingress_unzoned` — NOT peer-steerable. Both
+//!     derive from the tunnel row's `logical_ifindex`, fixed when the
+//!     control thread spawns. No packet content reaches them.
+//!   - `next_table_unsupported` / `no_egress_ifindex` (`NoRoute`) — the
+//!     peer DOES select these via the inner destination, but both are
+//!     slow-path ELIGIBLE dispositions that the mainline transit path
+//!     also hands to the kernel FIB without evaluating the transit
+//!     policy (that gate runs only for `ForwardCandidate`). Dropping
+//!     them here alone would diverge from
+//!     `ForwardingDisposition::is_slow_path_eligible` AND re-create the
+//!     WG-vs-transit asymmetry. Delegated for parity, recorded as a
+//!     residual — not claimed closed.
+//!   - `local_delivery` — peer-selectable on demand (AllowedIPs
+//!     validates only the inner SOURCE, so the destination is entirely
+//!     the peer's choice) and NOT covered by this gate. A host-bound
+//!     inner packet belongs to the host-inbound plane
+//!     (`host-inbound-traffic` admission, then the `to-zone junos-host`
+//!     policy), which this control-thread gate does not implement.
+//!     Applying a TRANSIT zone-pair policy to it would be the wrong
+//!     authority; dropping it would break every legitimate host-bound
+//!     flow through the tunnel (ping/SSH to the firewall over WG).
+//!     **This is an open residual of #5618, not a closed case** — see
+//!     `docs/wireguard-interop.md`.
 //!
 //! Every un-adjudicated packet bumps `inner_policy_unadjudicated`, so
 //! the residual delegation is operator-visible rather than silent.
 //! Note that a cold ARP/ND entry is NOT in this set: a `MissingNeighbor`
 //! resolution still carries `egress_ifindex`, so the zone pair is known
-//! and the policy is enforced normally.
+//! and the policy is enforced normally. Neither is an unzoned EGRESS
+//! interface: the peer selects it, so it is adjudicated with
+//! `to_zone = 0` and resolved by #3110's default-action fall-through.
 
 use super::super::*;
-use crate::afxdp::forwarding::lookup_forwarding_resolution_inner;
+use crate::afxdp::forwarding::{
+    lookup_forwarding_resolution_inner, zone_pair_ids_for_flow_with_override,
+};
 use crate::afxdp::frame::{
-    packet_rel_l4_offset_and_protocol, parse_session_flow_from_frame, term_match_extra_from_frame,
+    ExtChainOutcome, parse_session_flow_from_frame, term_match_extra_from_frame,
+    walk_ipv6_ext_chain,
 };
 
 /// Ethernet header length of the synthetic frame the inner IP packet is
@@ -168,8 +212,15 @@ pub(super) fn evaluate_wg_inner_ingress(
     let logical_ifindex = endpoint.logical_ifindex;
     // #3110: zone id 0 is the reserved "unknown / no zone" sentinel. An
     // unzoned tunnel interface has no from-zone, so there is no zone pair
-    // to evaluate — this is the pre-existing "operator did not put wgN in
-    // a security zone" state, not a bypass we can close here.
+    // to evaluate at all — the gate's whole premise fails. This is
+    // operator config ("wgN is not in a security zone"), NOT peer-
+    // selectable: `logical_ifindex` is fixed by the tunnel row, so a peer
+    // cannot steer a packet into this branch. Delegate + count.
+    //
+    // Contrast the EGRESS zone below, which the peer DOES select via the
+    // inner destination: that one is adjudicated with `to_zone = 0` and
+    // resolved by #3110's fall-through to the default action, exactly as
+    // the mainline transit path does.
     let from_zone = forwarding
         .ifindex_to_zone_id
         .get(&logical_ifindex)
@@ -188,12 +239,9 @@ pub(super) fn evaluate_wg_inner_ingress(
         // by construction. Anything else is malformed — fail closed.
         _ => return InnerVerdict::ForwardDrop("inner_not_ip"),
     };
-    let Some((frame_len, meta)) = synthetic_frame_and_meta(inner, addr_family, gate_buf) else {
-        // Either the scratch is too small — unreachable in production
-        // (`gate_buf` is WG_GATE_ETH_LEN + 65535 while `decap_buf` is
-        // 65535) — or the inner packet is uninspectable. Fail closed
-        // rather than hand an unadjudicated packet to the kernel.
-        return InnerVerdict::ForwardDrop("inner_uninspectable");
+    let (frame_len, meta) = match synthetic_frame_and_meta(inner, addr_family, gate_buf) {
+        Ok(pair) => pair,
+        Err(reason) => return InnerVerdict::ForwardDrop(reason),
     };
     let frame = &gate_buf[..frame_len];
     let protocol = meta.protocol;
@@ -254,26 +302,57 @@ pub(super) fn evaluate_wg_inner_ingress(
             return InnerVerdict::Unadjudicated("local_delivery");
         }
         // xpf's own FIB said discard. That is a definite verdict, not an
-        // absence of authority — do not hand the plaintext to the kernel.
+        // absence of authority — and `DiscardRoute` is explicitly NOT
+        // slow-path eligible (`ForwardingDisposition::is_slow_path_eligible`:
+        // "matched a discard/reject route whose entire purpose is to drop
+        // the traffic"). Drop.
         ForwardingDisposition::DiscardRoute => {
             return InnerVerdict::ForwardDrop("discard_route");
         }
+        // r3 MAJOR 4: `NextTableUnsupported` is slow-path ELIGIBLE —
+        // "inter-VRF next-table the helper does not implement; defer to
+        // the kernel FIB". It is also produced for an acyclic chain past
+        // the eight-table limit, not only for discard-equivalent config,
+        // so dropping it blackholed kernel-routable inter-VRF traffic.
+        // Round 2 lumped it in with `DiscardRoute`; that was wrong.
         ForwardingDisposition::NextTableUnsupported => {
-            return InnerVerdict::ForwardDrop("next_table_unsupported");
+            return InnerVerdict::Unadjudicated("next_table_unsupported");
+        }
+        // r3 MAJOR 1 / `NoRoute`: no egress interface. Mainline treats
+        // `NoRoute` as slow-path ELIGIBLE ("userspace has no route, but
+        // the kernel FIB may (e.g. a route the helper has not yet
+        // learned); let the kernel try, rate-limited") and does NOT
+        // evaluate the transit policy for it — the flowless/session-miss
+        // policy gate runs only for `ForwardCandidate`. Delegating here
+        // is therefore exactly what the transit direction does for the
+        // same destination, so closing it in the WG direction alone would
+        // RE-CREATE the asymmetry this gate exists to remove. Peer-
+        // selectable via the inner destination, so it is recorded as a
+        // residual, not claimed closed.
+        _ if resolution.egress_ifindex <= 0 => {
+            return InnerVerdict::Unadjudicated("no_egress_ifindex");
         }
         _ => {}
     }
-    if resolution.egress_ifindex <= 0 {
-        return InnerVerdict::Unadjudicated("no_egress_ifindex");
-    }
-    let to_zone = forwarding
-        .ifindex_to_zone_id
-        .get(&resolution.egress_ifindex)
-        .copied()
-        .unwrap_or_default();
-    if to_zone == 0 {
-        return InnerVerdict::Unadjudicated("egress_unzoned");
-    }
+    // r3 MAJOR 1: the EGRESS zone is peer-selected (the inner destination
+    // is entirely the peer's choice — AllowedIPs validates only the inner
+    // SOURCE), so an unzoned egress must NOT bail out of adjudication. It
+    // is passed through as `to_zone = 0` and resolved by #3110's
+    // fall-through to the default action — byte-identical to what the
+    // mainline transit path does, which derives both ids with this same
+    // helper and hands a 0 straight to `evaluate_policy_result_l3_aware`.
+    // Round 2's `egress_unzoned` bail let a peer pick a destination
+    // routed out an unzoned interface and skip the policy entirely.
+    let (_from_zone_via_helper, to_zone) = zone_pair_ids_for_flow_with_override(
+        forwarding,
+        logical_ifindex,
+        None,
+        resolution.egress_ifindex,
+    );
+    debug_assert_eq!(
+        _from_zone_via_helper, from_zone,
+        "the gate's from-zone must agree with the shared zone-pair helper"
+    );
 
     // #3020: carry the REAL ICMP type/code so an icmp-type-constrained
     // application term (junos-ping = echo-request) matches. `extra` fails
@@ -310,10 +389,7 @@ pub(super) fn evaluate_wg_inner_ingress(
 
 /// Build the synthetic Ethernet-framed copy of `inner` in `gate_buf` and
 /// the `UserspaceDpMeta` describing it. Returns `(frame_len, meta)`, or
-/// `None` when the scratch is too small or the inner packet is
-/// UNINSPECTABLE (truncated IP header, declared length overrunning the
-/// buffer, or an IPv6 extension chain still unresolved at
-/// `MAX_IPV6_EXT_HEADERS`).
+/// `Err(reason)` when the packet must be dropped outright.
 ///
 /// **`l4_offset` is load-bearing and must be stamped** (r2 MAJOR 2).
 /// `term_match_extra_from_frame` trusts the field VERBATIM; leaving it at
@@ -322,24 +398,74 @@ pub(super) fn evaluate_wg_inner_ingress(
 /// type 0 code 0 — which broke `permit .. application junos-ping`
 /// (echo-request is type 8, so the term never matched and ping died
 /// through every tunnel) AND failed `deny .. application junos-ping`
-/// OPEN. `packet_rel_l4_offset_and_protocol` resolves the L4 offset and
-/// the TERMINAL protocol together over the L3-relative inner slice — the
-/// same SSOT the GRE inner-parse and tunnel local-origin metadata use,
-/// fail-closed on the uninspectable shapes above (#2292 / #4743).
+/// OPEN.
+///
+/// **Only an OVER-LIMIT IPv6 extension chain is a drop** (r3 MAJOR 3).
+/// Round 2 folded every "no resolvable L4" outcome into one
+/// `inner_uninspectable` drop, which newly killed valid traffic — most
+/// visibly a well-formed IPv6 packet with Next Header 59 (No Next
+/// Header), a legal terminal that simply has no L4. The mainline gate is
+/// narrower and says so explicitly (#4743, `poll_descriptor/mod.rs`):
+/// drop "ONLY the genuine over-limit chain; a non-first fragment /
+/// ICMPv6 / truncated packet is not over-limit and keeps its existing
+/// flowless handling." This mirrors that exactly:
+///
+///   - `L4(off, proto)` — normal: stamp the resolved offset + terminal
+///     protocol.
+///   - `OverLimit` — DROP (#4743 parity; the ext-header IDS-evasion
+///     shape).
+///   - `NoNextHeader` / `Truncated` — no L4 to point at, but the L3
+///     identity is intact and adjudicable: stamp the post-base-header
+///     offset and the base header's own Next Header byte, and let the
+///     flowless `l4_present = false` arm evaluate it.
+///
+/// An IPv4 packet whose IHL is degenerate is treated the same way: the
+/// L3 identity is still readable, so it is adjudicated rather than
+/// dropped. Only a packet too short to carry an L3 header at all is a
+/// drop — there is nothing to adjudicate.
 fn synthetic_frame_and_meta(
     inner: &[u8],
     addr_family: u8,
     gate_buf: &mut [u8],
-) -> Option<(usize, UserspaceDpMeta)> {
-    let frame_len = build_synthetic_frame(inner, addr_family, gate_buf)?;
-    let (rel_l4_offset, protocol) = packet_rel_l4_offset_and_protocol(inner, addr_family)?;
-    Some((
+) -> Result<(usize, UserspaceDpMeta), &'static str> {
+    let frame_len = build_synthetic_frame(inner, addr_family, gate_buf)
+        // Unreachable in production: `gate_buf` is WG_GATE_ETH_LEN +
+        // 65535 while `decap_buf` is 65535.
+        .ok_or("gate_buf_too_small")?;
+    let l3 = WG_GATE_ETH_LEN;
+    let (l4_offset, protocol) = if addr_family == libc::AF_INET as u8 {
+        if inner.len() < 20 {
+            return Err("inner_truncated_l3");
+        }
+        let protocol = inner[9];
+        let ihl = usize::from(inner[0] & 0x0f) * 4;
+        // A degenerate IHL still leaves the L3 identity readable, so
+        // adjudicate on it; point `l4_offset` past the fixed header.
+        let rel_l4 = if ihl >= 20 && inner.len() >= ihl { ihl } else { 20 };
+        (l3 + rel_l4, protocol)
+    } else {
+        if inner.len() < 40 {
+            return Err("inner_truncated_l3");
+        }
+        match walk_ipv6_ext_chain(&gate_buf[..frame_len], l3).outcome {
+            ExtChainOutcome::L4(offset, protocol) => (offset, protocol),
+            // #4743 parity: the ONE fail-closed inspection drop.
+            ExtChainOutcome::OverLimit => return Err("ipv6_ext_chain_over_limit"),
+            // A legal terminal with no L4 (59 = No Next Header), or a
+            // chain the walk could not finish. Either way the L3 identity
+            // is intact — adjudicate it flowlessly, as mainline does.
+            ExtChainOutcome::NoNextHeader | ExtChainOutcome::Truncated => {
+                (l3 + 40, inner[6])
+            }
+        }
+    };
+    Ok((
         frame_len,
         UserspaceDpMeta {
             addr_family,
             protocol,
             l3_offset: WG_GATE_ETH_LEN as u16,
-            l4_offset: (WG_GATE_ETH_LEN + rel_l4_offset) as u16,
+            l4_offset: u16::try_from(l4_offset).unwrap_or(u16::MAX),
             pkt_len: u16::try_from(inner.len()).unwrap_or(u16::MAX),
             ..UserspaceDpMeta::default()
         },
@@ -355,7 +481,7 @@ pub(super) fn synthetic_frame_and_meta_for_test(
     addr_family: u8,
     gate_buf: &mut [u8],
 ) -> Option<(usize, UserspaceDpMeta)> {
-    synthetic_frame_and_meta(inner, addr_family, gate_buf)
+    synthetic_frame_and_meta(inner, addr_family, gate_buf).ok()
 }
 
 /// Copy `inner` behind a synthetic Ethernet header in `gate_buf` and

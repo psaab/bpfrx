@@ -167,6 +167,38 @@ fn ipv6_tcp_non_first_fragment(src: Ipv6Addr, dst: Ipv6Addr) -> Vec<u8> {
     pkt
 }
 
+/// A well-formed IPv6 packet whose Next Header is 59 (No Next Header) —
+/// a LEGAL terminal with no L4 whatsoever. Round 2 dropped these.
+fn ipv6_no_next_header(src: Ipv6Addr, dst: Ipv6Addr) -> Vec<u8> {
+    let mut pkt = vec![0u8; 40];
+    pkt[0] = 0x60;
+    pkt[4..6].copy_from_slice(&0u16.to_be_bytes()); // zero payload length
+    pkt[6] = 59; // No Next Header
+    pkt[7] = 64;
+    pkt[8..24].copy_from_slice(&src.octets());
+    pkt[24..40].copy_from_slice(&dst.octets());
+    pkt
+}
+
+/// An IPv6 packet with 9 chained Destination-Options headers — one past
+/// `MAX_IPV6_EXT_HEADERS`, so the shared walker gives up. The #4743
+/// IDS-evasion shape, and the ONE inspection failure that drops.
+fn ipv6_over_limit_ext_chain() -> Vec<u8> {
+    let mut pkt = vec![0u8; 40 + 9 * 8 + 8];
+    pkt[0] = 0x60;
+    pkt[4..6].copy_from_slice(&((9 * 8 + 8) as u16).to_be_bytes());
+    pkt[6] = 60; // Destination Options
+    pkt[7] = 64;
+    pkt[8..24].copy_from_slice(&"2001:db8:77::5".parse::<Ipv6Addr>().unwrap().octets());
+    pkt[24..40].copy_from_slice(&"2001:db8:88::9".parse::<Ipv6Addr>().unwrap().octets());
+    for i in 0..9 {
+        let at = 40 + i * 8;
+        pkt[at] = if i == 8 { 6 } else { 60 };
+        pkt[at + 1] = 0; // 8 bytes
+    }
+    pkt
+}
+
 /// A minimal IPv6 TCP packet (40-byte IP header + 20-byte TCP header).
 fn ipv6_tcp(src: Ipv6Addr, dst: Ipv6Addr, src_port: u16, dst_port: u16) -> Vec<u8> {
     let mut pkt = vec![0u8; 60];
@@ -426,6 +458,18 @@ fn run_inner_full(forwarding: &ForwardingState, inner: &[u8]) -> (Vec<u8>, u64, 
     )
 }
 
+fn v6_route_to_lan() -> RouteSnapshot {
+    RouteSnapshot {
+        table: "inet6.0".to_string(),
+        family: "inet6".to_string(),
+        destination: "2001:db8:88::/64".to_string(),
+        next_hops: vec!["2001:db8:88::1@ge-0/0/9.0".to_string()],
+        discard: false,
+        next_table: String::new(),
+        preference: 0,
+    }
+}
+
 fn v4_route_to_lan() -> RouteSnapshot {
     RouteSnapshot {
         table: "inet.0".to_string(),
@@ -564,18 +608,7 @@ fn denied_inner_packet_is_dropped_even_with_a_cold_neighbor() {
 /// so these tests differ from it ONLY in the inner packet's shape.
 fn denied_zone_pair_forwarding() -> ForwardingState {
     let mut snapshot = base_snapshot();
-    snapshot.routes = vec![
-        v4_route_to_lan(),
-        RouteSnapshot {
-            table: "inet6.0".to_string(),
-            family: "inet6".to_string(),
-            destination: "2001:db8:88::/64".to_string(),
-            next_hops: vec!["2001:db8:88::1@ge-0/0/9.0".to_string()],
-            discard: false,
-            next_table: String::new(),
-            preference: 0,
-        },
-    ];
+    snapshot.routes = vec![v4_route_to_lan(), v6_route_to_lan()];
     snapshot.policies = vec![deny_rule("untrust", "trust")];
     build_forwarding_state(&snapshot)
 }
@@ -667,75 +700,226 @@ fn permitted_zone_pair_still_passes_protocols_without_a_5_tuple() {
     }
 }
 
-/// An UNINSPECTABLE inner packet is a definite xpf verdict, not an
-/// absence of authority: a truncated/degenerate IP header and an IPv6
-/// extension chain still unresolved at `MAX_IPV6_EXT_HEADERS` (#4743's
-/// IDS-evasion shape) must DROP rather than delegate.
-///
-/// Asserted at the GATE, then end-to-end. The two layers are separated
-/// deliberately: some degenerate headers are also refused earlier by
-/// `try_decap` (its AllowedIPs check reads the inner source), which is
-/// defense in depth — but it means an end-to-end "nothing escaped"
-/// assertion alone would pass even if the GATE fail-opened. The direct
-/// verdict assertion is what binds the gate's own behaviour.
+/// r3 MAJOR 3: the fail-closed inspection drop is NARROW. Only an
+/// OVER-LIMIT IPv6 extension chain drops (#4743's IDS-evasion shape) —
+/// mainline says so outright: drop "ONLY the genuine over-limit chain; a
+/// non-first fragment / ICMPv6 / truncated packet is not over-limit and
+/// keeps its existing flowless handling."
 #[test]
-fn uninspectable_inner_packets_are_dropped_not_delegated() {
+fn over_limit_ipv6_extension_chain_is_dropped() {
     let forwarding = denied_zone_pair_forwarding();
     let mut gate_buf = vec![0u8; super::policy_gate::WG_GATE_ETH_LEN + 65_535];
+    let inner = ipv6_over_limit_ext_chain();
 
-    // A v4 header whose declared IHL is 4 words = 16 bytes, below the
-    // 20-byte minimum, so the shared L4 resolver refuses it.
-    let mut bad_ihl = ipv4_tcp(
+    let verdict = super::policy_gate::evaluate_wg_inner_ingress(
+        &forwarding,
+        WG_ENDPOINT_ID,
+        &inner,
+        &mut gate_buf,
+    );
+    assert!(
+        matches!(verdict, super::policy_gate::InnerVerdict::ForwardDrop(_)),
+        "an over-limit IPv6 extension chain must fail CLOSED, got {verdict:?}"
+    );
+    let (escaped, _denies, forward_drops, unadjudicated) = run_inner_full(&forwarding, &inner);
+    assert!(escaped.is_empty(), "an over-limit chain must not reach the TUN");
+    assert_eq!(forward_drops, 1);
+    assert_eq!(unadjudicated, 0);
+}
+
+/// **r3 MAJOR 3 fail-on-revert.** A well-formed IPv6 packet with Next
+/// Header 59 (No Next Header) is a LEGAL terminal that simply carries no
+/// L4. Round 2 folded it into `inner_uninspectable` and DROPPED it,
+/// newly killing valid traffic that round 1 delivered. It must be
+/// adjudicated on its L3 identity like any other flowless packet:
+/// permitted under a permit, denied under a deny — never dropped for
+/// being unparseable.
+#[test]
+fn ipv6_no_next_header_is_adjudicated_not_dropped() {
+    let src: Ipv6Addr = "2001:db8:77::5".parse().unwrap();
+    let dst: Ipv6Addr = "2001:db8:88::9".parse().unwrap();
+    let inner = ipv6_no_next_header(src, dst);
+
+    // Under a PERMIT it must transit — this is the regression round 2
+    // introduced.
+    let mut permit_snapshot = base_snapshot();
+    permit_snapshot.routes = vec![v6_route_to_lan()];
+    permit_snapshot.policies = vec![permit_rule("untrust", "trust")];
+    let permit_fwd = build_forwarding_state(&permit_snapshot);
+    let (escaped, denies, forward_drops, unadjudicated) = run_inner_full(&permit_fwd, &inner);
+    assert_eq!(
+        escaped, inner,
+        "a valid IPv6 No-Next-Header packet must transit under a permit — it is a legal \
+         terminal, not an unparseable packet (denies={denies} forward_drops={forward_drops} \
+         unadjudicated={unadjudicated})"
+    );
+    assert_eq!(forward_drops, 0, "No-Next-Header is not an inspection failure");
+
+    // ...and under a DENY it must still be DENIED, not delegated: the
+    // fix must not turn the drop into a fail-open.
+    let deny_fwd = denied_zone_pair_forwarding();
+    let (escaped, denies, forward_drops, unadjudicated) = run_inner_full(&deny_fwd, &inner);
+    assert!(
+        escaped.is_empty(),
+        "a denied IPv6 No-Next-Header packet must not reach the TUN ({} bytes escaped)",
+        escaped.len()
+    );
+    assert_eq!(denies, 1, "the drop must be the ZONE-POLICY verdict");
+    assert_eq!(forward_drops, 0);
+    assert_eq!(unadjudicated, 0);
+}
+
+/// **r3 MAJOR 4 fail-on-revert.** `NextTableUnsupported` is slow-path
+/// ELIGIBLE — its documented contract is "inter-VRF next-table the
+/// helper does not implement; defer to the kernel FIB", and it is also
+/// produced for an acyclic chain past the eight-table limit, not only
+/// for discard-equivalent config. Round 2 lumped it in with
+/// `DiscardRoute` and blackholed kernel-routable inter-VRF traffic.
+#[test]
+fn next_table_unsupported_defers_to_the_kernel_fib() {
+    let mut snapshot = base_snapshot();
+    // A self-referential next-table: the resolver refuses it and reports
+    // NextTableUnsupported rather than a route.
+    snapshot.routes = vec![RouteSnapshot {
+        table: "inet.0".to_string(),
+        family: "inet".to_string(),
+        destination: "10.99.0.0/24".to_string(),
+        next_hops: Vec::new(),
+        discard: false,
+        next_table: "inet.0".to_string(),
+        preference: 0,
+    }];
+    snapshot.policies = vec![permit_rule("untrust", "trust")];
+    let forwarding = build_forwarding_state(&snapshot);
+
+    let inner = ipv4_tcp(
+        Ipv4Addr::new(10, 77, 0, 5),
+        Ipv4Addr::new(10, 99, 0, 9),
+        44_100,
+        80,
+    );
+    let (escaped, denies, forward_drops, unadjudicated) = run_inner_full(&forwarding, &inner);
+    assert_eq!(
+        escaped, inner,
+        "NextTableUnsupported is slow-path eligible — the packet must be deferred to the kernel \
+         FIB, not dropped (denies={denies} forward_drops={forward_drops})"
+    );
+    assert_eq!(
+        forward_drops, 0,
+        "deferring to the kernel FIB is not an xpf forward drop"
+    );
+    assert_eq!(
+        unadjudicated, 1,
+        "the deferral must be COUNTED as a residual delegation"
+    );
+}
+
+/// **r3 MAJOR 1 fail-on-revert.** The EGRESS zone is peer-selected: the
+/// inner destination is entirely the peer's choice, because AllowedIPs
+/// validates only the inner SOURCE. Round 2 bailed to `Unadjudicated`
+/// when the routed egress interface had no zone, so a peer picked a
+/// destination routed out an unzoned interface and skipped the policy.
+/// It must be adjudicated with `to_zone = 0` and resolved by #3110's
+/// default-action fall-through — what the mainline transit path does.
+#[test]
+fn unzoned_egress_is_adjudicated_because_the_peer_selects_it() {
+    let mut snapshot = base_snapshot();
+    snapshot.interfaces[1].zone = String::new(); // routed egress, no zone
+    snapshot.routes = vec![v4_route_to_lan()];
+    // A permit for the tunnel's own zone pair, so only the unzoned-egress
+    // handling can decide this packet. #3110 refuses zone-pair AND global
+    // policies when either id is 0, so the default action governs — and
+    // the default is deny.
+    snapshot.policies = vec![permit_rule("untrust", "trust")];
+    let forwarding = build_forwarding_state(&snapshot);
+
+    let inner = ipv4_tcp(
         Ipv4Addr::new(10, 77, 0, 5),
         Ipv4Addr::new(10, 88, 0, 9),
         44_100,
         80,
     );
-    bad_ihl[0] = 0x44;
+    let (escaped, denies, forward_drops, unadjudicated) = run_inner_full(&forwarding, &inner);
+    assert!(
+        escaped.is_empty(),
+        "a peer-selected unzoned egress skipped adjudication and the packet reached the TUN \
+         ({} bytes escaped)",
+        escaped.len()
+    );
+    assert_eq!(
+        denies, 1,
+        "an unzoned egress must reach the policy evaluator and land on the default action"
+    );
+    assert_eq!(forward_drops, 0);
+    assert_eq!(
+        unadjudicated, 0,
+        "a peer-selectable branch must not read as 'no authority' and delegate"
+    );
+}
 
-    // A v6 packet with 9 chained Destination-Options headers — one past
-    // MAX_IPV6_EXT_HEADERS, so the shared walker refuses the chain.
-    let mut over_limit = vec![0u8; 40 + 9 * 8 + 8];
-    over_limit[0] = 0x60;
-    over_limit[4..6].copy_from_slice(&((9 * 8 + 8) as u16).to_be_bytes());
-    over_limit[6] = 60; // Destination Options
-    over_limit[7] = 64;
-    over_limit[8..24].copy_from_slice(&"2001:db8:77::5".parse::<Ipv6Addr>().unwrap().octets());
-    over_limit[24..40].copy_from_slice(&"2001:db8:88::9".parse::<Ipv6Addr>().unwrap().octets());
-    for i in 0..9 {
-        let at = 40 + i * 8;
-        over_limit[at] = if i == 8 { 6 } else { 60 };
-        over_limit[at + 1] = 0; // 8 bytes
-    }
+/// r3 MAJOR 2, pinned rather than changed. A port-bearing PERMIT matches
+/// the FIRST fragment (real ports) but not the non-first fragments, which
+/// fall to the default policy and drop.
+///
+/// This is NOT a behaviour this gate invents — it is the mainline transit
+/// behaviour, stated in `poll_descriptor/mod.rs`: "L4-specific-PERMITTED
+/// fragmented flows are the deferred fragment-association-cache stage of
+/// the #3291 plan; until then their non-first fragments fall to the
+/// default policy, the documented fail-closed limitation." Both
+/// directions call the SAME `evaluate_policy_result_l3_aware` with
+/// `(ports = 0, l4_present = false)`, so they agree by construction.
+///
+/// The test uses a PORT-BEARING permit (`junos-http`, TCP/80) precisely
+/// because `permit application any` cannot exercise it. It pins the
+/// asymmetry between the two fragments so that the deferred
+/// fragment-association cache, when it lands, reds this test in both
+/// directions at once rather than silently diverging them.
+#[test]
+fn port_bearing_permit_covers_the_first_fragment_only_documented_3291_limitation() {
+    let mut snapshot = base_snapshot();
+    snapshot.routes = vec![v4_route_to_lan()];
+    let mut rule = permit_rule("untrust", "trust");
+    rule.applications = vec!["junos-http".to_string()];
+    rule.application_terms = vec![PolicyApplicationSnapshot {
+        name: "junos-http".to_string(),
+        protocol: "tcp".to_string(),
+        destination_port: "80".to_string(),
+        ..Default::default()
+    }];
+    snapshot.policies = vec![rule];
+    let forwarding = build_forwarding_state(&snapshot);
 
-    for (label, inner) in [
-        ("v4 header with IHL < 5", bad_ihl),
-        ("over-limit v6 extension chain", over_limit),
-    ] {
-        let verdict = super::policy_gate::evaluate_wg_inner_ingress(
-            &forwarding,
-            WG_ENDPOINT_ID,
-            &inner,
-            &mut gate_buf,
-        );
-        assert!(
-            matches!(verdict, super::policy_gate::InnerVerdict::ForwardDrop(_)),
-            "{label}: an uninspectable inner packet must fail CLOSED at the gate, got {verdict:?}"
-        );
-        // ...and end-to-end it must never reach the kernel, whichever
-        // layer refuses it first.
-        let (escaped, _denies, _forward_drops, unadjudicated) =
-            run_inner_full(&forwarding, &inner);
-        assert!(
-            escaped.is_empty(),
-            "{label}: an uninspectable inner packet reached the wgN TUN ({} bytes escaped)",
-            escaped.len()
-        );
-        assert_eq!(
-            unadjudicated, 0,
-            "{label}: xpf reached a verdict — it must not read as kernel delegation"
-        );
-    }
+    let src = Ipv4Addr::new(10, 77, 0, 5);
+    let dst = Ipv4Addr::new(10, 88, 0, 9);
+
+    // The FIRST fragment carries real ports, so the port-bearing permit
+    // matches and it transits.
+    let mut first = ipv4_tcp(src, dst, 44_100, 80);
+    first[6..8].copy_from_slice(&0x2000u16.to_be_bytes()); // MF set, offset 0
+    let (escaped, denies, _fd, unadjudicated) = run_inner_full(&forwarding, &first);
+    assert_eq!(
+        escaped, first,
+        "the FIRST fragment carries real ports — a port-bearing permit must match it \
+         (denies={denies} unadjudicated={unadjudicated})"
+    );
+
+    // The NON-FIRST fragment has no L4 header, so the port-bearing term
+    // fails closed and the default policy governs. Mainline parity.
+    let non_first = ipv4_tcp_non_first_fragment(src, dst);
+    let (escaped, denies, forward_drops, unadjudicated) = run_inner_full(&forwarding, &non_first);
+    assert!(
+        escaped.is_empty(),
+        "a non-first fragment cannot match a port-bearing term; it must fall to the default \
+         policy — the documented #3291 limitation, identical to the transit direction \
+         ({} bytes escaped)",
+        escaped.len()
+    );
+    assert_eq!(denies, 1, "the default-policy verdict must be the recorded reason");
+    assert_eq!(forward_drops, 0);
+    assert_eq!(
+        unadjudicated, 0,
+        "the fragment WAS adjudicated (on L3) — it must not read as kernel delegation"
+    );
 }
 
 /// r2 MINOR 5: xpf's own FIB resolved a DISCARD route for the inner

@@ -792,42 +792,87 @@ instead would break legitimate fragmented traffic and legitimate ICMP
 errors under a permit policy. The two directions now agree by
 construction.
 
+#### Inherited limitation: a port-bearing PERMIT and a non-first fragment
+
+Because port-bearing terms fail closed under `l4_present = false`, a
+`permit ... application junos-http` matches the **first** fragment (real
+ports) but not the **non-first** fragments, which fall to the default
+policy and drop. This is not something the WireGuard gate invents — it is
+the mainline transit behaviour, stated in `poll_descriptor/mod.rs`:
+"L4-specific-PERMITTED fragmented flows are the deferred
+fragment-association-cache stage of the #3291 plan; until then their
+non-first fragments fall to the default policy, the documented
+fail-closed limitation." Both directions call the same
+`evaluate_policy_result_l3_aware`, so WireGuard inner ingress simply
+inherits the same limitation as every other interface, and the same
+deferred fix (a fragment-association cache keyed on
+`(src, dst, frag-id)`) closes it in both directions at once.
+
+The alternative — permitting a fragment on the L3 match alone — would
+make a port-bearing permit port-*agnostic* for fragments and would
+re-create the asymmetry this gate exists to remove (the same flow dropped
+LAN→WAN, permitted WG→LAN). Note #4569 does **not** cover this: it
+remembers only a skipped port-bearing *deny* and turns a later permit
+into a drop; it never recovers a skipped port-bearing *permit*.
+
 ### Fail-closed cases
 
-Three dispositions are xpf verdicts in their own right, not an absence of
-authority, so they DROP and bump `inner_forward_drops`:
+Deliberately narrow. Only three things DROP and bump
+`inner_forward_drops`:
 
-- the xpf FIB resolved a **discard route** (or an unsupported next-table
-  chain) for the inner destination;
-- the inner packet is **uninspectable** — a truncated IP header, a
-  declared length overrunning the buffer, or an IPv6 extension chain
-  still unresolved at `MAX_IPV6_EXT_HEADERS` (the mainline forward path
-  fails these closed too, #2292 / #4743; an over-limit chain is a known
-  IDS-evasion shape);
-- the inner payload is **not IPv4 or IPv6**. WireGuard is an IP tunnel,
-  so anything else is malformed by construction.
+- the xpf FIB matched a **discard route** — one "whose entire purpose is
+  to drop the traffic", and explicitly NOT slow-path eligible;
+- the inner packet's IPv6 extension chain is **over-limit** (still
+  unresolved at `MAX_IPV6_EXT_HEADERS`) — the #4743 IDS-evasion shape.
+  A `NoNextHeader` terminal or an unfinished chain does **not** drop: the
+  L3 identity is intact, so it is adjudicated flowlessly, matching
+  mainline ("drop ONLY the genuine over-limit chain; a non-first fragment
+  / ICMPv6 / truncated packet is not over-limit and keeps its existing
+  flowless handling");
+- the inner payload is **not IPv4 or IPv6**, or is too short to carry an
+  L3 header. WireGuard is an IP tunnel, so there is no identity to
+  adjudicate.
 
 **Where xpf still delegates to the kernel — and how you see it.** The
-gate enforces only where xpf actually HAS authority. It preserves
-today's kernel delegation, and bumps `inner_policy_unadjudicated`, ONLY
-when xpf cannot compute a zone pair at all:
+gate enforces only where xpf actually HAS authority. Steerability
+differs across these, and it matters: a delegation a peer can select on
+demand is a bypass, one fixed by operator config is not.
+
+Not peer-steerable — both derive from the tunnel row's
+`logical_ifindex`, fixed when the control thread spawns:
 
 - the tunnel interface is **not in a security zone** (no from-zone);
-- the routed **egress interface is unzoned** (no to-zone);
-- the xpf FIB **resolves no egress interface** for the inner
-  destination;
-- the inner destination is **host-bound** (`LocalDelivery`) — that is a
-  `host-inbound-traffic` / `to-zone junos-host` question, a different
-  policy plane, not a transit zone pair. **This residual is reachable on
-  demand, not incidental**: AllowedIPs constrains the inner *source*
-  only, so a peer may freely address any firewall-local IP and reach the
-  host-inbound plane. Behaviour is unchanged from master and closing it
-  belongs to the full-fix scope below, but do not read it as an edge
-  case.
+- the tunnel endpoint has left the snapshot (teardown in flight).
 
-Dropping in those cases would mean refusing traffic on the basis of a
-zone pair xpf could not compute — a worse failure than the bug. Counting
-them makes the residual delegation operator-visible instead of silent.
+Peer-steerable via the inner destination, and delegated for **mainline
+parity** rather than because it is safe — recorded as residuals, not
+claimed closed:
+
+- the xpf FIB **resolves no egress interface** (`NoRoute`), or the route
+  needs an **unsupported next-table** chain. Both are slow-path
+  ELIGIBLE dispositions (`ForwardingDisposition::is_slow_path_eligible`:
+  "userspace has no route, but the kernel FIB may ... let the kernel
+  try"; "inter-VRF next-table the helper does not implement; defer to
+  the kernel FIB"), and the mainline transit path does not evaluate the
+  transit policy for them either — that gate runs only for
+  `ForwardCandidate`. Dropping them in the WireGuard direction alone
+  would diverge from that contract and re-create the very asymmetry this
+  gate removes.
+- the inner destination is **host-bound** (`LocalDelivery`) — a
+  `host-inbound-traffic` / `to-zone junos-host` question, a different
+  policy plane that this control-thread gate does not implement.
+  Applying a transit zone-pair policy would be the wrong authority;
+  dropping would break every legitimate host-bound flow through the
+  tunnel (ping or SSH to the firewall over WireGuard). **Open residual
+  of #5618**, reachable on demand: AllowedIPs validates only the inner
+  *source*, so the destination is entirely the peer's choice.
+
+An **unzoned egress interface is NOT in this list**. The peer selects it
+via the inner destination, so it is adjudicated with `to_zone = 0` and
+resolved by #3110's fall-through to the default action — byte-identical
+to the mainline transit path, which derives both zone ids with the same
+helper and hands a `0` straight to the policy evaluator. A cold ARP/ND
+entry is likewise not in this list (see above).
 
 Operator surfaces:
 
