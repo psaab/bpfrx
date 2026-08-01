@@ -1,10 +1,9 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v64 — r63 findings folded (Codex NEEDS-REVISION
-  5M/1m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS
-  0M/1m — the arm-ID-reuse leg, IS Codex M3's testing half;
-  all three confirm the §4.7 structure); pending convergence
-  review r64
+- **Status**: DRAFT v65 — r64 findings folded (Codex NEEDS-REVISION
+  3M/1m; AGY PLAN-READY; Claude SMR PLAN-READY (0 findings,
+  4 documented attacks FAILED); all three confirm the §4.7
+  structure); pending convergence review r65
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -2913,6 +2912,42 @@
   absolute wording is rewritten to the bounded form (Codex
   m1): teardown waits up to the five-second bound and may
   overlap ONE already-entered mutation.
+  v65: r64 convergence — the shutdown disposition's downstream
+  holes are closed, the manager-epoch reset is scoped to
+  Teardown, the rendering inventory gains the queued set, and
+  the budget arithmetic is corrected (Codex NEEDS-REVISION
+  3M/1m, folds 2 FOLDED / 3 PARTIAL, structure confirmed; AGY
+  PLAN-READY 5/5 with 2 fresh attacks FAILED, structure
+  confirmed; SMR PLAN-READY with 4 documented attacks FAILED):
+  (a) THE THREE DOWNSTREAM HOLES (Codex M1, all verified:
+  (i) after the drain times out, `stopPolicySchedulerLoop`
+  reacquires applySem with `context.Background()` — UNCAPPED —
+  `daemon_run_shutdown.go:78`, `daemon_scheduler.go:170-183`;
+  (ii) a startup abort invokes shutdown BEFORE `applyCancel`
+  initialization, `daemon_run.go:157-197`, skipping the drain
+  while phase four can launch the callback,
+  `daemon_run_bringup.go:493-520`; (iii) a preemption after
+  the callback's fence check but before the netlink call):
+  the downstream reacquisition gains a bounded context; the
+  admission-gate close is UNCONDITIONAL at every shutdown
+  entry, ahead of any conditional drain; and §9 gains the
+  preemption-between-check-and-call leg. (b) THE RESET SCOPE
+  (Codex M2, verified: `stopLocked` also runs during ordinary
+  helper restarts, `process.go:18-33,133`,
+  `manager_compile.go:242-249`, `process_status.go:61-70`,
+  and a compile restart occurs after the daemon installed the
+  callback with no later registration in that apply): the
+  reset/generation bump is TEARDOWN-SPECIFIC (never the
+  helper-restart paths), precedes `stopLocked`'s early return
+  (`process.go:210-216`), and the callback's generation
+  comparison occurs AFTER its applySem acquisition; §9 gains
+  the Teardown→reset→B-registration→A-generation-rejection
+  regression. (c) THE RENDERING INVENTORY GAINS THE QUEUED
+  SET (Codex M3). (d) The budget arithmetic is corrected
+  (Codex m1): the listed waits total 18s (with up to 6s more
+  from Run's defers, `daemon_run.go:100-112`, and a
+  pre-existing unbounded `wg.Wait`,
+  `daemon_run_shutdown.go:62-64`).
 
 ---
 
@@ -7061,7 +7096,10 @@ v20 history). The delivery is TWO units:
   tracks the outcome in its health state and pkg/cluster
   renders it) AND the current attempt token + the per-arm-ID
   pending set (r56 Codex m2 — the no-pending-outstanding term
-  is operator-checkable only if the surface carries it); the
+  is operator-checkable only if the surface carries it) AND
+  the per-attempt QUEUED set (r64 Codex M3's inventory
+  completion — the queued-empty term is operator-checkable
+  only if the surface carries the queued reservations); the
   rendering lands in pkg/cluster, the
   canonical accessor in pkg/configstore, the injection in
   pkg/daemon, and pkg/grpcapi/pkg/cli stay CODE-untouched as
@@ -7124,11 +7162,22 @@ v20 history). The delivery is TWO units:
   callback — treating XSK as already bound,
   `daemon_apply_interfaces.go:57-77`): the reusable-Teardown
   path RESETS the one-shot flag and CLEARS the callback
-  registration state (Teardown/stopLocked reset
-  `xskBoundNotified` and clear `OnXSKBound`), AND the
+  registration state — with the reset's SCOPE pinned (r64
+  Codex M2, verified: `stopLocked` also runs during ordinary
+  helper restarts, `process.go:18-33,133`,
+  `manager_compile.go:242-249`, `process_status.go:61-70`,
+  and a compile restart occurs after the daemon installed the
+  callback with no later registration in that apply — so a
+  `stopLocked`-scoped reset would strand epoch readiness):
+  the reset/generation bump is TEARDOWN-SPECIFIC (never the
+  helper-restart paths) and precedes `stopLocked`'s early
+  return (`process.go:210-216`), and the callback's
+  generation comparison occurs AFTER its applySem
+  acquisition — AND the
   callback carries the manager's lifecycle generation — a
   fire in a later manager epoch abandons by generation
-  mismatch; AND the callback is lifecycle-total and
+  mismatch; with the §9 Teardown→reset→B-registration→
+  A-generation-rejection regression; AND the callback is lifecycle-total and
   outcome-truthful (r58 Codex M2, both halves verified: (a)
   shutdown can release applySem before the detached callback
   runs, `daemon_run_shutdown.go:50-64,214-230` — so the
@@ -7164,7 +7213,11 @@ v20 history). The delivery is TWO units:
   implementability demand + M5's budget proof, both verified:
   the existing sequential worst-case waits — 5s apply drain +
   3s aggregator + 3s IPsec join + 2s HA clear + 5s
-  session-sync stop — already reach at least 23s against
+  session-sync stop — already reach 18s (with up to 6s more
+  from Run's defers, `daemon_run.go:100-112`, and a
+  pre-existing unbounded `wg.Wait`,
+  `daemon_run_shutdown.go:62-64` — arithmetic corrected per
+  r64 Codex m1) against
   `TimeoutStopSec=20`, `test/incus/xpfd.service:11`, so NO new
   sequential wait can be added): the gate is DAEMON-SCOPE
   state (an admission flag + the in-flight tracking, NOT
@@ -7177,6 +7230,20 @@ v20 history). The delivery is TWO units:
   waits for every in-flight callback — the close-admission
   step in `runShutdownSequence` adds NO new sequential wait
   (it flips the flag and the existing drain does the join) —
+  with the THREE downstream holes closed (r64 Codex M1, all
+  verified: (i) after the drain times out,
+  `stopPolicySchedulerLoop` reacquires applySem with
+  `context.Background()` — UNCAPPED —
+  `daemon_run_shutdown.go:78`, `daemon_scheduler.go:170-183`
+  — so the downstream reacquisition gains a bounded context;
+  (ii) a startup abort invokes shutdown BEFORE `applyCancel`
+  initialization, `daemon_run.go:157-197`, skipping the drain
+  while phase four can launch the callback,
+  `daemon_run_bringup.go:493-520` — so the admission-gate
+  close is UNCONDITIONAL at every shutdown entry, ahead of
+  any conditional drain; (iii) the §9 leg gains the
+  preemption-between-check-and-call case, not only an
+  already-entered operation) —
   Teardown never closes
   it — the shutdown closes
   admission FIRST and then joins the reserved set, and the
