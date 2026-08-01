@@ -62864,3 +62864,61 @@ break — `go vet` confirmed passing under every revert.
   silently -> 4 reds. Negative control: the ordinary armed boot still promotes.
 - **File(s)**: scripts/image/{xpf-kernel-promote,test_kernel_promote_explicit_path.py},
     pkg/upgrade/kernel_arm_record_6601_test.go, docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6601 r8 — fix the cross-check's string compare (it refused a healthy
+  candidate on every never-cut box), bind the Go producer side, and correct the
+  `--journal` rationale.
+  MAJOR-1. The record/unit cross-check compared STRINGS. The record comes from
+  `os.Executable()` -> `/proc/self/exe`, which the kernel reports FULLY RESOLVED
+  (the concrete `versions/<ver>/xpfd`); ExecStart before the first cut is the
+  shipped base unit's `/usr/local/sbin/xpfd` SYMLINK that `seed-runtime` creates
+  on first install. One file, two names, read as a "disagreement" -> refusal. So
+  every freshly installed or baked appliance was affected, and it bit hardest
+  with `MainPID=0` (xpfd.service not running) — which is the expected outcome of
+  a candidate kernel that breaks the AF_XDP shim, i.e. exactly the scenario the
+  revert guard exists for. Behaviour delta vs master: master ran the gate, hit
+  Gate 3/4, reverted and rebooted to known-good; this branch exited 0 with a
+  refusal and stranded the box. Fixed with `same_file` (`-ef`, `readlink -f`
+  fallback; both verified in /bin/sh, dash and busybox). The `-ef` lint is now
+  scoped to the `same_file` body — its ban is about SELECTION between leftovers,
+  an unanswerable question, whereas "do these two names denote one file" is
+  answerable and required — plus a new assertion pinning `same_file` to exactly
+  one caller so the exemption cannot widen.
+  The suite could not express the bug: `_derive_armed()` parses the record OUT of
+  `stub_execstart`, so record and ExecStart were string-equal by construction.
+  Added `_seed_runtime_layout()`, which builds the real chain
+  (`sbin/xpfd -> versions/current -> versions/v1/xpfd`) and records the RESOLVED
+  path, plus an over-reach guard (a symlink resolving to a DIFFERENT version
+  must still refuse) and both under busybox.
+  MAJOR-2. Four Go points had no coverage; deleting any left the whole suite
+  green while the feature was inert. Added tests driving the REAL state machine:
+  Arm writes the sidecar + stamps PromoteBinary; Promote REVERTS on a mismatched
+  PromoteBinary; the REAL `resolveArmingBinary` fails closed on all three
+  osExecutable failure shapes (the existing test replaced the resolver wholesale,
+  so the function body was executed by no test in the repo); Arm refuses when the
+  sidecar cannot be written.
+  MINOR-1. The `--journal` rationale was WRONG in three places: Go derives the
+  sidecar from the journal's directory, so that flag moves BOTH files and the
+  gate takes the QUIET branch, not the loud one. Corrected in the script, the
+  python module docstring and the class docstring; documented as diagnostic-only
+  for `arm` in the flag help + docs; filed #6632 for the arm-time refusal.
+  MINOR-2. `read` returns non-zero at EOF-without-newline AFTER setting the
+  variable, so `|| RECORDED=""` discarded a good path and misdiagnosed it as
+  "does not contain an absolute path". `journal_state` already handled this; the
+  two reads now agree.
+  NITs: `..._never_reaches_for_path` now also asserts the refusal (it was reached
+  by five tests but bound by four); `promoteScriptPath` Fatals instead of Skips
+  (a packaging move would have retired all four canaries silently); documented
+  the three `osExecutable` callers and the deliberate arm-closed/promote-open
+  asymmetry.
+  Validation: 65/65 python, `make selftest` 48/0/0, go build + vet + `go test
+  ./pkg/upgrade ./cmd/xpfd` green, gofmt clean on touched files (the 4 remaining
+  pkg/upgrade hits are pre-existing on origin/master — re-verified). SIX mutation
+  proofs, each build/vet/syntax-CLEAN first: string-compare cross-check -> 3 reds;
+  record read reverted -> 1 red; drop recordPromoteBinary -> 3 reds; drop Gate 2b
+  -> 1 red; resolveArmingBinary fails open -> 3 subtest reds; swallow the sidecar
+  write error -> 1 red.
+- **File(s)**: scripts/image/{xpf-kernel-promote,test_kernel_promote_explicit_path.py},
+    pkg/upgrade/{kernel_arm_record_6601_test.go,kernel_linux.go},
+    cmd/xpfd/upgrade_kernel.go, docs/in-place-upgrade.md, _Log.md

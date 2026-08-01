@@ -960,13 +960,20 @@ against, and the gate runs.
 **"Record absent" is itself an inference, and it is checked (#6601 r7).**
 When the sidecar is missing the gate would otherwise declare *nothing to
 promote* and exit — a positive claim made from the **absence** of a file.
-That claim holds only because arming writes the record; the two desync
-out of band. Go derives the sidecar's location from the journal path, so
-`xpfd upgrade kernel arm --journal <elsewhere>` writes it where the gate
-never looks, and a restored rootfs, a stray cleanup of `/var/lib/xpf`, or
-an interrupted clear each get there too. A candidate would then be armed,
-the gate would silently not run, and the next reboot would revert it —
-behind a line that reads like an ordinary boot.
+That claim holds only because arming writes the record before the `ARMED`
+transition and clears it with the journal, so no crash ordering can
+produce the divergence. Losing **one** of the two files out of band can:
+
+- a `/var/lib/xpf` restored from a backup taken before the arm, or
+  restored only partially;
+- a stray cleanup — a tmpfiles rule, an operator `rm`, a housekeeping
+  sweep — that removes the sidecar and leaves the journal;
+- a candidate armed by a build **predating** the sidecar and then
+  upgraded through the #1917 binary channel before the candidate boot:
+  the journal says `ARMED` and no record was ever written.
+
+A candidate is then armed, the gate silently does not run, and the next
+reboot reverts it — behind a line that reads like an ordinary boot.
 
 Not promoting is the safe direction, so this is availability and honesty
 rather than security. It is nonetheless the same laundering the
@@ -979,6 +986,19 @@ candidate `ARMED`? — and:
 | absent, or not at `ARMED` | quiet `nothing to promote` (naming both files) |
 | `ARMED` | loud `ERROR … REFUSING to promote`, saying the gate **did NOT run** and the candidate is **UNVERIFIED**, naming both files |
 | present but not a readable regular file | `WARNING`: cannot establish whether anything is armed — absence of evidence is not evidence of absence |
+
+**`--journal` is not one of those cases**, and must not be cited as this
+check's motivation. Go derives the sidecar from the journal's *directory*,
+so `xpfd upgrade kernel arm --journal <elsewhere>` moves **both** files
+together: the gate finds neither and takes the quiet branch. That is a
+real trap — the boot unit hardcodes
+`ExecStart=/usr/local/sbin/xpf-kernel-promote` with no way to pass a
+journal path, so a candidate armed against a non-default journal is
+*structurally* unpromotable — but it is pre-existing (before this gate
+existed, `xpfd upgrade kernel promote` read the default journal, found
+nothing and no-op'd identically) and orthogonal. **For the kernel
+channel, `--journal` is diagnostic-only**; the arm-time refusal is
+tracked separately as #6632.
 
 `ARMED` **specifically**, not `ARMING`: `ARMING` is prepared intent
 recorded before the firmware one-shot is read back, which is exactly the

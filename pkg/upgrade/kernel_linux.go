@@ -493,9 +493,28 @@ func (s *realKernelSystem) BootCurrent() (string, error) {
 	return "", fmt.Errorf("BootCurrent not found in efibootmgr output")
 }
 
-// osExecutable is os.Executable, a package var so a test can drive
-// resolveVerifyGateBin's ordering deterministically (under `go test` the real
-// os.Executable is the TEST binary, which is not an xpfd).
+// osExecutable is os.Executable, a package var so a test can drive the callers
+// below deterministically (under `go test` the real os.Executable is the TEST
+// binary, which is not an xpfd).
+//
+// THREE callers, across two files, and they do NOT want the same thing from it
+// (#6601):
+//
+//   - resolveVerifyGateBin (here) — first preference for the INNER hop's
+//     verify-dataplane exec; falls through to the configured roots below.
+//   - resolveArmingBinary (kernel_arm_record.go) — the AUTHORITY. The arming
+//     process IS an xpfd, so this names the live binary by construction. It
+//     fails CLOSED: an error refuses the arm, because arming is retryable and
+//     an unverified candidate kernel is not.
+//   - VerifyPromoteBinaryMatchesRecord (kernel_arm_record.go) — the promote-time
+//     cross-check. It fails OPEN on an error, deliberately: this is a second
+//     opinion whose authority (the sidecar) was already applied and validated by
+//     the outer hop, so an indeterminate answer must not veto a promotion the
+//     record already justified.
+//
+// That arm-closed / promote-open asymmetry is intentional. Change one of the
+// three and check the other two: they are the same function var, not the same
+// contract.
 var osExecutable = os.Executable
 
 // gateSbinDir and gateVersionsDir are the two configured-layout roots

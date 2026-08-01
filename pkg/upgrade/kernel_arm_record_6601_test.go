@@ -209,6 +209,208 @@ func TestPromoteScriptArmRecordPathMatchesGo(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// PRODUCER WIRING (#6601 r8 MAJOR-2).
+//
+// The tests above pin the record's SHAPE and the shell's view of it. None of
+// them drove the state machine, so four load-bearing points were unbound: that
+// arming calls recordPromoteBinary at all, that the promote path enforces the
+// record, that resolveArmingBinary itself fails closed, and that a failed
+// sidecar write refuses the arm. Deleting any of them left the entire Go suite
+// and all 65 python tests green while the feature was inert -- with the
+// recordPromoteBinary call removed, arming writes no sidecar, and EVERY
+// candidate boot then refuses. Python cannot see it: the shell harness writes
+// the record itself, never through Go.
+// ---------------------------------------------------------------------------
+
+// TestArmWritesTheSidecarAndJournalField drives the REAL arm and asserts the
+// record exists afterwards. This is the one that kills "delete the
+// recordPromoteBinary call from armCandidate".
+func TestArmWritesTheSidecarAndJournalField(t *testing.T) {
+	f := newFakeKernelSystem()
+	r := newKernelRunner(t, f)
+	if err := r.Arm("6.18.5-12-generic"); err != nil {
+		t.Fatalf("Arm: %v", err)
+	}
+
+	j, err := r.loadKernelJournal()
+	if err != nil {
+		t.Fatalf("load journal: %v", err)
+	}
+	if j.State != KernelStateArmed {
+		t.Fatalf("journal state = %s, want ARMED", j.State)
+	}
+	if j.PromoteBinary == "" {
+		t.Error("arming reached ARMED without stamping PromoteBinary on the journal; " +
+			"Gate 2b then has nothing to enforce")
+	}
+
+	rec := ArmRecordPath(r.cfg.JournalPath)
+	data, err := os.ReadFile(rec)
+	if err != nil {
+		t.Fatalf("arming reached ARMED without writing the sidecar %s (%v). The boot "+
+			"gate reads THIS file and never infers a path, so every candidate boot "+
+			"would find the record absent, the journal ARMED, and refuse — the "+
+			"feature is inert", rec, err)
+	}
+	got := strings.TrimSpace(string(data))
+	if got != j.PromoteBinary {
+		t.Errorf("sidecar = %q but journal PromoteBinary = %q; they are written from "+
+			"one resolved value and must not diverge", got, j.PromoteBinary)
+	}
+	self, err := osExecutable()
+	if err == nil && got != self {
+		t.Errorf("sidecar = %q, want the arming process's own binary %q — the whole "+
+			"point is that the arming knows this by construction", got, self)
+	}
+}
+
+// TestPromoteRevertsWhenTheRunningBinaryIsNotTheRecordedOne drives the REAL
+// promote path with a journal whose PromoteBinary names some other xpfd. Gate 2b
+// must REVERT: an undesignated binary does not get to authorize a promotion, and
+// on an A/B kernel trial reverting is the safe direction.
+func TestPromoteRevertsWhenTheRunningBinaryIsNotTheRecordedOne(t *testing.T) {
+	f := newFakeKernelSystem()
+	r := newKernelRunner(t, f)
+	if err := r.Arm("6.18.5-12-generic"); err != nil {
+		t.Fatalf("Arm: %v", err)
+	}
+
+	// The candidate boot is otherwise PERFECT: firmware honoured BootNext, the
+	// running kernel is the candidate, and both verification gates pass. The
+	// ONLY thing wrong is that this process is not the xpfd the arming
+	// designated — so a green result here means Gate 2b did not run.
+	j, err := r.loadKernelJournal()
+	if err != nil {
+		t.Fatalf("load journal: %v", err)
+	}
+	j.PromoteBinary = "/nonexistent/some-other/xpfd"
+	if err := r.saveKernelJournal(j); err != nil {
+		t.Fatalf("save journal: %v", err)
+	}
+	f.running = "6.18.5-12-generic"
+	f.bootCurrent = "0004"
+	f.verifyPass = true
+	f.beaconPass = true
+
+	err = r.Promote()
+	if err == nil {
+		t.Fatal("Promote SUCCEEDED while running a binary the arming did not designate; " +
+			"an undesignated xpfd authorized the promotion (#6601 Gate 2b)")
+	}
+	if !errorsIsReverted(err) {
+		t.Fatalf("Promote error = %v, want ErrKernelReverted — a record mismatch must "+
+			"REVERT, not surface as an infra error the oneshot ignores", err)
+	}
+	if f.order[0] == "0004" {
+		t.Error("the candidate slot was promoted to the BootOrder front despite the " +
+			"arm-record mismatch")
+	}
+}
+
+// TestResolveArmingBinaryFailsClosed exercises the REAL resolveArmingBinary.
+//
+// TestRecordPromoteBinaryFailsClosed above replaces the resolver wholesale, so
+// it proves only that recordPromoteBinary propagates an error handed to it —
+// the real function body was executed by no test in the repo. Both of its arms
+// are covered here, and the refusal is asserted end to end through Arm: a
+// preflight that cannot establish which binary is arming must refuse, because
+// arming is retryable and an unverified candidate kernel is not.
+func TestResolveArmingBinaryFailsClosed(t *testing.T) {
+	origExe := osExecutable
+	t.Cleanup(func() { osExecutable = origExe })
+
+	cases := []struct {
+		name string
+		exe  func() (string, error)
+		want string
+	}{
+		{
+			name: "os.Executable errors",
+			exe:  func() (string, error) { return "", errors.New("no /proc/self/exe") },
+			want: "os.Executable",
+		},
+		{
+			name: "os.Executable names something unusable",
+			exe:  func() (string, error) { return "/nonexistent/xpfd", nil },
+			want: "running binary",
+		},
+		{
+			name: "os.Executable returns a relative path",
+			exe:  func() (string, error) { return "xpfd", nil },
+			want: "running binary",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			osExecutable = tc.exe
+
+			got, err := resolveArmingBinary()
+			if err == nil {
+				t.Fatalf("resolveArmingBinary returned %q with no error; it FAILED OPEN, "+
+					"so an unverifiable layout stays armable precisely when the system "+
+					"cannot be interrogated", got)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not mention %q", err, tc.want)
+			}
+
+			// End to end: the arm itself must refuse, at the operator's terminal.
+			f := newFakeKernelSystem()
+			r := newKernelRunner(t, f)
+			err = r.Arm("6.18.5-12-generic")
+			if err == nil {
+				t.Fatal("Arm SUCCEEDED although the arming binary is unresolvable; the " +
+					"candidate would boot UNVERIFIED and never be promoted")
+			}
+			if !errors.Is(err, ErrKernelPromoteBinaryUnresolvable) {
+				t.Errorf("Arm error = %v, want ErrKernelPromoteBinaryUnresolvable", err)
+			}
+			j, jerr := r.loadKernelJournal()
+			if jerr != nil {
+				t.Fatalf("load journal: %v", jerr)
+			}
+			if j.State.atLeast(KernelStateArmed) {
+				t.Errorf("journal reached %s despite the refusal; the record is written "+
+					"BEFORE the ARMED transition precisely so this cannot happen", j.State)
+			}
+		})
+	}
+}
+
+// TestArmRefusesWhenTheSidecarCannotBeWritten covers the third fail-closed
+// point: the resolve succeeded but the sidecar did not land. An ARMED journal
+// with no readable record is the divergent state the boot gate refuses on, so
+// producing one here would arm a candidate that can never be promoted.
+//
+// The sidecar path is occupied by a DIRECTORY, so the durable rename onto it
+// fails while the journal's own directory stays writable (a read-only-directory
+// model would not survive a root test runner).
+func TestArmRefusesWhenTheSidecarCannotBeWritten(t *testing.T) {
+	f := newFakeKernelSystem()
+	r := newKernelRunner(t, f)
+	rec := ArmRecordPath(r.cfg.JournalPath)
+	if err := os.MkdirAll(rec, 0o755); err != nil {
+		t.Fatalf("stage a directory at the sidecar path: %v", err)
+	}
+
+	err := r.Arm("6.18.5-12-generic")
+	if err == nil {
+		t.Fatal("Arm SUCCEEDED although the sidecar could not be written; the candidate " +
+			"would boot with the journal ARMED and no record, which the gate refuses")
+	}
+	if !errors.Is(err, ErrKernelPromoteBinaryUnresolvable) {
+		t.Errorf("Arm error = %v, want ErrKernelPromoteBinaryUnresolvable", err)
+	}
+	j, jerr := r.loadKernelJournal()
+	if jerr != nil {
+		t.Fatalf("load journal: %v", jerr)
+	}
+	if j.State.atLeast(KernelStateArmed) {
+		t.Errorf("journal reached %s with no sidecar on disk", j.State)
+	}
+}
+
 var (
 	kernelJournalPathRE = regexp.MustCompile(`(?m)^KERNEL_JOURNAL="([^"]+)"`)
 	journalArmedStateRE = regexp.MustCompile(`(?m)^JOURNAL_ARMED_STATE="([^"]+)"`)
@@ -293,9 +495,18 @@ func TestPromoteScriptSelectsFromTheRecordNotInference(t *testing.T) {
 			"selection has drifted back to inference (#6601 r6)")
 	}
 	// The cross-check must refuse on disagreement rather than prefer one side.
-	if !strings.Contains(src, `"$CROSS" != "$RECORDED"`) {
+	if !strings.Contains(src, `! same_file "$CROSS" "$RECORDED"`) {
 		t.Error("no record-vs-unit disagreement check; a stale leftover unit " +
 			"could again select an older binary (#6601 r6 MAJOR)")
+	}
+	// ...and it must compare FILES. os.Executable() records a RESOLVED path
+	// while the shipped base unit's ExecStart is the /usr/local/sbin/xpfd
+	// symlink until the first cut, so a string compare refuses a healthy
+	// candidate on every never-cut box (#6601 r8 MAJOR-1).
+	if strings.Contains(src, `"$CROSS" != "$RECORDED"`) {
+		t.Error("the cross-check compares the record and the unit as STRINGS; one " +
+			"file reached through two names reads as a disagreement and refuses a " +
+			"healthy promotion (#6601 r8 MAJOR-1)")
 	}
 	// Nothing may re-introduce a compiled-default fallback.
 	for _, banned := range []string{
@@ -317,7 +528,13 @@ func promoteScriptPath(t *testing.T) string {
 	}
 	p := filepath.Join(wd, "..", "..", "scripts", "image", "xpf-kernel-promote")
 	if _, err := os.Stat(p); err != nil {
-		t.Skipf("promote script not found at %s: %v", p, err)
+		// FATAL, not Skip (#6601 r8 NIT). These are cross-language canaries: a
+		// packaging move that relocated the script would otherwise retire all
+		// four of them silently, which is the failure mode they exist to
+		// prevent, applied to themselves.
+		t.Fatalf("promote script not found at %s: %v — the cross-language canaries "+
+			"cannot run, so the shell's ARM_RECORD/KERNEL_JOURNAL/JOURNAL_ARMED_STATE/"+
+			"PROMOTE_UNIT are no longer pinned against Go", p, err)
 	}
 	return p
 }

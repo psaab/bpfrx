@@ -41,12 +41,20 @@ into a refusal and reds the test.
 
 SECOND, the quiet skip is itself an inference, and this issue exists because
 every inference eventually met a box that broke it. "Record absent" means
-"nothing armed" only because arming writes the record; the two files desync out
-of band (a non-default `--journal` path, a restored rootfs, a partial clear), and
-a candidate then goes UNVERIFIED behind a log line that reads like an ordinary
-boot. That is the same laundering the r5 MINOR-1 work removed from the
-not-found-unit branch, so the journal is consulted for ONE BIT — is a candidate
-ARMED — and the divergent state is loud.
+"nothing armed" only because arming writes the record, and losing just ONE of
+the two files breaks that: a `/var/lib/xpf` restored from before the arm or
+restored partially, a stray cleanup that takes the sidecar and leaves the
+journal, or a candidate armed by a build predating the sidecar. A candidate then
+goes UNVERIFIED behind a log line that reads like an ordinary boot — the same
+laundering the r5 MINOR-1 work removed from the not-found-unit branch — so the
+journal is consulted for ONE BIT (is a candidate ARMED) and the divergent state
+is loud.
+
+(A non-default `--journal` is NOT one of those cases and must not be cited as
+one: Go derives the sidecar from the journal's directory, so that flag moves
+BOTH files together and the gate finds neither. It is a real trap — the boot
+unit hardcodes this script with no way to pass a journal path, so such a
+candidate is structurally unpromotable — but a pre-existing and separate one.)
 
 FAIL-ON-REVERT: restore `command -v xpfd` / bare `xpfd upgrade kernel promote`,
 reintroduce a compiled-default fallback, remove the arm-record check, or make
@@ -112,6 +120,14 @@ def shell_function_body(text: str, name: str) -> str:
     raise AssertionError(f"unterminated shell function {name}")
 
 
+def shell_function_lines(text: str, name: str):
+    """1-based (first, last) line numbers of `name() { ... }`."""
+    body = shell_function_body(text, name)
+    start = text.index(body)
+    first = text.count("\n", 0, start) + 1
+    return first, first + body.count("\n")
+
+
 def code_lines():
     """The script's lines with comments stripped."""
     for lineno, line in enumerate(script_text().splitlines(), start=1):
@@ -142,10 +158,33 @@ class TestNoPathResolution(unittest.TestCase):
             "selection has drifted back to inference (#6601 r6)",
         )
         self.assertIn(
-            '"$CROSS" != "$RECORDED"',
+            'same_file "$CROSS" "$RECORDED"',
             text,
             "no record-vs-unit disagreement check; a stale leftover unit could "
             "again select an older binary (#6601 r6 MAJOR)",
+        )
+        self.assertNotIn(
+            '"$CROSS" != "$RECORDED"',
+            text,
+            "the cross-check compares STRINGS again. The record is a RESOLVED "
+            "path (os.Executable -> /proc/self/exe) and the shipped base unit's "
+            "ExecStart is the /usr/local/sbin/xpfd SYMLINK until the first cut, "
+            "so a string compare refuses a healthy candidate on every never-cut "
+            "box (#6601 r8 MAJOR-1)",
+        )
+        # `same_file` must stay confined to the cross-check: the `-ef` lint
+        # exemption above is scoped to its body, so a second caller would be a
+        # selection path smuggled past the ban.
+        calls = [
+            f"{SCRIPT.name}:{lineno}: {code.strip()}"
+            for lineno, code in code_lines()
+            if "same_file" in code and "same_file()" not in code
+        ]
+        self.assertEqual(
+            len(calls),
+            1,
+            "same_file must be called ONCE, by the cross-check. Any other "
+            f"caller is a filesystem-derived SELECTION (#6601 r8): {calls}",
         )
 
     def test_discovers_configured_path_from_systemd(self):
@@ -182,14 +221,27 @@ class TestNoPathResolution(unittest.TestCase):
         # healthy layout, in EVERY shape (different files, same inode, only one
         # survivor) — so the gate must have no filesystem-derived candidate at
         # all, not a cleverer test over one.
+        #
+        # The `-ef` ban is scoped to SELECTION (#6601 r8). Its rationale is that
+        # a same-inode test cannot decide WHICH of two leftover defaults is the
+        # live xpfd — an unanswerable question. Inside `same_file` the question
+        # is a different one, and answerable: do these two NAMES denote the same
+        # FILE? That is required there, because the record is a resolved path
+        # and ExecStart is a symlink before the first cut. The companion
+        # assertion below pins `same_file` to the cross-check so the exemption
+        # cannot widen into a selection path.
+        sf_first, sf_last = shell_function_lines(script_text(), "same_file")
         offenders = []
         for lineno, code in code_lines():
             for lit in (SBIN, VERSIONED):
                 if lit in code:
                     offenders.append(f"{SCRIPT.name}:{lineno}: {code.strip()}")
-            if re.search(r"(?:^|\s)-ef(?:\s|$)", code):
+            if re.search(r"(?:^|\s)-ef(?:\s|$)", code) and not (
+                sf_first <= lineno <= sf_last
+            ):
                 offenders.append(
-                    f"{SCRIPT.name}:{lineno}: same-inode test: {code.strip()}"
+                    f"{SCRIPT.name}:{lineno}: same-inode test OUTSIDE same_file: "
+                    f"{code.strip()}"
                 )
         self.assertEqual(
             offenders,
@@ -551,6 +603,34 @@ class _GateBase(unittest.TestCase):
         self.armed = str(live)
         return live, ran
 
+    def _seed_runtime_layout(self, version: str = "v1"):
+        """The layout a NEVER-CUT box actually has, with the record resolved.
+
+        `debian/xpf.postinst` runs `xpfd seed-runtime` on first install, and
+        `pkg/upgrade/runtime/seed.go` creates `<SbinDir>/xpfd` as an absolute
+        symlink through `versions/current`. No cut has run, so there is no
+        `10-xpf-version.conf` drop-in and ExecStart is still the shipped base
+        unit's `/usr/local/sbin/xpfd` — while `os.Executable()` in the arming
+        process reports the fully-resolved `versions/<ver>/xpfd`.
+
+        `_derive_armed()` cannot express this: it parses the record OUT of
+        `stub_execstart`, so record and ExecStart are string-equal by
+        construction and the symlink asymmetry is invisible. That is why the
+        r8 MAJOR-1 string compare survived a suite that claimed to cover the
+        healthy default-rooted box. Callers set `self.armed` from the RESOLVED
+        path returned here.
+
+        Returns (resolved_versioned_path, sbin_symlink_path, ran_marker).
+        """
+        base = str(self.fake_root) + "/var/lib/xpf/versions"
+        versioned = Path(base) / version / "xpfd"
+        ran = self._install_abs(versioned)
+        Path(base + "/current").symlink_to(version)
+        sbin = Path(str(self.fake_root) + SBIN)
+        sbin.parent.mkdir(parents=True, exist_ok=True)
+        sbin.symlink_to(base + "/current/xpfd")
+        return versioned, sbin, ran
+
     def _sbin_symlink_to_versioned(self):
         """The `flip` 6b layout: <SbinDir>/xpfd -> <VersionsDir>/current/xpfd.
 
@@ -809,6 +889,57 @@ class TestResolutionBehaviour(_GateBase):
     """Cross-check behaviour: it may confirm the record, never replace it."""
 
     # ---------------------------------------------- anti-over-reach: it works
+
+    def test_never_cut_box_promotes_though_execstart_names_the_sbin_symlink(self):
+        # #6601 r8 MAJOR-1, the state EVERY freshly installed or freshly baked
+        # appliance is in. The record is the RESOLVED versioned path
+        # (os.Executable -> /proc/self/exe) and ExecStart is the sbin SYMLINK
+        # the shipped base unit carries until the first cut. One file, two
+        # names — a string compare called that a "disagreement" and refused.
+        #
+        # MainPID=0 is the aggravator that makes it reachable rather than
+        # theoretical: it is what the gate sees when xpfd.service is not
+        # running, which is the expected outcome of a candidate kernel that
+        # breaks the AF_XDP shim (the unit's ExecStartPre runs
+        # verify-dataplane). So the refusal landed exactly where the revert
+        # guard was supposed to fire, and the box was stranded on a kernel
+        # whose dataplane never comes up.
+        versioned, sbin, ran = self._seed_runtime_layout()
+        self.assertNotEqual(
+            str(versioned), str(sbin), "fixture does not model the symlink asymmetry"
+        )
+        self.assertTrue(sbin.is_symlink() and sbin.resolve() == versioned.resolve())
+        self.armed = str(versioned)
+        self.stub_execstart = f"{{ path={sbin} ; argv[]={sbin} ; ignore_errors=no }}"
+        self.stub_mainpid = "0"  # xpfd.service is NOT running
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self._assert_ran(res, ran, "never-cut box, ExecStart names the sbin symlink")
+        self.assertIn(
+            "confirmed by",
+            res.stderr,
+            "the symlink and the resolved path were not recognised as one file: "
+            f"{res.stderr}",
+        )
+
+    def test_sbin_symlink_to_a_DIFFERENT_version_still_refuses(self):
+        # The over-reach guard on the fix above. Comparing FILES must not
+        # launder the r6 sequence: a stale drop-in (or a stale sbin symlink)
+        # naming an OLDER version names a DIFFERENT file, and identity must
+        # still say no.
+        _versioned, sbin, ran = self._seed_runtime_layout(version="v1")
+        other = Path(str(self.fake_root) + "/var/lib/xpf/versions/v2/xpfd")
+        other_ran = self._install_abs(other)
+        self.armed = str(other)  # armed by v2; the unit still points at v1
+        self.stub_execstart = f"{{ path={sbin} ; argv[]={sbin} }}"
+        self.stub_mainpid = "0"
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self._assert_refused(res, "sbin symlink resolves to a DIFFERENT version")
+        self.assertFalse(ran.exists(), f"ran the stale v1 binary: {res.stderr}")
+        self.assertFalse(other_ran.exists(), f"ran a contradicted record: {res.stderr}")
 
     def test_healthy_default_rooted_box_promotes_confirmed_by_execstart(self):
         # ANTI-OVER-REACH. A default-rooted install has not relocated anything,
@@ -1381,12 +1512,26 @@ class TestArmedWithoutARecordIsNotLaundered(_GateBase):
     from the ABSENCE of a file.
 
     That claim holds only because arming writes the record (before the ARMED
-    transition) and clears it with the journal. The two desync out of band: Go
-    derives the record's location from the journal path, so `xpfd upgrade kernel
-    arm --journal <elsewhere>` writes it where this gate never looks, and a
-    restored rootfs, a stray cleanup of /var/lib/xpf, or an interrupted clear
-    each get there too. A candidate is then armed, the gate silently does not
-    run, and the next reboot reverts it.
+    transition) and clears it with the journal, so no crash ordering can produce
+    the divergence. Losing ONE of the two files out of band can:
+
+      * a /var/lib/xpf restored from a backup taken before the arm, or restored
+        only partially;
+      * a stray cleanup (tmpfiles rule, an operator `rm`, a housekeeping sweep)
+        that removes the sidecar and leaves the journal;
+      * a candidate armed by a build PREDATING the sidecar and upgraded through
+        the #1917 binary channel before the candidate boot — journal ARMED, no
+        record ever written.
+
+    A candidate is then armed, the gate silently does not run, and the next
+    reboot reverts it.
+
+    Explicitly NOT one of those: `arm --journal <elsewhere>`. Go derives the
+    sidecar from the journal's directory, so that flag moves both files together
+    and the gate finds neither, taking the quiet branch. It is a separate,
+    pre-existing trap (the boot unit hardcodes the script with no journal
+    argument, so such a candidate can never be promoted at all) and must not be
+    cited as this check's motivation.
 
     Not promoting is the SAFE direction, so this is availability and honesty
     rather than security — but a candidate kernel that silently never promotes
@@ -1417,10 +1562,33 @@ class TestArmedWithoutARecordIsNotLaundered(_GateBase):
         # The refusal must not become a reason to go looking for an xpfd. This
         # is the state with the strongest pull towards a fallback: something IS
         # armed and there is a perfectly good xpfd on $PATH.
+        #
+        # The $PATH assertion alone holds on BOTH branches, so it does not bind
+        # the refusal — it would stay green under a make-this-silent mutation.
+        # Assert the refusal too, so five tests reach this branch and five bind
+        # it (#6601 r8 NIT).
         self.arm_explicitly_absent = True
         self.journal = self.journal_body("ARMED")
         res = self._run()
         self._assert_no_path_fallback(res, "armed journal, absent record")
+        self._assert_refused(res, "armed journal, absent record")
+
+    def test_record_without_a_trailing_newline_is_still_a_path(self):
+        # #6601 r8 MINOR-2. `read` returns non-zero at EOF-without-newline
+        # AFTER setting the variable, so `|| RECORDED=""` discarded a perfectly
+        # good absolute path and then refused with "does not contain an
+        # absolute path" — fail-safe, but it misdiagnoses, and it sends the
+        # operator after the wrong fault.
+        live, ran = self._arm_a_live_binary()
+        self.arm_explicitly_absent = True  # write the record by hand, unterminated
+        rec = Path(str(self.fake_root) + ARM_RECORD)
+        rec.parent.mkdir(parents=True, exist_ok=True)
+        rec.write_text(str(live))  # NO trailing newline
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self._assert_ran(res, ran, "arm record with no trailing newline")
+        self.assertNotIn("does not contain an absolute path", res.stderr)
 
     def test_compact_armed_journal_is_still_recognised(self):
         # The gate reads the journal line by line and json.MarshalIndent output
@@ -1692,6 +1860,36 @@ class TestBusyboxParity(_GateBase):
                     f"{res.stderr}",
                 )
                 self._assert_ran(res, live_ran, f"bare ExecStart with a {label}")
+
+    def test_never_cut_symlink_layout_promotes_under_busybox(self):
+        # The r8 MAJOR-1 fix leans on `-ef` (with a `readlink -f` fallback), and
+        # neither is in POSIX `test`. busybox sh is the other shell this runs
+        # under at early boot, and a `same_file` that silently never matches
+        # there would refuse a healthy candidate on every never-cut appliance —
+        # the exact regression the fix removes, reintroduced on one platform.
+        versioned, sbin, ran = self._seed_runtime_layout()
+        self.armed = str(versioned)
+        self.stub_execstart = f"{{ path={sbin} ; argv[]={sbin} }}"
+        self.stub_mainpid = "0"
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self._assert_ran(res, ran, "busybox sh, never-cut symlink layout")
+        self.assertIn("confirmed by", res.stderr)
+
+    def test_different_files_still_refuse_under_busybox(self):
+        # The over-reach half: `same_file` must still say NO under busybox, or
+        # the r6 stale-leftover-unit MAJOR is laundered on that platform.
+        _versioned, sbin, _ran = self._seed_runtime_layout(version="v1")
+        other = Path(str(self.fake_root) + "/var/lib/xpf/versions/v2/xpfd")
+        self._install_abs(other)
+        self.armed = str(other)
+        self.stub_execstart = f"{{ path={sbin} ; argv[]={sbin} }}"
+        self.stub_mainpid = "0"
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self._assert_refused(res, "busybox sh, genuinely different files")
 
     def test_journal_armed_state_is_recognised_under_busybox(self):
         # The r7 journal read is a `case` glob with an embedded variable and

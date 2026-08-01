@@ -466,6 +466,49 @@ try_candidate() {
     XPFD_SRC="$2"
 }
 
+# same_file is TRUE when two paths denote the same FILE. The cross-check needs
+# file identity, not string equality, because its two sides are produced by
+# mechanisms that disagree about symlinks (#6601 r8 MAJOR-1):
+#
+#   * the record comes from os.Executable() -> /proc/self/exe, which the kernel
+#     reports FULLY RESOLVED. On the `flip` 6b layout that is the concrete
+#     <VersionsDir>/<ver>/xpfd, never the <SbinDir>/xpfd symlink it was exec'd
+#     through.
+#   * ExecStart is whatever systemd was configured with, and BEFORE THE FIRST
+#     CUT that is the shipped base unit's `ExecStart=/usr/local/sbin/xpfd` --
+#     the symlink `seed-runtime` creates on first install (debian/xpf.postinst
+#     -> pkg/upgrade/runtime/seed.go). flip step 6c only pins the concrete
+#     versioned path into 10-xpf-version.conf AFTER a cut.
+#
+# So on every freshly installed or freshly baked box the two names denote ONE
+# file and differ as strings. A string compare called that a "disagreement" and
+# refused a healthy candidate -- and it did so precisely when xpfd.service is
+# NOT running, because that is when the MainPID hop is silent and ExecStart is
+# the only cross-check left. xpfd.service failing to start is a first-class
+# expected outcome of a candidate kernel that breaks the AF_XDP shim (the unit's
+# ExecStartPre runs verify-dataplane), which is the exact scenario this channel
+# exists to catch: the revert guard was made unable to fire.
+#
+# `-ef` is dev+inode identity, which is precisely the question here. It is NOT
+# the banned same-inode SELECTION heuristic: that one tried to decide WHICH of
+# two leftover defaults was live, which the filesystem cannot answer. This
+# compares a known authority against a second opinion, where identity settles
+# it -- and it cannot launder the r6 sequence, because a stale drop-in naming an
+# OLDER version names a DIFFERENT file and still refuses.
+#
+# Verified honoured by /bin/sh, dash and busybox sh. `readlink -f` is a fallback
+# so a shell without `-ef` degrades to canonical-path equality rather than to a
+# false refusal. Both callers pass paths that have already passed `usable`.
+same_file() {
+    [ "$1" = "$2" ] && return 0
+    if [ "$1" -ef "$2" ] 2>/dev/null; then
+        return 0
+    fi
+    sf_a=$(readlink -f -- "$1" 2>/dev/null) || sf_a=""
+    sf_b=$(readlink -f -- "$2" 2>/dev/null) || sf_b=""
+    [ -n "$sf_a" ] && [ "$sf_a" = "$sf_b" ]
+}
+
 # ---------------------------------------------------------------- selection
 #
 # ABSENT MEANS NOTHING IS ARMED — BUT ONLY IF THE JOURNAL AGREES (#6601 r7).
@@ -479,12 +522,27 @@ try_candidate() {
 # "Normally" is the whole problem. Deriving "nothing is armed" from the ABSENCE
 # of a file is an inference from ambient state, and this issue exists because
 # every such inference eventually met a box that broke it. This one breaks
-# whenever the two files desync out of band: `--journal <path>` puts the record
-# beside THAT journal while this gate reads the compiled default, and a restored
-# rootfs, a stray cleanup of /var/lib/xpf, or a half-finished clear each get
-# there too. A candidate is then armed, the gate silently does not run, the
-# candidate is never promoted, and the next reboot reverts it — reported by a
-# line that reads like an ordinary boot.
+# whenever the two files desync out of band, which takes losing ONE of them:
+#
+#   * a /var/lib/xpf restored from a backup taken before the arm, or restored
+#     only partially;
+#   * a stray cleanup (tmpfiles rule, an operator `rm`, a housekeeping sweep)
+#     that removes the sidecar and leaves the journal;
+#   * a candidate armed by a build PREDATING the sidecar, upgraded through the
+#     #1917 binary channel before the candidate boot: the journal says ARMED
+#     and no record was ever written.
+#
+# Note what is NOT in that list: `xpfd upgrade kernel arm --journal <elsewhere>`
+# moves BOTH files together (Go derives the sidecar from the journal's
+# directory), so the gate finds neither and takes the quiet branch. That is a
+# real trap, but a DIFFERENT one -- the boot unit hardcodes this script with no
+# way to pass a journal path, so a non-default --journal is structurally
+# unpromotable, exactly as it was before this gate existed. It is tracked
+# separately; do not cite it as the motivation for the check below.
+#
+# In the desyncs that ARE reachable, a candidate is armed, the gate silently
+# does not run, the candidate is never promoted, and the next reboot reverts it
+# — reported by a line that reads like an ordinary boot.
 #
 # Not promoting is the SAFE direction, so this is availability and honesty
 # rather than security. It is nonetheless exactly the laundering the r5 MINOR-1
@@ -495,7 +553,15 @@ try_candidate() {
 RECORDED=""
 if [ -f "$ARM_RECORD" ] && [ -r "$ARM_RECORD" ]; then
     # `read` stops at the first newline; the record is one line by construction.
-    { IFS= read -r RECORDED < "$ARM_RECORD"; } 2>/dev/null || RECORDED=""
+    #
+    # `|| [ -n "$RECORDED" ]` because `read` returns NON-ZERO at EOF-without-
+    # newline AFTER setting the variable (#6601 r8 MINOR-2). Go writes a
+    # trailing newline, but a record restored, hand-edited or copied without one
+    # is a perfectly good absolute path, and discarding it produced the
+    # actively-misleading "does not contain an absolute path" refusal.
+    # journal_state already handles this exact case a few lines up; the two
+    # reads now agree.
+    { IFS= read -r RECORDED || [ -n "$RECORDED" ]; } < "$ARM_RECORD" 2>/dev/null || RECORDED=""
 fi
 
 if [ ! -e "$ARM_RECORD" ]; then
@@ -552,13 +618,14 @@ try_candidate "$(unit_main_pid_exe)" "systemd MainPID -> /proc/<pid>/exe for $PR
 try_candidate "$(unit_exec_start)" "systemd ExecStart for $PROMOTE_UNIT"
 CROSS="$XPFD"
 
-if [ -n "$CROSS" ] && [ "$CROSS" != "$RECORDED" ]; then
+if [ -n "$CROSS" ] && ! same_file "$CROSS" "$RECORDED"; then
     refuse "the arming recorded $RECORDED as the xpfd that must verify this" \
         "candidate, but $PROMOTE_UNIT independently resolves to $CROSS" \
-        "($XPFD_SRC). These disagree, which is exactly what a stale leftover" \
-        "unit looks like: a prior cut can leave a disabled-but-loaded unit" \
-        "whose drop-in still names an OLD version, and retention keeps that" \
-        "version executable. Refusing rather than picking a side."
+        "($XPFD_SRC), and those are DIFFERENT FILES (not merely different" \
+        "names for one). That is exactly what a stale leftover unit looks" \
+        "like: a prior cut can leave a disabled-but-loaded unit whose drop-in" \
+        "still names an OLD version, and retention keeps that version" \
+        "executable. Refusing rather than picking a side."
 fi
 
 XPFD="$RECORDED"
