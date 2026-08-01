@@ -2,7 +2,9 @@ package authz
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -69,6 +71,12 @@ type socketQuery struct {
 	uid   uint32
 	state uint64
 	found bool
+	// malformed records that a row matched this query's 4-tuple but its state
+	// or uid column would not parse. It is kept separate from `found` because
+	// the two carry different obligations: `found` may still yield an identity,
+	// `malformed` never does — but it does prove a socket exists, which is the
+	// half that must not be lost. See scanTableInto.
+	malformed bool
 	// filesRead counts how many of this query's target files were actually
 	// read. Zero means we looked nowhere, which must not be reported as "no
 	// row found" — see findPeerSocket.
@@ -78,11 +86,29 @@ type socketQuery struct {
 }
 
 type socketResult struct {
-	uid   uint32
-	state uint64
-	found bool
-	err   error
+	uid       uint32
+	state     uint64
+	found     bool
+	malformed bool
+	err       error
 }
+
+// maxPendingLookups caps the batcher's queue.
+//
+// Every entry is a goroutine blocked in LookupPeer, so the queue length is
+// bounded in practice by the number of connections accepted since the current
+// read began — but "in practice" is not a bound, and http.Server imposes no
+// connection limit of its own. Past the cap a lookup is refused outright rather
+// than queued, which LookupPeer turns into a DENIAL (an errored table read
+// falls back to the address classification, and a caller that could be local is
+// denied). Refusing is therefore fail-closed, and it keeps a connect flood from
+// growing an unbounded slice inside the daemon while it also grows the goroutine
+// count.
+//
+// The value is deliberately far above any legitimate concurrency: the surface
+// answers a handful of operator actions per second, and 4096 simultaneous
+// in-flight peer lookups on it is already an attack rather than a workload.
+const maxPendingLookups = 4096
 
 // socketBatcher is the single-flight scheduler.
 type socketBatcher struct {
@@ -93,10 +119,19 @@ type socketBatcher struct {
 
 var batcher socketBatcher
 
+// errBatcherSaturated is returned when the pending queue is at maxPendingLookups.
+var errBatcherSaturated = errors.New("socket-table lookup queue is saturated")
+
 // lookup enqueues q and blocks until a read that started after the enqueue has
 // answered it.
 func (b *socketBatcher) lookup(q *socketQuery) socketResult {
 	b.mu.Lock()
+	if len(b.pending) >= maxPendingLookups {
+		b.mu.Unlock()
+		slog.Warn("authz: refusing peer lookup, socket-table queue saturated",
+			"pending", maxPendingLookups)
+		return socketResult{err: errBatcherSaturated}
+	}
 	b.pending = append(b.pending, q)
 	if !b.running {
 		b.running = true
@@ -133,7 +168,9 @@ func (b *socketBatcher) run() {
 				// claim hands the caller the credential path.
 				err = fmt.Errorf("no socket table could be read")
 			}
-			q.res <- socketResult{uid: q.uid, state: q.state, found: q.found, err: err}
+			q.res <- socketResult{
+				uid: q.uid, state: q.state, found: q.found, malformed: q.malformed, err: err,
+			}
 		}
 	}
 }
@@ -176,6 +213,15 @@ func scanBatch(batch []*socketQuery) {
 
 // scanTableInto reads one /proc/net/tcp{,6} file, recording matches onto the
 // queries waiting for them. It reports whether the file was read at all.
+//
+// A row that MATCHES a query's 4-tuple but whose state or uid column will not
+// parse is recorded as `malformed` rather than dropped. Dropping it reported "no
+// row" for a caller we had in fact found, which under LookupPeer's shape sends
+// that caller to the address classification and, on a stale negative, to the
+// credential. Recording it keeps the fail-safe outcome (no identity, and the
+// caller is known local, so it is denied) AND keeps the diagnosis, which a
+// silent `continue` threw away — the kernel does not emit such a row, so if one
+// appears the operator needs to know rather than see an unexplained 403.
 func scanTableInto(path string, byLocal map[string]map[string][]*socketQuery) bool {
 	f, err := os.Open(path)
 	if err != nil {
@@ -183,10 +229,17 @@ func scanTableInto(path string, byLocal map[string]map[string][]*socketQuery) bo
 	}
 	defer f.Close()
 
+	// Collected and logged ONCE per file per scan: the batcher already bounds
+	// scan frequency, and a per-row log on a table this size would be a flood
+	// vector rather than a diagnostic.
+	var badRows int
+	var badSample string
+
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		// Columns: sl local rem st tx:rx tr:when retrnsmt uid timeout inode ...
-		fields := strings.Fields(sc.Text())
+		line := sc.Text()
+		fields := strings.Fields(line)
 		if len(fields) < 8 {
 			continue // the header row and any short/garbled line
 		}
@@ -198,12 +251,16 @@ func scanTableInto(path string, byLocal map[string]map[string][]*socketQuery) bo
 		if !ok {
 			continue
 		}
-		st, perr := strconv.ParseUint(fields[3], 16, 8)
-		if perr != nil {
-			continue
-		}
-		uid, perr := strconv.ParseUint(fields[7], 10, 32)
-		if perr != nil {
+		st, sterr := strconv.ParseUint(fields[3], 16, 8)
+		uid, uiderr := strconv.ParseUint(fields[7], 10, 32)
+		if sterr != nil || uiderr != nil {
+			badRows++
+			if badSample == "" {
+				badSample = fmt.Sprintf("state=%q uid=%q", fields[3], fields[7])
+			}
+			for _, q := range qs {
+				q.malformed = true
+			}
 			continue
 		}
 		for _, q := range qs {
@@ -219,6 +276,11 @@ func scanTableInto(path string, byLocal map[string]map[string][]*socketQuery) bo
 			// reports 0 for a timewait mini-socket.
 			q.uid, q.state, q.found = 0, st, true
 		}
+	}
+	if badRows > 0 {
+		slog.Warn("authz: socket-table row matched a peer lookup but would not parse; "+
+			"the caller is treated as local-and-unattributable (denied)",
+			"path", path, "rows", badRows, "first", badSample)
 	}
 	// A read error mid-file (including bufio.Scanner's token-too-long) leaves
 	// whatever matched before it. Report the file as read only if it completed,

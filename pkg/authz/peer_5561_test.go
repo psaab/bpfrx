@@ -350,16 +350,26 @@ func TestLookupPeerRefusesScopedPeerAddress_5561(t *testing.T) {
 	}
 }
 
-// TestNonLocalPeerReadsNoSocketTable_5561 is the MAJOR-D guard at this layer: a
-// peer that cannot be local must cost ZERO socket-table work, so connection
-// churn from a routable address cannot serialize full /proc walks behind the
-// accept loop.
+// TestUnreadableTableStillReportsARoutablePeerOffBox_5561 was the MAJOR-D guard
+// for a property that no longer holds, and now guards what replaced it.
 //
-// The probe is precise rather than timing-based: the table paths point at files
-// that do not exist. If the code reads the table it gets "no socket table could
-// be read", which fails CLOSED to Local=true. Only a short-circuit before the
-// read yields a non-local answer.
-func TestNonLocalPeerReadsNoSocketTable_5561(t *testing.T) {
+// It used to claim that a peer which cannot be local costs ZERO socket-table
+// work. That early-out is GONE: it made a cached NEGATIVE decisive, which is the
+// round-5 MAJOR (see TestBrandNewLocalAddressIsAttributedNotOffBox_5561), and
+// the single-flight batcher had already removed the cost argument for it — 120
+// concurrent fresh connections cost 3 table reads. The table is now read first
+// for everyone. Asserting "zero reads" here would be asserting a property the
+// code deliberately gave up; the cost property that survives is
+// pkg/api's TestConcurrentConnectionsShareOneSocketTableRead_5561's, and it is about reads per
+// connection rather than reads at all.
+//
+// What must NOT change is the direction of the error path. With no readable
+// table the lookup knows nothing about the caller, so it falls back to the
+// address classification — the same answer the early-out gave, in both
+// directions. A routable peer that is not one of ours is still reported off-box,
+// so a broken /proc does not silently lock out every remote administrator; a
+// peer that IS one of ours is denied.
+func TestUnreadableTableStillReportsARoutablePeerOffBox_5561(t *testing.T) {
 	dir := t.TempDir()
 	defer SetProcNetTCPPathsForTest(filepath.Join(dir, "absent"), filepath.Join(dir, "absent6"))()
 	defer setLocalAddrsForTest([]net.Addr{
@@ -370,11 +380,22 @@ func TestNonLocalPeerReadsNoSocketTable_5561(t *testing.T) {
 		&net.TCPAddr{IP: net.IPv4(198, 51, 100, 7), Port: 51234},
 		&net.TCPAddr{IP: net.IPv4(10, 0, 61, 1), Port: 8080})
 	if id.Local {
-		t.Fatalf("a routable, non-local peer read the socket table (%+v) — every connection "+
-			"from off-box would walk /proc, which is the accept-loop flood", id)
+		t.Fatalf("an unreadable socket table reported a routable, NON-local peer as local "+
+			"(%+v) — a broken /proc would then deny every remote administrator, credential "+
+			"or not", id)
 	}
 	if id.OK {
 		t.Fatalf("a non-local peer was attributed: %+v", id)
+	}
+
+	// The other direction of the same fallback: a caller from one of OUR
+	// addresses, with no table to consult, is local-and-unattributable (denied).
+	ours := LookupPeer(
+		&net.TCPAddr{IP: net.IPv4(10, 0, 61, 1), Port: 51234},
+		&net.TCPAddr{IP: net.IPv4(10, 0, 61, 9), Port: 8080})
+	if !ours.Local || ours.OK {
+		t.Fatalf("an unreadable socket table reported a caller from our OWN address as "+
+			"%+v — it must deny, not fall through to the credential", ours)
 	}
 }
 
@@ -588,9 +609,9 @@ func TestProcAddrEncoding_5561(t *testing.T) {
 // cannot drift from the real /proc format without this failing.
 func TestProcParserAgreesWithLiveKernelRow_5561(t *testing.T) {
 	server, _ := acceptedPair(t, "tcp4", "127.0.0.1:0", nil)
-	uid, state, found, err := findPeerSocket(
+	uid, state, found, malformed, err := findPeerSocket(
 		server.RemoteAddr().(*net.TCPAddr), server.LocalAddr().(*net.TCPAddr))
-	if err != nil || !found {
+	if err != nil || !found || malformed {
 		t.Fatalf("live socket-table lookup failed: found=%v err=%v", found, err)
 	}
 	if state != tcpEstablished {
@@ -633,94 +654,116 @@ func firstRoutableHostAddr(t *testing.T) net.IP {
 	return nil
 }
 
-// TestBrandNewLocalAddressIsNotOffBox_5561 is the round-5 MAJOR guard.
+// TestBrandNewLocalAddressIsAttributedNotOffBox_5561 is the primary round-5
+// MAJOR guard, and it pins the fix's first half.
 //
-// The accept-time locality classification reads a snapshot refreshed at most
-// once per localAddrTTL, for hits AND misses. That rate limit is right for the
-// flood it exists to stop, but it caches a NEGATIVE answer — and the negative is
-// the one verdict that ADMITS: "not on this host" is the only row an api-auth
-// credential may speak for, and LookupPeer returns it without reading the socket
-// table at all. So for up to one TTL after an address is added to this host, a
-// caller arriving from that address is adjudicated through a shared secret
-// instead of through its login class. Address adds are observable to any local
-// account (`ip monitor address` needs no privilege) and this box adds them
-// routinely — VRRP VIPs on failover, DHCP leases, RA-derived addresses.
+// The accept-time interface-address snapshot is refreshed at most once per
+// localAddrTTL, for hits AND misses. The rate limit is right for the flood it
+// exists to stop, but the answer it caches includes the NEGATIVE — and the
+// negative used to be decisive: `!couldBeLocal` returned "not on this host"
+// WITHOUT READING THE SOCKET TABLE, which is the one row an api-auth credential
+// may speak for. So for up to a TTL after an address was added to this host, a
+// caller arriving from it did not merely lose its attribution, it skipped
+// attribution and was adjudicated through a shared secret. Address adds are
+// observable to any local account (`ip monitor address` needs no privilege) and
+// this box performs them routinely — VRRP VIPs on failover, DHCP leases,
+// RA-derived addresses.
 //
-// The window is real and is asserted here as a PRECONDITION. What must not
-// happen is acting on it: PeerCouldBeLocalNow re-derives the same rule from an
-// enumeration started by the call, and the credential row consults that instead.
-func TestBrandNewLocalAddressIsNotOffBox_5561(t *testing.T) {
-	t.Run("real socket on a real host address", func(t *testing.T) {
-		host := firstRoutableHostAddr(t)
-		// Both ends off-loopback, so couldBeLocal cannot short-circuit and the
-		// verdict really does come from the interface-address snapshot.
-		server, _ := acceptedPair(t, "tcp4", (&net.TCPAddr{IP: host}).String(),
-			&net.TCPAddr{IP: host})
-		client := server.RemoteAddr().(*net.TCPAddr)
-		local := server.LocalAddr().(*net.TCPAddr)
+// The fix is to stop letting a negative decide: read the table first, and use
+// the address classification only where the table has nothing to say. A row hit
+// proves locality on its own, from the kernel rather than from a snapshot.
+//
+// Reproduced against a REAL established socket whose two ends are a real
+// routable address of this host, with the snapshot seeded from before that
+// address existed. The caller must be ATTRIBUTED — same uid the kernel reports
+// for the socket — not routed off-box.
+func TestBrandNewLocalAddressIsAttributedNotOffBox_5561(t *testing.T) {
+	host := firstRoutableHostAddr(t)
+	// Both ends off-loopback, so couldBeLocal cannot short-circuit on the
+	// loopback clause and the stale snapshot is really what would decide.
+	server, _ := acceptedPair(t, "tcp4", (&net.TCPAddr{IP: host}).String(),
+		&net.TCPAddr{IP: host})
+	client := server.RemoteAddr().(*net.TCPAddr)
+	local := server.LocalAddr().(*net.TCPAddr)
 
-		// This caller is unambiguously ON THIS HOST: the kernel is holding its
-		// established socket and reports this process's own uid for it.
-		uid, state, found, err := findPeerSocket(client, local)
-		if err != nil || !found || state != tcpEstablished {
-			t.Fatalf("precondition: the live socket %v -> %v was not found "+
-				"(found=%v state=%d err=%v)", client, local, found, state, err)
-		}
-		if uid != uint32(os.Getuid()) {
-			t.Fatalf("precondition: live socket reported uid %d, want %d", uid, os.Getuid())
-		}
+	// This caller is unambiguously ON THIS HOST: the kernel is holding its
+	// established socket and reports this process's own uid for it.
+	uid, state, found, malformed, err := findPeerSocket(client, local)
+	if err != nil || !found || malformed || state != tcpEstablished {
+		t.Fatalf("precondition: the live socket %v -> %v was not found "+
+			"(found=%v malformed=%v state=%d err=%v)", client, local, found, malformed, state, err)
+	}
+	if uid != uint32(os.Getuid()) {
+		t.Fatalf("precondition: live socket reported uid %d, want %d", uid, os.Getuid())
+	}
 
-		// Seed the accept-time snapshot from a moment BEFORE the address existed
-		// — the state the cache is in for up to a TTL after any address add.
-		prev := localAddrsFn
-		localAddrsFn = func() ([]net.Addr, error) { return nil, nil }
-		resetLocalAddrCacheForTest()
-		if isLocalAddr(host) {
-			t.Fatal("could not seed a pre-add snapshot")
-		}
-		// The address is now on the host (it always was — the seeded snapshot is
-		// what lagged). Restore the real enumerator WITHOUT clearing the cache,
-		// which is exactly the state a real address add leaves behind.
-		localAddrsFn = prev
-		t.Cleanup(resetLocalAddrCacheForTest)
+	// Seed the accept-time snapshot from a moment BEFORE the address existed —
+	// the state the cache is in for up to a TTL after any address add.
+	prev := localAddrsFn
+	localAddrsFn = func() ([]net.Addr, error) { return nil, nil }
+	resetLocalAddrCacheForTest()
+	if isLocalAddr(host) {
+		t.Fatal("could not seed a pre-add snapshot")
+	}
+	// The address is on the host (it always was — the seeded snapshot is what
+	// lagged). Restore the real enumerator WITHOUT clearing the cache, which is
+	// exactly the state a real address add leaves behind.
+	localAddrsFn = prev
+	t.Cleanup(resetLocalAddrCacheForTest)
 
-		if id := LookupPeer(client, local); id.Local || id.OK {
-			t.Fatalf("precondition: the stale-snapshot window did not reproduce (%+v); "+
-				"this case is then asserting nothing", id)
-		}
-		if !PeerCouldBeLocalNow(client, local) {
-			t.Fatalf("a caller whose ESTABLISHED socket this kernel is holding, from an " +
-				"address assigned to this very host, was confirmed OFF-BOX — the api-auth " +
-				"credential would then speak for it, so any local account that connects " +
-				"from a freshly added VIP or DHCP address escapes its login class")
-		}
-	})
+	id := LookupPeer(client, local)
+	if !id.OK {
+		t.Fatalf("a caller whose ESTABLISHED socket this kernel is holding, from an "+
+			"address assigned to this very host, was not attributed (%+v). If Local is "+
+			"false the api-auth credential speaks for it, so any local account that "+
+			"connects from a freshly added VIP or DHCP address escapes its login class", id)
+	}
+	if !id.Local || id.UID != uint32(os.Getuid()) {
+		t.Fatalf("LookupPeer = %+v, want an attributed LOCAL identity for uid %d", id, os.Getuid())
+	}
+}
 
-	t.Run("deterministic, no routable address required", func(t *testing.T) {
-		client := &net.TCPAddr{IP: net.IPv4(203, 0, 113, 5), Port: 51234}
-		local := &net.TCPAddr{IP: net.IPv4(198, 51, 100, 1), Port: 8080}
+// TestBrandNewLocalAddressWithNoSocketRowIsNotOffBox_5561 pins the fix's second
+// half: the residual the table-first restructure does NOT cover.
+//
+// Reading the table first removes the cached negative from the decision for any
+// caller that HAS a socket. It does not remove it from the "no row at all" case,
+// which is still resolved from the address classification — and a local caller
+// that destroyed its own socket (an SO_LINGER-0 reset) before the read, from an
+// address added within the last TTL, lands there. Such a caller cannot read a
+// response, but the handler still runs, so a fire-and-forget commit is a real
+// outcome rather than a cosmetic one.
+//
+// PeerCouldBeLocalNow closes it: the credential row re-derives locality from an
+// enumeration started by the call. This case drives exactly that state — an
+// address that IS on the host, a snapshot that predates it, and no socket row.
+func TestBrandNewLocalAddressWithNoSocketRowIsNotOffBox_5561(t *testing.T) {
+	client := &net.TCPAddr{IP: net.IPv4(203, 0, 113, 5), Port: 51234}
+	local := &net.TCPAddr{IP: net.IPv4(198, 51, 100, 1), Port: 8080}
 
-		prev := localAddrsFn
-		localAddrsFn = func() ([]net.Addr, error) { return nil, nil } // pre-add snapshot
-		resetLocalAddrCacheForTest()
-		if isLocalAddr(client.IP) {
-			t.Fatal("could not seed a pre-add snapshot")
-		}
-		// The address is added to the host. The cache does not know yet.
-		localAddrsFn = func() ([]net.Addr, error) {
-			return []net.Addr{&net.IPNet{IP: client.IP, Mask: net.CIDRMask(24, 32)}}, nil
-		}
-		t.Cleanup(func() { localAddrsFn = prev; resetLocalAddrCacheForTest() })
+	prev := localAddrsFn
+	localAddrsFn = func() ([]net.Addr, error) { return nil, nil } // pre-add snapshot
+	resetLocalAddrCacheForTest()
+	if isLocalAddr(client.IP) {
+		t.Fatal("could not seed a pre-add snapshot")
+	}
+	// The address is added to the host. The cache does not know yet.
+	localAddrsFn = func() ([]net.Addr, error) {
+		return []net.Addr{&net.IPNet{IP: client.IP, Mask: net.CIDRMask(24, 32)}}, nil
+	}
+	t.Cleanup(func() { localAddrsFn = prev; resetLocalAddrCacheForTest() })
 
-		if id := LookupPeer(client, local); id.Local {
-			// Precondition only: the stale snapshot must still be in force.
-			t.Fatalf("precondition: the cache refreshed early (%+v)", id)
-		}
-		if !PeerCouldBeLocalNow(client, local) {
-			t.Fatal("an address that IS on this host was confirmed off-box from a stale " +
-				"snapshot — the confirmation is reading the cache, not the host")
-		}
-	})
+	// Precondition: no row for this synthetic 4-tuple, and the stale snapshot is
+	// still in force, so LookupPeer really does report it off-box.
+	if id := LookupPeer(client, local); id.Local {
+		t.Fatalf("precondition: the cache refreshed early (%+v); this case is then "+
+			"asserting nothing", id)
+	}
+	if !PeerCouldBeLocalNow(client, local) {
+		t.Fatal("an address that IS on this host was confirmed off-box from a stale " +
+			"snapshot — the confirmation is reading the cache, not the host, so a local " +
+			"caller that reset its socket still reaches the api-auth credential")
+	}
 }
 
 // TestConfirmationFailsClosed_5561 pins the direction of every failure mode of
@@ -804,5 +847,146 @@ func TestConfirmationIsSingleFlighted_5561(t *testing.T) {
 		t.Fatalf("%d concurrent confirmations drove %d interface enumerations — the "+
 			"confirmation is not batched, so it reintroduces the per-connection "+
 			"amplification the accept-time cache exists to prevent", 2*callers, scans)
+	}
+}
+
+// TestMalformedRowIsLocalAndUnattributable_5561 covers the row the parser cannot
+// read.
+//
+// The kernel does not emit a socket-table row with an unparsable state or uid
+// column, so this is a "cannot happen" path — which is exactly why it must not
+// be a SILENT one. It used to `continue`, dropping the row. That was fail-safe
+// only while a caller reaching the parser had already been established as local:
+// with the table read first, "dropped" becomes "no row", "no row" falls through
+// to the address classification, and a stale negative there sends the caller to
+// the credential. The row is now recorded as malformed, which proves a socket
+// exists without naming its owner — local, unattributable, denied — and is
+// logged once per file per scan so the operator gets a reason rather than an
+// unexplained 403.
+func TestMalformedRowIsLocalAndUnattributable_5561(t *testing.T) {
+	const header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+	client := &net.TCPAddr{IP: net.IPv4(203, 0, 113, 5), Port: 43210}
+	server := &net.TCPAddr{IP: net.IPv4(198, 51, 100, 1), Port: 8080}
+	cl, _ := procAddr4(client)
+	sv, _ := procAddr4(server)
+
+	for _, tc := range []struct{ name, state, uid string }{
+		{"unparsable state column", "zz", "1001"},
+		{"unparsable uid column", "01", "notanumber"},
+		{"both columns unparsable", "--", "--"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			v4 := filepath.Join(dir, "tcp")
+			write(t, v4, header+"   0: "+cl+" "+sv+" "+tc.state+
+				" 00000000:00000000 00:00000000 00000000  "+tc.uid+
+				"        0 4242 1 0000000000000000 100 0 0 10 0\n")
+			write(t, filepath.Join(dir, "tcp6"), header)
+			defer SetProcNetTCPPathsForTest(v4, filepath.Join(dir, "tcp6"))()
+			// No interface addresses at all: if the malformed row were dropped,
+			// the address classification would call this caller off-box and hand
+			// it the credential. Only recording the row can rescue it.
+			defer setLocalAddrsForTest(nil)()
+
+			id := LookupPeer(client, server)
+			if id.OK {
+				t.Fatalf("a row whose %s was accepted as an identity: %+v", tc.name, id)
+			}
+			if !id.Local {
+				t.Fatalf("a row that MATCHED this caller's 4-tuple but would not parse was "+
+					"reported off-box (%+v) — a socket demonstrably exists here, so the "+
+					"api-auth credential must not speak for it", id)
+			}
+			if !strings.Contains(id.Detail, "could not be parsed") {
+				t.Errorf("detail does not explain the refusal: %q", id.Detail)
+			}
+		})
+	}
+
+	// Negative control: the SAME row with both columns well-formed and
+	// established IS attributed, so the refusals above are the parse failure and
+	// not a broken matcher.
+	dir := t.TempDir()
+	v4 := filepath.Join(dir, "tcp")
+	write(t, v4, header+"   0: "+cl+" "+sv+
+		" 01 00000000:00000000 00:00000000 00000000  1001        0 4242 1 0000000000000000 100 0 0 10 0\n")
+	write(t, filepath.Join(dir, "tcp6"), header)
+	defer SetProcNetTCPPathsForTest(v4, filepath.Join(dir, "tcp6"))()
+	defer setLocalAddrsForTest(nil)()
+	if id := LookupPeer(client, server); !id.OK || id.UID != 1001 {
+		t.Fatalf("the well-formed control row parsed as %+v, want uid 1001", id)
+	}
+}
+
+// TestSaturatedBatcherFailsClosed_5561 covers the queue bound.
+//
+// Every pending entry is a goroutine blocked in LookupPeer, so the slice grows
+// with concurrent connections and http.Server imposes no limit of its own. Past
+// maxPendingLookups a lookup is refused rather than queued — and the refusal has
+// to land on the DENY side: an errored table read falls back to the address
+// classification, so a caller that could be local is denied and one that could
+// not is still reported off-box (a saturated queue must not lock out every
+// remote administrator either).
+func TestSaturatedBatcherFailsClosed_5561(t *testing.T) {
+	// Fill the queue with entries that will never be drained by pinning the
+	// batcher's `running` flag: no goroutine is started, so nothing dequeues.
+	batcher.mu.Lock()
+	prevPending, prevRunning := batcher.pending, batcher.running
+	batcher.pending = make([]*socketQuery, maxPendingLookups)
+	batcher.running = true
+	batcher.mu.Unlock()
+	t.Cleanup(func() {
+		batcher.mu.Lock()
+		batcher.pending, batcher.running = prevPending, prevRunning
+		batcher.mu.Unlock()
+	})
+
+	defer setLocalAddrsForTest([]net.Addr{
+		&net.IPNet{IP: net.IPv4(10, 0, 61, 1), Mask: net.CIDRMask(24, 32)},
+	})()
+
+	// lookupOrTimeout is the load-bearing shape of this case: past the cap a
+	// lookup must RETURN a verdict. Without the cap it appends to a queue nothing
+	// will drain and blocks forever, so "did it come back" IS the property, and
+	// the timeout turns an unbounded queue into an assertion instead of a hang.
+	lookupOrTimeout := func(t *testing.T, client, server *net.TCPAddr) PeerIdentity {
+		t.Helper()
+		done := make(chan PeerIdentity, 1)
+		go func() { done <- LookupPeer(client, server) }()
+		select {
+		case id := <-done:
+			return id
+		case <-time.After(5 * time.Second):
+			t.Fatalf("LookupPeer(%v) never returned with the queue at its cap — the "+
+				"pending slice is unbounded, so a connect flood grows it without limit "+
+				"and every new caller blocks instead of being denied", client)
+			return PeerIdentity{}
+		}
+	}
+
+	// A caller from one of OUR addresses: denied, not attributed.
+	ours := lookupOrTimeout(t,
+		&net.TCPAddr{IP: net.IPv4(10, 0, 61, 1), Port: 51234},
+		&net.TCPAddr{IP: net.IPv4(10, 0, 61, 9), Port: 8080})
+	if ours.OK || !ours.Local {
+		t.Fatalf("a saturated queue produced %+v for a caller from our own address — it "+
+			"must deny rather than fall through to the credential", ours)
+	}
+
+	// A routable caller that is not ours: still off-box, so saturation is not a
+	// way to deny every credentialed remote administrator.
+	remote := lookupOrTimeout(t,
+		&net.TCPAddr{IP: net.IPv4(198, 51, 100, 7), Port: 51234},
+		&net.TCPAddr{IP: net.IPv4(10, 0, 61, 1), Port: 8080})
+	if remote.OK || remote.Local {
+		t.Fatalf("a saturated queue reported a routable non-local peer as %+v", remote)
+	}
+
+	// And the queue did not grow past its cap.
+	batcher.mu.Lock()
+	n := len(batcher.pending)
+	batcher.mu.Unlock()
+	if n > maxPendingLookups {
+		t.Fatalf("pending queue grew to %d, past the %d cap", n, maxPendingLookups)
 	}
 }

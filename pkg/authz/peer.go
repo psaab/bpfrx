@@ -130,25 +130,32 @@ var localAddrsFn = net.InterfaceAddrs
 // # What the staleness costs, stated correctly
 //
 // An earlier version of this comment argued the staleness was safe on its own.
-// IT IS NOT, and the direction it named was backwards. For up to one TTL after
+// IT WAS NOT, and the direction it named was backwards. For up to one TTL after
 // an address is ADDED to this host, a caller arriving from that brand-new
 // address is classified as off-box — and "off-box" is precisely the row an
-// api-auth credential is allowed to speak for. Such a caller does not merely
-// lose its attribution: it SKIPS the socket-table read entirely (LookupPeer
-// short-circuits on !couldBeLocal before any table is consulted) and lands on
-// the credential row, which authorizes as a full-power principal. A local
-// account that watches `ip monitor address` — unprivileged — and connects from
-// a freshly added VRRP VIP, DHCP lease or RA-derived address inside that window
-// therefore escapes its login class through a shared secret. That is exactly
-// the escalation #5561 exists to prevent, not a residual of it.
+// api-auth credential is allowed to speak for. The old shape of LookupPeer made
+// that decisive: it asked couldBeLocal FIRST and returned "not on this host"
+// without reading the socket table, so such a caller did not merely lose its
+// attribution, it skipped attribution and landed on the credential row, which
+// authorizes as a full-power principal. A local account that watches
+// `ip monitor address` — unprivileged — and connects from a freshly added VRRP
+// VIP, DHCP lease or RA-derived address inside that window escaped its login
+// class through a shared secret. That is the escalation #5561 exists to
+// prevent, not a residual of it.
 //
-// What actually makes the window harmless is NOT this cache. It is that the one
-// decision the "off-box" verdict feeds — whether a credential may speak for the
-// caller — is re-derived from an enumeration started at the moment of use, by
-// PeerCouldBeLocalNow below. With that in place a stale snapshot can cost a
-// local caller its ATTRIBUTION for at most one TTL (it is denied instead of
-// resolved to its class, an over-denial), and can never promote one to the
-// credential row.
+// Two changes bound it, and neither is this cache:
+//
+//   - LookupPeer now reads the socket table FIRST and consults this
+//     classification only where the table has nothing to say. A row hit proves
+//     locality from the kernel, so for any caller that HAS a socket — which is
+//     every caller that can read a response — a stale negative decides nothing.
+//   - The one case the table cannot answer is "no row at all", and there a
+//     stale negative can still say off-box. PeerCouldBeLocalNow re-derives the
+//     rule from an enumeration started at the moment of use, and the credential
+//     row consults it before honoring a credential.
+//
+// What remains is an over-denial: for at most one TTL a local caller with no
+// socket row is denied rather than resolved to its class.
 //
 // Connections delivered on a loopback address never consult this cache at all —
 // couldBeLocal short-circuits on the loopback clause — so the default
@@ -297,13 +304,18 @@ func (h *hostAddrScanner) run() {
 //
 // # Why a second check exists at all
 //
-// LookupPeer classifies locality once, at accept, from a snapshot that lags an
-// address ADD by up to localAddrTTL. Every verdict it draws from that snapshot
-// DENIES except one: "not on this host", which is the sole row an api-auth
-// credential may speak for. A caller must therefore never be admitted through
-// that row on the strength of a cached observation — hence this call, which the
-// credential path makes at the moment the credential is about to be honored
-// (pkg/api's principal()).
+// LookupPeer reads the socket table first, so a caller that has a socket is
+// answered by the kernel and the cached snapshot decides nothing for it. One
+// case is left over: NO ROW AT ALL. There the classification is all we have, its
+// snapshot lags an address ADD by up to localAddrTTL, and the answer it can give
+// — "not on this host" — is the sole row an api-auth credential may speak for.
+//
+// That case is reachable: a local caller from a brand-new address that reset its
+// own socket before the read has no row. It cannot read a response, but the
+// handler still runs, so a fire-and-forget mutation is a real outcome. A caller
+// must therefore never be admitted through that row on the strength of a cached
+// observation — hence this call, which the credential path makes at the moment
+// the credential is about to be honored (pkg/api's principal()).
 //
 // # Why it cannot itself become a bypass
 //
@@ -404,46 +416,66 @@ func LookupPeer(client, server net.Addr) PeerIdentity {
 	if ct.Port == st.Port && ct.IP.Equal(st.IP) {
 		return PeerIdentity{Local: true, Detail: "peer and local addresses are identical"}
 	}
-	// Classify locality BEFORE reading the socket table. Two reasons, one
-	// security and one availability.
-	//
-	// Security: absence from our namespace's table is not evidence of being
-	// off-box (see the file comment). Establishing locality up front means the
-	// "not found" case below can never be reinterpreted as "remote".
-	//
-	// Availability: a peer that cannot be local needs no lookup at all, so
-	// connection churn from a routable address does ZERO socket-table work. That
-	// is the flood that would otherwise serialize full /proc scans behind the
-	// accept loop and lock out the very administrators the credential path
-	// exists for.
-	if !couldBeLocal(ct, st) {
-		return PeerIdentity{Detail: fmt.Sprintf("peer %v is not on this host", ct.IP)}
-	}
-
 	// A ZONED (scope-qualified) peer address cannot be ATTRIBUTED. /proc/net/tcp6
 	// prints only the 128 address bits, never the scope id, so two link-local
 	// callers on different interfaces render the identical key and the first
 	// established row would win — an order-dependent identity, the same defect
-	// class as matching on ports alone. Refuse to guess.
+	// class as matching on ports alone. Refuse to guess: skip the table entirely
+	// and decide locality from the addresses.
 	//
-	// This is deliberately checked AFTER locality: a scoped peer that is NOT on
-	// this host is a remote administrator reaching an IPv6 link-local management
-	// bind, and refusing it before the locality test locked out every credentialed
-	// remote on such a bind. Only a scoped peer we would otherwise have to
-	// attribute is refused. The SERVER's zone is not disqualifying on its own —
-	// the client column still selects the row.
+	// The refusal must NOT be unconditional. A scoped peer that is not on this
+	// host is a remote administrator reaching an IPv6 link-local management bind,
+	// and denying it locked out every credentialed remote on such a bind. So only
+	// a scoped peer we would otherwise have to attribute is refused. The SERVER's
+	// zone is not disqualifying on its own — the client column still selects the
+	// row.
 	if ct.Zone != "" {
-		return PeerIdentity{
-			Local:  true,
-			Detail: fmt.Sprintf("peer address %v is scope-qualified and cannot be attributed from the socket table", ct),
+		if couldBeLocal(ct, st) {
+			return PeerIdentity{
+				Local:  true,
+				Detail: fmt.Sprintf("peer address %v is scope-qualified and cannot be attributed from the socket table", ct),
+			}
 		}
+		return PeerIdentity{Detail: fmt.Sprintf("peer %v is not on this host", ct.IP)}
 	}
 
-	uid, state, found, err := findPeerSocket(ct, st)
+	// Read the socket table FIRST, and consult the address classification only
+	// where the table has nothing to say.
+	//
+	// The previous shape asked couldBeLocal up front and returned "not on this
+	// host" without reading the table at all. That made a NEGATIVE address answer
+	// decisive — and the address snapshot behind it is cached (localAddrTTL), so
+	// for up to a TTL after an address was added to this host a caller arriving
+	// from it did not merely lose its attribution, it SKIPPED attribution and
+	// landed on the credential row. Reading the table first removes the negative
+	// from that decision entirely for any caller that has a socket: a row hit
+	// proves locality on its own, and it proves it from the kernel rather than
+	// from a snapshot.
+	//
+	// The early-out existed to keep connection churn from a routable address off
+	// the socket table. The single-flight batcher in socketscan.go already
+	// removed that argument — measured, 120 concurrent fresh connections cost 3
+	// table reads in 82 ms — so the cost it bought is no longer worth the
+	// authority it gave away.
+	uid, state, found, malformed, err := findPeerSocket(ct, st)
 	if err != nil {
-		// Fail closed: we could not consult the socket table, so we cannot
-		// attribute a caller we already know could be local.
-		return PeerIdentity{Local: true, Detail: "socket table unreadable: " + err.Error()}
+		// The table told us nothing, so fall back to the address classification
+		// — which is exactly the answer the old early-out gave, in both
+		// directions. A caller that could be local is denied (we cannot attribute
+		// it); one that could not is still reported off-box, so an unreadable
+		// /proc does not silently lock out every remote administrator.
+		if couldBeLocal(ct, st) {
+			return PeerIdentity{Local: true, Detail: "socket table unreadable: " + err.Error()}
+		}
+		return PeerIdentity{Detail: fmt.Sprintf(
+			"peer %v is not on this host (socket table unreadable: %v)", ct.IP, err)}
+	}
+	if malformed {
+		// A row matched this 4-tuple but its state or uid column would not parse.
+		// A socket exists here, so the caller is LOCAL; we just cannot say who it
+		// is. Reporting "no row" instead would route it through the address
+		// classification and, on a stale negative, to the credential.
+		return PeerIdentity{Local: true, Detail: "peer socket row could not be parsed"}
 	}
 	if found && state == tcpEstablished {
 		return PeerIdentity{UID: uid, OK: true, Local: true}
@@ -454,10 +486,17 @@ func LookupPeer(client, server net.Addr) PeerIdentity {
 			Detail: fmt.Sprintf("peer socket is in TCP state %d, not established", state),
 		}
 	}
-	// Local, but with no live socket — it destroyed its own (an SO_LINGER-0
-	// reset) between connecting and this lookup. Locality was established from
-	// the addresses, which it cannot make disappear.
-	return PeerIdentity{Local: true, Detail: "local peer has no established socket"}
+	// No row at all. This is the ONLY place the address classification still
+	// decides, and the only place its cached NEGATIVE can still reach the
+	// credential row: a local caller that destroyed its own socket (an SO_LINGER-0
+	// reset) before the read, from an address added within the last TTL, is
+	// reported off-box. Such a caller cannot read a response, but the handler
+	// still runs, so the residual is real rather than cosmetic — it is closed one
+	// layer up by PeerCouldBeLocalNow, which the credential row consults.
+	if couldBeLocal(ct, st) {
+		return PeerIdentity{Local: true, Detail: "local peer has no established socket"}
+	}
+	return PeerIdentity{Detail: fmt.Sprintf("peer %v is not on this host", ct.IP)}
 }
 
 // couldBeLocal reports whether the peer of an accepted connection is on THIS
@@ -509,10 +548,12 @@ func loopbackDelivery(client, server *net.TCPAddr) bool {
 // of daemon CPU per connection. The batching does not weaken the guarantee that
 // a connection is answered only from a read that started after it was accepted.
 //
-// found=false means no row matched in either file. err is non-nil only when NO
-// table could be read at all; an absent tcp6 (an IPv6-less kernel) alongside a
-// readable tcp is not an error.
-func findPeerSocket(client, server *net.TCPAddr) (uid uint32, state uint64, found bool, err error) {
+// found=false means no row matched in either file. malformed=true means a row
+// DID match but its state or uid column would not parse, which proves a socket
+// exists without saying who owns it. err is non-nil only when NO table could be
+// read at all (an absent tcp6 alongside a readable tcp is not an error) or when
+// the batcher is saturated.
+func findPeerSocket(client, server *net.TCPAddr) (uid uint32, state uint64, found, malformed bool, err error) {
 	q := &socketQuery{res: make(chan socketResult, 1)}
 	if l, lok := procAddr4(client); lok {
 		if r, rok := procAddr4(server); rok {
@@ -525,10 +566,10 @@ func findPeerSocket(client, server *net.TCPAddr) (uid uint32, state uint64, foun
 		}
 	}
 	if len(q.keys) == 0 {
-		return 0, 0, false, fmt.Errorf("cannot render %v -> %v for a socket-table lookup", client, server)
+		return 0, 0, false, false, fmt.Errorf("cannot render %v -> %v for a socket-table lookup", client, server)
 	}
 	res := batcher.lookup(q)
-	return res.uid, res.state, res.found, res.err
+	return res.uid, res.state, res.found, res.malformed, res.err
 }
 
 // procAddr4 renders a TCPAddr the way /proc/net/tcp does. ok=false when the

@@ -66540,3 +66540,37 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/authz/peer.go, pkg/authz/peer_5561_test.go, pkg/api/authz.go,
   pkg/api/server.go, pkg/api/config_authz_5561_test.go, pkg/api/README.md,
   docs/system-login.md, _Log.md
+
+- **Timestamp**: 2026-08-01 (round-5 fold, second pass)
+- **Action**: #5561 — adopt the reviewer's derived fix for the localAddrTTL
+  negative window and fold 3 MINORs. LookupPeer no longer short-circuits on a
+  NEGATIVE address answer: the batched socket-table read runs first and
+  `couldBeLocal` is consulted only where the table has nothing to say, because a
+  row hit proves locality from the kernel rather than from a cached snapshot. The
+  early-out existed purely to keep churn off the table and the single-flight
+  batcher had already retired that argument (reviewer measured 120 concurrent
+  fresh connections = 3 reads / 82 ms). Kept the credential-row re-derivation
+  (`authz.PeerCouldBeLocalNow`) as well, because the restructure does NOT cover
+  the "no row at all" case — a local caller that reset its own socket before the
+  read still meets the stale negative there, and the handler runs even when the
+  response cannot be delivered. Error path now falls back to the address rule in
+  BOTH directions, so an unreadable /proc denies a local caller without locking
+  out every remote administrator (bit-identical to what the early-out gave). The
+  zone check moved ahead of the read and branches on locality, preserving both
+  the scoped-local refusal and the scoped-remote credential path. MINORs: a
+  socket-table row that matches the 4-tuple but will not parse is now recorded as
+  `malformed` (local, unattributable, denied) and logged once per file per scan
+  instead of silently dropped — dropping it became unsafe once the table is read
+  first; `batcher.pending` capped at 4096 with a fail-closed refusal; the
+  anti-drift route scanner widened from server.go-with-a-mux-named-`mux` to every
+  non-test file and any receiver, proven against a testdata fixture because every
+  real route happens to use the narrow shape. Six mutations, each build+vet rc=0
+  with an assertion red: restore the early-out (2 tests red, 46 pass), drop
+  malformed rows (1 test, 3 subtests red, 746 pass), remove the queue cap (1 red,
+  749 pass), narrow the route scanner (1 red, 749 pass), remove the credential-row
+  confirmation (1 red, 749 pass), make the confirmation read the cache (1 red, 749
+  pass).
+- **File(s)**: pkg/authz/peer.go, pkg/authz/socketscan.go,
+  pkg/authz/peer_5561_test.go, pkg/api/authz.go,
+  pkg/api/config_authz_5561_test.go, pkg/api/testdata/routescan/,
+  pkg/api/README.md, _Log.md

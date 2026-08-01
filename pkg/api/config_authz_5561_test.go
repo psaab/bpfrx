@@ -1046,15 +1046,22 @@ func TestProductionServerEnforcesRealPeerIdentity_5561(t *testing.T) {
 }
 
 // TestEveryMutatingRouteHasAPermission_5561 is the anti-drift guard. It reads
-// the route registrations out of server.go and requires the permission table to
+// the route registrations out of EVERY non-test file in the package — not just
+// server.go, and not just calls on a variable literally named `mux`, either of
+// which would have made the guard narrower than the claim it protects: a route
+// added in a new file, or on a differently-named ServeMux, would have been
+// invisible to it and become a silently inert 403 in production.
+// TestRouteScannerReachesEveryRegistrationSite_5561 proves that reach against a
+// fixture, because the real package happens to register every route one way.
+// It requires the permission table to
 // cover them EXACTLY in both directions: a new state-changing route with no
 // entry fails here rather than silently becoming an inert 403 in production,
 // and an entry whose route was renamed or removed fails here rather than
 // silently guarding nothing.
 func TestEveryMutatingRouteHasAPermission_5561(t *testing.T) {
-	registered := registeredRoutes(t, "server.go")
+	registered := registeredRoutes(t, ".", ".go")
 	if len(registered) < 40 {
-		t.Fatalf("only parsed %d routes out of server.go — the scanner has stopped "+
+		t.Fatalf("only parsed %d routes out of the package — the scanner has stopped "+
 			"matching the registration form and is no longer guarding anything", len(registered))
 	}
 
@@ -1152,48 +1159,116 @@ func sortedRouteKeys() []string {
 	return keys
 }
 
-// registeredRoutes extracts the "METHOD /path" patterns passed to mux.Handle /
-// mux.HandleFunc in the named source file.
-func registeredRoutes(t *testing.T, file string) []string {
+// registeredRoutes extracts the "METHOD /path" patterns passed to any
+// Handle/HandleFunc call in every non-test file of `dir` carrying the given
+// suffix.
+//
+// Deliberately NOT keyed on the file name or on a receiver named `mux`. A route
+// added in a new file, or registered on `apiMux`/`s.router`, is still a route,
+// and an anti-drift guard that could not see it would let exactly that route
+// become an unguarded-then-inert endpoint. The receiver is therefore any
+// expression and the filter is on the PATTERN — a string literal beginning with
+// "/" or with "METHOD /" — which is what a route registration actually looks
+// like.
+func registeredRoutes(t *testing.T, dir, suffix string) []string {
 	t.Helper()
-	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, file, nil, 0)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		t.Fatalf("parse %s: %v", file, err)
+		t.Fatalf("read %s: %v", dir, err)
 	}
+	var files []string
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, suffix) || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		files = append(files, filepath.Join(dir, name))
+	}
+	if len(files) == 0 {
+		t.Fatalf("no source files matched %s/*%s — the scanner is looking nowhere", dir, suffix)
+	}
+
 	var out []string
-	ast.Inspect(f, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok || len(call.Args) == 0 {
-			return true
-		}
-		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok {
-			return true
-		}
-		recv, ok := sel.X.(*ast.Ident)
-		if !ok || recv.Name != "mux" {
-			return true
-		}
-		if sel.Sel.Name != "HandleFunc" && sel.Sel.Name != "Handle" {
-			return true
-		}
-		lit, ok := call.Args[0].(*ast.BasicLit)
-		if !ok || lit.Kind != token.STRING {
-			t.Errorf("route registration at %s has a non-literal pattern; the coverage "+
-				"guard cannot see it", fset.Position(call.Pos()))
-			return true
-		}
-		pattern, err := strconv.Unquote(lit.Value)
+	for _, path := range files {
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, path, nil, 0)
 		if err != nil {
-			t.Errorf("unquote %s: %v", lit.Value, err)
-			return true
+			t.Fatalf("parse %s: %v", path, err)
 		}
-		out = append(out, pattern)
-		return true
-	})
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok || len(call.Args) == 0 {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			if sel.Sel.Name != "HandleFunc" && sel.Sel.Name != "Handle" {
+				return true
+			}
+			lit, ok := call.Args[0].(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				t.Errorf("Handle/HandleFunc call at %s has a non-literal first argument; "+
+					"if that is a route registration the coverage guard cannot see it",
+					fset.Position(call.Pos()))
+				return true
+			}
+			pattern, err := strconv.Unquote(lit.Value)
+			if err != nil {
+				t.Errorf("unquote %s: %v", lit.Value, err)
+				return true
+			}
+			if !looksLikeRoutePattern(pattern) {
+				return true
+			}
+			out = append(out, pattern)
+			return true
+		})
+	}
 	sort.Strings(out)
 	return out
+}
+
+// looksLikeRoutePattern reports whether a string literal is an http.ServeMux
+// pattern: "/path" or "METHOD /path".
+func looksLikeRoutePattern(s string) bool {
+	if strings.HasPrefix(s, "/") {
+		return true
+	}
+	method, rest, ok := strings.Cut(s, " ")
+	if !ok || !strings.HasPrefix(rest, "/") || method == "" {
+		return false
+	}
+	return method == strings.ToUpper(method)
+}
+
+// TestRouteScannerReachesEveryRegistrationSite_5561 proves the anti-drift
+// scanner's REACH, which the real package cannot: every route today is
+// registered in server.go on a variable named `mux`, so narrowing the scanner
+// back to that shape would break nothing and the widening would be an unguarded
+// claim.
+//
+// The fixture under testdata/ registers routes the narrow scanner could not see
+// — a file that is not server.go, a mux named `apiMux`, and a nested `s.router`
+// — and all three must come back.
+func TestRouteScannerReachesEveryRegistrationSite_5561(t *testing.T) {
+	got := registeredRoutes(t, filepath.Join("testdata", "routescan"), ".go.fixture")
+	want := []string{
+		"DELETE /api/v1/fixture/nested",
+		"GET /api/v1/fixture/safe",
+		"POST /api/v1/fixture/elsewhere",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("scanner found %v, want %v — a route registered outside server.go or on "+
+			"a mux not named `mux` is invisible to the coverage guard, so it would become "+
+			"a silently inert endpoint in production", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("scanner found %v, want %v", got, want)
+		}
+	}
 }
 
 // TestBrandNewLocalAddressCannotBorrowCredential_5561 is the round-5 MAJOR guard

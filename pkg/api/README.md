@@ -354,8 +354,17 @@ filtering. The rule still **fails safe** under all three, because each of them
 classifies a *remote* caller as local, and a local caller with no socket row is
 denied. The table over-denies; it never inverts. A routable delivery address
 falls back to "is the peer one of *our* addresses", sound positively and
-carrying the residuals below negatively. An unreadable or absent socket table is
-reported local-and-unattributable, never remote.
+carrying the residuals below negatively.
+
+The classification is consulted **after** the socket-table read, not before it,
+and only where the table has nothing to say — a matched row settles locality on
+its own. An unreadable or absent table falls back to the same address rule in
+both directions: a caller that could be ours is local-and-unattributable
+(denied), one that could not is still reported off-box, so a broken `/proc` does
+not silently lock out every remote administrator. A row that matches the 4-tuple
+but whose state or uid column will not parse proves a socket exists without
+naming its owner: local, unattributable, denied, and logged once per scan rather
+than dropped in silence.
 
 <a id="residuals"></a>
 **Residuals, stated rather than papered over.** The first two over-deny and
@@ -384,23 +393,40 @@ built on that classification has to know so.
   arriving from that address is classified **off-box**. An earlier version of
   this list claimed such a caller "still cannot escape a class it holds, because
   a local caller with a class is only reachable through the socket table, which
-  is not cached." **That was backwards.** Being classified off-box means the
-  socket table is never read at all — `LookupPeer` short-circuits on
-  `!couldBeLocal` before consulting it — so the caller lands on the credential
-  row, which authorizes as a *full-power* principal. The staleness therefore
-  granted access; it did not over-deny.
+  is not cached." **That was backwards.** Being classified off-box meant the
+  socket table was never read at all — `LookupPeer` short-circuited on
+  `!couldBeLocal` before consulting it — so the caller landed on the credential
+  row, which authorizes as a *full-power* principal. The staleness granted
+  access; it did not over-deny.
 
-  It is reachable, not theoretical: address adds are observable to any
+  It was reachable, not theoretical: address adds are observable to any
   unprivileged account (`ip monitor address` needs no privilege) and this box
-  adds them routinely — VRRP VIPs on failover, DHCP leases, RA-derived
-  addresses. A local `read-only` holder of the api-auth secret that connects
-  from a freshly added address inside the window reaches configure and commit.
+  performs them routinely — VRRP VIPs on failover, DHCP leases, RA-derived
+  addresses. Reproduced against one live ESTABLISHED socket, changing only
+  whether the snapshot predated the client's address add:
 
-  What closes it is not the cache but the row-4 re-derivation described above:
-  the credential row asks `authz.PeerCouldBeLocalNow` for a *fresh* enumeration
-  and denies a caller that is on this host. The remaining cost of the stale
-  snapshot is an over-denial — for at most a second, a local caller from a
-  brand-new address is denied instead of resolved to its class.
+  ```
+  truthful cache : OK=true  Local=true  uid=1000
+  stale cache    : OK=false Local=false uid=0  "peer 10.166.99.1 is not on this host"
+  ```
+
+  Two changes close it, and neither is the cache:
+
+  1. **The socket table is read first.** `couldBeLocal` is consulted only where
+     the table has nothing to say. A row hit proves locality from the kernel, so
+     for any caller that has a socket — which is every caller that can read a
+     response — the cached negative decides nothing. The early-out existed only
+     to keep churn off the table, and the single-flight batcher had already
+     removed that argument (120 concurrent fresh connections: **3** reads in
+     82 ms).
+  2. **The credential row re-derives locality.** The one case the table cannot
+     answer is "no row at all", where a local caller that reset its own socket
+     before the read still meets the stale negative. It cannot read a response,
+     but the handler still runs, so a fire-and-forget commit is a real outcome.
+     `authz.PeerCouldBeLocalNow` answers that case from a *fresh* enumeration.
+
+  What remains is an over-denial: for at most a second, a local caller with no
+  socket row is denied instead of resolved to its class.
 
   **Bounds.** It required an *off-loopback* bind (on the default loopback bind
   `couldBeLocal` short-circuits before the cache is ever consulted, so the
@@ -503,12 +529,15 @@ population #5561 exists to constrain. Three bounds:
   arriving before its lookup finishes waits for it; a wedged lookup denies rather
   than hangs, on a deadline stamped **per connection** (not per request, which
   would charge the full timeout again on every request the connection makes).
-- **No read at all for a peer that cannot be local.** Locality is classified from
-  addresses *before* any table read, so churn from a routable address is a couple
-  of comparisons. The host-address snapshot behind that check is refreshed at most
-  once per second for hits **and** misses — an earlier version refreshed on every
-  miss, which is precisely the flooding case, so the amplification was fully
-  intact while the comment claimed otherwise.
+- **The address snapshot, for the cases the table does not answer.** Locality is
+  classified from a cached interface-address snapshot, refreshed at most once per
+  second for hits **and** misses — an earlier version refreshed on every miss,
+  which is precisely the flooding case, so the amplification was fully intact
+  while the comment claimed otherwise. This used to *also* short-circuit the
+  table read for a peer that could not be local; that early-out is **gone**, for
+  the security reason under [residuals](#residuals). Reinstating the read costs
+  nothing measurable because of the bound above — the read it reinstates is the
+  batched one.
 - **The authoritative locality re-check is behind the credential.** The row-4
   re-derivation enumerates interfaces for real (~32 µs on a box carrying 14
   addresses, against 4.3–10.1 ms for one `/proc/net/tcp` read). It runs only for

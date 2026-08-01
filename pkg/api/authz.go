@@ -170,8 +170,11 @@ func (p *pendingPeer) wait(ctx context.Context) (authz.PeerIdentity, bool) {
 // ESTABLISHED guarantee is unaffected: the lookup is started at accept, not at
 // request time, so its timing is still outside the caller's control.
 //
-// authz.LookupPeer additionally does NO socket-table work at all for a peer that
-// cannot be local, so the churn that motivates this is cheap on both counts.
+// authz.LookupPeer reads the socket table for EVERY peer — it used to skip the
+// read for one it classified off-box, but that made a cached address answer
+// decisive on the only row a credential may speak for. The single-flight batcher
+// in socketscan.go is what makes the unconditional read affordable: 120
+// concurrent fresh connections cost 3 table reads.
 func (s *Server) connContext(ctx context.Context, c net.Conn) context.Context {
 	client, server := c.RemoteAddr(), c.LocalAddr()
 	p := &pendingPeer{
