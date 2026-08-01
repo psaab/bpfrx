@@ -2224,13 +2224,21 @@ func redundancyGroupBody(rgNode *Node) []*Node {
 // VALUE rather than a statement keyword, so a value spelled like a statement is
 // STOLEN and compiled as that statement:
 //
-//	packed:    redundancy-group 1 interface-monitor preempt weight 255;
-//	             -> InterfaceMonitors=[]  Preempt=true
-//	container: redundancy-group 1 { interface-monitor preempt weight 255; }
-//	             -> InterfaceMonitors=[{preempt 255}]  Preempt=false
+//	packed:    redundancy-group 1 interface-monitor ip-monitoring weight 255;
+//	             -> InterfaceMonitors=[]  IPMonitoring=&{GlobalWeight:0 GlobalThreshold:0 Targets:[]}
+//	container: redundancy-group 1 { interface-monitor ip-monitoring weight 255; }
+//	             -> InterfaceMonitors=[{ip-monitoring 255}]  IPMonitoring=nil
 //
 // The two spellings disagree — precisely what splitting the packed line exists
-// to prevent. (Measured, not reasoned: both lines above were compiled.)
+// to prevent. (Measured, not reasoned: both lines above were compiled at THIS
+// head. The example deliberately uses ip-monitoring, which still reaches no
+// gate. An earlier version of this comment used `preempt`, and that spelling is
+// now REJECTED at commit by the arity gate added later in this same PR —
+// "preempt: takes no argument but carries [weight 255]" — so quoting it here
+// would show output the compiler no longer produces. `node` is likewise caught,
+// by the #5694 identity gate. Re-measure this block if either gate moves;
+// a stale "measured" claim is how the next reader concludes the analysis was
+// already done and stops checking.)
 //
 // NOT fixed here. The stolen token has to sit in entry-NAME position, and no
 // legal Junos interface name or IP address collides with any keyword registered
