@@ -40,17 +40,19 @@ import (
 //     RETAINED (fail-closed, not mgmt-down), its fingerprint field is left
 //     unrecorded so the next commit RETRIES the bind (retry debt), and the error
 //     is surfaced.
-//   - AUTH ORDERING (revocation decoupled from the HTTPS leg): auth publishes as
-//     soon as the HTTP leg is at its desired bind (httpOK), INDEPENDENT of the
-//     HTTPS-leg outcome — a committed credential revocation must not be blocked
-//     by an HTTPS bind failure. When httpOK the live HTTP listener is at
-//     next.Addr, whose #4047/#5127 loopback clamp justified next.Auth, so
-//     applying it there cannot fail-open; it defers ONLY when the HTTP leg's OWN
-//     rebind failed (the retained old bind may not match next.Auth's clamp). A
-//     TIGHTENING (non-nil) is published whatever the HTTPS outcome (it only ADDS
-//     a requirement). Removing ALL api-auth (nil) additionally requires the LIVE
-//     HTTPS to be off/loopback, so a non-loopback HTTPS retained by a failed
-//     rebind is never dropped to no-auth.
+//   - AUTH ORDERING: the two directions are not symmetric. A TIGHTENING
+//     (non-nil) publishes BEFORE either leg is (re)bound and unconditionally —
+//     it only ADDS a requirement, so applying it to whatever is live is strictly
+//     more restrictive than leaving the previous snapshot there. That keeps a
+//     committed revocation from being blocked by a bind failure (#5866 Finding A,
+//     #5561 round 7: deferring it left the RETAINED listener honouring the old
+//     secret permanently) AND keeps a freshly-bound listener from ever serving
+//     under a superseded snapshot (#5561 round 9: ReconcileHTTP serves before it
+//     returns, so publishing afterwards left the new socket on the old policy for
+//     the width of the intervening ReconcileHTTPS). Removing ALL api-auth (nil)
+//     publishes AFTER the rebinds and stays gated on httpOK plus the LIVE HTTPS
+//     being off/loopback: it REMOVES a requirement, and both gates read the
+//     fingerprint the rebinds just advanced.
 //
 // The reconcile is serialized by mu; the apply path (applyConfigLocked under the
 // apply semaphore) already runs commits one at a time, so a newer generation can

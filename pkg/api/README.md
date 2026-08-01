@@ -292,6 +292,25 @@ mutation proof; each was added because its absence was a live bypass.
   request. Deferring it lets the caller pick the moment — and pick to make it
   fail (see the precedence rule below).
 
+Those accept-time lookups are **admission-controlled**: a package-global pool of
+`maxConcurrentPeerLookups` (1024) tokens bounds how many run at once, because the
+wedge that motivates the bound is inside the interface enumeration holding its
+own mutex, where a context would not help — only admission control would. Past
+the cap a connection resolves IMMEDIATELY to an unattributable local identity,
+which DENIES, reached without spawning anything.
+
+The pool's accounting has three rules and all three are load-bearing: a running
+lookup HOLDS a token, a finished one RETURNS it, and a connection REFUSED
+admission touches the count in neither direction. Get the second wrong and the
+pool stops being a concurrency ceiling and becomes a *lifetime budget* — the
+1024th connection ever accepted exhausts it permanently and every connection
+after it is denied, which is a total management-plane lockout reached by ordinary
+use with no attacker and no wedge. Get the third wrong in the releasing direction
+and the pool admits past the cap it exists to enforce.
+`TestPeerLookupSlotsAreReturned_5561` pins all three.
+`PeerLookupSlotsInUseForTest()` and `PeerIdentityWaitersForTest()` are the
+accept-side and request-side gauges; a wedge pins both at once.
+
 An **`api-auth` credential** is the second identity. It authorizes as a
 full-power principal, which is what it already grants (#4047 makes it the sole
 gate on an off-loopback bind), so narrowing it would be a separate breaking
@@ -333,6 +352,36 @@ snapshot — and cannot close the reverse; see [Residuals](#residuals) for which
 direction is which. It runs **after** the
 credential is validated — a caller presenting none cannot drive a kernel
 enumeration.
+
+**Every input to the decision is read after the last thing that can block.**
+An authorization verdict is only as current as the state it was drawn from, and
+this gate has two blocking steps a request can sit inside for a long time:
+`pendingPeer.wait` (up to `peerLookupTimeout`, 5s, and the caller can lengthen
+its own by connecting while the socket table is contended) and, on the
+credential row, the fresh interface enumeration above (single-flighted, so a
+request can wait out another goroutine's). Both used to sit *after* the state
+they superseded had already been captured:
+
+- The active config was read *before* the peer wait, so a `commit` demoting a
+  `super-user` to `read-only` — or deleting it from `system login user`
+  outright — did not reach that principal's own in-flight request. The wait now
+  comes first and the snapshot is read after it (`authorizeInputs`), so exactly
+  one snapshot feeds both the principal's class and `Authorize`, and nothing
+  blocks between the read and the verdict.
+- The credential principal was minted *before* the enumeration. It is a value
+  and `ReplaceAuth` swaps a pointer, so a rotated or revoked secret did not
+  invalidate a principal already speaking. The credential is now re-validated
+  against the LIVE snapshot after the enumeration; a request whose secret was
+  revoked mid-flight is denied. The re-check compares the *credential*, not
+  snapshot pointer identity — the reconciler republishes on every commit, so
+  pointer identity would 403 a valid caller for an unrelated commit.
+
+The residual is named rather than papered over: a `/etc/passwd` read still
+separates the snapshot from the verdict on the peer-UID row. Snapshot and
+decision cannot be made simultaneous without holding the config store's lock
+across the whole gate; they can be made adjacent.
+`authz_freshness_5561_test.go` pins both, each with a control that must be
+ADMITTED so a reverted ordering cannot be "caught" by an unrelated 403.
 
 The rule has been narrowed twice, each time because a weaker version had a hole
 the claim did not admit to:

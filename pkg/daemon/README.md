@@ -240,22 +240,39 @@ credential revocation is enforced even on an apply that returns early
   next commit retries (retry debt), and log the error. This does not brick an
   otherwise-successful commit (same posture as `reconcileSNMP` bind-failure
   retry).
-- **Auth ordering — revocation decoupled from the HTTPS leg**: auth publishes as
-  soon as the HTTP leg is at its desired bind (`httpOK`), INDEPENDENT of the
-  HTTPS-leg outcome — a committed credential revocation must not be blocked by an
-  HTTPS bind failure. When `httpOK` the live HTTP listener is at `next.Addr`,
-  whose #4047/#5127 loopback clamp justified `next.Auth`, so applying it there
-  cannot fail-open; it defers ONLY when the HTTP leg's OWN rebind failed (the
-  retained old bind may not match `next.Auth`'s clamp). A tightening (non-nil)
-  publishes whatever the HTTPS outcome (it only ADDS a requirement). Removing ALL
-  api-auth (nil) additionally requires the live HTTPS to be off/loopback, so a
-  non-loopback HTTPS retained by a failed rebind is never dropped to no-auth.
+- **Auth ordering — a TIGHTENING publishes FIRST, a LOOSENING publishes LAST.**
+  The two directions are not symmetric and are not sequenced together.
+  - A **non-nil** `next.Auth` publishes **before either leg is (re)bound**, and
+    unconditionally — whatever the HTTPS outcome, and even when the HTTP leg's
+    OWN rebind then fails and the old listener is retained. It only ADDS a
+    requirement, so applying it to whatever is currently live is strictly more
+    restrictive than leaving the previous snapshot there, whatever that bind is.
+    Two things follow. A committed credential revocation is never blocked by a
+    bind failure (#5866 Finding A, #5561 round 7) — deferring it there left the
+    RETAINED listener honouring the OLD secret indefinitely, a permanent
+    fail-open rather than a race. And no listener ever SERVES under a superseded
+    snapshot (#5561 round 9): `ReconcileHTTP` binds and starts serving before it
+    returns, so publishing afterwards left the new socket enforcing the old
+    policy for the width of the intervening `ReconcileHTTPS` — worst case a
+    loopback→off-box move that ADDS the credential the #4047/#5127 clamp
+    requires, where the old snapshot is legitimately nil and the new routable
+    listener answered everything through the nil-snapshot pass-through.
+  - A **nil** `next.Auth` (remove ALL api-auth) publishes **after** the rebinds
+    and stays gated: it REMOVES a requirement, so it needs `httpOK` (the live
+    HTTP listener is at `next.Addr`, whose loopback clamp justified the nil; a
+    retained old bind may not match it) AND the live HTTPS off or loopback (so a
+    non-loopback HTTPS retained by a failed rebind is never dropped to no-auth).
+    Both gates read the fingerprint the rebinds just updated, so this direction
+    cannot move earlier.
+
   Pinned by `TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866`
-  (revocation honored across a failing HTTPS rebind) +
+  (revocation honored across a failing HTTPS rebind),
   `TestMgmtReconcileRemoveAuthDeferredWhenHTTPRebindFails_5866` (nil auth NOT
-  applied to a retained non-loopback listener — no fail-open). The reconcile is
-  serialized by its mutex and the apply semaphore, so a newer generation never
-  completes behind an older one.
+  applied to a retained non-loopback listener — no fail-open), and
+  `management_authpublish_5561_test.go`, which records the LIVE snapshot at the
+  instant each listener is bound and requires it to be the published one. The
+  reconcile is serialized by its mutex and the apply semaphore, so a newer
+  generation never completes behind an older one.
 
 #### Effective-listener snapshot for `show system services` (#6385/#6401)
 

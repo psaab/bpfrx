@@ -66916,7 +66916,16 @@ break — `go vet` confirmed passing under every revert.
   guards and all of pkg/cli WITHOUT that line and reds with `CLI resolved [0],
   shared evaluator resolved [5]` WITH it. MINOR-5 the two scoped local-denial
   states now carry distinct Details, guarded.
+- **Docs**: pkg/api/README.md gains the freshness contract (every input read
+  after the last blocking step; the credential re-validated after the
+  enumeration; the passwd-read residual named) and the admission pool's
+  three-rule accounting contract. pkg/daemon/README.md + the
+  managementReconciler type doc replace "auth publishes as soon as the HTTP leg
+  is at its desired bind" — now false for the tightening direction — with the
+  asymmetric rule the code enforces: a TIGHTENING publishes first and
+  unconditionally, a LOOSENING publishes last and stays gated.
 - **File(s)**: pkg/api/authz.go, pkg/api/authz_freshness_5561_test.go,
   pkg/api/README.md, pkg/authz/peer.go, pkg/authz/peer_5561_test.go,
   pkg/daemon/management.go, pkg/daemon/management_authpublish_5561_test.go,
-  pkg/cli/permissions_shared_evaluator_5561_test.go, _Log.md
+  pkg/daemon/README.md, pkg/cli/permissions_shared_evaluator_5561_test.go,
+  _Log.md
