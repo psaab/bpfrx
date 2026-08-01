@@ -519,7 +519,16 @@ leave `configuration-synchronize` off on a keyed cluster** and manage config
 on both nodes out-of-band, accepting the operational cost. Restore it only
 when #6629 has landed.
 
-*The delete cannot be done on a running pair without the sync undoing it.*
+*By far the easiest path is to never reach this state.* Provision both
+nodes from text with `configuration-synchronize` ABSENT and the key
+already set, before the pair carries traffic. Note that the shipped
+reference configs (`docs/ha-cluster.conf`, `docs/ha-cluster-userspace.conf`)
+DO enable `configuration-synchronize`, and the Incus test harness pushes
+them unchanged — so neither is an example of this order; you have to
+remove the line from your own config first. On a new build or during a
+maintenance window you were taking anyway, this costs nothing.
+
+*On a LIVE pair the delete cannot be done without the sync undoing it.*
 `configuration-synchronize` is committed from the RG0 primary. Delete it
 there and the SECONDARY still has it enabled — so the moment that secondary
 is promoted, reconciliation (`daemon_ha.go:444`) sees sync enabled in its
@@ -528,23 +537,45 @@ former primary (`daemon_ha_sync.go:462`), restoring the very line you just
 deleted. You cannot simply "delete on both nodes": the second delete
 requires a promotion, and the promotion re-adds the first.
 
-There are two orders that actually work, and neither is a two-command
-sequence:
+There is ONE safe order on a live pair, and it is a controlled
+single-node outage — not a two-command sequence, and NOT a link cut:
 
-1. **Before the pair carries traffic** (new build, or a maintenance window
-   you were taking anyway). Provision both nodes from text with
-   `configuration-synchronize` absent and the key already set, so the state
-   is never reached. This is the recommended path, and it is what
-   `cluster-setup.sh` does — it wipes `.configdb` and bootstraps both nodes
-   from the keyed text config.
+```
+# 1. On the RG0 primary: delete the line and commit.
+delete chassis cluster configuration-synchronize   # commit
 
-2. **On a live pair**, sever the sync path before promoting. Drop the
-   session-sync/fabric segment between the nodes (or stop `xpfd` on the
-   node you are about to demote) so the promoted secondary has nobody to
-   push to, delete the line there, then restore connectivity. This is a
-   controlled outage of the control channel, and both nodes are briefly
-   authoritative for their own config — verify both stores agree before
-   restoring the link.
+# 2. Stop xpfd on that SAME node and leave it down.
+systemctl stop xpfd
+
+# 3. Wait for the peer to promote and for its session-sync to report the
+#    peer disconnected. Do not proceed on a timer.
+show chassis cluster status          # on the peer: it must be primary
+
+# 4. On the now-primary peer: delete the line and commit.
+delete chassis cluster configuration-synchronize   # commit
+
+# 5. Verify BOTH persistent stores no longer carry it, then restart the
+#    stopped node. It comes back as secondary with sync already absent on
+#    both sides, so nothing pushes the line back.
+systemctl start xpfd
+```
+
+Step 2 is what makes this work: with that node's `xpfd` down there is
+nobody for the promoted peer's reconciliation to push to, so the deletion
+survives the promotion.
+
+**Do NOT sever the link instead.** An earlier version of this section
+suggested cutting "the session-sync/fabric segment" before promoting.
+That is wrong and dangerous. Session and config sync run on the CONTROL
+link — the same interface as the heartbeat, port 4785 — and only fall
+back to fabric when no control interface is configured
+(`daemon_ha_sync.go`). So cutting fabric alone does not stop config sync
+in any shipped configuration, and cutting the control segment takes the
+heartbeat with it: both nodes stop hearing each other, both declare the
+peer dead, and both become primary. That is a dataplane split-brain with
+duplicate VIPs, not merely two nodes with independent config authority.
+A physical cut also races disconnect detection, so a promotion issued
+immediately after it can still find the session established.
 
 Once BOTH nodes have sync disabled, ongoing config management is manual and
 paired: only the RG0 primary is writable, so every change is a controlled
