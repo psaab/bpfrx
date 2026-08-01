@@ -521,16 +521,22 @@ func LookupPeer(client, server net.Addr) PeerIdentity {
 	// authority it gave away.
 	uid, state, found, malformed, err := findPeerSocket(ct, st)
 	if err != nil {
-		// The table told us nothing, so fall back to the address classification
-		// — which is exactly the answer the old early-out gave, in both
-		// directions. A caller that could be local is denied (we cannot attribute
-		// it); one that could not is still reported off-box, so an unreadable
-		// /proc does not silently lock out every remote administrator.
-		if couldBeLocal(ct, st) {
-			return PeerIdentity{Local: true, Detail: "socket table unreadable: " + err.Error()}
-		}
-		return PeerIdentity{Detail: fmt.Sprintf(
-			"peer %v is not on this host (socket table unreadable: %v)", ct.IP, err)}
+		// A failed table read is UNKNOWN, and unknown must deny (#5561 round 7).
+		//
+		// This used to fall back to the address classification in both
+		// directions, so a caller the cached snapshot did not recognise was
+		// reported off-box — credential-eligible — on the strength of an
+		// observation we never actually made. The caller's row may be in exactly
+		// the file that failed: tcp and tcp6 are alternatives, not duplicates,
+		// and a partial failure is half an observation rather than a small one.
+		//
+		// The cost is real and is the right trade: while /proc/net/tcp{,6} is
+		// unreadable, a remote administrator holding a valid credential is denied
+		// too. That is an outage on a box whose /proc is broken, against handing
+		// a local caller the credential path — and only the second one is a
+		// privilege boundary. An ABSENT table is not a failure (scanBatch), so
+		// an IPv6-less kernel does not take this path.
+		return PeerIdentity{Local: true, Detail: "socket table unreadable: " + err.Error()}
 	}
 	if malformed {
 		// A row matched this 4-tuple but its state or uid column would not parse.

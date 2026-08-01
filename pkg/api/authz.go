@@ -290,7 +290,7 @@ func (s *Server) activeConfig() *config.Config {
 // anything. It closes the direction that motivated it (an address ADDED since the
 // snapshot); it cannot close the reverse, because a scan cannot observe an address
 // that is already gone.
-func (s *Server) principal(r *http.Request) authz.Principal {
+func (s *Server) principal(r *http.Request, cfg *config.Config) authz.Principal {
 	pending, ok := peerIdentityFrom(r.Context())
 	if !ok {
 		// No ConnContext ran for this connection, so we cannot even tell whether
@@ -307,7 +307,7 @@ func (s *Server) principal(r *http.Request) authz.Principal {
 		// (1) and (2). PrincipalForUID yields an unresolved principal for an
 		// account outside the login model, which Authorize denies — and no
 		// credential is consulted on the way there.
-		return authz.PrincipalForUID(s.activeConfig(), id.UID)
+		return authz.PrincipalForUID(cfg, id.UID)
 	}
 	if id.Local {
 		return authz.Unauthenticated("caller is local but could not be identified: " + id.Detail)
@@ -398,16 +398,37 @@ func (s *Server) mutationAuthzGuard(next http.Handler) http.Handler {
 		// rather than reach the mux's redirect.
 		required, known := restMutationPermissions[r.Method+" "+r.URL.Path]
 		if !known {
-			slog.Warn("api: refused unguarded mutating request",
+			// Debug for the same reason as the denial below: caller-driven and
+			// unauthenticated, so a Warn here is a log-amplification lever.
+			slog.Debug("api: refused unguarded mutating request",
 				"method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
 			writeError(w, http.StatusForbidden,
 				"permission denied: no authorization policy is defined for this mutating endpoint")
 			return
 		}
 
-		p := s.principal(r)
-		if err := authz.Authorize(s.activeConfig(), p, required); err != nil {
-			slog.Warn("api: denied mutating request",
+		// ONE config snapshot for BOTH the principal's class and the
+		// authorization decision (#5561 round 7).
+		//
+		// These used to be two independent ActiveConfig() reads. A commit landing
+		// between them meant the class was copied out of config A while the
+		// decision was evaluated against config B — so a `super-user` demoted to
+		// `read-only`, or deleted from `system login user` outright, kept the
+		// authority its old class carried for the duration of an in-flight
+		// request. Authorize() re-validates p.Class against the cfg it is given
+		// (ResolveClassPermissions + ClassHasPermission), so reading once and
+		// passing the same pointer to both makes a revoked or demoted principal
+		// evaluate against the config that revoked it. No test caught this
+		// because every authorization fixture holds its store immutable for the
+		// whole request.
+		cfg := s.activeConfig()
+		p := s.principal(r, cfg)
+		if err := authz.Authorize(cfg, p, required); err != nil {
+			// Debug, not Warn: this fires once per DENIED request, and a
+			// keep-alive loop from an unauthenticated caller is exactly the
+			// cheapest way to drive it. The project's logging rule forbids
+			// per-request Info/Warn on a caller-driven path (CLAUDE.md).
+			slog.Debug("api: denied mutating request",
 				"method", r.Method, "path", r.URL.Path,
 				"principal", p.String(), "source", p.Source.String(),
 				"required", authz.PermissionName(required), "err", err)

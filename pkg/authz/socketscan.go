@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"strconv"
@@ -85,6 +86,16 @@ type socketQuery struct {
 	// read. Zero means we looked nowhere, which must not be reported as "no
 	// row found" — see findPeerSocket.
 	filesRead int
+	// filesFailed counts this query's target files that could NOT be read.
+	//
+	// Non-zero is a FAILURE even when filesRead is also non-zero. A caller's row
+	// lives in exactly one of tcp/tcp6 and we cannot know which, so "tcp read
+	// clean and empty, tcp6 unreadable" is not evidence of "no row" — it is a
+	// partial observation. Reporting it as a successful omission sends a LOCAL
+	// caller whose row is in the unread file to the off-box row, which is the
+	// one row an api-auth credential may speak for. Only the full-failure case
+	// was checked before; this is the partial one.
+	filesFailed int
 
 	res chan socketResult
 }
@@ -165,7 +176,13 @@ func (b *socketBatcher) run() {
 
 		for _, q := range batch {
 			var err error
-			if q.filesRead == 0 {
+			switch {
+			case q.filesFailed > 0:
+				// Partial (or total) read failure: at least one candidate table
+				// could not be consulted, so "no row" is unsupported. Fail closed.
+				err = fmt.Errorf("%d of this peer's %d socket tables could not be read",
+					q.filesFailed, q.filesFailed+q.filesRead)
+			case q.filesRead == 0:
 				// Every candidate table was absent or unreadable. "No row
 				// found" would be a claim about the caller drawn from having
 				// looked nowhere — and under LookupPeer's precedence that
@@ -202,13 +219,22 @@ func scanBatch(batch []*socketQuery) {
 	}
 
 	for path, byLocal := range wants {
-		if !scanTableInto(path, byLocal) {
-			continue // absent or unreadable; filesRead stays unincremented
+		ok, absent := scanTableInto(path, byLocal)
+		if absent {
+			// ENOENT is not a failed observation. A kernel built without IPv6
+			// has no /proc/net/tcp6 at all, so the file is not a candidate
+			// table rather than one we could not read — counting it as a
+			// failure would deny every caller on such a box.
+			continue
 		}
 		for _, byRemote := range byLocal {
 			for _, qs := range byRemote {
 				for _, q := range qs {
-					q.filesRead++
+					if ok {
+						q.filesRead++
+					} else {
+						q.filesFailed++
+					}
 				}
 			}
 		}
@@ -216,7 +242,7 @@ func scanBatch(batch []*socketQuery) {
 }
 
 // scanTableInto reads one /proc/net/tcp{,6} file, recording matches onto the
-// queries waiting for them. It reports whether the file was read at all.
+// queries waiting for them.
 //
 // A row that MATCHES a query's 4-tuple but whose state or uid column will not
 // parse is recorded as `malformed` rather than dropped. Dropping it reported "no
@@ -226,10 +252,14 @@ func scanBatch(batch []*socketQuery) {
 // caller is known local, so it is denied) AND keeps the diagnosis, which a
 // silent `continue` threw away — the kernel does not emit such a row, so if one
 // appears the operator needs to know rather than see an unexplained 403.
-func scanTableInto(path string, byLocal map[string]map[string][]*socketQuery) bool {
+// It reports (read, absent): read=true means the file was consulted end to end;
+// absent=true means it does not exist, which is not a failure (see scanBatch).
+// read=false with absent=false is a genuine failure — present but unreadable, or
+// truncated mid-scan — and MUST NOT be reported as "no row found".
+func scanTableInto(path string, byLocal map[string]map[string][]*socketQuery) (read, absent bool) {
 	f, err := os.Open(path)
 	if err != nil {
-		return false
+		return false, errors.Is(err, fs.ErrNotExist)
 	}
 	defer f.Close()
 
@@ -289,7 +319,7 @@ func scanTableInto(path string, byLocal map[string]map[string][]*socketQuery) bo
 	// A read error mid-file (including bufio.Scanner's token-too-long) leaves
 	// whatever matched before it. Report the file as read only if it completed,
 	// so a truncated scan cannot be mistaken for "no row exists".
-	return sc.Err() == nil
+	return sc.Err() == nil, false
 }
 
 // normalizeHexColumn upper-cases a /proc address column. The kernel already

@@ -66722,3 +66722,39 @@ break — `go vet` confirmed passing under every revert.
   ./... rc=0 (60 ok, 0 FAIL), -race rc=0.
 - **File(s)**: pkg/authz/peer.go, pkg/authz/socketscan.go, pkg/api/authz.go,
   pkg/api/README.md, docs/system-login.md, _Log.md
+
+- **Timestamp**: 2026-08-01 (round-7, Codex 5-MAJOR fold — PARTIAL)
+- **Action**: #5561 — folded 2 of 5 round-7 MAJORs plus one MINOR; 3 remain and
+  are listed for the next pass. MAJOR-3 (partial enumeration failure read as a
+  successful omission): `scanTableInto` now returns (read, absent) and
+  `socketQuery` tracks `filesFailed`, so "tcp clean+empty, tcp6 present but
+  unreadable" is a FAILURE rather than "no row". First attempt over-corrected —
+  an ABSENT tcp6 (IPv6-less kernel) became a failure and reddened
+  `TestProcParserRejectsNonEstablishedRow_5561`, correctly; ENOENT is now
+  discriminated from unreadable. Then the deeper half: `LookupPeer`'s error
+  branch had FALLEN BACK to `couldBeLocal`, so an unrecognised caller was
+  reported off-box on an observation never made. A failed read is UNKNOWN and now
+  denies everyone. That inverted the two guards the parent predicted would fight
+  — `TestUnreadableTableStillReportsARoutablePeerOffBox_5561` (renamed
+  `TestUnreadableTableDeniesEveryone_5561`) and the remote half of
+  `TestSaturatedBatcherFailsClosed_5561` — both of which encoded the fail-open as
+  REQUIRED; their redding is the fix, not a regression. MAJOR-1 (revoked local
+  principal): `principal()` and `Authorize()` took two independent
+  `ActiveConfig()` reads, so a class copied from config A was evaluated against
+  config B; both now take ONE snapshot passed by the caller, and Authorize
+  re-validates the class against it. MINOR (MAJOR-5a): the two per-request
+  `slog.Warn` on denied/unguarded mutations are now `slog.Debug` — caller-driven
+  and unauthenticated, so Warn there is a log-amplification lever and violates
+  the project logging rule. Mutation: disabling the partial-failure branch gives
+  build rc=0 (0 bytes), vet rc=0 (0 bytes), and reds ONLY
+  TestPartialTableReadFailsClosed_5561's unreadable subtest at
+  peer_5561_test.go:1211, 53 pass — with the absent-tcp6 negative control green
+  in both worlds.
+- **NOT DONE, carried:** MAJOR-2 (revoked api-auth credential in flight),
+  MAJOR-4 (cleartext secret-bearing URLs on unauthenticated GETs — DDNS
+  Server/URLTemplate/CheckIPURL, FeedServer.URL; `secretIndices` is keyword-based
+  so `url`/`server` never match), MAJOR-5b (timed-out request does not cancel its
+  accept-time lookup goroutine), and the
+  `TestResolveClassPermissionsIsSharedWithTheCLI_5561` binding gap.
+- **File(s)**: pkg/authz/peer.go, pkg/authz/socketscan.go,
+  pkg/authz/peer_5561_test.go, pkg/api/authz.go, _Log.md

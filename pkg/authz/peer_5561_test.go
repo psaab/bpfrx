@@ -350,26 +350,24 @@ func TestLookupPeerRefusesScopedPeerAddress_5561(t *testing.T) {
 	}
 }
 
-// TestUnreadableTableStillReportsARoutablePeerOffBox_5561 was the MAJOR-D guard
-// for a property that no longer holds, and now guards what replaced it.
+// TestUnreadableTableDeniesEveryone_5561 replaces a guard that encoded a
+// FAIL-OPEN as required behaviour, twice over.
 //
-// It used to claim that a peer which cannot be local costs ZERO socket-table
-// work. That early-out is GONE: it made a cached NEGATIVE decisive, which is the
-// round-5 MAJOR (see TestBrandNewLocalAddressIsAttributedNotOffBox_5561), and
-// the single-flight batcher had already removed the cost argument for it — 120
-// concurrent fresh connections cost 3 table reads. The table is now read first
-// for everyone. Asserting "zero reads" here would be asserting a property the
-// code deliberately gave up; the cost property that survives is
-// pkg/api's TestConcurrentConnectionsShareOneSocketTableRead_5561's, and it is about reads per
-// connection rather than reads at all.
+// It first asserted "a peer that cannot be local costs ZERO socket-table work" —
+// an early-out that made a cached NEGATIVE decisive, removed in round 5. It was
+// then rewritten to assert that an unreadable table still reports a routable
+// peer OFF-BOX, on the reasoning that a broken /proc must not lock out remote
+// administrators. That reasoning is an availability argument standing where a
+// security one belongs: "off-box" is the single row an api-auth credential may
+// speak for, and a failed read is not evidence for it. The caller's row may be
+// in precisely the file that failed — tcp and tcp6 are alternatives, not
+// duplicates.
 //
-// What must NOT change is the direction of the error path. With no readable
-// table the lookup knows nothing about the caller, so it falls back to the
-// address classification — the same answer the early-out gave, in both
-// directions. A routable peer that is not one of ours is still reported off-box,
-// so a broken /proc does not silently lock out every remote administrator; a
-// peer that IS one of ours is denied.
-func TestUnreadableTableStillReportsARoutablePeerOffBox_5561(t *testing.T) {
+// So the direction is inverted deliberately: a table read that FAILS denies
+// everyone, credentialed or not. An ABSENT table is a separate case and is NOT
+// a failure (see TestPartialTableReadFailsClosed_5561), so an IPv6-less kernel
+// is unaffected.
+func TestUnreadableTableDeniesEveryone_5561(t *testing.T) {
 	dir := t.TempDir()
 	defer SetProcNetTCPPathsForTest(filepath.Join(dir, "absent"), filepath.Join(dir, "absent6"))()
 	defer setLocalAddrsForTest([]net.Addr{
@@ -379,17 +377,16 @@ func TestUnreadableTableStillReportsARoutablePeerOffBox_5561(t *testing.T) {
 	id := LookupPeer(
 		&net.TCPAddr{IP: net.IPv4(198, 51, 100, 7), Port: 51234},
 		&net.TCPAddr{IP: net.IPv4(10, 0, 61, 1), Port: 8080})
-	if id.Local {
-		t.Fatalf("an unreadable socket table reported a routable, NON-local peer as local "+
-			"(%+v) — a broken /proc would then deny every remote administrator, credential "+
-			"or not", id)
+	if !id.Local {
+		t.Fatalf("an unreadable socket table reported a routable peer OFF-BOX (%+v) — that "+
+			"is the one row an api-auth credential may speak for, and we never made the "+
+			"observation that would support it", id)
 	}
 	if id.OK {
-		t.Fatalf("a non-local peer was attributed: %+v", id)
+		t.Fatalf("an unreadable socket table produced an identity: %+v", id)
 	}
 
-	// The other direction of the same fallback: a caller from one of OUR
-	// addresses, with no table to consult, is local-and-unattributable (denied).
+	// And a caller from one of OUR addresses, same unknown answer, same denial.
 	ours := LookupPeer(
 		&net.TCPAddr{IP: net.IPv4(10, 0, 61, 1), Port: 51234},
 		&net.TCPAddr{IP: net.IPv4(10, 0, 61, 9), Port: 8080})
@@ -1059,13 +1056,18 @@ func TestSaturatedBatcherFailsClosed_5561(t *testing.T) {
 			"must deny rather than fall through to the credential", ours)
 	}
 
-	// A routable caller that is not ours: still off-box, so saturation is not a
-	// way to deny every credentialed remote administrator.
+	// A routable caller that is not ours: ALSO denied. A saturated queue is a
+	// failed read, and a failed read is unknown — see
+	// TestUnreadableTableDeniesEveryone_5561. This assertion used to require
+	// off-box here, on the availability argument that saturation must not lock
+	// out remote administrators; that put an availability rule where a security
+	// one belongs, since off-box is the row the credential speaks for.
 	remote := lookupOrTimeout(t,
 		&net.TCPAddr{IP: net.IPv4(198, 51, 100, 7), Port: 51234},
 		&net.TCPAddr{IP: net.IPv4(10, 0, 61, 1), Port: 8080})
-	if remote.OK || remote.Local {
-		t.Fatalf("a saturated queue reported a routable non-local peer as %+v", remote)
+	if remote.OK || !remote.Local {
+		t.Fatalf("a saturated queue reported a routable peer as %+v — saturation is a failed "+
+			"observation, so it must deny rather than hand out the credential row", remote)
 	}
 
 	// And the queue did not grow past its cap.
@@ -1138,4 +1140,72 @@ func TestSaturatedEnumerationQueueFailsClosed_5561(t *testing.T) {
 	if n > maxHostAddrWaiters {
 		t.Fatalf("waiter queue grew to %d, past the %d cap", n, maxHostAddrWaiters)
 	}
+}
+
+// TestPartialTableReadFailsClosed_5561 is the round-7 MAJOR-3 guard.
+//
+// The full-failure case was checked twice and is correct: no table readable ->
+// error -> local -> deny. The PARTIAL case was not. A caller's row lives in
+// exactly ONE of tcp/tcp6 and we cannot know which, so "tcp read clean and
+// empty, tcp6 present but unreadable" is not evidence of "no row" — it is half
+// an observation. Reporting it as a successful omission sends a LOCAL caller
+// whose row is in the unread file to the off-box row, the one row an api-auth
+// credential may speak for.
+//
+// The discrimination that keeps this from over-denying: an ABSENT tcp6 is not a
+// failure. A kernel built without IPv6 has no such file, and counting that as a
+// failed read would deny every caller on such a box — which is why the negative
+// control below is as load-bearing as the positive one.
+func TestPartialTableReadFailsClosed_5561(t *testing.T) {
+	const header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+	client := &net.TCPAddr{IP: net.IPv4(198, 51, 100, 7), Port: 43210}
+	server := &net.TCPAddr{IP: net.IPv4(10, 0, 61, 1), Port: 8080}
+	ours := []net.Addr{&net.IPNet{IP: net.IPv4(10, 0, 61, 1), Mask: net.CIDRMask(24, 32)}}
+
+	t.Run("present but unreadable tcp6 is a FAILURE, not an omission", func(t *testing.T) {
+		dir := t.TempDir()
+		v4, v6 := filepath.Join(dir, "tcp"), filepath.Join(dir, "tcp6")
+		write(t, v4, header) // reads clean, matches nothing
+		write(t, v6, header)
+		if err := os.Chmod(v6, 0o000); err != nil {
+			t.Skipf("cannot make %s unreadable: %v", v6, err)
+		}
+		if f, err := os.Open(v6); err == nil {
+			f.Close()
+			t.Skip("running with privileges that ignore file mode; cannot stage an unreadable table")
+		}
+		defer SetProcNetTCPPathsForTest(v4, v6)()
+		defer setLocalAddrsForTest(ours)() // caller is NOT one of ours
+
+		id := LookupPeer(client, server)
+		if !id.Local {
+			t.Fatalf("a peer whose tcp6 table could not be read was reported OFF-BOX (%+v) — "+
+				"its row may well be in the file we failed to read, so this hands a local "+
+				"caller the api-auth credential path on a half-finished observation", id)
+		}
+		if id.OK {
+			t.Fatalf("a partial read produced an identity: %+v", id)
+		}
+	})
+
+	// Negative control, and the reason the fix discriminates on ENOENT: an
+	// ABSENT tcp6 is an IPv6-less kernel, not a failed read. This must still
+	// answer from tcp alone, in BOTH directions.
+	t.Run("absent tcp6 is not a failure", func(t *testing.T) {
+		dir := t.TempDir()
+		v4 := filepath.Join(dir, "tcp")
+		write(t, v4, header)
+		defer SetProcNetTCPPathsForTest(v4, filepath.Join(dir, "nonexistent-tcp6"))()
+		defer setLocalAddrsForTest(ours)()
+
+		if id := LookupPeer(client, server); id.Local {
+			t.Fatalf("an ABSENT tcp6 was treated as a failed read (%+v) — every caller on an "+
+				"IPv6-less kernel would be denied", id)
+		}
+		oursCaller := &net.TCPAddr{IP: net.IPv4(10, 0, 61, 1), Port: 51234}
+		other := &net.TCPAddr{IP: net.IPv4(10, 0, 61, 9), Port: 8080}
+		if id := LookupPeer(oursCaller, other); !id.Local {
+			t.Fatalf("a caller from our OWN address was reported off-box with tcp6 absent: %+v", id)
+		}
+	})
 }
