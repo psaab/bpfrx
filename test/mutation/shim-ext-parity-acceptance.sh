@@ -1,118 +1,375 @@
 #!/usr/bin/env bash
 #
 # #4555 acceptance harness: prove the IPv6 extension-header parity guards
-# actually fire, by mutating the shim's walk and observing the corpus red.
+# actually fire, by mutating the shim's walk and observing the guards red.
 #
 # Committed deliberately. The mutation rows in the PR body and _Log.md are only
 # evidence if the procedure that produced them can be audited — ordering, return
 # codes, restore verification and signal handling all change what the rows mean.
 # Prose describing a harness is not a harness.
 #
-# Three properties, each learned from a failure of an earlier version of this
-# script:
+# EVERY CHECK MUST BE ABLE TO OBSERVE THE THING IT REPORTS ON.
 #
-#   1. EXCLUSIVE LOCK. Two concurrent runs mutate the same file and interleave
-#      their restores. One run's row then describes the other run's tree.
-#   2. GREEN BASELINE SELF-CHECK (row 0). If the tree is not clean before the
-#      first mutation, every later row is void. An earlier run was killed
-#      mid-mutation, the next run captured the mutated tree as its "pristine"
-#      copy, and reported a clean tree as failing. Refusing to start is better
-#      than emitting confident false rows.
-#   3. RESTORE ON EXIT/INT/TERM. A trap cannot catch SIGKILL, so the trap is not
-#      the safety property — property 2 is. The trap narrows the window; the
-#      baseline check is what makes a poisoned tree non-fatal.
+# Review found the same defect three times in this one file: a probe that
+# reports success without having observed anything. The build gate ran
+# `cargo build`, which never compiles the file being mutated, so a mutation
+# that did not even parse scored as "the guard fired". The row's per-test
+# columns were decorative — deleting BOTH negative-control tests left every row
+# printing an empty column and the script still exited PASS, because
+# `cargo test <filter matching nothing>` exits 0 with `0 passed` and no
+# Go-style `[no tests to run]` marker. And the "first divergence" extractor's
+# character class excluded `{` and `:`, so once the assertion text changed it
+# matched nothing and every RED row printed no reason at all.
+#
+# So each check below closes its own path to vacuous success, and the two that
+# were previously inoperative are DEMONSTRATED by preflights rather than
+# asserted:
+#
+#   P1  a deliberate syntax error in the mutated file must make the BUILD gate
+#       fail. If it does not, the build gate does not compile that file and no
+#       row it prints can distinguish an assertion from a compile error.
+#   P2  a filter matching nothing must be REPORTED AS MISSING by the same
+#       per-test extractor the rows use — not scored as a pass.
+#
+# Four properties, each learned from a failure of an earlier version:
+#
+#   1. EXCLUSIVE LOCK, at a fixed path. Two concurrent runs mutate the same file
+#      and interleave their restores; one run's row then describes the other
+#      run's tree. The lock used to live under ${TMPDIR}, which this repo
+#      routinely varies, so two runs took two different locks and serialised
+#      nothing.
+#   2. GREEN BASELINE SELF-CHECK (row 0), plus a tree-cleanliness check. If the
+#      tree is not clean before the first mutation, every later row is void. An
+#      earlier run was killed mid-mutation, the next run captured the mutated
+#      tree as its "pristine" copy, and reported a clean tree as failing.
+#      Passing tests are NOT tree cleanliness: a mutation the guards do not
+#      detect would be captured as GOLD and restored as "pristine", so the file
+#      is compared against git as well.
+#   3. RESTORE ON EXIT/INT/TERM, VERIFIED. A trap cannot catch SIGKILL, so the
+#      trap is not the safety property — property 2 is. The trap narrows the
+#      window; the `cmp` is what proves the restore happened.
+#   4. EVERY ROW CARRIES AN EXPECTATION. A row that must RED and a row that must
+#      SURVIVE are both checked, so a harness that reds unconditionally fails
+#      just as loudly as one that never reds. Row 11 is a semantically null
+#      edit to the mutated file: it must survive, which is what separates "the
+#      guard binds this BEHAVIOUR" from "the guard noticed the file changed".
 #
 # Usage:  test/mutation/shim-ext-parity-acceptance.sh
-# Requires: cargo + the pinned toolchain; no root, no cluster, no network.
+# Requires: cargo + the pinned toolchain, python3; no root, no cluster, no
+# network.
+# Runtime: ~5 min per row — the mutated file is `#[path]`-included into the
+# userspace-dp test binary, so every row is a full release rebuild of that
+# crate.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WALK="${REPO}/userspace-xdp/src/ipv6_ext_walk.rs"
+WALK_REL="userspace-xdp/src/ipv6_ext_walk.rs"
 GOLD="$(mktemp -t ipv6_ext_walk.gold.XXXXXX)"
-LOCK="${TMPDIR:-/tmp}/xpf-4555-acceptance.lock"
+# Fixed path, NOT ${TMPDIR}-derived: this repo documents TMPDIR=/tmp as a
+# workaround for unix-socket tests, so a TMPDIR-scoped lock is routinely two
+# different locks.
+LOCK="/tmp/xpf-4555-acceptance.lock"
 : "${CARGO_TARGET_DIR:=/dev/shm/cargo-4555-acceptance}"
 export CARGO_TARGET_DIR
 export TMPDIR="${TMPDIR:-/tmp}"
 
+# The tests this harness scores. A name that does not appear in cargo's output
+# is a HARNESS ERROR, never a pass — see P2.
+TEST_PATH="afxdp::frame::tests_shim_ext_parity"
+GUARDS=(
+  shim_walk_and_userspace_walk_agree_over_a_corpus
+  shim_is_not_more_permissive
+  shim_ipv6_ext_walk_matches_userspace_walker
+)
+# Negative controls: they assert nothing about any shim-side behaviour the
+# mutations below perturb, so they must stay `ok` in EVERY row. A row where a
+# control moved is a row whose guard columns are not attributable.
+CONTROLS=(
+  shim_walk_corpus_negative_control
+  shim_ext_parity_negative_control_unchanged_classifications
+)
+ALL_TESTS=("${GUARDS[@]}" "${CONTROLS[@]}")
+
 exec 9>"${LOCK}"
 flock -n 9 || { echo "another acceptance run holds ${LOCK}; refusing to interleave"; exit 1; }
 
+build_log="$(mktemp)"; test_log="$(mktemp)"; pysub="$(mktemp -t xpf4555sub.XXXXXX)"
 cp "${WALK}" "${GOLD}"
-trap 'cp "${GOLD}" "${WALK}"; rm -f "${GOLD}"' EXIT INT TERM
+cleanup() {
+  cp "${GOLD}" "${WALK}" || echo "RESTORE FAILED: ${GOLD} -> ${WALK}" >&2
+  rm -f "${GOLD}" "${build_log}" "${test_log}" "${pysub}"
+}
+trap cleanup EXIT INT TERM
 
-build_log="$(mktemp)"; test_log="$(mktemp)"
-run() {
-  ( cd "${REPO}/userspace-dp" && cargo build --release ) >"${build_log}" 2>&1
-  local brc=$?
-  if [ $brc -ne 0 ]; then
-    printf '%-54s BUILD rc=%d  <-- FALSE RED, not an assertion\n' "$1" "$brc"
-    grep -m2 -E '^error' "${build_log}" | sed 's/^/      /'
-    return 1
-  fi
-  ( cd "${REPO}/userspace-dp" && cargo test --release --bin xpf-userspace-dp tests_shim_ext_parity ) >"${test_log}" 2>&1
-  local trc=$?
-  r() { grep -E "tests_shim_ext_parity::$1 \.\.\." "${test_log}" | grep -oE '(ok|FAILED)' | head -1; }
-  printf '%-54s build=0 rc=%-3d | corpus=%-6s facts=%-6s CONTROL=%s/%s\n' "$1" "$trc" \
-    "$(r shim_walk_and_userspace_walk_agree_over_a_corpus)" \
-    "$(r shim_ipv6_ext_walk_matches_userspace_walker)" \
-    "$(r shim_walk_corpus_negative_control)" \
-    "$(r shim_ext_parity_negative_control_unchanged_classifications)"
-  grep -m1 -oE '[A-Za-z0-9 ()=,>-]+: shim=[A-Za-z0-9(), ]+ userspace=[A-Za-z0-9(), ]+' "${test_log}" \
-    | sed 's/^/      first divergence: /'
-  return $trc
+fail() { echo "HARNESS ERROR: $*" >&2; exit 3; }
+
+# Textual substitution that ASSERTS it matched. A `sed -i` that silently
+# matches nothing runs the row against an UNMUTATED tree and reports
+# "MUTATION SURVIVED", attributing a harness failure to the guard.
+cat >"${pysub}" <<'PY'
+import sys
+path, want = sys.argv[1], int(sys.argv[2])
+parts = sys.stdin.read().split("\n@@@\n")
+if len(parts) != 2:
+    sys.exit("mutation spec must be OLD then a lone @@@ line then NEW")
+old, new = parts[0], parts[1]
+if new.endswith("\n"):
+    new = new[:-1]
+if old == new:
+    sys.exit("mutation is a no-op: OLD and NEW are identical")
+s = open(path).read()
+got = s.count(old)
+if got != want:
+    sys.exit("mutation target found %d times, expected %d:\n%s" % (got, want, old))
+open(path, "w").write(s.replace(old, new))
+PY
+py_sub() { python3 "${pysub}" "${WALK}" "$1"; }
+spec() { printf '%s\n@@@\n%s\n' "$1" "$2"; }
+
+# --- the build gate -------------------------------------------------------
+#
+# `cargo test --no-run` and NOT `cargo build`. The mutated file enters the tree
+# only through `#[cfg(test)] mod tests_shim_ext_parity` ->
+# `#[path = "../../../../userspace-xdp/src/ipv6_ext_walk.rs"] mod shim_walk`,
+# and `cargo build` sets no `cfg(test)`, so it compiles neither that file nor
+# the userspace-xdp crate. P1 demonstrates that this command does.
+#
+# `9>&-` closes the lock fd in the child. Without it cargo and rustc INHERIT it,
+# so a run killed mid-build leaves its lock held by orphaned compiler processes
+# and the next run refuses to start against a lock nothing is using. Found by
+# doing exactly that.
+build_gate() {
+  ( cd "${REPO}/userspace-dp" && cargo test --release --bin xpf-userspace-dp --no-run ) \
+    >"${build_log}" 2>&1 9>&-
 }
 
-echo "=== #4555 acceptance: mutate the shim walk, the corpus must red ==="
+test_gate() {
+  ( cd "${REPO}/userspace-dp" && cargo test --release --bin xpf-userspace-dp "$@" ) \
+    >"${test_log}" 2>&1 9>&-
+}
+
+# `ok`, `FAILED`, `DUP`, or empty when the named test did not run. Anchored on
+# the full module path, so no substring of another test's name satisfies it.
+result_of() {
+  local n
+  n="$(grep -cE "^test ${TEST_PATH}::$1 \.\.\. (ok|FAILED)\$" "${test_log}")"
+  if [ "${n}" -gt 1 ]; then echo DUP; return; fi
+  sed -nE "s/^test ${TEST_PATH}::$1 \.\.\. (ok|FAILED)\$/\1/p" "${test_log}"
+}
+
+# A RED row must say WHY. Specific pattern first, generic panic context as a
+# fallback; the caller asserts the result is non-empty. An extractor that
+# silently matches nothing is the exact defect this file keeps regrowing.
+explain() {
+  local e
+  e="$(grep -m1 -oE '(\[l3=[0-9]+\] |next-header [0-9]+: )[^"]*' "${test_log}")"
+  if [ -z "${e}" ]; then
+    e="$(grep -m1 -A3 -E "^thread '.*' panicked" "${test_log}" | tr '\n' ' ')"
+  fi
+  printf '%s' "${e}"
+}
+
+# 0 green, 1 red, 2 build failure. Exits 3 on a harness error.
+run() {
+  local label="$1"
+  build_gate
+  local brc=$?
+  if [ ${brc} -ne 0 ]; then
+    printf '%-56s BUILD rc=%-3d <-- FALSE RED, not an assertion\n' "${label}" "${brc}"
+    grep -m2 -E '^error' "${build_log}" | sed 's/^/      /'
+    return 2
+  fi
+  test_gate tests_shim_ext_parity
+  local trc=$?
+
+  local -a cols=()
+  local -a bad=()
+  local t r
+  for t in "${ALL_TESTS[@]}"; do
+    r="$(result_of "${t}")"
+    case "${r}" in
+      ok|FAILED) ;;
+      *) bad+=("${t}=${r:-MISSING}") ;;
+    esac
+    cols+=("${r:-MISSING}")
+  done
+  if [ ${#bad[@]} -ne 0 ]; then
+    printf '%-56s build=%d rc=%-3d | %s\n' "${label}" "${brc}" "${trc}" "${cols[*]}"
+    fail "no usable result for: ${bad[*]}. cargo exits 0 on a filter that matches nothing, so an absent test is never a pass."
+  fi
+
+  printf '%-56s build=%d rc=%-3d | corpus=%-6s permissive=%-6s facts=%-6s CONTROL=%s/%s\n' \
+    "${label}" "${brc}" "${trc}" "${cols[0]}" "${cols[1]}" "${cols[2]}" "${cols[3]}" "${cols[4]}"
+
+  # The controls must be untouched by every shim-side mutation, or the guard
+  # columns beside them are not attributable to the mutation.
+  local i
+  for i in 3 4; do
+    if [ "${cols[$i]}" != "ok" ]; then
+      echo "      ^^ CONTROL ${ALL_TESTS[$i]} = ${cols[$i]} — this row's guard columns are not attributable"
+      return 1
+    fi
+  done
+
+  if [ ${trc} -ne 0 ]; then
+    local why; why="$(explain)"
+    [ -n "${why}" ] || fail "row '${label}' is RED but no reason could be extracted from ${test_log}; the extractor no longer matches the assertion text"
+    echo "      first divergence: ${why}"
+    return 1
+  fi
+  return 0
+}
+
+echo "=== #4555 acceptance: mutate the shim walk, the guards must red ==="
+
+# --- preconditions --------------------------------------------------------
+if git -C "${REPO}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  if ! git -C "${REPO}" diff --quiet -- "${WALK}"; then
+    echo "ABORT: ${WALK_REL} differs from git HEAD. A mutation the guards do NOT"
+    echo "       detect would be captured as the pristine copy and restored as"
+    echo "       such; passing tests are not tree cleanliness."
+    exit 1
+  fi
+  echo "PRECONDITION: ${WALK_REL} matches git HEAD"
+else
+  echo "PRECONDITION: tree cleanliness UNVERIFIED — ${REPO} is not a git work tree"
+fi
+
+# --- P1: the build gate compiles the file this harness mutates ------------
+# Without this, every row's build column is a hardcoded claim. Measured, not
+# asserted: a file that is not valid Rust must make the gate fail.
+printf 'P1  build gate observes %s ... ' "${WALK_REL}"
+printf '\nthis is not rust\n' >>"${WALK}"
+if build_gate; then
+  cp "${GOLD}" "${WALK}"
+  fail "the build gate SUCCEEDED with a syntax error in ${WALK_REL}. It does not compile the mutated file, so it cannot distinguish an assertion from a compile failure — which is the only thing it exists to do."
+fi
+cp "${GOLD}" "${WALK}"
+cmp -s "${GOLD}" "${WALK}" || fail "restore after P1 did not reproduce the pristine file"
+echo "yes (build failed on a deliberate syntax error)"
+
+# --- P2: a test that does not run is reported MISSING, not ok -------------
+# `cargo test <filter matching nothing>` exits 0 and prints `0 passed`. The
+# per-test extractor must therefore report absence, or every column is
+# decorative and a vacuous run scores as a pass.
+printf 'P2  a vacuous run is reported MISSING ... '
+test_gate xpf_4555_no_such_test_name
+vac_rc=$?
+[ ${vac_rc} -eq 0 ] || fail "expected a filter matching nothing to exit 0, got ${vac_rc}; P2 no longer demonstrates what it claims"
+for t in "${ALL_TESTS[@]}"; do
+  [ -z "$(result_of "${t}")" ] || fail "the per-test extractor reported a result for ${t} in a run that executed no tests"
+done
+echo "yes (cargo exit 0, all ${#ALL_TESTS[@]} columns MISSING)"
+
+# --- row 0: green baseline ------------------------------------------------
 if ! run "0. GREEN [baseline self-check]"; then
-  echo "ABORT: baseline is not green. The tree is dirty or a previous run was"
-  echo "       killed mid-mutation; every row after this would be meaningless."
+  echo "ABORT: baseline is not green. Every row after this would be meaningless."
   exit 1
 fi
 
-mutate_generic_advance() { sed -i 's|+ 1) \* 8)?;|+ 1) * 16)?;|' "${WALK}"; }
-mutate_drop_generic_revalidation() {
-  python3 - "${WALK}" <<'PY'
-import sys
-p = sys.argv[1]; s = open(p).read()
-old = """                offset = offset.checked_add(((opt[1] as u16) + 1) * 8)?;
+# --- mutation targets -----------------------------------------------------
+GENERIC_ARM='            EH_CLASS_GENERIC => {
+                let opt = read_bytes(data, data_end, offset as usize, 2)?;
+                protocol = opt[0];
+                offset = offset.checked_add(((opt[1] as u16) + 1) * 8)?;
                 read_bytes(
                     data,
                     data_end,
                     l3_offset as usize,
                     (offset - l3_offset) as usize,
-                )?;"""
-assert s.count(old) == 1, "generic arm not found in its expected shape"
-open(p, 'w').write(s.replace(old, "                offset = offset.checked_add(((opt[1] as u16) + 1) * 8)?;"))
-PY
-}
-mutate_statement_outside_match() {
-  python3 - "${WALK}" <<'PY'
-import sys
-p = sys.argv[1]; s = open(p).read()
-a = "    for _ in 0..MAX_EXT_HDRS {\n"
-assert s.count(a) == 1
-open(p, 'w').write(s.replace(a, a + "        if offset > 200 {\n            break;\n        }\n"))
-PY
-}
-mutate_auth_advance() { sed -i 's|+ 2) \* 4)?;|+ 2) * 8)?;|' "${WALK}"; }
+                )?;
+            }'
+AUTH_ARM='            EH_CLASS_AUTH => {
+                let opt = read_bytes(data, data_end, offset as usize, 2)?;
+                protocol = opt[0];
+                offset = offset.checked_add(((opt[1] as u16) + 2) * 4)?;
+                read_bytes(
+                    data,
+                    data_end,
+                    l3_offset as usize,
+                    (offset - l3_offset) as usize,
+                )?;
+            }'
+FRAG_READ='                let frag = read_bytes(data, data_end, offset as usize, 8)?;'
+LOOP_HEAD='    for _ in 0..MAX_EXT_HDRS {'
+REVAL_BASE='                    l3_offset as usize,
+                    (offset - l3_offset) as usize,'
 
+# Quoted patterns, so bash treats them literally rather than as globs.
+GENERIC_ADV16="${GENERIC_ARM/"+ 1) * 8"/"+ 1) * 16"}"
+GENERIC_REVAL_M1="${GENERIC_ARM/"(offset - l3_offset) as usize"/"(offset - l3_offset - 1) as usize"}"
+AUTH_ADV8="${AUTH_ARM/"+ 2) * 4"/"+ 2) * 8"}"
+AUTH_REVAL_M1="${AUTH_ARM/"(offset - l3_offset) as usize"/"(offset - l3_offset - 1) as usize"}"
+FRAG_READ_7="${FRAG_READ/", 8)?;"/", 7)?;"}"
+FRAG_READ_2="${FRAG_READ/", 8)?;"/", 2)?;"}"
+REVAL_BASE_0="${REVAL_BASE/"l3_offset as usize,"/"0usize,"}"
+# A real edit that compiles and changes nothing observable — see property 4.
+GENERIC_RENAMED="${GENERIC_ARM//opt/hdr}"
+# Drop the whole post-advance revalidation call from an arm.
+drop_reval() {
+  printf '%s' "$1" | grep -v \
+    -e '^                read_bytes($' \
+    -e '^                    data,$' \
+    -e '^                    data_end,$' \
+    -e '^                    l3_offset as usize,$' \
+    -e '^                    (offset - l3_offset) as usize,$' \
+    -e '^                )?;$'
+}
+GENERIC_NO_REVAL="$(drop_reval "${GENERIC_ARM}")"
+AUTH_NO_REVAL="$(drop_reval "${AUTH_ARM}")"
+LOOP_HEAD_GUARDED="${LOOP_HEAD}
+        if offset > 200 {
+            break;
+        }"
+
+m_generic_advance()      { spec "${GENERIC_ARM}"  "${GENERIC_ADV16}"      | py_sub 1; }
+m_generic_reval_delete() { spec "${GENERIC_ARM}"  "${GENERIC_NO_REVAL}"   | py_sub 1; }
+m_generic_reval_minus1() { spec "${GENERIC_ARM}"  "${GENERIC_REVAL_M1}"   | py_sub 1; }
+m_auth_advance()         { spec "${AUTH_ARM}"     "${AUTH_ADV8}"          | py_sub 1; }
+m_auth_reval_delete()    { spec "${AUTH_ARM}"     "${AUTH_NO_REVAL}"      | py_sub 1; }
+m_auth_reval_minus1()    { spec "${AUTH_ARM}"     "${AUTH_REVAL_M1}"      | py_sub 1; }
+m_frag_read_2()          { spec "${FRAG_READ}"    "${FRAG_READ_2}"        | py_sub 1; }
+m_frag_read_7()          { spec "${FRAG_READ}"    "${FRAG_READ_7}"        | py_sub 1; }
+m_stmt_outside_match()   { spec "${LOOP_HEAD}"    "${LOOP_HEAD_GUARDED}"  | py_sub 1; }
+m_semantically_null()    { spec "${GENERIC_ARM}"  "${GENERIC_RENAMED}"    | py_sub 1; }
+# The revalidation's BASE offset stops accounting for l3. Bit-identical at
+# l3 = 0 — the only value the corpus used to walk at — and a fail-open of
+# exactly l3 bytes at the 14 and 18 the shim actually passes. Both arms.
+m_l3_base_zero()         { spec "${REVAL_BASE}"   "${REVAL_BASE_0}"       | py_sub 2; }
+
+# --- the matrix -----------------------------------------------------------
 rc=0
-for spec in \
-  "mutate_generic_advance|1. generic advance *8 -> *16" \
-  "mutate_drop_generic_revalidation|2. generic post-advance revalidation DELETED (security)" \
-  "mutate_statement_outside_match|3. statement inside the loop, outside the match" \
-  "mutate_auth_advance|4. AUTH advance *4 -> *8"; do
-  fn="${spec%%|*}"; label="${spec#*|}"
+row() {  # row <mutator> <red|survive> <label>
+  local fn="$1" want="$2" label="$3"
   cp "${GOLD}" "${WALK}"
-  "${fn}"
-  if run "${label}"; then
-    echo "      ^^ MUTATION SURVIVED — the guard does not bind this edit"
-    rc=1
-  fi
-done
+  "${fn}" || fail "mutator ${fn} did not apply"
+  cmp -s "${GOLD}" "${WALK}" && fail "mutator ${fn} left the file unchanged"
+  run "${label}"
+  local got=$?
+  case "${want}:${got}" in
+    red:1|survive:0) ;;
+    red:0)     echo "      ^^ MUTATION SURVIVED — the guards do not bind this edit"; rc=1 ;;
+    survive:1) echo "      ^^ RED ON A SEMANTICALLY NULL EDIT — this harness reds on change, not on behaviour"; rc=1 ;;
+    *:2)       echo "      ^^ BUILD FAILED — this row proves nothing about the guards"; rc=1 ;;
+    *)         echo "      ^^ unexpected outcome ${got} for expectation ${want}"; rc=1 ;;
+  esac
+}
+
+row m_generic_advance      red     " 1. GENERIC advance *8 -> *16"
+row m_generic_reval_delete red     " 2. GENERIC post-advance revalidation DELETED"
+row m_generic_reval_minus1 red     " 3. GENERIC revalidation length - 1"
+row m_auth_advance         red     " 4. AUTH advance *4 -> *8"
+row m_auth_reval_delete    red     " 5. AUTH post-advance revalidation DELETED"
+row m_auth_reval_minus1    red     " 6. AUTH revalidation length - 1"
+row m_frag_read_2          red     " 7. FRAGMENT read 8 -> 2"
+row m_frag_read_7          red     " 8. FRAGMENT read 8 -> 7"
+row m_l3_base_zero         red     " 9. revalidation base l3_offset -> 0 (both arms)"
+row m_stmt_outside_match   red     "10. statement inside the loop, outside the match"
+row m_semantically_null    survive "11. NEG-CTL semantically null rename (must survive)"
 
 cp "${GOLD}" "${WALK}"
-run "5. RESTORED" || rc=1
-rm -f "${build_log}" "${test_log}"
-echo "=== acceptance $([ $rc -eq 0 ] && echo PASS || echo FAIL) ==="
-exit $rc
+cmp -s "${GOLD}" "${WALK}" || fail "restore did not reproduce the pristine file"
+run "12. RESTORED" || rc=1
+echo "=== acceptance $([ ${rc} -eq 0 ] && echo PASS || echo FAIL) ==="
+exit ${rc}

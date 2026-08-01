@@ -1,3 +1,99 @@
+## 2026-08-01 — #4555 round 6: unfake the parity comparison, unfake the harness
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Hostile re-gate returned MERGE-NEEDS-MAJOR with six MAJORs, every
+  one in the GUARD or its acceptance harness rather than in the shipped walk.
+  The reviewer's 120,000-buffer randomized differential over all 14 relevant
+  next-header types (random HdrExtLen, random padding, random truncation,
+  l3 in {0,14}) found ZERO divergences between the two walkers, and confirmed
+  `MAX_EXT_HDRS == MAX_IPV6_EXT_HEADERS - 1` is correct — both sides resolve
+  exactly 0..=7 and refuse 8 or more. The walk is untouched, the tracked object
+  is unchanged, no `make generate`. Two of the six (arm boundary cases, L3
+  sweep) were closed by `c87851b3f` while this round was in flight; its three
+  boundary-exact cases and their comment are carried forward VERBATIM, and my
+  exact (target, target-1) pairs sit alongside them at a different magnitude.
+  - **(1) THE COMPARISON WAS A TAUTOLOGY.** `walk_ipv6_ext_headers` returns
+    `(offset, protocol)` and records no fragment state. The previous revision
+    compared a `WalkRecord` carrying `saw_fragment`/`non_first_fragment` too,
+    and supplied the shim's two columns by hand-writing a SECOND walk loop
+    inside the test that re-derived them with literally the same expression
+    `walk_ipv6_ext_chain` uses (`tests:550` vs `inspect.rs:236`). Every
+    comparison of those columns was `X == X`: no shim-side edit could move
+    them, and the widened corpus stayed GREEN on the exact non-first-fragment
+    input it was widened to catch. Second loop deleted; the corpus now compares
+    only what the shim actually returns.
+  - **(2) WROTE THE ASSERTION THE FILE HAD BEEN CITING.**
+    `shim_is_not_more_permissive` was named at `:493-496` as the mitigation for
+    exactly this gap and existed nowhere in the tree — the third dangling
+    citation on this branch. It exists now and both halves are MEASURED by
+    running the real walkers: two chains differing only in the Fragment
+    header's offset/M/identification bytes give the SAME real shim result and
+    DIFFERENT `ExtChainWalk`s. Every sub-field the old `.is_some()` collapsed is
+    pinned — readable/unreadable discriminant, 13-bit offset, M flag, 32-bit
+    identification — plus `ipv6_is_any_fragment` / `ipv6_is_non_first_fragment`
+    on the declared-but-truncated header. It records the divergence as KNOWN and
+    UNCLOSED (#6704, pre-existing) and declines to claim it is safe.
+  - **(3) THE HARNESS COULD REPORT SUCCESS WITHOUT OBSERVING ANYTHING** — three
+    instances of one defect. (a) The build gate ran `cargo build`, which never
+    compiles `ipv6_ext_walk.rs` (`#[cfg(test)]`-only), so a mutation that did
+    not parse scored as "the guard fired"; now `cargo test --no-run`, and
+    preflight P1 DEMONSTRATES the coverage by requiring a deliberate syntax
+    error to break the gate. (b) Nothing asserted a test RAN: `cargo test
+    <filter matching nothing>` exits 0 with `0 passed` and no Go-style `[no
+    tests to run]` marker, so with both negative controls deleted every row
+    printed an empty column and the script still exited PASS. Per-test results
+    now come from an anchored full-module-path match, an absent test is a
+    HARNESS ERROR, and preflight P2 demonstrates it. (c) The `first divergence`
+    extractor's character class excluded `{` and `:`, so it matched nothing once
+    the assertion text changed and every RED row printed no reason; fixed, and a
+    RED row with no extractable reason is now a HARNESS ERROR.
+  - **(4) EVERY ROW CARRIES AN EXPECTATION.** Row 11 is a semantically null
+    rename that must SURVIVE, so a harness that reds unconditionally fails as
+    loudly as one that never reds. Mutators assert their target COUNT (two were
+    `sed -i` with no match check), restore is verified with `cmp`, the lock
+    moved off `${TMPDIR}` (which this repo routinely varies) to a fixed path,
+    the baseline compares the mutated file against git HEAD instead of inferring
+    cleanliness from passing tests, and the lock fd is closed in cargo's
+    children (`9>&-`) — an inherited fd 9 left the lock held by orphaned rustc
+    after a killed run, found by doing exactly that.
+  - **Validation** — `test/mutation/shim-ext-parity-acceptance.sh` from this
+    tree, ALL 13 rows, build exit 0 in every row, `=== acceptance PASS ===`:
+
+    ```
+    P1  build gate observes ipv6_ext_walk.rs .. yes (build failed on a deliberate syntax error)
+    P2  a vacuous run is reported MISSING ..... yes (cargo exit 0, all 5 columns MISSING)
+     0. GREEN [baseline self-check]              rc=0   | corpus=ok     permissive=ok     facts=ok CONTROL=ok/ok
+     1. GENERIC advance *8 -> *16                rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     2. GENERIC post-advance revalidation DELETED rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     3. GENERIC revalidation length - 1          rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     4. AUTH advance *4 -> *8                    rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     5. AUTH post-advance revalidation DELETED   rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     6. AUTH revalidation length - 1             rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     7. FRAGMENT read 8 -> 2                     rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     8. FRAGMENT read 8 -> 7                     rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     9. revalidation base l3_offset -> 0         rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+    10. statement in the loop, outside the match rc=101 | corpus=FAILED permissive=ok     facts=ok CONTROL=ok/ok
+    11. NEG-CTL semantically null rename         rc=0   | corpus=ok     permissive=ok     facts=ok CONTROL=ok/ok
+    12. RESTORED                                 rc=0   | corpus=ok     permissive=ok     facts=ok CONTROL=ok/ok
+    ```
+
+    First divergence per row (the extractor MINOR-0 had blinded):
+    row 6 `[l3=0] AH(len=0) buffer one byte short: shim=L4(48, 6) userspace=FailClosed`;
+    row 8 `[l3=0] Fragment buffer one byte short: shim=L4(48, 6) userspace=FailClosed`;
+    row 9 `[l3=14] HbH(len=5) -> TCP, trimmed 21: shim=L4(102, 6) userspace=FailClosed`
+    — row 9 fires ONLY at a non-zero l3, which is what makes the sweep
+    load-bearing rather than decorative. Row 10's `permissive=ok` is the
+    `shim_is_not_more_permissive` column correctly declining to fire on a
+    mutation that makes the shim MORE restrictive (`OverLimit` where this crate
+    resolves `L4(424, 6)`) — the column discriminates rather than co-signing.
+  - **Validation, the harness's own controls** — the M-6 property proved
+    end-to-end on a throwaway copy with BOTH negative-control tests deleted:
+    cargo exits 0, all three guard columns report `ok`, and the OLD harness
+    scored that as PASS. This one prints `ok ok ok MISSING MISSING`, names both
+    absent tests, and exits 3.
+- **File(s)**: userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  test/mutation/shim-ext-parity-acceptance.sh, _Log.md
+
 ## 2026-08-01 — #4555 round 4: execute the shim's walk instead of emitting three scalars
 
 - **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
