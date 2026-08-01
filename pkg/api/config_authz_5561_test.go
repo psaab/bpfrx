@@ -1606,3 +1606,71 @@ func TestAcceptTimeVerdictIsNotDiscarded_5561(t *testing.T) {
 			"re-derivations; the accept-time deny must short-circuit", n)
 	}
 }
+
+// TestWedgedLookupsDoNotAccumulate_5561 is the round-7 MAJOR-5b guard.
+//
+// The per-connection deadline stops the REQUEST waiting; it does not stop the
+// accept-time goroutine, and TestLookupDeadlineIsPerConnection_5561 asserts only
+// the former. Nothing cancels the latter — the wedge that matters is inside
+// localAddrsFn() holding localAddrCache.mu, where a context could not help
+// anyway — so continued connections against a wedged enumeration accumulated
+// goroutines without limit, driven by a caller that never authenticates.
+//
+// Admission control replaces cancellation: past maxConcurrentPeerLookups a
+// connection resolves IMMEDIATELY, and to a DENIAL, which is the same answer a
+// timed-out lookup gives and is reached without spawning anything.
+func TestWedgedLookupsDoNotAccumulate_5561(t *testing.T) {
+	usePasswdFixture(t)
+
+	// Fill the pool, as a wedged enumeration would.
+	held := 0
+	defer func() {
+		for i := 0; i < held; i++ {
+			<-peerLookupSlots
+		}
+	}()
+	for held < maxConcurrentPeerLookups {
+		select {
+		case peerLookupSlots <- struct{}{}:
+			held++
+		default:
+			t.Fatalf("could not fill the lookup pool; %d of %d taken before it refused",
+				held, maxConcurrentPeerLookups)
+		}
+	}
+
+	// A resolver that would BLOCK FOREVER if it were ever reached. With the pool
+	// full it must not be, so this doubles as the "nothing was spawned" probe:
+	// if the bound were absent the request would hang here rather than deny.
+	wedged := make(chan struct{})
+	defer close(wedged)
+	_, base := authzServer(t, Config{
+		Addr:  "127.0.0.1:8080",
+		Store: authzStore(t, authzTestConfig),
+		PeerLookupFn: func(net.Addr, net.Addr) authz.PeerIdentity {
+			<-wedged
+			return authz.PeerIdentity{}
+		},
+	})
+
+	done := make(chan int, 1)
+	go func() {
+		status, _ := postRoute(t, base, "POST /api/v1/config/enter", nil)
+		done <- status
+	}()
+	select {
+	case status := <-done:
+		if status != http.StatusForbidden {
+			t.Fatalf("a connection admitted past the lookup cap returned %d, want 403 — "+
+				"exhausting the pool must DENY, not admit", status)
+		}
+	case <-time.After(peerLookupTimeout / 2):
+		t.Fatal("a connection arriving with the lookup pool full still waited on a lookup " +
+			"— the accept-time goroutine is unbounded, so a wedged enumeration accumulates " +
+			"one blocked goroutine per connection for as long as callers keep connecting")
+	}
+
+	if n := PeerLookupSlotsInUseForTest(); n > maxConcurrentPeerLookups {
+		t.Fatalf("in-flight lookups grew to %d, past the %d cap", n, maxConcurrentPeerLookups)
+	}
+}

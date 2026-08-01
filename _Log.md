@@ -66785,3 +66785,32 @@ break — `go vet` confirmed passing under every revert.
   of scope — filed as #6703.
 - **File(s)**: pkg/daemon/management.go, pkg/daemon/management_5866_test.go,
   _Log.md
+
+- **Timestamp**: 2026-08-01 (round-7c, MAJOR-5b + binding gap — round 7 COMPLETE)
+- **Action**: #5561 — closed the last two round-7 items. MAJOR-5b: the
+  per-connection deadline stops the REQUEST waiting but nothing stopped the
+  accept-time goroutine, so continued connections against a wedged enumeration
+  accumulated goroutines without limit, driven by a caller that never
+  authenticates. Cancellation is NOT available — the wedge is inside
+  `localAddrsFn()` holding `localAddrCache.mu`, where a context cannot help — so
+  the fix is admission control: `peerLookupSlots`, cap 1024, and past it the
+  connection resolves IMMEDIATELY to an unattributable LOCAL identity (a denial,
+  the same answer a timed-out lookup gives) without spawning anything. Confirmed
+  first that no existing test bound it. Mutation (spawn regardless in the default
+  branch): build rc=0 (0 bytes), vet rc=0 (0 bytes), reds ONLY
+  TestWedgedLookupsDoNotAccumulate_5561 at config_authz_5561_test.go:1668 — and
+  TestLookupDeadlineIsPerConnection_5561 stays PASS in BOTH worlds, which is
+  itself the proof that the existing deadline test never bound cancellation.
+  Binding gap: TestResolveClassPermissionsIsSharedWithTheCLI_5561 calls
+  `config.ResolveClassPermissions` directly and never enters pkg/cli, so it pins
+  the helper's BEHAVIOUR while proving nothing about the CLI using it. Added
+  TestCLIResolvesThroughTheSharedEvaluator_5561 in pkg/cli, driving the CLI's own
+  store-bound adapter and requiring agreement with the shared function across
+  built-in AND config-defined classes — the custom classes carry the assertion,
+  since a built-ins-only duplicate agrees on every built-in and diverges only
+  there. Mutation (swap the CLI to a duplicated built-ins-only evaluator): build
+  rc=0, vet rc=0, reds the NEW guard at
+  permissions_shared_evaluator_5561_test.go:61 while the OLD test stays PASS —
+  direct proof it never bound the sharing it is named for.
+- **File(s)**: pkg/api/authz.go, pkg/api/config_authz_5561_test.go,
+  pkg/cli/permissions_shared_evaluator_5561_test.go, _Log.md

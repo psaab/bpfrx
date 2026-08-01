@@ -109,6 +109,22 @@ type peerIdentityKey struct{}
 // total rather than this long on every request the connection makes.
 const peerLookupTimeout = 5 * time.Second
 
+// maxConcurrentPeerLookups bounds accept-time peer lookups in flight at once.
+//
+// Deliberately far above any legitimate concurrency on a surface that answers a
+// handful of operator actions per second; it is a ceiling on unbounded growth,
+// not a throttle. Sized like the two queue caps in pkg/authz for the same
+// reason and with the same fail-closed direction.
+const maxConcurrentPeerLookups = 1024
+
+// peerLookupSlots is the admission token pool for those lookups. Package-level:
+// the resource being bounded is the daemon's goroutines and memory, which every
+// listener shares.
+var peerLookupSlots = make(chan struct{}, maxConcurrentPeerLookups)
+
+// PeerLookupSlotsInUseForTest reports how many lookup slots are held. Test-only.
+func PeerLookupSlotsInUseForTest() int { return len(peerLookupSlots) }
+
 // pendingPeer is a connection's peer identity, resolved once, asynchronously,
 // starting at accept.
 //
@@ -183,10 +199,33 @@ func (s *Server) connContext(ctx context.Context, c net.Conn) context.Context {
 		client:   client,
 		server:   server,
 	}
-	go func() {
-		defer close(p.done)
-		p.id = s.lookupPeer(client, server)
-	}()
+	// Bound the in-flight lookups (#5561 round 7, MAJOR-5b).
+	//
+	// The request-side deadline (pendingPeer.wait) stops the REQUEST waiting; it
+	// does not stop this goroutine, and nothing else does either. The wedge that
+	// motivates the bound is inside localAddrsFn() holding localAddrCache.mu, so
+	// a context would not unblock it — cancellation is not available here, only
+	// admission control. Without a cap, continued connections against a wedged
+	// enumeration accumulate goroutines and their captured addresses without
+	// limit, which an unauthenticated caller can drive.
+	//
+	// Past the cap the connection is resolved IMMEDIATELY to an unattributable
+	// LOCAL identity, which denies — the same answer a timed-out lookup produces,
+	// reached without spawning anything.
+	select {
+	case peerLookupSlots <- struct{}{}:
+		go func() {
+			defer func() { <-peerLookupSlots }()
+			defer close(p.done)
+			p.id = s.lookupPeer(client, server)
+		}()
+	default:
+		p.id = authz.PeerIdentity{
+			Local:  true,
+			Detail: "peer-identity lookup capacity exhausted; refusing to queue another",
+		}
+		close(p.done)
+	}
 	return context.WithValue(ctx, peerIdentityKey{}, p)
 }
 
