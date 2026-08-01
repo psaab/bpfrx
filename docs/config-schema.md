@@ -1239,6 +1239,47 @@ first). The compiler is now uniformly first-wins via `monitorWeightTokens`, and
 a duplicate is rejected outright, so no operator is relying on which form they
 happened to write.
 
+**A gate that walks ENTRY LISTS will miss the statement's own PROPERTIES.** The
+weight gate above was first written around `monitorEntryNodes`, which produces
+entries — interface names, `family inet` addresses. `ip-monitoring`'s
+`global-weight` and `global-threshold` are properties of the statement, not
+entries of a list, so nothing looked at them and
+`ip-monitoring global-weight nope;` committed clean at a compiled 0. That is the
+WORST instance of the class rather than a lesser one: a malformed per-target
+weight costs the group one target's demotion debt, whereas an unusable global
+weight is zero debt for the entire group, so no number of failing probes demotes
+it and failover never happens. `validateMonitorWeightTokensAST` now applies the
+same missing-value / non-integer / duplicate rules to both globals, through one
+shared `checkTokens` rather than a second copy. The globals' reader is
+`ipMonitoringGlobalTokens`, which walks the same `packedStatementProps` result
+the compiler dispatches from — `nodeVal(findNamedNode(props, name))` is
+`ipMonitoringGlobalTokens(props, name)[0]` whenever the property is present, so
+the gate cannot validate a token the compiler does not use. Pinned by
+`TestIPMonitoringGlobalTokensMatchesCompilerRead_6588`.
+
+**A statement that takes NO argument still needs its arity checked.** `preempt`
+and `strict-vip-ownership` compile to a bool and never read the node, so
+anything else written on them is discarded in silence:
+
+```
+redundancy-group 1 preempt weight 255;      # Preempt=true, `weight 255` gone
+redundancy-group 1 preempt delay 5;         # Preempt=true, `delay 5` gone
+redundancy-group 1 preempt { delay 5; }     # Preempt=true, the block gone
+```
+
+Unlike the value-position collision described later, this needs no implausible
+input — a stray token is ordinary typing, and `preempt delay`/`limit`/`period`
+are real Junos SRX options xpf does not implement, so accepting them silently
+tells the operator they configured a preempt delay that does not exist.
+`SchemaValidate` accepts all three (measured), and a bool has nowhere to record
+what was dropped, so `validateRGNoArgStatementsAST`
+(`compiler_chassis_rg_arity.go`) checks it on the AST through the same
+`redundancyGroupBody` splitter. The flag set is written by hand — arity is not
+recoverable from a handler's type, since every handler has the same signature
+whether or not it reads the node — and
+`TestRedundancyGroupNoArgStatementsAreRegistered_6588` keeps it from naming a
+statement the dispatch table does not have.
+
 **The packing recurses: an INSTANCE can carry its whole body on its own Keys
 too.** Everything above is about a statement inside a named instance's body.
 The instance line itself packs the same way:
@@ -1356,6 +1397,24 @@ container/flat-set and single-entry cases as green controls. Its `assertMonitors
 helper requires a weight for every name — there is no name-only variant, because
 having one meant every bracketed-list case in that file ran weight-less and the
 apply-to-all rule above was unguarded.
+
+**Two things that file learned the hard way, both worth keeping.** First, a
+refactor can delete regression coverage for a bug that is still fixed, and
+nothing goes red: the dispatch-table change dropped the bracket-inline-weight
+and bare-`redundancy-group { <id> ... }` suites along with the source-parsing
+drift guard it was deliberately replacing, leaving the apply-to-all rule and the
+`Keys[0]` offset discrimination unguarded while both behaviours still worked.
+When a refactor removes tests, account for each one: replaced, or restored.
+
+Second, a completeness check that only asserts a sample EXISTS proves nothing. A
+table entry keyed `review-placeholder` whose sample text was `preempt`, with a
+`Preempt` assertion, satisfied every check in
+`TestRedundancyGroupStatementsSurvivePackedLine_6588` while `review-placeholder`
+never appeared in the input and its handler was never dispatched. The typed
+assertions cannot catch this, because `preempt` sets `rg.Preempt` no matter
+which key the sample is filed under. The test now requires each sample to begin
+with its own statement keyword AND instruments the dispatch table so a case that
+never reaches the handler it is filed under fails.
 
 **`multi: true` ALSO prevents single-value REPLACE for repeated keyed-list
 leaves (#3984).** The `#2419` discussion above is about ONE statement with a

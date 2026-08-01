@@ -70,48 +70,85 @@ func validateMonitorWeightTokensAST(nodes []*Node, lenient bool) ([]string, erro
 		return fmt.Errorf("%s", msg)
 	}
 
+	// checkTokens applies the missing-value / non-integer / duplicate rules to
+	// the value tokens of ONE weight-like field. Every field this gate covers
+	// shares those rules because every one of them reaches the compiler through
+	// the same Atoi-then-keep-0 coercion, so they are implemented once here
+	// rather than per field.
+	//
+	// where identifies the offending field, already scoped to its redundancy
+	// group (`redundancy-group 1 interface-monitor ge-0/0/0`). subject names
+	// what was specified — `weight` for a monitored entry, `global-weight` /
+	// `global-threshold` for an ip-monitoring global — and consequence spells
+	// out the runtime effect, which differs between a per-entry weight and a
+	// group-wide global.
+	//
+	// An empty token list means the field is absent, which is legal: the
+	// documented 0 default (#6549). A PRESENT keyword with no value yields one
+	// empty-string token from the readers below, so it is reported as malformed
+	// rather than mistaken for absent.
+	checkTokens := func(where, subject, consequence string, toks []string) error {
+		if len(toks) == 0 {
+			return nil
+		}
+		if len(toks) > 1 {
+			distinct := false
+			for _, t := range toks[1:] {
+				if t != toks[0] {
+					distinct = true
+					break
+				}
+			}
+			if distinct {
+				return emit("chassis cluster %s: %s specified %d times with different "+
+					"values %q — the compiled value would depend on the spelling; specify "+
+					"exactly one %s", where, subject, len(toks), toks, subject)
+			}
+			return emit("chassis cluster %s: %s specified %d times; specify exactly one %s",
+				where, subject, len(toks), subject)
+		}
+		if _, err := strconv.Atoi(toks[0]); err != nil {
+			return emit("chassis cluster %s: %s %q is not an integer — it compiles to the 0 "+
+				"default, so %s; set a %s in %d..%d",
+				where, subject, toks[0], consequence, subject,
+				MinInterfaceMonitorWeight, MaxInterfaceMonitorWeight)
+		}
+		return nil
+	}
+
 	// checkEntries validates every entry of one monitor statement. what names
-	// the statement for the operator (e.g. `interface-monitor`), and label
-	// renders the entry's identity within the redundancy group.
+	// the statement for the operator (e.g. `interface-monitor`).
 	checkEntries := func(rgName, what string, entries []*Node) error {
 		for _, entry := range entries {
-			toks := monitorWeightTokens(entry)
-			if len(toks) == 0 {
-				continue // No weight at all: the documented 0 default (#6549).
+			if err := checkTokens(
+				fmt.Sprintf("redundancy-group %s %s %s", rgName, what, entry.Name()),
+				monitorWeightKeyword,
+				"the monitor going down deducts NO weight and the redundancy group never demotes",
+				monitorWeightTokens(entry)); err != nil {
+				return err
 			}
-			if len(toks) > 1 {
-				distinct := false
-				for _, t := range toks[1:] {
-					if t != toks[0] {
-						distinct = true
-						break
-					}
-				}
-				if distinct {
-					if err := emit("chassis cluster redundancy-group %s %s %s: weight "+
-						"specified %d times with different values %q — the compiled weight "+
-						"would depend on the spelling; specify exactly one weight",
-						rgName, what, entry.Name(), len(toks), toks); err != nil {
-						return err
-					}
-					continue
-				}
-				if err := emit("chassis cluster redundancy-group %s %s %s: weight "+
-					"specified %d times; specify exactly one weight",
-					rgName, what, entry.Name(), len(toks)); err != nil {
-					return err
-				}
-				continue
-			}
-			if _, err := strconv.Atoi(toks[0]); err != nil {
-				if err := emit("chassis cluster redundancy-group %s %s %s: weight %q is not "+
-					"an integer — it compiles to the 0 default, so the monitor going down "+
-					"deducts NO weight and the redundancy group never demotes; set a weight "+
-					"in %d..%d",
-					rgName, what, entry.Name(), toks[0],
-					MinInterfaceMonitorWeight, MaxInterfaceMonitorWeight); err != nil {
-					return err
-				}
+		}
+		return nil
+	}
+
+	// checkIPMonitoringGlobals validates the two group-wide ip-monitoring
+	// values. They were missed when this gate was first written because it
+	// walked only the ENTRY lists (interface-monitor names, family inet
+	// addresses), and the globals are properties of the ip-monitoring statement
+	// rather than entries of a list. The consequence is at least as bad: an
+	// unusable global-weight is zero demotion debt for the WHOLE group, so no
+	// number of failing probes demotes it. A typo'd weight is ordinary operator
+	// input, so this is reachable in a way the value-position collision
+	// documented on redundancyGroupStatements is not.
+	checkIPMonitoringGlobals := func(rgName string, props []*Node) error {
+		for _, subject := range []string{"global-weight", "global-threshold"} {
+			if err := checkTokens(
+				fmt.Sprintf("redundancy-group %s ip-monitoring", rgName),
+				subject,
+				"the redundancy group accrues NO demotion debt when its monitored "+
+					"targets fail and never demotes",
+				ipMonitoringGlobalTokens(props, subject)); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -128,7 +165,15 @@ func validateMonitorWeightTokensAST(nodes []*Node, lenient bool) ([]string, erro
 							return err
 						}
 					case "ip-monitoring":
-						for _, familyNode := range packedStatementProps(child, 1, isIPMonitoringProp) {
+						// One packedStatementProps result feeds both the
+						// globals and the family walk, so the gate sees
+						// exactly the node set compileRGIPMonitoring compiles
+						// from.
+						ipmProps := packedStatementProps(child, 1, isIPMonitoringProp)
+						if err := checkIPMonitoringGlobals(rgInst.name, ipmProps); err != nil {
+							return err
+						}
+						for _, familyNode := range ipmProps {
 							if familyNode.Name() != "family" {
 								continue
 							}

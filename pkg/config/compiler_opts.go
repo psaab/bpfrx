@@ -363,6 +363,20 @@ type compileOpts struct {
 	// lenientChassisClusterIdentities.
 	lenientChassisMonitorWeight bool
 
+	// lenientChassisRGStatementArity (#6588) downgrades the redundancy-group
+	// no-argument statement gate (validateRGNoArgStatementsAST) from a hard
+	// compile error to a cfg.Warnings entry on the tolerant load / peer-sync
+	// paths. `preempt` and `strict-vip-ownership` compile to a bool and never
+	// read the node, so trailing tokens or a block body — including the real
+	// Junos `preempt delay <n>` that xpf does not implement — are discarded in
+	// silence and the operator believes they configured something that does not
+	// exist. Commit / commit-check stay strict so a new operator edit is
+	// rejected; an already-persisted or peer-synced config an older binary
+	// accepted must still BOOT (warn) per the #1960 fail-closed-on-load
+	// doctrine — the flag itself still compiles, now with the discarded tokens
+	// flagged. Same doctrine as lenientChassisMonitorWeight.
+	lenientChassisRGStatementArity bool
+
 	// lenientIPsecProposalProtocol (#4298, V-2) downgrades the IPsec
 	// proposal `protocol ah` reject (validateIPsecProposalProtocolStrict)
 	// from a hard error to a warning on the tolerant load / peer-sync paths.
@@ -2035,6 +2049,7 @@ func lenientCompileOpts() compileOpts {
 		lenientReservedProposalSetNames:        true,
 		lenientChassisClusterIdentities:        true,
 		lenientChassisMonitorWeight:            true,
+		lenientChassisRGStatementArity:         true,
 		lenientIPsecProposalProtocol:           true,
 		lenientIPsecManualKey:                  true,
 		lenientLogProfileStreamRef:             true,

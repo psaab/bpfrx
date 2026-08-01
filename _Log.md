@@ -65958,3 +65958,50 @@ break — `go vet` confirmed passing under every revert.
   accessor the PR orphaned has one caller and one definition again.
   Docs-and-wiring only: no runtime behaviour change.
 - **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 03:20
+- **Action**: #6658 review fold — assert monitor WEIGHTS, not just names, on
+  bracketed lists. `assertMonitors`'s weight arm was dead code: its only caller
+  was an `assertMonitorNames` shim passing nil, so every bracketed-list case in
+  the #6588 suite ran weight-less and the apply-to-all rule in
+  `monitorEntryNodes` was unguarded. Reverting that function to the round-4
+  positional attachment left build, vet and the whole suite green. The shim is
+  deleted and weights are mandatory; name-only callers pass explicit zeros,
+  which asserts the documented #6549 default instead of skipping the check.
+  Also corrected the `redundancyGroupStatements` enumeration, which claimed
+  three drift routes (all of them the table under-covering the compiler) when a
+  probe found a fourth of the opposite shape: the splitter matches a registered
+  keyword in VALUE position, so `interface-monitor preempt weight 255` steals
+  `preempt` and the packed and container spellings disagree. Unreachable from a
+  real config (no Junos interface name collides), so documented rather than
+  fixed; splitting position-aware is #6665.
+- **File(s)**: pkg/config/compiler_chassis_packed_monitor_6588_test.go,
+  pkg/config/compiler_system.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-08-01 04:05
+- **Action**: #6658 review fold round 2 — close two silent-no-effect holes the
+  Codex xhigh review found, and restore the regression coverage the
+  dispatch-table refactor (b3158d315) deleted. (1) `ip-monitoring`'s
+  `global-weight` / `global-threshold` bypassed every gate: the weight gate
+  walked only ENTRY lists, so `global-weight nope`, `global-weight;` and
+  `global-weight 100 global-weight 200` all committed clean at a compiled 0 —
+  zero demotion debt for the WHOLE group, so no number of failing probes
+  demotes it. Now checked by the same missing-value / non-integer / duplicate
+  rules through a shared `checkTokens`, reading the globals with
+  `ipMonitoringGlobalTokens` over the same `packedStatementProps` result the
+  compiler dispatches from. (2) `preempt` and `strict-vip-ownership` compile to
+  a bool and never read the node, so `preempt delay 5` — real Junos syntax xpf
+  does not implement — was accepted and discarded silently; new
+  `validateRGNoArgStatementsAST` rejects trailing tokens and block bodies,
+  strict at commit and warning on the tolerant load path (#1960). (3)
+  `TestRedundancyGroupStatementsSurvivePackedLine_6588` was placeholder-vacuous:
+  an entry keyed `review-placeholder` with sample text `preempt` passed while
+  its handler was never dispatched. Samples must now begin with their own
+  keyword, and the dispatch table is instrumented so a case that never reaches
+  its handler fails. (4) Restored `TestChassisRedundancyGroupBareContainerShape_6588`
+  and the bracket out-of-range / ambiguous-weight cases that b3158d315 dropped.
+- **File(s)**: pkg/config/compiler_chassis_monitor_weight.go,
+  pkg/config/compiler_chassis_rg_arity.go, pkg/config/compiler_system.go,
+  pkg/config/compiler_prewalk.go, pkg/config/compiler_opts.go,
+  pkg/config/compiler_chassis_packed_monitor_6588_test.go,
+  docs/config-schema.md, _Log.md

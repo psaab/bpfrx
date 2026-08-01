@@ -494,6 +494,20 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 		return nil, err
 	}
 
+	// #6588: a redundancy-group FLAG statement (`preempt`,
+	// `strict-vip-ownership`) that carries trailing tokens or a block body. The
+	// compilers set a bool and never read the node, so the extra tokens are
+	// discarded silently — including `preempt delay 5`, which is real Junos
+	// syntax xpf does not implement. The compiled bool has nowhere to record
+	// what was dropped and the schema walker accepts it, so it is checked on
+	// the AST. Strict at commit / commit-check; warn on the tolerant load /
+	// peer-sync path.
+	rgArityWarnings, err := validateRGNoArgStatementsAST(
+		tree.Children, opts.lenientChassisRGStatementArity)
+	if err != nil {
+		return nil, err
+	}
+
 	var warnings []string
 	warnings = append(warnings, ctrlCharWarnings...)
 	warnings = append(warnings, trackWarnings...)
@@ -521,6 +535,7 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 	warnings = append(warnings, natMixedScopeWarnings...)
 	warnings = append(warnings, chassisIdentityWarnings...)
 	warnings = append(warnings, monitorWeightWarnings...)
+	warnings = append(warnings, rgArityWarnings...)
 	warnings = append(warnings, garpCountWarnings...)
 	return warnings, nil
 }

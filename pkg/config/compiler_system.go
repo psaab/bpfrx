@@ -2417,6 +2417,38 @@ func isIPMonitoringProp(tok string) bool {
 	return false
 }
 
+// ipMonitoringGlobalTokens returns every VALUE carried by the named
+// `ip-monitoring` global property (`global-weight` / `global-threshold`) in a
+// packedStatementProps result, in source order.
+//
+// This is the globals' counterpart to monitorWeightTokens, and exists for the
+// same reason (#6588): compileRGIPMonitoring reads a global with
+// findNamedNode + nodeVal, which is FIRST-WINS and silently leaves the 0
+// default when the value is missing or fails Atoi. A malformed or duplicated
+// global is therefore indistinguishable from `global-weight 0` in the compiled
+// struct, so it has to be caught on the AST — and the gate must read the same
+// token the compiler does or the two can disagree about which value won.
+//
+// That correspondence is exact rather than parallel: over the same props slice
+// this walks the same nodes with the same name predicate in the same order and
+// reads them with the same nodeVal, so
+//
+//	nodeVal(findNamedNode(props, name)) == ipMonitoringGlobalTokens(props, name)[0]
+//
+// whenever the property is present at all. The gate rejects len > 1, so where
+// the compiler's first-wins pick is observable there is exactly one token and
+// the two readers cannot pick differently. Pinned by
+// TestIPMonitoringGlobalTokensMatchesCompilerRead_6588.
+func ipMonitoringGlobalTokens(props []*Node, name string) []string {
+	var out []string
+	for _, n := range props {
+		if len(n.Keys) > 0 && n.Keys[0] == name {
+			out = append(out, nodeVal(n))
+		}
+	}
+	return out
+}
+
 // findNamedNode returns the first node in nodes whose first key is name — the
 // slice equivalent of Node.FindChild, for callers that must search a
 // packedStatementProps result rather than a node's raw Children.
