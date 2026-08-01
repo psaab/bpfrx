@@ -2597,13 +2597,26 @@ fn shim_raw_rx_queue_exposes_no_arithmetic() {
 ///     the pinned lookup by NAME, so pinning that statement says nothing about
 ///     what the names are worth. Round 3 shadowed each of them one line above
 ///     the pin — `% 4` on the ifindex, and an unsafe raw-bytes forgery on the
-///     queue — and all three tests stayed green. Hence the `let <name>` bounds:
-///     a value can only reach the pinned statement through a binding of that
-///     exact name, so bounding the BINDINGS is what bounds the values.
+///     queue — and all three tests stayed green. Hence the binding bounds: a
+///     value can only reach the pinned statement through a binding of that
+///     exact name, so bounding the BINDINGS is what bounds the values. (The
+///     first attempt at that bounded one SPELLING of a binding rather than
+///     bindings — see (5).)
 ///  4. **A compile-time claim is only true while the type still says so.**
 ///     Adding `impl Rem<u32> for RawRxQueue` and a `pub` field reddened
 ///     nothing, and with one shadow line reintroduced #5173 with no `unsafe`
 ///     at all. Hence the trait-impl and field-privacy bounds.
+///  5. **A binding bound must bound BINDINGS, not one spelling of one.**
+///     `["let", name]` matches a bare-identifier `let` pattern and nothing
+///     else. Round 4 walked through it four ways, all compiling with all three
+///     tests green: `let (rx_queue, _z) = (transmute::<u32, RawRxQueue>(q % 4),
+///     0u32);` — which is #5173 in the EMITTED OBJECT, gaining `r1 &= 0x3`
+///     before the map lookup and losing the `> 0xf` stride guard —
+///     `let Some(<name>) = … else`, a `macro_rules!` body taking an
+///     `$n:ident`, and the closure/`fn` parameter that used to be carried
+///     below as the declared residual. Hence the mention COUNT, which is
+///     class-complete over binding forms in a way no pattern match is: a
+///     binding cannot exist without writing the name it binds.
 ///
 /// # What is still unbound — and it cannot be driven to zero here
 ///
@@ -2613,14 +2626,25 @@ fn shim_raw_rx_queue_exposes_no_arithmetic() {
 /// binding bounds subsume what used to be enumerated symbol by symbol — a
 /// forged `RawRxQueue` (`transmute`, `mem::zeroed`, `MaybeUninit::assume_init`,
 /// a pointer read: an open-ended class no symbol list could keep up with) can
-/// only be USED by binding the name the pinned lookup passes. What remains:
+/// only be USED by binding the name the pinned lookup passes, and every form of
+/// binding raises that name's count. What remains:
 ///
-///  - **A parameter, rather than a `let`, can shadow either name.** Wrapping
-///    the pinned lookup statement in a closure or a helper `fn` whose parameter
-///    is called `ingress_ifindex` or `rx_queue` rebinds it without writing
-///    `let`. Nothing here catches that. It is not cheap to hide: the pinned
-///    statement must appear verbatim inside the new body, and the reduced value
-///    must be passed in at a visible call site.
+///  - **CONSERVATION — the mention bound counts, it does not classify.** Every
+///    binding form has to write the name, so none of them is FREE; but an
+///    author who also DELETES an existing mention pays for one and leaves the
+///    total where it was. That is what is left of the binding residual, and it
+///    is not the same shape as what it replaced: the escape is no longer an
+///    added line, it is an added line plus a deletion. Every mention counted is
+///    a pinned statement, a compiled use, or one documentation line, so the
+///    deletion has to remove real code or real prose from a hash-pinned file.
+///    The two counts leave very different amounts of slack, and it is worth
+///    saying which. `rx_queue`'s six code sites are the two pinned statements,
+///    `for_trace()`'s only caller, and `binding_slot`'s parameter plus its two
+///    uses — deleting ANY of them breaks a pin, the build, or the executed
+///    stride test, so its one doc line is the only free slot. `ingress_ifindex`
+///    is looser: most of its 24 code sites are `record_trace` arguments, and
+///    dropping a trace call compiles. Buying a shadow there costs a visibly
+///    deleted telemetry call rather than nothing.
 ///  - **The ifindex half is a bare `u32`.** `binding_slot`'s queue argument is a
 ///    newtype; its ifindex argument is not, and it cannot be one without a
 ///    second wrapper whose constructor would take a bare `u32` for the same
@@ -2844,11 +2868,15 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
         ifx_site.len(),
     );
 
-    // ---- Neither coordinate may be re-bound under its own name. -----------
+    // ---- Neither coordinate may be re-bound, in ANY binding form. ---------
     //
     // The two statement pins fix the definition and the use; a SHADOW between
-    // them changes neither. This is the bound that closes the gap, and it is
-    // load-bearing for three separate escapes round 3 demonstrated:
+    // them changes neither. Two bounds close that, and they are deliberately
+    // different in KIND, because the first one alone was escaped.
+    //
+    // `let <name>` is the PRECISE bound. It matches the exact shape of the
+    // three escapes round 3 demonstrated, so when it reds its message can say
+    // what was done:
     //
     //   - `ingress_ifindex` rebound to `ingress_ifindex % 4` — #5173 through
     //     the interface dimension, invisible to both statement pins;
@@ -2863,26 +2891,96 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
     //     the trait bound below) — a complete #5173 reintroduction with no
     //     `unsafe` anywhere.
     //
-    // Matching on `let <name>` rather than `<name> =` is deliberate: a type
+    // Matching `let <name>` rather than `<name> =` is deliberate: a type
     // annotation (`let rx_queue: RawRxQueue = …`) puts a token between the two
     // and slips a `<name> =` pair, and the unsafe-forgery shadow is spelled
     // exactly that way. Reassignment without `let` needs `mut`, which breaks
-    // whichever statement pin above declares the name. A `macro_rules!` body
-    // that expands to a rebinding must still write these tokens to define
-    // itself, and macro hygiene stops an out-of-crate one from shadowing here.
-    for name in ["ingress_ifindex", "rx_queue"] {
+    // whichever statement pin above declares the name.
+    //
+    // The MENTION COUNT is the CLASS-COMPLETE bound, and it ships because
+    // `let <name>` on its own was escaped FOUR ways in round 4 — every one of
+    // them compiling for `bpfel-unknown-none`, with all three tests green.
+    // `["let", name]` matches only a BARE-IDENTIFIER `let` pattern; put any
+    // token between the two and it is gone. The four:
+    //
+    //   - a tuple pattern —
+    //         let (rx_queue, _z) = (transmute::<u32, RawRxQueue>(q % 4), 0u32);
+    //     which is a COMPILED #5173, not a theoretical one: the emitted program
+    //     gains `r1 &= 0x3` before the map lookup and LOSES the `> 0xf` stride
+    //     guard, because LLVM can then prove the index in range;
+    //   - `let Some(<name>) = … else { … };`, and every other refutable or
+    //     destructuring pattern with it;
+    //   - a `macro_rules!` body taking an `$n:ident`. An earlier revision of
+    //     this comment asserted that such a body "must still write these tokens
+    //     to define itself, and macro hygiene stops an out-of-crate one from
+    //     shadowing here". That was simply WRONG on the first half: the body
+    //     writes `let $n`, and an `ident` metavariable is call-site-hygienic, so
+    //     an in-crate macro shadows fine;
+    //   - a closure or `fn` PARAMETER — which this test used to carry as its
+    //     declared residual, and no longer does.
+    //
+    // Enumerating binding FORMS would always be one form behind, exactly as
+    // enumerating fabrication symbols would. Counting MENTIONS is not, and that
+    // is the whole reason it is what ships: a binding of `<name>` — tuple,
+    // struct, slice or `Some(..)` pattern, `let … else`, `if let`, `while let`,
+    // `for`, a match arm, a macro expansion, a closure or `fn` parameter —
+    // cannot exist without WRITING `<name>`, so every one of them raises this
+    // count. Same idiom, and the same reasoning, as `BINDINGS_MENTIONS` and
+    // `CTOR_MENTIONS` above; the counts are larger here only because these two
+    // are ordinary working identifiers rather than one-site symbols.
+    //
+    // What the count does NOT do is classify — it counts. What that leaves is
+    // on this test's doc comment under CONSERVATION.
+    const INGRESS_IFINDEX_MENTIONS: usize = 25; // 24 code sites + 1 doc line
+    const RX_QUEUE_MENTIONS: usize = 7; //         6 code sites + 1 doc line
+    for (name, mention_bound) in [
+        ("ingress_ifindex", INGRESS_IFINDEX_MENTIONS),
+        ("rx_queue", RX_QUEUE_MENTIONS),
+    ] {
         let rebinds = seq(&["let", name]);
         assert_eq!(
             rebinds.len(),
             1,
-            "#5173: `{name}` must be bound exactly ONCE in the shim crate, but was bound {} times \
-             {rebinds:?}. Both statement pins above stay green when the coordinate is SHADOWED \
-             between its definition and its use, so this is the bound that sees it — a one-line \
-             `%` shadow, or a shadow whose value is forged out of raw bytes by any `unsafe` \
-             construction the newtype cannot prevent. Do not add a second binding of this name; \
-             if the value genuinely needs deriving, give the derived value a DIFFERENT name and \
-             note that the pinned lookup statement will then reject passing it.",
+            "#5173: `{name}` must be bound by exactly ONE `let {name}` statement in the shim \
+             crate, but {} match {rebinds:?}. Both statement pins above stay green when the \
+             coordinate is SHADOWED between its definition and its use, so this is the bound that \
+             sees it — a one-line `%` shadow, or a shadow whose value is forged out of raw bytes \
+             by any `unsafe` construction the newtype cannot prevent. Do not add a second binding \
+             of this name; if the value genuinely needs deriving, give the derived value a \
+             DIFFERENT name and note that the pinned lookup statement will then reject passing \
+             it. (This bound sees a bare-identifier `let` and nothing else — a tuple pattern, a \
+             `let … else`, a macro expansion or a parameter slips it, which is what the mention \
+             bound below is for.)",
             rebinds.len(),
+        );
+
+        // Per-file tally rather than one entry per occurrence: at these counts
+        // a flat list is a wall of the same path, and which FILE moved is the
+        // only part an author needs.
+        let tally: Vec<String> = tokens
+            .iter()
+            .filter_map(|(file, toks)| match shim_token_seq_count(toks, &[name]) {
+                0 => None,
+                n => Some(format!("{file}: {n}")),
+            })
+            .collect();
+        let mentions = seq(&[name]);
+        assert_eq!(
+            mentions.len(),
+            mention_bound,
+            "#5173: `{name}` must be NAMED exactly {mention_bound} times in the shim crate, but \
+             was named {} times. Per file: {tally:#?}\nThis is the CLASS-COMPLETE half of the \
+             binding bound and the reason it is a count rather than a pattern match: a rebinding \
+             of this name in ANY form — a tuple, struct, slice or `Some(..)` pattern, a \
+             `let … else`, `if let`, `while let`, `for`, a match arm, a `macro_rules!` expansion, \
+             or a closure/`fn` parameter — has to WRITE the name to exist, so all of them land \
+             here even though only the bare-identifier `let` lands on the bound above. Four such \
+             forms were demonstrated compiling with every other check green, one of them a \
+             `transmute` forgery bound through a tuple pattern that reintroduced #5173 in the \
+             emitted object. A comment or doc line that spells the identifier trips this too; \
+             that is a spurious RED, never a silent pass. If you are adding a legitimate mention, \
+             raise the constant deliberately and say why.",
+            mentions.len(),
         );
     }
 

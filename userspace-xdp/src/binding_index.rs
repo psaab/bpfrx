@@ -57,18 +57,28 @@
 //!     rejected by the type system.
 //!
 //!     What bounds all three is source, in the parity tests, and it is worth
-//!     saying HOW because the obvious way does not work: not by enumerating the
-//!     fabrication symbols, which would always be one symbol behind, but by
-//!     pinning the lookup statement so both coordinates must arrive under a
-//!     fixed NAME, and then bounding each of those names to a single binding in
-//!     the whole crate. A forged or reduced value that cannot be bound to the
-//!     name is a value the pinned statement will not accept.
+//!     saying HOW because two obvious ways do not work. NOT by enumerating the
+//!     fabrication symbols, which would always be one symbol behind. And NOT by
+//!     matching the `let` + name token pair a shadow is usually spelled with:
+//!     that is one binding FORM out of many, and a tuple pattern, a
+//!     `let … else`, a `macro_rules!` body taking an `$n:ident` and a closure
+//!     parameter each rebind without writing it — a hostile round drove a
+//!     compiled defect through all four. What works is COUNTING. The lookup
+//!     statement is pinned so both coordinates must arrive under a fixed NAME,
+//!     and the total number of times each of those names appears anywhere in
+//!     the crate is pinned too. A binding cannot exist without writing the name
+//!     it binds, whatever form it takes, so every one of them moves that count.
 //!
 //! The honest summary: the source-asserted surface cannot reach ZERO while the
-//! coordinate originates in aya-dependent code — a parameter of an enclosing
-//! closure or helper `fn` still shadows a name without writing a binding, which
-//! nothing here catches. What it can do, and now does, is make every known
-//! reintroduction of #5173 either fail to compile or fail a pinned statement.
+//! coordinate originates in aya-dependent code. What remains is CONSERVATION —
+//! a count bounds occurrences, it does not classify them, so an author who
+//! DELETES an existing use or line of prose can pay for a shadow and leave the
+//! total where it was. Every mention it counts is a pinned statement, a
+//! compiled use or documentation, so that means removing real code or real
+//! prose from a hash-pinned file rather than quietly adding a line, and it is a
+//! far narrower residual than the open set of binding forms it replaced. What
+//! the bounds can do, and now do, is make every known reintroduction of #5173
+//! either fail to compile, fail a pinned statement, or move a pinned count.
 //!
 //! Nothing here may depend on `aya`, on a BPF map, or on `std` — that is what
 //! keeps it host-compilable, and it is the whole point.

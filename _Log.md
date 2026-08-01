@@ -66456,3 +66456,62 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: userspace-dp/src/main_tests.rs,
   userspace-xdp/src/binding_index.rs,
   pkg/dataplane/userspace_xdp_manifest.json, _Log.md
+- **Timestamp**: 2026-08-01 22:40
+- **Action**: #5173 / PR #6676 round-4 fold — the binding bound bounded one
+  SPELLING of a binding, not bindings. `shim_token_seq_count(toks,
+  &["let", name])` matches only a bare-identifier `let` pattern, and a
+  hostile re-gate walked through it four ways, every one compiling for
+  `bpfel-unknown-none` with all three tests green: a tuple pattern, a
+  `let … else`, a `macro_rules!` body taking an `$n:ident`, and a
+  closure/`fn` parameter. The tuple-pattern one is a COMPILED #5173 —
+  reproduced firsthand at the object level: the emitted program gains
+  `r1 &= 0x3` before the binding-map lookup and LOSES the `> 0xf` stride
+  guard, because LLVM can then prove the index in range.
+
+  Fixed by adding the CLASS-COMPLETE bound the file's own idiom already
+  uses for `USERSPACE_BINDINGS` and `from_ctx_field`: the total mention
+  count of each coordinate name in the shim crate is pinned
+  (`INGRESS_IFINDEX_MENTIONS = 25`, `RX_QUEUE_MENTIONS = 7`). A binding
+  cannot exist without WRITING the name it binds, whatever pattern,
+  macro or parameter form it takes, so every binding form raises the
+  count — where enumerating the forms would always be one form behind,
+  exactly as enumerating fabrication symbols would. The `let <name>`
+  bound is kept ahead of it for its precise message on the common shadow.
+  This also closes the residual the previous head DECLARED open (the
+  closure/`fn` parameter): probed and now RED.
+
+  Three false or stale statements corrected in the same pass. The
+  assertion message claimed the name "must be bound exactly ONCE in the
+  shim crate", broader than what was enforced. The comment claimed a
+  `macro_rules!` body "must still write these tokens to define itself,
+  and macro hygiene stops an out-of-crate one from shadowing here" —
+  false on the first half, since the body writes `let $n` and an `ident`
+  metavariable is call-site-hygienic. And the residual, stated in the
+  test doc, the `binding_index.rs` module doc, the commit message and
+  the PR body as "a parameter, rather than a `let`", is now stated as
+  what genuinely remains: CONSERVATION, since a count bounds occurrences
+  without classifying them, so an author who also DELETES an existing
+  mention pays for a shadow and leaves the total where it was.
+
+  Validation: 28-row mutation matrix, serialized libtest output
+  (`--test-threads=1` — parallel writers interleaved partial lines and
+  DESTROYED anchored result lines, a false NOTRUN; polarity is safe but
+  a result can be silently dropped). Shim `bpfel-unknown-none` build rc 0
+  asserted in every row reporting a test result; the only nonzero shim
+  rows stay M6/M7a where the compile rejection IS the result. Byte-exact
+  restore asserted per row over the whole `userspace-xdp/` tree. P1-P4
+  and the closure-parameter residual R1 are green on parent `db6b22576`
+  and RED at this head, all five on the new mention bound. Every prior
+  row still reds on its own intended assertion. `make generate`: verifier
+  PASS, object sha256 `114354c9…` UNCHANGED, so the change is
+  codegen-neutral; BOTH source input hashes moved (`lib.rs` and
+  `binding_index.rs`), correcting a PR-body line that named only one.
+  `TestUserspaceXDPShimObjectMatchesSourceManifest` ok, `go build` and
+  `go vet` 0. Rust suite 4236 passed / 1 failed —
+  `afxdp::ha::…current_generation_install_and_delete_still_apply_on_poisoned_shared_mutex`,
+  which fails with IDENTICAL counts on parent `db6b22576` and passes 3 of
+  3 in isolation: the #6712 poisoned-shared-mutex flake family, and this
+  change touches zero `afxdp/` files.
+- **File(s)**: userspace-dp/src/main_tests.rs,
+  userspace-xdp/src/binding_index.rs, userspace-xdp/src/lib.rs,
+  pkg/dataplane/userspace_xdp_manifest.json, _Log.md

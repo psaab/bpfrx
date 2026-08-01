@@ -425,11 +425,14 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     };
 
     // #5173: this statement is pinned token-for-token by the parity tests, and
-    // the name it binds is bounded to exactly this one binding in the crate.
-    // The interface coordinate stays a bare u32 all the way into
-    // `binding_slot`, so unlike the queue coordinate NOTHING rejects a
-    // reduction of it by type — pinning where it comes from, refusing a second
-    // binding of the name, and pinning how it is passed is the whole defence.
+    // the name it binds is bounded twice over there — to exactly one `let`
+    // binding, and to a fixed total number of mentions anywhere in the crate.
+    // The second bound is what catches a rebinding spelled as a tuple pattern,
+    // a `let … else`, a macro expansion or a parameter, none of which write the
+    // token pair the first one matches. The interface coordinate stays a bare
+    // u32 all the way into `binding_slot`, so unlike the queue coordinate
+    // NOTHING rejects a reduction of it by type — pinning where it comes from,
+    // bounding the name, and pinning how it is passed is the whole defence.
     let ingress_ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
     if unsafe { USERSPACE_INGRESS_IFACES.get(&ingress_ifindex) }.map_or(true, |v| *v == 0) {
         return Ok(cpumap_or_pass(ctrl));
