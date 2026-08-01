@@ -1782,19 +1782,27 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 // narrower set the operator wrote. It also bypassed
 // validateEventAttributesMatch — a packed-leaf expression naming an unknown
 // field committed clean because the compiler never produced it.
+// #6673: an authored-but-EMPTY expression is kept, not skipped. Before #6659
+// the block spelling appended strings.Join(amChild.Keys, " ") unconditionally,
+// so `attributes-match { ""; e1.owner matches X; }` produced an "" entry and
+// validateEventAttributesMatch HARD-REJECTED it at strict commit as a malformed
+// match expression. Filtering it out silently accepted that config instead —
+// converting a fail-CLOSED commit gate into a fail-OPEN one, which is the exact
+// defect class this arm was widened to fix. The packed spelling now behaves the
+// same way (the parity this helper exists for), so `attributes-match "";` is
+// rejected too; the tolerant load / peer-sync path downgrades both to a warning
+// and still boots. A bare `attributes-match;` carrying no value slot at all
+// remains "no constraint authored" and is untouched.
 func eventAttributesMatchExprs(child *Node) []string {
 	var exprs []string
-	// Packed leaf: the tail tokens form exactly ONE expression.
+	// Packed leaf: the tail tokens form exactly ONE expression. Emitted
+	// whenever a value slot exists, even if the expression is empty.
 	if len(child.Keys) > 1 {
-		if expr := strings.TrimSpace(strings.Join(child.Keys[1:], " ")); expr != "" {
-			exprs = append(exprs, expr)
-		}
+		exprs = append(exprs, strings.TrimSpace(strings.Join(child.Keys[1:], " ")))
 	}
 	// Block / flat-set: one expression per child.
 	for _, amChild := range child.Children {
-		if expr := strings.TrimSpace(strings.Join(amChild.Keys, " ")); expr != "" {
-			exprs = append(exprs, expr)
-		}
+		exprs = append(exprs, strings.TrimSpace(strings.Join(amChild.Keys, " ")))
 	}
 	return exprs
 }
@@ -1820,20 +1828,26 @@ func eventAttributesMatchExprs(child *Node) []string {
 //
 // A child boundary and a tail-token boundary are different things, so the two
 // rules do not conflict.
+// #6673: an authored-but-EMPTY command is kept, not skipped, for the same
+// reason as eventAttributesMatchExprs above. Before #6659 the block spelling
+// appended cmdChild.Name() unconditionally, so `commands { ""; "set system
+// host-name foo"; }` produced an "" entry and the event engine
+// (pkg/eventengine/engine.go) refused the WHOLE remediation batch, because every
+// command must carry the "set " prefix. Filtering the empty entry out would run
+// the rest of the batch instead — a partially-applied configuration change the
+// operator never got under master, from a batch master declined outright.
+// Keeping it preserves that fail-closed behaviour and gives the packed spelling
+// the same one. A `commands;` with no value slot still contributes nothing.
 func eventChangeConfigCommands(cmdsNode *Node) []string {
 	var cmds []string
 	// Packed: each trailing token is one complete (quoted) command.
 	for _, k := range cmdsNode.Keys[1:] {
-		if c := strings.TrimSpace(k); c != "" {
-			cmds = append(cmds, c)
-		}
+		cmds = append(cmds, strings.TrimSpace(k))
 	}
 	// Block: each child is one command; join its Keys so an unquoted command
 	// survives whole instead of truncating to its first word.
 	for _, cmdChild := range cmdsNode.Children {
-		if c := strings.TrimSpace(strings.Join(cmdChild.Keys, " ")); c != "" {
-			cmds = append(cmds, c)
-		}
+		cmds = append(cmds, strings.TrimSpace(strings.Join(cmdChild.Keys, " ")))
 	}
 	return cmds
 }

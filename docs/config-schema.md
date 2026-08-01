@@ -964,6 +964,56 @@ complaint about the pair that actually installs. For the same reason the
 match-side widening buys DIAGNOSTIC completeness, not a dataplane backstop: the
 tail values never reach the Rust parser at all.
 
+**An EMPTY authored value is a value, and whether to keep it depends on whether
+the leaf SELECTS or SETS (#6673).** `firewallMatchValues` skips blank tokens,
+which is right where every value it returns is installed — but a leaf that reads
+one value into a scalar that installs, plus a list that only validators consume,
+must keep them. `nodeVal` SELECTS a blank token, so filtering it out of the list
+lets the scalar hold a value the list does not contain, and every validator and
+diagnostic reading the list then describes a rule that is not the one in effect.
+Three categories, and the non-uniformity is deliberate:
+
+| Category | Leaves | Reader | Empty value |
+|---|---|---|---|
+| SELECTION (scalar installs, list validates) | `routing-options forwarding-table export`, `security nat static … match destination-address` | `multiLeafAuthoredValues` (`ast.go`) | KEPT |
+| SET (every value installs) | `security flow traceoptions flag`, `security nat proxy-arp … address` | `firewallMatchValues` / `proxyARPAddressValues` | SKIPPED |
+| VALIDATED LIST (a downstream checker rejects a malformed entry) | `event-options … attributes-match`, `… then change-configuration commands` | `eventAttributesMatchExprs` / `eventChangeConfigCommands` | KEPT |
+
+`multiLeafAuthoredValues` exists to make one invariant TOTAL:
+`multiLeafAuthoredValues(n)[0] == nodeVal(n)` for every node shape — including a
+node carrying no value slot at all (`export [ ];`, whose brackets the lexer
+strips, leaving `Keys=["export"]`), for which it returns one empty value because
+that is what `nodeVal` selects. Consumers therefore MUST skip empty entries when
+validating a value and MUST count only non-empty entries when enforcing
+cardinality (`nonEmptyValues`) — an empty slot is a selection, not a second
+policy or prefix, so counting it would invent a rejection.
+
+Two traps this closed, both invisible to a shape matrix that never builds an
+empty value:
+
+- **A selection can move.** Deriving the scalar from `list[0]` over an
+  empty-filtered list made `export [ "" p1 ];` select `p1` where it had selected
+  nothing — silently ENABLING an ECMP policy the operator had blanked. The
+  scalar is now the verbatim pre-#6659 statement (`FindChild` + `nodeVal`),
+  which also preserves LAST-ROOT-WINS across two top-level `routing-options`
+  blocks: `compiler_dispatch.go` calls `compileRoutingOptions` once per root, so
+  the scalar re-assigns while the list appends, and `list[0]` named the first
+  root's policy instead of the rendered one.
+- **Dropping an empty entry can turn a fail-CLOSED gate fail-OPEN.** The
+  pre-#6659 `attributes-match` reader appended every child expression
+  unconditionally, so a stray `""` was hard-rejected as a malformed match
+  expression; filtering it accepted that config and let the event policy fire on
+  every occurrence of its event. Likewise an empty `commands` entry made the
+  event engine decline the WHOLE remediation batch (every command needs the
+  `set ` prefix) — filtering it applies the batch in part instead.
+
+A diagnostic about a NON-SELECTED value must not describe the selected one's
+fate. `emitMatchAddr` (`compiler_validate_strict_nat.go`) picks the tolerant-path
+suffix per value: the selected value really does drop the whole rule, while a
+malformed value in any other slot never reaches the dataplane at all, so the rule
+installs and keeps translating. Telling an operator their published service is
+down when it is up is the same class of defect as the silence #6659 removed.
+
 **A multi-value leaf can be PRESENT and still carry NOTHING — presence must be
 decided by VALUES, never by the leaf NAME (#6526).** `firewallMatchValues`
 skips blank tokens, and its doc comment states the contract: *an empty result

@@ -769,7 +769,27 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 						// than silently collapsing — see MatchAddresses. The
 						// tolerant path has no such gate, so it must keep the
 						// historical selection.
-						rule.MatchAddresses = append(rule.MatchAddresses, firewallMatchValues(m)...)
+						//
+						// #6673: read the list with multiLeafAuthoredValues, NOT
+						// firewallMatchValues. The latter drops empty values while
+						// nodeVal selects them, so the scalar could hold a value
+						// the list did not contain: `destination-address
+						// 192.0.2.1/32` followed by `destination-address [ ]`
+						// left Match = "" (an inert rule, exactly as before
+						// #6659) with MatchAddresses = ["192.0.2.1/32"]. Every
+						// consumer of the list is a validator or a diagnostic
+						// that describes what installs, so a list that omits the
+						// installed value makes all of them wrong at once — the
+						// cardinality gate names a prefix that is not in effect,
+						// and the prefix loops "cover" a value that was never
+						// selected. multiLeafAuthoredValues guarantees
+						// MatchAddresses[0] == nodeVal(m) per statement, so the
+						// installed value is always present.
+						//
+						// Empty entries are not a second prefix: the gates count
+						// only non-empty values and the value loops skip them, so
+						// this changes no accept/reject outcome.
+						rule.MatchAddresses = append(rule.MatchAddresses, multiLeafAuthoredValues(m)...)
 						rule.Match = nodeVal(m)
 					case "source-address":
 						// #3435 (M02): support bracket / repeated lists

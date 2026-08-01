@@ -245,14 +245,22 @@ func validateForwardingTableExportSingleStrict(cfg *Config) error {
 	if cfg == nil {
 		return nil
 	}
-	if n := len(cfg.RoutingOptions.ForwardingTableExports); n > 1 {
+	// #6673: count only NON-EMPTY values, and name the policy that actually
+	// renders. ForwardingTableExports records every authored value slot
+	// including empty ones so the list always contains what the scalar selected
+	// (see multiLeafAuthoredValues); an empty slot blanks the export rather than
+	// adding a policy, and `export [ "" p1 ];` must stay acceptable exactly as
+	// it was before #6659. The selected policy is the scalar, NOT element [0]:
+	// with two top-level `routing-options` roots the last root wins, so [0]
+	// named a policy that does not render.
+	exports := nonEmptyValues(cfg.RoutingOptions.ForwardingTableExports)
+	if n := len(exports); n > 1 {
 		return fmt.Errorf(
 			"routing-options forwarding-table export declares %d policies (%v); "+
 				"the forwarding-table export renders as a SINGLE ECMP policy "+
 				"lookup, so only %q would take effect and the rest would be "+
 				"silently ignored — configure one export policy (#6659)",
-			n, cfg.RoutingOptions.ForwardingTableExports,
-			cfg.RoutingOptions.ForwardingTableExports[0])
+			n, exports, cfg.RoutingOptions.ForwardingTableExport)
 	}
 	return nil
 }

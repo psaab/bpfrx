@@ -1256,6 +1256,28 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 	emit := func(msg string) error {
 		return emitSuffix(msg, " (ignored: rule dropped by dataplane until corrected)")
 	}
+	// emitMatchAddr is emit for a complaint whose operand is ONE authored
+	// `match destination-address` value out of the list #6659 made visible.
+	//
+	// #6673: the plain `emit` suffix — "rule dropped by dataplane until
+	// corrected" — is FALSE for a value the compiler did not select. Only ONE
+	// value is ever lowered (rule.Match, the value nodeVal took from the last
+	// authored statement); a malformed value in any other slot never reaches
+	// the dataplane, so nothing is dropped and the rule installs and translates
+	// normally on rule.Match. Reporting it as a dropped rule tells the operator
+	// their published service is down when it is up, and the reverse mistake —
+	// staying silent — is what #6659 was fixing. Name the actual effect per
+	// value: the selected one really does drop the rule, a non-selected one is
+	// ignored on its own.
+	emitMatchAddr := func(addr, selected, msg string) error {
+		if addr == selected {
+			return emit(msg)
+		}
+		return emitSuffix(msg, fmt.Sprintf(
+			" (ignored: this value is not the one the rule installs — %q is, "+
+				"and it stays active; correct or remove the unused value)",
+			selected))
+	}
 
 	for _, rs := range cfg.Security.NAT.Static {
 		if rs == nil {
@@ -1359,7 +1381,7 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 					continue
 				}
 				if _, _, _, parsedIP := natStaticPrefixInfo(addr); !parsedIP {
-					if err := emit(fmt.Sprintf(
+					if err := emitMatchAddr(addr, rule.Match, fmt.Sprintf(
 						"security nat static rule-set %q rule %q match destination-address %q is not a valid IP address or CIDR prefix (static NAT requires a literal address or prefix, not an address-book name or a typo'd value)",
 						rs.Name, rule.Name, addr)); err != nil {
 						return nil, err
@@ -1440,16 +1462,22 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 				}
 			}
 			// #6659 follow-up: the operand here is a MATCH address, so it runs
-			// per authored value with a per-address block-pair exemption. Read
-			// scalar, a non-host prefix in slot 2 escaped this check entirely
-			// (the reviewer's verified case: `[ 192.0.2.1/32 198.51.100.0/24 ]`
-			// warned about nothing while `198.51.100.0/24` alone warned).
+			// per authored value with a per-address block-pair exemption.
+			// Reading only the scalar, a non-host prefix in slot 2 escaped this
+			// check entirely (the reviewer's verified case:
+			// `[ 192.0.2.1/32 198.51.100.0/24 ]` warned about nothing while
+			// `198.51.100.0/24` alone warned).
+			//
+			// #6673: report the effect per value via emitMatchAddr. A non-host
+			// mask in a slot the compiler did not select is not "silently
+			// dropped by the dataplane" as a rule — it never reaches the
+			// dataplane at all, and the rule keeps translating on rule.Match.
 			for _, addr := range matchAddrs {
 				if addr == "" || blockPairFor(addr) {
 					continue
 				}
 				if host, parsed := isHostMaskAddress(addr); parsed && !host {
-					if err := emit(fmt.Sprintf(
+					if err := emitMatchAddr(addr, rule.Match, fmt.Sprintf(
 						"security nat static rule-set %q rule %q match destination-address %q must be a host route (/32 for IPv4, /128 for IPv6); a non-host mask is silently dropped by the dataplane",
 						rs.Name, rule.Name, addr)); err != nil {
 						return nil, err
@@ -2256,7 +2284,16 @@ func validateStaticNATMatchAddressesStrict(cfg *Config) error {
 			if rule == nil {
 				continue
 			}
-			if len(rule.MatchAddresses) > 1 {
+			// #6673: count only NON-EMPTY values. MatchAddresses records every
+			// authored value slot including the empty ones, because nodeVal
+			// selects an empty slot and the list has to contain what installs
+			// (see multiLeafAuthoredValues). An empty slot is a selection, not a
+			// second external prefix — `destination-address 192.0.2.1/32`
+			// followed by `destination-address [ ]` authors ONE prefix and
+			// blanks it, which master accepted, so counting raw length here
+			// would invent a rejection this gate was never meant to make.
+			addrs := nonEmptyValues(rule.MatchAddresses)
+			if len(addrs) > 1 {
 				return fmt.Errorf(
 					"static NAT rule-set %q rule %q declares %d `match "+
 						"destination-address` prefixes (%v); a static-NAT rule "+
@@ -2264,8 +2301,8 @@ func validateStaticNATMatchAddressesStrict(cfg *Config) error {
 						"`then static-nat prefix` target, so only %q would take "+
 						"effect and the rest would be silently ignored — author "+
 						"one rule per external prefix (#6659)",
-					rs.Name, rule.Name, len(rule.MatchAddresses),
-					rule.MatchAddresses, rule.Match)
+					rs.Name, rule.Name, len(addrs),
+					addrs, rule.Match)
 			}
 		}
 	}

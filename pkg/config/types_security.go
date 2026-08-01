@@ -936,6 +936,10 @@ type StaticNATRule struct {
 	// list at commit rather than letting it silently collapse to the first.
 	// Widening static NAT to fan one rule into N external prefixes is a
 	// separate semantic change (see #6674), not this fix.
+	//
+	// #6673: read with multiLeafAuthoredValues, which KEEPS empty values, so this
+	// list always contains what Match selected; an empty entry is a selection, not
+	// a second prefix. Rationale: compileNATStatic and docs/config-schema.md.
 	MatchAddresses []string
 	// SourceAddress is the FIRST configured `match source-address` value,
 	// retained for back-compat (e.g. "::/0" for NAT64). Prefer

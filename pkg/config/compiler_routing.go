@@ -22,14 +22,33 @@ func compileRoutingOptions(node *Node, ro *RoutingOptionsConfig) error {
 	// `export [ p1 p2 ]` collapses onto Keys[1:] and `export { p1; p2; }` onto
 	// Children; nodeVal kept only the first, which meant the second policy was
 	// neither rendered NOR reference-checked — a dangling reference in slot 2
-	// committed clean. ForwardingTableExport keeps the first element so the FRR
-	// renderer is unchanged; the strict gate rejects a multi-valued list.
+	// committed clean. The strict gate now rejects a multi-valued list.
+	//
+	// #6673: the SCALAR keeps the verbatim pre-#6659 statement — FindChild plus
+	// nodeVal, assigned once per compileRoutingOptions invocation. It is NOT
+	// ForwardingTableExports[0]. Two authoring shapes make the two differ, and
+	// both change which policy the FRR renderer installs:
+	//
+	//   - an EMPTY value in the first slot. `export [ "" p1 ];`, `export [ ];
+	//     export p1;`, `export { ""; p1; }` and the flat-set `export ""` +
+	//     `export p1` pair all select "" (no export policy) under nodeVal, but
+	//     [0] over an empty-filtered list selects p1 — silently ENABLING an
+	//     ECMP/consistent-hash policy the operator had blanked out.
+	//   - two top-level `routing-options` roots (a `load override` artifact:
+	//     the parser keeps repeated same-key blocks as separate siblings, and
+	//     compiler_dispatch.go calls this function for each). The scalar
+	//     assignment re-runs per root, so the LAST root wins, exactly as before
+	//     #6659; an append-then-[0] made the FIRST root win instead.
+	//
+	// The plural still accumulates across roots, which is what the reference
+	// gate wants (every named policy must exist) and what makes the cardinality
+	// gate see the ambiguity.
 	if ftNode := node.FindChild("forwarding-table"); ftNode != nil {
 		for _, expNode := range ftNode.FindChildren("export") {
-			ro.ForwardingTableExports = append(ro.ForwardingTableExports, firewallMatchValues(expNode)...)
+			ro.ForwardingTableExports = append(ro.ForwardingTableExports, multiLeafAuthoredValues(expNode)...)
 		}
-		if len(ro.ForwardingTableExports) > 0 {
-			ro.ForwardingTableExport = ro.ForwardingTableExports[0]
+		if expNode := ftNode.FindChild("export"); expNode != nil {
+			ro.ForwardingTableExport = nodeVal(expNode)
 		}
 	}
 

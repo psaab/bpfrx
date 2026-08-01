@@ -73658,3 +73658,45 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   and ZERO non-6673 static-NAT failures.
 - **File(s)**: pkg/config/compiler_nat_static.go,
   pkg/dataplane/userspace/static_nat_repeated_match_6673_test.go, _Log.md
+
+
+- **Timestamp**: 2026-08-02 13:40
+- **Action**: #6673 F2 MAJOR — make the empty-value semantics of the six widened
+  multi-value arms match master, and make the scalar and plural mechanisms agree.
+  Built a master-vs-head differential over 35 empty-value shapes (`[ "" x ]`,
+  `[ ]`, a bare `""`, and an empty value in a non-first slot, strict AND
+  tolerant, all six arms) — the shape matrix #6659 shipped with never
+  constructed an empty value, so four behaviour changes were invisible to it by
+  construction. (1) SELECTION MOVED: deriving `ForwardingTableExport` from
+  `Exports[0]` over an empty-filtered list made `export [ "" p1 ];` select p1
+  where master selected nothing, silently enabling an ECMP policy the operator
+  had blanked; four authoring shapes affected, plus LAST-ROOT-WINS lost across
+  two `routing-options` roots. Restored the verbatim pre-#6659 `FindChild` +
+  `nodeVal` statement. (2) DRIFT: `firewallMatchValues` skips empty values while
+  `nodeVal` selects them, so `rule.Match` could hold a value absent from
+  `MatchAddresses` — every consumer of that list is a validator or diagnostic
+  describing what installs. New `multiLeafAuthoredValues` (ast.go) keeps empty
+  values and guarantees `values[0] == nodeVal(n)` for every node shape;
+  cardinality gates count `nonEmptyValues` so no accept/reject outcome changes.
+  (3+4) NEW REGRESSIONS FOUND AND FIXED: dropping an empty `attributes-match`
+  expression turned master's fail-CLOSED malformed-expression rejection into a
+  fail-open (the policy then fires on every occurrence of its event), and
+  dropping an empty `commands` entry applies in part a remediation batch the
+  event engine previously declined whole. Both readers keep empty entries again;
+  the packed spellings now behave like the block ones, which is the dual-shape
+  parity the arms were widened for. Flow-trace flags and proxy-ARP addresses are
+  SET leaves and keep skipping empties, as master did — pinned as a control.
+  Also corrected the tolerant-path suffix: `emitMatchAddr` no longer claims "rule
+  dropped by dataplane" for a value the compiler did not select, since only
+  `rule.Match` is lowered and the rule keeps translating. RED-on-revert: 13
+  mutations, build rc=0 + vet rc=0 asserted under each, all 13 red the named test
+  with a real `--- FAIL:` line. Two mutations initially produced NO red and
+  exposed a non-binding assertion — the warning lookup matched the cardinality
+  warning, which quotes the same value and legitimately carries no suffix — fixed
+  by keying on the message body and asserting a unique match.
+- **File(s)**: pkg/config/ast.go, pkg/config/compiler_routing.go,
+  pkg/config/compiler_nat_static.go, pkg/config/compiler_services.go,
+  pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_validate_strict_routing.go,
+  pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
+  docs/config-schema.md, _Log.md

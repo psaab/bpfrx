@@ -199,6 +199,74 @@ func (n *Node) FindChildren(name string) []*Node {
 	return result
 }
 
+// multiLeafAuthoredValues returns EVERY value a `multi: true` leaf carries,
+// across both parser AST shapes, WITHOUT discarding empty ones.
+//
+// It is the plural counterpart of nodeVal for a SELECTION leaf — one whose
+// values are read into a list for validation while a single scalar (nodeVal) is
+// what actually installs. The two must not disagree about which values exist,
+// so this reader is defined to make one invariant TOTAL:
+//
+//	multiLeafAuthoredValues(n)[0] == nodeVal(n)   for every node n
+//
+// which is why it differs from firewallMatchValues in two ways:
+//
+//   - it KEEPS empty tokens. firewallMatchValues drops them, because there an
+//     empty result legitimately means "criterion absent" and every value it
+//     returns is installed. Here an empty value is not absence — nodeVal
+//     SELECTS it, and selecting an empty value is how an operator renders a rule
+//     inert. Dropping it from the list while the scalar still selects it is what
+//     let `Match` hold a value that was not in `MatchAddresses` (#6673): the
+//     validators reason from the list, so the list has to admit that the
+//     installed value is empty rather than silently showing an earlier,
+//     non-installed one.
+//   - a node carrying NO value slot at all (`export [ ];`, i.e. Keys=["export"]
+//     with no children — the lexer strips the brackets, leaving nothing) yields
+//     one empty value rather than nothing, because nodeVal selects "" for it.
+//     Without this the invariant above would fail for exactly the shape that
+//     started the investigation.
+//
+// Consumers therefore MUST skip empty entries when validating a value, and MUST
+// count only non-empty entries when enforcing cardinality — an empty slot is a
+// selection, not a second policy/prefix. Callers that install every value they
+// read (firewall match criteria, flow trace flags, proxy-ARP addresses) want
+// firewallMatchValues, not this.
+func multiLeafAuthoredValues(n *Node) []string {
+	if n == nil {
+		return nil
+	}
+	var vals []string
+	if len(n.Keys) > 1 {
+		vals = append(vals, n.Keys[1:]...)
+	}
+	for _, vn := range n.Children {
+		// Name(), not Keys[0]: a child with no keys at all contributes an
+		// empty value rather than being skipped, because nodeVal reads exactly
+		// Children[0].Name() and would select "" for it. Skipping it would let
+		// a later keyed sibling occupy slot 0 and break the invariant.
+		vals = append(vals, vn.Name())
+	}
+	if len(vals) == 0 {
+		// nodeVal returns "" here; mirror that so the selected value is always
+		// represented in the list.
+		return []string{""}
+	}
+	return vals
+}
+
+// nonEmptyValues returns the entries of vals that are not empty. Cardinality
+// gates over a multiLeafAuthoredValues list use it so an empty selection slot is
+// not miscounted as an additional authored policy/prefix.
+func nonEmptyValues(vals []string) []string {
+	var out []string
+	for _, v := range vals {
+		if v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
 // ConfigTree is the root of a parsed configuration.
 type ConfigTree struct {
 	Children []*Node
