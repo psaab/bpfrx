@@ -99,10 +99,25 @@ changes when a file actually crosses 1500 or 2000 LOC — a real, rare,
 actionable event.
 
 The **LOC column is an advisory snapshot.** It is not gated, and the
-tree is expected to outrun it between regenerations. It cannot drift
-far: every recorded number is pinned to its own tier band, and any band
-crossing fails the gate, which forces a regeneration that refreshes all
-of them.
+tree is expected to outrun it between regenerations. How far it can
+drift depends on the tier, and the asymmetry is worth stating plainly
+rather than implying a uniform bound:
+
+- A `[WATCH]` number is bounded on both sides — the band is 1500-1999,
+  so it cannot be more than ~500 lines wrong before a crossing fails
+  the gate and forces a regeneration that refreshes every number.
+- A `[REFACTOR]` number is bounded only from below. The band is
+  "2000 or more" and is **open above**, so a file already over 2000 can
+  grow without limit and no gate fires. This artifact contains its own
+  example: `userspace-dp/src/afxdp/worker/loop_body/mod.rs` drifted
+  2119 -> 2448 (+329) with no signal.
+
+That is acceptable because the number is advisory and the tier is what
+the project's rules act on — a file over 2000 is already `[REFACTOR]`
+and stays `[REFACTOR]` however much it grows, so the actionable fact
+does not go stale even when the number does. But do not read a
+`[REFACTOR]` LOC as current; regenerate before using one to compare
+two candidates against each other.
 
 **Why the LOC column cannot be gated (#6617).** It used to be — the
 canary compared the artifact byte-for-byte — and that criterion could
@@ -111,7 +126,7 @@ depends on every audited file in the tree, not just the ones a PR
 touches. Under parallel merges, a PR that regenerates the artifact
 correctly at its own base still lands stale, because a sibling PR grew a
 different file in between. Measured over the 40 first-parent commits
-ending at `b4605ea9d`, `master` was byte-stale in **28** of them; #6602
+ending at `b4605ea9d`, `master` was byte-stale in **26** of them; #6602
 and #6613 each regenerated the artifact in their own merge commit and
 each *still* landed red, both disagreeing only on `pkg/snmp/agent.go`, a
 file neither PR touched. A gate that fails when the author did

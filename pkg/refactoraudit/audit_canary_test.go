@@ -130,7 +130,7 @@ func runScript(t *testing.T, root string, args ...string) string {
 // parallel-merge workflow a PR that regenerates the artifact correctly at
 // its own base still lands stale, because a sibling PR grew a different
 // file in between. That is not hypothetical — measured over the 40
-// first-parent commits ending at b4605ea9d, master was byte-stale in 28
+// first-parent commits ending at b4605ea9d, master was byte-stale in 26
 // of them, and #6602 and #6613 BOTH regenerated the artifact in their own
 // merge commit and BOTH still landed red, each disagreeing only on
 // pkg/snmp/agent.go, a file neither PR touched (grown by #6596, merged
@@ -146,10 +146,16 @@ func runScript(t *testing.T, root string, args ...string) string {
 // in docs/pr/1706 and docs/pr/1732 plans).
 //
 // The LOC column stays in the artifact for prioritisation, as an advisory
-// snapshot refreshed by `make audit-check`. It cannot drift far: a
-// recorded LOC is pinned to its tier band by TestHeatmapArtifactWellFormed,
-// and any band crossing reds this test, which forces a regeneration that
-// refreshes every number.
+// snapshot refreshed by `make audit-check`. TestHeatmapArtifactWellFormed
+// pins each recorded LOC to its tier band, and any band crossing reds this
+// test, which forces a regeneration that refreshes every number — but the
+// bound that gives is ASYMMETRIC. [WATCH] is 1500-1999, bounded both ways.
+// [REFACTOR] is "2000 or more", open above, so a file already past 2000 can
+// grow without limit unwatched; this artifact's own
+// userspace-dp/src/afxdp/worker/loop_body/mod.rs drifted 2119 -> 2448 with
+// no signal. That is tolerable only because the TIER is what the project's
+// rules act on and the tier does not go stale — not because the number is
+// nearly right.
 //
 // FAIL-ON-REVERT: retagging any committed row's tier, deleting a row, or
 // adding a phantom row makes this test RED.
@@ -361,6 +367,37 @@ func TestProductionSentinelVisible(t *testing.T) {
 		if strings.HasSuffix(line, sentinel) && !strings.HasPrefix(line, "[REFACTOR]") {
 			t.Errorf("sentinel row is not [REFACTOR] tier: %q", line)
 		}
+	}
+
+	// PER-LANGUAGE FLOOR. The sentinel above is a single Rust path, so it
+	// survives the Go leg of the generator being broken entirely: drop
+	// audit_go(), regenerate, and the Go rows go 25 -> 0 while every test
+	// here — and `make audit-check` — still reports success, because each
+	// remaining check is satisfied by a Rust-only artifact. A whole language
+	// silently leaving the audit is exactly the failure this file exists to
+	// catch, so require at least one row from each side.
+	var goRows, rustRows int
+	for _, line := range strings.Split(heatmap, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 3 {
+			continue
+		}
+		switch path := fields[2]; {
+		case strings.HasPrefix(path, "pkg/"), strings.HasPrefix(path, "cmd/"):
+			goRows++
+		case strings.HasPrefix(path, "userspace-dp/"), strings.HasPrefix(path, "userspace-xdp/"):
+			rustRows++
+		}
+	}
+	if goRows == 0 {
+		t.Error("no pkg/ or cmd/ rows in the heatmap: the Go leg of the audit " +
+			"produced nothing. This repo always has >=1500 LOC Go files, so an " +
+			"all-Rust artifact means the generator's Go half is broken, not that " +
+			"the Go tree got small.")
+	}
+	if rustRows == 0 {
+		t.Error("no userspace-dp/ or userspace-xdp/ rows in the heatmap: the Rust " +
+			"leg of the audit produced nothing.")
 	}
 
 	// No excluded test file may reappear.
