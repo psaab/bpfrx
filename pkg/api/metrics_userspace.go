@@ -291,6 +291,13 @@ func (c *xpfCollector) emitWireguardTelemetry(ch chan<- prometheus.Metric, statu
 		counter(c.wgSessionsExpiredTotal, t.SessionsExpired, t.Tunnel)
 		counter(c.wgHandshakeAttemptsAbortedTotal, t.PendingAbortedAttemptWindow, t.Tunnel)
 
+		// #5618: xpf forward zone-policy authority over decapped inner
+		// plaintext. Both verdicts always emit (including zero) so an
+		// operator can alert on `unadjudicated` climbing — a silent
+		// residual delegation is exactly what #5618 reported.
+		counter(c.wgInnerZonePolicyTotal, t.InnerPolicyDenies, t.Tunnel, "deny")
+		counter(c.wgInnerZonePolicyTotal, t.InnerPolicyUnadjudicated, t.Tunnel, "unadjudicated")
+
 		// #1434 multi-peer: one confirmed-session gauge per peer,
 		// labeled by tunnel + peer pubkey.
 		for _, p := range t.Peers {

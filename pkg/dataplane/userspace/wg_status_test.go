@@ -75,7 +75,9 @@ func TestProcessStatusWgTunnelsPopulatedDecode(t *testing.T) {
 			"rekeys_initiated_keepalive_no_session": 41,
 			"keepalives_tx_passive": 42,
 			"keepalives_tx_persistent": 43,
-			"pending_aborted_attempt_window": 44
+			"pending_aborted_attempt_window": 44,
+			"inner_policy_denies": 51,
+			"inner_policy_unadjudicated": 52
 		}]
 	}`
 	var status ProcessStatus
@@ -158,6 +160,9 @@ func TestProcessStatusWgTunnelsPopulatedDecode(t *testing.T) {
 		{"KeepalivesTxPassive", row.KeepalivesTxPassive, 42},
 		{"KeepalivesTxPersistent", row.KeepalivesTxPersistent, 43},
 		{"PendingAbortedAttemptWindow", row.PendingAbortedAttemptWindow, 44},
+		// #5618 inner-ingress zone-policy authority.
+		{"InnerPolicyDenies", row.InnerPolicyDenies, 51},
+		{"InnerPolicyUnadjudicated", row.InnerPolicyUnadjudicated, 52},
 	}
 	for _, c := range ladder {
 		if c.got != c.want {

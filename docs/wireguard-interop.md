@@ -724,6 +724,111 @@ source) plus the `cookie.rs` unit tests `source_bucket_burst_then_throttle`,
   collision. Handshake construction runs on the control thread only — never
   the AF_XDP poll worker.
 
+## Inner-ingress zone-policy authority (#5618)
+
+**What was wrong.** The #1432-S2a boundary handed the decapped inner
+packet straight to the `wgN` TUN
+(`wg_control/dispatch.rs` → `slowpath::write_packet_nonblocking`) and let
+the Linux kernel route AND firewall it. The xpf AF_XDP forward
+zone-policy engine never saw that traffic, so **a flow the operator's
+`from-zone <wg-zone> to-zone <x>` policy DENIES still transited** — it
+re-entered via the kernel FIB instead of the xpf forward path. The
+WireGuard AllowedIPs check inside `try_decap` is a *cryptographic
+peer/source-ownership* gate, not the SRX zone-pair authority, and never
+substituted for one.
+
+The bypass was **one-directional**. Transit egress (LAN → `wgN`) already
+ran the full AF_XDP forward pipeline and was policy-adjudicated before
+`frame/wg.rs` encapped it; only the inbound decap direction escaped. An
+operator reading `show security policies` therefore saw a rule that was
+enforced outbound and silently unenforced inbound.
+
+**What the gate does.** `wg_control/policy_gate.rs` evaluates every
+decapped inner packet BEFORE the TUN write, against the live forwarding
+snapshot (one `RuntimeViewReader` load per control-loop iteration, so a
+burst is never split across two policy generations):
+
+1. **from-zone** = the zone bound to the tunnel's **logical** interface
+   (`TunnelEndpoint.logical_ifindex`), never the outer UDP interface —
+   the same logical-interface authority model native GRE decap uses.
+2. **to-zone** = the zone of the egress interface the xpf FIB resolves
+   for the inner destination, looked up **in the tunnel interface's
+   routing instance** (a `wgN` bound into a VRF does not resolve its
+   to-zone out of `inet.0`).
+3. `evaluate_policy` on the inner 5-tuple, carrying the real ICMP
+   type/code so an icmp-typed application term (`junos-ping`) matches.
+
+A non-permit verdict **drops the plaintext**: no TUN write, so the kernel
+never sees the packet and cannot forward it. The datagram still
+authenticated, so per-peer endpoint learning proceeds unchanged (a
+verdict on the inner flow says nothing about the outer peer's identity).
+
+A **cold ARP/ND entry does not disable the gate**: the FIB resolution is
+`MissingNeighbor`, which still carries the egress ifindex, so the zone
+pair is known and the verdict is enforced.
+
+**Where xpf still delegates to the kernel — and how you see it.** The
+gate enforces only where xpf actually HAS authority. It preserves
+today's kernel delegation, and bumps `inner_policy_unadjudicated`, when:
+
+- the tunnel interface is **not in a security zone** (no from-zone);
+- the routed **egress interface is unzoned** (no to-zone);
+- the inner destination is **host-bound** (`LocalDelivery`) — that is a
+  `host-inbound-traffic` / `to-zone junos-host` question, a different
+  policy plane, not a transit zone pair;
+- the xpf FIB **resolves no egress interface** for the inner
+  destination;
+- the inner packet carries **no parseable 5-tuple** (non-IP payload,
+  non-first fragment, an IPv6 extension chain the shared walker refuses).
+
+Dropping in those cases would mean refusing traffic on the basis of a
+zone pair xpf could not compute — a worse failure than the bug. Counting
+them makes the residual delegation operator-visible instead of silent.
+
+Operator surfaces:
+
+```
+show security wireguard detail
+  Receive drops by reason:
+    zone-policy-deny        <n>
+  Inner zone policy:  <n> denied by xpf policy, <m> delivered without an
+                      xpf verdict (kernel-adjudicated)
+```
+
+Prometheus: `xpf_userspace_wg_inner_zone_policy_total{tunnel,verdict}`
+with `verdict=deny` and `verdict=unadjudicated`. Both series always emit
+(including zero) so a rising `unadjudicated` is alertable. If you expect
+a tunnel to be fully xpf-adjudicated, alert on
+`rate(xpf_userspace_wg_inner_zone_policy_total{verdict="unadjudicated"}[5m]) > 0`
+— the usual cause is a `wgN` interface with no `security zones` binding.
+
+**What is still NOT done (the #5618 residual).** This gate is the
+forward zone-policy half only. Decapped inner ingress still does not:
+create an xpf session (so the return path is not xpf-stateful), run
+NAT/PBR/firewall filters/screen, emit the RT_FLOW policy-deny record
+with the logical ingress zone, take host-inbound admission, or gate on
+the HA redundancy-group owner. Those need the bounded
+control-thread→worker logical-ingress handoff described in the #5618
+design comment — a packet channel into the AF_XDP workers with explicit
+buffer ownership, fail-closed backpressure, and snapshot-rotation
+invalidation. #5618 stays open for that work.
+
+**Scope vs #5619.** #5619 (IPsec-passthrough plaintext returning through
+the Linux XFRM stack) is the same *architectural class* — authenticated
+plaintext re-entering via a kernel path with no xpf forward consumer —
+but **not the same mechanism**, and this fix does not cover it. Here xpf
+owns the decapsulation: the plaintext exists inside `userspace-dp`, in a
+buffer this process controls, with a tunnel-endpoint id that names a
+logical interface, and can simply not be written out. In the IPsec case
+the KERNEL owns decapsulation (strongSwan-installed XFRM states): the
+plaintext materializes inside `xfrm_input` and is delivered to the
+routing stack without ever passing through userspace-dp, so there is no
+buffer to gate and no point at which xpf could decline the write. Its
+`xfrmi`/`if_id` plaintext needs a different mechanism entirely (an
+ingress hook on the `xfrmi` device, or moving ESP decapsulation into the
+dataplane); the shared opportunity is only the eventual bounded
+logical-tunnel-ingress abstraction, not this gate.
+
 ## Honesty note (S1/S2 boundary)
 
 **S1 is NOT yet proven to interoperate with an independent WireGuard peer.**

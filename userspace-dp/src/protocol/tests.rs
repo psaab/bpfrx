@@ -2161,6 +2161,9 @@ fn process_status_wg_tunnels_roundtrip_and_compat() {
         keepalives_tx_passive: 42,
         keepalives_tx_persistent: 43,
         pending_aborted_attempt_window: 44,
+        // #5618 inner-ingress zone-policy authority.
+        inner_policy_denies: 51,
+        inner_policy_unadjudicated: 52,
     };
     let status = ProcessStatus {
         wg_tunnels: vec![row],
@@ -2187,6 +2190,10 @@ fn process_status_wg_tunnels_roundtrip_and_compat() {
     assert_eq!(wire_row["hs_cookie_replies_sent"], 46);
     assert_eq!(wire_row["hs_rx_cookie_consumed"], 50);
     assert_eq!(wire_row["hs_rx_under_load_no_mac2"], 47);
+    // #5618: the inner zone-policy counters are on the wire (the Go
+    // control plane renders them as WG telemetry).
+    assert_eq!(wire_row["inner_policy_denies"], 51);
+    assert_eq!(wire_row["inner_policy_unadjudicated"], 52);
     let back: ProcessStatus =
         serde_json::from_value(value).expect("deserialize ProcessStatus");
     assert_eq!(back.wg_tunnels.len(), 1);

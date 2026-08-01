@@ -8,8 +8,34 @@
 //!     dataplane workers via `ForwardingState.wg_engines`).
 //!   - a `UdpSocket` bound on `wg_listen_port` (outer transport, RX+TX).
 //!   - the persistent `wgN` **TUN** (inner). The kernel routes inner
-//!     traffic to/from it; xpf does not re-implement inner routing or
-//!     policy in S2a.
+//!     traffic to/from it; xpf does not re-implement inner ROUTING here.
+//!   - a `RuntimeViewReader` (#5618) — the read-only handle on the
+//!     published forwarding/policy snapshot that the inbound
+//!     zone-policy gate adjudicates against.
+//!
+//! ## Inner-ingress zone-policy authority (#5618)
+//!
+//! The S2a boundary originally delegated inner POLICY to the kernel as
+//! well as inner routing, which made the tunnel an inter-zone policy
+//! BYPASS: a flow the operator's `from-zone <wg-zone> to-zone <x>`
+//! policy DENIES still transited, because the decapped plaintext went
+//! straight to the kernel FIB without ever meeting `evaluate_policy`.
+//! The direction was asymmetric — transit egress (LAN → `wgN`) runs the
+//! full AF_XDP forward pipeline and IS adjudicated.
+//!
+//! `policy_gate.rs` closes the forward-authority half: every decapped
+//! inner packet is evaluated as ingress on the tunnel's LOGICAL
+//! interface (its zone + routing instance, the same model native GRE
+//! decap uses) against the routed egress interface's zone, and a
+//! non-permit verdict DROPS it before the TUN write. Where xpf cannot
+//! compute a zone pair (unzoned tunnel/egress, host-bound destination,
+//! unroutable inner, no parseable 5-tuple) the kernel delegation is
+//! preserved and COUNTED (`inner_policy_unadjudicated`) rather than
+//! silent. Session state, NAT, screen, filters/PBR, host-inbound
+//! admission, and the RT_FLOW policy-deny record for inner ingress are
+//! still kernel-side — those need the bounded control-thread→worker
+//! logical-ingress handoff #5618 tracks as the full fix. Operator doc:
+//! `docs/wireguard-interop.md` ("Inner-ingress zone-policy authority").
 //!
 //! ## RX model — kernel socket, ESP/IPsec precedent (plan §3.4)
 //!
@@ -29,8 +55,9 @@
 //!     type byte. type 1 → `consume_initiation_create_response` + send
 //!     the response; type 2 → `consume_response`; type 3 (cookie) →
 //!     drop+count (S7); type 4 (transport) → `try_decap` (the engine
-//!     AllowedIPs-gates the inner src) → write the plaintext inner IP to
-//!     the `wgN` TUN, where the kernel routes/firewalls it.
+//!     AllowedIPs-gates the inner src) → the #5618 forward zone-policy
+//!     gate → write the plaintext inner IP to the `wgN` TUN, where the
+//!     kernel routes it.
 //!   - **Egress** (TUN → engine → kernel socket): inner IP packets the
 //!     kernel routes onto `wgN` are read, `try_encap`'d, and sent to the
 //!     peer endpoint. The transit AF_XDP egress is the other encap site
@@ -62,6 +89,10 @@
 //!     emit/pace helpers.
 //!   - `dispatch` — inbound type-byte dispatch (`InboundOutcome`
 //!     auth-before-roam contract) + the TUN-read encap-and-send.
+//!   - `policy_gate` — the #5618 inner-ingress forward zone-policy
+//!     verdict (logical-interface from-zone, routed to-zone,
+//!     `evaluate_policy`, fail-open-but-counted where xpf has no
+//!     authority).
 
 use super::*;
 use crate::afxdp::wg::counters::WgCounters;
@@ -72,6 +103,7 @@ use std::os::fd::AsRawFd;
 mod attempt;
 mod dispatch;
 mod mtu;
+mod policy_gate;
 mod sock;
 
 use attempt::{
@@ -79,6 +111,7 @@ use attempt::{
     start_attempt,
 };
 use dispatch::{InboundOutcome, dispatch_inbound, encap_and_send};
+use policy_gate::WG_GATE_ETH_LEN;
 use sock::{
     PollWait, WgRecv, bind_wg_socket, canonicalize_endpoint, poll_timeout_ms, set_recv_tos_options,
     wg_poll_wait, wg_recvmsg,
@@ -123,6 +156,11 @@ pub(super) fn wg_control_loop(
     listen_port: u16,
     outer_mtu: usize,
     per_peer_outer_mtu: std::collections::HashMap<[u8; 32], usize>,
+    // #5618: read-only handle on the published runtime view, so the
+    // inbound decap path can adjudicate inner plaintext against the LIVE
+    // forwarding/policy snapshot. Same D.1 handle the GRE local-origin
+    // thread takes (`tunnel.rs`); `RuntimeViewReader` cannot publish.
+    shared_runtime: RuntimeViewReader,
     recent_exceptions: Arc<Mutex<ExceptionEventRing>>,
     stop: Arc<AtomicBool>,
 ) {
@@ -193,12 +231,13 @@ pub(super) fn wg_control_loop(
         tun,
         outer_mtu,
         &per_peer_outer_mtu,
+        tunnel_endpoint_id,
+        &shared_runtime,
         &recent_exceptions,
         &stop,
     );
     // #1866 D3: clean stop-flag exit (teardown) — rare, one line.
     eprintln!("xpf-userspace-dp: WG control thread stopped tun={tunnel_name}");
-    let _ = tunnel_endpoint_id;
 }
 
 /// The per-tunnel control loop proper, on pre-opened fds so the loop
@@ -213,6 +252,8 @@ fn run_wg_control_loop(
     mut tun: std::fs::File,
     outer_mtu: usize,
     per_peer_outer_mtu: &std::collections::HashMap<[u8; 32], usize>,
+    tunnel_endpoint_id: u16,
+    shared_runtime: &RuntimeViewReader,
     recent_exceptions: &Arc<Mutex<ExceptionEventRing>>,
     stop: &AtomicBool,
 ) {
@@ -237,6 +278,19 @@ fn run_wg_control_loop(
     let mut tun_buf = vec![0u8; 65_535];
     let mut decap_buf = vec![0u8; 65_535];
     let mut encap_buf = vec![0u8; 65_535];
+    // #5618: scratch for the inner-ingress policy gate's synthetic
+    // Ethernet-framed copy of the decapped inner packet (every shared
+    // L3/L4 parser in this tree is Ethernet-framed by contract). One
+    // allocation at thread start, like the four buffers above — the gate
+    // itself never allocates.
+    let mut gate_buf = vec![0u8; WG_GATE_ETH_LEN + 65_535];
+
+    // #5618 / #1881 D.1: track the worker-visible forwarding ArcSwap, ONE
+    // load per outer iteration, so every packet in a burst is adjudicated
+    // against ONE coherent snapshot. A validation-only publish rotates the
+    // runtime view but not the forwarding `Arc`, so `load_forwarding_if_changed`
+    // correctly reports no change here (#6592).
+    let mut forwarding: Arc<ForwardingState> = shared_runtime.load().forwarding().clone();
 
     let socket_fd = socket.as_raw_fd();
     let tun_fd = tun.as_raw_fd();
@@ -275,6 +329,14 @@ fn run_wg_control_loop(
     while !stop.load(Ordering::Relaxed) {
         let mut did_work = false;
 
+        // #5618: refresh the adjudication snapshot ONCE per iteration,
+        // before the RX burst, so a mid-burst commit cannot split a burst
+        // across two zone/policy generations.
+        if let Some(next) = super::super::types::load_forwarding_if_changed(&forwarding, shared_runtime)
+        {
+            forwarding = next;
+        }
+
         // --- Inbound: kernel socket → engine → TUN ---
         for _ in 0..WG_RX_BURST {
             // #2317: recvmsg (not recv_from) so the outer IP TOS /
@@ -305,6 +367,9 @@ fn run_wg_control_loop(
                         outer_ecn,
                         &mut decap_buf,
                         &mut encap_buf,
+                        &forwarding,
+                        tunnel_endpoint_id,
+                        &mut gate_buf,
                         tunnel_name,
                         recent_exceptions,
                     );
@@ -535,3 +600,9 @@ fn run_wg_control_loop(
 #[cfg(test)]
 #[path = "wg_control_tests.rs"]
 mod tests;
+
+// #5618: the inner-ingress zone-policy gate's own suite — kept in its own
+// file so `wg_control_tests.rs` stays the timer/socket/poll-loop suite.
+#[cfg(test)]
+#[path = "policy_gate_tests.rs"]
+mod policy_gate_tests;

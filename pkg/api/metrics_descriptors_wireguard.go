@@ -93,4 +93,9 @@ func (c *xpfCollector) initWireGuardDescriptors() {
 		"Pending WireGuard handshake reservations released by the REKEY_ATTEMPT_TIME (90s) give-up — a stale msg2 after this cannot complete the abandoned handshake (#1888 S5).",
 		[]string{"tunnel"}, nil,
 	)
+	c.wgInnerZonePolicyTotal = prometheus.NewDesc(
+		"xpf_userspace_wg_inner_zone_policy_total",
+		"Decapped WireGuard inner packets by xpf FORWARD zone-policy verdict (#5618). verdict=deny: dropped by the `from-zone <wg-zone> to-zone <routed-egress-zone>` policy before reaching the wgN TUN — before #5618 every one of these transited via the kernel FIB, because the tunnel bypassed xpf forward authority entirely. verdict=unadjudicated: delivered to the TUN with NO xpf verdict — the residual #1432-S2a kernel delegation (unzoned tunnel or egress interface, host-bound inner destination, no route in the xpf FIB, or no parseable inner 5-tuple). A climbing unadjudicated series means inter-zone authority for that tunnel still rests with the kernel.",
+		[]string{"tunnel", "verdict"}, nil,
+	)
 }

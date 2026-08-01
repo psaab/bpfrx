@@ -214,6 +214,14 @@ fn spawn_poll_loop(
             // #5291: no per-peer overrides in the idle poll-loop tests —
             // every peer falls back to the scalar (WG_DEFAULT_OUTER_MTU).
             &std::collections::HashMap::new(),
+            // #5618: these poll-loop tests exercise timer/wake/MTU
+            // behaviour, not the inner zone-policy gate. An EMPTY runtime
+            // view carries no tunnel endpoint, so the gate declines
+            // authority (unadjudicated) and the pre-#5618 TUN delivery is
+            // preserved — exactly what these tests assert on. The gate's
+            // own coverage is `policy_gate_tests.rs`.
+            0,
+            &crate::afxdp::types::RuntimeViewChannel::default().reader(),
             &exceptions,
             &stop,
         );
@@ -372,6 +380,10 @@ fn wg_tun_origin_egress_uses_per_peer_outer_mtu_5291() {
             tun,
             outer_mtu,
             &per_peer,
+            // #5618: per-peer MTU test — no forwarding snapshot needed
+            // (see the note in `spawn_poll_loop`).
+            0,
+            &crate::afxdp::types::RuntimeViewChannel::default().reader(),
             &exceptions,
             &stop_thread,
         );

@@ -5,6 +5,7 @@
 
 use super::super::*;
 use super::mtu::wg_inner_fits_outer_mtu;
+use super::policy_gate::{InnerVerdict, evaluate_wg_inner_ingress};
 use super::sock::wg_send_to;
 use crate::afxdp::wg::counters::WgCounters;
 use std::net::{SocketAddr, UdpSocket};
@@ -66,6 +67,12 @@ pub(super) fn dispatch_inbound(
     outer_ecn: Option<u8>,
     decap_buf: &mut [u8],
     response_buf: &mut [u8],
+    // #5618: the live forwarding snapshot + this tunnel's endpoint id and
+    // a synthetic-frame scratch, so decapped plaintext gets an xpf FORWARD
+    // ZONE-POLICY verdict before it can reach the kernel.
+    forwarding: &ForwardingState,
+    tunnel_endpoint_id: u16,
+    gate_buf: &mut [u8],
     tunnel_name: &str,
     recent_exceptions: &Arc<Mutex<ExceptionEventRing>>,
 ) -> InboundOutcome {
@@ -198,10 +205,75 @@ pub(super) fn dispatch_inbound(
                             return InboundOutcome::Authenticated(outcome.peer_pubkey);
                         }
                     }
+                    // #5618: xpf FORWARD ZONE-POLICY authority over the
+                    // decapped plaintext, BEFORE it can reach the kernel.
+                    // Pre-#5618 this site wrote straight to the TUN and
+                    // the kernel FIB decided everything, so a flow the
+                    // operator's from-zone/to-zone policy DENIES still
+                    // transited — the AllowedIPs gate inside try_decap is
+                    // a cryptographic peer/source-ownership check, not the
+                    // SRX zone-pair authority. `evaluate_wg_inner_ingress`
+                    // resolves the from-zone from the tunnel's LOGICAL
+                    // interface (the same model native GRE decap uses),
+                    // routes the inner destination in that interface's
+                    // routing instance to get the to-zone, and runs
+                    // `evaluate_policy`. A non-permit verdict DROPS here:
+                    // no TUN write, so the kernel never sees the packet.
+                    //
+                    // The datagram still AUTHENTICATED (the peer holds the
+                    // keys), so the return is `Authenticated` and
+                    // endpoint-learning proceeds exactly as for the
+                    // RFC 6040 illegal-ECN drop above — a policy verdict
+                    // on the inner flow says nothing about the outer
+                    // peer's identity.
+                    //
+                    // Counted, not evented: a deny flood would churn the
+                    // bounded exception ring and evict real tunnel
+                    // exceptions, so this follows the existing WG
+                    // drop-by-reason discipline (`decap_drops_*`) and
+                    // surfaces through the counter. The RT_FLOW
+                    // policy-deny record for inner ingress needs the full
+                    // worker re-entry (#5618 residual).
+                    match evaluate_wg_inner_ingress(
+                        forwarding,
+                        tunnel_endpoint_id,
+                        &decap_buf[..outcome.len],
+                        gate_buf,
+                    ) {
+                        InnerVerdict::Permit => {}
+                        InnerVerdict::Deny {
+                            from_zone: _from_zone,
+                            to_zone: _to_zone,
+                        } => {
+                            WgCounters::bump(&engine.counters().inner_policy_denies);
+                            debug_log!(
+                                "WG[{}]: inner policy DENY zone {} -> {}",
+                                tunnel_name,
+                                _from_zone,
+                                _to_zone
+                            );
+                            return InboundOutcome::Authenticated(outcome.peer_pubkey);
+                        }
+                        InnerVerdict::Unadjudicated(_reason) => {
+                            // xpf had no forward authority over this
+                            // packet (unzoned tunnel/egress, host-bound
+                            // destination, unresolvable route, unparseable
+                            // inner). Preserve the S2a kernel delegation
+                            // rather than drop on a zone pair we could not
+                            // compute — but COUNT it, so the residual
+                            // delegation is operator-visible.
+                            WgCounters::bump(&engine.counters().inner_policy_unadjudicated);
+                            debug_log!(
+                                "WG[{}]: inner policy unadjudicated ({})",
+                                tunnel_name,
+                                _reason
+                            );
+                        }
+                    }
                     // Write the plaintext inner IP to the wgN TUN; the
-                    // kernel routes/firewalls it (NOT the AF_XDP policy
-                    // engine — the AllowedIPs gate inside try_decap is
-                    // S2a's inner-src control).
+                    // kernel routes/firewalls it (the xpf zone-pair
+                    // verdict above has already permitted it, or declined
+                    // authority over it).
                     //
                     // #2438: the wgN TUN fd is O_NONBLOCK, so this uses
                     // the single-write whole-packet seam

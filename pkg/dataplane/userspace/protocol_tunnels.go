@@ -178,4 +178,20 @@ type WgTunnelStatus struct {
 	KeepalivesTxPassive               uint64 `json:"keepalives_tx_passive,omitempty"`
 	KeepalivesTxPersistent            uint64 `json:"keepalives_tx_persistent,omitempty"`
 	PendingAbortedAttemptWindow       uint64 `json:"pending_aborted_attempt_window,omitempty"`
+
+	// #5618 inner-ingress zone-policy authority (wire-additive; zero on
+	// helpers predating the gate).
+	//
+	// InnerPolicyDenies counts decapped, authenticated inner packets the
+	// xpf forward zone policy DROPPED before they could reach the wgN TUN
+	// and the kernel FIB. Pre-#5618 every one of these transited.
+	//
+	// InnerPolicyUnadjudicated counts decapped inner packets delivered to
+	// the TUN with NO xpf forward-policy verdict — the residual #1432-S2a
+	// kernel delegation (unzoned tunnel or egress, host-bound inner
+	// destination, unresolvable route, no parseable 5-tuple). A climbing
+	// value means inter-zone authority for that tunnel still rests with
+	// the kernel.
+	InnerPolicyDenies        uint64 `json:"inner_policy_denies,omitempty"`
+	InnerPolicyUnadjudicated uint64 `json:"inner_policy_unadjudicated,omitempty"`
 }

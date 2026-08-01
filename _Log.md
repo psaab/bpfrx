@@ -1,3 +1,62 @@
+## 2026-08-01 — #5618 WireGuard decapped plaintext bypassed xpf forward zone policy
+
+- **Timestamp**: 2026-08-01 (fix/5618-wg-plaintext-zone-authority)
+- **Action**: `wg_control/dispatch.rs` wrote authenticated WireGuard
+  plaintext straight to the `wgN` TUN, where the Linux kernel routed AND
+  firewalled it. The xpf AF_XDP forward zone-policy engine never saw that
+  traffic, so a flow the operator's `from-zone <wg-zone> to-zone <x>`
+  policy DENIES still transited — it re-entered via the kernel FIB. The
+  bypass was one-directional: transit egress (LAN -> `wgN`) already ran
+  the full forward pipeline and WAS adjudicated, so the same rule was
+  enforced outbound and silently unenforced inbound. AllowedIPs is a
+  cryptographic peer/source-ownership gate, not the zone-pair authority.
+  Added `wg_control/policy_gate.rs`: the decapped inner packet is
+  evaluated as ingress on the tunnel's LOGICAL interface (zone + routing
+  instance, the model native GRE decap uses) against the xpf-FIB-resolved
+  egress interface's zone, with the real ICMP type/code carried into
+  `evaluate_policy`; a non-permit verdict DROPS before the TUN write, so
+  the kernel never sees the packet. The control loop now takes a
+  `RuntimeViewReader` and refreshes its `Arc<ForwardingState>` once per
+  iteration, so a burst is never split across two policy generations.
+  Where xpf cannot compute a zone pair (unzoned tunnel or egress,
+  host-bound inner destination, unroutable inner, unparseable inner) the
+  kernel delegation is preserved and COUNTED rather than silent — a
+  `MissingNeighbor` resolution is NOT such a case (it carries the egress
+  ifindex, so a cold ARP/ND entry does not disable the gate). Two new
+  counters (`inner_policy_denies`, `inner_policy_unadjudicated`) plumbed
+  through status -> control wire -> Go, surfaced in
+  `show security wireguard detail` and
+  `xpf_userspace_wg_inner_zone_policy_total{tunnel,verdict}`.
+  PARTIAL: inner ingress still creates no xpf session and runs no
+  NAT/PBR/filter/screen/host-inbound/HA-RG gating, and emits no RT_FLOW
+  policy-deny — that needs the bounded control-thread->worker
+  logical-ingress handoff, so #5618 stays open. #5619 (IPsec/XFRM) is the
+  same class but a DIFFERENT mechanism (the kernel owns decapsulation
+  there; no userspace buffer to gate) and is not covered.
+- **File(s)**:
+  `userspace-dp/src/afxdp/coordinator/wg_control/policy_gate.rs` (new),
+  `userspace-dp/src/afxdp/coordinator/wg_control/policy_gate_tests.rs` (new),
+  `userspace-dp/src/afxdp/coordinator/wg_control/{mod.rs,dispatch.rs,wg_control_tests.rs}`,
+  `userspace-dp/src/afxdp/coordinator/{tunnel_supervision.rs,status.rs,README.md}`,
+  `userspace-dp/src/afxdp/wg/counters.rs`,
+  `userspace-dp/src/protocol/{control.rs,tests.rs}`,
+  `userspace-dp/tests/runtime_view_publish_canary.rs`,
+  `pkg/dataplane/userspace/{protocol_tunnels.go,wg_status_test.go}`,
+  `pkg/dataplane/userspace/format/wireguard.go`,
+  `pkg/api/{metrics.go,metrics_descriptors_wireguard.go,metrics_userspace.go,metrics_wireguard_test.go}`,
+  `docs/wireguard-interop.md`, `docs/userspace-dataplane-gaps.md`
+- **Validation**: `TMPDIR=/tmp CARGO_TARGET_DIR=/dev/shm/cargo-5618 cargo
+  test --release --bins --tests -- --test-threads=1` green (4239 + 60 + 8
+  + 22 + 31 + 1 + 2). Go `build ./...`, `vet`, and
+  `go test ./pkg/api/... ./pkg/dataplane/userspace/...` green.
+  MUTATION PROOF: removing the `return` from the Deny arm (master's
+  fall-through-to-TUN behaviour) leaves `cargo build --release` CLEAN and
+  reds exactly the three enforcement tests as ASSERTION failures — "a
+  zone-policy-DENIED inner packet reached the wgN TUN and would be routed
+  by the kernel — xpf forward authority is bypassed (40 bytes escaped)"
+  — while all nine negative-control/contract tests stay green. Cluster
+  smoke still REQUIRED (this changes the packet path); not run here.
+
 ## 2026-07-31 — #6611 review round 2: guard scoped narrower than its claim
 
 - **Timestamp**: 2026-07-31 (fix/6611-control-channel-auth, PR #6624)

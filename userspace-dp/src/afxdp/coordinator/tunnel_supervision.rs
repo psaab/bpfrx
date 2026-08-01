@@ -834,6 +834,11 @@ impl super::Coordinator {
         let recent_exceptions = self.recent_exceptions.clone();
         let thread_tunnel_name = tunnel_name.clone();
         let thread_per_peer_outer_mtu = per_peer_outer_mtu.clone();
+        // #5618: read-only runtime-view handle, so the control thread can
+        // adjudicate decapped inner plaintext against the LIVE forwarding
+        // + policy snapshot instead of delegating inter-zone authority to
+        // the kernel. Same handle the GRE local-origin threads take.
+        let thread_shared_runtime = self.ha.runtime_reader();
         eprintln!(
             "xpf-userspace-dp: spawning WG control thread endpoint={id} tun={tunnel_name} port={listen_port}"
         );
@@ -847,6 +852,7 @@ impl super::Coordinator {
                     listen_port,
                     outer_mtu,
                     thread_per_peer_outer_mtu,
+                    thread_shared_runtime,
                     recent_exceptions,
                     stop_clone,
                 );

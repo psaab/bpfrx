@@ -596,6 +596,7 @@ type xpfCollector struct {
 	wgKeepalivesSentTotal           *prometheus.Desc
 	wgSessionsExpiredTotal          *prometheus.Desc
 	wgHandshakeAttemptsAbortedTotal *prometheus.Desc
+	wgInnerZonePolicyTotal          *prometheus.Desc
 
 	// #2464: per-collector NetFlow v9 / IPFIX write-health. A flow-export
 	// collector that goes unreachable used to be invisible (every failed
@@ -912,6 +913,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.wgKeepalivesSentTotal
 	ch <- c.wgSessionsExpiredTotal
 	ch <- c.wgHandshakeAttemptsAbortedTotal
+	ch <- c.wgInnerZonePolicyTotal
 	ch <- c.flowExportCollectorWriteAttemptsTotal
 	ch <- c.flowExportCollectorWriteFailuresTotal
 	ch <- c.flowExportCollectorWriteSkippedTotal

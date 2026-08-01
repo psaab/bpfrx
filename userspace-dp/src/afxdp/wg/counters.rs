@@ -181,6 +181,26 @@ pub(crate) struct WgCounters {
     /// responder-only peer has no learned endpoint to send to.
     pub(crate) tun_rx_drops_no_endpoint: AtomicU64,
 
+    // --- #5618 inner-ingress zone-policy authority ---
+    /// Decapped, AUTHENTICATED inner packets DROPPED by the xpf forward
+    /// zone policy (`from-zone <wg-zone> to-zone <routed-egress-zone>`)
+    /// before reaching the `wgN` TUN. Pre-#5618 these transited: the
+    /// plaintext went straight to the kernel FIB, so the tunnel was an
+    /// inter-zone policy bypass. Nonzero here means xpf enforced a
+    /// verdict the kernel path would have missed.
+    pub(crate) inner_policy_denies: AtomicU64,
+    /// Decapped inner packets delivered to the TUN WITHOUT an xpf
+    /// forward-policy verdict — the residual #1432-S2a kernel
+    /// delegation, made countable. Bumped when the tunnel interface is
+    /// unzoned, the inner destination is host-bound (`LocalDelivery` —
+    /// a host-inbound question, not a forward one), the xpf FIB resolves
+    /// no egress interface, that egress interface is unzoned, or the
+    /// inner packet carries no parseable 5-tuple. A steadily climbing
+    /// value means inter-zone authority for this tunnel still rests with
+    /// the kernel; see `docs/wireguard-interop.md` ("Inner-ingress
+    /// zone-policy authority").
+    pub(crate) inner_policy_unadjudicated: AtomicU64,
+
     // --- #1888 S5 timers ---
     /// Encap refused: current session past REJECT_AFTER_TIME (the
     /// per-use T3 gate; arms the rekey edge).

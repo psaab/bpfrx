@@ -889,6 +889,11 @@ pub(crate) struct WgTunnelStatus {
     pub tun_write_errors: u64,
     #[serde(rename = "tun_rx_drops_no_endpoint", default)]
     pub tun_rx_drops_no_endpoint: u64,
+    // --- #5618 inner-ingress zone-policy authority ---
+    #[serde(rename = "inner_policy_denies", default)]
+    pub inner_policy_denies: u64,
+    #[serde(rename = "inner_policy_unadjudicated", default)]
+    pub inner_policy_unadjudicated: u64,
     // --- #1888 S5 timers ---
     #[serde(rename = "encap_drops_expired", default)]
     pub encap_drops_expired: u64,

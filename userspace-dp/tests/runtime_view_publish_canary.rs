@@ -134,6 +134,13 @@ const ALLOWED_READER_LOADS: &[(&str, usize, &str)] = &[
          forwarding half (it does not match generation stamps)",
     ),
     (
+        "src/afxdp/coordinator/wg_control/mod.rs",
+        1,
+        "run_wg_control_loop — seeds the #5618 inner-ingress zone-policy \
+         gate's forwarding half (it does not match generation stamps); the \
+         per-iteration refresh goes through load_forwarding_if_changed",
+    ),
+    (
         "src/afxdp/types/runtime_view.rs",
         1,
         "load_forwarding_if_changed — the #1188 short-circuit for \

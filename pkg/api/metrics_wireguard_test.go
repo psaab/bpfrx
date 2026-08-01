@@ -53,6 +53,9 @@ func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
 			"xpf_userspace_wg_sessions_expired_total", "t", []string{"tunnel"}, nil),
 		wgHandshakeAttemptsAbortedTotal: prometheus.NewDesc(
 			"xpf_userspace_wg_handshake_attempts_aborted_total", "t", []string{"tunnel"}, nil),
+		// #5618: xpf forward zone-policy verdicts over decapped inner plaintext.
+		wgInnerZonePolicyTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_inner_zone_policy_total", "t", []string{"tunnel", "verdict"}, nil),
 	}
 	status := dpuserspace.ProcessStatus{
 		WgTunnels: []dpuserspace.WgTunnelStatus{{
@@ -115,6 +118,12 @@ func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
 			KeepalivesTxPassive:               42,
 			KeepalivesTxPersistent:            43,
 			PendingAbortedAttemptWindow:       44,
+			// #5618 inner-ingress zone-policy authority. The
+			// unadjudicated leg is zero ON PURPOSE: a tunnel whose
+			// traffic is fully adjudicated must still emit the series
+			// so an operator can alert on it becoming nonzero.
+			InnerPolicyDenies:        51,
+			InnerPolicyUnadjudicated: 0,
 		}},
 	}
 
@@ -202,6 +211,8 @@ func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
 		"xpf_userspace_wg_keepalives_sent_total,kind=passive,tunnel=wg0":                            42,
 		"xpf_userspace_wg_keepalives_sent_total,kind=persistent,tunnel=wg0":                         43,
 		"xpf_userspace_wg_handshake_attempts_aborted_total,tunnel=wg0":                              44,
+		"xpf_userspace_wg_inner_zone_policy_total,tunnel=wg0,verdict=deny":                          51,
+		"xpf_userspace_wg_inner_zone_policy_total,tunnel=wg0,verdict=unadjudicated":                 0,
 	}
 	if len(got) != len(want) {
 		t.Errorf("emitted %d series, want %d", len(got), len(want))
@@ -268,6 +279,9 @@ func TestEmitWireguardTelemetryNeverHandshakedGauge(t *testing.T) {
 			"xpf_userspace_wg_sessions_expired_total", "t", []string{"tunnel"}, nil),
 		wgHandshakeAttemptsAbortedTotal: prometheus.NewDesc(
 			"xpf_userspace_wg_handshake_attempts_aborted_total", "t", []string{"tunnel"}, nil),
+		// #5618: xpf forward zone-policy verdicts over decapped inner plaintext.
+		wgInnerZonePolicyTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_inner_zone_policy_total", "t", []string{"tunnel", "verdict"}, nil),
 	}
 	status := dpuserspace.ProcessStatus{
 		// One peer (no session) so the per-peer session_confirmed gauge
@@ -294,9 +308,10 @@ func TestEmitWireguardTelemetryNeverHandshakedGauge(t *testing.T) {
 	// one peer here) + 3 rekey reasons + 2 keepalive-sent kinds +
 	// 1 sessions-expired + 1 attempts-aborted; +2 hs reasons #4094
 	// (under_load_no_mac2 + cookie_reply_budget) + 3 cookie-reply events
-	// #4094 (sent + mac2_ok [PR-A] + consumed [PR-B]) = 51.
-	if count != 51 {
-		t.Errorf("emitted %d series for a zeroed tunnel, want 51 (zeros are real signals)", count)
+	// #4094 (sent + mac2_ok [PR-A] + consumed [PR-B]) = 51; +2 inner
+	// zone-policy verdicts #5618 (deny + unadjudicated) = 53.
+	if count != 53 {
+		t.Errorf("emitted %d series for a zeroed tunnel, want 53 (zeros are real signals)", count)
 	}
 }
 
