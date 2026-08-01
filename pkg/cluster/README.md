@@ -519,13 +519,39 @@ leave `configuration-synchronize` off on a keyed cluster** and manage config
 on both nodes out-of-band, accepting the operational cost. Restore it only
 when #6629 has landed.
 
-*The delete is not a single step.* `configuration-synchronize` is committed
-from the RG0 primary; the secondary is not independently writable, and
-promoting it to run its own commit triggers reconciliation of the newly
-authoritative node's config. So "delete on both nodes, commit" is a
-failover sequence, not two commands — plan it as a maintenance window with
-the same care as the rotation procedure below, or perform it before the
-cluster carries traffic.
+*The delete cannot be done on a running pair without the sync undoing it.*
+`configuration-synchronize` is committed from the RG0 primary. Delete it
+there and the SECONDARY still has it enabled — so the moment that secondary
+is promoted, reconciliation (`daemon_ha.go:444`) sees sync enabled in its
+own local config and pushes its COMPLETE active configuration back to the
+former primary (`daemon_ha_sync.go:462`), restoring the very line you just
+deleted. You cannot simply "delete on both nodes": the second delete
+requires a promotion, and the promotion re-adds the first.
+
+There are two orders that actually work, and neither is a two-command
+sequence:
+
+1. **Before the pair carries traffic** (new build, or a maintenance window
+   you were taking anyway). Provision both nodes from text with
+   `configuration-synchronize` absent and the key already set, so the state
+   is never reached. This is the recommended path, and it is what
+   `cluster-setup.sh` does — it wipes `.configdb` and bootstraps both nodes
+   from the keyed text config.
+
+2. **On a live pair**, sever the sync path before promoting. Drop the
+   session-sync/fabric segment between the nodes (or stop `xpfd` on the
+   node you are about to demote) so the promoted secondary has nobody to
+   push to, delete the line there, then restore connectivity. This is a
+   controlled outage of the control channel, and both nodes are briefly
+   authoritative for their own config — verify both stores agree before
+   restoring the link.
+
+Once BOTH nodes have sync disabled, ongoing config management is manual and
+paired: only the RG0 primary is writable, so every change is a controlled
+RG0 promotion, an edit, verification on both stores, and a failback. That
+cost is the reason #6629 (redaction or transport encryption for the
+config-sync payload) is the real fix, and why this is documented as a
+constraint rather than recommended practice.
 
 ### Rolling it onto a live unkeyed cluster
 
