@@ -1,19 +1,20 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v72 — r70 folds: Codex M1's partition completion
-  (class-2 widened to ANY signature with byte-for-byte missing-map
-  outcomes incl. the error-signature no-ops; class-3 expanded to all
-  hybrids with required pre-error side effects; the AST matrix
-  assigns every exported method to a class), Codex m1's
-  gate-before-first-Start-state-access placement (AddTxPort
-  validation precedence preserved), Codex m2's class-4 corrections
-  (GetPersistentNAT + XDPLinks/TCLinks to the ungated construction
-  set; NewEventSource honors its error signature), Codex m3's
-  exact-schedule residual text + narrowed-not-closed exposure
-  wording, Codex m4's three-site comment-sweep addition; r70
-  verdicts: Codex PLAN-NEEDS-MAJOR (1M/4m — the partition gap),
-  AGY PLAN-READY, Claude SMR PLAN-READY; pending convergence
-  review r71
+- **Status**: DRAFT v73 — r71 folds: Codex M1's class-2
+  synchronization rule (acquire-load before first Start-state
+  access; class-2 joins the blocked-Start overlap), Codex M2's
+  categorized partition (categories L lifecycle / F facade / G
+  ungated-Go-state + the escape-first precedence rule — total and
+  exclusive against the 157-method inventory; the `IsLoaded`
+  double-listing resolved; `Mode()`'s home corrected to
+  `userspace.Manager`), Codex M3's raw-helper nested-call rule
+  (class-3 composition preserves the pinned legacy error texts),
+  Codex m1's residual writer inventory (:534 + the honest
+  raw-`XDPLinks` hazard), Codex m2's `m.mu` comment sweep, SMR
+  r71 m1's attach-family placement with the arming-order
+  invariant; r71 verdicts: Codex PLAN-NEEDS-MAJOR (3M/2m — all in
+  A3's partition), AGY PLAN-READY, Claude SMR
+  PLAN-READY-WITH-NITS (0M/1m); pending convergence review r72
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -3149,7 +3150,13 @@
   all required-side-effect hybrids, the AST matrix made
   the totality net; gate placement, class-4 corrections,
   exact-schedule residual, narrowed-not-closed wording,
-  comment sweep).
+  comment sweep). v73 (r71: class-2 gains its
+  synchronization rule; the partition gains categories
+  L/F/G + the escape-first precedence rule — total and
+  exclusive against the 157-method inventory; the class-3
+  raw-helper nested-call rule; residual writer inventory
+  + the honest XDPLinks hazard; the m.mu comment sweep;
+  the attach-family arming-order invariant).
 
 ---
 
@@ -3519,9 +3526,24 @@ class. The fold:
   the load, sequenced after all map population; `:458`, `:490`,
   `:1082` become Load; Store(false) at `Close()`'s ENTRY (:1206),
   before the link-handle closes).
-- **THE CONTRACT — method-by-method, FOUR classes + the ungated
-  construction set (r69 Codex M1; partition completed at v72 per r70
-  Codex M1 — v71's four classes still missed two real shapes)**:
+- **THE CONTRACT — a TOTAL, EXCLUSIVE partition of the exported
+  `*Manager` surface (r69 Codex M1; completed v72 per r70 Codex M1;
+  categorized v73 per r71 Codex M1/M2/M3 — all three verified against
+  the full 157-method inventory: apply.go 8, compiler.go 1, loader.go
+  26, counters 11, fabric 8, filter 10, flow 2, mirror 2, NAT 30,
+  policy 17, screen 8, session 18, stale 15, stats 1)**. Classification
+  is by the method's START-STATE access, in this precedence order
+  (r71 Codex M2 — the precedence is what makes the classes disjoint):
+  a method that ESCAPES a Start-state reference is class 4; else a
+  method touching Start-state with required pre-error Go-side side
+  effects is class 3; else a method touching Start-state whose pre-arm
+  outcome is master's missing-map outcome is class 2 (any signature);
+  else a method touching Start-state is class 1; methods touching only
+  `m.mu`-protected Go state are category G; lifecycle and facade
+  methods are categories L/F. The §9 matrix test assigns every
+  exported method to exactly one class via a generated AST inventory
+  AND asserts the precedence rule's disjointness — an unassigned,
+  double-assigned, or misclassed method fails the test.
   - **Class 1 — fallible map-required methods, no required pre-gate
     side effects** (e.g. `maps_fabric.go` `UpdateRGActive` :38,
     `UpdateFabricFwd` :30): acquire-load `m.loaded` BEFORE THE FIRST
@@ -3533,61 +3555,98 @@ class. The fold:
     precedence on an unarmed manager). Population sequenced-before the
     release-Store of `loaded=true` gives the happens-before edge: a
     method observing `true` sees a fully-populated `m.maps`; a method
-    during population observes `false` and never touches the map. The
-    /engineer pass makes the gate TOTAL with the enumerate-and-gate
-    audit over the 14 `pkg/dataplane` files (130 `m.maps[` sites).
-  - **Class 2 — neutral-outcome methods, ANY signature** (r70 Codex
-    M1's missing shape — error-signature intentional no-ops): the
-    pre-arm outcome is master's missing-map outcome BYTE-FOR-BYTE,
-    whatever it is: non-error neutrals (`IsLoaded` false :456,
-    `SessionCount` (0,0) `dataplane.go:299`, `GetMapStats` empty
-    :415) AND error-signature no-ops returning nil on the missing-map
-    path today — `ClearSessionCounts` (`maps_screen.go:57-75`,
-    skip-on-absent), `ClearStaticNATEntries` (`maps_nat.go:258-286`),
-    `UpdatePolicyScheduleState` (`maps_policy.go:244-255` — the #3780
-    retired-path deliberate nil so the scheduler self-heal never
-    spins; gating THIS one to the typed error would introduce the
-    spin). No typed error is introduced where master returns nil.
+    during population observes `false` and never touches the map.
+  - **Class 2 — neutral-outcome methods, ANY signature, WITH the
+    synchronization rule (r71 Codex M1 — v72 specified the outcomes
+    but not the synchronization, leaving 22 best-fit class-2 lookups
+    racing Start)**: acquire-load `m.loaded` before the first
+    Start-state access; on `false` return master's missing-map outcome
+    BYTE-FOR-BYTE (`IsLoaded` false — no, `IsLoaded` IS the gate read,
+    category G below; `SessionCount` (0,0) `dataplane.go:299`;
+    `GetMapStats` empty :415; the error-signature no-ops' nil:
+    `ClearSessionCounts` `maps_screen.go:57-75`, `ClearStaticNATEntries`
+    `maps_nat.go:258-286`, `UpdatePolicyScheduleState`
+    `maps_policy.go:244-255` — the #3780 deliberate nil that keeps the
+    scheduler self-heal from spinning). A gated class-2 method performs
+    NO lookup until population is complete, so it needs NO `m.mu`
+    (r71's note: `ClearStaticNATEntries` must not hold `m.mu` across
+    iteration — with the gate it never looks up mid-population, and
+    its post-gate iteration uses the library handle, which is
+    library-safe). Class-2 methods join the §9 blocked-Start overlap
+    test — a nonconcurrent matrix cannot distinguish a correct neutral
+    gate from today's ungated lookup.
   - **Class 3 — hybrids with required pre-error Go-side side
-    effects** (r70-expanded): `ClearNATRuleCounters`
-    (`maps_nat.go:395`), `ClearGlobalCounters`
-    (`maps_counters.go:176`), `ClearNATRuleCounterOffsets`
-    (`maps_nat.go:389`), `ClearZoneCounters` (`maps_counters.go:227`
-    — #3643 offset-first clear with mapless nil success),
-    `ClearAllCounters` (`maps_counters.go:245` — must reset the
-    global offsets BEFORE its later missing-interface error;
-    `manager_counters_test.go:509-565` requires the side effect and
-    tolerates only the later error): UNGATED — the pinned pre-arm
-    behavior IS the contract (`manager_nat_test.go:320`,
-    `zonecounters.go:7-18`). Their `m.maps` lookups move under `m.mu`
-    via SCOPED lookup locking (a `mapsLocked` helper — NOT
-    whole-method locking: the offset-clear helpers take `m.mu`
-    internally and `sync.Mutex` is non-reentrant), and `Start`'s
-    population insert loops (`loader_userspace_shim.go:185-190`) take
-    `m.mu` — closing the lookup-vs-population race without touching
-    the pinned behavior. (`Start` holds no `m.mu` — `apply.go:208` —
-    and the shim loader takes none today, so no deadlock cycle.)
-  - **Class 4 — escaping getters of Start-populated state**:
-    `Map` (:1151), `Program` (:1156), `NewEventSource` (:1161 —
-    returns `(nil, ErrDataplaneNotArmed)`, honoring its
-    `(EventSource, error)` signature; r70 Codex m2): gated; callers
-    use the returned references per-operation (verified: no
-    long-lived `*ebpf.Map` caching), so a post-gate-true reference
-    is fully constructed.
-  - **Ungated construction-time set** (r70 Codex m2 + SMR r69 m2):
+    effects**: `ClearNATRuleCounters` (`maps_nat.go:395`),
+    `ClearGlobalCounters` (`maps_counters.go:176`),
+    `ClearZoneCounters` (`maps_counters.go:227` — #3643),
+    `ClearAllCounters` (`maps_counters.go:245`): UNGATED — the pinned
+    pre-arm behavior IS the contract (`manager_nat_test.go:320`,
+    `manager_counters_test.go:509-565`, `zonecounters.go:7-18`).
+    Their `m.maps` lookups move under `m.mu` via SCOPED lookup locking
+    (lock the lookup, copy the `*ebpf.Map` handle, release BEFORE any
+    BPF iteration/update — verified shape per r71; never whole-method
+    locking: the offset helpers take `m.mu` internally and
+    `sync.Mutex` is non-reentrant), and `Start`'s population insert
+    loops (`loader_userspace_shim.go:185-190` — assignment loops only;
+    collection construction and pinning stay outside) take `m.mu`.
+    **The nested-call rule (r71 Codex M3)**: class-3 hybrids compose
+    through INTERNAL raw helpers, never through the public gated
+    methods — `ClearAllCounters` calls `clearInterfaceCountersRaw`-
+    style internals, so its pinned legacy error text
+    ("interface_counters map not found", tolerated by
+    `manager_counters_test.go:552`) survives instead of being replaced
+    by `ErrDataplaneNotArmed`. Per-method classification cannot catch
+    nested-call composition; the matrix test asserts the raw-helper
+    shape for every class-3 method with internal calls.
+  - **Class 4 — escaping getters of Start-populated state**: `Map`
+    (:1151), `Program` (:1156), `NewEventSource` (:1161 — returns
+    `(nil, ErrDataplaneNotArmed)`, honoring its `(EventSource, error)`
+    signature): gated; callers use the returned references
+    per-operation (verified: no long-lived `*ebpf.Map` caching), so a
+    post-gate-true reference is fully constructed. (Precedence:
+    `Map`/`Program` also match the broad class-2 neutral-nil
+    predicate, and `NewEventSource` matches class 1 — the
+    escape-first precedence rule resolves them to class 4, r71 Codex
+    M2.)
+  - **Category L — lifecycle** (r71 Codex M2's missing category):
+    `Load` (retired sentinel), `LoadUserspaceShim`, `Start`,
+    `CompileUserspaceShim`, `Close`, `Teardown` — the arming/teardown
+    path itself, ungated BY CONSTRUCTION (they define armedness; the
+    attach family `AttachXDP`/`DetachXDP`/`AttachTC`/`DetachTC` is
+    class 1 with the ARMING-ORDER invariant, SMR r71 m1: the arm
+    path's attach runs strictly post-Store(true) — `LoadUserspaceShim`
+    never attaches; the attach flow is CompileUserspaceShim-driven,
+    post-Load — and the §9 matrix's pre-arm `AttachXDP` assertion
+    doubles as the reorder tripwire).
+  - **Category F — facade/domain accessors**: `Link`, `HA`,
+    `Sessions`, `SessionDeltas`, `Telemetry`, `ApplyConfig`,
+    `LastApplyResult`, `LastCompileResult`, `XDPEntryProgram`,
+    `SelectUserspaceXDPShimEntryProgram`,
+    `UsingUserspaceXDPShimEntryProgram` — return construction-time
+    handles/results or drive their own sub-locking; each is verified
+    at /engineer to touch no unsynchronized Start-populated state (any
+    that does is classed by the access rules instead — the matrix
+    enforces).
+  - **Category G — ungated Go-state helpers** (r71 Codex M2's second
+    missing category): the offset readers/setters/clears across
+    `maps_counters.go` / `maps_nat.go:365` / `maps_screen.go:88`
+    (including `IncrementGlobalCounter`) — they touch only
+    `m.mu`-protected Go state, never `m.maps`/`m.programs`; several
+    are readers that legitimately return POPULATED values on an
+    unarmed manager (pinned by `zone_flood_counters_hide_test.go:61`)
+    — that is their contract, preserved. `IsLoaded` is the gate read
+    itself (resolving the v72 double-listing, r71 Codex M2), and
+    `Mode()` lives on `userspace.Manager` (`manager.go:437`), NOT the
+    root Manager — the v72 text's placement is corrected here.
     `GetPersistentNAT` (:1146 — `New()`-allocated at :89-100 with its
-    own `sync.RWMutex`, `persistent_nat.go:51-65`; a pre-Start
-    gRPC test pins it, `server_show_nat_test.go:15-20`), `XDPLinks`/
-    `TCLinks` (:1195/:1199 — `New()`-created and attach-mutated
-    post-arm; their daemon callers are applySem-serialized, the
-    existing discipline — they are NOT in the Start-population race
-    surface), `Mode()` (consumed pre-arm by
-    `userspaceDataplaneActive`), and `IsLoaded` itself.
-  - **Totality mechanism**: the §9 method-matrix test assigns EVERY
-    exported `*Manager` method to exactly one class via a generated
-    AST inventory — an unassigned or misclassed method fails the
-    test. This is the net that catches what v70/v71's prose
-    partitions missed.
+    own `sync.RWMutex`, `persistent_nat.go:51-65`; pre-Start
+    test-pinned at `server_show_nat_test.go:15-20`) and
+    `XDPLinks`/`TCLinks` (:1195/:1199 — `New()`-created,
+    attach-mutated post-arm) are category G/F respectively by their
+    state; the `XDPLinks` raw-map hazard is named honestly (r71 Codex
+    m1): the 1 Hz status path ranges it at `maps_sync.go:943` while
+    Compile can mutate it before taking the userspace `m.mu` —
+    pre-existing, not worsened by PR-1, §10.
 - **`loaded` mechanics**: `atomic.Bool` (:36 declaration; `:164`
   Store(true) — already the LAST step of the load, sequenced after
   all map population; `:458`, `:490`, `:1082` become Load; the
@@ -3780,23 +3839,23 @@ convergence on the seed before any implementation of G/H/H2.
   Codex m2 + SMR m1);
   the §4 A1 deletion inventory (`var _` assertion, userspace wrapper,
   `userspaceStatusProbe`, the unused `errors` import) executed.
-- `pkg/dataplane` (r68 Codex M1; contract at v72 per r69/r70 Codex
-  M1/M2 — work item A3, the armed-state admission gate): `loader.go`
-  `loaded` → `atomic.Bool` (:36, :164, :458, :490, :1082;
-  Store(false) at `Close()` ENTRY :1206); the v72 partition (§4 A1):
-  class-1 fallible map-required methods gate BEFORE THE FIRST
-  Start-state access (pure validation may precede); class-2
-  neutral-outcome methods of ANY signature keep master's missing-map
-  outcome byte-for-byte (incl. the error-signature no-ops
-  `ClearSessionCounts`/`ClearStaticNATEntries`/
-  `UpdatePolicyScheduleState`); class-3 hybrids with required
-  pre-error side effects (`ClearNATRuleCounters`/
-  `ClearGlobalCounters`/`ClearZoneCounters`/`ClearAllCounters` +
-  the offset helpers) stay UNGATED with scoped `m.mu` lookup locking
-  and `Start`'s population loops under `m.mu`; class-4 escaping
-  getters of Start-populated state (`Map`/`Program`/`NewEventSource`)
-  gate; the construction set (`GetPersistentNAT`/`XDPLinks`/
-  `TCLinks`/`Mode()`/`IsLoaded`) stays ungated.
+- `pkg/dataplane` (r68 Codex M1; the v73 categorized partition per
+  r69/r70/r71 Codex M1/M2/M3 — work item A3, the armed-state
+  admission gate): `loader.go` `loaded` → `atomic.Bool` (:36, :164,
+  :458, :490, :1082; Store(false) at `Close()` ENTRY :1206); the
+  total, exclusive partition of all 157 exported methods (§4 A1) by
+  Start-state access with the escape-first precedence rule: class-1
+  fallible map-required (gate before the first Start-state access;
+  pure validation may precede); class-2 neutral-outcome ANY
+  signature WITH the acquire-load rule (class-2 joins the
+  blocked-Start overlap); class-3 required-side-effect hybrids
+  UNGATED with scoped `m.mu` lookup locking, population loops under
+  `m.mu`, and the raw-helper nested-call rule; class-4 escaping
+  getters gated; category L lifecycle (ungated by construction;
+  the attach family is class-1 with the arming-order invariant);
+  category F facade accessors; category G ungated Go-state helpers
+  (offset family, `IsLoaded`; `GetPersistentNAT`; `Mode()`'s home
+  corrected to `userspace.Manager`).
 - FOLLOW-UP unit (G+H+H2) package touches — `daemon_apply_commit.go`,
   `daemon_run.go`/`daemon_run_shutdown.go`, `pkg/configstore`
   (`store_persist.go`, `crypto.go`, `store_commit.go`/`db.go`/`store.go`),
@@ -3958,6 +4017,10 @@ classification snapshot.
   call) — r68 Codex m3 inventory completion.
 - `pkg/dataplane/README.md` (or the loader's doc comment): the armed-state
   admission contract (work item A3) — the four-class pre-arm outcomes.
+- The `m.mu` contract comment at `loader.go:49` (r71 Codex m2):
+  today it names only the offset state; v73 makes `m.mu` also
+  protect `m.maps`/`m.programs` population and the scoped class-3
+  lookups — the comment is updated in the same pass.
 - Stale source comments describing direct `d.dp` access or the
   plain-interface race (r69 Codex m4 + r70 Codex m4 — the census
   subtracts comments, so these need the explicit sweep):
@@ -4060,15 +4123,16 @@ Preserved exactly:
   PR-1; the H2 health-message additions that previously grew this bullet
   are FOLLOW-UP — moved to `followup-seed.md` §6-mirror at v70, r68
   Codex m4), REST simulator fail-closed `ok=false` (#3414).
-- Pre-arm backend calls (work item A3, the v72 partition — §4 A1):
+- Pre-arm backend calls (work item A3, the v73 partition — §4 A1):
   class-1 methods return the typed `ErrDataplaneNotArmed` instead of
   master's "map not found" error or the fatal concurrent-map throw
-  (the ONLY intentional behavior change); class-2 keep master's
-  missing-map outcome byte-for-byte, including the error-signature
-  no-ops' nil; class-3 keep their test-pinned side-effect-plus-
-  success behavior; class-4 return nil (+ the typed error where the
-  signature carries one). Post-arm behavior bit-identical; no
-  signature changes.
+  (the ONLY intentional behavior change; the class-3 raw-helper
+  composition rule keeps even the legacy error TEXTS stable,
+  r71 Codex M3); class-2 keep master's missing-map outcome
+  byte-for-byte via the acquire-load gate; class-3 keep their
+  test-pinned side-effect-plus-success behavior; class-4 return nil
+  (+ the typed error where the signature carries one). Post-arm
+  behavior bit-identical; no signature changes.
 
 ## 7. Hidden invariants the change must preserve
 
@@ -4111,10 +4175,12 @@ Preserved exactly:
     `Close()`'s entry (:1206) gates NEW entrants but cannot drain an
     in-flight operation that already observed true; the pre-existing
     shutdown-window link-map race (`Close`'s :1206-1216 range vs the
-    live userspace path's `AttachXDP` insertion :575 / detach
-    deletion :661, admitted late after the scheduler stop's
-    unbounded applySem acquisition releases,
-    `daemon_scheduler.go:170-183`) stands as a named residual (§10);
+    live userspace path's link-map writers — pinned-link reuse
+    insertion :534, fresh insertion :575, detach deletion :661 —
+    admitted late after the scheduler stop's unbounded applySem
+    acquisition releases, `daemon_scheduler.go:170-183`, a late
+    confirm rollback acquiring with `context.Background()`,
+    `daemon_apply_commit.go:629`) stands as a named residual (§10);
     cilium/ebpf documents close-in-use as unsafe (`map.go:273`).
 13. **#4577 confirm contract (r8/r10/r11/r12/r13/r14/r15)**: an
     unconfirmed config must NEVER stand, and a CONFIRMED config must
@@ -4239,9 +4305,9 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    (r68 Codex M1 — the A3 gate legs) — invoked from `test-go` (r1/r2:
    plain `go test ./...` has no race teeth; full-repo `-race` stays
    out of scope). **[CORE]**
-4a. A3 armed-gate tests (`pkg/dataplane`, r68 Codex M1 / r69 Codex m1 —
-   respecified for determinism): the root `Manager.Start` invokes the
-   retired Load path (`apply.go:208`); real shim population runs
+4a. A3 armed-gate tests (`pkg/dataplane`, r68 Codex M1 / r69 Codex m1 /
+   r71 Codex M1-M3 — respecified): the root `Manager.Start` invokes
+   the retired Load path (`apply.go:208`); real shim population runs
    through the userspace manager + the privileged loader
    (`loader.go:152`, `loader_userspace_shim.go:95`), so the test drives
    a SYNTHETIC per-manager loader seam (test-only var) with FIXED
@@ -4250,14 +4316,17 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    pause-after-write would order the readers and need not trigger
    `-race`: (i) `TestManager_ArmedGate_BlockedStart` — class-1/class-4
    calls during the held window return `ErrDataplaneNotArmed`/nil,
+   class-2 calls return their exact neutral values (r71 Codex M1 —
+   class-2 joins the overlap: a nonconcurrent matrix cannot
+   distinguish a correct neutral gate from today's ungated lookup),
    class-3 calls succeed via the `m.mu` path, no fatal fault; (ii)
    `TestManager_PreArmMethodMatrix` — every exported `*Manager`
-   method is ASSIGNED to exactly one class of the v72 partition by
-   the test's generated AST inventory (an unassigned or misclassed
-   method fails the test — the net that catches what v70/v71's prose
-   partitions missed), and every Start-state-touching method invoked
-   pre-arm returns its CLASS's contract outcome (typed error /
-   neutral / pinned hybrid success / nil per class). **[CORE]**
+   method is ASSIGNED to exactly one v73 class/category by the
+   generated AST inventory, with the precedence rule's DISJOINTNESS
+   asserted (r71 Codex M2) and the class-3 raw-helper composition
+   shape asserted (r71 Codex M3 — `ClearAllCounters` composes through
+   internal raw helpers, preserving its pinned legacy error text).
+   **[CORE]**
 5. Canary tests: redesigned matcher self-tests both directions; new
    `daemon_dp_canary_test.go` asserts no direct `dpCell` access outside the
    accessors. **[CORE]**
@@ -4308,11 +4377,16 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
   acquisition (`daemon_scheduler.go:170-183`) that waits out an
   in-flight apply holder, so the surviving interleaving is
   LATE/ALREADY-NEW admission after the semaphore is released — a
-  fresh attach writing the Go link maps (the live userspace path's
-  `AttachXDP` fresh insertion `loader.go:575` and detach deletion
+  fresh attach writing the Go link maps (pinned-link reuse insertion
+  `loader.go:534` — reachable because userspace Compile ignores
+  pin-removal errors before `CompileUserspaceShim`,
+  `manager_compile.go:168` — fresh insertion `:575`, detach deletion
   `:661`; `:1124` is the TC path the userspace shim does not invoke)
   while `Close` ranges them (:1206-1216); cilium/ebpf documents
-  close-in-use as unsafe (`map.go:273`). Full lifecycle exclusion
+  close-in-use as unsafe (`map.go:273`). The related raw-`XDPLinks`
+  exposure is named honestly (r71 Codex m1): the 1 Hz status path
+  ranges it at `maps_sync.go:943` while Compile can mutate it before
+  taking the userspace `m.mu` — pre-existing, not worsened by PR-1. Full lifecycle exclusion
   (lease/refcount + drain) is a dataplane-lifecycle redesign — a
   follow-up candidate, NOT #2114. PR-1's A3 adoption of the
   `Close()`-entry Store(false) narrows the entrant window but
@@ -4731,23 +4805,18 @@ Still open:
    PLAN-READY when all three verdicts gate the PR-1 design as
    ready.
 
-7. **r68-r70 resolution (for the record)**: Codex r68 M1 (armed-state
-   admission gate) folded as work item A3; Codex r69 M1/M2 falsified
-   v70's universal form (non-error signatures; test-pinned mapless
-   counter-clear contracts; a false cilium/ebpf close premise); Codex
-   r70 M1 falsified v71's four-class partition (error-signature
-   no-ops and required-side-effect hybrids fit no class) — v72
-   carries the completed partition (class-2 = master's missing-map
-   outcome byte-for-byte for ANY signature; class-3 = all hybrids
-   with required pre-error side effects; the AST matrix as the
-   totality net), the gate-before-first-Start-state-access placement,
-   the class-4 corrections, the exact-schedule residual text, and the
-   narrowed-not-closed exposure wording. Each reviewer: verify the
-   v72 partition against the real method set (the class-2 no-ops
-   `maps_screen.go:57`/`maps_nat.go:258`/`maps_policy.go:244`; the
-   class-3 expansion `maps_counters.go:227,245`; the ungated
-   construction set `loader.go:89-100`), and the claim that no
-   pre-existing hazard is worsened while two windows narrow.
+7. **r68-r71 resolution (for the record)**: Codex r68 M1 (armed-state
+   admission gate) folded as work item A3; r69 M1/M2 falsified v70's
+   universal form; r70 M1 falsified v71's four-class partition; r71
+   M1-M3 falsified v72's outcome-only class-2 (no synchronization
+   rule), its incomplete/non-exclusive partition (the 157-method
+   inventory), and its nested-call composition — v73 carries the
+   categorized partition (classes 1-4 + categories L/F/G + the
+   escape-first precedence rule), class-2's acquire-load rule with
+   the blocked-Start overlap, and the class-3 raw-helper composition
+   rule. Each reviewer: verify the v73 partition against the full
+   exported method set, the precedence rule's disjointness, and the
+   raw-helper preservation of the pinned legacy error texts.
 
 ---
 
