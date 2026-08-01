@@ -431,7 +431,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         parsed.protocol == PROTO_GRE && (ctrl.flags & USERSPACE_CTRL_FLAG_NATIVE_GRE) != 0;
 
     let rx_queue_index = unsafe { (*ctx.ctx).rx_queue_index };
-    let selected_queue = select_userspace_queue(ctrl, rx_queue_index, &parsed);
+    let selected_queue = select_userspace_queue(rx_queue_index);
     record_trace(
         ctrl.flags,
         ingress_ifindex,
@@ -442,13 +442,20 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         0,
         &parsed,
     );
-    let binding_idx = ingress_ifindex * BINDING_QUEUES_PER_IFACE + selected_queue;
-    let mut binding = USERSPACE_BINDINGS.get(binding_idx);
-    // Treat zero-flags (unpopulated Array entry) as missing.
-    if binding.map_or(true, |b| b.flags == 0) && selected_queue != rx_queue_index {
-        let fallback_idx = ingress_ifindex * BINDING_QUEUES_PER_IFACE + rx_queue_index;
-        binding = USERSPACE_BINDINGS.get(fallback_idx);
-    }
+    // #5173: the binding index carries the queue in a fixed-width dimension
+    // (`ifindex * BINDING_QUEUES_PER_IFACE + queue`), so a queue id at or above
+    // the stride would address the NEXT ifindex's slots and redirect this
+    // interface's packets into another interface's XSK. The publish side
+    // already refuses such queue ids (#4894); this is the matching read-side
+    // bound, needed because `rx_queue_index` comes from the hardware and is not
+    // clamped by anything now that the queue coordinate is no longer reduced.
+    // Never clamp or modulo it back into range — that is precisely the
+    // mis-steer this fix removes. No binding is the correct answer.
+    let binding = if selected_queue >= BINDING_QUEUES_PER_IFACE {
+        None
+    } else {
+        USERSPACE_BINDINGS.get(ingress_ifindex * BINDING_QUEUES_PER_IFACE + selected_queue)
+    };
     let binding = match binding {
         Some(b) if b.flags != 0 => b,
         _ => {
@@ -1457,28 +1464,34 @@ fn is_ipv6_link_local(ip: [u8; 16]) -> bool {
     ip[0] == 0xfe && (ip[1] & 0xc0) == 0x80
 }
 
-fn select_userspace_queue(
-    ctrl: &UserspaceCtrl,
-    rx_queue_index: u32,
-    _parsed: &ParsedPacket,
-) -> u32 {
-    let queue_count = if ctrl.queue_count == 0 {
-        ctrl.workers
-    } else {
-        ctrl.queue_count
-    };
-    if queue_count <= 1 {
-        return 0;
-    }
-    /*
-     * AF_XDP delivery is queue-bound. XDP may only redirect to a socket bound
-     * to the packet's actual RX queue. Hashing to a different userspace queue
-     * here silently strands packets between redirect intent and ring delivery.
-     *
-     * Keep the XDP handoff on the ingress queue and let userspace do any
-     * higher-level work redistribution after the packet is received.
-     */
-    rx_queue_index % queue_count
+/// #5173: the XSK redirect target is the packet's OWN RX queue, always.
+///
+/// AF_XDP delivery is queue-bound: the kernel's `xsk_rcv_check` drops a
+/// redirect whose target socket is bound to a different (netdev, queue) than
+/// the packet arrived on. So the queue coordinate must not be transformed
+/// between "which queue did this arrive on" and "which XSK do we redirect to".
+///
+/// This used to return `rx_queue_index % queue_count`, where `queue_count` was
+/// the planner's global MINIMUM RX-queue count across interfaces. The comment
+/// that sat here described the invariant above correctly and then the code
+/// broke it: on any box whose interfaces have asymmetric queue counts, a packet
+/// arriving on a queue at or above that minimum was reduced onto a DIFFERENT
+/// queue's socket and silently dropped by the kernel. The raw-queue fallback
+/// meant to catch that only fired when the reduced target was absent, and the
+/// planner created a binding for every queue below the minimum on every
+/// interface — so the reduced target always existed and the fallback was dead
+/// code. RSS restriction did not save it either: it is best-effort, mlx5-only,
+/// and skipped entirely for `workers == 1` and for `workers >= queues`.
+///
+/// The identity is kept as a named function rather than inlined at the call
+/// site so that the invariant, and the reason it is an identity, stay attached
+/// to the queue selection itself. `ctrl.queue_count` is deliberately NOT read:
+/// the planner's aggregate queue count is a userspace work-distribution
+/// concept and has no business changing a packet's queue coordinate. Any
+/// higher-level redistribution belongs in userspace, after delivery.
+#[inline(always)]
+fn select_userspace_queue(rx_queue_index: u32) -> u32 {
+    rx_queue_index
 }
 
 fn parse_l4(

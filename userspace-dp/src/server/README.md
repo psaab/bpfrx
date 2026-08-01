@@ -232,6 +232,50 @@ configuration (#805). On non-mlx5 + `workers > 1 && workers <
 queues`, modulo collision can leave one worker bound to multiple
 queues. See PR #1243's kill record for why i40e doesn't reshape.
 
+### Queue coverage is PER-INTERFACE, not the global minimum (#5173)
+
+`replan_bindings_from_candidates` plans every RX queue each interface
+actually has, capped at `BINDING_QUEUES_PER_IFACE` (the binding array's
+queue stride). It used to plan the cross-product of `min(rx_queues)`
+across all interfaces × all interfaces, which left an interface with more
+queues than the smallest one with **no binding for its higher queues**.
+
+That gap was a silent packet loss, not a capacity limit. AF_XDP delivery
+is queue-bound: the kernel's `xsk_rcv_check` drops a redirect whose target
+socket is bound to a different `(netdev, queue)` than the packet arrived
+on. The shim reduced such a packet's queue coordinate
+(`rx_queue_index % queue_count`) onto a queue that *did* have a binding
+and redirected it there — to a socket bound to a different queue. The
+raw-queue fallback meant to catch this only fired when the reduced target
+was **absent**, and the planner guaranteed it was present, so the fallback
+was dead code. RSS restriction did not save it either: it is best-effort,
+mlx5-only, and skipped for `workers == 1` and `workers >= queues`.
+
+The shim no longer transforms the coordinate at all
+(`select_userspace_queue` is the identity), so every queue an interface
+can deliver on needs its own binding. Two invariants hold this together
+and both are pinned by tests:
+
+- **Never reduce the queue coordinate.** Not a modulo, not a clamp. An
+  out-of-range queue must resolve to *no binding*, never to a different
+  queue's socket. `shim_does_not_transform_the_rx_queue_coordinate`.
+- **Bound-check the queue against the stride on read.** The flat index is
+  `ifindex * BINDING_QUEUES_PER_IFACE + queue`, so a queue id at or above
+  the stride addresses the *next ifindex's* slots — an even worse
+  mis-steer, across interfaces. While the coordinate was reduced this was
+  unreachable; with the real hardware index it is not. The publish side
+  already fail-closes on such ids (#4894);
+  `shim_bound_checks_the_binding_queue_dimension` pins the read side, and
+  `queue_planner_caps_queue_ids_at_the_binding_stride` keeps the planner
+  from emitting ids the manager would have to reject.
+
+Queue-major slot ordering is preserved, so a symmetric configuration
+(every interface the same queue count — the common case) plans a
+byte-identical layout and sees zero binding churn on upgrade;
+`queue_planner_symmetric_config_unchanged_control` pins that. Queues above
+the stride remain a separate, pre-existing limit (#4894) that this change
+neither widens nor trips.
+
 ## Gotchas
 
 - `reconcile_status_bindings` has two arms. When `should_run_afxdp`

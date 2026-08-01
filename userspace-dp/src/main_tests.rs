@@ -1373,8 +1373,20 @@ fn queue_planner_keeps_queue_zero_available_for_userspace() {
     assert!(q1.registered);
 }
 
+/// #5173: every RX queue an interface can actually deliver on gets its own
+/// binding — the planner must NOT reduce to the global minimum queue count.
+///
+/// This test previously asserted the opposite (`queue_planner_uses_smallest_
+/// queue_count`): with a 4-queue and a 2-queue interface it expected 4
+/// bindings, i.e. queues 0-1 on both and nothing for `ge-0-0-1`'s queues 2
+/// and 3. That gap was the defect. The shim reduced a packet arriving on
+/// `ge-0-0-1` queue 2 or 3 (`rx_queue_index % queue_count`) onto queue 0 or 1
+/// and redirected it to the XSK bound there — a socket bound to a DIFFERENT
+/// queue, which the kernel's `xsk_rcv_check` drops. Silent loss on any box
+/// with asymmetric RX-queue counts, which the global-minimum planner
+/// guaranteed whenever one interface had more queues than the smallest.
 #[test]
-fn queue_planner_uses_smallest_queue_count() {
+fn queue_planner_covers_each_interfaces_own_queues() {
     let snapshot = ConfigSnapshot {
         interfaces: vec![
             InterfaceSnapshot {
@@ -1395,17 +1407,83 @@ fn queue_planner_uses_smallest_queue_count() {
         ..Default::default()
     };
     let bindings = replan_queues(Some(&snapshot), 2, &[]);
-    assert_eq!(bindings.len(), 4);
+
+    // The property, stated directly: every (interface, queue) the hardware can
+    // deliver on has a binding, and nothing is planned for a queue that does
+    // not exist.
+    let mut planned: Vec<(String, u32)> = bindings
+        .iter()
+        .map(|b| (b.interface.clone(), b.queue_id))
+        .collect();
+    planned.sort();
+    let mut want: Vec<(String, u32)> = Vec::new();
+    for q in 0..4 {
+        want.push(("ge-0-0-1".to_string(), q));
+    }
+    for q in 0..2 {
+        want.push(("ge-0-0-2".to_string(), q));
+    }
+    want.sort();
+    assert_eq!(
+        planned, want,
+        "every interface's own RX queues must be planned (#5173): the shim no longer reduces a \
+         packet's queue coordinate, so a queue with no binding has nowhere to deliver"
+    );
+
+    // Slots stay unique and dense — the flat binding index depends on it.
+    let mut slots: Vec<u32> = bindings.iter().map(|b| b.slot).collect();
+    slots.sort_unstable();
+    assert_eq!(slots, (0..bindings.len() as u32).collect::<Vec<_>>());
+
     let queues = summarize_queues(&bindings);
-    assert_eq!(queues.len(), 2);
-    for (idx, q) in queues.iter().enumerate() {
-        assert_eq!(q.queue_id, idx as u32);
-        assert_eq!(
-            q.interfaces,
-            vec!["ge-0-0-1".to_string(), "ge-0-0-2".to_string()]
-        );
+    assert_eq!(queues.len(), 4, "queues 0-3 are represented");
+    // Queues 0 and 1 exist on both interfaces; 2 and 3 only on ge-0-0-1.
+    assert_eq!(
+        queues[0].interfaces,
+        vec!["ge-0-0-1".to_string(), "ge-0-0-2".to_string()]
+    );
+    assert_eq!(
+        queues[1].interfaces,
+        vec!["ge-0-0-1".to_string(), "ge-0-0-2".to_string()]
+    );
+    assert_eq!(queues[2].interfaces, vec!["ge-0-0-1".to_string()]);
+    assert_eq!(queues[3].interfaces, vec!["ge-0-0-1".to_string()]);
+    for q in &queues {
         assert!(!q.registered);
     }
+}
+
+/// #5173: the planner must not emit a queue id at or above the binding
+/// array's stride. The flat index is `ifindex * BINDING_QUEUES_PER_IFACE +
+/// queue`, so such an id addresses the NEXT ifindex's slots — the publish
+/// side fail-closes on it (#4894) and the shim bound-checks it on read.
+/// Planning past the stride would only produce bindings the manager must
+/// reject, taking the whole control plane down on a box with a
+/// many-queue NIC. Queues above the cap remain a separate, pre-existing
+/// limit; this fix must not widen it and must not trip it either.
+#[test]
+fn queue_planner_caps_queue_ids_at_the_binding_stride() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "ge-0/0/1".to_string(),
+            linux_name: "ge-0-0-1".to_string(),
+            zone: "trust".to_string(),
+            rx_queues: 64,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let bindings = replan_queues(Some(&snapshot), 4, &[]);
+    assert_eq!(
+        bindings.len(),
+        16,
+        "a 64-queue NIC must plan exactly the 16 queues the binding stride can address"
+    );
+    let max_queue = bindings.iter().map(|b| b.queue_id).max().unwrap();
+    assert!(
+        max_queue < 16,
+        "planned queue id {max_queue} reaches the stride and would alias the next ifindex"
+    );
 }
 
 #[test]
@@ -2382,4 +2460,200 @@ fn tx_latency_hist_binding_counters_snapshot_is_static_send() {
     // different ways.
     fn require_static_send<T: 'static + Send>() {}
     require_static_send::<BindingCountersSnapshot>();
+}
+
+// ---------------------------------------------------------------------------
+// #5173: the shim must not transform a packet's queue coordinate.
+// ---------------------------------------------------------------------------
+//
+// AF_XDP delivery is queue-bound: the kernel's `xsk_rcv_check` drops a redirect
+// whose target socket is bound to a different (netdev, queue) than the packet
+// arrived on. So between "which queue did this arrive on" and "which XSK do we
+// redirect to" the queue coordinate must survive unchanged.
+//
+// SCOPE, stated plainly. The shim is `no_std`, built for
+// `bpfel-unknown-none`, so this crate's tests cannot execute it; these two
+// checks read its SOURCE. A source check can only see what it is written to
+// look for — it cannot prove the compiled object behaves as the text reads.
+// They are deliberately narrow: one asserts a single function is the identity,
+// the other that the binding index is bound-checked rather than reduced. They
+// are NOT a model of the shim's packet path and must not grow into one. The
+// half of this defect that IS executable — that every interface's own queues
+// get a binding — is covered by `queue_planner_covers_each_interfaces_own_queues`
+// against the real planner.
+
+fn shim_source() -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("userspace-xdp")
+        .join("src")
+        .join("lib.rs");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read the AF_XDP shim source at {}: {e}. This guard must not be skipped — a \
+             skip would fail open on exactly the #5173 mis-steer it exists to catch.",
+            path.display()
+        )
+    })
+}
+
+/// Collapse a Rust snippet to a formatting-insensitive token stream so
+/// rustfmt reflow is invisible but any added/removed/altered token is not.
+fn shim_tokens(src: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut chars = src.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_whitespace() {
+            continue;
+        }
+        if c.is_alphanumeric() || c == '_' {
+            let mut w = String::from(c);
+            while let Some(&n) = chars.peek() {
+                if n.is_alphanumeric() || n == '_' {
+                    w.push(n);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            out.push(w);
+        } else {
+            out.push(c.to_string());
+        }
+    }
+    out.join(" ")
+}
+
+/// `select_userspace_queue` must be the identity on the RX queue index.
+///
+/// It used to return `rx_queue_index % queue_count`, reducing the coordinate
+/// onto the planner's global-minimum queue space and redirecting the packet to
+/// a socket bound to a different queue.
+#[test]
+fn shim_does_not_transform_the_rx_queue_coordinate() {
+    let src = shim_source();
+    const SIG: &str = "fn select_userspace_queue(rx_queue_index: u32) -> u32 {";
+    let at = src.find(SIG).unwrap_or_else(|| {
+        panic!(
+            "shim has no `{SIG}` — #5173 requires the XSK redirect target to be the packet's own \
+             RX queue. If the signature changed, re-establish that property by hand and teach \
+             this guard the new shape."
+        )
+    });
+    let open = at + SIG.len() - 1;
+    let bytes = src.as_bytes();
+    let mut depth = 0usize;
+    let mut close = None;
+    for (i, b) in bytes.iter().enumerate().skip(open) {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body = &src[open + 1..close.expect("select_userspace_queue has unbalanced braces")];
+    assert_eq!(
+        shim_tokens(body),
+        "rx_queue_index",
+        "#5173: select_userspace_queue must return the RX queue index UNCHANGED. AF_XDP delivery \
+         is queue-bound — the kernel drops a redirect to a socket bound to a different queue than \
+         the packet arrived on, so any transform here (a modulo onto the planner's queue count, a \
+         clamp, a hash) silently strands packets between redirect intent and ring delivery. Body \
+         was: {:?}",
+        shim_tokens(body)
+    );
+}
+
+/// The binding lookup must BOUND-CHECK the queue against the array stride,
+/// never reduce it back into range.
+///
+/// The flat index is `ifindex * BINDING_QUEUES_PER_IFACE + queue`, so a queue
+/// id at or above the stride addresses the next ifindex's slots. While the
+/// coordinate was reduced by a modulo this could not happen; now that the real
+/// hardware queue index is used, the read side needs its own bound — and the
+/// answer for an out-of-range queue must be "no binding", not a reduction,
+/// which would reintroduce the mis-steer across interfaces instead of within
+/// one.
+#[test]
+fn shim_bound_checks_the_binding_queue_dimension() {
+    let src = shim_source();
+    let at = src
+        .find("let binding = if selected_queue >= BINDING_QUEUES_PER_IFACE {")
+        .unwrap_or_else(|| {
+            panic!(
+                "the shim's binding lookup no longer bound-checks the queue against \
+                 BINDING_QUEUES_PER_IFACE (#5173/#4894). Without it a packet on a queue at or \
+                 above the stride reads the ADJACENT ifindex's binding and is redirected into \
+                 another interface's XSK."
+            )
+        });
+    let window = &src[at..src.len().min(at + 400)];
+    assert!(
+        shim_tokens(window).contains("None"),
+        "the out-of-stride branch must yield NO binding; reducing or clamping the queue back into \
+         range is the #5173 mis-steer in another form. Window: {window}"
+    );
+    assert!(
+        !shim_tokens(window).contains("selected_queue % ")
+            && !shim_tokens(window).contains("rx_queue_index % "),
+        "the binding lookup reduces the queue coordinate with a modulo (#5173). Window: {window}"
+    );
+}
+
+/// NEGATIVE CONTROL for the #5173 mutation proof, and the zero-churn claim.
+///
+/// When every interface has the SAME RX-queue count, per-interface planning and
+/// the old global-minimum cross-product produce byte-for-byte the same layout —
+/// same slots, same queue ids, same interface order. So this test is true in
+/// both worlds: it must stay green under every #5173 mutation, and a red here
+/// means the harness or the planner's common path broke, not that the fix
+/// regressed. It also pins the upgrade property the planner comment claims:
+/// the symmetric configuration (the overwhelmingly common one) sees no
+/// binding churn.
+#[test]
+fn queue_planner_symmetric_config_unchanged_control() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "ge-0/0/1".to_string(),
+                linux_name: "ge-0-0-1".to_string(),
+                zone: "trust".to_string(),
+                rx_queues: 3,
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "ge-0/0/2".to_string(),
+                linux_name: "ge-0-0-2".to_string(),
+                zone: "untrust".to_string(),
+                rx_queues: 3,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let bindings = replan_queues(Some(&snapshot), 2, &[]);
+    let got: Vec<(u32, u32, String)> = bindings
+        .iter()
+        .map(|b| (b.slot, b.queue_id, b.interface.clone()))
+        .collect();
+    let want: Vec<(u32, u32, String)> = vec![
+        (0, 0, "ge-0-0-1".to_string()),
+        (1, 0, "ge-0-0-2".to_string()),
+        (2, 1, "ge-0-0-1".to_string()),
+        (3, 1, "ge-0-0-2".to_string()),
+        (4, 2, "ge-0-0-1".to_string()),
+        (5, 2, "ge-0-0-2".to_string()),
+    ];
+    assert_eq!(
+        got, want,
+        "symmetric queue counts must plan the identical queue-major cross-product before and \
+         after #5173 — this is the zero-churn property, and this test is the mutation proof's \
+         negative control"
+    );
 }

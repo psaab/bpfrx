@@ -1,3 +1,66 @@
+## 2026-08-01 — #5173 shim queue mis-steer: never transform the queue coordinate
+
+- **Timestamp**: 2026-08-01 (fix/5173-shim-queue-mis-steer)
+- **Action**: Fixed the AF_XDP queue mis-steer. `select_userspace_queue`
+  returned `rx_queue_index % queue_count`, where `queue_count` was the
+  planner's global MINIMUM RX-queue count across interfaces. AF_XDP
+  delivery is queue-bound — the kernel's `xsk_rcv_check` drops a redirect
+  whose target socket is bound to a different (netdev, queue) than the
+  packet arrived on — so a packet arriving on a queue at or above that
+  minimum was reduced onto a different queue's socket and silently
+  dropped. The raw-queue fallback meant to catch this only fired when the
+  reduced target was ABSENT, and the planner created a binding for every
+  queue below the minimum on every interface, so the reduced target always
+  existed and the fallback was dead code.
+
+  The comment above the defect stated the invariant the code then broke
+  ("Keep the XDP handoff on the ingress queue"), which is presumably how
+  it survived. It now describes what the code does.
+
+  Two halves. The shim stops transforming the coordinate:
+  `select_userspace_queue` is the identity, and `ctrl.queue_count` is no
+  longer read at all — the planner's aggregate queue count is a userspace
+  work-distribution concept with no business changing a packet's queue.
+  The planner plans each interface's OWN queues instead of the global
+  minimum, so every queue an interface can deliver on has a binding.
+
+  A hazard the naive fix would have introduced, caught before writing it:
+  the flat binding index is `ifindex * BINDING_QUEUES_PER_IFACE + queue`,
+  and the modulo was the ONLY thing keeping that in range. Removing it
+  would let a packet on RX queue 20 read the NEXT ifindex's slot and be
+  redirected into another interface's XSK — strictly worse than the bug
+  being fixed. There was no read-side stride guard in the shim (the
+  existing dead fallback used the raw index unguarded). Added the bound
+  check; an out-of-stride queue resolves to NO binding, never a reduction.
+  The planner is capped at the same stride so it cannot emit ids the
+  manager must reject (#4894) and take the control plane down on a
+  many-queue NIC.
+
+  Verifier cost, measured early as instructed: the fix REDUCES it, because
+  it deletes the modulo, the queue_count branch and the whole fallback
+  lookup — 990,796 insns (origin/master, 0.92% headroom) to 797,849
+  (20.2%). The concern about a per-interface keyed lookup being expensive
+  was inverted; the lookup was already keyed by (ifindex, queue), only the
+  queue coordinate was being reduced first.
+
+  Queue-major slot ordering is preserved, so a symmetric configuration
+  plans a byte-identical layout and sees zero binding churn on upgrade.
+  `queue_planner_uses_smallest_queue_count` encoded the defect as expected
+  behaviour (4 bindings for a 4-queue + 2-queue pair) and was rewritten as
+  `queue_planner_covers_each_interfaces_own_queues`.
+
+  Validation: `make generate` verifier PASS. Four-row mutation matrix,
+  build CLEAN (exit 0) in every row so every red is an assertion:
+  restoring the modulo reds the identity guard, dropping the stride check
+  reds the bound guard, reverting the planner to min() reds the coverage
+  guard, and the negative control (symmetric config unchanged) is green in
+  all four.
+- **File(s)**: userspace-xdp/src/lib.rs,
+  userspace-dp/src/server/helpers/planning.rs,
+  userspace-dp/src/main_tests.rs, userspace-dp/src/server/README.md,
+  pkg/dataplane/userspace_xdp_bpfel.o,
+  pkg/dataplane/userspace_xdp_manifest.json, _Log.md
+
 ## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
 
 - **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
