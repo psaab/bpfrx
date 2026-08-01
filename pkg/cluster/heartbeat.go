@@ -827,18 +827,32 @@ type heartbeatAuthState struct {
 //     genuine peer actually signed, so replaying a captured high-epoch frame
 //     cannot push the floor above the live peer and lock it out.
 //
-// An epoch the floor cannot ORDER (epochOrderable: outside the absolute
-// plausibility band, or more than bootEpochMaxSkew ahead of our own clock) is
-// REFUSED. It is tested before anything else in the hasEpoch path, so such a
+// An epoch outside the ABSOLUTE plausibility band (epochUsableAsFloor: zero, or
+// beyond year 2200) is REFUSED. That check is clock-independent, so it is safe
+// on every frame and runs before anything else in the hasEpoch path: such a
 // frame never reaches the floor comparison, never touches the ring, and never
 // arms the latch — s.epochSeen stays false. A corrupt far-future value
 // therefore cannot slam the one-way door.
 //
+// The FORWARD bound (epochWithinForwardBound: more than bootEpochMaxSkew — one
+// HOUR — ahead of our own wall clock) is deliberately NOT tested here. It gates
+// only the RAISE path, epoch > highEpoch, where latching a far-future floor is
+// the actual hazard.
+//
+// DO NOT HOIST THE FORWARD BOUND BACK TO THE TOP. Re-testing an epoch that has
+// ALREADY been accepted is a different thing from vetting a new one, and doing
+// it was a defect: a backward wall-clock step beyond the skew made every
+// subsequent frame from a healthy, already-latched incarnation fail the bound
+// and be rejected BEFORE the monotonic lastSeen update, so the peer was
+// declared dead in ~500ms and the cluster went dual-master. At epoch ==
+// highEpoch the frame therefore falls through to the ring, which is correct:
+// equality cannot move the floor, so the one-way door is untouched either way.
+//
 // The second-order consequence is the safe direction and is deliberate: a peer
-// whose clock runs more than a year ahead is refused outright, and because the
-// latch never armed on it, its EPOCHLESS frames would still be accepted if it
-// were later rolled back. Refusing an unorderable epoch never strands a peer
-// that comes back into range.
+// whose clock runs more than an hour ahead cannot RAISE the floor, and because
+// the latch never armed on it, its EPOCHLESS frames would still be accepted if
+// it were later rolled back. Refusing to latch an out-of-bound epoch never
+// strands a peer that comes back into range.
 func (s *heartbeatAuthState) admitAuthed(hasEpoch bool, epoch, session, counter uint64) bool {
 	return s.admitAuthedLocked(hasEpoch, epoch, session, counter)
 }

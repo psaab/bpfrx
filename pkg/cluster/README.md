@@ -433,13 +433,31 @@ peer liveness (`lastSeen`) or drive election.
     single-fault path: a peer whose clock or persisted state runs far ahead, yet
     still lands before 2200, would latch a floor its own corrected incarnations
     can never climb back above. So an epoch may also be at most
-    `bootEpochMaxSkew` (one year, ~3.15e16 ns — four orders below the gap to
-    `MaxUint64`) ahead of the RECEIVER's wall clock. Bounding the forward side
+    `bootEpochMaxSkew` (one HOUR, 3.6e12 ns) ahead of the RECEIVER's wall
+    clock. The slack IS the worst-case lockout — a bad epoch inside the bound
+    is latched, and a repaired peer sits below that floor until its own
+    wall-clock seed climbs past it — so an hour is deliberate: a year of slack
+    bought nothing over it (the bound only has to exceed real inter-node skew,
+    milliseconds under NTP and minutes without it) and cost a year-long
+    lockout. Bounding the forward side
     stops the **latch**, which is the unrecoverable half, so a peer that is
     corrected is accepted again the moment it comes back into range.
     `refineBootEpoch` applies the same bound to the value it chains from, and the
     floor store applies it on LOAD, so a node — or a floor — written under a bad
     clock heals instead of being stranded.
+
+    The forward bound gates the RAISE path only (`epoch > highEpoch`), never
+    `epoch == highEpoch`. Re-testing an epoch that has ALREADY been accepted is
+    a different question from vetting a new one, and conflating them was a
+    defect: a backward wall-clock step beyond the skew made every subsequent
+    frame from a healthy, already-latched incarnation fail the bound and be
+    rejected BEFORE the monotonic `lastSeen` update, so the peer was declared
+    dead in ~500ms and the cluster went dual-master. The relaxation has a
+    price and it is worth naming: when the floor already sits beyond the bound,
+    an equal-epoch frame now reaches `heartbeatAuthReplay.admit` and costs one
+    ascending archive pass. That is the whole cost — equality cannot move the
+    floor, so the one-way door is untouched.
+
     The forward bound is applied ONLY when the receiver's own clock is itself
     credible (`epochClockSaneFloor`, year 2020). An appliance with a dead RTC
     boots near the Unix epoch and syncs NTP seconds later; during that window a
