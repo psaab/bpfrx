@@ -732,7 +732,25 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 				for _, m := range matchNode.Children {
 					switch m.Name() {
 					case "destination-address":
-						rule.Match = nodeVal(m)
+						// #6659: read EVERY value, not just the first. The
+						// schema declares this leaf `multi: true`, so a bracket
+						// list collapses onto m.Keys[1:] (flat-set) or
+						// m.Children (hierarchical) exactly like the
+						// source-address sibling below. nodeVal kept only the
+						// first prefix, and the dropped ones ALSO escaped
+						// ValidateIPPrefix — a malformed prefix in any slot but
+						// the first committed clean.
+						//
+						// Match keeps the first element (unchanged dataplane
+						// lowering: StaticNATRuleSnapshot.ExternalIP is a single
+						// address). A genuinely multi-valued list is REJECTED at
+						// strict commit by
+						// validateStaticNATMatchAddressesStrict rather than
+						// silently collapsing — see MatchAddresses.
+						rule.MatchAddresses = append(rule.MatchAddresses, firewallMatchValues(m)...)
+						if len(rule.MatchAddresses) > 0 {
+							rule.Match = rule.MatchAddresses[0]
+						}
 					case "source-address":
 						// #3435 (M02): support bracket / repeated lists
 						// (`source-address [ a b c ]`) — the schema declares

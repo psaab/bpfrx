@@ -918,6 +918,20 @@ type DeterministicNATConfig struct {
 type StaticNATRule struct {
 	Name  string
 	Match string // destination-address (external/public IP)
+	// MatchAddresses is the FULL `match destination-address` list as authored
+	// (#6659). The compiler previously read this leaf with nodeVal, so a
+	// bracket / block list silently kept only the first prefix — and, worse,
+	// the dropped values never reached ValidateIPPrefix, so a MALFORMED prefix
+	// in any slot but the first committed clean (a validation fail-open).
+	//
+	// Match still carries the first element and is what the dataplane snapshot
+	// lowers to (ExternalIP is a single address in the Rust static_nat table),
+	// so a rule with more than one prefix has no representable meaning today.
+	// validateStaticNATMatchAddressesStrict therefore REJECTS a multi-valued
+	// list at commit rather than letting it silently collapse to the first.
+	// Widening static NAT to fan one rule into N external prefixes is a
+	// separate semantic change (see the #6659 follow-up), not this fix.
+	MatchAddresses []string
 	// SourceAddress is the FIRST configured `match source-address` value,
 	// retained for back-compat (e.g. "::/0" for NAT64). Prefer
 	// SourceAddresses for the full bracket/repeated list — SourceAddress

@@ -132,6 +132,28 @@ func runUniformGatesLogFeedRouting(tree *ConfigTree, cfg *Config, opts compileOp
 		}
 	}
 
+	// #6659: a multi-policy `routing-options forwarding-table export` chain.
+	// The leaf is declared `multi: true` and Junos accepts a chain, but the FRR
+	// renderer honours exactly one policy (resolveECMP derives ecmpMaxPaths from
+	// a single policy-statement). The compiler read the leaf with nodeVal, so a
+	// chain silently collapsed to the first policy AND the dropped names escaped
+	// the reference gate directly above — a dangling policy in slot 2 committed
+	// clean on the very scenario that gate exists to catch. The compiler now
+	// accumulates all values (so the gate above checks every one) and this gate
+	// rejects the multi-valued case so the collapse is loud instead of silent.
+	// Strict on commit / commit-check; lenient on load / peer-sync (warn —
+	// #1960; ForwardingTableExport still carries the first policy, so rendering
+	// on the tolerant path is exactly pre-#6659). Reuses lenientRoutingExportRef
+	// like the sibling gate above.
+	if err := validateForwardingTableExportSingleStrict(cfg); err != nil {
+		if opts.lenientRoutingExportRef {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("forwarding-table export chain (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #2881: policy community cross-reference gate. A policy term's
 	// `from community <name>` (rendered `match community <name>`) and
 	// `then community delete <name>` (rendered `set comm-list <name> delete`,

@@ -196,15 +196,64 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 	// forwarding-table export → resolveECMP (config_render.go). Renders
 	// directly as an ECMP policy lookup, so it must be a defined
 	// policy-statement; a missing one silently disables ECMP/consistent-hash.
-	if err := checkPolicyRef(
-		"routing-options forwarding-table export",
-		cfg.RoutingOptions.ForwardingTableExport,
-		hintExport,
-	); err != nil {
-		return fmt.Errorf("%s (the expected ECMP / consistent-hash "+
-			"load-balancing would be silently disabled)", err)
+	//
+	// #6659: check EVERY authored policy, not just the first. This gate used to
+	// read the scalar ForwardingTableExport, which the compiler filled with
+	// nodeVal — so `export [ p1 p2 ]` validated only p1 and a DANGLING p2
+	// committed clean, defeating the gate on exactly the silent-ECMP-loss
+	// scenario its own error text describes. Fall back to the scalar when the
+	// list is empty so a typed config produced by an older binary (peer sync /
+	// a restored DB) is still checked.
+	refs := cfg.RoutingOptions.ForwardingTableExports
+	if len(refs) == 0 && cfg.RoutingOptions.ForwardingTableExport != "" {
+		refs = []string{cfg.RoutingOptions.ForwardingTableExport}
+	}
+	for _, ref := range refs {
+		if err := checkPolicyRef(
+			"routing-options forwarding-table export",
+			ref,
+			hintExport,
+		); err != nil {
+			return fmt.Errorf("%s (the expected ECMP / consistent-hash "+
+				"load-balancing would be silently disabled)", err)
+		}
 	}
 
+	return nil
+}
+
+// validateForwardingTableExportSingleStrict (#6659) hard-rejects a
+// `routing-options forwarding-table export` list carrying MORE THAN ONE policy.
+//
+// Junos accepts an export policy CHAIN here and the schema declares the leaf
+// `multi: true`, but the FRR renderer honours exactly ONE: resolveECMP
+// (frr/config_render.go) looks up a single policy-statement to derive
+// ecmpMaxPaths. Before #6659 the compiler read the leaf with nodeVal, so a
+// multi-policy chain silently collapsed to the first — the operator's remaining
+// policies had no effect on load-balancing and nothing said so.
+//
+// Rejecting makes that collapse loud and fails CLOSED. It is deliberately NOT a
+// renderer change: implementing a real policy chain means deciding how several
+// policies compose into one ecmpMaxPaths, which is a routing-semantics design
+// question rather than a multi-value-read fix. Tracked as the #6659 follow-up.
+//
+// Strict on commit / commit-check (hard reject); the call site downgrades to a
+// warning on the tolerant load / peer-sync path (#1960 no-brick), where
+// ForwardingTableExport still carries the first policy so rendering is exactly
+// pre-#6659.
+func validateForwardingTableExportSingleStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	if n := len(cfg.RoutingOptions.ForwardingTableExports); n > 1 {
+		return fmt.Errorf(
+			"routing-options forwarding-table export declares %d policies (%v); "+
+				"the forwarding-table export renders as a SINGLE ECMP policy "+
+				"lookup, so only %q would take effect and the rest would be "+
+				"silently ignored — configure one export policy (#6659)",
+			n, cfg.RoutingOptions.ForwardingTableExports,
+			cfg.RoutingOptions.ForwardingTableExports[0])
+	}
 	return nil
 }
 

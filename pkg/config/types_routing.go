@@ -139,7 +139,23 @@ type RoutingOptionsConfig struct {
 	StaticRoutes              []*StaticRoute
 	Inet6StaticRoutes         []*StaticRoute // rib inet6.0 static routes
 	GenerateRoutes            []*GenerateRoute
-	ForwardingTableExport     string // forwarding-table { export <policy>; }
+	ForwardingTableExport     string // forwarding-table { export <policy>; } — FIRST value only; see ForwardingTableExports
+	// ForwardingTableExports is the FULL `forwarding-table export` list as
+	// authored (#6659). The leaf is declared `multi: true`, but the compiler
+	// read it with nodeVal and kept only the first policy — so a second policy
+	// was neither rendered NOR reference-checked, and a DANGLING reference in
+	// any slot but the first committed clean, defeating the very gate
+	// (validatePolicyReferencesStrict) whose error text warns that "the
+	// expected ECMP / consistent-hash load-balancing would be silently
+	// disabled".
+	//
+	// ForwardingTableExport keeps the first element and remains what the FRR
+	// renderer consumes (resolveECMP derives ecmpMaxPaths from exactly one
+	// policy-statement). validateForwardingTableExportSingleStrict rejects a
+	// multi-valued list rather than letting it silently collapse. Honouring a
+	// full Junos export policy CHAIN is a separate renderer change, not this
+	// fix.
+	ForwardingTableExports []string
 	AutonomousSystem          uint32 // autonomous-system <number>
 	RibGroups                 map[string]*RibGroup
 	InterfaceRoutesRibGroup   string // global interface-routes { rib-group inet <name>; }

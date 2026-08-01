@@ -141,6 +141,26 @@ func runUniformGatesFirewallNAT2(tree *ConfigTree, cfg *Config, opts compileOpts
 		}
 	}
 
+	// #6659: a static-NAT `match destination-address` list. The leaf is
+	// declared `multi: true`, but the compiler read it with nodeVal and kept
+	// only the first prefix — so the remaining prefixes were neither translated
+	// NOR validated (a malformed prefix in any slot but the first committed
+	// clean). The compiler now accumulates every value; this gate rejects the
+	// multi-valued case because a static-NAT rule lowers to exactly ONE
+	// dataplane row. Strict on commit / commit-check (hard reject so the
+	// previously-silent collapse is operator-visible); lenient on load /
+	// peer-sync (warn — #1960 no-brick; Match still carries the first prefix, so
+	// the tolerant path behaves exactly as it did pre-#6659). Reuses
+	// lenientFirewallRefs like the sibling static-NAT gates above.
+	if err := validateStaticNATMatchAddressesStrict(cfg); err != nil {
+		if opts.lenientFirewallRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("static NAT match destination-address list (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #5628 (codex-review-181 M16): a source / destination NAT rule's complete
 	// `then` block must carry EXACTLY ONE NAT-terminal translation action. A
 	// rule with ZERO actions installs no translation (an intended `off`

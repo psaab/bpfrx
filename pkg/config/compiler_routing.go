@@ -17,9 +17,19 @@ func compileRoutingOptions(node *Node, ro *RoutingOptionsConfig) error {
 	}
 
 	// Parse forwarding-table { export <policy>; }
+	//
+	// #6659: read EVERY value. The leaf is declared `multi: true`, so
+	// `export [ p1 p2 ]` collapses onto Keys[1:] and `export { p1; p2; }` onto
+	// Children; nodeVal kept only the first, which meant the second policy was
+	// neither rendered NOR reference-checked — a dangling reference in slot 2
+	// committed clean. ForwardingTableExport keeps the first element so the FRR
+	// renderer is unchanged; the strict gate rejects a multi-valued list.
 	if ftNode := node.FindChild("forwarding-table"); ftNode != nil {
-		if expNode := ftNode.FindChild("export"); expNode != nil {
-			ro.ForwardingTableExport = nodeVal(expNode)
+		for _, expNode := range ftNode.FindChildren("export") {
+			ro.ForwardingTableExports = append(ro.ForwardingTableExports, firewallMatchValues(expNode)...)
+		}
+		if len(ro.ForwardingTableExports) > 0 {
+			ro.ForwardingTableExport = ro.ForwardingTableExports[0]
 		}
 	}
 

@@ -1753,6 +1753,83 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 	return nil
 }
 
+// eventAttributesMatchExprs extracts every `attributes-match` expression an
+// event-policy match node carries, across BOTH parser AST shapes (#6659 — the
+// event-options instance of the #2419 dual-shape class).
+//
+// The UNIT here is a whole EXPRESSION (`<event>.<attribute> matches <value>`),
+// not a token, so firewallMatchValues is the WRONG reader: it would split one
+// constraint into three bogus ones. The two shapes:
+//
+//   - block / flat-set  `attributes-match { e.owner matches Comcast; }`
+//     (and `set ... attributes-match e.owner matches Comcast`)
+//     → one CHILD per expression, its Keys carrying the tokens. Joining each
+//     child's Keys yields the expression. This shape already worked.
+//   - packed leaf       `attributes-match e.owner matches Comcast;`
+//     → NO children; the whole expression rides on the node's own Keys after
+//     the keyword. Reading only Children compiled ZERO constraints.
+//
+// Dropping the constraints is a FAIL-OPEN: an event policy with no
+// attributes-match fires on every occurrence of the event rather than the
+// narrower set the operator wrote. It also bypassed
+// validateEventAttributesMatch — a packed-leaf expression naming an unknown
+// field committed clean because the compiler never produced it.
+func eventAttributesMatchExprs(child *Node) []string {
+	var exprs []string
+	// Packed leaf: the tail tokens form exactly ONE expression.
+	if len(child.Keys) > 1 {
+		if expr := strings.TrimSpace(strings.Join(child.Keys[1:], " ")); expr != "" {
+			exprs = append(exprs, expr)
+		}
+	}
+	// Block / flat-set: one expression per child.
+	for _, amChild := range child.Children {
+		if expr := strings.TrimSpace(strings.Join(amChild.Keys, " ")); expr != "" {
+			exprs = append(exprs, expr)
+		}
+	}
+	return exprs
+}
+
+// eventChangeConfigCommands extracts every `then change-configuration commands`
+// entry, across BOTH parser AST shapes (#6659).
+//
+// The token boundary differs from eventAttributesMatchExprs above, which is why
+// they are separate readers rather than one shared helper — verified against the
+// actual parsed ASTs:
+//
+//   - CHILD form   `commands { "set system host-name foo"; "delete ..."; }`
+//     → one child per command. A QUOTED command lexes to a single Key; an
+//     UNQUOTED one (`set system host-name foo;`) lexes to Keys=["set","system",
+//     "host-name","foo"], so the child's Keys must be JOINED. The pre-#6659
+//     reader took child.Name() (Keys[0]) and truncated an unquoted command to
+//     its first word — `set` — which is not a command at all.
+//   - PACKED form  `commands "set system host-name foo";` → Keys=["commands",
+//     "<cmd>"], and `commands [ "cmd1" "cmd2" ]` → Keys=["commands","cmd1",
+//     "cmd2"]. Here each TAIL TOKEN is one complete command (a quoted string is
+//     one token), so the tail is read per-token, NOT joined. Reading only
+//     Children compiled zero remediation commands.
+//
+// A child boundary and a tail-token boundary are different things, so the two
+// rules do not conflict.
+func eventChangeConfigCommands(cmdsNode *Node) []string {
+	var cmds []string
+	// Packed: each trailing token is one complete (quoted) command.
+	for _, k := range cmdsNode.Keys[1:] {
+		if c := strings.TrimSpace(k); c != "" {
+			cmds = append(cmds, c)
+		}
+	}
+	// Block: each child is one command; join its Keys so an unquoted command
+	// survives whole instead of truncating to its first word.
+	for _, cmdChild := range cmdsNode.Children {
+		if c := strings.TrimSpace(strings.Join(cmdChild.Keys, " ")); c != "" {
+			cmds = append(cmds, c)
+		}
+	}
+	return cmds
+}
+
 func compileEventOptions(node *Node, policies *[]*EventPolicy) error {
 	// #4423 L1: two same-named policy stanzas must MERGE into one policy, not
 	// coexist as duplicates. Flat-set / display-set config already merges (the
@@ -1826,17 +1903,11 @@ func compileEventOptions(node *Node, policies *[]*EventPolicy) error {
 				}
 				ep.WithinClauses = append(ep.WithinClauses, w)
 			case "attributes-match":
-				// Each child is a match line like "ping_test_failed.test-owner matches Comcast"
-				for _, amChild := range child.Children {
-					// Reconstruct the match expression from keys
-					ep.AttributesMatch = append(ep.AttributesMatch, strings.Join(amChild.Keys, " "))
-				}
+				ep.AttributesMatch = append(ep.AttributesMatch, eventAttributesMatchExprs(child)...)
 			case "then":
 				if ccNode := child.FindChild("change-configuration"); ccNode != nil {
 					if cmdsNode := ccNode.FindChild("commands"); cmdsNode != nil {
-						for _, cmdChild := range cmdsNode.Children {
-							ep.ThenCommands = append(ep.ThenCommands, cmdChild.Name())
-						}
+						ep.ThenCommands = append(ep.ThenCommands, eventChangeConfigCommands(cmdsNode)...)
 					}
 				}
 			}

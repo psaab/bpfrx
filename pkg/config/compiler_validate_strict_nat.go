@@ -2140,6 +2140,59 @@ func validateStaticNATInetTargetStrict(cfg *Config) error {
 	return nil
 }
 
+// validateStaticNATMatchAddressesStrict (#6659) hard-rejects a static-NAT rule
+// whose `match destination-address` carries MORE THAN ONE prefix.
+//
+// Before #6659 the compiler read this leaf with nodeVal, so a bracket / block
+// list silently kept only the FIRST prefix. Two things went wrong at once:
+//
+//   - the rule translated only one of the authored external prefixes, and the
+//     others fell through static NAT entirely, with no diagnostic; and
+//   - the dropped prefixes never reached prefix validation, so a MALFORMED
+//     entry in any slot but the first committed CLEAN — a validation fail-open.
+//
+// The compiler now accumulates every value into MatchAddresses (so all of them
+// are visible to validation), and this gate rejects the multi-valued case. It
+// is a rejection rather than a fan-out because a static-NAT rule lowers to ONE
+// dataplane row — StaticNATRuleSnapshot.ExternalIP is a single address in the
+// Rust static_nat table — so N prefixes have no representable meaning without
+// inventing rule-fanout semantics (which external prefix pairs with the single
+// `then static-nat prefix`?). Junos likewise takes one prefix here. Rejecting
+// makes the previously-silent collapse loud and fails CLOSED; the operator
+// writes one rule per external prefix. Widening static NAT to fan a rule across
+// several external prefixes is a separate semantic change, not this fix.
+//
+// Strict on commit / commit-check (hard reject); the call site downgrades to a
+// warning on the tolerant load / peer-sync path (#1960 no-brick), where Match
+// still carries the first prefix so behaviour is exactly pre-#6659.
+func validateStaticNATMatchAddressesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	for _, rs := range cfg.Security.NAT.Static {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil {
+				continue
+			}
+			if len(rule.MatchAddresses) > 1 {
+				return fmt.Errorf(
+					"static NAT rule-set %q rule %q declares %d `match "+
+						"destination-address` prefixes (%v); a static-NAT rule "+
+						"translates exactly ONE external prefix to the single "+
+						"`then static-nat prefix` target, so only %q would take "+
+						"effect and the rest would be silently ignored — author "+
+						"one rule per external prefix (#6659)",
+					rs.Name, rule.Name, len(rule.MatchAddresses),
+					rule.MatchAddresses, rule.MatchAddresses[0])
+			}
+		}
+	}
+	return nil
+}
+
 // validateStaticNATSingleTargetStrict (#6483) hard-rejects a static-NAT rule
 // that declares MORE THAN ONE translation target. A Junos static-nat rule maps
 // to EXACTLY ONE of `prefix <ip>` | `prefix-name <name>` | `nptv6-prefix <p6>` |

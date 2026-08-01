@@ -105,6 +105,8 @@ func compileNAT(node *Node, sec *SecurityConfig) error {
 	}
 
 	// proxy-arp { interface <name> { address <addr>; } }
+	//
+	// proxyARPAddressValues is defined below compileNAT (see #6659).
 	if err := forEachChild(node.Children, "proxy-arp", func(proxyNode *Node) error {
 		for _, inst := range namedInstances(proxyNode.FindChildren("interface")) {
 			entry := &ProxyARPEntry{Interface: inst.name}
@@ -137,8 +139,25 @@ func compileNAT(node *Node, sec *SecurityConfig) error {
 					}
 				}
 
-				// Single address
-				if v := nodeVal(prop); v != "" {
+				// Single address, or a bracket / block LIST of addresses
+				// (#6659). `address [ 192.0.2.1 192.0.2.2 ]` collapses onto
+				// Keys[1:] and `address { 192.0.2.1; 192.0.2.2; }` onto
+				// Children; nodeVal read only the first, so every address
+				// after the first silently got NO proxy-ARP entry — the
+				// firewall answered ARP for one address of the authored set and
+				// stayed silent for the rest, so inbound traffic to them was
+				// never drawn to this box.
+				//
+				// This is a pure value-drop, NOT a validation fail-open: proxy-
+				// ARP addresses carry no commit-time validator at all, so a
+				// malformed address in the FIRST slot commits clean too
+				// (verified). Adding that gate is out of scope here.
+				//
+				// Read via proxyARPAddressValues rather than firewallMatchValues
+				// so a MALFORMED range that fell through the two branches above
+				// (a `to` child with an empty endpoint) does not contribute the
+				// literal token "to" as an address.
+				for _, v := range proxyARPAddressValues(prop) {
 					addr := v
 					if !strings.Contains(addr, "/") {
 						addr += "/32"
@@ -154,6 +173,37 @@ func compileNAT(node *Node, sec *SecurityConfig) error {
 	}
 
 	return nil
+}
+
+// proxyARPAddressValues extracts every address a proxy-arp `address` node
+// carries, across BOTH parser AST shapes (#6659 — the proxy-ARP instance of the
+// #2419 dual-shape class):
+//
+//   - single      `address 192.0.2.1;`            → Keys=["address","192.0.2.1"]
+//   - bracket     `address [ 192.0.2.1 .2 ];`     → Keys=["address",".1",".2"]
+//     (the lexer strips `[`/`]`, so the list collapses onto ONE node's Keys)
+//   - block       `address { 192.0.2.1; .2; }`    → one child leaf per address
+//
+// It differs from firewallMatchValues in exactly one way: it SKIPS a `to` child.
+// The caller handles `address <low> to <high>` ranges in two earlier branches,
+// but those `continue` only on a WELL-FORMED range; a malformed one (a `to`
+// child with an empty endpoint) falls through to here, and a plain
+// firewallMatchValues would then contribute the literal token "to" as an
+// address, which would be appended as "to/32". Skipping it preserves the
+// pre-#6659 behaviour for that malformed shape (one address, no bogus entry).
+func proxyARPAddressValues(prop *Node) []string {
+	var vals []string
+	for _, k := range prop.Keys[1:] {
+		if k != "" && k != "to" {
+			vals = append(vals, k)
+		}
+	}
+	for _, vn := range prop.Children {
+		if len(vn.Keys) >= 1 && vn.Keys[0] != "" && vn.Keys[0] != "to" {
+			vals = append(vals, vn.Keys[0])
+		}
+	}
+	return vals
 }
 
 func compileNAT64(node *Node, sec *SecurityConfig) error {
