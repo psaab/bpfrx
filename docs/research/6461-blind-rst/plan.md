@@ -1,40 +1,51 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.36.0 — THE TERMINAL CUT, round-120 folds (Codex
-r120's 11B/1H/1M/1L: the anchor apply runs at the COMMON SUCCESS-ONLY
-POSTBLOCK — `!recycle_now` at `flow_cache_hit.rs:549-552`, where BOTH
-success arms converge (the dominant in-place arm `:444-497` skips the
-fallback block entirely); the carrier is TWO validated handles for a
-reverse-direction binding (the matched R for probation/identity, the
-canonical F for the anchor/close-mark — the family hop's second lookup
-exists on master); the precedence rule — every install/upsert/overwrite
-at key K invalidates K's exact-query-key cache slot, so a
-precedence-changing install never leaves a stale descriptor forwarding
-the prior winner's decision; the expected forward id is CARRIED on the
-synthesized reverse entry (`expected_fwd_id`, stamped at synthesis from
-the forward row's id — the v10.35.0 adjacency breadcrumb is retracted:
-prewarm and singleton paths break adjacency), with the tunnel
-`UpsertLocal` class carrying 0 → UNBOUND-absorbing; the different-family
-overwrite is classified by the (nat, is_reverse) snapshot compare and
-runs REMOVE+INSTALL semantics (re-mint + full authority-state reinit —
-K's anchor/sticky state never rides onto S2); a zero wire id ALWAYS
-fresh-mints (the preserve clause retracted — no same-incarnation
-evidence rides the command); the node bit's producer is threaded
-(`set_identity(worker_id, node_id)` from `/etc/xpf/node-id` via worker
-setup — physical id, not role state); the close-bit merge covers EVERY
-synth against a marked family including close→close retries AND the
-sibling's shared-hit materialization (a published closing/reset replica
-can never be reconstructed alive by a bare-ACK materialization); the
-capacity-corner accounting has its full producer/carrier/consumer chain
-(typed `Site2bOutcome`, `Option<ValidatedTarget>`, hoisted fallback
-field, `account_packet -> bool`, mutually exclusive chokepoint branch)
-scoped to accounting-eligible forwarded dispositions; the cost/history
-stragglers are reconciled. Round-120: Codex NO (11B/1H/1M/1L — folded
-this revision; r119-8/9 RESOLVED); AGY r119: five dispatch attempts —
+**Status: DRAFT v10.37.0 — THE TERMINAL CUT, round-121 folds (Codex
+r121's 6B/3H/2M: the admission semantics are REDEFINED rather than
+re-mechanized — "committed" = admitted to the worker's TX pipeline at
+the `!recycle_now` postblock, NOT dispatched-on-wire; the
+dispatch-drop residual is accepted deliberately with the four-point
+argument (ingress-observation state, attacker-unreachable, strictly
+stricter than master's own pre-construction telemetry admission, and
+the request-riding alternative is machinery for zero
+attacker-observable benefit). The reverse binding simplifies to the
+STORED EXPECTATION VERIFIED PER HOP — the promote-time bind step is
+gone: `fwd_companion_id` holds the producer-supplied expected id at
+install (positional: explicit; site-2b Local: the matched id; synced:
+the synthesis-stamped `expected_fwd_id`; tunnel/Shared: 0), every
+reverse→forward hop compares the probed forward's id against it plus
+key+NAT, and 0 never verifies. The different-family discriminator is
+now the CARRIED STABLE ID on the update itself (the `(nat,
+is_reverse)` compare is replaced — an exact tuple/NAT reincarnation
+has identical values yet is the ABA case): equal ids → same-family
+in-place refresh; different or zero → remove+install with full
+authority-state reinit. The precedence invalidation covers the
+COMPLETE accepted-query alias family (old and new identities) with
+the two specified drains (the WorkerScratch accumulator drained before
+the next descriptor; the worker-command invalidation buffer drained
+across all bindings before the next RX batch). `family_handle` is an
+Option — a zero-expectation reverse suppresses all forward-family
+authority while matched-R operations proceed (never an occupant
+capture). The materialize seed is exactly the replica's stored close
+bits (a blind current RST can never upgrade an alive/FIN-only
+replica); the promote publication carries the effective stored state
+(raw flags control eligibility only). The site-2b pre-install source
+is complete (Local: the pre-install re-probe snapshot; Shared: the
+shared row's carried `tcp_flags` — the across-scopes wrapper gains
+it). The accounting fallback extends to the Local identity-agreeing
+ValidatorRefused class (never Shared/identity-mismatch). The
+`account_packet -> bool` additive return is reconciled with the
+UNCHANGED-placement text; the constructor-test and §11 labels are
+current. Round-121: Codex NO (6B/3H/2M — folded this revision;
+r120-6/7/8/11/12/13 RESOLVED); AGY r119 attempt 6: headless
+command-permission denial (six attempts documented); SMR r121 pending
+(fold verification lands with this revision). Round-120: Codex NO
+(11B/1H/1M/1L — folded
+v10.36.0; r119-8/9 RESOLVED); AGY r119: five dispatch attempts —
 two non-review content faults, two headless command-permission denials,
 one off-topic CLI-documentation response (infra per protocol; a sixth
-attempt runs on v10.36.0); SMR r120 pending (fold verification lands
-with this revision). Round-119: Codex NO (6B/1H/1M/1L — folded
+attempt runs on v10.36.0); SMR r120 YES (fold verification).
+Round-119: Codex NO (6B/1H/1M/1L — folded
 v10.35.0; r118-3/6/7/8/9 RESOLVED); AGY r118 infra (documented
 retries); SMR r119 YES (fold verification, v10.34.0).
 Round-118: Codex NO (4B/3H/1M/1L — folded v10.34.0;
@@ -859,8 +870,10 @@ request-build stage:
   is the attacker's own spray budget plus one timeout. Accepted —
   restructuring the bound-then-apply order across every enqueue site is
   worse than the residual. **All other arms are commit-clean.**
-- **`account_packet` is UNCHANGED; the anchor apply rides a DISTINCT
-  post-admission hook (v10.4.0 wording fix, round-86 Codex 7):** #2501
+- **`account_packet` keeps #2501 counter PLACEMENT and gains one
+  additive `-> bool` charged return (v10.37.0, round-120/121 Codex
+  11 — the "UNCHANGED/no signature change" phrasing is corrected):
+  #2501
   counter placement is untouched (`account_packet` keeps counting
   attempted forwards at `flow_cache_hit.rs:312` /
   `poll_descriptor/mod.rs:3497` — RT_FLOW volume semantics; the
@@ -868,8 +881,9 @@ request-build stage:
   why it cannot host the anchor). The anchor's update hooks are the
   per-disposition FINAL-ADMISSION apply points of §5.2 (two call
   classes: the cache-hit commit arm and the slow-path commit arms),
-  fed by the same seg view; no signature change to `account_packet`
-  at all. **The apply hook has NO missing-forward fallback (round-83
+  fed by the same seg view; the only `account_packet` delta is the
+  charged/missed boolean the capacity-corner fallback consumes.
+  **The apply hook has NO missing-forward fallback (round-83
   Codex, core-gate note):** unlike
   `account_packet`'s tolerant reverse hop (`session/mod.rs:1205`), a
   missing canonical forward entry means the hook is a NO-OP — updates
@@ -1470,9 +1484,24 @@ engaged.) The accept/refuse split:
   Codex 10: `session_glue/mod.rs:1092-1115` reconstructs from the new
   packet's raw flags today, ignoring `replica.tcp_flags` — a bare ACK
   in the publish→replication window would rebuild an ALIVE entry from
-  a published RST/FIN row): the materialize merges the replica's
-  carried close bits over the packet's raw flags; raw packet flags
-  still drive screens/cache/accounting.
+  a published RST/FIN row): the materialize seeds its close state from
+  the REPLICA'S stored (trusted-by-propagation) close bits ONLY, plus
+  the current packet's close bits ONLY when the current close itself
+  VALIDATED under §5.4 — at site 2c every current close is refused (no
+  anchor), so in practice the seed is exactly the replica's close bits
+  (v10.37.0, round-121 Codex 6: a naive `raw | replica` merge would
+  let a BLIND current RST upgrade an alive or FIN-only replica to
+  reset/2 s — the merge is NOT naive); raw packet flags
+  still drive screens/cache/accounting. AND the materialize-then-
+  promote publication carries the entry's EFFECTIVE STORED state, not
+  the packet's raw flags (v10.37.0, round-121 Codex 7:
+  `maybe_promote_synced_session`'s single raw `tcp_flags` input drives
+  both the `SessionUpdate` and the republished/replicated row today,
+  `session_glue/mod.rs:1235-1252`, `session_glue/promote.rs:99-138` —
+  a bare ACK could materialize a closing replica correctly and
+  immediately republish it ACK-only for another worker; under the
+  rule, raw flags control promote ELIGIBILITY while the effective
+  stored state controls the update and the publication).
   The (Local, ESTABLISHED, non-closing) →
   master-verbatim table row is correspondingly read as "the matched
   forward family is not closing-marked" (a closing-marked family runs
@@ -1505,17 +1534,42 @@ engaged.) The accept/refuse split:
   carried-handle mechanics above) — from the accept to master's
   existing accounting chokepoint (`poll_descriptor/mod.rs:3478-3503`);
   the fallback fires ONLY when the reverse-key probe missed for
-  this packet and charges the packet (real length, real DSCP, real
-  disposition) to the re-validated forward entry's `rev` counters with
+  this packet, and its producer classes are EXACTLY two (v10.37.0,
+  round-121 Codex 10): (i) an accepted close whose reverse install
+  capacity-refused, AND (ii) a LOCAL identity-agreeing
+  `ValidatorRefused` close — that packet is forwarded and skips the
+  reverse install, so `account_packet` misses R and returns before
+  deriving F; without the fallback F loses the reverse bytes/packets
+  and the `observed_tcp_flags` that feed the Close harvest
+  (`expire.rs:358-371`). Shared-scope and identity-mismatch refusals
+  NEVER produce a fallback target (no identity-agreeing forward
+  exists to charge). The charge uses
+  the re-validated forward entry's `rev` counters with
   the `observed_tcp_flags` fold — the install-success path is
   unchanged (the reverse-entry probe folds onto the forward entry's
   `rev` by the same derivation), so both paths end with exactly one
   `rev` charge on F at master's own chokepoint with master's own
   inputs. A SYN-ACK+FIN/RST validates the
   close (§5.4) but NEVER establishment-promotes (rule 5 — the
-  conjunction stated). The mark itself: two
-  sequential same-worker writes: install the reverse companion, then
-  re-probe and mark the local forward entry (the `forward_match` in hand
+  conjunction stated). The mark itself: the
+  sequential same-worker writes are ORDERED FOR THE INHERITANCE
+  (v10.37.0, round-121 Codex 9 — the v9 "install the reverse
+  companion, then re-probe and mark" order predated the inheritance;
+  the re-probe is now PRE-install): re-probe the local forward entry
+  FIRST (identity agreement AND the `closing`/`reset` snapshot), the
+  synth computes the effective inherited seed from that snapshot, the
+  reverse installs WITH the inherited state, and the forward mark
+  lands last — the pair remains indivisible to any reader
+  (worker-owned table, no cross-worker observer). The pre-install
+  source is complete: a LOCAL match snapshots the forward's
+  `closing`/`reset` at the identity re-probe, and a SHARED match reads
+  the shared row's carried `tcp_flags` close bits — the across-scopes
+  wrapper currently DISCARDS `SyncedSessionEntry.tcp_flags`
+  (`shared_ops.rs:638-665`), so the `ForwardSessionMatch` gains the
+  forward family's close state alongside the id (`entry.rs:208-213`);
+  the "every synth against a marked family" rule is thereby
+  implementable for both scopes
+  (the `forward_match` in hand
   is a CLONE, `shared_ops.rs:638-665`; worker-owned tables have no
   cross-worker observer, so the pair is indivisible to any reader; the
   SHARED-match case never reaches the mark — no anchor → refuse)
@@ -1889,11 +1943,28 @@ adopting the shared decision/metadata, §5.6).
   (§5.6) — POD, `Copy`, no serde, never on the HA wire (the sync
   install/upsert paths zero/default both fields exactly as they do
   `established`-class local state today).
-- `ForwardSessionMatch` gains the matched entry's `session_id`
-  (`entry.rs:208-213`; v10.34.0, round-118 Codex 7 — the site-2b
-  reactive synth's binding producer; a Local match carries the exact
-  matched id with the identity re-probe before install, a Shared match
-  synthesizes UNBOUND).
+- `ForwardSessionMatch` gains the matched entry's `session_id` AND
+  the forward family's close state (`closing`/`reset`)
+  (`entry.rs:208-213`; v10.34.0, round-118 Codex 7; the close state
+  v10.37.0, round-121 Codex 9 — the site-2b
+  reactive synth's binding producer and inheritance source; a Local
+  match carries the exact matched id + the pre-install re-probe
+  snapshot; a Shared match reads the shared row's carried
+  `tcp_flags` close bits — the across-scopes wrapper discards them
+  today, `shared_ops.rs:638-665` — and synthesizes expectation 0).
+- The reverse entry's `fwd_companion_id` stores the EXPECTED family
+  id, verified PER HOP (v10.37.0, round-121 Codex 5 — the expectation
+  IS the binding; there is no promote-time bind step): the install/
+  upsert paths gain the expectation input (`SessionInstall` and the
+  synced constructors carry it, `ctx.rs:27-49`,
+  `session_glue/commands/upsert_synced.rs:64-79`); every
+  reverse→forward hop compares the probed forward's id against the
+  stored expectation plus key+NAT — a match writes the anchor sample,
+  a mismatch or a 0 expectation suppresses. `SyncedSessionEntry` gains
+  `expected_fwd_id: u64` stamped at synthesis from the forward row's
+  id (`shared_ops.rs:750-785`; in-memory + worker-command carriage
+  only, no wire change; the tunnel `UpsertLocal` class carries 0 →
+  permanent UNBOUND, round-120 Codex 8).
 - `MatchedToken` (v10.33.0/v10.34.0, §5.6): `{ key: SessionKey, nat:
   NatDecision, is_reverse: bool, session_id: u64, source: MatchSource,
   transition: Option<TokenTransition> }` — 96 B, the `Option` niche-
@@ -1922,25 +1993,34 @@ adopting the shared decision/metadata, §5.6).
   reverse-key probe was absent, charging real length/DSCP/disposition
   with the `observed_tcp_flags` fold.
 - The import breadcrumb (v10.35.0, round-119 Codex 3) is SUPERSEDED by
-  the carried expected id (v10.36.0, round-120 Codex 4): FIFO
+  the carried expected id (v10.36.0, round-120 Codex 4) and the
+  promote-time bind is SUPERSEDED by per-hop verification (v10.37.0,
+  round-121 Codex 5): FIFO
   adjacency is not a family proof (prewarm enqueues all forwards then
   all reverses, `shared_ops.rs:345-418`; singletons queue
   independently, `session_glue/mod.rs:838-848`), so the reverse entry
   carries `expected_fwd_id` stamped at synthesis from the forward
-  row's id; the reverse's own promote binds by comparing the probed
-  forward's id against the RECORDED expected id (never the occupant).
+  row's id; the expectation is stored in `fwd_companion_id` at install
+  and every hop verifies the probed forward's id against it (never
+  the occupant; nothing extra happens at promote).
 - `update_session` gains the identity-replacement branch (v10.35.0,
-  round-119 Codex 4; the classification + state reinit v10.36.0,
-  round-120 Codex 5): the path already snapshots the pre-update
-  origin/NAT/orientation/RG (`session/mod.rs:1398-1453`); an update
-  whose `(nat, is_reverse)` DIFFERS from the snapshot is a
-  different-family replacement and runs `remove_entry` + FULL INSTALL
-  semantics — id re-mint, anchor zeroed (absorbing), gated
+  round-119 Codex 4; the discriminator v10.37.0, round-121 Codex 4 —
+  the `(nat, is_reverse)` compare is REPLACED because an exact
+  tuple/NAT reincarnation has identical values yet is the ABA case):
+  the `SessionUpdate` gains the incoming family id (the caller passes
+  the synced row's / shared entry's `session_id`, `ctx.rs:62-70`,
+  `session_glue/promote.rs:99-107`); the update compares it against
+  the stored `session_id` — EQUAL (plus key) is a same-family refresh:
+  update in place, id and authority state preserved (a legitimate
+  NAT/orientation refresh rides the existing reindex,
+  `session/mod.rs:1344-1463`); DIFFERENT — or an incoming 0, which
+  fails closed — is a different-family replacement and runs
+  `remove_entry` + FULL INSTALL
+  semantics — id re-mint or adopt the incoming non-zero id, anchor
+  zeroed (absorbing), gated
   `closing`/`reset`/`established` seed from the update's flags,
   `probation` cleared, `fwd_companion_id` zeroed — so none of K's
-  authority/lifecycle state rides onto S2; an update whose
-  `(nat, is_reverse)` equals the snapshot is a same-family refresh and
-  updates in place with id and authority state preserved.
+  authority/lifecycle state rides onto S2.
 - The id replication-invariance completions (v10.35.0, round-119 Codex
   5): the SharedPromote shared-replica republication
   (`session_glue/promote.rs:116-138`), the local-origin shared
@@ -2008,8 +2088,10 @@ adopting the shared decision/metadata, §5.6).
   (master parity).
 - `tcp_seg_view()` (§5.3) — new helper in `frame/tcp.rs`.
 - `close_seq_plausible()` (§5.4) — new pure function in `session/`.
-- `account_packet` is UNCHANGED (v10.4.1 wording, round-87 Codex
-  r86-7-disposition): counters stay exactly where #2501 put them
+- `account_packet` keeps #2501 counter placement and gains one
+  additive `-> bool` charged return (v10.37.0, round-120/121 Codex 11 —
+  the "UNCHANGED" wording is corrected): counters stay exactly where
+  #2501 put them
   (`flow_cache_hit.rs:312-317`, `poll_descriptor/mod.rs:3494-3503` —
   the slow-path call PRECEDES request construction/output filtering,
   `poll_descriptor/mod.rs:3752`, which is exactly why it cannot host
@@ -2355,7 +2437,16 @@ adopting the shared decision/metadata, §5.6).
     `matched_handle` (the matched reverse entry) — the family hop's
     second lookup exists on master, `session/mod.rs:1183-1205`, so a
     reverse-direction check resolves both, a forward-direction check
-    one). The ANCHOR APPLY runs at the COMMON SUCCESS-ONLY POSTBLOCK
+    one; AND `family_handle` is an OPTION, v10.37.0 round-121 Codex 8:
+    a reverse whose stored expectation is 0 (UNBOUND-absorbing — the
+    tunnel class, a Shared synth, a refused-forward import) has NO
+    trustworthy forward to resolve, so `family_handle = None` and ALL
+    forward-family authority (the anchor hop, the close mark) is
+    suppressed while the matched-R operations proceed — never an
+    occupant capture; a non-zero expectation resolves the derived
+    forward key and sets `family_handle = Some` ONLY when the probed
+    entry's id equals the stored expectation (plus key+NAT) — a
+    per-hop verification, not a bind). The ANCHOR APPLY runs at the COMMON SUCCESS-ONLY POSTBLOCK
     (v10.36.0, round-120 Codex 1 — the v10.35.0 ":507-548 success arm"
     named only the fallback request arm; the dominant in-place rewrite
     arm enqueues `pending_tx_prepared` and clears `recycle_now` at
@@ -2364,11 +2455,29 @@ adopting the shared decision/metadata, §5.6).
     `!recycle_now` at the recycle point (`:549-552`) — a packet whose
     rewrite/request construction FAILED on both arms still has
     `recycle_now` set, is recycled WITHOUT the apply, and never
-    advances the trusted anchor (the committed-packet invariant;
-    "enqueued to the TX pipeline" is the admission semantics —
+    advances the trusted anchor. The admission SEMANTICS are stated
+    exactly (v10.37.0, round-121 Codex 1 — a redefinition, not the
+    request-riding machinery): "committed" = ADMITTED TO THE WORKER'S
+    TX PIPELINE (the postblock), NOT dispatched-on-wire — the fallback
+    arm's enqueued request can still drop at dispatch (missing
+    binding, frame-build failure, redirect-inbox overflow —
+    `worker/lifecycle.rs:226-281`, `tx/dispatch/mod.rs:512-573`,
+    `:1378-1397`, the silent overflow `umem/mod.rs:1257-1321`), and
+    the plan accepts that residual DELIBERATELY: (i) the anchor is
+    ingress-observation state — the packet really arrived at the
+    dataplane and passed the flow's policy, so its sample is a true
+    wire observation (a middlebox's seen-window, not the endpoint's
+    accepted-into-buffer window); (ii) the residual is not
+    attacker-reachable — an off-path attacker can neither observe nor
+    induce a dispatch drop, and the sample still had to pass the
+    in-window/proof gate; (iii) the alternative (an authority payload
+    riding every pending request to dispatch success) adds per-request
+    carriage machinery for zero attacker-observable benefit; (iv)
+    master's own telemetry (`account_packet`, `:295-317`) already
+    charges pre-construction, so the postblock is strictly STRICTER
+    than master's accounting admission.
     `touch_if_stale`/`account_packet` at `:295-317` stay
-    MASTER-VERBATIM: #2501 telemetry, not authority state, and
-    master's telemetry charging precedes construction today).
+    MASTER-VERBATIM (#2501 telemetry, not authority state).
     Same-worker single-threaded, no
     expire/GC pass interleaves within one descriptor's processing (the
     reap runs per loop body, `worker/loop_body/mod.rs:1481-1521`
@@ -2393,17 +2502,39 @@ adopting the shared decision/metadata, §5.6).
     never key/NAT/id identity fields (round-120 Codex 2's confirming
     trace) — so the identity established at the early check still
     holds at the apply points. AND the precedence rule (v10.36.0,
-    round-120 Codex 3): validating the cached BACKING entry does not
+    round-120 Codex 3; the full-family shape + producers v10.37.0,
+    round-121 Codex 2/3): validating the cached BACKING entry does not
     prove it is still the query's current resolution WINNER (a direct
     primary entry at the query key outranks a reverse-translated
     alias, `lookup.rs:62-68`; an ordinary local match outranks
     forward-wire/shared, `shared_ops.rs:602-635`; a worker
     `UpsertSynced` installs WITHOUT flow-cache invalidation,
     `session_glue/commands/upsert_synced.rs:64-120`) — so EVERY
-    session-table install/upsert/overwrite at key K also invalidates
-    the exact-query-key flow-cache slot for K (the existing exact-key
-    invalidation helper, `flow_cache.rs:1105-1120`, plus the sibling
-    fan-out accumulator, v10.22.0): a precedence-changing install can
+    session-table install/upsert/overwrite invalidates the COMPLETE
+    accepted-query alias FAMILY of the affected identity — old AND new
+    (canonical, reverse companion, reverse-translated, reverse-wire,
+    and forward-wire query aliases, the site-2c displaced-family set,
+    `session/mod.rs:1895-1948`; the consumers,
+    `lookup.rs:62-68`, `:222-250`, `:253-320`) — exact-key-only
+    invalidation (`flow_cache.rs:1105-1120`) would leave a stale
+    descriptor active on a NEWLY-outranked alias Q. The producer/
+    carrier mechanics are specified (round-121 Codex 3): (i) the
+    install/upsert/overwrite sites write the invalidated alias family
+    into the existing per-worker `WorkerScratch` batch accumulator
+    (the v10.22.0 mechanism — the sites returning only `bool` today
+    gain a lightweight family-OUT into the accumulator, NOT a return-
+    type change); the current binding's caches drain the accumulator
+    IMMEDIATELY before the next descriptor's processing (the
+    `poll_binding` fan-out level, v10.22.0); (ii) the worker-command
+    paths (`UpsertSynced`/`UpsertLocal` — they mutate before binding
+    polling and the handler owns no caches,
+    `session_glue/mod.rs:649-705`, `worker/loop_body/mod.rs:682-717`)
+    record the invalidated family into a per-worker pending
+    invalidation buffer that drains across ALL bindings before the
+    next RX batch (a separately sized command drain — commands are
+    rare against packets, so the all-binding fan-out cost is bounded
+    by command rate, never packet rate). A precedence-changing install
+    can
     never leave an old descriptor forwarding the prior winner's
     decision, and the identity check retains the backing-identity
     guard for the non-precedence ABA cases. The ordering promise is scoped to
@@ -2493,20 +2624,20 @@ adopting the shared decision/metadata, §5.6).
     post-restart fresh mints at the same counter value) is residual
     and churns out — the persisted/boot-epoch discriminator is the
     #6311 follow-up, §10. The
-    binding producers are EXACTLY these three, and the bind ALWAYS
-    compares against a RECORDED expected id — never the bare current
-    occupant (v10.35.0, round-119 Codex 1/3/7; the expected id is
-    CARRIED, not adjacency-inferred, v10.36.0 round-120 Codex 4 — the
-    v10.35.0 queue-adjacency breadcrumb is RETRACTED: activation
-    prewarm enqueues ALL forwards then ALL reverses,
-    `shared_ops.rs:345-418`, and singleton replicas queue
-    independently, `session_glue/mod.rs:838-848`, so FIFO adjacency is
-    not a family proof) —
-    UNBOUND is otherwise ABSORBING: no lazy bind on an ordinary hop,
-    and no occupant-capture at the promote either — derived key+NAT
-    agreement with whatever happens to occupy the forward key is not
-    family evidence, it is the ABA case the id exists to
-    distinguish; and no rebind after a mismatch): (a) the positional
+    binding producers are EXACTLY these three, and the stored value is
+    the EXPECTED family id, verified PER HOP against the probed
+    forward entry — there is NO separate bind step (v10.36.0's
+    promote-time bind is SUPERSEDED v10.37.0, round-121 Codex 5: the
+    expectation IS the binding — every reverse→forward hop compares
+    the probed forward entry's id against the STORED expectation plus
+    key+NAT, a match writes the anchor sample, a mismatch suppresses;
+    nothing is ever learned from the occupant, so the round-118
+    lazy-bind and round-119 K-capture traces both stay dead, and a
+    refused-then-later-successful forward import starts passing the
+    moment the real family (carrying the expected id, adopted from the
+    populated wire field) arrives. UNBOUND (`0`) is ABSORBING: a
+    zero expectation never verifies, so the hop always suppresses —
+    no lazy bind, no rebind, no promote-time step): (a) the positional
     fresh-flow reverse install carries the forward entry's id
     EXPLICITLY (the positional `install_with_protocol_with_origin`
     path, `poll_descriptor/mod.rs:2449-2458`, `:2777-2787`, gains the
@@ -2515,7 +2646,8 @@ adopting the shared decision/metadata, §5.6).
     LOCAL match carries the matched forward entry's id on the
     `ForwardSessionMatch` (`entry.rs:208-213` gains it — the type
     carries only key/decision/metadata today) with the identity
-    re-probe before install; a SHARED match installs UNBOUND; (c) an
+    re-probe before install; a SHARED match installs with expectation
+    0 (UNBOUND); (c) an
     HA-IMPORTED reverse carries the EXPECTED forward id ON THE
     SYNTHESIZED ENTRY ITSELF: every reverse `SyncedSessionEntry` is
     built FROM its forward row (`synthesized_synced_reverse_entry`,
@@ -2527,18 +2659,16 @@ adopting the shared decision/metadata, §5.6).
     uniformly because all three synthesize the reverse from the
     forward row (in-memory shared entry + worker-command carriage
     only; the reverse never rides the cross-node wire as a separate
-    record, so no wire change); the reverse's local install records
-    it, and the reverse entry's OWN synced→local
-    promote (`maybe_promote_synced_session`,
-    `session_glue/promote.rs:99-139` → `promote_synced_with_origin`,
-    `session/mod.rs:1673-1675`) BINDS AT THE TRANSITION by
-    comparing the probed forward entry's id AGAINST THE RECORDED
-    EXPECTED id (plus key+NAT): a match binds; a mismatch or
-    `expected == 0` leaves the entry UNBOUND-absorbing — the occupant
-    can never SELF-CERTIFY (round-119 Codex 3's K-capture trace dies:
-    K's id ≠ the recorded expected id, so the stranger at the forward
-    key is never captured; and a refused forward import means the
-    local K can never match the synthesized expected id). The local
+    record, so no wire change); the reverse's LOCAL install copies the
+    carried expectation into `fwd_companion_id` (the install/upsert
+    paths gain the expectation input — `SessionInstall` and the synced
+    upsert/materialize constructors carry it, `ctx.rs:27-49`,
+    `session_glue/commands/upsert_synced.rs:64-79`; this answers the
+    round-121 Codex 5 storage question: the expectation lives in the
+    SAME 8 B field, there is no second slot), and every later hop
+    verifies against it. The reverse SharedPromote/positional/site-2b
+    reverse-row constructions are covered by (a)/(b) — they carry the
+    producer's id directly. The local
     GRE tunnel path is the one class with NO real id to carry
     (v10.36.0, round-120 Codex 8: `tunnel.rs:563-615` constructs F/R
     with `session_id: 0` before any worker entry exists, publishes
@@ -2546,51 +2676,44 @@ adopting the shared decision/metadata, §5.6).
     worker `:732-745`, where each worker's table independently mints
     on zero — there is no single real id at publish time and no
     cross-worker allocator): tunnel-path reverses carry
-    `expected_fwd_id = 0` → UNBOUND-absorbing (fail-closed: these are
+    expectation 0 → permanent UNBOUND (fail-closed: these are
     firewall-local tunnel-endpoint flows; reverse-direction anchor
     learning is suppressed and reverse-direction closes refuse until
     churn — the imported-class posture of §2 — while forward-direction
     learning and validation ride the direct canonical hit). A standby
-    runs no hops, so nothing binds
+    runs no hops, so nothing verifies
     there; the first
-    reverse hit on the newly-active node promotes and binds, and an
+    reverse hit on the newly-active node hops and verifies, and an
     adopted-id forward keeps its id across its own later promote, so
-    the binding survives); an absent forward, a reciprocity mismatch,
+    the expectation survives); an absent forward, a reciprocity mismatch,
     or an id mismatch
-    leaves the entry UNBOUND-absorbing (fail-closed: reverse-direction
+    suppresses the hop (fail-closed: reverse-direction
     anchor learning is suppressed, reverse-direction closes refuse —
     the imported-class posture of §2 — while forward-direction learning
     and validation ride the direct canonical hit and are unaffected).
     AND the identity-replacement rule (v10.35.0, round-119 Codex 4;
-    the classification + state reinit v10.36.0, round-120 Codex 5):
-    `update_session` already snapshots the pre-update
-    origin/NAT/orientation/RG (`session/mod.rs:1398-1453`), and the
-    family discriminator IS the (nat, is_reverse) pair: an update
-    whose `(nat, is_reverse)` DIFFERS from the snapshot's is a
-    DIFFERENT-FAMILY replacement (the `UpsertRefused`-then-promote
-    case) and runs REMOVE+INSTALL semantics — `remove_entry` + a full
-    fresh install: the id re-mints (`alloc_session_id`), the anchor
-    zeroes (absorbing zero-trust), `closing`/`reset`/`established`
-    seed per the gated rules from the update's flags, `probation`
-    clears, `fwd_companion_id` zeroes — K's anchor, sticky state, and
-    companion binding NEVER ride onto S2 (a later close can never
-    validate against K's anchor); an update whose `(nat, is_reverse)`
-    EQUALS the snapshot's is a same-family refresh (same wire family,
-    packet-indistinguishable) and updates in place with the id and
-    authority state preserved;
-    the re-mint propagates to the
+    the discriminator is the CARRIED STABLE ID, v10.37.0, round-121
+    Codex 4 — the v10.36.0 `(nat, is_reverse)` snapshot compare is
+    REPLACED: an exact tuple/NAT reincarnation has identical nat and
+    orientation yet is the ABA case the id exists to distinguish):
+    the `SessionUpdate` gains the incoming family id (the promote/
+    update caller passes the synced row's or the shared entry's
+    `session_id`, `ctx.rs:62-70`,
+    `session_glue/promote.rs:99-107`) and the update compares it
+    against the stored `session_id` — EQUAL ids (plus key) mean the
+    same incarnation: update in place, id and authority state
+    preserved (a legitimate NAT/orientation refresh rides the existing
+    reindex, `session/mod.rs:1344-1463`); DIFFERENT ids — or an
+    incoming id of 0, which must fail closed — mean a different-family
+    replacement: `remove_entry` + FULL INSTALL semantics (id re-mint
+    or adopt the incoming non-zero id, anchor zeroed (absorbing),
+    gated `closing`/`reset`/`established` seed from the update's
+    flags, `probation` cleared, `fwd_companion_id` zeroed) — K's
+    anchor, sticky state, and companion binding NEVER ride onto S2
+    (a later close can never
+    validate against K's anchor); the re-mint/adopt propagates to the
     sibling through the now-populated wire id (above), keeping the
-    sibling's binding consistent. AND the zero-wire-id rule (v10.36.0,
-    round-120 Codex 6 — the v10.35.0 preserve-on-zero clause is
-    RETRACTED: the upsert removes the same-key predecessor before
-    selecting the id, `install.rs:295-344`, and the command carries no
-    same-incarnation evidence, `upsert_synced.rs:64-79`, so preserving
-    would let a legacy peer's NEW same-key/NAT incarnation inherit
-    K's id): a zero wire id ALWAYS fresh-mints; the resulting id flip
-    evicts stale cached tokens (mismatch → evict → re-resolve) and
-    leaves imported reverses UNBOUND-absorbing — fail-closed, and
-    reachable only with a legacy pre-population peer because every
-    current-version path populates the real id. The reverse entry
+    sibling's expectation consistent. The reverse entry
     does NOT otherwise store the forward entry's id,
     `install.rs:152`, and a same-key+NAT replacement K2 mints a
     DISTINCT id (#4915: "a reused 5-tuple gets a distinct id",
@@ -3248,15 +3371,25 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   UNLESS the effective transition is `OverdueSkipped` or
   `UpsertRefused` (the anchor commit hook is suppressed for both,
   v10.28.0, round-112 Codex 4).
-- **Constructor gating:** site 2b accept → companion installed with the
-  seed AND the forward family marked atomically (exactly one producer;
+- **Constructor gating:** site 2b accept → the forward family marked
+  and the companion installed with the inherited seed — EXCEPT the
+  capacity-refused case, where the forward mark still lands and no
+  reverse installs (the re-synth retry carries the inheritance,
+  v10.34.0/v10.36.0; the "every accept installs" phrasing is corrected,
+  v10.37.0 round-121 Codex 11) — exactly one producer on the forward
+  entry in both cases;
   #4380 retention semantics asserted, not an idealized 2 s whole-flow
   reap); site 2b refuse → NO install (`created=false,
   install_failed=true`, no cache insert, packet still forwarded, next
   reply re-synthesizes and revalidates); site 2c refuse → install ALIVE
   (or skip wholesale when the existing entry is overdue —
   `OverdueSkipped`, v10.27.1)
-  at the probation timeout with `closing=false, reset=false`; site 2c
+  at the probation timeout with its close state seeded FROM THE
+  REPLICA'S stored close bits (the round-121 Codex 6 seed rule — a
+  closing/reset replica yields a closing/reset materialization even
+  though the current close was refused; the blanket
+  `closing=false, reset=false` phrasing is corrected, round-121 Codex
+  11); site 2c
   with a non-close attacker packet → untrusted samples only.
 - **Materialize preservation + retention fence (v10.7.0, rounds 89-90
   Codex):** (a) with a probation entry K installed (refused-close
@@ -3931,7 +4064,7 @@ this branch only if the minimal fix proves insufficient.
   design.
 ---
 
-## 11. Open questions for the convergence round (v10.32.0)
+## 11. Open questions for the convergence round (v10.37.0)
 
 1. **The terminal cut itself:** Part A (the gate) + the wire-free
    Part-B rules (closing-never-promote ×2, constructor gating with
@@ -3978,9 +4111,11 @@ this branch only if the minimal fix proves insufficient.
    deferred refresh (round-88) — is any pre-commit refresh/requeue
    path left for a probation entry (lookup, `touch_if_stale`, promote,
    materialize refresh), and does the commit-hook clear+refresh cover
-   every admission arm? (e) the v10.32.0 end-state: the state-keyed
-   2b proof, the two-direction identity binding, the single token
-   carrier, the early identity check, and the §9 matrix — is any
+   every admission arm? (e) the v10.37.0 end-state: the state-keyed
+   2b proof, the per-hop verified expectation (no bind step), the
+   two-handle carrier with the Optional family handle, the early
+   identity check, the full-family precedence invalidation with its
+   two drains, and the §9 matrix — is any
    producer path or consumer ordering still two-readable?
 
 4. **The emission posture:** master's `expire.rs:342-350` gate is
