@@ -66574,3 +66574,43 @@ break — `go vet` confirmed passing under every revert.
   pkg/authz/peer_5561_test.go, pkg/api/authz.go,
   pkg/api/config_authz_5561_test.go, pkg/api/testdata/routescan/,
   pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 (round-5 fold, third pass)
+- **Action**: #5561 — close an UNGUARDED property found by parent edge-mutation.
+  The ordering of the two checks in `principal()` (locality re-derivation INSIDE
+  the credential branch, so an uncredentialed caller drives no enumeration) is
+  property P2, and nothing defended it: hoisting the check above the credential
+  test left build, vet and the whole suite green. Worse, the test that was
+  supposed to guard it —
+  `TestUncredentialedCallerDrivesNoInterfaceEnumeration_5561` — was VACUOUS for
+  TWO independent reasons, each making its expected value the failure default.
+  (1) It counted `authz.HostAddrScansForTest()` over a LOOPBACK listener, but
+  `PeerCouldBeLocalNow` short-circuits on `loopbackDelivery` BEFORE enumerating,
+  so the counter reads 0 whether the check runs early, late or never. (2) It sent
+  uncredentialed requests to a server WITH api-auth configured, but
+  `dynamicAuthMiddleware` wraps the authz guard (`listenerHandler`), so a missing
+  or wrong credential is 401'd upstream and `principal()` is never reached at
+  all. Replaced with two tests on the correct premise — the ordering is
+  observable exactly where `s.credential` can fail INSIDE `principal()`, i.e. a
+  listener with NO api-auth snapshot.
+  `TestUncredentialedCallerDrivesNoLocalityRecheck_5561` counts invocations of
+  the locality seam (an invocation count cannot be satisfied by the check never
+  happening) and asserts ZERO without a credential AND exactly ONE with a valid
+  one — the second half defeats the "deleted entirely" default.
+  `TestOffLoopbackCredentialRowEnumeratesOnlyOnce_5561` binds a REAL routable
+  host address so both connection ends are off-loopback and the real enumeration
+  runs, with a precondition skip if the kernel sources from loopback; it asserts
+  zero enumerations uncredentialed, and >=1 enumeration plus a 403 with a valid
+  credential (the end-to-end P1 proof on the production path, no locality
+  injection). Corrected the `principal()` comment, which claimed the ordering
+  protects "the flooding population" without stating that api-auth listeners are
+  already gated upstream — the same overstatement that produced the vacuous test.
+  Documented the 60-connection cost test's deliberately loose `maxReads = 12`
+  bound and, explicitly, what it does NOT cover (it absorbs the 2x regression the
+  hoist causes). Mutations: hoist above the credential check — build rc=0 (0
+  bytes), vet rc=0 (0 bytes), both new guards red as assertions ("25 requests
+  ... drove 25 locality re-derivations", "10 uncredentialed requests drove 10
+  REAL interface enumerations"), 751 pass; delete the check entirely — build and
+  vet rc=0, the two "valid credential" halves red plus
+  TestBrandNewLocalAddressCannotBorrowCredential_5561, 750 pass.
+- **File(s)**: pkg/api/authz.go, pkg/api/config_authz_5561_test.go, _Log.md

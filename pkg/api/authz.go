@@ -307,9 +307,22 @@ func (s *Server) principal(r *http.Request) authz.Principal {
 		// enumeration started by THIS request. The verdict that got us here was
 		// cached at accept and lags an address add; a caller that is in fact on
 		// this host must be denied even holding a valid credential, which is the
-		// precedence rule this function states. Deliberately AFTER the credential
-		// check: a caller presenting none — the flooding population — must not be
-		// able to drive an enumeration.
+		// precedence rule this function states.
+		//
+		// The position is deliberate and load-bearing: INSIDE the credential
+		// branch, so a request that presents no valid credential drives no
+		// interface enumeration. State the scope precisely, because an earlier
+		// version of this comment did not and the test written from it was
+		// vacuous. On a listener that HAS api-auth, dynamicAuthMiddleware
+		// (server.go listenerHandler) already answers a missing or wrong
+		// credential with a 401 and this function is never reached — so the
+		// ordering buys nothing there. It matters on a listener with NO api-auth
+		// snapshot, where the middleware passes everything through, s.credential
+		// fails here on the nil snapshot, and hoisting this check would enumerate
+		// once per request for any caller that can open a socket.
+		// TestUncredentialedCallerDrivesNoLocalityRecheck_5561 and
+		// TestOffLoopbackCredentialRowEnumeratesOnlyOnce_5561 both fail if it is
+		// hoisted, and both fail if it is removed.
 		if s.peerIsLocalNow(pending) {
 			return authz.Unauthenticated("caller is local but could not be identified: " +
 				"peer address is assigned to this host, so an api-auth credential may not speak for it")

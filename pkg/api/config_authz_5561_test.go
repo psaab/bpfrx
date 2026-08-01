@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -835,9 +836,20 @@ func TestConcurrentConnectionsShareOneSocketTableRead_5561(t *testing.T) {
 	addr := strings.TrimPrefix(base, "http://")
 
 	const conns = 60
-	// Generous ceiling: the point is that cost does not scale with connections,
-	// not that batching is maximally tight. Without single-flighting this is
-	// exactly `conns`.
+	// Generous ceiling, DELIBERATELY. Batch boundaries are scheduling-dependent
+	// — the same 60 connections legitimately land in 1, 2 or 3 batches run to
+	// run — so an exact expected count would be flaky rather than stricter. The
+	// property under test is that cost does not SCALE with connections; without
+	// single-flighting this is exactly `conns`, two orders away from the bound.
+	//
+	// Read what that does NOT cover. The slack absorbs a constant-factor
+	// regression: a change that doubled reads from 2 to 4 would pass here. In
+	// particular this case is NOT coverage of where the credential row's locality
+	// re-derivation sits — hoisting it above the credential check doubles the
+	// reads and this bound swallows it.
+	// TestUncredentialedCallerDrivesNoLocalityRecheck_5561 and
+	// TestOffLoopbackCredentialRowEnumeratesOnlyOnce_5561 own that property and
+	// assert ZERO rather than a ceiling, for exactly this reason.
 	const maxReads = 12
 
 	before := authz.SocketScansForTest()
@@ -1318,41 +1330,220 @@ func TestBrandNewLocalAddressCannotBorrowCredential_5561(t *testing.T) {
 	}
 }
 
-// TestUncredentialedCallerDrivesNoInterfaceEnumeration_5561 pins the ORDER of
-// the two checks in principal(), which is the whole cost argument for making the
-// locality re-derivation authoritative.
+// TestUncredentialedCallerDrivesNoLocalityRecheck_5561 pins the ORDER of the two
+// checks in principal(), which is property P2.
 //
-// The re-derivation enumerates interfaces for real. Run before the credential
-// check, it would hand every unauthenticated connection a fresh enumeration —
-// the per-connection amplification TestLocalAddrCacheRateLimitsMisses_5561
-// forbids for the accept-time cache, reintroduced one layer up and reachable by
-// anyone who can open a socket. Run after, only a request that already presented
-// a VALID credential can drive one, and such a caller is authorized anyway.
-func TestUncredentialedCallerDrivesNoInterfaceEnumeration_5561(t *testing.T) {
+// The locality re-derivation enumerates interfaces for real. Run before the
+// credential check it would hand every request that reaches the gate a fresh
+// enumeration — the per-connection amplification
+// TestLocalAddrCacheRateLimitsMisses_5561 forbids for the accept-time cache,
+// reintroduced one layer up. Run after, only a request that already presented a
+// VALID credential can drive one, and such a caller is authorized anyway.
+//
+// # Getting the premise right, twice over
+//
+// Two earlier versions of this probe were VACUOUS, each for its own reason, and
+// both are worth naming because each produced a green test whose expected value
+// was the failure default:
+//
+//  1. Counting authz.HostAddrScansForTest() over a LOOPBACK listener.
+//     PeerCouldBeLocalNow short-circuits on loopbackDelivery before it
+//     enumerates, so the counter reads zero whether the check runs early, late,
+//     or never. TestOffLoopbackCredentialRowEnumeratesOnlyOnce_5561 below is the
+//     version that actually reaches the enumeration.
+//  2. Sending uncredentialed requests to a server that HAS api-auth configured.
+//     dynamicAuthMiddleware wraps the authz guard (server.go listenerHandler), so
+//     it answers a missing or wrong credential with its own 401 and principal()
+//     is never reached at all. Zero re-derivations, in every world.
+//
+// So the ordering is observable exactly where the credential check can FAIL
+// INSIDE principal(): a listener with NO api-auth snapshot, where
+// dynamicAuthMiddleware passes everything through and s.credential returns false
+// on a nil snapshot. That is the case below.
+func TestUncredentialedCallerDrivesNoLocalityRecheck_5561(t *testing.T) {
 	usePasswdFixture(t)
-	_, base := authzServer(t, Config{
-		Addr:  "127.0.0.1:8080",
-		Store: authzStore(t, authzTestConfig),
-		Auth:  &AuthConfig{Users: map[string]string{"webadmin": "s3cret"}},
-		// Off-box at accept, so every request reaches the credential row.
-		PeerLookupFn: remotePeer(),
+
+	t.Run("no api-auth: the gate is reached and must not re-derive", func(t *testing.T) {
+		var rechecks atomic.Int64
+		_, base := authzServer(t, Config{
+			Addr:  "127.0.0.1:8080",
+			Store: authzStore(t, authzTestConfig),
+			// No Auth: dynamicAuthMiddleware passes through, so principal() runs
+			// and s.credential fails on the nil snapshot — the one path where the
+			// ordering of the two checks is observable.
+			PeerLookupFn: remotePeer(),
+			PeerLocalityFn: func(net.Addr, net.Addr) bool {
+				rechecks.Add(1)
+				return false
+			},
+		})
+
+		const rounds = 25
+		for i := 0; i < rounds; i++ {
+			if status, _ := postRoute(t, base, "POST /api/v1/config/enter", nil); status != http.StatusForbidden {
+				t.Fatalf("an uncredentialed caller got %d, want 403", status)
+			}
+		}
+		if n := rechecks.Load(); n != 0 {
+			t.Fatalf("%d requests that carried no credential drove %d locality "+
+				"re-derivations — the re-check runs BEFORE the credential check, so any "+
+				"caller that can open a socket forces an interface enumeration per request",
+				rounds, n)
+		}
 	})
 
-	before := authz.HostAddrScansForTest()
-	for i := 0; i < 25; i++ {
-		if status, _ := postRoute(t, base, "POST /api/v1/config/enter", nil); status == http.StatusOK {
-			t.Fatal("an uncredentialed, unidentifiable caller reached the handler")
+	// The other half. Without it, deleting the check outright satisfies the
+	// assertion above, so this pins that the credential row DOES consult it.
+	t.Run("a valid credential drives exactly one re-derivation", func(t *testing.T) {
+		var rechecks atomic.Int64
+		basic := "Basic " + base64.StdEncoding.EncodeToString([]byte("webadmin:s3cret"))
+		_, base := authzServer(t, Config{
+			Addr:         "127.0.0.1:8080",
+			Store:        authzStore(t, authzTestConfig),
+			Auth:         &AuthConfig{Users: map[string]string{"webadmin": "s3cret"}},
+			PeerLookupFn: remotePeer(),
+			PeerLocalityFn: func(net.Addr, net.Addr) bool {
+				rechecks.Add(1)
+				return false // off-box, so the credential is honoured
+			},
+		})
+		status, errMsg := postRoute(t, base, "POST /api/v1/config/enter",
+			map[string]string{"Authorization": basic})
+		if status == http.StatusForbidden {
+			t.Fatalf("the off-box control was refused: %q", errMsg)
 		}
-		// A WRONG credential must not buy one either.
-		bad := "Basic " + base64.StdEncoding.EncodeToString([]byte("webadmin:wrong"))
-		if status, _ := postRoute(t, base, "POST /api/v1/config/enter",
-			map[string]string{"Authorization": bad}); status == http.StatusOK {
-			t.Fatal("an invalid credential reached the handler")
+		if n := rechecks.Load(); n != 1 {
+			t.Fatalf("a request with a VALID credential drove %d locality re-derivations, "+
+				"want exactly 1 — the credential row is not consulting the check, so a "+
+				"caller that is on this host is admitted by the shared secret", n)
 		}
+	})
+}
+
+// routableHostAddr returns a real non-loopback IPv4 address of this host, so a
+// case can build a connection whose BOTH ends are off-loopback and therefore
+// reach the interface-enumeration clause of PeerCouldBeLocalNow instead of its
+// loopback short-circuit.
+func routableHostAddr(t *testing.T) net.IP {
+	t.Helper()
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Skipf("cannot enumerate interfaces: %v", err)
 	}
-	if scans := authz.HostAddrScansForTest() - before; scans != 0 {
-		t.Fatalf("50 requests with no valid credential drove %d interface enumerations — "+
-			"the locality re-derivation runs BEFORE the credential check, so any caller "+
-			"that can open a socket can force authoritative kernel work per request", scans)
+	for _, a := range addrs {
+		n, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip := n.IP.To4()
+		if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+			continue
+		}
+		return ip
 	}
+	t.Skip("this host has no routable IPv4 address to build an off-loopback connection from")
+	return nil
+}
+
+// authzServerAt is authzServer bound to a chosen address rather than 127.0.0.1,
+// so a case can build connections whose both ends are off-loopback.
+func authzServerAt(t *testing.T, cfg Config, bind string) (*Server, string) {
+	t.Helper()
+	s := NewServer(cfg)
+	ln, err := net.Listen("tcp", bind)
+	if err != nil {
+		t.Skipf("cannot listen on %s: %v", bind, err)
+	}
+	srv := s.buildHTTPServer(ln.Addr().String())
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	return s, "http://" + ln.Addr().String()
+}
+
+// TestOffLoopbackCredentialRowEnumeratesOnlyOnce_5561 drives the same ordering
+// property through the REAL enumeration with no locality injection, and is
+// simultaneously the end-to-end P1 proof on the production path.
+//
+// The listener binds a real routable address of this host, so a connection to it
+// has non-loopback addresses at both ends and PeerCouldBeLocalNow actually
+// enumerates instead of short-circuiting. The caller's source address is then
+// genuinely one of ours, which is exactly the stale-snapshot window: the injected
+// resolver supplies the accept-time verdict "not on this host" while the caller
+// really is on it.
+func TestOffLoopbackCredentialRowEnumeratesOnlyOnce_5561(t *testing.T) {
+	usePasswdFixture(t)
+	host := routableHostAddr(t)
+	bind := (&net.TCPAddr{IP: host}).String()
+
+	// Precondition: the kernel must source a connection to this address from a
+	// NON-loopback address, or PeerCouldBeLocalNow short-circuits and the probe
+	// measures nothing.
+	probeLn, err := net.Listen("tcp", bind)
+	if err != nil {
+		t.Skipf("cannot listen on %s: %v", bind, err)
+	}
+	probe, err := net.Dial("tcp", probeLn.Addr().String())
+	if err != nil {
+		probeLn.Close()
+		t.Skipf("cannot dial %v: %v", probeLn.Addr(), err)
+	}
+	src := probe.LocalAddr().(*net.TCPAddr)
+	probe.Close()
+	probeLn.Close()
+	if src.IP.IsLoopback() {
+		t.Skipf("kernel sourced the connection from %v; PeerCouldBeLocalNow would "+
+			"short-circuit on loopback and this probe would measure nothing", src.IP)
+	}
+
+	// P2, on the real enumeration: no api-auth, so principal() is reached and
+	// s.credential fails inside it. Not one interface enumeration may result.
+	t.Run("no api-auth: uncredentialed requests cost zero enumerations", func(t *testing.T) {
+		_, base := authzServerAt(t, Config{
+			Addr:         bind,
+			Store:        authzStore(t, authzTestConfig),
+			PeerLookupFn: remotePeer(),
+		}, bind)
+
+		before := authz.HostAddrScansForTest()
+		const rounds = 10
+		for i := 0; i < rounds; i++ {
+			if status, _ := postRoute(t, base, "POST /api/v1/config/enter", nil); status != http.StatusForbidden {
+				t.Fatalf("an uncredentialed caller got %d, want 403", status)
+			}
+		}
+		if scans := authz.HostAddrScansForTest() - before; scans != 0 {
+			t.Fatalf("%d uncredentialed requests drove %d REAL interface enumerations — "+
+				"the locality re-derivation runs before the credential check", rounds, scans)
+		}
+	})
+
+	// P1, on the real enumeration: a valid credential must cost at least one
+	// enumeration AND be DENIED, because that enumeration finds the caller's
+	// address on this host.
+	t.Run("a valid credential is denied because the caller is on this host", func(t *testing.T) {
+		basic := "Basic " + base64.StdEncoding.EncodeToString([]byte("webadmin:s3cret"))
+		_, base := authzServerAt(t, Config{
+			Addr:         bind,
+			Store:        authzStore(t, authzTestConfig),
+			Auth:         &AuthConfig{Users: map[string]string{"webadmin": "s3cret"}},
+			PeerLookupFn: remotePeer(),
+		}, bind)
+
+		before := authz.HostAddrScansForTest()
+		status, errMsg := postRoute(t, base, "POST /api/v1/config/enter",
+			map[string]string{"Authorization": basic})
+		if scans := authz.HostAddrScansForTest() - before; scans == 0 {
+			t.Fatal("a request with a VALID credential drove NO interface enumeration — " +
+				"the credential row is not re-deriving locality, so the accept-time " +
+				"snapshot decides and a caller on this host is admitted by the secret")
+		}
+		if status != http.StatusForbidden {
+			t.Fatalf("a caller connecting FROM %v — an address assigned to this host — was "+
+				"admitted with %d on the strength of the api-auth secret (error=%q)",
+				src.IP, status, errMsg)
+		}
+		if !strings.Contains(errMsg, "assigned to this host") {
+			t.Errorf("denial did not name the reason: %q", errMsg)
+		}
+	})
 }
