@@ -56,9 +56,20 @@ error produced `BUILD rc=0 TEST rc=101` and was scored as "the guard fired".
 Two preflights run first and must themselves fail when broken — one proves the
 build gate really compiles the file under test, one proves a filter matching
 nothing is scored MISSING rather than `ok` (`cargo test` exits 0 on a filter that
-matches no test). The corpus builder also carries a non-vacuity floor, because
+matches no test). The corpus builder also carries non-vacuity floors, because
 every assertion in that file is of the form "this collection is empty" or "this
 count equals cases * offsets", and both hold trivially on an empty corpus.
+
+Those floors are named per SHAPE — the hand-crafted block, per-arm
+boundary-tight cases, the chain-length boundary, the next-header sweep, the L3
+offsets — and not as one size threshold, because a size threshold did not bind.
+A single `cases.len() >= 200` stood there: 256 of the ~310 cases come from one
+homogeneous next-header sweep, so cutting the corpus down to that sweep AND
+deleting the generic arm's post-advance bounds revalidation was measured to
+leave all five tests `ok`. A floor is worth its predicate, never the prose
+beside it, so each one now also states what it does NOT cover. They stop a shape
+being deleted between acceptance runs; they do not establish that the corpus is
+adequate, which is what the matrix above measures.
 
 Note `ipv6_ext_walk.rs` is a hashed input of `userspace_xdp_manifest.json`, so
 even a comment edit there requires `make generate` and trips
@@ -488,11 +499,24 @@ depending only on `core`, which `tests_shim_ext_parity.rs`
 `walk_ipv6_ext_chain`. Advance arithmetic, bounds revalidation and
 resolvable chain length are compared outcomes, not source-text claims.
 
-The two layers cover different things and both are needed: the corpus
-proves the walk behaves identically, and the emitted facts travel with the
-artifact so a consumer of a prebuilt object — the Debian packaging path
-never compiles the shim crate — can check the walk's constants without a
-Rust toolchain.
+The two layers cover different things and both are needed. The corpus
+proves the walk behaves identically **in the dimension the shim
+represents**, which is narrower than "identically":
+`walk_ipv6_ext_headers` returns `(offset, protocol)` and nothing else, so
+the compared unit is terminal offset, terminal protocol, no-next-header
+and fail-closed. Fragment state is not compared because the shim has none
+to compare against. `walk_ipv6_ext_chain` additionally records the first
+Fragment header's raw bytes and a non-first-fragment flag, and the shim's
+blindness there is a real, OPEN divergence rather than an artefact of the
+comparison: on `IPv6 || Fragment(frag_off != 0, next = TCP)` the shim
+resolves `L4(48, TCP)` and `parse_l4` reads fragment PAYLOAD as a TCP
+header, where this crate refuses those bytes. That is **#6704** —
+pre-existing, not introduced by #4555, PINNED (not fixed) by
+`shim_is_not_more_permissive`, and closable only by a shim behaviour
+change with its own verifier cost. The emitted facts, meanwhile, travel
+with the artifact so a consumer of a prebuilt object — the Debian
+packaging path never compiles the shim crate — can check the walk's
+constants without a Rust toolchain.
 
 This also fixes a scope gap a compile-time assertion could not: an
 assertion in the shim only runs when the shim crate is COMPILED, which the

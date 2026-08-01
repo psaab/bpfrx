@@ -781,33 +781,168 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
         "HbH + Mobility -> TCP".into(),
         chain(&[(HBH, 0), (MOBILITY, 0)], TCP, 0),
     ));
+    // Everything above is HAND-CRAFTED, one named shape per case. Snapshot the
+    // count here, before the homogeneous sweep below, so a floor can see this
+    // block on its own. 54 cases today.
+    let handcrafted = cases.len();
+
     // Every next-header value as the first header.
     for p in 0u16..=255 {
         cases.push((format!("first={p}"), chain(&[(p as u8, 0)], TCP, 0)));
     }
 
-    // NON-VACUITY FLOOR. Every assertion in this file is of the form "this
-    // collection is empty" or "this count equals cases.len() * L3_OFFSETS.len()",
-    // and BOTH hold trivially when the corpus is empty: an empty drift list is
-    // empty, an empty permissive list is empty, and `0 == 0 * 3`. Emptying this
-    // function was measured to leave all five tests reporting `ok` in 0.00s.
+    // --- NON-VACUITY FLOORS -------------------------------------------------
     //
-    // The floor lives here, in the single producer, rather than in each consumer:
-    // it protects the tests that exist today and any added later, which is the
-    // failure mode a per-test assertion invites. It is deliberately far below
-    // the real size (>300) so ordinary corpus edits do not trip it, and far
-    // above zero so an emptied or short-circuited builder cannot pass.
+    // Every assertion that CONSUMES this corpus is of the form "this collection
+    // is empty" or "this count equals cases.len() * L3_OFFSETS.len()", and BOTH
+    // hold trivially when the corpus is empty: an empty drift list is empty, an
+    // empty permissive list is empty, and `0 == 0 * 3`. Emptying this function
+    // was measured to leave all five tests reporting `ok` in 0.00s.
+    //
+    // What stood here was a single `cases.len() >= 200` whose message promised
+    // that no assertion in the file could pass vacuously. It was a VACUITY floor
+    // wearing a COVERAGE message: the 256-entry sweep directly above clears 200
+    // by itself with 56 to spare, so cutting the corpus down to that sweep AND
+    // deleting the generic arm's post-advance revalidation — the security
+    // property — was measured to leave all five tests `ok`. A floor whose prose
+    // is broader than its predicate is worse than no floor, because it
+    // manufactures the belief that a shape is protected.
+    //
+    // So each floor below binds ONE named property and its message claims only
+    // that. None of them claims the corpus is ADEQUATE: adequacy is not a
+    // property of a count, it is what `test/mutation/shim-ext-parity-acceptance.sh`
+    // measures by mutating the shim and requiring each guard to red. These floors
+    // exist to stop a shape being DELETED between acceptance runs.
+    //
+    // All of them read only the corpus bytes and this crate's walker. Nothing
+    // here touches the shim, so no mutation the acceptance matrix applies can
+    // move a floor — a floor red is always a corpus defect, never a shim
+    // finding. Neither negative-control test calls this function, so a floor red
+    // leaves both CONTROL columns `ok` and the harness's attributability rule
+    // intact.
+    let fails_closed = |b: &[u8]| userspace_verdict(b, 0) == Verdict::FailClosed;
+
+    // 1. THE HAND-CRAFTED BLOCK EXISTS. Counts only the cases built before the
+    //    sweep, so the sweep cannot satisfy it.
+    //    Binds: the block was not removed wholesale.
+    //    Does NOT bind: any individual shape, or the block's internal balance —
+    //    floors 2-5 each name one shape.
     assert!(
-        cases.len() >= 200,
-        "the #4555 parity corpus built only {} cases; every assertion in this file passes \
-         vacuously on a short corpus, so this is a harness failure, not a parity result",
-        cases.len()
+        handcrafted >= 40,
+        "the #4555 parity corpus built only {handcrafted} hand-crafted cases before the \
+         next-header sweep. The sweep contributes 256 cases of ONE homogeneous shape (a single \
+         minimum-size header in a 68-byte buffer) and clears any aggregate size floor by itself, \
+         so `cases.len()` cannot see this block disappear — which is why this floor counts the \
+         block alone."
+    );
+
+    // 2. PER-ARM BOUNDARY-TIGHT COVERAGE. A case can observe a post-advance
+    //    revalidation that was deleted, or weakened by a byte, only if the packet
+    //    ENDS at or before the advance target: with slack after the header the
+    //    walk lands inside the buffer either way. "Ends at or before the target"
+    //    is not read off the bytes here — that would re-model the advance
+    //    arithmetic this file exists to stop modelling — it is MEASURED, as this
+    //    crate's walker failing closed.
+    //
+    //    Keyed by the FIRST extension header the case declares. Every
+    //    boundary-tight case here is a single-header chain, so that is also the
+    //    arm which truncates; a multi-header chain truncating on a LATER arm
+    //    would be counted under its first header's arm. The count is therefore a
+    //    lower bound on per-arm coverage, not a census.
+    //
+    //    Two per arm, not one: one case makes the arm's bound observable at a
+    //    single magnitude, and an error that scales with the declared length
+    //    could hide in a coincidence at that magnitude — which is why the AUTH
+    //    cases above end at 42/47/59 and the FRAGMENT cases at 42/47/47 rather
+    //    than all at one target. GENERIC 6, AUTH 3, FRAGMENT 3 today.
+    for (arm, firsts, want) in [
+        ("GENERIC", &[HBH, DEST, MOBILITY][..], 2usize),
+        ("AUTH", &[AH][..], 2),
+        ("FRAGMENT", &[FRAG][..], 2),
+    ] {
+        let n = cases
+            .iter()
+            .filter(|(_, b)| firsts.contains(&b[6]) && fails_closed(b))
+            .count();
+        assert!(
+            n >= want,
+            "the #4555 parity corpus has only {n} boundary-tight case(s) on the {arm} arm \
+             (want >= {want}): cases declaring a first extension header in {firsts:?} whose packet \
+             ends at or before the advance target, measured as walk_ipv6_ext_chain failing closed. \
+             Only that shape can observe a deleted or one-byte-weakened post-advance revalidation \
+             in this arm; a padded case lands inside the buffer with or without the check. Two are \
+             required so the arm's bound is exercised at more than one magnitude."
+        );
+    }
+
+    // 3. THE RESOLVABLE-CHAIN-LENGTH BOUNDARY IS STRADDLED.
+    //    `shim_ipv6_ext_walk_matches_userspace_walker` argues the shim's
+    //    `MAX_EXT_HDRS == MAX_IPV6_EXT_HEADERS - 1` relation rather than asserting
+    //    numeric equality, and cites THIS corpus as what measures the exit
+    //    semantics the argument rests on. That citation is only true while the
+    //    corpus contains a chain at the longest resolvable length and a chain
+    //    past it. Both are measured on this crate's walker.
+    //    Does NOT bind: that the two sit adjacent, nor that the intermediate
+    //    lengths are present.
+    let longest_resolved = 40 + 8 * (MAX_IPV6_EXT_HEADERS - 1);
+    let at_max_len = cases
+        .iter()
+        .filter(|(_, b)| userspace_verdict(b, 0) == Verdict::L4(longest_resolved, TCP))
+        .count();
+    let over_limit = cases
+        .iter()
+        .filter(|(_, b)| userspace_verdict(b, 0) == Verdict::OverLimit)
+        .count();
+    assert!(
+        at_max_len >= 1 && over_limit >= 1,
+        "the #4555 parity corpus no longer straddles the resolvable chain-length boundary: \
+         {at_max_len} case(s) resolve a terminal at offset {longest_resolved} (a chain of \
+         MAX_IPV6_EXT_HEADERS - 1 = {} minimum-size headers, the longest this crate resolves) and \
+         {over_limit} case(s) exceed the bound. Without one of each, nothing here measures where \
+         either walker stops, and the MAX_EXT_HDRS == MAX_IPV6_EXT_HEADERS - 1 relation asserted \
+         in shim_ipv6_ext_walk_matches_userspace_walker is argued from a comment rather than \
+         observed.",
+        MAX_IPV6_EXT_HEADERS - 1,
+    );
+
+    // 4. EVERY NEXT-HEADER VALUE APPEARS AS A FIRST HEADER. The behavioural
+    //    walked-type-set comparison — which values one walker steps THROUGH and
+    //    the other treats as terminal — exists only where the corpus supplies
+    //    that value. (`shim_ipv6_ext_walk_matches_userspace_walker` covers all 256
+    //    against the EMITTED table, but that is the manifest's classification,
+    //    not the executed walk's.)
+    //    Does NOT bind: that each value is presented in more than one position;
+    //    only the first-header position is swept.
+    let mut seen = [false; 256];
+    for (_, b) in &cases {
+        seen[usize::from(b[6])] = true;
+    }
+    let distinct = seen.iter().filter(|s| **s).count();
+    assert_eq!(
+        distinct, 256,
+        "the #4555 parity corpus presents only {distinct} of 256 next-header values as a chain's \
+         first header; the executed walked-type-set comparison is blind to the missing ones"
+    );
+
+    // 5. THE L3 OFFSETS ARE NOT ALL ZERO, AND INCLUDE ZERO.
+    //    `L3_OFFSETS.len() >= 3` stood here and asserted a PROXY: `[0, 0, 0]` has
+    //    length 3 and restores exactly the l3-blindness the message described.
+    //    The two properties the array actually carries are below, each asserted
+    //    directly.
+    //    Does NOT bind: the specific 14 and 18 `parse_l2` produces. Those are
+    //    declared two screens up in a three-element const; the corpus is 200
+    //    lines, which is the asymmetry these floors exist for.
+    assert!(
+        L3_OFFSETS.iter().any(|&o| o != 0),
+        "every #4555 corpus L3 offset is 0 ({L3_OFFSETS:?}): replacing the revalidation's base \
+         `l3_offset as usize` with `0usize` is BIT-IDENTICAL at l3 = 0 and a fail-open of exactly \
+         l3 bytes at the 14 and 18 the shim passes, so at l3 = 0 alone that mutation is invisible \
+         by construction — which is how it survived three rounds."
     );
     assert!(
-        L3_OFFSETS.len() >= 3,
-        "the #4555 corpus must run at more than one L3 offset: with a single offset the \
-         `l3_offset -> 0` mutation is invisible by construction, which is exactly how it \
-         survived three rounds"
+        L3_OFFSETS.contains(&0),
+        "the #4555 corpus L3 offsets ({L3_OFFSETS:?}) no longer include 0, the offset \
+         `walk_ipv6_ext_chain`'s other callers pass when they hand it an L3-relative slice"
     );
 
     cases

@@ -170,7 +170,11 @@ explain() {
   printf '%s' "${e}"
 }
 
-# 0 green, 1 red, 2 build failure. Exits 3 on a harness error.
+# RETURNS 0 green, 1 red (a guard assertion fired), 2 build failure, and 3 for a
+# row that cannot be attributed to the mutation because a negative control moved
+# — see the `return 3` below for why a moved control must not share a code with
+# a genuine red. Separately, `fail()` EXITS 3 on a harness error; that ends the
+# whole run, where a `return 3` is one row that row() scores as failed.
 run() {
   local label="$1"
   build_gate

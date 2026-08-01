@@ -66747,3 +66747,44 @@ break — `go vet` confirmed passing under every revert.
   pkg/daemon/userspace_sync_session_id_6198_test.go,
   userspace-dp/src/session/mod.rs, userspace-dp/src/session/tests.rs,
   userspace-dp/src/session/README.md, docs/session-sync-architecture.md, _Log.md
+- **Timestamp**: 2026-08-01 16:55
+- **Action**: #6655 review fold round 6 — two guards I added in earlier rounds
+  assert a PROXY rather than the property their own message claims. (F1) The
+  corpus floor `assert!(cases.len() >= 200, "...every assertion in this file
+  passes vacuously on a short corpus...")` was a VACUITY floor wearing a
+  COVERAGE message: 256 of the 310 cases come from one `for p in 0..=255` loop,
+  which clears 200 by itself with 56 to spare, so the floor could not see all 54
+  hand-crafted boundary cases deleted. Measured firsthand on the untouched
+  round-5 file: corpus cut to that sweep AND the generic arm's post-advance
+  bounds revalidation deleted from `ipv6_ext_walk.rs` — the security property —
+  left all five tests `ok`, `cargo test` rc 0. Replaced with five floors, each
+  binding ONE named shape and each stating what it does NOT cover: the
+  hand-crafted block counted BEFORE the sweep (>= 40 of 54); per-arm
+  boundary-tight coverage (>= 2 each for GENERIC/AUTH/FRAGMENT, MEASURED as this
+  crate's walker failing closed rather than by re-deriving each arm's advance
+  target, which would re-model the walk this file exists to stop modelling);
+  the resolvable chain-length boundary straddled (>= 1 case resolving at offset
+  40 + 8*(MAX_IPV6_EXT_HEADERS-1) and >= 1 OverLimit); all 256 next-header
+  values present as a first header; and the L3 offsets. (F2)
+  `assert!(L3_OFFSETS.len() >= 3, ...)` asserted a proxy — `[0, 0, 0]` has
+  length 3 and restores exactly the l3-blindness the message described — split
+  into `any(|&o| o != 0)` (what makes the `l3_offset -> 0` revalidation-base
+  mutation observable) plus `contains(&0)` (the offset
+  `walk_ipv6_ext_chain`'s other callers pass). All five floors read only the
+  corpus bytes and this crate's walker, so no acceptance-matrix shim mutation
+  can move one; neither negative control calls `parity_corpus()`, so a floor red
+  leaves both CONTROL columns `ok` and the harness's attributability rule holds.
+  Proved by a 12-row mutation matrix: for each floor, a corpus edit that the OLD
+  floor scored GREEN and the NEW floor reds on, with `cargo build` + `cargo test
+  --no-run` rc 0 in every row (a build break would be a false red), the specific
+  assertion named with its message, `shim_ipv6_ext_walk_matches_userspace_walker`
+  and both controls staying `ok` (the guard is scoped, not blanket), and a
+  byte-exact sha256 restore after each. Docs: corrected the stale `run()`
+  contract comment in `test/mutation/shim-ext-parity-acceptance.sh` (it still
+  said "0 green, 1 red, 2 build failure" after `return 3` for a moved control was
+  added), and scoped `pkg/dataplane/README.md`'s "the corpus proves the walk
+  behaves identically" to the dimension the shim actually represents — the shim's
+  walk returns `(offset, protocol)` and no fragment state, which is #6704, open
+  and pinned rather than fixed.
+- **File(s)**: userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  test/mutation/shim-ext-parity-acceptance.sh, pkg/dataplane/README.md, _Log.md
