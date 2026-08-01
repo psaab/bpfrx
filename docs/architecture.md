@@ -177,7 +177,18 @@ editing cmdtree.
   interceptors are installed on the fabric listener only; the loopback
   listener keeps the full service. The **same PSK** authenticates the
   heartbeat (#4326); it shares the `chassis cluster authentication-key`
-  leaf and reuses the dual-accept posture. The stronger residuals —
+  leaf and reuses the dual-accept posture. **The PSK is no longer optional
+  in practice (#6611):** because all three channels fail OPEN unkeyed, an
+  unkeyed cluster runs its entire control channel unauthenticated, and
+  every config this repository shipped used to be unkeyed — so the
+  enforcing branches were never exercised. `validateClusterAuthKeyStrict`
+  now hard-rejects an unkeyed `chassis cluster` on the strict commit /
+  commit-check path and warns on the tolerant load / peer-sync path
+  (#1960 no-brick: an already-unkeyed cluster still boots after upgrade
+  and is keyed on its next commit), and every reference/test config sets
+  a key. Operator guidance — generation, distribution, rolling rollout,
+  rotation — is in `pkg/cluster/README.md` → "Operating the control-link
+  PSK (#6611)". The stronger residuals —
   removing the ~1-window replay horizon (mTLS with per-node certs) and
   HMAC-authenticating the session-sync stream (#4107 F23) — remain deferred
   (see `pkg/cluster/README.md`).

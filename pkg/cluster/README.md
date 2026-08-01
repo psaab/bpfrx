@@ -405,6 +405,85 @@ connection is authenticated, then seals every subsequent frame.
   the bulk. See `docs/session-sync-architecture.md` → "Atomic Install +
   Cold-Prime Decision (#4962)".
 
+## Operating the control-link PSK (#6611)
+
+All three authenticated control channels above — heartbeat (PR-A), fabric
+gRPC (#4357) and session sync (#4369) — key off ONE leaf:
+
+```
+set chassis cluster authentication-key <key>
+```
+
+Each channel deliberately fails **OPEN** when that leaf is absent, which is
+what makes a rolling key rollout possible. The cost is that an unkeyed
+cluster runs its whole control channel unauthenticated: any host that can
+reach the control segment can forge a heartbeat to drive election, call the
+allowlisted fabric RPCs (read/clear sessions, cross-node failover), and open
+a session-sync connection. Before #6611 every config this repository shipped,
+documented and tested was unkeyed, so the enforcing branches were dead code
+in practice.
+
+**Commit gate.** `validateClusterAuthKeyStrict`
+(`pkg/config/compiler_validate_strict_cluster_auth.go`) hard-rejects a
+`chassis cluster` with no key on the **strict** commit / commit-check path,
+and downgrades to a `cfg.Warnings` entry on the **tolerant** load / peer-sync
+path (`opts.lenientClusterAuthKey`). That split is the migration contract:
+
+- A cluster that was unkeyed before the upgrade loads its stored config
+  through `CompileConfigLenient` at daemon start, so it **boots and keeps
+  forwarding** — #1960 no-brick. It warns instead.
+- The operator's next `commit` is refused until they set a key. The refusal
+  is inert for traffic: a rejected commit leaves the active config and the
+  dataplane untouched.
+
+**Generating a key.** Any high-entropy string; 32 bytes of base64 is a good
+default:
+
+```
+openssl rand -base64 32
+```
+
+**Distribution.** The key must be **identical on both nodes** and must NOT be
+`${node}`-scoped — each node signs with it and verifies the peer with the
+same value, so a per-node key authenticates nothing and leaves the channel
+permanently in dual-accept. Put it in the shared (non-group) `chassis
+cluster` stanza, as the reference configs do. With `configuration-synchronize`
+the RG0 primary propagates it to the peer on commit.
+
+**Rollout onto a live unkeyed cluster.** Dual-accept makes this
+non-disruptive and order-independent:
+
+1. Set the key on one node and commit. It now signs; the unkeyed peer has no
+   key, so it accepts everything, and the keyed node has not armed
+   enforcement yet, so it still accepts the peer's unsigned frames.
+2. Set the SAME key on the other node and commit. Both sign, each observes
+   the other authenticate, and enforcement arms — an unsigned frame is from
+   then on rejected as a downgrade.
+
+Confirm the posture with `show chassis cluster statistics`, whose
+`Authentication:` line (`controlLinkAuthStatus`) reads
+`engaged (peer authenticated; unauthenticated frames rejected)` once both
+nodes are keyed — `dual-accept (...)` means the channel is still
+unauthenticated in practice.
+
+**Rotation.** The token/HMAC construction has no key-id field, so a rotation
+is a second rollout: change the key on one node (that node's frames are now
+unverifiable by the peer, which rejects them once armed), then immediately on
+the other. Rotate during a maintenance window, or clear the key on both nodes
+first to return to dual-accept and re-key from there. The
+`authentication-key` leaf is `config.Secret`-typed and redacted in every
+show/log/JSON render, so the live value cannot be read back off the box —
+keep it in your own secret store.
+
+**Shipped configs.** `docs/ha-cluster.conf`, `docs/ha-cluster-loss.conf`,
+`docs/ha-cluster-userspace.conf`, `test/incus/xpf-cluster-fw{0,1}.conf` and
+`examples/deploy/ha-pair.conf` all carry a key, so the HA smoke cluster
+exercises the ENFORCING branch rather than the `keyConfigured == false`
+shortcut. Those are **lab values published in a public repository** — replace
+them before any real deployment.
+`TestShippedClusterConfigsAreKeyed_6611` / `...UseOneKeyPerCluster_6611`
+(`pkg/config`) lock both properties.
+
 ## IPsec SA sync
 
 Active IKE/child-SA connection names ride the session-sync channel so the

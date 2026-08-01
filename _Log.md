@@ -1,3 +1,71 @@
+## 2026-07-31 — #6611 cluster control-channel auth: dormant in every shipped config
+
+- **Timestamp**: 2026-07-31 (fix/6611-control-channel-auth)
+- **Action**: #6611 [SECURITY] Three control-channel authentication mechanisms
+  — fabric gRPC auth (#4357), heartbeat HMAC + anti-replay (#4326) and
+  session-sync challenge/response + per-frame HMAC (#4369) — all key off ONE
+  leaf, `chassis cluster authentication-key`, and all three deliberately fail
+  OPEN when it is absent (`fabricAuthDecision`/`heartbeatAuthDecision` accept on
+  `!keyConfigured`; `performSyncHandshake` runs no handshake with no local key).
+  No configuration in the repository set that leaf — verified firsthand on
+  `b4605ea9d`: `docs/ha-cluster.conf`, `docs/ha-cluster-loss.conf`,
+  `docs/ha-cluster-userspace.conf`, `test/incus/xpf-cluster-fw{0,1}.conf` and
+  `examples/deploy/ha-pair.conf` all carried a `cluster { }` stanza with no key.
+  So every deployment that followed this project's own HA documentation ran the
+  fabric gRPC listener, the heartbeat AND session sync unauthenticated
+  (allowlist-only), and the enforcing branches had never been exercised by the
+  smoke cluster. Scope decision: NOT warn-only. The insecure state is made hard
+  to REACH — `validateClusterAuthKeyStrict`
+  (`pkg/config/compiler_validate_strict_cluster_auth.go`, invoked last in
+  `runUniformGatesClusterZone` so structural cluster errors keep the first-error
+  slot) HARD-REJECTS an unkeyed (or whitespace-only-keyed) `chassis cluster` on
+  the strict commit / commit-check path, and downgrades to a `cfg.Warnings`
+  entry on the tolerant load / peer-sync path (`lenientClusterAuthKey`). That
+  split IS the migration: an already-unkeyed cluster loads its stored config
+  through `CompileConfigLenient` at daemon start, boots and keeps forwarding
+  (#1960 no-brick), and is keyed on the operator's next commit; a rejected
+  commit leaves the active config and dataplane untouched, and dual-accept lets
+  the key roll out one node at a time. The issue proposed warn-only on the
+  grounds that rejecting "would brick an existing unkeyed cluster on upgrade" —
+  that conflates the two paths: the upgrade path is the LENIENT one and is
+  untouched. All six shipped configs now set a key (lab values, marked
+  CHANGE-ME). Fixture churn: 39 test files gained an `authentication-key` line
+  because they strict-compile a cluster fixture; the golden `#4406` baseline
+  regenerated to exactly 12 lines, `ControlLinkAuthKey: "" -> "<redacted>"`,
+  nothing else. `TestClusterAuthKeyAbsentIsEmpty` (#4107) moved to
+  `CompileConfigLenient` — the tolerant path is now the only caller of the
+  absent-key shape. Tests (`cluster_authkey_required_6611_test.go`): strict
+  reject naming the remediation, whitespace-only reject, tolerant-path warning
+  (the no-brick contract), value-independent error text (no key material in the
+  message), plus shipped-config regression locks that compile every shipped
+  config for BOTH nodes and assert a non-empty key that is identical across
+  nodes (a `${node}`-scoped key would authenticate nothing). Negative controls:
+  a keyed cluster and a standalone config both stay green. MUTATION VERIFIED
+  both ways — removing the gate call site keeps `go build ./...` and
+  `go vet ./...` clean while 4 guards red on assertions ("commit accepted a
+  chassis cluster with no authentication-key"); removing the key from
+  `docs/ha-cluster-userspace.conf` reds only that subtest, the other five stay
+  green. Docs: `pkg/cluster/README.md` gains "Operating the control-link PSK
+  (#6611)" (generation, distribution, rolling rollout, rotation, and the
+  `show chassis cluster statistics` posture check), `docs/architecture.md`
+  records that the PSK is no longer optional in practice, and
+  `docs/config-schema.md` gains the gate section. Validation:
+  `go build ./...` exit 0, `go vet ./...` clean, `go test ./... -count=1` green
+  except `TestHeatmapNotStale` (pkg/refactoraudit), which is PRE-EXISTING RED on
+  pristine `origin/master` b4605ea9d (verified in a detached worktree) from
+  unrelated LOC drift — deliberately NOT regenerated here so another team's
+  drift does not land in this PR. Cluster smoke (`make test-failover` on the
+  loss userspace cluster, now KEYED) is REQUIRED and is scheduled by the team
+  lead — this is the first end-to-end exercise of the enforcing path.
+- **File(s)**: pkg/config/compiler_validate_strict_cluster_auth.go (new),
+  pkg/config/compiler_uniformgates_cluster_zone.go, pkg/config/compiler_opts.go,
+  pkg/config/cluster_authkey_required_6611_test.go (new),
+  pkg/config/testdata/golden_4406.json, docs/ha-cluster.conf,
+  docs/ha-cluster-loss.conf, docs/ha-cluster-userspace.conf,
+  examples/deploy/ha-pair.conf, test/incus/xpf-cluster-fw0.conf,
+  test/incus/xpf-cluster-fw1.conf, pkg/cluster/README.md, docs/architecture.md,
+  docs/config-schema.md, + 39 test files keyed for the strict gate
+
 ## 2026-07-31 — #6532 round-4 fold: stopped patching callee shapes, changed the approach
 
 - **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact, PR #6602)

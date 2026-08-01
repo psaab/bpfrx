@@ -1726,6 +1726,48 @@ see `docs/host-inbound-service-matrix.md`. Coverage:
 (reporter), `metrics_host_inbound_ambiguous_3718_test.go` (metric),
 `host_inbound_ambiguous_3718_test.go` (daemon log transitions).
 
+## Unkeyed chassis-cluster fail-closed gate (#6611)
+
+Three control-channel authentication mechanisms — fabric gRPC auth (#4357),
+heartbeat HMAC + anti-replay (#4326) and session-sync challenge/response +
+per-frame HMAC (#4369) — all key off ONE leaf, `chassis cluster
+authentication-key`, and all three deliberately fail **OPEN** when it is
+absent (`fabricAuthDecision` / `heartbeatAuthDecision` return accept on
+`!keyConfigured`; `performSyncHandshake` runs no handshake with no local key).
+That fail-open is what makes a rolling key rollout possible, but it means an
+unkeyed cluster runs its **entire** control channel unauthenticated —
+allowlist-only — so any host on the control segment can forge a heartbeat to
+drive election, invoke the allowlisted fabric RPCs (read/clear sessions,
+cross-node failover), and open a session-sync connection. Before #6611 no
+config in the repository set the leaf, so those enforcing branches had never
+run against real cluster traffic.
+
+`validateClusterAuthKeyStrict`
+(`pkg/config/compiler_validate_strict_cluster_auth.go`, invoked last in
+`runUniformGatesClusterZone` so every structural cluster error still wins the
+first-error slot) **rejects at commit / commit-check** a `chassis cluster`
+stanza whose `authentication-key` is absent or whitespace-only (whitespace
+would satisfy the runtime's `len(key) > 0` test while carrying no entropy).
+Lenient downgrade to a `cfg.Warnings` entry on the tolerant load / peer-sync
+path (`lenientClusterAuthKey`, #1960 no-brick) — and that downgrade **is** the
+upgrade path: a cluster that was unkeyed before this gate existed loads its
+stored config through `CompileConfigLenient` at daemon start, boots, keeps
+forwarding, and is keyed on the operator's next commit. A rejected commit is
+inert for traffic (the active config and dataplane are untouched), and
+dual-accept lets the key then be rolled out one node at a time.
+
+The gate error names the leaf and the remediation but never renders the value
+— `authentication-key` is `config.Secret`-typed and is in `ast_redact.go`'s
+secret set. Every shipped cluster config (`docs/ha-cluster*.conf`,
+`test/incus/xpf-cluster-fw{0,1}.conf`, `examples/deploy/ha-pair.conf`) now
+carries a key so the HA smoke cluster exercises the enforcing branch.
+Operator guidance (generation, distribution, rolling rollout, rotation) is in
+`pkg/cluster/README.md` → "Operating the control-link PSK (#6611)". Coverage:
+`cluster_authkey_required_6611_test.go` — strict reject, whitespace-only
+reject, tolerant-path warning, value-independent error text, and the
+shipped-config regression locks; negative controls assert a keyed cluster and
+a standalone (no `chassis cluster`) config are unaffected.
+
 ## Trailing-token arity on scalar value leaves (#3332)
 
 The mirror image of the multi-value contract is the **scalar** value leaf: a
