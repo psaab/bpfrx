@@ -1,9 +1,9 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v65 — r64 findings folded (Codex NEEDS-REVISION
-  3M/1m; AGY PLAN-READY; Claude SMR PLAN-READY (0 findings,
-  4 documented attacks FAILED); all three confirm the §4.7
-  structure); pending convergence review r65
+- **Status**: DRAFT v66 — r65 findings folded (Codex NEEDS-REVISION
+  3M/1m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS
+  0M/1m — the two missing §9 legs, folded here; all three
+  confirm the §4.7 structure); pending convergence review r66
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -2948,6 +2948,55 @@
   from Run's defers, `daemon_run.go:100-112`, and a
   pre-existing unbounded `wg.Wait`,
   `daemon_run_shutdown.go:62-64`).
+  v66: r65 convergence — the join waits on the reserved set,
+  the scheduler timeout gains its safe terminal state, the
+  callback fence gains the zeroize latch, and the reset
+  taxonomy is stated (Codex NEEDS-REVISION 3M/1m, folds 2
+  FOLDED / 2 NOT-FOLDED, structure confirmed; AGY PLAN-READY
+  4/4 with 2 fresh attacks FAILED, structure confirmed; SMR
+  PLAN-READY-WITH-NITS 0M/1m — the two missing §9 legs,
+  folded here): (a) THE JOIN WAITS ON THE RESERVED SET (Codex
+  M1, verified: a `go m.OnXSKBound()` goroutine can remain
+  UNSCHEDULED while the shutdown acquires/releases applySem
+  and start afterward, `maps_sync.go:451-456` — a semaphore
+  drain never sees a not-yet-started callback): the
+  admission-gate reservation (recorded at launch under the
+  ledger lock) is the join state — the shutdown closes
+  admission, then waits the reserved set; a not-yet-scheduled
+  callback's FIRST act is the fence check (gate closed ⇒
+  abandon and retire its reservation), so the reserved set
+  always drains — no new sequential wait beyond the
+  set-drain's 5s disposition. (b) THE SCHEDULER'S SAFE
+  TERMINAL STATE (Codex M2, verified: the acquire error is
+  ignored and the release unconditional,
+  `daemon_scheduler.go:170-183`, and cancellation cannot
+  unblock an update already acquiring with the intentionally
+  uncancelled `d.daemonCtx`, leaving `schedulerWg.Wait()`
+  unbounded, `daemon_scheduler.go:192-203`,
+  `scheduler.go:103-116,207-217`): the bound matches the
+  drain's 5s (no new sequential wait), and on expiry the
+  scheduler stop is ABANDONED with the process exiting — the
+  scheduler's state is in-memory and dies with the process,
+  and its mutation path shares the apply machinery's fence.
+  (c) THE ZEROIZE LATCH JOINS THE FENCE (Codex M3, verified:
+  a successful zeroize releases applySem with `resetting`
+  LATCHED before stopping xpfd, `daemon_apply_reset.go:59-89`,
+  `server_diag_system_action.go:69-86,186-205`,
+  `cli_request_system.go:174-198` — a queued callback could
+  acquire after the wipe and mutate netlink from the retained
+  pre-wipe configuration): the callback's fence is
+  `runCtx.Err()` OR `stopping` OR `resetting`. (d) THE RESET
+  TAXONOMY (Codex m1): `Manager.Close` is a third, terminal
+  category and `Teardown` has both reusable and terminal
+  callers (`manager.go:471-482`, `bootstrap.go:470-475`,
+  `daemon_run_shutdown.go:222-229`) — the reset runs on BOTH
+  Teardown paths, never on `stopLocked`'s helper-restart
+  paths, and `Close` needs no reset (the process is exiting).
+  (e) §9 gains the v65 SHUTDOWN legs (SMR m1 + Codex's
+  fold-1/fold-2 testing PARTIALs): the
+  preemption-between-check-and-call leg, the
+  Teardown→reset→B-registration→A-generation-rejection leg,
+  and the reserved-set-drain leg.
 
 ---
 
@@ -7171,7 +7220,16 @@ v20 history). The delivery is TWO units:
   `stopLocked`-scoped reset would strand epoch readiness):
   the reset/generation bump is TEARDOWN-SPECIFIC (never the
   helper-restart paths) and precedes `stopLocked`'s early
-  return (`process.go:210-216`), and the callback's
+  return (`process.go:210-216`) — with the caller taxonomy
+  STATED (r65 Codex m1, verified: `Manager.Close` is a
+  third, terminal category, and `Teardown` itself has both
+  reusable and terminal callers, `manager.go:471-482`,
+  `bootstrap.go:470-475`, `daemon_run_shutdown.go:222-229`):
+  the reset runs on BOTH Teardown paths (reusable and
+  terminal — a terminal Teardown's reset is harmless because
+  the process is exiting), never on `stopLocked`'s
+  helper-restart paths, and `Close` needs no reset (the
+  process is exiting) — and the callback's
   generation comparison occurs AFTER its applySem
   acquisition — AND the
   callback carries the manager's lifecycle generation — a
@@ -7182,10 +7240,19 @@ v20 history). The delivery is TWO units:
   shutdown can release applySem before the detached callback
   runs, `daemon_run_shutdown.go:50-64,214-230` — so the
   callback re-checks the work-item-G fence — `runCtx.Err()`
-  OR `stopping`, the FULL form (r59 Codex M2a, verified:
-  signal-driven teardown begins BEFORE `runShutdownSequence`
-  publishes `stopping`, and the drain proceeds after its
-  five-second timeout, `daemon_run_shutdown.go:50-64,214-230`)
+  OR `stopping` OR `resetting`, the FULL form (r59 Codex M2a,
+  verified: signal-driven teardown begins BEFORE
+  `runShutdownSequence` publishes `stopping`, and the drain
+  proceeds after its five-second timeout,
+  `daemon_run_shutdown.go:50-64,214-230`; and r65 Codex M3,
+  verified the zeroize interval: a successful zeroize
+  releases applySem with `resetting` LATCHED before stopping
+  xpfd, `daemon_apply_reset.go:59-89`,
+  `server_diag_system_action.go:69-86,186-205`,
+  `cli_request_system.go:174-198` — so a queued callback
+  could acquire after the wipe and mutate netlink from the
+  retained pre-wipe configuration; the zeroize latch is the
+  third fence state)
   — AFTER acquiring applySem AND again BEFORE each mutation,
   with the callback TEARDOWN-SERIALIZED (r60 Codex M2,
   verified: the netlink mutations are non-contextual calls,
@@ -7225,17 +7292,41 @@ v20 history). The delivery is TWO units:
   `daemon_run_naming.go:230-235`, which would strand a
   manager-owned gate while reserved work survives), the
   callback HOLDS applySem THROUGH ITS BODY (it already
-  acquires it at fire per the v58 closure), so the EXISTING
-  5s apply drain (`daemon_run_shutdown.go:50-58`) already
-  waits for every in-flight callback — the close-admission
+  acquires it at fire per the v58 closure), and the JOIN
+  WAITS ON THE RESERVED SET, not on the semaphore (r65 Codex
+  M1, verified: a `go m.OnXSKBound()` goroutine can remain
+  UNSCHEDULED while the shutdown acquires/releases applySem
+  and start afterward, `maps_sync.go:451-456` — a semaphore
+  drain never sees a not-yet-started callback): the
+  admission-gate reservation (recorded at launch under the
+  ledger lock) is the join state — the shutdown closes
+  admission, then waits the reserved set (a WaitGroup/count
+  under the ledger lock); a not-yet-scheduled callback's
+  FIRST act is the fence check (gate closed ⇒ abandon and
+  retire its reservation), so the reserved set always
+  drains — the close-admission
   step in `runShutdownSequence` adds NO new sequential wait
-  (it flips the flag and the existing drain does the join) —
+  beyond the set-drain's 5s disposition —
   with the THREE downstream holes closed (r64 Codex M1, all
   verified: (i) after the drain times out,
   `stopPolicySchedulerLoop` reacquires applySem with
   `context.Background()` — UNCAPPED —
   `daemon_run_shutdown.go:78`, `daemon_scheduler.go:170-183`
-  — so the downstream reacquisition gains a bounded context;
+  — so the downstream reacquisition gains a bounded context
+  WITH THE SAFE TERMINAL STATE PINNED (r65 Codex M2, verified:
+  the bound was unspecified, the acquire error is ignored and
+  the release unconditional, `daemon_scheduler.go:170-183`,
+  and cancellation cannot unblock an update already acquiring
+  with the intentionally-uncancelled `d.daemonCtx`, leaving
+  `schedulerWg.Wait()` unbounded,
+  `daemon_scheduler.go:192-203`, `scheduler.go:103-116,
+  207-217`): the bound matches the drain's 5s (NO new
+  sequential wait — the reacquisition overlaps the existing
+  waits), and on expiry the scheduler stop is ABANDONED with
+  the process exiting — the policy scheduler's state is
+  in-memory and dies with the process, and its mutation path
+  shares the apply machinery's fence, so a stranded
+  scheduler's next mutation abandons at the fence;
   (ii) a startup abort invokes shutdown BEFORE `applyCancel`
   initialization, `daemon_run.go:157-197`, skipping the drain
   while phase four can launch the callback,
@@ -8757,6 +8848,17 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      and the re-drive overwrites it) and the MARKER-NO-OP
      REJECTION leg (a no-op pass never ticks ConfigsSent, so no
      runbook step may wait on a tick);
+     (h2o) the v65 SHUTDOWN legs (r65 SMR m1 + Codex
+     fold-1/fold-2): the PREEMPTION-BETWEEN-CHECK-AND-CALL
+     leg (a fence check, then a preemption, then the netlink
+     call beginning after the timeout — the callback must not
+     start the call), the TEARDOWN→RESET→B-REGISTRATION→
+     A-GENERATION-REJECTION leg (the epoch-A callback's fire
+     in epoch B is rejected by the generation mismatch while
+     epoch B's own registration fires cleanly), and the
+     RESERVED-SET-DRAIN leg (a not-yet-scheduled callback
+     abandons at the closed gate and retires its reservation,
+     so the reserved set always drains);
      (h2m) the v62 legs (r62 Codex m1 + fold-2): the LINKDEL
      INJECTION leg (a mismatched link whose `LinkDel` fails
      retires the arm FAILED — the discarded-error path,
