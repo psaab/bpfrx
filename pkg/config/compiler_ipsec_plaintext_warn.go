@@ -53,9 +53,20 @@ import (
 // Why the operator needs telling. Before #5619 the config gave an affirmative
 // FALSE signal: `set security zones security-zone vpn interfaces st0.0`
 // commits cleanly (#4515 accepts a zone referencing a bind-interface even with
-// no explicit `set interfaces st0 unit 0`), the Go compiler programs
-// iface_zone_map for the xfrmi ifindex, and the XDP shim is attached to it.
-// Everything reads as enforced. An operator who zones a VPN interface and sees
+// no explicit `set interfaces st0 unit 0`), the zone assignment is accepted,
+// and nothing in the CLI or the commit output distinguishes it from a zone
+// that is enforced. Everything READS as enforced.
+//
+// What actually happens is the opposite, and it is worth naming precisely
+// because the obvious description of it is wrong twice over. The tunnel is
+// excluded from the ingress-adjudication set, and `syncInterfaceAttachments`
+// (pkg/dataplane/userspace/manager_compile.go) then builds an `allowed` set
+// from buildUserspaceIngressIfindexes and calls DetachXDP on every ifindex
+// outside it — so the shim is DETACHED from the xfrmi, not attached to it.
+// (An earlier revision of this comment said "the XDP shim is attached to it",
+// and attributed the programming to `iface_zone_map`, which now exists only in
+// the retired-eBPF tree — pkg/dataplane/loader.go and maps_stale.go, behind
+// the retirement canary. Neither statement described this code.) An operator who zones a VPN interface and sees
 // it accepted has been told something specific and untrue about their security
 // posture — which is worse than an unimplemented feature, and is what this
 // warning corrects.

@@ -131,23 +131,120 @@ func TestPlaintextWarningIsQuietWithoutIPsec(t *testing.T) {
 // materializes NO xfrm device is already reported by the #5297 arm (silent
 // tunnel down). Adding a plaintext advisory on top would be noise about a
 // plaintext path that does not exist.
+//
+// TWO DISTINCT REJECTION SITES, and the inputs are chosen to separate them.
+// An earlier revision of this test drove only `ge-0/0/0.0`, which fails the
+// IsSecureTunnelIfName predicate and is discarded BEFORE the `ifID == 0`
+// guard is ever reached — so deleting that guard left this test, and the whole
+// file, green. It documented a guard it did not bind.
+//
+// Measured on this tree:
+//
+//	name         IsSecureTunnelIfName(base)   XFRMIfNameAndID -> ifID
+//	ge-0/0/0.0   false                        0     (sibling predicate rejects)
+//	st-1         TRUE                         0     (only ifID == 0 rejects)
+//	st65536      TRUE                         0     (only ifID == 0 rejects)
+//
+// The st* rows are the ones that bind the guard: they pass the predicate and
+// are stopped solely by the if_id test. They matter on the LENIENT path, where
+// #5297 is not rejecting such names.
 func TestPlaintextWarningSkipsInvalidBindInterface(t *testing.T) {
-	tree := &ConfigTree{}
-	for _, line := range []string{
-		"set security ipsec vpn bad bind-interface ge-0/0/0.0",
+	for _, tc := range []struct {
+		name, bindIface, rejectedBy string
+	}{
+		{"not_a_secure_tunnel_name", "ge-0/0/0.0", "IsSecureTunnelIfName predicate"},
+		{"secure_tunnel_name_negative_unit", "st-1", "ifID == 0 guard"},
+		{"secure_tunnel_name_out_of_range", "st65536", "ifID == 0 guard"},
 	} {
-		path, err := ParseSetCommand(line)
-		if err != nil {
-			t.Fatalf("parse: %v", err)
-		}
-		if err := tree.SetPath(path); err != nil {
-			t.Fatalf("setpath: %v", err)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			tree := &ConfigTree{}
+			line := "set security ipsec vpn bad bind-interface " + tc.bindIface
+			path, err := ParseSetCommand(line)
+			if err != nil {
+				t.Fatalf("parse %q: %v", line, err)
+			}
+			if err := tree.SetPath(path); err != nil {
+				t.Fatalf("setpath %q: %v", line, err)
+			}
+			// Premise check: assert this input really does reach the site it is
+			// here to exercise, so a future change to either predicate cannot
+			// quietly turn this subtest back into a duplicate of its sibling.
+			base, _, _ := strings.Cut(tc.bindIface, ".")
+			_, ifID := XFRMIfNameAndID(tc.bindIface)
+			if tc.rejectedBy == "ifID == 0 guard" && !IsSecureTunnelIfName(base) {
+				t.Fatalf("premise broken: %q no longer passes IsSecureTunnelIfName, so it "+
+					"cannot bind the ifID == 0 guard", tc.bindIface)
+			}
+			if ifID != 0 {
+				t.Fatalf("premise broken: %q now yields if_id %d, so it no longer "+
+					"exercises a bind-interface that materializes no device", tc.bindIface, ifID)
+			}
+			// The strict path REJECTS an invalid bind-interface (#5297), so drive
+			// the advisory directly against the AST rather than through
+			// CompileConfig.
+			if got := warnSecureTunnelPlaintextUnadjudicatedAST(tree.Children); len(got) != 0 {
+				t.Errorf("advisory fired for a bind-interface that creates no xfrm device "+
+					"(rejected by the %s): %v", tc.rejectedBy, got)
+			}
+		})
 	}
-	// The strict path REJECTS an invalid bind-interface (#5297), so drive the
-	// advisory directly against the AST rather than through CompileConfig.
-	if got := warnSecureTunnelPlaintextUnadjudicatedAST(tree.Children); len(got) != 0 {
-		t.Errorf("advisory fired for a bind-interface that creates no xfrm device: %v", got)
+}
+
+// TestPlaintextWarningFiresOnEveryCompilePath pins the coverage this advisory's
+// own argument leans on, which nothing else in this file exercised.
+//
+// The operator who most needs telling is the one who does NOT re-commit after
+// an upgrade: their config arrives by RESTART (Store.Load) or PEER-SYNC
+// (Store.SyncApply), and both use the LENIENT entry point, not the strict one
+// an operator drives by hand. An advisory that fired only on strict commit
+// would systematically miss exactly the population it was written for, and
+// every test here would still be green.
+//
+// The node-aware variants are included because `apply-groups "${node}"` makes
+// the two nodes compile different trees — an advisory that survived on node 0
+// and vanished on node 1 would be worse than none, since the operator would
+// see it, fix nothing, and reasonably conclude the peer is clean.
+func TestPlaintextWarningFiresOnEveryCompilePath(t *testing.T) {
+	build := func(t *testing.T) *ConfigTree {
+		t.Helper()
+		tree := &ConfigTree{}
+		for _, line := range []string{
+			"set security ipsec vpn v1 bind-interface st0.0",
+			"set security zones security-zone vpn interfaces st0.0",
+		} {
+			path, err := ParseSetCommand(line)
+			if err != nil {
+				t.Fatalf("ParseSetCommand(%q): %v", line, err)
+			}
+			if err := tree.SetPath(path); err != nil {
+				t.Fatalf("SetPath(%q): %v", line, err)
+			}
+		}
+		return tree
+	}
+
+	for _, tc := range []struct {
+		name    string
+		compile func(*ConfigTree) (*Config, error)
+	}{
+		{"strict_operator_commit", CompileConfig},
+		{"lenient_restart_and_peer_sync", CompileConfigLenient},
+		{"node0", func(tr *ConfigTree) (*Config, error) { return CompileConfigForNode(tr, 0) }},
+		{"node1", func(tr *ConfigTree) (*Config, error) { return CompileConfigForNode(tr, 1) }},
+		{"node0_lenient", func(tr *ConfigTree) (*Config, error) { return CompileConfigForNodeLenient(tr, 0) }},
+		{"node1_lenient", func(tr *ConfigTree) (*Config, error) { return CompileConfigForNodeLenient(tr, 1) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := tc.compile(build(t))
+			if err != nil {
+				t.Fatalf("compile: %v (a #5619 plaintext advisory must NEVER reject)", err)
+			}
+			got := plaintextWarnings5619(cfg)
+			if len(got) != 1 {
+				t.Fatalf("want exactly 1 #5619 advisory on the %s path, got %d: %v",
+					tc.name, len(got), got)
+			}
+		})
 	}
 }
 
