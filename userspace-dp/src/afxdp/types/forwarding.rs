@@ -495,15 +495,41 @@ impl ForwardingState {
     }
 
     /// #3651: the egress (to) zone id for `egress_ifindex`, or `0` when the
-    /// interface is unknown / unzoned. Mirrors the egress half of
-    /// `zone_pair_ids_for_flow_with_override`; used by the per-zone traffic
-    /// counter (`record_zone_traffic`) on the forward path where only the
-    /// egress ifindex (not zone) is in hand.
+    /// interface is unknown / unzoned. THE single egress-zone resolver: the
+    /// zone-pair resolver (`zone_pair_ids_for_flow_with_override`), the
+    /// per-zone traffic counter (`record_zone_traffic`) and the filter-log
+    /// egress-zone field all read through here, so the adjudicated zone and
+    /// the logged/counted zone can never disagree.
+    ///
+    /// #6713: `egress` is NOT the authoritative ifindex -> zone map —
+    /// `ifindex_to_zone_id` is. `populate_egress` skips any interface whose
+    /// link-layer address cannot be resolved (`interfaces.rs`, the `src_mac`
+    /// gate), which for an IPsec secure tunnel (xfrmi) is UNCONDITIONAL: it is
+    /// `ARPHRD_NONE`, so `hardware_addr` is empty, the parent is itself a
+    /// MAC-less xfrmi, and `iface.tunnel` means a Junos `tunnel {source
+    /// destination}` stanza that `st0` does not have. Reading only `egress`
+    /// therefore returned `0` for a correctly-zoned tunnel, and zone id 0 is
+    /// the reserved "unknown" sentinel that `evaluate_policy_result_l3_aware`
+    /// refuses to match ANY exact, wildcard or `junos-global` rule against — so
+    /// no operator-authored permit could ever apply to LAN->tunnel transit and
+    /// every packet fell to the default policy.
+    ///
+    /// The fallback fires ONLY when `egress` has no row at all. A row that
+    /// exists and carries `zone_id == 0` (a genuinely unzoned interface) is
+    /// left at 0 deliberately: `ifindex_to_zone_id` also carries the zone
+    /// PROPAGATED from a child unit onto its physical parent, and inheriting
+    /// that onto an interface the operator deliberately left unzoned would
+    /// widen the adjudicated zone pair for ordinary VLAN trunks. So for every
+    /// ifindex that has an egress row this is bit-identical to the pre-#6713
+    /// read; only the MAC-less-interface hole is closed, and it is closed with
+    /// exactly the value the INGRESS half of the same zone pair already uses
+    /// for that ifindex.
     #[inline]
     pub(in crate::afxdp) fn egress_zone_id(&self, egress_ifindex: i32) -> u16 {
         self.egress
             .get(&egress_ifindex)
             .map(|iface| iface.zone_id)
+            .or_else(|| self.ifindex_to_zone_id.get(&egress_ifindex).copied())
             .unwrap_or(0)
     }
 

@@ -791,6 +791,48 @@ supports protocol + port ranges. `rule.inactive` is the policy-scheduler result
 published by the Go daemon; inactive scheduled rules are skipped before any
 match side effects or counters.
 
+**Zone-pair resolution — the egress half (#6713).** `ingress_zone` and
+`egress_zone` above are u16 ids resolved by
+`forwarding::zone_pair_ids_for_flow_with_override`. Both halves now read the
+SAME authoritative source. The ingress half reads
+`ForwardingState::ifindex_to_zone_id`; the egress half calls
+`ForwardingState::egress_zone_id`, which prefers the denormalized
+`EgressInterface.zone_id` (one map lookup + a field load on the hot path) and
+falls back to `ifindex_to_zone_id` when the interface has **no `egress` row at
+all**.
+
+That fallback is load-bearing, not defensive. `forwarding_build::populate_egress`
+builds an `EgressInterface` only for an interface whose link-layer address it can
+resolve — the row carries `src_mac` + `bind_ifindex`, i.e. an assertion that an
+Ethernet frame can be built for it and handed to an AF_XDP bind target. An IPsec
+secure tunnel (`st0`, an xfrmi) is `ARPHRD_NONE` and fails that gate
+unconditionally: `hardware_addr` is empty, `mac_by_ifindex[parent]` is absent
+(the parent is itself a MAC-less xfrmi), and `iface.tunnel` means a Junos
+`tunnel { source destination }` stanza that `st0` does not have. Reading the
+to-zone from `egress` alone therefore yielded id **0** for a correctly-zoned
+tunnel — and 0 is the reserved "unknown zone" sentinel that
+`evaluate_policy_result_l3_aware` refuses to match ANY exact, wildcard or
+`junos-global` rule against. Every LAN→tunnel packet was adjudicated as
+`(lan, 0)`, no operator-authored permit could apply, and the drop was attributed
+to the implicit default policy — pointing every diagnostic at the wrong place.
+
+Scope of the fallback:
+
+- It fires ONLY when `egress` has no row. A row that exists carrying
+  `zone_id == 0` (a genuinely unzoned interface) stays 0 — `ifindex_to_zone_id`
+  also holds the zone PROPAGATED from a child unit onto its physical parent, and
+  inheriting that would widen the adjudicated pair for ordinary VLAN trunks. So
+  for every ifindex that HAS an egress row the resolved to-zone is unchanged.
+- `egress_zone_id` is the single egress-zone resolver: policy adjudication, the
+  #3651 per-zone traffic counter, and the filter-log `egress_zone_id` field all
+  route through it, so the adjudicated zone and the logged/counted zone cannot
+  disagree.
+- The MAC-less interface is still ABSENT from `state.egress`, so nothing on the
+  TX path changes: `session_glue::populate_egress_resolution` still leaves
+  `src_mac = None` and `tx_ifindex = egress_ifindex` for it, and the packet still
+  reaches the kernel through the slow-path reinject rather than an AF_XDP TX with
+  an all-zero source MAC on a link-layer-less device.
+
 **Malformed-address fail-closed (#3367 legacy, #3711 v3 + books).** Every
 address parse path in the snapshot builder REPORTS an unparseable token and
 fails the WHOLE snapshot closed rather than silently dropping it. Silent-drop is

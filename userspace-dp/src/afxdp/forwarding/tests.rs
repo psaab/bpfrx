@@ -5,7 +5,10 @@ use crate::event_stream::DataplaneEventRateLimitConfig;
 use crate::event_stream::codec::DataplaneEventKind;
 use crate::nat::SourceNatFailureReason;
 use crate::test_zone_ids::*;
-use crate::{FabricSnapshot, NeighborSnapshot, SourceNATRuleSnapshot, ZoneSnapshot};
+use crate::{
+    FabricSnapshot, InterfaceAddressSnapshot, NeighborSnapshot, PolicyRuleSnapshot, RouteSnapshot,
+    SourceNATRuleSnapshot, ZoneSnapshot,
+};
 
 fn active_ha_runtime(now_secs: u64) -> HAGroupRuntime {
     HAGroupRuntime {
@@ -4904,5 +4907,398 @@ fn fabric_link_empty_peer_mac_is_skipped_as_unresolved_peer() {
     assert!(
         after > before,
         "an unresolved fabric peer must bump FABRIC_LINK_UNRESOLVED_PEER"
+    );
+}
+
+// ===================== #6713: MAC-less egress zone resolution =====================
+//
+// An IPsec secure tunnel (xfrmi) is `ARPHRD_NONE`: it has no link-layer
+// address, so `populate_egress`'s `src_mac` gate skips it and the interface
+// gets NO `state.egress` row. All three of that gate's MAC sources fail for it
+// unconditionally: `hardware_addr` is empty (netlink reports `hw_len=0`),
+// `mac_by_ifindex[bind_ifindex]` is absent (the parent is itself a MAC-less
+// xfrmi), and `iface.tunnel` is false (that flag means a Junos
+// `tunnel {source destination}` stanza, which `st0` does not have).
+//
+// The to-zone of a forwarding decision used to be read from `state.egress`
+// alone, so a correctly-zoned tunnel adjudicated as zone id 0 — the reserved
+// "unknown" sentinel that `evaluate_policy_result_l3_aware` refuses to match
+// ANY exact, wildcard or `junos-global` rule against. Every LAN->tunnel packet
+// therefore fell to the default policy no matter what the operator permitted.
+
+/// The zone id the #6713 fixture gives the tunnel's `vpn` zone. Reuses an
+/// existing test-only constant; only distinctness from the LAN zone matters.
+const TEST_VPN_ZONE_ID_6713: u16 = TEST_DMZ_ZONE_ID;
+
+const TUNNEL_IFINDEX_6713: i32 = 42;
+const LAN_IFINDEX_6713: i32 = 24;
+/// MAC-ful, UNZONED physical parent of a zoned VLAN unit — the scoping guard.
+const UNZONED_PARENT_IFINDEX_6713: i32 = 90;
+
+/// Policy shape for the #6713 fixture.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TunnelPolicy6713 {
+    /// `from-zone lan to-zone vpn ... then permit` -- what an operator writes
+    /// for a route-based VPN.
+    PermitLanToVpn,
+    /// A permit that exists but is scoped to a DIFFERENT zone pair. The tunnel
+    /// must NOT inherit it; the default-DENY policy must still deny.
+    PermitOtherPairOnly,
+    /// `from-zone lan to-zone vpn ... then deny` -- the operator's OWN deny,
+    /// which must be the attributed verdict rather than the implicit default.
+    DenyLanToVpn,
+}
+
+fn secure_tunnel_snapshot_6713(policy: TunnelPolicy6713) -> ConfigSnapshot {
+    ConfigSnapshot {
+        zones: vec![
+            ZoneSnapshot {
+                name: "lan".to_string(),
+                id: TEST_LAN_ZONE_ID,
+                host_inbound_configured: true,
+                host_inbound_system_services: vec!["any-service".to_string()],
+                ..Default::default()
+            },
+            ZoneSnapshot {
+                name: "vpn".to_string(),
+                id: TEST_VPN_ZONE_ID_6713,
+                host_inbound_configured: true,
+                host_inbound_system_services: vec!["any-service".to_string()],
+                ..Default::default()
+            },
+        ],
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "reth1.0".to_string(),
+                zone: "lan".to_string(),
+                linux_name: "ge-0-0-1".to_string(),
+                ifindex: LAN_IFINDEX_6713,
+                mtu: 1500,
+                hardware_addr: "02:bf:72:01:00:01".to_string(),
+                addresses: vec![InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "10.0.61.1/24".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+            // The secure tunnel, base + unit 0. Both share the xfrmi's single
+            // netdev/ifindex, both carry the `vpn` zone, and NEITHER has a
+            // hardware address -- the deployed shape of a route-based VPN.
+            InterfaceSnapshot {
+                name: "st0".to_string(),
+                zone: "vpn".to_string(),
+                linux_name: "st0".to_string(),
+                ifindex: TUNNEL_IFINDEX_6713,
+                mtu: 1400,
+                unit_count: 1,
+                addresses: vec![InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "10.5.5.1/30".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "st0.0".to_string(),
+                zone: "vpn".to_string(),
+                linux_name: "st0".to_string(),
+                parent_linux_name: "st0".to_string(),
+                ifindex: TUNNEL_IFINDEX_6713,
+                parent_ifindex: TUNNEL_IFINDEX_6713,
+                mtu: 1400,
+                addresses: vec![InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "10.5.5.1/30".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+            // Scoping control: a MAC-ful physical parent the operator left
+            // UNZONED, carrying a zoned VLAN unit. `populate_interfaces`
+            // propagates the unit's zone onto the parent ifindex, so
+            // `ifindex_to_zone_id` has a non-zero entry for it -- but the
+            // parent DOES have an `egress` row (zone_id 0), and the egress
+            // resolver must keep answering 0 for it.
+            InterfaceSnapshot {
+                name: "ge-0/0/9".to_string(),
+                linux_name: "ge-0-0-9".to_string(),
+                ifindex: UNZONED_PARENT_IFINDEX_6713,
+                mtu: 1500,
+                unit_count: 1,
+                hardware_addr: "02:bf:72:09:00:00".to_string(),
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "ge-0/0/9.100".to_string(),
+                zone: "lan".to_string(),
+                linux_name: "ge-0-0-9.100".to_string(),
+                parent_linux_name: "ge-0-0-9".to_string(),
+                ifindex: 91,
+                parent_ifindex: UNZONED_PARENT_IFINDEX_6713,
+                vlan_id: 100,
+                mtu: 1500,
+                hardware_addr: "02:bf:72:09:00:00".to_string(),
+                ..Default::default()
+            },
+        ],
+        routes: vec![RouteSnapshot {
+            table: "inet.0".to_string(),
+            family: "inet".to_string(),
+            destination: "192.168.99.0/24".to_string(),
+            next_hops: vec!["10.5.5.2".to_string()],
+            discard: false,
+            next_table: String::new(),
+            preference: 5,
+        }],
+        default_policy: "deny".to_string(),
+        policies: vec![match policy {
+            TunnelPolicy6713::PermitLanToVpn => PolicyRuleSnapshot {
+                name: "lan-to-vpn".to_string(),
+                from_zone: "lan".to_string(),
+                to_zone: "vpn".to_string(),
+                source_addresses: vec!["any".to_string()],
+                destination_addresses: vec!["any".to_string()],
+                applications: vec!["any".to_string()],
+                application_terms: Vec::new(),
+                action: "permit".to_string(),
+                ..Default::default()
+            },
+            // Scoped to (vpn, lan) -- the RETURN pair, not the transit pair
+            // under test. A fix that widened the tunnel's zone into "matches
+            // anything" would pick this up.
+            TunnelPolicy6713::PermitOtherPairOnly => PolicyRuleSnapshot {
+                name: "vpn-to-lan".to_string(),
+                from_zone: "vpn".to_string(),
+                to_zone: "lan".to_string(),
+                source_addresses: vec!["any".to_string()],
+                destination_addresses: vec!["any".to_string()],
+                applications: vec!["any".to_string()],
+                application_terms: Vec::new(),
+                action: "permit".to_string(),
+                ..Default::default()
+            },
+            TunnelPolicy6713::DenyLanToVpn => PolicyRuleSnapshot {
+                name: "lan-to-vpn-deny".to_string(),
+                from_zone: "lan".to_string(),
+                to_zone: "vpn".to_string(),
+                source_addresses: vec!["any".to_string()],
+                destination_addresses: vec!["any".to_string()],
+                applications: vec!["any".to_string()],
+                application_terms: Vec::new(),
+                action: "deny".to_string(),
+                ..Default::default()
+            },
+        }],
+        ..Default::default()
+    }
+}
+
+/// Asserts the fixture still reproduces the #6713 shape: the tunnel is zoned,
+/// has NO `egress` row, and the real FIB hands its ifindex to the policy site.
+/// Without this the zone-pair assertions could pass vacuously.
+fn assert_secure_tunnel_preconditions_6713(state: &ForwardingState) -> ForwardingResolution {
+    assert!(
+        !state.egress.contains_key(&TUNNEL_IFINDEX_6713),
+        "precondition: the MAC-less tunnel must have NO state.egress row -- that hole is what \
+         #6713 is about. If populate_egress now admits MAC-less interfaces, this test no longer \
+         exercises the defect and must be re-pointed."
+    );
+    assert_eq!(
+        state
+            .ifindex_to_zone_id
+            .get(&TUNNEL_IFINDEX_6713)
+            .copied()
+            .unwrap_or(0),
+        TEST_VPN_ZONE_ID_6713,
+        "precondition: the tunnel IS correctly zoned in the authoritative map"
+    );
+    let resolution = lookup_forwarding_resolution_v4(
+        state,
+        None,
+        "192.168.99.7".parse().expect("dst"),
+        "inet.0",
+        0,
+        true,
+        None,
+    );
+    assert_eq!(
+        resolution.egress_ifindex, TUNNEL_IFINDEX_6713,
+        "precondition: the real FIB must hand the tunnel ifindex to the policy site \
+         (disposition {:?})",
+        resolution.disposition
+    );
+    resolution
+}
+
+/// #6713 core, fail-on-revert. A LAN -> secure-tunnel packet must be
+/// adjudicated against `(lan, vpn)` and PERMITTED by the operator's explicit
+/// `from-zone lan to-zone vpn permit` under a default-DENY policy.
+///
+/// Revert `ForwardingState::egress_zone_id`'s `ifindex_to_zone_id` fallback and
+/// the to-zone collapses to 0, no rule can match, and the action becomes the
+/// default Deny -- this test goes RED on both the zone-pair and the action.
+#[test]
+fn secure_tunnel_to_zone_reaches_policy_6713() {
+    let state = build_forwarding_state(&secure_tunnel_snapshot_6713(
+        TunnelPolicy6713::PermitLanToVpn,
+    ));
+    let resolution = assert_secure_tunnel_preconditions_6713(&state);
+
+    let (from_id, to_id) =
+        zone_pair_ids_for_flow(&state, LAN_IFINDEX_6713, resolution.egress_ifindex);
+    assert_eq!(from_id, TEST_LAN_ZONE_ID, "from-zone");
+    assert_eq!(
+        to_id, TEST_VPN_ZONE_ID_6713,
+        "to-zone must be the tunnel's configured zone, not the 0 'unknown' sentinel"
+    );
+
+    let result = crate::policy::evaluate_policy_result_with_icmp(
+        &state.policy,
+        from_id,
+        to_id,
+        "10.0.61.102".parse().expect("src"),
+        "192.168.99.7".parse().expect("dst"),
+        PROTO_TCP,
+        40000,
+        443,
+        None,
+        64,
+    );
+    assert_eq!(
+        result.action,
+        PolicyAction::Permit,
+        "the operator's explicit from-zone lan to-zone vpn permit must match"
+    );
+    assert_ne!(
+        result.policy_id,
+        crate::policy::DEFAULT_POLICY_SENTINEL_ID,
+        "the verdict must come from the operator's rule, not the implicit default policy"
+    );
+
+    // The String twin used by test-only callers must agree with the production
+    // u16 resolver -- it reads the same egress-zone helper.
+    let (from_zone, to_zone) =
+        zone_pair_for_flow(&state, LAN_IFINDEX_6713, resolution.egress_ifindex);
+    assert_eq!(from_zone, "lan");
+    assert_eq!(to_zone, "vpn");
+}
+
+/// #6713 fail-CLOSED direction. The fix must not turn "policy cannot see the
+/// tunnel" into "the tunnel is permitted". With the SAME topology and NO
+/// matching permit, a LAN -> tunnel packet is still DENIED, and the denial is
+/// now attributed to the implicit default policy for the REAL zone pair
+/// `(lan, vpn)` rather than to the unknown-zone accident.
+#[test]
+fn secure_tunnel_without_permit_still_denies_6713() {
+    let state = build_forwarding_state(&secure_tunnel_snapshot_6713(
+        TunnelPolicy6713::PermitOtherPairOnly,
+    ));
+    let resolution = assert_secure_tunnel_preconditions_6713(&state);
+
+    let (from_id, to_id) =
+        zone_pair_ids_for_flow(&state, LAN_IFINDEX_6713, resolution.egress_ifindex);
+    assert_eq!(
+        to_id, TEST_VPN_ZONE_ID_6713,
+        "the deny must be a REAL adjudication of (lan, vpn), not a zone-0 fallthrough"
+    );
+
+    let result = crate::policy::evaluate_policy_result_with_icmp(
+        &state.policy,
+        from_id,
+        to_id,
+        "10.0.61.102".parse().expect("src"),
+        "192.168.99.7".parse().expect("dst"),
+        PROTO_TCP,
+        40000,
+        443,
+        None,
+        64,
+    );
+    assert_eq!(
+        result.action,
+        PolicyAction::Deny,
+        "the only permit in the config is scoped to (vpn, lan); the tunnel must NOT \
+         inherit it and the default-DENY policy must still deny"
+    );
+    assert_eq!(
+        result.policy_id,
+        crate::policy::DEFAULT_POLICY_SENTINEL_ID,
+        "attributed to the implicit default policy"
+    );
+}
+
+/// #6713, the other half of "the fix does not fail open": the operator's OWN
+/// `from-zone lan to-zone vpn ... then deny` must be the ATTRIBUTED verdict.
+/// Before the fix the packet was also denied -- but by the implicit default
+/// policy, because the to-zone was 0 and the operator's rule was never
+/// consulted. Same drop, different (and truthful) attribution: this is what
+/// makes `show security policies` and the RT_FLOW deny event point at the rule
+/// that actually decided.
+///
+/// Revert the `egress_zone_id` fallback and the policy id becomes the default
+/// sentinel -- RED.
+#[test]
+fn secure_tunnel_operator_deny_is_attributed_to_its_rule_6713() {
+    let state =
+        build_forwarding_state(&secure_tunnel_snapshot_6713(TunnelPolicy6713::DenyLanToVpn));
+    let resolution = assert_secure_tunnel_preconditions_6713(&state);
+
+    let (from_id, to_id) =
+        zone_pair_ids_for_flow(&state, LAN_IFINDEX_6713, resolution.egress_ifindex);
+    assert_eq!(to_id, TEST_VPN_ZONE_ID_6713);
+
+    let result = crate::policy::evaluate_policy_result_with_icmp(
+        &state.policy,
+        from_id,
+        to_id,
+        "10.0.61.102".parse().expect("src"),
+        "192.168.99.7".parse().expect("dst"),
+        PROTO_TCP,
+        40000,
+        443,
+        None,
+        64,
+    );
+    assert_eq!(result.action, PolicyAction::Deny);
+    assert_ne!(
+        result.policy_id,
+        crate::policy::DEFAULT_POLICY_SENTINEL_ID,
+        "the operator's explicit deny must be the attributed verdict, not the implicit default"
+    );
+}
+
+/// #6713 scoping guard. The `ifindex_to_zone_id` fallback fires ONLY when the
+/// interface has NO `egress` row. A MAC-ful interface the operator deliberately
+/// left UNZONED keeps to-zone 0 even though `ifindex_to_zone_id` carries the
+/// zone PROPAGATED onto it from a zoned VLAN unit -- inheriting that would
+/// widen the adjudicated zone pair for ordinary trunks.
+///
+/// Widen the fallback to also fire on `Some(0)` and this goes RED.
+#[test]
+fn unzoned_interface_with_egress_row_stays_zone_zero_6713() {
+    let state = build_forwarding_state(&secure_tunnel_snapshot_6713(
+        TunnelPolicy6713::PermitLanToVpn,
+    ));
+
+    assert!(
+        state.egress.contains_key(&UNZONED_PARENT_IFINDEX_6713),
+        "precondition: the MAC-ful unzoned parent DOES have an egress row"
+    );
+    assert_eq!(
+        state
+            .ifindex_to_zone_id
+            .get(&UNZONED_PARENT_IFINDEX_6713)
+            .copied()
+            .unwrap_or(0),
+        TEST_LAN_ZONE_ID,
+        "precondition: its child's zone IS propagated onto it in ifindex_to_zone_id -- \
+         without that this test cannot detect an over-firing fallback"
+    );
+
+    let (_, to_id) = zone_pair_ids_for_flow(&state, LAN_IFINDEX_6713, UNZONED_PARENT_IFINDEX_6713);
+    assert_eq!(
+        to_id, 0,
+        "an interface with an egress row carrying zone_id 0 must stay 0"
     );
 }

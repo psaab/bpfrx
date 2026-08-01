@@ -165,13 +165,14 @@ pub(super) fn filter_log_ingress_zone_id(
         .unwrap_or(0)
 }
 
+/// #6713: resolve through the shared `egress_zone_id` so a filter-log event
+/// reports the SAME to-zone the policy plane adjudicated. The sibling
+/// `filter_log_ingress_zone_id` above already reads `ifindex_to_zone_id`;
+/// reading only `egress` here logged zone 0 for a MAC-less interface (an IPsec
+/// xfrmi) whose zone the ingress half resolved correctly.
 #[inline]
 pub(super) fn filter_log_egress_zone_id(forwarding: &ForwardingState, egress_ifindex: i32) -> u16 {
-    forwarding
-        .egress
-        .get(&egress_ifindex)
-        .map(|egress| egress.zone_id)
-        .unwrap_or(0)
+    forwarding.egress_zone_id(egress_ifindex)
 }
 
 #[derive(Clone, Copy, Debug)]

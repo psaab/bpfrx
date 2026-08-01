@@ -66266,3 +66266,37 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-08-01 16:40
+- **Action**: #6713 — a MAC-less IPsec secure tunnel (`st0`, an xfrmi) is
+  skipped by `forwarding_build::populate_egress` (its `src_mac` gate is
+  unsatisfiable for an `ARPHRD_NONE` device: `hardware_addr` is empty,
+  `mac_by_ifindex[parent]` is absent because the parent is itself a MAC-less
+  xfrmi, and `iface.tunnel` means a Junos `tunnel {source destination}` stanza
+  `st0` does not have). The to-zone of a forwarding decision was read from
+  `state.egress` alone, so a correctly-zoned tunnel adjudicated as zone id 0 —
+  the reserved "unknown" sentinel that `evaluate_policy_result_l3_aware`
+  refuses to match ANY exact, wildcard or `junos-global` rule against. Every
+  LAN->tunnel packet was evaluated as `(lan, 0)`, no operator permit could
+  apply, and the drop was misattributed to the implicit default policy.
+  Fixed at the READ, not at `populate_egress`: `ForwardingState::egress_zone_id`
+  now falls back to the authoritative `ifindex_to_zone_id` when the interface
+  has NO egress row, and the zone-pair resolver (both the production u16 form
+  and its test-only String twin), the #3651 per-zone traffic counter and the
+  filter-log egress-zone field all route through that one helper. Admitting the
+  tunnel INTO `state.egress` was rejected: an `EgressInterface` carries
+  `src_mac` + `bind_ifindex`, i.e. an assertion that an Ethernet frame can be
+  built and TXed for it, which is false for a link-layer-less xfrmi and would
+  have changed ~30 TX-path consumers. The fallback is deliberately scoped to
+  the absent-row case; an existing row carrying `zone_id == 0` stays 0 so an
+  interface the operator left unzoned does not inherit a child unit's
+  propagated zone. Measured end-to-end (real Go snapshot -> real
+  `build_forwarding_state` -> real FIB -> real policy evaluator) across
+  2 bind spellings x 3 next-hops x 2 destinations x 3 policy shapes: master
+  drops 8 of the bare spelling's 12 permitted cells, head permits all 12, and
+  the no-matching-permit control still denies at both revisions.
+- **File(s)**: userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/filter.rs,
+  userspace-dp/src/afxdp/forward_request.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md
