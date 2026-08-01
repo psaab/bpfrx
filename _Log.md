@@ -66512,3 +66512,19 @@ break — `go vet` confirmed passing under every revert.
   contract; mutation 19 (refinement no-op) reds both subtests.
 - **File(s)**: pkg/cluster/heartbeat_manager.go, pkg/cluster/heartbeat_epoch_test.go,
   pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-02 01:55
+- **Action**: #6169 — swept by DELETED SYMBOL NAME, an angle none of the previous
+  sweeps used, and found six more. The prior passes were all keyed on the removed
+  design's PROSE (durable floor, fails open, both state files); they cannot catch
+  a comment that correctly describes current behaviour while attributing it to a
+  function that no longer exists. `nextBootEpoch` was named as live in five
+  places (2 code comments describing the plausibility bound, 3 README bullets
+  describing the sender) and `bootEpochResolveWait` in one — all deleted symbols.
+  Retargeted at `bootEpochSeed` / `refineBootEpoch`. Sweep is now three
+  independent axes: removed-design prose, behaviour keywords (fails open / state
+  files / once per process), and removed-symbol identifiers. The last is
+  mechanical and complete by construction — enumerate what the diff deleted,
+  grep each — so it is the one to run first next time rather than last.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/heartbeat_epoch_test.go,
+  pkg/cluster/README.md, _Log.md

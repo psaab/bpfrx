@@ -328,7 +328,8 @@ peer liveness (`lastSeen`) or drive election.
     flush the ring — the bypass that failed review in #6370. The floor only
     rises to a value the genuine peer actually signed, so replaying a
     captured high-epoch frame cannot push it above the live peer.
-  - **Sender** (`nextBootEpoch`): `max(persisted+1, wall_clock_nanos)`,
+  - **Sender** (`bootEpochSeed` published synchronously, then `refineBootEpoch`):
+    `max(persisted+1, wall_clock_nanos)`,
     persisted atomically at `/var/lib/xpf/ha-boot-epoch` (the same durable
     state root as SNMPv3 `engineBoots`). The two terms cover the two
     failure modes neither survives alone — a **backward clock step** across
@@ -416,7 +417,7 @@ peer liveness (`lastSeen`) or drive election.
     (`epochPlausibleMax`) may be latched: a present-day value is ~0.25x that
     bound, `MaxUint64` is ~2.5x it (year 2554). `MaxUint64` is unreachable
     by ordinary operation but IS reachable through a corrupt or hand-edited
-    persist file — and `nextBootEpoch` chaining from such a value would emit
+    persist file — and `refineBootEpoch` chaining from such a value would emit
     `MaxUint64` on one boot and then REGRESS on the next (`MaxUint64+1`
     overflows, so the wall clock wins), permanently locking this node out of
     a peer that had latched it. It therefore refuses to chain from an
@@ -436,7 +437,7 @@ peer liveness (`lastSeen`) or drive election.
     `MaxUint64`) ahead of the RECEIVER's wall clock. Bounding the forward side
     stops the **latch**, which is the unrecoverable half, so a peer that is
     corrected is accepted again the moment it comes back into range.
-    `nextBootEpoch` applies the same bound to the value it chains from, and the
+    `refineBootEpoch` applies the same bound to the value it chains from, and the
     floor store applies it on LOAD, so a node — or a floor — written under a bad
     clock heals instead of being stranded.
     The forward bound is applied ONLY when the receiver's own clock is itself

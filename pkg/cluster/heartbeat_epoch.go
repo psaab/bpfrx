@@ -138,7 +138,7 @@ var bootEpochPath = "/var/lib/xpf/ha-boot-epoch"
 //
 // The floor is a ONE-WAY DOOR: once raised it rejects everything below it, so a
 // bogus far-future value locks the peer out permanently. The epoch is
-// nanoseconds-since-the-Unix-epoch by construction (nextBootEpoch), so anything
+// nanoseconds-since-the-Unix-epoch by construction (bootEpochSeed), so anything
 // at or past the year 2200 is not a timestamp any healthy sender produces:
 //
 //	now (2026)          ~1.79e18 ns   ->  0.25x the bound
@@ -147,7 +147,7 @@ var bootEpochPath = "/var/lib/xpf/ha-boot-epoch"
 //
 // MaxUint64 is ~528 years out, so it is unreachable by ordinary operation — but
 // it IS reachable through a corrupted or hand-edited persist file, which is the
-// only path that ever puts an arbitrary uint64 in this field. nextBootEpoch
+// only path that ever puts an arbitrary uint64 in this field. refineBootEpoch
 // refuses to chain from such a value, and this is the receiver-side backstop for
 // a peer running a build that does not.
 //
@@ -296,7 +296,7 @@ func heartbeatFrameEpoch(data, authKey []byte) (epoch uint64, present bool) {
 // initHeartbeatEpochState starts this node's boot-epoch resolution, and is
 // called from StartHeartbeat. It MUST NOT BLOCK.
 //
-// It used to wait up to bootEpochResolveWait for the persisted value, back when
+// It used to wait up to two seconds for the persisted value, back when
 // the epoch was only published after that read completed. Once emission moved
 // ahead of all I/O (Manager.heartbeatBootEpoch) the wait stopped buying
 // anything — and it was actively harmful: StartHeartbeat calls StopHeartbeat

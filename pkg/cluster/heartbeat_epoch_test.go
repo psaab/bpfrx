@@ -183,7 +183,7 @@ func TestHeartbeatBootEpochClosesSustainedReplay_6169(t *testing.T) {
 		caps := make([][][]byte, 0, n)
 		for i := 0; i < n; i++ {
 			// A real daemon restart draws a fresh session AND a strictly higher
-			// epoch (nextBootEpoch).
+			// epoch (bootEpochSeed + refineBootEpoch).
 			frames := e.captureIncarnation(uint64(0x3000+i), uint64(1_000+i), epochFramesPerIncarnation)
 			e.liveRun(frames, "epoch capture")
 			caps = append(caps, frames)
