@@ -1044,6 +1044,22 @@ flattens it into a form that fails to compile on reload (it fails closed, with a
 dropping admission). Author multi-member bodies in hierarchical form, or use
 per-interface statements, if you round-trip configs through `display set`.
 
+**Revoking a grant made this way needs care.** A bracket-body grant has no
+targeted `delete`: because the admission was authored on the multi-member node
+rather than on either interface, there is no per-interface path to remove it
+from just one member. The revocation that does work —
+`delete security zones security-zone <z> interfaces [ a b ]` — deletes the
+whole node, which also removes `a` and `b` from the zone entirely. That is
+almost never what an operator wants, and on a zone-based firewall dropping a
+zone membership is a much larger change than dropping a service.
+
+The safe pattern, and the one to prefer when a grant may later need narrowing:
+author per-interface statements instead of a bracket body. Two statements
+granting `ssh` to `a` and to `b` are individually revocable; one bracket body
+granting it to both is not. If you already have a bracket body and need to
+revoke for one member, rewrite it as per-interface statements in the same commit
+as the delete, so the zone membership is never actually lost.
+
 ## Repeated host-inbound-traffic blocks merge (#4544)
 
 Junos MERGES two literal `host-inbound-traffic { ... }` blocks authored under

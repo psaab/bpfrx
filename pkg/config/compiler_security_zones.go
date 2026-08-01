@@ -214,7 +214,10 @@ func compileZones(node *Node, sec *SecurityConfig) error {
 						// convenient. The interface name is `schemaNode.wildcard`
 						// with args:0, multi:false, compoundKey:false
 						// (schema_security.go), so SetPath's
-						// `nodeKeyCount = 1 + childSchema.args` is ALWAYS 1 and its
+						// `nodeKeyCount = 1 + childSchema.args` (ast_edit.go:289 —
+						// NOT the same-named local in schema_complete.go,
+						// which is the completion walker and decides
+						// nothing here) is ALWAYS 1 and its
 						// container branch stores exactly one token; surplus bracket
 						// tokens can only land on a child LEAF (which has no
 						// host-inbound child, so it is never read here). A bracket

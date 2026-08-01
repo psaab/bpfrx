@@ -319,6 +319,40 @@ security {
 	})
 }
 
+// TestHostInbound6391BareMultiMemberBodyFansToAllMembers pins the BRACKET-LESS
+// spelling of the same shape. The lexer discards `[` and `]`, so
+//
+//	[ ge-0/0/0 ge-0/0/1 ] { host-inbound-traffic {...} }
+//	  ge-0/0/0 ge-0/0/1   { host-inbound-traffic {...} }
+//
+// parse to a byte-identical multi-key node and must therefore compile
+// identically. The brackets are cosmetic at this position.
+//
+// Worth pinning separately rather than trusting the equivalence: the whole
+// safety argument for keying on Keys rests on which spellings can produce
+// len(Keys)>1, so "the lexer drops brackets" is load-bearing rather than
+// incidental. If a future lexer change made the two forms diverge, the
+// bracketed test above would keep passing while this one caught it.
+func TestHostInbound6391BareMultiMemberBodyFansToAllMembers(t *testing.T) {
+	tree := parseHierarchical(t, `
+security {
+    zones {
+        security-zone trust {
+            interfaces {
+                ge-0/0/0 ge-0/0/1 {
+                    host-inbound-traffic { system-services ssh; }
+                }
+            }
+        }
+    }
+}`)
+	got := compileHostInbound6391(t, tree)
+	assertHostInbound6391(t, got, map[string]hib6391{
+		"ge-0/0/0": {SystemServices: []string{"ssh"}},
+		"ge-0/0/1": {SystemServices: []string{"ssh"}},
+	})
+}
+
 // TestHostInbound6391BracketBodyNestedExtraMemberScope pins the judgement call
 // at the edge of the fan: a bracket body that ALSO nests a further membership
 // statement (`[ a b ] { c; host-inbound {...} }`) applies the override to a and b
