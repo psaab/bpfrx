@@ -1795,8 +1795,18 @@ type compileOpts struct {
 	// tolerant load / peer-sync paths downgrade to a warning so an
 	// already-persisted or peer-synced config an older binary silently
 	// accepted still BOOTS (#1960 fail-closed-on-load class) — and there the
-	// policy is additionally poisoned to never-match by compilePolicy's #5575
-	// LenientContentDropped flag rather than published as a widened permit.
+	// policy is additionally poisoned by compilePolicy's #5575
+	// LenientContentDropped flag rather than published as a widened permit —
+	// but ONLY on the userspace dataplane, which is the sole plane that reads
+	// that flag. The kernel host-inbound actuator (junos_host_deny.go ->
+	// daemon_apply_tail.go) does NOT consult it, so a poisoned `junos-host`
+	// policy still projects to nft with an empty source list read as
+	// source-any: it becomes permitAll and suppresses a following deny. That
+	// gap is PRE-EXISTING (the OMITTED spelling reaches it identically on
+	// master) and is tracked as #6705, not introduced here. The runtime
+	// consequences of the snapshot rejection itself — the transit window, HA
+	// divergence, and a poisoned commit-confirmed rollback target — are
+	// likewise pre-existing and tracked as #6707.
 	// Kept as its own flag (not folded into lenientPolicyMissingMatch) so the
 	// two findings stay independently attributable. Same doctrine as
 	// lenientPolicyMissingMatch.
