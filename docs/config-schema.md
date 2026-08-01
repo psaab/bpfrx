@@ -1123,6 +1123,64 @@ the same divergence class #3606 calls out for ports. Covered by
 `pkg/config/compiler_application_chained_leaves_6524_test.go` and the
 policy-OUTCOME suite `pkg/policymatch/app_chained_leaves_6524_test.go`.
 
+**A PACKED hierarchical statement carries its entries on its OWN Keys — the
+fourth collapse pattern, and the only one the flat-set path never produces
+(#6588).** The three patterns above are all `SetPath` artifacts. This one comes
+from the *hierarchical* parser and therefore reaches the compiler only through a
+hand-authored config file, `load merge` / `load override`, or a peer config
+sync — never through a `set` command. A statement that groups entries can be
+written three ways, and they do NOT produce the same AST:
+
+```
+interface-monitor { ge-0/0/0 weight 255; }   # CONTAINER: Keys=[interface-monitor], one child per entry
+interface-monitor ge-0/0/0 weight 255;       # PACKED:    Keys=[interface-monitor ge-0/0/0 weight 255], NO children
+interface-monitor ge-0/0/0 { weight 255; }   # PACKED + body: Keys=[interface-monitor ge-0/0/0], children are that ENTRY's attributes
+set ... interface-monitor ge-0/0/0 weight 255   # flat-set: SetPath yields the CONTAINER shape
+```
+
+A compiler that enumerates entries by iterating the statement's `Children`
+alone sees NOTHING in the packed shape. That was the #6588 fail-open: a packed
+`chassis cluster redundancy-group <n> interface-monitor <if> weight <w>`
+compiled to ZERO interface monitors and a packed `ip-monitoring` to zero
+targets, while `commit` succeeded with no error and no warning — the operator
+had link and probe tracking configured and a redundancy group that never
+demoted on failure. The third spelling was worse than a drop: the entry name
+packs onto the statement while the attributes arrive as children, so reading
+`Children` minted a monitor for an interface literally named `weight`.
+
+`packedOrContainerEntries(cfgNode, skip)` (`compiler_system.go`) is the
+canonical reader — `skip` is how many leading Keys name the statement itself.
+Note its rule is **EITHER/OR, not accumulate**, which is the opposite of the
+`#2419` multi-value contract above and the distinction to get right: a
+multi-value leaf spreads values across Keys AND children of the same kind, so
+`firewallMatchValues` must sum both; a grouping statement with an inline tail IS
+one entry, so its children are that entry's properties, not sibling entries.
+Accumulating there mints the bogus `weight` monitor. `namedInstances`
+(`compiler_protocols.go`) already applies the same either/or rule to named
+instances. Only the outermost level is unpacked — one tail is one entry, which
+is what Junos renders (one statement per line).
+
+Consequences worth knowing when adding a reader:
+
+- **The schema walker does not see this shape at all.** `SchemaValidate` walks
+  the AST from `setSchema`, and a packed tail sits below the depth it reaches,
+  so a typed leaf's `validator` never fires on it. A range/arity gate that must
+  cover the packed spelling has to run on the COMPILED struct
+  (`validateChassisClusterStrict`), not on the schema — which is only true once
+  the packed shape actually compiles.
+- **Silently compiling to nothing is the worst of the three options.** A
+  statement whose packed spelling is genuinely unsupported must be REJECTED at
+  commit with an actionable error. `services ip-monitoring` (a different
+  stanza, `compiler_services.go`) is the fail-CLOSED example: its packed
+  `then preferred-route ...;` is likewise dropped, but a policy with zero
+  compiled routes is a hard commit error ("at least one then preferred-route
+  route is required"), so the operator is told rather than left with a silent
+  no-op.
+
+Covered by `pkg/config/compiler_chassis_packed_monitor_6588_test.go`, which
+pins all three interface-monitor spellings against each other and keeps the
+container/flat-set cases as green controls.
+
 **`multi: true` ALSO prevents single-value REPLACE for repeated keyed-list
 leaves (#3984).** The `#2419` discussion above is about ONE statement with a
 bracket list. The SAME `multi: true` marker fixes a second, distinct shape:
@@ -3578,11 +3636,16 @@ reserved for whole-dataplane selection where a rewrite shim
   same way #4434/#4880 gate the RG id and node priority: on the COMPILED
   `*Config` in `validateChassisClusterStrict`, `0..255`, strict-reject at
   commit / warn on the tolerant load / peer-sync path. Running on the
-  compiled int covers the flat-set and container-hierarchical shapes with
-  one gate (the PACKED one-liner `interface-monitor <if> weight <n>;`
-  written directly under `redundancy-group` is a separate matter — it
-  compiles to ZERO monitors, so the gate never sees it and no debt is
-  installed either; tracked as **#6588**). It is a wire-width gate like
+  compiled int covers ALL THREE spellings with one gate — flat-set,
+  container-hierarchical, and (since **#6588**) the PACKED one-liner
+  `interface-monitor <if> weight <n>;` written directly under
+  `redundancy-group`. The packed spelling used to compile to ZERO monitors,
+  so the gate never saw it and no debt was installed either; now that it
+  compiles like the other two, the gate covers it for free. Note the
+  coverage claim holds BECAUSE the gate reads the compiled int: a typed
+  schema leaf would still miss the packed shape, which sits below the depth
+  `SchemaValidate` reaches (see "A PACKED hierarchical statement carries its
+  entries on its OWN Keys"). It is a wire-width gate like
   its siblings: the weight is the debt subtracted from the RG weight,
   which the heartbeat advertises through a single byte
   (`HeartbeatGroup.Weight`, `uint8(rg.Weight)`) while the local election

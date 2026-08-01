@@ -1960,7 +1960,10 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 			case "strict-vip-ownership":
 				rg.StrictVIPOwnership = true
 			case "interface-monitor":
-				for _, ifChild := range child.Children {
+				// packedOrContainerEntries (#6588): the packed one-liner
+				// `interface-monitor ge-0/0/0 weight 255;` carries the monitor
+				// on the statement's OWN Keys and has no children at all.
+				for _, ifChild := range packedOrContainerEntries(child, 1) {
 					im := &InterfaceMonitor{
 						Interface: ifChild.Name(),
 					}
@@ -1983,35 +1986,47 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 				}
 			case "ip-monitoring":
 				ipm := &IPMonitoring{}
-				if gwNode := child.FindChild("global-weight"); gwNode != nil {
+				// #6588: ip-monitoring installs redundancy-group demotion debt
+				// through the same election path as interface-monitor, and it
+				// packs the same way — `ip-monitoring global-weight 255;` and
+				// `ip-monitoring family inet 10.0.1.1 weight 100;` are leaves
+				// with no children.
+				ipmEntries := packedOrContainerEntries(child, 1)
+				if gwNode := findNamedNode(ipmEntries, "global-weight"); gwNode != nil {
 					if v := nodeVal(gwNode); v != "" {
 						if n, err := strconv.Atoi(v); err == nil {
 							ipm.GlobalWeight = n
 						}
 					}
 				}
-				if gtNode := child.FindChild("global-threshold"); gtNode != nil {
+				if gtNode := findNamedNode(ipmEntries, "global-threshold"); gtNode != nil {
 					if v := nodeVal(gtNode); v != "" {
 						if n, err := strconv.Atoi(v); err == nil {
 							ipm.GlobalThreshold = n
 						}
 					}
 				}
-				for _, familyNode := range child.Children {
+				for _, familyNode := range ipmEntries {
 					if familyNode.Name() != "family" {
 						continue
 					}
 					// Determine inet node: compound key "family inet" vs nested family { inet { } }
 					var inetNode *Node
+					// inetSkip is how many of inetNode's leading Keys name the
+					// node itself rather than a monitored address, so a packed
+					// target (`family inet 10.0.1.1 weight 100;`) is unpacked
+					// from the right offset.
+					inetSkip := 2
 					if len(familyNode.Keys) >= 2 && familyNode.Keys[1] == "inet" {
 						inetNode = familyNode
 					} else {
 						inetNode = familyNode.FindChild("inet")
+						inetSkip = 1
 					}
 					if inetNode == nil {
 						continue
 					}
-					for _, addrChild := range inetNode.Children {
+					for _, addrChild := range packedOrContainerEntries(inetNode, inetSkip) {
 						target := &IPMonitorTarget{
 							Address: addrChild.Name(),
 						}
@@ -2040,6 +2055,72 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 		ch.Cluster.RedundancyGroups = append(ch.Cluster.RedundancyGroups, rg)
 	}
 
+	return nil
+}
+
+// packedOrContainerEntries returns one node per entry carried by cfgNode,
+// across every hierarchical spelling of a Junos statement that groups entries
+// (#6588 — the chassis-cluster instance of the #2419 / #3843 dual-AST-shape
+// class). `skip` is the number of leading Keys that name the statement itself
+// rather than an entry.
+//
+//   - CONTAINER block   `interface-monitor { ge-0/0/0 weight 255; }`
+//     → Keys=["interface-monitor"], one child node per entry. The entries are
+//     the children; returned unchanged.
+//   - PACKED one-liner  `interface-monitor ge-0/0/0 weight 255;`
+//     → Keys=["interface-monitor","ge-0/0/0","weight","255"], NO children. The
+//     statement itself is a single entry; it is returned as one synthetic node
+//     carrying the Keys tail.
+//   - PACKED with block `interface-monitor ge-0/0/0 { weight 255; }`
+//     → Keys=["interface-monitor","ge-0/0/0"], children are that entry's
+//     ATTRIBUTES. The synthetic node keeps them so a nested `weight` is still
+//     found by the caller's FindChild.
+//   - flat set command  `set ... interface-monitor ge-0/0/0 weight 255`
+//     → SetPath yields the CONTAINER shape (the statement keyword becomes the
+//     node, the remaining tokens one child leaf), so it needs no unpacking.
+//
+// The inline tail and the children are EITHER/OR rather than accumulated —
+// exactly the rule namedInstances already applies to named instances. A tail
+// means the statement IS one entry, so its children are that entry's
+// properties, not sibling entries. Accumulating instead would mint a bogus
+// second entry named after the first attribute (`interface-monitor ge-0/0/0 {
+// weight 255; }` would compile a monitor for an interface literally called
+// "weight").
+//
+// Before #6588 the callers iterated cfgNode.Children only, so every PACKED
+// spelling was SILENTLY DROPPED: a hand-authored or `load merge`d config
+// compiled to ZERO interface monitors and ZERO ip-monitoring targets while
+// `commit` succeeded with no error and no warning. The operator had link and
+// probe tracking configured and a redundancy group that never demoted — a
+// failover fail-open. Since the monitors now reach the compiled *Config, the
+// #6549 weight range gate in validateChassisClusterStrict (which runs on the
+// compiled int) covers the packed spelling too.
+//
+// Only the outermost level is unpacked: the tail becomes ONE entry, which is
+// the shape Junos renders (one statement per line). A tail packing two sibling
+// statements onto a single line is not a Junos spelling and is not split here.
+func packedOrContainerEntries(cfgNode *Node, skip int) []*Node {
+	if len(cfgNode.Keys) > skip {
+		return []*Node{{
+			Keys:     append([]string(nil), cfgNode.Keys[skip:]...),
+			Children: cfgNode.Children,
+			IsLeaf:   cfgNode.IsLeaf,
+			Line:     cfgNode.Line,
+			Column:   cfgNode.Column,
+		}}
+	}
+	return cfgNode.Children
+}
+
+// findNamedNode returns the first node in nodes whose first key is name — the
+// slice equivalent of Node.FindChild, for callers that must search the
+// packedOrContainerEntries result rather than a node's raw Children.
+func findNamedNode(nodes []*Node, name string) *Node {
+	for _, n := range nodes {
+		if len(n.Keys) > 0 && n.Keys[0] == name {
+			return n
+		}
+	}
 	return nil
 }
 

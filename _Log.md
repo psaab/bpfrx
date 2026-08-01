@@ -1,3 +1,51 @@
+## 2026-08-01 — #6588 config/cluster: packed interface-monitor / ip-monitoring compiled to nothing
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf)
+- **Action**: Fixed a chassis-cluster failover FAIL-OPEN. A redundancy-group
+  monitor authored in the PACKED hierarchical spelling — one statement
+  directly under `redundancy-group`, no nested block — compiled to NOTHING.
+  The parser yields a single leaf
+  (`Keys=[interface-monitor ge-0/0/0 weight 255]`, no children) while
+  `compileChassis` enumerated monitors by iterating `child.Children` only,
+  so the operator got `rgs=1, monitors=0`: link tracking configured, commit
+  clean, and a redundancy group that never demoted on link-down.
+  Swept the whole `compileChassis` switch (6 arms) and found the same drop
+  at TWO more sites in the same loop, both fixed here: packed `ip-monitoring`
+  (`ip-monitoring global-weight 255;`, `ip-monitoring family inet <addr>
+  weight <n>;`) dropped its global weights and every probe target — the same
+  RG-demotion debt path — and a packed `family inet <addr> weight <n>;` leaf
+  written INSIDE an `ip-monitoring { ... }` block dropped the target too.
+  The `node` / `gratuitous-arp-count` / `preempt` / `strict-vip-ownership`
+  arms already handled both shapes (verified by direct compile, not by
+  reading). A third sub-shape surfaced from the new test rather than the
+  issue: `interface-monitor ge-0/0/0 { weight 255; }` packed the NAME onto
+  the statement while the attributes arrived as children, so the old reader
+  minted a monitor for an interface literally called `weight`.
+  New shared reader `packedOrContainerEntries(cfgNode, skip)` normalises all
+  shapes; its rule is EITHER/OR (an inline tail means the statement IS one
+  entry, so its children are that entry's properties) — the same rule
+  `namedInstances` already applies, and deliberately NOT the accumulate rule
+  the #2419 multi-value contract uses, since accumulating is what mints the
+  bogus `weight` monitor. `findNamedNode` is its slice-shaped `FindChild`.
+  Second-order: because the packed shape now reaches the compiled `*Config`,
+  the #6549 weight range gate (which runs on the compiled int) covers it for
+  free — a packed `weight -100` is now rejected at commit instead of
+  silently accepted.
+- **Validation**: fail-on-revert with `compiler_system.go` restored verbatim
+  from `origin/master` (test kept): `go build ./...` + `go vet ./...` CLEAN,
+  every Packed subtest RED as an assertion naming the missing monitor /
+  target, and the FlatSet / ContainerHierarchical / Control* subtests GREEN
+  as controls. Full `pkg/config` suite under mutation: 7 top-level FAILs, all
+  `*_6588`, zero others. Restored: full `go test ./...` exit 0.
+- **Scope left out**: `services ip-monitoring` (#1827, `compiler_services.go`)
+  drops its packed `then preferred-route ...;` too, but that is fail-CLOSED —
+  a policy with zero compiled routes is a hard commit error ("at least one
+  then preferred-route route is required"), verified by direct compile. It is
+  a different stanza with a loud failure, so it stays out of this PR.
+- **File(s)**: `pkg/config/compiler_system.go`,
+  `pkg/config/compiler_chassis_packed_monitor_6588_test.go` (new),
+  `docs/config-schema.md`, `_Log.md`
+
 ## 2026-07-31 — #6611 review round 2: guard scoped narrower than its claim
 
 - **Timestamp**: 2026-07-31 (fix/6611-control-channel-auth, PR #6624)
