@@ -1,17 +1,19 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v71 — r69 folds: Codex M1's four-class A3
-  contract redesign (v70's universal typed-error form falsified by
-  the non-error signatures + the test-pinned mapless counter-clear
-  contracts), Codex M2's teardown-claim retraction (the cilium/ebpf
-  close-in-use premise was wrong; the shutdown link-map race is now
-  a named residual, §10), AGY r69's `Close()`-entry Store(false),
-  Codex m1-m4 (blocked-Start test respec, corrected alternative
-  rationale, fwdstatus test legs, comment sweep + file-count fix),
-  SMR r69 m1/m2 (getter family named, ungated carve-out explicit);
-  r69 verdicts: Codex PLAN-NEEDS-MAJOR (2M/4m — both in v70's A3
-  fold), AGY PLAN-NEEDS-MINOR (0M/1m), Claude SMR
-  PLAN-READY-WITH-NITS (0M/2m); pending convergence review r70
+- **Status**: DRAFT v72 — r70 folds: Codex M1's partition completion
+  (class-2 widened to ANY signature with byte-for-byte missing-map
+  outcomes incl. the error-signature no-ops; class-3 expanded to all
+  hybrids with required pre-error side effects; the AST matrix
+  assigns every exported method to a class), Codex m1's
+  gate-before-first-Start-state-access placement (AddTxPort
+  validation precedence preserved), Codex m2's class-4 corrections
+  (GetPersistentNAT + XDPLinks/TCLinks to the ungated construction
+  set; NewEventSource honors its error signature), Codex m3's
+  exact-schedule residual text + narrowed-not-closed exposure
+  wording, Codex m4's three-site comment-sweep addition; r70
+  verdicts: Codex PLAN-NEEDS-MAJOR (1M/4m — the partition gap),
+  AGY PLAN-READY, Claude SMR PLAN-READY; pending convergence
+  review r71
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -3141,7 +3143,13 @@
   `errors`-import deletion join the inventory); Codex m4
   (the §7 shutdown-admission invariant and the §6
   health-message growth parenthetical were follow-up
-  residue — moved to the seed).
+  residue — moved to the seed). v72 (r70: the partition
+  completed — class-2 widened to any signature with
+  byte-for-byte missing-map outcomes, class-3 expanded to
+  all required-side-effect hybrids, the AST matrix made
+  the totality net; gate placement, class-4 corrections,
+  exact-schedule residual, narrowed-not-closed wording,
+  comment sweep).
 
 ---
 
@@ -3509,46 +3517,77 @@ class. The fold:
 - `pkg/dataplane/loader.go`: `loaded bool` → `loaded atomic.Bool`
   (:36 declaration; `:164` Store(true) — already the LAST step of
   the load, sequenced after all map population; `:458`, `:490`,
-  `:1082` become Load; `:1217` Store(false) at Teardown).
-- **THE CONTRACT — FOUR CLASSES, method-by-method (r69 Codex M1 —
-  v70's universal typed-error form was falsified: several exported
-  methods have non-error signatures, and the counter-clear family
-  carries test-pinned mapless-success contracts)**:
-  - **Class 1 — fallible map-required methods** (error in the
-    signature; e.g. `maps_fabric.go` `UpdateRGActive` :38,
-    `UpdateFabricFwd` :30): acquire-load `m.loaded` FIRST; pre-arm
-    return the typed `ErrDataplaneNotArmed` before any map access.
-    Population sequenced-before the release-Store of `loaded=true`
-    gives the happens-before edge: a method observing `true` sees a
-    fully-populated `m.maps`; a method during population observes
-    `false` and never touches the map. The /engineer pass makes the
-    gate TOTAL with an enumerate-and-gate audit over the 14
-    `pkg/dataplane` files (130 `m.maps[` sites).
-  - **Class 2 — non-error signatures** (`IsLoaded() bool` :456,
-    `SessionCount() (int,int)` `dataplane.go:299`, `GetMapStats()
-    []MapStats` :415, the mapless-ok seeders/cleaners): pre-arm
-    NEUTRAL outcome identical to today's missing-map path (`false` /
-    `(0,0)` / empty / documented no-op). No signature changes.
-  - **Class 3 — hybrid Go-side methods with PINNED mapless-success
-    contracts** (`ClearNATRuleCounters` `maps_nat.go:395`,
-    `ClearGlobalCounters` `maps_counters.go:176`,
-    `ClearNATRuleCounterOffsets` `maps_nat.go:389` — the #2218
-    userspace-only contracts pinned by `manager_nat_test.go:320` and
-    `manager_counters_test.go:455`): UNGATED — their pre-arm success
-    IS the contract. Their `m.maps` lookups move under `m.mu`, and
-    `Start`'s population insert loops
-    (`loader_userspace_shim.go:185-190`) take `m.mu` — closing the
-    lookup-vs-population race without touching the pinned behavior.
-  - **Class 4 — escaping-reference getters** (`Map` :1151, `Program`
-    :1156, `NewEventSource` :1161, `XDPLinks` :1195, `TCLinks` :1199,
-    `GetPersistentNAT` :1146 — SMR r69 m1): gated, returning nil
-    pre-arm; callers use the returned references per-operation
-    (verified: no long-lived `*ebpf.Map` caching across operations),
-    so a post-gate-true reference is fully constructed.
-  - **Ungated by design (SMR r69 m2)**: construction-time-value
-    methods (`Mode()` — consumed pre-arm by
-    `userspaceDataplaneActive`, `daemon_ha_userspace_readiness.go:202`)
-    and `IsLoaded` itself (the gate read).
+  `:1082` become Load; Store(false) at `Close()`'s ENTRY (:1206),
+  before the link-handle closes).
+- **THE CONTRACT — method-by-method, FOUR classes + the ungated
+  construction set (r69 Codex M1; partition completed at v72 per r70
+  Codex M1 — v71's four classes still missed two real shapes)**:
+  - **Class 1 — fallible map-required methods, no required pre-gate
+    side effects** (e.g. `maps_fabric.go` `UpdateRGActive` :38,
+    `UpdateFabricFwd` :30): acquire-load `m.loaded` BEFORE THE FIRST
+    Start-state access; pre-arm return the typed `ErrDataplaneNotArmed`.
+    Pure validation that touches NO Start-populated state may precede
+    the gate (r70 Codex m1 — `AddTxPort` validates the ifindex at
+    `loader.go:982-991` before any map access, and
+    `constants_test.go:187-220` pins the capacity/remediation error's
+    precedence on an unarmed manager). Population sequenced-before the
+    release-Store of `loaded=true` gives the happens-before edge: a
+    method observing `true` sees a fully-populated `m.maps`; a method
+    during population observes `false` and never touches the map. The
+    /engineer pass makes the gate TOTAL with the enumerate-and-gate
+    audit over the 14 `pkg/dataplane` files (130 `m.maps[` sites).
+  - **Class 2 — neutral-outcome methods, ANY signature** (r70 Codex
+    M1's missing shape — error-signature intentional no-ops): the
+    pre-arm outcome is master's missing-map outcome BYTE-FOR-BYTE,
+    whatever it is: non-error neutrals (`IsLoaded` false :456,
+    `SessionCount` (0,0) `dataplane.go:299`, `GetMapStats` empty
+    :415) AND error-signature no-ops returning nil on the missing-map
+    path today — `ClearSessionCounts` (`maps_screen.go:57-75`,
+    skip-on-absent), `ClearStaticNATEntries` (`maps_nat.go:258-286`),
+    `UpdatePolicyScheduleState` (`maps_policy.go:244-255` — the #3780
+    retired-path deliberate nil so the scheduler self-heal never
+    spins; gating THIS one to the typed error would introduce the
+    spin). No typed error is introduced where master returns nil.
+  - **Class 3 — hybrids with required pre-error Go-side side
+    effects** (r70-expanded): `ClearNATRuleCounters`
+    (`maps_nat.go:395`), `ClearGlobalCounters`
+    (`maps_counters.go:176`), `ClearNATRuleCounterOffsets`
+    (`maps_nat.go:389`), `ClearZoneCounters` (`maps_counters.go:227`
+    — #3643 offset-first clear with mapless nil success),
+    `ClearAllCounters` (`maps_counters.go:245` — must reset the
+    global offsets BEFORE its later missing-interface error;
+    `manager_counters_test.go:509-565` requires the side effect and
+    tolerates only the later error): UNGATED — the pinned pre-arm
+    behavior IS the contract (`manager_nat_test.go:320`,
+    `zonecounters.go:7-18`). Their `m.maps` lookups move under `m.mu`
+    via SCOPED lookup locking (a `mapsLocked` helper — NOT
+    whole-method locking: the offset-clear helpers take `m.mu`
+    internally and `sync.Mutex` is non-reentrant), and `Start`'s
+    population insert loops (`loader_userspace_shim.go:185-190`) take
+    `m.mu` — closing the lookup-vs-population race without touching
+    the pinned behavior. (`Start` holds no `m.mu` — `apply.go:208` —
+    and the shim loader takes none today, so no deadlock cycle.)
+  - **Class 4 — escaping getters of Start-populated state**:
+    `Map` (:1151), `Program` (:1156), `NewEventSource` (:1161 —
+    returns `(nil, ErrDataplaneNotArmed)`, honoring its
+    `(EventSource, error)` signature; r70 Codex m2): gated; callers
+    use the returned references per-operation (verified: no
+    long-lived `*ebpf.Map` caching), so a post-gate-true reference
+    is fully constructed.
+  - **Ungated construction-time set** (r70 Codex m2 + SMR r69 m2):
+    `GetPersistentNAT` (:1146 — `New()`-allocated at :89-100 with its
+    own `sync.RWMutex`, `persistent_nat.go:51-65`; a pre-Start
+    gRPC test pins it, `server_show_nat_test.go:15-20`), `XDPLinks`/
+    `TCLinks` (:1195/:1199 — `New()`-created and attach-mutated
+    post-arm; their daemon callers are applySem-serialized, the
+    existing discipline — they are NOT in the Start-population race
+    surface), `Mode()` (consumed pre-arm by
+    `userspaceDataplaneActive`), and `IsLoaded` itself.
+  - **Totality mechanism**: the §9 method-matrix test assigns EVERY
+    exported `*Manager` method to exactly one class via a generated
+    AST inventory — an unassigned or misclassed method fails the
+    test. This is the net that catches what v70/v71's prose
+    partitions missed.
 - **`loaded` mechanics**: `atomic.Bool` (:36 declaration; `:164`
   Store(true) — already the LAST step of the load, sequenced after
   all map population; `:458`, `:490`, `:1082` become Load; the
@@ -3557,15 +3596,20 @@ class. The fold:
   admission bit, NOT a lease — it cannot drain an operation that
   already observed true).
 - **Master-today in-window outcomes, preserved-or-improved
-  precisely** (replaces v70's false "no successful path changes"):
-  the only pre-arm SUCCESSES on master are the class-3 mapless
-  contracts (test-pinned) and class-2 neutral empties — both
-  preserved by construction; the class-1 in-window outcomes
-  (map-not-found error or the fatal concurrent-map throw) become the
-  one clean typed error. A pre-arm initial-election `SetRGActive`
+  precisely** (v72 wording after r70 Codex M1 falsified v71's
+  "only pre-arm successes" claim): the pre-arm outcomes on master
+  are (i) the class-3 hybrids' pinned side-effect-plus-success/
+  later-error behavior — preserved by construction; (ii) the
+  class-2 neutral outcomes INCLUDING the error-signature no-ops'
+  nil returns — preserved byte-for-byte; (iii) the class-1
+  outcomes (map-not-found error or the fatal concurrent-map
+  throw) — these become the one clean typed error, the only
+  intentional behavior change; (iv) the class-4 getters'
+  nil-return — preserved, with the typed error added where the
+  signature carries one. A pre-arm initial-election `SetRGActive`
   now returns the typed error instead of racing; the desired state
-  was already recorded (`daemon_ha.go:290-291`, before the call) and
-  is retried unconditionally by the reconcile loop
+  was already recorded (`daemon_ha.go:290-291`, before the call)
+  and is retried unconditionally by the reconcile loop
   (`reconcileRGStateLoop` runs immediately on startup and every 2s
   with `needsApply = tr.Changed || s.NeedsApply()`,
   `daemon_ha.go:604,:809`) — no lost transition.
@@ -3573,12 +3617,18 @@ class. The fold:
   invariant text overclaimed a teardown proof on a WRONG library
   premise — cilium/ebpf documents "It is not safe to close a map
   which is used by other goroutines" (`map.go:273`). The
-  pre-existing shutdown-window race stands named, not hidden: after
-  the apply-drain timeout (`daemon_run_shutdown.go:50-58`), a shim
-  attach can still write the Go link maps (`loader.go:534`, `:1124`)
-  while `Close` ranges them (:1206-1216). Pre-existing on master,
-  not worsened by PR-1, outside the RACE-1/2/3 publication windows;
-  full lifecycle exclusion (lease/refcount + drain) is a
+  pre-existing shutdown-window race stands named, not hidden, with
+  the schedule described exactly (r70 Codex m3): shutdown's
+  `stopPolicySchedulerLoop` performs an UNBOUNDED applySem
+  acquisition (`daemon_scheduler.go:170-183`) that waits out an
+  in-flight apply holder, so the surviving interleaving is
+  LATE/ALREADY-NEW admission after the semaphore is released — a
+  fresh attach writing the Go link maps (the live userspace path's
+  `AttachXDP` fresh insertion `loader.go:575` and detach deletion
+  `:661`; `:1124` is the TC path the userspace shim does not
+  invoke) while `Close` ranges them (:1206-1216). Pre-existing on
+  master, not worsened by PR-1, outside the RACE-1/2/3 publication
+  windows; full lifecycle exclusion (lease/refcount + drain) is a
   dataplane-lifecycle follow-up (§10), not #2114.
 - **Alternative considered and not adopted (r69 Codex m2 — v70's
   replay premise was FALSE and is corrected)**: a pending-owner +
@@ -3663,10 +3713,13 @@ v20 history). The delivery is TWO units:
   canary), docs + tests. This core is complete and self-contained:
   it closes RACE-1 (watcher chain), RACE-2 (bootstrap-exit arm), and
   RACE-3 (recovered confirm timer) at BOTH layers — (L1) the
-  interface tear, by the cell; (L2) method-level safety against a
-  published-but-unarmed backend, by A3's armed gate — and
-  regresses nothing — every pre-existing hazard it does NOT address
-  stays exactly as exposed as master is today.
+  interface tear, by the cell; (L2) method-level admission safety
+  against a published-but-unarmed backend, by A3's contract — and
+  regresses nothing: no pre-existing hazard is WORSENED, and two
+  pre-existing windows are NARROWED without closure being claimed
+  (r70 Codex m3 — the `Close()`-entry Store(false) narrows new
+  admission at teardown; the population `m.mu` narrows the
+  lookup-vs-population window; the §10 residuals remain open).
 - **Follow-up issue (filed at /engineer time; seeded from this
   document)**: "commit-confirmed recovery integrity: startup gate +
   FirstCommit+cluster Load recovery + confirm-record durability" —
@@ -3727,17 +3780,23 @@ convergence on the seed before any implementation of G/H/H2.
   Codex m2 + SMR m1);
   the §4 A1 deletion inventory (`var _` assertion, userspace wrapper,
   `userspaceStatusProbe`, the unused `errors` import) executed.
-- `pkg/dataplane` (r68 Codex M1, contract redesigned v71 per r69
-  Codex M1/M2 — work item A3, the armed-state admission gate):
-  `loader.go` `loaded` → `atomic.Bool` (:36, :164, :458, :490,
-  :1082; Store(false) at `Close()` ENTRY :1206); the four-class
-  method-by-method contract (§4 A1): class-1 fallible methods gate
-  on `loaded` with `ErrDataplaneNotArmed`; class-2 non-error
-  signatures keep neutral pre-arm outcomes; class-3 mapless-success
-  counter-clears stay UNGATED with their `m.maps` lookups and
-  `Start`'s population loops moved under `m.mu`; class-4
-  escaping-reference getters gate to nil; construction-value methods
-  (`Mode()`) ungated.
+- `pkg/dataplane` (r68 Codex M1; contract at v72 per r69/r70 Codex
+  M1/M2 — work item A3, the armed-state admission gate): `loader.go`
+  `loaded` → `atomic.Bool` (:36, :164, :458, :490, :1082;
+  Store(false) at `Close()` ENTRY :1206); the v72 partition (§4 A1):
+  class-1 fallible map-required methods gate BEFORE THE FIRST
+  Start-state access (pure validation may precede); class-2
+  neutral-outcome methods of ANY signature keep master's missing-map
+  outcome byte-for-byte (incl. the error-signature no-ops
+  `ClearSessionCounts`/`ClearStaticNATEntries`/
+  `UpdatePolicyScheduleState`); class-3 hybrids with required
+  pre-error side effects (`ClearNATRuleCounters`/
+  `ClearGlobalCounters`/`ClearZoneCounters`/`ClearAllCounters` +
+  the offset helpers) stay UNGATED with scoped `m.mu` lookup locking
+  and `Start`'s population loops under `m.mu`; class-4 escaping
+  getters of Start-populated state (`Map`/`Program`/`NewEventSource`)
+  gate; the construction set (`GetPersistentNAT`/`XDPLinks`/
+  `TCLinks`/`Mode()`/`IsLoaded`) stays ungated.
 - FOLLOW-UP unit (G+H+H2) package touches — `daemon_apply_commit.go`,
   `daemon_run.go`/`daemon_run_shutdown.go`, `pkg/configstore`
   (`store_persist.go`, `crypto.go`, `store_commit.go`/`db.go`/`store.go`),
@@ -3900,9 +3959,14 @@ classification snapshot.
 - `pkg/dataplane/README.md` (or the loader's doc comment): the armed-state
   admission contract (work item A3) — the four-class pre-arm outcomes.
 - Stale source comments describing direct `d.dp` access or the
-  plain-interface race (r69 Codex m4 — the census subtracts comments,
-  so these need the explicit sweep): `daemon_run.go:373`,
-  `daemon_ha_sync.go:297`, `daemon_natpoolalarm_race_test.go:11`.
+  plain-interface race (r69 Codex m4 + r70 Codex m4 — the census
+  subtracts comments, so these need the explicit sweep):
+  `daemon_run.go:373`, `daemon_ha_sync.go:297`,
+  `daemon_natpoolalarm_race_test.go:11`, plus the r70 additions
+  `daemon_ha_sync.go:1117-1124`, `bootstrap.go:324-330`,
+  `daemon_natpoolalarm.go:98-110`. The /engineer pass greps for
+  residual `d\.dp` comment prose after the conversion and justifies
+  or rewords each hit.
 - Recovery-contract docs for work item H's third outcome (FOLLOW-UP —
   `followup-seed.md`; r9 Codex m2,
   r10 Codex m4, r11): the "Two outcomes" comment at
@@ -3996,12 +4060,15 @@ Preserved exactly:
   PR-1; the H2 health-message additions that previously grew this bullet
   are FOLLOW-UP — moved to `followup-seed.md` §6-mirror at v70, r68
   Codex m4), REST simulator fail-closed `ok=false` (#3414).
-- Pre-arm backend calls (work item A3, four classes — §4 A1):
+- Pre-arm backend calls (work item A3, the v72 partition — §4 A1):
   class-1 methods return the typed `ErrDataplaneNotArmed` instead of
-  master's "map not found" error or the fatal concurrent-map throw;
-  class-2 keep neutral outcomes; class-3 keep their test-pinned
-  mapless success; class-4 return nil. Post-arm behavior
-  bit-identical; no signature changes.
+  master's "map not found" error or the fatal concurrent-map throw
+  (the ONLY intentional behavior change); class-2 keep master's
+  missing-map outcome byte-for-byte, including the error-signature
+  no-ops' nil; class-3 keep their test-pinned side-effect-plus-
+  success behavior; class-4 return nil (+ the typed error where the
+  signature carries one). Post-arm behavior bit-identical; no
+  signature changes.
 
 ## 7. Hidden invariants the change must preserve
 
@@ -4043,10 +4110,12 @@ Preserved exactly:
     lifetime or teardown exclusion is claimed — the Store(false) at
     `Close()`'s entry (:1206) gates NEW entrants but cannot drain an
     in-flight operation that already observed true; the pre-existing
-    shutdown-window link-map race (`Close`'s :1206-1216 range vs
-    attach writes :534/:1124 after the apply-drain timeout) stands
-    as a named residual (§10); cilium/ebpf documents close-in-use as
-    unsafe (`map.go:273`).
+    shutdown-window link-map race (`Close`'s :1206-1216 range vs the
+    live userspace path's `AttachXDP` insertion :575 / detach
+    deletion :661, admitted late after the scheduler stop's
+    unbounded applySem acquisition releases,
+    `daemon_scheduler.go:170-183`) stands as a named residual (§10);
+    cilium/ebpf documents close-in-use as unsafe (`map.go:273`).
 13. **#4577 confirm contract (r8/r10/r11/r12/r13/r14/r15)**: an
     unconfirmed config must NEVER stand, and a CONFIRMED config must
     never be rolled back. Work item H's revert-at-Load (FOLLOW-UP —
@@ -4182,12 +4251,13 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    `-race`: (i) `TestManager_ArmedGate_BlockedStart` — class-1/class-4
    calls during the held window return `ErrDataplaneNotArmed`/nil,
    class-3 calls succeed via the `m.mu` path, no fatal fault; (ii)
-   `TestManager_PreArmMethodMatrix` — every exported Start-state-
-   touching method invoked pre-arm returns its CLASS's contract
-   outcome (typed error / neutral / mapless success / nil per the
-   four classes), with the method inventory GENERATED (AST over the
-   package, paired against the matrix) so a new ungated method fails
-   the test. **[CORE]**
+   `TestManager_PreArmMethodMatrix` — every exported `*Manager`
+   method is ASSIGNED to exactly one class of the v72 partition by
+   the test's generated AST inventory (an unassigned or misclassed
+   method fails the test — the net that catches what v70/v71's prose
+   partitions missed), and every Start-state-touching method invoked
+   pre-arm returns its CLASS's contract outcome (typed error /
+   neutral / pinned hybrid success / nil per class). **[CORE]**
 5. Canary tests: redesigned matcher self-tests both directions; new
    `daemon_dp_canary_test.go` asserts no direct `dpCell` access outside the
    accessors. **[CORE]**
@@ -4232,15 +4302,21 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
 - Any Rust/helper change; dataplane hot-swap/re-arm support (the accessor
   ENABLES it safely later).
 - Full-repo `go test -race` wiring.
-- **Pre-existing shutdown-window link-map race (r69 Codex M2 — named,
-  not fixed)**: after the apply-drain timeout
-  (`daemon_run_shutdown.go:50-58`), a shim attach can still write the
-  Go link maps (`loader.go:534`, `:1124`) while `Close` ranges them
-  (:1206-1216); cilium/ebpf documents close-in-use as unsafe
-  (`map.go:273`). Full lifecycle exclusion (lease/refcount + drain)
-  is a dataplane-lifecycle redesign — a follow-up candidate, NOT
-  #2114. PR-1's A3 adoption of the `Close()`-entry Store(false)
-  narrows the entrant window but deliberately claims no drain.
+- **Pre-existing shutdown-window link-map race (r69 Codex M2,
+  exact-schedule r70 Codex m3 — named, not fixed)**: shutdown's
+  `stopPolicySchedulerLoop` performs an UNBOUNDED applySem
+  acquisition (`daemon_scheduler.go:170-183`) that waits out an
+  in-flight apply holder, so the surviving interleaving is
+  LATE/ALREADY-NEW admission after the semaphore is released — a
+  fresh attach writing the Go link maps (the live userspace path's
+  `AttachXDP` fresh insertion `loader.go:575` and detach deletion
+  `:661`; `:1124` is the TC path the userspace shim does not invoke)
+  while `Close` ranges them (:1206-1216); cilium/ebpf documents
+  close-in-use as unsafe (`map.go:273`). Full lifecycle exclusion
+  (lease/refcount + drain) is a dataplane-lifecycle redesign — a
+  follow-up candidate, NOT #2114. PR-1's A3 adoption of the
+  `Close()`-entry Store(false) narrows the entrant window but
+  deliberately claims no drain.
 - **Broader cluster-runtime lifecycle question (follow-up issue, filed at
   /engineer time)**: should `enterBootstrapMode` stop cluster comms when
   `d.cluster != nil`? The permanent recovery invariant (work item H — `followup-seed.md`)
@@ -4655,18 +4731,23 @@ Still open:
    PLAN-READY when all three verdicts gate the PR-1 design as
    ready.
 
-7. **r68+r69 resolution (for the record)**: Codex r68 M1 (armed-state
-   admission gate) folded as work item A3; Codex r69 M1/M2 then
-   falsified v70's universal form (non-error signatures; test-pinned
-   mapless counter-clear contracts; a false cilium/ebpf close premise)
-   and v71 carries the four-class contract, the retracted teardown
-   claim (named residual, §10), the `Close()`-entry Store(false) (AGY
-   r69), and the corrected publish-after-`Start` rationale (viable
-   alternative, not adopted — three corrected reasons). Each reviewer:
-   verify the four-class contract's per-class outcomes against the
-   real signatures (`dataplane.go:299,415,445`; `maps_nat.go:395`;
-   `maps_counters.go:176`), the class-3 `m.mu` mechanism, and the
-   admission-not-lease scoping of invariant 12.
+7. **r68-r70 resolution (for the record)**: Codex r68 M1 (armed-state
+   admission gate) folded as work item A3; Codex r69 M1/M2 falsified
+   v70's universal form (non-error signatures; test-pinned mapless
+   counter-clear contracts; a false cilium/ebpf close premise); Codex
+   r70 M1 falsified v71's four-class partition (error-signature
+   no-ops and required-side-effect hybrids fit no class) — v72
+   carries the completed partition (class-2 = master's missing-map
+   outcome byte-for-byte for ANY signature; class-3 = all hybrids
+   with required pre-error side effects; the AST matrix as the
+   totality net), the gate-before-first-Start-state-access placement,
+   the class-4 corrections, the exact-schedule residual text, and the
+   narrowed-not-closed exposure wording. Each reviewer: verify the
+   v72 partition against the real method set (the class-2 no-ops
+   `maps_screen.go:57`/`maps_nat.go:258`/`maps_policy.go:244`; the
+   class-3 expansion `maps_counters.go:227,245`; the ungated
+   construction set `loader.go:89-100`), and the claim that no
+   pre-existing hazard is worsened while two windows narrow.
 
 ---
 
