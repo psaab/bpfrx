@@ -885,3 +885,56 @@ func bootEpochIncarnation(path string) (epoch uint64, persisted bool) {
 	}
 	return epoch, persisted
 }
+
+// TestReadErrorDoesNotRegressPersistedEpoch_6169 is the fail-on-revert gate for
+// the durable regression a transient read error caused.
+//
+// A non-ENOENT ReadFile error logged, left prev=0, and fell through to
+// WriteFileDurable — durably replacing a possibly HIGHER persisted value with
+// this incarnation's wall-clock seed. A peer that had latched the higher value
+// then refuses this node indefinitely. It is the exact durable regression
+// withEpochFileLock's own rationale says must never happen, and the sibling
+// branches already decided the other way: MkdirAllDurable failure returns and
+// lock failure skips.
+//
+// The fault is injected with a SELF-REFERENTIAL SYMLINK, which is the shape
+// that actually exercises the branch: ReadFile fails ELOOP (non-ENOENT) while
+// the temp-file+rename write would SUCCEED, replacing the link. An earlier
+// version of this test used a directory, where the write fails too — so it
+// passed for a reason unrelated to the fix and did not red under mutation.
+//
+// RED-on-revert: delete the `return` after the read-error warning in
+// refineBootEpoch.
+func TestReadErrorDoesNotRegressPersistedEpoch_6169(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ha-boot-epoch")
+
+	// Self-referential symlink: read fails ELOOP, write would succeed.
+	if err := os.Symlink(path, path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.ReadFile(path); err == nil || os.IsNotExist(err) {
+		t.Skipf("could not induce a non-ENOENT read error on this filesystem: %v", err)
+	}
+
+	var published atomic.Uint64
+	seed := bootEpochSeed()
+	published.Store(seed)
+	refineBootEpoch(path, &published)
+
+	// The published epoch is untouched — the wall-clock seed is still valid and
+	// still on the wire.
+	if got := published.Load(); got != seed {
+		t.Fatalf("published epoch changed from %d to %d on a read error", seed, got)
+	}
+	// And nothing was written over the unknown state: the path is still the
+	// symlink, not a regular file holding this incarnation's lower seed.
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("state path disappeared: %v", err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("refineBootEpoch OVERWROTE unreadable state; a transient read error must ABORT, " +
+			"not durably replace a possibly-higher persisted value with this incarnation's seed")
+	}
+}

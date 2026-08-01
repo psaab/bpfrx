@@ -871,10 +871,21 @@ func (s *heartbeatAuthState) admitAuthedLocked(hasEpoch bool, epoch, session, co
 	// outside the comparable range is governed by the bounded ring alone, so
 	// captures from an incarnation that once emitted an out-of-range epoch would
 	// replay indefinitely. See epochOrderable.
-	if !epochOrderable(epoch, time.Now().UnixNano()) {
+	// The ABSOLUTE sanity check is clock-independent, so it is safe on every
+	// frame: a 0 or beyond-year-2200 value is never a real incarnation.
+	if !epochUsableAsFloor(epoch) {
 		return false
 	}
 	if epoch < s.highEpoch {
+		return false
+	}
+	// The FORWARD bound is clock-dependent, so it gates ONLY the irreversible
+	// operation — raising the floor. Applying it to a frame from the
+	// already-latched incarnation (epoch == highEpoch) made a backward
+	// wall-clock step beyond bootEpochMaxSkew reject a HEALTHY peer before the
+	// monotonic lastSeen update, declaring it dead in ~500ms and going
+	// dual-master. See epochWithinForwardBound.
+	if epoch > s.highEpoch && !epochWithinForwardBound(epoch, time.Now().UnixNano()) {
 		return false
 	}
 	if !s.replay.admit(session, counter) {

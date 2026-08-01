@@ -1015,11 +1015,18 @@ Procedure:
 > is a REQUIRED post-upgrade step, not a footnote. Every capture an on-link
 > sniffer took before the upgrade was signed with the OLD key, so rotation is
 > the only thing that retires an attacker's existing archive — no code change
-> can retroactively invalidate frames they already hold. #6169's downgrade
-> latch refuses those captures once the peer has proved it emits epochs, so
-> rotation is not the sole defence; but until the latch has armed on a given
-> node (a brand-new chassis, or one that has not yet heard an epoch), the
-> pre-upgrade archive is exactly what it is exposed to.
+> can retroactively invalidate frames they already hold. The mechanism is
+> `verifyHeartbeatMAC(frame, key)`, which uses the LIVE key: after a rotation
+> every pre-upgrade capture fails `macOK` and is discarded before it reaches
+> any epoch logic at all.
+>
+> **This step is what makes the accepted restart residual acceptable.** The
+> downgrade latch (`epochSeen`) is process-scoped, so a full daemon restart on
+> the surviving node clears it, and while the genuine peer is ABSENT nothing
+> re-arms it — that window is exactly what a pre-upgrade epoch-less archive
+> replays into. Rotation removes the archive, so the window has nothing to
+> exploit. Skipping rotation leaves the residual live; the residual was not
+> priced as "narrow" on the assumption that nobody would.
 >
 > **How to tell whether you are still exposed:** `show chassis cluster
 > information` / `statistics` print `Heartbeats without epoch:` in the

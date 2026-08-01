@@ -727,3 +727,63 @@ func TestStartHeartbeatReturnsWithAUsableEpoch_6169(t *testing.T) {
 		t.Fatal("the refinement worker never completed after the lock was released")
 	}
 }
+
+// TestBackwardClockStepDoesNotKillALatchedPeer_6169 is the fail-on-revert gate
+// for the clock-step false-peer-death.
+//
+// epochOrderable was applied to EVERY epoch-bearing frame, including one
+// carrying the already-accepted epoch from the already-latched incarnation. A
+// backward wall-clock step beyond bootEpochMaxSkew therefore made the live
+// peer's ordinary frames fail the forward bound and be rejected BEFORE the
+// monotonic lastSeen update — a healthy peer declared dead in ~500ms, and a
+// spurious dual-master. That is wall-clock sensitivity on the accept path,
+// which #1792's CLOCK_MONOTONIC lastSeen exists specifically to keep out.
+//
+// The forward bound now gates only RAISING the floor.
+//
+// RED-on-revert: restore the unconditional `if !epochOrderable(epoch, now)`
+// ahead of the floor comparison in admitAuthedLocked.
+func TestBackwardClockStepDoesNotKillALatchedPeer_6169(t *testing.T) {
+	e := newLatchEnv(t)
+
+	// The peer's clock is well ahead of ours — or equivalently, ours has since
+	// stepped back. Either way its epoch is beyond the forward bound relative to
+	// our clock RIGHT NOW.
+	stepped := uint64(time.Now().UnixNano()) + bootEpochMaxSkew*3
+	if epochWithinForwardBound(stepped, time.Now().UnixNano()) {
+		t.Fatal("test setup: the epoch must be beyond the forward bound")
+	}
+
+	// It was latched earlier, when the clocks still agreed. Model that directly:
+	// the floor holds this incarnation's epoch.
+	e.r.auth.mu.Lock()
+	e.r.auth.highEpoch = stepped
+	e.r.auth.epochSeen = true
+	e.r.auth.mu.Unlock()
+
+	// The live peer keeps sending frames carrying that SAME epoch. Every one
+	// must be accepted: it is the incarnation we already latched, and nothing
+	// about it is newer or unordered.
+	for c := 1; c <= 10; c++ {
+		f := marshalHeartbeatAuthEpoch(samplePkt(), e.key, 0x7701, uint64(c), stepped)
+		if !e.feed(f) {
+			t.Fatalf("frame %d from the ALREADY-LATCHED incarnation was rejected after a clock "+
+				"step; the peer is declared dead in ~500ms and the cluster goes dual-master", c)
+		}
+	}
+	// Liveness was refreshed, so checkTimeout keeps the peer alive.
+	e.r.checkTimeout()
+	if !e.m.PeerAlive() {
+		t.Fatal("healthy peer declared dead after a backward clock step")
+	}
+
+	// The one-way door is still shut: a HIGHER out-of-bound epoch must not be
+	// latched, because raising the floor is the irreversible operation.
+	higher := stepped + 1
+	if e.feed(marshalHeartbeatAuthEpoch(samplePkt(), e.key, 0x7702, 1, higher)) {
+		t.Fatal("an out-of-bound HIGHER epoch was admitted; the forward bound must still gate raising")
+	}
+	if got := e.r.auth.peerEpochFloor(); got != stepped {
+		t.Fatalf("floor moved to %d, want it pinned at %d", got, stepped)
+	}
+}

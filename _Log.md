@@ -66546,3 +66546,29 @@ break — `go vet` confirmed passing under every revert.
   Confirmed the durability restatement landed in both README sites and the commit
   body, with the ascending-pass figure.
 - **File(s)**: pkg/cluster/heartbeat_epoch_latch_test.go, _Log.md
+
+- **Timestamp**: 2026-08-02 03:20
+- **Action**: #6169 — the two SHIP-blocking fixes. (1) CLOCK-STEP FALSE PEER-DEATH:
+  `epochOrderable` ran on EVERY epoched frame including `epoch == highEpoch` from
+  the already-latched incarnation, so a backward wall-clock step beyond
+  bootEpochMaxSkew rejected a HEALTHY peer before the monotonic lastSeen update —
+  wall-clock sensitivity on the accept path, which is exactly what #1792's
+  CLOCK_MONOTONIC lastSeen exists to prevent. Split the check: `epochUsableAsFloor`
+  (absolute, clock-independent) applies to every frame; the new
+  `epochWithinForwardBound` (clock-dependent) gates ONLY `epoch > highEpoch`, i.e.
+  the irreversible raise. Mutation 21 reds. (2) READ ERROR DURABLY REGRESSED THE
+  EPOCH: a non-ENOENT ReadFile error left prev=0 and fell through to the write,
+  clobbering a possibly-higher persisted value — the regression withEpochFileLock's
+  own comment argues against, and both sibling branches already abort. Now returns.
+  Mutation 22 reds — but only after I REWROTE the test: the first version injected
+  the fault with a directory, where the rename ALSO fails, so it passed for a
+  reason unrelated to the fix and stayed green under mutation. Switched to a
+  self-referential symlink (read fails ELOOP, write would succeed), which is the
+  shape that actually exercises the branch. (3) PSK rotation doc already existed at
+  README:1013 (review searched an older head); strengthened it to name the
+  `verifyHeartbeatMAC` live-key mechanism and to state explicitly that rotation is
+  what makes the accepted restart residual acceptable. Also retired the last stale
+  comment describing the removed startup wait (manager.go).
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/manager.go, pkg/cluster/heartbeat_epoch_test.go,
+  pkg/cluster/heartbeat_epoch_latch_test.go, pkg/cluster/README.md, _Log.md

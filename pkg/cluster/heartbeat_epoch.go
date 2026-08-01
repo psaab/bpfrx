@@ -184,11 +184,28 @@ func epochUsableAsFloor(epoch uint64) bool {
 // an out-of-range epoch would replay indefinitely. Not orderable, not admitted —
 // the same rule as an epochless frame from a latched peer.
 func epochOrderable(epoch uint64, nowNanos int64) bool {
-	if !epochUsableAsFloor(epoch) {
-		return false
-	}
-	// Only apply the forward bound when OUR clock is credible; see
-	// epochClockSaneFloor.
+	return epochUsableAsFloor(epoch) && epochWithinForwardBound(epoch, nowNanos)
+}
+
+// epochWithinForwardBound is the CLOCK-DEPENDENT half of epochOrderable, split
+// out because it must gate only the one operation that is irreversible.
+//
+// Raising the floor is a one-way door, so a far-future value must not be
+// latched. But re-testing an epoch that has ALREADY been accepted is a
+// different thing entirely, and doing it was a defect: a backward wall-clock
+// step beyond bootEpochMaxSkew made every subsequent frame from the
+// already-latched incarnation fail this bound and be rejected BEFORE the
+// monotonic lastSeen update, so a healthy peer was declared dead in ~500ms and
+// the cluster went dual-master. That is wall-clock sensitivity on the accept
+// path, which is exactly what #1792's CLOCK_MONOTONIC lastSeen exists to keep
+// out. admitAuthedLocked therefore applies this ONLY when epoch > highEpoch.
+//
+// It is skipped entirely when our own clock is not credible
+// (epochClockSaneFloor): an appliance with a dead RTC boots near the Unix epoch
+// and syncs NTP seconds later, and during that window a healthy peer's epoch is
+// ~56 years "ahead", so applying the bound would refuse the peer at exactly the
+// moment cold-boot split-brain is most likely.
+func epochWithinForwardBound(epoch uint64, nowNanos int64) bool {
 	if nowNanos > 0 && uint64(nowNanos) >= epochClockSaneFloor {
 		if epoch > uint64(nowNanos)+bootEpochMaxSkew {
 			return false
@@ -418,8 +435,18 @@ func refineBootEpoch(path string, published *atomic.Uint64) {
 				prev = n
 			}
 		} else if !os.IsNotExist(err) {
-			slog.Warn("cluster: HA boot-epoch state read error; keeping the wall-clock epoch",
-				"path", path, "err", err)
+			// ABORT rather than fall through to the write. Falling through left
+			// prev=0 and then durably replaced a possibly-HIGHER persisted value
+			// with this incarnation's (possibly lower) wall-clock seed — the
+			// exact durable regression withEpochFileLock's own rationale says
+			// must never happen, and the one that makes a peer which latched the
+			// higher value refuse this node indefinitely. The sibling branches
+			// already decided this: MkdirAllDurable failure returns, and lock
+			// failure skips. A transient read error is unknown state, and
+			// overwriting unknown state is not a safe way to fail.
+			slog.Warn("cluster: HA boot-epoch state read error; keeping the wall-clock epoch "+
+				"and NOT overwriting the persisted value", "path", path, "err", err)
+			return
 		}
 
 		epoch := published.Load()

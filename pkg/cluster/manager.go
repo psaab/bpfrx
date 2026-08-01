@@ -219,15 +219,20 @@ type Manager struct {
 
 	// bootEpochOnce/bootEpoch/bootEpochReady hold this daemon incarnation's
 	// #6169 boot epoch: a persisted, strictly-increasing-across-restart counter
-	// carried in the signed heartbeat so the peer can order incarnations. 0
-	// means "not resolved yet", the only state in which heartbeats go out
-	// without an epoch on an epoch-capable build. Resolved asynchronously off
-	// the send path (an fsync must never stall the 100ms send loop) and waited
-	// for with a bound by the first StartHeartbeat — see
-	// Manager.heartbeatBootEpoch and initHeartbeatEpochState. bootEpochReady is
-	// closed once the first resolve attempt finishes; a nil channel (a Manager
-	// not built by NewManager) simply never fires and the bounded wait times
-	// out, which is safe.
+	// carried in the signed heartbeat so the peer can order incarnations.
+	//
+	// bootEpoch is published SYNCHRONOUSLY from the wall clock on first use,
+	// before any file is touched, so it is never 0 for a node that has asked
+	// for it — a storage fault cannot make this node emit epoch-less frames and
+	// be declared dead by a latched peer. Persistence is a refinement that runs
+	// off the send path (an fsync must never stall the 100ms send loop) and only
+	// ever RAISES the value, its one job being to survive a backward clock step.
+	// See Manager.heartbeatBootEpoch and refineBootEpoch.
+	//
+	// bootEpochReady is closed once the first refinement attempt finishes.
+	// NOTHING in production waits on it — StartHeartbeat used to, which stalled
+	// a node whose heartbeat was already stopped, and that wait was removed
+	// (initHeartbeatEpochState). Tests use it to join the worker.
 	bootEpochOnce  sync.Once
 	bootEpoch      atomic.Uint64
 	bootEpochReady chan struct{}
