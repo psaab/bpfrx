@@ -242,13 +242,22 @@ var schemaChassis = &schemaNode{desc: "Chassis configuration", children: map[str
 				// SetMonitorWeight election.go:324); heartbeat monitor
 				// entries carry weight as uint8.
 				//
-				// #6549: unlike interface-monitor weight, these leaves
-				// have NO compiled-int gate in
-				// validateChassisClusterStrict — this ValidateInteger is
-				// their only commit-side defense, and compileTreeLenient
-				// downgrades it to a warning on Store.Load /
-				// Store.SyncApply (#1960 no-brick). An out-of-range value
-				// therefore REACHES runtime, where pkg/cluster bounds it:
+				// #6549 left these leaves to this ValidateInteger alone,
+				// on the reasoning that a typed leaf covers them. #6588
+				// showed that is only true for the shapes the schema
+				// WALKER reaches: SchemaValidate descends setSchema, so a
+				// PACKED statement (`ip-monitoring family inet 10.0.1.1
+				// weight -100;`, written directly under redundancy-group)
+				// sits below its depth and no validator fires. That was
+				// harmless while the packed spelling compiled to nothing;
+				// once #6588 made it compile, these leaves gained the same
+				// compiled-int gate their interface-monitor sibling has, in
+				// validateChassisClusterStrict — the one layer all three
+				// spellings pass through. This ValidateInteger remains the
+				// earlier, better-worded rejection for the flat-set path.
+				// Both are downgraded on the tolerant load / peer-sync
+				// paths (#1960 no-brick), so an out-of-range value can
+				// still REACH runtime, where pkg/cluster bounds it:
 				// Monitor.ipTargetWeight and the aggregate branch of
 				// desiredRGIPDebts (which also protects the cumulative
 				// global-threshold sum a negative weight would otherwise

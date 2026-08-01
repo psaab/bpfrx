@@ -1,3 +1,310 @@
+## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
+- **Action**: Round 6b corrected the overstated invariant but left the comment
+  merely accurate, not useful: it said the invariant is not enforced without
+  saying WHY the table is still worth having. Reviewer asked for the fuller
+  characterization in the comment itself. Now states, in the artifact that
+  ships: two of the three routes are closed BY CONSTRUCTION (a named-constant
+  KEY registers exactly like a literal one; no switch remains to nest another
+  inside), the third is demoted not eliminated, and what changed for it is which
+  act is natural — adding a `case` used to be the idiomatic way to add a
+  statement and diverged silently, whereas diverging now means ad-hoc dispatch
+  beside a five-line loop whose only other content is the table lookup.
+  docs/config-schema.md carried the same qualification without saying which
+  routes close; matched.
+- **File(s)**: `pkg/config/compiler_system.go`, `docs/config-schema.md`, `_Log.md`
+
+## 2026-08-01 — #6588 round 6b: correct an overstated invariant in the table comment
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
+- **Action**: The redundancyGroupStatements comment claimed a statement not in
+  the table "is not compiled either — so the two cannot disagree". Review tested
+  that rather than accepting it: dispatch injected inside the loop but outside
+  the table lookup reproduces the original divergence (container form honors the
+  statement, packed multi-statement line drops it). Same m4' result I reported
+  in round 6 — but the CODE COMMENT still carried the overstatement, which is
+  where the next person reads it, so the honest version in the PR body did not
+  fix anything. Reworded to state the real property: the invariant is "all
+  dispatch goes through this table", and the table being the only dispatch path
+  present makes the correct thing the easy thing — it is NOT enforced.
+  Fixed the identical overstatement in docs/config-schema.md, which also carried
+  "so the two cannot disagree" and then contradicted itself a paragraph later.
+  An overstated invariant is how the next person concludes they need not think.
+- **File(s)**: `pkg/config/compiler_system.go`, `docs/config-schema.md`, `_Log.md`
+
+## 2026-08-01 — #6588 round 6: replace the source-modelling drift guard with a dispatch table
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
+- **Action**: MAJOR-C — the round-4 drift guard PASSED while a 7th
+  redundancy-group statement was still dropped from a packed multi-statement
+  line, three different ways. Verified all three firsthand at 84f660259 before
+  writing (each: build CLEAN, guard PASS, statement DROPPED):
+    m3 `case rgHoldDownKeyword:` (a named constant, not a string literal) — the
+       guard `continue`d the non-BasicLit case silently, so len(arms) stayed 6
+       and even the `< 6` floor passed. This is the idiom THIS PR introduced
+       with `const monitorWeightKeyword = "weight"`.
+    m4 statement handled by a helper called from the loop, outside the switch —
+       the guard modelled ONE switch.
+    m7 nested `switch child.Name()` inside a `default:` arm — ast.Inspect
+       returned false after matching the outer switch so it never descended.
+  Camouflage that makes it worse than a gap: the same statement ALONE on a line
+  still works (packedStatementProps opens the first node regardless of the
+  predicate), so a developer sees three greens and ships the fold bug.
+  Took the reviewer's fix rather than hardening the guard:
+  redundancyGroupStatements, a map[string]func(*RedundancyGroup, *Node), is now
+  BOTH the compiler's dispatch and the splitter's token set;
+  isRedundancyGroupStatement is derived from it. The six switch arms were
+  extracted VERBATIM into named functions (body-identity verified
+  statement-by-statement against the pre-refactor arms: 22/5/1/1/23/49
+  statements, all identical modulo indentation; no top-level continue/break in
+  any extracted body, so leaving the switch/for changed no control flow).
+  Deleted the source-parsing guard rather than leaving a tautology, and replaced
+  it with TestRedundancyGroupStatementsSurvivePackedLine_6588, which DERIVES its
+  cases from the table: every registered statement is paired with every other on
+  one packed line, in both orders, and a table entry with no sample fails the
+  completeness check. Nothing to update when the table grows.
+- **Honest limit, not claimed closed**: re-ran all three against the table.
+  m3' (named-constant KEY) and m7' (ordinary entry — no switch remains to nest
+  inside) are now HONORED. m4' still DROPS: an ad-hoc `if` in the loop that
+  compiles a statement without registering it. The table makes the idiomatic
+  path correct by construction and converts m4 from invisible to a visible
+  deviation beside a five-line loop; it does not make it impossible, and Go
+  offers no way to. Reported as such rather than claiming three-of-three.
+- **Blast radius**: contained to compileChassis in compiler_system.go. All six
+  arms needed only (rg, child) — no arm touched ch, clusterNode or rgInst — so
+  the extraction is mechanical. No other caller. Full suite exit 0 across 59
+  packages, 116 passing 6588 subtests.
+- **File(s)**: `pkg/config/compiler_system.go`,
+  `pkg/config/compiler_chassis_packed_monitor_6588_test.go`,
+  `docs/config-schema.md`, `_Log.md`
+
+## 2026-08-01 — #6588 round 5: a regression this PR introduced, plus a second RG node shape
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
+- **Action**: Re-review at e25cc5d0c found two MAJORs; both reproduced firsthand
+  before writing.
+  (MAJOR-A, a REGRESSION vs master) `interface-monitor [ ge-0/0/0 ge-0/0/1 ]
+  weight 255` compiled ge-0/0/0 at weight ZERO. The round-3 splitter attached a
+  weight token to the entry immediately preceding it. Master compiled ONE
+  monitor at 255; this branch compiled two, N-1 of them inert — monitored,
+  shown, deducting nothing on link-down. Worse than master, and it contradicted
+  this PR's own children-block path, where `[ a b ] { weight 255; }` already
+  applied 255 to both. Fixed by making the attribute run CANDIDATE-scoped: names
+  and `weight` tokens are separated, then every name gets the full run.
+  Apply-to-all is the fail-safe direction and is strictly better than master
+  here (no member dropped, no weight lost). Two inline weights in one bracketed
+  statement are now REJECTED as ambiguous, consistent with the round-2
+  duplicate gate — master silently took the last and dropped the rest.
+  Root cause of it shipping: assertMonitorNames compared only
+  InterfaceMonitors[i].Interface and never .Weight, so the whole bracket suite
+  was blind to weight distribution. Replaced with assertMonitors(names,
+  weights); the name-only entry point now delegates, and the helper documents
+  why a name-only assertion is not enough.
+  (MAJOR-B) redundancyGroupBody used a fixed skip of 2, correct for only ONE of
+  namedInstances' two return shapes. For a bare `redundancy-group { 1 ...; }`
+  wrapper it returns a CHILD whose Keys[0] IS the id, so skip must be 1; with 2
+  the statement keyword was swallowed and the tail opened a node named after a
+  value, matching no switch arm — every statement dropped, election priority
+  included, through all four redundancyGroupBody readers. Keys[0] is an exact
+  discriminator (shape 1 is always reached via FindChildren("redundancy-group")).
+  Fixed rather than documented despite lower reachability: the guard covers all
+  four readers, so leaving it would make the three AST gates blind here while
+  LOOKING like they covered it.
+- **Validation**: two mutation proofs, build+vet CLEAN under each. (F) attach the
+  inline weight to the last entry only -> 2 top-level FAILs, assertions naming
+  the zero-weight monitor; the three MAJOR-A controls (children-block,
+  single-name, weight-less) stayed GREEN. (G) pin skip back to 2 -> 1 FAIL, 4
+  assertions naming the lost statement; both MAJOR-B controls (bare-wrapper
+  nested block, ordinary instance shape) stayed GREEN. Restored: build+vet
+  clean, `go test ./...` exit 0 across 59 packages, 104 passing 6588 subtests.
+- **File(s)**: `pkg/config/compiler_system.go`,
+  `pkg/config/compiler_chassis_packed_monitor_6588_test.go`,
+  `docs/config-schema.md`, `_Log.md`
+
+## 2026-08-01 — #6588 round 3b: drift guard on the isRedundancyGroupStatement list
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
+- **Action**: Round 3 introduced a HAND-WRITTEN token list
+  (isRedundancyGroupStatement) that redundancyGroupBody splits a packed instance
+  tail at. A token missing from that list is not a loud failure — the
+  statement's tokens append to whichever statement precedes it on the line, so
+  it silently does nothing. Same defect class as the bug, better camouflaged.
+  Checked the list against both sources of truth rather than re-reading it:
+  it equals compileChassis's switch arms EXACTLY (node, gratuitous-arp-count,
+  preempt, strict-vip-ownership, interface-monitor, ip-monitoring), and is a
+  strict SUPERSET of setSchema's redundancy-group children — setSchema is
+  missing `strict-vip-ownership`, which the compiler DOES handle. That schema
+  gap is pre-existing and unrelated (it costs config-mode completion for that
+  leaf, not compilation); reported, not fixed here.
+  Correct today is not the property worth having, so the list is no longer
+  trusted by inspection: TestRedundancyGroupStatementPredicateCoversCompiler_6588
+  parses compileChassis's OWN source (go/ast), extracts every `case "..."` of
+  the `switch child.Name()` dispatch, and requires the predicate to accept each.
+  Adding an arm without extending the predicate now fails with the token named.
+  The guard fails loudly if it cannot find the function or the switch, and has a
+  floor of 6 arms, so it cannot silently verify an empty set.
+- **Validation**: proved the guard FIRES in both drift directions, build+vet
+  CLEAN under each. (E1) drop "preempt" from the predicate -> RED naming
+  "preempt". (E2) add `case "hold-down-interval":` to compileChassis and forget
+  the predicate — the realistic drift — -> RED naming "hold-down-interval".
+  Restored: build+vet clean, `go test ./...` exit 0 across 59 packages, 86
+  passing 6588 subtests.
+- **File(s)**: `pkg/config/compiler_chassis_packed_monitor_6588_test.go`, `_Log.md`
+
+## 2026-08-01 — #6588 round 3: the same drop ONE LEVEL UP (redundancy-group instance)
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
+- **Action**: Round-3 review found a third shape, verified firsthand at the
+  round-2 head before writing: `redundancy-group 1 <statement>;` written on the
+  INSTANCE line compiles to an empty group. namedInstances resolves the name
+  across both shapes (Keys[1]) but returns the node with the body still on
+  Keys, so compileChassis's `range rgInst.node.Children` saw nothing. All four
+  statements confirmed lost with NO error: interface-monitor, ip-monitoring,
+  preempt, and — the severe one — `node 0 priority 200`, the redundancy-group
+  ELECTION PRIORITY. Dropped, the cluster elects on defaults and the wrong node
+  can hold the group, which is a superset of "never demotes".
+  Fixed with redundancyGroupBody = packedStatementProps(rgNode, 2,
+  isRedundancyGroupStatement), so a multi-statement line
+  (`node 0 priority 200 preempt gratuitous-arp-count 8;`) splits at statement
+  keywords instead of folding into the first. Applied at ALL FOUR readers of
+  the RG body — compileChassis plus validateMonitorWeightTokensAST,
+  validateChassisClusterIdentitiesAST and validateGratuitousARPCountAST —
+  because a compiler that sees a shape its gates cannot would admit, through
+  the packed instance line only, exactly what round 2 closed elsewhere.
+- **Rejected fix direction, with evidence**: the reviewer's preferred option was
+  to make namedInstances itself synthesize the packed tail as a child, fixing
+  all ~130 callers at once. Tried it. It breaks callers that already handle the
+  tail: 24 sites read inst.node.Keys directly, and compileStaticRoutes branches
+  on `len(Children)==0` to DETECT the packed shape, so a synthetic child
+  disables its packed path. The experiment turned TestDHCPRelayOverrides_* red
+  (override tokens swallowed into Interfaces) and
+  TestVRRPTrackInterface_KeysPackedDuplicateStrictReject red (lenient
+  first-wins gave an empty TrackInterface). One prediction was wrong and is
+  recorded as such: the packed static route itself SURVIVED the experiment
+  (its next-hop arrives as a real child either way).
+- **Audit answer — other namedInstances callers are NOT all safe**: measured by
+  direct compile, `system login class ops permissions view;` yields a class with
+  empty permissions, `system login user bob class ops;` a user with no class,
+  and `system syslog host 10.0.0.9 any;` a host with zero facilities. Same root
+  cause, different stanzas. Reported as follow-up work rather than claimed safe.
+- **Validation**: mutation D — redundancyGroupBody returns rgNode.Children —
+  build+vet CLEAN, 2 top-level FAILs (PackedBody, PackedBodyReachesGates), 13
+  assertions each naming the lost statement; the container-form control stayed
+  GREEN. Restored: build+vet clean, `go test ./...` exit 0 across 59 packages,
+  85 passing 6588 subtests.
+- **File(s)**: `pkg/config/compiler_system.go`,
+  `pkg/config/compiler_chassis_monitor_weight.go`,
+  `pkg/config/compiler_chassis_identity.go`,
+  `pkg/config/compiler_chassis_garp_count.go`,
+  `pkg/config/compiler_chassis_packed_monitor_6588_test.go`,
+  `docs/config-schema.md`, `_Log.md`
+
+## 2026-08-01 — #6588 round 2: three MAJORs inside the round-1 fix
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
+- **Action**: Hostile review returned DO-NOT-MERGE with three MAJORs, all
+  inside the code round 1 touched. Each premise was re-verified by direct
+  compile before writing, and one needed correcting.
+  (MAJOR 1) ip-monitoring 0..255 was ungated for the PACKED spelling. The
+  review framed it as "the packed path bypasses the validation the container
+  path gets"; direct compile shows the real shape is narrower and the fix is
+  wider — `SchemaValidate` is called from pkg/configstore, not CompileConfig,
+  and it walks setSchema, so the PACKED statement sits below the depth it
+  reaches for BOTH ip-monitoring and interface-monitor. The typed leaf covers
+  flat-set and container; nothing covered packed. Harmless while packed
+  compiled to nothing — but round 1 made it compile. Fix: extend the #6549
+  compiled-int gate in validateChassisClusterStrict to global-weight,
+  global-threshold and per-target weight, the one layer all three spellings
+  pass through. Pinned that reasoning with a test asserting SchemaValidate
+  returns nil for a config the compiled-int gate rejects.
+  (MAJOR 2) A bracketed `interface-monitor [ a b c ]` compiled ONE monitor.
+  Confirmed pre-existing in ALL THREE spellings, not introduced by round 1 —
+  the lexer strips the brackets (#2419) so N names land on one node's Keys
+  everywhere. The round-1 helper synthesised exactly one entry from the tail,
+  so it inherited the drop. Replaced with monitorEntryNodes, which splits each
+  candidate's Keys at entry boundaries with a reserved value slot after
+  `weight` (the #6524 rule). Kept the EITHER/OR tail-vs-children rule for
+  entry lists — accumulating there mints a monitor for an interface literally
+  named `weight` — and added packedStatementProps for the ip-monitoring
+  property body, where the two ARE siblings.
+  (MAJOR 4) `weight nope` committed clean with Weight=0, so the monitor
+  deducted nothing on link-down. The compiled struct cannot express it (a
+  failed Atoi is indistinguishable from `weight 0`), so this is a new AST gate,
+  validateMonitorWeightTokensAST, deriving its entries from the same readers
+  the compiler uses. Strict at commit, warn on the tolerant path
+  (lenientChassisMonitorWeight, #1960 no-brick).
+  Duplicates were shape-dependent (`weight 100 weight 200` inline -> 200;
+  `{ weight 100; weight 200; }` -> 100). The compiler is now uniformly
+  first-wins via monitorWeightTokens and the gate rejects the duplicate, so the
+  answer no longer depends on spelling.
+- **Validation**: three separate mutation proofs, each with build+vet CLEAN
+  first so the red is an assertion. (A) drop the ip-monitoring range block ->
+  2 top-level FAILs, both MAJOR-1 tests; in-range control GREEN. (B) make
+  monitorEntryNodes return the candidate unsplit -> 2 FAILs, both bracket
+  tests; the single-non-bracketed-entry control GREEN in full. (C) unwire the
+  weight gate from runPreWalkGates -> 3 FAILs (malformed, tolerant-warn,
+  duplicate); the valid-weight control GREEN. Restored: build+vet clean,
+  `go test ./...` exit 0 across 59 packages, 69 passing 6588 subtests.
+- **Scope refused**: the review also enumerated 14 other one-sided arms across
+  pkg/config with the same nodeVal root cause. Left alone and filed separately
+  by the reviewer — #6658 stays about redundancy-group monitors.
+- **File(s)**: `pkg/config/compiler_system.go`,
+  `pkg/config/compiler_chassis_monitor_weight.go` (new),
+  `pkg/config/compiler_validate_strict_chassis.go`,
+  `pkg/config/compiler_prewalk.go`, `pkg/config/compiler_opts.go`,
+  `pkg/config/schema_chassis.go` (stale comment),
+  `pkg/config/compiler_chassis_packed_monitor_6588_test.go`,
+  `docs/config-schema.md`, `_Log.md`
+
+## 2026-08-01 — #6588 config/cluster: packed interface-monitor / ip-monitoring compiled to nothing
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf)
+- **Action**: Fixed a chassis-cluster failover FAIL-OPEN. A redundancy-group
+  monitor authored in the PACKED hierarchical spelling — one statement
+  directly under `redundancy-group`, no nested block — compiled to NOTHING.
+  The parser yields a single leaf
+  (`Keys=[interface-monitor ge-0/0/0 weight 255]`, no children) while
+  `compileChassis` enumerated monitors by iterating `child.Children` only,
+  so the operator got `rgs=1, monitors=0`: link tracking configured, commit
+  clean, and a redundancy group that never demoted on link-down.
+  Swept the whole `compileChassis` switch (6 arms) and found the same drop
+  at TWO more sites in the same loop, both fixed here: packed `ip-monitoring`
+  (`ip-monitoring global-weight 255;`, `ip-monitoring family inet <addr>
+  weight <n>;`) dropped its global weights and every probe target — the same
+  RG-demotion debt path — and a packed `family inet <addr> weight <n>;` leaf
+  written INSIDE an `ip-monitoring { ... }` block dropped the target too.
+  The `node` / `gratuitous-arp-count` / `preempt` / `strict-vip-ownership`
+  arms already handled both shapes (verified by direct compile, not by
+  reading). A third sub-shape surfaced from the new test rather than the
+  issue: `interface-monitor ge-0/0/0 { weight 255; }` packed the NAME onto
+  the statement while the attributes arrived as children, so the old reader
+  minted a monitor for an interface literally called `weight`.
+  New shared reader `packedOrContainerEntries(cfgNode, skip)` normalises all
+  shapes; its rule is EITHER/OR (an inline tail means the statement IS one
+  entry, so its children are that entry's properties) — the same rule
+  `namedInstances` already applies, and deliberately NOT the accumulate rule
+  the #2419 multi-value contract uses, since accumulating is what mints the
+  bogus `weight` monitor. `findNamedNode` is its slice-shaped `FindChild`.
+  Second-order: because the packed shape now reaches the compiled `*Config`,
+  the #6549 weight range gate (which runs on the compiled int) covers it for
+  free — a packed `weight -100` is now rejected at commit instead of
+  silently accepted.
+- **Validation**: fail-on-revert with `compiler_system.go` restored verbatim
+  from `origin/master` (test kept): `go build ./...` + `go vet ./...` CLEAN,
+  every Packed subtest RED as an assertion naming the missing monitor /
+  target, and the FlatSet / ContainerHierarchical / Control* subtests GREEN
+  as controls. Full `pkg/config` suite under mutation: 7 top-level FAILs, all
+  `*_6588`, zero others. Restored: full `go test ./...` exit 0.
+- **Scope left out**: `services ip-monitoring` (#1827, `compiler_services.go`)
+  drops its packed `then preferred-route ...;` too, but that is fail-CLOSED —
+  a policy with zero compiled routes is a hard commit error ("at least one
+  then preferred-route route is required"), verified by direct compile. It is
+  a different stanza with a loud failure, so it stays out of this PR.
+- **File(s)**: `pkg/config/compiler_system.go`,
+  `pkg/config/compiler_chassis_packed_monitor_6588_test.go` (new),
+  `docs/config-schema.md`, `_Log.md`
+
 ## 2026-07-31 — #6611 review round 2: guard scoped narrower than its claim
 
 - **Timestamp**: 2026-07-31 (fix/6611-control-channel-auth, PR #6624)
@@ -65827,6 +66134,52 @@ break — `go vet` confirmed passing under every revert.
   pkg/cluster/README.md, docs/session-sync-architecture.md,
   docs/sync-protocol.md, _Log.md
 
+- **Timestamp**: 2026-08-01 03:20
+- **Action**: #6658 review fold — assert monitor WEIGHTS, not just names, on
+  bracketed lists. `assertMonitors`'s weight arm was dead code: its only caller
+  was an `assertMonitorNames` shim passing nil, so every bracketed-list case in
+  the #6588 suite ran weight-less and the apply-to-all rule in
+  `monitorEntryNodes` was unguarded. Reverting that function to the round-4
+  positional attachment left build, vet and the whole suite green. The shim is
+  deleted and weights are mandatory; name-only callers pass explicit zeros,
+  which asserts the documented #6549 default instead of skipping the check.
+  Also corrected the `redundancyGroupStatements` enumeration, which claimed
+  three drift routes (all of them the table under-covering the compiler) when a
+  probe found a fourth of the opposite shape: the splitter matches a registered
+  keyword in VALUE position, so `interface-monitor preempt weight 255` steals
+  `preempt` and the packed and container spellings disagree. Unreachable from a
+  real config (no Junos interface name collides), so documented rather than
+  fixed; splitting position-aware is #6665.
+- **File(s)**: pkg/config/compiler_chassis_packed_monitor_6588_test.go,
+  pkg/config/compiler_system.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-08-01 04:05
+- **Action**: #6658 review fold round 2 — close two silent-no-effect holes the
+  Codex xhigh review found, and restore the regression coverage the
+  dispatch-table refactor (b3158d315) deleted. (1) `ip-monitoring`'s
+  `global-weight` / `global-threshold` bypassed every gate: the weight gate
+  walked only ENTRY lists, so `global-weight nope`, `global-weight;` and
+  `global-weight 100 global-weight 200` all committed clean at a compiled 0 —
+  zero demotion debt for the WHOLE group, so no number of failing probes
+  demotes it. Now checked by the same missing-value / non-integer / duplicate
+  rules through a shared `checkTokens`, reading the globals with
+  `ipMonitoringGlobalTokens` over the same `packedStatementProps` result the
+  compiler dispatches from. (2) `preempt` and `strict-vip-ownership` compile to
+  a bool and never read the node, so `preempt delay 5` — real Junos syntax xpf
+  does not implement — was accepted and discarded silently; new
+  `validateRGNoArgStatementsAST` rejects trailing tokens and block bodies,
+  strict at commit and warning on the tolerant load path (#1960). (3)
+  `TestRedundancyGroupStatementsSurvivePackedLine_6588` was placeholder-vacuous:
+  an entry keyed `review-placeholder` with sample text `preempt` passed while
+  its handler was never dispatched. Samples must now begin with their own
+  keyword, and the dispatch table is instrumented so a case that never reaches
+  its handler fails. (4) Restored `TestChassisRedundancyGroupBareContainerShape_6588`
+  and the bracket out-of-range / ambiguous-weight cases that b3158d315 dropped.
+- **File(s)**: pkg/config/compiler_chassis_monitor_weight.go,
+  pkg/config/compiler_chassis_rg_arity.go, pkg/config/compiler_system.go,
+  pkg/config/compiler_prewalk.go, pkg/config/compiler_opts.go,
+  pkg/config/compiler_chassis_packed_monitor_6588_test.go,
+  docs/config-schema.md, _Log.md
 - **Timestamp**: 2026-08-01 05:10
 - **Action**: #6198 review fold (MERGE-NEEDS-MINOR, four minors). (1) Seed the
   synced-session id counter from the boot clock
