@@ -1029,6 +1029,28 @@ malformed value in any other slot never reaches the dataplane at all, so the rul
 installs and keeps translating. Telling an operator their published service is
 down when it is up is the same class of defect as the silence #6659 removed.
 
+**But do not overcorrect into the mirror claim.** "The rule keeps translating"
+holds only when the SELECTED value would itself install, and nothing guarantees
+that: with `destination-address bad-old;` then `destination-address
+bad-selected;` both values are malformed, so the warning about `bad-old`
+announcing that `bad-selected` "stays active" was contradicted by the very next
+warning on the same rule. `emitMatchAddr` therefore takes a `selectedInstalls`
+flag computed from the same two checks the loops apply, plus the empty-selection
+case (`[ "" a b ]` blanks `ExternalIP` and the Rust parse drops the mapping).
+The same trap sits on the routing side: the forwarding-table export diagnostic
+must re-run `checkPolicyRef` on the selected policy before saying it "still
+resolves", because the loop reports whichever undefined value it reaches first
+and that is usually not the selected one. State the consequence you have
+CHECKED, not the one the happy path suggests.
+
+**Cardinality gates name the SELECTED value, which is not element `[0]`.**
+`compileNATStatic` assigns `rule.Match = nodeVal(m)` once per
+`destination-address` sibling, so the LAST authored statement wins; only within
+one bracket/block list is the selected value that statement's first. The
+forwarding-table export scalar behaves the same way across repeated
+`routing-options` roots. Both gates quote the scalar, and both special-case an
+empty scalar — "only one is honoured" is false when the answer is none.
+
 **A multi-value leaf can be PRESENT and still carry NOTHING — presence must be
 decided by VALUES, never by the leaf NAME (#6526).** `firewallMatchValues`
 skips blank tokens, and its doc comment states the contract: *an empty result

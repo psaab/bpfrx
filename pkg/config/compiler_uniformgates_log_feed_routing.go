@@ -151,12 +151,16 @@ func runUniformGatesLogFeedRouting(tree *ConfigTree, cfg *Config, opts compileOp
 	// uses the SELECTED policy, and across two top-level `routing-options` roots
 	// the last root wins, so `export p1` then `export p2` renders p2 while the
 	// wrapper claimed p1. The wrapped error already quotes the policy that takes
-	// effect; the wrapper states only that exactly one does.
+	// effect; the wrapper defers to it. "AT MOST one", not "exactly one": the
+	// selected slot can be an authored blank (`export [ "" p1 p2 ];`), and then
+	// resolveECMP looks nothing up and NO policy renders.
 	if err := validateForwardingTableExportSingleStrict(cfg); err != nil {
 		if opts.lenientRoutingExportRef {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("routing-options forwarding-table export LIST FORM IS NOT SUPPORTED — "+
-					"the ECMP render honours exactly ONE policy and the rest have no "+
+					"the ECMP render honours AT MOST ONE policy (the one the wrapped "+
+					"error names — none at all when the selected value is empty) and "+
+					"the rest have no "+
 					"effect on load-balancing; configure one export policy (support for the Junos "+
 					"export policy CHAIN is tracked in #6674). Downgraded to a warning on the "+
 					"tolerant load / peer-sync path so an already-persisted config still boots: %v", err))

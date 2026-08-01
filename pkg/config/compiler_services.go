@@ -1796,11 +1796,11 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 //
 // Stored VERBATIM — deliberately no strings.TrimSpace. The lexer preserves
 // whitespace INSIDE a quoted token, so master's BLOCK spelling compiled the
-// padded form and so does this (the packed spelling, which master dropped
-// entirely, now matches it). Trimming is invisible to the matcher
-// (ParseEventAttributesMatch trims each field it splits out) but rewrites the
-// persisted config, `show event-options`, and the malformed-expression
-// diagnostic. Readers report authored values; they do not normalise them.
+// padded form and so does this. #6673: trimming would NOT rewrite the persisted
+// config — configstore writes the AST candidate tree (store_commit.go
+// writeActive -> db.go writeTreeMarked) and this reader returns new strings. It
+// changes the COMPILED policy and its consumers: policySemanticRevision (which
+// re-arms the engine), `show event-options`, and the quoted diagnostic.
 func eventAttributesMatchExprs(child *Node) []string {
 	var exprs []string
 	// Packed leaf: the tail tokens form exactly ONE expression. Emitted

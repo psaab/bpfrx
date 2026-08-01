@@ -163,8 +163,8 @@ func compileNAT(node *Node, sec *SecurityConfig) error {
 				//
 				// Read via proxyARPAddressValues rather than firewallMatchValues
 				// so a MALFORMED range that fell through the two branches above
-				// (a `to` child with an empty endpoint) does not contribute the
-				// literal token "to" as an address.
+				// does not widen at all: it keeps master's single-value read,
+				// which is what the dataplane installed before #6659 (#6673).
 				for _, v := range proxyARPAddressValues(prop) {
 					addr := v
 					if !strings.Contains(addr, "/") {
@@ -192,45 +192,84 @@ func compileNAT(node *Node, sec *SecurityConfig) error {
 //     (the lexer strips `[`/`]`, so the list collapses onto ONE node's Keys)
 //   - block       `address { 192.0.2.1; .2; }`    → one child leaf per address
 //
-// It differs from firewallMatchValues in exactly one way: it SKIPS a `to` token.
-// The caller handles `address <low> to <high>` ranges in two earlier branches,
-// but those `continue` only on a WELL-FORMED range; a malformed one — a `to`
-// child with an empty endpoint, or a bracket that leads with the keyword
-// (`address [ to 192.0.2.1 ]`) — falls through to here, where `to` is grammar,
-// not an address, and a plain firewallMatchValues would append it as "to/32".
+// It differs from firewallMatchValues in exactly one way: A MALFORMED RANGE
+// DOES NOT WIDEN. The caller handles `address <low> to <high>` in two earlier
+// branches, but those `continue` only on a WELL-FORMED range; a malformed one —
+// a `to` child with an empty endpoint, a bracket that leads with the keyword
+// (`address [ to 192.0.2.1 ]`), or a `to` anywhere past the range slot
+// (`address [ .1 .2 to .9 ]`) — falls through to here. For those, this helper
+// returns master's single-value read (nodeVal) and nothing else.
 //
-// #6673: what the skip does, stated exactly, because the claim it used to carry
-// — that it "preserves the pre-#6659 behaviour" — is false. Master read this
-// leaf with nodeVal and installed the KEYWORD: verified against origin/master,
-// `address [ to 192.0.2.1 ]`, `address { to; }` and `address { to; 192.0.2.5; }`
-// each compiled to exactly ["to/32"]. Head compiles them to ["192.0.2.1/32"],
-// [] and ["192.0.2.5/32"]. That is a deliberate behaviour CHANGE, and a
-// harmless one: netip.ParsePrefix("to/32") fails, so the installer
-// (pkg/dataplane/proxyarp.go) logged a bounded warning and skipped the entry.
-// Master authored an inert entry; head does not author it.
+// #6673: the reason is INSTALLATION parity, not compile-verdict parity, and the
+// earlier "skip the `to` token" spelling got the second without the first.
+// Measured against origin/master with the installer's own gate
+// (netip.ParsePrefix, pkg/dataplane/proxyarp.go), for `address [ to 192.0.2.1 ]`
+// master compiled ["to/32"] and installed NOTHING, while the token-skip
+// spelling compiled ["192.0.2.1/32"] and installed an NTF_PROXY neighbour plus
+// the interface proxy responder. The appliance answered ARP for the orphan high
+// endpoint of a malformed range — an address master never claimed. Same for
+// `address { to; 192.0.2.5; }` (master {}, skip-spelling {192.0.2.5/32}) and,
+// worse, for `address [ .1 .2 to .9 ]`, where the skip spelling installed .2 and
+// .9 on top of master's .1.
 //
-// The skip is load-bearing for a different reason than the one it claimed.
-// #6659 widened this read AND added validateProxyARPAddressesStrict, which
-// parses every value with the installer's own netip.ParsePrefix. Drop the skip
-// and "to/32" MATERIALISES into Addresses, where that validator HARD-REJECTS at
-// strict commit a config master accepted — an invented rejection, which is the
-// one outcome #6673 holds constant across this whole class. The skip keeps the
-// accept/reject verdict identical to master while discarding only a token the
-// dataplane could never have installed. Pinned by
-// TestProxyARPAddresses6673ToKeywordIsNotAnAddressAndDoesNotInventARejection.
+// Falling back to nodeVal makes that exact: for a malformed range this helper
+// yields master's compiled value, minus the bare keyword — and "to/32" is the
+// one value master compiled that could never install, so
+// installed(head) == installed(master) for EVERY malformed shape, in both
+// directions. Dropping the keyword instead of emitting it also keeps the
+// accept/reject verdict identical: #6659 added validateProxyARPAddressesStrict,
+// which parses every value with netip.ParsePrefix, so materialising "to/32"
+// would HARD-REJECT at strict commit a config master accepted — an invented
+// rejection, the other failure mode this must avoid.
+//
+// The #6659 widening is untouched where it belongs: a WELL-FORMED list
+// (`address [ .1 .2 ]`, `address { .1; .2; }`) still contributes every value,
+// which is the fail-open this arm was widened to fix. Pinned by
+// TestProxyARPAddresses6673MalformedRangeInstallsExactlyWhatMasterInstalled.
 func proxyARPAddressValues(prop *Node) []string {
+	// A malformed range keeps master's single-value read. nodeVal is master's
+	// exact reader (Keys[1], else the first child's name), so the only value
+	// dropped here is the grammar keyword itself.
+	if proxyARPMalformedRange(prop) {
+		if v := nodeVal(prop); v != "" && v != proxyARPRangeKeyword {
+			return []string{v}
+		}
+		return nil
+	}
 	var vals []string
 	for _, k := range prop.Keys[1:] {
-		if k != "" && k != "to" {
+		if k != "" {
 			vals = append(vals, k)
 		}
 	}
 	for _, vn := range prop.Children {
-		if len(vn.Keys) >= 1 && vn.Keys[0] != "" && vn.Keys[0] != "to" {
+		if len(vn.Keys) >= 1 && vn.Keys[0] != "" {
 			vals = append(vals, vn.Keys[0])
 		}
 	}
 	return vals
+}
+
+// proxyARPRangeKeyword is the `address <low> to <high>` range separator.
+const proxyARPRangeKeyword = "to"
+
+// proxyARPMalformedRange reports whether a proxy-arp `address` node that
+// REACHED the caller's single/list branch still carries a range keyword. Both
+// well-formed range shapes are consumed and `continue`d before that point, so a
+// surviving `to` in either read position means the statement is a broken range
+// rather than a list of addresses (#6673).
+func proxyARPMalformedRange(prop *Node) bool {
+	for _, k := range prop.Keys[1:] {
+		if k == proxyARPRangeKeyword {
+			return true
+		}
+	}
+	for _, vn := range prop.Children {
+		if len(vn.Keys) >= 1 && vn.Keys[0] == proxyARPRangeKeyword {
+			return true
+		}
+	}
+	return false
 }
 
 func compileNAT64(node *Node, sec *SecurityConfig) error {

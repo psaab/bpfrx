@@ -1269,7 +1269,15 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 	// staying silent — is what #6659 was fixing. Name the actual effect per
 	// value: the selected one really does drop the rule, a non-selected one is
 	// ignored on its own.
-	emitMatchAddr := func(addr, selected, msg string) error {
+	//
+	// #6673 follow-up: selectedInstalls says whether the SELECTED value would
+	// itself survive this validator's own checks. Without it the two loops can
+	// contradict each other on the same rule: with `destination-address bad-old;
+	// destination-address bad-selected;` the warning for bad-old announced that
+	// bad-selected "stays active", and the very next warning — for
+	// bad-selected, the value that IS selected — correctly said the dataplane
+	// drops the rule. The caller decides; this closure only words the result.
+	emitMatchAddr := func(addr, selected string, selectedInstalls bool, msg string) error {
 		if addr == selected {
 			return emit(msg)
 		}
@@ -1286,6 +1294,12 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			return emitSuffix(msg, " (ignored: this value is not the one the rule "+
 				"installs — the selected match destination-address is EMPTY, so "+
 				"the rule is dropped by the dataplane regardless of this value)")
+		}
+		if !selectedInstalls {
+			return emitSuffix(msg, fmt.Sprintf(
+				" (ignored: this value is not the one the rule installs — %q is, "+
+					"but that value is invalid too, so the rule is dropped by the "+
+					"dataplane regardless of this value)", selected))
 		}
 		return emitSuffix(msg, fmt.Sprintf(
 			" (ignored: this value is not the one the rule installs — %q is, "+
@@ -1390,12 +1404,30 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			blockPairFor := func(matchAddr string) bool {
 				return isStaticBlockPair(matchAddr, rule.Then)
 			}
+			// #6673: does the SELECTED match value clear BOTH match-side checks
+			// below — the literal-address parse and the host-mask rule (with the
+			// same per-address block-pair exemption)? If not, a complaint about
+			// some OTHER slot must not promise that the selected value "stays
+			// active": the selected value is the one that lowers to
+			// StaticNATRuleSnapshot.ExternalIP, and the dataplane drops the
+			// whole rule when it cannot parse it. Mirrors the two loops exactly
+			// so the wording can never disagree with the loops' own verdicts.
+			selectedInstalls := func() bool {
+				if _, _, _, parsedIP := natStaticPrefixInfo(rule.Match); !parsedIP {
+					return false
+				}
+				if blockPairFor(rule.Match) {
+					return true
+				}
+				host, parsed := isHostMaskAddress(rule.Match)
+				return !parsed || host
+			}()
 			for _, addr := range matchAddrs {
 				if addr == "" {
 					continue
 				}
 				if _, _, _, parsedIP := natStaticPrefixInfo(addr); !parsedIP {
-					if err := emitMatchAddr(addr, rule.Match, fmt.Sprintf(
+					if err := emitMatchAddr(addr, rule.Match, selectedInstalls, fmt.Sprintf(
 						"security nat static rule-set %q rule %q match destination-address %q is not a valid IP address or CIDR prefix (static NAT requires a literal address or prefix, not an address-book name or a typo'd value)",
 						rs.Name, rule.Name, addr)); err != nil {
 						return nil, err
@@ -1491,7 +1523,7 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 					continue
 				}
 				if host, parsed := isHostMaskAddress(addr); parsed && !host {
-					if err := emitMatchAddr(addr, rule.Match, fmt.Sprintf(
+					if err := emitMatchAddr(addr, rule.Match, selectedInstalls, fmt.Sprintf(
 						"security nat static rule-set %q rule %q match destination-address %q must be a host route (/32 for IPv4, /128 for IPv6); a non-host mask is silently dropped by the dataplane",
 						rs.Name, rule.Name, addr)); err != nil {
 						return nil, err
@@ -2285,7 +2317,15 @@ func validateStaticNATInetTargetStrict(cfg *Config) error {
 //
 // Strict on commit / commit-check (hard reject); the call site downgrades to a
 // warning on the tolerant load / peer-sync path (#1960 no-brick), where Match
-// still carries the first prefix so behaviour is exactly pre-#6659.
+// still carries the SELECTED prefix so behaviour is exactly pre-#6659.
+//
+// #6673: "selected", not "first". compileNATStatic runs
+// `rule.Match = nodeVal(m)` once per `destination-address` sibling, so the LAST
+// authored statement wins outright — `destination-address 192.0.2.1/32;` then
+// `destination-address 198.51.100.1/32;` installs 198.51.100.1/32, not the
+// first. Only WITHIN a single bracket/block list is the selected value that
+// statement's first, which is why the error below quotes rule.Match rather than
+// addrs[0]. That value can also be an authored blank, handled separately.
 func validateStaticNATMatchAddressesStrict(cfg *Config) error {
 	if cfg == nil {
 		return nil
@@ -2308,6 +2348,23 @@ func validateStaticNATMatchAddressesStrict(cfg *Config) error {
 			// would invent a rejection this gate was never meant to make.
 			addrs := nonEmptyValues(rule.MatchAddresses)
 			if len(addrs) > 1 {
+				// #6673: the selected slot can itself be the authored BLANK —
+				// `destination-address [ "" 192.0.2.1/32 198.51.100.1/32 ];`
+				// counts two prefixes but nodeVal selects the empty one, so
+				// ExternalIP lowers as "" and the Rust parse drops the whole
+				// mapping. "only %q would take effect" printed `only ""` and
+				// implied one of the two still translates.
+				if rule.Match == "" {
+					return fmt.Errorf(
+						"static NAT rule-set %q rule %q declares %d `match "+
+							"destination-address` prefixes (%v); a static-NAT rule "+
+							"translates exactly ONE external prefix to the single "+
+							"`then static-nat prefix` target and the selected value "+
+							"is EMPTY, so NONE of them takes effect and the "+
+							"dataplane drops the rule — author one rule per "+
+							"external prefix (#6659)",
+						rs.Name, rule.Name, len(addrs), addrs)
+				}
 				return fmt.Errorf(
 					"static NAT rule-set %q rule %q declares %d `match "+
 						"destination-address` prefixes (%v); a static-NAT rule "+

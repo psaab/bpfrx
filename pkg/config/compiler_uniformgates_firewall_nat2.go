@@ -149,16 +149,25 @@ func runUniformGatesFirewallNAT2(tree *ConfigTree, cfg *Config, opts compileOpts
 	// multi-valued case because a static-NAT rule lowers to exactly ONE
 	// dataplane row. Strict on commit / commit-check (hard reject so the
 	// previously-silent collapse is operator-visible); lenient on load /
-	// peer-sync (warn — #1960 no-brick; Match still carries the first prefix, so
-	// the tolerant path behaves exactly as it did pre-#6659). Reuses
+	// peer-sync (warn — #1960 no-brick; Match still carries the SELECTED prefix,
+	// so the tolerant path behaves exactly as it did pre-#6659). Reuses
 	// lenientFirewallRefs like the sibling static-NAT gates above.
+	//
+	// #6673: "selected", not "first". compileNATStatic assigns
+	// `rule.Match = nodeVal(m)` once per `destination-address` sibling, so the
+	// LAST authored statement wins; only WITHIN one bracket/block list is the
+	// selected value that statement's first. And "AT MOST one" is honoured, not
+	// "exactly one": the selected slot can be an authored blank
+	// (`destination-address [ "" a b ];`), which lowers ExternalIP as "" and
+	// makes the dataplane drop the rule entirely.
 	if err := validateStaticNATMatchAddressesStrict(cfg); err != nil {
 		if opts.lenientFirewallRefs {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("static NAT `match destination-address` LIST FORM IS NOT SUPPORTED — "+
-					"only ONE prefix is honoured — the LAST authored `match "+
-					"destination-address` statement, or within a bracketed list "+
-					"that statement's first value — and the rest carry no translation; "+
+					"AT MOST ONE prefix is honoured — the one the wrapped error names "+
+					"(the LAST authored `match destination-address` statement, or within "+
+					"a bracketed list that statement's first value; none at all when that "+
+					"value is empty) — and the rest carry no translation; "+
 					"author one rule per external prefix (support for the list form is tracked "+
 					"in #6674). Downgraded to a warning on the tolerant load / peer-sync path "+
 					"so an already-persisted config still boots: %v", err))

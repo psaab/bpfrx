@@ -73758,3 +73758,53 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
   pkg/eventengine/classify_plan_empty_command_6673_test.go,
   docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-08-02 21:05
+- **Action**: #6673 F4 fold — the proxy-ARP MAJOR the previous round could not
+  see, plus five diagnostic/rationale MINORs. (1) MAJOR: the F3 round verified
+  the malformed-range `to` skip on ACCEPTANCE parity — master accepts, head
+  accepts — and that is not the property that matters. Measured INSTALLATION
+  parity instead, running master and head through the installer's own gate
+  (`netip.ParsePrefix`, pkg/dataplane/proxyarp.go) over 34 authoring shapes
+  (23 hierarchical + 11 flat-set): the skip promoted a malformed range's
+  surviving endpoint to a standalone proxy address on SIX shapes. Master
+  compiled `address [ to 192.0.2.1 ]` to `["to/32"]` and installed NOTHING;
+  head installed an NTF_PROXY neighbour and enabled the interface proxy
+  responder for `192.0.2.1`. Codex reported one shape; the differential found
+  five more, worst of them `address [ .1 .2 to .9 ]`, where head installed .2
+  AND the orphan high endpoint .9 on top of master's .1. Fix: a malformed range
+  keeps master's single-value read (`nodeVal`) minus the bare keyword, so
+  installed(head) == installed(master) EXACTLY for every malformed shape in both
+  directions, with no invented rejection. The #6659 widening is untouched on
+  well-formed lists. Post-fix drift vs master is now only the four well-formed
+  list shapes (the intended widening) and three shapes carrying a genuinely
+  malformed ADDRESS literal (the intended `validateProxyARPAddressesStrict`
+  tightening, install set unchanged). (2) The routing per-value diagnostic said
+  the selected policy "still resolves" without checking it; with two undefined
+  policies the loop reports the first and mis-states the consequence for the
+  second. (3) `emitMatchAddr` said the selected value "stays active" without
+  checking it, so two malformed `destination-address` siblings produced two
+  warnings on one rule that contradicted each other. (4) Both cardinality gates
+  printed `only "" would take effect` when the selected slot was an authored
+  blank — none takes effect; the tolerant wrappers said "exactly/only ONE" for
+  the same reason. (5) Two comments still said the static-NAT "first" prefix is
+  selected; `rule.Match = nodeVal(m)` runs per sibling, so the LAST statement
+  wins and "first" holds only within one bracket list. (6) The trimming note
+  claimed trimming "rewrites the persisted config" — it does not: configstore
+  persists the AST candidate tree (store_commit.go writeActive -> db.go
+  writeTreeMarked) and the reader returns new strings; what it changes is the
+  compiled policy and its consumers. RED-on-revert: 8 mutations, `go build
+  -buildvcs=false ./...` rc=0 and `go vet ./pkg/config/... ./pkg/dataplane/...`
+  rc=0 asserted BEFORE every red, predicate-disable/substitution style only;
+  each reds its named test with a real `--- FAIL:` line. Two scope probes found
+  the `selectedInstalls` host-mask and block-pair legs UNBOUND by the first
+  draft of the guard and the test was widened until mutating each one reds.
+  `compiler_services.go` held at 1999 lines (TestHeatmapNotStale headroom).
+- **File(s)**: pkg/config/compiler_nat_source.go,
+  pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_validate_strict_routing.go,
+  pkg/config/compiler_uniformgates_firewall_nat2.go,
+  pkg/config/compiler_uniformgates_log_feed_routing.go,
+  pkg/config/compiler_services.go,
+  pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
+  docs/config-schema.md, _Log.md

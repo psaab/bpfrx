@@ -239,6 +239,22 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 				"table renders — the selected forwarding-table export is EMPTY, "+
 				"so no ECMP policy is configured at all; correct or remove the "+
 				"undefined policy)", err)
+		case checkPolicyRef("routing-options forwarding-table export",
+			selected, hintExport) != nil:
+			// #6673: "%q is, and it still resolves" ASSUMED the selected policy
+			// resolves without ever checking it. With `export missing-old;`
+			// then `export missing-selected;` the list is
+			// [missing-old, missing-selected] and the scalar is
+			// missing-selected; the loop reaches missing-old FIRST and
+			// reassured the operator that missing-selected "still resolves"
+			// when it is undefined too and ECMP is disabled. The verdict was
+			// right (strict rejects, tolerant warns) and the stated consequence
+			// was backwards, which on the tolerant path is the only thing the
+			// operator gets.
+			return fmt.Errorf("%s (this value is not the one the forwarding "+
+				"table renders — %q is, but that policy is UNDEFINED as well, "+
+				"so the expected ECMP / consistent-hash load-balancing is "+
+				"silently disabled; define or correct it)", err, selected)
 		default:
 			return fmt.Errorf("%s (this value is not the one the forwarding "+
 				"table renders — %q is, and it still resolves; correct or "+
@@ -284,6 +300,21 @@ func validateForwardingTableExportSingleStrict(cfg *Config) error {
 	// named a policy that does not render.
 	exports := nonEmptyValues(cfg.RoutingOptions.ForwardingTableExports)
 	if n := len(exports); n > 1 {
+		// #6673: the selected slot can itself be an authored BLANK —
+		// `export [ "" p1 p2 ];` counts two policies but nodeVal selects the
+		// empty slot, so resolveECMP looks nothing up and NO policy renders.
+		// "only %q would take effect" then printed `only "" would take effect`,
+		// naming a policy that does not exist and implying one of the two is
+		// still honoured.
+		if cfg.RoutingOptions.ForwardingTableExport == "" {
+			return fmt.Errorf(
+				"routing-options forwarding-table export declares %d policies (%v); "+
+					"the forwarding-table export renders as a SINGLE ECMP policy "+
+					"lookup and the selected value is EMPTY, so NONE of them takes "+
+					"effect and no ECMP policy is configured at all — configure one "+
+					"export policy (#6659)",
+				n, exports)
+		}
 		return fmt.Errorf(
 			"routing-options forwarding-table export declares %d policies (%v); "+
 				"the forwarding-table export renders as a SINGLE ECMP policy "+

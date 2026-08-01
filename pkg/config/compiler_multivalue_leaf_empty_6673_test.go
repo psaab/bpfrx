@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net/netip"
 	"reflect"
 	"strings"
 	"testing"
@@ -773,6 +774,191 @@ security { nat { static { rule-set rs1 { from zone untrust;
 	}
 }
 
+// TestStaticNATMatch6673NonSelectedSuffixChecksTheSelectedValueToo guards the
+// mirror of the branch above: emitMatchAddr's "%q is, and it stays active" said
+// the rule keeps translating without ever checking that the SELECTED value would
+// itself install.
+//
+// With two malformed `destination-address` siblings the two loops contradicted
+// each other on the SAME rule — the warning for bad-old announced that
+// bad-selected "stays active", and the very next warning, for bad-selected (the
+// value that IS selected), correctly said the dataplane drops the rule. Only one
+// of those can be true. rule.Match lowers to StaticNATRuleSnapshot.ExternalIP,
+// so when it does not parse the whole mapping is dropped and NOTHING stays
+// active.
+// selectedInstalls has THREE legs — the literal-address parse, the block-pair
+// exemption, and the host-mask rule — and every one is exercised here. Covering
+// only the parse leg leaves the other two free to misword: the host-mask leg
+// would claim "stays active" about a selected value the dataplane drops for a
+// non-host mask, and dropping the block-pair exemption would claim "invalid too"
+// about a legal subnet 1:1 that installs perfectly well.
+func TestStaticNATMatch6673NonSelectedSuffixChecksTheSelectedValueToo(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		cfg          string
+		wantSelected string
+		// old/sel are the substrings that identify each value's own warning.
+		oldSub, selSub string
+		// selectedStaysActive inverts the assertion: the selected value is
+		// installable, so the non-selected complaint SHOULD say it stays
+		// active and the selected value earns no complaint of its own.
+		selectedStaysActive bool
+	}{
+		{
+			// Parse leg: neither value is a literal address.
+			name: "selected value does not parse",
+			cfg: `
+security { nat { static { rule-set rs1 { from zone untrust;
+    rule r1 { match { destination-address bad-old; destination-address bad-selected; }
+              then { static-nat prefix 10.0.0.1/32; } } } } } }`,
+			wantSelected: "bad-selected",
+			oldSub:       `destination-address "bad-old" is not a valid`,
+			selSub:       `destination-address "bad-selected" is not a valid`,
+		},
+		{
+			// Host-mask leg: both values parse but neither is a host route,
+			// and neither forms a block pair with the /32 `then` prefix — so
+			// the dataplane drops the rule on the SELECTED one all the same.
+			name: "selected value parses but is a non-host mask",
+			cfg: `
+security { nat { static { rule-set rs1 { from zone untrust;
+    rule r1 { match { destination-address 198.51.100.0/24; destination-address 203.0.113.0/24; }
+              then { static-nat prefix 10.0.0.1/32; } } } } } }`,
+			wantSelected: "203.0.113.0/24",
+			oldSub:       `destination-address "198.51.100.0/24" must be a host route`,
+			selSub:       `destination-address "203.0.113.0/24" must be a host route`,
+		},
+		{
+			// Block-pair leg (CONTROL, opposite direction): the selected value
+			// is a non-host mask that DOES form a legal equal-length subnet 1:1
+			// with the `then` prefix (#3031), so the dataplane installs it and
+			// the non-selected complaint must still say it stays active.
+			// Without the exemption this case would be mis-worded the other
+			// way, telling the operator a working rule is dropped.
+			name: "selected value is a legal block pair and does install",
+			cfg: `
+security { nat { static { rule-set rs1 { from zone untrust;
+    rule r1 { match { destination-address 203.0.113.0/25; destination-address 198.51.100.0/24; }
+              then { static-nat prefix 10.0.0.0/24; } } } } } }`,
+			wantSelected:        "198.51.100.0/24",
+			oldSub:              `destination-address "203.0.113.0/25" must be a host route`,
+			selectedStaysActive: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := CompileConfigLenient(hierTree6659(t, tc.cfg))
+			if err != nil {
+				t.Fatalf("tolerant compile: %v", err)
+			}
+			rule := cfg.Security.NAT.Static[0].Rules[0]
+			if rule.Match != tc.wantSelected {
+				t.Fatalf("Match = %q, want %q — the premise of this case is that "+
+					"the LAST authored sibling is selected", rule.Match, tc.wantSelected)
+			}
+			wOld := findWarning6673(t, cfg, tc.oldSub)
+			if tc.selectedStaysActive {
+				if !strings.Contains(wOld, "stays active") {
+					t.Fatalf("the selected value %q is a legal block pair with the "+
+						"`then` prefix and installs, so the complaint about the "+
+						"non-selected value must say it stays active:\n  %s",
+						rule.Match, wOld)
+				}
+				if strings.Contains(wOld, "invalid too") {
+					t.Fatalf("the complaint about the non-selected value calls the "+
+						"selected value %q invalid, but it is a legal subnet 1:1 "+
+						"that the dataplane installs:\n  %s", rule.Match, wOld)
+				}
+				return
+			}
+			if strings.Contains(wOld, "stays active") {
+				t.Fatalf("the warning for the NON-selected value says the rule "+
+					"stays active on %q, but that value is invalid too and the "+
+					"dataplane drops the rule — the two warnings on this rule "+
+					"contradict each other:\n  %s", rule.Match, wOld)
+			}
+			if !strings.Contains(wOld, "invalid too") {
+				t.Fatalf("the warning for the NON-selected value does not say "+
+					"the selected value is invalid too:\n  %s", wOld)
+			}
+			// The selected value's OWN warning is unchanged: it really does drop
+			// the rule. Select it by its OPERAND — the non-selected warning
+			// above also quotes the selected value, in its suffix.
+			wSel := findWarning6673(t, cfg, tc.selSub)
+			if !strings.Contains(wSel, "(ignored: rule dropped by dataplane until corrected)") {
+				t.Fatalf("the warning for the SELECTED value must still say the "+
+					"rule is dropped, because it is:\n  %s", wSel)
+			}
+		})
+	}
+}
+
+// TestCardinalityGates6673EmptySelectionSaysNoneTakesEffect guards both
+// multi-value cardinality gates against an authored blank in the SELECTED slot.
+//
+// Each gate counts only NON-EMPTY values (so `[ "" p1 ]` stays acceptable) and
+// then names the selected scalar. Those two rules combine badly: `[ "" p1 p2 ]`
+// counts two, trips the gate, and the scalar is the blank — so the message read
+// `only "" would take effect`, naming a policy/prefix that does not exist and
+// implying one of the two is still honoured. Neither is: an empty
+// forwarding-table export renders no ECMP policy at all, and an empty
+// ExternalIP makes the Rust parse drop the whole static-NAT mapping. The
+// tolerant wrappers said "exactly ONE"/"only ONE" for the same reason.
+func TestCardinalityGates6673EmptySelectionSaysNoneTakesEffect(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		cfg        string
+		wantSubs   []string
+		rejectSubs []string
+	}{
+		{
+			name: "forwarding-table export",
+			cfg: `
+policy-options { policy-statement p1 { then accept; } policy-statement p2 { then accept; } }
+routing-options { forwarding-table { export [ "" p1 p2 ]; } }`,
+			wantSubs:   []string{"selected value is EMPTY", "NONE of them takes effect"},
+			rejectSubs: []string{`only "" would take effect`},
+		},
+		{
+			name: "static NAT match destination-address",
+			cfg: `
+security { nat { static { rule-set rs1 { from zone untrust;
+    rule r1 { match { destination-address [ "" 192.0.2.1/32 198.51.100.1/32 ]; }
+              then { static-nat prefix 10.0.0.1/32; } } } } } }`,
+			wantSubs:   []string{"selected value is EMPTY", "NONE of them takes effect", "drops the rule"},
+			rejectSubs: []string{`only "" would take effect`},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := CompileConfigMustFail6673(t, hierTree6659(t, tc.cfg))
+			got := err.Error()
+			for _, sub := range tc.wantSubs {
+				if !strings.Contains(got, sub) {
+					t.Fatalf("strict error does not contain %q:\n  %s", sub, got)
+				}
+			}
+			for _, sub := range tc.rejectSubs {
+				if strings.Contains(got, sub) {
+					t.Fatalf("strict error contains %q — it names a value that "+
+						"does not exist and implies one of the listed values is "+
+						"still honoured:\n  %s", sub, got)
+				}
+			}
+			// The tolerant wrapper must not re-assert "exactly/only ONE" either.
+			cfg, lerr := CompileConfigLenient(hierTree6659(t, tc.cfg))
+			if lerr != nil {
+				t.Fatalf("tolerant compile: %v", lerr)
+			}
+			w := findWarning6673(t, cfg, "LIST FORM IS NOT SUPPORTED")
+			for _, wrong := range []string{"exactly ONE policy", "only ONE prefix is honoured"} {
+				if strings.Contains(w, wrong) {
+					t.Fatalf("tolerant wrapper claims %q while the error it wraps "+
+						"says NONE takes effect:\n  %s", wrong, w)
+				}
+			}
+		})
+	}
+}
+
 // TestForwardingTableExport6673TolerantWarningDoesNotNameTheWrongSlot guards the
 // wrapper text against the error it wraps.
 //
@@ -856,6 +1042,28 @@ routing-options { forwarding-table { export nosuch; } }`,
 			wantSubs:   []string{`"nosuch"`, "silently disabled"},
 			rejectSubs: []string{"still resolves"},
 		},
+		{
+			// #6673: the "still resolves" branch ASSUMED the selected policy
+			// resolves without checking it. The loop reports whichever value it
+			// reaches first, and that is usually NOT the selected one: here the
+			// plural is [missing-old, missing-selected] and the scalar is
+			// missing-selected, so the diagnostic for missing-old reassured the
+			// operator that missing-selected "still resolves" — while it is
+			// undefined too and ECMP is disabled. The verdict was already right
+			// (strict rejects, tolerant warns); the stated consequence was
+			// backwards, and on the tolerant path the consequence is all the
+			// operator gets.
+			name: "BOTH the reported value and the selected policy are undefined",
+			cfg: `
+routing-options { forwarding-table { export missing-old; } }
+routing-options { forwarding-table { export missing-selected; } }`,
+			wantSubs: []string{
+				`"missing-old"`,
+				`"missing-selected" is, but that policy is UNDEFINED as well`,
+				"silently disabled",
+			},
+			rejectSubs: []string{"still resolves"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := CompileConfigMustFail6673(t, hierTree6659(t, tc.cfg))
@@ -884,8 +1092,10 @@ routing-options { forwarding-table { export nosuch; } }`,
 // padded string and so must this. Trimming here is invisible to the matcher
 // (ParseEventAttributesMatch trims every field it splits out) and to the engine
 // (classifyPlan trims each command), which is exactly what makes it easy to add
-// by accident — but it rewrites the persisted config, the policy's semantic
-// revision, and what `show event-options` prints back at the operator.
+// by accident. #6673: what it changes is NOT the persisted config — configstore
+// writes the AST candidate tree, and these readers return new strings without
+// touching the node — but the COMPILED policy and its consumers: the policy's
+// semantic revision, and what `show event-options` prints back at the operator.
 func TestEventOptions6673ValuesAreStoredVerbatim(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -932,35 +1142,85 @@ event-options { policy pA { events e1;
 	}
 }
 
-// TestProxyARPAddresses6673ToKeywordIsNotAnAddressAndDoesNotInventARejection
-// pins the `to`-token skip in proxyARPAddressValues, which was reachable,
-// behaviour-changing and completely unbound.
+// TestProxyARPAddresses6673MalformedRangeInstallsExactlyWhatMasterInstalled
+// binds the acceptance criterion this arm is actually held to: not "does the
+// compiler return the same VERDICT as master" but "does the DATAPLANE install
+// the same set of proxy addresses as master".
 //
-// A malformed range falls through the caller's two range branches to the
-// value reader, where `to` is grammar rather than an address. Master read this
-// leaf with nodeVal and installed the KEYWORD — every shape below compiled to
-// exactly ["to/32"] on origin/master. The skip is not "preserving pre-#6659
-// behaviour" (it changes it); what it preserves is the ACCEPT/REJECT verdict:
-// #6659 also added validateProxyARPAddressesStrict, which parses every value
-// with netip.ParsePrefix, so without the skip "to/32" materialises and strict
-// commit HARD-REJECTS a config master accepted.
-func TestProxyARPAddresses6673ToKeywordIsNotAnAddressAndDoesNotInventARejection(t *testing.T) {
+// A malformed range — a `to` that neither of the caller's two range branches
+// consumed — falls through to the value reader. The first spelling of this fold
+// merely skipped the `to` TOKEN there, which kept the compile verdict identical
+// to master and was verified on that basis alone. It was still a runtime
+// regression: dropping the keyword PROMOTED the range's surviving endpoint to a
+// standalone proxy address. `address [ to 192.0.2.1 ]` compiled ["to/32"] on
+// master, which netip.ParsePrefix rejects at pkg/dataplane/proxyarp.go, so
+// master installed NOTHING; the token-skip spelling compiled ["192.0.2.1/32"],
+// and the installer then added an NTF_PROXY neighbour and enabled the interface
+// proxy responder. The appliance answered ARP for the orphan high endpoint of a
+// broken range — traffic drawn to this box that master never claimed.
+//
+// wantInstalled below is therefore MASTER's installed set, measured against
+// origin/master with the installer's own netip.ParsePrefix gate, and the test
+// asserts the installed set as well as the compiled list. The `to` at a
+// non-range slot cases (`[ .1 .2 to .9 ]`) are the same defect one step further
+// out: the token-skip spelling installed .2 AND .9 on top of master's .1.
+//
+// Both directions matter, so the corpus keeps the shapes where master DID
+// install (`[ .1 to ]`, `{ .5; to; }`): going inert there would be the opposite
+// regression, dropping an address master answered for. And the strict verdict is
+// asserted alongside, because the other failure mode is an invented rejection —
+// materialising "to/32" makes validateProxyARPAddressesStrict hard-reject a
+// config master accepted.
+func TestProxyARPAddresses6673MalformedRangeInstallsExactlyWhatMasterInstalled(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		cfg  string
-		want []string
+		want []string // compiled ProxyARPEntry.Addresses
+		// wantInstalled is what origin/master's compiled output survives
+		// netip.ParsePrefix to install. It must match head's exactly.
+		wantInstalled []string
 	}{
 		{"bracket leading with the keyword", `
 security { nat { proxy-arp { interface ge-0-0-0 { address [ to 192.0.2.1 ]; } } } }`,
-			[]string{"192.0.2.1/32"}},
+			nil, nil},
 		{"block with a keyword-only child", `
 security { nat { proxy-arp { interface ge-0-0-0 { address { to; 192.0.2.5; } } } } }`,
-			[]string{"192.0.2.5/32"}},
+			nil, nil},
+		{"keyword-only block", `
+security { nat { proxy-arp { interface ge-0-0-0 { address { to; } } } } }`,
+			nil, nil},
+		{"bare keyword", `
+security { nat { proxy-arp { interface ge-0-0-0 { address to; } } } }`,
+			nil, nil},
+		{"keyword ahead of a CIDR", `
+security { nat { proxy-arp { interface ge-0-0-0 { address [ to 192.0.2.0/30 ]; } } } }`,
+			nil, nil},
+		{"keyword past the range slot", `
+security { nat { proxy-arp { interface ge-0-0-0 { address [ 192.0.2.1 192.0.2.2 to 192.0.2.9 ]; } } } }`,
+			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}},
+		{"keyword further past the range slot", `
+security { nat { proxy-arp { interface ge-0-0-0 { address [ 192.0.2.1 192.0.2.2 192.0.2.3 to 192.0.2.9 ]; } } } }`,
+			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}},
+		{"dangling trailing keyword still installs the low endpoint", `
+security { nat { proxy-arp { interface ge-0-0-0 { address [ 192.0.2.1 to ]; } } } }`,
+			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}},
+		{"block address then dangling keyword still installs", `
+security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.5; to; } } } } }`,
+			[]string{"192.0.2.5/32"}, []string{"192.0.2.5/32"}},
+		{"well-formed sibling beside a malformed range", `
+security { nat { proxy-arp { interface ge-0-0-0 { address [ to 192.0.2.1 ]; address 192.0.2.9; } } } }`,
+			[]string{"192.0.2.9/32"}, []string{"192.0.2.9/32"}},
 		{"well-formed range still expands (CONTROL)", `
 security { nat { proxy-arp { interface ge-0-0-0 { address 192.0.2.1 to 192.0.2.3; } } } }`,
+			[]string{"192.0.2.1/32", "192.0.2.2/32", "192.0.2.3/32"},
 			[]string{"192.0.2.1/32", "192.0.2.2/32", "192.0.2.3/32"}},
-		{"plain list is unaffected (CONTROL)", `
+		{"plain list keeps the #6659 widening (CONTROL)", `
 security { nat { proxy-arp { interface ge-0-0-0 { address [ 192.0.2.1 192.0.2.2 ]; } } } }`,
+			[]string{"192.0.2.1/32", "192.0.2.2/32"},
+			[]string{"192.0.2.1/32", "192.0.2.2/32"}},
+		{"plain block keeps the #6659 widening (CONTROL)", `
+security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.1; 192.0.2.2; } } } } }`,
+			[]string{"192.0.2.1/32", "192.0.2.2/32"},
 			[]string{"192.0.2.1/32", "192.0.2.2/32"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -974,11 +1234,43 @@ security { nat { proxy-arp { interface ge-0-0-0 { address [ 192.0.2.1 192.0.2.2 
 					"materialise as \"to/32\" makes the proxy-ARP validator "+
 					"reject it", err)
 			}
-			if got := cfg.Security.NAT.ProxyARP[0].Addresses; !reflect.DeepEqual(got, tc.want) {
+			var got []string
+			for _, e := range cfg.Security.NAT.ProxyARP {
+				got = append(got, e.Addresses...)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("Addresses = %q, want %q", got, tc.want)
+			}
+			// The claim this test exists for: what the DATAPLANE installs.
+			// installedProxyARP6673 applies the installer's own gate, so a
+			// compiled value that promotes a malformed range's endpoint shows
+			// up here as an address master never answered ARP for.
+			if inst := installedProxyARP6673(got); !reflect.DeepEqual(inst, tc.wantInstalled) {
+				t.Fatalf("dataplane would install %q, but origin/master installed %q\n"+
+					"pkg/dataplane/proxyarp.go adds an NTF_PROXY neighbour and enables "+
+					"the interface proxy responder for every address that survives "+
+					"netip.ParsePrefix; a malformed range must not promote its "+
+					"surviving endpoint into that set, and must not drop an endpoint "+
+					"master did install", inst, tc.wantInstalled)
 			}
 		})
 	}
+}
+
+// installedProxyARP6673 returns the subset of compiled proxy-ARP addresses that
+// pkg/dataplane/proxyarp.go would actually install — it applies that installer's
+// own netip.ParsePrefix gate, the one that makes "to/32" inert.
+func installedProxyARP6673(addrs []string) []string {
+	var out []string
+	for _, a := range addrs {
+		if a == "" {
+			continue
+		}
+		if _, err := netip.ParsePrefix(a); err == nil {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 // --- helpers ---------------------------------------------------------------
