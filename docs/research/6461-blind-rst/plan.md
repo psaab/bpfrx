@@ -1,39 +1,42 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v10.35.0 — THE TERMINAL CUT, round-119 folds (Codex
-r119's 6B/1H/1M/1L: the commit-side mechanics are now the CARRIED
-VALIDATED HANDLE — the early identity check resolves the canonical slab
-handle, the descriptor's commit scratch carries it, and every authority
-mutation re-validates it at its own apply point with an L1 slab index +
-identity compare, NO re-hash; the "rides master's account_packet
-borrows" phrasing is retracted. The ANCHOR APPLY moves to the
-post-construction success arm (`flow_cache_hit.rs:507-548`) — a
-rewrite-failed packet recycled at `:550-555` never advances the trusted
-anchor (the committed-packet invariant restored). The imported-reverse
-binding now compares against a RECORDED EXPECTED id — the per-worker
-paired-publish breadcrumb (F-then-R FIFO adjacency,
-`session_import.rs:215-223`) preserves the expected forward id at
-import and the promote compares, so the occupant can never self-certify
-(the K-capture trace dies). The different-family overwrite promote
-RE-MINTS the session id (genuine identity replacement — S2 never wears
-K's id). The id's replication invariance is COMPLETED: the
-SharedPromote republication, local-origin shared publishes, and the HA
-bulk export populate the real id (the #5212 wire field exists — a
-behavior completion, not a format change), and a zero-wire-id
-re-import preserves the existing entry's id; the allocator's wrap guard
-becomes a skip and the hi-word gains a node bit (#6311 pulled in). The
-closing-family inheritance is ONE EFFECTIVE SEED STATE — the effective
-flags drive the installer's timeout/closing/reset/observed-flags AND
-the publish/replication, so the sibling reconstructs the same closing
-state. The capacity-corner accounting carries the identity-bound
-fallback target to master's own chokepoint
-(`poll_descriptor/mod.rs:3478-3503`) with master's own inputs — the
-in-resolution direct charge is retracted (resolution lacks length/DSCP).
-§3.1's second-window row is corrected: the window DOES rewrite
-`worker/loop_body/mod.rs` (+342/−13; reap definition :1481→`:1615`).
-Round-119: Codex NO (6B/1H/1M/1L — folded this revision; r118-3/6/7/8/9
-RESOLVED); AGY r118 dispatched on v10.34.0 (result pending, folds land
-next revision); SMR r119 YES (fold verification, v10.34.0).
+**Status: DRAFT v10.36.0 — THE TERMINAL CUT, round-120 folds (Codex
+r120's 11B/1H/1M/1L: the anchor apply runs at the COMMON SUCCESS-ONLY
+POSTBLOCK — `!recycle_now` at `flow_cache_hit.rs:549-552`, where BOTH
+success arms converge (the dominant in-place arm `:444-497` skips the
+fallback block entirely); the carrier is TWO validated handles for a
+reverse-direction binding (the matched R for probation/identity, the
+canonical F for the anchor/close-mark — the family hop's second lookup
+exists on master); the precedence rule — every install/upsert/overwrite
+at key K invalidates K's exact-query-key cache slot, so a
+precedence-changing install never leaves a stale descriptor forwarding
+the prior winner's decision; the expected forward id is CARRIED on the
+synthesized reverse entry (`expected_fwd_id`, stamped at synthesis from
+the forward row's id — the v10.35.0 adjacency breadcrumb is retracted:
+prewarm and singleton paths break adjacency), with the tunnel
+`UpsertLocal` class carrying 0 → UNBOUND-absorbing; the different-family
+overwrite is classified by the (nat, is_reverse) snapshot compare and
+runs REMOVE+INSTALL semantics (re-mint + full authority-state reinit —
+K's anchor/sticky state never rides onto S2); a zero wire id ALWAYS
+fresh-mints (the preserve clause retracted — no same-incarnation
+evidence rides the command); the node bit's producer is threaded
+(`set_identity(worker_id, node_id)` from `/etc/xpf/node-id` via worker
+setup — physical id, not role state); the close-bit merge covers EVERY
+synth against a marked family including close→close retries AND the
+sibling's shared-hit materialization (a published closing/reset replica
+can never be reconstructed alive by a bare-ACK materialization); the
+capacity-corner accounting has its full producer/carrier/consumer chain
+(typed `Site2bOutcome`, `Option<ValidatedTarget>`, hoisted fallback
+field, `account_packet -> bool`, mutually exclusive chokepoint branch)
+scoped to accounting-eligible forwarded dispositions; the cost/history
+stragglers are reconciled. Round-120: Codex NO (11B/1H/1M/1L — folded
+this revision; r119-8/9 RESOLVED); AGY r119: five dispatch attempts —
+two non-review content faults, two headless command-permission denials,
+one off-topic CLI-documentation response (infra per protocol; a sixth
+attempt runs on v10.36.0); SMR r120 pending (fold verification lands
+with this revision). Round-119: Codex NO (6B/1H/1M/1L — folded
+v10.35.0; r118-3/6/7/8/9 RESOLVED); AGY r118 infra (documented
+retries); SMR r119 YES (fold verification, v10.34.0).
 Round-118: Codex NO (4B/3H/1M/1L — folded v10.34.0;
 r117-7 RESOLVED); AGY r117 two infra failures (non-review content;
 headless command-permission denial — re-dispatched with the proven
@@ -384,14 +387,19 @@ What the fix buys, at absolute scale:
   the one consistent figure, v10.33.0 round-117 Codex 6) PLUS the
   per-binding flow-cache token: one additive `Option<MatchedToken>`
   (~96 B — 40 B `SessionKey`, `key.rs:9-17`, + 44 B `NatDecision`,
-  `nat/mod.rs:90-103`, + 8 B epoch + orientation/provenance bytes; the
-  `Option` niche-fills on the provenance enum) on `FlowCacheEntry`,
+  `nat/mod.rs:90-103`, + 8 B stable id + orientation/source/transition
+  bytes; the
+  `Option` niche-fills on the source enum) on `FlowCacheEntry`,
   4,096 entries per binding ≈ +384 KiB per binding (owned per binding,
   not per worker). No Go sidecar. Per-packet: one
   TCP-header view compute (seq/ack/wnd/flags/seg_len) plus ≤2
-  plausibility-gated `u32` stores per committed TCP data packet, and a
-  second table probe only on closing-flag segments (which already take
-  the full slow path).
+  plausibility-gated `u32` stores per committed TCP data packet, a
+  companion table probe on closing-flag segments (which already take
+  the full slow path), AND the cache identity-check probe(s) on every
+  session-backed cache hit — one canonical probe for a forward-direction
+  binding, two for a reverse-direction binding (v10.36.0 — the
+  "closing-only" phrasing here predated the identity check; §8 carries
+  the full accounting).
 
 What the fix does **not** buy: protection against an on-path attacker
 (observes sequence numbers; out of threat model); protection of pre-5961
@@ -1435,8 +1443,9 @@ engaged.) The accept/refuse split:
   packet contributes NO anchor sample (no entry exists to hang it
   on — the commit token requires an installed entry). Two capacity-
   corner completions (v10.34.0, round-118 Codex 4; completed v10.35.0,
-  round-119 Codex 6/7): FIRST, a LATER
-  non-closing reverse packet against the now-marked (closing) forward
+  round-119 Codex 6/7; extended v10.36.0, round-120 Codex 9/10): FIRST,
+  a LATER
+  reverse packet against the now-marked (closing) forward
   entry retries the synth master-verbatim — and that synth computes ONE
   EFFECTIVE INHERITED SEED STATE from the matched forward family's
   sticky state: the effective flags are the driving packet's flags
@@ -1450,7 +1459,21 @@ engaged.) The accept/refuse split:
   (`session_glue/commands/upsert_synced.rs:64-79`,
   `install.rs:382-400`) — inheriting only the local booleans would
   leave the established timeout and an alive sibling replica (the
-  divergence trace); the (Local, ESTABLISHED, non-closing) →
+  divergence trace). The merge applies to EVERY synth against a
+  marked family (round-120 Codex 9): a non-closing retry AND a
+  close-flagged retry alike — an RST-marked family followed by an
+  accepted FIN yields `closing`+`reset` on the new reverse (the 2 s
+  clock, never a FIN-only 30 s one whose liveness would retain the
+  RST-marked forward past its deadline through `expire.rs:296-320`,
+  `:468-523`), and FIN→RST merges identically. The same close-bit
+  merge governs the sibling's shared-hit MATERIALIZATION (round-120
+  Codex 10: `session_glue/mod.rs:1092-1115` reconstructs from the new
+  packet's raw flags today, ignoring `replica.tcp_flags` — a bare ACK
+  in the publish→replication window would rebuild an ALIVE entry from
+  a published RST/FIN row): the materialize merges the replica's
+  carried close bits over the packet's raw flags; raw packet flags
+  still drive screens/cache/accounting.
+  The (Local, ESTABLISHED, non-closing) →
   master-verbatim table row is correspondingly read as "the matched
   forward family is not closing-marked" (a closing-marked family runs
   this inheritance instead). Without
@@ -1462,20 +1485,26 @@ engaged.) The accept/refuse split:
   inheritance the late reverse is born on the family's closing clock,
   which is exactly master's semantics for straggler traffic on a
   closing flow. SECOND, the accepted close packet's own accounting
-  (reshaped v10.35.0, round-119 Codex 7 — the v10.34.0 direct charge
-  at the mark re-probe is RETRACTED: resolution/site-2b receives no
-  packet length or DSCP, `session_glue/mod.rs:1124-1143`,
+  (reshaped v10.36.0, round-120 Codex 11/12 — the full
+  producer/carrier/consumer chain is the §5.8 `Site2bOutcome` +
+  `Option<ValidatedTarget>` + hoisted fallback field +
+  `account_packet -> bool` + mutually exclusive chokepoint branch;
+  the earlier in-resolution direct charge is RETRACTED: resolution/
+  site-2b receives no packet length or DSCP,
+  `session_glue/mod.rs:1124-1143`,
   `shared_ops.rs:824-842`, and master's accounting runs later, only
   for forwarding dispositions, `poll_descriptor/mod.rs:3478-3503` —
   charging at resolution would count packets later denied or dropped
-  and would skip the `observed_tcp_flags` fold):
+  and would skip the `observed_tcp_flags` fold; and the one-charge
+  invariant is scoped to the accounting-eligible forwarded
+  dispositions):
   on the install-refused path `account_packet` probes the absent
-  reverse key and returns without charging anyone
+  reverse key and returns `false`
   (`session/mod.rs:1177-1210`), so the close-accept path carries an
   identity-bound FALLBACK TARGET — the validated forward handle (the
   carried-handle mechanics above) — from the accept to master's
   existing accounting chokepoint (`poll_descriptor/mod.rs:3478-3503`);
-  the fallback fires ONLY when the reverse-key probe was absent for
+  the fallback fires ONLY when the reverse-key probe missed for
   this packet and charges the packet (real length, real DSCP, real
   disposition) to the re-validated forward entry's `rev` counters with
   the `observed_tcp_flags` fold — the install-success path is
@@ -1870,55 +1899,113 @@ adopting the shared decision/metadata, §5.6).
   transition: Option<TokenTransition> }` — 96 B, the `Option` niche-
   filling on `MatchSource`; carried by the resolution result, the
   per-descriptor `matched_token` slot, and the cache entry.
-- The commit-side carrier (v10.35.0, round-119 Codex 1/2): the early
-  identity check resolves the canonical slab HANDLE; the handle rides
+- The commit-side carrier (v10.35.0, round-119 Codex 1/2; the
+  two-handle shape + the postblock v10.36.0, round-120 Codex 1/2): the
+  early identity check resolves the canonical slab HANDLE (plus the
+  matched-reverse handle for a reverse-direction binding); the
+  handle(s) ride
   the descriptor's existing commit scratch (`Copy`, no borrow
-  crossing); every authority mutation re-validates it at its own apply
+  crossing); every authority mutation re-validates at its own apply
   point (`entries.get` + primary-key/identity compare — the codebase's
   own stale-handle guard pattern). The ANCHOR apply's final-admission
-  point is the post-construction success arm
-  (`flow_cache_hit.rs:507-548`); a construction failure recycles at
-  `:550-555` without the apply.
+  point is the COMMON SUCCESS-ONLY POSTBLOCK (`!recycle_now` at
+  `flow_cache_hit.rs:549-552`; both success arms converge there); a
+  construction failure keeps `recycle_now` set and recycles without
+  the apply. AND every session-table install/upsert/overwrite at key K
+  invalidates K's exact-query-key flow-cache slot (round-120 Codex 3 —
+  the precedence-winner rule; the existing helper
+  `flow_cache.rs:1105-1120` + the sibling fan-out accumulator).
 - The capacity-corner accounting fallback (v10.35.0, round-119 Codex
   7): the close-accept path carries the validated forward handle as a
   fallback target to master's accounting chokepoint
   (`poll_descriptor/mod.rs:3478-3503`); it fires only when the
   reverse-key probe was absent, charging real length/DSCP/disposition
   with the `observed_tcp_flags` fold.
-- The import breadcrumb (v10.35.0, round-119 Codex 3): a per-worker
-  one-slot `last_synced_forward: Option<(SessionKey, u64)>` in the
-  command-drain scratch — set by a successful non-reverse
-  `UpsertSynced`, CLEARED by any other queue command (including a
-  refused forward upsert); a reverse `UpsertSynced` records
-  `expected = breadcrumb.id` iff the breadcrumb key equals the derived
-  forward key AND §5.5 reciprocity verifies, else `expected = 0`
-  (UNBOUND-absorbing). The reverse entry's own promote binds by
-  comparing the probed forward's id against the RECORDED expected id.
-- `update_session` gains the identity-replacement re-mint branch
-  (v10.35.0, round-119 Codex 4): overwriting a DIFFERENT-family
-  predecessor (the `UpsertRefused`-then-promote case) re-mints
-  `session_id` via `alloc_session_id`; same-family refreshes preserve
-  it (write-once).
+- The import breadcrumb (v10.35.0, round-119 Codex 3) is SUPERSEDED by
+  the carried expected id (v10.36.0, round-120 Codex 4): FIFO
+  adjacency is not a family proof (prewarm enqueues all forwards then
+  all reverses, `shared_ops.rs:345-418`; singletons queue
+  independently, `session_glue/mod.rs:838-848`), so the reverse entry
+  carries `expected_fwd_id` stamped at synthesis from the forward
+  row's id; the reverse's own promote binds by comparing the probed
+  forward's id against the RECORDED expected id (never the occupant).
+- `update_session` gains the identity-replacement branch (v10.35.0,
+  round-119 Codex 4; the classification + state reinit v10.36.0,
+  round-120 Codex 5): the path already snapshots the pre-update
+  origin/NAT/orientation/RG (`session/mod.rs:1398-1453`); an update
+  whose `(nat, is_reverse)` DIFFERS from the snapshot is a
+  different-family replacement and runs `remove_entry` + FULL INSTALL
+  semantics — id re-mint, anchor zeroed (absorbing), gated
+  `closing`/`reset`/`established` seed from the update's flags,
+  `probation` cleared, `fwd_companion_id` zeroed — so none of K's
+  authority/lifecycle state rides onto S2; an update whose
+  `(nat, is_reverse)` equals the snapshot is a same-family refresh and
+  updates in place with id and authority state preserved.
 - The id replication-invariance completions (v10.35.0, round-119 Codex
   5): the SharedPromote shared-replica republication
   (`session_glue/promote.rs:116-138`), the local-origin shared
   publishes, and the HA bulk export (`ha/export.rs:143-165`) populate
   the entry's REAL `session_id` (the #5212 wire field already exists —
-  behavior completion, not a format change); `upsert_synced_with_origin`
-  PRESERVES the existing entry's id when a re-import carries a zero
-  wire id. `alloc_session_id` gains the skip-on-collision wrap guard
+  behavior completion, not a format change); a zero wire id on a
+  re-import ALWAYS fresh-mints (v10.36.0, round-120 Codex 6 — the
+  preserve-on-zero clause retracted: no same-incarnation evidence rides
+  the command, `upsert_synced.rs:64-79`).
+  `SyncedSessionEntry` gains `expected_fwd_id: u64` (v10.36.0,
+  round-120 Codex 4 — stamped at reverse synthesis from the forward
+  row's id, `shared_ops.rs:750-785`; in-memory + worker-command
+  carriage only, no wire change; the tunnel `UpsertLocal` class carries
+  0 → UNBOUND-absorbing, round-120 Codex 8).
+  `alloc_session_id` gains the skip-on-collision wrap guard
   (round-119 Codex 9) and the hi-word gains a node-discriminator bit
-  (`(worker_id & 0x7FFF) << 49 | (node_id & 1) << 48`,
-  `session/mod.rs:766-789`; #6311 pulled in, round-119 Codex 5b). No
+  (`(worker_id & 0x7FFF) << 49 | (node_id & 1) << 48`; #6311 pulled
+  in, round-119 Codex 5b) with the producer threaded explicitly
+  (v10.36.0, round-120 Codex 7): `set_worker_id(worker_id)` becomes
+  `set_identity(worker_id, node_id)` (`session/mod.rs:766-789`), the
+  PHYSICAL node id read from `/etc/xpf/node-id` (0 standalone — NOT
+  role state, which flips at failover), threaded through worker setup
+  (`worker/loop_body/setup.rs:131-135`). No
   production consumer decodes the hi word — the only `id >> 48`
-  decoders are two test assertions (`session/tests.rs:374`, `:446`),
-  which update with the new layout.
+  decoders are the test assertions (`session/tests.rs:366-374`,
+  `:394-448`), which migrate with the new layout.
 - The site-2b installer gains the effective-flags inheritance
-  (v10.35.0, round-119 Codex 6): a synth against a closing-marked
+  (v10.35.0, round-119 Codex 6; extended v10.36.0, round-120 Codex
+  9/10): a synth against a closing-marked
   forward family computes the effective flags (driving packet's flags
   OR the family close bits) and that ONE value drives the installer's
   timeout/`closing`/`reset`/`observed_tcp_flags` computation AND the
-  publish/replication.
+  publish/replication — for EVERY synth against a marked family,
+  including close-flagged retries (RST→FIN and FIN→RST both merge to
+  the family's `closing`+`reset`, so a late FIN against an RST-marked
+  family is born on the 2 s clock, never the 30 s one). The same
+  close-bit merge governs the sibling's shared-hit MATERIALIZATION
+  (`session_glue/mod.rs:1092-1115` uses the new packet's raw flags
+  today): the materialize merges the replica's carried `tcp_flags`
+  close bits over the packet's raw flags, so a published closing/reset
+  replica can never be reconstructed alive by a bare-ACK
+  materialization in the publish→replication window; raw packet flags
+  still drive screens/cache/accounting.
+- The capacity-corner accounting chain (v10.36.0, round-120 Codex
+  11/12 — full producer/carrier/consumer): the site-2b return becomes
+  a typed `Site2bOutcome ::= Installed | ValidatorRefused |
+  CapacityRefused` (replacing the bare `bool`,
+  `shared_ops.rs:824-895` — validator refusal and accepted capacity
+  refusal are distinguishable); the close-accept path produces
+  `Option<ValidatedTarget { handle, key, nat, id }>` — `Some` ONLY on
+  an accepted close whose reverse install capacity-refused; the
+  resolution shape gains the optional fallback field
+  (`shared_ops.rs:563-578`); the poller initializes it `None` per
+  descriptor and hoists it past the `resolved.decision` reduction
+  (`poll_descriptor/mod.rs:509`, `:883`, the `install_failed`
+  precedent); `account_packet` gains a `-> bool` charged return
+  (additive); the master's accounting chokepoint
+  (`poll_descriptor/mod.rs:3478-3503`) fires the fallback ONLY when
+  `account_packet` returned `false` AND the fallback is `Some` AND
+  the handle re-validates — mutually exclusive by construction — and
+  the "exactly one `rev` charge" invariant is scoped to
+  accounting-eligible forwarded dispositions
+  (`ForwardCandidate | FabricRedirect`): LocalDelivery, host-denial,
+  MissingNeighbor, and earlier exits charge nothing on either path
+  (master parity).
 - `tcp_seg_view()` (§5.3) — new helper in `frame/tcp.rs`.
 - `close_seq_plausible()` (§5.4) — new pure function in `session/`.
 - `account_packet` is UNCHANGED (v10.4.1 wording, round-87 Codex
@@ -2260,23 +2347,39 @@ adopting the shared decision/metadata, §5.6).
     and identity compare — an L1 array index and ~93 B of compares,
     NO re-hash probe — the stale-handle/primary-key guard pattern is
     the codebase's own, `install.rs:127-138`) and mutates only on
-    agreement. The ANCHOR APPLY runs at the DISTINCT final-admission
-    point AFTER successful request construction/enqueue (the
-    `:507-548` success arm; §5.2's "distinct final-admission apply
-    point" made exact): a packet whose rewrite/request construction
-    FAILS is recycled at `:550-555` WITHOUT the apply, so a
-    never-egressed packet never advances the trusted anchor — the
-    committed-packet invariant holds verbatim (the v10.34.0 text had
-    the anchor state moving at the `:295-317` accounting point, which
-    PRECEDES the rewrite-failure window; `touch_if_stale`/
-    `account_packet` there stay MASTER-VERBATIM — they are #2501
-    telemetry, not authority state). Same-worker single-threaded, no
+    agreement (the two-handle shape, v10.36.0 round-120 Codex 2: one
+    handle cannot cover a reverse-direction hit — the matched entry R
+    hosts the probation/identity operations while the anchor and the
+    close mark target F; the carrier holds `family_handle` (canonical
+    forward) plus, when the token's orientation is reverse,
+    `matched_handle` (the matched reverse entry) — the family hop's
+    second lookup exists on master, `session/mod.rs:1183-1205`, so a
+    reverse-direction check resolves both, a forward-direction check
+    one). The ANCHOR APPLY runs at the COMMON SUCCESS-ONLY POSTBLOCK
+    (v10.36.0, round-120 Codex 1 — the v10.35.0 ":507-548 success arm"
+    named only the fallback request arm; the dominant in-place rewrite
+    arm enqueues `pending_tx_prepared` and clears `recycle_now` at
+    `:444-497`, SKIPPING the fallback block): both success arms
+    converge on the `recycle_now` flag, so the apply runs iff
+    `!recycle_now` at the recycle point (`:549-552`) — a packet whose
+    rewrite/request construction FAILED on both arms still has
+    `recycle_now` set, is recycled WITHOUT the apply, and never
+    advances the trusted anchor (the committed-packet invariant;
+    "enqueued to the TX pipeline" is the admission semantics —
+    `touch_if_stale`/`account_packet` at `:295-317` stay
+    MASTER-VERBATIM: #2501 telemetry, not authority state, and
+    master's telemetry charging precedes construction today).
+    Same-worker single-threaded, no
     expire/GC pass interleaves within one descriptor's processing (the
     reap runs per loop body, `worker/loop_body/mod.rs:1481-1521`
     branch-base / `:1615` master), so a validated handle cannot go
     stale mid-packet — the re-validation is the belt, not the
-    suspenders. The early identity check remains the ONE added hash
-    probe per session-backed hit, probing the token's CANONICAL key —
+    suspenders. The early identity check is the added hash probe per
+    session-backed hit — ONE for a forward-direction binding, TWO for
+    a reverse-direction binding (the canonical probe plus the
+    matched-reverse probe, the latter same-key with master's own
+    `:295-317` reverse probes, hence warm) — probing the token's
+    CANONICAL key:
     same-key and warm with master's `touch_if_stale` probe ONLY for a
     plain non-translated forward hit; reverse and translated hits probe
     a distinct canonical key (`FlowCacheEntry.key` stays the packet
@@ -2286,8 +2389,24 @@ adopting the shared decision/metadata, §5.6).
     in the same hit. The consumers between the check and the commit
     region (`:137-290`: TTL/TE, filter counters, policers, logs, BA
     reclassify) never touch the session table (verified by inspection),
-    so the identity established at the early check still holds at the
-    apply points. The ordering promise is scoped to
+    and master's own `:295-317` calls update only timing/counters —
+    never key/NAT/id identity fields (round-120 Codex 2's confirming
+    trace) — so the identity established at the early check still
+    holds at the apply points. AND the precedence rule (v10.36.0,
+    round-120 Codex 3): validating the cached BACKING entry does not
+    prove it is still the query's current resolution WINNER (a direct
+    primary entry at the query key outranks a reverse-translated
+    alias, `lookup.rs:62-68`; an ordinary local match outranks
+    forward-wire/shared, `shared_ops.rs:602-635`; a worker
+    `UpsertSynced` installs WITHOUT flow-cache invalidation,
+    `session_glue/commands/upsert_synced.rs:64-120`) — so EVERY
+    session-table install/upsert/overwrite at key K also invalidates
+    the exact-query-key flow-cache slot for K (the existing exact-key
+    invalidation helper, `flow_cache.rs:1105-1120`, plus the sibling
+    fan-out accumulator, v10.22.0): a precedence-changing install can
+    never leave an old descriptor forwarding the prior winner's
+    decision, and the identity check retains the backing-identity
+    guard for the non-precedence ABA cases. The ordering promise is scoped to
     FORWARDING/POLICY effects (v10.33.0, round-117 Codex 7):
     `lookup_counted`'s bookkeeping — LRU promote, `hits += 1`, the
     `last_used_epoch` activity stamp, the `observed_bytes` add
@@ -2337,10 +2456,16 @@ adopting the shared decision/metadata, §5.6).
     (`session_glue/promote.rs:116-138` — the "this shared replica needs
     no id" comment predates the binding's need), the local-origin
     shared publish (#5212's "leave this 0" classes), and the HA bulk
-    export (`ha/export.rs:143-165`). AND the upsert re-import of an
-    EXISTING same-key entry with a zero wire id PRESERVES the existing
-    entry's id instead of minting (so an old-peer zero-id refresh
-    cannot flip an established binding). 0 is unambiguous:
+    export (`ha/export.rs:143-165`). AND a zero wire id on a re-import
+    ALWAYS fresh-mints (v10.36.0, round-120 Codex 6 — the v10.35.0
+    preserve-on-zero clause is RETRACTED: the upsert removes the
+    predecessor before selecting the id, `install.rs:295-344`, and the
+    command carries no same-incarnation evidence,
+    `upsert_synced.rs:64-79`; a legacy peer's new same-key/NAT
+    incarnation must never inherit K's id — the flip evicts stale
+    cached tokens and leaves imported reverses UNBOUND-absorbing,
+    fail-closed, and unreachable in a same-version pair because every
+    current path populates the real id). 0 is unambiguous:
     `alloc_session_id` starts its counter at 1 and guards the wrap —
     the guard becomes a SKIP (`session/mod.rs:784-789`, v10.35.0
     round-119 Codex 9: the mask + `low == 0 → 1` map would emit the
@@ -2370,7 +2495,13 @@ adopting the shared decision/metadata, §5.6).
     #6311 follow-up, §10. The
     binding producers are EXACTLY these three, and the bind ALWAYS
     compares against a RECORDED expected id — never the bare current
-    occupant (v10.35.0, round-119 Codex 1/3/7 —
+    occupant (v10.35.0, round-119 Codex 1/3/7; the expected id is
+    CARRIED, not adjacency-inferred, v10.36.0 round-120 Codex 4 — the
+    v10.35.0 queue-adjacency breadcrumb is RETRACTED: activation
+    prewarm enqueues ALL forwards then ALL reverses,
+    `shared_ops.rs:345-418`, and singleton replicas queue
+    independently, `session_glue/mod.rs:838-848`, so FIFO adjacency is
+    not a family proof) —
     UNBOUND is otherwise ABSORBING: no lazy bind on an ordinary hop,
     and no occupant-capture at the promote either — derived key+NAT
     agreement with whatever happens to occupy the forward key is not
@@ -2385,26 +2516,42 @@ adopting the shared decision/metadata, §5.6).
     `ForwardSessionMatch` (`entry.rs:208-213` gains it — the type
     carries only key/decision/metadata today) with the identity
     re-probe before install; a SHARED match installs UNBOUND; (c) an
-    HA-IMPORTED reverse records the EXPECTED forward id AT IMPORT from
-    the paired-publish breadcrumb (the fan-out pushes
-    `UpsertSynced(forward)` then `UpsertSynced(reverse)` back-to-back
-    on each worker's FIFO command queue, `session_import.rs:215-223` —
-    a per-worker one-slot breadcrumb records the just-succeeded
-    forward upsert's `(canonical key, adopted id)`, is CLEARED by any
-    other queue command including a REFUSED forward upsert, and the
-    reverse upsert records `expected = breadcrumb.id` iff the
-    breadcrumb key equals the reverse's derived forward key AND the
-    §5.5 reciprocity verifies; no breadcrumb → `expected = 0` =
-    UNBOUND-absorbing) — and the reverse entry's OWN synced→local
+    HA-IMPORTED reverse carries the EXPECTED forward id ON THE
+    SYNTHESIZED ENTRY ITSELF: every reverse `SyncedSessionEntry` is
+    built FROM its forward row (`synthesized_synced_reverse_entry`,
+    `shared_ops.rs:750-785`), the forward row's id is in hand at that
+    exact point and is discarded today (`session_id: 0` on the
+    reverse), so the reverse entry gains `expected_fwd_id: u64`
+    stamped from the forward row's id at synthesis — covering the
+    direct import, the activation prewarm, and the singleton paths
+    uniformly because all three synthesize the reverse from the
+    forward row (in-memory shared entry + worker-command carriage
+    only; the reverse never rides the cross-node wire as a separate
+    record, so no wire change); the reverse's local install records
+    it, and the reverse entry's OWN synced→local
     promote (`maybe_promote_synced_session`,
     `session_glue/promote.rs:99-139` → `promote_synced_with_origin`,
-    `session/mod.rs:1673-1675`) then BINDS AT THE TRANSITION by
+    `session/mod.rs:1673-1675`) BINDS AT THE TRANSITION by
     comparing the probed forward entry's id AGAINST THE RECORDED
     EXPECTED id (plus key+NAT): a match binds; a mismatch or
     `expected == 0` leaves the entry UNBOUND-absorbing — the occupant
     can never SELF-CERTIFY (round-119 Codex 3's K-capture trace dies:
     K's id ≠ the recorded expected id, so the stranger at the forward
-    key is never captured). A standby runs no hops, so nothing binds
+    key is never captured; and a refused forward import means the
+    local K can never match the synthesized expected id). The local
+    GRE tunnel path is the one class with NO real id to carry
+    (v10.36.0, round-120 Codex 8: `tunnel.rs:563-615` constructs F/R
+    with `session_id: 0` before any worker entry exists, publishes
+    first `:691-730`, and only then queues `UpsertLocal` to every
+    worker `:732-745`, where each worker's table independently mints
+    on zero — there is no single real id at publish time and no
+    cross-worker allocator): tunnel-path reverses carry
+    `expected_fwd_id = 0` → UNBOUND-absorbing (fail-closed: these are
+    firewall-local tunnel-endpoint flows; reverse-direction anchor
+    learning is suppressed and reverse-direction closes refuse until
+    churn — the imported-class posture of §2 — while forward-direction
+    learning and validation ride the direct canonical hit). A standby
+    runs no hops, so nothing binds
     there; the first
     reverse hit on the newly-active node promotes and binds, and an
     adopted-id forward keeps its id across its own later promote, so
@@ -2414,17 +2561,36 @@ adopting the shared decision/metadata, §5.6).
     anchor learning is suppressed, reverse-direction closes refuse —
     the imported-class posture of §2 — while forward-direction learning
     and validation ride the direct canonical hit and are unaffected).
-    AND the identity-replacement rule (v10.35.0, round-119 Codex 4):
-    when `update_session`/promote overwrites a DIFFERENT-FAMILY
-    predecessor (the `UpsertRefused`-then-promote case — the matched
-    record holds unrelated K's fields while the update carries S2's
-    decision/NAT), the entry RE-MINTS its `session_id`
-    (`alloc_session_id`) as a genuine identity replacement — write-once
-    is scoped to same-family refreshes; without the re-mint S2 would
-    wear K's id and a stale K-bound reverse could authenticate against
-    S2 on an exact key/NAT reuse; the re-mint propagates to the
+    AND the identity-replacement rule (v10.35.0, round-119 Codex 4;
+    the classification + state reinit v10.36.0, round-120 Codex 5):
+    `update_session` already snapshots the pre-update
+    origin/NAT/orientation/RG (`session/mod.rs:1398-1453`), and the
+    family discriminator IS the (nat, is_reverse) pair: an update
+    whose `(nat, is_reverse)` DIFFERS from the snapshot's is a
+    DIFFERENT-FAMILY replacement (the `UpsertRefused`-then-promote
+    case) and runs REMOVE+INSTALL semantics — `remove_entry` + a full
+    fresh install: the id re-mints (`alloc_session_id`), the anchor
+    zeroes (absorbing zero-trust), `closing`/`reset`/`established`
+    seed per the gated rules from the update's flags, `probation`
+    clears, `fwd_companion_id` zeroes — K's anchor, sticky state, and
+    companion binding NEVER ride onto S2 (a later close can never
+    validate against K's anchor); an update whose `(nat, is_reverse)`
+    EQUALS the snapshot's is a same-family refresh (same wire family,
+    packet-indistinguishable) and updates in place with the id and
+    authority state preserved;
+    the re-mint propagates to the
     sibling through the now-populated wire id (above), keeping the
-    sibling's binding consistent. The reverse entry
+    sibling's binding consistent. AND the zero-wire-id rule (v10.36.0,
+    round-120 Codex 6 — the v10.35.0 preserve-on-zero clause is
+    RETRACTED: the upsert removes the same-key predecessor before
+    selecting the id, `install.rs:295-344`, and the command carries no
+    same-incarnation evidence, `upsert_synced.rs:64-79`, so preserving
+    would let a legacy peer's NEW same-key/NAT incarnation inherit
+    K's id): a zero wire id ALWAYS fresh-mints; the resulting id flip
+    evicts stale cached tokens (mismatch → evict → re-resolve) and
+    leaves imported reverses UNBOUND-absorbing — fail-closed, and
+    reachable only with a legacy pre-population peer because every
+    current-version path populates the real id. The reverse entry
     does NOT otherwise store the forward entry's id,
     `install.rs:152`, and a same-key+NAT replacement K2 mints a
     DISTINCT id (#4915: "a reused 5-tuple gets a distinct id",
@@ -2797,15 +2963,19 @@ untouched.
 - **Hot-path discipline:** zero new allocations; zero new atomics; the
   per-TCP-data-packet cost at the commit-arm anchor hook (a DISTINCT
   final-admission apply point from the pre-admission #2501 accounting
-  call, §5.2 — the POST-CONSTRUCTION success arm,
-  `flow_cache_hit.rs:507-548`, so a rewrite-failed packet recycled at
-  `:550-555` never advances the anchor, v10.35.0 round-119 Codex 1) is one
+  call, §5.2 — the COMMON SUCCESS-ONLY POSTBLOCK, `!recycle_now` at
+  `flow_cache_hit.rs:549-552`, where both the in-place (`:444-497`) and
+  fallback (`:498-548`) arms converge, v10.36.0 round-120 Codex 1) is
+  one
   8-byte read + ≤2 gated stores against the CARRIED validated handle
   (an L1 slab index + identity compare, no re-hash, v10.35.0 round-119
-  Codex 2); closing segments add one table probe on a
+  Codex 2; TWO carried handles for a reverse-direction binding,
+  round-120 Codex 2); closing segments add one table probe on a
   path that already takes the full slow path; EVERY session-backed cache
-  hit adds one identity probe — the early identity-only check's
-  `key_to_handle` probe at `flow_cache_hit.rs:~133`, same-key with the
+  hit adds the identity probe(s) — ONE canonical probe for a
+  forward-direction binding, TWO for a reverse-direction binding (the
+  canonical probe + the matched-reverse probe); the canonical probe is
+  same-key with the
   two probes master already does later on the hit path
   (`touch_if_stale`/`account_packet`, `:295-317`) only for a plain
   non-translated forward hit, plus L1 compares of
@@ -3005,7 +3175,7 @@ untouched.
 |---|---|---|
 | Behavioral regression | MED | Gate only withholds demotion, never blocks delivery; refuse on missing/untrusted baseline. Residuals (stated in §2/§5.2/§7): soft-refused legit close after unobserved stretches or both-direction path switches → entry idles ≤ established timeout; imported entries never validate closes until churn (bounded lingering; §10.5 wire-anchor restores); tuple stays busy meanwhile — pre-existing semantics for silently-dead flows. Restart-RST covered by the union rule. OPENING covered by SEG.LEN-aware ack check against the FORWARD entry's state. |
 | Lifetime / borrow-checker | LOW | Anchor is `Copy` POD on an existing entry; marking restructured into the existing post-borrow propagation phase; no new cross-boundary borrows. |
-| Performance regression | LOW-MED | 49 B/entry slab growth (v10.34.0: 40 B anchor + 1 B probation + 8 B `fwd_companion_id` — the stable session id, renamed from the epoch form round-118 Codex 2, same 8 B; 49 × 131,072 = 6,422,528 B ≈ 6.1 MiB/worker at cap, ≈ 36.7 MiB at 6 workers) plus the cache's optional token field (~96 B `Option<MatchedToken>` — 40 B `SessionKey` (`key.rs:9-17`) + 44 B `NatDecision` (`nat/mod.rs:90-103`) + 8 B stable id + orientation/source/transition bytes, the `Option` niche-filling on the source enum — on the ~96 B entry × the 4,096-entry cache PER BINDING, ≈ +384 KiB per binding, owned per binding not per worker — `flow_cache.rs:5-14`, `:201-224`, `worker/flow_cache_state.rs:26-35`, `worker/mod.rs:196-201`; the ~doubled entry width and the larger four-way set scan are noted and gated by the §9 `size_of` assertions + measurement); one TCP-header view compute (seq/ack/wnd/flags/seg_len) + ≤2 gated stores per committed TCP data packet (closing segments skip updates entirely); one extra probe per closing segment; PLUS one session-table identity probe per session-backed cache hit (v10.33.1 SMR r118, mechanics corrected v10.35.0 round-119 Codex 1/2: the early identity-only check at `flow_cache_hit.rs:~133` probes the token's CANONICAL key once and CARRIES the validated slab handle in the descriptor's commit scratch — same-key and warm with master's `touch_if_stale`/`account_packet` probes (`:295-317`) ONLY for a plain non-translated forward hit; reverse and translated hits probe a distinct canonical key — a first touch that `account_packet`'s forward-derive re-touches warm later in the same hit; every authority mutation re-validates the carried handle at its own apply point — an L1 slab index + ~93 B of compares, NO re-hash probe — and the anchor apply runs at the post-construction success arm (`:507-548`) so a rewrite-failed packet recycled at `:550-555` never advances the trusted anchor). Must be measured at minimum-frame rates (§9) — the 23 Gbit/s MTU-sized iperf run alone is insufficient (≈37 Mpps at 25 Gbit/s small-frame is the real gate; `iperf3 -l 64` is a proxy, not a demonstrated line-rate generator — gate on pps, not bandwidth). |
+| Performance regression | LOW-MED | 49 B/entry slab growth (v10.34.0: 40 B anchor + 1 B probation + 8 B `fwd_companion_id` — the stable session id, renamed from the epoch form round-118 Codex 2, same 8 B; 49 × 131,072 = 6,422,528 B ≈ 6.1 MiB/worker at cap, ≈ 36.7 MiB at 6 workers) plus the cache's optional token field (~96 B `Option<MatchedToken>` — 40 B `SessionKey` (`key.rs:9-17`) + 44 B `NatDecision` (`nat/mod.rs:90-103`) + 8 B stable id + orientation/source/transition bytes, the `Option` niche-filling on the source enum — on the ~96 B entry × the 4,096-entry cache PER BINDING, ≈ +384 KiB per binding, owned per binding not per worker — `flow_cache.rs:5-14`, `:201-224`, `worker/flow_cache_state.rs:26-35`, `worker/mod.rs:196-201`; the ~doubled entry width and the larger four-way set scan are noted and gated by the §9 `size_of` assertions + measurement); one TCP-header view compute (seq/ack/wnd/flags/seg_len) + ≤2 gated stores per committed TCP data packet (closing segments skip updates entirely); one extra probe per closing segment; PLUS the session-table identity probe(s) per session-backed cache hit (v10.33.1 SMR r118; mechanics corrected v10.36.0 round-120 Codex 1/2/3: the early identity-only check at `flow_cache_hit.rs:~133` resolves and CARRIES the validated slab handle(s) in the descriptor's commit scratch — ONE canonical probe for a forward-direction binding, TWO for a reverse-direction binding (the canonical probe + the matched-reverse probe, the latter warm against master's own `:295-317` reverse probes); same-key/warm with master's `touch_if_stale`/`account_packet` probes ONLY for a plain non-translated forward hit; every authority mutation re-validates its carried handle at its own apply point — an L1 slab index + ~93 B of compares, NO re-hash; the anchor apply runs at the COMMON SUCCESS-ONLY POSTBLOCK (`!recycle_now` at `:549-552` — both the in-place `:444-497` and fallback `:498-548` arms converge there), so a construction-failed recycled packet never advances the trusted anchor; and every install/upsert/overwrite at key K invalidates K's exact-query-key cache slot so a precedence-changing install never leaves a stale descriptor forwarding the prior winner). Must be measured at minimum-frame rates (§9) — the 23 Gbit/s MTU-sized iperf run alone is insufficient (≈37 Mpps at 25 Gbit/s small-frame is the real gate; `iperf3 -l 64` is a proxy, not a demonstrated line-rate generator — gate on pps, not bandwidth). |
 | Architectural mismatch | LOW | No new subsystem; anchors at the existing #2501/#3706 chokepoints; #4400-style always-on gate. No pipeline restructure. No distributed protocol. |
 | HA / rolling upgrade | LOW | No wire change; mixed-version pair behaves as same-version (a pre-upgrade node keeps master's demote behavior for its own table; the upgraded node simply refuses blind demotes on its own). Pre-upgrade and imported entries sit in the absorbing zero-trust state — closes refuse until churn (strictly more conservative than master; bounded lingering, §2; Phase 2 §10.5 closes it for synced flows). The replica no-Close invariant + the SharedPromote refuse trace are regression-tested. |
 | Pending-neighbor behavior | LOW | Master's buffered-decision retry is UNCHANGED (v10.2.0 retreat): no re-resolution, no hold, no new drop class, no stale-transmit change — the admitted-close delivery is master-parity, and the pre-existing stale-decision window is documented (§7 race d, follow-up §10.6.2). Buffered packets never move the anchor — a fail-toward-refuse residual (anchors lag behind long ARP stalls; closes soft-refuse; entries idle out normally), never a walk/poison channel. |
@@ -3452,43 +3622,69 @@ values (probabilistic sprays can legitimately hit the admitted interval):
   trace); a Local identity-agreeing match validates and marks the
   forward family in the same resolve.
 - **Companion-id binding (v10.34.0, round-118 Codex 1/2/7/9; the
-  expected-id compare v10.35.0, round-119 Codex 3/4/5/9):** the
+  carried expected id v10.36.0, round-120 Codex 4/5/6/7/8):** the
   positional fresh-flow reverse install records the forward entry's
   `session_id`; the site-2b Local-match synth records the matched id
-  (Shared-match synth → UNBOUND); an HA-imported reverse records the
-  EXPECTED id at import from the paired-publish breadcrumb (F-then-R
-  queue adjacency, `session_import.rs:215-223`; a refused forward
-  upsert leaves no breadcrumb → UNBOUND) and binds ONLY at its own
-  synced→local promote by comparing the probed forward's id AGAINST
-  THE RECORDED expected id (never the bare occupant — the K-capture
-  trace); an UNBOUND entry
+  (Shared-match synth → UNBOUND); an HA-imported reverse carries
+  `expected_fwd_id` stamped at synthesis from the forward row's id
+  (direct import, prewarm, AND singleton paths — all synthesize the
+  reverse from the forward row, `shared_ops.rs:750-785`) and binds
+  ONLY at its own synced→local promote by comparing the probed
+  forward's id AGAINST THE RECORDED expected id (never the bare
+  occupant — the K-capture trace; a refused forward import leaves the
+  local stranger's id ≠ expected → UNBOUND); the tunnel `UpsertLocal`
+  class carries 0 → UNBOUND-absorbing; an UNBOUND entry
   NEVER binds on an ordinary hop (the stale-R1/stranger-K2 ABA case:
   R1's anchor sample never lands on K2 — K2 minted a distinct id) and
   NEVER rebinds after a mismatch; a bound binding survives the forward
   entry's promotion/refresh and replication unchanged (id write-once
   for same-family refreshes; the promote-republication + local-origin
-  publish + bulk-export paths populate the real id, and a zero-wire-id
-  re-import of an existing entry PRESERVES its id); the
-  different-family overwrite promote RE-MINTS the id (a stale K-bound
-  reverse then mismatches S2); reverse-direction anchor learning on an
+  publish + bulk-export paths populate the real id; a zero wire id
+  ALWAYS fresh-mints — the flip evicts stale tokens, fail-closed);
+  the different-family overwrite promote (the (nat, is_reverse)
+  snapshot compare) runs remove+install semantics — re-minted id,
+  zeroed anchor, gated seed, cleared probation/companion binding (a
+  stale K-bound reverse then mismatches S2, and no close validates
+  against K's leftover anchor); reverse-direction anchor learning on
+  an
   UNBOUND-absorbing entry is
   suppressed while forward-direction learning rides the direct
   canonical hit (fail-closed, bounded lingering, §2 posture).
+- **Cache precedence + the success postblock (v10.36.0, round-120
+  Codex 1/2/3):** an install/upsert/overwrite at key K while a
+  descriptor is cached for K → the slot is invalidated and the next
+  packet re-resolves (the direct-primary-outranks-alias trace); a
+  reverse-direction committed packet applies its anchor sample through
+  the TWO carried handles (R for the matched-entry operations, F for
+  the anchor), each re-validated at its apply point; the anchor apply
+  fires iff `!recycle_now` — a crafted construction-failure packet
+  (both arms decline) recycles with ZERO anchor movement; the in-place
+  arm (dominant) and the fallback arm both apply.
 - **Capacity-corner family state (v10.34.0, round-118 Codex 4;
-  v10.35.0 round-119 Codex 6/7):** an
+  v10.35.0 round-119 Codex 6/7; v10.36.0 round-120 Codex 9/10/11/12):**
+  an
   accepted close with a capacity-refused reverse install still marks
-  the forward family; a LATER non-closing reverse synth against the
-  marked (closing) forward installs the reverse entry with ONE
+  the forward family; a LATER reverse synth against the
+  marked (closing) forward — NON-CLOSING OR CLOSE-FLAGGED (RST→FIN and
+  FIN→RST retries alike) — installs the reverse entry with ONE
   EFFECTIVE INHERITED SEED STATE (the driving packet's flags OR'd with
   the family close bits) driving the timeout/`closing`/`reset`/
   `observed_tcp_flags` computation AND the publish/replication, so the
   sibling reconstructs the same closing state (never born non-closing
   with the established timeout — the companion-retention postponement
-  trace); the accepted close packet's accounting lands exactly one
-  `rev` charge on the forward entry on BOTH install outcomes at
+  trace); the sibling's shared-hit MATERIALIZATION merges the
+  replica's carried close bits over the packet's raw flags (a
+  published closing/reset replica is never reconstructed alive by a
+  bare-ACK materialization in the publish→replication window); the
+  accepted close packet's accounting lands exactly one
+  `rev` charge on the forward entry on BOTH install outcomes on
+  accounting-eligible forwarded dispositions, at
   master's own chokepoint (`poll_descriptor/mod.rs:3478-3503`) with
   master's own inputs (length/DSCP/disposition), via the carried
-  identity-bound fallback target on the install-refused path.
+  identity-bound fallback target on the install-refused path (typed
+  `Site2bOutcome` distinguishes validator refusal from capacity
+  refusal; `account_packet -> bool`; the fallback fires only on a
+  missed reverse probe — mutually exclusive).
 - **Reverse-hit family identity (round-85 Codex 4):** a close
   direct-hitting a separated stale reverse `R1/NAT1` with a replacement
   forward `K/NAT2` present: reciprocity fails (NAT1 ≠ NAT2) →
