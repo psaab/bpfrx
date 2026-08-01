@@ -1,11 +1,10 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v51 — r50 findings folded (Codex NEEDS-REVISION
-  4M/1m; AGY PLAN-READY-WITH-NITS 0M/1m — the acceptance
-  re-activation copy, IS Codex fold-2's PARTIAL; Claude SMR
-  PLAN-READY-WITH-NITS 0M/1m — the push-window clause, IS part
-  of Codex M3; all three confirm the §4.7 structure); pending
-  convergence review r51
+- **Status**: DRAFT v52 — r51 findings folded (Codex NEEDS-REVISION
+  4M/1m; AGY NEEDS-REVISION 1M — the tick-hang, IS Codex M4's
+  second half; Claude SMR PLAN-READY-WITH-NITS 0M/1m — the
+  witness clause, IS Codex M4; all three confirm the §4.7
+  structure); pending convergence review r52
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -2199,6 +2198,59 @@
   fold-2's PARTIAL), and the acceptance apply-failure term
   gains the executable failure-count == 0 AND
   last-outcome-success form (Codex m1).
+  v52: r51 convergence — the snapshot gains a single-owner
+  versioned contract with a seqlock read side, the convergence
+  signal covers the pending-XSK deferral, and the reconciler
+  join becomes the interval-bracketed double digest check
+  (Codex NEEDS-REVISION 4M/1m, folds 2 FOLDED / 3 PARTIAL,
+  structure confirmed; AGY NEEDS-REVISION 1M — the tick-hang,
+  IS Codex M4's second half; SMR PLAN-READY-WITH-NITS 0M/1m —
+  the witness clause, IS Codex M4): (a) THE SINGLE-OWNER
+  VERSIONED SNAPSHOT (Codex M1, verified the ownership gap:
+  the store's promotion changes ActiveApplied's computed truth
+  BEFORE `applyConfigLocked` begins while the MarkActiveApplied
+  stamps land AFTER the boundary,
+  `daemon_apply_commit.go:194-246,277-286,464-475`,
+  `store.go:781-809,831-848` — copying ActiveApplied at the
+  boundary can read false after success): the CONFIGSTORE owns
+  the converged-state snapshot; every promotion and every
+  applied-digest/apply-outcome stamp publishes the same
+  versioned snapshot. (b) THE SEQLOCK READ SIDE (Codex M2,
+  verified the load→failed-apply→resume race: a one-load
+  reader descheduled through a failed apply returns the
+  captured green, `daemon_dhcp.go:73-90`,
+  `daemon_feeds.go:26-41`, `server_show_cluster_text.go:66-74`):
+  read the version, read the snapshot, RE-READ the version,
+  retry on change — the versioned re-read is the linearization
+  point (the show path takes no applySem). (c) THE PENDING-XSK
+  FEED (Codex M3, verified: the userspace compile records the
+  desired snapshot and returns nil while deferring publication,
+  `manager_compile.go:230-257,289-298`,
+  `manager.go:348-357`, and the rejection is merely logged and
+  retried, `process_status.go:118-131,183-186`): the deferral
+  records NOT-converged until the publication completes, and a
+  deferred-publication failure drives lastOK=false / count++.
+  (d) THE INTERVAL-BRACKETED DOUBLE DIGEST CHECK (Codex M4 +
+  AGY M1, both verified: a marker no-op pass returns before
+  QueueConfig and never ticks ConfigsSent,
+  `daemon_ha_sync.go:478-485`, `sync_conn_config.go:234-250` —
+  the tick-hang — and a pass paused after claiming can survive
+  a reconnect's epoch bump and resume with a newer wire
+  generation, `daemon_ha_sync.go:51-57,474-489`,
+  `sync_conn_config.go:222-243,254-272,325-395`, the claimed
+  marker suppressing repair, `daemon_ha_sync.go:479-484`):
+  the tick/no-op witness is dropped; the operator re-reads BOTH
+  nodes' digests after the re-convergence and again after ONE
+  FULL reconcile interval (`periodic = 30s`,
+  `configSyncReconcileLoop`), re-driving the intended text on
+  ANY flip (the operator's commit push always carries the
+  newest wire generation); a still-flipping state after two
+  intervals is a stuck-lock incident — fail-closed. (e) §9
+  gains the contract legs (Codex m1): stale-snapshot-return,
+  mid-render-entry, single-owner publication order,
+  pending-XSK rejection, the paused-outbound-claimant /
+  reconnect / commit / release ordering, and marker-no-op
+  rejection.
 
 ---
 
@@ -4679,7 +4731,28 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   later pass carries the intended text — with sync DISABLED no config flows regardless of
   authority (both push gates closed,
   `daemon_ha_sync.go:336-370,461-465`), so the re-convergence
-  is applied per-node — and the precedence rule between the
+  is applied per-node — with the FINAL VERIFICATION positioned
+  deterministically (r51 Codex M4 + r51 AGY M1, both verified:
+  the ConfigsSent tick is NOT a faithful witness — a marker
+  no-op pass returns before QueueConfig and never ticks,
+  `daemon_ha_sync.go:478-485`,
+  `sync_conn_config.go:234-250`, so waiting for a tick can hang
+  — and a pass paused after claiming at
+  `daemon_ha_sync.go:474-489` can survive a reconnect's epoch
+  bump, `daemon_ha_sync.go:51-57`, while ANOTHER pass supplies
+  the observed tick, then resume and push the OLD text with a
+  later wire generation,
+  `sync_conn_config.go:234-243,254-272,325-395`, the claimed
+  intended marker suppressing the repair,
+  `daemon_ha_sync.go:479-484`): the final predicate runs TWICE
+  bracketing ONE FULL reconcile interval (`periodic = 30s`,
+  `configSyncReconcileLoop`) — the operator re-reads BOTH
+  nodes' digests after the re-convergence, again after one full
+  interval, and re-drives the intended text on ANY flip (the
+  operator's commit push always carries the newest wire
+  generation, so a re-drive overwrites a stale landing); a
+  still-flipping state after two intervals is a stuck-lock
+  incident — fail-closed, the predicate never blesses — and the precedence rule between the
   restart pins is EXPLICIT: intended-holder-first GOVERNS; the
   plain repair case (holder == local) IS the r39 local-first
   pin's case; and the pin's protection is per-node regardless
@@ -5692,16 +5765,27 @@ v20 history). The delivery is TWO units:
   `daemon_run_bringup.go:516-520`; DHCP/feeds,
   `daemon_dhcp.go:73-90`, `daemon_feeds.go:26-42`;
   commit/rollback/sync, `daemon_apply_commit.go:246,489,697`) —
-  published as ONE COHERENT SNAPSHOT (r50 Codex M1, verified
-  the render race: independent atomics rendered beside the
-  independently-locked `ActiveApplied`, `store.go:797-809`,
-  with the show path taking no applySem,
-  `server_show_cluster_text.go:66-74`, can read old-lastOK=true
-  then count==0 then still-true ActiveApplied while an apply is
-  parked): the three fields are ONE immutable snapshot struct
-  swapped under a single `atomic.Pointer` (or one mutex), the
-  writer updates it at the apply boundary, and the renderer
-  reads exactly one snapshot — with the truth assignment at the
+  published as ONE COHERENT VERSIONED SNAPSHOT with ONE OWNER
+  (r50 Codex M1 + r51 Codex M1/M2, three races verified: (i)
+  independent atomics beside the independently-locked
+  ActiveApplied tear mid-render, `store.go:797-809`,
+  `server_show_cluster_text.go:66-74`; (ii) the store's
+  promotion changes ActiveApplied's computed truth BEFORE
+  `applyConfigLocked` begins while the `MarkActiveApplied`
+  stamps land AFTER the boundary,
+  `daemon_apply_commit.go:194-246,277-286,464-475`,
+  `store.go:781-809,831-848` — copying ActiveApplied at the
+  boundary can read false after success; (iii) a one-load
+  reader descheduled before a failed apply resumes and returns
+  the captured pre-failure green): the CONFIGSTORE owns the
+  converged-state snapshot — a single versioned struct
+  (active/appliedDigest state + the apply-health fields),
+  where EVERY promotion and EVERY applied-digest/apply-outcome
+  stamp publishes the same versioned snapshot, and the read
+  side is seqlock-style: read the version, read the snapshot,
+  RE-READ the version, retry on change (the show path takes no
+  applySem, so the versioned re-read is the linearization
+  point) — with the truth assignment at the
   CONVERGENCE point, not the outer return (r50 Codex M2,
   verified both false-green paths: the mandatory deferred-MAC
   second `ApplyConfig` can fail while merely recording retry
@@ -5714,7 +5798,18 @@ v20 history). The delivery is TWO units:
   `daemon_apply_dataplane.go:137-163`): `lastApplyOK` reads
   TRUE only when the dataplane phase actually converged — the
   deferred-MAC retry-debt outcome and the nil-dp skip both
-  record NOT-converged (count++, lastOK false) — so an
+  record NOT-converged (count++, lastOK false), AND the
+  pending-XSK publication deferral records NOT-converged until
+  the deferred publication COMPLETES (r51 Codex M3, verified:
+  the userspace compile records the desired snapshot and
+  returns nil while explicitly deferring publication,
+  `manager_compile.go:230-257,289-298`,
+  `manager.go:348-357`, so the daemon treats the phase as
+  successful, `daemon_apply_dataplane.go:137-163`, while the
+  actual publication happens asynchronously and its rejection
+  is merely logged and retried,
+  `process_status.go:118-131,183-186` — the deferred
+  publication's completion/failure drives lastOK/count) — so an
   in-flight or
   parked apply reads not-success (the false-green-in-flight
   window, r49 Codex M1: a DHCP/feed reapply can be mid-flight
@@ -7058,17 +7153,24 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      flows and the re-convergence is per-node,
      `daemon_ha_sync.go:336-370,461-465`) — read the
      post-election RG0 state, `load override` + `commit` the
-     intended text on whichever node holds authority — AFTER
-     the authority's first post-election post-stability
-     reconcile pass is OBSERVED complete (the `ConfigsSent`
-     tick, `status.go:340-356`): a paused reconciler can
-     otherwise `QueueConfig` captured OLD text with a NEWER
-     wire generation after the predicate passed
-     (`daemon_ha_sync.go:462-497`,
-     `sync_conn_config.go:222-243,254-272,325-395`), and the
-     claimed marker suppresses the self-heal
-     (`daemon_ha_sync.go:479-484`) — the observed pass plus the
-     operator's newer-gen commit push closes it (r50 Codex M3);
+     intended text on whichever node holds authority — with the
+     FINAL VERIFICATION running TWICE bracketing ONE FULL
+     reconcile interval (`periodic = 30s`,
+     `configSyncReconcileLoop`): the ConfigsSent tick is NOT a
+     faithful witness (a marker no-op pass returns before
+     QueueConfig and never ticks, `daemon_ha_sync.go:478-485`,
+     `sync_conn_config.go:234-250`; and a pass paused after
+     claiming can survive a reconnect's epoch bump and resume
+     later with a newer wire generation,
+     `daemon_ha_sync.go:51-57,474-489`,
+     `sync_conn_config.go:222-243,254-272,325-395`, the claimed
+     marker suppressing repair, `daemon_ha_sync.go:479-484`) —
+     the operator re-reads BOTH nodes' digests after the
+     re-convergence and again after one full interval,
+     re-driving the intended text on ANY flip (the operator's
+     commit push carries the newest wire generation); a
+     still-flipping state after two intervals is a stuck-lock
+     incident — fail-closed (r51 Codex M4 + r51 AGY M1);
      a per-node commit on a read-only secondary is executed by
      PROMOTING it first with the existing manual-failover
      request (promotion clears the read-only gate,
@@ -7252,6 +7354,27 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      past the predicate's read (via the test seam) reads
      `lastApplyOK == false` from ENTRY until its nil return, so
      the predicate can never read green in flight;
+     (h2c) the SNAPSHOT-CONTRACT legs (r51 Codex M1/M2/m1): the
+     STALE-SNAPSHOT-RETURN leg (a renderer loads the pre-entry
+     snapshot, is descheduled through a failed DHCP/feed apply,
+     and resumes — the seqlock version re-read forces the
+     retry, never returning the captured green), the
+     MID-RENDER-ENTRY leg (an apply entering BETWEEN component
+     reads is caught by the version change), and the
+     single-owner publication order regression (every promotion
+     and every stamp publishes the same versioned snapshot);
+     (h2d) the PENDING-XSK REJECTION leg (r51 Codex M3/m1): a
+     deferred-publication rejection drives lastOK=false /
+     count++ and the predicate cannot bless until the
+     publication completes;
+     (h2e) the OUTBOUND-CLAIMANT legs (r51 Codex M4/m1): the
+     paused-claimant / reconnect / commit / release ordering
+     (a pass paused after its marker claim survives a reconnect
+     epoch bump and resumes with a newer wire generation — the
+     interval-bracketed double digest check catches the flip
+     and the re-drive overwrites it) and the MARKER-NO-OP
+     REJECTION leg (a no-op pass never ticks ConfigsSent, so no
+     runbook step may wait on a tick);
      (h) the PULSE-BETWEEN-READS leg (r45 Codex M2 + r46 Codex
      M1) — a
      dispatch that lands, applies CLEANLY, and retires between
