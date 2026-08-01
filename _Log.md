@@ -1,3 +1,48 @@
+## 2026-08-01 — #5618 round 4: truncated ext chain fails OPEN; FBF moves the route
+
+- **Timestamp**: 2026-08-01 (fix/5618-wg-plaintext-zone-authority, PR #6651)
+- **Action**: Folded three review MAJORs across two commits. (1) Round 3
+  un-dropped `ExtChainOutcome::NoNextHeader` correctly but folded `Truncated`
+  in with it and adjudicated both on `inner[6]`. At this call site
+  `walk_ipv6_ext_chain` reaches `Truncated` only from inside an
+  extension-header arm (the caller already rejects `inner.len() < 40`), so
+  `inner[6]` is provably an extension-header number, never the upper-layer
+  protocol — one bad `hdrextlen` byte walked TCP/80 past a `deny junos-http`
+  as "protocol 60" (68 bytes on the TUN, denies=0). `Truncated` now returns
+  `Err("ipv6_ext_chain_truncated")`. The parity claim both the code and
+  `docs/wireguard-interop.md` rested on was itself wrong: #4743's
+  `poll_descriptor/mod.rs` comment describes the USERSPACE stage, and a
+  truncated chain never reaches it on the transit path — the XDP shim drops it
+  at ingress (`parse_ipv6` revalidates `read_bytes(.., offset - l3_offset)`,
+  returns `None`, `drop_degraded_transit(.., PARSE_FAIL)` → `XDP_DROP`). Both
+  now say which stage each sentence is about. `NoNextHeader` also stamps the
+  constant 59 rather than `inner[6]`, which is that extension header's number
+  when the 59 sits behind one; mainline stamps 59 there too. (2) A `then
+  routing-instance` term on the tunnel's own unit overrides the table the
+  egress lookup should use, and the kernel honours it for plaintext routed off
+  the TUN (`pkg/routing/rules.go` installs the rule at 31000-31999 ahead of
+  the main table; #5117 scopes it to the ingress interface, here `wgN`), so
+  the gate's base-table to-zone is not where the packet goes. It now delegates
+  and counts, matching `NextTableUnsupported`. Steerability stated precisely:
+  a peer cannot create the branch, but the precheck is per-family and the peer
+  picks the version nibble. (3) Both zone ids the policy uses now come from
+  `zone_pair_ids_for_flow_with_override`; the prior revision consumed only
+  `to_zone` and asserted the from-id agreed in a `debug_assert_eq!` that
+  release builds compile out. PUSHED BACK on a fourth finding: the #5689 NAT
+  fragment association cannot apply here — `nat_install_forward_fragment_assoc`
+  self-gates on a committed same-family rewrite and runs only at the AF_XDP
+  cold-path forward commit, which inner plaintext never reaches, so a consult
+  would miss unconditionally; deferring non-first fragments instead would
+  revert r2 MAJOR 1 and hand every DENY a peer-selected one-bit bypass. Docs
+  corrected to stop claiming the two paths are identical for NAT'd fragments.
+  Validation: 4377 pass / 0 fail; six mutations across the three fixes, each
+  with a clean release build, an assertion red, and negative controls green.
+  Cluster smoke still REQUIRED (this changes the packet path); not run here.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/wg_control/policy_gate.rs,
+  userspace-dp/src/afxdp/coordinator/wg_control/policy_gate_tests.rs,
+  userspace-dp/src/afxdp/coordinator/wg_control/dispatch.rs,
+  userspace-dp/src/afxdp/wg/counters.rs, docs/wireguard-interop.md, _Log.md
+
 ## 2026-08-01 — #5618 round 3: round 2 over-corrected; three reverts to mainline parity
 
 - **Timestamp**: 2026-08-01 (fix/5618-wg-plaintext-zone-authority, PR #6651)
