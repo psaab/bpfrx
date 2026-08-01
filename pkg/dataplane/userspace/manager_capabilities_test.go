@@ -271,6 +271,7 @@ func TestIsRequiredProtocolGateError(t *testing.T) {
 	for _, sentinel := range []error{
 		ErrPolicySchedulerProtocolIncompatible,
 		ErrPersistentSourceNATProtocolIncompatible,
+		ErrScopedGlobalZoneSetProtocolIncompatible,
 	} {
 		if !IsRequiredProtocolGateError(sentinel) {
 			t.Errorf("IsRequiredProtocolGateError(%v) = false, want true (bare sentinel)", sentinel)

@@ -6625,8 +6625,15 @@ where only `z214` collides **survives** scoped to `[z174]`. Dropping the whole
 rule there would be **fail-open**: surviving-zone (`z174`) traffic would no longer
 hit the deny and would reach a later/default permit while the snapshot publishes
 successfully. After pruning, the singular `MatchFromZone`/`MatchToZone` is
-regenerated from the surviving set (`config.ScopeSingular`) so an old Rust helper
-that reads only the singular field also sees a surviving, non-quarantined zone.
+regenerated from the surviving set (`config.ScopeSingular`) so any reader of the
+singular field sees a surviving, non-quarantined zone rather than the dropped
+one. That regeneration keeps the two shapes CONSISTENT; it is not a
+rolling-upgrade compatibility guarantee. A helper old enough to read only the
+singular field cannot receive the snapshot at all — the config-snapshot protocol
+version is `4` and both mutating verbs gate on exact equality, and a multi-zone
+scope committed against a pre-`4` helper disarms it and aborts the commit
+(`ErrScopedGlobalZoneSetProtocolIncompatible`, #5488; see
+`docs/userspace-dataplane-architecture.md` *Config-snapshot protocol version*).
 The rest of the config still loads (#1960 no-brick).
 The id→name reverse maps resolve a colliding id to the survivor deterministically
 (`config.StableZoneIDOwner`; `pkg/cli/apply.go:syslogZoneNameMap`,
