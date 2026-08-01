@@ -249,9 +249,10 @@ peer liveness (`lastSeen`) or drive election.
   `CurrentHAProtocolVersion` bump.
 
   `marker = HMAC(PSK, "xpf-ha-boot-epoch-v1")[:8]` is key-derived, NOT a
-  fixed ASCII magic. The section is located by scanning back from the
-  fixed-size trailer, so the bytes ahead of it are the tail of the version
-  section — a stable, build-specific string. A fixed magic could therefore
+  fixed ASCII magic. The section is read at a SINGLE FIXED OFFSET back from
+  the fixed-size trailer (`len-68` — one index, no search loop), so the bytes
+  it lands on are the tail of the version section — a stable, build-specific
+  string. A fixed magic could therefore
   be matched by an ordinary body on **every** frame of some build,
   deterministically; and because the receiver LATCHES the high-water epoch,
   a body-derived value read as a uint64 (~7e18, far above a wall-clock
@@ -391,8 +392,58 @@ peer liveness (`lastSeen`) or drive election.
     rather than locking, so bounding below would refuse an appliance with a
     dead RTC; and an absolute bound means a receiver whose OWN clock is
     wrong does not start refusing a healthy peer. An implausible epoch still
-    satisfies the latch (the peer demonstrably emits epochs) but is never
-    compared against, nor stored as, the floor.
+    is refused outright rather than admitted-and-ignored: a frame the floor
+    cannot ORDER would be governed by the bounded ring alone, which is the
+    epoch-less bypass in miniature.
+  - **Forward bound — the recoverable half.** The absolute bound alone leaves a
+    single-fault path: a peer whose clock or persisted state runs far ahead, yet
+    still lands before 2200, would latch a floor its own corrected incarnations
+    can never climb back above. So an epoch may also be at most
+    `bootEpochMaxSkew` (one year, ~3.15e16 ns — four orders below the gap to
+    `MaxUint64`) ahead of the RECEIVER's wall clock. Bounding the forward side
+    stops the **latch**, which is the unrecoverable half, so a peer that is
+    corrected is accepted again the moment it comes back into range.
+    `nextBootEpoch` applies the same bound to the value it chains from, and the
+    floor store applies it on LOAD, so a node — or a floor — written under a bad
+    clock heals instead of being stranded.
+    The forward bound is applied ONLY when the receiver's own clock is itself
+    credible (`epochClockSaneFloor`, year 2020). An appliance with a dead RTC
+    boots near the Unix epoch and syncs NTP seconds later; during that window a
+    healthy peer's epoch is ~56 years "ahead", and a naive forward bound would
+    make it refuse its peer at exactly the moment cold-boot split-brain is most
+    likely — the hazard `heartbeatStartupGrace` already exists for. Below that
+    floor only the absolute bound applies, which is permissive, never locking.
+    The trade this makes is deliberate: a backward clock step LARGER than the
+    skew allowance regresses this node's epoch rather than chaining. That value
+    is only reachable if this node's own clock was the wrong one when it
+    persisted — in which case the peer refused and never latched it, so nothing
+    is locked out. A recoverable regression beats an unrecoverable lockout.
+  - **Cross-process locking on both state files.** Nothing in xpf enforces a
+    single daemon instance — there is no pidfile, and the gRPC listener sets
+    `SO_REUSEPORT` (`pkg/grpcapi/server.go`), so a second `xpfd` does NOT fail
+    on a port collision the way it otherwise would. Two overlapping incarnations
+    could therefore interleave read-modify-write and publish epochs that are not
+    strictly ordered, which is the one property the whole mechanism rests on. An
+    advisory `flock` on a sidecar file (`withEpochFileLock`) serializes the whole
+    read-modify-write, not merely the write. It fails OPEN: a node that cannot
+    lock must not become a node that cannot heartbeat.
+  - **Layering with #4107's `peerAuthSeen` — two gates, neither redundant.**
+    `peerAuthSeen` latches "the peer proved it holds the PSK" and refuses
+    UNSIGNED frames; `epochSeen` latches "the peer proved it runs an
+    epoch-capable build" and refuses SIGNED-BUT-EPOCH-LESS ones. A replayed
+    pre-upgrade capture is genuinely signed (it came off a keyed cluster), so it
+    passes the first gate and is stopped only by the second — which is precisely
+    why the epoch latch was needed. An unsigned frame never reaches the epoch
+    gate: `readLoop` calls `admitAuthed` only when the MAC verified. The one
+    path skipping BOTH is a cluster with no key configured at all, where there
+    is no MAC to verify and the key-derived marker cannot exist; that is #6624's
+    domain (an unkeyed chassis cluster is refused at commit), not the epoch's.
+  - **Observability.** `HeartbeatStats.EpochlessAdmitted` counts authenticated
+    heartbeats admitted WITHOUT an epoch — the exposure meter — and
+    `EpochDowngradeRejected` counts those the latch refused. Without a counter
+    the residual is invisible: an operator who has upgraded both nodes has no
+    way to tell whether the cluster is still accepting pre-upgrade-shaped
+    frames, and the documentation would be the only defence.
   - **Sender nonce is INCARNATION-scoped** (`Manager.heartbeatNonce`). It
     used to be per-`heartbeatSender`, so every `StartHeartbeat` minted a
     fresh session — and routine events mint them (VRF rebind, comms
@@ -884,11 +935,27 @@ Procedure:
 3. Restart `xpfd` on both nodes (per #6628 above, and to clear the sticky
    `peerAuthSeen`).
 
+> [!IMPORTANT]
+> **Rotate the PSK after upgrading both nodes to a #6169-capable build.** This
+> is a REQUIRED post-upgrade step, not a footnote. Every capture an on-link
+> sniffer took before the upgrade was signed with the OLD key, so rotation is
+> the only thing that retires an attacker's existing archive — no code change
+> can retroactively invalidate frames they already hold. #6169's downgrade
+> latch refuses those captures once the peer has proved it emits epochs, so
+> rotation is not the sole defence; but until the latch has armed on a given
+> node (a brand-new chassis, or one that has not yet heard an epoch), the
+> pre-upgrade archive is exactly what it is exposed to.
+>
+> **How to tell whether you are still exposed:** `HeartbeatStats` carries
+> `EpochlessAdmitted`. If it is non-zero and still climbing after both nodes are
+> upgraded, this node is still accepting epoch-less frames — either a node is
+> genuinely on an older build, or someone is replaying captures. A settled
+> counter after a completed rollout means the latch has armed and epoch-less
+> frames are being refused (`EpochDowngradeRejected`).
+
 Rotation is also the **anti-replay capture-invalidation** step. Every archived
 capture an on-link sniffer holds was signed under the old key, so after a
-rotation none of it verifies. #6169's downgrade latch already refuses replayed
-pre-upgrade (epoch-less) captures, so this is defence in depth rather than the
-primary close — but it is what retires an attacker's whole archive at once.
+rotation none of it verifies.
 The boot-epoch marker is key-derived (`HMAC(PSK, "xpf-ha-boot-epoch-v1")[:8]`),
 so it changes with the key automatically — no separate rollout step. The
 restart in step 3 does NOT reset the epoch floor: it is persisted at

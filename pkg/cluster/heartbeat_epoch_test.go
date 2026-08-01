@@ -4,6 +4,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
@@ -327,10 +328,9 @@ func TestHeartbeatEpochDualAcceptMigration_6169(t *testing.T) {
 		if err != nil {
 			t.Fatalf("decode legacy frame: %v", err)
 		}
-		if gotPkt.NodeID != wantPkt.NodeID || gotPkt.ClusterID != wantPkt.ClusterID ||
-			gotPkt.SoftwareVersion != wantPkt.SoftwareVersion ||
-			gotPkt.HAProtocolVersion != wantPkt.HAProtocolVersion ||
-			len(gotPkt.Groups) != len(wantPkt.Groups) || len(gotPkt.Monitors) != len(wantPkt.Monitors) {
+		// Whole-struct compare: the parse is offset-driven, so any byte the
+		// epoch section displaced would surface somewhere in the decode.
+		if !reflect.DeepEqual(gotPkt, wantPkt) {
 			t.Fatalf("legacy receiver decoded a v2 frame differently:\n got %+v\nwant %+v", gotPkt, wantPkt)
 		}
 		// The epoch really is inside the signed span: flipping a bit in it must
@@ -476,18 +476,53 @@ func TestNextBootEpochMonotonic_6169(t *testing.T) {
 	// genuinely restarted node's heartbeats. persisted+1 dominates.
 	t.Run("backward_clock_step_does_not_regress", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "ha-boot-epoch")
-		// A persisted value far in the future models "the clock has since
-		// stepped back well below the last epoch".
-		future := uint64(time.Now().Add(100 * 365 * 24 * time.Hour).UnixNano())
-		if err := os.WriteFile(path, []byte(strconv.FormatUint(future, 10)), 0o644); err != nil {
+		// A persisted value slightly ahead of now models "the clock has since
+		// stepped back below the last epoch" — the realistic shape of RTC skew
+		// or an NTP correction.
+		ahead := uint64(time.Now().Add(time.Hour).UnixNano())
+		if err := os.WriteFile(path, []byte(strconv.FormatUint(ahead, 10)), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		got, ok := nextBootEpoch(path)
 		if !ok {
 			t.Fatal("persist failed")
 		}
-		if got != future+1 {
-			t.Fatalf("epoch = %d, want %d (persisted+1 must dominate a backward clock step)", got, future+1)
+		if got != ahead+1 {
+			t.Fatalf("epoch = %d, want %d (persisted+1 must dominate a backward clock step)", got, ahead+1)
+		}
+	})
+
+	// THE TRADE THE FORWARD BOUND MAKES, pinned so it is deliberate rather than
+	// discovered. A persisted value more than bootEpochMaxSkew ahead of now is
+	// NOT chained from, so a backward clock step larger than the skew allowance
+	// does regress this node's epoch.
+	//
+	// That is the right way round. Such a value is only reachable if this
+	// node's own clock was the wrong one when it persisted — and in that case
+	// the peer (with a correct clock) refused and never latched it, so nothing
+	// is locked out. Chaining from it instead would strand this node
+	// permanently above the range its peer will ever accept, with no way back
+	// down. Recoverable regression beats unrecoverable lockout.
+	t.Run("value_beyond_the_forward_bound_is_not_chained_from", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "ha-boot-epoch")
+		farAhead := uint64(time.Now().UnixNano()) + bootEpochMaxSkew*3
+		if err := os.WriteFile(path, []byte(strconv.FormatUint(farAhead, 10)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		got, ok := nextBootEpoch(path)
+		if !ok {
+			t.Fatal("persist failed")
+		}
+		if got >= farAhead {
+			t.Fatalf("epoch = %d, chained from an out-of-range persisted value %d — "+
+				"this node could never come back down into its peer's accepted range", got, farAhead)
+		}
+		if !epochOrderable(got, time.Now().UnixNano()) {
+			t.Fatalf("reseeded epoch %d is itself out of range", got)
+		}
+		// The file was healed, so the next boot chains normally.
+		if next, _ := nextBootEpoch(path); next <= got {
+			t.Fatalf("after healing, the next epoch %d did not exceed %d", next, got)
 		}
 	})
 

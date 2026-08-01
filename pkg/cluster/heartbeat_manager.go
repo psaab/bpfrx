@@ -507,6 +507,8 @@ func (m *Manager) HeartbeatStats() HeartbeatStats {
 	if receiver != nil {
 		s.Received = receiver.received.Load()
 		s.RecvErrors = receiver.recvErrors.Load()
+		s.EpochlessAdmitted = receiver.auth.epochlessAdmitted.Load()
+		s.EpochDowngradeRejected = receiver.auth.epochDowngradeRejected.Load()
 	}
 	return s
 }
@@ -517,4 +519,19 @@ type HeartbeatStats struct {
 	Received   uint64
 	SendErrors uint64
 	RecvErrors uint64
+
+	// EpochlessAdmitted counts authenticated heartbeats admitted WITHOUT a
+	// #6169 boot epoch, and EpochDowngradeRejected counts those refused because
+	// the peer had already proved it emits them.
+	//
+	// EpochlessAdmitted is the exposure meter. A frame with no epoch is
+	// governed by the bounded session ring alone, which is the mechanism that
+	// stops working past heartbeatReplaySessions captures — so a non-zero and
+	// still-climbing value after BOTH nodes are upgraded means either a node is
+	// still on a pre-#6169 build or someone is replaying pre-upgrade captures.
+	// Rotating the control-link PSK is what retires an attacker's archive; see
+	// "Operating the control-link PSK" in pkg/cluster/README.md. Without this
+	// counter that residual is invisible to an operator.
+	EpochlessAdmitted      uint64
+	EpochDowngradeRejected uint64
 }

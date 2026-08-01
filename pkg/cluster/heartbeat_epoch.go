@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/psaab/xpf/pkg/fsatomic"
 )
 
@@ -68,8 +70,9 @@ const (
 	//
 	// The marker is HMAC(PSK, bootEpochLabel)[:8], NOT a fixed ASCII magic. A
 	// fixed magic would be matchable by ordinary body bytes: the section is
-	// located by scanning backwards from the (fixed-size) auth trailer, so the
-	// bytes just before it are the tail of the version section — a stable,
+	// read at a SINGLE FIXED OFFSET back from the fixed-size auth trailer
+	// (len-68, one index — there is no search loop and nothing unbounded), so
+	// the bytes it lands on are the tail of the version section — a stable,
 	// build-specific string. A colliding software-version string would collide
 	// on EVERY frame of that build, deterministically, and because the receiver
 	// LATCHES the high-water epoch, a bogus body-derived epoch would sit far
@@ -89,6 +92,29 @@ const (
 	// epochUsableAsFloor. A literal because time.Date is not a constant
 	// expression; a test pins it against time.Date so it cannot drift.
 	epochPlausibleMax uint64 = 7258118400_000000000
+
+	// bootEpochMaxSkew is how far AHEAD of the receiver's own wall clock a peer
+	// epoch may be and still be ordered against the floor. A peer epoch beyond
+	// it is a broken clock or corrupt state, never a real incarnation.
+	//
+	// One year (~3.15e16 ns) is four orders of magnitude below the gap to
+	// MaxUint64 (~1.84e19), so it is generous for any real cluster — two nodes
+	// on the same control link are normally within seconds — while still
+	// closing the single-fault `persisted == MaxUint64-1` path into a permanent
+	// peer lockout.
+	bootEpochMaxSkew uint64 = 365 * 24 * 60 * 60 * 1_000_000_000
+
+	// epochClockSaneFloor is 2020-01-01T00:00:00Z in nanoseconds: the point
+	// below which the LOCAL clock is obviously unset rather than merely wrong.
+	//
+	// The forward bound is only applied when our own clock is above this. An
+	// appliance whose RTC is dead boots at (or near) the Unix epoch and syncs
+	// NTP some seconds later; during that window a healthy peer's epoch is
+	// ~56 years "ahead" of us, and a naive forward bound would make us refuse
+	// our peer at exactly the moment cold-boot split-brain is most likely (the
+	// same hazard heartbeatStartupGrace exists for). Falling back to the
+	// absolute bound alone there is permissive, never locking.
+	epochClockSaneFloor uint64 = 1577836800_000000000
 
 	// bootEpochResolveWait bounds how long the FIRST StartHeartbeat waits for
 	// the boot epoch to be resolved before it starts sending.
@@ -145,6 +171,72 @@ var (
 // used as a floor.
 func epochUsableAsFloor(epoch uint64) bool {
 	return epoch > 0 && epoch < epochPlausibleMax
+}
+
+// epochOrderable reports whether a peer epoch may be compared against, and
+// latched as, the anti-replay floor. nowNanos is the receiver's own wall clock.
+//
+// It is epochUsableAsFloor plus a FORWARD bound. The absolute bound alone
+// catches garbage, but leaves a single-fault path open: a peer whose clock (or
+// persisted state) runs far ahead — yet still lands before year 2200 — would
+// latch a floor its own corrected incarnations can never climb back above, and
+// nothing would ever accept that peer again. Bounding how far ahead of US an
+// epoch may be stops the LATCH, which is the unrecoverable half, so a peer that
+// is corrected (or whose state is repaired) is accepted again the moment it
+// comes back into range.
+//
+// A frame whose epoch is not orderable is REJECTED rather than admitted-and-not-
+// latched. Admitting it would recreate, in miniature, the epochless bypass this
+// mechanism exists to close: a frame the floor cannot order is governed by the
+// bounded ring alone, so captured frames from an incarnation that once emitted
+// an out-of-range epoch would replay indefinitely. Not orderable, not admitted —
+// the same rule as an epochless frame from a latched peer.
+func epochOrderable(epoch uint64, nowNanos int64) bool {
+	if !epochUsableAsFloor(epoch) {
+		return false
+	}
+	// Only apply the forward bound when OUR clock is credible; see
+	// epochClockSaneFloor.
+	if nowNanos > 0 && uint64(nowNanos) >= epochClockSaneFloor {
+		if epoch > uint64(nowNanos)+bootEpochMaxSkew {
+			return false
+		}
+	}
+	return true
+}
+
+// withEpochFileLock serializes a read-modify-write of an epoch state file
+// across PROCESSES, not merely within one.
+//
+// Within a process each file has a single writer (sync.Once for the boot epoch,
+// a mutex for the peer floor), but nothing in xpf enforces a single daemon
+// instance: there is no pidfile, and the gRPC listener sets SO_REUSEPORT
+// (pkg/grpcapi/server.go), so a second xpfd does NOT fail on a port collision
+// the way it otherwise would. Two overlapping incarnations could therefore
+// interleave read-modify-write and publish epochs that are not strictly
+// ordered — which is precisely the property the whole mechanism rests on. An
+// advisory lock on a sidecar file is cheaper than reasoning about whether the
+// race is reachable.
+//
+// Fails OPEN: if the lock cannot be taken the work still runs. A node that
+// cannot lock must not be a node that cannot heartbeat.
+func withEpochFileLock(path string, fn func()) {
+	f, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		slog.Warn("cluster: HA epoch state lock unavailable; proceeding unlocked",
+			"path", path, "err", err)
+		fn()
+		return
+	}
+	defer f.Close()
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
+		slog.Warn("cluster: HA epoch state lock failed; proceeding unlocked",
+			"path", path, "err", err)
+		fn()
+		return
+	}
+	defer func() { _ = unix.Flock(int(f.Fd()), unix.LOCK_UN) }()
+	fn()
 }
 
 // heartbeatEpochMarker derives this cluster's boot-epoch section marker from
@@ -229,46 +321,64 @@ func nextBootEpoch(path string) (epoch uint64, persisted bool) {
 		epoch = uint64(now)
 	}
 
-	var prev uint64
-	if data, err := os.ReadFile(path); err == nil {
-		if n, perr := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64); perr != nil {
-			slog.Warn("cluster: HA boot-epoch state unreadable; seeding from wall clock", "path", path)
-		} else if !epochUsableAsFloor(n) {
-			// Implausible (corrupt / hand-edited). Chaining from it would push
-			// this node's epoch toward MaxUint64, where the NEXT boot regresses.
-			slog.Warn("cluster: HA boot-epoch state is implausible; ignoring it and reseeding from the wall clock",
-				"path", path, "value", n)
-		} else {
-			prev = n
-		}
-	} else if !os.IsNotExist(err) {
-		// A missing file is first boot (prev stays 0 — the wall clock seeds it),
-		// not an error. Any other read error still degrades to the wall-clock
-		// seed rather than failing heartbeat start.
-		slog.Warn("cluster: HA boot-epoch state read error; seeding from wall clock",
-			"path", path, "err", err)
-	}
-
-	if next := prev + 1; next > epoch {
-		epoch = next
-	}
-	// 0 is the reserved "no epoch" sentinel, so never publish it — only
-	// reachable with a wall clock at the Unix epoch and no persisted state.
-	if epoch == 0 {
-		epoch = 1
-	}
-
-	if err := fsatomic.MkdirAllDurable(filepath.Dir(path), 0o755); err != nil {
+	// The state dir must exist before the lock file can be created.
+	dirErr := fsatomic.MkdirAllDurable(filepath.Dir(path), 0o755)
+	if dirErr != nil {
 		slog.Warn("cluster: HA boot-epoch state dir create failed; this incarnation's epoch is NOT durable "+
-			"(a backward clock step across the next restart could regress it)", "path", path, "err", err)
-		return epoch, false
+			"(a backward clock step across the next restart could regress it)", "path", path, "err", dirErr)
 	}
-	if err := fsatomic.WriteFileDurable(path, []byte(strconv.FormatUint(epoch, 10)+"\n"), 0o644); err != nil {
-		slog.Warn("cluster: HA boot-epoch state persist failed; this incarnation's epoch is NOT durable "+
-			"(a backward clock step across the next restart could regress it)", "path", path, "err", err)
-		return epoch, false
-	}
-	return epoch, true
+
+	// The read-modify-write must be atomic ACROSS PROCESSES, not just the write
+	// — see withEpochFileLock. Without it two overlapping incarnations can read
+	// the same previous value and publish epochs that are not strictly ordered.
+	withEpochFileLock(path, func() {
+		var prev uint64
+		if data, err := os.ReadFile(path); err == nil {
+			n, perr := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+			switch {
+			case perr != nil:
+				slog.Warn("cluster: HA boot-epoch state unreadable; seeding from wall clock", "path", path)
+			case !epochOrderable(n, now):
+				// Corrupt, hand-edited, or written while this node's clock ran
+				// far ahead. Chaining from it would push this node's epoch
+				// toward MaxUint64, where the NEXT boot REGRESSES — and would
+				// keep a node whose clock has since been corrected permanently
+				// above the range its peer will accept, with no way back down.
+				// Ignoring it reseeds from the wall clock and rewrites the file
+				// with a sane value, so the node heals.
+				slog.Warn("cluster: HA boot-epoch state is out of range; ignoring it and reseeding from the wall clock",
+					"path", path, "value", n)
+			default:
+				prev = n
+			}
+		} else if !os.IsNotExist(err) {
+			// A missing file is first boot (prev stays 0 — the wall clock seeds
+			// it), not an error. Any other read error still degrades to the
+			// wall-clock seed rather than failing heartbeat start.
+			slog.Warn("cluster: HA boot-epoch state read error; seeding from wall clock",
+				"path", path, "err", err)
+		}
+
+		if next := prev + 1; next > epoch {
+			epoch = next
+		}
+		// 0 is the reserved "no epoch" sentinel, so never publish it — only
+		// reachable with a wall clock at the Unix epoch and no persisted state.
+		if epoch == 0 {
+			epoch = 1
+		}
+
+		if dirErr != nil {
+			return
+		}
+		if err := fsatomic.WriteFileDurable(path, []byte(strconv.FormatUint(epoch, 10)+"\n"), 0o644); err != nil {
+			slog.Warn("cluster: HA boot-epoch state persist failed; this incarnation's epoch is NOT durable "+
+				"(a backward clock step across the next restart could regress it)", "path", path, "err", err)
+			return
+		}
+		persisted = true
+	})
+	return epoch, persisted
 }
 
 // peerEpochFloorStore persists the receiver's high-water peer epoch.
@@ -309,8 +419,11 @@ func (s *peerEpochFloorStore) load() uint64 {
 		return 0
 	}
 	n, perr := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
-	if perr != nil || !epochUsableAsFloor(n) {
-		slog.Warn("cluster: HA peer epoch-floor is unreadable or implausible; starting without an across-reboot replay floor",
+	// The forward bound applies on LOAD as well as on receive: a floor recorded
+	// while this node's clock ran far ahead would otherwise be restored forever
+	// and lock the peer out even after the clock is corrected.
+	if perr != nil || !epochOrderable(n, time.Now().UnixNano()) {
+		slog.Warn("cluster: HA peer epoch-floor is unreadable or out of range; starting without an across-reboot replay floor",
 			"path", s.path)
 		return 0
 	}
@@ -336,9 +449,25 @@ func (s *peerEpochFloorStore) store(epoch uint64) {
 			"path", s.path, "err", err)
 		return
 	}
-	if err := fsatomic.WriteFileDurable(s.path, []byte(strconv.FormatUint(epoch, 10)+"\n"), 0o644); err != nil {
-		slog.Warn("cluster: HA peer epoch-floor persist failed; the across-reboot replay floor will not survive a restart",
-			"path", s.path, "err", err)
+	// Cross-process serialization, same reasoning as the boot epoch: nothing
+	// enforces a single xpfd instance, and a floor that goes BACKWARDS on disk
+	// would silently reopen the replay window on the next restart.
+	var wrote bool
+	withEpochFileLock(s.path, func() {
+		if cur, err := os.ReadFile(s.path); err == nil {
+			if n, perr := strconv.ParseUint(strings.TrimSpace(string(cur)), 10, 64); perr == nil && n >= epoch {
+				wrote = true // another instance already recorded this or higher
+				return
+			}
+		}
+		if err := fsatomic.WriteFileDurable(s.path, []byte(strconv.FormatUint(epoch, 10)+"\n"), 0o644); err != nil {
+			slog.Warn("cluster: HA peer epoch-floor persist failed; the across-reboot replay floor will not survive a restart",
+				"path", s.path, "err", err)
+			return
+		}
+		wrote = true
+	})
+	if !wrote {
 		return
 	}
 	s.written = epoch

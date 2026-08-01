@@ -66308,3 +66308,32 @@ break — `go vet` confirmed passing under every revert.
   pkg/cluster/manager.go, pkg/cluster/heartbeat_manager.go,
   pkg/cluster/heartbeat_epoch_latch_test.go, pkg/cluster/heartbeat_epoch_test.go,
   pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 17:20
+- **Action**: #6169 round-2 review fold. The three-way-confirmed MAJOR (epochless
+  bypass) was already closed by the previous fold f7536ce32 — the reviews ran at
+  9fc8b79f7, where `grep epochSeen` is genuinely empty; verified the fold
+  satisfies the property as stated rather than re-doing it. New in this round:
+  (1) FORWARD BOUND on an accepted epoch (`epochOrderable`): at most
+  `bootEpochMaxSkew` (1y) ahead of the receiver's wall clock, applied ONLY when
+  our own clock is credible (`epochClockSaneFloor`, y2020) so a dead-RTC cold
+  boot does not refuse a healthy peer — the naive relative form would, at exactly
+  the moment cold-boot split-brain is most likely. Same bound applied in
+  `nextBootEpoch` (won't chain from an out-of-range prev) and on floor LOAD, so a
+  node or floor written under a bad clock HEALS. An unorderable epoch is now
+  REFUSED, not admitted-and-ignored — admitting it was the epochless bypass in
+  miniature. (2) Cross-process `flock` on both state files (`withEpochFileLock`):
+  nothing enforces a single xpfd (no pidfile, and gRPC sets SO_REUSEPORT so a 2nd
+  instance does NOT fail on the port), so the read-modify-write, not just the
+  write, needed to be atomic. Fails open. (3) OBSERVABILITY:
+  `HeartbeatStats.EpochlessAdmitted` / `EpochDowngradeRejected` — without a
+  counter the residual is invisible to an operator. (4) Docs: PSK rotation
+  elevated to a REQUIRED post-upgrade step with the counter as the exposure
+  meter; the #4107 `peerAuthSeen` layering stated (two gates, neither redundant;
+  the unkeyed path is #6624's domain). Tidiness: "scan back" -> single fixed
+  offset (there is no search loop); whole-struct DeepEqual in the legacy-receiver
+  test. Mutations 10/11/12 red as assertions with build+vet rc=0; 7 re-verified;
+  negative controls green in every world.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/heartbeat.go,
+  pkg/cluster/heartbeat_manager.go, pkg/cluster/heartbeat_epoch_latch_test.go,
+  pkg/cluster/heartbeat_epoch_test.go, pkg/cluster/README.md, _Log.md

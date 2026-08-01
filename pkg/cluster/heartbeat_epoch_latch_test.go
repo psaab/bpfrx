@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 )
 
 // #6169 — the DOWNGRADE LATCH.
@@ -230,19 +231,28 @@ func TestHeartbeatEpochRollbackRefusedThenRecovered_6169(t *testing.T) {
 func TestHeartbeatEpochImplausibleValueCannotLockOut_6169(t *testing.T) {
 	e := newLatchEnv(t)
 
-	// A frame carrying an absurd epoch is accepted (it is MAC-authentic) but
-	// must not raise the floor.
-	if !e.feed(marshalHeartbeatAuthEpoch(samplePkt(), e.key, 0x55E0, 1, math.MaxUint64)) {
-		t.Fatal("a MAC-authentic frame with an implausible epoch should not be rejected")
+	// A frame carrying an epoch the floor cannot ORDER is REFUSED, not
+	// admitted-and-ignored: a frame outside the comparable range would be
+	// governed by the bounded ring alone, which is the epochless bypass in
+	// miniature.
+	for _, bad := range []uint64{
+		math.MaxUint64,
+		epochPlausibleMax,
+		uint64(time.Now().UnixNano()) + bootEpochMaxSkew*2, // plausible year, but far ahead of us
+	} {
+		if e.feed(marshalHeartbeatAuthEpoch(samplePkt(), e.key, 0x55E0, 1, bad)) {
+			t.Fatalf("a frame with an unorderable epoch (%d) was admitted", bad)
+		}
 	}
 	if got := e.r.auth.peerEpochFloor(); got != 0 {
-		t.Fatalf("floor = %d, want 0 — an implausible epoch must never be latched as the floor", got)
+		t.Fatalf("floor = %d, want 0 — an unorderable epoch must never be latched as the floor", got)
 	}
-	if !e.r.auth.peerEpochLatched() {
-		t.Fatal("an epoch section, even an implausible one, proves the peer emits epochs")
+	if e.r.auth.peerEpochLatched() {
+		t.Fatal("a REFUSED frame must not arm the latch")
 	}
-	// The genuine peer with an ordinary epoch is still accepted — no lockout.
-	e.liveRun(e.captureIncarnation(0x55E1, 9_400_000_000_000_000, epochFramesPerIncarnation), "genuine peer after an implausible epoch")
+	// The genuine peer with an ordinary epoch is still accepted the moment it
+	// comes back into range — the refusal must not be a one-way door.
+	e.liveRun(e.captureIncarnation(0x55E1, 9_400_000_000_000_000, epochFramesPerIncarnation), "genuine peer after an unorderable epoch")
 	// And nothing implausible reached stable storage.
 	if raw, err := os.ReadFile(e.floorPath); err == nil {
 		if got, _ := strconv.ParseUint(string(raw[:len(raw)-1]), 10, 64); !epochUsableAsFloor(got) {
@@ -298,4 +308,112 @@ func TestHeartbeatEpochFloorFailsOpen_6169(t *testing.T) {
 			t.Fatalf("in-memory floor = %d, want the advanced value even when the write fails", got)
 		}
 	})
+}
+
+// TestHeartbeatEpochlessAdmitsAreCounted_6169 pins the OBSERVABILITY guard.
+//
+// Until the peer has proved it emits epochs, an epochless frame is admitted on
+// the bounded ring alone — which is the mechanism that stops working past
+// heartbeatReplaySessions captures. That residual must be VISIBLE: an operator
+// who has upgraded both nodes otherwise has no way to tell whether the cluster
+// is still accepting pre-upgrade-shaped frames, and the documentation would be
+// the only defence.
+//
+// The guard asserts the COUNT, not merely that the code path exists.
+func TestHeartbeatEpochlessAdmitsAreCounted_6169(t *testing.T) {
+	e := newLatchEnv(t)
+
+	if got := e.r.auth.epochlessAdmitted.Load(); got != 0 {
+		t.Fatalf("epochlessAdmitted starts at %d, want 0", got)
+	}
+	// A not-yet-upgraded peer: every admitted frame must be counted.
+	const n = 7
+	e.liveRun(e.captureIncarnation(0x88E0, 0, n), "not-yet-upgraded peer")
+	if got := e.r.auth.epochlessAdmitted.Load(); got != n {
+		t.Fatalf("epochlessAdmitted = %d after %d admitted epochless frames, want %d", got, n, n)
+	}
+
+	// An epoch-bearing frame must NOT be counted as epochless exposure.
+	e.liveRun(e.captureIncarnation(0x88E1, 9_600_000_000_000_000, 3), "upgraded peer")
+	if got := e.r.auth.epochlessAdmitted.Load(); got != n {
+		t.Fatalf("epochlessAdmitted = %d after epoch-bearing frames, want it unchanged at %d", got, n)
+	}
+
+	// Once latched, epochless frames are REFUSED — counted separately, and the
+	// exposure meter must not climb.
+	before := e.r.auth.epochDowngradeRejected.Load()
+	const rejects = 4
+	for i := 0; i < rejects; i++ {
+		if e.feed(marshalHeartbeatAuthEpoch(samplePkt(), e.key, uint64(0x88F0+i), 1, 0)) {
+			t.Fatal("epochless frame admitted after the latch armed")
+		}
+	}
+	if got := e.r.auth.epochDowngradeRejected.Load(); got != before+rejects {
+		t.Fatalf("epochDowngradeRejected = %d, want %d", got, before+rejects)
+	}
+	if got := e.r.auth.epochlessAdmitted.Load(); got != n {
+		t.Fatalf("epochlessAdmitted climbed to %d on REFUSED frames, want %d", got, n)
+	}
+
+	// And it reaches the operator surface.
+	e.m.mu.Lock()
+	e.m.hbReceiver = e.r
+	e.m.mu.Unlock()
+	st := e.m.HeartbeatStats()
+	if st.EpochlessAdmitted != n {
+		t.Fatalf("HeartbeatStats.EpochlessAdmitted = %d, want %d", st.EpochlessAdmitted, n)
+	}
+	if st.EpochDowngradeRejected != before+rejects {
+		t.Fatalf("HeartbeatStats.EpochDowngradeRejected = %d, want %d", st.EpochDowngradeRejected, before+rejects)
+	}
+}
+
+// TestHeartbeatEpochLatchLayersOverPeerAuthSeen_6169 states how the #6169 epoch
+// latch composes with the #4107 peerAuthSeen latch. They are LAYERED, not
+// duplicative, and neither subsumes the other:
+//
+//   - peerAuthSeen latches "the peer proved it holds the PSK" and refuses
+//     UNSIGNED frames from then on.
+//   - epochSeen latches "the peer proved it runs an epoch-capable build" and
+//     refuses SIGNED-BUT-EPOCHLESS frames from then on.
+//
+// An attacker's replayed pre-upgrade capture is genuinely signed (it was
+// captured off a keyed cluster), so it passes the first gate and is stopped only
+// by the second — which is exactly why the epoch latch was needed. An unsigned
+// frame never reaches the epoch gate at all: readLoop only calls admitAuthed
+// when the MAC verified.
+//
+// The remaining open path is a cluster with NO key configured, where neither
+// mechanism exists because there is no MAC to verify and the epoch marker is
+// key-derived. That is #6624's domain — an unkeyed chassis cluster is refused at
+// commit — and is out of scope here.
+func TestHeartbeatEpochLatchLayersOverPeerAuthSeen_6169(t *testing.T) {
+	e := newLatchEnv(t)
+
+	// A signed, epoch-bearing frame arms BOTH latches.
+	e.liveRun(e.captureIncarnation(0x99E0, 9_700_000_000_000_000, 3), "signed peer with an epoch")
+	if !e.r.auth.peerAuthenticated() {
+		t.Fatal("#4107: an accepted signed frame must arm peerAuthSeen")
+	}
+	if !e.r.auth.peerEpochLatched() {
+		t.Fatal("#6169: an accepted epoch-bearing frame must arm epochSeen")
+	}
+
+	// UNSIGNED frame -> stopped by the #4107 gate, before admitAuthed runs.
+	unsigned := MarshalHeartbeat(samplePkt())
+	if _, _, present := heartbeatAuthTrailer(unsigned); present {
+		t.Fatal("test frame unexpectedly carries an auth trailer")
+	}
+	if e.feed(unsigned) {
+		t.Fatal("#4107: an unsigned frame must be refused once the peer has authenticated")
+	}
+
+	// SIGNED but epochless -> passes #4107 (the MAC verifies), stopped by #6169.
+	signedEpochless := MarshalHeartbeatAuth(samplePkt(), e.key, 0x99E1, 1)
+	if !verifyHeartbeatMAC(signedEpochless, e.key) {
+		t.Fatal("test frame should verify")
+	}
+	if e.feed(signedEpochless) {
+		t.Fatal("#6169: a signed but epochless frame must be refused once the epoch latch armed")
+	}
 }

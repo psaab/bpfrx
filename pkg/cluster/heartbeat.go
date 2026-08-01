@@ -699,6 +699,21 @@ type heartbeatAuthState struct {
 	// attacker waits for.
 	epochSeen bool
 
+	// epochlessAdmitted counts authenticated heartbeats ADMITTED without a boot
+	// epoch, and epochDowngradeRejected counts those refused because the peer
+	// had already proved it emits them. Atomics, not mu-guarded, because
+	// HeartbeatStats reads them from another goroutine.
+	//
+	// These exist so the #6169 residual is OBSERVABLE. Without a counter an
+	// operator who has upgraded both nodes has no way to tell whether the
+	// cluster is still accepting pre-upgrade-shaped frames — the exposure would
+	// be invisible and the documentation would be the only defence. A non-zero
+	// epochlessAdmitted after a completed rollout means either a node is still
+	// on an old build or someone is replaying captures; a non-zero
+	// epochDowngradeRejected means the latch is actively refusing something.
+	epochlessAdmitted      atomic.Uint64
+	epochDowngradeRejected atomic.Uint64
+
 	// persistFloor durably records an advanced floor. Set once by
 	// Manager.initHeartbeatEpochState before any frame is admitted, and nil in
 	// unit tests (in-memory only). It is called OUTSIDE the mutex and must not
@@ -810,19 +825,38 @@ func (s *heartbeatAuthState) admitAuthedLocked(hasEpoch bool, epoch, session, co
 	if !hasEpoch {
 		if s.epochSeen {
 			// Downgrade: this peer has proved it emits epochs.
+			s.epochDowngradeRejected.Add(1)
 			return false, 0, nil
 		}
-		return s.replay.admit(session, counter), 0, nil
+		// The migration window — and the ONLY residual an operator can still be
+		// exposed to on merge day, since a capture taken before the upgrade is
+		// epochless and this node has not yet seen proof the peer emits epochs.
+		// Counted so that exposure is visible rather than inferred: a peer still
+		// sending epochless frames after both nodes are upgraded is either
+		// mid-rollout or an attack, and both are things an operator must see.
+		// Surfaced through HeartbeatStats.EpochlessAdmitted.
+		ok := s.replay.admit(session, counter)
+		if ok {
+			s.epochlessAdmitted.Add(1)
+		}
+		return ok, 0, nil
 	}
-	usable := epochUsableAsFloor(epoch)
-	if usable && epoch < s.highEpoch {
+	// An epoch the floor cannot ORDER is refused, not admitted-and-ignored.
+	// Admitting it would recreate the epochless bypass in miniature: a frame
+	// outside the comparable range is governed by the bounded ring alone, so
+	// captures from an incarnation that once emitted an out-of-range epoch would
+	// replay indefinitely. See epochOrderable.
+	if !epochOrderable(epoch, time.Now().UnixNano()) {
+		return false, 0, nil
+	}
+	if epoch < s.highEpoch {
 		return false, 0, nil
 	}
 	if !s.replay.admit(session, counter) {
 		return false, 0, nil
 	}
 	s.epochSeen = true
-	if usable && epoch > s.highEpoch {
+	if epoch > s.highEpoch {
 		s.highEpoch = epoch
 		advanced = epoch
 	}
