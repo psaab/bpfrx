@@ -1692,7 +1692,7 @@ func userspaceSkipsIngressInterface(iface InterfaceSnapshot) bool {
 		// is a base-name match, not a whole-string match and not a bare
 		// HasPrefix("st"); over-matching here would silently drop a real data
 		// interface out of adjudication, which is worse than the gap below.
-		// TestSecureTunnelSpellingsAllExcluded and
+		// TestSecureTunnelStaysOutOfDataplaneSets and
 		// TestSecureTunnelNonTunnelStNamesStayAdjudicated pin both directions.
 		//
 		// Route-based IPsec decrypts in the KERNEL XFRM stack, which delivers
@@ -1719,16 +1719,34 @@ func userspaceSkipsIngressInterface(iface InterfaceSnapshot) bool {
 		// resolved to 0 before (resolve_next_hop_target_v4, fib.rs, ends
 		// `.unwrap_or((0, 0))`).
 		//
-		// That was traced to a terminal outcome and it changes no disposition:
-		// an egress ifindex with no XSK binding is dropped by the TX dispatcher
-		// as `missing_egress_binding` (tx/dispatch/mod.rs), and ifindex 0 had no
-		// binding either — so LAN->tunnel transit dropped at the same site for
-		// the same reason before and after. What DID change is a strict
-		// improvement: the egress zone now resolves, so such a flow is
-		// adjudicated against the real zone pair instead of an unresolved one.
-		// Widening this exclusion to cover those maps would REMOVE that, and an
-		// interface absent from the zone maps resolves to zone_id 0, which a
-		// `from-zone any to-zone any permit` matches (#6682).
+		// AND IT MOVES A TX DISPOSITION — an earlier version of this comment
+		// claimed otherwise ("the TX dispatcher drops it as
+		// missing_egress_binding either way"). That was WRONG: a LAN->tunnel
+		// packet never reaches the TX dispatcher, because the FIB claims it
+		// first. Measured end to end, real Go wire snapshot -> real Rust FIB,
+		// `next-hop <gw-in-tunnel-subnet>`:
+		//
+		//	bind-interface st0    : MissingNeighbor before AND after
+		//	bind-interface st0.0  : NoRoute before -> MissingNeighbor after
+		//
+		// Both spellings are ONE tunnel (same if_id, same unit ref `st0.0`),
+		// so this is a CONVERGENCE onto what the canonical bare spelling
+		// already did — the divergence WAS the name bug. It is still
+		// operator-visible, because the two arms differ: `NoRoute` reinjects
+		// to the kernel unconditionally, while `MissingNeighbor` runs its own
+		// zone-policy evaluation first and a DENY exits before the reinject
+		// gate. So a LAN->tunnel flow with no `from-zone <lan> to-zone
+		// <tunnel-zone>` permit goes from kernel-delivered to dropped on the
+		// dotted spelling. That reinject was a zone-policy bypass — #5619's
+		// subject — so the drop is the correction; under a PERMIT both arms
+		// reinject and nothing changes at this gate.
+		// TestSecureTunnelSpellingsAgreeOnForwardingInputs pins the
+		// convergence.
+		//
+		// Widening this exclusion to cover those maps would ALSO drop the
+		// egress-zone resolution, and an interface absent from the zone maps
+		// resolves to zone_id 0, which a `from-zone any to-zone any permit`
+		// matches (#6682).
 		//
 		// Admitting it to the sets below would make
 		// the shim claim the xfrmi's ingress and steer it to an XSK that
@@ -1736,11 +1754,16 @@ func userspaceSkipsIngressInterface(iface InterfaceSnapshot) bool {
 		// no zero-copy), and drop_degraded_transit would then DROP the
 		// decrypted plaintext — turning today's policy gap into a dead tunnel.
 		//
-		// Before #5619 this exclusion happened by ACCIDENT: snapshotLinuxName
-		// resolved `st0.0` to the nonexistent netdev `st0`, so the unit
-		// carried ifindex 0 and fell out of these sets on the `Ifindex <= 0`
-		// guard. Fixing that name made the accident stop working, so the
-		// exclusion is stated deliberately here instead.
+		// Before #5619 this exclusion was an ACCIDENT for ONE spelling ONLY.
+		// snapshotLinuxName collapsed unit 0, so `bind-interface st0.0`
+		// resolved to the nonexistent netdev `st0`, carried ifindex 0 and fell
+		// out of these sets on the `Ifindex <= 0` guard. `bind-interface st0`,
+		// `st10.5` and `st0.7` all resolved to REAL ifindexes and were fully
+		// adjudicated and RSS-bound — measured, not inferred. So this arm is
+		// NEW behaviour for three of the four spellings, not a preserved
+		// accident: it is what stops a route-based tunnel from collapsing the
+		// AF_XDP binding plan onto a single XSK on a virtual netdev. Do not
+		// delete it as inert.
 		//
 		// The consequence is real and operator-visible: decrypted IPsec
 		// plaintext traverses Linux routing with NO xpf zone policy. That is

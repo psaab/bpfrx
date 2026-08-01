@@ -453,6 +453,33 @@ func snapshotLinuxName(cfg *config.Config, ifName string, iface *config.Interfac
 		// and under `bind-interface st0.0` there is no `st0` device at all, so
 		// resolving to nothing is the honest answer rather than aliasing the
 		// base row onto the unit's device.
+		//
+		// THIS MOVES A FORWARDING DISPOSITION — read before "simplifying" it.
+		// The unit row's ifindex is the gate on Rust `populate_interfaces`
+		// (`if iface.ifindex <= 0 { continue }`), so resolving the name also
+		// admits the tunnel's connected prefix to the FIB. Measured end to
+		// end (real Go wire snapshot -> real Rust FIB) for a LAN->tunnel
+		// transit flow, `next-hop <gw-in-tunnel-subnet>`:
+		//
+		//	bind-interface st0    : MissingNeighbor before AND after
+		//	bind-interface st0.0  : NoRoute before -> MissingNeighbor after
+		//
+		// The two spellings describe ONE tunnel — same if_id, same unit ref
+		// `st0.0` — and the divergence was purely this name bug. So the
+		// change is a CONVERGENCE onto what the canonical bare spelling
+		// already did, not a new state. It is still operator-visible: the
+		// `NoRoute` arm reinjects unconditionally, whereas the
+		// `MissingNeighbor` arm runs its OWN zone-policy evaluation first
+		// (poll_descriptor/mod.rs), so a LAN->tunnel flow with no
+		// `from-zone <lan> to-zone <tunnel-zone>` permit is now DROPPED where
+		// the dotted spelling used to be kernel-reinjected and delivered.
+		// That reinject was a zone-policy bypass — the #5619 subject — so the
+		// deny is the correction, but it is a behaviour change and is stated
+		// in the PR body too. Under a PERMIT both arms reinject, so a
+		// policied tunnel is unaffected at this gate.
+		// TestSecureTunnelSpellingsAgreeOnForwardingInputs pins the
+		// convergence; `secure_tunnel_unit_ifindex_decides_route_disposition`
+		// (userspace-dp) pins the FIB consequence the claim rests on.
 		if config.IsSecureTunnelIfName(ifName) {
 			ref := fmt.Sprintf("%s.%d", ifName, unit.Number)
 			if dev, ok := cfg.SecureTunnelNetdevForRef(ref); ok {
