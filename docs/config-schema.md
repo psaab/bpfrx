@@ -971,13 +971,21 @@ one value into a scalar that installs, plus a list that only validators consume,
 must keep them. `nodeVal` SELECTS a blank token, so filtering it out of the list
 lets the scalar hold a value the list does not contain, and every validator and
 diagnostic reading the list then describes a rule that is not the one in effect.
-Three categories, and the non-uniformity is deliberate:
+Four categories, and the non-uniformity is deliberate:
 
 | Category | Leaves | Reader | Empty value |
 |---|---|---|---|
 | SELECTION (scalar installs, list validates) | `routing-options forwarding-table export`, `security nat static … match destination-address` | `multiLeafAuthoredValues` (`ast.go`) | KEPT |
 | SET (every value installs) | `security flow traceoptions flag`, `security nat proxy-arp … address` | `firewallMatchValues` / `proxyARPAddressValues` | SKIPPED |
-| VALIDATED LIST (a downstream checker rejects a malformed entry) | `event-options … attributes-match`, `… then change-configuration commands` | `eventAttributesMatchExprs` / `eventChangeConfigCommands` | KEPT |
+| VALIDATED LIST (a downstream checker rejects a malformed entry) | `event-options … attributes-match` | `eventAttributesMatchExprs` | KEPT |
+| REPORTED LIST (nothing rejects it; the list IS the compiled policy) | `event-options … then change-configuration commands` | `eventChangeConfigCommands` | KEPT |
+
+The last two rows look like one category and are not. `attributes-match` really
+is validated — `ValidateEventAttributesMatchStrict` hard-rejects a `""` expression at
+strict commit. `commands` is not: `eventengine.classifyPlan` trims and SKIPS an
+empty command, so an empty entry never reaches a checker and the remediation
+batch is unaffected by it. Its entry is kept because the compiled list is
+observable in its own right (below), not because anything gates on it.
 
 `multiLeafAuthoredValues` exists to make one invariant TOTAL:
 `multiLeafAuthoredValues(n)[0] == nodeVal(n)` for every node shape — including a
@@ -1003,9 +1011,16 @@ empty value:
   pre-#6659 `attributes-match` reader appended every child expression
   unconditionally, so a stray `""` was hard-rejected as a malformed match
   expression; filtering it accepted that config and let the event policy fire on
-  every occurrence of its event. Likewise an empty `commands` entry made the
-  event engine decline the WHOLE remediation batch (every command needs the
-  `set ` prefix) — filtering it applies the batch in part instead.
+  every occurrence of its event.
+- **A leaf that merely LOOKS validated is a trap of its own.** The sibling
+  `commands` leaf keeps its empty entry too, but not for the reason above:
+  `classifyPlan` skips an empty command, so the batch runs identically either
+  way and master never declined it. What filtering would change is the compiled
+  policy — `policySemanticRevision` hashes every `ThenCommands` entry, and
+  `show event-options` prints the list verbatim — so the empty is kept for
+  OUTPUT PARITY. Assuming the fail-closed story generalises from one event-
+  options leaf to the next is exactly the guess that has to be checked against
+  the consumer rather than inferred from the shape of the config.
 
 A diagnostic about a NON-SELECTED value must not describe the selected one's
 fate. `emitMatchAddr` (`compiler_validate_strict_nat.go`) picks the tolerant-path

@@ -32,11 +32,17 @@ import (
 //     address`) installs every value it reads. An empty value is not a
 //     selection, it is nothing, and the pre-#6659 compiler skipped it. Both
 //     keep skipping it (firewallMatchValues / proxyARPAddressValues).
-//   - A VALIDATED-LIST leaf (`event-options ... attributes-match`, `... then
-//     change-configuration commands`) is consumed downstream by a checker that
-//     REJECTS a malformed entry. The pre-#6659 compiler kept empty entries here
-//     and the checker rejected them; dropping them would silently convert a
-//     fail-CLOSED gate into a fail-OPEN one.
+//   - A VALIDATED-LIST leaf (`event-options ... attributes-match`) is consumed
+//     downstream by a checker that REJECTS a malformed entry. The pre-#6659
+//     compiler kept empty entries here and the checker rejected them; dropping
+//     them would silently convert a fail-CLOSED gate into a fail-OPEN one.
+//   - A REPORTED-LIST leaf (`event-options ... then change-configuration
+//     commands`) LOOKS like the previous category and is not. Nothing rejects an
+//     empty command: eventengine.classifyPlan trims and SKIPS it, so the
+//     remediation batch is identical either way and master never declined it
+//     (pinned by TestClassifyPlan6673SkipsAnEmptyCommand in pkg/eventengine).
+//     Its empty entry is kept for OUTPUT PARITY — the compiled list is hashed
+//     into policySemanticRevision and printed verbatim by `show event-options`.
 //
 // Each test states which category its arm is in and what master did, because the
 // justification for keeping an empty value and the justification for dropping
@@ -564,14 +570,19 @@ event-options { policy pA { events e1; attributes-match e1.test-owner matches Co
 }
 
 // TestEventChangeConfigCommands6673EmptyCommandStaysInTheBatch is the sibling
-// regression guard.
+// regression guard — but it guards OUTPUT PARITY, not a fail-closed gate, and
+// the distinction is deliberate.
 //
 // Before #6659 the block spelling appended cmdChild.Name() unconditionally, so
-// `commands { ""; "set system host-name foo"; }` produced an "" entry and the
-// event engine (pkg/eventengine) refused the WHOLE remediation batch — every
-// command must carry the "set " prefix. Filtering the empty entry out runs the
-// rest of the batch instead: a partially-applied configuration change, from a
-// batch the daemon previously declined outright.
+// `commands { ""; "set system host-name foo"; }` compiled to ["", "set system
+// host-name foo"]. This test pins that list. Unlike attributes-match, no
+// downstream checker rejects the empty entry: eventengine.classifyPlan trims
+// and SKIPS an empty command (it has since the engine's first commit), so the
+// remediation batch runs identically either way. What filtering would change is
+// the compiled policy itself — policySemanticRevision hashes every
+// ThenCommands entry, and `show event-options` prints the list verbatim — so
+// the reader reports what was authored and leaves the judgement to the
+// consumer that already makes it.
 //
 // The packed spelling now behaves the same way, which is the parity this helper
 // exists for; before #6659 it compiled to nothing.
@@ -616,8 +627,9 @@ event-options { policy pA { events e1; then { change-configuration {
 				got := cfg.EventOptions[0].ThenCommands
 				if !reflect.DeepEqual(got, tc.want) {
 					t.Fatalf("%s: ThenCommands = %q, want %q — an empty entry "+
-						"must survive so the event engine declines the whole "+
-						"batch instead of applying it in part",
+						"must survive so the compiled policy stays identical "+
+						"to master's (semantic revision + show event-options); "+
+						"the engine skips it either way",
 						path.name, got, tc.want)
 				}
 			}
@@ -724,6 +736,248 @@ security { nat { static { rule-set rs1 { from zone untrust;
 	if !strings.Contains(w2, "rule dropped by dataplane") {
 		t.Fatalf("tolerant warning for the SELECTED non-host prefix must still "+
 			"say the rule is dropped, because it is:\n  %s", w2)
+	}
+}
+
+// TestStaticNATMatch6673EmptySelectionSuffixDoesNotClaimAnActiveRule guards the
+// third branch of emitMatchAddr.
+//
+// The "not the one the rule installs — %q is, and it stays active" wording
+// assumes the SELECTED value is a real prefix. It need not be: an authored blank
+// can be the selection (`destination-address [ "" bogus ]` — nodeVal takes the
+// leading empty slot), and the message then renders as `"" is, and it stays
+// active`, which translates nothing and reassures the operator about a rule that
+// does not exist. rule.Match == "" lowers ExternalIP: "" and the Rust
+// parse_nat_prefix("") returns None, so from_snapshots drops the whole mapping.
+func TestStaticNATMatch6673EmptySelectionSuffixDoesNotClaimAnActiveRule(t *testing.T) {
+	tolerant := hierTree6659(t, `
+security { nat { static { rule-set rs1 { from zone untrust;
+    rule r1 { match { destination-address [ "" not-an-address ]; }
+              then { static-nat prefix 10.0.0.1/32; } } } } } }`)
+	cfg, err := CompileConfigLenient(tolerant)
+	if err != nil {
+		t.Fatalf("tolerant compile: %v", err)
+	}
+	if got := cfg.Security.NAT.Static[0].Rules[0].Match; got != "" {
+		t.Fatalf("Match = %q, want %q — the premise of this test is that the "+
+			"SELECTED value is the authored blank", got, "")
+	}
+	w := findWarning6673(t, cfg, "not-an-address", "is not a valid IP address or CIDR prefix")
+	if strings.Contains(w, "stays active") {
+		t.Fatalf("tolerant warning tells the operator a rule stays active when "+
+			"the selected match destination-address is EMPTY and the rule is "+
+			"dropped:\n  %s", w)
+	}
+	if !strings.Contains(w, "EMPTY") {
+		t.Fatalf("tolerant warning does not say the selection is empty:\n  %s", w)
+	}
+}
+
+// TestForwardingTableExport6673TolerantWarningDoesNotNameTheWrongSlot guards the
+// wrapper text against the error it wraps.
+//
+// The wrapper used to open "only the FIRST policy is honoured by the ECMP
+// render". The renderer uses the SELECTED policy, and across two top-level
+// `routing-options` roots the last root wins — so for `export p1` then
+// `export p2` the wrapper claimed p1 while the very error it embeds correctly
+// says only "p2" would take effect. One warning, two answers.
+func TestForwardingTableExport6673TolerantWarningDoesNotNameTheWrongSlot(t *testing.T) {
+	tolerant := hierTree6659(t, `
+policy-options { policy-statement p1 { then accept; } policy-statement p2 { then accept; } }
+routing-options { forwarding-table { export p1; } }
+routing-options { forwarding-table { export p2; } }`)
+	cfg, err := CompileConfigLenient(tolerant)
+	if err != nil {
+		t.Fatalf("tolerant compile: %v", err)
+	}
+	if got := cfg.RoutingOptions.ForwardingTableExport; got != "p2" {
+		t.Fatalf("ForwardingTableExport = %q, want %q — the premise of this "+
+			"test is that the LAST root wins", got, "p2")
+	}
+	w := findWarning6673(t, cfg, "LIST FORM IS NOT SUPPORTED")
+	if !strings.Contains(w, `"p2"`) {
+		t.Fatalf("tolerant warning does not name the policy that actually "+
+			"renders:\n  %s", w)
+	}
+	for _, wrong := range []string{"FIRST policy", "first policy"} {
+		if strings.Contains(w, wrong) {
+			t.Fatalf("tolerant warning claims %q while the error it wraps says "+
+				"only %q takes effect — the wrapper must not name a slot:\n  %s",
+				wrong, "p2", w)
+		}
+	}
+}
+
+// TestForwardingTableExport6673DanglingRefNamesThePerValueConsequence guards
+// #6715.
+//
+// #6659 widened this gate from the rendering scalar to EVERY authored value, so
+// a NON-rendering token can now reach it. The consequence text did not widen
+// with it: `export [ p1 nosuch ]` reported that "the expected ECMP /
+// consistent-hash load-balancing would be silently disabled" while p1 renders
+// and ECMP resolves fine. Master could not produce that message because it only
+// ever passed the scalar. Same fix as the static-NAT side (emitMatchAddr):
+// decide which value the reference is before naming the consequence.
+func TestForwardingTableExport6673DanglingRefNamesThePerValueConsequence(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		cfg        string
+		wantSubs   []string
+		rejectSubs []string
+	}{
+		{
+			name: "dangling value is NOT the one that renders",
+			cfg: `
+policy-options { policy-statement p1 { then accept; } }
+routing-options { forwarding-table { export [ p1 nosuch ]; } }`,
+			wantSubs:   []string{`"nosuch"`, `"p1" is, and it still resolves`},
+			rejectSubs: []string{"silently disabled"},
+		},
+		{
+			name: "dangling value IS the one that renders",
+			cfg: `
+routing-options { forwarding-table { export nosuch; } }`,
+			wantSubs:   []string{`"nosuch"`, "silently disabled"},
+			rejectSubs: []string{"still resolves"},
+		},
+		{
+			name: "dangling value with an EMPTY selection",
+			cfg: `
+routing-options { forwarding-table { export [ "" nosuch ]; } }`,
+			wantSubs:   []string{`"nosuch"`, "EMPTY"},
+			rejectSubs: []string{"silently disabled", "still resolves"},
+		},
+		{
+			name: "two roots — the LAST root's dangling policy is the one that renders",
+			cfg: `
+policy-options { policy-statement p1 { then accept; } }
+routing-options { forwarding-table { export p1; } }
+routing-options { forwarding-table { export nosuch; } }`,
+			wantSubs:   []string{`"nosuch"`, "silently disabled"},
+			rejectSubs: []string{"still resolves"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := CompileConfigMustFail6673(t, hierTree6659(t, tc.cfg))
+			got := err.Error()
+			for _, sub := range tc.wantSubs {
+				if !strings.Contains(got, sub) {
+					t.Fatalf("strict error does not contain %q:\n  %s", sub, got)
+				}
+			}
+			for _, sub := range tc.rejectSubs {
+				if strings.Contains(got, sub) {
+					t.Fatalf("strict error contains %q, which is false for this "+
+						"shape:\n  %s", sub, got)
+				}
+			}
+		})
+	}
+}
+
+// --- normalisation: the readers report what was authored --------------------
+
+// TestEventOptions6673ValuesAreStoredVerbatim guards the deliberate absence of
+// strings.TrimSpace in both event-options readers.
+//
+// The lexer preserves whitespace INSIDE a quoted token, so master compiled the
+// padded string and so must this. Trimming here is invisible to the matcher
+// (ParseEventAttributesMatch trims every field it splits out) and to the engine
+// (classifyPlan trims each command), which is exactly what makes it easy to add
+// by accident — but it rewrites the persisted config, the policy's semantic
+// revision, and what `show event-options` prints back at the operator.
+func TestEventOptions6673ValuesAreStoredVerbatim(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		cfg      string
+		wantAM   []string
+		wantCmds []string
+	}{
+		{
+			name: "block spelling",
+			cfg: `
+event-options { policy pA { events e1;
+    attributes-match { "  e1.test-owner matches Comcast  "; }
+    then { change-configuration { commands { "  set system host-name foo  "; } } } } }`,
+			wantAM:   []string{"  e1.test-owner matches Comcast  "},
+			wantCmds: []string{"  set system host-name foo  "},
+		},
+		{
+			name: "packed spelling",
+			cfg: `
+event-options { policy pA { events e1;
+    attributes-match "  e1.test-owner matches Comcast  ";
+    then { change-configuration { commands "  set system host-name foo  "; } } } }`,
+			wantAM:   []string{"  e1.test-owner matches Comcast  "},
+			wantCmds: []string{"  set system host-name foo  "},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := CompileConfigLenient(hierTree6659(t, tc.cfg))
+			if err != nil {
+				t.Fatalf("tolerant compile: %v", err)
+			}
+			ep := cfg.EventOptions[0]
+			if !reflect.DeepEqual(ep.AttributesMatch, tc.wantAM) {
+				t.Fatalf("AttributesMatch = %q, want %q — the reader must not "+
+					"normalise an authored expression; master stored it verbatim",
+					ep.AttributesMatch, tc.wantAM)
+			}
+			if !reflect.DeepEqual(ep.ThenCommands, tc.wantCmds) {
+				t.Fatalf("ThenCommands = %q, want %q — the reader must not "+
+					"normalise an authored command; classifyPlan trims it itself",
+					ep.ThenCommands, tc.wantCmds)
+			}
+		})
+	}
+}
+
+// TestProxyARPAddresses6673ToKeywordIsNotAnAddressAndDoesNotInventARejection
+// pins the `to`-token skip in proxyARPAddressValues, which was reachable,
+// behaviour-changing and completely unbound.
+//
+// A malformed range falls through the caller's two range branches to the
+// value reader, where `to` is grammar rather than an address. Master read this
+// leaf with nodeVal and installed the KEYWORD — every shape below compiled to
+// exactly ["to/32"] on origin/master. The skip is not "preserving pre-#6659
+// behaviour" (it changes it); what it preserves is the ACCEPT/REJECT verdict:
+// #6659 also added validateProxyARPAddressesStrict, which parses every value
+// with netip.ParsePrefix, so without the skip "to/32" materialises and strict
+// commit HARD-REJECTS a config master accepted.
+func TestProxyARPAddresses6673ToKeywordIsNotAnAddressAndDoesNotInventARejection(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  string
+		want []string
+	}{
+		{"bracket leading with the keyword", `
+security { nat { proxy-arp { interface ge-0-0-0 { address [ to 192.0.2.1 ]; } } } }`,
+			[]string{"192.0.2.1/32"}},
+		{"block with a keyword-only child", `
+security { nat { proxy-arp { interface ge-0-0-0 { address { to; 192.0.2.5; } } } } }`,
+			[]string{"192.0.2.5/32"}},
+		{"well-formed range still expands (CONTROL)", `
+security { nat { proxy-arp { interface ge-0-0-0 { address 192.0.2.1 to 192.0.2.3; } } } }`,
+			[]string{"192.0.2.1/32", "192.0.2.2/32", "192.0.2.3/32"}},
+		{"plain list is unaffected (CONTROL)", `
+security { nat { proxy-arp { interface ge-0-0-0 { address [ 192.0.2.1 192.0.2.2 ]; } } } }`,
+			[]string{"192.0.2.1/32", "192.0.2.2/32"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// STRICT: the keyword must never reach
+			// validateProxyARPAddressesStrict, or the widened read invents a
+			// commit rejection master never made.
+			cfg, err := CompileConfig(hierTree6659(t, tc.cfg))
+			if err != nil {
+				t.Fatalf("strict compile rejected a config master accepted: %v\n"+
+					"the `to` token is grammar, not an address; letting it "+
+					"materialise as \"to/32\" makes the proxy-ARP validator "+
+					"reject it", err)
+			}
+			if got := cfg.Security.NAT.ProxyARP[0].Addresses; !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("Addresses = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

@@ -1273,6 +1273,20 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 		if addr == selected {
 			return emit(msg)
 		}
+		// #6673: an authored-but-EMPTY slot can be the SELECTED value —
+		// `destination-address [ "" bogus ]` blanks the match, and nodeVal
+		// selects the blank. The "%q is, and it stays active" wording then
+		// renders as `"" is, and it stays active`, which translates nothing and
+		// reassures the operator about a rule that does not exist: rule.Match
+		// == "" lowers ExternalIP: "" and the Rust parse_nat_prefix("") returns
+		// None, so from_snapshots drops the whole mapping. Neither of the other
+		// two suffixes is true here — this value still is not the one that
+		// installs, but there is no surviving rule to keep active.
+		if selected == "" {
+			return emitSuffix(msg, " (ignored: this value is not the one the rule "+
+				"installs — the selected match destination-address is EMPTY, so "+
+				"the rule is dropped by the dataplane regardless of this value)")
+		}
 		return emitSuffix(msg, fmt.Sprintf(
 			" (ignored: this value is not the one the rule installs — %q is, "+
 				"and it stays active; correct or remove the unused value)",

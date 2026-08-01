@@ -43,6 +43,18 @@ func compileRoutingOptions(node *Node, ro *RoutingOptionsConfig) error {
 	// The plural still accumulates across roots, which is what the reference
 	// gate wants (every named policy must exist) and what makes the cardinality
 	// gate see the ambiguity.
+	//
+	// KNOWN BLIND SPOT (#6714, unchanged from master, deliberately not fixed
+	// here): the FindChild below takes the FIRST `forwarding-table` block only.
+	// Two blocks inside ONE `routing-options` root —
+	// `forwarding-table { export p1; } forwarding-table { export p2; }` — leave
+	// p2 invisible to BOTH the scalar and the list, so the cardinality gate
+	// cannot see the ambiguity it exists to reject and the config commits clean.
+	// Repeated `routing-options` ROOTS are handled (compiler_dispatch.go calls
+	// this per root); repeated sibling BLOCKS within a root are not. Widening it
+	// is a FindChild-vs-FindChildren change of the same class as the `export`
+	// leaf itself and belongs with the other repeated-block sites in #6714,
+	// not bundled into the empty-value fold.
 	if ftNode := node.FindChild("forwarding-table"); ftNode != nil {
 		for _, expNode := range ftNode.FindChildren("export") {
 			ro.ForwardingTableExports = append(ro.ForwardingTableExports, multiLeafAuthoredValues(expNode)...)

@@ -73678,11 +73678,14 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   describing what installs. New `multiLeafAuthoredValues` (ast.go) keeps empty
   values and guarantees `values[0] == nodeVal(n)` for every node shape;
   cardinality gates count `nonEmptyValues` so no accept/reject outcome changes.
-  (3+4) NEW REGRESSIONS FOUND AND FIXED: dropping an empty `attributes-match`
+  (3) NEW REGRESSION FOUND AND FIXED: dropping an empty `attributes-match`
   expression turned master's fail-CLOSED malformed-expression rejection into a
-  fail-open (the policy then fires on every occurrence of its event), and
-  dropping an empty `commands` entry applies in part a remediation batch the
-  event engine previously declined whole. Both readers keep empty entries again;
+  fail-open (the policy then fires on every occurrence of its event). (4) The
+  sibling `commands` leaf is an OUTPUT-PARITY divergence, NOT a fail-open —
+  `eventengine.classifyPlan` has trimmed and SKIPPED empty commands since the
+  engine's first commit, so the remediation batch is identical either way; the
+  compiled list is kept because it is hashed into `policySemanticRevision` and
+  printed verbatim by `show event-options`. Both readers keep empty entries again;
   the packed spellings now behave like the block ones, which is the dual-shape
   parity the arms were widened for. Flow-trace flags and proxy-ARP addresses are
   SET leaves and keep skipping empties, as master did — pinned as a control.
@@ -73699,4 +73702,59 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/config/compiler_validate_strict_nat.go,
   pkg/config/compiler_validate_strict_routing.go,
   pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
+  docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-08-02 18:20
+- **Action**: #6673 F3 MINOR fold — correct a rationale that was factually false
+  in five shipping places, and close the two behaviour gaps the R5 re-gate
+  found. (1) The F2 entry above, `compiler_services.go`, `docs/config-schema.md`
+  and the guard test all justified keeping an empty `then change-configuration
+  commands` entry by claiming master's event engine "declined the WHOLE
+  remediation batch" for it. It never did: `eventengine.classifyPlan` opens with
+  `cmd = strings.TrimSpace(cmd); if cmd == "" { continue }` and has since the
+  engine's first commit — driven directly, `["", "set …"]` gives ok=true with
+  one op. The CODE is right and unchanged; only the reason was wrong. Restated
+  as what it actually preserves: OUTPUT PARITY. The compiled list is hashed into
+  `policySemanticRevision` and printed verbatim by `show event-options`, so
+  filtering would silently diverge the persisted policy from master's while
+  changing nothing about what the batch executes. The classification table gains
+  a fourth row (REPORTED LIST) because `commands` and `attributes-match` are not
+  one category — only the latter has a checker that rejects. (2) #6715, which
+  this PR NEWLY INTRODUCED rather than inherited: widening the dangling-reference
+  gate from the rendering scalar to every authored value let a NON-rendering
+  token reach "load-balancing would be silently disabled", which is false while
+  the selected policy renders. Fixed the same way the NAT side was — decide per
+  value, with a third branch for an EMPTY selection (`export [ "" nosuch ]`), so
+  no message names a policy that is not there. (3) The tolerant list-form warning
+  claimed "only the FIRST policy is honoured" while the error it wraps correctly
+  says only `"p2"` takes effect across two `routing-options` roots; the wrapper
+  no longer names a slot. (4) `emitMatchAddr` rendered `— "" is, and it stays
+  active` when the SELECTED value was an authored blank; `parse_nat_prefix("")`
+  returns None, so the rule is dropped, and the suffix now says so. (5) Dropped
+  the undocumented `strings.TrimSpace` both event readers had gained. The lexer
+  DOES preserve whitespace inside a quoted token (probed both ways), so trimming
+  diverged the persisted string, the semantic revision and the diagnostic from
+  master while being invisible to every consumer — the opposite of the parity
+  argument in (1). (6) The proxy-ARP `to`-skip comment claimed it "preserves the
+  pre-#6659 behaviour"; a master-vs-head differential shows master compiled
+  `address [ to 192.0.2.1 ]`, `address { to; }` and `address { to; 192.0.2.5; }`
+  to exactly `["to/32"]` while head gives `["192.0.2.1/32"]`, `[]` and
+  `["192.0.2.5/32"]`. It is a deliberate CHANGE, and its real purpose is that
+  without it `to/32` materialises and `validateProxyARPAddressesStrict`
+  hard-REJECTS a config master accepted — an invented rejection. Comment
+  corrected and the skip is now bound. (7) Recorded the #6714 sibling blind spot:
+  a SECOND `forwarding-table` block inside ONE `routing-options` root is
+  invisible to both the scalar and the list (`FindChild`), same as master.
+  RED-on-revert: 7 mutations, `go build -buildvcs=false ./...` rc=0 and
+  `go vet ./pkg/config/... ./pkg/eventengine/...` rc=0 asserted BEFORE every red,
+  predicate-disable/substitution style only (no deletion mutation that could
+  break the build into a false red); each reds its named test with a real
+  `--- FAIL:` line and a confirmed `=== RUN` count.
+- **File(s)**: pkg/config/compiler_services.go,
+  pkg/config/compiler_nat_source.go, pkg/config/compiler_routing.go,
+  pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_validate_strict_routing.go,
+  pkg/config/compiler_uniformgates_log_feed_routing.go,
+  pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
+  pkg/eventengine/classify_plan_empty_command_6673_test.go,
   docs/config-schema.md, _Log.md

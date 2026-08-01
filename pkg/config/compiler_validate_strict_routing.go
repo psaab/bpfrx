@@ -208,14 +208,41 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 	if len(refs) == 0 && cfg.RoutingOptions.ForwardingTableExport != "" {
 		refs = []string{cfg.RoutingOptions.ForwardingTableExport}
 	}
+	// #6715: the consequence is per VALUE, exactly as on the static-NAT side
+	// (emitMatchAddr, compiler_validate_strict_nat.go). Widening this gate to
+	// every authored value let a NON-rendering token reach a message that only
+	// the RENDERING one earns: resolveECMP looks up
+	// cfg.RoutingOptions.ForwardingTableExport, so with `export [ p1 nosuch ]`
+	// the dangling `nosuch` is inert while `p1` renders and ECMP resolves —
+	// "load-balancing would be silently disabled" is simply false there. Master
+	// could not hit this because it only ever passed the scalar. Decide which
+	// value the reference is before naming the consequence.
+	selected := cfg.RoutingOptions.ForwardingTableExport
 	for _, ref := range refs {
-		if err := checkPolicyRef(
+		err := checkPolicyRef(
 			"routing-options forwarding-table export",
 			ref,
 			hintExport,
-		); err != nil {
+		)
+		if err == nil {
+			continue
+		}
+		switch {
+		case ref == selected:
 			return fmt.Errorf("%s (the expected ECMP / consistent-hash "+
 				"load-balancing would be silently disabled)", err)
+		case selected == "":
+			// The selected slot is an authored blank (`export [ "" nosuch ]`),
+			// so nothing renders and there is no surviving policy to name —
+			// the same empty-selection case emitMatchAddr handles.
+			return fmt.Errorf("%s (this value is not the one the forwarding "+
+				"table renders — the selected forwarding-table export is EMPTY, "+
+				"so no ECMP policy is configured at all; correct or remove the "+
+				"undefined policy)", err)
+		default:
+			return fmt.Errorf("%s (this value is not the one the forwarding "+
+				"table renders — %q is, and it still resolves; correct or "+
+				"remove the undefined policy)", err, selected)
 		}
 	}
 
@@ -239,8 +266,10 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 //
 // Strict on commit / commit-check (hard reject); the call site downgrades to a
 // warning on the tolerant load / peer-sync path (#1960 no-brick), where
-// ForwardingTableExport still carries the first policy so rendering is exactly
-// pre-#6659.
+// ForwardingTableExport still carries the SELECTED policy so rendering is
+// exactly pre-#6659. "Selected", not "first": across two top-level
+// `routing-options` roots the last root wins (#6673), which is why the error
+// below quotes cfg.RoutingOptions.ForwardingTableExport rather than exports[0].
 func validateForwardingTableExportSingleStrict(cfg *Config) error {
 	if cfg == nil {
 		return nil

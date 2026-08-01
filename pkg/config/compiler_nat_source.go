@@ -192,13 +192,32 @@ func compileNAT(node *Node, sec *SecurityConfig) error {
 //     (the lexer strips `[`/`]`, so the list collapses onto ONE node's Keys)
 //   - block       `address { 192.0.2.1; .2; }`    → one child leaf per address
 //
-// It differs from firewallMatchValues in exactly one way: it SKIPS a `to` child.
+// It differs from firewallMatchValues in exactly one way: it SKIPS a `to` token.
 // The caller handles `address <low> to <high>` ranges in two earlier branches,
-// but those `continue` only on a WELL-FORMED range; a malformed one (a `to`
-// child with an empty endpoint) falls through to here, and a plain
-// firewallMatchValues would then contribute the literal token "to" as an
-// address, which would be appended as "to/32". Skipping it preserves the
-// pre-#6659 behaviour for that malformed shape (one address, no bogus entry).
+// but those `continue` only on a WELL-FORMED range; a malformed one — a `to`
+// child with an empty endpoint, or a bracket that leads with the keyword
+// (`address [ to 192.0.2.1 ]`) — falls through to here, where `to` is grammar,
+// not an address, and a plain firewallMatchValues would append it as "to/32".
+//
+// #6673: what the skip does, stated exactly, because the claim it used to carry
+// — that it "preserves the pre-#6659 behaviour" — is false. Master read this
+// leaf with nodeVal and installed the KEYWORD: verified against origin/master,
+// `address [ to 192.0.2.1 ]`, `address { to; }` and `address { to; 192.0.2.5; }`
+// each compiled to exactly ["to/32"]. Head compiles them to ["192.0.2.1/32"],
+// [] and ["192.0.2.5/32"]. That is a deliberate behaviour CHANGE, and a
+// harmless one: netip.ParsePrefix("to/32") fails, so the installer
+// (pkg/dataplane/proxyarp.go) logged a bounded warning and skipped the entry.
+// Master authored an inert entry; head does not author it.
+//
+// The skip is load-bearing for a different reason than the one it claimed.
+// #6659 widened this read AND added validateProxyARPAddressesStrict, which
+// parses every value with the installer's own netip.ParsePrefix. Drop the skip
+// and "to/32" MATERIALISES into Addresses, where that validator HARD-REJECTS at
+// strict commit a config master accepted — an invented rejection, which is the
+// one outcome #6673 holds constant across this whole class. The skip keeps the
+// accept/reject verdict identical to master while discarding only a token the
+// dataplane could never have installed. Pinned by
+// TestProxyARPAddresses6673ToKeywordIsNotAnAddressAndDoesNotInventARejection.
 func proxyARPAddressValues(prop *Node) []string {
 	var vals []string
 	for _, k := range prop.Keys[1:] {

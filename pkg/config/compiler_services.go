@@ -1780,12 +1780,12 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 // Dropping the constraints is a FAIL-OPEN: an event policy with no
 // attributes-match fires on every occurrence of the event rather than the
 // narrower set the operator wrote. It also bypassed
-// validateEventAttributesMatch — a packed-leaf expression naming an unknown
+// ValidateEventAttributesMatchStrict — a packed-leaf expression naming an unknown
 // field committed clean because the compiler never produced it.
 // #6673: an authored-but-EMPTY expression is kept, not skipped. Before #6659
 // the block spelling appended strings.Join(amChild.Keys, " ") unconditionally,
 // so `attributes-match { ""; e1.owner matches X; }` produced an "" entry and
-// validateEventAttributesMatch HARD-REJECTED it at strict commit as a malformed
+// ValidateEventAttributesMatchStrict HARD-REJECTED it at strict commit as a malformed
 // match expression. Filtering it out silently accepted that config instead —
 // converting a fail-CLOSED commit gate into a fail-OPEN one, which is the exact
 // defect class this arm was widened to fix. The packed spelling now behaves the
@@ -1793,16 +1793,24 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 // rejected too; the tolerant load / peer-sync path downgrades both to a warning
 // and still boots. A bare `attributes-match;` carrying no value slot at all
 // remains "no constraint authored" and is untouched.
+//
+// Stored VERBATIM — deliberately no strings.TrimSpace. The lexer preserves
+// whitespace INSIDE a quoted token, so master's BLOCK spelling compiled the
+// padded form and so does this (the packed spelling, which master dropped
+// entirely, now matches it). Trimming is invisible to the matcher
+// (ParseEventAttributesMatch trims each field it splits out) but rewrites the
+// persisted config, `show event-options`, and the malformed-expression
+// diagnostic. Readers report authored values; they do not normalise them.
 func eventAttributesMatchExprs(child *Node) []string {
 	var exprs []string
 	// Packed leaf: the tail tokens form exactly ONE expression. Emitted
 	// whenever a value slot exists, even if the expression is empty.
 	if len(child.Keys) > 1 {
-		exprs = append(exprs, strings.TrimSpace(strings.Join(child.Keys[1:], " ")))
+		exprs = append(exprs, strings.Join(child.Keys[1:], " "))
 	}
 	// Block / flat-set: one expression per child.
 	for _, amChild := range child.Children {
-		exprs = append(exprs, strings.TrimSpace(strings.Join(amChild.Keys, " ")))
+		exprs = append(exprs, strings.Join(amChild.Keys, " "))
 	}
 	return exprs
 }
@@ -1828,26 +1836,36 @@ func eventAttributesMatchExprs(child *Node) []string {
 //
 // A child boundary and a tail-token boundary are different things, so the two
 // rules do not conflict.
-// #6673: an authored-but-EMPTY command is kept, not skipped, for the same
-// reason as eventAttributesMatchExprs above. Before #6659 the block spelling
-// appended cmdChild.Name() unconditionally, so `commands { ""; "set system
-// host-name foo"; }` produced an "" entry and the event engine
-// (pkg/eventengine/engine.go) refused the WHOLE remediation batch, because every
-// command must carry the "set " prefix. Filtering the empty entry out would run
-// the rest of the batch instead — a partially-applied configuration change the
-// operator never got under master, from a batch master declined outright.
-// Keeping it preserves that fail-closed behaviour and gives the packed spelling
-// the same one. A `commands;` with no value slot still contributes nothing.
+// #6673: an authored-but-EMPTY command is kept, not skipped — but for a
+// DIFFERENT reason than eventAttributesMatchExprs above, and the obvious guess
+// is wrong. Before #6659 the block spelling appended cmdChild.Name()
+// unconditionally, so `commands { ""; "set system host-name foo"; }` compiled
+// to ["", "set …"]. Keeping the entry is OUTPUT PARITY with that, NOT a
+// fail-closed gate: unlike attributes-match, nothing downstream rejects an empty
+// command. eventengine.classifyPlan opens with `cmd = strings.TrimSpace(cmd);
+// if cmd == "" { continue }` — present since the engine's first commit — so it
+// is SKIPPED and the batch yields the same typed plan either way (driven
+// directly: ["", "set …"] gives ok=true, one op). It is still not unobservable,
+// which is why this reader must not decide it away: policySemanticRevision
+// hashes EVERY ThenCommands entry (authoring or removing the empty re-arms the
+// policy, exactly as on master) and `show event-options` prints the list
+// verbatim (pkg/cli/cli_show_routing.go, pkg/grpcapi/server_show_events.go).
+// Filtering would diverge the compiled policy from master's on both surfaces
+// while changing nothing about what the batch executes; whether an empty command
+// is meaningless is the consumer's call, and the consumer already makes it.
+// Commands are likewise stored VERBATIM — no TrimSpace, same reasoning,
+// classifyPlan trims them itself. A `commands;` with no value slot still
+// contributes nothing.
 func eventChangeConfigCommands(cmdsNode *Node) []string {
 	var cmds []string
 	// Packed: each trailing token is one complete (quoted) command.
 	for _, k := range cmdsNode.Keys[1:] {
-		cmds = append(cmds, strings.TrimSpace(k))
+		cmds = append(cmds, k)
 	}
 	// Block: each child is one command; join its Keys so an unquoted command
 	// survives whole instead of truncating to its first word.
 	for _, cmdChild := range cmdsNode.Children {
-		cmds = append(cmds, strings.TrimSpace(strings.Join(cmdChild.Keys, " ")))
+		cmds = append(cmds, strings.Join(cmdChild.Keys, " "))
 	}
 	return cmds
 }
