@@ -74060,3 +74060,24 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/config/compiler_system_login_packed_6662_test.go,
   pkg/config/compiler_opts.go, pkg/config/compiler_prewalk.go,
   docs/system-login.md, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-08-01 (round 2)
+- **Action**: #6706 self-audit against the over-reach / precedence vectors.
+  Found and fixed a regression of my own (uid 0 LISTED WITH NO CLASS resolved to
+  `unauthorized`, demoting the console root shell on an ordinary additive
+  `user root authentication ssh-ed25519` stanza — a lockout of the lifeline);
+  a permissive-direction miss (uid 0 resolving through a passwd alias such as
+  `toor` silently skipped an explicit `user root class <c>`); and a VACUOUS test
+  of my own (`TestUnauthorizedClassCannotBeWidened_6701` built a Config by hand
+  with a nil store, so resolveClassPerms never read it — it stayed GREEN when
+  built-in precedence was inverted). The vacuous test was found by mutation
+  M15, not by reading; rewritten to drive Store.SyncApply (the real tolerant
+  ingress) with a premise check on the compiled struct. Also verified
+  apply-groups coverage (the gate runs post-expansion; applied bodies rejected,
+  nested still compiles) and corrected an overclaimed scope note: the
+  unapplied-group assertion holds STRUCTURALLY (ExpandGroups deletes the groups
+  stanza before the gate runs) and is not mutation-bound, so it is now labelled
+  documentation rather than a guard.
+- **File(s)**: pkg/cli/identity.go, pkg/cli/identity_6701_test.go,
+  pkg/config/compiler_system_login_packed_6662_test.go, docs/system-login.md,
+  _Log.md
