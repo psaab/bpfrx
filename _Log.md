@@ -1,3 +1,42 @@
+## 2026-08-01 — #5619 PR1 round 2: prove the exclusion changes nothing
+
+- **Timestamp**: 2026-08-01 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Review conditions on the reshape. "Net forwarding behaviour is
+  identical before and after" was the load-bearing claim and was asserted in
+  prose; it is now proven by DIFFERENTIAL tests on both planes — the same
+  config/candidate list is built twice, with and without the route-based VPN,
+  and the ingress-adjudication set, the RSS allowlist and the AF_XDP binding
+  plan must come out byte-identical. Both differentials assert the tunnel row
+  is RESOLVED first, so neither can be satisfied by the pre-fix ifindex-0
+  accident.
+
+  Exclusion scope stated rather than implied: a BASE-name match (unit stripped)
+  against `st` + numeric remainder. Covers `st0`, `st0.0`, `st10.5`; does NOT
+  cover `stx` / `start0`, which stay adjudicated — over-matching would silently
+  drop a real data interface out of adjudication.
+
+  MTU/addresses now asserted rather than riding along: a secure-tunnel unit
+  reported MTU 0 and no live addresses because it resolved to the nonexistent
+  netdev `st0`.
+
+  Mutation matrix extended to 6 rows with a `go vet` gate added alongside the
+  two build gates. Row 3 reds the Rust arm alone and row 2 the Go arm, so each
+  exclusion arm is independently bound. Row 5 mutates the OTHER resolver
+  (`ResolveKernelIfName`) and reds `parity` ALONE — the parity guard binds
+  DIVERGENCE symmetrically, not merely the absence of the rule on one side.
+  Row 6 resolves to a wrong-but-plausible netdev and reds the MTU/address
+  guard, so it binds the real device rather than "the name changed".
+
+  Filed #6700 for the remaining work with the evidence verbatim: the AF_XDP
+  bind on a virtual netdev (1 RX queue, no ndo_bpf/ndo_xsk_wakeup) AND the
+  reverse direction — LAN->tunnel egress needs the dataplane to hand plaintext
+  INTO the xfrmi for kernel encryption, which is a new egress mechanism, not a
+  config change.
+- **File(s)**: pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go,
+  userspace-dp/src/server/helpers/planning.rs, userspace-dp/src/main_tests.rs,
+  _Log.md
+
 ## 2026-08-01 — #5619 PR1: secure-tunnel netdev name drift + explicit dataplane exclusion
 
 - **Timestamp**: 2026-08-01 (fix/5619-ipsec-passthrough-zone-policy)

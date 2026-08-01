@@ -2494,3 +2494,76 @@ fn binding_candidate_excludes_secure_tunnel() {
         "the ordinary data interface must still be planned"
     );
 }
+
+/// #5619: adding a secure tunnel must leave the binding PLAN byte-identical.
+///
+/// The Go half of this differential lives in
+/// `TestSecureTunnelAddsNothingToDataplaneSets`
+/// (pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go), which pins the
+/// ingress-adjudication set and the RSS allowlist. This is the binding-plan
+/// half: the same candidate list is planned twice, once with a RESOLVED
+/// secure-tunnel row and once without it, and the produced layout must be
+/// identical — same slots, same queue ids, same interfaces.
+///
+/// The premise matters as much as the result. The tunnel row carries a real
+/// netdev name and a real ifindex, i.e. it is the row as it appears AFTER the
+/// #5619 name fix. Were it the pre-fix row (linux_name "st0", ifindex 0) the
+/// two plans would match for the old accidental reason and this would prove
+/// nothing.
+#[test]
+fn secure_tunnel_adds_nothing_to_the_binding_plan() {
+    use crate::server::helpers::replan_queues;
+
+    let lan = InterfaceSnapshot {
+        name: "ge-0/0/1".to_string(),
+        linux_name: "ge-0-0-1".to_string(),
+        zone: "trust".to_string(),
+        ifindex: 11,
+        rx_queues: 2,
+        ..Default::default()
+    };
+    let tunnel = InterfaceSnapshot {
+        name: "st0.0".to_string(),
+        linux_name: "st0.0".to_string(),
+        zone: "vpn".to_string(),
+        ifindex: 42,
+        rx_queues: 1,
+        ..Default::default()
+    };
+    // PREMISE: this is the POST-fix row — resolved name, real ifindex.
+    assert_eq!(tunnel.linux_name, "st0.0");
+    assert!(tunnel.ifindex > 0);
+
+    let with_tunnel = ConfigSnapshot {
+        interfaces: vec![lan.clone(), tunnel],
+        ..Default::default()
+    };
+    let without_tunnel = ConfigSnapshot {
+        interfaces: vec![lan],
+        ..Default::default()
+    };
+
+    let got = replan_queues(Some(&with_tunnel), 2, &[]);
+    let want = replan_queues(Some(&without_tunnel), 2, &[]);
+
+    assert!(
+        !want.is_empty(),
+        "premise broken: the ordinary data interface must still be planned, \
+         otherwise this differential is vacuous"
+    );
+    let key = |bindings: &[BindingStatus]| -> Vec<(u32, u32, String)> {
+        bindings
+            .iter()
+            .map(|b| (b.slot, b.queue_id, b.interface.clone()))
+            .collect()
+    };
+    assert_eq!(
+        key(&got),
+        key(&want),
+        "adding a route-based IPsec secure tunnel CHANGED the binding plan. The \
+         xfrmi must add nothing: an XSK cannot come up on a virtual netdev (no \
+         ndo_bpf / ndo_xsk_wakeup, so no zero-copy), so a binding planned for it \
+         would never go READY and the shim would drop the decrypted plaintext \
+         (#5619)"
+    );
+}
