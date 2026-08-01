@@ -458,7 +458,8 @@ id just handed out. The duplicate stays inside the namespace, so nothing downstr
 looks wrong — uniqueness just silently stops holding. The wrap is reachable rather
 than theoretical, because the seed itself consumes counter space and the distance to
 the boundary depends on uptime phase. Ringing is the right behaviour there: a wrap
-re-mints only ids this incarnation issued 2^48 conversions ago, or ids from an
+re-mints only ids this incarnation issued 2^48-1 conversions ago (the ring skips
+the zero counter, so 2^48-1 values are usable, not 2^48), or ids from an
 incarnation whose entries are long gone. Refusing to mint would be worse — the id is
 display-only, but the conversion carrying it installs an HA-synced session, so
 failing it to protect a display field would trade a cosmetic alias for lost sessions

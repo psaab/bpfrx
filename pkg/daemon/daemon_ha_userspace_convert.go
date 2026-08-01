@@ -67,17 +67,27 @@ const userspaceSyncedSessionIDCounterMask = uint64(0x0000_FFFF_FFFF_FFFF)
 // right to seed the counter. 2^10 ns ≈ 1.024 µs of seed granularity, which sets
 // both properties that matter:
 //
-//   - Two incarnations collide only if their first allocations land within the
-//     same 1.024 µs. A daemon restart is milliseconds at the very least (process
-//     teardown, exec, init), so the window is unreachable by three orders of
-//     magnitude. Seeding at SECOND resolution — the first cut of this fix — left
-//     a window of up to a full second, which systemd's `RestartSec=1` lands
-//     squarely inside.
-//   - The seed advances ~976,562 per second of uptime, so a restarting
-//     incarnation starts above its predecessor's high-water mark unless that
-//     predecessor averaged more than ~976k synced conversions per second. That is
-//     well above what the dataplane produces, and it is an AVERAGE over the
-//     predecessor's whole lifetime, not a peak.
+//   - Two incarnations share the same SEED only if their first allocations land
+//     in the same aligned 1.024 µs bucket. A daemon restart is milliseconds at
+//     the very least (process teardown, exec, init), so that window is
+//     unreachable by three orders of magnitude. Seeding at SECOND resolution —
+//     the first cut of this fix — left a window of up to a full second, which
+//     systemd's `RestartSec=1` lands squarely inside.
+//   - Distinct seeds are necessary but not sufficient: two incarnations can still
+//     overlap by RANGE. The seed advances ~976,562 per second, so a successor
+//     seeded t nanoseconds later starts (t >> 10) values above its predecessor,
+//     and the ranges overlap once the predecessor mints more than that many ids.
+//     At a 1 ms gap that is only ~976 ids. What makes overlap unreachable in
+//     practice is the ratio: sustaining it needs an average above ~976k synced
+//     conversions per second, far above what the dataplane produces.
+//
+// Be precise about the interval that average is taken over. Seeding is LAZY
+// (sync.Once on the first allocation), so both endpoints are FIRST ALLOCATIONS,
+// not process starts — the averaging interval begins when the predecessor first
+// minted an id, not when it booted. An incarnation that idles for a long time
+// and then mints just before being replaced gets only the teardown/restart gap
+// of headroom, not its whole lifetime. Conversely, delay before the successor's
+// first allocation widens the gap.
 //
 // The 48-bit seed space covers 2^58 ns ≈ 9.1 years of uptime before it cycles;
 // a cycle can only alias ids from an incarnation that old.
@@ -135,7 +145,8 @@ var (
 //
 // The wrap itself is reachable, not theoretical: the seed consumes counter space,
 // so the distance to it depends on uptime phase. A wrap only re-mints ids this
-// incarnation issued 2^48 conversions ago, or ids from an incarnation whose
+// incarnation issued 2^48-1 conversions ago (the ring skips the zero counter,
+// so 2^48-1 values are usable, not 2^48), or ids from an incarnation whose
 // entries are long gone — so the ring is the right behaviour. Refusing to mint
 // would be worse: this id is display-only, but the conversion that carries it
 // installs an HA-synced session, and failing that to protect a display field
