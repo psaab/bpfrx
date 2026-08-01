@@ -58,11 +58,14 @@ func (m *Manager) StartHeartbeat(localAddr, peerAddr, vrfDevice string) error {
 	threshold := m.hbThreshold
 	m.mu.Unlock()
 
-	// #6169: restore the durable peer epoch floor BEFORE the receiver can admit
-	// a frame (a gap here lets a replay re-anchor a low floor), and give this
-	// node's own boot epoch a bounded chance to resolve before the sender's
-	// first send (a latched peer refuses epochless frames). Both are once per
-	// process, so a routine VRF-rebind restart pays neither.
+	// #6169: kick this node's boot-epoch resolution. This MUST NOT BLOCK —
+	// StopHeartbeat() above has already torn the heartbeat down, so any wait
+	// here is a window with no frames going out at all, which a peer cannot
+	// tell apart from a dead node. An earlier revision waited up to 2s for the
+	// persisted value and measured 2.005s/2.012s/2.011s against a 500ms
+	// dead-peer threshold under a wedged store. It buys nothing now: the
+	// wall-clock epoch is published synchronously before any I/O, so the frame
+	// already carries one and persistence catches up off-path.
 	m.initHeartbeatEpochState()
 
 	// Select the UDP network from the control-link address family so a v6

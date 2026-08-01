@@ -621,35 +621,91 @@ func TestEpochPlausibleBound_6169(t *testing.T) {
 	}
 }
 
-// TestHeartbeatBootEpochResolvesAsync_6169 pins that the epoch is resolved off
-// the send path. Resolution fsyncs; doing it inline would block the 100ms send
-// loop on a wedged disk and cause the very failover the mechanism protects
-// against. Until it resolves, the sender advertises no epoch (0).
-func TestHeartbeatBootEpochResolvesAsync_6169(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "ha-boot-epoch")
-	orig := bootEpochPath
-	bootEpochPath = path
-	t.Cleanup(func() { bootEpochPath = orig })
+// TestHeartbeatBootEpochRefinementCompletes_6169 observes the persistence
+// refinement actually running.
+//
+// This test previously polled until heartbeatBootEpoch returned non-zero. Once
+// the epoch was published synchronously — the correct fix for the storage-hang
+// finding — that loop exited on its first iteration and the test stopped
+// exercising the thing its name claims. It kept passing and guarded nothing.
+// The same fix also invalidated its other assertion: it required the epoch to
+// be STABLE across calls, but refinement legitimately RAISES it after a
+// backward clock step, so that had become a false claim rather than a weak one.
+//
+// It now joins the worker and checks both halves of the real contract: with no
+// refinement needed the published value is untouched and reaches disk, and with
+// one needed the value is raised.
+func TestHeartbeatBootEpochRefinementCompletes_6169(t *testing.T) {
+	t.Run("no_refinement_needed_value_persists_unchanged", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "ha-boot-epoch")
+		orig := bootEpochPath
+		bootEpochPath = path
+		t.Cleanup(func() { bootEpochPath = orig })
 
-	m := NewManager(0, 42)
-	m.heartbeatBootEpoch() // kicks the async resolve
-	deadline := time.Now().Add(5 * time.Second)
-	var got uint64
-	for time.Now().Before(deadline) {
-		if got = m.heartbeatBootEpoch(); got != 0 {
-			break
+		m := NewManager(0, 42)
+		published := m.heartbeatBootEpoch()
+		if published == 0 {
+			t.Fatal("no epoch published synchronously")
 		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	if got == 0 {
-		t.Fatal("boot epoch never resolved")
-	}
-	// Stable across calls — one epoch per daemon incarnation.
-	for i := 0; i < 10; i++ {
-		if again := m.heartbeatBootEpoch(); again != got {
-			t.Fatalf("boot epoch changed within one incarnation: %d then %d", got, again)
+		// JOIN the worker rather than polling for a value that is already set —
+		// this is what makes the test observe the refinement at all, and it also
+		// keeps the worker from outliving t.TempDir.
+		select {
+		case <-m.bootEpochReady:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the refinement worker never completed")
 		}
-	}
+
+		// It ran: the epoch reached disk.
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("refinement did not persist the epoch: %v", err)
+		}
+		onDisk, perr := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64)
+		if perr != nil {
+			t.Fatalf("persisted value unparseable: %q", raw)
+		}
+		// Nothing to raise against, so the published value is unchanged and is
+		// exactly what was recorded.
+		if final := m.heartbeatBootEpoch(); final != published {
+			t.Fatalf("epoch changed with no refinement needed: %d then %d", published, final)
+		}
+		if onDisk != published {
+			t.Fatalf("persisted %d, want the published %d", onDisk, published)
+		}
+	})
+
+	t.Run("refinement_raises_after_a_backward_clock_step", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "ha-boot-epoch")
+		// A persisted value ahead of now models a clock that has since stepped
+		// back below the last epoch — the one case persistence exists for.
+		ahead := uint64(time.Now().Add(30 * time.Minute).UnixNano())
+		if err := os.WriteFile(path, []byte(strconv.FormatUint(ahead, 10)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		orig := bootEpochPath
+		bootEpochPath = path
+		t.Cleanup(func() { bootEpochPath = orig })
+
+		m := NewManager(0, 42)
+		published := m.heartbeatBootEpoch()
+		select {
+		case <-m.bootEpochReady:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the refinement worker never completed")
+		}
+		final := m.heartbeatBootEpoch()
+		if final <= published {
+			t.Fatalf("refinement did not raise the epoch: published %d, final %d "+
+				"(persisted %d) — the backward-clock-step protection did not run",
+				published, final, ahead)
+		}
+		if final != ahead+1 {
+			t.Fatalf("refined epoch = %d, want %d (persisted+1)", final, ahead+1)
+		}
+	})
 }
 
 // TestBootEpochNeverBlocksOnStorage_6169 is the fail-on-revert gate for the

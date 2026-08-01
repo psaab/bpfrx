@@ -66486,3 +66486,29 @@ break — `go vet` confirmed passing under every revert.
   and concludes it was oversold.
 - **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/heartbeat_epoch_test.go,
   pkg/cluster/heartbeat_epoch_latch_test.go, pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-02 01:30
+- **Action**: #6169 — the doc sweep's own blind spot, plus a test my fix made
+  vacuous. NEW-1/NEW-2 were already fixed in 7f14a7cd0 (both reviews read stale
+  heads). But my NEW-1 commit did NOT touch heartbeat_manager.go, so the comment
+  sitting DIRECTLY on the defect survived — it still said "restore the durable
+  peer epoch floor" (deleted) and "Both are once per process, so a routine
+  VRF-rebind restart pays neither" (measurably false under the exact failure the
+  wait existed for). Missed because the handed-down grep alternation
+  (`durable floor|persisted floor|primeEpochFloor|made durable|peer-epoch-floor`)
+  does not match "durable peer epoch floor" — a COUNT derived from a grep carries
+  that grep's blind spot downstream, twice in this PR. Re-swept from SIX
+  independent angles (`durable.*floor`, `fails? open`, `state files`,
+  `epoch.*floor`, `once per process`, `restore the`) and found two MORE:
+  README's lock bullet said "both state files" (there is one) and "It fails OPEN"
+  (the code SKIPS — the exact rationale I replaced, still standing as the live
+  description three lines below the correct one), and the #5086 section still
+  claimed the floor and latch are DURABLE. All four fixed. Codex finding 4:
+  publishing the epoch synchronously silently removed the condition
+  `TestHeartbeatBootEpochResolvesAsync_6169` polled on, so it exited on iteration
+  0 and guarded nothing — and its "stable across calls" assertion had become a
+  FALSE claim, since refinement legitimately raises the epoch after a backward
+  clock step. Rewritten to join the worker and assert both halves of the real
+  contract; mutation 19 (refinement no-op) reds both subtests.
+- **File(s)**: pkg/cluster/heartbeat_manager.go, pkg/cluster/heartbeat_epoch_test.go,
+  pkg/cluster/README.md, _Log.md

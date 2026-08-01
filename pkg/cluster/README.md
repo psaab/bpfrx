@@ -451,15 +451,26 @@ peer liveness (`lastSeen`) or drive election.
     is only reachable if this node's own clock was the wrong one when it
     persisted — in which case the peer refused and never latched it, so nothing
     is locked out. A recoverable regression beats an unrecoverable lockout.
-  - **Cross-process locking on both state files.** Nothing in xpf enforces a
-    single daemon instance — there is no pidfile, and the gRPC listener sets
-    `SO_REUSEPORT` (`pkg/grpcapi/server.go`), so a second `xpfd` does NOT fail
-    on a port collision the way it otherwise would. Two overlapping incarnations
-    could therefore interleave read-modify-write and publish epochs that are not
+  - **Cross-process locking on the boot-epoch file** (the only epoch state file
+    — there is no peer-floor file). Nothing in xpf enforces a single daemon
+    instance: there is no pidfile, and the gRPC listener sets `SO_REUSEPORT`
+    (`pkg/grpcapi/server.go`), so a second `xpfd` does NOT fail on a port
+    collision the way it otherwise would. Two overlapping incarnations could
+    therefore interleave read-modify-write and publish epochs that are not
     strictly ordered, which is the one property the whole mechanism rests on. An
     advisory `flock` on a sidecar file (`withEpochFileLock`) serializes the whole
-    read-modify-write, not merely the write. It fails OPEN: a node that cannot
-    lock must not become a node that cannot heartbeat.
+    read-modify-write, not merely the write.
+
+    **It fails CLOSED — the write is SKIPPED, not run unlocked.** Proceeding
+    unlocked does not trade correctness for liveness; it trades a TRANSIENT
+    liveness risk for a DURABLE one. A raced read-modify-write can leave a lower
+    epoch in the file, that value is read back as `prev` on the next boot, and it
+    is exactly the term that matters after a backward clock step — the one case
+    persistence exists for. The epoch then produced can sit below the peer's
+    latched floor and be refused: the same false-peer-death, one restart later
+    and durable. Declining costs only backward-clock-step protection, and only
+    until the next resolve succeeds, because the wall-clock epoch is already
+    published and on the wire.
   - **Layering with #4107's `peerAuthSeen` — two gates, neither redundant.**
     `peerAuthSeen` latches "the peer proved it holds the PSK" and refuses
     UNSIGNED frames; `epochSeen` latches "the peer proved it runs an
@@ -582,12 +593,13 @@ peer liveness (`lastSeen`) or drive election.
   restart window (a VRF-rebind restart retries the bind for up to ~5 s)
   and an unsigned fabric RPC was accepted from a peer already known to
   hold the key. It now reads the process-lifetime state.
-  **Closed by #6169 for a keyed cluster:** the session ring is still in
-  memory, so a full daemon restart starts with an empty ring — but the
-  boot-epoch floor and its downgrade latch are DURABLE, so the restarted
-  node still refuses both a retired incarnation (below the restored floor)
-  and an epochless pre-upgrade capture (the latch). The ring no longer has
-  to carry that case alone.
+  **Narrowed, not closed, by #6169:** the session ring, the boot-epoch floor
+  and the downgrade latch are all process state, so a full daemon restart
+  starts with all three empty. What #6169 changes is how fast that repairs:
+  the peer's next epoch-bearing frame re-establishes the floor above every
+  captured older epoch and re-arms the latch, so the exposure is bounded by
+  the peer speaking rather than by the ring alone. With a SILENT peer the
+  window stays open until it returns — see the boot-epoch residuals above.
 - **Dual-accept (rolling upgrade), `heartbeatAuthDecision`.** Mirrors
   the #4126 VRRP-checksum dual-accept migration:
   - No local key → accept everything (this node cannot verify; may be
