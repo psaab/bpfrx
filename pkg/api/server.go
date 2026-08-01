@@ -100,15 +100,26 @@ type Config struct {
 	// nil defaults to net.Listen; a test injects a fake so the
 	// make-before-break listener reconcile is exercised without real ports.
 	ListenFunc func(network, address string) (net.Listener, error)
-	Store      *configstore.Store
-	DP         apiRuntimeDataPlane
-	EventBuf   *logging.EventBuffer
-	GC         *conntrack.GC
-	Routing    *routing.Manager
-	FRR        *frr.Manager
-	IPsec      *ipsec.Manager
-	DHCP       *dhcp.Manager
-	VRRPMgr    *vrrp.Manager // native VRRP manager
+	// PeerUIDFn resolves the UID owning the peer end of an accepted
+	// connection, for the #5561 server-side authorization gate. `client` is
+	// the connection's remote address and `server` its local address. nil
+	// defaults to authz.PeerUID, the kernel socket-table lookup.
+	//
+	// It is a seam, not a mock: a test injects a fixed UID so the route
+	// table and the class evaluation are exercised for a principal the test
+	// chooses, instead of only for whichever account happens to run the
+	// suite. The kernel lookup itself is covered against real sockets in
+	// pkg/authz.
+	PeerUIDFn func(client, server net.Addr) (uint32, error)
+	Store     *configstore.Store
+	DP        apiRuntimeDataPlane
+	EventBuf  *logging.EventBuffer
+	GC        *conntrack.GC
+	Routing   *routing.Manager
+	FRR       *frr.Manager
+	IPsec     *ipsec.Manager
+	DHCP      *dhcp.Manager
+	VRRPMgr   *vrrp.Manager // native VRRP manager
 	// #846: atomic commit+apply callbacks. The daemon holds its
 	// apply semaphore across configstore.Commit and applyConfig, so
 	// two concurrent committers can't interleave their commit→apply
@@ -321,7 +332,9 @@ type Server struct {
 	// listen is the listener factory (#5866): Config.ListenFunc or net.Listen. A
 	// test injects a fake so the make-before-break reconcile is exercised without
 	// binding real ports.
-	listen                           func(network, address string) (net.Listener, error)
+	listen func(network, address string) (net.Listener, error)
+	// peerUIDFn is Config.PeerUIDFn; nil means authz.PeerUID (#5561).
+	peerUIDFn                        func(client, server net.Addr) (uint32, error)
 	store                            *configstore.Store
 	dp                               apiRuntimeDataPlane
 	eventBuf                         *logging.EventBuffer
@@ -453,6 +466,9 @@ func NewServer(cfg Config) *Server {
 	if s.listen == nil {
 		s.listen = net.Listen
 	}
+	// #5561: the peer-UID resolver behind the authorization gate. nil means
+	// the real kernel socket-table lookup (authz.PeerUID).
+	s.peerUIDFn = cfg.PeerUIDFn
 
 	mux := http.NewServeMux()
 
@@ -569,7 +585,15 @@ func NewServer(cfg Config) *Server {
 	// request that clears auth then hits this guard, so an attacker holding
 	// ambient Basic credentials is still blocked from driving a state change from
 	// a cross-site page. Safe methods and header-key/Bearer clients are unaffected.
-	sharedBase := mutationCrossSiteGuard(mux)
+	// #5561: enforce per-principal authorization on every state-changing route
+	// INSIDE the cross-site guard, so the order a mutation is evaluated in is
+	// (1) is this request cross-site provenance, (2) does the listener's
+	// api-auth policy admit it, (3) is the CALLER allowed to perform this
+	// action. Steps 1 and 2 are properties of the request; step 3 is the first
+	// one that asks who is making it. It sits inside the auth middleware
+	// (applied per listener in listenerHandler) because a valid api-auth
+	// credential is one of the identities it considers.
+	sharedBase := mutationCrossSiteGuard(s.mutationAuthzGuard(mux))
 	// #4162: auth policy belongs to the listener that accepted the request.
 	// Keep one mux/collector/CSRF base so HTTP and HTTPS share the scrape
 	// limiter and session-gauge cache, then derive an auth wrapper from each
@@ -622,6 +646,11 @@ func (s *Server) buildHTTPServer(addr string) *http.Server {
 		ReadTimeout:       apiReadTimeout,
 		IdleTimeout:       apiIdleTimeout,
 		MaxHeaderBytes:    apiMaxHeaderBytes,
+		// #5561: carry the accepted connection's typed addresses into every
+		// request context so the authorization gate can ask the kernel who
+		// owns the peer socket. http.Request exposes RemoteAddr as a string
+		// and does not expose the local address at all.
+		ConnContext: connContext,
 		// WriteTimeout intentionally unset — see the const block above (SSE
 		// streams + large scrapes must not be severed).
 	}
@@ -653,6 +682,8 @@ func (s *Server) buildHTTPSServer(addr string) (*http.Server, error) {
 		ReadTimeout:       apiReadTimeout,
 		IdleTimeout:       apiIdleTimeout,
 		MaxHeaderBytes:    apiMaxHeaderBytes,
+		// #5561: same peer-identity plumbing as the HTTP leg.
+		ConnContext: connContext,
 		// WriteTimeout intentionally unset — see the const block above.
 		TLSConfig: &tls.Config{
 			Certificates: []tls.Certificate{tlsCert},

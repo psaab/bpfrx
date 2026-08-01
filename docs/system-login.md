@@ -64,6 +64,35 @@ runtime RBAC table can never drift apart: adding a class in one place
 without the other is impossible. An empty/unset class keeps the legacy
 allow-everything behavior (no class configured = no RBAC restriction).
 
+### Where the class is enforced — per control surface (#5561)
+
+The class evaluator is shared (`config.ResolveClassPermissions` /
+`config.ClassHasPermission`), but each control surface must *call* it, and
+until #5561 only the CLI did. That mattered because a login user is a real
+shell account — the daemon creates each one with `useradd -m -s /bin/bash` —
+so the holder can bypass a CLI-side check simply by not using the CLI.
+
+| Surface | Enforcement |
+|---|---|
+| Console / SSH CLI | `checkPermission`, **client-side** — it runs in the CLI process, so it binds only callers who use the CLI. |
+| HTTP REST (`127.0.0.1:8080`) | **Server-side** since #5561: the mutation surface derives the caller's UID from the kernel socket table, maps it to this account, and evaluates the class before the handler runs. See `pkg/api/README.md` "Server-side authorization". |
+| gRPC (`127.0.0.1:50051`) | **Not yet enforced — #5278 is open.** The listener installs no per-principal check, so a login-class holder can still drive privileged RPCs directly. The shared layer (`pkg/authz`) is built for two consumers; the gRPC leg is an interceptor that derives the same principal and calls the same `authz.Authorize`. |
+
+On the REST surface the class is evaluated against a **server-derived**
+identity, so it is a real boundary rather than an advisory one:
+
+- The caller's UID comes from the kernel (INET_DIAG / `/proc/net/tcp`), not
+  from anything the request carries.
+- **UID 0 is authorized unconditionally** — root owns the config DB on disk, so
+  a denial would be theater.
+- A local UID that is **not** a configured `system login user` is **denied** the
+  mutation surface. Note the contrast with the CLI, where an unset class means
+  "no restriction": on a network-reachable API the absence of a class means the
+  RBAC model says nothing about that account, which is a reason to deny. Grant
+  it explicitly with `set system login user <account> class <class>` if it needs
+  access.
+- Read-only endpoints, `/health` and `/metrics` are unaffected.
+
 ### Custom login classes (accept-with-advisory, #4304 S-2)
 
 Real vSRX configs define their own RBAC classes:

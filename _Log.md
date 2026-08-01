@@ -305,6 +305,60 @@
   `pkg/config/compiler_chassis_packed_monitor_6588_test.go` (new),
   `docs/config-schema.md`, `_Log.md`
 
+## 2026-08-01 — #5561 REST config mutation endpoints had no per-principal auth
+
+- **Timestamp**: 2026-08-01 (fix/5561-rest-config-auth)
+- **Action**: Closed the RBAC bypass on the HTTP control surface. Every
+  state-changing route on `127.0.0.1:8080` — `config/set`, `config/load`,
+  the commit family, the clear verbs, diagnostics and `system/action` — now
+  requires a server-derived principal that holds the action's login-class
+  permission. Verified unfixed on `origin/master` 8a69bef9a first:
+  `dynamicAuthMiddleware` returns `next.ServeHTTP` unconditionally when
+  `s.auth.Load()` is nil, which is the default on a loopback bind.
+  **Identity.** The peer UID is read from the kernel socket table
+  (INET_DIAG via `netlink.SocketGet`, falling back to `/proc/net/tcp{,6}`),
+  resolved through `/etc/passwd` to an account name and then to a class via
+  `system login user <name> class`. `SO_PEERCRED` cannot answer for an
+  AF_INET listener, and moving the surface to a Unix socket would have cost
+  a new transport, config knob, packaging change and client migration for an
+  identity the kernel already exposes on the existing socket. **Only
+  `TCP_ESTABLISHED` is accepted**: the kernel reports UID 0 for a TIME_WAIT
+  mini-socket, so without the state check a caller that closes right after
+  writing the request is reported as root. That escalation was confirmed
+  empirically by mutation, not argued.
+  **Fail-closed shape.** The route table is an allow-list keyed on the exact
+  registered `"METHOD /path"`; a non-safe method with no entry is denied, so
+  a future POST route added without an entry is inert rather than open. UID 0
+  is authorized without consulting passwd or the config (root owns the config
+  DB; a config dependency would lock the operator out of a box that has not
+  loaded one). An api-auth credential remains a full-power principal, but a
+  peer UID that resolves to a login user outranks it, so a `read-only`
+  account holding the API password stays read-only.
+  **Blast radius.** One population changes: a non-root local UID that is not
+  a configured `system login user` and presents no credential. Nothing
+  in-tree is in it (the CLI speaks gRPC; deploy/day-0/harness tooling reads
+  `/metrics` only). Reads, `/health`, `/metrics` and the SSE streams are
+  untouched; a denial cannot brick a running box.
+  **Shared, not per-surface.** The decision lives in `pkg/authz` and the
+  class evaluator moved to `pkg/config` with `pkg/cli` delegating to it, so
+  #5278 (the same hole on gRPC) is a thin interceptor over the same
+  `authz.Authorize` rather than a second policy that drifts.
+- **File(s)**: `pkg/authz/authz.go` (new), `pkg/authz/peer.go` (new),
+  `pkg/authz/passwd.go` (new), `pkg/authz/authz_5561_test.go` (new),
+  `pkg/authz/peer_5561_test.go` (new), `pkg/config/login_perms.go` (new),
+  `pkg/api/authz.go` (new), `pkg/api/config_authz_5561_test.go` (new),
+  `pkg/api/server.go`, `pkg/cli/permissions.go`, `pkg/api/README.md`,
+  `docs/system-login.md`
+- **Validation**: 4 mutations, `go build ./...` and `go vet ./...` CLEAN
+  under each, each reding as an assertion. (1) Removing the guard call site
+  in `NewServer` → every mutating route returns 200/400/503 instead of 403
+  ("an unauthenticated local process reached the handler"); the two negative
+  controls stay green. (2) Disabling `ClassHasPermission` → only the four
+  "class lacks permission" subtests red. (3) Removing the `TCP_ESTABLISHED`
+  requirement → "closed connection reported uid 0 — a caller could escalate
+  to root by closing its socket after sending the request", running as uid
+  1000. (4) Dropping `ConnContext` from `buildHTTPSServer` → the listener
+  scan names the exact literal. Full `go test ./... -count=1` green.
 ## 2026-07-31 — #6611 review round 2: guard scoped narrower than its claim
 
 - **Timestamp**: 2026-07-31 (fix/6611-control-channel-auth, PR #6624)

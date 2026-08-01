@@ -245,6 +245,94 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
   fidelity for cross-system correlation; the CLI keeps human-friendly
   whole-second output.
 
+## Server-side authorization (#5561)
+
+Every state-changing route is gated on a **server-derived principal** before it
+reaches its handler. `authz.go` owns the route table and the middleware; the
+decision itself lives in `pkg/authz` so the gRPC surface can reach the same
+verdict when #5278 lands.
+
+**Why the loopback bind was not enough.** The daemon provisions every `system
+login user` a real shell account (`useradd -m -s /bin/bash`), and the CLI's RBAC
+check runs *in the CLI process*. A `read-only` class holder could therefore
+`curl 127.0.0.1:8080/api/v1/config/set` and commit, and the class boundary never
+ran. The pre-existing gates do not cover this: the #4047/#5127 clamp constrains
+*where* the listener binds, not *who* connects; `api-auth` is off by default on
+a loopback bind (`dynamicAuthMiddleware` passes every request through when the
+snapshot is nil) and is a shared secret rather than an identity; and the #5055
+cross-site guard is a browser-CSRF defense that a non-browser client passes by
+design.
+
+**How the caller is identified.** Two identities, most specific first:
+
+1. **Peer UID.** For a connection whose peer is on this host, the owning UID is
+   read out of the kernel's socket table — INET_DIAG, falling back to
+   `/proc/net/tcp{,6}`. The caller supplies nothing, so there is nothing to
+   forge. The UID resolves to an account name via `/etc/passwd` and then to a
+   class via `system login user <name> class`. `SO_PEERCRED` would answer the
+   same question but only for AF_UNIX, and this is an AF_INET listener.
+   - **Only a socket in `TCP_ESTABLISHED` is accepted.** This is load-bearing:
+     the kernel reports UID 0 for a TIME_WAIT mini-socket, so without the state
+     check a caller that closes its socket right after writing the request is
+     reported as **root**. That escalation is demonstrated, not theorized —
+     removing the check makes `TestPeerUIDRefusesAfterPeerClose_5561` observe
+     uid 0 for a connection made by an unprivileged uid.
+   - The lookup runs lazily, only for mutating requests and only while the
+     request is in flight (so the socket is established for exactly the window
+     that matters). Reads, `/health` and `/metrics` never pay for it.
+2. **An `api-auth` credential**, which authorizes as a full-power principal.
+   That is what it already grants — #4047 makes it the sole gate on an
+   off-loopback bind — so narrowing it here would be a separate breaking change.
+   A peer UID that resolves to a configured login user **outranks** it, so a
+   `read-only` account that also knows the API password stays `read-only`.
+
+**UID 0 is authorized unconditionally**, without consulting `/etc/passwd` or the
+active config. Root owns the daemon and the on-disk config DB, so denying it
+would be theater — and making root's access depend on an active config would
+lock the operator out of a box that has not loaded one yet.
+
+**Route table.** `restMutationPermissions` is an ALLOW-list keyed by the exact
+`"METHOD /path"` a route was registered under; permissions mirror
+`pkg/cli/permissions.go` so `curl` and the CLI answer the same. A non-safe
+method with no entry is **denied**, so a future `mux.HandleFunc("POST …")`
+without a table entry is inert rather than unguarded.
+`TestEveryMutatingRouteHasAPermission_5561` reads the registrations out of
+`server.go` and requires coverage in both directions, turning that from a
+runtime surprise into a test failure. `POST /api/v1/system/action` is gated at
+**maintenance** — the highest permission any of its body-selected verbs needs —
+because the middleware does not consume the request body; the effect is that an
+`operator` principal cannot use its `clear-config-lock` verb over REST. It
+over-restricts rather than under-restricts.
+
+**Safe methods are untouched.** GET/HEAD/OPTIONS/TRACE, `/health`, `/metrics`
+and the SSE streams keep exactly their previous access rules (the #4162 metrics
+gate and `api-auth` still apply to them).
+
+**What this breaks, and the remedy.** One population changes behavior: a local
+process running as a **non-root UID that is not a configured `system login
+user`** and presenting no credential. It could previously mutate and commit
+config; it now gets `403` naming the reason. Nothing in this repository is in
+that population — the CLI speaks gRPC, and the deploy/day-0/harness tooling
+reads `/metrics` only — but operator automation might be. Any one of these
+restores it:
+
+- run the caller as root, or
+- `set system login user <account> class super-user` (the account then also
+  gets the class's CLI rights), or
+- configure `set system services web-management api-auth …` and present the
+  credential.
+
+A denial is confined to the REST mutation surface: forwarding, the dataplane,
+the console CLI and gRPC are unaffected, so this cannot brick a running box.
+
+**Identity plumbing.** `connContext` (the `http.Server.ConnContext` hook) carries
+the accepted connection's typed addresses into each request; `http.Request`
+exposes `RemoteAddr` only as a string and no local address at all. It must be set
+on **every** `http.Server` literal, including the #5866 day-2 rebind path in
+`listener.go` — a listener without it can identify nobody, which would refuse
+every mutation on it after an unrelated bind change.
+`TestEveryListenerCarriesPeerIdentity_5561` enforces that across the package.
+
 ## Callers
 
 `cmd/xpfd` builds the `Server` from its assembled dependencies and runs it
@@ -252,8 +340,8 @@ under the daemon's errgroup. Nothing else imports this package.
 
 ## Dependencies
 
-`config`, `configstore`, `conntrack`, `dataplane`, `dhcp`, `frr`, `ipsec`,
-`logging`, `routing`, `vrrp`.
+`authz`, `config`, `configstore`, `conntrack`, `dataplane`, `dhcp`, `frr`,
+`ipsec`, `logging`, `routing`, `vrrp`.
 
 ## Gotchas
 
