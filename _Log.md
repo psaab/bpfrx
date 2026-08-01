@@ -66814,3 +66814,39 @@ break — `go vet` confirmed passing under every revert.
   direct proof it never bound the sharing it is named for.
 - **File(s)**: pkg/api/authz.go, pkg/api/config_authz_5561_test.go,
   pkg/cli/permissions_shared_evaluator_5561_test.go, _Log.md
+
+- **Timestamp**: 2026-08-01 (round-8 PARTIAL — findings 4 and 7)
+- **Action**: #5561 Codex round 3 returned 7 MAJORs. Folded 2; 5 remain and are
+  listed below with analysis, not left implicit. FINDING 4 (sibling fail-open):
+  the scoped-IPv6 branch answered from the CACHED classification without
+  consulting either socket table, so a scoped caller the snapshot did not
+  recognise went off-box — the credential row — on ZERO observations. Same defect
+  the error path was corrected for one branch up, left in a sibling. It now reads
+  the table first: a matching row PROVES a socket exists here (locality from the
+  kernel) even though /proc carries no scope id to attribute it by; an
+  unreadable/absent-everything table denies; only a genuinely-observed absence
+  lets the address classification decide, preserving the MINOR-2 property that a
+  scoped remote still reaches the credential.
+  `TestScopedRemotePeerStillReachesTheCredential_5561` required BOTH tables
+  ABSENT and Local=false — i.e. it encoded the zero-observation fail-open as
+  required — and now uses present-but-empty tables. FINDING 7 (the sharing guard
+  still did not bind): a BEHAVIOURAL test compares outputs and therefore cannot
+  distinguish "these share an implementation" from "these have equivalent
+  implementations"; my earlier custom-class reasoning held only against a
+  built-ins-only duplicate, not a faithful one. Added
+  `TestCLIResolveClassPermsCallsSharedEvaluator_5561`, a STRUCTURAL AST check
+  that `CLI.resolveClassPerms` contains exactly one call to
+  `config.ResolveClassPermissions` (the #6706 shape). Mutation with a FAITHFUL
+  inline copy of the real evaluator body: build rc=0 (0 bytes), vet rc=0 (0
+  bytes), the behavioural guard PASSES and only the structural one reds at
+  permissions_shared_evaluator_5561_test.go:153 — exactly one FAIL.
+- **NOT DONE, carried (5 of 7):** findings 1-3 share ONE root — an authorization
+  decision made against state captured BEFORE a boundary the request later
+  crosses (`pending.wait`, the request-body read, listener reconcile). They want
+  one mechanism (decide after every blocking boundary / revalidate at the
+  mutation boundary), not three patches. Findings 5+6: the admission cap I added
+  in round 7c starts at ACCEPT before authentication, is package-global across
+  every listener and Server, converts would-be SUCCESSES into denials, and its
+  slot RELEASE is untested (delete the release defer and the guard stays green).
+- **File(s)**: pkg/authz/peer.go, pkg/authz/peer_5561_test.go,
+  pkg/cli/permissions_shared_evaluator_5561_test.go, _Log.md

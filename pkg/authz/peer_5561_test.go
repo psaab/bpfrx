@@ -475,8 +475,17 @@ func TestLocalAddrCacheRateLimitsMisses_5561(t *testing.T) {
 // caller, which on an IPv6 link-local management bind is every credentialed
 // remote administrator.
 func TestScopedRemotePeerStillReachesTheCredential_5561(t *testing.T) {
+	const header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
 	dir := t.TempDir()
-	defer SetProcNetTCPPathsForTest(filepath.Join(dir, "absent"), filepath.Join(dir, "absent6"))()
+	// PRESENT and EMPTY, not absent. The tables used to be absent here, which
+	// made this case require an off-box verdict drawn from having read NOTHING —
+	// the same zero-observation fail-open the error path was corrected for. A
+	// scoped peer may only reach the credential once the table has actually been
+	// consulted and genuinely holds no row for it.
+	v4, v6 := filepath.Join(dir, "tcp"), filepath.Join(dir, "tcp6")
+	write(t, v4, header)
+	write(t, v6, header)
+	defer SetProcNetTCPPathsForTest(v4, v6)()
 	// Our own link-local address is a DIFFERENT one, so the caller is off-box.
 	defer setLocalAddrsForTest([]net.Addr{
 		&net.IPNet{IP: net.ParseIP("fe80::e01:0:0:1"), Mask: net.CIDRMask(64, 128)},
@@ -1206,6 +1215,63 @@ func TestPartialTableReadFailsClosed_5561(t *testing.T) {
 		other := &net.TCPAddr{IP: net.IPv4(10, 0, 61, 9), Port: 8080}
 		if id := LookupPeer(oursCaller, other); !id.Local {
 			t.Fatalf("a caller from our OWN address was reported off-box with tcp6 absent: %+v", id)
+		}
+	})
+}
+
+// TestScopedPeerWithNoObservationDenies_5561 is the round-4 finding-4 guard, and
+// the sibling of the error-path fix one branch up.
+//
+// The scoped-address branch used to answer from the cached classification
+// WITHOUT consulting either socket table, so a scoped caller the snapshot did
+// not recognise was reported off-box — the credential row — on zero
+// observations. Closing a fail-open in one branch and leaving its sibling is how
+// the same defect ships twice; this pins the sibling.
+func TestScopedPeerWithNoObservationDenies_5561(t *testing.T) {
+	ours := []net.Addr{&net.IPNet{IP: net.ParseIP("fe80::e01:0:0:1"), Mask: net.CIDRMask(64, 128)}}
+	client := &net.TCPAddr{IP: net.ParseIP("fe80::ee01:0:0:99"), Port: 43210, Zone: "eth0"}
+	server := &net.TCPAddr{IP: net.ParseIP("fe80::e01:0:0:1"), Port: 8080, Zone: "eth0"}
+
+	t.Run("no table could be read", func(t *testing.T) {
+		dir := t.TempDir()
+		defer SetProcNetTCPPathsForTest(filepath.Join(dir, "absent"), filepath.Join(dir, "absent6"))()
+		defer setLocalAddrsForTest(ours)()
+		if id := LookupPeer(client, server); !id.Local || id.OK {
+			t.Fatalf("a scoped peer was reported %+v with NO socket table readable — that is "+
+				"the credential row, reached without a single observation", id)
+		}
+	})
+
+	// A matching row proves a socket exists here even though it names nobody, so
+	// locality is established from the KERNEL rather than from the snapshot.
+	t.Run("a matching row proves locality without attributing", func(t *testing.T) {
+		const header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+		cl, ok := procAddr6(client)
+		if !ok {
+			t.Fatal("cannot render client address")
+		}
+		sv, ok := procAddr6(server)
+		if !ok {
+			t.Fatal("cannot render server address")
+		}
+		dir := t.TempDir()
+		v4, v6 := filepath.Join(dir, "tcp"), filepath.Join(dir, "tcp6")
+		write(t, v4, header)
+		write(t, v6, header+"   0: "+cl+" "+sv+" 01 00000000:00000000 00:00000000 00000000     0        0 4242 1 0000000000000000 100 0 0 10 0\n")
+		defer SetProcNetTCPPathsForTest(v4, v6)()
+		// The snapshot does NOT recognise this caller, so only the row can save it.
+		defer setLocalAddrsForTest(ours)()
+
+		id := LookupPeer(client, server)
+		if id.OK {
+			t.Fatalf("a scoped peer was ATTRIBUTED from a row carrying no scope id: %+v", id)
+		}
+		if !id.Local {
+			t.Fatalf("a scoped peer with a MATCHING socket row was reported off-box (%+v) — "+
+				"the row proves a socket exists on this host, whoever owns it", id)
+		}
+		if !strings.Contains(id.Detail, "scope-qualified") {
+			t.Errorf("detail does not explain the refusal: %q", id.Detail)
 		}
 	})
 }

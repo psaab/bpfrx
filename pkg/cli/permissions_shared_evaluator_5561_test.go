@@ -1,6 +1,9 @@
 package cli
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -87,4 +90,70 @@ func samePerms(a, b []config.LoginClassPermission) bool {
 		}
 	}
 	return true
+}
+
+// TestCLIResolveClassPermsCallsSharedEvaluator_5561 is the STRUCTURAL half, and
+// it exists because the behavioural half above cannot do this job.
+//
+// A behavioural test compares OUTPUTS. It therefore cannot distinguish "these
+// share an implementation" from "these have equivalent implementations" — swap
+// config.ResolveClassPermissions for a FAITHFUL inline copy and every output
+// comparison still agrees, for built-in and custom classes alike. My earlier
+// reasoning ("custom classes carry the assertion") held only against a
+// built-ins-only duplicate, which is the weaker mutant. Against a faithful one
+// the behavioural guard is green and the factoring is gone.
+//
+// Sharing is a STRUCTURAL property, so it needs a structural check: the CLI's
+// adapter must actually CALL config.ResolveClassPermissions. This reads the AST
+// of the real source file rather than exercising behaviour, which is the only
+// thing a faithful copy cannot satisfy.
+func TestCLIResolveClassPermsCallsSharedEvaluator_5561(t *testing.T) {
+	const (
+		file    = "permissions.go"
+		fn      = "resolveClassPerms"
+		wantPkg = "config"
+		wantSel = "ResolveClassPermissions"
+	)
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", file, err)
+	}
+
+	var body *ast.FuncDecl
+	ast.Inspect(f, func(n ast.Node) bool {
+		fd, ok := n.(*ast.FuncDecl)
+		if ok && fd.Name.Name == fn && fd.Recv != nil {
+			body = fd
+		}
+		return body == nil
+	})
+	if body == nil {
+		t.Fatalf("no method %s found in %s — the guard is looking at the wrong symbol and "+
+			"would pass vacuously", fn, file)
+	}
+
+	var calls int
+	ast.Inspect(body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		pkg, ok := sel.X.(*ast.Ident)
+		if ok && pkg.Name == wantPkg && sel.Sel.Name == wantSel {
+			calls++
+		}
+		return true
+	})
+	if calls != 1 {
+		t.Fatalf("%s.%s contains %d call(s) to %s.%s, want exactly 1 — the CLI is not "+
+			"resolving through the shared evaluator, so `curl` and the CLI can drift into "+
+			"disagreeing about what a class may do. A behaviourally identical inline copy "+
+			"passes every output comparison and is exactly what this check exists to catch.",
+			file, fn, calls, wantPkg, wantSel)
+	}
 }

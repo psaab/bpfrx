@@ -492,6 +492,29 @@ func LookupPeer(client, server net.Addr) PeerIdentity {
 	// zone is not disqualifying on its own — the client column still selects the
 	// row.
 	if ct.Zone != "" {
+		// Consult the table anyway. We cannot ATTRIBUTE from it — /proc carries
+		// no scope id — but a matching row still PROVES a socket exists on this
+		// host for those 128 bits and ports, and that is evidence of locality
+		// even when it names nobody. Skipping the read and answering from the
+		// cached classification alone was the same zero-observation fail-open
+		// this function's error path was corrected for one branch up: a scoped
+		// caller the snapshot did not recognise went off-box — the credential
+		// row — without anything ever being read.
+		_, _, found, malformed, err := findPeerSocket(ct, st)
+		switch {
+		case err != nil:
+			return PeerIdentity{Local: true, Detail: "socket table unreadable: " + err.Error()}
+		case found || malformed:
+			return PeerIdentity{
+				Local:  true,
+				Detail: fmt.Sprintf("peer address %v is scope-qualified and cannot be attributed from the socket table", ct),
+			}
+		}
+		// No row, and the table was readable: the observation was actually made.
+		// Only now may the address classification decide, and a scoped peer that
+		// is not one of ours is a remote administrator reaching an IPv6
+		// link-local management bind — denying it there locked out every
+		// credentialed remote on such a bind.
 		if couldBeLocal(ct, st) {
 			return PeerIdentity{
 				Local:  true,
