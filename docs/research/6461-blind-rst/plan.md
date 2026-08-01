@@ -1950,8 +1950,12 @@ adopting the shared decision/metadata, §5.6).
   reactive synth's binding producer and inheritance source; a Local
   match carries the exact matched id + the pre-install re-probe
   snapshot; a Shared match reads the shared row's carried
-  `tcp_flags` close bits — the across-scopes wrapper discards them
-  today, `shared_ops.rs:638-665` — and synthesizes expectation 0).
+  `tcp_flags` close bits AND the shared row's `session_id` as the
+  expectation — the across-scopes wrapper discards both
+  today, `shared_ops.rs:638-665`; the materialize-adopt of that
+  shared forward adopts the same wire id (the r119-5a completion), so
+  the expectation verifies once the forward materializes locally; a
+  legacy zero-id row synthesizes expectation 0 (UNBOUND)).
 - The reverse entry's `fwd_companion_id` stores the EXPECTED family
   id, verified PER HOP (v10.37.0, round-121 Codex 5 — the expectation
   IS the binding; there is no promote-time bind step): the install/
@@ -2658,8 +2662,11 @@ adopting the shared decision/metadata, §5.6).
     LOCAL match carries the matched forward entry's id on the
     `ForwardSessionMatch` (`entry.rs:208-213` gains it — the type
     carries only key/decision/metadata today) with the identity
-    re-probe before install; a SHARED match installs with expectation
-    0 (UNBOUND); (c) an
+    re-probe before install; a SHARED match carries the shared row's
+    `session_id` as the expectation (the across-scopes wrapper gains
+    it; the materialize-adopt of that shared forward adopts the same
+    wire id, so the expectation verifies once the forward materializes
+    locally; a legacy zero-id row → 0 = UNBOUND); (c) an
     HA-IMPORTED reverse carries the EXPECTED forward id ON THE
     SYNTHESIZED ENTRY ITSELF: every reverse `SyncedSessionEntry` is
     built FROM its forward row (`synthesized_synced_reverse_entry`,
