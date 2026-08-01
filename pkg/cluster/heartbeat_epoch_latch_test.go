@@ -2,8 +2,12 @@ package cluster
 
 import (
 	"math"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // #6169 — the DOWNGRADE LATCH.
@@ -390,4 +394,101 @@ func TestHeartbeatUnorderableEpochNeverArmsLatch_6169(t *testing.T) {
 	// The safe direction: that peer, rolled back to a pre-#6169 build, is still
 	// accepted — the latch never armed on it.
 	e.liveRun(e.captureIncarnation(0xCC02, 0, epochFramesPerIncarnation), "peer rolled back after a far-future epoch")
+}
+
+// TestHeldFlockCannotCauseFalsePeerDeath_6169 reproduces, link by link, the
+// exact chain a tie-break review measured against an earlier revision of this
+// change:
+//
+//	held the real flock            -> StartHeartbeat returned after 2.0076s, bootEpoch 0
+//	bootEpoch 0 => epochless frame -> heartbeatFrameEpoch: present=false
+//	latched peer rejects them      -> fresh-nonce valid-MAC frames ALL rejected
+//	rejection => declared dead     -> PeerAlive() false after 500ms
+//
+// A local, recoverable storage stall became a peer-declared death in 500ms — an
+// availability regression on exactly the path this change exists to protect,
+// and caused by the change itself.
+//
+// The chain is broken at LINK 1: the boot epoch is published synchronously from
+// the wall clock before any file is touched, so a held lock (or a hung fsync,
+// or an unwritable state dir) cannot make this node emit an epochless frame.
+// The remaining links are asserted anyway, because the property that matters is
+// the end of the chain, not the beginning.
+//
+// RED-on-revert: gate publication on the worker again (store bootEpoch only
+// after refineBootEpoch) and link 1 fails immediately.
+func TestHeldFlockCannotCauseFalsePeerDeath_6169(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ha-boot-epoch")
+	orig := bootEpochPath
+	bootEpochPath = path
+	t.Cleanup(func() { bootEpochPath = orig })
+
+	// Hold the REAL advisory lock the persist path takes, for the whole test.
+	lockFile, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockFile.Close()
+	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatalf("could not take the lock the test needs to hold: %v", err)
+	}
+
+	// LINK 1 — the sender still has an epoch, immediately, with the lock held.
+	sender := NewManager(0, 42)
+	start := time.Now()
+	epoch := sender.heartbeatBootEpoch()
+	elapsed := time.Since(start)
+	if epoch == 0 {
+		t.Fatal("LINK 1: bootEpoch is 0 while the persist lock is held — a storage stall " +
+			"makes this node emit epochless frames, which a latched peer rejects")
+	}
+	if elapsed > time.Second {
+		t.Fatalf("LINK 1: heartbeatBootEpoch blocked for %v on a held lock; it must not do I/O", elapsed)
+	}
+
+	// LINK 2 — the frames it emits carry that epoch.
+	key := []byte("cluster-shared-secret")
+	frame := marshalHeartbeatAuthEpoch(samplePkt(), key, 0xDD01, 1, epoch)
+	got, present := heartbeatFrameEpoch(frame, key)
+	if !present || got != epoch {
+		t.Fatalf("LINK 2: frame epoch = (%d,%v), want (%d,true)", got, present, epoch)
+	}
+
+	// LINK 3 — a LATCHED peer accepts them.
+	e := newLatchEnv(t)
+	e.liveRun(e.captureIncarnation(0xDD00, epoch-1000, epochFramesPerIncarnation), "arming the peer's latch")
+	if !e.r.auth.peerEpochLatched() {
+		t.Fatal("test setup: the receiver should be latched")
+	}
+	for c := 1; c <= 5; c++ {
+		f := marshalHeartbeatAuthEpoch(samplePkt(), e.key, 0xDD01, uint64(c), epoch)
+		if !e.feed(f) {
+			t.Fatalf("LINK 3: a latched peer REJECTED frame %d from a node whose storage is stalled", c)
+		}
+	}
+
+	// LINK 4 — and therefore never declares it dead.
+	e.r.checkTimeout()
+	if !e.m.PeerAlive() {
+		t.Fatal("LINK 4: peer declared DEAD while its heartbeats were being accepted")
+	}
+
+	// The lock is still held, so nothing above depended on the persist landing.
+	if _, err := os.Stat(path); err == nil {
+		t.Fatal("the epoch was persisted despite the lock being held; the lock is not exclusive")
+	}
+
+	// Release and drain the worker before the test ends, so its write cannot
+	// race t.TempDir() cleanup. This also demonstrates the self-heal the
+	// tie-break observed: the persist completes once the lock frees.
+	_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
+	select {
+	case <-sender.bootEpochReady:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the persist worker never completed after the lock was released")
+	}
+	if sender.heartbeatBootEpoch() == 0 {
+		t.Fatal("the epoch went back to 0 after the persist completed")
+	}
 }

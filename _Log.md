@@ -66391,3 +66391,23 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/heartbeat.go,
   pkg/cluster/manager.go, pkg/cluster/heartbeat_epoch_latch_test.go,
   pkg/cluster/heartbeat_epoch_test.go, pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 22:30
+- **Action**: #6169 tie-break response. Q2 (storage hang -> false peer-death) was
+  ALREADY fixed by the reshape in 2cba87111 — the epoch is published
+  synchronously from the wall clock before any file is touched — but that was
+  proven with an unwritable-path proxy, not the tie-break's actual experiment.
+  Added `TestHeldFlockCannotCauseFalsePeerDeath_6169`, which holds the REAL
+  advisory flock and walks all four measured links: bootEpoch non-zero and
+  non-blocking under a held lock; the emitted frame carries an epoch; a LATCHED
+  receiver accepts those frames; checkTimeout does NOT declare the peer dead. It
+  also drains the worker after releasing, demonstrating the self-heal. Mutation 17
+  (publish only after the worker — the tie-break's measured shape) reds LINK 1
+  with build+vet rc=0. Q1: the persist hook, `peerFloor` and the whole
+  peerEpochFloorStore are GONE with the durable floor, so the untracked-goroutine
+  window and the synchronous-hook test that could not see it were deleted with the
+  mechanism, not patched. Also fixed a FOURTH stale comment: the `epochSeen` doc
+  still said "restored from the DURABLE floor at start (primeEpochFloor)" after
+  the reshape removed both — a `grep primeEpochFloor` caught it.
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_epoch_latch_test.go,
+  _Log.md

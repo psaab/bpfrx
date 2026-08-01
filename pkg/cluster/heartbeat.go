@@ -694,9 +694,28 @@ type heartbeatAuthState struct {
 	// floor latched at a live peer's epoch, 975/975 epochless replays were
 	// still admitted.
 	//
-	// It is restored from the DURABLE floor at start (primeEpochFloor), because
-	// an in-memory-only latch is cleared by exactly the receiver restart an
-	// attacker waits for.
+	// DURABILITY — deliberately PROCESS-SCOPED, not on disk.
+	//
+	// A durable latch would additionally cover "the survivor's daemon restarts
+	// while the genuine peer is silent", but it was removed after review priced
+	// it: it needs a peer-floor state file, which turns a deliberate rollback
+	// into "delete the right file on the right node and restart" (a procedure
+	// run under incident pressure), opens a crash window between accepting a
+	// frame and committing the floor, needs cross-process locking on the
+	// receive path, and makes an in-range-but-wrong epoch a lockout that
+	// outlives reboots.
+	//
+	// What process scope costs is narrow, because this state already lives on
+	// the Manager (#5086/#6642): a heartbeat restart, a DHCP-triggered VRF
+	// rebind and an HA comms restart all PRESERVE it. Only a full daemon
+	// restart clears it, and a live peer re-arms it with its next heartbeat —
+	// one DefaultHeartbeatInterval, ~100ms. So the uncovered case needs a
+	// daemon restart AND a genuinely absent peer AND an attacker holding
+	// pre-upgrade captures; and rotating the control-link PSK, already a
+	// REQUIRED post-upgrade step, retires those captures outright.
+	//
+	// It also makes rollback recovery "restart xpfd", an operation operators
+	// already perform, instead of a documented rm.
 	epochSeen bool
 
 	// epochlessAdmitted counts authenticated heartbeats ADMITTED without a boot
