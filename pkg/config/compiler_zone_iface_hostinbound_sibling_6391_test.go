@@ -17,54 +17,55 @@ import (
 // the SAME `a` container and the host-inbound body becomes a child of the node
 // that also carries the `b` membership leaf.
 //
-// PR #6389 (advances #5609, CLOSED unmerged) tried to make a hierarchical
-// multi-member `load override` block apply the override to every member by
-// fanning the parsed host-inbound across `zoneInterfaceMembers(iface)`. That
-// fanout is UNSOUND: the flat-set single-scoped case and the hierarchical
-// multi-member case compile to the SAME AST, so the fanout cannot tell them
-// apart and OVER-ADMITS — it opens the service on `b` for the common
+// PR #6389 (advances #5609, CLOSED unmerged) tried to make a multi-member
+// `load override` block apply the override to every member by fanning the parsed
+// host-inbound across `zoneInterfaceMembers(iface)` — every name in the node's
+// Keys AND its nested membership children. That fanout OVER-ADMITS: it opens the
+// service on `b` for the common
 //
 //	set security zones security-zone Z interfaces [ a b ]
 //	set security zones security-zone Z interfaces a host-inbound-traffic system-services ssh
 //
-// config that scopes ssh to `a` only. Codex's hostile review of #6389 plus a
-// firsthand repro caught this host-inbound sibling leak; #6389 closed unmerged.
+// config that scopes ssh to `a` only, because SetPath nests the bracket tail under
+// the first member and the second `set` reuses that same container. Codex's
+// hostile review of #6389 plus a firsthand repro caught this host-inbound sibling
+// leak; #6389 closed unmerged.
 //
-// Current master is the fail-SAFE status quo: `compileZones` keys the
-// per-interface override strictly on `iface.Name()` (the direct child the
-// stanza was written under), so a sibling never inherits it. These tests are
-// the RED-on-revert guard that PINS that isolation: re-introducing the #6389
-// `for _, member := range zoneInterfaceMembers(iface)` fanout turns the
-// CONTAINER-SHARING cases RED (a sibling wrongly carries the override) —
-// first-member, three-member, multi-service, protocols, and the two
-// hierarchical multi-member-body cases. The later-member and
-// no-shared-backing-store cases stay GREEN CONTROLS: their interfaces do NOT
-// share a SetPath container (SetPath splits a later-authored member, and two
-// separately-authored top-level interfaces are independent), so the fanout does
-// not touch them — they prove the guard is not a tautology. The guard advances
-// #6391 in the issue's option-1 (fail-safe) direction; see docs/config-schema.md.
+// #6391 REPLACED the fail-safe first-member-only status quo with a fan that keys
+// on the node's KEYS and never on its CHILDREN. The premise #6389 and the original
+// #6391 issue text both worked from — "the flat-set single-scoped case and the
+// hierarchical multi-member case compile to the SAME AST, so no AST-keyed fan can
+// tell them apart" — was TESTED against firsthand AST dumps and is FALSE. The two
+// shapes are distinct:
 //
-// TWO KINDS of assertion below, do NOT conflate them:
+//	`[ a b ] { host-inbound {...} }`  -> ONE container Keys=["a","b"], NO
+//	                                    membership child. Multi-member intent.
+//	`set ... interfaces [ a b ]`      -> container Keys=["a"] with a membership
+//	`set ... interfaces a host-...`      CHILD leaf Keys=["b"]. Single-scoped.
 //
-//   - FLAT-SET, INDIVIDUALLY-SCOPED (the first/later-member, three-member,
-//     multi-service and protocols cases, plus the aliasing guard): a service or
-//     protocol authored under ONE named interface via its OWN `set` statement
-//     (`interfaces a host-inbound-traffic system-services ssh`) must never
-//     appear on a sibling. This is UNCONDITIONALLY correct under every design
-//     option (1/2/3) — an individually-authored per-interface stanza is
-//     single-scoped by definition, so a future parse-time fan (option 2/3) for
-//     the multi-member case must still leave these untouched. Asserted firmly.
+// What IS identical is the flat-set shape and the `a { b; host-inbound {...} }`
+// hierarchical shape — because the latter is the former's SERIALIZATION
+// (`ConfigTree.Format()`, the render configstore persists and HA config sync
+// ships, emits exactly it). That is why fanning on children leaks on every
+// reload, and why first-member-only remains correct for THAT shape permanently.
 //
-//   - MULTI-MEMBER BODY (the two hierarchical cases): a host-inbound BODY
-//     hanging off a bracket-membership / shared container
-//     (`[ a b ] { host-inbound ... }` or the `a { b; host-inbound ... }`
-//     load-override artifact). First-member-only here is the CURRENT option-1
-//     fail-safe outcome, NOT the final multi-member semantics: options 2/3
-//     (parse-time scope disambiguation, still an open DESIGN call on #6391) may
-//     deliberately fan the body to every member. These two cases pin CURRENT
-//     behavior and catch UNINTENDED drift; when option 2/3 lands, its author
-//     updates these two expectations as part of that work. They must NOT be
-//     read as asserting that first-member-only is correct forever.
+// So the assertions below split by SHAPE, not by confidence:
+//
+//   - INDIVIDUALLY-SCOPED / CONTAINER-SHARING (first/later-member, three-member,
+//     multi-service, protocols, the `a { b; ... }` hierarchical case, plus the
+//     aliasing guard): a service or protocol authored under ONE named interface
+//     must NEVER appear on a sibling. UNCONDITIONAL — this is the #6389 leak and
+//     it stays pinned forever. Re-introducing a children-fan turns these RED.
+//
+//   - MULTI-MEMBER BODY (Keys=[a,b], authored ON the bracket membership): applies
+//     to EVERY member. This expectation was INVERTED by #6391 — not a change of
+//     mind about sibling isolation, but the consequence of the two shapes being
+//     different. Reverting the Keys-fan turns this RED.
+//
+//   - NEGATIVE DIRECTION (FlatSetNeverYieldsMultiKeyContainer): no `set`-authored
+//     config may produce a multi-key interface container, or the fan would
+//     re-open the #6389 leak. Schema-guaranteed today; asserted so a future
+//     SetPath / schema refactor cannot silently break it.
 //
 // IMPORTANT (per CLAUDE.md): flat-set syntax is built with ParseSetCommand +
 // tree.SetPath, never NewParser; the hierarchical shape uses parseHierarchical.
@@ -225,17 +226,29 @@ func TestHostInbound6391ProtocolsNoSiblingLeak(t *testing.T) {
 	})
 }
 
-// TestHostInbound6391HierarchicalNestedChildNoSiblingLeak covers the exact
-// load-override AST shape #6389 targeted: a hierarchical block that NESTS the
-// second member under the first alongside a host-inbound body
-// (`interfaces { ge-0/0/0 { ge-0/0/1; host-inbound-traffic { ssh } } }`). This
-// is a MULTI-MEMBER BODY case, NOT an individually-scoped stanza: first-member-
-// only (ssh on ge-0/0/0, nested ge-0/0/1 clean) is the CURRENT option-1 fail-
-// safe outcome, not the final multi-member semantics. An options-2/3 design fix
-// (parse-time scope disambiguation, still open on #6391) may deliberately fan
-// the body to ge-0/0/1 too; when it lands, update this expectation. Today the
-// assertion pins current behavior and the #6389 fanout (which opens ssh on
-// ge-0/0/1 without that design work) turns it RED.
+// TestHostInbound6391HierarchicalNestedChildNoSiblingLeak covers the AST shape
+// #6389 targeted: a hierarchical block that NESTS the second member under the
+// first alongside a host-inbound body
+// (`interfaces { ge-0/0/0 { ge-0/0/1; host-inbound-traffic { ssh } } }`).
+//
+// THIS TEST STAYS GREEN UNDER THE #6391 FIX, and the reason is the whole reason
+// #6389 was unsound. This shape is NOT a multi-member intent that merely
+// resembles the flat-set one — it is the SERIALIZATION of the flat-set one.
+// `ConfigTree.Format()` (what configstore persists through, store_format.go, and
+// what HA config sync ships via d.store.ShowActive()) renders the flat-set
+//
+//	set ... interfaces [ ge-0/0/0 ge-0/0/1 ]
+//	set ... interfaces ge-0/0/0 host-inbound-traffic system-services ssh
+//
+// as EXACTLY this text, and re-parsing it yields a byte-identical AST
+// (Keys=["ge-0/0/0"], child leaf Keys=["ge-0/0/1"], child host-inbound-traffic).
+// So a fan that fired here would leak ssh onto ge-0/0/1 on every RELOAD of an
+// ordinary single-scoped flat-set config — which is precisely the regression
+// #6389 shipped. First-member-only is therefore the CORRECT permanent answer for
+// this shape, not a fail-safe compromise: ssh on ge-0/0/0, nested ge-0/0/1 clean.
+//
+// The genuine multi-member intent is the DISTINCT Keys=[a,b] shape covered by
+// TestHostInbound6391HierarchicalBracketBodyFansToAllMembers.
 func TestHostInbound6391HierarchicalNestedChildNoSiblingLeak(t *testing.T) {
 	tree := parseHierarchical(t, `
 security {
@@ -256,19 +269,37 @@ security {
 	})
 }
 
-// TestHostInbound6391HierarchicalBracketBodyNoSiblingLeak covers the
-// Keys=[a,b] hierarchical bracket-with-body shape
-// (`interfaces { [ ge-0/0/0 ge-0/0/1 ] { host-inbound-traffic { ssh } } }`) —
-// the canonical MULTI-MEMBER BODY: a host-inbound stanza authored ON the bracket
-// membership itself. The lexer strips the brackets so the member node carries
-// both names in its Keys; iface.Name() is the first key, so the CURRENT option-1
-// fail-safe scopes ssh to ge-0/0/0 and leaves ge-0/0/1 clean. This is the
-// under-application #5609-A3.1 / #6391 tracks: first-member-only is the fail-safe
-// default PENDING the options-2/3 design call, NOT the final semantics — an
-// option-2/3 fix that fans the body to every bracket member will intentionally
-// flip this expectation. It is asserted here to pin current behavior, not to
-// declare first-member-only correct forever.
-func TestHostInbound6391HierarchicalBracketBodyNoSiblingLeak(t *testing.T) {
+// TestHostInbound6391HierarchicalBracketBodyFansToAllMembers is the #6391 FIX
+// assertion: the canonical MULTI-MEMBER BODY — a host-inbound stanza authored ON
+// the bracket membership itself — applies to EVERY bracket member.
+//
+// This expectation was INVERTED by #6391 (it previously asserted first-member-
+// only). That was not a change of mind about sibling isolation; it is the
+// consequence of discovering that this shape and the flat-set single-scoped shape
+// are STRUCTURALLY DIFFERENT, which the #6391 issue text and the pre-fix docs both
+// denied. Dumping the compiled AST for each:
+//
+//	`[ a b ] { host-inbound {...} }`   -> ONE container, Keys=["a","b"] (len 2),
+//	                                     NO membership child.
+//	`set ... interfaces [ a b ]`       -> container Keys=["a"] (len 1) with a
+//	`set ... interfaces a host-...`       membership CHILD leaf Keys=["b"].
+//
+// The discriminator is therefore len(Keys)>1, and it is safe in the direction
+// that matters (a false positive would LEAK): no `set`-authored config can
+// produce a multi-key interface container, because the interface name is
+// `schemaNode.wildcard` with args:0 / multi:false / compoundKey:false
+// (schema_security.go), so SetPath's `nodeKeyCount = 1 + args` is always 1.
+// Surplus bracket tokens can only land on a child LEAF. That invariant is pinned
+// independently by TestHostInbound6391FlatSetNeverYieldsMultiKeyContainer so a
+// future schema refactor that broke it fails loudly rather than silently
+// re-opening the #6389 leak.
+//
+// The multi-key shape is reachable only from a hierarchical parse — `load
+// override` or a hand-authored config file. It survives Format()->NewParser
+// (local persistence) and HA config sync byte-for-byte. It does NOT survive a
+// `show | display set` round-trip, which mangles it into an uncompilable leaf —
+// that is a separate pre-existing defect tracked as #6668, NOT introduced here.
+func TestHostInbound6391HierarchicalBracketBodyFansToAllMembers(t *testing.T) {
 	tree := parseHierarchical(t, `
 security {
     zones {
@@ -284,7 +315,196 @@ security {
 	got := compileHostInbound6391(t, tree)
 	assertHostInbound6391(t, got, map[string]hib6391{
 		"ge-0/0/0": {SystemServices: []string{"ssh"}},
+		"ge-0/0/1": {SystemServices: []string{"ssh"}},
 	})
+}
+
+// TestHostInbound6391BracketBodyNestedExtraMemberScope pins the judgement call
+// at the edge of the fan: a bracket body that ALSO nests a further membership
+// statement (`[ a b ] { c; host-inbound {...} }`) applies the override to a and b
+// — the names on the node the body was authored on — but NOT to c.
+//
+// c is a nested membership statement, not a bracket sibling of the authored
+// node, so it is in the same position as the `b` leaf in the flat-set shape:
+// authored separately, therefore not in scope. Deliberate, and asserted so it
+// stays a decision rather than an accident. c is still a zone MEMBER (it appears
+// in zone.Interfaces via zoneInterfaceMembers) — it simply falls back to the
+// zone-level host-inbound, which is the conservative direction.
+func TestHostInbound6391BracketBodyNestedExtraMemberScope(t *testing.T) {
+	tree := parseHierarchical(t, `
+security {
+    zones {
+        security-zone trust {
+            interfaces {
+                [ ge-0/0/0 ge-0/0/1 ] {
+                    ge-0/0/2;
+                    host-inbound-traffic { system-services ssh; }
+                }
+            }
+        }
+    }
+}`)
+	got := compileHostInbound6391(t, tree)
+	assertHostInbound6391(t, got, map[string]hib6391{
+		"ge-0/0/0": {SystemServices: []string{"ssh"}},
+		"ge-0/0/1": {SystemServices: []string{"ssh"}},
+	})
+
+	// c IS a zone member, it just carries no per-interface override.
+	sec := tree.FindChild("security")
+	secCfg := &SecurityConfig{Zones: map[string]*ZoneConfig{}}
+	if err := compileZones(sec.FindChild("zones"), secCfg); err != nil {
+		t.Fatalf("compileZones: %v", err)
+	}
+	if got, want := secCfg.Zones["trust"].Interfaces, []string{"ge-0/0/0", "ge-0/0/1", "ge-0/0/2"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("zone.Interfaces = %q, want %q (the nested member must stay a zone member)", got, want)
+	}
+}
+
+// TestHostInbound6391FlatSetNeverYieldsMultiKeyContainer is the NEGATIVE-direction
+// guard for the #6391 discriminator, and the one that makes the fix durable.
+//
+// The fan keys on len(iface.Keys)>1. A false POSITIVE is the dangerous direction:
+// if any `set`-authored config could produce a multi-key interface container, the
+// fan would re-open the #6389 sibling leak on a config the operator scoped to one
+// interface. Today that is impossible by schema construction (the interface name
+// is a wildcard with args:0 / multi:false / compoundKey:false, so SetPath's
+// nodeKeyCount is always 1) — but that is a fact someone would otherwise have to
+// re-derive from the schema after any SetPath or schema_security.go refactor.
+//
+// This asserts it directly over the flat-set spellings that plausibly stress it:
+// brackets of several widths, both authoring orders, bare multi-name membership,
+// overlapping repeated brackets, and a host-inbound token tail. If a refactor
+// ever makes one of these yield a multi-key container, this fails HERE with the
+// offending Keys rather than silently widening admission.
+func TestHostInbound6391FlatSetNeverYieldsMultiKeyContainer(t *testing.T) {
+	spellings := [][]string{
+		{"set security zones security-zone trust interfaces [ ge-0/0/0 ge-0/0/1 ]"},
+		{"set security zones security-zone trust interfaces [ ge-0/0/0 ge-0/0/1 ge-0/0/2 ge-0/0/3 ]"},
+		{"set security zones security-zone trust interfaces ge-0/0/0 ge-0/0/1"},
+		{"set security zones security-zone trust interfaces ge-0/0/0 ge-0/0/1 host-inbound-traffic system-services ssh"},
+		{
+			"set security zones security-zone trust interfaces [ ge-0/0/0 ge-0/0/1 ]",
+			"set security zones security-zone trust interfaces ge-0/0/0 host-inbound-traffic system-services ssh",
+		},
+		{
+			"set security zones security-zone trust interfaces ge-0/0/0 host-inbound-traffic system-services ssh",
+			"set security zones security-zone trust interfaces [ ge-0/0/0 ge-0/0/1 ]",
+		},
+		{
+			"set security zones security-zone trust interfaces [ ge-0/0/0 ge-0/0/1 ]",
+			"set security zones security-zone trust interfaces ge-0/0/1 host-inbound-traffic system-services ssh",
+		},
+		{
+			"set security zones security-zone trust interfaces [ ge-0/0/0 ge-0/0/1 ]",
+			"set security zones security-zone trust interfaces [ ge-0/0/0 ge-0/0/2 ]",
+			"set security zones security-zone trust interfaces ge-0/0/0 host-inbound-traffic protocols ospf",
+		},
+		{
+			"set security zones security-zone trust interfaces ge-0/0/0",
+			"set security zones security-zone trust interfaces ge-0/0/0 host-inbound-traffic system-services ssh",
+		},
+	}
+
+	for i, cmds := range spellings {
+		tree := &ConfigTree{}
+		for _, cmd := range cmds {
+			path, err := ParseSetCommand(cmd)
+			if err != nil {
+				t.Fatalf("spelling %d: ParseSetCommand(%q): %v", i, cmd, err)
+			}
+			if err := tree.SetPath(path); err != nil {
+				t.Fatalf("spelling %d: SetPath(%q): %v", i, cmd, err)
+			}
+		}
+		sec := tree.FindChild("security")
+		if sec == nil {
+			t.Fatalf("spelling %d: no security node", i)
+		}
+		zones := sec.FindChild("zones")
+		if zones == nil {
+			t.Fatalf("spelling %d: no zones node", i)
+		}
+		for _, zone := range zones.FindChildren("security-zone") {
+			for _, prop := range zone.Children {
+				if prop.Name() != "interfaces" {
+					continue
+				}
+				// Only CONTAINER nodes matter: the fan reads Keys on a node that
+				// carries a host-inbound-traffic child, and a leaf has no
+				// children. Assert on containers at every depth anyway, so a
+				// refactor that starts nesting containers is caught too.
+				var walk func(n *Node)
+				walk = func(n *Node) {
+					if !n.IsLeaf && len(n.Keys) > 1 && n.Name() != "host-inbound-traffic" {
+						t.Fatalf("spelling %d (%q): flat-set produced a MULTI-KEY interface container Keys=%q — "+
+							"the #6391 fan would treat it as a multi-member bracket body and leak the override "+
+							"to every name in Keys (the #6389 regression). Either SetPath or the "+
+							"security-zone interfaces schema changed; re-derive the discriminator before "+
+							"relaxing this assertion.", i, cmds, n.Keys)
+					}
+					for _, c := range n.Children {
+						walk(c)
+					}
+				}
+				for _, iface := range prop.Children {
+					walk(iface)
+				}
+			}
+		}
+	}
+}
+
+// TestHostInbound6391BracketBodyMembersDoNotShareBackingStore guards the aliasing
+// trap the multi-member fan introduces. mergeHostInbound returns src UNCHANGED
+// when dst is nil (the #4544 no-copy fast path), so storing one parsed body under
+// N member keys without cloning would alias ONE value across all N. A later merge
+// mutates dst IN PLACE, so a subsequent single-scoped override on one member
+// would silently surface on its bracket siblings.
+//
+// Here `ping` is authored on ge-0/0/0 ALONE after the bracket body opened `ssh`
+// on both: ge-0/0/0 must end up with ssh+ping and ge-0/0/1 with ssh ONLY. Without
+// cloneHostInbound, ge-0/0/1 wrongly admits ping too.
+func TestHostInbound6391BracketBodyMembersDoNotShareBackingStore(t *testing.T) {
+	tree := parseHierarchical(t, `
+security {
+    zones {
+        security-zone trust {
+            interfaces {
+                [ ge-0/0/0 ge-0/0/1 ] {
+                    host-inbound-traffic { system-services ssh; }
+                }
+                ge-0/0/0 {
+                    host-inbound-traffic { system-services ping; }
+                }
+            }
+        }
+    }
+}`)
+	assertHostInbound6391(t, compileHostInbound6391(t, tree), map[string]hib6391{
+		"ge-0/0/0": {SystemServices: []string{"ping", "ssh"}},
+		"ge-0/0/1": {SystemServices: []string{"ssh"}},
+	})
+
+	// Pointer independence, not just value equality: the two members must not
+	// share a backing array even when they carry equal token sets.
+	sec := tree.FindChild("security")
+	secCfg := &SecurityConfig{Zones: map[string]*ZoneConfig{}}
+	if err := compileZones(sec.FindChild("zones"), secCfg); err != nil {
+		t.Fatalf("compileZones: %v", err)
+	}
+	zone := secCfg.Zones["trust"]
+	a, b := zone.InterfaceHostInbound["ge-0/0/0"], zone.InterfaceHostInbound["ge-0/0/1"]
+	if a == nil || b == nil {
+		t.Fatalf("expected both members to carry an override, got a=%v b=%v", a, b)
+	}
+	if a == b {
+		t.Fatalf("bracket members share the SAME *HostInboundTraffic — a later in-place merge on one leaks to the other")
+	}
+	if len(a.SystemServices) > 0 && len(b.SystemServices) > 0 &&
+		&a.SystemServices[0] == &b.SystemServices[0] {
+		t.Fatalf("bracket members share the SAME SystemServices backing array")
+	}
 }
 
 // TestHostInbound6391NoSharedBackingStoreAcrossInterfaces guards the aliasing

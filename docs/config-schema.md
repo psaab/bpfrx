@@ -944,54 +944,97 @@ membership (security boundary) loss that also hid the dropped interface from
 the strict `validateZoneInterfaceDefinedStrict` gate. Covered by
 `pkg/config/compiler_zone_interfaces_bracket_5248_test.go`.
 
-**A per-interface `host-inbound-traffic` override is scoped to the SINGLE
-interface it is written under — it NEVER fans out to bracket siblings
-(#6391).** The `zoneInterfaceMembers` flatten above is for zone MEMBERSHIP
-only. Host-inbound is compiled separately and keyed strictly on the direct
-child the stanza hangs under (`iface.Name()` in `compileZones`), never across
-the flattened member set. This matters because the flat-set single-scoped case
-and a hierarchical multi-member `load override` block compile to the SAME AST:
-`interfaces [ ge-0/0/0 ge-0/0/1 ]` followed by
-`interfaces ge-0/0/0 host-inbound-traffic system-services ssh` reuses the FIRST
-member's SetPath container, so the `ge-0/0/0` node carries BOTH the `ge-0/0/1`
-membership leaf AND the host-inbound body — structurally identical to a
-hand-authored `interfaces { ge-0/0/0 { ge-0/0/1; host-inbound-traffic {...} } }`.
-A fanout keyed on the compiled AST alone therefore cannot tell "scope ssh to
-`ge-0/0/0` only" from "apply to every bracket member", so fanning the override
-across `zoneInterfaceMembers` (attempted in PR #6389, closed unmerged) OPENS ssh
-on `ge-0/0/1`, which the operator never configured — an over-permission /
-host-inbound leak.
+**A per-interface `host-inbound-traffic` override is scoped by the KEYS of the
+node it is authored on, never by that node's CHILDREN (#6391).** The
+`zoneInterfaceMembers` flatten above is for zone MEMBERSHIP only — it recurses
+into children. Host-inbound is compiled separately and deliberately does NOT: it
+applies to every name in `iface.Keys` and stops there.
 
-Two properties, do NOT conflate them:
+That distinction exists because the two shapes below are NOT the same AST, which
+is the opposite of what this document asserted before #6391 (it claimed they were
+"structurally identical" and that no AST-keyed fan could separate them — a claim
+disproved by dumping both):
 
-- **Individually-scoped isolation (UNCONDITIONAL invariant).** A service
-  authored under ONE named interface via its own `set` statement
+| authored as | compiled AST | meaning |
+|---|---|---|
+| `interfaces { [ ge-0/0/0 ge-0/0/1 ] { host-inbound-traffic {...} } }` | ONE container `Keys=["ge-0/0/0","ge-0/0/1"]`, **no** membership child | multi-member intent → **both** members |
+| `set ... interfaces [ ge-0/0/0 ge-0/0/1 ]`<br>`set ... interfaces ge-0/0/0 host-inbound-traffic system-services ssh` | container `Keys=["ge-0/0/0"]` with membership **child leaf** `Keys=["ge-0/0/1"]` | ssh scoped to `ge-0/0/0` **only** |
+
+`SetPath` descends the wildcard for the FIRST bracket token and nests the tail
+under it, then the second `set` REUSES that same `ge-0/0/0` container — which is
+why the container ends up carrying both the `ge-0/0/1` membership leaf and the
+host-inbound body even though ssh is single-scoped. Fanning across
+`zoneInterfaceMembers` (children included) is exactly what PR #6389 did, and it
+OPENS ssh on `ge-0/0/1`, which the operator never configured — an over-permission
+/ host-inbound leak (admission is additive, `host_inbound_view.go`). #6389 closed
+unmerged.
+
+**What genuinely IS identical** — and the reason the children-fan leaks so
+broadly — is the flat-set shape above and the hand-authored
+`interfaces { ge-0/0/0 { ge-0/0/1; host-inbound-traffic {...} } }`. The latter is
+the former's SERIALIZATION: `ConfigTree.Format()` (the render `configstore`
+persists through, and the one HA config sync ships via `ShowActive()`) emits
+literally that text, and re-parsing it is byte-identical. So a fan that fires on
+that shape leaks on every RELOAD of an ordinary single-scoped config, and
+first-member-only is the permanently correct answer there — not a compromise.
+
+**Why keying on `Keys` is safe, not merely convenient.** A false positive here
+would re-open the #6389 leak, so the load-bearing property is that **no
+`set`-authored config can produce a multi-key interface container**. That holds by
+schema construction: the interface name is `schemaNode.wildcard` with `args: 0`,
+`multi: false`, `compoundKey: false` (`schema_security.go`), so `SetPath`'s
+`nodeKeyCount = 1 + childSchema.args` is ALWAYS 1 and its container branch stores
+exactly one token. Surplus bracket tokens can only land on a child LEAF, which has
+no `host-inbound-traffic` child and is therefore never read by the fan. The
+multi-key shape is reachable ONLY from a hierarchical parse (`load override`, a
+hand-authored config file). `ExpandGroups` preserves the distinction (an inherited
+multi-key node stays a separate sibling rather than merging into a single-key
+one).
+
+Scope rules that follow:
+
+- **Individually-scoped isolation (UNCONDITIONAL).** A service authored under ONE
+  named interface via its own `set` statement
   (`interfaces ge-0/0/0 host-inbound-traffic system-services ssh`) is
-  single-scoped by definition and must NEVER appear on a sibling — under every
-  design option. This holds today and must keep holding after any future fix.
+  single-scoped and must NEVER appear on a sibling.
+- **Multi-member body applies to every member.** A body authored ON a bracket
+  membership (`interfaces [ ge-0/0/0 ge-0/0/1 ] { host-inbound-traffic { ... } }`)
+  applies to both. This is an admission WIDENING relative to pre-#6391, which
+  applied it to the first member only — see the operator note in
+  `docs/host-inbound-service-matrix.md`.
+- **A nested extra membership is out of scope.**
+  `[ a b ] { c; host-inbound {...} }` fans to `a` and `b` but NOT `c`: `c` is a
+  nested membership statement, not a bracket sibling of the authored node, so it
+  is in the same position as the flat-set `b` leaf. `c` remains a zone MEMBER and
+  falls back to the zone-level host-inbound.
+- **Members do not share a backing store.** `mergeHostInbound` returns `src`
+  unchanged when `dst` is nil, so the fan clones per key (`cloneHostInbound`).
+  Without that, a later single-scoped override merged into one member would
+  mutate the value its bracket siblings point at.
 
-- **Multi-member body (CURRENT fail-safe, pending a design call).** A
-  host-inbound BODY hanging off a bracket membership itself
-  (`interfaces [ ge-0/0/0 ge-0/0/1 ] { host-inbound-traffic { ... } }`, or the
-  `ge-0/0/0 { ge-0/0/1; host-inbound-traffic { ... } }` load-override artifact)
-  currently applies to the first member ONLY. That is the issue's **option 1**
-  (fail-safe): the override stays on the single named interface and a bracketed
-  multi-member intent UNDER-applies (a sibling falls back to the zone-level
-  host-inbound) rather than over-admitting. This is the current default, NOT the
-  final multi-member semantics — making the multi-member intent apply to every
-  member without the flat-set leak needs parse-time scope disambiguation
-  (options 2/3), still an OPEN design call on #6391.
+**Round-trip limitation (#6668, pre-existing, NOT introduced by #6391).** The
+multi-key shape survives `Format()` → `NewParser` (local persistence) and HA
+config sync byte-for-byte, but it does NOT survive `show | display set`:
+`FormatSet()` emits
+`set ... interfaces ge-0/0/0 ge-0/0/1 host-inbound-traffic system-services ssh`,
+which replays into a single garbage leaf
+`Keys=["ge-0/0/1","host-inbound-traffic","system-services","ssh"]` and then fails
+to compile (`zone "trust" references interface "host-inbound-traffic"`). It fails
+CLOSED, but it means the multi-member fan is not durable through a display-set
+round-trip. Tracked separately as #6668.
 
-Both properties are pinned by
+All of the above is pinned by
 `pkg/config/compiler_zone_iface_hostinbound_sibling_6391_test.go`, which asserts
-the FULL per-interface host-inbound map (every interface, both system-services
-AND protocols). Re-introducing the #6389 fanout turns the CONTAINER-SHARING
-cases RED — first-member, three-member, multi-service, protocols, and the two
-hierarchical multi-member-body cases — while the later-member and
-no-shared-backing-store cases stay GREEN CONTROLS (their interfaces do not share
-a SetPath container, so the fanout cannot touch them). The two multi-member-body
-cases assert current option-1 behavior only; an options-2/3 fix intentionally
-updates those two expectations.
+the FULL per-interface host-inbound map (every interface, both system-services AND
+protocols). Re-introducing a children-fan turns the CONTAINER-SHARING cases RED
+(first-member, three-member, multi-service, protocols, and the
+`a { b; host-inbound }` serialization case); reverting the Keys-fan turns
+`TestHostInbound6391HierarchicalBracketBodyFansToAllMembers` RED. The later-member
+and no-shared-backing-store cases stay GREEN CONTROLS (their interfaces do not
+share a SetPath container). `TestHostInbound6391FlatSetNeverYieldsMultiKeyContainer`
+guards the negative direction — a future `SetPath` or schema change that let
+flat-set yield a multi-key container fails there rather than silently widening
+admission.
 
 **Sibling leaves on ONE flat-set line also collapse into a NESTED chain, not
 siblings — the third collapse pattern (#6524).** The two patterns above cover a
