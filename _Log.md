@@ -74081,3 +74081,32 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/cli/identity.go, pkg/cli/identity_6701_test.go,
   pkg/config/compiler_system_login_packed_6662_test.go, docs/system-login.md,
   _Log.md
+
+- **Timestamp**: 2026-08-01 (round 3 — independent-review folds)
+- **Action**: #6706 folds. MINOR-2: nothing bound the daemon to the shared
+  resolver — mutation M15 inlined a faithful copy into applyCLILoginClass and
+  the WHOLE suite stayed green. Added a structural canary (every SetUserClass
+  writer must CALL cli.ResolveLoginClass) with a synthetic detector; proved it
+  reds on an inline copy while pkg/daemon + pkg/osident behavioural tests stay
+  GREEN. MINOR-4: the completeness drift guard skipped every schema node with
+  args != 0 — guard scope narrower than the claim. Widened to every
+  children-bearing node at any arity, which required the gate to know each
+  statement's arity (an args-bearing block carries its arg on Keys in the
+  CORRECT nested spelling, so `len(Keys) > 1` would reject the very form the
+  gate accepts); loginBlockOnlyStatements now records arity and a guard asserts
+  it equals the schema's. MINOR-1: the id.Resolved() test in candidateNames is
+  the ONLY protection against an unidentifiable caller matching a configured
+  user, and `system login user "" { class super-user; }` compiles CLEAN
+  (measured). Bound it, and separated PROTECTION from MESSAGE — mutation showed
+  the review's cited line (!id.Resolved() in ResolveLoginClass) selects only the
+  denial wording. MAJOR-1 was verified FALSE at ac5c47639 by the coordinator
+  (already closed by the round-2 fix) and left untouched. MINOR-3 (uid-collision
+  surface) recorded in the PR body as an accepted consequence. OBS-2: verified
+  firsthand that pkg/cli.New has ONE caller gated on isInteractive() and that
+  pkg/grpcapi + pkg/api contain ZERO permission checks; rewrote the PR body to
+  stop claiming a CLI RBAC boundary. Did NOT file a new issue for the
+  enforcement gap — #5278, #5561 and #6660 already cover it.
+- **File(s)**: pkg/cli/identity.go, pkg/cli/identity_6701_test.go,
+  pkg/cli/userclass_entrypoint_canary_test.go,
+  pkg/config/compiler_system_login_gates.go,
+  pkg/config/compiler_system_login_packed_6662_test.go, _Log.md
