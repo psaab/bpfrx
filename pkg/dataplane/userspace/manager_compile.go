@@ -325,10 +325,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 		return result, err
 	}
 	if err := m.ensureRequiredSnapshotProtocolLocked(cfg); err != nil {
-		if disarmErr := m.disarmSnapshotProtocolFailureLocked(err); disarmErr != nil {
-			return result, errors.Join(err, disarmErr)
-		}
-		return result, err
+		return result, m.disarmSnapshotProtocolFailClosedLocked(snap, err, samePlanRefresh)
 	}
 	if m.deferWorkers {
 		snap.DeferWorkers = true
@@ -818,6 +815,47 @@ func (m *Manager) ensureRequiredSnapshotProtocolLocked(cfg *config.Config) error
 		return err
 	}
 	return m.ensureScopedGlobalZoneSetProtocolLocked(cfg)
+}
+
+// disarmSnapshotProtocolFailClosedLocked is the shared fail-closed action for a
+// required-protocol gate hit on a publish path (#5488 F7). It disarms the helper
+// — the fail-closed contract of requiredProtocolGateSentinels — and, when the
+// disarm ITSELF fails, additionally drives the userspace_ctrl shim to Enabled=0
+// on the paths whose classifier BPF maps were already mutated IN PLACE.
+//
+// Why the extra step. A failed disarm leaves the helper ARMED on its
+// previous-good Rust snapshot. On a same-plan refresh the ingress/local/
+// interface-NAT classifier maps were already rewritten to the NEW plan with
+// ctrl still enabled (syncUserspaceClassifierMapsFailClosedLocked), so simply
+// returning would leave the XDP shim redirecting transit to XSK against maps a
+// generation AHEAD of the snapshot the helper is enforcing. That is precisely
+// the "fail-OPEN security/availability mismatch" failClosedUserspaceCtrlMapLocked
+// exists to prevent (#4959), and the reason publishSnapshotFailClosedLocked
+// takes the same mapsMutatedInPlace flag. Driving ctrl to 0 drops transit to the
+// kernel-only fail-closed posture until a later good commit re-publishes.
+//
+// mapsMutatedInPlace MUST mirror the flag the caller passes to
+// publishSnapshotFailClosedLocked, which is the codebase's oracle for "the
+// classifier maps are ahead of the applied snapshot": samePlanRefresh in Compile,
+// unconditionally true in syncSnapshotLocked (its only producer of an
+// unpublished lastSnapshot is Compile's pendingXSKStartup branch, which always
+// mutates the maps in place). The bootstrap path already programmed
+// ctrl.Enabled=0, so it needs no extra fail-closed.
+//
+// Every failClosedUserspaceCtrlMapLocked return path PRESERVES cause (returned
+// as-is, or wrapped with errors.Join), so the gate sentinel still satisfies
+// IsRequiredProtocolGateError and the commit still ABORTS. A fail-closed disarm
+// must never be downgraded into a promoted commit (#2138).
+func (m *Manager) disarmSnapshotProtocolFailClosedLocked(snapshot *ConfigSnapshot, protocolErr error, mapsMutatedInPlace bool) error {
+	disarmErr := m.disarmSnapshotProtocolFailureLocked(protocolErr)
+	if disarmErr == nil {
+		return protocolErr
+	}
+	joined := errors.Join(protocolErr, disarmErr)
+	if !mapsMutatedInPlace {
+		return joined
+	}
+	return m.failClosedUserspaceCtrlMapLocked(snapshot, joined)
 }
 
 func (m *Manager) disarmSnapshotProtocolFailureLocked(protocolErr error) error {

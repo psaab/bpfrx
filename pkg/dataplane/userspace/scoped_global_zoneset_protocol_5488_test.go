@@ -249,31 +249,126 @@ func TestScopedGlobalSingleZoneAndUnscopedPolicyNotGated(t *testing.T) {
 	}
 }
 
-// TestScopedGlobalZoneSetGateCoversZonePairTier pins the gate to the whole
-// emission surface. lowerPolicy stamps MatchFromZone/MatchToZone from
-// pol.Match.FromZones/ToZones for EVERY rule, not just the global tier, so a
-// multi-zone scope reaching a zone-pair policy must be gated too.
-func TestScopedGlobalZoneSetGateCoversZonePairTier(t *testing.T) {
-	cfg := &config.Config{Security: config.SecurityConfig{
-		Policies: []*config.ZonePairPolicies{{
-			FromZone: "trust", ToZone: "untrust",
-			Policies: []*config.Policy{{
-				Name: "zp-scoped",
+// TestScopedGlobalZoneSetGateCoversBothScopeSides pins BOTH halves of
+// policyScopeIsMultiZone (`len(FromZones) > 1 || len(ToZones) > 1`) to a
+// reachable config, and the predicate to the whole emission surface.
+//
+// The to-zone half needs its own REACHABLE positive case: an ordinary Junos
+// `global policy p match { from-zone trust; to-zone [ untrust dmz ]; }` is a
+// multi-zone scope on the TO side only, and `ScopeSingular` narrows it to
+// `untrust` exactly as it narrows the from side. Without this row the to-zone
+// half of the predicate would be pinned only by the zone-pair row below, whose
+// shape the compiler never actually produces (`compiler_security_policy.go`
+// populates Match.FromZones/ToZones only for global policies) — a guard scoped
+// narrower than the claim it protects, and one a future cleanup could delete as
+// "tests an unreachable branch".
+func TestScopedGlobalZoneSetGateCoversBothScopeSides(t *testing.T) {
+	globalScoped := func(name string, from, to []string) *config.Config {
+		return &config.Config{Security: config.SecurityConfig{
+			GlobalPolicies: []*config.Policy{{
+				Name: name,
 				Match: config.PolicyMatch{
 					SourceAddresses:      []string{"any"},
 					DestinationAddresses: []string{"any"},
 					Applications:         []string{"any"},
-					ToZones:              []string{"untrust", "dmz"},
+					FromZones:            from,
+					ToZones:              to,
 				},
 				Action: config.PolicyDeny,
 			}},
-		}},
-	}}
-	m := New()
-	m.lastStatus.ConfigSnapshotProtocolVersion = preV4SnapshotProtocolVersion
-	if err := m.ensureScopedGlobalZoneSetProtocolLocked(cfg); !errors.Is(err, ErrScopedGlobalZoneSetProtocolIncompatible) {
-		t.Errorf("zone-pair tier multi-zone scope = %v, want ErrScopedGlobalZoneSetProtocolIncompatible", err)
+		}}
 	}
+
+	cases := []struct {
+		name        string
+		cfg         *config.Config
+		wantSingFrm string
+		wantSingTo  string
+	}{
+		{
+			// The from-side hazard (the shape in the issue report).
+			name:        "global multi-zone FROM side",
+			cfg:         globalScoped("g-from-multi", []string{"dmz", "trust"}, []string{"untrust"}),
+			wantSingFrm: "dmz", wantSingTo: "untrust",
+		},
+		{
+			// The to-side hazard — reachable, ordinary Junos:
+			//   global policy g match { from-zone trust; to-zone [ untrust dmz ]; }
+			name:        "global multi-zone TO side",
+			cfg:         globalScoped("g-to-multi", []string{"trust"}, []string{"dmz", "untrust"}),
+			wantSingFrm: "trust", wantSingTo: "dmz",
+		},
+		{
+			name:        "global multi-zone BOTH sides",
+			cfg:         globalScoped("g-both-multi", []string{"dmz", "trust"}, []string{"untrust", "wan"}),
+			wantSingFrm: "dmz", wantSingTo: "untrust",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// The narrowing is real on this shape: the singular field a pre-v4
+			// helper reads resolves a STRICTLY smaller scope than configured.
+			snaps, err := buildPolicySnapshots(tc.cfg)
+			if err != nil {
+				t.Fatalf("buildPolicySnapshots: %v", err)
+			}
+			if len(snaps) != 1 {
+				t.Fatalf("expected 1 lowered rule, got %d", len(snaps))
+			}
+			s := snaps[0]
+			if s.MatchFromZone != tc.wantSingFrm || s.MatchToZone != tc.wantSingTo {
+				t.Errorf("singular scope = %q->%q, want %q->%q",
+					s.MatchFromZone, s.MatchToZone, tc.wantSingFrm, tc.wantSingTo)
+			}
+			narrowed := false
+			if got := preV4HelperEffectiveScope(s.MatchFromZone); len(got) < len(s.effectiveMatchFromZones()) {
+				narrowed = true
+			}
+			if got := preV4HelperEffectiveScope(s.MatchToZone); len(got) < len(s.effectiveMatchToZones()) {
+				narrowed = true
+			}
+			if !narrowed {
+				t.Fatalf("precondition failed: neither side is narrowed by a singular-only reader "+
+					"(from %q->%q, to %q->%q); this row no longer exercises the #5488 fail-open",
+					s.MatchFromZone, s.effectiveMatchFromZones(), s.MatchToZone, s.effectiveMatchToZones())
+			}
+
+			m := New()
+			m.lastStatus.ConfigSnapshotProtocolVersion = preV4SnapshotProtocolVersion
+			if err := m.ensureScopedGlobalZoneSetProtocolLocked(tc.cfg); !errors.Is(err, ErrScopedGlobalZoneSetProtocolIncompatible) {
+				t.Errorf("gate = %v, want ErrScopedGlobalZoneSetProtocolIncompatible", err)
+			}
+		})
+	}
+
+	// Defensive breadth: lowerPolicy stamps the singular fields from the same
+	// Match for EVERY rule, not just the global tier, so the predicate scans the
+	// zone-pair tier too. The compiler does not produce this shape today
+	// (compiler_security_policy.go populates the scope only for globals), so
+	// this row guards the emission surface rather than a reachable config.
+	t.Run("zone-pair tier (defensive, not compiler-reachable)", func(t *testing.T) {
+		cfg := &config.Config{Security: config.SecurityConfig{
+			Policies: []*config.ZonePairPolicies{{
+				FromZone: "trust", ToZone: "untrust",
+				Policies: []*config.Policy{{
+					Name: "zp-scoped",
+					Match: config.PolicyMatch{
+						SourceAddresses:      []string{"any"},
+						DestinationAddresses: []string{"any"},
+						Applications:         []string{"any"},
+						ToZones:              []string{"untrust", "dmz"},
+					},
+					Action: config.PolicyDeny,
+				}},
+			}},
+		}}
+		m := New()
+		m.lastStatus.ConfigSnapshotProtocolVersion = preV4SnapshotProtocolVersion
+		if err := m.ensureScopedGlobalZoneSetProtocolLocked(cfg); !errors.Is(err, ErrScopedGlobalZoneSetProtocolIncompatible) {
+			t.Errorf("zone-pair tier multi-zone scope = %v, want ErrScopedGlobalZoneSetProtocolIncompatible", err)
+		}
+	})
 }
 
 // TestSnapshotProtocolVersionLockstepWithRust guards the failure mode that

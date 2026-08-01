@@ -2,7 +2,6 @@ package userspace
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -84,11 +83,14 @@ func (m *Manager) syncSnapshotLocked() error {
 	// for parity with update_neighbors path.
 	publishSnap := *m.lastSnapshot
 	publishSnap.Neighbors = filterPublishableNeighbors(m.lastSnapshot.Neighbors)
+	// #5488 (F7): mapsMutatedInPlace is unconditionally true here for the same
+	// reason the publishSnapshotFailClosedLocked call below passes true — the
+	// only producer of an unpublished lastSnapshot is Compile's pendingXSKStartup
+	// branch, which ALWAYS mutated the classifier maps in place first. So a
+	// failed disarm here must also drive ctrl to 0 rather than leave the shim
+	// running maps a generation ahead of the applied snapshot.
 	if err := m.ensureRequiredSnapshotProtocolLocked(publishSnap.Config); err != nil {
-		if disarmErr := m.disarmSnapshotProtocolFailureLocked(err); disarmErr != nil {
-			return errors.Join(err, disarmErr)
-		}
-		return err
+		return m.disarmSnapshotProtocolFailClosedLocked(&publishSnap, err, true)
 	}
 	// #2124: this is the XSK-startup deferred same-plan publish path, which
 	// publishes apply_snapshot independently of Compile(). Disarm before

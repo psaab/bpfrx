@@ -65647,3 +65647,49 @@ break — `go vet` confirmed passing under every revert.
   pkg/dataplane/userspace/scoped_global_zoneset_protocol_5488_test.go,
   userspace-dp/src/protocol/control.rs,
   docs/userspace-dataplane-architecture.md, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-08-01
+- **Action**: #5488 review fold (PR #6644, 5 items). **F4 — guard scope narrower
+  than the claim:** `policyScopeIsMultiZone` tests `len(FromZones) > 1 ||
+  len(ToZones) > 1`, but the only test pinning the to-zone half used a zone-pair
+  policy carrying `Match.ToZones` — a shape the compiler never produces
+  (`compiler_security_policy.go` populates the scope only for globals). Added
+  `TestScopedGlobalZoneSetGateCoversBothScopeSides` with REACHABLE rows for a
+  global scoped `from-zone trust; to-zone [ dmz untrust ]` (to-side), the from
+  side, and both sides — each asserting the singular field really is narrowed
+  before asserting the gate fires. The zone-pair row is kept, relabelled as
+  defensive breadth over the emission surface. Re-ran the to-zone-half mutation:
+  the NEW reachable row reds, not just the defensive one. **F7 — ctrl fail-close
+  on a FAILED disarm:** when `disarmSnapshotProtocolFailureLocked` errors the
+  helper stays ARMED on its previous-good snapshot, and on a same-plan refresh
+  the classifier maps were already mutated in place with ctrl enabled — the
+  shim then runs maps a generation ahead of the applied snapshot (the #4959
+  fail-open). Extracted `disarmSnapshotProtocolFailClosedLocked`, which drives
+  `userspace_ctrl` to Enabled=0 via `failClosedUserspaceCtrlMapLocked` on that
+  branch. Scope was set by the codebase's own oracle: `publishSnapshotFailClosedLocked`
+  has exactly TWO callers (Compile with `samePlanRefresh`, `syncSnapshotLocked`
+  with `true`), and BOTH had the identical hazard — so the sibling
+  `process_status.go` site is fixed too rather than shipping a fix narrower
+  than the defect. The other three gate call sites (route overlay, deferred
+  worker arm, HA reconcile) use a bare `requestLocked` and mutate no maps
+  first, so they are correctly out of scope. Every
+  `failClosedUserspaceCtrlMapLocked` return path preserves `cause`, so the
+  sentinel still satisfies `IsRequiredProtocolGateError` and the commit still
+  aborts — asserted explicitly. **F5** — disclosed the node-LOCAL residual
+  (#6650): the version never crosses the cluster heartbeat, so config-sync to a
+  pre-v4 PEER still narrows the deny. **F1/F2/F3** — refreshed the stale
+  two-gate enumerations in `userspace-dp/src/server/README.md`,
+  `docs/userspace-dataplane-gaps.md`, and `pkg/daemon/daemon_apply.go`.
+  Validation: both mutations red as ASSERTIONS with `go build ./...` +
+  `go vet ./...` CLEAN; the F7 scope controls (bootstrap path, successful
+  disarm) and all pre-existing #4959 tests stay green under the F7 mutation.
+  The F7 behavioral test needs memlock privileges (like its #4959 siblings) —
+  verified under `sudo` that all three sub-tests genuinely RUN and pass, not
+  skip. Full `go test ./...` and the Rust cargo suite green.
+- **File(s)**: pkg/dataplane/userspace/manager_compile.go,
+  pkg/dataplane/userspace/process_status.go,
+  pkg/dataplane/userspace/scoped_global_zoneset_protocol_5488_test.go,
+  pkg/dataplane/userspace/scoped_global_zoneset_failclosed_5488_test.go,
+  pkg/daemon/daemon_apply.go, userspace-dp/src/server/README.md,
+  docs/userspace-dataplane-architecture.md, docs/userspace-dataplane-gaps.md,
+  _Log.md

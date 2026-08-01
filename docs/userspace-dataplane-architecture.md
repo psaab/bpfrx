@@ -1640,6 +1640,27 @@ global emits neither side, so neither can be narrowed by a singular-only
 reader and neither is gated; that keeps the disarm blast radius to
 exactly the misrepresentable population.
 
+If the disarm ITSELF fails, the helper is still armed on its
+previous-good snapshot — and on a publish path whose classifier BPF maps
+were already mutated in place, the shim would be redirecting transit to
+XSK against maps a generation ahead of what the helper is enforcing. So
+`disarmSnapshotProtocolFailClosedLocked` additionally drives
+`userspace_ctrl` to `Enabled=0` on exactly the two paths that pass
+`mapsMutatedInPlace=true` to `publishSnapshotFailClosedLocked` (Compile's
+`samePlanRefresh` and `syncSnapshotLocked`), dropping transit to the
+kernel-only fail-closed posture. The wrap preserves the gate sentinel, so
+the commit still aborts.
+
+**Residual: this version is node-LOCAL (#6650).** The snapshot protocol
+version governs the daemon↔local-helper socket only; it never crosses the
+cluster heartbeat. In a mixed-version HA pair, node A (v4) commits a
+multi-zone scope, its own gate does not fire because its own helper is
+v4, and `pushCommittedConfigToPeer` ships the config TEXT to node B —
+whose v3 daemon compiles it and narrows the deny against its own v3
+helper. That is the same fail-open relocated from "old helper" to "old
+peer node", and it is NOT closed here: closing it needs a scope signal on
+the config-sync/heartbeat wire. Tracked as #6650.
+
 ### Control-socket request size cap (#2523, #2744)
 
 Each control-socket request is a single newline-delimited JSON body. The
