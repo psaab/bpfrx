@@ -4093,9 +4093,13 @@ type EventEntry struct {
 	// consuming GetEvents can reproduce the full close record. All are
 	// additive (new field numbers, no renumber). 0 / "" means the event
 	// did not carry the field (e.g. a non-close event, or no NAT applied).
-	NatSrcAddr     string `protobuf:"bytes,21,opt,name=nat_src_addr,json=natSrcAddr,proto3" json:"nat_src_addr,omitempty"`              // post-NAT source "ip:port" ("" = no NAT)
-	NatDstAddr     string `protobuf:"bytes,22,opt,name=nat_dst_addr,json=natDstAddr,proto3" json:"nat_dst_addr,omitempty"`              // post-NAT destination "ip:port"
-	SessionId      uint64 `protobuf:"varint,23,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`                  // unique session identifier
+	NatSrcAddr string `protobuf:"bytes,21,opt,name=nat_src_addr,json=natSrcAddr,proto3" json:"nat_src_addr,omitempty"` // post-NAT source "ip:port" ("" = no NAT)
+	NatDstAddr string `protobuf:"bytes,22,opt,name=nat_dst_addr,json=natDstAddr,proto3" json:"nat_dst_addr,omitempty"` // post-NAT destination "ip:port"
+	// Node-local dataplane session id (the #4915 [152:160] ringbuf slot): unique
+	// within this node, but NOT the same on both cluster nodes (#6198). Use it to
+	// correlate this event with `show security flow session` on THIS node; it is
+	// not a cross-node key.
+	SessionId      uint64 `protobuf:"varint,23,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
 	ElapsedTime    uint32 `protobuf:"varint,24,opt,name=elapsed_time,json=elapsedTime,proto3" json:"elapsed_time,omitempty"`            // seconds since session creation (CLOSE)
 	Created        uint32 `protobuf:"varint,25,opt,name=created,proto3" json:"created,omitempty"`                                       // absolute session-creation Unix seconds (CLOSE)
 	CreatedNanos   uint32 `protobuf:"varint,26,opt,name=created_nanos,json=createdNanos,proto3" json:"created_nanos,omitempty"`         // sub-second nanosecond remainder of created

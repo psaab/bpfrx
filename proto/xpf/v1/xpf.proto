@@ -538,7 +538,11 @@ message EventEntry {
   // did not carry the field (e.g. a non-close event, or no NAT applied).
   string nat_src_addr = 21;     // post-NAT source "ip:port" ("" = no NAT)
   string nat_dst_addr = 22;     // post-NAT destination "ip:port"
-  uint64 session_id = 23;       // unique session identifier
+  // Node-local dataplane session id (the #4915 [152:160] ringbuf slot): unique
+  // within this node, but NOT the same on both cluster nodes (#6198). Use it to
+  // correlate this event with `show security flow session` on THIS node; it is
+  // not a cross-node key.
+  uint64 session_id = 23;
   uint32 elapsed_time = 24;     // seconds since session creation (CLOSE)
   uint32 created = 25;          // absolute session-creation Unix seconds (CLOSE)
   uint32 created_nanos = 26;    // sub-second nanosecond remainder of created
