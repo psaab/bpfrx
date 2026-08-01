@@ -296,3 +296,366 @@ fn protocols_all_admits_ip_routing_not_l2() {
         "`protocols all` must not admit IS-IS (proto 124) — L2/OSI, handled by FRR",
     );
 }
+
+// #3226: `system-services all` is the union of the DEFINED system services
+// (Junos: "traffic from the defined system services available on the Routing
+// Engine"), NOT a packet-wide admit. Before #3226 the `all` arm set
+// `all_services = true`, which short-circuits `ZoneHostInbound::admits` to
+// `true` for EVERY protocol/port — so an `all` zone accepted GRE/ESP/AH/OSPF/
+// PIM/VRRP and any future protocol number on its local addresses. This asserts
+// the per-packet VERDICT on the AF_XDP classifier, the mirror of the Go
+// TestClassifyHostInboundSystemServicesAllScopedToNamedServices and the nft
+// TestHostInboundNftSystemServicesAllIsScopedNotBlanket.
+//
+// FAIL-ON-REVERT: fold `all` back into the `any-service` arm (or make
+// system_service_all_expansion yield nothing) and the DENIED assertions flip.
+#[test]
+fn system_services_all_is_scoped_not_packet_wide() {
+    const TCP: u8 = 6;
+    const UDP: u8 = 17;
+    const ZONE: u16 = 11;
+
+    let mut state = ForwardingState::default();
+    state
+        .zone_host_inbound
+        .insert(ZONE, zone_host_inbound_from_tokens(&["all".to_string()], &[]));
+
+    // ADMITTED: the named system-service union `all` stands for.
+    for (name, proto, port) in [
+        ("ssh", TCP, 22u16),
+        ("https", TCP, 443),
+        ("telnet", TCP, 23),
+        ("snmp", UDP, 161),
+        ("ntp", UDP, 123),
+        ("ike", UDP, 500),
+        ("netconf", TCP, 830),
+    ] {
+        assert!(
+            host_inbound_admits(&state, ZONE, proto, port, false, 0),
+            "`system-services all` must admit {name} ({proto}/{port}) — it expands to the named service union",
+        );
+    }
+
+    // DENIED: raw IP protocols Junos's `all` never opens. ESP(50)/AH(51) are
+    // deliberately omitted — they carry an unconditional host-terminated-IPsec
+    // accept upstream of this classifier, so they prove nothing here.
+    for (name, proto) in [
+        ("ospf", 89u8),
+        ("gre", 47),
+        ("vrrp", 112),
+        ("pim", 103),
+        ("nhrp", 54),
+        ("future-proto-253", 253),
+    ] {
+        assert!(
+            !host_inbound_admits(&state, ZONE, proto, 0, false, 0),
+            "`system-services all` must DENY raw IP protocol {name} ({proto}) — it is not a packet-wide admit (#3226)",
+        );
+    }
+
+    // DENIED: an unlisted TCP port — the per-zone default deny is re-armed.
+    assert!(
+        !host_inbound_admits(&state, ZONE, TCP, 9999, false, 0),
+        "`system-services all` must DENY an unlisted tcp/9999 (#3226)",
+    );
+
+    // The v6 family behaves identically for the dual-family services.
+    assert!(
+        host_inbound_admits(&state, ZONE, TCP, 22, true, 0),
+        "`system-services all` must admit ssh on IPv6 too",
+    );
+    assert!(
+        !host_inbound_admits(&state, ZONE, 89, 0, true, 0),
+        "`system-services all` must DENY ospf3/proto-89 on IPv6 too (#3226)",
+    );
+}
+
+// #3226 over-reach guard: `any-service` REMAINS the packet-wide escape hatch
+// (Junos: "all system services on an entire port range including the system
+// services that are not defined"). If the narrowing were mistakenly applied to
+// `any-service` as well, every assertion here flips.
+#[test]
+fn any_service_remains_full_admit() {
+    const ZONE: u16 = 12;
+
+    let mut state = ForwardingState::default();
+    state.zone_host_inbound.insert(
+        ZONE,
+        zone_host_inbound_from_tokens(&["any-service".to_string()], &[]),
+    );
+
+    for (name, proto, port) in [
+        ("ospf", 89u8, 0u16),
+        ("gre", 47, 0),
+        ("vrrp", 112, 0),
+        ("unlisted tcp/9999", 6, 9999),
+    ] {
+        assert!(
+            host_inbound_admits(&state, ZONE, proto, port, false, 0),
+            "`any-service` must remain a full admit for {name} — it is the documented escape hatch (#3226)",
+        );
+    }
+}
+
+// #3226: the `system-services all` expansion EXCLUDES the xpf-only extension
+// tokens (HOST_INBOUND_NON_JUNOS_SERVICES) — the load-bearing job of that set
+// on this surface, mirroring HOST_INBOUND_L2_PROTOCOLS for `protocols all`.
+// `gre` is a recognized xpf system-service (so the exclusion is meaningful) but
+// is NOT a Junos system service, so folding it into `all` would make `all` open
+// IP protocol 47 that Junos's `all` never opens.
+//
+// FAIL-ON-REVERT: remove "gre" from HOST_INBOUND_NON_JUNOS_SERVICES and it
+// reappears in the expansion, turning the exclusion assertion RED.
+#[test]
+fn system_services_all_excludes_non_junos_extensions() {
+    let expansion: Vec<&str> = system_service_all_expansion().collect();
+
+    for x in HOST_INBOUND_NON_JUNOS_SERVICES {
+        assert!(
+            !expansion.contains(x),
+            "xpf-only service {x:?} must be excluded from the `system-services all` expansion",
+        );
+    }
+    assert!(
+        KNOWN_SYSTEM_SERVICE_TOKENS.contains(&"gre"),
+        "gre must be a recognized system-service token (so the exclusion is meaningful)",
+    );
+    assert!(
+        !expansion.contains(&"gre"),
+        "gre (xpf extension) must not appear in the `system-services all` expansion",
+    );
+    // The two meta tokens must never appear — `all` would recurse forever.
+    for meta in ["all", "any-service"] {
+        assert!(
+            !expansion.contains(&meta),
+            "meta token {meta:?} must not appear in the `system-services all` expansion (recursion / semantics)",
+        );
+    }
+    // Sanity: real Junos system services still expand.
+    for s in ["ssh", "https", "snmp", "ping", "ntp", "ident-reset"] {
+        assert!(
+            expansion.contains(&s),
+            "Junos system service {s:?} must remain in the `system-services all` expansion",
+        );
+    }
+}
+
+// #3226 fold, fail-CLOSED half: scoping `all` to the recognized-token union
+// only preserves Junos semantics if that union CONTAINS every service Juniper
+// defines. Several did not exist on either surface, so an authored `all`
+// stopped admitting them with no in-grammar way to restore them (the Go strict
+// validator rejects any token outside the same allowlist).
+//
+// The set is derived from Juniper's published YANG schema, extracted into
+// pkg/config/testdata/junos-es-conf-security@2024-01-01.yang.gz — NOT from
+// the prose reference pages, which are individually incomplete and had this
+// union wrong three times.
+//
+// This test covers only the tokens with a port Juniper actually FIXES:
+//
+//   reverse-telnet tcp/2900, reverse-ssh tcp/2901
+//       explicit YANG `default` statements on
+//       `[edit system services reverse telnet|ssh] port`.
+//   lsselfping udp/8503
+//       RFC 7746 §3/§6 (IANA `lsp-self-ping`). NOT 3503 — that is `lsping`.
+//
+// The remaining Junos services in the union have no authoritative tuple xpf can
+// admit and are
+// covered by `unported_services_admit_nothing_3226` instead.
+//
+// Rust mirror of the Go TestClassifyHostInboundAllAdmitsDocumentedJunosServices
+// and the nft golden TestHostInboundNftRenderGoldenByteIdentical.
+//
+// FAIL-ON-REVERT: drop a token from KNOWN_SYSTEM_SERVICE_TOKENS or its
+// classify_system_service arm and its rows flip to denied.
+#[test]
+fn system_services_all_admits_documented_junos_services_3226() {
+    const TCP: u8 = 6;
+    const UDP: u8 = 17;
+    const ZONE: u16 = 14;
+
+    let mut state = ForwardingState::default();
+    state
+        .zone_host_inbound
+        .insert(ZONE, zone_host_inbound_from_tokens(&["all".to_string()], &[]));
+
+    for (name, token, proto, port) in [
+        ("reverse-telnet", "reverse-telnet", TCP, 2900u16),
+        ("reverse-ssh", "reverse-ssh", TCP, 2901),
+        ("lsselfping", "lsselfping", UDP, 8503),
+    ] {
+        // Reached through the `all` union, on both families.
+        for v6 in [false, true] {
+            assert!(
+                host_inbound_admits(&state, ZONE, proto, port, v6, 0),
+                "`system-services all` must admit {name} ({proto}/{port}, v6={v6}) — it is a documented Junos system-service",
+            );
+        }
+        // And reachable by NAMING the service, which is what makes the union
+        // restorable rather than a dead end.
+        let mut named = ForwardingState::default();
+        named
+            .zone_host_inbound
+            .insert(ZONE, zone_host_inbound_from_tokens(&[token.to_string()], &[]));
+        assert!(
+            host_inbound_admits(&named, ZONE, proto, port, false, 0),
+            "an explicit `system-services {token}` must admit {name} ({proto}/{port})",
+        );
+    }
+}
+
+// #3226 fold, unverified-port half: the Junos services xpf has no authoritative
+// listening port for (HOST_INBOUND_UNPORTED_SERVICES) must contribute NOTHING to
+// the admit set — whether reached through `all` or named explicitly.
+//
+// Earlier revisions of this fold synthesized a port for two of them from
+// circumstantial evidence: r2cp udp/28762 (a value draft-dubois-r2cp-00 merely
+// SUGGESTS for prototypes, which Juniper adopts nowhere) and rpm tcp+udp/7 (the
+// FLOOR of the configurable `[edit services rpm probe-server] port` range, not a
+// default — the container is presence-gated, so with no configuration nothing
+// listens at all). Both opened a port on every `all` zone that in the ordinary
+// case has no listener, while still failing to open whatever port the operator
+// actually configured. An unverified port is wrong in BOTH directions at once,
+// which is why the correct model is no tuple plus a commit advisory.
+//
+// The basis is a deliberate CHOICE under uncertainty, NOT an inference from the
+// schema. (An earlier revision argued the absence of a YANG `default` proved
+// there was no fixed port; that is false — `[edit system services telnet]` has
+// no port leaf either, yet telnet is TCP/23 — and has been withdrawn.) No
+// authoritative host-inbound tuple was found for these tokens, and under that
+// gap opening nothing fails in one direction and visibly, whereas a guess fails
+// in both directions and silently.
+//
+// FAIL-ON-REVERT: hand any of these tokens a port (in classify_system_service or
+// by dropping it from HOST_INBOUND_UNPORTED_SERVICES while adding an insert) and
+// the sweep below flips to admitted. The two historical guesses are probed by
+// name so a literal revert of the previous revision is caught precisely.
+#[test]
+fn unported_services_admit_nothing_3226() {
+    const TCP: u8 = 6;
+    const UDP: u8 = 17;
+    const ZONE: u16 = 21;
+
+    // A representative sweep: the two historical guesses, plus ports that would
+    // plausibly be reached for these services, plus a raw IP protocol.
+    let probes: [(u8, u16); 10] = [
+        (UDP, 28762), // the r2cp guess (draft "suggested", never Junos)
+        (TCP, 7),     // the rpm guess (range floor, not a default)
+        (UDP, 7),
+        (TCP, 443),   // a tcp-encap port in Juniper's own sample output
+        (TCP, 9500),  // another port from that sample (remote gateway side)
+        (UDP, 36000), // the appqoe PASSIVE probe — transit, Juniper says DISCARD
+        (UDP, 500),   // MNHA examples admit IKE via its OWN `ike` token
+        (TCP, 22),    // ...and SSH via its OWN `ssh` token
+        (UDP, 3503),  // lsping's port must not leak to an unported token
+        (TCP, 830),
+    ];
+
+    for token in HOST_INBOUND_UNPORTED_SERVICES {
+        let mut named = ForwardingState::default();
+        named.zone_host_inbound.insert(
+            ZONE,
+            zone_host_inbound_from_tokens(&[(*token).to_string()], &[]),
+        );
+        for (proto, port) in probes {
+            for v6 in [false, true] {
+                assert!(
+                    !host_inbound_admits(&named, ZONE, proto, port, v6, 0),
+                    "`system-services {token}` must admit NOTHING ({proto}/{port}, v6={v6}) — \
+                     xpf has no authoritative listening port for it, so any admit here is a guess (#3226)",
+                );
+            }
+        }
+        // The token must still be RECOGNIZED (it is a real Junos service and a
+        // valid vSRX stanza must commit) — assert it is in the known set, so
+        // "admits nothing" can never be satisfied by deleting the token.
+        assert!(
+            KNOWN_SYSTEM_SERVICE_TOKENS.contains(token),
+            "{token} must stay a recognized system-service — the no-port model \
+             narrows what it admits, it does not remove the token",
+        );
+        // ...and it must NOT be an xpf-only extension: these are genuine Junos
+        // services, so `all` still covers them (contributing nothing).
+        assert!(
+            !HOST_INBOUND_NON_JUNOS_SERVICES.contains(token),
+            "{token} is a Junos service, not an xpf extension — it must stay in the `all` union",
+        );
+    }
+
+    // Reached through `all`, the same ports stay denied: the union inherits the
+    // no-tuple model rather than re-opening the guesses.
+    let mut all = ForwardingState::default();
+    all.zone_host_inbound
+        .insert(ZONE, zone_host_inbound_from_tokens(&["all".to_string()], &[]));
+    for (proto, port) in [(UDP, 28762u16), (TCP, 7), (UDP, 7), (UDP, 36000)] {
+        assert!(
+            !host_inbound_admits(&all, ZONE, proto, port, false, 0),
+            "`system-services all` must DENY {proto}/{port} — it expands to the Junos service \
+             union, and no service in that union fixes this port (#3226)",
+        );
+    }
+    // Guard against the sweep going vacuously green: `all` must still admit the
+    // services that DO carry a fixed port.
+    for (proto, port) in [(TCP, 2900u16), (TCP, 2901), (UDP, 8503), (TCP, 22)] {
+        assert!(
+            host_inbound_admits(&all, ZONE, proto, port, false, 0),
+            "`system-services all` must still admit {proto}/{port} — otherwise the deny \
+             assertions above prove nothing",
+        );
+    }
+}
+
+// #3226 fold, over-admit half: `r-exec`/`rexec` (tcp/512) is absent from
+// Juniper's documented host-inbound service list — zone-level and
+// interface-level both document rlogin and rsh but not rexec — so a
+// Junos-correct `all` never opens 512. Unlike the port-neutral xpf spellings
+// (webapi-* resolve to the http/https ports, ssh-netconf to ssh ∪ netconf) 512
+// is opened by no other token, so including it widened `all` past the meaning
+// #3226 restores.
+//
+// FAIL-ON-REVERT: remove "r-exec"/"rexec" from HOST_INBOUND_NON_JUNOS_SERVICES
+// and the first assertion flips to admitted.
+#[test]
+fn system_services_all_excludes_rexec_3226() {
+    const TCP: u8 = 6;
+    const ZONE: u16 = 15;
+
+    let mut state = ForwardingState::default();
+    state
+        .zone_host_inbound
+        .insert(ZONE, zone_host_inbound_from_tokens(&["all".to_string()], &[]));
+    assert!(
+        !host_inbound_admits(&state, ZONE, TCP, 512, false, 0),
+        "`system-services all` must DENY rexec tcp/512 — it is not a documented Junos system-service (#3226)",
+    );
+
+    // Both spellings stay fully usable when listed EXPLICITLY.
+    for token in ["r-exec", "rexec"] {
+        let mut named = ForwardingState::default();
+        named
+            .zone_host_inbound
+            .insert(ZONE, zone_host_inbound_from_tokens(&[token.to_string()], &[]));
+        assert!(
+            host_inbound_admits(&named, ZONE, TCP, 512, false, 0),
+            "an explicit `system-services {token}` must still admit tcp/512 — the carve-out narrows `all`, it does not remove the token",
+        );
+    }
+}
+
+// #3226: an EXPLICIT `system-services gre` still admits IP protocol 47. The
+// carve-out narrows the `all` meta-token; it does not remove the token. Without
+// this the exclusion above could be "fixed" by deleting the gre arm entirely.
+#[test]
+fn explicit_gre_service_still_admits_proto_47() {
+    const ZONE: u16 = 13;
+
+    let mut state = ForwardingState::default();
+    state
+        .zone_host_inbound
+        .insert(ZONE, zone_host_inbound_from_tokens(&["gre".to_string()], &[]));
+
+    assert!(
+        host_inbound_admits(&state, ZONE, 47, 0, false, 0),
+        "an explicit `system-services gre` must still admit IP protocol 47",
+    );
+}

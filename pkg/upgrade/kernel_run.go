@@ -54,6 +54,13 @@ func (r *KernelRunner) clearKernelJournal() error {
 	if err := os.Remove(r.cfg.JournalPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove kernel-upgrade journal: %w", err)
 	}
+	// Keep "nothing armed" and "no arm record" the SAME statement. The boot
+	// gate treats an absent record as a definitive "nothing to promote", so a
+	// record surviving a cleared journal would make it refuse on every
+	// subsequent ordinary boot (#6601 r6).
+	if err := r.clearArmRecord(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -381,6 +388,13 @@ func (r *KernelRunner) armCandidate(j *KernelJournal) error {
 	// Verified: the firmware WILL boot the candidate next. Record the confirmed
 	// boot id and transition to the genuine (trial-in-flight) ARMED state.
 	j.BootID = inactiveID
+	// Record WHICH xpfd must verify this candidate, before the journal says
+	// ARMED. The gate reads this instead of inferring a binary from ambient
+	// state; failing here refuses the arm rather than producing an armed
+	// candidate nothing is designated to verify (#6601 r6).
+	if err := r.recordPromoteBinary(j); err != nil {
+		return fmt.Errorf("kernel-upgrade arm: %w", err)
+	}
 	if err := r.ktransition(j, KernelStateArmed); err != nil {
 		return err
 	}
@@ -496,6 +510,16 @@ func (r *KernelRunner) Promote() error {
 // never prunes the kernel it is validating.
 func (r *KernelRunner) verifyAndPromote(j *KernelJournal, candID, running string) error {
 	sys := r.cfg.Sys
+
+	// Gate 2b: the binary running this gate must be the one the ARMING
+	// designated (#6601 r6). The outer hop selects from the arm record, so this
+	// is normally trivially true; it earns its place when the gate was invoked
+	// by hand or by a different xpfd than the one that armed. A mismatch
+	// REVERTS — an undesignated binary must not authorize the promotion, and
+	// reverting is the safe direction on an A/B kernel trial.
+	if err := VerifyPromoteBinaryMatchesRecord(j.PromoteBinary); err != nil {
+		return r.revert(j, fmt.Errorf("arm-record mismatch: %w", err))
+	}
 
 	// Gate 3: verify-dataplane (the #1864 kernel verifier) on the candidate.
 	ok, err := sys.VerifyDataplane()

@@ -31,7 +31,7 @@ import (
 func hostInboundFlushTestConfig(wanServices ...string) *config.Config {
 	cfg := hostInboundTestConfig()
 	cfg.Security.Zones["wan"].HostInboundTraffic.SystemServices = wanServices
-	cfg.Security.Zones["lan"].HostInboundTraffic = &config.HostInboundTraffic{SystemServices: []string{"all"}}
+	cfg.Security.Zones["lan"].HostInboundTraffic = &config.HostInboundTraffic{SystemServices: []string{"any-service"}}
 	return cfg
 }
 
@@ -170,6 +170,8 @@ func TestHostInboundConntrackFlushReconcileOnTightening_5566(t *testing.T) {
 // nothing to reconcile and the filter builder returns nil.
 func TestHostInboundConntrackFlushNoOpWhenNothingCovered_5566(t *testing.T) {
 	// Only an allows-all zone: no catch-all drop, so no covered address.
+	// #3226: `any-service` is the packet-wide admit token (`all` now expands to
+	// the named-service union and DOES emit a catch-all drop).
 	cfg := &config.Config{}
 	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
 		"reth1": {Name: "reth1", Units: map[int]*config.InterfaceUnit{
@@ -180,7 +182,7 @@ func TestHostInboundConntrackFlushNoOpWhenNothingCovered_5566(t *testing.T) {
 		"open": {
 			Name:               "open",
 			Interfaces:         []string{"reth1.0"},
-			HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"all"}},
+			HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"any-service"}},
 		},
 	}
 	views := dpuserspace.BuildZoneHostInboundViews(cfg)

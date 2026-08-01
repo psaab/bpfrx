@@ -26,6 +26,13 @@ RemainAfterExit=yes
 # exit-1 infra error is treated as un-promoted without a reboot (the next plain
 # reboot falls back via the firmware-cleared BootNext).
 TimeoutStartSec=120
+# Pin $PATH to the DISTRIBUTION directories. The gate PATH-resolves systemctl,
+# readlink and reboot on purpose (they are distribution-owned, unlike xpfd), but
+# systemd's default PATH ranks the operator-writable /usr/local/sbin and
+# /usr/local/bin FIRST -- exactly where a stale or planted artifact would sit on
+# a box whose promote-vs-rollback decision this unit authors (#6601 r4). xpfd
+# itself is never PATH-resolved by either hop.
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/usr/local/sbin/xpf-kernel-promote
 
 [Install]

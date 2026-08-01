@@ -59,7 +59,9 @@ and states that the multicast is currently admitted packet-wide via the input
 chain's accept fall-through — a known parity gap (#4455). It is **never a hard
 reject**: the config is valid Junos, and rejecting or narrowing it would break a
 zone that relies on today's accept (see the migration decision below). This
-mirrors the #3226 `system-services all` packet-wide-admit advisory pattern.
+mirrors the #3226 `system-services all` SCOPING advisory pattern (that
+advisory warns that `all` no longer admits packet-wide; it is not itself a
+packet-wide admit).
 
 A **companion advisory** (`validateHostInboundManagedRoutingMismatch`, #4455
 Component B) closes the *inverse* blind spot: the advisory above fires only when
@@ -139,6 +141,7 @@ is the only operator-visible surface.
 ## See also
 
 - `docs/host-inbound-service-matrix.md` — the per-token service/protocol matrix
-  and the sibling #3226 `system-services all` packet-wide-admit advisory.
+  and the sibling #3226 `system-services all` SCOPING advisory (which warns
+  that `all` stopped admitting packet-wide).
 - `pkg/config/host_inbound_tokens.go` — the recognized-token allowlist, family
   maps, and per-tuple L4 match SSOT.

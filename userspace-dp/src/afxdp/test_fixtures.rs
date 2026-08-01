@@ -553,22 +553,24 @@ pub(super) fn nat_snapshot() -> ConfigSnapshot {
         zones: vec![
             // #3705: EVERY known zone is host-inbound ENFORCING (the build path
             // inserts an entry regardless of the flag). These fixture zones carry
-            // `system-services all` so host-bound (local-delivery) traffic is
-            // admitted — the explicit form of the pre-#3705 configured=false
+            // `system-services any-service` so host-bound (local-delivery) traffic
+            // is admitted — the explicit form of the pre-#3705 configured=false
             // admit-all default the local-delivery tests rely on. Transit tests
             // never reach the host-inbound gate, so this is behavior-preserving.
+            // #3226: `any-service` (not `all`) is the packet-wide admit token —
+            // `all` now expands to the named system-service union.
             ZoneSnapshot {
                 name: "lan".to_string(),
                 id: TEST_LAN_ZONE_ID,
                 host_inbound_configured: true,
-                host_inbound_system_services: vec!["all".to_string()],
+                host_inbound_system_services: vec!["any-service".to_string()],
                 ..Default::default()
             },
             ZoneSnapshot {
                 name: "wan".to_string(),
                 id: TEST_WAN_ZONE_ID,
                 host_inbound_configured: true,
-                host_inbound_system_services: vec!["all".to_string()],
+                host_inbound_system_services: vec!["any-service".to_string()],
                 ..Default::default()
             },
         ],
@@ -733,29 +735,31 @@ pub(super) fn policy_deny_snapshot() -> ConfigSnapshot {
     ConfigSnapshot {
         // #2391: interfaces below reference "lan"/"wan"; the zone table must
         // define them or the forwarding build fails closed (InterfaceUnknownZone).
-        // #3705: every known zone is host-inbound enforcing; carry `all` so
-        // host-bound local-delivery traffic is admitted (explicit form of the
-        // pre-#3705 configured=false admit-all default). Behavior-preserving.
+        // #3705: every known zone is host-inbound enforcing; carry
+        // `any-service` so host-bound local-delivery traffic is admitted
+        // (explicit form of the pre-#3705 configured=false admit-all default).
+        // #3226: `any-service` is the packet-wide admit token — `all` now
+        // expands to the named system-service union. Behavior-preserving.
         zones: vec![
             ZoneSnapshot {
                 name: "lan".to_string(),
                 id: TEST_LAN_ZONE_ID,
                 host_inbound_configured: true,
-                host_inbound_system_services: vec!["all".to_string()],
+                host_inbound_system_services: vec!["any-service".to_string()],
                 ..Default::default()
             },
             ZoneSnapshot {
                 name: "wan".to_string(),
                 id: TEST_WAN_ZONE_ID,
                 host_inbound_configured: true,
-                host_inbound_system_services: vec!["all".to_string()],
+                host_inbound_system_services: vec!["any-service".to_string()],
                 ..Default::default()
             },
             ZoneSnapshot {
                 name: "dmz".to_string(),
                 id: TEST_DMZ_ZONE_ID,
                 host_inbound_configured: true,
-                host_inbound_system_services: vec!["all".to_string()],
+                host_inbound_system_services: vec!["any-service".to_string()],
                 ..Default::default()
             },
         ],

@@ -64068,3 +64068,925 @@ break — `go vet` confirmed passing under every revert.
   is address-matched and a separate surface. Codex re-review of the folded head
   918ea0b95 returned MERGE-READY with no findings.
 - **File(s)**: docs/fabric-cross-chassis-fwd.md, _Log.md
+- **Action**: #3226 — scope `host-inbound-traffic system-services all` to the
+  named system-service union (Junos parity); keep `any-service` as the
+  packet-wide escape hatch. Junos defines `all` as "traffic from the defined
+  system services available on the Routing Engine" and its documented
+  system-service list carries NO raw IP protocol, so the pre-#3226 blanket
+  admit (nft `hostInboundAllowsAll` -> bare `<fam> daddr <addrs> accept` with
+  NO catch-all drop; Rust `all_services` short-circuiting `admits()`) accepted
+  GRE/ESP/AH/OSPF/PIM/VRRP and arbitrary future protocol numbers to any zoned
+  firewall address — a fail-OPEN vs the spec that could mask a missing explicit
+  `protocols` entry. `all` now expands via the SSOT exactly as #3199 scoped
+  `protocols all`, so the zone falls through to the per-match path and the
+  catch-all deny is re-armed. The xpf-only `gre` token is excluded from the
+  expansion (mirroring how HostInboundL2Protocols excludes `isis` from
+  `protocols all`, #3311) and must be listed explicitly. `any-service` keeps
+  the full admit — Junos's own "including the system services that are not
+  defined" escape hatch, and a one-token migration for anyone who relied on the
+  old breadth. Two verdict bugs found and fixed while wiring the expansion:
+  BOTH nft builders keyed the rule verdict on the AUTHORED token, so `all`'s
+  expanded ident-reset tuple would have rendered `tcp dport 113 accept` and
+  ADMITTED ident probes the per-token form resets — the verdict now comes from
+  the expanded token (`HostInboundServiceTokenExpansion`), which is also what
+  keeps the junos-host shield's IKE exemption (fail-CLOSED risk: dropping the
+  IKE it exists to exempt) and its ident carve-out correct for `all`.
+  No-op on every shipped config: each puts `system-services all` on the
+  lifeline-only `control` zone, which contributes no host-inbound addresses
+  (#3277) — independently confirmed by the #4406 compile golden, whose only
+  diff is 12 removals of the now-inapplicable full-admit advisory with ZERO
+  structural change. The commit advisory split accordingly: `any-service` keeps
+  the breadth warning, `all` gets a scoping/upgrade notice gated on the zone
+  owning a non-lifeline interface (ungated it would fire on every cluster
+  commit forever about a guaranteed no-op).
+  Validation: full Go suite green (only the pre-existing, master-identical
+  `TestHeatmapNotStale` fails); full Rust suite 4221 passed; gofmt/clippy clean;
+  mutation-probed on a throwaway detached worktree (Go + Rust arms separately).
+- **File(s)**: pkg/config/{host_inbound_tokens.go,compiler_validate_warn.go,
+    junos_host_deny.go}, pkg/daemon/daemon_nft.go,
+    pkg/nftables/netlink_hostinbound.go,
+    userspace-dp/src/afxdp/forwarding/host_inbound.rs,
+    userspace-dp/src/afxdp/types/forwarding.rs,
+    docs/host-inbound-service-matrix.md, docs/junos-cli-reference.md,
+    pkg/daemon/README.md, plus tests + retargeted admit-all fixtures, _Log.md
+
+- **Timestamp**: 2026-07-31 (fix/3226-system-services-all-scoping, Codex
+  MERGE-NEEDS-MAJOR fold on PR #6616)
+- **Action**: #3226 fold — make the `system-services all` union EQUAL Juniper's
+  defined-service set in BOTH directions, and correct the privileged netlink
+  expectation. Codex round 2 found the scoping was derived from xpf's historical
+  recognized-token list, which is not the same set as Junos's.
+  (1) HIGH, fail-CLOSED: `r2cp`, `reverse-ssh`, `reverse-telnet` and `rpm` are
+  documented on BOTH Juniper host-inbound reference pages (zone-level and
+  interface-level) but were absent from `KnownHostInboundSystemServices`
+  entirely. Scoping `all` therefore stopped admitting four DEFINED services AND
+  left no in-grammar remedy: strict validation
+  (`validateHostInboundStanzaStrict`) rejects any token outside the same
+  allowlist, so an operator could not restore them by naming the service, and
+  `any-service` is materially broader than the one service wanted. All four are
+  now recognized and in the union, at their Junos default ports — r2cp udp/28762
+  (`[edit protocols r2cp] server-port`), reverse-telnet tcp/2900, reverse-ssh
+  tcp/2901 (the `[edit system services reverse]` defaults), rpm tcp+udp/7 (the
+  RPM probe-server port is "7 or 49160 through 65535"; 7 is the only
+  platform-fixed value, and admitting the 16k high range on every `all` zone
+  would trade one over-admit for a larger one).
+  (2) The inverse over-admit: `r-exec`/`rexec` (tcp/512) is NOT on either
+  Juniper page, so a Junos-correct `all` never opens 512. Unlike the other
+  xpf-only spellings it is not a port-neutral alias — `webapi-clear-text`/
+  `webapi-ssl` resolve to the http/https ports and `ssh-netconf`/`netconf-ssh`
+  to ssh union netconf, so including THEM widens nothing, whereas 512 is opened
+  by no other token. It joins `gre` in `HostInboundNonJunosSystemServices` and
+  is excluded from the expansion; listed explicitly it still opens 512. `sip`
+  was deliberately NOT reclassified despite also being absent from the fetched
+  reference pages: it is a vSRX ALG service with a reviewed #3619 disposition
+  and a fail-on-revert port pin, and the fetched pages are demonstrably partial
+  (they also omit `lsping`, which Juniper does define), so narrowing on that
+  evidence would be a fail-CLOSED change on unreliable grounds.
+  (3) MEDIUM: `pkg/nftables/netlink_kernel_test.go` still asserted `mgmt/ip`
+  (a `system-services all` zone) must NOT have a deny counter — the pre-#3226
+  full-admit shape. Under CAP_NET_ADMIN that now FAILS; it passed only because
+  the private-netns tests skip without the capability. Flipped to REQUIRE
+  `mgmt/ip`, and the construct-complete scenario gained an `admin`
+  (`any-service`, dual-stack) view so the bare-accept/no-counter path — now
+  reachable by `any-service` alone — keeps live coverage, with its own
+  must-NOT-have-a-counter assertion.
+- **Validation**: full Go suite green apart from the pre-existing
+  `TestHeatmapNotStale` (fails identically on clean origin/master, issue #6617);
+  full Rust suite green — 4224 + 60 + 8 + 22 + 1 passed, 0 failed; gofmt clean
+  on every touched file; `go vet` clean. The PRIVILEGED netlink leg was actually
+  EXECUTED (`unshare -rn ./nft.test -test.run
+  TestCounterReadbackThroughExistingReaders`) rather than left to CI: PASS with
+  the flipped assertions, and RED with the old `mgmt/ip`-absent assertion
+  restored — direct proof the Codex finding was real, not theoretical.
+  Mutation-probed per-arm in a throwaway detached worktree
+  (`/dev/shm/probe-6616b`), Go and Rust independently, build+vet clean each time
+  so every red is an ASSERTION.
+- **File(s)**: pkg/config/host_inbound_tokens.go,
+    pkg/config/host_inbound_tokens_test.go,
+    pkg/dataplane/userspace/host_inbound_all_scoping_3226_test.go,
+    pkg/daemon/host_inbound_ssot_render_3627_test.go,
+    pkg/nftables/{netlink_kernel_test.go,netlink_scenario_test.go},
+    userspace-dp/src/afxdp/forwarding/{host_inbound.rs,host_inbound_tests.rs},
+    docs/host-inbound-service-matrix.md, docs/junos-cli-reference.md,
+    pkg/daemon/README.md, _Log.md
+
+## 2026-07-31 — #3226 fold r3: derive the system-services union from Juniper's YANG schema
+
+- **Timestamp**: 2026-07-31
+- **Action**: Fold the Codex MAJOR on PR #6616. Replace the hand-transcribed
+  `system-services` oracle with one DERIVED from Juniper's published YANG
+  schema, add the four further missing tokens the prose pages omitted, and stop
+  synthesizing unverified ports.
+- **Findings**:
+  - Authoritative source: `junos-es-conf-security@2024-01-01.yang` (revision
+    description `"Junos: 24.4R2.25"`), grouping
+    `zone-system-services-object-type`. 37 tokens. The sibling
+    `interface-system-services-object-type` grouping is IDENTICAL, 25.4R1 is
+    identical, 20.4R1 differs only by lacking `lsselfping`.
+  - Codex named 2 missing tokens (`appqoe`, `tcp-encap`); the schema shows **4**
+    (`lsselfping` and `high-availability` too) — confirming the prose pages were
+    the wrong oracle, not just an incomplete one.
+  - `sip` IS in the schema, vindicating r2's refusal to narrow it.
+  - `r-exec`/`rexec`, `gre`, `r-login`, `r-sh`, `ssh-netconf`/`netconf-ssh`,
+    `ipsec` are NOT in the schema — the rexec/gre carve-outs stand.
+  - Ports: `reverse-telnet` tcp/2900 and `reverse-ssh` tcp/2901 carry explicit
+    YANG `default` statements; `lsselfping` is udp/8503 per RFC 7746 §3/§6.
+    `r2cp`, `rpm`, `tcp-encap`, `appqoe`, `high-availability` have NO
+    platform-fixed port — verified firsthand against the protocols/services/
+    security/chassis YANG modules. r2's udp/28762 (r2cp) and tcp+udp/7 (rpm)
+    were a draft SUGGESTION and a range FLOOR respectively; both removed.
+- **File(s)**:
+  - `pkg/config/testdata/junos-24.4R2-host-inbound-system-services.txt` (NEW —
+    vendored schema extract + provenance + verified-reproducible regen command)
+  - `pkg/config/host_inbound_tokens.go` (4 new tokens;
+    `HostInboundUnportedSystemServices` SSOT + load-bearing gate; ports)
+  - `pkg/config/host_inbound_tokens_test.go` (oracle derived from the extract;
+    fail-open direction restated over atomic (proto, port) openings)
+  - `pkg/config/host_inbound_rust_parity_test.go` (unported-set parity + a
+    source-level "the Rust unported arm inserts no port" contract)
+  - `pkg/config/compiler_validate_warn.go` (commit advisory on explicit naming)
+  - `pkg/config/host_inbound_fulladmit_warn_3226_test.go` (advisory test)
+  - `pkg/daemon/host_inbound_parity_test.go` (unported carve-out, no-op assert)
+  - `pkg/daemon/host_inbound_ssot_render_3627_test.go` (golden refresh)
+  - `pkg/dataplane/userspace/host_inbound_all_scoping_3226_test.go` (verdict)
+  - `userspace-dp/src/afxdp/forwarding/host_inbound.rs` (+tests.rs) (Rust mirror)
+  - `docs/host-inbound-service-matrix.md`, `docs/junos-cli-reference.md`,
+    `pkg/daemon/README.md`
+- **Validation**: `go test ./...` — 58 packages ok, only the known pre-existing
+  `TestHeatmapNotStale` (#6617) fails. `cargo test` — 4225+60+8+22+1 passed, 0
+  failed. gofmt clean on every changed file. Per-arm mutation proofs (Go and
+  Rust separately) run in a throwaway detached worktree.
+
+## 2026-07-31 — #3226 fold r4: real YANG derivation; withdraw the invalid no-port inference
+
+- **Timestamp**: 2026-07-31
+- **Action**: Fold the second Codex MAJOR round on PR #6616 (three findings).
+- **Finding 1 — the oracle was still a hand-maintained literal.** r3 vendored only
+  the EXTRACTED TOKEN LIST; the test read it directly, never parsing the YANG,
+  never checking the recorded SHA-256. Codex showed that deleting `appqoe` from
+  both the fixture and the implementations stayed GREEN. Fixed by vendoring the
+  MODULE itself (gzipped, 97 KB) and having the test parse it under three gates:
+  a SHA-256 pin on the decompressed bytes (equal to the upstream file's hash),
+  real brace-matched grouping extraction, and an independent token-count pin.
+  The zone-vs-interface grouping agreement is now ENFORCED, not commented.
+- **Finding 2 — the "positive evidence" argument was logically invalid.** r3
+  claimed YANG records a `default` wherever a platform default exists, so its
+  absence proved there was none. Codex refuted it: `[edit system services
+  telnet]` has no port leaf either, yet telnet is TCP/23. The generalization is
+  WITHDRAWN everywhere it appeared (Go SSOT, Go tests, Rust const, Rust tests,
+  matrix doc). The five no-admit services are now justified as an explicit
+  CHOICE under uncertainty, and split into two labelled classes
+  (`HostInboundNoAdmitReason`, held in bijection with the no-admit set by test):
+    - operator-configured port (`rpm`, `r2cp`) — Junos documents the port as
+      operator-chosen over a range with no default, so there is no correct port
+      to admit and restoring one is not an available option;
+    - unsourced (`tcp-encap`, `appqoe`, `high-availability`) — we did not find
+      the tuple, which is an admission, not a finding.
+  The commit advisory now words itself differently per class.
+- **Finding 3 — the advertised escape hatch did not work.** The advisory told
+  operators to "admit the real port with a firewall filter". Verified firsthand:
+  on the kernel path `xpf_lo0` (hook-input priority 0) runs BEFORE
+  `xpf_hostinbound` (10), so a filter accept DOES rescue; but on the AF_XDP
+  local-delivery path #3485 deliberately runs host-inbound FIRST and never
+  evaluates lo0 after a deny, so a filter CANNOT rescue there. Advisory rewritten
+  to lead with `any-service` (the only both-surface escape) and to qualify the
+  lo0 remedy as kernel-path-only. Reordering the userspace path is explicitly
+  NOT the fix (it would revert codex-review-118 M1) and is recorded as such.
+- **File(s)**:
+  - `pkg/config/testdata/junos-es-conf-security@2024-01-01.yang.gz` (NEW, vendored
+    module, `gzip -9 -n` so it is byte-reproducible)
+  - `pkg/config/testdata/junos-24.4R2-host-inbound-system-services.txt` (DELETED —
+    the literal that called itself derived)
+  - `pkg/config/host_inbound_tokens.go` (withdraw the inference; add
+    `HostInboundNoAdmitReason` + the two class constants)
+  - `pkg/config/host_inbound_tokens_test.go` (gunzip + SHA-256 gate + real
+    grouping parse + count pin + enforced zone/interface agreement + reason
+    bijection)
+  - `pkg/config/compiler_validate_warn.go` (per-class advisory wording; corrected
+    escape-hatch text)
+  - `pkg/config/host_inbound_fulladmit_warn_3226_test.go` (pin both)
+  - `pkg/dataplane/userspace/host_inbound_all_scoping_3226_test.go`,
+    `userspace-dp/src/afxdp/forwarding/host_inbound.rs` (+`_tests.rs`)
+  - `docs/host-inbound-service-matrix.md`, `docs/junos-cli-reference.md`,
+    `pkg/daemon/README.md`
+- **Validation**: `go test ./...`, `cargo test`, gofmt clean on changed files,
+  per-arm mutation proofs (Go and Rust separately) in a throwaway detached
+  worktree — including the exact case Codex showed passing: deleting a token from
+  the vendored oracle now REDs.
+
+## 2026-07-31 — #3226 fold r5: withdraw the lo0 escape hatch (nft accept is not terminal for the hook)
+
+- **Timestamp**: 2026-07-31
+- **Action**: Fold the third Codex MAJOR round on PR #6616.
+- **Blocking finding — the r4 "kernel path only" qualification was still false.**
+  r4 reasoned that because `xpf_lo0` is hook-input priority 0 and
+  `xpf_hostinbound` is 10, an lo0 `accept` terminates before the host-inbound
+  backstop. The priorities are right; the inference is wrong. In nftables
+  `accept` ends the current BASE CHAIN, not the hook — nftables(8): "An accept
+  verdict ... ends the evaluation of the current base chain. ... The packet
+  advances to the next base chain", whereas only `drop` "immediately ends the
+  evaluation of the whole ruleset". Verified the wording firsthand against the
+  netfilter manpage. So the packet still traverses xpf_hostinbound at priority 10
+  and still hits its catch-all drop: an lo0 filter rescues NOTHING on EITHER
+  surface. Chose to WITHDRAW the remedy rather than narrow it again — the
+  alternative (a mark set in xpf_lo0 and tested in xpf_hostinbound, or merging
+  the chains) is a new security mechanism that lets an lo0 filter override the
+  zone host-inbound default-deny, needs its own threat review, and would STILL
+  not help on AF_XDP without reordering #3485.
+  - The string assertion that pinned the false statement is replaced by
+    (a) a NEGATIVE guard that the refuted remedy is ABSENT, and (b) a
+    BEHAVIOURAL bind that the remedy the advisory does name works: `any-service`
+    is a full-admit token, so no catch-all drop is emitted at all.
+- **Advisory bug**: a stanza with both `any-service` and an unported token
+  emitted a self-contradicting pair (one warning that any-service admits
+  everything, another that rpm is DENIED and to add any-service). The unported
+  advisory is now suppressed when the stanza already carries a full-admit token.
+- **MAJOR 2 residue swept**: 14 sites across Go, Rust, tests and docs still
+  asserted the stronger "NO platform-fixed port" / "Junos fixes no port", which
+  contradicts the `unsourced` class that says a fixed port may exist and we did
+  not find it. All reworded to "xpf has no authoritative listening port".
+- **X==X removed**: `host_inbound_match_3627_test.go` rebuilt the expected `all`
+  result by iterating `HostInboundAllExpansionServices()` and concatenating
+  `HostInboundServiceMatch(tok, fam)` — exactly what production's `all` branch
+  does — while its comment claimed to be "derived independently". Replaced with
+  a hard-coded literal of the atomic (proto, port) openings `all` grants, with
+  the 90-port traceroute range collapsed and asserted separately. Verified it
+  binds: moving reverse-telnet 2900 -> 2999 REDs in both directions.
+- **File(s)**: `pkg/config/compiler_validate_warn.go`,
+  `pkg/config/host_inbound_fulladmit_warn_3226_test.go`,
+  `pkg/config/host_inbound_match_3627_test.go`,
+  `pkg/config/host_inbound_tokens.go`, `pkg/config/host_inbound_tokens_test.go`,
+  `pkg/config/host_inbound_rust_parity_test.go`,
+  `pkg/daemon/host_inbound_ssot_render_3627_test.go`, `pkg/daemon/README.md`,
+  `pkg/dataplane/userspace/host_inbound_all_scoping_3226_test.go`,
+  `userspace-dp/src/afxdp/forwarding/host_inbound.rs` (+`_tests.rs`),
+  `docs/host-inbound-service-matrix.md`, `docs/junos-cli-reference.md`
+- **Validation**: `go test ./...` 58 ok, only pre-existing #6617. `cargo test`
+  4225 passed, 0 failed. gofmt clean. Per-arm mutation proofs in a throwaway
+  detached worktree.
+
+## 2026-07-31 — #3226 fold r6: finish the withdrawal, widen the guard, unify the advisory input
+
+- **Timestamp**: 2026-07-31
+- **Action**: Fold the fourth Codex round on PR #6616 (2 MAJOR + 1 MINOR).
+- **MAJOR 1 — the lo0 withdrawal was incomplete.** Two live sites survived:
+  `docs/host-inbound-service-matrix.md:366` still told operators to admit the
+  service "with an explicit firewall filter on the real port" AND claimed the
+  commit advisory said so (both false), and a test comment at
+  `host_inbound_fulladmit_warn_3226_test.go:275` still affirmed the rescue
+  "works on the kernel path only". Both fixed.
+  - ROOT CAUSE: the negative guard asserted the refuted phrasing was absent from
+    the ADVISORY STRING, but the claim lives in the operator doc too — a guard
+    narrower than the claim it protects. WIDENED: the doc's refutational
+    material is now fenced with `REFUTED-REMEDY:BEGIN/END` and a new test
+    (`TestHostInboundMatrixDocDoesNotAdviseTheRefutedRemedy`) asserts the
+    refuted phrasing appears ONLY inside the fence, with an anti-vacuity check
+    that the fence actually contains the refutation and that live guidance still
+    names `any-service`.
+- **MAJOR 2 — absolute-port sweep finished.** Six more sites flattened all five
+  tokens into the disproven "Junos fixes no port" (`host_inbound_tokens.go`,
+  two in `pkg/dataplane/userspace`, `pkg/daemon/host_inbound_parity_test.go`,
+  `host_inbound_tokens_test.go`), plus a Rust comment that actively
+  CONTRADICTED the classification by describing `tcp-encap` as using an
+  "operator-chosen SSL termination port" — the operator-configured class for a
+  token classified unsourced. All reworded.
+- **MINOR 3 — fixed structurally, not case by case.** The three advisory passes
+  ran per RAW STANZA while enforcement UNIONS zone and interface tokens
+  (additive Junos semantics), so the advisory reasoned about a different object
+  than the enforcer. Now both consume `config.UnionHostInboundTokens` — which
+  already existed as the display-side peer — and the dataplane's
+  `unionHostInboundTokens` delegates to it (keeping a local `lowerDedup` so the
+  lower-cased dedup semantics are byte-identical to before). The scoping and
+  unported advisories are suppressed whenever the EFFECTIVE set full-admits,
+  including the zone-level case where every interface overrides with a
+  full-admit. Closes `any-service + all`, zone `any-service` + interface `rpm`,
+  and the inverse.
+- **File(s)**: `docs/host-inbound-service-matrix.md`,
+  `pkg/config/compiler_validate_warn.go`, `pkg/config/host_inbound_view.go`,
+  `pkg/config/host_inbound_fulladmit_warn_3226_test.go`,
+  `pkg/config/host_inbound_tokens.go`, `pkg/config/host_inbound_tokens_test.go`,
+  `pkg/daemon/host_inbound_parity_test.go`,
+  `pkg/dataplane/userspace/zones_override.go`,
+  `pkg/dataplane/userspace/host_inbound_all_scoping_3226_test.go`,
+  `userspace-dp/src/afxdp/forwarding/host_inbound_tests.rs`
+- **Validation**: `go test ./...` 58 ok, only pre-existing #6617. `cargo test`
+  4225+60+8+22+1 passed, 0 failed — no linker SIGBUS on this host, the Rust leg
+  linked and ran normally. gofmt clean. Per-arm mutation proofs in a throwaway
+  detached worktree.
+- **Timestamp**: 2026-07-31 (fix/6541-kernel-gate-explicit-path)
+- **Action**: #6541 — the A/B kernel promote/rollback gate PATH-resolved a bare
+  `xpfd`. `realKernelSystem.VerifyDataplane` ran `exec.Command("xpfd",
+  "verify-dataplane")` while every sibling xpfd invocation in the package
+  builds an explicit path (`realSystem.VerifyDataplane`/`BinaryVersion` take an
+  explicit `bin`; cutover.go, flip.go, runtime/seed.go all `filepath.Join` it
+  out of the version dir). That gate runs as root on a candidate boot and its
+  exit status decides promote-vs-rollback, so a PATH entry ordered ahead of the
+  real location got to author that decision — and with no attacker at all, a
+  stale xpfd in another PATH directory would verify the wrong build against the
+  candidate kernel.
+  Added `resolveVerifyGateBin`: prefers `os.Executable()` (the gate IS `xpfd
+  upgrade kernel promote`, so the running process is by construction the live
+  xpfd, and /proc/self/exe resolves sbin -> current -> versions/<ver>/xpfd down
+  to the concrete versioned artifact — the same version-multiplexed shape
+  `realSystem.VerifyDataplane` is handed), falling back to
+  `<VersionsDir>/current/xpfd`. Each candidate is validated absolute + existing
+  + regular + executable. A hardcoded /usr/local/sbin/xpfd was deliberately NOT
+  used: it is a PATH directory itself and pinning a literal would defeat the A/B
+  version multiplexing this channel exists to serve.
+  FAIL-CLOSED, not a PATH fallback: with no explicit candidate the resolver
+  errors, `VerifyDataplane` propagates, and `verifyAndPromote` turns any Gate-3
+  error into `revert()` — restore the known-good BootOrder and reboot to the
+  known-good slot. On an A/B kernel promote that is the safe direction.
+  SECOND BARE SITE, found by re-deriving the enumeration rather than trusting
+  the issue's "exactly one site": `scripts/image/xpf-kernel-promote`, the shell
+  wrapper systemd runs as the OUTER hop of this same gate, did `command -v
+  xpfd` + bare `xpfd upgrade kernel promote`. Now tests
+  /var/lib/xpf/versions/current/xpfd then /usr/local/sbin/xpfd; neither is
+  PATH-resolved, and with neither present it SKIPs (exit 0) exactly as before.
+  Enumeration (re-derived from the AST, all 9 direct exec.* sites +
+  24 wrapper call sites in pkg/upgrade): 1 bare xpf artifact (this one),
+  3 explicit `bin`, 3 system binaries (systemctl x2, apt-get) where PATH
+  resolution is correct by design, 2 parameterized helpers; every one of the
+  24 runCmd/captureCmd literal call sites names a system binary. The issue's
+  count was right for pkg/upgrade. `runCmd("systemctl","is-active","xpfd")` is
+  NOT a finding — that "xpfd" is a systemd UNIT name, resolved by systemd.
+  Tests: `kernel_verify_explicit_path_6541_test.go` asserts on the RESOLVED
+  ARGV (not a side effect) — cmd.Path alone would not be revert-proof, since
+  `exec.Command("xpfd",...)` LookPaths to an absolute Path on a host that has
+  xpfd on PATH, whereas cmd.Args[0] is always verbatim what exec.Command was
+  given. `exec_bare_artifact_lint_6541_test.go` ENUMERATES every shell-out
+  under pkg/upgrade from the AST (so a new bare invocation is caught with no
+  edit), derives the package's own exec wrappers structurally (a func that
+  hands its own first string param to exec.Command — closing the
+  runCmd/captureCmd hole), and takes artifact names from pkg/upgrade/manifest
+  (the SSOT). Scoped precisely so it cannot false-positive into being disabled:
+  only the command-NAME argument, only string literals, only xpf's own
+  artifacts, only bare (separator-free) names.
+  Validation: RED-on-revert confirmed for both halves — reverting the Go site
+  to `exec.Command("xpfd", ...)` BUILDS CLEAN and fails 4 tests on assertions
+  (including one that shows a hostile PATH stub reporting a false PASS);
+  reverting the shell site fails 8 of 9 python cases. Full pkg/upgrade +
+  cmd/... suites green, `go build ./...` clean, `make selftest` 48/48 with the
+  new leg and with xpf-kernel-promote added to the shell-syntax/shellcheck
+  lists. No cluster smoke: this touches no forwarding, HA, or session-sync
+  code.
+- **File(s)**: pkg/upgrade/{kernel_linux.go,kernel.go,
+    kernel_verify_explicit_path_6541_test.go,
+    exec_bare_artifact_lint_6541_test.go},
+    scripts/image/{xpf-kernel-promote,test_kernel_promote_explicit_path.py},
+    scripts/run-selftests.sh, docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-31 (fix/6541-kernel-gate-explicit-path, review fold r1)
+- **Action**: #6541 fold of an independent hostile review (MERGE-NEEDS-MINOR).
+  All four findings verified firsthand and all four are CORRECT — nothing
+  pushed back on.
+  MINOR 1 — the lint was MORE PERMISSIVE than the production validator it
+  guards, and the disagreement was codified in two assertions pointing opposite
+  ways: `isBareXpfArtifact` returned "not a finding" for any literal containing
+  a separator (so `./xpfd` passed), while `validateGateBin` rejects every
+  non-absolute path and its test pinned `./xpfd` as an ERROR. A guard laxer than
+  its subject blesses the next variant: `exec.Command("./"+verifyGateBin, ...)`
+  in a helper that chdirs, then a later refactor drops the chdir, and the
+  root-run gate resolves against systemd's WorkingDirectory (/) and errors Gate 3
+  into a spurious revert — with the lint green throughout. flip.go's header
+  records a real past incident of this CWD-resolution class. Renamed to
+  `isNonAbsoluteXpfArtifact`, switched to `!filepath.IsAbs(lit)` +
+  `filepath.Base(lit)` for the artifact match, flipped the `./xpfd` case to
+  flagged, added parent-relative / bare-relative-subdir / relative-helper cases,
+  and renamed the tests to say what they now enforce
+  (`TestNoBareOrRelativeXpfArtifactExec`,
+  `TestNonAbsoluteXpfArtifactDetectorScoping`). Added
+  `TestLintAgreesWithProductionValidator`, which asserts the invariant directly
+  — for any xpf-artifact literal the lint flags it EXACTLY when validateGateBin
+  rejects it as non-absolute — so the two cannot drift apart again. It is
+  one-directional by design: validateGateBin also rejects missing/non-regular/
+  non-executable absolute paths, which a static lint cannot judge.
+  MINOR 2 — the `(deleted)` rationale was factually WRONG. Verified against the
+  toolchain on this box: `/usr/lib/go-1.26/src/os/executable_procfs.go:27` is
+  `return stringslite.TrimSuffix(path, " (deleted)"), err`, so Go TRIMS the
+  suffix and returns the original path with a nil error. `os.Executable` cannot
+  produce a `(deleted)`-suffixed string, which made
+  `TestResolveVerifyGateBinFallsBackWhenRunningBinaryDeleted` feed the resolver
+  an impossible input while its NAME promised a guarantee it did not test. The
+  real mechanism is ENOENT on `os.Stat`. Corrected the doc comment to describe
+  that, and re-pointed the test at the real reachable scenario (create
+  `versions/v1.2.3/xpfd`, unlink it, seed that path) — it still covers a branch
+  distinct from the os.Executable-errored test, so it was kept rather than
+  folded away. Renamed to
+  `TestResolveVerifyGateBinFallsBackWhenRunningBinaryPathIsGone`. Added
+  `TestOsExecutableTrimsDeletedSuffix` to PIN the toolchain claim the comment
+  now rests on; it actually unlinks a running binary (copies the test binary to
+  a temp path, re-execs the copy, child removes its own path and reports
+  os.Executable) rather than asserting against the undeleted test binary, which
+  would have been a tautology and would have repeated the very defect the
+  reviewer flagged. Also softened the "only candidate that is exactly the
+  running build, with no window for a concurrent flip" claim at the same site:
+  os.Executable yields a PATH, not an inode, so a #2176-shape overwrite leaves
+  it stat'ing to a NEWER file while the process runs the old one. The promote
+  lock serializes this against a binary cut, and the exec target stays explicit
+  either way — which is the property the function exists to guarantee.
+  NIT 3 — recorded the `--versions-dir` divergence at `gateVersionsDir`
+  (the flag is real: cmd/xpfd/upgrade.go:247, cmd/xpfd/seed_runtime.go:65;
+  KernelConfig carries no VersionsDir to thread, confirmed by grep). Bounded and
+  safe: on a relocated install the fallback simply does not exist, os.Executable
+  still resolves, and total failure fail-closes into revert.
+  NIT 4 — `[ -x "$candidate" ]` is TRUE for a searchable DIRECTORY while
+  validateGateBin rejects non-regular targets, so the two hops were not the
+  symmetric pair the PR body claimed. Now `[ -f ] && [ -x ]`, with a new python
+  case asserting a directory at the primary candidate falls through to the sbin
+  path and never to $PATH.
+  Also scoped the PR body's "Over-reach guards, GREEN under revert" bullet: the
+  shell exit-3 and infra-error cases are green under the GO revert but red under
+  the SHELL revert.
+  Validation: gofmt clean on all four touched Go files (the 4 remaining
+  `gofmt -l` hits under pkg/upgrade — cutover_refuse_test.go, lock/lock.go,
+  version.go, version_test.go — are PRE-EXISTING on origin/master and untouched
+  by this PR, verified by `git show origin/master:<f> | gofmt`). go vet clean,
+  `go build ./...` clean, full pkg/upgrade suite green, python selftest 10/10.
+  MINOR 1 red-probe run in a THROWAWAY DETACHED worktree (never in the PR
+  worktree): a relative-path exec added there keeps build+vet CLEAN and fails
+  the lint on an assertion.
+- **File(s)**: pkg/upgrade/{kernel_linux.go,
+    kernel_verify_explicit_path_6541_test.go,
+    exec_bare_artifact_lint_6541_test.go},
+    scripts/image/{xpf-kernel-promote,test_kernel_promote_explicit_path.py},
+    _Log.md
+
+- **Timestamp**: 2026-07-31 (fix/6541-kernel-gate-explicit-path, review fold r2)
+- **Action**: #6541 fold of a Codex re-gate on 07a08baaf (MERGE-NEEDS-MINOR).
+  Both MINORs verified firsthand and both are CORRECT.
+  MINOR 1 — MY FOLD r1 INTRODUCED A SELECTION REGRESSION, not just a skip gap.
+  Verified: `--versions-dir` and `--sbin-dir` are both real operator options
+  (cmd/xpfd/upgrade.go:247/250); flip step 6b repoints
+  `filepath.Join(cfg.SbinDir, b)` -> `filepath.Join(cfg.VersionsDir, currentLink, b)`
+  (flip.go:43-45), so the sbin entry tracks the CONFIGURED runtime root; and
+  nothing removes an older default `/var/lib/xpf/versions/current` on relocation
+  (the only RemoveAll calls in flip/seed are for partials and temp paths). My
+  outer gate checked the hardcoded default versioned path FIRST, so on a
+  relocated install it would select a STALE build and verify the candidate
+  kernel against the wrong dataplane — strictly WORSE than the bare `xpfd` it
+  replaced, which resolved to the live sbin entry via systemd's default PATH.
+  Chose the REORDER option (sbin-first) over deriving the service executable or
+  declaring relocation unsupported, and extended it to the Go hop so NIT 3's
+  root is DISSOLVED rather than merely commented. New order, both hops:
+  os.Executable (Go only) -> <SbinDir>/xpfd -> <VersionsDir>/current/xpfd. The
+  invariant is stated at both sites and in the doc: the managed sbin entry is
+  the AUTHORITY because the cut repoints it and it therefore needs no configured
+  root; the versioned path is a degraded-box fallback (#2176 dangling symlink,
+  which `-f` rejects) and is correct only on a default-rooted box. Residual
+  stated rather than hidden: `--sbin-dir` is relocatable too, so a double
+  relocation plus a broken link can still reach a stale default — ordinary
+  relocation is covered by os.Executable, which needs no configured root.
+  Repointed both regression guards to the NEW order and added coverage for the
+  hazard itself: `TestResolveVerifyGateBinPrefersSbinOverDefaultVersionsRoot`
+  (leftover stale default root + live sbin entry into a relocated root — sbin
+  must win), `TestResolveVerifyGateBinSkipsDanglingSbinEntry`, and python
+  `test_prefers_sbin_entry_over_default_versions_root` +
+  `test_dangling_sbin_symlink_falls_through_to_versioned_runtime`. The python
+  order assertion now pins CANDIDATES_IN_ORDER instead of the old ordering.
+  MINOR 2 — the AST lint claimed more coverage than it provided.
+  (a) METHOD-WRAPPER NAME MISMATCH, the one that silently dropped real call
+  paths: `execWrapperNames` records a bare declaration name (`VerifyDataplane`)
+  while enumeration used `selectorName`, which renders a call receiver-qualified
+  (`s.VerifyDataplane`) or returns "" outright for a nested receiver
+  (`r.cfg.Sys.VerifyDataplane`). So every call through System.VerifyDataplane /
+  System.BinaryVersion — both of which take an explicit `bin` first param and
+  exec it — was invisible. Added `calleeFinalName` (final selector segment) for
+  wrapper lookup, and asserted the closure against REAL code:
+  TestExecEnumerationCoversKnownSites now requires cutover.go to be reached and
+  at least one method-wrapper site to be enumerated.
+  (b) `stringConsts` took only package-level consts whose initializer was a
+  direct literal, so `const command = "./" + verifyGateBin` and function-local
+  consts were skipped while the test claimed compile-time constant-expression
+  coverage. Now collects package-level AND local consts and iterates to a
+  fixpoint. Ambiguous names (one identifier, two const bindings, no scope
+  resolution here) are DROPPED rather than guessed — same conservative default
+  already applied to variables. Three new subtests pin all three shapes.
+  (c) Documented every remaining blind spot where the coverage is claimed —
+  run-time values (deliberate: it is the CORRECT pattern and chasing variables
+  would flag every correct site), ambiguous consts, final-name method matching,
+  and package scope.
+  (d) `docs/in-place-upgrade.md` named the REMOVED `TestNoBareXpfArtifactExec`
+  and claimed it rejects "any bare" invocation. Rewritten to the current name
+  and the actual non-absolute rule; also updated for the new candidate order,
+  with the sbin-outranks-versioned rationale. Swept the tree: no surviving
+  reference to any removed identifier outside historical _Log narrative, and
+  every Test name referenced in docs exists.
+  NOT FOLDED: the pre-existing `exec.LookPath("xpf-userspace-dp")` at
+  pkg/dataplane/userspace/process.go:191 — outside this Gate-3 change. It is a
+  last-resort fallback after explicit candidates are stat'd, but it is the same
+  class (a bare xpf-owned artifact PATH-resolved by a root daemon) and warrants
+  its own issue.
+  Validation: gofmt clean on all touched Go files, go vet ./... clean,
+  go build ./... clean, full pkg/upgrade suite green, all 7
+  scripts/image/test_*.py green (this one 11 cases). Fail-on-revert re-probed in
+  a THROWAWAY detached worktree.
+- **File(s)**: pkg/upgrade/{kernel_linux.go,
+    kernel_verify_explicit_path_6541_test.go,
+    exec_bare_artifact_lint_6541_test.go},
+    scripts/image/{xpf-kernel-promote,test_kernel_promote_explicit_path.py},
+    docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-31 (fix/6541-kernel-gate-explicit-path, review fold r3)
+- **Action**: #6541 fold of a Codex MERGE-NEEDS-MAJOR on c5eae360d. All three
+  findings verified firsthand; all three correct. NO pushback — I had drafted a
+  "pre-existing gap, not a regression" rebuttal and it is WRONG, refuted by
+  Codex's own concrete config.
+  MAJOR — relocating BOTH runtime roots defeats the outer gate. `--versions-dir`
+  AND `--sbin-dir` are real options (cmd/xpfd/upgrade.go:247/250) and the cut
+  maintains the CONFIGURED paths (flip.go), but the outer hop knew only the two
+  compiled defaults. My drafted rebuttal was that a relocated sbin dir would not
+  be on systemd's PATH either, so old==new. Codex's config kills that:
+  `--sbin-dir=/usr/sbin`, and `systemd-path search-binaries-default` on this box
+  returns `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin` — /usr/sbin IS on
+  it, so the OLD `command -v xpfd` found the live entry and MY replacement
+  ignored it. That is a genuine regression I introduced, and the r2 "residual"
+  note was false: the configured sbin entry need not be lost, it can be intact
+  and merely not one of the hardcoded defaults. Two bad outcomes: with no
+  leftovers the gate SKIPS an armed promotion (worst case — the candidate kernel
+  runs unverified with nothing in the journal saying the gate never ran); with
+  leftovers it execs a STALE build that can reject a healthy candidate and
+  trigger a needless revert/reboot.
+  CHOSE DISCOVERY VIA SYSTEMD ExecStart (the reviewer's first option), plus the
+  loud-refusal backstop (their second) — they are complementary, not
+  alternatives. `systemctl show -p ExecStart --value xpfd.service` is literally
+  "the same source flip writes": flip step 6c templates
+  ExecStart=<VersionsDir>/<ver>/xpfd into 10-xpf-version.conf on every cut, and
+  the shipped base unit (test/incus/xpfd.service:8) carries
+  ExecStart=/usr/local/sbin/xpfd pre-cut, so it names the live binary in both
+  states. It needs no new verb, no new state file, no new format to keep in
+  sync; it is a CONCRETE ABSOLUTE PATH independent of every compiled default, so
+  it covers both relocations at once; and it cannot select a stale build because
+  it is the path systemd actually launches. systemctl is $PATH-resolved, which
+  is correct and consistent with the lint's own scoping (distribution-owned
+  binary). Compiled defaults are retained BELOW discovery for a box where
+  systemd cannot answer. When nothing resolves AND xpfd.service is known to
+  systemd, the gate now logs `ERROR: ... REFUSING to promote` naming every
+  candidate tried, and takes the existing non-rebooting infra-error path —
+  deliberately still exit 0, because a non-zero exit trips OnFailure= and
+  REBOOTS the box over what may be a transient packaging window, while an
+  un-promoted candidate is already safe (firmware cleared BootNext). Only a box
+  with no xpfd.service at all still skips quietly.
+  MINOR 2 — ambiguous constants POISONED their dependents. My r2 fixpoint folded
+  first and deleted duplicate names after, so a const derived from an ambiguous
+  name kept whichever binding won: package `base="/usr/local/sbin/"` shadowed
+  locally by `base="./"`, then local `command=base+"xpfd"`, folded to the
+  ABSOLUTE package value and BLESSED an exec that really runs ./xpfd. That
+  inverts the guard — a false negative in the "checked and approved" sense, not
+  the "not checked" sense. Fixed by excluding ambiguous names BEFORE the
+  fixpoint, so dependents never resolve at all. New subtest
+  `ambiguous_const_poisons_dependents` pins it.
+  MINOR 3 — my directory regression test was VACUOUS after the r2 reorder: it
+  placed the directory at VERSIONED (now the fallback) while installing a valid
+  SBIN, so the directory was never examined and reverting `[ -f ]` left it
+  green. Moved the directory to SBIN (the first compiled-default candidate) and
+  assert the fall-through to VERSIONED.
+  New python coverage for the MAJOR: systemctl stub driven by env vars
+  (STUB_EXECSTART/STUB_LOADSTATE) so discovery is exercised hermetically;
+  `test_discovers_relocated_roots_via_systemd_execstart` (both roots relocated,
+  no compiled default exists), `test_systemd_execstart_outranks_stale_compiled_defaults`,
+  `test_unusable_execstart_falls_through_to_compiled_defaults` (over-reach guard
+  — discovery must not become a single point of failure),
+  `test_refuses_loudly_when_installed_but_unlocatable` (asserts exit 0 AND that
+  no reboot was issued), and a static `test_discovers_configured_path_from_systemd`.
+  Validation: gofmt clean, go vet ./... clean, go build ./... clean, full
+  pkg/upgrade suite green, all 7 scripts/image python selftests green (this one
+  16 cases), sh -n + shellcheck clean. RED-pre-fix verified in a THROWAWAY
+  detached worktree.
+- **File(s)**: scripts/image/{xpf-kernel-promote,test_kernel_promote_explicit_path.py},
+    pkg/upgrade/{kernel_linux.go,exec_bare_artifact_lint_6541_test.go},
+    docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6541 / PR #6601 fold r4 — Codex MERGE-NEEDS-MAJOR on the kernel
+  promote gate. Two paths still executed the WRONG verifier.
+  MAJOR 1 — the ExecStart parse could silently truncate and exec a different
+  binary. `sed -n 's/.*path=\([^ ;]*\).*/\1/p'` treated space and `;` as
+  terminators, but systemd PERMITS both in an executable path and the property
+  printer substitutes it raw (`path=%s`, no escaping). `path=/opt/relocated
+  live/xpfd` therefore yielded `/opt/relocated` — a DIFFERENT executable — and
+  a truncated read that happens to be executable suppresses every remaining
+  candidate and its exit 0 AUTHORIZES the promotion. The greedy `.*path=` also
+  took the LAST match, and `| head -n 1` took the FIRST of several ExecStart
+  entries without proving uniqueness (an operator-overridden `Type=oneshot`
+  can have several and the first need not be xpfd).
+  Fold: added `/proc/<MainPID>/exe` as the FIRST discovery hop — MainPID is a
+  structured integer and `/proc/<pid>/exe` a kernel symlink, so no rendered
+  path text is parsed at all (rejects a `… (deleted)` readback and a non-`xpfd`
+  basename, which also closes the pid-recycle window). The ExecStart parse is
+  now anchored on `{ path=` and cuts at systemd's REAL delimiter, the literal
+  `" ; argv[]="` (verified against live systemd renderings, incl. a no-arg
+  unit and multi-entry man-db.service), gives up unless that delimiter occurs
+  exactly once, and refuses any multi-LINE value. The bare-rendering tolerance
+  now accepts only a whole-value absolute path, so an `@`/`-`/`+`/`!` prefix
+  yields nothing instead of a guess. UNAMBIGUOUS OR NOTHING.
+  MAJOR 2 — the compiled-default ORDER was wrong for `--sbin-dir`-only
+  relocation. `--sbin-dir` and `--versions-dir` relocate independently and each
+  partial move inverts which default is live: versions-only leaves the sbin
+  entry LIVE, sbin-only leaves `/usr/local/sbin/xpfd` a STALE leftover while
+  `/var/lib/xpf/versions/current/xpfd` is live. Ranking sbin first ran the
+  stale build whenever systemd could not answer — and a stale default also
+  pre-empted the loud-refusal branch entirely on a both-roots-relocated box.
+  Fold: the defaults are now an UNAMBIGUOUS SET, not a ranked list. Take one
+  only when the two are the SAME file (`-ef` — the ordinary layout where flip
+  6b left the sbin entry a symlink to the versioned runtime is ONE inode) or
+  when only one is usable at all (`-f`/`-x` still drops the #2176 dangling
+  symlink and the directory case). Two usable-but-different defaults mean one
+  is stale with nothing on the box to say which → refuse LOUDLY.
+  Audit notes folded: `xpfd_unit_known` became tri-state `xpfd_unit_state`
+  (known/absent/unknown) — a systemctl that is missing or erroring proves
+  NOTHING about whether xpf is installed, so it no longer launders into the
+  benign quiet skip; only an actual `not-found` answer skips. Documented that
+  "known" means known/LOADABLE (masked counts), not enabled. The unit now pins
+  `Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin` — the gate PATH-resolves
+  systemctl/readlink/reboot on purpose, and systemd's default PATH ranks the
+  operator-writable /usr/local/{s,}bin FIRST.
+  Validation: 9 new/rewritten python cases verified RED at the pre-fix head
+  46707e4db in a THROWAWAY detached worktree (8 failures + 1 error), then green
+  (23 cases). Per-element mutation sensitivity confirmed: reverting the
+  delimiter cut, the multi-line guard, the `-ef` same-file test, the MainPID
+  hop, or the unknown-state loudness each reds its own case and nothing else.
+  Anti-over-reach `test_agreeing_compiled_defaults_still_resolve` pins that an
+  ordinary default-rooted box (sbin symlink → versioned runtime) still resolves
+  rather than refusing. `go test ./pkg/upgrade/...` green, gofmt clean on the
+  branch's Go files, `sh -n` + `busybox sh -n` clean, `git diff --check` clean,
+  `make selftest` 47 pass / 1 fail where the single failure
+  (scripts/image/test_validate_scenarios.py, xorriso extract exit 5) was
+  verified to fail identically at origin/master 1aa1d38c2.
+- **File(s)**: scripts/image/{xpf-kernel-promote,xpf-kernel-promote.service,
+    test_kernel_promote_explicit_path.py}, docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6541 / PR #6601 fold r5 — CLOSE THE CLASS: delete the kernel
+  promote gate's compiled-defaults fallback outright, and bind the MainPID hop
+  to the unit. Codex r4 verdict MERGE-NEEDS-MAJOR (2 MAJOR + 1 MINOR).
+  MAJOR-1: `-ef` cannot distinguish a HEALTHY default layout from BOTH-ROOTS-
+  RELOCATED, where the leftover sbin symlink still points at the leftover
+  versioned runtime, so the pair is ONE INODE either way. Codex reproduced it
+  end to end (live_ran False / stale_ran True). Root cause is not that case:
+  it is that the gate was INFERRING which xpfd is live from filesystem
+  evidence, and filesystem evidence is inherently ambiguous once a root has
+  been relocated — relocation removes nothing, so leftovers are
+  indistinguishable from a healthy install and there is always one more case
+  (r1 $PATH → r2 wrong rank → r3 parse → r4 same-inode).
+  Fix (option A of the two the brief offered — delete, not a daemon-written
+  state file): the authority order is now exactly (1) /proc/<MainPID>/exe,
+  (2) a strictly-parsed ExecStart, (3) a LOUD REFUSAL, with no fourth step.
+  `try_compiled_defaults`, `DEFAULTS_AMBIGUOUS`, the `-ef` test and both
+  hardcoded default paths are gone from the script. Chose delete over a state
+  file because refusal is already a correct, safe terminal outcome here — it
+  takes the non-rebooting infra-error path, leaves the armed candidate
+  un-promoted, and the next plain reboot falls back through the
+  firmware-cleared BootNext to the known-good slot — whereas a state file adds
+  a new on-disk artifact that can itself go stale, i.e. the same class again.
+  Nothing real needs the fallback: an armed candidate boot runs the gate
+  After=xpfd.service, so MainPID answers; if xpfd is down, ExecStart still
+  answers (systemd knows a unit's ExecStart whether or not it is running); and
+  a box where neither answers is broken in a way a guess cannot fix.
+  MAJOR-2 (PID recycle): the MainPID hop read the pid once and accepted
+  /proc/<pid>/exe on a basename check alone, so a recycled pid running any
+  binary named `xpfd` could author promote-vs-rollback. Now the pid is bound
+  back to the unit AFTER the readlink — membership in xpfd.service's own
+  ControlGroup (matched against the PATH FIELD of /proc/<pid>/cgroup, exactly
+  or as the parent of a delegated subgroup, never as a substring) plus a
+  MainPID re-read requiring the same positive pid. Verified the mechanism
+  firsthand as root on a live systemd host (cron/dbus/incus): MainPID →
+  readlink /proc/<pid>/exe yields the real binary and ControlGroup is exactly
+  the path field of that pid's cgroup line.
+  MINOR (false mutation-sensitivity claim): the multi-line ExecStart guard was
+  claimed per-element sensitive but the delimiter-count rule independently
+  rejects a real multi-entry render. Rather than manufacture sensitivity, the
+  claim was corrected in both script and test comments, and a case only the
+  newline guard rejects (several lines carrying ONE delimiter, first entry a
+  real binary) was added so the guard now carries its own weight. Same
+  treatment for the "(deleted)" guard: documented as defence in depth, since
+  the basename guard and the regular-file admission test also reject it —
+  asserted as an OUTCOME instead. Also folded the audit note that the bare
+  ExecStart rendering rejected only spaces and semicolons: it now rejects ALL
+  whitespace via `[[:space:]]` (honoured by dash and busybox sh), so "whole
+  path only" is true rather than approximately true.
+  Validation: 9 of the 35 python cases verified RED at the pre-fix head
+  4f2d2b814 in a THROWAWAY detached worktree (/dev/shm/probe-6601h, removed
+  after), including Codex's exact reproduction — the pre-fix gate logs
+  `using .../usr/local/sbin/xpfd (compiled defaults (both name the same file))`
+  then `promotion gate: clean`, i.e. the stale build authorized the promotion.
+  Per-element mutation sweep over 11 guards: 10 are killed by exactly the case
+  that names them (newline guard, whitespace class, `-f` admission, cgroup
+  binding, cgroup exact-tail vs substring, cgroup parent-arm vs exact-only,
+  MainPID re-read, delimiter count, basename guard, ControlGroup absolute-path
+  guard); the "(deleted)" guard is provably subsumed and is documented as such
+  rather than claimed. Anti-over-reach kept and retargeted per the brief: a
+  healthy default-rooted box now resolves via ExecStart AND via MainPID (two
+  tests), a delegated subgroup still counts as membership, an unreportable
+  ControlGroup falls through to ExecStart rather than stranding the gate, and
+  a plain bare absolute ExecStart still resolves. `go test ./pkg/upgrade/...`
+  green, all 7 scripts/image/test_*.py green (including
+  test_validate_scenarios.py, which passed here), `make selftest` 48 pass /
+  0 fail, `sh -n` + `dash -n` + `busybox sh -n` clean, shellcheck clean,
+  `git diff --check` clean, gofmt clean on the branch's Go files (the repo-wide
+  `gofmt -l` hits are pre-existing at origin/master and touch no file in this
+  PR). Residual noted, NOT folded (out of the verdict and out of scope): the
+  INNER hop's resolveVerifyGateBin still falls back to <SbinDir>/xpfd and
+  <VersionsDir>/current/xpfd when os.Executable fails.
+- **File(s)**: scripts/image/{xpf-kernel-promote,
+    test_kernel_promote_explicit_path.py}, docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-31 (fix/6541-kernel-gate-explicit-path, review fold r5)
+- **Action**: #6601 r5 fold — two MINORs + NIT-1 from an independent hostile
+  review of 7b17c6429 (Codex MERGE-READY no findings; AGY MERGE-READY). Both
+  MINORs verified firsthand; both correct.
+  MINOR-1 — the quiet-skip branch hardcoded `xpfd.service`, so a standalone box
+  cut with `xpfd upgrade cut --unit myxpf` (a SUPPORTED selector,
+  cmd/xpfd/upgrade.go:253) got LoadState=not-found -> `absent` -> "skipping
+  promotion gate" -> exit 0, with an armed candidate running UNVERIFIED behind a
+  reassuring line. That is exactly the laundering the `unknown` branch comment
+  was written to forbid, and a regression against both master and 4f2d2b814.
+  CHOSE OPTION (b) + (c), NOT (a). Verified (a) is impossible: `grep Unit
+  pkg/upgrade/state.go pkg/upgrade/kernel.go` returns NOTHING — there is no
+  authoritative record of the unit name; flip writes its drop-in UNDER
+  <unit>.service.d/ without recording which unit. Deriving it by scanning for
+  */10-xpf-version.conf is precisely the "infer which unit" the reviewer forbids
+  and reopens the indistinguishable-leftover class this PR closed. So (b): pin
+  the channel and REFUSE at arm time — new `CheckKernelPromotionUnit`
+  (pkg/upgrade/kernel_promote_unit.go) probing systemd's LoadState for
+  DefaultUnit, wired into `xpfd upgrade kernel arm` before any mutation, exit 2.
+  Direct in-repo precedent: `NewCLICluster` (#1983) already refuses a
+  non-default --unit rather than drive control against the wrong daemon, same
+  reasoning shape. TRI-STATE: only a DEFINITE not-found refuses; a probe error
+  means systemctl could not be consulted and proves nothing, so it is allowed
+  through (collapsing them would block arming whenever systemd blipped). masked/
+  bad-setting are allowed — the unit EXISTS so its ExecStart is still readable.
+  Plus (c) for defence in depth: the boot-time absent branch is now a WARNING
+  that says the gate did NOT run, names the unit it looked for and the facts,
+  and states any armed candidate is UNVERIFIED. Justified by debian/rules:62 —
+  the same deb that installs this script generates and enables xpfd.service, so
+  not-found on a box running this gate is never the benign case.
+  Added a CROSS-LANGUAGE drift canary: the shell now carries one
+  `PROMOTE_UNIT="xpfd.service"` constant (all systemctl queries parameterised)
+  and `TestPromoteScriptUnitMatchesDefaultUnit` asserts it equals
+  upgrade.DefaultUnit + ".service"; `TestPromoteScriptQueriesOnlyThePinnedUnit`
+  stops a stray literal from escaping the canary. Without this the arm-time
+  guard could clear a host the boot-time gate cannot service.
+  MINOR-2 — the refusal was ~90 words of policy and zero facts, and with exit 0
+  keeping the unit `active` (systemctl status reads SUCCESS) that line is the
+  ONLY operator signal. It now echoes LoadState/MainPID/raw ExecStart captured
+  with the SAME queries discovery used, and BRANCHES its advice: the
+  systemctl-unreachable half no longer tells the operator to "fix xpfd.service's
+  ExecStart", which pointed at the wrong system.
+  NIT-1 — the `[[:space:]]` portability claim was asserted but never bound (the
+  suite only ever exec'd /bin/sh). Parameterised the harness shell and added
+  TestBusyboxParity: resolve+run, whitespace AND tab rejection, and the renamed-
+  unit warning, all under busybox sh; SKIPs when busybox is absent. Verified
+  they actually RAN here (busybox present), not skipped.
+  Also fixed a test my own change would have made vacuous:
+  `test_main_pid_candidate_is_bound_to_the_unit` counted `--property=MainPID`
+  across the WHOLE FILE and expected 2; the new diagnostic query made it 3. A
+  naive `>= 2` would have been vacuous (deleting the re-read leaves 1 discovery
+  + 1 diagnostic = 2, still passing), so the count is now scoped to the
+  `unit_main_pid_exe` function body via a new `shell_function_body` helper,
+  preserving exact revert-detection. Extracted the harness into a `_GateBase`
+  class (setUp + helpers, no test methods) so the three new classes share the
+  systemctl stub and $PATH trap rather than duplicating them.
+  NIT-2 (no durable record of a refusal) is being filed separately — NOT folded.
+  Validation: gofmt clean on all touched files (the 4 remaining pkg/upgrade
+  gofmt hits are PRE-EXISTING on origin/master and untouched), go vet ./...
+  clean, go build ./... clean, full pkg/upgrade + cmd suites green, all 7
+  scripts/image python selftests green (this one 42 cases), sh -n + dash -n +
+  busybox sh -n + shellcheck clean. RED-on-revert verified in a THROWAWAY
+  detached worktree.
+- **File(s)**: scripts/image/{xpf-kernel-promote,test_kernel_promote_explicit_path.py},
+    pkg/upgrade/{kernel_promote_unit.go,kernel_promote_unit_6601_test.go,
+    system_linux.go}, cmd/xpfd/upgrade_kernel.go, docs/in-place-upgrade.md,
+    _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6601 r7 — migrate the boot-gate self-test suite onto the arm-record
+  design, and stop laundering ARMED-without-record as a benign skip.
+  The r6 commit made the arm record the gate's authority and left the shell half
+  unfinished: 11 assertions in `test_kernel_promote_explicit_path.py` construct
+  the retired ambient-inference world. A probe of the whole suite found the
+  damage was larger than the failures — 22 of 32 behavioural runs short-circuited
+  at the new "nothing to promote" early exit, so ELEVEN MORE tests were passing
+  VACUOUSLY without reaching the code they name. `_assert_refused` had been
+  loosened to accept either "REFUSING" or "nothing to promote", which is what hid
+  them. It now requires the SPECIFIC outcome (`_assert_refused` vs
+  `_assert_nothing_armed`), so a vacuous pass is impossible to write.
+  TRIAGE. Bucket (A) obsolete-by-design: NONE. The team lead's three suggested
+  (A)s are all still live code — `unit_main_pid_exe`, `unit_exec_start` and the
+  cgroup matcher now feed the CROSS-CHECK, so deleting their tests would retire
+  the only coverage of a live refusal trigger. Bucket (B), re-expressed: all of
+  them. The invariants survive with an INVERTED consequence — a bad answer from a
+  unit hop no longer hands an impostor the promote decision, it fabricates a
+  disagreement and vetoes a healthy promotion — so each test now arms a good
+  record, feeds the hop something it must not believe, and asserts the gate still
+  PROMOTES. Bucket (C) busybox whitespace: ExecStart is still parsed (it feeds
+  the cross-check), so the `[[:space:]]` rejection still has to hold; the fixture
+  names a REAL executable so tolerating it would contradict the record.
+  ARMED-WITHOUT-RECORD. Answered YES: the gate now consults the journal when the
+  record is absent and refuses LOUDLY on ARMED. "Record absent means nothing is
+  armed" is an inference from the absence of a file, and Go derives the record's
+  location from the journal path while the shell hardcodes the default — so
+  `arm --journal <elsewhere>` alone desyncs them. A BOOLEAN only, never a path:
+  reading `promote_binary` out of JSON in sh is the delimiter class the sidecar
+  exists to avoid. `ARMED` specifically, not `ARMING` (matches `IsArmed`).
+  MINOR-3. Every systemd answer is now read ONCE into a discovery snapshot before
+  anything is decided; the hops and the refusal both consume it, and
+  `unit_facts`/`set_cause_advice` cannot query systemd at all.
+  Validation: 60/60 python (was 42 — 18 net new), `make selftest` 48/0/0,
+  go build + vet + `go test ./pkg/upgrade ./cmd/xpfd` green, sh -n + dash -n +
+  busybox sh -n + shellcheck clean. THREE mutation proofs, each verified
+  build/syntax/lint-CLEAN so the red is an assertion and not a false red:
+  drop the record admission check -> 12 assertion reds; drop the record-vs-unit
+  disagreement refusal -> 2 reds + the Go canary; make ARMED-without-record skip
+  silently -> 4 reds. Negative control: the ordinary armed boot still promotes.
+- **File(s)**: scripts/image/{xpf-kernel-promote,test_kernel_promote_explicit_path.py},
+    pkg/upgrade/kernel_arm_record_6601_test.go, docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6601 r8 — fix the cross-check's string compare (it refused a healthy
+  candidate on every never-cut box), bind the Go producer side, and correct the
+  `--journal` rationale.
+  MAJOR-1. The record/unit cross-check compared STRINGS. The record comes from
+  `os.Executable()` -> `/proc/self/exe`, which the kernel reports FULLY RESOLVED
+  (the concrete `versions/<ver>/xpfd`); ExecStart before the first cut is the
+  shipped base unit's `/usr/local/sbin/xpfd` SYMLINK that `seed-runtime` creates
+  on first install. One file, two names, read as a "disagreement" -> refusal. So
+  every freshly installed or baked appliance was affected, and it bit hardest
+  with `MainPID=0` (xpfd.service not running) — which is the expected outcome of
+  a candidate kernel that breaks the AF_XDP shim, i.e. exactly the scenario the
+  revert guard exists for. Behaviour delta vs master: master ran the gate, hit
+  Gate 3/4, reverted and rebooted to known-good; this branch exited 0 with a
+  refusal and stranded the box. Fixed with `same_file` (`-ef`, `readlink -f`
+  fallback; both verified in /bin/sh, dash and busybox). The `-ef` lint is now
+  scoped to the `same_file` body — its ban is about SELECTION between leftovers,
+  an unanswerable question, whereas "do these two names denote one file" is
+  answerable and required — plus a new assertion pinning `same_file` to exactly
+  one caller so the exemption cannot widen.
+  The suite could not express the bug: `_derive_armed()` parses the record OUT of
+  `stub_execstart`, so record and ExecStart were string-equal by construction.
+  Added `_seed_runtime_layout()`, which builds the real chain
+  (`sbin/xpfd -> versions/current -> versions/v1/xpfd`) and records the RESOLVED
+  path, plus an over-reach guard (a symlink resolving to a DIFFERENT version
+  must still refuse) and both under busybox.
+  MAJOR-2. Four Go points had no coverage; deleting any left the whole suite
+  green while the feature was inert. Added tests driving the REAL state machine:
+  Arm writes the sidecar + stamps PromoteBinary; Promote REVERTS on a mismatched
+  PromoteBinary; the REAL `resolveArmingBinary` fails closed on all three
+  osExecutable failure shapes (the existing test replaced the resolver wholesale,
+  so the function body was executed by no test in the repo); Arm refuses when the
+  sidecar cannot be written.
+  MINOR-1. The `--journal` rationale was WRONG in three places: Go derives the
+  sidecar from the journal's directory, so that flag moves BOTH files and the
+  gate takes the QUIET branch, not the loud one. Corrected in the script, the
+  python module docstring and the class docstring; documented as diagnostic-only
+  for `arm` in the flag help + docs; filed #6632 for the arm-time refusal.
+  MINOR-2. `read` returns non-zero at EOF-without-newline AFTER setting the
+  variable, so `|| RECORDED=""` discarded a good path and misdiagnosed it as
+  "does not contain an absolute path". `journal_state` already handled this; the
+  two reads now agree.
+  NITs: `..._never_reaches_for_path` now also asserts the refusal (it was reached
+  by five tests but bound by four); `promoteScriptPath` Fatals instead of Skips
+  (a packaging move would have retired all four canaries silently); documented
+  the three `osExecutable` callers and the deliberate arm-closed/promote-open
+  asymmetry.
+  Validation: 65/65 python, `make selftest` 48/0/0, go build + vet + `go test
+  ./pkg/upgrade ./cmd/xpfd` green, gofmt clean on touched files (the 4 remaining
+  pkg/upgrade hits are pre-existing on origin/master — re-verified). SIX mutation
+  proofs, each build/vet/syntax-CLEAN first: string-compare cross-check -> 3 reds;
+  record read reverted -> 1 red; drop recordPromoteBinary -> 3 reds; drop Gate 2b
+  -> 1 red; resolveArmingBinary fails open -> 3 subtest reds; swallow the sidecar
+  write error -> 1 red.
+- **File(s)**: scripts/image/{xpf-kernel-promote,test_kernel_promote_explicit_path.py},
+    pkg/upgrade/{kernel_arm_record_6601_test.go,kernel_linux.go},
+    cmd/xpfd/upgrade_kernel.go, docs/in-place-upgrade.md, _Log.md
+- **Timestamp**: 2026-07-31
+- **Action**: #6617 — fixed `TestHeatmapNotStale`, which was RED on clean
+  `origin/master`. Root cause is (b) with an (a) component: the artifact was
+  genuinely stale (3 rows), but it keeps going stale because the criterion was
+  byte-for-byte equality against a repo-GLOBAL snapshot, which cannot hold
+  under parallel merges. Measured firsthand over the 40 first-parent commits
+  ending at `b4605ea9d`: master was byte-stale in 26 of them, in two runs (19
+  consecutive commits reaching 22 rows of drift, then 7 more). The decisive
+  evidence is #6602 and #6613 — both regenerated the artifact AT THEIR OWN
+  BASE and both still landed RED, each disagreeing only on
+  `pkg/snmp/agent.go`, a file neither PR touched (grown by #6596, which merged
+  between their base and their merge). A gate that fails when the author did
+  everything right is noise, and the noise is what let the earlier 21-commit
+  run go unnoticed. Regenerated the artifact and changed the criterion to the
+  merge-stable audit CONTENT — which files are audited, at which tier — with
+  the LOC column kept as an advisory snapshot whose bound is ASYMMETRIC
+  ([WATCH] 1500-1999 is bounded both ways; [REFACTOR] is open above, so a
+  file past 2000 can grow unwatched) checked by
+  `TestHeatmapArtifactWellFormed` (per-row LOC/tier agreement + generator sort
+  order, both hand-edit detectors). Added `TestGeneratorDeterministic` (the
+  issue's acceptance criterion 3). `make audit-check` now classifies its own
+  diff — up-to-date / ADVISORY LOC-only (exit 0) / ERROR tier-or-membership
+  (exit 1). It validates both artifacts before diffing, but it compares the
+  sorted (tier, path) projection, so it is deliberately blind to LOC values
+  and row order and can still be green while TestHeatmapArtifactWellFormed
+  fails — `go test ./pkg/refactoraudit/` is authoritative. Of the 3 drifting rows on
+  master only `pkg/dhcprelay/relay.go` (WATCH -> REFACTOR) was real staleness,
+  and the new gate names exactly that.
+- **File(s)**: pkg/refactoraudit/audit_canary_test.go, pkg/refactoraudit/doc.go,
+  docs/refactoring-audit-current.txt, docs/refactoring-audit.md,
+  scripts/refactoring-audit.sh, Makefile, _Log.md

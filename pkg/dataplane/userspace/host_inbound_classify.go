@@ -132,8 +132,18 @@ type HostInboundViewVerdict struct {
 func (a HostInboundAdmission) Describe() string {
 	switch a.Status {
 	case HostInboundTokenAdmit:
-		if a.Token == "all" || a.Token == "any-service" {
-			return fmt.Sprintf("admitted by host-inbound-traffic system-services %s (all host services open)", a.Token)
+		// `all` is NOT a full admit since #3226 — it expands to the union of
+		// named services, so a zone carrying only `all` still DENIES gre/47,
+		// tcp/113 and anything else outside that union. Saying "all host
+		// services open" here contradicted the enforcement on the same zone in
+		// the same breath.
+		if a.Token == "any-service" {
+			return "admitted by host-inbound-traffic system-services any-service (all host services open)"
+		}
+		if a.Token == "all" {
+			return "admitted by host-inbound-traffic system-services all (the union of " +
+				"named system-services; NOT a packet-wide admit — see `show " +
+				"host-inbound-traffic services`)"
 		}
 		return fmt.Sprintf("admitted by host-inbound-traffic %s %s", a.Kind, a.Token)
 	case HostInboundGlobalAccept:
@@ -250,7 +260,8 @@ func ClassifyHostInboundForInterface(cfg *config.Config, fromZone, ifaceRef stri
 // ordering (full-admit → global pre-accept → indeterminate short-circuits →
 // per-view token admit → default-deny) scoped to one view's token set.
 func classifyOneView(v ZoneHostInboundView, proto uint8, hasProto bool, dstPort int, icmpType *uint8, family string) HostInboundAdmission {
-	// Full-admit (`system-services all` / `any-service`) admits everything,
+	// Full-admit (`any-service` ONLY — #3226 narrowed `system-services all` to
+	// the named union) admits everything,
 	// independent of the tuple — report it even when the tuple is otherwise
 	// indeterminate.
 	for _, s := range v.SystemServices {

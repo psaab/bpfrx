@@ -83,6 +83,154 @@ pub(in crate::afxdp) fn zone_host_inbound_from_tokens(
     hi
 }
 
+/// Every recognized `system-services` token that names a CONCRETE service
+/// (mirror of the Go SSOT config.KnownHostInboundSystemServices minus the two
+/// meta tokens `all` and `any-service`). The `system-services all` expansion is
+/// derived from this list MINUS the xpf-only extension set
+/// (HOST_INBOUND_NON_JUNOS_SERVICES) — see `system_service_all_expansion`.
+/// Listing `gre` here (and excluding it via the non-Junos set) is what makes
+/// that set load-bearing on this surface (#3226), mirroring how listing `isis`
+/// in KNOWN_ROUTING_PROTOCOL_TOKENS makes HOST_INBOUND_L2_PROTOCOLS
+/// load-bearing for `protocols all` (#3311).
+const KNOWN_SYSTEM_SERVICE_TOKENS: &[&str] = &[
+    "ssh",
+    "telnet",
+    "ftp",
+    "http",
+    "webapi-clear-text",
+    "https",
+    "webapi-ssl",
+    "ping",
+    "dns",
+    "dhcp",
+    "bootp",
+    "dhcpv6",
+    "ntp",
+    "snmp",
+    "snmp-trap",
+    "ike",
+    "ipsec",
+    "tftp",
+    "netconf",
+    "ssh-netconf",
+    "netconf-ssh",
+    "finger",
+    "ident-reset",
+    "lsping",
+    "sip",
+    "r-login",
+    "rlogin",
+    "r-sh",
+    "rsh",
+    // #3226: `r-exec`/`rexec` (tcp/512) is an xpf-only spelling — Juniper's
+    // host-inbound service list documents rlogin and rsh but NOT rexec — and
+    // unlike the other xpf spellings it is not a port-neutral alias, so it is
+    // EXCLUDED from the `all` expansion below via
+    // HOST_INBOUND_NON_JUNOS_SERVICES.
+    "r-exec",
+    "rexec",
+    "xnm-clear-text",
+    "xnm-ssl",
+    "traceroute",
+    // #3226 fold: Junos host-inbound services xpf previously did not recognize
+    // at all. Membership is derived from Juniper's published YANG schema
+    // (pkg/config/testdata/junos-es-conf-security@2024-01-01.yang.gz), not
+    // from prose reference pages — those were incomplete and had this set wrong
+    // three times. Mirror of config.KnownHostInboundSystemServices.
+    //
+    // Only reverse-telnet (tcp/2900) and reverse-ssh (tcp/2901) carry a
+    // PLATFORM-DEFAULT port (explicit YANG `default` statements), and
+    // lsselfping carries a STANDARDS-ASSIGNED one (RFC 7746, udp/8503). The
+    // rest are listed in HOST_INBOUND_UNPORTED_SERVICES below: recognized, but
+    // no admit tuple, because xpf has no authoritative port to admit for them.
+    "r2cp",
+    "reverse-ssh",
+    "reverse-telnet",
+    "rpm",
+    "lsselfping",
+    "tcp-encap",
+    "appqoe",
+    "high-availability",
+    // #3226: `gre` is an xpf EXTENSION (Junos has no raw-IP-protocol
+    // system-service), so it is EXCLUDED from the `all` expansion below via
+    // HOST_INBOUND_NON_JUNOS_SERVICES.
+    "gre",
+];
+
+/// xpf-only `system-services` tokens — the Rust mirror of the Go SSOT
+/// config.HostInboundNonJunosSystemServices (#3226). Junos scopes
+/// `system-services all` to the DEFINED system services, and its service list
+/// carries no raw IP protocol; xpf additionally accepts `gre` (IP protocol 47)
+/// because operator configs list it there, and `r-exec`/`rexec` (tcp/512),
+/// which Juniper's host-inbound list does not document at all and which — unlike
+/// the port-neutral xpf spellings webapi-*/netconf-ssh — opens a port no other
+/// token opens. Folding an xpf-only token into the `all` expansion would make
+/// `all` open a protocol or port Junos's `all` never opens, so these are
+/// excluded from the expansion and must be listed explicitly. Keep in lockstep
+/// with the Go set (the #3486 parity test guards this).
+const HOST_INBOUND_NON_JUNOS_SERVICES: &[&str] = &["gre", "r-exec", "rexec"];
+
+/// Recognized JUNOS `system-services` tokens xpf has no authoritative listening
+/// tuple to admit for — the Rust mirror of the Go SSOT
+/// config.HostInboundUnportedSystemServices (#3226 fold). Unlike
+/// HOST_INBOUND_NON_JUNOS_SERVICES these are NOT xpf extensions: they are in
+/// Juniper's published schema, so they stay recognized and stay in the
+/// `system-services all` union. They simply contribute NO admit tuple: for rpm
+/// and r2cp Junos documents the port as operator-chosen, and for the rest xpf
+/// could not find an authoritative one. Those are DIFFERENT statements and the
+/// Go set records which applies per token.
+///
+/// This is a deliberate CHOICE under uncertainty, not an inference. For each of
+/// these tokens xpf looked for an authoritative host-inbound listening tuple and
+/// did not find one. (An earlier revision argued the absence of a YANG `default`
+/// PROVED there was no fixed port; that generalization is false — `[edit system
+/// services telnet]` has no port leaf either, yet telnet is TCP/23 — and has
+/// been withdrawn.) Faced with the gap, guessing a port is wrong in BOTH
+/// directions at once: it opens a port nothing listens on while still denying
+/// the port actually in use, invisibly. Opening nothing is wrong in one
+/// direction only, is announced to the operator at commit, and never silently
+/// widens the host's exposure.
+///
+/// The five are NOT one class, and the Go side labels them
+/// (config.HostInboundNoAdmitReason): `rpm` and `r2cp` have an
+/// OPERATOR-CONFIGURED port that Junos documents as a range with no default — so
+/// there is no correct port to admit, and restoring one is not even an available
+/// option; `tcp-encap`, `appqoe` and `high-availability` are UNSOURCED — we did
+/// not find the tuple, which is an admission, not a finding. This surface does
+/// not need the distinction (both classes admit nothing), so the mirror stays a
+/// single array; the labelling lives with the evidence, on the Go set. The
+/// operator-facing consequence, and which escape hatch works on which surface,
+/// is in docs/host-inbound-service-matrix.md.
+///
+/// Keep in lockstep with the Go set — the #3486 parity test asserts equality,
+/// and `unported_services_admit_nothing_3226` asserts the behavior, so this
+/// const is load-bearing rather than decorative.
+const HOST_INBOUND_UNPORTED_SERVICES: &[&str] =
+    &["r2cp", "rpm", "tcp-encap", "appqoe", "high-availability"];
+
+/// True if `token` is an xpf-only (non-Junos) system-service, and so excluded
+/// from the `system-services all` expansion. #3226.
+fn is_non_junos_system_service(token: &str) -> bool {
+    HOST_INBOUND_NON_JUNOS_SERVICES.contains(&token)
+}
+
+/// The system-service tokens that `system-services all` expands to (#3226),
+/// derived from KNOWN_SYSTEM_SERVICE_TOKENS MINUS the xpf-only extension set.
+/// In Junos `host-inbound-traffic system-services all` admits "traffic from the
+/// defined system services available on the Routing Engine" — NOT every IP
+/// protocol and NOT a blanket bypass. Expanding to a concrete admit set (rather
+/// than the pre-#3226 `all_services` short-circuit) keeps an `all` zone from
+/// accepting GRE/ESP/AH/OSPF/PIM/VRRP and arbitrary future protocol numbers on
+/// its local addresses, and re-arms the per-zone default deny for everything
+/// the named set does not cover. Aliases (http/webapi-clear-text, ike/ipsec,
+/// ...) resolve to the same ports; the admit sets dedup.
+fn system_service_all_expansion() -> impl Iterator<Item = &'static str> {
+    KNOWN_SYSTEM_SERVICE_TOKENS
+        .iter()
+        .copied()
+        .filter(|t| !is_non_junos_system_service(t))
+}
+
 /// Classify one Junos `system-services` token into the admission set.
 /// Unrecognised tokens are intentionally ignored (fail-closed: they do not
 /// broaden admit). Covers the common Junos service set; the repo configs use
@@ -96,7 +244,29 @@ pub(in crate::afxdp) fn zone_host_inbound_from_tokens(
 /// vice versa) turns that test RED.
 fn classify_system_service(token: &str, hi: &mut ZoneHostInbound) {
     match token {
-        "all" | "any-service" => hi.all_services = true,
+        // #3226: `system-services all` admits only the DEFINED system-service
+        // set (Junos: "traffic from the defined system services available on
+        // the Routing Engine") — it expands to every recognized service EXCEPT
+        // the xpf-only extensions (gre), via system_service_all_expansion
+        // (= KNOWN_SYSTEM_SERVICE_TOKENS minus HOST_INBOUND_NON_JUNOS_SERVICES),
+        // NOT a blanket accept. The expansion never yields "all", so this
+        // recursion terminates. Mirrors the Go SSOT `all` case in
+        // config.HostInboundServiceMatch, which derives the same exclusion from
+        // config.HostInboundAllExpansionServices().
+        "all" => {
+            for tok in system_service_all_expansion() {
+                classify_system_service(tok, hi);
+            }
+        }
+        // `any-service` REMAINS the packet-wide full admit (#3226): Junos
+        // defines it as "all system services on an entire port range including
+        // the system services that are not defined", i.e. the explicit escape
+        // hatch for traffic the named set does not cover. xpf reads it as a
+        // superset (every IP protocol, not just the TCP/UDP port range) — the
+        // fail-safe direction for a token whose purpose is to over-admit, and
+        // the one-token migration for a config that relied on the pre-#3226
+        // breadth of `all`. Commit-warned in compiler_validate_warn.go.
+        "any-service" => hi.all_services = true,
         "ssh" => {
             hi.tcp_ports.insert(22);
         }
@@ -213,6 +383,38 @@ fn classify_system_service(token: &str, hi: &mut ZoneHostInbound) {
         "r-exec" | "rexec" => {
             hi.tcp_ports.insert(512);
         }
+        // #3226 fold — Junos host-inbound services at a port Juniper actually
+        // fixes. Mirror of config.HostInboundServiceMatch; the port values are
+        // pinned on this surface by
+        // system_services_all_admits_documented_junos_services_3226 and on the
+        // Go side by TestHostInboundDocumentedJunosServiceTokensCommit_3226 +
+        // the nft golden TestHostInboundNftRenderGoldenByteIdentical.
+        //
+        // `[edit system services reverse telnet|ssh] port` carry explicit YANG
+        // `default` statements of 2900 / 2901 (junos-es-conf-system 24.4R2).
+        "reverse-telnet" => {
+            hi.tcp_ports.insert(2900);
+        }
+        "reverse-ssh" => {
+            hi.tcp_ports.insert(2901);
+        }
+        // RFC 7746 §3: "The UDP Destination Port MUST be lsp-self-ping (8503)";
+        // §6 records the IANA assignment. Distinct from `lsping` (udp/3503, the
+        // MPLS echo port) despite the similar name — they are different
+        // protocols, so this must NOT be folded into the lsping arm.
+        "lsselfping" => {
+            hi.udp_ports.insert(8503);
+        }
+        // #3226 fold — recognized Junos services with no authoritative tuple
+        // (HOST_INBOUND_UNPORTED_SERVICES). This arm must stay EMPTY: xpf has no
+        // authoritative port for them, so any value inserted here would be a guess
+        // that opens an unused port while still denying the one in use. They
+        // remain recognized (a valid vSRX stanza must commit, #3200) and remain
+        // in the `all` union, contributing nothing. Mirror of the
+        // config.HostInboundUnportedSystemServices gate in
+        // config.HostInboundServiceMatch; `unported_services_admit_nothing_3226`
+        // is the RED-on-revert guard.
+        "r2cp" | "rpm" | "tcp-encap" | "appqoe" | "high-availability" => {}
         "xnm-clear-text" => {
             hi.tcp_ports.insert(3221);
         }

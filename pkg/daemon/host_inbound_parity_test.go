@@ -21,12 +21,37 @@ import (
 func TestHostInboundNftMatchesKnownTokens(t *testing.T) {
 	// Every known system-service must be recognized by the nft builder.
 	for tok := range config.KnownHostInboundSystemServices {
-		if tok == "all" || tok == "any-service" {
-			// Full-admit tokens are handled by hostInboundAllowsAll, not the
-			// per-token match switch (which returns nil for them by design).
+		if config.HostInboundFullAdmitService(tok) {
+			// The full-admit token (`any-service`) is handled by
+			// hostInboundAllowsAll, not the per-token match switch (which
+			// returns nil for it by design). #3226: `all` is NO LONGER in this
+			// branch — it expands to the named-service union, so it must
+			// produce nft matches like any other token and falls through to the
+			// assertion below.
 			v := dpuserspace.ZoneHostInboundView{SystemServices: []string{tok}}
 			if !hostInboundAllowsAll(v) {
 				t.Errorf("known full-admit system-service %q not recognized by hostInboundAllowsAll", tok)
+			}
+			continue
+		}
+		if config.HostInboundUnportedSystemServices[tok] {
+			// #3226 fold: a Junos service xpf has no authoritative listening port
+			// for (r2cp, rpm, tcp-encap, appqoe, high-availability) is a
+			// recognized-but-no-op host-inbound token, the service-side analogue
+			// of the L2 protocols below. The every-token-produces-a-match rule
+			// cannot apply — there is no port to match on, and synthesizing one
+			// would open an unused port while still denying the port actually in
+			// use. So assert the inverse: BOTH families must produce NO match,
+			// which is what keeps the two enforcement surfaces consistent.
+			//
+			// Fail-on-revert: hand one of these a port in
+			// config.HostInboundServiceMatch and this goes RED.
+			if len(hostInboundServiceMatches(tok, "ip")) != 0 ||
+				len(hostInboundServiceMatches(tok, "ip6")) != 0 {
+				t.Errorf("unported system-service %q produced an nft match — xpf has no "+
+					"authoritative port for it (operator-configured for rpm/r2cp; UNSOURCED "+
+					"for tcp-encap/appqoe/high-availability, where a fixed port may exist but "+
+					"was not located), so any match here is a guess (#3226)", tok)
 			}
 			continue
 		}
