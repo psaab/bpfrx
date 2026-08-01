@@ -128,6 +128,9 @@ reviewer (joins at /engineer on the code PR).
 | r41 | Codex | codex companion task-ms26jz51-kdzutm (session 019f9fdc-897b-74b2-8d77-982dada9bad8) | NEEDS-REVISION (4 MAJOR, 1 MINOR; folds 1 FOLDED / 2 NOT-FOLDED — the NOT-FOLDEDs are the v41 queue-length + gen-fence pair replaced in v42). Structure confirmed |
 | r41 | AGY | agy print-mode direct, one empty-body retry (agy-plan-r41.md) | PLAN-READY (3/3 folds FOLDED; 2 fresh attacks FAILED). Structure confirmed |
 | r41 | Claude SMR | in-conversation (claude-smr-plan-r41.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — indicator freshness pin). Structure confirmed |
+| r42 | Codex | codex companion task-ms9u3gm6-lf8y0m (session 019fbb72-5e76-7950-b4d9-a581580a49ae) | NEEDS-REVISION (3 MAJOR, 2 MINOR; folds 2 FOLDED / 3 PARTIAL). Structure confirmed |
+| r42 | AGY | agy print-mode direct (agy-plan-r42.md) | NEEDS-REVISION (1 MAJOR — counter drop/skip retirement leak, IS Codex M1 / SMR m1; folds 4 FOLDED / 1 PARTIAL; 2 fresh attacks FAILED). Structure confirmed |
+| r42 | Claude SMR | in-conversation (claude-smr-plan-r42.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — counter-balance pin, IS Codex M1 / AGY M1 at MINOR severity). Structure confirmed |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 

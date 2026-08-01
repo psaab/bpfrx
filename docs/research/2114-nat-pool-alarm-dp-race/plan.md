@@ -1,9 +1,10 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v42 — r41 findings folded (Codex NEEDS-REVISION
-  4M/1m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m —
-  its indicator-freshness pin is folded here; all three confirm
-  the §4.7 structure); pending convergence review r42
+- **Status**: DRAFT v43 — r42 findings folded (Codex NEEDS-REVISION
+  3M/2m; AGY NEEDS-REVISION 1M; Claude SMR PLAN-READY-WITH-NITS
+  0M/1m — all three independently caught the counter-balance
+  gap; all three confirm the §4.7 structure); pending
+  convergence review r43
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -1619,6 +1620,73 @@
   dequeued, apply blocked on `applySem` via the test seam)
   asserts the counter NEVER reads zero until the apply returns,
   covering all three false-idle windows the gapful pair had.
+  v43: r42 convergence — the counter gains TOTAL retirement and
+  NODE-LIFETIME ownership, the drain gains the EOF witness, and
+  the admitted residuals gain shape (iii) (Codex NEEDS-REVISION
+  3M/2m, folds 2 FOLDED / 3 PARTIAL, structure confirmed; AGY
+  NEEDS-REVISION 1M — the same balance gap, folds 4 FOLDED /
+  1 PARTIAL, structure confirmed; SMR PLAN-READY-WITH-NITS
+  0M/1m — the same balance gap at MINOR; all three reviewers
+  independently caught the counter-balance defect, severity
+  MAJOR on 2-of-3 because a leaked token hangs the mandatory
+  drain forever — the SMR under-called it and the fold treats
+  it as MAJOR): (a) TOTAL RETIREMENT (Codex M1 + AGY M1 + SMR
+  m1, all verified against the code): every received token has
+  exactly one retirement owner — the increment is taken ONLY in
+  the successful-enqueue arm (the nil-channel guard and the
+  queue-full `default:` drop arm, `sync_conn_read.go:321-331`,
+  do NOT increment — a dropped frame never reaches an apply, so
+  an unconditional receipt-side increment leaks +1 and
+  `outstanding == 0` becomes unreachable); the decrement is
+  DEQUEUE-SCOPED via a per-item `defer` in the consumer,
+  covering the stale-generation skip
+  (`sync_conn_config.go:331-336`), the nil-handler skip
+  (`sync_conn_config.go:337-341`), apply failure, and panic
+  unwind; and session TEARDOWN retires every still-buffered
+  token (the ctx-cancel abandonment path,
+  `sync_conn_config.go:325-330`, and `SessionSync.Stop`,
+  `sync_conn.go:349-385`). (b) NODE-LIFETIME OWNERSHIP + the
+  EOF witness (Codex M2, both windows verified): the counter
+  lives in daemon-scope node-lifetime state, NOT on the
+  replaceable `SessionSync` stats provider — a received
+  transport-changing config replaces the session MID-CALLBACK
+  (apply step 20, `daemon_apply_tail.go:238-255`, teardown
+  5s-capped, `daemon_ha_sync.go:1405-1415`,
+  `sync_conn.go:349-385`; the manager re-points at the fresh
+  provider, `sync_state.go:47-63`, `daemon_ha_sync.go:906-913`),
+  so a provider-scoped counter would false-idle the fresh
+  provider while the old apply is still blocked; and the LOCAL
+  drain (2c) first observes the LOCAL EOF/disconnection of the
+  stopped peer's session(s) (the read loop terminates on
+  header-read EOF, `sync_conn_read.go:28-60`) — bytes the peer
+  sent before dying are either fully dispatched (counted) or
+  abandoned mid-frame at EOF (never counted, never applied) —
+  closing the partial-frame-in-flight window. (c) Admitted
+  residual shape (iii) (Codex M3, verified the admitted set
+  covered only (i)/(ii)): a local→peer push
+  (`daemon_ha_sync.go:417-522`, `sync_conn_config.go:230-250`)
+  initiated BETWEEN the peer preflight (2a) and the peer stop
+  (2b) can promote at the peer and FAIL its active write
+  (`store.go:687-717,738-746`), raising peer
+  `ActivePersistDegraded` that the stop abandons
+  (`store_persist.go:397-401`); bounded — the loss is the
+  in-memory promote only (the peer's persisted active stays the
+  prior config), the peer's restart `Load` classifies its
+  records, the reconnect re-drive re-pushes the current config
+  (`daemon_ha_sync.go:926-956`), and a permanent persist
+  failure surfaces as the peer's `/health` 503; deterministic
+  closure would require a producer-pause knob (new machinery) —
+  per the runbook's admit+bound idiom (r29/r37/r38) the
+  residual is admitted and bounded. (d) The acceptance copy
+  names the RIGHT read surface (Codex m1): the peer's debt mask
+  + active-persist state come from the peer's `/health`; the
+  peer's `ConfigSyncOutstanding` comes from the peer's
+  cluster-status RPC. (e) The JOIN-COHERENCE leg names its
+  sub-legs (Codex m2): framed-blocking-apply, LEGACY GEN-0
+  payload, CONCURRENT `resetRecvGen`, PROVIDER-REPLACEMENT
+  (node-lifetime survival), and RETIREMENT-TOTALITY (drop /
+  stale-skip / nil-handler-skip / teardown-with-buffered each
+  leave the counter balanced at zero).
 
 ---
 
@@ -3673,10 +3741,41 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   JOIN IS ADDED TO THE PLAN AS A GAP-FREE OUTSTANDING-SYNC
   COUNTER (r41 Codex M1, replacing the gapful queue-length +
   gen-fence pair): a single atomic
-  `ConfigSyncOutstanding` counter on EACH node — INCREMENTED at
-  frame receipt (BEFORE enqueue, `sync_conn_read.go:298-324`)
-  and DECREMENTED only AFTER the apply returns (including the
-  applySem-blocked duration, `sync_conn_config.go:325-351`) —
+  `ConfigSyncOutstanding` counter on EACH node, with TOTAL
+  retirement and NODE-LIFETIME ownership (r42 Codex M1/M2 +
+  r42 AGY M1 + r42 SMR m1 — all three reviewers independently
+  caught the balance gap; severity MAJOR on 2-of-3 because a
+  leaked token hangs the mandatory drain forever): the counter
+  lives in NODE-LIFETIME state (the daemon scope), NOT on the
+  replaceable `SessionSync` stats provider — a received
+  transport-changing config replaces the session MID-CALLBACK
+  (apply step 20, `daemon_apply_tail.go:238-255`:
+  `stopClusterComms`+`startClusterComms`, teardown 5s-capped,
+  `daemon_ha_sync.go:1405-1415`, `sync_conn.go:349-385`; the
+  manager re-points at the fresh provider,
+  `sync_state.go:47-63`, `daemon_ha_sync.go:906-913`) — so a
+  provider-scoped counter would false-idle the fresh provider
+  while the old apply is still blocked; the status surface reads
+  the node-lifetime counter across ALL communication epochs.
+  Every received token has EXACTLY ONE retirement owner:
+  INCREMENTED only in the SUCCESSFUL-enqueue arm of the
+  non-blocking send at frame receipt
+  (`sync_conn_read.go:298-324` — the nil-channel guard and the
+  queue-full `default:` drop arm, `sync_conn_read.go:321-331`,
+  do NOT increment, else a dropped frame leaks +1 and
+  `outstanding == 0` becomes unreachable); DECREMENTED
+  DEQUEUE-SCOPED via a per-item `defer` in the consumer
+  (`sync_conn_config.go:325-351`) — covering the
+  stale-generation skip (`sync_conn_config.go:331-336`), the
+  nil-handler skip (`sync_conn_config.go:337-341`), apply
+  failure, and panic unwind — with the decrement running only
+  AFTER the apply returns, including the applySem-blocked
+  duration (`daemon_apply_commit.go:326-335`); and session
+  TEARDOWN retires every still-buffered token (the ctx-cancel
+  abandonment path, `sync_conn_config.go:325-330`, and
+  `SessionSync.Stop`, `sync_conn.go:349-385` — on Stop the
+  queue is drained-and-retired so no token leaks across a
+  provider replacement) —
   independent of generation numbers and epoch resets, so
   `outstanding == 0` is a true join with no false-idle window;
   the counter is exposed read-only on the cluster status surface
@@ -3699,11 +3798,18 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   (2b) STOP THE PEER xpfd (the universal fence — a stopped peer
   cannot push over ANY transport, and NO new inbound frames or
   outbound pushes can initiate after it: outbound pushes require
-  a connected peer); (2c) LOCAL OUTSTANDING DRAIN — wait for the
-  LOCAL `ConfigSyncOutstanding == 0` (every in-flight inbound
-  apply completes, including any applySem-blocked one — the
-  counter by construction cannot report idle while an apply is
-  blocked); (3)
+  a connected peer); (2c) LOCAL OUTSTANDING DRAIN — first observe the LOCAL
+  EOF/disconnection of the stopped peer's session(s) (the read
+  loop terminates on header-read EOF,
+  `sync_conn_read.go:28-60`; bytes the peer sent before dying
+  are either fully dispatched — counted — or abandoned mid-frame
+  at EOF, never counted and never applied: safe), THEN wait for
+  the LOCAL `ConfigSyncOutstanding == 0` (every in-flight
+  inbound apply completes, including any applySem-blocked one —
+  the counter by construction cannot report idle while an apply
+  is blocked, and the EOF witness closes the
+  partial-frame-in-flight window the counter cannot see, r42
+  Codex M2); (3)
   the operator RE-CHECKS THE FULL STATE — `ConfirmDebtKindMask
   == 0` AND `persistDegraded == false` AND
   `ConfigSyncOutstanding == 0` (r39 Codex M1 + r41 Codex M2: the
@@ -3718,13 +3824,31 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   `Load` classification completes BEFORE cluster comms
   (`daemon_run.go:157-177,393-398` — cluster comms start only
   after Load) — and only then restart the peer. The residual
-  after the fence is explicitly ADMITTED in TWO bounded shapes:
+  after the fence is explicitly ADMITTED in THREE bounded shapes:
   (i) a window whose deadline fires between the re-check and the
   stop (the process-local provenance loss admitted since r29);
   (ii) a post-barrier peer SyncApply raising a process-local
   D-kind debt that the stop abandons (r37 Codex M1) — bounded to
   syncs already in flight BEFORE the peer stop (the peer stop is
-  the barrier; nothing new initiates after it). The abandoned-D
+  the barrier; nothing new initiates after it); (iii) a
+  local→peer push (reconnect/promotion/the reconciler,
+  `daemon_ha_sync.go:417-522`; `QueueConfig` writes directly,
+  `sync_conn_config.go:230-250`) initiated BETWEEN the peer
+  preflight (2a) and the peer stop (2b) — the peer can promote
+  the sync and then FAIL its active write
+  (`store.go:687-717,738-746`), raising peer
+  `ActivePersistDegraded` that the stop abandons
+  (`store_persist.go:397-401`) — r42 Codex M3, verified the
+  admitted set covered only (i)/(ii): bounded — the loss is the
+  in-memory promote only (the peer's PERSISTED active stays the
+  prior config), the peer's restart `Load` classifies its
+  records through the same machinery, the reconnect re-drive
+  re-pushes the current config (`daemon_ha_sync.go:926-956`) so
+  the peer re-converges, and a PERMANENT persist failure
+  surfaces as the peer's own `/health` 503 on its rejoin;
+  deterministic closure would require a producer-pause knob
+  (new machinery) — per this runbook's established admit+bound
+  idiom (r29/r37/r38) the residual is admitted and bounded. The abandoned-D
   outcome is bounded AND the offline repair shape for it is
   PINNED (r38 Codex M2, verified the conflation: a
   tombstone-SUCCESS/delete-failure leaves a `Resolved:true`
@@ -4623,19 +4747,38 @@ v20 history). The delivery is TWO units:
   package comment (`fsatomic.go:1-4`) and
   `pkg/fsatomic/README.md:3-12` (both currently claim exactly two
   writers) are updated for the third (r37 Codex m2).
-- `pkg/cluster` (r41 Codex M1/M2/M3 + SMR m1 — the observable
-  join): the gap-free `ConfigSyncOutstanding` atomic counter —
-  INCREMENTED at frame receipt BEFORE enqueue
-  (`sync_conn_read.go:298-324`), DECREMENTED only AFTER the apply
-  returns including the applySem-blocked duration
-  (`sync_conn_config.go:325-351`), independent of generation
-  numbers and epoch resets (`sync_conn_gen.go:340-362`); exposed
-  read-only on the cluster status surface (gRPC/CLI) on BOTH
-  nodes and read LIVE (single atomic — no joint-protection gap);
-  the cluster-status RPC also wires the confirm-side debt mask +
-  active-persist state (the peer-side preflight's read path —
-  the peer's own `/health` endpoint already carries them per the
-  health-snapshot work).
+- `pkg/cluster` (r41 Codex M1/M2/M3 + SMR m1 + r42 Codex M1/M2 +
+  r42 AGY M1 + r42 SMR m1 — the observable join): the gap-free
+  `ConfigSyncOutstanding` atomic counter in NODE-LIFETIME state
+  (daemon scope — NOT the replaceable `SessionSync` provider: a
+  transport-changing apply replaces the session mid-callback,
+  `daemon_apply_tail.go:238-255`, teardown 5s-capped,
+  `daemon_ha_sync.go:1405-1415`, `sync_conn.go:349-385`, and the
+  manager re-points at the fresh provider, `sync_state.go:47-63`,
+  `daemon_ha_sync.go:906-913`); TOTAL retirement — every received
+  token has exactly one retirement owner: INCREMENTED only in the
+  successful-enqueue arm (`sync_conn_read.go:298-324`; the
+  nil-channel guard and queue-full drop arm,
+  `sync_conn_read.go:321-331`, do NOT increment), DECREMENTED
+  dequeue-scoped via a per-item `defer` in the consumer (covers
+  the stale-generation skip, `sync_conn_config.go:331-336`, the
+  nil-handler skip, `sync_conn_config.go:337-341`, apply failure,
+  and panic unwind — after the apply returns, including the
+  applySem-blocked duration, `daemon_apply_commit.go:326-335`),
+  and session TEARDOWN retires every still-buffered token
+  (`sync_conn_config.go:325-330`, `sync_conn.go:349-385`),
+  independent of generation numbers and epoch resets
+  (`sync_conn_gen.go:340-362`); exposed read-only on the cluster
+  status surface (gRPC/CLI) on BOTH nodes and read LIVE (single
+  atomic — no joint-protection gap); the cluster-status RPC also
+  wires the confirm-side debt mask + active-persist state (the
+  peer-side preflight's read path — the peer's own `/health`
+  endpoint already carries them per the health-snapshot work; the
+  peer's COUNTER is read via the peer's cluster-status RPC, r42
+  Codex m1); the LOCAL drain also requires the observed LOCAL
+  EOF/disconnection of the stopped peer's session(s) FIRST (the
+  partial-frame witness, `sync_conn_read.go:28-60` — r42 Codex
+  M2).
 - `pkg/configstore/store_commit.go` + `db.go` + `store.go` +
   `store_persist.go` (r11-r17): the `canonicalConfigHash` binding at
   the sole arm site (`writeConfirmState`); the additive `Resolved` +
@@ -5654,25 +5797,32 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      is safe LIVE (the probe's confirmed-absence barrier is
      idempotent), repair-to-valid FILESYSTEM remediation requires
      xpfd STOPPED with the MANDATORY `mask == 0` precondition
-     EXPLICIT and FENCED (the r36-r41 producer-quiesce protocol:
+     EXPLICIT and FENCED (the r36-r42 producer-quiesce protocol:
      (1) no live commit-confirmed window stands, (2) refrain
      from commits and FENCE the async producer ENFORCEABLY with
      the peer-side preflight — PEER full-state clean (peer
      `ConfirmDebtKindMask == 0` AND peer `persistDegraded ==
-     false` AND peer `ConfigSyncOutstanding == 0`, read via the
-     peer's own `/health` endpoint per r41 Codex M3; an unclean
-     peer makes the stopped path UNAVAILABLE
+     false` — read via the peer's own `/health` endpoint per
+     r41 Codex M3 — AND peer `ConfigSyncOutstanding == 0` — read
+     via the peer's cluster-status RPC, which carries the
+     counter per the §5.1 `pkg/cluster` entry, r42 Codex m1; an
+     unclean peer makes the stopped path UNAVAILABLE
      — use live removal), then STOP THE PEER xpfd (the universal
      fence over every transport — `down em0` is NOT universal:
      sync falls back to fabric over possibly two paths,
      `daemon_ha_sync.go:774-785,820-860`) — and DRAIN THE LOCAL
-     OUTSTANDING COUNTER (the gap-free `ConfigSyncOutstanding`
-     atomic — incremented at frame receipt BEFORE enqueue,
-     decremented only AFTER the apply returns including the
-     applySem-blocked duration; a queue-length + gen-fence pair
-     has three false-idle windows: dequeue precedes flag
-     publication, gen-0 applies are invisible, `resetRecvGen`
-     clears mid-apply) to ZERO,
+     OUTSTANDING COUNTER: observe the LOCAL EOF/disconnection of
+     the stopped peer's session(s) FIRST (the partial-frame
+     witness — bytes sent before the peer died are either fully
+     dispatched and counted or abandoned mid-frame at EOF,
+     `sync_conn_read.go:28-60`, r42 Codex M2), then wait the
+     gap-free `ConfigSyncOutstanding` atomic to ZERO (node-
+     lifetime ownership, total retirement: incremented only in
+     the successful-enqueue arm, decremented dequeue-scoped per
+     item, teardown retires the still-buffered; a queue-length +
+     gen-fence pair has three false-idle windows: dequeue
+     precedes flag publication, gen-0 applies are invisible,
+     `resetRecvGen` clears mid-apply),
      (3) RE-CHECK THE FULL STATE —
      `ConfirmDebtKindMask == 0` AND `persistDegraded == false`
      AND `ConfigSyncOutstanding == 0`
@@ -5713,13 +5863,26 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      `fsatomic.go:41-44` discipline; a test seam drives the
      failure path — defense-in-depth; the stopped
      requirement is the authoritative closure);
-     the JOIN-COHERENCE leg (r41 Codex m1 + SMR m1) — the
-     `ConfigSyncOutstanding` counter is read LIVE and coherent:
-     a framed-blocking-apply regression (frame dequeued, apply
-     blocked on `applySem` via the test seam) asserts the counter
-     NEVER reads zero until the apply returns — covering the
-     dequeue-before-flag-publication, gen-0-invisible, and
-     `resetRecvGen`-mid-apply windows the gapful pair had;
+     the JOIN-COHERENCE leg (r41 Codex m1 + SMR m1 + r42 Codex
+     m2) — the `ConfigSyncOutstanding` counter is read LIVE and
+     coherent, with NAMED sub-legs: (a) the framed-blocking-apply
+     regression (frame dequeued, apply blocked on `applySem` via
+     the test seam) asserts the counter NEVER reads zero until
+     the apply returns — the dequeue-before-flag-publication
+     window; (b) a LEGACY GEN-0 payload leg — a gen==0 frame is
+     counted at receipt and retired after its apply returns,
+     closing the gen-0-invisible window
+     (`sync_conn_config.go:289-309`); (c) a CONCURRENT
+     `resetRecvGen` leg — a bulk-start reset mid-apply
+     (`sync_conn_read.go:183-195`, `sync_conn_gen.go:340-362`)
+     leaves the counter untouched; (d) a PROVIDER-REPLACEMENT
+     leg — a transport-changing apply (`daemon_apply_tail.go:
+     238-255`) swaps the `SessionSync` mid-callback and the
+     NODE-LIFETIME counter still reports the in-flight token
+     until the old apply returns; (e) a RETIREMENT-TOTALITY leg —
+     queue-full drop, stale-generation skip, nil-handler skip,
+     and teardown-with-buffered-items each leave the counter
+     balanced at zero;
      the OBSERVABILITY leg
      (r32 Codex M1b) — `ConfigWriteUnverified` renders in /health
      and folds into the aggregate OR, and the retry loop ACTIVELY
