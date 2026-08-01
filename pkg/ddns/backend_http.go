@@ -124,8 +124,15 @@ const (
 // provider-chosen value came out twice.
 type redirectRefusal struct {
 	reason redirectReason
-	from   *url.URL // previous hop; nil for the hop cap
-	to     *url.URL // refused target; nil for the hop cap
+	// via[0] — the request THIS package built from configuration — not the
+	// previous hop. Same-host comparison is lenient about case, a trailing dot
+	// and the default port, so a provider can take an allowed hop to its own
+	// spelling of our host; rendering that made the message vary per request.
+	from *url.URL // configured origin; nil for the hop cap
+	// Held so the grammar can be applied at render time, but NEVER rendered:
+	// it is provider-chosen, so it both discloses a credential-shaped reg-name
+	// and varies per request. Kept for the same-host DECISION and for tests.
+	to *url.URL // refused target; nil for the hop cap
 }
 
 // Error renders the refusal from FIXED prose plus grammar-bounded tokens. Every

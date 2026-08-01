@@ -116,7 +116,8 @@ operator never named. The realistic trigger is a mistyped or hostile `server`
 leaf, and fail-closed is this package's posture everywhere else (bind error,
 malformed `checkip-url`, unrecognized response body). A provider that genuinely
 moves to a new host is served by pointing the leaf at the final host; the error
-names both hosts so the operator can do exactly that. **Same-host redirects — the
+names the CONFIGURED endpoint and the refusal class — never the refused target,
+which is provider-chosen — so the operator can do exactly that. **Same-host redirects — the
 common real case, a path or API-version move — are still followed.**
 
 #### The concrete break: an APEX `server` leaf (apex → `www`)
@@ -137,7 +138,8 @@ set … dynamic-dns provider duck server duckdns.org
 ```
 
 Same shape for `cloudflare.com` → `www.cloudflare.com` and `amazonaws.com` →
-`aws.amazon.com`. The failure is loud and the error names both hosts. **The fix
+`aws.amazon.com`. The failure is loud and the error names the configured
+endpoint (never the provider-supplied target). **The fix
 is to configure the FINAL host** — `server www.duckdns.org` — not the apex.
 There is no commit-time check for this: detecting it requires a network call.
 

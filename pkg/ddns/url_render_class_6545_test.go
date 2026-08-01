@@ -509,6 +509,17 @@ func TestGenericTransportFailureRedactsPasswordInPath(t *testing.T) {
 	if err == nil {
 		t.Fatal("a synthetic transport failure must surface an error")
 	}
+	// REACHED-TRANSPORT floor, and the third vacuous shape found in this file.
+	// Without it, ANY earlier unrelated failure inside UpsertLease — a template
+	// rejection, a bind error, a validation refusal — satisfies both the
+	// non-nil check above and the does-not-contain check below, so the test
+	// passes while never exercising the transport render it is named for. The
+	// host sibling already carried this assertion; this one did not.
+	if !strings.Contains(err.Error(), "request failed") {
+		t.Fatalf("error %q did not come from the transport path; UpsertLease failed "+
+			"EARLIER, so this test never rendered a transport error and its "+
+			"redaction check proved nothing", err)
+	}
 	if strings.Contains(err.Error(), pathSentinel) {
 		t.Fatalf("the %%p-expanded password leaked from the URL PATH on transport failure:\n"+
 			"  error = %q\n"+
@@ -788,10 +799,16 @@ func TestScrubInnerErrorKeepsRecognisedDiagnostics(t *testing.T) {
 }
 
 // TestGuardRedirectRefusalBoundsProviderSuppliedHost covers the half of round 7
-// that is remote-controlled rather than operator-controlled: the refusal message
-// names the redirect TARGET, and that target comes from the provider's Location
-// header. A provider echoing our own credential back as a hostname got the hop
+// that is remote-controlled rather than operator-controlled. It USED to check
+// that the refusal's rendering of the redirect TARGET was character-bounded,
+// because a provider echoing our own credential back as a hostname got the hop
 // refused — correctly — and the credential written to the log.
+//
+// Round 14 went further and stopped rendering the target at all: the grammar
+// bounded its character set but not its content, so a well-formed reg-name came
+// out verbatim, and being provider-chosen it also varied per request and
+// defeated the daemon's dedup. This now asserts the target is ABSENT, which is
+// strictly stronger than asserting it was sanitised.
 //
 // The host is bounded by the same grammar, not withheld: naming the host you
 // refused to follow is the entire diagnostic.
