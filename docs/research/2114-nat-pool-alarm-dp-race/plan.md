@@ -1,10 +1,11 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v50 — r49 findings folded (Codex NEEDS-REVISION
-  3M/2m; AGY NEEDS-REVISION 1M; Claude SMR PLAN-READY-WITH-NITS
-  0M/2m — all three independently caught the restart-choreography
-  contradiction; all three confirm the §4.7 structure); pending
-  convergence review r50
+- **Status**: DRAFT v51 — r50 findings folded (Codex NEEDS-REVISION
+  4M/1m; AGY PLAN-READY-WITH-NITS 0M/1m — the acceptance
+  re-activation copy, IS Codex fold-2's PARTIAL; Claude SMR
+  PLAN-READY-WITH-NITS 0M/1m — the push-window clause, IS part
+  of Codex M3; all three confirm the §4.7 structure); pending
+  convergence review r51
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -2141,6 +2142,63 @@
   completes before its own comms). (d) The acceptance copy
   gains the re-baseline termination branch (Codex m1). (e) The
   re-capture rule covers BOTH baselines (Codex m2 = SMR m1).
+  v51: r50 convergence — the apply-health state publishes as
+  one coherent snapshot with truth at the convergence point,
+  the choreography joins the outbound reconciler, and the
+  authority-dependent branches become executable (Codex
+  NEEDS-REVISION 4M/1m, folds 2 FOLDED / 3 PARTIAL, structure
+  confirmed; AGY PLAN-READY-WITH-NITS 0M/1m — the acceptance
+  re-activation copy, IS Codex fold-2's PARTIAL, folded here;
+  SMR PLAN-READY-WITH-NITS 0M/1m — the push-window clause, IS
+  part of Codex M3, folded here): (a) THE COHERENT SNAPSHOT
+  CONTRACT (Codex M1, verified the render race: independent
+  atomics rendered beside the independently-locked
+  ActiveApplied with the show path taking no applySem can read
+  old-lastOK=true then count==0 then still-true ActiveApplied
+  while an apply is parked, `store.go:797-809`,
+  `server_show_cluster_text.go:66-74`): the apply-health fields
+  publish as ONE immutable snapshot struct swapped under a
+  single `atomic.Pointer`; the renderer reads exactly one
+  snapshot; §9 gains the mid-render-entry leg. (b) TRUTH AT
+  THE CONVERGENCE POINT (Codex M2, verified both false-green
+  paths: the mandatory deferred-MAC second `ApplyConfig` can
+  fail while merely recording retry debt and the commit still
+  succeeds, `daemon_apply_dataplane.go:390-402,466-489`,
+  `manager_worker_arm_5134.go:10-21`; a `dp.Start` failure
+  clears `d.dp` yet still runs the boot apply whose dataplane
+  phase skips nil `d.dp`, `daemon_run_bringup.go:493-520`,
+  `daemon_apply_dataplane.go:137-163`): `lastApplyOK` reads
+  TRUE only when the dataplane phase actually converged — both
+  outcomes record NOT-converged (count++, lastOK false). (c)
+  THE OUTBOUND-RECONCILER JOIN (Codex M3, verified the
+  stale-capture construction: the reconciler captures old text
+  and claims the old marker without applySem serialization,
+  `daemon_ha_sync.go:462-497`; a paused reconciler can
+  `QueueConfig` the OLD text with a NEWER wire generation,
+  `sync_conn_config.go:222-243`, which the receiver accepts and
+  applies, `sync_conn_config.go:254-272,325-395` — AFTER the
+  predicate passed — and the claimed marker suppresses the
+  self-heal, `daemon_ha_sync.go:479-484`): the re-convergence
+  commit runs only AFTER the authority's first post-election
+  post-stability reconcile pass is OBSERVED complete (the
+  `ConfigsSent` tick, `status.go:340-356`); the stale pass's
+  old-text push is overwritten by the operator's newer-gen
+  commit push, and every later pass carries the intended text.
+  (d) THE AUTHORITY-DEPENDENT BRANCHES ARE EXECUTABLE (Codex
+  M4, verified both dead ends: the read-only secondary rejects
+  mutations, `store.go:346-353`, `store_lock.go:9-27`; only
+  the RG0 primary is writable and promotion clears the gate,
+  `daemon_ha.go:438-475`): a per-node commit on a read-only
+  secondary is executed by PROMOTING it first with the
+  existing manual-failover request, then restoring the intended
+  mastership; and the terminal corner (encrypted origin-pinned
+  artifact + no operator text + cross-node need) is NAMED
+  runbook-unrecoverable — fail-closed, rebuild from config
+  management. (e) The acceptance re-activation copy gains the
+  two-node + complete-predicate form (r50 AGY m1 = Codex
+  fold-2's PARTIAL), and the acceptance apply-failure term
+  gains the executable failure-count == 0 AND
+  last-outcome-success form (Codex m1).
 
 ---
 
@@ -4602,7 +4660,23 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   installs the intended text with `load override` + `commit`
   on WHICHEVER node holds authority (the operator's text is
   the primary artifact), and lets the normal sync carry it to
-  the peer — with sync DISABLED no config flows regardless of
+  the peer — with the OUTBOUND-RECONCILER JOIN (r50 Codex M3,
+  verified the stale-capture construction: the reconciler
+  captures the old text and claims the old (epoch ×
+  generation) marker WITHOUT applySem serialization,
+  `daemon_ha_sync.go:462-497`; a paused reconciler can then
+  `QueueConfig` the OLD text with a NEWER wire generation,
+  `sync_conn_config.go:222-243`, which the receiver accepts
+  and applies, `sync_conn_config.go:254-272,325-395` — AFTER
+  the predicate passed — and the claimed marker suppresses the
+  later self-heal, `daemon_ha_sync.go:479-484`): the
+  re-convergence commit runs only AFTER the authority's first
+  post-election post-stability reconcile pass is OBSERVED
+  complete (the `ConfigsSent` tick on the status surface —
+  monotonic, `status.go:340-356` — or the marker no-op); a
+  stale pass's old-text push is then OVERWRITTEN by the
+  operator's commit push (newer wire generation), and every
+  later pass carries the intended text — with sync DISABLED no config flows regardless of
   authority (both push gates closed,
   `daemon_ha_sync.go:336-370,461-465`), so the re-convergence
   is applied per-node — and the precedence rule between the
@@ -4611,7 +4685,20 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   pin's case; and the pin's protection is per-node regardless
   (each node's `Load` completes before its own cluster comms),
   so a peer-first start in this recovery case preserves the
-  classification protection on both nodes —
+  classification protection on both nodes — and the PER-NODE
+  commit paths are made executable (r50 Codex M4, verified both
+  dead ends: the read-only secondary rejects mutations,
+  `store.go:346-353`, `store_lock.go:9-27`, and only the RG0
+  primary is writable — promotion clears the gate,
+  `daemon_ha.go:438-475`): a per-node commit on a read-only
+  secondary is executed by PROMOTING it first with the
+  existing manual-failover request (then restoring the
+  intended mastership after the commit); and the terminal
+  corner is NAMED: an encrypted-artifact origin that must not
+  hold the final authority AND an unavailable operator text is
+  RUNBOOK-UNRECOVERABLE — fail-closed; the predicate never
+  blesses; the operator rebuilds the other node's
+  configuration from their config management / day-0 process —
   then re-verify per the post-restart predicate below
   (the commit re-drives the normal sync where enabled). The operational closure is PINNED
   in the runbook, no new machinery: (α) the stopped-filesystem
@@ -5596,18 +5683,45 @@ v20 history). The delivery is TWO units:
   `startupDoneOnce sync.Once`, `startupOK atomic.Bool`, `finishStartup`,
   and the r8 `stopping atomic.Bool` shutdown-admission fence.
   PLUS the work-item-H2 apply-health state (r48 Codex M2 + r49
-  Codex M1): a PROCESS-LIFETIME `applyFailureCount` atomic and a
-  `lastApplyOK atomic.Bool`, initialized BEFORE the restarted
-  process's boot apply and written CENTRALLY at the single
-  full-apply entry (`applyConfig`/`applyConfigLocked`,
-  `daemon_apply.go:49-86,141-355`) — `lastApplyOK` is set FALSE
-  AT ENTRY and TRUE only on a nil return (so an in-flight or
-  parked apply reads not-success — the false-green-in-flight
+  Codex M1 + r50 Codex M1/M2): a PROCESS-LIFETIME
+  `applyFailureCount` and a `lastApplyOK` flag, initialized
+  BEFORE the restarted process's boot apply and written
+  CENTRALLY at the single full-apply entry
+  (`applyConfigLocked`, `daemon_apply.go:141-355` — every
+  wrapper flows through it: boot,
+  `daemon_run_bringup.go:516-520`; DHCP/feeds,
+  `daemon_dhcp.go:73-90`, `daemon_feeds.go:26-42`;
+  commit/rollback/sync, `daemon_apply_commit.go:246,489,697`) —
+  published as ONE COHERENT SNAPSHOT (r50 Codex M1, verified
+  the render race: independent atomics rendered beside the
+  independently-locked `ActiveApplied`, `store.go:797-809`,
+  with the show path taking no applySem,
+  `server_show_cluster_text.go:66-74`, can read old-lastOK=true
+  then count==0 then still-true ActiveApplied while an apply is
+  parked): the three fields are ONE immutable snapshot struct
+  swapped under a single `atomic.Pointer` (or one mutex), the
+  writer updates it at the apply boundary, and the renderer
+  reads exactly one snapshot — with the truth assignment at the
+  CONVERGENCE point, not the outer return (r50 Codex M2,
+  verified both false-green paths: the mandatory deferred-MAC
+  second `ApplyConfig` can fail while merely recording retry
+  debt and the commit still succeeds,
+  `daemon_apply_dataplane.go:390-402,466-489`,
+  `manager_worker_arm_5134.go:10-21`; and a `dp.Start` failure
+  clears `d.dp` yet still runs the boot apply whose dataplane
+  phase skips nil `d.dp`,
+  `daemon_run_bringup.go:493-520`,
+  `daemon_apply_dataplane.go:137-163`): `lastApplyOK` reads
+  TRUE only when the dataplane phase actually converged — the
+  deferred-MAC retry-debt outcome and the nil-dp skip both
+  record NOT-converged (count++, lastOK false) — so an
+  in-flight or
+  parked apply reads not-success (the false-green-in-flight
   window, r49 Codex M1: a DHCP/feed reapply can be mid-flight
   with ActiveApplied still true and the count still zero,
   `daemon_dhcp.go:73-90`, `daemon_feeds.go:26-42`,
   `store.go:797-809`), and `applyFailureCount` increments on
-  every non-nil return — covering the DHCP/boot/feeds/sync
+  every non-converged return — covering the DHCP/boot/feeds/sync
   wrappers that the compile-health (`daemon.go:871-880`,
   `daemon_health.go:79-125`) and the SessionSync-only
   `ConfigsApplyFailed` (`sync.go:110-119`) surfaces miss.
@@ -6944,7 +7058,26 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      flows and the re-convergence is per-node,
      `daemon_ha_sync.go:336-370,461-465`) — read the
      post-election RG0 state, `load override` + `commit` the
-     intended text on whichever node holds authority, and let
+     intended text on whichever node holds authority — AFTER
+     the authority's first post-election post-stability
+     reconcile pass is OBSERVED complete (the `ConfigsSent`
+     tick, `status.go:340-356`): a paused reconciler can
+     otherwise `QueueConfig` captured OLD text with a NEWER
+     wire generation after the predicate passed
+     (`daemon_ha_sync.go:462-497`,
+     `sync_conn_config.go:222-243,254-272,325-395`), and the
+     claimed marker suppresses the self-heal
+     (`daemon_ha_sync.go:479-484`) — the observed pass plus the
+     operator's newer-gen commit push closes it (r50 Codex M3);
+     a per-node commit on a read-only secondary is executed by
+     PROMOTING it first with the existing manual-failover
+     request (promotion clears the read-only gate,
+     `daemon_ha.go:438-475`; `store.go:346-353`,
+     `store_lock.go:9-27`), then restoring the intended
+     mastership; and the terminal corner is NAMED (encrypted
+     origin-pinned artifact + no operator text + cross-node
+     need): RUNBOOK-UNRECOVERABLE, fail-closed, rebuild from
+     config management (r50 Codex M4) — and let
      the normal sync carry it; the intended-holder-first /
      local-first precedence is explicit (the holder governs;
      the plain case IS local-first; each node's Load completes
@@ -7008,7 +7141,15 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      `daemon_nft.go:262-272`) keeps ActiveApplied true while
      the new address lacks enforcement — so the predicate ALSO
      requires NO dataplane apply failure since the post-restart
-     bringup on either node — a PROCESS-LIFETIME failure
+     bringup on either node — i.e. failure-count == 0 AND
+     last-outcome-success read from ONE coherent snapshot (r50
+     Codex m1 + M1 — the mid-render entry race is closed by the
+     single-snapshot publication, and the truth assignment is
+     at the CONVERGENCE point: the deferred-MAC retry-debt
+     outcome and the nil-dp boot skip both record NOT-converged,
+     `daemon_apply_dataplane.go:390-402,466-489,137-163`,
+     `manager_worker_arm_5134.go:10-21`,
+     `daemon_run_bringup.go:493-520`) — a PROCESS-LIFETIME failure
      counter + last-outcome flag initialized BEFORE the boot
      apply and instrumented centrally at every full-apply entry
      (the existing surfaces do not carry it: compile health is
@@ -7025,9 +7166,18 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      `store_lock.go:334-338`, `store_command.go:304-334`) —
      before the repair is declared
      done; and ONLY THEN the operator RE-ACTIVATES
-     `event-options` (a normal commit reverting the quiesce —
-     r48 Codex M3 + r48 SMR m1: without it the quiesce's side
-     effect becomes the running state) and re-verifies against
+     `event-options` — ON BOTH NODES, each commit's own success
+     required, EXACTLY mirroring the quiesce (r49 Codex M2:
+     with ConfigSync=false one commit cannot update the peer,
+     `daemon_ha_sync.go:336-364`; the Store promotes before
+     apply, `daemon_apply_commit.go:225-246`, so a reactivation
+     apply can abort before the engine's reconciliation,
+     `daemon_apply_tail.go:194-202`) —
+     and re-verifies the COMPLETE predicate again (not merely
+     digest equality — r50 AGY m1 / r50 Codex fold-2: the
+     pre-quiesce digest match AND the full persist-health
+     aggregate AND ActiveApplied AND the apply-failure/
+     last-outcome terms on BOTH nodes) against
      the PRE-QUIESCE digest captured before (1a) — the
      two-digest discipline: post-restart verification against
      the fence-time digest, re-activation verification against
