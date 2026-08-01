@@ -1,23 +1,28 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v77 — r75 folds: Codex M1's two-state gate
-  predicate (the fresh-vs-retained conflation fix — `Close`
-  retains `m.maps`/`m.programs` for hitless restart, so the gate
-  fires ONLY on the fresh-unarmed state; retained-unarmed proceeds
-  exactly as master — retained reads report, retained mutations
-  reach the live pinned maps, incl. the never-throttled watchdog
-  timestamp; the matrix gains retained-state coverage), Codex M2's
-  lock-OWNERSHIP assertion (a mutant dropping only the `:632`
-  lock passed the race schedule — the section holds a test hook
-  while the getter must block), Codex m1-m3 (the stale §5.1
-  delegation label; the named Detach leg + the error-order
-  qualification; the fixture migration mechanism + the ~30-test
-  inventory); SMR r75's m1 WITHDRAWN per Codex r75's verified
-  ruling (Start never touches `xdpFlagClaims` — its exposure is
-  the post-arm class, not A3's scope); r75 verdicts: Codex
-  PLAN-NEEDS-MAJOR (2M/3m), AGY PLAN-READY, Claude SMR
-  PLAN-READY-WITH-NITS (0M/1m, withdrawn); pending convergence
-  review r76
+- **Status**: DRAFT v78 — r76 folds: Codex M1 + AGY M1's uniform
+  registry-access rule (EVERY `m.maps`/`m.programs` access in every
+  class in every state goes through the single `m.mu`-scoped
+  helper; classification + handle selection are ONE scoped
+  operation; population publishes as ONE whole-batch critical
+  section — locking the writer never protected unlocked readers),
+  Codex M2's L2 narrowing (A3 claims fresh-unarmed admission
+  safety + registry-selection race safety in every state — NOT
+  current-generation delivery or re-arm linearizability; the
+  retained-generation confusion on the bootstrap-recurrence
+  Teardown-retain path is master's own racy behavior, named in
+  §10 and owned by the follow-up's work item H), the all-or-
+  nothing population proof (AGY r76 M2's partial-state premise
+  does not exist — every fallible pin step returns before the
+  insert loops; Codex's partial-load check PASSes), Codex m1-m3
+  (invariant 12 + the §4.7 pointer texts reworded to the two-state
+  form; §9 gains the retained blocked-re-Start overlap with every
+  class driven + the Detach test's population actor; the fixture
+  migration classification redone — injected fixtures are
+  retained-unarmed and PROCEED, the XSK fixture is not broken);
+  r76 verdicts: Codex PLAN-NEEDS-MAJOR (2M/3m), AGY
+  PLAN-NEEDS-MAJOR (2M), Claude SMR PLAN-READY; pending
+  convergence review r77
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -3180,7 +3185,13 @@
   the fresh-vs-retained conflation fix; the lock-ownership
   test assertion; the named Detach leg + error-order
   qualification; the fixture migration mechanism +
-  inventory; the SMR m1 withdrawal).
+  inventory; the SMR m1 withdrawal). v78 (r76: the uniform
+  registry-access rule + whole-batch publication; the L2
+  narrowing (admission + registry-selection safety only;
+  the retained-generation confusion named to §10, owned by
+  follow-up H); the all-or-nothing population proof;
+  invariant-12/pointer rewording; the retained re-Start
+  overlap leg; the fixture classification redo).
 
 ---
 
@@ -3453,8 +3464,7 @@ verbatim from plan v68 @ `f9d0b3eb7`) now lives in
 `followup-seed.md` in this directory, which also carries the open
 reviewer findings against that unit. PR-1 (this document) neither
 ships nor depends on G/H/H2: every hazard they address is
-pre-existing on master and stays exactly as exposed as master is
-today (§4.7). Where PR-1's classification text references the gate
+pre-existing on master and not worsened by PR-1 (§4.7). Where PR-1's classification text references the gate
 or the recovery guard for reachability scoping (§5.2/§5.3/§5.4), the
 classification stands with a pointer to the seed.
 
@@ -3596,6 +3606,23 @@ class. The fold:
     release-Store of `loaded=true` gives the happens-before edge: a
     method observing `true` sees a fully-populated `m.maps`; a method
     during population observes `false` and never touches the map.
+    **THE UNIFORM REGISTRY-ACCESS RULE (r76 Codex M1 + AGY r76 M1 —
+    the retained-proceed race fix):** EVERY `m.maps`/`m.programs`
+    access in EVERY class in EVERY state goes through the single
+    `m.mu`-scoped registry helper — classification AND handle
+    selection happen as ONE scoped operation under the lock (the
+    gate outcome and the handle copy are atomic), and the
+    population publishes as ONE whole-batch critical section (the
+    program assignment plus both insert loops,
+    `loader_userspace_shim.go:183-190`, under a single `m.mu`
+    hold) — without whole-batch publication the first insertion
+    would flip fresh→retained while population is still partial
+    (verified all-or-nothing otherwise: every fallible pin step
+    returns before the insert loops, so no partial state exists
+    OUTSIDE the batch; r76 Codex's partial-load check PASSes this
+    and AGY r76 M2's partial-state premise does not exist on
+    current code). Locking the writer never protected unlocked
+    readers; this rule is uniform so no reader is unlocked.
     **THE GATE PREDICATE IS TWO-STATE (r75 Codex M1 — the fresh-vs-
     retained conflation fix):** `Close` sets `loaded=false` but
     clears NEITHER `m.maps` NOR `m.programs` (`loader.go:1206-1218` —
@@ -3834,9 +3861,25 @@ class. The fold:
   sequence. Recorded as the documented alternative.
 - The RACE-1/RACE-2 closure claims stay the two precise layers
   everywhere they appear: **(L1)** the interface tear — closed by
-  the cell; **(L2)** method-level ADMISSION safety against a
-  published-but-unarmed backend — closed by A3's four-class
-  contract. No teardown/lifetime closure is claimed anywhere.
+  the cell; **(L2)** narrowed to its defensible form (r76 Codex
+  M2): (i) FRESH-unarmed admission safety (the typed error where
+  master returned map-not-found), and (ii) REGISTRY-SELECTION
+  race safety in every state (the uniform `m.mu` registry rule +
+  whole-batch publication). A3 does NOT claim current-generation
+  delivery, re-arm linearizability, or teardown/lifetime safety:
+  on the bootstrap-recurrence path (`bootstrap.go:470` —
+  Teardown-RETAINs the Manager, `Cleanup` removes the pin tree,
+  `loader.go:1221-1235`), the retained handles reference DEAD
+  unpinned kernel objects, a re-`Start` creates FRESH maps
+  (`loadOrCreatePinnedShimMap`, `loader_userspace_shim.go:602`),
+  and a retained-proceed method can mutate the obsolete object —
+  a mutation that never reaches the live generation. That hazard
+  is master's own racy behavior on the recurrence path — the
+  EXACT recurrence the follow-up unit's work item H terminates
+  (`followup-seed.md`) — PR-1 neither creates nor worsens it, and
+  "preserve master" is explicitly NOT claimed as an oracle for a
+  path whose master behavior is already racy (r76 Codex M2's
+  phrasing adopted). §10 carries it.
 
 ### Option B: eliminate the writer (write-once `d.dp` + degraded adapter)
 
@@ -3944,7 +3987,7 @@ own per-round structure confirmations kept PR-1 intact throughout
 in the follow-up", r65/r67). The verdict surface for #2114's
 PLAN-READY is therefore PR-1 ONLY: this document neither ships nor
 depends on G/H/H2 — every hazard they address is pre-existing on
-master and stays exactly as exposed as master is today. The
+master and not worsened by PR-1. The
 follow-up issue (filed at /engineer-2114 time) re-runs /research
 convergence on the seed before any implementation of G/H/H2.
 ## 5. Concrete design (A1)
@@ -4310,20 +4353,26 @@ Preserved exactly:
     shutdown-admission guard invariant is work-item-G content; it moved
     verbatim to `followup-seed.md` §7-mirror.
 12. **Armed-state admission (work item A3, r68 Codex M1; scoped r69
-    Codex M2)**: `loaded` is an `atomic.Bool`; its Store(true) is
-    the LAST step of the load, sequenced after all map population
-    (`loader.go:164`). The invariant is ADMISSION + VISIBILITY only:
-    a method observing false never touches Start-populated state; a
-    method observing true sees a fully-populated `m.maps`. NO
-    lifetime or teardown exclusion is claimed — the Store(false) at
-    `Close()`'s entry (:1206) gates NEW entrants but cannot drain an
-    in-flight operation that already observed true; the pre-existing
-    shutdown-window link-map race (`Close`'s :1206-1216 range vs the
-    live userspace path's link-map writers — pinned-link reuse
-    insertion :534, fresh insertion :575, detach deletion :661 —
-    admitted late after the scheduler stop's unbounded applySem
-    acquisition releases, `daemon_scheduler.go:170-183`, a late
-    confirm rollback acquiring with `context.Background()`,
+    Codex M2; two-state r75/r76)**: `loaded` is an `atomic.Bool`;
+    its Store(true) is the LAST step of the whole-batch population
+    critical section (`loader.go:164`). The invariant, stated
+    exactly (r76 Codex m1's corrections): (i) a method gated on the
+    FRESH state (`loaded==false` AND the registry empty — one
+    scoped `m.mu` operation with the handle selection) never
+    touches Start-populated state; (ii) a method observing true
+    sees a fully-populated registry; (iii) a retained-state method
+    proceeds against the retained registry UNDER the uniform
+    registry rule — master's exact behavior. NO lifetime or
+    teardown exclusion is claimed — the Store(false) at `Close()`'s
+    entry (:1206) gates new FRESH-state entrants (retained-state
+    methods proceed per the two-state rule, = master) and cannot
+    drain an in-flight operation; the pre-existing shutdown-window
+    link-map race (`Close`'s :1206-1216 range vs the live userspace
+    path's link-map writers — pinned-link reuse insertion :534,
+    fresh insertion :575, detach deletion :661 — admitted late
+    after the scheduler stop's unbounded applySem acquisition
+    releases, `daemon_scheduler.go:170-183`, a late confirm
+    rollback acquiring with `context.Background()`,
     `daemon_apply_commit.go:629`) stands as a named residual (§10);
     cilium/ebpf documents close-in-use as unsafe (`map.go:273`).
 13. **#4577 confirm contract (r8/r10/r11/r12/r13/r14/r15)**: an
@@ -4498,20 +4547,32 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    m1's wording fix) — and the class-3 raw-helper composition shape
    is asserted (r71 Codex M3 — `ClearAllCounters` composes through
    internal raw helpers, preserving its pinned legacy error text).
-   The existing fixture `TestXSKLivenessFailureRestoresUserspaceShimEntry`
-   (`xdp_shim_decouple_test.go:32,:321`) constructs an unarmed
-   `New()` and expects the selector restoration — the Swap class-1
-   gate breaks it; it migrates to an explicitly ARMED synthetic
-   fixture via the EXISTING userspace-local reflect/unsafe
-   injection mechanism (`manager_testhelpers_test.go:22`'s
-   `injectShimMap` pattern — a helper in `pkg/dataplane/*_test.go`
-   would NOT be importable from package userspace, r75 Codex m3),
-   and the migration sweep is inventoried honestly: ~30 synthetic
-   userspace tests (e.g. `maps_sync_cap_test.go:63` class-4 `Map`
-   calls, `clear_bounded_5304_test.go:35` class-1 setters on an
-   injected unarmed manager) plus root fixtures
-       (`maps_session_clear_test.go:17`, the exact-error tests in
-   `watchdog_test.go:9`). The Detach leg gets its named test
+   PLUS the RETAINED-state coverage the §4 contract promised (r76
+   Codex m2 — the v77 text promised it but §9 never gained it):
+   `TestManager_ArmedGate_RetainedReStartOverlap` — a retained
+   fixture (seed maps+programs, `loaded=false`) driven through a
+   blocked re-`Start` whose whole-batch critical section holds a
+   hook, with EVERY class's methods driven across the seam: fresh
+   methods gate, retained methods proceed under the registry rule,
+   no fatal fault, and the whole-batch boundary proven (no partial
+   registry is observable). The named Detach test's "race-free"
+   gains its concurrent population actor (the same blocked
+   re-`Start` seam).
+   The fixture-migration classification is REDONE under the
+   two-state rule (r76 Codex m3 — v77's prescription was stale):
+   `injectShimMap` modifies only `maps`, never `loaded`
+   (`manager_testhelpers_test.go:22`), so an injected fixture is
+   RETAINED-unarmed — and under the two-state predicate it
+   PROCEEDS. The XSK fixture
+   (`xdp_shim_decouple_test.go:32,:321,:41` — it already injects
+   ctrl/binding maps before the Swap call) is retained-unarmed and
+   the gate does NOT break it. Only fixtures asserting
+   `loaded==true` semantics (armed assertions) need the armed
+   synthetic fixture (an in-package `pkg/dataplane` helper for the
+   root tests; the userspace tests keep the reflect/unsafe
+   pattern); the /engineer pass re-derives the true migration set
+   from the two-state classification instead of the stale ~30
+   estimate (most injected fixtures proceed unchanged). The Detach leg gets its named test
    (r75 Codex m2): `TestManager_ArmedGate_DetachRetainedClaims`
    (matching the race target's `-run` pattern) — the fake
    `link.Link` embed, `xdpLinks`+`xdpFlagClaims` seeded, cleanup
@@ -4565,6 +4626,20 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
 - Any Rust/helper change; dataplane hot-swap/re-arm support (the accessor
   ENABLES it safely later).
 - Full-repo `go test -race` wiring.
+- **Pre-existing retained-generation confusion on the bootstrap-
+  recurrence path (r76 Codex M2 — named, owned by the follow-up's
+  work item H)**: `bootstrap.go:470` Teardown-retains the Manager;
+  `Cleanup` removes the pin tree (`loader.go:1221-1235`); the
+  retained `m.maps`/`m.programs` handles reference dead unpinned
+  kernel objects while re-`Start` creates fresh ones. A retained-
+  proceed method can mutate the obsolete object (the mutation never
+  reaches the live generation) and multi-map readers can report a
+  mixed old/new generation. Master has this exact behavior today
+  with NO gate at all; the recurrence itself is what work item H
+  terminates (`followup-seed.md`), and the generation/
+  linearizability redesign rides with it. A3's registry rule keeps
+  the Go-level access race-free in the meantime; it deliberately
+  does NOT claim generation correctness here.
 - **Pre-existing shutdown-window link-map race (r69 Codex M2,
   exact-schedule r70 Codex m3 — named, not fixed)**: shutdown's
   `stopPolicySchedulerLoop` performs an UNBOUNDED applySem
@@ -5027,19 +5102,18 @@ Still open:
    PLAN-READY when all three verdicts gate the PR-1 design as
    ready.
 
-7. **r68-r75 resolution (for the record)**: Codex r68 M1 (armed-state
-   admission gate) folded as work item A3; r69-r74 falsified each
-   intermediate form, and r75 caught the systemic fresh-vs-retained
-   conflation (Close retains the maps for hitless restart — the gate
-   must fire only on the fresh state) and the lock-ownership proof
-   gap — v77 carries the two-state predicate, the retained-state
-   matrix coverage, the in-section ownership assertion, and the
-   fixture migration mechanism. SMR r75's m1 (xdpFlagClaims locking)
-   was WITHDRAWN per Codex r75's verified ruling (Start never touches
-   the field; its exposure is the post-arm class). Each reviewer:
-   verify the two-state predicate against loader.go:1206-1218 +
-   bootstrap.go:470, the retained-state coverage in §9, and the
-   ownership-assertion seam.
+7. **r68-r76 resolution (for the record)**: Codex r68 M1 (armed-state
+   admission gate) folded as work item A3; r69-r75 falsified each
+   intermediate form, and r76 caught the last two structural defects
+   (locking the writer never protected unlocked readers — the uniform
+   registry rule + whole-batch publication; "retained" conflated
+   live-pinned with torn-down generations — the L2 claim narrowed to
+   admission + registry-selection safety, with the generation hazard
+   named to §10 and owned by the follow-up's work item H). AGY r76's
+   partial-state premise was falsified by the all-or-nothing
+   population proof (both reviewers see this). Each reviewer: verify
+   the uniform registry rule covers every class in every state, the
+   whole-batch boundary, and the narrowed L2 wording.
 
 ---
 
