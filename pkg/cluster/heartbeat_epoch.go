@@ -226,10 +226,31 @@ func epochOrderable(epoch uint64, nowNanos int64) bool {
 // Fails CLOSED: if the lock cannot be taken, the read-modify-write is SKIPPED
 // rather than run unlocked. A lock whose failure path executes the critical
 // section anyway is not a lock — it reinstates the very race it exists to
-// prevent, exactly when the guard cannot fire. Skipping is free here precisely
-// because emission does not depend on it: the wall-clock epoch is already
-// published and already on the wire, so all that is lost is
-// backward-clock-step protection.
+// prevent, exactly when the guard cannot fire.
+//
+// WHY DECLINING IS RIGHT, not merely cheap. Proceeding unlocked does not trade
+// correctness for liveness; it trades a TRANSIENT liveness risk for a DURABLE
+// one. A raced read-modify-write can leave a lower epoch in the file than an
+// overlapping incarnation already emitted. That value is read back as `prev` on
+// the next boot, and it is exactly the term that matters after a backward clock
+// step — the one case persistence exists for. The epoch then produced can sit
+// BELOW the peer's latched floor, where admitAuthedLocked refuses it: the same
+// false-peer-death the fail-open was supposed to avoid, moved one restart later
+// and made durable rather than transient. Corrupting the state whose only job is
+// surviving a clock step is not a safe way to fail.
+//
+// What declining costs is bounded and transient by comparison: the wall-clock
+// epoch is already published and already on the wire (see
+// Manager.heartbeatBootEpoch), so only backward-clock-step protection is lost,
+// and only until the next resolve succeeds.
+//
+// The old justification — "a node that cannot lock must not be a node that
+// cannot heartbeat" — was a SENDER-liveness argument applied to a call site that
+// is not on the heartbeat path at all. This runs on refineBootEpoch's worker,
+// off both the send loop and the receive loop, so declining it cannot stop this
+// node emitting anything. It also matches its siblings: MkdirAllDurable failure
+// already declines and WriteFileDurable failure already declines, so lock
+// failure was the only branch of three that proceeded.
 func withEpochFileLock(path string, fn func()) {
 	f, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {

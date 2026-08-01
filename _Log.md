@@ -66437,3 +66437,25 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_epoch.go,
   pkg/cluster/manager.go, pkg/cluster/heartbeat_epoch_latch_test.go,
   pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 23:55
+- **Action**: #6169 — lock-skip rationale + last stale doc reference. The five
+  stale-doc sites cited by review were already corrected in e84af04a0 (review read
+  3ba876e7c, one commit behind); verified at HEAD rather than assumed — all five
+  clean, and a grep of the deleted symbols found ONE survivor: the README
+  entry-points list still named `peerEpochFloorStore`. Fixed; the deleted
+  mechanism now has zero occurrences under pkg/. Strengthened `withEpochFileLock`'s
+  comment with the argument that makes the skip obviously right rather than
+  arguably right: proceeding unlocked did NOT trade correctness for liveness, it
+  traded a TRANSIENT liveness risk for a DURABLE one — a raced read-modify-write
+  can leave a lower epoch in the file, that value is read back as `prev` on the
+  next boot, and it is exactly the term that matters after a backward clock step,
+  so the epoch produced can sit below the peer's latched floor and be refused:
+  the same false-peer-death, moved one restart later and made durable. Also noted
+  the old justification ("a node that cannot lock must not be a node that cannot
+  heartbeat") was a SENDER-liveness argument applied to a call site that is not on
+  the heartbeat path at all, and that 2 of 3 branches in the same function already
+  declined. Elevated the one-heartbeat-interval restart window from a rollout-step
+  side note to the design decision that REPLACED durability, with what was bought
+  in exchange stated alongside it.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/README.md, _Log.md

@@ -31,10 +31,12 @@ locating any symbol below is now a matter of opening the named file.
 - The #6169 across-reboot boot epoch — wire section constants, the
   key-derived marker (`heartbeatEpochMarker`), the verified-frame reader
   (`heartbeatFrameEpoch`), the plausibility bound (`epochUsableAsFloor`),
-  the persisted monotonic seed (`nextBootEpoch`,
-  `Manager.heartbeatBootEpoch`), the durable peer floor / downgrade latch
-  (`peerEpochFloorStore`) and the start-time wiring
-  (`Manager.initHeartbeatEpochState`) — `heartbeat_epoch.go`.
+  the monotonic seed published synchronously from the wall clock
+  (`Manager.heartbeatBootEpoch`) with its off-path persistence refinement
+  (`refineBootEpoch`, `withEpochFileLock`) and the start-time wiring
+  (`Manager.initHeartbeatEpochState`) — `heartbeat_epoch.go`. The downgrade
+  latch itself is process-scoped state on `heartbeatAuthState`; there is no
+  peer-floor file.
 - Single-RG manual failover and transfer-commit protocol
   (`ManualFailover`, `ForceSecondary`, `ResetFailover`,
   `RequestPeerFailover`, `commitRequestedPeerFailover`,
@@ -344,11 +346,25 @@ peer liveness (`lastSeen`) or drive election.
     epoch, an epochless frame from it is REFUSED (`epochSeen` in
     `heartbeatAuthState`). The latch is armed by OBSERVATION, never by local
     build version — that is what keeps a rolling upgrade working.
-  - **The latch is PROCESS-SCOPED, deliberately.** It lives on
-    `Manager.hbAuth` (#5086/#6642), so a heartbeat restart, a DHCP-triggered
-    VRF rebind and an HA comms restart all PRESERVE it — the routine events.
-    Only a full daemon restart clears it, and a live peer re-arms it with its
-    next heartbeat (~100 ms).
+  - **The latch is PROCESS-SCOPED, and that is the design decision that
+    REPLACED durability.** It lives on `Manager.hbAuth` (#5086/#6642), so a
+    heartbeat restart, a DHCP-triggered VRF rebind and an HA comms restart all
+    PRESERVE it — the routine events. Only a full daemon restart clears it.
+
+    **The cost is exactly one heartbeat interval**, and it is what was bought in
+    exchange for deleting the peer-floor file. After a receiver daemon restart
+    the floor and latch re-arm from the peer's next epoch-bearing frame. A replay
+    landing inside that window IS admitted and can even set a low floor, but the
+    live peer's next frame carries a strictly higher epoch, which repairs the
+    floor and re-arms the latch — so **sustained** exposure additionally requires
+    the genuine peer to be ABSENT, in which case the attack forges liveness for a
+    dead peer and suppresses failover. Measured, not assumed:
+    `TestReceiverRestartWindowIsOneHeartbeat_6169`.
+
+    In exchange, rollback recovery is `systemctl restart xpfd` rather than
+    deleting a state file, there is no commit window between accepting a frame
+    and durably recording it, the receive path needs no cross-process lock, and
+    an in-range-but-wrong epoch cannot lock a peer out across reboots.
 
     An earlier revision persisted the floor so the latch also survived a daemon
     restart. Review priced that and it was removed: a peer-floor state file
