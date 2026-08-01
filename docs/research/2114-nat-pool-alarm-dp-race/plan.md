@@ -1,18 +1,22 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v74 — r72 folds: Codex M1's partition closure
-  (the three no-op stubs assigned; "touches" limited to DIRECT
-  access with the delegation rule; the matrix oracle honestly
-  scoped — AST enforces totality, runtime tests enforce outcomes,
-  the access audit carries correctness), Codex M2's `xdpEntryProg`
-  trio synchronization (a real Start-overlap race: the selector
-  write/write + status-read races — the field joins `m.mu`, the
-  trio joins the overlap set), Codex M3's detach reclassification
-  (category G — the neutral no-link nil path preserved), Codex
-  m1-m3 (`VlanSubInterfaces` race to §10; class-3 test-oracle
-  wording; the `ErrDataplaneNotArmed` declaration contract);
-  r72 verdicts: Codex PLAN-NEEDS-MAJOR (3M/3m), AGY PLAN-READY,
-  Claude SMR PLAN-READY; pending convergence review r73
+- **Status**: DRAFT v75 — r73 folds: the trio's locked-helper
+  scheme (the v74 "all three accessors lock" text deadlocked —
+  `Using...` calls `XDPEntryProgram` — triple-confirmed by Codex,
+  AGY, and the SMR pass), the `swapXDPEntryProg` :632 write under
+  a scoped `m.mu` section, `SwapToUserspaceXDPShimEntryProgram`
+  assigned class 1 (AGY's omitted-method catch), `DetachXDP`'s
+  mixed classification (category-G absent-link nil + the class-2
+  delegation target, with the seeded re-arm test leg), the
+  dedicated two-sided XDP test seam at `:154` (a population-only
+  barrier could not prove the XDP sync), the §9 totality-wording
+  fix, the §5.1/§5.5/§6 inventory alignment, and the
+  `VlanSubInterfaces` adjudication (residual stays per Codex's
+  verified post-arm scoping; named the first cheap-follow-up fix
+  per AGY's severity assessment — AGY rules on this in r74);
+  r73 verdicts: Codex PLAN-NEEDS-MAJOR (3M/3m), AGY
+  PLAN-NEEDS-MAJOR (4 items), Claude SMR PLAN-READY-WITH-NITS
+  (0M/1m); pending convergence review r74
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -3160,7 +3164,12 @@
   synchronized (a real Start-overlap race found inside
   category F); the detaches reclassified to category G;
   the VlanSubInterfaces residual; test-oracle wording;
-  the ErrDataplaneNotArmed declaration contract).
+  the ErrDataplaneNotArmed declaration contract). v75 (r73:
+  the trio locked-helper scheme (the v74 text deadlocked);
+  the :632 swap write scoped; SwapToUserspaceXDPShimEntryProgram
+  assigned class 1; DetachXDP's mixed classification; the
+  dedicated XDP test seam; totality wording; inventory
+  alignment; the VlanSubInterfaces adjudication).
 
 ---
 
@@ -3663,28 +3672,50 @@ class. The fold:
     `GetPersistentNAT` (:1146 — `New()`-allocated at :89-100 with its
     own `sync.RWMutex`, `persistent_nat.go:51-65`; pre-Start
     test-pinned at `server_show_nat_test.go:15-20`),
-    `XDPLinks`/`TCLinks` (:1195/:1199 — `New()`-created), AND the
-    detaches (r72 Codex M3: `DetachXDP` :639 / `DetachTC` :1131 read
-    only the construction-created link maps and return nil on the
-    empty map — a class-1 typed error would BREAK that preserved
-    neutral path) are category G; the `XDPLinks` raw-map hazard is
+    `XDPLinks`/`TCLinks` (:1195/:1199 — `New()`-created), AND
+    `DetachTC` (:1131 — reads only the construction-created link
+    map, nil on empty) are category G. `DetachXDP` (:639) is the
+    MIXED case (r73 Codex M1): its absent-link early return reads
+    only the construction link map (category-G nil preserved), but
+    the nonempty path delegates to `setXDPAttachedFlag` (:650),
+    which reads Start-populated `m.maps` (:700 `iface_zone_map`,
+    :730 `vlan_iface_map`) — reachable on re-arm because `Close`
+    never clears `xdpLinks` and bootstrap retains the Manager for
+    re-arm (`bootstrap.go:470`). The delegation target becomes a
+    class-2 internal (acquire-load `loaded`; on false the body's
+    no-map nil path — identical to master's "No iface_zone_map
+    yet" early return), and the §9 matrix gains the seeded re-arm
+    leg (an unarmed Manager with a populated `xdpLinks` entry:
+    detach returns the preserved outcome, no race); the `XDPLinks` raw-map hazard is
     named honestly (r71 Codex m1): the 1 Hz status path ranges it at
     `maps_sync.go:943` while Compile can mutate it before taking the
     userspace `m.mu` — pre-existing, not worsened by PR-1, §10.
-  - **The `xdpEntryProg` trio SYNCHRONIZED (r72 Codex M2 — a real
-    Start-overlap race inside category F as written):
-    `XDPEntryProgram`/`SelectUserspaceXDPShimEntryProgram`/
-    `UsingUserspaceXDPShimEntryProgram` (`loader.go:105-120`) read/
-    write the plain `m.xdpEntryProg` field with no synchronization —
+  - **The `xdpEntryProg` trio + the swap writer SYNCHRONIZED (r72
+    Codex M2; the lock SHAPE fixed at v75 per r73 Codex M2 / AGY
+    r73 / SMR r73 m1 — three independent reports of the same
+    defect):** the plain `m.xdpEntryProg` field is read/written at
+    `loader.go:106/:109/:115` (the trio), `:632` (the omitted
+    `swapXDPEntryProg` write), and initialized at `:97` —
     `LoadUserspaceShim` writes it during Start (`:154`, before the
     `:164` Store), a recovered-rollback Compile calls the selector
     pre-`m.mu` (RACE-3's window), and the 1 Hz status path reads it
-    (`maps_sync.go:481`, `:947`). v74: the field joins the
-    `m.mu`-protected set (all three accessors lock; one write per
-    load + 1 Hz reads — noise), the trio joins the §9 blocked-Start
-    overlap set, and the `loader.go:49` `m.mu` comment names it.
-    This closes the selector write/write + status-read races — the
-    last piece of the RACE-3 L2 closure.
+    (`maps_sync.go:481`, `:947`). The v74 "all three accessors
+    lock" text would DEADLOCK: `UsingUserspaceXDPShimEntryProgram`
+    (:118-120) CALLS `XDPEntryProgram`, and `sync.Mutex` is
+    non-reentrant. v75 specifies the locked-helper scheme: an
+    internal `xdpEntryProgramLocked()` raw helper; each public
+    accessor takes `m.mu` ONCE and delegates (`Using...` locks once
+    and calls the helper, never the public getter);
+    `swapXDPEntryProg`'s :632 write moves under a SCOPED `m.mu`
+    section (never whole-method locking — that would recurse
+    through the getter and hold the mutex across the link
+    updates). With the field `m.mu`-protected, the trio's home is
+    category G (resolving the F/G double-match, r73 Codex m1).
+    The trio joins the §9 blocked-Start overlap set, the
+    `loader.go:49` `m.mu` comment names the field (§5.5 aligned),
+    and the §9 XDP seam (below) proves the synchronization. This
+    closes the selector write/write + status-read races — the last
+    piece of the RACE-3 L2 closure.
 - **`loaded` mechanics**: `atomic.Bool` (:36 declaration; `:164`
   Store(true) — already the LAST step of the load, sequenced after
   all map population; `:458`, `:490`, `:1082` become Load; the
@@ -3893,7 +3924,13 @@ convergence on the seed before any implementation of G/H/H2.
   the attach family is class-1 with the arming-order invariant);
   category F facade accessors; category G ungated Go-state helpers
   (offset family, `IsLoaded`; `GetPersistentNAT`; `Mode()`'s home
-  corrected to `userspace.Manager`).
+  corrected to `userspace.Manager`); the `xdpEntryProg` locked-
+  helper scheme (trio + the `swapXDPEntryProg` :632 write under a
+  scoped section, never whole-method); `DetachXDP`'s mixed shape
+  (category-G absent-link nil + the class-2 delegation target);
+  `SwapToUserspaceXDPShimEntryProgram` (:604) is class 1 (its
+  pre-arm "XDP program not found" becomes the typed error — the
+  intended class-1 change; AGY r73's omitted-method catch).
 - FOLLOW-UP unit (G+H+H2) package touches — `daemon_apply_commit.go`,
   `daemon_run.go`/`daemon_run_shutdown.go`, `pkg/configstore`
   (`store_persist.go`, `crypto.go`, `store_commit.go`/`db.go`/`store.go`),
@@ -4055,10 +4092,11 @@ classification snapshot.
   call) — r68 Codex m3 inventory completion.
 - `pkg/dataplane/README.md` (or the loader's doc comment): the armed-state
   admission contract (work item A3) — the four-class pre-arm outcomes.
-- The `m.mu` contract comment at `loader.go:49` (r71 Codex m2):
-  today it names only the offset state; v73 makes `m.mu` also
-  protect `m.maps`/`m.programs` population and the scoped class-3
-  lookups — the comment is updated in the same pass.
+- The `m.mu` contract comment at `loader.go:49` (r71 Codex m2,
+  aligned with §4 at v75 per r73 Codex m2): today it names only
+  the offset state; it is updated to name the offset state, the
+  `m.maps`/`m.programs` population + scoped class-3 lookups, AND
+  the `xdpEntryProg` field.
 - Stale source comments describing direct `d.dp` access or the
   plain-interface race (r69 Codex m4 + r70 Codex m4 — the census
   subtracts comments, so these need the explicit sweep):
@@ -4168,9 +4206,10 @@ Preserved exactly:
   composition rule keeps even the legacy error TEXTS stable,
   r71 Codex M3); class-2 keep master's missing-map outcome
   byte-for-byte via the acquire-load gate; class-3 keep their
-  test-pinned side-effect-plus-success behavior; class-4 return nil
-  (+ the typed error where the signature carries one). Post-arm
-  behavior bit-identical; no signature changes.
+  test-pinned side-effect-plus-PINNED-OUTCOME behavior (success OR
+  the legacy later error — r73 Codex m2's §6 wording fix); class-4
+  return nil (+ the typed error where the signature carries one).
+  Post-arm behavior bit-identical; no signature changes.
 
 ## 7. Hidden invariants the change must preserve
 
@@ -4361,12 +4400,20 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    side effects AND return their pinned outcomes (success OR the
    legacy later error — r72 Codex m2 wording correction), and the
    synchronized `xdpEntryProg` trio joins the overlap set (r72
-   Codex M2); no fatal fault; (ii)
+   Codex M2) — and the XDP field gets its DEDICATED two-sided seam
+   (r73 Codex M3): real Start writes the selector at `loader.go:154`
+   BEFORE the population barrier, so a population-only barrier
+   orders the selector write before the accessor calls and the test
+   would pass even with unsynchronized access — the synthetic
+   loader gains a second entered/resume barrier around the `:154`
+   selector write, with the getter, predicate, and swap (`:632`)
+   driven concurrently across it; no fatal fault; (ii)
    `TestManager_PreArmMethodMatrix` — every exported `*Manager`
-   method is ASSIGNED to exactly one v73 class/category by the
-   generated AST inventory, with the precedence rule's DISJOINTNESS
-   asserted (r71 Codex M2) and the class-3 raw-helper composition
-   shape asserted (r71 Codex M3 — `ClearAllCounters` composes through
+   method is ASSIGNED to exactly one v75 class/category by the
+   generated AST inventory — the manifest asserts TOTALITY (one
+   label per method, matching §4's honest oracle scoping; r73 Codex
+   m1's wording fix) — and the class-3 raw-helper composition shape
+   is asserted (r71 Codex M3 — `ClearAllCounters` composes through
    internal raw helpers, preserving its pinned legacy error text).
    **[CORE]**
 5. Canary tests: redesigned matcher self-tests both directions; new
@@ -4430,10 +4477,28 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
   ranges it at `maps_sync.go:943` while Compile can mutate it before
   taking the userspace `m.mu` — pre-existing, not worsened by PR-1.
   The adjacent exported `VlanSubInterfaces` Go-map race joins it
-  (r72 Codex m1): the status helper reads it at `maps_sync.go:950`
-  while `CompileUserspaceShim` writes it (`loader.go:201`) before
-  acquiring the userspace `m.mu` (`manager_compile.go:213`) —
-  pre-existing, not worsened by PR-1. Full lifecycle exclusion
+  (r72 Codex m1; inventory completed at v75 per r73 Codex m3 — also
+  read during the swap path at `loader.go:622` and written by the
+  legacy Compile at `compiler.go:441`): the status helper reads it
+  at `maps_sync.go:950` while `CompileUserspaceShim` writes it
+  (`loader.go:201`) before acquiring the userspace `m.mu`
+  (`manager_compile.go:213`) — pre-existing, not worsened by PR-1.
+  **The r73 reviewer-split adjudication**: AGY r73 ruled this MUST
+  join A3 (a fatal map crash on the 1 Hz status path; folding the
+  trio while residual-izing this field is unprincipled); Codex r73
+  ruled residual-ization CONSISTENT (verified: `userspace.Manager.Start`
+  only delegates to `Load`, `manager.go:370`, and the 1 Hz status
+  loop starts only after a successful Compile,
+  `manager_compile.go:399` — so this is a POST-arm Compile-vs-status
+  race with NO Start-window overlap, outside A3's pre-arm L2 scope).
+  Ruling: the residual STAYS (Codex's scoping is the principled
+  line — A3's claim is the pre-arm window), AND the hazard gets the
+  explicit disposition AGY's severity assessment demands: it is a
+  fatal-crash-class pre-existing race fixable by a one-field `m.mu`
+  guard, named here as the FIRST cheap-follow-up candidate after
+  PR-1 (filed with the follow-up issue at /engineer time), not
+  silently dropped. AGY's r74 re-review rules on this adjudication
+  explicitly. Full lifecycle exclusion
   (lease/refcount + drain) is a dataplane-lifecycle redesign — a
   follow-up candidate, NOT #2114. PR-1's A3 adoption of the
   `Close()`-entry Store(false) narrows the entrant window but
@@ -4852,21 +4917,22 @@ Still open:
    PLAN-READY when all three verdicts gate the PR-1 design as
    ready.
 
-7. **r68-r72 resolution (for the record)**: Codex r68 M1 (armed-state
-   admission gate) folded as work item A3; r69 M1/M2 falsified v70's
-   universal form; r70 M1 falsified v71's four-class partition; r71
-   M1-M3 falsified v72's outcome-only class-2, its incomplete/
-   non-exclusive partition, and its nested-call composition; r72
-   M1-M3 falsified v73's remaining gaps (three unassigned no-op
-   stubs; L/F overlap without the direct-access limitation; the
-   unsynchronized `xdpEntryProg` trio — a real Start-overlap race;
-   the misclassified detaches). v74 carries the closure: direct-
-   access + delegation classification, the honestly-scoped matrix
-   oracle, the synchronized trio, the category-G detaches, and the
-   full residual inventory. Each reviewer: verify the v74 partition
-   against the full exported method set ONE more time (totality is
-   now mechanically enforced), the trio's `m.mu` synchronization,
-   and the detach neutral path preservation.
+7. **r68-r73 resolution (for the record)**: Codex r68 M1 (armed-state
+   admission gate) folded as work item A3; r69-r72 falsified each
+   intermediate form (universal gate; four-class partition;
+   outcome-only class-2; the no-op stubs + the trio race + the
+   detach misclassification); r73 triple-confirmed the trio lock
+   deadlock (Codex + AGY + SMR independently) and added the
+   DetachXDP mixed case, the XDP test seam, and the
+   SwapToUserspaceXDPShimEntryProgram assignment — v75 carries the
+   locked-helper scheme, the scoped :632 write, the mixed detach
+   classification, the dedicated XDP seam, and the VlanSubInterfaces
+   adjudication (residual stays per Codex's verified post-arm
+   scoping; named the first cheap-follow-up fix per AGY's severity
+   assessment). Each reviewer: verify the locked-helper scheme
+   against loader.go:105-120/:632, the DetachXDP mixed shape against
+   loader.go:639/:650/:700/:730, and rule explicitly on the
+   VlanSubInterfaces adjudication.
 
 ---
 
