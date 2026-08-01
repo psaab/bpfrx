@@ -1,9 +1,9 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v66 — r65 findings folded (Codex NEEDS-REVISION
-  3M/1m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS
-  0M/1m — the two missing §9 legs, folded here; all three
-  confirm the §4.7 structure); pending convergence review r66
+- **Status**: DRAFT v67 — r66 findings folded (Codex NEEDS-REVISION
+  3M/1m; AGY PLAN-READY; Claude SMR PLAN-READY (0 findings,
+  4 documented attacks FAILED); all three confirm the §4.7
+  structure); pending convergence review r67
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -2997,6 +2997,43 @@
   preemption-between-check-and-call leg, the
   Teardown→reset→B-registration→A-generation-rejection leg,
   and the reserved-set-drain leg.
+  v67: r66 convergence — the reservation binds to a defer on
+  every exit, the mutation entry serializes against the gate
+  closure, and the scheduler abandonment gains its fence and
+  terminal latch (Codex NEEDS-REVISION 3M/1m, folds 2 FOLDED
+  / 2 PARTIAL / 1 NOT-FOLDED, structure confirmed; AGY
+  PLAN-READY 5/5 with fresh attacks FAILED, structure
+  confirmed; SMR PLAN-READY with 4 documented attacks FAILED):
+  (a) THE DEFER-BOUND RESERVATION + THE HONEST HUNG
+  DISPOSITION (Codex M1, verified: a callback hung in a
+  non-contextual netlink call cannot run its defer,
+  `daemon_ha_fabric.go:23-93,102-148`): the reservation
+  retires via a defer on EVERY callback exit path; a callback
+  past the bound has at most ONE in-flight netlink call (its
+  next mutation abandons at the fence); a never-returning
+  call dies with the process at `TimeoutStopSec=20`. (b) THE
+  CHECK-THEN-ENTER CRITICAL SECTION (Codex M2, verified:
+  repeated atomic loads cannot establish never-mutating — a
+  callback preempted after its check until after the timeout
+  can resume and enter the call): the fence check and each
+  mutation's entry form ONE critical section under the
+  ledger lock, so no call STARTS after the gate closes.
+  (c) THE SCHEDULER'S FENCE + TERMINAL LATCH (Codex M3, all
+  three parts verified: (i) `publishPolicyScheduleState`
+  checks only epoch before dataplane mutation,
+  `daemon_scheduler.go:192-217,229-241` — it gains the
+  three-term fence check; (ii) the abandonment gains a
+  TERMINAL LATCH making any later `stopPolicySchedulerLoop`
+  call a no-op, answering Run's unconditional defer re-entry,
+  `daemon_run.go:89-100`; (iii) the scheduler's mutation
+  holds `m.mu` across the snapshot IPC,
+  `manager_compile.go:447-453,526-564`, while Close/Teardown
+  require the same mutex, `manager.go:471-482` — the
+  teardown can wait behind ONE in-flight scheduler snapshot,
+  bounded by the control-request deadline, and the fence
+  prevents NEW mutations). (d) The zeroize consistency (Codex
+  m1): the two-term "full" references now read the three-term
+  form, and §9 gains the ZEROIZE CALLBACK leg.
 
 ---
 
@@ -7254,12 +7291,20 @@ v20 history). The delivery is TWO units:
   retained pre-wipe configuration; the zeroize latch is the
   third fence state)
   — AFTER acquiring applySem AND again BEFORE each mutation,
-  with the callback TEARDOWN-SERIALIZED (r60 Codex M2,
+  with each mutation's ENTRY serialized against the gate
+  closure (r66 Codex M2, verified: repeated atomic loads
+  cannot establish never-mutating — a callback preempted
+  after its check until after the timeout can resume and
+  enter the call): the fence check and each mutation's entry
+  form ONE critical section under the ledger lock
+  (check-then-enter atomically), so no call STARTS after the
+  gate closes; a call already entered at the close is the
+  bounded overlap; and a call that never returns is bounded
+  by process exit — with the callback TEARDOWN-SERIALIZED (r60 Codex M2,
   verified: the netlink mutations are non-contextual calls,
   `daemon_ha_fabric.go:29-93,102-148`, and a signal can arrive
   after any check, with shutdown proceeding after its bounded
-  drain, `daemon_run_shutdown.go:50-64,214-230` — repeated
-  atomic loads cannot establish never-mutating): the callback
+  drain, `daemon_run_shutdown.go:50-64,214-230`): the callback
   is included in the shutdown's JOIN SET with the lifecycle
   protocol PINNED (r61 Codex M2, verified: a WaitGroup Add
   from the detached firing path can race shutdown's Wait —
@@ -7303,8 +7348,18 @@ v20 history). The delivery is TWO units:
   admission, then waits the reserved set (a WaitGroup/count
   under the ledger lock); a not-yet-scheduled callback's
   FIRST act is the fence check (gate closed ⇒ abandon and
-  retire its reservation), so the reserved set always
-  drains — the close-admission
+  retire its reservation), with the reservation bound to a
+  DEFER on EVERY callback exit path and the hung-call
+  disposition stated honestly (r66 Codex M1, verified: a
+  callback hung in a non-contextual netlink call cannot run
+  its defer, `daemon_ha_fabric.go:23-93,102-148`, so at the
+  bound the teardown proceeds with the callback live): the
+  defer covers completion, abandon, and error exits; a
+  callback past the bound has at most ONE in-flight netlink
+  call (its next mutation abandons at the fence), and a call
+  that never returns dies with the process at
+  `TimeoutStopSec=20` — so the reserved set drains or the
+  disposition bounds the wait — the close-admission
   step in `runShutdownSequence` adds NO new sequential wait
   beyond the set-drain's 5s disposition —
   with the THREE downstream holes closed (r64 Codex M1, all
@@ -7323,7 +7378,21 @@ v20 history). The delivery is TWO units:
   207-217`): the bound matches the drain's 5s (NO new
   sequential wait — the reacquisition overlaps the existing
   waits), and on expiry the scheduler stop is ABANDONED with
-  the process exiting — the policy scheduler's state is
+  the process exiting — with the abandonment's safety made
+  real (r66 Codex M3, all three parts verified: (i) the
+  scheduler's dataplane-mutation path checks NO fence today —
+  `publishPolicyScheduleState` checks only epoch before
+  dataplane mutation, `daemon_scheduler.go:192-217,229-241` —
+  so it gains the three-term fence check before any dataplane
+  mutation; (ii) the abandonment gains a TERMINAL LATCH — an
+  abandoned-stop flag making any later `stopPolicySchedulerLoop`
+  call a no-op, answering Run's unconditional defer re-entry,
+  `daemon_run.go:89-100`; (iii) the scheduler's mutation holds
+  `m.mu` across the snapshot IPC, `manager_compile.go:447-453,
+  526-564`, while Close/Teardown require the same mutex,
+  `manager.go:471-482` — so the teardown can wait behind ONE
+  in-flight scheduler snapshot, bounded by the control-request
+  deadline, and the fence prevents NEW mutations) — the policy scheduler's state is
   in-memory and dies with the process, and its mutation path
   shares the apply machinery's fence, so a stranded
   scheduler's next mutation abandons at the fence;
@@ -7340,7 +7409,9 @@ v20 history). The delivery is TWO units:
   admission FIRST and then joins the reserved set, and the
   join's 5s bound is the disposition — a callback still
   in-flight past the bound hits the full fence
-  (`runCtx.Err()` OR `stopping`) at each mutation and
+  (`runCtx.Err()` OR `stopping` OR `resetting` — the
+  three-term form, r66 Codex m1's consistency fix) at each
+  mutation and
   abandons, with the overlap bounded to one in-flight
   netlink call (r62 Codex fold-2's honesty point: a
   non-contextual call already entered cannot reach another
@@ -8858,7 +8929,11 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      epoch B's own registration fires cleanly), and the
      RESERVED-SET-DRAIN leg (a not-yet-scheduled callback
      abandons at the closed gate and retires its reservation,
-     so the reserved set always drains);
+     so the reserved set always drains), and the ZEROIZE
+     CALLBACK leg (r66 Codex m1): a callback queued before a
+     zeroize acquires after the wipe and reads `resetting` —
+     abandoning every mutation from the retained pre-wipe
+     configuration (`daemon_apply_reset.go:59-89`);
      (h2m) the v62 legs (r62 Codex m1 + fold-2): the LINKDEL
      INJECTION leg (a mismatched link whose `LinkDel` fails
      retires the arm FAILED — the discarded-error path,
