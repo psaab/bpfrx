@@ -1,22 +1,23 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v75 — r73 folds: the trio's locked-helper
-  scheme (the v74 "all three accessors lock" text deadlocked —
-  `Using...` calls `XDPEntryProgram` — triple-confirmed by Codex,
-  AGY, and the SMR pass), the `swapXDPEntryProg` :632 write under
-  a scoped `m.mu` section, `SwapToUserspaceXDPShimEntryProgram`
-  assigned class 1 (AGY's omitted-method catch), `DetachXDP`'s
-  mixed classification (category-G absent-link nil + the class-2
-  delegation target, with the seeded re-arm test leg), the
-  dedicated two-sided XDP test seam at `:154` (a population-only
-  barrier could not prove the XDP sync), the §9 totality-wording
-  fix, the §5.1/§5.5/§6 inventory alignment, and the
-  `VlanSubInterfaces` adjudication (residual stays per Codex's
-  verified post-arm scoping; named the first cheap-follow-up fix
-  per AGY's severity assessment — AGY rules on this in r74);
-  r73 verdicts: Codex PLAN-NEEDS-MAJOR (3M/3m), AGY
-  PLAN-NEEDS-MAJOR (4 items), Claude SMR PLAN-READY-WITH-NITS
-  (0M/1m); pending convergence review r74
+- **Status**: DRAFT v76 — r74 folds: Codex M1's DetachXDP
+  correction (the v75 class-2 gate would skip the retained-claim
+  cleanup that master runs on the retained re-arm state — no
+  `loaded` gate on this path; `setXDPAttachedFlag` becomes a
+  class-3-like internal with scoped `m.mu` lookups and always-run
+  cleanup; the §9 Detach leg specified with the fake link and the
+  `xdpFlagClaims` assertion), Codex M2's direct `:632` pinning
+  (a blocked Start could silent-green the swap lock — the test
+  drives a direct `swapXDPEntryProg` with a seeded distinct
+  program), Codex m1's label hygiene (trio single-homed in G;
+  DetachXDP's single manifest label), Codex m2's fixture migration
+  (TestXSKLivenessFailureRestoresUserspaceShimEntry → armed
+  synthetic fixture), Codex m3's premise correction (the status
+  loop can start before Compile-failure propagation — conclusion
+  unchanged, r74 re-confirmed); AGY r74 ACCEPTED the
+  VlanSubInterfaces adjudication as 'fully valid and sufficient';
+  r74 verdicts: Codex PLAN-NEEDS-MAJOR (2M/3m), AGY PLAN-READY,
+  Claude SMR PLAN-READY; pending convergence review r75
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -3169,7 +3170,13 @@
   the :632 swap write scoped; SwapToUserspaceXDPShimEntryProgram
   assigned class 1; DetachXDP's mixed classification; the
   dedicated XDP test seam; totality wording; inventory
-  alignment; the VlanSubInterfaces adjudication).
+  alignment; the VlanSubInterfaces adjudication). v76 (r74:
+  the DetachXDP retained-claim correction (no gate on the
+  cleanup path; class-3-like internal); the direct :632
+  test pinning; label hygiene (trio single-homed in G;
+  DetachXDP's single label); the fixture migration; the
+  status-loop premise correction; AGY accepted the VLAN
+  adjudication).
 
 ---
 
@@ -3650,14 +3657,17 @@ class. The fold:
     unassigned methods) touch NO shared state and join category L
     as documented no-ops.
   - **Category F — facade/domain accessors**: `Link`, `HA`,
-    `Sessions`, `SessionDeltas`, `Telemetry`, `ApplyConfig`,
-    `LastApplyResult`, `LastCompileResult`, `XDPEntryProgram`,
-    `SelectUserspaceXDPShimEntryProgram`,
-    `UsingUserspaceXDPShimEntryProgram` — return construction-time
-    handles/results or drive their own sub-locking; each is verified
-    at /engineer to touch no unsynchronized Start-populated state (any
-    that does is classed by the access rules instead — the matrix
-    enforces).
+    `Sessions`, `SessionDeltas`, `Telemetry`, `ApplyConfig` (its
+    multi-target delegation orders per-target in sequence, r73
+    Codex m1: `Compile`'s inner classing, then `LastApplyResult`'s
+    facade read), `LastApplyResult`, `LastCompileResult` — return
+    construction-time handles/results or drive their own
+    sub-locking; each is verified at /engineer to touch no
+    unsynchronized Start-populated state (any that does is classed
+    by the access rules instead — the matrix enforces). (The
+    `xdpEntryProg` trio's single home is category G under the
+    locked-helper scheme — removed from this listing, r74 Codex
+    m1.)
   - **Category G — ungated Go-state helpers** (r71 Codex M2's second
     missing category): the offset readers/setters/clears across
     `maps_counters.go` / `maps_nat.go:365` / `maps_screen.go:88`
@@ -3680,13 +3690,26 @@ class. The fold:
     the nonempty path delegates to `setXDPAttachedFlag` (:650),
     which reads Start-populated `m.maps` (:700 `iface_zone_map`,
     :730 `vlan_iface_map`) — reachable on re-arm because `Close`
-    never clears `xdpLinks` and bootstrap retains the Manager for
-    re-arm (`bootstrap.go:470`). The delegation target becomes a
-    class-2 internal (acquire-load `loaded`; on false the body's
-    no-map nil path — identical to master's "No iface_zone_map
-    yet" early return), and the §9 matrix gains the seeded re-arm
-    leg (an unarmed Manager with a populated `xdpLinks` entry:
-    detach returns the preserved outcome, no race); the `XDPLinks` raw-map hazard is
+    clears NEITHER `xdpLinks` NOR `m.maps` NOR `xdpFlagClaims`
+    (`loader.go:1206`) and bootstrap retains the Manager for
+    re-arm (`bootstrap.go:470`). The v75 class-2 gate on this
+    path was WRONG (r74 Codex M1): `setXDPAttachedFlag(false)`
+    performs REQUIRED Go-side work — it discovers the retained
+    claims (:711) and deletes the detaching ifindex from
+    `xdpFlagClaims` (:777) — and on the retained re-arm state
+    `m.maps` is still populated, so master RUNS the cleanup while
+    a `loaded`-gate would skip it, leaving stale claims a later
+    `SetZone` consumes into a spurious re-flag (:851/:865). v76:
+    NO `loaded` gate on this path — the delegation target is a
+    class-3-LIKE internal: the claim cleanup always runs, and its
+    `m.maps` lookups take scoped `m.mu` sections (the class-3
+    mechanism). `DetachXDP`'s single manifest label is category G
+    (its direct access is the construction link map) with the
+    class-3-like delegation target named (r74 Codex m1's
+    single-label rule), and §9 gains the specified Detach leg: a
+    package-local fake embedding `link.Link` (overriding
+    `Unpin`/`Close`), seeding `xdpLinks` AND `xdpFlagClaims`,
+    asserting the cleanup runs and no race fires. the `XDPLinks` raw-map hazard is
     named honestly (r71 Codex m1): the 1 Hz status path ranges it at
     `maps_sync.go:943` while Compile can mutate it before taking the
     userspace `m.mu` — pre-existing, not worsened by PR-1, §10.
@@ -3706,11 +3729,19 @@ class. The fold:
     internal `xdpEntryProgramLocked()` raw helper; each public
     accessor takes `m.mu` ONCE and delegates (`Using...` locks once
     and calls the helper, never the public getter);
-    `swapXDPEntryProg`'s :632 write moves under a SCOPED `m.mu`
-    section (never whole-method locking — that would recurse
-    through the getter and hold the mutex across the link
-    updates). With the field `m.mu`-protected, the trio's home is
-    category G (resolving the F/G double-match, r73 Codex m1).
+    `swapXDPEntryProg`'s SHIM-FIELD accesses move under scoped
+    `m.mu` sections (r74 Codex M2's precision): the `:609`
+    `m.programs` lookup, the `:613` already-selected check (via
+    the locked helper), and the `:632` write each take `m.mu`
+    around the ACCESS only — never whole-method locking (that
+    would recurse through the getter and hold the mutex across
+    the `:618-628` link-update loop; the loop's `xdpLinks` range
+    is serialized by the OUTER userspace `m.mu` against
+    Compile-driven attaches — the swap is invoked from the
+    liveness-restore path, `maps_sync.go:490-540`, under that
+    outer lock). With the field `m.mu`-protected, the trio's home
+    is category G (resolving the F/G double-match, r73 Codex m1 —
+    the §4 category-F text no longer lists the trio).
     The trio joins the §9 blocked-Start overlap set, the
     `loader.go:49` `m.mu` comment names the field (§5.5 aligned),
     and the §9 XDP seam (below) proves the synchronization. This
@@ -4407,7 +4438,16 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    would pass even with unsynchronized access — the synthetic
    loader gains a second entered/resume barrier around the `:154`
    selector write, with the getter, predicate, and swap (`:632`)
-   driven concurrently across it; no fatal fault; (ii)
+   driven concurrently across it — and the `:632` lock is pinned
+   DIRECTLY (r74 Codex M2): a blocked Start leaves the public Swap
+   at its class-1 gate, a direct private swap exits at the `:609`
+   absent-program check or the `:613` already-selected check, so a
+   missing `:632` lock could silent-green — the test therefore
+   drives a DIRECT `swapXDPEntryProg` call with a seeded DISTINCT
+   test-only program (seed `m.programs["test_prog"]` and
+   `xdpEntryProg="other"` so both early exits fail and `:632`
+   executes), raced against the getter across the seam; no fatal
+   fault; (ii)
    `TestManager_PreArmMethodMatrix` — every exported `*Manager`
    method is ASSIGNED to exactly one v75 class/category by the
    generated AST inventory — the manifest asserts TOTALITY (one
@@ -4415,6 +4455,11 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    m1's wording fix) — and the class-3 raw-helper composition shape
    is asserted (r71 Codex M3 — `ClearAllCounters` composes through
    internal raw helpers, preserving its pinned legacy error text).
+   The existing fixture `TestXSKLivenessFailureRestoresUserspaceShimEntry`
+   (`xdp_shim_decouple_test.go:32,:321`) constructs an unarmed
+   `New()` and expects the selector restoration — the Swap class-1
+   gate breaks it; it migrates to an explicitly ARMED synthetic
+   fixture via a `pkg/dataplane` test helper (r74 Codex m2).
    **[CORE]**
 5. Canary tests: redesigned matcher self-tests both directions; new
    `daemon_dp_canary_test.go` asserts no direct `dpCell` access outside the
@@ -4486,11 +4531,16 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
   **The r73 reviewer-split adjudication**: AGY r73 ruled this MUST
   join A3 (a fatal map crash on the 1 Hz status path; folding the
   trio while residual-izing this field is unprincipled); Codex r73
-  ruled residual-ization CONSISTENT (verified: `userspace.Manager.Start`
-  only delegates to `Load`, `manager.go:370`, and the 1 Hz status
-  loop starts only after a successful Compile,
-  `manager_compile.go:399` — so this is a POST-arm Compile-vs-status
-  race with NO Start-window overlap, outside A3's pre-arm L2 scope).
+  ruled residual-ization CONSISTENT and r74 RE-CONFIRMED the
+  conclusion while correcting one premise (r74 Codex m3): the
+  status loop does NOT start only after a successful Compile —
+  `clearHelperHAStateWithDebtEnsureRetryLocked` starts it before
+  propagating two Compile failures (`manager_ha.go:115`,
+  `manager_compile.go:276,:378`) — but EVERY loop-start path is
+  still after `bpfShim.CompileUserspaceShim` has returned, and
+  `Start` only delegates to `Load` (`manager.go:370`), so this
+  remains a POST-arm Compile-vs-status race with NO Start-window
+  overlap, outside A3's pre-arm L2 scope.
   Ruling: the residual STAYS (Codex's scoping is the principled
   line — A3's claim is the pre-arm window), AND the hazard gets the
   explicit disposition AGY's severity assessment demands: it is a
@@ -4917,22 +4967,18 @@ Still open:
    PLAN-READY when all three verdicts gate the PR-1 design as
    ready.
 
-7. **r68-r73 resolution (for the record)**: Codex r68 M1 (armed-state
-   admission gate) folded as work item A3; r69-r72 falsified each
-   intermediate form (universal gate; four-class partition;
-   outcome-only class-2; the no-op stubs + the trio race + the
-   detach misclassification); r73 triple-confirmed the trio lock
-   deadlock (Codex + AGY + SMR independently) and added the
-   DetachXDP mixed case, the XDP test seam, and the
-   SwapToUserspaceXDPShimEntryProgram assignment — v75 carries the
-   locked-helper scheme, the scoped :632 write, the mixed detach
-   classification, the dedicated XDP seam, and the VlanSubInterfaces
-   adjudication (residual stays per Codex's verified post-arm
-   scoping; named the first cheap-follow-up fix per AGY's severity
-   assessment). Each reviewer: verify the locked-helper scheme
-   against loader.go:105-120/:632, the DetachXDP mixed shape against
-   loader.go:639/:650/:700/:730, and rule explicitly on the
-   VlanSubInterfaces adjudication.
+7. **r68-r74 resolution (for the record)**: Codex r68 M1 (armed-state
+   admission gate) folded as work item A3; r69-r73 falsified each
+   intermediate form, and r74 caught the last two mechanical defects
+   (the v75 DetachXDP gate would have skipped the retained-claim
+   cleanup master runs on the re-arm state; the population/selector
+   barriers could silent-green the :632 swap lock) — v76 carries the
+   class-3-like delegation target with always-run cleanup, the direct
+   swap pinning, the label hygiene, the fixture migration, and the
+   corrected status-loop premise; AGY r74 explicitly ACCEPTED the
+   VlanSubInterfaces adjudication. Each reviewer: verify the v76
+   Detach shape against loader.go:639-660/:699-790 and the XDP
+   seam's direct-:632 pin.
 
 ---
 
