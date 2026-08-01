@@ -823,15 +823,37 @@ Deliberately narrow. Only three things DROP and bump
 - the xpf FIB matched a **discard route** — one "whose entire purpose is
   to drop the traffic", and explicitly NOT slow-path eligible;
 - the inner packet's IPv6 extension chain is **over-limit** (still
-  unresolved at `MAX_IPV6_EXT_HEADERS`) — the #4743 IDS-evasion shape.
-  A `NoNextHeader` terminal or an unfinished chain does **not** drop: the
-  L3 identity is intact, so it is adjudicated flowlessly, matching
-  mainline ("drop ONLY the genuine over-limit chain; a non-first fragment
-  / ICMPv6 / truncated packet is not over-limit and keeps its existing
-  flowless handling");
+  unresolved at `MAX_IPV6_EXT_HEADERS` — the #4743 IDS-evasion shape) or
+  **truncated** (an extension header declares a length running past the
+  end of the packet). Both are uninspectable *and* unadjudicable: the
+  only protocol byte still available is an extension-header number, not
+  the upper-layer protocol, so no protocol- or port-keyed rule can match
+  and one bad length byte would otherwise walk a packet through a DENY.
+  A `NoNextHeader` terminal does **not** drop — 59 is a legal chain
+  terminal that simply carries no L4, and the L3 identity is intact, so
+  it is adjudicated flowlessly;
 - the inner payload is **not IPv4 or IPv6**, or is too short to carry an
   L3 header. WireGuard is an IP tunnel, so there is no identity to
   adjudicate.
+
+**Mainline parity on the extension chain is a per-STAGE claim.** The
+#4743 comment in `poll_descriptor/mod.rs` — drop "ONLY the genuine
+over-limit chain; a non-first fragment / ICMPv6 / truncated packet is not
+over-limit and keeps its existing flowless handling" — is about the
+**userspace** stage, and it is accurate there. It is *not* a statement
+that a truncated chain transits, and it must not be read as authority for
+delivering one: on the transit path a truncated chain never reaches that
+stage, because the **XDP shim drops it at ingress**. After each generic
+extension-header advance, `parse_ipv6` in `userspace-xdp/src/lib.rs`
+revalidates `read_bytes(data, data_end, l3_offset, offset - l3_offset)`;
+a declared length past the frame makes the parse return `None`, and a
+`None` parse goes to
+`drop_degraded_transit(ctrl, USERSPACE_FALLBACK_REASON_PARSE_FAIL)`,
+which returns `XDP_DROP`. The WireGuard gate is the first inspection the
+**inner** packet gets — nothing upstream of it has walked that chain — so
+delivering the shape there would make the tunnel strictly *more*
+permissive than the wire it claims parity with. Dropping it is what
+restores the parity.
 
 **Where xpf still delegates to the kernel — and how you see it.** The
 gate enforces only where xpf actually HAS authority. Steerability

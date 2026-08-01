@@ -190,14 +190,20 @@ pub(crate) struct WgCounters {
     /// verdict the kernel path would have missed.
     pub(crate) inner_policy_denies: AtomicU64,
     /// Decapped inner packets DROPPED by a definite NON-policy xpf
-    /// verdict: the xpf FIB resolved a discard route (or an unsupported
-    /// next-table chain) for the inner destination, or the inner packet
-    /// is uninspectable — a truncated IP header, a declared length
-    /// overrunning the buffer, an IPv6 extension chain still unresolved
-    /// at `MAX_IPV6_EXT_HEADERS` (the #4743 IDS-evasion shape), or a
+    /// verdict: the xpf FIB resolved a DISCARD route for the inner
+    /// destination, or the inner packet is uninspectable — too short to
+    /// carry an IP header, an IPv6 extension chain still unresolved at
+    /// `MAX_IPV6_EXT_HEADERS` (the #4743 IDS-evasion shape) or one whose
+    /// declared extension-header length overruns the packet, or a
     /// non-IPv4/IPv6 payload on an IP tunnel. The mainline forward path
-    /// fails all of these closed too; delegating them to the kernel
-    /// would be incoherent after xpf has already reached a verdict.
+    /// fails all of these closed too — the over-limit chain in the
+    /// userspace stage (#4743), the truncated chain at XDP ingress
+    /// (`parse_ipv6` returns `None` → `drop_degraded_transit`) —
+    /// so delegating them to the kernel would be incoherent after xpf
+    /// has already reached a verdict. NOT in this set: an unsupported
+    /// next-table chain (slow-path ELIGIBLE, so it delegates and lands
+    /// in `inner_policy_unadjudicated`), and an IPv6 `NoNextHeader`
+    /// terminal (legal; adjudicated flowlessly on its L3 identity).
     pub(crate) inner_forward_drops: AtomicU64,
     /// Decapped inner packets delivered to the TUN WITHOUT an xpf
     /// forward-policy verdict — the residual #1432-S2a kernel

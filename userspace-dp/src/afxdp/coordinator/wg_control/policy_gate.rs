@@ -104,10 +104,17 @@
 //!     "whose entire purpose is to drop the traffic", and it is
 //!     explicitly NOT slow-path eligible. `NextTableUnsupported` is a
 //!     different animal and DELEGATES (see below).
-//!   - an OVER-LIMIT IPv6 extension chain (#4743's IDS-evasion shape).
-//!     A `NoNextHeader` terminal or an unfinished chain does NOT drop —
-//!     the L3 identity is intact, so it is adjudicated flowlessly, which
-//!     is what mainline does.
+//!   - an IPv6 extension chain that is OVER-LIMIT (#4743's IDS-evasion
+//!     shape) or TRUNCATED (an extension header declaring a length past
+//!     the end of the packet). Both are uninspectable AND unadjudicable:
+//!     the only protocol byte still available is an extension-header
+//!     number, not the upper-layer protocol, so no protocol- or
+//!     port-keyed rule can match it. The XDP shim already drops the
+//!     truncated shape at ingress on the transit path, so this is
+//!     parity, not over-reach. A `NoNextHeader` terminal does NOT drop —
+//!     59 is legal, has no L4 by definition, and the L3 identity is
+//!     intact, so it is adjudicated flowlessly. See
+//!     `synthetic_frame_and_meta` for the per-outcome reasoning.
 //!   - a non-IPv4/IPv6 inner payload, or one too short to carry an L3
 //!     header. WireGuard is an IP tunnel; the inner version nibble is 4
 //!     or 6 by construction (a zero-length keepalive never reaches here —
@@ -166,6 +173,13 @@ use crate::afxdp::frame::{
 /// by contract) can read it. Mirrors the `14` native GRE decap uses for
 /// its synthetic inner frame.
 pub(super) const WG_GATE_ETH_LEN: usize = 14;
+
+/// IPv6 Next Header 59, "No Next Header" (RFC 8200 §4.7) — a legal chain
+/// terminal carrying no upper-layer header. Stamped as the protocol when
+/// `walk_ipv6_ext_chain` reports [`ExtChainOutcome::NoNextHeader`], which
+/// is the same value the XDP shim's `parse_ipv6` leaves in `protocol`
+/// when it breaks on `NEXTHDR_NONE`.
+const PROTO_IPV6_NO_NEXT_HEADER: u8 = 59;
 
 /// The xpf forward-policy verdict for one decapped inner packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,6 +286,20 @@ pub(super) fn evaluate_wg_inner_ingress(
                 let Some((src_ip, dst_ip)) = inner_l3_addrs(frame, addr_family) else {
                     return InnerVerdict::ForwardDrop("inner_uninspectable");
                 };
+                // LOAD-BEARING: ports are hard 0 here, and that is safe
+                // only because this arm is unreachable for any protocol
+                // that HAS ports. `parse_session_flow_from_frame`
+                // returns `None` exactly when `parse_flow_ports`
+                // (`frame/inspect.rs`) does, and that helper yields
+                // `Some` only for TCP, UDP, and the identifier-bearing
+                // ICMP/ICMPv6 query types — every other protocol falls
+                // to its `_ => None`. So "no 5-tuple" implies "no ports
+                // exist", never "ports exist but we did not read them",
+                // and pairing the zeros with `l4_present = false` cannot
+                // silently match a port-bearing term against a real port
+                // of 0. Any future widening of `parse_flow_ports` to a
+                // protocol whose ports this arm can still fail to read
+                // breaks that implication and must be reviewed here.
                 (src_ip, dst_ip, 0, 0, false)
             }
         };
@@ -400,29 +428,63 @@ pub(super) fn evaluate_wg_inner_ingress(
 /// through every tunnel) AND failed `deny .. application junos-ping`
 /// OPEN.
 ///
-/// **Only an OVER-LIMIT IPv6 extension chain is a drop** (r3 MAJOR 3).
-/// Round 2 folded every "no resolvable L4" outcome into one
-/// `inner_uninspectable` drop, which newly killed valid traffic — most
-/// visibly a well-formed IPv6 packet with Next Header 59 (No Next
-/// Header), a legal terminal that simply has no L4. The mainline gate is
-/// narrower and says so explicitly (#4743, `poll_descriptor/mod.rs`):
-/// drop "ONLY the genuine over-limit chain; a non-first fragment /
-/// ICMPv6 / truncated packet is not over-limit and keeps its existing
-/// flowless handling." This mirrors that exactly:
+/// **Two IPv6 extension-chain outcomes drop; the rest adjudicate**
+/// (r3 MAJOR 3, then r4 MAJOR 1). Round 2 folded every "no resolvable
+/// L4" outcome into one `inner_uninspectable` drop, which newly killed
+/// valid traffic — most visibly a well-formed IPv6 packet with Next
+/// Header 59 (No Next Header), a legal terminal that simply has no L4.
+/// Round 3 corrected that by un-dropping `NoNextHeader`, but folded
+/// `Truncated` back in with it, which fails OPEN. The four outcomes are
+/// four different animals:
 ///
 ///   - `L4(off, proto)` — normal: stamp the resolved offset + terminal
 ///     protocol.
-///   - `OverLimit` — DROP (#4743 parity; the ext-header IDS-evasion
-///     shape).
-///   - `NoNextHeader` / `Truncated` — no L4 to point at, but the L3
-///     identity is intact and adjudicable: stamp the post-base-header
-///     offset and the base header's own Next Header byte, and let the
-///     flowless `l4_present = false` arm evaluate it.
+///   - `OverLimit` — DROP. The #4743 IDS-evasion shape.
+///   - `Truncated` — DROP (r4 MAJOR 1). An extension header declared a
+///     length running past the end of the packet. There is no honest
+///     protocol byte to adjudicate on: `walk_ipv6_ext_chain` can only
+///     reach this outcome from INSIDE an extension-header arm (the
+///     pre-loop short-buffer return is unreachable here — the caller
+///     already rejected `inner.len() < 40`), so the base header's Next
+///     Header byte is by construction an extension-header number
+///     (0/43/44/51/60/135/139/140/253/254), never the upper-layer
+///     protocol. Adjudicating on it means no protocol- or port-keyed
+///     rule can match, so one bad length byte walks a packet straight
+///     through a DENY. See the mainline-parity note below.
+///   - `NoNextHeader` — no L4, but a LEGAL terminal, so adjudicate it
+///     flowlessly on its L3 identity. The stamped protocol is the
+///     constant 59, not `inner[6]`: 59 is what "No Next Header" MEANS,
+///     and when the 59 sits on an intermediate extension header rather
+///     than the base header, `inner[6]` is that extension header's
+///     number instead — the same category error as the `Truncated` arm
+///     above. Mainline stamps 59 here too (`parse_ipv6`'s
+///     `NEXTHDR_NONE => break` leaves `protocol` at 59). With protocol
+///     59 the stamped `l4_offset` is immaterial by construction: no
+///     port parser and no ICMP type/code reader fires for it.
 ///
-/// An IPv4 packet whose IHL is degenerate is treated the same way: the
-/// L3 identity is still readable, so it is adjudicated rather than
-/// dropped. Only a packet too short to carry an L3 header at all is a
-/// drop — there is nothing to adjudicate.
+/// **Mainline parity, by stage.** The #4743 comment in
+/// `poll_descriptor/mod.rs` — drop "ONLY the genuine over-limit chain; a
+/// non-first fragment / ICMPv6 / truncated packet is not over-limit and
+/// keeps its existing flowless handling" — describes the USERSPACE
+/// stage, and it is accurate there. It is NOT authority for delivering a
+/// truncated chain, because on the transit path a truncated chain never
+/// reaches that stage: the XDP shim drops it at INGRESS. After each
+/// generic extension-header advance `parse_ipv6` revalidates
+/// `read_bytes(data, data_end, l3_offset, offset - l3_offset)`
+/// (`userspace-xdp/src/lib.rs`); a declared length past the frame makes
+/// the parse return `None`, and a `None` parse goes to
+/// `drop_degraded_transit(ctrl, USERSPACE_FALLBACK_REASON_PARSE_FAIL)`,
+/// which returns `XDP_DROP`. The WireGuard gate is the first inspection
+/// the INNER packet gets — nothing upstream of it has walked that chain
+/// — so delivering the shape here made the tunnel strictly more
+/// permissive than the wire it claims parity with. Dropping it restores
+/// the parity.
+///
+/// An IPv4 packet whose IHL is degenerate is treated the way
+/// `NoNextHeader` is: the L3 identity is still readable and the protocol
+/// byte is at a fixed offset that no length field can move, so it is
+/// adjudicated rather than dropped. Only a packet too short to carry an
+/// L3 header at all is a drop — there is nothing to adjudicate.
 fn synthetic_frame_and_meta(
     inner: &[u8],
     addr_family: u8,
@@ -449,14 +511,22 @@ fn synthetic_frame_and_meta(
         }
         match walk_ipv6_ext_chain(&gate_buf[..frame_len], l3).outcome {
             ExtChainOutcome::L4(offset, protocol) => (offset, protocol),
-            // #4743 parity: the ONE fail-closed inspection drop.
+            // #4743's IDS-evasion shape.
             ExtChainOutcome::OverLimit => return Err("ipv6_ext_chain_over_limit"),
-            // A legal terminal with no L4 (59 = No Next Header), or a
-            // chain the walk could not finish. Either way the L3 identity
-            // is intact — adjudicate it flowlessly, as mainline does.
-            ExtChainOutcome::NoNextHeader | ExtChainOutcome::Truncated => {
-                (l3 + 40, inner[6])
-            }
+            // r4 MAJOR 1: an extension header declared a length past the
+            // end of the packet. Only reachable from inside an
+            // extension-header arm here (the caller already rejected
+            // `inner.len() < 40`), so `inner[6]` is provably an
+            // extension-header number rather than the real upper-layer
+            // protocol — adjudicating on it lets one bad length byte
+            // walk the packet through a protocol- or port-keyed DENY.
+            // The XDP shim drops this shape at ingress on the transit
+            // path; see the header comment.
+            ExtChainOutcome::Truncated => return Err("ipv6_ext_chain_truncated"),
+            // 59 is a LEGAL terminal that simply has no L4: the L3
+            // identity is intact, so adjudicate it flowlessly. Stamp the
+            // constant 59, NOT `inner[6]` — see the header comment.
+            ExtChainOutcome::NoNextHeader => (l3 + 40, PROTO_IPV6_NO_NEXT_HEADER),
         }
     };
     Ok((

@@ -180,6 +180,50 @@ fn ipv6_no_next_header(src: Ipv6Addr, dst: Ipv6Addr) -> Vec<u8> {
     pkt
 }
 
+/// An IPv6 TCP packet behind ONE Destination-Options header, whose
+/// `hdrextlen` byte is the caller's. `hdrextlen = 0` is the well-formed
+/// 8-byte option (the walk resolves TCP at +48); anything large enough
+/// to run past the 68-byte packet makes the walk report `Truncated`.
+///
+/// The two differ by that ONE byte and nothing else — same addresses,
+/// same declared payload length, same TCP header at the same offset —
+/// so a behavioural difference between them can only come from the
+/// truncation verdict.
+fn ipv6_destopt_tcp(src: Ipv6Addr, dst: Ipv6Addr, hdrextlen: u8, dst_port: u16) -> Vec<u8> {
+    let mut pkt = vec![0u8; 68];
+    pkt[0] = 0x60;
+    pkt[4..6].copy_from_slice(&28u16.to_be_bytes()); // DestOpt (8) + TCP (20)
+    pkt[6] = 60; // Destination Options
+    pkt[7] = 64;
+    pkt[8..24].copy_from_slice(&src.octets());
+    pkt[24..40].copy_from_slice(&dst.octets());
+    // Destination-Options header at +40: next = TCP, length as given.
+    pkt[40] = 6;
+    pkt[41] = hdrextlen;
+    // TCP header at +48.
+    pkt[48..50].copy_from_slice(&44_100u16.to_be_bytes());
+    pkt[50..52].copy_from_slice(&dst_port.to_be_bytes());
+    pkt[60] = 0x50; // data offset = 5 words
+    pkt[61] = 0x02; // SYN
+    pkt
+}
+
+/// An IPv6 packet whose chain is `base -> DestOpt -> 59`: the No Next
+/// Header terminal sits on the EXTENSION header, not on the base header,
+/// so `inner[6]` is 60 (Destination Options) rather than 59.
+fn ipv6_destopt_then_no_next_header(src: Ipv6Addr, dst: Ipv6Addr) -> Vec<u8> {
+    let mut pkt = vec![0u8; 48];
+    pkt[0] = 0x60;
+    pkt[4..6].copy_from_slice(&8u16.to_be_bytes()); // just the DestOpt
+    pkt[6] = 60; // Destination Options
+    pkt[7] = 64;
+    pkt[8..24].copy_from_slice(&src.octets());
+    pkt[24..40].copy_from_slice(&dst.octets());
+    pkt[40] = 59; // No Next Header
+    pkt[41] = 0; // 8 bytes — well formed, NOT truncated
+    pkt
+}
+
 /// An IPv6 packet with 9 chained Destination-Options headers — one past
 /// `MAX_IPV6_EXT_HEADERS`, so the shared walker gives up. The #4743
 /// IDS-evasion shape, and the ONE inspection failure that drops.
@@ -724,6 +768,201 @@ fn over_limit_ipv6_extension_chain_is_dropped() {
     let (escaped, _denies, forward_drops, unadjudicated) = run_inner_full(&forwarding, &inner);
     assert!(escaped.is_empty(), "an over-limit chain must not reach the TUN");
     assert_eq!(forward_drops, 1);
+    assert_eq!(unadjudicated, 0);
+}
+
+/// **r4 MAJOR 1 fail-on-revert.** A TRUNCATED IPv6 extension chain — an
+/// extension header declaring a length that runs past the end of the
+/// packet — must DROP, not be adjudicated.
+///
+/// Round 3 folded `Truncated` in with `NoNextHeader` and stamped
+/// `inner[6]`, the BASE header's Next Header byte, as the protocol.
+/// `walk_ipv6_ext_chain` can only reach `Truncated` from inside an
+/// extension-header arm here (the caller already rejected
+/// `inner.len() < 40`, so the pre-loop short-buffer return is
+/// unreachable), which makes `inner[6]` provably an extension-header
+/// number — never the upper-layer protocol. A rule keyed on protocol or
+/// port therefore cannot match, and one bad length byte walks the packet
+/// straight through the DENY.
+///
+/// The control and the attack differ by exactly ONE byte, the
+/// Destination-Options `hdrextlen`. The control (`hdrextlen = 0`, a
+/// well-formed 8-byte option) resolves TCP/80 and the `junos-http` DENY
+/// fires; the attack (`hdrextlen = 100`, declaring 808 bytes inside a
+/// 68-byte packet) was adjudicated as protocol 60 and crossed it.
+///
+/// Mainline is NOT more permissive here: on the transit path the XDP
+/// shim drops this shape at ingress — `parse_ipv6` revalidates
+/// `read_bytes(data, data_end, l3_offset, offset - l3_offset)` after
+/// each generic extension-header advance, returns `None`, and a `None`
+/// parse is `drop_degraded_transit(.., PARSE_FAIL)` → `XDP_DROP`. The
+/// #4743 "a truncated packet ... keeps its existing flowless handling"
+/// comment describes the USERSPACE stage, which this shape never
+/// reaches.
+#[test]
+fn truncated_ipv6_extension_chain_cannot_cross_a_port_bearing_deny() {
+    let src: Ipv6Addr = "2001:db8:77::5".parse().unwrap();
+    let dst: Ipv6Addr = "2001:db8:88::9".parse().unwrap();
+
+    // p1 DENIES junos-http (TCP/80); p2 permits everything else. A
+    // port-bearing rule is the point: a protocol-agnostic `deny any`
+    // would drop the attack packet for the wrong reason and prove
+    // nothing about the protocol byte.
+    let mut snapshot = base_snapshot();
+    snapshot.routes = vec![v6_route_to_lan()];
+    let mut deny_http = deny_rule("untrust", "trust");
+    deny_http.name = "deny-http".to_string();
+    deny_http.applications = vec!["junos-http".to_string()];
+    deny_http.application_terms = vec![PolicyApplicationSnapshot {
+        name: "junos-http".to_string(),
+        protocol: "tcp".to_string(),
+        destination_port: "80".to_string(),
+        ..Default::default()
+    }];
+    snapshot.policies = vec![deny_http, permit_rule("untrust", "trust")];
+    let forwarding = build_forwarding_state(&snapshot);
+
+    // CONTROL: the same packet with a well-formed option length. The
+    // chain resolves, the port-bearing DENY matches, nothing escapes.
+    // This is what proves the policy under test is real and reachable.
+    let wellformed = ipv6_destopt_tcp(src, dst, 0, 80);
+    let (escaped, denies, forward_drops, unadjudicated) = run_inner_full(&forwarding, &wellformed);
+    assert!(
+        escaped.is_empty(),
+        "control: a well-formed DestOpt+TCP/80 packet must be DENIED ({} bytes escaped, \
+         denies={denies} forward_drops={forward_drops} unadjudicated={unadjudicated})",
+        escaped.len()
+    );
+    assert_eq!(
+        denies, 1,
+        "control: the port-bearing DENY must be the recorded reason, not an incidental \
+         forward drop (forward_drops={forward_drops})"
+    );
+
+    // ATTACK: one byte different. It must not reach the TUN.
+    let truncated = ipv6_destopt_tcp(src, dst, 100, 80);
+    assert_eq!(
+        truncated.len(),
+        wellformed.len(),
+        "the two packets must differ only in the hdrextlen byte"
+    );
+
+    // The END-TO-END assertion comes FIRST, deliberately: it is the
+    // security property, and a mechanism assertion placed ahead of it
+    // would short-circuit the mutation red and leave "the packet reaches
+    // the kernel" unproven.
+    let (escaped, denies, forward_drops, unadjudicated) = run_inner_full(&forwarding, &truncated);
+    assert!(
+        escaped.is_empty(),
+        "a TRUNCATED IPv6 extension chain crossed the junos-http DENY and reached the wgN TUN \
+         — one hdrextlen byte turned TCP/80 into 'protocol 60' and no port-keyed rule could \
+         match it ({} bytes escaped, denies={denies} forward_drops={forward_drops} \
+         unadjudicated={unadjudicated})",
+        escaped.len()
+    );
+    assert_eq!(
+        forward_drops, 1,
+        "the truncated chain is an inspection failure, not a policy verdict"
+    );
+    assert_eq!(
+        unadjudicated, 0,
+        "xpf reached a verdict — this must not read as kernel delegation"
+    );
+
+    // Then bind the specific mechanism: the gate must refuse to build a
+    // synthetic meta for this shape at all, rather than stamping an
+    // extension-header number as the protocol.
+    let mut gate_buf = vec![0u8; super::policy_gate::WG_GATE_ETH_LEN + 65_535];
+    assert!(
+        super::policy_gate::synthetic_frame_and_meta_for_test(
+            &truncated,
+            libc::AF_INET6 as u8,
+            &mut gate_buf,
+        )
+        .is_none(),
+        "a truncated extension chain has no honest protocol byte — the gate must not \
+         synthesise a meta for it"
+    );
+    let verdict = super::policy_gate::evaluate_wg_inner_ingress(
+        &forwarding,
+        WG_ENDPOINT_ID,
+        &truncated,
+        &mut gate_buf,
+    );
+    assert!(
+        matches!(verdict, super::policy_gate::InnerVerdict::ForwardDrop(_)),
+        "a truncated IPv6 extension chain must fail CLOSED, got {verdict:?}"
+    );
+}
+
+/// **r4 MAJOR 1, second half.** `NoNextHeader` must keep its flowless
+/// adjudication, but the protocol it is adjudicated on must be 59 — what
+/// "No Next Header" MEANS — not `inner[6]`. When the 59 sits on an
+/// intermediate extension header rather than the base header, `inner[6]`
+/// is that extension header's number (60 here), the same category error
+/// the truncated arm made. Mainline stamps 59 for this shape:
+/// `parse_ipv6`'s `NEXTHDR_NONE => break` leaves `protocol` at 59.
+#[test]
+fn no_next_header_behind_an_extension_header_is_adjudicated_as_protocol_59() {
+    let src: Ipv6Addr = "2001:db8:77::5".parse().unwrap();
+    let dst: Ipv6Addr = "2001:db8:88::9".parse().unwrap();
+    let inner = ipv6_destopt_then_no_next_header(src, dst);
+    assert_eq!(inner[6], 60, "the base Next Header must be the DestOpt, not 59");
+
+    // END-TO-END first: a PROTOCOL-KEYED deny on 59, with a permit-any
+    // behind it. Stamping `inner[6]` makes the packet read as protocol
+    // 60, the deny does not match, and the permit passes it to the TUN.
+    let mut snapshot = base_snapshot();
+    snapshot.routes = vec![v6_route_to_lan()];
+    let mut deny_59 = deny_rule("untrust", "trust");
+    deny_59.name = "deny-proto-59".to_string();
+    deny_59.applications = vec!["proto-59".to_string()];
+    deny_59.application_terms = vec![PolicyApplicationSnapshot {
+        name: "proto-59".to_string(),
+        protocol: "59".to_string(),
+        ..Default::default()
+    }];
+    snapshot.policies = vec![deny_59, permit_rule("untrust", "trust")];
+    let proto_keyed = build_forwarding_state(&snapshot);
+    let (escaped, denies, forward_drops, unadjudicated) = run_inner_full(&proto_keyed, &inner);
+    assert!(
+        escaped.is_empty(),
+        "a 59 terminal behind an extension header was adjudicated as protocol 60, so the \
+         protocol-keyed DENY missed it and the permit-any behind it let it reach the wgN TUN \
+         ({} bytes escaped, denies={denies} forward_drops={forward_drops} \
+         unadjudicated={unadjudicated})",
+        escaped.len()
+    );
+    assert_eq!(denies, 1, "the protocol-59 DENY must be the recorded reason");
+    assert_eq!(forward_drops, 0, "No-Next-Header is not an inspection failure");
+
+    // Then the mechanism, through the production meta builder.
+    let mut gate_buf = vec![0u8; super::policy_gate::WG_GATE_ETH_LEN + 65_535];
+    let (_len, meta) = super::policy_gate::synthetic_frame_and_meta_for_test(
+        &inner,
+        libc::AF_INET6 as u8,
+        &mut gate_buf,
+    )
+    .expect("a NoNextHeader terminal is adjudicable, not a drop");
+    assert_eq!(
+        meta.protocol, 59,
+        "the stamped protocol must be the 59 terminal, not the extension header it sat behind"
+    );
+
+    // ...and it still transits under a permit / drops under a deny.
+    let mut permit_snapshot = base_snapshot();
+    permit_snapshot.routes = vec![v6_route_to_lan()];
+    permit_snapshot.policies = vec![permit_rule("untrust", "trust")];
+    let permit_fwd = build_forwarding_state(&permit_snapshot);
+    let (escaped, _denies, forward_drops, _unadj) = run_inner_full(&permit_fwd, &inner);
+    assert_eq!(escaped, inner, "a legal 59 terminal must transit under a permit");
+    assert_eq!(forward_drops, 0, "No-Next-Header is not an inspection failure");
+
+    let deny_fwd = denied_zone_pair_forwarding();
+    let (escaped, denies, forward_drops, unadjudicated) = run_inner_full(&deny_fwd, &inner);
+    assert!(escaped.is_empty(), "a denied 59 terminal must not reach the TUN");
+    assert_eq!(denies, 1, "the drop must be the ZONE-POLICY verdict");
+    assert_eq!(forward_drops, 0);
     assert_eq!(unadjudicated, 0);
 }
 
