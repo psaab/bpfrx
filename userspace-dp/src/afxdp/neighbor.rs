@@ -1102,8 +1102,13 @@ pub(super) fn neigh_monitor_thread(
 /// AF_UNIX `SOCK_DGRAM` socketpair in tests — no privileged AF_NETLINK socket
 /// and no reliance on real kernel neighbor churn (the team-requested
 /// "factor for deterministic unit-testing" seam). The caller supplies the
-/// already-bound, already-dumped netlink `fd` (with the 500ms `SO_RCVTIMEO`
-/// set) and closes it after this returns.
+/// already-bound, already-dumped netlink `fd` and closes it after this
+/// returns. The PRODUCTION caller sets a 500ms `SO_RCVTIMEO` on it
+/// (`neigh_monitor_thread`), which is what bounds stop-latency in the field —
+/// but this loop does not depend on that value, and the #5165 tests
+/// deliberately supply a much longer one so the loop stays parked in `recv`
+/// across a stop and the post-recv re-check is actually reached. Do not read
+/// the 500ms as a precondition of this function.
 ///
 /// Each `recv()` batch bumps the neighbor generation (`Release`, before any
 /// mutation) and applies every RTM_{NEW,DEL}NEIGH message to
@@ -2218,11 +2223,22 @@ mod monitor_lifecycle_tests_5165 {
                 libc::MSG_DONTWAIT,
             )
         };
+        // `leftover < 0` alone would accept ANY error as "drained" — an EBADF
+        // from a future refactor would read as success. Only EAGAIN /
+        // EWOULDBLOCK means the queue is genuinely empty.
+        let drain_errno = std::io::Error::last_os_error().raw_os_error();
         assert!(
             leftover < 0,
             "the post-stop batch must have been RECEIVED by the loop, but \
              {leftover} bytes are still queued — the loop exited on its \
              top-of-loop check, so the post-recv re-check was never exercised",
+        );
+        assert!(
+            matches!(drain_errno, Some(libc::EAGAIN) | Some(libc::EWOULDBLOCK)),
+            "drain recv failed with errno {drain_errno:?}, not EAGAIN/EWOULDBLOCK. \
+             The queue being empty is the ONLY acceptable reason this returns \
+             <0; any other error means the fd is unusable and this assertion \
+             would otherwise have passed for the wrong reason",
         );
 
         assert!(
