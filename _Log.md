@@ -66238,3 +66238,38 @@ break — `go vet` confirmed passing under every revert.
   pkg/daemon/userspace_sync_session_id_6198_test.go,
   userspace-dp/src/session/mod.rs, userspace-dp/src/session/tests.rs,
   userspace-dp/src/session/README.md, docs/session-sync-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-01 12:40
+- **Action**: #6169 — close the >=65-recording sustained heartbeat replay with a
+  signed boot epoch. Two parts. (1) Scope the #4107 anti-replay nonce to the
+  daemon incarnation (`Manager.heartbeatNonce`) instead of the heartbeatSender,
+  so routine heartbeat restarts (VRF rebind, comms restart) stop minting fresh
+  sessions — otherwise one daemon incarnation could emit more than a ringful of
+  sessions under ONE epoch and the ring stayed churnable inside an incarnation.
+  (2) Carry a per-incarnation boot epoch in the SIGNED heartbeat: a 16-byte
+  `marker(8)+epoch(8)` section inserted BETWEEN the body and the `XPFA` trailer,
+  so a pre-#6169 receiver still finds the trailer at len-52, still verifies the
+  MAC over exactly the bytes the new sender signed, and simply ignores the
+  epoch (bidirectional compat, no HAProtocolVersion bump — the #6370 attempt
+  appended AFTER the trailer and split a keyed cluster). Marker is key-derived
+  `HMAC(PSK,"xpf-ha-boot-epoch-v1")[:8]`, not a fixed magic, so an ordinary body
+  cannot deterministically collide and latch a bogus far-future floor. Receiver
+  keeps an O(1) `highEpoch` floor on the Manager (restart-proof via #6642) and
+  rejects `epoch < highEpoch` BEFORE the session ring is touched — the ordering
+  is load-bearing because `ring.admit` records a never-seen session as a side
+  effect. Sender epoch is `max(persisted+1, wall_nanos)` at NANOSECOND
+  resolution, persisted atomically under /var/lib/xpf; persist-before-emit means
+  a node that cannot write advertises no epoch and its peer falls back to the
+  ring, so no healthy node's heartbeats can ever become unacceptable to a
+  healthy peer — that is what keeps this change free of election/ownership
+  coupling and of any HA availability cost. Resolution is async (fsync must not
+  block the 100ms send loop). Deliberately NO sticky epoch-strip gate: it would
+  reject a live peer during a supported A/B rollback, which is dual-primary —
+  worse than the replay it closes; that residual is closed by PSK rotation.
+  Removed `heartbeatAuthState.admit` so `admitAuthed` is the single gate.
+  Baseline reproduced first (64 recordings -> 0/640 admitted; 65 -> 650/650).
+  Five mutations each red an ASSERTION with build+vet rc=0.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/heartbeat_epoch_test.go,
+  pkg/cluster/heartbeat_nonce_scope_test.go, pkg/cluster/heartbeat.go,
+  pkg/cluster/manager.go, pkg/cluster/heartbeat_replay_restart_5086_test.go,
+  pkg/cluster/heartbeat_auth_test.go, pkg/cluster/README.md, _Log.md

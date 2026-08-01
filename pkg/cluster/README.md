@@ -23,10 +23,16 @@ locating any symbol below is now a matter of opening the named file.
   `vrfListenConfig` — `heartbeat_manager.go`.
 - `HeartbeatPacket`, `MarshalHeartbeat`,
   `UnmarshalHeartbeat`, the #4107 control-channel auth
-  (`MarshalHeartbeatAuth`, `heartbeatAuthTrailer`,
-  `verifyHeartbeatMAC`, `heartbeatAuthReplay`,
-  `heartbeatAuthDecision`), sender/receiver goroutine types —
+  (`MarshalHeartbeatAuth`, `marshalHeartbeatAuthEpoch`,
+  `heartbeatAuthTrailer`, `verifyHeartbeatMAC`, `heartbeatAuthReplay`,
+  `heartbeatAuthState.admitAuthed`, `heartbeatAuthDecision`,
+  `Manager.heartbeatNonce`), sender/receiver goroutine types —
   `heartbeat.go`. See "Control-channel authentication" below.
+- The #6169 across-reboot boot epoch — wire section constants, the
+  key-derived marker (`heartbeatEpochMarker`), the verified-frame reader
+  (`heartbeatFrameEpoch`), and the persisted monotonic seed
+  (`nextBootEpoch`, `Manager.heartbeatBootEpoch`) —
+  `heartbeat_epoch.go`.
 - Single-RG manual failover and transfer-commit protocol
   (`ManualFailover`, `ForceSecondary`, `ResetFailover`,
   `RequestPeerFailover`, `commitRequestedPeerFailover`,
@@ -217,6 +223,44 @@ peer liveness (`lastSeen`) or drive election.
   enforcing peer would reject and split the cluster (dual-primary). The
   overflow guard is unreachable at the uint8-bounded RG count and fails
   LOUD (`slog.Error`) rather than emitting cleartext.
+- **Wire, boot-epoch section (#6169).** A signed frame optionally carries
+  a 16-byte boot-epoch section `marker(8) + epoch(8, little-endian)`
+  inserted **BETWEEN the body and the `XPFA` trailer**
+  (`marshalHeartbeatAuthEpoch`):
+
+  ```
+  [ body … version section ][ marker(8) ][ epoch(8) ][ XPFA(4) session(8) counter(8) HMAC(32) ]
+                             \___ #6169 epoch section ___/\_________ #4107 auth trailer _________/
+                                                          \_ signed span ends before the digest _/
+  ```
+
+  The placement is load-bearing and is **not** interchangeable with
+  appending after the trailer. Appending after it (the earlier attempt,
+  #6370) moves the `XPFA` magic off `len-52`, so a pre-#6169 receiver reads
+  the frame as UNSIGNED — and an enforcing pre-#6169 peer then rejects
+  every frame, splitting a keyed cluster mid-upgrade. With the section
+  before the trailer, a pre-#6169 receiver still locates the trailer at
+  `len-52`, still verifies the MAC over exactly the bytes the new sender
+  signed, still decodes an identical packet (the epoch lands past the
+  version section, which `UnmarshalHeartbeat` ignores), and simply never
+  sees the epoch. Bidirectional compatibility with **no**
+  `CurrentHAProtocolVersion` bump.
+
+  `marker = HMAC(PSK, "xpf-ha-boot-epoch-v1")[:8]` is key-derived, NOT a
+  fixed ASCII magic. The section is located by scanning back from the
+  fixed-size trailer, so the bytes ahead of it are the tail of the version
+  section — a stable, build-specific string. A fixed magic could therefore
+  be matched by an ordinary body on **every** frame of some build,
+  deterministically; and because the receiver LATCHES the high-water epoch,
+  a body-derived value read as a uint64 (~7e18, far above a wall-clock
+  epoch ~1.8e18) would permanently lock the peer out. A key-derived marker
+  is a PRF value no attacker can compute without the PSK, and an archived
+  legacy body collides at only ~2⁻⁶⁴. The epoch is read **only** from a
+  MAC-verified frame — only a verified frame authorises treating `len-52`
+  as the end of the signed body. The tail reserve grows to 68 bytes when a
+  marker is emitted, so a maximal frame still fits `maxHeartbeatSize`;
+  reserving only 52 lets the frame overrun the receiver's read buffer,
+  which truncates it and destroys the MAC.
 - **Anti-replay.** `session` is a random per-sender-process id and
   `counter` a monotonic per-session counter. `heartbeatAuthReplay.admit`
   remembers a BOUNDED SET of per-session high-water counters
@@ -256,11 +300,88 @@ peer liveness (`lastSeen`) or drive election.
   incarnations — and routine peer restarts consume ring slots permanently now
   that the ring outlives a local restart. Neither is a regression: before
   #5086 any local heartbeat restart wiped the ring entirely, so this worst
-  case is a strict subset of the previous one. A complete fix
-  needs a boot-epoch / monotonic-across-reboot counter carried in the frame
-  (a wire change) — tracked as a follow-up (#6169). The map still causes NO
+  case is a strict subset of the previous one. The map still causes NO
   genuine-peer lockout (an evicted live watermark just makes the peer's next
   frame never-seen → admitted) and cannot grow memory (fixed 64 slots).
+  **#6169 closes the ≥65 churn** with the signed boot epoch below; the ring
+  is retained and still owns within-incarnation replay and the whole legacy
+  (epoch-less) path.
+- **Across-incarnation anti-replay — the signed boot epoch (#6169).**
+  The ring can only ever be a bounded set because session ids are random and
+  unordered. The frame therefore carries a **boot epoch**: a per-daemon-
+  incarnation counter that strictly increases across restarts and reboots,
+  giving the receiver a TOTAL ORDER over peer incarnations in O(1) state.
+  - **Receiver** (`heartbeatAuthState.admitAuthed`, floor `highEpoch` on the
+    `Manager` so it survives a heartbeat restart exactly like the ring):
+    `epoch < highEpoch` → REJECT (a retired incarnation); `epoch ==
+    highEpoch` → the same incarnation, fall through to the ring;
+    `epoch > highEpoch` → let the ring vet the nonce, then raise the floor.
+    **The floor is tested BEFORE the ring is consulted and a rejected frame
+    never reaches `ring.admit`.** That ordering is load-bearing: `admit`
+    RECORDS a never-seen session as a side effect, so checking the epoch
+    after it would let rejected replays keep evicting live watermarks and
+    flush the ring — the bypass that failed review in #6370. The floor only
+    rises to a value the genuine peer actually signed, so replaying a
+    captured high-epoch frame cannot push it above the live peer.
+  - **Sender** (`nextBootEpoch`): `max(persisted+1, wall_clock_nanos)`,
+    persisted atomically at `/var/lib/xpf/ha-boot-epoch` (the same durable
+    state root as SNMPv3 `engineBoots`). The two terms cover the two
+    failure modes neither survives alone — a **backward clock step** across
+    a reboot is dominated by `persisted+1`, and **lost persisted state**
+    (fresh image, wiped `/var/lib`, first boot) is dominated by the wall
+    clock. Resolution is NANOSECONDS deliberately: a coarser seed hands two
+    incarnations starting in the same interval identical values.
+  - **PERSIST-BEFORE-EMIT, and why this mechanism costs no HA availability.**
+    The epoch is advertised only once it is durably on disk. A node that
+    cannot write simply advertises **no** epoch and its peer falls back to
+    the session ring — degraded to the pre-#6169 posture, never wedged.
+    There is consequently **no state in which a healthy node's heartbeats
+    become unacceptable to a healthy peer**, so the epoch needs no
+    election/ownership coupling, no eligibility advertisement and no
+    operator override. Resolution also runs **asynchronously**, once per
+    `Manager`, off the send path: it fsyncs, and an fsync against a wedged
+    disk would otherwise block the 100 ms send loop and cause the very
+    failover this protects against.
+  - **Sender nonce is INCARNATION-scoped** (`Manager.heartbeatNonce`). It
+    used to be per-`heartbeatSender`, so every `StartHeartbeat` minted a
+    fresh session — and routine events mint them (VRF rebind, comms
+    restart). One long-lived daemon could therefore emit more than a ringful
+    of sessions under ONE epoch, which the floor cannot separate, leaving
+    the ring churnable within an incarnation. One incarnation now emits one
+    session with a counter monotonic across heartbeat restarts, so the floor
+    leaves an attacker at most one session and the ring rejects it on the
+    watermark. Nothing regresses on the receiver: a heartbeat restart keeps
+    the session and advances the counter (admitted); a daemon restart builds
+    a new `Manager` and draws a fresh session (admitted as never-seen).
+  - **No sticky "peer speaks epochs" downgrade gate — deliberate.** Such a
+    gate would close the residual that captures from a PRE-upgrade
+    incarnation still churn the ring, but two things legitimately stop a
+    healthy peer emitting epochs: a rollback to a pre-#6169 build (A/B image
+    rollback, #1930 — and mixed-version clusters are supported during any
+    rolling upgrade) and a storage fault. The gate would make this node
+    reject a LIVE peer, which the peer cannot observe or correct — it still
+    hears us so it never demotes, while we conclude it is dead and promote:
+    dual-primary. That is strictly worse than the replay it closes.
+  - **Honest residuals.** (1) Captures taken from a pre-upgrade
+    (epoch-less) incarnation still take the legacy ring path and remain
+    churnable at ≥65 recordings; closed operationally by rotating the
+    control-link PSK once both nodes run an epoch-capable build, which makes
+    every archived capture unverifiable. (2) The receiver floor is in
+    memory, so after a full daemon restart it is 0 and re-primes from the
+    first authenticated frame it accepts; if that frame is a replay AND the
+    genuine peer never speaks again, the replay is sustained. A live peer
+    repairs the floor on its next heartbeat because its epoch is strictly
+    higher. Closing (2) needs a durable RECEIVER floor, which introduces its
+    own cross-reboot self-lock and is deliberately out of scope here.
+    (3) Losing the persisted epoch AND stepping the clock back below the
+    last emitted value in the same reboot regresses the sender's epoch and
+    the peer rejects it; recovery is restarting the peer's daemon (the floor
+    is in memory). Both terms of the seed must fail together for this.
+  - **No clone/bake requirement** (unlike the SNMPv3 engine-id, `pkg/snmp`).
+    Epochs are compared per-PEER, never between the two nodes, so two chassis
+    cloned from one image may hold identical persisted values harmlessly; and
+    a baked-in value can only ever raise a node's starting epoch, which the
+    never-regress rule already permits.
 - **The tracker's LIFETIME is the process, not the heartbeat (#5086).**
   The watermarks and the sticky `peerAuthSeen` flag live in
   `Manager.hbAuth` (`heartbeatAuthState`); a `heartbeatReceiver` holds a
@@ -291,12 +412,14 @@ peer liveness (`lastSeen`) or drive election.
   restart window (a VRF-rebind restart retries the bind for up to ~5 s)
   and an unsigned fabric RPC was accepted from a peer already known to
   hold the key. It now reads the process-lifetime state.
-  **Residual, unchanged by #5086:** the state is in memory, so a full
-  daemon restart or reboot still starts with an empty tracker and a
-  captured run replays once against the restarted node. Closing that
-  needs the same signed boot-epoch as the ≥65-recording churn — both are
-  #6169. #5086 removes the vectors an attacker can reach without the
-  survivor restarting its whole daemon.
+  **Residual, unchanged by #5086 and only partly closed by #6169:** the
+  state is in memory, so a full daemon restart or reboot still starts with
+  an empty tracker AND a zero epoch floor, and a captured run replays
+  against the restarted node. #6169's sender-side epoch means a LIVE peer
+  repairs the floor with its next heartbeat (its epoch is strictly higher
+  than any capture), so the window is bounded by the peer speaking; it is
+  only sustained if the genuine peer never speaks again. Fully closing it
+  needs a DURABLE receiver floor — see the boot-epoch residuals above.
 - **Dual-accept (rolling upgrade), `heartbeatAuthDecision`.** Mirrors
   the #4126 VRRP-checksum dual-accept migration:
   - No local key → accept everything (this node cannot verify; may be
@@ -705,6 +828,17 @@ Procedure:
    possible — that gap is the dual-master window.
 3. Restart `xpfd` on both nodes (per #6628 above, and to clear the sticky
    `peerAuthSeen`).
+
+Rotation is also the **anti-replay capture-invalidation** step. Every archived
+capture an on-link sniffer holds was signed under the old key, so after a
+rotation none of it verifies. That is what closes the #6169 residual for
+frames captured from a PRE-upgrade (epoch-less) incarnation, which otherwise
+still take the legacy session-ring path and stay churnable at ≥65 recordings.
+Rotate once both nodes are known to be running an epoch-capable build.
+Note also that the boot-epoch marker is key-derived
+(`HMAC(PSK, "xpf-ha-boot-epoch-v1")[:8]`), so it changes with the key
+automatically — no separate rollout step, and the restart in step 3 re-primes
+each node's in-memory epoch floor.
 
 Do **not** try to "return to dual-accept" by clearing the key first: an
 unkeyed `chassis cluster` is exactly what the commit gate rejects, so that
@@ -1174,8 +1308,7 @@ outside the monitor loop:
   active/active direction stays a documented fail-OPEN residual on #6284 (item 1,
   needs a bidirectional config-gen namespace #5274 scoped out).
 - **RT_FLOW session id (#5212)**: distinct from BOTH the synthesized BPF-ABI
-  `SessionID` (node-local, minted per converted session by
-  `nextUserspaceSyncedSessionID` since #6198) AND the per-key install generation,
+  `SessionID` (`now<<16|slot`, node-local) AND the per-key install generation,
   every session install carries the ORIGINATING node's stable RT_FLOW session id
   (`SessionValue{,V6}.RTFlowSessionID`, the dataplane's
   `SessionTable::alloc_session_id` value) as a length-gated trailing `uint64` on

@@ -66,7 +66,18 @@ func (e *replay5086Env) feed(frame []byte) bool {
 	}
 	session, counter, present := heartbeatAuthTrailer(frame)
 	macOK := present && len(e.key) > 0 && verifyHeartbeatMAC(frame, e.key)
-	nonceFresh := macOK && e.r.auth.admit(session, counter)
+	// #6169: readLoop reads the boot epoch only from a MAC-verified frame and
+	// applies the epoch floor and the session ring as one decision. These
+	// captures carry no epoch section, so this mirrors readLoop exactly and the
+	// decision falls through to the ring.
+	var (
+		epoch    uint64
+		hasEpoch bool
+	)
+	if macOK {
+		epoch, hasEpoch = heartbeatFrameEpoch(frame, e.key)
+	}
+	nonceFresh := macOK && e.r.auth.admitAuthed(hasEpoch, epoch, session, counter)
 	accept, _ := heartbeatAuthDecision(len(e.key) > 0, present, macOK, nonceFresh, e.r.auth.peerAuthenticated())
 	if !accept {
 		return false
@@ -264,7 +275,7 @@ func TestHeartbeatAuthStateOutlivesReceiver_5086(t *testing.T) {
 		t.Fatal("receiver auth state must never be nil")
 	}
 	// Record a peer session on the first receiver.
-	if !first.auth.admit(0x1234, 7) {
+	if !first.auth.admitAuthed(false, 0, 0x1234, 7) {
 		t.Fatal("first sighting of a session must be admitted")
 	}
 	first.auth.notePeerAuthenticated()
@@ -279,7 +290,7 @@ func TestHeartbeatAuthStateOutlivesReceiver_5086(t *testing.T) {
 	}
 
 	// The retired-session watermark survived every restart.
-	if last.auth.admit(0x1234, 7) {
+	if last.auth.admitAuthed(false, 0, 0x1234, 7) {
 		t.Error("#5086: a replayed (session, counter) must stay rejected across heartbeat restarts")
 	}
 	if !last.auth.peerAuthenticated() {

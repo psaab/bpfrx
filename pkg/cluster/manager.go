@@ -217,6 +217,15 @@ type Manager struct {
 	hbSession   uint64
 	hbCounter   atomic.Uint64
 
+	// bootEpochOnce/bootEpoch hold this daemon incarnation's #6169 boot epoch:
+	// a durably persisted, strictly-increasing-across-restart counter carried in
+	// the signed heartbeat so the peer can order incarnations. 0 means "not
+	// resolved / not durably persisted", in which case heartbeats carry no epoch
+	// and anti-replay degrades to the bounded session ring. Resolved
+	// asynchronously off the send path — see Manager.heartbeatBootEpoch.
+	bootEpochOnce sync.Once
+	bootEpoch     atomic.Uint64
+
 	// hbStartMu serializes StartHeartbeat's stop-previous + socket-create +
 	// install sequence so two concurrent StartHeartbeat calls (e.g. a
 	// comms-restart bind-retry goroutine racing RestartHeartbeat) cannot

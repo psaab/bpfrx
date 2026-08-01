@@ -303,7 +303,7 @@ func TestHeartbeatAuthReplay_BoundedRing(t *testing.T) {
 // ACCEPTS. It reconstructs the exact readLoop gate —
 //
 //	macOK      := present && len(key) > 0 && verifyHeartbeatMAC(frame, key)
-//	nonceFresh := macOK && r.auth.admit(session, counter)
+//	nonceFresh := macOK && r.auth.admitAuthed(hasEpoch, epoch, session, counter)
 //	accept, _  := heartbeatAuthDecision(len(key) > 0, present, macOK, nonceFresh, peerAuthSeen)
 //
 // over real signed frames, and asserts that a #5477 A->B->A replay yields
@@ -325,7 +325,13 @@ func TestHeartbeatReplayGatesLivenessRefresh(t *testing.T) {
 	gate := func(frame []byte) bool {
 		session, counter, present := heartbeatAuthTrailer(frame)
 		macOK := present && len(key) > 0 && verifyHeartbeatMAC(frame, key)
-		nonceFresh := macOK && r.auth.admit(session, counter)
+		// These frames carry no #6169 epoch section, so this mirrors readLoop
+		// exactly and the decision falls through to the session ring.
+		epoch, hasEpoch := uint64(0), false
+		if macOK {
+			epoch, hasEpoch = heartbeatFrameEpoch(frame, key)
+		}
+		nonceFresh := macOK && r.auth.admitAuthed(hasEpoch, epoch, session, counter)
 		accept, _ := heartbeatAuthDecision(len(key) > 0, present, macOK, nonceFresh, r.auth.peerAuthenticated())
 		if macOK {
 			r.auth.notePeerAuthenticated()
