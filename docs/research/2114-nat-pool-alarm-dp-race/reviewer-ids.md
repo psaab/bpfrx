@@ -167,6 +167,9 @@ reviewer (joins at /engineer on the code PR).
 | r54 | Codex | codex companion task-msa5w52v-18utff (session 019fbca0-b184-7312-b020-edc3daaad19b) | NEEDS-REVISION (6 MAJOR, 2 MINOR; folds 1 FOLDED / 3 PARTIAL / 1 NOT-FOLDED). Structure confirmed |
 | r54 | AGY | agy print-mode direct (agy-plan-r54.md) | PLAN-READY (5/5 folds FOLDED; 3 attacks FAILED; no findings). Structure confirmed |
 | r54 | Claude SMR | in-conversation (claude-smr-plan-r54.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — claim-ordering pin, IS part of Codex M1/M2). Structure confirmed |
+| r55 | Codex | codex companion task-msa7u7aj-bk42ee (session 019fbcd2-92a0-7180-9098-570a84ffff8e; first dispatch task-msa6msxd-iwk7wv infra-failed, redispatched) | NEEDS-REVISION (9 MAJOR, 2 MINOR; folds 4 PARTIAL / 1 NOT-FOLDED). Structure confirmed |
+| r55 | AGY | agy print-mode direct, one timeout retry at 12m (agy-plan-r55.md) | PLAN-READY (5/5 folds FOLDED; 3 attacks FAILED; no findings). Structure confirmed |
+| r55 | Claude SMR | in-conversation (claude-smr-plan-r55.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — per-attempt pending-set reset, IS Codex M6). Structure confirmed |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 

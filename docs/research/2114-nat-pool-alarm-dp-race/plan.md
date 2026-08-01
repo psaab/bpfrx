@@ -1,9 +1,9 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v55 — r54 findings folded (Codex NEEDS-REVISION
-  6M/2m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m —
-  the claim-ordering pin, IS part of Codex M1/M2; all three
-  confirm the §4.7 structure); pending convergence review r55
+- **Status**: DRAFT v56 — r55 findings folded (Codex NEEDS-REVISION
+  9M/2m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m —
+  the per-attempt pending-set reset, IS Codex M6; all three
+  confirm the §4.7 structure); pending convergence review r56
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -2428,6 +2428,80 @@
   the token + pending-set beside lastOK/count (Codex fold-3),
   and the stale "OBSERVED complete" prerequisite is struck
   (Codex m2).
+  v56: r55 convergence — the send-boundary protocol completes
+  (provider coherence, authority generation, success semantics,
+  single-owner lock discipline), the mint is fully enumerated
+  and admission-ordered, OnXSKBound self-registers, the
+  supersession re-registers live debts, and the seventh arm
+  becomes terminal (Codex NEEDS-REVISION 9M/2m, folds 4
+  PARTIAL / 1 NOT-FOLDED, structure confirmed; AGY PLAN-READY
+  5/5 with 3 fresh attacks FAILED, structure confirmed; SMR
+  PLAN-READY-WITH-NITS 0M/1m — the per-attempt pending-set
+  reset, IS Codex M6): (a) PROVIDER COHERENCE + SUCCESS
+  SEMANTICS (Codex M1, verified: the captured `ss` can be
+  replaced by a transport-changing apply,
+  `daemon_apply_tail.go:238-255`,
+  `daemon_ha_sync.go:658-667,1405-1415`; `QueueConfig` returns
+  no result and may no-op or fail, `sync_conn_config.go:234-250`;
+  a fabric-0-fails/fabric-1-survives case fires no daemon
+  callback, `sync_conn.go:480-498,569-570`, so the epoch does
+  not advance and a pre-send claim would suppress the retry):
+  the boundary revalidation gains PROVIDER IDENTITY,
+  `QueueConfig` gains a success return, and the marker
+  publishes only on send-SUCCESS while still locked. (b) THE
+  AUTHORITY GENERATION (Codex M2, verified: RG0 transitions do
+  not take `configSyncMu`, `daemon_ha.go:438-450`; a sender
+  can validate as primary, demote mid-write, and have the
+  frame rejected, `daemon_ha_sync.go:544-548`): the marker's
+  claim state gains an authority generation invalidated on any
+  demotion/re-promotion. (c) THE LOCK-DISCIPLINE (Codex M3,
+  verified the literal self-deadlock: `pushConfigToPeer` →
+  `markConfigSyncPushed` independently locks `configSyncMu`,
+  `daemon_ha_sync.go:355-377,407-414`): ONE locked-send owner;
+  the marker helper is lock-ASSUMING. (d) THE CONTENTION BOUND
+  (Codex m1, corrected: `syncWriteDeadline` is 2s,
+  `sync.go:88`, starting INSIDE `writeFull` after the
+  `writeMu` wait, `sync_protocol.go:59-74`): the mutex can be
+  held across a writeMu wait plus a 2s write; a §9 contention
+  regression pins it. (e) THE COMPLETE ENTRY ENUMERATION +
+  ADMISSION-ORDERED MINT (Codex M4, verified: v55 named only
+  commitAndApply and undefined "background wrappers";
+  `commitConfirmedAndApply`, `syncAndApply`, the rollback
+  path, `applyConfig`, and `applyConfigResult` were omitted;
+  and a function-entry mint could supersede the running apply
+  while waiting on applySem): every entry is named, the mint
+  occurs AFTER applySem admission and BEFORE
+  preflight/promotion, and the outcome classifies at the
+  TERMINAL outer return (a compile error may still be retried
+  by `commitWithGenBinding`, `daemon_apply_commit.go:102-125`).
+  (f) MANAGER-OWNED SELF-REGISTRATION (Codex M5, verified the
+  daemon-side check/set race: the status loop can set
+  `xskBoundNotified` and launch the old callback between the
+  daemon's check and its `SetOnXSKBound` call,
+  `daemon_apply_interfaces.go:61,98-100`, `manager.go:424-433`,
+  `maps_sync.go:451-456`): the manager registers the arm
+  atomically with the launch decision under its own `m.mu`.
+  (g) THE NEXT-MINT SUPERSESSION (Codex M6 = SMR m1, verified:
+  manager work remains live outside applySem,
+  `process_status.go:150-198`, including the unbounded
+  deferred-worker retry): a new mint ATOMICALLY supersedes the
+  old token's registration set AND re-registers every
+  still-relevant manager debt under the new token (the daemon
+  queries the manager's outstanding debt state at the mint
+  boundary). (h) THE SEVENTH ARM MADE TERMINAL (Codex M7,
+  verified: `syncInterfaceAttachments`' DetachXDP/DetachTC
+  failures are merely logged, `manager_compile.go:211-214,
+  567-591`, while ApplyConfig returns nil,
+  `manager.go:348-357` — a config removing a data interface
+  could be stamped converged with the old attachment live):
+  the detach failure becomes a RETURNED TERMINAL pipeline
+  failure. (i) The done predicate carries the no-pending term
+  in the runbook, acceptance, and status inventory (Codex M8);
+  the "every non-converged return increments" leftover is
+  aligned to terminal-only (Codex M9); and §9 gains the
+  send-boundary legs (Codex m2): mismatch-drop-without-claim,
+  commit/reconciler serialization, provider replacement,
+  dual-fabric send failure, and authority turnover.
 
 ---
 
@@ -4928,13 +5002,41 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   and a commit push serialize and a stale capture can never
   land after a newer one — the reconciler at the send boundary
   (i) revalidates authority + connection epoch/liveness +
-  ConfigSync-enabled (all re-read at the boundary), (ii)
+  ConfigSync-enabled AND PROVIDER IDENTITY (r55 Codex M1/M2,
+  verified: the captured `ss` can be replaced by a
+  transport-changing apply, `daemon_apply_tail.go:238-255`,
+  `daemon_ha_sync.go:658-667,1405-1415` — an equal
+  epoch/liveness does not prove the pointer is current; and
+  RG0 transitions do not take `configSyncMu`,
+  `daemon_ha.go:438-450`, so a sender can validate as primary,
+  demote mid-write, and have the frame rejected,
+  `daemon_ha_sync.go:544-548` — the marker's claim state gains
+  an AUTHORITY GENERATION, invalidated on any
+  demotion/re-promotion), (ii)
   recomputes `configGenerationHash(ShowActive())` — the SAME
   function on the current text, matching the capture's type —
   and drops with an alarm on a mismatch, and (iii) claims the
-  marker ONLY NOW (validate-then-claim-then-send: a drop never
-  claims, so the marker can never suppress a needed later
-  push); the ConfigsSent tick and the marker no-op
+  marker ONLY NOW and ONLY ON SEND-SUCCESS (r55 Codex M1:
+  `QueueConfig` returns no result and may no-op or fail,
+  `sync_conn_config.go:234-250` — and a fabric-0-fails/
+  fabric-1-survives case fires no daemon callback,
+  `sync_conn.go:480-498,569-570`, so the epoch does not
+  advance and a pre-send claim would suppress the retry):
+  `QueueConfig` gains a success return, the marker publishes
+  only on success while still locked, and the send path's
+  ownership is EXPLICIT (r55 Codex M3, verified the literal
+  self-deadlock: `pushConfigToPeer` calls
+  `markConfigSyncPushed`, which independently locks
+  `configSyncMu`, `daemon_ha_sync.go:355-377,407-414`): ONE
+  locked-send owner, and the marker helper is lock-ASSUMING
+  (it never re-locks) —
+  with the contention bound pinned (r55 Codex m1, corrected:
+  `syncWriteDeadline` is 2s, `sync.go:88`, and it starts
+  INSIDE `writeFull` after the `writeMu` wait,
+  `sync_protocol.go:59-74` — so the mutex can be held across
+  a writeMu wait PLUS a 2s write; a waiting commit retains
+  applySem through it — bounded, with a §9 contention
+  regression); the ConfigsSent tick and the marker no-op
   remain WITHDRAWN as witnesses (r52 Codex M4: a no-op pass
   never ticks, and the marker is private, `daemon.go:420-424`);
   and the observation ORDER is non-circular: the post-election
@@ -5077,7 +5179,9 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   restarted process's boot apply and instrumented CENTRALLY at
   every full-apply entry (the §5.1 pkg/daemon inventory carries
   it), rendered beside ActiveApplied on the status surface; the
-  predicate is failure-count == 0 AND last-outcome-success
+  predicate is failure-count == 0 AND no pending arm
+  outstanding (the per-arm-ID registration set for the current
+  token) AND last-outcome-success
   (process-lifetime, so no baseline capture is needed), and §9
   gains the sticky same-text regression (a failed same-text
   state-dependent reapply keeps ActiveApplied true while the
@@ -6074,7 +6178,16 @@ v20 history). The delivery is TWO units:
   is merely logged, `daemon_apply_interfaces.go:98-109`, and
   `PrepareLinkCycle` suppresses/logs its command failures
   through a void interface, `daemon_apply_dataplane.go:289-296`,
-  `process_linkcycle.go:145-162`) — deferred-MAC, pending-XSK
+  `process_linkcycle.go:145-162`) — PLUS the seventh, made
+  TERMINAL rather than tokened (r55 Codex M7, verified:
+  `syncInterfaceAttachments` is a void call,
+  `manager_compile.go:211-214`, whose DetachXDP/DetachTC
+  failures are merely logged, `:567-591`, while ApplyConfig
+  returns nil, `manager.go:348-357` — a config REMOVING a data
+  interface could be stamped converged while the old XDP/TC
+  attachment remains live: a stale-enforcement failure, so it
+  becomes a RETURNED TERMINAL pipeline failure, not an
+  asynchronous arm) — deferred-MAC, pending-XSK
   publication, XSK-liveness probe, link-cycle rebind
   (NotifyLinkCycle), the OnXSKBound goroutine, and
   PrepareLinkCycle — carries the apply's ATTEMPT TOKEN with
@@ -6086,7 +6199,17 @@ v20 history). The delivery is TWO units:
   ApplyConfig can process status and launch a callback before
   returning, `manager_compile.go:357-402`,
   `maps_sync.go:451-457`): each arm is a (token, arm-ID)
-  registration recorded BEFORE the arm launches, the pending
+  registration recorded BEFORE the arm launches — with the
+  manager-internal launches SELF-REGISTERED by the manager
+  under its own `m.mu` (r55 Codex M5, verified the
+  daemon-side check/set race: the status loop can set
+  `xskBoundNotified` and launch the old callback between the
+  daemon's `XSKBoundNotified` check and its `SetOnXSKBound`
+  call, `daemon_apply_interfaces.go:61,98-100`,
+  `manager.go:424-433`, `maps_sync.go:451-456` — so the
+  daemon-side registration can strand or lose): the manager
+  registers the arm atomically with the launch decision,
+  the pending
   state is a per-arm-ID set (not a scalar), and a completion
   retires its own registration exactly once — a duplicate or
   unregistered completion is ignored — with
@@ -6098,8 +6221,19 @@ v20 history). The delivery is TWO units:
   `commitWithGenBinding` still invokes commitFn after an
   initial compile error): the token is a uint64 monotonic
   per-apply generation (no overflow), MINTED at the OUTER
-  apply-attempt entry (`commitAndApply` and the background
-  wrappers — before preflight), OWNED by the daemon and
+  apply-attempt entry — EVERY entry enumerated (r55 Codex M4):
+  `commitAndApply`, `commitConfirmedAndApply`
+  (`daemon_apply_commit.go:527-575`), `syncAndApply`
+  (:331-402,489), the rollback path (:697), `applyConfig`, and
+  `applyConfigResult` (`daemon_apply.go:50-86`) — and the mint
+  is ordered AFTER applySem ADMISSION and BEFORE
+  preflight/promotion (a function-entry mint could supersede
+  the currently-running apply while still WAITING on the
+  semaphore — admission at `daemon_apply_commit.go:172-175,
+  528-531,332-335`, `daemon_apply.go:50-51,84-85`), with the
+  outcome classified at the TERMINAL outer return (a compile
+  error may still be retried by `commitWithGenBinding`,
+  `daemon_apply_commit.go:102-125`), OWNED by the daemon and
   PUBLISHED with the configstore's versioned snapshot, THREADED
   through the manager calls that defer (the tokenless
   interfaces at `apply.go:37-40,130-134` gain it), with the
@@ -6117,7 +6251,17 @@ v20 history). The delivery is TWO units:
   completion matches no registration), and a
   process-lifetime namespace (the predicate is consulted
   post-restart, where the freshly-minted token series rejects
-  every pre-restart completion); the signal reads CONVERGED
+  every pre-restart completion); and the NEXT-MINT supersession
+  is explicit (r55 Codex M6 = r55 SMR m1, verified: manager
+  work remains live outside applySem,
+  `process_status.go:150-198`, including the unbounded
+  deferred-worker retry, so a new attempt must not strand the
+  old token's live debts NOR let them block the new
+  predicate): a new mint ATOMICALLY supersedes the old token's
+  registration set AND re-registers every still-relevant
+  manager debt under the new token (the daemon queries the
+  manager's outstanding debt state at the mint boundary), so
+  the predicate evaluates exactly the current attempt's arms; the signal reads CONVERGED
   only when the pipeline AND every arm's completion carry the
   CURRENT attempt token; and the state machine distinguishes
   CONVERGED / PENDING / FAILED — a PENDING arm does NOT
@@ -6139,7 +6283,8 @@ v20 history). The delivery is TWO units:
   with ActiveApplied still true and the count still zero,
   `daemon_dhcp.go:73-90`, `daemon_feeds.go:26-42`,
   `store.go:797-809`), and `applyFailureCount` increments on
-  every non-converged return — covering the DHCP/boot/feeds/sync
+  every TERMINAL failure — never on a PENDING arm (r55 Codex
+  M9's consistency fix) — covering the DHCP/boot/feeds/sync
   wrappers that the compile-health (`daemon.go:871-880`,
   `daemon_health.go:79-125`) and the SessionSync-only
   `ConfigsApplyFailed` (`sync.go:110-119`) surfaces miss.
@@ -7583,7 +7728,9 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      `daemon_nft.go:262-272`) keeps ActiveApplied true while
      the new address lacks enforcement — so the predicate ALSO
      requires NO dataplane apply failure since the post-restart
-     bringup on either node — i.e. failure-count == 0 AND
+     bringup on either node — i.e. failure-count == 0 AND no
+     pending arm outstanding (the per-arm-ID registration set
+     for the current token) AND
      last-outcome-success read from ONE coherent snapshot (r50
      Codex m1 + M1 — the mid-render entry race is closed by the
      single-snapshot publication, and the truth assignment is
@@ -7717,6 +7864,20 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      and the re-drive overwrites it) and the MARKER-NO-OP
      REJECTION leg (a no-op pass never ticks ConfigsSent, so no
      runbook step may wait on a tick);
+     (h2i) the SEND-BOUNDARY legs (r55 Codex m2): the
+     MISMATCH-DROP-WITHOUT-CLAIM leg (a stale capture drops at
+     the boundary and the marker stays unclaimed, so a later
+     pass for the same generation still pushes), the
+     COMMIT/RECONCILER SERIALIZATION leg (a commit push and a
+     reconciler send serialize under `configSyncMu` held
+     through the send), the PROVIDER-REPLACEMENT leg (a
+     transport-changing apply mid-claim is caught by the
+     provider-identity revalidation), the DUAL-FABRIC
+     SEND-FAILURE leg (a fabric-0 failure with fabric-1
+     surviving leaves the marker unpublished and the retry
+     unsuppressed), and the AUTHORITY-TURNOVER leg (a demotion
+     mid-claim invalidates the authority generation and the
+     claim);
      (h2f) the COMPOSITE-READER leg (r52 Codex M1): the #4957
      shortcut's (text, applied) pair is read from ONE versioned
      snapshot — an A→B promotion/apply between the two reads
