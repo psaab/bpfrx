@@ -1,23 +1,23 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v76 — r74 folds: Codex M1's DetachXDP
-  correction (the v75 class-2 gate would skip the retained-claim
-  cleanup that master runs on the retained re-arm state — no
-  `loaded` gate on this path; `setXDPAttachedFlag` becomes a
-  class-3-like internal with scoped `m.mu` lookups and always-run
-  cleanup; the §9 Detach leg specified with the fake link and the
-  `xdpFlagClaims` assertion), Codex M2's direct `:632` pinning
-  (a blocked Start could silent-green the swap lock — the test
-  drives a direct `swapXDPEntryProg` with a seeded distinct
-  program), Codex m1's label hygiene (trio single-homed in G;
-  DetachXDP's single manifest label), Codex m2's fixture migration
-  (TestXSKLivenessFailureRestoresUserspaceShimEntry → armed
-  synthetic fixture), Codex m3's premise correction (the status
-  loop can start before Compile-failure propagation — conclusion
-  unchanged, r74 re-confirmed); AGY r74 ACCEPTED the
-  VlanSubInterfaces adjudication as 'fully valid and sufficient';
-  r74 verdicts: Codex PLAN-NEEDS-MAJOR (2M/3m), AGY PLAN-READY,
-  Claude SMR PLAN-READY; pending convergence review r75
+- **Status**: DRAFT v77 — r75 folds: Codex M1's two-state gate
+  predicate (the fresh-vs-retained conflation fix — `Close`
+  retains `m.maps`/`m.programs` for hitless restart, so the gate
+  fires ONLY on the fresh-unarmed state; retained-unarmed proceeds
+  exactly as master — retained reads report, retained mutations
+  reach the live pinned maps, incl. the never-throttled watchdog
+  timestamp; the matrix gains retained-state coverage), Codex M2's
+  lock-OWNERSHIP assertion (a mutant dropping only the `:632`
+  lock passed the race schedule — the section holds a test hook
+  while the getter must block), Codex m1-m3 (the stale §5.1
+  delegation label; the named Detach leg + the error-order
+  qualification; the fixture migration mechanism + the ~30-test
+  inventory); SMR r75's m1 WITHDRAWN per Codex r75's verified
+  ruling (Start never touches `xdpFlagClaims` — its exposure is
+  the post-arm class, not A3's scope); r75 verdicts: Codex
+  PLAN-NEEDS-MAJOR (2M/3m), AGY PLAN-READY, Claude SMR
+  PLAN-READY-WITH-NITS (0M/1m, withdrawn); pending convergence
+  review r76
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -3176,7 +3176,11 @@
   test pinning; label hygiene (trio single-homed in G;
   DetachXDP's single label); the fixture migration; the
   status-loop premise correction; AGY accepted the VLAN
-  adjudication).
+  adjudication). v77 (r75: the two-state gate predicate —
+  the fresh-vs-retained conflation fix; the lock-ownership
+  test assertion; the named Detach leg + error-order
+  qualification; the fixture migration mechanism +
+  inventory; the SMR m1 withdrawal).
 
 ---
 
@@ -3592,6 +3596,30 @@ class. The fold:
     release-Store of `loaded=true` gives the happens-before edge: a
     method observing `true` sees a fully-populated `m.maps`; a method
     during population observes `false` and never touches the map.
+    **THE GATE PREDICATE IS TWO-STATE (r75 Codex M1 — the fresh-vs-
+    retained conflation fix):** `Close` sets `loaded=false` but
+    clears NEITHER `m.maps` NOR `m.programs` (`loader.go:1206-1218` —
+    the hitless-restart posture: pinned maps keep forwarding and the
+    retained Manager keeps them live), and bootstrap retains the
+    Manager for re-arm (`bootstrap.go:470`). The gate fires ONLY on
+    the FRESH-unarmed state (`loaded==false` AND `m.maps` empty,
+    checked under `m.mu`) — exactly where master returns the
+    map-not-found errors the typed error replaces. On the
+    RETAINED-unarmed state (`loaded==false`, maps present) every
+    class proceeds EXACTLY as master: retained reads report the
+    retained state (`SessionCount` counts it, `maps_session.go:326`;
+    `GetMapStats` reports it, `maps_stats.go:69`), retained
+    mutations reach the live retained maps (the never-throttled
+    watchdog timestamp write, `manager_ha.go:807-815` — suppressing
+    it would trip the BPF ~2s stale window while the pinned
+    dataplane still forwards), and class-4 getters return the
+    retained handles. Suppressing stale handles might be a
+    defensible policy — it is NOT preservation, and A3 does not
+    adopt it. The /engineer pass runs the two-state audit per class
+    (fresh-neutral vs retained-proceed, with caller retry/side-
+    effect analysis) and the §9 matrix gains retained-state
+    coverage: seed maps+programs with `loaded=false`, assert
+    master's retained behavior per class.
   - **Class 2 — neutral-outcome methods, ANY signature, WITH the
     synchronization rule (r71 Codex M1 — v72 specified the outcomes
     but not the synchronization, leaving 22 best-fit class-2 lookups
@@ -3958,7 +3986,10 @@ convergence on the seed before any implementation of G/H/H2.
   corrected to `userspace.Manager`); the `xdpEntryProg` locked-
   helper scheme (trio + the `swapXDPEntryProg` :632 write under a
   scoped section, never whole-method); `DetachXDP`'s mixed shape
-  (category-G absent-link nil + the class-2 delegation target);
+  (category-G absent-link nil + the class-3-LIKE delegation target —
+  scoped `m.mu` lookups, cleanup always runs, no `loaded` gate;
+  v76 corrected the v75 text's stale class-2 reference here, r75
+  Codex m1);
   `SwapToUserspaceXDPShimEntryProgram` (:604) is class 1 (its
   pre-arm "XDP program not found" becomes the typed error — the
   intended class-1 change; AGY r73's omitted-method catch).
@@ -4230,17 +4261,22 @@ Preserved exactly:
   PR-1; the H2 health-message additions that previously grew this bullet
   are FOLLOW-UP — moved to `followup-seed.md` §6-mirror at v70, r68
   Codex m4), REST simulator fail-closed `ok=false` (#3414).
-- Pre-arm backend calls (work item A3, the v73 partition — §4 A1):
+- Pre-arm backend calls (work item A3, the v73 partition + the v77
+  two-state predicate — §4 A1): the gate fires ONLY on the
+  FRESH-unarmed state (`loaded==false` AND maps empty) — there,
   class-1 methods return the typed `ErrDataplaneNotArmed` instead of
   master's "map not found" error or the fatal concurrent-map throw
-  (the ONLY intentional behavior change; the class-3 raw-helper
-  composition rule keeps even the legacy error TEXTS stable,
-  r71 Codex M3); class-2 keep master's missing-map outcome
-  byte-for-byte via the acquire-load gate; class-3 keep their
-  test-pinned side-effect-plus-PINNED-OUTCOME behavior (success OR
-  the legacy later error — r73 Codex m2's §6 wording fix); class-4
-  return nil (+ the typed error where the signature carries one).
-  Post-arm behavior bit-identical; no signature changes.
+  (the ONLY intentional behavior change, now precisely scoped; the
+  class-3 raw-helper composition rule keeps even the legacy error
+  TEXTS stable, r71 Codex M3); class-2 keep master's missing-map
+  outcome byte-for-byte; class-3 keep their test-pinned
+  side-effect-plus-PINNED-OUTCOME behavior; class-4 return nil (+
+  the typed error where the signature carries one). On the
+  RETAINED-unarmed state every class proceeds EXACTLY as master
+  (r75 Codex M1 — retained reads report retained state, retained
+  mutations reach the live pinned maps; suppression would be a
+  policy change, not preservation). Post-arm behavior
+  bit-identical; no signature changes.
 
 ## 7. Hidden invariants the change must preserve
 
@@ -4446,8 +4482,15 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    drives a DIRECT `swapXDPEntryProg` call with a seeded DISTINCT
    test-only program (seed `m.programs["test_prog"]` and
    `xdpEntryProg="other"` so both early exits fail and `:632`
-   executes), raced against the getter across the seam; no fatal
-   fault; (ii)
+   executes), raced against the getter across the seam — AND the
+   test asserts lock OWNERSHIP, not just branch execution (r75
+   Codex M2: a mutant dropping only the `:632` lock still passes
+   the race schedule, because the getter's unlock synchronizes-
+   before the swap's earlier `:609`/`:613` sections — the read
+   happens-before the mutant write): the `:632` critical section
+   contains a test hook that HOLDS the section while a getter
+   attempts, and the test asserts the getter BLOCKS until release
+   (or fails an in-section `TryLock`); no fatal fault; (ii)
    `TestManager_PreArmMethodMatrix` — every exported `*Manager`
    method is ASSIGNED to exactly one v75 class/category by the
    generated AST inventory — the manifest asserts TOTALITY (one
@@ -4459,7 +4502,24 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    (`xdp_shim_decouple_test.go:32,:321`) constructs an unarmed
    `New()` and expects the selector restoration — the Swap class-1
    gate breaks it; it migrates to an explicitly ARMED synthetic
-   fixture via a `pkg/dataplane` test helper (r74 Codex m2).
+   fixture via the EXISTING userspace-local reflect/unsafe
+   injection mechanism (`manager_testhelpers_test.go:22`'s
+   `injectShimMap` pattern — a helper in `pkg/dataplane/*_test.go`
+   would NOT be importable from package userspace, r75 Codex m3),
+   and the migration sweep is inventoried honestly: ~30 synthetic
+   userspace tests (e.g. `maps_sync_cap_test.go:63` class-4 `Map`
+   calls, `clear_bounded_5304_test.go:35` class-1 setters on an
+   injected unarmed manager) plus root fixtures
+       (`maps_session_clear_test.go:17`, the exact-error tests in
+   `watchdog_test.go:9`). The Detach leg gets its named test
+   (r75 Codex m2): `TestManager_ArmedGate_DetachRetainedClaims`
+   (matching the race target's `-run` pattern) — the fake
+   `link.Link` embed, `xdpLinks`+`xdpFlagClaims` seeded, cleanup
+   asserted race-free — with the error-order qualification:
+   "cleanup always runs" means UNLESS a discovery failure returns
+   first (the `vlan_iface_map` lookup :730 and `iface_zone_map`
+   iteration :747 error paths preserve claims and the link for
+   retry — claims are never deleted before those failures).
    **[CORE]**
 5. Canary tests: redesigned matcher self-tests both directions; new
    `daemon_dp_canary_test.go` asserts no direct `dpCell` access outside the
@@ -4967,18 +5027,19 @@ Still open:
    PLAN-READY when all three verdicts gate the PR-1 design as
    ready.
 
-7. **r68-r74 resolution (for the record)**: Codex r68 M1 (armed-state
-   admission gate) folded as work item A3; r69-r73 falsified each
-   intermediate form, and r74 caught the last two mechanical defects
-   (the v75 DetachXDP gate would have skipped the retained-claim
-   cleanup master runs on the re-arm state; the population/selector
-   barriers could silent-green the :632 swap lock) — v76 carries the
-   class-3-like delegation target with always-run cleanup, the direct
-   swap pinning, the label hygiene, the fixture migration, and the
-   corrected status-loop premise; AGY r74 explicitly ACCEPTED the
-   VlanSubInterfaces adjudication. Each reviewer: verify the v76
-   Detach shape against loader.go:639-660/:699-790 and the XDP
-   seam's direct-:632 pin.
+7. **r68-r75 resolution (for the record)**: Codex r68 M1 (armed-state
+   admission gate) folded as work item A3; r69-r74 falsified each
+   intermediate form, and r75 caught the systemic fresh-vs-retained
+   conflation (Close retains the maps for hitless restart — the gate
+   must fire only on the fresh state) and the lock-ownership proof
+   gap — v77 carries the two-state predicate, the retained-state
+   matrix coverage, the in-section ownership assertion, and the
+   fixture migration mechanism. SMR r75's m1 (xdpFlagClaims locking)
+   was WITHDRAWN per Codex r75's verified ruling (Start never touches
+   the field; its exposure is the post-arm class). Each reviewer:
+   verify the two-state predicate against loader.go:1206-1218 +
+   bootstrap.go:470, the retained-state coverage in §9, and the
+   ownership-assertion seam.
 
 ---
 
