@@ -1,9 +1,9 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v47 — r46 findings folded (Codex NEEDS-REVISION
-  3M/3m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m —
-  its epoch-lifetime nit IS Codex M1, folded here; all three
-  confirm the §4.7 structure); pending convergence review r47
+- **Status**: DRAFT v48 — r47 findings folded (Codex NEEDS-REVISION
+  5M/2m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/2m —
+  its two nits IS Codex M3 + M5; all three confirm the §4.7
+  structure); pending convergence review r48
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -1961,6 +1961,70 @@
   accessor) + pkg/daemon (injection) + pkg/cluster (rendering)
   are touched, pkg/grpcapi/pkg/cli stay CODE-untouched as
   relays (`server_show_cluster_text.go:66-74`).
+  v48: r47 convergence — the epoch publishes with the
+  reservation, the same-text rebuttal is withdrawn, the capture
+  is ordered after the window resolution and the automation
+  quiesce, and the encrypted fallback is pinned to its origin
+  node (Codex NEEDS-REVISION 5M/2m, folds 3 FOLDED / 3 PARTIAL,
+  structure confirmed; AGY PLAN-READY 6/6 with 2 fresh attacks
+  FAILED, structure confirmed; SMR PLAN-READY-WITH-NITS 0M/2m
+  — the capture ordering IS Codex M3, the encrypted-fallback
+  scope IS Codex M5): (a) THE EPOCH PUBLISHES WITH THE
+  RESERVATION (Codex M1, verified the race: an epoch
+  incremented only on a successful reservation can publish
+  AFTER a fast consumer applies and retires, letting (3)
+  observe the stale epoch with a zero counter): the epoch
+  advances WITH the provisional pre-enqueue reservation and
+  NEVER rolls back — nil/full attempts move the epoch without
+  moving the counter (conservative false-positives, covered by
+  the re-baseline rule); acceptance leg (f) asserts the epoch's
+  visibility at the seam too. (b) THE SAME-TEXT REBUTTAL IS
+  WITHDRAWN (Codex M2's counterexample verified: a DHCP lease
+  change reapplies the same T to build address-scoped
+  host-inbound enforcement for the NEW address,
+  `daemon_dhcp.go:231-245`; an nft failure leaves the prior
+  kernel generation covering only its former destinations,
+  `daemon_nft.go:262-272`; the error returns without clearing
+  the old digest, `daemon_apply_tail.go:83-89,316-327`,
+  `daemon_apply.go:56-70` — ActiveApplied compares H(T) only):
+  the done predicate ALSO requires NO dataplane apply failure
+  since the post-restart bringup on EITHER node — the
+  last-apply-outcome + a monotonic apply-failure count tracked
+  in the daemon's health state and rendered beside
+  ActiveApplied. (c) THE CAPTURE IS ORDERED (Codex M3 = SMR m2,
+  the sharper construction verified: capturing T1 while a
+  commit-confirmed window is live, then rolling back to T0 at
+  step (1), leaves the captured pair stale —
+  `store_commit.go:427-461,503-524` — and a stale-pair restore
+  Loads T1 AS committed, `store_persist.go:21-55`): the
+  runbook gains (1a) the AUTOMATION QUIESCE and (1b) the
+  capture AFTER the window resolution + the moratorium; any
+  commit that lands anyway forces a re-capture. (d) THE
+  AUTOMATION MORATORIUM (Codex M4, verified: the event engine
+  autonomously stages and commits, `engine.go:920-948`, via
+  `commitAndApply` WITHOUT peer sync,
+  `daemon_apply_tail.go:446-455` — invisible to the counter and
+  the epoch — and shutdown does not fence it,
+  `daemon_run_shutdown.go:25-59`, `engine.go:354-367,583-595`):
+  if any `event-options` policy is configured, the operator
+  `deactivate event-options` and commits FIRST (before the
+  capture); the post-restart digest comparison is the backstop
+  detection. (e) THE ENCRYPTED FALLBACK IS ORIGIN-NODE-PINNED
+  (Codex M5 = SMR m1, verified: the body is keyed by the
+  source's independently-random master.key,
+  `crypto.go:262-285,457-480`, and a different authority cannot
+  AEAD-open it, `crypto.go:307-356,443-455`): the file-level
+  restore applies to the ORIGIN node when encrypted; only the
+  cleartext-body (no master password) file is portable; the
+  operator's config TEXT is the primary artifact in all cases.
+  (f) Residual (iii)'s window runs from the preflight's FIRST
+  sub-read (Codex m1 — the /health and cluster-status reads
+  are not one coherent snapshot; a promote+fail-persist+retire
+  can slip between them, `store.go:687-746`; the post-restart
+  closure handles the outcome). (g) The on-disk file is an
+  opaque config-DB artifact (Codex m2 — magic-header framing
+  line + possibly-encrypted JSON body, `envelope.go:78-99`,
+  `db.go:445-450` — preserved byte-for-byte).
 
 ---
 
@@ -3975,7 +4039,30 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   remediation runs a PRODUCER-QUIESCE protocol, not a point
   check — (1) the operator ensures NO live commit-confirmed
   window stands (confirm or roll back any armed window first —
-  window resolution is operator-paced), (2) the operator REFRAINS
+  window resolution is operator-paced), (1a) the operator
+  QUIESCES AUTOMATION: if any `event-options` policy is
+  configured, `deactivate event-options` and commit FIRST —
+  the event engine is the ONLY autonomous local commit source
+  (r47 Codex M4, verified: it stages and commits independently,
+  `engine.go:920-948`, via `commitAndApply` WITHOUT peer sync,
+  `daemon_apply_tail.go:446-455` — invisible to the counter and
+  the dispatch epoch — and shutdown does not fence it: the
+  applyCancel + applySem drain precede the engine's Close,
+  `daemon_run_shutdown.go:25-59`, whose lifetime context is
+  cancelled only by Close, `engine.go:354-367,583-595`) — and
+  (1b) ONLY THEN the operator CAPTURES the intended-config
+  digest + text (r47 Codex M3 = r47 SMR m2, the sharper
+  construction verified: capturing T1 while a commit-confirmed
+  window is live and then rolling back to T0 at step (1) leaves
+  the captured pair stale — CommitConfirmed persists active.json
+  with committed=1 BEFORE writing confirm.json,
+  `store_commit.go:427-461,503-524`, `db.go:105-116` — and a
+  stale-pair restore would Load T1 AS committed,
+  `store_persist.go:21-55`, letting the final predicate bless a
+  formerly unconfirmed configuration; the capture therefore
+  FOLLOWS the window resolution, the automation quiesce, and
+  the moratorium's declaration, and any commit that lands
+  anyway forces a re-capture), (2) the operator REFRAINS
   from new commits and FENCES the async producer ENFORCEABLY,
   with the observable join, the peer-side preflight, and the
   ordering PINNED (r38 Codex M1 + r39 Codex M1/M2/M3 + r40 Codex
@@ -4103,8 +4190,15 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   replaces the provider mid-callback,
   `daemon_apply_tail.go:238-255`, permitting an old-(0,0) →
   apply → fresh-(0,0) ABA that ERASES the pulse) — the epoch
-  increments in the same critical section on a SUCCESSFUL
-  reservation, lives in NODE-LIFETIME state beside the counter
+  advances WITH the provisional pre-enqueue reservation and
+  NEVER ROLLS BACK (r47 Codex M1, verified the publication
+  race: an epoch incremented only on a successful reservation
+  can publish AFTER a fast consumer applies and retires,
+  letting (3) observe the stale epoch with a zero counter — so
+  nil/full attempts move the epoch WITHOUT moving the counter:
+  a conservative epoch false-positive the re-baseline rule
+  already covers), lives in NODE-LIFETIME state beside the
+  counter
   (preserved across every SessionSync replacement), and is
   exposed beside the counter on the status surface — against
   the value observed at (2c),
@@ -4197,8 +4291,10 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   the operator RE-CHECKS THE FULL STATE — `ConfirmDebtKindMask
   == 0` AND `persistDegraded == false` AND
   `ConfigSyncOutstanding == 0` AND the NODE-LIFETIME MONOTONIC
-  dispatch epoch (the pinned counter-sibling — incremented on
-  each successful reservation, preserved across SessionSync
+  dispatch epoch (the pinned counter-sibling — advanced WITH
+  the provisional pre-enqueue reservation and NEVER rolled
+  back, r47 Codex M1, so nil/full attempts are conservative
+  epoch false-positives; preserved across SessionSync
   replacements, exposed beside the counter) UNCHANGED since the
   (2c) observation
   (r45 Codex M2 + r46 Codex M1 — the level counter alone misses
@@ -4228,13 +4324,19 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   local→peer push (reconnect/promotion/the reconciler,
   `daemon_ha_sync.go:417-522`; `QueueConfig` writes directly,
   `sync_conn_config.go:230-250`) whose APPLY LANDS between the
-  peer preflight (2a) and the peer stop (2b) — REGARDLESS of
+  peer preflight's FIRST sub-read and the peer stop (2b) —
+  REGARDLESS of
   when the frame was received (r45 Codex M3: a complete frame
   paused pre-dispatch, `sync_conn_read.go:84-93`, or held as
   the handshake's `pendingFrame`, `sync_auth.go:352-369`, can
   be RECEIVED before the preflight yet dispatch after it — the
   residual covers the apply's landing, not the push's
-  initiation) — the peer can promote
+  initiation; and r47 Codex m1: the preflight's reads are SPLIT
+  across /health and the cluster-status RPC with no coherent
+  snapshot, so a frame can promote, fail persistence, and
+  retire BETWEEN the two sub-reads, `store.go:687-746` — the
+  window therefore runs from the FIRST sub-read, and the
+  post-restart closure handles the outcome) — the peer can promote
   the sync and then FAIL its active write
   (`store.go:687-717,738-746`), raising peer
   `ActivePersistDegraded` that the stop abandons
@@ -4288,13 +4390,23 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   committed configuration (this procedure changes no config;
   the intended config is what the operator committed and holds
   in their config management) — with the IN-BOX fallback being
-  the on-disk `.configdb/active.json` copied off-node by the
+  the on-disk `.configdb/active.json` — an opaque config-DB
+  artifact (a magic-header framing line + a possibly-encrypted
+  JSON body, `envelope.go:78-99`, `db.go:445-450` — preserved
+  byte-for-byte, r47 Codex m2) — copied off-node by the
   root-held operator, WITH ITS FORMAT CAVEATS NAMED (verified:
-  the file is a JSON envelope, `db.go:73-75,105-117`,
-  `writeTreeMarked` — NOT Junos text, so it cannot feed `load
+  the file is NOT Junos text, so it cannot feed `load
   override` directly, `store_command.go:306-309` — and its body
   is KEY-ENCRYPTED when the config carries a master password,
-  `crypto.go:262-285`; the file copy is therefore a
+  `crypto.go:262-285`, keyed by the SOURCE node's own
+  independently-random master.key, `crypto.go:457-480`, which a
+  DIFFERENT authority cannot AEAD-open,
+  `crypto.go:307-356,443-455` — r47 Codex M5: the file-level
+  restore is therefore pinned to the ORIGIN NODE when the body
+  is encrypted; only the cleartext-body (no master password)
+  file is portable across boxes; the operator's config TEXT is
+  the primary re-convergence artifact in all cases); the file
+  copy is a
   byte-exact RESTORE artifact for the stopped-daemon phase, not
   a text source) — no CLI/gRPC capture surface exists or is
   needed (r46 Codex M3: the
@@ -4375,17 +4487,24 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   active/applied/persistence, `store_command.go:304-334`, and a
   healthy recovered confirm window can pass every other field
   yet later roll back). The appliedDigest's TEXT-SCOPED
-  semantics are NOT a done-predicate hole (r46 Codex M2c,
-  ruled on here with evidence): a failed SAME-TEXT reapply
-  (the DHCP callback, `daemon_dhcp.go:73-90`;
-  `daemon_apply.go:49-70`) leaves the same text's PRIOR
-  successful enforcement in place — converged by definition —
-  and a failed DIFFERENT-text apply reads ActiveApplied=false
-  via the digest mismatch (the #5679 deferred commit error is
-  the running-node signal, `daemon_apply_dataplane.go:145-159`);
-  on a fresh boot the digest is empty, so a failed bringup
-  reads false — the post-restart predicate reads the
-  post-bringup state, which is exactly when it is consulted —
+  semantics leave ONE done-predicate hole, admitted after the
+  r46 rebuttal was WITHDRAWN (r47 Codex M2's counterexample
+  verified): a failed SAME-TEXT reapply can leave STALE
+  enforcement when the enforcement depends on dynamic state,
+  not just the text — a DHCP lease change reapplies the same T
+  to build address-scoped host-inbound enforcement for the NEW
+  address (`daemon_dhcp.go:231-245`), an nft installation
+  failure leaves the prior kernel generation covering only its
+  former destinations (`daemon_nft.go:262-272`), and the error
+  returns without clearing the old digest
+  (`daemon_apply_tail.go:83-89,316-327`, `daemon_apply.go:56-70`)
+  — ActiveApplied compares H(T) only, so it stays true while
+  the new address lacks enforcement. The done predicate
+  therefore ALSO requires NO dataplane apply failure since the
+  post-restart bringup on EITHER node — the last-apply-outcome
+  + a monotonic apply-failure count are tracked in the daemon's
+  health state and rendered beside ActiveApplied (the §5.1
+  inventory carries the exposure) —
   with the disabled-sync subclass's MANUAL re-convergence
   performed first where it fired —
   before the repair is declared done. The same shape covers a push landing on the
@@ -5378,7 +5497,11 @@ v20 history). The delivery is TWO units:
   pulse, `daemon_apply_tail.go:238-255`) — is exposed beside
   the counter; and the ActiveApplied state (r46 Codex M2a —
   internal today, `store.go:797-809`) is rendered on the same
-  status surface; the rendering lands in pkg/cluster, the
+  status surface, ALONGSIDE the last-apply-outcome + a
+  monotonic apply-failure count (r47 Codex M2 — the done
+  predicate's no-apply-failure-since-bringup term; the daemon
+  tracks the outcome in its health state and pkg/cluster
+  renders it); the rendering lands in pkg/cluster, the
   canonical accessor in pkg/configstore, the injection in
   pkg/daemon, and pkg/grpcapi/pkg/cli stay CODE-untouched as
   relays (`server_show_cluster_text.go:66-74`).
@@ -6427,7 +6550,19 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      idempotent), repair-to-valid FILESYSTEM remediation requires
      xpfd STOPPED with the MANDATORY `mask == 0` precondition
      EXPLICIT and FENCED (the r36-r42 producer-quiesce protocol:
-     (1) no live commit-confirmed window stands, (2) refrain
+     (1) no live commit-confirmed window stands, (1a) automation
+     is quiesced — if any `event-options` policy is configured,
+     `deactivate event-options` and commit FIRST (the event
+     engine is the only autonomous local commit source,
+     `engine.go:920-948` via `daemon_apply_tail.go:446-455`
+     without peer sync, invisible to the counter/epoch; shutdown
+     does not fence it, `daemon_run_shutdown.go:25-59`,
+     `engine.go:354-367,583-595` — r47 Codex M4), (1b) ONLY
+     THEN capture the intended-config digest + text (capturing
+     before the window resolution leaves the pair stale across
+     a rollback — `store_commit.go:427-461,503-524`,
+     `store_persist.go:21-55` — r47 Codex M3 = r47 SMR m2; any
+     commit that lands anyway forces a re-capture), (2) refrain
      from commits and FENCE the async producer ENFORCEABLY with
      the peer-side preflight — PEER full-state clean (peer
      `ConfirmDebtKindMask == 0` AND peer `persistDegraded ==
@@ -6540,12 +6675,20 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      redaction-free, no cleartext needed) AND the intended
      config's TEXT — the OPERATOR'S OWN committed configuration
      (this procedure changes no config), with the in-box
-     fallback being the on-disk `.configdb/active.json` copied
-     off-node by the root-held operator as a byte-exact
-     STOPPED-DAEMON RESTORE artifact (a JSON envelope, NOT
+     fallback being the on-disk `.configdb/active.json` — an
+     opaque config-DB artifact (a magic-header framing line + a
+     possibly-encrypted JSON body, `envelope.go:78-99`,
+     `db.go:445-450`; preserved byte-for-byte, r47 Codex m2) —
+     copied off-node by the root-held operator as a byte-exact
+     STOPPED-DAEMON RESTORE artifact (NOT
      Junos text — it cannot feed `load override` directly,
-     `store_command.go:306-309` — and key-encrypted when the
-     config carries a master password, `crypto.go:262-285`) —
+     `store_command.go:306-309` — and when the config carries a
+     master password the body is keyed by the SOURCE node's
+     independently-random master.key, `crypto.go:262-285,457-480`,
+     which a DIFFERENT authority cannot AEAD-open,
+     `crypto.go:307-356,443-455` — so the file-level restore is
+     pinned to the ORIGIN NODE in the encrypted case and
+     portable only when cleartext, r47 Codex M5) —
      no CLI/gRPC capture surface exists or is
      needed (r46 Codex M3: every rendered surface is redacted,
      `grpcapi/server_config.go:347-380`, `api/config.go:304-352`,
@@ -6569,11 +6712,17 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      `daemon_apply_commit.go:464-494`; the config-apply health
      alarm is delayed and diagnostic-only,
      `sync_conn_config.go:369-379` — r45 Codex M4; the digest's
-     text-scoped semantics are not a hole — a failed same-text
-     reapply leaves the same text's prior converged
-     enforcement, and a failed different-text apply reads false
-     via the digest mismatch, r46 Codex M2c ruled on with
-     evidence) — EXPOSED beside the counter/epoch/digest on the
+     text-scoped semantics leave ONE hole — the r46 rebuttal
+     WITHDRAWN per r47 Codex M2's verified counterexample: a
+     failed same-text reapply with state-dependent enforcement
+     (the DHCP host-inbound build, `daemon_dhcp.go:231-245`;
+     nft failure retains the prior kernel generation,
+     `daemon_nft.go:262-272`) keeps ActiveApplied true while
+     the new address lacks enforcement — so the predicate ALSO
+     requires NO dataplane apply failure since the post-restart
+     bringup on either node, tracked in the daemon's health
+     state and rendered beside ActiveApplied) —
+     EXPOSED beside the counter/epoch/digest on the
      cluster-status rendering (r46 Codex M2a) — AND
      `IsConfirmPending() == false` AND `IsDirty() == false` (or
      the candidate explicitly discarded) on BOTH nodes (r46
@@ -6625,7 +6774,9 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      completes but before the producer's continuation asserts
      the reservation is ALREADY visible (the consumer can
      dequeue at the seam; the counter never reads a false
-     zero); (g) the ENQUEUE-AFTER-TEARDOWN leg, rewritten as TWO
+     zero — and the EPOCH'S advance is
+     visible at the same seam, r47 Codex M1); (g) the
+     ENQUEUE-AFTER-TEARDOWN leg, rewritten as TWO
      legs (r46 Codex m1 — freezing the reader INSIDE the
      critical section while Stop publishes+drains is impossible
      under the same exclusion; the exclusion prevents that
