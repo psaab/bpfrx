@@ -198,6 +198,31 @@ closing it needs the dataplane to own the xfrmi end-to-end, including a
 plaintext egress path into the tunnel. Deleting either exclusion without
 building that path re-opens the drop above rather than fixing the gap.
 
+**Scope of the exclusion — it is narrower than "the dataplane ignores secure
+tunnels".** The predicate gates three sets and only three: the
+ingress-adjudication map, the AF_XDP binding plan and the RSS allowlist. Since
+#5619 made the xfrmi's ifindex resolve, the tunnel *does* enter the forwarding
+state built by `populate_interfaces` / `populate_egress`
+(`afxdp/forwarding_build/interfaces.rs`), which gate on `ifindex > 0` rather
+than on this predicate — so `name_to_ifindex`, the zone map and the egress map
+all see it, and a static route `next-hop st0.0` now resolves to a real ifindex
+where `resolve_next_hop_target_v4` previously fell through to
+`.unwrap_or((0, 0))`.
+
+That was traced to a terminal outcome and changes no disposition. An egress
+ifindex with **no XSK binding** is dropped by the TX dispatcher as
+`missing_egress_binding` (`afxdp/tx/dispatch/mod.rs`) — and ifindex 0 had no
+binding either, so LAN→tunnel transit dropped at the same site for the same
+reason before and after. What *did* change is a strict improvement: the egress
+zone resolves, so the flow is adjudicated against the real zone pair instead of
+an unresolved one.
+
+Do **not** "fix" that by widening the exclusion into those maps. An interface
+absent from the zone maps resolves to `zone_id = 0`, and a `from-zone any
+to-zone any permit` matches zone-pair (0, 0) with no zone guard (#6682) — that
+trades a drop that already existed for a possible policy bypass. The LAN→tunnel
+drop is the reverse-direction half of #6700, not a regression introduced here.
+
 The same-plan fast path in `apply_snapshot` (`handlers/snapshot.rs`) relies
 on this coupling for correctness (#2916): when `snapshot_binding_plan_key` is
 unchanged it skips `replan_queues` entirely (it only reconciles/refreshes the
