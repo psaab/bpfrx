@@ -2,6 +2,7 @@ package config
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -152,6 +153,15 @@ event-options {
 		t.Fatal("packed-leaf attributes-match with an unknown attribute field committed CLEAN; " +
 			"the compiler dropped the expression so the validator never saw it (gate escape)")
 	}
+	// Assert the ATTRIBUTES-MATCH gate's wording, not just that something
+	// rejected the config. No other gate rejects this config today, but "only
+	// one gate can fire" is precisely the assumption that broke the
+	// forwarding-table guard once a second gate was added alongside it — an
+	// `err != nil` assertion silently stops binding the moment that happens.
+	const wantMsg = "unknown field"
+	if !strings.Contains(err.Error(), wantMsg) {
+		t.Fatalf("rejected, but not by the attributes-match field validator.\n  got: %v\n  want a message containing %q", err, wantMsg)
+	}
 }
 
 // --- FAIL-OPEN 2: event-options then change-configuration commands ----------
@@ -247,8 +257,17 @@ func TestFlowTraceFlags6659UnknownFlagInAnySlotRejected(t *testing.T) {
 			"set security flow traceoptions flag [ totally-bogus-flag basic-datapath ]"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := CompileConfig(setTree6659(t, tc.cmd)); err == nil {
+			_, err := CompileConfig(setTree6659(t, tc.cmd))
+			if err == nil {
 				t.Fatal("unknown flow trace flag committed CLEAN (gate escape)")
+			}
+			// Assert the UNKNOWN-FLAG gate's wording. Same reasoning as the
+			// attributes-match guard: no competing gate rejects this config
+			// today, but a bare `err != nil` stops binding the moment one is
+			// added, which is exactly how the forwarding-table guard went blind.
+			const wantMsg = "unknown flow trace flag"
+			if !strings.Contains(err.Error(), wantMsg) {
+				t.Fatalf("rejected, but not by the unknown-flag gate.\n  got: %v\n  want a message containing %q", err, wantMsg)
 			}
 		})
 	}
@@ -262,9 +281,10 @@ func TestFlowTraceFlags6659UnknownFlagInAnySlotRejected(t *testing.T) {
 // were neither translated nor validated — a malformed prefix in slot 2 committed
 // clean.
 func TestStaticNATMatchAddresses6659MultiRejected(t *testing.T) {
+	const multiMsg = "`match destination-address` prefixes"
 	for _, tc := range []struct{ name, addrs string }{
 		{"two well-formed prefixes", "[ 192.0.2.1/32 192.0.2.2/32 ]"},
-		{"malformed prefix in SECOND slot (the escape)", "[ 192.0.2.1/32 not-an-address ]"},
+		{"malformed prefix in SECOND slot", "[ 192.0.2.1/32 not-an-address ]"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := CompileConfig(setTree6659(t,
@@ -276,7 +296,80 @@ func TestStaticNATMatchAddresses6659MultiRejected(t *testing.T) {
 				t.Fatal("multi-valued static-NAT match destination-address committed CLEAN; " +
 					"only the first prefix would translate and the rest are silently ignored")
 			}
+			// Assert WHICH gate fired. At strict commit the multi-value gate
+			// runs first and MASKS the prefix validator, so the malformed-slot-2
+			// case is expected to report the multi message here, not a prefix
+			// error. Pinning that keeps this subtest honest: it is a second
+			// instance of the multi rejection, NOT evidence that the prefix gate
+			// sees slot 2. The prefix gate's multi-slot reach is asserted on the
+			// tolerant path instead — see
+			// TestStaticNATMatchAddresses6659TolerantPathValidatesEveryPrefix.
+			if !strings.Contains(err.Error(), multiMsg) {
+				t.Fatalf("rejected, but not by the multi-value gate.\n  got: %v\n  want a message containing %q", err, multiMsg)
+			}
 		})
+	}
+}
+
+// TestStaticNATMatchAddresses6659TolerantPathValidatesEveryPrefix is the real
+// gate-escape guard for site 6, and it has to run on the TOLERANT path.
+//
+// At strict commit the multi-value gate rejects the list outright and fires
+// BEFORE the prefix validator, so a malformed slot-2 prefix is unreachable there
+// — which means a strict-path test cannot distinguish "the prefix gate reads
+// every value" from "the prefix gate reads only the first". On the tolerant load
+// / peer-sync path the multi-value gate downgrades to a warning and the config
+// LOADS, so the prefix validator is the only thing left between a malformed
+// slot-2 prefix and a mapping the Rust dataplane silently drops
+// (`parse_nat_prefix` returns None and `from_snapshots` continues).
+//
+// Before #6659 that validator read the scalar rule.Match — the FIRST value — so
+// the tail escaped it entirely. It now walks MatchAddresses.
+func TestStaticNATMatchAddresses6659TolerantPathValidatesEveryPrefix(t *testing.T) {
+	cfg, err := CompileConfigLenient(setTree6659(t,
+		"set security nat static rule-set rs1 from zone untrust",
+		"set security nat static rule-set rs1 rule r1 match destination-address [ 192.0.2.1/32 not-an-address ]",
+		"set security nat static rule-set rs1 rule r1 then static-nat prefix 10.0.0.1/32",
+	))
+	if err != nil {
+		t.Fatalf("tolerant path must LOAD (no-brick, #1960), got: %v", err)
+	}
+	// Assert the PREFIX gate's distinctive wording, NOT merely that the bad
+	// value appears somewhere in the warnings.
+	//
+	// Asserting `Contains(warnings, "not-an-address")` is ATTRIBUTION-BLIND and
+	// silently vacuous here: the multi-value gate's own warning echoes the whole
+	// authored list — "...prefixes ([192.0.2.1/32 not-an-address])..." — so the
+	// bad token appears whether or not the prefix validator ever looked at slot
+	// 2. Written that way this test stayed GREEN when the prefix validator was
+	// mutated back to a scalar-only read, i.e. it did not bind the fix it is
+	// named for. That is the same defect the reviewer found in
+	// TestForwardingTableExport6659DanglingRefInAnySlot, reproduced here while
+	// fixing it: whenever two gates can both react to one probe config, any
+	// assertion they can BOTH satisfy proves nothing about which one fired.
+	const prefixMsg = "is not a valid IP address or CIDR prefix"
+	joined := strings.Join(cfg.Warnings, "\n")
+	if !strings.Contains(joined, prefixMsg) {
+		t.Fatalf("the malformed SLOT-2 prefix escaped the PREFIX validator on the tolerant "+
+			"path — it is reading only the first value.\nwant a warning containing %q\nwarnings:\n%s",
+			prefixMsg, joined)
+	}
+	if !strings.Contains(joined, "not-an-address") {
+		t.Fatalf("prefix complaint present but does not name the offending value:\n%s", joined)
+	}
+	// Negative control on the same path: a well-formed list warns about the
+	// multi-value collapse but must NOT produce a prefix complaint.
+	okCfg, err := CompileConfigLenient(setTree6659(t,
+		"set security nat static rule-set rs1 from zone untrust",
+		"set security nat static rule-set rs1 rule r1 match destination-address [ 192.0.2.1/32 192.0.2.2/32 ]",
+		"set security nat static rule-set rs1 rule r1 then static-nat prefix 10.0.0.1/32",
+	))
+	if err != nil {
+		t.Fatalf("tolerant path must LOAD, got: %v", err)
+	}
+	if strings.Contains(strings.Join(okCfg.Warnings, "\n"), "is not a valid IP address or CIDR prefix") {
+		t.Fatalf("well-formed prefixes produced a prefix-validity complaint:\n%s",
+			strings.Join(okCfg.Warnings, "\n"))
 	}
 }
 
@@ -305,7 +398,27 @@ func TestStaticNATMatchAddresses6659SingleUnchanged(t *testing.T) {
 // dangling export policy from silently disabling ECMP, and it read the same
 // nodeVal the compiler did — so an undefined policy in slot 2 committed clean on
 // exactly the scenario the gate's own error message describes.
+//
+// IT MUST ASSERT ON THE ERROR TEXT, not merely on `err != nil`. Two independent
+// gates reject `export [ p1 p2 ]`: the multi-policy gate
+// (validateForwardingTableExportSingleStrict) and the dangling-reference loop
+// this test is named for. A bare `err != nil` cannot attribute the rejection, so
+// restoring the one-sided slot-1 read left this test GREEN — the multi gate was
+// satisfying it and the actual site-14 fix had no guard at all. Caught by
+// mutating the dangling loop back to slot 1 and observing nothing red.
+//
+// Why it matters even though strict commit is safe either way: at strict commit
+// the multi gate rejects the list outright, so a dangling slot-2 ref cannot
+// survive. But the TOLERANT load / peer-sync path downgrades that gate to a
+// warning and the config loads, and there the multi-slot dangling read is the
+// only thing between a dangling reference and silently-disabled ECMP.
 func TestForwardingTableExport6659DanglingRefInAnySlot(t *testing.T) {
+	// The dangling gate's distinctive wording. The multi-policy gate says
+	// "declares N policies" instead, so requiring this substring pins WHICH gate
+	// fired.
+	const danglingMsg = "references undefined policy-statement"
+	const multiMsg = "declares 2 policies"
+
 	for _, tc := range []struct {
 		name    string
 		defined string
@@ -320,6 +433,14 @@ func TestForwardingTableExport6659DanglingRefInAnySlot(t *testing.T) {
 			))
 			if err == nil {
 				t.Fatal("dangling forwarding-table export policy committed CLEAN (gate escape)")
+			}
+			if !strings.Contains(err.Error(), danglingMsg) {
+				t.Fatalf("rejected, but NOT by the dangling-reference gate.\n"+
+					"  got:  %v\n"+
+					"  want a message containing %q.\n"+
+					"If this is the %q message, the multi-policy gate is satisfying this "+
+					"test and the multi-slot dangling read is UNGUARDED — that is the exact "+
+					"defect this assertion exists to catch.", err, danglingMsg, multiMsg)
 			}
 		})
 	}

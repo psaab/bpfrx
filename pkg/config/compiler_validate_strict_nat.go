@@ -1295,11 +1295,33 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			// blockPair / host-mask checks so an unparseable value reports its
 			// own (clearer) error rather than being skipped as "not a block
 			// pair".
-			if rule.Match != "" {
-				if _, _, _, parsedIP := natStaticPrefixInfo(rule.Match); !parsedIP {
+			// #6659: validate EVERY authored destination-address, not just the
+			// first. Before #6659 the compiler read this leaf with nodeVal, so
+			// only one value existed to check. It now accumulates into
+			// MatchAddresses, and reading only the scalar rule.Match here would
+			// leave the tail unvalidated — which matters specifically on the
+			// TOLERANT load / peer-sync path: there
+			// validateStaticNATMatchAddressesStrict downgrades the multi-value
+			// rejection to a warning and the config LOADS, so this gate is the
+			// only thing standing between a malformed slot-2 prefix and a
+			// silently-dropped mapping in the Rust dataplane. At strict commit
+			// the multi-value gate rejects the list outright and fires first, so
+			// the tail is unreachable there; the tolerant path is where this
+			// loop earns its keep. Fall back to the scalar when the plural is
+			// empty so a typed config produced by an older binary (peer sync, a
+			// restored DB) is still checked.
+			matchAddrs := rule.MatchAddresses
+			if len(matchAddrs) == 0 && rule.Match != "" {
+				matchAddrs = []string{rule.Match}
+			}
+			for _, addr := range matchAddrs {
+				if addr == "" {
+					continue
+				}
+				if _, _, _, parsedIP := natStaticPrefixInfo(addr); !parsedIP {
 					if err := emit(fmt.Sprintf(
 						"security nat static rule-set %q rule %q match destination-address %q is not a valid IP address or CIDR prefix (static NAT requires a literal address or prefix, not an address-book name or a typo'd value)",
-						rs.Name, rule.Name, rule.Match)); err != nil {
+						rs.Name, rule.Name, addr)); err != nil {
 						return nil, err
 					}
 				}
