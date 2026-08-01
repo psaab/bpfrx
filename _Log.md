@@ -66273,3 +66273,38 @@ break — `go vet` confirmed passing under every revert.
   pkg/cluster/heartbeat_nonce_scope_test.go, pkg/cluster/heartbeat.go,
   pkg/cluster/manager.go, pkg/cluster/heartbeat_replay_restart_5086_test.go,
   pkg/cluster/heartbeat_auth_test.go, pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 15:05
+- **Action**: #6169 review fold — close the epochless bypass (review MAJOR) plus
+  two uint64-boundary hardening findings. The MAJOR: the floor only ever sees
+  frames that CARRY an epoch, and an attacker's captures are by construction
+  mostly PRE-upgrade and therefore epochless, so they bypassed the floor
+  entirely. Measured on the first cut with the floor latched at a live peer's
+  epoch: 975/975 epochless replays admitted — the fix defended only against an
+  attacker who started capturing AFTER the upgrade. Added a DOWNGRADE LATCH
+  (`epochSeen`): once the peer is seen to emit an epoch, epochless frames from
+  it are refused. Latch is armed by OBSERVATION (never by local build version)
+  so a rolling upgrade still works, and is DURABLE via a persisted peer floor
+  at /var/lib/xpf/ha-peer-epoch-floor, loaded before the receiver admits its
+  first frame — an in-memory latch is cleared by exactly the receiver restart
+  an attacker waits for. To keep the latch safe, the sender switched from
+  persist-before-emit to ALWAYS-EMIT: a persist failure now degrades
+  monotonicity (wall-clock fallback), never emission, which buys the invariant
+  "a keyed heartbeat carries no epoch iff the peer runs a pre-#6169 build". So
+  no runtime fault can make a healthy node unacceptable to a healthy peer; the
+  one legitimate latch trigger is a deliberate ROLLBACK to a pre-#6169 build,
+  which is refused with a rate-limited actionable log and recovered by clearing
+  the floor file + restart (documented). Every storage fault on both sides fails
+  OPEN. Hardening: `nextBootEpoch` refuses to chain from an implausible
+  persisted value (MaxUint64-1 previously saturated then REGRESSED on the next
+  boot, permanently locking out a peer that had latched it) and the receiver
+  will only latch an epoch below year 2200 (`epochUsableAsFloor`) — one-sided
+  and absolute, so a dead RTC or a wrong local clock never refuses a peer.
+  StartHeartbeat now primes the floor and bounded-waits the boot-epoch resolve
+  so opening frames already carry an epoch. Mutations 7/8/9 red the new guards
+  as assertions with build+vet rc=0; mutations 1/2 re-verified on the new shape;
+  negative controls green in every world.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/heartbeat.go,
+  pkg/cluster/manager.go, pkg/cluster/heartbeat_manager.go,
+  pkg/cluster/heartbeat_epoch_latch_test.go, pkg/cluster/heartbeat_epoch_test.go,
+  pkg/cluster/README.md, _Log.md

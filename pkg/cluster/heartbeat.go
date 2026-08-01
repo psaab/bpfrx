@@ -684,6 +684,28 @@ type heartbeatAuthState struct {
 	// epoch" sentinel, so it can never be a real floor.
 	highEpoch uint64
 
+	// epochSeen is the DOWNGRADE LATCH: the peer has proved it runs a build
+	// that emits boot epochs, so an epochless frame from it is now refused.
+	//
+	// Without this the epoch closes almost nothing. An attacker's captured
+	// incarnations are, by construction, mostly from BEFORE the upgrade and so
+	// carry no epoch; if epochless frames are accepted forever the floor is
+	// never even consulted. Measured on the first cut of this change: with the
+	// floor latched at a live peer's epoch, 975/975 epochless replays were
+	// still admitted.
+	//
+	// It is restored from the DURABLE floor at start (primeEpochFloor), because
+	// an in-memory-only latch is cleared by exactly the receiver restart an
+	// attacker waits for.
+	epochSeen bool
+
+	// persistFloor durably records an advanced floor. Set once by
+	// Manager.initHeartbeatEpochState before any frame is admitted, and nil in
+	// unit tests (in-memory only). It is called OUTSIDE the mutex and must not
+	// block — the implementation hands off to a goroutine, so an fsync can
+	// never stall the heartbeat read loop.
+	persistFloor func(uint64)
+
 	// peerAuthSeen is sticky and READ cross-goroutine
 	// (Manager.HeartbeatPeerAuthSeen, consumed by the gRPC fabric listener to
 	// arm its downgrade-guard off the fast-arming heartbeat instead of the
@@ -720,41 +742,108 @@ type heartbeatAuthState struct {
 //     genuine peer actually signed, so replaying a captured high-epoch frame
 //     cannot push the floor above the live peer and lock it out.
 //
-// MIGRATION (dual-accept, the #4126 VRRP-checksum / heartbeatAuthDecision
-// pattern). A frame with NO epoch section is passed to the ring exactly as
-// before, so a not-yet-upgraded peer keeps working unchanged in both
-// directions, and so does an upgraded peer that could not durably persist its
-// epoch (persist-before-emit; see nextBootEpoch).
+// MIGRATION + THE DOWNGRADE LATCH (dual-accept, the #4126 VRRP-checksum /
+// heartbeatAuthDecision pattern).
 //
-// There is deliberately NO sticky "peer has spoken epochs, so a markerless
-// frame is now a downgrade" gate, even though it would close the residual that
-// captures taken from a PRE-upgrade incarnation still churn the ring. Two
-// things legitimately stop a healthy peer emitting epochs after it has emitted
-// them: a rollback to a pre-#6169 build (an explicitly supported operation —
-// A/B image rollback, #1930 — and mixed-version clusters are supported during
-// any rolling upgrade), and a storage fault. A sticky gate would make this node
-// reject a LIVE peer's heartbeats, which the peer cannot observe or correct: it
-// still hears us, so it never demotes, while we conclude it is dead and promote
-// — dual-primary. That is strictly worse than the replay it would close. The
-// residual is instead closed operationally by rotating the control-link PSK
-// once both nodes run an epoch-capable build, which makes every archived
-// capture unverifiable.
+// An epochless frame is accepted and passed to the ring exactly as before —
+// UNTIL the peer has proved it emits epochs. From then on an epochless frame
+// from that peer is refused. Both halves are required:
+//
+//   - Accepting epochless frames before the peer has proved otherwise is what
+//     keeps a rolling upgrade from splitting the cluster, and it is why the
+//     latch is armed by OBSERVATION rather than by local build version.
+//   - Refusing them afterwards is what actually closes #6169. An attacker's
+//     captures are by construction mostly PRE-upgrade and therefore epochless;
+//     without the latch they bypass the floor entirely and the fix would only
+//     defend against an attacker who started capturing after the upgrade.
+//     Measured on the first cut of this change: floor latched at a live peer's
+//     epoch, and still 975/975 epochless replays admitted.
+//
+// The latch is armed by an ACCEPTED frame that carried an epoch section, and it
+// is restored at start from the DURABLE floor — an in-memory latch is cleared
+// by exactly the receiver restart an attacker waits for.
+//
+// WHAT MAKES THE LATCH SAFE is the sender-side invariant in heartbeat_epoch.go:
+// a keyed heartbeat carries no epoch IF AND ONLY IF the peer runs a pre-#6169
+// build. A storage fault does NOT stop a healthy node emitting an epoch (it
+// falls back to a wall-clock value and logs), so no runtime fault can make this
+// node refuse a live peer. The one remaining trigger is a genuine ROLLBACK of
+// the peer to a pre-#6169 build, which is a deliberate, operator-initiated act:
+// that peer's frames are refused until an operator clears the persisted floor
+// (see pkg/cluster/README.md). This is the same trade #4107's sticky
+// peerAuthSeen already makes for the auth trailer, made durable.
+//
+// The three epoch cases, once the peer is known to emit them:
+//
+//   - epoch < highEpoch — a RETIRED incarnation. Reject. This is the #6169
+//     close: no matter how many captured sessions the attacker churns the ring
+//     with, every one belongs to an incarnation at or below the highest epoch
+//     already seen, so they never reach the ring at all.
+//   - epoch == highEpoch — the SAME incarnation. Fall through to the ring,
+//     which is what handles within-incarnation replay (unchanged #6167
+//     behaviour).
+//   - epoch > highEpoch — a genuinely NEWER incarnation. Let the ring vet the
+//     nonce, then raise the floor. The floor only ever rises to a value the
+//     genuine peer actually signed, so replaying a captured high-epoch frame
+//     cannot push the floor above the live peer and lock it out.
+//
+// An epoch outside the plausibility band (epochUsableAsFloor) still satisfies
+// the latch — the peer demonstrably emits epochs — but is neither compared
+// against the floor nor latched as one, so a corrupt far-future value cannot
+// slam the one-way door.
 func (s *heartbeatAuthState) admitAuthed(hasEpoch bool, epoch, session, counter uint64) bool {
+	ok, advanced, persist := s.admitAuthedLocked(hasEpoch, epoch, session, counter)
+	// Persist OUTSIDE the lock: the hand-off must never run under s.mu, and the
+	// floor only advances once per peer incarnation so this is a rare call.
+	if advanced != 0 && persist != nil {
+		persist(advanced)
+	}
+	return ok
+}
+
+// admitAuthedLocked is the locked half of admitAuthed. advanced is non-zero
+// when the durable floor should be updated; persist is returned rather than
+// read by the caller so the hook is never touched outside the mutex.
+func (s *heartbeatAuthState) admitAuthedLocked(hasEpoch bool, epoch, session, counter uint64) (ok bool, advanced uint64, persist func(uint64)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !hasEpoch {
-		return s.replay.admit(session, counter)
+		if s.epochSeen {
+			// Downgrade: this peer has proved it emits epochs.
+			return false, 0, nil
+		}
+		return s.replay.admit(session, counter), 0, nil
 	}
-	if epoch < s.highEpoch {
-		return false
+	usable := epochUsableAsFloor(epoch)
+	if usable && epoch < s.highEpoch {
+		return false, 0, nil
 	}
 	if !s.replay.admit(session, counter) {
-		return false
+		return false, 0, nil
 	}
-	if epoch > s.highEpoch {
+	s.epochSeen = true
+	if usable && epoch > s.highEpoch {
 		s.highEpoch = epoch
+		advanced = epoch
 	}
-	return true
+	return true, advanced, s.persistFloor
+}
+
+// primeEpochFloor restores the durable across-reboot floor and installs the
+// persistence hook. It must run before the receiver admits its first frame, or
+// a replay slips into the gap and re-anchors a low floor. A non-zero floor also
+// arms the downgrade latch: a floor can only have been written by an accepted
+// epoch-bearing frame, so it is proof the peer emits epochs.
+func (s *heartbeatAuthState) primeEpochFloor(floor uint64, persist func(uint64)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if floor > s.highEpoch {
+		s.highEpoch = floor
+	}
+	if floor > 0 {
+		s.epochSeen = true
+	}
+	s.persistFloor = persist
 }
 
 // peerEpochFloor reports the highest peer boot epoch accepted so far (0 when
@@ -763,6 +852,14 @@ func (s *heartbeatAuthState) peerEpochFloor() uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.highEpoch
+}
+
+// peerEpochLatched reports whether the peer has proved it emits boot epochs, so
+// an epochless frame from it is now refused. Diagnostics and tests only.
+func (s *heartbeatAuthState) peerEpochLatched() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.epochSeen
 }
 
 // peerAuthenticated reports whether the peer has ever sent a valid
@@ -1067,6 +1164,13 @@ func (r *heartbeatReceiver) readLoop() {
 		accept, reason := heartbeatAuthDecision(len(key) > 0, present, macOK, nonceFresh, r.peerAuthenticated())
 		if !accept {
 			r.recvErrors.Add(1)
+			// #6169: an authenticated frame that lost its epoch after the peer
+			// had proved it signs one is operator-actionable (a deliberate
+			// rollback stays refused until the floor is cleared), so surface it
+			// distinctly instead of burying it in the generic replay reason.
+			if macOK && !hasEpoch && r.auth.peerEpochLatched() {
+				r.mgr.NoteEpochDowngradeHeartbeat()
+			}
 			slog.Warn("cluster: heartbeat auth rejected",
 				"reason", reason, "peer_node", pkt.NodeID)
 			continue

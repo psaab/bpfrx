@@ -58,6 +58,13 @@ func (m *Manager) StartHeartbeat(localAddr, peerAddr, vrfDevice string) error {
 	threshold := m.hbThreshold
 	m.mu.Unlock()
 
+	// #6169: restore the durable peer epoch floor BEFORE the receiver can admit
+	// a frame (a gap here lets a replay re-anchor a low floor), and give this
+	// node's own boot epoch a bounded chance to resolve before the sender's
+	// first send (a latched peer refuses epochless frames). Both are once per
+	// process, so a routine VRF-rebind restart pays neither.
+	m.initHeartbeatEpochState()
+
 	// Select the UDP network from the control-link address family so a v6
 	// control link binds; v4 stays "udp4". net.JoinHostPort brackets a v6
 	// literal (fd00::1 -> [fd00::1]:port) — plain "%s:%d" would produce an

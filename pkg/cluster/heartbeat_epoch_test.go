@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -507,27 +508,80 @@ func TestNextBootEpochMonotonic_6169(t *testing.T) {
 		}
 	})
 
-	// PERSIST-BEFORE-EMIT. A node that cannot durably write its epoch reports
-	// ok=false and therefore advertises NO epoch, so its peer falls back to the
-	// bounded session ring. It must never emit an unpersisted epoch: the next
-	// incarnation could not observe it and might repeat or regress it, which
-	// would make the peer reject a healthy node.
-	t.Run("persist_failure_reports_not_ok", func(t *testing.T) {
+	// A PERSIST FAILURE MUST NOT SUPPRESS EMISSION. This is the property that
+	// keeps the downgrade latch safe: if a storage fault made a healthy node
+	// emit epochless frames, a latched peer would refuse a LIVE node and the
+	// latch would have manufactured a split-brain. So the epoch is still
+	// returned (and still advertised) — only its DURABILITY is lost, which at
+	// worst costs monotonicity across a simultaneous backward clock step.
+	t.Run("persist_failure_still_yields_a_usable_epoch", func(t *testing.T) {
 		dir := t.TempDir()
 		blocker := filepath.Join(dir, "blocker")
 		if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
 		}
+		before := uint64(time.Now().UnixNano())
 		// The parent component is a regular file, so the state dir cannot be
 		// created — a failure mode that holds even when running as root.
-		got, ok := nextBootEpoch(filepath.Join(blocker, "sub", "ha-boot-epoch"))
-		if ok {
-			t.Fatalf("persist failure reported ok (epoch %d)", got)
+		got, persisted := nextBootEpoch(filepath.Join(blocker, "sub", "ha-boot-epoch"))
+		if persisted {
+			t.Fatalf("persist failure reported durable (epoch %d)", got)
 		}
-		if got != 0 {
-			t.Fatalf("persist failure returned epoch %d, want the 0 sentinel", got)
+		if got < before {
+			t.Fatalf("persist failure returned epoch %d, below the wall clock %d — a node that "+
+				"cannot write must still ADVERTISE an epoch or a latched peer refuses it", got, before)
 		}
 	})
+
+	// A corrupt / hand-edited value near MaxUint64 must not be chained from.
+	// Incrementing it saturates on one boot and REGRESSES on the next
+	// (MaxUint64+1 overflows, so the wall clock wins), and a peer that latched
+	// MaxUint64 would then refuse this node forever — a permanent, self-
+	// inflicted lockout. Ignoring the implausible value heals the file instead.
+	t.Run("implausible_persisted_value_does_not_regress", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "ha-boot-epoch")
+		if err := os.WriteFile(path, []byte(strconv.FormatUint(math.MaxUint64-1, 10)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		first, ok1 := nextBootEpoch(path)
+		second, ok2 := nextBootEpoch(path)
+		if !ok1 || !ok2 {
+			t.Fatalf("persist failed (%v, %v)", ok1, ok2)
+		}
+		if second <= first {
+			t.Fatalf("epoch REGRESSED across restarts: %d then %d — a peer that latched the "+
+				"first value would refuse this node forever", first, second)
+		}
+		if !epochUsableAsFloor(first) || !epochUsableAsFloor(second) {
+			t.Fatalf("implausible epochs emitted: %d, %d", first, second)
+		}
+	})
+}
+
+// TestEpochPlausibleBound_6169 pins the one-sided sanity bound on what may be
+// latched as a floor. The floor is a ONE-WAY DOOR, so a bogus far-future value
+// locks the peer out permanently; a LOW value is merely permissive, which is
+// why the bound is upper-only (an appliance with a dead RTC must not be
+// refused, and the bound must not depend on the receiver's own clock).
+func TestEpochPlausibleBound_6169(t *testing.T) {
+	if want := uint64(time.Date(2200, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano()); epochPlausibleMax != want {
+		t.Fatalf("epochPlausibleMax = %d, want %d (2200-01-01T00:00:00Z)", epochPlausibleMax, want)
+	}
+	now := uint64(time.Now().UnixNano())
+	if !epochUsableAsFloor(now) {
+		t.Fatalf("a present-day wall-clock epoch (%d) must be usable as a floor", now)
+	}
+	if epochUsableAsFloor(math.MaxUint64) {
+		t.Fatal("MaxUint64 must not be usable as a floor")
+	}
+	if epochUsableAsFloor(0) {
+		t.Fatal("the 0 sentinel must not be usable as a floor")
+	}
+	// A dead RTC (clock at the Unix epoch + a little) is permissive, not
+	// locking, and must still be accepted as a floor.
+	if !epochUsableAsFloor(1) {
+		t.Fatal("a low epoch must remain usable — bounding below would refuse a peer with a dead RTC")
+	}
 }
 
 // TestHeartbeatBootEpochResolvesAsync_6169 pins that the epoch is resolved off

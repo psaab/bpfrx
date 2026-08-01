@@ -217,14 +217,35 @@ type Manager struct {
 	hbSession   uint64
 	hbCounter   atomic.Uint64
 
-	// bootEpochOnce/bootEpoch hold this daemon incarnation's #6169 boot epoch:
-	// a durably persisted, strictly-increasing-across-restart counter carried in
-	// the signed heartbeat so the peer can order incarnations. 0 means "not
-	// resolved / not durably persisted", in which case heartbeats carry no epoch
-	// and anti-replay degrades to the bounded session ring. Resolved
-	// asynchronously off the send path — see Manager.heartbeatBootEpoch.
-	bootEpochOnce sync.Once
-	bootEpoch     atomic.Uint64
+	// bootEpochOnce/bootEpoch/bootEpochReady hold this daemon incarnation's
+	// #6169 boot epoch: a persisted, strictly-increasing-across-restart counter
+	// carried in the signed heartbeat so the peer can order incarnations. 0
+	// means "not resolved yet", the only state in which heartbeats go out
+	// without an epoch on an epoch-capable build. Resolved asynchronously off
+	// the send path (an fsync must never stall the 100ms send loop) and waited
+	// for with a bound by the first StartHeartbeat — see
+	// Manager.heartbeatBootEpoch and initHeartbeatEpochState. bootEpochReady is
+	// closed once the first resolve attempt finishes; a nil channel (a Manager
+	// not built by NewManager) simply never fires and the bounded wait times
+	// out, which is safe.
+	bootEpochOnce  sync.Once
+	bootEpoch      atomic.Uint64
+	bootEpochReady chan struct{}
+
+	// epochInitOnce/peerFloor own the RECEIVER half: the durable high-water
+	// epoch accepted from the peer, which doubles as the #6169 downgrade latch
+	// (a non-zero floor is proof the peer emits epochs, so an epochless frame
+	// from it is refused from then on). Durable because an in-memory latch is
+	// cleared by exactly the receiver restart an attacker waits for.
+	epochInitOnce sync.Once
+	peerFloor     *peerEpochFloorStore
+
+	// lastEpochDowngradeWarn rate-limits the epoch-downgrade rejection warning.
+	// The rejection is operator-actionable (a peer rolled back to a pre-#6169
+	// build stays refused until the persisted floor is cleared), so it must be
+	// visible — but the peer sends at 5-10/s, so an unguarded log would flood
+	// journald. Read/written under m.mu.
+	lastEpochDowngradeWarn time.Time
 
 	// hbStartMu serializes StartHeartbeat's stop-previous + socket-create +
 	// install sequence so two concurrent StartHeartbeat calls (e.g. a
@@ -438,7 +459,28 @@ func NewManager(nodeID, clusterID int) *Manager {
 		preManualFailoverRetryInterval: DefaultPreManualFailoverRetryInterval,
 		failoverInProgress:             make(map[int]bool),
 		failoverGen:                    make(map[int]uint64),
+		bootEpochReady:                 make(chan struct{}),
 	}
+}
+
+// NoteEpochDowngradeHeartbeat surfaces a #6169 epoch-downgrade rejection.
+//
+// The peer previously proved it runs a build that signs a boot epoch, and is
+// now sending frames without one. That is either a replay of pre-upgrade
+// captures (the attack this closes) or a genuine rollback of the peer to a
+// pre-#6169 build — which is operator-actionable, since the peer stays refused
+// until the persisted floor is cleared. Rate-limited to once per 30s so a
+// 5-10/s heartbeat stream cannot flood the log.
+func (m *Manager) NoteEpochDowngradeHeartbeat() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if time.Since(m.lastEpochDowngradeWarn) < 30*time.Second {
+		return
+	}
+	m.lastEpochDowngradeWarn = time.Now()
+	slog.Warn("cluster: heartbeat refused — peer stopped signing a boot epoch it previously signed. " +
+		"This is a replayed pre-upgrade capture, or the peer was rolled back to a build older than #6169. " +
+		"If the rollback was intentional, clear " + peerEpochFloorPath + " on this node and restart xpfd")
 }
 
 // NodeID returns the local node ID.

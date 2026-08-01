@@ -30,9 +30,11 @@ locating any symbol below is now a matter of opening the named file.
   `heartbeat.go`. See "Control-channel authentication" below.
 - The #6169 across-reboot boot epoch — wire section constants, the
   key-derived marker (`heartbeatEpochMarker`), the verified-frame reader
-  (`heartbeatFrameEpoch`), and the persisted monotonic seed
-  (`nextBootEpoch`, `Manager.heartbeatBootEpoch`) —
-  `heartbeat_epoch.go`.
+  (`heartbeatFrameEpoch`), the plausibility bound (`epochUsableAsFloor`),
+  the persisted monotonic seed (`nextBootEpoch`,
+  `Manager.heartbeatBootEpoch`), the durable peer floor / downgrade latch
+  (`peerEpochFloorStore`) and the start-time wiring
+  (`Manager.initHeartbeatEpochState`) — `heartbeat_epoch.go`.
 - Single-RG manual failover and transfer-commit protocol
   (`ManualFailover`, `ForceSecondary`, `ResetFailover`,
   `RequestPeerFailover`, `commitRequestedPeerFailover`,
@@ -331,17 +333,66 @@ peer liveness (`lastSeen`) or drive election.
     (fresh image, wiped `/var/lib`, first boot) is dominated by the wall
     clock. Resolution is NANOSECONDS deliberately: a coarser seed hands two
     incarnations starting in the same interval identical values.
-  - **PERSIST-BEFORE-EMIT, and why this mechanism costs no HA availability.**
-    The epoch is advertised only once it is durably on disk. A node that
-    cannot write simply advertises **no** epoch and its peer falls back to
-    the session ring — degraded to the pre-#6169 posture, never wedged.
-    There is consequently **no state in which a healthy node's heartbeats
-    become unacceptable to a healthy peer**, so the epoch needs no
-    election/ownership coupling, no eligibility advertisement and no
-    operator override. Resolution also runs **asynchronously**, once per
-    `Manager`, off the send path: it fsyncs, and an fsync against a wedged
-    disk would otherwise block the 100 ms send loop and cause the very
-    failover this protects against.
+  - **The DOWNGRADE LATCH — without it the floor closes almost nothing.**
+    The floor only ever sees frames that CARRY an epoch, and an attacker's
+    captures are by construction mostly from BEFORE the upgrade, so they
+    carry none. A receiver that accepts epochless frames forever never
+    consults the floor at all. Measured on the first cut of this change,
+    with the floor latched at a live peer's epoch: **975/975 epochless
+    replays still admitted.** So once the peer has been seen to emit an
+    epoch, an epochless frame from it is REFUSED (`epochSeen` in
+    `heartbeatAuthState`). The latch is armed by OBSERVATION, never by local
+    build version — that is what keeps a rolling upgrade working.
+  - **The latch is DURABLE.** It is restored at start from the persisted
+    floor (`/var/lib/xpf/ha-peer-epoch-floor`, loaded by
+    `initHeartbeatEpochState` BEFORE the receiver admits its first frame — a
+    gap there lets a replay re-anchor a low floor). An in-memory-only latch
+    is cleared by exactly the receiver restart an attacker waits for, the
+    same window that made a single captured run replay 300/300 against a
+    restarted node. A non-zero floor is itself the proof, since only an
+    accepted epoch-bearing frame can write one. The floor is written only
+    when it ADVANCES (once per peer incarnation, not per frame) and on its
+    own goroutine, so an fsync never stalls the receive path.
+  - **ALWAYS-EMIT, and why this mechanism costs no HA availability.** A
+    persistence failure degrades MONOTONICITY, never EMISSION: the sender
+    falls back to a wall-clock epoch (still monotonic unless the clock also
+    steps backwards) and logs. That is what makes the latch safe, and it
+    buys a crisp invariant:
+
+    > a keyed heartbeat carries no epoch **iff** the peer runs a pre-#6169 build.
+
+    So **no runtime fault can make a healthy node's heartbeats unacceptable
+    to a healthy peer** — not a full disk, not a read-only `/var`, not a
+    wedged fsync. That is why the epoch needs no election/ownership
+    coupling, no eligibility advertisement and no operator override. Every
+    storage fault on either side fails OPEN: an unreadable or implausible
+    floor starts the receiver UNLATCHED and permissive, and an unwritable
+    floor still works in memory for the life of the process.
+  - **Resolution runs asynchronously** off the send path (it fsyncs, and an
+    fsync against a wedged disk would otherwise block the 100 ms send loop
+    and cause the very failover this protects against). The FIRST
+    `StartHeartbeat` waits for it with a bound (`bootEpochResolveWait`, 2 s)
+    so the opening frames already carry an epoch and a latched peer does not
+    refuse them; a timeout is safe and self-healing, costing only rejoin
+    latency. Only the first start of a process can pay that wait, so a
+    routine VRF rebind never does.
+  - **Plausibility bound — the floor is a ONE-WAY DOOR.** A latched epoch
+    rejects everything below it forever, so a bogus far-future value is a
+    permanent lockout. Only an epoch below **year 2200**
+    (`epochPlausibleMax`) may be latched: a present-day value is ~0.25x that
+    bound, `MaxUint64` is ~2.5x it (year 2554). `MaxUint64` is unreachable
+    by ordinary operation but IS reachable through a corrupt or hand-edited
+    persist file — and `nextBootEpoch` chaining from such a value would emit
+    `MaxUint64` on one boot and then REGRESS on the next (`MaxUint64+1`
+    overflows, so the wall clock wins), permanently locking this node out of
+    a peer that had latched it. It therefore refuses to chain from an
+    implausible previous value and rewrites the file with a sane one. The
+    bound is deliberately ONE-SIDED and absolute: a low epoch is permissive
+    rather than locking, so bounding below would refuse an appliance with a
+    dead RTC; and an absolute bound means a receiver whose OWN clock is
+    wrong does not start refusing a healthy peer. An implausible epoch still
+    satisfies the latch (the peer demonstrably emits epochs) but is never
+    compared against, nor stored as, the floor.
   - **Sender nonce is INCARNATION-scoped** (`Manager.heartbeatNonce`). It
     used to be per-`heartbeatSender`, so every `StartHeartbeat` minted a
     fresh session — and routine events mint them (VRF rebind, comms
@@ -353,30 +404,36 @@ peer liveness (`lastSeen`) or drive election.
     watermark. Nothing regresses on the receiver: a heartbeat restart keeps
     the session and advances the counter (admitted); a daemon restart builds
     a new `Manager` and draws a fresh session (admitted as never-seen).
-  - **No sticky "peer speaks epochs" downgrade gate — deliberate.** Such a
-    gate would close the residual that captures from a PRE-upgrade
-    incarnation still churn the ring, but two things legitimately stop a
-    healthy peer emitting epochs: a rollback to a pre-#6169 build (A/B image
-    rollback, #1930 — and mixed-version clusters are supported during any
-    rolling upgrade) and a storage fault. The gate would make this node
-    reject a LIVE peer, which the peer cannot observe or correct — it still
-    hears us so it never demotes, while we conclude it is dead and promote:
-    dual-primary. That is strictly worse than the replay it closes.
-  - **Honest residuals.** (1) Captures taken from a pre-upgrade
-    (epoch-less) incarnation still take the legacy ring path and remain
-    churnable at ≥65 recordings; closed operationally by rotating the
-    control-link PSK once both nodes run an epoch-capable build, which makes
-    every archived capture unverifiable. (2) The receiver floor is in
-    memory, so after a full daemon restart it is 0 and re-primes from the
-    first authenticated frame it accepts; if that frame is a replay AND the
-    genuine peer never speaks again, the replay is sustained. A live peer
-    repairs the floor on its next heartbeat because its epoch is strictly
-    higher. Closing (2) needs a durable RECEIVER floor, which introduces its
-    own cross-reboot self-lock and is deliberately out of scope here.
-    (3) Losing the persisted epoch AND stepping the clock back below the
-    last emitted value in the same reboot regresses the sender's epoch and
-    the peer rejects it; recovery is restarting the peer's daemon (the floor
-    is in memory). Both terms of the seed must fail together for this.
+  - **What happens on a ROLLBACK — the one legitimate latch trigger.**
+    Because a storage fault no longer stops a node emitting an epoch, the
+    only way a healthy peer goes epochless after having emitted one is a
+    deliberate rollback to a pre-#6169 build (A/B image rollback, #1930).
+    That peer IS refused: this node declares it dead and takes over, and the
+    rolled-back node cannot see that it is being refused. This is a real,
+    deliberate trade — the same one #4107's sticky `peerAuthSeen` already
+    makes for the auth trailer, made durable. It is bounded and
+    operator-visible:
+      - a cluster that has never run an epoch-capable build is never latched,
+        so a plain rolling upgrade in either direction is unaffected;
+      - the rejection logs a rate-limited, actionable warning naming the file
+        to clear (`Manager.NoteEpochDowngradeHeartbeat`);
+      - **recovery:** delete `/var/lib/xpf/ha-peer-epoch-floor` on the node
+        that is refusing, and restart `xpfd` there. It comes back unlatched
+        and accepts the rolled-back peer again. Rolling BOTH nodes back needs
+        no action beyond that on whichever node had latched.
+    If you are planning a rollback, clear the floor as part of it rather than
+    discovering the refusal during the outage.
+  - **Honest residuals.** (1) The receiver floor and latch are per-PEER and
+    per-node; a node that has genuinely never seen an epoch (brand-new
+    chassis joining an upgraded cluster) is unlatched until the peer's first
+    epoch-bearing frame arrives, so a replay landing in that window is
+    admitted until the live peer speaks. (2) Losing the persisted epoch AND
+    stepping the clock back below the last emitted value in the same reboot
+    regresses the sender's epoch; the peer then refuses it, with the same
+    clear-the-floor recovery as a rollback. Both terms of the seed must fail
+    together for this. (3) Rotating the control-link PSK changes the
+    key-derived marker but NOT the persisted floor; the floor stays valid
+    because it is a per-peer counter, not key material.
   - **No clone/bake requirement** (unlike the SNMPv3 engine-id, `pkg/snmp`).
     Epochs are compared per-PEER, never between the two nodes, so two chassis
     cloned from one image may hold identical persisted values harmlessly; and
@@ -412,14 +469,12 @@ peer liveness (`lastSeen`) or drive election.
   restart window (a VRF-rebind restart retries the bind for up to ~5 s)
   and an unsigned fabric RPC was accepted from a peer already known to
   hold the key. It now reads the process-lifetime state.
-  **Residual, unchanged by #5086 and only partly closed by #6169:** the
-  state is in memory, so a full daemon restart or reboot still starts with
-  an empty tracker AND a zero epoch floor, and a captured run replays
-  against the restarted node. #6169's sender-side epoch means a LIVE peer
-  repairs the floor with its next heartbeat (its epoch is strictly higher
-  than any capture), so the window is bounded by the peer speaking; it is
-  only sustained if the genuine peer never speaks again. Fully closing it
-  needs a DURABLE receiver floor — see the boot-epoch residuals above.
+  **Closed by #6169 for a keyed cluster:** the session ring is still in
+  memory, so a full daemon restart starts with an empty ring — but the
+  boot-epoch floor and its downgrade latch are DURABLE, so the restarted
+  node still refuses both a retired incarnation (below the restored floor)
+  and an epochless pre-upgrade capture (the latch). The ring no longer has
+  to carry that case alone.
 - **Dual-accept (rolling upgrade), `heartbeatAuthDecision`.** Mirrors
   the #4126 VRRP-checksum dual-accept migration:
   - No local key → accept everything (this node cannot verify; may be
@@ -831,14 +886,14 @@ Procedure:
 
 Rotation is also the **anti-replay capture-invalidation** step. Every archived
 capture an on-link sniffer holds was signed under the old key, so after a
-rotation none of it verifies. That is what closes the #6169 residual for
-frames captured from a PRE-upgrade (epoch-less) incarnation, which otherwise
-still take the legacy session-ring path and stay churnable at ≥65 recordings.
-Rotate once both nodes are known to be running an epoch-capable build.
-Note also that the boot-epoch marker is key-derived
-(`HMAC(PSK, "xpf-ha-boot-epoch-v1")[:8]`), so it changes with the key
-automatically — no separate rollout step, and the restart in step 3 re-primes
-each node's in-memory epoch floor.
+rotation none of it verifies. #6169's downgrade latch already refuses replayed
+pre-upgrade (epoch-less) captures, so this is defence in depth rather than the
+primary close — but it is what retires an attacker's whole archive at once.
+The boot-epoch marker is key-derived (`HMAC(PSK, "xpf-ha-boot-epoch-v1")[:8]`),
+so it changes with the key automatically — no separate rollout step. The
+restart in step 3 does NOT reset the epoch floor: it is persisted at
+`/var/lib/xpf/ha-peer-epoch-floor` and is a per-peer counter, not key
+material, so it stays valid across a rotation.
 
 Do **not** try to "return to dual-accept" by clearing the key first: an
 unkeyed `chassis cluster` is exactly what the commit gate rejects, so that
