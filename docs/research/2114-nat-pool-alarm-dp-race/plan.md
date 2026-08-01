@@ -1,11 +1,9 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v61 — r60 findings folded (Codex NEEDS-REVISION
-  7M/4m; AGY NEEDS-REVISION 3M/1m; Claude SMR
-  PLAN-READY-WITH-NITS 0M/2m — the two-counter relationship IS
-  part of Codex M3, the in-flight retoken rule IS Codex M5;
-  all three confirm the §4.7 structure); pending convergence
-  review r61
+- **Status**: DRAFT v62 — r61 findings folded (Codex NEEDS-REVISION
+  5M/3m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m
+  — the alias-collapse pin, IS Codex M4; all three confirm
+  the §4.7 structure); pending convergence review r62
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -2761,6 +2759,58 @@
   residual reference aligns to the (vi) withdrawal (Codex m3);
   and the §5.1 inventory gains `daemon_apply.go` for the
   QUEUED wrappers (Codex m4).
+  v62: r61 convergence — the acceptance copy gains the full
+  actuated predicate, the callback join gets its admission
+  gate, the predicate gains the queued-empty term with the
+  identity ordering, the aliases collapse at supersession,
+  and the ledger nesting gets its canonical order (Codex
+  NEEDS-REVISION 5M/3m, folds 2 FOLDED / 3 PARTIAL /
+  2 NOT-FOLDED, structure confirmed; AGY PLAN-READY 7/7 with
+  3 fresh attacks FAILED — including its own alias-collapse
+  analysis matching the pin — structure confirmed; SMR
+  PLAN-READY-WITH-NITS 0M/1m — the alias-collapse pin, IS
+  Codex M4): (a) THE ACCEPTANCE COPY CARRIES THE MULTI-TERM
+  ACTUATED PREDICATE (Codex M1 — the formal acceptance had
+  only "one election primary" plus an undefined generic
+  authority check): exactly one rg_active, exactly one VRRP
+  MASTER where applicable, both on the intended node, the
+  loser explicitly inactive, read per-node. (b) THE CALLBACK
+  JOIN'S LIFECYCLE PROTOCOL (Codex M2, verified: a WaitGroup
+  Add from the detached firing path can race shutdown's Wait,
+  `maps_sync.go:451-456`, `daemon_run.go:115-119`, and a
+  timed-out join would let non-contextual netlink operations
+  overlap the teardown, `daemon_ha_fabric.go:23-93,102-148`):
+  a closed/admission gate atomically reserves in-flight work
+  BEFORE launch under the debt-ledger lock (admission closed
+  ⇒ never launches; open ⇒ reserves before launch); the
+  shutdown closes admission FIRST, then joins the reserved
+  set; the 5s bound is the disposition, with a callback past
+  the join abandoning at each fence check. (c) THE
+  QUEUED-EMPTY TERM + THE IDENTITY ORDERING (Codex M3): the
+  predicate gains "no QUEUED reservation outstanding" (the
+  queued set empty, rendered beside the pending set), and the
+  identity ordering is defined — the enqueue-reservation
+  sequence is the canonical order and the admission token
+  INHERITS its reservation's position. (d) THE ALIAS COLLAPSE
+  (Codex M4 = SMR m1, verified the transitivity gap with
+  indefinitely-live retry debt,
+  `manager_worker_arm_5134.go:38-96`): every outstanding alias
+  is rewritten to the NEW current token at each supersession
+  — resolution is always one step and no chain accumulates.
+  (e) THE CANONICAL NESTING ORDER (Codex M5, verified the
+  contradiction: the OnXSKBound decision/flag/launch happen
+  under `m.mu` today, `maps_sync.go:353,451-456`, and
+  `pendingHAStateClear` registration depends on `m.mu`-held
+  cluster state and IPC outcomes, `manager_ha.go:78-112,
+  139-150`): the readiness decision + flag + registration +
+  launch form ONE section taken as `m.mu` THEN ledger lock —
+  the canonical nesting — with the reverse forbidden and the
+  ledger lock never held across IPC. (f) The minors: the
+  aggregation gains `LinkDel` (m1 — discarded today,
+  `daemon_ha_fabric.go:52-53`); §9 gains the HA-clear-debt
+  legs (m2); and the 120s figure is corrected to the 3s
+  small-request deadline / ~67s maximum-snapshot figures (m3,
+  `process_control.go:31-56,85-103,129-142`).
 
 ---
 
@@ -6675,13 +6725,25 @@ v20 history). The delivery is TWO units:
   DEBT-LEDGER LOCK (r60 Codex M6, verified the contradiction:
   serializing through `m.mu` collides with the short-held
   ledger rule — the status loop holds `m.mu` across
-  `requestLocked`, whose round trip can block for 120s,
-  `process_status.go:160-167`,
-  `process_control.go:52-56,129-142`): the debt-ledger lock is
+  `requestLocked`, whose round trip is bounded by the
+  three-second small-request deadline (corrected per r61
+  Codex m3 — not 120s; the maximum applies to a 64-MiB
+  apply_snapshot at roughly 67s under the current cap/formula,
+  `process_control.go:31-56,85-103,129-142`): the debt-ledger
+  lock is
   never held across control-socket IPC (the status loop takes
   it briefly for debt mutations only), and the lock order is
-  applySem → ledger lock, with `m.mu` never nested with the
-  ledger lock, so
+  applySem → ledger lock, with the ONE permitted nesting being
+  `m.mu` → ledger lock for the decision-registration section
+  (r61 Codex M5, verified the contradiction: the OnXSKBound
+  readiness decision, one-shot flag, and launch happen under
+  `m.mu` today, `maps_sync.go:353,451-456`, and the
+  `pendingHAStateClear` registration/retirement depends on
+  `m.mu`-protected cluster state and IPC outcomes,
+  `manager_ha.go:78-112,139-150`): the readiness decision +
+  flag + registration + launch form ONE section taken as
+  `m.mu` THEN ledger lock — the canonical nesting order —
+  with the reverse nesting forbidden, so
   no registration can interleave between the debt snapshot
   and the supersession — the transaction is part of the plan,
   and the re-registration is TOTAL — every live manager debt
@@ -6695,7 +6757,15 @@ v20 history). The delivery is TWO units:
   ignore the completion and pend B forever): a carried-forward
   registration records the ALIAS (old-token, arm-ID) →
   (new-token, arm-ID), and a completion for the aliased old
-  identity retires the carried registration — so an in-flight
+  identity retires the carried registration — with the alias
+  map COLLAPSED AT EACH SUPERSESSION (r61 Codex M4 + r61 SMR
+  m1, verified the transitivity gap: after A→B and B→C a
+  completion carrying A must resolve through two aliases, and
+  retry debt can remain live indefinitely,
+  `manager_worker_arm_5134.go:38-96`): every outstanding alias
+  is rewritten to the NEW current token at each supersession,
+  so resolution is always one step and no chain accumulates —
+  so an in-flight
   arm's completion is never lost across a supersession;
   the signal reads CONVERGED
   only when the pipeline AND every arm's completion carry the
@@ -6869,7 +6939,8 @@ v20 history). The delivery is TWO units:
   the OnXSKBound closure's fire-time re-derivation under
   applySem with the full-fence re-checks, and
   `ensureFabricIPVLAN`'s failures becoming returned/aggregated
-  errors with the existing-link KIND check
+  errors (including `LinkDel`, r61 Codex m1) with the
+  existing-link type+mode check
   (`daemon_ha_fabric.go:29-53,72-93,102-148`).
 - `pkg/dataplane/userspace` (r56 Codex M7's inventory
   completion): the attempt-token threading through the
@@ -6917,7 +6988,21 @@ v20 history). The delivery is TWO units:
   after any check, with shutdown proceeding after its bounded
   drain, `daemon_run_shutdown.go:50-64,214-230` — repeated
   atomic loads cannot establish never-mutating): the callback
-  is included in the shutdown's JOIN SET (the teardown waits
+  is included in the shutdown's JOIN SET with the lifecycle
+  protocol PINNED (r61 Codex M2, verified: a WaitGroup Add
+  from the detached firing path can race shutdown's Wait —
+  `maps_sync.go:451-456`, `daemon_run.go:115-119` — and a
+  timed-out join would let non-contextual netlink operations
+  overlap the teardown, `daemon_ha_fabric.go:23-93,102-148`):
+  a closed/admission gate atomically reserves in-flight work
+  BEFORE launch (under the debt-ledger lock: admission closed
+  ⇒ the callback never launches; admission open ⇒ the
+  registration reserves before launch), the shutdown closes
+  admission FIRST and then joins the reserved set, and the
+  join's 5s bound is the disposition — a callback still
+  in-flight past the bound hits the full fence
+  (`runCtx.Err()` OR `stopping`) at each mutation and
+  abandons — the teardown waits
   for in-flight callbacks before the dataplane teardown; the
   callback's body is bounded netlink work, and the 5s bound
   remains the safety net),
@@ -6930,8 +7015,12 @@ v20 history). The delivery is TWO units:
   ParentIndex matches, `daemon_ha_fabric.go:29-53,72-93,
   102-148`): every operation's failure is RETURNED and
   aggregated (`errors.Join` over the parent-up, the link
-  creation, the address reconciliation, and the MTU/up
-  operations), the existing-link acceptance gains the KIND
+  creation, the address reconciliation, the MTU/up
+  operations, AND the mismatched-link deletion — `LinkDel`'s
+  error is discarded today, `daemon_ha_fabric.go:52-53`, so a
+  failed delete must fail the arm rather than leave the
+  mismatched link, r61 Codex m1), the existing-link
+  acceptance gains the KIND
   **and MODE** check (r60 Codex M7, verified: the desired link
   is specifically IPVLAN_MODE_L2, `daemon_ha_fabric.go:56-62`
   — a same-parent IPVLAN in L3/L3S mode has the right kind
@@ -8277,10 +8366,16 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      the candidate explicitly discarded) on BOTH nodes (r46
      Codex M2b — `store_commit.go:796-800`,
      `store_lock.go:334-338`, `store_command.go:304-334`) —
-     AND the RG0 election SETTLED with exactly ONE primary
-     matching the intended mastership (r58 Codex M1's
-     dual-primary live-forwarding false green,
-     `daemon_ha.go:273-325`, `daemon_ha_sync.go:545-548`) —
+     AND the MULTI-TERM ACTUATED authority predicate
+     (r61 Codex M1's acceptance alignment): exactly one node
+     with RG0 rg_active, exactly one VRRP MASTER where a
+     VRRP-backed RG applies, BOTH on the intended node, and
+     the loser EXPLICITLY INACTIVE — read PER-NODE on each
+     node's OWN status surface (RG0 normally has no VRRP
+     instance, `vrrp/manager.go:929-936`; a failed SetRGActive
+     can leave the loser ACTIVE+BACKUP while the winner is
+     ACTIVE+MASTER, `rg_state.go:250-263`,
+     `daemon_ha.go:340-371,809-848`) —
      before the repair is declared
      done; and the residual enumeration includes the r58
      hybrid residuals (iv)-(v) per the normative fence
@@ -8450,6 +8545,12 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      can no longer combine text A with ActiveApplied(B) —
      exercised with the high-water advance assertion
      (`sync_conn_config.go:319-324,390-395`);
+     (h2l) the HA-CLEAR-DEBT legs (r61 Codex m2): the
+     `pendingHAStateClear` debt's registration, supersession,
+     alias completion, and ledger serialization (the existing
+     tests cover only the boolean debt/retry behavior,
+     `hastate_clear_debt_5487_test.go:15-112`,
+     `manager_ha_clear_debt_5873_test.go:32-112`);
      (h2g) the ATTEMPT-TOKEN legs (r52 Codex M2/M3): an OLD
      arm's completion arriving during a NEWER apply cannot
      stamp converged (the token mismatch), exercised across the
