@@ -327,3 +327,365 @@ func TestChassisIPMonitoringFullyPacked_6588(t *testing.T) {
 		}
 	})
 }
+
+// ---------------------------------------------------------------------------
+// #6588 review round 2 — three MAJORs found inside the code this PR touched.
+// ---------------------------------------------------------------------------
+
+// compileMonitorTextErr is compileMonitorText's counterpart for configs that
+// must be REJECTED at strict commit.
+func compileMonitorTextErr(t *testing.T, text string) error {
+	t.Helper()
+	p := NewParser(text)
+	tree, perrs := p.Parse()
+	if len(perrs) > 0 {
+		t.Fatalf("parse: %v", perrs)
+	}
+	_, err := CompileConfig(tree)
+	return err
+}
+
+func flatMonitorTree(t *testing.T, extra ...string) *ConfigTree {
+	t.Helper()
+	return buildTree(t, append([]string{
+		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key test-cluster-psk-6588",
+		"set chassis cluster redundancy-group 1 node 0 priority 200",
+	}, extra...))
+}
+
+// MAJOR 1 -------------------------------------------------------------------
+
+// TestChassisIPMonitoringWeightRangeGated_6588 pins that the ip-monitoring
+// weights are range-gated in ALL THREE spellings.
+//
+// #6549 deliberately left these to their typed schema leaves
+// (ValidateInteger(0,255)) instead of the compiled-int gate it added for
+// interface-monitor. That was sound while the packed spelling compiled to
+// nothing — but SchemaValidate walks the AST from setSchema and a packed
+// statement sits BELOW the depth it reaches (pinned by
+// TestChassisPackedShapeBypassesSchemaWalk_6588), so once #6588 made the packed
+// shape compile, an out-of-range packed weight would have reached the runtime
+// with no commit-side gate on any path. The gate now lives on the compiled int
+// beside its interface-monitor sibling, which is the only layer all three
+// spellings pass through.
+func TestChassisIPMonitoringWeightRangeGated_6588(t *testing.T) {
+	for _, bad := range []struct {
+		what  string
+		want  string
+		flat  string
+		cont  string
+		packd string
+	}{
+		{
+			what: "global-weight", want: "global-weight 300 is out of range 0..255",
+			flat: "set chassis cluster redundancy-group 1 ip-monitoring global-weight 300",
+			cont: "            ip-monitoring {\n                global-weight 300;\n            }",
+			packd: "            ip-monitoring global-weight 300;",
+		},
+		{
+			what: "global-threshold", want: "global-threshold 256 is out of range 0..255",
+			flat: "set chassis cluster redundancy-group 1 ip-monitoring global-threshold 256",
+			cont: "            ip-monitoring {\n                global-threshold 256;\n            }",
+			packd: "            ip-monitoring global-threshold 256;",
+		},
+		{
+			what: "target weight", want: "family inet 10.0.1.1 weight -100 is out of range 0..255",
+			flat: "set chassis cluster redundancy-group 1 ip-monitoring family inet 10.0.1.1 weight -100",
+			cont: "            ip-monitoring {\n                family {\n                    inet {\n                        10.0.1.1 weight -100;\n                    }\n                }\n            }",
+			packd: "            ip-monitoring family inet 10.0.1.1 weight -100;",
+		},
+	} {
+		t.Run(bad.what+"/FlatSet", func(t *testing.T) {
+			_, err := CompileConfig(flatMonitorTree(t, bad.flat))
+			assertErrContains(t, err, bad.want)
+		})
+		t.Run(bad.what+"/ContainerHierarchical", func(t *testing.T) {
+			assertErrContains(t, compileMonitorTextErr(t, packedMonitorConfig(bad.cont)), bad.want)
+		})
+		t.Run(bad.what+"/Packed", func(t *testing.T) {
+			assertErrContains(t, compileMonitorTextErr(t, packedMonitorConfig(bad.packd)), bad.want)
+		})
+	}
+}
+
+// TestChassisIPMonitoringInRangeStillCommits_6588 is the MAJOR-1 negative
+// control: every legal ip-monitoring value, including both boundaries, must
+// still commit AND compile verbatim. It passes with and without the gate.
+func TestChassisIPMonitoringInRangeStillCommits_6588(t *testing.T) {
+	for _, w := range []int{0, 1, 128, 254, 255} {
+		t.Run(fmt.Sprintf("weight_%d", w), func(t *testing.T) {
+			rg := compileMonitorText(t, packedMonitorConfig(fmt.Sprintf(
+				"            ip-monitoring {\n"+
+					"                global-weight %d;\n"+
+					"                global-threshold %d;\n"+
+					"                family inet {\n"+
+					"                    10.0.1.1 weight %d;\n"+
+					"                }\n"+
+					"            }", w, w, w)))
+			if rg.IPMonitoring == nil {
+				t.Fatal("redundancy group carries no compiled ip-monitoring")
+			}
+			if rg.IPMonitoring.GlobalWeight != w || rg.IPMonitoring.GlobalThreshold != w {
+				t.Fatalf("global-weight/threshold = %d/%d, want %d/%d (the gate must not alter an in-range value)",
+					rg.IPMonitoring.GlobalWeight, rg.IPMonitoring.GlobalThreshold, w, w)
+			}
+			if len(rg.IPMonitoring.Targets) != 1 || rg.IPMonitoring.Targets[0].Weight != w {
+				t.Fatalf("targets = %+v, want one target with weight %d", rg.IPMonitoring.Targets, w)
+			}
+		})
+	}
+}
+
+// TestChassisPackedShapeBypassesSchemaWalk_6588 is the load-bearing evidence
+// for WHERE the MAJOR-1 gate had to go: the typed-leaf gate cannot see a packed
+// statement, so a schema validator can never cover it. SchemaValidate accepts
+// an ip-monitoring weight the compiled-int gate rejects.
+func TestChassisPackedShapeBypassesSchemaWalk_6588(t *testing.T) {
+	p := NewParser(packedMonitorConfig("            ip-monitoring family inet 10.0.1.1 weight -100;"))
+	tree, perrs := p.Parse()
+	if len(perrs) > 0 {
+		t.Fatalf("parse: %v", perrs)
+	}
+	if err := SchemaValidate(tree, nil); err != nil {
+		t.Fatalf("SchemaValidate unexpectedly saw the packed statement (%v) — if the typed "+
+			"leaf now reaches it, the compiled-int gate's rationale needs revisiting", err)
+	}
+	if _, err := CompileConfig(tree); err == nil {
+		t.Fatal("the compiled-int gate must reject what SchemaValidate cannot see")
+	}
+}
+
+// MAJOR 2 -------------------------------------------------------------------
+
+// TestChassisInterfaceMonitorBracketList_6588 pins the #2419 bracketed-list
+// collapse for monitors. The lexer strips `[`/`]`, so
+// `interface-monitor [ ge-0/0/0 ge-0/0/1 ge-0/0/2 ]` lands as N names on ONE
+// node's Keys in EVERY spelling. Compiling only the first name is the same
+// failover fail-open as dropping the statement, one monitor at a time.
+func TestChassisInterfaceMonitorBracketList_6588(t *testing.T) {
+	want := []string{"ge-0/0/0", "ge-0/0/1", "ge-0/0/2"}
+
+	t.Run("FlatSet", func(t *testing.T) {
+		cfg, err := CompileConfig(flatMonitorTree(t,
+			"set chassis cluster redundancy-group 1 interface-monitor [ ge-0/0/0 ge-0/0/1 ge-0/0/2 ]"))
+		if err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+		assertMonitorNames(t, onlyRG6588(t, cfg), want)
+	})
+	t.Run("ContainerHierarchical", func(t *testing.T) {
+		assertMonitorNames(t, compileMonitorText(t, packedMonitorConfig(
+			"            interface-monitor {\n                [ ge-0/0/0 ge-0/0/1 ge-0/0/2 ];\n            }")), want)
+	})
+	t.Run("Packed", func(t *testing.T) {
+		assertMonitorNames(t, compileMonitorText(t, packedMonitorConfig(
+			"            interface-monitor [ ge-0/0/0 ge-0/0/1 ge-0/0/2 ];")), want)
+	})
+	// A weight-less bracketed list must still yield one monitor per name.
+	t.Run("PackedNoWeight", func(t *testing.T) {
+		assertMonitorNames(t, compileMonitorText(t, packedMonitorConfig(
+			"            interface-monitor [ ge-0/0/0 ge-0/0/1 ];")), []string{"ge-0/0/0", "ge-0/0/1"})
+	})
+}
+
+// TestChassisIPMonitoringBracketTargets_6588 covers the same collapse on the
+// ip-monitoring target list.
+func TestChassisIPMonitoringBracketTargets_6588(t *testing.T) {
+	rg := compileMonitorText(t, packedMonitorConfig(
+		"            ip-monitoring family inet [ 10.0.1.1 10.0.2.1 10.0.3.1 ];"))
+	if rg.IPMonitoring == nil {
+		t.Fatal("redundancy group carries no compiled ip-monitoring")
+	}
+	var got []string
+	for _, tg := range rg.IPMonitoring.Targets {
+		got = append(got, tg.Address)
+	}
+	want := []string{"10.0.1.1", "10.0.2.1", "10.0.3.1"}
+	if len(got) != len(want) {
+		t.Fatalf("ip-monitoring targets = %v, want %v — a bracketed list must compile to one "+
+			"target per address", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ip-monitoring targets = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestChassisInterfaceMonitorSingleEntryNotSplit_6588 is the MAJOR-2 negative
+// control the review asked for: a single NON-bracketed packed monitor must
+// still compile to exactly ONE entry, with its weight intact. The splitter must
+// not shred `ge-0/0/0 weight 255` into an entry per token. Passes with and
+// without the split.
+func TestChassisInterfaceMonitorSingleEntryNotSplit_6588(t *testing.T) {
+	t.Run("PackedWithWeight", func(t *testing.T) {
+		assertSingleMonitor(t, compileMonitorText(t, packedMonitorConfig(
+			"            interface-monitor ge-0/0/0 weight 255;")), "ge-0/0/0", 255)
+	})
+	t.Run("ContainerWithWeight", func(t *testing.T) {
+		assertSingleMonitor(t, compileMonitorText(t, packedMonitorConfig(
+			"            interface-monitor {\n                ge-0/0/0 weight 255;\n            }")), "ge-0/0/0", 255)
+	})
+	t.Run("PackedNestedWeightBlock", func(t *testing.T) {
+		assertSingleMonitor(t, compileMonitorText(t, packedMonitorConfig(
+			"            interface-monitor ge-0/0/0 {\n                weight 255;\n            }")), "ge-0/0/0", 255)
+	})
+	t.Run("FlatSetWithWeight", func(t *testing.T) {
+		cfg, err := CompileConfig(flatMonitorTree(t,
+			"set chassis cluster redundancy-group 1 interface-monitor ge-0/0/0 weight 255"))
+		if err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+		assertSingleMonitor(t, onlyRG6588(t, cfg), "ge-0/0/0", 255)
+	})
+	t.Run("SingleIPMonitorTarget", func(t *testing.T) {
+		rg := compileMonitorText(t, packedMonitorConfig(
+			"            ip-monitoring family inet 10.0.1.1 weight 100;"))
+		if rg.IPMonitoring == nil || len(rg.IPMonitoring.Targets) != 1 {
+			t.Fatalf("expected exactly 1 ip-monitoring target, got %+v", rg.IPMonitoring)
+		}
+		if got := rg.IPMonitoring.Targets[0]; got.Address != "10.0.1.1" || got.Weight != 100 {
+			t.Fatalf("target = %s weight %d, want 10.0.1.1 weight 100", got.Address, got.Weight)
+		}
+	})
+}
+
+// MAJOR 4 -------------------------------------------------------------------
+
+// TestChassisMonitorWeightMalformedRejected_6588 pins that a weight which is
+// PRESENT but not an integer is rejected at commit in every spelling. Before
+// the gate it compiled to the 0 default: the operator configured link tracking,
+// commit succeeded, and the monitor going down deducted NOTHING — the same
+// silent-nothing class as the packed-statement drop this PR fixes. The compiled
+// struct cannot express it (a failed Atoi is indistinguishable from `weight 0`),
+// so the check runs on the AST.
+func TestChassisMonitorWeightMalformedRejected_6588(t *testing.T) {
+	const want = `weight "nope" is not an integer`
+
+	t.Run("InterfaceMonitor/FlatSet", func(t *testing.T) {
+		_, err := CompileConfig(flatMonitorTree(t,
+			"set chassis cluster redundancy-group 1 interface-monitor ge-0/0/0 weight nope"))
+		assertErrContains(t, err, want)
+	})
+	t.Run("InterfaceMonitor/ContainerHierarchical", func(t *testing.T) {
+		assertErrContains(t, compileMonitorTextErr(t, packedMonitorConfig(
+			"            interface-monitor {\n                ge-0/0/0 weight nope;\n            }")), want)
+	})
+	t.Run("InterfaceMonitor/Packed", func(t *testing.T) {
+		assertErrContains(t, compileMonitorTextErr(t, packedMonitorConfig(
+			"            interface-monitor ge-0/0/0 weight nope;")), want)
+	})
+	t.Run("InterfaceMonitor/PackedNestedWeightBlock", func(t *testing.T) {
+		assertErrContains(t, compileMonitorTextErr(t, packedMonitorConfig(
+			"            interface-monitor ge-0/0/0 {\n                weight nope;\n            }")), want)
+	})
+	t.Run("InterfaceMonitor/WeightWithNoValue", func(t *testing.T) {
+		assertErrContains(t, compileMonitorTextErr(t, packedMonitorConfig(
+			"            interface-monitor ge-0/0/0 weight;")), `weight "" is not an integer`)
+	})
+	t.Run("IPMonitoringTarget/Packed", func(t *testing.T) {
+		assertErrContains(t, compileMonitorTextErr(t, packedMonitorConfig(
+			"            ip-monitoring family inet 10.0.1.1 weight nope;")), want)
+	})
+	t.Run("IPMonitoringTarget/ContainerHierarchical", func(t *testing.T) {
+		assertErrContains(t, compileMonitorTextErr(t, packedMonitorConfig(
+			"            ip-monitoring {\n                family inet {\n                    10.0.1.1 weight nope;\n                }\n            }")), want)
+	})
+}
+
+// TestChassisMonitorWeightMalformedTolerantNoBrick_6588 pins the #1960 posture:
+// an already-persisted or peer-synced config carrying a malformed weight must
+// still BOOT, with a warning.
+func TestChassisMonitorWeightMalformedTolerantNoBrick_6588(t *testing.T) {
+	p := NewParser(packedMonitorConfig("            interface-monitor ge-0/0/0 weight nope;"))
+	tree, perrs := p.Parse()
+	if len(perrs) > 0 {
+		t.Fatalf("parse: %v", perrs)
+	}
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("lenient compile must not reject a malformed monitor weight (no-brick), got %v", err)
+	}
+	if !warningsContain(cfg.Warnings, `weight "nope" is not an integer`) {
+		t.Fatalf("lenient compile should have warned; warnings=%v", cfg.Warnings)
+	}
+	// The monitor itself still compiles, with the documented 0 default.
+	assertSingleMonitor(t, onlyRG6588(t, cfg), "ge-0/0/0", 0)
+}
+
+// TestChassisMonitorWeightValidStillCommits_6588 is the MAJOR-4 negative
+// control: a well-formed weight — and a monitor with no weight at all, the
+// documented 0 default from #6549 — must still commit. Passes with and without
+// the gate.
+func TestChassisMonitorWeightValidStillCommits_6588(t *testing.T) {
+	for _, w := range []int{0, 1, 128, 255} {
+		t.Run(fmt.Sprintf("weight_%d", w), func(t *testing.T) {
+			assertSingleMonitor(t, compileMonitorText(t, packedMonitorConfig(fmt.Sprintf(
+				"            interface-monitor ge-0/0/0 weight %d;", w))), "ge-0/0/0", w)
+		})
+	}
+	t.Run("NoWeightAtAll", func(t *testing.T) {
+		assertSingleMonitor(t, compileMonitorText(t, packedMonitorConfig(
+			"            interface-monitor ge-0/0/0;")), "ge-0/0/0", 0)
+	})
+}
+
+// Duplicates ----------------------------------------------------------------
+
+// TestChassisMonitorWeightDuplicateRejected_6588 pins that a duplicate weight
+// is rejected rather than resolved differently per spelling. Before the gate,
+// `weight 100 weight 200` inline compiled to 200 (the inline scan overwrote)
+// while `{ weight 100; weight 200; }` compiled to 100 (FindChild returns the
+// first) — the answer depended on how the operator happened to write it.
+func TestChassisMonitorWeightDuplicateRejected_6588(t *testing.T) {
+	const want = "weight specified 2 times with different values"
+
+	t.Run("InlineTail", func(t *testing.T) {
+		assertErrContains(t, compileMonitorTextErr(t, packedMonitorConfig(
+			"            interface-monitor ge-0/0/0 weight 100 weight 200;")), want)
+	})
+	t.Run("NestedBlock", func(t *testing.T) {
+		assertErrContains(t, compileMonitorTextErr(t, packedMonitorConfig(
+			"            interface-monitor ge-0/0/0 {\n                weight 100;\n                weight 200;\n            }")), want)
+	})
+	t.Run("InlineAndNested", func(t *testing.T) {
+		assertErrContains(t, compileMonitorTextErr(t, packedMonitorConfig(
+			"            interface-monitor ge-0/0/0 weight 100 {\n                weight 200;\n            }")), want)
+	})
+	t.Run("IdenticalRepeat", func(t *testing.T) {
+		// Same value twice is still ambiguous authoring, but the message must
+		// not claim a value conflict that does not exist.
+		err := compileMonitorTextErr(t, packedMonitorConfig(
+			"            interface-monitor ge-0/0/0 weight 100 weight 100;"))
+		assertErrContains(t, err, "weight specified 2 times")
+		if err != nil && strings.Contains(err.Error(), "different values") {
+			t.Fatalf("error %q claims differing values for an identical repeat", err)
+		}
+	})
+}
+
+func assertErrContains(t *testing.T, err error, want string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected commit to be rejected with %q, got nil error", want)
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("error %q does not contain %q", err, want)
+	}
+}
+
+func assertMonitorNames(t *testing.T, rg *RedundancyGroup, want []string) {
+	t.Helper()
+	if len(rg.InterfaceMonitors) != len(want) {
+		t.Fatalf("expected %d interface-monitors %v, got %d: %s — a bracketed list must "+
+			"compile to one monitor per name, not one monitor for the first name",
+			len(want), want, len(rg.InterfaceMonitors), describeMonitors(rg.InterfaceMonitors))
+	}
+	for i, w := range want {
+		if rg.InterfaceMonitors[i].Interface != w {
+			t.Fatalf("monitor[%d] = %q, want %q (got %s)",
+				i, rg.InterfaceMonitors[i].Interface, w, describeMonitors(rg.InterfaceMonitors))
+		}
+	}
+}

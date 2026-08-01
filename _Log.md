@@ -1,3 +1,60 @@
+## 2026-08-01 — #6588 round 2: three MAJORs inside the round-1 fix
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
+- **Action**: Hostile review returned DO-NOT-MERGE with three MAJORs, all
+  inside the code round 1 touched. Each premise was re-verified by direct
+  compile before writing, and one needed correcting.
+  (MAJOR 1) ip-monitoring 0..255 was ungated for the PACKED spelling. The
+  review framed it as "the packed path bypasses the validation the container
+  path gets"; direct compile shows the real shape is narrower and the fix is
+  wider — `SchemaValidate` is called from pkg/configstore, not CompileConfig,
+  and it walks setSchema, so the PACKED statement sits below the depth it
+  reaches for BOTH ip-monitoring and interface-monitor. The typed leaf covers
+  flat-set and container; nothing covered packed. Harmless while packed
+  compiled to nothing — but round 1 made it compile. Fix: extend the #6549
+  compiled-int gate in validateChassisClusterStrict to global-weight,
+  global-threshold and per-target weight, the one layer all three spellings
+  pass through. Pinned that reasoning with a test asserting SchemaValidate
+  returns nil for a config the compiled-int gate rejects.
+  (MAJOR 2) A bracketed `interface-monitor [ a b c ]` compiled ONE monitor.
+  Confirmed pre-existing in ALL THREE spellings, not introduced by round 1 —
+  the lexer strips the brackets (#2419) so N names land on one node's Keys
+  everywhere. The round-1 helper synthesised exactly one entry from the tail,
+  so it inherited the drop. Replaced with monitorEntryNodes, which splits each
+  candidate's Keys at entry boundaries with a reserved value slot after
+  `weight` (the #6524 rule). Kept the EITHER/OR tail-vs-children rule for
+  entry lists — accumulating there mints a monitor for an interface literally
+  named `weight` — and added packedStatementProps for the ip-monitoring
+  property body, where the two ARE siblings.
+  (MAJOR 4) `weight nope` committed clean with Weight=0, so the monitor
+  deducted nothing on link-down. The compiled struct cannot express it (a
+  failed Atoi is indistinguishable from `weight 0`), so this is a new AST gate,
+  validateMonitorWeightTokensAST, deriving its entries from the same readers
+  the compiler uses. Strict at commit, warn on the tolerant path
+  (lenientChassisMonitorWeight, #1960 no-brick).
+  Duplicates were shape-dependent (`weight 100 weight 200` inline -> 200;
+  `{ weight 100; weight 200; }` -> 100). The compiler is now uniformly
+  first-wins via monitorWeightTokens and the gate rejects the duplicate, so the
+  answer no longer depends on spelling.
+- **Validation**: three separate mutation proofs, each with build+vet CLEAN
+  first so the red is an assertion. (A) drop the ip-monitoring range block ->
+  2 top-level FAILs, both MAJOR-1 tests; in-range control GREEN. (B) make
+  monitorEntryNodes return the candidate unsplit -> 2 FAILs, both bracket
+  tests; the single-non-bracketed-entry control GREEN in full. (C) unwire the
+  weight gate from runPreWalkGates -> 3 FAILs (malformed, tolerant-warn,
+  duplicate); the valid-weight control GREEN. Restored: build+vet clean,
+  `go test ./...` exit 0 across 59 packages, 69 passing 6588 subtests.
+- **Scope refused**: the review also enumerated 14 other one-sided arms across
+  pkg/config with the same nodeVal root cause. Left alone and filed separately
+  by the reviewer — #6658 stays about redundancy-group monitors.
+- **File(s)**: `pkg/config/compiler_system.go`,
+  `pkg/config/compiler_chassis_monitor_weight.go` (new),
+  `pkg/config/compiler_validate_strict_chassis.go`,
+  `pkg/config/compiler_prewalk.go`, `pkg/config/compiler_opts.go`,
+  `pkg/config/schema_chassis.go` (stale comment),
+  `pkg/config/compiler_chassis_packed_monitor_6588_test.go`,
+  `docs/config-schema.md`, `_Log.md`
+
 ## 2026-08-01 — #6588 config/cluster: packed interface-monitor / ip-monitoring compiled to nothing
 
 - **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf)

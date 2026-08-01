@@ -1177,9 +1177,55 @@ Consequences worth knowing when adding a reader:
   route is required"), so the operator is told rather than left with a silent
   no-op.
 
+**The two collapses COMPOSE, and a monitor statement hits both.** The packed
+collapse above is orthogonal to the `#2419` bracket collapse at the top of this
+section, and `interface-monitor` is subject to each independently:
+
+```
+interface-monitor [ ge-0/0/0 ge-0/0/1 ];    # PACKED *and* bracketed
+```
+
+The lexer strips the brackets, so N interface names land on ONE node's Keys — in
+the packed statement, in a hierarchical container child, and in the flat-set
+child alike. Unpacking the statement but then treating its whole tail as a
+single entry compiles the FIRST name and silently discards the rest: the same
+failover fail-open as dropping the statement, one monitor at a time. So
+`monitorEntryNodes` splits each candidate's Keys at entry boundaries — a token
+that is neither the `weight` keyword nor the value slot reserved immediately
+after it starts a new entry. The value-slot reservation is the same rule the
+#6524 application walk needs, and for the same reason: `weight` consumes exactly
+one following token even when that token spells something else.
+
+Note the two rules pull in opposite directions and both are needed:
+
+| | tail vs children | why |
+|---|---|---|
+| **entry list** (`interface-monitor`, ip-monitoring `inet` addresses) | EITHER/OR | a tail means the statement IS one entry, so children are that entry's ATTRIBUTES — accumulating mints a monitor for an interface literally named `weight` |
+| **property body** (`ip-monitoring` itself) | BOTH | properties are siblings at the same level, so a packed tail and a real block body lose nothing when combined; the tail is split only at recognized property keywords (`packedStatementProps`) so `global-weight 255` is not shredded into two |
+
+**A value that is present but UNUSABLE needs an AST gate — the compiled struct
+cannot express it.** `compileChassis` parses a monitor weight with
+`strconv.Atoi` and leaves the 0 default on failure, so by the time the
+compiled-int range gate runs, `weight nope`, `weight 0`, and no weight at all
+are indistinguishable. `interface-monitor ge-0/0/0 weight nope;` therefore
+committed clean and installed a monitor that deducts NOTHING on link-down —
+the same silent-nothing class as the dropped statement. It is rejected by
+`validateMonitorWeightTokensAST` (`compiler_chassis_monitor_weight.go`), which
+derives its entries from `monitorEntryNodes` / `monitorWeightTokens` so the gate
+and the compiler can never disagree about which token is a weight or which entry
+owns it. Strict at commit, warn on the tolerant load / peer-sync path (#1960).
+
+That gate also settles a spelling-dependent answer: a DUPLICATE weight used to
+compile to 200 inline (`weight 100 weight 200` — the inline scan overwrote) but
+to 100 in a block (`{ weight 100; weight 200; }` — `FindChild` returns the
+first). The compiler is now uniformly first-wins via `monitorWeightTokens`, and
+a duplicate is rejected outright, so no operator is relying on which form they
+happened to write.
+
 Covered by `pkg/config/compiler_chassis_packed_monitor_6588_test.go`, which
-pins all three interface-monitor spellings against each other and keeps the
-container/flat-set cases as green controls.
+pins all three interface-monitor spellings against each other, covers the
+bracketed / malformed / duplicate cases in each, and keeps the
+container/flat-set and single-entry cases as green controls.
 
 **`multi: true` ALSO prevents single-value REPLACE for repeated keyed-list
 leaves (#3984).** The `#2419` discussion above is about ONE statement with a
@@ -3645,7 +3691,12 @@ reserved for whole-dataplane selection where a rewrite shim
   coverage claim holds BECAUSE the gate reads the compiled int: a typed
   schema leaf would still miss the packed shape, which sits below the depth
   `SchemaValidate` reaches (see "A PACKED hierarchical statement carries its
-  entries on its OWN Keys"). It is a wire-width gate like
+  entries on its OWN Keys"). #6588 extended the SAME compiled-int gate to the
+  ip-monitoring `global-weight` / `global-threshold` / per-target `weight`,
+  which #6549 had left to their typed schema leaves: those leaves are real, but
+  the schema walker cannot reach the packed spelling for them either, so once
+  the packed shape compiled they needed the compiled-int layer too. It is a
+  wire-width gate like
   its siblings: the weight is the debt subtracted from the RG weight,
   which the heartbeat advertises through a single byte
   (`HeartbeatGroup.Weight`, `uint8(rg.Weight)`) while the local election

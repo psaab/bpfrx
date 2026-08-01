@@ -1960,26 +1960,25 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 			case "strict-vip-ownership":
 				rg.StrictVIPOwnership = true
 			case "interface-monitor":
-				// packedOrContainerEntries (#6588): the packed one-liner
+				// monitorEntryNodes (#6588): the packed one-liner
 				// `interface-monitor ge-0/0/0 weight 255;` carries the monitor
-				// on the statement's OWN Keys and has no children at all.
-				for _, ifChild := range packedOrContainerEntries(child, 1) {
+				// on the statement's OWN Keys and has no children at all, and a
+				// bracketed `[ ge-0/0/0 ge-0/0/1 ]` collapses N monitors onto
+				// one node's Keys in EVERY spelling.
+				for _, ifChild := range monitorEntryNodes(child, 1) {
 					im := &InterfaceMonitor{
 						Interface: ifChild.Name(),
 					}
-					// weight is typically inline: "ge-0/0/0 weight 255"
-					for i := 1; i < len(ifChild.Keys)-1; i++ {
-						if ifChild.Keys[i] == "weight" {
-							if n, err := strconv.Atoi(ifChild.Keys[i+1]); err == nil {
-								im.Weight = n
-							}
-						}
-					}
-					if wNode := ifChild.FindChild("weight"); wNode != nil {
-						if v := nodeVal(wNode); v != "" {
-							if n, err := strconv.Atoi(v); err == nil {
-								im.Weight = n
-							}
+					// monitorWeightTokens reads both value locations
+					// (`ge-0/0/0 weight 255` and `ge-0/0/0 { weight 255; }`)
+					// and is FIRST-WINS, so the compiled weight no longer
+					// depends on the spelling. A malformed or duplicated
+					// weight is rejected/warned by
+					// validateMonitorWeightTokensAST; here it leaves the
+					// pre-existing 0 default.
+					if toks := monitorWeightTokens(ifChild); len(toks) > 0 {
+						if n, err := strconv.Atoi(toks[0]); err == nil {
+							im.Weight = n
 						}
 					}
 					rg.InterfaceMonitors = append(rg.InterfaceMonitors, im)
@@ -1991,7 +1990,7 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 				// packs the same way — `ip-monitoring global-weight 255;` and
 				// `ip-monitoring family inet 10.0.1.1 weight 100;` are leaves
 				// with no children.
-				ipmEntries := packedOrContainerEntries(child, 1)
+				ipmEntries := packedStatementProps(child, 1, isIPMonitoringProp)
 				if gwNode := findNamedNode(ipmEntries, "global-weight"); gwNode != nil {
 					if v := nodeVal(gwNode); v != "" {
 						if n, err := strconv.Atoi(v); err == nil {
@@ -2010,39 +2009,24 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 					if familyNode.Name() != "family" {
 						continue
 					}
-					// Determine inet node: compound key "family inet" vs nested family { inet { } }
-					var inetNode *Node
+					// Compound key "family inet" vs nested family { inet { } }.
 					// inetSkip is how many of inetNode's leading Keys name the
 					// node itself rather than a monitored address, so a packed
 					// target (`family inet 10.0.1.1 weight 100;`) is unpacked
-					// from the right offset.
-					inetSkip := 2
-					if len(familyNode.Keys) >= 2 && familyNode.Keys[1] == "inet" {
-						inetNode = familyNode
-					} else {
-						inetNode = familyNode.FindChild("inet")
-						inetSkip = 1
-					}
+					// from the right offset. Shared with the #6588 weight gate.
+					inetNode, inetSkip := ipMonitoringInetNode(familyNode)
 					if inetNode == nil {
 						continue
 					}
-					for _, addrChild := range packedOrContainerEntries(inetNode, inetSkip) {
+					for _, addrChild := range monitorEntryNodes(inetNode, inetSkip) {
 						target := &IPMonitorTarget{
 							Address: addrChild.Name(),
 						}
-						// weight inline: "10.0.1.1 weight 100"
-						for i := 1; i < len(addrChild.Keys)-1; i++ {
-							if addrChild.Keys[i] == "weight" {
-								if n, err := strconv.Atoi(addrChild.Keys[i+1]); err == nil {
-									target.Weight = n
-								}
-							}
-						}
-						if wNode := addrChild.FindChild("weight"); wNode != nil {
-							if v := nodeVal(wNode); v != "" {
-								if n, err := strconv.Atoi(v); err == nil {
-									target.Weight = n
-								}
+						// Same FIRST-WINS dual-location weight read as the
+						// interface-monitor arm above.
+						if toks := monitorWeightTokens(addrChild); len(toks) > 0 {
+							if n, err := strconv.Atoi(toks[0]); err == nil {
+								target.Weight = n
 							}
 						}
 						ipm.Targets = append(ipm.Targets, target)
@@ -2058,63 +2042,181 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 	return nil
 }
 
-// packedOrContainerEntries returns one node per entry carried by cfgNode,
-// across every hierarchical spelling of a Junos statement that groups entries
-// (#6588 — the chassis-cluster instance of the #2419 / #3843 dual-AST-shape
-// class). `skip` is the number of leading Keys that name the statement itself
-// rather than an entry.
+// monitorEntryNodes returns one node per MONITORED ENTRY carried by cfgNode —
+// a redundancy-group `interface-monitor` statement or an ip-monitoring
+// `inet` address list — across every spelling (#6588). `skip` is the number of
+// leading Keys that name the statement itself rather than an entry.
 //
-//   - CONTAINER block   `interface-monitor { ge-0/0/0 weight 255; }`
-//     → Keys=["interface-monitor"], one child node per entry. The entries are
-//     the children; returned unchanged.
-//   - PACKED one-liner  `interface-monitor ge-0/0/0 weight 255;`
-//     → Keys=["interface-monitor","ge-0/0/0","weight","255"], NO children. The
-//     statement itself is a single entry; it is returned as one synthetic node
-//     carrying the Keys tail.
-//   - PACKED with block `interface-monitor ge-0/0/0 { weight 255; }`
-//     → Keys=["interface-monitor","ge-0/0/0"], children are that entry's
-//     ATTRIBUTES. The synthetic node keeps them so a nested `weight` is still
-//     found by the caller's FindChild.
-//   - flat set command  `set ... interface-monitor ge-0/0/0 weight 255`
-//     → SetPath yields the CONTAINER shape (the statement keyword becomes the
-//     node, the remaining tokens one child leaf), so it needs no unpacking.
+// Two independent collapses have to be undone, and they compose:
 //
-// The inline tail and the children are EITHER/OR rather than accumulated —
-// exactly the rule namedInstances already applies to named instances. A tail
-// means the statement IS one entry, so its children are that entry's
-// properties, not sibling entries. Accumulating instead would mint a bogus
-// second entry named after the first attribute (`interface-monitor ge-0/0/0 {
-// weight 255; }` would compile a monitor for an interface literally called
-// "weight").
+//  1. PACKED statement. `interface-monitor ge-0/0/0 weight 255;` yields
+//     Keys=["interface-monitor","ge-0/0/0","weight","255"] and NO children,
+//     while `interface-monitor { ge-0/0/0 weight 255; }` yields
+//     Keys=["interface-monitor"] with one child per entry. A flat `set` command
+//     produces the CONTAINER shape. Reading only Children dropped the packed
+//     spelling entirely — the original #6588 fail-open.
 //
-// Before #6588 the callers iterated cfgNode.Children only, so every PACKED
-// spelling was SILENTLY DROPPED: a hand-authored or `load merge`d config
-// compiled to ZERO interface monitors and ZERO ip-monitoring targets while
-// `commit` succeeded with no error and no warning. The operator had link and
-// probe tracking configured and a redundancy group that never demoted — a
-// failover fail-open. Since the monitors now reach the compiled *Config, the
-// #6549 weight range gate in validateChassisClusterStrict (which runs on the
-// compiled int) covers the packed spelling too.
+//     Tail and children are EITHER/OR here, not accumulated — the rule
+//     namedInstances already applies. A tail means the statement IS one entry,
+//     so its children are that entry's ATTRIBUTES:
+//     `interface-monitor ge-0/0/0 { weight 255; }` must compile ONE monitor for
+//     ge-0/0/0, not a second one named after its first attribute. (Accumulating
+//     there mints a monitor for an interface literally called "weight".)
 //
-// Only the outermost level is unpacked: the tail becomes ONE entry, which is
-// the shape Junos renders (one statement per line). A tail packing two sibling
-// statements onto a single line is not a Junos spelling and is not split here.
-func packedOrContainerEntries(cfgNode *Node, skip int) []*Node {
+//  2. BRACKETED list. The lexer strips `[`/`]` (#2419), so
+//     `interface-monitor [ ge-0/0/0 ge-0/0/1 ]` collapses N names onto ONE
+//     node's Keys in EVERY spelling — packed, hierarchical container child, and
+//     flat-set child alike. Taking only Keys[skip] compiled the FIRST name and
+//     silently discarded the rest, which is the same failover fail-open one
+//     monitor at a time. Each candidate's Keys are therefore SPLIT at entry
+//     boundaries: a token that is not the `weight` keyword (or the value slot
+//     reserved immediately after it) starts a new entry.
+//
+// The value slot reservation matters for the same reason it does in the #6524
+// application walk: `weight` consumes exactly one following token even when
+// that token spells something else, so a malformed `weight weight` cannot
+// silently split into two entries. A malformed or duplicated weight is
+// reported by validateMonitorWeightTokensAST, which derives its entries from
+// THIS function so the gate and the compiler can never disagree.
+//
+// A candidate's children are attributes of every entry it produces. That is
+// exact for the N==1 case (the only shape Junos renders) and lossless for the
+// invented `[ a b ] { weight 255; }` — over-applying a weight adds demotion
+// debt, the fail-SAFE direction, whereas dropping it silently is the failure
+// mode this whole change exists to remove.
+func monitorEntryNodes(cfgNode *Node, skip int) []*Node {
+	var candidates []*Node
 	if len(cfgNode.Keys) > skip {
-		return []*Node{{
-			Keys:     append([]string(nil), cfgNode.Keys[skip:]...),
+		candidates = []*Node{{
+			Keys:     cfgNode.Keys[skip:],
 			Children: cfgNode.Children,
 			IsLeaf:   cfgNode.IsLeaf,
 			Line:     cfgNode.Line,
 			Column:   cfgNode.Column,
 		}}
+	} else {
+		candidates = cfgNode.Children
 	}
-	return cfgNode.Children
+
+	var entries []*Node
+	for _, cand := range candidates {
+		var split []*Node
+		for i := 0; i < len(cand.Keys); {
+			tok := cand.Keys[i]
+			if tok == monitorWeightKeyword && len(split) > 0 {
+				// Attribute of the entry opened above; reserve its value slot.
+				cur := split[len(split)-1]
+				cur.Keys = append(cur.Keys, tok)
+				if i+1 < len(cand.Keys) {
+					cur.Keys = append(cur.Keys, cand.Keys[i+1])
+					i += 2
+					continue
+				}
+				i++
+				continue
+			}
+			split = append(split, &Node{
+				Keys:   []string{tok},
+				IsLeaf: cand.IsLeaf,
+				Line:   cand.Line,
+				Column: cand.Column,
+			})
+			i++
+		}
+		for _, e := range split {
+			e.Children = cand.Children
+		}
+		entries = append(entries, split...)
+	}
+	return entries
+}
+
+// monitorWeightKeyword is the only attribute a monitored entry carries. It is
+// named so monitorEntryNodes and validateMonitorWeightTokensAST cannot drift
+// apart from the compiler's reader.
+const monitorWeightKeyword = "weight"
+
+// monitorWeightTokens returns every `weight` VALUE an entry carries, across
+// both locations the value can occupy (#6588):
+//
+//   - inline on the entry's own Keys — `ge-0/0/0 weight 255`
+//   - as a child leaf              — `ge-0/0/0 { weight 255; }`
+//
+// Callers take the FIRST token, so the compiled weight is the same regardless
+// of spelling. Before #6588 the two locations disagreed on which duplicate
+// won: the inline scan overwrote (last wins) while FindChild returned the
+// first, so `weight 100 weight 200` compiled to 200 inline but 100 in a block.
+// Returning every token also lets the AST gate REJECT a duplicate rather than
+// silently pick one, which is what makes the answer spelling-independent.
+//
+// A `weight` keyword with no following token yields an empty-string entry, so
+// the gate reports it as malformed rather than the caller treating it as absent.
+func monitorWeightTokens(entry *Node) []string {
+	var out []string
+	for i := 1; i < len(entry.Keys); i++ {
+		if entry.Keys[i] != monitorWeightKeyword {
+			continue
+		}
+		if i+1 < len(entry.Keys) {
+			out = append(out, entry.Keys[i+1])
+			i++
+			continue
+		}
+		out = append(out, "")
+	}
+	for _, c := range entry.Children {
+		if len(c.Keys) > 0 && c.Keys[0] == monitorWeightKeyword {
+			out = append(out, nodeVal(c))
+		}
+	}
+	return out
+}
+
+// packedStatementProps returns one node per PROPERTY carried by a statement
+// whose body is a set of named properties rather than a list of monitored
+// entries — `ip-monitoring` (#6588). `skip` names the statement itself and
+// isProp reports whether a token opens a new property.
+//
+//	ip-monitoring { global-weight 255; family inet 10.0.1.1 weight 100; }
+//	  -> Keys=["ip-monitoring"], one child per property (returned as-is)
+//	ip-monitoring global-weight 255;
+//	  -> Keys=["ip-monitoring","global-weight","255"], no children
+//	     -> one synthetic property node ["global-weight","255"]
+//
+// This is deliberately NOT monitorEntryNodes: there every non-attribute token
+// opens an entry, which would shred `global-weight 255` into two. Here the tail
+// is split only at recognized property keywords, so a property's value tokens
+// stay with it. Both a packed tail and real children are returned when both
+// exist — properties are siblings, so nothing is lost either way (unlike a
+// monitored entry, where children are that entry's attributes).
+func packedStatementProps(cfgNode *Node, skip int, isProp func(string) bool) []*Node {
+	var props []*Node
+	if len(cfgNode.Keys) > skip {
+		var cur *Node
+		for _, tok := range cfgNode.Keys[skip:] {
+			if cur == nil || isProp(tok) {
+				cur = &Node{Keys: []string{tok}, Line: cfgNode.Line, Column: cfgNode.Column}
+				props = append(props, cur)
+				continue
+			}
+			cur.Keys = append(cur.Keys, tok)
+		}
+	}
+	return append(props, cfgNode.Children...)
+}
+
+// isIPMonitoringProp reports whether tok opens an `ip-monitoring` property.
+func isIPMonitoringProp(tok string) bool {
+	switch tok {
+	case "global-weight", "global-threshold", "family":
+		return true
+	}
+	return false
 }
 
 // findNamedNode returns the first node in nodes whose first key is name — the
-// slice equivalent of Node.FindChild, for callers that must search the
-// packedOrContainerEntries result rather than a node's raw Children.
+// slice equivalent of Node.FindChild, for callers that must search a
+// packedStatementProps result rather than a node's raw Children.
 func findNamedNode(nodes []*Node, name string) *Node {
 	for _, n := range nodes {
 		if len(n.Keys) > 0 && n.Keys[0] == name {

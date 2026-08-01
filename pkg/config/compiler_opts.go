@@ -348,6 +348,21 @@ type compileOpts struct {
 	// Same doctrine as lenientReservedProposalSetNames.
 	lenientChassisClusterIdentities bool
 
+	// lenientChassisMonitorWeight (#6588) downgrades the redundancy-group
+	// monitor weight gate (validateMonitorWeightTokensAST) from a hard compile
+	// error to a cfg.Warnings entry on the tolerant load / peer-sync paths. A
+	// weight that is malformed (`weight nope`) or specified twice with
+	// different values compiles to the 0 default / a spelling-dependent pick,
+	// so the monitored link going down deducts NO weight (or the wrong one) and
+	// the redundancy group does not demote — the same silent-nothing class as
+	// the packed-statement drop #6588 fixes. Commit / commit-check stay strict
+	// so a new operator edit is rejected; an already-persisted or peer-synced
+	// config an older binary accepted must still BOOT (warn) per the #1960
+	// fail-closed-on-load doctrine — compileChassis keeps the stable
+	// first-wins / 0-default coercion, now flagged. Same doctrine as
+	// lenientChassisClusterIdentities.
+	lenientChassisMonitorWeight bool
+
 	// lenientIPsecProposalProtocol (#4298, V-2) downgrades the IPsec
 	// proposal `protocol ah` reject (validateIPsecProposalProtocolStrict)
 	// from a hard error to a warning on the tolerant load / peer-sync paths.
@@ -2019,6 +2034,7 @@ func lenientCompileOpts() compileOpts {
 		lenientIPsecTrafficSelectors:           true,
 		lenientReservedProposalSetNames:        true,
 		lenientChassisClusterIdentities:        true,
+		lenientChassisMonitorWeight:            true,
 		lenientIPsecProposalProtocol:           true,
 		lenientIPsecManualKey:                  true,
 		lenientLogProfileStreamRef:             true,
