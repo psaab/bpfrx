@@ -720,23 +720,24 @@ func TestScrubInnerErrorResistsForgedProvenance(t *testing.T) {
 // which is the very thing #6545 exists to produce.
 func TestScrubInnerErrorKeepsRecognisedDiagnostics(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		err  error
-		want string
+		name    string
+		err     error
+		want    string
+		notWant string // must NOT appear; "" skips the check
 	}{
-		{"errno", syscall.ECONNREFUSED, "connection refused"},
+		{"errno", syscall.ECONNREFUSED, "connection refused", ""},
 		{"errno wrapped by net.OpError", &net.OpError{
 			Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED,
-		}, "connection refused"},
-		{"no route to host", syscall.EHOSTUNREACH, "no route to host"},
+		}, "connection refused", ""},
+		{"no route to host", syscall.EHOSTUNREACH, "no route to host", ""},
 		{"opError with no recognised errno", &net.OpError{
 			Op: "dial", Net: "tcp", Err: errors.New("x"),
-		}, "dial failed"},
-		{"context deadline", context.DeadlineExceeded, "context deadline exceeded"},
+		}, "dial failed", ""},
+		{"context deadline", context.DeadlineExceeded, "context deadline exceeded", ""},
 		{"dns not found", &net.DNSError{Err: "x", Name: hostSentinel, IsNotFound: true},
-			"dns lookup failed: no such host"},
+			"dns lookup failed: no such host", ""},
 		{"unknown authority", x509.UnknownAuthorityError{},
-			"tls: certificate signed by unknown authority"},
+			"tls: certificate signed by unknown authority", ""},
 		{"our own redirect refusal", &redirectRefusal{
 			reason: redirectReasonCrossHost,
 			from:   mustParseURL(t, "https://prov.example/a"),
@@ -746,9 +747,10 @@ func TestScrubInnerErrorKeepsRecognisedDiagnostics(t *testing.T) {
 			// per request, breaking the daemon's once-per-(provider,error)
 			// dedup on a never-pruned map. The FROM host is our configured
 			// endpoint and is stable, so it stays.
-		}, "refusing cross-host redirect from prov.example to a provider-supplied host"},
+		}, "refusing cross-host redirect from prov.example to a provider-supplied host",
+			"evil.example"},
 		{"our own refusal, wrapped by the http client", fmt.Errorf("wrapped: %w",
-			&redirectRefusal{reason: redirectReasonHopCap}), "stopped after 10 redirects"},
+			&redirectRefusal{reason: redirectReasonHopCap}), "stopped after 10 redirects", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := scrubInnerError(tc.err)
@@ -756,6 +758,16 @@ func TestScrubInnerErrorKeepsRecognisedDiagnostics(t *testing.T) {
 				t.Fatalf("scrubInnerError(%T) = %q, want it to contain %q.\n"+
 					"Making the classifier total must not make it useless — these are the "+
 					"classes an operator diagnoses from.", tc.err, got, tc.want)
+			}
+			// Presence of the generic phrase does not prove ABSENCE of the
+			// target. Round 15 caught this: the case was described as "strictly
+			// stronger" than the old name-the-target assertion when it only
+			// checked the replacement wording had arrived.
+			if tc.notWant != "" && strings.Contains(got, tc.notWant) {
+				t.Fatalf("scrubInnerError(%T) = %q, which still names the "+
+					"provider-chosen target %q. That value varies per request and "+
+					"defeats the daemon's once-per-(provider,error) dedup.",
+					tc.err, got, tc.notWant)
 			}
 		})
 	}

@@ -375,20 +375,27 @@ Two further consequences:
   one, but the bound is not total and should not be read as such. The diagnostic cost — `net/http`'s internal prose, the failing
   address, the unknown-error type name — is accepted: an unrecognised error is
   exactly the case where we cannot say what it contains.
-- **`guardRedirect`'s refusals are grammar-bounded, but only in the character
-  set — NOT in the content.** Both hosts and the downgrade scheme render through
-  `refusalHost`/`safeScheme`, which withhold a zone id, raw non-ASCII, or
-  anything that is not a plain reg-name. A provider answering
-  `Location: https://<our-password>.evil.example/` gets the hop refused — that is
-  the point — but `<password>.evil.example` IS a well-formed reg-name, so the
-  refusal message renders it verbatim and the credential still reaches the log.
-  `scrubURLError` records the same residual generally, and its justification —
-  the name is already in every resolver query and TLS ClientHello — does **not**
-  transfer here: `CheckRedirect` aborts before any dial, so a refused target is
-  never resolved and never sent anywhere. Closing it needs the refusal to render
-  a provider-supplied host by reference (a hop index, a hash) rather than by
-  name. The same-host **decision** still compares the raw values via
-  `redirectHost`; only the rendering changed.
+- **`guardRedirect`'s refusals name no provider-supplied host at all.** The
+  grammar (`refusalHost`/`safeScheme`) bounds a host's character SET — zone ids,
+  raw non-ASCII and anything that is not a plain reg-name are withheld — but it
+  does not bound the CONTENT, and that was not enough. A provider answering
+  `Location: https://<our-password>.evil.example/` gets the hop refused, yet
+  `<password>.evil.example` is a well-formed reg-name, so naming it put the
+  credential in the log. `scrubURLError`'s general justification — such a name is
+  already in every resolver query and TLS ClientHello — does **not** transfer
+  here: `CheckRedirect` aborts before any dial, so a refused target is never
+  resolved and never sent anywhere.
+  It also defeated deduplication, which is what forced the fix. The daemon keys a
+  never-pruned, process-lifetime map on the rendered string to warn once per
+  (provider, error), so a provider redirecting to per-request hostnames minted a
+  fresh entry every 30s reconcile tick.
+  So the refusal renders the refusal CLASS plus `via[0]` — the URL this package
+  built from configuration — and describes the target only by class.
+  `via[0]`, not the previous hop: same-host comparison is lenient about case, a
+  trailing dot and the default port, so a provider could take an allowed hop to
+  its own spelling (`Prov.example`) and have THAT rendered, which reintroduced
+  the same per-request variability one hop out. The same-host **decision** still
+  compares the raw values via `redirectHost`; only the rendering changed.
 
 Gates in `url_render_class_6545_test.go`. The behavioural half pins
 `scrubURLError` by **exact equality** rather than sentinel-probing — a field

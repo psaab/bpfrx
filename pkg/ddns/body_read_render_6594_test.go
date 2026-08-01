@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -130,8 +131,18 @@ func TestCyclicURLErrorDoesNotOverflowTheStack(t *testing.T) {
 // so a fix that special-cased self-reference would pass the test above and
 // still die here.
 func TestDeeplyNestedURLErrorDoesNotOverflowTheStack(t *testing.T) {
+	// SAME VACUITY SHAPE as TestDeepUnwrapChainTerminates, found in the sibling
+	// by round 15 after the first was fixed: an unrecognised leaf renders
+	// transportWithheld, which is ALSO classifyTransportError's ordinary
+	// fallback, so the assertion held even with the depth checks removed — the
+	// newer entry-tree guard returned first and the comment's claim about which
+	// bound it tests was false.
+	//
+	// A RECOGNISED leaf separates the outcomes: terminating at a bound yields
+	// withheld, while walking the whole nest reaches io.ErrUnexpectedEOF and
+	// yields transportEOF.
 	const secret = "SUPERSECRET"
-	var err error = errors.New("leaf")
+	var err error = io.ErrUnexpectedEOF
 	for i := 0; i < 100_000; i++ {
 		err = &url.Error{Op: "Get", URL: "http://prov.example/?p=" + secret, Err: err}
 	}
@@ -141,8 +152,12 @@ func TestDeeplyNestedURLErrorDoesNotOverflowTheStack(t *testing.T) {
 	if strings.Contains(got, secret) {
 		t.Fatalf("deeply nested *url.Error leaked the credential: %s", got)
 	}
+	if got == string(transportEOF) {
+		t.Fatalf("deep nest classified as %q: the walk reached the recognised leaf, "+
+			"so nothing bounded it", got)
+	}
 	if !strings.Contains(got, string(transportWithheld)) {
-		t.Fatalf("deeply nested *url.Error did not terminate at the depth bound; got: %s", got)
+		t.Fatalf("deeply nested *url.Error did not terminate at a bound; got: %s", got)
 	}
 }
 
@@ -293,5 +308,46 @@ func TestRefusedRedirectRendersStablyAcrossHosts(t *testing.T) {
 			"distinct rendered strings, want 1. The daemon keys a never-pruned "+
 			"sync.Map on this text, so each distinct string is a permanent entry "+
 			"and a fresh WARN every 30s tick:\n%s", len(renders), strings.Join(keys, "\n"))
+	}
+}
+
+// TestRefusedRedirectAfterAnAllowedHopIsStable is round 15's MAJOR: the refusal
+// rendered `via[len(via)-1]` as its FROM host, and same-host comparison is
+// deliberately lenient about case, a trailing dot and the default port. So a
+// provider could take an ALLOWED first hop to its own chosen spelling of our
+// host, and only then attempt the cross-host one — putting a provider-chosen
+// string back into the message and defeating the daemon's dedup again, one hop
+// further out than the direct case.
+//
+// via[0] is the URL this package built from configuration, so it is stable
+// whatever spelling the provider echoes back.
+func TestRefusedRedirectAfterAnAllowedHopIsStable(t *testing.T) {
+	renders := make(map[string]struct{})
+	for _, spelling := range []string{
+		"https://prov.example/upd",
+		"https://Prov.Example/upd",
+		"https://PROV.EXAMPLE/upd",
+		"https://prov.example.:443/upd",
+		"https://prov.example:443/upd",
+	} {
+		origin := httptest.NewRequest(http.MethodGet, "https://prov.example/upd", nil)
+		hop := httptest.NewRequest(http.MethodGet, spelling, nil)
+		next := httptest.NewRequest(http.MethodGet, "https://evil.example/x", nil)
+
+		err := guardRedirect(next, []*http.Request{origin, hop})
+		if err == nil {
+			t.Fatalf("spelling %q: a cross-host hop must be refused", spelling)
+		}
+		renders[err.Error()] = struct{}{}
+	}
+	if len(renders) != 1 {
+		keys := make([]string, 0, len(renders))
+		for k := range renders {
+			keys = append(keys, k)
+		}
+		t.Fatalf("five provider spellings of our OWN host produced %d distinct "+
+			"refusal strings, want 1 — the refusal is rendering a provider-echoed "+
+			"value, which defeats the never-pruned dedup map:\n%s",
+			len(renders), strings.Join(keys, "\n"))
 	}
 }

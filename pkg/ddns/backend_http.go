@@ -269,7 +269,11 @@ const maxRedirects = 10
 //     is this package's posture everywhere else (bind error, malformed
 //     checkip-url, unrecognized response body). A provider that genuinely moves
 //     to a new host is served by pointing the leaf at the final host; the error
-//     names both hosts so the operator can do exactly that. SAME-host
+//     names the CONFIGURED endpoint and the refusal class so the operator can do
+//     exactly that. It deliberately does NOT name the refused target: that value
+//     is provider-chosen, so rendering it both disclosed a credential-shaped
+//     reg-name and varied per request, defeating the daemon's once-per-
+//     (provider, error) dedup. SAME-host
 //     redirects — the common real case, a path or API-version move — are still
 //     followed.
 //
@@ -301,15 +305,25 @@ func guardRedirect(req *http.Request, via []*http.Request) error {
 	}
 	if len(via) > 0 {
 		prev := via[len(via)-1].URL
+		// `origin` is what the REFUSAL renders, and it must be via[0] — the URL
+		// this package built from configuration — not `prev`. Same-host
+		// comparison is deliberately lenient about case, a trailing dot and the
+		// default port, so a provider can first take an ALLOWED hop to its own
+		// chosen spelling (`Prov.example`) and only then attempt the cross-host
+		// one. Rendering `prev` then published that provider-chosen spelling,
+		// and five case variants produced five distinct daemon strings — which
+		// re-opens exactly the dedup defeat this refusal was just fixed to
+		// close, one hop further out. via[0] is ours and is stable.
+		origin := via[0].URL
 		if strings.EqualFold(prev.Scheme, "https") && !strings.EqualFold(req.URL.Scheme, "https") {
 			// The scheme AND the host here come from the provider's Location
 			// header. They are NOT rendered at construction — the refusal holds
 			// the URLs and applies the grammar in Error(), so the bounding
 			// cannot be skipped by a future edit to this call site.
-			return &redirectRefusal{reason: redirectReasonDowngrade, from: prev, to: req.URL}
+			return &redirectRefusal{reason: redirectReasonDowngrade, from: origin, to: req.URL}
 		}
 		if !strings.EqualFold(redirectHost(prev), redirectHost(req.URL)) {
-			return &redirectRefusal{reason: redirectReasonCrossHost, from: prev, to: req.URL}
+			return &redirectRefusal{reason: redirectReasonCrossHost, from: origin, to: req.URL}
 		}
 	}
 	// Followed (same-host) hop: never echo the previous URL's query string —
