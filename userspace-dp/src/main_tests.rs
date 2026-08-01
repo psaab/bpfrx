@@ -2498,7 +2498,7 @@ fn binding_candidate_excludes_secure_tunnel() {
 /// #5619: adding a secure tunnel must leave the binding PLAN byte-identical.
 ///
 /// The Go half of this differential lives in
-/// `TestSecureTunnelAddsNothingToDataplaneSets`
+/// `TestSecureTunnelAddsNothingToTheAdjudicatedSets`
 /// (pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go), which pins the
 /// ingress-adjudication set and the RSS allowlist. This is the binding-plan
 /// half: the same candidate list is planned twice, once with a RESOLVED

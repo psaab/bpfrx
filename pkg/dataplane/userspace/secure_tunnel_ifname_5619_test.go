@@ -2,6 +2,7 @@ package userspace
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"testing"
 
@@ -359,6 +360,136 @@ func TestSecureTunnelUnitReportsMTUAndAddresses(t *testing.T) {
 				t.Fatalf("premise broken: no %q unit in the snapshot", unitRef)
 			}
 		})
+	}
+}
+
+// connectedPrefixInputs mirrors, in Go, the gate the Rust dataplane applies to
+// the interface rows this package ships: `populate_interfaces` skips a row on
+// `if iface.ifindex <= 0 { continue }` and pushes ONE connected route per
+// address of every row that survives
+// (userspace-dp/src/afxdp/forwarding_build/interfaces.rs). The returned set is
+// therefore the exact input from which the FIB derives `connected_v4` — and
+// `infer_connected_route_target_v4` resolves a static route's gateway against
+// nothing else.
+//
+// Returned as a SET rather than a list because a base row and its unit-0 row
+// legitimately carry the same (ifindex, address) pair under some spellings and
+// collapse to one connected prefix downstream.
+func connectedPrefixInputs(snaps []InterfaceSnapshot) map[string]bool {
+	out := map[string]bool{}
+	for _, s := range snaps {
+		if s.Ifindex <= 0 {
+			continue
+		}
+		for _, a := range s.Addresses {
+			out[fmt.Sprintf("%d|%s", s.Ifindex, a.Address)] = true
+		}
+	}
+	return out
+}
+
+// TestSecureTunnelSpellingsAgreeOnForwardingInputs is the guard for the
+// FORWARDING half of #5619 — the half the name fix moves and the earlier
+// analysis of this change got wrong.
+//
+// Every spelling below describes ONE tunnel: `bind-interface st0` and
+// `bind-interface st0.0` derive the same XFRM if_id and the same unit ref
+// `st0.0`. They must therefore hand the dataplane the same forwarding inputs.
+// Before the fix they did not, and the consequence was a DISPOSITION SPLIT
+// measured end to end (real Go wire snapshot -> real Rust FIB) for a LAN->tunnel
+// flow via a gateway inside the tunnel subnet:
+//
+//	bind-interface st0    -> MissingNeighbor
+//	bind-interface st0.0  -> NoRoute
+//
+// `NoRoute` is slow-path eligible and reinjects unconditionally; the
+// `MissingNeighbor` arm runs its OWN zone-policy evaluation and a deny exits
+// before the reinject gate. So the same tunnel, spelled two ways, either
+// enforced zone policy on LAN->tunnel transit or bypassed it into the kernel.
+//
+// What is asserted, and why each half is load-bearing:
+//
+//   - PER SPELLING, the unit row must clear the `ifindex > 0` gate AND carry
+//     the tunnel address. Both are required for the connected prefix to exist;
+//     asserting only the cross-spelling equality below would MISS the
+//     round-1 reconstruction bug, because under it the BARE spelling's base
+//     `st0` row still resolves to ifindex 42 with the same address and holds
+//     the set equal while the UNIT row silently reads 0.
+//   - ACROSS SPELLINGS, the derived connected-prefix input set must be
+//     identical. This is the convergence claim itself, and it is what fails
+//     under the original unit-0 collapse.
+func TestSecureTunnelSpellingsAgreeOnForwardingInputs(t *testing.T) {
+	var reference map[string]bool
+	var referenceName string
+	for _, tc := range secureTunnelSpellings {
+		cfg, unitRef, wantDev := spellingConfig(t, tc.bindIface, tc.ifName, tc.unit)
+		prev := buildLinkSnapshot
+		buildLinkSnapshot = func(name string) (int, int, string, []InterfaceAddressSnapshot) {
+			switch name {
+			case wantDev:
+				return 42, 1400, "", []InterfaceAddressSnapshot{
+					{Family: "inet", Address: "10.5.5.1/30"},
+				}
+			case "ge-0-0-0":
+				return 11, 1500, "02:00:00:00:00:01", []InterfaceAddressSnapshot{
+					{Family: "inet", Address: "10.0.1.1/24"},
+				}
+			}
+			return 0, 0, "", nil
+		}
+		snaps := buildInterfaceSnapshots(cfg)
+		buildLinkSnapshot = prev
+
+		var unitRow *InterfaceSnapshot
+		for i := range snaps {
+			if snaps[i].Name == unitRef {
+				unitRow = &snaps[i]
+			}
+		}
+		if unitRow == nil {
+			t.Fatalf("%s: premise broken: no %q row in the snapshot", tc.name, unitRef)
+		}
+		// The `ifindex > 0` gate. A unit row that fails it contributes NO
+		// connected prefix, and a LAN->tunnel route via a gateway in the
+		// tunnel subnet then resolves NoRoute instead of MissingNeighbor —
+		// reinjected to the kernel with the zone policy unevaluated.
+		if unitRow.Ifindex <= 0 {
+			t.Errorf("%s (bind-interface %s): %s Ifindex = %d; the row is skipped by "+
+				"populate_interfaces, so the tunnel contributes no connected prefix and "+
+				"LAN->tunnel transit resolves NoRoute (kernel reinject, zone policy "+
+				"bypassed) instead of MissingNeighbor",
+				tc.name, tc.bindIface, unitRef, unitRow.Ifindex)
+		}
+		var carriesTunnelAddr bool
+		for _, a := range unitRow.Addresses {
+			if a.Address == "10.5.5.1/30" {
+				carriesTunnelAddr = true
+			}
+		}
+		if !carriesTunnelAddr {
+			t.Errorf("%s (bind-interface %s): %s addresses = %v, want the tunnel address "+
+				"10.5.5.1/30 — without it the row yields no connected prefix even at a "+
+				"resolved ifindex", tc.name, tc.bindIface, unitRef, unitRow.Addresses)
+		}
+
+		got := connectedPrefixInputs(snaps)
+		if reference == nil {
+			reference, referenceName = got, tc.name
+			continue
+		}
+		if !maps.Equal(got, reference) {
+			t.Errorf("connected-prefix inputs differ between spellings %q and %q: %v vs %v "+
+				"— these spell the SAME tunnel (same if_id, same unit ref), so a difference "+
+				"here means the two take different FIB dispositions for identical config",
+				referenceName, tc.name, reference, got)
+		}
+	}
+	if reference == nil {
+		t.Fatal("premise broken: no spelling was exercised")
+	}
+	if !reference["42|10.5.5.1/30"] {
+		t.Errorf("premise broken: the tunnel prefix never entered the connected-prefix "+
+			"inputs at all (%v); this test would then pass vacuously", reference)
 	}
 }
 

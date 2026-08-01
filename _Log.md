@@ -67,6 +67,102 @@
 - **File(s)**: pkg/config/compiler_ipsec_plaintext_warn.go,
   pkg/config/compiler_ipsec_plaintext_warn_5619_test.go,
   pkg/config/compiler_prewalk.go, _Log.md
+## 2026-08-01 — #5619 PR1 round 5: the TX-disposition trace was WRONG; retraced by execution
+
+- **Timestamp**: 2026-08-01 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Retracted and replaced the round-4 conclusion recorded above.
+  Round 4 concluded "no new drop; the TX dispatcher drops it either way". That
+  is **false**: a LAN->tunnel packet never reaches the TX dispatcher, because
+  the FIB claims it on an earlier arm. The round-4 trace analysed a site that
+  neither revision executes for this flow.
+
+  Retraced by EXECUTION rather than by reading, on both revisions:
+
+  1. Go half — the same probe file run at HEAD `dcd9f7207` and at the merge-base
+     `ebe370701`, dumping `buildInterfaceSnapshots` with `buildLinkSnapshot`
+     stubbed so only the netdev `XFRMIfNameAndID(bind-interface)` names exists.
+     Measured: the secure-tunnel UNIT row's ifindex changes for **exactly one**
+     spelling. `bind-interface st0.0` goes 0 -> 42. `st0`, `st10.5` and `st0.7`
+     were ALREADY 42 pre-fix (no unit-0 collapse fires for a non-zero unit, and
+     for bare `st0` the collapsed name IS the device).
+
+  2. Wire half — the real `buildSnapshotWithSchedulerStateAndNATCounters` output
+     serialized to JSON on each revision, then deserialized by the REAL Rust
+     `build_forwarding_state` + `lookup_forwarding_resolution_v4`. Matrix:
+     2 spellings x 3 next-hop spellings x 2 destinations = 12 cells.
+
+  Result: 4 of 12 cells flip disposition, ALL of them in the dotted
+  `bind-interface st0.0` spelling (4 of that spelling's 6). Zero cells flip for
+  bare `bind-interface st0`. The flip is `NoRoute` (egress 0) ->
+  `MissingNeighbor` (egress 42), caused by the tunnel's connected prefix
+  entering `connected_v4` once the unit row clears
+  `populate_interfaces`' `ifindex <= 0` skip.
+
+  Classification: **correction, not regression.** Both spellings describe ONE
+  tunnel (same if_id, same unit ref `st0.0`); pre-fix they took DIFFERENT
+  dispositions purely because of the name bug, and post-fix they converge on
+  what the canonical bare spelling already did. Operator-visible consequence,
+  now stated in the code and the PR body: `NoRoute` reinjects to the kernel
+  unconditionally while the `MissingNeighbor` arm evaluates zone policy first
+  and a DENY exits before the reinject gate — so LAN->tunnel transit with no
+  `from-zone <lan> to-zone <tunnel-zone>` permit goes from kernel-delivered to
+  dropped on the dotted spelling. That reinject was a zone-policy bypass, which
+  is #5619's subject. Under a PERMIT both arms reinject; nothing changes there.
+
+  Also measured and corrected: the "exclusion was an accident before #5619"
+  claim held for the dotted spelling ONLY. At the merge-base, `st0`, `st10.5`
+  and `st0.7` were in `buildUserspaceIngressIfindexes` AND
+  `UserspaceBoundLinuxInterfaces`. The exclusion arm is therefore NEW behaviour
+  for three of four spellings, not a preserved accident — it must not be deleted
+  as inert.
+
+- **File(s)**:
+  - `pkg/dataplane/userspace/interfaces.go` — the disposition caveat at the fix
+    site (the code, not just the PR body, now carries it).
+  - `pkg/dataplane/userspace/maps_sync.go` — replaced the false
+    "changes no disposition" paragraph with the measured result; corrected the
+    accident claim to three-of-four-spellings; fixed a dangling citation to
+    `TestSecureTunnelSpellingsAllExcluded` (never existed) ->
+    `TestSecureTunnelStaysOutOfDataplaneSets`.
+  - `pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go` —
+    `TestSecureTunnelSpellingsAgreeOnForwardingInputs` plus the
+    `connectedPrefixInputs` projection that mirrors the Rust
+    `populate_interfaces` gate.
+  - `userspace-dp/src/afxdp/forwarding_build/tests.rs` —
+    `secure_tunnel_unit_ifindex_decides_route_disposition` pins the FIB half.
+  - `userspace-dp/src/main_tests.rs` — dangling citation
+    `TestSecureTunnelAddsNothingToDataplaneSets` ->
+    `TestSecureTunnelAddsNothingToTheAdjudicatedSets`.
+
+- **Validation**: `go build ./...` 0 and `go vet ./pkg/dataplane/...` 0 asserted
+  BEFORE trusting any red. Mutation at BOTH edges of the fix's scope, each with
+  build+vet clean first and named PASS/FAIL lines, never a bare exit code:
+    - M1 remove the arm (original unit-0 collapse): target test FAILS on
+      `dotted_st0_0` (both the per-spelling ifindex assertion and the
+      cross-spelling set equality); 3 controls PASS.
+    - M2 reconstruct `<ifName>.<unit>` (round-1 bug): target test FAILS on
+      `bare_st0` via the PER-SPELLING assertion ONLY — the set-equality half
+      stays green because the base `st0` row still carries (42, 10.5.5.1/30).
+      That is exactly why both halves are asserted; a set-only guard would have
+      been scoped narrower than its claim.
+    - M3 widen the FIB gate to `ifindex < 0`: the Rust test FAILS with
+      `left: MissingNeighbor / right: NoRoute`; 3 sibling secure-tunnel tests
+      PASS. (First re-run after restoring the file reported FAIL from a stale
+      mtime, not a real failure; `touch` + re-run is green.)
+  Full suites green at the head: `go test ./...` rc 0, zero FAIL lines;
+  `cargo test --bin xpf-userspace-dp` 4238 passed / 0 failed.
+
+- **Not verified**: no cluster smoke (parent schedules those; the loss cluster
+  runs no route-based IPsec) and nothing exercised against a live xfrmi. The
+  `poll_descriptor` consequence of the flip (the `MissingNeighbor` arm's
+  deny -> `break RecycleAndContinue` bypassing the reinject gate) is read from
+  source plus the pinned `is_slow_path_eligible` table, NOT executed — the
+  worker loop was not run. INCONCLUSIVE and not chased: whether the
+  negative-neighbor cache (3 s TTL, armed on `pending_neigh` timeout) makes a
+  PERMITTED tunnel flow fast-fail instead of reinject. If it does it is
+  PRE-EXISTING — bare `st0` already resolved MissingNeighbor at the merge-base —
+  but this change extends its reach to the dotted spelling.
+
 ## 2026-08-01 — #5619 PR1 round 4: TX disposition traced; claim narrowed
 
 - **Timestamp**: 2026-08-01 (fix/5619-ipsec-passthrough-zone-policy)
