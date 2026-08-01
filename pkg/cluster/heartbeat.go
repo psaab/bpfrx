@@ -712,13 +712,49 @@ type heartbeatAuthState struct {
 	// DURABILITY — deliberately PROCESS-SCOPED, not on disk.
 	//
 	// A durable latch would additionally cover "the survivor's daemon restarts
-	// while the genuine peer is silent", but it was removed after review priced
-	// it: it needs a peer-floor state file, which turns a deliberate rollback
-	// into "delete the right file on the right node and restart" (a procedure
-	// run under incident pressure), opens a crash window between accepting a
-	// frame and committing the floor, needs cross-process locking on the
-	// receive path, and makes an in-range-but-wrong epoch a lockout that
-	// outlives reboots.
+	// while the genuine peer is silent". It was priced and declined — but the
+	// pricing has to be done against the design actually on the table, and an
+	// earlier revision of this comment did not: it charged a durable LATCH for
+	// the costs of a durable FLOOR. Those are different objects.
+	//
+	// A durable FLOOR persists highEpoch. It turns a deliberate rollback into
+	// "delete the right file on the right node and restart" (a procedure run
+	// under incident pressure) and makes an in-range-but-wrong epoch — the
+	// bounded lockout of README residual 2 — outlive reboots, converting a
+	// self-clearing hour into an operator ticket. Those two costs are real and
+	// they are why there is no peer-floor file.
+	//
+	// A durable LATCH need not be a floor. The narrowest form is a PSK-SCOPED
+	// BOOLEAN — {key fingerprint, epochSeen} — which persists no epoch at all,
+	// so an in-range wrong floor still dies at the next restart, and which
+	// resets by construction when the control-link PSK is rotated. Neither
+	// floor cost above applies to it. What it does cost:
+	//
+	//   - A DURABLE WRITE ON THE ACCEPT PATH, with no good failure policy. The
+	//     write must land BEFORE the frame is accepted, or a crash in between
+	//     leaves the latch clear across the reboot — precisely the state a
+	//     replay wants, so the window it was bought to close is still open. And
+	//     a write that must complete before an accept puts storage back on the
+	//     control-channel receive path, which is the hazard the sender half of
+	//     #6169 spent real effort removing (see the HANGING-store case below):
+	//     fail-open on a wedged fsync buys nothing over today, fail-closed lets
+	//     a disk fault refuse a healthy peer.
+	//   - CROSS-PROCESS LOCKING on that path, for the same SO_REUSEPORT reason
+	//     withEpochFileLock exists.
+	//   - It STRICTLY WORSENS the legitimate rollback, which is the common case
+	//     and the one with no attacker in it. Today a restart clears the latch
+	//     and the downgraded peer is accepted. With the latch durable, a
+	//     restart no longer clears it, so every deliberate downgrade requires a
+	//     PSK rotation across both nodes — the heavier procedure — even when
+	//     nothing is being replayed.
+	//
+	// And what it buys is already bought from the other side. The window is
+	// "restart while the genuine peer is silent AND an attacker holds
+	// pre-upgrade captures", and the post-upgrade PSK rotation this design
+	// already REQUIRES retires those captures outright: after it, there is
+	// nothing left to replay into the window, durable latch or not. Paying
+	// storage on the receive path and a heavier rollback procedure to
+	// re-close a window the mandatory rotation closes is not a good trade.
 	//
 	// What process scope costs is narrow, because this state already lives on
 	// the Manager (#5086/#6642): a heartbeat restart, a DHCP-triggered VRF
@@ -954,14 +990,19 @@ func (s *heartbeatAuthState) admitAuthedLocked(hasEpoch bool, epoch, session, co
 	// The key is re-read per frame on both paths, so rotation needs no restart
 	// of its own.
 	//
-	// This is NOT closed in code, and the alternatives were priced. A durable
-	// latch or floor re-creates the peer-floor state file this design
-	// deliberately removed (see the epochSeen field comment) and makes an
-	// in-range-but-wrong epoch a lockout that outlives reboots. Binding arming
-	// to freshness needs a challenge-response or a timestamp the heartbeat wire
-	// format does not carry, and cannot be approximated from the epoch itself: a
-	// legitimately long-lived peer's epoch is arbitrarily old, so no
-	// recency test separates it from an archived one.
+	// This is NOT closed in code, and the alternatives were priced separately,
+	// because they are separate designs. A durable FLOOR re-creates the
+	// peer-floor state file this design deliberately removed and makes an
+	// in-range-but-wrong epoch a lockout that outlives reboots. A durable
+	// PSK-scoped LATCH avoids both of those, and is declined for its own
+	// reasons — a durable write on the accept path with no good failure policy,
+	// cross-process locking there, a strictly heavier procedure for the
+	// no-attacker rollback, and a window the mandatory post-upgrade PSK rotation
+	// already closes. Both are priced in full at the epochSeen field comment.
+	// Binding arming to freshness needs a challenge-response or a timestamp the
+	// heartbeat wire format does not carry, and cannot be approximated from the
+	// epoch itself: a legitimately long-lived peer's epoch is arbitrarily old,
+	// so no recency test separates it from an archived one.
 	//
 	// SCOPE, honestly: a peer that has NEVER emitted an epoch cannot be falsely
 	// armed this way — there is nothing to capture. It bites on rollback,

@@ -238,10 +238,13 @@ type Manager struct {
 	bootEpochReady chan struct{}
 
 	// lastEpochDowngradeWarn rate-limits the epoch-downgrade rejection warning.
-	// The rejection is operator-actionable (a peer rolled back to a pre-#6169
-	// build stays refused until xpfd is restarted on this node), so it must be
-	// visible — but the peer sends at 5-10/s, so an unguarded log would flood
-	// journald. Read/written under m.mu.
+	// The rejection is operator-actionable — a peer rolled back to a pre-#6169
+	// build stays refused until the control-link PSK is rotated on BOTH nodes
+	// and xpfd is then restarted on this one; a bare restart is not reliable
+	// recovery, because an archived epoch-bearing frame replayed into the empty
+	// post-restart state re-arms the latch (see the arming site in
+	// admitAuthedLocked) — so it must be visible. But the peer sends at 5-10/s,
+	// so an unguarded log would flood journald. Read/written under m.mu.
 	lastEpochDowngradeWarn time.Time
 
 	// hbStartMu serializes StartHeartbeat's stop-previous + socket-create +

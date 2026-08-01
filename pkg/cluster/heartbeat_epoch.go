@@ -235,19 +235,45 @@ func epochOrderable(epoch uint64, nowNanos int64) bool {
 // never heals; a correctly clocked peer then refuses this node's epoch on its
 // raise path, which is asymmetric visibility, not mutual isolation.
 //
-// It cannot be closed here. Under a dead RTC a legitimate previous epoch and a
-// corrupt future one are INDISTINGUISHABLE: both sit implausibly far "ahead" of
-// a 1970 clock — a legitimate 2026 value by ~56 years, the corrupt year-2191
-// fixture the tests use by ~222 — and nothing on this node separates them,
-// because the forward bound that WOULD discriminate is precisely what is
-// skipped below epochClockSaneFloor. What is missing is a trustworthy
-// REFERENCE, not a magnitude gap. So tightening the bound would reject the
-// legitimate value, which
-// is precisely the case persistence exists to carry across a backward clock
-// step. The absolute year-2200 band is the only filter that survives an
-// uncredible clock, and it is already applied unconditionally. Healing after
-// the fact would mean LOWERING a published epoch mid-incarnation, the one
-// direction the whole design refuses. The residual is stated in
+// It cannot be closed COMPLETELY here, and the qualifier matters — an earlier
+// revision of this comment said "cannot be closed" flat, which is too strong.
+//
+// What is genuinely impossible is a DISCRIMINATOR. Under a dead RTC a
+// legitimate previous epoch and a corrupt future one are indistinguishable:
+// both sit implausibly far "ahead" of a 1970 clock — a legitimate present-day
+// value by ~56 years, the year-2191 fixture the tests use by ~222 — and nothing
+// on this node separates them, because the forward bound that WOULD
+// discriminate is precisely what is skipped below epochClockSaneFloor. What is
+// missing is a trustworthy REFERENCE, not a magnitude gap. Healing after the
+// fact would mean LOWERING a published epoch mid-incarnation, the one direction
+// the whole design refuses.
+//
+// What IS available is a partial NARROWING, and it was considered and declined
+// rather than missed: epochPlausibleMax is an arbitrary horizon, so lowering it
+// (say to 2100) would reject the year-2191 fixture while still carrying every
+// present-day value across an uncredible clock. It does not create a
+// discriminator — any corrupt value below the new horizon still passes — it
+// only moves the boundary, so the residual survives in the same shape with a
+// smaller window.
+//
+// It is declined because the horizon is not free space; it is a hard cliff on
+// the whole mechanism, in BOTH time and clock-fault magnitude:
+//
+//   - epochUsableAsFloor is applied to every frame, and a value at or past the
+//     horizon is REJECTED, not merely unlatched. So a node whose clock reads
+//     past the horizon is refused outright by its peer — a healthy peer
+//     declared dead, which is the dual-master failure the equal-epoch
+//     relaxation above exists to avoid. Lowering the horizon makes a FORWARD
+//     clock fault (a wrong RTC, a bogus NTP source) that much easier to land
+//     there.
+//   - The trade is therefore: narrow a fault whose worst outcome is ASYMMETRIC
+//     VISIBILITY (this node's epoch is refused on the peer's raise path; the
+//     peer is still seen here) by widening one whose outcome is MUTUAL
+//     REFUSAL. That is the wrong direction, and it is the same asymmetry the
+//     absolute bound is deliberately one-sided for.
+//
+// So the absolute year-2200 band stays, applied unconditionally, as the only
+// filter that survives an uncredible clock. The residual is stated in
 // pkg/cluster/README.md under "Honest residuals"; the operational close is a
 // working RTC or ordering xpfd after time synchronization.
 func epochWithinForwardBound(epoch uint64, nowNanos int64) bool {
@@ -463,13 +489,37 @@ func refineBootEpoch(path string, published *atomic.Uint64) {
 		return
 	}
 	withEpochFileLock(path, func() {
-		// ONE clock sample, shared by the load check and the candidate check
-		// below. Two samples could straddle the forward bound and validate
-		// `prev` against a different instant than the value actually derived
-		// from it.
-		now := epochNowNanos()
 		var prev uint64
 		if data, err := os.ReadFile(path); err == nil {
+			// ONE clock sample, taken AFTER the read RETURNS and shared by the
+			// load check and the candidate check below.
+			//
+			// Two properties, and they pull in opposite directions if you only
+			// think about one of them:
+			//
+			//   - ONE sample, not two. Two samples could straddle the forward
+			//     bound and validate `prev` against a different instant than the
+			//     value actually derived from it.
+			//   - AFTER the read, not before. The clock-credibility gate
+			//     (epochClockSaneFloor) is what decides whether the forward
+			//     bound applies at all, so the sample must describe the clock as
+			//     it is when the value is JUDGED, not as it was when the read
+			//     was issued. Sampling first reopened the exact hole this
+			//     function exists to close on an appliance with a dead RTC:
+			//     xpfd starts near 1970, the sample captures that uncredible
+			//     instant, the read stalls (a cold or busy disk is the ordinary
+			//     case here, not a contrived one), NTP corrects the clock to the
+			//     present before the read returns, and a corrupt-but-below-2200
+			//     value is then judged against the stale 1970 sample — so the
+			//     forward bound is skipped and the bad successor is published by
+			//     a node whose clock was, by the time it mattered, perfectly
+			//     good. Sampling here shrinks that window to the microseconds
+			//     between the read returning and the comparison, and there is no
+			//     I/O left inside it.
+			//
+			// Only the read path needs a sample: the non-existent-file and
+			// read-error paths never consult the clock.
+			now := epochNowNanos()
 			n, perr := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
 			switch {
 			case perr != nil:
@@ -488,6 +538,19 @@ func refineBootEpoch(path string, published *atomic.Uint64) {
 				// ahead. Chaining from it would push this node toward MaxUint64,
 				// where the NEXT boot regresses, and would strand it above the
 				// range its peer accepts. Ignoring it heals the file.
+				//
+				// NOT ONLY those, though — and the residual is #6711. An INTACT
+				// value written by a correctly-clocked earlier incarnation lands
+				// here too if THIS incarnation's clock has stepped back by more
+				// than bootEpochMaxSkew while still sitting above
+				// epochClockSaneFloor. The peer latched the earlier value, so
+				// declining to chain leaves this node below its floor until a
+				// restart. Both branches are lockouts; this one ends at the next
+				// restart and chaining does not end at all, which is why it is
+				// still the right way round. Carrying an intact predecessor
+				// across a larger backward step needs a change to persistence
+				// semantics, so it is tracked there rather than papered over
+				// here.
 				slog.Warn("cluster: HA boot-epoch state cannot be chained from (it, or the epoch derived "+
 					"from it, is out of range); ignoring it and keeping the wall-clock epoch",
 					"path", path, "value", n)

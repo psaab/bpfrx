@@ -169,10 +169,13 @@ func TestRefinementValidatesThePublishedEpochNotJustThePersistedOne_6169(t *test
 // is credible at the moment refinement loads the file: below
 // epochClockSaneFloor the forward bound is skipped, so a wrong-but-below-2200
 // value passes and is chained from. That skip is deliberate — under a dead RTC
-// a legitimate previous epoch and a corrupt future one are indistinguishable,
-// both ~56 years "ahead" of a 1970 clock — so this test documents a residual
-// rather than a bug to fix. Refinement runs once per Manager, so a later NTP
-// correction does not re-validate the value.
+// a legitimate previous epoch and a corrupt future one are both implausibly far
+// "ahead" of a 1970 clock (a legitimate present-day value by ~56 years, the
+// year-2191 fixture below by ~222) and nothing on this node separates them,
+// because the predicate that WOULD discriminate is exactly the one being
+// skipped — so this test documents a residual rather than a bug to fix.
+// Refinement runs once per Manager, so a later NTP correction does not
+// re-validate the value.
 //
 // RED-on-revert for the DOCUMENTATION: if the healing precondition is ever
 // removed from epochWithinForwardBound / the README, this test still pins the

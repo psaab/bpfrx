@@ -341,6 +341,12 @@ peer liveness (`lastSeen`) or drive election.
     (fresh image, wiped `/var/lib`, first boot) is dominated by the wall
     clock. Resolution is NANOSECONDS deliberately: a coarser seed hands two
     incarnations starting in the same interval identical values.
+    **The first term is BOUNDED, and the bound is `bootEpochMaxSkew` (one
+    hour).** A persisted value further ahead than that is not chained from at
+    all (`epochOrderable` in `refineBootEpoch`), so a backward step LARGER
+    than an hour is not carried across even with the file perfectly intact —
+    see residual 3 and #6711. Read `persisted+1` as covering ordinary RTC
+    skew and NTP corrections, not arbitrary clock faults.
   - **The DOWNGRADE LATCH — without it the floor closes almost nothing.**
     The floor only ever sees frames that CARRY an epoch, and an attacker's
     captures are by construction mostly from BEFORE the upgrade, so they
@@ -380,20 +386,37 @@ peer liveness (`lastSeen`) or drive election.
     epoch frame re-arms the latch against the empty post-restart state, so the
     restart alone is not reliable recovery (residual 5).
 
-    An earlier revision persisted the floor so the latch also survived a daemon
+    An earlier revision persisted the FLOOR so the latch also survived a daemon
     restart. Review priced that and it was removed: a peer-floor state file
     turns a deliberate ROLLBACK into "delete the right file on the right node
     and restart" — a procedure done under pressure at 3am — opens a crash
     window between accepting a frame and committing the floor, needs
     cross-process locking on the receive path, and lets an in-range-but-wrong
-    epoch lock a peer out across reboots. The window it closed needs a daemon
-    restart AND a genuinely absent peer AND an attacker holding pre-upgrade
-    captures; and rotating the control-link PSK — already a REQUIRED
-    post-upgrade step — retires those captures outright. Rollback recovery is
-    now that same rotation followed by `systemctl restart xpfd`, both operations
-    operators already perform, rather than a hand-edit of state. The rotation
-    carries real weight here: without it the restart is defeatable by one
-    replayed archived frame (residual 5).
+    epoch lock a peer out across reboots.
+
+    **A durable LATCH is not the same object as a durable FLOOR, and the two
+    must be priced apart.** The narrowest durable latch is a PSK-scoped boolean
+    — `{key fingerprint, epochSeen}` — which persists no epoch, so an in-range
+    wrong floor still dies at the next restart, and which resets by
+    construction on a PSK rotation. Neither floor cost above applies to it. It
+    is still declined, on its own costs: the durable write has to land BEFORE
+    the frame is accepted (a crash in between leaves the latch clear across the
+    reboot, which is exactly the state a replay wants), so it puts storage on
+    the control-channel receive path with no good failure policy — fail-open
+    buys nothing over today, fail-closed lets a disk fault refuse a healthy
+    peer; it needs the same cross-process lock for the same `SO_REUSEPORT`
+    reason; and it makes the NO-ATTACKER rollback strictly worse, since a
+    restart would no longer clear the latch and every deliberate downgrade
+    would require a PSK rotation across both nodes.
+
+    The window either design closes needs a daemon restart AND a genuinely
+    absent peer AND an attacker holding pre-upgrade captures; and rotating the
+    control-link PSK — already a REQUIRED post-upgrade step — retires those
+    captures outright, closing it from the other side without any durable state.
+    Rollback recovery is now that same rotation followed by `systemctl restart
+    xpfd`, both operations operators already perform, rather than a hand-edit of
+    state. The rotation carries real weight here: without it the restart is
+    defeatable by one replayed archived frame (residual 5).
   - **ALWAYS-EMIT, and why this mechanism costs no HA availability.** The
     epoch is published SYNCHRONOUSLY from the wall clock with **no file access
     at all**, so every frame carries one from the very first send. Persistence
@@ -497,10 +520,29 @@ peer liveness (`lastSeen`) or drive election.
     likely — the hazard `heartbeatStartupGrace` already exists for. Below that
     floor only the absolute bound applies, which is permissive, never locking.
     The trade this makes is deliberate: a backward clock step LARGER than the
-    skew allowance regresses this node's epoch rather than chaining. That value
-    is only reachable if this node's own clock was the wrong one when it
-    persisted — in which case the peer refused and never latched it, so nothing
-    is locked out. A recoverable regression beats an unrecoverable lockout.
+    skew allowance regresses this node's epoch rather than chaining. It is NOT
+    true — an earlier revision of this paragraph said it — that such a value is
+    only reachable when this node's own clock was the wrong one at persist
+    time, and therefore that nothing is ever locked out. An incarnation running
+    at the RIGHT time persists `T` and its peer latches floor `T`; the next
+    incarnation starts at `T-2h` (still credible, above year 2020), rejects the
+    intact `T` for exceeding `now+1h`, publishes `T-2h`, and is refused by the
+    peer until a restart. Both branches of the trade are lockouts; the choice is
+    between one that ends at the next restart on either node and one that never
+    ends, because chaining from an out-of-range value strands this node
+    permanently above the range its peer will ever accept. A recoverable lockout
+    beats an unrecoverable one — but the residual is real and is tracked as
+    #6711, not argued away. Pinned by
+    `TestRefinementValidatesThePublishedEpochNotJustThePersistedOne_6169` and
+    the `value_beyond_the_forward_bound_is_not_chained_from` subtest.
+
+    `refineBootEpoch` takes its ONE clock sample AFTER `os.ReadFile` returns,
+    not before it. Sampling first let a stalled read straddle an NTP correction:
+    a dead-RTC boot captured a 1970 instant, the read completed after the clock
+    reached the present, and the value was then judged against the stale sample
+    — so the credibility gate skipped the forward bound on a node whose clock
+    was by then perfectly good, and a corrupt-but-below-2200 successor was
+    published. (`TestRefinementSamplesTheClockAfterLoadingPersistedState_6669`.)
   - **Cross-process locking on the boot-epoch file** (the only epoch state file
     — there is no peer-floor file). Nothing in xpf enforces a single daemon
     instance: there is no pidfile, and the gRPC listener sets `SO_REUSEPORT`
@@ -628,10 +670,21 @@ peer liveness (`lastSeen`) or drive election.
        cleared latch. With a durable floor this needed deleting a state file,
        which is what made it a MAJOR.
        (`TestInBoundFarFutureEpochLockoutIsBounded_6169`.)
-    3. **Sender epoch double fault.** Losing the persisted epoch AND stepping the
-       clock back below the last emitted value in the same reboot regresses the
-       sender's epoch and the peer refuses it, with the same restart recovery as
-       a rollback. Both terms of the seed must fail together.
+    3. **Sender epoch regression — and it is NOT only a double fault.** Losing
+       the persisted epoch AND stepping the clock back below the last emitted
+       value in the same reboot regresses the sender's epoch and the peer
+       refuses it, with the same restart recovery as a rollback. This
+       paragraph used to end "both terms of the seed must fail together", and
+       that margin does not hold: a SINGLE backward step larger than
+       `bootEpochMaxSkew` (one hour) does it on its own with the persisted file
+       perfectly intact, because `refineBootEpoch` declines to chain from a
+       value more than an hour ahead of `now`. The peer had latched the earlier,
+       correct epoch, so it refuses the restarted node; a later NTP correction
+       does NOT repair it, since the epoch is published once per incarnation and
+       the file has by then been overwritten with the lower value. Recovery is a
+       restart on either node once the clock is right. Tracked as **#6711** — a
+       behavioural fix there touches persistence semantics and is deliberately
+       out of scope here.
     4. **PSK rotation** changes the key-derived marker; the in-memory floor and
        latch are unaffected and stay valid, since a floor is a per-peer counter
        rather than key material.
@@ -646,12 +699,16 @@ peer liveness (`lastSeen`) or drive election.
        rejection warning now says. Scope: a peer that has NEVER emitted an epoch
        cannot be falsely armed this way — there is nothing to capture — so this
        bites on rollback, replacement under the same identity and key, or a
-       partial upgrade. Not closed in code: a durable latch re-creates the
-       peer-floor file this design deliberately removed, and a freshness test
-       needs a challenge-response or timestamp the wire format does not carry
-       (a legitimately long-lived peer's epoch is arbitrarily old, so no recency
-       test separates it from an archived one).
-       (`TestArchivedEpochReplayReArmsLatchAfterRestart_6169`.)
+       partial upgrade. Not closed in code: a durable FLOOR re-creates the
+       peer-floor file this design deliberately removed; a durable PSK-scoped
+       LATCH avoids that but pays a durable write on the accept path, a
+       cross-process lock there, and a heavier no-attacker rollback, to close a
+       window the mandatory PSK rotation already closes (both priced above); and
+       a freshness test needs a challenge-response or timestamp the wire format
+       does not carry (a legitimately long-lived peer's epoch is arbitrarily
+       old, so no recency test separates it from an archived one).
+       (`TestArchivedEpochReplayReArmsLatchAfterRestart_6169`,
+       `TestRollbackRecoveryOrderingIsRotateThenRestart_6169`.)
     6. **A bad persisted epoch heals only if the local clock is credible when
        refinement loads it.** Below `epochClockSaneFloor` the forward bound is
        skipped, so a wrong-but-below-2200 persisted value is chained from rather
@@ -659,13 +716,25 @@ peer liveness (`lastSeen`) or drive election.
        correction does not re-validate it. On an appliance with a dead RTC whose
        `xpfd` always starts before time sync, the value therefore never heals,
        and a correctly clocked peer refuses this node's epoch on its raise path
-       — asymmetric visibility, not mutual isolation. Inherent, not an
-       oversight: under a dead RTC a legitimate previous epoch and a corrupt
-       future one are indistinguishable, and healing after the fact would mean
-       LOWERING a published epoch mid-incarnation, the one direction the design
-       refuses. Operational close: a working RTC, or ordering `xpfd` after time
-       synchronization.
+       — asymmetric visibility, not mutual isolation. No complete close exists:
+       under a dead RTC a legitimate previous epoch and a corrupt future one are
+       indistinguishable (nothing on the node is a trustworthy time reference),
+       and healing after the fact would mean LOWERING a published epoch
+       mid-incarnation, the one direction the design refuses. A PARTIAL
+       narrowing does exist and was declined rather than missed — lowering the
+       arbitrary year-2200 horizon would reject a year-2191 value while still
+       carrying present-day ones — because the horizon is a hard cliff, not
+       spare room: a value at or past it is rejected outright on EVERY frame, so
+       lowering it makes a forward clock fault that much more likely to produce
+       mutual refusal. That trades a fault whose worst case is asymmetric
+       visibility for one whose worst case is dual-master. Reasoned at
+       `epochWithinForwardBound`. Operational close: a working RTC, or ordering
+       `xpfd` after time synchronization.
        (`TestPersistedEpochHealsOnlyWhenClockCredible_6169`.)
+       Refinement's clock sample is taken AFTER the state read returns, so a
+       stalled read straddling an NTP correction cannot judge the file against a
+       clock that no longer exists
+       (`TestRefinementSamplesTheClockAfterLoadingPersistedState_6669`).
   - **No clone/bake requirement** (unlike the SNMPv3 engine-id, `pkg/snmp`).
     Epochs are compared per-PEER, never between the two nodes, so two chassis
     cloned from one image may hold identical persisted boot epochs harmlessly;
@@ -1149,9 +1218,18 @@ Procedure:
 > `Control link statistics:` block. If it is non-zero and still climbing after
 > both nodes are upgraded, this node is still accepting epoch-less frames —
 > either a node is genuinely on an older build, or someone is replaying
-> captures — and the line carries an inline note saying so. Once the peer signs
-> epochs the latch arms, `Epoch downgrades rejected:` starts counting, and the
-> epoch-less count is marked historical.
+> captures — and the line carries an inline note saying so. Once an accepted
+> epoch-bearing frame arms the latch, the inline note flips to "epoch-less
+> frames now refused; count is historical" and the epoch-less count stops
+> climbing.
+>
+> `Epoch downgrades rejected:` is a SEPARATE signal and does **not** start
+> counting when the latch arms — it stays at 0 until some later epoch-less
+> frame actually arrives and is refused, which on a healthy upgraded cluster
+> may never happen. Read it as "something is still sending epoch-less frames
+> and being turned away" (a peer left behind, a rollback, or a replay), not as
+> a confirmation that the latch is armed. The inline note is what reports the
+> latch.
 
 Rotation is also the **anti-replay capture-invalidation** step. Every archived
 capture an on-link sniffer holds was signed under the old key, so after a

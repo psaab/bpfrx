@@ -47,7 +47,8 @@ func TestArchivedEpochReplayReArmsLatchAfterRestart_6169(t *testing.T) {
 		}
 	}
 
-	// 3. The operator performs the documented recovery: restart xpfd here.
+	// 3. The operator performs the recovery the README USED to document,
+	//    unqualified: restart xpfd here, with no rotation first.
 	e.restartDaemon()
 	if e.r.auth.peerEpochLatched() {
 		t.Fatal("a daemon restart must disarm the latch")
@@ -75,21 +76,141 @@ func TestArchivedEpochReplayReArmsLatchAfterRestart_6169(t *testing.T) {
 		}
 	}
 
-	// 6. The complete recovery is a PSK ROTATION FIRST: with a new key the
-	//    archived frame no longer verifies, so it cannot reach the latch at all,
-	//    and the restart then sticks.
-	e.restartDaemon()
-	e.key = []byte("rotated-cluster-shared-secret")
-	if e.feed(archived[0]) {
-		t.Fatal("an archived frame still verified after a PSK rotation — rotation is the only " +
-			"thing that retires the attacker's capture, so this must fail")
+	// 6. So a bare restart is not the recovery. WHICH ordering of rotation and
+	//    restart is — and what the wrong one costs — is proved separately, in
+	//    TestRollbackRecoveryOrderingIsRotateThenRestart_6169. Doing it here, in
+	//    a flow that has already restarted twice, is how the previous revision
+	//    ended up asserting "rotation first" over a body that restarted first.
+}
+
+// rolledBackPeerRefusedUnderArchive builds the state both recovery orderings
+// start from, so neither has to be inferred from the other's leftovers:
+//
+//   - the peer ran an epoch-capable build, so the downgrade latch is ARMED;
+//   - an on-link attacker holds an archived epoch-bearing frame from that
+//     period, signed under the CURRENT PSK;
+//   - the peer has since been legitimately rolled back to a pre-#6169 build and
+//     its genuine epoch-less frames are being refused.
+//
+// It returns the env and the attacker's archived frame.
+func rolledBackPeerRefusedUnderArchive(t *testing.T, session uint64) (*latchEnv, []byte) {
+	t.Helper()
+	e := newLatchEnv(t)
+
+	const peerEpoch = uint64(9_500_000_000_000_000)
+	archived := e.captureIncarnation(session, peerEpoch, epochFramesPerIncarnation)
+	e.liveRun(archived, "peer on an epoch-capable build")
+	if !e.r.auth.peerEpochLatched() {
+		t.Fatal("setup: an accepted epoch-bearing frame must arm the latch")
 	}
-	if e.r.auth.peerEpochLatched() {
-		t.Fatal("a frame that failed MAC verification must not arm the latch")
+
+	for i, f := range e.captureIncarnation(session+1, 0, epochFramesPerIncarnation) {
+		if e.feed(f) {
+			t.Fatalf("setup: rolled-back frame %d admitted; the latch is not engaging", i)
+		}
 	}
-	// The rolled-back peer, re-keyed with the operator, is accepted again.
-	e.liveRun(e.captureIncarnation(0x6702, 0, epochFramesPerIncarnation),
-		"rolled-back peer after rotating the PSK and restarting")
+	return e, archived[0]
+}
+
+// TestRollbackRecoveryOrderingIsRotateThenRestart_6169 pins the ORDER the
+// operator warning and pkg/cluster/README.md both prescribe, by executing both
+// orderings end to end.
+//
+// The two steps do different jobs and neither substitutes for the other:
+// rotation retires the attacker's archive (every captured frame fails
+// verifyHeartbeatMAC under the new key) but does NOT clear the in-memory latch;
+// a restart clears the latch but does NOT retire the archive. So the order is
+// the whole content of the advice, and a test that asserts one ordering in a
+// comment while executing the other proves neither.
+//
+// RED-on-revert: swap the two operations inside either subtest.
+func TestRollbackRecoveryOrderingIsRotateThenRestart_6169(t *testing.T) {
+	rotated := []byte("rotated-cluster-shared-secret")
+
+	t.Run("rotate_then_restart_recovers", func(t *testing.T) {
+		e, archived := rolledBackPeerRefusedUnderArchive(t, 0x6710)
+
+		// ROTATE FIRST. The archive dies with the old key — but rotation alone
+		// is not the recovery: the latch is in memory and rotation does not
+		// touch it, so the rolled-back peer is still refused under the new key.
+		e.key = rotated
+		if !e.r.auth.peerEpochLatched() {
+			t.Fatal("a PSK rotation must not, by itself, clear the downgrade latch — if it did, " +
+				"the restart in the documented recovery would be pointless")
+		}
+		for i, f := range e.captureIncarnation(0x6712, 0, epochFramesPerIncarnation) {
+			if e.feed(f) {
+				t.Fatalf("re-keyed rolled-back frame %d admitted before the restart; rotation "+
+					"alone cannot be the recovery", i)
+			}
+		}
+
+		// THEN RESTART. The latch clears, and there is nothing left to re-arm it.
+		e.restartDaemon()
+		if e.r.auth.peerEpochLatched() {
+			t.Fatal("a daemon restart must disarm the latch")
+		}
+		if e.feed(archived) {
+			t.Fatal("an archived frame still verified after a PSK rotation — rotation is the " +
+				"only thing that retires the attacker's capture, so this must fail")
+		}
+		if e.r.auth.peerEpochLatched() {
+			t.Fatal("a frame that failed MAC verification must not arm the latch")
+		}
+
+		// The rolled-back peer, re-keyed with the operator, is accepted again —
+		// and stays accepted while the attacker keeps replaying.
+		e.liveRun(e.captureIncarnation(0x6713, 0, epochFramesPerIncarnation),
+			"rolled-back peer after rotating the PSK and restarting")
+		if e.feed(archived) {
+			t.Fatal("the retired archive verified on a later attempt")
+		}
+		e.liveRun(e.captureIncarnation(0x6714, 0, epochFramesPerIncarnation),
+			"rolled-back peer after a further replay attempt")
+	})
+
+	t.Run("restart_then_rotate_costs_a_second_restart", func(t *testing.T) {
+		e, archived := rolledBackPeerRefusedUnderArchive(t, 0x6720)
+
+		// RESTART FIRST — the wrong order. The latch clears, and the archive is
+		// still valid because the key has not changed yet, so one replay lands
+		// in the window and re-arms it.
+		e.restartDaemon()
+		if e.r.auth.peerEpochLatched() {
+			t.Fatal("a daemon restart must disarm the latch")
+		}
+		if !e.feed(archived) {
+			t.Fatal("the archived frame was refused by a freshly restarted receiver under the " +
+				"UNROTATED key; if this now fails, the re-arm is closed and README residual 5 " +
+				"plus the arming-site comment in admitAuthedLocked are stale")
+		}
+		if !e.r.auth.peerEpochLatched() {
+			t.Fatal("the replayed archived frame did not re-arm the latch")
+		}
+
+		// NOW rotate. It retires the archive, but the latch it already re-armed
+		// is in memory and rotation does not clear it — a floor and a latch are
+		// per-peer state, not key material. The rolled-back peer stays refused.
+		e.key = rotated
+		if !e.r.auth.peerEpochLatched() {
+			t.Fatal("rotating the PSK must not clear a latch that is already armed; if it did, " +
+				"the ordering advice would be unnecessary")
+		}
+		for i, f := range e.captureIncarnation(0x6722, 0, epochFramesPerIncarnation) {
+			if e.feed(f) {
+				t.Fatalf("re-keyed rolled-back frame %d admitted while the re-armed latch is "+
+					"engaged", i)
+			}
+		}
+
+		// A SECOND restart is what recovers — the cost of the wrong order.
+		e.restartDaemon()
+		if e.feed(archived) {
+			t.Fatal("the archived frame verified after the rotation; it must be dead by now")
+		}
+		e.liveRun(e.captureIncarnation(0x6723, 0, epochFramesPerIncarnation),
+			"rolled-back peer after the SECOND restart")
+	})
 }
 
 // TestEpochDowngradeWarningNamesTheCompleteRecovery_6169 is the fail-on-revert

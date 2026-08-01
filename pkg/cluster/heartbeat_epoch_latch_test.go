@@ -130,7 +130,10 @@ func TestHeartbeatEpochLatchScopeIsTheProcess_6169(t *testing.T) {
 	}
 
 	// A FULL daemon restart clears it. Documented, and the reason rollback
-	// recovery is "restart xpfd" rather than deleting a state file.
+	// recovery is "rotate the PSK, then restart xpfd" rather than deleting a
+	// state file. (The rotation is the half that retires an attacker's archive;
+	// see TestRollbackRecoveryOrderingIsRotateThenRestart_6169. Nothing is being
+	// replayed here, so the restart alone is enough for this assertion.)
 	e.restartDaemon()
 	if e.r.auth.peerEpochLatched() {
 		t.Fatal("a full daemon restart is documented to clear the latch; it did not")
@@ -188,10 +191,20 @@ func TestHeartbeatEpochUpgradeWindowStillAccepts_6169(t *testing.T) {
 //
 // The peer IS refused; that is the deliberate trade, and the same one #4107's
 // sticky peerAuthSeen already makes for the auth trailer. Recovery is
-// `systemctl restart xpfd` on the refusing node — an operation operators
-// already perform, with no state file to hand-edit. That is the reason the
-// latch is process-scoped: an earlier revision persisted it, which turned this
-// procedure into "delete the right file on the right node, then restart".
+// ROTATE THE CONTROL-LINK PSK ON BOTH NODES, THEN `systemctl restart xpfd` on
+// the refusing node — operations operators already perform, with no state file
+// to hand-edit. That is the reason the latch is process-scoped: an earlier
+// revision persisted it, which turned this procedure into "delete the right
+// file on the right node, then restart".
+//
+// THE ROTATION IS NOT OPTIONAL AND ITS POSITION IS NOT COSMETIC. A bare restart
+// clears the latch, the floor and the ring together, so a single ARCHIVED
+// epoch-bearing frame replayed into that empty state re-arms the latch and the
+// rolled-back peer is refused again — one replay per restart, indefinitely.
+// Rotation is what retires the archive. This test covers only the no-attacker
+// case, where the restart alone is enough; the ordering itself is proved in
+// TestRollbackRecoveryOrderingIsRotateThenRestart_6169 and the re-arm in
+// TestArchivedEpochReplayReArmsLatchAfterRestart_6169.
 func TestHeartbeatEpochRollbackRefusedThenRecovered_6169(t *testing.T) {
 	e := newLatchEnv(t)
 	e.liveRun(e.captureIncarnation(0x44E0, 9_300_000_000_000_000, epochFramesPerIncarnation), "peer on an epoch-capable build")
@@ -209,7 +222,11 @@ func TestHeartbeatEpochRollbackRefusedThenRecovered_6169(t *testing.T) {
 			got, len(rolledBack))
 	}
 
-	// Documented recovery: restart xpfd on the refusing node. No file to delete.
+	// Documented recovery, second half: restart xpfd on the refusing node. No
+	// file to delete. The first half — rotating the control-link PSK — is not
+	// exercised here because no archived frame is being replayed in this
+	// scenario; with one, the restart alone is defeated
+	// (TestRollbackRecoveryOrderingIsRotateThenRestart_6169).
 	e.restartDaemon()
 	if e.r.auth.peerEpochLatched() {
 		t.Fatal("a daemon restart must disarm the latch")
@@ -513,7 +530,10 @@ func TestHeldFlockCannotCauseFalsePeerDeath_6169(t *testing.T) {
 //     peer's own wall-clock seed climbs past the floor within that window; and
 //  2. the floor is in memory, so `systemctl restart xpfd` on the refusing node
 //     clears it immediately — with a durable floor this needed deleting a state
-//     file, which is what made it a MAJOR.
+//     file, which is what made it a MAJOR. Subject to the same caveat as the
+//     latch: a replayed archived frame can re-raise a cleared floor exactly as
+//     it re-arms a cleared latch (README residual 5), so with an attacker
+//     present the restart must follow a PSK rotation.
 func TestInBoundFarFutureEpochLockoutIsBounded_6169(t *testing.T) {
 	e := newLatchEnv(t)
 	now := uint64(time.Now().UnixNano())

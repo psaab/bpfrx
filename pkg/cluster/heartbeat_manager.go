@@ -496,6 +496,20 @@ func (m *Manager) handlePeerNeverSeen() {
 }
 
 // HeartbeatStats returns current heartbeat counters.
+//
+// The SCOPES here differ, and reporting them off the same nil check was a
+// defect. Sent/Received/error counts belong to the goroutine currently
+// installed, so they are correctly gated on a live sender/receiver. The #6169
+// epoch state does NOT: the downgrade latch and its counters live on
+// Manager.hbAuth precisely so a heartbeat restart or a VRF rebind cannot reset
+// them (#5086/#6642), and the receiver merely holds a pointer to it.
+//
+// Gating them on `receiver != nil` therefore reported the latch as CLEAR during
+// every window in which no receiver is installed — StopHeartbeat, and the whole
+// bind-retry span of a failed RestartHeartbeat, which is up to ~5s of retries
+// and is exactly when an operator is looking at the status output. The
+// underlying state was armed the entire time. Read it from the Manager, which
+// owns it, so the report tracks the process state rather than the goroutine's.
 func (m *Manager) HeartbeatStats() HeartbeatStats {
 	m.mu.RLock()
 	sender := m.hbSender
@@ -510,10 +524,11 @@ func (m *Manager) HeartbeatStats() HeartbeatStats {
 	if receiver != nil {
 		s.Received = receiver.received.Load()
 		s.RecvErrors = receiver.recvErrors.Load()
-		s.EpochlessAdmitted = receiver.auth.epochlessAdmitted.Load()
-		s.EpochDowngradeRejected = receiver.auth.epochDowngradeRejected.Load()
-		s.PeerEpochLatched = receiver.auth.peerEpochLatched()
 	}
+	// Process-scoped, not receiver-scoped: valid with no receiver installed.
+	s.EpochlessAdmitted = m.hbAuth.epochlessAdmitted.Load()
+	s.EpochDowngradeRejected = m.hbAuth.epochDowngradeRejected.Load()
+	s.PeerEpochLatched = m.hbAuth.peerEpochLatched()
 	return s
 }
 

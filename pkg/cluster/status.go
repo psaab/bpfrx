@@ -788,7 +788,15 @@ func epochlessExposureNote(s HeartbeatStats) string {
 		return ""
 	}
 	if s.PeerEpochLatched {
-		return "  (peer now signs boot epochs; count is historical)"
+		// "the latch is armed", NOT "the peer now signs boot epochs". They are
+		// not the same statement, and only the first is something this node
+		// knows. An ARCHIVED epoch-bearing frame replayed after a restart arms
+		// the latch just as a live one does (README residual 5), so the latch
+		// can be armed while the peer currently on the wire is a rolled-back,
+		// epoch-less build being refused. What the operator can rely on is the
+		// consequence — epoch-less frames are refused from here on, so the count
+		// stops being live exposure — and that is what this says.
+		return "  (epoch-less frames now refused; count is historical)"
 	}
 	return "  (peer not signing boot epochs - replay protection is ring-only; rotate the control-link PSK once both nodes are upgraded)"
 }

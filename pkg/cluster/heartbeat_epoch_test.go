@@ -499,12 +499,38 @@ func TestBootEpochMonotonic_6169(t *testing.T) {
 	// NOT chained from, so a backward clock step larger than the skew allowance
 	// does regress this node's epoch.
 	//
-	// That is the right way round. Such a value is only reachable if this
-	// node's own clock was the wrong one when it persisted — and in that case
-	// the peer (with a correct clock) refused and never latched it, so nothing
-	// is locked out. Chaining from it instead would strand this node
+	// WHY THE RATIONALE HERE IS NARROWER THAN IT LOOKS. An earlier revision of
+	// this comment justified the trade by asserting that such a value "is only
+	// reachable if this node's own clock was the wrong one when it persisted —
+	// in which case the peer refused and never latched it, so nothing is locked
+	// out". That is FALSE, and a characterization test whose stated reason is
+	// wrong is worse than one with no reason at all: it stops the next reader
+	// questioning the behaviour. There is a second, entirely benign way to
+	// reach it, with intact storage and a CORRECT earlier clock:
+	//
+	//	1. incarnation A runs at the right time T, persists T; the peer
+	//	   latches floor T — so something IS locked out;
+	//	2. incarnation B starts with its clock at T-2h, still comfortably
+	//	   above epochClockSaneFloor, and publishes T-2h;
+	//	3. refinement rejects the intact, correct persisted T for exceeding
+	//	   now+bootEpochMaxSkew, leaves prev=0, and overwrites the file with
+	//	   T-2h;
+	//	4. the peer refuses every B frame below floor T, and a later NTP
+	//	   correction cannot move B's already-published epoch — a restart is
+	//	   needed.
+	//
+	// So the honest statement of the trade is: BOTH outcomes are lockouts, and
+	// the choice is between one that ends at the next restart and one that does
+	// not end at all. Chaining from an out-of-range value would strand this node
 	// permanently above the range its peer will ever accept, with no way back
-	// down. Recoverable regression beats unrecoverable lockout.
+	// down; declining costs a lockout that any restart on either node clears.
+	// Recoverable beats unrecoverable — but it is not free, and it is not
+	// confined to a node that was already misconfigured.
+	//
+	// The behavioural fix (carrying an intact persisted epoch across a larger
+	// backward step without reopening the unbounded-chain hazard) touches
+	// persistence semantics and is tracked separately as #6711. This subtest
+	// pins today's behaviour, not the desired one.
 	t.Run("value_beyond_the_forward_bound_is_not_chained_from", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "ha-boot-epoch")
 		farAhead := uint64(time.Now().UnixNano()) + bootEpochMaxSkew*3

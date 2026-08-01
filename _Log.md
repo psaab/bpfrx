@@ -66662,3 +66662,69 @@ break — `go vet` confirmed passing under every revert.
   pkg/cluster/heartbeat_epoch_rollback_recovery_6669_test.go,
   pkg/cluster/heartbeat_epoch_status_6169_test.go,
   pkg/cluster/heartbeat_epoch_latch_test.go, _Log.md
+
+- **Timestamp**: 2026-08-01 21:40
+- **Action**: #6169 fold round 2 (PR #6669) — Codex verification of the previous
+  fold returned MERGE-NEEDS-MAJOR. (MAJOR-1, a regression the previous fold
+  introduced) Collapsing two clock samples into one was right, but the single
+  sample was taken BEFORE `os.ReadFile` rather than after it, so a stalled read
+  straddling an NTP correction judged the persisted value against a clock that
+  no longer existed: a dead-RTC boot captured 1970, the read completed after the
+  clock reached the present, `epochClockSaneFloor` then skipped the forward
+  bound on the stale sample, and a corrupt-but-below-2200 successor was
+  published by a node whose clock was by then good. Sample moved after the
+  successful read; only that branch consults the clock. (MAJOR-2, claims only —
+  the behavioural fix is #6711) A single backward clock step larger than
+  `bootEpochMaxSkew`, with storage intact and the EARLIER clock correct,
+  regresses the sender epoch below a floor its peer already latched. Corrected
+  the sender bullet, the forward-bound trade paragraph and residual 3 in
+  pkg/cluster/README.md, the chain-refusal comment in `refineBootEpoch`, and the
+  `value_beyond_the_forward_bound_is_not_chained_from` rationale, which pinned
+  the behaviour on the false assertion that such a value is reachable only when
+  this node's own clock was wrong at persist time. (MINOR-3)
+  `Manager.HeartbeatStats` read the downgrade latch and its counters through the
+  installed receiver and gated them on `receiver != nil`, so it reported the
+  latch CLEAR through `StopHeartbeat` and the whole ~5s bind-retry span of a
+  failed `RestartHeartbeat` — and status therefore re-ran the "replay protection
+  is ring-only; rotate the PSK" advice while the latch was refusing. Read from
+  `m.hbAuth`, which owns them. (MINOR-4) The recovery test asserted rotate-first
+  over a body that restarted first, with no replay between, so it proved neither
+  ordering; replaced with `TestRollbackRecoveryOrderingIsRotateThenRestart_6169`
+  executing both — rotate/restart recovers, restart/rotate re-arms via one
+  replayed archived frame and costs a second restart. (MINOR-5) Corrected the
+  remaining contradictory text: the ~56-vs-222-year magnitude in the bounds
+  test, the README claim that the downgrade counter starts when the latch arms
+  (it stays 0 until a later epochless frame is refused), the status note
+  asserting the peer "now signs boot epochs" when an archive can arm the latch
+  against a rolled-back epochless peer, and four sites still calling a bare
+  restart the rollback recovery. Also addressed two Codex design critiques in
+  the rationale rather than the code: the "not closable" claim is now qualified
+  with the partial narrowing that exists (lowering the arbitrary year-2200
+  horizon) and why it is declined — the horizon is a hard cliff, and a value
+  past it is rejected on EVERY frame, so lowering it trades a fault whose worst
+  case is asymmetric visibility for one whose worst case is mutual refusal; and
+  the durable-latch rejection no longer charges a durable LATCH for the costs of
+  a durable FLOOR — a PSK-scoped `{key fingerprint, epochSeen}` boolean avoids
+  both floor costs and is declined on its own (a durable write on the accept
+  path with no good failure policy, cross-process locking there, a strictly
+  heavier no-attacker rollback, closing a window the mandatory PSK rotation
+  already closes).
+  Validation: `go build -buildvcs=false ./...` and `go vet ./pkg/cluster/...`
+  rc 0 before every red; `go test -race ./pkg/cluster/` green; consumer packages
+  (cmd/cli, cmd/xpfd, pkg/cli, pkg/clusterfailover, pkg/daemon, pkg/grpcapi,
+  pkg/upgrade, pkg/vrrp) green. Four mutations, each with build+vet CLEAN first
+  and each scoped to its own assertions: hoisting the clock sample back above
+  the read reds only the new sample-placement test at exactly 7000000000000000001
+  while `absolute_band`, `forward_bound` and the `in_range_predecessor_still_
+  chains` control stay green; re-gating the epoch fields on `receiver != nil`
+  reds only the new stats-scope test; and swapping the two operations inside
+  each ordering subtest reds that subtest alone.
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/heartbeat_manager.go, pkg/cluster/manager.go,
+  pkg/cluster/status.go, pkg/cluster/README.md,
+  pkg/cluster/heartbeat_epoch_clock_sample_6669_test.go,
+  pkg/cluster/heartbeat_epoch_stats_scope_6669_test.go,
+  pkg/cluster/heartbeat_epoch_test.go,
+  pkg/cluster/heartbeat_epoch_bounds_6669_test.go,
+  pkg/cluster/heartbeat_epoch_rollback_recovery_6669_test.go,
+  pkg/cluster/heartbeat_epoch_latch_test.go, _Log.md
