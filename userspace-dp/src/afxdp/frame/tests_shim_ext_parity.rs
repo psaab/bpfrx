@@ -747,6 +747,19 @@ fn shim_walk_and_userspace_walk_agree_over_a_corpus() {
         // while the shim's arm simply fails the 8-byte read and the whole walk
         // returns None. Comparing sighting state across a refusal would assert a
         // correspondence that does not exist and is not needed.
+        //
+        // PROVENANCE, because a narrowing looks identical to the bug it could
+        // be. This scope was NOT reasoned to in advance. The naive full-record
+        // comparison was written first, and it RED on
+        // `Fragment truncated to 2 bytes`: userspace reported
+        // `saw_fragment: true` from a declared-but-unreadable header while the
+        // shim's 8-byte read failed and the walk returned None. Reading that
+        // failure is what established the boundary — a conclusion from an
+        // observed false positive, not an assumption baked in at design time.
+        // Anyone auditing this should re-derive the compared-field list from
+        // `ExtChainWalk` itself rather than from this comment, and treat a
+        // field present in the type but absent here as the same defect class
+        // that motivated widening the comparison in the first place.
         let mismatch = if matches!(s.verdict, Verdict::L4(..)) || matches!(u.verdict, Verdict::L4(..)) {
             s != u
         } else {
