@@ -7,7 +7,34 @@ import (
 )
 
 const (
-	ProtocolVersion                  = 3
+	// ProtocolVersion is the config-snapshot wire contract version. It is
+	// the Go mirror of CONFIG_SNAPSHOT_PROTOCOL_VERSION
+	// (userspace-dp/src/protocol/control.rs) and the two MUST be bumped in
+	// lockstep: both apply_snapshot and bump_fib_generation gate on EXACT
+	// equality, so a helper at a different version refuses the snapshot
+	// outright rather than decoding it under the wrong contract.
+	//
+	// v4 (#5488): a scoped GLOBAL policy carries its zone SCOPE as a zone
+	// SET in the plural match_from_zones/match_to_zones fields, and those
+	// fields are AUTHORITATIVE. The singular match_from_zone/match_to_zone
+	// fields carry only the FIRST element (config.ScopeSingular).
+	//
+	// #4626 added the plural fields as purely ADDITIVE JSON without bumping
+	// this constant, which made the version handshake lie: a pre-#4626
+	// helper advertising the same version 3 ignores fields it does not know
+	// and reads ONLY the singular field, so a global `deny` scoped
+	// `[dmz trust] -> untrust` silently NARROWS to `dmz -> untrust` and the
+	// trust-sourced traffic the operator denied is evaluated by lower
+	// precedence rules instead — a rolling-upgrade fail-OPEN. A
+	// compatibility extension that changes deny/reject COVERAGE must not be
+	// silently ignorable under an unchanged protocol version.
+	//
+	// The bump alone only makes an old helper REFUSE the snapshot (it keeps
+	// forwarding its previous-good image), so it is paired with the
+	// ensureScopedGlobalZoneSetProtocolLocked required-protocol gate in
+	// manager_compile.go, which DISARMS the helper and aborts the commit
+	// when the running helper is too old to represent a multi-zone scope.
+	ProtocolVersion                  = 4
 	InjectPacketTupleProtocolVersion = 1
 	TypeUserspace                    = "userspace"
 
