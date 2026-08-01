@@ -517,12 +517,20 @@ func (s SNMPConfig) MarshalYAML() (any, error) {
 // Name is the SNMPv1/v2c community string, which IS the shared secret (it
 // authorizes the request on the wire). It is also the key of the
 // SNMPConfig.Communities map, so it stays a plain string (the map lookup in
-// pkg/snmp/agent.go is by the on-wire community string). Redaction is
-// applied only on the JSON/YAML surface via the targeted MarshalJSON /
-// MarshalYAML below — keeping it a string means the map key, the compiler
-// assignment, and the text `show snmp` / `show configuration` render paths
-// (which print the map key, not this field, and are out of scope for the
-// #2053 marshal leak) are all unchanged.
+// pkg/snmp/agent.go is by the on-wire community string). Redaction on the
+// JSON/YAML surface is applied via the targeted MarshalJSON / MarshalYAML
+// below; keeping Name a string leaves the map key and the compiler assignment
+// unchanged.
+//
+// The cost of that choice is that Name is the ONE operator secret in the
+// config tree not covered by the Secret newtype's String() redaction (#2053) —
+// every other secret masks itself under %s/%v, this one does not. So each
+// manual TEXT renderer that prints the map key must mask it explicitly, via
+// the shared SNMPCommunityDisplayName helper below. Three surfaces do:
+// pkg/cli `show snmp` / `show system services` (#4111), the pkg/api show-text
+// handler (#5315) and the pkg/grpcapi ShowText snmp topic (#6532). The raw-AST
+// `show configuration` render paths are masked separately by RedactedClone
+// (ast_redact.go, #4051), which matches the community on the AST key path.
 type SNMPCommunity struct {
 	Name          string
 	Authorization string // "read-only" or "read-write"
@@ -573,6 +581,37 @@ func (c SNMPCommunity) MarshalYAML() (any, error) {
 		Authorization string
 		Clients       []SNMPClient `yaml:",omitempty"`
 	}{Name: Secret(c.Name), Authorization: c.Authorization, Clients: c.Clients}, nil
+}
+
+// SNMPCommunityDisplayName returns the token an operator-facing TEXT renderer
+// must print in place of an SNMPv1/v2c community name. It is the single
+// implementation of the community-masking rule, shared by every render surface
+// that formats the Communities map key itself:
+//
+//   - pkg/cli `show snmp` + `show system services` (#4111) pass
+//     redact=showConfigRedacted(), so a VIEW-only login class sees the
+//     placeholder and super-user keeps cleartext (the #4057/#4106
+//     console-operator allowance).
+//   - pkg/api show-text (#5315) and pkg/grpcapi ShowText (#6532) pass
+//     redact=true unconditionally: neither surface carries a login class to
+//     gate on, so there is no privileged caller to exempt. The gRPC one is not
+//     merely loopback — ShowText is on the cluster-fabric allowlist (#4122),
+//     reachable from the peer chassis.
+//
+// The authorization mode is NOT a secret and is never masked by this helper —
+// callers keep rendering it in the clear.
+//
+// Why a helper and not an inline `if` per site: the community is the one
+// operator secret that the Secret newtype does not protect (see SNMPCommunity
+// above), so every renderer must remember to mask it by hand. Three
+// independent copies of that one-line rule is precisely how the gRPC surface
+// silently stayed in the clear for two hardening passes (#6532). One
+// implementation, one place to audit.
+func SNMPCommunityDisplayName(name string, redact bool) string {
+	if redact {
+		return SecretDataPlaceholder
+	}
+	return name
 }
 
 // SNMPTrapGroup defines an SNMP trap destination group.

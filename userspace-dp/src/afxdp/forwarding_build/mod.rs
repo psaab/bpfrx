@@ -618,7 +618,7 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     // #1636 option D: compute the pending-neighbor drop timeout from the
     // live kernel retrans_time_ms sysctls. Re-evaluated every snapshot so
     // a runtime sysctl change (e.g. an admin reverting PR-1) is picked up
-    // on the next apply and propagated atomically via ha.forwarding.
+    // on the next apply and propagated atomically via the ha.runtime view.
     state.pending_neigh_timeout_ns =
         compute_pending_neigh_timeout_ns(&state.ifindex_to_name, &RealSysctlReader);
 

@@ -49,6 +49,9 @@ type JunosHostDenyRule struct {
 	SrcExcluded    bool
 	Src            []string
 	PermitSubtract []string
+	DstAny         bool
+	DstExcluded    bool
+	Dst            []string
 	L4             []JunosHostDenyL4
 }
 

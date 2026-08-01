@@ -1,3 +1,289 @@
+## 2026-07-31 — #6532 round-4 fold: stopped patching callee shapes, changed the approach
+
+- **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact, PR #6602)
+- **Action**: Codex found two more escapes on db5162267 — `[](byte)(x.PSK)` and
+  `([](byte))(x.PSK)` (the callee was de-parenthesized but `arr.Elt` was still
+  required to be an immediate Ident), and `string(x.PSK[:])` (trailingIdent did
+  not traverse SliceExpr). It also named the escape that ends the approach:
+  `type Clear string; Clear(x.PSK)` unwraps the secret and NO builtin-name
+  matching can ever see it, because a conversion's callee is a type expression
+  whose grammar is open.
+  Per the team-lead directive, stopped patching outward and changed the design:
+  the conversion check NO LONGER INSPECTS THE CALLEE AT ALL. It now fires on a
+  one-argument call whose argument names a Secret-bearing field. Every
+  conversion — builtin, parenthesized at any depth, aliased, or a named string
+  type declared anywhere — is a one-argument call, so the whole callee-shape
+  dimension collapses to zero code. One argument is a deliberate line, not an
+  oversight: the SAFE idiom `fmt.Fprintf(buf, "%s", x.PSK)` is multi-argument
+  and redacts correctly, so flagging it would fire on every correct render.
+  `secretUnwrapConversionName` and `unwrapParens` were deleted outright.
+  The remaining gated dimension — the argument's wrapper chain — is closed by
+  ENUMERATING go/ast node kinds rather than source shapes: secretExprTail now
+  handles Paren, Star, Index, IndexList, Slice, TypeAssert and address-of Unary.
+  Harvest gaps Codex flagged also fixed: typeMentionsSecret now strips parens
+  (`PSK (Secret)` is legal) and follows ChanType; structTypeOf follows map KEYS
+  as well as values (an anonymous struct is a legal comparable map key).
+  Added TestSecretFieldHarvestShapes — 13 synthetic declaration shapes plus a
+  negative control — because the harvest had been widened in prose and code but
+  never tested, the same gap that let the scanner ship blind twice.
+  STATED THE HARD LIMIT, which is the substantive answer rather than another
+  near-miss: this guard is syntactic and fires where a field is NAMED, so it
+  cannot follow a value into a local, a parameter, a helper return, an
+  out-of-package field or a multi-argument handoff, nor see append/copy/range/
+  reflection. Closing those needs go/types (x/tools is only an INDIRECT
+  dependency today) or an explicit-allowlist inversion over all 42 conversions
+  in pkg/grpcapi (measured, not estimated). Named the clean upstream fix:
+  making config.Secret a struct instead of a named string type would make
+  `string(s)` fail to COMPILE and collapse the entire shape space to the single
+  Reveal accessor — a pkg/config-wide change (Secret is comparable and used as
+  a map key), so it belongs in its own issue, not this PR.
+  Also corrected the remaining false claims: the file header no longer says
+  "the TWO ways to defeat"; the Reveal false positive is now stated as EVERY
+  selector named Reveal (package members and fields, not merely methods); and
+  the residual list no longer claims named-type conversions escape, because
+  after the redesign they do not.
+  Validation — 10 mutations, each in a throwaway detached worktree with
+  build+vet CLEAN so every red is an assertion:
+    M1 drop ParenExpr from secretExprTail   -> parenthesized_conversion_argument
+    M2 drop SliceExpr                       -> sliced_field, sliced_field_with_bounds
+    M3 drop StarExpr                        -> pointer_deref, address-of_field,
+                                               pointer_deref_of_indexed_collection
+    M4 drop IndexExpr                       -> indexed_collection_field, +deref
+    M5 drop TypeAssertExpr                  -> type-asserted_field
+    M6 drop ParenExpr from typeMentionsSecret -> parenthesized_type
+    M7 drop ChanType                        -> channel_of_Secret
+    M8 stop following map KEY               -> map_KEY_anonymous_struct
+    M9 drop embedded-field handling         -> embedded_Secret
+    M10 RESTORE callee-shape gating         -> 13 subtests RED, including both
+        named-string-type cases — the empirical proof that the redesign, not
+        another shape patch, was the necessary fix.
+  Meta-tests now run 42 subtests. Probe worktree removed; the PR worktree was
+  never used for a probe. gofmt clean, go build ./... and go vet ./... clean,
+  pkg/grpcapi + pkg/api + pkg/config + pkg/cli green.
+- **File(s)**: pkg/grpcapi/server_fabric_secret_render_6532_test.go,
+    docs/architecture.md, _Log.md
+
+## 2026-07-31 — #6532 round-3 fold: parenthesized callees escaped the scanner
+
+- **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact, PR #6602)
+- **Action**: Codex found the round-2 scanner still missed shapes it claimed to
+  cover, and it was right. `(x.PSK.Reveal)()`, `(string)(x.PSK)`,
+  `([]byte)(x.PSK)` and `((string))(x.PSK)` are legal Go that gofmt leaves
+  untouched, and every one presents `call.Fun` as an `*ast.ParenExpr` — proved
+  firsthand with a standalone go/ast program: all four print
+  `Fun=*ast.ParenExpr selector=false ident=false arraytype=false PAREN=true`,
+  so neither the Reveal check nor the conversion check saw them. A method VALUE
+  (`reveal := x.PSK.Reveal`) escaped too: its call site is `reveal()` with no
+  selector at all.
+  Same failure mode as the round-2 MAJOR, one level up — the check was correct
+  for the shapes it was tested against, and the meta-test only fed shapes the
+  scanner already handled. A meta-test that exercises only what already works
+  proves nothing.
+  Fix, and the AST program pointed at a better one than paren-unwrapping the
+  Reveal callee: `ast.Inspect` reaches every `.Reveal` SelectorExpr regardless
+  of parenthesization AND when it is never called (verified — it printed the
+  selector for both the paren-called form and the method-value binding). So
+  Reveal detection now matches the SELECTION rather than the call, covering all
+  three shapes uniformly with no paren logic. The conversion check gets
+  recursive `unwrapParens` on the callee (single-level is not enough —
+  `((string))(x)` is legal).
+  MINOR 1 — architecture.md said "exactly two escape hatches" while the test
+  itself listed append/index/range/reflection; that contradiction is resolved
+  by saying two DETECTED forms and enumerating the residuals, now including
+  `copy(dst, secret)`. `collectSecretFieldNames` recursed only when the
+  immediate expression was a StructType, missing `[]struct{...}`,
+  `*struct{...}`, `map[K]struct{...}` and embedded unnamed Secret fields; it
+  now looks through slice/array/pointer/map via structTypeOf and harvests an
+  embedded Secret under its type name. Harvest still resolves the same 13 live
+  names (no live nested-struct Secret exists today — the widening is for the
+  next one).
+  MINOR 2 — completed the false-positive disclosure: ANY method named Reveal is
+  flagged whatever its receiver (no type resolution); the conversion check
+  matches a trailing IDENTIFIER so unrelated locals and parameters named
+  Password/PSK are flagged too, not merely fields; shadowing applies to rune,
+  uint8 and int32 as well as string and byte.
+  Validation — per-shape mutation, each in a throwaway detached worktree with
+  build+vet CLEAN so every red is an assertion:
+    A. drop unwrapParens from the conversion callee -> RED on
+       parenthesized_string_conversion, parenthesized_byte_slice_conversion,
+       doubly_parenthesized_conversion.
+    B. revert Reveal to CallExpr-anchored matching -> RED on
+       parenthesized_Reveal_callee, Reveal_bound_as_a_method_value.
+    C. drop ParenExpr from trailingIdent -> RED on
+       parenthesized_conversion_argument.
+  That is all six newly-covered shapes, each proven to fail without its fix.
+  Meta-test now runs 15 shapes plus the negative control. Probe worktree
+  removed; the PR worktree was never used for a probe. gofmt clean, go build
+  ./... and go vet ./... clean, pkg/grpcapi + pkg/api + pkg/config + pkg/cli
+  green.
+- **File(s)**: pkg/grpcapi/server_fabric_secret_render_6532_test.go,
+    docs/architecture.md, _Log.md
+
+## 2026-07-31 — #6532 round-2 fold: my previous fold BROKE the guard it widened
+
+- **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact, PR #6602)
+- **Action**: Codex re-gate found a MAJOR in the round-1 fold, and it was
+  correct. Widening the structural guard from a Reveal() line-grep to an AST
+  scan, I put `if !ok || len(call.Args) != 1 { return true }` ahead of the
+  Reveal check. A zero-argument method call has len(Args)==0 — the receiver
+  lives in CallExpr.Fun, not Args — so the Reveal branch became UNREACHABLE
+  DEAD CODE. Net effect: I added conversion detection and silently deleted the
+  original protection, on exactly the paths (wireguard / ipsec-statistics /
+  bfd-peers, which short-circuit on a nil dataplane) where this guard is the
+  ONLY net. Proved firsthand with a standalone go/ast program:
+  `CallExpr Reveal(): len(Args)=0 -> gate returns early: true`.
+  Root cause of it shipping: my round-1 mutation probe for the Reveal branch
+  injected `var _ = "x.Reveal()"` — a STRING LITERAL. That matched the old
+  line-grep, but a string literal is not a CallExpr, so the probe was never
+  valid against the AST implementation, and I never re-ran it after the
+  rewrite. I proved the NEW detection fired and never re-proved the OLD one.
+  Fix: extracted the scan into a pure function (scanSecretUnwraps) returning
+  findings, with the two detections INDEPENDENT — Reveal is matched before any
+  argument-count gate, and neither shares a precondition with the other.
+  Added TestSecretUnwrapScannerDetectsBothForms, a meta-test that feeds the
+  scanner synthetic sources and asserts it REPORTS each shape it claims: the
+  Reveal accessor, string/[]byte/[]rune/[]uint8 conversions, a conversion
+  nested in a call argument, through a pointer deref, and of an indexed
+  collection field — plus a negative control that a plain %s render of a
+  Secret is NOT flagged.
+  MINOR 1 — widened the harvest. `APIKeys []Secret` (types_system.go:377) is
+  REAL, not hypothetical, and the old `field.Type == Ident("Secret")` match
+  missed it, so `string(...APIKeys[i])` went undetected. typeMentionsSecret now
+  walks slice/array/pointer/map/qualified shapes and recurses into nested
+  anonymous structs; harvest went 12 -> 13 names, gaining APIKeys. Confirmed
+  the real WireGuard names ARE covered (PresharedKeyHex, WgLocalPrivkeyHex).
+  Rewrote the scope block to state the residuals COMPLETELY — aliased locals,
+  parameters, helper returns, out-of-package fields, type aliases, and
+  non-conversion unwrapping (append/index/range/reflection) — and to record
+  that name-based matching false-positives on unrelated fields named
+  Password/PSK and on shadowed string/byte identifiers, which is the correct
+  bias on a network-exposed surface.
+  MINOR 2 — corrected three false doc claims: architecture.md no longer says
+  the surface is safe "because no Reveal() call exists" (both escape hatches
+  now named, with the residuals and the meta-test); the test file header no
+  longer names the old test or the Reveal-only rationale; system-login.md no
+  longer groups `show snmp v3` with the masked community path (the snmp-v3
+  topic renders no community and no placeholder) and now states that remote
+  `cli show system services` uses the `system-services` topic, whose renderer
+  omits SNMP entirely (verified: zero SNMP references in
+  pkg/grpcapi/server_show_system.go).
+  Validation: the meta-test was proven to CATCH this exact MAJOR — in a
+  throwaway detached worktree, reintroducing `len(call.Args) != 1` ahead of
+  the Reveal check makes TestSecretUnwrapScannerDetectsBothForms/Reveal_accessor
+  go RED with build+vet CLEAN, while TestGRPCAPINeverUnwrapsSecretCleartext
+  stays GREEN — demonstrating the real guard structurally cannot detect its own
+  breakage and the meta-test is load-bearing. Probe worktree removed; the PR
+  worktree was never used for a probe. gofmt clean, go build ./... and
+  go vet ./... clean, pkg/grpcapi + pkg/api + pkg/config + pkg/cli green.
+- **File(s)**: pkg/grpcapi/server_fabric_secret_render_6532_test.go,
+    docs/{architecture.md,system-login.md}, _Log.md
+
+## 2026-07-31 — #6532 review fold: three MINORs, all about artifacts overstating coverage
+
+- **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact, PR #6602)
+- **Action**: Hostile review returned MERGE-NEEDS-MINOR with no code-correctness
+  defect. All three MINORs were artifacts claiming more than they delivered;
+  each is now either corrected or actually delivered.
+  MINOR 1 — the "#4111 behaviour is unchanged / super-user still reads
+  cleartext" claim is FALSE for the remote `cli` binary. `cmd/cli/show.go`
+  routes `show snmp` straight to the RPC via `c.showText("snmp")`, and
+  `cmd/cli` has zero login-class awareness (verified: no userClass/LoginClass/
+  PermAll/showConfigRedacted hits), so a super-user on `cli` now gets
+  `##SECRET-DATA##`. Kept the posture — threading a class into pkg/grpcapi is
+  impossible today and meaningless on the fabric listener where the caller is
+  the peer chassis, and `cli show configuration snmp` was ALREADY masked for
+  every class by #4051, so the two remote read-back paths now agree instead of
+  contradicting. Amended docs/system-login.md: the #4111 paragraph now scopes
+  its allowance to the CONSOLE CLI, and a new callout states the remote-CLI
+  masking plus the operational consequence (no remote read-back; recover from
+  console as super-user or the DR archive, noting a redacted export is
+  deliberately not restorable per #4060).
+  MINOR 2 — the MonitorInterface audit-register entry was factually wrong on
+  all three counts. It streams pre-formatted TEXT frames of counter snapshots
+  (RenderTrafficSummary/RenderSingleInterface), it DOES render configuration
+  (interface set + display names from the active config), and there is no pcap
+  anywhere in server_diag_monitor.go. Rather than just restate it, promoted it
+  to a REAL probe: a monitorFrameSink mock stream captures the first frame and
+  aborts, so it is now driven with a nil dataplane like the seven unary probes.
+  MINOR 3 — `TestGRPCAPINeverRevealsSecretCleartext` claimed "the ONE way to
+  defeat String() is Reveal()". False: config.Secret is `type Secret string`,
+  so `string(x.PSK)` / `[]byte(x.PSK)` yields cleartext and a Reveal() grep
+  misses it. Replaced the line-grep with an AST scan covering BOTH paths,
+  matching conversions against the Secret-typed field names parsed from
+  FILE-SCOPE declarations in pkg/config (12 unique names; the function-local
+  `Name Secret` alias fields in the SNMPCommunity marshallers are correctly
+  excluded). Renamed to TestGRPCAPINeverUnwrapsSecretCleartext and stated the
+  real residual instead of overclaiming again: a conversion applied to a local
+  variable previously assigned from a secret field is not caught.
+  NIT 4 — delivered the determinism parity rather than scoping the claim.
+  gRPC showSNMP now sorts trap groups and USM users as well as communities
+  (shared sortedMapKeys helper), and both pkg/cli community loops sort via
+  sortedSNMPCommunityNames. This matters most under redaction: every displayed
+  key is the same placeholder, so an unsorted map printed N indistinguishable
+  lines with shuffling authorization modes.
+  NIT 5 — documented that the interceptor source scan is textual and reads only
+  the function bodies, so hoisting a method-name constant into a helper would
+  silently drop it from the audited set; added a canary that fails if the scan
+  stops finding SystemAction (reachable ONLY via the scan — it is in neither
+  allowlist map).
+  Validation: the widened scan was proven firsthand in a THROWAWAY detached
+  worktree, twice. Injecting `string(u.AuthPassword)` into showSNMP: build+vet
+  CLEAN, scan FAILS as an assertion. Then the reviewer's actual scenario —
+  `string(u.PrivPassword)` injected BEHIND a nil-dataplane short-circuit: the
+  empirical sweep PASSES (blind to that path) while the structural guard FAILS,
+  proving it is the only net there. Probe worktree removed; PR worktree never
+  used for a revert probe. New determinism test mutation-tested (reverting the
+  community sort goes RED at attempt 4). gofmt clean, go build ./... and
+  go vet ./... clean, pkg/grpcapi + pkg/api + pkg/config + pkg/cli +
+  pkg/refactoraudit green.
+- **File(s)**: pkg/grpcapi/{server_fabric_secret_render_6532_test.go,
+    server_show_snmp_community_redaction_6532_test.go,
+    server_show_dhcp_lldp_snmp.go},
+    pkg/cli/{show_services_snmp.go,cli_show_system.go},
+    docs/system-login.md, _Log.md
+
+## 2026-07-31 — #6532: redact the SNMP community on the fabric-reachable gRPC ShowText
+
+- **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact)
+- **Action**: gRPC `ShowText{Topic:"snmp"}` rendered the SNMPv1/v2c community
+  string — which IS the authenticator for v1/v2c — in cleartext. The usual
+  loopback bound does not apply: `ShowText` is on the cluster-fabric allowlist
+  (#4122), so the render is reachable from the peer chassis over the fabric IP.
+  Both sibling surfaces had already been hardened (REST #5315, CLI #4111) and
+  this one was left behind. The community is the ONE operator secret the
+  `config.Secret` newtype does not protect — it stays a plain string because it
+  is the `Communities` map key — so every manual renderer must mask it by hand,
+  which is exactly how three independent copies of the rule let one drift.
+  Fixed by masking unconditionally on the gRPC path (gRPC carries no login
+  class to gate on, matching REST and the sibling `ShowConfig` #4051), and by
+  collapsing all four render sites onto one shared helper,
+  `config.SNMPCommunityDisplayName(name, redact)`. The CLI keeps its per-class
+  predicate (`showConfigRedacted()`), so #4111 behaviour is unchanged:
+  view-only masked, super-user cleartext.
+  Audited the whole fabric allowlist as the issue asked. Empirical sweep: one
+  config staging every secret leaf in the redaction SSOT, driven through all
+  ~115 ShowText topics and every allowlisted RPC — the SNMP community was the
+  only leak. Structural reason: every other secret is `config.Secret` (its
+  `String()` masks under %s/%v, #2053) and `pkg/grpcapi` never calls the
+  `Reveal()` cleartext accessor. Both facts are now asserted, along with a
+  completeness gate that enumerates the allowlist maps AND the method names the
+  interceptor source special-cases (so `SystemAction` is covered too), and a
+  ShowText topic-coverage gate derived from the dispatcher source.
+  Validation: RED-on-revert verified as an assertion failure (not a build
+  break) on the community mask; all four new gates mutation-tested individually
+  (drop the mask / drop a probe / drop a topic / inject a `Reveal()`), each RED,
+  all restore GREEN. A staging-is-real test asserts all 21 secret sentinels
+  actually reach the committed active config, so the "no secret appeared"
+  scans cannot pass vacuously. Full pkg/grpcapi, pkg/api, pkg/cli, pkg/config,
+  pkg/daemon, pkg/dataplane/userspace suites green (the event-stream socket
+  tests need TMPDIR=/tmp — sun_path 108). Heatmap regenerated
+  (types_system.go 1645 -> 1684).
+- **File(s)**: pkg/config/types_system.go, pkg/grpcapi/server_show_dhcp_lldp_snmp.go,
+    pkg/api/show_text.go, pkg/cli/{show_services_snmp.go,cli_show_system.go},
+    pkg/grpcapi/{server_show_snmp_community_redaction_6532_test.go,
+    server_fabric_secret_render_6532_test.go},
+    docs/{architecture.md,system-login.md,refactoring-audit-current.txt}, _Log.md
+
 ## 2026-07-26 — #6474: re-NAT outbound ICMP errors through source NAT
 
 - **Timestamp**: 2026-07-26 (fix/6474-snat-outbound-icmp-error, stacked on
@@ -58375,6 +58661,170 @@ top.
   manifest via cmd/shim-manifest. Verified: fsatomic+dataplane green;
   editing xpf_common.h now trips the freshness test; src-edit coverage intact.
 
+## 2026-07-22 — #6291 torn validation/forwarding publish ordering (userspace-dp)
+- **Action**: Fix the sibling of #5166 — worker could transiently observe
+  OLD validation + NEW forwarding in the same-plan snapshot refresh.
+- **File(s)**: userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/coordinator/snapshot_refresh.rs,
+  userspace-dp/src/afxdp/coordinator/README.md
+- Root cause: coordinator stores `shared_validation` BEFORE `ha.forwarding`
+  and the worker READ validation before forwarding — store order matched
+  read order, so a publish between the two worker loads paired new-forwarding
+  with old-validation. classify_metadata() would then let a packet stamped at
+  the old generation pass and be forwarded under new state.
+- Fix (option b — forwarding must stay stored last for #5166 CoS): reorder
+  the WORKER reads to forwarding-FIRST, validation-SECOND via a new inlined
+  `refresh_forwarding_then_validation` helper (keeps #1188 short-circuit).
+  Now observing new forwarding implies new-or-newer validation. The mirror
+  residual (new-validation, old-forwarding) SURVIVES and is NOT benign —
+  see the 2026-07-31 correction block below and #6592. Coordinator store
+  order unchanged (already correct); added a load-bearing comment + module doc.
+- Test: `snapshot_refresh_no_old_validation_with_new_forwarding_6291`
+  (renamed 2026-07-31; deterministic,
+  publish injected between the two acquire-loads via the `between` seam).
+  RED-on-revert verified (swap the two loads → RED). Full cargo suite green
+  (4153+ passed, exit 0); named test 3x ok.
+- **Review fold (2026-07-31, PR #6333 hostile review MERGE-READY-WITH-MINORS,
+  no BLOCK/MAJOR)**: the core reorder and the `between` seam were verified
+  sound and are UNCHANGED. Folded:
+  - MINOR-3 — the invariant is two-sided but only the CONSUMER half was
+    RED-guarded; swapping the two coordinator stores left the whole suite
+    green. Added the producer-side `#[cfg(test)]
+    validation_at_forwarding_publish` seam (twin of the #5166
+    `cos_owner_at_forwarding_publish`), captured immediately above the
+    `ha.forwarding` store, asserted by
+    `refresh_runtime_snapshot_publishes_validation_before_forwarding`. The
+    seam also retains the worker-visible forwarding Arc AT THAT INSTANT and
+    the test asserts it is not the post-refresh Arc, so hoisting the
+    forwarding store above the capture — which would satisfy the validation
+    assert vacuously — is RED too. Retaining the Arc (not a raw pointer)
+    keeps the old allocation alive so `Arc::ptr_eq` cannot be fooled by
+    address reuse.
+  - MINOR-1 — the worker STARTUP SEED (`loop_body/setup.rs`) still read
+    validation before forwarding, i.e. the exact order this fix calls the
+    bug, making the new module doc/README false as written at one of the two
+    worker-side read sites. Not live (the seed is consumed only by
+    `poll_binding`, and iteration 1 repairs validation before any packet is
+    classified), swapped anyway.
+  - MINOR-2 — `stop_inner` stored forwarding before validation, contradicting
+    the doc's categorical rule. Not live (`stop_and_clear` joins every worker
+    thread ~35 lines earlier) and not a regression, but swapped for
+    uniformity with a comment naming the join.
+  - NITs: `loop_body/mod.rs` header no longer claims "no call was added to
+    the per-tick path" (it records the `#[inline]` carve-out and the release
+    `nm` evidence instead); the `!torn` assert now comes FIRST so a future RED
+    names the invariant; this log block gained its missing blank line.
+- **Fold validation**: BOTH producer-side revert forms fail by ASSERTION, not
+  a build break — exchanging the two stores in place gives `left:
+  ValidationState { snapshot_installed: false, config_generation: 0,
+  fib_generation: 0 } right: ... config_generation: 7 ...`; hoisting the
+  forwarding store above the capture gives "the validation capture must be
+  taken BEFORE the ha.forwarding store, or the ordering assert above proves
+  nothing". Production file restored + diff-verified after each. Full cargo
+  suite re-run green; all three ordering test NAMES confirmed present in the
+  run output (stale-binary guard).
+- **Honest sizing**: this is an invariant tightening, NOT a traffic win.
+  Nobody should expect a measurable effect. (The "at most one tick of extra
+  `config_gen_mismatch` drops" characterisation this bullet originally
+  carried was too generous — corrected in the 2026-07-31 block below.)
+
+## 2026-07-31 — #6333 claim correction: the surviving pair is NOT benign (#6592)
+- **Action**: Correct an overstated safety claim in PR #6333. The fix itself
+  is UNCHANGED — no production behaviour change in this commit. Only docs,
+  comments, one test doc/name, and one added assertion.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/snapshot_refresh.rs,
+  userspace-dp/src/afxdp/coordinator/README.md,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs, _Log.md
+- **What was wrong**: #6333 documented the surviving `(new-validation,
+  old-forwarding)` pair as benign — "the generation guard errs toward a
+  one-tick `ConfigGenerationMismatch` drop, never a stale forward". It is
+  not drop-only. Chain: `worker/loop_body/mod.rs` installs validation
+  UNCONDITIONALLY on difference but updates forwarding ONLY when the Arc
+  rotated, so a worker whose forwarding load returned `None` (pre-publish)
+  and whose validation load landed post-publish holds new validation + old
+  forwarding. The coordinator then returns the new generation to Go
+  (`server/handlers/snapshot.rs`), Go writes it to `userspace_ctrl`
+  (`manager_compile.go` / `maps_sync.go`), and the shim stamps subsequent
+  packets NEW (`userspace-xdp/src/lib.rs`). Those packets match the new
+  validation, classify `Valid` (`forwarding/fib.rs`), and are forwarded
+  under the OLD forwarding state — a withdrawn route or a new deny is not
+  applied. Nothing orders the Go control-map update after every worker's
+  next forwarding load; a worker can simply be descheduled in between.
+- **Why the earlier analysis was not wrong, just scoped differently**: the
+  PR-#6333 review reasoned about the window DURING publish, where the shim
+  provably cannot stamp the new generation —
+  `status.last_snapshot_generation` advances only inside `apply_snapshot`,
+  under the `ServerState` mutex held across `refresh_runtime_snapshot`.
+  That is correct for that window. This defect lives in the window AFTER
+  publish completes and before the worker's next forwarding load. Both
+  analyses hold for the window each describes.
+- **Still a strict improvement, and why**: both orientations were reachable
+  on master; this eliminates one and adds none. The eliminated orientation
+  `(old-validation, new-forwarding)` needed NO additional condition to
+  forward across generations — old-stamped packets (the traffic in flight
+  during the window) passed the still-old validation and were forwarded
+  under the new state immediately. The surviving orientation needs Go to
+  complete a control-socket round trip AND the worker to still be behind at
+  that point, which at 10K-100K ticks/s means a descheduled or stalled
+  worker. Real reduction in exposure, not a closure. Filed as **#6592**
+  (fix: pair validation with a specific forwarding snapshot atomically —
+  one `ArcSwap` holding both, or generation fields in `ForwardingState`).
+- **Corrections made** (every site that called the residual benign):
+  - `snapshot_refresh.rs` module header — replaced the "residual ... is
+    benign" clause with a "# The mirror window survives and is NOT benign
+    (#6592)" section spelling out both phases (drop-only while the shim
+    stamps OLD; stale forward once Go advances the stamp).
+  - `snapshot_refresh.rs` inline comment above the `shared_validation`
+    store — added the scope note + #6592 pointer.
+  - `refresh_forwarding_then_validation` doc comment
+    (`worker/loop_body/mod.rs`) — same replacement, plus the exposure
+    comparison between the eliminated and surviving orientations.
+  - `coordinator/README.md` #6291 bullet — replaced the benign sentence
+    with a bolded scope paragraph.
+  - `coordinator/tests.rs` producer-half test doc — added a scope note that
+    the two tests together exclude ONE orientation only.
+  - `_Log.md` — the original entry's "residual ... is benign" and the
+    "at most one tick of extra drops" sizing bullet.
+- **Mislabeled test — relabelled, not deleted**: the worker test constructed
+  the surviving pair and its doc called the result "the benign
+  (new-validation, old-forwarding) residual". Its two ASSERTIONS were
+  correct and are kept unchanged — they assert the `(old-validation,
+  new-forwarding)` orientation is impossible, which is true and is the
+  invariant this PR establishes. Only the surrounding claim was false. So:
+  (a) the doc comment gained a "# Scope" section stating the outcome state
+  is the #6592 KNOWN GAP and must not be read as a coherence proof;
+  (b) renamed `snapshot_refresh_no_torn_validation_forwarding_6291` →
+  `snapshot_refresh_no_old_validation_with_new_forwarding_6291`, because
+  the old name itself asserted the overbroad claim ("no torn
+  validation/forwarding") at all five citation sites; (c) added a third
+  assertion recording the residual as an executable fact rather than prose
+  — it asserts the worker did NOT adopt forwarding here, with a message
+  naming #6592 and directing whoever changes the pairing to revisit the
+  test and the ordering docs instead of deleting the assertion. When #6592
+  lands this assertion is expected to go RED; that is deliberate.
+- **Also recorded, NOT implemented**: the pre-existing #5166 seam captures
+  only the CoS owner map, so it does not prove its own placement the way
+  the #6291 seam does (hoisting the `ha.forwarding` store above it would
+  satisfy its assert vacuously), and six sibling publications riding the
+  same gate — CoS owner-live, root leases, exact backlogs, queue leases,
+  vtime floors, and `ha.fabrics` — have no individual ordering assertion at
+  all. Pointer added in `snapshot_refresh.rs` and `coordinator/README.md`;
+  filed as **#6593**; the work is out of scope for this PR.
+- **Validation**: full `cargo test --release` on the final tree — 4219 + 60
+  + 8 + 22 + 1 passed, 0 failed, 2 ignored, exit 0. Affected test NAMES
+  confirmed present in `-v`/`--exact` output under the RENAMED name
+  (stale-binary guard): `snapshot_refresh_no_old_validation_with_new_
+  forwarding_6291`, `refresh_runtime_snapshot_publishes_validation_before_
+  forwarding`, `refresh_runtime_snapshot_publishes_cos_owner_map_before_
+  forwarding`. The new #6592 assertion was proven to BIND, by ASSERTION not
+  a build break: seeding the test's `cached_forwarding` with a foreign Arc
+  so `load_arc_if_changed` returns `Some` makes the worker adopt forwarding
+  and the assertion fires with its #6592 message (the two pre-existing
+  asserts still pass in that mutation, so it is the new one that catches
+  it). Production file restored and diff-verified identical; the test is
+  green again. No production code path changed in this commit.
+
 ## #6310 — CoS cross-worker prepared-redirect allocation-free (eng6310)
 - **Timestamp**: 2026-07-22
 - **Action**: Eliminate per-packet `frame.to_vec()` at the two cross-binding
@@ -62124,6 +62574,1076 @@ break — `go vet` confirmed passing under every revert.
     pkg/routing/monitor.go, _Log.md
 
 - **Timestamp**: 2026-07-31
+- **Action**: #2387 — land the VRF session-identity decision record on master,
+  correct the shipped README's superseded "HA wire bump" cost claim, and add a
+  guard binding both to the code they describe.
+  `userspace-dp/src/afxdp/forwarding/README.md` documents the #2387
+  single-forwarding-domain session-identity limitation and cites
+  `docs/research/2387-vrf-flow-identity/plan.md` as the decision record for the
+  deferred real fix. That plan lived ONLY on the unmerged
+  `research/2387-vrf-flow-identity` branch, so the shipped citation dangled —
+  the exact failure `pkg/api/zone_counter_doc_ref_test.go` was written to
+  prevent after it happened once for #3643.
+  Landed the plan plus its six reviewer files, and added a v5 §0 addendum
+  recording three first-hand findings that change the deferral calculus:
+  (0a) plan §4d is WRONG that Track B needs an HA wire break — §4d is right
+  that the wire KEY block is fixed-width, but the routing-domain does not have
+  to live there. It rides as a length-gated trailing VALUE field exactly like
+  #2170 Generation / #3301 AppTimeout+PolicyCounterIdx / #4565 Nat64SnatV4 /
+  #5274 ConfigEpoch / #5212 RTFlowSessionID, and the repo states the rule at
+  sync_protocol.go:930 ("does NOT bump SessionSyncWireVersion"); interning
+  domain 0 = the default routing-instance makes a legacy peer's omitted field
+  decode to the default VRF, so CurrentHAProtocolVersion never moves and the
+  #1930 mixed-base ISSU gate is never tripped. This was plan §11 Q5, called
+  there "the single biggest lever on B-min's cost".
+  (0b) "decline the cross-domain hit and fall through to the session-miss path"
+  is NOT a viable cheap middle: install_with_protocol_with_origin opens with an
+  unconditional remove_entry(&key) (session/install.rs:139), so two colliding
+  flows would evict each other per packet (per-packet SNAT re-allocation breaks
+  both). Only DENY (fail-closed drop) and ISOLATE (widened identity) are
+  coherent end-states.
+  (0c) corner inventory the plan lacked: GRE decap is SAFE (gre.rs:760 rebinds
+  the inner ingress_ifindex to the tunnel logical ifindex, so a decapped flow's
+  domain is stable); fabric ingress needs an explicit exemption; the §7
+  inter-VRF route-leaked corner is CHEAP if the ingress+egress domain live in
+  SessionMetadata (which already stores and swaps the zone pair) rather than in
+  the key.
+  Also recorded that Track A is COMPLETE (A.1 #4327, A.2 42bc6bc88, A.3 docs),
+  so the conntrack table is now the SOLE collision surface, and narrowed the
+  open maintainer question from "is overlapping-subnet VRF in scope" to the
+  single binary DENY-vs-ISOLATE choice.
+  No dataplane behaviour change — the #2387 bug itself is untouched and the
+  issue stays open pending that call.
+  Validation: new `userspace-dp/tests/vrf_session_identity_doc_guard.rs` (2
+  tests) green under `cargo test --release`; RED-on-revert proven by mutation in
+  a throwaway detached worktree (see review notes) with the crate still building
+  clean; `cargo fmt --check` and `cargo clippy` clean on the touched test.
+- **File(s)**: docs/research/2387-vrf-flow-identity/{plan.md,agy-plan-r1.md,
+    agy-plan-r2.md,claude-smr-plan-r1.md,claude-smr-plan-r2.md,codex-plan-r1.md,
+    codex-plan-r2.md,reviewer-ids.md},
+    userspace-dp/src/afxdp/forwarding/README.md,
+    userspace-dp/tests/vrf_session_identity_doc_guard.rs, _Log.md
+- **Action**: #6562 (dhcprelay security) — bind every relayed reply to an
+  outstanding request, and REFUSE DHCPFORCERENEW. Two defects, two gates.
+
+  DEFECT 1: `handleServerResponses` forwarded any well-formed BOOTREPLY that
+  passed the #4163 source-IP allow-list. A source IP is spoofable, so an
+  off-path attacker forging a configured server's address could inject an
+  OFFER/ACK (hostile gateway/DNS) or a NAK (forced client restart). FIX: new
+  `pending.go` — a bounded, expiring table of outstanding transactions. The
+  client loop inserts a key BEFORE the upstream write (the reply loop is a
+  different goroutine; a post-send insert races a fast server's OFFER); the
+  reply loop forwards OFFER/ACK/NAK only on a match. Key is xid + chaddr:
+  RFC 2131 §4.3.1 Table 3 requires a server to copy BOTH from the client's
+  message, and the relay's own mutations (hops/giaddr/Option 82) touch
+  neither. Option 61 deliberately NOT keyed — RFC 2131 told servers they MUST
+  NOT echo it and only RFC 6842 §3 reversed that, so keying on it would drop
+  every reply from a pre-6842 server. Cap 8192, TTL 30s, evict-OLDEST (not
+  drop-new: drop-new lets an attacker who fills the table lock out every new
+  client; eviction can only cause a drop, never an accept, so it trades away
+  no security). A match does NOT consume the entry — the relay fans out to
+  every server in the group, so one DISCOVER draws N OFFERs, and RFC 2131
+  §4.4.1 has the SELECTING REQUEST reuse the OFFER's xid. Table lives on
+  interfaceRelay so a #2347/#3960 session rebuild does not strand a client.
+
+  DEFECT 2: FORCERENEW was forwarded unauthenticated (#2645 reasoned RFC 3118
+  auth is end-to-end and out of scope for a relay). REVERSED. RFC 3203 §6 —
+  NOT §5, which is IANA Considerations; the issue and a stale code comment
+  both mis-cited it — makes authentication a MUST precisely because
+  "FORCERENEW can be used to snoop and spoof traffic". A relay cannot
+  discharge that MUST: RFC 3118 §5.2 puts the secret between source and
+  destination, §3 casts the relay as a transparent mutator excluded from the
+  hash, and §5.3 assigns validation to the receiver. An Option-90 PRESENCE
+  check would be theater — the same spoofing attacker supplies the option.
+  Refusal is a handled condition, not an outage: RFC 3203 §2.2 defines server
+  retransmission on loss, and T1/T2 renewal is untouched. No opt-in knob.
+
+  OBSERVABILITY (the fail direction matters more than usual here — an
+  over-strict binding silently breaks DHCP for real clients): three new
+  counters on RelayStats + `show services dhcp relay` —
+  RepliesDroppedNoRequest, PendingEvicted (early warning that the table is at
+  capacity and legitimate bindings are being lost), RepliesDroppedForceRenew.
+  Both new drop paths log warn-once-then-Debug. A nil table fails CLOSED,
+  matching the #4163 empty-allow-set posture.
+
+  VALIDATION: fail-on-revert proven SEPARATELY for both defects, each an
+  ASSERTION failure with `go vet` clean (no build break). Disabling only the
+  binding gate → NoOutstandingRequestDropped + WrongChaddrDropped RED,
+  ForceRenewRefused GREEN. Restoring the FORCERENEW forward → ForceRenewRefused
+  RED, binding tests GREEN. OVER-REACH GUARD
+  TestRelay_NormalExchange_EndToEndStillRelays drives DISCOVER/OFFER,
+  REQUEST/ACK, RENEW and REBIND through the LIVE manager (bindings created by
+  production code, not a test helper) and stayed GREEN under both reverts.
+  Required a `fakeConn.push()` wake path so a reply can be injected only after
+  the request it answers was relayed. #2645's two tests were updated: the
+  forwarded-assert became ForceRenewRefused (armed for the xid, so the refusal
+  is pinned to the message TYPE, not to a missing binding), and the
+  deliverReply-level FORCERENEW test was removed as unreachable (the matrix
+  test already covers the ciaddr row). Suites: pkg/dhcprelay, pkg/dhcp,
+  pkg/dhcpserver all PASS incl. -race; pkg/cli PASS; go build ./... clean;
+  gofmt/vet clean.
+- **File(s)**: pkg/dhcprelay/{pending.go,relay.go,README.md,
+    relay_binding_6562_test.go,delivery_test.go,relay_test.go},
+    pkg/cli/show_services_dhcp.go, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6562 / PR #6603 review fold — F1 MAJOR (pending-table capacity
+  did not track maximum-packet-rate) + F2/F3/F4/F5 MINORs.
+
+  F1 (MAJOR). `pendingCap` was a hardcoded 8192 while the fill rate is the
+  configurable #5670 `maxPacketRate` (schema 1..1000000, default 100). Steady
+  occupancy is rate x TTL, so above ~273 pps the table was CAP-BOUND and the
+  reply-binding window silently collapsed from 30s to 8192/rate seconds — and
+  README.md recommends raising maximum-packet-rate on a busy segment, steering
+  operators straight into it. At 3000 pps the window is 2.7s; a boot storm
+  against a server whose RTT exceeds that has every reply dropped at the relay,
+  turning a completing storm into a permanent retry storm. Compounding it, the
+  at-cap path did TWO full O(cap) map scans per admitted packet (reap sweep +
+  minimum-expiry scan) on the single client-facing read goroutine.
+
+  REMEDIATION: took BOTH reviewer shapes (b)+(a), not (c). (b) alone leaves the
+  window collapse — the actual availability regression — unfixed; (c) only
+  warns about it. (b) O(1) ring: every entry carries the SAME ttl, so insertion
+  order IS expiry order and the oldest is always at the ring head — no scan.
+  Duplicate inserts get a new slot; the old one is stale (map holds a later
+  expiry) and is discarded free at the head. A slot is always freed before a
+  push, so len(entries) <= count <= capacity — the ring bounds the map. (a)
+  capacity = rate*pendingTTL + relayBurstFor(rate), clamped [4096, 131072]. The
+  ceiling is mandatory: 1e6 pps x 30s is ~3e7 entries (GBs), i.e. the
+  memory-exhaustion vector the table exists not to be. Above ~4096 pps the
+  ceiling binds; that is unavoidable (window x rate IS memory) but is now
+  EXPLICIT — pendingCapacityFor reports the clamp and Apply logs a startup Warn
+  naming the effective window.
+
+  F2. Cap comment claimed "well past the default"; the real threshold was 273
+  pps = 2.73x default. Moot now that capacity is derived, but the README's
+  #5670 section gained the actual ~4096 pps ceiling threshold and a
+  cross-reference in both places that recommend raising the rate.
+
+  F3. PendingEvicted is COINCIDENT, not leading — an eviction causes the
+  subsequent drop, lead time one server RTT. Plumbed the already-existing
+  size() through as PendingSize + PendingCapacity (gauges) into RelayStats,
+  Stats() and the CLI as "Pending N/M"; corrected the README claim.
+
+  F4 (text only). The "handled condition" argument rested on RFC 3203 §2.2's
+  retransmission sentence, which describes TRANSIENT loss — here the loss is
+  PERMANENT and §2.2 itself says "The amount of retransmissions should be
+  limited", so the backoff never converges. Replaced in relay.go + README with
+  the dispositive §2.2 sentence, verified verbatim at rfc3203.txt:71: "The DHCP
+  server sends a unicast FORCERENEW message to the client." A conformant
+  unicast to the client's leased IP never lands on the relay's giaddr:67
+  socket, so refusal costs a conformant deployment NOTHING and the only
+  FORCERENEW reaching this arm is non-conformant or hostile. Also recorded that
+  the arm is belt-and-braces (a server-chosen xid matches no outstanding
+  request, so the binding gate would drop it anyway) — it buys a distinct
+  counter and log. Scoped the "must be visible" claim to the console CLI:
+  RelayStats has no gRPC/Prometheus surface (pre-existing, filed separately).
+
+  F5. fakeConn.ReadFrom no longer self-recurses after a wake; plain for loop.
+
+  VALIDATION — three revert probes, each in a THROWAWAY detached worktree at
+  the branch HEAD (never the PR worktree), each build+vet CLEAN so the red is
+  an ASSERTION: (1) capacity back to fixed 8192 -> TracksMaxPacketRate RED
+  ("a reply arriving 3s after its request no longer binds at 3000 pps
+  (capacity 8192, 9000 intervening requests, evictions 809)") + Derivation RED;
+  (2) eviction back to the O(n) minimum-expiry map scan -> AtCapInsertIsConstant
+  Time RED; (3) relay.go un-wired to a constant while pendingCapacityFor stays
+  correct -> PendingCapacityFollowsOverride RED ("capacity = 8192, want 96000").
+  Probe (2) initially PASSED — the reverted code bypasses the ring so slotScans
+  stayed 0 and sailed under the upper bound. Added a LOWER bound (>= 1 scan per
+  at-cap insert) which makes the counter's liveness part of the contract; probe
+  re-run then went RED. Over-reach guard NormalExchange_EndToEndStillRelays and
+  ForceRenewRefused stayed GREEN under all three. Suites: pkg/dhcprelay
+  -race -count=5 PASS; pkg/dhcp, pkg/dhcpserver, pkg/cli -race PASS; build,
+  gofmt, vet clean.
+- **File(s)**: pkg/dhcprelay/{pending.go,relay.go,README.md,
+    relay_binding_6562_test.go,delivery_test.go,relay_test.go},
+    pkg/cli/show_services_dhcp.go, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6562 / PR #6603 re-review fold — Codex MAJOR (a config reload
+  destroyed every live binding) + 4 MINORs.
+
+  MAJOR. Every field in relaySpec participates in equal(), so ANY day-2 change
+  to a relay group stops the relay and builds a replacement with a brand-new
+  pending table. The replacement rebinds the SAME giaddr:67, so replies for
+  pre-reload requests still ARRIVE and were then dropped by the binding gate —
+  pre-#6562 they were forwarded, so a straight availability regression. It is
+  sharpest for maximum-packet-rate, whose documented remedy is to raise it on a
+  busy segment: an operator following the docs DURING a boot storm would flush
+  every in-flight binding and cause the retry storm the table exists to
+  prevent. PROVENANCE NOTE: this was NOT introduced by the previous fold — the
+  first commit (1c071c18c:903) also built a fresh table per session; the fold
+  made it reachable via the newly-documented remedy. Fixed for ALL five spec
+  fields, not just rate. FIX: pendingTable.snapshot()/adopt() plus a phase-2.5
+  loop in Apply that runs AFTER the old relay's goroutines are joined (snapshot
+  complete, table quiescent) and BEFORE the replacement launches (nothing races
+  the destination). Adopted entries keep their ORIGINAL expiry — a reload must
+  not refresh the TTL, which would widen the xid-guessing window on every
+  commit. A SMALLER replacement (rate lowered) drops the oldest excess and
+  COUNTS them in PendingEvicted rather than discarding silently.
+
+  MINOR 1. popHeadLocked used expiry equality as slot identity. Two inserts of
+  the same key can share an expiry (time.Now() is not guaranteed to advance
+  between calls; a frozen test clock never does), so popping the OLDER slot
+  matched the map entry the NEWER slot owned and deleted a live binding. My
+  duplicate test had DODGED this by advancing the clock 1ms with a comment
+  claiming a real clock guarantees distinctness — it does not. Replaced with an
+  explicit monotonic generation counter (pendingEntry.gen / pendingSlot.gen);
+  new test uses a FROZEN clock so equal expiries are the case under test.
+
+  MINOR 2. size() returned len(entries) but capacity pressure is governed by
+  ring count. Diverges BOTH ways: expired entries linger in the map on an idle
+  relay (reads high), and duplicate inserts consume slots without adding keys
+  (reads low — a cap-4 ring holding A,B,B,B reports 2/4 yet the next insert
+  evicts live A). Split into occupancy() (ring count, drives PendingSize) and
+  liveEntries() (map count, diagnostic). Fixed the stale "pending-evicted is
+  the early warning" comment still in pkg/cli/show_services_dhcp.go.
+
+  MINOR 3. The strict "O(1) at capacity" claim was false: the reclaim loop can
+  pop up to `capacity` slots on the first insert after a long idle. Documented
+  the real bound (amortized O(1); worst case one full drain, at most once per
+  idle period) in both pending.go and README rather than adding a special-case
+  reset.
+
+  MINOR 4. The overflow test passed the untyped constant 1<<40, which fails to
+  COMPILE under GOARCH=386 ("overflows"). Verified firsthand, changed to 1<<30.
+  Added GOARCH=386 go vet to the gate.
+
+  Also added the reviewer's memory note to the README (48 B/slot -> 6 MiB ring,
+  ~18 MiB/interface at the ceiling, multiplicative across interfaces).
+
+  VALIDATION — four revert probes, each in a THROWAWAY detached worktree at the
+  branch HEAD (removed after; never the PR worktree), each build+vet CLEAN so
+  every red is an ASSERTION: (1) drop the phase-2.5 migration -> BOTH
+  RateChangePreservesBindings ("the outstanding binding was destroyed by the
+  rate change") and its _EndToEnd sibling RED; (2) slot identity back to expiry
+  equality -> EqualExpiriesDoNotLoseBinding RED; (3) occupancy back to
+  len(entries) -> OccupancyTracksRingNotMap RED ("occupancy = 2, want 4") plus
+  the EqualExpiries precondition. The end-to-end reload test needed a tracking
+  conn factory: a restart opens FRESH conns, so the original harness pair
+  belongs to the dead session, and the new pair is opened ASYNCHRONOUSLY from
+  the supervisor goroutine (hence pairAfter(t, n) rather than "latest").
+  Suites: pkg/dhcprelay -race -count=5 PASS; pkg/dhcp, pkg/dhcpserver, pkg/cli
+  -race PASS; go build ./... , gofmt, vet, GOARCH=386 vet clean.
+- **File(s)**: pkg/dhcprelay/{pending.go,relay.go,README.md,
+    relay_binding_6562_test.go}, pkg/cli/show_services_dhcp.go, _Log.md
+
+- **Timestamp**: 2026-07-31 14:55 PDT
+- **Action**: #6603 re-review fold, residual pass. Verified the previous fold
+  commit (e98510a6b) against the Codex verdict finding by finding, reproduced
+  its fail-on-revert claims independently in a throwaway detached worktree, and
+  closed the three gaps it left.
+
+  Independent revert probes (worktree /dev/shm/probe-6603g at e98510a6b, build
+  and vet CLEAN in each so every red is an assertion, worktree removed after):
+    * Neutralizing the phase-2.5 snapshot/adopt migration in Apply reds BOTH
+      TestRelay_RateChangePreservesBindings ("the outstanding binding was
+      destroyed by the rate change") and its _EndToEnd sibling, the latter
+      logging the exact predicted "dropping server reply with no outstanding
+      request" WARN. MAJOR gate confirmed.
+    * Reverting popHeadLocked slot identity from the generation counter back to
+      e.exp.Equal(s.exp) reds TestPendingTable_EqualExpiriesDoNotLoseBinding.
+    * Pointing occupancy() back at len(t.entries) reds
+      TestPendingTable_OccupancyTracksRingNotMap ("occupancy = 2, want 4").
+
+  Gaps closed in this commit:
+    * MINOR 4 was only half-folded. The previous commit made the README's O(1)
+      claim honest but added neither remedy Codex asked for. insert() now takes
+      the pathological case in CONSTANT time: the ring is expiry-ordered, so one
+      probe of the newest slot proves the whole ring is dead, and head/count
+      reset to zero with the map replaced wholesale. Previously that call popped
+      up to 131072 slots, each with a map lookup and delete, under the mutex on
+      the client-facing packet path.
+    * adopt() bounded migration by raw capacity, ignoring the destination's
+      existing count. That breaks pushLocked's documented "caller has already
+      made room" contract for a non-empty destination: count runs past the ring
+      length and the modular index overwrites live slots. Now bounded by
+      REMAINING room; identical on the production path (a fresh table), correct
+      for any caller.
+    * The CLI comment fold replaced the stale "pending-evicted is the early
+      warning" sentence but left the pre-existing paragraph that already said
+      the same thing, so the block stated the leading-indicator point twice with
+      a ragged wrap. Collapsed to one statement.
+
+  New fail-on-revert binders: TestPendingTable_FullDrainIsConstantTime (counts
+  slots examined, not time, so it cannot flake; also asserts the drain is REAL
+  and is not miscounted as a cap-pressure eviction) and
+  TestPendingTable_AdoptRespectsRemainingRoom (occupancy must not exceed
+  capacity; pre-existing destination bindings must not be clobbered).
+
+  Suites: pkg/dhcprelay -race -count=5 PASS; pkg/cli -race PASS; go build ./...,
+  vet, gofmt (dhcprelay + cli), and GOARCH=386 build+vet all clean. The repo-wide
+  gofmt -l hits are pre-existing files in other packages, none touched here.
+- **File(s)**: pkg/dhcprelay/{pending.go,README.md,relay_binding_6562_test.go},
+    pkg/cli/show_services_dhcp.go, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6562 / PR #6603 third review round — three Codex MINORs on the
+  pending ring (bounded reclaim, adopt precondition, occupancy gauge).
+
+  MINOR 1. The constant-time fast path only covers EVERY slot being expired.
+  The adjacent case — capacity-1 expired with the newest still live, i.e. a
+  quiet period then one late request — failed the probe and fell into an
+  unbounded loop popping ~131071 slots one at a time under the mutex on the
+  packet path: the same stall, narrower trigger. The guard added for the fast
+  path FROZE the clock, so every slot shared one expiry and the mixed ring was
+  unconstructible — the case could not be exercised. FIX: head drain capped at
+  maxDrainPerInsert (64). insert needs exactly ONE free slot, so more buys
+  nothing; leftovers are inert (matches re-checks expiry, occupancy excludes
+  them) and clear at ~65 slots/packet. New guard staggers expiries 1ms apart
+  and asserts the ring is MIXED as a precondition.
+
+  MINOR 2. adopt appended without merging, so migrated expiries could land
+  after a destination's later ones and break the expiry ordering every other
+  operation depends on — the full-drain probe would read a newer-but-expired
+  tail slot, conclude the ring was dead and wipe live bindings. Production
+  adopts into an empty table so this was not a live-path defect, but the doc
+  claimed correctness "for any destination", which was false. FIX: require an
+  empty destination and PANIC otherwise (a programmer-error assertion,
+  unreachable from the sole caller); doc claim corrected in pending.go and
+  README. Chose the assertion over an ordered merge: no caller needs the
+  general case and it is not worth the complexity on a security-relevant path.
+
+  MINOR 3. occupancy() returned the raw ring count, which includes the expired
+  prefix, so an idle full table reported capacity/capacity even though the next
+  insert reclaims the lot and evicts nothing — the same false-HIGH the previous
+  round fixed for len(entries), reintroduced. FIX: report unexpired slots; the
+  expired ones are a contiguous prefix (ring is expiry-ordered), so the
+  boundary is a binary search, O(log capacity) under the mutex.
+
+  SELF-CAUGHT, WORTH RECORDING: while fixing MINOR 1 I added evictHeadLocked so
+  the at-cap eviction loop would not count an expired pop as cap pressure, plus
+  a test asserting it. Mutation-testing the change showed the test could NOT
+  fail. Reachability analysis proved why: the loop needs count >= capacity, but
+  the fast path leaves count 0 and any drain leaves count = cap-d < cap, so
+  whenever the loop runs the head is unexpired BY CONSTRUCTION (d == 64 would
+  need cap-64 >= cap). The defensive check was dead logic and the test was
+  vacuous — exactly the guard-cannot-fire pattern flagged this round. REMOVED
+  both; the proof now lives in a comment in insert(), and the test was reframed
+  to pin the reachable operator-facing property (an idle relay reports no
+  evictions) with an explicit scope note that it does not bind an unreachable
+  expiry re-check.
+
+  VALIDATION — mutation proof per finding in a THROWAWAY detached worktree
+  (/dev/shm/probe-6603i, removed after), build+vet CLEAN in each so every red
+  is an ASSERTION: (1) drain bound removed -> PartialDrainIsBounded RED
+  ("examined 4095 slots (capacity 4096); per-insert reclaim must be bounded by
+  ~68"); (2) empty-destination precondition removed -> AdoptRequiresEmpty
+  Destination RED (no panic); (3) occupancy back to raw count ->
+  OccupancyExcludesExpired RED ("occupancy = 64, want 32" and "= 64, want 0"
+  wholly expired) plus PartialDrainIsBounded's mixed-ring precondition. All
+  re-verified after removing evictHeadLocked. Suites: pkg/dhcprelay
+  -race -count=5 PASS; pkg/dhcp, pkg/dhcpserver, pkg/cli -race PASS; build,
+  vet, gofmt clean.
+- **File(s)**: pkg/dhcprelay/{pending.go,README.md,relay_binding_6562_test.go},
+    _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6562 review-fold round 4 (Codex MERGE-NEEDS-MINOR, one residual —
+  the data-structure correction is CONFIRMED closed: mixed-case reclaim bounded
+  at 64 pops still leaving room for the new binding, and the fixture now
+  staggers expiries by 1ms and reaches one-live/4095-expired, failing with 4095
+  scans when the bound is removed). The residual was a documentation math error
+  in two places: `pending.go` and `README.md` both claimed a backlog clears at
+  ~65 slots per admitted packet, on the reasoning that the drain removes 64 and
+  the eviction loop frees one more. The eviction loop cannot run — after any
+  POSITIVE drain `count < capacity`, which the early return in the eviction path
+  proves. The real figure is a NET 63: 64 drained, one added. Corrected in both
+  places and stated with the reason, since the wrong number was arrived at by a
+  plausible-but-false chain that a reader would otherwise re-derive.
+- **File(s)**: pkg/dhcprelay/pending.go, pkg/dhcprelay/README.md, _Log.md
+- **Timestamp**: 2026-07-31 05:20
+  - **Action**: Fold the final-review MINOR-1 on #6291 — the sizing narrative had
+    been corrected from "the residual is benign" into an overstatement in the
+    OPPOSITE direction. Per occurrence the eliminated orientation was the worse
+    one, but by RATE it was the rarer one (it needed a whole FIB-clone publish
+    window to nest inside a nanosecond gap between two adjacent acquire-loads —
+    a stalled worker), while the survivor needs only the forwarding load to land
+    anywhere in that window, near-certain for at least one per-VF worker on
+    every apply. Recorded both directions so the record is not left overstated
+    either way.
+  - **File(s)**: userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+    userspace-dp/src/afxdp/coordinator/README.md
+
+- **Timestamp**: 2026-07-31 07:05
+  - **Action**: #6592 — pair validation and forwarding ATOMICALLY so a worker can
+    never hold one half from generation N and the other from N-1, in EITHER
+    orientation. `shared_validation` (an `ArcSwap<ValidationState>`) and
+    `ha.forwarding` (an `ArcSwap<ForwardingState>`) are replaced by a single
+    `ha.runtime: ArcSwap<RuntimeView>` where `RuntimeView { validation,
+    forwarding: Arc<ForwardingState> }`. The worker's per-tick refresh
+    (`refresh_runtime_view`) and its startup seed both take BOTH halves out of
+    ONE `ArcSwap` load, so whichever view is observed, its two halves were
+    published together. #6291's read-order flip could only ever exclude ONE
+    orientation — an acquire/release pair is directional — and the one it left,
+    `(new validation, old forwarding)`, is the COMMON one and is not drop-only:
+    after Go writes the new generation into `userspace_ctrl` the shim stamps
+    NEW, those packets classify Valid against the worker's new validation, and
+    they forward under the STALE tables.
+    DESIGN: the forwarding half stays a NESTED `Arc` rather than being inlined
+    into a single flat snapshot, because `bump_fib_generation` advances
+    validation with NO table change and Go fires it repeatedly during route
+    convergence. `republish_runtime_validation` reuses the published forwarding
+    `Arc`, so the worker's #1188 `Arc::ptr_eq` short-circuit still hits and the
+    expensive rotation branch is not taken. Measured
+    (`benches/runtime_view_refresh.rs`): validation-only publish 214 ns (reuse)
+    vs 14.2 us (inlined rebuild) at 1K routes — 66x — and 239 ns vs 62.5 us at
+    10K routes — 262x. The per-tick worker refresh went from 45.97 ns (two
+    ArcSwap loads) to 22.57 ns (one), so the hot path got cheaper, not dearer.
+    Every publish site now funnels through one choke point
+    (`Coordinator::publish_runtime_view` / `republish_runtime_validation`), which
+    builds the view from `self.validation` AT the store — so coherence is
+    structural at every site instead of depending on store order. `stop_inner`
+    needed `self.validation` defaulted BEFORE its publish (it used to be reset
+    after the stores, which was harmless with two independent Arcs but would now
+    publish a default forwarding paired with the outgoing validation). #5166 is
+    unchanged: the CoS maps + `ha.fabrics` still store before the view, and the
+    worker still reads the view before the CoS Arcs.
+    GATES: the consumer test
+    (`snapshot_refresh_runtime_view_pair_is_atomic_6592`) drives the refresh with
+    a coordinator publish injected through the `between` seam and asserts the
+    returned pair is coherent — splitting it back into two `ArcSwap` loads goes
+    RED in EITHER order and the message names which orientation was
+    reintroduced. The producer test
+    (`refresh_runtime_snapshot_publishes_a_coherent_view_pair`) asserts the pair a
+    worker observes IS the pair the choke point intended, via the
+    `runtime_view_at_publish` seam, which retains the PREVIOUS view so it proves
+    its own position (hoisting the store above the capture is RED too). #1188 is
+    pinned by `bump_fib_generation_publishes_new_stamps_without_rotating_forwarding`.
+    Release symbol check: `refresh_runtime_view` is absent from `nm` on the
+    release binary while `worker_loop` is present — the seam leaves no call
+    boundary. Full `cargo test --release` green (4220 + 60 + 8 + 22 + 1); all
+    five new/updated test names confirmed in the release `-v` output.
+  - **File(s)**: userspace-dp/src/afxdp/types/{runtime_view.rs,mod.rs},
+    userspace-dp/src/afxdp/coordinator/{mod.rs,ha_state.rs,snapshot_refresh.rs,
+    tunnel_supervision.rs,tests.rs,README.md},
+    userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
+    userspace-dp/src/afxdp/worker/{launch.rs,loop_body/mod.rs,loop_body/setup.rs},
+    userspace-dp/src/afxdp/tunnel.rs,
+    userspace-dp/src/afxdp/forwarding/README.md,
+    userspace-dp/benches/runtime_view_refresh.rs, userspace-dp/Cargo.toml,
+    docs/userspace-dataplane-architecture.md, docs/fabric-cross-chassis-fwd.md,
+    _Log.md
+
+- **Timestamp**: 2026-07-31 09:40
+  - **Action**: Fold the independent hostile review of PR #6608 (#6592) —
+    MERGE-NEEDS-MINOR, two MINORs plus four NITs, no MAJOR.
+    MINOR-1: the "single choke point" was a CONVENTION, not an invariant.
+    `HaState::runtime` was `pub(in crate::afxdp)`, so any module under
+    `crate::afxdp` could `ha.runtime.store(...)` and bypass
+    `store_runtime_view` — and the PR's own `seed_published_validation` did
+    exactly that, proving the path open rather than theoretical. Both
+    RED-on-revert seams sit inside or behind the choke point, so a future site
+    publishing `RuntimeView::new(older_validation, fwd)` directly would
+    reintroduce the #6592 mirror on the WRITER side with the suite green. Took
+    BOTH offered remedies, because neither alone is an invariant: narrowed the
+    field to `pub(super)` (removes the reach from worker/, tunnel.rs, ha/,
+    forwarding/ and every other afxdp module; readers now take a handle via the
+    new `HaState::runtime_reader`), AND added
+    `tests/runtime_view_publish_canary.rs`. The visibility cannot close it — a
+    new site inside `coordinator/` still compiles and the reader handle is a
+    storable `Arc<ArcSwap<..>>` by construction — so the canary is what makes
+    the remaining paths mechanical. It pins three rules: exactly one
+    `.runtime.store(` (the choke point); no `RuntimeView` CONSTRUCTED outside
+    the choke point without an explicit `runtime-view-canary: test-local`
+    marker (construction is the rule that catches a bypass storing through a
+    cloned handle, which the textual store rule cannot see); and one
+    runtime-view load per production reader, with a per-file table — which is
+    also what covers NIT-4's "a second load elsewhere in the tick" hole.
+    `seed_published_validation` now routes through
+    `republish_runtime_validation` so the tree has exactly ONE store with no
+    cfg(test) exemption to reason about.
+    MINOR-2: a doc comment on `published_validation` claimed `self.validation`
+    may be "left unpublished" by a mid-apply abort. #3766 made that
+    unreachable, and the claim is actively dangerous now: this PR NEWLY routes
+    `update_neighbors` and `refresh_fabric_links` through
+    `publish_runtime_view`, which carries `self.validation`; if the claim were
+    true, a `SyncFabricState` or neighbor push after an aborted apply would
+    publish (stranded new validation, old forwarding) — the mirror bug moved
+    writer-side. Verified the property firsthand rather than taking it on
+    report: the assignment-to-publish windows are 131 lines
+    (`refresh_runtime_snapshot_inner`) and 51 lines (`apply_snapshot`), and a
+    scan of both for `return` / `?` / `unwrap` / `expect` / `panic!` / `todo!`
+    / `unreachable!` returns EMPTY. Replaced the parenthetical with the
+    property stated positively and marked LOAD-BEARING for the two new call
+    sites.
+    NIT-3: stale `ha.forwarding` names in two live comments
+    (forwarding_build/mod.rs, coordinator/tests.rs).
+    NIT-4: gave the consumer seam a COMPILE-TIME position proof — `between`
+    now takes the just-read `ValidationState`, so it cannot be hoisted above
+    the load (which would let the injected publish land before any read and
+    pass vacuously on an old-old pair). This is the analogue of the producer
+    seam's previous-view assert. The residual limit (the test drives
+    `refresh_runtime_view`, not the real `worker_loop`) is now stated in the
+    doc and covered mechanically by the canary's load count. Re-verified the
+    seam still compiles away after the signature change: `worker_loop`'s
+    release disassembly is BYTE-IDENTICAL to the pre-change baseline (9404
+    instructions), `refresh_runtime_view` still absent from `nm`, zero
+    closure/`call_once` calls.
+    NIT-5: one sentence at the `stop_inner` publish explaining the
+    clone-a-just-defaulted-state cost as deliberate (teardown-only; uniformity
+    of one publish path beats skipping ~20 empty-collection clones).
+    NIT-6: bench head now states what G1 does NOT prove — it measures the SHAPE
+    change, not the production symbol, and the compile-away property rests on
+    the separate release-binary checks.
+    Canary hardening worth recording: the first run fired FIVE violations, two
+    of which were the canary counting its own PROSE (the #6592 docs quote
+    `ha.runtime.store(`, `RuntimeView::default()` and `shared_runtime.load()`).
+    Comment-only lines are now skipped — a trailing comment on a code line is
+    still counted, so a construction cannot hide behind one — and `->
+    RuntimeView {` is excluded as a return type rather than a construction.
+    Both hardenings carry their own self-tests so they cannot silently rot.
+    A THIRD hardening came out of the fire-probe itself and is the important
+    one: the probe's bypass was written as a rustfmt-wrapped chain
+    (`self.ha` / `.runtime` / `.store(...)` on three lines), so the substring
+    `.runtime.store(` appeared on NO single line and the line-based rule 1 did
+    not fire — the exact "canary that cannot fire" failure mode. (Rule 2 caught
+    that bypass on its construction, which is why construction is the
+    load-bearing rule, but rule 1 was still broken.) Rules 1 and 3 now count
+    over comment-stripped, whitespace-REMOVED code so a wrapped chain matches
+    however it is formatted, with self-tests for both wrapped shapes.
+    GATES: `cargo test --release --bins --tests -- --test-threads=1` green
+    (4220 + 60 + 8 + 22 + 13 + 1, exit 0). Canary fire-probes run in a
+    THROWAWAY detached worktree.
+  - **File(s)**: userspace-dp/tests/runtime_view_publish_canary.rs,
+    userspace-dp/src/afxdp/coordinator/{ha_state.rs,mod.rs,tests.rs},
+    userspace-dp/src/afxdp/worker/{launch.rs,loop_body/mod.rs},
+    userspace-dp/src/afxdp/types/runtime_view.rs,
+    userspace-dp/src/afxdp/forwarding_build/mod.rs,
+    userspace-dp/benches/runtime_view_refresh.rs, _Log.md
+
+- **Timestamp**: 2026-07-31 11:15
+  - **Action**: Fold the Codex re-gate on PR #6608 (#6592) — MERGE-NEEDS-MINOR:
+    the source canary was demonstrably FAIL-OPEN, and the fix is to move the
+    write capability into the type system rather than keep enumerating
+    bypasses.
+    REPRODUCED FIRST, before changing anything. Codex's injection, verbatim,
+    into `refresh_fabric_links`:
+      let runtime_writer_alias = self.ha.runtime_reader();
+      let mut torn = runtime_writer_alias.load_full().as_ref().clone();
+      torn.validation.fib_generation =
+          torn.validation.fib_generation.wrapping_add(1);
+      runtime_writer_alias.store(Arc::new(torn));
+    On head 6d066d203 that COMPILED, published the exact (new validation, old
+    forwarding) tear, and all 15 canary tests PASSED (exit 0). My fold report
+    had argued rule 2 was the backstop because "a publish needs a view VALUE" —
+    that reasoning is exactly what fails, because a value can be obtained by
+    CLONING one out of a load instead of constructing one. Third enumeration
+    failure on this canary (after the rustfmt-wrapped chain), which is the
+    argument for stopping.
+    FIX — type-level, three independent compile errors on that injection:
+    (1) `RuntimeViewReader` (new): private `ArcSwap` field, sole method
+    `load()`. `runtime_reader()` returns it instead of
+    `Arc<ArcSwap<RuntimeView>>`, so a consumer cannot obtain a writer —
+    `.store(..)` and `.load_full()` do not exist on it.
+    (2) `RuntimeView` is no longer `Clone` — `.as_ref().clone()` does not
+    compile, which makes `RuntimeView::new` the ONLY way to obtain a view value
+    anywhere and turns "a publish needs a CONSTRUCTED view" from an
+    enumeration into a true statement.
+    (3) `RuntimeView`'s fields are private with `validation()` / `forwarding()`
+    accessors — `torn.validation.fib_generation = ..` does not compile.
+    Also `RuntimeViewChannel` (new) wraps the coordinator's `ArcSwap` in a
+    private field exposing only `publish`/`load`/`load_full`/`reader`, so
+    `swap`, `rcu`, `compare_and_swap` and `Deref` are unreachable rather than
+    merely unmatched by a regex — Codex's other named evasion.
+    CANARY, now defence in depth rather than the boundary: rule 1 counts
+    `.runtime.publish(` (the only mutation left); NEW rule 1b fires if any file
+    outside `types/runtime_view.rs` so much as names `ArcSwap<RuntimeView>`,
+    which is precisely the capability escape the probe used; rule 2's
+    `test-local` marker is now honoured ONLY in a file's test half (Codex:
+    unconstrained, it silenced production code too); and a truncation-heuristic
+    guard fires if a COUNTED reader file grows `#[cfg(not(test))]` past its
+    first top-level `#[cfg(test)]`, which is the only way production code lands
+    in the discarded half. 20 canary tests including self-tests for each new
+    rule. Deliberately NOT chased: distinguishing test from production loads
+    past the truncation point needs region tracking; the early warning is
+    enough while the count is zero, and that limit is written down rather than
+    implied.
+    CORRECTED MY OWN RECORD: my earlier "zero closure/call_once calls in
+    worker_loop" was an artefact — `dumpwl.py` normalises `<...>` to `<SYM>`
+    BEFORE the grep, so the check could never have matched. On raw objdump
+    `worker_loop` contains exactly 2 `call_once` calls, both a shared
+    `.llvm.`-deduplicated lazy-init thunk (`xor %edi,%edi` then a NULL-test on
+    the returned pointer), present identically with and without the seam call.
+    Codex was right and the corrected instrument is the call/lock-count
+    isolation, not a symbol grep.
+    GATES: `cargo test --release --bins --tests -- --test-threads=1` green
+    (4220 + 60 + 8 + 22 + 20 + 1, exit 0).
+  - **File(s)**: userspace-dp/src/afxdp/types/runtime_view.rs,
+    userspace-dp/src/afxdp/coordinator/{ha_state.rs,mod.rs,tests.rs,
+    tunnel_supervision.rs,snapshot_refresh.rs,README.md},
+    userspace-dp/src/afxdp/worker/{launch.rs,loop_body/mod.rs,loop_body/setup.rs},
+    userspace-dp/src/afxdp/tunnel.rs,
+    userspace-dp/tests/runtime_view_publish_canary.rs, _Log.md
+
+- **Timestamp**: 2026-07-31 14:33
+  - **Action**: Fold the Codex re-gate on PR #6608 (#6592) — the canary's
+    test-region heuristic was fail-open, and the file it was blind to is the
+    one file it most needs to watch.
+    REPRODUCED FIRST, on head 3b2151aa3, in a throwaway detached worktree.
+    Codex's finding: production_half truncated a file at its FIRST top-level
+    cfg(test), and in coordinator/mod.rs that attribute sits on a test-only
+    `use` at line 35 — so 1200+ lines, INCLUDING the publish choke point at
+    line 1117, were discarded from the scan. Its words: "unconditional
+    production items after the first cfg(test) are discarded". Injected an
+    explicit construct-and-publish below line 35, spelled to dodge rule 1 by
+    rebinding the channel and carrying the test-local marker (honoured in the
+    "test half", which truncation had made the whole file):
+      fn probe_torn_publish(&mut self, stale: ValidationState,
+                            forwarding: Arc<ForwardingState>) {
+          let torn = Arc::new(RuntimeView::new(stale, forwarding)); // marker
+          let channel = &self.ha.runtime;
+          channel.publish(torn);
+      }
+    That COMPILED, published the (stale validation, live forwarding) tear, and
+    all 20 canary tests PASSED (exit 0). This is the residue the type system
+    explicitly cannot express — the one thing the canary is now the sole
+    guard for — so the blind spot sat exactly on top of the remaining risk.
+    Fourth enumeration/heuristic failure on this canary, after the
+    rustfmt-wrapped chain and the cloned-view bypass.
+    FIX — region tracking, not a wider heuristic. A top-level cfg(test) on an
+    ITEM hides only that item; only the brace-delimited forms (mod, impl,
+    macro!) introduce a region. `test_regions` skips the attributed item —
+    consuming the whole attribute run, so `#[cfg(test)] #[path = "x_tests.rs"]
+    mod tests;` ends at its semicolon — and CONTINUES scanning. Brace tracking
+    runs over comment- and literal-masked text (`mask_non_code`: nested block
+    comments, raw/byte strings, char literals incl. '{' and '\u{...}'), because
+    a single "{" in a string would otherwise desync the depth counter for the
+    rest of the file, and desync decides which half a line lands in. The halves
+    are line-aligned and elided regions are filled with a NUL rather than a
+    blank, so the whitespace-stripped blob (which is what makes the
+    rustfmt-wrapped-chain rule work) cannot splice two lines across a gap and
+    manufacture a match present in neither.
+    Deleted `scan_truncation_heuristic` — the cfg(not(test))-past-truncation
+    early warning — rather than keep it: with region tracking there is no
+    truncation point, so the rule could never fire again, and this file's own
+    doctrine is that a canary that cannot fire is worse than no canary. It is
+    strictly subsumed: that production code is now simply scanned.
+    5 new self-tests, each verified NON-VACUOUS by neutralizing split_halves
+    back to truncation (all 5 RED, 18 pass). Two of them initially passed
+    under truncation for the wrong reason — their fixture STARTED with
+    cfg(test), so `find("\n#[cfg(test)]")` found nothing and scanned the whole
+    file; both now carry a leading production line so a truncating
+    implementation really does truncate. MUTATION: same injected tree, fixed
+    canary — rule 2 fires, "src/afxdp/coordinator/mod.rs: 2 RuntimeView
+    construction(s), expected 1", exit 101.
+    The corrected scan is much wider (coordinator/mod.rs goes from 34 scanned
+    lines to 1276; ~100 files across the tree gain production code that the
+    truncation had discarded) and the tree is clean under it — no table entry
+    needed relaxing.
+    Docs: coordinator/README.md claimed the canary covers "a new publish site
+    inside coordinator/". That claim was false for most of that file; the
+    README now records why and what replaced it.
+    GATES: cargo test --release --bins --tests -- --test-threads=1 green
+    (60 + 4220 + 8 + 22 + 23 + 1, exit 0; canary 20 -> 23 tests). Type-level
+    containment re-verified firsthand, unchanged by this fold: Codex's
+    aliased-writer injection still fails to build with 2x E0599 (no `load_full`
+    / no `store` on RuntimeViewReader), and routing the same injection through
+    the coordinator's own channel to unmask the other two legs fails with 2x
+    E0616 (private field `validation`) plus E0308 (RuntimeView is not Clone, so
+    `.as_ref().clone()` yields a reference). All probes in a throwaway detached
+    worktree, removed after.
+  - **File(s)**: userspace-dp/tests/runtime_view_publish_canary.rs,
+    userspace-dp/src/afxdp/coordinator/README.md, _Log.md
+
+- **Timestamp**: 2026-07-31 13:05
+  - **Action**: Fold the Codex re-gate of 93c87076a on PR #6608 (#6592) — two
+    REAL fail-opens in the canary's region tracker, both confirmed by Codex
+    with compiling fixtures, both the same class the tracker was already fixed
+    for once.
+    BUG 1 — raw C strings unrecognized. `raw_string_open` accepted the `r`,
+    `br` prefixes but not `cr`; the match arm did not even admit `b'c'`. Codex's
+    fixture `#[cfg(test)] const S: &CStr = cr#""{"#;` compiles under rustc 1.96
+    in BOTH modes, and its `{` desynced brace tracking so `production_half`
+    returned the following production fn as elided NULs — its
+    `shared_runtime.load()` invisible to rule 3.
+    BUG 2 — a brace-delimited item closed without checking `aux == 0`, so
+    `#[cfg(test)] swallow!({} #[cfg(test)] garbage);` "ended" at the INNER `{}`,
+    the trailing attribute-shaped tokens read as top level, and the production
+    fn after them was elided.
+    FIX, made STRUCTURAL rather than additive per the review: the raw-literal
+    prefix set is now derived from the grammar (`r` / `br` / `cr`, any hash
+    count) instead of from the shapes this tree happens to contain; and an item
+    body brace is recognized ONLY at `aux == 0`, so a brace inside `()`/`[]` is
+    a macro argument / array / struct-literal-in-call and never mistaken for the
+    item's own body.
+    COVERAGE, enumerated from Rust's literal grammar rather than accumulated:
+    a `LITERAL_SHAPES` table drives one self-test per shape that can legally
+    hide an unbalanced `{` — line comment, block comment, NESTED block comment,
+    char literal, `'\u{7b}'` escape, byte char, string, string with escaped
+    quote, byte string, C string, raw string (0/1/2 hashes), raw byte string,
+    raw C string — 15 rows. Plus both of Codex's fixtures verbatim, a
+    lifetime-tick test (`'a` must NOT mask as a char literal), and a test that
+    `#[cfg(test)]` appearing inside a string or doc comment opens no region.
+    LIMITS written down as an executable test rather than assumed:
+    `#[cfg(all(test, ..))]`, `#[cfg_attr(.., cfg(test))]`, and attributes
+    GENERATED by `macro_rules!` are NOT recognized. None can hide a `{` — they
+    are limits of the ATTRIBUTE matching, not the literal grammar — and each
+    fails CLOSED: the region goes unrecognized so its lines stay in the
+    PRODUCTION half and are scanned MORE, never less.
+    Fixture-template bug caught while writing the matrix: the single-line
+    template `fn t() { // { }` put the closing brace inside the line comment,
+    making the FIXTURE invalid Rust rather than testing the masker. Body now
+    spans lines.
+    MUTATION MATRIX — 10/10 RED, and building it caught THREE self-tests that
+    did not actually bind their fix (the whole point of mutation over
+    assertion-counting):
+      * nested block comment: the row's brace sat BEFORE the inner `*/`, so a
+        NON-nesting masker covered it by accident. Moved the brace after the
+        inner close.
+      * raw byte / raw C string: `br#"{"#` is masked by the plain-string arm
+        anyway, so the prefix handling was never exercised. Content must START
+        with a quote (`br#""{"#`) — then a masker that misses the prefix closes
+        at the inner quote and leaves the brace bare. Same shape Codex used.
+      * the two `aux == 0` gates are DUAL: removing either alone is masked by
+        the other, so each individually mutated GREEN. Recorded as ONE mutation
+        (remove both) rather than pretending to two independent rows.
+    GATES: `cargo test --release --bins --tests -- --test-threads=1` green
+    (4220 + 60 + 8 + 22 + 29 + 1, exit 0). Type-probe regressions re-confirmed:
+    aliased writer still 2x E0599, coordinator-channel variant still 2x E0616 +
+    E0308. Matrix and probes run in a throwaway detached worktree, removed.
+  - **File(s)**: userspace-dp/tests/runtime_view_publish_canary.rs, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6592 review-fold (Codex MERGE-NEEDS-MINOR, one residual). The
+  canary's `mask_non_code` did not mask a Rust SHEBANG. rustc strips `#!` before
+  tokenization, so its bytes are not code — but the tracker counted its
+  delimiters, and a legal `#!/usr/bin/env rust-script }` set brace depth to -1;
+  the following `struct S {` returned it to zero, making a FIELD's nested
+  `#[cfg(test)]` look top-level. A field has neither a semicolon nor its own
+  body, so `attributed_item_end` then ran to EOF and elided the production
+  function. Masked the leading `#!` line, explicitly NOT `#![`, which is an
+  inner attribute and IS code.
+  NOTE ON THE TEST: my first fixture used a plain struct field and was VACUOUS —
+  neutering the mask left it GREEN, because without the nested `#[cfg(test)]`
+  nothing was elided. Caught by mutation, not by reading. Corrected to the
+  reviewer's exact shape (attribute on the field) and re-verified: the mask
+  mutation now reds `hostile_fixture_shebang_is_not_code` while
+  `inner_attribute_is_not_mistaken_for_a_shebang` stays green — an exact
+  partition. Full gate green: 4220 + 60 + 8 + 22 + 31 + 1, 0 failed.
+- **File(s)**: userspace-dp/tests/runtime_view_publish_canary.rs, _Log.md
+- **Timestamp**: 2026-07-31
+- **Action**: #6524 fix — a chained flat-set custom application compiled
+  PROTOCOL-ONLY, so a policy matching it permitted ALL TCP.
+  `set applications application myapp protocol tcp destination-port 8080`
+  builds a CHAIN of single-key nodes (SetPath parks the rest of the line under
+  the node it just created, because these leaves declare `children: nil`), so
+  `destination-port` nests under the VALUE node `tcp` and is never a sibling of
+  `protocol`. compileApplications iterated only `inst.node.Children`, saw just
+  `protocol`, and never assigned DestinationPort; an empty port term matches
+  ANY port (pkg/policymatch), so the referencing policy over-permitted. Nothing
+  caught it: protocol / destination-port / source-port were the only
+  `applications application` match leaves neither typed nor `scalar: true`, so
+  no arity gate engaged and the chained form validated clean at BOTH
+  SchemaValidate and strict commit. The REVERSE order was caught only
+  incidentally by the #3109 protocol-less gate — that asymmetry hid it.
+  Verified firsthand before coding (ParseSetCommand + SetPath, never
+  NewParser): dumped the chain AST, confirmed DestinationPort=="" with
+  SchemaValidate CLEAN, then confirmed a permit policy admitted tcp/22.
+  Fixed in the COMPILER, not the schema, and said why: CompileConfigLenient
+  (boot load + HA SyncApply) downgrades a schema rejection to a WARNING and
+  keeps compiling, so a schema-only reject would leave a persisted or
+  peer-pushed config still protocol-only and still permitting all TCP — exactly
+  where no operator sees the warning. It would also mint a new
+  commit-vs-load split for a spelling that now has well-defined semantics (the
+  divergence class #3606 calls out). New `applicationDirectLeaves` walks the
+  chain across BOTH AST shapes and splits each node's PACKED Keys into one leaf
+  per recognized keyword — a three-leaf line collapses to
+  `protocol tcp -> Keys=[source-port 5000 destination-port 8080]`, so a
+  Keys[2:]-is-garbage rule was wrong and the scan is keyword-delimited, the same
+  shape parseApplicationTerms uses. Tokens it cannot map to a known leaf land on
+  the new Application.UnknownDirectLeaves and are hard-rejected by
+  validateApplicationSyntaxStrict (lenient-warn), which is what makes
+  `protocol [ tcp udp ]` and `destination-port [ 22 23 ]` operator-visible: a
+  DIRECT body holds ONE protocol and ONE port, so a bracket tail is
+  unrepresentable, not merely mis-read. The record is carried onto generated
+  term applications too, since the parent struct is discarded on that branch.
+  `term` is emitted but not descended into (its subtree is opaque and
+  parseApplicationTerms already guards it with UnknownTermLeaves).
+  Fail-on-revert asserts the POLICY OUTCOME, not the struct: with the walk
+  reverted, tcp/22 is PERMITTED by an app declared `protocol tcp
+  destination-port 8080` and the 4 pkg/policymatch tests go RED, while the two
+  over-reach guards (hierarchical + sibling flat-set spellings) stay GREEN.
+  Golden 4406 shifted by exactly 3 leaves — its own fixture uses the chained
+  form, so appA's DestinationPort went ""->"80" (the bug was sitting in the
+  project's own corpus) — plus the new struct field key; regenerated.
+  Full pkg/config + pkg/policymatch green. pkg/dataplane/userspace has 7
+  event-stream failures, verified IDENTICAL on pristine origin/master
+  (detached worktree, diffed failure lists) — pre-existing, zero regressions.
+- **File(s)**: pkg/config/{compiler_applications.go,types_security.go,
+    compiler_validate_strict_application.go,
+    compiler_application_chained_leaves_6524_test.go,
+    testdata/golden_4406.json},
+    pkg/policymatch/app_chained_leaves_6524_test.go,
+    docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6524 / PR 6604 hostile-review fold (MERGE-NEEDS-MAJOR) — close a
+  fail-open the PR itself INTRODUCED, plus a phantom-leaf widening.
+  MAJOR: teaching the compiler to follow the flat-set chain also let it reach
+  `term` nodes nested down that chain, so it minted `<parent>-<term>`
+  applications that the collision gate could not see —
+  compiler_applications_collision.go:225 still enumerated `inst.node.Children`
+  while compiler_applications.go had moved to applicationDirectLeaves. The two
+  walks diverged, so a generated name was invisible to every flat-namespace gate
+  (#3472 H01/H02/H03, M08, M03) and silently OVERWROTE an authored application,
+  erasing a deny that referenced it. Verified firsthand on both sides: on my
+  head `set applications application myapp description doc term t1 protocol udp`
+  clobbered an authored `myapp-t1` (tcp/22 -> udp/"") with err=nil and ZERO
+  warnings; on pristine origin/master (detached worktree) `myapp-t1` stayed
+  tcp/22. `description` is the strict-path entry route because it deliberately
+  does not set hasDirectBody (#3366) so MixedDirectTermApps never fires; on the
+  tolerant path that gate is only a warning so no description prefix is needed.
+  The SIBLING spelling was always caught — only the chained shape evaded it.
+  Fixed by extracting applicationTermNodes + applicationTermKeys and routing
+  BOTH the compiler and the collision gate through them, making the "single
+  source of truth" doc claim actually true instead of softening it. The shared
+  helper also always COPIES, removing a latent aliasing hazard: the compiler
+  previously sliced `prop.Keys[1:]` and appended child keys onto it, which can
+  write into the node's own backing array when that slice has spare capacity.
+  MINOR: the chain scan did not reserve the leaf's value slot, so a value token
+  that happens to spell a grammar keyword synthesized a PHANTOM valueless leaf
+  that RESET an assigned field. `description destination-port` drove
+  DestinationPort back to "" — match-every-port on the tolerant path, the exact
+  widening this PR exists to close, reintroduced by another route — plus a FALSE
+  strict "conflicting duplicate" reject; `description protocol` wiped Protocol;
+  and the phantom's unconditional hasDirectBody falsely tripped #3366 on a
+  term-only app. Every `args:1` leaf now consumes exactly one token as its value
+  before the keyword scan resumes. Bracket-tail detection is unaffected (the
+  SECOND value token is still flagged).
+  PUSHED BACK on MINOR 3: the premise "master committed an unquoted multi-word
+  description" is wrong for the real commit path — SchemaValidate on pristine
+  master already rejects it via the #3332 scalar gate ("unexpected trailing
+  token \"web\""), because schema_security.go:1273 marks `description`
+  scalar:true. Only CompileConfig in isolation accepted it. Kept the reject
+  (agreeing with the schema rather than contradicting a prior explicit
+  decision); fixed the message misattribution instead — it no longer claims
+  "widening", which is wrong for a dropped protocol alternative (that NARROWS)
+  and meaningless for a description token.
+  MINOR 2 (chained spelling not individually deletable) documented rather than
+  fixed: it is pre-existing SetPath/DeletePath behaviour for EVERY chained leaf,
+  and addressing a leaf nested under a value node changes path resolution for
+  every `children: nil` leaf in the schema.
+  NIT: the keyword canary was list==copy-of-list; it now enumerates
+  schemaApplications.children["application"].children in BOTH directions.
+  Fail-on-revert verified in a THROWAWAY detached worktree (never the PR
+  worktree), build+vet CLEAN there so each red is an ASSERTION: reverting only
+  the collision-gate enumeration turns the 2 clobber tests RED while the sibling
+  baseline, both over-reach guards and all MINOR tests stay GREEN; reverting only
+  the value-slot reservation turns the 3 phantom subtests RED while the
+  bracket-tail subtest and both over-reach guards stay GREEN.
+  Full pkg/config + pkg/policymatch green; build, vet, gofmt clean.
+- **File(s)**: pkg/config/{compiler_applications.go,
+    compiler_applications_collision.go,compiler_validate_strict_application.go,
+    types_security.go,compiler_application_chained_leaves_6524_test.go},
+    docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6524 / PR 6604 Codex re-gate fold (MERGE-NEEDS-MAJOR) — stop the
+  chain walk RECOVERING a keyword after unrepresentable content, and give
+  `description` tail handling.
+  MAJOR: applicationDirectLeaves recorded an unknown token, advanced one slot
+  and CONTINUED, so a later recognized keyword was compiled normally. Verified
+  at the VERDICT level on both sides. My head, tolerant path:
+  `set applications application myapp bogus value protocol tcp` compiled
+  protocol=tcp and tcp/22 came back matched=true action=PolicyPermit
+  contentRejected=false — an all-TCP permit. Pristine origin/master (detached
+  worktree, same probe): protocol-less, tcp/22 matched=false action=PolicyDeny
+  contentRejected=true. So the PR converted an inert fail-closed residual into
+  an ACTIVE permit on boot / HA SyncApply, where the strict reject is only a
+  warning. Same root via the other ordering:
+  `destination-port [ 22 23 ] protocol tcp` skipped `23` then recovered
+  `protocol tcp`. Fixed by POISONING the remainder of a node's run and its
+  subtree on the first unrepresentable token — both the unknown-keyword branch
+  and the bracket-tail branch. Sibling leaves are deliberately unaffected
+  (separate nodes), so a stray `bogus value` line still leaves a neighbouring
+  `protocol tcp` line compiled exactly as master compiled it; that is pinned by
+  a paired over-reach guard at the verdict level, because over-poisoning would
+  silently fail-close a whole working config.
+  MINOR (`description`): Codex was RIGHT that my justification was false. I had
+  claimed the schema's scalar:true arity already enforced this at commit; it
+  does so only for the SIBLING spelling — verified firsthand that in the CHAINED
+  spelling SchemaValidate returns nil while my compiler gate rejected, so the
+  chained form WAS a new hard-reject over a metadata leaf. Rather than justify
+  it, made `description` a TAIL leaf (Junos takes its text to end-of-statement):
+  the run is joined, so `description my web app` and `description
+  destination-port` both compile as written, and a description can no longer
+  poison the rest of the run. The run still stops at the next recognized
+  keyword, so the chained-`term` reproducer keeps working. The schema's
+  scalar:true gate is untouched and still rejects the sibling spelling, which
+  master's own commit path also rejected — so no master-COMMITTABLE config is
+  newly refused (master's CompileConfig accepted it in isolation, but
+  SchemaValidate did not).
+  Also: corrected the docs claim that "both sides go through
+  applicationTermNodes" (the compiler consumes applicationDirectLeaves directly;
+  only the collision gate goes through applicationTermNodes — both derive from
+  the same walk), and added an arity pin + scope note to the schema canary,
+  which guards the KEY SET but not `args` drift.
+  Fail-on-revert in a THROWAWAY detached worktree, build+vet CLEAN there:
+  restoring `i++; continue` turns BOTH orderings RED as verdict assertions
+  ("tcp/22 was PERMITTED ..."), while every guard stays GREEN —
+  TestChainedApp{DestPort,SourcePort,ICMPType,Deny}, SiblingAppSpelling,
+  StrayStatementDoesNotDisarmSiblingLeaves, HierarchicalAppBody,
+  SiblingFlatSetAppBody, SiblingTermClobber, DescriptionIsATail.
+  Full pkg/config + pkg/policymatch green; build, vet, gofmt clean.
+- **File(s)**: pkg/config/{compiler_applications.go,types_security.go,
+    compiler_application_chained_leaves_6524_test.go},
+    pkg/policymatch/app_unknown_recovery_6524_test.go,
+    docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6524 / PR 6604 — third fold pass. Audited the previous fold
+  against the Codex verdict firsthand rather than trusting its self-report, and
+  found the MAJOR correctly closed but the MINOR's JUSTIFICATION still false in
+  the same way Codex had flagged the original.
+  Codex's MINOR said the claim "scalar validation already enforces this" was
+  false. The fold replaced it with "the schema never sees the chained one" —
+  which is ALSO false. Dumped the real AST for every spelling and found a
+  multi-word description occupies THREE positions, not two:
+    - sibling / hierarchical            -> schema scalar:true governs it
+    - HEAD of a flat-set chain          -> `set ... description my web app ...`
+      builds [description my] -> [web app ...]; the tail is a CHILD node, so
+      the joined run is only ["my"] and "web" opens a fresh run.
+      SchemaValidate DOES fire here: `unexpected trailing token "web"`.
+    - PACKED chain tail                 -> `set ... protocol tcp description my
+      web app` packs the whole description onto ONE node's Keys, below the
+      depth the schema walk reaches (SchemaValidate returns nil).
+  So the tail-join rescues exactly ONE position (the packed tail), which is
+  also the only position where a spelling master COMMITTED would otherwise
+  have become a new hard reject. The head-of-chain spelling stays a commit
+  error — and that is PARITY, because master rejected it through the same
+  untouched schema gate. Codex tested the packed-tail spelling and generalized;
+  the fold generalized in the opposite direction. Both overshot.
+  Corrected the claim at all three sites that carried it (the `description`
+  branch in compiler_applications.go, the UnknownDirectLeaves doc on
+  types_security.go, and the docs/config-schema.md bullet) to enumerate the
+  three positions and say exactly which one the join covers. This is not
+  cosmetic: an over-broad "the schema never sees the chained one" invites a
+  future change to loosen a gate master also held.
+  Added the missing coverage — TestDescriptionIsATailLeaf previously exercised
+  ONLY the packed-tail position, so a reader would conclude `description my web
+  app` commits, which it does not. The new subtest pins the head-of-chain
+  position AND asserts the MECHANISM that makes it parity (SchemaValidate still
+  fires), because asserting only "commit fails" cannot distinguish a
+  pre-existing gate from one this PR introduced.
+  Verification, all in a THROWAWAY detached worktree (/dev/shm/probe-6604d,
+  build+vet CLEAN there, removed after):
+    - MAJOR RED at pre-fold head 4e132ced5, VERDICT level, BOTH orderings:
+      "tcp/22 was PERMITTED by an application whose body contains
+      unrepresentable content" for `bogus value protocol tcp` AND for
+      `destination-port [ 22 23 ] protocol tcp`.
+    - MINOR RED at the same head: `chained multi-word description commits`
+      failed on the hard reject of "web".
+    - New subtest RED there too, as an assertion: `Protocol="tcp", want ""`.
+    - Over-reach guards PASS at the pre-fold head (they do not co-vary):
+      StrayStatementDoesNotDisarmSiblingLeaves,
+      UnknownTokenDoesNotPoisonSiblingLeaves, ApplicationDirectLeafArityIsOne.
+  Also probed and cleared two shapes I suspected: a `term` at mid-run inside a
+  packed tail carries NO Children (so a term's token stream is never split
+  across Keys and Children), and the hierarchical shape still compiles as
+  siblings, byte-identical to master.
+  Full pkg/config + pkg/policymatch green; vet clean; gofmt clean on every file
+  this PR touches (the three gofmt-dirty files under pkg/config are dirty on
+  origin/master too — pre-existing, not this PR's).
+- **File(s)**: pkg/config/{compiler_applications.go,types_security.go,
+    compiler_application_chained_leaves_6524_test.go},
+    docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6524 review-fold round 4 (Codex MERGE-NEEDS-MINOR, one residual).
+  The strict-path diagnostic listed every direct leaf as "each taking a SINGLE
+  value", which contradicted the packed multi-word `description` tail this PR
+  deliberately accepts. An operator hitting the message would be told the
+  opposite of the behaviour. Reworded to exempt `description` explicitly. No
+  code change; Codex reproduced all three description AST shapes and their
+  SchemaValidate outcomes, confirmed tolerant poisoning preserves
+  master-enforced sibling leaves, confirmed both recovery orderings permit
+  TCP/22 under the MAJOR revert with every named over-reach guard green, and
+  confirmed collision enumeration and compilation still share the one walk.
+- **File(s)**: pkg/config/compiler_validate_strict_application.go, _Log.md
+- **Action**: #4146 destination slice — enforce a `to-zone junos-host` DENY that
+  carries an explicit `match destination-address` on the DIRECT host-bound path.
+  #4932 shipped the kernel-nft projection of the representable junos-host DENY
+  class, but `junosHostProjectTerm` marked ANY term with a scoped destination
+  un-representable. Because the representability gate is WHOLE-PROGRAM, a single
+  `match destination-address <fw-ip>` deny not only went unenforced itself — it
+  silently disabled kernel enforcement of EVERY other junos-host deny on that
+  ingress zone. Reproduced firsthand before touching code: the projection
+  returned `representable=false`, zero programs, empty `RenderedPolicyKeys`,
+  while `policymatch.Match` (the Go mirror of Rust
+  `evaluate_junos_host_policy`, which already matched destination via
+  `rule_l3_matches(rule, state, src_ip, dst_ip)`) returned DENY — a fail-open on
+  the only surface that actually sees the packet.
+  Fix: project the destination dimension onto the rule (`Dst` / `DstExcluded` /
+  `DstAny`) and render `<fam> daddr <set>` / `daddr != <set>` AFTER the source
+  predicate, on BOTH nft surfaces (the exec-nft oracle in `daemon_nft.go` and
+  the production netlink installer in `pkg/nftables`). The ZONE scope stays
+  `iifname` — the daddr predicate only NARROWS on top of it, so a
+  destination-scoped deny on a data zone can never suppress management ingress
+  on a lifeline. Source and destination now route through ONE shared projection
+  formula (`junosHostProjectAddrMatch`) so the #5828 degenerate `any`+excluded
+  case ("every address EXCEPT every address" = the empty set => project NO rule,
+  never an unconditional drop) cannot be fixed on one dimension and regress on
+  the other. A destination-scoped PERMIT stays un-representable: a permit is
+  projected only as a `saddr !=` subtraction of later denies, which cannot
+  express a destination-dimension carve — the whole program then emits nothing
+  and every policy keeps the #4168 warning.
+  Validation: full `go test ./...` green (58 pkgs; the refactoring-audit heatmap
+  canary was regenerated for the +25 LOC in daemon_nft.go). The T1 nft-vs-netlink
+  ruleset-parity gate RAN (not skipped) under `unshare -rn` with the new
+  positive/negated daddr constructs added to its fixture, and all six of its
+  mutation-sensitivity sub-cases still diverge. Mutation-probed in a throwaway
+  detached worktree.
+- **File(s)**: pkg/config/{junos_host_deny.go,junos_host_deny_dst_4146_test.go},
+    pkg/daemon/{daemon_nft.go,daemon_nft_netlink.go,daemon_nft_netlink_parity_test.go,
+    host_inbound_junos_host_4146_test.go,host_inbound_junos_host_dst_4146_test.go},
+    pkg/nftables/{netlink_spec.go,netlink_hostinbound.go},
+    pkg/dataplane/userspace/junos_host_deny.go,
+    docs/host-inbound-service-matrix.md, docs/refactoring-audit-current.txt, _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #4146 review-fold (independent hostile review, MERGE-NEEDS-MINOR).
+  (1) `junosHostProjectAddrMatch` classified an `*-excluded` whose resolved set
+  is empty as match-ALL. That is correct when the OTHER family carries a prefix
+  (the intended match-all-of-opposite-family arm) but wrong when the set is
+  empty across BOTH families: Rust's `rule_l3_matches` fails CLOSED there
+  (`!(v4_empty && v6_empty)`), so the projection widened the authored scope to
+  every firewall address while the dataplane denied nothing — with
+  `application any` a whole-zone host-inbound blackhole. Cross-family emptiness
+  is now computed by the caller (which has both families) and passed in; the
+  excluded arm fails closed on it. Strict commit already rejects an
+  empty/dangling address-set, but the LENIENT load / peer-sync path does not, so
+  a config persisted by an older binary reaches the projection. Note the same
+  class already ships on the SOURCE axis; both axes are fixed by one formula.
+  (2) The T1 nft-vs-netlink parity gate — self-described as the security merge
+  gate that MUST NOT silently skip — used a bare `exec.LookPath("nft")` while
+  `nft` ships in /usr/sbin here, so a non-root PATH made it SKIP while `make
+  test` still reported green. Switched to the existing `findNft()` helper.
+  IMPORTANT: fixing only the presence check turned the silent skip into a FALSE
+  FAILURE, because the oracle execs bare `"nft"` at five sites which also
+  resolve through PATH; all five now use the resolved binary. Verified the gate
+  RUNS and PASSES with nft absent from PATH.
+- **File(s)**: pkg/config/junos_host_deny.go,
+    pkg/config/junos_host_deny_dst_4146_test.go,
+    pkg/daemon/daemon_nft_netlink_parity_test.go, _Log.md
+- **Action**: #6532 review-fold round 5 (Codex MERGE-NEEDS-MINOR). Codex confirmed
+  the argument-gating inversion CLOSES the conversion-callee shape class and the
+  production redaction is correct; all three findings were claim-accuracy plus one
+  small harvest gap. (1) `collectSecretFieldNames` now recurses into BOTH map
+  halves explicitly — `structTypeOf` can only return one struct, so
+  `map[struct{ Key Secret }]struct{ Value Secret }` harvested `Key` and silently
+  never visited `Value` while the doc claimed both sides were followed. (2)
+  Replaced the "TWO independent ways to defeat" framing with "TWO DETECTED
+  SHAPES", since Go's expression grammar is open and enumerating defeat
+  mechanisms is not something a syntactic guard can claim. (3) Added an explicit
+  RESIDUALS block naming what is NOT flagged: a COMPUTED argument
+  (`Clear(x.PSK + "")`, `Clear([]config.Secret{x.PSK}[0])`, `Clear(<-ch)`) which
+  passes the arity gate but does not resolve to a harvested field name;
+  `copy(dst, secret)` / `append(dst, secret...)` which are two-argument; and
+  reflection / interface-value unwraps. No production code changed. Full
+  `go test ./pkg/grpcapi/` green.
+- **File(s)**: pkg/grpcapi/server_fabric_secret_render_6532_test.go, _Log.md
 - **Action**: #6551 — bound the SNMP GETBULK grid AT the response ceiling instead
   of expanding it fully and trimming afterwards.
   Reproduced first. With 50 interfaces, a 4094-byte v2c GETBULK carrying 580
@@ -62922,3 +64442,34 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: scripts/image/{xpf-kernel-promote,test_kernel_promote_explicit_path.py},
     pkg/upgrade/{kernel_arm_record_6601_test.go,kernel_linux.go},
     cmd/xpfd/upgrade_kernel.go, docs/in-place-upgrade.md, _Log.md
+- **Timestamp**: 2026-07-31
+- **Action**: #6617 — fixed `TestHeatmapNotStale`, which was RED on clean
+  `origin/master`. Root cause is (b) with an (a) component: the artifact was
+  genuinely stale (3 rows), but it keeps going stale because the criterion was
+  byte-for-byte equality against a repo-GLOBAL snapshot, which cannot hold
+  under parallel merges. Measured firsthand over the 40 first-parent commits
+  ending at `b4605ea9d`: master was byte-stale in 26 of them, in two runs (19
+  consecutive commits reaching 22 rows of drift, then 7 more). The decisive
+  evidence is #6602 and #6613 — both regenerated the artifact AT THEIR OWN
+  BASE and both still landed RED, each disagreeing only on
+  `pkg/snmp/agent.go`, a file neither PR touched (grown by #6596, which merged
+  between their base and their merge). A gate that fails when the author did
+  everything right is noise, and the noise is what let the earlier 21-commit
+  run go unnoticed. Regenerated the artifact and changed the criterion to the
+  merge-stable audit CONTENT — which files are audited, at which tier — with
+  the LOC column kept as an advisory snapshot whose bound is ASYMMETRIC
+  ([WATCH] 1500-1999 is bounded both ways; [REFACTOR] is open above, so a
+  file past 2000 can grow unwatched) checked by
+  `TestHeatmapArtifactWellFormed` (per-row LOC/tier agreement + generator sort
+  order, both hand-edit detectors). Added `TestGeneratorDeterministic` (the
+  issue's acceptance criterion 3). `make audit-check` now classifies its own
+  diff — up-to-date / ADVISORY LOC-only (exit 0) / ERROR tier-or-membership
+  (exit 1). It validates both artifacts before diffing, but it compares the
+  sorted (tier, path) projection, so it is deliberately blind to LOC values
+  and row order and can still be green while TestHeatmapArtifactWellFormed
+  fails — `go test ./pkg/refactoraudit/` is authoritative. Of the 3 drifting rows on
+  master only `pkg/dhcprelay/relay.go` (WATCH -> REFACTOR) was real staleness,
+  and the new gate names exactly that.
+- **File(s)**: pkg/refactoraudit/audit_canary_test.go, pkg/refactoraudit/doc.go,
+  docs/refactoring-audit-current.txt, docs/refactoring-audit.md,
+  scripts/refactoring-audit.sh, Makefile, _Log.md

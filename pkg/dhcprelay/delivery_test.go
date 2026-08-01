@@ -106,6 +106,33 @@ func testServerSet(ips ...net.IP) []*net.UDPAddr {
 	return set
 }
 
+// armedRelay builds an interfaceRelay whose #6562 outstanding-request table is
+// already armed for each given reply — i.e. it models the normal flow, where
+// the client-facing loop forwarded a request upstream and the server echoed
+// that request's xid and chaddr back (RFC 2131 §4.3.1 Table 3).
+//
+// Every handleServerResponses test that expects a reply to be DELIVERED must
+// arm the relay: an unbound reply is now dropped by design. Tests that expect a
+// DROP use a bare interfaceRelay (unarmedRelay) instead.
+func armedRelay(name string, replies ...*dhcpv4.DHCPv4) *interfaceRelay {
+	ir := unarmedRelay(name)
+	for _, r := range replies {
+		ir.pending.insert(pendingKeyFor(r))
+	}
+	return ir
+}
+
+// unarmedRelay builds an interfaceRelay with a live-but-EMPTY pending table:
+// no outstanding requests, so every reply fails the #6562 binding. It is a real
+// table rather than a nil one so these tests exercise the ordinary miss path,
+// not the nil-receiver fail-closed guard.
+func unarmedRelay(name string) *interfaceRelay {
+	return &interfaceRelay{
+		ifaceName: name,
+		pending:   newPendingTable(defaultTestPendingCap(), pendingTTL, time.Now),
+	}
+}
+
 // TestDeliverReply_Matrix is the §7.1 decision-matrix oracle: every row of the
 // reply-destination table maps to exactly one delivery path and one counter.
 func TestDeliverReply_Matrix(t *testing.T) {
@@ -475,7 +502,7 @@ func TestHandleServerResponses_NakForwarded(t *testing.T) {
 	clientConn := newFakeConn()
 	defer clientConn.Close()
 	fl2 := &fakeL2{}
-	ir := &interfaceRelay{ifaceName: "ge-0-0-0"}
+	ir := armedRelay("ge-0-0-0", nak)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -537,51 +564,24 @@ func newForceRenew(t *testing.T, ciaddr net.IP, chaddr net.HardwareAddr) *dhcpv4
 	return pkt
 }
 
-// TestDeliverReply_ForceRenew_UnicastCiaddr proves a DHCPFORCERENEW is unicast
-// to the client's current address (ciaddr), NOT broadcast like a NAK. RFC 3203
-// targets a client that already owns a lease, so the matrix must route a type-9
-// reply (yiaddr==0, real ciaddr, flag clear) through the ciaddr UDP-unicast row.
-func TestDeliverReply_ForceRenew_UnicastCiaddr(t *testing.T) {
-	ir := &interfaceRelay{ifaceName: "ge-0-0-0"}
-	client := newFakeConn()
-	defer client.Close()
-	fl2 := &fakeL2{}
-
-	pkt := newForceRenew(t, testCiaddr, testChaddr)
-	if !deliverReply(ir, client, fl2, testGiaddr, pkt, pkt.ToBytes()) {
-		t.Fatal("deliverReply returned false (FORCERENEW not delivered)")
-	}
-
-	if fl2.callCount() != 0 {
-		t.Errorf("FORCERENEW must NOT use raw-L2 unicast, got %d calls", fl2.callCount())
-	}
-	if ir.repliesBroadcastNak.Load() != 0 {
-		t.Errorf("FORCERENEW must NOT take the NAK broadcast path, got %d", ir.repliesBroadcastNak.Load())
-	}
-	if ir.repliesUnicastCiaddr.Load() != 1 {
-		t.Errorf("repliesUnicastCiaddr = %d, want 1", ir.repliesUnicastCiaddr.Load())
-	}
-
-	client.mu.Lock()
-	writes := append([]fakeWrite(nil), client.writes...)
-	client.mu.Unlock()
-	if len(writes) != 1 {
-		t.Fatalf("expected 1 client UDP write, got %d", len(writes))
-	}
-	got := writes[0].addr.(*net.UDPAddr)
-	if !got.IP.Equal(testCiaddr) || got.Port != clientPort {
-		t.Errorf("FORCERENEW dst = %v, want unicast %v:%d", got, testCiaddr, clientPort)
-	}
-}
-
-// TestHandleServerResponses_ForceRenewForwarded is the fail-on-revert gate for
-// #2645: a DHCPFORCERENEW server reply MUST be forwarded to the client (unicast
-// to ciaddr), not silently dropped by the default arm. Removing
-// dhcpv4.MessageTypeForceRenew from the accepted set in handleServerResponses
-// makes this test red (the reply is never written to the client conn).
-func TestHandleServerResponses_ForceRenewForwarded(t *testing.T) {
+// TestHandleServerResponses_ForceRenewRefused is the #6562 fail-on-revert gate
+// for the SECOND defect: a DHCPFORCERENEW MUST NOT be forwarded to the client,
+// even when it arrives from a CONFIGURED server (so the #4163 source check
+// passes) and is otherwise perfectly well formed.
+//
+// This deliberately REVERSES #2645, which forwarded FORCERENEW on the reasoning
+// that RFC 3118 authentication is end-to-end and therefore not the relay's
+// concern. RFC 3203 §6 makes that authentication a MUST precisely because
+// "FORCERENEW can be used to snoop and spoof traffic", and a relay holds none
+// of the key material RFC 3118 §5.2/§5.3 places between the client and the
+// server — so it cannot verify one and refuses instead.
+//
+// Restoring messageTypeForceRenew to the forwarded set in handleServerResponses
+// makes this RED: the reply reaches the client conn and
+// repliesDroppedForceRenew stays 0.
+func TestHandleServerResponses_ForceRenewRefused(t *testing.T) {
 	fr := newForceRenew(t, testCiaddr, testChaddr)
-	fr.GatewayIPAddr = testGiaddr // server echoes giaddr; relay must zero it
+	fr.GatewayIPAddr = testGiaddr
 	serverConn := newFakeConn()
 	serverConn.mu.Lock()
 	serverConn.pending = [][]byte{fr.ToBytes()}
@@ -589,7 +589,11 @@ func TestHandleServerResponses_ForceRenewForwarded(t *testing.T) {
 	clientConn := newFakeConn()
 	defer clientConn.Close()
 	fl2 := &fakeL2{}
-	ir := &interfaceRelay{ifaceName: "ge-0-0-0"}
+	// ARMED for this very transaction: the refusal must be driven by the
+	// message TYPE, not by a missing outstanding-request binding. Without this
+	// the test would pass for the wrong reason (the #6562 binding would drop it
+	// anyway) and would not pin the FORCERENEW rule at all.
+	ir := armedRelay("ge-0-0-0", fr)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -599,36 +603,42 @@ func TestHandleServerResponses_ForceRenewForwarded(t *testing.T) {
 		close(done)
 	}()
 
-	// Wait for the client-direction write (the FORCERENEW must reach the client).
+	// The datagram is consumed but never forwarded, so poll the refusal counter
+	// rather than a client write.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		clientConn.mu.Lock()
-		n := len(clientConn.writes)
-		clientConn.mu.Unlock()
-		if n > 0 {
+		if ir.repliesDroppedForceRenew.Load() > 0 {
 			break
 		}
 		time.Sleep(time.Millisecond)
 	}
 
-	clientConn.mu.Lock()
-	writes := append([]fakeWrite(nil), clientConn.writes...)
-	clientConn.mu.Unlock()
-	if len(writes) != 1 {
-		t.Fatalf("DHCPFORCERENEW not forwarded to client: got %d writes, want 1", len(writes))
+	if got := ir.repliesDroppedForceRenew.Load(); got != 1 {
+		t.Errorf("repliesDroppedForceRenew = %d, want 1 (FORCERENEW must be refused+counted)", got)
 	}
-	dst := writes[0].addr.(*net.UDPAddr)
-	if !dst.IP.Equal(testCiaddr) || dst.Port != clientPort {
-		t.Errorf("FORCERENEW forwarded to %v, want unicast %v:%d", dst, testCiaddr, clientPort)
+	clientConn.mu.Lock()
+	nWrites := len(clientConn.writes)
+	clientConn.mu.Unlock()
+	if nWrites != 0 {
+		t.Errorf("FORCERENEW reached the client: got %d client writes, want 0", nWrites)
+	}
+	if ir.repliesForwarded.Load() != 0 {
+		t.Errorf("repliesForwarded = %d, want 0", ir.repliesForwarded.Load())
+	}
+	if ir.repliesUnicastCiaddr.Load() != 0 {
+		t.Errorf("repliesUnicastCiaddr = %d, want 0 (must not reach deliverReply)", ir.repliesUnicastCiaddr.Load())
 	}
 	if fl2.callCount() != 0 {
-		t.Errorf("FORCERENEW must not use raw-L2, got %d calls", fl2.callCount())
+		t.Errorf("FORCERENEW used raw-L2: got %d calls, want 0", fl2.callCount())
 	}
-	if ir.repliesForwarded.Load() != 1 {
-		t.Errorf("repliesForwarded = %d, want 1", ir.repliesForwarded.Load())
+	// The refusal is its OWN counter, not a side effect of the other gates —
+	// an operator must be able to tell "FORCERENEW refused" from "rogue source"
+	// and from "no outstanding request".
+	if got := ir.repliesDroppedUnknownServer.Load(); got != 0 {
+		t.Errorf("repliesDroppedUnknownServer = %d, want 0 (source WAS configured)", got)
 	}
-	if ir.repliesUnicastCiaddr.Load() != 1 {
-		t.Errorf("repliesUnicastCiaddr = %d, want 1", ir.repliesUnicastCiaddr.Load())
+	if got := ir.repliesDroppedNoRequest.Load(); got != 0 {
+		t.Errorf("repliesDroppedNoRequest = %d, want 0 (relay WAS armed for this xid)", got)
 	}
 
 	cancel()
@@ -651,7 +661,7 @@ func TestHandleServerResponses_L2SourceIsSavedGiaddr(t *testing.T) {
 	clientConn := newFakeConn()
 	defer clientConn.Close()
 	fl2 := &fakeL2{}
-	ir := &interfaceRelay{ifaceName: "ge-0-0-0"}
+	ir := armedRelay("ge-0-0-0", offer)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -715,7 +725,7 @@ func TestHandleServerResponses_ConfiguredSourceForwarded(t *testing.T) {
 	clientConn := newFakeConn()
 	defer clientConn.Close()
 	fl2 := &fakeL2{}
-	ir := &interfaceRelay{ifaceName: "ge-0-0-0"}
+	ir := armedRelay("ge-0-0-0", offer)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -759,7 +769,7 @@ func TestHandleServerResponses_UnconfiguredSourceDropped(t *testing.T) {
 	clientConn := newFakeConn()
 	defer clientConn.Close()
 	fl2 := &fakeL2{}
-	ir := &interfaceRelay{ifaceName: "ge-0-0-0"}
+	ir := unarmedRelay("ge-0-0-0")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -817,7 +827,7 @@ func TestHandleServerResponses_MultiServerGroupAnyMemberForwarded(t *testing.T) 
 	clientConn := newFakeConn()
 	defer clientConn.Close()
 	fl2 := &fakeL2{}
-	ir := &interfaceRelay{ifaceName: "ge-0-0-0"}
+	ir := armedRelay("ge-0-0-0", offer)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -856,7 +866,7 @@ func TestHandleServerResponses_ConfiguredSourceWrongOpCodeDropped(t *testing.T) 
 	clientConn := newFakeConn()
 	defer clientConn.Close()
 	fl2 := &fakeL2{}
-	ir := &interfaceRelay{ifaceName: "ge-0-0-0"}
+	ir := unarmedRelay("ge-0-0-0")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -281,7 +281,7 @@ next-hops, preference 0). The wire specimen lives in
       (fabric removed, not replaced) is not a supersession, so the working link
       survives. The prune runs in both `refresh_fabric_links` (SyncFabricState)
       and `refresh_runtime_snapshot_inner` (config apply); the pruned set is
-      stored into BOTH the full `ha.forwarding` Arc AND the worker fast-path
+      stored into BOTH the full `ha.runtime` view's forwarding Arc AND the worker fast-path
       `ha.fabrics` Arc so no reader retains the stale peer.
 
 ## Session identity is NOT VRF-aware — single forwarding domain (#2387)
@@ -337,17 +337,39 @@ limitation, tracked by #2387.
   flow. The invariant the real fix must restore: **a cached fast-path
   decision is only reused for a flow in the same scope it was admitted
   under.**
+- **The conntrack table is now the SOLE collision surface.** The flow cache
+  used to alias too; it is keyed on the LOGICAL (VLAN unit) ingress ifindex
+  since `42bc6bc88`, so two units of one parent no longer share a cache
+  entry. Only the ifindex-less conntrack table remains.
 - **Interim mitigation + deferred real fix.** The Go compiler emits a
   commit WARNING (`validateVRFOverlap`, `pkg/config`) when two distinct
   routing-instances carry overlapping L3 address space, so the operator is
   told the topology is not session-isolated (the config still commits — an
   overlapping-subnet PBR VRF is a legitimate working design). The real fix
   (Track B) adds a **symmetric routing-domain id** to `SessionKey` +
-  `FlowCacheLookup` + the reverse-key transforms, plus the HA session-sync
-  wire bump — the discriminator MUST be the routing-domain id (symmetric
-  across forward/reply), NOT zone or ingress-ifindex (asymmetric → breaks
-  conntrack reverse matching). See
-  `docs/research/2387-vrf-flow-identity/plan.md`.
+  `FlowCacheLookup` + the reverse-key transforms — the discriminator MUST
+  be the routing-domain id (symmetric across forward/reply), NOT zone or
+  ingress-ifindex (asymmetric → breaks conntrack reverse matching).
+- **The HA session-sync wire does NOT need a version bump** (corrected in
+  plan v5 §0a; the plan's own §4d said otherwise). The domain does not have
+  to live in the fixed-width wire KEY block — it rides as a length-gated
+  trailing **value** field, exactly like #2170 `Generation`, #3301
+  `AppTimeout`/`PolicyCounterIdx`, #4565 `Nat64SnatV4`, #5274 `ConfigEpoch`
+  and #5212 `RTFlowSessionID` (`pkg/cluster/sync_protocol.go`; the
+  `SessionSyncRequest` control-socket struct is all `#[serde(default)]`).
+  The receiver folds it into the key it reconstructs. Interning **domain 0
+  = the default routing-instance** makes an old peer's omitted field decode
+  to the default VRF, so a non-VRF cluster is bit-identical across the
+  mixed-version window and `CurrentHAProtocolVersion` never moves.
+- **Do NOT "decline the hit and fall through"** as a cheap mitigation.
+  `install_with_protocol_with_origin` opens with an unconditional
+  `remove_entry(&key)` (`session/install.rs`), so the session-miss path
+  would re-install under the same bare 5-tuple and evict the incumbent
+  VRF's session — the two flows then evict each other per packet
+  (per-packet SNAT re-allocation breaks both). The only coherent
+  end-states are a fail-closed DROP or a widened identity.
+- Decision record: `docs/research/2387-vrf-flow-identity/plan.md` (read §0
+  first — it supersedes §4d and narrows the open call).
 
 ## Where it sits
 

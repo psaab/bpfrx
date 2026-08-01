@@ -14,6 +14,10 @@ to the interface name.
   AND on every day-2 commit (#2348). A nil `cfg` stops all relays.
 - `Stats()` — `relay.go`. Per-interface counters.
 - `RelayStats` — `relay.go`.
+- `pendingTable` — `pending.go`. The bounded, expiring outstanding-request
+  table that binds each relayed reply to a request the relay actually
+  forwarded (#6562). Internal; reached through `interfaceRelay.pending`. See
+  "Outstanding-request binding" below.
 - `SetMasterGate(g)` — `relay.go`. Installs the per-interface HA master-state
   gate (#2456); the daemon passes `Daemon.relayMasterGateOpen`. nil = always
   relay (standalone). Read per packet, so failover is followed live.
@@ -41,7 +45,7 @@ carries server-bound options, per RFC 2131 §3.4:
 | `INFORM` | yes (#2153) | client already holds an address, asks only for supplemental parameters (DNS/domain/NTP) |
 | `DECLINE` | yes (#2789) | client detected the offered address already in use (ARP probe) and broadcasts a DHCPDECLINE (RFC 2131 §3.1 step 4, §4.4.1); relayed so the originating server marks the address unavailable instead of re-offering it. Carries no server reply |
 | `RELEASE` | no | unicast by the client directly to its bound server (RFC 2131 §4.4.4) — it routes without relay assistance and is never seen on the relay's client-facing broadcast socket |
-| server reply types (`OFFER`/`ACK`/`NAK`/`FORCERENEW`) | n/a | not client-originated; the client→server gate never sees them. The reverse server→client path (`handleServerResponses`) forwards `OFFER`, `ACK`, `NAK` (#2606), and `FORCERENEW` (#2645) — see the reply matrix below |
+| server reply types (`OFFER`/`ACK`/`NAK`/`FORCERENEW`) | n/a | not client-originated; the client→server gate never sees them. The reverse server→client path (`handleServerResponses`) forwards `OFFER`, `ACK` and `NAK` (#2606) **when they bind to an outstanding request** (#6562); `FORCERENEW` is **refused** (#6562, reversing #2645) — see the reply matrix below |
 
 The `INFORM` reply (a server-issued `ACK` with no `yiaddr` but a real
 `ciaddr`) is delivered by the matrix below via the "flag clear, `yiaddr==0`,
@@ -112,8 +116,9 @@ identity.
 
 ## Reply delivery model (#2076)
 
-Server replies (OFFER/ACK/NAK/FORCERENEW) are delivered to clients honoring the
-RFC 2131 §4.1 broadcast flag:
+Server replies (OFFER/ACK/NAK) that pass the source check (#4163) **and** bind
+to an outstanding request (#6562) are delivered to clients honoring the RFC 2131
+§4.1 broadcast flag:
 
 | Condition | Delivery |
 |-----------|----------|
@@ -136,17 +141,71 @@ has no usable address, and broadcasting also prevents a server that
 erroneously echoes a stale `ciaddr` from steering the NAK into a UDP unicast to
 an address the client does not own.
 
-**DHCPFORCERENEW (#2645).** A server sends `DHCPFORCERENEW` (RFC 3203, message
-type 9) to a client that **already holds a lease** to force it back into the
-`RENEWING` state ahead of its T1 timer (for example, to push a configuration
-change). Before #2645 `handleServerResponses` dropped it via the `default` arm,
-so a server could never reach a relayed client. It is now forwarded. Unlike a
-NAK, FORCERENEW is **not** force-broadcast: the target client owns a current
-address (carried in `ciaddr`, `yiaddr==0`) and answers ARP for it, so the reply
-matrix routes it through the normal "flag clear, `yiaddr==0`, real `ciaddr`"
-UDP-unicast row — the same row that delivers an INFORM `ACK`. The relay only
-forwards the message; RFC 3203's RFC-3118 authentication is end-to-end between
-client and server and is out of scope for the relay agent.
+**DHCPFORCERENEW — REFUSED (#6562, reversing #2645).** A server sends
+`DHCPFORCERENEW` (RFC 3203, message type 9 — defined in §4 "Message layout",
+assigned in §5 "IANA Considerations") to a client that **already holds a lease**
+to force it back into the `RENEWING` state ahead of its T1 timer. #2645 made the
+relay forward it, on the reasoning that RFC 3118 authentication is end-to-end
+between client and server and therefore out of scope for a relay. **That
+reasoning was wrong, and the relay now refuses the message.**
+
+RFC 3203 **§6** (Security Considerations — *not* §5, which is IANA
+Considerations) makes the authentication mandatory, and says why:
+
+> As in some network environments FORCERENEW can be used to snoop and spoof
+> traffic, the FORCERENEW message MUST be authenticated using the procedures as
+> described in [DHCP-AUTH]. FORCERENEW messages failing the authentication
+> should be silently discarded by the client.
+
+A relay **structurally cannot** discharge that MUST:
+
+- RFC 3118 §5.2 defines the key as "K — a secret value shared between the
+  **source and destination** of the message", and notes that "Delayed
+  authentication requires a shared secret key for each client on each DHCP
+  server". The relay is neither endpoint and holds no secret or secret-ID map.
+- RFC 3118 §3 ("Interaction with Relay Agents") casts the relay purely as a
+  transparent mutator whose `giaddr`/`hops`/Option-82 changes are **excluded**
+  from the hash — it is not a party to the authentication.
+- RFC 3118 §5.3 assigns validation to the receiver: "If the MAC computed by the
+  **receiver** does not match the MAC contained in the authentication option,
+  the receiver MUST discard the DHCP message."
+
+Checking only that Option 90 is **present** would be theater: the off-path
+attacker in this threat model already forges the server's source IP, so they can
+equally attach a well-formed Option 90 with a bogus MAC — and since the relay
+cannot check the MAC, a presence test admits exactly the attacker it is meant to
+stop. Most deployed clients do not implement RFC 3118 at all, so nothing
+downstream would catch it either.
+
+**Refusing costs a conformant deployment nothing**, because a conformant
+FORCERENEW never reaches this socket. RFC 3203 §2.2 opens:
+
+> The DHCP server sends a unicast FORCERENEW message to the client.
+
+A unicast addressed to the client's own leased address routes as ordinary
+traffic and is never delivered to the relay's `giaddr:67` server socket at all.
+The only FORCERENEW that can arrive *here* is one deliberately addressed to
+`giaddr:67` — a non-conformant server, or the attacker §6 is about. Ordinary
+leasing is untouched either way: clients still renew at T1/T2. The refusal is
+**loud** — every one bumps `RepliesDroppedForceRenew` and the first per session
+logs at `Warn`.
+
+> Do **not** justify this by §2.2's retransmission sentence ("it should
+> retransmit the FORCERENEW message using an exponential backoff algorithm").
+> That describes recovery from *transient* loss. Here the loss is **permanent** —
+> every retransmission hits the same refusal — and §2.2 itself bounds the
+> attempts: "The amount of retransmissions should be limited." The backoff never
+> converges, so it cannot carry the argument. The unicast sentence above can.
+
+The refusal is also **belt-and-braces**: FORCERENEW is server-initiated, so its
+xid matches no outstanding request and the binding gate below would drop it
+regardless. The dedicated arm exists to give the refusal its own counter and
+log, so an operator can tell it apart from an ordinary unbound reply.
+
+There is deliberately **no opt-in knob** to re-enable forwarding. If a
+deployment genuinely needs relayed FORCERENEW, that is a follow-up that should
+come with a way to actually verify the message, not a flag that restores an
+unverifiable forward.
 
 **Why raw L2 (`l2send_linux.go`).** A client in SELECTING/REQUESTING that
 clears the broadcast flag has **not yet configured** the offered address,
@@ -178,13 +237,26 @@ RFC 768).
   (`RepliesL2Unicast`, `RepliesUnicastCiaddr`, `RepliesBroadcastFlag1`,
   `RepliesBroadcastForced`, `RepliesBroadcastNoTarget`,
   `RepliesBroadcastL2Fallback`, `RepliesBroadcastNak`,
-  `RepliesDroppedUnknownServer`). **`RepliesBroadcastL2Fallback` is the one
+  `RepliesDroppedUnknownServer`, `RepliesDroppedNoRequest`,
+  `RepliesDroppedForceRenew`, `PendingEvicted`).
+  **`RepliesBroadcastL2Fallback` is the one
   to alert on** — it means the raw-L2 path failed (CAP_NET_RAW, driver, or
   MTU) and the relay degraded to broadcast. **`RepliesDroppedUnknownServer`
   (#4163)** counts replies dropped because their source IP was not a
   configured server — a non-zero value is a rogue-reply injection attempt (or
   a multi-homed server unicasting from an unlisted source IP); see "Reply
-  source validation" below. **`RequestsDroppedRateLimit` (#5670)** counts
+  source validation" below. **`RepliesDroppedNoRequest` (#6562)** counts
+  replies dropped because they answered no outstanding relayed request —
+  either an injection that passed the source check, **or a legitimate reply
+  that missed the binding window**, which is a client-visible DHCP failure, so
+  this one must be *watched*, not assumed hostile. **`PendingSize` /
+  `PendingCapacity` (#6562)** are the outstanding-request table's occupancy and
+  ceiling — the **leading** indicator: occupancy approaching capacity means
+  bindings are about to be evicted. **`PendingEvicted` (#6562)** is coincident,
+  not leading: it rises only once bindings are already being lost.
+  **`RepliesDroppedForceRenew` (#6562)** counts refused DHCPFORCERENEW
+  messages. See "Outstanding-request binding" below.
+  **`RequestsDroppedRateLimit` (#5670)** counts
   client-facing datagrams dropped by the per-interface ingress rate limiter — a
   sustained nonzero value is a flood / amplification attempt (see "Ingress rate
   limit" below). `show ... dhcp-relay` prints this breakdown.
@@ -219,10 +291,224 @@ from the relay's explicit, configured server list.
   presenting as a silent black-hole. If a real deployment needs that, a
   follow-up can add an explicit extra-reply-source allow-list knob; it is not
   needed to close the injection hole.
-- `giaddr`-echo and Option-82 correlation are strictly-stronger secondary
-  checks and are **out of scope** here (Option 82 is stripped on the reply, but
-  not echo-validated); source-set membership is the primary, highest-value
-  control. This is DHCPv4-only (there is no DHCPv6 relay — see below).
+- Source-set membership is necessary but **not sufficient** — a source IP is
+  spoofable. Since #6562 it is the *first* of two checks; see
+  "Outstanding-request binding" immediately below. (`giaddr`-echo and Option-82
+  correlation remain out of scope: Option 82 is stripped on the reply but not
+  echo-validated.) This is DHCPv4-only (there is no DHCPv6 relay — see below).
+
+## Outstanding-request binding (#6562)
+
+The #4163 source check above stops an attacker who cannot forge a source
+address. It does **not** stop one who can: an off-path attacker who spoofs a
+configured server's IP passes it, and the relay would then forward a forged
+`OFFER`/`ACK` (hostile gateway/DNS) or `NAK` (forced client restart) to the
+client. So every reply must additionally **bind to a request the relay actually
+forwarded**.
+
+`pending.go` holds a bounded, expiring table of outstanding transactions. The
+client-facing loop inserts an entry for each request it relays upstream
+(*before* the upstream write — the reply loop is a different goroutine, and a
+fast server can answer before a post-send insert would have run); the
+server-facing loop forwards a reply only if `pendingTable.matches` hits.
+
+**Key — `xid` + `chaddr`.** RFC 2131 §4.1 gives the xid's purpose ("The 'xid'
+field is used by the client to match incoming DHCP messages with pending
+requests"), and its §4.3.1 Table 3 requires a server to copy **both** `xid` and
+`chaddr` from the client's message into `DHCPOFFER`/`DHCPACK`/`DHCPNAK` — so
+both halves are present on the request and echoed on the reply. The relay's own
+mutations (`hops`, `giaddr`, Option 82) touch neither, so the key is stable
+across stamping. Option 61 (client-identifier) is **deliberately excluded**
+even though it is a stronger identity: RFC 2131 told servers they MUST NOT echo
+it and only RFC 6842 §3 (2013) reversed that to a MUST, so keying on it would
+drop every reply from a pre-RFC-6842 server — a silent, segment-wide outage. The
+ingress interface is not keyed either: each relay interface owns its own table.
+
+**Bounded — capacity is derived from `maximum-packet-rate`, evict-oldest.**
+Steady-state occupancy is `rate × TTL`, and the fill rate is the configurable
+#5670 limit — so capacity **must** track it. `pendingCapacityFor` sizes the
+table at `rate × pendingTTL + relayBurstFor(rate)` (the sustained window plus
+the token bucket's 2-second burst allowance), clamped to
+`[4096, 131072]`. `maxPacketRate` participates in `relaySpec.equal()`, so a
+day-2 rate change restarts the session and re-derives it.
+
+> A **fixed** capacity is a trap, and this originally shipped as a hardcoded
+> 8192. Above ~273 pps the table became cap-bound and the binding window
+> silently collapsed from 30 s to `8192/rate` seconds — while the
+> "Ingress rate limit" section below *recommends raising*
+> `maximum-packet-rate` on a busy segment. A segment provisioned at 3000 pps
+> had a 2.7 s window; a boot storm against a server whose RTT exceeded that had
+> every reply dropped at the relay, turning a storm that previously completed
+> into a permanent retry storm. `TestPendingCapacity_TracksMaxPacketRate` pins
+> the property (a reply arriving one server RTT later still binds), not the
+> number.
+
+The **ceiling** is mandatory in the other direction: the schema allows up to
+1000000 pps, and an unclamped derivation would be ~3×10⁷ entries — gigabytes,
+i.e. the memory-exhaustion vector this table exists not to be. Above ~4096 pps
+the ceiling binds and the effective window is `capacity/rate` seconds; that is
+unavoidable (window × rate *is* memory) but it is made explicit rather than
+emergent — `Apply` logs a startup `Warn` naming the reduced window, and
+`PendingSize`/`PendingCapacity` show the runtime truth.
+
+At capacity the table reaps expired slots first, then evicts the **oldest** — it
+does **not** refuse the new request. Refusing new requests would let an attacker
+who fills the table lock out every new client (a total segment outage); evicting
+the oldest degrades gracefully, and the choice trades away no security, because
+eviction can only cause a legitimate reply to be *dropped*, never an unsolicited
+reply to be *accepted*. Every eviction bumps `PendingEvicted`.
+
+**Amortized O(1) at capacity.** Expiry and eviction go through a fixed-size ring
+of insertions, not a scan. This works because every entry carries the *same*
+TTL, so insertion order **is** expiry order and the oldest is always at the ring
+head. The original implementation ranged the whole map for the minimum expiry —
+two full `O(capacity)` scans per admitted packet once full, on the single
+client-facing read goroutine, which saturates a core in exactly the overload the
+table is meant to survive.
+
+Per-insert reclaim work is **bounded by a constant**, via two mechanisms that
+cover different cases:
+
+- The *wholly expired* ring — the first insert after a long idle period — is
+  taken in constant time by a fast path: because the ring is expiry-ordered, one
+  probe of the newest slot proves the whole ring is dead, so `head`/`count` reset
+  to zero and the map is replaced wholesale rather than deleted key by key.
+- The *mixed* ring — most slots expired but the newest still live, which is a
+  quiet period followed by a single late request — cannot use that probe, so the
+  head drain is capped at `maxDrainPerInsert` (64) slots per call. Without the
+  cap this case popped ~`capacity` (up to 131071) slots one at a time, each with
+  a map lookup and delete, under the mutex on the client-facing packet path: the
+  same multi-millisecond stall as before, just behind a narrower trigger.
+
+`insert` needs exactly one free slot, so reclaiming more per call buys nothing.
+Leftover expired slots are inert — `matches` re-checks the expiry and
+`PendingSize` excludes them — and later inserts clear the backlog at a net 63
+slots per admitted packet (64 drained, one added; the eviction loop cannot run
+after a positive drain, because `count < capacity` by then). `TestPendingTable_FullDrainIsConstantTime` and
+`TestPendingTable_PartialDrainIsBounded` pin the two cases by counting slots
+examined; the latter must **stagger** expiries, because a frozen clock makes
+every slot expire together and the mixed case unconstructible.
+
+Because both reclaim steps always free room before the at-capacity eviction loop
+can run, that loop only ever displaces an *unexpired* binding — so counting each
+pop as cap pressure is exact, and `PendingEvicted` cannot fire on a relay that is
+merely idle. `insert` carries the proof.
+
+A key re-inserted before its old slot expires (a retransmission, or the
+SELECTING REQUEST reusing the DISCOVER's xid) simply gets a new slot; the older
+one is stale and is discarded for free at the head. Slot identity is an explicit
+**generation counter**, not the expiry: two inserts of the same key can carry
+identical expiries (nothing guarantees `time.Now()` advances between two calls),
+and matching on expiry would pop the older slot and delete a binding the newer
+slot still owns. Because a slot is always freed before a push,
+`len(entries) ≤ count ≤ capacity` — the ring bounds the map, so duplicate
+inserts cannot grow either structure.
+`TestPendingTable_AtCapInsertIsConstantTime` pins the cost by counting ring
+slots examined (deterministic, no timing), with a **lower** bound as well as an
+upper one so an implementation that bypasses the ring cannot pass by reporting
+zero.
+
+**Memory.** A `pendingSlot` is 48 bytes on amd64, so the ring is a fixed
+`48 × capacity` (6 MiB at the 131072 ceiling) plus the Go map, ~18 MiB per
+interface at full occupancy on a ceiling-sized table. That is bounded per
+interface but **multiplicative across relay interfaces**: a chassis with many
+high-rate relay segments should size `maximum-packet-rate` per segment rather
+than setting it high everywhere.
+
+**Bindings survive a config reload.** Every field in `relaySpec` — servers,
+always-broadcast, hop count, trust-option-82, packet rate — participates in
+`equal()`, so any day-2 change to a group stops the relay and builds a
+replacement. The replacement rebinds the *same* `giaddr:67`, so replies for
+pre-reload requests still arrive; without migration they would hit the binding
+gate and be dropped, which pre-#6562 would have been forwarded. `Apply` therefore
+snapshots the old table's live bindings and adopts them into the replacement,
+**after** the old relay's goroutines are joined (so the snapshot is complete)
+and **before** the new one launches (so nothing races the destination).
+
+This matters most for `maximum-packet-rate`, whose documented remedy is to raise
+it on a busy segment: without migration, an operator following that advice
+*during* a boot storm would flush every in-flight binding and cause the retry
+storm this table exists to prevent. Adopted entries keep their **original
+expiry** — a reload must not refresh the TTL, which would widen the attacker's
+xid-guessing window every time the config was touched. If the replacement is
+*smaller* (the rate was lowered), the oldest excess bindings are dropped and
+**counted** in `PendingEvicted` rather than discarded silently.
+
+`adopt` **requires an empty destination**, and asserts it. It appends rather than
+merging, so migrated expiries landing after a destination's later ones would
+destroy the expiry ordering everything else depends on: the full-drain probe
+would read a newer-but-expired tail slot, conclude the whole ring was dead, and
+wipe live bindings, while the head drain and `PendingSize`'s binary search would
+mis-locate the boundary. The sole production caller adopts into a table built
+moments earlier and never launched, so the assertion cannot fire in the live
+path — it exists so a future second caller fails loudly instead of silently
+corrupting the structure that decides which replies reach clients. An ordered
+merge would generalise it, but no caller needs one.
+
+**TTL — 30s.** This bounds the window in which a guessed xid would be accepted,
+while covering realistic server latency. RFC 2131 §4.1's retransmission schedule
+is 4s, then 8s, doubling to a 64s maximum, so 30s spans the first three
+retransmissions. A too-short TTL is self-healing rather than fatal: the client's
+retransmission traverses the relay and arms a fresh entry, and this holds
+whichever xid it uses — §4.1 leaves that open ("A client may choose to reuse the
+same 'xid' or select a new 'xid' for each retransmitted message") — because the
+server's answer echoes whatever xid the retransmission carried.
+
+**A match does not consume the entry.** The relay fans each request out to
+*every* server in the group, so an N-server group answers one `DISCOVER` with N
+`OFFER`s; and RFC 2131 §4.4.1 has the SELECTING `DHCPREQUEST` reuse the
+`DHCPOFFER`'s xid, so the same binding must also admit the `ACK`/`NAK`.
+Consuming on first match would silently break multi-server redundancy.
+
+**Fail direction.** A binding that is too strict silently breaks DHCP for real
+clients, which is a worse outage than the injection it prevents. Every drop is
+therefore counted (`RepliesDroppedNoRequest`) and logged warn-once-then-`Debug`.
+
+The **leading** indicator is `PendingSize`/`PendingCapacity`: occupancy climbing
+toward capacity means the relay is about to start evicting bindings, and it is
+visible *before* any reply is lost. `PendingEvicted` is **coincident**, not
+leading — an eviction is what *causes* the subsequent drop, so its lead time is
+one server RTT (tens of ms to a couple of seconds). Alert on the
+size/capacity ratio; treat a rising `PendingEvicted` as damage already in
+progress.
+
+`PendingSize` reports **unexpired ring slots**. Neither of the two obvious
+alternatives is correct:
+
+- the map's key count reads *low*, because duplicate inserts consume ring slots
+  without adding keys — a capacity-4 ring holding `A,B,B,B` has two keys but
+  evicts live `A` on the very next insert, so the gauge would show a comfortable
+  `2/4` at the exact moment eviction began;
+- the raw ring count reads *high*, because expired slots stay counted until some
+  later insert reclaims them — an idle full table would report
+  `capacity/capacity` even though the next insert reclaims the lot and evicts
+  nothing, paging an operator over a relay that is simply quiet.
+
+Expired slots form a contiguous prefix (the ring is expiry-ordered), so the
+boundary is found by binary search — `O(log capacity)` under the mutex, which
+matters because `Stats()` reads this while the packet path is running.
+
+These counters are currently surfaced only by the **on-box console CLI**
+(`show services dhcp relay`) — there is no gRPC RPC or Prometheus collector for
+`RelayStats`, so the remote `cli` and external alerting do not see them. That
+gap is pre-existing and tracked separately; it does bound "visible" to the
+console today.
+
+A nil table fails **closed** (it
+admits nothing), matching the #4163 empty-allow-set posture, so a wiring
+regression is a loud counted outage rather than a silent loss of the control;
+`TestManagerRelay_HasPendingTable` guards the production wiring.
+
+**Table lifetime.** The table lives on `interfaceRelay`, not on the session, so
+a session rebuild (#2347 ifindex drift, #3960 re-address) does not wipe
+in-flight bindings and strand a client mid-transaction.
+
+**HA note (#2456).** Entries are per-node. If a client's transaction spans a
+failover, the newly-active node has no binding for the in-flight reply and drops
+it; the client's normal retransmission then re-arms the new node. The window is
+bounded by one client retransmission, and the drop is visible in
+`RepliesDroppedNoRequest`. (A BACKUP node never inserts, because the master gate
+drops the request before it is forwarded.)
 
 ### `overrides always-broadcast` config
 
@@ -286,11 +572,20 @@ set forwarding-options dhcp-relay group <g> overrides maximum-packet-rate <pps>
   the sustained rate throttles a persistent flood. Set a high value
   (schema range `1..1000000`) to effectively disable the bound on a segment that
   legitimately needs it.
+  - **Raising this also resizes the #6562 outstanding-request table**, whose
+    capacity is derived as `rate × 30s + 2×rate` — that is deliberate, so the
+    reply-binding window does not collapse on a segment you just told the relay
+    to expect more traffic from. Above **~4096 pps** the table's memory ceiling
+    (131072 entries) binds instead, the effective binding window becomes
+    `capacity/rate` seconds rather than 30 s, and the relay logs a startup
+    `Warn` naming the reduced window. Watch `PendingSize`/`PendingCapacity` on
+    such a segment. See "Outstanding-request binding" above.
 - **Counted + throttled log.** Every dropped datagram bumps
   `RelayStats.RequestsDroppedRateLimit`; the log is warn-once-per-session then
   `Debug` (never per packet, per the project logging rules). A sustained
   nonzero counter means the segment is exceeding its pps bound — a flood /
-  amplification attempt or a segment that should raise `maximum-packet-rate`.
+  amplification attempt or a segment that should raise `maximum-packet-rate`
+  (which resizes the #6562 binding table with it — see the sub-bullet above).
 - Compiles to `DHCPRelayGroup.MaximumPacketRate` and flows into
   `relaySpec.maxPacketRate` (a change resizes the bucket, so it restarts the
   per-interface relay). All three parse shapes (flat-set, merged-Keys, block

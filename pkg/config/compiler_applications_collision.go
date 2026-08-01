@@ -222,16 +222,26 @@ func validateApplicationNameCollisionsAST(nodes []*Node, lenient bool) ([]string
 			}
 			seen := termSeen[appName]
 			dupReported := termDupReported[appName]
-			for _, prop := range inst.node.Children {
-				if prop.Name() != "term" || len(prop.Keys) < 2 {
+			// #6524: enumerate terms through applicationTermNodes /
+			// applicationTermKeys — the SAME walk compileApplications uses to
+			// decide what to write. This loop previously scanned
+			// inst.node.Children directly, which could not see a term reached
+			// through a flat-set CHAIN (`application myapp description doc term
+			// t1 protocol udp` nests the term under the `description` value
+			// node). Once #6524 taught the compiler to follow that chain, such a
+			// term was MINTED into apps.Applications but stayed invisible to
+			// every gate below — so a generated `<parent>-<term>` could silently
+			// overwrite an AUTHORED application (H01) with no commit error,
+			// erasing a deny that referenced it. `description` is the entry route
+			// on the strict path because it deliberately does not set
+			// hasDirectBody (#3366), so MixedDirectTermApps never engages; on the
+			// tolerant path that gate is only a warning, so no `description`
+			// prefix is even needed. The sibling spelling was always caught here
+			// — only the chained shape evaded it.
+			for _, prop := range applicationTermNodes(inst.node) {
+				allKeys := applicationTermKeys(prop)
+				if len(allKeys) == 0 {
 					continue
-				}
-				// Reassemble the term tokens across both AST shapes, mirroring
-				// compileApplications: hierarchical packs values in prop.Keys,
-				// flat set splits them across prop.Keys and prop.Children.
-				allKeys := append([]string(nil), prop.Keys[1:]...)
-				for _, c := range prop.Children {
-					allKeys = append(allKeys, c.Keys...)
 				}
 				for _, t := range parseApplicationTerms(appName, allKeys) {
 					// #3472: record this generated name and the parent that
