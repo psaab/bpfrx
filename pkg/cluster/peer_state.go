@@ -32,19 +32,22 @@ func (m *Manager) peerHeartbeatFreshLocked() bool {
 // downgrade-guard: heartbeats flow continuously (~200ms), so this arms within
 // one interval of a keyed peer coming up — closing the post-restart window
 // where nothing had yet dialed the fabric listener on-demand to arm its own
-// sticky flag. Returns false when no heartbeat receiver is wired (standalone /
-// heartbeat not started) or the peer has not authenticated, so a node with no
-// PSK, or a rolling upgrade where the peer is not yet signing, keeps the
-// dual-accept grace. Reads m.hbReceiver under the manager lock (it may be
-// swapped by RestartHeartbeat); the flag itself is an atomic.
+// sticky flag. Returns false when the peer has never authenticated (a node
+// with no PSK, or a rolling upgrade where the peer is not yet signing), so
+// those keep the dual-accept grace.
+//
+// #5086: this reads the Manager's process-lifetime auth state, NOT the current
+// heartbeatReceiver. The flag must be sticky for the life of the process, and
+// reading it off the receiver made it sticky only for the life of a heartbeat:
+// StopHeartbeat nils m.hbReceiver and StartHeartbeat installs a fresh one, so
+// every RestartHeartbeat (a DHCP-triggered VRF rebind retries the bind for up
+// to ~5s) silently disarmed the fabric listener's downgrade-guard and re-armed
+// it only after the next authenticated heartbeat landed. An unsigned fabric
+// RPC inside that window was accepted from a peer already known to hold the
+// key. The state now outlives the socket, so the guard cannot be reset by
+// restarting the heartbeat.
 func (m *Manager) HeartbeatPeerAuthSeen() bool {
-	m.mu.RLock()
-	r := m.hbReceiver
-	m.mu.RUnlock()
-	if r == nil {
-		return false
-	}
-	return r.peerAuthenticated()
+	return m.heartbeatAuthState().peerAuthenticated()
 }
 
 // PeerNodeID returns the peer's node ID (valid only when PeerAlive is true).

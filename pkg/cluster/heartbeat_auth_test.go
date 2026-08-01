@@ -303,7 +303,7 @@ func TestHeartbeatAuthReplay_BoundedRing(t *testing.T) {
 // ACCEPTS. It reconstructs the exact readLoop gate —
 //
 //	macOK      := present && len(key) > 0 && verifyHeartbeatMAC(frame, key)
-//	nonceFresh := macOK && r.authReplay.admit(session, counter)
+//	nonceFresh := macOK && r.auth.admit(session, counter)
 //	accept, _  := heartbeatAuthDecision(len(key) > 0, present, macOK, nonceFresh, peerAuthSeen)
 //
 // over real signed frames, and asserts that a #5477 A->B->A replay yields
@@ -313,7 +313,7 @@ func TestHeartbeatAuthReplay_BoundedRing(t *testing.T) {
 // would refresh liveness / drive a bogus election.
 func TestHeartbeatReplayGatesLivenessRefresh(t *testing.T) {
 	key := []byte("cluster-shared-secret")
-	r := &heartbeatReceiver{}
+	r := &heartbeatReceiver{auth: &heartbeatAuthState{}}
 
 	const (
 		sessA = 0xA11CE
@@ -325,10 +325,10 @@ func TestHeartbeatReplayGatesLivenessRefresh(t *testing.T) {
 	gate := func(frame []byte) bool {
 		session, counter, present := heartbeatAuthTrailer(frame)
 		macOK := present && len(key) > 0 && verifyHeartbeatMAC(frame, key)
-		nonceFresh := macOK && r.authReplay.admit(session, counter)
-		accept, _ := heartbeatAuthDecision(len(key) > 0, present, macOK, nonceFresh, r.peerAuthSeen.Load())
+		nonceFresh := macOK && r.auth.admit(session, counter)
+		accept, _ := heartbeatAuthDecision(len(key) > 0, present, macOK, nonceFresh, r.auth.peerAuthenticated())
 		if macOK {
-			r.peerAuthSeen.Store(true)
+			r.auth.notePeerAuthenticated()
 		}
 		return accept
 	}
@@ -428,22 +428,37 @@ func TestHeartbeatAuthDecision_ForgedFrameRejected(t *testing.T) {
 }
 
 // TestManagerHeartbeatPeerAuthSeen pins the #4107 arming wire the gRPC fabric
-// listener reads to close its post-restart downgrade window: nil receiver (no
-// heartbeat path) and an unarmed receiver report false; a receiver whose sticky
-// flag is set (a verified authed heartbeat arrived) reports true.
+// listener reads to close its post-restart downgrade window: an unarmed
+// manager reports false; once a verified authed heartbeat has arrived it
+// reports true. #5086 additionally pins that the flag is sticky for the life
+// of the PROCESS, not the life of a heartbeat — tearing the receiver down (as
+// StopHeartbeat/RestartHeartbeat do) must not disarm the guard.
 func TestManagerHeartbeatPeerAuthSeen(t *testing.T) {
 	m := &Manager{}
 	if m.HeartbeatPeerAuthSeen() {
-		t.Error("no receiver wired: expected false")
+		t.Error("no heartbeat started: expected false")
 	}
-	r := &heartbeatReceiver{mgr: m}
+	r := &heartbeatReceiver{mgr: m, auth: m.heartbeatAuthState()}
 	m.hbReceiver = r
 	if m.HeartbeatPeerAuthSeen() {
 		t.Error("receiver unarmed (peer not yet authenticated): expected false")
 	}
 	// A verified authed heartbeat arms the sticky flag (readLoop does this).
-	r.peerAuthSeen.Store(true)
+	r.auth.notePeerAuthenticated()
 	if !m.HeartbeatPeerAuthSeen() {
 		t.Error("receiver armed: expected true")
+	}
+
+	// #5086: a heartbeat restart drops the receiver and installs a new one.
+	// The peer has already PROVEN it holds the PSK, so the downgrade-guard
+	// must stay armed across the whole restart window (a VRF-rebind restart
+	// retries the bind for up to ~5s).
+	m.hbReceiver = nil
+	if !m.HeartbeatPeerAuthSeen() {
+		t.Error("#5086: tearing down the receiver must NOT disarm the downgrade-guard")
+	}
+	m.hbReceiver = &heartbeatReceiver{mgr: m, auth: m.heartbeatAuthState()}
+	if !m.HeartbeatPeerAuthSeen() {
+		t.Error("#5086: a freshly installed receiver must inherit the armed guard")
 	}
 }
