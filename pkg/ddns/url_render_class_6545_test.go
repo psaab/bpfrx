@@ -975,15 +975,30 @@ var urlErrorProducers = map[string]bool{
 	"url.Parse":                  true,
 	"url.ParseRequestURI":        true,
 	".Do":                        true, // any client.Do / b.client.Do
+	// readCappedBody was the gap this list had at round 10. doRequest has TWO
+	// adjacent error returns; .Do covered the first, and the second — four
+	// lines below it — rendered readCappedBody's error with %w and no producer
+	// entry, so no site was ever built for it and the gate was green over a
+	// verbatim render inside the very function it exists to protect. Reading
+	// the body is part of issuing the request: the error is caller-reachable
+	// (the caller supplies the *http.Client, hence resp.Body) and carries
+	// connection-varying text.
+	"readCappedBody": true,
 }
 
 // urlErrorRenderers are the ONLY things such an error may be handed to. The
 // first two sanitize; errors.As/Is inspect without rendering.
 var urlErrorRenderers = map[string]bool{
 	"scrubURLError": true,
-	"urlParseCause": true,
-	"errors.As":     true,
-	"errors.Is":     true,
+	// scrubInnerError is a sanitizer on the same footing as scrubURLError: it
+	// returns a declared transportReason constant, our own refusal's fixed
+	// prose, or recurses back through scrubURLError — never the error's own
+	// text. It is the correct renderer for an error that is NOT a *url.Error,
+	// which is what readCappedBody produces.
+	"scrubInnerError": true,
+	"urlParseCause":   true,
+	"errors.As":       true,
+	"errors.Is":       true,
 }
 
 // issue6606Exemption is the ONE knowingly-unfixed site, kept explicit rather

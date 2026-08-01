@@ -96,11 +96,26 @@ const (
 //
 // The fields hold the *url.URL values, not pre-rendered text, so the host and
 // scheme grammar is applied HERE at render time — unconditionally, on the way
-// out — rather than trusted to have been applied at construction. That matters
-// because the redirect target is PROVIDER-supplied: a provider answering
-// `Location: https://<our-own-password>.evil.example/` gets the hop refused
-// (the point of the guard) and, without the grammar, would have had the echoed
-// credential written to the daemon log.
+// out — rather than trusted to have been applied at construction. What that
+// buys is a bounded CHARACTER SET on a provider-supplied host: a zone id, raw
+// non-ASCII, or anything that is not a plain reg-name is withheld.
+//
+// It does NOT bound the CONTENT, and the difference matters enough to state
+// here rather than leave a reader to infer it. A provider answering
+// `Location: https://<our-own-password>.evil.example/` gets the hop refused —
+// that is the guard doing its job — but `<password>.evil.example` is a
+// well-formed reg-name, so the refusal message renders it verbatim and the
+// credential reaches the daemon log. scrubURLError records the same residual
+// for the general case, but its justification does NOT carry over to this one:
+// it argues such a name is already in every resolver query and TLS
+// ClientHello, which holds for an operator's own `%p`-expanded template and is
+// false for a REFUSED redirect target — CheckRedirect aborts before any dial,
+// so that host is never resolved and never sent anywhere.
+//
+// So this is a real residual, not a closed case. Closing it needs the refusal
+// to render a provider-supplied host by reference (a hop index, a hash) rather
+// than by name; the tests here cover only the zone-id and non-ASCII shapes,
+// which is exactly what the grammar genuinely stops.
 type redirectRefusal struct {
 	reason redirectReason
 	from   *url.URL // previous hop; nil for the hop cap
@@ -532,7 +547,22 @@ func doRequest(ctx context.Context, client *http.Client, req *http.Request) (int
 	}
 	body, rerr := readCappedBody(resp)
 	if rerr != nil {
-		return resp.StatusCode, nil, fmt.Errorf("ddns http: read response: %w", rerr)
+		// SECURITY: reading the body is part of ISSUING the request, so this
+		// return is subject to the same rule as the one above — it was the
+		// second of two adjacent error returns and the only one still on %w.
+		//
+		// Two things came out of that. A mid-body RST yields a *net.OpError
+		// whose text embeds the EPHEMERAL LOCAL PORT, which changes every
+		// connection; the daemon's checkip probe keys a process-lifetime
+		// sync.Map on this string to log "once per (provider, error)", so a
+		// persistently RST-ing endpoint minted a new key and a new WARN every
+		// reconcile tick, forever. And the caller supplies the *http.Client,
+		// so the same adversary that owns RoundTrip owns resp.Body.Read and
+		// could echo the request URL — the query, hence the password — here.
+		//
+		// scrubInnerError, not scrubURLError: rerr is not a *url.Error, and
+		// the classifier is what bounds it to a declared constant.
+		return resp.StatusCode, nil, fmt.Errorf("ddns http: read response: %s", scrubInnerError(rerr))
 	}
 	return resp.StatusCode, body, nil
 }
@@ -620,10 +650,22 @@ func doRequest(ctx context.Context, client *http.Client, req *http.Request) (int
 //
 // A non-*url.Error goes through the same classifier: it is not automatically
 // URL-free just because it is not a *url.Error (round 7).
-func scrubURLError(err error) string {
+func scrubURLError(err error) string { return scrubURLErrorAt(err, 0) }
+
+// scrubURLErrorAt carries the recursion depth that maxUnwrapDepth's comment
+// always claimed to bound. scrubURLError and scrubInnerError are MUTUALLY
+// recursive through the nested-*url.Error case, and neither counted: a
+// caller-supplied *url.Error whose Err points at ITSELF overflowed the stack.
+// That is a `fatal error`, not a panic — recover() does not catch it and the
+// whole xpfd process dies, which is strictly worse than the hang the comment
+// budgeted for. A deep non-cyclic nest did the same.
+func scrubURLErrorAt(err error, depth int) string {
+	if depth >= maxUnwrapDepth {
+		return string(transportWithheld)
+	}
 	var ue *url.Error
 	if !errors.As(err, &ue) {
-		return scrubInnerError(err)
+		return scrubInnerErrorAt(err, depth+1)
 	}
 	u, perr := url.Parse(ue.URL)
 	if perr != nil {
@@ -632,7 +674,8 @@ func scrubURLError(err error) string {
 		return fmt.Sprintf("url is not a valid URL: %s", urlParseCause(perr))
 	}
 	target, note := safeURLTarget(u)
-	return fmt.Sprintf("%s %q%s: %s", safeOp(ue.Op), target, note, scrubInnerError(ue.Err))
+	return fmt.Sprintf("%s %q%s: %s", safeOp(ue.Op), target, note,
+		scrubInnerErrorAt(ue.Err, depth+1))
 }
 
 // safeOp bounds url.Error.Op, which is NOT ours (round 8). net/http derives it
@@ -898,7 +941,14 @@ const (
 // The diagnostic cost is real and accepted: net/http's internal errors.New
 // prose, the failing address, and the unknown-error type name are all gone. An
 // unrecognised error is exactly the case where we cannot say what it contains.
-func scrubInnerError(err error) string {
+func scrubInnerError(err error) string { return scrubInnerErrorAt(err, 0) }
+
+// scrubInnerErrorAt is the depth-carrying half of the mutual recursion; see
+// scrubURLErrorAt.
+func scrubInnerErrorAt(err error, depth int) string {
+	if depth >= maxUnwrapDepth {
+		return string(transportWithheld)
+	}
 	if err == nil {
 		return string(transportNil)
 	}
@@ -912,7 +962,7 @@ func scrubInnerError(err error) string {
 	// (Op, URL, Err) goes back through the scrub.
 	var nested *url.Error
 	if errors.As(err, &nested) {
-		return scrubURLError(nested)
+		return scrubURLErrorAt(nested, depth+1)
 	}
 	return string(classifyTransportError(err))
 }
