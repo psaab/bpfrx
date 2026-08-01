@@ -1102,8 +1102,13 @@ pub(super) fn neigh_monitor_thread(
 /// AF_UNIX `SOCK_DGRAM` socketpair in tests — no privileged AF_NETLINK socket
 /// and no reliance on real kernel neighbor churn (the team-requested
 /// "factor for deterministic unit-testing" seam). The caller supplies the
-/// already-bound, already-dumped netlink `fd` (with the 500ms `SO_RCVTIMEO`
-/// set) and closes it after this returns.
+/// already-bound, already-dumped netlink `fd` and closes it after this
+/// returns. The PRODUCTION caller sets a 500ms `SO_RCVTIMEO` on it
+/// (`neigh_monitor_thread`), which is what bounds stop-latency in the field —
+/// but this loop does not depend on that value, and the #5165 tests
+/// deliberately supply a much longer one so the loop stays parked in `recv`
+/// across a stop and the post-recv re-check is actually reached. Do not read
+/// the 500ms as a precondition of this function.
 ///
 /// Each `recv()` batch bumps the neighbor generation (`Release`, before any
 /// mutation) and applies every RTM_{NEW,DEL}NEIGH message to
@@ -2101,15 +2106,30 @@ mod monitor_lifecycle_tests_5165 {
         }
     }
 
+    /// Push one RTM_NEWNEIGH datagram into the socketpair.
+    ///
+    /// #6621: this uses `write(2)`, NOT `send(2)`. On a CONNECTED
+    /// `SOCK_DGRAM` socket the two are equivalent — POSIX defines
+    /// `write` as `send` with `flags == 0`, and a socketpair is
+    /// connected by construction — but `libc::send` compiles to the
+    /// `sendto` syscall, and a seccomp network-egress filter can deny
+    /// `sendto` (`EPERM`) while leaving `write` and `recvfrom`
+    /// permitted on that same socket. Measured in the sandbox that
+    /// reported #6621: `socketpair` ok, `send` -> `-1 EPERM`,
+    /// `write` -> 48 bytes delivered, `recv` -> 48 bytes read. Under
+    /// `send` this helper's assert therefore fired with an opaque
+    /// `n == -1` before the loop under test ever saw a byte — a
+    /// permanently-red test that said nothing about the dataplane.
+    /// Do NOT switch this back to `send`.
     fn write_newneigh(fd: i32, ifindex: i32, ip: IpAddr, mac: [u8; 6]) {
         let buf = build_newneigh_request(ifindex, ip, mac, NUD_REACHABLE);
-        let n = unsafe {
-            libc::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), 0)
-        };
+        let n = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
         assert_eq!(
             n,
             buf.len() as isize,
-            "socketpair send must deliver the whole RTM_NEWNEIGH datagram",
+            "socketpair write must deliver the whole RTM_NEWNEIGH datagram \
+             (errno: {})",
+            io::Error::last_os_error(),
         );
     }
 
@@ -2125,6 +2145,11 @@ mod monitor_lifecycle_tests_5165 {
     /// in recv() (past its top-of-loop stop check); only THEN is stop set and
     /// event 2 injected to unblock recv(). Reverting the post-recv
     /// `if stop { break }` makes the loop apply event 2 -> `key2` appears -> RED.
+    ///
+    /// #6621: that sequencing is only a real gate if the loop actually RECEIVES
+    /// event 2, so the run is now self-verifying — a long harness recv timeout
+    /// keeps the loop parked in recv() across the stop, and a post-join drain
+    /// asserts the datagram was consumed rather than left queued.
     #[test]
     fn steady_state_drops_batch_received_after_stop_5165() {
         let mut fds = [0i32; 2];
@@ -2132,7 +2157,16 @@ mod monitor_lifecycle_tests_5165 {
             unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
         assert_eq!(rc, 0, "socketpair failed");
         let (write_fd, read_fd) = (fds[0], fds[1]);
-        set_rcvtimeo(read_fd, 500);
+        // #6621: a LONG harness receive timeout, deliberately not the
+        // production 500ms. The sequence below signals stop while the loop is
+        // BLOCKED in recv() so the POST-recv re-check is the gate under test.
+        // If the timeout could expire in that window the loop would instead
+        // exit on its TOP-of-loop check, never receive event 2, and the `key2`
+        // assertion would hold VACUOUSLY — green while proving nothing. 10s is
+        // far longer than the 30ms settle and costs nothing at runtime: the
+        // loop returns the moment event 2 unblocks recv (or, on a revert,
+        // immediately after applying it).
+        set_rcvtimeo(read_fd, 10_000);
 
         let map = Arc::new(ShardedNeighborMap::new());
         let generation = Arc::new(AtomicU64::new(1));
@@ -2174,6 +2208,54 @@ mod monitor_lifecycle_tests_5165 {
         // stop, and it breaks WITHOUT applying it. join() returns once broken.
         handle.join().expect("monitor steady-state join");
 
+        // #6621: PROVE the loop consumed event 2 before asserting on it. A
+        // recv() dequeues the datagram, so a loop that reached the post-recv
+        // re-check leaves the socket EMPTY (EAGAIN). A loop that exited on the
+        // top-of-loop check instead never read it, and the datagram is still
+        // queued — in which case `key2` being absent says nothing about the
+        // re-check and this run must NOT be reported as a pass.
+        let mut drained = [0u8; 128];
+        // EINTR is a legitimate recv() outcome and says nothing about whether
+        // the queue is empty, so retry it rather than reporting it as a
+        // failure. Bounded so a pathological signal storm cannot spin here.
+        let (leftover, drain_errno) = {
+            let mut last = (0isize, None);
+            for _ in 0..16 {
+                let n = unsafe {
+                    libc::recv(
+                        read_fd,
+                        drained.as_mut_ptr() as *mut libc::c_void,
+                        drained.len(),
+                        libc::MSG_DONTWAIT,
+                    )
+                };
+                let e = std::io::Error::last_os_error().raw_os_error();
+                last = (n, e);
+                if !(n < 0 && e == Some(libc::EINTR)) {
+                    break;
+                }
+            }
+            last
+        };
+        // `leftover < 0` alone would accept ANY error as "drained" — an EBADF
+        // from a future refactor would read as success. Only EAGAIN means the
+        // queue is genuinely empty. (EWOULDBLOCK is not matched separately:
+        // Linux defines it as the same value as EAGAIN, so a second arm is an
+        // unreachable pattern; this file is Linux-only.)
+        assert!(
+            leftover < 0,
+            "the post-stop batch must have been RECEIVED by the loop, but \
+             {leftover} bytes are still queued — the loop exited on its \
+             top-of-loop check, so the post-recv re-check was never exercised",
+        );
+        assert!(
+            drain_errno == Some(libc::EAGAIN),
+            "drain recv failed with errno {drain_errno:?}, not EAGAIN. The queue \
+             being empty is the ONLY acceptable reason this returns <0; any other \
+             error means the fd is unusable and this assertion would otherwise \
+             have passed for the wrong reason",
+        );
+
         assert!(
             map.get(&key2).is_none(),
             "a batch received AFTER stop must NOT mutate the map (post-recv re-check)",
@@ -2183,8 +2265,11 @@ mod monitor_lifecycle_tests_5165 {
             "the pre-stop entry must remain",
         );
 
+        // Both ends are ours and the loop is joined, so close both — the
+        // read end used to leak for the lifetime of the test binary.
         unsafe {
             libc::close(write_fd);
+            libc::close(read_fd);
         }
     }
 
