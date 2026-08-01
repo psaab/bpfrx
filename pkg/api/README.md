@@ -367,11 +367,33 @@ naming its owner: local, unattributable, denied, and logged once per scan rather
 than dropped in silence.
 
 <a id="residuals"></a>
-**Residuals, stated rather than papered over.** The first two over-deny and
-grant nothing. The third — the address-snapshot lag — is the one that pointed
-the *other* way, and it is closed rather than tolerated; it is kept on this list
-because the accept-time classification still gets it wrong, and anything new
-built on that classification has to know so.
+**Residuals, stated rather than papered over.**
+
+One of them over-denies and grants nothing: DNAT-to-loopback. The other two are
+the same shape as each other, and it is worth naming that shape once rather than
+filing them as unrelated curiosities.
+
+> The locality re-derivation answers **"is this address on this host, in my
+> namespace, right now."** The question authorization actually needs is **"was
+> this caller local when it connected."** Those coincide for the case the fix was
+> written for and come apart in two directions.
+
+- **Spatially** — a caller local to the BOX but not to the daemon's network
+  namespace. Both halves of the lookup are namespace-scoped, so it reads as
+  remote. That is the container case below.
+- **Temporally** — a caller whose address was on this host at accept and is not
+  by the time the request is adjudicated. A fresh scan is by construction fresher
+  than the connection, so it cannot see that. That is the churn case below.
+
+Be precise about what the address-snapshot fix closed, because "closed" without a
+direction is what the previous version of this list got wrong in the other
+direction. It closes the case that motivated it — an address ADDED recently,
+where a stale cache said *not local* and handed the caller the credential. It is
+**definitionally unable** to close the reverse: a scan cannot observe an address
+that is already gone. Both remaining cases need the `api-auth` secret *plus*
+timing, and neither is a regression — before #5561 any secret holder had full
+power unconditionally, so this is a narrowing with a race hole in it rather than
+a new hole.
 
 - **DNAT to loopback.** If a remote connection is redirected to a loopback
   address before it reaches the listener, the delivery address is loopback, the
@@ -379,7 +401,8 @@ built on that classification has to know so.
   administrator behind such a redirect cannot use the mutation surface even with
   a valid credential. This is the most plausible of the three; bind
   `web-management` to a real address rather than DNAT-ing to loopback.
-- **Another network namespace, off-loopback bind — argument corrected.** A
+- **Another network namespace, off-loopback bind — the SPATIAL case of the shape
+  above, and an argument corrected.** A
   container's veth peer and a real remote client are indistinguishable in the
   socket table, so a netns caller on a routable bind reaches the credential path.
   Both halves of the lookup are namespace-scoped: `findPeerSocket` reads only
@@ -406,7 +429,7 @@ built on that classification has to know so.
   holding it.** If that is not wanted, do not give containers the secret, and
   keep `web-management` on loopback where `couldBeLocal` short-circuits before
   any of this applies.
-- **A brand-new local address — direction corrected, and closed.** The
+- **A brand-new local address — the direction that IS closed.** The
   host-address snapshot is refreshed at most once per second, for hits *and*
   misses, so for up to a second after an address is added to this host a caller
   arriving from that address is classified **off-box**. An earlier version of
@@ -447,7 +470,8 @@ built on that classification has to know so.
   What remains is an over-denial: for at most a second, a local caller with no
   socket row is denied instead of resolved to its class.
 
-  **And one under-denial, stated rather than papered over.** A *successful*
+  **And the TEMPORAL case of the shape above — the direction that is NOT
+  closed.** A *successful*
   enumeration that finds nothing is not proof the caller is off-box — errors
   fail closed, omissions cannot. A clean no-match reads the same whether the
   caller is genuinely remote, in another namespace, or was on this host a moment
@@ -462,7 +486,7 @@ built on that classification has to know so.
   attempted here. The bound is the same one as for the namespace residual above:
   a caller this host cannot place is governed by the `api-auth` credential.
 
-  **Bounds.** It required an *off-loopback* bind (on the default loopback bind
+  **Bounds (of the closed direction).** It required an *off-loopback* bind (on the default loopback bind
   `couldBeLocal` short-circuits before the cache is ever consulted, so the
   default posture was provably never exposed), a configured `api-auth` secret in
   the caller's hands, and an address added to the host within the last second.

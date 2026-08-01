@@ -66651,3 +66651,29 @@ break — `go vet` confirmed passing under every revert.
   discarded -> config_authz_5561_test.go:1594.
 - **File(s)**: pkg/authz/peer.go, pkg/authz/peer_5561_test.go,
   pkg/api/config_authz_5561_test.go, pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 (round-6b, residual framing)
+- **Action**: #5561 — the residual list claimed the address-snapshot lag "is
+  closed rather than tolerated". Closed WITHOUT A DIRECTION is the same error the
+  list previously made the other way. It closes the case that motivated it (an
+  address ADDED recently, where a stale cache said not-local) and is
+  DEFINITIONALLY unable to close the reverse — a fresh scan cannot observe an
+  address that is already gone. Restructured the section around the shape both
+  remaining residuals share, which the parent named: the re-derivation answers
+  "is this address on this host, in my namespace, right now", while
+  authorization needs "was this caller local when it connected". Those come apart
+  SPATIALLY (a caller local to the box but outside the daemon's netns — the
+  container case) and TEMPORALLY (local at accept, gone by the scan — the VRRP/
+  DHCP churn case). Both now read as instances of one shape rather than unrelated
+  curiosities, the brand-new-address entry is retitled "the direction that IS
+  closed", its Bounds paragraph is scoped to that direction, and the section
+  states plainly that neither remaining case is a regression: before #5561 any
+  api-auth secret holder had full power unconditionally, so this is a narrowing
+  with a race hole rather than a new hole. No code change. The 2x-regression
+  mutation the parent asked for on the round-6 exact-count asserts: build rc=0
+  (0 bytes), vet rc=0 (0 bytes), a batch scanned twice reds BOTH —
+  config_authz_5561_test.go:1540 ("drove 2 interface enumerations, want exactly
+  1") and peer_5561_test.go:910 ("drove 4 enumerations, want exactly 2"), 754
+  pass. The forms these replaced both ADMIT that mutation: `scans != 0` passes on
+  2, and `scans > callers/4` (>50) passes on 4.
+- **File(s)**: pkg/api/README.md, _Log.md
