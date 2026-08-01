@@ -34,8 +34,12 @@
       "sha256": "1a3211eab48c72a993e31b4b8c1ea2e232de0c48658aea543faa469b7100e858"
     },
     {
+      "path": "userspace-xdp/src/binding_index.rs",
+      "sha256": "a5c5d53d732241b3f730b40147ffd4745b6d17cb094dfe59438ccec2e03cd06b"
+    },
+    {
       "path": "userspace-xdp/src/lib.rs",
-      "sha256": "f92285c993bb065b8d7b0b0b8961bede228ef0514d660439bfc76e93b6388dd9"
+      "sha256": "800fe2eeaf534397f1e095bf4b3094c8d8310ab92d7c0ccc25abff2b29fe8628"
     }
   ]
 }

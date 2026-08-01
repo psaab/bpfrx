@@ -72,7 +72,8 @@ const USERSPACE_CTRL_FLAG_STRICT: u32 = 8;
 /// already-loaded flags word restores the true zero-cost-when-absent
 /// property.
 const USERSPACE_CTRL_FLAG_WG_RX: u32 = 16;
-const BINDING_QUEUES_PER_IFACE: u32 = 16;
+mod binding_index;
+use binding_index::{BINDING_QUEUES_PER_IFACE, RawRxQueue, binding_slot};
 // MAX_INTERFACES is threaded in from bpf/headers/xpf_common.h via the
 // pkg/dataplane/build-userspace-xdp.sh wrapper, which does
 // `export MAX_INTERFACES=$(awk ... xpf_common.h)` before `cargo build`.
@@ -430,8 +431,13 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let native_gre =
         parsed.protocol == PROTO_GRE && (ctrl.flags & USERSPACE_CTRL_FLAG_NATIVE_GRE) != 0;
 
-    let rx_queue_index = unsafe { (*ctx.ctx).rx_queue_index };
-    let selected_queue = select_userspace_queue(rx_queue_index);
+    // #5173: wrap the coordinate at the ONE point it leaves the context, so
+    // nothing downstream can reduce it — `RawRxQueue` has a private field and no
+    // arithmetic impls. The repo-scoped checks in the parity tests pin that this
+    // is the only construction site and that its argument is the context field.
+    let rx_queue = RawRxQueue::from_ctx_field(unsafe { (*ctx.ctx).rx_queue_index });
+    let rx_queue_index = rx_queue.for_trace();
+    let selected_queue = rx_queue_index;
     record_trace(
         ctrl.flags,
         ingress_ifindex,
@@ -442,32 +448,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         0,
         &parsed,
     );
-    // #5173: the binding index carries the queue in a fixed-width dimension
-    // (`ifindex * BINDING_QUEUES_PER_IFACE + queue`), so a queue id at or above
-    // the stride addresses the NEXT ifindex's row. This bound is required
-    // BECAUSE this change removed the modulo: `rx_queue_index` comes from the
-    // hardware and nothing else clamps it.
-    //
-    // What an out-of-stride read would actually do, stated precisely because an
-    // earlier version of this comment got it wrong and the error propagated
-    // into review: it reads row `(ifindex + q/16, q%16)`, which holds a socket
-    // bound to a DIFFERENT netdev and a different queue. The kernel rejects
-    // that on both counts — `xsk_rcv_check()` in `net/xdp/xsk.c` tests
-    // `xs->dev != xdp->rxq->dev || xs->queue_id != xdp->rxq->queue_index` — so
-    // the packet is DROPPED, not delivered into another interface's XSK. It is
-    // the same class of silent drop as the mis-steer this fix removes, not a
-    // cross-interface leak and not a zone-confusion bug. The bound is still
-    // worth having: it makes the refusal explicit and traced at the point the
-    // index is formed, rather than relying on the kernel to catch a key this
-    // code should never have constructed.
-    //
-    // Never clamp or modulo the queue back into range — that reintroduces the
-    // mis-steer. No binding is the correct answer.
-    let binding = if selected_queue >= BINDING_QUEUES_PER_IFACE {
-        None
-    } else {
-        USERSPACE_BINDINGS.get(ingress_ifindex * BINDING_QUEUES_PER_IFACE + selected_queue)
-    };
+    let binding = binding_slot(ingress_ifindex, rx_queue).and_then(|idx| USERSPACE_BINDINGS.get(idx));
     let binding = match binding {
         Some(b) if b.flags != 0 => b,
         _ => {
@@ -1476,44 +1457,6 @@ fn is_ipv6_link_local(ip: [u8; 16]) -> bool {
     ip[0] == 0xfe && (ip[1] & 0xc0) == 0x80
 }
 
-/// #5173: the XSK redirect target is the packet's OWN RX queue, always.
-///
-/// AF_XDP delivery is queue-bound: the kernel's `xsk_rcv_check` drops a
-/// redirect whose target socket is bound to a different (netdev, queue) than
-/// the packet arrived on. So the queue coordinate must not be transformed
-/// between "which queue did this arrive on" and "which XSK do we redirect to".
-///
-/// This used to return `rx_queue_index % queue_count`, where `queue_count` was
-/// the planner's global MINIMUM RX-queue count across interfaces. The comment
-/// that sat here described the invariant above correctly and then the code
-/// broke it: on any box whose interfaces have asymmetric queue counts, a packet
-/// arriving on a queue at or above that minimum was reduced onto a DIFFERENT
-/// queue's socket, and `xsk_rcv_check()` dropped it for the queue mismatch.
-/// RSS restriction did not save it either: it is best-effort, mlx5-only, and
-/// skipped entirely for `workers == 1` and for `workers >= queues`.
-///
-/// The raw-queue fallback that was meant to catch this fired only when the
-/// reduced target's binding was ABSENT. Calling it dead code — as an earlier
-/// version of this comment did — is true only in steady state, and understates
-/// the old behaviour. `flags == 0` means "not FORWARDING-live", not merely
-/// "unplanned": `bindingForwardingLive` in `pkg/dataplane/userspace/maps_sync.go`
-/// requires Registered && Armed && Ready && a live worker. So during every
-/// bringup, every unarmed or dead worker, and every RG transition, a planned
-/// binding reads back as absent, the fallback fired, and it indexed with the
-/// raw unbounded `rx_queue_index`. The out-of-stride read below was therefore
-/// REACHABLE on the old code, not latent — which is why the read-side bound is
-/// part of this change rather than a nicety.
-///
-/// The identity is kept as a named function rather than inlined at the call
-/// site so that the invariant, and the reason it is an identity, stay attached
-/// to the queue selection itself. `ctrl.queue_count` is deliberately NOT read:
-/// the planner's aggregate queue count is a userspace work-distribution
-/// concept and has no business changing a packet's queue coordinate. Any
-/// higher-level redistribution belongs in userspace, after delivery.
-#[inline(always)]
-fn select_userspace_queue(rx_queue_index: u32) -> u32 {
-    rx_queue_index
-}
 
 fn parse_l4(
     data: usize,

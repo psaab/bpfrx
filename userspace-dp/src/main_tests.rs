@@ -2457,162 +2457,142 @@ fn shim_tokens(src: &str) -> String {
     out.join(" ")
 }
 
-/// #5173 property guard A: the shim reads the binding map EXACTLY ONCE, and
-/// the index it forms is exactly `ifindex * stride + selected_queue`.
-///
-/// File-scoped on purpose. The previous version pinned one spelling of one
-/// line, and a hostile review proved three mutations that reintroduce the
-/// mis-steer while leaving it green: reducing at the CALL SITE, masking the
-/// queue INSIDE the lookup, and shadowing `selected_queue` one line ABOVE the
-/// anchor (the old check used a forward-only 400-character window, so anything
-/// behind it was invisible). Pinning the count of map reads plus the exact
-/// token sequence of the index has no direction and no window.
-#[test]
-fn shim_reads_the_binding_map_once_with_an_unreduced_index() {
-    let src = shim_source();
-    const GET: &str = "USERSPACE_BINDINGS.get(";
-    let sites: Vec<usize> = src.match_indices(GET).map(|(i, _)| i).collect();
-    assert_eq!(
-        sites.len(),
-        1,
-        "#5173: the shim must read the binding map exactly once; found {} sites. A second read \
-         is how the removed raw-queue fallback comes back, and that one indexed with an \
-         unbounded rx_queue_index.",
-        sites.len()
-    );
+// #5173: the index computation is EXECUTED here, not described.
+//
+// `binding_index.rs` is the shim's own source, `#[path]`-included and compiled
+// for the host. What runs below is the code the BPF object is built from.
+#[path = "../../userspace-xdp/src/binding_index.rs"]
+mod shim_binding_index;
 
-    // Take the parenthesised argument of the single call.
-    let start = sites[0] + GET.len() - 1;
-    let bytes = src.as_bytes();
-    let mut depth = 0usize;
-    let mut end = None;
-    for (i, b) in bytes.iter().enumerate().skip(start) {
-        match b {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = Some(i);
-                    break;
-                }
+/// Every `(ifindex, queue)` resolves to its OWN interface's row, or to nothing.
+///
+/// This replaces four source-spelling checks that a hostile review escaped
+/// twice. The mapping, the stride bound, and the property that a slot never
+/// leaves its interface's row are now results of running the shim's function.
+#[test]
+fn shim_binding_slot_never_leaves_its_interfaces_row() {
+    use shim_binding_index::{BINDING_QUEUES_PER_IFACE as STRIDE, RawRxQueue, binding_slot};
+    for ifindex in [0u32, 1, 2, 7, 63, 1000, 65535] {
+        let row_start = ifindex * STRIDE;
+        for q in 0u32..64 {
+            let got = binding_slot(ifindex, RawRxQueue::from_ctx_field(q));
+            if q >= STRIDE {
+                assert_eq!(
+                    got, None,
+                    "#5173: queue {q} is at or above the stride and must resolve to NO binding; \
+                     clamping it back into range is the mis-steer in another form, and indexing \
+                     with it addresses ifindex {}'s row",
+                    ifindex + q / STRIDE
+                );
+                continue;
             }
-            _ => {}
+            let slot = got.unwrap_or_else(|| panic!("in-stride queue {q} resolved to no binding"));
+            assert_eq!(
+                slot,
+                row_start + q,
+                "#5173: the slot must be the packet's OWN queue in its OWN interface's row"
+            );
+            assert!(
+                slot >= row_start && slot < row_start + STRIDE,
+                "#5173: slot {slot} escaped ifindex {ifindex}'s row [{row_start}, {})",
+                row_start + STRIDE
+            );
         }
     }
-    let arg = &src[start + 1..end.expect("unbalanced parens in the binding lookup")];
-    assert_eq!(
-        shim_tokens(arg),
-        "ingress_ifindex * BINDING_QUEUES_PER_IFACE + selected_queue",
-        "#5173: the binding index must be formed from the UNREDUCED queue coordinate. Any mask, \
-         modulo or clamp here redirects the packet to a socket bound to a different queue, which \
-         xsk_rcv_check() drops. Got: {:?}",
-        shim_tokens(arg)
-    );
 }
 
-/// #5173 property guard B: `selected_queue` is bound exactly once, from the
-/// identity, and never rebound or shadowed.
+/// The queue coordinate cannot be transformed after it is wrapped.
 ///
-/// This is what kills a reduction at the call site and a shadowing rebind —
-/// neither of which the old keyhole checks could see.
+/// `RawRxQueue` has a private field and no arithmetic impls, so `queue % 2`,
+/// `queue & 3` and friends do not COMPILE outside its module — enforced by the
+/// compiler rather than asserted about source text. This test records the
+/// property and the one thing it does NOT cover, verified by compiling both:
+/// reducing the newtype is rejected, reducing the raw `u32` BEFORE construction
+/// builds clean, because the constructor must accept a bare integer that
+/// originates in an aya context no `core`-only module can see. That residual is
+/// exactly what `shim_index_path_has_one_construction_and_one_lookup` pins.
 #[test]
-fn shim_binds_the_queue_coordinate_exactly_once_from_the_identity() {
-    let src = shim_source();
-    let binds: Vec<&str> = src
-        .lines()
-        .map(str::trim)
-        .filter(|l| {
-            // Only BINDINGS of `selected_queue`, not lines that merely read it
-            // (`let binding = if selected_queue >= ...` reads, it does not bind).
-            let rest = l.strip_prefix("let ").unwrap_or("");
-            let rest = rest.strip_prefix("mut ").unwrap_or(rest);
-            rest.starts_with("selected_queue")
+fn shim_raw_rx_queue_exposes_no_arithmetic() {
+    use shim_binding_index::RawRxQueue;
+    let a = RawRxQueue::from_ctx_field(3);
+    let b = RawRxQueue::from_ctx_field(3);
+    assert_eq!(a, b, "the wrapper must preserve the coordinate verbatim");
+    assert_eq!(a.for_trace(), 3, "telemetry readback must not alter the value");
+}
+
+/// REPO-scoped, not file-scoped: the whole shim crate has exactly one binding
+/// lookup and exactly one place the coordinate is wrapped.
+///
+/// File-scoping was the previous version's residual — a reviewer escaped it by
+/// putting a raw fallback lookup in a DIFFERENT file, which a per-file check
+/// cannot see by construction. Walking the crate closes that. What remains
+/// source-asserted is one expression: the argument handed to the constructor.
+#[test]
+fn shim_index_path_has_one_construction_and_one_lookup() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("userspace-xdp")
+        .join("src");
+    let mut sources: Vec<(String, String)> = Vec::new();
+    fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+        for e in std::fs::read_dir(dir).expect("read shim src dir") {
+            let p = e.expect("dir entry").path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().and_then(|x| x.to_str()) == Some("rs") {
+                let body = std::fs::read_to_string(&p).expect("read shim source");
+                out.push((p.display().to_string(), body));
+            }
+        }
+    }
+    walk(&root, &mut sources);
+    assert!(!sources.is_empty(), "found no shim sources under {}", root.display());
+
+    let count = |needle: &str| -> Vec<String> {
+        sources
+            .iter()
+            .flat_map(|(name, body)| {
+                std::iter::repeat(name.clone()).take(body.matches(needle).count())
+            })
+            .collect()
+    };
+
+    let lookups = count("USERSPACE_BINDINGS.get(");
+    assert_eq!(
+        lookups.len(),
+        1,
+        "#5173: the shim crate must contain exactly ONE binding-map lookup; found {lookups:?}. A \
+         second one is how the removed raw-queue fallback returns, and it indexed with an \
+         unbounded rx_queue_index. This check is REPO-scoped because a file-scoped one was \
+         escaped by moving the extra lookup to another file."
+    );
+
+    let ctors = count("RawRxQueue::from_ctx_field(");
+    assert_eq!(
+        ctors.len(),
+        1,
+        "#5173: the coordinate must be wrapped in exactly ONE place; found {ctors:?}. The \
+         constructor takes a bare u32 — a reduction applied before it is wrapped is the one \
+         escape the newtype cannot prevent — so a second construction site reopens it."
+    );
+
+    // …and that single construction is fed the context field, unmodified.
+    let site = sources
+        .iter()
+        .find_map(|(_, b)| {
+            b.lines()
+                .find(|l| l.contains("RawRxQueue::from_ctx_field("))
+                .map(str::trim)
         })
-        .collect();
+        .expect("construction site not found");
     assert_eq!(
-        binds.len(),
-        1,
-        "#5173: `selected_queue` must be bound exactly once; found {:?}. A second binding \
-         (including a shadowing `let selected_queue = selected_queue & N;`) reintroduces the \
-         reduction this fix removed.",
-        binds
-    );
-    assert_eq!(
-        shim_tokens(binds[0]),
-        "let selected_queue = select_userspace_queue ( rx_queue_index ) ;",
-        "#5173: the queue coordinate must come straight from the identity with nothing applied \
-         to it. Got: {:?}",
-        shim_tokens(binds[0])
-    );
-}
-
-/// #5173 property guard C: `select_userspace_queue` is the identity.
-#[test]
-fn shim_does_not_transform_the_rx_queue_coordinate() {
-    let src = shim_source();
-    const SIG: &str = "fn select_userspace_queue(rx_queue_index: u32) -> u32 {";
-    let at = src.find(SIG).unwrap_or_else(|| {
-        panic!(
-            "shim has no `{SIG}` — #5173 requires the XSK redirect target to be the packet's own \
-             RX queue. If the signature changed, re-establish that property by hand."
-        )
-    });
-    let open = at + SIG.len() - 1;
-    let bytes = src.as_bytes();
-    let mut depth = 0usize;
-    let mut close = None;
-    for (i, b) in bytes.iter().enumerate().skip(open) {
-        match b {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    close = Some(i);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let body = &src[open + 1..close.expect("select_userspace_queue has unbalanced braces")];
-    assert_eq!(
-        shim_tokens(body),
-        "rx_queue_index",
-        "#5173: select_userspace_queue must return the RX queue index UNCHANGED. AF_XDP delivery \
-         is queue-bound — xsk_rcv_check() drops a redirect to a socket bound to a different \
-         queue — so any transform here strands packets between redirect intent and ring \
-         delivery. Body was: {:?}",
-        shim_tokens(body)
-    );
-}
-
-/// #5173 property guard D: the stride bound is a whole statement, pinned by
-/// exact tokens, so neither branch can be altered without reddening.
-///
-/// Token-exact on the ENTIRE `let binding = if ... ;` statement rather than a
-/// forward window: the out-of-stride branch must yield `None`, and the in-range
-/// branch must be the single unreduced lookup guard A pins.
-#[test]
-fn shim_bound_checks_the_binding_queue_dimension() {
-    let src = shim_source();
-    const ANCHOR: &str = "let binding = if selected_queue >= BINDING_QUEUES_PER_IFACE {";
-    let at = src.find(ANCHOR).unwrap_or_else(|| {
-        panic!(
-            "the shim's binding lookup no longer bound-checks the queue against \
-             BINDING_QUEUES_PER_IFACE (#5173/#4894). Without it the index is formed from an \
-             unbounded hardware queue id and addresses the adjacent ifindex's row."
-        )
-    });
-    // Whole statement: from `let` to the `;` that closes the if/else expression.
-    let end = src[at..].find("};").expect("unterminated binding lookup statement") + at + 2;
-    assert_eq!(
-        shim_tokens(&src[at..end]),
-        "let binding = if selected_queue > = BINDING_QUEUES_PER_IFACE { None } else { \
-         USERSPACE_BINDINGS . get ( ingress_ifindex * BINDING_QUEUES_PER_IFACE + selected_queue ) } ;",
-        "#5173: the out-of-stride branch must yield NO binding and the in-range branch must be \
-         the single unreduced lookup. Clamping or masking the queue back into range is the \
-         mis-steer in another form. Got: {:?}",
-        shim_tokens(&src[at..end])
+        shim_tokens(site),
+        "let rx_queue = RawRxQueue : : from_ctx_field ( unsafe { ( * ctx . ctx ) . rx_queue_index } ) ;",
+        "#5173: the wrapped value must be the context's RX queue index with nothing applied to \
+         it. This single expression is the entire remaining source-asserted surface — everything \
+         after the wrap is enforced by the compiler, and the mapping and bound by execution. \
+         Got: {:?}",
+        shim_tokens(site)
     );
 }
 
