@@ -65606,3 +65606,30 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/refactoraudit/audit_canary_test.go, pkg/refactoraudit/doc.go,
   docs/refactoring-audit-current.txt, docs/refactoring-audit.md,
   scripts/refactoring-audit.sh, Makefile, _Log.md
+
+- **Timestamp**: 2026-08-01
+- **Action**: #5086 — anchor heartbeat anti-replay state to the Manager so a
+  heartbeat restart cannot reset it. #5477 gave the receiver a bounded set of
+  retired-session watermarks, but the tracker was a `heartbeatReceiver` field
+  and every `StartHeartbeat` builds a new receiver — including
+  `RestartHeartbeat` on a DHCP-triggered VRF rebind and the HA comms restart,
+  both routine. The replacement receiver started EMPTY, so captured
+  authenticated frames from retired peer incarnations were all re-admitted as
+  never-seen, refreshing peer liveness and applying stale election state; a
+  dead peer kept looking alive and the survivor never took over. Measured
+  pre-fix: 20/60 replayed frames admitted per restart (~4 s of forged liveness
+  vs the ~1 s peer-dead window), fresh on every restart. Moved the replay ring
+  + sticky `peerAuthSeen` into `Manager.hbAuth` (`heartbeatAuthState`, its own
+  mutex now that it outlives one readLoop); receivers hold a pointer.
+  `HeartbeatPeerAuthSeen` reads it directly, closing the mirror hole where
+  `StopHeartbeat` nil'd `m.hbReceiver` and silently disarmed the gRPC fabric
+  downgrade-guard for the restart window (~5 s on a VRF-rebind bind retry).
+  Memory bound unchanged and restart-independent: one fixed 64 x 16 B ring per
+  Manager. No wire change, no added failover latency. Residual (in-memory
+  state is still lost on a full daemon restart, and the >=65-recording ring
+  churn) needs the signed boot-epoch — #6169.
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/manager.go,
+  pkg/cluster/peer_state.go, pkg/cluster/heartbeat_replay_restart_5086_test.go,
+  pkg/cluster/heartbeat_auth_test.go,
+  pkg/cluster/controllink_auth_status_4484_test.go, pkg/cluster/README.md,
+  _Log.md

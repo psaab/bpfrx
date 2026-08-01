@@ -45,9 +45,9 @@ func TestControlLinkAuthStatus(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			m := &Manager{controlAuthKey: tc.key}
-			r := &heartbeatReceiver{mgr: m}
+			r := &heartbeatReceiver{mgr: m, auth: m.heartbeatAuthState()}
 			m.hbReceiver = r
-			r.peerAuthSeen.Store(tc.peerAuthSeen)
+			r.auth.peerAuthSeen.Store(tc.peerAuthSeen)
 
 			got := m.controlLinkAuthStatus()
 			engaged := strings.HasPrefix(got, "engaged")
@@ -73,9 +73,9 @@ func TestControlLinkAuthStatus(t *testing.T) {
 // helper. RED-on-revert: dropping the Authentication line makes this fail.
 func TestFormatControlPlaneStatisticsIncludesAuth(t *testing.T) {
 	m := &Manager{controlAuthKey: []byte("shared-psk-16byte")}
-	r := &heartbeatReceiver{mgr: m}
+	r := &heartbeatReceiver{mgr: m, auth: m.heartbeatAuthState()}
 	m.hbReceiver = r
-	r.peerAuthSeen.Store(true)
+	r.auth.peerAuthSeen.Store(true)
 
 	out := m.FormatControlPlaneStatistics()
 	if !strings.Contains(out, "Authentication:") {
