@@ -373,12 +373,36 @@ loops exit differently, so they are deliberately NOT equal:
 
 So the correct condition is `MAX_EXT_HDRS == MAX_IPV6_EXT_HEADERS - 1`
 (7 and 8): both walkers resolve 0..=7 extension headers and both refuse 8
-or more. A mismatch is fail-closed — the shim's unresolved chain leaves
-the extension-header type in `ParsedPacket::protocol` with `parse_l4`'s
-catch-all ports 0/0, so the session key misses and the packet is redirected
-to userspace for full policy — but it costs that flow the XDP fast path
-permanently. `tests_shim_ext_parity.rs` in userspace-dp fails on drift in
-either the resolvable chain length or the walked type set.
+or more.
+
+**The two mismatch directions are not symmetric.** Only shim-BELOW-userspace
+is fail-closed: the shim's unresolved chain leaves the extension-header type
+in `ParsedPacket::protocol` with `parse_l4`'s catch-all ports 0/0, so the
+session key misses and the packet is redirected to userspace for full
+policy — it costs that flow the XDP fast path permanently, nothing more.
+Shim-ABOVE-userspace is the direction never to take: the shim would stamp a
+full 5-tuple and `l4_offset` for a chain `walk_ipv6_ext_chain` refuses with
+`OverLimit`, and hand that meta to consumers that trust it. Independently of
+that argument, bound 8 does not load — see the table above.
+
+**`parsed.protocol` is not only a session-key ingredient.** It also drives
+pre-session dispatch that terminates in the shim: ESP and non-native GRE to
+`cpumap_or_pass` (kernel XFRM / tunnel decap), WireGuard-to-firewall via
+`wg_steer_to_kernel`, ICMPv6 NDP 133-137 via `pass_local_control`. Widening
+the walked type set therefore re-routes packets between the XSK path and the
+kernel path — `IPv6 → Mobility → ESP` reached userspace over XSK before
+#4555 and now goes to the kernel stack, matching how `DestOpt → ESP` already
+behaved and how userspace-dp classifies the same chain. On the userspace
+side `meta.protocol` feeds NAT64 translation and L4 checksum recomputation
+(`frame/mod.rs`), so walk agreement matters well beyond telemetry.
+
+`tests_shim_ext_parity.rs` in userspace-dp fails on drift in either the
+resolvable chain length or the walked type set. Because it models the shim
+from source rather than executing it (the shim is `no_std`, built for
+`bpfel-unknown-none`), it pins the loop header, requires the loop body to
+contain nothing but the `match protocol` block, and compares each arm body
+by whitespace-normalised token equality — a substring test let an altered
+advance, or a prepended `if opt[1] == 0 { break; }`, pass green.
 
 ## SR-IOV / driver constraints
 

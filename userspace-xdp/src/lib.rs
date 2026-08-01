@@ -52,15 +52,40 @@ const TCP_FLAG_ACK: u8 = 0x10;
 /// to 8 to "match" would make the shim resolve 8-header chains that
 /// userspace fails closed on.
 ///
-/// Getting it wrong in either direction is fail-closed — the shim's only
-/// job here is to recompute the session key userspace already installed,
-/// and a chain it cannot resolve leaves the unconsumed extension-header
-/// type in `ParsedPacket::protocol` with `parse_l4`'s catch-all ports 0/0,
-/// so the key misses the session map and the packet is redirected to
-/// userspace for full policy. The cost is a permanent loss of the XDP fast
-/// path for that flow, which is what #4555 fixes: before it, this was 6
-/// against userspace's 8, so a chain of exactly 7 extension headers
-/// resolved in userspace and never in the shim.
+/// THE TWO DIRECTIONS ARE NOT SYMMETRIC. Only shim-BELOW-userspace is
+/// fail-closed: a chain the shim cannot resolve leaves the unconsumed
+/// extension-header type in `ParsedPacket::protocol` with `parse_l4`'s
+/// catch-all ports 0/0, so the key misses the session map and the packet
+/// is redirected to userspace for full policy. The cost is a permanent
+/// loss of the XDP fast path for that flow, which is what #4555 fixes:
+/// before it, this was 6 against userspace's 8, so a chain of exactly 7
+/// extension headers resolved in userspace and never in the shim.
+///
+/// Shim-ABOVE-userspace must never be taken, and it is precisely the
+/// direction a future maintainer is tempted into by the constants not
+/// looking equal. At bound 8 the shim would resolve and stamp a full
+/// 5-tuple and `l4_offset` for a chain `walk_ipv6_ext_chain` refuses
+/// with `OverLimit`, then hand that meta on to consumers that TRUST it
+/// (see the pre-session dispatch below, plus userspace-dp's NAT64
+/// translation and L4 checksum recomputation, which read
+/// `meta.protocol`). That is a different and worse story than the
+/// fail-closed one above. Independently of the argument, bound 8 does
+/// not load at all — see the verifier table below.
+///
+/// `parsed.protocol` is NOT only a session-key ingredient. It also
+/// drives PRE-SESSION dispatch that terminates in the shim, before any
+/// session lookup: ESP goes to `cpumap_or_pass` for the kernel XFRM
+/// path, non-native GRE likewise for tunnel decap, WireGuard-to-firewall
+/// is steered to the kernel by `wg_steer_to_kernel`, and ICMPv6 NDP
+/// types 133-137 take `pass_local_control`. So widening the walked type
+/// set re-routes packets between the XSK path and the kernel path, not
+/// merely their session key: `IPv6 → Mobility → ESP` reached userspace
+/// over XSK before #4555 and now goes to the kernel stack. That
+/// direction is correct — userspace-dp classifies the same chain as ESP,
+/// and `DestOpt → ESP` already behaved this way — so #4555 extends
+/// deliberate existing routing to five more header types rather than
+/// inventing a path. It does mean the blast radius is wider than
+/// "session key parity", which is why this change wants a cluster smoke.
 ///
 /// The bound is capped by BPF verifier budget, not by taste — the loop is
 /// fully unrolled, so each iteration duplicates every arm body and its

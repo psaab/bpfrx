@@ -119,10 +119,14 @@ trap 'rm -f "${SHIMVERIFY}"' EXIT
 ) || fail "failed to build cmd/shimverify"
 
 run_verifier() {
+	# XPF_SHIM_ALLOW_LOW_HEADROOM (#4555) must survive the sudo hop —
+	# sudo scrubs the environment, so pass it explicitly via `env` or the
+	# documented override silently does nothing.
+	local allow_low="${XPF_SHIM_ALLOW_LOW_HEADROOM:-0}"
 	if [[ "$(id -u)" -eq 0 ]]; then
-		"${SHIMVERIFY}" "${CANDIDATE}"
+		XPF_SHIM_ALLOW_LOW_HEADROOM="${allow_low}" "${SHIMVERIFY}" "${CANDIDATE}"
 	elif sudo -n true 2>/dev/null; then
-		sudo -n "${SHIMVERIFY}" "${CANDIDATE}"
+		sudo -n env "XPF_SHIM_ALLOW_LOW_HEADROOM=${allow_low}" "${SHIMVERIFY}" "${CANDIDATE}"
 	else
 		return 99
 	fi
@@ -147,6 +151,13 @@ case "${VERIFY_RC}" in
 	fail "kernel verifier REJECTED the candidate object — the tracked ${OUT_FILE} was NOT updated.
   This is the #1864 failure mode (toolchain codegen drift). Do not commit or deploy.
   Pinned toolchain: ${PINNED_TOOLCHAIN}; this build used: ${TOOLCHAIN}." ;;
+4)
+	fail "the candidate LOADS but is below the #4555 verifier-headroom floor — the tracked
+  ${OUT_FILE} was NOT updated. See the shimverify message above for the measured
+  numbers. This is the early-warning tripwire, not a kernel rejection: the shim
+  previously reached 0.92% headroom with every gate green, and the next edit to its
+  parsing paths then hit the 1M processed-insn wall. Reduce verifier cost, or re-run
+  with XPF_SHIM_ALLOW_LOW_HEADROOM=1 to install anyway with the risk understood." ;;
 *)
 	fail "shimverify failed (rc=${VERIFY_RC}) — the tracked ${OUT_FILE} was NOT updated." ;;
 esac

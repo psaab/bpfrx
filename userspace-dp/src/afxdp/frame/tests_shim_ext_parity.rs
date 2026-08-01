@@ -99,11 +99,105 @@ impl ShimWalk {
     /// One iteration consumes one extension header, and the loop exits by
     /// exhaustion carrying the last declared next-header value into
     /// `parse_l4` — so `bound` headers are consumed and the L4 after them
-    /// is still resolved. `assert_no_post_loop_overlimit_check` pins the
-    /// exhaustion semantics this relies on.
+    /// is still resolved.
+    ///
+    /// The shim side of this comparison is a source MODEL, not an
+    /// execution — the shim is `no_std` and built for
+    /// `bpfel-unknown-none`, so this crate's test binary cannot run it.
+    /// Three pins are what make the model trustworthy, and each fails
+    /// loudly rather than degrading quietly:
+    ///
+    ///   1. the loop header text (`shim_loop_open_idx`) and the
+    ///      requirement that the loop body contains NOTHING but the
+    ///      `match protocol` block (`shim_walk_model`) — so no extra
+    ///      per-iteration statement can hide outside the match;
+    ///   2. every arm body pinned by whitespace-normalised EQUALITY
+    ///      against the literals below, so any change to the advance
+    ///      arithmetic or any added statement inside an arm panics
+    ///      instead of passing (a `contains` substring test let
+    ///      `((opt[1] as u16) + 1) * 8 + 8` and a prepended
+    ///      `if opt[1] == 0 { break; }` through — the latter rejects the
+    ///      ORDINARY 8-byte HbH/DestOpt, i.e. destroys parity for
+    ///      essentially every real chain);
+    ///   3. `assert_no_post_loop_overlimit_check`, which pins the
+    ///      exhaustion semantics the `bound`-headers-resolvable claim
+    ///      rests on.
     fn max_resolvable_ext_headers(&self) -> usize {
         self.bound
     }
+}
+
+// The exact bodies of the shim's three walking arms. Compared by
+// whitespace-normalised token equality (see `normalise_tokens`), so
+// rustfmt reflow is invisible but ANY added, removed or altered token is
+// not. Update these ONLY together with a re-derivation of the parity
+// argument above.
+const SHIM_GENERIC_ARM_BODY: &str = r#"
+    let opt = read_bytes(data, data_end, offset as usize, 2)?;
+    protocol = opt[0];
+    offset = offset.checked_add(((opt[1] as u16) + 1) * 8)?;
+    read_bytes(data, data_end, l3_offset as usize, (offset - l3_offset) as usize)?;
+"#;
+
+const SHIM_AUTH_ARM_BODY: &str = r#"
+    let opt = read_bytes(data, data_end, offset as usize, 2)?;
+    protocol = opt[0];
+    offset = offset.checked_add(((opt[1] as u16) + 2) * 4)?;
+    read_bytes(data, data_end, l3_offset as usize, (offset - l3_offset) as usize)?;
+"#;
+
+const SHIM_FRAGMENT_ARM_BODY: &str = r#"
+    let frag = read_bytes(data, data_end, offset as usize, 8)?;
+    protocol = frag[0];
+    offset = offset.checked_add(mem::size_of::<FragHdr>() as u16)?;
+"#;
+
+/// Normalise a Rust snippet to a formatting-insensitive token stream:
+/// every token is either a run of `[A-Za-z0-9_]` or a single punctuation
+/// character, joined by single spaces. Two snippets differing only in
+/// line breaks, indentation or rustfmt reflow normalise identically;
+/// any added, removed or altered token changes the result.
+///
+/// The one token deliberately discarded is a trailing comma immediately
+/// before a closing delimiter — rustfmt emits it in the multi-line form
+/// of a call and omits it in the single-line form, and it is
+/// syntactically inert, so keeping it would make these pins hostage to
+/// reflow without adding any signal.
+fn normalise_tokens(src: &str) -> String {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut chars = src.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_whitespace() {
+            continue;
+        }
+        if c.is_alphanumeric() || c == '_' {
+            let mut word = String::from(c);
+            while let Some(&next) = chars.peek() {
+                if next.is_alphanumeric() || next == '_' {
+                    word.push(next);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            tokens.push(word);
+        } else {
+            tokens.push(c.to_string());
+        }
+    }
+    let mut out: Vec<&str> = Vec::with_capacity(tokens.len());
+    for (i, tok) in tokens.iter().enumerate() {
+        if tok == ","
+            && matches!(
+                tokens.get(i + 1).map(String::as_str),
+                Some(")") | Some("]") | Some("}")
+            )
+        {
+            continue;
+        }
+        out.push(tok);
+    }
+    out.join(" ")
 }
 
 fn shim_source_path() -> PathBuf {
@@ -254,6 +348,25 @@ fn shim_walk_model(src: &str) -> ShimWalk {
          teach this parser the new shape",
     );
     let arms_src = braced_body(&loop_body, match_at + MATCH_HDR.len() - 1);
+
+    // The loop body must be the `match protocol` block and NOTHING else.
+    // Pinning only the arm bodies would leave a statement placed inside
+    // the loop but OUTSIDE the match entirely invisible — the same
+    // blind spot, one level up. `if depth > 3 { break; }` before the
+    // match would silently cut the resolvable chain length while every
+    // arm still matched its pinned literal.
+    // +1 steps past the match block's own closing brace, which sits at
+    // `match_at + MATCH_HDR.len() + arms_src.len()`.
+    let match_end = match_at + MATCH_HDR.len() + arms_src.len() + 1;
+    let outside: String = [&loop_body[..match_at], &loop_body[match_end..]].concat();
+    assert!(
+        outside.trim().is_empty(),
+        "the shim's extension-header walk loop body contains statements outside the `match \
+         protocol` block. Those are invisible to this guard's per-arm pins and can change the \
+         resolvable chain length on their own. Re-establish the #4555 parity by hand and teach \
+         this parser the new shape. Text outside the match:\n{outside}"
+    );
+
     let arms = split_match_arms(&arms_src);
     assert!(
         arms.len() >= 4,
@@ -263,15 +376,21 @@ fn shim_walk_model(src: &str) -> ShimWalk {
         arms.iter().map(|(p, _)| p).collect::<Vec<_>>()
     );
 
-    // --- classify each arm by the advance arithmetic in its body ---
+    // --- classify each arm by whitespace-normalised body EQUALITY ---
+    // NOT a substring test: a `contains("+ 1) * 8")` classifier accepts
+    // an arm that also advances by a further 8, or that prepends
+    // `if opt[1] == 0 { break; }` (which rejects the ordinary 8-byte
+    // HbH/DestOpt and so destroys parity for essentially every real
+    // chain). Equality makes both of those panic here instead.
     let classify = |pattern: &str, body: &str| -> EhClass {
-        if body.contains("+ 1) * 8") {
+        let normalised = normalise_tokens(body);
+        if normalised == normalise_tokens(SHIM_GENERIC_ARM_BODY) {
             EhClass::Generic
-        } else if body.contains("+ 2) * 4") {
+        } else if normalised == normalise_tokens(SHIM_AUTH_ARM_BODY) {
             EhClass::Auth
-        } else if body.contains("FragHdr") {
+        } else if normalised == normalise_tokens(SHIM_FRAGMENT_ARM_BODY) {
             EhClass::Fragment
-        } else if body.trim() == "break" {
+        } else if normalised == "break" {
             // `NEXTHDR_NONE => break` is the No-Next-Header terminal;
             // `_ => break` is the stop-here-this-is-L4 default.
             if pattern.trim() == "_" {
@@ -281,8 +400,15 @@ fn shim_walk_model(src: &str) -> ShimWalk {
             }
         } else {
             panic!(
-                "shim walk arm {pattern:?} has an unrecognised body {body:?} — re-establish the \
-                 #4555 parity by hand and teach this parser the new shape"
+                "shim walk arm {pattern:?} does not match any pinned arm body. This guard models \
+                 the shim from source rather than executing it, so an arm body it does not \
+                 recognise means the model — and the resolvable-chain-length claim built on it — \
+                 is no longer known to be right. Re-establish the #4555 parity by hand and update \
+                 the pinned literal.\n  got:      {normalised}\n  generic:  {}\n  auth:     {}\n  \
+                 fragment: {}",
+                normalise_tokens(SHIM_GENERIC_ARM_BODY),
+                normalise_tokens(SHIM_AUTH_ARM_BODY),
+                normalise_tokens(SHIM_FRAGMENT_ARM_BODY),
             )
         }
     };
@@ -489,27 +615,32 @@ fn shim_ipv6_ext_walk_matches_userspace_walker() {
     );
 }
 
-/// NEGATIVE CONTROL for the mutation proof: everything here is true both
-/// WITH and WITHOUT the #4555 shim fix, so a red here means the harness
-/// itself broke rather than the parity guard firing.
+/// NEGATIVE CONTROL for the mutation proof.
 ///
-/// - ESP (50) is terminal on both sides in every revision (encrypted
-///   payload, unreadable inner next-header).
-/// - TCP (6) / UDP (17) / ICMPv6 (58) are terminal on both sides.
-/// - Hop-by-Hop (0), Routing (43) and DestOpt (60) are generic on both
-///   sides — they were already in the shim's arm before #4555.
-/// - AH (51) and Fragment (44) keep their own arms on both sides.
-/// - No-Next-Header (59) is a terminal-with-no-L4 on both sides.
-/// - Both walkers resolve a 0-, 1- and 5-header chain, and neither
-///   resolves a 16-header chain — chain lengths on the same side of both
-///   the pre-#4555 bound (6) and the post-#4555 bound (7).
+/// This test deliberately touches NOTHING on the shim side — no
+/// `read_shim_source`, no `shim_walk_model`. It exercises only this
+/// crate's walker and the probe harness the guard above measures with.
+/// That independence is the whole point: every mutation used to prove the
+/// guard is a mutation of the SHIM source, so a control that shared the
+/// source model would red alongside the guard and prove nothing. An
+/// earlier draft did exactly that — it asserted shim-side classifications
+/// too, and went red on any mutation that made an arm unparseable,
+/// co-signing instead of controlling. Those shim-side assertions were
+/// redundant anyway: the guard's 256-value comparison already covers them.
 ///
-/// If this test reds under the mutation it is a co-signer, not a control.
+/// A red HERE means this crate's `walk_ipv6_ext_chain` changed, or the
+/// probe construction broke — not that the shim drifted.
+///
+/// - ESP (50) is terminal (encrypted payload, unreadable inner
+///   next-header); TCP (6) / UDP (17) / ICMPv6 (58) are terminal.
+/// - Hop-by-Hop (0), Routing (43) and DestOpt (60) are generic.
+/// - AH (51) and Fragment (44) have their own advance arithmetic.
+/// - No-Next-Header (59) is a terminal with no L4.
+/// - Chains of 0, 1 and 5 headers resolve; 16 does not. Those lengths sit
+///   on the same side of both the pre-#4555 bound (6) and the post-#4555
+///   bound (7), so they are invariant across the fix.
 #[test]
 fn shim_ext_parity_negative_control_unchanged_classifications() {
-    let src = read_shim_source();
-    let shim = shim_walk_model(&src);
-
     for (proto, want) in [
         (0u8, EhClass::Generic), // Hop-by-Hop
         (43, EhClass::Generic),  // Routing
@@ -523,12 +654,6 @@ fn shim_ext_parity_negative_control_unchanged_classifications() {
         (58, EhClass::Terminal), // ICMPv6
     ] {
         assert_eq!(
-            shim.classes[usize::from(proto)],
-            want,
-            "shim classification of next-header {proto} changed; this is pre-#4555 behaviour \
-             the fix must not perturb"
-        );
-        assert_eq!(
             userspace_class(proto),
             want,
             "userspace classification of next-header {proto} changed; this is pre-#4555 \
@@ -536,23 +661,22 @@ fn shim_ext_parity_negative_control_unchanged_classifications() {
         );
     }
 
-    // Chain lengths both bounds agree on, either side of the fix.
+    // Chain lengths invariant across the fix, measured on the userspace
+    // walker only.
     for n in [0usize, 1, 5] {
         assert!(
             userspace_resolves_chain_of(n),
             "userspace walker stopped resolving a {n}-header chain"
-        );
-        assert!(
-            n <= shim.max_resolvable_ext_headers(),
-            "shim stopped resolving a {n}-header chain"
         );
     }
     assert!(
         !userspace_resolves_chain_of(16),
         "userspace walker resolved a 16-header chain; it is meant to fail closed"
     );
-    assert!(
-        16 > shim.max_resolvable_ext_headers(),
-        "shim resolved a 16-header chain; it is meant to give up"
+    assert_eq!(
+        userspace_max_resolvable_ext_headers(),
+        MAX_IPV6_EXT_HEADERS - 1,
+        "the userspace walker's resolvable chain length no longer matches its own bound; the \
+         #4555 guard's measurement harness is broken, independently of the shim"
     );
 }

@@ -1,3 +1,90 @@
+## 2026-08-01 — #4555 review fold: guard scope, headroom tripwire, two doc corrections
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Hostile review returned MERGE-NEEDS-MINOR with no MAJOR; the
+  parity reasoning was independently reproduced. Four folds.
+
+  **M-1 (the real one) — the parity guard was scoped narrower than its
+  claim.** The shim side is a source MODEL, never executed, and each arm
+  was classified by a SUBSTRING of its body (`contains("+ 1) * 8")`), so
+  anything else in the body was invisible. The reviewer demonstrated two
+  mutations that passed GREEN: adding `+ 8` to the generic advance, and
+  prepending `if opt[1] == 0 { break; }` to the generic arm. The second
+  is the sharp one — `HdrExtLen == 0` IS the ordinary 8-byte
+  HbH/DestOpt, so that edit destroys parity for essentially every real
+  chain while the guard reports ok. Replaced the substring classifier
+  with whitespace-normalised token EQUALITY against pinned arm-body
+  literals. The normaliser tokenises (identifier runs vs single
+  punctuation chars) so rustfmt reflow is invisible, and drops a
+  trailing comma before a closing delimiter, which rustfmt emits only in
+  the multi-line form — without that the pins would be hostage to
+  reflow.
+
+  Closed the SIBLING hole the same mutations imply: pinning arm bodies
+  still left a statement placed inside the loop but OUTSIDE the `match`
+  entirely invisible (`if offset > 200 { break; }` would cut the
+  resolvable chain length with every arm still matching). The loop body
+  must now contain the match block and nothing else.
+
+  Also made the negative control a REAL control. It previously called
+  `shim_walk_model` too, so it went red alongside the guard on any
+  mutation that made an arm unparseable — co-signing, not controlling.
+  It is now shim-source-free: it exercises only this crate's walker and
+  the probe harness. Its shim-side assertions were redundant anyway, the
+  guard's 256-value comparison subsumes them. With that change the
+  control stays green under all six mutations.
+
+  **M-4 — no durability gate on verifier headroom.** Every gate added
+  after #1864 is BINARY, which is exactly how master reached 0.92%
+  headroom with everything green. Added `ShimVerifierStats` +
+  `VerifyUserspaceShimObjectStats` (loads with `LogLevelStats`, parses
+  `processed N insns (limit M)`), a committed floor
+  `UserspaceShimMinVerifierHeadroomPct = 3.0`, and a `shimverify` exit
+  code 4 for "loads but below the floor". Chose a HARD FAIL with an
+  `XPF_SHIM_ALLOW_LOW_HEADROOM=1` override, mirroring the existing
+  `XPF_SHIM_ALLOW_UNPINNED_INSTALL` precedent in the same recipe — the
+  failure mode being guarded is a dead dataplane, so default-closed is
+  right. An unparseable stats line WARNS and passes: that means "cannot
+  measure", and blocking builds over a kernel log-format difference
+  guards nothing. Existing signatures kept, so the runtime deploy
+  pre-flight (`VerifyEmbeddedUserspaceShim`) and the root-gated tests
+  are untouched. Threading the override through `sudo` explicitly was
+  necessary — sudo scrubs the environment, so the documented escape
+  hatch would otherwise have been a silent no-op.
+
+  **M-2 — the doc understated the blast radius.** `parsed.protocol` is
+  not only a session-key ingredient: it drives PRE-SESSION dispatch that
+  terminates in the shim (ESP and non-native GRE to `cpumap_or_pass`, WG
+  steering, ICMPv6 NDP 133-137 to `pass_local_control`). Verified all
+  four sites firsthand, plus the userspace `meta.protocol` consumers
+  (NAT64 translation and L4 checksum recomputation in `frame/mod.rs`).
+  So widening the type set re-routes packets between the XSK and kernel
+  paths: `IPv6 → Mobility → ESP` reached userspace over XSK before and
+  now goes to the kernel — the correct direction (userspace-dp
+  classifies it as ESP too, and `DestOpt → ESP` already behaved that
+  way), but a wider change than "session key parity" and the reason this
+  wants a cluster smoke.
+
+  **M-3 — an incorrect safety claim.** "Getting it wrong in either
+  direction is fail-closed" was wrong: only shim-BELOW-userspace is. At
+  bound 8 the shim would stamp a full 5-tuple and `l4_offset` for a
+  chain userspace refuses with `OverLimit` and hand that meta to
+  consumers that trust it. Corrected in the constant's doc comment and
+  in the README, stating the two directions separately.
+
+  Validation: `make generate` PASS, now reporting `processed 947188
+  insns (limit 1000000), headroom 5.28%`; the object is BIT-IDENTICAL to
+  the pre-fold one (the shim change was doc-comment-only). The headroom
+  gate was proven to FIRE — with the floor temporarily raised to 6.0 the
+  same object exits 4, and `XPF_SHIM_ALLOW_LOW_HEADROOM=1` returns it to
+  exit 0 with a warning. Six-mutation matrix: all six red the guard
+  (previously two passed green), all six leave the control green.
+- **File(s)**: userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  userspace-xdp/src/lib.rs, pkg/dataplane/verify_userspace_shim.go,
+  pkg/dataplane/verify_userspace_shim_headroom_test.go,
+  pkg/dataplane/build-userspace-xdp.sh, cmd/shimverify/main.go,
+  pkg/dataplane/README.md, _Log.md
+
 ## 2026-08-01 — #4555 IPv6 extension-header walk parity: shim vs userspace
 
 - **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity)
