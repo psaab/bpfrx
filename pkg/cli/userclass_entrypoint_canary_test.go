@@ -534,29 +534,44 @@ func productionRoots(t *testing.T) []string {
 }
 
 // isNestedModuleRoot reports whether path is the root of a NESTED Go module —
-// a directory carrying its own go.mod.
+// a directory carrying its own go.mod FILE.
 //
-// `go build ./...` does not descend into these, so production code inside one is
-// not part of the module under test and must not be judged by this canary. The
+// `go list ./...` does not descend into these, so a file inside one is not a
+// package of the module under test and must not be judged by this canary. The
 // walk was widened from pkg/+cmd/ to the module root to close a real gap (a new
 // top-level package would otherwise go unscanned), and that widening is what
 // made this necessary.
 //
-// Not hypothetical: this repository carries an in-tree checkout with its own
-// go.mod holding the pre-#6701 os.Getenv("USER"), which reddened three canaries
-// on files outside the module under test while build and vet stayed clean —
-// i.e. `make test` would have failed on a maintainer's box for code this module
-// never compiles.
+// THE !IsDir() TERM IS LOAD-BEARING. cmd/go's own rule (modload/search.go)
+// requires a regular file, so a DIRECTORY named `go.mod` is not a module marker
+// and `go list ./...` walks straight through it. Without the term,
+// `mkdir -p somepkg/go.mod` makes this canary skip a package the toolchain
+// genuinely compiles, and a planted violation inside it PASSES (#6706 MINOR-1,
+// proven by mutation).
+//
+// The trigger was NOT an in-tree checkout, as an earlier revision of this
+// comment said. `git ls-files | grep go.mod` returns exactly one line, the
+// repository root; the nested module is `wt-master/`, an UNTRACKED agent-scratch
+// worktree. That is why the skip keys on the go.mod marker rather than a name.
+//
+// Scope limit: "not in `./...`" is not "does not ship" — a `replace` directive
+// would link a nested module into the binary while `go list ./...` still reports
+// zero packages for it. Not live today (one tracked go.mod, no replace
+// directives), but the reasoning does not extend that far (#6706 MINOR-2).
 func isNestedModuleRoot(path string) bool {
-	_, err := os.Stat(filepath.Join(path, "go.mod"))
-	return err == nil
+	info, err := os.Stat(filepath.Join(path, "go.mod"))
+	return err == nil && !info.IsDir()
 }
 
 // skipCanaryDir reports directories the canary walks must not descend into:
 // every dotted directory (.git, .github, and any tooling scratch or nested
 // worktree an agent leaves behind), plus the usual vendored/generated trees.
 func skipCanaryDir(name string) bool {
-	if strings.HasPrefix(name, ".") {
+	// Dotted AND underscored: `go list ./...` excludes both, so scanning either
+	// produces a red that `go build ./...` and `go vet ./...` disagree with —
+	// the same false-red class this skip exists to prevent (#6706 MINOR-7,
+	// reproduced at the previous head with an `_scratch/` directory).
+	if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") {
 		return true
 	}
 	switch name {

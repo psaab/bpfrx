@@ -74156,3 +74156,71 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/config/compiler_prewalk.go, pkg/config/compiler_system_login_gates.go,
   pkg/config/compiler_system_login_packed_6662_test.go, docs/system-login.md,
   docs/junos-config-display-reference.md, _Log.md
+
+## 2026-08-01 — #6706 fold r5: make the canaries bind, and match os/user's passwd rule
+
+- **Timestamp**: 2026-08-01
+- **Action**: Fold all eight findings from the r4 hostile re-gate on PR #6706
+  at `072d3e9f1`. Four were guards that could not fire or fired falsely; four
+  were claims that overstated what the code does.
+- **F1 (MATERIAL — guard could not fire).** `isNestedModuleRoot` used a bare
+  `os.Stat`, so a DIRECTORY named `go.mod` counted as a module marker and made
+  both #6701 canaries skip a package the toolchain genuinely compiles. cmd/go's
+  own rule (`modload/search.go`) requires a regular file. Added `!info.IsDir()`
+  in both `pkg/osident/user_env_canary_test.go` and
+  `pkg/cli/userclass_entrypoint_canary_test.go`. PROVEN: `mkdir -p evilpkg/go.mod`
+  with a planted `os.Getenv("USER")` — `go list ./evilpkg` names it, `go build`
+  rc 0, canary REDs at `evilpkg/evil.go:5:28`; drop the `!IsDir()` term and it
+  goes GREEN with the violation still live.
+- **F7 (false red).** `./...` also excludes `_`-prefixed directories; the walks
+  did not. PROVEN: `_scratch/old.go` with a violation — `go list ./...` reports
+  0 packages for it, build rc 0, and the canary FAILED. Both walks now skip `_`
+  as well as `.`; head is green and reverting reproduces the false red. This is
+  the exact false-red class the previous commit set out to kill.
+- **F3 (control did not bind the code under test).** The anti-vacuity control
+  re-implemented the AST predicate inline, so breaking the real walk's copy left
+  the control green. Extracted the single `identityEnvHits(fset, f)` used by
+  BOTH. PROVEN: disabling the selector match inside the shared predicate now
+  reds the control with "the REAL detector found []", build rc 0. Its comment
+  previously named three failure modes it did not cover; it now states that it
+  binds the predicate only, that wrong-root/wrong-suffix are caught by the
+  `filesScanned == 0` Fatal, and that swallowed parse errors are caught by
+  nothing.
+- **F4 (fail-closed availability regression + a test that could not bind it).**
+  `lookupPasswd` accepted rows os/user rejects: NIS compat lines (`+alice::1000`),
+  truncated rows (`bob:x:1000`), and zero-padded uids (`01000` via Atoi). Because
+  this lookup fails CLOSED on ambiguity, one stray row at a LIVE uid turned a
+  legitimate operator into ReasonAmbiguousUID and denied them — and it falsified
+  the package doc's claim that every uid with a local row resolves identically.
+  Now mirrors `matchUserIndexValue` exactly: >= 7 fields, name non-empty and not
+  `+`/`-`, uid compared as a STRING, uid and gid both parseable. Verified against
+  the stdlib source, not the review's summary. The existing test could not bind
+  this (all six subtests stayed green through the change), so the fixture gained
+  one of each rejected shape AT alice's own uid. PROVEN: reverting the parity fix
+  reds exactly the five uid-1000 cases and leaves the four unrelated ones green,
+  build+vet rc 0.
+- **F5 (the only false runtime claim).** Decision 1 said an explicit class wins
+  "for any uid including 0". It does not: matching is BY NAME, so with uid 0
+  shared by root and toor, osident reports ReasonAmbiguousUID with an empty Name,
+  nothing matches, and `system login user toor class read-only` is silently not
+  applied — the caller gets super-user. Left as-is (uid 0 owns the config DB, the
+  daemon and the secrets; the alternative locks the console out over a passwd
+  alias) but no longer misreported: the comment states the case, and the reason
+  string no longer claims "uid 0 is not configured under `system login`" when it
+  may well be, under a name we failed to resolve.
+- **F2/F6/F8 (claims).** The skip's justification said "this repository carries
+  an in-tree checkout with its own go.mod" — false; `git ls-files | grep go.mod`
+  returns one line, the root. The subject is `wt-master/`, UNTRACKED agent
+  scratch, which is precisely why the skip must key on the marker rather than a
+  name. Also recorded that "not in `./...`" is not "does not ship" (a `replace`
+  directive would link a nested module in), and that the detector requires a
+  string LITERAL, so `const k = "USER"; os.Getenv(k)` escapes the "at any site"
+  headline. Reachability swept: zero production `syscall.Getenv`/`os.LookupEnv`
+  identity reads; three `os.Environ()` uses, all `pkg/upgrade` building a child
+  environment.
+- **Validation**: `go build ./...` rc 0, `go vet ./...` rc 0, `go test -race`
+  on osident/cli/config/daemon clean, full `go test ./...` clean, `gofmt` clean.
+  Build+vet asserted rc 0 under every mutation, so no red above is a build break.
+- **File(s)**: pkg/osident/user_env_canary_test.go, pkg/osident/osident.go,
+  pkg/osident/passwd_6706_test.go, pkg/cli/userclass_entrypoint_canary_test.go,
+  pkg/cli/identity.go, _Log.md

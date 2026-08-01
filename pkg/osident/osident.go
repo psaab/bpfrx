@@ -183,15 +183,39 @@ func lookupPasswd(path string, uid int) (string, error) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		// name:passwd:uid:gid:gecos:home:shell. NIS compat lines (`+`, `-`)
-		// and truncated rows carry no parsable uid and are skipped by the
-		// Atoi below rather than by sniffing the name.
+		// name:passwd:uid:gid:gecos:home:shell.
+		//
+		// These row filters MIRROR os/user's pure-Go matchUserIndexValue
+		// exactly, and every one of them is load-bearing rather than defensive.
+		// An earlier revision of this comment claimed NIS compat lines (`+`,
+		// `-`) and truncated rows "carry no parsable uid and are skipped by the
+		// Atoi below". That is false — `+alice::1000:...` yields "+alice" and
+		// `alice:x:1000` yields "alice" — and because this lookup fails CLOSED
+		// on ambiguity, a single stray row for a LIVE uid would have turned a
+		// legitimate operator into ReasonAmbiguousUID and denied them, where
+		// the standard library resolves the name fine (#6706 MINOR-4).
+		// Diverging from stdlib here does not narrow safely; it narrows into an
+		// availability failure, and it would falsify this package's own claim
+		// that for every uid with a local row the resolved name is identical.
+		//
+		//   - >= 7 fields: stdlib requires `bytes.Count(line, ':') >= 6`, so a
+		//     truncated row is not a passwd entry at all.
+		//   - name non-empty and not `+`/`-`: NIS compat lines are directives,
+		//     not accounts.
+		//   - uid compared as a STRING: stdlib does `parts[idx] != value`, so
+		//     `01000` does not match uid 1000. Atoi alone would accept it.
+		//   - uid and gid must both parse.
 		fields := strings.Split(line, ":")
-		if len(fields) < 3 || fields[0] == "" {
+		if len(fields) < 7 || fields[0] == "" || fields[0][0] == '+' || fields[0][0] == '-' {
 			continue
 		}
-		rowUID, convErr := strconv.Atoi(strings.TrimSpace(fields[2]))
-		if convErr != nil || rowUID != uid {
+		if fields[2] != strconv.Itoa(uid) {
+			continue
+		}
+		if _, convErr := strconv.Atoi(fields[2]); convErr != nil {
+			continue
+		}
+		if _, convErr := strconv.Atoi(fields[3]); convErr != nil {
 			continue
 		}
 		if !containsString(names, fields[0]) {

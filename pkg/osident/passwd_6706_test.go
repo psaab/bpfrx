@@ -140,6 +140,9 @@ alice:x:1000:1000:Alice:/home/alice:/bin/bash
 alice:x:1000:1000:Alice again:/home/alice:/bin/bash
 twin-a:x:2001:2001::/home/a:/bin/sh
 twin-b:x:2001:2001::/home/b:/bin/sh
++alice::1000:1000:::
+shortbob:x:1000
+zeropad:x:01000:1000:Carol:/home/carol:/bin/sh
 `
 	path := filepath.Join(t.TempDir(), "passwd")
 	if err := os.WriteFile(path, []byte(file), 0o600); err != nil {
@@ -152,14 +155,27 @@ twin-b:x:2001:2001::/home/b:/bin/sh
 		wantName string
 		wantErr  error
 	}{
+		// Every case below with uid 1000 is load-bearing for the SAME assertion:
+		// alice must still resolve. This lookup fails CLOSED on ambiguity, so a
+		// row this parser accepts but os/user rejects does not merely add
+		// noise — it turns a legitimate operator into ReasonAmbiguousUID and
+		// DENIES them. The fixture therefore carries one of each stdlib-rejected
+		// shape at alice's OWN uid; before the parity fix each of these alone
+		// made "ordinary row" fail with errAmbiguousUID (#6706 MINOR-4).
 		{"ordinary row", 1000, "alice", nil},
 		{"duplicate identical row is one account", 1000, "alice", nil},
+		// `+alice::1000:1000:::` — a NIS compat directive, not an account.
+		// stdlib rejects on parts[0][0] == '+'.
+		{"NIS compat line at a live uid does not alias it", 1000, "alice", nil},
+		// `shortbob:x:1000` — three fields. stdlib requires >= 6 colons.
+		{"truncated row at a live uid does not alias it", 1000, "alice", nil},
+		// `zeropad:x:01000:...` — Atoi("01000") == 1000, but stdlib compares the
+		// uid field as a STRING, so it never matches uid 1000.
+		{"zero-padded uid does not alias the same numeric uid", 1000, "alice", nil},
 		{"uid 0", 0, "root", nil},
 		{"absent uid", 4242, "", errNoPasswdEntry},
 		{"two distinct names share a uid", 2001, "", errAmbiguousUID},
-		// A NIS compat line and a truncated row carry no parsable uid, so they
-		// must not be mistaken for uid 0 (Atoi("") fails) — otherwise `+::::::`
-		// would name the root caller `+`.
+		// `+::::::` and `-badnis` must not be mistaken for uid 0.
 		{"malformed rows do not alias uid 0", 5, "", errNoPasswdEntry},
 	}
 	for _, tt := range tests {

@@ -70,18 +70,36 @@ const ClassRootDefault = "super-user"
 //
 // Order of decision:
 //
-//  1. an EXPLICIT class on a matching `system login user` always wins, for any
-//     uid including 0. An explicit class is an instruction, and honouring it can
-//     only narrow privilege.
+//  1. an EXPLICIT class on a matching `system login user` wins. An explicit
+//     class is an instruction, and honouring it can only narrow privilege.
+//
+//     "MATCHING" IS BY NAME, so this cannot win when the caller has no name.
+//     An earlier revision of this list said an explicit class wins "for any uid
+//     including 0", which is false in exactly one reachable case: uid 0 shared
+//     by two passwd accounts (the classic root/toor alias). osident then
+//     reports ReasonAmbiguousUID with an empty Name, configuredClass matches
+//     nothing, and decision 2 hands back ClassRootDefault — so
+//     `system login user toor class read-only` is NOT applied and the caller
+//     gets super-user (#6706 MINOR-5).
+//
+//     This is left as-is rather than fixed, and the reason is the same one
+//     stated above: uid 0 already owns the config database, the daemon process
+//     and the on-disk secrets, so it is not a boundary xpf can enforce — the
+//     alternative would be locking the console out over a passwd alias. What is
+//     NOT acceptable is misreporting it, so the reason string below names the
+//     ambiguity instead of claiming root is unconfigured.
+//
 //  2. uid 0 otherwise gets ClassRootDefault — whether root is absent from
 //     `system login` or is LISTED WITH NO CLASS. See rootOmittedClass below for
 //     why the omission case must not fail closed.
+//
 //  3. a non-root account listed with an EMPTY class -> ClassUnidentified. RBAC
 //     is configured and this account is listed but says nothing about what it
 //     may do; falling through to the empty-string legacy mode would grant it
 //     everything. (Pre-#6662 a packed `user alice class ops;` compiled exactly
 //     this shape from a config that READS as restrictive, which is how the two
 //     defects compounded.)
+//
 //  4. anything else — unresolvable identity, or an OS account absent from
 //     `system login` -> ClassUnidentified.
 func ResolveLoginClass(login *config.LoginConfig, id osident.Identity) (string, string) {
@@ -94,6 +112,16 @@ func ResolveLoginClass(login *config.LoginConfig, id osident.Identity) (string, 
 			return ClassRootDefault, fmt.Sprintf(
 				"uid 0 (%s) is listed under `system login` with no class; applying the root "+
 					"default rather than locking the console out on an omission", id)
+		}
+		// Do not claim uid 0 is unconfigured when we simply could not tell. With
+		// an ambiguous or unreadable passwd the caller may well BE configured
+		// under a name we failed to resolve, and saying otherwise sends the
+		// operator to add a stanza that already exists (#6706 MINOR-5).
+		if !id.Resolved() {
+			return ClassRootDefault, fmt.Sprintf(
+				"uid 0 could not be named (%s), so no `system login user` stanza could be "+
+					"matched; applying the root default. Any explicit class configured for "+
+					"this account was NOT applied", unidentifiedReason(id))
 		}
 		return ClassRootDefault, fmt.Sprintf(
 			"uid 0 (%s) is not configured under `system login`; applying the root default", id)

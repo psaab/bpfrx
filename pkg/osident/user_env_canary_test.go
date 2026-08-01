@@ -53,12 +53,7 @@ func TestNoIdentityFromEnvironment_6701(t *testing.T) {
 	}
 	roots := []string{repoRoot}
 	var filesScanned int
-
-	type hit struct {
-		pos string
-		env string
-	}
-	var hits []hit
+	var hits []identityEnvHit
 
 	for _, root := range roots {
 		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -71,13 +66,17 @@ func TestNoIdentityFromEnvironment_6701(t *testing.T) {
 				if path != root && strings.HasPrefix(d.Name(), ".") {
 					return fs.SkipDir
 				}
+				// Skip directories `./...` itself excludes, so this canary
+				// cannot red on code `go build ./...` never compiles — that
+				// false red is what #6706 MINOR-7 was about, and an underscore
+				// directory reproduced it at the previous head.
+				if path != root && strings.HasPrefix(d.Name(), "_") {
+					return fs.SkipDir
+				}
 				// Skip NESTED GO MODULES — a directory below the root carrying
-				// its own go.mod. `go build ./...` skips them, so code inside
-				// one is not part of the module under test and must not be
-				// judged by this canary. Not hypothetical: this repository
-				// carries an in-tree checkout with its own go.mod holding the
-				// pre-#6701 os.Getenv("USER"), which reddened this canary on
-				// code this module never builds.
+				// its own go.mod FILE. See isNestedModuleRoot for why the
+				// file-vs-directory distinction is load-bearing rather than
+				// pedantic.
 				if path != root && isNestedModuleRoot(path) {
 					return fs.SkipDir
 				}
@@ -96,33 +95,7 @@ func TestNoIdentityFromEnvironment_6701(t *testing.T) {
 				return nil // not our business to police unparsable files
 			}
 			filesScanned++
-			ast.Inspect(f, func(n ast.Node) bool {
-				call, ok := n.(*ast.CallExpr)
-				if !ok || len(call.Args) != 1 {
-					return true
-				}
-				sel, ok := call.Fun.(*ast.SelectorExpr)
-				if !ok {
-					return true
-				}
-				pkgIdent, ok := sel.X.(*ast.Ident)
-				if !ok || pkgIdent.Name != "os" {
-					return true
-				}
-				if sel.Sel.Name != "Getenv" && sel.Sel.Name != "LookupEnv" {
-					return true
-				}
-				lit, ok := call.Args[0].(*ast.BasicLit)
-				if !ok || lit.Kind != token.STRING {
-					return true
-				}
-				name, uerr := strconv.Unquote(lit.Value)
-				if uerr != nil || !identityEnvVars[name] {
-					return true
-				}
-				hits = append(hits, hit{pos: fset.Position(call.Pos()).String(), env: name})
-				return true
-			})
+			hits = append(hits, identityEnvHits(fset, f)...)
 			return nil
 		})
 		if err != nil {
@@ -142,31 +115,29 @@ func TestNoIdentityFromEnvironment_6701(t *testing.T) {
 	}
 }
 
-// TestUserEnvCanaryDetectsAViolation_6701 proves the canary above is not
-// vacuous: it exercises the same AST predicate against a synthetic source file
-// that DOES read os.Getenv("USER"), and requires a hit. Without this, a walk
-// that silently matched nothing (wrong root, wrong suffix filter, parse errors
-// swallowed) would report PASS forever.
-func TestUserEnvCanaryDetectsAViolation_6701(t *testing.T) {
-	const src = `package p
-
-import "os"
-
-func who() string {
-	u := os.Getenv("USER")
-	if u == "" {
-		u = os.Getenv("LOGNAME")
-	}
-	_ = os.Getenv("XPF_UNRELATED")
-	return u
+// identityEnvHit is one production read of an identity-naming environment
+// variable, located for the operator.
+type identityEnvHit struct {
+	pos string
+	env string
 }
-`
-	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "synthetic.go", src, 0)
-	if err != nil {
-		t.Fatalf("parse synthetic: %v", err)
-	}
-	var found []string
+
+// identityEnvHits is THE detector. Both the repository walk above and the
+// anti-vacuity control below call it, which is the point: an earlier revision
+// re-implemented this predicate inline in the control, so breaking the walk's
+// copy left the control green and the control proved nothing about the code
+// under test (#6706 MINOR-3, demonstrated by mutation).
+//
+// KNOWN LIMIT, stated rather than implied by silence: the argument must be a
+// string LITERAL. `const k = "USER"; os.Getenv(k)` is not detected, nor is
+// os.Environ() scanned by hand, nor syscall.Getenv. That is a deliberate
+// trade — keying on the literal is what keeps os.Getenv("XPF_*"), PATH and
+// TMPDIR out of the result — but it means the headline "at any site" is bounded
+// by "written as a literal". A sweep at the current head found zero production
+// syscall.Getenv/os.LookupEnv identity reads and three os.Environ() uses, all in
+// pkg/upgrade assembling a child process environment, none an identity read.
+func identityEnvHits(fset *token.FileSet, f *ast.File) []identityEnvHit {
+	var out []identityEnvHit
 	ast.Inspect(f, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok || len(call.Args) != 1 {
@@ -191,28 +162,83 @@ func who() string {
 		if uerr != nil || !identityEnvVars[name] {
 			return true
 		}
-		found = append(found, name)
+		out = append(out, identityEnvHit{pos: fset.Position(call.Pos()).String(), env: name})
 		return true
 	})
+	return out
+}
+
+// TestUserEnvCanaryDetectsAViolation_6701 proves the DETECTOR is not vacuous:
+// it runs identityEnvHits — the very function the walk above calls, not a copy
+// of it — against a synthetic file that does read os.Getenv("USER"), and
+// requires both hits.
+//
+// What it does and does not cover, stated precisely because an earlier revision
+// of this comment claimed more: it binds the PREDICATE (selectors, literal
+// unquoting, and the identityEnvVars set — empty that map and this test reds).
+// It does NOT bind the walk's traversal. A wrong root or a wrong suffix filter
+// is caught by the `filesScanned == 0` Fatal in the test above; swallowed parse
+// errors are caught by nothing here, and remain a known gap.
+func TestUserEnvCanaryDetectsAViolation_6701(t *testing.T) {
+	const src = `package p
+
+import "os"
+
+func who() string {
+	u := os.Getenv("USER")
+	if u == "" {
+		u = os.Getenv("LOGNAME")
+	}
+	_ = os.Getenv("XPF_UNRELATED")
+	return u
+}
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "synthetic.go", src, 0)
+	if err != nil {
+		t.Fatalf("parse synthetic: %v", err)
+	}
+	var found []string
+	for _, h := range identityEnvHits(fset, f) {
+		found = append(found, h.env)
+	}
 	if len(found) != 2 {
-		t.Fatalf("synthetic detector found %v, want exactly [USER LOGNAME] — the canary predicate "+
-			"does not actually detect the defect it claims to guard", found)
+		t.Fatalf("the REAL detector found %v in the synthetic violation, want exactly "+
+			"[USER LOGNAME] — identityEnvHits does not detect the defect it claims to guard", found)
 	}
 }
 
 // isNestedModuleRoot reports whether path is the root of a NESTED Go module —
-// a directory carrying its own go.mod.
+// a directory carrying its own go.mod FILE.
 //
-// `go build ./...` does not descend into these, so production code inside one is
-// not part of the module under test. This canary walks the module ROOT (widened
-// from pkg/+cmd/ so a new top-level package cannot go unscanned), and that
-// widening is what makes this skip necessary.
+// `go list ./...` does not descend into these, so a file inside one is not a
+// package of the module under test and cannot be judged by this canary without
+// producing a red that `go build ./...` and `go vet ./...` both disagree with.
+// This canary walks the module ROOT (widened from pkg/+cmd/ so a new top-level
+// package cannot go unscanned), and that widening is what makes the skip
+// necessary.
 //
-// Not hypothetical: this repository carries an in-tree checkout with its own
-// go.mod holding the pre-#6701 os.Getenv("USER"). Without this skip the canary
-// reds on files outside the module under test while build and vet stay clean —
-// i.e. `make test` fails for code this module never compiles.
+// THE !IsDir() TERM IS LOAD-BEARING, not defensive tidiness. cmd/go's own rule
+// (modload/search.go) requires a regular file; a DIRECTORY named `go.mod` is not
+// a module marker, so `go list ./...` walks straight through it. Without the
+// term, `mkdir -p somepkg/go.mod` makes this canary skip a package the toolchain
+// genuinely compiles — a planted os.Getenv("USER") inside it PASSES. Proven by
+// mutation: with the term, the planted violation reds by file:line:col; without
+// it, green (#6706 MINOR-1).
+//
+// The trigger was NOT an in-tree checkout, as an earlier revision of this
+// comment said. `git ls-files | grep go.mod` returns exactly one line, the
+// repository root. The nested module is `wt-master/`, an UNTRACKED agent-scratch
+// worktree — which is precisely why the skip must key on the go.mod marker
+// rather than on a name a future scratch directory might not use.
+//
+// Scope limit worth naming: "not in `./...`" is not the same as "does not ship".
+// A `replace example.com/nested => ./nested` directive would link a nested
+// module into the binary while `go list ./...` still reports zero packages for
+// it, so this skip would hide it. Not live today — one tracked go.mod, no
+// replace directives — but the reasoning does not extend that far (#6706
+// MINOR-2).
 func isNestedModuleRoot(path string) bool {
-	_, err := os.Stat(filepath.Join(path, "go.mod"))
-	return err == nil
+	info, err := os.Stat(filepath.Join(path, "go.mod"))
+	return err == nil && !info.IsDir()
 }
