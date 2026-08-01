@@ -23,8 +23,43 @@ import (
 // with the recognized-token SSOT and the Rust classifier.
 func TestHostInboundNftRenderGoldenByteIdentical(t *testing.T) {
 	svc := map[string][2][]string{
-		"all":               {nil, nil},
-		"any-service":       {nil, nil},
+		// #3226: `all` renders the union of the named system-services (the
+		// xpf-only `gre` and `r-exec`/`rexec` extensions excluded), in
+		// HostInboundAllExpansionServices order. Before #3226 it rendered
+		// NOTHING here because it took the hostInboundAllowsAll blanket-accept
+		// branch instead. `tcp dport 113` appears via the expanded ident-reset
+		// and carries the `reject with tcp reset` VERDICT (verdicts are
+		// asserted separately — this golden pins the match FRAGMENTS).
+		//
+		// FAIL-ON-REVERT, all three directions of the #3226 fold:
+		//
+		//   ABSENT — `tcp dport 512`: Juniper's schema enumerates rlogin and rsh
+		//     but not rexec, so a Junos-correct `all` never opens 512.
+		//   PRESENT — the Junos services xpf previously did not recognize that
+		//     have a port Juniper FIXES: tcp 2901 (reverse-ssh), tcp 2900
+		//     (reverse-telnet) from explicit YANG `default` statements, and udp
+		//     8503 (lsselfping) from RFC 7746.
+		//   ABSENT — `udp dport 28762` and `tcp/udp dport 7`. An earlier revision
+		//     rendered these for r2cp and rpm, from a draft SUGGESTION and a
+		//     configurable range FLOOR respectively. Neither is a Junos default,
+		//     so both opened a port with no listener on every `all` zone while
+		//     still denying whatever port the operator had configured.
+		"all": {
+			{"udp dport { 67, 68 }", "udp dport { 67, 68 }", "udp dport 53", "tcp dport 53", "tcp dport 79", "tcp dport 21", "tcp dport 80", "tcp dport 443", "tcp dport 113", "udp dport { 500, 4500 }", "udp dport { 500, 4500 }", "udp dport 3503", "udp dport 8503", "tcp dport 830", "tcp dport { 22, 830 }", "udp dport 123", "icmp type echo-request", "tcp dport 513", "tcp dport 514", "tcp dport 2901", "tcp dport 2900", "tcp dport 513", "tcp dport 514", "udp dport 5060", "tcp dport 5060", "udp dport 161", "udp dport 162", "tcp dport 22", "tcp dport { 22, 830 }", "tcp dport 23", "udp dport 69", "udp dport 33434-33523", "tcp dport 80", "tcp dport 443", "tcp dport 3221", "tcp dport 3220"},
+			{"udp dport { 546, 547 }", "udp dport 53", "tcp dport 53", "tcp dport 79", "tcp dport 21", "tcp dport 80", "tcp dport 443", "tcp dport 113", "udp dport { 500, 4500 }", "udp dport { 500, 4500 }", "udp dport 3503", "udp dport 8503", "tcp dport 830", "tcp dport { 22, 830 }", "udp dport 123", "icmpv6 type echo-request", "tcp dport 513", "tcp dport 514", "tcp dport 2901", "tcp dport 2900", "tcp dport 513", "tcp dport 514", "udp dport 5060", "tcp dport 5060", "udp dport 161", "udp dport 162", "tcp dport 22", "tcp dport { 22, 830 }", "tcp dport 23", "udp dport 69", "udp dport 33434-33523", "tcp dport 80", "tcp dport 443", "tcp dport 3221", "tcp dport 3220"},
+		},
+		"any-service": {nil, nil},
+		// #3226 fold: Junos services xpf has no authoritative listening port for
+		// (config.HostInboundUnportedSystemServices) render NOTHING on either
+		// family. They stay recognized and stay in the `all` union above,
+		// contributing no fragment. Earlier revisions rendered "udp dport 28762"
+		// for r2cp and "tcp/udp dport 7" for rpm from a draft SUGGESTION and a
+		// configurable range FLOOR respectively; neither is a Junos default.
+		"appqoe":            {nil, nil},
+		"high-availability": {nil, nil},
+		"r2cp":              {nil, nil},
+		"rpm":               {nil, nil},
+		"tcp-encap":         {nil, nil},
 		"bootp":             {{"udp dport { 67, 68 }"}, nil},
 		"dhcp":              {{"udp dport { 67, 68 }"}, nil},
 		"dhcpv6":            {nil, {"udp dport { 546, 547 }"}},
@@ -38,6 +73,7 @@ func TestHostInboundNftRenderGoldenByteIdentical(t *testing.T) {
 		"ike":               {{"udp dport { 500, 4500 }"}, {"udp dport { 500, 4500 }"}},
 		"ipsec":             {{"udp dport { 500, 4500 }"}, {"udp dport { 500, 4500 }"}},
 		"lsping":            {{"udp dport 3503"}, {"udp dport 3503"}},
+		"lsselfping":        {{"udp dport 8503"}, {"udp dport 8503"}},
 		"netconf":           {{"tcp dport 830"}, {"tcp dport 830"}},
 		"netconf-ssh":       {{"tcp dport { 22, 830 }"}, {"tcp dport { 22, 830 }"}},
 		"ntp":               {{"udp dport 123"}, {"udp dport 123"}},
@@ -45,6 +81,8 @@ func TestHostInboundNftRenderGoldenByteIdentical(t *testing.T) {
 		"r-exec":            {{"tcp dport 512"}, {"tcp dport 512"}},
 		"r-login":           {{"tcp dport 513"}, {"tcp dport 513"}},
 		"r-sh":              {{"tcp dport 514"}, {"tcp dport 514"}},
+		"reverse-ssh":       {{"tcp dport 2901"}, {"tcp dport 2901"}},
+		"reverse-telnet":    {{"tcp dport 2900"}, {"tcp dport 2900"}},
 		"rexec":             {{"tcp dport 512"}, {"tcp dport 512"}},
 		"rlogin":            {{"tcp dport 513"}, {"tcp dport 513"}},
 		"rsh":               {{"tcp dport 514"}, {"tcp dport 514"}},
@@ -134,19 +172,43 @@ func TestHostInboundNftRenderGoldenByteIdentical(t *testing.T) {
 // would make the classifier report "not admitted" while the nft chain still
 // admits (or vice versa).
 func TestHostInboundIdentResetRejectMarkerMatchesNftVerdict(t *testing.T) {
+	// #3226: the builder assigns the verdict per EXPANDED token
+	// (hostInboundMatchSet walks config.HostInboundServiceTokenExpansion), so
+	// the marker/verdict agreement is a property of the CONCRETE tokens. Walking
+	// the expansion covers every authored token including `all`, whose expansion
+	// contains ident-reset.
 	for tok := range config.KnownHostInboundSystemServices {
-		reject := false
-		for _, fam := range []string{"ip", "ip6"} {
-			for _, m := range config.HostInboundServiceMatch(tok, fam) {
-				if m.Reject {
-					reject = true
+		for _, sub := range config.HostInboundServiceTokenExpansion(tok) {
+			reject := false
+			for _, fam := range []string{"ip", "ip6"} {
+				for _, m := range config.HostInboundServiceMatch(sub, fam) {
+					if m.Reject {
+						reject = true
+					}
 				}
 			}
+			wantReject := hostInboundServiceAction(sub) == hostInboundReject
+			if reject != wantReject {
+				t.Errorf("service %q (via authored token %q): SSOT Reject marker = %v but nft verdict reject = %v — the marker and the nft verdict must agree", sub, tok, reject, wantReject)
+			}
 		}
-		wantReject := hostInboundServiceAction(tok) == hostInboundReject
-		if reject != wantReject {
-			t.Errorf("service %q: SSOT Reject marker = %v but nft verdict reject = %v — the marker and the nft verdict must agree", tok, reject, wantReject)
+	}
+
+	// #3226 fail-open guard: `all` MUST expand to a set containing a Reject
+	// tuple, and the builder must not flatten it to an accept. If
+	// hostInboundMatchSet went back to keying the verdict on the AUTHORED token,
+	// `all`'s tcp/113 fragment would render `accept` and ADMIT ident probes the
+	// per-token form resets.
+	sawReject := false
+	for _, sub := range config.HostInboundServiceTokenExpansion("all") {
+		for _, m := range config.HostInboundServiceMatch(sub, "ip") {
+			if m.Reject {
+				sawReject = true
+			}
 		}
+	}
+	if !sawReject {
+		t.Errorf("`system-services all` expansion must contain the ident-reset Reject tuple (#3226)")
 	}
 }
 

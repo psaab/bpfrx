@@ -561,6 +561,44 @@ From zone: guest, To zone: lan
     accepting `SSH` would itself reintroduce a split-brain). Recognized tokens
     (`ssh`, `ping`, `all`, `any-service`, `ipsec`/`ike`, `protocols all`
     routing-scoped per #3199, …) are unaffected.
+  - **`system-services all` is the named-service union (#3226):** `all` follows
+    the Junos definition — "traffic from the defined system services available
+    on the Routing Engine" — and expands to the union of the named
+    system-service tokens, so the zone keeps its catch-all host-inbound drop.
+    It does NOT admit raw IP protocols (GRE/OSPF/PIM/VRRP or future
+    protocol numbers) or unlisted TCP/UDP ports; list those explicitly under
+    `system-services` / `protocols`. The two xpf-only tokens are excluded from
+    the expansion and must be listed explicitly: `gre` (Junos has no
+    raw-IP-protocol system-service) and `r-exec`/`rexec` (Juniper's host-inbound
+    list documents `rlogin` and `rsh` but not rexec, and tcp/512 is opened by no
+    other token). Conversely, the services in Juniper's schema that xpf did not
+    previously recognize — `r2cp`, `reverse-ssh`, `reverse-telnet`, `rpm`,
+    `lsselfping`, `tcp-encap`, `appqoe` and `high-availability` — are now
+    accepted at commit and included in the union, so scoping `all` cannot strand
+    a defined service. The union's membership is derived from Juniper's
+    published YANG schema, vendored at
+    `pkg/config/testdata/junos-es-conf-security@2024-01-01.yang.gz`.
+    `any-service` remains the packet-wide escape hatch and is the one-token way
+    to restore the pre-#3226 behaviour. Both draw a WARN-only commit advisory.
+    See `docs/host-inbound-service-matrix.md`.
+  - **Junos services xpf admits nothing for (#3226):** `r2cp`, `rpm`,
+    `tcp-encap`, `appqoe` and `high-availability` are real Junos services, so
+    they COMMIT — but xpf found no authoritative host-inbound listening tuple
+    for any of them and deliberately opens nothing rather than guessing. This is
+    a CHOICE under uncertainty, not an inference: a guessed port is wrong in both
+    directions at once (it opens a port with no listener AND still denies the one
+    in use, invisibly), whereas opening nothing is wrong in one direction and is
+    announced at commit. Their traffic is DENIED, and `system-services
+    any-service` is the ONLY remedy — an lo0 input filter does not help on
+    either enforcement path. (On AF_XDP, #3485 evaluates host-inbound before the
+    filter and never reaches it after a deny. On the kernel path `xpf_lo0` is
+    priority 0 and `xpf_hostinbound` is 10, but nftables `accept` ends the
+    current BASE CHAIN, not the hook — the packet advances to the next base
+    chain and still hits the catch-all drop. Only `drop` is terminal for the
+    hook.) Naming one of these tokens draws a WARN-only commit advisory saying
+    exactly this. Ports xpf DOES open for this group:
+    `reverse-telnet` tcp/2900 and `reverse-ssh` tcp/2901 (explicit YANG platform
+    defaults) and `lsselfping` udp/8503 (RFC 7746 — not 3503, which is `lsping`).
   - **IS-IS host-inbound (L2 no-op, #3311):** `host-inbound-traffic protocols
     isis` is now ACCEPTED at commit (vSRX parity) — before #3311 it was
     hard-rejected even though IS-IS routing is supported via FRR, a fail-closed

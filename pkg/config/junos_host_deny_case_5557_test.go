@@ -53,15 +53,56 @@ func TestJunosHostExemptionFlagsCaseInsensitive_5557(t *testing.T) {
 // case-sensitive `== "all"` let an upper-case `ALL` escape both. Reverting to
 // the raw comparison makes these assertions RED.
 func TestHostInboundFullAdmitServiceCaseInsensitive_5557(t *testing.T) {
-	for _, tok := range []string{"ALL", "All", "Any-Service", "ANY-SERVICE", " all "} {
+	for _, tok := range []string{"Any-Service", "ANY-SERVICE", " any-service "} {
 		if !HostInboundFullAdmitService(tok) {
 			t.Errorf("HostInboundFullAdmitService(%q) = false, want true (case/space-insensitive full admit)", tok)
 		}
 	}
-	// Non-full-admit tokens stay negative regardless of case.
-	for _, tok := range []string{"ssh", "SSH", "ike", "IKE", "protocols-all", ""} {
+	// Non-full-admit tokens stay negative regardless of case. #3226 moved
+	// `all` into this list: it is no longer a packet-wide admit but the union
+	// of the named system-services.
+	for _, tok := range []string{"ssh", "SSH", "ike", "IKE", "protocols-all", "",
+		"all", "ALL", "All", " all "} {
 		if HostInboundFullAdmitService(tok) {
 			t.Errorf("HostInboundFullAdmitService(%q) = true, want false", tok)
+		}
+	}
+}
+
+// TestHostInboundServiceTokenExpansionCaseInsensitive_5557_3226 carries the
+// #5557 case-fold contract onto the surface #3226 moved `all` to. Enforcement
+// lower-cases every token (unionHostInboundTokens / lowerTokens in
+// pkg/dataplane/userspace, the Rust classify_system_service), but the coarse
+// junos-host shield feeds this helper the RAW authored case. A case-sensitive
+// `== "all"` would leave a lenient-loaded upper-case `ALL` unexpanded, so the
+// shield would not see the `ike` / `ident-reset` the expansion contains and
+// would drop the very IKE it exists to exempt — the #5557 failure mode on a new
+// surface.
+func TestHostInboundServiceTokenExpansionCaseInsensitive_5557_3226(t *testing.T) {
+	for _, tok := range []string{"all", "ALL", "All", " all "} {
+		got := HostInboundServiceTokenExpansion(tok)
+		if len(got) < 2 {
+			t.Fatalf("HostInboundServiceTokenExpansion(%q) = %v, want the multi-token named-service union", tok, got)
+		}
+		var sawIKE, sawIdent bool
+		for _, e := range got {
+			switch e {
+			case "ike":
+				sawIKE = true
+			case "ident-reset":
+				sawIdent = true
+			}
+		}
+		if !sawIKE || !sawIdent {
+			t.Errorf("HostInboundServiceTokenExpansion(%q) must contain ike and ident-reset (the coarse-shield exemptions), got %v", tok, got)
+		}
+	}
+	// Every other token — including the full-admit escape hatch, which is not a
+	// per-service union at all — stands only for itself.
+	for _, tok := range []string{"ssh", "any-service", "gre", "sssh"} {
+		got := HostInboundServiceTokenExpansion(tok)
+		if len(got) != 1 || got[0] != tok {
+			t.Errorf("HostInboundServiceTokenExpansion(%q) = %v, want [%q]", tok, got, tok)
 		}
 	}
 }

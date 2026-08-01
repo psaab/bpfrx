@@ -14,27 +14,52 @@ import (
 // zone-level tokens kept first in their original order and override-only tokens
 // appended. Either argument may be nil. Junos host-inbound is additive across
 // the two levels, so an interface admits a service when EITHER level lists it.
+// #3226 fold: the union itself is now config.UnionHostInboundTokens, shared with
+// the commit-time advisories. Before that this file owned the only union and the
+// advisories computed their own per-RAW-STANZA view, so the two reasoned about
+// DIFFERENT objects and the advice contradicted enforcement (a zone-level
+// `any-service` with a per-interface `rpm` warned rpm was DENIED while this
+// builder full-admitted it). This wrapper keeps the lower-casing the dataplane
+// needs for map keying — config's shared union preserves authored case for the
+// display surfaces — and keeps the local name its callers already use.
 func unionHostInboundTokens(zoneHI, ifaceHI *config.HostInboundTraffic) (svc, proto []string) {
-	add := func(dst *[]string, seen map[string]bool, src []string) {
-		for _, t := range src {
-			t = strings.ToLower(strings.TrimSpace(t))
-			if t == "" || seen[t] {
-				continue
-			}
-			seen[t] = true
-			*dst = append(*dst, t)
-		}
-	}
-	seenS, seenP := map[string]bool{}, map[string]bool{}
+	var zs, zp, is, ip []string
 	if zoneHI != nil {
-		add(&svc, seenS, zoneHI.SystemServices)
-		add(&proto, seenP, zoneHI.Protocols)
+		zs, zp = zoneHI.SystemServices, zoneHI.Protocols
 	}
 	if ifaceHI != nil {
-		add(&svc, seenS, ifaceHI.SystemServices)
-		add(&proto, seenP, ifaceHI.Protocols)
+		is, ip = ifaceHI.SystemServices, ifaceHI.Protocols
 	}
-	return svc, proto
+	return lowerDedup(config.UnionHostInboundTokens(zs, is)),
+		lowerDedup(config.UnionHostInboundTokens(zp, ip))
+}
+
+// lowerDedup lower-cases, trims and de-duplicates in one pass, preserving first
+// -seen order. The shared config union dedups on the AUTHORED token (it
+// preserves case for the display surfaces), so `SSH` and `ssh` both survive it
+// and would collapse to a duplicate `ssh` here. Plain lowerTokens does not
+// dedup, so it would leak that duplicate into the dataplane view — harmless for
+// the classifier, which is set-based, but a gratuitous change to a snapshot
+// other tests compare exactly. Dedup on the LOWER-CASED token, exactly as this
+// function did before it delegated.
+func lowerDedup(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, t := range in {
+		t = strings.ToLower(strings.TrimSpace(t))
+		if t == "" || seen[t] {
+			continue
+		}
+		seen[t] = true
+		out = append(out, t)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // mergeHostInboundTraffic returns a NEW *config.HostInboundTraffic whose token

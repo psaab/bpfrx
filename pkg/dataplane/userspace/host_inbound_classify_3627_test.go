@@ -73,10 +73,24 @@ func TestClassifyHostInboundReportsAdmittingToken(t *testing.T) {
 // TestClassifyHostInboundFullAdmit: `system-services all` admits every tuple,
 // even one that is otherwise indeterminate (no port).
 func TestClassifyHostInboundFullAdmit(t *testing.T) {
-	cfg := cfgWithHostInbound("edge", []string{"all"}, nil)
+	// #3226: `any-service` is the packet-wide full admit. It reports a
+	// token-admit for ANY tuple — here a TCP query with no port, which no
+	// per-service match could satisfy.
+	cfg := cfgWithHostInbound("edge", []string{"any-service"}, nil)
 	got := ClassifyHostInbound(cfg, "edge", 6, true, 0, nil, "ip")
-	if got.Status != HostInboundTokenAdmit || got.Token != "all" {
-		t.Fatalf("full-admit: got %+v, want token-admit all", got)
+	if got.Status != HostInboundTokenAdmit || got.Token != "any-service" {
+		t.Fatalf("full-admit: got %+v, want token-admit any-service", got)
+	}
+	// `all` is NOT a full admit any more: it expands to the named-service
+	// union, so an unlisted port is DENIED and a raw IP protocol is DENIED.
+	// Restoring `all` to config.HostInboundFullAdmitService turns both RED
+	// (the full-admit branch reports token-admit before the tuple is examined).
+	scoped := cfgWithHostInbound("edge", []string{"all"}, nil)
+	if got := ClassifyHostInbound(scoped, "edge", 6, true, 9999, nil, "ip"); got.Status != HostInboundDenied {
+		t.Fatalf("system-services all tcp/9999: got %+v, want denied (#3226 — `all` is not a full admit)", got)
+	}
+	if got := ClassifyHostInbound(scoped, "edge", 89, true, 0, nil, "ip"); got.Status != HostInboundDenied {
+		t.Fatalf("system-services all ospf/proto-89: got %+v, want denied (#3226 — `all` is not a full admit)", got)
 	}
 }
 

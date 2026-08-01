@@ -1340,7 +1340,13 @@ fn build_forwarding_state_enforces_host_inbound_traffic() {
                 host_inbound_protocols: vec![],
                 ..Default::default()
             },
-            // control: all — fully open (heartbeat zone).
+            // control: `system-services all` — the heartbeat zone as every
+            // shipped HA config authors it. #3226: `all` is the union of the
+            // named system-services, NOT a packet-wide admit, so this zone is
+            // open to ssh/https/snmp/... but NOT to raw IP protocols. (In a
+            // real cluster the control zone is lifeline-only, so it never even
+            // contributes host-inbound addresses — see
+            // pkg/dataplane/userspace.BuildZoneHostInboundViews.)
             ZoneSnapshot {
                 name: "control".into(),
                 id: 13,
@@ -1405,14 +1411,25 @@ fn build_forwarding_state_enforces_host_inbound_traffic() {
         "lan dhcp deny"
     );
 
-    // control (id 13): all → admit everything.
+    // control (id 13): `all` → the named system-service union (#3226). SSH and
+    // SNMP are admitted; an arbitrary port and a raw IP protocol are DENIED.
+    // Before #3226 `all` short-circuited to a packet-wide admit, so both of the
+    // deny assertions below were admits.
     assert!(
-        host_inbound_admits(&state, 13, 6, 12345, false, 0),
-        "control all tcp"
+        host_inbound_admits(&state, 13, 6, 22, false, 0),
+        "control all ssh (named system-service)"
     );
     assert!(
-        host_inbound_admits(&state, 13, 89, 0, false, 0),
-        "control all ospf"
+        host_inbound_admits(&state, 13, 17, 161, false, 0),
+        "control all snmp (named system-service)"
+    );
+    assert!(
+        !host_inbound_admits(&state, 13, 6, 12345, false, 0),
+        "control all must DENY an unlisted tcp port (#3226 — `all` is not packet-wide)"
+    );
+    assert!(
+        !host_inbound_admits(&state, 13, 89, 0, false, 0),
+        "control all must DENY ospf/proto-89 (#3226 — a routing protocol needs a `protocols` entry)"
     );
 
     // #3705: legacy (id 14) is a KNOWN configured=false zone → now default-DENY,

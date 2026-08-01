@@ -254,11 +254,13 @@ mod flowless_local_delivery_tests {
     }
 
     // (b) NO over-gating: a flowless packet the zone DOES admit must still be
-    // delivered. `host-inbound-traffic system-services all` admits every host-
-    // bound packet regardless of L4 → Deliver.
+    // delivered. `host-inbound-traffic system-services any-service` admits every
+    // host-bound packet regardless of L4 → Deliver. (#3226: `any-service`, not
+    // `all`, is the packet-wide admit — a flowless packet carries no port, so
+    // the named-service union `all` now expands to would not match it.)
     #[test]
     fn flowless_admit_all_delivered() {
-        let fw = fw_with_host_inbound(ZONE, &["all"], &[]);
+        let fw = fw_with_host_inbound(ZONE, &["any-service"], &[]);
         assert_eq!(
             verdict(&fw, &flowless_flow(PROTO_TCP), flowless_meta(PROTO_TCP), ZONE),
             FlowlessLocalVerdict::Deliver,
@@ -283,7 +285,7 @@ mod flowless_local_delivery_tests {
     // protocol-only term matches regardless of L4 presence.
     #[test]
     fn flowless_lo0_discard_not_delivered() {
-        let mut fw = fw_with_host_inbound(ZONE, &["all"], &[]);
+        let mut fw = fw_with_host_inbound(ZONE, &["any-service"], &[]);
         fw.filter_state = crate::filter::parse_filter_state(
             &[crate::FirewallFilterSnapshot {
                 name: "protect-re".into(),
@@ -313,7 +315,7 @@ mod flowless_local_delivery_tests {
     #[test]
     fn flowless_junos_host_deny_not_delivered() {
         use crate::test_zone_ids::TEST_TRUST_ZONE_ID;
-        let mut fw = fw_with_host_inbound(TEST_TRUST_ZONE_ID, &["all"], &[]);
+        let mut fw = fw_with_host_inbound(TEST_TRUST_ZONE_ID, &["any-service"], &[]);
         let zone_name_to_id: rustc_hash::FxHashMap<String, u16> =
             [("trust".to_string(), TEST_TRUST_ZONE_ID)]
                 .into_iter()

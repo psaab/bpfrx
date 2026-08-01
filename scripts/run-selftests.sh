@@ -91,6 +91,7 @@ SH_SCRIPTS="
 scripts/image/xpf-day0-config
 scripts/image/xpf-grow-root
 scripts/image/xpf-uefi-slots
+scripts/image/xpf-kernel-promote
 scripts/image/incus-agent-setup
 scripts/image/test-grow-root.sh
 scripts/dist/selftest.sh
