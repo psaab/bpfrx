@@ -1,11 +1,10 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v63 — r62 findings folded (Codex NEEDS-REVISION
-  3M/2m; AGY PLAN-READY-WITH-NITS 0M/1m — the rg_active
-  rendering entry, IS Codex m2; Claude SMR
-  PLAN-READY-WITH-NITS 0M/1m — the acceptance queued-empty
-  term, IS Codex fold-3; all three confirm the §4.7
-  structure); pending convergence review r63
+- **Status**: DRAFT v64 — r63 findings folded (Codex NEEDS-REVISION
+  5M/1m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS
+  0M/1m — the arm-ID-reuse leg, IS Codex M3's testing half;
+  all three confirm the §4.7 structure); pending convergence
+  review r64
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -2813,6 +2812,7 @@
   legs (m2); and the 120s figure is corrected to the 3s
   small-request deadline / ~67s maximum-snapshot figures (m3,
   `process_control.go:31-56,85-103,129-142`).
+
   v63: r62 convergence — the acceptance predicate is augmented
   not replaced, the admission gate gains its shutdown-only
   owner, the aliases retire with their registrations, and the
@@ -2864,6 +2864,55 @@
   at `daemon_ha_fabric.go:52-53` cannot satisfy the test) and
   the second 120s instance is corrected (Codex fold-6's
   catch).
+  v64: r63 convergence — the shutdown gate is daemon-scope and
+  adds no new wait, the callback gains the manager-epoch
+  discipline, the alias purge covers every retirement path,
+  the queued-empty term reaches the remaining copies, and the
+  join respects the shutdown budget (Codex NEEDS-REVISION
+  5M/1m, folds 3 FOLDED / 3 PARTIAL, structure confirmed; AGY
+  PLAN-READY 6/6 with 3 fresh attacks FAILED, structure
+  confirmed; SMR PLAN-READY-WITH-NITS 0M/1m — the
+  arm-ID-reuse leg, IS Codex M3's testing half): (a) THE
+  DAEMON-SCOPE GATE WITH NO NEW WAIT (Codex M1 + M5, both
+  verified: the v63 text said "a named call" without a name
+  or owner, and the existing sequential worst-case waits —
+  5s apply drain + 3s aggregator + 3s IPsec join + 2s HA
+  clear + 5s session-sync stop — already reach at least 23s
+  against `TimeoutStopSec=20`, `test/incus/xpfd.service:11`):
+  the gate is DAEMON-SCOPE state (not manager-owned — a
+  re-arm failure clears `d.dp`,
+  `daemon_run_naming.go:230-235`, which would strand a
+  manager-owned gate while reserved work survives); the
+  callback HOLDS applySem THROUGH ITS BODY, so the EXISTING
+  5s apply drain (`daemon_run_shutdown.go:50-58`) already
+  waits for every in-flight callback — the close-admission
+  step flips the flag and adds NO new sequential wait. (b)
+  THE MANAGER-EPOCH DISCIPLINE (Codex M2, verified the exact
+  bootstrap interleaving: epoch A reserves and launches the
+  detached callback then stalls; bootstrap Teardown RETAINS
+  the manager, `bootstrap.go:470-475`, and Teardown/stopLocked
+  reset NEITHER `xskBoundNotified` NOR `OnXSKBound`,
+  `manager.go:421-433,478-482`, `process.go:197-267`; epoch B
+  restarts the same object, so A's callback can resume with
+  the fences open while B never produces its own readiness
+  callback, `daemon_apply_interfaces.go:57-77`): the
+  reusable-Teardown path RESETS the one-shot flag and CLEARS
+  the callback registration state, AND the callback carries
+  the manager's lifecycle generation — a fire in a later
+  manager epoch abandons by generation mismatch. (c) THE
+  ALIAS PURGE ON EVERY RETIREMENT PATH (Codex M3): the
+  neutral/cancellation exits (the debt-drop exits for an
+  absent helper or an already-armed later apply,
+  `manager_worker_arm_5134.go:42-54`) now invoke the
+  reverse-alias purge too, and §9 gains the ARM-ID-REUSE leg
+  (a delayed duplicate completion against a reused arm ID is
+  ignored — the testing half + SMR m1). (d) THE QUEUED-EMPTY
+  TERM IN THE REMAINING COPIES (Codex M4): the §5.1
+  convergence definition, both post-reactivation summaries,
+  and the rendering inventory all carry the term now. (e) The
+  absolute wording is rewritten to the bounded form (Codex
+  m1): teardown waits up to the five-second bound and may
+  overlap ONE already-entered mutation.
 
 ---
 
@@ -5613,7 +5662,8 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   predicate again (not merely digest equality): the pre-quiesce
   digest match AND the full persist-health aggregate AND
   ActiveApplied AND the apply-failure/last-outcome terms AND
-  the no-pending-outstanding term (r56 Codex m2) on
+  the no-pending-outstanding term (r56 Codex m2) AND the
+  no-QUEUED-reservation-outstanding term (r63 Codex M4) on
   BOTH nodes — the two-digest discipline: the post-restart
   verification compares against the fence-time (post-quiesce)
   digest; the re-activation re-verifies against the
@@ -6844,7 +6894,12 @@ v20 history). The delivery is TWO units:
   A/X completion retire the NEW live arm and false-green
   convergence): every reverse alias targeting a registration
   is REMOVED atomically when that registration completes or
-  terminally retires, with the §9 arm-ID-reuse/stale-duplicate
+  terminally retires — on EVERY retirement path including the
+  neutral/cancellation exits (r63 Codex M3, verified the
+  omission: the debt-drop exits for an absent helper or an
+  already-armed later apply,
+  `manager_worker_arm_5134.go:42-54`, were not named) — with
+  the §9 arm-ID-reuse/stale-duplicate
   regression —
   so an in-flight
   arm's completion is never lost across a supersession;
@@ -6858,7 +6913,8 @@ v20 history). The delivery is TWO units:
   FAILED), so a clean completion or a
   success-after-rejection rehabilitates the predicate, while
   the predicate requires count==0 AND no pending arm
-  outstanding AND lastOK; and the snapshot CARRIES the pending
+  outstanding AND no QUEUED reservation outstanding AND
+  lastOK (r63 Codex M4's remaining-copy alignment); and the snapshot CARRIES the pending
   state (r53 Codex M3 = r53 AGY m1 = r53 SMR m2): the current
   attempt token + a pending-arm count (incremented when an arm
   defers, decremented on a token-matching completion),
@@ -7056,7 +7112,23 @@ v20 history). The delivery is TWO units:
   deferred-overlay set from the CURRENT config, abandoning if
   the state it was installed for no longer stands — so a
   stale closure is a no-op by construction, with the §9
-  stale-callback leg; AND the callback is lifecycle-total and
+  stale-callback leg; AND the MANAGER-EPOCH discipline (r63
+  Codex M2, verified the bootstrap interleaving: epoch A
+  reserves and launches the detached callback, then stalls;
+  bootstrap Teardown RETAINS the manager,
+  `bootstrap.go:470-475`, and Teardown/stopLocked reset
+  NEITHER `xskBoundNotified` NOR `OnXSKBound`,
+  `manager.go:421-433,478-482`, `process.go:197-267`; epoch B
+  restarts the same object, so A's callback can resume with
+  the fences open while B never produces its own readiness
+  callback — treating XSK as already bound,
+  `daemon_apply_interfaces.go:57-77`): the reusable-Teardown
+  path RESETS the one-shot flag and CLEARS the callback
+  registration state (Teardown/stopLocked reset
+  `xskBoundNotified` and clear `OnXSKBound`), AND the
+  callback carries the manager's lifecycle generation — a
+  fire in a later manager epoch abandons by generation
+  mismatch; AND the callback is lifecycle-total and
   outcome-truthful (r58 Codex M2, both halves verified: (a)
   shutdown can release applySem before the detached callback
   runs, `daemon_run_shutdown.go:50-64,214-230` — so the
@@ -7088,9 +7160,24 @@ v20 history). The delivery is TWO units:
   and retains the object for re-arm, `bootstrap.go:470-475` —
   a monotonic gate buried in both hooks would break the
   bootstrap re-arm): the gate closes ONLY on process
-  shutdown, via a named close-admission/join call in
-  `runShutdownSequence` AHEAD of the subsystem teardown
-  (`daemon_run_shutdown.go:214-230`) — Teardown never closes
+  shutdown, via the CONCRETELY-NAMED mechanism (r63 Codex M1's
+  implementability demand + M5's budget proof, both verified:
+  the existing sequential worst-case waits — 5s apply drain +
+  3s aggregator + 3s IPsec join + 2s HA clear + 5s
+  session-sync stop — already reach at least 23s against
+  `TimeoutStopSec=20`, `test/incus/xpfd.service:11`, so NO new
+  sequential wait can be added): the gate is DAEMON-SCOPE
+  state (an admission flag + the in-flight tracking, NOT
+  manager-owned — a re-arm failure clears `d.dp`,
+  `daemon_run_naming.go:230-235`, which would strand a
+  manager-owned gate while reserved work survives), the
+  callback HOLDS applySem THROUGH ITS BODY (it already
+  acquires it at fire per the v58 closure), so the EXISTING
+  5s apply drain (`daemon_run_shutdown.go:50-58`) already
+  waits for every in-flight callback — the close-admission
+  step in `runShutdownSequence` adds NO new sequential wait
+  (it flips the flag and the existing drain does the join) —
+  Teardown never closes
   it — the shutdown closes
   admission FIRST and then joins the reserved set, and the
   join's 5s bound is the disposition — a callback still
@@ -7105,7 +7192,11 @@ v20 history). The delivery is TWO units:
   for in-flight callbacks before the dataplane teardown; the
   callback's body is bounded netlink work, and the 5s bound
   remains the safety net),
-  never mutating live state during teardown; (b) the callback's
+  with the teardown overlap honestly bounded (r63 Codex m1's
+  wording correction): teardown waits up to the five-second
+  bound and may overlap ONE already-entered mutation — the
+  callback abandons at its next fence check — never mutating
+  BEYOND one in-flight call during teardown; (b) the callback's
   outcome reporting is DEEP (r59 Codex M2b, verified:
   `ensureFabricIPVLAN` ignores parent-up errors, logs
   MTU/address errors, discards existing-child MTU/up errors,
@@ -8500,7 +8591,8 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      pre-quiesce digest match AND the full persist-health
      aggregate AND ActiveApplied AND the apply-failure/
      last-outcome terms AND the no-pending-outstanding term
-     (r59 Codex m2) AND the authority check on BOTH nodes) against
+     (r59 Codex m2) AND the no-QUEUED-reservation-outstanding
+     term (r63 Codex M4) AND the authority check on BOTH nodes) against
      the PRE-QUIESCE digest captured before (1a) — the
      two-digest discipline: post-restart verification against
      the fence-time digest, re-activation verification against
@@ -8661,6 +8753,13 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      can no longer combine text A with ActiveApplied(B) —
      exercised with the high-water advance assertion
      (`sync_conn_config.go:319-324,390-395`);
+     (h2n) the ARM-ID-REUSE leg (r63 Codex M3's testing half +
+     r63 SMR m1 — referenced since v63 but never named): a
+     delayed duplicate completion against a REUSED arm ID is
+     ignored, with the reverse-alias purge verified at every
+     retirement path (completion, terminal failure, and the
+     neutral/cancellation exits,
+     `manager_worker_arm_5134.go:42-54`);
      (h2l) the HA-CLEAR-DEBT legs (r61 Codex m2): the
      `pendingHAStateClear` debt's registration, supersession,
      alias completion, and ledger serialization (the existing
