@@ -1304,10 +1304,12 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			// WHAT THIS BUYS, stated precisely because the obvious rationale is
 			// FALSE and a false rationale talks the next reader out of checking:
 			// this loop is NOT the last line of defence in front of the Rust
-			// dataplane. Only the FIRST value is ever lowered — the userspace
+			// dataplane. Only ONE value is ever lowered — the userspace
 			// snapshot builder sets `ExternalIP: rule.Match`
-			// (pkg/dataplane/userspace/nat_static.go), rule.Match is
-			// MatchAddresses[0] (compiler_nat_static.go), and MatchAddresses has
+			// (pkg/dataplane/userspace/nat_static.go), rule.Match is the value
+			// nodeVal selected from the LAST authored statement
+			// (compiler_nat_static.go) — NOT MatchAddresses[0]; the two differ
+			// whenever a bracketed list precedes a repeated sibling. MatchAddresses has
 			// NO consumer outside these validators. A malformed value in slot 2
 			// is therefore dropped by the Go lowering and never reaches
 			// `parse_nat_prefix` at all.
@@ -2263,7 +2265,7 @@ func validateStaticNATMatchAddressesStrict(cfg *Config) error {
 						"effect and the rest would be silently ignored — author "+
 						"one rule per external prefix (#6659)",
 					rs.Name, rule.Name, len(rule.MatchAddresses),
-					rule.MatchAddresses, rule.MatchAddresses[0])
+					rule.MatchAddresses, rule.Match)
 			}
 		}
 	}

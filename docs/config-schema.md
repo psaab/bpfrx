@@ -951,8 +951,14 @@ The mirror-image rule applies to a validator that already exists: widen it
 per-value only where the OPERAND is the value being widened. The static-NAT
 `match destination-address` host-route and `/0` checks moved to a per-address
 block-pair classification, but the `then static-nat prefix` checks and the #3202
-port check kept the SCALAR pair, because only `MatchAddresses[0]` is ever
-lowered (`ExternalIP: rule.Match`, `pkg/dataplane/userspace/nat_static.go`) — an
+port check kept the SCALAR pair, because only ONE value is ever lowered
+(`ExternalIP: rule.Match`, `pkg/dataplane/userspace/nat_static.go`). That value
+is what `nodeVal` selected from the LAST authored `match destination-address`
+statement — within a bracketed list, that statement's first value — so it is
+**not** in general `MatchAddresses[0]`: author a bracket followed by a repeated
+sibling and `MatchAddresses[0]`, `MatchAddresses[len-1]` and `rule.Match` are
+three different prefixes. Reading the scalar is therefore the only way to name
+the prefix that actually installs — an
 "any authored match address pairs with the target" flag would SUPPRESS a true
 complaint about the pair that actually installs. For the same reason the
 match-side widening buys DIAGNOSTIC completeness, not a dataplane backstop: the

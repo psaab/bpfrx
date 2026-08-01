@@ -924,7 +924,12 @@ type StaticNATRule struct {
 	// the dropped values never reached ValidateIPPrefix, so a MALFORMED prefix
 	// in any slot but the first committed clean (a validation fail-open).
 	//
-	// Match still carries the first element and is what the dataplane snapshot
+	// Match still carries the value the LAST authored statement selected — the
+	// nodeVal assignment runs once per child, so the last `match
+	// destination-address` node wins, and within a bracketed list that node's
+	// FIRST value. It is therefore not in general MatchAddresses[0] nor
+	// MatchAddresses[len-1]: for `sibling then bracket` the three differ.
+	// Match is what the dataplane snapshot
 	// lowers to (ExternalIP is a single address in the Rust static_nat table),
 	// so a rule with more than one prefix has no representable meaning today.
 	// validateStaticNATMatchAddressesStrict therefore REJECTS a multi-valued

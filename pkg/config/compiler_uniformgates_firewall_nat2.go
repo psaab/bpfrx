@@ -156,7 +156,9 @@ func runUniformGatesFirewallNAT2(tree *ConfigTree, cfg *Config, opts compileOpts
 		if opts.lenientFirewallRefs {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("static NAT `match destination-address` LIST FORM IS NOT SUPPORTED — "+
-					"only the FIRST prefix is honoured and the rest carry no translation; "+
+					"only ONE prefix is honoured — the LAST authored `match "+
+					"destination-address` statement, or within a bracketed list "+
+					"that statement's first value — and the rest carry no translation; "+
 					"author one rule per external prefix (support for the list form is tracked "+
 					"in #6674). Downgraded to a warning on the tolerant load / peer-sync path "+
 					"so an already-persisted config still boots: %v", err))
