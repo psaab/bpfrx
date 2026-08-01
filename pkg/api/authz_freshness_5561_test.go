@@ -1,10 +1,16 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -489,4 +495,209 @@ func TestPeerLookupSlotsAreReturned_5561(t *testing.T) {
 			"injected attribution — the token the finished lookup returned was not reusable", np.id)
 	}
 	waitSlots(t, maxConcurrentPeerLookups-1, "the follow-on lookup did not return its token")
+}
+
+// withheldBody is a mutating request whose HEADERS have been sent and whose
+// BODY has not. It is the shape the gate's second adjudication exists for: the
+// caller, not the server, decides when the handler's decode can finish.
+//
+// It speaks HTTP on a raw connection rather than going through http.Client on
+// purpose. A client-side io.Pipe body does NOT reproduce the case: net/http
+// buffers the request headers and only flushes them once the body produces
+// bytes (or an Expect: 100-continue handshake forces it), so a withheld body
+// withholds the headers too and the server never starts the request at all.
+type withheldBody struct {
+	conn net.Conn
+	req  *http.Request
+}
+
+// openWithheldBody sends `route`'s request line and headers, declaring a
+// two-byte body that finish() supplies later.
+func openWithheldBody(t *testing.T, base, route string, hdrs map[string]string) *withheldBody {
+	t.Helper()
+	method, path, ok := strings.Cut(route, " ")
+	if !ok {
+		t.Fatalf("malformed route key %q", route)
+	}
+	addr := strings.TrimPrefix(base, "http://")
+	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	if err != nil {
+		t.Fatalf("dial %s: %v", addr, err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s %s HTTP/1.1\r\n", method, path)
+	fmt.Fprintf(&b, "Host: %s\r\n", addr)
+	b.WriteString("Content-Type: application/json\r\n")
+	b.WriteString("Content-Length: 2\r\n")
+	for k, v := range hdrs {
+		fmt.Fprintf(&b, "%s: %s\r\n", k, v)
+	}
+	b.WriteString("Connection: close\r\n\r\n")
+	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		t.Fatalf("SetDeadline: %v", err)
+	}
+	if _, err := io.WriteString(conn, b.String()); err != nil {
+		t.Fatalf("write request headers: %v", err)
+	}
+	return &withheldBody{conn: conn, req: &http.Request{Method: method}}
+}
+
+// finish supplies the withheld body and reads the response.
+func (w *withheldBody) finish(t *testing.T) (int, string) {
+	t.Helper()
+	// A write error here means the server already answered and closed — which is
+	// itself a valid outcome to read below, so it is not fatal.
+	_, _ = io.WriteString(w.conn, "{}")
+	resp, err := http.ReadResponse(bufio.NewReader(w.conn), w.req)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var r Response
+	_ = json.Unmarshal(body, &r)
+	return resp.StatusCode, r.Error
+}
+
+// waitForMutationBodyWaiter blocks until a request is parked reading its
+// caller's body inside the mutation gate — the happens-before edge that says
+// "the first adjudication has finished and the second has not started".
+func waitForMutationBodyWaiter(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if MutationBodyWaitersForTest() > 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("no request ever parked reading its body inside the gate, so the case never " +
+		"reached the window it tests")
+}
+
+// TestAuthorizationIsRemadeAfterTheCallerSuppliesItsBody_5561 is the round-10
+// finding-1 guard.
+//
+// Ordering the gate's own blocking steps (the two guards above) is necessary and
+// not sufficient, because the gate is not the last thing that blocks before the
+// mutation runs. The handler is, and it blocks on the one input the CALLER owns
+// outright: the request body. decodeJSONBody reads it AFTER the middleware has
+// returned its verdict, for as long as apiReadTimeout (30s) allows, and the
+// caller chooses how long that takes:
+//
+//	send headers for POST /api/v1/config/enter, withhold the body
+//	  -> the gate authorizes and the handler is entered, parked in Decode
+//	another session commits a demotion / revokes the credential
+//	  -> nothing re-reads it
+//	supply the body
+//	  -> the mutation runs on an authorization made up to 30 seconds ago
+//
+// Both revocation shapes are driven, because they are caught by different
+// halves of the second adjudication: the config demotion by its fresh
+// ActiveConfig() read, the api-auth revocation by its fresh credential check. A
+// fix that re-read only one of the two leaves the other on the old behaviour.
+//
+// Each row runs TWICE, once with no revocation. The control must be ADMITTED:
+// without it, a second adjudication that denied EVERYTHING would look like a
+// fix.
+func TestAuthorizationIsRemadeAfterTheCallerSuppliesItsBody_5561(t *testing.T) {
+	const (
+		credUser = "webadmin"
+		credPass = "s3cret"
+	)
+	for _, tc := range []struct {
+		name string
+		// hdrs is the credential the request presents, if any.
+		hdrs map[string]string
+		// serverFor builds the fixture; revoke performs the revocation that must
+		// reach the in-flight request.
+		credentialRow bool
+		why           string
+	}{
+		{
+			name: "class-demoted-while-body-withheld",
+			why: "adminuser was demoted from super-user to read-only while its own request " +
+				"sat withholding its body",
+		},
+		{
+			name:          "credential-revoked-while-body-withheld",
+			hdrs:          map[string]string{"Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte(credUser+":"+credPass))},
+			credentialRow: true,
+			why: "the api-auth credential was revoked while the request that presented it sat " +
+				"withholding its body",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, revoke := range []bool{false, true} {
+				name := "control-no-revocation"
+				if revoke {
+					name = "revoked-while-body-withheld"
+				}
+				t.Run(name, func(t *testing.T) {
+					usePasswdFixture(t)
+					store := authzStore(t, authzTestConfig)
+
+					var enumerations atomic.Int64
+					cfg := Config{Addr: "127.0.0.1:8080", Store: store}
+					if tc.credentialRow {
+						cfg.Auth = &AuthConfig{Users: map[string]string{credUser: credPass}}
+						cfg.PeerLookupFn = remotePeer()
+						cfg.PeerLocalityFn = func(net.Addr, net.Addr) bool {
+							enumerations.Add(1)
+							return false
+						}
+					} else {
+						cfg.PeerLookupFn = fixedPeerUID(authzUIDSuperuser)
+					}
+					s, base := authzServer(t, cfg)
+
+					req := openWithheldBody(t, base, "POST /api/v1/config/enter", tc.hdrs)
+
+					// The request has been authorized and is now parked reading the
+					// body it has not sent. This is the window, and it is the caller
+					// that holds it open.
+					waitForMutationBodyWaiter(t)
+					if revoke {
+						if tc.credentialRow {
+							// Exactly what `delete system services web-management
+							// ... api-auth` does: ReplaceAuth with a policy that no
+							// longer honours the presented credential.
+							s.ReplaceAuth(&AuthConfig{Users: map[string]string{"someone-else": "different"}})
+						} else {
+							authzRecommit(t, store, authzConfigAdminDemoted)
+						}
+					}
+
+					status, msg := req.finish(t)
+
+					if tc.credentialRow {
+						// The locality re-derivation is a property of the
+						// connection's addresses, which did not change. Adjudicating
+						// twice must not enumerate twice — see requestIdentity.
+						if got := enumerations.Load(); got != 1 {
+							t.Fatalf("the credential row drove %d interface enumerations for ONE "+
+								"request, want exactly 1: the second adjudication must reuse the "+
+								"connection-fixed locality verdict, not pay for it again", got)
+						}
+					}
+					if !revoke {
+						if status == http.StatusForbidden || status == http.StatusUnauthorized {
+							t.Fatalf("the CONTROL was refused (%d, %q) — a caller whose authority "+
+								"was never revoked must be admitted, so the refusal below would "+
+								"prove nothing", status, msg)
+						}
+						return
+					}
+					if status != http.StatusForbidden {
+						t.Fatalf("got %d, want 403: %s, and the mutation was still authorized "+
+							"(error=%q). The gate adjudicated once, BEFORE the caller-controlled "+
+							"body read, so the verdict the handler ran under was made up to "+
+							"apiReadTimeout before the mutation itself", status, tc.why, msg)
+					}
+				})
+			}
+		})
+	}
 }

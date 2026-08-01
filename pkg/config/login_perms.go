@@ -69,8 +69,25 @@ func ClassHasPermission(cfg *Config, class string, required LoginClassPermission
 // enforcing an authorization boundary must not substitute a default class for
 // that case — it means the RBAC model says nothing about this account, which is
 // a reason to deny, not a reason to pick a class.
+//
+// A name the daemon would REFUSE TO PROVISION is treated the same way, and this
+// is the one place the rule is not obvious, so it is stated: a strict commit
+// rejects an invalid `system login user <name>` at the schema (ValidateLoginUsername),
+// but the TOLERANT load and peer-sync paths downgrade that to a warning (#1960)
+// and keep the stanza active. pkg/daemon's account reconciliation
+// (applySystemLogin) already refuses to provision such a name, so the daemon
+// never created the account — yet this function would still hand its class to
+// whatever OS account happens to bear the name. That is a config the runtime
+// declined to realize granting authority over a control surface, which is a
+// fail-open. Resolving it the same way as an absent user makes the two halves
+// agree: an account the daemon would not create is an account the daemon does
+// not authorize. It cannot deny anyone the daemon actually provisioned, because
+// provisioning applies the identical validator.
 func LoginUserClass(cfg *Config, name string) (string, bool) {
 	if cfg == nil || cfg.System.Login == nil || name == "" {
+		return "", false
+	}
+	if err := ValidateLoginUsername(name, nil); err != nil {
 		return "", false
 	}
 	for _, u := range cfg.System.Login.Users {

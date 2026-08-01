@@ -383,6 +383,44 @@ across the whole gate; they can be made adjacent.
 `authz_freshness_5561_test.go` pins both, each with a control that must be
 ADMITTED so a reverted ordering cannot be "caught" by an unrelated 403.
 
+**And the gate is not the last thing that blocks.** Ordering the gate's own
+blocking steps is necessary and was not sufficient, because the *handler* blocks
+too — on the one input the caller owns outright, its request body.
+`decodeJSONBody` reads it after the middleware has already returned its verdict,
+for as long as `apiReadTimeout` (30s) allows, and the caller chooses how long
+that takes:
+
+```
+send headers for POST /api/v1/system/action, withhold the body
+  -> the gate authorizes; the handler is entered and parks in Decode
+another session revokes the credential / demotes the class
+  -> nothing re-reads it
+supply {"action":"reboot"}
+  -> the box reboots on an authorization made 30 seconds ago
+```
+
+So the body is drained **inside the gate**, between two adjudications:
+
+| step | why it is where it is |
+|---|---|
+| **pass 1** | Fail-fast, and it comes first for *availability*, not authorization. Buffering before deciding would let any caller that can open a socket park up to `maxRequestBodyBytes` of daemon memory per connection behind a 30s read timeout — 16 MiB × N from a `read-only` shell account. With the check first, only a principal already authorized for **this** route can make the daemon hold a buffer. |
+| **drain** | The caller-controlled block, moved in front of the verdict that admits the mutation. Bounded at `maxRequestBodyBytes+1`, one byte past the handlers' own cap, so an oversized body still reaches `MaxBytesReader` and still answers 413 — the outcome is preserved byte for byte. |
+| **pass 2** | The verdict the handler actually runs under. It re-reads the **live** half — the config snapshot and the api-auth credential, the two things a commit can change under an in-flight request. The **connection-fixed** half (the accept-time peer UID, and the credential row's locality re-derivation) is reused: a connection's addresses do not change mid-request, and re-enumerating interfaces per pass would make every credentialed mutation pay twice for an unchanged answer. The `/etc/passwd` resolution *is* repeated, deliberately — it is a page-cached read of a small local file, and repeating it means an account deleted mid-request is noticed. |
+
+Two residuals, both named. Locality is answered from an enumeration started on
+pass 1, so an address added to this host *while the body was being read* is not
+seen — the same direction [Residuals](#residuals) already names for the
+accept-time snapshot (a scan cannot observe an address that arrives after it),
+widened from the snapshot's TTL to the body window. And a handler that read its
+body in pieces, or blocked on something else of the caller's choosing after the
+decode, would reopen a window the gate cannot see; every mutating handler today
+decodes once, up front, before it acts.
+`TestAuthorizationIsRemadeAfterTheCallerSuppliesItsBody_5561` drives both
+revocation shapes — a class demotion (caught by the fresh snapshot) and an
+`api-auth` revocation (caught by the fresh credential check) — because a fix
+that re-read only one of the two leaves the other on the old behaviour. It also
+pins the enumeration count at exactly one per request.
+
 The rule has been narrowed twice, each time because a weaker version had a hole
 the claim did not admit to:
 

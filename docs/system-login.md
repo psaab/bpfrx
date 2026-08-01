@@ -110,7 +110,24 @@ identity, so it is a real boundary rather than an advisory one:
   is re-derived from a fresh interface enumeration before it is acted on, so a
   caller connecting from a just-added VRRP VIP or DHCP lease is still governed
   by its class rather than by the shared secret.
+- A `system login user` whose **name the daemon would refuse to provision** is
+  denied. A strict commit rejects an invalid name at the schema, but the
+  tolerant load and peer-sync paths (#1960) downgrade that to a warning and keep
+  the stanza active, and account reconciliation then skips it — so the account
+  was never created by xpf. Handing that stanza's class to whatever OS account
+  happens to bear the name would grant authority from a config the runtime
+  declined to realize, so `config.LoginUserClass` applies the same validator and
+  resolves such a user exactly like an absent one. This cannot deny anyone xpf
+  actually provisioned: provisioning runs the identical check. If an operator
+  sees an unexpected denial here, the fix is to rename the user to a valid login
+  name and commit — which is also what makes the shell account appear.
 - Read-only endpoints, `/health` and `/metrics` are unaffected.
+- The authorization is re-made **after** the caller has supplied its request
+  body, not only when its headers arrive. A caller cannot hold a mutation open
+  on a stale verdict by dribbling the body: a `commit` demoting its class, or a
+  `delete system services web-management ... api-auth` revoking its credential,
+  reaches the request before the mutation runs. See `pkg/api/README.md`
+  "Every input to the decision is read after the last thing that can block".
 
 ### Custom login classes (accept-with-advisory, #4304 S-2)
 

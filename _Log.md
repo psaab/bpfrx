@@ -66929,3 +66929,77 @@ break — `go vet` confirmed passing under every revert.
   pkg/daemon/management.go, pkg/daemon/management_authpublish_5561_test.go,
   pkg/daemon/README.md, pkg/cli/permissions_shared_evaluator_5561_test.go,
   _Log.md
+
+- **Timestamp**: 2026-08-01 (round-10 — finding 1 + MINOR-7 fixed; 2,3,4,5,6,8 triaged PRE-EXISTING and filed)
+- **Action**: #5561 round-10 fold. Codex returned MERGE-NEEDS-MAJOR with six
+  MAJORs and two MINORs. Triage first: findings 2, 3, 4, 5, 6 and 8 all cite
+  files this branch does not touch (`daemon_apply.go`, `daemon_dhcp.go`,
+  `daemon_feeds.go`, `daemon_apply_commit.go`, `daemon_run.go`,
+  `daemon_run_servers.go`, `pkg/api/listener.go`), and the two functions in the
+  one file the branch DOES touch that they name — `managementReconciler.start`
+  and `startTo` — are byte-identical to `origin/master`. They are daemon
+  LIFECYCLE defects, not request-path ones, and folding six of them into a REST
+  authorization change makes it unreviewable. Filed as #6716 (queued apply
+  republishes a revoked credential from a stale config + a false applied-stamp),
+  #6717 (nil auth publish races the ASYNC listener retirement — unauthenticated
+  read window), #6718 (first-commit-confirmed rollback never reconciles
+  management), #6719 (HA startup installs a stale auth snapshot; `d.mgmt`
+  published unsynchronized), #6720 (tolerant peer sync promotes then skips the
+  management reconcile), #6721 (a BOOT bind failure is never retried, contrary
+  to two comments).
+- **Finding 1 — FIXED HERE, because it falsified this PR's own claim.**
+  pkg/api/README.md said "Every input to the decision is read after the last
+  thing that can block." It was not: the gate is not the last thing that blocks.
+  The HANDLER is, on the one input the caller owns outright — its request body.
+  `decodeJSONBody` reads it after the middleware returned its verdict, for up to
+  `apiReadTimeout` (30s), and the caller chooses how long that takes. Send
+  headers for `POST /api/v1/system/action`, withhold the body, let another
+  session revoke the credential or demote the class, then supply
+  `{"action":"reboot"}` — the box reboots on an authorization made 30 seconds
+  earlier. Same TOCTOU class the PR exists to close, one layer later.
+  `mutationAuthzGuard` now adjudicates TWICE with the body drained between.
+  Pass 1 is fail-fast and comes first for AVAILABILITY, not authorization:
+  buffering before deciding would let any caller that can open a socket park up
+  to `maxRequestBodyBytes` (16 MiB) of daemon memory per connection behind a 30s
+  read timeout, from a `read-only` shell account. Pass 2 re-reads the LIVE half
+  (config snapshot + credential); the connection-fixed half (accept-time UID and
+  the credential row's locality enumeration) is memoized on a new
+  `requestIdentity`, so adjudicating twice still costs exactly ONE interface
+  enumeration — `TestOffLoopbackCredentialRowEnumeratesOnlyOnce_5561` stays
+  green and the new guard asserts the count itself. The drain is bounded at
+  `maxRequestBodyBytes+1`, one byte past the handlers' own cap, so an oversized
+  body still reaches `MaxBytesReader` and still answers 413 — outcomes preserved
+  byte for byte.
+- **MINOR-7 — FIXED HERE**, because `config.LoginUserClass` is new in this PR.
+  A tolerant load / peer sync keeps a `system login user` whose name the schema
+  rejects (#1960 downgrades it to a warning); `applySystemLogin` then REFUSES to
+  provision it, but `LoginUserClass` exact-matched it anyway, so an OS account
+  that happened to bear the name was handed a class the runtime had declined to
+  realize. It now applies the identical validator and resolves such a user like
+  an absent one. Cannot deny anyone the daemon actually provisioned —
+  provisioning runs the same check.
+- **Mutation evidence**: build+vet asserted rc 0 before every red. (A) delete
+  the pass-2 re-adjudication, keep the drain: build+vet CLEAN,
+  `TestAuthorizationIsRemadeAfterTheCallerSuppliesItsBody_5561` reds on BOTH
+  revocation shapes (`got 200, want 403`) while the round-9 guards
+  (`TestConfigSnapshotIsReadAfterThePeerWait_5561`,
+  `TestRevokedCredentialCannotFinishAnInFlightRequest_5561`,
+  `TestOffLoopbackCredentialRowEnumeratesOnlyOnce_5561`) stay green — specific,
+  not a blanket break. (B) EDGE: delete the drain, KEEP pass 2 — build+vet
+  CLEAN, the same test reds (the gate never parks in the body read), so the
+  guard binds both halves, not just the re-check. (C) delete the
+  `ValidateLoginUsername` gate: build+vet CLEAN,
+  `TestTolerantlyLoadedInvalidUsernameGrantsNoClass_5561` reds with `uid 4250
+  resolved to ... class "super-user"` while its VALID-name control passes.
+- **Contested/none**: nothing contested. The confirmed-invariant list Codex
+  supplied was left untouched.
+- **Docs**: pkg/api/README.md's freshness section gains the body layer — the
+  three-step table (fail-fast / drain / re-decide), why pass 1 comes first
+  (availability, with the 16 MiB × N arithmetic), and two named residuals
+  (locality answered from pass 1's enumeration, so an address added during the
+  body window is unseen; a handler that read its body in pieces would reopen a
+  window the gate cannot see). docs/system-login.md gains the invalid-username
+  policy and the after-the-body re-adjudication.
+- **File(s)**: pkg/api/authz.go, pkg/api/authz_freshness_5561_test.go,
+  pkg/api/README.md, pkg/authz/authz_5561_test.go, pkg/config/login_perms.go,
+  docs/system-login.md, _Log.md

@@ -275,3 +275,68 @@ func TestResolveClassPermissionsIsSharedWithTheCLI_5561(t *testing.T) {
 		t.Error("LoginUserClass found a user in a nil config")
 	}
 }
+
+// TestTolerantlyLoadedInvalidUsernameGrantsNoClass_5561 is the round-10
+// finding-7 guard.
+//
+// A STRICT commit rejects an invalid `system login user <name>` at the schema
+// (config.ValidateLoginUsername). The TOLERANT load and peer-sync paths do not:
+// they warn and keep going (pkg/configstore/store.go), so a legacy on-disk
+// config or a divergent peer can make such a stanza ACTIVE. pkg/daemon's account
+// reconciliation (applySystemLogin) then refuses to provision the account —
+// which is the correct half of the answer, and used to be the only half. The
+// class stayed readable, so if an account with that exact name already existed
+// in /etc/passwd for any other reason, the caller running as it was handed the
+// class the daemon had declined to realize.
+//
+// `UPPER` is the shape that matters: a plain name with no metacharacters, which
+// the validator refuses only because the login-name grammar is lowercase. It is
+// the case an operator could plausibly have on disk, and the one that reads as
+// harmless.
+//
+// The control is the same fixture with a VALID name and the same class: it must
+// still resolve, or "deny the invalid one" would be indistinguishable from
+// "deny everything".
+func TestTolerantlyLoadedInvalidUsernameGrantsNoClass_5561(t *testing.T) {
+	dir := t.TempDir()
+	passwd := filepath.Join(dir, "passwd")
+	if err := os.WriteFile(passwd, []byte(
+		"UPPER:x:4250:4250::/home/UPPER:/bin/bash\n"+
+			"lawful:x:4251:4251::/home/lawful:/bin/bash\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defer SetPasswdPathForTest(passwd)()
+
+	// The config a tolerant load leaves active: both users carry super-user.
+	cfg := &config.Config{}
+	cfg.System.Login = &config.LoginConfig{
+		Users: []*config.LoginUser{
+			{Name: "UPPER", Class: "super-user"},
+			{Name: "lawful", Class: "super-user"},
+		},
+	}
+
+	t.Run("the control resolves", func(t *testing.T) {
+		p := PrincipalForUID(cfg, 4251)
+		if !p.Resolved() || p.Class != "super-user" {
+			t.Fatalf("uid 4251 (a VALID login user name) produced %+v, want a resolved "+
+				"super-user — the denial below would otherwise prove nothing", p)
+		}
+		if err := Authorize(cfg, p, config.PermConfig); err != nil {
+			t.Fatalf("the control was denied: %v", err)
+		}
+	})
+
+	t.Run("a name host provisioning refuses is not a principal", func(t *testing.T) {
+		p := PrincipalForUID(cfg, 4250)
+		if p.Resolved() {
+			t.Fatalf("uid 4250 resolved to %+v. `system login user UPPER` is a name the daemon "+
+				"REFUSES to provision (applySystemLogin skips it), so no account with that name "+
+				"was created by the login model — yet it was handed that stanza's class over the "+
+				"REST control surface", p)
+		}
+		if err := Authorize(cfg, p, config.PermConfig); err == nil {
+			t.Fatal("an unresolved principal was authorized for `configure`")
+		}
+	})
+}

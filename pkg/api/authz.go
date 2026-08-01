@@ -1,8 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -263,6 +266,45 @@ func (s *Server) peerIsLocalNow(p *pendingPeer) bool {
 	return authz.PeerCouldBeLocalNow(p.client, p.server)
 }
 
+// requestIdentity is the half of the authorization inputs that is FIXED for the
+// life of ONE request: the connection's peer identity (resolved once, starting
+// at accept) and — on the credential row only — the locality re-derivation.
+//
+// It exists because mutationAuthzGuard adjudicates TWICE, once before it reads
+// the caller's body and once after (see that function). Re-deriving these on the
+// second pass would buy nothing and cost something: a connection's client and
+// server addresses are fixed at accept and its kernel-reported UID with them, so
+// both passes would read the same answer, while peerIsLocalNow drives a full
+// interface enumeration. The LIVE half — the config snapshot and the api-auth
+// credential, the two things a commit can change underneath an in-flight
+// request — is deliberately NOT memoized and is re-read on every pass.
+//
+// The residual this fixes in place rather than closing: locality is answered
+// from an enumeration started on the FIRST pass, so an address added to this
+// host while the body was being read is not seen. That is the same direction
+// pkg/api/README.md "Residuals" already names for the accept-time snapshot (a
+// scan cannot observe an address that arrives after it), widened from the
+// snapshot's TTL to the body window. It is not a new direction of failure, and
+// the alternative — an enumeration per pass — makes every credentialed mutation
+// pay twice for an answer about addresses that did not change.
+type requestIdentity struct {
+	pending      *pendingPeer
+	id           authz.PeerIdentity
+	localityDone bool
+	local        bool
+}
+
+// isLocalNow answers the credential row's locality question for ri, driving at
+// most ONE enumeration per request however many passes ask.
+func (s *Server) isLocalNow(ri *requestIdentity) bool {
+	if ri.localityDone {
+		return ri.local
+	}
+	ri.local = s.peerIsLocalNow(ri.pending)
+	ri.localityDone = true
+	return ri.local
+}
+
 // lookupPeer resolves the peer identity through the injected resolver
 // (Config.PeerLookupFn) or pkg/authz's kernel lookup, normalizing the result.
 //
@@ -323,23 +365,47 @@ func (s *Server) activeConfig() *config.Config {
 // A config snapshot and a decision cannot be made simultaneous without holding
 // the store's lock across the whole gate; they can be made adjacent, and that
 // is what this ordering buys.
-func (s *Server) authorizeInputs(r *http.Request) (*config.Config, authz.Principal) {
+// A nil third return means the request denied before any connection-fixed
+// identity was established, so there is nothing for a later pass to re-derive
+// against; the caller must refuse without re-adjudicating.
+func (s *Server) authorizeInputs(r *http.Request) (*config.Config, authz.Principal, *requestIdentity) {
 	pending, ok := peerIdentityFrom(r.Context())
 	if !ok {
 		// No ConnContext ran for this connection, so we cannot even tell whether
 		// the caller is local — and therefore cannot tell whether a credential
 		// is allowed to speak for it. Refuse rather than guess.
-		return s.activeConfig(), authz.Unauthenticated("connection identity was not captured at accept")
+		return s.activeConfig(), authz.Unauthenticated("connection identity was not captured at accept"), nil
 	}
 	// THE BLOCKING STEP. Nothing that feeds the decision may be read before it.
 	peerWaitersInFlight.Add(1)
 	id, resolved := pending.wait(r.Context())
 	peerWaitersInFlight.Add(-1)
 	if !resolved {
-		return s.activeConfig(), authz.Unauthenticated("peer identity lookup did not complete for this connection")
+		return s.activeConfig(),
+			authz.Unauthenticated("peer identity lookup did not complete for this connection"),
+			nil
 	}
+	ri := &requestIdentity{pending: pending, id: id}
 	cfg := s.activeConfig()
-	return cfg, s.principalFrom(r, cfg, pending, id)
+	return cfg, s.principalFrom(r, cfg, ri), ri
+}
+
+// reauthorizeInputs re-derives the decision's LIVE half — a fresh config
+// snapshot and a fresh credential validation — against the connection-fixed
+// identity authorizeInputs already resolved.
+//
+// It is the second pass of mutationAuthzGuard's two-pass adjudication, and the
+// only reason it is a separate function is that the first pass's blocking steps
+// (the peer wait, the interface enumeration) must NOT run again: repeating them
+// would re-answer questions whose inputs are fixed at accept while paying their
+// full cost on every mutating request. What it does repeat is exactly what a
+// concurrent commit can change — s.activeConfig() and s.auth — so a demotion, a
+// deletion from `system login user`, or an api-auth revocation that lands while
+// the caller is still sending its body reaches the verdict that admits the
+// mutation.
+func (s *Server) reauthorizeInputs(r *http.Request, ri *requestIdentity) (*config.Config, authz.Principal) {
+	cfg := s.activeConfig()
+	return cfg, s.principalFrom(r, cfg, ri)
 }
 
 // principalFrom derives the caller's server-side identity for one request (#5561).
@@ -396,7 +462,8 @@ func (s *Server) authorizeInputs(r *http.Request) (*config.Config, authz.Princip
 //
 // The ORDER in which its two inputs are obtained — the peer wait and the config
 // read — is argued on authorizeInputs, which is the only caller.
-func (s *Server) principalFrom(r *http.Request, cfg *config.Config, pending *pendingPeer, id authz.PeerIdentity) authz.Principal {
+func (s *Server) principalFrom(r *http.Request, cfg *config.Config, ri *requestIdentity) authz.Principal {
+	id := ri.id
 	if id.OK {
 		// (1) and (2). PrincipalForUID yields an unresolved principal for an
 		// account outside the login model, which Authorize denies — and no
@@ -427,7 +494,10 @@ func (s *Server) principalFrom(r *http.Request, cfg *config.Config, pending *pen
 		// TestUncredentialedCallerDrivesNoLocalityRecheck_5561 and
 		// TestOffLoopbackCredentialRowEnumeratesOnlyOnce_5561 both fail if it is
 		// hoisted, and both fail if it is removed.
-		if s.peerIsLocalNow(pending) {
+		//
+		// Memoized on ri so the gate's second pass (reauthorizeInputs) reuses the
+		// verdict rather than enumerating again — see requestIdentity.
+		if s.isLocalNow(ri) {
 			return authz.Unauthenticated("caller is local but could not be identified: " +
 				"peer address is assigned to this host, so an api-auth credential may not speak for it")
 		}
@@ -547,8 +617,49 @@ func (s *Server) mutationAuthzGuard(next http.Handler) http.Handler {
 		// blocking peer wait, which reopened the same demotion window at up to
 		// peerLookupTimeout wide. authorizeInputs does the wait first and reads
 		// the snapshot after it — see its doc comment.
-		cfg, p := s.authorizeInputs(r)
-		if err := authz.Authorize(cfg, p, required); err != nil {
+		//
+		// # Why the decision is made TWICE
+		//
+		// Ordering the gate's own blocking steps is not sufficient, because the
+		// gate is not the last thing that blocks before the mutation runs. The
+		// handler is, and it blocks on the one input the CALLER owns outright:
+		// its request body. `decodeJSONBody` reads it after this middleware has
+		// already returned its verdict, for as long as apiReadTimeout allows
+		// (30s), and the caller chooses how long that takes. So
+		//
+		//	send headers for POST /api/v1/system/action, withhold the body
+		//	  -> gate authorizes, handler entered, handler parks in Decode
+		//	another session revokes the credential / demotes the class
+		//	  -> nothing re-reads it
+		//	supply {"action":"reboot"}
+		//	  -> the box reboots on an authorization made 30 seconds ago
+		//
+		// That is the same TOCTOU the ordering above closes, one layer later, and
+		// it is the layer that matters: an authorization is a statement about the
+		// moment the action runs, not about the moment the headers arrived.
+		//
+		// So the body is drained HERE, between two adjudications:
+		//
+		//	pass 1  fail-fast, and the reason it comes FIRST is availability, not
+		//	        authorization. Buffering before deciding would let any caller
+		//	        that can open a socket park up to maxRequestBodyBytes of the
+		//	        daemon's memory per connection behind a 30s read timeout —
+		//	        16 MiB x N connections from a `read-only` shell account. With
+		//	        the check first, only a principal already authorized for THIS
+		//	        route can make the daemon hold a buffer.
+		//	drain   the caller-controlled block, moved in front of the verdict
+		//	        that admits the mutation.
+		//	pass 2  the verdict the handler actually runs under. It re-reads the
+		//	        config snapshot and re-validates the credential (the live
+		//	        half); the connection-fixed half is reused — requestIdentity
+		//	        says why.
+		//
+		// The residual is stated, not papered over: a handler that reads the body
+		// in pieces, or blocks on something else of the caller's choosing after
+		// the decode, reopens a window this cannot see. Every mutating handler
+		// today decodes once, up front, through decodeJSONBody (or the equivalent
+		// MaxBytesReader+Decode in dhcp.go) before it acts.
+		deny := func(p authz.Principal, err error) {
 			// Debug, not Warn: this fires once per DENIED request, and a
 			// keep-alive loop from an unauthenticated caller is exactly the
 			// cheapest way to drive it. The project's logging rule forbids
@@ -558,6 +669,29 @@ func (s *Server) mutationAuthzGuard(next http.Handler) http.Handler {
 				"principal", p.String(), "source", p.Source.String(),
 				"required", authz.PermissionName(required), "err", err)
 			writeError(w, http.StatusForbidden, err.Error())
+		}
+
+		cfg, p, ri := s.authorizeInputs(r)
+		if err := authz.Authorize(cfg, p, required); err != nil {
+			deny(p, err)
+			return
+		}
+		if ri == nil {
+			// Unreachable: authorizeInputs returns a nil identity only on paths
+			// whose principal is Unauthenticated, which Authorize just denied.
+			// Fail closed rather than serve a mutation whose verdict cannot be
+			// re-made after the body.
+			deny(p, errors.New("permission denied: connection identity is unavailable for re-adjudication"))
+			return
+		}
+
+		if !bufferMutationBody(w, r) {
+			return
+		}
+
+		cfg, p = s.reauthorizeInputs(r, ri)
+		if err := authz.Authorize(cfg, p, required); err != nil {
+			deny(p, err)
 			return
 		}
 		slog.Debug("api: authorized mutating request",
@@ -565,4 +699,50 @@ func (s *Server) mutationAuthzGuard(next http.Handler) http.Handler {
 			"principal", p.String(), "required", authz.PermissionName(required))
 		next.ServeHTTP(w, r)
 	})
+}
+
+// mutationBodyWaitersInFlight counts requests parked reading a mutating
+// request's body inside the gate — i.e. requests that have passed the first
+// adjudication and have not yet reached the second.
+//
+// Same role as peerWaitersInFlight, for the other blocking step: it is the only
+// externally observable moment at which a test knows the gate is inside the
+// window a revocation has to land in, so the guard for that window does not have
+// to sleep and hope. One atomic add per mutating request that carries a body, on
+// a surface that answers a handful of operator actions per second.
+var mutationBodyWaitersInFlight atomic.Int64
+
+// MutationBodyWaitersForTest reports how many mutating requests are parked
+// reading their caller's body between the gate's two adjudications. Test-only.
+func MutationBodyWaitersForTest() int { return int(mutationBodyWaitersInFlight.Load()) }
+
+// bufferMutationBody reads a mutating request's body to completion and replaces
+// r.Body with the buffered copy, so the handler's later decode cannot block on
+// the caller — see mutationAuthzGuard. It returns false when it has already
+// written an error response.
+//
+// The ceiling is maxRequestBodyBytes+1, one byte past the cap the handlers'
+// own MaxBytesReader enforces. Reading exactly one byte past it preserves the
+// existing outcome byte for byte: a body over the cap still reaches the handler
+// long enough for MaxBytesReader to trip and answer 413, rather than being
+// turned into a different error here. A body under the cap is handed over
+// whole, so decode behaviour — including which malformed inputs produce 400 —
+// is unchanged.
+func bufferMutationBody(w http.ResponseWriter, r *http.Request) bool {
+	if r.Body == nil || r.Body == http.NoBody {
+		return true
+	}
+	mutationBodyWaitersInFlight.Add(1)
+	buf, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodyBytes+1))
+	mutationBodyWaitersInFlight.Add(-1)
+	if err != nil {
+		// The caller hung up, timed out, or sent a malformed chunked body. Not
+		// an authorization outcome: 400, and the handler never runs.
+		slog.Debug("api: could not read mutating request body",
+			"method", r.Method, "path", r.URL.Path, "err", err)
+		writeError(w, http.StatusBadRequest, "could not read request body")
+		return false
+	}
+	r.Body = io.NopCloser(bytes.NewReader(buf))
+	return true
 }
