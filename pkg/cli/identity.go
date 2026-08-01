@@ -186,16 +186,33 @@ func configuredName(login *config.LoginConfig, id osident.Identity) string {
 // The `id.Resolved()` test is LOAD-BEARING, not a tidiness check, and this is
 // the only place that protection exists. An unidentified caller has Name == "",
 // and `system login user "" { class super-user; }` can be LIVE today. The
-// reason is stronger than a missing validator, and is worth stating exactly
-// because the obvious version of it is wrong. `config.ValidateLoginUsername`
-// DOES reject an empty name, and COMMIT-CHECK enforces it — measured,
-// SchemaValidate returns `system login user: invalid value "": login user name
-// must not be empty`. The COMPILER does not: CompileConfig returns a nil error
-// and keeps the entry. And the TOLERANT load / peer-sync path never runs
-// SchemaValidate at all, so a config arriving by that route keeps the
-// empty-named super-user SILENTLY — not downgraded to a warning, no diagnostic
-// of any kind. A guard that only held on the commit path would therefore not
-// hold on the one path an operator never sees.
+// reason is not a missing validator, and the exact mechanism matters because
+// two plausible wrong versions of it exist.
+//
+//   - `config.ValidateLoginUsername` DOES reject an empty name
+//     (schema_validators.go), and STRICT commit-check enforces it:
+//     configstore.compileTreeStrict runs schemaValidateExpandedTreeForNode,
+//     which returns `system login user: invalid value "": login user name must
+//     not be empty`, and the commit fails.
+//   - The TOLERANT ingress — Store.Load and Store.SyncApply, i.e. boot and
+//     peer-sync — runs the SAME gate via Store.compileTreeLenient, but
+//     DOWNGRADES the violation to `slog.Warn("typed-leaf schema violation in
+//     tolerated config; continuing (a strict commit would reject this)")` and
+//     KEEPS the entry. That downgrade is deliberate (#1319): hard-failing here
+//     would blackout-boot a node carrying a legacy config, or alarm-loop HA
+//     config sync from an un-upgraded primary.
+//
+// So the entry reaches the active config by a route that logs a warning and
+// proceeds — not by one that rejects, and not silently either.
+//
+// Do NOT verify this against `config.CompileConfigLenient`. That is a
+// different function: it runs no schema gate, returns nil, and keeps the entry
+// with no warning at all. Probing it and concluding "the tolerant path is
+// silent" is wrong, and was the mistake that produced an earlier revision of
+// this comment. The tolerant PATH is configstore's compileTreeLenient.
+//
+// A guard that only held on the strict commit path would therefore not hold on
+// the one path an operator does not drive by hand.
 // Without this test the empty name would be offered to the match loop
 // below, where `u.Name != name` succeeds against that entry and the
 // unidentifiable caller is handed super-user — the #6701 hole reopened from the

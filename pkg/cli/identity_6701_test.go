@@ -289,12 +289,15 @@ func TestClassUnidentifiedIsDenyingNotLegacy_6701(t *testing.T) {
 // The premise is measured, not assumed: `system login user "" { class
 // super-user; }` reaches the ACTIVE config — not because the validator is
 // missing, but despite it. `config.ValidateLoginUsername` rejects an empty
-// name and commit-check enforces it (SchemaValidate: `invalid value "": login
-// user name must not be empty`). The COMPILER does not — CompileConfig returns
-// nil and keeps the entry — and the tolerant load / peer-sync path never runs
-// SchemaValidate, so an entry arriving that way is kept SILENTLY, with no
-// warning at all. So such an entry really can be live, and on exactly the path
-// an operator never sees. An
+// name and STRICT commit-check enforces it (configstore.compileTreeStrict ->
+// schemaValidateExpandedTreeForNode: `invalid value "": login user name must
+// not be empty`). The TOLERANT ingress — Store.Load and Store.SyncApply, i.e.
+// boot and peer-sync — runs the SAME gate via Store.compileTreeLenient but
+// DOWNGRADES the violation to an slog.Warn and keeps the entry, deliberately
+// (#1319), so that a legacy config cannot blackout-boot a node or alarm-loop
+// HA sync. So such an entry really can be live, on a path the operator does
+// not drive by hand. Do not check this against config.CompileConfigLenient —
+// that is a different function with no schema gate at all. An
 // unidentified caller carries Name == "". If candidateNames offered that name
 // to the match loop, `u.Name == ""` would match the entry and hand the caller
 // super-user, reopening #6701 without touching $USER.
