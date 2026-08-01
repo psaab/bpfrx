@@ -1,9 +1,9 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v41 — r40 findings folded (Codex NEEDS-REVISION
-  2M/1m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m —
-  its H-branch config-shape split is folded here; all three
-  confirm the §4.7 structure); pending convergence review r41
+- **Status**: DRAFT v42 — r41 findings folded (Codex NEEDS-REVISION
+  4M/1m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m —
+  its indicator-freshness pin is folded here; all three confirm
+  the §4.7 structure); pending convergence review r42
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -1551,6 +1551,74 @@
   "the v29 design" — Codex m1) and the retained v39 history
   entry's `down em0` alternative is annotated WITHDRAWN (Codex
   fold-partial 3).
+  v42: r41 convergence — the observable join is REDESIGNED as a
+  gap-free outstanding-sync counter and the fence is reordered
+  around it (Codex NEEDS-REVISION 4M/1m, folds 1 FOLDED /
+  2 NOT-FOLDED — both NOT-FOLDEDs are the v41 queue-length +
+  gen-fence pair this v42 replaces — structure confirmed; AGY
+  PLAN-READY 3/3 with 2 fresh attacks FAILED, structure
+  confirmed; SMR PLAN-READY-WITH-NITS 0M/1m): (a) the join is a
+  single atomic `ConfigSyncOutstanding` counter per node
+  (Codex M1, verified the three false-idle windows in the v41
+  pair: dequeue precedes flag publication —
+  `sync_conn_config.go:325-350`; legacy gen-0 applies leave the
+  flag zero — `sync_conn_config.go:289-309`,
+  `sync_protocol.go:704-712`; `resetRecvGen` can clear the flag
+  during an apply — `sync_conn_read.go:183-195`,
+  `sync_conn_gen.go:340-362`) — INCREMENTED at frame receipt
+  BEFORE enqueue (`sync_conn_read.go:298-324`) and DECREMENTED
+  only AFTER the apply returns, including the applySem-blocked
+  duration (`sync_conn_config.go:325-351`,
+  `daemon_apply_commit.go:326-335`), independent of generation
+  numbers and epoch resets, so `outstanding == 0` is a true join
+  with no false-idle window; exposed read-only on the cluster
+  status surface (gRPC/CLI, BOTH nodes) and read LIVE at check
+  time (a single atomic — Codex m1's joint-protection coherence
+  note answered by construction). (b) The fence sequence is
+  reordered (Codex M2, verified neither direction was actually
+  drained: local→peer writes can start after the local
+  observation — `QueueConfig` writes directly,
+  `sync_conn_config.go:230-250`, asynchronously triggerable,
+  `daemon_ha_sync.go:417-522` — and peer→local writes can start
+  after the local drain while the peer still runs; and the final
+  debts-only re-check misses a merely-enqueued or
+  applySem-blocked apply that has not raised debt yet —
+  `store.go:687-746` — which process exit then abandons,
+  `store_persist.go:397-401`, with degraded health
+  election-neutral, `cluster/readiness.go:20-24`,
+  `cluster/election.go:427-432`): (2a) PEER-SIDE PREFLIGHT (peer
+  `ConfirmDebtKindMask == 0` AND peer `persistDegraded == false`
+  AND peer `ConfigSyncOutstanding == 0`); (2b) STOP THE PEER
+  xpfd FIRST (the universal fence — a stopped peer cannot push
+  over ANY transport and no new inbound frames initiate);
+  (2c) LOCAL OUTSTANDING DRAIN to zero (every in-flight inbound
+  apply completes, including any applySem-blocked one); (3)
+  local full-state re-check now INCLUDING
+  `ConfigSyncOutstanding == 0`; (4) stop and repair. (c) The
+  peer full-state read path is PINNED (Codex M3, verified the
+  peer debt mask + active-persist state had no designed read
+  path — `ConfigPersistDegradedState()` was wired only into
+  pkg/api health, `plan.md:4608-4654`, and cluster status
+  exposed only config-sync counters, `cluster/status.go:340-356`):
+  the peer's own `/health` endpoint on its localhost ALREADY
+  carries the debt mask and active-persist state per the
+  health-snapshot work (operator reads it via the peer's
+  localhost or SSH), and the cluster-status RPC gains the
+  outstanding counter AND wires the confirm-side debt mask +
+  active-persist state — the §5.1 inventory gains the
+  `pkg/cluster` entry. (d) The formal acceptance copy is
+  rewritten to the CURRENT fence (Codex M4, verified
+  plan.md:5553-5569 still specified peer preflight → peer stop →
+  capped timer wait): no timer anywhere; the peer-side preflight
+  includes the counter read via the peer's `/health`; the local
+  drain waits on the counter to ZERO; the re-check includes the
+  counter. (e) The live-read pin + its regression (Codex m1 +
+  SMR m1): the counter is read LIVE at check time (never a
+  cached or periodically-refreshed value), and §9 gains the
+  JOIN-COHERENCE leg — a framed-blocking-apply regression (frame
+  dequeued, apply blocked on `applySem` via the test seam)
+  asserts the counter NEVER reads zero until the apply returns,
+  covering all three false-idle windows the gapful pair had.
 
 ---
 
@@ -3569,59 +3637,82 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   from new commits and FENCES the async producer ENFORCEABLY,
   with the observable join, the peer-side preflight, and the
   ordering PINNED (r38 Codex M1 + r39 Codex M1/M2/M3 + r40 Codex
-  M1/M2, all verified: (i) the SyncApply apply flag and queue
-  are PRIVATE — `cluster/sync.go:594-616` — and the public
-  status surfaces expose only cumulative/history data —
-  `cluster/sync.go:191-228`, `cluster/status.go:340-356` — so no
-  observable predicate fences peer-driven syncs TODAY; (ii) the
-  private 64-slot channel's consumer invokes
+  M1/M2 + r41 Codex M1/M2/M3, all verified: (i) the SyncApply
+  apply flag and queue are PRIVATE — `cluster/sync.go:594-616` —
+  and the public status surfaces expose only cumulative/history
+  data — `cluster/sync.go:191-228`, `cluster/status.go:340-356` —
+  so no observable predicate fences peer-driven syncs TODAY;
+  (ii) the private 64-slot channel's consumer invokes
   `syncAndApply(context.Background())` and can block
   INDEFINITELY on `applySem` — `sync_conn_config.go:325-351`,
   `daemon_apply_commit.go:326-335` — so NO time-based wait
-  drains the queue; (iii) `down em0` is NOT a universal
-  alternative: config sync uses the configured control interface
-  only when both control fields exist and otherwise falls back
-  to the fabric, possibly over TWO redundant paths —
-  `daemon_ha_sync.go:774-785,820-860`; (iv) the peer stop
+  drains the queue; (iii) a queue-length + generation-fence
+  indicator has THREE false-idle windows — dequeue precedes flag
+  publication (`sync_conn_config.go:325-350`), legacy gen-0
+  applies leave the flag zero (`sync_conn_config.go:289-309`,
+  `sync_protocol.go:704-712`), and `resetRecvGen` can clear it
+  during an apply (`sync_conn_read.go:183-195`,
+  `sync_conn_gen.go:340-362`); (iv) `down em0` is NOT a
+  universal alternative: config sync uses the configured control
+  interface only when both control fields exist and otherwise
+  falls back to the fabric, possibly over TWO redundant paths —
+  `daemon_ha_sync.go:774-785,820-860`; (v) the peer stop
   abandons the PEER's process-local debts symmetrically, so the
   peer needs the SAME full-state preflight before IT is stopped;
-  (v) the reverse direction has its own TOCTOU — when the
+  (vi) the reverse direction has its own TOCTOU — when the
   target is RG0 authority, reconnect/promotion/the reconciler
   can push the current config to the peer BETWEEN the peer's
   check and its stop, raising peer `persistDegraded` on write
   failure, `store.go:687-717,738-746`, and degraded health is
-  election-neutral so a crash takeover in the gap stays ungated;
-  (vi) the restart ORDER matters — a peer restarted before the
+  election-neutral so a crash takeover in the gap stays ungated
+  (`cluster/readiness.go:20-24`, `cluster/election.go:427-432`);
+  (vii) the restart ORDER matters — a peer restarted before the
   target stops resumes reconnect/reconcile pushes,
   `daemon_ha_sync.go:926-956`, while a peer left stopped after
   the target stops is a full cluster outage): THE OBSERVABLE
-  JOIN IS ADDED TO THE PLAN — the cluster status surface
-  (gRPC/CLI, BOTH nodes) gains a config-sync QUEUE-DEPTH +
-  APPLY-IN-FLIGHT indicator (the currently-private queue and
-  flag, `cluster/sync.go:594-616`, exposed read-only) — and the
-  fence drains BOTH directions through it: (2a) LOCAL DRAIN —
-  wait until the indicator shows queue-empty AND no
-  apply-in-flight on the LOCAL node (no local→peer push can be
-  in flight), then ONE full pass at the retry loop's CAPPED
-  backoff (debts themselves are raised SYNCHRONOUSLY in memory
-  under `s.mu` at the producing operation's failure, so the
-  re-check observes them regardless of backoff phase, and an
-  in-flight resolution's finalize runs inside a pass); (2b)
-  PEER-SIDE PREFLIGHT — on the PEER, verify the same
-  full-state condition (peer `ConfirmDebtKindMask == 0` AND
-  peer `persistDegraded == false` — a just-landed sync's debts
-  are raised synchronously at the peer and visible on its own
-  status); if the peer is not clean, the stopped path is
-  UNAVAILABLE — use the live removal path instead; (2c) STOP
-  THE PEER xpfd (the universal fence — a stopped peer cannot
-  push over ANY transport); (3)
+  JOIN IS ADDED TO THE PLAN AS A GAP-FREE OUTSTANDING-SYNC
+  COUNTER (r41 Codex M1, replacing the gapful queue-length +
+  gen-fence pair): a single atomic
+  `ConfigSyncOutstanding` counter on EACH node — INCREMENTED at
+  frame receipt (BEFORE enqueue, `sync_conn_read.go:298-324`)
+  and DECREMENTED only AFTER the apply returns (including the
+  applySem-blocked duration, `sync_conn_config.go:325-351`) —
+  independent of generation numbers and epoch resets, so
+  `outstanding == 0` is a true join with no false-idle window;
+  the counter is exposed read-only on the cluster status surface
+  (gRPC/CLI, BOTH nodes) and read LIVE at check time (a single
+  atomic — no joint-protection gap, r41 Codex m1's coherence
+  note answered by construction), with the implementation in the
+  §5.1 inventory and a coherence regression in §9. THE FENCE
+  SEQUENCE IS THEN (r41 Codex M2's ordering): (2a) PEER-SIDE
+  PREFLIGHT — on the PEER, verify peer `ConfirmDebtKindMask ==
+  0` AND peer `persistDegraded == false` AND peer
+  `ConfigSyncOutstanding == 0` — the peer's full state read path
+  is PINNED (r41 Codex M3: the peer's own `/health` endpoint on
+  its localhost ALREADY carries the debt mask and active-persist
+  state per the health-snapshot work, and the cluster-status RPC
+  gains the outstanding counter — the operator reads the peer's
+  health via the peer's localhost or SSH; the §5.1 inventory
+  wires the mask/persist fields into the cluster-status surface
+  alongside the counter); if the peer is not clean, the stopped
+  path is UNAVAILABLE — use the live removal path instead;
+  (2b) STOP THE PEER xpfd (the universal fence — a stopped peer
+  cannot push over ANY transport, and NO new inbound frames or
+  outbound pushes can initiate after it: outbound pushes require
+  a connected peer); (2c) LOCAL OUTSTANDING DRAIN — wait for the
+  LOCAL `ConfigSyncOutstanding == 0` (every in-flight inbound
+  apply completes, including any applySem-blocked one — the
+  counter by construction cannot report idle while an apply is
+  blocked); (3)
   the operator RE-CHECKS THE FULL STATE — `ConfirmDebtKindMask
-  == 0` AND `persistDegraded == false` (r39 Codex M1, verified
-  the mask-only gap: a queued apply can promote, cancel the old
+  == 0` AND `persistDegraded == false` AND
+  `ConfigSyncOutstanding == 0` (r39 Codex M1 + r41 Codex M2: the
+  mask-only gap — a queued apply can promote, cancel the old
   window, and FAIL its active write — `store.go:687-717,738-746`
   — leaving `ActivePersistDegraded` while the old record stands
-  as the SOLE crash-recovery intent, which a mask-only check
-  would read as clean and stop on top of), and only then (4)
+  as the SOLE crash-recovery intent — and the merely-enqueued or
+  applySem-blocked apply has not raised debt yet, which only the
+  counter sees), and only then (4)
   stops xpfd and repairs. The ordering after the repair is
   PINNED (r39 Codex M2): START THE LOCAL xpfd first — its
   `Load` classification completes BEFORE cluster comms
@@ -4532,6 +4623,19 @@ v20 history). The delivery is TWO units:
   package comment (`fsatomic.go:1-4`) and
   `pkg/fsatomic/README.md:3-12` (both currently claim exactly two
   writers) are updated for the third (r37 Codex m2).
+- `pkg/cluster` (r41 Codex M1/M2/M3 + SMR m1 — the observable
+  join): the gap-free `ConfigSyncOutstanding` atomic counter —
+  INCREMENTED at frame receipt BEFORE enqueue
+  (`sync_conn_read.go:298-324`), DECREMENTED only AFTER the apply
+  returns including the applySem-blocked duration
+  (`sync_conn_config.go:325-351`), independent of generation
+  numbers and epoch resets (`sync_conn_gen.go:340-362`); exposed
+  read-only on the cluster status surface (gRPC/CLI) on BOTH
+  nodes and read LIVE (single atomic — no joint-protection gap);
+  the cluster-status RPC also wires the confirm-side debt mask +
+  active-persist state (the peer-side preflight's read path —
+  the peer's own `/health` endpoint already carries them per the
+  health-snapshot work).
 - `pkg/configstore/store_commit.go` + `db.go` + `store.go` +
   `store_persist.go` (r11-r17): the `canonicalConfigHash` binding at
   the sole arm site (`writeConfirmState`); the additive `Resolved` +
@@ -5550,23 +5654,33 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      is safe LIVE (the probe's confirmed-absence barrier is
      idempotent), repair-to-valid FILESYSTEM remediation requires
      xpfd STOPPED with the MANDATORY `mask == 0` precondition
-     EXPLICIT and FENCED (the r36-r40 producer-quiesce protocol:
+     EXPLICIT and FENCED (the r36-r41 producer-quiesce protocol:
      (1) no live commit-confirmed window stands, (2) refrain
      from commits and FENCE the async producer ENFORCEABLY with
      the peer-side preflight — PEER full-state clean (peer
      `ConfirmDebtKindMask == 0` AND peer `persistDegraded ==
-     false`; an unclean peer makes the stopped path UNAVAILABLE
+     false` AND peer `ConfigSyncOutstanding == 0`, read via the
+     peer's own `/health` endpoint per r41 Codex M3; an unclean
+     peer makes the stopped path UNAVAILABLE
      — use live removal), then STOP THE PEER xpfd (the universal
      fence over every transport — `down em0` is NOT universal:
      sync falls back to fabric over possibly two paths,
-     `daemon_ha_sync.go:774-785,820-860`) — and
-     wait ONE full pass at the loop's
-     CAPPED backoff (drains the local receiver's queued apply),
+     `daemon_ha_sync.go:774-785,820-860`) — and DRAIN THE LOCAL
+     OUTSTANDING COUNTER (the gap-free `ConfigSyncOutstanding`
+     atomic — incremented at frame receipt BEFORE enqueue,
+     decremented only AFTER the apply returns including the
+     applySem-blocked duration; a queue-length + gen-fence pair
+     has three false-idle windows: dequeue precedes flag
+     publication, gen-0 applies are invisible, `resetRecvGen`
+     clears mid-apply) to ZERO,
      (3) RE-CHECK THE FULL STATE —
      `ConfirmDebtKindMask == 0` AND `persistDegraded == false`
+     AND `ConfigSyncOutstanding == 0`
      (a queued apply can leave `ActivePersistDegraded` with the
      old record as the sole crash-recovery intent — a mask-only
-     check reads it clean), (4) stop and repair — a debt raised mid-wait
+     check reads it clean; a merely-enqueued or applySem-blocked
+     apply has not raised debt yet, which only the counter
+     sees), (4) stop and repair — a debt raised mid-wait
      shows at the re-check; the blind-spot residuals are admitted
      and bounded: a mid-fence window deadline (the r29
      provenance loss) SPLIT by deadline at restart — still-
@@ -5599,6 +5713,13 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      `fsatomic.go:41-44` discipline; a test seam drives the
      failure path — defense-in-depth; the stopped
      requirement is the authoritative closure);
+     the JOIN-COHERENCE leg (r41 Codex m1 + SMR m1) — the
+     `ConfigSyncOutstanding` counter is read LIVE and coherent:
+     a framed-blocking-apply regression (frame dequeued, apply
+     blocked on `applySem` via the test seam) asserts the counter
+     NEVER reads zero until the apply returns — covering the
+     dequeue-before-flag-publication, gen-0-invisible, and
+     `resetRecvGen`-mid-apply windows the gapful pair had;
      the OBSERVABILITY leg
      (r32 Codex M1b) — `ConfigWriteUnverified` renders in /health
      and folds into the aggregate OR, and the retry loop ACTIVELY
