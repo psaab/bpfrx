@@ -1745,16 +1745,47 @@ run against real cluster traffic.
 `validateClusterAuthKeyStrict`
 (`pkg/config/compiler_validate_strict_cluster_auth.go`, invoked last in
 `runUniformGatesClusterZone` so every structural cluster error still wins the
-first-error slot) **rejects at commit / commit-check** a `chassis cluster`
-stanza whose `authentication-key` is absent or whitespace-only (whitespace
-would satisfy the runtime's `len(key) > 0` test while carrying no entropy).
+first-error slot) **rejects on the strict path** a `chassis cluster` stanza
+whose `authentication-key` is absent or whitespace-only. The whitespace case is
+an EMPTINESS normalization so the gate agrees with the runtime's
+`len(key) > 0` test — it is not an entropy floor, and a one-character key
+passes. Key strength is a continuum and is reported by
+`ClusterAuthKeyStrengthWarnings` as a `cfg.Warnings` entry on BOTH paths
+(below `MinAdvisedControlLinkKeyLen` = 16 characters, or a key matching one of
+this repository's published `CHANGE-ME`/`EXAMPLE-ONLY` placeholders) rather
+than rejected — hard-rejecting a weak-but-real key would create a new brick
+class for an operator who already configured authentication.
+
+**Strict here means every caller of `compileTreeStrict`, not just the operator
+commit.** Three paths reject an unkeyed cluster, and they differ in
+consequence:
+
+- `Store.Commit` / `CommitCheck` / `CommitConfirmed` — the operator commit.
+  **Inert for traffic:** the active config and the dataplane are untouched, so
+  the cluster keeps running while the operator adds the key.
+- `daemon.bootstrapFromFile` — the UNATTENDED first-boot import of
+  `/etc/xpf/xpf.conf`, taken whenever the config DB has no active config
+  (`daemon_run_bringup.go`). A reject leaves the node with **no active config**,
+  not a warning. This is the reimage / node-replacement / DR-restore path, and
+  the path `test/incus/cluster-setup.sh` takes on every `make cluster-deploy`
+  (it wipes `/etc/xpf/.configdb`).
+- `configstore.CheckText` — `xpfd check-config`, wired into
+  `scripts/deploy/xpf-deploy.py`, `scripts/image/make_config_drive.py` and the
+  first-boot loader `scripts/image/xpf-day0-config` (which falls back to the
+  factory bootstrap on reject).
+
 Lenient downgrade to a `cfg.Warnings` entry on the tolerant load / peer-sync
-path (`lenientClusterAuthKey`, #1960 no-brick) — and that downgrade **is** the
-upgrade path: a cluster that was unkeyed before this gate existed loads its
-stored config through `CompileConfigLenient` at daemon start, boots, keeps
-forwarding, and is keyed on the operator's next commit. A rejected commit is
-inert for traffic (the active config and dataplane are untouched), and
-dual-accept lets the key then be rolled out one node at a time.
+path (`lenientClusterAuthKey`, #1960 no-brick) — that downgrade **is** the
+IN-PLACE upgrade path: a cluster that was unkeyed before this gate existed
+keeps its config DB, loads it through `CompileConfigLenient` at daemon start,
+boots, keeps forwarding, and is keyed on the operator's next commit;
+dual-accept then lets the key roll out one node at a time. Because the
+unattended paths above fail closed, the migration has a REQUIRED ORDER: **key
+the running cluster first, then re-provision / reimage / rebuild a day-0
+drive.** `pkg/cluster/README.md` -> "Operating the control-link PSK (#6611)"
+is the operator-facing statement of that order, and of the #6628 caveat that
+session sync only picks the key up on a NEW connection (so a daemon restart is
+required for it to enforce).
 
 The gate error names the leaf and the remediation but never renders the value
 — `authentication-key` is `config.Secret`-typed and is in `ast_redact.go`'s
@@ -1764,9 +1795,13 @@ carries a key so the HA smoke cluster exercises the enforcing branch.
 Operator guidance (generation, distribution, rolling rollout, rotation) is in
 `pkg/cluster/README.md` → "Operating the control-link PSK (#6611)". Coverage:
 `cluster_authkey_required_6611_test.go` — strict reject, whitespace-only
-reject, tolerant-path warning, value-independent error text, and the
-shipped-config regression locks; negative controls assert a keyed cluster and
-a standalone (no `chassis cluster`) config are unaffected.
+reject, tolerant-path warning, value-independent error text, key-strength and
+placeholder advisories, and the shipped-config regression locks;
+`pkg/daemon/bootstrap_cluster_authkey_6611_test.go` and
+`pkg/configstore/check_cluster_authkey_6611_test.go` pin the two UNATTENDED
+strict paths (including that a rejected bootstrap leaves no active config).
+Negative controls assert a keyed cluster, a standalone (no `chassis cluster`)
+config, and a keyed unattended bootstrap are all unaffected.
 
 ## Trailing-token arity on scalar value leaves (#3332)
 

@@ -77,9 +77,112 @@ func TestKeyedClusterCommitsClean_6611(t *testing.T) {
 		t.Fatalf("ControlLinkAuthKey = %q, want the configured PSK", got)
 	}
 	for _, w := range cfg.Warnings {
-		if strings.Contains(w, "cluster authentication") {
-			t.Fatalf("keyed cluster emitted an auth warning: %q", w)
+		if strings.Contains(w, "downgraded to warning on tolerant path") &&
+			strings.Contains(w, "authentication-key") {
+			t.Fatalf("keyed cluster emitted the missing-key warning: %q", w)
 		}
+		if strings.Contains(w, "authentication-key is") ||
+			strings.Contains(w, "looks like a placeholder") {
+			t.Fatalf("a 22-character non-placeholder key emitted a strength "+
+				"warning: %q", w)
+		}
+	}
+}
+
+// TestShortClusterAuthKeyWarnsNotRejected_6611 pins the deliberate asymmetry
+// between absence and weakness. Absence is binary and is rejected; strength is
+// a continuum, so a short key WARNS on both paths and still commits. Rejecting
+// it would create a new brick class — including via bootstrapFromFile, which is
+// unattended — for an operator who already configured authentication.
+func TestShortClusterAuthKeyWarnsNotRejected_6611(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key abc",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("commit rejected a short but real key (must warn, not reject): %v", err)
+	}
+	var found string
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "authentication-key is 3 characters") {
+			found = w
+			break
+		}
+	}
+	if found == "" {
+		t.Fatalf("no key-strength warning for a 3-character key; warnings=%v", cfg.Warnings)
+	}
+	if !strings.Contains(found, "16 or more is advised") {
+		t.Fatalf("strength warning does not state the advised floor: %q", found)
+	}
+	// The key itself must never be rendered.
+	if strings.Contains(found, "abc") {
+		t.Fatalf("strength warning leaked the key: %q", found)
+	}
+}
+
+// TestPlaceholderClusterAuthKeyWarns_6611 covers the copied-reference-config
+// case: the shipped configs carry PUBLISHED lab values, so a config using one
+// satisfies the gate while remaining forgeable by anyone who has read the repo.
+// It cannot be a hard reject — test/incus/cluster-setup.sh deploys
+// docs/ha-cluster.conf verbatim — so it warns.
+func TestPlaceholderClusterAuthKeyWarns_6611(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key xpf-lab-ha-psk-cluster-1-CHANGE-ME",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("commit rejected a placeholder key (must warn, not reject): %v", err)
+	}
+	var found string
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "looks like a placeholder") {
+			found = w
+			break
+		}
+	}
+	if found == "" {
+		t.Fatalf("no placeholder warning for a shipped lab key; warnings=%v", cfg.Warnings)
+	}
+	if strings.Contains(found, "xpf-lab-ha-psk") {
+		t.Fatalf("placeholder warning leaked the key: %q", found)
+	}
+}
+
+// TestClusterAuthKeyStrengthWarningsOnTolerantPath_6611 proves the advisories
+// are path-independent: a provisioning/day-0 config loaded leniently gets the
+// same signal an operator commit does.
+func TestClusterAuthKeyStrengthWarningsOnTolerantPath_6611(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key xy",
+	})
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("tolerant path rejected a short key: %v", err)
+	}
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "authentication-key is 2 characters") {
+			return
+		}
+	}
+	t.Fatalf("tolerant path emitted no key-strength warning; warnings=%v", cfg.Warnings)
+}
+
+// TestStandaloneEmitsNoStrengthWarning_6611 is the strength guard's NEGATIVE
+// CONTROL: no cluster stanza means no key to judge.
+func TestStandaloneEmitsNoStrengthWarning_6611(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.1.1/24",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("commit rejected a standalone config: %v", err)
+	}
+	if got := ClusterAuthKeyStrengthWarnings(cfg); got != nil {
+		t.Fatalf("standalone config produced key-strength warnings: %v", got)
 	}
 }
 

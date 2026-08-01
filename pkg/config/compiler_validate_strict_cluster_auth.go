@@ -25,17 +25,34 @@ import (
 // sessions, and inject synthetic sessions. Before this gate, an unkeyed cluster
 // committed silently: nothing in the configuration layer even mentioned it.
 //
-// Strict on commit / commit-check: an operator at a CLI can always add the key
-// before re-committing, and the cluster keeps running while they do — a
-// rejected commit does not disturb the active config or the dataplane.
+// STRICT applies to EVERY caller of compileTreeStrict, which is more than the
+// operator commit. All three of these refuse an unkeyed cluster:
+//
+//	Store.Commit / CommitCheck / CommitConfirmed — the operator commit. A
+//	  rejection here is inert for traffic: the active config and the dataplane
+//	  are untouched, so the cluster keeps running while the operator adds a key.
+//	daemon.bootstrapFromFile (daemon_apply_commit.go) — the UNATTENDED first-boot
+//	  import of /etc/xpf/xpf.conf, taken whenever the config DB has no active
+//	  config (daemon_run_bringup.go). A rejection here leaves the node with NO
+//	  active config — it does not boot with a warning. This is the path a
+//	  reimaged / replaced / DR-restored node takes, and the path
+//	  test/incus/cluster-setup.sh takes on every cluster-deploy (it wipes
+//	  /etc/xpf/.configdb).
+//	configstore.CheckText — `xpfd check-config`, wired into
+//	  scripts/deploy/xpf-deploy.py, scripts/image/make_config_drive.py and the
+//	  first-boot loader scripts/image/xpf-day0-config (which falls back to the
+//	  factory bootstrap on reject).
+//
+// So the migration order matters and is documented in pkg/cluster/README.md:
+// key the RUNNING cluster first (that commit is accepted), and only then
+// re-provision, reimage, or rebuild a day-0 drive.
 //
 // Lenient on load / peer-sync (opts.lenientClusterAuthKey): an already-persisted
 // or peer-synced unkeyed config still BOOTS with a warning (#1960 no-brick).
-// That is what preserves the upgrade path — a cluster that was unkeyed before
-// the upgrade loads its stored config through CompileConfigLenient, comes up,
-// and keeps forwarding; the operator is told to set a key on the next commit
-// rather than losing the cluster at boot. The dual-accept grace in all three
-// mechanisms means a key can then be rolled out one node at a time.
+// That is what preserves the IN-PLACE upgrade path — a cluster that was unkeyed
+// before the upgrade keeps its config DB, loads it through CompileConfigLenient,
+// comes up, and keeps forwarding. The dual-accept grace in all three mechanisms
+// means a key can then be rolled out one node at a time.
 //
 // The key is compared only for emptiness and is never echoed into the error —
 // the whole point of Secret (compiler_system.go) is that it never reaches a log
@@ -44,9 +61,13 @@ func validateClusterAuthKeyStrict(cfg *Config) error {
 	if cfg == nil || cfg.Chassis.Cluster == nil {
 		return nil
 	}
-	// TrimSpace: a whitespace-only key satisfies the runtime's len(key) > 0
-	// test and would "work" as a PSK with essentially no entropy. Treat it as
-	// unset here so the strict path refuses it rather than blessing it.
+	// TrimSpace normalizes emptiness so this gate agrees with the runtime's
+	// len(key) > 0 test: a whitespace-only key is "configured" to the runtime
+	// but is not a key. This is an EMPTINESS floor, not an entropy floor — a
+	// one-character key passes here. Key strength is a continuum and is
+	// surfaced by ClusterAuthKeyStrengthWarnings rather than rejected, so a
+	// weak-but-real key never becomes a new brick class for an operator who
+	// already did the right thing.
 	if strings.TrimSpace(cfg.Chassis.Cluster.ControlLinkAuthKey.Reveal()) != "" {
 		return nil
 	}
@@ -57,4 +78,59 @@ func validateClusterAuthKeyStrict(cfg *Config) error {
 		"or clear sessions, and inject sessions; set `chassis cluster " +
 		"authentication-key <key>` to the SAME value on both nodes (generate " +
 		"one with `openssl rand -base64 32`)")
+}
+
+// MinAdvisedControlLinkKeyLen is the length below which
+// ClusterAuthKeyStrengthWarnings flags a control-link PSK as weak. The PSK
+// backs HMAC-SHA256 on the heartbeat, the fabric bearer token and the
+// session-sync frame MAC; 16 characters is the floor at which a key is worth
+// more than a dictionary guess, and `openssl rand -base64 32` (the documented
+// generator) produces 44.
+const MinAdvisedControlLinkKeyLen = 16
+
+// clusterAuthKeyPlaceholderMarkers are substrings that identify a key copied
+// verbatim from a reference config in this repository. Those values are
+// PUBLISHED, so a config carrying one satisfies validateClusterAuthKeyStrict
+// while remaining trivially forgeable by anyone who has read the repo.
+var clusterAuthKeyPlaceholderMarkers = []string{"change-me", "example-only"}
+
+// ClusterAuthKeyStrengthWarnings reports control-link PSK weaknesses that are
+// real but do not justify refusing the config: a key that is short, or one
+// copied verbatim from a shipped reference config. These are WARNINGS on both
+// the strict and tolerant paths — unlike absence, which is binary and is
+// rejected, key strength is a continuum, and hard-rejecting a short key would
+// brick a commit (and, via bootstrapFromFile, a provision) for an operator who
+// already configured authentication.
+//
+// The warning never renders the key: it reports the length, and for a
+// placeholder it names the marker that matched, which is a literal from this
+// repository rather than operator key material.
+func ClusterAuthKeyStrengthWarnings(cfg *Config) []string {
+	if cfg == nil || cfg.Chassis.Cluster == nil {
+		return nil
+	}
+	key := strings.TrimSpace(cfg.Chassis.Cluster.ControlLinkAuthKey.Reveal())
+	if key == "" {
+		return nil // absence is validateClusterAuthKeyStrict's business
+	}
+	var out []string
+	if len(key) < MinAdvisedControlLinkKeyLen {
+		out = append(out, fmt.Sprintf("chassis cluster authentication-key is %d "+
+			"characters; %d or more is advised (the PSK backs HMAC-SHA256 on the "+
+			"heartbeat, the fabric bearer token and the session-sync frame MAC) — "+
+			"generate one with `openssl rand -base64 32`",
+			len(key), MinAdvisedControlLinkKeyLen))
+	}
+	lower := strings.ToLower(key)
+	for _, marker := range clusterAuthKeyPlaceholderMarkers {
+		if strings.Contains(lower, marker) {
+			out = append(out, fmt.Sprintf("chassis cluster authentication-key looks "+
+				"like a placeholder copied from a reference config (it contains %q); "+
+				"those values are published in this repository, so the control "+
+				"channel is forgeable by anyone who has read it — replace it with a "+
+				"key generated by `openssl rand -base64 32`", marker))
+			break
+		}
+	}
+	return out
 }

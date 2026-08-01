@@ -295,5 +295,13 @@ func runUniformGatesClusterZone(tree *ConfigTree, cfg *Config, opts compileOpts)
 		}
 	}
 
+	// #6611 key-strength advisories. Absence is binary and is rejected above;
+	// strength is a continuum, so a short key or one copied verbatim from a
+	// published reference config WARNS on both paths rather than failing the
+	// config. Rejecting those would create a new brick class (including via
+	// bootstrapFromFile, an unattended path) for an operator who already
+	// configured authentication.
+	cfg.Warnings = append(cfg.Warnings, ClusterAuthKeyStrengthWarnings(cfg)...)
+
 	return nil
 }

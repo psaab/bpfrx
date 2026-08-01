@@ -182,13 +182,26 @@ editing cmdtree.
   unkeyed cluster runs its entire control channel unauthenticated, and
   every config this repository shipped used to be unkeyed — so the
   enforcing branches were never exercised. `validateClusterAuthKeyStrict`
-  now hard-rejects an unkeyed `chassis cluster` on the strict commit /
-  commit-check path and warns on the tolerant load / peer-sync path
-  (#1960 no-brick: an already-unkeyed cluster still boots after upgrade
+  now hard-rejects an unkeyed `chassis cluster` on the STRICT compile
+  path and warns on the tolerant load / peer-sync path (#1960 no-brick:
+  an in-place-upgraded unkeyed cluster keeps its config DB, still boots,
   and is keyed on its next commit), and every reference/test config sets
-  a key. Operator guidance — generation, distribution, rolling rollout,
-  rotation — is in `pkg/cluster/README.md` → "Operating the control-link
-  PSK (#6611)". The stronger residuals —
+  a key. Strict is every caller of `compileTreeStrict`, not just the
+  operator commit: `daemon.bootstrapFromFile` (the UNATTENDED first-boot
+  import, where a reject leaves the node with NO active config) and
+  `configstore.CheckText` (`xpfd check-config`, behind xpf-deploy and
+  the day-0 loader) also refuse — so provisioning a NEW node fails
+  closed, and the migration has a required order: key the running
+  cluster first, then re-provision. Note also that session sync fixes a
+  connection's auth state at connect and committing the key does not
+  restart cluster comms, so an established stream stays unauthenticated
+  until a daemon restart (#6628); config-sync carries the PSK in the
+  clear over that HMAC-only link, so the key must be provisioned
+  out-of-band (#6629); and rotation has no key overlap, making a
+  mismatch a ~1s dual-master window rather than an auth hiccup (#6630).
+  Operator guidance — generation, distribution, rolling rollout with the
+  required restart, rotation — is in `pkg/cluster/README.md` →
+  "Operating the control-link PSK (#6611)". The stronger residuals —
   removing the ~1-window replay horizon (mTLS with per-node certs) and
   HMAC-authenticating the session-sync stream (#4107 F23) — remain deferred
   (see `pkg/cluster/README.md`).

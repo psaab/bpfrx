@@ -423,66 +423,159 @@ a session-sync connection. Before #6611 every config this repository shipped,
 documented and tested was unkeyed, so the enforcing branches were dead code
 in practice.
 
-**Commit gate.** `validateClusterAuthKeyStrict`
-(`pkg/config/compiler_validate_strict_cluster_auth.go`) hard-rejects a
-`chassis cluster` with no key on the **strict** commit / commit-check path,
-and downgrades to a `cfg.Warnings` entry on the **tolerant** load / peer-sync
-path (`opts.lenientClusterAuthKey`). That split is the migration contract:
+### Where the key is required
 
-- A cluster that was unkeyed before the upgrade loads its stored config
-  through `CompileConfigLenient` at daemon start, so it **boots and keeps
-  forwarding** — #1960 no-brick. It warns instead.
-- The operator's next `commit` is refused until they set a key. The refusal
-  is inert for traffic: a rejected commit leaves the active config and the
-  dataplane untouched.
+`validateClusterAuthKeyStrict`
+(`pkg/config/compiler_validate_strict_cluster_auth.go`) rejects a `chassis
+cluster` with no key on the **strict** compile path and downgrades to a
+`cfg.Warnings` entry on the **tolerant** path (`opts.lenientClusterAuthKey`).
+Strict is **not** only the operator commit — it is every caller of
+`compileTreeStrict`:
 
-**Generating a key.** Any high-entropy string; 32 bytes of base64 is a good
-default:
+| path | caller | effect of a reject |
+|---|---|---|
+| operator commit | `Store.Commit` / `CommitCheck` / `CommitConfirmed` | **Inert for traffic.** The active config and the dataplane are untouched; the cluster keeps running while you add the key. |
+| **first-boot import** | `daemon.bootstrapFromFile` (`daemon_apply_commit.go`), taken whenever the config DB has no active config (`daemon_run_bringup.go`) | **The node comes up with NO active config** — unattended, no warning. |
+| **day-0 validation** | `configstore.CheckText` (`xpfd check-config`) | `xpf-deploy.py` dies; `make_config_drive.py` refuses; the first-boot loader `scripts/image/xpf-day0-config` falls back to the **factory bootstrap**. |
+| load / peer config-sync | `Store.Load`, `SyncApply` → `compileTreeLenient` | **Warns and boots.** This is the in-place upgrade path. |
+
+So an **in-place upgrade is safe** — that population keeps its `.configdb`
+and loads leniently. What is NOT safe is provisioning a node **without** a DB
+while the cluster's config is still unkeyed: reimaging or replacing a failed
+node, restoring from an archived text config, or building a day-0 drive from
+an unkeyed config. A node in that state comes up unconfigured, and a
+factory-default node never forms the cluster, so peer config-sync cannot
+rescue it. This repository's own `make cluster-deploy` takes that path —
+`test/incus/cluster-setup.sh` pushes the text config and then `rm -rf
+/etc/xpf/.configdb`.
+
+### Required order
+
+> **Key the RUNNING cluster first. Only then re-provision, reimage, or
+> rebuild a day-0 drive.** The keying commit itself is always accepted, so
+> this order always works. The reverse order strands the new node.
+
+### Generating and distributing the key
+
+Any high-entropy string; 32 bytes of base64 is a good default:
 
 ```
 openssl rand -base64 32
 ```
 
-**Distribution.** The key must be **identical on both nodes** and must NOT be
-`${node}`-scoped — each node signs with it and verifies the peer with the
-same value, so a per-node key authenticates nothing and leaves the channel
-permanently in dual-accept. Put it in the shared (non-group) `chassis
-cluster` stanza, as the reference configs do. With `configuration-synchronize`
-the RG0 primary propagates it to the peer on commit.
+The key must be **identical on both nodes** and must NOT be `${node}`-scoped —
+each node signs with it and verifies the peer with the same value, so a
+per-node key authenticates nothing and leaves the channel permanently in
+dual-accept. Put it in the shared (non-group) `chassis cluster` stanza, as
+the reference configs do.
 
-**Rollout onto a live unkeyed cluster.** Dual-accept makes this
-non-disruptive and order-independent:
+**Provision it out-of-band — do not rely on `configuration-synchronize` to
+carry it (#6629).** Config-sync serializes the active config and writes it
+over the session-sync stream, which is HMAC-authenticated but **not
+encrypted**; during the very first rollout that stream is also still
+unauthenticated (see below). A passive observer on the control segment can
+therefore learn the PSK from the commit that installs it. Push the key to
+each node by the same trusted channel you use for any other secret.
+
+### Rolling it onto a live unkeyed cluster
+
+Dual-accept makes the forward direction non-disruptive:
 
 1. Set the key on one node and commit. It now signs; the unkeyed peer has no
    key, so it accepts everything, and the keyed node has not armed
    enforcement yet, so it still accepts the peer's unsigned frames.
 2. Set the SAME key on the other node and commit. Both sign, each observes
-   the other authenticate, and enforcement arms — an unsigned frame is from
-   then on rejected as a downgrade.
+   the other authenticate, and enforcement arms.
+3. **Restart `xpfd` on both nodes**, one at a time, waiting for the cluster
+   to re-form in between.
+
+Step 3 is not optional. **Session sync fixes a connection's authentication
+state when the TCP connection is established** (`performSyncHandshake` →
+`wrapSyncConn`), and committing the key does **not** restart cluster comms —
+the restart decision compares only `clusterTransportKey`
+(`daemon_apply_tail.go` / `daemon_ha_sync.go`), which does not include the
+auth key. So an already-established session-sync stream stays
+**unauthenticated indefinitely** after the key is committed: a hostile stream
+admitted before the commit keeps injecting frames, and legitimate traffic
+stays unsigned until an incidental disconnect or a restart. The heartbeat and
+the fabric gRPC listener DO pick the key up immediately (both read the live
+key per frame / per RPC); only session sync is connection-scoped. Tracked as
+**#6628** — until it is fixed, the restart is the operator's part of the
+contract.
 
 Confirm the posture with `show chassis cluster statistics`, whose
 `Authentication:` line (`controlLinkAuthStatus`) reads
 `engaged (peer authenticated; unauthenticated frames rejected)` once both
 nodes are keyed — `dual-accept (...)` means the channel is still
-unauthenticated in practice.
+unauthenticated in practice. Note this line reflects the heartbeat/fabric
+posture; it does not tell you whether an existing session-sync connection
+predates the key.
 
-**Rotation.** The token/HMAC construction has no key-id field, so a rotation
-is a second rollout: change the key on one node (that node's frames are now
-unverifiable by the peer, which rejects them once armed), then immediately on
-the other. Rotate during a maintenance window, or clear the key on both nodes
-first to return to dual-accept and re-key from there. The
-`authentication-key` leaf is `config.Secret`-typed and redacted in every
-show/log/JSON render, so the live value cannot be read back off the box —
-keep it in your own secret store.
+**Rolling BACK is not symmetric.** `peerAuthSeen` is sticky in memory and
+clears only on restart, so a node that has seen its peer authenticate will
+reject that peer's unsigned heartbeats. Returning one node to an unkeyed
+config or an older binary while the other stays armed produces the same
+split-brain described under rotation.
 
-**Shipped configs.** `docs/ha-cluster.conf`, `docs/ha-cluster-loss.conf`,
+### Rotation
+
+There is no key-id, no previous/current overlap and no coordinated rekey, so
+rotation is a **planned-outage operation, not a rolling one**.
+
+While the two nodes hold different keys, each receives a present-but-invalid
+HMAC from the other. `handleFrame` rejects those frames and `continue`s
+**without refreshing `lastSeen`** (`heartbeat.go`), so neither node refreshes
+peer liveness: after `heartbeat-interval × heartbeat-threshold` (200 ms × 5 =
+**~1 s** at the defaults) **both** nodes declare the peer dead and **both**
+take over their redundancy groups — dual-master with duplicate VIPs on the
+wire for the whole window between the two commits.
+
+Procedure:
+
+1. Take a maintenance window.
+2. Commit the new key on both nodes back-to-back, keeping the gap as short as
+   possible — that gap is the dual-master window.
+3. Restart `xpfd` on both nodes (per #6628 above, and to clear the sticky
+   `peerAuthSeen`).
+
+Do **not** try to "return to dual-accept" by clearing the key first: an
+unkeyed `chassis cluster` is exactly what the commit gate rejects, so that
+path does not exist. Tracked as **#6630**.
+
+### Key strength
+
+The commit gate is an **emptiness floor, not an entropy floor**: it rejects an
+absent or whitespace-only key (whitespace would satisfy the runtime's
+`len(key) > 0` test while being no key at all), but a one-character key
+passes. Strength is a continuum, so `ClusterAuthKeyStrengthWarnings` reports
+it as a **warning** on both paths rather than rejecting — hard-rejecting a
+short key would create a new brick class, including via the unattended
+`bootstrapFromFile` path, for an operator who already configured
+authentication. It warns below `MinAdvisedControlLinkKeyLen` (16 characters)
+and when the key looks like one of this repository's published placeholders.
+
+### Shipped configs
+
+`docs/ha-cluster.conf`, `docs/ha-cluster-loss.conf`,
 `docs/ha-cluster-userspace.conf`, `test/incus/xpf-cluster-fw{0,1}.conf` and
 `examples/deploy/ha-pair.conf` all carry a key, so the HA smoke cluster
 exercises the ENFORCING branch rather than the `keyConfigured == false`
-shortcut. Those are **lab values published in a public repository** — replace
-them before any real deployment.
+shortcut. Those values are **published in a public repository**: a config
+copied from them satisfies the gate while remaining trivially forgeable by
+anyone who has read the repo. They are marked `CHANGE-ME` and trip the
+placeholder warning above. Replace them before any real deployment.
 `TestShippedClusterConfigsAreKeyed_6611` / `...UseOneKeyPerCluster_6611`
-(`pkg/config`) lock both properties.
+(`pkg/config`) lock the keyed and one-key-per-cluster properties;
+`TestBootstrapFromFileRejectsUnkeyedCluster_6611` (`pkg/daemon`) and
+`TestCheckTextRejectsUnkeyedCluster_6611` (`pkg/configstore`) pin the two
+unattended strict paths.
+
+The `authentication-key` leaf is `config.Secret`-typed and is redacted in the
+ordinary show/log/JSON render paths (`ast_redact.go`), so it is not exposed to
+routine operator output or diagnostics. That is not an absolute guarantee: a
+sufficiently privileged CLI class can still render cleartext configuration,
+and config-sync transmits it in the clear (#6629). Keep the authoritative copy
+in your own secret store.
 
 ## IPsec SA sync
 
