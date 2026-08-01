@@ -1,9 +1,11 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v53 — r52 findings folded (Codex NEEDS-REVISION
-  4M/1m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/2m;
-  all three confirm the §4.7 structure); pending convergence
-  review r53
+- **Status**: DRAFT v54 — r53 findings folded (Codex NEEDS-REVISION
+  4M/1m; AGY PLAN-READY-WITH-NITS 0M/1m — the pending-arm
+  inventory, IS Codex M3; Claude SMR PLAN-READY-WITH-NITS
+  0M/2m — the token seeding IS part of Codex M2, the pending
+  observability IS Codex M3; all three confirm the §4.7
+  structure); pending convergence review r54
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -2303,6 +2305,56 @@
   double digest check is the ONLY join. (e) The §9 legs gain
   the composite-reader leg, the attempt-token legs across all
   four arms, and the pending/failed distinction leg.
+  v54: r53 convergence — the reconciler gains the pre-send
+  staleness re-check, the token lifecycle and the pending
+  state are fully inventoried, the count semantics align to
+  the tri-state, and the v53 claimed-but-missing folds are
+  actually written (Codex NEEDS-REVISION 4M/1m, folds 1
+  FOLDED / 4 PARTIAL, structure confirmed; AGY
+  PLAN-READY-WITH-NITS 0M/1m — the pending-arm inventory, IS
+  Codex M3; SMR PLAN-READY-WITH-NITS 0M/2m — the token seeding
+  IS part of Codex M2, the pending observability IS Codex M3):
+  (a) THE PRE-SEND STALENESS RE-CHECK (Codex M1, verified the
+  paused-claimant class has no timing bound: the reconciler
+  claims its marker and unlocks BEFORE `QueueConfig`,
+  `daemon_ha_sync.go:462-497`, and a claimant paused past both
+  digest reads can resume and take a fresh wire generation,
+  `sync_conn_config.go:230-243`): the reconciler RE-VALIDATES
+  its captured generation against the store's current active
+  generation immediately before `QueueConfig` — a stale
+  capture drops with an alarm — closing the class by
+  construction, not timing; the observation order is also
+  de-circularized (the post-election read DETECTS, the
+  re-convergence commit follows, the two bracketing reads
+  FOLLOW the re-convergence). (b) THE TOKEN LIFECYCLE (Codex
+  M2): uint64 monotonic, minted at the central full-apply
+  entry, daemon-owned and published with the configstore's
+  versioned snapshot, threaded through the deferring manager
+  calls (the tokenless interfaces at `apply.go:37-40,130-134`
+  gain it), with manager/helper-restart inheritance seeded
+  from the helper's reported generation on attach (the #6034
+  resume pattern, `process_status.go:165-172`). (c) THE
+  PENDING STATE IS INVENTORIED AND OBSERVABLE (Codex M3 = AGY
+  m1 = SMR m2): the snapshot carries the current attempt
+  token + a pending-arm count (incremented on deferral,
+  decremented on a token-matching completion), rendered beside
+  lastOK/count. (d) THE COUNT SEMANTICS ALIGN TO THE
+  TRI-STATE (Codex M4, verified the contradiction: §9's h2d
+  leg and the §5.1 text still drove count++ on retryable
+  rejections while the tri-state said pending does not
+  increment and acceptance requires count==0): a retryable
+  rejection is PENDING (count unmoved); the count moves only
+  on a TERMINAL failure (an apply pipeline failure or an arm's
+  retry budget exhausted). (e) THE PUBLICATION METHOD AND THE
+  WRITER DOUBLE-BUMP ARE ACTUALLY WRITTEN (Codex m1 — the v53
+  revision entry claimed them folded but the normative text
+  never gained them, the second honest-fold failure of this
+  loop, repaired here): the store's `NoteApplyOutcome`-shaped
+  boundary method is the single publication entry every
+  failure class flows through, and the writer bumps the
+  version BEFORE and AFTER publishing (odd-in-flight /
+  even-stable; the reader retries on an odd or changed
+  version).
 
 ---
 
@@ -4776,10 +4828,26 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   later self-heal, `daemon_ha_sync.go:479-484`): the
   re-convergence commit runs only AFTER the authority's first
   post-election post-stability reconcile pass is OBSERVED
-  complete (the interval-bracketed digest check below — the
-  ONLY join; the ConfigsSent tick and the marker no-op are
-  WITHDRAWN as witnesses, r52 Codex M4: a no-op pass never
-  ticks, and the marker is private, `daemon.go:420-424`); a
+  complete — the join is the interval-bracketed digest check
+  below PLUS the reconciler's own PRE-SEND STALENESS RE-CHECK
+  (r53 Codex M1, verified the paused-claimant class has no
+  timing bound: the reconciler claims its marker and unlocks
+  BEFORE `QueueConfig`, `daemon_ha_sync.go:462-497`, and a
+  claimant paused past both digest reads can resume and take a
+  fresh wire generation, `sync_conn_config.go:230-243`): the
+  reconciler RE-VALIDATES its captured generation against the
+  store's CURRENT active generation immediately before
+  `QueueConfig` — a capture that no longer matches drops with
+  an alarm — so a stale capture can NEVER be pushed regardless
+  of pause length (a code-level pin inside the H2 work, not a
+  timing argument); the ConfigsSent tick and the marker no-op
+  remain WITHDRAWN as witnesses (r52 Codex M4: a no-op pass
+  never ticks, and the marker is private, `daemon.go:420-424`);
+  and the observation ORDER is non-circular: the post-election
+  digest read DETECTS the divergence, the re-convergence
+  commit follows, and the two bracketing reads FOLLOW the
+  re-convergence (one after it, one after one full interval);
+  a
   stale pass's old-text push is then OVERWRITTEN by the
   operator's commit push (newer wire generation), and every
   later pass carries the intended text — with sync DISABLED no config flows regardless of
@@ -5839,7 +5907,17 @@ v20 history). The delivery is TWO units:
   side is seqlock-style: read the version, read the snapshot,
   RE-READ the version, retry on change (the show path takes no
   applySem, so the versioned re-read is the linearization
-  point) — and the COMPOSITE readers join the same publication
+  point), with the WRITE side's double-bump and the
+  publication method NAMED (r53 Codex m1 — claimed-folded in
+  v53 but never actually written, an honest-fold failure
+  repaired here): the writer bumps the version BEFORE and
+  AFTER publishing (odd-in-flight / even-stable; the reader
+  retries on an odd or changed version), and the daemon
+  publishes every apply outcome through the store's
+  `NoteApplyOutcome`-shaped boundary method (the single
+  publication entry every failure class flows through —
+  including pre-promotion compile failures, which never touch
+  the store's own commit paths) — and the COMPOSITE readers join the same publication
   (r52 Codex M1, verified: `handleConfigSync`'s #4957 converged
   shortcut reads `ShowActive` and `ActiveApplied` in SEPARATE
   store lock transactions, `daemon_ha_sync.go:544-568`,
@@ -5862,9 +5940,15 @@ v20 history). The delivery is TWO units:
   `daemon_apply_dataplane.go:137-163`): `lastApplyOK` reads
   TRUE only when the dataplane phase actually converged — the
   deferred-MAC retry-debt outcome and the nil-dp skip both
-  record NOT-converged (count++, lastOK false), AND the
-  pending-XSK publication deferral records NOT-converged until
-  the deferred publication COMPLETES (r51 Codex M3, verified:
+  record FAILED (count++, lastOK false — a TERMINAL outcome:
+  the debt's retry is bounded by the #5134 worker-arm retry
+  machinery and its exhaustion is terminal), AND the
+  pending-XSK publication deferral records PENDING — NOT
+  converged, WITHOUT moving the count — until the deferred
+  publication COMPLETES or its retry budget is EXHAUSTED (the
+  r53 Codex M4 alignment: a retryable rejection is PENDING;
+  only a terminal failure increments), with the lastOK/count
+  semantics per the tri-state (r51 Codex M3, verified:
   the userspace compile records the desired snapshot and
   returns nil while explicitly deferring publication,
   `manager_compile.go:230-257,289-298`,
@@ -5887,16 +5971,36 @@ v20 history). The delivery is TWO units:
   swallowed, `daemon_apply_dataplane.go:390-401`,
   `process_linkcycle.go:184-224`): EVERY asynchronous arm —
   deferred-MAC, pending-XSK publication, XSK-liveness probe,
-  link-cycle rebind — carries the apply's ATTEMPT TOKEN (a
-  monotonic per-apply generation); the signal reads CONVERGED
+  link-cycle rebind — carries the apply's ATTEMPT TOKEN, with
+  the token's full lifecycle PINNED (r53 Codex M2, verified it
+  was unspecified): the token is a uint64 monotonic per-apply
+  generation (no overflow), MINTED at the central full-apply
+  entry (`applyConfigLocked`), OWNED by the daemon and
+  PUBLISHED with the configstore's versioned snapshot, THREADED
+  through the manager calls that defer (the tokenless
+  interfaces at `apply.go:37-40,130-134` gain it), with the
+  manager/helper-restart INHERITANCE seeded from the helper's
+  reported generation on attach (the #6034 resume pattern,
+  `process_status.go:165-172` — a completion from a prior
+  daemon incarnation can never carry a current token), and a
+  process-lifetime namespace (the predicate is consulted
+  post-restart, where the freshly-seeded token series rejects
+  every pre-restart completion); the signal reads CONVERGED
   only when the pipeline AND every arm's completion carry the
   CURRENT attempt token; and the state machine distinguishes
   CONVERGED / PENDING / FAILED — a PENDING arm does NOT
   increment the failure count (the count moves only on a
-  terminal failure), so a clean completion or a
+  terminal failure — an apply pipeline failure or an arm's
+  retry budget EXHAUSTED; a retryable rejection is PENDING, not
+  FAILED), so a clean completion or a
   success-after-rejection rehabilitates the predicate, while
   the predicate requires count==0 AND no pending arm
-  outstanding AND lastOK) — so an
+  outstanding AND lastOK; and the snapshot CARRIES the pending
+  state (r53 Codex M3 = r53 AGY m1 = r53 SMR m2): the current
+  attempt token + a pending-arm count (incremented when an arm
+  defers, decremented on a token-matching completion),
+  rendered beside lastOK/count on the status surface so the
+  no-pending-outstanding term is operator-checkable) — so an
   in-flight or
   parked apply reads not-success (the false-green-in-flight
   window, r49 Codex M1: a DHCP/feed reapply can be mid-flight
@@ -7257,7 +7361,14 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      re-driving the intended text on ANY flip (the operator's
      commit push carries the newest wire generation); a
      still-flipping state after two intervals is a stuck-lock
-     incident — fail-closed (r51 Codex M4 + r51 AGY M1);
+     incident — fail-closed (r51 Codex M4 + r51 AGY M1); AND
+     the reconciler itself gains the PRE-SEND STALENESS
+     RE-CHECK (r53 Codex M1: the claim-then-unlock-then-send
+     window, `daemon_ha_sync.go:462-497`, has no timing bound —
+     the reconciler re-validates its captured generation
+     against the store's current active generation immediately
+     before `QueueConfig`, and a stale capture drops with an
+     alarm, so no pause length can push old text);
      a per-node commit on a read-only secondary is executed by
      PROMOTING it first with the existing manual-failover
      request (promotion clears the read-only gate,
@@ -7450,10 +7561,12 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      reads is caught by the version change), and the
      single-owner publication order regression (every promotion
      and every stamp publishes the same versioned snapshot);
-     (h2d) the PENDING-XSK REJECTION leg (r51 Codex M3/m1): a
-     deferred-publication rejection drives lastOK=false /
-     count++ and the predicate cannot bless until the
-     publication completes;
+     (h2d) the PENDING-XSK REJECTION leg (r51 Codex M3/m1 +
+     r53 Codex M4): a deferred-publication rejection is PENDING
+     — lastOK=false, the count UNMOVED — while its retry
+     budget lasts, and the predicate cannot bless until the
+     publication completes (only budget exhaustion or an apply
+     pipeline failure moves the count);
      (h2e) the OUTBOUND-CLAIMANT legs (r51 Codex M4/m1): the
      paused-claimant / reconnect / commit / release ordering
      (a pass paused after its marker claim survives a reconnect
