@@ -33,6 +33,23 @@ import (
 // could quietly invert. If a future change genuinely needs to reject one of
 // these, that belongs in a separate gate with its own justification, not here.
 //
+// ONE aggregated advisory per commit, not one per tunnel. An advisory that
+// fires N times on every commit is filtered out, and then it protects nobody —
+// the same reason compiler_system.go folds several inert knobs into a single
+// message. The affected tunnels are named inside it.
+//
+// It fires whenever a secure tunnel is configured, NOT only when one carries a
+// zone. Leaving a tunnel out of a zone is not a mitigation: an interface in no
+// zone resolves to zone id 0, and a `from-zone any to-zone any permit` rule
+// matches zone-pair (0,0) with no zone guard (#6682). So an unzoned tunnel's
+// plaintext is not merely unpoliced — it can be affirmatively PERMITTED by a
+// wildcard rule. Gating this advisory on zoning would tell that operator
+// nothing at all.
+//
+// The two groups are worded differently on purpose. A ZONED tunnel is the acute
+// case and reads as an escalation, because the operator has been told something
+// specific and untrue. An unzoned tunnel is a plain statement of the gap.
+//
 // Why the operator needs telling. Before #5619 the config gave an affirmative
 // FALSE signal: `set security zones security-zone vpn interfaces st0.0`
 // commits cleanly (#4515 accepts a zone referencing a bind-interface even with
@@ -118,33 +135,63 @@ func warnSecureTunnelPlaintextUnadjudicatedAST(nodes []*Node) []string {
 	})
 
 	sort.Slice(findings, func(i, j int) bool {
-		if findings[i].vpn != findings[j].vpn {
-			return findings[i].vpn < findings[j].vpn
+		if findings[i].bindIface != findings[j].bindIface {
+			return findings[i].bindIface < findings[j].bindIface
 		}
-		return findings[i].bindIface < findings[j].bindIface
+		return findings[i].vpn < findings[j].vpn
 	})
-
-	warnings := make([]string, 0, len(findings))
-	for _, f := range findings {
-		msg := fmt.Sprintf(
-			"security ipsec vpn %s: decrypted traffic arriving on secure tunnel %q "+
-				"is NOT evaluated against xpf security policies. Route-based IPsec "+
-				"decrypts in the kernel XFRM stack and the plaintext is forwarded by "+
-				"Linux routing, which xpf does not adjudicate — no zone policy, no "+
-				"session, no NAT and no screen are applied to it. Restrict what the "+
-				"tunnel can reach with routing or with the peer's own policy until "+
-				"this is enforced (#5619)",
-			f.vpn, f.bindIface)
-		if f.zone != "" {
-			msg += fmt.Sprintf(
-				". NOTE: %q is assigned to security-zone %q, but that zone assignment "+
-					"does NOT currently govern the decrypted traffic — the zone is "+
-					"accepted at commit and programmed, yet the plaintext bypasses it",
-				f.bindIface, f.zone)
-		}
-		warnings = append(warnings, msg)
+	if len(findings) == 0 {
+		return nil
 	}
-	return warnings
+
+	// ONE aggregated advisory per commit, not one per tunnel. An advisory that
+	// fires N times on every commit gets filtered out, and then it protects
+	// nobody — the same reason compiler_system.go folds several inert knobs
+	// into a single message.
+	//
+	// The two groups are stated separately and worded differently on purpose.
+	// A ZONED tunnel is the acute case: the operator has been told something
+	// specific and untrue, because the zone commits cleanly and is programmed
+	// and so the posture READS as enforced. An unzoned tunnel is a plain gap.
+	var zoned, unzoned []finding
+	for _, f := range findings {
+		if f.zone != "" {
+			zoned = append(zoned, f)
+		} else {
+			unzoned = append(unzoned, f)
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString("security ipsec: decrypted traffic on route-based IPsec secure tunnels is " +
+		"NOT evaluated against xpf security policies (#5619).")
+	if len(zoned) > 0 {
+		b.WriteString("\n  ASSIGNED A ZONE THAT IS NOT ENFORCED — this reads as protected and is not:")
+		for _, f := range zoned {
+			fmt.Fprintf(&b, "\n    %s (security ipsec vpn %s) is assigned to security-zone %q, "+
+				"but that zone does NOT govern its decrypted traffic",
+				f.bindIface, f.vpn, f.zone)
+		}
+	}
+	if len(unzoned) > 0 {
+		b.WriteString("\n  NOT ZONE-ADJUDICATED:")
+		for _, f := range unzoned {
+			fmt.Fprintf(&b, "\n    %s (security ipsec vpn %s)", f.bindIface, f.vpn)
+		}
+	}
+	b.WriteString("\n  Route-based IPsec decrypts in the kernel XFRM stack and the plaintext is " +
+		"forwarded by Linux routing, which xpf does not adjudicate: no zone policy, no " +
+		"session, no NAT and no screen are applied to it.")
+	if len(unzoned) > 0 {
+		// Leaving a tunnel out of a zone is not a mitigation, and an operator
+		// reading only the zoned paragraph could conclude that it is.
+		b.WriteString(" An UNZONED tunnel is not safer: an interface in no zone resolves to " +
+			"zone id 0, which a `from-zone any to-zone any permit` rule matches (#6682).")
+	}
+	b.WriteString(" Restrict what the tunnel can reach with routing or with the peer's own " +
+		"policy until this is enforced.")
+
+	return []string{b.String()}
 }
 
 // collectZoneInterfaceRefsAST maps each `security zones security-zone <z>

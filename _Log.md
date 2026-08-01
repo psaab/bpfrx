@@ -1,3 +1,31 @@
+## 2026-08-01 — #5619 PR2 round 2: aggregate the advisory, escalate the zoned case
+
+- **Timestamp**: 2026-08-01 (fix/5619-ipsec-plaintext-warn)
+- **Action**: Per the scope decision, the plaintext advisory now emits ONE
+  aggregated message per commit naming every affected tunnel, instead of one per
+  tunnel. An advisory that fires N times on every commit gets filtered out, and
+  then it protects nobody — same shape compiler_system.go uses when folding
+  several inert knobs into one message.
+
+  It still fires whenever a secure tunnel is configured, NOT only when one
+  carries a zone. Leaving a tunnel out of a zone is not a mitigation: an
+  interface in no zone resolves to zone id 0 and a `from-zone any to-zone any
+  permit` rule matches zone-pair (0,0) with no zone guard (#6682), so an unzoned
+  tunnel's plaintext can be affirmatively PERMITTED by a wildcard rule. Gating
+  on zoning would tell that operator nothing.
+
+  The two groups are worded differently. ZONED reads as an escalation
+  ("ASSIGNED A ZONE THAT IS NOT ENFORCED — this reads as protected and is not")
+  because the operator has been told something specific and untrue; UNZONED is a
+  plain statement of the gap, plus the #6682 caveat so nobody concludes that
+  unzoning is the safe option. The caveat is omitted when every tunnel is zoned,
+  so it does not become noise where it does not apply.
+
+  Rebased onto the round-3 PR1 (bare-`st0` fix), so the advisory keys off the
+  corrected shared predicate.
+- **File(s)**: pkg/config/compiler_ipsec_plaintext_warn.go,
+  pkg/config/compiler_ipsec_plaintext_warn_5619_test.go, _Log.md
+
 ## 2026-08-01 — #5619 PR2: commit-time advisory that IPsec plaintext is unadjudicated
 
 - **Timestamp**: 2026-08-01 (fix/5619-ipsec-plaintext-warn)
