@@ -344,39 +344,50 @@ peer liveness (`lastSeen`) or drive election.
     epoch, an epochless frame from it is REFUSED (`epochSeen` in
     `heartbeatAuthState`). The latch is armed by OBSERVATION, never by local
     build version — that is what keeps a rolling upgrade working.
-  - **The latch is DURABLE.** It is restored at start from the persisted
-    floor (`/var/lib/xpf/ha-peer-epoch-floor`, loaded by
-    `initHeartbeatEpochState` BEFORE the receiver admits its first frame — a
-    gap there lets a replay re-anchor a low floor). An in-memory-only latch
-    is cleared by exactly the receiver restart an attacker waits for, the
-    same window that made a single captured run replay 300/300 against a
-    restarted node. A non-zero floor is itself the proof, since only an
-    accepted epoch-bearing frame can write one. The floor is written only
-    when it ADVANCES (once per peer incarnation, not per frame) and on its
-    own goroutine, so an fsync never stalls the receive path.
-  - **ALWAYS-EMIT, and why this mechanism costs no HA availability.** A
-    persistence failure degrades MONOTONICITY, never EMISSION: the sender
-    falls back to a wall-clock epoch (still monotonic unless the clock also
-    steps backwards) and logs. That is what makes the latch safe, and it
-    buys a crisp invariant:
+  - **The latch is PROCESS-SCOPED, deliberately.** It lives on
+    `Manager.hbAuth` (#5086/#6642), so a heartbeat restart, a DHCP-triggered
+    VRF rebind and an HA comms restart all PRESERVE it — the routine events.
+    Only a full daemon restart clears it, and a live peer re-arms it with its
+    next heartbeat (~100 ms).
+
+    An earlier revision persisted the floor so the latch also survived a daemon
+    restart. Review priced that and it was removed: a peer-floor state file
+    turns a deliberate ROLLBACK into "delete the right file on the right node
+    and restart" — a procedure done under pressure at 3am — opens a crash
+    window between accepting a frame and committing the floor, needs
+    cross-process locking on the receive path, and lets an in-range-but-wrong
+    epoch lock a peer out across reboots. The window it closed needs a daemon
+    restart AND a genuinely absent peer AND an attacker holding pre-upgrade
+    captures; and rotating the control-link PSK — already a REQUIRED
+    post-upgrade step — retires those captures outright. Rollback recovery is
+    now `systemctl restart xpfd`, an operation operators already perform.
+  - **ALWAYS-EMIT, and why this mechanism costs no HA availability.** The
+    epoch is published SYNCHRONOUSLY from the wall clock with **no file access
+    at all**, so every frame carries one from the very first send. Persistence
+    is a REFINEMENT that runs on a worker and only ever RAISES the value; its
+    single job is surviving a backward clock step.
+
+    This ordering is load-bearing, not tidiness. The latch means a peer REJECTS
+    epoch-less frames from a node that has proved it emits them — so if a
+    storage fault could stop this node emitting one, the latch would convert a
+    disk stall into a **false peer-death**, an availability regression on an HA
+    path caused by the fix itself. With emission decoupled from I/O, a hung
+    disk, a blocking `flock` and a wedged `fsync` are all survivable, and the
+    invariant holds:
 
     > a keyed heartbeat carries no epoch **iff** the peer runs a pre-#6169 build.
 
-    So **no runtime fault can make a healthy node's heartbeats unacceptable
-    to a healthy peer** — not a full disk, not a read-only `/var`, not a
-    wedged fsync. That is why the epoch needs no election/ownership
-    coupling, no eligibility advertisement and no operator override. Every
-    storage fault on either side fails OPEN: an unreadable or implausible
-    floor starts the receiver UNLATCHED and permissive, and an unwritable
-    floor still works in memory for the life of the process.
-  - **Resolution runs asynchronously** off the send path (it fsyncs, and an
-    fsync against a wedged disk would otherwise block the 100 ms send loop
-    and cause the very failover this protects against). The FIRST
-    `StartHeartbeat` waits for it with a bound (`bootEpochResolveWait`, 2 s)
-    so the opening frames already carry an epoch and a latched peer does not
-    refuse them; a timeout is safe and self-healing, costing only rejoin
-    latency. Only the first start of a process can pay that wait, so a
-    routine VRF rebind never does.
+    The residual is the double fault only: storage that never completes AND a
+    clock that stepped backwards.
+  - **The state lock fails CLOSED.** Nothing in xpf enforces a single daemon
+    instance — no pidfile, and the gRPC listener sets `SO_REUSEPORT`
+    (`pkg/grpcapi/server.go`), so a second `xpfd` does NOT fail on a port
+    collision the way it otherwise would. `withEpochFileLock` therefore
+    serializes the whole read-modify-write of the boot-epoch file across
+    processes. On lock failure it SKIPS the persist rather than running the
+    critical section unlocked: a lock whose failure path runs the work anyway
+    is not a lock. Skipping is free precisely because emission does not depend
+    on it — only backward-clock-step protection is lost.
   - **Plausibility bound — the floor is a ONE-WAY DOOR.** A latched epoch
     rejects everything below it forever, so a bogus far-future value is a
     permanent lockout. Only an epoch below **year 2200**
@@ -485,12 +496,11 @@ peer liveness (`lastSeen`) or drive election.
         so a plain rolling upgrade in either direction is unaffected;
       - the rejection logs a rate-limited, actionable warning naming the file
         to clear (`Manager.NoteEpochDowngradeHeartbeat`);
-      - **recovery:** delete `/var/lib/xpf/ha-peer-epoch-floor` on the node
-        that is refusing, and restart `xpfd` there. It comes back unlatched
-        and accepts the rolled-back peer again. Rolling BOTH nodes back needs
-        no action beyond that on whichever node had latched.
-    If you are planning a rollback, clear the floor as part of it rather than
-    discovering the refusal during the outage.
+      - **recovery:** `systemctl restart xpfd` on the node that is refusing.
+        The latch is process-scoped, so it comes back unlatched and accepts the
+        rolled-back peer again — there is no state file to hand-edit and no
+        new CLI surface to learn. Rolling BOTH nodes back needs no action
+        beyond that on whichever node had latched.
   - **Honest residuals.** (1) The receiver floor and latch are per-PEER and
     per-node; a node that has genuinely never seen an epoch (brand-new
     chassis joining an upgraded cluster) is unlatched until the peer's first
@@ -977,9 +987,9 @@ capture an on-link sniffer holds was signed under the old key, so after a
 rotation none of it verifies.
 The boot-epoch marker is key-derived (`HMAC(PSK, "xpf-ha-boot-epoch-v1")[:8]`),
 so it changes with the key automatically — no separate rollout step. The
-restart in step 3 does NOT reset the epoch floor: it is persisted at
-`/var/lib/xpf/ha-peer-epoch-floor` and is a per-peer counter, not key
-material, so it stays valid across a rotation.
+restart in step 3 also clears each node's in-memory epoch floor and latch; both
+re-arm from the peer's next epoch-bearing heartbeat, within one heartbeat
+interval.
 
 Do **not** try to "return to dual-accept" by clearing the key first: an
 unkeyed `chassis cluster` is exactly what the commit gate rejects, so that

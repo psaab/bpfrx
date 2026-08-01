@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -647,5 +649,160 @@ func TestHeartbeatBootEpochResolvesAsync_6169(t *testing.T) {
 		if again := m.heartbeatBootEpoch(); again != got {
 			t.Fatalf("boot epoch changed within one incarnation: %d then %d", got, again)
 		}
+	}
+}
+
+// TestBootEpochNeverBlocksOnStorage_6169 is the fail-on-revert gate for the
+// availability half of #6169.
+//
+// The downgrade latch means a peer REJECTS epoch-less frames from a node that
+// has proved it emits epochs. So if a storage fault could stop this node
+// emitting one, the latch would convert a disk stall into a false peer-death —
+// an availability regression on an HA path, caused by the fix. The invariant
+// that prevents it: the epoch is published SYNCHRONOUSLY from the wall clock
+// with no file access at all, and persistence is a refinement that only ever
+// raises it.
+//
+// RED-on-revert: make heartbeatBootEpoch resolve through the filesystem before
+// publishing (the earlier shape) and the first call returns 0 here.
+func TestBootEpochNeverBlocksOnStorage_6169(t *testing.T) {
+	// A state path that can never be created: the parent component is a regular
+	// file, which fails even as root.
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	orig := bootEpochPath
+	bootEpochPath = filepath.Join(blocker, "sub", "ha-boot-epoch")
+	t.Cleanup(func() { bootEpochPath = orig })
+
+	m := NewManager(0, 42)
+	before := uint64(time.Now().UnixNano())
+	// FIRST call, no waiting: an epoch must already be available.
+	got := m.heartbeatBootEpoch()
+	if got == 0 {
+		t.Fatal("heartbeatBootEpoch returned 0 on the first call — emission is gated on " +
+			"storage, so a disk stall would make a latched peer see this healthy node as dead")
+	}
+	if got < before {
+		t.Fatalf("published epoch %d is below the wall clock %d", got, before)
+	}
+	// And it stays available even though the persist can never succeed.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if m.heartbeatBootEpoch() == 0 {
+			t.Fatal("epoch went back to 0 after the failed persist")
+		}
+		select {
+		case <-m.bootEpochReady:
+			deadline = time.Now()
+		default:
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+	// A real signed frame carries it, so a latched peer accepts us.
+	key := []byte("cluster-shared-secret")
+	frame := marshalHeartbeatAuthEpoch(samplePkt(), key, 1, 1, m.heartbeatBootEpoch())
+	if _, present := heartbeatFrameEpoch(frame, key); !present {
+		t.Fatal("a node with unwritable state emitted an epoch-less frame")
+	}
+}
+
+// TestBootEpochRefinementRaisesAfterBackwardClockStep_6169 pins the other half:
+// persistence is a REFINEMENT that still does its one job. After a backward
+// clock step the wall-clock seed alone would not clear the previous
+// incarnation, so the worker raises the published epoch above it.
+func TestBootEpochRefinementRaisesAfterBackwardClockStep_6169(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ha-boot-epoch")
+	// A persisted value slightly ahead of now models a clock that has since
+	// stepped back below the last epoch.
+	ahead := uint64(time.Now().Add(30 * time.Minute).UnixNano())
+	if err := os.WriteFile(path, []byte(strconv.FormatUint(ahead, 10)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var published atomic.Uint64
+	seed := uint64(time.Now().UnixNano())
+	published.Store(seed)
+
+	refineBootEpoch(path, &published)
+
+	if got := published.Load(); got != ahead+1 {
+		t.Fatalf("refined epoch = %d, want %d (persisted+1 must dominate a backward clock step)", got, ahead+1)
+	}
+	// The refined value reached disk, so the next incarnation chains from it.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64); got != ahead+1 {
+		t.Fatalf("persisted %d, want %d", got, ahead+1)
+	}
+	_ = seed
+}
+
+// TestEpochFileLockFailsClosed_6169 is the guard for the lock's failure path.
+//
+// A lock whose failure path executes the critical section anyway is not a lock:
+// it reinstates the concurrent-resolution race precisely when the guard cannot
+// fire. Skipping is free here because emission does not depend on it — the
+// wall-clock epoch is already published and already on the wire, so all that is
+// lost is backward-clock-step protection.
+//
+// RED-on-revert: restore `fn()` on either failure path in withEpochFileLock.
+func TestEpochFileLockFailsClosed_6169(t *testing.T) {
+	// The lock file itself cannot be created: its parent component is a regular
+	// file, which fails even as root.
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ran := false
+	withEpochFileLock(filepath.Join(blocker, "sub", "ha-boot-epoch"), func() { ran = true })
+	if ran {
+		t.Fatal("withEpochFileLock ran the critical section UNLOCKED after failing to take the lock — " +
+			"that reinstates the concurrent-resolution race exactly when the guard cannot fire")
+	}
+
+	// Sanity: the happy path still runs it.
+	ran = false
+	withEpochFileLock(filepath.Join(t.TempDir(), "ha-boot-epoch"), func() { ran = true })
+	if !ran {
+		t.Fatal("withEpochFileLock did not run the critical section when the lock was available")
+	}
+}
+
+// TestEpochForwardSlackIsNotLockoutScale_6169 pins the SIZE of the forward
+// bound, because the slack is itself the worst-case lockout.
+//
+// An epoch INSIDE the bound is latched. A peer that is then repaired and
+// returns to real time sits below that floor until its own wall-clock seed
+// climbs past it — so the slack and the lockout duration are the same number.
+// A year of slack bought nothing over an hour (the bound only has to exceed
+// real inter-node clock skew, which is milliseconds under NTP and minutes
+// without it) and cost a year-long lockout that needs intervention.
+//
+// RED-on-revert: widen bootEpochMaxSkew back toward a year.
+func TestEpochForwardSlackIsNotLockoutScale_6169(t *testing.T) {
+	const maxTolerableLockout = uint64(time.Hour)
+	if bootEpochMaxSkew > maxTolerableLockout {
+		t.Fatalf("bootEpochMaxSkew = %v; an epoch inside the bound IS latched, so this is also the "+
+			"worst-case lockout for a repaired peer. Keep it <= %v.",
+			time.Duration(bootEpochMaxSkew), time.Duration(maxTolerableLockout))
+	}
+	// It must still comfortably exceed real clock skew, or healthy peers are refused.
+	if bootEpochMaxSkew < uint64(time.Minute) {
+		t.Fatalf("bootEpochMaxSkew = %v is below plausible inter-node clock skew",
+			time.Duration(bootEpochMaxSkew))
+	}
+	// And it still closes the MaxUint64 class by orders of magnitude.
+	now := uint64(time.Now().UnixNano())
+	if epochOrderable(math.MaxUint64, int64(now)) {
+		t.Fatal("MaxUint64 must remain unorderable")
+	}
+	if !epochOrderable(now+bootEpochMaxSkew/2, int64(now)) {
+		t.Fatal("an epoch inside the skew allowance must remain orderable")
+	}
+	if epochOrderable(now+bootEpochMaxSkew*2, int64(now)) {
+		t.Fatal("an epoch beyond the skew allowance must be unorderable")
 	}
 }

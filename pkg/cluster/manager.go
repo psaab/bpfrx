@@ -232,14 +232,6 @@ type Manager struct {
 	bootEpoch      atomic.Uint64
 	bootEpochReady chan struct{}
 
-	// epochInitOnce/peerFloor own the RECEIVER half: the durable high-water
-	// epoch accepted from the peer, which doubles as the #6169 downgrade latch
-	// (a non-zero floor is proof the peer emits epochs, so an epochless frame
-	// from it is refused from then on). Durable because an in-memory latch is
-	// cleared by exactly the receiver restart an attacker waits for.
-	epochInitOnce sync.Once
-	peerFloor     *peerEpochFloorStore
-
 	// lastEpochDowngradeWarn rate-limits the epoch-downgrade rejection warning.
 	// The rejection is operator-actionable (a peer rolled back to a pre-#6169
 	// build stays refused until the persisted floor is cleared), so it must be
@@ -480,7 +472,7 @@ func (m *Manager) NoteEpochDowngradeHeartbeat() {
 	m.lastEpochDowngradeWarn = time.Now()
 	slog.Warn("cluster: heartbeat refused — peer stopped signing a boot epoch it previously signed. " +
 		"This is a replayed pre-upgrade capture, or the peer was rolled back to a build older than #6169. " +
-		"If the rollback was intentional, clear " + peerEpochFloorPath + " on this node and restart xpfd")
+		"If the rollback was intentional, restart xpfd on THIS node to clear the latch")
 }
 
 // NodeID returns the local node ID.

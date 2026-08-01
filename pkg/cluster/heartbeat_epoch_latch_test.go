@@ -2,9 +2,6 @@ package cluster
 
 import (
 	"math"
-	"os"
-	"path/filepath"
-	"strconv"
 	"testing"
 	"time"
 )
@@ -23,45 +20,26 @@ import (
 // because an in-memory latch is cleared by exactly the receiver restart an
 // attacker waits for.
 
-// latchEnv is an epochEnv wired to a temp-dir durable floor, so the tests can
-// model a receiver daemon restart.
+// latchEnv is an epochEnv plus the ability to model a FULL receiver daemon
+// restart (a brand-new Manager, so every in-memory tracker is gone).
 type latchEnv struct {
 	*epochEnv
-	floorPath string
-	store     *peerEpochFloorStore
 }
 
 func newLatchEnv(t *testing.T) *latchEnv {
 	t.Helper()
-	e := &latchEnv{
-		epochEnv:  newEpochEnv(t),
-		floorPath: filepath.Join(t.TempDir(), "ha-peer-epoch-floor"),
-	}
-	e.primeFromDisk()
-	return e
+	return &latchEnv{epochEnv: newEpochEnv(t)}
 }
 
-// primeFromDisk models what StartHeartbeat does via initHeartbeatEpochState:
-// load the durable floor and install the persist hook before any frame is
-// admitted. Writes are synchronous here so the tests are deterministic; in
-// production the hook hands off to a goroutine.
-func (e *latchEnv) primeFromDisk() {
-	e.store = &peerEpochFloorStore{path: e.floorPath}
-	floor := e.store.load()
-	store := e.store
-	e.r.auth.primeEpochFloor(floor, func(epoch uint64) { store.store(epoch) })
-}
-
-// restartDaemon models a FULL receiver daemon restart: a brand-new Manager and
-// receiver (so all in-memory anti-replay state is gone), re-primed from the
-// same durable floor file.
+// restartDaemon models a FULL receiver daemon restart. Unlike a heartbeat
+// restart or a VRF rebind — which preserve Manager.hbAuth (#5086/#6642) — this
+// discards every in-memory tracker, including the downgrade latch.
 func (e *latchEnv) restartDaemon() {
 	e.m = NewManager(0, 42)
 	e.r = newHeartbeatReceiver(e.m, nil, DefaultHeartbeatThreshold, DefaultHeartbeatInterval)
 	e.m.mu.Lock()
 	e.m.hbReceiver = e.r
 	e.m.mu.Unlock()
-	e.primeFromDisk()
 }
 
 // epochlessCaptures builds n distinct PRE-UPGRADE (epochless) incarnations —
@@ -113,54 +91,64 @@ func TestHeartbeatEpochlessReplayRefusedOnceLatched_6169(t *testing.T) {
 	e.liveRun(rebooted, "genuine peer reboot")
 }
 
-// TestHeartbeatEpochLatchSurvivesDaemonRestart_6169 pins the DURABILITY half.
-// An in-memory latch is cleared by a receiver daemon restart, which is exactly
-// the moment an attacker replays: the restarted node comes up with an empty
-// ring AND an unarmed latch, and the whole captured run is re-admitted.
+// TestHeartbeatEpochLatchScopeIsTheProcess_6169 pins the ACTUAL durability
+// contract, in both directions, so the boundary is deliberate rather than
+// discovered.
 //
-// RED-on-revert: make peerEpochFloorStore.store a no-op (or load return 0) and
-// the post-restart replay is admitted again.
-func TestHeartbeatEpochLatchSurvivesDaemonRestart_6169(t *testing.T) {
+// The latch survives the restarts that happen routinely — a heartbeat restart,
+// a DHCP-triggered VRF rebind, an HA comms restart — because the state lives on
+// Manager.hbAuth (#5086/#6642). It does NOT survive a full daemon restart, and
+// a live peer re-arms it with its next heartbeat.
+//
+// An earlier revision persisted the floor to disk to cover the daemon-restart
+// case too. Review priced that: it made a deliberate rollback require deleting
+// a state file, opened a crash window between accepting a frame and committing
+// the floor, needed cross-process locking, and let an in-range-but-wrong epoch
+// lock a peer out across reboots. The narrow window it closed is covered
+// operationally by PSK rotation.
+func TestHeartbeatEpochLatchScopeIsTheProcess_6169(t *testing.T) {
 	e := newLatchEnv(t)
-
 	const liveEpoch = uint64(9_100_000_000_000_000)
 	e.liveRun(e.captureIncarnation(0x22E0, liveEpoch, epochFramesPerIncarnation), "live upgraded incarnation")
 
-	// The floor reached stable storage. Reported non-fatally so that when this
-	// regresses the test still runs on to the SECURITY assertion below — the
-	// red should show replays being admitted, not just a missing file.
-	if raw, err := os.ReadFile(e.floorPath); err != nil {
-		t.Errorf("floor not persisted: %v", err)
-	} else if got, _ := strconv.ParseUint(string(raw[:len(raw)-1]), 10, 64); got != liveEpoch {
-		t.Errorf("persisted floor = %s, want %d", raw, liveEpoch)
-	}
-
-	// The peer dies and the SURVIVOR's daemon restarts — every in-memory
-	// tracker is gone.
-	e.restartDaemon()
+	// A ROUTINE heartbeat restart (VRF rebind / comms restart) must NOT clear
+	// the latch or the floor — this is the case that matters day to day.
+	e.restartHeartbeat()
 	if !e.r.auth.peerEpochLatched() {
-		t.Fatal("the durable floor must re-arm the downgrade latch across a daemon restart")
+		t.Fatal("a heartbeat restart must not clear the downgrade latch (#5086/#6642 anchoring)")
 	}
 	if got := e.r.auth.peerEpochFloor(); got != liveEpoch {
-		t.Fatalf("restored floor = %d, want %d", got, liveEpoch)
+		t.Fatalf("floor after a heartbeat restart = %d, want %d", got, liveEpoch)
 	}
-
-	// Pre-upgrade epochless captures: still refused.
 	admitted, total := e.replayAll(e.epochlessCaptures(heartbeatReplaySessions+8), 3)
 	if admitted != 0 {
-		t.Fatalf("post-restart epochless replay: %d/%d admitted, want 0", admitted, total)
+		t.Fatalf("epochless replay after a heartbeat restart: %d/%d admitted, want 0", admitted, total)
 	}
-	// And a RETIRED epoch-bearing incarnation is still below the restored floor.
-	retired := e.captureIncarnation(0x22DF, liveEpoch-1, epochFramesPerIncarnation)
-	for i, f := range retired {
+
+	// A FULL daemon restart clears it. Documented, and the reason rollback
+	// recovery is "restart xpfd" rather than deleting a state file.
+	e.restartDaemon()
+	if e.r.auth.peerEpochLatched() {
+		t.Fatal("a full daemon restart is documented to clear the latch; it did not")
+	}
+
+	// And the live peer re-arms it on its very next heartbeat — one interval.
+	if !e.feed(marshalHeartbeatAuthEpoch(samplePkt(), e.key, 0x22E1, 1, liveEpoch+1)) {
+		t.Fatal("the live peer's first post-restart frame must be accepted")
+	}
+	if !e.r.auth.peerEpochLatched() {
+		t.Fatal("one genuine epoch-bearing heartbeat must re-arm the latch")
+	}
+	admitted, total = e.replayAll(e.epochlessCaptures(heartbeatReplaySessions+8), 3)
+	if admitted != 0 {
+		t.Fatalf("epochless replay after re-arming: %d/%d admitted, want 0", admitted, total)
+	}
+	// The floor came back with it, so retired incarnations stay rejected.
+	for i, f := range e.captureIncarnation(0x22DF, liveEpoch-1, epochFramesPerIncarnation) {
 		if e.feed(f) {
-			t.Fatalf("retired-epoch frame %d admitted after a daemon restart", i)
+			t.Fatalf("retired-epoch frame %d admitted after re-arming", i)
 		}
 	}
-	// NEGATIVE CONTROL: the genuine peer, rebooted into a higher epoch, is
-	// still admitted after the restart — the durable floor must not wedge a
-	// live cluster.
-	e.liveRun(e.captureIncarnation(0x22E1, liveEpoch+1, epochFramesPerIncarnation), "genuine peer reboot after restart")
 }
 
 // TestHeartbeatEpochUpgradeWindowStillAccepts_6169 is the migration gate. The
@@ -194,34 +182,35 @@ func TestHeartbeatEpochUpgradeWindowStillAccepts_6169(t *testing.T) {
 // form, exactly what happens when a peer is rolled back to a pre-#6169 build —
 // the one legitimate trigger the latch cannot distinguish from an attack.
 //
-// The peer IS refused. That is the deliberate trade, and it is the same one
-// #4107's sticky peerAuthSeen already makes for the auth trailer, made durable.
-// Recovery is an explicit operator act: clear the persisted floor and restart,
-// which is what the rate-limited rejection log instructs
-// (Manager.NoteEpochDowngradeHeartbeat).
+// The peer IS refused; that is the deliberate trade, and the same one #4107's
+// sticky peerAuthSeen already makes for the auth trailer. Recovery is
+// `systemctl restart xpfd` on the refusing node — an operation operators
+// already perform, with no state file to hand-edit. That is the reason the
+// latch is process-scoped: an earlier revision persisted it, which turned this
+// procedure into "delete the right file on the right node, then restart".
 func TestHeartbeatEpochRollbackRefusedThenRecovered_6169(t *testing.T) {
 	e := newLatchEnv(t)
 	e.liveRun(e.captureIncarnation(0x44E0, 9_300_000_000_000_000, epochFramesPerIncarnation), "peer on an epoch-capable build")
 
-	// Operator rolls the peer back to a pre-#6169 build: fresh session, fresh
-	// counter, no epoch section. Refused — indistinguishable on the wire from a
-	// replayed pre-upgrade capture.
+	// Operator rolls the peer back: fresh session, fresh counter, no epoch.
+	// Refused — indistinguishable on the wire from a replayed capture.
 	rolledBack := e.captureIncarnation(0x44FF, 0, epochFramesPerIncarnation)
 	for i, f := range rolledBack {
 		if e.feed(f) {
 			t.Fatalf("rolled-back peer frame %d was admitted — the latch is not engaging", i)
 		}
 	}
-
-	// Documented recovery: clear the persisted floor, restart xpfd.
-	if err := os.Remove(e.floorPath); err != nil && !os.IsNotExist(err) {
-		t.Fatal(err)
+	if got := e.m.HeartbeatStats().EpochDowngradeRejected; got != uint64(len(rolledBack)) {
+		t.Fatalf("EpochDowngradeRejected = %d, want %d — the operator must be able to SEE the refusal",
+			got, len(rolledBack))
 	}
+
+	// Documented recovery: restart xpfd on the refusing node. No file to delete.
 	e.restartDaemon()
 	if e.r.auth.peerEpochLatched() {
-		t.Fatal("clearing the persisted floor must disarm the latch")
+		t.Fatal("a daemon restart must disarm the latch")
 	}
-	e.liveRun(rolledBack, "rolled-back peer after the operator cleared the floor")
+	e.liveRun(rolledBack, "rolled-back peer after restarting xpfd on the refusing node")
 }
 
 // TestHeartbeatEpochImplausibleValueCannotLockOut_6169 pins the one-way-door
@@ -253,61 +242,6 @@ func TestHeartbeatEpochImplausibleValueCannotLockOut_6169(t *testing.T) {
 	// The genuine peer with an ordinary epoch is still accepted the moment it
 	// comes back into range — the refusal must not be a one-way door.
 	e.liveRun(e.captureIncarnation(0x55E1, 9_400_000_000_000_000, epochFramesPerIncarnation), "genuine peer after an unorderable epoch")
-	// And nothing implausible reached stable storage.
-	if raw, err := os.ReadFile(e.floorPath); err == nil {
-		if got, _ := strconv.ParseUint(string(raw[:len(raw)-1]), 10, 64); !epochUsableAsFloor(got) {
-			t.Fatalf("implausible floor %d was persisted", got)
-		}
-	}
-}
-
-// TestHeartbeatEpochFloorFailsOpen_6169 pins that every receiver-side storage
-// fault fails OPEN. A node that cannot read its own floor must start
-// permissive, not start refusing its peer: the latch exists to stop a replay,
-// and trading a replay for a self-inflicted split-brain is not a trade worth
-// making.
-func TestHeartbeatEpochFloorFailsOpen_6169(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		content string
-	}{
-		{"corrupt", "not-a-number"},
-		{"implausible", strconv.FormatUint(math.MaxUint64, 10)},
-		{"zero", "0"},
-		{"empty", ""},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			e := newLatchEnv(t)
-			if err := os.WriteFile(e.floorPath, []byte(tc.content), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			e.restartDaemon()
-			if e.r.auth.peerEpochLatched() {
-				t.Fatalf("an unreadable floor (%q) must leave the receiver UNLATCHED", tc.content)
-			}
-			if got := e.r.auth.peerEpochFloor(); got != 0 {
-				t.Fatalf("floor = %d, want 0", got)
-			}
-			// Permissive: a not-yet-upgraded peer still works.
-			e.liveRun(e.captureIncarnation(0x66E0, 0, epochFramesPerIncarnation), "legacy peer after a corrupt floor")
-		})
-	}
-
-	// A floor that cannot be WRITTEN must not reject anything either — the
-	// in-memory floor still works, it just does not survive a restart.
-	t.Run("unwritable_path_still_admits", func(t *testing.T) {
-		e := newLatchEnv(t)
-		blocker := filepath.Join(t.TempDir(), "blocker")
-		if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		e.floorPath = filepath.Join(blocker, "sub", "floor")
-		e.primeFromDisk()
-		e.liveRun(e.captureIncarnation(0x77E0, 9_500_000_000_000_000, epochFramesPerIncarnation), "peer with an unwritable local floor")
-		if got := e.r.auth.peerEpochFloor(); got != 9_500_000_000_000_000 {
-			t.Fatalf("in-memory floor = %d, want the advanced value even when the write fails", got)
-		}
-	})
 }
 
 // TestHeartbeatEpochlessAdmitsAreCounted_6169 pins the OBSERVABILITY guard.
@@ -447,10 +381,10 @@ func TestHeartbeatUnorderableEpochNeverArmsLatch_6169(t *testing.T) {
 	if got := e.r.auth.peerEpochFloor(); got != 0 {
 		t.Fatalf("floor = %d, want 0", got)
 	}
-	// Nothing was persisted either, so a restart does not inherit a bogus latch.
+	// A restart does not inherit a bogus latch either.
 	e.restartDaemon()
 	if e.r.auth.peerEpochLatched() {
-		t.Fatal("a refused frame must not leave a durable latch behind")
+		t.Fatal("a refused frame must not leave a latch behind")
 	}
 
 	// The safe direction: that peer, rolled back to a pre-#6169 build, is still

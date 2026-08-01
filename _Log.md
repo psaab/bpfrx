@@ -66363,3 +66363,31 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/cluster/status.go, pkg/cluster/heartbeat.go,
   pkg/cluster/heartbeat_epoch_status_6169_test.go,
   pkg/cluster/heartbeat_epoch_latch_test.go, pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 21:40
+- **Action**: #6169 round-4 — RESHAPED rather than patched. Codex xhigh returned
+  five MAJORs, four of them the same theme: the failure paths did not hold the
+  invariant the happy path established. Priced the durable peer-epoch floor and
+  REMOVED it: its marginal benefit was one narrow window (receiver daemon restart
+  AND genuinely absent peer AND attacker holding pre-upgrade captures, itself
+  retired by the already-REQUIRED PSK rotation), while its marginal cost was four
+  of the five MAJORs — rollback needing a documented `rm` under incident pressure
+  (M1), a crash window between accept and commit whose test could not even
+  observe it because it installed a SYNCHRONOUS hook against production's
+  goroutine (M3), a receive-path cross-process lock (M5), and a persisted
+  in-range-but-wrong epoch locking a peer out across reboots (M4). The latch is
+  now process-scoped on Manager.hbAuth, which already survives the routine
+  restarts (heartbeat restart, VRF rebind, comms restart, #5086/#6642); only a
+  full daemon restart clears it and a live peer re-arms it in ~100ms. Rollback
+  recovery becomes `systemctl restart xpfd` — no state file, no new CLI.
+  M2 fixed independently: the boot epoch is now published SYNCHRONOUSLY from the
+  wall clock with NO file access, and persistence is a refinement worker that
+  only RAISES it (its one job is the backward clock step). So a hung disk cannot
+  make a latched peer see a healthy node as epoch-less and therefore dead. With
+  emission decoupled from I/O, the lock could be made to fail CLOSED at zero
+  availability cost (M5). M4: skew tightened one year -> ONE HOUR, because the
+  slack IS the worst-case lockout for a repaired peer. Guards added per finding;
+  mutations 13-16 each red an assertion with build+vet rc=0.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/heartbeat.go,
+  pkg/cluster/manager.go, pkg/cluster/heartbeat_epoch_latch_test.go,
+  pkg/cluster/heartbeat_epoch_test.go, pkg/cluster/README.md, _Log.md

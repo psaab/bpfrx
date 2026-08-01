@@ -714,13 +714,6 @@ type heartbeatAuthState struct {
 	epochlessAdmitted      atomic.Uint64
 	epochDowngradeRejected atomic.Uint64
 
-	// persistFloor durably records an advanced floor. Set once by
-	// Manager.initHeartbeatEpochState before any frame is admitted, and nil in
-	// unit tests (in-memory only). It is called OUTSIDE the mutex and must not
-	// block — the implementation hands off to a goroutine, so an fsync can
-	// never stall the heartbeat read loop.
-	persistFloor func(uint64)
-
 	// peerAuthSeen is sticky and READ cross-goroutine
 	// (Manager.HeartbeatPeerAuthSeen, consumed by the gRPC fabric listener to
 	// arm its downgrade-guard off the fast-arming heartbeat instead of the
@@ -815,26 +808,18 @@ type heartbeatAuthState struct {
 // were later rolled back. Refusing an unorderable epoch never strands a peer
 // that comes back into range.
 func (s *heartbeatAuthState) admitAuthed(hasEpoch bool, epoch, session, counter uint64) bool {
-	ok, advanced, persist := s.admitAuthedLocked(hasEpoch, epoch, session, counter)
-	// Persist OUTSIDE the lock: the hand-off must never run under s.mu, and the
-	// floor only advances once per peer incarnation so this is a rare call.
-	if advanced != 0 && persist != nil {
-		persist(advanced)
-	}
-	return ok
+	return s.admitAuthedLocked(hasEpoch, epoch, session, counter)
 }
 
-// admitAuthedLocked is the locked half of admitAuthed. advanced is non-zero
-// when the durable floor should be updated; persist is returned rather than
-// read by the caller so the hook is never touched outside the mutex.
-func (s *heartbeatAuthState) admitAuthedLocked(hasEpoch bool, epoch, session, counter uint64) (ok bool, advanced uint64, persist func(uint64)) {
+// admitAuthedLocked is the locked half of admitAuthed.
+func (s *heartbeatAuthState) admitAuthedLocked(hasEpoch bool, epoch, session, counter uint64) (ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !hasEpoch {
 		if s.epochSeen {
 			// Downgrade: this peer has proved it emits epochs.
 			s.epochDowngradeRejected.Add(1)
-			return false, 0, nil
+			return false
 		}
 		// The migration window — and the ONLY residual an operator can still be
 		// exposed to on merge day, since a capture taken before the upgrade is
@@ -847,7 +832,7 @@ func (s *heartbeatAuthState) admitAuthedLocked(hasEpoch bool, epoch, session, co
 		if ok {
 			s.epochlessAdmitted.Add(1)
 		}
-		return ok, 0, nil
+		return ok
 	}
 	// An epoch the floor cannot ORDER is refused, not admitted-and-ignored.
 	// Admitting it would recreate the epochless bypass in miniature: a frame
@@ -855,37 +840,19 @@ func (s *heartbeatAuthState) admitAuthedLocked(hasEpoch bool, epoch, session, co
 	// captures from an incarnation that once emitted an out-of-range epoch would
 	// replay indefinitely. See epochOrderable.
 	if !epochOrderable(epoch, time.Now().UnixNano()) {
-		return false, 0, nil
+		return false
 	}
 	if epoch < s.highEpoch {
-		return false, 0, nil
+		return false
 	}
 	if !s.replay.admit(session, counter) {
-		return false, 0, nil
+		return false
 	}
 	s.epochSeen = true
 	if epoch > s.highEpoch {
 		s.highEpoch = epoch
-		advanced = epoch
 	}
-	return true, advanced, s.persistFloor
-}
-
-// primeEpochFloor restores the durable across-reboot floor and installs the
-// persistence hook. It must run before the receiver admits its first frame, or
-// a replay slips into the gap and re-anchors a low floor. A non-zero floor also
-// arms the downgrade latch: a floor can only have been written by an accepted
-// epoch-bearing frame, so it is proof the peer emits epochs.
-func (s *heartbeatAuthState) primeEpochFloor(floor uint64, persist func(uint64)) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if floor > s.highEpoch {
-		s.highEpoch = floor
-	}
-	if floor > 0 {
-		s.epochSeen = true
-	}
-	s.persistFloor = persist
+	return true
 }
 
 // peerEpochFloor reports the highest peer boot epoch accepted so far (0 when
