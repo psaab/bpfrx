@@ -702,6 +702,48 @@ fn shim_walk_and_userspace_walk_agree_over_a_corpus() {
         cases.push((format!("NON-FIRST Fragment(frag_off={frag_off:#06x}) -> TCP"), b));
     }
 
+    // BOUNDARY-EXACT cases: the packet ends exactly ONE BYTE SHORT of each
+    // arm's advance target. A minimal-length packet proves the arm is
+    // exercised; it does not prove it is exercised AT THE BOUNDARY, and a
+    // realistic regression is a length computed one byte short, not a deleted
+    // check. With the packet ending at `target - 1` the correct revalidation
+    // (which demands `target`) fails while a `- 1` variant succeeds, so the two
+    // produce different verdicts. The generic arm already had this shape — its
+    // `one byte short` case is why a generic length-1 mutation reds — and these
+    // copy it to AH and Fragment, which did not.
+    //
+    // AH: header at 40, HdrExtLen 3 -> advance (3+2)*4 = 20 -> target 60.
+    // Packet length 59 is one byte short of that.
+    {
+        let mut b = vec![0u8; 40];
+        b[0] = 0x60;
+        b[6] = AH;
+        b.extend_from_slice(&[TCP, 3]);
+        b.resize(59, 0);
+        cases.push(("AH(len=3) packet ends one byte short of target 60".into(), b));
+    }
+    // Fragment reads a fixed 8 bytes before advancing. A packet with exactly 7
+    // bytes available at the header start separates an 8-byte read from a
+    // 7-byte one: the former fails closed, the latter proceeds.
+    {
+        let mut b = vec![0u8; 40];
+        b[0] = 0x60;
+        b[6] = FRAG;
+        b.resize(47, 0);
+        b[40] = TCP;
+        cases.push(("Fragment with exactly 7 bytes available".into(), b));
+    }
+    // And the same one-short shape for the generic arm at a larger declared
+    // length, so the boundary is covered at more than one magnitude.
+    {
+        let mut b = vec![0u8; 40];
+        b[0] = 0x60;
+        b[6] = DEST;
+        b.extend_from_slice(&[TCP, 5]);
+        b.resize(87, 0); // target is 40 + (5+1)*8 = 88
+        cases.push(("DestOpt(len=5) packet ends one byte short of target 88".into(), b));
+    }
+
     // Fragment and AH have their own advance arithmetic.
     cases.push(("Fragment -> TCP".into(), chain(&[(FRAG, 0)], TCP, 0)));
     cases.push((
@@ -733,10 +775,26 @@ fn shim_walk_and_userspace_walk_agree_over_a_corpus() {
         cases.push((format!("first={p}"), chain(&[(p as u8, 0)], TCP, 0)));
     }
 
-    let mut drift: Vec<String> = Vec::new();
+    // Vary the L3 offset. Every case above is built at offset 0, and a whole
+    // class of base-offset error is invisible there — mutating a revalidation's
+    // base from `l3_offset` to `0` changes nothing when they are equal. 14 is
+    // untagged Ethernet and 18 is VLAN-tagged; those are the offsets that occur
+    // in production, and `frame_l3_offset` returns exactly them.
+    let mut expanded: Vec<(String, Vec<u8>, usize)> = Vec::new();
     for (name, buf) in &cases {
-        let s = shim_record(buf, 0);
-        let u = userspace_record(buf, 0);
+        for l3 in [0usize, 14, 18] {
+            let mut b = vec![0u8; l3];
+            b.extend_from_slice(buf);
+            expanded.push((format!("{name} @l3={l3}"), b, l3));
+        }
+    }
+    let cases = expanded;
+
+    let mut drift: Vec<String> = Vec::new();
+    for (name, buf, l3) in &cases {
+        let (buf, l3) = (buf.as_slice(), *l3);
+        let s = shim_record(buf, l3);
+        let u = userspace_record(buf, l3);
         // The fragment fields govern one question: may this RESOLVED L4 seed a
         // session? So they are decision-relevant exactly when a terminal L4 was
         // resolved. On a fail-closed or over-limit verdict neither side is going
