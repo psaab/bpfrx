@@ -197,7 +197,11 @@ func (b *dyndns2Backend) DeleteLease(ctx context.Context, rec LeaseDNSRecord) er
 func (b *dyndns2Backend) update(ctx context.Context, q url.Values) error {
 	u, err := url.Parse(b.endpoint)
 	if err != nil {
-		return fmt.Errorf("ddns dyndns2: bad endpoint: %w", err)
+		// SECURITY: the endpoint derives from the `server` leaf and may carry
+		// userinfo; %w would re-embed it. Same class as duckdns/cloudflare/
+		// route53 even though resolveDyndns2Endpoint already url.Parsed it
+		// (#6545) — the invariant must not depend on that reachability argument.
+		return fmt.Errorf("ddns dyndns2: bad endpoint: %s", scrubURLError(err))
 	}
 	// Merge the caller's parameters onto any the endpoint already carries.
 	base := u.Query()
@@ -208,7 +212,8 @@ func (b *dyndns2Backend) update(ctx context.Context, q url.Values) error {
 
 	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
 	if err != nil {
-		return fmt.Errorf("ddns dyndns2: build request: %w", err)
+		// SECURITY: as above — never %w a URL-bearing build error (#6545).
+		return fmt.Errorf("ddns dyndns2: build request: %s", scrubURLError(err))
 	}
 	// Basic auth via the header (set explicitly, NOT in the URL userinfo, so the
 	// password never lands in a logged URL string).

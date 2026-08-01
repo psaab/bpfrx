@@ -136,9 +136,9 @@ func TestCheckIPThroughMockServer(t *testing.T) {
 		_, _ = w.Write([]byte("93.184.216.34\n"))
 	}))
 	defer srv.Close()
-	a, ok := CheckIP(context.Background(), srv.Client(), srv.URL, true, nil)
-	if !ok || a.String() != "93.184.216.34" {
-		t.Fatalf("CheckIP returned %v ok=%v", a, ok)
+	a, ok, err := CheckIP(context.Background(), srv.Client(), srv.URL, true, nil)
+	if !ok || a.String() != "93.184.216.34" || err != nil {
+		t.Fatalf("CheckIP returned %v ok=%v err=%v", a, ok, err)
 	}
 }
 
@@ -234,8 +234,16 @@ func TestCheckIPRejectsMalformedURL(t *testing.T) {
 		return nil, nil
 	})}
 	for _, bad := range []string{"ftp://checkip.example/", "http://", "not a url"} {
-		if _, ok := CheckIP(context.Background(), client, bad, true, nil); ok {
+		_, ok, err := CheckIP(context.Background(), client, bad, true, nil)
+		if ok {
 			t.Fatalf("CheckIP(%q) ok=true, want false (malformed URL must fail closed)", bad)
+		}
+		// A malformed checkip-url is a CONFIGURATION error, not a transient —
+		// the refusal must be reportable, or it lands right back in the
+		// indistinguishable-forever bucket #2773 closed.
+		if err == nil {
+			t.Fatalf("CheckIP(%q) err=nil; a malformed URL must report WHY it failed, "+
+				"not masquerade as an ordinary no-address miss", bad)
 		}
 	}
 }

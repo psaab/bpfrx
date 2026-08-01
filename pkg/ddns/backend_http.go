@@ -3,13 +3,18 @@ package ddns
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -58,6 +63,110 @@ var errHTTPAuth = errors.New("ddns http: authentication/authorization refused")
 // 911/dnserr, HTTP 429). The engine backs off; this lets the backend log it as
 // a ban-avoidance signal rather than a generic failure.
 var errHTTPRateLimited = errors.New("ddns http: provider rate-limited")
+
+// errRedirectRefused is the sentinel CALLERS match with errors.Is to classify a
+// refusal. It is NOT what the scrubber trusts — see redirectRefusal.
+var errRedirectRefused = errors.New("ddns http: redirect refused")
+
+// redirectReason is the CLOSED set of things guardRedirect refuses.
+type redirectReason string
+
+const (
+	redirectReasonHopCap    redirectReason = "hop-cap"
+	redirectReasonDowngrade redirectReason = "downgrade"
+	redirectReasonCrossHost redirectReason = "cross-host"
+)
+
+// redirectRefusal is guardRedirect's typed refusal, and the ONLY error whose
+// text scrubInnerError will render.
+//
+// ROUND 8 REPLACED A SENTINEL WITH A TYPE, because the sentinel was FORGEABLE.
+// The previous form asked errors.Is(err, errRedirectRefused) and, on a match,
+// returned err.Error() verbatim. errors.Is dispatches to the error's OWN
+// `Is(error) bool` method, and CheckIP takes a caller-supplied *http.Client —
+// so a RoundTripper returning an error whose Is always says true and whose
+// Error() is the request URL got the credential printed unchanged. Identity is
+// not something a caller-supplied value can be asked about; errors.As has the
+// same hole (it dispatches to `As(any) bool`).
+//
+// A concrete UNEXPORTED struct type cannot be forged: no other package can name
+// it, so no other package can construct a value of it, and a type assertion is
+// a language operation with no user-defined hook. scrubInnerError therefore
+// walks the chain itself and type-ASSERTS rather than asking errors.Is/As.
+//
+// The fields hold the *url.URL values, not pre-rendered text, so the host and
+// scheme grammar is applied HERE at render time — unconditionally, on the way
+// out — rather than trusted to have been applied at construction. What that
+// buys is a bounded CHARACTER SET on a provider-supplied host: a zone id, raw
+// non-ASCII, or anything that is not a plain reg-name is withheld.
+//
+// The grammar does NOT bound the CONTENT, only the character set — and that is
+// why the refused TARGET is no longer rendered at all. A provider answering
+// `Location: https://<our-own-password>.evil.example/` gets the hop refused,
+// but `<password>.evil.example` is a well-formed reg-name, so naming it printed
+// the credential into the daemon log. The general-case justification in
+// scrubURLError — that such a name is already in every resolver query and TLS
+// ClientHello — is FALSE here: CheckRedirect aborts before any dial, so a
+// refused target is never resolved and never sent anywhere.
+//
+// It also broke deduplication, which is what forced the fix rather than another
+// paragraph of disclosure. The daemon keys a never-pruned, process-lifetime
+// sync.Map on the rendered string to warn once per (provider, error); a
+// provider redirecting to per-request hostnames therefore minted a fresh key
+// and a fresh WARN every 30s reconcile tick, forever. Exactly the unbounded
+// growth the body-read scrub was added to stop, on the OTHER of doRequest's two
+// adjacent error returns.
+//
+// So Error() now names only the FROM host (our configured endpoint, stable) and
+// describes the target by class. scrubURLErrorAt additionally suppresses its own
+// target render when the chain carries a refusal, because net/http sets
+// url.Error.URL to the provider's Location — without that, the same
+// provider-chosen value came out twice.
+type redirectRefusal struct {
+	reason redirectReason
+	// via[0] — the request THIS package built from configuration — not the
+	// previous hop. Same-host comparison is lenient about case, a trailing dot
+	// and the default port, so a provider can take an allowed hop to its own
+	// spelling of our host; rendering that made the message vary per request.
+	from *url.URL // configured origin; nil for the hop cap
+	// Held so the grammar can be applied at render time, but NEVER rendered:
+	// it is provider-chosen, so it both discloses a credential-shaped reg-name
+	// and varies per request. Kept for the same-host DECISION and for tests.
+	to *url.URL // refused target; nil for the hop cap
+}
+
+// Error renders the refusal from FIXED prose plus grammar-bounded tokens. Every
+// interpolated value is either a compile-time constant of this package or the
+// output of refusalHost/refusalScheme, both of which are total into a closed
+// character set. Nothing here reads another error's text.
+func (r *redirectRefusal) Error() string {
+	switch r.reason {
+	case redirectReasonHopCap:
+		return fmt.Sprintf("ddns http: stopped after %d redirects", maxRedirects)
+	case redirectReasonDowngrade:
+		// r.to is PROVIDER-CHOSEN and therefore varies per request; r.from is
+		// our configured endpoint and is stable. Rendering r.to broke the
+		// daemon's once-per-(provider,error) dedup: a provider redirecting to
+		// per-request hostnames minted a fresh key in a never-pruned map on
+		// every 30s tick. The scheme is a closed two-value grammar, so it is
+		// safe and useful; the host is neither.
+		return "ddns http: refusing HTTPS->" + refusalScheme(r.to) +
+			" redirect downgrade from " + refusalHost(r.from) +
+			" to a provider-supplied host (would expose update credentials in " +
+			"cleartext)"
+	case redirectReasonCrossHost:
+		return "ddns http: refusing cross-host redirect from " + refusalHost(r.from) +
+			" to a provider-supplied host that is not the configured endpoint " +
+			"(would disclose the update credentials and payload); point the " +
+			"provider endpoint at the final host instead"
+	}
+	return errRedirectRefused.Error()
+}
+
+// Is lets callers keep classifying with errors.Is(err, errRedirectRefused).
+// Providing it is safe in the direction that matters: it is OUR type answering
+// about itself, not us believing a stranger's answer.
+func (r *redirectRefusal) Is(target error) bool { return target == errRedirectRefused }
 
 // newHTTPClient builds the shared, hardened HTTP client for every HTTP backend
 // with NO source binding (the default route / kernel-chosen source). TLS
@@ -114,30 +223,168 @@ func newHTTPClientBound(b bindConfig) *http.Client {
 	return &http.Client{
 		Timeout:       httpClientTimeout,
 		Transport:     tr,
-		CheckRedirect: refuseSchemeDowngrade,
+		CheckRedirect: guardRedirect,
 	}
 }
 
-// refuseSchemeDowngrade is the shared *http.Client.CheckRedirect for every HTTP
-// DDNS backend. It refuses an HTTPS->HTTP redirect downgrade (#4861): a
-// credentialed backend (dyndns2 Basic auth, DuckDNS/Cloudflare query/bearer
-// token, Route 53 SigV4) that started over TLS must never be walked onto a
-// plaintext connection by a 30x Location, which would put the update credential
-// on the wire in cleartext for an on-path attacker. Same-scheme redirects and
-// an HTTP->HTTPS upgrade are still followed. The default 10-redirect cap is
-// re-implemented here because setting CheckRedirect replaces Go's built-in cap.
-func refuseSchemeDowngrade(req *http.Request, via []*http.Request) error {
-	if len(via) >= 10 {
-		return errors.New("ddns http: stopped after 10 redirects")
+// maxRedirects re-implements Go's built-in redirect cap. Setting CheckRedirect
+// REPLACES http.Client's default 10-hop limit, so the cap has to be restored by
+// the policy itself or a redirect loop would spin forever inside one request.
+const maxRedirects = 10
+
+// guardRedirect is the shared *http.Client.CheckRedirect for every HTTP DDNS
+// backend. It enforces three things on a 30x Location, and restores the hop cap
+// the default policy would otherwise have provided.
+//
+//  1. NO SCHEME DOWNGRADE (#4861). A credentialed backend (dyndns2 Basic auth,
+//     DuckDNS/Cloudflare query/bearer token, Route 53 SigV4) that started over
+//     TLS must never be walked onto a plaintext connection, which would put the
+//     update credential on the wire for an on-path attacker. An HTTP->HTTPS
+//     upgrade is still followed.
+//
+//  2. NO CROSS-HOST REDIRECT (#6545). The scheme guard alone left an
+//     https->https hop to a DIFFERENT host wide open, and Go discloses real
+//     secrets across exactly that hop — verified firsthand against the stdlib,
+//     not assumed:
+//
+//     - Referer carries the FULL previous URL INCLUDING the query string.
+//     net/http refererForURL() strips only the userinfo and suppresses the
+//     header only for https->http; on an https->https hop to any host the
+//     redirect target receives e.g.
+//     "https://www.duckdns.org/update?domains=h&token=<TOKEN>". That is a
+//     live provider credential for DuckDNS (token is a QUERY param, not
+//     Basic — see backend_duckdns.go), for the generic backend (a %p-expanded
+//     password or a literal ?token= in url-template), and for a checkip-url
+//     that carries an API key. It also discloses the FQDN and the public
+//     address being published for every backend.
+//
+//     - Go forwards Authorization/Cookie to any SUBDOMAIN of the original
+//     host (net/http shouldCopyHeaderOnRedirect -> isDomainOrSubdomain).
+//     So a redirect to sub.<configured-host> hands the dyndns2/generic Basic
+//     credential and the Cloudflare bearer token to a host the operator never
+//     configured. Stripping Referer would NOT have closed that half.
+//
+//     Refusing outright, rather than sanitizing and following, is the choice
+//     because these clients are machine-to-machine callers of an endpoint the
+//     operator PINNED (a built-in provider constant, or a `server` /
+//     `url-template` / `checkip-url` leaf). There is no discovery step that
+//     needs to land somewhere else, and following a Location to an unconfigured
+//     host is itself the trust violation: it sends the update payload (which
+//     FQDN, which public address) — and on a 307/308 the whole request body,
+//     e.g. a Route 53 change batch — to a host the operator never named. The
+//     realistic trigger is a mistyped or hostile `server` leaf, and fail-closed
+//     is this package's posture everywhere else (bind error, malformed
+//     checkip-url, unrecognized response body). A provider that genuinely moves
+//     to a new host is served by pointing the leaf at the final host; the error
+//     names the CONFIGURED endpoint and the refusal class so the operator can do
+//     exactly that. It deliberately does NOT name the refused target: that value
+//     is provider-chosen, so rendering it both disclosed a credential-shaped
+//     reg-name and varied per request, defeating the daemon's once-per-
+//     (provider, error) dedup. SAME-host
+//     redirects — the common real case, a path or API-version move — are still
+//     followed.
+//
+//  3. NO Referer ON ANY FOLLOWED REDIRECT. Defense in depth on top of (2): the
+//     hop we do allow is same-host, so the target already holds the credential
+//     it is being sent, but there is no reason for a DDNS API call to echo its
+//     own query string back into a header that provider access logs record
+//     separately. Go sets Referer on the new request BEFORE calling
+//     CheckRedirect precisely so a policy can override it (see the comment on
+//     Client.do), so deleting it here is the supported seam. Deleting from a nil
+//     header map is a defined no-op, so a synthetic request needs no guard.
+//
+// Host comparison is by HOSTNAME only — case-insensitive per RFC 4343, with one
+// trailing root dot normalized away, and deliberately PORT-INDEPENDENT. The
+// trust anchor is the DNS name and the TLS certificate identity bound to it,
+// which is what the operator configured and what cert verification pins; a port
+// move stays inside that identity, and a port-strict rule would falsely refuse
+// the plain "https://prov.example:443/x" -> "https://prov.example/x" default-port
+// normalization. A Unicode (non-punycode) Location host compares unequal to its
+// A-label spelling and is refused; that is the conservative direction (a false
+// refusal, never a false allow) and no in-tree provider uses an IDN host.
+//
+// The comparison is against the PREVIOUS hop, matching the scheme guard. Under
+// exact equality that is equivalent to comparing against the original request:
+// every hop must equal its predecessor, so by induction every hop equals hop 0.
+func guardRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRedirects {
+		return &redirectRefusal{reason: redirectReasonHopCap}
 	}
 	if len(via) > 0 {
 		prev := via[len(via)-1].URL
+		// `origin` is what the REFUSAL renders, and it must be via[0] — the URL
+		// this package built from configuration — not `prev`. Same-host
+		// comparison is deliberately lenient about case, a trailing dot and the
+		// default port, so a provider can first take an ALLOWED hop to its own
+		// chosen spelling (`Prov.example`) and only then attempt the cross-host
+		// one. Rendering `prev` then published that provider-chosen spelling,
+		// and five case variants produced five distinct daemon strings — which
+		// re-opens exactly the dedup defeat this refusal was just fixed to
+		// close, one hop further out. via[0] is ours and is stable.
+		origin := via[0].URL
 		if strings.EqualFold(prev.Scheme, "https") && !strings.EqualFold(req.URL.Scheme, "https") {
-			return fmt.Errorf("ddns http: refusing HTTPS->%s redirect downgrade to %s "+
-				"(would expose update credentials in cleartext)", req.URL.Scheme, req.URL.Host)
+			// The scheme AND the host here come from the provider's Location
+			// header. They are NOT rendered at construction — the refusal holds
+			// the URLs and applies the grammar in Error(), so the bounding
+			// cannot be skipped by a future edit to this call site.
+			return &redirectRefusal{reason: redirectReasonDowngrade, from: origin, to: req.URL}
+		}
+		if !strings.EqualFold(redirectHost(prev), redirectHost(req.URL)) {
+			return &redirectRefusal{reason: redirectReasonCrossHost, from: origin, to: req.URL}
 		}
 	}
+	// Followed (same-host) hop: never echo the previous URL's query string —
+	// which carries the DuckDNS/generic/checkip credential — into Referer.
+	req.Header.Del("Referer")
 	return nil
+}
+
+// refusalHost renders a host inside a guardRedirect refusal sentence: the safe
+// grammar, or a fixed placeholder when the host does not fit it. It differs from
+// safeHostText only in never returning "" — an empty slot mid-sentence ("refusing
+// cross-host redirect from prov.example to ") reads as a bug rather than as a
+// withheld value.
+//
+// This is a RENDERING helper only. guardRedirect's same-host DECISION still uses
+// redirectHost on the raw values; a host that fails the grammar must be refused,
+// not compared loosely.
+func refusalHost(u *url.URL) string {
+	if u == nil {
+		return hostWithheldText
+	}
+	if h := safeHostText(u); h != "" {
+		return h
+	}
+	return hostWithheldText
+}
+
+// refusalScheme renders a scheme inside a refusal sentence: http/https, or a
+// fixed placeholder. Same rationale as refusalHost — the Location header's
+// scheme is provider-supplied, and url.Parse bounds its character set but
+// neither its content nor its length.
+func refusalScheme(u *url.URL) string {
+	if u == nil {
+		return schemeWithheldText
+	}
+	if s := safeScheme(u.Scheme); s != "" {
+		return s
+	}
+	return schemeWithheldText
+}
+
+// The fixed placeholders used wherever a value fails the grammar.
+const (
+	hostWithheldText   = "(host withheld: not a plain host name)"
+	schemeWithheldText = "(scheme withheld: not http or https)"
+)
+
+// redirectHost normalizes a URL's host for guardRedirect's same-host test:
+// the hostname with the port dropped (URL.Hostname also unwraps an IPv6 literal
+// from its brackets) and one trailing root dot removed, so "prov.example." and
+// "prov.example" are the one name they actually are. Case folding is left to the
+// EqualFold comparison at the call site.
+func redirectHost(u *url.URL) string {
+	return strings.TrimSuffix(u.Hostname(), ".")
 }
 
 // httpClientCache caches the hardened *http.Client (and its underlying
@@ -334,29 +581,673 @@ func doRequest(ctx context.Context, client *http.Client, req *http.Request) (int
 	}
 	body, rerr := readCappedBody(resp)
 	if rerr != nil {
-		return resp.StatusCode, nil, fmt.Errorf("ddns http: read response: %w", rerr)
+		// SECURITY: reading the body is part of ISSUING the request, so this
+		// return is subject to the same rule as the one above — it was the
+		// second of two adjacent error returns and the only one still on %w.
+		//
+		// Two things came out of that. A mid-body RST yields a *net.OpError
+		// whose text embeds the EPHEMERAL LOCAL PORT, which changes every
+		// connection; the daemon's checkip probe keys a process-lifetime
+		// sync.Map on this string to log "once per (provider, error)", so a
+		// persistently RST-ing endpoint minted a new key and a new WARN every
+		// reconcile tick, forever. And the caller supplies the *http.Client,
+		// so the same adversary that owns RoundTrip owns resp.Body.Read and
+		// could echo the request URL — the query, hence the password — here.
+		//
+		// scrubInnerError, not scrubURLError: rerr is not a *url.Error, and
+		// the classifier is what bounds it to a declared constant.
+		return resp.StatusCode, nil, fmt.Errorf("ddns http: read response: %s", scrubInnerError(rerr))
 	}
 	return resp.StatusCode, body, nil
 }
 
-// scrubURLError renders an HTTP-client error without leaking secrets carried in
-// the request URL's userinfo/query. A *url.Error embeds the full URL in its
-// Error() string; we replace it with the same URL stripped of userinfo and query
-// (the host+path are not sensitive). Any other error is returned verbatim (it
-// never carries the URL).
+// scrubURLError is the SINGLE renderer in this package for an error that may
+// carry a request URL. Every DDNS site that fails while BUILDING or while
+// ISSUING a request routes through it, so "no credential reaches a log" is a
+// property of the package rather than of each call site remembering to redact
+// (#6545 review). The one deliberate exception is the dyndns2 raw-`server`
+// render in resolveDyndns2Endpoint, tracked separately as #6606 and pinned by
+// an explicit, self-expiring exemption in the source gate
+// (url_render_class_6545_test.go).
+//
+// WHAT IT RENDERS: at most SCHEME://HOST[:PORT], built by ALLOWLIST — and the
+// allowlist is over the CHARACTERS, not just over the url.URL fields. Round 7
+// found that field-level allowlisting was not enough: an allowlist is only as
+// good as the safety of what it admits, and `Host` is NOT credential-free.
+//
+// Field-level allowlisting (a fresh url.URL carrying only Scheme and Host)
+// closed the field-expansion class — User, Path, RawPath, RawQuery, Fragment,
+// RawFragment, Opaque, OmitHost and anything net/url adds later are absent by
+// construction. It did not close the credential class, because `Host` is a
+// container for substituted template text, not a name. What url.Parse will
+// legally leave in `Host` (verified against Go 1.26 net/url):
+//
+//   - AN IPv6 ZONE ID. RFC 6874 lets a zone use "basically any %-encoding it
+//     likes", and net/url honours that: "https://[fe80::1%25%p]/update" is a
+//     SUPPORTED generic template and parses to Host = "[fe80::1%<password>]".
+//     u.Hostname() does not help — it strips the brackets and keeps the zone.
+//   - A REG-NAME LABEL. "https://%p.example.com/" parses to
+//     Host = "<password>.example.com" whenever the password is host-safe.
+//   - RAW NON-ASCII BYTES. %-escapes above 0x7F are decoded in place, so
+//     "ex%FFample.com" reaches Host as a literal 0xFF — log-injection material
+//     on top of everything else.
+//   - A PORT, which is digits-only (net/url's validOptionalPort) but is still
+//     a place a numeric password can land.
+//   - ANY OF THE ABOVE FROM THE PROVIDER. A cross-host Location echoing our own
+//     credential as its hostname is refused by guardRedirect — correctly — and
+//     the refusal named the host.
+//
+// Userinfo is NOT in this list: url.Parse splits "user:pass@host" into u.User,
+// so an ordinary credentialed URL was already safe.
+//
+// So the host is rebuilt from a CLOSED GRAMMAR rather than copied (safeHostText):
+// an IP literal is re-rendered from netip with its ZONE DROPPED, and a reg-name
+// must be ASCII letters/digits/'-'/'_' in dot-separated labels or it is withheld
+// entirely. The scheme is likewise reduced to the two values this package ever
+// legitimately uses. What survives is exactly the network identity that is on
+// the wire in the DNS query, the TCP SYN and the TLS SNI regardless; path,
+// query, userinfo, fragment and zone id are all operator- or provider-supplied
+// opaque bytes and are treated as secret.
+//
+// THE RESIDUAL, stated rather than papered over. Two things survive:
+//
+//   - a password used as the DNS NAME ("https://%p.example.com/"). It is
+//     already in every resolver query, in the PTR/SNI the endpoint sees, and in
+//     the TLS ClientHello; the renderer cannot tell a legitimate label from a
+//     password without template-expansion taint, and withholding every hostname
+//     would gut diagnosis.
+//   - a NUMERIC password used as a valid port ("https://prov.example:%p/"),
+//     which is retained as up to five decimal digits.
+//
+// Both are configuration errors the logging boundary cannot repair, and hiding
+// them would make them less likely to be noticed. But note the asymmetry
+// honestly: a log is durable and often more widely readable than a packet
+// capture, so "disclosed elsewhere" is a reason to accept these two, not a
+// general licence to log secrets.
+//
+// The diagnostic cost of dropping the path is deliberate and small: the
+// caller's own prefix already names the backend and the operation ("ddns
+// cloudflare: build request", "ddns route53: build list request"), so what is
+// lost is the API sub-path, not the ability to tell which call failed.
+//
+// A URL THAT DOES NOT RE-PARSE yields NO URL at all — only the sanitized
+// urlParseCause reason. The old code fell back to ue.URL VERBATIM, which was
+// survivable only while this helper was reachable exclusively from the
+// transport path, where the URL had necessarily parsed on the way in. It is now
+// also the renderer for BUILD-request failures, whose DEFINING input is a URL
+// that does not parse, so that fallback would have been a direct leak of the
+// whole raw string.
+//
+// THE INNER ERROR is rendered too, because that is the entire diagnostic value
+// ("connection refused", "i/o timeout", "certificate signed by unknown
+// authority") — but by CLASSIFICATION, never verbatim. See scrubInnerError.
+//
+// A non-*url.Error goes through the same classifier: it is not automatically
+// URL-free just because it is not a *url.Error (round 7).
+// errTreeWithinBound reports whether err's Unwrap tree is small enough that the
+// STDLIB can walk it safely. Round 11 bounded this file's own recursion and
+// stopped there, which was not enough: errors.Is and errors.As do their own
+// traversal, dispatching to the error's Unwrap method, and that method belongs
+// to the caller. An error whose Unwrap returns ITSELF makes errors.As spin
+// forever, and an Unwrap() []error self-cycle recurses until the stack
+// overflows -- a `fatal error` that recover() cannot catch.
+//
+// The round-11 cyclic test missed both because its root was directly a
+// *url.Error, so errors.As matched on the first node and never followed Unwrap
+// at all. The guard has to run BEFORE the first errors.As, not inside the
+// recursion it protects.
+//
+// A NODE BUDGET, not a visited set: errors are interfaces, and comparing two
+// for identity panics when the dynamic type is not comparable. A budget is
+// sufficient anyway -- a cycle exhausts it, and so does a nest deep enough to
+// overflow. Recursion here is self-limiting because every call spends budget.
+func errTreeWithinBound(err error) bool {
+	budget := maxUnwrapDepth
+	var walk func(error) bool
+	walk = func(e error) bool {
+		for e != nil {
+			if budget <= 0 {
+				return false
+			}
+			budget--
+			switch u := e.(type) {
+			case interface{ Unwrap() error }:
+				e = u.Unwrap()
+			case interface{ Unwrap() []error }:
+				for _, sub := range u.Unwrap() {
+					// Charge for the SLOT, not just for a non-nil child.
+					// walk(nil) returns immediately without spending budget, so
+					// a root handing back maxUnwrapDepth+1 nil children used to
+					// pass the guard and then make every stdlib traversal scan
+					// that fanout. Fanout is work whether or not the entry is
+					// nil.
+					if budget <= 0 {
+						return false
+					}
+					budget--
+					if sub == nil {
+						continue
+					}
+					if !walk(sub) {
+						return false
+					}
+				}
+				return true
+			default:
+				return true
+			}
+		}
+		return true
+	}
+	return walk(err)
+}
+
 func scrubURLError(err error) string {
+	if !errTreeWithinBound(err) {
+		return string(transportWithheld)
+	}
+	return scrubURLErrorAt(err, 0)
+}
+
+// scrubURLErrorAt carries the recursion depth that maxUnwrapDepth's comment
+// always claimed to bound. scrubURLError and scrubInnerError are MUTUALLY
+// recursive through the nested-*url.Error case, and neither counted: a
+// caller-supplied *url.Error whose Err points at ITSELF overflowed the stack.
+// That is a `fatal error`, not a panic — recover() does not catch it and the
+// whole xpfd process dies, which is strictly worse than the hang the comment
+// budgeted for. A deep non-cyclic nest did the same.
+func scrubURLErrorAt(err error, depth int) string {
+	if depth >= maxUnwrapDepth {
+		return string(transportWithheld)
+	}
 	var ue *url.Error
 	if !errors.As(err, &ue) {
-		return err.Error()
+		return scrubInnerErrorAt(err, depth+1)
 	}
-	safe := ue.URL
-	if u, perr := url.Parse(ue.URL); perr == nil {
-		u.RawQuery = ""
-		u.User = nil
-		safe = u.Redacted()
+	// A REFUSED REDIRECT is the one case where ue.URL is not ours: net/http
+	// sets it to the Location the provider chose, so rendering it as the
+	// "target" publishes a provider-controlled host — and did so a second time,
+	// since the refusal prose named it too. Two renders of a per-request value
+	// is what broke the dedup this package's own body-read fix exists to
+	// protect. Render the refusal alone; it already names the stable FROM host.
+	if r := findRedirectRefusal(err); r != nil {
+		return r.Error()
 	}
-	return fmt.Sprintf("%s %q: %v", ue.Op, safe, ue.Err)
+	u, perr := url.Parse(ue.URL)
+	if perr != nil {
+		// Nothing can be recovered safely from a URL that does not parse — not
+		// even the host. Report the sanitized reason and no part of the input.
+		return fmt.Sprintf("url is not a valid URL: %s", urlParseCause(perr))
+	}
+	target, note := safeURLTarget(u)
+	return fmt.Sprintf("%s %q%s: %s", safeOp(ue.Op), target, note,
+		scrubInnerErrorAt(ue.Err, depth+1))
 }
+
+// safeOp bounds url.Error.Op, which is NOT ours (round 8). net/http derives it
+// from the request method and net/url sets "parse", but a caller-supplied
+// RoundTripper can return a *url.Error it built itself:
+//
+//	&url.Error{Op: req.URL.String(), URL: "https://safe.example/", Err: …}
+//
+// leaked the complete request URL through the one field the scrub never
+// touched. Op is now an allowlist of the values the two producers actually
+// emit; anything else becomes a constant.
+func safeOp(op string) string {
+	switch op {
+	case "Get", "Head", "Post", "Put", "Patch", "Delete", "Options", "Trace", "Connect", "parse":
+		return op
+	}
+	return "request"
+}
+
+// safeURLTarget renders the largest part of u that the closed grammar admits,
+// plus a fixed NOTE naming anything withheld (empty when nothing was). Splitting
+// the note out keeps the target a well-formed URL instead of stuffing a
+// parenthetical inside it.
+//
+// The note is not exhaustive by design: an out-of-range PORT is dropped
+// silently, because the host is still fully rendered and a note would be noise.
+// The three notes cover the cases where a whole component vanished.
+func safeURLTarget(u *url.URL) (target, note string) {
+	scheme := safeScheme(u.Scheme)
+	if scheme == "" {
+		// Nothing downstream of an unrecognised scheme can be trusted to be a
+		// host at all, so nothing is rendered. This package only ever issues
+		// http(s), so no legitimate diagnostic is lost.
+		return "", " (url withheld: scheme is not http or https)"
+	}
+	host := safeHostText(u)
+	if host == "" {
+		return scheme + ":", " (host withheld: not a plain host name)"
+	}
+	target = scheme + "://" + host
+	if zoneOf(u.Hostname()) != "" {
+		// Not "link-local": a zone is legal on a global or IPv4-mapped literal
+		// too, and the note must not assert a scope the address may not have.
+		note = " (IPv6 zone id withheld)"
+	}
+	return target, note
+}
+
+// safeScheme reduces a URL scheme to the two values this package legitimately
+// uses, or "" for anything else. url.Parse constrains a scheme's CHARACTERS but
+// not its content, so a template that expanded a credential into the scheme
+// position would otherwise be rendered; the allowlist makes that impossible
+// without depending on any upstream validator having run.
+func safeScheme(s string) string {
+	switch strings.ToLower(s) {
+	case "http":
+		return "http"
+	case "https":
+		return "https"
+	}
+	return ""
+}
+
+// safeHostText renders u's authority under the closed grammar, or "" if it does
+// not fit. The result is one of exactly three shapes:
+//
+//   - an IP literal re-rendered by netip WITH ANY ZONE ID DROPPED, bracketed
+//     when it is v6 ("[2001:db8::1]", "192.0.2.7");
+//   - a reg-name of dot-separated labels drawn from ASCII letters, digits, '-'
+//     and '_', at most 63 bytes per label and 253 total, with at most one
+//     trailing root dot;
+//
+// each optionally followed by ":" and 1..5 decimal digits in 1..65535.
+//
+// Everything else — a raw non-ASCII byte, a '%', an empty label, an
+// over-long name, a non-numeric or out-of-range port — yields "". The point is
+// that the OUTPUT CHARACTER SET is closed, so no amount of template
+// substitution or provider-supplied Location text can put arbitrary bytes into
+// a log line through this path.
+func safeHostText(u *url.URL) string {
+	host := safeHostName(u.Hostname())
+	if host == "" {
+		return ""
+	}
+	if port := safePort(u.Port()); port != "" {
+		return host + ":" + port
+	}
+	return host
+}
+
+// safeHostName applies the grammar to a bare hostname (no port, no brackets).
+func safeHostName(h string) string {
+	if h == "" {
+		return ""
+	}
+	if addr, err := netip.ParseAddr(h); err == nil {
+		// An IP literal is re-rendered from the PARSED value, which is how the
+		// zone id is dropped: netip holds it as a separate field, so
+		// WithZone("") removes it structurally rather than by trimming text.
+		addr = addr.WithZone("")
+		if addr.Is6() {
+			return "[" + addr.String() + "]"
+		}
+		return addr.String()
+	}
+	return safeRegName(h)
+}
+
+// zoneOf reports the IPv6 zone id on a hostname, or "" when there is none. It is
+// used only to decide whether to say a zone was withheld — the zone itself is
+// never rendered.
+func zoneOf(h string) string {
+	addr, err := netip.ParseAddr(h)
+	if err != nil {
+		return ""
+	}
+	return addr.Zone()
+}
+
+// safeRegName returns h when it is a plain DNS-shaped name under the grammar
+// documented on safeHostText, "" otherwise.
+func safeRegName(h string) string {
+	if len(h) > 253 {
+		return ""
+	}
+	labels := strings.TrimSuffix(h, ".")
+	if labels == "" {
+		return ""
+	}
+	for _, label := range strings.Split(labels, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return ""
+		}
+		for i := 0; i < len(label); i++ {
+			switch c := label[i]; {
+			case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-', c == '_':
+			default:
+				return ""
+			}
+		}
+	}
+	return h
+}
+
+// safePort returns p when it is a decimal port in 1..65535, "" otherwise.
+// net/url already rejects a non-numeric port, so this is a second, local proof
+// rather than a first line of defence.
+func safePort(p string) string {
+	if p == "" || len(p) > 5 {
+		return ""
+	}
+	n, err := strconv.Atoi(p)
+	if err != nil || n < 1 || n > 65535 {
+		return ""
+	}
+	return p
+}
+
+// transportReason is a CLOSED enumeration of what scrubInnerError may report,
+// following the parseReason precedent in checkip.go: because the classifier
+// returns transportReason, a bare pass-through of an error's text — "return
+// text" — does not COMPILE. Reintroducing the leak requires an explicit
+// transportReason(...) conversion, which is a deliberate, greppable edit rather
+// than a plausible-looking slip.
+//
+// Round 8 removed the last conversion. There is now NO path from any error's
+// Error() into a transportReason: every return in classifyTransportError and
+// its helpers names one of the constants below, which
+// TestClassifyTransportErrorReturnsOnlyConstants proves by resolving each
+// returned identifier with go/types.
+type transportReason string
+
+// The COMPLETE set of reasons scrubInnerError can report.
+const (
+	transportNil            transportReason = "<nil>"
+	transportWithheld       transportReason = "transport error withheld"
+	transportTimeout        transportReason = "network timeout"
+	transportDeadline       transportReason = "context deadline exceeded"
+	transportCanceled       transportReason = "context canceled"
+	transportEOF            transportReason = "connection closed before a complete response"
+	transportDNS            transportReason = "dns lookup failed"
+	transportDNSNotFound    transportReason = "dns lookup failed: no such host"
+	transportDNSTimeout     transportReason = "dns lookup failed: timed out"
+	transportTLSVerify      transportReason = "tls: certificate verification failed"
+	transportTLSHostname    transportReason = "tls: certificate is not valid for the requested host"
+	transportTLSAuthority   transportReason = "tls: certificate signed by unknown authority"
+	transportTLSInvalid     transportReason = "tls: certificate is invalid"
+	transportTLSHandshake   transportReason = "tls: handshake failed"
+	transportSchemeMismatch transportReason = "server gave an HTTP response to an HTTPS client"
+	transportLocationEcho   transportReason = "failed to parse redirect Location header " +
+		"(withheld: it echoes provider-supplied URL text)"
+
+	// Stage of a *net.OpError with no recognised errno under it.
+	transportDialFailed  transportReason = "dial failed"
+	transportReadFailed  transportReason = "read failed"
+	transportWriteFailed transportReason = "write failed"
+
+	// The allowlisted errno values. The spellings match the kernel's own so an
+	// operator can still grep for them, but they are OUR constants — nothing is
+	// taken from syscall.Errno.Error(), which is not a closed table.
+	transportConnRefused      transportReason = "connection refused"
+	transportConnReset        transportReason = "connection reset by peer"
+	transportConnAborted      transportReason = "software caused connection abort"
+	transportBrokenPipe       transportReason = "broken pipe"
+	transportConnTimedOut     transportReason = "connection timed out"
+	transportHostUnreachable  transportReason = "no route to host"
+	transportNetUnreachable   transportReason = "network is unreachable"
+	transportNetDown          transportReason = "network is down"
+	transportHostDown         transportReason = "host is down"
+	transportAddrNotAvail     transportReason = "cannot assign requested address"
+	transportAddrInUse        transportReason = "address already in use"
+	transportAFNotSupported   transportReason = "address family not supported by protocol"
+	transportPermissionDenied transportReason = "permission denied"
+	transportMessageTooLong   transportReason = "message too long"
+	transportNoBuffers        transportReason = "no buffer space available"
+	transportTooManyFiles     transportReason = "too many open files"
+)
+
+// scrubInnerError renders the error nested inside a *url.Error.
+//
+// ROUND 7 MADE THIS TOTAL. It previously returned any non-*url.Error VERBATIM
+// on the reasoning that "transport errors name a host/IP, never a URL". That
+// held for the transports this package builds itself, but CheckIP takes a
+// caller-supplied *http.Client, and a RoundTripper returning
+//
+//	fmt.Errorf("request %s failed: %w", req.URL, context.DeadlineExceeded)
+//
+// put the complete path credential straight through. The old special case for
+// net/http's Location-parse message was an exact PREFIX match, so the same
+// message wrapped one layer deep also walked past it.
+//
+// ROUND 8 REMOVED THE ABILITY TO EXPRESS THE LEAK, rather than checking for it.
+// Round 7's rule was PROVENANCE — render an error's own text once we believe it
+// is ours or the kernel's. A caller-supplied RoundTripper defeated that four
+// separate ways, because every "is this one of ours?" question routes through
+// something the caller controls:
+//
+//   - errors.Is dispatches to the error's own Is(error) bool. An error whose Is
+//     always says true and whose Error() is the request URL was printed
+//     verbatim as a "refusal".
+//   - A forged *url.Error carried the request URL in Op, the field the URL
+//     scrub never rebuilt (now safeOp).
+//   - syscall.Errno.Error() is NOT a closed table: an unknown value renders
+//     "errno 65432", so a numeric credential survived (now an errno allowlist).
+//   - %T is not a compile-time symbol: reflect.StructOf builds a runtime type
+//     whose name embeds an input-derived struct TAG (now dropped entirely).
+//
+// THE PROPERTY NOW: the returned string is drawn from a set this package
+// declares, whatever the error claims about itself. classifyTransportError
+// returns the closed transportReason type and every one of its returns names a
+// declared constant — pinned by TestClassifyTransportErrorReturnsOnlyConstants,
+// which RESOLVES each returned identifier with go/types (the same discipline,
+// and the same shadow-proofing, as the urlParseCause gate next door). No
+// caller-supplied Error() text reaches the output on any path.
+//
+// The one error whose text IS rendered is *redirectRefusal, and it is reached
+// by TYPE ASSERTION over the unwrap chain, never by errors.Is/As — an
+// unexported concrete struct type cannot be named, constructed, or impersonated
+// from outside this package, and a type assertion has no user-defined hook. Its
+// Error() is built from fixed prose plus refusalHost/refusalScheme output. That
+// path exists because the cross-host refusal IS the diagnostic #6545 produces.
+//
+// The diagnostic cost is real and accepted: net/http's internal errors.New
+// prose, the failing address, and the unknown-error type name are all gone. An
+// unrecognised error is exactly the case where we cannot say what it contains.
+func scrubInnerError(err error) string {
+	// Same stdlib-traversal guard as scrubURLError: this is an entry point for
+	// a caller-supplied error, and everything below it (errors.Is, errors.As,
+	// classifyTransportError) walks the tree with the caller's own Unwrap.
+	if !errTreeWithinBound(err) {
+		return string(transportWithheld)
+	}
+	return scrubInnerErrorAt(err, 0)
+}
+
+// scrubInnerErrorAt is the depth-carrying half of the mutual recursion; see
+// scrubURLErrorAt.
+func scrubInnerErrorAt(err error, depth int) string {
+	if depth >= maxUnwrapDepth {
+		return string(transportWithheld)
+	}
+	if err == nil {
+		return string(transportNil)
+	}
+	// Our own typed refusal, found by assertion over the chain.
+	if r := findRedirectRefusal(err); r != nil {
+		return r.Error()
+	}
+	// A nested *url.Error would re-embed a full URL in its own Error(); recurse
+	// through the same scrub instead of printing it. errors.As is safe HERE
+	// because the result is not rendered as text — every field it reaches
+	// (Op, URL, Err) goes back through the scrub.
+	var nested *url.Error
+	if errors.As(err, &nested) {
+		return scrubURLErrorAt(nested, depth+1)
+	}
+	return string(classifyTransportError(err))
+}
+
+// maxUnwrapDepth bounds every chain walk in this file. errors.Unwrap dispatches
+// to the error's own Unwrap, so a caller-supplied error can return ITSELF and
+// spin forever; a hang is a denial of service, not a leak, but it is just as
+// much the caller's choice.
+const maxUnwrapDepth = 100
+
+// findRedirectRefusal walks the unwrap chain and TYPE-ASSERTS. It deliberately
+// does not use errors.As: errors.As consults an As(any) bool method, which a
+// caller-supplied error implements to become whatever it likes.
+func findRedirectRefusal(err error) *redirectRefusal {
+	for i := 0; err != nil && i < maxUnwrapDepth; i++ {
+		if r, isRefusal := err.(*redirectRefusal); isRefusal {
+			return r
+		}
+		err = errors.Unwrap(err)
+	}
+	return nil
+}
+
+// classifyTransportError maps an arbitrary transport error onto the closed
+// transportReason set. Every branch reads TYPE, STRUCTURE or an allowlisted
+// VALUE; none renders an error's message text, and every return below names a
+// declared constant (enforced by TestClassifyTransportErrorReturnsOnlyConstants).
+func classifyTransportError(err error) transportReason {
+	// net/http builds fmt.Errorf("failed to parse Location header %q: %v", ...)
+	// BEFORE CheckRedirect runs, so a provider that 3xx-es to a malformed
+	// Location echoing our own query lands the credential here. It has no
+	// distinguishing type, so it is matched on the invariant prefix — at any
+	// wrapping depth, unlike the round-6 exact match. The text is INSPECTED,
+	// never returned, and anything the match misses falls through to
+	// "withheld", so a stdlib rewording fails CLOSED.
+	for e, i := err, 0; e != nil && i < maxUnwrapDepth; e, i = errors.Unwrap(e), i+1 {
+		if strings.HasPrefix(e.Error(), locationHeaderPrefix) {
+			return transportLocationEcho
+		}
+	}
+
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return transportDeadline
+	case errors.Is(err, context.Canceled):
+		return transportCanceled
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return transportEOF
+	case errors.Is(err, http.ErrSchemeMismatch):
+		return transportSchemeMismatch
+	}
+
+	// errors.Is/As are FORGEABLE, but forging one of these buys nothing: every
+	// branch below returns a constant, and the structural fields read
+	// (IsNotFound, IsTimeout, Op) are booleans or allowlisted tokens. An error
+	// that lies its way into a branch mislabels itself; it cannot smuggle text.
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		switch {
+		case dnsErr.IsNotFound:
+			return transportDNSNotFound
+		case dnsErr.IsTimeout:
+			return transportDNSTimeout
+		}
+		return transportDNS
+	}
+
+	// TLS/x509. The x509 types all quote provider-supplied certificate fields in
+	// their Error(), so only the TYPE is read. Inlined rather than delegated to a
+	// helper so that every return in this function is a bare constant, which is
+	// what TestClassifyTransportErrorReturnsOnlyConstants can prove.
+	var hostErr x509.HostnameError
+	if errors.As(err, &hostErr) {
+		return transportTLSHostname
+	}
+	var authErr x509.UnknownAuthorityError
+	if errors.As(err, &authErr) {
+		return transportTLSAuthority
+	}
+	var invalidErr x509.CertificateInvalidError
+	if errors.As(err, &invalidErr) {
+		return transportTLSInvalid
+	}
+	var verifyErr *tls.CertificateVerificationError
+	if errors.As(err, &verifyErr) {
+		return transportTLSVerify
+	}
+	var recErr tls.RecordHeaderError
+	if errors.As(err, &recErr) {
+		return transportTLSHandshake
+	}
+
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errnoReason(errno)
+	}
+
+	// A *net.OpError with no recognised errno underneath still says which STAGE
+	// failed. Only Op is read, against net's own vocabulary, and it selects a
+	// constant — Net adds nothing but combinations, and Addr/Source are the
+	// request host.
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		switch opErr.Op {
+		case "dial":
+			return transportDialFailed
+		case "read":
+			return transportReadFailed
+		case "write":
+			return transportWriteFailed
+		}
+		return transportWithheld
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return transportTimeout
+	}
+
+	return transportWithheld
+}
+
+// errnoReason maps an ALLOWLISTED errno VALUE onto a declared constant.
+//
+// Round 7 called syscall.Errno.Error() "a table lookup over the kernel's fixed
+// error list" and converted its text directly. That was wrong: the table is not
+// total. An errno outside it renders dynamically — syscall.Errno(65432) becomes
+// "errno 65432" — so a numeric credential steered into the chain came out in
+// the message. Switching on the VALUE and returning constants removes the
+// dynamic path; an unrecognised errno is withheld like anything else.
+func errnoReason(e syscall.Errno) transportReason {
+	switch e {
+	case syscall.ECONNREFUSED:
+		return transportConnRefused
+	case syscall.ECONNRESET:
+		return transportConnReset
+	case syscall.ECONNABORTED:
+		return transportConnAborted
+	case syscall.EPIPE:
+		return transportBrokenPipe
+	case syscall.ETIMEDOUT:
+		return transportConnTimedOut
+	case syscall.EHOSTUNREACH:
+		return transportHostUnreachable
+	case syscall.ENETUNREACH:
+		return transportNetUnreachable
+	case syscall.ENETDOWN:
+		return transportNetDown
+	case syscall.EHOSTDOWN:
+		return transportHostDown
+	case syscall.EADDRNOTAVAIL:
+		return transportAddrNotAvail
+	case syscall.EADDRINUSE:
+		return transportAddrInUse
+	case syscall.EAFNOSUPPORT:
+		return transportAFNotSupported
+	case syscall.EACCES, syscall.EPERM:
+		return transportPermissionDenied
+	case syscall.EMSGSIZE:
+		return transportMessageTooLong
+	case syscall.ENOBUFS, syscall.ENOMEM:
+		return transportNoBuffers
+	case syscall.EMFILE, syscall.ENFILE:
+		return transportTooManyFiles
+	}
+	return transportWithheld
+}
+
+// locationHeaderPrefix is the invariant head of net/http's Location-parse
+// failure (net/http/client.go), which quotes the raw header value.
+const locationHeaderPrefix = `failed to parse Location header `
 
 // queryEscape URL-query-escapes a value for safe insertion into a generic
 // template URL (%u/%p/%h/%i expansion).

@@ -35,7 +35,13 @@ func TestCheckIPBoundFailsClosedOnBindError(t *testing.T) {
 	defer srv.Close()
 
 	bindErr := errors.New("ddns: invalid source-address \"not-an-ip\": bad")
-	a, ok := CheckIPBound(context.Background(), srv.Client(), srv.URL, true, nil, bindErr)
+	a, ok, cerr := CheckIPBound(context.Background(), srv.Client(), srv.URL, true, nil, bindErr)
+	// The fail-closed refusal must also be REPORTABLE, not just silent: the
+	// daemon logs the reason once per (provider, error). A nil here would put
+	// the bind failure back in the undiagnosable-forever bucket.
+	if !errors.Is(cerr, bindErr) {
+		t.Fatalf("CheckIPBound(bindErr) err = %v, want the bind error itself", cerr)
+	}
 	if ok {
 		t.Fatalf("CheckIPBound with a bind error returned ok=true addr=%v; "+
 			"the checkip oracle must fail closed, never publish an IP obtained "+
@@ -61,9 +67,10 @@ func TestCheckIPBoundNoSourceUsesDefaultRoute(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	a, ok := CheckIPBound(context.Background(), srv.Client(), srv.URL, true, nil, nil)
-	if !ok || a.String() != "93.184.216.34" {
-		t.Fatalf("CheckIPBound(no source, bindErr=nil) = %v ok=%v; want 93.184.216.34 true", a, ok)
+	a, ok, cerr := CheckIPBound(context.Background(), srv.Client(), srv.URL, true, nil, nil)
+	if !ok || a.String() != "93.184.216.34" || cerr != nil {
+		t.Fatalf("CheckIPBound(no source, bindErr=nil) = %v ok=%v err=%v; want 93.184.216.34 true <nil>",
+			a, ok, cerr)
 	}
 }
 
@@ -98,8 +105,9 @@ func TestCheckIPBoundAvailableSourceWorks(t *testing.T) {
 			client.Transport, ok && tr.DialContext != nil)
 	}
 
-	a, ok := CheckIPBound(context.Background(), client, srv.URL, true, nil, nil)
-	if !ok || a.String() != "93.184.216.34" {
-		t.Fatalf("CheckIPBound(honored bound source) = %v ok=%v; want 93.184.216.34 true", a, ok)
+	a, ok2, cerr := CheckIPBound(context.Background(), client, srv.URL, true, nil, nil)
+	if !ok2 || a.String() != "93.184.216.34" || cerr != nil {
+		t.Fatalf("CheckIPBound(honored bound source) = %v ok=%v err=%v; want 93.184.216.34 true <nil>",
+			a, ok2, cerr)
 	}
 }

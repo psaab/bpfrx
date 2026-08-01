@@ -5368,6 +5368,35 @@ reserved for whole-dataplane selection where a rewrite shim
     at the transport boundary, never in a URL/error/log; `DDNSProvider.String()`
     redacts all of them); HTTPS with system-trust cert+hostname verification
     (no InsecureSkipVerify); bounded request timeout; capped response body.
+    **Redirects are constrained (#4861, #6545):** the shared `CheckRedirect`
+    (`ddns.guardRedirect`) refuses a 30x `Location` that downgrades the scheme
+    (HTTPS→HTTP) or changes the HOST, strips `Referer` from any redirect it does
+    follow, and keeps the 10-hop cap. The cross-host refusal exists because Go
+    puts the FULL previous URL — query string included — in `Referer` on an
+    HTTPS→HTTPS hop (disclosing the DuckDNS/`generic`/`checkip-url` query-param
+    token to the redirect target) and forwards `Authorization`/`Cookie` to any
+    SUBDOMAIN of the original host (disclosing the dyndns2/`generic` Basic
+    credential and the Cloudflare bearer token). Operator-visible consequence: a
+    `server` / `url-template` / `checkip-url` pointing at an endpoint that
+    redirects to a DIFFERENT host fails the publish with a `refusing cross-host
+    redirect from <a> to <b>` error naming both hosts — point the leaf at the
+    final host. Same-host redirects (a path or API-version move) still work.
+    **The common trigger is an APEX `server` leaf.** No shipped default endpoint
+    redirects, but a hand-written bare host resolves to the apex over HTTPS
+    (`server duckdns.org` → `https://duckdns.org/update`) and the apex 301s to
+    `www` (`https://www.duckdns.org/update`) — so `server duckdns.org` worked
+    before and is REFUSED now. Same for a `cloudflare.com` or `amazonaws.com`
+    apex leaf. Fix: configure the final host, `server www.duckdns.org`. There is
+    no commit-time check because detecting the redirect requires a network call.
+    This is NOT fixable by allowing same-registrable-domain hops: `www.<host>` is
+    a SUBDOMAIN of `<host>`, and the subdomain hop is exactly where Go forwards
+    `Authorization`/`Cookie` — relaxing the guard for the ergonomics would
+    re-open the credential disclosure it exists to close.
+    A `checkip-url` failure — a refused redirect, a malformed URL, an
+    unreachable endpoint, a non-2xx status — is now LOGGED once per (provider,
+    error) by the daemon instead of collapsing into a silent, permanent
+    "transient observation failure"; the ordinary dual-stack miss (endpoint
+    answered, no address of the requested family) stays silent.
   - **Commit warnings** (`validateSurfaceADDNSWarnings`): an incomplete HTTP
     provider (dyndns2 with no server + unknown name, duckdns missing api-token
     (#2960), cloudflare missing

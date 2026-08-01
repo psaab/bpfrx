@@ -2,6 +2,7 @@ package ddns
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/netip"
@@ -37,10 +38,32 @@ var ipAddrRe = regexp.MustCompile(
 // even if otherwise valid — the embedded-resolver case). The shared hardened
 // HTTP client (TLS-verified, bounded timeout, capped body) is used.
 //
-// Returns (addr, true) on success; (zero, false) when no usable address of the
-// requested family is found (the engine then treats it as a transient
-// observation failure and leaves the scope untouched — never a withdraw).
-func CheckIP(ctx context.Context, client *http.Client, urlStr string, wantV4 bool, allowlist []netip.Addr) (netip.Addr, bool) {
+// Returns (addr, true, nil) on success. On a miss ok is false and the scope is
+// left untouched by the engine — never a withdraw — but the third return
+// DISTINGUISHES why:
+//
+//   - (zero, false, err) — the probe FAILED: a malformed checkip-url, an
+//     unreachable/refused endpoint, a non-2xx status, or a refused redirect
+//     (a cross-host Location, #6545). err carries the operator-facing reason.
+//   - (zero, false, nil) — the probe SUCCEEDED but the body carried no usable
+//     address of the requested family. That is the ordinary dual-stack case (a
+//     v4-only endpoint queried for AAAA) and is deliberately not an error.
+//
+// The error return exists because several of the failure causes are PERMANENT
+// configuration errors — this package's own doctrine, stated at
+// validateCheckIPURL below, is that a malformed URL "is a configuration error,
+// not a transient". Collapsing them into a bare ok=false made a misconfigured
+// checkip-url an indistinguishable, undiagnosable, forever-transient
+// observation failure — exactly the class #2773/#3737 were filed to eliminate.
+// The daemon call site (pkg/daemon/daemon_ddns_surface_a.go) logs it once per
+// (provider, error).
+//
+// Note the error is NOT wrapped-sentinel-inspectable: doRequest deliberately
+// renders transport errors through scrubURLError into a STRING (breaking the
+// %w chain) so a URL query — which for the generic backend carries the
+// %p-expanded password — can never reach a log. Match on the message, or add a
+// typed pre-transport error, but do not re-plumb %w through doRequest.
+func CheckIP(ctx context.Context, client *http.Client, urlStr string, wantV4 bool, allowlist []netip.Addr) (netip.Addr, bool, error) {
 	if client == nil {
 		client = newHTTPClient()
 	}
@@ -52,18 +75,28 @@ func CheckIP(ctx context.Context, client *http.Client, urlStr string, wantV4 boo
 	// (the commit-time validateSurfaceADDNSWarnings warning is the operator-facing
 	// half; this is the runtime backstop for a URL that slipped past commit).
 	if err := validateCheckIPURL(urlStr); err != nil {
-		return netip.Addr{}, false
+		return netip.Addr{}, false, err
 	}
 	req, err := http.NewRequest(http.MethodGet, urlStr, nil)
 	if err != nil {
-		return netip.Addr{}, false
+		// Unreachable in practice — validateCheckIPURL above already parsed this
+		// exact string and the method is a constant — but http.NewRequest fails
+		// by returning url.Parse's *url.Error VERBATIM, raw query and all, so
+		// apply the same discipline as every other build-request site: render
+		// through scrubURLError, which withholds a URL that does not parse and
+		// reports only the sanitized urlParseCause reason (#6545).
+		return netip.Addr{}, false, fmt.Errorf("ddns checkip: build request: %s", scrubURLError(err))
 	}
 	req.Header.Set("User-Agent", "xpf-ddns/1.0")
 	code, body, err := doRequest(ctx, client, req)
-	if err != nil || classifyHTTPStatus(code) != nil {
-		return netip.Addr{}, false
+	if err != nil {
+		return netip.Addr{}, false, err
 	}
-	return parseCheckIPBody(string(body), wantV4, allowlist)
+	if serr := classifyHTTPStatus(code); serr != nil {
+		return netip.Addr{}, false, serr
+	}
+	a, ok := parseCheckIPBody(string(body), wantV4, allowlist)
+	return a, ok, nil
 }
 
 // CheckIPBound runs the checkip probe through a source-bound HTTP client while
@@ -90,11 +123,17 @@ func CheckIP(ctx context.Context, client *http.Client, urlStr string, wantV4 boo
 // interface / VRF that is down, surfaces later as a DIAL error inside CheckIP,
 // which already returns ok=false (fail-closed) on its own — so this gate is the
 // one residual fall-open the bind-error branch left open.
-func CheckIPBound(ctx context.Context, client *http.Client, urlStr string, wantV4 bool, allowlist []netip.Addr, bindErr error) (netip.Addr, bool) {
+//
+// The third return mirrors CheckIP's: non-nil means the probe FAILED for a
+// stated reason (here, bindErr itself when the source could not be honored),
+// nil with ok=false means the probe ran and simply found no address of the
+// requested family. Callers that already surface bindErr themselves should not
+// log it twice.
+func CheckIPBound(ctx context.Context, client *http.Client, urlStr string, wantV4 bool, allowlist []netip.Addr, bindErr error) (netip.Addr, bool, error) {
 	if bindErr != nil {
 		// Source requested but not honored: fail closed, never probe via the
 		// default route (would return the wrong WAN's public IP).
-		return netip.Addr{}, false
+		return netip.Addr{}, false, bindErr
 	}
 	return CheckIP(ctx, client, urlStr, wantV4, allowlist)
 }
@@ -283,16 +322,189 @@ const AddressSourceCheckIP AddressSource = "checkip"
 // case-INSENSITIVE per RFC 3986 §3.1 ("HTTPS://host" is valid), so it parses
 // first and compares the parsed scheme with EqualFold rather than a
 // case-sensitive HasPrefix on the raw string (#2842).
+//
+// SECURITY: NO refusal below prints ANY part of the URL. Since #6545 the daemon
+// observer (pkg/daemon/daemon_ddns_surface_a.go) LOGS this error and retains its
+// text as a dedup map key for the process lifetime, and a checkip-url routinely
+// carries an API key in its userinfo, query or fragment.
+//
+// Redacting the URL instead of omitting it was tried and is NOT sufficient:
+// config.RedactURL is a best-effort string scrubber, not a parser, and it has at
+// least three holes that a refusal message walks straight into.
+//
+//   - Missing '@'. The scan finds userinfo by '@', so the commonest credentialed
+//     typo defeats it outright: RedactURL("http://user:s3cr3t.example/") returns
+//     that string UNCHANGED (no '@', and no '?' either).
+//   - Scheme-relative authority. "//user:SECRET@host/" PARSES fine with populated
+//     userinfo, but with no "://" the scan starts at index 0, hits the leading
+//     '/' immediately, and takes the authority to be empty — so the userinfo is
+//     never found and the value is returned unchanged.
+//   - Fragments are never redacted at all. "ftp://host/#apikey=SECRET" and
+//     "http:///path#SECRET" both parse, and both keep the secret verbatim.
+//
+// The last two are PARSE-SUCCESS inputs, so no amount of "only redact once
+// url.Parse succeeded" gating helps; that gate was the previous iteration of
+// this comment and it was wrong. (The general RedactURL weakness is tracked
+// separately as #6609. This validator does not wait on it, and deliberately does
+// not depend on it: omitting the value is correct here regardless of how well
+// any scrubber works.)
+//
+// Omitting the URL costs nothing operationally. A refusal is always attributable
+// without it: the daemon carries "provider" as its own log attribute, the
+// commit-time warning names the provider and the leaf, and the operator is
+// looking at the value they just typed.
 func validateCheckIPURL(u string) error {
 	parsed, err := url.Parse(u)
 	if err != nil {
-		return fmt.Errorf("ddns checkip: url %q is not a valid URL: %w", u, err)
+		// Render the parse failure's CAUSE as a plain string and drop the %w
+		// wrap: url.Parse returns a *url.Error whose Error() re-embeds the FULL
+		// raw input, query included, so wrapping it (with %w or %v) would put
+		// the credential straight back. Dropping the wrapper is NOT sufficient
+		// either — several inner causes embed input too, one of them unbounded —
+		// so the cause goes through urlParseCause, which only ever returns a
+		// fixed constant. scrubURLError is deliberately not reused here: it
+		// recovers a safe URL by RE-PARSING ue.URL, and this URL is precisely
+		// the one that does not parse, so it would fall through to the raw
+		// string.
+		return fmt.Errorf("ddns checkip: url is not a valid URL: %s", urlParseCause(err))
 	}
 	if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
-		return fmt.Errorf("ddns checkip: url %q must be http(s)", u)
+		return errors.New("ddns checkip: url must be http(s)")
 	}
 	if parsed.Host == "" {
-		return fmt.Errorf("ddns checkip: url %q has no host", u)
+		return errors.New("ddns checkip: url has no host")
 	}
 	return nil
+}
+
+// parseReason is a CLOSED enumeration of the reasons urlParseCause may report.
+// It exists to move the no-leak property out of prose and into the type system:
+// urlParseCause returns parseReason, so a bare pass-through of the underlying
+// error text — "return cause" — does not COMPILE. Reintroducing the leak now
+// requires an explicit parseReason(...) conversion, which is a deliberate,
+// greppable edit rather than a plausible-looking slip.
+//
+// Being honest about the limit: within this package a conversion is still
+// legal, so the type is a barrier against the accidental form, not a proof.
+// TestURLParseCauseReturnsOnlyDeclaredConstants supplies the proof — it walks
+// urlParseCause's AST and asserts every return statement is a bare identifier
+// naming one of the constants below, which rejects the conversion form too and,
+// unlike a value-based check, covers branches no test input reaches.
+type parseReason string
+
+// The COMPLETE set of reasons urlParseCause can return.
+const (
+	causeMalformedURL   parseReason = "malformed URL"
+	causeMissingScheme  parseReason = "missing protocol scheme"
+	causeControlChar    parseReason = "invalid control character in URL"
+	causeEmptyURL       parseReason = "empty url"
+	causeInvalidURI     parseReason = "invalid URI for request"
+	causePathColon      parseReason = "first path segment in URL cannot contain colon"
+	causeBadUserinfo    parseReason = "invalid userinfo"
+	causeInvalidIPLit   parseReason = "invalid IP-literal"
+	causeMissingBracket parseReason = "missing ']' in host"
+	causeInvalidPort    parseReason = "invalid port after host"
+	causeInvalidHost    parseReason = "invalid host"
+	causeBadEscape      parseReason = "invalid percent-escape"
+	causeBadHostChar    parseReason = "invalid character in host"
+)
+
+// urlParseCause renders WHY url.Parse rejected an input, guaranteeing the result
+// carries NO part of that input.
+//
+// THE INVARIANT: every return below names one of the cause* CONSTANTS declared
+// above. Nothing derived from the argument is ever returned — not even after
+// inspection, and not via a variable that merely happens to hold a literal.
+// That, not any particular enumeration below, is what makes this safe, and it
+// holds no matter how net/url's messages change.
+//
+// Two earlier versions of this comment overstated things, so the enforcement is
+// spelled out: the parseReason return type makes a bare pass-through fail to
+// COMPILE, and TestURLParseCauseReturnsOnlyDeclaredConstants walks this
+// function's AST to assert every return is a bare constant identifier. The
+// value-based test alongside it only covers causes it invokes, which is why the
+// AST check exists — a selective pass-through on an unexercised branch is
+// invisible to input-driven testing.
+//
+// The enumeration exists only to keep the message useful. It is NOT sufficient
+// on its own, and two things make that concrete:
+//
+//   - Dropping the *url.Error wrapper is not enough. The wrapper re-embeds the
+//     whole raw URL, but several INNER causes embed input too, and one is
+//     unbounded: fmt.Errorf("invalid port %q after host", colonPort) (url.go
+//     561/630) quotes an arbitrary-length substring. The realistic trigger is an
+//     operator who omits the '@' in a credentialed URL —
+//     "https://user:s3cr3t.example/" parses as host "user", port
+//     ":s3cr3t.example" — so the failure mode puts the PASSWORD in the message.
+//     fmt.Errorf("invalid host: %w", err) (line 600) is unbounded the same way
+//     via netip's ParseAddr("<raw host>"). url.EscapeError (118/127/139) and
+//     url.InvalidHostError (148) quote a bounded 3- and 1-character fragment.
+//
+//   - Switching on the error TYPE cannot work. fmt.Errorf without %w returns
+//     *errors.errorString, which is exactly the type of the SAFE errors.New
+//     causes, so "invalid port \"...\" after host" and "missing protocol scheme"
+//     are indistinguishable by type. Hence the exact-match switch on the fixed
+//     sentences, plus class detection for the four input-bearing shapes — each
+//     of which maps to its own constant so the class stays diagnostic ("invalid
+//     port after host" still tells the operator where to look) without the
+//     offending bytes.
+//
+// The switch cases are the net/url parse failures whose text is a FIXED sentence
+// containing no part of the input, enumerated deliberately from the Go 1.26.4
+// net/url/url.go parse path rather than guessed: errors.New at lines 380, 436,
+// 440, 470, 481, 526, 550, 556 and 603. ("invalid URI for request", line 470, is
+// ParseRequestURI-only and unreachable through url.Parse; it is handled anyway
+// because this helper is meant to be reusable by the other DDNS URL validators,
+// #6606.) It is an ALLOWLIST, never a blocklist: anything unmatched falls
+// through to causeMalformedURL, so a stdlib rewording or a brand-new cause
+// degrades the diagnostic instead of opening a leak.
+func urlParseCause(err error) parseReason {
+	var ue *url.Error
+	if !errors.As(err, &ue) || ue.Err == nil {
+		// Not a url.Parse failure at all (unreachable via url.Parse, which
+		// always wraps). Nothing is known about this text — fail closed.
+		return causeMalformedURL
+	}
+	cause := ue.Err.Error()
+
+	switch cause {
+	case "missing protocol scheme":
+		return causeMissingScheme
+	case "net/url: invalid control character in URL":
+		return causeControlChar
+	case "empty url":
+		return causeEmptyURL
+	case "invalid URI for request":
+		return causeInvalidURI
+	case "first path segment in URL cannot contain colon":
+		return causePathColon
+	case "net/url: invalid userinfo":
+		return causeBadUserinfo
+	case "invalid IP-literal":
+		return causeInvalidIPLit
+	case "missing ']' in host":
+		return causeMissingBracket
+	}
+
+	// Input-bearing classes, each collapsed to its own constant. The two typed
+	// ones are matched by type; the two fmt.Errorf ones have no distinguishing
+	// type, so they are matched on the invariant PREFIX that precedes the
+	// interpolated input.
+	var esc url.EscapeError
+	if errors.As(ue.Err, &esc) {
+		return causeBadEscape
+	}
+	var badHost url.InvalidHostError
+	if errors.As(ue.Err, &badHost) {
+		return causeBadHostChar
+	}
+	if strings.HasPrefix(cause, "invalid port \"") {
+		return causeInvalidPort
+	}
+	if strings.HasPrefix(cause, "invalid host: ") {
+		return causeInvalidHost
+	}
+
+	// Unrecognized: fail closed rather than pass an unaudited string through.
+	return causeMalformedURL
 }

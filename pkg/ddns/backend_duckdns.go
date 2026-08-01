@@ -180,7 +180,10 @@ func (b *duckdnsBackend) DeleteLease(ctx context.Context, rec LeaseDNSRecord) er
 func (b *duckdnsBackend) update(ctx context.Context, fqdn string, q url.Values) error {
 	u, err := url.Parse(b.endpoint)
 	if err != nil {
-		return fmt.Errorf("ddns duckdns: bad endpoint: %w", err)
+		// SECURITY: %w here re-embeds the raw endpoint (a `server` leaf may carry
+		// userinfo/path/query credentials, and it reaches this constructor
+		// UNPARSED). Render through the shared scrubber (#6545).
+		return fmt.Errorf("ddns duckdns: bad endpoint: %s", scrubURLError(err))
 	}
 	// Merge the caller's parameters onto domains=+token= (and any the endpoint
 	// already carries).
@@ -194,7 +197,9 @@ func (b *duckdnsBackend) update(ctx context.Context, fqdn string, q url.Values) 
 
 	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
 	if err != nil {
-		return fmt.Errorf("ddns duckdns: build request: %w", err)
+		// SECURITY: u.String() at this point already carries token=<api-token> in
+		// the query, and %w would print the whole URL (#6545).
+		return fmt.Errorf("ddns duckdns: build request: %s", scrubURLError(err))
 	}
 	req.Header.Set("User-Agent", "xpf-ddns/1.0")
 

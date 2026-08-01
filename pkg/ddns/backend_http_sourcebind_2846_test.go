@@ -137,7 +137,7 @@ func TestCheckIPClientBoundDialsFromSourceAddress(t *testing.T) {
 	// wantV4=true; allowlist nil. The response is TEST-NET (rejected by the
 	// public gate) so the ADDRESS result is irrelevant here — we only assert the
 	// dial source. CheckIP still performs the bound dial.
-	_, _ = CheckIP(context.Background(), client, srv.URL, true, nil)
+	_, _, _ = CheckIP(context.Background(), client, srv.URL, true, nil)
 
 	src := <-gotSrc
 	if src != wantSrc {

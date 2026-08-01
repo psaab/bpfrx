@@ -180,7 +180,9 @@ func (b *route53Backend) listRRSet(ctx context.Context, name, rtype string) (r53
 	path := "/" + route53APIVersion + "/hostedzone/" + b.zoneID + "/rrset"
 	req, err := http.NewRequest(http.MethodGet, b.endpoint+path+"?"+q.Encode(), nil)
 	if err != nil {
-		return r53LiveRRSet{}, fmt.Errorf("ddns route53: build list request: %w", err)
+		// SECURITY: endpoint comes from the `server` leaf UNPARSED, so %w would
+		// print whatever credential it carries (#6545).
+		return r53LiveRRSet{}, fmt.Errorf("ddns route53: build list request: %s", scrubURLError(err))
 	}
 	req.Header.Set("User-Agent", "xpf-ddns/1.0")
 	signRequest(req, b.creds, nil, b.now())
@@ -198,7 +200,17 @@ func (b *route53Backend) listRRSet(ctx context.Context, name, rtype string) (r53
 	}
 	var resp listRRSetsXML
 	if err := xml.Unmarshal(raw, &resp); err != nil {
-		return r53LiveRRSet{}, fmt.Errorf("ddns route53: %s: decode rrset list: %w", b.name, err)
+		// SECURITY: Go's XML decoder quotes provider-controlled declaration
+		// values back in its error text, e.g.
+		//   xml: unsupported version "<whatever the body said>"; only version
+		//   1.0 is supported
+		// and `raw` is a 2xx response body, so that string is entirely
+		// attacker-chosen. A provider echoing our own update URL there puts the
+		// credential into this error, which the daemon logs. Withhold it: the
+		// prefix already says what failed, and the decoder's detail is not worth
+		// a disclosure channel.
+		return r53LiveRRSet{}, fmt.Errorf("ddns route53: %s: decode rrset list: %s",
+			b.name, scrubInnerError(err))
 	}
 	want := strings.TrimSuffix(name, ".")
 	for _, s := range resp.ResourceRecordSets.ResourceRecordSet {
@@ -260,7 +272,9 @@ func (b *route53Backend) change(ctx context.Context, action, name, rtype string,
 	path := "/" + route53APIVersion + "/hostedzone/" + b.zoneID + "/rrset/"
 	req, err := http.NewRequest(http.MethodPost, b.endpoint+path, bytes.NewReader(body))
 	if err != nil {
-		return "", "", fmt.Errorf("ddns route53: build request: %w", err)
+		// SECURITY: endpoint comes from the `server` leaf UNPARSED, so %w would
+		// print whatever credential it carries (#6545).
+		return "", "", fmt.Errorf("ddns route53: build request: %s", scrubURLError(err))
 	}
 	req.Header.Set("Content-Type", "application/xml")
 	req.Header.Set("User-Agent", "xpf-ddns/1.0")
