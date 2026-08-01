@@ -264,6 +264,25 @@ credential revocation is enforced even on an apply that returns early
     non-loopback HTTPS retained by a failed rebind is never dropped to no-auth).
     Both gates read the fingerprint the rebinds just updated, so this direction
     cannot move earlier.
+  - **Auth freshness — the unconditional publish is pinned to the COMMITTED
+    credential** (#5561 round 10). Publishing `next.Auth` regardless of the
+    rebind outcome is right only while `next` came from the newest committed
+    config, and on the apply path it need not have: a caller that snapshots
+    `store.ActiveConfig()` and THEN waits on the apply semaphore (the DHCP
+    lease-change callback) can be overtaken by a commit and re-enter
+    `applyConfig` carrying a superseded config. `reconcile` therefore routes the
+    desired config through `withCommittedAuth`, which replaces the credential
+    half with the store's ACTIVE one whenever the active config specifies a
+    credential set — never turning a non-nil publish into a nil one, so it
+    cannot relax the #4047/#5127 clamp. Without it, a stale replay whose own
+    rebind failed left the listener the newer commit had moved to serving under
+    the credential that commit REPLACED. Only the credential half is pinned: a
+    stale replay still drives the listener toward the stale ENDPOINT, which is
+    the general stale-snapshot apply defect (#6716) and lives in the apply path.
+    Gating the publish on the rebind outcome instead is NOT the repair — it
+    restores the round-7 fail-open in the same edit;
+    `management_authstale_5561_test.go` drives both directions for exactly that
+    reason.
 
   Pinned by `TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866`
   (revocation honored across a failing HTTPS rebind),

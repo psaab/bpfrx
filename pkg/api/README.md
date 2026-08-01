@@ -403,9 +403,9 @@ So the body is drained **inside the gate**, between two adjudications:
 
 | step | why it is where it is |
 |---|---|
-| **pass 1** | Fail-fast, and it comes first for *availability*, not authorization. Buffering before deciding would let any caller that can open a socket park up to `maxRequestBodyBytes` of daemon memory per connection behind a 30s read timeout — 16 MiB × N from a `read-only` shell account. With the check first, only a principal already authorized for **this** route can make the daemon hold a buffer. |
-| **drain** | The caller-controlled block, moved in front of the verdict that admits the mutation. Bounded at `maxRequestBodyBytes+1`, one byte past the handlers' own cap, so an oversized body still reaches `MaxBytesReader` and still answers 413 — the outcome is preserved byte for byte. |
-| **pass 2** | The verdict the handler actually runs under. It re-reads the **live** half — the config snapshot and the api-auth credential, the two things a commit can change under an in-flight request. The **connection-fixed** half (the accept-time peer UID, and the credential row's locality re-derivation) is reused: a connection's addresses do not change mid-request, and re-enumerating interfaces per pass would make every credentialed mutation pay twice for an unchanged answer. The `/etc/passwd` resolution *is* repeated, deliberately — it is a page-cached read of a small local file, and repeating it means an account deleted mid-request is noticed. |
+| **pass 1** | Fail-fast, and it comes first for *availability*, not authorization. Buffering before deciding would let any caller that can open a socket park daemon memory behind a 30s read timeout. With the check first, only a principal already authorized for **this** route can make the daemon hold a buffer. That is a necessary bound and not a sufficient one — the cheapest permission on the surface is `PermView`, held by a `read-only` shell account — so the drain is bounded again below. |
+| **drain** | The caller-controlled block, moved in front of the verdict that admits the mutation, and bounded in **both** dimensions. **Per route** (`restMutationBodyLimits`): `POST /api/v1/config/load` keeps the 16 MiB whole-configuration ceiling, config edits get 1 MiB, diagnostics and `system/action` get 64 KiB, and the two routes whose handlers never touch the body (`security/sessions/clear`, `security/counters/clear`) are **not buffered at all** — their own immediate answer is restored rather than moved behind a read the caller controls. `dhcp/identifiers/clear` is deliberately *not* in that class: #4794 made it decode an optional body, so it keeps the ordering. **In aggregate** (`mutationBodyBudgetBytes`, 64 MiB): a request reserves `min(Content-Length, route ceiling)` for its whole lifetime and is refused **429** when the budget is exhausted, so the memory a caller can pin is capped no matter how many sockets it opens. On the one route still at the 16 MiB cap the read is `limit+1`, so an oversized body still reaches `MaxBytesReader` and still answers 413; on a tighter route the gate answers 413 itself, with the same status and message. |
+| **pass 2** | The verdict the handler actually runs under. It re-reads the **live** half — the config snapshot and the api-auth credential, the two things a commit can change under an in-flight request — **on every row**, not only on the credential row. The credential re-check used to sit inside `principalFrom`'s off-box branch, which an attributed *local* caller never reaches, so a configured administrator on this host could present secret A, withhold its body, let another session rotate A to B, and still have the mutation run; the same hole in its worst spelling let a request admitted while the listener had *no* api-auth stay credentialless after a commit added one. The **connection-fixed** half (the accept-time peer UID, and the credential row's locality re-derivation) is reused: a connection's addresses do not change mid-request, and re-enumerating interfaces per pass would make every credentialed mutation pay twice for an unchanged answer. The `/etc/passwd` resolution *is* repeated, deliberately — it is a page-cached read of a small local file, and repeating it means an account deleted mid-request is noticed. |
 
 Two residuals, both named. Locality is answered from an enumeration started on
 pass 1, so an address added to this host *while the body was being read* is not
@@ -420,6 +420,17 @@ revocation shapes — a class demotion (caught by the fresh snapshot) and an
 `api-auth` revocation (caught by the fresh credential check) — because a fix
 that re-read only one of the two leaves the other on the old behaviour. It also
 pins the enumeration count at exactly one per request.
+`TestLocalCallerCredentialIsRevalidatedAfterTheBody_5561`
+(`authz_bodywindow_5561_test.go`) drives the **intersection** those two rows
+leave empty — a LOCAL attributed caller whose credential is rotated, or newly
+required, inside the window — which is exactly where the credential re-check
+did not run. `authz_bodybudget_5561_test.go` owns what the window may cost:
+`TestNoBodyRouteIsNotBufferedByTheGate_5561` (with a body-taking control that
+must still park), `TestPerRouteBodyLimitIsEnforced_5561`,
+`TestGateBodyBufferIsBoundedInAggregate_5561` (concurrent withheld-body
+requests exceeding the budget must be REFUSED, not admitted), and
+`TestEveryGuardedRouteDeclaresABodyLimit_5561`, which keeps the permission and
+body-limit tables from diverging.
 
 The rule has been narrowed twice, each time because a weaker version had a hole
 the claim did not admit to:

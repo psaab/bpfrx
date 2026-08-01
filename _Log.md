@@ -1,3 +1,80 @@
+## 2026-08-01 — #5561 round 10: fold three MAJOR findings on PR #6645
+
+- **Timestamp**: 2026-08-01 (fix/5561-rest-config-auth, PR #6645)
+- **Action**: Three MAJORs, two of them introduced by the round-9 fold. All
+  three confirmed firsthand before fixing; none refuted.
+
+  **MAJOR 1 — the second adjudication did not re-check the credential for
+  attributed LOCAL callers.** `principalFrom` re-validated the api-auth
+  credential only inside its off-box branch, which the peer-UID row returns
+  before ever reaching. So a configured administrator ON THIS HOST could
+  present secret A, withhold its body, let another session rotate A to B, and
+  still have the mutation run — pass 2 refreshed the login class and nothing
+  else. The nil -> non-nil direction is the same hole in its worst spelling: a
+  request admitted through `dynamicAuthMiddleware`'s nil-snapshot pass-through
+  stayed credentialless after a commit ADDED api-auth. Fixed by re-evaluating
+  the listener's own authentication gate at the top of `principalFrom`, on
+  every row, routed through `credentialPrincipalUser` (`authCheck`'s two
+  exemptions are /health and /metrics, both GET, which `isSafeHTTPMethod`
+  returned before the gate ran). New test drives the INTERSECTION the existing
+  matrix omits (local attributed caller x credential change), both spellings,
+  each with a control that must be ADMITTED. TRUE parent RED at fe827f73f
+  (build rc 0, vet rc 0, got 200 want 403 on both rows; controls green).
+
+  **MAJOR 2 — the round-9 fold introduced an aggregate-unbounded body-buffer
+  DoS.** Every authorized POST reached `bufferMutationBody`, which retained up
+  to 16 MiB per request with no per-route ceiling and no aggregate bound; the
+  gate holds that buffer for as long as the CALLER takes to finish sending
+  (apiReadTimeout, 30s). Worse, `security/sessions/clear` used to reject a
+  body-carrying clear immediately without reading a byte, and that rejection
+  moved behind the caller-controlled read. Fixed in three parts rather than
+  papered with a comment: (a) `restMutationBodyLimits`, a per-route ceiling —
+  `config/load` keeps 16 MiB, config edits 1 MiB, diagnostics and
+  `system/action` 64 KiB, and the two routes whose handlers never touch the
+  body are NOT buffered at all, restoring their immediate answer;
+  `dhcp/identifiers/clear` is deliberately NOT in that class because #4794 made
+  it decode an optional body, so it keeps the ordering. (b)
+  `mutationBodyBudgetBytes` (64 MiB), an aggregate admission bound — a request
+  reserves min(Content-Length, ceiling) for its whole lifetime and is refused
+  429 past the budget, which is what makes the availability claim the two-pass
+  design is justified by actually true. (c) a completeness test keeping the
+  permission and body-limit tables from diverging. Tests bind the AGGREGATE
+  property (concurrent withheld-body requests exceeding the budget must be
+  REFUSED, with controls that one request on an idle budget IS admitted and
+  that some of the burst gets in). The no-body test carries a body-taking
+  CONTROL that must still park, so the probe discriminates. RED proved by
+  mutating the fix out (per-route ceilings removed, aggregate bound removed;
+  symbols kept so build rc 0 / vet rc 0): the three specific guards RED, the
+  table-completeness test and the round-9 freshness guards GREEN. The no-body
+  half is additionally TRUE parent RED at fe827f73f.
+
+  **MAJOR 3 — a failed rebind left a REVOKED credential live.** HEAD published
+  every non-nil auth snapshot unconditionally, before the rebind. On the apply
+  path a caller that snapshots `store.ActiveConfig()` and then waits on the
+  apply semaphore (the DHCP lease-change callback) can be overtaken by a commit
+  and replay a superseded config: the replay published the SUPERSEDED
+  credential, its own rebind failed, and the listener the newer commit had
+  moved to kept serving under the credential that commit REPLACED. Verified the
+  "pre-existing" boundary firsthand rather than taking it on trust: at
+  origin/master (ad9591177) the stale-replay case PASSES and the round-7
+  rotation case FAILS; at fe827f73f the reverse. So the widening IS this PR's,
+  and restoring master's httpOK gate would ship the round-7 fail-open back.
+  Fixed by pinning the CREDENTIAL half to the store's ACTIVE config
+  (`withCommittedAuth`) before handing the desired config to `reconcileTo` —
+  never turning a non-nil publish into a nil one, so it cannot relax the
+  #4047/#5127 clamp. Only the credential is pinned; the stale ENDPOINT is the
+  general stale-snapshot apply defect (#6716) and stays there. Test drives BOTH
+  directions in one file for exactly the reason above. TRUE parent RED at
+  fe827f73f on the stale case with the round-7 case green.
+
+  Validation: `go build ./...` rc 0, `go vet ./...` rc 0,
+  `go test -race ./pkg/api/... ./pkg/daemon/... ./pkg/config/...` all ok, and
+  the full `go test ./...` Go suite rc 0 with zero FAIL lines.
+- **File(s)**: `pkg/api/authz.go`, `pkg/api/authz_bodywindow_5561_test.go`,
+  `pkg/api/authz_bodybudget_5561_test.go`, `pkg/api/README.md`,
+  `pkg/daemon/management.go`, `pkg/daemon/management_authstale_5561_test.go`,
+  `pkg/daemon/README.md`, `_Log.md`
+
 ## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
 
 - **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)

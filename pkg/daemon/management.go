@@ -53,6 +53,12 @@ import (
 //     publishes AFTER the rebinds and stays gated on httpOK plus the LIVE HTTPS
 //     being off/loopback: it REMOVES a requirement, and both gates read the
 //     fingerprint the rebinds just advanced.
+//   - AUTH FRESHNESS: an unconditional publish is only safe while the config it
+//     came from is the newest COMMITTED one, so reconcile pins the credential
+//     half to the store's active config before handing it to reconcileTo — see
+//     withCommittedAuth. Without that, a stale-snapshot apply replay could
+//     resurrect a superseded credential on a listener the operator had already
+//     moved past.
 //
 // The reconcile is serialized by mu; the apply path (applyConfigLocked under the
 // apply semaphore) already runs commits one at a time, so a newer generation can
@@ -189,7 +195,52 @@ func (m *managementReconciler) effectiveHTTPListener() sysservices.Listener {
 // the OLD listener is retained (fail-safe) and the next commit retries. An
 // auth-only change (or an unchanged config) always returns nil.
 func (m *managementReconciler) reconcile(cfg *config.Config) error {
-	return m.reconcileTo(m.desired(cfg))
+	return m.reconcileTo(m.withCommittedAuth(m.desired(cfg)))
+}
+
+// withCommittedAuth pins next's api-auth policy to the one the store's ACTIVE
+// config carries, whenever that config specifies one (#5561 round 10,
+// finding 3).
+//
+// The credential set published here governs the LIVE listener, and reconcileTo
+// publishes a non-nil one UNCONDITIONALLY — before the rebind and regardless of
+// whether the rebind succeeds — because a committed revocation must not be
+// blocked by a bind failure (#5561 round 7). That is right only while `cfg` is
+// the newest committed policy, and on one path it is not: applyConfig callers
+// that snapshot store.ActiveConfig() and THEN wait on the apply semaphore (the
+// DHCP lease-change callback is the live example) can be overtaken by a commit
+// and re-enter the apply carrying a superseded config. Without this, such a
+// replay published the SUPERSEDED credential over the committed one and — when
+// its own rebind then failed, leaving the newer endpoint serving — left a
+// credential the operator had already replaced accepting full-power requests on
+// it. Gating the publish on the rebind outcome instead (the pre-round-7 shape)
+// does not fix that: the two cases are the same shape from inside reconcileTo
+// and differ only in WHICH config is newer, so the only sound discriminator is
+// to ask the store.
+//
+// Scope, stated precisely: this pins the CREDENTIAL half only. A stale replay
+// still drives the listener toward the stale ENDPOINT — that is the general
+// stale-snapshot apply defect (#6716), which lives in the apply path and is not
+// repaired here. The credential is separated out because it is the security
+// control: a stale bind is a reachability bug the next commit corrects, while a
+// resurrected credential is an authentication bypass that persists.
+//
+// Direction of the override: it applies only when the ACTIVE config specifies a
+// credential set, i.e. it never turns a non-nil publish into a nil one. That
+// keeps it incapable of relaxing the #4047/#5127 clamp, whose requirement is
+// derived from `next`'s own bind address rather than from the active config's.
+func (m *managementReconciler) withCommittedAuth(next api.Config) api.Config {
+	if m.d == nil || m.d.store == nil {
+		return next
+	}
+	active := m.d.store.ActiveConfig()
+	if active == nil {
+		return next
+	}
+	if committed := m.desired(active).Auth; committed != nil {
+		next.Auth = committed
+	}
+	return next
 }
 
 // reconcileTo drives the reconcile against an explicit desired config. Split

@@ -102,6 +102,94 @@ var restMutationPermissions = map[string]config.LoginClassPermission{
 	"POST /api/v1/system/action": config.PermMaint,
 }
 
+// Per-route ceilings on the request body the gate will hold buffered
+// (#5561 round 10, finding 2).
+//
+// The gate reads a mutating request's body BEFORE the verdict the handler runs
+// under (mutationAuthzGuard says why). That read is the one step of the gate a
+// CALLER controls outright, so its memory cost has to be bounded in both
+// dimensions: per request, and in aggregate across every request in flight.
+// A blanket maxRequestBodyBytes did neither usefully — 16 MiB is the ceiling
+// the ONE route that carries a whole candidate configuration needs, and
+// applying it to `POST /api/v1/diagnostics/ping` let the cheapest permission on
+// the surface (PermView, a `read-only` shell account) reserve the same 16 MiB
+// per connection as a configure-authorized commit.
+const (
+	// mutationBodyNone marks a route that consumes NO request body. The gate
+	// does not buffer for these AT ALL: their handlers never read the body (two
+	// of the three reject a non-zero ContentLength outright, #3421 H6 / #4794),
+	// so there is no caller-controlled block between the gate and the mutation
+	// and nothing for the second adjudication to get in front of. Buffering
+	// them was pure cost — it turned an immediate 400 into a 16 MiB read the
+	// caller could stall for the whole apiReadTimeout.
+	mutationBodyNone int64 = 0
+	// mutationBodySmall fits a JSON object of scalar options — a ping target
+	// plus counts, a system action verb. Orders of magnitude above the real
+	// payloads, small enough that the cheapest permissions cannot crowd the
+	// aggregate budget.
+	mutationBodySmall int64 = 64 << 10 // 64 KiB
+	// mutationBodyEdit fits a configuration EDIT: one `set`/`delete` input, a
+	// commit log message, a rollback index, an annotation.
+	mutationBodyEdit int64 = 1 << 20 // 1 MiB
+	// mutationBodyLoad is the whole-candidate-configuration ceiling, unchanged
+	// from the handler-side maxRequestBodyBytes it replaces on this route.
+	mutationBodyLoad int64 = maxRequestBodyBytes // 16 MiB
+)
+
+// restMutationBodyLimits is the per-route buffer ceiling. It is keyed exactly
+// like restMutationPermissions and must cover the same routes:
+// TestEveryGuardedRouteDeclaresABodyLimit_5561 fails if the two key sets ever
+// diverge, so a new mutating route cannot silently inherit the largest cap.
+// A route absent from the table anyway falls back to mutationBodySmall (the
+// tightest cap that still preserves the two-pass ordering), never to the
+// largest.
+var restMutationBodyLimits = map[string]int64{
+	// Operational clear verbs. sessions/counters are parameterless by contract
+	// and their handlers never touch the body — one rejects a non-zero
+	// ContentLength outright (#3421 H6), the other ignores the request entirely
+	// — so there is no caller-controlled block for the gate to get in front of
+	// and nothing to buffer.
+	"POST /api/v1/security/sessions/clear": mutationBodyNone,
+	"POST /api/v1/security/counters/clear": mutationBodyNone,
+	// The DHCP clear is NOT in that class despite its name: #4794 made it
+	// DECODE an optional {"interface":...} body whenever ContentLength is
+	// non-zero, so its handler does block on the caller and must keep the
+	// buffered-body ordering. Its payload is one interface name.
+	"POST /api/v1/dhcp/identifiers/clear": mutationBodySmall,
+
+	// Diagnostics: a target plus a handful of scalars.
+	"POST /api/v1/diagnostics/ping":       mutationBodySmall,
+	"POST /api/v1/diagnostics/traceroute": mutationBodySmall,
+
+	// Configuration edits and the commit family.
+	"POST /api/v1/config/enter":            mutationBodyEdit,
+	"POST /api/v1/config/exit":             mutationBodyEdit,
+	"POST /api/v1/config/set":              mutationBodyEdit,
+	"POST /api/v1/config/delete":           mutationBodyEdit,
+	"POST /api/v1/config/deactivate":       mutationBodyEdit,
+	"POST /api/v1/config/activate":         mutationBodyEdit,
+	"POST /api/v1/config/commit":           mutationBodyEdit,
+	"POST /api/v1/config/commit-check":     mutationBodyEdit,
+	"POST /api/v1/config/commit-confirmed": mutationBodyEdit,
+	"POST /api/v1/config/confirm":          mutationBodyEdit,
+	"POST /api/v1/config/rollback":         mutationBodyEdit,
+	"POST /api/v1/config/annotate":         mutationBodyEdit,
+
+	// The only route that legitimately carries a whole configuration.
+	"POST /api/v1/config/load": mutationBodyLoad,
+
+	// Destructive maintenance: an action verb and its options.
+	"POST /api/v1/system/action": mutationBodySmall,
+}
+
+// mutationBodyLimit returns the buffer ceiling for a guarded route.
+func mutationBodyLimit(route string) int64 {
+	if n, ok := restMutationBodyLimits[route]; ok {
+		return n
+	}
+	return mutationBodySmall
+}
+
 type peerIdentityKey struct{}
 
 // peerLookupTimeout bounds how long a CONNECTION's peer lookup may take. It only
@@ -463,6 +551,39 @@ func (s *Server) reauthorizeInputs(r *http.Request, ri *requestIdentity) (*confi
 // The ORDER in which its two inputs are obtained — the peer wait and the config
 // read — is argued on authorizeInputs, which is the only caller.
 func (s *Server) principalFrom(r *http.Request, cfg *config.Config, ri *requestIdentity) authz.Principal {
+	// The listener's OWN authentication gate is evaluated exactly once, by
+	// dynamicAuthMiddleware, before this middleware is entered — which is
+	// before the caller has supplied its body. Re-evaluate it HERE so the
+	// gate's second pass answers to the LIVE snapshot (#5561 round 10,
+	// finding 1).
+	//
+	// Without this, only the credential row below re-validated, and it is the
+	// row a local caller never reaches. So an attributed LOCAL administrator
+	// could hold the window open with a withheld body while another session
+	// rotated the credential it had presented, and the mutation still ran on
+	// the revoked secret: pass 2 refreshed the login class and nothing else.
+	// The nil -> non-nil direction is the same hole in its worst spelling — a
+	// request admitted while the listener had NO api-auth policy stayed
+	// credentialless after a commit ADDED one, so a tightening the operator
+	// committed did not reach the request it was committed to stop.
+	//
+	// It is routed through credentialPrincipalUser rather than authCheck
+	// because authCheck's two exemptions (/health always, /metrics on a
+	// loopback bind) are GET-only paths that isSafeHTTPMethod already returned
+	// before the gate ran; on a mutating route the two are the same predicate.
+	//
+	// A nil snapshot is not a failure: it means this listener has no api-auth
+	// policy at all, which the #4047/#5127 clamp confines to a loopback bind.
+	// The denial is a 403 rather than the middleware's 401 because it is the
+	// gate that writes it; a caller racing a credential change gets a refusal
+	// with a reason either way.
+	if a := s.auth.Load(); a != nil {
+		if _, ok := credentialPrincipalUser(*a, r); !ok {
+			return authz.Unauthenticated(
+				"api-auth credential was revoked, rotated, or newly required while this " +
+					"request was being adjudicated")
+		}
+	}
 	id := ri.id
 	if id.OK {
 		// (1) and (2). PrincipalForUID yields an unresolved principal for an
@@ -586,7 +707,8 @@ func (s *Server) mutationAuthzGuard(next http.Handler) http.Handler {
 		// normalized first: cleaning can only widen what matches, and a
 		// non-canonical spelling of a guarded route must fail closed here
 		// rather than reach the mux's redirect.
-		required, known := restMutationPermissions[r.Method+" "+r.URL.Path]
+		route := r.Method + " " + r.URL.Path
+		required, known := restMutationPermissions[route]
 		if !known {
 			// Debug for the same reason as the denial below: caller-driven and
 			// unauthenticated, so a Warn here is a log-amplification lever.
@@ -642,11 +764,15 @@ func (s *Server) mutationAuthzGuard(next http.Handler) http.Handler {
 		//
 		//	pass 1  fail-fast, and the reason it comes FIRST is availability, not
 		//	        authorization. Buffering before deciding would let any caller
-		//	        that can open a socket park up to maxRequestBodyBytes of the
-		//	        daemon's memory per connection behind a 30s read timeout —
-		//	        16 MiB x N connections from a `read-only` shell account. With
-		//	        the check first, only a principal already authorized for THIS
-		//	        route can make the daemon hold a buffer.
+		//	        that can open a socket park the daemon's memory behind a 30s
+		//	        read timeout. With the check first, only a principal already
+		//	        authorized for THIS route can make the daemon hold a buffer.
+		//	        Authorization is a necessary bound and not a sufficient one,
+		//	        though — the cheapest permission on the surface (PermView, a
+		//	        `read-only` shell account, on /diagnostics/ping) is still a
+		//	        principal — so the drain is ALSO bounded per route and in
+		//	        aggregate; see restMutationBodyLimits and
+		//	        mutationBodyBudgetBytes.
 		//	drain   the caller-controlled block, moved in front of the verdict
 		//	        that admits the mutation.
 		//	pass 2  the verdict the handler actually runs under. It re-reads the
@@ -685,7 +811,17 @@ func (s *Server) mutationAuthzGuard(next http.Handler) http.Handler {
 			return
 		}
 
-		if !bufferMutationBody(w, r) {
+		// The drain is bounded in BOTH dimensions before it starts: this route's
+		// own ceiling, and the aggregate budget across every request in flight.
+		// The availability argument above is only true with the second one — a
+		// per-request cap says nothing about how many requests a caller opens.
+		limit := mutationBodyLimit(route)
+		release, admitted := admitMutationBody(w, r, limit)
+		if !admitted {
+			return
+		}
+		defer release()
+		if !bufferMutationBody(w, r, limit) {
 			return
 		}
 
@@ -716,24 +852,117 @@ var mutationBodyWaitersInFlight atomic.Int64
 // reading their caller's body between the gate's two adjudications. Test-only.
 func MutationBodyWaitersForTest() int { return int(mutationBodyWaitersInFlight.Load()) }
 
+// mutationBodyBudgetBytes bounds the TOTAL request-body bytes the gate may have
+// admitted across every mutating request in flight (#5561 round 10, finding 2).
+//
+// The per-route ceiling above bounds ONE request; it says nothing about a
+// thousand. The gate holds its buffer for as long as the caller takes to send
+// the body, which is up to apiReadTimeout (30s) and entirely the caller's
+// choice, so per-request caps alone leave the daemon's heap a function of how
+// many connections a caller opens: 64 half-sent 16 MiB posts from ONE
+// `read-only` shell account is a gigabyte of resident memory, reached without
+// ever completing a request.
+//
+// This is the bound that makes the availability argument in mutationAuthzGuard
+// true rather than merely intended: past it a request is REFUSED (429) instead
+// of admitted to buffer, so the memory a caller can make the daemon hold is
+// capped no matter how many sockets it opens. 64 MiB is four concurrent
+// whole-configuration loads — far above operator concurrency on a surface that
+// answers a handful of actions per second — and the per-route ceilings keep a
+// view-tier caller from reserving in units a configure-tier caller needs.
+const mutationBodyBudgetBytes int64 = 64 << 20 // 64 MiB
+
+// mutationBodyBytesAdmitted is the live sum of those reservations.
+var mutationBodyBytesAdmitted atomic.Int64
+
+// MutationBodyBytesAdmittedForTest reports the bytes currently reserved against
+// the gate's aggregate body budget. Test-only.
+func MutationBodyBytesAdmittedForTest() int64 { return mutationBodyBytesAdmitted.Load() }
+
+// MutationBodyBudgetForTest reports the aggregate budget. Test-only.
+func MutationBodyBudgetForTest() int64 { return mutationBodyBudgetBytes }
+
+// reserveMutationBodyBytes takes n bytes of the aggregate budget. ok=false
+// means the budget is exhausted and nothing was taken.
+//
+// A CAS loop rather than a mutex: the reservation is a load and an add on a
+// path that goes on to do IO, and a failed CAS means another request moved the
+// total, which is exactly when the ceiling must be re-tested.
+func reserveMutationBodyBytes(n int64) bool {
+	for {
+		cur := mutationBodyBytesAdmitted.Load()
+		if cur+n > mutationBodyBudgetBytes {
+			return false
+		}
+		if mutationBodyBytesAdmitted.CompareAndSwap(cur, cur+n) {
+			return true
+		}
+	}
+}
+
+// admitMutationBody reserves the budget this request's body can cost and
+// returns the release, which the gate defers for the WHOLE request — the
+// buffer the reservation stands for is handed to the handler and lives until
+// the handler returns, so releasing it when the read finishes would under-count
+// exactly the memory being bounded.
+//
+// ok=false means the budget is exhausted and the 429 has already been written.
+// A route that consumes no body reserves nothing and gets a no-op release.
+func admitMutationBody(w http.ResponseWriter, r *http.Request, limit int64) (release func(), ok bool) {
+	noop := func() {}
+	if r.Body == nil || r.Body == http.NoBody || limit == mutationBodyNone {
+		return noop, true
+	}
+	// Reserve what this request can actually cost. A declared ContentLength is
+	// authoritative for a non-chunked body — net/http will not deliver more
+	// than it — so a small declared body reserves small and a legitimate
+	// operator action does not consume a whole route-ceiling slot. A chunked
+	// body (ContentLength -1) declares nothing, so it reserves the ceiling.
+	reserve := limit + 1
+	if r.ContentLength >= 0 && r.ContentLength < reserve {
+		reserve = r.ContentLength
+	}
+	if reserve <= 0 {
+		return noop, true
+	}
+	if !reserveMutationBodyBytes(reserve) {
+		// Debug, not Warn: caller-driven, so a Warn here is a log-amplification
+		// lever (CLAUDE.md).
+		slog.Debug("api: refused mutating request body admission",
+			"method", r.Method, "path", r.URL.Path, "want", reserve,
+			"admitted", mutationBodyBytesAdmitted.Load())
+		writeError(w, http.StatusTooManyRequests,
+			"request body admission limit reached; retry shortly")
+		return nil, false
+	}
+	return func() { mutationBodyBytesAdmitted.Add(-reserve) }, true
+}
+
 // bufferMutationBody reads a mutating request's body to completion and replaces
 // r.Body with the buffered copy, so the handler's later decode cannot block on
 // the caller — see mutationAuthzGuard. It returns false when it has already
 // written an error response.
 //
-// The ceiling is maxRequestBodyBytes+1, one byte past the cap the handlers'
-// own MaxBytesReader enforces. Reading exactly one byte past it preserves the
-// existing outcome byte for byte: a body over the cap still reaches the handler
-// long enough for MaxBytesReader to trip and answer 413, rather than being
-// turned into a different error here. A body under the cap is handed over
-// whole, so decode behaviour — including which malformed inputs produce 400 —
-// is unchanged.
-func bufferMutationBody(w http.ResponseWriter, r *http.Request) bool {
-	if r.Body == nil || r.Body == http.NoBody {
+// limit is the route's ceiling (restMutationBodyLimits). A limit of
+// mutationBodyNone means the route consumes no body: the gate buffers NOTHING
+// and the handler answers whatever it answers today (the parameterless-clear
+// contract's own 400), which is what it did before the gate started reading
+// bodies at all.
+//
+// Otherwise it reads at most limit+1 bytes. On the one route whose limit is
+// still maxRequestBodyBytes the extra byte preserves the previous outcome byte
+// for byte — the body reaches the handler long enough for its own
+// MaxBytesReader to trip and answer 413. On a route with a TIGHTER limit the
+// handler's reader would not trip, so the 413 is written here instead, with the
+// same status and the same message decodeJSONBody produces. A body under the
+// limit is handed over whole, so decode behaviour — including which malformed
+// inputs produce 400 — is unchanged.
+func bufferMutationBody(w http.ResponseWriter, r *http.Request, limit int64) bool {
+	if r.Body == nil || r.Body == http.NoBody || limit == mutationBodyNone {
 		return true
 	}
 	mutationBodyWaitersInFlight.Add(1)
-	buf, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodyBytes+1))
+	buf, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
 	mutationBodyWaitersInFlight.Add(-1)
 	if err != nil {
 		// The caller hung up, timed out, or sent a malformed chunked body. Not
@@ -741,6 +970,10 @@ func bufferMutationBody(w http.ResponseWriter, r *http.Request) bool {
 		slog.Debug("api: could not read mutating request body",
 			"method", r.Method, "path", r.URL.Path, "err", err)
 		writeError(w, http.StatusBadRequest, "could not read request body")
+		return false
+	}
+	if int64(len(buf)) > limit {
+		writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
 		return false
 	}
 	r.Body = io.NopCloser(bytes.NewReader(buf))
