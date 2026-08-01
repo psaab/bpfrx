@@ -66411,3 +66411,29 @@ break — `go vet` confirmed passing under every revert.
   the reshape removed both — a `grep primeEpochFloor` caught it.
 - **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_epoch_latch_test.go,
   _Log.md
+
+- **Timestamp**: 2026-08-01 23:15
+- **Action**: #6169 — post-reshape comment sweep + the two open findings measured.
+  Grepping the DELETED symbols found SEVEN stale references to the removed
+  durable floor across four files, not the one block spotted: two in
+  heartbeat.go (including the rollback recovery instruction pointing at a state
+  file that no longer exists), two in manager.go (the operator-facing
+  rate-limited warning), one in heartbeat_epoch.go, one in the latch test header,
+  two in README. All corrected to the restart-only recovery. Also re-stated the
+  storage claim explicitly naming the HANGING case, which is the one that was
+  actually broken: a FAILING store always fell through to the wall-clock seed; a
+  HANGING one did not, because the epoch was computed before I/O and then thrown
+  away by not publishing until after a blocking LOCK_EX. Findings re-checked
+  against the reshape: MAJOR 1 and MAJOR 3 are MOOT (no state to hand-edit, no
+  durable window); MAJOR 5 is free (emission no longer depends on the lock);
+  MAJOR 2 is fixed and pinned by the tie-break's own held-flock experiment
+  (3ba876e7c); MAJOR 4 is NOT moot but reduced — an in-bound skewed epoch still
+  latches, now bounded BOTH by the one-hour slack (self-clearing) and by a
+  restart clearing the in-memory floor. Measured the receiver-restart cost rather
+  than asserting it: ONE heartbeat interval with a live peer; a replay inside the
+  window IS admitted, the live peer's higher epoch repairs the floor, so sustained
+  exposure additionally needs the peer ABSENT. Both now have tests and are
+  documented as deliberate.
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/manager.go, pkg/cluster/heartbeat_epoch_latch_test.go,
+  pkg/cluster/README.md, _Log.md

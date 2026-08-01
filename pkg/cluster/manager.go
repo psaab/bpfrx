@@ -234,7 +234,7 @@ type Manager struct {
 
 	// lastEpochDowngradeWarn rate-limits the epoch-downgrade rejection warning.
 	// The rejection is operator-actionable (a peer rolled back to a pre-#6169
-	// build stays refused until the persisted floor is cleared), so it must be
+	// build stays refused until xpfd is restarted on this node), so it must be
 	// visible — but the peer sends at 5-10/s, so an unguarded log would flood
 	// journald. Read/written under m.mu.
 	lastEpochDowngradeWarn time.Time
@@ -461,7 +461,7 @@ func NewManager(nodeID, clusterID int) *Manager {
 // now sending frames without one. That is either a replay of pre-upgrade
 // captures (the attack this closes) or a genuine rollback of the peer to a
 // pre-#6169 build — which is operator-actionable, since the peer stays refused
-// until the persisted floor is cleared. Rate-limited to once per 30s so a
+// until xpfd is restarted on this node. Rate-limited to once per 30s so a
 // 5-10/s heartbeat stream cannot flood the log.
 func (m *Manager) NoteEpochDowngradeHeartbeat() {
 	m.mu.Lock()

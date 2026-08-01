@@ -45,8 +45,9 @@ import (
 //     replays those and the floor is never consulted at all. Measured on the
 //     first cut of this change: with the floor latched at a live peer's epoch,
 //     975/975 epochless replays were still admitted. The fix is the DOWNGRADE
-//     LATCH (see heartbeatAuthState.admitAuthed) plus a DURABLE floor, so the
-//     latch is not reopened by a receiver restart.
+//     LATCH (see heartbeatAuthState.admitAuthed). It is process-scoped: a
+//     durable floor was built, priced against rollback/crash/lock costs, and
+//     removed — see the epochSeen field comment.
 //
 //  2. The sender must therefore ALWAYS advertise an epoch once it runs a build
 //     that can. If a storage fault made a healthy node emit epochless frames, a

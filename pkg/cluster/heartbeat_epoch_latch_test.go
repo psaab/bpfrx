@@ -20,9 +20,9 @@ import (
 // admitted.
 //
 // The latch closes that: once the peer has proved it emits epochs, an epochless
-// frame from it is refused. It is restored from the DURABLE floor at start,
-// because an in-memory latch is cleared by exactly the receiver restart an
-// attacker waits for.
+// frame from it is refused. It is PROCESS-scoped: the routine restarts preserve
+// it and only a full daemon restart clears it, after which a live peer re-arms
+// it with its next heartbeat.
 
 // latchEnv is an epochEnv plus the ability to model a FULL receiver daemon
 // restart (a brand-new Manager, so every in-memory tracker is gone).
@@ -490,5 +490,107 @@ func TestHeldFlockCannotCauseFalsePeerDeath_6169(t *testing.T) {
 	}
 	if sender.heartbeatBootEpoch() == 0 {
 		t.Fatal("the epoch went back to 0 after the persist completed")
+	}
+}
+
+// TestInBoundFarFutureEpochLockoutIsBounded_6169 answers whether MAJOR 4
+// survives the removal of the durable floor. It does, in reduced form, and this
+// pins the reduced shape so it is a known cost rather than a discovery.
+//
+//   - An epoch BEYOND the forward bound is refused and never latched, so it
+//     cannot lock anything out (TestHeartbeatUnorderableEpochNeverArmsLatch).
+//   - An epoch INSIDE the bound IS latched, and a repaired peer returning to
+//     real time then sits below that floor. That is the residual.
+//
+// Two things bound it, and the second is what the durable version lacked:
+//  1. the slack IS the lockout, and it is one hour (bootEpochMaxSkew), so the
+//     peer's own wall-clock seed climbs past the floor within that window; and
+//  2. the floor is in memory, so `systemctl restart xpfd` on the refusing node
+//     clears it immediately — with a durable floor this needed deleting a state
+//     file, which is what made it a MAJOR.
+func TestInBoundFarFutureEpochLockoutIsBounded_6169(t *testing.T) {
+	e := newLatchEnv(t)
+	now := uint64(time.Now().UnixNano())
+
+	// A peer whose clock is ahead, but INSIDE the skew allowance: latched.
+	inBound := now + bootEpochMaxSkew/2
+	if !epochOrderable(inBound, int64(now)) {
+		t.Fatal("test setup: the value must be inside the bound")
+	}
+	e.liveRun(e.captureIncarnation(0xEE01, inBound, epochFramesPerIncarnation), "peer with a clock inside the skew allowance")
+	if got := e.r.auth.peerEpochFloor(); got != inBound {
+		t.Fatalf("floor = %d, want %d", got, inBound)
+	}
+
+	// The peer is repaired and comes back at real time: BELOW the floor, refused.
+	repaired := e.captureIncarnation(0xEE02, now, epochFramesPerIncarnation)
+	for i, f := range repaired {
+		if e.feed(f) {
+			t.Fatalf("repaired peer frame %d admitted; expected refusal below the latched floor", i)
+		}
+	}
+
+	// BOUND 1 — the lockout cannot exceed the slack. Once the peer's own
+	// wall-clock seed passes the floor it is accepted again with no operator
+	// action at all.
+	e.liveRun(e.captureIncarnation(0xEE03, inBound+1, epochFramesPerIncarnation), "peer once its clock passes the floor")
+
+	// BOUND 2 — and a restart clears it outright. This is the difference the
+	// durable floor did not have: no state file, no rm.
+	e2 := newLatchEnv(t)
+	e2.liveRun(e2.captureIncarnation(0xEE04, now+bootEpochMaxSkew/2, epochFramesPerIncarnation), "peer with a clock inside the allowance")
+	e2.restartDaemon()
+	if got := e2.r.auth.peerEpochFloor(); got != 0 {
+		t.Fatalf("floor = %d after a daemon restart, want 0 — the lockout must be clearable by a restart", got)
+	}
+	e2.liveRun(e2.captureIncarnation(0xEE05, now, epochFramesPerIncarnation), "repaired peer after restarting xpfd")
+}
+
+// TestReceiverRestartWindowIsOneHeartbeat_6169 measures what the in-memory
+// floor actually costs at a receiver daemon restart, rather than asserting it.
+//
+// The claim being checked: the window is bounded by the peer's next genuine
+// heartbeat — roughly one interval — after which the floor re-establishes above
+// any captured older epoch. It holds, with one honest qualification: a replay
+// landing INSIDE the window is admitted (and can even set a low floor), but the
+// live peer's next frame carries a strictly higher epoch, which repairs the
+// floor and re-arms the latch. Sustained exposure therefore additionally
+// requires the genuine peer to be ABSENT.
+func TestReceiverRestartWindowIsOneHeartbeat_6169(t *testing.T) {
+	e := newLatchEnv(t)
+	const liveEpoch = uint64(9_500_000_000_000_000)
+	e.liveRun(e.captureIncarnation(0xFF01, liveEpoch, epochFramesPerIncarnation), "live upgraded peer")
+
+	// The attacker's pre-upgrade, epochless captures.
+	caps := e.epochlessCaptures(heartbeatReplaySessions + 8)
+
+	// Daemon restart: the window opens.
+	e.restartDaemon()
+	if e.r.auth.peerEpochLatched() {
+		t.Fatal("a daemon restart should clear the latch")
+	}
+	// Inside the window a replay IS admitted — stated, not hidden.
+	if !e.feed(caps[0][0]) {
+		t.Fatal("expected the documented in-window admission")
+	}
+
+	// The genuine peer's very next heartbeat closes it: one frame, one interval.
+	if !e.feed(marshalHeartbeatAuthEpoch(samplePkt(), e.key, 0xFF02, 1, liveEpoch+1)) {
+		t.Fatal("the live peer's first post-restart frame must be accepted")
+	}
+	if !e.r.auth.peerEpochLatched() {
+		t.Fatal("one genuine epoch-bearing heartbeat must re-arm the latch")
+	}
+
+	// From here the whole capture set is refused again.
+	admitted, total := e.replayAll(caps, 3)
+	if admitted != 0 {
+		t.Fatalf("after re-arming: %d/%d replays admitted, want 0", admitted, total)
+	}
+	// And a retired incarnation is below the re-established floor.
+	for i, f := range e.captureIncarnation(0xFF03, liveEpoch-1, epochFramesPerIncarnation) {
+		if e.feed(f) {
+			t.Fatalf("retired-epoch frame %d admitted after re-arming", i)
+		}
 	}
 }

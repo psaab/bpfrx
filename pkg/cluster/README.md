@@ -490,7 +490,7 @@ peer liveness (`lastSeen`) or drive election.
     That peer IS refused: this node declares it dead and takes over, and the
     rolled-back node cannot see that it is being refused. This is a real,
     deliberate trade — the same one #4107's sticky `peerAuthSeen` already
-    makes for the auth trailer, made durable. It is bounded and
+    makes for the auth trailer. It is bounded and
     operator-visible:
       - a cluster that has never run an epoch-capable build is never latched,
         so a plain rolling upgrade in either direction is unaffected;
@@ -501,21 +501,35 @@ peer liveness (`lastSeen`) or drive election.
         rolled-back peer again — there is no state file to hand-edit and no
         new CLI surface to learn. Rolling BOTH nodes back needs no action
         beyond that on whichever node had latched.
-  - **Honest residuals.** (1) The receiver floor and latch are per-PEER and
-    per-node; a node that has genuinely never seen an epoch (brand-new
-    chassis joining an upgraded cluster) is unlatched until the peer's first
-    epoch-bearing frame arrives, so a replay landing in that window is
-    admitted until the live peer speaks. (2) Losing the persisted epoch AND
-    stepping the clock back below the last emitted value in the same reboot
-    regresses the sender's epoch; the peer then refuses it, with the same
-    clear-the-floor recovery as a rollback. Both terms of the seed must fail
-    together for this. (3) Rotating the control-link PSK changes the
-    key-derived marker but NOT the persisted floor; the floor stays valid
-    because it is a per-peer counter, not key material.
+  - **Honest residuals**, each measured rather than asserted.
+    1. **Receiver restart window.** The floor and latch are process-scoped, so a
+       full daemon restart on the receiving node reopens the window until the
+       peer's next epoch-bearing heartbeat — ONE heartbeat interval with a live
+       peer. A replay landing inside that window IS admitted and can even set a
+       low floor, but the live peer's next frame carries a strictly higher epoch,
+       which repairs the floor and re-arms the latch. **Sustained exposure
+       therefore additionally requires the genuine peer to be ABSENT**, in which
+       case the attack forges liveness for a dead peer and suppresses failover.
+       (`TestReceiverRestartWindowIsOneHeartbeat_6169`.)
+    2. **In-bound clock skew latches a bounded lockout.** A peer epoch ahead of
+       us but INSIDE the skew allowance is latched, so a peer later repaired to
+       real time sits below that floor. Bounded twice: the slack IS the lockout
+       (one hour), so the peer's own wall-clock seed climbs past it unattended;
+       and the floor is in memory, so `systemctl restart xpfd` on the refusing
+       node clears it immediately. With a durable floor this needed deleting a
+       state file, which is what made it a MAJOR.
+       (`TestInBoundFarFutureEpochLockoutIsBounded_6169`.)
+    3. **Sender epoch double fault.** Losing the persisted epoch AND stepping the
+       clock back below the last emitted value in the same reboot regresses the
+       sender's epoch and the peer refuses it, with the same restart recovery as
+       a rollback. Both terms of the seed must fail together.
+    4. **PSK rotation** changes the key-derived marker; the in-memory floor and
+       latch are unaffected and stay valid, since a floor is a per-peer counter
+       rather than key material.
   - **No clone/bake requirement** (unlike the SNMPv3 engine-id, `pkg/snmp`).
     Epochs are compared per-PEER, never between the two nodes, so two chassis
-    cloned from one image may hold identical persisted values harmlessly; and
-    a baked-in value can only ever raise a node's starting epoch, which the
+    cloned from one image may hold identical persisted boot epochs harmlessly;
+    and a baked-in value can only ever raise a node's starting epoch, which the
     never-regress rule already permits.
 - **The tracker's LIFETIME is the process, not the heartbeat (#5086).**
   The watermarks and the sticky `peerAuthSeen` flag live in

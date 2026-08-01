@@ -787,18 +787,31 @@ type heartbeatAuthState struct {
 //     epoch, and still 975/975 epochless replays admitted.
 //
 // The latch is armed by an ACCEPTED frame that carried an epoch section, and it
-// is restored at start from the DURABLE floor — an in-memory latch is cleared
-// by exactly the receiver restart an attacker waits for.
+// is PROCESS-scoped: it lives on Manager.hbAuth, so the routine restarts
+// (heartbeat restart, DHCP-triggered VRF rebind, HA comms restart) preserve it
+// and only a full daemon restart clears it. See the epochSeen field comment for
+// why a durable latch was priced and removed.
 //
 // WHAT MAKES THE LATCH SAFE is the sender-side invariant in heartbeat_epoch.go:
 // a keyed heartbeat carries no epoch IF AND ONLY IF the peer runs a pre-#6169
-// build. A storage fault does NOT stop a healthy node emitting an epoch (it
-// falls back to a wall-clock value and logs), so no runtime fault can make this
-// node refuse a live peer. The one remaining trigger is a genuine ROLLBACK of
-// the peer to a pre-#6169 build, which is a deliberate, operator-initiated act:
-// that peer's frames are refused until an operator clears the persisted floor
-// (see pkg/cluster/README.md). This is the same trade #4107's sticky
-// peerAuthSeen already makes for the auth trailer, made durable.
+// build.
+//
+// That invariant holds against BOTH storage failure modes, and the distinction
+// is load-bearing because only one of them was ever covered. A FAILING store
+// (unwritable dir, ENOSPC, corrupt file) always fell through to the wall-clock
+// seed. A HANGING store did not: the epoch was computed before any I/O and then
+// thrown away by not publishing until after a blocking LOCK_EX, so a held lock
+// left bootEpoch at 0 and the sender silently degraded to a legacy frame — which
+// a latched peer then rejects, declaring a healthy node dead within ~500ms
+// (measured). Emission is now published from the wall clock BEFORE any file is
+// touched (Manager.heartbeatBootEpoch), so a hung disk, a blocking flock and a
+// wedged fsync are all survivable; persistence only ever raises the value later.
+//
+// The one remaining trigger is a genuine ROLLBACK of the peer to a pre-#6169
+// build, a deliberate operator-initiated act: that peer's frames are refused
+// until `systemctl restart xpfd` on THIS node clears the in-memory latch. There
+// is no state file to hand-edit. This is the same trade #4107's sticky
+// peerAuthSeen already makes for the auth trailer.
 //
 // The three epoch cases, once the peer is known to emit them:
 //
