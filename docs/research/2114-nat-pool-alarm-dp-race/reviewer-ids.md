@@ -137,6 +137,9 @@ reviewer (joins at /engineer on the code PR).
 | r44 | Codex | codex companion task-ms9vtbvj-nwpk0v (session 019fbb9e-66dd-7490-a468-2882801bfb62) | NEEDS-REVISION (5 MAJOR, 2 MINOR; folds 1 FOLDED / 4 PARTIAL / 1 NOT-FOLDED). Structure confirmed |
 | r44 | AGY | agy print-mode direct (agy-plan-r44.md) | PLAN-READY (5/5 folds FOLDED; 1 fresh attack FAILED; no findings). Structure confirmed |
 | r44 | Claude SMR | in-conversation (claude-smr-plan-r44.md) | PLAN-READY (0 findings; 5 documented fresh attacks FAILED). Structure confirmed |
+| r45 | Codex | codex companion task-ms9wsaqj-xhgruk (session 019fbbb7-4bad-7d41-9fac-4b302bfc863b) | NEEDS-REVISION (5 MAJOR, 4 MINOR; folds 1 FOLDED / 6 PARTIAL). Structure confirmed |
+| r45 | AGY | agy print-mode direct (agy-plan-r45.md) | NEEDS-REVISION (1 MAJOR — gate check/reserve/enqueue not serialized vs Stop's drain, IS Codex M1 / SMR m1; folds 6 FOLDED / 1 PARTIAL). Structure confirmed |
+| r45 | Claude SMR | in-conversation (claude-smr-plan-r45.md) | PLAN-READY-WITH-NITS (0 MAJOR, 2 MINOR — gate atomicity, IS Codex M1 / AGY M1; withdrawal-consistency scoping, IS Codex m1). Structure confirmed |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 
