@@ -164,6 +164,9 @@ reviewer (joins at /engineer on the code PR).
 | r53 | Codex | codex companion task-msa556gu-w89iif (session 019fbc8d-7fb1-79c3-9763-8a699152b837) | NEEDS-REVISION (4 MAJOR, 1 MINOR; folds 1 FOLDED / 4 PARTIAL). Structure confirmed |
 | r53 | AGY | agy print-mode direct (agy-plan-r53.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — pending-arm inventory, IS Codex M3). Structure confirmed |
 | r53 | Claude SMR | in-conversation (claude-smr-plan-r53.md) | PLAN-READY-WITH-NITS (0 MAJOR, 2 MINOR — token seeding IS part of Codex M2; pending observability IS Codex M3). Structure confirmed |
+| r54 | Codex | codex companion task-msa5w52v-18utff (session 019fbca0-b184-7312-b020-edc3daaad19b) | NEEDS-REVISION (6 MAJOR, 2 MINOR; folds 1 FOLDED / 3 PARTIAL / 1 NOT-FOLDED). Structure confirmed |
+| r54 | AGY | agy print-mode direct (agy-plan-r54.md) | PLAN-READY (5/5 folds FOLDED; 3 attacks FAILED; no findings). Structure confirmed |
+| r54 | Claude SMR | in-conversation (claude-smr-plan-r54.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — claim-ordering pin, IS part of Codex M1/M2). Structure confirmed |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 

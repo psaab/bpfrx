@@ -1,11 +1,9 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v54 — r53 findings folded (Codex NEEDS-REVISION
-  4M/1m; AGY PLAN-READY-WITH-NITS 0M/1m — the pending-arm
-  inventory, IS Codex M3; Claude SMR PLAN-READY-WITH-NITS
-  0M/2m — the token seeding IS part of Codex M2, the pending
-  observability IS Codex M3; all three confirm the §4.7
-  structure); pending convergence review r54
+- **Status**: DRAFT v55 — r54 findings folded (Codex NEEDS-REVISION
+  6M/2m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m —
+  the claim-ordering pin, IS part of Codex M1/M2; all three
+  confirm the §4.7 structure); pending convergence review r55
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -2355,6 +2353,81 @@
   version BEFORE and AFTER publishing (odd-in-flight /
   even-stable; the reader retries on an odd or changed
   version).
+  v55: r54 convergence — the reconciler gains the full
+  send-boundary protocol, the token mints at the outer
+  apply-attempt entry, the pending state becomes per-arm
+  registration, and the arm inventory completes at six (Codex
+  NEEDS-REVISION 6M/2m, folds 1 FOLDED / 3 PARTIAL /
+  1 NOT-FOLDED, structure confirmed; AGY PLAN-READY 5/5 with
+  3 fresh attacks FAILED, structure confirmed; SMR
+  PLAN-READY-WITH-NITS 0M/1m — the claim-ordering pin, IS
+  part of Codex M1/M2): (a) THE SEND-BOUNDARY PROTOCOL (Codex
+  M1 + M2 + M3 + m1, all verified: a re-check alone is not an
+  exclusion boundary — `ShowActive` releases the store lock
+  before the send, `store_format.go:31-36`, and a paused
+  claimant resumes with a newer wire generation,
+  `sync_conn_config.go:234-243,267-272`; a stale drop poisons
+  the CLAIMED-is-PUSHED marker — the A→B→A case reachable via
+  the event engine's syncPeer=false commits,
+  `daemon_apply_commit.go:596-599`; the capture's gate reads
+  and text read are separate transactions,
+  `daemon_ha_sync.go:462-471`; authority can change after the
+  gate check, `daemon_ha_sync.go:451-454,544-548`; and the
+  capture is a uint64 FNV hash while ActiveDigest is SHA-256,
+  `daemon_ha_sync.go:381-388,467-472`,
+  `store.go:772-779,812-829`): under `configSyncMu` HELD FROM
+  VALIDATION THROUGH SEND-COMPLETION — with EVERY push path
+  (reconciler AND commit push) taking the same mutex — the
+  reconciler at the boundary (i) revalidates authority +
+  connection epoch/liveness + ConfigSync-enabled, (ii)
+  recomputes `configGenerationHash(ShowActive())` — same
+  function, same type — and drops with an alarm on a
+  mismatch, and (iii) claims the marker ONLY at the send
+  boundary (validate-then-claim-then-send: a drop never
+  claims, so the marker never suppresses a needed push). (b)
+  THE OUTER MINT (Codex M4, verified: preflight/compile
+  failures return before `applyConfigLocked`,
+  `daemon_apply_commit.go:98-126,194-222,551-575`, and
+  `commitWithGenBinding` still invokes commitFn after an
+  initial compile error): the token mints at the OUTER
+  apply-attempt entry (`commitAndApply` and the background
+  wrappers, before preflight); a preflight/compile failure is
+  a FAILED attempt with no arms. (c) PER-ARM REGISTRATION
+  (Codex M5, verified: a scalar pending count is not a join —
+  a duplicate completion decrements twice; a post-return
+  increment can lose an early completion because ApplyConfig
+  can launch a callback before returning,
+  `manager_compile.go:357-402`, `maps_sync.go:451-457`):
+  (token, arm-ID) registrations recorded BEFORE launch; the
+  pending state is a per-arm-ID set; a completion retires its
+  own registration exactly once; unregistered or duplicate
+  completions are ignored. (d) THE SIX-ARM INVENTORY (Codex
+  M6, verified: `OnXSKBound` launches a goroutine whose
+  fabric-IPVLAN failure is merely logged,
+  `maps_sync.go:451-457`, `daemon_apply_interfaces.go:98-109`;
+  `PrepareLinkCycle` suppresses/logs command failures through
+  a void interface, `daemon_apply_dataplane.go:289-296`,
+  `process_linkcycle.go:145-162`): deferred-MAC, pending-XSK
+  publication, XSK-liveness probe, link-cycle rebind,
+  OnXSKBound, PrepareLinkCycle — all tokened and registered.
+  (e) THE TOKEN NAMESPACE CORRECTION (Codex fold-2): the
+  #6034 seed is the neighbor-REPLACE generation, a different
+  namespace the helper initializes to zero
+  (`process_status.go:165-172`, `protocol_status.go:73-84`,
+  `lifecycle.rs:184-216`) — the cross-incarnation rejection
+  comes from the registration rule (a completion whose
+  (token, arm-ID) was never registered in THIS incarnation is
+  ignored), with a manager attach re-registering the current
+  attempt's outstanding arms. (f) THE DEFERRED-MAC PENDING
+  CORRECTION (Codex fold-4, verified the retry is UNBOUNDED —
+  every tick until the workers bind,
+  `manager_worker_arm_5134.go:18-38`,
+  `process_status.go:183-198`): the deferred-MAC debt is
+  PENDING (the predicate stays unblessed, fail-closed); the
+  nil-dp skip is TERMINAL. (g) The status rendering carries
+  the token + pending-set beside lastOK/count (Codex fold-3),
+  and the stale "OBSERVED complete" prerequisite is struck
+  (Codex m2).
 
 ---
 
@@ -4826,21 +4899,42 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   and applies, `sync_conn_config.go:254-272,325-395` — AFTER
   the predicate passed — and the claimed marker suppresses the
   later self-heal, `daemon_ha_sync.go:479-484`): the
-  re-convergence commit runs only AFTER the authority's first
-  post-election post-stability reconcile pass is OBSERVED
-  complete — the join is the interval-bracketed digest check
-  below PLUS the reconciler's own PRE-SEND STALENESS RE-CHECK
-  (r53 Codex M1, verified the paused-claimant class has no
-  timing bound: the reconciler claims its marker and unlocks
-  BEFORE `QueueConfig`, `daemon_ha_sync.go:462-497`, and a
-  claimant paused past both digest reads can resume and take a
-  fresh wire generation, `sync_conn_config.go:230-243`): the
-  reconciler RE-VALIDATES its captured generation against the
-  store's CURRENT active generation immediately before
-  `QueueConfig` — a capture that no longer matches drops with
-  an alarm — so a stale capture can NEVER be pushed regardless
-  of pause length (a code-level pin inside the H2 work, not a
-  timing argument); the ConfigsSent tick and the marker no-op
+  re-convergence commit runs AFTER the election settles — the
+  join is the interval-bracketed digest check
+  below PLUS the reconciler's SEND-BOUNDARY PROTOCOL (r53 Codex
+  M1 + r54 Codex M1/M2/M3/m1, all verified: the claim-then-unlock-
+  then-send window has no timing bound,
+  `daemon_ha_sync.go:462-497`; a re-check alone is not an
+  exclusion boundary — `ShowActive` releases the store lock
+  before the send, `store_format.go:31-36`, and a commit can
+  promote and push B while claimant A is paused, A resuming
+  with a newer wire generation,
+  `sync_conn_config.go:234-243,267-272,325-395`; a stale drop
+  poisons the marker because CLAIMED and PUSHED are the same
+  state — the A→B→A-in-one-epoch case, reachable because
+  event-engine commits use syncPeer=false,
+  `daemon_apply_commit.go:596-599`; the capture's
+  `ActiveConfig` gate reads and `ShowActive` text read are
+  separate transactions, `daemon_ha_sync.go:462-471`,
+  `store_format.go:31-36,55-60`, so an enabled→disabled flip
+  can pass a generation-only check; authority can change after
+  the gate check, `daemon_ha_sync.go:451-454,544-548`; and the
+  captured value is a uint64 FNV hash,
+  `daemon_ha_sync.go:381-388,467-472`, while the store's
+  ActiveDigest is a SHA-256 string, `store.go:772-779,812-829`):
+  under `configSyncMu` HELD FROM VALIDATION THROUGH
+  SEND-COMPLETION — with EVERY push path (the reconciler AND
+  the commit push) taking the same mutex, so a validated send
+  and a commit push serialize and a stale capture can never
+  land after a newer one — the reconciler at the send boundary
+  (i) revalidates authority + connection epoch/liveness +
+  ConfigSync-enabled (all re-read at the boundary), (ii)
+  recomputes `configGenerationHash(ShowActive())` — the SAME
+  function on the current text, matching the capture's type —
+  and drops with an alarm on a mismatch, and (iii) claims the
+  marker ONLY NOW (validate-then-claim-then-send: a drop never
+  claims, so the marker can never suppress a needed later
+  push); the ConfigsSent tick and the marker no-op
   remain WITHDRAWN as witnesses (r52 Codex M4: a no-op pass
   never ticks, and the marker is private, `daemon.go:420-424`);
   and the observation ORDER is non-circular: the post-election
@@ -5940,9 +6034,13 @@ v20 history). The delivery is TWO units:
   `daemon_apply_dataplane.go:137-163`): `lastApplyOK` reads
   TRUE only when the dataplane phase actually converged — the
   deferred-MAC retry-debt outcome and the nil-dp skip both
-  record FAILED (count++, lastOK false — a TERMINAL outcome:
-  the debt's retry is bounded by the #5134 worker-arm retry
-  machinery and its exhaustion is terminal), AND the
+  record per their REAL termination shapes (r54 Codex fold-4,
+  verified: the deferred-MAC retry is UNBOUNDED — every tick
+  until the workers bind, `manager_worker_arm_5134.go:18-38`,
+  `process_status.go:183-198` — so the deferred-MAC debt is
+  PENDING, holding the predicate unblessed without moving the
+  count; the nil-dp skip is TERMINAL — FAILED, count++,
+  lastOK false), AND the
   pending-XSK publication deferral records PENDING — NOT
   converged, WITHOUT moving the count — until the deferred
   publication COMPLETES or its retry budget is EXHAUSTED (the
@@ -5970,21 +6068,55 @@ v20 history). The delivery is TWO units:
   and the link-cycle rebind is a void call whose failure is
   swallowed, `daemon_apply_dataplane.go:390-401`,
   `process_linkcycle.go:184-224`): EVERY asynchronous arm —
-  deferred-MAC, pending-XSK publication, XSK-liveness probe,
-  link-cycle rebind — carries the apply's ATTEMPT TOKEN, with
-  the token's full lifecycle PINNED (r53 Codex M2, verified it
-  was unspecified): the token is a uint64 monotonic per-apply
-  generation (no overflow), MINTED at the central full-apply
-  entry (`applyConfigLocked`), OWNED by the daemon and
+  SIX named (r54 Codex M6, verified the inventory was not
+  exhaustive: `OnXSKBound` launches a goroutine,
+  `maps_sync.go:451-457`, whose critical fabric-IPVLAN failure
+  is merely logged, `daemon_apply_interfaces.go:98-109`, and
+  `PrepareLinkCycle` suppresses/logs its command failures
+  through a void interface, `daemon_apply_dataplane.go:289-296`,
+  `process_linkcycle.go:145-162`) — deferred-MAC, pending-XSK
+  publication, XSK-liveness probe, link-cycle rebind
+  (NotifyLinkCycle), the OnXSKBound goroutine, and
+  PrepareLinkCycle — carries the apply's ATTEMPT TOKEN with
+  EXACTLY-ONCE PER-ARM REGISTRATION (r54 Codex M5, verified:
+  a token plus a scalar pending count is not a join — a
+  duplicate completion for arm A decrements twice and falsely
+  reports zero while arm B is live, and a daemon-side
+  post-return increment can lose an early completion because
+  ApplyConfig can process status and launch a callback before
+  returning, `manager_compile.go:357-402`,
+  `maps_sync.go:451-457`): each arm is a (token, arm-ID)
+  registration recorded BEFORE the arm launches, the pending
+  state is a per-arm-ID set (not a scalar), and a completion
+  retires its own registration exactly once — a duplicate or
+  unregistered completion is ignored — with
+  the token's full lifecycle PINNED (r53 Codex M2 + r54 Codex
+  M4, verified the mint point was wrong: commit preflight and
+  compile failures return BEFORE `applyConfigLocked`,
+  `daemon_apply_commit.go:98-126,194-222,551-575`, so a
+  central-entry mint cannot cover them — and
+  `commitWithGenBinding` still invokes commitFn after an
+  initial compile error): the token is a uint64 monotonic
+  per-apply generation (no overflow), MINTED at the OUTER
+  apply-attempt entry (`commitAndApply` and the background
+  wrappers — before preflight), OWNED by the daemon and
   PUBLISHED with the configstore's versioned snapshot, THREADED
   through the manager calls that defer (the tokenless
   interfaces at `apply.go:37-40,130-134` gain it), with the
-  manager/helper-restart INHERITANCE seeded from the helper's
-  reported generation on attach (the #6034 resume pattern,
-  `process_status.go:165-172` — a completion from a prior
-  daemon incarnation can never carry a current token), and a
+  cross-incarnation discipline CORRECTED (r54 Codex fold-2,
+  verified: the #6034 seed updates the manager-neighbor
+  REPLACE generation, `process_status.go:165-172`,
+  `protocol_status.go:73-84` — a DIFFERENT namespace the
+  helper initializes to zero, `lifecycle.rs:184-216` — it
+  cannot seed an apply-attempt namespace): the token is
+  process-incarnation-scoped, and the registration rule
+  (below) is what rejects stale completions — a completion
+  whose (token, arm-ID) was never registered in THIS
+  incarnation is ignored — with a manager attach RE-REGISTERING
+  the current attempt's outstanding arms (any pre-restart
+  completion matches no registration), and a
   process-lifetime namespace (the predicate is consulted
-  post-restart, where the freshly-seeded token series rejects
+  post-restart, where the freshly-minted token series rejects
   every pre-restart completion); the signal reads CONVERGED
   only when the pipeline AND every arm's completion carry the
   CURRENT attempt token; and the state machine distinguishes
@@ -7362,13 +7494,23 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      commit push carries the newest wire generation); a
      still-flipping state after two intervals is a stuck-lock
      incident — fail-closed (r51 Codex M4 + r51 AGY M1); AND
-     the reconciler itself gains the PRE-SEND STALENESS
-     RE-CHECK (r53 Codex M1: the claim-then-unlock-then-send
-     window, `daemon_ha_sync.go:462-497`, has no timing bound —
-     the reconciler re-validates its captured generation
-     against the store's current active generation immediately
-     before `QueueConfig`, and a stale capture drops with an
-     alarm, so no pause length can push old text);
+     the reconciler itself gains the SEND-BOUNDARY PROTOCOL
+     (r54 Codex M1/M2/M3/m1: a re-check alone is not an
+     exclusion boundary — the store lock releases before the
+     send, `store_format.go:31-36`, and a paused claimant
+     resumes with a newer wire generation,
+     `sync_conn_config.go:234-243,267-272` — and a stale drop
+     poisons the CLAIMED-is-PUSHED marker,
+     `daemon_ha_sync.go:474-489` — the A→B→A case reachable via
+     the event engine's syncPeer=false commits,
+     `daemon_apply_commit.go:596-599`): under `configSyncMu`
+     HELD FROM VALIDATION THROUGH SEND-COMPLETION with EVERY
+     push path taking the same mutex, the reconciler at the
+     boundary (i) revalidates authority + connection
+     epoch/liveness + ConfigSync-enabled, (ii) recomputes
+     `configGenerationHash(ShowActive())` and drops with an
+     alarm on a mismatch, and (iii) claims the marker ONLY at
+     the send boundary — a drop never claims);
      a per-node commit on a read-only secondary is executed by
      PROMOTING it first with the existing manual-failover
      request (promotion clears the read-only gate,

@@ -1,0 +1,26 @@
+# AGY adversarial plan-review — round 54 (plan v54 @ 8cc30c5f1)
+
+Direct agy print-mode invocation from the trusted workspace with --add-dir (see reviewer-ids.md infra notes). Verdict: PLAN-READY (5/5 folds FOLDED; 3 fresh attacks FAILED; no new findings). Structure confirmed. Raw output follows verbatim (file:/// link markup as emitted).
+
+---
+
+(A) Fold verification:
+1. FOLDED — [daemon_ha_sync.go:470-489](file:///home/ps/git/kimi-xpf/.claude/worktrees/2114-research-nat-pool-alarm-dp-race/pkg/daemon/daemon_ha_sync.go#L470-L489) and [plan.md:4832-4848](file:///home/ps/git/kimi-xpf/.claude/worktrees/2114-research-nat-pool-alarm-dp-race/docs/research/2114-nat-pool-alarm-dp-race/plan.md#L4832-L4848): `captured_gen` (`uint64` FNV-1a hash of `ShowActive()`) is directly comparable to `configGenerationHash(d.store.ShowActive())` (`uint64`); dropping a stale capture leaves `configSyncPushedGen` holding `gen_stale`, which differs from `gen_current`, so a subsequent pass for `gen_current` evaluates `configSyncPushedGen == gen_current` as false and pushes normally without suppression.
+2. FOLDED — [process_status.go:165-172](file:///home/ps/git/kimi-xpf/.claude/worktrees/2114-research-nat-pool-alarm-dp-race/pkg/dataplane/userspace/process_status.go#L165-L172) and [plan.md:5974-5989](file:///home/ps/git/kimi-xpf/.claude/worktrees/2114-research-nat-pool-alarm-dp-race/docs/research/2114-nat-pool-alarm-dp-race/plan.md#L5974-L5989): helper ACK `ManagerNeighborGeneration` seeds manager token counter on attach; `uint64` monotonic attempt token is daemon-owned, minted at central `applyConfigLocked` entry (`daemon_apply.go:141-155`), and process-lifetime namespaced, ensuring pre-restart completions carry obsolete tokens and are rejected.
+3. FOLDED — [plan.md:5880-6003](file:///home/ps/git/kimi-xpf/.claude/worktrees/2114-research-nat-pool-alarm-dp-race/docs/research/2114-nat-pool-alarm-dp-race/plan.md#L5880-L6003) and [plan.md:7588-7592](file:///home/ps/git/kimi-xpf/.claude/worktrees/2114-research-nat-pool-alarm-dp-race/docs/research/2114-nat-pool-alarm-dp-race/plan.md#L7588-L7592): snapshot carries `currentAttemptToken` and `pendingArmCount` (incremented on deferral, decremented on token-matching completion), rendering pending state fully observable beside `lastApplyOK` and `applyFailureCount` so the `pendingArmCount == 0` predicate term is checkable.
+4. FOLDED — [plan.md:2341-2348](file:///home/ps/git/kimi-xpf/.claude/worktrees/2114-research-nat-pool-alarm-dp-race/docs/research/2114-nat-pool-alarm-dp-race/plan.md#L2341-L2348), [plan.md:5943-5950](file:///home/ps/git/kimi-xpf/.claude/worktrees/2114-research-nat-pool-alarm-dp-race/docs/research/2114-nat-pool-alarm-dp-race/plan.md#L5943-L5950), [plan.md:5991-5998](file:///home/ps/git/kimi-xpf/.claude/worktrees/2114-research-nat-pool-alarm-dp-race/docs/research/2114-nat-pool-alarm-dp-race/plan.md#L5991-L5998), and [plan.md:7564-7570](file:///home/ps/git/kimi-xpf/.claude/worktrees/2114-research-nat-pool-alarm-dp-race/docs/research/2114-nat-pool-alarm-dp-race/plan.md#L7564-L7570): counter semantics are unified across runbook, §5.1, acceptance, and §9 h2d leg — a retryable rejection remains PENDING (`applyFailureCount` unmoved), while `applyFailureCount` increments only on terminal failures (apply pipeline error or retry budget exhaustion).
+5. FOLDED — [plan.md:5912-5919](file:///home/ps/git/kimi-xpf/.claude/worktrees/2114-research-nat-pool-alarm-dp-race/docs/research/2114-nat-pool-alarm-dp-race/plan.md#L5912-L5919): normative text in §5.1 explicitly names `NoteApplyOutcome` as the store's single publication boundary method and specifies the writer's bump-BEFORE-and-AFTER (odd-in-flight / even-stable) seqlock versioning discipline.
+
+(B) Fresh attacks:
+- Staleness re-check marker interaction: FAILED — `d.configSyncPushedGen` holds `gen_stale`, so when the store holds `gen_current` (`gen_current != gen_stale`), the marker check `d.configSyncPushedGen == gen_current` in [daemon_ha_sync.go:480](file:///home/ps/git/kimi-xpf/.claude/worktrees/2114-research-nat-pool-alarm-dp-race/pkg/daemon/daemon_ha_sync.go#L480) evaluates to false on the next pass, allowing the needed push for `gen_current` to proceed without suppression.
+- NoteApplyOutcome boundary method lock-ordering hazard: FAILED — `pkg/configstore` is a leaf dependency of `pkg/daemon` with no import of `pkg/daemon` or reference to `applySem`, maintaining a strict 1-way lock hierarchy (`applySem` -> `store.mu`).
+- Regression/earlier-round audit: FAILED — no regressions across v54 edits or unhandled interleavings identified.
+
+(C) New findings:
+None.
+
+(D) Structure confirmation:
+The §4.7 delivery structure (two units: core #2114 PR + follow-up unit G+H+H2) stands with r28 (A) dissent recorded ([plan.md:15-19](file:///home/ps/git/kimi-xpf/.claude/worktrees/2114-research-nat-pool-alarm-dp-race/docs/research/2114-nat-pool-alarm-dp-race/plan.md#L15-L19), [plan.md:5849-5865](file:///home/ps/git/kimi-xpf/.claude/worktrees/2114-research-nat-pool-alarm-dp-race/docs/research/2114-nat-pool-alarm-dp-race/plan.md#L5849-L5865), [plan.md:8062-8072](file:///home/ps/git/kimi-xpf/.claude/worktrees/2114-research-nat-pool-alarm-dp-race/docs/research/2114-nat-pool-alarm-dp-race/plan.md#L8062-L8072)).
+
+(E) Verdict line:
+PLAN-READY
