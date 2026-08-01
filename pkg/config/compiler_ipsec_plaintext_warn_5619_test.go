@@ -309,3 +309,41 @@ func TestPlaintextWarningOmitsTheUnzonedCaveatWhenAllZoned(t *testing.T) {
 		t.Errorf("the unzoned group must be omitted entirely when empty: %s", got[0])
 	}
 }
+
+// TestPlaintextWarningMatchesZoneAcrossSpellings is the bare-`st0` check.
+//
+// `bind-interface st0` and a zone on `st0.0` describe the SAME xfrmi — both
+// if_id 1 (pkg/routing/xfrm.go) — but they are different strings. Matching the
+// zone literally would report a ZONED tunnel as unzoned, dropping the
+// escalation in exactly the case that earns it: where the operator HAS been
+// told something specific and untrue. Same spelling-mismatch class as the
+// #5619 netdev-name bug, so it is joined the same way: on if_id.
+func TestPlaintextWarningMatchesZoneAcrossSpellings(t *testing.T) {
+	for _, tc := range []struct{ bind, zoneRef string }{
+		{"st0.0", "st0.0"},
+		{"st0", "st0.0"},   // bare bind, dotted zone ref
+		{"st0.0", "st0"},   // dotted bind, bare zone ref
+		{"st0", "st0"},     // both bare
+		{"st1.7", "st1.7"}, // non-zero unit
+	} {
+		t.Run(tc.bind+"_zone_"+tc.zoneRef, func(t *testing.T) {
+			cfg := compileWarn5619(t,
+				"set security ipsec vpn v bind-interface "+tc.bind,
+				"set security zones security-zone vpn interfaces "+tc.zoneRef,
+			)
+			got := plaintextWarnings5619(cfg)
+			if len(got) != 1 {
+				t.Fatalf("want exactly 1 advisory, got %d: %v", len(got), got)
+			}
+			if !strings.Contains(got[0], "ASSIGNED A ZONE THAT IS NOT ENFORCED") {
+				t.Errorf("bind-interface %q with a zone on %q must land in the ESCALATED "+
+					"group — they are the same xfrmi (same if_id), and reporting it as "+
+					"unzoned drops the escalation exactly where the operator has been told "+
+					"something untrue. Got: %s", tc.bind, tc.zoneRef, got[0])
+			}
+			if strings.Contains(got[0], "#6682") {
+				t.Errorf("the unzoned caveat fired for a tunnel that IS zoned: %s", got[0])
+			}
+		})
+	}
+}

@@ -71,7 +71,7 @@ import (
 // compileExpanded: an apply-groups-inherited bind-interface is covered and an
 // `inactive:` VPN is ignored for free.
 func warnSecureTunnelPlaintextUnadjudicatedAST(nodes []*Node) []string {
-	zoneByIface := collectZoneInterfaceRefsAST(nodes)
+	zoneByIfID := collectZoneInterfaceRefsAST(nodes)
 
 	type finding struct {
 		vpn       string
@@ -102,7 +102,8 @@ func warnSecureTunnelPlaintextUnadjudicatedAST(nodes []*Node) []string {
 				// validateSecureTunnelBindInterfaceAST (silent tunnel down).
 				// Warning here too would just add noise to a config that is
 				// already being told about a worse problem.
-				if _, ifID := XFRMIfNameAndID(bindIface); ifID == 0 {
+				_, ifID := XFRMIfNameAndID(bindIface)
+				if ifID == 0 {
 					continue
 				}
 				// Split the unit suffix off exactly as XFRMIfNameAndID does,
@@ -127,7 +128,7 @@ func warnSecureTunnelPlaintextUnadjudicatedAST(nodes []*Node) []string {
 				findings = append(findings, finding{
 					vpn:       inst.name,
 					bindIface: bindIface,
-					zone:      zoneByIface[bindIface],
+					zone:      zoneByIfID[ifID],
 				})
 			}
 			return nil
@@ -195,18 +196,25 @@ func warnSecureTunnelPlaintextUnadjudicatedAST(nodes []*Node) []string {
 }
 
 // collectZoneInterfaceRefsAST maps each `security zones security-zone <z>
-// interfaces <ref>` member to its zone name, across every duplicate `security`
-// and `zones` block.
+// interfaces <ref>` secure-tunnel member to its zone name, keyed by XFRM
+// if_id rather than by the literal ref string.
+//
+// The if_id is the key because the two spellings of one device are NOT
+// interchangeable as strings but ARE the same device: `bind-interface st0` and
+// a zone on `st0.0` describe the same xfrmi (both if_id 1,
+// pkg/routing/xfrm.go). Matching literally would miss that pairing and report a
+// ZONED tunnel as unzoned — dropping the escalation in exactly the case that
+// earns it, where the operator HAS been told something untrue. This is the same
+// spelling-mismatch class as the #5619 netdev-name bug, so it is keyed the same
+// way: join on if_id, with XFRMIfNameAndID as the single source of truth.
 //
 // Membership is read through zoneInterfaceMembers, the shared flattener the
 // real zone compiler uses (#5248/#2419): a bracketed list
 // `interfaces [ st0.0 st0.1 ]` arrives bracket-stripped and NESTED under the
-// first member rather than as siblings, so reading only iface.Name() would see
-// just the first and silently miss the rest. A missed member here would mean a
-// zoned tunnel whose warning omits the zone clause — a quieter warning than the
-// operator has earned.
-func collectZoneInterfaceRefsAST(nodes []*Node) map[string]string {
-	out := map[string]string{}
+// first member, so reading only iface.Name() would see just the first and
+// silently miss the rest.
+func collectZoneInterfaceRefsAST(nodes []*Node) map[uint32]string {
+	out := map[uint32]string{}
 	_ = forEachChild(nodes, "security", func(security *Node) error {
 		return forEachChild(security.Children, "zones", func(zones *Node) error {
 			for _, inst := range namedInstances(zones.FindChildren("security-zone")) {
@@ -222,10 +230,15 @@ func collectZoneInterfaceRefsAST(nodes []*Node) map[string]string {
 							if member == "" {
 								continue
 							}
+							_, ifID := XFRMIfNameAndID(member)
+							if ifID == 0 {
+								// Not a secure tunnel; irrelevant here.
+								continue
+							}
 							// First zone wins; a duplicate assignment is a
 							// separate concern with its own gate.
-							if _, exists := out[member]; !exists {
-								out[member] = inst.name
+							if _, exists := out[ifID]; !exists {
+								out[ifID] = inst.name
 							}
 						}
 					}
