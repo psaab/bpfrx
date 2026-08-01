@@ -1196,6 +1196,23 @@ after it starts a new entry. The value-slot reservation is the same rule the
 #6524 application walk needs, and for the same reason: `weight` consumes exactly
 one following token even when that token spells something else.
 
+**An inline attribute on a bracketed list is CANDIDATE-scoped, not positional.**
+`interface-monitor [ ge-0/0/0 ge-0/0/1 ] weight 255` applies 255 to BOTH names.
+Attaching the weight to the entry that precedes it — the obvious reading — left
+`ge-0/0/0` at weight ZERO: monitored, present in `show`, and deducting nothing
+when its link fails, so the group did not demote. With N names, N-1 monitors
+were inert. That is worse than reading only the first name (which at least
+protected `ge-0/0/0` at 255), and it contradicted the children-block spelling
+`[ a b ] { weight 255; }`, which already applied the weight to both. Apply-to-all
+makes the two spellings agree and is the fail-safe direction. Two inline weights
+in one bracketed statement are ambiguous about which member each belongs to and
+are REJECTED, consistent with the duplicate-weight gate.
+
+Assert compiled WEIGHTS, not just names, when testing this. A name-only
+assertion is blind to precisely the failure that matters: a monitor that exists
+with weight 0 is indistinguishable at runtime from no monitor at all, and the
+regression above shipped past a full bracket-list suite for exactly that reason.
+
 Note the two rules pull in opposite directions and both are needed:
 
 | | tail vs children | why |
@@ -1243,7 +1260,14 @@ elects on defaults, so the WRONG NODE can hold the group — strictly worse than
 
 `redundancyGroupBody` (`compiler_system.go`) undoes it for the chassis-cluster
 surface, splitting the tail at redundancy-group statement keywords so a
-multi-statement line yields one node each. All FOUR readers of that body use it
+multi-statement line yields one node each. It must also pick the right offset
+for the shape it is handed: `namedInstances` returns EITHER the
+`redundancy-group <id>` node itself (`Keys[0]` is the keyword, body starts at
+`Keys[2]`) OR, for a bare `redundancy-group { ... }` wrapper, a child whose
+`Keys[0]` IS the id (body starts at `Keys[1]`). `Keys[0]` discriminates them
+exactly. A fixed offset of 2 swallowed the statement keyword on the second
+shape and opened a node named after a value, matching no switch arm — the same
+silent-nothing outcome, election priority included. All FOUR readers of that body use it
 — `compileChassis` plus the three AST gates (`validateMonitorWeightTokensAST`,
 `validateChassisClusterIdentitiesAST`, `validateGratuitousARPCountAST`) — because
 teaching the compiler to see a shape the gates cannot admits, through the packed

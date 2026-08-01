@@ -1,3 +1,46 @@
+## 2026-08-01 — #6588 round 5: a regression this PR introduced, plus a second RG node shape
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
+- **Action**: Re-review at e25cc5d0c found two MAJORs; both reproduced firsthand
+  before writing.
+  (MAJOR-A, a REGRESSION vs master) `interface-monitor [ ge-0/0/0 ge-0/0/1 ]
+  weight 255` compiled ge-0/0/0 at weight ZERO. The round-3 splitter attached a
+  weight token to the entry immediately preceding it. Master compiled ONE
+  monitor at 255; this branch compiled two, N-1 of them inert — monitored,
+  shown, deducting nothing on link-down. Worse than master, and it contradicted
+  this PR's own children-block path, where `[ a b ] { weight 255; }` already
+  applied 255 to both. Fixed by making the attribute run CANDIDATE-scoped: names
+  and `weight` tokens are separated, then every name gets the full run.
+  Apply-to-all is the fail-safe direction and is strictly better than master
+  here (no member dropped, no weight lost). Two inline weights in one bracketed
+  statement are now REJECTED as ambiguous, consistent with the round-2
+  duplicate gate — master silently took the last and dropped the rest.
+  Root cause of it shipping: assertMonitorNames compared only
+  InterfaceMonitors[i].Interface and never .Weight, so the whole bracket suite
+  was blind to weight distribution. Replaced with assertMonitors(names,
+  weights); the name-only entry point now delegates, and the helper documents
+  why a name-only assertion is not enough.
+  (MAJOR-B) redundancyGroupBody used a fixed skip of 2, correct for only ONE of
+  namedInstances' two return shapes. For a bare `redundancy-group { 1 ...; }`
+  wrapper it returns a CHILD whose Keys[0] IS the id, so skip must be 1; with 2
+  the statement keyword was swallowed and the tail opened a node named after a
+  value, matching no switch arm — every statement dropped, election priority
+  included, through all four redundancyGroupBody readers. Keys[0] is an exact
+  discriminator (shape 1 is always reached via FindChildren("redundancy-group")).
+  Fixed rather than documented despite lower reachability: the guard covers all
+  four readers, so leaving it would make the three AST gates blind here while
+  LOOKING like they covered it.
+- **Validation**: two mutation proofs, build+vet CLEAN under each. (F) attach the
+  inline weight to the last entry only -> 2 top-level FAILs, assertions naming
+  the zero-weight monitor; the three MAJOR-A controls (children-block,
+  single-name, weight-less) stayed GREEN. (G) pin skip back to 2 -> 1 FAIL, 4
+  assertions naming the lost statement; both MAJOR-B controls (bare-wrapper
+  nested block, ordinary instance shape) stayed GREEN. Restored: build+vet
+  clean, `go test ./...` exit 0 across 59 packages, 104 passing 6588 subtests.
+- **File(s)**: `pkg/config/compiler_system.go`,
+  `pkg/config/compiler_chassis_packed_monitor_6588_test.go`,
+  `docs/config-schema.md`, `_Log.md`
+
 ## 2026-08-01 — #6588 round 3b: drift guard on the isRedundancyGroupStatement list
 
 - **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)

@@ -2102,33 +2102,47 @@ func monitorEntryNodes(cfgNode *Node, skip int) []*Node {
 
 	var entries []*Node
 	for _, cand := range candidates {
-		var split []*Node
+		// Separate the entry NAMES from the `weight <n>` attribute tokens, then
+		// give every name the candidate's full attribute run. The attributes are
+		// candidate-scoped, NOT positional: a bracketed list with a trailing
+		// inline weight applies that weight to every member, matching the
+		// children-block spelling `[ a b ] { weight 255; }` and the fail-safe
+		// rule documented above. Attaching it to the preceding name only (the
+		// obvious reading, and what this function did when it was first written)
+		// left `[ ge-0/0/0 ge-0/0/1 ] weight 255` with ge-0/0/0 at weight ZERO —
+		// monitored but deducting nothing, so its link going down did not demote
+		// the group. That was WORSE than master, which compiled one monitor at
+		// 255 and dropped the rest.
+		var names, attrs []string
 		for i := 0; i < len(cand.Keys); {
 			tok := cand.Keys[i]
-			if tok == monitorWeightKeyword && len(split) > 0 {
-				// Attribute of the entry opened above; reserve its value slot.
-				cur := split[len(split)-1]
-				cur.Keys = append(cur.Keys, tok)
+			if tok == monitorWeightKeyword && len(names) > 0 {
+				// Reserve the value slot: `weight` consumes exactly one
+				// following token even when that token spells a name.
+				attrs = append(attrs, tok)
 				if i+1 < len(cand.Keys) {
-					cur.Keys = append(cur.Keys, cand.Keys[i+1])
+					attrs = append(attrs, cand.Keys[i+1])
 					i += 2
 					continue
 				}
 				i++
 				continue
 			}
-			split = append(split, &Node{
-				Keys:   []string{tok},
-				IsLeaf: cand.IsLeaf,
-				Line:   cand.Line,
-				Column: cand.Column,
-			})
+			names = append(names, tok)
 			i++
 		}
-		for _, e := range split {
-			e.Children = cand.Children
+		for _, name := range names {
+			keys := make([]string, 0, 1+len(attrs))
+			keys = append(keys, name)
+			keys = append(keys, attrs...)
+			entries = append(entries, &Node{
+				Keys:     keys,
+				Children: cand.Children,
+				IsLeaf:   cand.IsLeaf,
+				Line:     cand.Line,
+				Column:   cand.Column,
+			})
 		}
-		entries = append(entries, split...)
 	}
 	return entries
 }
@@ -2241,7 +2255,26 @@ func packedStatementProps(cfgNode *Node, skip int, isProp func(string) bool) []*
 // first-wins yields an empty TrackInterface). See the #6588 PR body for the
 // experiment. Other one-sided namedInstances callers are tracked separately.
 func redundancyGroupBody(rgNode *Node) []*Node {
-	return packedStatementProps(rgNode, 2, isRedundancyGroupStatement)
+	// namedInstances returns TWO different node shapes, and the number of
+	// leading identity Keys differs between them:
+	//
+	//   len(child.Keys) >= 2  -> the node ITSELF, Keys[0]=="redundancy-group",
+	//                            Keys[1]==<id>                        -> skip 2
+	//   otherwise             -> a `sub` CHILD of a bare `redundancy-group { }`
+	//                            container, whose Keys[0] IS the <id>  -> skip 1
+	//
+	// Keys[0] is an exact discriminator: the first shape is always reached
+	// through FindChildren("redundancy-group"), so its Keys[0] is that keyword;
+	// the second is a child of that container, so its Keys[0] is the instance
+	// name and never the keyword. Using a fixed skip of 2 swallowed the
+	// STATEMENT keyword on the second shape and opened a node named after a
+	// value, which no switch arm matches — the same silent-nothing outcome,
+	// including the dropped election priority, that this function exists to fix.
+	skip := 1
+	if rgNode.Name() == "redundancy-group" {
+		skip = 2
+	}
+	return packedStatementProps(rgNode, skip, isRedundancyGroupStatement)
 }
 
 // isRedundancyGroupStatement reports whether tok opens a statement in a

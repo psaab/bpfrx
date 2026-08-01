@@ -681,6 +681,21 @@ func assertErrContains(t *testing.T, err error, want string) {
 
 func assertMonitorNames(t *testing.T, rg *RedundancyGroup, want []string) {
 	t.Helper()
+	assertMonitors(t, rg, want, nil)
+}
+
+// assertMonitors compares the compiled monitors by NAME and, when wantWeights
+// is non-nil, by WEIGHT.
+//
+// The weight arm exists because its absence hid a regression: the original
+// name-only helper let `interface-monitor [ ge-0/0/0 ge-0/0/1 ] weight 255`
+// compile to ge-0/0/0=0, ge-0/0/1=255 with every bracket test green. A monitor
+// that exists with weight 0 deducts nothing when its link fails, so the group
+// does not demote — the same runtime outcome as no monitor at all, which is
+// exactly what these tests are supposed to be watching for. Never assert a
+// monitor list by name alone.
+func assertMonitors(t *testing.T, rg *RedundancyGroup, want []string, wantWeights []int) {
+	t.Helper()
 	if len(rg.InterfaceMonitors) != len(want) {
 		t.Fatalf("expected %d interface-monitors %v, got %d: %s — a bracketed list must "+
 			"compile to one monitor per name, not one monitor for the first name",
@@ -690,6 +705,15 @@ func assertMonitorNames(t *testing.T, rg *RedundancyGroup, want []string) {
 		if rg.InterfaceMonitors[i].Interface != w {
 			t.Fatalf("monitor[%d] = %q, want %q (got %s)",
 				i, rg.InterfaceMonitors[i].Interface, w, describeMonitors(rg.InterfaceMonitors))
+		}
+	}
+	for i := range wantWeights {
+		if got := rg.InterfaceMonitors[i].Weight; got != wantWeights[i] {
+			t.Fatalf("monitor %s weight = %d, want %d (got %s) — a monitor compiled at "+
+				"weight 0 deducts NOTHING when its link fails, so the redundancy group "+
+				"does not demote",
+				rg.InterfaceMonitors[i].Interface, got, wantWeights[i],
+				describeMonitors(rg.InterfaceMonitors))
 		}
 	}
 }
@@ -993,4 +1017,172 @@ func TestRedundancyGroupStatementPredicateCoversCompiler_6588(t *testing.T) {
 				arm, arm, arm)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// #6588 review round 5 — a regression this branch introduced, and a second
+// namedInstances node shape the fixed skip did not cover.
+// ---------------------------------------------------------------------------
+
+// TestChassisInterfaceMonitorBracketInlineWeight_6588 pins MAJOR-A: a trailing
+// inline weight on a bracketed list applies to EVERY member.
+//
+// The entry splitter originally attached a `weight` token to the entry
+// immediately preceding it, which is the obvious reading and is wrong here:
+// `[ ge-0/0/0 ge-0/0/1 ] weight 255` compiled ge-0/0/0 at weight ZERO. That is
+// WORSE than master, which compiled one monitor at 255 and dropped the rest —
+// master at least protected ge-0/0/0. With N names, N-1 monitors were inert:
+// present in `show`, deducting nothing on link-down, group never demotes.
+//
+// The chosen semantics is apply-to-all, matching the children-block spelling
+// `[ a b ] { weight 255; }` (which already applied 255 to both) and the
+// fail-safe rule monitorEntryNodes documents. It is also strictly better than
+// master on this input: no member is dropped and no weight is lost.
+//
+// FAIL-ON-REVERT: attach the weight to split[len(split)-1] again and every
+// subtest below fails naming the zero-weight monitor.
+func TestChassisInterfaceMonitorBracketInlineWeight_6588(t *testing.T) {
+	t.Run("FlatSetTwoNames", func(t *testing.T) {
+		cfg, err := CompileConfig(flatMonitorTree(t,
+			"set chassis cluster redundancy-group 1 interface-monitor [ ge-0/0/0 ge-0/0/1 ] weight 255"))
+		if err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+		assertMonitors(t, onlyRG6588(t, cfg),
+			[]string{"ge-0/0/0", "ge-0/0/1"}, []int{255, 255})
+	})
+	t.Run("FlatSetThreeNames", func(t *testing.T) {
+		cfg, err := CompileConfig(flatMonitorTree(t,
+			"set chassis cluster redundancy-group 1 interface-monitor [ ge-0/0/0 ge-0/0/1 ge-0/0/2 ] weight 100"))
+		if err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+		assertMonitors(t, onlyRG6588(t, cfg),
+			[]string{"ge-0/0/0", "ge-0/0/1", "ge-0/0/2"}, []int{100, 100, 100})
+	})
+	t.Run("ContainerHierarchical", func(t *testing.T) {
+		assertMonitors(t, compileMonitorText(t, packedMonitorConfig(
+			"            interface-monitor [ ge-0/0/0 ge-0/0/1 ] weight 255;")),
+			[]string{"ge-0/0/0", "ge-0/0/1"}, []int{255, 255})
+	})
+	t.Run("PackedInstanceLine", func(t *testing.T) {
+		assertMonitors(t, compileRGText(t, packedRGConfig(
+			"        redundancy-group 1 interface-monitor [ ge-0/0/0 ge-0/0/1 ] weight 255;")),
+			[]string{"ge-0/0/0", "ge-0/0/1"}, []int{255, 255})
+	})
+
+	// NEGATIVE CONTROL: the children-block spelling already applied the weight
+	// to every member and must keep doing so. Green with and without the fix.
+	t.Run("ControlChildrenBlockWeight", func(t *testing.T) {
+		assertMonitors(t, compileMonitorText(t, packedMonitorConfig(
+			"            interface-monitor [ ge-0/0/0 ge-0/0/1 ] {\n                weight 255;\n            }")),
+			[]string{"ge-0/0/0", "ge-0/0/1"}, []int{255, 255})
+	})
+	// NEGATIVE CONTROL: a single name with an inline weight is unaffected by
+	// how the attribute is scoped. Green in both worlds.
+	t.Run("ControlSingleNameInlineWeight", func(t *testing.T) {
+		assertMonitors(t, compileMonitorText(t, packedMonitorConfig(
+			"            interface-monitor ge-0/0/0 weight 255;")),
+			[]string{"ge-0/0/0"}, []int{255})
+	})
+	// A weight-less list still compiles every member at the documented 0
+	// default — apply-to-all must not invent a weight.
+	t.Run("ControlNoWeightStaysZero", func(t *testing.T) {
+		assertMonitors(t, compileMonitorText(t, packedMonitorConfig(
+			"            interface-monitor [ ge-0/0/0 ge-0/0/1 ];")),
+			[]string{"ge-0/0/0", "ge-0/0/1"}, []int{0, 0})
+	})
+	// The out-of-range gate sees every member, not just the last.
+	t.Run("OutOfRangeRejectedForAllMembers", func(t *testing.T) {
+		assertErrContains(t, compileMonitorTextErr(t, packedMonitorConfig(
+			"            interface-monitor [ ge-0/0/0 ge-0/0/1 ] weight 300;")),
+			"interface-monitor ge-0/0/0 weight 300 is out of range 0..255")
+	})
+	// Two inline weights in one bracketed statement are ambiguous about which
+	// member each belongs to. Master silently took the LAST and dropped every
+	// member but the first; rejecting is loud and matches the round-2
+	// duplicate-weight gate.
+	t.Run("AmbiguousPerMemberWeightsRejected", func(t *testing.T) {
+		assertErrContains(t, compileMonitorTextErr(t, packedMonitorConfig(
+			"            interface-monitor [ ge-0/0/0 weight 100 ge-0/0/1 weight 200 ];")),
+			"weight specified 2 times with different values")
+	})
+}
+
+// TestChassisIPMonitoringBracketInlineWeight_6588 pins the same semantics on
+// the ip-monitoring target list, which shares monitorEntryNodes.
+func TestChassisIPMonitoringBracketInlineWeight_6588(t *testing.T) {
+	rg := compileMonitorText(t, packedMonitorConfig(
+		"            ip-monitoring family inet [ 10.0.1.1 10.0.2.1 ] weight 100;"))
+	if rg.IPMonitoring == nil || len(rg.IPMonitoring.Targets) != 2 {
+		t.Fatalf("expected 2 ip-monitoring targets, got %+v", rg.IPMonitoring)
+	}
+	for _, tgt := range rg.IPMonitoring.Targets {
+		if tgt.Weight != 100 {
+			t.Fatalf("target %s weight = %d, want 100 — a target compiled at weight 0 "+
+				"deducts nothing when the probe fails", tgt.Address, tgt.Weight)
+		}
+	}
+}
+
+// TestChassisRedundancyGroupBareContainerShape_6588 pins MAJOR-B: the SECOND
+// node shape namedInstances returns.
+//
+// namedInstances yields either the `redundancy-group <id>` node itself
+// (Keys[0]=="redundancy-group", so the body starts at Keys[2]) or, for a bare
+// `redundancy-group { ... }` wrapper, a CHILD whose Keys[0] IS the instance id
+// (so the body starts at Keys[1]). redundancyGroupBody used a fixed skip of 2,
+// which on the second shape swallowed the statement KEYWORD and opened a node
+// named after a value — matching no switch arm, so every statement was dropped
+// exactly as in round 1, election priority included.
+//
+// Reachability through the shipped parser is lower than the round-1 shape (no
+// Junos output and no SetPath path emits a bare wrapper), but this is fixed
+// rather than documented: the guard covers all four redundancyGroupBody
+// readers, so leaving it would make the three AST gates blind here while
+// LOOKING like they covered it.
+//
+// FAIL-ON-REVERT: pin skip back to 2 and every subtest fails naming the lost
+// statement.
+func TestChassisRedundancyGroupBareContainerShape_6588(t *testing.T) {
+	t.Run("PackedInterfaceMonitor", func(t *testing.T) {
+		assertMonitors(t, compileRGText(t, packedRGConfig(
+			"        redundancy-group {\n            1 interface-monitor ge-0/0/0 weight 255;\n        }")),
+			[]string{"ge-0/0/0"}, []int{255})
+	})
+	t.Run("PackedNodePriority", func(t *testing.T) {
+		rg := compileRGText(t, packedRGConfig(
+			"        redundancy-group {\n            1 node 0 priority 200;\n        }"))
+		if got, ok := rg.NodePriorities[0]; !ok || got != 200 {
+			t.Fatalf("bare `redundancy-group { 1 node 0 priority 200; }` lost the election "+
+				"priority: NodePriorities = %v", rg.NodePriorities)
+		}
+	})
+	t.Run("PackedPreempt", func(t *testing.T) {
+		rg := compileRGText(t, packedRGConfig(
+			"        redundancy-group {\n            1 preempt;\n        }"))
+		if !rg.Preempt {
+			t.Fatal("bare `redundancy-group { 1 preempt; }` lost `preempt`")
+		}
+	})
+	t.Run("GatesStillReachIt", func(t *testing.T) {
+		assertErrContains(t, compileMonitorTextErr(t, packedRGConfig(
+			"        redundancy-group {\n            1 interface-monitor ge-0/0/0 weight nope;\n        }")),
+			`weight "nope" is not an integer`)
+	})
+	// NEGATIVE CONTROL: the nested-block form under a bare wrapper already
+	// worked (its body arrives as real children) and must be unchanged. Green
+	// with and without the fix.
+	t.Run("ControlBareWrapperNestedBlock", func(t *testing.T) {
+		assertMonitors(t, compileRGText(t, packedRGConfig(
+			"        redundancy-group {\n            1 {\n                interface-monitor ge-0/0/0 weight 255;\n            }\n        }")),
+			[]string{"ge-0/0/0"}, []int{255})
+	})
+	// NEGATIVE CONTROL: the ordinary `redundancy-group <id>` shape still uses
+	// skip 2. Green in both worlds.
+	t.Run("ControlOrdinaryInstanceShape", func(t *testing.T) {
+		assertMonitors(t, compileRGText(t, packedRGConfig(
+			"        redundancy-group 1 interface-monitor ge-0/0/0 weight 255;")),
+			[]string{"ge-0/0/0"}, []int{255})
+	})
 }
