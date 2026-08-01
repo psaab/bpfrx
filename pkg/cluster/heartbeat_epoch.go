@@ -123,19 +123,6 @@ const (
 	// absolute bound alone there is permissive, never locking.
 	epochClockSaneFloor uint64 = 1577836800_000000000
 
-	// bootEpochResolveWait bounds how long the FIRST StartHeartbeat waits for
-	// the boot epoch to be resolved before it starts sending.
-	//
-	// Without this wait the sender emits epochless frames for the first tick or
-	// two of every daemon start, and a peer that has latched (see admitAuthed)
-	// refuses them — a self-inflicted rejoin delay at exactly the moment the
-	// cluster is converging. Resolving costs one small fsync, so the wait
-	// normally returns in microseconds; the bound is what keeps a wedged disk
-	// from turning a control-path call into a hang. Only the first
-	// StartHeartbeat of a process can pay it (sync.Once), so a routine VRF
-	// rebind never does. On timeout the sender simply starts epochless and
-	// heals as soon as the resolve lands.
-	bootEpochResolveWait = 2 * time.Second
 )
 
 // bootEpochPath is where this node's own boot epoch is persisted. /var/lib/xpf
@@ -306,119 +293,25 @@ func heartbeatFrameEpoch(data, authKey []byte) (epoch uint64, present bool) {
 	return binary.LittleEndian.Uint64(data[markerAt+heartbeatEpochMarkerSize : bodyEnd]), true
 }
 
-// nextBootEpoch computes this daemon incarnation's boot epoch and persists it
-// durably. It ALWAYS returns a usable epoch; persisted reports whether the value
-// reached stable storage.
+// initHeartbeatEpochState starts this node's boot-epoch resolution, and is
+// called from StartHeartbeat. It MUST NOT BLOCK.
 //
-// The value is
+// It used to wait up to bootEpochResolveWait for the persisted value, back when
+// the epoch was only published after that read completed. Once emission moved
+// ahead of all I/O (Manager.heartbeatBootEpoch) the wait stopped buying
+// anything — and it was actively harmful: StartHeartbeat calls StopHeartbeat
+// first, so the wait stalled a node with its heartbeat already STOPPED, and the
+// channel it waited on is closed by the refine worker, which under a wedged
+// store never returns. Measured on the wedged store: 2.005s / 2.012s / 2.011s,
+// three of three paying the full bound, against a dead-peer threshold of 500ms
+// at the code default and 1s at the shipped 200ms interval. That is the same
+// false-peer-death this change exists to remove, relocated from "emits
+// epoch-less frames" to "emits no frames at all" — which a peer cannot tell
+// apart. Every routine VRF rebind and HA comms restart would have paid it.
 //
-//	max(trusted_previous + 1, wall_clock_nanoseconds)
-//
-// The two terms cover the two failure modes neither survives alone:
-//
-//   - Wall clock STEPS BACKWARDS across a restart (RTC skew, an NTP step, a
-//     manual set-back): previous+1 dominates, so the new incarnation is still
-//     strictly above the last one and a genuinely restarted peer is never
-//     mistaken for a replay of its own retired incarnation.
-//   - Persisted state is LOST (fresh image, wiped /var/lib, first boot): the
-//     wall clock dominates, so the new incarnation lands far above any retired
-//     low counter and replayed old-epoch frames stay below it.
-//
-// RESOLUTION IS NANOSECONDS, deliberately. A coarser (say second-resolution)
-// seed lets two incarnations that start within the same integer second draw
-// IDENTICAL seeds — a defect already on record on a sibling change. Here even
-// that would be covered by the previous+1 term, but nanoseconds means the
-// wall-clock term alone is already unique across any realistic process restart
-// (a daemon restart takes milliseconds).
-//
-// A persisted value is only chained from when it is PLAUSIBLE
-// (epochUsableAsFloor). A corrupted or hand-edited file holding, say,
-// MaxUint64-1 would otherwise be incremented to MaxUint64 on one boot and then
-// REGRESS on the next (MaxUint64+1 overflows, so the wall clock wins), and a
-// peer that had latched MaxUint64 would refuse this node forever — a permanent,
-// self-inflicted lockout. Ignoring an implausible previous value degrades to the
-// wall-clock seed and REWRITES the file with a sane one, healing it.
-//
-// PERSISTENCE FAILURE DOES NOT SUPPRESS EMISSION. The caller still advertises
-// the returned epoch. Not emitting would be far worse than emitting an
-// unpersisted one: a peer that has latched (admitAuthed) refuses epochless
-// frames, so a storage fault would take a healthy node off the air. An
-// unpersisted epoch is still wall-clock-derived and therefore still monotonic
-// across a restart unless the clock ALSO steps backwards — the documented
-// double fault.
-func nextBootEpoch(path string) (epoch uint64, persisted bool) {
-	now := time.Now().UnixNano()
-	if now > 0 {
-		epoch = uint64(now)
-	}
-
-	// The state dir must exist before the lock file can be created.
-	dirErr := fsatomic.MkdirAllDurable(filepath.Dir(path), 0o755)
-	if dirErr != nil {
-		slog.Warn("cluster: HA boot-epoch state dir create failed; this incarnation's epoch is NOT durable "+
-			"(a backward clock step across the next restart could regress it)", "path", path, "err", dirErr)
-	}
-
-	// The read-modify-write must be atomic ACROSS PROCESSES, not just the write
-	// — see withEpochFileLock. Without it two overlapping incarnations can read
-	// the same previous value and publish epochs that are not strictly ordered.
-	withEpochFileLock(path, func() {
-		var prev uint64
-		if data, err := os.ReadFile(path); err == nil {
-			n, perr := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
-			switch {
-			case perr != nil:
-				slog.Warn("cluster: HA boot-epoch state unreadable; seeding from wall clock", "path", path)
-			case !epochOrderable(n, now):
-				// Corrupt, hand-edited, or written while this node's clock ran
-				// far ahead. Chaining from it would push this node's epoch
-				// toward MaxUint64, where the NEXT boot REGRESSES — and would
-				// keep a node whose clock has since been corrected permanently
-				// above the range its peer will accept, with no way back down.
-				// Ignoring it reseeds from the wall clock and rewrites the file
-				// with a sane value, so the node heals.
-				slog.Warn("cluster: HA boot-epoch state is out of range; ignoring it and reseeding from the wall clock",
-					"path", path, "value", n)
-			default:
-				prev = n
-			}
-		} else if !os.IsNotExist(err) {
-			// A missing file is first boot (prev stays 0 — the wall clock seeds
-			// it), not an error. Any other read error still degrades to the
-			// wall-clock seed rather than failing heartbeat start.
-			slog.Warn("cluster: HA boot-epoch state read error; seeding from wall clock",
-				"path", path, "err", err)
-		}
-
-		if next := prev + 1; next > epoch {
-			epoch = next
-		}
-		// 0 is the reserved "no epoch" sentinel, so never publish it — only
-		// reachable with a wall clock at the Unix epoch and no persisted state.
-		if epoch == 0 {
-			epoch = 1
-		}
-
-		if dirErr != nil {
-			return
-		}
-		if err := fsatomic.WriteFileDurable(path, []byte(strconv.FormatUint(epoch, 10)+"\n"), 0o644); err != nil {
-			slog.Warn("cluster: HA boot-epoch state persist failed; this incarnation's epoch is NOT durable "+
-				"(a backward clock step across the next restart could regress it)", "path", path, "err", err)
-			return
-		}
-		persisted = true
-	})
-	return epoch, persisted
-}
-
-// initHeartbeatEpochState resolves this node's boot epoch before the sender's
-// first send, and is called from StartHeartbeat.
-//
-// It is best-effort and CANNOT BLOCK: heartbeatBootEpoch publishes a wall-clock
-// epoch synchronously with no I/O at all, so a frame always has one to carry.
-// The only thing this adds is a bounded opportunity for the persisted value to
-// be read first, which matters solely after a backward clock step.
+// So there is no wait: kick the resolve and return. The wall-clock epoch is
+// already published by the time this returns, and the persisted refinement
+// lands whenever storage allows.
 func (m *Manager) initHeartbeatEpochState() {
 	if m == nil {
 		return
@@ -431,13 +324,20 @@ func (m *Manager) initHeartbeatEpochState() {
 		return
 	}
 	m.heartbeatBootEpoch()
-	select {
-	case <-m.bootEpochReady:
-	case <-time.After(bootEpochResolveWait):
-		// Not a problem: the wall-clock epoch is already being advertised. This
-		// only means the persisted value has not been consulted yet.
-		slog.Debug("cluster: HA boot-epoch persistence still resolving; the wall-clock epoch is already in use")
+}
+
+// bootEpochSeed is the wall-clock value an incarnation advertises before any
+// I/O. Factored out so tests drive the SAME seed production uses rather than
+// restating it — a restated seed is free to drift from the shipped one.
+//
+// 0 is the reserved "no epoch" sentinel, so it is never returned; that is only
+// reachable with a clock at the Unix epoch.
+func bootEpochSeed() uint64 {
+	now := time.Now().UnixNano()
+	if now > 0 {
+		return uint64(now)
 	}
+	return 1
 }
 
 // heartbeatBootEpoch returns this daemon incarnation's boot epoch. It NEVER
@@ -465,16 +365,15 @@ func (m *Manager) heartbeatBootEpoch() uint64 {
 	}
 	m.bootEpochOnce.Do(func() {
 		// Publish immediately, before any I/O can be attempted.
-		now := time.Now().UnixNano()
-		seed := uint64(1)
-		if now > 0 {
-			seed = uint64(now)
-		}
-		m.bootEpoch.Store(seed)
+		m.bootEpoch.Store(bootEpochSeed())
 
 		// Read bootEpochPath on THIS goroutine: it is a package var tests
 		// override, and a worker reading it later would race the next test.
 		path := bootEpochPath
+		// bootEpochReady is closed when the refine attempt finishes. Nothing in
+		// production waits on it — that wait was removed, see
+		// initHeartbeatEpochState — but tests use it to join the worker so a
+		// refinement cannot race their assertions or t.TempDir cleanup.
 		ready := m.bootEpochReady
 		go func() {
 			defer func() {

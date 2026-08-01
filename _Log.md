@@ -66459,3 +66459,30 @@ break — `go vet` confirmed passing under every revert.
   side note to the design decision that REPLACED durability, with what was bought
   in exchange stated alongside it.
 - **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-02 00:40
+- **Action**: #6169 — NEW-1 (blocking) + NEW-2 folded; NEW-3 verified already
+  clean. NEW-1: `initHeartbeatEpochState` still waited up to 2s on
+  `bootEpochReady`, which closes in a defer inside the refine goroutine — under a
+  wedged store that goroutine never returns. StartHeartbeat calls StopHeartbeat()
+  FIRST, so every routine restart (VRF rebind, HA comms restart) stalled a node
+  with its heartbeat already STOPPED, against a 500ms/1s dead-peer threshold.
+  That is the same false-peer-death this work removed, relocated from "emits
+  epochless frames" to "emits no frames at all" — indistinguishable to the peer.
+  The wait was a leftover from the pre-decoupling design and bought nothing once
+  emission moved ahead of all I/O; deleted, along with now-unused
+  `bootEpochResolveWait`. Guard + mutation 18 (reinstate the wait) reds at
+  2.008s. NEW-2: `nextBootEpoch` had ZERO production callers and 9 test call
+  sites — a green suite exercising read-modify-write logic that shipped nothing
+  and could silently diverge. Deleted; tests repointed at the live
+  `refineBootEpoch`, with the wall-clock seed factored into a shared
+  `bootEpochSeed()` so the helper cannot restate (and drift from) production.
+  NEW-3: the ten cited sites were already corrected in e84af04a0/8802c4f97;
+  verified at HEAD. Restated the durability trade honestly per review: the window
+  is bounded by the peer's NEXT GENUINE FRAME, not wall clock — ~100ms live,
+  OPEN UNTIL RETURN if the peer is silent, which is the case durability existed
+  for. Recorded the measured figures (1080/1080 admitted in-window, 0/120 after;
+  one ascending pass ~60 frames across 12 incarnations) so nobody re-derives it
+  and concludes it was oversold.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/heartbeat_epoch_test.go,
+  pkg/cluster/heartbeat_epoch_latch_test.go, pkg/cluster/README.md, _Log.md

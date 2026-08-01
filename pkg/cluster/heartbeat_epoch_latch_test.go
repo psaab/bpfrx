@@ -594,3 +594,65 @@ func TestReceiverRestartWindowIsOneHeartbeat_6169(t *testing.T) {
 		}
 	}
 }
+
+// TestInitHeartbeatEpochStateNeverBlocks_6169 is the guard for the relocated
+// form of the storage-hang failure.
+//
+// StartHeartbeat calls StopHeartbeat() FIRST, then initHeartbeatEpochState().
+// While that second call waited on the refine worker, a wedged store stalled a
+// node whose heartbeat was already STOPPED — measured at 2.005s / 2.012s /
+// 2.011s against a dead-peer threshold of 500ms (code default) or 1s (shipped
+// 200ms interval). The peer cannot tell "emits epoch-less frames" from "emits
+// no frames at all"; both end in a healthy node declared dead. Every routine
+// VRF rebind and HA comms restart would have paid it.
+//
+// The wait bought nothing once emission moved ahead of all I/O, so it is gone.
+//
+// RED-on-revert: reinstate a `select { case <-m.bootEpochReady: case
+// <-time.After(...) }` in initHeartbeatEpochState.
+func TestInitHeartbeatEpochStateNeverBlocks_6169(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ha-boot-epoch")
+	orig := bootEpochPath
+	bootEpochPath = path
+	t.Cleanup(func() { bootEpochPath = orig })
+
+	// Wedge the store by holding the lock the refine worker needs.
+	lockFile, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockFile.Close()
+	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatalf("could not take the lock the test needs to hold: %v", err)
+	}
+
+	m := NewManager(0, 42)
+	m.mu.Lock()
+	m.controlAuthKey = []byte("cluster-shared-secret") // keyed, so the epoch path engages
+	m.mu.Unlock()
+
+	// Three calls, as three routine restarts would make.
+	const budget = 250 * time.Millisecond // well under the 500ms dead-peer floor
+	for i := 0; i < 3; i++ {
+		start := time.Now()
+		m.initHeartbeatEpochState()
+		if elapsed := time.Since(start); elapsed > budget {
+			t.Fatalf("initHeartbeatEpochState blocked %v on call %d with the store wedged; "+
+				"StartHeartbeat has already STOPPED the heartbeat by this point, so this is a "+
+				"self-inflicted peer-death window", elapsed, i)
+		}
+	}
+	// And the epoch is advertised throughout, despite the wedge.
+	if m.heartbeatBootEpoch() == 0 {
+		t.Fatal("no epoch advertised while the store is wedged")
+	}
+
+	// Release and drain so the worker cannot race t.TempDir cleanup.
+	_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
+	select {
+	case <-m.bootEpochReady:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the refine worker never completed after the lock was released")
+	}
+}

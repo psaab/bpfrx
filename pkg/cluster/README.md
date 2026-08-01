@@ -351,14 +351,20 @@ peer liveness (`lastSeen`) or drive election.
     heartbeat restart, a DHCP-triggered VRF rebind and an HA comms restart all
     PRESERVE it — the routine events. Only a full daemon restart clears it.
 
-    **The cost is exactly one heartbeat interval**, and it is what was bought in
-    exchange for deleting the peer-floor file. After a receiver daemon restart
-    the floor and latch re-arm from the peer's next epoch-bearing frame. A replay
-    landing inside that window IS admitted and can even set a low floor, but the
-    live peer's next frame carries a strictly higher epoch, which repairs the
-    floor and re-arms the latch — so **sustained** exposure additionally requires
-    the genuine peer to be ABSENT, in which case the attack forges liveness for a
-    dead peer and suppresses failover. Measured, not assumed:
+    **The cost is bounded by the peer's NEXT GENUINE FRAME — not by wall clock**,
+    and that distinction is the whole of it. Measured after a receiver daemon
+    restart: **1080/1080 epoch-less captures admitted** inside the window, then
+    **0/120** once a genuine frame lands. What the attacker gets is one full
+    ascending pass over their captures — about 60 frames across 12 retired
+    incarnations — not a single frame. A replayed OLD epoch CAN set the floor low
+    (the forward bound constrains only how far AHEAD an epoch may be), but it
+    cannot be sustained: the genuine frame always dominates and re-arms the latch.
+
+    With a LIVE peer that is ~100 ms and the trade is clearly good. With a
+    **SILENT** peer the window stays open until the peer returns — and that is
+    precisely the scenario the durable floor was justified by, so this residual
+    is narrow only in the live-peer case. It is stated that way deliberately: the
+    trade was taken with the silent-peer cost known, not overlooked. Measured by
     `TestReceiverRestartWindowIsOneHeartbeat_6169`.
 
     In exchange, rollback recovery is `systemctl restart xpfd` rather than
@@ -518,14 +524,13 @@ peer liveness (`lastSeen`) or drive election.
         new CLI surface to learn. Rolling BOTH nodes back needs no action
         beyond that on whichever node had latched.
   - **Honest residuals**, each measured rather than asserted.
-    1. **Receiver restart window.** The floor and latch are process-scoped, so a
-       full daemon restart on the receiving node reopens the window until the
-       peer's next epoch-bearing heartbeat — ONE heartbeat interval with a live
-       peer. A replay landing inside that window IS admitted and can even set a
-       low floor, but the live peer's next frame carries a strictly higher epoch,
-       which repairs the floor and re-arms the latch. **Sustained exposure
-       therefore additionally requires the genuine peer to be ABSENT**, in which
-       case the attack forges liveness for a dead peer and suppresses failover.
+    1. **Receiver restart window — bounded by the peer's next genuine frame, not
+       by time.** ~100 ms with a LIVE peer; **open until the peer returns if it is
+       SILENT**, which is the case durability existed for. Measured: 1080/1080
+       epoch-less captures admitted inside the window, 0/120 after a genuine
+       frame lands; the attacker gets one full ascending pass (~60 frames across
+       12 retired incarnations). A replayed old epoch can set the floor low but
+       cannot sustain it — the genuine frame always dominates.
        (`TestReceiverRestartWindowIsOneHeartbeat_6169`.)
     2. **In-bound clock skew latches a bounded lockout.** A peer epoch ahead of
        us but INSIDE the skew allowance is latched, so a peer later repaired to

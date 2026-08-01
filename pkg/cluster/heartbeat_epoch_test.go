@@ -436,13 +436,13 @@ func TestHeartbeatEpochFrameFitsWireCap_6169(t *testing.T) {
 
 // TestNextBootEpochMonotonic_6169 covers the epoch SEED: resolution, first
 // boot, a backward clock step, and a persist failure.
-func TestNextBootEpochMonotonic_6169(t *testing.T) {
+func TestBootEpochMonotonic_6169(t *testing.T) {
 	// First boot with no persisted value seeds from the wall clock, well above
 	// any low retired counter, and persists.
 	t.Run("first_boot_seeds_from_wall_clock", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "sub", "ha-boot-epoch")
 		before := uint64(time.Now().UnixNano())
-		got, ok := nextBootEpoch(path)
+		got, ok := bootEpochIncarnation(path)
 		if !ok {
 			t.Fatal("first boot failed to persist")
 		}
@@ -462,7 +462,7 @@ func TestNextBootEpochMonotonic_6169(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "ha-boot-epoch")
 		prev := uint64(0)
 		for i := 0; i < 200; i++ {
-			got, ok := nextBootEpoch(path)
+			got, ok := bootEpochIncarnation(path)
 			if !ok {
 				t.Fatalf("restart %d failed to persist", i)
 			}
@@ -485,7 +485,7 @@ func TestNextBootEpochMonotonic_6169(t *testing.T) {
 		if err := os.WriteFile(path, []byte(strconv.FormatUint(ahead, 10)), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		got, ok := nextBootEpoch(path)
+		got, ok := bootEpochIncarnation(path)
 		if !ok {
 			t.Fatal("persist failed")
 		}
@@ -511,7 +511,7 @@ func TestNextBootEpochMonotonic_6169(t *testing.T) {
 		if err := os.WriteFile(path, []byte(strconv.FormatUint(farAhead, 10)), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		got, ok := nextBootEpoch(path)
+		got, ok := bootEpochIncarnation(path)
 		if !ok {
 			t.Fatal("persist failed")
 		}
@@ -523,7 +523,7 @@ func TestNextBootEpochMonotonic_6169(t *testing.T) {
 			t.Fatalf("reseeded epoch %d is itself out of range", got)
 		}
 		// The file was healed, so the next boot chains normally.
-		if next, _ := nextBootEpoch(path); next <= got {
+		if next, _ := bootEpochIncarnation(path); next <= got {
 			t.Fatalf("after healing, the next epoch %d did not exceed %d", next, got)
 		}
 	})
@@ -536,7 +536,7 @@ func TestNextBootEpochMonotonic_6169(t *testing.T) {
 			t.Fatal(err)
 		}
 		before := uint64(time.Now().UnixNano())
-		got, ok := nextBootEpoch(path)
+		got, ok := bootEpochIncarnation(path)
 		if !ok {
 			t.Fatal("persist failed")
 		}
@@ -560,7 +560,7 @@ func TestNextBootEpochMonotonic_6169(t *testing.T) {
 		before := uint64(time.Now().UnixNano())
 		// The parent component is a regular file, so the state dir cannot be
 		// created — a failure mode that holds even when running as root.
-		got, persisted := nextBootEpoch(filepath.Join(blocker, "sub", "ha-boot-epoch"))
+		got, persisted := bootEpochIncarnation(filepath.Join(blocker, "sub", "ha-boot-epoch"))
 		if persisted {
 			t.Fatalf("persist failure reported durable (epoch %d)", got)
 		}
@@ -580,8 +580,8 @@ func TestNextBootEpochMonotonic_6169(t *testing.T) {
 		if err := os.WriteFile(path, []byte(strconv.FormatUint(math.MaxUint64-1, 10)), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		first, ok1 := nextBootEpoch(path)
-		second, ok2 := nextBootEpoch(path)
+		first, ok1 := bootEpochIncarnation(path)
+		second, ok2 := bootEpochIncarnation(path)
 		if !ok1 || !ok2 {
 			t.Fatalf("persist failed (%v, %v)", ok1, ok2)
 		}
@@ -805,4 +805,27 @@ func TestEpochForwardSlackIsNotLockoutScale_6169(t *testing.T) {
 	if epochOrderable(now+bootEpochMaxSkew*2, int64(now)) {
 		t.Fatal("an epoch beyond the skew allowance must be unorderable")
 	}
+}
+
+// bootEpochIncarnation drives the LIVE production sequence for one daemon
+// incarnation: publish the wall-clock seed synchronously, exactly as
+// Manager.heartbeatBootEpoch does, then run the persistence refinement. It
+// returns the epoch actually advertised and whether that value reached disk.
+//
+// These tests previously drove a separate nextBootEpoch that duplicated this
+// logic and had ZERO production callers — a green suite exercising
+// read-modify-write code that shipped nothing and was free to diverge from the
+// live path. Someone would eventually have fixed a bug in it, watched the tests
+// pass, and changed nothing. Both halves here are shipped functions.
+func bootEpochIncarnation(path string) (epoch uint64, persisted bool) {
+	var published atomic.Uint64
+	published.Store(bootEpochSeed())
+	refineBootEpoch(path, &published)
+	epoch = published.Load()
+	if data, err := os.ReadFile(path); err == nil {
+		if n, perr := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64); perr == nil && n == epoch {
+			persisted = true
+		}
+	}
+	return epoch, persisted
 }
