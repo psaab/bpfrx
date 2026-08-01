@@ -802,10 +802,18 @@ type heartbeatAuthState struct {
 //     genuine peer actually signed, so replaying a captured high-epoch frame
 //     cannot push the floor above the live peer and lock it out.
 //
-// An epoch outside the plausibility band (epochUsableAsFloor) still satisfies
-// the latch — the peer demonstrably emits epochs — but is neither compared
-// against the floor nor latched as one, so a corrupt far-future value cannot
-// slam the one-way door.
+// An epoch the floor cannot ORDER (epochOrderable: outside the absolute
+// plausibility band, or more than bootEpochMaxSkew ahead of our own clock) is
+// REFUSED. It is tested before anything else in the hasEpoch path, so such a
+// frame never reaches the floor comparison, never touches the ring, and never
+// arms the latch — s.epochSeen stays false. A corrupt far-future value
+// therefore cannot slam the one-way door.
+//
+// The second-order consequence is the safe direction and is deliberate: a peer
+// whose clock runs more than a year ahead is refused outright, and because the
+// latch never armed on it, its EPOCHLESS frames would still be accepted if it
+// were later rolled back. Refusing an unorderable epoch never strands a peer
+// that comes back into range.
 func (s *heartbeatAuthState) admitAuthed(hasEpoch bool, epoch, session, counter uint64) bool {
 	ok, advanced, persist := s.admitAuthedLocked(hasEpoch, epoch, session, counter)
 	// Persist OUTSIDE the lock: the hand-off must never run under s.mu, and the

@@ -417,3 +417,43 @@ func TestHeartbeatEpochLatchLayersOverPeerAuthSeen_6169(t *testing.T) {
 		t.Fatal("#6169: a signed but epochless frame must be refused once the epoch latch armed")
 	}
 }
+
+// TestHeartbeatUnorderableEpochNeverArmsLatch_6169 makes the corrected
+// admitAuthed comment executable.
+//
+// An earlier revision of this change ADMITTED an unorderable epoch without
+// latching it; the comment above admitAuthed still described that behaviour
+// after the code changed to REFUSE. Both halves are pinned here so the comment
+// cannot drift from the code again:
+//
+//   - a frame whose epoch cannot be ordered is refused and does NOT arm the
+//     latch, and
+//   - the second-order consequence is the SAFE direction — because the latch
+//     never armed, a peer that is later rolled back to a pre-#6169 build is
+//     still accepted. Refusing an unorderable epoch never strands a peer.
+func TestHeartbeatUnorderableEpochNeverArmsLatch_6169(t *testing.T) {
+	e := newLatchEnv(t)
+
+	// A peer whose clock runs years ahead: refused outright.
+	farAhead := uint64(time.Now().UnixNano()) + bootEpochMaxSkew*3
+	for i := 0; i < 5; i++ {
+		if e.feed(marshalHeartbeatAuthEpoch(samplePkt(), e.key, 0xCC01, uint64(i+1), farAhead)) {
+			t.Fatalf("frame %d with a far-future epoch was admitted", i)
+		}
+	}
+	if e.r.auth.peerEpochLatched() {
+		t.Fatal("a refused frame must never arm the downgrade latch")
+	}
+	if got := e.r.auth.peerEpochFloor(); got != 0 {
+		t.Fatalf("floor = %d, want 0", got)
+	}
+	// Nothing was persisted either, so a restart does not inherit a bogus latch.
+	e.restartDaemon()
+	if e.r.auth.peerEpochLatched() {
+		t.Fatal("a refused frame must not leave a durable latch behind")
+	}
+
+	// The safe direction: that peer, rolled back to a pre-#6169 build, is still
+	// accepted — the latch never armed on it.
+	e.liveRun(e.captureIncarnation(0xCC02, 0, epochFramesPerIncarnation), "peer rolled back after a far-future epoch")
+}

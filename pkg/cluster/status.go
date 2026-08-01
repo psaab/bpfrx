@@ -251,6 +251,9 @@ func (m *Manager) FormatInformation() string {
 	fmt.Fprintf(&b, "  Heartbeat packets sent:     %d\n", hbStats.Sent)
 	fmt.Fprintf(&b, "  Heartbeat packets received: %d\n", hbStats.Received)
 	fmt.Fprintf(&b, "  Heartbeat packet errors:    %d\n", hbStats.SendErrors+hbStats.RecvErrors)
+	fmt.Fprintf(&b, "  Heartbeats without epoch:   %d%s\n", hbStats.EpochlessAdmitted,
+		epochlessExposureNote(hbStats))
+	fmt.Fprintf(&b, "  Epoch downgrades rejected:  %d\n", hbStats.EpochDowngradeRejected)
 	fmt.Fprintln(&b)
 
 	// Sync link statistics.
@@ -399,6 +402,9 @@ func (m *Manager) FormatStatistics() string {
 	fmt.Fprintf(&b, "    Heartbeat packets sent:     %d\n", hbStats.Sent)
 	fmt.Fprintf(&b, "    Heartbeat packets received: %d\n", hbStats.Received)
 	fmt.Fprintf(&b, "    Heartbeat packet errors:    %d\n", hbStats.SendErrors+hbStats.RecvErrors)
+	fmt.Fprintf(&b, "    Heartbeats without epoch:   %d%s\n", hbStats.EpochlessAdmitted,
+		epochlessExposureNote(hbStats))
+	fmt.Fprintf(&b, "    Epoch downgrades rejected:  %d\n", hbStats.EpochDowngradeRejected)
 	fmt.Fprintln(&b)
 
 	// Services synchronized table.
@@ -446,6 +452,9 @@ func (m *Manager) FormatControlPlaneStatistics() string {
 	fmt.Fprintf(&b, "    Heartbeat packets received: %d\n", hbStats.Received)
 	fmt.Fprintf(&b, "    Heartbeat send errors:      %d\n", hbStats.SendErrors)
 	fmt.Fprintf(&b, "    Heartbeat receive errors:   %d\n", hbStats.RecvErrors)
+	fmt.Fprintf(&b, "    Heartbeats without epoch:   %d%s\n", hbStats.EpochlessAdmitted,
+		epochlessExposureNote(hbStats))
+	fmt.Fprintf(&b, "    Epoch downgrades rejected:  %d\n", hbStats.EpochDowngradeRejected)
 	fmt.Fprintf(&b, "    Authentication:             %s\n", m.controlLinkAuthStatus())
 	return b.String()
 }
@@ -749,4 +758,29 @@ func (m *Manager) FormatInterfaces(input InterfacesInput) string {
 	}
 
 	return b.String()
+}
+
+// epochlessExposureNote annotates the #6169 epoch-less heartbeat counter so the
+// number is actionable without the operator having to know what it means.
+//
+// An authenticated heartbeat with no boot epoch is admitted on the bounded
+// session ring alone — the mechanism that stops working past
+// heartbeatReplaySessions captured incarnations. A non-zero count is expected
+// mid-rollout (the peer is still on a pre-#6169 build), but once BOTH nodes are
+// upgraded it means either a node was left behind or someone is replaying
+// pre-upgrade captures. Rotating the control-link PSK is what retires an
+// attacker's archive; see "Operating the control-link PSK" in
+// pkg/cluster/README.md.
+//
+// The note is suppressed once the downgrade latch has armed and is refusing
+// epoch-less frames, because at that point the historical count is a record of
+// the migration rather than live exposure.
+func epochlessExposureNote(s HeartbeatStats) string {
+	if s.EpochlessAdmitted == 0 {
+		return ""
+	}
+	if s.EpochDowngradeRejected > 0 {
+		return "  (peer now signs boot epochs; count is historical)"
+	}
+	return "  (peer not signing boot epochs - replay protection is ring-only; rotate the control-link PSK once both nodes are upgraded)"
 }

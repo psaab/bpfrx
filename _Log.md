@@ -66337,3 +66337,29 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/heartbeat.go,
   pkg/cluster/heartbeat_manager.go, pkg/cluster/heartbeat_epoch_latch_test.go,
   pkg/cluster/heartbeat_epoch_test.go, pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 19:10
+- **Action**: #6169 round-3 review fold — two MINORs. (1) The doc comment above
+  `admitAuthed` still described the SUPERSEDED behaviour: it claimed an
+  unorderable epoch "still satisfies the latch ... neither compared against the
+  floor nor latched", but the round-2 fold changed that path to REFUSE, so
+  `s.epochSeen = true` is never reached. Both clauses were wrong, at the exact
+  spot a reader checks whether a far-future peer can bypass the latch. Corrected,
+  and made executable — `TestHeartbeatUnorderableEpochNeverArmsLatch_6169` pins
+  both the refusal + no-latch AND the second-order consequence worth keeping (a
+  peer later rolled back is still accepted, because the latch never armed: the
+  safe direction). Second time this PR a comment outlived a behaviour change.
+  (2) The exposure meter had NO operator surface — `EpochlessAdmitted` /
+  `EpochDowngradeRejected` were populated on the Go struct and rendered nowhere,
+  while README told operators to read them. Added both to the `Control link
+  statistics:` block at all three render sites (`FormatInformation`,
+  `FormatStatistics`, `FormatControlPlaneStatistics`) with an inline actionable
+  note (`rotate the control-link PSK`) while the peer is not signing epochs,
+  switching to "count is historical" once the latch arms. Guard asserts the
+  RENDERED string per surface; mutating each site individually reds only that
+  site's subtests. Prometheus deliberately NOT done: `xpfCollector` is
+  dataplane-scoped with no cluster surface, so it needs a new dependency edge —
+  recorded as a follow-up rather than bolted on.
+- **File(s)**: pkg/cluster/status.go, pkg/cluster/heartbeat.go,
+  pkg/cluster/heartbeat_epoch_status_6169_test.go,
+  pkg/cluster/heartbeat_epoch_latch_test.go, pkg/cluster/README.md, _Log.md

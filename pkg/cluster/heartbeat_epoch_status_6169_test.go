@@ -1,0 +1,104 @@
+package cluster
+
+import (
+	"strings"
+	"testing"
+)
+
+// #6169 observability: the epoch-less heartbeat counter is the operator's ONLY
+// way to tell whether a cluster is still accepting pre-upgrade-shaped frames,
+// and pkg/cluster/README.md instructs them to read it. A counter that is
+// populated on an internal Go struct but rendered nowhere is documentation, not
+// observability.
+//
+// These assert the RENDERED string on every surface that prints the "Control
+// link statistics:" block, not merely that the struct field increments.
+//
+// RED-on-revert: drop either fmt.Fprintf from any of the three render sites in
+// status.go and the corresponding subtest fails.
+
+// epochStatusEnv drives real frames through the real gate, then renders.
+func epochStatusEnv(t *testing.T) *latchEnv {
+	t.Helper()
+	e := newLatchEnv(t)
+	e.m.mu.Lock()
+	e.m.hbReceiver = e.r
+	e.m.mu.Unlock()
+	return e
+}
+
+func TestEpochlessCounterIsRendered_6169(t *testing.T) {
+	e := epochStatusEnv(t)
+
+	// A not-yet-upgraded peer: 6 authenticated frames admitted WITHOUT an epoch.
+	const epochless = 6
+	e.liveRun(e.captureIncarnation(0xAA01, 0, epochless), "not-yet-upgraded peer")
+
+	renders := map[string]func() string{
+		"FormatInformation":            e.m.FormatInformation,
+		"FormatStatistics":             e.m.FormatStatistics,
+		"FormatControlPlaneStatistics": e.m.FormatControlPlaneStatistics,
+	}
+	for name, render := range renders {
+		t.Run(name+"_exposure", func(t *testing.T) {
+			out := render()
+			if !strings.Contains(out, "Heartbeats without epoch:") {
+				t.Fatalf("%s does not render the epoch-less heartbeat counter.\n"+
+					"pkg/cluster/README.md tells operators to read it; a counter nobody "+
+					"can see is documentation, not observability.\n--- output ---\n%s", name, out)
+			}
+			// The VALUE must be right, not just the label.
+			if !strings.Contains(out, "Heartbeats without epoch:   6") {
+				t.Fatalf("%s rendered the wrong epoch-less count (want 6)\n--- output ---\n%s", name, out)
+			}
+			if !strings.Contains(out, "Epoch downgrades rejected:  0") {
+				t.Fatalf("%s did not render the downgrade-rejection counter as 0\n--- output ---\n%s", name, out)
+			}
+			// While the peer is NOT signing epochs, the operator needs to be told
+			// what the number means and what action closes it.
+			if !strings.Contains(out, "rotate the control-link PSK") {
+				t.Fatalf("%s renders the count without the actionable note\n--- output ---\n%s", name, out)
+			}
+		})
+	}
+
+	// The peer upgrades and starts signing; epoch-less frames are now refused.
+	e.liveRun(e.captureIncarnation(0xAA02, 9_800_000_000_000_000, 2), "upgraded peer")
+	if e.feed(marshalHeartbeatAuthEpoch(samplePkt(), e.key, 0xAA03, 1, 0)) {
+		t.Fatal("epoch-less frame admitted after the latch armed")
+	}
+
+	for name, render := range renders {
+		t.Run(name+"_after_latch", func(t *testing.T) {
+			out := render()
+			if !strings.Contains(out, "Epoch downgrades rejected:  1") {
+				t.Fatalf("%s did not render the downgrade rejection\n--- output ---\n%s", name, out)
+			}
+			// The historical count stays visible but is no longer flagged as live
+			// exposure — the latch is refusing now.
+			if !strings.Contains(out, "Heartbeats without epoch:   6") {
+				t.Fatalf("%s lost the historical epoch-less count\n--- output ---\n%s", name, out)
+			}
+			if strings.Contains(out, "rotate the control-link PSK") {
+				t.Fatalf("%s still flags live exposure after the latch armed\n--- output ---\n%s", name, out)
+			}
+			if !strings.Contains(out, "count is historical") {
+				t.Fatalf("%s does not mark the count historical once the latch armed\n--- output ---\n%s", name, out)
+			}
+		})
+	}
+}
+
+// A clean, fully-upgraded cluster must render a quiet 0 with no scary note.
+func TestEpochlessCounterQuietWhenClean_6169(t *testing.T) {
+	e := epochStatusEnv(t)
+	e.liveRun(e.captureIncarnation(0xBB01, 9_900_000_000_000_000, 4), "upgraded peer")
+
+	out := e.m.FormatControlPlaneStatistics()
+	if !strings.Contains(out, "Heartbeats without epoch:   0") {
+		t.Fatalf("clean cluster should render 0 epoch-less heartbeats\n--- output ---\n%s", out)
+	}
+	if strings.Contains(out, "rotate the control-link PSK") || strings.Contains(out, "count is historical") {
+		t.Fatalf("clean cluster should render no exposure note\n--- output ---\n%s", out)
+	}
+}

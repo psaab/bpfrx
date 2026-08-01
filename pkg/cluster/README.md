@@ -444,6 +444,23 @@ peer liveness (`lastSeen`) or drive election.
     the residual is invisible: an operator who has upgraded both nodes has no
     way to tell whether the cluster is still accepting pre-upgrade-shaped
     frames, and the documentation would be the only defence.
+
+    Both are RENDERED in the `Control link statistics:` block on all three
+    surfaces that print it — `FormatInformation`, `FormatStatistics` and
+    `FormatControlPlaneStatistics` — as `Heartbeats without epoch:` and
+    `Epoch downgrades rejected:`. While the peer is not yet signing epochs the
+    count carries an inline note naming the action that closes it (rotate the
+    control-link PSK); once the latch has armed the note switches to marking the
+    count historical, since it is then a record of the migration rather than
+    live exposure. A counter populated on an internal struct but rendered
+    nowhere would be documentation, not observability, so the guard asserts the
+    RENDERED string on each surface rather than the struct field.
+
+    **Not yet a Prometheus series.** The collector (`pkg/api`, `xpfCollector`)
+    is dataplane-scoped and has no cluster/heartbeat surface at all, so this
+    would mean plumbing the cluster `Manager` into it — a new dependency edge,
+    not a one-line addition. Worth doing as its own change; the CLI block is
+    what an upgrading operator reads today.
   - **Sender nonce is INCARNATION-scoped** (`Manager.heartbeatNonce`). It
     used to be per-`heartbeatSender`, so every `StartHeartbeat` minted a
     fresh session — and routine events mint them (VRF rebind, comms
@@ -946,12 +963,14 @@ Procedure:
 > node (a brand-new chassis, or one that has not yet heard an epoch), the
 > pre-upgrade archive is exactly what it is exposed to.
 >
-> **How to tell whether you are still exposed:** `HeartbeatStats` carries
-> `EpochlessAdmitted`. If it is non-zero and still climbing after both nodes are
-> upgraded, this node is still accepting epoch-less frames — either a node is
-> genuinely on an older build, or someone is replaying captures. A settled
-> counter after a completed rollout means the latch has armed and epoch-less
-> frames are being refused (`EpochDowngradeRejected`).
+> **How to tell whether you are still exposed:** `show chassis cluster
+> information` / `statistics` print `Heartbeats without epoch:` in the
+> `Control link statistics:` block. If it is non-zero and still climbing after
+> both nodes are upgraded, this node is still accepting epoch-less frames —
+> either a node is genuinely on an older build, or someone is replaying
+> captures — and the line carries an inline note saying so. Once the peer signs
+> epochs the latch arms, `Epoch downgrades rejected:` starts counting, and the
+> epoch-less count is marked historical.
 
 Rotation is also the **anti-replay capture-invalidation** step. Every archived
 capture an on-link sniffer holds was signed under the old key, so after a
