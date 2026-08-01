@@ -183,6 +183,16 @@ type Manager struct {
 	hbSender   *heartbeatSender
 	hbReceiver *heartbeatReceiver
 
+	// hbAuth is the #4107 control-channel authentication state for the peer:
+	// the anti-replay watermarks plus the sticky peer-authenticated flag. It
+	// deliberately hangs off the Manager rather than the heartbeatReceiver so
+	// it survives every StartHeartbeat/RestartHeartbeat — a heartbeat restart
+	// must not hand an attacker a fresh, empty replay tracker that re-admits
+	// captured heartbeats from retired peer incarnations (#5086). Fixed size
+	// (~1 KiB), allocated once, never reset for the life of the process. Its
+	// own locking makes it safe to touch without m.mu.
+	hbAuth heartbeatAuthState
+
 	// hbStartMu serializes StartHeartbeat's stop-previous + socket-create +
 	// install sequence so two concurrent StartHeartbeat calls (e.g. a
 	// comms-restart bind-retry goroutine racing RestartHeartbeat) cannot

@@ -113,17 +113,36 @@ Go side; **the JSON tags ARE the contract** — changing one without
 updating the other breaks the helper.
 
 `ConfigSnapshot.version` is a compatibility gate, not just documentation.
-The helper accepts only the current snapshot protocol version; this prevents a
-new daemon from publishing fields such as policy-scheduler inactive bits or
-source-NAT persistent-lease settings to a helper that would silently ignore
-them.
+The helper accepts only the current snapshot protocol version — EXACT equality,
+on both mutating verbs (`apply_snapshot` and `bump_fib_generation`). This
+prevents a new daemon from publishing fields such as policy-scheduler inactive
+bits, source-NAT persistent-lease settings, or scoped-global zone SETS to a
+helper that would silently ignore them. Bump `CONFIG_SNAPSHOT_PROTOCOL_VERSION`
+(`protocol/control.rs`) and the Go mirror `ProtocolVersion` TOGETHER whenever a
+change makes an older reader interpret the same bytes differently — in
+particular whenever a new field becomes authoritative over an existing one.
+Leaving the version unchanged for such a field is what caused #5488: the
+plural `match_from_zones`/`match_to_zones` scope became authoritative in #4626
+while the version stayed at 3, so a pre-#4626 helper at the same advertised
+version read only the singular field and NARROWED a multi-zone global deny (a
+rolling-upgrade fail-open).
+
 The helper also reports `config_snapshot_protocol_version` in status so a new
 daemon can fail closed before sending snapshots that require newer runtime
 semantics to an older helper binary that predates the gate. If the daemon
-detects an incompatible helper while scheduled policies or per-pool source-NAT
-`persistent-nat` settings are configured, it sends `set_forwarding_state
-armed=false` before returning the compile/publish error; the old helper must
-not keep forwarding a stale snapshot that ignores those semantics.
+detects an incompatible helper while any of the gated features is configured —
+scheduled policies, per-pool source-NAT `persistent-nat` settings, or a
+scoped-global policy whose zone scope holds MORE THAN ONE zone on a side
+(#5488) — it sends `set_forwarding_state armed=false` before returning the
+compile/publish error; the old helper must not keep forwarding a stale snapshot
+that ignores those semantics. The Go-side gate list is
+`requiredProtocolGateSentinels` in `pkg/dataplane/userspace/manager_compile.go`;
+every gate must be registered there or the commit is promoted against a
+disarmed dataplane (#2138). If that disarm ITSELF fails on a publish path whose
+classifier BPF maps were already mutated in place, the daemon additionally
+drives the `userspace_ctrl` shim to `Enabled=0` so transit falls back to the
+kernel-only fail-closed posture rather than running maps a generation ahead of
+the applied snapshot (#5488 F7, mirroring #4959).
 
 `inject_packet_tuple_protocol_version` is the corresponding status gate for
 `inject_packet` requests that set `emit_on_wire=true`. Those requests must carry
