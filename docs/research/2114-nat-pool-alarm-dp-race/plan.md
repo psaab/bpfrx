@@ -1,9 +1,9 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v48 — r47 findings folded (Codex NEEDS-REVISION
-  5M/2m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/2m —
-  its two nits IS Codex M3 + M5; all three confirm the §4.7
-  structure); pending convergence review r48
+- **Status**: DRAFT v49 — r48 findings folded (Codex NEEDS-REVISION
+  5M/2m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m —
+  its re-activation nit IS part of Codex M3; all three confirm
+  the §4.7 structure); pending convergence review r49
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -2025,6 +2025,69 @@
   opaque config-DB artifact (Codex m2 — magic-header framing
   line + possibly-encrypted JSON body, `envelope.go:78-99`,
   `db.go:445-450` — preserved byte-for-byte).
+  v49: r48 convergence — the epoch contract is unified, the
+  apply-failure predicate is executable, the quiesce is a
+  verified two-node step with a re-activation ending, and the
+  encrypted-fallback recovery has its choreography (Codex
+  NEEDS-REVISION 5M/2m, folds 2 FOLDED / 5 PARTIAL, structure
+  confirmed; AGY PLAN-READY 7/7 with 2 fresh attacks FAILED,
+  structure confirmed; SMR PLAN-READY-WITH-NITS 0M/1m — the
+  missing re-activation, IS part of Codex M3): (a) THE EPOCH
+  CONTRACT IS UNIFIED (Codex M1, verified the contradiction:
+  the live runbook said provisional-and-never-rollback while
+  §5.1, the formal (3), and JOIN leg (h) still said
+  "successful reservation"): ALL sites now read advanced WITH
+  the provisional pre-enqueue reservation, NEVER rolled back;
+  a nil/full attempt moves the epoch without the counter; and
+  the (h) leg asserts a nil/full attempt advances the epoch
+  permanently. (b) THE APPLY-FAILURE PREDICATE IS EXECUTABLE
+  (Codex M2, verified the existing surfaces do not carry it:
+  compile health is compile-specific, `daemon.go:871-880`,
+  `daemon_health.go:79-125`; `ConfigsApplyFailed` is
+  SessionSync-only, `sync.go:110-119`,
+  `sync_conn_config.go:351-379`; the DHCP/boot/feeds applies
+  run separate wrappers, `daemon_apply.go:49-86`): a
+  PROCESS-LIFETIME apply-failure counter + last-outcome flag,
+  initialized BEFORE the restarted process's boot apply and
+  instrumented CENTRALLY at every full-apply entry (the §5.1
+  pkg/daemon inventory carries it), rendered beside
+  ActiveApplied; the predicate is failure-count == 0 AND
+  last-outcome-success; §9 gains the sticky same-text
+  regression. (c) THE QUIESCE IS A VERIFIED TWO-NODE STEP WITH
+  A RE-ACTIVATION ENDING (Codex M3 + M4 + SMR m1, all parts
+  verified: an operator commit syncs only from the RG0
+  authority and is suppressed when ConfigSync is disabled,
+  `daemon_apply_commit.go:578-601`, `daemon_ha_sync.go:336-370`;
+  a promoted secondary is writable and commits locally with
+  syncPeer=false, `daemon_ha.go:438-450`,
+  `daemon_apply_tail.go:446-455`; a promotion can persist
+  before an apply aborts ahead of tail step 17, leaving the
+  durable tree deactivated while the live engine retains its
+  policies, `daemon_apply.go:282-309,404-409`,
+  `daemon_apply_tail.go:194-202`): the deactivation is applied
+  per-node with each commit's own success required (the tail
+  abort surfaces as the #5679 deferred error); the quiesce's
+  config change is admitted (it is NOT "no config change" —
+  `store_command.go:111-129`, `config/inactive.go:5-10`); the
+  PRE-QUIESCE digest is captured before (1a) and the procedure
+  ENDS with the re-activation commit + re-verification against
+  the pre-quiesce digest (the two-digest discipline). (d) THE
+  ENCRYPTED-FALLBACK CHOREOGRAPHY (Codex M5, verified the
+  contradiction: the intended holder can be the read-only
+  secondary AND non-portable): restart the INTENDED-CONFIG
+  HOLDER first — its `Load` classification completes before
+  cluster comms, `daemon_run.go:157-177,393-398` — and ensure
+  it is the RG0 authority before any older-config peer can
+  overwrite it; only then restart the other node. (e) The
+  acceptance copy's residual (iii) window is aligned to the
+  FIRST sub-read (Codex m1). (f) The re-baseline rule gains
+  the TERMINATION CLAUSE (Codex m2, verified: unkeyed
+  third-party ingress keeps advancing the never-rolled-back
+  epoch, `sync_admission.go:58-83`, `sync_auth.go:321-334`):
+  if the epoch STILL advances after the second re-baseline,
+  the stopped remediation is UNAVAILABLE while pulses continue
+  (fail-closed); the operator fences the ingress source or
+  uses the live removal path.
 
 ---
 
@@ -4042,6 +4105,25 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   window resolution is operator-paced), (1a) the operator
   QUIESCES AUTOMATION: if any `event-options` policy is
   configured, `deactivate event-options` and commit FIRST —
+  on BOTH nodes, each commit required to SUCCEED (r48 Codex M4,
+  both parts verified: (i) an operator commit syncs only from
+  the RG0 authority and is suppressed when ConfigSync is
+  disabled, `daemon_apply_commit.go:578-601`,
+  `daemon_ha_sync.go:336-370` — and a retained-policy secondary
+  becomes writable on promotion after the authority stops,
+  `daemon_ha.go:438-450`, committing locally with
+  syncPeer=false, `daemon_apply_tail.go:446-455` — so the
+  deactivation must be applied per-node: via the authority's
+  sync when enabled, by the operator's own per-node commit when
+  not, with each node's own apply observed; (ii) a Store
+  promotion can persist before an apply aborts ahead of tail
+  step 17, `daemon_apply.go:282-309,404-409`,
+  `daemon_apply_tail.go:194-202` — leaving the durable tree
+  deactivated while the LIVE engine retains its policies — so
+  the quiesce's EFFECTIVENESS is verified, not assumed: the
+  deactivate commit's own result must succeed on each node —
+  a tail abort surfaces as the #5679 deferred commit error,
+  `daemon_apply_dataplane.go:145-159`) —
   the event engine is the ONLY autonomous local commit source
   (r47 Codex M4, verified: it stages and commits independently,
   `engine.go:920-948`, via `commitAndApply` WITHOUT peer sync,
@@ -4049,7 +4131,12 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   the dispatch epoch — and shutdown does not fence it: the
   applyCancel + applySem drain precede the engine's Close,
   `daemon_run_shutdown.go:25-59`, whose lifetime context is
-  cancelled only by Close, `engine.go:354-367,583-595`) — and
+  cancelled only by Close, `engine.go:354-367,583-595`) — with
+  the PRE-QUIESCE digest captured first (the true
+  pre-procedure intent — the quiesce is itself an
+  operator-visible config change, `store_command.go:111-129`,
+  `config/inactive.go:5-10`, REVERTED at the procedure's end
+  below) — and
   (1b) ONLY THEN the operator CAPTURES the intended-config
   digest + text (r47 Codex M3 = r47 SMR m2, the sharper
   construction verified: capturing T1 while a commit-confirmed
@@ -4208,7 +4295,18 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   change; a stale-skip receipt moves the epoch without state
   change — a CONSERVATIVE false-positive, and the runbook's
   rule is EXPLICIT: re-baseline and repeat the (2c)→(3) pass
-  (the peer is stopped, so the epoch settles); and a dispatch
+  (the peer is stopped, so the epoch settles) — WITH THE
+  TERMINATION CLAUSE (r48 Codex m2, verified: in UNKEYED
+  deployments a third-party or stale-process ingress keeps
+  advancing the never-rolled-back epoch through the same
+  counted dispatch path, `sync_admission.go:58-83`,
+  `sync_auth.go:321-334`, so the re-baseline loop need not
+  terminate): if the epoch STILL advances after the second
+  re-baseline, a live ingress source exists — the stopped
+  remediation is UNAVAILABLE while pulses continue (fail-closed
+  by construction); the operator identifies and fences the
+  ingress source (itself an incident) or uses the live removal
+  path instead; and a dispatch
   landing
   after (3) is residual (iii)'s admitted local window.
   Because the reservation lives in the
@@ -4387,8 +4485,10 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   config from the cluster-status surface (operator-readable,
   redaction-free — the digest needs no cleartext), and (β) the
   intended config's TEXT — which is the OPERATOR'S OWN
-  committed configuration (this procedure changes no config;
-  the intended config is what the operator committed and holds
+  committed configuration (aside from the
+  quiesce's own deactivate/re-activate pair, which is
+  operator-visible and reverted at the end — r48 Codex M3; the
+  intended config is what the operator committed and holds
   in their config management) — with the IN-BOX fallback being
   the on-disk `.configdb/active.json` — an opaque config-DB
   artifact (a magic-header framing line + a possibly-encrypted
@@ -4423,7 +4523,19 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   path — or, when the operator's text source is unavailable,
   the STOPPED-DAEMON file-level restore of the captured
   `active.json` onto the authority (with the directory sync and
-  the encryption caveat above) —
+  the encryption caveat above) — and when the intended holder
+  IS the read-only secondary with an encrypted (non-portable)
+  artifact, the choreography is PINNED (r48 Codex M5, verified
+  the contradiction: the plan admits the intended holder can be
+  the read-only secondary, forbids moving its encrypted
+  artifact cross-node, and cannot then mandate restoration
+  onto a different authority): restart the INTENDED-CONFIG
+  HOLDER first — its `Load` classification completes BEFORE
+  cluster comms (`daemon_run.go:157-177,393-398`), so it holds
+  its intended config before any peer can push an older one —
+  and ensure it is the RG0 authority (the normal election with
+  the operator controlling restart order); only then restart
+  the other node —
   then re-verify per the post-restart predicate below
   (the commit re-drives the normal sync where enabled). The operational closure is PINNED
   in the runbook, no new machinery: (α) the stopped-filesystem
@@ -4501,13 +4613,35 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   — ActiveApplied compares H(T) only, so it stays true while
   the new address lacks enforcement. The done predicate
   therefore ALSO requires NO dataplane apply failure since the
-  post-restart bringup on EITHER node — the last-apply-outcome
-  + a monotonic apply-failure count are tracked in the daemon's
-  health state and rendered beside ActiveApplied (the §5.1
-  inventory carries the exposure) —
+  post-restart bringup on EITHER node, with the executable
+  shape PINNED (r48 Codex M2, verified the existing surfaces do
+  not carry it: the compile health is compile-specific,
+  `daemon.go:871-880`, `daemon_health.go:79-125`;
+  `ConfigsApplyFailed` covers only SessionSync callbacks,
+  `sync.go:110-119`, `sync_conn_config.go:351-379`; the
+  DHCP/boot/feeds applies run separate wrappers,
+  `daemon_apply.go:49-86`): a PROCESS-LIFETIME apply-failure
+  counter + last-apply-outcome flag, initialized BEFORE the
+  restarted process's boot apply and instrumented CENTRALLY at
+  every full-apply entry (the §5.1 pkg/daemon inventory carries
+  it), rendered beside ActiveApplied on the status surface; the
+  predicate is failure-count == 0 AND last-outcome-success
+  (process-lifetime, so no baseline capture is needed), and §9
+  gains the sticky same-text regression (a failed same-text
+  state-dependent reapply keeps ActiveApplied true while the
+  failure count moves) —
   with the disabled-sync subclass's MANUAL re-convergence
   performed first where it fired —
-  before the repair is declared done. The same shape covers a push landing on the
+  before the repair is declared done; and ONLY THEN the
+  operator RE-ACTIVATES `event-options` (a normal commit
+  reverting the quiesce — r48 Codex M3 + r48 SMR m1: without
+  this step the fence's side effect becomes the running state
+  and the box's automation is silently OFF) and re-verifies
+  the digest against the PRE-QUIESCE intent captured before
+  (1a) — the two-digest discipline: the post-restart
+  verification compares against the fence-time (post-quiesce)
+  digest; the re-activation re-verifies against the
+  pre-procedure digest. The same shape covers a push landing on the
   LOCAL node between the re-check (3) and the local stop (4) —
   from any ingress source, including a stale peer process or,
   in unkeyed deployments, a third party (dual-accepted
@@ -5484,8 +5618,13 @@ v20 history). The delivery is TWO units:
   executable surface; the prior "pkg/grpcapi and pkg/cli
   untouched" scoping is amended to admit exactly this field);
   the NODE-LIFETIME MONOTONIC DISPATCH EPOCH (r46 Codex M1) —
-  incremented in the same critical section on each SUCCESSFUL
-  reservation, living in node-lifetime state beside the counter
+  advanced in the same critical section WITH the provisional
+  pre-enqueue reservation and NEVER rolled back (r47/r48 Codex
+  M1 — a nil/full attempt moves the EPOCH without the counter:
+  a conservative false-positive the re-baseline rule covers;
+  "successful reservation" semantics would publish after a fast
+  consumer retires, reopening the false-idle), living in
+  node-lifetime state beside the counter
   and PRESERVED across every SessionSync replacement (the
   provider-scoped candidates fail: `lastAppliedConfigGen`
   ignores gen-0 and failed applies and resets on bulk re-prime,
@@ -6552,7 +6691,19 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      EXPLICIT and FENCED (the r36-r42 producer-quiesce protocol:
      (1) no live commit-confirmed window stands, (1a) automation
      is quiesced — if any `event-options` policy is configured,
-     `deactivate event-options` and commit FIRST (the event
+     `deactivate event-options` and commit FIRST ON BOTH NODES,
+     each commit required to SUCCEED (an operator commit syncs
+     only from the RG0 authority and is suppressed when
+     ConfigSync is disabled, `daemon_apply_commit.go:578-601`,
+     `daemon_ha_sync.go:336-370`; a promoted secondary is
+     writable, `daemon_ha.go:438-450`; a promotion can persist
+     before an apply aborts ahead of tail step 17 leaving the
+     durable tree deactivated while the live engine retains its
+     policies, `daemon_apply.go:282-309,404-409`,
+     `daemon_apply_tail.go:194-202` — so effectiveness is
+     verified per node via the commit's own result, the tail
+     abort surfacing as the #5679 deferred error,
+     `daemon_apply_dataplane.go:145-159` — r48 Codex M4) (the event
      engine is the only autonomous local commit source,
      `engine.go:920-948` via `daemon_apply_tail.go:446-455`
      without peer sync, invisible to the counter/epoch; shutdown
@@ -6603,8 +6754,10 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      (3) RE-CHECK THE FULL STATE —
      `ConfirmDebtKindMask == 0` AND `persistDegraded == false`
      AND `ConfigSyncOutstanding == 0` AND the NODE-LIFETIME
-     MONOTONIC dispatch epoch (incremented on each successful
-     reservation, preserved across SessionSync replacements,
+     MONOTONIC dispatch epoch (advanced WITH the provisional
+     pre-enqueue reservation, NEVER rolled back — nil/full
+     attempts are conservative epoch false-positives, r48 Codex
+     M1 — preserved across SessionSync replacements,
      exposed beside the counter — r46 Codex M1: the
      provider-scoped candidates reset or ABA,
      `sync_conn_gen.go:340-367`, `sync_state.go:47-63`,
@@ -6640,13 +6793,18 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      BIND and replay the resolved window, and the `Resolved:
      true` synthesized shape is the machinery's own, never
      hand-authored), and the r42/r43 residual (iii): a push
-     whose APPLY lands between the peer preflight and the peer
+     whose APPLY lands between the peer preflight's FIRST
+     sub-read and the peer
      stop — REGARDLESS of when the frame was received (a
      complete frame paused pre-dispatch or held as the
      handshake's `pendingFrame` can be received before the
      preflight yet dispatch after it,
      `sync_conn_read.go:84-93`, `sync_auth.go:352-369` — r45
-     Codex M3) — (or
+     Codex M3; and the preflight's split /health +
+     cluster-status reads are not one coherent snapshot — a
+     promote+fail-persist+retire can slip between them,
+     `store.go:687-746` — so the window runs from the FIRST
+     sub-read, r47 Codex m1 + r48 Codex m1) — (or
      on the LOCAL node between the re-check and the local stop,
      from any ingress source including a stale peer process or,
      in unkeyed deployments, a third party) can promote and
@@ -6663,7 +6821,14 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      preempting peer whose older config has ConfigSync=false
      leaves NEITHER side pushing, `daemon_ha_sync.go:461-465` —
      detected by the intended-config comparison and closed by
-     the pinned MANUAL re-convergence) — bounded by the repair
+     the pinned MANUAL re-convergence — and when the intended
+     holder is the read-only secondary with an encrypted
+     (non-portable) artifact, the choreography is pinned:
+     restart the INTENDED-CONFIG HOLDER FIRST (its `Load`
+     classification completes before cluster comms,
+     `daemon_run.go:157-177,393-398`) and ensure it is the RG0
+     authority before any older-config peer can overwrite it,
+     only then restart the other node — r48 Codex M5) — bounded by the repair
      step's successful directory `sync` of the configdb PARENT
      directory on EVERY AFFECTED NODE — BOTH nodes; the
      post-rename failure can belong to the peer's filesystem,
@@ -6674,7 +6839,9 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      canonical digest (from the cluster-status surface —
      redaction-free, no cleartext needed) AND the intended
      config's TEXT — the OPERATOR'S OWN committed configuration
-     (this procedure changes no config), with the in-box
+     (aside from the quiesce's own operator-visible
+     deactivate/re-activate pair, reverted at the end — r48
+     Codex M3), with the in-box
      fallback being the on-disk `.configdb/active.json` — an
      opaque config-DB artifact (a magic-header framing line + a
      possibly-encrypted JSON body, `envelope.go:78-99`,
@@ -6720,8 +6887,15 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      `daemon_nft.go:262-272`) keeps ActiveApplied true while
      the new address lacks enforcement — so the predicate ALSO
      requires NO dataplane apply failure since the post-restart
-     bringup on either node, tracked in the daemon's health
-     state and rendered beside ActiveApplied) —
+     bringup on either node — a PROCESS-LIFETIME failure
+     counter + last-outcome flag initialized BEFORE the boot
+     apply and instrumented centrally at every full-apply entry
+     (the existing surfaces do not carry it: compile health is
+     compile-specific, `daemon.go:871-880`,
+     `daemon_health.go:79-125`; `ConfigsApplyFailed` is
+     SessionSync-only, `sync.go:110-119`; the DHCP/boot/feeds
+     applies run separate wrappers, `daemon_apply.go:49-86` —
+     r48 Codex M2), rendered beside ActiveApplied) —
      EXPOSED beside the counter/epoch/digest on the
      cluster-status rendering (r46 Codex M2a) — AND
      `IsConfirmPending() == false` AND `IsDirty() == false` (or
@@ -6729,7 +6903,14 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      Codex M2b — `store_commit.go:796-800`,
      `store_lock.go:334-338`, `store_command.go:304-334`) —
      before the repair is declared
-     done),
+     done; and ONLY THEN the operator RE-ACTIVATES
+     `event-options` (a normal commit reverting the quiesce —
+     r48 Codex M3 + r48 SMR m1: without it the quiesce's side
+     effect becomes the running state) and re-verifies against
+     the PRE-QUIESCE digest captured before (1a) — the
+     two-digest discipline: post-restart verification against
+     the fence-time digest, re-activation verification against
+     the pre-procedure digest),
      and every
      content-INDEPENDENT repair write
      RE-VERIFIES the target's classification inside the SAME
@@ -6794,8 +6975,11 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      dispatch that lands, applies CLEANLY, and retires between
      the (2c) observation and the (3) re-check returns the
      level counter to zero but MOVES the pinned NODE-LIFETIME
-     monotonic dispatch epoch (incremented on each successful
-     reservation, preserved across SessionSync replacements):
+     monotonic dispatch epoch (advanced WITH the provisional
+     reservation and NEVER rolled back — the leg ALSO asserts a
+     nil/full attempt advances the epoch permanently without
+     moving the counter, r48 Codex M1; preserved across
+     SessionSync replacements):
      the
      regression asserts the epoch comparison at (3) catches the
      pulse the level cannot — including across a

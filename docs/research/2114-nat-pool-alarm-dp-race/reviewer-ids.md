@@ -146,6 +146,9 @@ reviewer (joins at /engineer on the code PR).
 | r47 | Codex | codex companion task-ms9z6ra6-0fcorx (session 019fbbf4-d92c-7df1-8824-563ad084334b) | NEEDS-REVISION (5 MAJOR, 2 MINOR; folds 3 FOLDED / 3 PARTIAL). Structure confirmed |
 | r47 | AGY | agy print-mode direct (agy-plan-r47.md) | PLAN-READY (6/6 folds FOLDED; 2 fresh attacks FAILED; no findings). Structure confirmed |
 | r47 | Claude SMR | in-conversation (claude-smr-plan-r47.md) | PLAN-READY-WITH-NITS (0 MAJOR, 2 MINOR — capture ordering IS Codex M3; encrypted-fallback scope IS Codex M5). Structure confirmed |
+| r48 | Codex | codex companion task-msa0lwgp-ns7h20 (session 019fbc19-4131-7713-8b0a-aa495a0b15c9) | NEEDS-REVISION (5 MAJOR, 2 MINOR; folds 2 FOLDED / 5 PARTIAL). Structure confirmed |
+| r48 | AGY | agy print-mode direct (agy-plan-r48.md) | PLAN-READY (7/7 folds FOLDED; 2 fresh attacks FAILED; no findings). Structure confirmed |
+| r48 | Claude SMR | in-conversation (claude-smr-plan-r48.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — re-activation step, IS part of Codex M3). Structure confirmed |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 
