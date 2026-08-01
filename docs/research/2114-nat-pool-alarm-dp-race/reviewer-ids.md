@@ -182,6 +182,9 @@ reviewer (joins at /engineer on the code PR).
 | r59 | Codex | codex companion task-msac7cbq-0d4e5j (session 019fbd42-70bc-7b42-b263-19e4771e8954) | NEEDS-REVISION (5 MAJOR, 2 MINOR; folds 1 FOLDED / 3 PARTIAL / 1 NOT-FOLDED). Structure confirmed |
 | r59 | AGY | agy print-mode direct at 12m (agy-plan-r59.md) | NEEDS-REVISION (1 MAJOR — trailing SUCCESS overwrites waiter QUEUED, IS part of Codex M4). Structure confirmed |
 | r59 | Claude SMR | in-conversation (claude-smr-plan-r59.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — additive-QUEUED pin, IS part of Codex M4). Structure confirmed |
+| r60 | Codex | codex companion task-msadgfd5-g7ntju (session 019fbd62-89bd-7a33-8d3f-f9319bfd146b) | NEEDS-REVISION (7 MAJOR, 4 MINOR; folds 1 FOLDED / 3 PARTIAL / 1 NOT-FOLDED). Structure confirmed |
+| r60 | AGY | agy print-mode direct at 12m (agy-plan-r60.md) | NEEDS-REVISION (3 MAJOR, 1 MINOR — actuated observability IS Codex M1; in-flight registration IS Codex M5; mint-vs-QUEUED identity IS Codex M3; counter divergence IS part of Codex M3). Structure confirmed |
+| r60 | Claude SMR | in-conversation (claude-smr-plan-r60.md) | PLAN-READY-WITH-NITS (0 MAJOR, 2 MINOR — two-counter relationship IS part of Codex M3; in-flight retoken rule IS Codex M5). Structure confirmed |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 

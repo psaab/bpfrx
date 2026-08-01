@@ -1,10 +1,11 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v60 — r59 findings folded (Codex NEEDS-REVISION
-  5M/2m; AGY NEEDS-REVISION 1M — the QUEUED-overwrite, IS part
-  of Codex M4; Claude SMR PLAN-READY-WITH-NITS 0M/1m — the
-  additive-QUEUED pin, IS part of Codex M4; all three confirm
-  the §4.7 structure); pending convergence review r60
+- **Status**: DRAFT v61 — r60 findings folded (Codex NEEDS-REVISION
+  7M/4m; AGY NEEDS-REVISION 3M/1m; Claude SMR
+  PLAN-READY-WITH-NITS 0M/2m — the two-counter relationship IS
+  part of Codex M3, the in-flight retoken rule IS Codex M5;
+  all three confirm the §4.7 structure); pending convergence
+  review r61
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -2691,6 +2692,75 @@
   `daemon_apply_interfaces.go` + `daemon_ha_fabric.go` (Codex
   m1), and the acceptance post-reactivation predicate gains
   the no-pending + authority terms (Codex m2).
+  v61: r60 convergence — the actuated predicate becomes
+  multi-term with per-node reads, the callback gets the
+  teardown-serialized lease, the three identities and the
+  fieldwise merge are defined, the completion alias covers
+  carried-forward arms, and the debt ledger gets its own lock
+  (Codex NEEDS-REVISION 7M/4m, folds 1 FOLDED / 3 PARTIAL /
+  1 NOT-FOLDED, structure confirmed; AGY NEEDS-REVISION 3M/1m
+  — the actuated-state observability IS Codex M1, the
+  in-flight registration IS Codex M5, the mint-vs-QUEUED
+  identity IS Codex M3, the counter divergence IS part of
+  Codex M3; SMR PLAN-READY-WITH-NITS 0M/2m — the two-counter
+  relationship IS part of Codex M3, the in-flight retoken rule
+  IS Codex M5): (a) THE MULTI-TERM ACTUATED PREDICATE (Codex
+  M1 + AGY M1, verified: RG0 normally has NO VRRP instance,
+  `vrrp/manager.go:929-936`, `vrrp.go:128-142,170-173` —
+  "RG0 ACTIVE AND VRRP MASTER" is not generally observable;
+  and for a VRRP-backed RG the demotion resigns VRRP BEFORE
+  clearing rg_active, so a failed SetRGActive leaves the
+  loser ACTIVE+BACKUP while the winner is ACTIVE+MASTER):
+  the check is exactly one node with RG0 rg_active, exactly
+  one VRRP MASTER where a VRRP-backed RG applies, BOTH on the
+  intended node, and the loser EXPLICITLY INACTIVE — read
+  PER-NODE on each node's OWN status surface (the operator
+  already reads the peer via its localhost per the r42 fold).
+  (b) THE TEARDOWN-SERIALIZED CALLBACK LEASE (Codex M2,
+  verified: the netlink mutations are non-contextual calls and
+  a signal can arrive after any check, with shutdown
+  proceeding after its bounded drain,
+  `daemon_run_shutdown.go:50-64,214-230`): the callback is
+  included in the shutdown's JOIN SET — the teardown waits
+  for in-flight callbacks before the dataplane teardown; the
+  callback's body is bounded netlink work; the 5s bound
+  remains the safety net. (c) THE THREE IDENTITIES + THE
+  FIELDWISE MERGE (Codex M3 + AGY M3 + M4 + AGY m1 + SMR m1):
+  the ENQUEUE-RESERVATION SEQUENCE (monotonic, minted at
+  enqueue) tags the QUEUED publication; the ADMISSION ATTEMPT
+  TOKEN mints at admission and the queued entry MIGRATES to it
+  atomically; the seqlock version is a third counter (per
+  publication, both sides); and publications merge FIELDWISE
+  MONOTONIC — the failure count is a monotonic accumulator
+  every terminal failure increments regardless of generation,
+  while the per-attempt state fields are generation-guarded.
+  (d) THE COMPLETION ALIAS (Codex M5 + AGY M2 + SMR m2): a
+  carried-forward registration records the ALIAS
+  (old-token, arm-ID) → (new-token, arm-ID), and a completion
+  for the aliased old identity retires the carried
+  registration — an in-flight arm's completion is never lost
+  across a supersession. (e) THE DEBT-LEDGER LOCK (Codex M6,
+  verified the contradiction: serializing through `m.mu`
+  collides with the short-held rule — the status loop holds
+  `m.mu` across `requestLocked`, whose round trip can block
+  for 120s, `process_status.go:160-167`,
+  `process_control.go:52-56,129-142`): a SEPARATE short-held
+  debt-ledger lock serializes registration, completion, and
+  the mint-boundary supersession — never held across
+  control-socket IPC; the lock order is applySem → ledger
+  lock, with `m.mu` never nested with the ledger lock. (f)
+  THE TYPE+MODE CHECK (Codex M7): the desired link is
+  specifically IPVLAN_MODE_L2 (`daemon_ha_fabric.go:56-62`) —
+  a same-parent IPVLAN in L3/L3S mode has the right kind and
+  wrong semantics — so acceptance validates type AND mode and
+  REPLACES a mismatched link. (g) The minors: the
+  `pendingHAStateClear` retry debt joins the arm inventory
+  (Codex m1, `manager.go:227-236`, `manager_ha.go:98-151`);
+  §9's callback legs gain the early-fence, teardown-join, and
+  per-operation aggregation cases (Codex m2); the acceptance
+  residual reference aligns to the (vi) withdrawal (Codex m3);
+  and the §5.1 inventory gains `daemon_apply.go` for the
+  QUEUED wrappers (Codex m4).
 
 ---
 
@@ -5387,21 +5457,30 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   with EXACTLY ONE primary, matching the intended mastership
   (read on the cluster status surface) —
   before the repair is declared done — with the authority
-  check verifying the ACTUATED state, not merely the election
-  state (r59 Codex M1, verified: `runElection` publishes the
-  new state BEFORE the daemon consumes its event, the
-  userspace desired activity is cluster-primary OR
-  VRRP-master, so a demoted election state can retain
-  rg_active while VRRP is still MASTER, and a SetRGActive
-  failure leaves that live until a later retry,
-  `election.go:337-395`, `rg_state.go:250-263`,
-  `daemon_ha.go:340-371,809-848`; and the status combines
-  local and cached-peer snapshots from different instants,
-  `status.go:12-25`, `heartbeat_manager.go:306-355`): the
-  check requires exactly one node with RG0 ACTIVE AND VRRP
-  MASTER (the actuated state) — not merely the election
-  state — and the term joins the final post-reactivation
-  predicate as well; and ONLY THEN the
+  check verifying the ACTUATED state as a MULTI-TERM
+  predicate, not merely the election state (r59 Codex M1 +
+  r60 Codex M1 + r60 AGY M1, all verified: `runElection`
+  publishes the new state BEFORE the daemon consumes its
+  event, and a demoted election state can retain rg_active
+  while VRRP is still MASTER, `election.go:337-395`,
+  `rg_state.go:250-263`, `daemon_ha.go:340-371,809-848`;
+  RG0 normally has NO VRRP instance, `vrrp/manager.go:929-936`,
+  `vrrp.go:128-142,170-173`, so "RG0 ACTIVE AND VRRP MASTER"
+  is not generally observable; and for a VRRP-backed RG the
+  demotion resigns VRRP BEFORE clearing rg_active, so a failed
+  SetRGActive leaves the loser ACTIVE+BACKUP while the winner
+  is ACTIVE+MASTER — an "exactly one ACTIVE AND MASTER"
+  conjunction can hold despite dual rg_active for arbitrarily
+  many failed retries; and the peer's actuated state is not
+  on the shared status surface, `status.go:12-25`,
+  `heartbeat_manager.go:306-355`, `heartbeat.go:636-641`):
+  the check is the MULTI-TERM actuated predicate — exactly
+  one node with RG0 rg_active, exactly one VRRP MASTER where
+  a VRRP-backed RG applies, BOTH on the intended node, and
+  the loser EXPLICITLY INACTIVE — read PER-NODE on each
+  node's OWN status surface (the operator already reads the
+  peer via its localhost per the r42 fold), and the term
+  joins the final post-reactivation predicate as well; and ONLY THEN the
   operator RE-ACTIVATES `event-options` — ON BOTH NODES, each
   commit's own success required, EXACTLY mirroring the quiesce
   (r49 Codex M2, verified: with ConfigSync=false one commit
@@ -6448,7 +6527,12 @@ v20 history). The delivery is TWO units:
   asynchronous arm) — deferred-MAC, pending-XSK
   publication, XSK-liveness probe, link-cycle rebind
   (NotifyLinkCycle), the OnXSKBound goroutine, and
-  PrepareLinkCycle — carries the apply's ATTEMPT TOKEN with
+  PrepareLinkCycle — PLUS the `pendingHAStateClear` retry debt
+  (r60 Codex m1, verified it was missing: explicit asynchronous
+  retry debt, `manager.go:227-236`, `manager_ha.go:98-151`,
+  `process_status.go:200-207`; its originating apply fails
+  terminally, so it is registered as debt without being an
+  independent false-green path) — carries the apply's ATTEMPT TOKEN with
   EXACTLY-ONCE PER-ARM REGISTRATION (r54 Codex M5, verified:
   a token plus a scalar pending count is not a join — a
   duplicate completion for arm A decrements twice and falsely
@@ -6502,10 +6586,30 @@ v20 history). The delivery is TWO units:
   QUEUED state; multiple waiters need additive reservations;
   and a canceled acquisition returns directly,
   `daemon_apply_commit.go:172-175`, which could leave QUEUED
-  false-red indefinitely): (i) every publication is tagged
-  with its attempt generation and a lower-generation
-  publication NEVER overwrites a higher-generation state (A's
-  SUCCESS cannot erase B's QUEUED); (ii) the queued state is
+  false-red indefinitely), with the THREE IDENTITIES DEFINED
+  (r60 Codex M3 + r60 AGY M3, verified the impossibility:
+  the attempt token mints at admission while QUEUED publishes
+  before admission — an enqueued waiter lacks a minted
+  token): (a) the ENQUEUE-RESERVATION SEQUENCE — a monotonic
+  counter minted at ENQUEUE — tags the QUEUED publication;
+  (b) the ADMISSION ATTEMPT TOKEN mints at admission, and the
+  queued entry MIGRATES to it atomically at the
+  queued-to-running transition; (c) the seqlock version is a
+  THIRD counter, bumped per publication on both sides (the
+  read-side retry is on the version only — the three counters
+  serve enqueue ordering, attempt identity, and read
+  linearization respectively and never alias); and the
+  publication merge is FIELDWISE MONOTONIC (r60 Codex M4,
+  verified the whole-snapshot hazard: dropping a
+  lower-generation terminal FAILURE wholesale would lose the
+  failure-count increment, while applying it wholesale could
+  erase a higher-generation queued reservation): the failure
+  count is a monotonic accumulator that EVERY terminal failure
+  increments regardless of generation, while the per-attempt
+  state fields are generation-guarded — (i) every publication is tagged
+  with its attempt identity and a lower-identity
+  publication NEVER overwrites a higher-identity per-attempt
+  state (A's SUCCESS cannot erase B's QUEUED); (ii) the queued state is
   a per-attempt SET, not a scalar; (iii) a canceled
   acquisition retires its queued entry (no indefinite
   false-red); (iv) the queued-to-running transition is atomic
@@ -6567,14 +6671,33 @@ v20 history). The delivery is TWO units:
   ignored, leaving work live with the predicate green,
   `process_status.go:150-198`, `maps_sync.go:451-456`):
   registration, completion, AND the mint-boundary
-  supersession ALL serialize through the manager's `m.mu`, so
+  supersession ALL serialize through a SEPARATE SHORT-HELD
+  DEBT-LEDGER LOCK (r60 Codex M6, verified the contradiction:
+  serializing through `m.mu` collides with the short-held
+  ledger rule — the status loop holds `m.mu` across
+  `requestLocked`, whose round trip can block for 120s,
+  `process_status.go:160-167`,
+  `process_control.go:52-56,129-142`): the debt-ledger lock is
+  never held across control-socket IPC (the status loop takes
+  it briefly for debt mutations only), and the lock order is
+  applySem → ledger lock, with `m.mu` never nested with the
+  ledger lock, so
   no registration can interleave between the debt snapshot
   and the supersession — the transaction is part of the plan,
   and the re-registration is TOTAL — every live manager debt
   re-registers under the new token, so residual (vi) is
   WITHDRAWN (r59 Codex M5: an omitted arm's ignored completion
   was a possible false green; with total re-registration no
-  live arm is ever omitted); the signal reads CONVERGED
+  live arm is ever omitted) — with the COMPLETION ALIAS
+  (r60 Codex M5 = r60 AGY M2 = r60 SMR m2, verified: a
+  carried-forward registration under token B while the
+  in-flight arm completes with its captured token A would
+  ignore the completion and pend B forever): a carried-forward
+  registration records the ALIAS (old-token, arm-ID) →
+  (new-token, arm-ID), and a completion for the aliased old
+  identity retires the carried registration — so an in-flight
+  arm's completion is never lost across a supersession;
+  the signal reads CONVERGED
   only when the pipeline AND every arm's completion carry the
   CURRENT attempt token; and the state machine distinguishes
   CONVERGED / PENDING / FAILED — a PENDING arm does NOT
@@ -6736,6 +6859,10 @@ v20 history). The delivery is TWO units:
   canonical accessor in pkg/configstore, the injection in
   pkg/daemon, and pkg/grpcapi/pkg/cli stay CODE-untouched as
   relays (`server_show_cluster_text.go:66-74`).
+- `pkg/daemon/daemon_apply.go` (r60 Codex m4's inventory
+  completion): the QUEUED publication and the admission
+  transition live in the direct semaphore-entry wrappers
+  (`daemon_apply.go:49-86`).
 - `pkg/daemon/daemon_apply_interfaces.go` +
   `pkg/daemon/daemon_ha_fabric.go` (r59 Codex m1's inventory
   completion — the callback work necessarily modifies both):
@@ -6784,6 +6911,16 @@ v20 history). The delivery is TWO units:
   publishes `stopping`, and the drain proceeds after its
   five-second timeout, `daemon_run_shutdown.go:50-64,214-230`)
   — AFTER acquiring applySem AND again BEFORE each mutation,
+  with the callback TEARDOWN-SERIALIZED (r60 Codex M2,
+  verified: the netlink mutations are non-contextual calls,
+  `daemon_ha_fabric.go:29-93,102-148`, and a signal can arrive
+  after any check, with shutdown proceeding after its bounded
+  drain, `daemon_run_shutdown.go:50-64,214-230` — repeated
+  atomic loads cannot establish never-mutating): the callback
+  is included in the shutdown's JOIN SET (the teardown waits
+  for in-flight callbacks before the dataplane teardown; the
+  callback's body is bounded netlink work, and the 5s bound
+  remains the safety net),
   never mutating live state during teardown; (b) the callback's
   outcome reporting is DEEP (r59 Codex M2b, verified:
   `ensureFabricIPVLAN` ignores parent-up errors, logs
@@ -6795,7 +6932,12 @@ v20 history). The delivery is TWO units:
   aggregated (`errors.Join` over the parent-up, the link
   creation, the address reconciliation, and the MTU/up
   operations), the existing-link acceptance gains the KIND
-  check, and the callback retires the arm FAILED on any
+  **and MODE** check (r60 Codex M7, verified: the desired link
+  is specifically IPVLAN_MODE_L2, `daemon_ha_fabric.go:56-62`
+  — a same-parent IPVLAN in L3/L3S mode has the right kind
+  and wrong forwarding semantics): a type-or-mode-mismatched
+  existing link is REPLACED, and the callback retires the arm
+  FAILED on any
   aggregated failure — never converged on a partial or
   wrong-kind reconciliation).
   The counter is
@@ -8141,8 +8283,9 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      `daemon_ha.go:273-325`, `daemon_ha_sync.go:545-548`) —
      before the repair is declared
      done; and the residual enumeration includes the r58
-     hybrid residuals (iv)-(vi) per the normative fence
-     section (r58 SMR m1's copy alignment); and ONLY THEN the operator RE-ACTIVATES
+     hybrid residuals (iv)-(v) per the normative fence
+     section — residual (vi) was WITHDRAWN in v60 (the
+     re-registration is total), r60 Codex m3's alignment — and ONLY THEN the operator RE-ACTIVATES
      `event-options` — ON BOTH NODES, each commit's own success
      required, EXACTLY mirroring the quiesce (r49 Codex M2:
      with ConfigSync=false one commit cannot update the peer,
@@ -8259,9 +8402,14 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      session-clear failure never reads green) and the
      STALE-CALLBACK legs (a stale OnXSKBound closure takes
      applySem, re-derives from the current config, and
-     abandons on mismatch AND on the `stopping` fence — never
-     mutating during teardown — and a fire-time
-     creation/reconciliation failure retires the arm FAILED);
+     abandons on mismatch AND on the FULL fence — `runCtx.Err()`
+     OR `stopping`, including the early signal-driven window —
+     with the teardown JOIN (a teardown beginning between the
+     guard and a mutation is covered by the shutdown's join
+     set), and a fire-time operation-by-operation aggregated
+     failure (parent-up, creation, address reconciliation,
+     MTU/up, and the type+mode mismatch) retires the arm
+     FAILED — r60 Codex m2's leg completion);
      (h2j) the v56-MECHANISM legs (r56 Codex M8): the OLD/NEW
      OnXSKBound CALLBACK INTERLEAVE (the manager's atomic
      install/register/already-bound operation can neither
