@@ -1,9 +1,8 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v44 — r43 findings folded (Codex NEEDS-REVISION
-  3M/2m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m —
-  its witness-surface pin is folded here; all three confirm the
-  §4.7 structure); pending convergence review r44
+- **Status**: DRAFT v45 — r44 findings folded (Codex NEEDS-REVISION
+  5M/2m; AGY PLAN-READY; Claude SMR PLAN-READY; all three
+  confirm the §4.7 structure); pending convergence review r45
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -1755,6 +1754,72 @@
   stale-skip, nil-handler-skip, callback failure, panic unwind,
   partial-frame exit, pre-install dispatch, superseded-reader
   dispatch, teardown-with-buffered.
+  v45: r44 convergence — the reservation is gated on session
+  liveness, the instantaneous-join claim is withdrawn in favor
+  of the composition, the disabled-sync subclass is named, the
+  durability sync pins every affected node, and the done
+  predicate is the full aggregate (Codex NEEDS-REVISION 5M/2m,
+  folds 1 FOLDED / 4 PARTIAL / 1 NOT-FOLDED, structure
+  confirmed; AGY PLAN-READY 5/5 with 1 fresh attack FAILED,
+  structure confirmed; SMR PLAN-READY 0 findings with 5
+  documented fresh attacks FAILED): (a) SESSION-LIVENESS GATE
+  (Codex M1, verified: Stop can return with readers alive past
+  the 5s cap, `sync_conn.go:349-385`, after the consumer
+  selected ctx.Done, `sync_conn_config.go:325-330` — a
+  surviving reader could reserve+send into the still-open queue
+  after its one-shot drain with no consumer left to retire it):
+  a session-dead flag is published at Stop START (before the
+  drain); a dispatch that observes it takes the DROP path — no
+  reservation, an alarm, re-convergence on the next push; §9
+  gains the enqueue-after-teardown seam leg. (b) THE
+  INSTANTANEOUS-JOIN CLAIM IS WITHDRAWN (Codex M2, verified all
+  three verified-undispatched windows: a reader paused between
+  verification and `handleMessage`, `sync_conn_read.go:84-93`;
+  a legacy peer's first frame in the handshake's `pendingFrame`,
+  `sync_auth.go:352-369`; a WRITER-side failure publishing Down
+  while that conn's reader remains runnable,
+  `sync_conn_config.go:234-248` + `sync_conn.go:480-497`):
+  witness-Down + counter==0 at the (2c) instant can precede a
+  late dispatch; the fence's safety is the COMPOSITION — (2c)
+  drains, (3) RE-READS the counter (a pre-(3) dispatch is
+  caught by (3)'s counter term), and a post-(3) dispatch is
+  residual (iii)'s admitted local window. (c) THE DISABLED-SYNC
+  SUBCLASS IS NAMED (Codex M3, verified: `ConfigSync` defaults
+  false unless `configuration-synchronize` exists,
+  `compiler_system.go:1872-1874`, `types_chassis.go:113`; the
+  reconciler also skips on the sync-disabled gate,
+  `daemon_ha_sync.go:461-465`): a preempting peer whose older
+  loaded config has ConfigSync=false leaves NEITHER side
+  pushing — the divergence does NOT self-heal; the
+  intended-config comparison DETECTS it and the runbook pins
+  the MANUAL re-convergence action. (d) THE DURABILITY SYNC
+  PINS EVERY AFFECTED NODE (Codex M4, verified: the barrier is
+  the resolved target's parent-directory fsync,
+  `fsatomic.go:354-366`, and residual (iii)'s post-rename
+  failure can belong to the PEER's filesystem; the peer can
+  otherwise restart, load the visible content, and have
+  equality suppress the rewrite, `daemon_apply.go:49-70`,
+  `daemon_ha_sync.go:550-568`): a successful directory `sync`
+  of the configdb parent on BOTH nodes before EITHER restart.
+  (e) THE DONE PREDICATE IS THE FULL AGGREGATE (Codex M5,
+  verified: a restart-time push can promote+apply the intended
+  config while its disk write fails,
+  `store.go:687-689,738-769`, leaving the aggregate true while
+  the parts pass, `store_persist.go:342-352`):
+  `ConfigPersistDegraded() == false` — over
+  ActivePersistDegraded, the mask, ConfirmRecordState, and
+  ConfigWriteUnverified — on BOTH nodes. (f) The intended-config
+  capture is an OFF-NODE canonical digest taken BEFORE the
+  fence (Codex m1, verified the show/export/compare surfaces
+  redact secrets, `grpcapi/server_config.go:347-356`,
+  `api/config.go:304-312` — a secret-only regression would
+  compare equal on them). (g) The direct-injection tests are
+  migrated (Codex m2, verified:
+  `sync_config_gen_test.go:226-237,256-267`,
+  `sync_config_epoch_sweep_race_6284_test.go:104-108` enqueue
+  unreserved items that would underflow the unconditional
+  dequeue defer) — each routed through dispatch or given an
+  explicit reservation.
 
 ---
 
@@ -3850,7 +3915,34 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   abandonment path, `sync_conn_config.go:325-330`, and
   `SessionSync.Stop`, `sync_conn.go:349-385` — on Stop the
   queue is drained-and-retired so no token leaks across a
-  provider replacement). Because the reservation lives in the
+  provider replacement), AND the reservation itself is GATED ON
+  SESSION LIVENESS (r44 Codex M1, verified: Stop can return
+  with readers still alive past the 5s cap —
+  `sync_conn.go:349-385` — after the consumer has selected
+  ctx.Done, `sync_conn_config.go:325-330`; a surviving reader
+  could then reserve+send into the still-open queue AFTER its
+  one-shot drain, and no consumer remains to retire it): a
+  session-dead flag is published at Stop START (before the
+  drain), and a dispatch that observes it takes the DROP path —
+  NO reservation, an alarm, re-convergence on the peer's next
+  push after comms restart — so no token can be created on a
+  dead session. The witness+counter observation is NOT claimed
+  as an INSTANTANEOUS join (r44 Codex M2, verified): a
+  complete, verified, not-yet-dispatched frame can exist
+  outside both — a reader paused between verification and
+  `handleMessage` (`sync_conn_read.go:84-93`), a legacy/unkeyed
+  peer's first frame sitting in the handshake's `pendingFrame`
+  (`sync_auth.go:352-369`, processed at `sync_conn.go:122-127`),
+  or a WRITER-side failure publishing Down via `handleDisconnect`
+  while that conn's reader remains runnable
+  (`sync_conn_config.go:234-248`, `sync_conn.go:480-497`) — so
+  witness-Down + counter==0 at the (2c) instant can precede a
+  late dispatch; the fence's safety is the COMPOSITION, not the
+  instant: (2c) drains, (3) RE-READS the counter (a dispatch
+  landing before (3) is caught by (3)'s
+  `ConfigSyncOutstanding == 0` term), and a dispatch landing
+  after (3) is residual (iii)'s admitted local window.
+  Because the reservation lives in the
   DISPATCH path (the `syncMsgConfig` case), the counter is the
   ALL-INGRESS JOIN (r43 Codex M2, verified the three non-registered
   reader classes): a legacy/unkeyed peer's first frame is
@@ -3963,15 +4055,37 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   re-drive skips until peer-connected AND RG0-authority AND
   30s-stable (`daemon_ha_sync.go:447-465`), and the stale peer
   can preempt under its old priorities
-  (`cluster/election.go:172-193`) — so the cluster converges to
-  the RG0 AUTHORITY's config, which MAY be the peer's older
+  (`cluster/election.go:172-193`) — so WHEN the authority's
+  loaded config has config-sync enabled the cluster converges
+  to the RG0 AUTHORITY's config, which MAY be the peer's older
   persisted one: a bounded REGRESSION to a persisted state,
-  never a silent divergence. The operational closure is PINNED
+  never a silent divergence; and the DISABLED-SYNC SUBCLASS is
+  named (r44 Codex M3, verified: `ConfigSync` defaults false
+  unless `configuration-synchronize` exists,
+  `compiler_system.go:1872-1874`, `types_chassis.go:113`, and
+  the reconciler skips on the sync-disabled gate too,
+  `daemon_ha_sync.go:461-465`): if the peer's OLDER loaded
+  config has ConfigSync=false and it preempts, the newer node
+  fails the AUTHORITY gate while the peer-authority fails the
+  SYNC-ENABLED gate — NEITHER side pushes and the divergence
+  does NOT self-heal; the post-restart intended-config
+  comparison below DETECTS it (the two nodes hold different
+  configs, and only one matches the operator's intent), and the
+  runbook pins the MANUAL re-convergence action (the operator
+  re-drives the intended config onto the authority — a
+  re-commit / manual sync from the node holding the intended
+  config — and re-verifies). The operational closure is PINNED
   in the runbook, no new machinery: (α) the stopped-filesystem
-  repair step ends with a directory `sync` of the configdb (the
-  repair already operates on the filesystem with both daemons
-  stopped — the sync bounds the post-rename durability-unknown
-  subclass before any restart), and (β) a POST-RESTART
+  repair step ends with a successful directory `sync` of the
+  configdb's PARENT directory on EVERY AFFECTED NODE — BOTH
+  nodes, because residual (iii)'s post-rename durability
+  failure can belong to the PEER's filesystem (the barrier is
+  the resolved target's parent-directory fsync,
+  `fsatomic.go:354-366`; the peer can otherwise restart, load
+  the visible content, mark it applied, and have equality
+  suppress any rewrite, `daemon_apply.go:49-70`,
+  `daemon_ha_sync.go:550-568`) — before EITHER restart (r44
+  Codex M4); and (β) a POST-RESTART
   VERIFICATION step: after the local-then-peer restart, the
   operator verifies BOTH nodes hold the same intended config —
   compared against the OPERATOR'S intended config (the
@@ -3979,11 +4093,24 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   merely cross-node agreement: if the peer preempted and pushed
   its older persisted config, cross-node agreement alone would
   pass on the OLDER config while the operator's intended newer
-  one is silently gone —
-  (the cluster status config-sync section + a config compare)
-  AND `ConfigWriteUnverified == false` AND
-  `ConfirmDebtKindMask == 0` on both nodes before the repair is
-  declared done. The same shape covers a push landing on the
+  one is silently gone — and the comparison surface is pinned
+  (r44 Codex m1): an OFF-NODE canonical digest of the intended
+  config is captured BEFORE the fence (the configstore's
+  canonical-hash machinery), because the show/export/compare
+  surfaces REDACT secrets (`grpcapi/server_config.go:347-356`,
+  `api/config.go:304-312`) and a secret-only regression would
+  compare equal on them; AND the FULL derived persist-health
+  state is clean on BOTH nodes — `ConfigPersistDegraded() ==
+  false`, the AGGREGATE over ActivePersistDegraded, the confirm
+  debt mask, ConfirmRecordState, and ConfigWriteUnverified
+  (the x14 state model, :4175-4192 — r44 Codex M5: a
+  restart-time push can promote+apply the intended config while
+  its disk write fails, `store.go:687-689,738-769`, so the
+  config comparison and the individual fields can pass while
+  the aggregate is still true, `store_persist.go:342-352`) —
+  with the disabled-sync subclass's MANUAL re-convergence
+  performed first where it fired —
+  before the repair is declared done. The same shape covers a push landing on the
   LOCAL node between the re-check (3) and the local stop (4) —
   from any ingress source, including a stale peer process or,
   in unkeyed deployments, a third party (dual-accepted
@@ -4916,7 +5043,13 @@ v20 history). The delivery is TWO units:
   and panic unwind — after the apply returns, including the
   applySem-blocked duration, `daemon_apply_commit.go:326-335`),
   and session TEARDOWN retires every still-buffered token
-  (`sync_conn_config.go:325-330`, `sync_conn.go:349-385`).
+  (`sync_conn_config.go:325-330`, `sync_conn.go:349-385`), and
+  the reservation is GATED ON SESSION LIVENESS (r44 Codex M1):
+  a session-dead flag is published at Stop START (before the
+  drain); a dispatch that observes it takes the DROP path — no
+  reservation, an alarm, re-convergence on the peer's next
+  push — so a reader surviving past Stop's 5s cap cannot create
+  an unretirable token on the dead session.
   Because the reservation lives in the DISPATCH path, the
   counter is the ALL-INGRESS JOIN (r43 Codex M2): pre-install
   pending frames (`sync_conn.go:122-127`), superseded readers
@@ -4925,7 +5058,14 @@ v20 history). The delivery is TWO units:
   `handleMessage` switch and reserve identically; unkeyed
   third-party ingress (`sync_admission.go:58-83`,
   `sync_auth.go:321-334`) is equally counted — observed, never
-  invisible. The counter is
+  invisible. The EXISTING direct-injection tests are migrated
+  (r44 Codex m2, verified:
+  `sync_config_gen_test.go:226-237,256-267` and
+  `sync_config_epoch_sweep_race_6284_test.go:104-108` enqueue
+  unreserved `configApplyItem` values directly — under the
+  unconditional dequeue defer they would UNDERFLOW the
+  counter): each is routed through the dispatch path or its
+  injected items carry an explicit reservation. The counter is
   independent of generation numbers and epoch resets
   (`sync_conn_gen.go:340-362`); exposed read-only on the cluster
   status surface (gRPC/CLI) on BOTH
@@ -6038,14 +6178,31 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      convergence is AUTHORITY-CONDITIONAL (the re-drive skips
      until peer-connected + RG0-authority + 30s-stable,
      `daemon_ha_sync.go:447-465`; the stale peer can preempt,
-     `cluster/election.go:172-193`) — bounded by the repair
-     step's directory `sync` of the configdb and the
+     `cluster/election.go:172-193`; and the DISABLED-SYNC
+     subclass does not self-heal — `ConfigSync` defaults false,
+     `compiler_system.go:1872-1874`, `types_chassis.go:113`; a
+     preempting peer whose older config has ConfigSync=false
+     leaves NEITHER side pushing, `daemon_ha_sync.go:461-465` —
+     detected by the intended-config comparison and closed by
+     the pinned MANUAL re-convergence) — bounded by the repair
+     step's successful directory `sync` of the configdb PARENT
+     directory on EVERY AFFECTED NODE — BOTH nodes; the
+     post-rename failure can belong to the peer's filesystem,
+     `fsatomic.go:354-366` — before either restart, and the
      POST-RESTART VERIFICATION step (both nodes hold the same
      intended config — compared against the OPERATOR'S intended
-     config, not merely cross-node agreement, which a
+     config captured as an OFF-NODE canonical digest BEFORE the
+     fence, since the show/export surfaces redact secrets,
+     `grpcapi/server_config.go:347-356`, `api/config.go:304-312`;
+     not merely cross-node agreement, which a
      preempting peer's older pushed config would falsely
-     satisfy — AND `ConfigWriteUnverified == false` AND
-     `ConfirmDebtKindMask == 0` before the repair is declared
+     satisfy — AND the FULL derived persist-health state
+     `ConfigPersistDegraded() == false` on BOTH nodes — the
+     aggregate over ActivePersistDegraded, the mask,
+     ConfirmRecordState, and ConfigWriteUnverified, since a
+     restart-time push can promote+apply while its disk write
+     fails, `store.go:687-689,738-769`,
+     `store_persist.go:342-352` — before the repair is declared
      done),
      and every
      content-INDEPENDENT repair write
@@ -6091,7 +6248,11 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      completes but before the producer's continuation asserts
      the reservation is ALREADY visible (the consumer can
      dequeue at the seam; the counter never reads a false
-     zero);
+     zero); (g) the ENQUEUE-AFTER-TEARDOWN leg (r44 Codex M1) —
+     a reader kept alive past Stop's 5s cap dispatches after
+     the consumer has exited: the session-dead gate forces the
+     DROP path (no reservation), and the counter stays
+     balanced at zero across the teardown;
      the OBSERVABILITY leg
      (r32 Codex M1b) — `ConfigWriteUnverified` renders in /health
      and folds into the aggregate OR, and the retry loop ACTIVELY

@@ -134,6 +134,9 @@ reviewer (joins at /engineer on the code PR).
 | r43 | Codex | codex companion task-ms9uv83j-reux8h (session 019fbb86-1e39-7a02-96de-c35e6186d54c) | NEEDS-REVISION (3 MAJOR, 2 MINOR; folds 1 FOLDED / 4 PARTIAL). Structure confirmed |
 | r43 | AGY | agy print-mode direct (agy-plan-r43.md) | PLAN-READY (5/5 folds FOLDED; 2 fresh attacks FAILED; no findings). Structure confirmed |
 | r43 | Claude SMR | in-conversation (claude-smr-plan-r43.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — EOF-witness surface pin). Structure confirmed |
+| r44 | Codex | codex companion task-ms9vtbvj-nwpk0v (session 019fbb9e-66dd-7490-a468-2882801bfb62) | NEEDS-REVISION (5 MAJOR, 2 MINOR; folds 1 FOLDED / 4 PARTIAL / 1 NOT-FOLDED). Structure confirmed |
+| r44 | AGY | agy print-mode direct (agy-plan-r44.md) | PLAN-READY (5/5 folds FOLDED; 1 fresh attack FAILED; no findings). Structure confirmed |
+| r44 | Claude SMR | in-conversation (claude-smr-plan-r44.md) | PLAN-READY (0 findings; 5 documented fresh attacks FAILED). Structure confirmed |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 
