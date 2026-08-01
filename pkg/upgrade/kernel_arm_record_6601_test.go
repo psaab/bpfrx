@@ -209,6 +209,74 @@ func TestPromoteScriptArmRecordPathMatchesGo(t *testing.T) {
 	}
 }
 
+var (
+	kernelJournalPathRE = regexp.MustCompile(`(?m)^KERNEL_JOURNAL="([^"]+)"`)
+	journalArmedStateRE = regexp.MustCompile(`(?m)^JOURNAL_ARMED_STATE="([^"]+)"`)
+	promoteUnitRE       = regexp.MustCompile(`(?m)^PROMOTE_UNIT="([^"]+)"`)
+)
+
+// TestPromoteScriptJournalMatchesGo is the CROSS-LANGUAGE canary for the r7
+// divergent-state check. When the arm record is absent the boot gate consults
+// the journal for ONE BIT — is a candidate ARMED — so that a record which
+// desynced out of band produces a loud refusal instead of a benign "nothing to
+// promote". Both the journal's location and the state token it looks for are
+// hardcoded in POSIX sh; if either drifts from Go, the check silently never
+// fires and the silent skip is back.
+func TestPromoteScriptJournalMatchesGo(t *testing.T) {
+	data, err := os.ReadFile(promoteScriptPath(t))
+	if err != nil {
+		t.Fatalf("read promote script: %v", err)
+	}
+
+	m := kernelJournalPathRE.FindSubmatch(data)
+	if m == nil {
+		t.Fatal("no `KERNEL_JOURNAL=\"...\"` assignment in the promote script; " +
+			"the gate can no longer tell an armed-without-record box from an " +
+			"ordinary boot")
+	}
+	if got, want := string(m[1]), DefaultKernelJournalPath; got != want {
+		t.Errorf("promote script reads the kernel journal from %q but Go writes it "+
+			"to %q; an ARMED candidate whose record went missing would be reported "+
+			"as 'nothing to promote'", got, want)
+	}
+
+	m = journalArmedStateRE.FindSubmatch(data)
+	if m == nil {
+		t.Fatal("no `JOURNAL_ARMED_STATE=\"...\"` assignment in the promote script")
+	}
+	got := string(m[1])
+	if want := string(KernelStateArmed); got != want {
+		t.Errorf("promote script looks for journal state %q but Go writes %q", got, want)
+	}
+	// ARMING is PREPARED INTENT recorded before the firmware one-shot is read
+	// back — not a trial in flight. upgrade.IsArmed draws exactly this line, and
+	// matching it here would put a loud refusal on every boot of a box whose arm
+	// was interrupted.
+	if got == string(KernelStateArming) {
+		t.Errorf("promote script treats %q as a trial in flight; only the verified "+
+			"%q state is one (see IsArmed)", KernelStateArming, KernelStateArmed)
+	}
+}
+
+// TestPromoteScriptUnitMatchesDefaultUnit pins the unit the gate CROSS-CHECKS
+// the record against. Since r6 this unit is no longer the authority, so drift
+// no longer selects a wrong binary — it silently retires the cross-check (a
+// unit that never resolves can never contradict a stale record) or, worse,
+// contradicts a good record and refuses every promotion.
+func TestPromoteScriptUnitMatchesDefaultUnit(t *testing.T) {
+	data, err := os.ReadFile(promoteScriptPath(t))
+	if err != nil {
+		t.Fatalf("read promote script: %v", err)
+	}
+	m := promoteUnitRE.FindSubmatch(data)
+	if m == nil {
+		t.Fatal("no `PROMOTE_UNIT=\"...\"` assignment in the promote script")
+	}
+	if got, want := string(m[1]), DefaultUnit+".service"; got != want {
+		t.Errorf("promote script cross-checks against %q but the default unit is %q", got, want)
+	}
+}
+
 // TestPromoteScriptSelectsFromTheRecordNotInference guards the design itself:
 // the record must be consulted, and the inference helpers must not be able to
 // select a binary on their own. `try_candidate` may still run — it feeds the

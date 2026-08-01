@@ -62821,3 +62821,46 @@ break — `go vet` confirmed passing under every revert.
     pkg/upgrade/{kernel_promote_unit.go,kernel_promote_unit_6601_test.go,
     system_linux.go}, cmd/xpfd/upgrade_kernel.go, docs/in-place-upgrade.md,
     _Log.md
+
+- **Timestamp**: 2026-07-31
+- **Action**: #6601 r7 — migrate the boot-gate self-test suite onto the arm-record
+  design, and stop laundering ARMED-without-record as a benign skip.
+  The r6 commit made the arm record the gate's authority and left the shell half
+  unfinished: 11 assertions in `test_kernel_promote_explicit_path.py` construct
+  the retired ambient-inference world. A probe of the whole suite found the
+  damage was larger than the failures — 22 of 32 behavioural runs short-circuited
+  at the new "nothing to promote" early exit, so ELEVEN MORE tests were passing
+  VACUOUSLY without reaching the code they name. `_assert_refused` had been
+  loosened to accept either "REFUSING" or "nothing to promote", which is what hid
+  them. It now requires the SPECIFIC outcome (`_assert_refused` vs
+  `_assert_nothing_armed`), so a vacuous pass is impossible to write.
+  TRIAGE. Bucket (A) obsolete-by-design: NONE. The team lead's three suggested
+  (A)s are all still live code — `unit_main_pid_exe`, `unit_exec_start` and the
+  cgroup matcher now feed the CROSS-CHECK, so deleting their tests would retire
+  the only coverage of a live refusal trigger. Bucket (B), re-expressed: all of
+  them. The invariants survive with an INVERTED consequence — a bad answer from a
+  unit hop no longer hands an impostor the promote decision, it fabricates a
+  disagreement and vetoes a healthy promotion — so each test now arms a good
+  record, feeds the hop something it must not believe, and asserts the gate still
+  PROMOTES. Bucket (C) busybox whitespace: ExecStart is still parsed (it feeds
+  the cross-check), so the `[[:space:]]` rejection still has to hold; the fixture
+  names a REAL executable so tolerating it would contradict the record.
+  ARMED-WITHOUT-RECORD. Answered YES: the gate now consults the journal when the
+  record is absent and refuses LOUDLY on ARMED. "Record absent means nothing is
+  armed" is an inference from the absence of a file, and Go derives the record's
+  location from the journal path while the shell hardcodes the default — so
+  `arm --journal <elsewhere>` alone desyncs them. A BOOLEAN only, never a path:
+  reading `promote_binary` out of JSON in sh is the delimiter class the sidecar
+  exists to avoid. `ARMED` specifically, not `ARMING` (matches `IsArmed`).
+  MINOR-3. Every systemd answer is now read ONCE into a discovery snapshot before
+  anything is decided; the hops and the refusal both consume it, and
+  `unit_facts`/`set_cause_advice` cannot query systemd at all.
+  Validation: 60/60 python (was 42 — 18 net new), `make selftest` 48/0/0,
+  go build + vet + `go test ./pkg/upgrade ./cmd/xpfd` green, sh -n + dash -n +
+  busybox sh -n + shellcheck clean. THREE mutation proofs, each verified
+  build/syntax/lint-CLEAN so the red is an assertion and not a false red:
+  drop the record admission check -> 12 assertion reds; drop the record-vs-unit
+  disagreement refusal -> 2 reds + the Go canary; make ARMED-without-record skip
+  silently -> 4 reds. Negative control: the ordinary armed boot still promotes.
+- **File(s)**: scripts/image/{xpf-kernel-promote,test_kernel_promote_explicit_path.py},
+    pkg/upgrade/kernel_arm_record_6601_test.go, docs/in-place-upgrade.md, _Log.md

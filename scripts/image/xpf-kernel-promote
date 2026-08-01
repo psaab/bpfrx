@@ -26,29 +26,53 @@
 set -u
 log() { echo "xpf-kernel-promote: $*" >&2; }
 
-# PROMOTE_UNIT is the systemd unit this gate derives the live xpfd from. It is
-# PINNED to the default, not inferred, and that pinning is enforced at BOTH
-# ends (#6601 r5):
+# ---------------------------------------------------------------- authority
 #
-#   * Here, because inferring "which unit is the xpf one" is exactly the class
-#     of guess this gate exists to eliminate. Scanning for
-#     <something>.service.d/10-xpf-version.conf would resolve a leftover from a
-#     renamed/removed unit just as readily as the live one -- the same
-#     indistinguishable-leftover problem that removed the filesystem fallbacks.
-#     There is no authoritative record to read instead: flip writes its drop-in
-#     UNDER <unit>.service.d/ without recording the unit name anywhere.
+# THE ARM RECORD IS THE AUTHORITY (#6601 r6). The gate READS which xpfd must
+# verify this candidate; nothing here infers one.
 #
-#   * At ARM time, where `xpfd upgrade kernel arm` REFUSES when systemd
-#     definitively reports this unit absent (CheckKernelPromotionUnit,
-#     pkg/upgrade). That is the honest place to fail: the operator sees it at
-#     their terminal instead of discovering at the next boot that an armed
-#     candidate went unverified.
+# Five earlier designs derived "which xpfd is live" from ambient state — $PATH,
+# compiled defaults, inode identity, a unit name, then that unit's LoadState —
+# and every one of them could be stale after a relocation or a unit switch. The
+# last broke concretely: a DISABLED unit still reports LoadState=loaded with
+# MainPID=0, so a leftover default unit whose drop-in still pointed at an older
+# version passed the arm-time check, and on the candidate boot its stale
+# ExecStart was accepted and the stale binary reported the gate clean.
 #
-# `xpfd upgrade cut --unit <name>` is a supported standalone selector, and on
-# such a box flip maintains <name>.service instead. The kernel channel does not
-# support that layout; it says so at arm time rather than guessing here. This
-# mirrors the #1983 precedent, where NewCLICluster refuses a non-default --unit
-# rather than drive control against the wrong daemon.
+# `xpfd upgrade kernel arm` does not have to infer any of this: it IS an xpfd,
+# so os.Executable() names the live binary by construction, and it writes that
+# path here as part of arming. That converts an unanswerable question ("which
+# xpfd is live?") into a recorded fact ("which xpfd armed this candidate?").
+#
+# The record is a ONE-LINE file on purpose: this gate is POSIX sh with no safe
+# JSON parser, so the path it execs must never come out of a JSON value. The
+# same value is stamped onto KernelJournal.PromoteBinary and the Go half
+# cross-checks the two, so a divergence is caught rather than trusted.
+ARM_RECORD="/var/lib/xpf/kernel-promote-binary"
+
+# The kernel-channel journal, consulted for ONE BIT and never for a path (see
+# ABSENT MEANS NOTHING IS ARMED, below): is a candidate ARMED right now?
+#
+# `ARMED` specifically — not ARMING. ARMING is prepared-intent recorded before
+# the firmware one-shot is read back; only the verified ARMED state is a trial
+# in flight, which is exactly the distinction `upgrade.IsArmed` draws. Both
+# constants are pinned against Go by drift canaries
+# (TestPromoteScriptJournalMatchesGo, pkg/upgrade).
+KERNEL_JOURNAL="/var/lib/xpf/kernel-upgrade.state"
+JOURNAL_ARMED_STATE="ARMED"
+
+# PROMOTE_UNIT is the systemd unit the record is CROSS-CHECKED against. It is no
+# longer where the binary comes from; it is a second opinion, and an absent
+# second opinion is not evidence against the record.
+#
+# It stays PINNED to the default rather than inferred because inferring "which
+# unit is the xpf one" would resolve a leftover from a renamed or removed unit
+# just as readily as the live one — the same indistinguishable-leftover problem
+# that removed the filesystem fallbacks. `xpfd upgrade cut --unit <name>` is a
+# supported standalone selector, and such a box is now SUPPORTED here rather
+# than refused at arm time: the record carries the authority, xpfd.service
+# simply resolves nothing to cross-check against, and the gate runs. (The r5
+# arm-time unit check went with the unit-derived authority it protected.)
 #
 # The name is kept in sync with upgrade.DefaultUnit by a drift canary
 # (TestPromoteScriptUnitMatchesDefaultUnit, pkg/upgrade).
@@ -63,15 +87,11 @@ PROMOTE_UNIT="xpfd.service"
 # `verify-dataplane` exec, is resolved explicitly by resolveVerifyGateBin in
 # pkg/upgrade/kernel_linux.go.)
 #
-# Every source below obeys one rule: UNAMBIGUOUS OR NOTHING. A source that
-# cannot prove WHICH executable it is naming stays silent, because here a wrong
-# answer is far worse than no answer -- it suppresses every remaining candidate
-# and that binary's exit 0 AUTHORIZES the promotion (#6601 r4).
+# CROSS-CHECK ORDER — the order in which the pinned unit's own answer is sought,
+# purely to CONTRADICT the record. It is not a selection order and there is no
+# fallback step: when none of it resolves, the record still stands.
 #
-# AUTHORITY ORDER -- and it is an AUTHORITY order, not a search path. Never
-# $PATH, and (see below) never an inference:
-#
-#   1. /proc/<MainPID>/exe for xpfd.service -- the KERNEL's answer for the
+#   1. /proc/<MainPID>/exe for xpfd.service — the KERNEL's answer for the
 #      binary the live daemon is ACTUALLY executing, reached through a
 #      structured integer property plus a kernel symlink. No rendered path text
 #      is parsed at all, so a runtime root containing a space or a ';' cannot be
@@ -81,19 +101,19 @@ PROMOTE_UNIT="xpfd.service"
 #   2. The ExecStart systemd has for xpfd.service. This is what the cut writes:
 #      flip step 6c templates ExecStart=<VersionsDir>/<ver>/xpfd into
 #      10-xpf-version.conf on every cut (pkg/upgrade/flip.go), and the shipped
-#      base unit carries ExecStart=/usr/local/sbin/xpfd before the first cut. So
-#      it names the live binary both pre- and post-cut, and it is a CONCRETE
-#      ABSOLUTE PATH that depends on no compiled-in root -- which matters
-#      because `--versions-dir` AND `--sbin-dir` are both real operator options
-#      (cmd/xpfd/upgrade.go) and the cut maintains whatever was configured.
+#      base unit carries ExecStart=/usr/local/sbin/xpfd before the first cut.
 #
-#   3. A LOUD REFUSAL.
+# Both hops obey one rule: UNAMBIGUOUS OR NOTHING. A source that cannot prove
+# WHICH executable it is naming stays silent. That rule mattered more when these
+# hops SELECTED the binary (a wrong answer authorized the promotion, #6601 r4);
+# it still matters, because a wrong answer here now manufactures a false
+# DISAGREEMENT and refuses a healthy promotion.
 #
-# THERE IS DELIBERATELY NO STEP 4 (#6601 r5). No compiled-in default paths, no
-# "whichever default is usable", no same-inode heuristic. Three earlier
-# revisions of this gate each closed one ambiguous filesystem case and left
-# another, because the question a defaults fallback is trying to answer --
-# WHICH of these files is the live xpfd -- is not answerable from the
+# THERE IS DELIBERATELY NO FILESYSTEM FALLBACK (#6601 r5). No compiled-in
+# default paths, no "whichever default is usable", no same-inode heuristic.
+# Three earlier revisions of this gate each closed one ambiguous filesystem case
+# and left another, because the question a defaults fallback is trying to answer
+# — WHICH of these files is the live xpfd — is not answerable from the
 # filesystem at all once an operator has relocated a root. `--sbin-dir` and
 # `--versions-dir` relocate INDEPENDENTLY, and neither relocation REMOVES what
 # it left behind, so a leftover is byte-for-byte indistinguishable from a
@@ -111,13 +131,6 @@ PROMOTE_UNIT="xpfd.service"
 #                          default" IS the stale leftover.
 #   NEITHER relocated    : healthy -- and systemd answers, so the fallback was
 #                          never needed here in the first place.
-#
-# Every branch a defaults fallback could take therefore has a relocation shape
-# that makes it wrong, and the wrongness is SILENT: a stale xpfd verifies the
-# CANDIDATE KERNEL against a dataplane build nobody chose, and its exit 0
-# authorizes the promotion. So the rule is enforced rather than merely stated:
-# no source here selects a binary from an inference that a leftover file can
-# satisfy.
 #
 # Refusing is not a lesser outcome, it is the correct one. The refusal takes
 # the same non-rebooting infra-error path as an rc=1 from the gate: the box
@@ -139,6 +152,119 @@ NL='
 '
 # systemd's REAL field delimiter after `path=` in the ExecStart rendering.
 ARGV_SEP=' ; argv[]='
+
+# ------------------------------------------------------- discovery snapshot
+#
+# Every systemd answer this gate decides on OR reports is read HERE, once,
+# before anything is decided (#6601 r7 MINOR-3).
+#
+# The previous revision suppressed each query's failure at the point of use
+# (`2>/dev/null || return 0`) and then RE-QUERIED systemctl to build the refusal
+# message. A query that failed during discovery and succeeded on the re-read was
+# therefore reported as "the unit IS known to systemd", and the operator was
+# advised to fix an ExecStart that had never been consulted — the message
+# described a system state the decision was never made on. Facts and advice now
+# come from this snapshot, so what is printed is what was decided on, by
+# construction rather than by care.
+#
+# The ONE deliberate exception is the MainPID RE-READ inside unit_main_pid_exe:
+# that read exists precisely to detect a pid that moved AFTER the snapshot, so
+# it must be fresh. It is a comparison against the snapshot, never a substitute
+# for it.
+SNAP_QUERY_FAILED=0
+
+if SNAP_LOADSTATE=$(systemctl show --property=LoadState --value "$PROMOTE_UNIT" 2>/dev/null); then
+    SNAP_LOADSTATE_SHOW="$SNAP_LOADSTATE"
+else
+    SNAP_LOADSTATE=""
+    SNAP_LOADSTATE_SHOW="<systemctl failed>"
+    SNAP_QUERY_FAILED=1
+fi
+
+if SNAP_MAINPID=$(systemctl show --property=MainPID --value "$PROMOTE_UNIT" 2>/dev/null); then
+    SNAP_MAINPID_SHOW="$SNAP_MAINPID"
+else
+    SNAP_MAINPID=""
+    SNAP_MAINPID_SHOW="<systemctl failed>"
+    SNAP_QUERY_FAILED=1
+fi
+
+if SNAP_CONTROLGROUP=$(systemctl show --property=ControlGroup --value "$PROMOTE_UNIT" 2>/dev/null); then
+    SNAP_CONTROLGROUP_SHOW="$SNAP_CONTROLGROUP"
+else
+    SNAP_CONTROLGROUP=""
+    SNAP_CONTROLGROUP_SHOW="<systemctl failed>"
+    SNAP_QUERY_FAILED=1
+fi
+
+if SNAP_EXECSTART=$(systemctl show --property=ExecStart --value "$PROMOTE_UNIT" 2>/dev/null); then
+    SNAP_EXECSTART_SHOW="$SNAP_EXECSTART"
+else
+    SNAP_EXECSTART=""
+    SNAP_EXECSTART_SHOW="<systemctl failed>"
+    SNAP_QUERY_FAILED=1
+fi
+
+# unit_facts renders the snapshot. The refusal is the ONLY operator-visible
+# signal this gate produces — it exits 0 deliberately, so `systemctl status
+# xpf-kernel-promote` reads SUCCESS — so policy prose without the values systemd
+# actually returned is not actionable (#6601 r5 MINOR-2).
+unit_facts() {
+    printf 'unit=%s LoadState=[%s] MainPID=[%s] ControlGroup=[%s] ExecStart=[%s]' \
+        "$PROMOTE_UNIT" "$SNAP_LOADSTATE_SHOW" "$SNAP_MAINPID_SHOW" \
+        "$SNAP_CONTROLGROUP_SHOW" "$SNAP_EXECSTART_SHOW"
+}
+
+# set_cause_advice sets CAUSE and ADVICE from the snapshot. The advice BRANCHES:
+# telling an operator to fix an ExecStart when systemctl could not be consulted
+# at all points at the wrong system (#6601 r5 MINOR-2), and telling them to fix
+# a unit this host deliberately does not use is no better.
+CAUSE=""
+ADVICE=""
+set_cause_advice() {
+    if [ "$SNAP_QUERY_FAILED" -ne 0 ]; then
+        CAUSE="systemctl could not be consulted at all (missing, errored, or it"
+        CAUSE="$CAUSE returned nothing), so NOTHING is known about $PROMOTE_UNIT"
+        CAUSE="$CAUSE on this box and the record has no second opinion"
+        ADVICE="Check that systemd is running and systemctl works in this boot"
+        ADVICE="$ADVICE (\`systemctl show --property=LoadState $PROMOTE_UNIT\`);"
+        ADVICE="$ADVICE this is a systemd-availability problem, NOT a"
+        ADVICE="$ADVICE $PROMOTE_UNIT configuration problem. Then re-arm from the"
+        ADVICE="$ADVICE live xpfd (\`xpfd upgrade kernel arm\`), which rewrites"
+        ADVICE="$ADVICE the record"
+    elif [ "$SNAP_LOADSTATE" = not-found ]; then
+        CAUSE="$PROMOTE_UNIT is not-found, so either this host runs xpfd under a"
+        CAUSE="$CAUSE different unit (\`xpfd upgrade cut --unit <name>\`) or xpf"
+        CAUSE="$CAUSE is not installed here; the record is the only authority on"
+        CAUSE="$CAUSE such a box and there is nothing to cross-check it against"
+        ADVICE="Re-arm from the live xpfd (\`xpfd upgrade kernel arm\`), which"
+        ADVICE="$ADVICE rewrites the record from the binary doing the arming"
+    else
+        CAUSE="$PROMOTE_UNIT IS known to systemd (LoadState=$SNAP_LOADSTATE), so"
+        CAUSE="$CAUSE xpf IS installed here"
+        ADVICE="Fix $PROMOTE_UNIT so its ExecStart names the live xpfd as a"
+        ADVICE="$ADVICE single unambiguous absolute path, then re-arm from the"
+        ADVICE="$ADVICE live xpfd (\`xpfd upgrade kernel arm\`), which rewrites"
+        ADVICE="$ADVICE the record"
+    fi
+}
+
+# refuse prints the loud, fact-carrying refusal and takes the NON-REBOOTING
+# infra-error path. exit 0 is DELIBERATE: a non-zero exit trips the unit's
+# OnFailure= and reboots the box over what may be a transient packaging window,
+# and the firmware already cleared BootNext, so the next plain reboot falls back
+# to known-good on its own.
+refuse() {
+    set_cause_advice
+    log "ERROR: $* REFUSING to promote: this gate does NOT fall back to" \
+        "inferring which xpfd is live, because a runtime left behind by" \
+        "--versions-dir/--sbin-dir relocation or a unit switch is" \
+        "indistinguishable from a live one and executing the stale half would" \
+        "verify the candidate kernel against the wrong dataplane. The armed" \
+        "candidate stays un-promoted and the next plain reboot falls back to" \
+        "the known-good slot. $CAUSE. FACTS: $(unit_facts). $ADVICE."
+    exit 0
+}
 
 # pid_in_unit_cgroup is TRUE when process $1 is a member of control group $2.
 #
@@ -163,11 +289,10 @@ pid_in_unit_cgroup() {
 # A pid is a NUMBER, though, and a number is not an identity (#6601 r4
 # MAJOR-2). If xpfd.service exits between the MainPID read and the readlink and
 # the kernel recycles that pid onto an unrelated process, /proc/<pid>/exe names
-# that process's binary -- and this gate would then run it as the promotion
-# authority. The basename guard alone does not close that; it only requires the
-# recycled binary to be CALLED `xpfd`. So bind the pid back to the UNIT before
-# believing it, and do the binding AFTER the readlink so a recycle that happens
-# DURING the sequence is caught rather than raced past:
+# that process's binary. The basename guard alone does not close that; it only
+# requires the recycled binary to be CALLED `xpfd`. So bind the pid back to the
+# UNIT before believing it, and do the binding AFTER the readlink so a recycle
+# that happens DURING the sequence is caught rather than raced past:
 #
 #   * membership in xpfd.service's OWN control group. systemd reports the
 #     unit's cgroup as a structured property and the kernel reports each
@@ -175,9 +300,16 @@ pid_in_unit_cgroup() {
 #     kernel itself vouches for -- a recycled pid belongs to whatever cgroup
 #     its new owner was forked into, not to this unit's. It also rejects an
 #     unrelated same-numbered process seen through a mismatched /proc.
-#   * MainPID re-read and still the SAME positive pid.
+#   * MainPID RE-READ and still the SAME positive pid. This is the one query
+#     deliberately not taken from the discovery snapshot: its entire purpose is
+#     to observe a pid that moved after the snapshot was taken.
+#
+# What a wrong answer costs changed with the r6 redesign and the binding is kept
+# for the new cost: this hop no longer selects the binary, so believing an
+# impostor now manufactures a false DISAGREEMENT with the record and refuses a
+# healthy promotion, rather than handing an impostor the promote decision.
 unit_main_pid_exe() {
-    pid=$(systemctl show --property=MainPID --value "$PROMOTE_UNIT" 2>/dev/null) || return 0
+    pid="$SNAP_MAINPID"
     case "$pid" in
         '' | *[!0-9]*) return 0 ;;
     esac
@@ -199,12 +331,11 @@ unit_main_pid_exe() {
         *) return 0 ;;
     esac
 
-    unitcg=$(systemctl show --property=ControlGroup --value "$PROMOTE_UNIT" 2>/dev/null) || return 0
-    case "$unitcg" in
+    case "$SNAP_CONTROLGROUP" in
         /*) ;;
         *) return 0 ;;
     esac
-    pid_in_unit_cgroup "$pid" "$unitcg" || return 0
+    pid_in_unit_cgroup "$pid" "$SNAP_CONTROLGROUP" || return 0
 
     pid2=$(systemctl show --property=MainPID --value "$PROMOTE_UNIT" 2>/dev/null) || return 0
     [ "$pid2" = "$pid" ] || return 0
@@ -223,11 +354,10 @@ unit_main_pid_exe() {
 # escaping. systemd PERMITS an executable path containing a space or a ';', so a
 # parse that stops at the first one does not merely fail to resolve -- it
 # resolves to a SHORTER, DIFFERENT path (#6601 r4: `path=/opt/relocated live/xpfd`
-# yielded `/opt/relocated`, which the gate then executed as the promotion
-# authority). Cut at the literal " ; argv[]=" systemd emits immediately after
-# the field instead, and give up unless it occurs EXACTLY ONCE -- a second
-# occurrence means the path (or an argument) contains the delimiter itself and
-# no textual parse can recover the boundary.
+# yielded `/opt/relocated`). Cut at the literal " ; argv[]=" systemd emits
+# immediately after the field instead, and give up unless it occurs EXACTLY ONCE
+# -- a second occurrence means the path (or an argument) contains the delimiter
+# itself and no textual parse can recover the boundary.
 #
 # Multiple ExecStart entries render one per LINE. The shipped Type=simple unit
 # cannot validly carry more than one, but an operator-overridden Type=oneshot
@@ -241,7 +371,7 @@ unit_main_pid_exe() {
 # one delimiter across several lines, where the count rule passes and the parse
 # would silently adopt the first entry.
 unit_exec_start() {
-    raw=$(systemctl show --property=ExecStart --value "$PROMOTE_UNIT" 2>/dev/null) || return 0
+    raw="$SNAP_EXECSTART"
     [ -n "$raw" ] || return 0
     case "$raw" in
         *"$NL"*) return 0 ;;
@@ -278,6 +408,47 @@ unit_exec_start() {
     esac
 }
 
+# journal_state answers ONE question about the kernel-channel journal — is a
+# candidate ARMED? — and echoes exactly one of:
+#
+#   absent        : no journal at all. Nothing was ever armed here.
+#   not-armed     : a journal exists but is not at the verified ARMED state
+#                   (PREFLIGHT/INSTALLED/ARMING mid-run, or a terminal
+#                   PROMOTED/REVERTED that has not been cleared yet).
+#   armed         : a candidate kernel IS in trial right now.
+#   indeterminate : a journal exists but cannot be read as one. Absence of
+#                   evidence is not evidence of absence, so this is NOT folded
+#                   into "not-armed".
+#
+# A BOOLEAN, NEVER A PATH. The journal also carries PromoteBinary, and reading
+# THAT here would put the executed path back inside a JSON value parsed by sh —
+# the exact "a value may contain the delimiter" class that MAJOR-1 was about,
+# and the reason the one-line sidecar exists. This function must never grow a
+# path extraction.
+#
+# The match is line-scoped and requires the closing quote, so `"ARMING"` and a
+# hypothetical `"ARMED_X"` do not satisfy it, and an escaped occurrence inside
+# some other value (`\"state\":`) cannot either. Its cost if it were ever wrong
+# is bounded to a message: this runs only when the record is absent, in which
+# case the gate cannot run regardless of the answer.
+journal_state() {
+    [ -e "$KERNEL_JOURNAL" ] || { echo absent; return 0; }
+    if [ ! -f "$KERNEL_JOURNAL" ] || [ ! -r "$KERNEL_JOURNAL" ]; then
+        echo indeterminate
+        return 0
+    fi
+    jline=""
+    # `|| [ -n "$jline" ]` so a final line with no trailing newline is still
+    # examined: json.MarshalIndent output ends at `}` with no newline, and a
+    # compact single-line rendering would otherwise never be read at all.
+    while IFS= read -r jline || [ -n "$jline" ]; do
+        case "$jline" in
+            *'"state":'*"\"$JOURNAL_ARMED_STATE\""*) echo armed; return 0 ;;
+        esac
+        jline=""
+    done < "$KERNEL_JOURNAL"
+    echo not-armed
+}
 
 XPFD=""
 XPFD_SRC=""
@@ -297,63 +468,76 @@ try_candidate() {
 
 # ---------------------------------------------------------------- selection
 #
-# THE ARM RECORD IS THE AUTHORITY (#6601 r6). Everything below reads it; nothing
-# below infers a binary.
+# ABSENT MEANS NOTHING IS ARMED — BUT ONLY IF THE JOURNAL AGREES (#6601 r7).
 #
-# Five earlier designs derived "which xpfd is live" from ambient state -- $PATH,
-# compiled defaults, inode identity, a unit name, then that unit's LoadState --
-# and every one of them could be stale after a relocation or a unit switch. The
-# last broke concretely: a DISABLED unit still reports LoadState=loaded with
-# MainPID=0, so a leftover default unit whose drop-in still pointed at an older
-# version passed the arm-time check, and on the candidate boot its stale
-# ExecStart was accepted and the stale binary reported the gate clean.
+# The record is written by arming (BEFORE the ARMED transition) and removed with
+# the journal, so in every state the Go half can produce, a record exists for as
+# long as a candidate is armed. Its absence is therefore normally a definitive
+# statement that there is nothing to promote — which is also the only state in
+# which not running the gate is harmless.
 #
-# `xpfd upgrade kernel arm` does not have to infer any of this: it IS an xpfd,
-# so it knows the live binary by construction, and it writes that path here as
-# part of arming. This turns an unanswerable question ("which xpfd is live?")
-# into a recorded fact ("which xpfd armed this candidate?").
+# "Normally" is the whole problem. Deriving "nothing is armed" from the ABSENCE
+# of a file is an inference from ambient state, and this issue exists because
+# every such inference eventually met a box that broke it. This one breaks
+# whenever the two files desync out of band: `--journal <path>` puts the record
+# beside THAT journal while this gate reads the compiled default, and a restored
+# rootfs, a stray cleanup of /var/lib/xpf, or a half-finished clear each get
+# there too. A candidate is then armed, the gate silently does not run, the
+# candidate is never promoted, and the next reboot reverts it — reported by a
+# line that reads like an ordinary boot.
 #
-# ABSENT MEANS NOTHING IS ARMED. The record is written by arming and removed
-# with the journal, so its absence is not a failure to diagnose -- it is a
-# definitive statement that there is no candidate to promote, which is also the
-# only state in which not running the gate is harmless.
-ARM_RECORD="/var/lib/xpf/kernel-promote-binary"
-
+# Not promoting is the SAFE direction, so this is availability and honesty
+# rather than security. It is nonetheless exactly the laundering the r5 MINOR-1
+# work removed from the not-found-unit branch: an armed candidate going
+# UNVERIFIED behind a reassuring log line. So the quiet exit is now conditional
+# on the journal agreeing that nothing is armed, and the divergent state is
+# LOUD.
 RECORDED=""
-if [ -e "$ARM_RECORD" ]; then
+if [ -f "$ARM_RECORD" ] && [ -r "$ARM_RECORD" ]; then
     # `read` stops at the first newline; the record is one line by construction.
-    IFS= read -r RECORDED < "$ARM_RECORD" 2>/dev/null || RECORDED=""
+    { IFS= read -r RECORDED < "$ARM_RECORD"; } 2>/dev/null || RECORDED=""
 fi
 
-if [ -z "$RECORDED" ] && [ ! -e "$ARM_RECORD" ]; then
-    log "no armed kernel candidate recorded ($ARM_RECORD absent); nothing to promote"
+if [ ! -e "$ARM_RECORD" ]; then
+    JSTATE=$(journal_state)
+    case "$JSTATE" in
+        armed)
+            refuse "a candidate kernel is ARMED in $KERNEL_JOURNAL but the arm" \
+                "record $ARM_RECORD is ABSENT, so the promotion gate did NOT" \
+                "run and that candidate is running UNVERIFIED. Arming writes" \
+                "the record before it records ARMED and clears it with the" \
+                "journal, so the two desynced out of band -- a non-default" \
+                "--journal path, a restored or partially cleaned /var/lib/xpf," \
+                "or an interrupted clear."
+            ;;
+        indeterminate)
+            log "WARNING: the promotion gate did NOT run. The arm record" \
+                "$ARM_RECORD is absent, and $KERNEL_JOURNAL exists but cannot" \
+                "be read as a journal, so this gate cannot establish whether a" \
+                "candidate kernel is armed. If one IS armed it is running" \
+                "UNVERIFIED and will NOT be promoted; the next plain reboot" \
+                "falls back to the known-good slot. Check $KERNEL_JOURNAL is a" \
+                "readable regular file, then re-arm from the live xpfd."
+            exit 0
+            ;;
+    esac
+    log "no armed kernel candidate recorded ($ARM_RECORD absent, $KERNEL_JOURNAL" \
+        "$JSTATE); nothing to promote"
     exit 0
 fi
 
 case "$RECORDED" in
     /*) ;;
     *)
-        log "ERROR: the arm record $ARM_RECORD is present but does not contain an" \
-            "absolute path (got [${RECORDED}]). A candidate kernel may be armed" \
-            "and this gate will NOT guess a binary to verify it with. REFUSING" \
-            "to promote: the candidate stays un-promoted and the next plain" \
-            "reboot falls back to the known-good slot. Re-arm to rewrite the" \
-            "record."
-        exit 0
+        refuse "the arm record $ARM_RECORD is present but does not contain an" \
+            "absolute path (got [${RECORDED}]), so a candidate kernel may be" \
+            "armed and this gate has no binary to verify it with."
         ;;
 esac
 
 if ! usable "$RECORDED"; then
-    log "ERROR: the arming recorded $RECORDED as the xpfd that must verify this" \
-        "candidate, but that path is not an executable regular file now." \
-        "REFUSING to promote -- this gate does NOT fall back to inferring a" \
-        "path, because a runtime left behind by --versions-dir/--sbin-dir" \
-        "relocation or a unit switch is indistinguishable from a live one and" \
-        "executing the stale half would verify the candidate kernel against the" \
-        "wrong dataplane. The armed candidate stays un-promoted and the next" \
-        "plain reboot falls back to the known-good slot. Re-arm from the live" \
-        "xpfd to rewrite the record."
-    exit 0
+    refuse "the arming recorded $RECORDED as the xpfd that must verify this" \
+        "candidate, but that path is not an executable regular file now."
 fi
 
 # CROSS-CHECK, never an alternative. When the pinned unit independently resolves
@@ -369,15 +553,12 @@ try_candidate "$(unit_exec_start)" "systemd ExecStart for $PROMOTE_UNIT"
 CROSS="$XPFD"
 
 if [ -n "$CROSS" ] && [ "$CROSS" != "$RECORDED" ]; then
-    log "ERROR: the arming recorded $RECORDED as the xpfd that must verify this" \
+    refuse "the arming recorded $RECORDED as the xpfd that must verify this" \
         "candidate, but $PROMOTE_UNIT independently resolves to $CROSS" \
         "($XPFD_SRC). These disagree, which is exactly what a stale leftover" \
-        "unit looks like: a prior cut can leave a disabled-but-loaded unit whose" \
-        "drop-in still names an OLD version, and retention keeps that version" \
-        "executable. REFUSING to promote rather than picking a side. The armed" \
-        "candidate stays un-promoted and the next plain reboot falls back to the" \
-        "known-good slot."
-    exit 0
+        "unit looks like: a prior cut can leave a disabled-but-loaded unit" \
+        "whose drop-in still names an OLD version, and retention keeps that" \
+        "version executable. Refusing rather than picking a side."
 fi
 
 XPFD="$RECORDED"

@@ -892,14 +892,10 @@ location must not be able to author that decision — and even with no
 attacker, a stale `xpfd` left in another directory would verify the wrong
 build against the candidate kernel. Both hops resolve explicitly:
 
-- *Outer hop* — `scripts/image/xpf-kernel-promote` asks the kernel and
-  systemd where `xpfd.service` runs from. Its **authority order** is
-  exactly three steps, and there is deliberately no fourth:
-
-  1. `/proc/<MainPID>/exe` for `xpfd.service`, with the pid bound back
-     to the unit;
-  2. a strictly-parsed `ExecStart` for `xpfd.service`;
-  3. a **loud refusal**.
+- *Outer hop* — `scripts/image/xpf-kernel-promote` runs the xpfd the
+  **arming recorded** (below). It cross-checks that record against
+  `xpfd.service` and refuses on disagreement; it never resolves a binary
+  any other way.
 
   Nothing is `$PATH`-resolved and nothing is inferred from the
   filesystem. The unit also pins
@@ -915,7 +911,83 @@ build against the candidate kernel. Both hops resolve explicitly:
   versioned artifact — then `<SbinDir>/xpfd`, then
   `<VersionsDir>/current/xpfd`.
 
-**Why the outer hop asks systemd instead of guessing.**
+**The arming records which xpfd must verify the candidate (#6601).**
+Six revisions tried to answer *which xpfd is live?* on the candidate boot
+from ambient state — `$PATH`, then the compiled defaults, then inode
+identity, then a unit name, then that unit's `LoadState` — and each one
+closed a single stale-authority window and left another. The last broke
+concretely: a **disabled** unit still reports `LoadState=loaded` with
+`MainPID=0`, so a leftover default unit whose drop-in named an OLD
+version satisfied the arm-time check, and on the candidate boot its stale
+`ExecStart` was accepted and the stale binary authorized the promotion.
+
+Every one of those signals is ambient, and ambient state is exactly what
+an operator can change between arming and the candidate boot. So the gate
+stopped selecting signals and the question was removed instead:
+**`xpfd upgrade kernel arm` IS an xpfd**, so `os.Executable()` names the
+live binary by construction rather than by inference, and it knows this at
+the moment it arms. Arming records that path, and the boot gate reads it.
+*Which xpfd is live?* (unanswerable later) becomes *which xpfd armed this
+candidate?* (a recorded fact).
+
+The record is written twice, from one resolved value, in
+`recordPromoteBinary` (`pkg/upgrade/kernel_arm_record.go`):
+
+- `KernelJournal.PromoteBinary`, for the Go half's Gate-2b cross-check
+  (`VerifyPromoteBinaryMatchesRecord`) — a mismatch **reverts**, so an
+  undesignated binary never authorizes a promotion;
+- a one-line sidecar at `/var/lib/xpf/kernel-promote-binary`, beside the
+  journal, for the boot gate. The duplication is deliberate: the gate is
+  POSIX `sh` with no safe JSON parser, and the path it execs must never
+  come out of a JSON value — the same *a value may legally contain the
+  delimiter* class that the `ExecStart` parse below is about.
+
+It **fails closed**. A preflight that cannot establish which binary is
+arming refuses the arm: arming is retryable, an unverified candidate
+kernel is not. The sidecar is cleared with the journal
+(`clearKernelJournal`) so "nothing armed" and "no record" stay one
+statement — a record surviving a cleared journal would refuse every later
+ordinary boot. Cross-language drift canaries
+(`TestPromoteScriptArmRecordPathMatchesGo`,
+`TestPromoteScriptJournalMatchesGo`) keep the shell's hardcoded paths and
+state token equal to Go's.
+
+Because the record carries the authority, a host cut with
+`xpfd upgrade cut --unit <name>` is now **supported** rather than refused
+at arm time: `xpfd.service` simply resolves nothing to cross-check
+against, and the gate runs.
+
+**"Record absent" is itself an inference, and it is checked (#6601 r7).**
+When the sidecar is missing the gate would otherwise declare *nothing to
+promote* and exit — a positive claim made from the **absence** of a file.
+That claim holds only because arming writes the record; the two desync
+out of band. Go derives the sidecar's location from the journal path, so
+`xpfd upgrade kernel arm --journal <elsewhere>` writes it where the gate
+never looks, and a restored rootfs, a stray cleanup of `/var/lib/xpf`, or
+an interrupted clear each get there too. A candidate would then be armed,
+the gate would silently not run, and the next reboot would revert it —
+behind a line that reads like an ordinary boot.
+
+Not promoting is the safe direction, so this is availability and honesty
+rather than security. It is nonetheless the same laundering the
+renamed-unit warning exists to prevent, so the quiet exit is conditional:
+with no sidecar the gate consults the journal for **one bit** — is a
+candidate `ARMED`? — and:
+
+| journal | outcome |
+|---|---|
+| absent, or not at `ARMED` | quiet `nothing to promote` (naming both files) |
+| `ARMED` | loud `ERROR … REFUSING to promote`, saying the gate **did NOT run** and the candidate is **UNVERIFIED**, naming both files |
+| present but not a readable regular file | `WARNING`: cannot establish whether anything is armed — absence of evidence is not evidence of absence |
+
+`ARMED` **specifically**, not `ARMING`: `ARMING` is prepared intent
+recorded before the firmware one-shot is read back, which is exactly the
+line `IsArmed` draws (#5847), and matching it would put a loud error on
+every boot of a box whose arm was interrupted. The read is a boolean and
+never a path — `journal_state` must not grow a `promote_binary`
+extraction, and a test asserts it has not.
+
+**Why the outer hop cross-checks against systemd instead of guessing.**
 `--versions-dir` **and** `--sbin-dir` are both real operator options, and
 the cut maintains whatever was configured. A gate that knows only the
 compiled defaults therefore breaks on a supported layout: with
@@ -926,6 +998,14 @@ outcome, because the candidate kernel then runs unverified with nothing
 in the journal to say the gate never ran — or, with leftover artifacts at
 the default paths, **exec a stale build** that can reject a healthy
 candidate and trigger a needless revert/reboot.
+
+Since the record became the authority the cost of a wrong answer *here*
+inverted: these hops no longer select the binary, so believing a bad one
+does not hand it the promote decision — it fabricates a **disagreement**
+with the record and refuses a healthy promotion. The strictness below is
+kept for that reason, and the tests assert it by arming a good record,
+feeding a hop something it must not believe, and requiring the gate to
+promote anyway.
 
 **There is no inference fallback, by construction (#6601).** Earlier
 revisions of this gate did consult `/usr/local/sbin/xpfd` and
@@ -966,8 +1046,14 @@ gate requires both:
 - `MainPID` re-read and still the same positive pid.
 
 A pid that cannot be bound this way yields nothing, and `ExecStart` gets
-its turn — availability is preserved by the *next authority*, never by a
-guess.
+its turn; if that yields nothing either, the record stands unopposed —
+absence of a cross-check is not evidence against the authority.
+Availability is never preserved by a guess.
+
+The first `MainPID` read comes from a **discovery snapshot** taken once,
+before anything is decided, and the re-read is the one query deliberately
+not taken from it (its whole purpose is to observe a pid that moved since
+the snapshot). See *the refusal carries the facts*, below.
 
 `xpfd.service` answers this directly, in two forms. `MainPID` +
 `/proc/<pid>/exe` is the **kernel's** answer for the binary the live
@@ -981,10 +1067,10 @@ distribution-owned binary, unlike xpfd.
 
 **Unambiguous or nothing.** Every discovery source obeys one rule: a
 source that cannot prove *which* executable it is naming must yield
-nothing and let the next one try. A wrong answer here is far worse than
-no answer — it suppresses every remaining candidate and that binary's
-exit 0 *authorizes* the promotion. Two consequences worth stating
-(#6601):
+nothing and let the next one try. When these hops still *selected* the
+binary a wrong answer was far worse than no answer — it suppressed every
+remaining candidate and that binary's exit 0 *authorized* the promotion;
+now it vetoes a healthy one. Two consequences worth stating (#6601):
 
 - `MainPID` is a structured integer and `/proc/<pid>/exe` is a kernel
   symlink, so this hop parses **no rendered path text at all**. It is
@@ -1010,17 +1096,18 @@ than only claiming to; `-f` also rejects the `#2176` dangling symlink.
 
 **Refusing loudly beats skipping quietly.** The gate logs an explicit
 `ERROR: … REFUSING to promote` and takes the non-rebooting infra-error
-path whenever it cannot resolve xpfd and cannot *prove* the box is
-xpf-free:
+path in every state where something may be armed and it cannot run:
 
-- nothing resolved and `xpfd.service` is known to systemd — xpf is
-  installed here;
-- nothing resolved and `systemctl` could not be consulted at all
-  (missing, erroring, empty answer) — that proves nothing about whether
-  xpf is installed, so it must not be laundered into the benign skip.
+- the record names a path that is not an executable regular file now —
+  a relocation, a GC'd version dir, a `#2176` dangling symlink;
+- the record is present but is not an absolute path — "absent" is a
+  definitive statement and must not be reachable by mis-parsing a file
+  that IS present;
+- the unit **contradicts** the record — the r6 sequence itself, a stale
+  leftover unit whose drop-in still names an older version. Neither side
+  is provably right, so the gate refuses rather than picking one;
+- the journal says `ARMED` and the record is absent (above).
 
-Note that "known to systemd" means known/**loadable** — a `masked` or
-disabled-but-loadable unit still answers — not enabled and not running.
 Every one of these deliberately still exits 0: a non-zero exit would trip
 `OnFailure=` and reboot the box over what may be a transient packaging
 window, whereas an un-promoted candidate is already safe — the firmware
@@ -1031,13 +1118,26 @@ slot.
 keeps the unit `active` — `systemctl status xpf-kernel-promote` reads
 SUCCESS — that journal line is the *only* operator-visible signal, so it
 echoes what systemd actually returned (`LoadState=[…] MainPID=[…]
-ExecStart=[…]`) and branches its advice on which cause fired. Telling an
-operator to fix `ExecStart` when `systemctl` could not be consulted at
-all points at the wrong system, so that case says so explicitly instead.
+ControlGroup=[…] ExecStart=[…]`) and branches its advice on which cause
+fired — `systemctl` unreachable, unit not-found, or unit known — because
+telling an operator to fix `ExecStart` when `systemctl` could not be
+consulted at all, or to fix an `xpfd.service` this host deliberately does
+not use, points at the wrong system.
 
-**The promotion unit is pinned, at both ends.** The gate derives the live
-xpfd from `xpfd.service` *specifically*, and deliberately does not infer
-which unit is the xpf one: scanning for a
+Those facts must be the ones the **decision** was made on. The previous
+revision suppressed each query's failure at the point of use
+(`2>/dev/null || return 0`) and then *re-queried* to build this message,
+so a query that failed during discovery and succeeded on the re-read was
+reported as "the unit IS known to systemd" and the operator was told to
+fix an `ExecStart` that had never been consulted. Every systemd answer is
+now read once, up front, into a **discovery snapshot**, and both the hops
+and the message consume it — so what is printed is what was decided on by
+construction rather than by care. `unit_facts` and `set_cause_advice`
+cannot query systemd at all, and a test asserts that.
+
+**The cross-check unit is pinned.** The gate cross-checks against
+`xpfd.service` *specifically*, and deliberately does not infer which unit
+is the xpf one: scanning for a
 `<something>.service.d/10-xpf-version.conf` would resolve a leftover from
 a renamed or removed unit exactly as readily as the live one — the same
 indistinguishable-leftover problem that removed the filesystem fallbacks
@@ -1045,27 +1145,23 @@ indistinguishable-leftover problem that removed the filesystem fallbacks
 writes its drop-in *under* `<unit>.service.d/` without recording the unit
 name anywhere.
 
-But `xpfd upgrade cut --unit <name>` is a supported standalone selector,
-and on such a host `flip` maintains `<name>.service` while
-`<SbinDir>/xpfd` is still repointed by step 6b. The gate would then query
-a unit that does not exist. Rather than guess, the channel says so at the
-*operator's terminal*: `xpfd upgrade kernel arm` **refuses** when systemd
-definitively reports `xpfd.service` absent
-(`CheckKernelPromotionUnit`, exit 2), so a candidate is never armed into
-a layout whose gate cannot run. Only a definite `not-found` refuses — an
-unreachable `systemctl` proves nothing and is allowed through. This
-mirrors the #1983 precedent, where `NewCLICluster` likewise refuses a
-non-default `--unit` rather than drive control against the wrong daemon.
-A cross-language drift canary (`TestPromoteScriptUnitMatchesDefaultUnit`)
-keeps the shell script's pinned unit equal to `upgrade.DefaultUnit`.
+`xpfd upgrade cut --unit <name>` is a supported standalone selector, and
+on such a host `flip` maintains `<name>.service` while `<SbinDir>/xpfd`
+is still repointed by step 6b, so the gate queries a unit that does not
+exist. Under the pre-record design the unit **was** the authority, so
+that layout could not be verified at all and `xpfd upgrade kernel arm`
+refused it up front (`CheckKernelPromotionUnit`). The record removes the
+dependency — the arming knows which xpfd it is regardless of what the
+unit is called — so **that arm-time refusal is gone with the authority it
+protected**, and such a box now promotes normally, logging
+`arm record (xpfd.service resolved nothing to cross-check against)`.
 
-If a box still reaches boot in that state — renamed after arming, or
-armed by an older build — the gate does **not** print a reassuring
-"skipping" line. It logs a `WARNING` saying the gate did not run, naming
-the unit it looked for and the facts it got, and states that any armed
-candidate is running **unverified** and will not be promoted. The deb
-that installs this script also installs `xpfd.service`, so `not-found`
-means the unit was removed or renamed — it is never the benign case.
+Drift still matters, for a different reason: a canary
+(`TestPromoteScriptUnitMatchesDefaultUnit`) keeps the shell script's
+pinned unit equal to `upgrade.DefaultUnit`, because a wrong unit either
+silently retires the cross-check (one that never resolves can never
+contradict a stale record) or contradicts a good record and refuses every
+promotion.
 
 `KernelConfig` carries neither directory, so the *inner* hop's two
 fallbacks are the compiled defaults; by then the outer hop has already
@@ -1334,6 +1430,14 @@ not be set (the node would not know it is a candidate), and an unverified
 candidate could become primary. The journaled state machine for the
 #1917 binary roll has the same requirement. This is a platform invariant
 of the appliance image (`docs/install-images.md`), not a tunable.
+
+The arm-record sidecar (`kernel-promote-binary`) shares that requirement
+and is written to the same directory for exactly that reason: it is what
+tells the boot gate **which xpfd** must verify the candidate. The two are
+written and cleared together, and the gate treats a divergence between
+them as an error rather than as a skip (#6601 r7), so losing only one of
+them is loud rather than silent — but losing either still costs the
+candidate its promotion.
 
 ## Kernel / OS upgrade lanes (#1930)
 

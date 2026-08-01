@@ -1,31 +1,56 @@
 #!/usr/bin/env python3
-"""Self-test: the #1930 kernel promotion gate resolves xpfd by EXPLICIT path.
+"""Self-test: the #1930 kernel promotion gate runs the xpfd the ARMING recorded.
 
-#6541. `scripts/image/xpf-kernel-promote` is the OUTER hop of the A/B kernel
-promote/rollback gate: systemd runs it as root on every boot, and on a candidate
-boot the exit status of the `xpfd upgrade kernel promote` it invokes decides
-promote-vs-rollback. A bare, $PATH-resolved `xpfd` lets any PATH entry ordered
-ahead of the real location author that decision — or, with no attacker at all,
-lets a stale xpfd from some other directory verify the wrong build against the
-candidate kernel.
+#6541 / #6601. `scripts/image/xpf-kernel-promote` is the OUTER hop of the A/B
+kernel promote/rollback gate: systemd runs it as root on every boot, and on a
+candidate boot the exit status of the `xpfd upgrade kernel promote` it invokes
+decides promote-vs-rollback. A bare, $PATH-resolved `xpfd` lets any PATH entry
+ordered ahead of the real location author that decision — or, with no attacker
+at all, lets a stale xpfd from some other directory verify the wrong build
+against the candidate kernel.
 
-The gate's authority order is (#6601 r5):
+Six revisions tried to answer "which xpfd is live?" from ambient state — $PATH,
+compiled defaults, inode identity, a unit name, then that unit's LoadState — and
+each one closed a single stale-authority window and left another. The last broke
+concretely: a DISABLED unit still reports LoadState=loaded with MainPID=0, so a
+leftover default unit whose drop-in named an OLD version satisfied the arm-time
+check and its stale ExecStart was accepted on the candidate boot.
 
-    1. /proc/<MainPID>/exe for xpfd.service, bound back to the unit
-    2. a strictly-parsed ExecStart for xpfd.service
-    3. a LOUD refusal
+r6 stopped selecting signals. `xpfd upgrade kernel arm` IS an xpfd, so
+os.Executable() names the live binary by construction; arming RECORDS that path
+and the boot gate READS it. The question changes from "which xpfd is live?"
+(unanswerable later) to "which xpfd armed this candidate?" (a fact). So the gate
+now has:
 
-with **no inference fallback**. That third step is the point of this file. Three
-earlier revisions guessed from the filesystem when systemd could not answer, and
-each one closed a single ambiguous case and left another, because a runtime left
-behind by `--versions-dir`/`--sbin-dir` relocation is indistinguishable from a
-live one — Codex reproduced a both-roots-relocated box whose two leftover
-defaults are the SAME INODE, so even a same-file test called them unambiguous
-and the gate executed the stale build. The class of bug is closed by removing
-the guess, not by patching one more case.
+    * ONE authority — the arm record;
+    * a CROSS-CHECK against the pinned unit (MainPID -> /proc/<pid>/exe, then a
+      strictly-parsed ExecStart) which may CONTRADICT the record but never
+      replace it;
+    * a LOUD refusal on contradiction or on an unusable record;
+    * a quiet "nothing to promote" ONLY when the record is absent AND the
+      journal agrees nothing is armed (#6601 r7).
+
+Two consequences shape the tests below.
+
+FIRST, the unit hops are still live code, but a wrong answer from them costs
+something different now: it no longer hands an impostor the promote decision, it
+manufactures a false DISAGREEMENT and REFUSES a healthy promotion. So the
+recycled-pid / cgroup / ExecStart-parsing tests assert that the gate still runs
+THE RECORDED BINARY — a mutation that loosens one of those guards turns the run
+into a refusal and reds the test.
+
+SECOND, the quiet skip is itself an inference, and this issue exists because
+every inference eventually met a box that broke it. "Record absent" means
+"nothing armed" only because arming writes the record; the two files desync out
+of band (a non-default `--journal` path, a restored rootfs, a partial clear), and
+a candidate then goes UNVERIFIED behind a log line that reads like an ordinary
+boot. That is the same laundering the r5 MINOR-1 work removed from the
+not-found-unit branch, so the journal is consulted for ONE BIT — is a candidate
+ARMED — and the divergent state is loud.
 
 FAIL-ON-REVERT: restore `command -v xpfd` / bare `xpfd upgrade kernel promote`,
-or reintroduce a compiled-default fallback, and this file fails.
+reintroduce a compiled-default fallback, remove the arm-record check, or make
+ARMED-without-record silent again, and this file fails.
 """
 
 import os
@@ -58,6 +83,9 @@ SBIN = "/usr/local/sbin/xpfd"
 # The arm record: written by `xpfd upgrade kernel arm`, read by the gate. Its
 # path is asserted against Go by TestPromoteScriptArmRecordPathMatchesGo.
 ARM_RECORD = "/var/lib/xpf/kernel-promote-binary"
+# The kernel-channel journal. The gate reads ONE BIT out of it (is a candidate
+# ARMED) and never a path. Pinned against Go by TestPromoteScriptJournalMatchesGo.
+KERNEL_JOURNAL = "/var/lib/xpf/kernel-upgrade.state"
 VERSIONED = "/var/lib/xpf/versions/current/xpfd"
 
 
@@ -103,9 +131,26 @@ class TestNoPathResolution(unittest.TestCase):
             "xpf-kernel-promote must stay a POSIX sh script (early boot)",
         )
 
+    def test_the_arm_record_is_the_authority(self):
+        # #6601 r6, the design itself. The EXECUTED path must come out of the
+        # record; the unit hops may run, but only to contradict it.
+        text = script_text()
+        self.assertIn(
+            'XPFD="$RECORDED"',
+            text,
+            "the gate never assigns the executed binary from the arm record; "
+            "selection has drifted back to inference (#6601 r6)",
+        )
+        self.assertIn(
+            '"$CROSS" != "$RECORDED"',
+            text,
+            "no record-vs-unit disagreement check; a stale leftover unit could "
+            "again select an older binary (#6601 r6 MAJOR)",
+        )
+
     def test_discovers_configured_path_from_systemd(self):
-        # The gate must ASK systemd rather than guess. `--versions-dir` and
-        # `--sbin-dir` are both real operator options and the cut maintains
+        # The CROSS-CHECK must ASK systemd rather than guess. `--versions-dir`
+        # and `--sbin-dir` are both real operator options and the cut maintains
         # whatever was configured, so a box that relocated BOTH has a perfectly
         # intact xpfd at a path no hardcoded list contains.
         text = script_text()
@@ -113,7 +158,7 @@ class TestNoPathResolution(unittest.TestCase):
             "ExecStart",
             text,
             "the gate never consults systemd's ExecStart for xpfd.service, so a "
-            "box with both runtime roots relocated has no resolvable candidate "
+            "box with both runtime roots relocated has no cross-check at all "
             "(#6541 fold r3)",
         )
         self.assertIn("xpfd.service", text)
@@ -169,24 +214,34 @@ class TestNoPathResolution(unittest.TestCase):
             text,
             "the MainPID hop never checks that the pid belongs to "
             "xpfd.service's own control group, so a recycled pid running an "
-            "unrelated binary named `xpfd` can author the promotion decision "
-            "(#6601 r4 MAJOR-2)",
+            "unrelated binary named `xpfd` can contradict the arm record and "
+            "veto a healthy promotion (#6601 r4 MAJOR-2)",
         )
         self.assertIn("/cgroup", text)
-        # Count within the DISCOVERY FUNCTION, not the whole file. The refusal
-        # path also queries MainPID (to print it as a fact), and a whole-file
-        # count would silently absorb the re-read being deleted: 1 discovery +
-        # 1 diagnostic still totals 2. Scoping keeps the revert-detection exact
-        # (#6601 r5).
+        # The pid must be read TWICE and required to be the same: once into the
+        # discovery snapshot, and once AGAIN inside unit_main_pid_exe after the
+        # readlink, so a recycle DURING the sequence is caught rather than raced
+        # past. Since r7 the FIRST read lives in the snapshot (facts and advice
+        # must describe the reads the decision was made on), so the count is
+        # asserted at both sites rather than twice in one function.
+        self.assertIn(
+            'SNAP_MAINPID=$(systemctl show --property=MainPID --value "$PROMOTE_UNIT"',
+            text,
+            "the MainPID discovery read is no longer taken into the snapshot, "
+            "so the refusal can report a pid the decision never saw "
+            "(#6601 r7 MINOR-3)",
+        )
         body = shell_function_body(text, "unit_main_pid_exe")
         self.assertEqual(
             len(re.findall(r"--property=MainPID", body)),
-            2,
-            "MainPID must be read AGAIN after the readlink, inside "
-            "unit_main_pid_exe, and required to be the same pid, so a recycle "
-            "DURING the sequence is caught rather than raced past "
-            "(#6601 r4 MAJOR-2)",
+            1,
+            "unit_main_pid_exe must RE-READ MainPID exactly once, after the "
+            "readlink — that read exists to observe a pid that moved since the "
+            "snapshot, so it is the one query that must NOT come from the "
+            "snapshot (#6601 r4 MAJOR-2)",
         )
+        self.assertIn('pid="$SNAP_MAINPID"', body)
+        self.assertIn('[ "$pid2" = "$pid" ]', body)
 
     def test_execstart_is_parsed_at_systemds_real_field_delimiter(self):
         # MAJOR (#6601 r4). `systemctl show -p ExecStart --value` renders
@@ -194,9 +249,8 @@ class TestNoPathResolution(unittest.TestCase):
         # and the property printer substitutes the stored path RAW ("path=%s"),
         # with no escaping. systemd PERMITS an executable path containing a
         # space or a ';', so a parser that stops at the first one does not fail
-        # to resolve -- it resolves to a SHORTER, DIFFERENT path, suppresses
-        # every remaining candidate, and lets that binary's exit 0 authorize the
-        # promotion. Cut at the real field delimiter instead.
+        # to resolve -- it resolves to a SHORTER, DIFFERENT path. Cut at the
+        # real field delimiter instead.
         text = script_text()
         self.assertIn(
             " ; argv[]=",
@@ -211,6 +265,55 @@ class TestNoPathResolution(unittest.TestCase):
             "a `[^ ;]` character class still terminates the ExecStart path at "
             "the first space or semicolon -- both are legal in a systemd "
             "executable path (#6601 r4 MAJOR-1)",
+        )
+
+    def test_refusal_facts_come_from_the_discovery_snapshot(self):
+        # #6601 r7 MINOR-3. The previous revision suppressed each systemctl
+        # failure at the point of use and then RE-QUERIED to build the refusal,
+        # so a query that failed during discovery and recovered by the time the
+        # message was assembled was reported as "the unit IS known to systemd"
+        # and the operator was told to fix an ExecStart that was never
+        # consulted. The message must describe the reads the DECISION was made
+        # on, which is only structurally true if the reporting path cannot
+        # query at all.
+        #
+        # Scoped to INVOCATION, not to the word: the advice text legitimately
+        # tells the operator to run `systemctl show ...` themselves. What must
+        # not appear is a command substitution or a systemctl command word.
+        text = script_text()
+        for fn in ("unit_facts", "set_cause_advice"):
+            body = shell_function_body(text, fn)
+            why = (
+                f"{fn} queries systemctl instead of rendering the discovery "
+                "snapshot, so the refusal can describe a system state the "
+                "decision was never made on (#6601 r7 MINOR-3)"
+            )
+            self.assertNotIn("$(systemctl", body, why)
+            for line in body.splitlines():
+                self.assertIsNone(
+                    re.match(r"\s*(?:if\s+|!\s+)?systemctl\b", line),
+                    f"{why}: {line.strip()!r}",
+                )
+
+    def test_journal_is_read_for_a_boolean_never_for_a_path(self):
+        # The journal carries PromoteBinary too, and reading THAT here would put
+        # the executed path back inside a JSON value parsed by sh — the exact
+        # "a value may legally contain the delimiter" class that MAJOR-1 was
+        # about, and the whole reason the one-line sidecar exists.
+        text = script_text()
+        body = shell_function_body(text, "journal_state")
+        self.assertNotIn(
+            "promote_binary",
+            body,
+            "journal_state extracts a PATH out of the JSON journal. The gate is "
+            "POSIX sh with no safe JSON parser; the path must come from the "
+            "one-line sidecar (#6601 r6/r7)",
+        )
+        self.assertIn(
+            'JOURNAL_ARMED_STATE="ARMED"',
+            text,
+            "the armed-state token is no longer pinned; ARMING is prepared "
+            "intent and must NOT read as a trial in flight (upgrade.IsArmed)",
         )
 
     def test_no_command_v_probe_for_xpfd(self):
@@ -262,7 +365,9 @@ class _GateBase(unittest.TestCase):
         #
         # MainPID reads are COUNTED so a test can model a pid that changes
         # mid-sequence (the recycle race): with STUB_MAINPID2 set, the second
-        # and later reads answer differently from the first.
+        # and later reads answer differently from the first. Since r7 the first
+        # read is the discovery snapshot's and the second is the re-read inside
+        # unit_main_pid_exe, which is exactly the pair the race guard compares.
         self.systemctl_ran = self.tmp / "systemctl.ran"
         self.mainpid_seq = self.tmp / "mainpid.seq"
         (self.path_dir / "systemctl").write_text(
@@ -292,7 +397,7 @@ class _GateBase(unittest.TestCase):
             "exit 0\n"
         )
         (self.path_dir / "systemctl").chmod(0o755)
-        # Default: systemd knows nothing, so nothing resolves.
+        # Default: systemd knows nothing, so nothing cross-checks.
         self.stub_execstart = ""
         self.stub_loadstate = "not-found"
         # Which shell runs the gate. Overridden by the busybox leg (NIT-1); the
@@ -304,23 +409,28 @@ class _GateBase(unittest.TestCase):
         # explicitly to model a disagreement, a stale record, or no arming.
         self.armed = None
         self.arm_explicitly_absent = False
+        # The kernel journal. None => not written at all (nothing was ever
+        # armed here). A string is written verbatim as the journal body.
+        self.journal = None
         self.stub_mainpid = "0"
         self.stub_mainpid2 = ""
         self.stub_controlgroup = ""
         self.stub_show_fail = ""
         self._stub_seq = 0
 
-        # A rewritten copy of the script whose HISTORICAL compiled-default
-        # paths are re-rooted into the temp tree. The current gate names
-        # neither, so this is a no-op for it -- it exists so that a revision
-        # which reintroduces a defaults fallback is caught HERE, resolving
-        # into the fake root, instead of touching the real filesystem.
+        # A rewritten copy of the script whose absolute state paths — and the
+        # HISTORICAL compiled-default paths — are re-rooted into the temp tree.
+        # The current gate names neither default, so those two are a no-op for
+        # it: they exist so that a revision which reintroduces a defaults
+        # fallback is caught HERE, resolving into the fake root, instead of
+        # touching the real filesystem.
         self.fake_root = self.tmp / "root"
         self.script_copy = self.tmp / "xpf-kernel-promote"
         text = script_text()
         text = text.replace(VERSIONED, str(self.fake_root) + VERSIONED)
         text = text.replace(SBIN, str(self.fake_root) + SBIN)
         text = text.replace(ARM_RECORD, str(self.fake_root) + ARM_RECORD)
+        text = text.replace(KERNEL_JOURNAL, str(self.fake_root) + KERNEL_JOURNAL)
         self.script_copy.write_text(text)
         self.script_copy.chmod(0o755)
 
@@ -366,6 +476,8 @@ class _GateBase(unittest.TestCase):
             armed = self.armed if self.armed is not None else self._derive_armed()
             if armed:
                 self._arm(armed)
+        if self.journal is not None:
+            self._write_journal(self.journal)
         env = dict(os.environ)
         env["PATH"] = str(self.path_dir) + os.pathsep + env.get("PATH", "")
         env["STUB_EXECSTART"] = self.stub_execstart
@@ -389,6 +501,36 @@ class _GateBase(unittest.TestCase):
         rec.write_text(f"{binary}\n")
         return rec
 
+    def _journal_path(self) -> Path:
+        return Path(str(self.fake_root) + KERNEL_JOURNAL)
+
+    def _write_journal(self, body: str) -> Path:
+        """Write a kernel-channel journal body verbatim.
+
+        Callers pass real `json.MarshalIndent` shapes (see journal_body) so the
+        gate's one-bit read is exercised against what Go actually writes.
+        """
+        j = self._journal_path()
+        j.parent.mkdir(parents=True, exist_ok=True)
+        j.write_text(body)
+        return j
+
+    @staticmethod
+    def journal_body(state: str) -> str:
+        """A journal as pkg/upgrade writes it: json.MarshalIndent, no trailing \\n."""
+        return (
+            "{\n"
+            '  "candidate_version": "6.18.5-12-generic",\n'
+            '  "known_good_version": "6.17.0-1-generic",\n'
+            '  "active_slot": "xpf-A",\n'
+            '  "inactive_slot": "xpf-B",\n'
+            f'  "state": "{state}",\n'
+            '  "started_at": "2026-07-31T09:00:00Z",\n'
+            '  "boot_id": "Boot0002",\n'
+            '  "promote_binary": "/opt/live/xpfd"\n'
+            "}"
+        )
+
     def _install(self, rel: str, exit_code: int) -> Path:
         """Install a recording stub at a re-rooted historical default path."""
         marker = self.tmp / (rel.replace("/", "_") + ".ran")
@@ -402,6 +544,13 @@ class _GateBase(unittest.TestCase):
         self._write_stub(abs_path, exit_code, marker)
         return marker
 
+    def _arm_a_live_binary(self):
+        """Install a recording stub, record it as the armed xpfd, return both."""
+        live = self.tmp / f"recorded{self._stub_seq}" / "xpfd"
+        ran = self._install_abs(live)
+        self.armed = str(live)
+        return live, ran
+
     def _sbin_symlink_to_versioned(self):
         """The `flip` 6b layout: <SbinDir>/xpfd -> <VersionsDir>/current/xpfd.
 
@@ -413,36 +562,40 @@ class _GateBase(unittest.TestCase):
         sbin_path.parent.mkdir(parents=True, exist_ok=True)
         sbin_path.symlink_to(str(self.fake_root) + VERSIONED)
 
+    # ------------------------------------------------------------- assertions
+
+    def _assert_no_path_fallback(self, res, why: str):
+        self.assertFalse(
+            self.marker.exists(),
+            f"the gate executed the xpfd it found on $PATH ({why}) (#6541): {res.stderr}",
+        )
+
     def _assert_refused(self, res, why: str):
+        """A LOUD refusal: the gate had something to promote and would not.
+
+        Deliberately NOT satisfied by the benign "nothing to promote" line. An
+        earlier draft of this migration accepted either, and eleven tests then
+        passed while never reaching the code they name — the vacuous pass is
+        exactly how a guard dies quietly.
+        """
         self.assertEqual(
             res.returncode,
             0,
             "the refusal must stay on the non-rebooting infra-error path; a "
             f"non-zero exit trips OnFailure= and reboots: {res.stderr}",
         )
-        # DID NOT ADOPT AN INFERRED BINARY. Under the r7 arm-record design there
-        # are two correct non-promotion outcomes, and which one applies depends
-        # on whether a candidate was armed at all:
-        #
-        #   * a candidate IS armed and something contradicts or invalidates the
-        #     record -> loud ERROR + REFUSING;
-        #   * nothing is armed -> "nothing to promote", which is not a failure
-        #     to diagnose but a definitive statement (the record is written by
-        #     arming and removed with the journal).
-        #
-        # Both mean the gate did not let an inferred binary authorize a
-        # promotion, which is what every caller of this helper is testing. The
-        # per-test assertNotIn("using <impostor>") above pins that the specific
-        # bad candidate was not adopted.
-        refused = "REFUSING to promote" in res.stderr
-        nothing_armed = "nothing to promote" in res.stderr
-        self.assertTrue(
-            refused or nothing_armed,
-            f"the gate neither refused nor reported nothing-armed ({why}); it "
-            f"may have adopted an inferred binary: {res.stderr}",
+        self.assertIn(
+            "REFUSING to promote",
+            res.stderr,
+            f"the gate did not refuse ({why}); it may have adopted an inferred "
+            f"binary, or skipped without reaching the check at all: {res.stderr}",
         )
-        if refused:
-            self.assertIn("ERROR", res.stderr, f"the refusal was not loud ({why}): {res.stderr}")
+        self.assertIn("ERROR", res.stderr, f"the refusal was not loud ({why}): {res.stderr}")
+        self.assertNotIn(
+            "nothing to promote",
+            res.stderr,
+            f"the refusal was reported as a benign nothing-to-promote ({why}): {res.stderr}",
+        )
         self.assertNotIn(
             "promotion gate: clean",
             res.stderr,
@@ -453,10 +606,33 @@ class _GateBase(unittest.TestCase):
             self.systemctl_ran.exists(),
             f"the refusal rebooted the box ({why})",
         )
-        self.assertFalse(
-            self.marker.exists(),
-            f"the gate executed the xpfd it found on $PATH ({why}) (#6541)",
+        self._assert_no_path_fallback(res, why)
+
+    def _assert_nothing_armed(self, res, why: str):
+        """The benign outcome: no record AND a journal that agrees."""
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(
+            "nothing to promote",
+            res.stderr,
+            f"the gate did not report nothing-armed ({why}): {res.stderr}",
         )
+        self.assertNotIn("REFUSING to promote", res.stderr)
+        self.assertNotIn("promotion gate: using", res.stderr)
+        self._assert_no_path_fallback(res, why)
+
+    def _assert_ran(self, res, ran: Path, why: str):
+        """The gate executed the recorded binary and did not refuse."""
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn(
+            "REFUSING",
+            res.stderr,
+            f"the gate refused a promotion it should have run ({why}): {res.stderr}",
+        )
+        self.assertTrue(
+            ran.exists(),
+            f"the gate did not run the recorded xpfd ({why}): {res.stderr}",
+        )
+        self._assert_no_path_fallback(res, why)
 
     def _spawn_fake_daemon(self, subdir: str, basename: str = "xpfd", unlink: bool = False):
         """Run a real process from a real file; return (proc, path, cgroup)."""
@@ -493,29 +669,27 @@ class _GateBase(unittest.TestCase):
         return proc, target, fields[2]
 
 
-class TestResolutionBehaviour(_GateBase):
-    """Resolution behaviour of the gate itself."""
+class TestRecordIsTheAuthority(_GateBase):
+    """The record answers what no inference could, and nothing overrides it."""
 
-    # ------------------------------------------------- no inference fallback
-
-    def test_relocated_roots_with_same_inode_leftovers_are_never_executed(self):
-        # #6601 r4 Codex MAJOR-1, reproduced exactly. Both roots relocated, so
-        # the LIVE xpfd is at neither default — and relocation removed neither
-        # leftover, so the old sbin symlink still points at the old versioned
-        # runtime. The two leftovers are therefore ONE INODE, which is
-        # bit-identical to what a HEALTHY default-rooted box looks like: `-ef`
-        # calls it unambiguous and hands the promotion decision to a STALE
-        # build (Codex: live_ran False / stale_ran True).
+    def test_relocated_roots_with_same_inode_leftovers_are_resolved_by_the_record(self):
+        # #6601 r4 Codex MAJOR-1, reproduced exactly — and now RESOLVED rather
+        # than refused. Both roots relocated, so the LIVE xpfd is at neither
+        # default, and relocation removed neither leftover: the old sbin symlink
+        # still points at the old versioned runtime, so the two leftovers are
+        # ONE INODE, bit-identical to a HEALTHY default-rooted box. `-ef` calls
+        # that unambiguous and hands the promotion decision to a STALE build
+        # (Codex: live_ran False / stale_ran True).
         #
-        # Neither systemd source can rescue it here: the daemon is not running
-        # (MainPID 0) and the ExecStart cannot be parsed, because the live
-        # path legally contains the literal " ; argv[]=" that is systemd's own
-        # field delimiter — so no textual parse can find the field boundary.
-        # `<tmp>/opt/relocated`, where cutting at the FIRST delimiter lands, is
-        # itself a real executable, so a parse that gives up on the count rule
-        # does not fail to resolve: it resolves to a THIRD binary.
+        # Neither systemd source can rescue it either: the daemon is not running
+        # (MainPID 0) and the ExecStart cannot be parsed, because the live path
+        # legally contains the literal " ; argv[]=" that is systemd's own field
+        # delimiter. `<tmp>/opt/relocated`, where cutting at the FIRST delimiter
+        # lands, is itself a real executable, so a parse that gives up on the
+        # count rule does not fail to resolve: it resolves to a THIRD binary.
         #
-        # There is nothing left that is an ANSWER, so the gate must REFUSE.
+        # This is the box the whole redesign exists for. The arming knew which
+        # xpfd it was, so the record names the live binary and the gate runs it.
         live_dir = self.tmp / "opt" / "relocated ; argv[]=x"
         live = live_dir / "xpfd"
         live_ran = self._install_abs(live)
@@ -525,6 +699,7 @@ class TestResolutionBehaviour(_GateBase):
         stale_ran = self._install(VERSIONED, 0)
         self._sbin_symlink_to_versioned()
 
+        self.armed = str(live)
         self.stub_mainpid = "0"
         self.stub_execstart = f"{{ path={live} ; argv[]={live} ; ignore_errors=no }}"
         self.stub_loadstate = "loaded"
@@ -539,24 +714,28 @@ class TestResolutionBehaviour(_GateBase):
             f"which is why there must be no filesystem fallback at all: {res.stderr}",
         )
         self.assertFalse(
-            live_ran.exists(),
-            "the gate parsed an ExecStart whose path contains systemd's own "
-            f"field delimiter: {res.stderr}",
-        )
-        self.assertFalse(
             truncated_ran.exists(),
             "the gate cut the ExecStart at the FIRST field delimiter and "
             f"executed {truncated} -- a shorter, different, and real binary "
             f"(#6601 r4 MAJOR-1): {res.stderr}",
         )
-        self._assert_refused(res, "both roots relocated, same-inode leftovers")
+        self._assert_ran(res, live_ran, "both roots relocated, same-inode leftovers")
+        self.assertIn(
+            "resolved nothing to cross-check against",
+            res.stderr,
+            "an ExecStart carrying systemd's own field delimiter twice was "
+            f"parsed anyway, so it could contradict the record: {res.stderr}",
+        )
 
     def test_disagreeing_leftover_defaults_are_never_executed(self):
         # The `--sbin-dir`-only / `--versions-dir`-only shapes: two usable
         # defaults that are DIFFERENT files. One is stale and nothing on the
-        # box says which, so no ranking is right for both.
+        # box says which, so no ranking is right for both. With the recorded
+        # binary gone and systemd unable to answer, two perfectly usable
+        # candidates are sitting right there — and the gate must still refuse.
         sbin_ran = self._install(SBIN, 0)
         versioned_ran = self._install(VERSIONED, 0)
+        self.armed = str(self.tmp / "gone" / "xpfd")
         self.stub_show_fail = "1"  # systemd cannot answer
 
         res = self._run()
@@ -573,6 +752,7 @@ class TestResolutionBehaviour(_GateBase):
         # relocation leaves the STALE half behind just as readily as the live
         # one.
         versioned_ran = self._install(VERSIONED, 0)
+        self.armed = str(self.tmp / "gone" / "xpfd")
         self.stub_show_fail = "1"
 
         res = self._run()
@@ -584,16 +764,63 @@ class TestResolutionBehaviour(_GateBase):
         )
         self._assert_refused(res, "exactly one usable default")
 
+    def test_recorded_binary_that_is_gone_refuses_rather_than_guessing(self):
+        # The record is the authority, so an unusable record is a REFUSAL, never
+        # a licence to look elsewhere. This is the r6 replacement for the old
+        # "nothing resolved" refusal.
+        self.armed = str(self.tmp / "gone" / "xpfd")
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self._assert_refused(res, "recorded binary no longer exists")
+        self.assertIn(str(self.tmp / "gone" / "xpfd"), res.stderr)
+
+    def test_recorded_relative_path_refuses(self):
+        # A record that is present but not an absolute path cannot name an
+        # executable unambiguously; "absent" is a definitive statement and must
+        # not be reachable by mis-parsing a file that IS present.
+        self._arm("not/absolute")
+        self.arm_explicitly_absent = True  # do not overwrite the record above
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self._assert_refused(res, "record is not an absolute path")
+        self.assertIn("not/absolute", res.stderr)
+
+    def test_unit_disagreeing_with_the_record_refuses_rather_than_picking(self):
+        # The r6 MAJOR sequence itself: a prior cut leaves a disabled-but-loaded
+        # unit whose drop-in still names an OLD version, retention keeps that
+        # version executable, and the unit therefore resolves a DIFFERENT binary
+        # from the one that armed. Neither side is provably right here, so the
+        # gate must refuse rather than pick.
+        _live, live_ran = self._arm_a_live_binary()
+        stale = self.tmp / "stale-version" / "xpfd"
+        stale_ran = self._install_abs(stale)
+        self.stub_execstart = f"{{ path={stale} ; argv[]={stale} }}"
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self._assert_refused(res, "unit contradicts the record")
+        self.assertFalse(stale_ran.exists(), f"the gate ran the STALE unit's binary: {res.stderr}")
+        self.assertFalse(live_ran.exists(), f"the gate ran a contradicted record: {res.stderr}")
+
+
+class TestResolutionBehaviour(_GateBase):
+    """Cross-check behaviour: it may confirm the record, never replace it."""
+
     # ---------------------------------------------- anti-over-reach: it works
 
-    def test_healthy_default_rooted_box_resolves_via_execstart(self):
-        # ANTI-OVER-REACH. Removing the guess must not strand the gate on an
-        # ordinary box. A default-rooted install has not relocated anything, so
-        # systemd answers: the shipped base unit carries
+    def test_healthy_default_rooted_box_promotes_confirmed_by_execstart(self):
+        # ANTI-OVER-REACH. A default-rooted install has not relocated anything,
+        # so systemd answers: the shipped base unit carries
         # ExecStart=/usr/local/sbin/xpfd before the first cut, and `flip` 6c
         # templates ExecStart=<VersionsDir>/<ver>/xpfd after every cut. The
-        # binary it names is reached DIRECTLY, through the sbin->versioned
-        # symlink `flip` 6b leaves.
+        # record names the same binary, reached through the sbin->versioned
+        # symlink `flip` 6b leaves, so the unit CONFIRMS the record.
+        #
+        # MainPID is 0 here, so "confirmed by" can only have come from the
+        # ExecStart hop — which is what keeps that parse under test now that it
+        # no longer selects the binary.
         versioned_ran = self._install(VERSIONED, 0)
         self._sbin_symlink_to_versioned()
         sbin = str(self.fake_root) + SBIN
@@ -601,25 +828,27 @@ class TestResolutionBehaviour(_GateBase):
         self.stub_loadstate = "loaded"
 
         res = self._run()
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertTrue(
-            versioned_ran.exists(),
-            "the gate refused on an ORDINARY, healthy default-rooted box whose "
-            "systemd names the binary outright -- removing the compiled-default "
-            f"guess must not cost availability: {res.stderr}",
+        self._assert_ran(res, versioned_ran, "healthy default-rooted box")
+        self.assertIn(
+            f"using {sbin} (arm record, confirmed by xpfd.service)",
+            res.stderr,
+            "the unit did not CONFIRM the record on an ordinary healthy box, so "
+            "the ExecStart cross-check is no longer exercised at all: "
+            f"{res.stderr}",
         )
-        self.assertNotIn("REFUSING", res.stderr)
-        self.assertIn("ExecStart", res.stderr)
-        self.assertFalse(self.marker.exists(), "the gate used $PATH (#6541)")
 
-    def test_healthy_default_rooted_box_resolves_via_main_pid(self):
+    def test_healthy_default_rooted_box_promotes_confirmed_by_main_pid(self):
         # The other half of anti-over-reach, and the ordinary case on a box
         # where the gate runs while xpfd is UP (the unit is After=xpfd.service).
         # Verified firsthand on a live systemd host as root: `systemctl show
         # -p MainPID --value` + `readlink /proc/<pid>/exe` yields the real
         # binary, and `-p ControlGroup --value` is exactly the path field of
         # that pid's /proc/<pid>/cgroup line.
+        #
+        # ExecStart is empty, so "confirmed by" can only have come from the
+        # MainPID -> /proc/<pid>/exe -> cgroup hop.
         proc, target, cgroup = self._spawn_fake_daemon("opt-live")
+        self.armed = str(target)
         self.stub_mainpid = str(proc.pid)
         self.stub_controlgroup = cgroup
         self.stub_loadstate = "loaded"
@@ -629,20 +858,21 @@ class TestResolutionBehaviour(_GateBase):
         res = self._run()
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn(
-            f"using {target} (",
+            f"using {target} (arm record, confirmed by xpfd.service)",
             res.stderr,
-            "the gate did not resolve xpfd through xpfd.service's MainPID and "
-            f"/proc/<pid>/exe: {res.stderr}",
+            "the gate did not confirm the record through xpfd.service's MainPID "
+            f"and /proc/<pid>/exe: {res.stderr}",
         )
-        self.assertIn("MainPID", res.stderr)
         self.assertFalse(stale_sbin.exists(), f"ran a leftover: {res.stderr}")
         self.assertFalse(stale_versioned.exists(), f"ran a leftover: {res.stderr}")
+        self._assert_no_path_fallback(res, "healthy box, daemon up")
 
     def test_discovers_relocated_roots_via_systemd_execstart(self):
         # MAJOR (fold r3). With `--versions-dir=/opt/xpf/versions
         # --sbin-dir=/usr/sbin`, NEITHER compiled default exists yet the live
         # binary is perfectly intact. Systemd knows where it is, because that
-        # is the ExecStart the cut templated (flip step 6c).
+        # is the ExecStart the cut templated (flip step 6c), and it agrees with
+        # what the arming recorded.
         relocated = self.tmp / "opt-xpf" / "versions" / "v7" / "xpfd"
         relocated_ran = self.tmp / "relocated.ran"
         self._write_stub(relocated, 0, relocated_ran)
@@ -651,17 +881,11 @@ class TestResolutionBehaviour(_GateBase):
         self.stub_loadstate = "loaded"
 
         res = self._run()
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertTrue(
-            relocated_ran.exists(),
-            "the gate did not run the relocated xpfd that systemd's ExecStart "
-            f"names, so an ARMED promotion is skipped: {res.stderr}",
-        )
-        self.assertFalse(self.marker.exists(), "the gate used $PATH (#6541)")
+        self._assert_ran(res, relocated_ran, "both roots relocated, unit agrees")
+        self.assertIn("confirmed by", res.stderr)
 
-    def test_systemd_execstart_outranks_leftover_defaults(self):
-        # Discovery must win over leftovers even when leftovers exist and are
-        # perfectly usable.
+    def test_leftover_defaults_never_outrank_the_record(self):
+        # Leftovers exist and are perfectly usable; the record still decides.
         relocated = self.tmp / "opt-xpf" / "versions" / "v7" / "xpfd"
         relocated_ran = self.tmp / "relocated.ran"
         self._write_stub(relocated, 0, relocated_ran)
@@ -673,24 +897,50 @@ class TestResolutionBehaviour(_GateBase):
         self.stub_loadstate = "loaded"
 
         res = self._run()
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertTrue(relocated_ran.exists(), f"the live binary did not run: {res.stderr}")
+        self._assert_ran(res, relocated_ran, "leftovers present")
         self.assertFalse(stale_sbin.exists(), f"ran the STALE leftover at {SBIN}")
         self.assertFalse(stale_versioned.exists(), f"ran the STALE leftover at {VERSIONED}")
 
+    def test_broken_unit_does_not_veto_a_recorded_promotion(self):
+        # A unit whose ExecStart names a path that no longer exists (mid-cut, a
+        # GC'd version dir). Earlier revisions fell through to the compiled
+        # defaults here. Under the record design there is nothing to fall
+        # through TO — and, just as importantly, a unit that resolves NOTHING
+        # must not be read as contradicting the record: absence of a
+        # cross-check is not evidence against the authority.
+        stale_sbin = self._install(SBIN, 0)
+        stale_versioned = self._install(VERSIONED, 0)
+        _live, live_ran = self._arm_a_live_binary()
+        self.stub_execstart = f"{{ path={self.tmp}/gone/xpfd ; argv[]={self.tmp}/gone/xpfd }}"
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self.assertFalse(stale_sbin.exists(), f"ran a leftover: {res.stderr}")
+        self.assertFalse(stale_versioned.exists(), f"ran a leftover: {res.stderr}")
+        self._assert_ran(res, live_ran, "unit ExecStart points at a GC'd path")
+        self.assertIn("resolved nothing to cross-check against", res.stderr)
+
     # ------------------------------------------------- MainPID -> unit binding
+    #
+    # These four all have the same shape now, and it is worth stating why. The
+    # MainPID hop no longer SELECTS the binary, so believing a pid that is not
+    # the unit's does not hand an impostor the promote decision — it produces a
+    # CROSS that contradicts the record and REFUSES a healthy promotion. Each
+    # test therefore arms a good record, feeds the hop something it must not
+    # believe, and asserts the gate still promotes. Delete the binding and the
+    # gate refuses instead; the test reds.
 
     def test_main_pid_outside_the_unit_cgroup_is_rejected(self):
         # #6601 r4 MAJOR-2. The recycle race, made concrete: MainPID names a
         # live process running a binary CALLED `xpfd`, but that process is not
         # in xpfd.service's control group — it is an unrelated program that
         # inherited the pid after the daemon exited. The basename guard alone
-        # accepts it and hands it the promote-vs-rollback decision.
+        # accepts it.
         proc, target, real_cgroup = self._spawn_fake_daemon("impostor")
         unit_cgroup = "/system.slice/xpfd.service"
         if real_cgroup == unit_cgroup or real_cgroup.startswith(unit_cgroup + "/"):
             self.skipTest("test process really is inside /system.slice/xpfd.service")
-        impostor_ran = self.tmp / "impostor-would-have-run"
+        _live, live_ran = self._arm_a_live_binary()
 
         self.stub_mainpid = str(proc.pid)
         self.stub_controlgroup = unit_cgroup
@@ -701,18 +951,18 @@ class TestResolutionBehaviour(_GateBase):
             f"using {target} (",
             res.stderr,
             "the gate accepted a process that is NOT a member of "
-            "xpfd.service's control group as the promotion authority. A "
-            "recycled pid running any binary named `xpfd` then decides "
-            f"promote-vs-rollback (#6601 r4 MAJOR-2): {res.stderr}",
+            "xpfd.service's control group as an answer about the live xpfd "
+            f"(#6601 r4 MAJOR-2): {res.stderr}",
         )
-        self.assertFalse(impostor_ran.exists())
-        self._assert_refused(res, "MainPID outside the unit cgroup")
+        self._assert_ran(res, live_ran, "MainPID outside the unit cgroup")
+        self.assertIn("resolved nothing to cross-check against", res.stderr)
 
     def test_main_pid_that_changes_mid_sequence_is_rejected(self):
         # The narrower half of the same race: the association held when it was
         # first read, but systemd's MainPID moved on while the gate was
         # resolving. Re-read and require the SAME pid.
         proc, target, cgroup = self._spawn_fake_daemon("racing")
+        _live, live_ran = self._arm_a_live_binary()
         self.stub_mainpid = str(proc.pid)
         self.stub_mainpid2 = str(proc.pid + 1)
         self.stub_controlgroup = cgroup
@@ -726,15 +976,15 @@ class TestResolutionBehaviour(_GateBase):
             "it finished resolving, so /proc/<pid>/exe may name a recycled "
             f"process's binary (#6601 r4 MAJOR-2): {res.stderr}",
         )
-        self._assert_refused(res, "MainPID changed mid-sequence")
+        self._assert_ran(res, live_ran, "MainPID changed mid-sequence")
 
     def test_main_pid_naming_a_non_xpfd_binary_is_rejected(self):
         # The basename guard. Every layout this gate supports names the
         # artifact `xpfd` (the manifest basename), so a MainPID whose
         # /proc/<pid>/exe names something else is not a layout the gate
-        # understands — it is an override, a wrapper, or a mis-association, and
-        # a wrong answer here authorizes the promotion.
+        # understands — it is an override, a wrapper, or a mis-association.
         proc, target, cgroup = self._spawn_fake_daemon("wrapper", basename="xpfd-wrapper")
+        _live, live_ran = self._arm_a_live_binary()
         self.stub_mainpid = str(proc.pid)
         self.stub_controlgroup = cgroup
         self.stub_loadstate = "loaded"
@@ -744,9 +994,9 @@ class TestResolutionBehaviour(_GateBase):
             f"using {target} (",
             res.stderr,
             "the gate accepted a MainPID whose executable is not named `xpfd` "
-            f"as the promotion authority: {res.stderr}",
+            f"as an answer about the live xpfd: {res.stderr}",
         )
-        self._assert_refused(res, "MainPID names a non-xpfd binary")
+        self._assert_ran(res, live_ran, "MainPID names a non-xpfd binary")
 
     def test_main_pid_whose_binary_was_replaced_on_disk_is_rejected(self):
         # A binary replaced (or removed) under a running daemon reads back as
@@ -757,6 +1007,7 @@ class TestResolutionBehaviour(_GateBase):
         # regular-file admission test), so no single one of them is claimed to
         # be the sole rejector (#6601 r4 MINOR).
         proc, target, cgroup = self._spawn_fake_daemon("replaced", unlink=True)
+        _live, live_ran = self._arm_a_live_binary()
         self.stub_mainpid = str(proc.pid)
         self.stub_controlgroup = cgroup
         self.stub_loadstate = "loaded"
@@ -768,7 +1019,7 @@ class TestResolutionBehaviour(_GateBase):
             "the gate adopted a MainPID whose executable was replaced on disk; "
             f'its /proc/<pid>/exe reads "<path> (deleted)": {res.stderr}',
         )
-        self._assert_refused(res, "MainPID binary deleted on disk")
+        self._assert_ran(res, live_ran, "MainPID binary deleted on disk")
 
     def test_prefix_sibling_cgroup_does_not_satisfy_membership(self):
         # The membership test matches the PATH FIELD of a /proc/<pid>/cgroup
@@ -780,6 +1031,7 @@ class TestResolutionBehaviour(_GateBase):
         proc, target, real_cgroup = self._spawn_fake_daemon("prefixy")
         if len(real_cgroup) < 2:
             self.skipTest(f"cgroup path too short to truncate: {real_cgroup!r}")
+        _live, live_ran = self._arm_a_live_binary()
         # A strict prefix of the real path: contained in the line, but not the
         # path field and not a parent directory of it.
         self.stub_controlgroup = real_cgroup[:-1]
@@ -794,18 +1046,20 @@ class TestResolutionBehaviour(_GateBase):
             "/proc/<pid>/cgroup line was accepted as unit membership "
             f"(#6601 r4 MAJOR-2): {res.stderr}",
         )
-        self._assert_refused(res, "prefix-sibling cgroup")
+        self._assert_ran(res, live_ran, "prefix-sibling cgroup")
 
     def test_delegated_subgroup_still_satisfies_membership(self):
-        # OVER-REACH GUARD on the same matcher. systemd may place a unit's
-        # processes in a subgroup of the unit's own cgroup (delegation), so a
-        # process UNDER the reported ControlGroup is still a member. Requiring
-        # an exact equality would reject a legitimately delegated unit and
-        # strand the gate.
+        # OVER-REACH GUARD on the same matcher, and the one test that requires
+        # it to say YES. systemd may place a unit's processes in a subgroup of
+        # the unit's own cgroup (delegation), so a process UNDER the reported
+        # ControlGroup is still a member. Requiring exact equality would make a
+        # legitimately delegated unit resolve NOTHING — which no longer strands
+        # the gate, but does silently retire the cross-check on every such box.
         proc, target, real_cgroup = self._spawn_fake_daemon("delegated")
         parent = real_cgroup.rsplit("/", 1)[0]
         if not parent.startswith("/") or parent == real_cgroup:
             self.skipTest(f"cgroup path has no parent to delegate from: {real_cgroup!r}")
+        self.armed = str(target)
         self.stub_controlgroup = parent
         self.stub_mainpid = str(proc.pid)
         self.stub_loadstate = "loaded"
@@ -813,18 +1067,16 @@ class TestResolutionBehaviour(_GateBase):
         res = self._run()
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn(
-            f"using {target} (",
+            f"using {target} (arm record, confirmed by xpfd.service)",
             res.stderr,
             "a process in a DELEGATED SUBGROUP of the unit's control group was "
             f"not recognised as a member: {res.stderr}",
         )
 
-    def test_unreported_control_group_falls_through_to_execstart(self):
+    def test_unreported_control_group_yields_nothing_rather_than_a_bad_cross_check(self):
         # OVER-REACH GUARD on the binding: a systemd that cannot report
-        # ControlGroup (or a /proc the gate cannot correlate) must not strand
-        # the gate — the MainPID source simply yields nothing and ExecStart
-        # gets its turn. Availability is preserved by the NEXT authority, never
-        # by a guess.
+        # ControlGroup (or a /proc the gate cannot correlate) must not make the
+        # MainPID hop guess. It yields nothing and ExecStart gets its turn.
         proc, _target, _cgroup = self._spawn_fake_daemon("live-unbindable")
         declared = self.tmp / "declared" / "xpfd"
         declared_ran = self._install_abs(declared)
@@ -835,14 +1087,14 @@ class TestResolutionBehaviour(_GateBase):
         self.stub_loadstate = "loaded"
 
         res = self._run()
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertTrue(
-            declared_ran.exists(),
-            "an unbindable MainPID stranded the gate instead of falling "
-            f"through to the declared ExecStart: {res.stderr}",
-        )
+        self._assert_ran(res, declared_ran, "unbindable MainPID, ExecStart agrees")
+        self.assertIn("confirmed by", res.stderr)
 
     # ---------------------------------------------------- ExecStart strictness
+    #
+    # Same inversion as the MainPID block: a mis-parse no longer executes the
+    # wrong binary, it fabricates a disagreement. Each test arms a good record
+    # and asserts the gate still promotes.
 
     def test_execstart_path_containing_a_space_is_not_truncated(self):
         # MAJOR (#6601 r4). systemd PERMITS an executable path containing a
@@ -850,10 +1102,8 @@ class TestResolutionBehaviour(_GateBase):
         # RAW into `path=%s` -- there is no escaping. A parse that stops at the
         # first space therefore does not merely fail to resolve: it resolves to
         # a SHORTER, DIFFERENT path. Here `<tmp>/relocated` is itself a valid
-        # executable, so the truncated read is ACCEPTED, every remaining
-        # candidate is suppressed, and that binary's exit 0 authorizes the
-        # promotion -- the candidate kernel gets verified against a build nobody
-        # chose.
+        # executable, so the truncated read is ACCEPTED and contradicts the
+        # record -- a healthy candidate is then never promoted.
         live = self.tmp / "relocated live" / "xpfd"
         live_ran = self._install_abs(live)
         truncated = self.tmp / "relocated"
@@ -867,18 +1117,14 @@ class TestResolutionBehaviour(_GateBase):
         self.stub_loadstate = "loaded"
 
         res = self._run()
-        self.assertEqual(res.returncode, 0, res.stderr)
         self.assertFalse(
             truncated_ran.exists(),
             f"the gate TRUNCATED systemd's ExecStart at the first space and "
             f"executed {truncated} -- a DIFFERENT binary from the "
             f"{live} systemd actually launches (#6601 r4 MAJOR-1): {res.stderr}",
         )
-        self.assertTrue(
-            live_ran.exists(),
-            f"the gate did not run the xpfd systemd's ExecStart names: {res.stderr}",
-        )
-        self.assertFalse(self.marker.exists(), "the gate used $PATH (#6541)")
+        self._assert_ran(res, live_ran, "ExecStart path contains a space")
+        self.assertIn("confirmed by", res.stderr)
 
     def test_execstart_path_containing_a_semicolon_is_not_truncated(self):
         # The other half of MAJOR-1: `;` is legal in a path too, and the
@@ -892,34 +1138,30 @@ class TestResolutionBehaviour(_GateBase):
         self.stub_loadstate = "loaded"
 
         res = self._run()
-        self.assertEqual(res.returncode, 0, res.stderr)
         self.assertFalse(
             truncated_ran.exists(),
             f"the gate TRUNCATED systemd's ExecStart at the first ';' and "
             f"executed {truncated} instead of {live} (#6601 r4 MAJOR-1): "
             f"{res.stderr}",
         )
-        self.assertTrue(
-            live_ran.exists(),
-            f"the gate did not run the xpfd systemd's ExecStart names: {res.stderr}",
-        )
+        self._assert_ran(res, live_ran, "ExecStart path contains a semicolon")
 
     def test_multiple_execstart_entries_are_not_reduced_to_the_first(self):
         # MAJOR-1, second shape. systemd renders one ExecStart entry per LINE
         # (verified against man-db.service). The shipped Type=simple unit cannot
         # validly carry more than one, but an operator-overridden Type=oneshot
         # can -- and its FIRST entry need not be xpfd at all. Taking it
-        # unconditionally hands the promote-vs-rollback decision to an arbitrary
-        # command.
+        # unconditionally lets an arbitrary command veto the promotion.
         #
         # NOTE (#6601 r4 MINOR): on a REAL multi-entry render each entry brings
         # its own " ; argv[]=", so the delimiter-COUNT rule already rejects this
         # value; the newline guard is defence in depth here, not the sole
         # rejector. The test below covers what only the newline guard rejects.
         foreign = self.tmp / "prep" / "install"
-        foreign_ran = self._install_abs(foreign)
+        self._install_abs(foreign)
         entry = self.tmp / "opt" / "xpfd"
-        entry_ran = self._install_abs(entry)
+        self._install_abs(entry)
+        _live, live_ran = self._arm_a_live_binary()
 
         self.stub_execstart = (
             f"{{ path={foreign} ; argv[]={foreign} -d ; ignore_errors=no }}\n"
@@ -928,13 +1170,14 @@ class TestResolutionBehaviour(_GateBase):
         self.stub_loadstate = "loaded"
 
         res = self._run()
-        self.assertFalse(
-            foreign_ran.exists(),
-            f"the gate executed {foreign}, the FIRST of several ExecStart "
+        self.assertNotIn(
+            str(foreign),
+            res.stderr,
+            f"the gate adopted {foreign}, the FIRST of several ExecStart "
             f"entries, which need not be xpfd (#6601 r4 MAJOR-1): {res.stderr}",
         )
-        self.assertFalse(entry_ran.exists(), "the gate picked an entry out of an ambiguous list")
-        self._assert_refused(res, "multi-entry ExecStart")
+        self._assert_ran(res, live_ran, "multi-entry ExecStart")
+        self.assertIn("resolved nothing to cross-check against", res.stderr)
 
     def test_multiline_execstart_with_one_delimiter_is_rejected(self):
         # The case the newline guard alone rejects, so that guard carries its
@@ -942,49 +1185,53 @@ class TestResolutionBehaviour(_GateBase):
         # ordinary multi-entry renders). One delimiter, several lines: the
         # count rule passes and, without the newline guard, the parse silently
         # adopts the first entry -- a REAL, usable binary here, so the mutation
-        # is not merely a failed resolve but a wrong execution.
+        # is not merely a failed resolve but a fabricated disagreement.
         first = self.tmp / "first" / "xpfd"
-        first_ran = self._install_abs(first)
+        self._install_abs(first)
         second = self.tmp / "second" / "xpfd"
-        second_ran = self._install_abs(second)
+        self._install_abs(second)
+        _live, live_ran = self._arm_a_live_binary()
 
         self.stub_execstart = f"{{ path={first} ; argv[]={first} }}\n{{ path={second} }}"
         self.stub_loadstate = "loaded"
 
         res = self._run()
-        self.assertFalse(
-            first_ran.exists(),
+        self.assertNotIn(
+            str(first),
+            res.stderr,
             "the gate adopted the first of a MULTI-LINE ExecStart render that "
             f"carries only one field delimiter: {res.stderr}",
         )
-        self.assertFalse(second_ran.exists())
-        self._assert_refused(res, "multi-line ExecStart with one delimiter")
+        self._assert_ran(res, live_ran, "multi-line ExecStart with one delimiter")
 
     def test_bare_execstart_with_a_tab_is_rejected(self):
         # #6601 r4 audit note. The bare (unstructured) rendering is accepted
         # only when the WHOLE value is one absolute path. Rejecting just spaces
         # and semicolons does not make that true: a tab separates a path from
         # its arguments equally well, and the value here names a real,
-        # executable file, so tolerating it is a wrong execution rather than a
-        # failed resolve.
+        # executable file, so tolerating it fabricates a disagreement rather
+        # than merely failing to resolve.
         tabbed = self.tmp / "tabbed" / "xpfd\t--flag"
-        tabbed_ran = self._install_abs(tabbed)
+        self._install_abs(tabbed)
+        _live, live_ran = self._arm_a_live_binary()
 
         self.stub_execstart = str(tabbed)
         self.stub_loadstate = "loaded"
 
         res = self._run()
-        self.assertFalse(
-            tabbed_ran.exists(),
+        self.assertNotIn(
+            str(tabbed),
+            res.stderr,
             "the gate accepted a bare ExecStart rendering containing a TAB. "
             "`path<TAB>--flag` is indistinguishable from a path plus an "
             f"argument, so it is not a whole path (#6601 r4): {res.stderr}",
         )
-        self._assert_refused(res, "bare ExecStart containing a tab")
+        self._assert_ran(res, live_ran, "bare ExecStart containing a tab")
 
     def test_bare_absolute_execstart_is_accepted(self):
         # OVER-REACH GUARD on the whitespace tightening: an ordinary bare
-        # rendering (a single absolute path, no arguments) must still resolve.
+        # rendering (a single absolute path, no arguments) must still resolve,
+        # or the cross-check quietly stops cross-checking on such a box.
         plain = self.tmp / "plain" / "xpfd"
         plain_ran = self._install_abs(plain)
 
@@ -992,15 +1239,12 @@ class TestResolutionBehaviour(_GateBase):
         self.stub_loadstate = "loaded"
 
         res = self._run()
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertTrue(
-            plain_ran.exists(),
-            f"a plain absolute bare ExecStart did not resolve: {res.stderr}",
-        )
+        self._assert_ran(res, plain_ran, "plain absolute bare ExecStart")
+        self.assertIn("confirmed by", res.stderr)
 
     # --------------------------------------------------- admission + refusals
 
-    def test_directory_candidate_is_not_treated_as_the_binary(self):
+    def test_directory_record_is_not_treated_as_the_binary(self):
         # `test -x` alone is TRUE for a searchable DIRECTORY. The inner hop's
         # validateGateBin rejects a non-regular target, so the outer hop must
         # too — otherwise the two hops' admission tests are not actually
@@ -1008,37 +1252,36 @@ class TestResolutionBehaviour(_GateBase):
         # as an infra error rather than the refusal it is.
         candidate = self.tmp / "isadir" / "xpfd"
         candidate.mkdir(parents=True)
-
-        self.stub_execstart = f"{{ path={candidate} ; argv[]={candidate} }}"
+        self.armed = str(candidate)
         self.stub_loadstate = "loaded"
 
         res = self._run()
         self.assertNotIn(
             "infra error",
             res.stderr,
-            f"a DIRECTORY named by ExecStart was exec'd as the gate binary "
+            f"a DIRECTORY named by the arm record was exec'd as the gate binary "
             f"instead of being rejected by the `-f` regular-file test: {res.stderr}",
         )
-        self._assert_refused(res, "ExecStart names a directory")
+        self._assert_refused(res, "the record names a directory")
 
-    def test_dangling_symlink_candidate_is_rejected(self):
+    def test_dangling_symlink_record_is_rejected(self):
         # #2176 leaves a symlink pointing into a removed versions dir.
         dangling = self.tmp / "dangle" / "xpfd"
         dangling.parent.mkdir(parents=True, exist_ok=True)
         dangling.symlink_to(self.tmp / "removed" / "versions" / "v1" / "xpfd")
-
-        self.stub_execstart = f"{{ path={dangling} ; argv[]={dangling} }}"
+        self.armed = str(dangling)
         self.stub_loadstate = "loaded"
 
         res = self._run()
-        self._assert_refused(res, "ExecStart names a dangling symlink")
+        self._assert_refused(res, "the record names a dangling symlink")
 
     def test_unqueryable_systemd_refuses_loudly_rather_than_skipping(self):
-        # #6601 r4 audit note. The quiet "xpf is not on this box" skip is only
-        # honest when systemd ANSWERED not-found. A systemctl that is missing or
-        # erroring proves NOTHING about whether xpf is installed -- laundering
-        # that into the benign skip lets an ARMED candidate sail past the gate
-        # behind a reassuring log line.
+        # #6601 r4 audit note. A systemctl that is missing or erroring proves
+        # NOTHING about this box -- laundering that into a benign skip lets an
+        # ARMED candidate sail past the gate behind a reassuring log line. Here
+        # the record is unusable AND systemd cannot be consulted, which is the
+        # least-information state the gate can be in, and it must still be loud.
+        self.armed = str(self.tmp / "gone" / "xpfd")
         self.stub_show_fail = "1"
 
         res = self._run()
@@ -1050,57 +1293,49 @@ class TestResolutionBehaviour(_GateBase):
         )
         self._assert_refused(res, "systemctl cannot be consulted")
 
-    def test_unusable_execstart_refuses_rather_than_guessing(self):
-        # A unit whose ExecStart names a path that no longer exists (mid-cut, a
-        # GC'd version dir). Earlier revisions fell through to the compiled
-        # defaults here -- which is exactly the wrong instinct: an ExecStart
-        # pointing into a relocated//GC'd root is the STRONGEST signal that a
-        # leftover at a default path is stale.
-        stale_sbin = self._install(SBIN, 0)
-        stale_versioned = self._install(VERSIONED, 0)
-        self.stub_execstart = f"{{ path={self.tmp}/gone/xpfd ; argv[]={self.tmp}/gone/xpfd }}"
+    def test_unqueryable_systemd_does_not_block_a_recorded_promotion(self):
+        # OVER-REACH GUARD on the above. systemd being unqueryable removes the
+        # cross-check, not the authority: with a usable record the gate must
+        # still promote, or an unrelated systemd hiccup silently costs every
+        # armed candidate its promotion.
+        _live, live_ran = self._arm_a_live_binary()
+        self.stub_show_fail = "1"
+
+        res = self._run()
+        self._assert_ran(res, live_ran, "systemctl unqueryable, record usable")
+        self.assertIn("resolved nothing to cross-check against", res.stderr)
+
+    def test_refuses_loudly_when_installed_but_the_record_is_unusable(self):
+        # FAIL LOUD, not quiet. xpfd.service is installed and a candidate was
+        # armed, but the recorded binary is gone: an armed candidate would
+        # otherwise sail past unverified with nothing in the journal to say so.
+        # The refusal must be explicit AND must stay exit 0 — a non-zero exit
+        # trips OnFailure= and reboots the box.
+        self.armed = str(self.tmp / "gone" / "xpfd")
         self.stub_loadstate = "loaded"
 
         res = self._run()
-        self.assertFalse(stale_sbin.exists(), f"ran a leftover: {res.stderr}")
-        self.assertFalse(stale_versioned.exists(), f"ran a leftover: {res.stderr}")
-        self._assert_refused(res, "ExecStart names a path that is gone")
-
-    def test_refuses_loudly_when_installed_but_unlocatable(self):
-        # FAIL LOUD, not quiet. xpfd.service is installed but nothing resolves:
-        # an armed candidate would otherwise sail past unverified with nothing
-        # in the journal to say so. The refusal must be explicit AND must stay
-        # exit 0 — a non-zero exit trips OnFailure= and reboots the box.
-        self.stub_loadstate = "loaded"
-
-        res = self._run()
-        self._assert_refused(res, "installed but unlocatable")
+        self._assert_refused(res, "installed but the record is unusable")
 
     def test_skips_rather_than_falling_back_to_path(self):
-        # systemd ANSWERED not-found: the one honest "xpf is not on this box"
-        # case. Skip quietly — and never reach for the perfectly good xpfd
-        # sitting on $PATH.
+        # Nothing armed and no journal: the one honest "there is nothing to
+        # promote" case. Skip quietly — and never reach for the perfectly good
+        # xpfd sitting on $PATH. That last clause is unconditional and survives
+        # every redesign: NO state of this gate may resolve xpfd through $PATH.
         res = self._run()
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertFalse(
-            self.marker.exists(),
-            "with no explicit candidate the gate fell back to $PATH (#6541)",
-        )
-        # MINOR-1 (#6601 r5): this must NOT read like a benign skip. The deb
-        # that installs this script also installs xpfd.service, so a not-found
-        # means the unit was removed or renamed -- and on such a box an armed
-        # candidate goes unverified. The line has to say the gate did not run
-        # and name what it looked for.
-        self.assertIn("WARNING", res.stderr)
-        self.assertIn("did NOT run", res.stderr)
-        self.assertIn("xpfd.service", res.stderr)
-        self.assertNotIn(
-            "skipping promotion gate",
-            res.stderr,
-            "the not-found branch still reads like a routine skip; on a box cut "
-            "with `--unit <name>` that line hides an UNVERIFIED armed candidate "
-            "(#6601 r5 MINOR-1)",
-        )
+        self._assert_nothing_armed(res, "no record, no journal")
+        # The quiet line still has to name what was looked for, so an operator
+        # who DID arm something can see which file the gate expected.
+        self.assertIn(str(self.fake_root) + ARM_RECORD, res.stderr)
+
+    def test_never_falls_back_to_path_on_a_refusal_either(self):
+        # The $PATH invariant is asserted on the REFUSAL path too, not only the
+        # quiet one: a refusal is precisely the moment a gate would be tempted
+        # to reach for "some xpfd, any xpfd".
+        self.armed = str(self.tmp / "gone" / "xpfd")
+        self.stub_loadstate = "loaded"
+        res = self._run()
+        self._assert_refused(res, "unusable record with a good xpfd on $PATH")
 
     # ------------------------------------------------------ contract preserved
 
@@ -1136,59 +1371,181 @@ class TestResolutionBehaviour(_GateBase):
         self.assertFalse(self.systemctl_ran.exists(), "an infra error triggered a reboot")
 
 
-class TestRenamedUnitIsNotLaundered(_GateBase):
-    """#6601 r5 MINOR-1 — `--unit <name>` boxes must not get a benign skip.
+class TestArmedWithoutARecordIsNotLaundered(_GateBase):
+    """#6601 r7 — "record absent" is an INFERENCE, and it must be checked.
 
-    `xpfd upgrade cut --unit myxpf` is a SUPPORTED standalone selector
-    (cmd/xpfd/upgrade.go). On such a host flip maintains myxpf.service, and the
-    deb-installed xpfd.service may have been removed. The gate queries
-    xpfd.service specifically -- deliberately, since inferring which unit is the
-    xpf one would resolve a leftover from a renamed unit as readily as the live
-    one -- so it finds not-found and cannot resolve a binary.
+    The r5 work removed a benign-looking skip from the not-found-unit branch
+    because an ARMED candidate could go unverified behind it. The r6 redesign
+    then introduced a new branch with exactly that shape: the record is absent,
+    so the gate declares "nothing to promote" and exits — a positive claim made
+    from the ABSENCE of a file.
 
-    That state must NOT be reported as a routine skip: an armed candidate would
-    boot, run UNVERIFIED, never be promoted, and the only journal line would read
-    like everything was fine. Two defences, both asserted here:
+    That claim holds only because arming writes the record (before the ARMED
+    transition) and clears it with the journal. The two desync out of band: Go
+    derives the record's location from the journal path, so `xpfd upgrade kernel
+    arm --journal <elsewhere>` writes it where this gate never looks, and a
+    restored rootfs, a stray cleanup of /var/lib/xpf, or an interrupted clear
+    each get there too. A candidate is then armed, the gate silently does not
+    run, and the next reboot reverts it.
 
-      * `xpfd upgrade kernel arm` REFUSES this layout up front
-        (CheckKernelPromotionUnit, pkg/upgrade -- Go-side tests).
-      * the boot-time gate says loudly that it did not run, and names what it
-        looked for.
+    Not promoting is the SAFE direction, so this is availability and honesty
+    rather than security — but a candidate kernel that silently never promotes
+    is exactly the laundering the tests above exist to prevent. So the quiet
+    exit is conditional on the journal agreeing, and the divergent state is loud.
     """
 
-    def test_renamed_unit_does_not_read_as_a_benign_skip(self):
-        # The whole scenario: the default unit is GONE (renamed to myxpf), and a
-        # perfectly good xpfd is on $PATH for a PATH-resolving gate to find.
+    def test_armed_journal_without_a_record_refuses_loudly(self):
+        self.arm_explicitly_absent = True
+        self.journal = self.journal_body("ARMED")
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self._assert_refused(res, "journal says ARMED, record absent")
+        for want in ("did NOT run", "UNVERIFIED", "ARMED"):
+            self.assertIn(
+                want,
+                res.stderr,
+                f"the divergent-state line does not say {want!r}; an operator "
+                f"cannot tell an armed candidate went unverified: {res.stderr}",
+            )
+        # It must name BOTH files, so the desync is diagnosable without guessing
+        # which one the operator should look at.
+        self.assertIn(str(self.fake_root) + ARM_RECORD, res.stderr)
+        self.assertIn(str(self.fake_root) + KERNEL_JOURNAL, res.stderr)
+
+    def test_armed_journal_without_a_record_never_reaches_for_path(self):
+        # The refusal must not become a reason to go looking for an xpfd. This
+        # is the state with the strongest pull towards a fallback: something IS
+        # armed and there is a perfectly good xpfd on $PATH.
+        self.arm_explicitly_absent = True
+        self.journal = self.journal_body("ARMED")
+        res = self._run()
+        self._assert_no_path_fallback(res, "armed journal, absent record")
+
+    def test_compact_armed_journal_is_still_recognised(self):
+        # The gate reads the journal line by line and json.MarshalIndent output
+        # has no trailing newline. A compact single-line rendering is therefore
+        # the shape most likely to be missed entirely — and missing it puts the
+        # silent skip straight back.
+        self.arm_explicitly_absent = True
+        self.journal = (
+            '{"candidate_version":"6.18.5-12-generic","state":"ARMED",'
+            '"boot_id":"Boot0002"}'
+        )
+        res = self._run()
+        self._assert_refused(res, "compact single-line ARMED journal")
+
+    def test_arming_state_is_not_a_trial_in_flight(self):
+        # OVER-REACH GUARD. ARMING is PREPARED INTENT recorded before the
+        # firmware one-shot is read back; only the verified ARMED state is a
+        # trial. `upgrade.IsArmed` draws exactly this line, and a journal stuck
+        # at ARMING is an ordinary boot. Refusing here would put a loud error
+        # on every boot of a box whose arm was interrupted.
+        self.arm_explicitly_absent = True
+        self.journal = self.journal_body("ARMING")
+        res = self._run()
+        self._assert_nothing_armed(res, "journal at ARMING, not ARMED")
+
+    def test_terminal_journal_states_are_not_a_trial_in_flight(self):
+        # Same guard for the other side: a PROMOTED/REVERTED journal that has
+        # not been cleared yet (a read-only root, say) is done, not armed.
+        for state in ("PROMOTED", "REVERTED", "PREFLIGHT", "INSTALLED"):
+            with self.subTest(state):
+                self.setUp()
+                self.arm_explicitly_absent = True
+                self.journal = self.journal_body(state)
+                res = self._run()
+                self._assert_nothing_armed(res, f"journal at {state}")
+
+    def test_unreadable_journal_warns_rather_than_claiming_nothing_is_armed(self):
+        # Absence of evidence is not evidence of absence. A journal that exists
+        # but cannot be read as one leaves the gate unable to establish whether
+        # a candidate is armed, and the honest report of that is a warning, not
+        # the confident "nothing to promote".
+        self.arm_explicitly_absent = True
+        j = self._journal_path()
+        j.parent.mkdir(parents=True, exist_ok=True)
+        j.mkdir()  # present, but not a readable regular file
+
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("WARNING", res.stderr)
+        self.assertIn("did NOT run", res.stderr)
+        self.assertIn("UNVERIFIED", res.stderr)
+        self.assertNotIn(
+            "nothing to promote",
+            res.stderr,
+            "an unreadable journal was reported as proof that nothing is armed "
+            f"(#6601 r7): {res.stderr}",
+        )
+        self._assert_no_path_fallback(res, "unreadable journal")
+
+    def test_armed_journal_WITH_a_usable_record_promotes(self):
+        # NEGATIVE CONTROL for the whole branch. The ordinary armed boot — a
+        # journal at ARMED and a record naming a live binary — must still
+        # promote. A gate that refuses everything is not a fix.
+        _live, live_ran = self._arm_a_live_binary()
+        self.journal = self.journal_body("ARMED")
+        self.stub_loadstate = "loaded"
+
+        res = self._run()
+        self._assert_ran(res, live_ran, "ordinary armed boot")
+        self.assertIn("promotion gate: clean", res.stderr)
+
+
+class TestRenamedUnitIsSupportedNotLaundered(_GateBase):
+    """#6601 r5 MINOR-1, re-expressed for the record design.
+
+    `xpfd upgrade cut --unit myxpf` is a SUPPORTED standalone selector
+    (cmd/xpfd/upgrade.go). On such a host flip maintains myxpf.service and the
+    deb-installed xpfd.service may have been removed, so the pinned unit reports
+    not-found and cannot resolve a binary.
+
+    Under the r5 design that state could not be verified at all: the unit WAS
+    the authority, so arming refused the layout up front and the boot gate had
+    to say loudly that it did not run. The record removes the dependency — the
+    arming knows which xpfd it is regardless of what the unit is called — so a
+    renamed-unit box now PROMOTES, and the laundering risk moved to the
+    armed-without-record state covered in the class above.
+
+    Both halves are asserted here: the renamed unit must not block a promotion,
+    and it must not manufacture a silent one either.
+    """
+
+    def test_renamed_unit_does_not_block_a_recorded_promotion(self):
+        _live, live_ran = self._arm_a_live_binary()
         self.stub_loadstate = "not-found"
         self.stub_mainpid = "0"
         self.stub_execstart = ""
 
         res = self._run()
-        self.assertEqual(
-            res.returncode,
-            0,
-            "must stay exit 0 -- a non-zero exit trips OnFailure= and reboots "
-            f"the box: {res.stderr}",
-        )
-        self.assertFalse(
-            self.marker.exists(),
-            "the gate executed the xpfd it found on $PATH (#6541)",
+        self._assert_ran(res, live_ran, "unit renamed away, record present")
+        self.assertIn(
+            "resolved nothing to cross-check against",
+            res.stderr,
+            "a not-found unit was reported as CONFIRMING the record; absence of "
+            f"a cross-check is not a cross-check: {res.stderr}",
         )
 
-        # The load-bearing assertion. A line that reads like a routine skip is
-        # exactly what launders an unverified candidate.
-        self.assertNotIn(
-            "skipping promotion gate",
-            res.stderr,
-            "a renamed-unit box still gets a reassuring 'skipping' line while an "
-            "armed candidate goes UNVERIFIED (#6601 r5 MINOR-1)",
-        )
-        for want in ("WARNING", "did NOT run", "xpfd.service", "UNVERIFIED"):
+    def test_renamed_unit_does_not_read_as_a_benign_skip(self):
+        # The whole scenario, with the state that actually launders: the default
+        # unit is GONE (renamed to myxpf), a candidate IS armed, the record has
+        # desynced, and a perfectly good xpfd is on $PATH for a PATH-resolving
+        # gate to find.
+        self.arm_explicitly_absent = True
+        self.journal = self.journal_body("ARMED")
+        self.stub_loadstate = "not-found"
+        self.stub_mainpid = "0"
+        self.stub_execstart = ""
+
+        res = self._run()
+        self._assert_refused(res, "renamed unit, armed candidate, no record")
+        for want in ("did NOT run", "UNVERIFIED"):
             self.assertIn(
                 want,
                 res.stderr,
-                f"the not-found line does not say {want!r}; an operator cannot "
-                f"tell the gate silently did not run: {res.stderr}",
+                f"the line does not say {want!r}; an operator cannot tell the "
+                f"gate silently did not run: {res.stderr}",
             )
         # It must name what it looked for, so the operator can act.
         self.assertIn("LoadState=[not-found]", res.stderr)
@@ -1196,28 +1553,34 @@ class TestRenamedUnitIsNotLaundered(_GateBase):
 
 
 class TestRefusalCarriesFacts(_GateBase):
-    """#6601 r5 MINOR-2 — the refusal is the only signal, so it must carry data.
+    """#6601 r5 MINOR-2 / r7 MINOR-3 — the refusal is the only signal.
 
     exit 0 keeps the unit `active`, so `systemctl status xpf-kernel-promote`
     reads SUCCESS. The journal line is all an operator gets, and policy prose
     without the facts systemd returned is not actionable. Its advice must also
-    branch on which of the two named causes fired: telling someone to fix
-    ExecStart when systemctl could not be consulted points at the wrong system.
+    branch on which cause fired: telling someone to fix ExecStart when systemctl
+    could not be consulted points at the wrong system.
+
+    r7 MINOR-3 adds that the facts must be the ones the DECISION was made on.
+    The previous revision suppressed query failures during discovery and then
+    RE-QUERIED to build this message, so a transient failure that had recovered
+    was reported as a unit configuration problem and the operator was told to fix
+    a perfectly valid ExecStart.
     """
 
     def test_refusal_echoes_what_systemd_returned(self):
+        self.armed = "/nonexistent/xpfd"
         self.stub_loadstate = "loaded"
         self.stub_mainpid = "0"
-        self.stub_execstart = "{ path=/nonexistent/xpfd ; argv[]=/nonexistent/xpfd ; ignore_errors=no }"
+        self.stub_execstart = "{ path=/some/other/xpfd ; argv[]=/some/other/xpfd ; ignore_errors=no }"
 
         res = self._run()
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn("ERROR", res.stderr)
-        self.assertIn("REFUSING to promote", res.stderr)
+        self._assert_refused(res, "recorded binary is gone")
 
         for want in (
             "LoadState=[loaded]",
             "MainPID=[0]",
+            "ExecStart=[{ path=/some/other/xpfd",
             "/nonexistent/xpfd",
         ):
             self.assertIn(
@@ -1229,13 +1592,14 @@ class TestRefusalCarriesFacts(_GateBase):
             )
 
     def test_advice_branches_on_the_cause_installed(self):
-        # xpf IS installed; the actionable advice is to fix the unit.
+        # xpf IS installed; the actionable advice names the unit AND the re-arm.
+        self.armed = str(self.tmp / "gone" / "xpfd")
         self.stub_loadstate = "loaded"
         self.stub_mainpid = "0"
         self.stub_execstart = "garbage-not-a-path"
 
         res = self._run()
-        self.assertEqual(res.returncode, 0, res.stderr)
+        self._assert_refused(res, "installed, record unusable")
         self.assertIn("IS known to systemd", res.stderr)
         self.assertIn("Fix xpfd.service", res.stderr)
         self.assertNotIn("systemd-availability problem", res.stderr)
@@ -1244,13 +1608,14 @@ class TestRefusalCarriesFacts(_GateBase):
         # systemctl could not be consulted. Telling the operator to fix
         # ExecStart here is actively WRONG -- there is no evidence about the
         # unit at all.
+        self.armed = str(self.tmp / "gone" / "xpfd")
         self.stub_show_fail = "1"
 
         res = self._run()
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn("ERROR", res.stderr)
+        self._assert_refused(res, "systemctl unreachable, record unusable")
         self.assertIn("could not be consulted", res.stderr)
         self.assertIn("systemd-availability problem", res.stderr)
+        self.assertIn("<systemctl failed>", res.stderr)
         self.assertNotIn(
             "Fix xpfd.service so its ExecStart",
             res.stderr,
@@ -1258,6 +1623,22 @@ class TestRefusalCarriesFacts(_GateBase):
             "systemctl could not be consulted at all -- that points at the "
             "wrong system (#6601 r5 MINOR-2)",
         )
+
+    def test_advice_branches_on_the_cause_unit_not_found(self):
+        # The third cause, new with the record design: the unit is genuinely
+        # not-found because this host runs xpfd under another name. Telling the
+        # operator to fix an xpfd.service they deliberately do not use is the
+        # same wrong-system mistake as the branch above, so the advice is the
+        # re-arm that actually rewrites the record.
+        self.armed = str(self.tmp / "gone" / "xpfd")
+        self.stub_loadstate = "not-found"
+
+        res = self._run()
+        self._assert_refused(res, "unit not-found, record unusable")
+        self.assertIn("is not-found", res.stderr)
+        self.assertIn("xpfd upgrade kernel arm", res.stderr)
+        self.assertNotIn("systemd-availability problem", res.stderr)
+        self.assertNotIn("Fix xpfd.service so its ExecStart", res.stderr)
 
 
 class TestBusyboxParity(_GateBase):
@@ -1283,34 +1664,54 @@ class TestBusyboxParity(_GateBase):
         self.stub_execstart = f"{{ path={live} ; argv[]={live} ; ignore_errors=no }}"
 
         res = self._run()
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertTrue(ran.exists(), f"busybox sh did not resolve+run: {res.stderr}")
+        self._assert_ran(res, ran, "busybox sh")
+        self.assertIn("confirmed by", res.stderr)
 
     def test_whitespace_rejection_holds_under_busybox(self):
-        # The bare-rendering branch must reject a TAB as well as a space. This
-        # is the specific claim the comment makes about [[:space:]].
+        # The bare-rendering branch must reject a TAB as well as a space — the
+        # specific claim the `[[:space:]]` comment makes. ExecStart is still
+        # parsed (it feeds the cross-check), so the rule still has to hold:
+        # each value below names a REAL executable, so tolerating it would
+        # contradict the record and refuse a healthy promotion.
         for ws, label in ((" ", "space"), ("\t", "tab")):
             with self.subTest(label):
+                self.setUp()
+                bad = self.tmp / "bare" / f"xpfd{ws}--flag"
+                self._install_abs(bad)
+                _live, live_ran = self._arm_a_live_binary()
                 self.stub_loadstate = "loaded"
                 self.stub_mainpid = "0"
-                self.stub_execstart = f"/opt/xpfd{ws}--flag"
+                self.stub_execstart = str(bad)
+
                 res = self._run()
-                self.assertEqual(res.returncode, 0, res.stderr)
-                self.assertIn(
-                    "REFUSING to promote",
+                self.assertNotIn(
+                    str(bad),
                     res.stderr,
                     f"busybox sh accepted a bare ExecStart containing a {label}; "
-                    "the [[:space:]] portability claim is false there",
+                    "the [[:space:]] portability claim is false there: "
+                    f"{res.stderr}",
                 )
+                self._assert_ran(res, live_ran, f"bare ExecStart with a {label}")
 
-    def test_renamed_unit_warning_holds_under_busybox(self):
+    def test_journal_armed_state_is_recognised_under_busybox(self):
+        # The r7 journal read is a `case` glob with an embedded variable and
+        # quoted quotes. busybox sh is the other shell this runs under at early
+        # boot, and a glob that silently never matches there would restore the
+        # silent skip on exactly the platform the appliance boots.
+        self.arm_explicitly_absent = True
+        self.journal = self.journal_body("ARMED")
         self.stub_loadstate = "not-found"
-        self.stub_mainpid = "0"
-        self.stub_execstart = ""
         res = self._run()
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn("WARNING", res.stderr)
-        self.assertNotIn("skipping promotion gate", res.stderr)
+        self._assert_refused(res, "busybox sh, journal ARMED, record absent")
+        self.assertIn("UNVERIFIED", res.stderr)
+
+    def test_arming_state_is_not_a_trial_under_busybox(self):
+        # The other side of the same glob: ARMING must NOT match, or busybox
+        # boxes get a loud error on every ordinary boot.
+        self.arm_explicitly_absent = True
+        self.journal = self.journal_body("ARMING")
+        res = self._run()
+        self._assert_nothing_armed(res, "busybox sh, journal ARMING")
 
 
 if __name__ == "__main__":
