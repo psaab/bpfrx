@@ -40,8 +40,13 @@ import (
 //     forwarding-table export). A commit-time validator walked the same one
 //     side the compiler did, so an INVALID value in any slot but the first
 //     committed CLEAN. Each of these has a paired "bogus value in slot 2"
-//     assertion — that half is the actual security bug, and a fix that only
-//     restores the value without extending the gate would leave it open.
+//     assertion — that half is the actual defect, and a fix that only restores
+//     the value without extending the gate would leave it open. What the escape
+//     COSTS differs per site and is stated at each test rather than assumed
+//     uniform: for static-NAT `match destination-address` it is a lost
+//     DIAGNOSTIC, not a dataplane fail-open, because only the first prefix is
+//     ever lowered (see
+//     TestStaticNATMatchAddresses6659TolerantPathValidatesEveryPrefix).
 //
 // Per CLAUDE.md, every flat-set case is built with ParseSetCommand +
 // tree.SetPath, never NewParser (which merges all set lines into one node).
@@ -319,9 +324,19 @@ func TestStaticNATMatchAddresses6659MultiRejected(t *testing.T) {
 // — which means a strict-path test cannot distinguish "the prefix gate reads
 // every value" from "the prefix gate reads only the first". On the tolerant load
 // / peer-sync path the multi-value gate downgrades to a warning and the config
-// LOADS, so the prefix validator is the only thing left between a malformed
-// slot-2 prefix and a mapping the Rust dataplane silently drops
-// (`parse_nat_prefix` returns None and `from_snapshots` continues).
+// LOADS, so the prefix validator is the only place a malformed tail prefix can
+// still be named.
+//
+// WHAT THE ESCAPE COSTS, stated because the tempting version is FALSE: this is
+// NOT a last line of defence in front of the Rust dataplane. Only the FIRST
+// prefix is ever lowered — the userspace snapshot builder sets
+// `ExternalIP: rule.Match` (pkg/dataplane/userspace/nat_static.go) and
+// MatchAddresses has no consumer outside these validators — so a malformed slot
+// 2 is dropped by the Go lowering and never reaches `parse_nat_prefix`. What is
+// lost when the tail escapes is the DIAGNOSTIC: the tolerant-path warning tells
+// the operator to split the list into one rule per external prefix, and without
+// this loop they would discover slot 2 is malformed only on the commit AFTER
+// they follow that advice.
 //
 // Before #6659 that validator read the scalar rule.Match — the FIRST value — so
 // the tail escaped it entirely. It now walks MatchAddresses.
@@ -370,6 +385,135 @@ func TestStaticNATMatchAddresses6659TolerantPathValidatesEveryPrefix(t *testing.
 	if strings.Contains(strings.Join(okCfg.Warnings, "\n"), "is not a valid IP address or CIDR prefix") {
 		t.Fatalf("well-formed prefixes produced a prefix-validity complaint:\n%s",
 			strings.Join(okCfg.Warnings, "\n"))
+	}
+}
+
+// staticNAT6659Trees builds one static-NAT probe in BOTH parser shapes, because
+// the bracketed list collapses onto Keys[1:] in either and a fix that reads only
+// one shape passes half of them (CLAUDE.md, #2419). The flat-set arm goes
+// through ParseSetCommand + SetPath, never NewParser.
+func staticNAT6659Trees(t *testing.T, match, then string) map[string]*ConfigTree {
+	t.Helper()
+	return map[string]*ConfigTree{
+		"flat-set": setTree6659(t,
+			"set security nat static rule-set rs1 from zone untrust",
+			"set security nat static rule-set rs1 rule r1 match destination-address "+match,
+			"set security nat static rule-set rs1 rule r1 then static-nat prefix "+then,
+		),
+		"hier block": hierTree6659(t, `
+security { nat { static { rule-set rs1 {
+    from zone untrust;
+    rule r1 {
+        match { destination-address `+match+`; }
+        then { static-nat { prefix `+then+`; } }
+    }
+} } } }`),
+	}
+}
+
+// TestStaticNATMatchAddresses6659TolerantPathHostMaskEverySlot is the
+// SCOPE guard for the widened prefix loop above.
+//
+// Widening the parse-validity check without widening the HOST-ROUTE check left
+// the fix scoped narrower than the claim it shipped under: read scalar, the
+// host-route requirement classified the whole rule off slot 1, so
+// `[ 192.0.2.1/32 198.51.100.0/24 ]` produced NO host-route complaint at all
+// while `198.51.100.0/24` on its own DID. A non-host prefix is a different
+// failure from an unparseable one — it parses fine, so the parse loop above
+// never touches it — and it is the more likely operator typo of the two.
+//
+// Tolerant path for the same reason its sibling is: at strict commit the
+// multi-value gate rejects the list first and the tail is unreachable.
+func TestStaticNATMatchAddresses6659TolerantPathHostMaskEverySlot(t *testing.T) {
+	// The host-route complaint NAMING the slot-2 address as its own operand.
+	//
+	// Asserting on the bare address would be attribution-blind and vacuous: the
+	// multi-value gate's warning echoes the entire authored list, so
+	// "198.51.100.0/24" appears in the warnings whether or not the host-route
+	// check ever looked past slot 1. Only the check itself emits this phrase.
+	const hostMsg = `match destination-address "198.51.100.0/24" must be a host route`
+
+	for name, tree := range staticNAT6659Trees(t, "[ 192.0.2.1/32 198.51.100.0/24 ]", "10.0.0.1/32") {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := CompileConfigLenient(tree)
+			if err != nil {
+				t.Fatalf("tolerant path must LOAD (no-brick, #1960), got: %v", err)
+			}
+			joined := strings.Join(cfg.Warnings, "\n")
+			if !strings.Contains(joined, hostMsg) {
+				t.Fatalf("the non-host SLOT-2 prefix escaped the HOST-ROUTE check — it is "+
+					"classifying the rule off slot 1 only.\nwant a warning containing %q\nwarnings:\n%s",
+					hostMsg, joined)
+			}
+		})
+	}
+
+	// Negative control on the same path: an all-host list warns about the
+	// multi-value collapse but must NOT produce a host-route complaint.
+	for name, tree := range staticNAT6659Trees(t, "[ 192.0.2.1/32 192.0.2.2/32 ]", "10.0.0.1/32") {
+		t.Run("all-host control/"+name, func(t *testing.T) {
+			cfg, err := CompileConfigLenient(tree)
+			if err != nil {
+				t.Fatalf("tolerant path must LOAD, got: %v", err)
+			}
+			if joined := strings.Join(cfg.Warnings, "\n"); strings.Contains(joined, "must be a host route") {
+				t.Fatalf("all-host prefixes produced a host-route complaint:\n%s", joined)
+			}
+		})
+	}
+}
+
+// TestStaticNATMatchAddresses6659TolerantPathZeroLengthBlockInAnySlot covers the
+// other consumer of the block-pair classification: #5658's `/0` identity-NAT
+// rejection. It reads a MATCH address, so it moved to the same per-address
+// classification — otherwise a `0.0.0.0/0` authored in the tail is classified
+// against slot 1, lands in neither the block branch nor the host branch, and
+// disappears.
+func TestStaticNATMatchAddresses6659TolerantPathZeroLengthBlockInAnySlot(t *testing.T) {
+	const zeroMsg = `zero-length (/0) prefix (match destination-address "0.0.0.0/0"`
+	for name, tree := range staticNAT6659Trees(t, "[ 192.0.2.0/24 0.0.0.0/0 ]", "0.0.0.0/0") {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := CompileConfigLenient(tree)
+			if err != nil {
+				t.Fatalf("tolerant path must LOAD, got: %v", err)
+			}
+			joined := strings.Join(cfg.Warnings, "\n")
+			if !strings.Contains(joined, zeroMsg) {
+				t.Fatalf("the /0 block pair authored in SLOT 2 escaped the #5658 check.\n"+
+					"want a warning containing %q\nwarnings:\n%s", zeroMsg, joined)
+			}
+		})
+	}
+}
+
+// TestStaticNATMatchAddresses6659ThenSideKeepsInstalledPair is the guard on the
+// OTHER edge of that widening — the one that says how far it must NOT go.
+//
+// The block-pair classification is what EXEMPTS a side from the host-route
+// requirement, so hoisting it to "any authored match address pairs with the
+// target" would have been the obvious way to widen it. That would be a
+// FAIL-OPEN: only slot 1 is ever lowered (`ExternalIP: rule.Match`), so
+// `match [ 192.0.2.1/32 198.51.100.0/24 ] then 10.0.0.0/24` installs a
+// host-vs-block pair, and an "any" flag would exempt the target from the
+// host-route complaint that catches it today because slot 2 happens to pair with
+// it. Checks whose operand is a match address widen per-address; checks whose
+// operand is the `then` prefix keep the pair that installs.
+func TestStaticNATMatchAddresses6659ThenSideKeepsInstalledPair(t *testing.T) {
+	const thenMsg = `then static-nat prefix "10.0.0.0/24" must be a host route`
+	for name, tree := range staticNAT6659Trees(t, "[ 192.0.2.1/32 198.51.100.0/24 ]", "10.0.0.0/24") {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := CompileConfigLenient(tree)
+			if err != nil {
+				t.Fatalf("tolerant path must LOAD, got: %v", err)
+			}
+			joined := strings.Join(cfg.Warnings, "\n")
+			if !strings.Contains(joined, thenMsg) {
+				t.Fatalf("the target's host-route complaint was SUPPRESSED by a tail match "+
+					"address that happens to pair with it — the installed pair is "+
+					"(%q, %q) and it is host-vs-block.\nwant a warning containing %q\nwarnings:\n%s",
+					"192.0.2.1/32", "10.0.0.0/24", thenMsg, joined)
+			}
+		})
 	}
 }
 
@@ -449,7 +593,17 @@ func TestForwardingTableExport6659DanglingRefInAnySlot(t *testing.T) {
 // TestForwardingTableExport6659MultiRejected pins that a multi-policy chain is
 // rejected rather than silently collapsing: the FRR renderer honours exactly one
 // export policy (resolveECMP), so the rest had no effect and nothing said so.
+//
+// It asserts the MULTI gate's own wording, for the same reason its sibling
+// TestForwardingTableExport6659DanglingRefInAnySlot asserts the dangling gate's:
+// both policies here are DEFINED, so today only the multi gate can reject this
+// config — but a bare `err != nil` would also be satisfied by any future gate
+// that happens to reject a two-policy export for an unrelated reason, and the
+// multi rejection this test is named for could then be deleted with nothing
+// going red. Attribution-blind assertions are exactly what let the one-sided
+// slot-1 read survive on the dangling test.
 func TestForwardingTableExport6659MultiRejected(t *testing.T) {
+	const multiMsg = "forwarding-table export declares 2 policies"
 	_, err := CompileConfig(setTree6659(t,
 		"set policy-options policy-statement p1 then accept",
 		"set policy-options policy-statement p2 then accept",
@@ -458,6 +612,10 @@ func TestForwardingTableExport6659MultiRejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("multi-policy forwarding-table export committed CLEAN; only the first " +
 			"policy renders, so the rest are silently ignored")
+	}
+	if !strings.Contains(err.Error(), multiMsg) {
+		t.Fatalf("rejected, but NOT by the multi-policy gate.\n  got:  %v\n"+
+			"  want a message containing %q", err, multiMsg)
 	}
 }
 
@@ -488,15 +646,21 @@ routing-options { forwarding-table { export p1; } }`)},
 	}
 }
 
-// --- proxy-ARP address list (value-drop, NOT a gate escape) -----------------
+// --- proxy-ARP address list (value-drop + the validator the widened read
+// --- required) --------------------------------------------------------------
 
-// TestProxyARPAddresses6659BothShapes pins the proxy-ARP list. This one is
-// included here because the issue groups it with the high-severity sites, but it
-// is a PURE VALUE-DROP, not a gate escape: proxy-ARP addresses carry no
-// commit-time validator at all, so a malformed address in the FIRST slot commits
-// clean too (asserted below so the distinction is recorded rather than assumed).
-// The drop still matters — the firewall answered ARP for one address of the
-// authored set and stayed silent for the rest.
+// TestProxyARPAddresses6659BothShapes pins the proxy-ARP list. The drop it
+// guards is a PURE VALUE-DROP rather than a gate escape — the firewall answered
+// ARP for one address of the authored set and stayed silent for the rest.
+//
+// The earlier revision of this comment claimed a malformed address in the FIRST
+// slot "commits clean too (asserted below)". Nothing below asserted it, and the
+// statement is no longer true either way: restoring the tail values means a
+// malformed one now MATERIALISES into ProxyARPEntry.Addresses instead of being
+// dropped at compile, so this PR had to add the missing commit-time validator in
+// the same change. That validator, and the acceptance boundary it draws, are
+// asserted for real in TestProxyARPAddresses6659MalformedRejected — including
+// the first-slot case, which is the hole that predates #6659.
 func TestProxyARPAddresses6659BothShapes(t *testing.T) {
 	want := []string{"192.0.2.1/32", "192.0.2.2/32"}
 	for _, tc := range []struct {
@@ -520,10 +684,131 @@ security { nat { proxy-arp { interface ge-0/0/0 { address { 192.0.2.1; 192.0.2.2
 	}
 }
 
+// proxyARP6659Trees builds one proxy-ARP `address` probe in BOTH parser shapes.
+func proxyARP6659Trees(t *testing.T, addrs ...string) map[string]*ConfigTree {
+	t.Helper()
+	bracket := "[ " + strings.Join(addrs, " ") + " ]"
+	var block strings.Builder
+	for _, a := range addrs {
+		block.WriteString(a)
+		block.WriteString("; ")
+	}
+	return map[string]*ConfigTree{
+		"flat-set bracket": setTree6659(t,
+			"set security nat proxy-arp interface ge-0/0/0 address "+bracket),
+		"hier block": hierTree6659(t,
+			"security { nat { proxy-arp { interface ge-0/0/0 { address { "+block.String()+"} } } } }"),
+	}
+}
+
+// TestProxyARPAddresses6659MalformedRejected is the validator the widened read
+// REQUIRED, and the assertion the previous revision of this file only claimed.
+//
+// Restoring the tail addresses changed what a malformed one does. It used to be
+// discarded at compile (nodeVal kept slot 1); it now lands in
+// ProxyARPEntry.Addresses, and pkg/dataplane/proxyarp.go parses each entry with
+// netip.ParsePrefix, logs a bounded warning and SKIPS the failures — a
+// silently-inert address that answers no ARP/ND, so inbound traffic to it is
+// never drawn to this firewall. A widened read with an unwidened validator
+// converts a value-drop into that inert entry, which is why the gate lands in
+// the same change rather than as a follow-up.
+//
+// Both slots are covered. Slot 2 is the one #6659 exposed; slot 1 is the hole
+// that predates it, because proxy-ARP addresses carried no commit-time
+// validator at all.
+func TestProxyARPAddresses6659MalformedRejected(t *testing.T) {
+	// The gate's own wording, naming the offending value. Nothing else in the
+	// compiler emits it, so a rejection carrying this phrase can only be this
+	// gate — no other gate can satisfy the assertion on the operator's behalf.
+	const gateMsg = `security nat proxy-arp interface "ge-0/0/0" address "bogus/32" is not a valid IP address or CIDR prefix`
+
+	for _, slot := range []struct {
+		name  string
+		addrs []string
+	}{
+		{"malformed in SECOND slot (exposed by the widened read)", []string{"192.0.2.1", "bogus"}},
+		{"malformed in FIRST slot (hole that predates #6659)", []string{"bogus", "192.0.2.1"}},
+	} {
+		for name, tree := range proxyARP6659Trees(t, slot.addrs...) {
+			t.Run("strict/"+slot.name+"/"+name, func(t *testing.T) {
+				_, err := CompileConfig(tree)
+				if err == nil {
+					t.Fatal("a malformed proxy-ARP address committed CLEAN; the installer " +
+						"skips it, so the firewall answers no ARP/ND for it and nothing said so")
+				}
+				if !strings.Contains(err.Error(), gateMsg) {
+					t.Fatalf("rejected, but NOT by the proxy-ARP address gate.\n  got:  %v\n"+
+						"  want a message containing %q", err, gateMsg)
+				}
+			})
+		}
+	}
+
+	// The TOLERANT load / peer-sync path must warn rather than reject (#1960
+	// no-brick: an already-persisted config with a bad proxy-ARP address has to
+	// keep booting). Covered separately from strict because a strict gate that
+	// fires first can mask an unvalidated tolerant path entirely — the tolerant
+	// path is where a downgrade that silently drops the diagnostic would hide.
+	for name, tree := range proxyARP6659Trees(t, "192.0.2.1", "bogus") {
+		t.Run("tolerant/"+name, func(t *testing.T) {
+			cfg, err := CompileConfigLenient(tree)
+			if err != nil {
+				t.Fatalf("tolerant path must LOAD (no-brick, #1960), got: %v", err)
+			}
+			joined := strings.Join(cfg.Warnings, "\n")
+			if !strings.Contains(joined, gateMsg) {
+				t.Fatalf("the malformed proxy-ARP address produced no gate warning on the "+
+					"tolerant path.\nwant a warning containing %q\nwarnings:\n%s", gateMsg, joined)
+			}
+			// And the entry still loads, unchanged — the downgrade must not
+			// quietly become a drop.
+			if len(cfg.Security.NAT.ProxyARP) != 1 {
+				t.Fatalf("expected 1 proxy-arp entry on the tolerant path, got %d",
+					len(cfg.Security.NAT.ProxyARP))
+			}
+			if want := []string{"192.0.2.1/32", "bogus/32"}; !reflect.DeepEqual(
+				cfg.Security.NAT.ProxyARP[0].Addresses, want) {
+				t.Fatalf("tolerant Addresses = %q, want %q",
+					cfg.Security.NAT.ProxyARP[0].Addresses, want)
+			}
+		})
+	}
+
+	// GREEN CONTROLS: the gate must not reject anything the installer accepts.
+	// netip.ParsePrefix is the installer's own call, so these are the shapes
+	// that reach it intact — a bare v4 address (compiler appends /32), an
+	// explicit CIDR block, and a v6 address.
+	for name, tree := range proxyARP6659Trees(t, "192.0.2.1", "198.51.100.0/24", "2001:db8::1/128") {
+		t.Run("well-formed control/"+name, func(t *testing.T) {
+			cfg, err := CompileConfig(tree)
+			if err != nil {
+				t.Fatalf("well-formed proxy-ARP addresses rejected: %v", err)
+			}
+			want := []string{"192.0.2.1/32", "198.51.100.0/24", "2001:db8::1/128"}
+			if got := cfg.Security.NAT.ProxyARP[0].Addresses; !reflect.DeepEqual(got, want) {
+				t.Fatalf("Addresses = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 // --- aliasing audit (carried forward from #6391) ----------------------------
 
-// TestMultiValueLeaf6659NoSharedBackingStore is the #6391 aliasing hazard applied
-// to every arm this PR touches.
+// TestMultiValueLeaf6659NoSharedBackingStore applies the #6391 aliasing hazard to
+// three of the arms this PR touches.
+//
+// SCOPE, because an earlier revision of this comment claimed "every arm this PR
+// touches" and the three subtests below do not cover that. Exercised:
+// event-options `attributes-match` (compiler_services.go:1914), proxy-ARP
+// `address` (compiler_nat_source.go:160) and static-NAT `match
+// destination-address` (compiler_nat_static.go:750). NOT exercised:
+// EventPolicy.ThenCommands, TraceOptions.Flags and
+// RoutingOptionsConfig.ForwardingTableExports — the last two are single-instance
+// leaves (one `traceoptions` block per section; one global `forwarding-table
+// export`) so the two-sibling probe this test is built on cannot be written for
+// them at all, but ThenCommands CAN have siblings and simply is not covered
+// here. For all three the argument is the structural one below, unverified by a
+// probe.
 //
 // On #6391 a fan that stored ONE parsed *HostInboundTraffic under N map keys
 // aliased a single value across all of them, because mergeHostInbound returns

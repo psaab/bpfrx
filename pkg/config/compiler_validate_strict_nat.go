@@ -1299,20 +1299,58 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			// first. Before #6659 the compiler read this leaf with nodeVal, so
 			// only one value existed to check. It now accumulates into
 			// MatchAddresses, and reading only the scalar rule.Match here would
-			// leave the tail unvalidated — which matters specifically on the
-			// TOLERANT load / peer-sync path: there
-			// validateStaticNATMatchAddressesStrict downgrades the multi-value
-			// rejection to a warning and the config LOADS, so this gate is the
-			// only thing standing between a malformed slot-2 prefix and a
-			// silently-dropped mapping in the Rust dataplane. At strict commit
+			// leave the tail unvalidated.
+			//
+			// WHAT THIS BUYS, stated precisely because the obvious rationale is
+			// FALSE and a false rationale talks the next reader out of checking:
+			// this loop is NOT the last line of defence in front of the Rust
+			// dataplane. Only the FIRST value is ever lowered — the userspace
+			// snapshot builder sets `ExternalIP: rule.Match`
+			// (pkg/dataplane/userspace/nat_static.go), rule.Match is
+			// MatchAddresses[0] (compiler_nat_static.go), and MatchAddresses has
+			// NO consumer outside these validators. A malformed value in slot 2
+			// is therefore dropped by the Go lowering and never reaches
+			// `parse_nat_prefix` at all.
+			//
+			// What it buys is DIAGNOSTIC COMPLETENESS on the TOLERANT load /
+			// peer-sync path, where validateStaticNATMatchAddressesStrict
+			// downgrades the multi-value rejection to a warning and the config
+			// LOADS with only slot 1 in effect. The remedy that warning
+			// prescribes is "author one rule per external prefix" — so the
+			// operator needs to know that slot 2 is ALSO malformed now, not on
+			// the next commit after they have split the list. At strict commit
 			// the multi-value gate rejects the list outright and fires first, so
-			// the tail is unreachable there; the tolerant path is where this
-			// loop earns its keep. Fall back to the scalar when the plural is
-			// empty so a typed config produced by an older binary (peer sync, a
-			// restored DB) is still checked.
+			// the tail is unreachable there. Fall back to the scalar when the
+			// plural is empty so a typed config produced by an older binary
+			// (peer sync, a restored DB) is still checked.
 			matchAddrs := rule.MatchAddresses
 			if len(matchAddrs) == 0 && rule.Match != "" {
 				matchAddrs = []string{rule.Match}
+			}
+			// #6659 follow-up: the block-pair classification below is what
+			// EXEMPTS an address from the host-route requirement, so a
+			// match-side check cannot be widened to the tail without widening
+			// the classification with it — a tail block prefix classified
+			// against slot 1 lands in neither branch and escapes silently
+			// (`[ 192.0.2.1/32 198.51.100.0/24 ]` produced no host-mask
+			// complaint at all while `198.51.100.0/24` alone did).
+			//
+			// blockPairFor answers the question the multi-value warning's own
+			// remedy asks: if this address were split into its own rule against
+			// the same `then` prefix, would that rule be a legal block-to-block
+			// map? That keeps the match-side diagnosis per-address.
+			//
+			// It is deliberately NOT hoisted into an "any address forms a block
+			// pair" flag for the THEN-side and rule-level checks below. Those
+			// describe the ONE pair that actually installs — (rule.Match,
+			// rule.Then) — so an "any" flag would SUPPRESS a true complaint
+			// about the installed pair: `match [ 192.0.2.1/32 198.51.100.0/24 ]
+			// then 10.0.0.1/24` installs host-vs-block, and the Then host-route
+			// complaint that catches it today would vanish because slot 2
+			// happens to pair with the target. Widening a check is only correct
+			// where the operand is the value being widened.
+			blockPairFor := func(matchAddr string) bool {
+				return isStaticBlockPair(matchAddr, rule.Then)
 			}
 			for _, addr := range matchAddrs {
 				if addr == "" {
@@ -1341,7 +1379,9 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			// NOT reject it as a non-host mask. Only the genuinely-invalid
 			// non-host cases (host-vs-block, mismatched length, mixed family,
 			// malformed mask) fall through to the host-route rejection below.
-			blockPair := isStaticBlockPair(rule.Match, rule.Then)
+			// The rule-level / then-side classification: the pair that actually
+			// installs. See blockPairFor above for why this one stays scalar.
+			blockPair := blockPairFor(rule.Match)
 			// #5658: a valid block pair whose prefix length is ZERO (`/0` on
 			// both sides — isStaticBlockPair already requires equal length) maps
 			// the ENTIRE address family 1:1. The dataplane host mask for a /0 is
@@ -1358,11 +1398,18 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			// IPv4 (0.0.0.0/0) and IPv6 (::/0) identically (natStaticPrefixInfo is
 			// family-agnostic on the length). Runs BEFORE the #3202 port check so
 			// the whole-family identity NAT is the primary reported error.
-			if blockPair {
-				if _, bits, _, _ := natStaticPrefixInfo(rule.Match); bits == 0 {
+			// #6659 follow-up: the operand here is a MATCH address, so it runs
+			// per authored value — a /0 block pair authored in the tail is
+			// reported against its own address rather than being classified
+			// against slot 1 and skipped.
+			for _, addr := range matchAddrs {
+				if addr == "" || !blockPairFor(addr) {
+					continue
+				}
+				if _, bits, _, _ := natStaticPrefixInfo(addr); bits == 0 {
 					if err := emit(fmt.Sprintf(
 						"security nat static rule-set %q rule %q maps a block-to-block subnet with a zero-length (/0) prefix (match destination-address %q <-> then static-nat prefix %q); a /0 mapping remaps the ENTIRE address family 1:1 (an identity translation that shadows every narrower static/DNAT rule) — use a specific subnet prefix",
-						rs.Name, rule.Name, rule.Match, rule.Then)); err != nil {
+						rs.Name, rule.Name, addr, rule.Then)); err != nil {
 						return nil, err
 					}
 				}
@@ -1390,11 +1437,19 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 					return nil, err
 				}
 			}
-			if rule.Match != "" && !blockPair {
-				if host, parsed := isHostMaskAddress(rule.Match); parsed && !host {
+			// #6659 follow-up: the operand here is a MATCH address, so it runs
+			// per authored value with a per-address block-pair exemption. Read
+			// scalar, a non-host prefix in slot 2 escaped this check entirely
+			// (the reviewer's verified case: `[ 192.0.2.1/32 198.51.100.0/24 ]`
+			// warned about nothing while `198.51.100.0/24` alone warned).
+			for _, addr := range matchAddrs {
+				if addr == "" || blockPairFor(addr) {
+					continue
+				}
+				if host, parsed := isHostMaskAddress(addr); parsed && !host {
 					if err := emit(fmt.Sprintf(
 						"security nat static rule-set %q rule %q match destination-address %q must be a host route (/32 for IPv4, /128 for IPv6); a non-host mask is silently dropped by the dataplane",
-						rs.Name, rule.Name, rule.Match)); err != nil {
+						rs.Name, rule.Name, addr)); err != nil {
 						return nil, err
 					}
 				}
@@ -2209,6 +2264,62 @@ func validateStaticNATMatchAddressesStrict(cfg *Config) error {
 						"one rule per external prefix (#6659)",
 					rs.Name, rule.Name, len(rule.MatchAddresses),
 					rule.MatchAddresses, rule.MatchAddresses[0])
+			}
+		}
+	}
+	return nil
+}
+
+// validateProxyARPAddressesStrict (#6659 follow-up) hard-rejects a
+// `security nat proxy-arp interface <if> address <addr>` value that the
+// dataplane cannot parse.
+//
+// This gate exists because #6659 WIDENED THE READ. Before it, the compiler took
+// this leaf with nodeVal and kept only the first address; `address
+// [ 192.0.2.1 bogus ]` compiled to one entry and the malformed tail was never
+// materialised. #6659 made the arm accumulate every value, so `bogus` now
+// reaches ProxyARPEntry.Addresses as "bogus/32" — and proxyarp.go's installer
+// does `netip.ParsePrefix(cidr)`, logs a bounded warning and `continue`s, so the
+// address answers no ARP/ND and inbound traffic to it is never drawn to this
+// firewall. Widening a read without widening its validator converts a
+// value-drop into a silently-inert entry, so the validator is widened here in
+// the same change.
+//
+// Note the check is NOT tail-only: a malformed address in the FIRST slot
+// committed clean before #6659 too (verified), because proxy-ARP addresses
+// carried no commit-time validator at all. Every slot is checked.
+//
+// The parse is netip.ParsePrefix — deliberately the SAME call the installer
+// makes (pkg/dataplane/proxyarp.go), so "accepted at commit" and "installed at
+// runtime" cannot diverge. The reported value is the COMPILED form: an address
+// authored without a prefix length has "/32" appended by the compiler, so
+// `address bogus` is reported as "bogus/32".
+//
+// Strict on commit / commit-check (hard reject so the inert entry is
+// operator-visible); the call site downgrades to a warning on the tolerant load
+// / peer-sync path (#1960 no-brick — an already-persisted config with a bad
+// proxy-ARP address must still boot, and the installer already skips exactly
+// that entry, so a leniently-loaded config is no worse than before this gate).
+func validateProxyARPAddressesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	for _, entry := range cfg.Security.NAT.ProxyARP {
+		if entry == nil {
+			continue
+		}
+		for _, addr := range entry.Addresses {
+			if addr == "" {
+				continue
+			}
+			if _, err := netip.ParsePrefix(addr); err != nil {
+				return fmt.Errorf(
+					"security nat proxy-arp interface %q address %q is not a valid "+
+						"IP address or CIDR prefix; the dataplane parses every "+
+						"proxy-ARP address with netip.ParsePrefix and SKIPS the ones "+
+						"that fail, so this address would answer no ARP/ND and inbound "+
+						"traffic to it would never be drawn to this firewall (#6659)",
+					entry.Interface, addr)
 			}
 		}
 	}

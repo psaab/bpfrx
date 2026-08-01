@@ -148,10 +148,18 @@ func compileNAT(node *Node, sec *SecurityConfig) error {
 				// stayed silent for the rest, so inbound traffic to them was
 				// never drawn to this box.
 				//
-				// This is a pure value-drop, NOT a validation fail-open: proxy-
-				// ARP addresses carry no commit-time validator at all, so a
-				// malformed address in the FIRST slot commits clean too
-				// (verified). Adding that gate is out of scope here.
+				// The DROP itself is a pure value-drop, not a validation
+				// fail-open. But restoring the tail changes what a malformed
+				// address does: it used to be discarded at compile, and it now
+				// MATERIALISES into Addresses, where the installer
+				// (pkg/dataplane/proxyarp.go) fails netip.ParsePrefix, logs a
+				// bounded warning and skips it — a silently-inert entry. Before
+				// #6659 proxy-ARP addresses carried NO commit-time validator at
+				// all, so a malformed address in the FIRST slot committed clean
+				// too. Widening a read requires widening its validator in the
+				// same change, so validateProxyARPAddressesStrict now checks
+				// EVERY value with the installer's own parse (strict rejects,
+				// tolerant warns — see compiler_uniformgates_firewall_nat2.go).
 				//
 				// Read via proxyARPAddressValues rather than firewallMatchValues
 				// so a MALFORMED range that fell through the two branches above

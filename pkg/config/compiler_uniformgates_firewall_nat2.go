@@ -165,6 +165,29 @@ func runUniformGatesFirewallNAT2(tree *ConfigTree, cfg *Config, opts compileOpts
 		}
 	}
 
+	// #6659 follow-up: a `security nat proxy-arp ... address` value the
+	// dataplane cannot parse. #6659 widened this arm from nodeVal (first value
+	// only) to the full list, so a malformed tail address now MATERIALISES into
+	// ProxyARPEntry.Addresses instead of being dropped at compile — and
+	// proxyarp.go's installer parses each address with netip.ParsePrefix and
+	// SKIPS the failures, leaving a silently-inert entry that answers no
+	// ARP/ND. Widening a read requires widening its validator in the same
+	// change, so the gate lands here rather than being deferred. It is not
+	// tail-only: proxy-ARP addresses carried NO commit-time validator at all
+	// before this, so a malformed FIRST address committed clean too. Strict on
+	// commit / commit-check (hard reject); lenient on load / peer-sync (warn —
+	// #1960 no-brick; the installer already skips the bad entry, so a
+	// leniently-loaded config is no worse than before the gate). Reuses
+	// lenientFirewallRefs like the sibling NAT gates above.
+	if err := validateProxyARPAddressesStrict(cfg); err != nil {
+		if opts.lenientFirewallRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("proxy-ARP address (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #5628 (codex-review-181 M16): a source / destination NAT rule's complete
 	// `then` block must carry EXACTLY ONE NAT-terminal translation action. A
 	// rule with ZERO actions installs no translation (an intended `off`

@@ -933,6 +933,31 @@ allowed-ips folds are covered by the `security-nat-static-multi-zone` and
 `interfaces-wireguard-allowed-ips-multi` dual-AST fixtures plus
 `TestWireguardAllowedIPsBracketList{FlatSet,Hierarchical}`.
 
+**Widening a multi-value READ requires widening its VALIDATOR in the same
+change (#6659).** Adopting the accumulating reader at a site changes what a
+malformed value DOES. Before, a bad value in slot 2 was discarded at compile and
+could never reach the dataplane; after, it materialises in the typed config and
+the runtime installer is the first thing that sees it. `security nat proxy-arp
+address` is the worked example: `address [ 192.0.2.1 bogus ]` used to compile to
+one entry, and with the widened read it compiles to
+`["192.0.2.1/32", "bogus/32"]`, which `pkg/dataplane/proxyarp.go` parses with
+`netip.ParsePrefix`, logs a bounded warning about, and SKIPS — a silently-inert
+address that answers no ARP/ND. `validateProxyARPAddressesStrict`
+(`compiler_validate_strict_nat.go`, wired in
+`compiler_uniformgates_firewall_nat2.go`) now checks EVERY value with the
+installer's own parse: strict rejects, tolerant warns (#1960 no-brick).
+
+The mirror-image rule applies to a validator that already exists: widen it
+per-value only where the OPERAND is the value being widened. The static-NAT
+`match destination-address` host-route and `/0` checks moved to a per-address
+block-pair classification, but the `then static-nat prefix` checks and the #3202
+port check kept the SCALAR pair, because only `MatchAddresses[0]` is ever
+lowered (`ExternalIP: rule.Match`, `pkg/dataplane/userspace/nat_static.go`) — an
+"any authored match address pairs with the target" flag would SUPPRESS a true
+complaint about the pair that actually installs. For the same reason the
+match-side widening buys DIAGNOSTIC completeness, not a dataplane backstop: the
+tail values never reach the Rust parser at all.
+
 **A multi-value leaf can be PRESENT and still carry NOTHING — presence must be
 decided by VALUES, never by the leaf NAME (#6526).** `firewallMatchValues`
 skips blank tokens, and its doc comment states the contract: *an empty result
