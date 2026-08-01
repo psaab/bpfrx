@@ -66238,3 +66238,31 @@ break — `go vet` confirmed passing under every revert.
   pkg/daemon/userspace_sync_session_id_6198_test.go,
   userspace-dp/src/session/mod.rs, userspace-dp/src/session/tests.rs,
   userspace-dp/src/session/README.md, docs/session-sync-architecture.md, _Log.md
+- **Timestamp**: 2026-08-01 09:15
+- **Action**: #6526 — a security-policy `match` leaf written with NO OPERAND
+  satisfied the #3044 required-dimension gate and compiled to the
+  byte-identical empty slice the OMITTED form produces, which the userspace
+  matcher reads as match-ANY; `then permit` therefore permitted every source.
+  Root cause: the gate decided presence from the leaf NAME
+  (`present[m.Name()] = true`) while `firewallMatchValues` — the reader
+  `compilePolicy` actually uses — skips blank tokens so an empty result means
+  "criterion absent". Reachable through the CLI's own `set` path
+  (`ParseSetCommand` + `SetPath`) and the hierarchical parser. Added
+  `policyValuelessMatchDimensions`, which decides presence with the compiler's
+  own value reader, and emitted it as a DISTINCT finding from the SAME walk as
+  #3044 under its own lenient flag (`lenientPolicyValuelessMatch`): strict
+  commit/commit-check hard-rejects, the tolerant load/peer-sync path warns
+  (#1960 no-brick) and additionally poisons the policy to never-match via the
+  #5575 `LenientContentDropped` flag, which the name-based predicate had also
+  let the valueless form bypass. Covers all FIVE value-bearing dimensions —
+  source-address, destination-address, application, and the scoped-global
+  from-zone/to-zone whose empty set collapses a global policy to the all-zones
+  wildcard. `source-address-excluded`/`destination-address-excluded` are
+  excluded (boolean modifiers, valueless by design), and from-zone/to-zone are
+  inspected only under a global policy so the #3113 gate keeps sole ownership
+  of them under a zone-pair policy.
+- **File(s)**: pkg/config/compiler_policy_missing_match.go,
+  pkg/config/compiler_security_policy.go, pkg/config/compiler_prewalk.go,
+  pkg/config/compiler_opts.go,
+  pkg/config/compiler_policy_valueless_match_6526_test.go,
+  docs/config-schema.md, _Log.md

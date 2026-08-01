@@ -70,6 +70,22 @@ import (
 // (#1960 fail-closed-on-load class). The policy keeps its pre-existing
 // match-any-for-missing compilation exactly as before this gate, now
 // flagged. Same doctrine as validatePolicyMatchLeavesStrict.
+//
+// #6526 extends the file to the SECOND way a dimension can fail to constrain
+// anything: a dimension written with NO OPERAND (`source-address;`, or a
+// `set ... match source-address` line with the value left off). The gate above
+// decides presence from the leaf NAME, so a valueless leaf satisfied it while
+// compiling to the byte-identical empty match-ANY slice the omitted form
+// produces — the reject gate protected a claim about VALUES with a check on
+// NAMES. policyValuelessMatchDimensions closes that by asking
+// firewallMatchValues (the SAME reader compilePolicy uses) whether the
+// dimension carries anything, and covers all FIVE value-bearing dimensions:
+// source-address, destination-address, application, plus the scoped-global
+// from-zone / to-zone (whose empty set collapses a global policy to the
+// all-zones wildcard). Same strict-reject / lenient-warn doctrine, and both
+// findings feed compilePolicy's #5575 LenientContentDropped poison so a
+// leniently-loaded valueless policy is published as never-match rather than as
+// a silently widened permit.
 
 // requiredPolicyMatchLeaves are the three Junos-mandatory match dimensions
 // every active security policy must specify. Kept in declaration order so
@@ -110,15 +126,117 @@ func policyMissingRequiredMatchDimensions(polNode *Node) []string {
 	return missing
 }
 
+// valueBearingPolicyMatchLeaves are the security-policy `match` dimensions
+// whose SEMANTICS are carried by their operand(s) — the leaves compilePolicy
+// reads with firewallMatchValues into a match set that the userspace matcher
+// interprets as match-ANY when empty. Kept in declaration order so the #6526
+// error message lists valueless dimensions deterministically.
+//
+// from-zone / to-zone are the scoped-global match context (#3148/#4626 M03)
+// and are value-bearing ONLY under a `security policies global` policy; under
+// a zone-pair policy they are not registered match siblings at all and the
+// #3113 unsupported-match-leaf gate (which runs FIRST in runPreWalkGates)
+// rejects them outright, so policyValuelessMatchDimensions skips them there
+// rather than double-attributing one typo to two gates.
+//
+// Deliberately EXCLUDED: source-address-excluded / destination-address-excluded.
+// Those are boolean MODIFIER leaves that legitimately carry no operand
+// (compilePolicy sets a bool off the leaf name alone), so an emptiness check
+// on them would reject valid Junos.
+var valueBearingPolicyMatchLeaves = []string{
+	"source-address",
+	"destination-address",
+	"application",
+	"from-zone",
+	"to-zone",
+}
+
+// policyValuelessMatchDimensions returns every value-bearing `match` dimension
+// that is PRESENT BY NAME in a policy node's UNION of `match {}` blocks but
+// whose accumulated value set is EMPTY, in declaration order; an empty result
+// means every present dimension actually constrains something. isGlobal marks a
+// `security policies global` policy so the global-only from-zone/to-zone match
+// context is inspected exactly where compilePolicy honours it.
+//
+// #6526 — the defect this closes. policyMissingRequiredMatchDimensions above
+// decides presence from the leaf NAME (`present[m.Name()] = true`), while the
+// reader compilePolicy actually uses — firewallMatchValues
+// (compiler_firewall.go) — SKIPS blank tokens, and its own doc comment states
+// the conflicting definition: "an empty result means criterion absent". A leaf
+// written with NO operand therefore satisfies the #3044 name-based gate and
+// compiles to the BYTE-IDENTICAL empty slice the omitted form produces:
+//
+//	match { source-address; destination-address any; application any; }
+//	set security policies from-zone t to-zone u policy p1 match source-address
+//
+// both yield Match.SourceAddresses == [] (n=0), which the userspace matcher
+// reads as match-ANY — so `then permit` permits EVERY source. The same shape
+// collapses a scoped-global `match from-zone` / `match to-zone` to the
+// all-zones wildcard. Both parser shapes produce it: hierarchically the leaf is
+// Keys=["source-address"] with no children; via ParseSetCommand + SetPath the
+// flat path lands on the same node. The gate protected a claim about VALUES
+// with a check on NAMES; this predicate closes the gap by asking
+// firewallMatchValues — the SAME reader compilePolicy uses — whether the
+// dimension carries anything, so the reject gate and the compiler can never
+// disagree about what "present" means.
+//
+// Union semantics (#3842 parity): a dimension is flagged only when the values
+// accumulated across EVERY `match {}` block are empty — precisely the condition
+// under which the compiled slice is empty and the dimension widens. A policy
+// that writes `source-address;` in one block and `source-address 10.0.0.0/8;`
+// in a duplicate block compiles to [10.0.0.0/8] and is NOT widened, so it is
+// not flagged; that mirrors how policyMissingRequiredMatchDimensions unions
+// presence across blocks.
+func policyValuelessMatchDimensions(polNode *Node, isGlobal bool) []string {
+	children := policyMatchChildren(polNode)
+	var valueless []string
+	for _, leaf := range valueBearingPolicyMatchLeaves {
+		if globalOnlyPolicyMatchLeaves[leaf] && !isGlobal {
+			continue
+		}
+		seen, valued := false, false
+		for _, m := range children {
+			if m.Name() != leaf {
+				continue
+			}
+			seen = true
+			if len(firewallMatchValues(m)) > 0 {
+				valued = true
+			}
+		}
+		if seen && !valued {
+			valueless = append(valueless, leaf)
+		}
+	}
+	return valueless
+}
+
 // validatePolicyRequiredMatchStrict walks the `security policies` subtree of
-// the group-expanded AST and rejects any policy whose `match` clause omits a
-// required dimension (source-address, destination-address, application) or
-// omits the `match` block entirely. Covers both zone-pair and global
-// policies. See the file header for the contract and rationale.
-func validatePolicyRequiredMatchStrict(nodes []*Node, lenient bool) ([]string, error) {
+// the group-expanded AST and rejects any policy whose `match` clause either
+//
+//   - OMITS a required dimension (source-address, destination-address,
+//     application) or omits the `match` block entirely (#3044), or
+//   - writes a value-bearing dimension with NO OPERAND, so the dimension
+//     compiles to the same empty match-ANY set the omitted form produces
+//     (#6526 — see policyValuelessMatchDimensions).
+//
+// Covers both zone-pair and global policies. The two failure modes share ONE
+// walk (so they can never diverge on scope — the duplicate-block and dual-AST
+// coverage below applies to both) but emit DISTINCT messages under DISTINCT
+// lenient flags, so an operator (and a test) can tell "you did not write the
+// criterion" apart from "you wrote it and left the value off". See the file
+// header for the contract and rationale.
+func validatePolicyRequiredMatchStrict(nodes []*Node, lenientMissing, lenientValueless bool) ([]string, error) {
 	var warnings []string
+	report := func(msg string, lenient bool) error {
+		if !lenient {
+			return fmt.Errorf("%s", msg)
+		}
+		warnings = append(warnings, msg)
+		return nil
+	}
 	emit := func(scope, policyName string, missing []string) error {
-		msg := fmt.Sprintf(
+		return report(fmt.Sprintf(
 			"security policies %s policy %q match is missing required "+
 				"criterion %s (Junos requires every security policy to specify "+
 				"source-address, destination-address, AND application; a missing "+
@@ -127,20 +245,43 @@ func validatePolicyRequiredMatchStrict(nodes []*Node, lenient bool) ([]string, e
 				"an over-broad block for deny) — add the missing criterion, using "+
 				"the explicit `any` keyword for an intentional wildcard (#3044)",
 			scope, policyName, strings.Join(quoteAll(missing), ", "),
-		)
-		if !lenient {
-			return fmt.Errorf("%s", msg)
-		}
-		warnings = append(warnings, msg)
-		return nil
+		), lenientMissing)
+	}
+	// emitValueless rejects a match dimension written with NO operand (#6526).
+	// Kept textually distinct from emit above — the two conditions are one
+	// keystroke apart for an operator but have different fixes, and a shared
+	// message would make them indistinguishable to anything asserting on it.
+	emitValueless := func(scope, policyName string, valueless []string) error {
+		return report(fmt.Sprintf(
+			"security policies %s policy %q match criterion %s is present but "+
+				"carries NO value (the leaf was written with no operand, e.g. "+
+				"`source-address;` or a `set ... match source-address` line with "+
+				"the value omitted) — an empty match dimension compiles to the "+
+				"SAME match-ANY as omitting the criterion entirely, silently "+
+				"WIDENING the policy to traffic the operator did not intend (a "+
+				"fail-open for permit, an over-broad block for deny; for a global "+
+				"policy's from-zone/to-zone it collapses the scope to the "+
+				"all-zones wildcard) — supply the intended value, using the "+
+				"explicit `any` keyword for an intentional wildcard (#6526)",
+			scope, policyName, strings.Join(quoteAll(valueless), ", "),
+		), lenientValueless)
 	}
 
-	checkPolicy := func(scope, policyName string, polNode *Node) error {
-		missing := policyMissingRequiredMatchDimensions(polNode)
-		if len(missing) == 0 {
-			return nil
+	checkPolicy := func(scope, policyName string, polNode *Node, isGlobal bool) error {
+		// Missing-entirely is reported first: it is the more fundamental
+		// authoring error, and on the strict path the first finding is the
+		// returned error.
+		if missing := policyMissingRequiredMatchDimensions(polNode); len(missing) > 0 {
+			if err := emit(scope, policyName, missing); err != nil {
+				return err
+			}
 		}
-		return emit(scope, policyName, missing)
+		if valueless := policyValuelessMatchDimensions(polNode, isGlobal); len(valueless) > 0 {
+			if err := emitValueless(scope, policyName, valueless); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 
 	// #3562: iterate EVERY top-level `security` node and EVERY `policies`
@@ -159,7 +300,7 @@ func validatePolicyRequiredMatchStrict(nodes []*Node, lenient bool) ([]string, e
 				switch child.Name() {
 				case "global":
 					for _, polInst := range namedInstances(child.FindChildren("policy")) {
-						if err := checkPolicy("global", polInst.name, polInst.node); err != nil {
+						if err := checkPolicy("global", polInst.name, polInst.node, true); err != nil {
 							return err
 						}
 					}
@@ -188,7 +329,7 @@ func validatePolicyRequiredMatchStrict(nodes []*Node, lenient bool) ([]string, e
 					for _, zp := range pairs {
 						scope := fmt.Sprintf("from-zone %s to-zone %s", zp.from, zp.to)
 						for _, polInst := range namedInstances(zp.policyNode.FindChildren("policy")) {
-							if err := checkPolicy(scope, polInst.name, polInst.node); err != nil {
+							if err := checkPolicy(scope, polInst.name, polInst.node, false); err != nil {
 								return err
 							}
 						}

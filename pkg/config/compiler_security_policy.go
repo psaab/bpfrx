@@ -395,7 +395,17 @@ func compilePolicy(polInst struct {
 	// false) and a DROPPED / MISSING constraint (empty slice, flag true) is made
 	// here on the AST: policyMissingRequiredMatchDimensions treats an omitted
 	// leaf differently from an explicit `any`.
+	//
+	// #6526: policyValuelessMatchDimensions is the third predicate because a
+	// dimension written with NO OPERAND (`source-address;`) compiles to the
+	// BYTE-IDENTICAL empty slice the omitted form produces — it read as
+	// "present" to the name-based predicate above and therefore slipped past
+	// this poison as well as past the strict gate, so a leniently-loaded
+	// valueless permit was published to the dataplane fully widened. It
+	// covers all five value-bearing dimensions, including the scoped-global
+	// from-zone/to-zone whose empty set means "all zones".
 	if len(policyMissingRequiredMatchDimensions(polInst.node)) > 0 ||
+		len(policyValuelessMatchDimensions(polInst.node, isGlobal)) > 0 ||
 		len(policyUnsupportedMatchLeafFindings(polInst.node, isGlobal)) > 0 ||
 		len(policyUnsupportedThenPermitModifiers(polInst.node)) > 0 {
 		pol.LenientContentDropped = true
