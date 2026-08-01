@@ -1275,3 +1275,91 @@ func TestScopedPeerWithNoObservationDenies_5561(t *testing.T) {
 		}
 	})
 }
+
+// TestScopedDenialsAreDistinguishable_5561 pins the #5561 round-9 MINOR-5 fix.
+//
+// The scoped branch has TWO local-denial outcomes and they are different
+// diagnoses with different operator remedies:
+//
+//	row found     the kernel proved a socket exists here; the missing scope id in
+//	              /proc is what stops us naming its owner
+//	no row, ours  the table was read and held NOTHING; the denial rests entirely
+//	              on the address classification
+//
+// Both used to emit the byte-identical Detail "peer address %v is
+// scope-qualified and cannot be attributed from the socket table", which is not
+// even true of the second — nothing was attributed because nothing was there.
+// That string is what reaches the 403 body and the audit log, so an operator
+// diagnosing a link-local management bind could not tell the two apart. Every
+// other denial in LookupPeer carries a state-specific Detail.
+func TestScopedDenialsAreDistinguishable_5561(t *testing.T) {
+	const header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+	client := &net.TCPAddr{IP: net.ParseIP("fe80::ee01:0:0:99"), Port: 43210, Zone: "eth0"}
+	server := &net.TCPAddr{IP: net.ParseIP("fe80::e01:0:0:1"), Port: 8080, Zone: "eth0"}
+
+	// (a) A matching ESTABLISHED row exists. Our own address list does NOT
+	// contain the caller, so only the row can establish locality.
+	rowFound := func() PeerIdentity {
+		cl, ok := procAddr6(client)
+		if !ok {
+			t.Fatal("cannot render client address")
+		}
+		sv, ok := procAddr6(server)
+		if !ok {
+			t.Fatal("cannot render server address")
+		}
+		dir := t.TempDir()
+		v4, v6 := filepath.Join(dir, "tcp"), filepath.Join(dir, "tcp6")
+		write(t, v4, header)
+		write(t, v6, header+"   0: "+cl+" "+sv+" 01 00000000:00000000 00:00000000 00000000     0        0 4242 1 0000000000000000 100 0 0 10 0\n")
+		defer SetProcNetTCPPathsForTest(v4, v6)()
+		defer setLocalAddrsForTest([]net.Addr{
+			&net.IPNet{IP: net.ParseIP("fe80::e01:0:0:1"), Mask: net.CIDRMask(64, 128)},
+		})()
+		return LookupPeer(client, server)
+	}()
+
+	// (b) The tables are PRESENT and EMPTY — genuinely read, genuinely holding
+	// nothing — and the caller's address IS one of ours.
+	noRowButOurs := func() PeerIdentity {
+		dir := t.TempDir()
+		v4, v6 := filepath.Join(dir, "tcp"), filepath.Join(dir, "tcp6")
+		write(t, v4, header)
+		write(t, v6, header)
+		defer SetProcNetTCPPathsForTest(v4, v6)()
+		defer setLocalAddrsForTest([]net.Addr{
+			&net.IPNet{IP: net.ParseIP("fe80::ee01:0:0:99"), Mask: net.CIDRMask(64, 128)},
+		})()
+		return LookupPeer(client, server)
+	}()
+
+	// Both are the same VERDICT — local, unattributable, denied. The fix is about
+	// the reason they report, so pin the verdict first or a Detail change could
+	// be "achieved" by changing the outcome.
+	for _, c := range []struct {
+		what string
+		id   PeerIdentity
+	}{{"a matching row", rowFound}, {"no row and an address of ours", noRowButOurs}} {
+		if c.id.OK || !c.id.Local {
+			t.Fatalf("%s: got %+v, want local-and-unattributable (denied)", c.what, c.id)
+		}
+		if !strings.Contains(c.id.Detail, "scope-qualified") {
+			t.Errorf("%s: detail does not name the scope refusal: %q", c.what, c.id.Detail)
+		}
+	}
+
+	if rowFound.Detail == noRowButOurs.Detail {
+		t.Fatalf("two distinguishable scoped-denial states emit the IDENTICAL Detail %q. "+
+			"That string is the 403 body and the audit line, so an operator cannot tell "+
+			"'the kernel proved a socket exists here' from 'the table was read and held "+
+			"nothing; your address is simply one of ours' — different diagnoses, different "+
+			"remedies", rowFound.Detail)
+	}
+	// And the no-row reason must not claim an attribution failure that never
+	// happened: there was nothing to attribute.
+	if strings.Contains(noRowButOurs.Detail, "cannot be attributed from the socket table") {
+		t.Errorf("the no-row denial reports %q — the table was read and held NOTHING, so "+
+			"'cannot be attributed from the socket table' describes the OTHER state",
+			noRowButOurs.Detail)
+	}
+}

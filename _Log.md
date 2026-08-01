@@ -66850,3 +66850,72 @@ break — `go vet` confirmed passing under every revert.
   slot RELEASE is untested (delete the release defer and the guard stays green).
 - **File(s)**: pkg/authz/peer.go, pkg/authz/peer_5561_test.go,
   pkg/cli/permissions_shared_evaluator_5561_test.go, _Log.md
+
+- **Timestamp**: 2026-08-01 (round-9 — findings 1, 2, 3, 5 CLOSED; MINOR-1..5)
+- **Action**: #5561 closed the four carried MAJORs the previous three rounds
+  deferred, each with an EDGE mutation as well as a centre one. FINDING 1
+  (TOCTOU): `mutationAuthzGuard` read the active config and THEN called
+  `principal()`, whose first act is `pendingPeer.wait` — the gate's only
+  unbounded block, up to `peerLookupTimeout` (5s). The decision was evaluated
+  against a snapshot up to five seconds stale, so a commit demoting or deleting a
+  principal did not reach its own in-flight request, and the width is
+  caller-influenced (connect while the socket table is contended). Split into
+  `authorizeInputs` (wait FIRST, snapshot after) + `principalFrom`; the residual
+  is now a passwd read on the UID row and a locality re-derivation on the
+  credential row, both stated in the doc comment. Binding this needed a real
+  happens-before edge: the first draft signalled from `PeerLookupFn`, which
+  `connContext` runs at ACCEPT, so the commit landed BEFORE the gate ran and the
+  mutant PASSED. Added `peerWaitersInFlight` /
+  `PeerIdentityWaitersForTest()` — the request-side twin of the existing
+  `PeerLookupSlotsInUseForTest()` accept-side gauge — so a test can observe "the
+  gate has started and has read nothing yet". FINDING 2 (credential outlives its
+  snapshot): `CredentialPrincipal` is a value and `ReplaceAuth` swaps a pointer,
+  so a revoked or rotated secret did not invalidate a principal already in
+  flight — across `peerIsLocalNow`, which takes `hostAddrScan`'s single-flight
+  and genuinely blocks. Re-validate against the LIVE snapshot AFTER that step
+  (re-check the credential, not pointer identity: `reconcileTo` republishes on
+  every commit, so pointer identity would 403 valid callers). FINDING 3
+  (serve-before-auth): `ReconcileHTTP` binds AND SERVES before returning, while
+  `reconcileTo` published auth at the END, with a whole `ReconcileHTTPS`
+  (keypair + bind) inside the window — worst case a loopback->off-box rebind that
+  ADDS the credential the #4047 clamp requires, so the new routable listener
+  served through `dynamicAuthMiddleware`'s nil-snapshot pass-through. Hoisted the
+  NON-NIL publish above both rebinds (only ADDS a requirement, the same argument
+  round 7 used to make it unconditional); the nil publish stays below, since it
+  REMOVES one and its gates read `m.cur`. FINDING 5 (untested release):
+  `TestWedgedLookupsDoNotAccumulate_5561` fills the pool by direct channel send,
+  so the acquire-site release defer was unexercised — deleting it turns a
+  concurrency ceiling into a lifetime budget (the 1024th connection ever accepted
+  locks the management plane out). New guard pins acquire, release+reuse, AND
+  that the REFUSAL arm touches the accounting in neither direction.
+- **Mutation evidence**: all eight build rc=0 / vet rc=0 with empty stderr, and
+  each named test red as an ASSERTION. M1 cfg-before-wait and M1e (fresh cfg for
+  `Authorize`, stale for the principal) both red
+  `TestConfigSnapshotIsReadAfterThePeerWait_5561` commit-during-wait while its
+  controls PASS — exactly one test fails across all of pkg/api. M2 (pre-block
+  principal returned) and M2e (re-validation present but BEFORE the blocking
+  step) both red `TestRevokedCredentialCannotFinishAnInFlightRequest_5561` on
+  BOTH credential shapes, controls PASS, one test failing across pkg/api. M3
+  (publish at the end) and M3e (publish after the HTTP bind, before the HTTPS
+  reconcile) both red the two new pkg/daemon guards — M3e is the edge that proves
+  they bind "before the HTTP bind", not merely "before the HTTPS reconcile". M4
+  (release defer deleted) reds the release assertion; M4e (refusal arm
+  over-releases) reds the refusal assertion. M6 (duplicate Detail restored) reds
+  the new pkg/authz guard.
+- **MINORs**: MINOR-1 `LookupPeer`'s scoped-branch header said "skip the table
+  entirely" three lines above an unconditional `findPeerSocket` — rewritten to
+  state what the code does and why the early-out must not come back. MINOR-2
+  pkg/api/README.md promised a broken `/proc` "does not silently lock out every
+  remote administrator", which `f6092cb4f` made false two commits later;
+  rewritten to say deny-unconditional, why that direction is right (an
+  availability outage versus a privilege-boundary bypass), and that an ABSENT
+  table is not a failed read. MINOR-3 added `set system login class super-user
+  permissions view` to the sharing fixture: proven load-bearing — the review's
+  "Mutation D" (a CLI-only special case keeping one shared call) passes both
+  guards and all of pkg/cli WITHOUT that line and reds with `CLI resolved [0],
+  shared evaluator resolved [5]` WITH it. MINOR-5 the two scoped local-denial
+  states now carry distinct Details, guarded.
+- **File(s)**: pkg/api/authz.go, pkg/api/authz_freshness_5561_test.go,
+  pkg/api/README.md, pkg/authz/peer.go, pkg/authz/peer_5561_test.go,
+  pkg/daemon/management.go, pkg/daemon/management_authpublish_5561_test.go,
+  pkg/cli/permissions_shared_evaluator_5561_test.go, _Log.md

@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/psaab/xpf/pkg/authz"
@@ -124,6 +125,28 @@ var peerLookupSlots = make(chan struct{}, maxConcurrentPeerLookups)
 
 // PeerLookupSlotsInUseForTest reports how many lookup slots are held. Test-only.
 func PeerLookupSlotsInUseForTest() int { return len(peerLookupSlots) }
+
+// peerWaitersInFlight counts requests currently PARKED in pendingPeer.wait
+// inside the mutation gate — i.e. requests that have reached authorizeInputs and
+// are blocked on their connection's accept-time lookup.
+//
+// It is the other half of the pair peerLookupSlots already forms: that gauge
+// counts lookups in flight on the ACCEPT side, this one counts requests waiting
+// on them on the REQUEST side, and a wedge shows up as both pinned at once.
+//
+// It also gives a test a genuine happens-before edge for the ordering
+// authorizeInputs exists to enforce. Everything the gate reads is read after the
+// wait, so "a waiter is parked" is the only externally observable moment at
+// which a test can know the gate has started and has not yet read anything —
+// which is exactly the window a commit has to land in to prove the ordering.
+// Without it a test can only sleep and hope, and a sleep that lands early makes
+// the DEFECT look fixed. One atomic add per mutating request, on a surface that
+// answers a handful of operator actions per second.
+var peerWaitersInFlight atomic.Int64
+
+// PeerIdentityWaitersForTest reports how many requests are parked awaiting their
+// connection's peer lookup. Test-only.
+func PeerIdentityWaitersForTest() int { return int(peerWaitersInFlight.Load()) }
 
 // pendingPeer is a connection's peer identity, resolved once, asynchronously,
 // starting at accept.
@@ -278,7 +301,48 @@ func (s *Server) activeConfig() *config.Config {
 	return s.store.ActiveConfig()
 }
 
-// principal derives the caller's server-side identity for one request (#5561).
+// authorizeInputs resolves BOTH inputs to the authorization decision — the
+// caller's principal and the config snapshot that principal is evaluated
+// against — in an order that keeps the snapshot fresh (#5561 round 9, finding 1).
+//
+// The order is the point. mutationAuthzGuard used to read the snapshot first
+// and then call principal(), whose FIRST action is pendingPeer.wait — the only
+// unbounded block in the gate, up to peerLookupTimeout (5s). The decision was
+// therefore evaluated against a config captured up to five seconds before it,
+// and a commit landing inside that window did not reach it: a `super-user`
+// demoted to `read-only`, or deleted from `system login user` outright, kept
+// its old authority for every request whose peer lookup was slow — and a caller
+// can make its own lookup slow by connecting while the socket table is
+// contended. Reading the snapshot AFTER the wait means the window between the
+// read and Authorize() contains no blocking call at all.
+//
+// The residual is stated rather than papered over: on the peer-UID row a
+// /etc/passwd read still separates the two (bounded, local, no lock held), and
+// on the credential row a locality re-derivation does (~32 µs, single-flighted)
+// — which is why the credential is RE-VALIDATED after it, see principalFrom.
+// A config snapshot and a decision cannot be made simultaneous without holding
+// the store's lock across the whole gate; they can be made adjacent, and that
+// is what this ordering buys.
+func (s *Server) authorizeInputs(r *http.Request) (*config.Config, authz.Principal) {
+	pending, ok := peerIdentityFrom(r.Context())
+	if !ok {
+		// No ConnContext ran for this connection, so we cannot even tell whether
+		// the caller is local — and therefore cannot tell whether a credential
+		// is allowed to speak for it. Refuse rather than guess.
+		return s.activeConfig(), authz.Unauthenticated("connection identity was not captured at accept")
+	}
+	// THE BLOCKING STEP. Nothing that feeds the decision may be read before it.
+	peerWaitersInFlight.Add(1)
+	id, resolved := pending.wait(r.Context())
+	peerWaitersInFlight.Add(-1)
+	if !resolved {
+		return s.activeConfig(), authz.Unauthenticated("peer identity lookup did not complete for this connection")
+	}
+	cfg := s.activeConfig()
+	return cfg, s.principalFrom(r, cfg, pending, id)
+}
+
+// principalFrom derives the caller's server-side identity for one request (#5561).
 //
 // The precedence rule is: IF THE CALLER IS ON THIS HOST, THE LOGIN MODEL IS THE
 // ONLY AUTHORITY. An api-auth credential may speak only for a caller that is not
@@ -329,19 +393,10 @@ func (s *Server) activeConfig() *config.Config {
 // anything. It closes the direction that motivated it (an address ADDED since the
 // snapshot); it cannot close the reverse, because a scan cannot observe an address
 // that is already gone.
-func (s *Server) principal(r *http.Request, cfg *config.Config) authz.Principal {
-	pending, ok := peerIdentityFrom(r.Context())
-	if !ok {
-		// No ConnContext ran for this connection, so we cannot even tell whether
-		// the caller is local — and therefore cannot tell whether a credential
-		// is allowed to speak for it. Refuse rather than guess.
-		return authz.Unauthenticated("connection identity was not captured at accept")
-	}
-	id, resolved := pending.wait(r.Context())
-	if !resolved {
-		return authz.Unauthenticated("peer identity lookup did not complete for this connection")
-	}
-
+//
+// The ORDER in which its two inputs are obtained — the peer wait and the config
+// read — is argued on authorizeInputs, which is the only caller.
+func (s *Server) principalFrom(r *http.Request, cfg *config.Config, pending *pendingPeer, id authz.PeerIdentity) authz.Principal {
 	if id.OK {
 		// (1) and (2). PrincipalForUID yields an unresolved principal for an
 		// account outside the login model, which Authorize denies — and no
@@ -351,7 +406,7 @@ func (s *Server) principal(r *http.Request, cfg *config.Config) authz.Principal 
 	if id.Local {
 		return authz.Unauthenticated("caller is local but could not be identified: " + id.Detail)
 	}
-	if cp, ok := s.credential(r); ok {
+	if _, ok := s.credential(r); ok {
 		// (4), but only once the off-box verdict is confirmed against an
 		// enumeration started by THIS request. The verdict that got us here was
 		// cached at accept and lags an address add; a caller that is in fact on
@@ -376,7 +431,33 @@ func (s *Server) principal(r *http.Request, cfg *config.Config) authz.Principal 
 			return authz.Unauthenticated("caller is local but could not be identified: " +
 				"peer address is assigned to this host, so an api-auth credential may not speak for it")
 		}
-		return cp
+		// DERIVE the principal from the LIVE snapshot, here, rather than from the
+		// one that opened this branch (#5561 round 9, finding 2).
+		//
+		// The check above answers only "does this caller hold a valid credential
+		// at all", which is what gates the enumeration; the principal it built is
+		// deliberately discarded. That principal is a VALUE, and ReplaceAuth
+		// swaps a pointer — it cannot reach anything already constructed — so
+		// returning it would let a rotated or revoked credential finish a request
+		// it no longer authorizes. That is not a theoretical nanosecond:
+		// peerIsLocalNow sits between the two and BLOCKS, taking hostAddrScan's
+		// single-flight, so a request can wait out another goroutine's whole
+		// interface enumeration in that gap. An operator revoking a LEAKED secret
+		// is entitled to have it stop working, and the whole point of ReplaceAuth
+		// (#5866) is that revocation needs no listener bounce.
+		//
+		// Re-checking the credential rather than comparing snapshot POINTERS is
+		// deliberate: reconcileTo republishes on every commit, so pointer
+		// identity would 403 a valid caller for an unrelated commit. This denies
+		// exactly when the presented credential no longer satisfies the live
+		// policy, and it costs one more constant-time compare on a row that has
+		// already proven it holds a valid secret.
+		live, still := s.credential(r)
+		if !still {
+			return authz.Unauthenticated(
+				"api-auth credential was revoked or rotated while this request was being adjudicated")
+		}
+		return live
 	}
 	return authz.Unauthenticated(id.Detail)
 }
@@ -447,7 +528,8 @@ func (s *Server) mutationAuthzGuard(next http.Handler) http.Handler {
 		}
 
 		// ONE config snapshot for BOTH the principal's class and the
-		// authorization decision (#5561 round 7).
+		// authorization decision (#5561 round 7), read AFTER the peer wait
+		// (#5561 round 9).
 		//
 		// These used to be two independent ActiveConfig() reads. A commit landing
 		// between them meant the class was copied out of config A while the
@@ -460,8 +542,12 @@ func (s *Server) mutationAuthzGuard(next http.Handler) http.Handler {
 		// evaluate against the config that revoked it. No test caught this
 		// because every authorization fixture holds its store immutable for the
 		// whole request.
-		cfg := s.activeConfig()
-		p := s.principal(r, cfg)
+		//
+		// Round 7 made the two reads one, but left the one read BEFORE the gate's
+		// blocking peer wait, which reopened the same demotion window at up to
+		// peerLookupTimeout wide. authorizeInputs does the wait first and reads
+		// the snapshot after it — see its doc comment.
+		cfg, p := s.authorizeInputs(r)
 		if err := authz.Authorize(cfg, p, required); err != nil {
 			// Debug, not Warn: this fires once per DENIED request, and a
 			// keep-alive loop from an unauthenticated caller is exactly the

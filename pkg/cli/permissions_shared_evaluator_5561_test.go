@@ -38,6 +38,23 @@ func TestCLIResolvesThroughTheSharedEvaluator_5561(t *testing.T) {
 		"set system login class noc-admin permissions all",
 		"set system login class viewer-plus permissions [ view clear ]",
 		"set system login class nothing-at-all permissions view",
+		// A custom class SHADOWING a built-in name, which the config path
+		// genuinely admits: schema_system.go validates `user ... class` against
+		// built-ins UNION custom classes, and compiler_system.go appends every
+		// parsed class with no collision check. It is the fixture that gives this
+		// test teeth against the ORDER a duplicated evaluator would get wrong.
+		//
+		// config.ResolveClassPermissions checks BUILT-INS FIRST, so the shared
+		// answer for "super-user" is PermAll and this line changes nothing while
+		// the CLI routes through it. A plausible CLI-only special case — resolve
+		// config-defined classes inline, fall through to the shared evaluator
+		// otherwise — keeps ONE syntactic shared call and so passes the
+		// structural guard below, and passed the whole pkg/cli suite before this
+		// line existed. With it, the CLI answers [view] where the shared
+		// evaluator answers [all] and this test REDs. Without it, the two guards
+		// between them bind "the body calls the shared evaluator" but not "the
+		// answer comes from it".
+		"set system login class super-user permissions view",
 	}
 	if _, err := store.LoadSet(strings.Join(sets, "\n")); err != nil {
 		t.Fatalf("LoadSet(): %v", err)

@@ -371,13 +371,40 @@ carrying the residuals below negatively.
 
 The classification is consulted **after** the socket-table read, not before it,
 and only where the table has nothing to say — a matched row settles locality on
-its own. An unreadable or absent table falls back to the same address rule in
-both directions: a caller that could be ours is local-and-unattributable
-(denied), one that could not is still reported off-box, so a broken `/proc` does
-not silently lock out every remote administrator. A row that matches the 4-tuple
-but whose state or uid column will not parse proves a socket exists without
-naming its owner: local, unattributable, denied, and logged once per scan rather
-than dropped in silence.
+its own. A row that matches the 4-tuple but whose state or uid column will not
+parse proves a socket exists without naming its owner: local, unattributable,
+denied, and logged once per scan rather than dropped in silence.
+
+**A failed table read denies unconditionally — including a remote administrator
+holding a valid credential.** If you are diagnosing a total management-plane
+lockout, this is the paragraph you want. Two states are read failures, and both
+deny: **any** candidate table that could not be read (hidepid, an LSM
+confinement, a `/proc` remount, ENOMEM under pressure) — *one* of two is enough —
+and **no** candidate table read at all. In either, `LookupPeer` returns
+*local-and-unattributable* for every caller, so every `POST /api/v1/config/*`
+answers **403** until `/proc` recovers, whoever is calling and whatever
+credential they present. It does **not** fall back to the address rule "in both
+directions"; an earlier revision of this document said it did, and that was
+wrong.
+
+That is the deliberate trade, and the direction is the reason. The alternative —
+falling back to the address rule on a failed read — makes a *negative* answer
+decisive on the strength of an observation that was never made: the caller's row
+may be in exactly the file that failed (`tcp` and `tcp6` are alternatives, not
+duplicates, so a partial failure is *half* an observation, not a small one), and
+a local caller the cached snapshot did not recognise would be reported off-box
+and handed the credential path. One side of that trade is an availability outage
+on a box whose `/proc` is broken; the other is a privilege-boundary bypass. Only
+the second is unrecoverable, so the read failure denies.
+
+An **absent** table is not a failed read, and the distinction is load-bearing:
+`scanBatch` skips ENOENT, so a kernel with no `/proc/net/tcp6` alongside a
+readable `/proc/net/tcp` reads normally and nothing is denied. Absence only
+denies when it leaves *nothing* read — zero files read **and** zero failed —
+which is the state a scope-qualified IPv6 caller reaches when `/proc/net/tcp6`
+is missing, since `tcp6` is that caller's only candidate. The recovery is to
+restore `/proc/net/tcp{,6}` readability for the daemon's UID; no config change
+reopens the surface, by design.
 
 <a id="residuals"></a>
 **Residuals, stated rather than papered over.** There are FOUR, and they are not

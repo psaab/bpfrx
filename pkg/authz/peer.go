@@ -482,15 +482,25 @@ func LookupPeer(client, server net.Addr) PeerIdentity {
 	// prints only the 128 address bits, never the scope id, so two link-local
 	// callers on different interfaces render the identical key and the first
 	// established row would win — an order-dependent identity, the same defect
-	// class as matching on ports alone. Refuse to guess: skip the table entirely
-	// and decide locality from the addresses.
+	// class as matching on ports alone. Refuse to guess: no scoped peer is ever
+	// given a UID, whatever the table says.
 	//
-	// The refusal must NOT be unconditional. A scoped peer that is not on this
-	// host is a remote administrator reaching an IPv6 link-local management bind,
-	// and denying it locked out every credentialed remote on such a bind. So only
-	// a scoped peer we would otherwise have to attribute is refused. The SERVER's
-	// zone is not disqualifying on its own — the client column still selects the
-	// row.
+	// The table is still READ. Refusing to attribute is not a reason to skip the
+	// observation — a matching row proves a socket exists on this host for those
+	// 128 bits and ports even though it names nobody, and answering from the
+	// cached address classification alone was a zero-observation fail-open (see
+	// the block below). An earlier version of this header said "skip the table
+	// entirely and decide locality from the addresses", which is what the code
+	// did before that fail-open was closed; it is stated here because a reviewer
+	// who reads this preamble and stops is the way that early-out gets
+	// reinstated.
+	//
+	// The refusal to attribute must NOT become a blanket denial. A scoped peer
+	// that is not on this host is a remote administrator reaching an IPv6
+	// link-local management bind, and denying it locked out every credentialed
+	// remote on such a bind. So only a scoped peer we would otherwise have to
+	// attribute is refused. The SERVER's zone is not disqualifying on its own —
+	// the client column still selects the row.
 	if ct.Zone != "" {
 		// Consult the table anyway. We cannot ATTRIBUTE from it — /proc carries
 		// no scope id — but a matching row still PROVES a socket exists on this
@@ -516,9 +526,17 @@ func LookupPeer(client, server net.Addr) PeerIdentity {
 		// link-local management bind — denying it there locked out every
 		// credentialed remote on such a bind.
 		if couldBeLocal(ct, st) {
+			// A DIFFERENT state from the row-found case above, and it gets a
+			// different Detail (#5561 round 9, MINOR-5). Both deny, but the 403
+			// body and the audit line are an operator's only handle on WHY: there
+			// the kernel proved a socket exists and the scope id is what stops us
+			// naming its owner; here the table was read and held nothing, and the
+			// denial rests entirely on the address classification. Different
+			// diagnosis, different remedy — emitting one string for both loses
+			// that.
 			return PeerIdentity{
 				Local:  true,
-				Detail: fmt.Sprintf("peer address %v is scope-qualified and cannot be attributed from the socket table", ct),
+				Detail: fmt.Sprintf("peer address %v is scope-qualified, has no socket-table row, and is assigned to this host", ct),
 			}
 		}
 		return PeerIdentity{Detail: fmt.Sprintf("peer %v is not on this host", ct.IP)}
