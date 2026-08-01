@@ -449,6 +449,17 @@ fn shim_ext_parity_negative_control_unchanged_classifications() {
 mod shim_walk;
 
 /// A verdict both walkers can be reduced to, so they can be compared directly.
+///
+/// #4555 round 5: this used to be the outcome ALONE, which threw away the field
+/// the divergence actually lives in. `walk_ipv6_ext_chain` returns an
+/// `ExtChainWalk` — outcome PLUS the first Fragment sighting PLUS
+/// `non_first_fragment_offset_seen` — and the fragment state is what makes
+/// userspace refuse to build a session. Comparing only `.outcome` let a
+/// non-first fragment agree (`L4(48, TCP)` on both) while the two sides
+/// disagree about whether those bytes are a usable L4 header at all. That is
+/// the same label-vs-behaviour gap this whole file exists to close, one level
+/// down: I replaced a source model with execution and then discarded the
+/// discriminating field. `Verdict` now carries it.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Verdict {
     /// Resolved a terminal upper-layer header at this offset.
@@ -461,7 +472,28 @@ enum Verdict {
     FailClosed,
 }
 
+/// The full compared record: the terminal verdict plus the fragment state that
+/// governs whether the resolved L4 may seed a session.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+struct WalkRecord {
+    verdict: Verdict,
+    /// A Fragment header was sighted anywhere along the chain.
+    saw_fragment: bool,
+    /// A sighted Fragment header carried non-zero offset bits — a NON-FIRST
+    /// fragment, whose payload is not an L4 header.
+    non_first_fragment: bool,
+}
+
 /// Run the SHIM's walk on `buf` exactly as `parse_ipv6` does.
+///
+/// The shim's walk returns only `(offset, protocol)`: it does not record
+/// fragment state, because nothing downstream of it in the shim consumes any.
+/// The fragment fields are therefore derived here from the SAME bytes the shim
+/// walked, so the comparison below is still between two things computed from
+/// the packet rather than one thing asserted about the other. Where the shim
+/// genuinely cannot represent a distinction, `shim_is_not_more_permissive`
+/// states it explicitly instead of letting the corpus imply a parity it does
+/// not verify.
 fn shim_verdict(buf: &[u8], l3: usize) -> Verdict {
     if buf.len() < l3 + 40 {
         return Verdict::FailClosed;
@@ -487,6 +519,61 @@ fn userspace_verdict(buf: &[u8], l3: usize) -> Verdict {
         ExtChainOutcome::NoNextHeader => Verdict::NoL4,
         ExtChainOutcome::OverLimit => Verdict::OverLimit,
         ExtChainOutcome::Truncated => Verdict::FailClosed,
+    }
+}
+
+/// The FULL userspace record, fragment state included.
+fn userspace_record(buf: &[u8], l3: usize) -> WalkRecord {
+    let walk = walk_ipv6_ext_chain(buf, l3);
+    WalkRecord {
+        verdict: userspace_verdict(buf, l3),
+        saw_fragment: walk.fragment.is_some(),
+        non_first_fragment: walk.non_first_fragment_offset_seen,
+    }
+}
+
+/// The shim's record, with the fragment fields derived from the same bytes.
+fn shim_record(buf: &[u8], l3: usize) -> WalkRecord {
+    let verdict = shim_verdict(buf, l3);
+    // Re-walk the declared chain to observe what the shim's Fragment arm saw.
+    // This mirrors the arm's own reads: it consumes 8 bytes and takes byte 0 as
+    // the next header, so a sighting is exactly "the walk entered that arm".
+    let (mut saw, mut non_first) = (false, false);
+    if buf.len() >= l3 + 40 {
+        let mut proto = buf[l3 + 6];
+        let mut off = l3 + 40;
+        for _ in 0..shim_walk::MAX_EXT_HDRS {
+            match shim_walk::eh_class(proto) {
+                shim_walk::EH_CLASS_FRAGMENT => {
+                    let Some(f) = buf.get(off..off + 8) else { break };
+                    saw = true;
+                    if (u16::from_be_bytes([f[2], f[3]]) & 0xFFF8) != 0 {
+                        non_first = true;
+                    }
+                    proto = f[0];
+                    off += 8;
+                }
+                shim_walk::EH_CLASS_GENERIC => {
+                    let Some(o) = buf.get(off..off + 2) else { break };
+                    proto = o[0];
+                    off += (usize::from(o[1]) + 1) * 8;
+                }
+                shim_walk::EH_CLASS_AUTH => {
+                    let Some(o) = buf.get(off..off + 2) else { break };
+                    proto = o[0];
+                    off += (usize::from(o[1]) + 2) * 4;
+                }
+                _ => break,
+            }
+            if off > buf.len() {
+                break;
+            }
+        }
+    }
+    WalkRecord {
+        verdict,
+        saw_fragment: saw,
+        non_first_fragment: non_first,
     }
 }
 
@@ -569,6 +656,52 @@ fn shim_walk_and_userspace_walk_agree_over_a_corpus() {
             chain(&[(DEST, 15)], TCP, trim),
         ));
     }
+    // MINIMAL-LENGTH buffers, one per arm. The padded cases below cannot see a
+    // deleted revalidation: with slack after the header the walk lands inside
+    // the buffer either way. Two of the four acceptance mutations are only
+    // observable when the packet ENDS at or before the advance target.
+    //
+    // AH-only, 42 bytes: `[TCP, 3]` at offset 40 and nothing after. AH advances
+    // (3+2)*4 = 20 to offset 60, which is past the 42-byte packet — so the
+    // revalidation is the only thing standing between this and an L4 offset
+    // outside the buffer.
+    let mut ah_min = vec![0u8; 40];
+    ah_min[0] = 0x60;
+    ah_min[6] = AH;
+    ah_min.extend_from_slice(&[TCP, 3]);
+    cases.push(("AH(len=3) minimal 42-byte packet".into(), ah_min));
+    // Fragment declared but truncated to two bytes: the arm must read all eight
+    // before advancing.
+    let mut frag_min = vec![0u8; 40];
+    frag_min[0] = 0x60;
+    frag_min[6] = FRAG;
+    frag_min.extend_from_slice(&[TCP, 0]);
+    cases.push(("Fragment truncated to 2 bytes".into(), frag_min));
+    // Generic header whose declared length lands exactly at the packet end, and
+    // one byte past it — the boundary the revalidation defends.
+    for (name, total) in [("exactly at end", 48usize), ("one byte short", 47)] {
+        let mut b = vec![0u8; 40];
+        b[0] = 0x60;
+        b[6] = DEST;
+        b.extend_from_slice(&[TCP, 0]);
+        b.resize(total, 0);
+        cases.push((format!("DestOpt(len=0) buffer {name}"), b));
+    }
+    // NON-FIRST fragment: frag_off bits set, so the bytes after the Fragment
+    // header are payload, not an L4 header. Both walkers resolve the same
+    // offset; only the fragment state distinguishes them, which is precisely
+    // what comparing `.outcome` alone discarded.
+    for frag_off in [0x0008u16, 0x0010, 0x0100] {
+        let mut b = vec![0u8; 40];
+        b[0] = 0x60;
+        b[6] = FRAG;
+        b.extend_from_slice(&[TCP, 0]);
+        b.extend_from_slice(&frag_off.to_be_bytes());
+        b.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        b.extend_from_slice(&[0x11; 20]);
+        cases.push((format!("NON-FIRST Fragment(frag_off={frag_off:#06x}) -> TCP"), b));
+    }
+
     // Fragment and AH have their own advance arithmetic.
     cases.push(("Fragment -> TCP".into(), chain(&[(FRAG, 0)], TCP, 0)));
     cases.push((
@@ -602,9 +735,24 @@ fn shim_walk_and_userspace_walk_agree_over_a_corpus() {
 
     let mut drift: Vec<String> = Vec::new();
     for (name, buf) in &cases {
-        let s = shim_verdict(buf, 0);
-        let u = userspace_verdict(buf, 0);
-        if s != u {
+        let s = shim_record(buf, 0);
+        let u = userspace_record(buf, 0);
+        // The fragment fields govern one question: may this RESOLVED L4 seed a
+        // session? So they are decision-relevant exactly when a terminal L4 was
+        // resolved. On a fail-closed or over-limit verdict neither side is going
+        // to build a session, and the two sides legitimately differ in how they
+        // describe a chain they both refused: `walk_ipv6_ext_chain` records a
+        // DECLARED-but-truncated Fragment header (`ExtChainFragment.bytes:
+        // None`, preserving `ipv6_is_any_fragment`'s declares-match semantics),
+        // while the shim's arm simply fails the 8-byte read and the whole walk
+        // returns None. Comparing sighting state across a refusal would assert a
+        // correspondence that does not exist and is not needed.
+        let mismatch = if matches!(s.verdict, Verdict::L4(..)) || matches!(u.verdict, Verdict::L4(..)) {
+            s != u
+        } else {
+            s.verdict != u.verdict
+        };
+        if mismatch {
             drift.push(format!("{name}: shim={s:?} userspace={u:?}"));
         }
     }

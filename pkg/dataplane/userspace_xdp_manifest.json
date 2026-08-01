@@ -40,7 +40,7 @@
     },
     {
       "path": "userspace-xdp/src/ipv6_ext_walk.rs",
-      "sha256": "418edd070925706cd3049dcbbfc9c375682f9fe0c9622cf297fc85a080bed578"
+      "sha256": "ee1411d16ed71460d5abb35904439624ada6b6d49ac7bdae20f5ba4663fcdc9d"
     },
     {
       "path": "userspace-xdp/src/lib.rs",

@@ -146,7 +146,11 @@ pub fn read_bytes<'a>(data: usize, data_end: usize, offset: usize, len: usize) -
 /// catch-all then yields ports 0/0, the session key misses, and the packet is
 /// redirected to userspace — the fail-closed path for an over-limit chain.
 ///
-/// Each arm's shape matters and is exercised by the host-side parity corpus:
+/// Each arm's shape matters. The host-side parity corpus exercises them with
+/// MINIMAL-length buffers as well as padded ones — a padded buffer cannot
+/// observe a missing revalidation, because the walk lands inside the packet
+/// either way. The cases that bind these arms are the ones whose packet ENDS at
+/// or before the advance target:
 /// the generic arm reads 2 bytes, advances `(HdrExtLen + 1) * 8` and
 /// REVALIDATES the whole advanced span against `data_end`; AH advances
 /// `(len + 2) * 4` (RFC 4302) and revalidates likewise; Fragment reads all 8
