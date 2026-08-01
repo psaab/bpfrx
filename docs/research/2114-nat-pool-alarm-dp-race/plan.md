@@ -1,9 +1,11 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v62 — r61 findings folded (Codex NEEDS-REVISION
-  5M/3m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m
-  — the alias-collapse pin, IS Codex M4; all three confirm
-  the §4.7 structure); pending convergence review r62
+- **Status**: DRAFT v63 — r62 findings folded (Codex NEEDS-REVISION
+  3M/2m; AGY PLAN-READY-WITH-NITS 0M/1m — the rg_active
+  rendering entry, IS Codex m2; Claude SMR
+  PLAN-READY-WITH-NITS 0M/1m — the acceptance queued-empty
+  term, IS Codex fold-3; all three confirm the §4.7
+  structure); pending convergence review r63
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -2811,6 +2813,57 @@
   legs (m2); and the 120s figure is corrected to the 3s
   small-request deadline / ~67s maximum-snapshot figures (m3,
   `process_control.go:31-56,85-103,129-142`).
+  v63: r62 convergence — the acceptance predicate is augmented
+  not replaced, the admission gate gains its shutdown-only
+  owner, the aliases retire with their registrations, and the
+  queued-empty term is ACTUALLY placed this time (Codex
+  NEEDS-REVISION 3M/2m, folds 2 FOLDED / 3 PARTIAL /
+  1 NOT-FOLDED, structure confirmed; AGY PLAN-READY-WITH-NITS
+  0M/1m — the rg_active rendering entry, IS Codex m2; SMR
+  PLAN-READY-WITH-NITS 0M/1m — the acceptance queued-empty
+  term, IS Codex fold-3): (a) THE AUGMENT (Codex M1, verified
+  the v62 regression: my M1 fold REPLACED the election-settled
+  term in the acceptance copy rather than augmenting it —
+  election state publishes before side effects run,
+  `election.go:337-395`, so an actuated-only snapshot can
+  coexist with an unsettled control state): the acceptance
+  carries BOTH the election-settled term AND the actuated
+  predicate. (b) THE SHUTDOWN-ONLY CLOSE/JOIN API (Codex M2,
+  verified: the only generic lifecycle hooks are Close and
+  Teardown, `apply.go:18-23`, and bootstrap calls the REUSABLE
+  Teardown and retains the object for re-arm,
+  `bootstrap.go:470-475`): the gate closes ONLY on process
+  shutdown, via a named close-admission/join call in
+  `runShutdownSequence` AHEAD of the subsystem teardown;
+  Teardown never closes it; and the disposition is honestly
+  bounded to one in-flight netlink call, with the §9
+  timeout-inside-mutation leg. (c) THE ALIAS RETIREMENT (Codex
+  M3, verified the correctness failure: arm IDs are reusable,
+  and a surviving A/X→B/X alias rebased to a later C/X
+  registration would let a delayed duplicate A/X completion
+  retire the NEW live arm — false green): every reverse alias
+  targeting a registration is REMOVED atomically when that
+  registration completes or terminally retires, with the §9
+  arm-ID-reuse/stale-duplicate regression. (d) THE QUEUED-EMPTY
+  TERM ACTUALLY PLACED (Codex fold-3's NOT-FOLDED — the v62
+  M3 fold was lost to a scripting failure, the FOURTH
+  honest-fold/scripting loss this loop; from here each fold
+  edit is one-replacement-per-script with a grep verification
+  after each): the normative predicate at :5491 AND the
+  acceptance predicate at :8344 both carry "no QUEUED
+  reservation outstanding" with the identity ordering. (e)
+  The named actuated surfaces (Codex m2 + AGY m1, verified no
+  new renderer is needed): `show chassis cluster data-plane
+  statistics` renders `rgN active=` per node
+  (`status_sections.go:329-335`,
+  `server_show_cluster_text.go:138-147`,
+  `cmd/cli/show.go:462-477`), and `show security vrrp`
+  renders runtime mastership (`cmd/cli/show_security.go:601-625`,
+  `server_nat.go:341-367`). (f) The minors: §9 gains the
+  LINKDEL INJECTION leg (Codex m1 — the discarded-error path
+  at `daemon_ha_fabric.go:52-53` cannot satisfy the test) and
+  the second 120s instance is corrected (Codex fold-6's
+  catch).
 
 ---
 
@@ -5490,7 +5543,14 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   it), rendered beside ActiveApplied on the status surface; the
   predicate is failure-count == 0 AND no pending arm
   outstanding (the per-arm-ID registration set for the current
-  token) AND last-outcome-success
+  token) AND no QUEUED reservation outstanding (the queued set
+  empty — rendered beside the pending set; and the identity
+  ordering is defined: the enqueue-reservation sequence is the
+  canonical order, and the admission token INHERITS its
+  reservation's position, so a publication's precedence is
+  always well-defined across the two namespaces — r61 Codex
+  M3, actually placed here after the v62 scripting loss, r62
+  Codex fold-3) AND last-outcome-success
   (process-lifetime, so no baseline capture is needed), and §9
   gains the sticky same-text regression (a failed same-text
   state-dependent reapply keeps ActiveApplied true while the
@@ -5528,8 +5588,18 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   one node with RG0 rg_active, exactly one VRRP MASTER where
   a VRRP-backed RG applies, BOTH on the intended node, and
   the loser EXPLICITLY INACTIVE — read PER-NODE on each
-  node's OWN status surface (the operator already reads the
-  peer via its localhost per the r42 fold), and the term
+  node's OWN status surface, with the surfaces NAMED (r62
+  Codex m2 + r62 AGY m1, verified they exist today and need
+  no new renderer): `show chassis cluster data-plane
+  statistics` renders `rgN active=` per node
+  (`status_sections.go:329-335`, via
+  `server_show_cluster_text.go:138-147`,
+  `cmd/cli/show.go:462-477`), and `show security vrrp`
+  renders the runtime VRRP mastership
+  (`cmd/cli/show_security.go:601-625`,
+  `server_nat.go:341-367`) — while `show chassis cluster
+  status` alone exposes only election state
+  (`status.go:10-25,91-104`) — and the term
   joins the final post-reactivation predicate as well; and ONLY THEN the
   operator RE-ACTIVATES `event-options` — ON BOTH NODES, each
   commit's own success required, EXACTLY mirroring the quiesce
@@ -6765,6 +6835,17 @@ v20 history). The delivery is TWO units:
   `manager_worker_arm_5134.go:38-96`): every outstanding alias
   is rewritten to the NEW current token at each supersession,
   so resolution is always one step and no chain accumulates —
+  AND the aliases are RETIRED WITH THEIR REGISTRATIONS (r62
+  Codex M3, verified the correctness failure: arm IDs are
+  reusable and duplicate completions must be ignored, while
+  surviving aliases are rebased at every supersession — an
+  A/X→B/X alias surviving B/X's retirement could be rebased
+  to a later C/X registration, letting a delayed duplicate
+  A/X completion retire the NEW live arm and false-green
+  convergence): every reverse alias targeting a registration
+  is REMOVED atomically when that registration completes or
+  terminally retires, with the §9 arm-ID-reuse/stale-duplicate
+  regression —
   so an in-flight
   arm's completion is never lost across a supersession;
   the signal reads CONVERGED
@@ -6951,8 +7032,11 @@ v20 history). The delivery is TWO units:
   mint's re-registration query reads (no `m.mu` held across
   control-socket IPC — r56 Codex M6 + r56 AGY M1:
   `process_status.go:150-255` holds `m.mu` across the whole
-  poll including IPC with a 2s dial and up to a 120s round
-  trip, `process_control.go:34-56,129-142`); and the
+  poll including IPC (bounded by the 3s small-request
+  deadline; the ~67s maximum applies to the largest
+  apply_snapshot, `process_control.go:31-56,85-103,129-142` —
+  r61 Codex m3's corrected evidence, this second instance
+  caught by r62 Codex fold-6); and the
   `syncInterfaceAttachments` detach failures becoming a
   returned terminal error with `errors.Join` over ALL
   attempted detaches (`manager_compile.go:211-214,567-591` —
@@ -6997,12 +7081,27 @@ v20 history). The delivery is TWO units:
   a closed/admission gate atomically reserves in-flight work
   BEFORE launch (under the debt-ledger lock: admission closed
   ⇒ the callback never launches; admission open ⇒ the
-  registration reserves before launch), the shutdown closes
+  registration reserves before launch), with the gate's OWNER
+  AND API PINNED (r62 Codex M2, verified: the only generic
+  dataplane lifecycle hooks today are Close and Teardown,
+  `apply.go:18-23`, and bootstrap calls the REUSABLE Teardown
+  and retains the object for re-arm, `bootstrap.go:470-475` —
+  a monotonic gate buried in both hooks would break the
+  bootstrap re-arm): the gate closes ONLY on process
+  shutdown, via a named close-admission/join call in
+  `runShutdownSequence` AHEAD of the subsystem teardown
+  (`daemon_run_shutdown.go:214-230`) — Teardown never closes
+  it — the shutdown closes
   admission FIRST and then joins the reserved set, and the
   join's 5s bound is the disposition — a callback still
   in-flight past the bound hits the full fence
   (`runCtx.Err()` OR `stopping`) at each mutation and
-  abandons — the teardown waits
+  abandons, with the overlap bounded to one in-flight
+  netlink call (r62 Codex fold-2's honesty point: a
+  non-contextual call already entered cannot reach another
+  fence before teardown proceeds — the bound to one call is
+  the honest statement, and §9 gains the
+  timeout-inside-mutation leg) — the teardown waits
   for in-flight callbacks before the dataplane teardown; the
   callback's body is bounded netlink work, and the 5s bound
   remains the safety net),
@@ -8343,7 +8442,9 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      requires NO dataplane apply failure since the post-restart
      bringup on either node — i.e. failure-count == 0 AND no
      pending arm outstanding (the per-arm-ID registration set
-     for the current token) AND
+     for the current token) AND no QUEUED reservation
+     outstanding (the queued set empty, rendered beside the
+     pending set — r62 Codex fold-3 + r62 SMR m1) AND
      last-outcome-success read from ONE coherent snapshot (r50
      Codex m1 + M1 — the mid-render entry race is closed by the
      single-snapshot publication, and the truth assignment is
@@ -8366,7 +8467,13 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      the candidate explicitly discarded) on BOTH nodes (r46
      Codex M2b — `store_commit.go:796-800`,
      `store_lock.go:334-338`, `store_command.go:304-334`) —
-     AND the MULTI-TERM ACTUATED authority predicate
+     AND the RG0 election SETTLED with exactly ONE primary
+     (the election-state term, RETAINED — v62's fold
+     mistakenly replaced rather than augmented here, r62 Codex
+     M1: election state publishes before side effects run,
+     `election.go:337-395`, so an actuated snapshot alone can
+     coexist with an unsettled or dual-primary control state
+     whose later processing changes actuation) AND the MULTI-TERM ACTUATED authority predicate
      (r61 Codex M1's acceptance alignment): exactly one node
      with RG0 rg_active, exactly one VRRP MASTER where a
      VRRP-backed RG applies, BOTH on the intended node, and
@@ -8491,6 +8598,15 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      and the re-drive overwrites it) and the MARKER-NO-OP
      REJECTION leg (a no-op pass never ticks ConfigsSent, so no
      runbook step may wait on a tick);
+     (h2m) the v62 legs (r62 Codex m1 + fold-2): the LINKDEL
+     INJECTION leg (a mismatched link whose `LinkDel` fails
+     retires the arm FAILED — the discarded-error path,
+     `daemon_ha_fabric.go:52-53`, cannot satisfy the test) and
+     the TIMEOUT-INSIDE-MUTATION leg (the join's bound expires
+     while a callback sits inside one non-contextual netlink
+     call — the callback completes that call and abandons at
+     the next fence, bounding the teardown overlap to one
+     call);
      (h2k) the HYBRID-CLOSURE legs (r58 Codex m1): the
      ROLLBACK-FORK legs (every rollback branch publishes its
      NEUTRAL/SUCCESS/FAILURE outcome — a failed rollback's

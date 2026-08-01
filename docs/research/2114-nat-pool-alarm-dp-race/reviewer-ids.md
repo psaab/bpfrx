@@ -188,6 +188,9 @@ reviewer (joins at /engineer on the code PR).
 | r61 | Codex | codex companion task-msaeqb8e-po29bx (session 019fbd83-32f6-7e11-8c7e-337a148da036) | NEEDS-REVISION (5 MAJOR, 3 MINOR; folds 2 FOLDED / 3 PARTIAL / 2 NOT-FOLDED). Structure confirmed |
 | r61 | AGY | agy print-mode direct at 12m (agy-plan-r61.md) | PLAN-READY (7/7 folds FOLDED; 3 attacks FAILED; no findings). Structure confirmed |
 | r61 | Claude SMR | in-conversation (claude-smr-plan-r61.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — alias-collapse pin, IS Codex M4). Structure confirmed |
+| r62 | Codex | codex companion task-msafqf0u-36x842 (session 019fbd9c-ee1f-7172-8563-91c01d83a9f9) | NEEDS-REVISION (3 MAJOR, 2 MINOR; folds 2 FOLDED / 3 PARTIAL / 1 NOT-FOLDED). Structure confirmed |
+| r62 | AGY | agy print-mode direct at 12m (agy-plan-r62.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — rg_active rendering entry, IS Codex m2). Structure confirmed |
+| r62 | Claude SMR | in-conversation (claude-smr-plan-r62.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — acceptance queued-empty term, IS Codex fold-3). Structure confirmed |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 
