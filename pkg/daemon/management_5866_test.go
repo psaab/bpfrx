@@ -545,3 +545,51 @@ func bytesEqual(a, b []byte) bool {
 	}
 	return true
 }
+
+// TestMgmtReconcileRotationHonoredDespiteHTTPRebindFailure_5561 is the round-7
+// MAJOR-2 guard.
+//
+// ReplaceAuth used to sit inside `if httpOK`, so when the HTTP leg's OWN rebind
+// failed and the old listener was retained, a credential ROTATION was never
+// published: the retained listener kept honouring the REVOKED secret, and not
+// for a race window — indefinitely, until some later reconcile happened to
+// succeed. The surrounding comment had the right argument for the wrong scope.
+// It says a non-nil Auth only ADDS a requirement and so cannot fail open; that
+// is true of ANY live bind, including one retained by a failure, so gating it on
+// httpOK bought nothing and cost revocation.
+//
+// The negative control is the other direction, and it is why the fix is not
+// simply "always publish": REMOVING all api-auth still defers on a failed HTTP
+// rebind, because that direction removes a requirement and can fail open. It is
+// covered by TestMgmtReconcileRemoveAuthDeferredWhenHTTPRebindFails_5866, which
+// must stay green.
+func TestMgmtReconcileRotationHonoredDespiteHTTPRebindFailure_5561(t *testing.T) {
+	reg := newFakeReg()
+	m := newTestMgmt(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	old := &api.AuthConfig{Users: map[string]string{"admin": "old-secret"}}
+	if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:8080", false, "", old)); err != nil {
+		t.Fatalf("initial start: %v", err)
+	}
+
+	// The operator rotates the credential AND the new bind fails.
+	rotated := &api.AuthConfig{Users: map[string]string{"admin": "new-secret"}}
+	reg.failAddr["10.0.0.2:8080"] = true
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.2:8080", false, "", rotated)); err == nil {
+		t.Fatal("a failed listener replacement must surface an error")
+	}
+
+	snap := m.srv.AuthSnapshotForTest()
+	if snap == nil {
+		t.Fatal("the live auth snapshot went nil on a failed rebind — that drops api-auth " +
+			"entirely, which is the fail-open the deferral exists to prevent")
+	}
+	if got := snap.Users["admin"]; got != "new-secret" {
+		t.Fatalf("after a credential rotation whose HTTP rebind FAILED, the live snapshot "+
+			"still authorizes %q — the revoked secret keeps working on the retained "+
+			"listener until some later reconcile happens to succeed, which is a permanent "+
+			"fail-open rather than a race window", got)
+	}
+}

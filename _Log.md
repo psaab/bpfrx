@@ -66758,3 +66758,30 @@ break — `go vet` confirmed passing under every revert.
   `TestResolveClassPermissionsIsSharedWithTheCLI_5561` binding gap.
 - **File(s)**: pkg/authz/peer.go, pkg/authz/socketscan.go,
   pkg/authz/peer_5561_test.go, pkg/api/authz.go, _Log.md
+
+- **Timestamp**: 2026-08-01 (round-7b, MAJOR-2)
+- **Action**: #5561 — MAJOR-2 (revoked api-auth credential stays full-power).
+  The mechanism is not the instruction window it was reported as: `ReplaceAuth`
+  sat inside `if httpOK` in pkg/daemon/management.go, so when the HTTP leg's OWN
+  rebind FAILED and the old listener was retained, a credential ROTATION was
+  never published at all — the retained listener kept honouring the REVOKED
+  secret indefinitely, until some later reconcile happened to succeed. Permanent,
+  not a race. The surrounding comment already had the right argument for the
+  wrong scope: a non-nil Auth only ADDS a requirement and so cannot fail open,
+  which is true of ANY live bind including one retained by a failure, so gating
+  it on httpOK bought nothing and cost revocation. Non-nil Auth is now published
+  unconditionally; dropping to NO auth still defers on !httpOK and still requires
+  the live HTTPS to be off or loopback, because THAT direction removes a
+  requirement. Guard: TestMgmtReconcileRotationHonoredDespiteHTTPRebindFailure_5561.
+  Verified first that NO existing test bound it — the mutation passed green
+  before the guard was written. Mutation with the guard: build rc=0 (0 bytes),
+  vet rc=0 (0 bytes), reds only the new test at management_5866_test.go:590
+  ("still authorizes \"old-secret\""), 29 pass, and the opposite-direction
+  control TestMgmtReconcileRemoveAuthDeferredWhenHTTPRebindFails_5866 green in
+  BOTH worlds.
+- **NOT DONE, carried:** MAJOR-5b (a timed-out request does not cancel its
+  accept-time lookup goroutine) and the
+  TestResolveClassPermissionsIsSharedWithTheCLI_5561 binding gap. MAJOR-4 is out
+  of scope — filed as #6703.
+- **File(s)**: pkg/daemon/management.go, pkg/daemon/management_5866_test.go,
+  _Log.md

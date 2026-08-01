@@ -240,12 +240,26 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 	// regardless of the HTTPS outcome. Removing ALL api-auth (nil) additionally
 	// requires the LIVE HTTPS to be off or loopback, so a non-loopback HTTPS
 	// retained by a failed HTTPS rebind is never dropped to no-auth (fail-open).
-	if httpOK {
-		if next.Auth != nil {
-			m.srv.ReplaceAuth(next.Auth)
-		} else if !m.cur.tls || mgmtAddrIsLoopback(m.cur.httpsAddr) {
-			m.srv.ReplaceAuth(nil)
-		}
+	// A NON-NIL credential set is published unconditionally — including when the
+	// HTTP leg's own rebind FAILED and the old listener was retained (#5561
+	// round 7, MAJOR-2).
+	//
+	// The reasoning above is right that a non-nil Auth only ADDS a requirement
+	// and so cannot fail-open; it was wrong to gate that on httpOK. Deferring it
+	// there is a fail-open for credential ROTATION and REVOCATION, which is the
+	// common case: replacing secret A with secret B means A must stop working,
+	// and skipping ReplaceAuth left the RETAINED listener honouring A
+	// indefinitely — until some later reconcile happened to succeed. Not a race
+	// window; a permanent one. Applying B to the retained old bind is strictly
+	// more restrictive than leaving A on it, whatever that bind is.
+	//
+	// Dropping to NO auth still requires httpOK, and still requires the live
+	// HTTPS to be off or loopback: that direction removes a requirement and is
+	// the one that can fail open.
+	if next.Auth != nil {
+		m.srv.ReplaceAuth(next.Auth)
+	} else if httpOK && (!m.cur.tls || mgmtAddrIsLoopback(m.cur.httpsAddr)) {
+		m.srv.ReplaceAuth(nil)
 	}
 
 	if len(errs) == 0 {
