@@ -85,6 +85,7 @@ func (o *monWeightFakeOps) AddrList(netlink.Link, int) ([]netlink.Addr, error) {
 const outOfRangeMonitorConfig = `
 chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         control-interface em0;
         fabric-interface fab0;
         reth-count 2;

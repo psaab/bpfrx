@@ -29,6 +29,7 @@ import (
 func ifMonSetLines(weight int) []string {
 	return []string{
 		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set chassis cluster redundancy-group 1 node 0 priority 200",
 		fmt.Sprintf("set chassis cluster redundancy-group 1 interface-monitor ge-0/0/0 weight %d", weight),
 	}
@@ -91,6 +92,7 @@ func TestChassisInterfaceMonitorWeightInRangeCommits_6549(t *testing.T) {
 func TestChassisInterfaceMonitorWeightMissingCommits_6549(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set chassis cluster redundancy-group 1 node 0 priority 200",
 		"set chassis cluster redundancy-group 1 interface-monitor ge-0/0/0",
 	})
@@ -141,6 +143,7 @@ func TestChassisInterfaceMonitorWeightTolerantPathNoBrick_6549(t *testing.T) {
 func TestChassisInterfaceMonitorWeightHierarchicalShape_6549(t *testing.T) {
 	const text = `chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         cluster-id 1;
         redundancy-group 1 {
             node 0 priority 200;

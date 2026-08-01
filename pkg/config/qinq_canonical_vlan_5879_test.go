@@ -137,7 +137,7 @@ func TestQinQPeerOnlyGroupRejectedOnCommittingNode_5879(t *testing.T) {
     }
 }
 apply-groups "${node}";
-chassis { cluster { node 0; } }`
+chassis { cluster { node 0; authentication-key test-cluster-psk-6611; } }`
 	tree := hierTree(t, src)
 
 	// Committing AS NODE 0: node0's own view is single-tag (clean), but the
@@ -161,7 +161,7 @@ chassis { cluster { node 0; } }`
     node1 { interfaces { ge-0/0/0 { unit 0 { vlan-id 100; family inet { address 10.0.1.1/24; } } } } }
 }
 apply-groups "${node}";
-chassis { cluster { node 0; } }`)
+chassis { cluster { node 0; authentication-key test-cluster-psk-6611; } }`)
 	if _, err := CompileConfigForNode(clean, 0); err != nil {
 		t.Fatalf("single-tag node-scoped config must compile for node0: %v", err)
 	}

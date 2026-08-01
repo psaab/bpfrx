@@ -99,6 +99,7 @@ func TestLoad_ToleratesStoredOutOfRangeChassisLeaf(t *testing.T) {
 	cfgPath := filepath.Join(t.TempDir(), "config")
 	writeStoredConfig(t, cfgPath,
 		"set chassis cluster cluster-id 999",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set chassis cluster heartbeat-interval 200")
 
 	s := newTestStoreAt(t, cfgPath)

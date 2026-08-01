@@ -345,6 +345,7 @@ func testStoreWithSetConfig(t *testing.T, lines []string) *configstore.Store {
 func TestTakeoverReadinessForRG_NoRethIgnoresClusterSyncReady(t *testing.T) {
 	store := testStoreWithSetConfig(t, []string{
 		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set chassis cluster node 0",
 		"set chassis cluster no-reth-vrrp",
 		"set chassis cluster redundancy-group 0 node 0 priority 200",

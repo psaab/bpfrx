@@ -1254,6 +1254,20 @@ type compileOpts struct {
 	// xpf_host_inbound_ambiguous_addresses metric are the operator's signal. Same
 	// doctrine as lenientZoneInterfaceMembership.
 	lenientDuplicateHostLocalAddress bool
+	// lenientClusterAuthKey (#6611) downgrades the cluster control-channel
+	// authentication gate (validateClusterAuthKeyStrict) from a hard compile
+	// error to a cfg.Warnings entry. The strict commit / commit-check path
+	// hard-rejects a `chassis cluster` with no `authentication-key`: the
+	// fabric gRPC listener (#4357), the heartbeat (#4326) and the session-sync
+	// channel (#4369) all authenticate with that one PSK and all three
+	// deliberately fail OPEN when it is absent, so an unkeyed cluster runs its
+	// entire control channel unauthenticated. The tolerant load / peer-sync
+	// paths downgrade to a warning so a cluster that was already unkeyed
+	// before this gate existed still BOOTS after the upgrade (#1960 no-brick)
+	// — that is the migration path; the dual-accept grace in all three
+	// mechanisms then lets the key be rolled out one node at a time without
+	// dropping the cluster. Same doctrine as lenientChassisRG.
+	lenientClusterAuthKey bool
 	// lenientDestNATAddresses (#2396) downgrades the destination-NAT
 	// destination-address gate (validateDestinationNATAddressesStrict) from a
 	// hard compile error to a cfg.Warnings entry. The strict commit /
@@ -2067,6 +2081,7 @@ func lenientCompileOpts() compileOpts {
 		lenientZoneInterfaceDefined:            true,
 		lenientHostInboundTokens:               true,
 		lenientDuplicateHostLocalAddress:       true,
+		lenientClusterAuthKey:                  true,
 		lenientDestNATAddresses:                true,
 		lenientRPMSourceAddress:                true,
 		lenientRPMLinkLocalZone:                true,

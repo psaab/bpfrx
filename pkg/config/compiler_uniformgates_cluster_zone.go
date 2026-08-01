@@ -271,5 +271,37 @@ func runUniformGatesClusterZone(tree *ConfigTree, cfg *Config, opts compileOpts)
 		}
 	}
 
+	// #6611 cluster control-channel authentication gate. Strict on commit /
+	// commit-check (hard-reject a `chassis cluster` with no
+	// `authentication-key` — the fabric gRPC listener, the heartbeat and the
+	// session-sync channel ALL key off that one PSK and all three fail OPEN
+	// without it, so the whole control channel runs unauthenticated and any
+	// host on the control segment can drive failover / read / clear / inject
+	// sessions). Lenient on load / peer-sync (warn so an already-persisted or
+	// peer-synced unkeyed config still boots — #1960 no-brick; this is the
+	// upgrade path for a cluster that was unkeyed before the gate existed, and
+	// the dual-accept grace in all three mechanisms lets the key then be rolled
+	// out one node at a time). Runs LAST in the cluster-zone segment so every
+	// structural cluster error still wins the first-error slot — an operator
+	// fixing a malformed redundancy-group should not be handed the auth message
+	// first. Runs on the fully-compiled *Config (ControlLinkAuthKey populated by
+	// compileChassis).
+	if err := validateClusterAuthKeyStrict(cfg); err != nil {
+		if opts.lenientClusterAuthKey {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("cluster authentication (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
+	// #6611 key-strength advisories. Absence is binary and is rejected above;
+	// strength is a continuum, so a short key or one copied verbatim from a
+	// published reference config WARNS on both paths rather than failing the
+	// config. Rejecting those would create a new brick class (including via
+	// bootstrapFromFile, an unattended path) for an operator who already
+	// configured authentication.
+	cfg.Warnings = append(cfg.Warnings, ClusterAuthKeyStrengthWarnings(cfg)...)
+
 	return nil
 }

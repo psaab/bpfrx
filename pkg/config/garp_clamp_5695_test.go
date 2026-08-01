@@ -67,6 +67,7 @@ func TestGratuitousARPCountCommitWarning_5695(t *testing.T) {
 	// Over the clamp: WARN (but still compile — never reject).
 	over := flatTreeFromSets(t,
 		"set chassis cluster redundancy-group 1 node 0 priority 200",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set chassis cluster redundancy-group 1 node 1 priority 100",
 		"set chassis cluster redundancy-group 1 gratuitous-arp-count 100000")
 	cfg, err := CompileConfig(over)
@@ -90,6 +91,7 @@ func TestGratuitousARPCountCommitWarning_5695(t *testing.T) {
 	for _, n := range []string{"1", "3", "8", "16", "32"} {
 		ok := flatTreeFromSets(t,
 			"set chassis cluster redundancy-group 1 node 0 priority 200",
+			"set chassis cluster authentication-key test-cluster-psk-6611",
 			"set chassis cluster redundancy-group 1 node 1 priority 100",
 			"set chassis cluster redundancy-group 1 gratuitous-arp-count "+n)
 		cfg, err := CompileConfig(ok)

@@ -82,6 +82,7 @@ func TestBuildSurfaceAScopesFromConfig(t *testing.T) {
 func TestBuildSurfaceAScopesAttributesRG(t *testing.T) {
 	store := testStoreWithSetConfig(t, []string{
 		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set chassis cluster node 0",
 		"set chassis cluster redundancy-group 1 node 0 priority 200",
 		"set interfaces reth0 redundant-ether-options redundancy-group 1",

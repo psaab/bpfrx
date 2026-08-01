@@ -20,6 +20,7 @@ func scopeClusterDaemon(t *testing.T) *Daemon {
 	t.Helper()
 	store := testStoreWithSetConfig(t, []string{
 		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set chassis cluster node 0",
 		"set chassis cluster redundancy-group 1 node 0 priority 200",
 		"set chassis cluster redundancy-group 2 node 0 priority 200",
@@ -110,6 +111,7 @@ func TestDDNSReconcileGateStandaloneNilOpts(t *testing.T) {
 func TestDDNSOverlappingPoolAttributionDeterministic(t *testing.T) {
 	store := testStoreWithSetConfig(t, []string{
 		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set chassis cluster node 0",
 		"set chassis cluster redundancy-group 1 node 0 priority 200",
 		"set chassis cluster redundancy-group 2 node 0 priority 200",

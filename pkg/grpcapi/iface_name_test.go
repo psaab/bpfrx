@@ -35,6 +35,7 @@ func TestGetInterfaces_ResolvesRethToLoopback(t *testing.T) {
 	}
 	sets := []string{
 		"set chassis cluster reth-count 1",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set interfaces lo gigether-options redundant-parent reth0",
 		"set interfaces reth0 redundant-ether-options redundancy-group 1",
 		"set security zones security-zone trust interfaces reth0",

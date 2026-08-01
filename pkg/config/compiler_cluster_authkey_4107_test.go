@@ -30,14 +30,20 @@ func TestClusterAuthKeyCompilesToSecret(t *testing.T) {
 	}
 }
 
+// TestClusterAuthKeyAbsentIsEmpty pins the #4107 compile behavior for an absent
+// key: the Secret is empty, which is what every runtime keyConfigured test reads.
+// It compiles on the TOLERANT path because #6611 made an unkeyed `chassis
+// cluster` a hard reject on the strict commit path — the tolerant path is
+// exactly where an already-persisted unkeyed config still has to compile, so
+// this is the surviving caller of the absent-key shape.
 func TestClusterAuthKeyAbsentIsEmpty(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set chassis cluster cluster-id 1",
 		"set chassis cluster node 0",
 	})
-	cfg, err := CompileConfig(tree)
+	cfg, err := CompileConfigLenient(tree)
 	if err != nil {
-		t.Fatalf("CompileConfig: %v", err)
+		t.Fatalf("CompileConfigLenient: %v", err)
 	}
 	if got := cfg.Chassis.Cluster.ControlLinkAuthKey.Reveal(); got != "" {
 		t.Fatalf("absent authentication-key must compile empty, got %q", got)

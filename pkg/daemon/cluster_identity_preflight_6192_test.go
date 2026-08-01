@@ -97,6 +97,12 @@ func TestClusterIdentityDay2ChangeRejected(t *testing.T) {
 	if err := store.SetFromInput("chassis cluster node 0"); err != nil {
 		t.Fatalf("set node 0: %v", err)
 	}
+	// #6611: an unkeyed chassis cluster is a hard reject on the strict commit
+	// path, so the fixture must carry the control-channel PSK to reach the
+	// identity preflight this test is about.
+	if err := store.SetFromInput("chassis cluster authentication-key test-cluster-psk-6611"); err != nil {
+		t.Fatalf("set authentication-key: %v", err)
+	}
 	if _, err := store.Commit(); err != nil {
 		t.Fatalf("commit clustered active: %v", err)
 	}

@@ -1,3 +1,215 @@
+## 2026-07-31 — #6611 review round 2: guard scoped narrower than its claim
+
+- **Timestamp**: 2026-07-31 (fix/6611-control-channel-auth, PR #6624)
+- **Action**: Round-2 hostile review returned MERGE-NEEDS-MINOR with both
+  round-1 MAJORs confirmed closed. Five fixes, each verified firsthand first.
+  (MINOR-1a) The comment justifying dropping nodeID 1 from
+  `TestCheckTextRejectsUnkeyedCluster_6611` asserted INVERTED gate ordering.
+  `compileTreeStrict` calls `CompileConfigForNode` (store.go:402) BEFORE
+  `crossCheckNodeID` (:409), so the #6611 gate fires first and the node-1
+  reject case would have passed at every nodeID. Restored `{-1, 0, 1}` and
+  rewrote the comment. The #4185 reasoning IS true for the ACCEPT loop (a
+  keyed config clears #6611 and then hits the identity cross-check against
+  the `node 0` fixture), so it moved there.
+  (MINOR-1b, the one that mattered) The bootstrap guard built its store with
+  `configstore.New`, which sets `nodeID: -1`, so it only ever exercised the
+  STANDALONE compile — never `CompileConfigForNode`, which is what a real
+  cluster node's first boot runs. The guard was scoped narrower than the
+  verdict it claimed to pin. `bootstrapDaemon` now takes a nodeID and calls
+  `SetNodeID`; reject and accept both run at {-1, 0, 1} with the `node` leaf
+  tracking the id. Added `TestBootstrapStoreIsInClusterMode_6611`, which
+  proves the plumbing actually takes effect by feeding a KEYED config whose
+  node leaf disagrees with the store id: that clears #6611 and is refused by
+  #4185, a verdict only reachable when `nodeID >= 0`. Without it the extended
+  coverage would have been three repetitions of the standalone compile.
+  (MINOR-2) A FOURTH strict population was undocumented: `pkg/eventengine`
+  autonomous remediation (`store.CommitCheck()` + the daemon commit closure,
+  both strict). Consequence now stated in all four surfaces — on the
+  in-place-upgraded unkeyed cluster the table calls safe, every
+  `change-configuration` policy silently fails from the moment of upgrade
+  with no operator present. "The cluster keeps running" is true of traffic
+  and the dataplane, not of automation.
+  (MINOR-3) `pkg/cluster/README.md` line 358, in the PRE-EXISTING F23 design
+  section, still said "Enforcement engages only once BOTH nodes are keyed and
+  signing" — which #6628 falsifies, fifty lines above the new section saying
+  the opposite. I rewrote 172 lines of that file and left it. Now carries the
+  re-establishment clause.
+  (MINOR-4) The rollout's own step 1 leaks the PSK the same section says to
+  provision out-of-band: every shipped config sets
+  `configuration-synchronize`, and `pushConfigToPeer` sends
+  `Store.ShowActive()` = `s.active.Format()`, the RAW tree with no
+  `ast_redact.go` pass. Added the mitigation that actually works — delete
+  `configuration-synchronize`, key both nodes, restore it — and said plainly
+  that out-of-band provisioning alone does not avoid the exposure.
+  NITs: the ~1s dual-master window is the SHIPPED cluster setting (200ms x 5);
+  `DefaultHeartbeatInterval` is 100ms, so ~500ms at code defaults — both now
+  named. Dropped "the keying commit is always accepted" (it strict-compiles
+  the whole candidate, so a lenient-tolerated #1319/#4185/#4525 violation can
+  refuse it — precisely this population). Fixed the TrimSpace rationale: it
+  makes the gate STRICTER than the runtime, not in agreement with it, and
+  documented the resulting lenient-path residual (runtime len=3 for a
+  three-space key while the boot log says "no authentication-key
+  configured"). MUTATION RE-VERIFIED, three mutations, `go build ./...` and
+  `go vet ./...` clean under each: (A) removing the reject call site reds 6
+  guards including both unattended paths, with 4 negative controls green;
+  (B) disarming the strength advisories reds all 3 strength tests, control
+  green; (C) removing the `SetNodeID` plumbing reds ONLY
+  `TestBootstrapStoreIsInClusterMode_6611` — which is exactly what that guard
+  exists to detect. Validation: `go build ./...` exit 0, `go vet ./...` clean,
+  gofmt clean on every touched file, `go test ./... -count=1` green except the
+  pre-existing `TestHeatmapNotStale`.
+- **File(s)**: pkg/daemon/bootstrap_cluster_authkey_6611_test.go,
+  pkg/configstore/check_cluster_authkey_6611_test.go,
+  pkg/config/compiler_validate_strict_cluster_auth.go, pkg/cluster/README.md,
+  docs/config-schema.md, docs/architecture.md
+
+## 2026-07-31 — #6611 review round 1: the strict-path claim was WRONG
+
+- **Timestamp**: 2026-07-31 (fix/6611-control-channel-auth, PR #6624)
+- **Action**: Codex (DO-NOT-MERGE) and hostile Claude (MERGE-NEEDS-MAJOR)
+  independently found that the PR's central scope argument was false, and I
+  re-verified every finding firsthand before acting. The claim "only the
+  operator's next commit is refused, and a rejected commit is inert for
+  traffic" holds for `Store.Commit`/`CommitCheck`/`CommitConfirmed` and is
+  FALSE for two other callers of `compileTreeStrict`: (A)
+  `daemon.bootstrapFromFile` (`daemon_apply_commit.go`), reached from
+  `daemon_run_bringup.go` whenever the config DB has no active config — an
+  unkeyed cluster config there leaves the node with NO active config,
+  unattended, not a warning; (B) `configstore.CheckText` behind `xpfd
+  check-config`, wired into `scripts/deploy/xpf-deploy.py`,
+  `scripts/image/make_config_drive.py` and the first-boot loader
+  `scripts/image/xpf-day0-config` (reject -> factory bootstrap). This is our
+  own deploy path: `test/incus/cluster-setup.sh` pushes the text config and
+  then `rm -rf /etc/xpf/.configdb`, so every `make cluster-deploy` goes
+  through (A). Also affected: node reimage/replacement into an existing
+  unkeyed cluster, DR restore from archived text, and any day-0 drive built
+  from an unkeyed config. In-place upgrade IS safe (keeps `.configdb`, loads
+  leniently) — that part of the claim survived. The reject is KEPT (failing
+  closed on a NEW provision is the right posture); what changed is the claim
+  and the documented ORDER: key the RUNNING cluster first, then re-provision
+  / reimage / rebuild a day-0 drive. Pinned with new guards:
+  `pkg/daemon/bootstrap_cluster_authkey_6611_test.go` (rejects unkeyed AND
+  asserts `active=false`; keyed + standalone negative controls) and
+  `pkg/configstore/check_cluster_authkey_6611_test.go` (rejects unkeyed for
+  node 0 and standalone -1; keyed negative control). Second correction: the
+  PR claimed all three channels become authenticated after the keying commit.
+  Codex showed session-sync fixes a connection's auth state at CONNECT
+  (`performSyncHandshake` -> `wrapSyncConn`) and the comms-restart decision
+  compares only `clusterTransportKey`, which has six transport fields and
+  does NOT include the auth key — so an established stream stays
+  unauthenticated indefinitely after the key is committed. Verified both
+  firsthand. Team lead filed #6628 (that), #6629 (config-sync ships the PSK
+  in cleartext over the HMAC-only, initially-unauthenticated link — the
+  prescribed rollout leaks the key it installs) and #6630 (rotation has no
+  overlap protocol). Not fixed here; the README now REQUIRES a daemon restart
+  as step 3 of the rollout and tells the operator to provision the PSK
+  out-of-band rather than via config-sync. Third: the README's rotation
+  escape hatch ("clear the key on both nodes first") was dead-end advice —
+  this PR's own gate rejects an unkeyed cluster — and the rotation hazard was
+  understated. `heartbeat.go` `continue`s on auth reject WITHOUT refreshing
+  `lastSeen` (verified), so mismatched keys mean neither node refreshes peer
+  liveness and BOTH declare the peer dead in ~1s (200ms x 5) and take over
+  their RGs: dual-master with duplicate VIPs, not an auth hiccup. Rotation is
+  now documented as a planned-outage operation, and the sticky `peerAuthSeen`
+  reverse-rollback hazard is named. Fourth: the whitespace check was framed as
+  an entropy floor but `authentication-key "a"` passes. Reframed as the
+  emptiness normalization it is, and backed by a REAL strength signal:
+  `ClusterAuthKeyStrengthWarnings` warns on BOTH paths below
+  `MinAdvisedControlLinkKeyLen` (16) and when the key matches a published
+  `CHANGE-ME`/`EXAMPLE-ONLY` placeholder — a warning, not a reject, because
+  hard-rejecting a weak-but-real key would create a new brick class via the
+  unattended bootstrap path for an operator who already did the right thing.
+  That also answers the shipped-configs point: our lab keys are PUBLISHED, so
+  a copied reference config satisfies the gate while being forgeable, and now
+  says so on every commit. Also dropped the README's inaccurate absolute that
+  the secret is redacted in EVERY render (a privileged CLI class can render
+  cleartext, and config-sync transmits it in the clear). MUTATION RE-VERIFIED
+  on the expanded guard set: removing the reject call site keeps `go build
+  ./...` and `go vet ./...` clean while the bootstrap guard reds
+  ("bootstrapFromFile ACCEPTED an unkeyed chassis cluster") and the
+  check-config guard reds ("check-config ACCEPTED an unkeyed chassis
+  cluster"), with their keyed/standalone negative controls green; disarming
+  the strength advisories reds all three strength tests with the negative
+  control green. Golden #4406 regenerated: 12 pure insertions, one placeholder
+  warning per matrix cell, nothing else. Validation: `go build ./...` exit 0,
+  `go vet ./...` clean, gofmt clean on every touched file, `go test ./...
+  -count=1` green except the pre-existing `TestHeatmapNotStale`.
+- **File(s)**: pkg/config/compiler_validate_strict_cluster_auth.go,
+  pkg/config/compiler_uniformgates_cluster_zone.go,
+  pkg/config/cluster_authkey_required_6611_test.go,
+  pkg/daemon/bootstrap_cluster_authkey_6611_test.go (new),
+  pkg/configstore/check_cluster_authkey_6611_test.go (new),
+  pkg/config/testdata/golden_4406.json, pkg/cluster/README.md,
+  docs/architecture.md, docs/config-schema.md
+
+## 2026-07-31 — #6611 cluster control-channel auth: dormant in every shipped config
+
+- **Timestamp**: 2026-07-31 (fix/6611-control-channel-auth)
+- **Action**: #6611 [SECURITY] Three control-channel authentication mechanisms
+  — fabric gRPC auth (#4357), heartbeat HMAC + anti-replay (#4326) and
+  session-sync challenge/response + per-frame HMAC (#4369) — all key off ONE
+  leaf, `chassis cluster authentication-key`, and all three deliberately fail
+  OPEN when it is absent (`fabricAuthDecision`/`heartbeatAuthDecision` accept on
+  `!keyConfigured`; `performSyncHandshake` runs no handshake with no local key).
+  No configuration in the repository set that leaf — verified firsthand on
+  `b4605ea9d`: `docs/ha-cluster.conf`, `docs/ha-cluster-loss.conf`,
+  `docs/ha-cluster-userspace.conf`, `test/incus/xpf-cluster-fw{0,1}.conf` and
+  `examples/deploy/ha-pair.conf` all carried a `cluster { }` stanza with no key.
+  So every deployment that followed this project's own HA documentation ran the
+  fabric gRPC listener, the heartbeat AND session sync unauthenticated
+  (allowlist-only), and the enforcing branches had never been exercised by the
+  smoke cluster. Scope decision: NOT warn-only. The insecure state is made hard
+  to REACH — `validateClusterAuthKeyStrict`
+  (`pkg/config/compiler_validate_strict_cluster_auth.go`, invoked last in
+  `runUniformGatesClusterZone` so structural cluster errors keep the first-error
+  slot) HARD-REJECTS an unkeyed (or whitespace-only-keyed) `chassis cluster` on
+  the strict commit / commit-check path, and downgrades to a `cfg.Warnings`
+  entry on the tolerant load / peer-sync path (`lenientClusterAuthKey`). That
+  split IS the migration: an already-unkeyed cluster loads its stored config
+  through `CompileConfigLenient` at daemon start, boots and keeps forwarding
+  (#1960 no-brick), and is keyed on the operator's next commit; a rejected
+  commit leaves the active config and dataplane untouched, and dual-accept lets
+  the key roll out one node at a time. The issue proposed warn-only on the
+  grounds that rejecting "would brick an existing unkeyed cluster on upgrade" —
+  that conflates the two paths: the upgrade path is the LENIENT one and is
+  untouched. All six shipped configs now set a key (lab values, marked
+  CHANGE-ME). Fixture churn: 39 test files gained an `authentication-key` line
+  because they strict-compile a cluster fixture; the golden `#4406` baseline
+  regenerated to exactly 12 lines, `ControlLinkAuthKey: "" -> "<redacted>"`,
+  nothing else. `TestClusterAuthKeyAbsentIsEmpty` (#4107) moved to
+  `CompileConfigLenient` — the tolerant path is now the only caller of the
+  absent-key shape. Tests (`cluster_authkey_required_6611_test.go`): strict
+  reject naming the remediation, whitespace-only reject, tolerant-path warning
+  (the no-brick contract), value-independent error text (no key material in the
+  message), plus shipped-config regression locks that compile every shipped
+  config for BOTH nodes and assert a non-empty key that is identical across
+  nodes (a `${node}`-scoped key would authenticate nothing). Negative controls:
+  a keyed cluster and a standalone config both stay green. MUTATION VERIFIED
+  both ways — removing the gate call site keeps `go build ./...` and
+  `go vet ./...` clean while 4 guards red on assertions ("commit accepted a
+  chassis cluster with no authentication-key"); removing the key from
+  `docs/ha-cluster-userspace.conf` reds only that subtest, the other five stay
+  green. Docs: `pkg/cluster/README.md` gains "Operating the control-link PSK
+  (#6611)" (generation, distribution, rolling rollout, rotation, and the
+  `show chassis cluster statistics` posture check), `docs/architecture.md`
+  records that the PSK is no longer optional in practice, and
+  `docs/config-schema.md` gains the gate section. Validation:
+  `go build ./...` exit 0, `go vet ./...` clean, `go test ./... -count=1` green
+  except `TestHeatmapNotStale` (pkg/refactoraudit), which is PRE-EXISTING RED on
+  pristine `origin/master` b4605ea9d (verified in a detached worktree) from
+  unrelated LOC drift — deliberately NOT regenerated here so another team's
+  drift does not land in this PR. Cluster smoke (`make test-failover` on the
+  loss userspace cluster, now KEYED) is REQUIRED and is scheduled by the team
+  lead — this is the first end-to-end exercise of the enforcing path.
+- **File(s)**: pkg/config/compiler_validate_strict_cluster_auth.go (new),
+  pkg/config/compiler_uniformgates_cluster_zone.go, pkg/config/compiler_opts.go,
+  pkg/config/cluster_authkey_required_6611_test.go (new),
+  pkg/config/testdata/golden_4406.json, docs/ha-cluster.conf,
+  docs/ha-cluster-loss.conf, docs/ha-cluster-userspace.conf,
+  examples/deploy/ha-pair.conf, test/incus/xpf-cluster-fw0.conf,
+  test/incus/xpf-cluster-fw1.conf, pkg/cluster/README.md, docs/architecture.md,
+  docs/config-schema.md, + 39 test files keyed for the strict gate
+
 ## 2026-07-31 — #6532 round-4 fold: stopped patching callee shapes, changed the approach
 
 - **Timestamp**: 2026-07-31 (fix/6532-grpc-snmp-community-redact, PR #6602)

@@ -8,6 +8,7 @@ import (
 func TestChassisCluster(t *testing.T) {
 	input := `chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         reth-count 5;
         redundancy-group 0 {
             node 0 priority 100;
@@ -69,7 +70,7 @@ func TestChassisCluster(t *testing.T) {
 }
 
 func TestChassisClusterSetSyntax(t *testing.T) {
-	commands := []string{"set chassis cluster reth-count 3", "set chassis cluster redundancy-group 0 node 0 priority 100", "set chassis cluster redundancy-group 0 node 1 priority 50", "set chassis cluster redundancy-group 1 node 0 priority 200", "set chassis cluster redundancy-group 1 gratuitous-arp-count 16"}
+	commands := []string{"set chassis cluster authentication-key test-cluster-psk-6611", "set chassis cluster reth-count 3", "set chassis cluster redundancy-group 0 node 0 priority 100", "set chassis cluster redundancy-group 0 node 1 priority 50", "set chassis cluster redundancy-group 1 node 0 priority 200", "set chassis cluster redundancy-group 1 gratuitous-arp-count 16"}
 	tree := &ConfigTree{}
 	for _, cmd := range commands {
 		path, err := ParseSetCommand(cmd)
@@ -109,6 +110,7 @@ func TestChassisClusterSetSyntax(t *testing.T) {
 func TestChassisClusterExtendedFields(t *testing.T) {
 	input := `chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         cluster-id 1;
         node 0;
         heartbeat-interval 500;
@@ -175,7 +177,7 @@ func TestChassisClusterExtendedFields(t *testing.T) {
 }
 
 func TestChassisClusterExtendedFieldsSet(t *testing.T) {
-	commands := []string{"set chassis cluster cluster-id 1", "set chassis cluster node 0", "set chassis cluster heartbeat-interval 500", "set chassis cluster heartbeat-threshold 5", "set chassis cluster reth-count 2", "set chassis cluster redundancy-group 0 node 0 priority 200", "set chassis cluster redundancy-group 0 node 1 priority 100", "set chassis cluster redundancy-group 0 preempt", "set chassis cluster redundancy-group 1 node 0 priority 200", "set chassis cluster redundancy-group 1 node 1 priority 100", "set chassis cluster redundancy-group 1 preempt", "set chassis cluster redundancy-group 1 gratuitous-arp-count 4"}
+	commands := []string{"set chassis cluster authentication-key test-cluster-psk-6611", "set chassis cluster cluster-id 1", "set chassis cluster node 0", "set chassis cluster heartbeat-interval 500", "set chassis cluster heartbeat-threshold 5", "set chassis cluster reth-count 2", "set chassis cluster redundancy-group 0 node 0 priority 200", "set chassis cluster redundancy-group 0 node 1 priority 100", "set chassis cluster redundancy-group 0 preempt", "set chassis cluster redundancy-group 1 node 0 priority 200", "set chassis cluster redundancy-group 1 node 1 priority 100", "set chassis cluster redundancy-group 1 preempt", "set chassis cluster redundancy-group 1 gratuitous-arp-count 4"}
 	tree := &ConfigTree{}
 	for _, cmd := range commands {
 		path, err := ParseSetCommand(cmd)
@@ -229,7 +231,7 @@ func TestChassisClusterExtendedFieldsSet(t *testing.T) {
 }
 
 func TestChassisClusterSyncOptions(t *testing.T) {
-	commands := []string{"set chassis cluster cluster-id 1", "set chassis cluster node 0", "set chassis cluster configuration-synchronize", "set chassis cluster nat-state-synchronization", "set chassis cluster ipsec-session-synchronization", "set chassis cluster dhcp-lease-synchronization"}
+	commands := []string{"set chassis cluster authentication-key test-cluster-psk-6611", "set chassis cluster cluster-id 1", "set chassis cluster node 0", "set chassis cluster configuration-synchronize", "set chassis cluster nat-state-synchronization", "set chassis cluster ipsec-session-synchronization", "set chassis cluster dhcp-lease-synchronization"}
 	tree := &ConfigTree{}
 	for _, cmd := range commands {
 		path, err := ParseSetCommand(cmd)
@@ -265,6 +267,7 @@ func TestChassisClusterSyncOptions(t *testing.T) {
 func TestChassisClusterSyncOptionsHierarchical(t *testing.T) {
 	input := `chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         cluster-id 1;
         node 0;
         configuration-synchronize;
@@ -301,7 +304,7 @@ func TestChassisClusterSyncOptionsHierarchical(t *testing.T) {
 }
 
 func TestChassisClusterRethAdvertiseInterval(t *testing.T) {
-	commands := []string{"set chassis cluster cluster-id 1", "set chassis cluster reth-advertise-interval 30"}
+	commands := []string{"set chassis cluster authentication-key test-cluster-psk-6611", "set chassis cluster cluster-id 1", "set chassis cluster reth-advertise-interval 30"}
 	tree := &ConfigTree{}
 	for _, cmd := range commands {
 		path, err := ParseSetCommand(cmd)
@@ -327,6 +330,7 @@ func TestChassisClusterRethAdvertiseInterval(t *testing.T) {
 func TestChassisClusterRethAdvertiseIntervalHierarchical(t *testing.T) {
 	input := `chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         cluster-id 1;
         reth-advertise-interval 50;
     }
@@ -349,7 +353,7 @@ func TestChassisClusterRethAdvertiseIntervalHierarchical(t *testing.T) {
 
 func TestChassisClusterHitlessRestartSet(t *testing.T) {
 	tree := &ConfigTree{}
-	sets := []string{"set chassis cluster cluster-id 1", "set chassis cluster node 0", "set chassis cluster hitless-restart"}
+	sets := []string{"set chassis cluster authentication-key test-cluster-psk-6611", "set chassis cluster cluster-id 1", "set chassis cluster node 0", "set chassis cluster hitless-restart"}
 	for _, line := range sets {
 		cmd, err := ParseSetCommand(line)
 		if err != nil {
@@ -374,6 +378,7 @@ func TestChassisClusterHitlessRestartSet(t *testing.T) {
 func TestChassisClusterHitlessRestartHierarchical(t *testing.T) {
 	input := `chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         cluster-id 1;
         hitless-restart;
     }
@@ -397,6 +402,7 @@ func TestChassisClusterHitlessRestartHierarchical(t *testing.T) {
 func TestChassisClusterHitlessRestartDefault(t *testing.T) {
 	input := `chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         cluster-id 1;
     }
 }`
@@ -418,7 +424,7 @@ func TestChassisClusterHitlessRestartDefault(t *testing.T) {
 
 func TestChassisClusterPeerFencingSet(t *testing.T) {
 	tree := &ConfigTree{}
-	sets := []string{"set chassis cluster cluster-id 1", "set chassis cluster node 0", "set chassis cluster peer-fencing disable-rg"}
+	sets := []string{"set chassis cluster authentication-key test-cluster-psk-6611", "set chassis cluster cluster-id 1", "set chassis cluster node 0", "set chassis cluster peer-fencing disable-rg"}
 	for _, line := range sets {
 		cmd, err := ParseSetCommand(line)
 		if err != nil {
@@ -443,6 +449,7 @@ func TestChassisClusterPeerFencingSet(t *testing.T) {
 func TestChassisClusterPeerFencingHierarchical(t *testing.T) {
 	input := `chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         cluster-id 1;
         peer-fencing disable-rg;
     }
@@ -466,6 +473,7 @@ func TestChassisClusterPeerFencingHierarchical(t *testing.T) {
 func TestChassisClusterPeerFencingDefault(t *testing.T) {
 	input := `chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         cluster-id 1;
     }
 }`
@@ -488,6 +496,7 @@ func TestChassisClusterPeerFencingDefault(t *testing.T) {
 func TestChassisClusterIPMonitoring(t *testing.T) {
 	input := `chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         cluster-id 1;
         node 0;
         redundancy-group 0 {
@@ -545,7 +554,7 @@ func TestChassisClusterIPMonitoring(t *testing.T) {
 }
 
 func TestChassisClusterIPMonitoringSetSyntax(t *testing.T) {
-	commands := []string{"set chassis cluster cluster-id 1", "set chassis cluster node 0", "set chassis cluster redundancy-group 0 node 0 priority 200", "set chassis cluster redundancy-group 0 ip-monitoring global-weight 255", "set chassis cluster redundancy-group 0 ip-monitoring global-threshold 200", "set chassis cluster redundancy-group 0 ip-monitoring family inet 10.0.1.1 weight 100", "set chassis cluster redundancy-group 0 ip-monitoring family inet 10.0.2.1 weight 80"}
+	commands := []string{"set chassis cluster authentication-key test-cluster-psk-6611", "set chassis cluster cluster-id 1", "set chassis cluster node 0", "set chassis cluster redundancy-group 0 node 0 priority 200", "set chassis cluster redundancy-group 0 ip-monitoring global-weight 255", "set chassis cluster redundancy-group 0 ip-monitoring global-threshold 200", "set chassis cluster redundancy-group 0 ip-monitoring family inet 10.0.1.1 weight 100", "set chassis cluster redundancy-group 0 ip-monitoring family inet 10.0.2.1 weight 80"}
 	tree := &ConfigTree{}
 	for _, cmd := range commands {
 		path, err := ParseSetCommand(cmd)
@@ -593,6 +602,7 @@ func TestChassisClusterIPMonitoringSetSyntax(t *testing.T) {
 func TestStrictVIPOwnershipHierarchical(t *testing.T) {
 	input := `chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         cluster-id 1;
         reth-count 2;
         redundancy-group 0 {
@@ -631,7 +641,7 @@ func TestStrictVIPOwnershipHierarchical(t *testing.T) {
 }
 
 func TestStrictVIPOwnershipSetSyntax(t *testing.T) {
-	commands := []string{"set chassis cluster cluster-id 1", "set chassis cluster reth-count 2", "set chassis cluster redundancy-group 0 node 0 priority 200", "set chassis cluster redundancy-group 0 node 1 priority 100", "set chassis cluster redundancy-group 1 node 0 priority 200", "set chassis cluster redundancy-group 1 node 1 priority 100", "set chassis cluster redundancy-group 1 strict-vip-ownership"}
+	commands := []string{"set chassis cluster authentication-key test-cluster-psk-6611", "set chassis cluster cluster-id 1", "set chassis cluster reth-count 2", "set chassis cluster redundancy-group 0 node 0 priority 200", "set chassis cluster redundancy-group 0 node 1 priority 100", "set chassis cluster redundancy-group 1 node 0 priority 200", "set chassis cluster redundancy-group 1 node 1 priority 100", "set chassis cluster redundancy-group 1 strict-vip-ownership"}
 	tree := &ConfigTree{}
 	for _, cmd := range commands {
 		path, err := ParseSetCommand(cmd)
@@ -664,6 +674,7 @@ func TestStrictVIPOwnershipSetSyntax(t *testing.T) {
 func TestStrictVIPOwnershipDefaultFalse(t *testing.T) {
 	input := `chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         redundancy-group 1 {
             node 0 priority 200;
         }
@@ -691,7 +702,7 @@ func TestStrictVIPOwnershipDefaultFalse(t *testing.T) {
 
 func TestChassisClusterNoRethVRRPSet(t *testing.T) {
 	tree := &ConfigTree{}
-	sets := []string{"set chassis cluster cluster-id 1", "set chassis cluster node 0", "set chassis cluster no-reth-vrrp"}
+	sets := []string{"set chassis cluster authentication-key test-cluster-psk-6611", "set chassis cluster cluster-id 1", "set chassis cluster node 0", "set chassis cluster no-reth-vrrp"}
 	for _, line := range sets {
 		cmd, err := ParseSetCommand(line)
 		if err != nil {
@@ -716,6 +727,7 @@ func TestChassisClusterNoRethVRRPSet(t *testing.T) {
 func TestChassisClusterNoRethVRRPHierarchical(t *testing.T) {
 	input := `chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         cluster-id 1;
         no-reth-vrrp;
     }
@@ -739,6 +751,7 @@ func TestChassisClusterNoRethVRRPHierarchical(t *testing.T) {
 func TestChassisClusterNoRethVRRPDefault(t *testing.T) {
 	input := `chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         cluster-id 1;
     }
 }`
@@ -760,7 +773,7 @@ func TestChassisClusterNoRethVRRPDefault(t *testing.T) {
 
 func TestChassisClusterPrivateRGElectionSet(t *testing.T) {
 	tree := &ConfigTree{}
-	sets := []string{"set chassis cluster cluster-id 1", "set chassis cluster node 0", "set chassis cluster private-rg-election"}
+	sets := []string{"set chassis cluster authentication-key test-cluster-psk-6611", "set chassis cluster cluster-id 1", "set chassis cluster node 0", "set chassis cluster private-rg-election"}
 	for _, line := range sets {
 		cmd, err := ParseSetCommand(line)
 		if err != nil {
@@ -785,6 +798,7 @@ func TestChassisClusterPrivateRGElectionSet(t *testing.T) {
 func TestChassisClusterPrivateRGElectionHierarchical(t *testing.T) {
 	input := `chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         cluster-id 1;
         private-rg-election;
     }
@@ -808,6 +822,7 @@ func TestChassisClusterPrivateRGElectionHierarchical(t *testing.T) {
 func TestChassisClusterPrivateRGElectionDefault(t *testing.T) {
 	input := `chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         cluster-id 1;
     }
 }`
@@ -830,6 +845,7 @@ func TestChassisClusterPrivateRGElectionDefault(t *testing.T) {
 func TestChassisClusterNoPrivateRGElection(t *testing.T) {
 	input := `chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         cluster-id 1;
         no-private-rg-election;
     }
@@ -940,7 +956,7 @@ func TestPeerFromPointToPoint(t *testing.T) {
 }
 
 func TestFabricLocalMemberResolution(t *testing.T) {
-	cmds := []string{"set interfaces fab0 fabric-options member-interfaces ge-0/0/7", "set interfaces fab0 unit 0 family inet address 10.99.1.1/30", "set interfaces fab1 fabric-options member-interfaces ge-7/0/7", "set interfaces fab1 unit 0 family inet address 10.99.2.1/30", "set chassis cluster node 0"}
+	cmds := []string{"set interfaces fab0 fabric-options member-interfaces ge-0/0/7", "set interfaces fab0 unit 0 family inet address 10.99.1.1/30", "set interfaces fab1 fabric-options member-interfaces ge-7/0/7", "set interfaces fab1 unit 0 family inet address 10.99.2.1/30", "set chassis cluster authentication-key test-cluster-psk-6611", "set chassis cluster node 0"}
 	tree := &ConfigTree{}
 	for _, cmd := range cmds {
 		path, err := ParseSetCommand(cmd)
@@ -972,7 +988,7 @@ func TestFabricLocalMemberResolution(t *testing.T) {
 }
 
 func TestFabricLocalMemberNode1(t *testing.T) {
-	cmds := []string{"set interfaces fab0 fabric-options member-interfaces ge-0/0/7", "set interfaces fab1 fabric-options member-interfaces ge-7/0/7", "set chassis cluster node 1"}
+	cmds := []string{"set interfaces fab0 fabric-options member-interfaces ge-0/0/7", "set interfaces fab1 fabric-options member-interfaces ge-7/0/7", "set chassis cluster authentication-key test-cluster-psk-6611", "set chassis cluster node 1"}
 	tree := &ConfigTree{}
 	for _, cmd := range cmds {
 		path, err := ParseSetCommand(cmd)
@@ -1004,7 +1020,7 @@ func TestFabricLocalMemberNode1(t *testing.T) {
 }
 
 func TestFabricAutoDetectFabricInterface(t *testing.T) {
-	cmds := []string{"set interfaces fab0 fabric-options member-interfaces ge-0/0/7", "set interfaces fab1 fabric-options member-interfaces ge-7/0/7", "set chassis cluster node 0", "set chassis cluster control-interface hb0", "set interfaces hb0 unit 0 family inet address 10.99.0.1/30"}
+	cmds := []string{"set interfaces fab0 fabric-options member-interfaces ge-0/0/7", "set interfaces fab1 fabric-options member-interfaces ge-7/0/7", "set chassis cluster authentication-key test-cluster-psk-6611", "set chassis cluster node 0", "set chassis cluster control-interface hb0", "set interfaces hb0 unit 0 family inet address 10.99.0.1/30"}
 	tree := &ConfigTree{}
 	for _, cmd := range cmds {
 		path, err := ParseSetCommand(cmd)
@@ -1032,7 +1048,7 @@ func TestFabricAutoDetectFabricInterface(t *testing.T) {
 }
 
 func TestFabricAutoDetectDualFabric(t *testing.T) {
-	cmds := []string{"set interfaces fab0 fabric-options member-interfaces ge-0/0/7", "set interfaces fab0 fabric-options member-interfaces ge-7/0/7", "set interfaces fab0 unit 0 family inet address 10.99.1.1/30", "set interfaces fab1 fabric-options member-interfaces ge-0/0/8", "set interfaces fab1 fabric-options member-interfaces ge-7/0/8", "set interfaces fab1 unit 0 family inet address 10.99.2.1/30", "set chassis cluster node 0", "set chassis cluster control-interface hb0", "set interfaces hb0 unit 0 family inet address 10.99.0.1/30"}
+	cmds := []string{"set interfaces fab0 fabric-options member-interfaces ge-0/0/7", "set interfaces fab0 fabric-options member-interfaces ge-7/0/7", "set interfaces fab0 unit 0 family inet address 10.99.1.1/30", "set interfaces fab1 fabric-options member-interfaces ge-0/0/8", "set interfaces fab1 fabric-options member-interfaces ge-7/0/8", "set interfaces fab1 unit 0 family inet address 10.99.2.1/30", "set chassis cluster authentication-key test-cluster-psk-6611", "set chassis cluster node 0", "set chassis cluster control-interface hb0", "set interfaces hb0 unit 0 family inet address 10.99.0.1/30"}
 	tree := &ConfigTree{}
 	for _, cmd := range cmds {
 		path, err := ParseSetCommand(cmd)
@@ -1063,7 +1079,7 @@ func TestFabricAutoDetectDualFabric(t *testing.T) {
 }
 
 func TestFabricAutoDetectDualFabricNode1(t *testing.T) {
-	cmds := []string{"set interfaces fab0 fabric-options member-interfaces ge-0/0/7", "set interfaces fab0 fabric-options member-interfaces ge-7/0/7", "set interfaces fab0 unit 0 family inet address 10.99.1.2/30", "set interfaces fab1 fabric-options member-interfaces ge-0/0/8", "set interfaces fab1 fabric-options member-interfaces ge-7/0/8", "set interfaces fab1 unit 0 family inet address 10.99.2.2/30", "set chassis cluster node 1", "set chassis cluster control-interface hb0", "set interfaces hb0 unit 0 family inet address 10.99.0.2/30"}
+	cmds := []string{"set interfaces fab0 fabric-options member-interfaces ge-0/0/7", "set interfaces fab0 fabric-options member-interfaces ge-7/0/7", "set interfaces fab0 unit 0 family inet address 10.99.1.2/30", "set interfaces fab1 fabric-options member-interfaces ge-0/0/8", "set interfaces fab1 fabric-options member-interfaces ge-7/0/8", "set interfaces fab1 unit 0 family inet address 10.99.2.2/30", "set chassis cluster authentication-key test-cluster-psk-6611", "set chassis cluster node 1", "set chassis cluster control-interface hb0", "set interfaces hb0 unit 0 family inet address 10.99.0.2/30"}
 	tree := &ConfigTree{}
 	for _, cmd := range cmds {
 		path, err := ParseSetCommand(cmd)
@@ -1094,7 +1110,7 @@ func TestFabricAutoDetectDualFabricNode1(t *testing.T) {
 }
 
 func TestFabricAutoDetectNode1(t *testing.T) {
-	cmds := []string{"set interfaces fab0 fabric-options member-interfaces ge-0/0/7", "set interfaces fab1 fabric-options member-interfaces ge-7/0/7", "set chassis cluster node 1", "set chassis cluster control-interface hb0", "set chassis cluster fabric-peer-address 10.99.1.1", "set interfaces hb0 unit 0 family inet address 10.99.0.2/30"}
+	cmds := []string{"set interfaces fab0 fabric-options member-interfaces ge-0/0/7", "set interfaces fab1 fabric-options member-interfaces ge-7/0/7", "set chassis cluster authentication-key test-cluster-psk-6611", "set chassis cluster node 1", "set chassis cluster control-interface hb0", "set chassis cluster fabric-peer-address 10.99.1.1", "set interfaces hb0 unit 0 family inet address 10.99.0.2/30"}
 	tree := &ConfigTree{}
 	for _, cmd := range cmds {
 		path, err := ParseSetCommand(cmd)
@@ -1122,7 +1138,7 @@ func TestFabricAutoDetectNode1(t *testing.T) {
 }
 
 func TestFabricLegacyModeNoLocalMember(t *testing.T) {
-	cmds := []string{"set interfaces fab0 unit 0 family inet address 10.99.1.1/30", "set chassis cluster node 0", "set chassis cluster fabric-interface fab0"}
+	cmds := []string{"set interfaces fab0 unit 0 family inet address 10.99.1.1/30", "set chassis cluster authentication-key test-cluster-psk-6611", "set chassis cluster node 0", "set chassis cluster fabric-interface fab0"}
 	tree := &ConfigTree{}
 	for _, cmd := range cmds {
 		path, err := ParseSetCommand(cmd)
@@ -1226,6 +1242,7 @@ func TestPerUnitTunnelConfig(t *testing.T) {
 func TestClusterNodeIDSet(t *testing.T) {
 	withLeaf := buildTree(t, []string{
 		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set chassis cluster node 0",
 	})
 	cfg, err := CompileConfig(withLeaf)
@@ -1244,6 +1261,7 @@ func TestClusterNodeIDSet(t *testing.T) {
 
 	noLeaf := buildTree(t, []string{
 		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 	})
 	cfg2, err := CompileConfig(noLeaf)
 	if err != nil {

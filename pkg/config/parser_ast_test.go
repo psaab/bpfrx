@@ -4377,7 +4377,7 @@ func TestExpandGroupsWithNodeVar(t *testing.T) {
 
 func TestCompileConfigForNode(t *testing.T) {
 	tree := &ConfigTree{}
-	setCommands := []string{`set groups node0 system host-name fw0`, `set groups node0 chassis cluster node 0`, `set groups node0 interfaces hb0 unit 0 family inet address 10.99.0.1/30`, `set groups node1 system host-name fw1`, `set groups node1 chassis cluster node 1`, `set groups node1 interfaces hb0 unit 0 family inet address 10.99.0.2/30`, `set apply-groups "${node}"`, `set chassis cluster cluster-id 1`}
+	setCommands := []string{`set groups node0 system host-name fw0`, `set groups node0 chassis cluster node 0`, `set groups node0 interfaces hb0 unit 0 family inet address 10.99.0.1/30`, `set groups node1 system host-name fw1`, `set groups node1 chassis cluster node 1`, `set groups node1 interfaces hb0 unit 0 family inet address 10.99.0.2/30`, `set apply-groups "${node}"`, `set chassis cluster cluster-id 1`, `set chassis cluster authentication-key test-cluster-psk-6611`}
 	for _, cmd := range setCommands {
 		path, err := ParseSetCommand(cmd)
 		if err != nil {

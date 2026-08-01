@@ -23,6 +23,7 @@ func newConfigSyncStore(t *testing.T, hostName string) *configstore.Store {
 	}
 	for _, cmd := range []string{
 		"chassis cluster cluster-id 1",
+		"chassis cluster authentication-key test-cluster-psk-6611",
 		"chassis cluster node 0",
 		"chassis cluster configuration-synchronize",
 		"system host-name " + hostName,

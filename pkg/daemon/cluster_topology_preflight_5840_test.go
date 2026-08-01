@@ -109,6 +109,11 @@ func TestClusterTopologyDay2TransitionRejected(t *testing.T) {
 	if err := store.SetFromInput("chassis cluster node 0"); err != nil {
 		t.Fatalf("set node: %v", err)
 	}
+	// #6611: the strict commit path rejects an unkeyed chassis cluster; key the
+	// candidate so the topology preflight is what decides this test.
+	if err := store.SetFromInput("chassis cluster authentication-key test-cluster-psk-6611"); err != nil {
+		t.Fatalf("set authentication-key: %v", err)
+	}
 
 	d := &Daemon{store: store, applySem: semaphore.NewWeighted(1)}
 	_, cerr := d.commitAndApply(context.Background(), "add chassis cluster", false)
@@ -146,6 +151,9 @@ func TestClusterTopologyDay2TransitionRejected(t *testing.T) {
 	}
 	if err := cfgless.SetFromInput("chassis cluster node 0"); err != nil {
 		t.Fatalf("set config-less node: %v", err)
+	}
+	if err := cfgless.SetFromInput("chassis cluster authentication-key test-cluster-psk-6611"); err != nil {
+		t.Fatalf("set config-less authentication-key: %v", err)
 	}
 	if active := cfgless.ActiveConfig(); active != nil {
 		t.Fatalf("config-less precondition: active config must be nil before commit; got %+v", active)

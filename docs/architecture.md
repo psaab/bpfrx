@@ -177,9 +177,37 @@ editing cmdtree.
   interceptors are installed on the fabric listener only; the loopback
   listener keeps the full service. The **same PSK** authenticates the
   heartbeat (#4326); it shares the `chassis cluster authentication-key`
-  leaf and reuses the dual-accept posture. The stronger residuals —
+  leaf and reuses the dual-accept posture. **The PSK is no longer optional
+  in practice (#6611):** because all three channels fail OPEN unkeyed, an
+  unkeyed cluster runs its entire control channel unauthenticated, and
+  every config this repository shipped used to be unkeyed — so the
+  enforcing branches were never exercised. `validateClusterAuthKeyStrict`
+  now hard-rejects an unkeyed `chassis cluster` on the STRICT compile
+  path and warns on the tolerant load / peer-sync path (#1960 no-brick:
+  an in-place-upgraded unkeyed cluster keeps its config DB, still boots,
+  and is keyed on its next commit), and every reference/test config sets
+  a key. Strict is every caller of `compileTreeStrict`, not just the
+  operator commit: `daemon.bootstrapFromFile` (the UNATTENDED first-boot
+  import, where a reject leaves the node with NO active config) and
+  `configstore.CheckText` (`xpfd check-config`, behind xpf-deploy and
+  the day-0 loader) also refuse — so provisioning a NEW node fails
+  closed, and the migration has a required order: key the running
+  cluster first, then re-provision. `pkg/eventengine` remediation is
+  strict too, so on a leniently-booted unkeyed cluster every
+  `change-configuration` policy silently fails until it is keyed. Note also that session sync fixes a
+  connection's auth state at connect and committing the key does not
+  restart cluster comms, so an established stream stays unauthenticated
+  until a daemon restart (#6628); config-sync carries the PSK in the
+  clear over that HMAC-only link, so the key must be provisioned
+  out-of-band (#6629); and rotation has no key overlap, making a
+  mismatch a ~1s dual-master window rather than an auth hiccup (#6630).
+  Operator guidance — generation, distribution, rolling rollout with the
+  required restart, rotation — is in `pkg/cluster/README.md` →
+  "Operating the control-link PSK (#6611)". The stronger residuals —
   removing the ~1-window replay horizon (mTLS with per-node certs) and
-  HMAC-authenticating the session-sync stream (#4107 F23) — remain deferred
+  giving the session-sync stream CONFIDENTIALITY (#6629 — it is
+  HMAC-authenticated today, F23 having landed, but not encrypted, so a
+  config-sync push crosses it in cleartext) — remain deferred
   (see `pkg/cluster/README.md`).
   - **No allowlisted RPC may render a configured secret (#6532).** Being on
     this allowlist means being reachable from the peer chassis over the

@@ -103,6 +103,7 @@ func leaseSyncTestDaemon(t *testing.T, sock4, sock6 string, withKnob bool) *Daem
 	}
 	set := "set chassis cluster cluster-id 1\n" +
 		"set chassis cluster node 0\n" +
+		"set chassis cluster authentication-key test-cluster-psk-6611\n" +
 		"set system services dhcp-local-server group g1 interface ge-0/0/1.0\n" +
 		"set system services dhcp-local-server group g1 dhcp-attributes subnet 10.0.61.0/24\n" +
 		"set system services dhcpv6-local-server group g6 interface ge-0/0/1.0\n"
