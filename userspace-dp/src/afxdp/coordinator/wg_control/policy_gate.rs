@@ -95,6 +95,25 @@
 //! would re-create the very asymmetry this gate exists to remove (the
 //! same flow dropped LAN→WAN, permitted WG→LAN).
 //!
+//! **One sub-case where mainline IS better, and why it cannot apply
+//! here.** For a flow that xpf same-family NATs, mainline's non-first
+//! fragments do not fall to the default policy: the cold-path forward
+//! commit installs a `(family, src, dst, ip_id)` association carrying
+//! the whole `SessionDecision` (#5689), and the flowless arm consults it
+//! (`nat_consult_forward_fragment_assoc`) so the fragment INHERITS the
+//! first fragment's permitted verdict. That mechanism is unreachable for
+//! WireGuard inner plaintext in both directions of the comparison:
+//! `nat_install_forward_fragment_assoc` self-gates on the committed
+//! decision actually carrying a same-family rewrite
+//! (`rewrite_src`/`rewrite_dst`), it is called only from the AF_XDP
+//! cold-path forward commit, and inner plaintext never traverses that
+//! path — it is written to the TUN and routed by the kernel, so xpf
+//! commits no NAT decision for it and installs no association. A consult
+//! added here would miss unconditionally. So the residual above is the
+//! plain port-bearing-permit one; do not describe the two paths as
+//! identical for NAT'd fragments, because for those mainline recovers
+//! the permit and this gate structurally cannot.
+//!
 //! ## Fail-CLOSED cases (`ForwardDrop`)
 //!
 //! Deliberately NARROW — round 2 over-corrected here and killed valid
@@ -130,6 +149,20 @@
 //!   - `endpoint_absent` / `ingress_unzoned` — NOT peer-steerable. Both
 //!     derive from the tunnel row's `logical_ifindex`, fixed when the
 //!     control thread spawns. No packet content reaches them.
+//!   - `pbr_route_override_possible` — operator-GATED, family-selected.
+//!     A `then routing-instance` (filter-based-forwarding) term on this
+//!     unit's input filter overrides the table the egress lookup should
+//!     use; the kernel honours that override for the plaintext it routes
+//!     off the TUN (#5117 scopes the ip rule to the ingress interface,
+//!     which here is `wgN`), and this gate does not evaluate filters —
+//!     so its to-zone would be computed against an egress the packet
+//!     never reaches. A peer cannot CREATE this branch (it needs the
+//!     operator's filter), but the precheck is per-family and the peer
+//!     picks the inner version nibble, so it can select the family that
+//!     has FBF configured. Delegating is still right: for that family
+//!     there is no correct verdict this gate can compute, so handing the
+//!     packet back with the residual COUNTED beats enforcing a verdict
+//!     derived from a zone pair that is not the real one.
 //!   - `next_table_unsupported` / `no_egress_ifindex` (`NoRoute`) — the
 //!     peer DOES select these via the inner destination, but both are
 //!     slow-path ELIGIBLE dispositions that the mainline transit path
@@ -235,12 +268,17 @@ pub(super) fn evaluate_wg_inner_ingress(
     // inner destination: that one is adjudicated with `to_zone = 0` and
     // resolved by #3110's fall-through to the default action, exactly as
     // the mainline transit path does.
-    let from_zone = forwarding
+    // Pre-filter only: the from-zone the POLICY is evaluated on is taken
+    // from the shared zone-pair helper further down (r4 MAJOR B), which
+    // needs an egress ifindex we do not have yet. This read is the same
+    // expression the helper uses for its from-id, kept here so an
+    // unzoned tunnel bails before the frame build and the FIB lookup.
+    let ingress_zone_id = forwarding
         .ifindex_to_zone_id
         .get(&logical_ifindex)
         .copied()
         .unwrap_or_default();
-    if from_zone == 0 {
+    if ingress_zone_id == 0 {
         return InnerVerdict::Unadjudicated("ingress_unzoned");
     }
 
@@ -304,6 +342,57 @@ pub(super) fn evaluate_wg_inner_ingress(
             }
         };
 
+    // r4 MAJOR A: this gate derives the to-zone from a FIB lookup in the
+    // tunnel's own routing instance. A filter-based-forwarding term
+    // (`then routing-instance <ri>`) on THIS unit's input filter
+    // overrides the table that lookup should use, and the override is
+    // real for exactly this traffic: the kernel FBF mirror installs the
+    // ip rule in the 31000-31999 band, ahead of the main table,
+    // deliberately so "the kernel also honors PBR for XDP_PASS'd
+    // packets" (`pkg/routing/rules.go`), and #5117 scopes each rule to
+    // the ingress interface via `FRA_IIFNAME` — which for decapped inner
+    // plaintext is the `wgN` TUN. So a PERMITTED inner packet can leave
+    // through the override VRF while this gate adjudicated the base
+    // table's egress zone: the verdict would be computed against a
+    // to-zone the packet never reaches. That cuts both ways — a denied
+    // base-table zone blackholes traffic the override VRF permits, and a
+    // permitted base-table zone waves through traffic the override VRF's
+    // zone pair denies.
+    //
+    // The gate does not evaluate filters at all (see the module header —
+    // that needs the control-thread→worker logical-ingress handoff #5618
+    // tracks as the full fix), so it cannot resolve the override itself.
+    // Adjudicating on a to-zone that is not where the packet goes is
+    // worse than not adjudicating, so DELEGATE — the same disposition
+    // `NextTableUnsupported` gets for the sibling "the helper cannot
+    // model this route" case — and count it.
+    //
+    // STEERABILITY, precisely. The branch cannot be CREATED by a peer:
+    // it exists only where the operator bound a route-lookup-affecting
+    // input filter to this unit for this family. But it is not wholly
+    // content-independent either — the precheck is per-family and the
+    // peer chooses the inner version nibble, so on a tunnel with FBF
+    // configured for ONE family a peer can pick that family and land
+    // here. That is acceptable, and it is the whole justification for
+    // delegating rather than dropping: for the family that carries FBF,
+    // the to-zone this gate can compute is the WRONG one, so there is no
+    // correct verdict to enforce and the honest move is to hand the
+    // packet back with the residual counted. Do not read this as "no
+    // packet content reaches this branch" — the family does.
+    //
+    // Contrast a non-first fragment: there the gate CAN compute the
+    // right zone pair (the L3 identity is intact and authoritative), so
+    // it must ADJUDICATE on it (r2 MAJOR 1). Delegating that one would
+    // give up authority the gate actually has and hand every DENY a
+    // one-bit bypass the peer selects at will.
+    if crate::filter::interface_filter_affects_route_lookup(
+        &forwarding.filter_state,
+        logical_ifindex,
+        addr_family == libc::AF_INET6 as u8,
+    ) {
+        return InnerVerdict::Unadjudicated("pbr_route_override_possible");
+    }
+
     // Route the inner destination in the TUNNEL's routing instance — a
     // wgN bound into a VRF must not resolve its to-zone out of inet.0.
     let table = forwarding
@@ -366,20 +455,35 @@ pub(super) fn evaluate_wg_inner_ingress(
     // is entirely the peer's choice — AllowedIPs validates only the inner
     // SOURCE), so an unzoned egress must NOT bail out of adjudication. It
     // is passed through as `to_zone = 0` and resolved by #3110's
-    // fall-through to the default action — byte-identical to what the
-    // mainline transit path does, which derives both ids with this same
-    // helper and hands a 0 straight to `evaluate_policy_result_l3_aware`.
+    // fall-through to the default action, which is what the mainline
+    // transit path does with a 0 from this same helper.
     // Round 2's `egress_unzoned` bail let a peer pick a destination
     // routed out an unzoned interface and skip the policy entirely.
-    let (_from_zone_via_helper, to_zone) = zone_pair_ids_for_flow_with_override(
+    //
+    // r4 MAJOR B: BOTH ids the policy is evaluated on come from the
+    // shared helper, and the earlier `ingress_zone_id` read is only the
+    // cheap pre-filter for the unzoned-tunnel bail. An earlier revision
+    // consumed just `to_zone`, discarded the helper's from-id into a
+    // `_`-binding, and asserted the two agreed in a `debug_assert_eq!` —
+    // which release builds compile out, so the code asserted an
+    // invariant it did not establish. They do agree (same map, same key,
+    // `override = None`, same 0 default, one immutable snapshot), but
+    // "agrees by construction" is a reason to consume the helper's
+    // value, not a reason to duplicate the derivation.
+    //
+    // Note what this helper parity does NOT extend to: a from-zone of 0.
+    // Mainline hands that straight to `evaluate_policy_result_l3_aware`;
+    // this gate returned `Unadjudicated("ingress_unzoned")` above and
+    // never reaches here. That divergence is deliberate — an unzoned
+    // TUNNEL is operator config the peer cannot steer, and the gate's
+    // premise (a real zone pair) fails — but it is a divergence, not
+    // parity, so do not read this call as making the two paths
+    // identical end to end.
+    let (from_zone, to_zone) = zone_pair_ids_for_flow_with_override(
         forwarding,
         logical_ifindex,
         None,
         resolution.egress_ifindex,
-    );
-    debug_assert_eq!(
-        _from_zone_via_helper, from_zone,
-        "the gate's from-zone must agree with the shared zone-pair helper"
     );
 
     // #3020: carry the REAL ICMP type/code so an icmp-type-constrained

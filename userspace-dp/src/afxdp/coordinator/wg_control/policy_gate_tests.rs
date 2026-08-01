@@ -771,6 +771,164 @@ fn over_limit_ipv6_extension_chain_is_dropped() {
     assert_eq!(unadjudicated, 0);
 }
 
+/// A `FirewallFilterSnapshot` whose single term carries a
+/// `then routing-instance` (filter-based-forwarding) action — the shape
+/// that sets `affects_route_lookup` on the compiled filter.
+fn fbf_filter(name: &str, family: &str) -> crate::FirewallFilterSnapshot {
+    crate::FirewallFilterSnapshot {
+        name: name.to_string(),
+        family: family.to_string(),
+        terms: vec![crate::FirewallTermSnapshot {
+            name: "steer".to_string(),
+            action: "accept".to_string(),
+            routing_instance: "tenant-a".to_string(),
+            ..Default::default()
+        }],
+    }
+}
+
+/// The negative control for [`fbf_filter`]: a filter with a real term
+/// that does NOT touch route lookup. Attached to the same unit, the gate
+/// must still adjudicate — the deferral is scoped to route-lookup-
+/// affecting filters, not to "this unit has any input filter".
+fn non_fbf_filter(name: &str, family: &str) -> crate::FirewallFilterSnapshot {
+    crate::FirewallFilterSnapshot {
+        name: name.to_string(),
+        family: family.to_string(),
+        terms: vec![crate::FirewallTermSnapshot {
+            name: "count-only".to_string(),
+            action: "accept".to_string(),
+            count: "c1".to_string(),
+            ..Default::default()
+        }],
+    }
+}
+
+/// **r4 MAJOR A fail-on-revert.** When the tunnel's own unit carries an
+/// input filter with a `then routing-instance` term, the gate's to-zone
+/// is derived from the WRONG table and it must DELEGATE rather than
+/// adjudicate.
+///
+/// The gate resolves the egress interface — and therefore the to-zone —
+/// with a FIB lookup in the tunnel's own routing instance. Filter-based
+/// forwarding overrides that table, and the override is real for exactly
+/// this traffic: `pkg/routing/rules.go` installs the kernel ip rule in
+/// the 31000-31999 band ahead of the main table so "the kernel also
+/// honors PBR for XDP_PASS'd packets", and #5117 scopes each rule to the
+/// ingress interface via `FRA_IIFNAME` — which for decapped inner
+/// plaintext is `wgN`. So the kernel sends the permitted plaintext
+/// through the override VRF while this gate adjudicated the base table's
+/// egress zone. Adjudicating on a to-zone the packet never reaches is
+/// worse than not adjudicating: it blackholes traffic the override VRF
+/// permits, and waves through traffic the override VRF's zone pair
+/// denies.
+///
+/// The zone pair here DENIES, so without the deferral the packet is
+/// dropped on a to-zone it would never have egressed through. With it,
+/// the packet is delegated and COUNTED — the residual is visible, not
+/// silent.
+#[test]
+fn pbr_route_override_on_the_tunnel_unit_defers_instead_of_adjudicating() {
+    let src = Ipv4Addr::new(10, 77, 0, 5);
+    let dst = Ipv4Addr::new(10, 88, 0, 9);
+    let inner = ipv4_tcp(src, dst, 44_100, 80);
+
+    let mut snapshot = base_snapshot();
+    snapshot.routes = vec![v4_route_to_lan()];
+    snapshot.policies = vec![deny_rule("untrust", "trust")];
+    // interfaces[0] is `wg0.0`, the tunnel's own logical unit.
+    assert_eq!(snapshot.interfaces[0].name, "wg0.0");
+    snapshot.interfaces[0].filter_input_v4 = "fbf-in".to_string();
+    snapshot.filters = vec![fbf_filter("fbf-in", "inet")];
+    let forwarding = build_forwarding_state(&snapshot);
+
+    let (escaped, denies, forward_drops, unadjudicated) = run_inner_full(&forwarding, &inner);
+    assert_eq!(
+        escaped, inner,
+        "a filter-based-forwarding term on the tunnel unit overrides the route table, so the \
+         gate's base-table to-zone is not where the kernel will send this packet — it must \
+         delegate, not deny on the wrong zone pair (denies={denies} \
+         forward_drops={forward_drops} unadjudicated={unadjudicated})"
+    );
+    assert_eq!(
+        unadjudicated, 1,
+        "the delegation must be COUNTED — an invisible residual is how this comes back"
+    );
+    assert_eq!(denies, 0, "the base-table zone pair must not have been adjudicated");
+    assert_eq!(forward_drops, 0);
+
+    // NEGATIVE CONTROL, same packet and same zone pair: an input filter
+    // on the same unit that does NOT affect route lookup leaves the
+    // egress prediction sound, so the gate still adjudicates and the
+    // DENY is still enforced. This is what keeps the deferral from
+    // widening into "any input filter disables the gate".
+    let mut plain = base_snapshot();
+    plain.routes = vec![v4_route_to_lan()];
+    plain.policies = vec![deny_rule("untrust", "trust")];
+    plain.interfaces[0].filter_input_v4 = "plain-in".to_string();
+    plain.filters = vec![non_fbf_filter("plain-in", "inet")];
+    let plain_fwd = build_forwarding_state(&plain);
+    let (escaped, denies, forward_drops, unadjudicated) = run_inner_full(&plain_fwd, &inner);
+    assert!(
+        escaped.is_empty(),
+        "a non-PBR input filter does not move the route lookup — the DENY must still be \
+         enforced ({} bytes escaped, denies={denies} forward_drops={forward_drops} \
+         unadjudicated={unadjudicated})",
+        escaped.len()
+    );
+    assert_eq!(denies, 1, "the zone-policy verdict must still be the reason");
+    assert_eq!(unadjudicated, 0, "a non-PBR filter must not trigger the deferral");
+    assert_eq!(forward_drops, 0);
+}
+
+/// **r4 MAJOR A, family scope.** The route-lookup precheck is
+/// per-family, and the deferral must be too: a `filter input` with a
+/// routing-instance term bound to the unit's INET family does not move
+/// an IPv6 packet's route lookup, so a v6 inner packet must still be
+/// adjudicated. A deferral that ignored family would silently disable
+/// the gate for the other family on every FBF-configured tunnel.
+#[test]
+fn pbr_deferral_is_scoped_to_the_inner_packets_address_family() {
+    let v6_src: Ipv6Addr = "2001:db8:77::5".parse().unwrap();
+    let v6_dst: Ipv6Addr = "2001:db8:88::9".parse().unwrap();
+    let v6_inner = ipv6_tcp(v6_src, v6_dst, 44_100, 80);
+
+    // v4-only FBF filter on the unit; the inner packet is v6.
+    let mut snapshot = base_snapshot();
+    snapshot.routes = vec![v6_route_to_lan()];
+    snapshot.policies = vec![deny_rule("untrust", "trust")];
+    snapshot.interfaces[0].filter_input_v4 = "fbf-in".to_string();
+    snapshot.filters = vec![fbf_filter("fbf-in", "inet")];
+    let forwarding = build_forwarding_state(&snapshot);
+    let (escaped, denies, forward_drops, unadjudicated) = run_inner_full(&forwarding, &v6_inner);
+    assert!(
+        escaped.is_empty(),
+        "an INET-family FBF filter cannot move an IPv6 route lookup — the v6 DENY must still \
+         be enforced ({} bytes escaped, denies={denies} forward_drops={forward_drops} \
+         unadjudicated={unadjudicated})",
+        escaped.len()
+    );
+    assert_eq!(denies, 1);
+    assert_eq!(unadjudicated, 0);
+
+    // ...and the v6 FBF filter DOES defer the v6 packet.
+    let mut v6_snapshot = base_snapshot();
+    v6_snapshot.routes = vec![v6_route_to_lan()];
+    v6_snapshot.policies = vec![deny_rule("untrust", "trust")];
+    v6_snapshot.interfaces[0].filter_input_v6 = "fbf-in6".to_string();
+    v6_snapshot.filters = vec![fbf_filter("fbf-in6", "inet6")];
+    let v6_fwd = build_forwarding_state(&v6_snapshot);
+    let (escaped, denies, forward_drops, unadjudicated) = run_inner_full(&v6_fwd, &v6_inner);
+    assert_eq!(
+        escaped, v6_inner,
+        "an INET6 FBF filter on the unit must defer the v6 packet (denies={denies} \
+         forward_drops={forward_drops} unadjudicated={unadjudicated})"
+    );
+    assert_eq!(unadjudicated, 1);
+    assert_eq!(denies, 0);
+    assert_eq!(forward_drops, 0);
+}
+
 /// **r4 MAJOR 1 fail-on-revert.** A TRUNCATED IPv6 extension chain — an
 /// extension header declaring a length that runs past the end of the
 /// packet — must DROP, not be adjudicated.

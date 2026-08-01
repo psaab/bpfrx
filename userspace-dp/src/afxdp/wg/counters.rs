@@ -208,11 +208,17 @@ pub(crate) struct WgCounters {
     /// Decapped inner packets delivered to the TUN WITHOUT an xpf
     /// forward-policy verdict — the residual #1432-S2a kernel
     /// delegation, made countable. Bumped ONLY where xpf cannot compute
-    /// a zone pair at all: the tunnel interface is unzoned, the routed
-    /// egress interface is unzoned, the xpf FIB resolves no egress
-    /// interface, or the inner destination is host-bound
+    /// a TRUSTWORTHY zone pair: the tunnel interface is unzoned, the xpf
+    /// FIB resolves no egress interface or needs an unsupported
+    /// next-table chain, the inner destination is host-bound
     /// (`LocalDelivery` — a host-inbound-admission question, a different
-    /// policy plane). A packet with no parseable 5-tuple is NOT in this
+    /// policy plane), or the tunnel's unit carries a
+    /// route-lookup-affecting input filter (`then routing-instance`), so
+    /// the base-table egress this gate would adjudicate on is not where
+    /// the kernel will send the plaintext. Note an unzoned EGRESS
+    /// interface is NOT in this set — it is adjudicated with
+    /// `to_zone = 0` and resolved by #3110's default-action
+    /// fall-through, because the peer selects it. A packet with no parseable 5-tuple is NOT in this
     /// set: it is adjudicated on its L3 identity via the shared
     /// `l4_present = false` path (r2 MAJOR 1 — before that fix an
     /// authenticated peer bypassed a DENY by picking any IP protocol

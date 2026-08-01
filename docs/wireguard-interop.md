@@ -815,6 +815,26 @@ LAN→WAN, permitted WG→LAN). Note #4569 does **not** cover this: it
 remembers only a skipped port-bearing *deny* and turns a later permit
 into a drop; it never recovers a skipped port-bearing *permit*.
 
+**One sub-case where mainline is better, and why it cannot apply here.**
+For a flow xpf same-family NATs, mainline's non-first fragments do *not*
+fall to the default policy: the cold-path forward commit installs a
+`(family, src, dst, ip_id)` association carrying the whole
+`SessionDecision` (#5689) and the flowless arm consults it
+(`nat_consult_forward_fragment_assoc`), so the fragment inherits the
+first fragment's permitted verdict. That mechanism is structurally
+unreachable for WireGuard inner plaintext:
+`nat_install_forward_fragment_assoc` self-gates on the committed decision
+actually carrying a same-family rewrite, and it is called only from the
+AF_XDP cold-path forward commit — a path inner plaintext never takes,
+since it is written to the TUN and routed by the kernel. xpf therefore
+commits no NAT decision for it and installs no association, and a
+consult added to this gate would miss unconditionally. So for a **NAT'd**
+fragmented flow the two paths are genuinely not identical: mainline
+recovers the permit and this gate cannot. Do not read the paragraph above
+as claiming otherwise. Closing it needs the same control-thread→worker
+handoff #5618 tracks as the full fix, not a lookup this gate can make on
+its own.
+
 ### Fail-closed cases
 
 Deliberately narrow. Only three things DROP and bump
@@ -865,6 +885,27 @@ Not peer-steerable — both derive from the tunnel row's
 
 - the tunnel interface is **not in a security zone** (no from-zone);
 - the tunnel endpoint has left the snapshot (teardown in flight).
+
+Operator-gated, family-selected — a peer cannot create this branch, but
+it can choose which family's packet it sends, and the precheck is
+per-family:
+
+- the tunnel's unit carries an input filter with a **`then
+  routing-instance`** (filter-based-forwarding) term. The gate derives
+  the to-zone from a FIB lookup in the tunnel's own routing instance,
+  but the kernel applies the FBF override to the plaintext it routes off
+  the TUN — `pkg/routing/rules.go` installs the ip rule in the
+  31000-31999 band ahead of the main table precisely so "the kernel also
+  honors PBR for XDP_PASS'd packets", and #5117 scopes each rule to the
+  ingress interface (`FRA_IIFNAME`), which for decapped inner plaintext
+  is `wgN`. So the gate's egress zone would not be the one the packet
+  actually leaves through — in either direction (a denied base-table
+  zone would blackhole traffic the override VRF permits; a permitted one
+  would wave through traffic the override VRF's zone pair denies). The
+  gate does not evaluate filters at all, so it delegates rather than
+  adjudicate on the wrong zone pair. Evaluating FBF here needs the same
+  control-thread→worker logical-ingress handoff #5618 tracks as the full
+  fix.
 
 Peer-steerable via the inner destination, and delegated for **mainline
 parity** rather than because it is safe — recorded as residuals, not
