@@ -5402,3 +5402,44 @@ Work item G IS a deliberate lifecycle change (startup-outcome gating of the roll
      and the FRESH-BOX leg — a never-committed box never
      enters the state (the #1894 first-encrypted-write auto-create
      still works).
+
+---
+
+## §6-mirror addition (v70, r68 Codex m4 — follow-up residue extracted from plan §6)
+
+The health endpoint's 200/503 CONTRACT grows the response TEXT
+repertoire by SIX cause-distinct degraded messages —
+terminal-unreadable, restart-recovery-owed, generic confirm-debt,
+the two key-class variants (terminal-latch key-class,
+confirm-debt key-class) naming ORIGINAL `.configdb/master.key`
+restoration, PLUS the write-unverified message (master-key
+validation outstanding) — the 503 semantics are unchanged (r18
+Codex item-7 + r20 Codex m2 + r29 Codex fold-partial 7 + r32
+Codex M1b).
+
+## §7-mirror addition (v70, r68 Codex m4 — follow-up residue extracted from plan §7)
+
+11. **Shutdown-admission guard (r8/r9/r10)**: the double nil-safe guard
+    (`d.stopping.Load() || (d.runCtx != nil && d.runCtx.Err() != nil)`,
+    checked by the executor UNDER applySem, joining the `isResetting()`
+    early-return) orders ENTRY absolutely: after ctx cancellation OR
+    after `runShutdownSequence`'s FIRST-STATEMENT `stopping` publication
+    (before `d.applyCancel()`), no rollback newly enters its critical
+    section; the cancellable `Acquire(runCtxOrBackground())` abandons a
+    wait interrupted by the signal instead of parking through teardown.
+    HONEST BOUND (r9 Codex M2, r10-narrowed per Codex m3, verified
+    `applyCloseoutDrainTimeout = 5s`, `daemon_run_shutdown.go:15,50-58`):
+    a rollback ALREADY in flight when the signal lands is
+    bounded-drain-covered for ≤5 s; beyond the drain budget the shutdown
+    proceeds (`:54-58`, logged) and the rollback — deliberately
+    non-cancellable work — can overlap manager/dataplane teardown. That
+    overlap exists on master today for every commit-confirmed timer (the
+    executor has no shutdown guard at all). NARROWED CLAIM: the guard
+    does not lengthen the admitted body and does not enlarge the existing
+    worst case — but by delaying an early-fired timer to END-of-PHASE-5
+    it CAN increase overlap likelihood vs master's immediate dispatch;
+    that is the price of closing the partial-init dispatch class, stated
+    openly. Closing the in-flight class would require a cancellable
+    apply — out of scope. The abandoned timer's persisted record
+    re-resolves on the next boot's expired-window path (same semantics as
+    the startup-failure abandon).

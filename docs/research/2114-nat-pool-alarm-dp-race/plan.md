@@ -1,14 +1,13 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v69 — the r28 split ruling EXECUTED at the document
-  level: the G+H+H2 follow-up unit's design moved verbatim to
-  `followup-seed.md` (with its open reviewer findings); this document is
-  now the PR-1-only plan-of-action (the `d.dp` synchronized-accessor
-  core). r67 verdicts stood at: Codex NEEDS-REVISION (4M/3m — ALL in
-  the extracted follow-up unit, per Codex's own structure
-  confirmation), AGY PLAN-READY, Claude SMR PLAN-READY-WITH-NITS
-  (0M/1m — resolved in v68). Pending convergence review r68 on the
-  PR-1 verdict surface.
+- **Status**: DRAFT v70 — r68 folds: Codex M1's armed-state backend
+  method gate (work item A3: `loaded` atomic + the gate-every-maps-
+  method rule), Codex m1's restored pure cell test leg, Codex m2 /
+  SMR m1's nil-receiver guard, Codex m3's docs/deletion inventory,
+  Codex m4's follow-up-residue extraction; r68 verdicts: Codex
+  PLAN-NEEDS-MAJOR (1M/4m — the first PR-1-surface MAJOR since the
+  split), AGY PLAN-READY, Claude SMR PLAN-READY-WITH-NITS (0M/1m);
+  pending convergence review r69
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -17,11 +16,12 @@
   `/engineer 2114`.
 - **Delivery** (r28 split ruling, §4.7; physically executed at v69): TWO
   units — the #2114 PR ships the `d.dp` accessor core (work item A1 +
-  the full site conversion + canaries + sampler narrowing — THIS
-  document); the named follow-up issue ships G+H+H2 (startup-readiness
-  gate + FirstCommit+cluster Load recovery + confirm-record durability
-  machinery) seeded from `followup-seed.md` (extracted verbatim from
-  this document at v69, with the open findings against that unit).
+  the armed-state gate A3 + the full site conversion + canaries +
+  sampler narrowing — THIS document); the named follow-up issue ships
+  G+H+H2 (startup-readiness gate + FirstCommit+cluster Load recovery +
+  confirm-record durability machinery) seeded from `followup-seed.md`
+  (extracted verbatim from this document at v69, with the open findings
+  against that unit).
 - **Revision history**: v1 @ `1d62be758` (initial). v2 @ `61568128f` (r1:
   deleted false invariants, deleted A2, canary redesign, sampler-only scope,
   snapshot boundaries, table regeneration). v3 @ `f0c1605cd` (r2: kind-gated
@@ -3105,7 +3105,28 @@
   per-round structure confirmations kept PR-1 intact).
   This document is now the PR-1-only plan-of-action; all
   remaining G/H/H2 mentions are pointers to the seed or
-  historical revision record.
+  historical revision record. v70: r68 folds — Codex M1
+  (the first PR-1-surface MAJOR since the split, verified:
+  the watcher calls `d.dp.HA().SetRGActive` at
+  `daemon_ha.go:297` in the pre-`Start` window while
+  `Start` populates the plain Go map `m.maps` at
+  `loader_userspace_shim.go:185-190` and `UpdateRGActive`
+  reads it at `maps_fabric.go:38` with no shared lock — a
+  fatal concurrent-map read/write on master today; the
+  cell closes the interface tear but cannot order the
+  backend's own post-publication mutations) folded as
+  work item A3 (armed-state method gate: `loaded` →
+  `atomic.Bool` + every exported maps-touching method
+  gates on it, with the two-layer RACE-1/RACE-2 closure
+  rewording); Codex m1 (the pure Store-vs-Load cell leg
+  of the confirm-timer test restored as [CORE]); Codex
+  m2 / SMR m1 (the narrowed `forwardingStatusDataplane()`
+  keeps the `d == nil ||` guard leg); Codex m3 (the
+  fwdstatus README:33 + sampler.go:48 wording and the
+  `errors`-import deletion join the inventory); Codex m4
+  (the §7 shutdown-admission invariant and the §6
+  health-message growth parenthetical were follow-up
+  residue — moved to the seed).
 
 ---
 
@@ -3418,7 +3439,10 @@ func (a forwardingStatusDaemonDataPlane) CachedStatus() (dpuserspace.ProcessStat
 ```
 
 - `forwardingStatusDataplane()` now returns `fwdstatus.CachedStatusProvider`
-  (nil iff `d.opts.NoDataplane`); `IsLoaded`/`GetMapStats`/`Status` leave
+  (nil iff `d == nil || d.opts.NoDataplane` — r68 Codex m2 + SMR m1:
+  the current constructor explicitly accepts a nil receiver at
+  `daemon_forwarding_status.go:123-125`; the guard leg is preserved);
+  `IsLoaded`/`GetMapStats`/`Status` leave
   the daemon adapter (verified: no production callers — the gRPC/CLI Build
   paths construct their OWN adapters per request from boot-captured probes,
   `server_show_forwarding.go:21-22`, `cli_show_chassis.go:59-60`, and are
@@ -3436,7 +3460,70 @@ func (a forwardingStatusDaemonDataPlane) CachedStatus() (dpuserspace.ProcessStat
   `userspaceCachedStatusProbe` is retained. A NEW unit test asserts the
   negative: the collapsed type must NOT satisfy
   `fwdstatus.DataPlaneAccessor` (plain type-assertion test — the `var _`
-  idiom cannot express negation).
+  idiom cannot express negation). The now-unused `errors` import at
+  `daemon_forwarding_status.go:3` leaves with the deleted helpers (r68
+  Codex m3).
+
+**Work item A3 — armed-state backend method gate (r68 Codex M1; the
+first PR-1-surface MAJOR since the split, code-verified before
+folding).** The cell closes the interface tear; it cannot order
+mutations the backend performs on ITSELF after publication. The
+verified race, live on master today: the cluster watcher starts at
+`daemon_run_bringup.go:203` (the election inside `UpdateConfig` at
+:181 / `election.go:443` synchronously enqueues the initial
+transition), the publication Store lands at `:469`, and `Start`
+remains later at `:493`; the watcher's handler chain can therefore
+load the coherent-but-starting backend and call
+`d.dp.HA().SetRGActive` (`daemon_ha.go:297`), which reads the plain
+Go map `m.maps` at `maps_fabric.go:38` while `Start` writes it at
+`loader_userspace_shim.go:185-190` — no shared lock, a fatal
+concurrent-map read/write. Bootstrap has the same shape:
+request-time `IsLoaded` reads `loaded` unsynchronized
+(`loader.go:457`) against the arm's `:164` write. These hazards
+pre-date PR-1 and PR-1 does not worsen them — but the plan's
+unqualified "closes the watcher chain at the memory-ordering level"
+claim was wrong, and the nil-or-full-slot test cannot detect this
+class. The fold:
+
+- `pkg/dataplane/loader.go`: `loaded bool` → `loaded atomic.Bool`
+  (:36 declaration; `:164` Store(true) — already the LAST step of
+  the load, sequenced after all map population; `:458`, `:490`,
+  `:1082` become Load; `:1217` Store(false) at Teardown).
+- **THE GATE RULE**: every exported `Manager` / shim-adapter method
+  that touches `m.maps` (or any Start-populated state) acquire-loads
+  `m.loaded` FIRST and returns the typed `ErrDataplaneNotArmed`
+  before any map access. Population sequenced-before the
+  release-Store of `loaded=true` gives the happens-before edge: a
+  method observing `true` sees a fully-populated `m.maps`; a method
+  running during population observes `false` and never touches the
+  map. The two pre-existing gates (`loader.go:490`, `:1082`)
+  establish the convention; the /engineer pass makes it TOTAL with
+  an enumerate-and-gate audit over the 14 `pkg/dataplane` files
+  (130 `m.maps[` sites) — `maps_fabric.go`'s `UpdateRGActive` (:38)
+  and `UpdateFabricFwd` (:30) are the named watcher-reachable
+  additions.
+- **Master-today failure shape in the window**: a pre-arm
+  `SetRGActive` either errors ("rg_active map not found" — map not
+  yet populated) or throws the fatal concurrent-map fault
+  (mid-population). The gate converts both to the one clean typed
+  error. NO successful path changes: post-arm `loaded` stays true
+  and every method proceeds exactly as today. A pre-arm
+  initial-election `SetRGActive` now returns the typed error instead
+  of racing; the missed transition is reconciled by the
+  post-publication `reconcileRGState` (`daemon_ha.go:707+`,
+  audit-tagged post-publication) — the /engineer pass names the
+  reconciliation proof in the PR.
+- **Alternative considered and rejected**: publish-after-`Start`
+  breaks bootstrap's construct-publish / arm-at-exit contract (the
+  exit path finds the constructed backend through the cell,
+  `daemon_run_naming.go:230-236`) and would require replaying the
+  initial-election transition consumed while the cell was nil; the
+  gate achieves method-level safety with zero lifecycle reordering
+  and zero bootstrap-semantics change.
+- The RACE-1/RACE-2 closure claims are reworded to the two precise
+  layers everywhere they appear: **(L1)** the interface tear —
+  closed by the cell; **(L2)** method-level safety against a
+  published-but-unarmed backend — closed by A3.
 
 ### Option B: eliminate the writer (write-once `d.dp` + degraded adapter)
 
@@ -3492,13 +3579,16 @@ v20 history). The delivery is TWO units:
 
 - **PR-1 (the #2114 deliverable — the titled defect)**: the `d.dp`
   synchronized-accessor core — work item A1 (the atomic publication
-  cell + uniform accessor), the 5-site writer conversion (§5.2), the
-  per-site snapshot boundaries (§5.3), the full reader conversion
-  (134 prod + ~110 test, §5.4), the `CachedStatusProvider` sampler
-  narrowing (§4 A1), the canary pair (§5.1 + `pkg/daemon` AST
+  cell + uniform accessor), work item A3 (the armed-state backend
+  method gate, r68 Codex M1, §4 A1), the 5-site writer conversion
+  (§5.2), the per-site snapshot boundaries (§5.3), the full reader
+  conversion (134 prod + ~110 test, §5.4), the `CachedStatusProvider`
+  sampler narrowing (§4 A1), the canary pair (§5.1 + `pkg/daemon` AST
   canary), docs + tests. This core is complete and self-contained:
   it closes RACE-1 (watcher chain), RACE-2 (bootstrap-exit arm), and
-  RACE-3 (recovered confirm timer) at the memory-ordering level and
+  RACE-3 (recovered confirm timer) at BOTH layers — (L1) the
+  interface tear, by the cell; (L2) method-level safety against a
+  published-but-unarmed backend, by A3's armed gate — and
   regresses nothing — every pre-existing hazard it does NOT address
   stays exactly as exposed as master is today.
 - **Follow-up issue (filed at /engineer time; seeded from this
@@ -3556,9 +3646,17 @@ convergence on the seed before any implementation of G/H/H2.
 - `pkg/daemon/daemon_forwarding_status.go`: single-method sampler-only
   adapter (§4 A1); `userspaceDataplaneStatus()` removed;
   `userspaceCachedStatusProbe` retained; `forwardingStatusDataplane()`
-  returns `fwdstatus.CachedStatusProvider`, nil iff `d.opts.NoDataplane`;
+  returns `fwdstatus.CachedStatusProvider`, nil iff `d == nil ||
+  d.opts.NoDataplane` (the nil-receiver guard leg preserved, r68
+  Codex m2 + SMR m1);
   the §4 A1 deletion inventory (`var _` assertion, userspace wrapper,
-  `userspaceStatusProbe`) executed.
+  `userspaceStatusProbe`, the unused `errors` import) executed.
+- `pkg/dataplane` (r68 Codex M1 — work item A3, the armed-state
+  gate): `loader.go` `loaded` → `atomic.Bool` (:36, :164, :458,
+  :490, :1082, :1217); the gate rule applied to every exported
+  maps-touching method across the 14 files (130 `m.maps[` sites —
+  enumerate-and-gate audit), `maps_fabric.go` `UpdateRGActive`/`UpdateFabricFwd`
+  named; the typed `ErrDataplaneNotArmed`.
 - FOLLOW-UP unit (G+H+H2) package touches — `daemon_apply_commit.go`,
   `daemon_run.go`/`daemon_run_shutdown.go`, `pkg/configstore`
   (`store_persist.go`, `crypto.go`, `store_commit.go`/`db.go`/`store.go`),
@@ -3714,6 +3812,13 @@ classification snapshot.
   `docs/ha-no-hitless-restart.md:22`, `docs/rib-group-route-leaking.md:94`
   (the /engineer pass greps `docs/` for `d\.dp` and updates or justifies
   each hit).
+- `pkg/fwdstatus/README.md:33` (the stale `DataPlaneAccessor.CachedStatus()`
+  wording rekeys to `CachedStatusProvider`) and the `sampler.go:48`
+  "failed `Status()` call" comment (reworded for the narrowed direct
+  call) — r68 Codex m3 inventory completion.
+- `pkg/dataplane/README.md` (or the loader's doc comment): the armed-state
+  gate contract (work item A3) — methods return `ErrDataplaneNotArmed`
+  before touching Start-populated state.
 - Recovery-contract docs for work item H's third outcome (FOLLOW-UP —
   `followup-seed.md`; r9 Codex m2,
   r10 Codex m4, r11): the "Two outcomes" comment at
@@ -3803,16 +3908,14 @@ Preserved exactly:
   (`cliDataPlane`/`grpcDataPlane`/`apiDataPlane`).
 - NAT pool-alarm monitor lifecycle (#2116) and `show security alarms`.
 - NoDataplane mode: cell nil for the daemon lifetime.
-- `applyResult()`, the health endpoint's 200/503 CONTRACT (the response
-  TEXT repertoire grows by SIX cause-distinct degraded messages —
-  terminal-unreadable, restart-recovery-owed, generic confirm-debt,
-  the two key-class variants (terminal-latch key-class,
-  confirm-debt key-class) naming ORIGINAL `.configdb/master.key`
-  restoration, PLUS the write-unverified message (master-key
-  validation outstanding) —
-  the 503 semantics are unchanged, r18 Codex item-7 + r20 Codex m2 +
-  r29 Codex fold-partial 7 + r32 Codex M1b),
-  REST simulator fail-closed `ok=false` (#3414).
+- `applyResult()`, the health endpoint's 200/503 CONTRACT (unchanged by
+  PR-1; the H2 health-message additions that previously grew this bullet
+  are FOLLOW-UP — moved to `followup-seed.md` §6-mirror at v70, r68
+  Codex m4), REST simulator fail-closed `ok=false` (#3414).
+- Pre-arm backend calls: exported maps-touching `Manager` methods return
+  the typed `ErrDataplaneNotArmed` instead of master's "map not found"
+  error or the fatal concurrent-map throw (work item A3 — no successful
+  path changes; post-arm behavior bit-identical).
 
 ## 7. Hidden invariants the change must preserve
 
@@ -3842,31 +3945,24 @@ Preserved exactly:
 10. **Retirement boundary**: the canary's invariant (daemon holds a
     `dataplane.RuntimeDataPlane` built by `NewRuntimeDataPlane`) preserved
     through the redesigned matcher; both-direction canary self-tests (§4).
-11. **Shutdown-admission guard (r8/r9/r10)**: the double nil-safe guard
-    (`d.stopping.Load() || (d.runCtx != nil && d.runCtx.Err() != nil)`,
-    checked by the executor UNDER applySem, joining the `isResetting()`
-    early-return) orders ENTRY absolutely: after ctx cancellation OR
-    after `runShutdownSequence`'s FIRST-STATEMENT `stopping` publication
-    (before `d.applyCancel()`), no rollback newly enters its critical
-    section; the cancellable `Acquire(runCtxOrBackground())` abandons a
-    wait interrupted by the signal instead of parking through teardown.
-    HONEST BOUND (r9 Codex M2, r10-narrowed per Codex m3, verified
-    `applyCloseoutDrainTimeout = 5s`, `daemon_run_shutdown.go:15,50-58`):
-    a rollback ALREADY in flight when the signal lands is
-    bounded-drain-covered for ≤5 s; beyond the drain budget the shutdown
-    proceeds (`:54-58`, logged) and the rollback — deliberately
-    non-cancellable work — can overlap manager/dataplane teardown. That
-    overlap exists on master today for every commit-confirmed timer (the
-    executor has no shutdown guard at all). NARROWED CLAIM: the guard
-    does not lengthen the admitted body and does not enlarge the existing
-    worst case — but by delaying an early-fired timer to END-of-PHASE-5
-    it CAN increase overlap likelihood vs master's immediate dispatch;
-    that is the price of closing the partial-init dispatch class, stated
-    openly. Closing the in-flight class would require a cancellable
-    apply — out of scope. The abandoned timer's persisted record
-    re-resolves on the next boot's expired-window path (same semantics as
-    the startup-failure abandon).
-12. **#4577 confirm contract (r8/r10/r11/r12/r13/r14/r15)**: an
+11. **[FOLLOW-UP — moved to the seed at v70 (r68 Codex m4)]**: the
+    shutdown-admission guard invariant is work-item-G content; it moved
+    verbatim to `followup-seed.md` §7-mirror.
+12. **Armed-state gate (work item A3, r68 Codex M1)**: `loaded` is an
+    `atomic.Bool`; its Store(true) is the LAST step of the load,
+    sequenced after all map population (`loader.go:164`); every
+    exported maps-touching method acquire-loads it and returns
+    `ErrDataplaneNotArmed` before any map access. Population
+    sequenced-before the release-Store gives the happens-before edge:
+    a method observing true sees a fully-populated `m.maps`; a method
+    during population observes false and never touches the map.
+    Teardown's Store(false, :1217) can only flip armed→unarmed for a
+    backend the cell no longer publishes-or a draining one; an
+    in-flight gated method holding the pre-Teardown read either
+    completes against the still-open maps (cilium/ebpf map ops are
+    goroutine-safe; Close concurrency returns an error, never a Go
+    fatal) or observes false on entry.
+13. **#4577 confirm contract (r8/r10/r11/r12/r13/r14/r15)**: an
     unconfirmed config must NEVER stand, and a CONFIRMED config must
     never be rolled back. Work item H's revert-at-Load (FOLLOW-UP —
     `followup-seed.md` §7-mirror) honors the first half for the
@@ -3879,7 +3975,7 @@ Preserved exactly:
 
 | Class | Rating | Assessment |
 |---|---|---|
-| Behavioral regression | **MED** | Large but mechanical diff; compiler-enforced completeness + regenerated §5.4 table + the new dpCell canary. Real risks: (a) a §5.3 snapshot-boundary mistake; (b) canary redesign errors (mitigated by both-direction self-tests); (c) the fwdstatus narrowing touching `NewSampler` (contained: 1 prod caller + 2 test sites; full-suite gate); (d) [FOLLOW-UP — seed] work item H narrows commit-confirmed recovery semantics for the FirstCommit+cluster class (revert-at-Load vs re-arm); the follow-up unit's risks are assessed in `followup-seed.md`. |
+| Behavioral regression | **MED** | Large but mechanical diff; compiler-enforced completeness + regenerated §5.4 table + the new dpCell canary. Real risks: (a) a §5.3 snapshot-boundary mistake; (b) canary redesign errors (mitigated by both-direction self-tests); (c) the fwdstatus narrowing touching `NewSampler` (contained: 1 prod caller + 2 test sites; full-suite gate); (d) [FOLLOW-UP — seed] work item H narrows commit-confirmed recovery semantics for the FirstCommit+cluster class (revert-at-Load vs re-arm); the follow-up unit's risks are assessed in `followup-seed.md`; (e) the A3 enumerate-and-gate audit could miss an exported maps-touching method — mitigated by the pre-arm method-matrix test and the blocked-Start -race regression (§9), and bounded by the failure shape (a missed gate reproduces master's map-not-found error, never a NEW failure mode). |
 | Lifetime / borrow | **LOW** | Immutable slots; captured references keep backends alive exactly as today. No FFI/Rust interaction. |
 | Performance regression | **LOW** | One atomic load + indirection per control-plane read (1 Hz sampler, request rate, watchdog 2/s, HA ≤15/s). One small allocation per Store, ≤5/lifetime. No per-packet Go code. |
 | Architectural mismatch | **LOW** | #2116 `atomic.Pointer` precedent; daemon atomics-for-publication idiom; no dataplane-lifecycle redesign (Option B rejected); canary redesign extends the existing boundary-guard pattern. Work items G+H (FOLLOW-UP — `followup-seed.md`) carry a deliberate lifecycle change (startup-outcome gating of the rollback executor + the shutdown-admission fence) and a narrowed recovery semantic; their full risk assessment lives in the seed. PR-1 itself adds no lifecycle change. |
@@ -3959,6 +4055,12 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    - `TestDataplaneCell_ClusterStartPublication` — RACE-1 shape:
      watcher-shape reader loop racing the boot `setDataplane(dp)`
      publication; nil-or-full-slot assertion; `-race` clean.
+   - `TestDataplaneCell_ConfirmTimerStoreVsApplyReader` (r68 Codex m1 —
+     the pure cell leg of the confirm-timer test has NO G/H/H2
+     dependency and stays [CORE]): two-sided gate — a
+     `setDataplane(dp)` publication gated immediately before the store
+     vs an applySem-holding reader gated immediately before its
+     `d.dataplane()` load; shared release; no channel between the pair.
    - **[FOLLOW-UP] legs moved (v69)**: the work-item-G gate tests
      (`TestDataplaneCell_ConfirmTimerVsBootPublication`), the work-item-H
      recovery-guard tests (i)-(x), and the work-item-H2 test legs
@@ -3973,8 +4075,19 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    `setDataplane` swaps). **[CORE]**
 4. Scoped race gate: new `test-race-dp` make target —
    `go test -race ./pkg/daemon/ -run 'DataplaneCell|NATPoolAlarm|ForwardingStatus|BootstrapExit' -count=2`
-   — invoked from `test-go` (r1/r2: plain `go test ./...` has no race
-   teeth; full-repo `-race` stays out of scope). **[CORE]**
+   plus `go test -race ./pkg/dataplane/ -run 'ArmedGate|PreArm' -count=2`
+   (r68 Codex M1 — the A3 gate legs) — invoked from `test-go` (r1/r2:
+   plain `go test ./...` has no race teeth; full-repo `-race` stays
+   out of scope). **[CORE]**
+4a. A3 armed-gate tests (`pkg/dataplane`, r68 Codex M1's demanded
+   regression): (i) `TestManager_ArmedGate_BlockedStart` — a test-only
+   load hook pauses shim population mid-`Start` while goroutines drive
+   `UpdateRGActive`, `IsLoaded`, and a maps-reading method; under
+   `-race`: no fatal fault, every call returns `ErrDataplaneNotArmed`;
+   (ii) `TestManager_PreArmMethodMatrix` — every exported maps-touching
+   `Manager` method invoked pre-`Start` returns the typed not-armed
+   error, no panic, no throw (this is what catches a missed gate in
+   the enumerate-and-gate audit). **[CORE]**
 5. Canary tests: redesigned matcher self-tests both directions; new
    `daemon_dp_canary_test.go` asserts no direct `dpCell` access outside the
    accessors. **[CORE]**
@@ -4432,6 +4545,17 @@ Still open:
    convergence under the follow-up issue. The plan converges
    PLAN-READY when all three verdicts gate the PR-1 design as
    ready.
+
+7. **r68 resolution (for the record)**: Codex M1 (armed-state method
+   gate) folded as work item A3 — the RACE-1/RACE-2 closure claims are
+   now the two precise layers (L1 tear, L2 method-level); Codex m1-m4
+   folded (pure cell test leg restored [CORE]; nil-receiver guard
+   preserved; docs/deletion inventory completed; follow-up residue
+   moved to the seed). Each reviewer: verify the A3 gate design
+   (happens-before via the sequenced-late release-Store of `loaded`),
+   the enumerate-and-gate audit's totality mechanism (the pre-arm
+   method-matrix test), and the rejected publish-after-Start
+   alternative's rationale.
 
 ---
 

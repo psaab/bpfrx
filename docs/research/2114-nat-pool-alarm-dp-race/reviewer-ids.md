@@ -239,3 +239,6 @@ reviewer (joins at /engineer on the code PR).
   `/home/ps/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-companion.mjs`
   (was 1.0.4). `status --json` → `latestFinished` holds the most recent
   completed job when `recent` is capped.
+| r68 | Claude SMR | in-conversation (claude-smr-plan-r68.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — the nil-receiver guard leg in the narrowed forwardingStatusDataplane). Extraction fidelity confirmed |
+| r68 | AGY | agy print-mode direct at 12m, attempt 2 from trusted bpfrx workspace (agy-plan-r68.md) | PLAN-READY (extraction fidelity confirmed; 6 verification areas; no findings; explicit NO to PR-1-blocking). Structure confirmed |
+| r68 | Codex | codex companion task-msaor22j-qq82yz (session 019fbe84-0763-7e62-a041-6b633d9b9f65) | PLAN-NEEDS-MAJOR (1 MAJOR — armed-state method gate / publication-vs-Start lifecycle; 4 MINOR — pure cell test leg, nil-receiver guard, docs/deletion inventory, follow-up residue). Census + cell + canaries confirmed clean |
