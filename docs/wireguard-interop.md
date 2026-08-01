@@ -755,8 +755,9 @@ burst is never split across two policy generations):
    for the inner destination, looked up **in the tunnel interface's
    routing instance** (a `wgN` bound into a VRF does not resolve its
    to-zone out of `inet.0`).
-3. `evaluate_policy` on the inner 5-tuple, carrying the real ICMP
-   type/code so an icmp-typed application term (`junos-ping`) matches.
+3. `evaluate_policy_result_l3_aware` on the inner tuple, carrying the
+   real ICMP type/code so an icmp-typed application term (`junos-ping`)
+   matches.
 
 A non-permit verdict **drops the plaintext**: no TUN write, so the kernel
 never sees the packet and cannot forward it. The datagram still
@@ -767,19 +768,62 @@ A **cold ARP/ND entry does not disable the gate**: the FIB resolution is
 `MissingNeighbor`, which still carries the egress ifindex, so the zone
 pair is known and the verdict is enforced.
 
+### A packet with no 5-tuple is adjudicated, not delegated
+
+This is the part that decides whether the deny is real. `parse_flow_ports`
+yields no 5-tuple for **every IP protocol except TCP, UDP, and
+identifier-bearing ICMP/ICMPv6**, for every ICMP error and ND/MLD type,
+and for every **non-first fragment**. Delegating that whole class to the
+kernel would leave the deny bypassable by an authenticated peer setting
+one byte — AllowedIPs constrains the inner *source*, nothing constrains
+the inner *protocol number*, and the peer is exactly the entity the deny
+exists to constrain.
+
+So a packet with no 5-tuple is adjudicated on the **L3 identity it does
+carry** — (src, dst, protocol) — through
+`evaluate_policy_result_l3_aware(.., l4_present = false)`, the same
+shared entry point the AF_XDP transit direction already uses for this
+class (#3291 / #4569). `l4_present = false` means "ports are 0 and MUST
+NOT be trusted": port-bearing application terms fail closed, while
+address/protocol/`any` terms evaluate normally, and #4569's
+fragment-association override turns a later permit into a drop when an
+overlapping port-bearing DENY was skipped. Dropping the class outright
+instead would break legitimate fragmented traffic and legitimate ICMP
+errors under a permit policy. The two directions now agree by
+construction.
+
+### Fail-closed cases
+
+Three dispositions are xpf verdicts in their own right, not an absence of
+authority, so they DROP and bump `inner_forward_drops`:
+
+- the xpf FIB resolved a **discard route** (or an unsupported next-table
+  chain) for the inner destination;
+- the inner packet is **uninspectable** — a truncated IP header, a
+  declared length overrunning the buffer, or an IPv6 extension chain
+  still unresolved at `MAX_IPV6_EXT_HEADERS` (the mainline forward path
+  fails these closed too, #2292 / #4743; an over-limit chain is a known
+  IDS-evasion shape);
+- the inner payload is **not IPv4 or IPv6**. WireGuard is an IP tunnel,
+  so anything else is malformed by construction.
+
 **Where xpf still delegates to the kernel — and how you see it.** The
 gate enforces only where xpf actually HAS authority. It preserves
-today's kernel delegation, and bumps `inner_policy_unadjudicated`, when:
+today's kernel delegation, and bumps `inner_policy_unadjudicated`, ONLY
+when xpf cannot compute a zone pair at all:
 
 - the tunnel interface is **not in a security zone** (no from-zone);
 - the routed **egress interface is unzoned** (no to-zone);
-- the inner destination is **host-bound** (`LocalDelivery`) — that is a
-  `host-inbound-traffic` / `to-zone junos-host` question, a different
-  policy plane, not a transit zone pair;
 - the xpf FIB **resolves no egress interface** for the inner
   destination;
-- the inner packet carries **no parseable 5-tuple** (non-IP payload,
-  non-first fragment, an IPv6 extension chain the shared walker refuses).
+- the inner destination is **host-bound** (`LocalDelivery`) — that is a
+  `host-inbound-traffic` / `to-zone junos-host` question, a different
+  policy plane, not a transit zone pair. **This residual is reachable on
+  demand, not incidental**: AllowedIPs constrains the inner *source*
+  only, so a peer may freely address any firewall-local IP and reach the
+  host-inbound plane. Behaviour is unchanged from master and closing it
+  belongs to the full-fix scope below, but do not read it as an edge
+  case.
 
 Dropping in those cases would mean refusing traffic on the basis of a
 zone pair xpf could not compute — a worse failure than the bug. Counting
@@ -791,14 +835,17 @@ Operator surfaces:
 show security wireguard detail
   Receive drops by reason:
     zone-policy-deny        <n>
-  Inner zone policy:  <n> denied by xpf policy, <m> delivered without an
-                      xpf verdict (kernel-adjudicated)
+    forward-drop            <n>
+  Inner zone policy:  <n> denied by xpf policy, <n> dropped by xpf
+                      forwarding, <m> delivered without an xpf verdict
+                      (kernel-adjudicated)
 ```
 
 Prometheus: `xpf_userspace_wg_inner_zone_policy_total{tunnel,verdict}`
-with `verdict=deny` and `verdict=unadjudicated`. Both series always emit
-(including zero) so a rising `unadjudicated` is alertable. If you expect
-a tunnel to be fully xpf-adjudicated, alert on
+with `verdict=deny`, `verdict=forward_drop`, and
+`verdict=unadjudicated`. All three series always emit (including zero) so
+a rising `unadjudicated` is alertable. If you expect a tunnel to be fully
+xpf-adjudicated, alert on
 `rate(xpf_userspace_wg_inner_zone_policy_total{verdict="unadjudicated"}[5m]) > 0`
 — the usual cause is a `wgN` interface with no `security zones` binding.
 

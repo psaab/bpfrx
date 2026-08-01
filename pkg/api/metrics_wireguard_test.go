@@ -123,6 +123,7 @@ func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
 			// traffic is fully adjudicated must still emit the series
 			// so an operator can alert on it becoming nonzero.
 			InnerPolicyDenies:        51,
+			InnerForwardDrops:        53,
 			InnerPolicyUnadjudicated: 0,
 		}},
 	}
@@ -212,6 +213,7 @@ func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
 		"xpf_userspace_wg_keepalives_sent_total,kind=persistent,tunnel=wg0":                         43,
 		"xpf_userspace_wg_handshake_attempts_aborted_total,tunnel=wg0":                              44,
 		"xpf_userspace_wg_inner_zone_policy_total,tunnel=wg0,verdict=deny":                          51,
+		"xpf_userspace_wg_inner_zone_policy_total,tunnel=wg0,verdict=forward_drop":                  53,
 		"xpf_userspace_wg_inner_zone_policy_total,tunnel=wg0,verdict=unadjudicated":                 0,
 	}
 	if len(got) != len(want) {
@@ -309,9 +311,9 @@ func TestEmitWireguardTelemetryNeverHandshakedGauge(t *testing.T) {
 	// 1 sessions-expired + 1 attempts-aborted; +2 hs reasons #4094
 	// (under_load_no_mac2 + cookie_reply_budget) + 3 cookie-reply events
 	// #4094 (sent + mac2_ok [PR-A] + consumed [PR-B]) = 51; +2 inner
-	// zone-policy verdicts #5618 (deny + unadjudicated) = 53.
-	if count != 53 {
-		t.Errorf("emitted %d series for a zeroed tunnel, want 53 (zeros are real signals)", count)
+	// zone-policy verdicts #5618 (deny + forward_drop + unadjudicated) = 54.
+	if count != 54 {
+		t.Errorf("emitted %d series for a zeroed tunnel, want 54 (zeros are real signals)", count)
 	}
 }
 

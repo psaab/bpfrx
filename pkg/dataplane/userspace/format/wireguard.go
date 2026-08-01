@@ -76,7 +76,7 @@ func FormatWireguardStatus(status userspace.ProcessStatus, detail bool, now time
 		decapDrops := t.DecapDropsMalformedHeader + t.DecapDropsUnknownSession +
 			t.DecapDropsCounterCeiling + t.DecapDropsCrypto + t.DecapDropsReplay +
 			t.DecapDropsAllowedIPs + t.DecapDropsMalformedInner + t.DecapDropsBuffer +
-			t.InnerPolicyDenies
+			t.InnerPolicyDenies + t.InnerForwardDrops
 		encapDrops := t.EncapDropsNoSession + t.EncapDropsUnconfirmed +
 			t.EncapDropsRekeyRequired + t.EncapDropsOther + t.EncapMtuDrops
 		hsDrops := t.HsRxDropsMac1Mismatch + t.HsRxDropsMalformed + t.HsRxDropsCrypto +
@@ -100,12 +100,13 @@ func FormatWireguardStatus(status userspace.ProcessStatus, detail bool, now time
 			{"malformed-inner", t.DecapDropsMalformedInner},
 			{"buffer", t.DecapDropsBuffer},
 			{"zone-policy-deny", t.InnerPolicyDenies},
+			{"forward-drop", t.InnerForwardDrops},
 		})
 		// #5618: the residual kernel delegation, made visible. A nonzero
 		// value means those inner packets reached the wgN TUN WITHOUT an
 		// xpf forward zone-policy verdict — the kernel FIB decided them.
-		fmt.Fprintf(&b, "  Inner zone policy:  %d denied by xpf policy, %d delivered without an xpf verdict (kernel-adjudicated)\n",
-			t.InnerPolicyDenies, t.InnerPolicyUnadjudicated)
+		fmt.Fprintf(&b, "  Inner zone policy:  %d denied by xpf policy, %d dropped by xpf forwarding, %d delivered without an xpf verdict (kernel-adjudicated)\n",
+			t.InnerPolicyDenies, t.InnerForwardDrops, t.InnerPolicyUnadjudicated)
 		b.WriteString("  Transmit drops by reason:\n")
 		writeWgReasonRows(&b, []wgReasonRow{
 			{"no-session", t.EncapDropsNoSession},

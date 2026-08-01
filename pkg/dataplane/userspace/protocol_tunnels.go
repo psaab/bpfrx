@@ -186,12 +186,20 @@ type WgTunnelStatus struct {
 	// xpf forward zone policy DROPPED before they could reach the wgN TUN
 	// and the kernel FIB. Pre-#5618 every one of these transited.
 	//
+	// InnerForwardDrops counts decapped inner packets dropped by a definite
+	// NON-policy xpf verdict: a discard route / unsupported next-table for
+	// the inner destination, or an uninspectable inner packet (truncated
+	// header, over-limit IPv6 extension chain, non-IP payload).
+	//
 	// InnerPolicyUnadjudicated counts decapped inner packets delivered to
 	// the TUN with NO xpf forward-policy verdict — the residual #1432-S2a
-	// kernel delegation (unzoned tunnel or egress, host-bound inner
-	// destination, unresolvable route, no parseable 5-tuple). A climbing
-	// value means inter-zone authority for that tunnel still rests with
-	// the kernel.
+	// kernel delegation. Bumped ONLY where xpf cannot compute a zone pair
+	// at all: unzoned tunnel or egress interface, host-bound inner
+	// destination, or no egress in the xpf FIB. A packet with no parseable
+	// 5-tuple is NOT in this set — it is adjudicated on its L3 identity. A
+	// climbing value means inter-zone authority for that tunnel still rests
+	// with the kernel.
 	InnerPolicyDenies        uint64 `json:"inner_policy_denies,omitempty"`
+	InnerForwardDrops        uint64 `json:"inner_forward_drops,omitempty"`
 	InnerPolicyUnadjudicated uint64 `json:"inner_policy_unadjudicated,omitempty"`
 }

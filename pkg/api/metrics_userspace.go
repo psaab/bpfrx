@@ -296,6 +296,7 @@ func (c *xpfCollector) emitWireguardTelemetry(ch chan<- prometheus.Metric, statu
 		// operator can alert on `unadjudicated` climbing — a silent
 		// residual delegation is exactly what #5618 reported.
 		counter(c.wgInnerZonePolicyTotal, t.InnerPolicyDenies, t.Tunnel, "deny")
+		counter(c.wgInnerZonePolicyTotal, t.InnerForwardDrops, t.Tunnel, "forward_drop")
 		counter(c.wgInnerZonePolicyTotal, t.InnerPolicyUnadjudicated, t.Tunnel, "unadjudicated")
 
 		// #1434 multi-peer: one confirmed-session gauge per peer,

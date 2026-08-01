@@ -1,3 +1,84 @@
+## 2026-08-01 — #5618 round 2: two attacker-selectable fail-opens in the gate
+
+- **Timestamp**: 2026-08-01 (fix/5618-wg-plaintext-zone-authority, PR #6651)
+- **Action**: Hostile review returned REQUEST CHANGES with 2 MAJOR, both
+  proven by firsthand execution through the production `dispatch_inbound`.
+  Verified both by reading before fixing.
+  (MAJOR 1) The gate bailed to `Unadjudicated` whenever
+  `parse_session_flow_from_frame` returned `None`. `parse_flow_ports`
+  returns `None` for EVERY IP protocol except TCP/UDP/identifier-bearing
+  ICMP, for every non-identifier ICMP type (dest-unreachable,
+  time-exceeded, packet-too-big, ND/MLD), and for every non-first
+  fragment — so an authenticated peer bypassed the DENY by setting one
+  byte (SCTP 132, GRE 47, IPIP 4, ESP 50), or by fragmenting. AllowedIPs
+  gates the inner SOURCE; nothing gates the inner PROTOCOL NUMBER, and
+  the peer is exactly the entity the deny constrains. The claim was
+  scoped materially narrower than the guard. Fixed by adjudicating on
+  the L3 identity the packet DOES carry via the shared
+  `evaluate_policy_result_l3_aware(.., l4_present = false)` — the same
+  entry point the transit direction already uses (#3291/#4569), so the
+  two directions now agree by construction. The in-code justification
+  ("adjudicating a fragment on fabricated ports") was factually wrong:
+  `l4_present = false` is DEFINED as "ports are 0 and MUST NOT be
+  trusted", so port-bearing terms fail closed while address/protocol/any
+  terms still evaluate.
+  (MAJOR 2) `UserspaceDpMeta { ..Default::default() }` left `l4_offset`
+  at 0, and `term_match_extra_from_frame` trusts the field VERBATIM —
+  so it read the ICMP type/code out of the ZEROED synthetic Ethernet
+  header. Every inner ICMP packet was evaluated as type 0 code 0, which
+  BOTH broke `permit application junos-ping` (echo-request is type 8 —
+  ping dead through every tunnel, the exact regression the PR claimed to
+  avoid) AND failed `deny application junos-ping` OPEN. Fixed by
+  stamping `l4_offset` from the shared
+  `packet_rel_l4_offset_and_protocol`, which also supplies the terminal
+  protocol and fails closed on a truncated header or an over-limit IPv6
+  extension chain.
+  (MODERATE 3, the one to internalise) The ICMP negative control was a
+  TAUTOLOGY — `permit_rule` left `application_terms` empty, so
+  `junos-ping` was a bare name with no icmp-type constraint and the rule
+  matched every ICMP packet regardless of what the gate passed. It
+  passed identically with the real type, with `(0,0)`, and with `None`,
+  so it could not detect MAJOR 2. Same recurring shape as the campaign
+  memory: a test whose expected value is also the failure-mode default.
+  Rewritten to attach the REAL expanded term the Go control plane emits
+  (`PolicyApplicationSnapshot { protocol: "icmp", icmp_type: Some(8) }`),
+  plus a `deny junos-ping` case with a trailing permit-any so the DENY is
+  load-bearing, plus a direct assertion on the type/code value the
+  production frame+meta builder computes.
+  (MODERATE 4) Residual re-documented: the fail-open set was described as
+  malformed/fragmented edge cases when it was the dominant attacker-
+  selected class. Also recorded that the `LocalDelivery` residual is
+  reachable ON DEMAND (AllowedIPs constrains the inner source, not the
+  destination), not incidental.
+  (MINOR 5) A `DiscardRoute` / `NextTableUnsupported` inner destination
+  now DROPS as `inner_forward_drops` instead of being handed to the
+  kernel — xpf's FIB reached a verdict, so delegating is incoherent.
+  Same for an uninspectable inner packet and a non-IP payload.
+- **File(s)**:
+  `userspace-dp/src/afxdp/coordinator/wg_control/{policy_gate.rs,policy_gate_tests.rs,dispatch.rs}`,
+  `userspace-dp/src/afxdp/coordinator/{status.rs,README.md}`,
+  `userspace-dp/src/afxdp/wg/counters.rs`,
+  `userspace-dp/src/protocol/{control.rs,tests.rs}`,
+  `pkg/dataplane/userspace/{protocol_tunnels.go,wg_status_test.go}`,
+  `pkg/dataplane/userspace/format/wireguard.go`,
+  `pkg/api/{metrics.go,metrics_descriptors_wireguard.go,metrics_userspace.go,metrics_wireguard_test.go}`,
+  `docs/wireguard-interop.md`, `docs/userspace-dataplane-gaps.md`
+- **Validation**: full Rust leg green (4245 + 60 + 8 + 22 + 31 + 1 + 2);
+  Go build/vet/test green. TWO mutation proofs, each with `cargo build
+  --release` CLEAN (exit 0) and a DISCRIMINATING control:
+  (A) restoring the `inner_flowless` bail reds
+  `denied_zone_pair_cannot_be_bypassed_by_the_inner_protocol_or_fragmentation`
+  ("sctp (proto 132): a DENIED inner packet reached the wgN TUN ... 28
+  bytes escaped") AND the permit-side control
+  `permitted_zone_pair_still_passes_protocols_without_a_5_tuple`, which
+  discriminates adjudicated-and-permitted from delegated by asserting
+  `unadjudicated == 0`.
+  (B) un-stamping `l4_offset` reds all three ICMP tests in BOTH
+  directions — the permit case drops a real echo-request (`left: []`),
+  the deny case lets one escape (28 bytes), and the direct value probe
+  reports `left: (0, 0) right: (8, 0)`.
+  Cluster smoke still REQUIRED; not run (team lead will re-smoke).
+
 ## 2026-08-01 — #5618 WireGuard decapped plaintext bypassed xpf forward zone policy
 
 - **Timestamp**: 2026-08-01 (fix/5618-wg-plaintext-zone-authority)

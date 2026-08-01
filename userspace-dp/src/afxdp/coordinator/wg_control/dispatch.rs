@@ -254,12 +254,31 @@ pub(super) fn dispatch_inbound(
                             );
                             return InboundOutcome::Authenticated(outcome.peer_pubkey);
                         }
+                        InnerVerdict::ForwardDrop(_reason) => {
+                            // xpf has a definite NON-policy verdict of
+                            // its own — its FIB said discard, or the
+                            // inner packet is uninspectable (truncated
+                            // header, over-limit IPv6 extension chain,
+                            // non-IP payload). Handing the plaintext to
+                            // the kernel after that would be incoherent,
+                            // and an uninspectable inner is exactly the
+                            // ext-header IDS-evasion shape #4743 fails
+                            // closed on in the mainline forward path.
+                            WgCounters::bump(&engine.counters().inner_forward_drops);
+                            debug_log!(
+                                "WG[{}]: inner forward drop ({})",
+                                tunnel_name,
+                                _reason
+                            );
+                            return InboundOutcome::Authenticated(outcome.peer_pubkey);
+                        }
                         InnerVerdict::Unadjudicated(_reason) => {
                             // xpf had no forward authority over this
-                            // packet (unzoned tunnel/egress, host-bound
-                            // destination, unresolvable route, unparseable
-                            // inner). Preserve the S2a kernel delegation
-                            // rather than drop on a zone pair we could not
+                            // packet: unzoned tunnel/egress, host-bound
+                            // destination (a host-inbound question, a
+                            // different policy plane), or no FIB egress.
+                            // Preserve the S2a kernel delegation rather
+                            // than drop on a zone pair we could not
                             // compute — but COUNT it, so the residual
                             // delegation is operator-visible.
                             WgCounters::bump(&engine.counters().inner_policy_unadjudicated);

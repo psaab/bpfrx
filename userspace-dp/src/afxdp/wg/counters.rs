@@ -189,16 +189,31 @@ pub(crate) struct WgCounters {
     /// inter-zone policy bypass. Nonzero here means xpf enforced a
     /// verdict the kernel path would have missed.
     pub(crate) inner_policy_denies: AtomicU64,
+    /// Decapped inner packets DROPPED by a definite NON-policy xpf
+    /// verdict: the xpf FIB resolved a discard route (or an unsupported
+    /// next-table chain) for the inner destination, or the inner packet
+    /// is uninspectable — a truncated IP header, a declared length
+    /// overrunning the buffer, an IPv6 extension chain still unresolved
+    /// at `MAX_IPV6_EXT_HEADERS` (the #4743 IDS-evasion shape), or a
+    /// non-IPv4/IPv6 payload on an IP tunnel. The mainline forward path
+    /// fails all of these closed too; delegating them to the kernel
+    /// would be incoherent after xpf has already reached a verdict.
+    pub(crate) inner_forward_drops: AtomicU64,
     /// Decapped inner packets delivered to the TUN WITHOUT an xpf
     /// forward-policy verdict — the residual #1432-S2a kernel
-    /// delegation, made countable. Bumped when the tunnel interface is
-    /// unzoned, the inner destination is host-bound (`LocalDelivery` —
-    /// a host-inbound question, not a forward one), the xpf FIB resolves
-    /// no egress interface, that egress interface is unzoned, or the
-    /// inner packet carries no parseable 5-tuple. A steadily climbing
-    /// value means inter-zone authority for this tunnel still rests with
-    /// the kernel; see `docs/wireguard-interop.md` ("Inner-ingress
-    /// zone-policy authority").
+    /// delegation, made countable. Bumped ONLY where xpf cannot compute
+    /// a zone pair at all: the tunnel interface is unzoned, the routed
+    /// egress interface is unzoned, the xpf FIB resolves no egress
+    /// interface, or the inner destination is host-bound
+    /// (`LocalDelivery` — a host-inbound-admission question, a different
+    /// policy plane). A packet with no parseable 5-tuple is NOT in this
+    /// set: it is adjudicated on its L3 identity via the shared
+    /// `l4_present = false` path (r2 MAJOR 1 — before that fix an
+    /// authenticated peer bypassed a DENY by picking any IP protocol
+    /// other than TCP/UDP/ICMP-query, or by fragmenting). A steadily
+    /// climbing value means inter-zone authority for this tunnel still
+    /// rests with the kernel; see `docs/wireguard-interop.md`
+    /// ("Inner-ingress zone-policy authority").
     pub(crate) inner_policy_unadjudicated: AtomicU64,
 
     // --- #1888 S5 timers ---

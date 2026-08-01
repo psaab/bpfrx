@@ -77,6 +77,7 @@ func TestProcessStatusWgTunnelsPopulatedDecode(t *testing.T) {
 			"keepalives_tx_persistent": 43,
 			"pending_aborted_attempt_window": 44,
 			"inner_policy_denies": 51,
+			"inner_forward_drops": 53,
 			"inner_policy_unadjudicated": 52
 		}]
 	}`
@@ -162,6 +163,7 @@ func TestProcessStatusWgTunnelsPopulatedDecode(t *testing.T) {
 		{"PendingAbortedAttemptWindow", row.PendingAbortedAttemptWindow, 44},
 		// #5618 inner-ingress zone-policy authority.
 		{"InnerPolicyDenies", row.InnerPolicyDenies, 51},
+		{"InnerForwardDrops", row.InnerForwardDrops, 53},
 		{"InnerPolicyUnadjudicated", row.InnerPolicyUnadjudicated, 52},
 	}
 	for _, c := range ladder {

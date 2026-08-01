@@ -2163,6 +2163,7 @@ fn process_status_wg_tunnels_roundtrip_and_compat() {
         pending_aborted_attempt_window: 44,
         // #5618 inner-ingress zone-policy authority.
         inner_policy_denies: 51,
+        inner_forward_drops: 53,
         inner_policy_unadjudicated: 52,
     };
     let status = ProcessStatus {
@@ -2193,6 +2194,7 @@ fn process_status_wg_tunnels_roundtrip_and_compat() {
     // #5618: the inner zone-policy counters are on the wire (the Go
     // control plane renders them as WG telemetry).
     assert_eq!(wire_row["inner_policy_denies"], 51);
+    assert_eq!(wire_row["inner_forward_drops"], 53);
     assert_eq!(wire_row["inner_policy_unadjudicated"], 52);
     let back: ProcessStatus =
         serde_json::from_value(value).expect("deserialize ProcessStatus");

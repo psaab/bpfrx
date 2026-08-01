@@ -1063,6 +1063,7 @@ impl super::Coordinator {
                 tun_write_errors: c.tun_write_errors.load(Ordering::Relaxed),
                 tun_rx_drops_no_endpoint: c.tun_rx_drops_no_endpoint.load(Ordering::Relaxed),
                 inner_policy_denies: c.inner_policy_denies.load(Ordering::Relaxed),
+                inner_forward_drops: c.inner_forward_drops.load(Ordering::Relaxed),
                 inner_policy_unadjudicated: c.inner_policy_unadjudicated.load(Ordering::Relaxed),
                 encap_drops_expired: c.encap_drops_expired.load(Ordering::Relaxed),
                 decap_drops_expired: c.decap_drops_expired.load(Ordering::Relaxed),

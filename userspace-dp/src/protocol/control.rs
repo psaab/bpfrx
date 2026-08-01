@@ -892,6 +892,8 @@ pub(crate) struct WgTunnelStatus {
     // --- #5618 inner-ingress zone-policy authority ---
     #[serde(rename = "inner_policy_denies", default)]
     pub inner_policy_denies: u64,
+    #[serde(rename = "inner_forward_drops", default)]
+    pub inner_forward_drops: u64,
     #[serde(rename = "inner_policy_unadjudicated", default)]
     pub inner_policy_unadjudicated: u64,
     // --- #1888 S5 timers ---
