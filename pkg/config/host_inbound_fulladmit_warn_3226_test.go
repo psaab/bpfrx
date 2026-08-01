@@ -439,11 +439,19 @@ func TestHostInboundMatrixDocDoesNotAdviseTheRefutedRemedy(t *testing.T) {
 	}
 	lines := strings.Split(string(raw), "\n")
 
-	// Count the markers as well as locating them. Taking the LAST BEGIN (a
-	// bare `begin = i`) let someone widen the fence to wrap the entire
-	// document, at which point "the phrasing appears only inside the fence" is
-	// trivially true and this guard passes vacuously. Exactly one pair, and the
-	// FIRST begin, so the fence stays a bounded region.
+	// Two conditions do the work, and a third is belt.
+	//
+	// LOAD-BEARING: exactly one BEGIN/END pair (a second fence lets the refuted
+	// phrasing hide in whichever region this guard happens to bound), and a
+	// span of at most half the file (a fence wrapping the whole document makes
+	// "the phrasing appears only inside the fence" trivially true).
+	//
+	// NOT independently necessary, and an earlier version of this comment
+	// claimed otherwise: taking the FIRST begin rather than the last is
+	// redundant once exactly one begin is mandatory, since first and last are
+	// then the same line. It is kept because it makes the intent obvious and
+	// stays correct if the count check is ever relaxed — but it is not what
+	// closes the bypass.
 	begin, end, nBegin, nEnd := -1, -1, 0, 0
 	for i, l := range lines {
 		if strings.Contains(l, "REFUTED-REMEDY:BEGIN") {

@@ -18,7 +18,8 @@ import "testing"
 //     boundary proving `protocols all` does not over-admit.
 //
 // host_inbound_classify_3627_test.go covers ssh+ping+bgp and the
-// `system-services all` full-admit, but no case pairs `protocols all` with a
+// `system-services all` named-service union (`all` is NOT a full admit since
+// #3226 — only `any-service` is), but no case pairs `protocols all` with a
 // service to assert this non-over-admit boundary.
 //
 // FAIL-ON-REVERT: turning `protocols all` into a full admit (e.g. teaching
