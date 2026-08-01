@@ -1,3 +1,33 @@
+## 2026-08-01 — #6588 round 3b: drift guard on the isRedundancyGroupStatement list
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
+- **Action**: Round 3 introduced a HAND-WRITTEN token list
+  (isRedundancyGroupStatement) that redundancyGroupBody splits a packed instance
+  tail at. A token missing from that list is not a loud failure — the
+  statement's tokens append to whichever statement precedes it on the line, so
+  it silently does nothing. Same defect class as the bug, better camouflaged.
+  Checked the list against both sources of truth rather than re-reading it:
+  it equals compileChassis's switch arms EXACTLY (node, gratuitous-arp-count,
+  preempt, strict-vip-ownership, interface-monitor, ip-monitoring), and is a
+  strict SUPERSET of setSchema's redundancy-group children — setSchema is
+  missing `strict-vip-ownership`, which the compiler DOES handle. That schema
+  gap is pre-existing and unrelated (it costs config-mode completion for that
+  leaf, not compilation); reported, not fixed here.
+  Correct today is not the property worth having, so the list is no longer
+  trusted by inspection: TestRedundancyGroupStatementPredicateCoversCompiler_6588
+  parses compileChassis's OWN source (go/ast), extracts every `case "..."` of
+  the `switch child.Name()` dispatch, and requires the predicate to accept each.
+  Adding an arm without extending the predicate now fails with the token named.
+  The guard fails loudly if it cannot find the function or the switch, and has a
+  floor of 6 arms, so it cannot silently verify an empty set.
+- **Validation**: proved the guard FIRES in both drift directions, build+vet
+  CLEAN under each. (E1) drop "preempt" from the predicate -> RED naming
+  "preempt". (E2) add `case "hold-down-interval":` to compileChassis and forget
+  the predicate — the realistic drift — -> RED naming "hold-down-interval".
+  Restored: build+vet clean, `go test ./...` exit 0 across 59 packages, 86
+  passing 6588 subtests.
+- **File(s)**: `pkg/config/compiler_chassis_packed_monitor_6588_test.go`, `_Log.md`
+
 ## 2026-08-01 — #6588 round 3: the same drop ONE LEVEL UP (redundancy-group instance)
 
 - **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)

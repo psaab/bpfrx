@@ -2,6 +2,10 @@ package config
 
 import (
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -889,4 +893,104 @@ func TestChassisRedundancyGroupPackedBodyReachesGates_6588(t *testing.T) {
 			"        redundancy-group 1 node bogus priority 200;")),
 			"redundancy-group node")
 	})
+}
+
+// TestRedundancyGroupStatementPredicateCoversCompiler_6588 is a DRIFT GUARD on
+// the hand-written isRedundancyGroupStatement token list.
+//
+// redundancyGroupBody splits a packed instance tail at that list. A token
+// missing from it is not a loud failure: the statement's tokens are appended to
+// whichever statement precedes it on the line, so it silently does nothing —
+// the exact class of defect this whole issue is about, with better camouflage.
+// A list that merely LOOKS complete today also drifts the moment someone adds a
+// `case` to compileChassis without touching the predicate.
+//
+// So the set is not re-asserted by hand here. It is DERIVED from the compiler
+// itself: this parses compileChassis's own source, extracts every `case "..."`
+// of the switch that dispatches redundancy-group body statements, and requires
+// the predicate to accept each one. Adding an arm without extending the
+// predicate fails this test with the missing token named.
+//
+// If the parse cannot find the switch the test FAILS rather than silently
+// passing on an empty set — a guard that can quietly verify nothing is worse
+// than no guard.
+func TestRedundancyGroupStatementPredicateCoversCompiler_6588(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "compiler_system.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse compiler_system.go: %v", err)
+	}
+
+	var fn *ast.FuncDecl
+	for _, d := range file.Decls {
+		if f, ok := d.(*ast.FuncDecl); ok && f.Name.Name == "compileChassis" {
+			fn = f
+			break
+		}
+	}
+	if fn == nil {
+		t.Fatal("compileChassis not found in compiler_system.go — this guard cannot verify " +
+			"the statement list; fix the guard rather than deleting it")
+	}
+
+	// Find the switch whose tag is `child.Name()` — the redundancy-group body
+	// dispatch. Keyed on the tag rather than on position so reordering the
+	// function does not silently blind the guard.
+	var arms []string
+	ast.Inspect(fn, func(n ast.Node) bool {
+		sw, ok := n.(*ast.SwitchStmt)
+		if !ok || sw.Tag == nil {
+			return true
+		}
+		call, ok := sw.Tag.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "Name" {
+			return true
+		}
+		if ident, ok := sel.X.(*ast.Ident); !ok || ident.Name != "child" {
+			return true
+		}
+		for _, stmt := range sw.Body.List {
+			cc, ok := stmt.(*ast.CaseClause)
+			if !ok {
+				continue
+			}
+			for _, e := range cc.List {
+				lit, ok := e.(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					continue
+				}
+				v, err := strconv.Unquote(lit.Value)
+				if err != nil {
+					t.Fatalf("unquote case literal %s: %v", lit.Value, err)
+				}
+				arms = append(arms, v)
+			}
+		}
+		return false
+	})
+
+	if len(arms) == 0 {
+		t.Fatal("found no `case \"...\"` arms on compileChassis's `switch child.Name()` — " +
+			"the guard has lost track of the compiler and is verifying nothing; fix it")
+	}
+	// Sanity floor: the arms known at the time this guard was written. Guards
+	// against the Inspect above latching onto some other, smaller switch.
+	if len(arms) < 6 {
+		t.Fatalf("found only %d redundancy-group statement arms %v — expected at least the 6 "+
+			"known ones; the guard is probably reading the wrong switch", len(arms), arms)
+	}
+
+	for _, arm := range arms {
+		if !isRedundancyGroupStatement(arm) {
+			t.Errorf("compileChassis handles redundancy-group statement %q but "+
+				"isRedundancyGroupStatement does not list it — a packed instance line carrying "+
+				"it (`redundancy-group 1 ... %s ...;`) folds its tokens into the PRECEDING "+
+				"statement and silently does nothing. Add %q to isRedundancyGroupStatement.",
+				arm, arm, arm)
+		}
+	}
 }
