@@ -350,6 +350,58 @@ func TestLoginBareInstanceStillCompiles_6662(t *testing.T) {
 	}
 }
 
+// TestLoginPackedInsideAppliedGroupRejected_6662 pins that the gate sees a
+// packed body arriving through `apply-groups`.
+//
+// The gate walks TOP-LEVEL `system`, so its coverage depends on running AFTER
+// apply-groups expansion — which runPreWalkGates does. If it ever moved ahead of
+// expansion, a packed login body hidden in an applied group would compile empty
+// again with the top-level cases still green, and `groups` is exactly how a
+// migrated vSRX config carries shared login stanzas.
+//
+// The UNAPPLIED case is the false-positive half and must NOT reject: an
+// unapplied group is inert (the compiler ignores its body too), so rejecting it
+// would fail a config that does nothing.
+func TestLoginPackedInsideAppliedGroupRejected_6662(t *testing.T) {
+	const groupBody = `groups { g1 { system { login { user alice class ops; } } } }`
+	const classDef = `system { login { class ops { permissions view; } } }`
+
+	t.Run("applied group is rejected", func(t *testing.T) {
+		_, err := compileLogin6662(t, groupBody+"\napply-groups g1;\n"+classDef)
+		mustReject(t, err, gate6662Marker, "packed body inside an applied group")
+	})
+
+	t.Run("unapplied group is inert, not rejected", func(t *testing.T) {
+		cfg, err := compileLogin6662(t, groupBody+"\n"+classDef)
+		if err != nil {
+			t.Fatalf("an UNAPPLIED group must not be rejected — its body never compiles: %v", err)
+		}
+		if len(cfg.System.Login.Users) != 0 {
+			t.Fatalf("unapplied group contributed users %+v; the premise of not rejecting it is "+
+				"that it contributes nothing", cfg.System.Login.Users)
+		}
+	})
+
+	t.Run("nested body inside an applied group still compiles", func(t *testing.T) {
+		cfg, err := compileLogin6662(t,
+			`groups { g1 { system { login { user alice { class ops; } } } } }`+
+				"\napply-groups g1;\n"+classDef)
+		if err != nil {
+			t.Fatalf("the NESTED spelling inside an applied group must compile: %v", err)
+		}
+		if len(cfg.System.Login.Users) != 1 || cfg.System.Login.Users[0].Class != "ops" {
+			t.Fatalf("users = %+v, want alice with class ops", cfg.System.Login.Users)
+		}
+	})
+
+	t.Run("shadowing class inside an applied group is rejected", func(t *testing.T) {
+		_, err := compileLogin6662(t,
+			`groups { g1 { system { login { class super-user { permissions view; } } } } }`+
+				"\napply-groups g1;")
+		mustReject(t, err, gate6701ShadowMarker, "shadowing class inside an applied group")
+	})
+}
+
 // ---------------------------------------------------------------------------
 // The tolerant path WARNS rather than rejecting (#1960 no-brick).
 // ---------------------------------------------------------------------------

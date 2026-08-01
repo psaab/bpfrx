@@ -88,12 +88,32 @@ The decision, in order:
 | Caller | Class |
 |---|---|
 | resolved name matches a `system login user` with a class | **that class** |
-| resolved name matches a user configured with **no** class | `unauthorized` |
-| uid 0, no matching `system login user` | `super-user` (Junos root default) |
+| **non-root** account listed with **no** class | `unauthorized` |
 | uid 0 **with** an explicit `system login user root class <c>` | **`<c>`** — an explicit restriction is honoured |
+| uid 0 listed with **no** class | `super-user` — an omission is not an instruction; see below |
+| uid 0, no matching `system login user` | `super-user` (Junos root default) |
 | OS account absent from `system login` | `unauthorized` |
 | uid with no passwd entry (unidentifiable) | `unauthorized` |
 | no `system login` stanza at all | **unset** — legacy allow-everything |
+
+**Why uid 0 listed with no class is not denied, when a non-root account in the
+same shape is.** The two are different questions. For a non-root account
+`system login` is the authority on what it may do, and saying nothing is not
+permission. For uid 0 it is neither an instruction nor enforceable:
+`set system login user root authentication ssh-ed25519 "…"` is an ordinary way
+to give root a key and expresses no intent to restrict anything, so denying on
+it would demote the **console** shell to `unauthorized` — a lockout of the
+lifeline caused by a purely additive config. And uid 0 owns the config database,
+the daemon process and the on-disk secrets, so a CLI denial is advisory
+regardless. An **explicit** class on `user root` is a different matter and is
+honoured.
+
+**uid 0 restriction is advisory.** Honouring `system login user root class <c>`
+prevents accidents; it is not a containment boundary, because uid 0 can edit the
+config database directly. If uid 0 resolves through a passwd **alias** (a second
+passwd row for uid 0, the classic `toor`), the resolved name is consulted first
+and the literal `root` second, so an explicit restriction written for `root`
+still applies to the aliased identity rather than being silently skipped.
 
 `unauthorized` is used rather than an unset class deliberately. The empty
 string is the legacy no-RBAC mode: `checkPermission` returns `nil` (allow
@@ -102,6 +122,15 @@ communities and authentication-keys in cleartext). Failing closed therefore has
 to **name** a class. `unauthorized` resolves to an empty-but-present permission
 set, so `checkPermission` denies every command by name and `showConfigRedacted`
 masks secrets.
+
+That safety depends on one property in a different function: `resolveClassPerms`
+consults the system-defined table **first**. A config carrying
+`system login class unauthorized { permissions all; }` would otherwise turn the
+fail-closed default into a full-power one for every unidentifiable caller. Such
+a definition is rejected at commit (see built-in shadowing below), but the
+tolerant load / peer-sync path only warns, so the runtime precedence is what
+actually holds — pinned by
+`TestUnauthorizedClassCannotBeWidened_6701`.
 
 The uid-0 default is Junos parity and is the console lifeline: uid 0 already
 owns the config database, the daemon process and the on-disk secrets, so it is

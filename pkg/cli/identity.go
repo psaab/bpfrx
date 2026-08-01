@@ -66,32 +66,38 @@ const ClassRootDefault = "super-user"
 //
 // Order of decision:
 //
-//  1. resolved name matches a `system login user` with a NON-EMPTY class -> that class;
-//  2. resolved name matches a user with an EMPTY class -> ClassUnidentified.
-//     RBAC is configured and this account is listed but says nothing about what
-//     it may do; falling through to the empty-string legacy mode would grant it
+//  1. an EXPLICIT class on a matching `system login user` always wins, for any
+//     uid including 0. An explicit class is an instruction, and honouring it can
+//     only narrow privilege.
+//  2. uid 0 otherwise gets ClassRootDefault — whether root is absent from
+//     `system login` or is LISTED WITH NO CLASS. See rootOmittedClass below for
+//     why the omission case must not fail closed.
+//  3. a non-root account listed with an EMPTY class -> ClassUnidentified. RBAC
+//     is configured and this account is listed but says nothing about what it
+//     may do; falling through to the empty-string legacy mode would grant it
 //     everything. (Pre-#6662 a packed `user alice class ops;` compiled exactly
-//     this shape from a config that READS as restrictive.)
-//  3. uid 0 with no match -> ClassRootDefault;
+//     this shape from a config that READS as restrictive, which is how the two
+//     defects compounded.)
 //  4. anything else — unresolvable identity, or an OS account absent from
 //     `system login` -> ClassUnidentified.
 func ResolveLoginClass(login *config.LoginConfig, id osident.Identity) (string, string) {
-	if login != nil && id.Resolved() {
-		for _, u := range login.Users {
-			if u == nil || u.Name != id.Name {
-				continue
-			}
-			if u.Class == "" {
-				return ClassUnidentified, fmt.Sprintf(
-					"login user %q is configured with no class; refusing to fall back to the "+
-						"unrestricted legacy mode", id.Name)
-			}
-			return u.Class, fmt.Sprintf("login user %q class %q", id.Name, u.Class)
-		}
+	class, listed := configuredClass(login, id)
+	if class != "" {
+		return class, fmt.Sprintf("login user %q class %q", configuredName(login, id), class)
 	}
 	if id.IsRoot() {
+		if listed {
+			return ClassRootDefault, fmt.Sprintf(
+				"uid 0 (%s) is listed under `system login` with no class; applying the root "+
+					"default rather than locking the console out on an omission", id)
+		}
 		return ClassRootDefault, fmt.Sprintf(
 			"uid 0 (%s) is not configured under `system login`; applying the root default", id)
+	}
+	if listed {
+		return ClassUnidentified, fmt.Sprintf(
+			"login user %q is configured with no class; refusing to fall back to the "+
+				"unrestricted legacy mode", id.Name)
 	}
 	if !id.Resolved() {
 		return ClassUnidentified, fmt.Sprintf(
@@ -99,4 +105,91 @@ func ResolveLoginClass(login *config.LoginConfig, id osident.Identity) (string, 
 	}
 	return ClassUnidentified, fmt.Sprintf(
 		"OS account %q (uid %d) is not configured under `system login`", id.Name, id.UID)
+}
+
+// rootOmittedClass documents why uid 0 listed with NO class gets the root
+// default rather than the fail-closed class, when a non-root account in the
+// same shape is denied.
+//
+// The two are genuinely different questions. For a non-root account, `system
+// login` is the authority on what that account may do, and saying nothing is
+// not permission — denying is the only safe reading. For uid 0 it is neither
+// safe nor meaningful:
+//
+//   - it is not an instruction. `set system login user root authentication
+//     ssh-ed25519 "..."` is an ordinary way to give root a key, and it leaves
+//     the class empty without expressing any intent to restrict anything. The
+//     first draft of this function denied on it, which demoted the CONSOLE root
+//     shell to `unauthorized` — a lockout of the lifeline, triggered by a
+//     config that reads as purely additive. That is over-reach: a gate that
+//     rejects valid configuration is its own outage.
+//   - it is not enforceable. uid 0 owns the config database, the daemon process
+//     and the on-disk secrets. A CLI-level denial is advisory at best.
+//
+// An EXPLICIT `system login user root class <c>` is a different matter and is
+// still honoured (decision 1) — that IS an instruction, and a configured
+// restriction silently ignored is the defect this whole change exists to
+// remove. It remains advisory for the reason above; docs/system-login.md says
+// so rather than implying uid 0 is contained.
+const rootOmittedClass = "see ResolveLoginClass decision 2"
+
+// configuredClass looks up id in the `system login user` list and returns its
+// class plus whether the account was LISTED AT ALL. The two are distinct: a
+// listed account with an empty class is a different state from an absent one,
+// and they resolve differently for uid 0.
+//
+// For uid 0 the literal name "root" is consulted as well as the passwd-resolved
+// name. A box may alias uid 0 to another entry (the classic `toor`), and
+// os/user.LookupId returns whichever passwd row comes first — so an operator's
+// explicit `system login user root class <c>` would otherwise be silently
+// skipped on exactly the identity it names. The resolved name is tried first so
+// a stanza written for the alias still wins where both exist.
+func configuredClass(login *config.LoginConfig, id osident.Identity) (string, bool) {
+	if login == nil {
+		return "", false
+	}
+	var listed bool
+	for _, name := range candidateNames(id) {
+		for _, u := range login.Users {
+			if u == nil || u.Name != name {
+				continue
+			}
+			listed = true
+			if u.Class != "" {
+				return u.Class, true
+			}
+		}
+	}
+	return "", listed
+}
+
+// configuredName reports which candidate name actually carried the class, for
+// the log line — so an operator whose uid 0 resolved through a passwd alias can
+// see WHICH stanza governed the decision.
+func configuredName(login *config.LoginConfig, id osident.Identity) string {
+	if login == nil {
+		return id.Name
+	}
+	for _, name := range candidateNames(id) {
+		for _, u := range login.Users {
+			if u != nil && u.Name == name && u.Class != "" {
+				return name
+			}
+		}
+	}
+	return id.Name
+}
+
+// candidateNames is the ordered set of `system login user` names that may
+// govern id: its passwd-resolved name, plus the literal "root" for uid 0.
+// An unresolved identity contributes no name of its own.
+func candidateNames(id osident.Identity) []string {
+	var names []string
+	if id.Resolved() {
+		names = append(names, id.Name)
+	}
+	if id.IsRoot() && id.Name != "root" {
+		names = append(names, "root")
+	}
+	return names
 }

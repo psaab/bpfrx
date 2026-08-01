@@ -102,6 +102,75 @@ func TestResolveLoginClass_6701(t *testing.T) {
 			reasonHas: "applying the root default",
 		},
 		{
+			// OVER-REACH GUARD. `set system login user root authentication
+			// ssh-ed25519 "..."` is an ordinary additive stanza that leaves the
+			// class empty and expresses no intent to restrict. The first draft
+			// applied the non-root empty-class rule here and demoted the CONSOLE
+			// root shell to `unauthorized` — a lockout of the lifeline caused by
+			// a config that reads as purely additive.
+			name:      "uid 0 LISTED WITH NO CLASS is not locked out of the console",
+			login:     loginCfg([2]string{"root", ""}),
+			id:        osident.Identity{UID: 0, Name: "root"},
+			wantClass: ClassRootDefault,
+			reasonHas: "listed under `system login` with no class",
+		},
+		{
+			// The uid-0 passwd ALIAS (`toor` and friends). os/user.LookupId
+			// returns whichever passwd row comes first, so without consulting
+			// the literal "root" an explicit restriction on the account the
+			// operator named would be silently skipped — a permissive-direction
+			// miss, which is this change's whole thesis.
+			name:      "uid 0 resolving under a passwd alias still honours `user root`",
+			login:     loginCfg([2]string{"root", "read-only"}),
+			id:        osident.Identity{UID: 0, Name: "toor"},
+			wantClass: "read-only",
+			reasonHas: `login user "root" class "read-only"`,
+		},
+		{
+			// The alias lookup must not OVERRIDE a stanza written for the
+			// resolved name: the resolved name is tried first.
+			name: "a stanza for the resolved alias wins over the `root` fallback",
+			login: loginCfg(
+				[2]string{"root", "operator"},
+				[2]string{"toor", "read-only"},
+			),
+			id:        osident.Identity{UID: 0, Name: "toor"},
+			wantClass: "read-only",
+		},
+		{
+			// A non-root account listed with no class still fails closed — the
+			// uid-0 carve-out above must not widen into the general rule.
+			name:       "a NON-root account listed with no class still fails closed",
+			login:      loginCfg([2]string{"root", ""}, [2]string{"dave", ""}),
+			id:         osident.Identity{UID: 1002, Name: "dave"},
+			wantClass:  ClassUnidentified,
+			reasonHas:  "configured with no class",
+			wantNotSup: true,
+		},
+		{
+			// An unresolved identity contributes no name, so an empty-named
+			// config row must never match it.
+			name:       "an unresolved identity does not match an empty-named config user",
+			login:      &config.LoginConfig{Users: []*config.LoginUser{{Name: "", Class: "super-user"}}},
+			id:         osident.Identity{UID: 1000},
+			wantClass:  ClassUnidentified,
+			reasonHas:  "has no passwd entry",
+			wantNotSup: true,
+		},
+		{
+			name:      "a numeric-only account name is matched as a name, not a uid",
+			login:     loginCfg([2]string{"1000", "read-only"}),
+			id:        osident.Identity{UID: 1000, Name: "1000"},
+			wantClass: "read-only",
+		},
+		{
+			name:       "a numeric-only name absent from the config is not promoted",
+			login:      loginCfg([2]string{"alice", "read-only"}),
+			id:         osident.Identity{UID: 1000, Name: "1000"},
+			wantClass:  ClassUnidentified,
+			wantNotSup: true,
+		},
+		{
 			name:      "uid 0 with an EXPLICIT stanza is restricted by it",
 			login:     loginCfg([2]string{"root", "read-only"}),
 			id:        osident.Identity{UID: 0, Name: "root"},
@@ -209,6 +278,57 @@ func TestClassUnidentifiedIsDenyingNotLegacy_6701(t *testing.T) {
 	if !c.showConfigRedacted() {
 		t.Errorf("showConfigRedacted() = false under class %q — secrets would render in cleartext",
 			ClassUnidentified)
+	}
+}
+
+// TestUnauthorizedClassCannotBeWidened_6701 pins the COUPLING the whole
+// fail-closed default rests on, which is easy to miss because it lives in a
+// different function.
+//
+// ClassUnidentified is safe only because resolveClassPerms consults the
+// system-defined table FIRST. If that precedence were ever inverted — or if a
+// custom definition were allowed to win — then a config carrying
+//
+//	system login class unauthorized { permissions all; }
+//
+// would turn the fail-closed DEFAULT into a full-power one: every
+// unidentifiable caller, and every OS account absent from `system login`, would
+// land on PermAll. The strict commit gate rejects such a definition
+// (validateLoginClassShadowsBuiltinAST), but the tolerant load / peer-sync path
+// only WARNS (#1960), so a persisted or peer-synced config can still carry it
+// at runtime. This asserts the runtime holds regardless, through the real gates
+// rather than by inspecting precedence.
+func TestUnauthorizedClassCannotBeWidened_6701(t *testing.T) {
+	// The compiled shape a leniently-loaded `class unauthorized { permissions
+	// all; }` produces: a custom class, mapped to PermAll.
+	cfg := &config.Config{}
+	cfg.System.Login = &config.LoginConfig{
+		Classes: []*config.LoginClass{{
+			Name:              ClassUnidentified,
+			Permissions:       []string{"all"},
+			MappedPermissions: []config.LoginClassPermission{config.PermAll},
+		}},
+	}
+
+	c := &CLI{userClass: ClassUnidentified, store: nil}
+	perms, ok := c.resolveClassPerms(ClassUnidentified)
+	if !ok {
+		t.Fatalf("resolveClassPerms(%q) did not resolve", ClassUnidentified)
+	}
+	if len(perms) != 0 {
+		t.Fatalf("resolveClassPerms(%q) = %v — a custom definition widened the fail-closed "+
+			"default; every unidentifiable caller now holds these permissions", ClassUnidentified, perms)
+	}
+	for _, p := range perms {
+		if p == config.PermAll {
+			t.Fatalf("the fail-closed default resolved to PermAll")
+		}
+	}
+	if err := c.checkPermission([]string{"request", "system", "reboot"}); err == nil {
+		t.Fatal("a widened `unauthorized` class authorized a destructive maintenance verb")
+	}
+	if !c.showConfigRedacted() {
+		t.Fatal("a widened `unauthorized` class read secrets in cleartext")
 	}
 }
 
