@@ -65608,6 +65608,71 @@ break — `go vet` confirmed passing under every revert.
   scripts/refactoring-audit.sh, Makefile, _Log.md
 
 - **Timestamp**: 2026-08-01
+- **Action**: "#5154 — make the HA session-import poison policy symmetric. The
+  #2170 generation guards in `upsert_synced_session` /
+  `delete_synced_session_gen` read `sessions.synced` with `.lock().ok()`, and
+  the #5674 admission bound read its length with
+  `.lock().map(..).unwrap_or(0)`. After a CONTAINED worker panic (#925
+  supervisor) poisoned that mutex, all three reads yielded 'nothing stored,
+  empty map', so every guard fell through — while the WRITE half
+  (`publish_shared_session` / `remove_shared_session`) commits through
+  `lock_shared_recover`, which `clear_poison()`s and mutates anyway.
+  Validation and mutation applied OPPOSITE poison policies, so a stale-
+  generation install regressed the stored generation, a stale delete removed
+  a NEWER live entry, and an over-ceiling import bypassed the aggregate bound
+  — a fail-OPEN on an ordering guard, reached by a path the system is designed
+  to survive. Fixed by RECOVERING the reads (the established #2402/#1807
+  module policy) rather than refusing the writes: `lock_shared_recover` clears
+  poison, so a refuse-on-poison write would fire nondeterministically
+  depending on which thread locked first, and would wedge HA session sync
+  after a panic the supervisor already contained. `upsert_synced_session` now
+  takes its stored-entry and length reads under ONE guard, which also closes a
+  real TOCTOU (they were separate locks, so the ceiling could be evaluated
+  against a map that had changed between them). Validation: 3 new tests
+  (stale install refused, stale delete refused, negative control that a
+  current-generation install/delete still applies across poisoning);
+  two-stage mutation proof — reverting ONLY the upsert read reds ONLY the
+  install test (`left: Some(1)` right `Some(2)`, the generation regressed),
+  reverting ONLY the delete read reds ONLY the delete test (`left: None`
+  right `Some(2)`, the live entry was removed), both with `cargo build
+  --release` clean (0 errors). Full `cargo test --release --bins --tests --
+  --test-threads=1` green (4354 passed / 0 failed). Filed #6641: the
+  `SHARED_SESSION_POISON_RECOVERIES` counter is still not exported as a
+  Prometheus metric, unlike its #1807 twin. HA cluster smoke required
+  (session-sync path) — scheduled by the team lead, not run here."
+- **File(s)**: userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/afxdp/ha_tests.rs, userspace-dp/src/afxdp/README.md,
+  _Log.md
+
+- **Timestamp**: 2026-08-01
+- **Action**: "#5154 review fold (PR #6643). (1) The #5674 ceiling read was
+  repaired but NOT test-bound — the pre-existing ceiling test
+  (`upsert_synced_session_rejects_over_ceiling_import_and_does_not_fan_out`)
+  runs on a HEALTHY mutex, so reverting the `synced_len` read alone left all
+  27 HA tests green and a future cleanup could have silently undone it. Added
+  `over_ceiling_import_rejected_on_poisoned_shared_mutex`: fills the shared
+  map to the entry cap, poisons the mutex, and asserts a new over-ceiling
+  forward is still refused, counted in `synced_import_cap_drops`, and NOT
+  fanned out to the worker queue. Mutation proof — reverting ONLY the length
+  read to `.lock().map(|s| s.len()).unwrap_or(0)`, ORDERED BEFORE the
+  recovering read, reds ONLY the new test as an assertion with the build
+  clean at 0 errors; the ordering is load-bearing because
+  `lock_shared_recover` calls `clear_poison()`, so a swallowing read placed
+  AFTER it observes a healthy mutex and the mutation is invisible. Under the
+  full origin/master form (all three reads swallowing) the new ceiling test
+  and the stale-install test both red. (2) Narrowed the afxdp README: the
+  #5154 subsection now states explicitly that it establishes the policy for
+  the three reads in `ha/session_import.rs` only, and tabulates the three
+  remaining non-recovering accessors verified firsthand —
+  `snapshot_shared_session_entries` `.unwrap_or_default()` (#6652), the
+  teardown + `SharedSessionOwnerRgIndexes::clear` `if let Ok(..)` skips
+  (#6653), and `snapshot_all_sessions_export` refusing on poison (#6654).
+  Also scoped the pre-existing #2402 paragraph's 'replaces all of them' to
+  the `shared_ops.rs` helpers it actually swept. Those three sites are
+  pre-existing and filed; NOT fixed here. Full `cargo test --release --
+  --test-threads=1` green (4355 passed / 0 failed). No cluster smoke run."
+- **File(s)**: userspace-dp/src/afxdp/ha_tests.rs,
+  userspace-dp/src/afxdp/README.md, _Log.md
 - **Action**: #5488 — bump the config-snapshot protocol version to 4 and gate a
   multi-zone scoped global policy fail-closed. #4626 gave a scoped global
   policy a zone-SET scope in the plural `match_from_zones`/`match_to_zones`
