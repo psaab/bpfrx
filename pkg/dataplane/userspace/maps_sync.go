@@ -1702,11 +1702,35 @@ func userspaceSkipsIngressInterface(iface InterfaceSnapshot) bool {
 		// an xfrmi for the egress direction, so it cannot own this interface
 		// end-to-end yet.
 		//
-		// Until it can, the xfrmi must stay out of every ifindex-keyed
-		// dataplane set this predicate gates — the ingress-adjudication map
-		// (buildUserspaceIngressIfindexes), the AF_XDP binding plan (mirrored
-		// in include_userspace_binding_interface, userspace-dp) and the RSS
-		// allowlist (UserspaceBoundLinuxInterfaces). Admitting it would make
+		// Until it can, the xfrmi must stay out of the ifindex-keyed
+		// dataplane sets THIS PREDICATE GATES — and only those: the
+		// ingress-adjudication map (buildUserspaceIngressIfindexes), the AF_XDP
+		// binding plan (mirrored in include_userspace_binding_interface,
+		// userspace-dp) and the RSS allowlist (UserspaceBoundLinuxInterfaces).
+		//
+		// SCOPE, stated because the narrower truth matters: this predicate does
+		// NOT make the xfrmi invisible to the dataplane generally. Once #5619
+		// made its ifindex resolve, the tunnel DOES enter the Rust
+		// forwarding-state maps that are gated on `ifindex > 0` rather than on
+		// this predicate — `populate_interfaces` and `populate_egress`
+		// (userspace-dp/src/afxdp/forwarding_build/interfaces.rs), hence
+		// `name_to_ifindex`, the zone map and the egress map. A static route
+		// `next-hop st0.0` therefore resolves to a real ifindex now where it
+		// resolved to 0 before (resolve_next_hop_target_v4, fib.rs, ends
+		// `.unwrap_or((0, 0))`).
+		//
+		// That was traced to a terminal outcome and it changes no disposition:
+		// an egress ifindex with no XSK binding is dropped by the TX dispatcher
+		// as `missing_egress_binding` (tx/dispatch/mod.rs), and ifindex 0 had no
+		// binding either — so LAN->tunnel transit dropped at the same site for
+		// the same reason before and after. What DID change is a strict
+		// improvement: the egress zone now resolves, so such a flow is
+		// adjudicated against the real zone pair instead of an unresolved one.
+		// Widening this exclusion to cover those maps would REMOVE that, and an
+		// interface absent from the zone maps resolves to zone_id 0, which a
+		// `from-zone any to-zone any permit` matches (#6682).
+		//
+		// Admitting it to the sets below would make
 		// the shim claim the xfrmi's ingress and steer it to an XSK that
 		// cannot come up on a virtual netdev (no ndo_bpf / ndo_xsk_wakeup, so
 		// no zero-copy), and drop_degraded_transit would then DROP the

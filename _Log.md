@@ -67,6 +67,53 @@
 - **File(s)**: pkg/config/compiler_ipsec_plaintext_warn.go,
   pkg/config/compiler_ipsec_plaintext_warn_5619_test.go,
   pkg/config/compiler_prewalk.go, _Log.md
+## 2026-08-01 — #5619 PR1 round 4: TX disposition traced; claim narrowed
+
+- **Timestamp**: 2026-08-01 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Traced the TX path to a terminal outcome before deciding whether
+  to widen the exclusion into populate_interfaces/populate_egress. Verdict: DO
+  NOT WIDEN — the current state introduces no new drop and is a strict
+  improvement, and widening would trade an already-existing drop for a possible
+  policy bypass.
+
+  The chain, verified in code rather than from doc comments:
+    - resolve_next_hop_target_v4 (forwarding_build/fib.rs) ends
+      `.unwrap_or((0, 0))`, so an interface-named next-hop that fails to resolve
+      keeps the route with ifindex 0.
+    - PRE-#5619 the xfrmi was absent from names/linux_names (populate_interfaces
+      gates on ifindex > 0 and its ifindex was 0), so `next-hop st0.0` resolved
+      to ifindex 0.
+    - resolve_tx_binding_ifindex (tx/dispatch/shared_recycle.rs) does
+      `egress.get(&ifindex) ... .unwrap_or(egress_ifindex)`, so target 0 stayed 0.
+    - A target ifindex with no XSK binding is dropped by the TX dispatcher:
+      `missing_egress_binding` + recycle_ingress_frame (tx/dispatch/mod.rs).
+      There is NO kernel fallback arm.
+    - POST-#5619 the ifindex resolves to the real xfrmi, which still has no
+      binding (deliberately) — so the frame drops at the SAME site for the SAME
+      reason. Only the ifindex named in the exception differs.
+
+  Net change is therefore a strict improvement: the egress zone now resolves, so
+  a LAN->tunnel flow is adjudicated against the real zone pair instead of an
+  unresolved one. Widening the exclusion would remove that, and an interface
+  absent from the zone maps resolves to zone_id 0, which a `from-zone any
+  to-zone any permit` matches with no zone guard (#6682) — trading a
+  pre-existing drop for a possible policy bypass.
+
+  Claim narrowed in both shipping artifacts (maps_sync.go exclusion comment and
+  userspace-dp/src/server/README.md): the predicate gates the ingress map, the
+  binding plan and the RSS allowlist — and ONLY those. The FIB/egress/zone maps
+  DO see the xfrmi, with the traced consequence stated and an explicit warning
+  not to "fix" it by widening.
+
+  Also completed the vacuity audit of earlier mutation rounds under the strict
+  run-detector: round 1 4/4 tests RAN, round 2 7/7 RAN, and the only vacuous run
+  was the transitional round-3 baseline (3 renamed-away tests) which was never
+  used as evidence. Rust rows were safe by construction — proven by feeding a
+  deliberately missing test name through the detector (cargo rc=0, "0 passed",
+  detector correctly reports NOTRUN).
+- **File(s)**: pkg/dataplane/userspace/maps_sync.go,
+  userspace-dp/src/server/README.md, _Log.md
+
 ## 2026-08-01 — #5619 PR1 round 3: bare `bind-interface st0` regression (MAJOR-1/2/3)
 
 - **Timestamp**: 2026-08-01 (fix/5619-ipsec-passthrough-zone-policy)
