@@ -371,7 +371,7 @@ func (d *Daemon) queueUserspaceSessionDeltas(
 				slog.Debug("userspace delta: queued V4", "src", delta.SrcIP, "dst", delta.DstIP, "ownerRG", delta.OwnerRGID)
 				queued++
 				if delta.FabricRedirect && !delta.FabricIngress {
-					if wireKey, wireVal, ok := userspaceForwardWireAliasFromDeltaV4(delta, zoneIDs); ok {
+					if wireKey, wireVal, ok := userspaceForwardWireAliasV4(key, val, delta); ok {
 						ss.QueueSessionV4(wireKey, wireVal)
 						queued++
 					}
@@ -384,7 +384,7 @@ func (d *Daemon) queueUserspaceSessionDeltas(
 				ss.QueueSessionV6(key, val)
 				queued++
 				if delta.FabricRedirect && !delta.FabricIngress {
-					if wireKey, wireVal, ok := userspaceForwardWireAliasFromDeltaV6(delta, zoneIDs); ok {
+					if wireKey, wireVal, ok := userspaceForwardWireAliasV6(key, val, delta); ok {
 						ss.QueueSessionV6(wireKey, wireVal)
 						queued++
 					}

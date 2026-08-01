@@ -65801,3 +65801,28 @@ break — `go vet` confirmed passing under every revert.
   accessor the PR orphaned has one caller and one definition again.
   Docs-and-wiring only: no runtime behaviour change.
 - **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 03:20
+- **Action**: #6198 — mint a real identity for the node-local BPF-ABI SessionID
+  on the HA-synced conversion path. The previous
+  `uint64(now)<<16 | uint64(delta.Slot&0xffff)` was not an identity: `delta.Slot`
+  is the AF_XDP BINDING slot (`BindingIdentity.slot`, a handful per node), the
+  binary event stream that carries the primary delta path never decodes it at
+  all (`decodeSessionEvent` leaves it 0), and `now` is CLOCK_MONOTONIC SECONDS —
+  so every session converted within one second collapsed onto ONE id (the
+  reported `&0xffff` slot aliasing is in fact unreachable; the real defect is
+  far wider). `nextUserspaceSyncedSessionID` replaces it with a monotonic
+  counter in a reserved `0xFFFF<<48` namespace, disjoint from the
+  worker-namespaced ids the Rust helper stamps into the same BPF conntrack
+  mirror field. `userspaceForwardWireAliasFromDelta{V4,V6}` become
+  `userspaceForwardWireAlias{V4,V6}` taking the already-converted base session,
+  so the fabric-redirect alias and its base still share one id instead of
+  minting two. The id stays deliberately node-local — the cross-node
+  correlatable id is the separate `RTFlowSessionID` (#5212). No wire-format
+  change (the field is already u64 on both sides) and no Rust change (the
+  helper never reads this field).
+- **File(s)**: pkg/daemon/daemon_ha_userspace_convert.go,
+  pkg/daemon/daemon_ha_userspace_stream.go, pkg/daemon/userspace_sync_test.go,
+  pkg/daemon/userspace_sync_session_id_6198_test.go, pkg/dataplane/types.go,
+  pkg/cluster/README.md, docs/session-sync-architecture.md,
+  docs/sync-protocol.md, _Log.md

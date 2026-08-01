@@ -378,7 +378,9 @@ never rejects on it. The path is: the Rust dataplane harvests the id onto
 `SessionDelta.session_id` and writes it as the trailing field of the
 `MSG_SESSION_OPEN` event-stream frame; the daemon decodes it into
 `SessionDeltaInfo.RTFlowSessionID` and stamps `SessionValue{,V6}.RTFlowSessionID`
-(distinct from the node-local BPF-ABI `SessionID`, which stays `now<<16|Slot`);
+(distinct from the node-local BPF-ABI `SessionID`, which since #6198 is minted
+per converted session by `nextUserspaceSyncedSessionID` — see "Node-Local
+BPF-ABI Session Id" below);
 `SessionSync` carries it as the trailing wire field; the peer daemon forwards it
 on `SessionSyncRequest.session_id`; and the peer helper's
 `upsert_synced_with_origin` ADOPTS it (stamping the imported `SessionEntry`)
@@ -387,6 +389,47 @@ falls back to `alloc_session_id()` — rolling-upgrade safe. Because the id is
 worker-namespaced, adopting the peer's id verbatim keeps it unique across the
 importing node's shared-nothing worker tables. The standby's SESSION_CLOSE
 RT_FLOW then correlates with the primary's SESSION_CREATE.
+
+### Node-Local BPF-ABI Session Id (#6198)
+
+`SessionValue{,V6}.SessionID` is the *other*, node-local id: the on-map BPF
+conntrack ABI field. It is NOT a lookup key — forwarding matches the 5-tuple
+`SessionKey` — and it is NOT carried to the peer helper (`buildSessionSyncRequest`
+forwards only `RTFlowSessionID`). Its blast radius is display and correlation:
+it rides the session wire, and on the receiving node `SetClusterSyncedSessionV4/V6`
+writes it into the BPF conntrack mirror, where `show security flow session`
+(`flowSessionDisplayID`), the REST session views, and the gRPC session RPCs
+surface it.
+
+Until #6198 the userspace converters synthesized it as
+`uint64(now)<<16 | uint64(delta.Slot&0xffff)`. Both halves were wrong:
+
+- `delta.Slot` is the AF_XDP **binding** slot (`BindingIdentity.slot`, one per
+  interface/queue — a handful per node), not a session-table slot. The `&0xffff`
+  mask was therefore unreachable in practice.
+- The binary event stream that carries the primary delta path never decodes
+  `Slot` at all (`decodeSessionEvent` leaves it `0`), so the low half was a
+  constant.
+- `now` is CLOCK_MONOTONIC **seconds**. Every session converted within one
+  second collapsed onto ONE id, conflating unrelated flows wherever the id is
+  displayed.
+
+`nextUserspaceSyncedSessionID` replaces it with a node-local monotonic counter in
+a reserved namespace: `0xFFFF << 48 | counter48`. The namespace keeps the
+control-plane-minted ids disjoint from the dataplane ids the helper stamps into
+the same mirror field (`(worker_id & 0xFFFF) << 48 | counter48`, worker ids being
+tiny queue indices), so the two writers can never alias. The counter never
+returns `0` — that is the established "unknown id" sentinel that makes
+`flowSessionDisplayID` fall back to the per-row ordinal.
+
+The fabric-redirect forward-wire alias entry (`userspaceForwardWireAliasV4/V6`)
+takes the ALREADY-CONVERTED base session rather than re-converting the delta, so
+the alias and its base — two conntrack keys for one logical session — share one
+id. Re-converting would mint a second.
+
+This id stays deliberately node-local; the cross-node correlatable id is the
+separate `RTFlowSessionID` above. Regression coverage:
+`TestUserspaceSyncedSessionID*6198` in `pkg/daemon`.
 
 ## Sync Readiness and Bulk Priming
 

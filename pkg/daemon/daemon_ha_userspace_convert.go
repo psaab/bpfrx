@@ -3,6 +3,7 @@ package daemon
 import (
 	"encoding/binary"
 	"net"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 
@@ -32,6 +33,57 @@ func daemonMonotonicSeconds() uint64 {
 	var ts unix.Timespec
 	_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
 	return uint64(ts.Sec)
+}
+
+// userspaceSyncedSessionIDNamespace reserves the high 16 bits of the node-local
+// BPF-ABI SessionID minted for an HA-synced session (#6198).
+//
+// The Rust dataplane's own stable id (`SessionTable::alloc_session_id`, #4915 —
+// carried across the cluster wire as the DISTINCT RTFlowSessionID, #5212) is
+// `(worker_id & 0xFFFF) << 48 | counter48`, where `worker_id` is a worker/queue
+// index (`set_worker_id`, userspace-dp/src/session/mod.rs). Reserving 0xFFFF for
+// the Go-minted ids keeps the two id spaces disjoint inside the shared BPF
+// conntrack mirror: the helper stamps its own id for sessions it owns, the
+// control plane stamps one of these for a peer-synced session it installs, and
+// neither can ever alias the other.
+const userspaceSyncedSessionIDNamespace = uint64(0xFFFF) << 48
+
+// userspaceSyncedSessionIDCounterMask is the low-48-bit counter space inside
+// that namespace — the same width the dataplane allocator uses.
+const userspaceSyncedSessionIDCounterMask = uint64(0x0000_FFFF_FFFF_FFFF)
+
+// userspaceSyncedSessionIDs is the node-local monotonic allocator behind
+// nextUserspaceSyncedSessionID.
+var userspaceSyncedSessionIDs atomic.Uint64
+
+// nextUserspaceSyncedSessionID mints the node-local BPF-ABI SessionID stamped on
+// a session converted from a userspace-helper delta (#6198).
+//
+// It replaces the previous `uint64(now)<<16 | uint64(delta.Slot&0xffff)`
+// composition, which was NOT an identity at all: `delta.Slot` is the AF_XDP
+// BINDING slot (`BindingIdentity.slot`, userspace-dp/src/afxdp/session_delta.rs
+// — one per interface/queue, a handful per node), and the binary event stream
+// that carries the primary delta path never decodes it at all
+// (`decodeSessionEvent` in pkg/dataplane/userspace/eventstream.go leaves it 0).
+// Every session converted within the same monotonic SECOND therefore collapsed
+// onto ONE id, conflating unrelated flows in `show security flow session` and in
+// the REST/gRPC session views. A monotonic counter gives every converted session
+// a distinct id for the lifetime of the daemon.
+//
+// The counter is masked to 48 bits and never returns 0 (`0` is the established
+// "no id / unknown" sentinel that makes `flowSessionDisplayID` fall back to the
+// per-row ordinal), so even the unreachable wrap case stays well-formed rather
+// than aliasing the namespace bits or emitting the sentinel.
+//
+// This id stays NODE-LOCAL by design: the cross-node correlatable id is the
+// separate RTFlowSessionID (#5212), which rides its own wire field and is
+// adopted verbatim by the peer helper. See docs/session-sync-architecture.md.
+func nextUserspaceSyncedSessionID() uint64 {
+	counter := userspaceSyncedSessionIDs.Add(1) & userspaceSyncedSessionIDCounterMask
+	if counter == 0 {
+		counter = 1
+	}
+	return userspaceSyncedSessionIDNamespace | counter
 }
 
 func userspaceSessionTimeout(proto uint8) uint32 {
@@ -183,8 +235,10 @@ func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	now := daemonMonotonicSeconds()
 	val := dataplane.SessionValue{
 		State: 4, // SESS_STATE_ESTABLISHED
-		// SessionID is the BPF-ABI conntrack id (node-local now<<16|Slot).
-		SessionID: uint64(now)<<16 | uint64(delta.Slot&0xffff),
+		// SessionID is the BPF-ABI conntrack id: node-local, and unique per
+		// converted session since #6198 (the previous now<<16|Slot composition
+		// collapsed every session converted in the same second onto one id).
+		SessionID: nextUserspaceSyncedSessionID(),
 		// #5212: the ORIGINATING node's stable RT_FLOW session id (distinct from
 		// SessionID above). Carried across the cluster sync wire so a peer-synced
 		// session adopts it and its SESSION_CREATE/CLOSE records correlate across
@@ -242,11 +296,15 @@ func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	return key, val, true
 }
 
-func userspaceForwardWireAliasFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map[string]uint16) (dataplane.SessionKey, dataplane.SessionValue, bool) {
-	key, val, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
-	if !ok {
-		return dataplane.SessionKey{}, dataplane.SessionValue{}, false
-	}
+// userspaceForwardWireAliasV4 derives the fabric-redirect forward-wire alias
+// entry from an ALREADY-CONVERTED base session.
+//
+// It takes the converted base rather than re-converting the delta because
+// nextUserspaceSyncedSessionID mints a FRESH id per conversion (#6198): a second
+// conversion of the same delta would split one logical session across two
+// SessionIDs, where the alias and its base entry must share one. It also drops a
+// redundant conversion from the delta path.
+func userspaceForwardWireAliasV4(key dataplane.SessionKey, val dataplane.SessionValue, delta dpuserspace.SessionDeltaInfo) (dataplane.SessionKey, dataplane.SessionValue, bool) {
 	wireKey := userspaceForwardWireKeyV4(key, delta)
 	if wireKey == key {
 		return dataplane.SessionKey{}, dataplane.SessionValue{}, false
@@ -284,8 +342,9 @@ func userspaceSessionFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	now := daemonMonotonicSeconds()
 	val := dataplane.SessionValueV6{
 		State: 4, // SESS_STATE_ESTABLISHED
-		// SessionID is the BPF-ABI conntrack id (node-local now<<16|Slot).
-		SessionID: uint64(now)<<16 | uint64(delta.Slot&0xffff),
+		// SessionID is the BPF-ABI conntrack id: node-local, and unique per
+		// converted session since #6198 (see the V4 converter).
+		SessionID: nextUserspaceSyncedSessionID(),
 		// #5212: the ORIGINATING node's stable RT_FLOW session id (see V4) —
 		// adopted by a peer-synced session so its RT_FLOW records correlate
 		// across HA nodes; 0 on a legacy helper => fresh local id on import.
@@ -355,11 +414,9 @@ func userspaceForwardWireKeyV6(key dataplane.SessionKeyV6, delta dpuserspace.Ses
 	return wire
 }
 
-func userspaceForwardWireAliasFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map[string]uint16) (dataplane.SessionKeyV6, dataplane.SessionValueV6, bool) {
-	key, val, ok := userspaceSessionFromDeltaV6(delta, zoneIDs)
-	if !ok {
-		return dataplane.SessionKeyV6{}, dataplane.SessionValueV6{}, false
-	}
+// userspaceForwardWireAliasV6 is the V6 twin of userspaceForwardWireAliasV4 —
+// same reason for taking the already-converted base (#6198).
+func userspaceForwardWireAliasV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, delta dpuserspace.SessionDeltaInfo) (dataplane.SessionKeyV6, dataplane.SessionValueV6, bool) {
 	wireKey := userspaceForwardWireKeyV6(key, delta)
 	if wireKey == key {
 		return dataplane.SessionKeyV6{}, dataplane.SessionValueV6{}, false

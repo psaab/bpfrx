@@ -114,8 +114,11 @@ type SessionValue struct {
 	// on the primary and closes on the peer after a failover then emits its
 	// SESSION_CREATE and SESSION_CLOSE records under ONE correlatable id across
 	// both nodes. Distinct from the BPF-ABI SessionID above (that is the Go
-	// dataplane's own conntrack id, now<<16|Slot in userspace mode — node-local
-	// by construction). Like Generation/ConfigEpoch this is userspace-sync-only
+	// dataplane's own conntrack id — node-local by construction; in userspace mode
+	// it is minted per converted session by nextUserspaceSyncedSessionID, #6198,
+	// replacing a now<<16|Slot composition that collapsed every session converted
+	// in one second onto a single id). Like Generation/ConfigEpoch this is
+	// userspace-sync-only
 	// HA metadata carried as a length-gated trailing field in the encode*Payload
 	// functions; it is NOT part of the BPF/C conntrack ABI and MUST NOT be added
 	// to it. 0 = "no id carried" (a legacy peer that omits the field, or a
@@ -221,8 +224,11 @@ type SessionValueV6 struct {
 	// on the primary and closes on the peer after a failover then emits its
 	// SESSION_CREATE and SESSION_CLOSE records under ONE correlatable id across
 	// both nodes. Distinct from the BPF-ABI SessionID above (that is the Go
-	// dataplane's own conntrack id, now<<16|Slot in userspace mode — node-local
-	// by construction). Like Generation/ConfigEpoch this is userspace-sync-only
+	// dataplane's own conntrack id — node-local by construction; in userspace mode
+	// it is minted per converted session by nextUserspaceSyncedSessionID, #6198,
+	// replacing a now<<16|Slot composition that collapsed every session converted
+	// in one second onto a single id). Like Generation/ConfigEpoch this is
+	// userspace-sync-only
 	// HA metadata carried as a length-gated trailing field in the encode*Payload
 	// functions; it is NOT part of the BPF/C conntrack ABI and MUST NOT be added
 	// to it. 0 = "no id carried" (a legacy peer that omits the field, or a
