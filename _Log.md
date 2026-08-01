@@ -66694,3 +66694,31 @@ break — `go vet` confirmed passing under every revert.
   mattered. Documentation only; no code change (`go build` rc=0, pkg/authz +
   pkg/api rc=0).
 - **File(s)**: pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 (round-6d, claim sweep)
+- **Action**: #5561 — three rounds of correcting the NAMED sentence had left
+  sibling sentences asserting the same thing elsewhere. Swept each CLAIM from
+  several angles instead of one phrase, and fixed every site. (A) "a local caller
+  never reaches the credential check" lived in THREE places — pkg/api/authz.go
+  principal(), pkg/api/README.md, docs/system-login.md — and is contradicted by
+  the netns bullet, since a same-host container does reach it. Replaced
+  everywhere with "a caller this host can PLACE never reaches the credential
+  check", plus the definition: placement is NAMESPACE-scoped and TIME-scoped, and
+  a caller this host cannot place is governed by the credential, which is what
+  #4047 makes it for. (B) "closes the window" appeared undirected in
+  pkg/api/authz.go principal(), README's row-4 paragraph, README's "Two changes
+  close it", and peer.go's no-row comment; all four now say WHICH direction (the
+  ADDED one) and that the reverse is unreachable by a scan. (C) the false
+  batching promise survived in TWO places, only one of which was named: peer.go's
+  hostAddrScanner doc AND socketscan.go, whose socket batcher has the identical
+  batch-before-read structure and therefore the identical imprecision — "N
+  connections arriving together cost ONE read" is the stronger claim the
+  discipline deliberately does not make. Both now state the real bound (elapsed
+  time over scan duration) with the measured numbers (60 -> 2, 120 -> 3). A
+  further angle-sweep caught a fourth shape nobody named: "the classification
+  over-denies; it never inverts" in peer.go and README read as a global claim
+  while being scoped to the loopback rule — now explicitly scoped, since two
+  residuals do grant. Documentation only. go build rc=0, go vet rc=0, go test
+  ./... rc=0 (60 ok, 0 FAIL), -race rc=0.
+- **File(s)**: pkg/authz/peer.go, pkg/authz/socketscan.go, pkg/api/authz.go,
+  pkg/api/README.md, docs/system-login.md, _Log.md

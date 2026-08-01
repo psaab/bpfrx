@@ -82,7 +82,9 @@ import (
 //
 // The rule still fails SAFE under all three, which is why it is the one we lean
 // on: each of them classifies a REMOTE caller as local, and a local caller with
-// no socket row is denied. The classification over-denies; it never inverts.
+// no socket row is denied. THAT RULE over-denies; it never inverts. (Scoped to
+// the loopback rule — it is not a claim about the classification as a whole, two
+// of whose residuals do grant; see pkg/api/README.md.)
 // (The cost is a real availability residual for a remote admin behind a
 // DNAT-to-loopback redirect — see pkg/api/README.md.)
 //
@@ -238,8 +240,8 @@ func resetLocalAddrCacheForTest() {
 // The batching argument is socketscan.go's, applied to the address table for
 // the same reason: the waiter set is taken under the same lock it was appended
 // under, and the enumeration begins after that swap — so no caller is ever
-// answered from an observation older than its own arrival, and N concurrent
-// callers cost ONE enumeration rather than N.
+// answered from an observation older than its own arrival. See now() for the
+// cost that buys and, precisely, the promise it does NOT make.
 type hostAddrScanner struct {
 	mu      sync.Mutex
 	waiters []chan hostAddrs
@@ -551,8 +553,10 @@ func LookupPeer(client, server net.Addr) PeerIdentity {
 	// credential row: a local caller that destroyed its own socket (an SO_LINGER-0
 	// reset) before the read, from an address added within the last TTL, is
 	// reported off-box. Such a caller cannot read a response, but the handler
-	// still runs, so the residual is real rather than cosmetic — it is closed one
-	// layer up by PeerCouldBeLocalNow, which the credential row consults.
+	// still runs, so the residual is real rather than cosmetic. PeerCouldBeLocalNow
+	// narrows it one layer up — it catches such a caller whenever the address is
+	// STILL on this host when the credential is adjudicated, and cannot when the
+	// address has since moved (see that function's "What FALSE means").
 	if couldBeLocal(ct, st) {
 		return PeerIdentity{Local: true, Detail: "local peer has no established socket"}
 	}

@@ -269,7 +269,15 @@ func (s *Server) activeConfig() *config.Config {
 //     api-auth credential exists to identify (#4047 requires one for any
 //     off-loopback bind).
 //
-// Rows 1-3 collapse to: a local caller never reaches s.credential.
+// Rows 1-3 collapse to: a caller this host CAN PLACE never reaches s.credential.
+//
+// "Can place", not "local" — the two differ and the difference is a residual,
+// not a quibble. Placement is namespace-scoped (a container on this box has its
+// own /proc/net/tcp and its own interface list, so it is local to the machine and
+// unplaceable by this daemon) and time-scoped (an address can arrive or leave
+// between the two observations). A caller this host cannot place IS governed by
+// the api-auth credential, which is what #4047 makes that credential for. See
+// pkg/api/README.md "Residuals".
 //
 // Row 4 carries one more obligation, because it is the only row that ADMITS on
 // the strength of a negative. The accept-time verdict "not on this host" is
@@ -278,8 +286,10 @@ func (s *Server) activeConfig() *config.Config {
 // host within the last second reaches row 4 while genuinely being local. The row
 // therefore re-derives locality from a fresh enumeration before honoring the
 // credential (peerIsLocalNow). That re-derivation can only move a caller from
-// row 4 to a denial — never the other way — so it closes the window without
-// widening anything.
+// row 4 to a denial — never the other way — so it narrows row 4 without widening
+// anything. It closes the direction that motivated it (an address ADDED since the
+// snapshot); it cannot close the reverse, because a scan cannot observe an address
+// that is already gone.
 func (s *Server) principal(r *http.Request) authz.Principal {
 	pending, ok := peerIdentityFrom(r.Context())
 	if !ok {

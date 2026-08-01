@@ -95,9 +95,13 @@ identity, so it is a real boundary rather than an advisory one:
   it explicitly with `set system login user <account> class <class>` if it needs
   access.
 - A local caller the server cannot identify is **denied**, and an `api-auth`
-  credential does not substitute for it. In fact **no local caller ever reaches
-  the credential check**: the credential speaks only for a caller that is not on
-  this host (the remote administrator #4047 requires it for). Otherwise a
+  credential does not substitute for it. In fact **no caller this host can PLACE
+  ever reaches the credential check**: the credential speaks only for a caller
+  this host cannot place (the remote administrator #4047 requires it for). Read
+  "can place" rather than "is local" — a process in a container on this same box
+  has its own socket table and interface list, so it is local to the machine yet
+  unplaceable by the daemon, and the credential governs it. That is the design,
+  not a gap in it; `pkg/api/README.md` "Residuals" states the bound. Otherwise a
   restricted account that also knew the shared secret could escape its class,
   either by making its own identity unreadable or simply by not being in the
   login model. That holds even for an address that appeared on this host a

@@ -309,17 +309,28 @@ one is the failure:
 | local, **NOT** attributable | **DENIED** |
 | not on this host | a credential may speak for it (remote administrator) |
 
-Rows 1-3 collapse to one sentence: **a local caller never reaches the credential
-check.** If a local account needs access it is given a class — that is the one
-place access is supposed to be written down.
+Rows 1-3 collapse to one sentence: **a caller this host can PLACE never reaches
+the credential check.** If such an account needs access it is given a class —
+that is the one place access is supposed to be written down.
+
+Read "can place", not "is local". The two are not the same, and the gap between
+them is where the residuals live: placement is **namespace-scoped** (a container
+on this box has its own `/proc/net/tcp` and its own interface list, so it is
+local to the machine and unplaceable by this daemon) and **time-scoped** (an
+address can arrive or leave between the two observations). A caller this host
+cannot place is governed by the `api-auth` credential — which is exactly what
+#4047 makes that credential for, not a leak in it. See
+[Residuals](#residuals).
 
 Row 4 is the only one that *admits* on the strength of a negative, so it carries
 one extra obligation: the "not on this host" verdict was drawn at accept from a
 **cached** interface-address snapshot, and the credential row **re-derives it
 from a fresh interface enumeration** (`authz.PeerCouldBeLocalNow`) before
 honoring the credential. That re-derivation can only move a caller from row 4
-into a denial, never the other way, so it closes the staleness window described
-under [residuals](#residuals) without widening anything. It runs **after** the
+into a denial, never the other way, so it narrows row 4 without widening
+anything. It closes the direction that motivated it — an address ADDED since the
+snapshot — and cannot close the reverse; see [Residuals](#residuals) for which
+direction is which. It runs **after** the
 credential is validated — a caller presenting none cannot drive a kernel
 enumeration.
 
@@ -352,7 +363,9 @@ arrive on a real interface — but it is a *conservative* rule, not a guarantee:
 `route_localnet=1`, `IP_TRANSPARENT` and DNAT-to-loopback each defeat that
 filtering. The rule still **fails safe** under all three, because each of them
 classifies a *remote* caller as local, and a local caller with no socket row is
-denied. The table over-denies; it never inverts. A routable delivery address
+denied. **That rule** over-denies; it never inverts — scoped to the loopback
+rule, not a claim about the classification as a whole, two of whose
+[residuals](#residuals) do grant. A routable delivery address
 falls back to "is the peer one of *our* addresses", sound positively and
 carrying the residuals below negatively.
 
@@ -461,7 +474,8 @@ a new hole.
   stale cache    : OK=false Local=false uid=0  "peer 10.166.99.1 is not on this host"
   ```
 
-  Two changes close it, and neither is the cache:
+  Two changes bound it, and neither is the cache. They close the ADDED
+  direction; residual #4 below is the reverse, which they cannot reach:
 
   1. **The socket table is read first.** `couldBeLocal` is consulted only where
      the table has nothing to say. A row hit proves locality from the kernel, so

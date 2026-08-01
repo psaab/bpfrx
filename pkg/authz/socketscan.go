@@ -43,8 +43,12 @@ import (
 // observation older than its own arrival. The caller still cannot influence when
 // the read happens, which is the whole point of resolving at accept.
 //
-// What changes is only the cost: N connections arriving together cost ONE read
-// instead of N.
+// What changes is the cost, stated precisely: connections that arrive before a
+// read STARTS share that read, and connections that arrive during it share the
+// read after it. So reads are bounded by elapsed time over read duration rather
+// than by connection count — NOT "N connections cost one read", which is the
+// stronger claim the batch-before-read discipline deliberately does not make.
+// Measured: 60 concurrent connections cost 2 reads, and 120 cost 3.
 
 // socketScans counts completed table reads. It exists so a test can assert the
 // COST property (N connections must not cost N reads) rather than merely that
