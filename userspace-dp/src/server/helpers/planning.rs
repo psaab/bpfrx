@@ -280,7 +280,44 @@ pub(crate) fn include_userspace_binding_interface(iface: &InterfaceSnapshot) -> 
     {
         return false;
     }
+    // #5619: an IPsec secure tunnel (st<N>) gets no AF_XDP binding.
+    //
+    // Route-based IPsec decrypts in the kernel XFRM stack and the plaintext
+    // is delivered on the xfrmi netdev; the dataplane has no path to hand a
+    // plaintext frame back INTO an xfrmi for the egress direction, so it
+    // cannot own the interface end-to-end. An xfrmi is also a virtual netdev
+    // with no `ndo_bpf`/`ndo_xsk_wakeup`, so an XSK cannot bind zero-copy
+    // there at all.
+    //
+    // This is the Rust half of a two-plane mirror: the Go control plane makes
+    // the SAME exclusion in `userspaceSkipsIngressInterface`
+    // (pkg/dataplane/userspace/maps_sync.go), which gates the ingress
+    // adjudication map and the RSS allowlist. Both planes must agree — the Go
+    // snapshot ships every interface regardless, so this predicate is an
+    // INDEPENDENT gate on the binding plan, not a restatement of the Go one.
+    // `binding_candidate_excludes_secure_tunnel` pins it.
+    if is_secure_tunnel_ifname(base) {
+        return false;
+    }
     !matches!(iface.zone.as_str(), "mgmt" | "control")
+}
+
+/// #5619: `st<N>` with a numeric N — the secure-tunnel base-name shape.
+///
+/// Mirrors `config.IsSecureTunnelIfName` (pkg/config/xfrmi.go). Lexical only:
+/// the Go side additionally bounds the index when deriving an XFRM if_id, but
+/// that stricter test decides device creation, not interface classification.
+///
+/// `parse::<i64>()` rather than an all-digits test is deliberate: the Go side
+/// classifies with `strconv.Atoi`, which also accepts a leading `+`/`-`. An
+/// all-digits test would diverge on `st-3` — unreachable as a real tunnel
+/// (XFRMIfNameAndID rejects a negative index), but a mirrored predicate that
+/// disagrees anywhere is the drift class this comment exists to prevent.
+pub(crate) fn is_secure_tunnel_ifname(base: &str) -> bool {
+    match base.strip_prefix("st") {
+        Some(rest) => rest.parse::<i64>().is_ok(),
+        None => false,
+    }
 }
 
 /// #3091: a VLAN-child interface (e.g. `reth0.80` → Linux netdev

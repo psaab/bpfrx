@@ -2383,3 +2383,114 @@ fn tx_latency_hist_binding_counters_snapshot_is_static_send() {
     fn require_static_send<T: 'static + Send>() {}
     require_static_send::<BindingCountersSnapshot>();
 }
+
+// ---------------------------------------------------------------------------
+// #5619: an IPsec secure tunnel (st<N>) gets no AF_XDP binding.
+// ---------------------------------------------------------------------------
+//
+// Route-based IPsec decrypts in the KERNEL XFRM stack, which delivers the
+// plaintext on the xfrmi netdev. The dataplane has no path to hand a plaintext
+// frame back INTO an xfrmi for the egress direction, and an xfrmi is a virtual
+// netdev with no `ndo_bpf`/`ndo_xsk_wakeup` so no XSK can bind zero-copy there.
+//
+// Before #5619 the xfrmi was kept out of the binding plan by ACCIDENT: the Go
+// snapshot resolved `st0.0` to the nonexistent netdev `st0`, so the unit
+// carried ifindex 0. #5619 fixed that name — which means this exclusion now has
+// to be stated deliberately, or a secure tunnel would be planned an XSK that
+// cannot come up and the shim would DROP the decrypted plaintext.
+
+/// The SAME classification table as the Go half
+/// (`secureTunnelIfNameCases`, pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go).
+/// Keep the two lists identical — a name added on one side only is exactly the
+/// two-plane drift this pair exists to catch.
+#[test]
+fn secure_tunnel_ifname_matches_go() {
+    use crate::server::helpers::is_secure_tunnel_ifname;
+
+    let cases: &[(&str, bool)] = &[
+        ("st0", true),
+        ("st1", true),
+        ("st9", true),
+        ("st10", true),
+        ("st0000", true),
+        // Go classifies with strconv.Atoi, which accepts a sign. Both planes
+        // must agree here even though XFRMIfNameAndID would refuse to build a
+        // device for them.
+        ("st-3", true),
+        ("st+5", true),
+        ("st", false),
+        ("stx", false),
+        ("st0x", false),
+        ("start0", false),
+        ("", false),
+        ("ge-0-0-0", false),
+        ("lo0", false),
+        ("fxp0", false),
+        ("em0", false),
+        ("fab0", false),
+        ("reth0", false),
+        ("gr-0-0-0", false),
+    ];
+    for (base, want) in cases {
+        assert_eq!(
+            is_secure_tunnel_ifname(base),
+            *want,
+            "is_secure_tunnel_ifname({base:?}) disagrees with the Go mirror \
+             config.IsSecureTunnelIfName — the two planes must classify every \
+             name identically (#5619)"
+        );
+    }
+}
+
+/// The real planner must produce NO binding for a secure tunnel, while still
+/// planning the ordinary data interface beside it.
+#[test]
+fn binding_candidate_excludes_secure_tunnel() {
+    use crate::server::helpers::replan_queues;
+
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "ge-0/0/1".to_string(),
+                linux_name: "ge-0-0-1".to_string(),
+                zone: "trust".to_string(),
+                ifindex: 11,
+                rx_queues: 2,
+                ..Default::default()
+            },
+            // The xfrmi as it appears AFTER the #5619 name fix: a real netdev
+            // name and a resolved ifindex. Pre-fix this row carried linux_name
+            // "st0" and ifindex 0, so it was excluded for the wrong reason —
+            // this row must be excluded on its own merits.
+            InterfaceSnapshot {
+                name: "st0.0".to_string(),
+                linux_name: "st0.0".to_string(),
+                zone: "vpn".to_string(),
+                ifindex: 42,
+                rx_queues: 1,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let bindings = replan_queues(Some(&snapshot), 2, &[]);
+    assert!(
+        !bindings.is_empty(),
+        "premise broken: the ordinary data interface must still be planned, \
+         otherwise this test would pass vacuously"
+    );
+    assert!(
+        bindings.iter().all(|b| b.interface != "st0.0"),
+        "the planner produced an AF_XDP binding for a secure tunnel (#5619). \
+         An XSK cannot come up on an xfrmi (virtual netdev, no ndo_bpf / \
+         ndo_xsk_wakeup), so the shim would claim the interface and \
+         drop_degraded_transit would DROP the decrypted plaintext — a dead \
+         tunnel, not a policy fix. Planned: {:?}",
+        bindings.iter().map(|b| &b.interface).collect::<Vec<_>>()
+    );
+    assert!(
+        bindings.iter().any(|b| b.interface == "ge-0-0-1"),
+        "the ordinary data interface must still be planned"
+    );
+}

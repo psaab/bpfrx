@@ -1678,6 +1678,38 @@ func userspaceSkipsIngressInterface(iface InterfaceSnapshot) bool {
 		return true
 	case base == "lo0":
 		return true
+	case config.IsSecureTunnelIfName(base):
+		// #5619: an IPsec secure tunnel (st<N>) is NOT adjudicated by the
+		// userspace dataplane, and this arm says so out loud.
+		//
+		// Route-based IPsec decrypts in the KERNEL XFRM stack, which delivers
+		// the plaintext on the xfrmi netdev (xfrmi_rcv_cb sets skb->dev, then
+		// xfrm_input -> gro_cells_receive -> __netif_receive_skb_core). The
+		// userspace dataplane has no path to hand a plaintext frame back INTO
+		// an xfrmi for the egress direction, so it cannot own this interface
+		// end-to-end yet.
+		//
+		// Until it can, the xfrmi must stay out of every ifindex-keyed
+		// dataplane set this predicate gates — the ingress-adjudication map
+		// (buildUserspaceIngressIfindexes), the AF_XDP binding plan (mirrored
+		// in include_userspace_binding_interface, userspace-dp) and the RSS
+		// allowlist (UserspaceBoundLinuxInterfaces). Admitting it would make
+		// the shim claim the xfrmi's ingress and steer it to an XSK that
+		// cannot come up on a virtual netdev (no ndo_bpf / ndo_xsk_wakeup, so
+		// no zero-copy), and drop_degraded_transit would then DROP the
+		// decrypted plaintext — turning today's policy gap into a dead tunnel.
+		//
+		// Before #5619 this exclusion happened by ACCIDENT: snapshotLinuxName
+		// resolved `st0.0` to the nonexistent netdev `st0`, so the unit
+		// carried ifindex 0 and fell out of these sets on the `Ifindex <= 0`
+		// guard. Fixing that name made the accident stop working, so the
+		// exclusion is stated deliberately here instead.
+		//
+		// The consequence is real and operator-visible: decrypted IPsec
+		// plaintext traverses Linux routing with NO xpf zone policy. That is
+		// #5619's open half. Deleting this arm without building the egress
+		// path re-opens the drop described above.
+		return true
 	}
 	switch iface.Zone {
 	case "mgmt", "control":

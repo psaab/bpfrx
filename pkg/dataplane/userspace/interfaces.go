@@ -426,6 +426,22 @@ func snapshotLinuxName(cfg *config.Config, ifName string, iface *config.Interfac
 		return config.LinuxIfName(ifName)
 	}
 	if unit != nil {
+		// #5619: a secure-tunnel unit's kernel device is the dotted ref
+		// VERBATIM — `st0.0` is created by the xfrmi reconciler as a netdev
+		// literally named `st0.0` (XFRMIfNameAndID returns
+		// LinuxIfName(bindInterface)). The unit-0 collapse below would yield
+		// `st0`, a name that exists on no box, so buildLinkSnapshot missed and
+		// the unit reported ifindex 0 / MTU 0 / no addresses.
+		//
+		// This mirrors the identical short-circuit in
+		// config.ResolveKernelIfName, whose doc comment already required this
+		// function to be kept in sync with it and which had the rule while
+		// this one did not. Placed FIRST, matching that function's ordering
+		// (the st rule takes precedence over the tunnel-name map there too).
+		// TestSecureTunnelResolverParity pins the two together.
+		if config.IsSecureTunnelIfName(ifName) {
+			return config.LinuxIfName(fmt.Sprintf("%s.%d", ifName, unit.Number))
+		}
 		if tunnelNames := cfg.TunnelNameMap(); len(tunnelNames) > 0 {
 			ref := fmt.Sprintf("%s.%d", ifName, unit.Number)
 			if linuxName, ok := tunnelNames[ref]; ok && linuxName != "" {

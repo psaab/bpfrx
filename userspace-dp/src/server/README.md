@@ -161,12 +161,42 @@ pair. The binding-candidate decision is a single shared invariant
 (`UserspaceBoundLinuxInterfaces` /
 `userspaceSkipsIngressInterface`) all filter through the same exclusion
 contract — `include_userspace_binding_interface` (zoned, non-tunnel,
-non-local-fabric, excluding `fxp*`/`em*`/`fab*`/`lo0` and `mgmt`/`control`
+non-local-fabric, excluding `fxp*`/`em*`/`fab*`/`lo0`, `st<N>` secure
+tunnels, and `mgmt`/`control`
 zones). The hash MUST cover exactly the interfaces the planner acts on, so
 a change to a non-candidate interface never spuriously bumps the plan key
 and a `ge-*`/`xe-*`/`et-*` netdev placed in a mgmt/control/tunnel/fabric
 context is never planned as an AF_XDP binding the rest of the system does
 not account for.
+
+### IPsec secure tunnels are excluded, deliberately (#5619)
+
+An `st<N>` secure tunnel gets **no** AF_XDP binding, and its ifindex stays
+out of the ingress-adjudication map and the RSS allowlist.
+
+Route-based IPsec decrypts in the **kernel** XFRM stack, which delivers the
+plaintext on the xfrmi netdev (`xfrmi_rcv_cb` sets `skb->dev`, then
+`xfrm_input` → `gro_cells_receive` → `__netif_receive_skb_core`). The
+dataplane has no path to hand a plaintext frame back *into* an xfrmi for the
+egress direction, and an xfrmi is a virtual netdev with no
+`ndo_bpf`/`ndo_xsk_wakeup` so an XSK cannot bind zero-copy there. Admitting it
+would make the shim claim the interface, find no usable binding, and
+`drop_degraded_transit` would DROP the decrypted plaintext — a dead tunnel.
+
+Before #5619 the exclusion happened by **accident**: the Go snapshot resolved
+`st0.0` to the nonexistent netdev `st0` (the unit-0 collapse), so the unit
+carried ifindex 0 and fell out of every ifindex-keyed set. #5619 fixed that
+name — `XFRMIfNameAndID` creates the device under the *verbatim* dotted ref —
+which is why the exclusion is now stated explicitly on both planes
+(`is_secure_tunnel_ifname` here, `config.IsSecureTunnelIfName` in Go) and
+pinned by `binding_candidate_excludes_secure_tunnel` +
+`secure_tunnel_ifname_matches_go`.
+
+The consequence is real and operator-visible: **decrypted IPsec plaintext
+traverses Linux routing with no xpf zone policy.** That is #5619's open half —
+closing it needs the dataplane to own the xfrmi end-to-end, including a
+plaintext egress path into the tunnel. Deleting either exclusion without
+building that path re-opens the drop above rather than fixing the gap.
 
 The same-plan fast path in `apply_snapshot` (`handlers/snapshot.rs`) relies
 on this coupling for correctness (#2916): when `snapshot_binding_plan_key` is

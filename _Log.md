@@ -1,3 +1,47 @@
+## 2026-08-01 — #5619 PR1: secure-tunnel netdev name drift + explicit dataplane exclusion
+
+- **Timestamp**: 2026-08-01 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: `snapshotLinuxName` resolved a secure-tunnel unit `st0.0` to the
+  netdev `st0` via the generic unit-0 collapse, but the xfrmi reconciler
+  creates the device under the VERBATIM dotted ref (`XFRMIfNameAndID` returns
+  `LinuxIfName(bindInterface)`), so the real netdev is `st0.0`. The dataplane
+  therefore looked up a name that exists on no box: the unit reported ifindex
+  0, MTU 0 and no addresses.
+
+  `Config.ResolveKernelIfName` already had the correct `st<N>.<M>`-verbatim
+  short-circuit AND a doc comment requiring `snapshotLinuxName` to be kept in
+  sync with it — nothing enforced that, and the dataplane copy silently lacked
+  the rule. Extracted the lexical test to `config.IsSecureTunnelIfName` so both
+  resolvers apply one predicate instead of a hand-copied third instance, and
+  added `TestSecureTunnelResolverParity` as the drift guard that was missing.
+
+  Fixing the name alone would have been a REGRESSION, not a fix. Measured
+  before writing it: with the ifindex resolving, the xfrmi enters
+  `userspace_ingress_ifaces` (`[11]` -> `[11 42]`), the AF_XDP binding plan and
+  the RSS allowlist. The shim would then claim the xfrmi's ingress and steer it
+  to an XSK that cannot come up on a virtual netdev (no `ndo_bpf` /
+  `ndo_xsk_wakeup`, so no zero-copy), and `drop_degraded_transit` would DROP
+  the decrypted plaintext — turning a policy gap into a dead tunnel. The
+  exclusion that previously happened by ACCIDENT (ifindex 0) is now stated
+  deliberately on both planes: `userspaceSkipsIngressInterface` (Go, gates the
+  ingress map + RSS allowlist) and `include_userspace_binding_interface`
+  (Rust, an INDEPENDENT gate on the binding plan — the Go snapshot ships every
+  interface regardless). Net forwarding behavior is identical before and after.
+
+  Scope: this does NOT close #5619. Decrypted IPsec plaintext still traverses
+  Linux routing with no xpf zone policy — the open half needs the dataplane to
+  own the xfrmi end-to-end including a plaintext egress path into the tunnel.
+  Both exclusion sites and the README say so explicitly so a future reader
+  cannot mistake the exclusion for a decision that the gap is acceptable.
+
+  Validation: Go `pkg/config` + `pkg/dataplane/userspace` suites green; Rust
+  build clean; 4-row mutation matrix with build gates on both toolchains.
+- **File(s)**: pkg/config/xfrmi.go, pkg/config/types.go,
+  pkg/dataplane/userspace/interfaces.go, pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go,
+  userspace-dp/src/server/helpers/planning.rs, userspace-dp/src/main_tests.rs,
+  userspace-dp/src/server/README.md, _Log.md
+
 ## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
 
 - **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)

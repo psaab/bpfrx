@@ -40,6 +40,37 @@ func XFRMIfNameAndID(bindIface string) (string, uint32) {
 	return LinuxIfName(bindIface), ifID
 }
 
+// IsSecureTunnelIfName reports whether an interface BASE name (no unit
+// suffix) is a secure-tunnel interface — `st<N>` with a numeric N.
+//
+// This is the shared lexical predicate behind the "kernel device name is the
+// dotted ref VERBATIM" rule. A secure tunnel is materialized by the xfrmi
+// reconciler (pkg/routing/xfrm.go) under exactly `LinuxIfName(bindInterface)`
+// — so `bind-interface st0.0` creates a netdev literally named `st0.0`, NOT
+// `st0`. Every resolver that maps a Junos ref to a kernel ifname must
+// therefore skip the usual unit-0 collapse for these interfaces
+// (`st0.0` -> `st0` is a name that exists on no box).
+//
+// Callers: ResolveKernelIfName (types.go) and snapshotLinuxName
+// (pkg/dataplane/userspace/interfaces.go). The two are pinned against each
+// other by TestSecureTunnelResolverParity — before #5619 the dataplane copy
+// silently lacked this rule, so a secure-tunnel unit resolved to a
+// nonexistent netdev, reported ifindex 0 / MTU 0 / no addresses, and fell out
+// of every ifindex-keyed dataplane set.
+//
+// Scope: this is the LEXICAL shape only. XFRMIfNameAndID additionally bounds
+// the st index (and the unit) to the range that yields a usable if_id; that
+// stricter test decides whether an XFRM device is actually created, and is
+// deliberately NOT folded in here so this predicate stays a pure name-shape
+// question with no behavior change for the resolvers that adopt it.
+func IsSecureTunnelIfName(base string) bool {
+	if !strings.HasPrefix(base, "st") || len(base) < 3 {
+		return false
+	}
+	_, err := strconv.Atoi(base[2:])
+	return err == nil
+}
+
 // ValidateSecureTunnelBindInterface reports whether a `security ipsec vpn
 // <name> bind-interface` value is a canonical secure-tunnel interface — the
 // only shape the route-based-VPN datapath can bind. The accepted lexical form

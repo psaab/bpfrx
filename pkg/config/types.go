@@ -182,10 +182,11 @@ func (c *Config) ResolveKernelIfName(ref string) string {
 	}
 
 	// XFRM (st<N>) is verbatim — kernel device is the full ref.
-	if strings.HasPrefix(base, "st") && len(base) >= 3 {
-		if _, err := strconv.Atoi(base[2:]); err == nil {
-			return LinuxIfName(ref)
-		}
+	// #5619: the lexical test lives in IsSecureTunnelIfName (xfrmi.go) so
+	// snapshotLinuxName can apply the IDENTICAL rule instead of a
+	// hand-copied third instance of it.
+	if IsSecureTunnelIfName(base) {
+		return LinuxIfName(ref)
 	}
 
 	// IRB.
