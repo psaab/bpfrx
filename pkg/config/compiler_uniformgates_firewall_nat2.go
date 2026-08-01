@@ -155,7 +155,11 @@ func runUniformGatesFirewallNAT2(tree *ConfigTree, cfg *Config, opts compileOpts
 	if err := validateStaticNATMatchAddressesStrict(cfg); err != nil {
 		if opts.lenientFirewallRefs {
 			cfg.Warnings = append(cfg.Warnings,
-				fmt.Sprintf("static NAT match destination-address list (downgraded to warning on tolerant path): %v", err))
+				fmt.Sprintf("static NAT `match destination-address` LIST FORM IS NOT SUPPORTED — "+
+					"only the FIRST prefix is honoured and the rest carry no translation; "+
+					"author one rule per external prefix (support for the list form is tracked "+
+					"in #6674). Downgraded to a warning on the tolerant load / peer-sync path "+
+					"so an already-persisted config still boots: %v", err))
 		} else {
 			return err
 		}

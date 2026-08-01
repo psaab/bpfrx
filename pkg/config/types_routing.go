@@ -154,7 +154,7 @@ type RoutingOptionsConfig struct {
 	// policy-statement). validateForwardingTableExportSingleStrict rejects a
 	// multi-valued list rather than letting it silently collapse. Honouring a
 	// full Junos export policy CHAIN is a separate renderer change, not this
-	// fix.
+	// fix (#6674).
 	ForwardingTableExports []string
 	AutonomousSystem          uint32 // autonomous-system <number>
 	RibGroups                 map[string]*RibGroup

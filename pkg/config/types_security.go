@@ -930,7 +930,7 @@ type StaticNATRule struct {
 	// validateStaticNATMatchAddressesStrict therefore REJECTS a multi-valued
 	// list at commit rather than letting it silently collapse to the first.
 	// Widening static NAT to fan one rule into N external prefixes is a
-	// separate semantic change (see the #6659 follow-up), not this fix.
+	// separate semantic change (see #6674), not this fix.
 	MatchAddresses []string
 	// SourceAddress is the FIRST configured `match source-address` value,
 	// retained for back-compat (e.g. "::/0" for NAT64). Prefer

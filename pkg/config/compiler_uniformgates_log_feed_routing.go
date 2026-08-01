@@ -148,7 +148,11 @@ func runUniformGatesLogFeedRouting(tree *ConfigTree, cfg *Config, opts compileOp
 	if err := validateForwardingTableExportSingleStrict(cfg); err != nil {
 		if opts.lenientRoutingExportRef {
 			cfg.Warnings = append(cfg.Warnings,
-				fmt.Sprintf("forwarding-table export chain (downgraded to warning on tolerant path): %v", err))
+				fmt.Sprintf("routing-options forwarding-table export LIST FORM IS NOT SUPPORTED — "+
+					"only the FIRST policy is honoured by the ECMP render and the rest have no "+
+					"effect on load-balancing; configure one export policy (support for the Junos "+
+					"export policy CHAIN is tracked in #6674). Downgraded to a warning on the "+
+					"tolerant load / peer-sync path so an already-persisted config still boots: %v", err))
 		} else {
 			return err
 		}

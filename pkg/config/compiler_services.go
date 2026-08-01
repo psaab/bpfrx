@@ -1757,6 +1757,14 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 // event-policy match node carries, across BOTH parser AST shapes (#6659 — the
 // event-options instance of the #2419 dual-shape class).
 //
+// NOTE for anyone auditing this class: the one-sidedness runs in BOTH
+// directions. This arm read Children and never Keys[1:], so its PACKED-LEAF
+// spelling compiled to nothing while the block spelling worked. Other arms have
+// the MIRROR bug — the CoS code-points collector reads Keys[1:] plus the inline
+// tail and never Children, so its hierarchical BLOCK spelling is the broken one.
+// Searching for "looks like a nodeVal call" finds only the first direction.
+// Check every leaf by compiling BOTH spellings and comparing.
+//
 // The UNIT here is a whole EXPRESSION (`<event>.<attribute> matches <value>`),
 // not a token, so firewallMatchValues is the WRONG reader: it would split one
 // constraint into three bogus ones. The two shapes:

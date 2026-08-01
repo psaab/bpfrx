@@ -15,6 +15,21 @@ import (
 // either widens what a rule matches, or escapes the commit gate that exists to
 // reject it — as opposed to the pure value-drops tracked separately on #6659.
 //
+// THE ONE-SIDEDNESS RUNS IN BOTH DIRECTIONS. This is the property that makes the
+// class recur, and it defeats the obvious fix strategy:
+//
+//   - some arms read Children and NEVER Keys[1:] — `attributes-match` and
+//     `then change-configuration commands` here, which is why their PACKED-LEAF
+//     spellings compiled to nothing while the block spellings worked;
+//   - other arms read Keys[1:] and NEVER Children — the CoS `code-points`
+//     collector (not in this PR) reads Keys plus the inline tail, so its
+//     hierarchical BLOCK spelling loses the entire classifier.
+//
+// Anyone fixing this class by pattern-matching "looks like a nodeVal call" finds
+// only the first direction and leaves the mirror image untouched. The check that
+// actually works is per-shape: compile BOTH the bracketed/packed spelling AND the
+// hierarchical block spelling and compare, which is what every test below does.
+//
 // Two distinct fail-open shapes appear below, do NOT conflate them:
 //
 //   - MATCH-WIDENING (attributes-match). Dropping the values makes the rule
@@ -382,6 +397,100 @@ security { nat { proxy-arp { interface ge-0/0/0 { address { 192.0.2.1; 192.0.2.2
 			}
 		})
 	}
+}
+
+// --- aliasing audit (carried forward from #6391) ----------------------------
+
+// TestMultiValueLeaf6659NoSharedBackingStore is the #6391 aliasing hazard applied
+// to every arm this PR touches.
+//
+// On #6391 a fan that stored ONE parsed *HostInboundTraffic under N map keys
+// aliased a single value across all of them, because mergeHostInbound returns
+// src unchanged when dst is nil — so a later in-place merge on one key surfaced
+// on the others. That hazard needs two ingredients: a shared STRUCT POINTER, and
+// a mutator that writes through it.
+//
+// None of the six accumulation targets here has either. Each is a []string
+// (EventPolicy.AttributesMatch / ThenCommands, TraceOptions.Flags,
+// ProxyARPEntry.Addresses, StaticNATRule.MatchAddresses,
+// RoutingOptionsConfig.ForwardingTableExports) filled by spread-appending a
+// FRESHLY RETURNED slice, so `append` copies the elements and the strings are
+// immutable; and the two scalars (Match, ForwardingTableExport) are string copies
+// of index 0, not slice aliases. That is a structural argument, so this test
+// pins the observable consequence instead of restating it: sibling instances that
+// each author their own values stay independent, with no value bleeding across.
+func TestMultiValueLeaf6659NoSharedBackingStore(t *testing.T) {
+	t.Run("two event policies stay independent", func(t *testing.T) {
+		cfg := mustCompile6659(t, hierTree6659(t, `
+event-options {
+    policy pA { events e1; attributes-match e1.test-owner matches Comcast; }
+    policy pB { events e2; attributes-match e2.test-name matches wan; }
+}`))
+		if len(cfg.EventOptions) != 2 {
+			t.Fatalf("expected 2 policies, got %d", len(cfg.EventOptions))
+		}
+		byName := map[string][]string{}
+		for _, p := range cfg.EventOptions {
+			byName[p.Name] = p.AttributesMatch
+		}
+		if want := []string{"e1.test-owner matches Comcast"}; !reflect.DeepEqual(byName["pA"], want) {
+			t.Fatalf("pA AttributesMatch = %q, want %q", byName["pA"], want)
+		}
+		if want := []string{"e2.test-name matches wan"}; !reflect.DeepEqual(byName["pB"], want) {
+			t.Fatalf("pB AttributesMatch = %q, want %q", byName["pB"], want)
+		}
+	})
+
+	t.Run("two proxy-arp interfaces stay independent", func(t *testing.T) {
+		cfg := mustCompile6659(t, setTree6659(t,
+			"set security nat proxy-arp interface ge-0/0/0 address [ 192.0.2.1 192.0.2.2 ]",
+			"set security nat proxy-arp interface ge-0/0/1 address [ 198.51.100.1 198.51.100.2 ]",
+		))
+		got := map[string][]string{}
+		for _, p := range cfg.Security.NAT.ProxyARP {
+			got[p.Interface] = p.Addresses
+		}
+		if want := []string{"192.0.2.1/32", "192.0.2.2/32"}; !reflect.DeepEqual(got["ge-0/0/0"], want) {
+			t.Fatalf("ge-0/0/0 = %q, want %q", got["ge-0/0/0"], want)
+		}
+		if want := []string{"198.51.100.1/32", "198.51.100.2/32"}; !reflect.DeepEqual(got["ge-0/0/1"], want) {
+			t.Fatalf("ge-0/0/1 = %q, want %q", got["ge-0/0/1"], want)
+		}
+		// Pointer independence of the backing arrays, the assertion that would
+		// have caught the #6391 shape on day one (value equality would not).
+		a, b := cfg.Security.NAT.ProxyARP[0].Addresses, cfg.Security.NAT.ProxyARP[1].Addresses
+		if len(a) > 0 && len(b) > 0 && &a[0] == &b[0] {
+			t.Fatal("two proxy-arp entries share the SAME Addresses backing array")
+		}
+	})
+
+	t.Run("two static NAT rules stay independent", func(t *testing.T) {
+		cfg := mustCompile6659(t, setTree6659(t,
+			"set security nat static rule-set rs1 from zone untrust",
+			"set security nat static rule-set rs1 rule r1 match destination-address 192.0.2.1/32",
+			"set security nat static rule-set rs1 rule r1 then static-nat prefix 10.0.0.1/32",
+			"set security nat static rule-set rs1 rule r2 match destination-address 192.0.2.9/32",
+			"set security nat static rule-set rs1 rule r2 then static-nat prefix 10.0.0.9/32",
+		))
+		rules := cfg.Security.NAT.Static[0].Rules
+		if len(rules) != 2 {
+			t.Fatalf("expected 2 rules, got %d", len(rules))
+		}
+		for _, tc := range []struct{ name, addr string }{{"r1", "192.0.2.1/32"}, {"r2", "192.0.2.9/32"}} {
+			for _, r := range rules {
+				if r.Name != tc.name {
+					continue
+				}
+				if r.Match != tc.addr || !reflect.DeepEqual(r.MatchAddresses, []string{tc.addr}) {
+					t.Fatalf("%s: Match=%q MatchAddresses=%q, want %q",
+						tc.name, r.Match, r.MatchAddresses, tc.addr)
+				}
+			}
+		}
+		if a, b := rules[0].MatchAddresses, rules[1].MatchAddresses; len(a) > 0 && len(b) > 0 && &a[0] == &b[0] {
+			t.Fatal("two static NAT rules share the SAME MatchAddresses backing array")
+		}
+	})
 }
 
 // TestProxyARPAddresses6659RangeStillExpands is the GREEN CONTROL that the list

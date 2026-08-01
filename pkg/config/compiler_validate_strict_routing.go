@@ -235,7 +235,7 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 // Rejecting makes that collapse loud and fails CLOSED. It is deliberately NOT a
 // renderer change: implementing a real policy chain means deciding how several
 // policies compose into one ecmpMaxPaths, which is a routing-semantics design
-// question rather than a multi-value-read fix. Tracked as the #6659 follow-up.
+// question rather than a multi-value-read fix. Tracked as #6674.
 //
 // Strict on commit / commit-check (hard reject); the call site downgrades to a
 // warning on the tolerant load / peer-sync path (#1960 no-brick), where
