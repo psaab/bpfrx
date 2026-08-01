@@ -65633,3 +65633,21 @@ break — `go vet` confirmed passing under every revert.
   pkg/cluster/heartbeat_auth_test.go,
   pkg/cluster/controllink_auth_status_4484_test.go, pkg/cluster/README.md,
   _Log.md
+
+- **Timestamp**: 2026-08-01 01:55
+- **Action**: #6642 review fold — correct the anti-replay ring's stated unit
+  (peer SESSION, not daemon incarnation) in both the code comments and the
+  cluster README, and give `heartbeatReceiver.peerAuthenticated()` a caller
+  again. Both findings were raised independently by the hostile Claude review
+  (MINOR-1, MINOR-2) and by Codex (finding 2), which converged on the doc
+  defect. A session id is minted per `heartbeatSender`, so a peer heartbeat
+  restart (VRF rebind, HA comms restart) mints one without a daemon boot: the
+  `heartbeatReplaySessions`+1 churn bound is 65 recorded SESSIONS, cheaper to
+  harvest than 65 daemon boots, and routine peer restarts now consume ring
+  slots permanently because the ring outlives a local restart. Neither is a
+  regression — pre-#5086 any local restart wiped the ring entirely, so this
+  worst case is a strict subset. `readLoop` now reaches the sticky flag through
+  `r.peerAuthenticated()` instead of `r.auth.peerAuthenticated()`, so the
+  accessor the PR orphaned has one caller and one definition again.
+  Docs-and-wiring only: no runtime behaviour change.
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/README.md, _Log.md

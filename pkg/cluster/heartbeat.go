@@ -509,7 +509,18 @@ func verifyHeartbeatMAC(data, authKey []byte) bool {
 // never-seen -> admitted) and cannot grow memory (fixed 64-slot array).
 //
 // 64 slots (64*16 = 1 KiB) bounds memory while forcing an attacker to have
-// captured 65+ distinct daemon incarnations before any replay is sustainable.
+// captured 65+ distinct peer SESSIONS before any replay is sustainable.
+//
+// The unit is a session id, not a daemon boot, and the two are not the same:
+// a session id is minted per heartbeatSender (see authSession below), so every
+// peer heartbeat RESTART — a DHCP-triggered VRF rebind, an HA comms restart —
+// mints a new one without the peer rebooting. Two consequences, both of which
+// only became relevant once #5086 made this ring outlive a local restart:
+// routine peer restarts now permanently consume slots, so the ring reaches
+// eviction pressure from legitimate traffic alone; and the attacker's capture
+// cost for the churn above is 65 sessions, which are cheaper to harvest than
+// 65 daemon boots. Neither is a regression — before #5086 any local restart
+// wiped the whole ring, so this worst case is a strict subset of that one.
 const heartbeatReplaySessions = 64
 
 // replaySessionMark is one remembered (session, high-water counter) pair.
@@ -723,9 +734,12 @@ type heartbeatSender struct {
 	sent       atomic.Uint64
 	sendErrors atomic.Uint64
 
-	// #4107 anti-replay: a random per-process session id plus a monotonic
+	// #4107 anti-replay: a random per-SENDER session id plus a monotonic
 	// per-session counter. A new sender (StartHeartbeat/RestartHeartbeat)
 	// re-seeds authSession so the receiver re-anchors after a restart/reboot.
+	// Per-sender, NOT per-process: a heartbeat restart mints a fresh session
+	// without a daemon boot, which is what makes heartbeatReplaySessions a
+	// bound on peer SESSIONS rather than on peer daemon incarnations.
 	authSession uint64
 	authCounter atomic.Uint64
 }
@@ -910,7 +924,7 @@ func (r *heartbeatReceiver) readLoop() {
 		session, counter, present := heartbeatAuthTrailer(buf[:n])
 		macOK := present && len(key) > 0 && verifyHeartbeatMAC(buf[:n], key)
 		nonceFresh := macOK && r.auth.admit(session, counter)
-		accept, reason := heartbeatAuthDecision(len(key) > 0, present, macOK, nonceFresh, r.auth.peerAuthenticated())
+		accept, reason := heartbeatAuthDecision(len(key) > 0, present, macOK, nonceFresh, r.peerAuthenticated())
 		if !accept {
 			r.recvErrors.Add(1)
 			slog.Warn("cluster: heartbeat auth rejected",
