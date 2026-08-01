@@ -1,10 +1,10 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v59 — r58 findings folded (Codex NEEDS-REVISION
-  4M/1m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m
-  — the acceptance residual enumeration, folded here; all
-  three confirm the §4.7 structure); pending convergence
-  review r59
+- **Status**: DRAFT v60 — r59 findings folded (Codex NEEDS-REVISION
+  5M/2m; AGY NEEDS-REVISION 1M — the QUEUED-overwrite, IS part
+  of Codex M4; Claude SMR PLAN-READY-WITH-NITS 0M/1m — the
+  additive-QUEUED pin, IS part of Codex M4; all three confirm
+  the §4.7 structure); pending convergence review r60
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -2636,6 +2636,61 @@
   (Codex m1): the rollback-fork legs and the stale-callback
   legs; and the acceptance copy's residual enumeration gains
   (iv)-(vi) plus the authority check (SMR m1).
+  v60: r59 convergence — the authority check verifies the
+  ACTUATED state, the callback fence is full-form with deep
+  outcome reporting, the QUEUED model gains its ordering and
+  retirement rules and its actual §5.1 placement (the third
+  honest-fold failure, owned), and residual (vi) is withdrawn
+  (Codex NEEDS-REVISION 5M/2m, folds 1 FOLDED / 3 PARTIAL /
+  1 NOT-FOLDED, structure confirmed; AGY NEEDS-REVISION 1M —
+  the QUEUED-overwrite, IS part of Codex M4; SMR
+  PLAN-READY-WITH-NITS 0M/1m — the additive-QUEUED pin, IS
+  part of Codex M4): (a) THE ACTUATED-STATE AUTHORITY CHECK
+  (Codex M1, verified: `runElection` publishes state before
+  the daemon consumes the event, the desired activity is
+  cluster-primary OR VRRP-master, so a demoted election state
+  can retain rg_active while VRRP is still MASTER, and a
+  SetRGActive failure leaves that live until a later retry,
+  `election.go:337-395`, `rg_state.go:250-263`,
+  `daemon_ha.go:340-371,809-848`; and the status combines
+  local and cached-peer snapshots from different instants,
+  `status.go:12-25`, `heartbeat_manager.go:306-355`): the
+  check requires exactly one node with RG0 ACTIVE AND VRRP
+  MASTER — the actuated state — and the term joins the final
+  post-reactivation predicate. (b) THE FULL-FORM FENCE + DEEP
+  OUTCOME REPORTING (Codex M2, verified: signal-driven
+  teardown begins BEFORE `runShutdownSequence` publishes
+  `stopping`, and the drain proceeds after its 5s timeout,
+  `daemon_run_shutdown.go:50-64,214-230`; and
+  `ensureFabricIPVLAN`'s failure suppression is multi-layer,
+  `daemon_ha_fabric.go:29-53,72-93,102-148`): the callback
+  checks `runCtx.Err()` OR `stopping` after acquiring applySem
+  AND again before each mutation; every operation's failure is
+  returned and aggregated (`errors.Join`), the existing-link
+  acceptance gains the KIND check, and any aggregated failure
+  retires the arm FAILED. (c) THE QUEUED MODEL — ACTUALLY
+  PLACED, WITH ORDERING AND RETIREMENT (Codex M4 + AGY M1 +
+  SMR m1 + Codex fold-3's honest-fold catch — the v59 QUEUED
+  fold landed only in the revision-history prose, the THIRD
+  such failure this loop, owned): the publication is
+  generation-tagged (a lower-generation publication never
+  overwrites a higher-generation state — A's trailing SUCCESS
+  cannot erase B's QUEUED), the queued state is a per-attempt
+  SET, a canceled acquisition retires its entry
+  (`daemon_apply_commit.go:172-175`), the queued-to-running
+  transition is atomic at admission, and the state lives in
+  the process-lifetime snapshot (`store.go:302-319`,
+  `daemon.go:1046-1054`) — placed in §5.1, the acceptance
+  copy, and §9 this time. (d) RESIDUAL (vi) WITHDRAWN (Codex
+  M5, verified the contradiction: an omitted cross-incarnation
+  arm's ignored completion was a possible false green): the
+  serialized supersession's re-registration is TOTAL — every
+  live manager debt re-registers under the new token — so no
+  live arm is ever omitted; the transaction is implemented,
+  not residual. (e) The §5.1 changed-file inventory gains
+  `daemon_apply_interfaces.go` + `daemon_ha_fabric.go` (Codex
+  m1), and the acceptance post-reactivation predicate gains
+  the no-pending + authority terms (Codex m2).
 
 ---
 
@@ -5331,7 +5386,22 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   post-restart verification requires the RG0 election SETTLED
   with EXACTLY ONE primary, matching the intended mastership
   (read on the cluster status surface) —
-  before the repair is declared done; and ONLY THEN the
+  before the repair is declared done — with the authority
+  check verifying the ACTUATED state, not merely the election
+  state (r59 Codex M1, verified: `runElection` publishes the
+  new state BEFORE the daemon consumes its event, the
+  userspace desired activity is cluster-primary OR
+  VRRP-master, so a demoted election state can retain
+  rg_active while VRRP is still MASTER, and a SetRGActive
+  failure leaves that live until a later retry,
+  `election.go:337-395`, `rg_state.go:250-263`,
+  `daemon_ha.go:340-371,809-848`; and the status combines
+  local and cached-peer snapshots from different instants,
+  `status.go:12-25`, `heartbeat_manager.go:306-355`): the
+  check requires exactly one node with RG0 ACTIVE AND VRRP
+  MASTER (the actuated state) — not merely the election
+  state — and the term joins the final post-reactivation
+  predicate as well; and ONLY THEN the
   operator RE-ACTIVATES `event-options` — ON BOTH NODES, each
   commit's own success required, EXACTLY mirroring the quiesce
   (r49 Codex M2, verified: with ConfigSync=false one commit
@@ -5387,11 +5457,15 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   Codex M2/M3) — each produces at worst a stale or rejected
   push, a digest divergence at the bracketing reads, re-drive
   recovery; and (vi) the exactly-once debt-transfer
-  transaction (r56 Codex M6) — a mis-registered or stranded
-  arm presents as a pending arm that never completes, holding
-  the predicate UNBLESSED (fail-closed, the safe direction);
-  the single-retoken transaction is a named precision
-  follow-up. THE NAMED FOLLOW-UP ISSUE (seeded at
+  transaction (r56 Codex M6) — WITHDRAWN as a residual (r59
+  Codex M5, verified the contradiction: a cross-incarnation
+  arm omitted from the current registration set is not
+  pending and its completion is ignored — a possible false
+  green): the serialized supersession's re-registration is
+  TOTAL — EVERY live manager debt re-registers under the new
+  token (the manager's debt ledger is complete because every
+  arm registers at launch) — so no live arm is ever omitted,
+  and the transaction is implemented, not residual. THE NAMED FOLLOW-UP ISSUE (seeded at
   implementation): the apply-level config-ACK wire message
   (the receiver ACKs acceptance, the sender's marker publishes
   only on the ACK) — hardening the #5863 safety net generally,
@@ -6414,7 +6488,31 @@ v20 history). The delivery is TWO units:
   preflight/promotion (a function-entry mint could supersede
   the currently-running apply while still WAITING on the
   semaphore — admission at `daemon_apply_commit.go:172-175,
-  528-531,332-335`, `daemon_apply.go:50-51,84-85`), with the
+  528-531,332-335`, `daemon_apply.go:50-51,84-85`), with an
+  apply attempt publishing QUEUED at ENQUEUE, BEFORE the
+  semaphore wait (r58 Codex M3 + r59 Codex fold-3's
+  honest-fold repair — the v59 fold landed only in the
+  revision-history prose, never here; the queued-waiter window
+  is real: a DHCP lease change precedes its `applyConfig`'s
+  semaphore wait and the reapply rebuilds the address-scoped
+  host-inbound enforcement, `daemon_dhcp.go:73-90,231-260`),
+  with the ORDERING AND RETIREMENT MODEL (r59 Codex M4 +
+  r59 AGY M1 + r59 SMR m1, all verified: a running attempt's
+  trailing SUCCESS can overwrite a higher-generation waiter's
+  QUEUED state; multiple waiters need additive reservations;
+  and a canceled acquisition returns directly,
+  `daemon_apply_commit.go:172-175`, which could leave QUEUED
+  false-red indefinitely): (i) every publication is tagged
+  with its attempt generation and a lower-generation
+  publication NEVER overwrites a higher-generation state (A's
+  SUCCESS cannot erase B's QUEUED); (ii) the queued state is
+  a per-attempt SET, not a scalar; (iii) a canceled
+  acquisition retires its queued entry (no indefinite
+  false-red); (iv) the queued-to-running transition is atomic
+  at admission; and (v) the queued state lives in the
+  process-lifetime snapshot (a restart constructs a fresh
+  Store, `store.go:302-319`, `daemon.go:1046-1054` — nothing
+  leaks across incarnations), with the
   outcome classified at the TERMINAL outer return (a compile
   error may still be retried by `commitWithGenBinding`,
   `daemon_apply_commit.go:102-125`), with the ROLLBACK fork's
@@ -6472,8 +6570,11 @@ v20 history). The delivery is TWO units:
   supersession ALL serialize through the manager's `m.mu`, so
   no registration can interleave between the debt snapshot
   and the supersession — the transaction is part of the plan,
-  and the residual (vi) stands only for the deeper
-  cross-incarnation precision follow-up; the signal reads CONVERGED
+  and the re-registration is TOTAL — every live manager debt
+  re-registers under the new token, so residual (vi) is
+  WITHDRAWN (r59 Codex M5: an omitted arm's ignored completion
+  was a possible false green; with total re-registration no
+  live arm is ever omitted); the signal reads CONVERGED
   only when the pipeline AND every arm's completion carry the
   CURRENT attempt token; and the state machine distinguishes
   CONVERGED / PENDING / FAILED — a PENDING arm does NOT
@@ -6635,6 +6736,14 @@ v20 history). The delivery is TWO units:
   canonical accessor in pkg/configstore, the injection in
   pkg/daemon, and pkg/grpcapi/pkg/cli stay CODE-untouched as
   relays (`server_show_cluster_text.go:66-74`).
+- `pkg/daemon/daemon_apply_interfaces.go` +
+  `pkg/daemon/daemon_ha_fabric.go` (r59 Codex m1's inventory
+  completion — the callback work necessarily modifies both):
+  the OnXSKBound closure's fire-time re-derivation under
+  applySem with the full-fence re-checks, and
+  `ensureFabricIPVLAN`'s failures becoming returned/aggregated
+  errors with the existing-link KIND check
+  (`daemon_ha_fabric.go:29-53,72-93,102-148`).
 - `pkg/dataplane/userspace` (r56 Codex M7's inventory
   completion): the attempt-token threading through the
   deferring calls (`apply.go:37-40,130-134` gain the
@@ -6669,16 +6778,26 @@ v20 history). The delivery is TWO units:
   outcome-truthful (r58 Codex M2, both halves verified: (a)
   shutdown can release applySem before the detached callback
   runs, `daemon_run_shutdown.go:50-64,214-230` — so the
-  callback re-checks the work-item-G `stopping` fence AFTER
-  acquiring applySem and abandons on it, never mutating live
-  state during teardown; (b) `ensureFabricIPVLAN` itself
-  ignores the parent-up failure, returns nil after void
-  address reconciliation, and only logs several
-  address/MTU/up failures, `daemon_ha_fabric.go:29-50,78-88,
-  115-147` — so the callback's fire-time work reports its
-  outcome INTO the arm's registration: a creation or
-  reconciliation failure retires the arm as FAILED, never as
-  converged).
+  callback re-checks the work-item-G fence — `runCtx.Err()`
+  OR `stopping`, the FULL form (r59 Codex M2a, verified:
+  signal-driven teardown begins BEFORE `runShutdownSequence`
+  publishes `stopping`, and the drain proceeds after its
+  five-second timeout, `daemon_run_shutdown.go:50-64,214-230`)
+  — AFTER acquiring applySem AND again BEFORE each mutation,
+  never mutating live state during teardown; (b) the callback's
+  outcome reporting is DEEP (r59 Codex M2b, verified:
+  `ensureFabricIPVLAN` ignores parent-up errors, logs
+  MTU/address errors, discards existing-child MTU/up errors,
+  calls a void reconciliation that suppresses list/delete/add
+  failures, and accepts any existing link type when
+  ParentIndex matches, `daemon_ha_fabric.go:29-53,72-93,
+  102-148`): every operation's failure is RETURNED and
+  aggregated (`errors.Join` over the parent-up, the link
+  creation, the address reconciliation, and the MTU/up
+  operations), the existing-link acceptance gains the KIND
+  check, and the callback retires the arm FAILED on any
+  aggregated failure — never converged on a partial or
+  wrong-kind reconciliation).
   The counter is
   independent of generation numbers and epoch resets
   (`sync_conn_gen.go:340-362`); exposed read-only on the cluster
@@ -8035,7 +8154,8 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      digest equality — r50 AGY m1 / r50 Codex fold-2: the
      pre-quiesce digest match AND the full persist-health
      aggregate AND ActiveApplied AND the apply-failure/
-     last-outcome terms on BOTH nodes) against
+     last-outcome terms AND the no-pending-outstanding term
+     (r59 Codex m2) AND the authority check on BOTH nodes) against
      the PRE-QUIESCE digest captured before (1a) — the
      two-digest discipline: post-restart verification against
      the fence-time digest, re-activation verification against

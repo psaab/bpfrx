@@ -179,6 +179,9 @@ reviewer (joins at /engineer on the code PR).
 | r58 | Codex | codex companion task-msab180x-ai3rrk (session 019fbd24-7763-74d0-9173-3bb499a5de2f) | NEEDS-REVISION (4 MAJOR, 1 MINOR; folds 2 PARTIAL / 2 NOT-FOLDED / 1 PARTIAL). Structure confirmed |
 | r58 | AGY | agy print-mode direct (agy-plan-r58.md) | PLAN-READY (5/5 folds FOLDED; 4 attacks FAILED; no findings). Structure confirmed |
 | r58 | Claude SMR | in-conversation (claude-smr-plan-r58.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — acceptance residual enumeration). Structure confirmed |
+| r59 | Codex | codex companion task-msac7cbq-0d4e5j (session 019fbd42-70bc-7b42-b263-19e4771e8954) | NEEDS-REVISION (5 MAJOR, 2 MINOR; folds 1 FOLDED / 3 PARTIAL / 1 NOT-FOLDED). Structure confirmed |
+| r59 | AGY | agy print-mode direct at 12m (agy-plan-r59.md) | NEEDS-REVISION (1 MAJOR — trailing SUCCESS overwrites waiter QUEUED, IS part of Codex M4). Structure confirmed |
+| r59 | Claude SMR | in-conversation (claude-smr-plan-r59.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — additive-QUEUED pin, IS part of Codex M4). Structure confirmed |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 
