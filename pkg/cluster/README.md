@@ -500,13 +500,32 @@ you delivered it. To actually avoid it, take config-sync out of the loop for
 the duration:
 
 ```
-delete chassis cluster configuration-synchronize   # on both nodes, commit
+delete chassis cluster configuration-synchronize   # see the caveats below
 <key both nodes out-of-band, per the rollout below>
-set chassis cluster configuration-synchronize      # restore, commit
+set chassis cluster configuration-synchronize      # ONLY once #6629 lands
 ```
 
-The restore commit re-synchronizes a config that both nodes already hold, so
-the key is no longer new information on the wire.
+**Two caveats, both load-bearing — read them before running the above.**
+
+*The restore does not restore safely.* An earlier version of this section
+claimed the restore commit was safe because it re-synchronises a config both
+nodes already hold, so the key is "no longer new information on the wire".
+That is wrong: the stream is authenticated but **not encrypted**, and a
+passive observer on the control segment reads the cleartext PSK off that
+re-sync regardless of whether the peers already know it. Confidentiality is
+not a function of who else already has the secret. Until #6629 gives that
+path either redaction or transport encryption, **the honest advice is to
+leave `configuration-synchronize` off on a keyed cluster** and manage config
+on both nodes out-of-band, accepting the operational cost. Restore it only
+when #6629 has landed.
+
+*The delete is not a single step.* `configuration-synchronize` is committed
+from the RG0 primary; the secondary is not independently writable, and
+promoting it to run its own commit triggers reconciliation of the newly
+authoritative node's config. So "delete on both nodes, commit" is a
+failover sequence, not two commands — plan it as a maintenance window with
+the same care as the rotation procedure below, or perform it before the
+cluster carries traffic.
 
 ### Rolling it onto a live unkeyed cluster
 

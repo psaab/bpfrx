@@ -205,7 +205,9 @@ editing cmdtree.
   required restart, rotation — is in `pkg/cluster/README.md` →
   "Operating the control-link PSK (#6611)". The stronger residuals —
   removing the ~1-window replay horizon (mTLS with per-node certs) and
-  HMAC-authenticating the session-sync stream (#4107 F23) — remain deferred
+  giving the session-sync stream CONFIDENTIALITY (#6629 — it is
+  HMAC-authenticated today, F23 having landed, but not encrypted, so a
+  config-sync push crosses it in cleartext) — remain deferred
   (see `pkg/cluster/README.md`).
   - **No allowlisted RPC may render a configured secret (#6532).** Being on
     this allowlist means being reachable from the peer chassis over the

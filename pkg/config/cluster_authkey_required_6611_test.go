@@ -138,7 +138,13 @@ func TestPlaceholderClusterAuthKeyWarns_6611(t *testing.T) {
 	}
 	var found string
 	for _, w := range cfg.Warnings {
-		if strings.Contains(w, "looks like a placeholder") {
+		// Match on the stable noun, not the phrasing: the wording changed
+		// when the advisory stopped naming the matched marker (that named a
+		// key exactly equal to it). See
+		// TestStrengthWarningNeverRendersTheKey_6611, which covers the
+		// key-EQUALS-marker case this test's own leak check below misses —
+		// it only exercises a key that CONTAINS one.
+		if strings.Contains(w, "placeholder") {
 			found = w
 			break
 		}
@@ -352,5 +358,52 @@ func TestShippedClusterConfigsUseOneKeyPerCluster_6611(t *testing.T) {
 					"— the PSK must be cluster-wide, not ${node}-scoped", rel)
 			}
 		})
+	}
+}
+
+// TestStrengthWarningNeverRendersTheKey_6611 pins the disclosure the advisory
+// itself produced. The warning used to name the placeholder marker it matched,
+// on the reasoning that a marker is a repository literal rather than operator
+// key material. That holds until the two coincide: a key of exactly
+// `change-me` makes the marker AND the key the same string, so the warning
+// printed the whole key into commit output and the log — the exact exposure it
+// exists to warn about.
+//
+// The keys below are deliberately EQUAL to, and SUBSTRINGS around, the
+// markers. A fix that only stopped naming the marker for long keys, or only on
+// one compile path, fails here.
+func TestStrengthWarningNeverRendersTheKey_6611(t *testing.T) {
+	for _, key := range []string{
+		"change-me",
+		"CHANGE-ME",
+		"example-only",
+		"xx-change-me-xx",
+		"Change-Me-Now-Really-Long-Enough-To-Pass-The-Length-Advice",
+	} {
+		tree := buildTree(t, []string{
+			"set chassis cluster cluster-id 1",
+			"set chassis cluster node 0",
+			"set chassis cluster reth-count 2",
+			"set chassis cluster authentication-key " + key,
+			"set chassis cluster redundancy-group 1 node 0 priority 200",
+		})
+		cfg, err := CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("key %q: compile: %v", key, err)
+		}
+		warnings := ClusterAuthKeyStrengthWarnings(cfg)
+		if len(warnings) == 0 {
+			t.Errorf("key %q produced no strength warning; a published "+
+				"placeholder must always warn", key)
+			continue
+		}
+		for _, w := range warnings {
+			if strings.Contains(w, key) {
+				t.Errorf("strength warning rendered the KEY %q verbatim: %s\n"+
+					"The advisory must report that a placeholder matched WITHOUT "+
+					"naming which, because when the key IS the marker the two are "+
+					"the same string.", key, w)
+			}
+		}
 	}
 }
