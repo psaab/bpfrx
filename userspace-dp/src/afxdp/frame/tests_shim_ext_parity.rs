@@ -319,8 +319,13 @@ fn shim_ipv6_ext_walk_matches_userspace_walker() {
     // MAX_IPV6_EXT_HEADERS - 1. The relation is therefore
     // `MAX_EXT_HDRS == MAX_IPV6_EXT_HEADERS - 1`, NOT numeric equality —
     // setting the shim to 8 would make it resolve chains this crate fails
-    // closed on. `shim_walk_exits_by_exhaustion` pins the exit semantics
-    // this reasoning rests on.
+    // closed on. What pins the exit semantics this reasoning rests on is the
+    // corpus in `shim_walk_and_userspace_walk_agree_over_a_corpus`, which walks
+    // chains of 0..=10 extension headers through BOTH walkers and compares
+    // verdicts — so the resolvable length is measured on each side rather than
+    // argued about either. (An earlier revision cited a source-text check named
+    // `shim_walk_exits_by_exhaustion`; that test was deleted when the walk
+    // became executable, and this sentence outlived it.)
     let userspace_max = userspace_max_resolvable_ext_headers();
     assert_eq!(
         facts.max_ext_hdrs, userspace_max,
