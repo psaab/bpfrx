@@ -1,9 +1,10 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v49 — r48 findings folded (Codex NEEDS-REVISION
-  5M/2m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m —
-  its re-activation nit IS part of Codex M3; all three confirm
-  the §4.7 structure); pending convergence review r49
+- **Status**: DRAFT v50 — r49 findings folded (Codex NEEDS-REVISION
+  3M/2m; AGY NEEDS-REVISION 1M; Claude SMR PLAN-READY-WITH-NITS
+  0M/2m — all three independently caught the restart-choreography
+  contradiction; all three confirm the §4.7 structure); pending
+  convergence review r50
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -2088,6 +2089,58 @@
   the stopped remediation is UNAVAILABLE while pulses continue
   (fail-closed); the operator fences the ingress source or
   uses the live removal path.
+  v50: r49 convergence — the apply-health state machine is
+  fully specified, the re-activation mirrors the quiesce, and
+  the restart choreography becomes election-aware (Codex
+  NEEDS-REVISION 3M/2m, folds 2 FOLDED / 4 PARTIAL, structure
+  confirmed; AGY NEEDS-REVISION 1M — the restart contradiction
+  plus the preemption sub-point, IS Codex M3, structure
+  confirmed; SMR PLAN-READY-WITH-NITS 0M/2m — the re-capture
+  scope IS Codex m2, the restart reconciliation IS Codex M3 /
+  AGY M1; all three reviewers independently caught the
+  restart-choreography contradiction): (a) THE APPLY-HEALTH
+  STATE MACHINE IS SPECIFIED (Codex M1, verified the v49 fold
+  referenced §5.1/§9 artifacts that were absent — an
+  honest-fold failure repaired here — and the false-green
+  in-flight window: a DHCP/feed reapply can be mid-flight with
+  ActiveApplied true and the count still zero,
+  `daemon_dhcp.go:73-90`, `daemon_feeds.go:26-42`,
+  `store.go:797-809`): the §5.1 pkg/daemon inventory now
+  carries the state — process-lifetime `applyFailureCount` +
+  `lastApplyOK`, initialized BEFORE the boot apply, written
+  centrally at the single full-apply entry with `lastApplyOK`
+  set FALSE AT ENTRY and TRUE only on a nil return
+  (`daemon_apply.go:49-86,141-355`) — and §9 gains BOTH legs:
+  the sticky-failure regression (a failed same-text reapply
+  keeps ActiveApplied true while the count moves) and the
+  parked-mid-apply regression (an in-flight apply reads
+  lastApplyOK == false from entry). (b) THE RE-ACTIVATION
+  MIRRORS THE QUIESCE (Codex M2, verified: with
+  ConfigSync=false one commit cannot update the peer,
+  `daemon_ha_sync.go:336-364`, and the Store promotes before
+  apply, `daemon_apply_commit.go:225-246`, so a reactivation
+  apply can abort before the engine's reconciliation,
+  `daemon_apply_tail.go:194-202`, leaving the digest restored
+  while automation stays empty): the re-activation is applied
+  ON BOTH NODES with each commit's own success required, and
+  is followed by the COMPLETE predicate again (not merely
+  digest equality). (c) THE CHOREOGRAPHY IS ELECTION-AWARE
+  (Codex M3 + AGY M1, both verified: restart order does NOT
+  hold authority — a higher-effective-priority peer preempts
+  after joining, `election.go:172-193`; the reconciliation is
+  authority-gated and stability-delayed,
+  `daemon_ha_sync.go:447-465`): restart the intended holder
+  first, start the peer, LET THE ELECTION SETTLE, read the
+  post-election RG0 state, and `load override` + `commit` the
+  intended text on WHICHEVER node holds authority — with sync
+  disabled no config flows and the re-convergence is per-node
+  (`daemon_ha_sync.go:336-370,461-465`); the precedence rule is
+  explicit: intended-holder-first GOVERNS, the plain repair
+  case (holder == local) IS the r39 local-first pin's case,
+  and the pin's protection is per-node (each node's `Load`
+  completes before its own comms). (d) The acceptance copy
+  gains the re-baseline termination branch (Codex m1). (e) The
+  re-capture rule covers BOTH baselines (Codex m2 = SMR m1).
 
 ---
 
@@ -4149,7 +4202,13 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   formerly unconfirmed configuration; the capture therefore
   FOLLOWS the window resolution, the automation quiesce, and
   the moratorium's declaration, and any commit that lands
-  anyway forces a re-capture), (2) the operator REFRAINS
+  anyway forces a re-capture OF WHICHEVER BASELINE IT
+  INVALIDATES (r49 Codex m2 + r49 SMR m1: a commit landing
+  between the pre-quiesce capture and the (1a) quiesce commit
+  invalidates the PRE-QUIESCE digest the final re-activation
+  verification compares against; a commit landing between (1a)
+  and (1b) invalidates the fence-time pair — the rule covers
+  BOTH captures)), (2) the operator REFRAINS
   from new commits and FENCES the async producer ENFORCEABLY,
   with the observable join, the peer-side preflight, and the
   ordering PINNED (r38 Codex M1 + r39 Codex M1/M2/M3 + r40 Codex
@@ -4531,11 +4590,28 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   artifact cross-node, and cannot then mandate restoration
   onto a different authority): restart the INTENDED-CONFIG
   HOLDER first — its `Load` classification completes BEFORE
-  cluster comms (`daemon_run.go:157-177,393-398`), so it holds
-  its intended config before any peer can push an older one —
-  and ensure it is the RG0 authority (the normal election with
-  the operator controlling restart order); only then restart
-  the other node —
+  cluster comms (`daemon_run.go:157-177,393-398`) — then start
+  the peer and LET THE ELECTION SETTLE, and RE-CONVERGE THROUGH
+  THE RESULTING AUTHORITY (r49 Codex M3 + r49 AGY M1, both
+  verified: restart order does NOT hold authority — a
+  higher-effective-priority peer preempts after joining,
+  `election.go:172-193`; and with sync enabled the
+  reconciliation is authority-gated and stability-delayed,
+  `daemon_ha_sync.go:447-465`): the operator reads the
+  post-election RG0 state (`show chassis cluster status`),
+  installs the intended text with `load override` + `commit`
+  on WHICHEVER node holds authority (the operator's text is
+  the primary artifact), and lets the normal sync carry it to
+  the peer — with sync DISABLED no config flows regardless of
+  authority (both push gates closed,
+  `daemon_ha_sync.go:336-370,461-465`), so the re-convergence
+  is applied per-node — and the precedence rule between the
+  restart pins is EXPLICIT: intended-holder-first GOVERNS; the
+  plain repair case (holder == local) IS the r39 local-first
+  pin's case; and the pin's protection is per-node regardless
+  (each node's `Load` completes before its own cluster comms),
+  so a peer-first start in this recovery case preserves the
+  classification protection on both nodes —
   then re-verify per the post-restart predicate below
   (the commit re-drives the normal sync where enabled). The operational closure is PINNED
   in the runbook, no new machinery: (α) the stopped-filesystem
@@ -4633,12 +4709,19 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   with the disabled-sync subclass's MANUAL re-convergence
   performed first where it fired —
   before the repair is declared done; and ONLY THEN the
-  operator RE-ACTIVATES `event-options` (a normal commit
-  reverting the quiesce — r48 Codex M3 + r48 SMR m1: without
-  this step the fence's side effect becomes the running state
-  and the box's automation is silently OFF) and re-verifies
-  the digest against the PRE-QUIESCE intent captured before
-  (1a) — the two-digest discipline: the post-restart
+  operator RE-ACTIVATES `event-options` — ON BOTH NODES, each
+  commit's own success required, EXACTLY mirroring the quiesce
+  (r49 Codex M2, verified: with ConfigSync=false one commit
+  cannot update the peer, `daemon_ha_sync.go:336-364`, and the
+  Store promotes BEFORE apply, `daemon_apply_commit.go:225-246`,
+  so a reactivation apply can abort before the engine's
+  reconciliation, `daemon_apply_tail.go:194-202`, leaving the
+  digest restored while automation stays empty) — and the
+  re-activation is followed by the COMPLETE health/apply
+  predicate again (not merely digest equality): the pre-quiesce
+  digest match AND the full persist-health aggregate AND
+  ActiveApplied AND the apply-failure/last-outcome terms on
+  BOTH nodes — the two-digest discipline: the post-restart
   verification compares against the fence-time (post-quiesce)
   digest; the re-activation re-verifies against the
   pre-procedure digest. The same shape covers a push landing on the
@@ -5512,6 +5595,22 @@ v20 history). The delivery is TWO units:
   PLUS the work-item-G state: `startupDone chan struct{}`,
   `startupDoneOnce sync.Once`, `startupOK atomic.Bool`, `finishStartup`,
   and the r8 `stopping atomic.Bool` shutdown-admission fence.
+  PLUS the work-item-H2 apply-health state (r48 Codex M2 + r49
+  Codex M1): a PROCESS-LIFETIME `applyFailureCount` atomic and a
+  `lastApplyOK atomic.Bool`, initialized BEFORE the restarted
+  process's boot apply and written CENTRALLY at the single
+  full-apply entry (`applyConfig`/`applyConfigLocked`,
+  `daemon_apply.go:49-86,141-355`) — `lastApplyOK` is set FALSE
+  AT ENTRY and TRUE only on a nil return (so an in-flight or
+  parked apply reads not-success — the false-green-in-flight
+  window, r49 Codex M1: a DHCP/feed reapply can be mid-flight
+  with ActiveApplied still true and the count still zero,
+  `daemon_dhcp.go:73-90`, `daemon_feeds.go:26-42`,
+  `store.go:797-809`), and `applyFailureCount` increments on
+  every non-nil return — covering the DHCP/boot/feeds/sync
+  wrappers that the compile-health (`daemon.go:871-880`,
+  `daemon_health.go:79-125`) and the SessionSync-only
+  `ConfigsApplyFailed` (`sync.go:110-119`) surfaces miss.
 - `pkg/daemon/daemon_forwarding_status.go`: single-method sampler-only
   adapter (§4 A1); `userspaceDataplaneStatus()` removed;
   `userspaceCachedStatusProbe` retained; `forwardingStatusDataplane()`
@@ -6713,7 +6812,9 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      before the window resolution leaves the pair stale across
      a rollback — `store_commit.go:427-461,503-524`,
      `store_persist.go:21-55` — r47 Codex M3 = r47 SMR m2; any
-     commit that lands anyway forces a re-capture), (2) refrain
+     commit that lands anyway forces a re-capture OF WHICHEVER
+     BASELINE IT INVALIDATES — the pre-quiesce digest OR the
+     fence-time pair, r49 Codex m2 + r49 SMR m1), (2) refrain
      from commits and FENCE the async producer ENFORCEABLY with
      the peer-side preflight — PEER full-state clean (peer
      `ConfirmDebtKindMask == 0` AND peer `persistDegraded ==
@@ -6762,7 +6863,14 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      provider-scoped candidates reset or ABA,
      `sync_conn_gen.go:340-367`, `sync_state.go:47-63`,
      `daemon_apply_tail.go:238-255`) UNCHANGED since the
-     (2c) observation (r45 Codex M2 — the level counter alone
+     (2c) observation — with the RE-BASELINE-and-repeat rule
+     AND its TERMINATION CLAUSE (a still-advancing epoch after
+     the second re-baseline means a live ingress source —
+     unkeyed third-party or stale process,
+     `sync_admission.go:58-83`, `sync_auth.go:321-334` — and the
+     stopped remediation is UNAVAILABLE while pulses continue;
+     fence the source or use live removal — r48 Codex m2 +
+     r49 Codex m1) (r45 Codex M2 — the level counter alone
      misses a dispatch that lands, applies cleanly, and retires
      between (2c) and (3); the monotonic epoch cannot)
      (a queued apply can leave `ActivePersistDegraded` with the
@@ -6826,9 +6934,22 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      (non-portable) artifact, the choreography is pinned:
      restart the INTENDED-CONFIG HOLDER FIRST (its `Load`
      classification completes before cluster comms,
-     `daemon_run.go:157-177,393-398`) and ensure it is the RG0
-     authority before any older-config peer can overwrite it,
-     only then restart the other node — r48 Codex M5) — bounded by the repair
+     `daemon_run.go:157-177,393-398`), start the peer, LET THE
+     ELECTION SETTLE, and re-converge THROUGH THE RESULTING
+     AUTHORITY (restart order does not hold authority — a
+     higher-priority peer preempts after joining,
+     `election.go:172-193`; with sync enabled the reconciliation
+     is authority-gated and stability-delayed,
+     `daemon_ha_sync.go:447-465`; with sync disabled no config
+     flows and the re-convergence is per-node,
+     `daemon_ha_sync.go:336-370,461-465`) — read the
+     post-election RG0 state, `load override` + `commit` the
+     intended text on whichever node holds authority, and let
+     the normal sync carry it; the intended-holder-first /
+     local-first precedence is explicit (the holder governs;
+     the plain case IS local-first; each node's Load completes
+     before its own comms regardless) — r48 Codex M5 + r49
+     Codex M3 + r49 AGY M1) — bounded by the repair
      step's successful directory `sync` of the configdb PARENT
      directory on EVERY AFFECTED NODE — BOTH nodes; the
      post-rename failure can belong to the peer's filesystem,
@@ -6970,6 +7091,17 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      first; the reader then enters the section, observes dead,
      and takes the DROP path — no reservation, the counter
      stays at zero;
+     (h2) the STICKY-APPLY-HEALTH legs (r48 Codex M2 + r49 Codex
+     M1): (h2a) the STICKY-FAILURE regression — a failed
+     same-text state-dependent reapply (the DHCP host-inbound
+     build, `daemon_dhcp.go:231-245`, with the nft failure
+     seam, `daemon_nft.go:262-272`) keeps ActiveApplied true
+     while `applyFailureCount` moves and `lastApplyOK` reads
+     false — the done predicate catches what the digest cannot;
+     (h2b) the PARKED-MID-APPLY regression — an apply parked
+     past the predicate's read (via the test seam) reads
+     `lastApplyOK == false` from ENTRY until its nil return, so
+     the predicate can never read green in flight;
      (h) the PULSE-BETWEEN-READS leg (r45 Codex M2 + r46 Codex
      M1) — a
      dispatch that lands, applies CLEANLY, and retires between

@@ -149,6 +149,9 @@ reviewer (joins at /engineer on the code PR).
 | r48 | Codex | codex companion task-msa0lwgp-ns7h20 (session 019fbc19-4131-7713-8b0a-aa495a0b15c9) | NEEDS-REVISION (5 MAJOR, 2 MINOR; folds 2 FOLDED / 5 PARTIAL). Structure confirmed |
 | r48 | AGY | agy print-mode direct (agy-plan-r48.md) | PLAN-READY (7/7 folds FOLDED; 2 fresh attacks FAILED; no findings). Structure confirmed |
 | r48 | Claude SMR | in-conversation (claude-smr-plan-r48.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — re-activation step, IS part of Codex M3). Structure confirmed |
+| r49 | Codex | codex companion task-msa1rryg-ve7lj1 (session 019fbc37-11c6-7ba3-b36a-8ca4c089effe) | NEEDS-REVISION (3 MAJOR, 2 MINOR; folds 2 FOLDED / 4 PARTIAL). Structure confirmed |
+| r49 | AGY | agy print-mode direct (agy-plan-r49.md) | NEEDS-REVISION (1 MAJOR — restart-order contradiction + preemption sub-point, IS Codex M3; folds 5 FOLDED / 1 NOT-FOLDED). Structure confirmed |
+| r49 | Claude SMR | in-conversation (claude-smr-plan-r49.md) | PLAN-READY-WITH-NITS (0 MAJOR, 2 MINOR — re-capture scope IS Codex m2; restart reconciliation IS Codex M3 / AGY M1). Structure confirmed |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 
