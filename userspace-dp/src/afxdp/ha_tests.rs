@@ -923,6 +923,178 @@ fn delete_synced_session_zero_generation_is_unconditional() {
     );
 }
 
+// ── #5154: the generation guards must survive a poisoned shared mutex ──
+//
+// `upsert_synced_session` read the stored entry with `.lock().ok()` and the
+// map length with `.lock().map(..).unwrap_or(0)`;
+// `delete_synced_session_gen` read with `.lock().ok()`. After a CONTAINED
+// worker panic (#925 supervisor) poisoned `sessions.synced`, all three reads
+// silently yielded "nothing stored / empty map" — so the #2170 generation
+// guards never evaluated — while the WRITE half (`publish_shared_session` /
+// `remove_shared_session`) went through `lock_shared_recover`, which
+// `clear_poison()`s and mutates anyway. Validation and mutation applied
+// OPPOSITE poison policies, so a delayed stale-generation install regressed
+// the stored generation and a stale delete removed a newer live entry.
+//
+// The fix makes the reads RECOVER too (the #2402 / #1807 module policy), so
+// the guards always evaluate against the committed map.
+//
+// PARENT-RED recipe: restore either read to its swallowing form — e.g.
+// `let (previous_entry, synced_len) = self.sessions.synced.lock().ok()
+//  .map(|s| (s.get(&entry.key).cloned(), s.len())).unwrap_or((None, 0));`
+// in `upsert_synced_session`, or `.lock().ok().and_then(|s|
+// s.get(&key).cloned())` in `delete_synced_session_gen`
+// (userspace-dp/src/afxdp/ha/session_import.rs). Target-count = 2 read sites.
+
+// Poison `sessions.synced` deterministically: a scoped thread panics while
+// holding the lock and `join()` observes the panic (the panic is CONTAINED —
+// it never unwinds into the test thread), mirroring a worker panic under the
+// #925 supervisor. Every `lock_shared_recover` CLEARS poison, so each
+// operation under test must be freshly poisoned.
+fn poison_shared_synced(coordinator: &Coordinator) {
+    let to_poison = coordinator.sessions.synced.clone();
+    let poisoner = std::thread::spawn(move || {
+        let _guard = to_poison.lock().expect("lock before poisoning");
+        panic!("poison shared session mutex");
+    })
+    .join();
+    assert!(poisoner.is_err(), "poisoning thread must panic");
+    assert!(
+        coordinator.sessions.synced.lock().is_err(),
+        "shared session mutex must be poisoned"
+    );
+}
+
+// Read the stored generation WITHOUT `expect()` so a still-poisoned mutex
+// yields a clean assertion failure below rather than a panic in the reader.
+fn synced_generation_recovered(coordinator: &Coordinator, key: &SessionKey) -> Option<u64> {
+    coordinator
+        .sessions
+        .synced
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(key)
+        .map(|entry| entry.generation)
+}
+
+#[test]
+fn stale_generation_install_refused_on_poisoned_shared_mutex() {
+    let coordinator = Coordinator::new();
+    let key = test_key();
+    let before = coordinator.session_install_stale_ignored_total();
+
+    coordinator.upsert_synced_session(synced_entry_with_generation(2));
+    assert_eq!(synced_generation_recovered(&coordinator, &key), Some(2));
+
+    poison_shared_synced(&coordinator);
+
+    // Delayed stale install (gen=1) against stored gen=2. Pre-fix the poisoned
+    // read returned None, the guard was skipped, and `publish_shared_session`
+    // recovered the poison and OVERWROTE the entry — rolling the stored
+    // generation back to 1.
+    coordinator.upsert_synced_session(synced_entry_with_generation(1));
+    assert_eq!(
+        synced_generation_recovered(&coordinator, &key),
+        Some(2),
+        "a poisoned shared mutex let a stale-generation install roll the \
+         stored generation back — the #2170 guard was skipped by the \
+         non-recovering read while the recovering write committed it"
+    );
+    assert_eq!(
+        coordinator.session_install_stale_ignored_total(),
+        before + 1,
+        "the stale install must be REFUSED and counted, not silently applied"
+    );
+}
+
+#[test]
+fn stale_generation_delete_refused_on_poisoned_shared_mutex() {
+    let coordinator = Coordinator::new();
+    let key = test_key();
+    let before = coordinator.session_delete_stale_ignored_total();
+
+    coordinator.upsert_synced_session(synced_entry_with_generation(2));
+    assert_eq!(synced_generation_recovered(&coordinator, &key), Some(2));
+
+    poison_shared_synced(&coordinator);
+
+    // Stale delete (gen=1) against stored gen=2. Pre-fix the poisoned read
+    // returned None, so the delete-side guard never evaluated and
+    // `remove_shared_session` recovered the poison and removed the entry —
+    // a stale delete killing a newer same-key replacement.
+    coordinator.delete_synced_session_gen(key.clone(), 1);
+    assert_eq!(
+        synced_generation_recovered(&coordinator, &key),
+        Some(2),
+        "a poisoned shared mutex let a stale-generation delete remove a \
+         NEWER live entry — the #2170 delete guard was skipped by the \
+         non-recovering read while the recovering remove committed it"
+    );
+    assert_eq!(
+        coordinator.session_delete_stale_ignored_total(),
+        before + 1,
+        "the stale delete must be REFUSED and counted, not silently applied"
+    );
+}
+
+// NEGATIVE CONTROL: the fix must RECOVER the poison and keep evaluating the
+// guard — not refuse everything it sees on a poisoned mutex. A current/newer
+// install and an equal-generation delete must still APPLY across poisoning,
+// so HA session sync keeps working after a contained worker panic. (This is
+// also what rules out the "refuse the write on poison" alternative: it would
+// fail every assertion here.)
+#[test]
+fn current_generation_install_and_delete_still_apply_on_poisoned_shared_mutex() {
+    let coordinator = Coordinator::new();
+    let key = test_key();
+    let stale_installs_before = coordinator.session_install_stale_ignored_total();
+    let stale_deletes_before = coordinator.session_delete_stale_ignored_total();
+    let recoveries_before =
+        super::shared_ops::SHARED_SESSION_POISON_RECOVERIES.load(Ordering::Relaxed);
+
+    coordinator.upsert_synced_session(synced_entry_with_generation(2));
+
+    // Newer-generation install on a poisoned mutex — must APPLY.
+    poison_shared_synced(&coordinator);
+    coordinator.upsert_synced_session(synced_entry_with_generation(3));
+    assert_eq!(
+        synced_generation_recovered(&coordinator, &key),
+        Some(3),
+        "a newer-generation install must still apply after poison recovery"
+    );
+
+    // Equal-generation delete on a (re-)poisoned mutex — must APPLY.
+    poison_shared_synced(&coordinator);
+    coordinator.delete_synced_session_gen(key.clone(), 3);
+    assert!(
+        synced_generation_recovered(&coordinator, &key).is_none(),
+        "an equal-generation delete must still remove the entry after \
+         poison recovery"
+    );
+
+    // Neither legitimate operation was counted as a stale refusal.
+    assert_eq!(
+        coordinator.session_install_stale_ignored_total(),
+        stale_installs_before,
+        "a legitimate install must not be counted as a stale refusal"
+    );
+    assert_eq!(
+        coordinator.session_delete_stale_ignored_total(),
+        stale_deletes_before,
+        "a legitimate delete must not be counted as a stale refusal"
+    );
+
+    // The panic that poisoned the mutex is OBSERVABLE: each recovery bumps
+    // the shared counter and emits a journald line. Pre-fix the two guard
+    // reads recovered nothing and logged nothing.
+    assert!(
+        super::shared_ops::SHARED_SESSION_POISON_RECOVERIES.load(Ordering::Relaxed)
+            > recoveries_before,
+        "poison recoveries must be counted so the underlying worker panic \
+         is not silently self-healed"
+    );
+}
+
 // --- #4393 peer-synced SNAT reverse-NAT dnat_table publish/delete wiring ----
 
 fn synced_snat_entry() -> SyncedSessionEntry {

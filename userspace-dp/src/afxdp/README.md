@@ -1057,6 +1057,49 @@ status reads in `state_writer.rs` / `slowpath.rs` keep
 `.lock().map(..).unwrap_or_default()` deliberately (a momentary
 default-mode status read is harmless and not on the session path).
 
+### The policy binds READS that gate a refusal, not just writes (#5154)
+
+The #2402 sweep covered `shared_ops.rs`, but the coordinator's HA
+session-import path (`ha/session_import.rs`) kept three swallowing reads —
+`upsert_synced_session` read the stored entry with `.lock().ok()` and the
+map length with `.lock().map(..).unwrap_or(0)`, and
+`delete_synced_session_gen` read with `.lock().ok()`. Each of those reads
+gates a REFUSAL: the #2170 install/delete generation guards and the #5674
+aggregate admission bound. Their writes, however, commit through
+`publish_shared_session` / `remove_shared_session`, i.e. through
+`lock_shared_recover`.
+
+So validation and mutation applied OPPOSITE poison policies. After a
+contained worker panic poisoned `sessions.synced`, the reads yielded
+"nothing stored, empty map", every guard fell through, and the recovering
+write committed the exact operation the guard exists to refuse — a
+stale-generation install regressed the stored generation, a stale delete
+removed a newer live entry, and an over-ceiling import bypassed the
+admission bound. A fail-OPEN on an ordering guard, reached by a path the
+#925 supervisor is designed to survive.
+
+All three reads now use `lock_shared_recover`, and `upsert_synced_session`
+takes its stored-entry and length reads under ONE guard (they were two
+separate locks, so the ceiling could be evaluated against a map that had
+changed between them).
+
+**Direction of the fix — recover the read, do not refuse the write.**
+Refusing to mutate on poison is not a coherent alternative here:
+`lock_shared_recover` CLEARS poison, so the poisoned window closes the
+instant any other shared-session path (publish, lookup, remove, prewarm)
+touches the mutex. A refuse-on-poison write would therefore fire or not
+fire depending on which thread locked first — a nondeterministic refusal
+of legitimate HA session sync — and would wedge session sync on an HA pair
+after a panic the supervisor already contained, which is its own outage.
+A safety property cannot rest on a flag another thread erases.
+
+Recovering also makes the panic MORE observable at these sites, not less:
+`lock_shared_recover` bumps `SHARED_SESSION_POISON_RECOVERIES` and emits
+the journald line, whereas the old `.ok()` reads recovered nothing and
+logged nothing. Note that counter is still not exported as a Prometheus
+metric, unlike its #1807 twin
+(`xpf_userspace_worker_command_queue_poison_recoveries_total`) — see #6641.
+
 ## RG-activation prewarm dedup is O(N+M) (#4069)
 
 `prewarm_reverse_synced_sessions_for_owner_rgs` runs on RG activation —

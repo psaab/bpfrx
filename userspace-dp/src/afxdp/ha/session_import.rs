@@ -39,11 +39,35 @@ impl crate::afxdp::Coordinator {
     pub fn upsert_synced_session(&self, entry: SyncedSessionEntry) {
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let ha_state = self.ha.rg_runtime.load();
-        let previous_entry = self
-            .sessions.synced
-            .lock()
-            .ok()
-            .and_then(|sessions| sessions.get(&entry.key).cloned());
+        // #5154: read the stored entry AND the map length under ONE RECOVERED
+        // critical section. Both reads feed a REFUSAL decision (the #2170
+        // generation guard and the #5674 admission bound), and every write
+        // below commits through `lock_shared_recover`. Reading with
+        // `.lock().ok()` / `.lock().map(..).unwrap_or(0)` applied the OPPOSITE
+        // poison policy to the validation half: after a contained worker panic
+        // (#925 supervisor) poisoned this mutex, the stored entry read as None
+        // and the length read as 0, so BOTH guards silently evaluated
+        // "no previous entry, empty map" and fell through — while the
+        // recovering write then committed the very install they exist to
+        // refuse. A stale-generation import regressed the stored generation and
+        // an over-ceiling import bypassed the aggregate bound, on a code path
+        // the system is explicitly designed to SURVIVE. Recovering here (the
+        // #2402 / #1807 module policy, `lock_shared_recover`: keep the
+        // committed map, clear the poison, count + log the recovery) makes
+        // validation and mutation agree. Refusing the WRITE on poison instead
+        // is not a coherent alternative: `lock_shared_recover` CLEARS poison,
+        // so the poisoned window closes the instant any other shared-session
+        // path (publish, lookup, remove, prewarm) touches this mutex — a
+        // refuse-on-poison write would fire or not fire depending on which
+        // thread locked first, and would wedge HA session sync after a panic
+        // the supervisor already contained. Folding the two reads into one
+        // guard also removes a real TOCTOU: they were separate locks, so the
+        // ceiling could be evaluated against a map that changed (including one
+        // that had gained this very key) between them.
+        let (previous_entry, synced_len) = {
+            let sessions = lock_shared_recover(&self.sessions.synced);
+            (sessions.get(&entry.key).cloned(), sessions.len())
+        };
         // #2170 install-side guard (SMR C3): refuse a strictly-older-
         // generation install so the per-key stored generation never
         // regresses (closes the delayed-stale-install variant on the
@@ -90,12 +114,6 @@ impl crate::afxdp::Coordinator {
         // transient window never rejects legitimate imports.
         if previous_entry.is_none() && !entry.metadata.is_reverse {
             let synced_cap = self.synced_import_cap();
-            let synced_len = self
-                .sessions
-                .synced
-                .lock()
-                .map(|sessions| sessions.len())
-                .unwrap_or(0);
             if synced_cap != 0 && synced_len >= synced_cap {
                 SYNCED_IMPORT_CAP_DROPS.fetch_add(1, Ordering::Relaxed);
                 return;
@@ -241,11 +259,17 @@ impl crate::afxdp::Coordinator {
     /// generation-aware deletes. A delete_gen of 0, or a stored generation of
     /// 0, falls back to unconditional delete (rolling-upgrade safe).
     pub fn delete_synced_session_gen(&self, key: SessionKey, delete_gen: u64) {
-        let removed_entry = self
-            .sessions.synced
-            .lock()
-            .ok()
-            .and_then(|sessions| sessions.get(&key).cloned());
+        // #5154: RECOVER the poison on this read (same policy as the write
+        // below, which reaches the map through `remove_shared_session` ->
+        // `lock_shared_recover`). With `.lock().ok()` a poisoned mutex read as
+        // None, so the delete-side generation guard never evaluated — and the
+        // recovering `remove_shared_session` then deleted the entry anyway.
+        // That is a stale delete killing a NEWER same-key replacement the
+        // helper had already mirrored: exactly the outcome this guard exists
+        // to prevent, reachable via a contained worker panic.
+        let removed_entry = lock_shared_recover(&self.sessions.synced)
+            .get(&key)
+            .cloned();
         if let Some(entry) = removed_entry.as_ref()
             && entry.generation != 0
             && delete_gen != 0

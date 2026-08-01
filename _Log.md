@@ -65606,3 +65606,40 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/refactoraudit/audit_canary_test.go, pkg/refactoraudit/doc.go,
   docs/refactoring-audit-current.txt, docs/refactoring-audit.md,
   scripts/refactoring-audit.sh, Makefile, _Log.md
+
+- **Timestamp**: 2026-08-01
+- **Action**: "#5154 — make the HA session-import poison policy symmetric. The
+  #2170 generation guards in `upsert_synced_session` /
+  `delete_synced_session_gen` read `sessions.synced` with `.lock().ok()`, and
+  the #5674 admission bound read its length with
+  `.lock().map(..).unwrap_or(0)`. After a CONTAINED worker panic (#925
+  supervisor) poisoned that mutex, all three reads yielded 'nothing stored,
+  empty map', so every guard fell through — while the WRITE half
+  (`publish_shared_session` / `remove_shared_session`) commits through
+  `lock_shared_recover`, which `clear_poison()`s and mutates anyway.
+  Validation and mutation applied OPPOSITE poison policies, so a stale-
+  generation install regressed the stored generation, a stale delete removed
+  a NEWER live entry, and an over-ceiling import bypassed the aggregate bound
+  — a fail-OPEN on an ordering guard, reached by a path the system is designed
+  to survive. Fixed by RECOVERING the reads (the established #2402/#1807
+  module policy) rather than refusing the writes: `lock_shared_recover` clears
+  poison, so a refuse-on-poison write would fire nondeterministically
+  depending on which thread locked first, and would wedge HA session sync
+  after a panic the supervisor already contained. `upsert_synced_session` now
+  takes its stored-entry and length reads under ONE guard, which also closes a
+  real TOCTOU (they were separate locks, so the ceiling could be evaluated
+  against a map that had changed between them). Validation: 3 new tests
+  (stale install refused, stale delete refused, negative control that a
+  current-generation install/delete still applies across poisoning);
+  two-stage mutation proof — reverting ONLY the upsert read reds ONLY the
+  install test (`left: Some(1)` right `Some(2)`, the generation regressed),
+  reverting ONLY the delete read reds ONLY the delete test (`left: None`
+  right `Some(2)`, the live entry was removed), both with `cargo build
+  --release` clean (0 errors). Full `cargo test --release --bins --tests --
+  --test-threads=1` green (4354 passed / 0 failed). Filed #6641: the
+  `SHARED_SESSION_POISON_RECOVERIES` counter is still not exported as a
+  Prometheus metric, unlike its #1807 twin. HA cluster smoke required
+  (session-sync path) — scheduled by the team lead, not run here."
+- **File(s)**: userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/afxdp/ha_tests.rs, userspace-dp/src/afxdp/README.md,
+  _Log.md
