@@ -161,11 +161,25 @@ audit-check:
 		echo "audit-check: refactoring-audit-current.txt is up to date"; \
 		exit 0; \
 	fi; \
+	if awk 'NF != 3 { print "  malformed row (want 3 fields, got " NF "): " $$0; bad = 1 } \
+		END { exit bad }' docs/refactoring-audit-current.txt; then :; else \
+		echo "ERROR: docs/refactoring-audit-current.txt has malformed rows."; \
+		echo "  The Go parser requires exactly 3 fields; this target used to project"; \
+		echo "  \$$1,\$$3 and silently ignore extra ones, so a hand edit could pass here"; \
+		echo "  and fail the test suite."; \
+		exit 1; \
+	fi; \
 	awk '{print $$1, $$3}' docs/refactoring-audit-current.txt | LC_ALL=C sort > "$$com"; \
 	awk '{print $$1, $$3}' "$$tmp" | LC_ALL=C sort > "$$gen"; \
 	if cmp -s "$$com" "$$gen"; then \
-		echo "audit-check: ADVISORY — only the LOC snapshot drifted (same files, same tiers)."; \
-		echo "  TestHeatmapNotStale PASSES on this; nothing is blocking. Refresh when convenient:"; \
+		echo "audit-check: ADVISORY — same files, same tiers; only the LOC snapshot drifted."; \
+		echo "  This target compares the (tier, path) projection SORTED, so it is blind to"; \
+		echo "  LOC values and to row order BY DESIGN — that is what makes LOC advisory."; \
+		echo "  TestHeatmapNotStale passes on this. It is NOT a statement about the whole"; \
+		echo "  suite: TestHeatmapArtifactWellFormed still checks each row's LOC against its"; \
+		echo "  tier band and checks generator sort order, and can fail while this target is"; \
+		echo "  green. Run 'go test ./pkg/refactoraudit/' for the authoritative answer."; \
+		echo "  Refresh when convenient:"; \
 		echo "    bash scripts/refactoring-audit.sh > docs/refactoring-audit-current.txt"; \
 		exit 0; \
 	fi; \
