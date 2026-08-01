@@ -772,14 +772,22 @@ func (m *Manager) FormatInterfaces(input InterfacesInput) string {
 // attacker's archive; see "Operating the control-link PSK" in
 // pkg/cluster/README.md.
 //
-// The note is suppressed once the downgrade latch has armed and is refusing
-// epoch-less frames, because at that point the historical count is a record of
-// the migration rather than live exposure.
+// The note is suppressed once the downgrade latch has armed, because at that
+// point the historical count is a record of the migration rather than live
+// exposure.
+//
+// It reads the LATCH (HeartbeatStats.PeerEpochLatched), not the rejection
+// counter. The counter was used as a proxy and is not one: it only moves when a
+// later epoch-less frame is actually refused, so a receiver that admitted some
+// epoch-less frames and then saw its first epoch-bearing one is latched with
+// the counter still at 0 — and reported "replay protection is ring-only" when
+// it was not. The exposure the note describes ends when the latch arms, so the
+// latch is what it must test.
 func epochlessExposureNote(s HeartbeatStats) string {
 	if s.EpochlessAdmitted == 0 {
 		return ""
 	}
-	if s.EpochDowngradeRejected > 0 {
+	if s.PeerEpochLatched {
 		return "  (peer now signs boot epochs; count is historical)"
 	}
 	return "  (peer not signing boot epochs - replay protection is ring-only; rotate the control-link PSK once both nodes are upgraded)"

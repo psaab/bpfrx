@@ -220,7 +220,13 @@ func TestHeartbeatEpochRollbackRefusedThenRecovered_6169(t *testing.T) {
 // TestHeartbeatEpochImplausibleValueCannotLockOut_6169 pins the one-way-door
 // guard. An epoch outside the plausibility band must never become the floor —
 // latching, say, MaxUint64 would reject every subsequent genuine frame forever.
-// It still satisfies the latch, because the peer demonstrably emits epochs.
+//
+// It does NOT arm the downgrade latch either, and that is the deliberate half:
+// the frame is REFUSED, and the refusal returns before the arming site. Arming
+// on it would make the refusal a one-way door — a peer whose only observed
+// epochs were out of range would then have its epoch-less frames refused too,
+// with nothing this receiver can order to let it back in. The assertions below
+// pin both: no floor, no latch, and the genuine peer still accepted afterwards.
 func TestHeartbeatEpochImplausibleValueCannotLockOut_6169(t *testing.T) {
 	e := newLatchEnv(t)
 

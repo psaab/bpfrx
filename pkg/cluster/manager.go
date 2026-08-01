@@ -465,9 +465,15 @@ func NewManager(nodeID, clusterID int) *Manager {
 // The peer previously proved it runs a build that signs a boot epoch, and is
 // now sending frames without one. That is either a replay of pre-upgrade
 // captures (the attack this closes) or a genuine rollback of the peer to a
-// pre-#6169 build — which is operator-actionable, since the peer stays refused
-// until xpfd is restarted on this node. Rate-limited to once per 30s so a
-// 5-10/s heartbeat stream cannot flood the log.
+// pre-#6169 build — which is operator-actionable. Rate-limited to once per 30s
+// so a 5-10/s heartbeat stream cannot flood the log.
+//
+// THE RECOVERY THIS NAMES IS THE COMPLETE ONE, in order. Restarting xpfd clears
+// the process-scoped latch, but an attacker holding one archived epoch-bearing
+// frame re-arms it against the empty post-restart state — see the arming site
+// in admitAuthedLocked. Rotating the control-link PSK first makes every
+// archived frame fail MAC verification, so it can never reach the latch. An
+// operator told only "restart" would loop.
 func (m *Manager) NoteEpochDowngradeHeartbeat() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -477,7 +483,9 @@ func (m *Manager) NoteEpochDowngradeHeartbeat() {
 	m.lastEpochDowngradeWarn = time.Now()
 	slog.Warn("cluster: heartbeat refused — peer stopped signing a boot epoch it previously signed. " +
 		"This is a replayed pre-upgrade capture, or the peer was rolled back to a build older than #6169. " +
-		"If the rollback was intentional, restart xpfd on THIS node to clear the latch")
+		"If the rollback was intentional: rotate the control-link PSK on BOTH nodes FIRST, then restart " +
+		"xpfd on THIS node to clear the latch. Restarting alone is not enough — a replayed archived " +
+		"epoch frame re-arms the latch, and only rotating the PSK retires that capture")
 }
 
 // NodeID returns the local node ID.

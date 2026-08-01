@@ -66600,3 +66600,65 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-08-01 19:35
+- **Action**: #6169 fold round (PR #6669) — two MAJORs and three MINORs from an
+  independent Codex correctness review. (MAJOR-2) The documented rollback
+  recovery does not work under the attacker the feature defends against: a
+  restart clears the floor, the latch and the ring TOGETHER, and arming needs
+  only an authenticated, orderable, ring-fresh epoch frame, so ONE archived
+  frame re-arms the latch against the empty post-restart state and the
+  legitimately rolled-back peer is refused again — one replay per restart,
+  indefinitely. Not closed in code: a durable latch re-creates the peer-floor
+  file this design deliberately removed (and makes an in-range-but-wrong epoch
+  a lockout outliving reboots), and a freshness test needs a challenge-response
+  or timestamp the heartbeat wire format does not carry — a legitimately
+  long-lived peer's epoch is arbitrarily old, so no recency test separates it
+  from an archived one. Corrected the recovery instead, everywhere it is
+  stated: the operator WARNING now names the PSK rotation FIRST (rotation makes
+  archived frames fail `verifyHeartbeatMAC`, so they never reach the latch; the
+  key is re-read per frame on both paths, so rotation needs no restart), the
+  arming site in `admitAuthedLocked` carries the caveat and the rejected
+  alternatives, and README residual 5 states it with scope — a peer that never
+  emitted an epoch cannot be falsely armed, so this bites on rollback,
+  same-identity replacement, or a partial upgrade. (MAJOR-1) Verified by
+  execution that the "bad-clock state heals" claim holds only when the LOCAL
+  clock is credible when refinement LOADS the file: below `epochClockSaneFloor`
+  the forward bound is skipped, so a wrong-but-below-2200 value is chained
+  from, and refinement runs once per Manager so a later NTP correction never
+  re-validates it. Inherent, not an oversight — under a dead RTC a legitimate
+  previous epoch and a corrupt future one are indistinguishable, and healing
+  after the fact means LOWERING a published epoch mid-incarnation, the one
+  direction the design refuses. Claim narrowed to exactly what holds, at both
+  sites (`epochWithinForwardBound`, README), plus residual 6. (MINOR-3)
+  `refineBootEpoch` validated `prev` and published `prev+1`; a persisted
+  `epochPlausibleMax-1` published exactly `epochPlausibleMax` (refused on a
+  strict `<`) and a persisted `now+bootEpochMaxSkew` published one nanosecond
+  past the bound — the node then signs frames no receiver accepts. Now
+  validates the successor against ONE clock sample. (MINOR-4) Status inferred
+  the latch from `EpochDowngradeRejected > 0`, which only moves on a LATER
+  refusal, so between arming and that frame it reported "replay protection is
+  ring-only" while the latch was refusing; added `HeartbeatStats.
+  PeerEpochLatched` and read the state instead of the proxy. The existing test
+  masked this by injecting a downgrade before rendering — split into a phase
+  that renders with nothing else injected. (MINOR-5) Fixed all nine
+  contradicting comments, including the two the review flagged as most
+  important (non-orderable frames are NOT uniformly rejected — `epoch ==
+  highEpoch` past the forward bound is admitted by design; a failed absolute
+  band DOES reject and does NOT arm), the non-existent peer-floor store, the
+  "persistence failure suppresses emission" implications, the obsolete
+  per-`heartbeatSender` session model (`heartbeatNonce` is Manager-scoped since
+  Stage 0), and the latch test whose comment contradicted its own assertion.
+  Validation: build + vet clean; `go test -race ./pkg/cluster/` green; four
+  mutations each RED with build+vet CLEAN first and scoped to their own
+  assertions — dropping the successor check reds both bound subtests while the
+  in-range negative control stays green; restoring the counter proxy reds
+  exactly the three new render subtests; reverting the warning text reds only
+  the warning test; and refusing to arm against an empty floor reds the
+  characterization test, proving it binds the residual the docs now describe.
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/heartbeat_manager.go, pkg/cluster/manager.go,
+  pkg/cluster/status.go, pkg/cluster/README.md,
+  pkg/cluster/heartbeat_epoch_bounds_6669_test.go,
+  pkg/cluster/heartbeat_epoch_rollback_recovery_6669_test.go,
+  pkg/cluster/heartbeat_epoch_status_6169_test.go,
+  pkg/cluster/heartbeat_epoch_latch_test.go, _Log.md

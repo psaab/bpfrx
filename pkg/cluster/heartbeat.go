@@ -420,8 +420,16 @@ func MarshalHeartbeatAuth(pkt *HeartbeatPacket, authKey []byte, session, counter
 //	[ marker(8) = HMAC(key, bootEpochLabel)[:8] ][ epoch(8, little-endian) ]
 //
 // BETWEEN the body and the auth trailer. epoch == 0 emits a byte-identical
-// legacy frame (the peer has no epoch to advertise yet, or could not persist
-// one).
+// legacy frame — the MarshalHeartbeatAuth path, i.e. a caller that has no epoch
+// to advertise at all.
+//
+// A KEYED PRODUCTION SENDER NEVER REACHES THAT PATH, and the distinction is
+// load-bearing for the receiver's downgrade latch: Manager.heartbeatBootEpoch
+// publishes a non-zero wall-clock value SYNCHRONOUSLY, before any file is
+// touched, so a persistence failure degrades MONOTONICITY, never EMISSION. That
+// is what makes "a keyed heartbeat carries no epoch <=> the peer runs a
+// pre-#6169 build" true, and a storage fault therefore cannot make a latched
+// peer see a healthy node as epoch-less (and so dead).
 //
 // The section placement is what makes this a NON-BREAKING wire change, and it
 // is not interchangeable with appending after the trailer (which is what failed
@@ -545,25 +553,32 @@ func verifyHeartbeatMAC(data, authKey []byte) bool {
 //     (Confirmed empirically: M == heartbeatReplaySessions recordings -> all
 //     replays rejected; M == heartbeatReplaySessions+1 -> sustained admits.)
 //
-// This receiver-only map cannot close that residual completely: a full fix
-// needs a boot-epoch / monotonic-across-reboot counter carried in the frame (a
-// wire change), tracked as a follow-up. It does NOT cause a genuine-peer
-// lockout (an evicted live-peer watermark just makes the peer's next frame
-// never-seen -> admitted) and cannot grow memory (fixed 64-slot array).
+// This receiver-only map cannot close that residual by itself — it needs a
+// total order over peer incarnations, which random session ids cannot provide.
+// That order SHIPPED in #6169 as the signed boot epoch (heartbeat_epoch.go):
+// admitAuthedLocked consults the epoch floor BEFORE this ring, so a frame from
+// a retired incarnation never reaches admit() and therefore cannot churn it.
+// The ring is retained and still owns within-incarnation replay. It does NOT
+// cause a genuine-peer lockout (an evicted live-peer watermark just makes the
+// peer's next frame never-seen -> admitted) and cannot grow memory (fixed
+// 64-slot array).
 //
 // 64 slots (64*16 = 1 KiB) bounds memory while forcing an attacker to have
 // captured 65+ distinct peer SESSIONS before any replay is sustainable.
 //
-// The unit is a session id, not a daemon boot, and the two are not the same:
-// a session id is minted per heartbeatSender (see authSession below), so every
-// peer heartbeat RESTART — a DHCP-triggered VRF rebind, an HA comms restart —
-// mints a new one without the peer rebooting. Two consequences, both of which
-// only became relevant once #5086 made this ring outlive a local restart:
-// routine peer restarts now permanently consume slots, so the ring reaches
-// eviction pressure from legitimate traffic alone; and the attacker's capture
-// cost for the churn above is 65 sessions, which are cheaper to harvest than
-// 65 daemon boots. Neither is a regression — before #5086 any local restart
-// wiped the whole ring, so this worst case is a strict subset of that one.
+// THE UNIT IS A DAEMON INCARNATION, and only since #6169 Stage 0. A session id
+// used to be minted per heartbeatSender, so every peer heartbeat RESTART — a
+// DHCP-triggered VRF rebind, an HA comms restart — minted a new one with no
+// reboot involved: routine peer restarts permanently consumed slots (the ring
+// reached eviction pressure from legitimate traffic alone), and the attacker's
+// capture cost for the churn above was 65 sessions, cheaper to harvest than 65
+// daemon boots. Worse, those extra sessions all shared ONE boot epoch, which
+// the floor cannot separate — so the ring stayed churnable WITHIN an
+// incarnation, under the epoch gate.
+//
+// Manager.heartbeatNonce now draws the session once per Manager
+// (hbNonceOnce) and only advances the counter, so a restart no longer
+// re-anchors. See TestHeartbeatNonceIsIncarnationScoped_6169.
 const heartbeatReplaySessions = 64
 
 // replaySessionMark is one remembered (session, high-water counter) pair.
@@ -714,8 +729,14 @@ type heartbeatAuthState struct {
 	// pre-upgrade captures; and rotating the control-link PSK, already a
 	// REQUIRED post-upgrade step, retires those captures outright.
 	//
-	// It also makes rollback recovery "restart xpfd", an operation operators
-	// already perform, instead of a documented rm.
+	// It also makes rollback recovery a restart, an operation operators already
+	// perform, instead of a documented rm.
+	//
+	// What process scope does NOT buy is a restart that recovers
+	// UNCONDITIONALLY. A replayed archived epoch frame re-arms this latch
+	// against the empty post-restart state, so PSK rotation has to come FIRST.
+	// Stated in full at the arming site in admitAuthedLocked, where the
+	// property lives.
 	epochSeen bool
 
 	// epochlessAdmitted counts authenticated heartbeats ADMITTED without a boot
@@ -809,9 +830,14 @@ type heartbeatAuthState struct {
 //
 // The one remaining trigger is a genuine ROLLBACK of the peer to a pre-#6169
 // build, a deliberate operator-initiated act: that peer's frames are refused
-// until `systemctl restart xpfd` on THIS node clears the in-memory latch. There
-// is no state file to hand-edit. This is the same trade #4107's sticky
-// peerAuthSeen already makes for the auth trailer.
+// until the latch is cleared. There is no state file to hand-edit. This is the
+// same trade #4107's sticky peerAuthSeen already makes for the auth trailer.
+//
+// `systemctl restart xpfd` on THIS node clears the latch, but it is NOT
+// sufficient on its own: an attacker holding one archived epoch-bearing frame
+// re-arms it against the empty post-restart state. Rotate the control-link PSK
+// on both nodes FIRST, then restart. See the arming site in admitAuthedLocked
+// for why, and why it is not closed in code.
 //
 // The three epoch cases, once the peer is known to emit them:
 //
@@ -905,6 +931,42 @@ func (s *heartbeatAuthState) admitAuthedLocked(hasEpoch bool, epoch, session, co
 	if !s.replay.admit(session, counter) {
 		return false
 	}
+	// ARMING THE LATCH. A REPLAY CAN DO THIS, and the consequence is a real
+	// residual an operator has to be told about, not a theoretical one.
+	//
+	// Arming requires only an authenticated, orderable, ring-fresh epoch frame.
+	// Against a FRESH state — which is exactly what the documented rollback
+	// recovery (restart xpfd) produces, since highEpoch, this latch and the ring
+	// are all process-scoped — a single ARCHIVED frame captured while the peer
+	// still ran an epoch-capable build satisfies all three: highEpoch is 0 so
+	// nothing is below the floor, and an empty ring calls its session
+	// never-seen. It re-arms the latch, and the legitimately rolled-back peer's
+	// genuine epochless frames are refused again at the top of this function.
+	// One replay per restart sustains that indefinitely.
+	//
+	// SO RESTARTING xpfd IS NOT, BY ITSELF, RELIABLE RECOVERY FROM A ROLLBACK
+	// while an on-link attacker holds such a capture — which is precisely the
+	// attacker #6169 exists to defend against. The complete recovery is to
+	// ROTATE THE CONTROL-LINK PSK on both nodes FIRST and restart xpfd after:
+	// rotation makes every archived frame fail verifyHeartbeatMAC, so it never
+	// reaches this function to re-arm anything. Order matters — restart first
+	// and the replay can land in the window before the new key is committed.
+	// The key is re-read per frame on both paths, so rotation needs no restart
+	// of its own.
+	//
+	// This is NOT closed in code, and the alternatives were priced. A durable
+	// latch or floor re-creates the peer-floor state file this design
+	// deliberately removed (see the epochSeen field comment) and makes an
+	// in-range-but-wrong epoch a lockout that outlives reboots. Binding arming
+	// to freshness needs a challenge-response or a timestamp the heartbeat wire
+	// format does not carry, and cannot be approximated from the epoch itself: a
+	// legitimately long-lived peer's epoch is arbitrarily old, so no
+	// recency test separates it from an archived one.
+	//
+	// SCOPE, honestly: a peer that has NEVER emitted an epoch cannot be falsely
+	// armed this way — there is nothing to capture. It bites on rollback,
+	// replacement under the same identity and key, or a partial upgrade.
+	// Pinned by TestArchivedEpochReplayReArmsLatchAfterRestart_6169.
 	s.epochSeen = true
 	if epoch > s.highEpoch {
 		s.highEpoch = epoch
@@ -1103,8 +1165,10 @@ func (s *heartbeatSender) send() {
 	var data []byte
 	if key := s.mgr.controlLinkAuthKey(); len(key) > 0 {
 		session, counter := s.mgr.heartbeatNonce()
-		// #6169: carry the boot epoch when one has been durably persisted; 0
-		// emits a byte-identical legacy frame.
+		// #6169: ALWAYS carry a boot epoch. heartbeatBootEpoch publishes a
+		// wall-clock value before any I/O and never returns 0 once called, so
+		// this cannot silently degrade to a legacy frame under a storage fault —
+		// which a latched peer would read as a rollback and refuse.
 		data = marshalHeartbeatAuthEpoch(pkt, key, session, counter, s.mgr.heartbeatBootEpoch())
 	} else {
 		data = MarshalHeartbeat(pkt)

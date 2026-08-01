@@ -122,7 +122,6 @@ const (
 	// same hazard heartbeatStartupGrace exists for). Falling back to the
 	// absolute bound alone there is permissive, never locking.
 	epochClockSaneFloor uint64 = 1577836800_000000000
-
 )
 
 // bootEpochPath is where this node's own boot epoch is persisted. /var/lib/xpf
@@ -132,6 +131,14 @@ const (
 // There is deliberately NO peer-side floor file; see the DURABILITY note on
 // heartbeatAuthState.epochSeen for why the receiver latch is process-scoped.
 var bootEpochPath = "/var/lib/xpf/ha-boot-epoch"
+
+// epochNowNanos is the wall clock refineBootEpoch validates persisted state
+// against. A var so a test can PIN an instant: the load-time checks are
+// clock-DEPENDENT (epochWithinForwardBound is skipped below
+// epochClockSaneFloor, and the forward bound is relative to this sample), so
+// the boundaries only exist for one specific `now` and cannot be hit reliably
+// with the real clock. Production never replaces it.
+var epochNowNanos = func() int64 { return time.Now().UnixNano() }
 
 // epochUsableAsFloor bounds what the receiver is willing to LATCH as its
 // high-water epoch.
@@ -158,9 +165,14 @@ var bootEpochPath = "/var/lib/xpf/ha-boot-epoch"
 // rather than relative to the receiver's own clock, so a receiver whose own
 // clock is wrong does not start refusing a healthy peer.
 //
-// An epoch that fails this test does NOT reject the frame and does NOT clear the
-// downgrade latch — the peer still demonstrably emits epochs. It is simply not
-// used as a floor.
+// A frame whose epoch fails this test is REJECTED, and because the rejection
+// returns before the arming site it does NOT arm the downgrade latch either.
+// Admitting it and merely declining to latch would recreate the epochless
+// bypass in miniature — a frame the floor cannot order is governed by the
+// bounded ring alone. Leaving the latch unarmed is the deliberate half: a peer
+// that only ever emitted out-of-range epochs has proved nothing this receiver
+// can act on, and refusing to latch on it is what keeps the refusal from
+// becoming a one-way door once that peer comes back into range.
 func epochUsableAsFloor(epoch uint64) bool {
 	return epoch > 0 && epoch < epochPlausibleMax
 }
@@ -177,12 +189,19 @@ func epochUsableAsFloor(epoch uint64) bool {
 // is corrected (or whose state is repaired) is accepted again the moment it
 // comes back into range.
 //
-// A frame whose epoch is not orderable is REJECTED rather than admitted-and-not-
-// latched. Admitting it would recreate, in miniature, the epochless bypass this
-// mechanism exists to close: a frame the floor cannot order is governed by the
-// bounded ring alone, so captured frames from an incarnation that once emitted
-// an out-of-range epoch would replay indefinitely. Not orderable, not admitted —
-// the same rule as an epochless frame from a latched peer.
+// THE RECEIVER DOES NOT CALL THIS; it applies the two halves separately, and
+// the split is the point. admitAuthedLocked runs epochUsableAsFloor on EVERY
+// frame (clock-independent, so a 0 or beyond-year-2200 value is refused
+// outright) but epochWithinForwardBound only on the RAISE path, epoch >
+// highEpoch. So a frame at epoch == highEpoch that is beyond the forward bound
+// is ADMITTED, not rejected — deliberately, because re-testing an
+// already-accepted epoch after a backward clock step is what declared a healthy
+// peer dead and went dual-master. See epochWithinForwardBound.
+//
+// The combined predicate is for callers validating a value they are about to
+// TRUST as a starting point rather than merely order against a floor — today
+// that is refineBootEpoch chaining from persisted state. There, both halves
+// apply: an unorderable value is ignored, never chained from.
 func epochOrderable(epoch uint64, nowNanos int64) bool {
 	return epochUsableAsFloor(epoch) && epochWithinForwardBound(epoch, nowNanos)
 }
@@ -205,6 +224,27 @@ func epochOrderable(epoch uint64, nowNanos int64) bool {
 // and syncs NTP seconds later, and during that window a healthy peer's epoch is
 // ~56 years "ahead", so applying the bound would refuse the peer at exactly the
 // moment cold-boot split-brain is most likely.
+//
+// THAT SKIP IS THE EXACT PRECONDITION ON SELF-HEALING, and it is a real
+// residual rather than an oversight. refineBootEpoch validates persisted state
+// with this predicate, so a persisted epoch that is wrong-but-below-year-2200
+// is only rejected — and the file only healed — when the LOCAL clock is
+// credible at the moment refinement loads it. Refinement runs once per Manager
+// (sync.Once), early in startup, so on an appliance whose RTC is dead and whose
+// xpfd always starts before NTP the bad value is chained from on every boot and
+// never heals; a correctly clocked peer then refuses this node's epoch on its
+// raise path, which is asymmetric visibility, not mutual isolation.
+//
+// It cannot be closed here. Under a dead RTC a legitimate previous epoch and a
+// corrupt future one are INDISTINGUISHABLE — both sit ~56 years "ahead" of a
+// 1970 clock — so tightening the bound would reject the legitimate value, which
+// is precisely the case persistence exists to carry across a backward clock
+// step. The absolute year-2200 band is the only filter that survives an
+// uncredible clock, and it is already applied unconditionally. Healing after
+// the fact would mean LOWERING a published epoch mid-incarnation, the one
+// direction the whole design refuses. The residual is stated in
+// pkg/cluster/README.md under "Honest residuals"; the operational close is a
+// working RTC or ordering xpfd after time synchronization.
 func epochWithinForwardBound(epoch uint64, nowNanos int64) bool {
 	if nowNanos > 0 && uint64(nowNanos) >= epochClockSaneFloor {
 		if epoch > uint64(nowNanos)+bootEpochMaxSkew {
@@ -217,9 +257,9 @@ func epochWithinForwardBound(epoch uint64, nowNanos int64) bool {
 // withEpochFileLock serializes a read-modify-write of an epoch state file
 // across PROCESSES, not merely within one.
 //
-// Within a process each file has a single writer (sync.Once for the boot epoch,
-// a mutex for the peer floor), but nothing in xpf enforces a single daemon
-// instance: there is no pidfile, and the gRPC listener sets SO_REUSEPORT
+// Within a process the one file this guards has a single writer (the boot
+// epoch, behind Manager.bootEpochOnce), but nothing in xpf enforces a single
+// daemon instance: there is no pidfile, and the gRPC listener sets SO_REUSEPORT
 // (pkg/grpcapi/server.go), so a second xpfd does NOT fail on a port collision
 // the way it otherwise would. Two overlapping incarnations could therefore
 // interleave read-modify-write and publish epochs that are not strictly
@@ -418,18 +458,33 @@ func refineBootEpoch(path string, published *atomic.Uint64) {
 		return
 	}
 	withEpochFileLock(path, func() {
+		// ONE clock sample, shared by the load check and the candidate check
+		// below. Two samples could straddle the forward bound and validate
+		// `prev` against a different instant than the value actually derived
+		// from it.
+		now := epochNowNanos()
 		var prev uint64
 		if data, err := os.ReadFile(path); err == nil {
 			n, perr := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
 			switch {
 			case perr != nil:
 				slog.Warn("cluster: HA boot-epoch state unreadable; keeping the wall-clock epoch", "path", path)
-			case !epochOrderable(n, time.Now().UnixNano()):
+			// VALIDATE THE VALUE THIS NODE WOULD PUBLISH, not merely the one on
+			// disk. The chained epoch is prev+1, so testing prev alone left a
+			// one-value escape at each bound: a persisted epochPlausibleMax-1
+			// passes the load check and then publishes exactly
+			// epochPlausibleMax, which every receiver refuses because
+			// epochUsableAsFloor is a strict `<`; a persisted value exactly at
+			// now+bootEpochMaxSkew likewise publishes one nanosecond past the
+			// bound. Not overflow — ordering. n+1 cannot overflow here: the
+			// first disjunct short-circuits unless n < epochPlausibleMax.
+			case !epochOrderable(n, now) || !epochOrderable(n+1, now):
 				// Corrupt, hand-edited, or written while this node's clock ran
 				// ahead. Chaining from it would push this node toward MaxUint64,
 				// where the NEXT boot regresses, and would strand it above the
 				// range its peer accepts. Ignoring it heals the file.
-				slog.Warn("cluster: HA boot-epoch state is out of range; ignoring it and keeping the wall-clock epoch",
+				slog.Warn("cluster: HA boot-epoch state cannot be chained from (it, or the epoch derived "+
+					"from it, is out of range); ignoring it and keeping the wall-clock epoch",
 					"path", path, "value", n)
 			default:
 				prev = n

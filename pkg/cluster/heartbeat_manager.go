@@ -512,6 +512,7 @@ func (m *Manager) HeartbeatStats() HeartbeatStats {
 		s.RecvErrors = receiver.recvErrors.Load()
 		s.EpochlessAdmitted = receiver.auth.epochlessAdmitted.Load()
 		s.EpochDowngradeRejected = receiver.auth.epochDowngradeRejected.Load()
+		s.PeerEpochLatched = receiver.auth.peerEpochLatched()
 	}
 	return s
 }
@@ -537,4 +538,17 @@ type HeartbeatStats struct {
 	// counter that residual is invisible to an operator.
 	EpochlessAdmitted      uint64
 	EpochDowngradeRejected uint64
+
+	// PeerEpochLatched is the DOWNGRADE LATCH itself (heartbeatAuthState.
+	// epochSeen): the peer has proved it emits boot epochs, so an epoch-less
+	// frame from it is refused from now on.
+	//
+	// This is the state, not a proxy for it. EpochDowngradeRejected was used as
+	// one and is not equivalent: it only moves when a LATER epoch-less frame
+	// arrives and is refused, so between the frame that arms the latch and the
+	// next epoch-less frame — which may never come — the counter is still 0
+	// while the latch is armed. Reporting live exposure off the counter told
+	// the operator "replay protection is ring-only" at a moment when it was
+	// not. epochlessExposureNote reads this instead.
+	PeerEpochLatched bool
 }

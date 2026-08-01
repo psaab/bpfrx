@@ -62,8 +62,42 @@ func TestEpochlessCounterIsRendered_6169(t *testing.T) {
 		})
 	}
 
-	// The peer upgrades and starts signing; epoch-less frames are now refused.
+	// The peer upgrades and starts signing. The latch arms on that first
+	// epoch-bearing frame — and the exposure the note describes ENDS THERE, not
+	// at some later refusal.
 	e.liveRun(e.captureIncarnation(0xAA02, 9_800_000_000_000_000, 2), "upgraded peer")
+	if !e.r.auth.peerEpochLatched() {
+		t.Fatal("setup: an accepted epoch-bearing frame must arm the latch")
+	}
+
+	// RENDER WITH NOTHING ELSE INJECTED. This is the state the old code got
+	// wrong: it inferred the latch from EpochDowngradeRejected, which only moves
+	// once a LATER epoch-less frame is actually refused — a frame that may never
+	// arrive. Between arming and that frame, status told the operator "replay
+	// protection is ring-only" while the latch was refusing.
+	//
+	// RED-on-revert: restore `s.EpochDowngradeRejected > 0` in
+	// epochlessExposureNote and these three subtests fail.
+	for name, render := range renders {
+		t.Run(name+"_latched_before_any_downgrade", func(t *testing.T) {
+			out := render()
+			if !strings.Contains(out, "Epoch downgrades rejected:  0") {
+				t.Fatalf("%s: this phase must have NO downgrade rejections yet — the point is "+
+					"that the latch is armed without one\n--- output ---\n%s", name, out)
+			}
+			if strings.Contains(out, "rotate the control-link PSK") {
+				t.Fatalf("%s reports LIVE epoch-less exposure while the downgrade latch is armed "+
+					"and refusing. The note must read the latch, not the rejection counter.\n"+
+					"--- output ---\n%s", name, out)
+			}
+			if !strings.Contains(out, "count is historical") {
+				t.Fatalf("%s does not mark the epoch-less count historical once the latch armed\n"+
+					"--- output ---\n%s", name, out)
+			}
+		})
+	}
+
+	// Now an epoch-less frame does arrive and is refused, moving the counter.
 	if e.feed(marshalHeartbeatAuthEpoch(samplePkt(), e.key, 0xAA03, 1, 0)) {
 		t.Fatal("epoch-less frame admitted after the latch armed")
 	}
