@@ -304,26 +304,57 @@ one is the failure:
 
 | peer lookup | principal |
 |---|---|
-| local, attributed to a `system login user` | that class — **a credential cannot upgrade it** |
-| local, attributed to an account outside the login model | a credential may speak for it |
-| **local, NOT attributable** | **DENIED** — no credential fallthrough |
+| local, attributed to a `system login user` | that class |
+| local, attributed to an account **outside** the login model | **DENIED** |
+| local, **NOT** attributable | **DENIED** |
 | not on this host | a credential may speak for it (remote administrator) |
 
-The third row is load-bearing. The first version stated the same intent but
-implemented it as "use the peer UID when the lookup succeeds, else fall back to
-the credential" — and the caller controlled whether it succeeded. A `read-only`
-account holding the api-auth secret escalated to full power by calling
-`shutdown(SHUT_WR)` before the request was authorized: 403 when polite, **200 on
-`/config/enter`** when hostile. A precedence rule that only holds on the success
-path is not a precedence rule.
+Rows 1-3 collapse to one sentence: **a local caller never reaches the credential
+check.** If a local account needs access it is given a class — that is the one
+place access is supposed to be written down.
 
-"Local" is decided by the socket table *and* by the address: a caller whose
-socket is gone entirely (an `SO_LINGER`-0 reset) is still local if its address is
-loopback or belongs to one of our interfaces. That address rule is why
-correctness no longer depends on winning a race with the caller — eager
-resolution removes the attack, the address rule removes the reliance on timing.
-An unreadable socket table is likewise reported as local-and-unattributable, not
-as "remote".
+The rule has been narrowed twice, each time because a weaker version had a hole
+the claim did not admit to:
+
+- **v1** used the peer UID when the lookup *succeeded* and fell back to the
+  credential otherwise. The caller controlled whether it succeeded: a
+  `read-only` account holding the api-auth secret escalated to full power by
+  calling `shutdown(SHUT_WR)` before the request was authorized — 403 when
+  polite, **200 on `/config/enter`** when hostile. A precedence rule that only
+  holds on the success path is not a precedence rule.
+- **v2** denied an *unattributable* local caller but still let the credential
+  speak for an *attributed* one outside the login model — the exact population
+  #5561 exists to constrain. It made the per-principal gate optional for anyone
+  holding the shared password, and it contradicted `docs/system-login.md`, which
+  already said such a caller is denied.
+
+**What "local" is allowed to mean.** Absence from *this* namespace's socket
+table is not evidence of being off-box: a peer in another network namespace
+appears in neither `/proc/net/tcp` nor `net.InterfaceAddrs()` here, and calling
+that "remote" would hand it the credential — the same unsound "not found means
+remote" inference that produced the v1 bypass. So "remote" is never inferred
+from a failed lookup. It is bounded by a kernel guarantee instead: **a
+connection delivered on a loopback address cannot have come from off-box**, since
+the kernel drops packets carrying loopback addresses that arrive on a real
+interface. That covers the entire default management posture — a caller reaching
+the default bind is local whatever the socket table says. A routable delivery
+address falls back to "is the peer one of *our* addresses", which is sound
+positively and carries the residual below negatively. An unreadable or absent
+socket table is reported local-and-unattributable, never remote.
+
+**Residual, stated rather than papered over.** On an **off-loopback** bind, a
+caller in another network namespace on this same host is indistinguishable from
+a remote administrator — a container's veth peer and a real remote client look
+identical in the socket table — so it reaches the credential path. That surface
+is the one #4047 already requires an api-auth credential for, and the credential
+is the designed gate there. The default loopback bind is not affected.
+
+**Scoped IPv6 is refused, not guessed.** `/proc/net/tcp6` prints only the 128
+address bits, never the scope id, so two link-local callers on different
+interfaces render an identical key and the first matching row would win — an
+order-dependent identity, the same defect class as matching on ports alone. A
+scope-qualified peer address is therefore reported local-and-unattributable
+(denied). Mutating the guard out attributes such a caller **uid 0**.
 
 **UID 0 is authorized unconditionally**, without consulting `/etc/passwd` or the
 active config. Root owns the daemon and the on-disk config DB, so denying it
@@ -374,12 +405,26 @@ which would refuse every mutation on it after an unrelated bind change.
 and `TestPeerIdentityIsResolvedAtAccept_5561` pins the once-per-connection
 timing (a per-request lookup is what the caller used to be able to defeat).
 
-**Cost.** The lookup is a bounded read of the kernel socket table in
-`http.Server`'s accept loop, once per accepted connection. The "is this address
-one of ours" check runs only when the socket lookup already failed, so a
-legitimate caller never reaches it. This is a control-plane listener answering a
-handful of operator actions per second; the trade is an identity the caller
-cannot influence.
+**Cost, and why it is off the accept loop.** `ConnContext` runs **serially** in
+`http.Server`'s accept loop, and a peer whose socket is not found costs a walk of
+the socket table. Resolving inline therefore let connection churn serialize those
+walks behind `Accept` and fill the listen backlog — locking out remote
+administrators before api-auth was even evaluated. Two changes bound it:
+
+- The lookup is **started** at accept but runs in its own goroutine. A request
+  that arrives before its lookup finishes waits for it; a wedged lookup denies
+  (`peerLookupTimeout`) rather than hangs. The ESTABLISHED guarantee is
+  unaffected — the inputs are fixed at accept, so the timing is still outside the
+  caller's control.
+- A peer that **cannot be local** does no socket-table work at all: locality is
+  classified from addresses first, so churn from a routable address is a couple
+  of comparisons. The host-address set behind that check is cached for one second
+  and refreshed at most once per second on a miss, so a flood cannot amplify
+  through it either.
+
+A *local* attacker can still cause one socket-table walk per connection, off the
+accept loop. They already have a shell on the box, the listener's read-side
+timeouts still apply, and the outcome is fail-closed.
 
 **Known residual (not #5561).** The READ surface — REST GETs, `/api/v1/show-text`
 — is unchanged and remains reachable by any local process on a loopback bind.

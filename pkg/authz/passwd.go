@@ -88,5 +88,6 @@ func SetProcNetTCPPathsForTest(v4, v6 string) (restore func()) {
 func setLocalAddrsForTest(addrs []net.Addr) (restore func()) {
 	prev := localAddrsFn
 	localAddrsFn = func() ([]net.Addr, error) { return addrs, nil }
-	return func() { localAddrsFn = prev }
+	resetLocalAddrCacheForTest()
+	return func() { localAddrsFn = prev; resetLocalAddrCacheForTest() }
 }

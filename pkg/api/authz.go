@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/psaab/xpf/pkg/authz"
 	"github.com/psaab/xpf/pkg/config"
@@ -99,43 +100,97 @@ var restMutationPermissions = map[string]config.LoginClassPermission{
 
 type peerIdentityKey struct{}
 
+// peerLookupTimeout bounds how long a request waits for its connection's peer
+// lookup. It only elapses if the socket-table read is wedged; a timeout yields
+// no identity, which denies.
+const peerLookupTimeout = 5 * time.Second
+
+// pendingPeer is a connection's peer identity, resolved once, asynchronously,
+// starting at accept.
+type pendingPeer struct {
+	done chan struct{}
+	id   authz.PeerIdentity
+}
+
+// wait blocks until the lookup finishes, the request context is cancelled, or
+// peerLookupTimeout elapses. ok=false means no identity is available and the
+// caller must deny.
+func (p *pendingPeer) wait(ctx context.Context) (authz.PeerIdentity, bool) {
+	select {
+	case <-p.done:
+		return p.id, true
+	default:
+	}
+	t := time.NewTimer(peerLookupTimeout)
+	defer t.Stop()
+	select {
+	case <-p.done:
+		return p.id, true
+	case <-ctx.Done():
+		return authz.PeerIdentity{}, false
+	case <-t.C:
+		return authz.PeerIdentity{}, false
+	}
+}
+
 // connContext is the http.Server ConnContext hook (wired by buildHTTPServer /
-// buildHTTPSServer). It resolves the peer's identity ONCE, at accept, and caches
-// it on the connection.
+// buildHTTPSServer). It STARTS the peer lookup for this connection, at accept,
+// and hands every request on the connection the same pending result.
 //
-// The first version deferred this to the authorization check, reasoning that the
-// client is blocked awaiting a response and so its socket is established for
-// exactly the window that matters. That reasoning assumed a COOPERATIVE client
-// and was wrong: `shutdown(fd, SHUT_WR)` takes the socket out of ESTABLISHED
-// while still letting the caller read the response, so a caller could choose the
-// moment of the lookup and choose to make it fail. Resolving at accept takes that
-// choice away — the identity is fixed when the connection is established, which
-// is the SO_PEERCRED semantic this is standing in for.
+// Why it is started at accept rather than at the authorization check: the first
+// version deferred it, reasoning that the client is blocked awaiting a response
+// and so its socket is established for exactly the window that matters. That
+// assumed a COOPERATIVE client and was wrong — `shutdown(fd, SHUT_WR)` leaves
+// ESTABLISHED while still letting the caller read the response, so the caller
+// could choose the moment of the lookup and choose to make it fail. Starting it
+// at accept takes that choice away: the inputs are fixed when the connection is
+// established, which is the SO_PEERCRED semantic this stands in for.
 //
-// The lookup runs in http.Server's accept loop, so it is on the path of every
-// accepted connection. It is one bounded read of the kernel socket table on a
-// control-plane listener that answers a handful of operator actions per second,
-// which is the right trade for an identity a caller cannot influence. Note that
-// correctness does NOT depend on the timing: authz.LookupPeer reports a caller
-// whose socket has vanished as LOCAL-but-unattributable (by address), which
-// denies. Eager resolution removes the attack; the address rule removes the
-// reliance on winning a race.
+// Why it runs in a goroutine rather than inline: ConnContext executes SERIALLY
+// in http.Server's accept loop, and a peer whose socket is not found costs a
+// full walk of the socket table. Connection churn would then serialize those
+// walks behind Accept and fill the listen backlog — locking out remote
+// administrators before api-auth is even evaluated. Off the accept path, the
+// listener keeps accepting; a request that arrives before its lookup finishes
+// simply waits for it, and a wedged lookup denies rather than hangs. The
+// ESTABLISHED guarantee is unaffected: the lookup is started at accept, not at
+// request time, so its timing is still outside the caller's control.
+//
+// authz.LookupPeer additionally does NO socket-table work at all for a peer that
+// cannot be local, so the churn that motivates this is cheap on both counts.
 func (s *Server) connContext(ctx context.Context, c net.Conn) context.Context {
-	return context.WithValue(ctx, peerIdentityKey{}, s.lookupPeer(c.RemoteAddr(), c.LocalAddr()))
+	client, server := c.RemoteAddr(), c.LocalAddr()
+	p := &pendingPeer{done: make(chan struct{})}
+	go func() {
+		defer close(p.done)
+		p.id = s.lookupPeer(client, server)
+	}()
+	return context.WithValue(ctx, peerIdentityKey{}, p)
 }
 
 // lookupPeer resolves the peer identity through the injected resolver
-// (Config.PeerLookupFn) or pkg/authz's kernel lookup.
+// (Config.PeerLookupFn) or pkg/authz's kernel lookup, normalizing the result.
+//
+// The normalization exists because an injected resolver is not bound by
+// LookupPeer's invariants and could report the nonsensical (OK, !Local): an
+// attributed peer is local by construction — we read its UID out of THIS host's
+// socket table. Left unnormalized, that state would reach the precedence rule as
+// "attributed but off-box", a combination the policy has no row for.
 func (s *Server) lookupPeer(client, server net.Addr) authz.PeerIdentity {
-	if s.peerLookupFn != nil {
-		return s.peerLookupFn(client, server)
+	fn := s.peerLookupFn
+	if fn == nil {
+		fn = authz.LookupPeer
 	}
-	return authz.LookupPeer(client, server)
+	id := fn(client, server)
+	if id.OK {
+		id.Local = true
+	}
+	return id
 }
 
-func peerIdentityFrom(ctx context.Context) (authz.PeerIdentity, bool) {
-	id, ok := ctx.Value(peerIdentityKey{}).(authz.PeerIdentity)
-	return id, ok
+func peerIdentityFrom(ctx context.Context) (*pendingPeer, bool) {
+	p, ok := ctx.Value(peerIdentityKey{}).(*pendingPeer)
+	return p, ok
 }
 
 // activeConfig returns the active config snapshot the login model is read from,
@@ -153,61 +208,59 @@ func (s *Server) activeConfig() *config.Config {
 
 // principal derives the caller's server-side identity for one request (#5561).
 //
-// The precedence rule is: WHEN THE CALLER IS LOCAL, THE PEER IDENTITY IS
-// AUTHORITATIVE. A credential may speak only for a caller the login model does
-// not describe, or for one that is not on this host at all.
+// The precedence rule is: IF THE CALLER IS ON THIS HOST, THE LOGIN MODEL IS THE
+// ONLY AUTHORITY. An api-auth credential may speak only for a caller that is not
+// local.
 //
-// The first version stated the same intent — "a peer UID outranks a credential"
-// — but implemented it as "use the peer UID when the lookup SUCCEEDS, otherwise
-// fall back to the credential". The caller controlled whether the lookup
-// succeeded (half-close before the request was authorized), so a `read-only`
-// account holding the api-auth secret escalated to full power just by calling
-// `shutdown(SHUT_WR)` first. A guard scoped to the success case is not a
-// precedence rule; the failure case is where precedence matters. The four
-// outcomes are now explicit:
+// This has been narrowed twice, each time because a weaker version had a hole
+// the claim above did not admit to:
 //
-//  1. Local and attributed to a configured `system login user` — that class is
-//     the answer. A credential CANNOT upgrade it. This is the property the
-//     issue is about: a restricted account stays restricted even if it also
-//     knows a shared secret.
-//  2. Local and attributed to an account the login model does not cover — the
-//     operator has assigned it no class, so a credential (an explicit operator
-//     grant) may speak for it.
-//  3. Local but NOT attributable — DENIED. No credential fallthrough. This is
-//     the row that used to escalate; a caller that can make its own identity
-//     unreadable must not thereby become anonymous-with-a-password.
+//   - v1 used the peer UID when the lookup SUCCEEDED and fell back to the
+//     credential otherwise. The caller controlled whether it succeeded
+//     (half-close), so a `read-only` account holding the shared secret reached
+//     full power.
+//   - v2 denied an UNATTRIBUTABLE local caller but still let the credential
+//     speak for an ATTRIBUTED one that was not a configured `system login user`.
+//     That is the population #5561 exists to constrain, and it made the
+//     per-principal gate optional for anyone holding the password. The operator
+//     doc already said such a caller is denied; the code did not.
+//
+// So the four outcomes are:
+//
+//  1. Local, attributed to a configured `system login user` — that class decides.
+//  2. Local, attributed to an account the login model does not cover — DENIED.
+//     Grant it a class if it needs access; that is the one place access is
+//     supposed to be written down.
+//  3. Local, not attributable — DENIED.
 //  4. Not on this host — a remote administrator, which is exactly what the
 //     api-auth credential exists to identify (#4047 requires one for any
 //     off-loopback bind).
+//
+// Rows 1-3 collapse to: a local caller never reaches s.credential.
 func (s *Server) principal(r *http.Request) authz.Principal {
-	cfg := s.activeConfig()
-
-	id, ok := peerIdentityFrom(r.Context())
+	pending, ok := peerIdentityFrom(r.Context())
 	if !ok {
 		// No ConnContext ran for this connection, so we cannot even tell whether
 		// the caller is local — and therefore cannot tell whether a credential
 		// is allowed to speak for it. Refuse rather than guess.
 		return authz.Unauthenticated("connection identity was not captured at accept")
 	}
+	id, resolved := pending.wait(r.Context())
+	if !resolved {
+		return authz.Unauthenticated("peer identity lookup did not complete for this connection")
+	}
 
 	if id.OK {
-		p := authz.PrincipalForUID(cfg, id.UID)
-		if p.Resolved() {
-			return p // (1) authoritative — no credential may override it
-		}
-		if cp, ok := s.credential(r); ok {
-			return cp // (2) outside the login model; the credential may grant it
-		}
-		return p
+		// (1) and (2). PrincipalForUID yields an unresolved principal for an
+		// account outside the login model, which Authorize denies — and no
+		// credential is consulted on the way there.
+		return authz.PrincipalForUID(s.activeConfig(), id.UID)
 	}
-
 	if id.Local {
-		// (3) A caller on this host that could not be attributed.
 		return authz.Unauthenticated("caller is local but could not be identified: " + id.Detail)
 	}
-
 	if cp, ok := s.credential(r); ok {
-		return cp // (4) remote administrator
+		return cp // (4)
 	}
 	return authz.Unauthenticated(id.Detail)
 }

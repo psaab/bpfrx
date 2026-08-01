@@ -305,6 +305,74 @@
   `pkg/config/compiler_chassis_packed_monitor_6588_test.go` (new),
   `docs/config-schema.md`, `_Log.md`
 
+## 2026-08-01 — #5561 review round 2: four MAJORs from Codex, all in my own gate
+
+- **Timestamp**: 2026-08-01 (fix/5561-rest-config-auth, PR #6645)
+- **Action**: Round-2 review returned DO-NOT-MERGE with four MAJORs. Round-1's
+  two fixes were confirmed real and test-bound; these are four further holes
+  in the same gate.
+  **MAJOR A — the precedence claim was still not implemented, and the code
+  contradicted our own doc.** In the `(OK, Local)` branch, a UID that resolved
+  to a real OS account with no `system login user` stanza fell through to
+  `s.credential(r)` — so an *attributed* local account outside the login model
+  became full-power via the shared secret, exactly the population #5561
+  constrains. `docs/system-login.md` already said such a caller is denied; the
+  code did not. The doc was right. The rule is now: **a local caller never
+  reaches the credential check.** If a local account needs access it gets a
+  class — that is the one place access is supposed to be written down. No
+  legitimate workflow was identified that needs the fallback; the remedy (grant
+  a class) is one commit and is documented.
+  **MAJOR B — netns callers were classified REMOTE, so they got the credential.**
+  Absence from THIS namespace's socket table (and from its `InterfaceAddrs`) is
+  not evidence of being off-box. This was the same unsound "not found means
+  remote" inference as round 1's MAJOR 2, one layer down. Fixed by bounding
+  "remote" with a kernel guarantee instead of an inference: **a connection
+  DELIVERED on a loopback address cannot have come from off-box** (the kernel
+  drops martian packets carrying loopback addresses on a real interface), so
+  the entire default management posture is local by construction whatever the
+  socket table says. The off-loopback residual (a container veth peer is
+  genuinely indistinguishable from a remote client) is stated in
+  pkg/api/README.md rather than papered over — and that surface is the one
+  #4047 already requires api-auth for.
+  **MAJOR C — IPv6 zone was discarded.** `/proc/net/tcp6` prints only the 128
+  address bits, never the scope id, so two link-local callers on different
+  interfaces render an identical key and the first established row wins —
+  order-dependent identity, the same defect class as matching on ports alone.
+  A scope-qualified peer address is now REFUSED (local-and-unattributable)
+  rather than guessed at.
+  **MAJOR D — accept-loop DoS, a direct cost of the eager resolution added in
+  round 1.** `ConnContext` runs serially in http.Server's accept loop and a
+  peer with no socket row cost a full walk of both tables, so connection churn
+  serialized those walks behind Accept and could fill the listen backlog —
+  locking out remote administrators before api-auth was evaluated. Fixed
+  without returning to lazy resolution (that reopens round 1's MAJOR 2): the
+  lookup is STARTED at accept but runs in its own goroutine, and locality is
+  now classified from addresses BEFORE any table read, so a peer that cannot
+  be local does zero socket-table work. The host-address set is cached 1s and
+  refreshed at most once per second on a miss, so a flood cannot amplify
+  through that either.
+  **MINOR** — `Config.PeerLookupFn` was returned verbatim, letting an injected
+  resolver construct the invalid `(OK=true, Local=false)` state `LookupPeer`
+  never produces. Normalized at the boundary.
+- **File(s)**: `pkg/authz/peer.go`, `pkg/authz/passwd.go`,
+  `pkg/authz/peer_5561_test.go`, `pkg/api/authz.go`,
+  `pkg/api/config_authz_5561_test.go`, `pkg/api/README.md`,
+  `docs/system-login.md`
+- **Validation**: 5 mutations, `go build ./...` and `go vet ./...` CLEAN under
+  each, each an assertion-level red. (A) restore the credential fallthrough
+  for an attributed local account -> all four routes admitted with the secret;
+  the discriminating control — an attributed local UID that IS in the login
+  model — stays green. (B) drop the loopback-delivery guarantee -> "a
+  connection DELIVERED on a loopback address was reported off-box". (C) drop
+  the zone guard -> "a scope-qualified peer was attributed uid 0". (D1) drop
+  the locality pre-classification -> "a routable, non-local peer read the
+  socket table". (D2) resolve inline in ConnContext -> "only 1 of 2 peer
+  lookups started while the first was still running". Note the C test was
+  strengthened mid-round: its first form red on a weak assertion because a
+  hand-written /proc hex fixture never matched, so the mutation was not
+  exposing the misattribution it guards. The fixture is now built from the
+  encoder (pinned independently by TestProcAddrEncoding_5561) and the mutation
+  exposes uid 0. Full `go test ./... -count=1` green (exit 0).
 ## 2026-08-01 — #5561 review round 1: two MAJOR authorization bypasses in my own fix
 
 - **Timestamp**: 2026-08-01 (fix/5561-rest-config-auth, PR #6645)

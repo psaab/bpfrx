@@ -4,6 +4,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -239,15 +240,138 @@ func TestLookupPeerFailsClosedOnUnreadableTable_5561(t *testing.T) {
 	restore := setLocalAddrsForTest(nil) // no local addresses at all
 	defer restore()
 
+	// A LOOPBACK-delivered connection: locality is already established from the
+	// addresses, so the unreadable table decides only attribution.
 	id := LookupPeer(
-		&net.TCPAddr{IP: net.IPv4(198, 51, 100, 7), Port: 51234},
-		&net.TCPAddr{IP: net.IPv4(10, 0, 61, 1), Port: 8080})
+		&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 51234},
+		&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8080})
 	if id.OK {
 		t.Fatalf("an unreadable socket table produced an identity: %+v", id)
 	}
 	if !id.Local {
 		t.Fatalf("an unreadable socket table reported the caller off-box (%+v) — a local "+
 			"caller could then be spoken for by a credential", id)
+	}
+}
+
+// TestLoopbackDeliveryIsLocalWithoutASocketRow_5561 is the MAJOR-B guard.
+//
+// Absence from THIS namespace's socket table is not evidence of being off-box: a
+// caller in another network namespace appears in neither /proc/net/tcp nor
+// net.InterfaceAddrs() here. Treating that as "remote" hands it the api-auth
+// credential, which is the same unsound "not found means remote" inference that
+// produced the half-close bypass.
+//
+// A connection DELIVERED on a loopback address is local by kernel guarantee —
+// the kernel drops packets carrying loopback addresses that arrive on a real
+// interface — so it must be reported local even when nothing about the CALLER is
+// recognizable. That covers the entire default management posture.
+func TestLoopbackDeliveryIsLocalWithoutASocketRow_5561(t *testing.T) {
+	dir := t.TempDir()
+	// An empty socket table: no row for anyone.
+	empty := filepath.Join(dir, "tcp")
+	write(t, empty, "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n")
+	defer SetProcNetTCPPathsForTest(empty, empty)()
+	// And no interface addresses at all, so the ADDRESS fallback cannot rescue it
+	// either — only the loopback-delivery rule can.
+	defer setLocalAddrsForTest(nil)()
+
+	id := LookupPeer(
+		&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 51234},
+		&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8080})
+	if id.OK {
+		t.Fatalf("an empty socket table produced an identity: %+v", id)
+	}
+	if !id.Local {
+		t.Fatalf("a connection DELIVERED on a loopback address was reported off-box (%+v) — "+
+			"a caller in another netns, or one that reset its socket, would be handed the "+
+			"api-auth credential path on the default management bind", id)
+	}
+}
+
+// TestLookupPeerRefusesScopedPeerAddress_5561 is the MAJOR-C guard.
+//
+// /proc/net/tcp6 prints only the 128 address bits, never the scope id, so two
+// link-local callers on different interfaces render the IDENTICAL key. Matching
+// on that key and taking the first established row makes identity
+// order-dependent — the same defect class as matching on ports alone. A scoped
+// peer address must be refused, not guessed at.
+func TestLookupPeerRefusesScopedPeerAddress_5561(t *testing.T) {
+	client := &net.TCPAddr{IP: net.ParseIP("fe80::ee01:0:0:1"), Port: 43210, Zone: "eth0"}
+	server := &net.TCPAddr{IP: net.ParseIP("fe80::e01:0:0:1"), Port: 8080, Zone: "eth0"}
+
+	// Build the row from the encoder (whose output is pinned independently by
+	// TestProcAddrEncoding_5561) so a hand-written hex typo cannot make this
+	// test pass for the wrong reason. The row's UID is 0: /proc carries no scope
+	// id, so a caller on a DIFFERENT interface with the same link-local bits
+	// would be attributed this row — root.
+	cl, ok := procAddr6(client)
+	if !ok {
+		t.Fatal("cannot render client address")
+	}
+	sv, ok := procAddr6(server)
+	if !ok {
+		t.Fatal("cannot render server address")
+	}
+	dir := t.TempDir()
+	v6 := filepath.Join(dir, "tcp6")
+	write(t, v6, "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"+
+		"   0: "+cl+" "+sv+" 01 00000000:00000000 00:00000000 00000000     0        0 4242 1 0000000000000000 100 0 0 10 0\n")
+	defer SetProcNetTCPPathsForTest(filepath.Join(dir, "tcp"), v6)()
+
+	// Establish locality by address so the zone guard is the ONLY thing between
+	// this caller and the ambiguous row. Without this the lookup short-circuits
+	// as "not on this host" and the test would pass for an unrelated reason.
+	defer setLocalAddrsForTest([]net.Addr{
+		&net.IPNet{IP: net.ParseIP("fe80::ee01:0:0:1"), Mask: net.CIDRMask(64, 128)},
+	})()
+
+	// Precondition: the identical row IS matched for an UNSCOPED caller, so a
+	// refusal below is the zone and not a broken matcher.
+	unscoped := &net.TCPAddr{IP: client.IP, Port: client.Port}
+	if id := LookupPeer(unscoped, &net.TCPAddr{IP: server.IP, Port: server.Port}); !id.OK {
+		t.Fatalf("precondition: the row was not matched for an unscoped caller: %+v", id)
+	}
+
+	id := LookupPeer(client, server)
+	if id.OK {
+		t.Fatalf("a scope-qualified peer was attributed uid %d from a row that carries no "+
+			"scope id — two link-local callers on different interfaces render the same key, "+
+			"so this identity is whichever row came first", id.UID)
+	}
+	if !id.Local {
+		t.Error("refusing to attribute a scoped peer must DENY, not fall through to a credential")
+	}
+	if !strings.Contains(id.Detail, "scope-qualified") {
+		t.Errorf("detail does not explain the refusal: %q", id.Detail)
+	}
+}
+
+// TestNonLocalPeerReadsNoSocketTable_5561 is the MAJOR-D guard at this layer: a
+// peer that cannot be local must cost ZERO socket-table work, so connection
+// churn from a routable address cannot serialize full /proc walks behind the
+// accept loop.
+//
+// The probe is precise rather than timing-based: the table paths point at files
+// that do not exist. If the code reads the table it gets "no socket table could
+// be read", which fails CLOSED to Local=true. Only a short-circuit before the
+// read yields a non-local answer.
+func TestNonLocalPeerReadsNoSocketTable_5561(t *testing.T) {
+	dir := t.TempDir()
+	defer SetProcNetTCPPathsForTest(filepath.Join(dir, "absent"), filepath.Join(dir, "absent6"))()
+	defer setLocalAddrsForTest([]net.Addr{
+		&net.IPNet{IP: net.IPv4(10, 0, 61, 1), Mask: net.CIDRMask(24, 32)},
+	})()
+
+	id := LookupPeer(
+		&net.TCPAddr{IP: net.IPv4(198, 51, 100, 7), Port: 51234},
+		&net.TCPAddr{IP: net.IPv4(10, 0, 61, 1), Port: 8080})
+	if id.Local {
+		t.Fatalf("a routable, non-local peer read the socket table (%+v) — every connection "+
+			"from off-box would walk /proc, which is the accept-loop flood", id)
+	}
+	if id.OK {
+		t.Fatalf("a non-local peer was attributed: %+v", id)
 	}
 }
 

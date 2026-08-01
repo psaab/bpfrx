@@ -172,13 +172,18 @@ func postRoute(t *testing.T, base, route string, hdrs map[string]string) (int, s
 
 // enterConfigure opens a configure session over the guarded route and returns
 // the session token the subsequent mutation must carry.
-func enterConfigure(t *testing.T, base string) string {
+func enterConfigure(t *testing.T, base string, hdrs ...map[string]string) string {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, base+"/api/v1/config/enter", strings.NewReader("{}"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	for _, h := range hdrs {
+		for k, v := range h {
+			req.Header.Set(k, v)
+		}
+	}
 	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -384,36 +389,35 @@ func TestUnknownMutatingRouteFailsClosed_5561(t *testing.T) {
 	}
 }
 
-// TestApiAuthCredentialIsAFullPowerPrincipal_5561 covers the second identity
-// and its precedence. A valid api-auth credential authorizes a caller whose UID
-// resolves to nothing — but it does NOT re-privilege a caller the peer identity
-// already places in a restricted class, which is the whole point of preferring
-// the more specific identity.
+// TestApiAuthCredentialIsAFullPowerPrincipal_5561 covers the second identity and
+// its precedence. A valid api-auth credential authorizes a caller that is NOT on
+// this host — the remote administrator #4047 requires it for — and it does not
+// speak for ANY local caller, identified or not.
 func TestApiAuthCredentialIsAFullPowerPrincipal_5561(t *testing.T) {
 	usePasswdFixture(t)
 	auth := &AuthConfig{Users: map[string]string{"webadmin": "s3cret"}}
 	basic := "Basic " + base64.StdEncoding.EncodeToString([]byte("webadmin:s3cret"))
 
-	t.Run("credential authorizes an otherwise unidentifiable caller", func(t *testing.T) {
+	t.Run("credential authorizes a caller that is not on this host", func(t *testing.T) {
 		_, base := authzServer(t, Config{
 			Addr:         "127.0.0.1:8080",
 			Store:        authzStore(t, authzTestConfig),
 			Auth:         auth,
-			PeerLookupFn: fixedPeerUID(authzUIDStranger), // real account, not a login user
+			PeerLookupFn: remotePeer(),
 		})
 		status, errMsg := postRoute(t, base, "POST /api/v1/config/enter",
 			map[string]string{"Authorization": basic})
 		if status == http.StatusForbidden {
-			t.Fatalf("a valid api-auth credential was refused: %q", errMsg)
+			t.Fatalf("a valid api-auth credential was refused for an off-box caller: %q", errMsg)
 		}
 	})
 
-	t.Run("without the credential the same caller is refused", func(t *testing.T) {
+	t.Run("without the credential the same remote caller is refused", func(t *testing.T) {
 		_, base := authzServer(t, Config{
 			Addr:         "127.0.0.1:8080",
 			Store:        authzStore(t, authzTestConfig),
 			Auth:         auth,
-			PeerLookupFn: fixedPeerUID(authzUIDStranger),
+			PeerLookupFn: remotePeer(),
 		})
 		status, _ := postRoute(t, base, "POST /api/v1/config/enter", nil)
 		// The api-auth middleware answers first with its own 401 challenge.
@@ -437,6 +441,90 @@ func TestApiAuthCredentialIsAFullPowerPrincipal_5561(t *testing.T) {
 		}
 		if !strings.Contains(errMsg, "opsuser") {
 			t.Errorf("denial did not attribute the read-only account: %q", errMsg)
+		}
+	})
+}
+
+// TestAttributedLocalCallerOutsideLoginModelIsDenied_5561 pins row (2) of the
+// precedence table, and is the MAJOR-A guard.
+//
+// An earlier version denied an UNATTRIBUTABLE local caller but still let an
+// api-auth credential speak for an ATTRIBUTED one that was not a configured
+// `system login user`. That is exactly the population #5561 exists to constrain:
+// it made the per-principal gate optional for anyone holding the shared
+// password, and it contradicted docs/system-login.md, which already said such a
+// caller is denied.
+//
+// The rule is now: a caller on this host is governed by the login model and
+// nothing else. If a local account needs access, it gets a class — that is the
+// one place access is supposed to be written down.
+func TestAttributedLocalCallerOutsideLoginModelIsDenied_5561(t *testing.T) {
+	usePasswdFixture(t)
+	auth := &AuthConfig{Users: map[string]string{"webadmin": "s3cret"}}
+	basic := "Basic " + base64.StdEncoding.EncodeToString([]byte("webadmin:s3cret"))
+
+	t.Run("attributed local account outside the login model is refused", func(t *testing.T) {
+		_, base := authzServer(t, Config{
+			Addr:  "127.0.0.1:8080",
+			Store: authzStore(t, authzTestConfig),
+			Auth:  auth,
+			// A REAL OS account (uid 4244 = "stranger") that carries no
+			// `system login user` stanza.
+			PeerLookupFn: fixedPeerUID(authzUIDStranger),
+		})
+		for _, route := range []string{
+			"POST /api/v1/config/enter",
+			"POST /api/v1/config/set",
+			"POST /api/v1/config/commit",
+			"POST /api/v1/system/action",
+		} {
+			status, errMsg := postRoute(t, base, route, map[string]string{"Authorization": basic})
+			if status != http.StatusForbidden {
+				t.Errorf("%s admitted a local account OUTSIDE the login model with %d because "+
+					"it presented the shared api-auth secret — the per-principal gate is "+
+					"optional for anyone who knows the password", route, status)
+			}
+			if !strings.Contains(errMsg, "not a configured") {
+				t.Errorf("%s denial did not name the reason: %q", route, errMsg)
+			}
+		}
+	})
+
+	// The discriminating control: an attributed local UID that IS in the login
+	// model, with a class that holds `configure`, still works normally. A gate
+	// that simply refused every local caller would pass the subtest above and
+	// fail this one.
+	t.Run("attributed local account INSIDE the login model still works", func(t *testing.T) {
+		store := authzStore(t, authzTestConfig)
+		_, base := authzServer(t, Config{
+			Addr:         "127.0.0.1:8080",
+			Store:        store,
+			Auth:         auth,
+			PeerLookupFn: fixedPeerUID(authzUIDSuperuser), // uid 4243 = adminuser, super-user
+		})
+		// The credential is presented here too, so this subtest and the one above
+		// differ in EXACTLY one variable: whether the attributed uid is in the
+		// login model.
+		session := enterConfigure(t, base, map[string]string{"Authorization": basic})
+		body := strings.NewReader(`{"input":"set system host-name inside-model"}`)
+		req, err := http.NewRequest(http.MethodPost, base+"/api/v1/config/set", body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", basic)
+		req.Header.Set(restConfigSessionHeader, session)
+		resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("a super-user login account was refused config/set: %d %s", resp.StatusCode, raw)
+		}
+		if candidate := store.ShowCandidate(); !strings.Contains(candidate, "inside-model") {
+			t.Fatalf("config/set returned 200 but the candidate does not carry the edit:\n%s", candidate)
 		}
 	})
 }
@@ -651,6 +739,113 @@ func TestPeerIdentityIsResolvedAtAccept_5561(t *testing.T) {
 	if got := count(); got != 2 {
 		t.Fatalf("a second connection resolved the peer %d times in total, want 2 — the "+
 			"identity must be per connection, never shared between callers", got)
+	}
+}
+
+// TestPeerLookupDoesNotBlockTheAcceptLoop_5561 is the MAJOR-D guard.
+//
+// ConnContext runs SERIALLY in http.Server's accept loop. A peer whose socket is
+// not found costs a walk of the socket table, so resolving inline meant
+// connection churn serialized those walks behind Accept and filled the listen
+// backlog — locking out remote administrators before api-auth was even
+// evaluated.
+//
+// The probe is deterministic rather than timing-based: the injected resolver
+// blocks until the test releases it. If ConnContext resolves inline, the accept
+// loop is stuck inside the FIRST connection's lookup and the second connection
+// is never accepted, so the resolver is entered exactly once. Off the accept
+// path, both connections are accepted and both lookups are in flight.
+func TestPeerLookupDoesNotBlockTheAcceptLoop_5561(t *testing.T) {
+	usePasswdFixture(t)
+
+	release := make(chan struct{})
+	entered := make(chan struct{}, 8)
+	blocking := func(net.Addr, net.Addr) authz.PeerIdentity {
+		entered <- struct{}{}
+		<-release
+		return authz.PeerIdentity{UID: authzUIDSuperuser, OK: true, Local: true}
+	}
+	defer close(release)
+
+	_, base := authzServer(t, Config{
+		Addr:         "127.0.0.1:8080",
+		Store:        authzStore(t, authzTestConfig),
+		PeerLookupFn: blocking,
+	})
+	addr := strings.TrimPrefix(base, "http://")
+
+	// Two independent connections, neither of which needs to complete a request.
+	for i := 0; i < 2; i++ {
+		c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			t.Fatalf("dial %d: %v", i, err)
+		}
+		defer c.Close()
+		// Write a byte so the server's serve goroutine is definitely engaged.
+		_, _ = c.Write([]byte("G"))
+	}
+
+	deadline := time.After(10 * time.Second)
+	for got := 0; got < 2; got++ {
+		select {
+		case <-entered:
+		case <-deadline:
+			t.Fatalf("only %d of 2 peer lookups started while the first was still "+
+				"running — ConnContext is resolving inline, so the accept loop is "+
+				"serialized behind every socket-table walk and connection churn can "+
+				"fill the listen backlog", got)
+		}
+	}
+}
+
+// TestInjectedResolverIsNormalized_5561 covers the boundary normalization: an
+// injected resolver is not bound by LookupPeer's invariants and can report the
+// nonsensical (OK=true, Local=false). An attributed peer is local by
+// construction — its UID came out of THIS host's socket table — so the
+// combination must be normalized before it reaches the precedence rule, which
+// has no row for "attributed but off-box".
+//
+// Unnormalized, such an identity would take the OK branch anyway, so the visible
+// consequence is subtle: it is the invariant, not the outcome, that is pinned
+// here. The observable assertion is that a restricted class still governs and
+// the credential is never consulted.
+func TestInjectedResolverIsNormalized_5561(t *testing.T) {
+	usePasswdFixture(t)
+	auth := &AuthConfig{Users: map[string]string{"webadmin": "s3cret"}}
+	basic := "Basic " + base64.StdEncoding.EncodeToString([]byte("webadmin:s3cret"))
+
+	s := NewServer(Config{
+		Addr:  "127.0.0.1:8080",
+		Store: authzStore(t, authzTestConfig),
+		Auth:  auth,
+		PeerLookupFn: func(net.Addr, net.Addr) authz.PeerIdentity {
+			return authz.PeerIdentity{UID: authzUIDReadOnly, OK: true, Local: false}
+		},
+	})
+	got := s.lookupPeer(&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1},
+		&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8080})
+	if !got.Local {
+		t.Fatal("an ATTRIBUTED peer identity was left marked non-local — the precedence " +
+			"rule has no row for that combination, and treating it as off-box would let a " +
+			"credential speak for a caller we identified")
+	}
+
+	// End to end, the read-only class still governs and the credential does not
+	// rescue it.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := s.buildHTTPServer(ln.Addr().String())
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	status, errMsg := postRoute(t, "http://"+ln.Addr().String(), "POST /api/v1/config/enter",
+		map[string]string{"Authorization": basic})
+	if status != http.StatusForbidden {
+		t.Fatalf("a read-only principal marked non-local was admitted with %d", status)
+	}
+	if !strings.Contains(errMsg, "opsuser") {
+		t.Errorf("denial did not attribute the read-only account: %q", errMsg)
 	}
 }
 

@@ -93,10 +93,12 @@ identity, so it is a real boundary rather than an advisory one:
   it explicitly with `set system login user <account> class <class>` if it needs
   access.
 - A local caller the server cannot identify is **denied**, and an `api-auth`
-  credential does not substitute for it. The credential speaks only for a
-  caller outside the login model or one that is not on this host — otherwise a
-  restricted account that also knew the shared secret could escape its class
-  simply by making its own identity unreadable.
+  credential does not substitute for it. In fact **no local caller ever reaches
+  the credential check**: the credential speaks only for a caller that is not on
+  this host (the remote administrator #4047 requires it for). Otherwise a
+  restricted account that also knew the shared secret could escape its class,
+  either by making its own identity unreadable or simply by not being in the
+  login model.
 - Read-only endpoints, `/health` and `/metrics` are unaffected.
 
 ### Custom login classes (accept-with-advisory, #4304 S-2)

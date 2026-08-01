@@ -8,6 +8,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 // peer.go answers "who is on the other end of this connection" from the
@@ -63,6 +65,27 @@ import (
 //
 // PeerIdentity therefore reports Local separately from OK. See the type.
 //
+// # What "not local" is allowed to mean
+//
+// Absence from THIS namespace's socket table is not evidence that a caller is
+// off-box: a peer in another network namespace on this same host appears in
+// neither /proc/net/tcp nor net.InterfaceAddrs() here, and calling that "remote"
+// would hand it the credential path — the same unsound "not found means remote"
+// inference that made the half-close bypass possible.
+//
+// So "remote" is never inferred from a failed lookup alone. It is bounded by a
+// property the kernel guarantees rather than one we deduce: **a connection
+// DELIVERED on a loopback address cannot have come from off-box** (the kernel
+// drops martian packets carrying a loopback source or destination on a real
+// interface). Every connection to the default loopback-only management bind is
+// therefore local by construction, whether or not its socket is found.
+//
+// For a connection delivered on a routable address the distinction is genuinely
+// unobservable — a container's veth peer and a remote administrator are
+// indistinguishable from the socket table — and that surface is the one #4047
+// requires an api-auth credential for. The residual is stated in
+// pkg/api/README.md rather than papered over.
+//
 // # The state requirement, and the race it closes
 //
 // Only a socket in TCP_ESTABLISHED yields a UID.
@@ -92,6 +115,80 @@ var (
 // can drive the "is the peer one of our own addresses" decision deterministically
 // instead of depending on the machine's interfaces.
 var localAddrsFn = net.InterfaceAddrs
+
+// localAddrTTL bounds how long a cached interface-address snapshot is reused.
+//
+// The snapshot exists so connection churn from a routable peer cannot force one
+// netlink dump per connection. A MISS still refreshes — but at most once per
+// TTL, so a flood cannot amplify through it. The staleness this admits is
+// one-directional and bounded: for up to one TTL after an address is added to
+// this host, a caller arriving from that brand-new address is classified as
+// off-box. Connections delivered on a loopback address never consult the cache
+// at all, so the default management posture is unaffected.
+const localAddrTTL = time.Second
+
+var localAddrCache struct {
+	mu      sync.Mutex
+	addrs   []net.Addr
+	fetched time.Time
+	err     error
+}
+
+// isLocalAddr reports whether ip is assigned to an interface of this host,
+// through a short-lived cache. A failure to enumerate interfaces returns true —
+// fail closed, so an unenumerable host does not classify a local caller as
+// remote and hand it the credential path.
+func isLocalAddr(ip net.IP) bool {
+	localAddrCache.mu.Lock()
+	defer localAddrCache.mu.Unlock()
+
+	if found, ok := matchCachedAddr(ip); ok {
+		return found
+	}
+	// Miss (or expiry): refresh once, then answer from the fresh snapshot.
+	localAddrCache.addrs, localAddrCache.err = localAddrsFn()
+	localAddrCache.fetched = time.Now()
+	if localAddrCache.err != nil {
+		return true
+	}
+	found, _ := matchCachedAddr(ip)
+	return found
+}
+
+// matchCachedAddr answers from the cached snapshot. ok=false means the caller
+// must refresh: either the snapshot has expired, or it is fresh but does not
+// contain ip (a negative answer from a snapshot that has not just been taken is
+// exactly the unsafe direction, so it is not trusted without a refresh).
+func matchCachedAddr(ip net.IP) (found, ok bool) {
+	if localAddrCache.fetched.IsZero() || time.Since(localAddrCache.fetched) > localAddrTTL {
+		return false, false
+	}
+	if localAddrCache.err != nil {
+		return true, true
+	}
+	for _, a := range localAddrCache.addrs {
+		switch v := a.(type) {
+		case *net.IPNet:
+			if v.IP.Equal(ip) {
+				return true, true
+			}
+		case *net.IPAddr:
+			if v.IP.Equal(ip) {
+				return true, true
+			}
+		}
+	}
+	return false, false
+}
+
+// resetLocalAddrCacheForTest drops the cached snapshot so a test that swaps
+// localAddrsFn observes the new value immediately.
+func resetLocalAddrCacheForTest() {
+	localAddrCache.mu.Lock()
+	defer localAddrCache.mu.Unlock()
+	localAddrCache.fetched = time.Time{}
+	localAddrCache.addrs, localAddrCache.err = nil, nil
+}
 
 // PeerIdentity is what the kernel could tell us about the far end of an accepted
 // connection.
@@ -151,11 +248,39 @@ func LookupPeer(client, server net.Addr) PeerIdentity {
 	if ct.Port == st.Port && ct.IP.Equal(st.IP) {
 		return PeerIdentity{Local: true, Detail: "peer and local addresses are identical"}
 	}
+	// A ZONED (scope-qualified) peer address cannot be attributed. /proc/net/tcp6
+	// prints only the 128 address bits, never the scope id, so two link-local
+	// callers on different interfaces render the identical key and the first
+	// established row would win — an order-dependent identity, which is the same
+	// defect class as matching on ports alone. Refuse to guess. The SERVER's zone
+	// is not disqualifying on its own: the client column still selects the row.
+	if ct.Zone != "" {
+		return PeerIdentity{
+			Local:  true,
+			Detail: fmt.Sprintf("peer address %v is scope-qualified and cannot be attributed from the socket table", ct),
+		}
+	}
+
+	// Classify locality BEFORE reading the socket table. Two reasons, one
+	// security and one availability.
+	//
+	// Security: absence from our namespace's table is not evidence of being
+	// off-box (see the file comment). Establishing locality up front means the
+	// "not found" case below can never be reinterpreted as "remote".
+	//
+	// Availability: a peer that cannot be local needs no lookup at all, so
+	// connection churn from a routable address does ZERO socket-table work. That
+	// is the flood that would otherwise serialize full /proc scans behind the
+	// accept loop and lock out the very administrators the credential path
+	// exists for.
+	if !couldBeLocal(ct, st) {
+		return PeerIdentity{Detail: fmt.Sprintf("peer %v is not on this host", ct.IP)}
+	}
 
 	uid, state, found, err := findPeerSocket(ct, st)
 	if err != nil {
-		// Fail closed: we could not consult the socket table, so we cannot rule
-		// out a local caller.
+		// Fail closed: we could not consult the socket table, so we cannot
+		// attribute a caller we already know could be local.
 		return PeerIdentity{Local: true, Detail: "socket table unreadable: " + err.Error()}
 	}
 	if found && state == tcpEstablished {
@@ -167,46 +292,30 @@ func LookupPeer(client, server net.Addr) PeerIdentity {
 			Detail: fmt.Sprintf("peer socket is in TCP state %d, not established", state),
 		}
 	}
-
-	// No socket for this 4-tuple. The caller may still be local — it can have
-	// destroyed its socket outright (RST) between connecting and this lookup —
-	// so decide on the ADDRESS, which it cannot make disappear. Only a peer whose
-	// address belongs to no interface of ours is treated as off-box.
-	//
-	// This address check runs ONLY on the failure path. A legitimate caller is
-	// attributed above and never reaches it, so its cost is paid only by a caller
-	// that is already being refused.
-	if ct.IP.IsLoopback() {
-		return PeerIdentity{Local: true, Detail: "loopback peer has no established socket"}
-	}
-	if isLocalAddr(ct.IP) {
-		return PeerIdentity{Local: true, Detail: "peer address is local but has no established socket"}
-	}
-	return PeerIdentity{Detail: fmt.Sprintf("peer %v is not on this host", ct.IP)}
+	// Local, but with no live socket — it destroyed its own (an SO_LINGER-0
+	// reset) between connecting and this lookup. Locality was established from
+	// the addresses, which it cannot make disappear.
+	return PeerIdentity{Local: true, Detail: "local peer has no established socket"}
 }
 
-// isLocalAddr reports whether ip is assigned to an interface of this host. A
-// failure to enumerate interfaces returns true — fail closed, so an unenumerable
-// host does not classify a local caller as remote and hand it the credential
-// path.
-func isLocalAddr(ip net.IP) bool {
-	addrs, err := localAddrsFn()
-	if err != nil {
+// couldBeLocal reports whether the peer of an accepted connection is on THIS
+// host, decided from addresses alone.
+//
+// The loopback clause is the load-bearing one: a connection DELIVERED on a
+// loopback address cannot have come from off-box, because the kernel drops
+// packets carrying loopback addresses that arrive on a real interface. That is a
+// guarantee, not an inference, and it covers the entire default management
+// posture — so a caller reaching the default bind is local no matter what the
+// socket table says, and no credential can speak for it.
+//
+// For a routable delivery address the answer falls back to "is the peer one of
+// OUR addresses", which is sound in the positive direction and admits the netns
+// residual documented in pkg/api/README.md in the negative one.
+func couldBeLocal(client, server *net.TCPAddr) bool {
+	if server.IP.IsLoopback() || client.IP.IsLoopback() {
 		return true
 	}
-	for _, a := range addrs {
-		switch v := a.(type) {
-		case *net.IPNet:
-			if v.IP.Equal(ip) {
-				return true
-			}
-		case *net.IPAddr:
-			if v.IP.Equal(ip) {
-				return true
-			}
-		}
-	}
-	return false
+	return isLocalAddr(client.IP)
 }
 
 // findPeerSocket scans the kernel socket table for the row whose LOCAL address
