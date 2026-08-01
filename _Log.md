@@ -305,6 +305,66 @@
   `pkg/config/compiler_chassis_packed_monitor_6588_test.go` (new),
   `docs/config-schema.md`, `_Log.md`
 
+## 2026-08-01 — #5561 review round 3: the identity cost, and two over-strong claims
+
+- **Timestamp**: 2026-08-01 (fix/5561-rest-config-auth, PR #6645)
+- **Action**: Round-3 review returned REQUEST CHANGES with 1 MAJOR + 4 MINOR.
+  The authorization logic itself was re-verified clean — both round-1 exploits
+  re-run and dead, TIME_WAIT/uid-0 now doubly enforced, all six precedence rows
+  driven including the off-box row returning 200.
+  **MAJOR — the identity cost 6-9 ms per CONNECTION, unbounded.** Reading
+  /proc/net/tcp{,6} is not proportional to row count: the kernel walks its
+  entire TCP hash table, sized from RAM. Measured on an idle box (11 and 39
+  rows) at 4.3 ms and 10.1 ms raw, 6.2 ms for a hit and 8.9 ms for a miss;
+  cross-checked outside Go at 200 x `cat /proc/net/tcp` = 3.24 s. A connect
+  loop at ~110 conn/s saturates a core inside xpfd with NO credentials on the
+  default posture — the same unprivileged local population #5561 exists to
+  constrain. This is a direct consequence of the round-1/round-2 direction
+  (resolve eagerly; then fix the accept-loop DoS without going back to lazy):
+  the cost moved off the accept loop rather than disappearing.
+  **Fixed by single-flighting** (`pkg/authz/socketscan.go`): one goroutine reads
+  the tables and every waiter registered before that read STARTED is answered
+  from it; a waiter arriving mid-read is served by the next one. The security
+  property is preserved exactly — the batch is taken under the same lock the
+  request was appended under, so a connection accepted at T is still only ever
+  answered from a read that started at or after T. Measured: 60 concurrent
+  connections cost 2 reads (38 without batching).
+  **The old accept-loop guard was scoped narrower than its claim.** It asserted
+  only that two lookups STARTED concurrently — liveness, not cost. Kept (it
+  still pins the serialization property) and joined by a COST guard that counts
+  actual table reads.
+  **MINOR-1** — the interface-address cache refreshed on every MISS, which is
+  the flooding case; 200 misses drove 200 enumerations while two comments
+  claimed "at most once per TTL". Rate-limited for hits and misses alike, and
+  the comments now match.
+  **MINOR-2** — the scoped-address refusal ran BEFORE the locality test, so an
+  IPv6 link-local management bind denied every credentialed remote admin. Moved
+  after: only a scoped peer we would otherwise have to ATTRIBUTE is refused.
+  **MINOR-3** — DNAT-to-loopback denies all remote admins. Documented as the
+  most plausible of the three residuals (it over-denies, never admits).
+  **MINOR-4** — the 5 s lookup timeout was per-request; a wedged table cost 5 s
+  on every request of a connection. Deadline now stamped at accept.
+  **Two doc corrections, both stated too strongly in my favour.** The loopback
+  rule is CONSERVATIVE, not a kernel guarantee — route_localnet=1,
+  IP_TRANSPARENT and DNAT-to-loopback all defeat martian filtering — but it
+  fails SAFE under all three, because each classifies a REMOTE caller as local
+  and a local caller with no socket row is denied. And the netns residual is
+  narrower than I wrote: `unshare -Urn` yields a namespace with only `lo`, and
+  attaching a veth needs CAP_NET_ADMIN in the HOST namespace, so it requires a
+  root-configured container runtime rather than an unprivileged user.
+- **File(s)**: `pkg/authz/socketscan.go` (new), `pkg/authz/peer.go`,
+  `pkg/authz/peer_5561_test.go`, `pkg/api/authz.go`,
+  `pkg/api/config_authz_5561_test.go`, `pkg/api/README.md`,
+  `docs/system-login.md`
+- **Validation**: 5 mutations, `go build ./...` and `go vet ./...` CLEAN under
+  each, all assertion-level. (MAJOR) remove single-flighting -> "60 connections
+  cost 38 socket-table reads (limit 12)", with every correctness test still
+  green, proving the batching changed cost and not semantics. (MINOR-1) refresh
+  on every miss -> "200 cache MISSES drove 200 interface enumerations".
+  (MINOR-2) move the zone check before locality -> "a scope-qualified peer that
+  is NOT on this host was reported LOCAL ... denies every credentialed remote
+  administrator". (MINOR-4) per-request timer -> "a second request on the SAME
+  connection waited 5.024321093s". Full `go test ./... -count=1` green (exit 0).
 ## 2026-08-01 — #5561 review round 2: four MAJORs from Codex, all in my own gate
 
 - **Timestamp**: 2026-08-01 (fix/5561-rest-config-auth, PR #6645)

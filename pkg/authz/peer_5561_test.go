@@ -408,6 +408,72 @@ func TestLookupPeerRejectsNonTCP_5561(t *testing.T) {
 	}
 }
 
+// TestLocalAddrCacheRateLimitsMisses_5561 is the MINOR-1 guard.
+//
+// The interface-address snapshot exists so connection churn from a routable
+// address cannot force one enumeration per connection. An earlier version
+// refreshed on every MISS — which is precisely the flooding case, since a
+// routable attacker's address never matches — so the amplification the cache
+// was supposed to prevent was fully intact while two comments claimed otherwise.
+// Refreshes are now rate-limited for hits and misses alike.
+func TestLocalAddrCacheRateLimitsMisses_5561(t *testing.T) {
+	var enumerations int
+	prev := localAddrsFn
+	localAddrsFn = func() ([]net.Addr, error) {
+		enumerations++
+		return []net.Addr{&net.IPNet{IP: net.IPv4(10, 0, 61, 1), Mask: net.CIDRMask(24, 32)}}, nil
+	}
+	resetLocalAddrCacheForTest()
+	defer func() { localAddrsFn = prev; resetLocalAddrCacheForTest() }()
+
+	// 200 lookups for an address that will NEVER be in the snapshot.
+	miss := net.IPv4(198, 51, 100, 7)
+	for i := 0; i < 200; i++ {
+		if isLocalAddr(miss) {
+			t.Fatal("a foreign address was reported local")
+		}
+	}
+	if enumerations > 2 {
+		t.Fatalf("200 cache MISSES drove %d interface enumerations — the cache is "+
+			"positive-only, so a connect flood from a routable address (which never "+
+			"matches) amplifies straight through it", enumerations)
+	}
+
+	// The positive path must still answer correctly from the same snapshot.
+	if !isLocalAddr(net.IPv4(10, 0, 61, 1)) {
+		t.Error("a genuinely local address was reported foreign")
+	}
+	if enumerations == 0 {
+		t.Error("no enumeration happened at all — the cache is not being populated")
+	}
+}
+
+// TestScopedRemotePeerStillReachesTheCredential_5561 is the MINOR-2 guard: the
+// scoped-address refusal must apply only to a peer we would otherwise have to
+// ATTRIBUTE. Checking it before the locality test denied every scope-qualified
+// caller, which on an IPv6 link-local management bind is every credentialed
+// remote administrator.
+func TestScopedRemotePeerStillReachesTheCredential_5561(t *testing.T) {
+	dir := t.TempDir()
+	defer SetProcNetTCPPathsForTest(filepath.Join(dir, "absent"), filepath.Join(dir, "absent6"))()
+	// Our own link-local address is a DIFFERENT one, so the caller is off-box.
+	defer setLocalAddrsForTest([]net.Addr{
+		&net.IPNet{IP: net.ParseIP("fe80::e01:0:0:1"), Mask: net.CIDRMask(64, 128)},
+	})()
+
+	client := &net.TCPAddr{IP: net.ParseIP("fe80::ee01:0:0:99"), Port: 43210, Zone: "eth0"}
+	server := &net.TCPAddr{IP: net.ParseIP("fe80::e01:0:0:1"), Port: 8080, Zone: "eth0"}
+	id := LookupPeer(client, server)
+	if id.Local {
+		t.Fatalf("a scope-qualified peer that is NOT on this host was reported LOCAL "+
+			"(%+v) — on an IPv6 link-local management bind that denies every "+
+			"credentialed remote administrator", id)
+	}
+	if id.OK {
+		t.Fatalf("an off-box scoped peer was attributed: %+v", id)
+	}
+}
+
 // TestProcParserRejectsNonEstablishedRow_5561 is the fixture half of the
 // TIME_WAIT defense. The kernel reports UID 0 for a timewait row; a parser that
 // matched on the 4-tuple alone would hand the authorization gate root.

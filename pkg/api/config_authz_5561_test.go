@@ -742,19 +742,20 @@ func TestPeerIdentityIsResolvedAtAccept_5561(t *testing.T) {
 	}
 }
 
-// TestPeerLookupDoesNotBlockTheAcceptLoop_5561 is the MAJOR-D guard.
-//
-// ConnContext runs SERIALLY in http.Server's accept loop. A peer whose socket is
-// not found costs a walk of the socket table, so resolving inline meant
-// connection churn serialized those walks behind Accept and filled the listen
-// backlog — locking out remote administrators before api-auth was even
+// TestPeerLookupDoesNotBlockTheAcceptLoop_5561 is the liveness half of the
+// MAJOR-D guard: ConnContext runs SERIALLY in http.Server's accept loop, so
+// resolving inline serializes every socket-table read behind Accept and can fill
+// the listen backlog — locking out remote administrators before api-auth is even
 // evaluated.
 //
 // The probe is deterministic rather than timing-based: the injected resolver
-// blocks until the test releases it. If ConnContext resolves inline, the accept
-// loop is stuck inside the FIRST connection's lookup and the second connection
-// is never accepted, so the resolver is entered exactly once. Off the accept
-// path, both connections are accepted and both lookups are in flight.
+// blocks until the test releases it. Resolving inline leaves the accept loop
+// stuck inside the FIRST connection's lookup, so the second connection is never
+// accepted and the resolver is entered exactly once.
+//
+// This asserts only that lookups OVERLAP. It says nothing about what they cost —
+// see TestConcurrentConnectionsShareOneSocketTableRead_5561, which is the guard
+// for the cost that moving off the accept loop did not remove.
 func TestPeerLookupDoesNotBlockTheAcceptLoop_5561(t *testing.T) {
 	usePasswdFixture(t)
 
@@ -774,7 +775,6 @@ func TestPeerLookupDoesNotBlockTheAcceptLoop_5561(t *testing.T) {
 	})
 	addr := strings.TrimPrefix(base, "http://")
 
-	// Two independent connections, neither of which needs to complete a request.
 	for i := 0; i < 2; i++ {
 		c, err := net.DialTimeout("tcp", addr, 5*time.Second)
 		if err != nil {
@@ -795,6 +795,141 @@ func TestPeerLookupDoesNotBlockTheAcceptLoop_5561(t *testing.T) {
 				"serialized behind every socket-table walk and connection churn can "+
 				"fill the listen backlog", got)
 		}
+	}
+}
+
+// TestConcurrentConnectionsShareOneSocketTableRead_5561 is the COST guard, and
+// it asserts the property the liveness guard above does not.
+//
+// Resolving per connection moved the socket-table read off the accept loop but
+// did not make it cheaper. Reading /proc/net/tcp{,6} is not proportional to row
+// count — the kernel walks its whole TCP hash table, sized by RAM — so a read
+// costs milliseconds even on an idle box. Per connection and unbounded, that is
+// a denial of service available to any local process with NO credentials: a
+// connect loop saturates a core inside the daemon, which is the same
+// unprivileged local population #5561 exists to constrain.
+//
+// So the assertion is on READS, not on latency or concurrency: N connections
+// arriving together must collapse into a handful of table reads. This uses the
+// REAL kernel lookup — no injected resolver — because the batching being
+// measured lives inside it.
+func TestConcurrentConnectionsShareOneSocketTableRead_5561(t *testing.T) {
+	usePasswdFixture(t)
+	_, base := authzServer(t, Config{
+		Addr:  "127.0.0.1:8080",
+		Store: authzStore(t, authzTestConfig),
+	})
+	addr := strings.TrimPrefix(base, "http://")
+
+	const conns = 60
+	// Generous ceiling: the point is that cost does not scale with connections,
+	// not that batching is maximally tight. Without single-flighting this is
+	// exactly `conns`.
+	const maxReads = 12
+
+	before := authz.SocketScansForTest()
+
+	var wg sync.WaitGroup
+	for i := 0; i < conns; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// A GET is enough: the lookup is started at accept regardless of
+			// what the connection goes on to request.
+			resp, err := (&http.Client{Timeout: 30 * time.Second}).Get(base + "/api/v1/config/status")
+			if err != nil {
+				return
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}()
+	}
+	wg.Wait()
+	_ = addr
+
+	// Every connection's lookup is started at accept but completes
+	// asynchronously; give the last batch a moment to drain before counting.
+	deadline := time.Now().Add(10 * time.Second)
+	var reads uint64
+	for {
+		reads = authz.SocketScansForTest() - before
+		if reads > maxReads || time.Now().After(deadline) {
+			break
+		}
+		prev := reads
+		time.Sleep(100 * time.Millisecond)
+		if authz.SocketScansForTest()-before == prev {
+			break // settled
+		}
+	}
+
+	if reads == 0 {
+		t.Fatalf("no socket-table reads observed for %d connections — the probe is not "+
+			"measuring the real lookup", conns)
+	}
+	if reads > maxReads {
+		t.Fatalf("%d connections cost %d socket-table reads (limit %d). Each read walks the "+
+			"kernel's entire TCP hash table and costs milliseconds, so an unprivileged "+
+			"local connect loop with no credentials burns a core inside the daemon",
+			conns, reads, maxReads)
+	}
+	t.Logf("%d concurrent connections cost %d socket-table read(s)", conns, reads)
+}
+
+// TestLookupDeadlineIsPerConnection_5561 is the MINOR-4 guard. The deadline is
+// stamped when the lookup starts at accept, so a wedged socket-table read costs
+// a connection peerLookupTimeout ONCE — not that long again on every request the
+// connection makes.
+//
+// The probe drives two requests on ONE keep-alive connection against a resolver
+// that never returns. With a per-request timer the second request restarts the
+// full clock; with a per-connection deadline it is already expired and denies
+// immediately.
+func TestLookupDeadlineIsPerConnection_5561(t *testing.T) {
+	usePasswdFixture(t)
+
+	wedged := make(chan struct{})
+	defer close(wedged)
+	_, base := authzServer(t, Config{
+		Addr:  "127.0.0.1:8080",
+		Store: authzStore(t, authzTestConfig),
+		PeerLookupFn: func(net.Addr, net.Addr) authz.PeerIdentity {
+			<-wedged
+			return authz.PeerIdentity{}
+		},
+	})
+
+	// One connection, reused: http.Client keeps it alive between requests.
+	client := &http.Client{Timeout: 60 * time.Second}
+	post := func() time.Duration {
+		start := time.Now()
+		req, err := http.NewRequest(http.MethodPost, base+"/api/v1/config/enter", strings.NewReader("{}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("a wedged lookup returned %d, want 403", resp.StatusCode)
+		}
+		return time.Since(start)
+	}
+
+	first := post()
+	if first < peerLookupTimeout/2 {
+		t.Fatalf("the first request waited only %v; expected roughly the %v lookup "+
+			"deadline, so this probe is not measuring what it claims", first, peerLookupTimeout)
+	}
+	second := post()
+	if second > peerLookupTimeout/2 {
+		t.Fatalf("a second request on the SAME connection waited %v — the deadline is "+
+			"per REQUEST, so a wedged socket table costs %v on every request the "+
+			"connection makes instead of once", second, peerLookupTimeout)
 	}
 }
 

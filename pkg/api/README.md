@@ -333,28 +333,55 @@ table is not evidence of being off-box: a peer in another network namespace
 appears in neither `/proc/net/tcp` nor `net.InterfaceAddrs()` here, and calling
 that "remote" would hand it the credential — the same unsound "not found means
 remote" inference that produced the v1 bypass. So "remote" is never inferred
-from a failed lookup. It is bounded by a kernel guarantee instead: **a
-connection delivered on a loopback address cannot have come from off-box**, since
-the kernel drops packets carrying loopback addresses that arrive on a real
-interface. That covers the entire default management posture — a caller reaching
-the default bind is local whatever the socket table says. A routable delivery
-address falls back to "is the peer one of *our* addresses", which is sound
-positively and carries the residual below negatively. An unreadable or absent
-socket table is reported local-and-unattributable, never remote.
+from a failed lookup.
 
-**Residual, stated rather than papered over.** On an **off-loopback** bind, a
-caller in another network namespace on this same host is indistinguishable from
-a remote administrator — a container's veth peer and a real remote client look
-identical in the socket table — so it reaches the credential path. That surface
-is the one #4047 already requires an api-auth credential for, and the credential
-is the designed gate there. The default loopback bind is not affected.
+It is bounded instead by the delivery address: **a connection delivered on a
+loopback address is treated as local.** Under a default configuration that is
+also true — martian filtering drops packets carrying loopback addresses that
+arrive on a real interface — but it is a *conservative* rule, not a guarantee:
+`route_localnet=1`, `IP_TRANSPARENT` and DNAT-to-loopback each defeat that
+filtering. The rule still **fails safe** under all three, because each of them
+classifies a *remote* caller as local, and a local caller with no socket row is
+denied. The table over-denies; it never inverts. A routable delivery address
+falls back to "is the peer one of *our* addresses", sound positively and
+carrying the residuals below negatively. An unreadable or absent socket table is
+reported local-and-unattributable, never remote.
+
+**Residuals, stated rather than papered over.** All three over-deny; none
+grants access.
+
+- **DNAT to loopback.** If a remote connection is redirected to a loopback
+  address before it reaches the listener, the delivery address is loopback, the
+  caller has no socket row here, and it is denied — so a legitimate remote
+  administrator behind such a redirect cannot use the mutation surface even with
+  a valid credential. This is the most plausible of the three; bind
+  `web-management` to a real address rather than DNAT-ing to loopback.
+- **Another network namespace, off-loopback bind.** A container's veth peer and
+  a real remote client are indistinguishable in the socket table, so a netns
+  caller on a routable bind reaches the credential path. It is narrower than it
+  first appears: an unprivileged user cannot get there. `unshare -Urn` yields a
+  namespace containing only `lo`, and attaching a veth to the host requires
+  CAP_NET_ADMIN *in the host namespace* — i.e. a root-configured container
+  runtime. The default loopback bind is unaffected either way, and #4047 already
+  requires an api-auth credential on the surface where this applies.
+- **A brand-new local address.** The host-address snapshot is refreshed at most
+  once per second, so for up to a second after an address is added to this host,
+  a caller arriving from it is classified off-box and may present a credential.
+  It still cannot escape a class it holds: a local caller with a class is only
+  reachable through the socket table, which is not cached.
 
 **Scoped IPv6 is refused, not guessed.** `/proc/net/tcp6` prints only the 128
 address bits, never the scope id, so two link-local callers on different
 interfaces render an identical key and the first matching row would win — an
 order-dependent identity, the same defect class as matching on ports alone. A
-scope-qualified peer address is therefore reported local-and-unattributable
-(denied). Mutating the guard out attributes such a caller **uid 0**.
+scope-qualified peer address that we would otherwise have to *attribute* is
+therefore reported local-and-unattributable (denied). Mutating the guard out
+attributes such a caller **uid 0**.
+
+The refusal is checked **after** the locality classification, deliberately: a
+scoped peer that is *not* on this host is a remote administrator reaching an
+IPv6 link-local management bind, and refusing before the locality test locked
+out every credentialed remote on such a bind.
 
 **UID 0 is authorized unconditionally**, without consulting `/etc/passwd` or the
 active config. Root owns the daemon and the on-disk config DB, so denying it
@@ -405,26 +432,36 @@ which would refuse every mutation on it after an unrelated bind change.
 and `TestPeerIdentityIsResolvedAtAccept_5561` pins the once-per-connection
 timing (a per-request lookup is what the caller used to be able to defeat).
 
-**Cost, and why it is off the accept loop.** `ConnContext` runs **serially** in
-`http.Server`'s accept loop, and a peer whose socket is not found costs a walk of
-the socket table. Resolving inline therefore let connection churn serialize those
-walks behind `Accept` and fill the listen backlog — locking out remote
-administrators before api-auth was even evaluated. Two changes bound it:
+**Cost.** This is load-bearing, not tuning: the lookup runs once per accepted
+CONNECTION, and reading `/proc/net/tcp{,6}` is **not** proportional to row count
+— the kernel walks its entire TCP hash table, sized from RAM. Measured on an idle
+box carrying 11 and 39 rows, a single raw read costs 4.3 ms and 10.1 ms, and a
+full lookup 6-9 ms. Unbounded and per connection, that is a denial of service
+available to any local process with **no credentials at all**: a connect loop at
+~110 conn/s saturates a core inside the daemon — the same unprivileged local
+population #5561 exists to constrain. Three bounds:
 
-- The lookup is **started** at accept but runs in its own goroutine. A request
-  that arrives before its lookup finishes waits for it; a wedged lookup denies
-  (`peerLookupTimeout`) rather than hangs. The ESTABLISHED guarantee is
-  unaffected — the inputs are fixed at accept, so the timing is still outside the
-  caller's control.
-- A peer that **cannot be local** does no socket-table work at all: locality is
-  classified from addresses first, so churn from a routable address is a couple
-  of comparisons. The host-address set behind that check is cached for one second
-  and refreshed at most once per second on a miss, so a flood cannot amplify
-  through it either.
+- **Single-flight** (`socketscan.go`). One goroutine reads the tables; every
+  waiter registered before that read *started* is answered from it, and a waiter
+  arriving mid-read is served by the next one. 60 concurrent connections cost
+  **2** reads, not 60. The security property is untouched: a connection accepted
+  at T is still only ever answered from a read that started at or after T,
+  because the batch is taken under the same lock the request was appended under.
+- **Off the accept loop.** `ConnContext` runs serially in `http.Server`'s accept
+  loop, so the lookup is *started* there but runs in its own goroutine. A request
+  arriving before its lookup finishes waits for it; a wedged lookup denies rather
+  than hangs, on a deadline stamped **per connection** (not per request, which
+  would charge the full timeout again on every request the connection makes).
+- **No read at all for a peer that cannot be local.** Locality is classified from
+  addresses *before* any table read, so churn from a routable address is a couple
+  of comparisons. The host-address snapshot behind that check is refreshed at most
+  once per second for hits **and** misses — an earlier version refreshed on every
+  miss, which is precisely the flooding case, so the amplification was fully
+  intact while the comment claimed otherwise.
 
-A *local* attacker can still cause one socket-table walk per connection, off the
-accept loop. They already have a shell on the box, the listener's read-side
-timeouts still apply, and the outcome is fail-closed.
+A *local* attacker can still make connections that each join a batched read.
+They already have a shell on the box, the cost no longer scales with connection
+count, and the outcome is fail-closed.
 
 **Known residual (not #5561).** The READ surface — REST GETs, `/api/v1/show-text`
 — is unchanged and remains reachable by any local process on a loopback bind.

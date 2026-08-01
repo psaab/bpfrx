@@ -1,12 +1,9 @@
 package authz
 
 import (
-	"bufio"
 	"encoding/binary"
 	"fmt"
 	"net"
-	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -73,12 +70,18 @@ import (
 // would hand it the credential path — the same unsound "not found means remote"
 // inference that made the half-close bypass possible.
 //
-// So "remote" is never inferred from a failed lookup alone. It is bounded by a
-// property the kernel guarantees rather than one we deduce: **a connection
-// DELIVERED on a loopback address cannot have come from off-box** (the kernel
-// drops martian packets carrying a loopback source or destination on a real
-// interface). Every connection to the default loopback-only management bind is
-// therefore local by construction, whether or not its socket is found.
+// So "remote" is never inferred from a failed lookup alone. It is bounded by the
+// DELIVERY address instead: a connection delivered on a loopback address is
+// treated as local. Under a default configuration that is also true — martian
+// filtering drops packets carrying loopback addresses that arrive on a real
+// interface — but it is a CONSERVATIVE rule, not a guarantee: route_localnet=1,
+// IP_TRANSPARENT and DNAT-to-loopback each defeat that filtering.
+//
+// The rule still fails SAFE under all three, which is why it is the one we lean
+// on: each of them classifies a REMOTE caller as local, and a local caller with
+// no socket row is denied. The classification over-denies; it never inverts.
+// (The cost is a real availability residual for a remote admin behind a
+// DNAT-to-loopback redirect — see pkg/api/README.md.)
 //
 // For a connection delivered on a routable address the distinction is genuinely
 // unobservable — a container's veth peer and a remote administrator are
@@ -119,12 +122,16 @@ var localAddrsFn = net.InterfaceAddrs
 // localAddrTTL bounds how long a cached interface-address snapshot is reused.
 //
 // The snapshot exists so connection churn from a routable peer cannot force one
-// netlink dump per connection. A MISS still refreshes — but at most once per
-// TTL, so a flood cannot amplify through it. The staleness this admits is
-// one-directional and bounded: for up to one TTL after an address is added to
-// this host, a caller arriving from that brand-new address is classified as
-// off-box. Connections delivered on a loopback address never consult the cache
-// at all, so the default management posture is unaffected.
+// interface enumeration per connection. Refreshes are rate-limited to one per
+// TTL regardless of hit or miss, so a flood cannot amplify through it either.
+//
+// The staleness that admits is bounded and one-directional: for up to one TTL
+// after an address is ADDED to this host, a caller arriving from that brand-new
+// address is classified as off-box and may therefore present an api-auth
+// credential. It still cannot escape a class it holds — a local caller with a
+// class is only reachable through the socket table, which is not cached — and
+// the window is a second. Connections delivered on a loopback address never
+// consult this cache at all, so the default management posture is unaffected.
 const localAddrTTL = time.Second
 
 var localAddrCache struct {
@@ -135,50 +142,41 @@ var localAddrCache struct {
 }
 
 // isLocalAddr reports whether ip is assigned to an interface of this host,
-// through a short-lived cache. A failure to enumerate interfaces returns true —
-// fail closed, so an unenumerable host does not classify a local caller as
-// remote and hand it the credential path.
+// through a snapshot refreshed at most once per localAddrTTL.
+//
+// The refresh is rate-limited for BOTH hits and misses. An earlier version
+// refreshed on every miss, which meant a connect flood from a routable address
+// — the case that never matches — drove one interface enumeration per
+// connection, exactly the amplification the cache exists to prevent. (The
+// comment claimed otherwise; the comment was wrong.)
+//
+// A failure to enumerate interfaces answers true — fail closed, so an
+// unenumerable host does not classify a local caller as remote and hand it the
+// credential path.
 func isLocalAddr(ip net.IP) bool {
 	localAddrCache.mu.Lock()
 	defer localAddrCache.mu.Unlock()
 
-	if found, ok := matchCachedAddr(ip); ok {
-		return found
+	if localAddrCache.fetched.IsZero() || time.Since(localAddrCache.fetched) > localAddrTTL {
+		localAddrCache.addrs, localAddrCache.err = localAddrsFn()
+		localAddrCache.fetched = time.Now()
 	}
-	// Miss (or expiry): refresh once, then answer from the fresh snapshot.
-	localAddrCache.addrs, localAddrCache.err = localAddrsFn()
-	localAddrCache.fetched = time.Now()
 	if localAddrCache.err != nil {
 		return true
-	}
-	found, _ := matchCachedAddr(ip)
-	return found
-}
-
-// matchCachedAddr answers from the cached snapshot. ok=false means the caller
-// must refresh: either the snapshot has expired, or it is fresh but does not
-// contain ip (a negative answer from a snapshot that has not just been taken is
-// exactly the unsafe direction, so it is not trusted without a refresh).
-func matchCachedAddr(ip net.IP) (found, ok bool) {
-	if localAddrCache.fetched.IsZero() || time.Since(localAddrCache.fetched) > localAddrTTL {
-		return false, false
-	}
-	if localAddrCache.err != nil {
-		return true, true
 	}
 	for _, a := range localAddrCache.addrs {
 		switch v := a.(type) {
 		case *net.IPNet:
 			if v.IP.Equal(ip) {
-				return true, true
+				return true
 			}
 		case *net.IPAddr:
 			if v.IP.Equal(ip) {
-				return true, true
+				return true
 			}
 		}
 	}
-	return false, false
+	return false
 }
 
 // resetLocalAddrCacheForTest drops the cached snapshot so a test that swaps
@@ -248,19 +246,6 @@ func LookupPeer(client, server net.Addr) PeerIdentity {
 	if ct.Port == st.Port && ct.IP.Equal(st.IP) {
 		return PeerIdentity{Local: true, Detail: "peer and local addresses are identical"}
 	}
-	// A ZONED (scope-qualified) peer address cannot be attributed. /proc/net/tcp6
-	// prints only the 128 address bits, never the scope id, so two link-local
-	// callers on different interfaces render the identical key and the first
-	// established row would win — an order-dependent identity, which is the same
-	// defect class as matching on ports alone. Refuse to guess. The SERVER's zone
-	// is not disqualifying on its own: the client column still selects the row.
-	if ct.Zone != "" {
-		return PeerIdentity{
-			Local:  true,
-			Detail: fmt.Sprintf("peer address %v is scope-qualified and cannot be attributed from the socket table", ct),
-		}
-	}
-
 	// Classify locality BEFORE reading the socket table. Two reasons, one
 	// security and one availability.
 	//
@@ -275,6 +260,25 @@ func LookupPeer(client, server net.Addr) PeerIdentity {
 	// exists for.
 	if !couldBeLocal(ct, st) {
 		return PeerIdentity{Detail: fmt.Sprintf("peer %v is not on this host", ct.IP)}
+	}
+
+	// A ZONED (scope-qualified) peer address cannot be ATTRIBUTED. /proc/net/tcp6
+	// prints only the 128 address bits, never the scope id, so two link-local
+	// callers on different interfaces render the identical key and the first
+	// established row would win — an order-dependent identity, the same defect
+	// class as matching on ports alone. Refuse to guess.
+	//
+	// This is deliberately checked AFTER locality: a scoped peer that is NOT on
+	// this host is a remote administrator reaching an IPv6 link-local management
+	// bind, and refusing it before the locality test locked out every credentialed
+	// remote on such a bind. Only a scoped peer we would otherwise have to
+	// attribute is refused. The SERVER's zone is not disqualifying on its own —
+	// the client column still selects the row.
+	if ct.Zone != "" {
+		return PeerIdentity{
+			Local:  true,
+			Detail: fmt.Sprintf("peer address %v is scope-qualified and cannot be attributed from the socket table", ct),
+		}
 	}
 
 	uid, state, found, err := findPeerSocket(ct, st)
@@ -302,11 +306,11 @@ func LookupPeer(client, server net.Addr) PeerIdentity {
 // host, decided from addresses alone.
 //
 // The loopback clause is the load-bearing one: a connection DELIVERED on a
-// loopback address cannot have come from off-box, because the kernel drops
-// packets carrying loopback addresses that arrive on a real interface. That is a
-// guarantee, not an inference, and it covers the entire default management
-// posture — so a caller reaching the default bind is local no matter what the
-// socket table says, and no credential can speak for it.
+// loopback address is treated as local, which covers the entire default
+// management posture — a caller reaching the default bind is local no matter
+// what the socket table says, and no credential can speak for it. It is a
+// conservative rule rather than a kernel guarantee (see the file comment), and
+// its failure mode is over-denial, not admission.
 //
 // For a routable delivery address the answer falls back to "is the peer one of
 // OUR addresses", which is sound in the positive direction and admits the netns
@@ -318,9 +322,9 @@ func couldBeLocal(client, server *net.TCPAddr) bool {
 	return isLocalAddr(client.IP)
 }
 
-// findPeerSocket scans the kernel socket table for the row whose LOCAL address
-// is the client and whose REMOTE address is the server — the mirror of the
-// connection this server accepted.
+// findPeerSocket looks for the row whose LOCAL address is the client and whose
+// REMOTE address is the server — the mirror of the connection this server
+// accepted.
 //
 // Both /proc/net/tcp and /proc/net/tcp6 are consulted. Which file holds a given
 // connection depends on the address family of the CLIENT's socket, which this
@@ -329,107 +333,33 @@ func couldBeLocal(client, server *net.TCPAddr) bool {
 // 127.0.0.1. Scanning only the file implied by the Go-side address would miss
 // that row and report the caller as off-box — which, under the precedence rule
 // in LookupPeer's doc, hands it the credential path. The miss is therefore a
-// security question, not just a robustness one, and both files are scanned.
+// security question, not just a robustness one, and both files are consulted.
 //
-// found=false means no row matched in either file. err is non-nil only when a
-// file that exists could not be read; an ABSENT file is not an error (a kernel
-// built without IPv6 has no tcp6).
+// The read itself is single-flighted through socketscan.go: concurrent lookups
+// share one table read, which is what keeps a connect flood from costing 6-9 ms
+// of daemon CPU per connection. The batching does not weaken the guarantee that
+// a connection is answered only from a read that started after it was accepted.
+//
+// found=false means no row matched in either file. err is non-nil only when NO
+// table could be read at all; an absent tcp6 (an IPv6-less kernel) alongside a
+// readable tcp is not an error.
 func findPeerSocket(client, server *net.TCPAddr) (uid uint32, state uint64, found bool, err error) {
-	type scan struct {
-		path   string
-		local  string
-		remote string
-	}
-	var scans []scan
-
+	q := &socketQuery{res: make(chan socketResult, 1)}
 	if l, lok := procAddr4(client); lok {
 		if r, rok := procAddr4(server); rok {
-			scans = append(scans, scan{procNetTCPPath, l, r})
+			q.keys = append(q.keys, scanKey{procNetTCPPath, l, r})
 		}
 	}
 	if l, lok := procAddr6(client); lok {
 		if r, rok := procAddr6(server); rok {
-			scans = append(scans, scan{procNetTCP6Path, l, r})
+			q.keys = append(q.keys, scanKey{procNetTCP6Path, l, r})
 		}
 	}
-	if len(scans) == 0 {
+	if len(q.keys) == 0 {
 		return 0, 0, false, fmt.Errorf("cannot render %v -> %v for a socket-table lookup", client, server)
 	}
-
-	read := 0
-	for _, s := range scans {
-		u, st, ok, serr := scanProcNet(s.path, s.local, s.remote)
-		if serr != nil {
-			if os.IsNotExist(serr) {
-				// e.g. no /proc/net/tcp6 on an IPv6-less kernel. Tolerated
-				// only because the loop below refuses to draw a conclusion
-				// unless SOME table was read.
-				continue
-			}
-			return 0, 0, false, serr
-		}
-		read++
-		if !ok {
-			continue
-		}
-		if st == tcpEstablished {
-			return u, st, true, nil
-		}
-		// A non-established match still proves the caller is LOCAL; keep
-		// scanning in case the live socket is in the other file.
-		uid, state, found = u, st, true
-	}
-	if read == 0 {
-		// Every candidate table was absent. "No row found" would be a claim
-		// about the caller drawn from having looked nowhere — and under
-		// LookupPeer's precedence that claim hands the caller the credential
-		// path. Report it as the failure it is.
-		return 0, 0, false, fmt.Errorf("no socket table could be read for %v -> %v", client, server)
-	}
-	return uid, state, found, nil
-}
-
-// scanProcNet finds the row in path whose local and remote address columns equal
-// wantLocal and wantRemote, preferring an ESTABLISHED row if several exist.
-func scanProcNet(path, wantLocal, wantRemote string) (uid uint32, state uint64, found bool, err error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, 0, false, err
-	}
-	defer f.Close()
-
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		// Columns: sl local rem st tx:rx tr:when retrnsmt uid timeout inode ...
-		fields := strings.Fields(sc.Text())
-		if len(fields) < 8 {
-			continue // the header row and any short/garbled line
-		}
-		if !strings.EqualFold(fields[1], wantLocal) || !strings.EqualFold(fields[2], wantRemote) {
-			continue
-		}
-		st, perr := strconv.ParseUint(fields[3], 16, 8)
-		if perr != nil {
-			continue
-		}
-		u, perr := strconv.ParseUint(fields[7], 10, 32)
-		if perr != nil {
-			return 0, 0, false, fmt.Errorf("unparseable uid %q in %s", fields[7], path)
-		}
-		if st == tcpEstablished {
-			return uint32(u), st, true, nil
-		}
-		// Remember a non-established match (TIME_WAIT and friends) so the caller
-		// learns the peer is LOCAL, but keep looking for a live socket. Its UID
-		// is deliberately NOT carried out as an identity: the kernel reports 0
-		// for a timewait mini-socket, and LookupPeer only reads uid when the
-		// state is established.
-		uid, state, found = 0, st, true
-	}
-	if err := sc.Err(); err != nil {
-		return 0, 0, false, err
-	}
-	return uid, state, found, nil
+	res := batcher.lookup(q)
+	return res.uid, res.state, res.found, res.err
 }
 
 // procAddr4 renders a TCPAddr the way /proc/net/tcp does. ok=false when the

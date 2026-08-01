@@ -83,7 +83,9 @@ identity, so it is a real boundary rather than an advisory one:
 
 - The caller's UID comes from the kernel (`/proc/net/tcp{,6}`), not from
   anything the request carries, and is fixed at connect rather than at request
-  time so the caller cannot choose when — or whether — it resolves.
+  time so the caller cannot choose when — or whether — it resolves. Concurrent
+  lookups share one table read, so the identity does not cost a kernel hash-table
+  walk per connection.
 - **UID 0 is authorized unconditionally** — root owns the config DB on disk, so
   a denial would be theater.
 - A local UID that is **not** a configured `system login user` is **denied** the

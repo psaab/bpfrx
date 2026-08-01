@@ -100,28 +100,37 @@ var restMutationPermissions = map[string]config.LoginClassPermission{
 
 type peerIdentityKey struct{}
 
-// peerLookupTimeout bounds how long a request waits for its connection's peer
-// lookup. It only elapses if the socket-table read is wedged; a timeout yields
-// no identity, which denies.
+// peerLookupTimeout bounds how long a CONNECTION's peer lookup may take. It only
+// elapses if the socket-table read is wedged; expiry yields no identity, which
+// denies.
+//
+// The deadline is per connection, not per request: it is stamped when the lookup
+// starts at accept, so a wedged table costs one connection at most this long in
+// total rather than this long on every request the connection makes.
 const peerLookupTimeout = 5 * time.Second
 
 // pendingPeer is a connection's peer identity, resolved once, asynchronously,
 // starting at accept.
 type pendingPeer struct {
-	done chan struct{}
-	id   authz.PeerIdentity
+	done     chan struct{}
+	deadline time.Time
+	id       authz.PeerIdentity
 }
 
 // wait blocks until the lookup finishes, the request context is cancelled, or
-// peerLookupTimeout elapses. ok=false means no identity is available and the
-// caller must deny.
+// the connection's lookup deadline passes. ok=false means no identity is
+// available and the caller must deny.
 func (p *pendingPeer) wait(ctx context.Context) (authz.PeerIdentity, bool) {
 	select {
 	case <-p.done:
 		return p.id, true
 	default:
 	}
-	t := time.NewTimer(peerLookupTimeout)
+	remaining := time.Until(p.deadline)
+	if remaining <= 0 {
+		return authz.PeerIdentity{}, false
+	}
+	t := time.NewTimer(remaining)
 	defer t.Stop()
 	select {
 	case <-p.done:
@@ -160,7 +169,7 @@ func (p *pendingPeer) wait(ctx context.Context) (authz.PeerIdentity, bool) {
 // cannot be local, so the churn that motivates this is cheap on both counts.
 func (s *Server) connContext(ctx context.Context, c net.Conn) context.Context {
 	client, server := c.RemoteAddr(), c.LocalAddr()
-	p := &pendingPeer{done: make(chan struct{})}
+	p := &pendingPeer{done: make(chan struct{}), deadline: time.Now().Add(peerLookupTimeout)}
 	go func() {
 		defer close(p.done)
 		p.id = s.lookupPeer(client, server)
