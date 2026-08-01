@@ -771,6 +771,95 @@ fn over_limit_ipv6_extension_chain_is_dropped() {
     assert_eq!(unadjudicated, 0);
 }
 
+/// A bare 20-byte IPv4 header DECLARING a transport protocol but
+/// carrying no L4 header at all. `total_length` is honest (20), so this
+/// is not a truncation the L3 parser rejects — it is a well-formed IP
+/// header whose declared transport is simply absent.
+fn ipv4_l4_declared_but_absent(src: Ipv4Addr, dst: Ipv4Addr, protocol: u8) -> Vec<u8> {
+    let mut pkt = vec![0u8; 20];
+    pkt[0] = 0x45;
+    pkt[2..4].copy_from_slice(&20u16.to_be_bytes());
+    pkt[8] = 64;
+    pkt[9] = protocol;
+    pkt[12..16].copy_from_slice(&src.octets());
+    pkt[16..20].copy_from_slice(&dst.octets());
+    pkt
+}
+
+/// **r5 MAJOR 2 fail-on-revert.** An inner packet declaring TCP or UDP
+/// but carrying no readable L4 header must DROP, not be permitted.
+///
+/// The XDP shim resolves TCP/UDP eagerly (`parse_l4`): TCP needs 14
+/// readable bytes plus a readable data-offset of at least 20, UDP needs
+/// 8, and a failure makes `parse_ipv4`/`parse_ipv6` return `None`, which
+/// is `drop_degraded_transit(.., PARSE_FAIL)` → `XDP_DROP`. So mainline
+/// never delivers this shape. Before the fix the gate fell to the
+/// flowless arm and PERMITTED it under a permit-any — more permissive
+/// than the wire it claims parity with.
+///
+/// This is NOT a policy-DENY bypass: under a deny the L3 adjudication
+/// still denied it. It is a fail-open relative to mainline, which is why
+/// the assertion below is against a PERMIT policy.
+#[test]
+fn inner_packet_declaring_tcp_or_udp_without_an_l4_header_is_dropped() {
+    let src = Ipv4Addr::new(10, 77, 0, 5);
+    let dst = Ipv4Addr::new(10, 88, 0, 9);
+
+    // PERMIT, so only the malformed-packet gate can drop it.
+    let mut snapshot = base_snapshot();
+    snapshot.routes = vec![v4_route_to_lan()];
+    snapshot.policies = vec![permit_rule("untrust", "trust")];
+    let forwarding = build_forwarding_state(&snapshot);
+
+    for (label, proto) in [("tcp", 6u8), ("udp", 17u8)] {
+        let inner = ipv4_l4_declared_but_absent(src, dst, proto);
+        let (escaped, denies, forward_drops, unadjudicated) =
+            run_inner_full(&forwarding, &inner);
+        assert!(
+            escaped.is_empty(),
+            "{label}: an inner packet declaring a ported transport with NO L4 header reached \
+             the wgN TUN under a permit — mainline drops this at XDP ingress \
+             (parse_l4 -> None -> PARSE_FAIL -> XDP_DROP), so the gate was more permissive \
+             than the wire ({} bytes escaped, denies={denies} forward_drops={forward_drops} \
+             unadjudicated={unadjudicated})",
+            escaped.len()
+        );
+        assert_eq!(
+            forward_drops, 1,
+            "{label}: the drop is an inspection failure, not a policy verdict"
+        );
+        assert_eq!(denies, 0, "{label}: the policy PERMITTED — the malformed shape dropped it");
+        assert_eq!(unadjudicated, 0, "{label}: this must not read as kernel delegation");
+    }
+
+    // NEGATIVE CONTROL — the guard must NOT widen to non-first
+    // fragments. A non-first fragment legitimately carries no L4 header,
+    // is peer-selectable, and is the shape r2 MAJOR 1 exists to
+    // adjudicate on L3 rather than delegate. Dropping it here would
+    // blackhole every fragmented TCP flow through the tunnel.
+    let frag = ipv4_tcp_non_first_fragment(src, dst);
+    let (escaped, denies, forward_drops, unadjudicated) = run_inner_full(&forwarding, &frag);
+    assert_eq!(
+        escaped, frag,
+        "a PERMITTED non-first fragment must still transit — it legitimately has no L4 \
+         header and must not be swept up by the malformed-L4 drop (denies={denies} \
+         forward_drops={forward_drops} unadjudicated={unadjudicated})"
+    );
+    assert_eq!(forward_drops, 0, "a non-first fragment is not a malformed L4 header");
+
+    // NEGATIVE CONTROL 2 — a protocol that has no ports at all is
+    // unaffected: SCTP carries no L4 the gate parses, and mainline's
+    // `parse_l4` returns a zero-port tuple for it rather than failing,
+    // so it must keep transiting under a permit.
+    let sctp = ipv4_proto(src, dst, 132);
+    let (escaped, _d, forward_drops, _u) = run_inner_full(&forwarding, &sctp);
+    assert_eq!(
+        escaped, sctp,
+        "a portless protocol must not be swept up by the ported-transport guard"
+    );
+    assert_eq!(forward_drops, 0);
+}
+
 /// A `FirewallFilterSnapshot` whose single term carries a
 /// `then routing-instance` (filter-based-forwarding) action — the shape
 /// that sets `affects_route_lookup` on the compiled filter.

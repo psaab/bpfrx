@@ -182,7 +182,57 @@
 //!     authority; dropping it would break every legitimate host-bound
 //!     flow through the tunnel (ping/SSH to the firewall over WG).
 //!     **This is an open residual of #5618, not a closed case** — see
-//!     `docs/wireguard-interop.md`.
+//!     `docs/wireguard-interop.md`. Tracked as **#6664**, which scopes
+//!     it to BOTH the transit slow path and this one; the pure
+//!     evaluator (`evaluate_junos_host_policy_l3_aware`) exists, but it
+//!     covers only the `to-zone junos-host` POLICY, not host-inbound
+//!     SERVICE admission or the lo0 filter, so wiring just that half
+//!     here would look like closure while leaving two of three gates
+//!     open — and would newly subject management-over-WG to a plane it
+//!     has never been under.
+//!
+//! ## Disposition parity table — WITH DIRECTION
+//!
+//! Every case where this gate and the mainline transit path disagree,
+//! and WHICH WAY. "Over-permit" means plaintext reaches the TUN that
+//! mainline would have stopped; "over-drop" means the reverse. Do not
+//! summarise this table as one direction — it is both.
+//!
+//! | Case | This gate | Mainline | Direction |
+//! |---|---|---|---|
+//! | `local_delivery` | delegate | host-inbound + `junos-host` | **over-permit** |
+//! | `ingress_unzoned` | delegate | zone 0 → default policy | **over-permit** |
+//! | `pbr_route_override_possible` | delegate | evaluates FBF, routes via override | **over-permit** |
+//! | `endpoint_absent` | delegate | no equivalent (teardown race) | **over-permit** |
+//! | `no_egress_ifindex` / `next_table_unsupported` | delegate | delegate (slow-path eligible) | parity |
+//! | non-first fragment, port-bearing permit, NO NAT | default policy | default policy | parity |
+//! | non-first fragment of a flow xpf would NAT | default policy (drop) | assoc HIT: forward; assoc MISS: **drop** | over-drop vs HIT only |
+//! | truncated chain on proto 135/139/140/253/254 | `ForwardDrop` | shim treats as terminal → forwards | **over-drop** |
+//! | declares TCP/UDP, no L4 header | `ForwardDrop` | `XDP_DROP` at ingress | parity (r5) |
+//! | truncated IPv6 ext chain | `ForwardDrop` | `XDP_DROP` at ingress | parity (r4) |
+//!
+//! Two rows deserve their reasoning, because the obvious remedy is
+//! wrong for both:
+//!
+//!   - **NAT'd non-first fragment.** The association mainline inherits
+//!     from is unreachable here (see the fragment section above), so the
+//!     only question is what to do without one. Mainline's own answer
+//!     for that case is to DROP: `poll_descriptor/mod.rs` gates on
+//!     `frame_is_non_first_fragment && flowless_fragment_requires_nat_translation`
+//!     and drops fail-closed (#6122, `nat_frag_untranslated_dropped`),
+//!     because forwarding it would leak the internal source or the
+//!     pre-NAT destination. So DELEGATING this shape — the intuitive
+//!     "stop over-dropping" fix — would make the gate strictly MORE
+//!     permissive than mainline, not less divergent. The current drop is
+//!     the closer behaviour; only the association-HIT case diverges, and
+//!     that one cannot arise here.
+//!   - **Truncated 135/139/140/253/254.** `walk_ipv6_ext_chain` treats
+//!     these as generic length-prefixed extension headers (#4517); the
+//!     XDP shim's `parse_ipv6` breaks on them as terminal. That
+//!     shim-vs-walker split predates this gate and affects mainline's
+//!     own userspace stage identically. The shape is malformed (a
+//!     declared length running past the packet), so failing it closed is
+//!     the defensible side of the divergence.
 //!
 //! Every un-adjudicated packet bumps `inner_policy_unadjudicated`, so
 //! the residual delegation is operator-visible rather than silent.
@@ -324,6 +374,39 @@ pub(super) fn evaluate_wg_inner_ingress(
                 let Some((src_ip, dst_ip)) = inner_l3_addrs(frame, addr_family) else {
                     return InnerVerdict::ForwardDrop("inner_uninspectable");
                 };
+                // r5 MAJOR 2: a packet DECLARING a ported transport but
+                // carrying no readable L4 header is not a legitimate
+                // flowless shape — it is malformed, and mainline never
+                // delivers it. The XDP shim resolves TCP/UDP eagerly
+                // (`parse_l4`, `userspace-xdp/src/lib.rs`): TCP needs 14
+                // readable bytes plus a data-offset of at least 20 that
+                // is itself readable, UDP needs 8, and a failure makes
+                // `parse_ipv4`/`parse_ipv6` return `None`, which is
+                // `drop_degraded_transit(.., PARSE_FAIL)` → `XDP_DROP`.
+                // Adjudicating it here instead let a 20-byte IPv4 packet
+                // with `protocol = 6` and no TCP header PERMIT under a
+                // permit-any, i.e. the gate was more permissive than the
+                // wire it claims parity with — the same defect shape as
+                // the truncated extension chain above.
+                //
+                // Reaching this arm with TCP/UDP already MEANS the header
+                // is unusable: `parse_session_flow_from_frame` returns
+                // `Some` for TCP/UDP whenever four port bytes sit inside
+                // the IP-declared datagram, so a `None` here is exactly
+                // "declared a ported transport, carried no usable
+                // header". No length arithmetic is re-derived.
+                //
+                // A NON-FIRST FRAGMENT is excluded and must stay so. It
+                // legitimately carries no L4 header, it is the shape r2
+                // MAJOR 1 exists to adjudicate rather than delegate, and
+                // it is peer-selectable — dropping it here would blackhole
+                // every fragmented TCP/UDP flow through the tunnel. Its
+                // handling is the documented #3291 limitation, unchanged.
+                if matches!(protocol, PROTO_TCP | PROTO_UDP)
+                    && !crate::afxdp::frame::frame_is_non_first_fragment(frame, meta)
+                {
+                    return InnerVerdict::ForwardDrop("inner_l4_header_absent");
+                }
                 // LOAD-BEARING: ports are hard 0 here, and that is safe
                 // only because this arm is unreachable for any protocol
                 // that HAS ports. `parse_session_flow_from_frame`

@@ -856,6 +856,48 @@ Deliberately narrow. Only three things DROP and bump
   L3 header. WireGuard is an IP tunnel, so there is no identity to
   adjudicate.
 
+**Disposition parity table — with DIRECTION.** Every case where this gate
+and the mainline transit path disagree, and which way. *Over-permit* means
+plaintext reaches the TUN that mainline would have stopped; *over-drop*
+means the reverse. This list runs in both directions — do not summarise
+it as one.
+
+| Case | This gate | Mainline | Direction |
+|---|---|---|---|
+| `local_delivery` (host-bound inner dst) | delegate | host-inbound admission + `to-zone junos-host` | **over-permit** (tracked #6664) |
+| `ingress_unzoned` (tunnel not in a zone) | delegate | zone 0 → default policy | **over-permit** |
+| `pbr_route_override_possible` (FBF on the unit) | delegate | evaluates FBF, routes via the override table | **over-permit** |
+| `endpoint_absent` (teardown race) | delegate | no equivalent | **over-permit**, bounded to teardown |
+| `no_egress_ifindex` / `next_table_unsupported` | delegate | delegate (slow-path eligible) | parity |
+| non-first fragment, port-bearing permit, no NAT | default policy | default policy | parity (the #3291 limitation) |
+| non-first fragment of a flow xpf would NAT | default policy (drops) | association HIT: forward; MISS: **drops** | over-drop vs the HIT case only |
+| truncated chain on protocol 135/139/140/253/254 | `ForwardDrop` | shim treats as terminal → forwards | **over-drop** |
+| declares TCP/UDP but carries no L4 header | `ForwardDrop` | `XDP_DROP` at ingress | parity |
+| truncated IPv6 extension chain | `ForwardDrop` | `XDP_DROP` at ingress | parity |
+
+Two rows need their reasoning spelled out, because the obvious remedy is
+wrong for both.
+
+*NAT'd non-first fragment.* The association mainline inherits the first
+fragment's verdict from is structurally unreachable here, so the only
+question is what to do without one — and mainline's own answer for that
+case is to **drop**: `poll_descriptor/mod.rs` gates on
+`frame_is_non_first_fragment && flowless_fragment_requires_nat_translation`
+and drops fail-closed (#6122, `nat_frag_untranslated_dropped`), because
+forwarding it would leak the internal source (SNAT/NPTv6) or the pre-NAT
+destination (DNAT). So *delegating* this shape — the intuitive "stop
+over-dropping" fix — would make the gate strictly **more permissive** than
+mainline rather than less divergent. The current drop is the closer
+behaviour; only the association-HIT case diverges, and it cannot arise on
+this path.
+
+*Truncated 135/139/140/253/254.* `walk_ipv6_ext_chain` treats these as
+generic length-prefixed extension headers (#4517) while the XDP shim's
+`parse_ipv6` breaks on them as terminal. That shim-vs-walker split
+predates this gate and affects mainline's own userspace stage identically.
+The shape is malformed — a declared length running past the end of the
+packet — so failing it closed is the defensible side.
+
 **Mainline parity on the extension chain is a per-STAGE claim.** The
 #4743 comment in `poll_descriptor/mod.rs` — drop "ONLY the genuine
 over-limit chain; a non-first fragment / ICMPv6 / truncated packet is not
