@@ -1,9 +1,10 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v67 — r66 findings folded (Codex NEEDS-REVISION
-  3M/1m; AGY PLAN-READY; Claude SMR PLAN-READY (0 findings,
-  4 documented attacks FAILED); all three confirm the §4.7
-  structure); pending convergence review r67
+- **Status**: DRAFT v68 — r67 findings folded (Codex NEEDS-REVISION
+  4M/3m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS
+  0M/1m — the section-hold bound, resolved per AGY's reading;
+  all three confirm the §4.7 structure); pending convergence
+  review r68
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -3034,6 +3035,60 @@
   prevents NEW mutations). (d) The zeroize consistency (Codex
   m1): the two-term "full" references now read the three-term
   form, and §9 gains the ZEROIZE CALLBACK leg.
+  v68: r67 convergence — the critical section is
+  check-plus-mark with the syscall outside the lock, the
+  scheduler's mutations get the same discipline plus the
+  observed latch, and the teardown's m.mu wait is honestly
+  bounded (Codex NEEDS-REVISION 4M/3m, folds 4 PARTIAL,
+  structure confirmed; AGY PLAN-READY with its attack-1
+  reading (the section covers check+registration, the syscall
+  outside) adopted; SMR PLAN-READY-WITH-NITS 0M/1m — the
+  section-hold bound, resolved per AGY's reading): (a) THE
+  CHECK-PLUS-MARK SECTION (Codex M1, verified the
+  unbounded-hold hazard: the netlink calls are synchronous
+  and non-contextual, `daemon_ha_fabric.go:23-148`, so
+  holding the ledger through the CALL would block the gate
+  closure, the join, and the mint): the section covers the
+  fence check + the entry MARK only (microseconds); the
+  netlink syscall executes OUTSIDE the lock; and the mark
+  establishes the call's precedence — a callback whose
+  section completed before the close legitimately entered,
+  and one arriving after sees the closed gate and abandons.
+  (b) THE SCHEDULER'S CHECK+MARK DISCIPLINE (Codex M2,
+  verified: `publishPolicyScheduleState` checks state then
+  makes two separate dataplane calls,
+  `daemon_scheduler.go:205-215,220-241`, and the userspace
+  seed releases `m.mu` before `UpdatePolicyScheduleState`
+  reacquires it, `manager_compile.go:153-160,447-453`): each
+  scheduler mutation's entry is marked atomically with its
+  fence check under the ledger lock — the same discipline as
+  the callback. (c) THE OBSERVED LATCH (Codex M3, verified:
+  `schedulerCancel`/`schedulerWg`/`schedulerStopped` are
+  applySem-guarded, `daemon.go:334-346`, and an
+  already-admitted apply can resume after ApplyConfig and
+  start another scheduler generation,
+  `daemon_apply_dataplane.go:133-165`,
+  `daemon_scheduler.go:140-157`): the latch is set under
+  applySem and OBSERVED by `startPolicySchedulerLoopLocked`
+  (a start after the latch is a no-op). (d) THE HONEST
+  m.mu WAIT BOUND (Codex M4, verified:
+  `UpdatePolicyScheduleState` holds `m.mu` across rebuild
+  work, optional preliminary IPC, and apply_snapshot,
+  `manager_compile.go:450-564`, with JSON marshaling before
+  any socket deadline, `process_control.go:106-142`, and the
+  snapshot deadline alone reaching ~67s versus
+  `TimeoutStopSec=20`): the wait is at most ONE in-flight
+  snapshot, bounded by the snapshot deadline, and the
+  pathological >20s case is SIGKILL-bounded — named. (e) The
+  minors: the acceptance's two-term "FULL fence" reference
+  gains the three-term form (Codex m1); the §5.1 daemon
+  inventory gains the admission flag + reserved set +
+  scheduler latch (Codex m2); §9 gains the SCHEDULER LATCH
+  leg; and the post-reactivation "COMPLETE" predicate gains
+  `IsConfirmPending` + `IsDirty` (Codex m3 — the event
+  engine mutates the candidate before invoking commitFn,
+  `engine.go:899-930,948`, so the abbreviated rerun could
+  false-green).
 
 ---
 
@@ -6696,6 +6751,12 @@ v20 history). The delivery is TWO units:
   PLUS the work-item-G state: `startupDone chan struct{}`,
   `startupDoneOnce sync.Once`, `startupOK atomic.Bool`, `finishStartup`,
   and the r8 `stopping atomic.Bool` shutdown-admission fence.
+  PLUS the work-item-H2 shutdown-admission state (r67 Codex
+  m2's inventory completion): the daemon-owned admission
+  flag + the reserved set (the callback join's state) and the
+  scheduler's abandoned-stop TERMINAL LATCH (observed by
+  `startPolicySchedulerLoopLocked`,
+  `daemon_scheduler.go:140-157`).
   PLUS the work-item-H2 authority/provider state (r56 Codex
   M7's inventory completion): the config-sync marker's claim
   carries the AUTHORITY GENERATION (bumped by the RG0
@@ -7296,8 +7357,18 @@ v20 history). The delivery is TWO units:
   cannot establish never-mutating — a callback preempted
   after its check until after the timeout can resume and
   enter the call): the fence check and each mutation's entry
-  form ONE critical section under the ledger lock
-  (check-then-enter atomically), so no call STARTS after the
+  MARK form ONE critical section under the ledger lock —
+  with the section's content pinned (r67 Codex M1, verified
+  the unbounded-hold hazard: the netlink calls are
+  synchronous and non-contextual,
+  `daemon_ha_fabric.go:23-148`, so holding the ledger through
+  the call itself would block the gate closure, the join, and
+  the mint): the section covers the fence check + the entry
+  MARK only (microseconds); the netlink syscall executes
+  OUTSIDE the lock; and the mark establishes the call's
+  precedence — a callback whose section completed before the
+  close legitimately entered, and one arriving after sees the
+  closed gate and abandons — so no call STARTS after the
   gate closes; a call already entered at the close is the
   bounded overlap; and a call that never returns is bounded
   by process exit — with the callback TEARDOWN-SERIALIZED (r60 Codex M2,
@@ -7379,20 +7450,41 @@ v20 history). The delivery is TWO units:
   sequential wait — the reacquisition overlaps the existing
   waits), and on expiry the scheduler stop is ABANDONED with
   the process exiting — with the abandonment's safety made
-  real (r66 Codex M3, all three parts verified: (i) the
-  scheduler's dataplane-mutation path checks NO fence today —
-  `publishPolicyScheduleState` checks only epoch before
-  dataplane mutation, `daemon_scheduler.go:192-217,229-241` —
-  so it gains the three-term fence check before any dataplane
-  mutation; (ii) the abandonment gains a TERMINAL LATCH — an
-  abandoned-stop flag making any later `stopPolicySchedulerLoop`
-  call a no-op, answering Run's unconditional defer re-entry,
-  `daemon_run.go:89-100`; (iii) the scheduler's mutation holds
-  `m.mu` across the snapshot IPC, `manager_compile.go:447-453,
-  526-564`, while Close/Teardown require the same mutex,
-  `manager.go:471-482` — so the teardown can wait behind ONE
-  in-flight scheduler snapshot, bounded by the control-request
-  deadline, and the fence prevents NEW mutations) — the policy scheduler's state is
+  real (r66 Codex M3 + r67 Codex M2/M3/M4, all verified: (i)
+  the scheduler's dataplane-mutation path checks NO fence
+  today — `publishPolicyScheduleState` checks only epoch
+  before dataplane mutation, `daemon_scheduler.go:192-217,
+  229-241` — so it gains the three-term fence check, with the
+  SAME check+mark section discipline as the callback (r67
+  Codex M2: the scheduler checks state then makes two
+  separate dataplane calls, `daemon_scheduler.go:205-215,
+  220-241`, and the userspace seed releases `m.mu` before
+  `UpdatePolicyScheduleState` reacquires it,
+  `manager_compile.go:153-160,447-453` — so each mutation's
+  entry is marked atomically with its fence check under the
+  ledger lock); (ii) the abandonment gains a TERMINAL LATCH —
+  set under applySem (the stop path's bounded acquire) and
+  OBSERVED by `startPolicySchedulerLoopLocked`, so a start
+  after the latch is a no-op (r67 Codex M3, verified:
+  `schedulerCancel`/`schedulerWg`/`schedulerStopped` are
+  applySem-guarded, `daemon.go:334-346`, and an
+  already-admitted apply can resume after ApplyConfig and
+  start another scheduler generation,
+  `daemon_apply_dataplane.go:133-165`,
+  `daemon_scheduler.go:140-157`) — answering Run's
+  unconditional defer re-entry,
+  `daemon_run.go:89-100`; (iii) the teardown's `m.mu` wait is
+  honestly bounded (r67 Codex M4, verified:
+  `UpdatePolicyScheduleState` holds `m.mu` across rebuild
+  work, optional preliminary IPC, and apply_snapshot,
+  `manager_compile.go:450-564`, with JSON marshaling before
+  any socket deadline, `process_control.go:106-142`, and the
+  snapshot deadline alone reaching ~67s,
+  `process_control.go:33-56,92-103`, versus
+  `TimeoutStopSec=20`): the wait is at most ONE in-flight
+  snapshot, bounded by the snapshot deadline, and the
+  pathological >20s case is SIGKILL-bounded — named — with
+  the fence preventing NEW mutations) — the policy scheduler's state is
   in-memory and dies with the process, and its mutation path
   shares the apply machinery's fence, so a stranded
   scheduler's next mutation abandons at the fence;
@@ -8821,7 +8913,12 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      aggregate AND ActiveApplied AND the apply-failure/
      last-outcome terms AND the no-pending-outstanding term
      (r59 Codex m2) AND the no-QUEUED-reservation-outstanding
-     term (r63 Codex M4) AND the authority check on BOTH nodes) against
+     term (r63 Codex M4) AND `IsConfirmPending() == false` AND
+     `IsDirty() == false` (or the candidate explicitly
+     discarded — r67 Codex m3's completion: the event engine
+     mutates the candidate before invoking commitFn,
+     `engine.go:899-930,948`, so the abbreviated rerun could
+     false-green) AND the authority check on BOTH nodes) against
      the PRE-QUIESCE digest captured before (1a) — the
      two-digest discipline: post-restart verification against
      the fence-time digest, re-activation verification against
@@ -8933,7 +9030,15 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      CALLBACK leg (r66 Codex m1): a callback queued before a
      zeroize acquires after the wipe and reads `resetting` —
      abandoning every mutation from the retained pre-wipe
-     configuration (`daemon_apply_reset.go:59-89`);
+     configuration (`daemon_apply_reset.go:59-89`); and the
+     SCHEDULER LATCH leg (r67 Codex m2): a timeout →
+     abandoned-stop latch → a late start attempt
+     (`startPolicySchedulerLoopLocked` observing the latch is
+     a no-op) AND the Run-defer re-entry (the second
+     `stopPolicySchedulerLoop` call is a no-op), including
+     the embedded/early-error Run path where no process exit
+     destroys the stranded state (`daemon_run.go:89-100,
+     815-832`);
      (h2m) the v62 legs (r62 Codex m1 + fold-2): the LINKDEL
      INJECTION leg (a mismatched link whose `LinkDel` fails
      retires the arm FAILED — the discarded-error path,
@@ -8950,7 +9055,8 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      STALE-CALLBACK legs (a stale OnXSKBound closure takes
      applySem, re-derives from the current config, and
      abandons on mismatch AND on the FULL fence — `runCtx.Err()`
-     OR `stopping`, including the early signal-driven window —
+     OR `stopping` OR `resetting` (the three-term form, r67
+     Codex m1's second instance), including the early signal-driven window —
      with the teardown JOIN (a teardown beginning between the
      guard and a mutation is covered by the shutdown's join
      set), and a fire-time operation-by-operation aggregated
