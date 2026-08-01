@@ -2393,16 +2393,27 @@ fn tx_latency_hist_binding_counters_snapshot_is_static_send() {
 // arrived on. So between "which queue did this arrive on" and "which XSK do we
 // redirect to" the queue coordinate must survive unchanged.
 //
-// SCOPE, stated plainly. The shim is `no_std`, built for
-// `bpfel-unknown-none`, so this crate's tests cannot execute it; these two
-// checks read its SOURCE. A source check can only see what it is written to
-// look for — it cannot prove the compiled object behaves as the text reads.
-// They are deliberately narrow: one asserts a single function is the identity,
-// the other that the binding index is bound-checked rather than reduced. They
-// are NOT a model of the shim's packet path and must not grow into one. The
-// half of this defect that IS executable — that every interface's own queues
-// get a binding — is covered by `queue_planner_covers_each_interfaces_own_queues`
-// against the real planner.
+// SCOPE, stated plainly, and it is narrower than these checks' placement
+// suggests. The shim is `no_std`, built for `bpfel-unknown-none`, so this
+// crate's tests cannot execute it; the FOUR checks below read its SOURCE.
+//
+// A source check can only see what it is written to look for. Making these
+// file-scoped raised the bar but did not change their kind: a hostile review
+// escaped them twice while every one stayed green — by transforming the raw
+// `rx_queue_index` BEFORE the identity call, and by adding a raw fallback
+// lookup in a DIFFERENT file, which a file-scoped check cannot see by
+// construction. They are not behavioural tests and must not be described as
+// though they were. Closing that properly means extracting the index
+// computation into a `core`-only function the shim calls and a host test
+// EXECUTES — the pattern used for the IPv6 extension-header walk in #4555 —
+// which is tracked rather than done here.
+//
+// The planner half of #5173 was reverted from this PR (see #6702), so the
+// executable coverage that used to be cited here no longer exists in this
+// branch; `queue_planner_uses_smallest_queue_count` — master's own test,
+// restored by that revert — is what exercises the real planner now, and it is
+// the negative control for the mutation matrix precisely because it is true in
+// both worlds.
 
 fn shim_source() -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
