@@ -1,0 +1,34 @@
+# Codex hostile plan-review — round 119 (v10.34.0, reviewed at 2c89c158db51)
+
+Reviewer: Codex (arc thread 019fb84c-173d-7d70-bb72-4b0e416b2c62, job task-ms9o7q0h-wstasj, 2026-08-01). Verdict: PLAN NO (6B/1H/1M/1L). Headline: the cache anchor update preceded actual admission; the zero-probe commit was not mechanically valid (encapsulated borrows); the reverse-promote binding could capture an unrelated forward (occupant self-certify); the different-family overwrite promote transfers K's id to S2; the id is not replication-invariant (promote republication + bulk export zero it) and not collision-sound for authority use; the closing-state inheritance was incomplete across the seed transaction; the capacity accounting was placed too early without inputs; the §3.1 second-window claim was false for worker/loop_body/mod.rs; the allocator wrap guard duplicates an id. r118-3/6/7/8/9 RESOLVED; r118-1/2/4/5 UNRESOLVED. Folded as v10.35.0.
+
+Revision note in the raw review: the prompt's short SHA was again mistyped (2c89c158d364); Codex reviewed the matching v10.34.0 commit 2c89c158db51c51b89b38ee398a395d59a7d1fd0. (Round-120 prompts carry the full 40-char SHA.)
+
+## Verbatim review
+
+PLAN NO
+
+1. BLOCKER — The cache anchor update still precedes actual admission. The proposed hook rides `touch_if_stale`/`account_packet` at `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs:295-317`, but rewrite/request construction can still fail at `:427-548`, after which the packet is recycled at `:550-555`. Such a packet would advance the trusted anchor without being forwarded, contradicting the core committed-packet invariant.
+
+2. BLOCKER — The claimed zero-probe commit implementation is not mechanically valid. `touch_if_stale` and `account_packet` encapsulate their borrows and return `()` (`userspace-dp/src/session/mod.rs:1118-1133`, `:1177-1210`); neither receives the token or segment view. Both start with exact canonical lookup through `record_by_key[_mut]` (`:1022-1064`), so reverse-translated and forward-wire query keys may yield no borrow. The design needs a real post-success canonical lookup or an explicitly carried validated handle.
+
+3. BLOCKER — Reverse-promote binding can capture an unrelated forward entry. HA import queues F and synthesized R independently (`userspace-dp/src/afxdp/ha/session_import.rs:215-223`). F can be refused over non-peer K (`userspace-dp/src/session/install.rs:310-315`) while R installs; R’s later hit then promotes through `userspace-dp/src/afxdp/session_glue/mod.rs:1157-1253` and `session_glue/promote.rs:86-107`. Producer (c) would capture K’s ID whenever key/NAT reciprocity happens to agree—the same ABA equivalence the ID is supposed to distinguish. The expected F ID is available during reverse synthesis but currently discarded (`userspace-dp/src/afxdp/shared_ops.rs:750-785`). It must be preserved and compared, not learned from the current occupant.
+
+4. BLOCKER — `UpsertRefused` followed by promotion transfers K’s discriminator to distinct S2. `update_session` overwrites decision, metadata, origin, epoch and timing but does not replace `session_id` (`userspace-dp/src/session/mod.rs:1344-1397`). Under the plan’s write-once rule, S2 therefore inherits K’s ID, with no specified reidentity/reset. For exact key/NAT/orientation reuse, stale R_K can still authenticate S2. Suppress this promotion or make it a genuine identity replacement.
+
+5. BLOCKER — `session_id` is neither replication-invariant nor a sound authority discriminator. SharedPromote republishes zero (`userspace-dp/src/afxdp/session_glue/promote.rs:116-138`); sibling handling carries that zero (`session_glue/commands/upsert_synced.rs:64-79`) and mints a fresh ID (`userspace-dp/src/session/install.rs:340-344`). Bulk HA export also emits zero (`userspace-dp/src/afxdp/ha/export.rs:143-165`). Thus an already-bound R can permanently mismatch after F is reimported. Separately, the allocator has no node namespace and import explicitly permits active/active collisions (`userspace-dp/src/session/mod.rs:766-789`; `session/install.rs:324-344`). Same tuple/NAT does not make distinct TCP incarnations’ sequence anchors interchangeable. Once this ID authorizes cache or anchor mutations, #6311 is no longer observability-only.
+
+6. BLOCKER — Closing-state inheritance is incomplete across the reverse seed transaction. One raw `tcp_flags` value currently drives timeout, `closing`, `reset`, and observed flags (`userspace-dp/src/session/install.rs:157-180`, `:194-200`), while the same raw value is published and replicated (`userspace-dp/src/afxdp/shared_ops.rs:857-892`). Receivers reconstruct state from it (`session_glue/commands/upsert_synced.rs:64-79`; `session/install.rs:382-400`). Merely inheriting local booleans can therefore leave an established timeout or alive sibling replicas. The contract needs one effective inherited seed state governing all those outputs. Its existing `(Local, ESTABLISHED, non-closing) = master-verbatim` row must also distinguish an already-closing forward family.
+
+7. HIGH — Capacity-refusal accounting is placed too early and lacks required inputs. The proposed direct charge occurs during the forward-entry mark re-probe, but resolution/site-2b receives no packet length or DSCP (`userspace-dp/src/afxdp/session_glue/mod.rs:1124-1143`; `shared_ops.rs:824-842`). Master accounting occurs later, only for forwarding dispositions, at `userspace-dp/src/afxdp/poll_descriptor/mod.rs:3478-3503`. Charging during resolution would count packets subsequently denied or dropped and would omit normal `observed_tcp_flags` semantics. Carry an identity-bound fallback target to the existing accounting chokepoint.
+
+8. MEDIUM — Section 3.1’s second-window drift claim is false. `fff7a4ab5..b4605ea9d` changes `userspace-dp/src/afxdp/worker/loop_body/mod.rs` by +342/−13; `reap_expired_sessions` moves from upstream line 1498 to 1615. The document repeatedly cites the worktree reap block at `userspace-dp/src/afxdp/worker/loop_body/mod.rs:1481-1521`, so the “no cited file moved/no line drift” mapping needs correction.
+
+9. LOW — The allocator’s wrap guard prevents zero but not reuse. At counters `2^48` and `2^48+1`, masking plus `low == 0 ? 1` emits the same low ID consecutively (`userspace-dp/src/session/mod.rs:784-789`). Operationally remote, but it contradicts a formal distinct-incarnation discriminator.
+
+Round-118 dispositions: r118-1 UNRESOLVED; r118-2 UNRESOLVED; r118-3 RESOLVED; r118-4 UNRESOLVED; r118-5 UNRESOLVED; r118-6 RESOLVED; r118-7 RESOLVED; r118-8 RESOLVED; r118-9 RESOLVED.
+
+Revision note: `2c89c158d364` does not resolve locally; I reviewed the matching v10.34.0 commit `2c89c158db51c51b89b38ee398a395d59a7d1fd0`.
+
+Codex session ID: 019fb84c-173d-7d70-bb72-4b0e416b2c62
+Resume in Codex: codex resume 019fb84c-173d-7d70-bb72-4b0e416b2c62

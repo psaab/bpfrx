@@ -1909,7 +1909,10 @@ adopting the shared decision/metadata, §5.6).
   wire id. `alloc_session_id` gains the skip-on-collision wrap guard
   (round-119 Codex 9) and the hi-word gains a node-discriminator bit
   (`(worker_id & 0x7FFF) << 49 | (node_id & 1) << 48`,
-  `session/mod.rs:766-789`; #6311 pulled in, round-119 Codex 5b).
+  `session/mod.rs:766-789`; #6311 pulled in, round-119 Codex 5b). No
+  production consumer decodes the hi word — the only `id >> 48`
+  decoders are two test assertions (`session/tests.rs:374`, `:446`),
+  which update with the new layout.
 - The site-2b installer gains the effective-flags inheritance
   (v10.35.0, round-119 Codex 6): a synth against a closing-marked
   forward family computes the effective flags (driving packet's flags
