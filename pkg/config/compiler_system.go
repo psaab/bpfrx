@@ -2195,9 +2195,13 @@ func redundancyGroupBody(rgNode *Node) []*Node {
 // program's source text is the wrong tool; deriving both consumers from one
 // table removes the divergence by construction instead.
 //
-// Adding a statement means adding an entry here. Doing so registers it with
-// the splitter in the same edit, and a statement NOT registered here is not
-// compiled either — so the two cannot disagree.
+// Adding a statement means adding an entry here, which registers it with the
+// splitter in the same edit. Note what that does and does NOT guarantee: the
+// invariant is "all dispatch goes through this table", and the table being the
+// only dispatch path present is what makes the correct thing the easy thing —
+// it is not enforced. Compiling a statement from ad-hoc code beside the lookup
+// instead of from an entry here re-opens the fold bug exactly as before
+// (verified, not assumed).
 var redundancyGroupStatements = map[string]func(rg *RedundancyGroup, child *Node){
 	"node":                 compileRGNodePriority,
 	"gratuitous-arp-count": compileRGGratuitousARPCount,

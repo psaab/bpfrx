@@ -1263,8 +1263,9 @@ surface, splitting the tail at redundancy-group statement keywords so a
 multi-statement line yields one node each. Those keywords come from
 `redundancyGroupStatements`, a `map[string]func(*RedundancyGroup, *Node)` that
 is BOTH the compiler's dispatch table and the splitter's token set — adding a
-statement means adding one entry, and a statement not in the table is not
-compiled either, so the two cannot disagree.
+statement means adding one entry, which registers it with the splitter in the
+same edit. The invariant is "all dispatch goes through the table", and it is
+made natural rather than enforced: see the qualification below.
 
 That is deliberately not a checked hand-written list. It was one: a test parsed
 `compileChassis`'s source and extracted the `case "..."` literals of its switch.

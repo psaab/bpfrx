@@ -1,3 +1,21 @@
+## 2026-08-01 — #6588 round 6b: correct an overstated invariant in the table comment
+
+- **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
+- **Action**: The redundancyGroupStatements comment claimed a statement not in
+  the table "is not compiled either — so the two cannot disagree". Review tested
+  that rather than accepting it: dispatch injected inside the loop but outside
+  the table lookup reproduces the original divergence (container form honors the
+  statement, packed multi-statement line drops it). Same m4' result I reported
+  in round 6 — but the CODE COMMENT still carried the overstatement, which is
+  where the next person reads it, so the honest version in the PR body did not
+  fix anything. Reworded to state the real property: the invariant is "all
+  dispatch goes through this table", and the table being the only dispatch path
+  present makes the correct thing the easy thing — it is NOT enforced.
+  Fixed the identical overstatement in docs/config-schema.md, which also carried
+  "so the two cannot disagree" and then contradicted itself a paragraph later.
+  An overstated invariant is how the next person concludes they need not think.
+- **File(s)**: `pkg/config/compiler_system.go`, `docs/config-schema.md`, `_Log.md`
+
 ## 2026-08-01 — #6588 round 6: replace the source-modelling drift guard with a dispatch table
 
 - **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
