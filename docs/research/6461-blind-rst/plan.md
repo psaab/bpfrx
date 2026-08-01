@@ -2007,9 +2007,13 @@ adopting the shared decision/metadata, §5.6).
   round-119 Codex 4; the discriminator v10.37.0, round-121 Codex 4 —
   the `(nat, is_reverse)` compare is REPLACED because an exact
   tuple/NAT reincarnation has identical values yet is the ABA case):
-  the `SessionUpdate` gains the incoming family id (the caller passes
-  the synced row's / shared entry's `session_id`, `ctx.rs:62-70`,
-  `session_glue/promote.rs:99-107`); the update compares it against
+  the `SessionUpdate` gains the incoming family id (the promote/synced
+  callers pass the synced row's / shared entry's `session_id`,
+  `ctx.rs:62-70`,
+  `session_glue/promote.rs:99-107`; a LOCAL real-traffic refresh
+  caller passes the entry's OWN current id — always equal, always the
+  in-place branch, so the hot refresh path is unchanged); the update
+  compares it against
   the stored `session_id` — EQUAL (plus key) is a same-family refresh:
   update in place, id and authority state preserved (a legitimate
   NAT/orientation refresh rides the existing reindex,
@@ -2518,20 +2522,28 @@ adopting the shared decision/metadata, §5.6).
     `lookup.rs:62-68`, `:222-250`, `:253-320`) — exact-key-only
     invalidation (`flow_cache.rs:1105-1120`) would leave a stale
     descriptor active on a NEWLY-outranked alias Q. The producer/
-    carrier mechanics are specified (round-121 Codex 3): (i) the
-    install/upsert/overwrite sites write the invalidated alias family
-    into the existing per-worker `WorkerScratch` batch accumulator
-    (the v10.22.0 mechanism — the sites returning only `bool` today
-    gain a lightweight family-OUT into the accumulator, NOT a return-
-    type change); the current binding's caches drain the accumulator
-    IMMEDIATELY before the next descriptor's processing (the
-    `poll_binding` fan-out level, v10.22.0); (ii) the worker-command
+    carrier mechanics are specified (round-121 Codex 3; the carrier
+    made concrete v10.37.0): the `SessionTable` gains a drainable
+    `pending_invalidations` buffer (the `drain_deltas` precedent,
+    `session/mod.rs:1676-1690` — the table owns the buffer and the
+    install/upsert/overwrite paths push the affected alias family into
+    it, so the `bool`-returning sites keep their signatures); (i) the
+    in-poll installs (fabric-return, LocalDelivery, ForwardFlow,
+    positional reverse, MissingNeighborSeed —
+    `poll_descriptor/mod.rs:110-131`, `:981-1008`, `:2449-2458`,
+    `:2777-2787`, `:4787-4795`, `local_delivery.rs:75-115`) drain the
+    buffer into the `WorkerScratch` accumulator at the `poll_binding`
+    level and fan out to the binding's caches IMMEDIATELY before the
+    next descriptor's processing (the v10.22.0 mechanism); (ii) the
+    worker-command
     paths (`UpsertSynced`/`UpsertLocal` — they mutate before binding
     polling and the handler owns no caches,
     `session_glue/mod.rs:649-705`, `worker/loop_body/mod.rs:682-717`)
-    record the invalidated family into a per-worker pending
-    invalidation buffer that drains across ALL bindings before the
-    next RX batch (a separately sized command drain — commands are
+    accumulate into the same table-side buffer during the command
+    drain, and the worker fans the buffer out across ALL of its
+    bindings (left+right, `worker/lifecycle.rs:53-55`) at loop top
+    AFTER the command drain and BEFORE the next RX batch (a
+    separately sized command drain — commands are
     rare against packets, so the all-binding fan-out cost is bounded
     by command rate, never packet rate). A precedence-changing install
     can
