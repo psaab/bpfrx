@@ -24,6 +24,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/psaab/xpf/pkg/authz"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/conntrack"
@@ -100,26 +101,27 @@ type Config struct {
 	// nil defaults to net.Listen; a test injects a fake so the
 	// make-before-break listener reconcile is exercised without real ports.
 	ListenFunc func(network, address string) (net.Listener, error)
-	// PeerUIDFn resolves the UID owning the peer end of an accepted
+	// PeerLookupFn resolves the identity of the peer end of an accepted
 	// connection, for the #5561 server-side authorization gate. `client` is
 	// the connection's remote address and `server` its local address. nil
-	// defaults to authz.PeerUID, the kernel socket-table lookup.
+	// defaults to authz.LookupPeer, the kernel socket-table lookup.
 	//
-	// It is a seam, not a mock: a test injects a fixed UID so the route
+	// It is a seam, not a mock: a test injects a chosen identity so the route
 	// table and the class evaluation are exercised for a principal the test
-	// chooses, instead of only for whichever account happens to run the
-	// suite. The kernel lookup itself is covered against real sockets in
-	// pkg/authz.
-	PeerUIDFn func(client, server net.Addr) (uint32, error)
-	Store     *configstore.Store
-	DP        apiRuntimeDataPlane
-	EventBuf  *logging.EventBuffer
-	GC        *conntrack.GC
-	Routing   *routing.Manager
-	FRR       *frr.Manager
-	IPsec     *ipsec.Manager
-	DHCP      *dhcp.Manager
-	VRRPMgr   *vrrp.Manager // native VRRP manager
+	// picks, instead of only for whichever account happens to run the suite.
+	// The kernel lookup itself is covered against real sockets in pkg/authz,
+	// and the REST gate is covered end-to-end with no injection at all by
+	// TestProductionServerEnforcesRealPeerIdentity_5561.
+	PeerLookupFn func(client, server net.Addr) authz.PeerIdentity
+	Store        *configstore.Store
+	DP           apiRuntimeDataPlane
+	EventBuf     *logging.EventBuffer
+	GC           *conntrack.GC
+	Routing      *routing.Manager
+	FRR          *frr.Manager
+	IPsec        *ipsec.Manager
+	DHCP         *dhcp.Manager
+	VRRPMgr      *vrrp.Manager // native VRRP manager
 	// #846: atomic commit+apply callbacks. The daemon holds its
 	// apply semaphore across configstore.Commit and applyConfig, so
 	// two concurrent committers can't interleave their commit→apply
@@ -333,8 +335,8 @@ type Server struct {
 	// test injects a fake so the make-before-break reconcile is exercised without
 	// binding real ports.
 	listen func(network, address string) (net.Listener, error)
-	// peerUIDFn is Config.PeerUIDFn; nil means authz.PeerUID (#5561).
-	peerUIDFn                        func(client, server net.Addr) (uint32, error)
+	// peerLookupFn is Config.PeerLookupFn; nil means authz.LookupPeer (#5561).
+	peerLookupFn                     func(client, server net.Addr) authz.PeerIdentity
 	store                            *configstore.Store
 	dp                               apiRuntimeDataPlane
 	eventBuf                         *logging.EventBuffer
@@ -466,9 +468,9 @@ func NewServer(cfg Config) *Server {
 	if s.listen == nil {
 		s.listen = net.Listen
 	}
-	// #5561: the peer-UID resolver behind the authorization gate. nil means
-	// the real kernel socket-table lookup (authz.PeerUID).
-	s.peerUIDFn = cfg.PeerUIDFn
+	// #5561: the peer-identity resolver behind the authorization gate. nil
+	// means the real kernel socket-table lookup (authz.LookupPeer).
+	s.peerLookupFn = cfg.PeerLookupFn
 
 	mux := http.NewServeMux()
 
@@ -646,11 +648,10 @@ func (s *Server) buildHTTPServer(addr string) *http.Server {
 		ReadTimeout:       apiReadTimeout,
 		IdleTimeout:       apiIdleTimeout,
 		MaxHeaderBytes:    apiMaxHeaderBytes,
-		// #5561: carry the accepted connection's typed addresses into every
-		// request context so the authorization gate can ask the kernel who
-		// owns the peer socket. http.Request exposes RemoteAddr as a string
-		// and does not expose the local address at all.
-		ConnContext: connContext,
+		// #5561: resolve the peer's identity at ACCEPT and carry it into every
+		// request on the connection. Deferring it would let the caller choose
+		// the moment of the lookup — and choose to make it fail.
+		ConnContext: s.connContext,
 		// WriteTimeout intentionally unset — see the const block above (SSE
 		// streams + large scrapes must not be severed).
 	}
@@ -683,7 +684,7 @@ func (s *Server) buildHTTPSServer(addr string) (*http.Server, error) {
 		IdleTimeout:       apiIdleTimeout,
 		MaxHeaderBytes:    apiMaxHeaderBytes,
 		// #5561: same peer-identity plumbing as the HTTP leg.
-		ConnContext: connContext,
+		ConnContext: s.connContext,
 		// WriteTimeout intentionally unset — see the const block above.
 		TLSConfig: &tls.Config{
 			Certificates: []tls.Certificate{tlsCert},

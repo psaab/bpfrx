@@ -305,6 +305,73 @@
   `pkg/config/compiler_chassis_packed_monitor_6588_test.go` (new),
   `docs/config-schema.md`, `_Log.md`
 
+## 2026-08-01 — #5561 review round 1: two MAJOR authorization bypasses in my own fix
+
+- **Timestamp**: 2026-08-01 (fix/5561-rest-config-auth, PR #6645)
+- **Action**: Hostile review returned DO-NOT-MERGE with two MAJORs. Both
+  reproduced firsthand before touching code; both were the same shape —
+  **a guard scoped narrower than the claim it protected**.
+  **MAJOR 1 — peer-UID spoofing, default posture.** `netlink.SocketGet` does
+  NOT do an exact 4-tuple lookup. It issues `SOCK_DIAG_BY_FAMILY` with
+  `NLM_F_DUMP`, and `inet_diag_dump_icsk` filters on family, states,
+  `idiag_sport` and `idiag_dport` — the addresses in `id` are IGNORED — then
+  the library returns `msgs[0]` without comparing the reply's `SocketID`
+  against the request. Identity was decided by port pair alone. Reproduced:
+  with one real socket at `127.0.0.2:35591 -> 127.0.0.1:38849`, a query for
+  `127.0.0.9:35591` (no socket at all) returned uid 1000, and the raw reply's
+  id carried source `127.0.0.2`. Since all of 127/8 is bindable unprivileged,
+  a local user who reuses a root-owned connection's source port is reported
+  as root. The `/proc` parser was correct from the start — it compares full
+  local AND remote addresses — but it ran second as a fallback and therefore
+  never ran. **Fix:** netlink removed entirely; the socket table is read
+  directly and matched in full. A "fast path" whose reply must be re-verified
+  against the request buys nothing on a surface answering a few operator
+  actions per second, and every line of it is another place to assume the
+  kernel filtered something it did not.
+  **MAJOR 2 — the precedence rule was switched off by the caller.** The PR,
+  the README and a test all asserted that a peer UID outranks an api-auth
+  credential. It did — but only when the lookup SUCCEEDED, and the caller
+  controlled that. My own rationale for lazy resolution ("the client is
+  blocked awaiting a response, so the socket is ESTABLISHED for exactly the
+  window that matters") assumed a cooperative client; `shutdown(SHUT_WR)`
+  leaves ESTABLISHED and still lets the caller read the response. Reproduced
+  on the real path: the same `read-only` account with the same valid
+  credential got 403 when polite and **200 on `/config/enter`** (and 400s
+  from inside the handlers on set/commit/system-action) when it half-closed
+  first. **Fix, two parts:** resolution moved to `connContext` (accept time,
+  once per connection, not caller-timed); and `LookupPeer` now returns a
+  THREE-state answer — attributed / local-but-unattributable / not-on-this-
+  host — with the middle state a HARD DENY that no credential substitutes
+  for. "Local" is decided by the socket table AND by the address, so a caller
+  whose socket is gone entirely (RST) is still local if its address is
+  loopback or one of ours. That address rule is what makes correctness
+  independent of winning a race; eager resolution removes the attack.
+  **Third-instance sweep** (the review asked for one). Two further
+  credential-fallthrough paths found in my own code and fixed: a v4-mapped
+  row lives in `/proc/net/tcp6` even when Go reports the peer as plain
+  IPv4, and scanning only the v4 file would have reported that caller
+  off-box — the credential path; and an ABSENT socket table was treated as
+  "no row found" rather than "we looked nowhere", same consequence. Both
+  now fail closed. A path/method sweep (percent-encoding, dot segments,
+  encoded slash, double slash, case, trailing slash, query, fragment,
+  HEAD/OPTIONS/TRACE/GET against a POST-only route) found no fourth: every
+  trick 403s at the table, safe methods 405 at the mux.
+- **File(s)**: `pkg/authz/peer.go` (rewritten), `pkg/authz/passwd.go`,
+  `pkg/authz/peer_5561_test.go` (rewritten), `pkg/api/authz.go`,
+  `pkg/api/server.go`, `pkg/api/config_authz_5561_test.go`,
+  `pkg/api/README.md`, `docs/system-login.md`
+- **Validation**: 4 mutations, `go build ./...` and `go vet ./...` CLEAN under
+  each, each reding as an assertion with the negative controls green.
+  (A) restore port-only matching → `TestLookupPeerRejectsAddressMismatch_5561`
+  reports uid 1000 for four addresses with no socket. (B1) restore the
+  credential fallthrough for an unattributable local caller →
+  `TestUnattributableLocalCallerCannotBorrowCredential_5561` and the real-path
+  `TestHalfCloseCannotBorrowCredential_5561` both red; the "remote caller with
+  a credential is still admitted" control stays green. (B2) drop the address
+  rule → the loopback and management-IP branches red. (B3) revert eager to
+  lazy resolution → `TestPeerIdentityIsResolvedAtAccept_5561` observes 0
+  lookups for a connection carrying two safe requests. Full
+  `go test ./... -count=1` green (exit 0).
 ## 2026-08-01 — #5561 REST config mutation endpoints had no per-principal auth
 
 - **Timestamp**: 2026-08-01 (fix/5561-rest-config-auth)

@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,7 +32,7 @@ import (
 // built by the PRODUCTION constructor (buildHTTPServer), so the ConnContext
 // plumbing that carries the connection's identity into the request is on the
 // tested path rather than reconstructed by the test. Only the peer-UID
-// resolution itself is injected (Config.PeerUIDFn), so a case can choose which
+// resolution itself is injected (Config.PeerLookupFn), so a case can choose which
 // principal is calling instead of testing whichever account runs the suite; the
 // kernel lookup behind it is covered against live sockets in pkg/authz, and
 // TestProductionServerEnforcesRealPeerIdentity_5561 below closes the loop with
@@ -118,16 +119,27 @@ func usePasswdFixture(t *testing.T) {
 	t.Cleanup(authz.SetPasswdPathForTest(path))
 }
 
-// fixedPeerUID builds a resolver that always reports uid.
-func fixedPeerUID(uid uint32) func(client, server net.Addr) (uint32, error) {
-	return func(net.Addr, net.Addr) (uint32, error) { return uid, nil }
+// fixedPeerUID builds a resolver that attributes every connection to uid.
+func fixedPeerUID(uid uint32) func(client, server net.Addr) authz.PeerIdentity {
+	return func(net.Addr, net.Addr) authz.PeerIdentity {
+		return authz.PeerIdentity{UID: uid, OK: true, Local: true}
+	}
 }
 
-// noPeerUID builds a resolver that can never establish an identity — the state
-// of a connection from a remote peer, or one whose socket has left ESTABLISHED.
-func noPeerUID() func(client, server net.Addr) (uint32, error) {
-	return func(net.Addr, net.Addr) (uint32, error) {
-		return 0, fmt.Errorf("%w: test", authz.ErrNoPeerIdentity)
+// unattributableLocalPeer builds a resolver reporting a caller that IS on this
+// host but could not be attributed — a half-closed socket, a TIME_WAIT row, or
+// an unreadable socket table. It must DENY, never reach the credential.
+func unattributableLocalPeer() func(client, server net.Addr) authz.PeerIdentity {
+	return func(net.Addr, net.Addr) authz.PeerIdentity {
+		return authz.PeerIdentity{Local: true, Detail: "test: socket not established"}
+	}
+}
+
+// remotePeer builds a resolver reporting a caller that is NOT on this host —
+// the only case in which an api-auth credential may speak for it.
+func remotePeer() func(client, server net.Addr) authz.PeerIdentity {
+	return func(net.Addr, net.Addr) authz.PeerIdentity {
+		return authz.PeerIdentity{Detail: "test: peer is not on this host"}
 	}
 }
 
@@ -200,9 +212,9 @@ func TestEveryMutatingRouteRefusesWithoutPrincipal_5561(t *testing.T) {
 	usePasswdFixture(t)
 	store := authzStore(t, authzTestConfig)
 	_, base := authzServer(t, Config{
-		Addr:      "127.0.0.1:8080",
-		Store:     store,
-		PeerUIDFn: noPeerUID(),
+		Addr:         "127.0.0.1:8080",
+		Store:        store,
+		PeerLookupFn: unattributableLocalPeer(),
 	})
 
 	routes := sortedRouteKeys()
@@ -232,9 +244,9 @@ func TestClassGatesMutationPerPermission_5561(t *testing.T) {
 	usePasswdFixture(t)
 	store := authzStore(t, authzTestConfig)
 	_, base := authzServer(t, Config{
-		Addr:      "127.0.0.1:8080",
-		Store:     store,
-		PeerUIDFn: fixedPeerUID(authzUIDReadOnly),
+		Addr:         "127.0.0.1:8080",
+		Store:        store,
+		PeerLookupFn: fixedPeerUID(authzUIDReadOnly),
 	})
 
 	for _, route := range sortedRouteKeys() {
@@ -274,9 +286,9 @@ func TestAuthorizedPrincipalStillMutatesConfig_5561(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			store := authzStore(t, authzTestConfig)
 			_, base := authzServer(t, Config{
-				Addr:      "127.0.0.1:8080",
-				Store:     store,
-				PeerUIDFn: fixedPeerUID(tc.uid),
+				Addr:         "127.0.0.1:8080",
+				Store:        store,
+				PeerLookupFn: fixedPeerUID(tc.uid),
 			})
 
 			session := enterConfigure(t, base)
@@ -313,9 +325,9 @@ func TestReadOnlyEndpointsUnaffected_5561(t *testing.T) {
 	usePasswdFixture(t)
 	store := authzStore(t, authzTestConfig)
 	_, base := authzServer(t, Config{
-		Addr:      "127.0.0.1:8080",
-		Store:     store,
-		PeerUIDFn: noPeerUID(),
+		Addr:         "127.0.0.1:8080",
+		Store:        store,
+		PeerLookupFn: unattributableLocalPeer(),
 	})
 
 	for _, path := range []string{
@@ -349,9 +361,9 @@ func TestReadOnlyEndpointsUnaffected_5561(t *testing.T) {
 func TestUnknownMutatingRouteFailsClosed_5561(t *testing.T) {
 	usePasswdFixture(t)
 	_, base := authzServer(t, Config{
-		Addr:      "127.0.0.1:8080",
-		Store:     authzStore(t, authzTestConfig),
-		PeerUIDFn: fixedPeerUID(0), // even ROOT is refused an ungoverned route
+		Addr:         "127.0.0.1:8080",
+		Store:        authzStore(t, authzTestConfig),
+		PeerLookupFn: fixedPeerUID(0), // even ROOT is refused an ungoverned route
 	})
 
 	for _, route := range []string{
@@ -384,10 +396,10 @@ func TestApiAuthCredentialIsAFullPowerPrincipal_5561(t *testing.T) {
 
 	t.Run("credential authorizes an otherwise unidentifiable caller", func(t *testing.T) {
 		_, base := authzServer(t, Config{
-			Addr:      "127.0.0.1:8080",
-			Store:     authzStore(t, authzTestConfig),
-			Auth:      auth,
-			PeerUIDFn: fixedPeerUID(authzUIDStranger), // real account, not a login user
+			Addr:         "127.0.0.1:8080",
+			Store:        authzStore(t, authzTestConfig),
+			Auth:         auth,
+			PeerLookupFn: fixedPeerUID(authzUIDStranger), // real account, not a login user
 		})
 		status, errMsg := postRoute(t, base, "POST /api/v1/config/enter",
 			map[string]string{"Authorization": basic})
@@ -398,10 +410,10 @@ func TestApiAuthCredentialIsAFullPowerPrincipal_5561(t *testing.T) {
 
 	t.Run("without the credential the same caller is refused", func(t *testing.T) {
 		_, base := authzServer(t, Config{
-			Addr:      "127.0.0.1:8080",
-			Store:     authzStore(t, authzTestConfig),
-			Auth:      auth,
-			PeerUIDFn: fixedPeerUID(authzUIDStranger),
+			Addr:         "127.0.0.1:8080",
+			Store:        authzStore(t, authzTestConfig),
+			Auth:         auth,
+			PeerLookupFn: fixedPeerUID(authzUIDStranger),
 		})
 		status, _ := postRoute(t, base, "POST /api/v1/config/enter", nil)
 		// The api-auth middleware answers first with its own 401 challenge.
@@ -412,10 +424,10 @@ func TestApiAuthCredentialIsAFullPowerPrincipal_5561(t *testing.T) {
 
 	t.Run("peer identity outranks the credential", func(t *testing.T) {
 		_, base := authzServer(t, Config{
-			Addr:      "127.0.0.1:8080",
-			Store:     authzStore(t, authzTestConfig),
-			Auth:      auth,
-			PeerUIDFn: fixedPeerUID(authzUIDReadOnly),
+			Addr:         "127.0.0.1:8080",
+			Store:        authzStore(t, authzTestConfig),
+			Auth:         auth,
+			PeerLookupFn: fixedPeerUID(authzUIDReadOnly),
 		})
 		status, errMsg := postRoute(t, base, "POST /api/v1/config/enter",
 			map[string]string{"Authorization": basic})
@@ -427,6 +439,219 @@ func TestApiAuthCredentialIsAFullPowerPrincipal_5561(t *testing.T) {
 			t.Errorf("denial did not attribute the read-only account: %q", errMsg)
 		}
 	})
+}
+
+// TestUnattributableLocalCallerCannotBorrowCredential_5561 pins row (3) of the
+// precedence table in Server.principal: a caller that IS on this host but could
+// not be attributed must be DENIED, never handed the api-auth credential.
+//
+// The first version of this gate fell back to the credential whenever the peer
+// lookup failed, and the caller controlled whether it failed — so a restricted
+// account escalated to full power simply by making itself unidentifiable. A
+// precedence rule that only holds when the lookup succeeds is not a precedence
+// rule.
+func TestUnattributableLocalCallerCannotBorrowCredential_5561(t *testing.T) {
+	usePasswdFixture(t)
+	auth := &AuthConfig{Users: map[string]string{"webadmin": "s3cret"}}
+	basic := "Basic " + base64.StdEncoding.EncodeToString([]byte("webadmin:s3cret"))
+
+	t.Run("local but unattributable is refused despite a valid credential", func(t *testing.T) {
+		_, base := authzServer(t, Config{
+			Addr:         "127.0.0.1:8080",
+			Store:        authzStore(t, authzTestConfig),
+			Auth:         auth,
+			PeerLookupFn: unattributableLocalPeer(),
+		})
+		for _, route := range []string{
+			"POST /api/v1/config/enter",
+			"POST /api/v1/config/set",
+			"POST /api/v1/config/commit",
+			"POST /api/v1/system/action",
+		} {
+			status, errMsg := postRoute(t, base, route, map[string]string{"Authorization": basic})
+			if status != http.StatusForbidden {
+				t.Errorf("%s admitted an UNIDENTIFIABLE local caller with %d because it "+
+					"presented the shared api-auth secret — a restricted account only has to "+
+					"make its own identity unreadable to reach full power", route, status)
+			}
+			if !strings.Contains(errMsg, "local but could not be identified") {
+				t.Errorf("%s denial did not name the reason: %q", route, errMsg)
+			}
+		}
+	})
+
+	// The negative control for the rule above: a caller that is genuinely NOT
+	// on this host is exactly who the credential exists to identify (#4047), so
+	// it must still be admitted. A gate that refused every unattributed caller
+	// would pass the subtest above and lock out every remote administrator.
+	t.Run("a remote caller with the credential is still admitted", func(t *testing.T) {
+		_, base := authzServer(t, Config{
+			Addr:         "127.0.0.1:8080",
+			Store:        authzStore(t, authzTestConfig),
+			Auth:         auth,
+			PeerLookupFn: remotePeer(),
+		})
+		status, errMsg := postRoute(t, base, "POST /api/v1/config/enter",
+			map[string]string{"Authorization": basic})
+		if status == http.StatusForbidden {
+			t.Fatalf("a remote administrator holding a valid api-auth credential was refused: %q",
+				errMsg)
+		}
+	})
+}
+
+// TestHalfCloseCannotBorrowCredential_5561 is the MAJOR-2 regression guard on
+// the REAL path: production server construction, real ConnContext, real kernel
+// socket-table lookup, real /etc/passwd, real credential — and a real
+// `shutdown(SHUT_WR)` on a hand-written HTTP request.
+//
+// Reproduced before the fix: the same `read-only` account with the same valid
+// credential got 403 when polite and 200/400 (i.e. past the gate, inside the
+// handler) when it half-closed first. The lazy lookup let the caller choose the
+// moment of resolution, and a failed resolution fell through to the full-power
+// credential. Both halves are fixed — the identity is resolved at accept, and a
+// local caller that cannot be attributed is denied rather than downgraded to
+// "anonymous with a password".
+func TestHalfCloseCannotBorrowCredential_5561(t *testing.T) {
+	uid := os.Getuid()
+	if uid == 0 {
+		t.Skip("running as root: UID 0 is authorized unconditionally, so the class " +
+			"this case restricts cannot be observed")
+	}
+	name, ok := authz.UsernameForUID(uint32(uid))
+	if !ok {
+		t.Skipf("uid %d has no /etc/passwd entry on this machine", uid)
+	}
+
+	cfgText := fmt.Sprintf("system {\n    host-name authz-halfclose;\n    login {\n        user %s {\n            class read-only;\n        }\n    }\n}\n", name)
+	auth := &AuthConfig{Users: map[string]string{"webadmin": "s3cret"}}
+	basic := "Basic " + base64.StdEncoding.EncodeToString([]byte("webadmin:s3cret"))
+
+	// No PeerLookupFn: the kernel answers for real.
+	_, base := authzServer(t, Config{
+		Addr:  "127.0.0.1:8080",
+		Store: authzStore(t, cfgText),
+		Auth:  auth,
+	})
+	addr := strings.TrimPrefix(base, "http://")
+
+	// rawPost writes a complete request by hand so the caller can half-close
+	// between the request and the response — something net/http's client will
+	// not do for us.
+	rawPost := func(path string, halfClose bool) string {
+		c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer c.Close()
+		req := "POST " + path + " HTTP/1.1\r\nHost: " + addr +
+			"\r\nAuthorization: " + basic +
+			"\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+		if _, err := c.Write([]byte(req)); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if halfClose {
+			// Leave ESTABLISHED while still reading the response — the move
+			// that used to defeat the lookup.
+			if err := c.(*net.TCPConn).CloseWrite(); err != nil {
+				t.Fatalf("CloseWrite: %v", err)
+			}
+			time.Sleep(150 * time.Millisecond)
+		}
+		buf := make([]byte, 128)
+		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, _ := c.Read(buf)
+		return string(buf[:n])
+	}
+
+	for _, path := range []string{
+		"/api/v1/config/enter",
+		"/api/v1/config/set",
+		"/api/v1/config/commit",
+		"/api/v1/system/action",
+	} {
+		t.Run(path, func(t *testing.T) {
+			// Precondition: a polite request from this read-only account is
+			// refused, so a pass below is the half-close and nothing else.
+			if polite := rawPost(path, false); !strings.HasPrefix(polite, "HTTP/1.1 403") {
+				t.Fatalf("precondition: a POLITE read-only caller was not refused: %q", polite)
+			}
+			hostile := rawPost(path, true)
+			if !strings.HasPrefix(hostile, "HTTP/1.1 403") {
+				t.Fatalf("a read-only account reached %s by calling shutdown(SHUT_WR) before "+
+					"the request was authorized, borrowing the api-auth credential: %q",
+					path, hostile)
+			}
+		})
+	}
+}
+
+// TestPeerIdentityIsResolvedAtAccept_5561 pins WHEN the identity is taken.
+//
+// The lookup must happen once per CONNECTION, at accept — not per mutating
+// request. Resolving it later hands the caller the choice of when it runs, and
+// therefore the choice of making it fail (see
+// TestHalfCloseCannotBorrowCredential_5561). Two observable consequences of
+// resolving at accept: it runs exactly once no matter how many requests the
+// connection carries, and it runs even on a connection that only ever issues a
+// safe request.
+func TestPeerIdentityIsResolvedAtAccept_5561(t *testing.T) {
+	usePasswdFixture(t)
+
+	var mu sync.Mutex
+	calls := 0
+	counting := func(net.Addr, net.Addr) authz.PeerIdentity {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		return authz.PeerIdentity{UID: authzUIDSuperuser, OK: true, Local: true}
+	}
+	count := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return calls
+	}
+
+	_, base := authzServer(t, Config{
+		Addr:         "127.0.0.1:8080",
+		Store:        authzStore(t, authzTestConfig),
+		PeerLookupFn: counting,
+	})
+
+	// One connection, kept alive across two requests.
+	client := &http.Client{Timeout: 10 * time.Second}
+	for i := 0; i < 2; i++ {
+		req, err := http.NewRequest(http.MethodPost, base+"/api/v1/config/status", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Method = http.MethodGet
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+	if got := count(); got != 1 {
+		t.Fatalf("peer identity resolved %d times for ONE connection carrying two SAFE "+
+			"requests, want exactly 1 at accept — a per-request lookup lets the caller "+
+			"choose the moment it runs, and choose to make it fail", got)
+	}
+
+	// A second connection resolves again — the cache is per connection, not
+	// per server, so a later caller is not attributed to an earlier one.
+	client.CloseIdleConnections()
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Get(base + "/api/v1/config/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if got := count(); got != 2 {
+		t.Fatalf("a second connection resolved the peer %d times in total, want 2 — the "+
+			"identity must be per connection, never shared between callers", got)
+	}
 }
 
 // TestProductionServerEnforcesRealPeerIdentity_5561 runs the whole path with NO
@@ -456,7 +681,7 @@ func TestProductionServerEnforcesRealPeerIdentity_5561(t *testing.T) {
 		t.Run(tc.class, func(t *testing.T) {
 			cfgText := fmt.Sprintf("system {\n    host-name authz-real;\n    login {\n        user %s {\n            class %s;\n        }\n    }\n}\n",
 				name, tc.class)
-			// No PeerUIDFn: authz.PeerUID queries the kernel for real.
+			// No PeerLookupFn: authz.LookupPeer queries the kernel for real.
 			_, base := authzServer(t, Config{
 				Addr:  "127.0.0.1:8080",
 				Store: authzStore(t, cfgText),

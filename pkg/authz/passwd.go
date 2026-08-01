@@ -2,6 +2,7 @@ package authz
 
 import (
 	"bufio"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -68,13 +69,24 @@ func SetPasswdPathForTest(path string) (restore func()) {
 	return func() { passwdPath = prev }
 }
 
-// SetProcNetTCPPathsForTest points the /proc fallback parser at fixtures and
+// SetProcNetTCPPathsForTest points the socket-table parser at fixtures and
 // restores the previous values through the returned function. Test-only; it
 // lets the parser be exercised against known kernel output (including the
-// TIME_WAIT/UID-0 row the ESTABLISHED requirement exists to reject) without
-// needing to provoke those states on a live socket.
+// TIME_WAIT/UID-0 row the ESTABLISHED requirement exists to reject, and the
+// v4-mapped-in-tcp6 row) without needing to provoke those states on a live
+// socket.
 func SetProcNetTCPPathsForTest(v4, v6 string) (restore func()) {
 	prev4, prev6 := procNetTCPPath, procNetTCP6Path
 	procNetTCPPath, procNetTCP6Path = v4, v6
 	return func() { procNetTCPPath, procNetTCP6Path = prev4, prev6 }
+}
+
+// setLocalAddrsForTest fixes the host address list LookupPeer consults when it
+// finds no socket, so the "is this caller on our own box" decision is
+// deterministic instead of depending on the machine's interfaces. Test-only,
+// unexported: only pkg/authz's own tests need it.
+func setLocalAddrsForTest(addrs []net.Addr) (restore func()) {
+	prev := localAddrsFn
+	localAddrsFn = func() ([]net.Addr, error) { return addrs, nil }
+	return func() { localAddrsFn = prev }
 }

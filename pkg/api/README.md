@@ -263,28 +263,67 @@ snapshot is nil) and is a shared secret rather than an identity; and the #5055
 cross-site guard is a browser-CSRF defense that a non-browser client passes by
 design.
 
-**How the caller is identified.** Two identities, most specific first:
+**How the caller is identified.** The peer's UID is read out of the kernel's
+socket table (`/proc/net/tcp` and `/proc/net/tcp6`), resolved to an account name
+via `/etc/passwd`, and then to a class via `system login user <name> class`. The
+caller supplies no part of the answer, so there is nothing to forge.
+`SO_PEERCRED` would answer the same question but only for AF_UNIX, and this is
+an AF_INET listener.
 
-1. **Peer UID.** For a connection whose peer is on this host, the owning UID is
-   read out of the kernel's socket table — INET_DIAG, falling back to
-   `/proc/net/tcp{,6}`. The caller supplies nothing, so there is nothing to
-   forge. The UID resolves to an account name via `/etc/passwd` and then to a
-   class via `system login user <name> class`. `SO_PEERCRED` would answer the
-   same question but only for AF_UNIX, and this is an AF_INET listener.
-   - **Only a socket in `TCP_ESTABLISHED` is accepted.** This is load-bearing:
-     the kernel reports UID 0 for a TIME_WAIT mini-socket, so without the state
-     check a caller that closes its socket right after writing the request is
-     reported as **root**. That escalation is demonstrated, not theorized —
-     removing the check makes `TestPeerUIDRefusesAfterPeerClose_5561` observe
-     uid 0 for a connection made by an unprivileged uid.
-   - The lookup runs lazily, only for mutating requests and only while the
-     request is in flight (so the socket is established for exactly the window
-     that matters). Reads, `/health` and `/metrics` never pay for it.
-2. **An `api-auth` credential**, which authorizes as a full-power principal.
-   That is what it already grants — #4047 makes it the sole gate on an
-   off-loopback bind — so narrowing it here would be a separate breaking change.
-   A peer UID that resolves to a configured login user **outranks** it, so a
-   `read-only` account that also knows the API password stays `read-only`.
+Three properties make the lookup safe rather than merely plausible. Each has a
+mutation proof; each was added because its absence was a live bypass.
+
+- **Both the local AND remote address must match exactly.** The first
+  implementation asked INET_DIAG through `netlink.SocketGet`, assuming a request
+  carrying a 4-tuple is answered for that 4-tuple. It is not: the library issues
+  an `NLM_F_DUMP`, whose kernel-side filter (`inet_diag_dump_icsk`) matches on
+  family, states, `idiag_sport` and `idiag_dport` and **ignores the addresses**,
+  then returns the first reply without checking it. Identity was decided by port
+  pair alone — and since every address in 127/8 is bindable by any local user, a
+  caller that reused the source port of a root-owned connection was reported as
+  **root**. Demonstrated: with one socket at `127.0.0.2:35591`, a query for
+  `127.0.0.9:35591` returned uid 1000 and a reply whose id read `127.0.0.2`.
+  netlink is gone; the socket table is read directly, matched in full.
+- **Only a socket in `TCP_ESTABLISHED` yields a UID.** The kernel reports UID 0
+  for a TIME_WAIT mini-socket, so without the state check a caller that closes
+  right after writing the request is reported as **root**. Demonstrated by
+  mutation, running as uid 1000.
+- **Resolution happens at accept, once per connection** (`connContext`), not per
+  request. Deferring it lets the caller pick the moment — and pick to make it
+  fail (see the precedence rule below).
+
+An **`api-auth` credential** is the second identity. It authorizes as a
+full-power principal, which is what it already grants (#4047 makes it the sole
+gate on an off-loopback bind), so narrowing it would be a separate breaking
+change.
+
+**Precedence: when the caller is LOCAL, the peer identity is authoritative.** A
+credential may speak only for a caller the login model does not describe, or one
+that is not on this host. The four outcomes are explicit because the interesting
+one is the failure:
+
+| peer lookup | principal |
+|---|---|
+| local, attributed to a `system login user` | that class — **a credential cannot upgrade it** |
+| local, attributed to an account outside the login model | a credential may speak for it |
+| **local, NOT attributable** | **DENIED** — no credential fallthrough |
+| not on this host | a credential may speak for it (remote administrator) |
+
+The third row is load-bearing. The first version stated the same intent but
+implemented it as "use the peer UID when the lookup succeeds, else fall back to
+the credential" — and the caller controlled whether it succeeded. A `read-only`
+account holding the api-auth secret escalated to full power by calling
+`shutdown(SHUT_WR)` before the request was authorized: 403 when polite, **200 on
+`/config/enter`** when hostile. A precedence rule that only holds on the success
+path is not a precedence rule.
+
+"Local" is decided by the socket table *and* by the address: a caller whose
+socket is gone entirely (an `SO_LINGER`-0 reset) is still local if its address is
+loopback or belongs to one of our interfaces. That address rule is why
+correctness no longer depends on winning a race with the caller — eager
+resolution removes the attack, the address rule removes the reliance on timing.
+An unreadable socket table is likewise reported as local-and-unattributable, not
+as "remote".
 
 **UID 0 is authorized unconditionally**, without consulting `/etc/passwd` or the
 active config. Root owns the daemon and the on-disk config DB, so denying it
@@ -325,13 +364,28 @@ restores it:
 A denial is confined to the REST mutation surface: forwarding, the dataplane,
 the console CLI and gRPC are unaffected, so this cannot brick a running box.
 
-**Identity plumbing.** `connContext` (the `http.Server.ConnContext` hook) carries
-the accepted connection's typed addresses into each request; `http.Request`
-exposes `RemoteAddr` only as a string and no local address at all. It must be set
-on **every** `http.Server` literal, including the #5866 day-2 rebind path in
-`listener.go` — a listener without it can identify nobody, which would refuse
-every mutation on it after an unrelated bind change.
-`TestEveryListenerCarriesPeerIdentity_5561` enforces that across the package.
+**Identity plumbing.** `connContext` (the `http.Server.ConnContext` hook)
+resolves the peer once, at accept, and caches it on the connection;
+`http.Request` exposes `RemoteAddr` only as a string and no local address at
+all. It must be set on **every** `http.Server` literal, including the #5866
+day-2 rebind path in `listener.go` — a listener without it can identify nobody,
+which would refuse every mutation on it after an unrelated bind change.
+`TestEveryListenerCarriesPeerIdentity_5561` enforces that across the package,
+and `TestPeerIdentityIsResolvedAtAccept_5561` pins the once-per-connection
+timing (a per-request lookup is what the caller used to be able to defeat).
+
+**Cost.** The lookup is a bounded read of the kernel socket table in
+`http.Server`'s accept loop, once per accepted connection. The "is this address
+one of ours" check runs only when the socket lookup already failed, so a
+legitimate caller never reaches it. This is a control-plane listener answering a
+handful of operator actions per second; the trade is an identity the caller
+cannot influence.
+
+**Known residual (not #5561).** The READ surface — REST GETs, `/api/v1/show-text`
+— is unchanged and remains reachable by any local process on a loopback bind.
+#5561 is scoped to the mutation surface; a read-side principal check is a
+separate question with a different blast radius (`/metrics` scrapers, health
+probes).
 
 ## Callers
 

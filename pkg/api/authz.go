@@ -97,33 +97,45 @@ var restMutationPermissions = map[string]config.LoginClassPermission{
 	"POST /api/v1/system/action": config.PermMaint,
 }
 
-// connAddrs carries the accepted connection's own addresses into the request
-// context. http.Request.RemoteAddr is a formatted string; the peer lookup needs
-// the typed net.Addr pair, and the LOCAL address is not on the request at all.
-type connAddrs struct {
-	local  net.Addr
-	remote net.Addr
-}
-
-type connAddrsKey struct{}
+type peerIdentityKey struct{}
 
 // connContext is the http.Server ConnContext hook (wired by buildHTTPServer /
-// buildHTTPSServer). It records the connection's addresses; it deliberately
-// does NOT resolve the peer UID here.
+// buildHTTPSServer). It resolves the peer's identity ONCE, at accept, and caches
+// it on the connection.
 //
-// Resolution is deferred to the authorization check for two reasons. It keeps
-// every read request, /health probe and /metrics scrape free of a kernel
-// socket-table query — connections are accepted far more often than mutations
-// are attempted. And it places the query while the request is in flight and the
-// client is blocked awaiting a response, which is precisely when the peer
-// socket is guaranteed ESTABLISHED, the state pkg/authz requires.
-func connContext(ctx context.Context, c net.Conn) context.Context {
-	return context.WithValue(ctx, connAddrsKey{}, connAddrs{local: c.LocalAddr(), remote: c.RemoteAddr()})
+// The first version deferred this to the authorization check, reasoning that the
+// client is blocked awaiting a response and so its socket is established for
+// exactly the window that matters. That reasoning assumed a COOPERATIVE client
+// and was wrong: `shutdown(fd, SHUT_WR)` takes the socket out of ESTABLISHED
+// while still letting the caller read the response, so a caller could choose the
+// moment of the lookup and choose to make it fail. Resolving at accept takes that
+// choice away — the identity is fixed when the connection is established, which
+// is the SO_PEERCRED semantic this is standing in for.
+//
+// The lookup runs in http.Server's accept loop, so it is on the path of every
+// accepted connection. It is one bounded read of the kernel socket table on a
+// control-plane listener that answers a handful of operator actions per second,
+// which is the right trade for an identity a caller cannot influence. Note that
+// correctness does NOT depend on the timing: authz.LookupPeer reports a caller
+// whose socket has vanished as LOCAL-but-unattributable (by address), which
+// denies. Eager resolution removes the attack; the address rule removes the
+// reliance on winning a race.
+func (s *Server) connContext(ctx context.Context, c net.Conn) context.Context {
+	return context.WithValue(ctx, peerIdentityKey{}, s.lookupPeer(c.RemoteAddr(), c.LocalAddr()))
 }
 
-func connAddrsFrom(ctx context.Context) (connAddrs, bool) {
-	a, ok := ctx.Value(connAddrsKey{}).(connAddrs)
-	return a, ok
+// lookupPeer resolves the peer identity through the injected resolver
+// (Config.PeerLookupFn) or pkg/authz's kernel lookup.
+func (s *Server) lookupPeer(client, server net.Addr) authz.PeerIdentity {
+	if s.peerLookupFn != nil {
+		return s.peerLookupFn(client, server)
+	}
+	return authz.LookupPeer(client, server)
+}
+
+func peerIdentityFrom(ctx context.Context) (authz.PeerIdentity, bool) {
+	id, ok := ctx.Value(peerIdentityKey{}).(authz.PeerIdentity)
+	return id, ok
 }
 
 // activeConfig returns the active config snapshot the login model is read from,
@@ -141,48 +153,77 @@ func (s *Server) activeConfig() *config.Config {
 
 // principal derives the caller's server-side identity for one request (#5561).
 //
-// Precedence is most-specific-first:
+// The precedence rule is: WHEN THE CALLER IS LOCAL, THE PEER IDENTITY IS
+// AUTHORITATIVE. A credential may speak only for a caller the login model does
+// not describe, or for one that is not on this host at all.
 //
-//  1. The kernel-reported peer UID, when it resolves to root or to a configured
-//     `system login user`. This is the identity the RBAC model is written
-//     against, so it wins even over a valid api-auth credential — a `read-only`
-//     account that also knows the API password stays read-only.
-//  2. A valid api-auth credential, which is a full-power principal (#4047 makes
-//     it the sole gate on an off-loopback bind).
-//  3. Otherwise the unresolved peer principal, so the denial can say WHY (which
-//     UID, and what was missing), or a bare unauthenticated principal.
+// The first version stated the same intent — "a peer UID outranks a credential"
+// — but implemented it as "use the peer UID when the lookup SUCCEEDS, otherwise
+// fall back to the credential". The caller controlled whether the lookup
+// succeeded (half-close before the request was authorized), so a `read-only`
+// account holding the api-auth secret escalated to full power just by calling
+// `shutdown(SHUT_WR)` first. A guard scoped to the success case is not a
+// precedence rule; the failure case is where precedence matters. The four
+// outcomes are now explicit:
+//
+//  1. Local and attributed to a configured `system login user` — that class is
+//     the answer. A credential CANNOT upgrade it. This is the property the
+//     issue is about: a restricted account stays restricted even if it also
+//     knows a shared secret.
+//  2. Local and attributed to an account the login model does not cover — the
+//     operator has assigned it no class, so a credential (an explicit operator
+//     grant) may speak for it.
+//  3. Local but NOT attributable — DENIED. No credential fallthrough. This is
+//     the row that used to escalate; a caller that can make its own identity
+//     unreadable must not thereby become anonymous-with-a-password.
+//  4. Not on this host — a remote administrator, which is exactly what the
+//     api-auth credential exists to identify (#4047 requires one for any
+//     off-loopback bind).
 func (s *Server) principal(r *http.Request) authz.Principal {
 	cfg := s.activeConfig()
 
-	unresolved := authz.Unauthenticated("connection carries no local peer identity")
-	if addrs, ok := connAddrsFrom(r.Context()); ok {
-		uid, err := s.peerUID(addrs.remote, addrs.local)
-		if err == nil {
-			p := authz.PrincipalForUID(cfg, uid)
-			if p.Resolved() {
-				return p
-			}
-			unresolved = p
-		} else {
-			unresolved = authz.Unauthenticated(err.Error())
-		}
+	id, ok := peerIdentityFrom(r.Context())
+	if !ok {
+		// No ConnContext ran for this connection, so we cannot even tell whether
+		// the caller is local — and therefore cannot tell whether a credential
+		// is allowed to speak for it. Refuse rather than guess.
+		return authz.Unauthenticated("connection identity was not captured at accept")
 	}
 
-	if a := s.auth.Load(); a != nil {
-		if user, ok := credentialPrincipalUser(*a, r); ok {
-			return authz.CredentialPrincipal(user)
+	if id.OK {
+		p := authz.PrincipalForUID(cfg, id.UID)
+		if p.Resolved() {
+			return p // (1) authoritative — no credential may override it
 		}
+		if cp, ok := s.credential(r); ok {
+			return cp // (2) outside the login model; the credential may grant it
+		}
+		return p
 	}
-	return unresolved
+
+	if id.Local {
+		// (3) A caller on this host that could not be attributed.
+		return authz.Unauthenticated("caller is local but could not be identified: " + id.Detail)
+	}
+
+	if cp, ok := s.credential(r); ok {
+		return cp // (4) remote administrator
+	}
+	return authz.Unauthenticated(id.Detail)
 }
 
-// peerUID resolves the peer UID through the injected resolver (Config.PeerUIDFn)
-// or pkg/authz's kernel lookup.
-func (s *Server) peerUID(client, server net.Addr) (uint32, error) {
-	if s.peerUIDFn != nil {
-		return s.peerUIDFn(client, server)
+// credential returns the principal for a valid api-auth credential on r, if the
+// listener has an auth policy and the request satisfies it.
+func (s *Server) credential(r *http.Request) (authz.Principal, bool) {
+	a := s.auth.Load()
+	if a == nil {
+		return authz.Principal{}, false
 	}
-	return authz.PeerUID(client, server)
+	user, ok := credentialPrincipalUser(*a, r)
+	if !ok {
+		return authz.Principal{}, false
+	}
+	return authz.CredentialPrincipal(user), true
 }
 
 // credentialPrincipalUser reports whether r presented a VALID configured

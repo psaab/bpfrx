@@ -81,8 +81,9 @@ so the holder can bypass a CLI-side check simply by not using the CLI.
 On the REST surface the class is evaluated against a **server-derived**
 identity, so it is a real boundary rather than an advisory one:
 
-- The caller's UID comes from the kernel (INET_DIAG / `/proc/net/tcp`), not
-  from anything the request carries.
+- The caller's UID comes from the kernel (`/proc/net/tcp{,6}`), not from
+  anything the request carries, and is fixed at connect rather than at request
+  time so the caller cannot choose when — or whether — it resolves.
 - **UID 0 is authorized unconditionally** — root owns the config DB on disk, so
   a denial would be theater.
 - A local UID that is **not** a configured `system login user` is **denied** the
@@ -91,6 +92,11 @@ identity, so it is a real boundary rather than an advisory one:
   RBAC model says nothing about that account, which is a reason to deny. Grant
   it explicitly with `set system login user <account> class <class>` if it needs
   access.
+- A local caller the server cannot identify is **denied**, and an `api-auth`
+  credential does not substitute for it. The credential speaks only for a
+  caller outside the login model or one that is not on this host — otherwise a
+  restricted account that also knew the shared secret could escape its class
+  simply by making its own identity unreadable.
 - Read-only endpoints, `/health` and `/metrics` are unaffected.
 
 ### Custom login classes (accept-with-advisory, #4304 S-2)
