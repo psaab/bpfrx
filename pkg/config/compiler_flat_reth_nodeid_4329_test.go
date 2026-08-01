@@ -16,6 +16,7 @@ import "testing"
 func flatRethClusterConfig() []string {
 	return []string{
 		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set chassis cluster reth-count 2",
 		"set interfaces ge-0/0/0 gigether-options redundant-parent reth0",
 		"set interfaces ge-7/0/0 gigether-options redundant-parent reth0",
@@ -110,6 +111,7 @@ func TestFlatRethGroupsFormUnaffected_4329(t *testing.T) {
 		"set groups node1 interfaces ge-7/0/0 gigether-options redundant-parent reth0",
 		`set apply-groups "${node}"`,
 		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set chassis cluster reth-count 2",
 		"set interfaces reth0 redundant-ether-options redundancy-group 1",
 	})
@@ -149,6 +151,7 @@ func TestFlatFabricResolvesLocalMemberPerNode_4329(t *testing.T) {
 	// fab1 carries the node-1 member (FPC 7); NO `chassis cluster node` leaf.
 	flatFabric := []string{
 		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set chassis cluster reth-count 2",
 		"set interfaces fab0 fabric-options member-interfaces ge-0/0/1",
 		"set interfaces fab0 unit 0 family inet address 10.99.1.1/30",
@@ -205,6 +208,7 @@ func TestFlatFabricGroupsFormUnaffected_4329(t *testing.T) {
 		"set groups node1 chassis cluster node 1",
 		`set apply-groups "${node}"`,
 		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set chassis cluster reth-count 2",
 		"set interfaces fab0 fabric-options member-interfaces ge-0/0/1",
 		"set interfaces fab1 fabric-options member-interfaces ge-7/0/1",

@@ -145,6 +145,7 @@ func TestDeviceMapFPCNodeAlignmentFatal(t *testing.T) {
 	// node is fatal (ge-7/0/3 on node 0).
 	tree := buildTree(t, []string{
 		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set chassis cluster node 0",
 		"set chassis device-map interface ge-7/0/3 pci 0000:09:00.0",
 	})
@@ -157,6 +158,7 @@ func TestDeviceMapFPCNodeAlignmentFatal(t *testing.T) {
 func TestDeviceMapFPCNodeAlignmentOKForLocalNode(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set chassis cluster node 1",
 		"set chassis device-map interface ge-7/0/3 pci 0000:09:00.0",
 	})

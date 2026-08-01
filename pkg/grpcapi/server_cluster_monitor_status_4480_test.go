@@ -33,6 +33,7 @@ interfaces {
 }
 chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         cluster-id 1;
         redundancy-group 1 {
             node 0 priority 100;

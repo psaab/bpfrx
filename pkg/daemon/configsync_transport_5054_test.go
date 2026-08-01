@@ -129,6 +129,7 @@ func newSyncProbeDaemon(t *testing.T, cl *cluster.Manager) (*Daemon, *int) {
 	seed("system host-name OLD")
 	if cl != nil {
 		seed("chassis cluster cluster-id 1")
+		seed("chassis cluster authentication-key test-cluster-psk-6611")
 		seed("chassis cluster node 0")
 	}
 	if _, err := s.Commit(); err != nil {

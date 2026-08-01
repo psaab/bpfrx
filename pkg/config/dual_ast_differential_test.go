@@ -673,6 +673,7 @@ system {
 		name: "chassis-cluster",
 		hier: `chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         reth-count 2;
         redundancy-group 0 {
             node 0 priority 100;

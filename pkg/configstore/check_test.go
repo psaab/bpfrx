@@ -65,6 +65,7 @@ func TestCheckTextSchemaValidateGate(t *testing.T) {
 	conf := checkValidConfig + `
 chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         reth-advertise-interval garbage;
     }
 }
@@ -120,6 +121,7 @@ func TestCheckTextNodeIDMismatchRejected(t *testing.T) {
 	conf := checkValidConfig + `
 chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         cluster-id 1;
         node 0;
     }
@@ -150,6 +152,7 @@ func TestCheckTextNoNodeLeafNoFalseReject(t *testing.T) {
 	conf := checkValidConfig + `
 chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         cluster-id 1;
     }
 }

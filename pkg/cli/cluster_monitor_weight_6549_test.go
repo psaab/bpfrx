@@ -65,6 +65,7 @@ func (o *cliMonWeightFakeOps) AddrList(netlink.Link, int) ([]netlink.Addr, error
 const cliOutOfRangeMonitorConfig = `
 chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         control-interface em0;
         fabric-interface fab0;
         reth-count 2;

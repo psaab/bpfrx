@@ -32,6 +32,7 @@ import (
 func rethRedundancyGroupSetLines(id string) []string {
 	return []string{
 		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set chassis cluster reth-count 1",
 		"set chassis cluster no-private-rg-election",
 		"set interfaces reth0 redundant-ether-options redundancy-group " + id,
@@ -96,6 +97,7 @@ func TestRethRedundancyGroupIDInRangeCommits(t *testing.T) {
 func TestRethRedundancyGroupIDOverflowSkippedWhenRGElectionPrivate(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set chassis cluster reth-count 1",
 		"set interfaces reth0 redundant-ether-options redundancy-group 200",
 	})
@@ -118,6 +120,7 @@ func TestRethRedundancyGroupIDOverflowSkippedWhenRGElectionPrivate(t *testing.T)
 func TestRethRedundancyGroupIDOverflowSkippedUnderNoRethVRRP(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set chassis cluster reth-count 1",
 		"set chassis cluster no-private-rg-election",
 		"set chassis cluster no-reth-vrrp",

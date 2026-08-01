@@ -166,6 +166,7 @@ func TestSchemaValidate_ChassisCluster_Matrix(t *testing.T) {
 func TestSchemaValidate_ChassisCluster_DeployedConfigShapeAccepted(t *testing.T) {
 	if err := schemaCheck(t, `chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         cluster-id 22;
         reth-count 2;
         heartbeat-interval 200;
@@ -185,6 +186,7 @@ func TestSchemaValidate_ChassisCluster_DeployedConfigShapeAccepted(t *testing.T)
 func TestSchemaValidate_ChassisCluster_HierarchicalRejectsOutOfRange(t *testing.T) {
 	err := schemaCheck(t, `chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         redundancy-group 1 {
             node 0 {
                 priority 300;
@@ -203,6 +205,7 @@ func TestSchemaValidate_ChassisCluster_HierarchicalRejectsOutOfRange(t *testing.
 func TestSchemaValidate_ChassisCluster_HierarchicalRejectsGarbageInterval(t *testing.T) {
 	err := schemaCheck(t, `chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         heartbeat-interval fast;
     }
 }`)
@@ -229,6 +232,7 @@ func TestSchemaValidate_ChassisCluster_HierarchicalRejectsGarbageInterval(t *tes
 func TestCompile_ChassisCluster_PackedOneLinerPriorityRejected(t *testing.T) {
 	packed := `chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         redundancy-group 1 {
             node 0 priority 999;
         }
@@ -253,6 +257,7 @@ func TestCompile_ChassisCluster_PackedOneLinerPriorityRejected(t *testing.T) {
 	// A valid packed priority compiles clean (no over-eager rejection).
 	okTree, errs := config.NewParser(`chassis {
     cluster {
+        authentication-key test-cluster-psk-6611;
         redundancy-group 1 {
             node 0 priority 200;
         }
@@ -288,12 +293,17 @@ func TestCompile_ChassisCluster_PriorityGateClosesBothShapes(t *testing.T) {
 	}
 
 	okTree := &config.ConfigTree{}
-	okPath, err := config.ParseSetCommand("set chassis cluster redundancy-group 1 node 0 priority 200")
-	if err != nil {
-		t.Fatalf("ParseSetCommand: %v", err)
-	}
-	if err := okTree.SetPath(okPath); err != nil {
-		t.Fatalf("SetPath: %v", err)
+	for _, cmd := range []string{
+		"set chassis cluster authentication-key test-cluster-psk-6611",
+		"set chassis cluster redundancy-group 1 node 0 priority 200",
+	} {
+		okPath, err := config.ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := okTree.SetPath(okPath); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
 	}
 	if _, err := config.CompileConfig(okTree); err != nil {
 		t.Fatalf("valid flat-set priority 200 must compile: %v", err)
@@ -306,6 +316,7 @@ func TestSchemaValidate_ChassisCluster_AcceptedValuesCompileAsWritten(t *testing
 	tree := &config.ConfigTree{}
 	for _, cmd := range []string{
 		"set chassis cluster cluster-id 22",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set chassis cluster heartbeat-interval 200",
 		"set chassis cluster heartbeat-threshold 5",
 		"set chassis cluster reth-advertise-interval 30",

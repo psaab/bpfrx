@@ -118,6 +118,7 @@ func raClusterStore(t *testing.T, prefix string) *configstore.Store {
 	}
 	if _, err := s.LoadSet(
 		"set chassis cluster cluster-id 1\n" +
+			"set chassis cluster authentication-key test-cluster-psk-6611\n" +
 			"set chassis cluster node 0\n" +
 			"set chassis cluster redundancy-group 1 node 0 priority 200\n" +
 			"set chassis cluster redundancy-group 1 node 1 priority 100\n" +

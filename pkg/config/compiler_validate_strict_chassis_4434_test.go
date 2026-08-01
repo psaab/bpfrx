@@ -24,8 +24,9 @@ import (
 // sequential ids 0..n-1, each with a well-formed node priority so the compiler
 // materializes a RedundancyGroup instance.
 func rgSetLines(n int) []string {
-	lines := make([]string, 0, n+1)
+	lines := make([]string, 0, n+2)
 	lines = append(lines, "set chassis cluster cluster-id 1")
+	lines = append(lines, "set chassis cluster authentication-key test-cluster-psk-6611")
 	for i := 0; i < n; i++ {
 		lines = append(lines,
 			fmt.Sprintf("set chassis cluster redundancy-group %d node 0 priority 100", i))
@@ -62,6 +63,7 @@ func TestChassisRedundancyGroupIDFailsCommit(t *testing.T) {
 	// A single group with an id > 255 truncates on the wire.
 	tree := buildTree(t, []string{
 		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set chassis cluster redundancy-group 300 node 0 priority 100",
 	})
 
@@ -85,6 +87,7 @@ func TestChassisRedundancyGroupInRangeCommits(t *testing.T) {
 
 	boundary := buildTree(t, []string{
 		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set chassis cluster redundancy-group 0 node 0 priority 200",
 		fmt.Sprintf("set chassis cluster redundancy-group %d node 1 priority 100", MaxHeartbeatRedundancyGroupID),
 	})
@@ -93,7 +96,8 @@ func TestChassisRedundancyGroupInRangeCommits(t *testing.T) {
 	}
 
 	// A cluster with no redundancy-group stanza at all is unaffected.
-	none := buildTree(t, []string{"set chassis cluster cluster-id 1"})
+	none := buildTree(t, []string{"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key test-cluster-psk-6611"})
 	if _, err := CompileConfig(none); err != nil {
 		t.Fatalf("commit rejected a cluster with no redundancy-groups: %v", err)
 	}

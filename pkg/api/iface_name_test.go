@@ -38,6 +38,7 @@ func TestInterfacesHandler_ResolvesRethToLoopback(t *testing.T) {
 	}
 	sets := []string{
 		"set chassis cluster reth-count 1",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set interfaces lo gigether-options redundant-parent reth0",
 		"set interfaces reth0 redundant-ether-options redundancy-group 1",
 		"set security zones security-zone trust interfaces reth0",
@@ -139,6 +140,7 @@ func TestWriteInterfacesDetail_DHCPLeasePath(t *testing.T) {
 	// LeaseFor("reth0.0", ...) which hits the decoy.
 	sets := []string{
 		"set chassis cluster reth-count 1",
+		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set interfaces lo gigether-options redundant-parent reth0",
 		"set interfaces reth0 redundant-ether-options redundancy-group 1",
 		"set interfaces reth0 unit 0 family inet dhcp",
