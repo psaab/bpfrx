@@ -1285,18 +1285,47 @@ to nest another inside. The third is demoted, not eliminated: compiling a
 statement WITHOUT registering it still folds it, but that now means ad-hoc
 dispatch beside a five-line loop whose only other content is the table lookup —
 obvious in review, where adding a `case` to an existing switch was the
-idiomatic act and diverged silently. It must also pick the right offset
-for the shape it is handed: `namedInstances` returns EITHER the
-`redundancy-group <id>` node itself (`Keys[0]` is the keyword, body starts at
-`Keys[2]`) OR, for a bare `redundancy-group { ... }` wrapper, a child whose
-`Keys[0]` IS the id (body starts at `Keys[1]`). `Keys[0]` discriminates them
-exactly. A fixed offset of 2 swallowed the statement keyword on the second
-shape and opened a node named after a value, matching no switch arm — the same
-silent-nothing outcome, election priority included. All FOUR readers of that body use it
-— `compileChassis` plus the three AST gates (`validateMonitorWeightTokensAST`,
-`validateChassisClusterIdentitiesAST`, `validateGratuitousARPCountAST`) — because
-teaching the compiler to see a shape the gates cannot admits, through the packed
-instance line only, exactly what those gates exist to reject.
+idiomatic act and diverged silently.
+
+**Those three routes are all the table UNDER-covering the compiler; there is a
+fourth of the opposite shape.** The splitter matches a registered keyword
+wherever the token appears in the tail, including where the token is a VALUE
+rather than a statement keyword, so a value spelled like a statement is stolen
+and compiled as that statement. Measured:
+
+```
+redundancy-group 1 interface-monitor preempt weight 255;        # InterfaceMonitors=[]              Preempt=true
+redundancy-group 1 { interface-monitor preempt weight 255; }    # InterfaceMonitors=[{preempt 255}] Preempt=false
+```
+
+The two spellings disagree — exactly what splitting the packed line exists to
+prevent. It is not fixed, because the stolen token must sit in entry-NAME
+position and no legal Junos interface name or IP address collides with a
+registered keyword (`ge-*`/`xe-*`/`et-*`, `reth*`, `fxp*`, `em*`, `lo0`, `st0`,
+`ae*`, `fab*`, `irb`, `vlan`), so it is unreachable from a real config rather
+than merely unlikely. There is deliberately no test pinning the divergence —
+that would assert the wrong answer is correct — and none asserting "keyword is
+not an interface name" either, because the project has no canonical
+interface-name predicate and inventing one in a test repeats the
+source-modelling mistake described above. What is guarded is the EDIT that would
+make the route reachable: registering a statement trips the completeness check
+in `TestRedundancyGroupStatementsSurvivePackedLine_6588`, which is where the
+collision question has to be asked. A real fix means splitting position-aware —
+a keyword opens a statement only where a statement may begin — which changes the
+splitter contract.
+
+The splitter must also pick the right offset for the shape it is handed:
+`namedInstances` returns EITHER the `redundancy-group <id>` node itself
+(`Keys[0]` is the keyword, body starts at `Keys[2]`) OR, for a bare
+`redundancy-group { ... }` wrapper, a child whose `Keys[0]` IS the id (body
+starts at `Keys[1]`). `Keys[0]` discriminates them exactly. A fixed offset of 2
+swallowed the statement keyword on the second shape and opened a node named
+after a value, matching no switch arm — the same silent-nothing outcome,
+election priority included. All FOUR readers of that body use it —
+`compileChassis` plus the three AST gates (`validateMonitorWeightTokensAST`,
+`validateChassisClusterIdentitiesAST`, `validateGratuitousARPCountAST`) —
+because teaching the compiler to see a shape the gates cannot admits, through
+the packed instance line only, exactly what those gates exist to reject.
 
 **Why this is NOT fixed inside `namedInstances`.** Making the helper synthesize
 the packed tail as a child would fix every caller at once, and it is tempting
@@ -1323,7 +1352,10 @@ Covered by `pkg/config/compiler_chassis_packed_monitor_6588_test.go`, which
 pins all three interface-monitor spellings against each other, covers the
 bracketed / malformed / duplicate cases in each, adds the packed-instance
 spelling for every redundancy-group statement, and keeps the
-container/flat-set and single-entry cases as green controls.
+container/flat-set and single-entry cases as green controls. Its `assertMonitors`
+helper requires a weight for every name — there is no name-only variant, because
+having one meant every bracketed-list case in that file ran weight-less and the
+apply-to-all rule above was unguarded.
 
 **`multi: true` ALSO prevents single-value REPLACE for repeated keyed-list
 leaves (#3984).** The `#2419` discussion above is about ONE statement with a

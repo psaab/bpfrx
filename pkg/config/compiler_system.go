@@ -2214,6 +2214,46 @@ func redundancyGroupBody(rgNode *Node) []*Node {
 // loop whose only other content is this lookup — obvious in review rather than
 // invisible. Demoted, not eliminated; Go offers no construct that would
 // eliminate it.
+//
+// FOURTH ROUTE, opposite direction — the splitter OVER-matches. All three routes
+// above are the table under-covering what the compiler honours: a statement is
+// compiled but not registered, so its tokens fold into the neighbour. There is
+// one more of the other shape, and an earlier version of this comment enumerated
+// "three" as if that were the whole space. The splitter matches a registered
+// keyword wherever the token appears in the tail, including where the token is a
+// VALUE rather than a statement keyword, so a value spelled like a statement is
+// STOLEN and compiled as that statement:
+//
+//	packed:    redundancy-group 1 interface-monitor preempt weight 255;
+//	             -> InterfaceMonitors=[]  Preempt=true
+//	container: redundancy-group 1 { interface-monitor preempt weight 255; }
+//	             -> InterfaceMonitors=[{preempt 255}]  Preempt=false
+//
+// The two spellings disagree — precisely what splitting the packed line exists
+// to prevent. (Measured, not reasoned: both lines above were compiled.)
+//
+// NOT fixed here. The stolen token has to sit in entry-NAME position, and no
+// legal Junos interface name or IP address collides with any keyword registered
+// below — names are ge-*/xe-*/et-*, reth*, fxp*, em*, lo0, st0, ae*, fab*, irb,
+// vlan. So the input is unreachable from a real config, and the runtime
+// materiality is nil.
+//
+// Note what is and is not guarded, since the paragraph above is the kind of
+// claim that rots. There is deliberately NO test asserting the divergence: it
+// would pin the wrong answer as correct and would have to be deleted by whoever
+// fixes this. There is also no test asserting "keyword is not a legal interface
+// name" — the project has no canonical interface-name predicate, so such a test
+// would have to invent the grammar, and inventing a model of something that
+// lives nowhere in code is the same mistake as the source-parsing drift guard
+// this table replaced. What IS guarded is the EDIT that would make the route
+// reachable: registering a statement here trips the completeness check in
+// TestRedundancyGroupStatementsSurvivePackedLine_6588, which fails until a human
+// adds a sample for the new keyword. That is the moment to ask whether the new
+// keyword can also spell an entry name.
+//
+// Fixing it properly means splitting position-aware — a keyword opens a
+// statement only where a statement may begin — which changes the splitter
+// contract and does not belong in a fix for the drop bug.
 var redundancyGroupStatements = map[string]func(rg *RedundancyGroup, child *Node){
 	"node":                 compileRGNodePriority,
 	"gratuitous-arp-count": compileRGGratuitousARPCount,

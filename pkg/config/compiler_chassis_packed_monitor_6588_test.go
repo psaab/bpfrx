@@ -465,6 +465,10 @@ func TestChassisPackedShapeBypassesSchemaWalk_6588(t *testing.T) {
 // failover fail-open as dropping the statement, one monitor at a time.
 func TestChassisInterfaceMonitorBracketList_6588(t *testing.T) {
 	want := []string{"ge-0/0/0", "ge-0/0/1", "ge-0/0/2"}
+	// No weight anywhere on these lines, so every monitor must carry the
+	// documented #6549 default. Asserted explicitly rather than skipped — see
+	// assertMonitors.
+	zeros := []int{0, 0, 0}
 
 	t.Run("FlatSet", func(t *testing.T) {
 		cfg, err := CompileConfig(flatMonitorTree(t,
@@ -472,45 +476,126 @@ func TestChassisInterfaceMonitorBracketList_6588(t *testing.T) {
 		if err != nil {
 			t.Fatalf("compile: %v", err)
 		}
-		assertMonitorNames(t, onlyRG6588(t, cfg), want)
+		assertMonitors(t, onlyRG6588(t, cfg), want, zeros)
 	})
 	t.Run("ContainerHierarchical", func(t *testing.T) {
-		assertMonitorNames(t, compileMonitorText(t, packedMonitorConfig(
-			"            interface-monitor {\n                [ ge-0/0/0 ge-0/0/1 ge-0/0/2 ];\n            }")), want)
+		assertMonitors(t, compileMonitorText(t, packedMonitorConfig(
+			"            interface-monitor {\n                [ ge-0/0/0 ge-0/0/1 ge-0/0/2 ];\n            }")), want, zeros)
 	})
 	t.Run("Packed", func(t *testing.T) {
-		assertMonitorNames(t, compileMonitorText(t, packedMonitorConfig(
-			"            interface-monitor [ ge-0/0/0 ge-0/0/1 ge-0/0/2 ];")), want)
+		assertMonitors(t, compileMonitorText(t, packedMonitorConfig(
+			"            interface-monitor [ ge-0/0/0 ge-0/0/1 ge-0/0/2 ];")), want, zeros)
 	})
 	// A weight-less bracketed list must still yield one monitor per name.
 	t.Run("PackedNoWeight", func(t *testing.T) {
-		assertMonitorNames(t, compileMonitorText(t, packedMonitorConfig(
-			"            interface-monitor [ ge-0/0/0 ge-0/0/1 ];")), []string{"ge-0/0/0", "ge-0/0/1"})
+		assertMonitors(t, compileMonitorText(t, packedMonitorConfig(
+			"            interface-monitor [ ge-0/0/0 ge-0/0/1 ];")),
+			[]string{"ge-0/0/0", "ge-0/0/1"}, []int{0, 0})
+	})
+}
+
+// TestChassisInterfaceMonitorBracketListWeight_6588 pins WHICH monitors a
+// bracketed list's weight lands on — the half of the bracket contract the
+// name-only assertions above cannot see.
+//
+// A weight written after a bracketed list applies to EVERY member. The obvious
+// implementation attaches it to the PRECEDING name only, which leaves
+// `[ ge-0/0/0 ge-0/0/1 ] weight 255` compiled as ge-0/0/0=0, ge-0/0/1=255: the
+// first link is monitored but deducts nothing when it fails, so the group does
+// not demote. That is a failover fail-open, and it is WORSE than the master
+// behaviour this PR replaced (which compiled one monitor at 255 and dropped the
+// rest) because the operator sees both interfaces echoed back by `show
+// configuration` and by `show chassis cluster status`.
+//
+// FAIL-ON-REVERT: restore the positional attachment in monitorEntryNodes
+// (append the `weight` tokens to the last name started, instead of collecting
+// them candidate-scoped) and every subtest marked BINDING below fails naming
+// the zero weight. The two CONTROL subtests carry the weight in a children
+// block, where it is candidate-scoped in both implementations — they are green
+// either way and are here to pin that the two spellings agree, not to catch the
+// positional regression.
+func TestChassisInterfaceMonitorBracketListWeight_6588(t *testing.T) {
+	pair := []string{"ge-0/0/0", "ge-0/0/1"}
+
+	// BINDING: inline weight after a bracketed list, in every spelling that
+	// reaches monitorEntryNodes.
+	t.Run("PackedInline", func(t *testing.T) {
+		assertMonitors(t, compileMonitorText(t, packedMonitorConfig(
+			"            interface-monitor [ ge-0/0/0 ge-0/0/1 ] weight 255;")),
+			pair, []int{255, 255})
+	})
+	t.Run("PackedInlineThreeMembers", func(t *testing.T) {
+		assertMonitors(t, compileMonitorText(t, packedMonitorConfig(
+			"            interface-monitor [ ge-0/0/0 ge-0/0/1 ge-0/0/2 ] weight 100;")),
+			[]string{"ge-0/0/0", "ge-0/0/1", "ge-0/0/2"}, []int{100, 100, 100})
+	})
+	t.Run("ContainerHierarchicalInline", func(t *testing.T) {
+		assertMonitors(t, compileMonitorText(t, packedMonitorConfig(
+			"            interface-monitor {\n                [ ge-0/0/0 ge-0/0/1 ] weight 255;\n            }")),
+			pair, []int{255, 255})
+	})
+	t.Run("FlatSetInline", func(t *testing.T) {
+		cfg, err := CompileConfig(flatMonitorTree(t,
+			"set chassis cluster redundancy-group 1 interface-monitor [ ge-0/0/0 ge-0/0/1 ] weight 255"))
+		if err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+		assertMonitors(t, onlyRG6588(t, cfg), pair, []int{255, 255})
+	})
+	// BINDING, one level up: the whole redundancy-group body packed onto the
+	// instance line still splits the list AND spreads the weight.
+	t.Run("PackedRedundancyGroupBodyInline", func(t *testing.T) {
+		assertMonitors(t, compileRGText(t, packedRGConfig(
+			"        redundancy-group 1 interface-monitor [ ge-0/0/0 ge-0/0/1 ] weight 255;")),
+			pair, []int{255, 255})
+	})
+
+	// CONTROL: the children-block spelling. The weight is candidate-scoped by
+	// construction here, so this stays green under the positional regression;
+	// it pins that the block and inline spellings agree.
+	t.Run("PackedChildrenBlock", func(t *testing.T) {
+		assertMonitors(t, compileMonitorText(t, packedMonitorConfig(
+			"            interface-monitor [ ge-0/0/0 ge-0/0/1 ] {\n                weight 255;\n            }")),
+			pair, []int{255, 255})
+	})
+	t.Run("ContainerHierarchicalChildrenBlock", func(t *testing.T) {
+		assertMonitors(t, compileMonitorText(t, packedMonitorConfig(
+			"            interface-monitor {\n                [ ge-0/0/0 ge-0/0/1 ] {\n                    weight 255;\n                }\n            }")),
+			pair, []int{255, 255})
 	})
 }
 
 // TestChassisIPMonitoringBracketTargets_6588 covers the same collapse on the
 // ip-monitoring target list.
 func TestChassisIPMonitoringBracketTargets_6588(t *testing.T) {
-	rg := compileMonitorText(t, packedMonitorConfig(
-		"            ip-monitoring family inet [ 10.0.1.1 10.0.2.1 10.0.3.1 ];"))
-	if rg.IPMonitoring == nil {
-		t.Fatal("redundancy group carries no compiled ip-monitoring")
-	}
-	var got []string
-	for _, tg := range rg.IPMonitoring.Targets {
-		got = append(got, tg.Address)
-	}
-	want := []string{"10.0.1.1", "10.0.2.1", "10.0.3.1"}
-	if len(got) != len(want) {
-		t.Fatalf("ip-monitoring targets = %v, want %v — a bracketed list must compile to one "+
-			"target per address", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("ip-monitoring targets = %v, want %v", got, want)
-		}
-	}
+	t.Run("NoWeight", func(t *testing.T) {
+		assertIPMonTargets(t, compileMonitorText(t, packedMonitorConfig(
+			"            ip-monitoring family inet [ 10.0.1.1 10.0.2.1 10.0.3.1 ];")),
+			[]string{"10.0.1.1", "10.0.2.1", "10.0.3.1"}, []int{0, 0, 0})
+	})
+	// BINDING, same shape as the interface-monitor case: ip-monitoring targets
+	// are split by the SAME monitorEntryNodes, so a positional weight
+	// attachment leaves the first probe target deducting nothing on failure.
+	t.Run("InlineWeight", func(t *testing.T) {
+		assertIPMonTargets(t, compileMonitorText(t, packedMonitorConfig(
+			"            ip-monitoring family inet [ 10.0.1.1 10.0.2.1 ] weight 100;")),
+			[]string{"10.0.1.1", "10.0.2.1"}, []int{100, 100})
+	})
+	t.Run("InlineWeightThreeTargets", func(t *testing.T) {
+		assertIPMonTargets(t, compileMonitorText(t, packedMonitorConfig(
+			"            ip-monitoring family inet [ 10.0.1.1 10.0.2.1 10.0.3.1 ] weight 200;")),
+			[]string{"10.0.1.1", "10.0.2.1", "10.0.3.1"}, []int{200, 200, 200})
+	})
+	t.Run("InlineWeightInsideFamilyBlock", func(t *testing.T) {
+		assertIPMonTargets(t, compileMonitorText(t, packedMonitorConfig(
+			"            ip-monitoring {\n                family inet {\n                    [ 10.0.1.1 10.0.2.1 ] weight 100;\n                }\n            }")),
+			[]string{"10.0.1.1", "10.0.2.1"}, []int{100, 100})
+	})
+	t.Run("PackedRedundancyGroupBodyInlineWeight", func(t *testing.T) {
+		assertIPMonTargets(t, compileRGText(t, packedRGConfig(
+			"        redundancy-group 1 ip-monitoring family inet [ 10.0.1.1 10.0.2.1 ] weight 100;")),
+			[]string{"10.0.1.1", "10.0.2.1"}, []int{100, 100})
+	})
 }
 
 // TestChassisInterfaceMonitorSingleEntryNotSplit_6588 is the MAJOR-2 negative
@@ -675,23 +760,32 @@ func assertErrContains(t *testing.T, err error, want string) {
 	}
 }
 
-func assertMonitorNames(t *testing.T, rg *RedundancyGroup, want []string) {
-	t.Helper()
-	assertMonitors(t, rg, want, nil)
-}
-
-// assertMonitors compares the compiled monitors by NAME and, when wantWeights
-// is non-nil, by WEIGHT.
+// assertMonitors compares the compiled monitors by NAME **and** by WEIGHT.
 //
-// The weight arm exists because its absence hid a regression: the original
-// name-only helper let `interface-monitor [ ge-0/0/0 ge-0/0/1 ] weight 255`
-// compile to ge-0/0/0=0, ge-0/0/1=255 with every bracket test green. A monitor
-// that exists with weight 0 deducts nothing when its link fails, so the group
-// does not demote — the same runtime outcome as no monitor at all, which is
-// exactly what these tests are supposed to be watching for. Never assert a
-// monitor list by name alone.
+// Both arms are MANDATORY, and there is deliberately no name-only wrapper.
+// This helper used to have an optional weight arm reached through an
+// `assertMonitorNames(t, rg, want)` shim that passed nil, and every caller in
+// this file went through that shim — so the weight arm was dead code and every
+// bracketed-list case here was weight-less. That is not a hypothetical gap: it
+// let `interface-monitor [ ge-0/0/0 ge-0/0/1 ] weight 255` compile to
+// ge-0/0/0=0, ge-0/0/1=255 with the whole bracket suite green. A monitor that
+// exists with weight 0 deducts nothing when its link fails, so the group does
+// not demote — the same runtime outcome as no monitor at all, which is exactly
+// what these tests exist to watch for.
+//
+// A caller that genuinely expects the weight-less default says so by passing
+// explicit zeros. That is an assertion (the documented #6549 default), not a
+// skip, and it cannot rot into one.
 func assertMonitors(t *testing.T, rg *RedundancyGroup, want []string, wantWeights []int) {
 	t.Helper()
+	// Refuse a silently-partial check: a short wantWeights would leave the
+	// tail of the monitor list unasserted, which is how the weight arm went
+	// dead in the first place.
+	if len(wantWeights) != len(want) {
+		t.Fatalf("assertMonitors misuse: %d names %v but %d weights %v — every monitor "+
+			"must be asserted by weight as well as by name",
+			len(want), want, len(wantWeights), wantWeights)
+	}
 	if len(rg.InterfaceMonitors) != len(want) {
 		t.Fatalf("expected %d interface-monitors %v, got %d: %s — a bracketed list must "+
 			"compile to one monitor per name, not one monitor for the first name",
@@ -703,13 +797,52 @@ func assertMonitors(t *testing.T, rg *RedundancyGroup, want []string, wantWeight
 				i, rg.InterfaceMonitors[i].Interface, w, describeMonitors(rg.InterfaceMonitors))
 		}
 	}
-	for i := range wantWeights {
+	for i := range want {
 		if got := rg.InterfaceMonitors[i].Weight; got != wantWeights[i] {
 			t.Fatalf("monitor %s weight = %d, want %d (got %s) — a monitor compiled at "+
 				"weight 0 deducts NOTHING when its link fails, so the redundancy group "+
 				"does not demote",
 				rg.InterfaceMonitors[i].Interface, got, wantWeights[i],
 				describeMonitors(rg.InterfaceMonitors))
+		}
+	}
+}
+
+// assertIPMonTargets is the ip-monitoring counterpart, and exists for the same
+// reason: the target list is built by the SAME monitorEntryNodes splitter, so a
+// weight-less address assertion leaves the identical hole.
+func assertIPMonTargets(t *testing.T, rg *RedundancyGroup, want []string, wantWeights []int) {
+	t.Helper()
+	if len(wantWeights) != len(want) {
+		t.Fatalf("assertIPMonTargets misuse: %d addresses %v but %d weights %v",
+			len(want), want, len(wantWeights), wantWeights)
+	}
+	if rg.IPMonitoring == nil {
+		t.Fatal("redundancy group carries no compiled ip-monitoring")
+	}
+	got := rg.IPMonitoring.Targets
+	describe := func() string {
+		if len(got) == 0 {
+			return "<none>"
+		}
+		parts := make([]string, 0, len(got))
+		for _, tg := range got {
+			parts = append(parts, fmt.Sprintf("%s weight %d", tg.Address, tg.Weight))
+		}
+		return strings.Join(parts, ", ")
+	}
+	if len(got) != len(want) {
+		t.Fatalf("ip-monitoring targets = %s, want %v — a bracketed list must compile to "+
+			"one target per address", describe(), want)
+	}
+	for i := range want {
+		if got[i].Address != want[i] {
+			t.Fatalf("target[%d] = %q, want %q (got %s)", i, got[i].Address, want[i], describe())
+		}
+		if got[i].Weight != wantWeights[i] {
+			t.Fatalf("target %s weight = %d, want %d (got %s) — a target compiled at weight 0 "+
+				"deducts NOTHING when its probe fails, so the redundancy group does not demote",
+				got[i].Address, got[i].Weight, wantWeights[i], describe())
 		}
 	}
 }
@@ -897,9 +1030,14 @@ func TestChassisRedundancyGroupPackedBodyReachesGates_6588(t *testing.T) {
 			"weight specified 2 times with different values")
 	})
 	t.Run("BracketListStillSplits", func(t *testing.T) {
-		assertMonitorNames(t, compileRGText(t, packedRGConfig(
+		assertMonitors(t, compileRGText(t, packedRGConfig(
 			"        redundancy-group 1 interface-monitor [ ge-0/0/0 ge-0/0/1 ];")),
-			[]string{"ge-0/0/0", "ge-0/0/1"})
+			[]string{"ge-0/0/0", "ge-0/0/1"}, []int{0, 0})
+	})
+	t.Run("BracketListWeightReachesEveryMember", func(t *testing.T) {
+		assertMonitors(t, compileRGText(t, packedRGConfig(
+			"        redundancy-group 1 interface-monitor [ ge-0/0/0 ge-0/0/1 ] weight 255;")),
+			[]string{"ge-0/0/0", "ge-0/0/1"}, []int{255, 255})
 	})
 	t.Run("IPMonitoringRangeStillGated", func(t *testing.T) {
 		assertErrContains(t, compileMonitorTextErr(t, packedRGConfig(
@@ -981,6 +1119,16 @@ func TestRedundancyGroupStatementsSurvivePackedLine_6588(t *testing.T) {
 		}},
 	}
 
+	// This completeness check is also the trip-wire for the splitter's
+	// over-match route (see redundancyGroupStatements' doc comment): the
+	// splitter matches a registered keyword wherever the token appears in a
+	// packed tail, including in entry-NAME position, so a keyword that can also
+	// spell an interface name or an IP address would be STOLEN from the
+	// statement it belongs to and the packed and container spellings would
+	// disagree. No current keyword can (names are ge-*/xe-*, reth*, fxp*, em*,
+	// lo0, st0, ae*, fab*, irb, vlan). Registering a new statement fails here
+	// until a sample is added — that is the moment to check the new keyword
+	// against those shapes.
 	for stmt := range redundancyGroupStatements {
 		if _, ok := samples[stmt]; !ok {
 			t.Errorf("redundancyGroupStatements registers %q but this test has no sample for "+
