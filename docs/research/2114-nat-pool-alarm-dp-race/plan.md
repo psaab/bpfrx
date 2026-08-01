@@ -1,9 +1,13 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v56 — r55 findings folded (Codex NEEDS-REVISION
-  9M/2m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m —
-  the per-attempt pending-set reset, IS Codex M6; all three
-  confirm the §4.7 structure); pending convergence review r56
+- **Status**: DRAFT v57 — r56 consistency findings folded (Codex
+  M7/M8/m1/m2/m3: the acceptance contract sync, the §5.1
+  authority/provider + userspace inventories, the §9
+  v56-mechanism legs, the pending-term omissions, the §6
+  signature list; the r56 M1-M6 mechanism-depth findings are
+  put to all three reviewers for an explicit engineering
+  ruling in r57 — see the v57 revision entry); pending the
+  r57 ruling round
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -2502,6 +2506,44 @@
   send-boundary legs (Codex m2): mismatch-drop-without-claim,
   commit/reconciler serialization, provider replacement,
   dual-fabric send failure, and authority turnover.
+  v57: r56 partial — the consistency findings fold (Codex M7:
+  the acceptance copy now carries the full send-boundary
+  protocol — provider identity, authority generation,
+  success-only publication, the lock-assuming helper — and the
+  §5.1 inventory gains the authority/provider state and the
+  pkg/dataplane/userspace change list, and §6's signature list
+  gains QueueConfig's success return and the token parameters;
+  Codex M8: §9 gains the v56-mechanism legs — the OnXSKBound
+  callback interleave, PrepareLinkCycle registration, the
+  completion-vs-next-mint transaction, the slow-poll mint, the
+  returned detach failure with errors.Join over ALL detaches,
+  and the authority leg extended through re-promotion; Codex
+  m1: the contention leg is named; Codex m2: the pending term
+  joins the post-reactivation predicate and the rendering
+  inventory; Codex m3: the detach conversion collects every
+  attempted detach). The r56 M1-M6 MECHANISM-DEPTH findings
+  (the apply-level ACK / receiver-acceptance gap, the
+  provider-generation linearization, the authority-invalidation
+  race with publication, the rollback health fork, the
+  callback identity, the debt-transfer transaction) are NOT
+  folded — they are put to all three reviewers for an explicit
+  engineering ruling in r57, per the convergence-loop
+  discipline: ten rounds (r47-r56) have refined the H2
+  done-predicate machinery, with each round's fold introducing
+  a new mechanism whose own correctness becomes the next
+  round's target. The ruling question: (A) CONTINUE folding
+  to instantaneous correctness (the current trajectory — the
+  ACK and the remaining transactions get designed in); (B)
+  SIMPLIFY THE CLAIM — the done-predicate's machinery reduces
+  to the converged core (the counter + epoch + coherent
+  snapshot + tri-state + the send-boundary protocol + the
+  bracket + re-drive), and the instantaneous-correctness
+  constructions become named bounded residuals with
+  detection-and-recovery (the interval-bracketed double digest
+  check and the operator re-drive) — the runbook's established
+  admit+bound idiom from r29/r37/r38 — with the apply-level
+  ACK named as a follow-up; or (C) SPLIT H2 further. Each
+  reviewer rules explicitly.
 
 ---
 
@@ -5200,7 +5242,8 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   re-activation is followed by the COMPLETE health/apply
   predicate again (not merely digest equality): the pre-quiesce
   digest match AND the full persist-health aggregate AND
-  ActiveApplied AND the apply-failure/last-outcome terms on
+  ActiveApplied AND the apply-failure/last-outcome terms AND
+  the no-pending-outstanding term (r56 Codex m2) on
   BOTH nodes — the two-digest discipline: the post-restart
   verification compares against the fence-time (post-quiesce)
   digest; the re-activation re-verifies against the
@@ -6075,6 +6118,13 @@ v20 history). The delivery is TWO units:
   PLUS the work-item-G state: `startupDone chan struct{}`,
   `startupDoneOnce sync.Once`, `startupOK atomic.Bool`, `finishStartup`,
   and the r8 `stopping atomic.Bool` shutdown-admission fence.
+  PLUS the work-item-H2 authority/provider state (r56 Codex
+  M7's inventory completion): the config-sync marker's claim
+  carries the AUTHORITY GENERATION (bumped by the RG0
+  transition path, `daemon_ha.go:438-475`) and the PROVIDER
+  IDENTITY (the captured `getSessionSync()` result,
+  revalidated at the send boundary) — both daemon-scope,
+  beside the existing marker fields (`daemon.go:420-424`).
   PLUS the work-item-H2 apply-health state (r48 Codex M2 + r49
   Codex M1 + r50 Codex M1/M2): a PROCESS-LIFETIME
   `applyFailureCount` and a `lastApplyOK` flag, initialized
@@ -6416,10 +6466,28 @@ v20 history). The delivery is TWO units:
   monotonic apply-failure count (r47 Codex M2 — the done
   predicate's no-apply-failure-since-bringup term; the daemon
   tracks the outcome in its health state and pkg/cluster
-  renders it); the rendering lands in pkg/cluster, the
+  renders it) AND the current attempt token + the per-arm-ID
+  pending set (r56 Codex m2 — the no-pending-outstanding term
+  is operator-checkable only if the surface carries it); the
+  rendering lands in pkg/cluster, the
   canonical accessor in pkg/configstore, the injection in
   pkg/daemon, and pkg/grpcapi/pkg/cli stay CODE-untouched as
   relays (`server_show_cluster_text.go:66-74`).
+- `pkg/dataplane/userspace` (r56 Codex M7's inventory
+  completion): the attempt-token threading through the
+  deferring calls (`apply.go:37-40,130-134` gain the
+  parameter); the manager-side atomic
+  install/register/already-bound operation for the OnXSKBound
+  arm (`manager.go:424-433`); the short-held debt ledger the
+  mint's re-registration query reads (no `m.mu` held across
+  control-socket IPC — r56 Codex M6 + r56 AGY M1:
+  `process_status.go:150-255` holds `m.mu` across the whole
+  poll including IPC with a 2s dial and up to a 120s round
+  trip, `process_control.go:34-56,129-142`); and the
+  `syncInterfaceAttachments` detach failures becoming a
+  returned terminal error with `errors.Join` over ALL
+  attempted detaches (`manager_compile.go:211-214,567-591` —
+  r56 Codex m3's attempt-all rule).
   The counter is
   independent of generation numbers and epoch resets
   (`sync_conn_gen.go:340-362`); exposed read-only on the cluster
@@ -6770,8 +6838,12 @@ classification snapshot.
 `Daemon` and its field are package-private; nothing outside `pkg/daemon`
 references them.
 
-**Intentional signature change (the only one)**: `fwdstatus.NewSampler`
-takes `CachedStatusProvider` instead of `DataPlaneAccessor` (r2 M1).
+**Intentional signature changes**: `fwdstatus.NewSampler`
+takes `CachedStatusProvider` instead of `DataPlaneAccessor` (r2 M1);
+and the work-item-H2 additions (r56 Codex M7): `QueueConfig`
+gains a success return (`sync_conn_config.go:234-250`), and
+the exported `ConfigSink`/`LinkController` interfaces gain the
+attempt-token parameters (`apply.go:37-40,130-134`).
 Callers: exactly one production (`daemon_run.go:595`) + two test sites
 (`sampler_test.go:69,106`); the test fake already satisfies the narrow
 interface. `DataPlaneAccessor`/`Build`/`Format` are unchanged for their
@@ -7640,22 +7712,22 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      still-flipping state after two intervals is a stuck-lock
      incident — fail-closed (r51 Codex M4 + r51 AGY M1); AND
      the reconciler itself gains the SEND-BOUNDARY PROTOCOL
-     (r54 Codex M1/M2/M3/m1: a re-check alone is not an
-     exclusion boundary — the store lock releases before the
-     send, `store_format.go:31-36`, and a paused claimant
-     resumes with a newer wire generation,
-     `sync_conn_config.go:234-243,267-272` — and a stale drop
-     poisons the CLAIMED-is-PUSHED marker,
-     `daemon_ha_sync.go:474-489` — the A→B→A case reachable via
-     the event engine's syncPeer=false commits,
-     `daemon_apply_commit.go:596-599`): under `configSyncMu`
+     (r54 Codex M1/M2/M3/m1 + r56 Codex M7's contract-sync):
+     under `configSyncMu`
      HELD FROM VALIDATION THROUGH SEND-COMPLETION with EVERY
-     push path taking the same mutex, the reconciler at the
+     push path taking the same mutex (ONE locked-send owner;
+     the marker helper is lock-ASSUMING,
+     `daemon_ha_sync.go:355-377,407-414`), the reconciler at the
      boundary (i) revalidates authority + connection
-     epoch/liveness + ConfigSync-enabled, (ii) recomputes
+     epoch/liveness + ConfigSync-enabled AND PROVIDER IDENTITY
+     (the captured `ss` re-validated as the current provider),
+     (ii) recomputes
      `configGenerationHash(ShowActive())` and drops with an
      alarm on a mismatch, and (iii) claims the marker ONLY at
-     the send boundary — a drop never claims);
+     the send boundary on send-SUCCESS (`QueueConfig` gains a
+     success return), with the claim carrying the AUTHORITY
+     GENERATION (invalidated on any demotion/re-promotion,
+     `daemon_ha.go:438-475`);
      a per-node commit on a read-only secondary is executed by
      PROMOTING it first with the existing manual-failover
      request (promotion clears the read-only gate,
@@ -7864,6 +7936,22 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      and the re-drive overwrites it) and the MARKER-NO-OP
      REJECTION leg (a no-op pass never ticks ConfigsSent, so no
      runbook step may wait on a tick);
+     (h2j) the v56-MECHANISM legs (r56 Codex M8): the OLD/NEW
+     OnXSKBound CALLBACK INTERLEAVE (the manager's atomic
+     install/register/already-bound operation can neither
+     strand the new registration nor lose an early
+     completion), the PrepareLinkCycle registration leg, the
+     COMPLETION-VS-NEXT-MINT TRANSACTION leg (a debt completing
+     between the manager snapshot and the daemon registration
+     cannot strand a new-token registration), the SLOW-POLL
+     MINT leg (the mint's debt query never blocks behind
+     control-socket IPC — the debt ledger is short-held, r56
+     Codex M6 + r56 AGY M1), the RETURNED DETACH-FAILURE leg
+     (a stale XDP/TC detach failure fails the pipeline
+     terminally, with `errors.Join` collecting EVERY attempted
+     detach — never returning on the first error and skipping
+     the rest, r56 Codex m3), and the AUTHORITY leg EXTENDED
+     through re-promotion + marker-state + retry assertions;
      (h2i) the SEND-BOUNDARY legs (r55 Codex m2): the
      MISMATCH-DROP-WITHOUT-CLAIM leg (a stale capture drops at
      the boundary and the marker stays unclaimed, so a later
@@ -7875,7 +7963,11 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      provider-identity revalidation), the DUAL-FABRIC
      SEND-FAILURE leg (a fabric-0 failure with fabric-1
      surviving leaves the marker unpublished and the retry
-     unsuppressed), and the AUTHORITY-TURNOVER leg (a demotion
+     unsuppressed), the CONTENTION leg (r56 Codex m1: a blocked
+     write holds `configSyncMu` across the untimed `writeMu`
+     wait PLUS the 2s `syncWriteDeadline`, `sync.go:88`,
+     `sync_protocol.go:59-74`, while a commit push waits —
+     asserted bounded), and the AUTHORITY-TURNOVER leg (a demotion
      mid-claim invalidates the authority generation and the
      claim);
      (h2f) the COMPOSITE-READER leg (r52 Codex M1): the #4957
