@@ -1,10 +1,9 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v46 — r45 findings folded (Codex NEEDS-REVISION
-  5M/4m; AGY NEEDS-REVISION 1M; Claude SMR PLAN-READY-WITH-NITS
-  0M/2m — all three independently caught the gate-atomicity
-  gap; all three confirm the §4.7 structure); pending
-  convergence review r46
+- **Status**: DRAFT v47 — r46 findings folded (Codex NEEDS-REVISION
+  3M/3m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m —
+  its epoch-lifetime nit IS Codex M1, folded here; all three
+  confirm the §4.7 structure); pending convergence review r47
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -1873,7 +1872,7 @@
   Show* SSOT backs HA sync and the DR archive,
   `grpcapi/server_config.go:349-352` — a digest alone cannot
   reconstruct text), and the recovery is an AUTHORITY-SIDE
-  `load override`/`load replace` + `commit` from the captured
+  `load override` + `commit` from the captured
   artifact. (f) The surviving instantaneous-join claims are
   scoped (Codex m1 + SMR m2): the counter is a true join OVER
   DISPATCHED FRAMES; "gap-free" is qualified at both surviving
@@ -1890,6 +1889,78 @@
   `sync_config_gen_test.go:236,237,266,267,293,322,340,357`,
   `sync_config_epoch_sweep_race_6284_test.go:108,163,198`,
   `sync_config_health_6387_test.go:152,207,253,281,330,338`.
+  v47: r46 convergence — the epoch becomes a pinned
+  node-lifetime dispatch epoch, the done predicate becomes
+  observable and closed, and the capture surface becomes the
+  on-disk active file (Codex NEEDS-REVISION 3M/3m, folds 3
+  FOLDED / 5 PARTIAL / 1 NOT-FOLDED, structure confirmed; AGY
+  PLAN-READY 9/9 with 3 fresh attacks FAILED, structure
+  confirmed; SMR PLAN-READY-WITH-NITS 0M/1m — the
+  epoch-lifetime pin, IS Codex M1): (a) THE NODE-LIFETIME
+  MONOTONIC DISPATCH EPOCH (Codex M1, verified the
+  provider-scoped candidates fail: `lastAppliedConfigGen`
+  ignores gen-0 and failed applies and resets on bulk re-prime,
+  `sync_conn_config.go:275-286,351-395`,
+  `sync_conn_gen.go:340-367`; `ConfigsReceived` increments
+  before disposition and is provider-scoped,
+  `sync_conn_read.go:298-330`, `sync.go:293-301,805-857` — a
+  transport-changing apply's provider swap ABA-erases a pulse,
+  `daemon_apply_tail.go:238-255`): ONE explicitly named epoch,
+  incremented in the same critical section on each SUCCESSFUL
+  reservation, living in node-lifetime state beside the counter
+  and preserved across every SessionSync replacement, exposed
+  beside the counter; the (3) comparison uses it, and the
+  runbook's conservative-false-positive rule is EXPLICIT
+  (re-baseline and repeat the (2c)→(3) pass — the peer is
+  stopped, so the epoch settles). (b) THE DONE PREDICATE IS
+  OBSERVABLE AND CLOSED (Codex M2): ActiveApplied is exposed
+  beside the counter/epoch/digest on the cluster-status
+  rendering (internal today, `health.go:65-84`); the predicate
+  gains `IsConfirmPending() == false` AND `IsDirty() == false`
+  (or the candidate explicitly discarded) on BOTH nodes
+  (verified independent exposed state, `store_commit.go:796-800`,
+  `store_lock.go:334-338`, via `GetConfigModeStatus`,
+  `grpcapi/server_config.go:98-103`; a `LoadOverride` can set
+  dirty without touching active/applied/persistence,
+  `store_command.go:304-334`); and the marker-invalidation ask
+  (Codex M2c) is RULED ON WITH EVIDENCE rather than folded —
+  the appliedDigest is text-scoped by #4957 design: a failed
+  SAME-TEXT reapply (`daemon_dhcp.go:73-90`,
+  `daemon_apply.go:49-70`) leaves the same text's prior
+  converged enforcement (the #5679 deferred commit error is
+  the running-node signal, `daemon_apply_dataplane.go:145-159`),
+  a failed DIFFERENT-text apply reads ActiveApplied=false via
+  the digest mismatch, and a fresh boot's empty digest makes a
+  failed bringup read false — the post-restart predicate reads
+  the post-bringup state, exactly when it is consulted. (c)
+  THE CAPTURE IS THE ON-DISK ACTIVE FILE (Codex M3, verified:
+  every rendered surface is redacted,
+  `grpcapi/server_config.go:347-380`, `api/config.go:304-352`,
+  `cmd/cli/show.go:81-120`; the embedded-TTY cleartext show is
+  not instantiated in service mode, `daemon_run.go:601-616`):
+  the capture is (α) the canonical digest from the
+  cluster-status surface (redaction-free) for verification and
+  (β) the intended config's TEXT — the OPERATOR'S OWN committed
+  configuration (the procedure changes no config) — for
+  re-convergence, with the on-disk `.configdb/active.json` copy
+  as the in-box fallback RESTORE artifact, its format caveats
+  named (a JSON envelope, not Junos text — it cannot feed
+  `load override` directly, `store_command.go:306-309` — and
+  key-encrypted when the config carries a master password,
+  `crypto.go:262-285`). (d) The JOIN-COHERENCE teardown leg is rewritten as
+  reader-wins / Stop-wins (Codex m1 — a freeze INSIDE the
+  critical section is impossible under the exclusion; the
+  exclusion prevents the interleaving by construction). (e)
+  `load replace` dropped (Codex m2 — modes are
+  override/merge/set, `cmd/cli/main.go:549-590`). (f) The
+  residual unscoped claims are scoped (Codex m3): the live
+  GAP-FREE heading, the ALL-INGRESS JOIN phrasing, and the
+  witness's "every relevant ingress reader" all now say
+  REGISTERED readers / DISPATCHED frames; and the §5.1
+  contradiction is resolved — pkg/configstore (canonical
+  accessor) + pkg/daemon (injection) + pkg/cluster (rendering)
+  are touched, pkg/grpcapi/pkg/cli stay CODE-untouched as
+  relays (`server_show_cluster_text.go:66-74`).
 
 ---
 
@@ -3941,7 +4012,7 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   target stops resumes reconnect/reconcile pushes,
   `daemon_ha_sync.go:926-956`, while a peer left stopped after
   the target stops is a full cluster outage): THE OBSERVABLE
-  JOIN IS ADDED TO THE PLAN AS A GAP-FREE OUTSTANDING-SYNC
+  JOIN IS ADDED TO THE PLAN AS AN OUTSTANDING-SYNC
   COUNTER (r41 Codex M1, replacing the gapful queue-length +
   gen-fence pair): a single atomic
   `ConfigSyncOutstanding` counter on EACH node, with TOTAL
@@ -4019,18 +4090,37 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   witness-Down + counter==0 at the (2c) instant can precede a
   late dispatch; the fence's safety is the COMPOSITION, not the
   instant: (2c) drains, (3) RE-READS the counter AND compares
-  the MONOTONIC config-sync epoch — `lastAppliedConfigGen` /
-  `ConfigsReceived`, both already monotonic and surfaced
-  (`status.go:340-356`) — against the value observed at (2c),
+  ONE EXPLICITLY NAMED NODE-LIFETIME MONOTONIC DISPATCH EPOCH
+  (r46 Codex M1, verified the provider-scoped candidates are
+  unusable: `lastAppliedConfigGen` ignores gen-0 and failed
+  applies and resets on bulk re-prime,
+  `sync_conn_config.go:275-286,351-395`,
+  `sync_conn_gen.go:340-367`; `ConfigsReceived` increments
+  before the queue-full/stale/failure disposition,
+  `sync_conn_read.go:298-330`, and both are scoped to the
+  REPLACEABLE SessionSync, `sync.go:293-301,805-857`,
+  `sync_state.go:47-63` — a transport-changing clean apply
+  replaces the provider mid-callback,
+  `daemon_apply_tail.go:238-255`, permitting an old-(0,0) →
+  apply → fresh-(0,0) ABA that ERASES the pulse) — the epoch
+  increments in the same critical section on a SUCCESSFUL
+  reservation, lives in NODE-LIFETIME state beside the counter
+  (preserved across every SessionSync replacement), and is
+  exposed beside the counter on the status surface — against
+  the value observed at (2c),
   so a dispatch that lands, applies CLEANLY, and retires
   between (2c) and (3) (the level returning to zero — r45 Codex
   M2's level-vs-sticky-event gap) is still SEEN as an epoch
-  change, and a dispatch landing
+  change; a stale-skip receipt moves the epoch without state
+  change — a CONSERVATIVE false-positive, and the runbook's
+  rule is EXPLICIT: re-baseline and repeat the (2c)→(3) pass
+  (the peer is stopped, so the epoch settles); and a dispatch
+  landing
   after (3) is residual (iii)'s admitted local window.
   Because the reservation lives in the
-  DISPATCH path (the `syncMsgConfig` case), the counter is the
-  ALL-INGRESS JOIN (r43 Codex M2, verified the three non-registered
-  reader classes): a legacy/unkeyed peer's first frame is
+  DISPATCH path (the `syncMsgConfig` case), the counter joins
+  EVERY DISPATCHED FRAME (r43 Codex M2, verified the three
+  non-registered reader classes): a legacy/unkeyed peer's first frame is
   processed BEFORE connection installation
   (`sync_conn.go:122-127` — `handleMessage` on the pending
   frame ahead of `installConn`), a same-fabric replacement's
@@ -4106,12 +4196,16 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   (3)
   the operator RE-CHECKS THE FULL STATE — `ConfirmDebtKindMask
   == 0` AND `persistDegraded == false` AND
-  `ConfigSyncOutstanding == 0` AND the MONOTONIC config-sync
-  epoch (`lastAppliedConfigGen` / `ConfigsReceived`,
-  `status.go:340-356`) UNCHANGED since the (2c) observation
-  (r45 Codex M2 — the level counter alone misses a dispatch
+  `ConfigSyncOutstanding == 0` AND the NODE-LIFETIME MONOTONIC
+  dispatch epoch (the pinned counter-sibling — incremented on
+  each successful reservation, preserved across SessionSync
+  replacements, exposed beside the counter) UNCHANGED since the
+  (2c) observation
+  (r45 Codex M2 + r46 Codex M1 — the level counter alone misses
+  a dispatch
   that lands, applies cleanly, and retires between (2c) and
-  (3); the monotonic epoch cannot)
+  (3), and a provider-scoped epoch can ABA-erased the pulse;
+  the node-lifetime monotonic epoch cannot)
   (r39 Codex M1 + r41 Codex M2: the
   mask-only gap — a queued apply can promote, cancel the old
   window, and FAIL its active write — `store.go:687-717,738-746`
@@ -4186,15 +4280,39 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   authority and `pushConfigToPeer` enforces ConfigSync,
   `daemon_ha_sync.go:336-370` — and the intended holder can be
   the READ-ONLY secondary, whose store rejects mutations,
-  `store.go:344-354`): the operator captures the COMPLETE
-  UNREDACTED intended artifact off-node BEFORE the fence (the
-  cleartext Show* SSOT already backs HA config sync and the DR
-  archive, `grpcapi/server_config.go:349-352` — the digest
-  alone cannot reconstruct secrets or text), and the recovery
+  `store.go:344-354`): the operator captures, BEFORE the fence,
+  (α) the CANONICAL DIGEST of the intended (fence-time active)
+  config from the cluster-status surface (operator-readable,
+  redaction-free — the digest needs no cleartext), and (β) the
+  intended config's TEXT — which is the OPERATOR'S OWN
+  committed configuration (this procedure changes no config;
+  the intended config is what the operator committed and holds
+  in their config management) — with the IN-BOX fallback being
+  the on-disk `.configdb/active.json` copied off-node by the
+  root-held operator, WITH ITS FORMAT CAVEATS NAMED (verified:
+  the file is a JSON envelope, `db.go:73-75,105-117`,
+  `writeTreeMarked` — NOT Junos text, so it cannot feed `load
+  override` directly, `store_command.go:306-309` — and its body
+  is KEY-ENCRYPTED when the config carries a master password,
+  `crypto.go:262-285`; the file copy is therefore a
+  byte-exact RESTORE artifact for the stopped-daemon phase, not
+  a text source) — no CLI/gRPC capture surface exists or is
+  needed (r46 Codex M3: the
+  gRPC/REST/remote-CLI renders are always redacted,
+  `grpcapi/server_config.go:347-380`, `api/config.go:304-352`,
+  `cmd/cli/show.go:81-120`, and the embedded-TTY cleartext show
+  is not instantiated in service mode, `daemon_run.go:601-616`),
+  and the recovery
   is an AUTHORITY-SIDE staging procedure: on the RG0 authority
-  (never read-only), `load override`/`load replace` from the
-  captured artifact + `commit` through the STANDARD config
-  path, then re-verify per the post-restart predicate below
+  (never read-only), `load override` (the only full-replace
+  mode — override/merge/set, `cmd/cli/main.go:549-590`; no
+  `load replace` exists, r46 Codex m2) of the operator's config
+  TEXT + `commit` through the STANDARD config
+  path — or, when the operator's text source is unavailable,
+  the STOPPED-DAEMON file-level restore of the captured
+  `active.json` onto the authority (with the directory sync and
+  the encryption caveat above) —
+  then re-verify per the post-restart predicate below
   (the commit re-drives the normal sync where enabled). The operational closure is PINNED
   in the runbook, no new machinery: (α) the stopped-filesystem
   repair step ends with a successful directory `sync` of the
@@ -4242,7 +4360,32 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   false, `store.go:797-809`, `daemon_apply_commit.go:464-494`,
   while every persistence field and both digests still pass;
   the config-apply health alarm is delayed and diagnostic-only,
-  `sync_conn_config.go:369-379`) —
+  `sync_conn_config.go:369-379`) — EXPOSED operator-readably
+  beside the counter/epoch/digest on the cluster-status
+  rendering (r46 Codex M2a: ActiveApplied is internal today —
+  `health.go:65-84`, `status.go:340-356`; the exposure lands in
+  pkg/cluster's rendering and relays through the code-untouched
+  grpcapi/cli layers, `server_show_cluster_text.go:66-74`) —
+  AND `IsConfirmPending() == false` AND `IsDirty() == false`
+  (or the candidate EXPLICITLY discarded) on BOTH nodes (r46
+  Codex M2b, verified: both are independent exposed state,
+  `store_commit.go:796-800`, `store_lock.go:334-338`, via
+  `GetConfigModeStatus`, `grpcapi/server_config.go:98-103`; a
+  `LoadOverride` can set dirty without touching
+  active/applied/persistence, `store_command.go:304-334`, and a
+  healthy recovered confirm window can pass every other field
+  yet later roll back). The appliedDigest's TEXT-SCOPED
+  semantics are NOT a done-predicate hole (r46 Codex M2c,
+  ruled on here with evidence): a failed SAME-TEXT reapply
+  (the DHCP callback, `daemon_dhcp.go:73-90`;
+  `daemon_apply.go:49-70`) leaves the same text's PRIOR
+  successful enforcement in place — converged by definition —
+  and a failed DIFFERENT-text apply reads ActiveApplied=false
+  via the digest mismatch (the #5679 deferred commit error is
+  the running-node signal, `daemon_apply_dataplane.go:145-159`);
+  on a fresh boot the digest is empty, so a failed bringup
+  reads false — the post-restart predicate reads the
+  post-bringup state, which is exactly when it is consulted —
   with the disabled-sync subclass's MANUAL re-convergence
   performed first where it fired —
   before the repair is declared done. The same shape covers a push landing on the
@@ -5199,7 +5342,7 @@ v20 history). The delivery is TWO units:
   drain): under `s.mu` or an equivalent lock, the teardown
   drain holding the same exclusion.
   Because the reservation lives in the DISPATCH path, the
-  counter is the ALL-INGRESS JOIN (r43 Codex M2): pre-install
+  counter joins EVERY DISPATCHED frame (r43 Codex M2): pre-install
   pending frames (`sync_conn.go:122-127`), superseded readers
   (`sync_conn.go:244-267,480-498`), and post-Stop-cap readers
   (`sync_conn.go:349-385`) all dispatch through the same
@@ -5220,7 +5363,25 @@ v20 history). The delivery is TWO units:
   onto this same cluster-status RPC (r45 Codex m3 — the
   pre-fence capture and the post-restart comparison need an
   executable surface; the prior "pkg/grpcapi and pkg/cli
-  untouched" scoping is amended to admit exactly this field).
+  untouched" scoping is amended to admit exactly this field);
+  the NODE-LIFETIME MONOTONIC DISPATCH EPOCH (r46 Codex M1) —
+  incremented in the same critical section on each SUCCESSFUL
+  reservation, living in node-lifetime state beside the counter
+  and PRESERVED across every SessionSync replacement (the
+  provider-scoped candidates fail: `lastAppliedConfigGen`
+  ignores gen-0 and failed applies and resets on bulk re-prime,
+  `sync_conn_config.go:275-286,351-395`,
+  `sync_conn_gen.go:340-367`; `ConfigsReceived` increments
+  before disposition and is provider-scoped,
+  `sync_conn_read.go:298-330`, `sync.go:293-301,805-857` — a
+  transport-changing apply's provider swap would ABA-erase a
+  pulse, `daemon_apply_tail.go:238-255`) — is exposed beside
+  the counter; and the ActiveApplied state (r46 Codex M2a —
+  internal today, `store.go:797-809`) is rendered on the same
+  status surface; the rendering lands in pkg/cluster, the
+  canonical accessor in pkg/configstore, the injection in
+  pkg/daemon, and pkg/grpcapi/pkg/cli stay CODE-untouched as
+  relays (`server_show_cluster_text.go:66-74`).
   The counter is
   independent of generation numbers and epoch resets
   (`sync_conn_gen.go:340-362`); exposed read-only on the cluster
@@ -5232,8 +5393,11 @@ v20 history). The delivery is TWO units:
   endpoint already carries them per the health-snapshot work; the
   peer's COUNTER is read via the peer's cluster-status RPC, r42
   Codex m1); the LOCAL drain also witnesses INGRESS QUIESCENCE
-  FIRST — the TERMINAL EXIT of every relevant ingress reader
-  (EOF, heartbeat-timeout, bad-magic, oversized/partial payload,
+  FIRST — the TERMINAL EXIT of every REGISTERED ingress reader
+  (r45 Codex m1: the surface does not register pre-install,
+  superseded, or post-cap readers — those are the counter's
+  domain) (EOF, heartbeat-timeout, bad-magic, oversized/partial
+  payload,
   auth-trailer failure, cancellation, read errors — r43 Codex
   m2), observed on the EXISTING sync-peer connection-state
   surface (`IsSyncConnected`, `sync_state.go:66-74`, rendered
@@ -5358,7 +5522,12 @@ v20 history). The delivery is TWO units:
 - `pkg/dataplane/retirement_boundary_canary_test.go`: matcher extension
   (incl. `*ast.IndexExpr` renderer support).
 - `pkg/daemon/daemon_dp_canary_test.go` (new): dpCell-access AST canary.
-- `pkg/grpcapi`, `pkg/cli` untouched.
+- `pkg/grpcapi`, `pkg/cli` CODE-untouched (r46 Codex fold-8/m3 —
+  they RELAY the cluster manager's formatted status,
+  `server_show_cluster_text.go:66-74`; the digest/epoch/
+  ActiveApplied exposures land in pkg/configstore (the canonical
+  accessor), pkg/daemon (the injection), and pkg/cluster (the
+  rendering), so the relay layers need no code change).
 
 ### 5.2 Writer conversion (5 sites — complete, both reviewers verified)
 
@@ -6272,7 +6441,9 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      sync falls back to fabric over possibly two paths,
      `daemon_ha_sync.go:774-785,820-860`) — and DRAIN THE LOCAL
      OUTSTANDING COUNTER: witness INGRESS QUIESCENCE FIRST — the
-     TERMINAL EXIT of every relevant ingress reader (EOF,
+     TERMINAL EXIT of every REGISTERED ingress reader (r45
+     Codex m1: pre-install, superseded, and post-cap readers
+     are the counter's domain, not this surface's) (EOF,
      heartbeat-timeout, bad-magic, oversized/partial payload,
      auth-trailer failure, cancellation, read errors — dispatch
      happens only after complete verification,
@@ -6296,9 +6467,13 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      `resetRecvGen` clears mid-apply),
      (3) RE-CHECK THE FULL STATE —
      `ConfirmDebtKindMask == 0` AND `persistDegraded == false`
-     AND `ConfigSyncOutstanding == 0` AND the MONOTONIC
-     config-sync epoch (`lastAppliedConfigGen` /
-     `ConfigsReceived`, `status.go:340-356`) UNCHANGED since the
+     AND `ConfigSyncOutstanding == 0` AND the NODE-LIFETIME
+     MONOTONIC dispatch epoch (incremented on each successful
+     reservation, preserved across SessionSync replacements,
+     exposed beside the counter — r46 Codex M1: the
+     provider-scoped candidates reset or ABA,
+     `sync_conn_gen.go:340-367`, `sync_state.go:47-63`,
+     `daemon_apply_tail.go:238-255`) UNCHANGED since the
      (2c) observation (r45 Codex M2 — the level counter alone
      misses a dispatch that lands, applies cleanly, and retires
      between (2c) and (3); the monotonic epoch cannot)
@@ -6360,11 +6535,23 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      `fsatomic.go:354-366` — before either restart, and the
      POST-RESTART VERIFICATION step (both nodes hold the same
      intended config — compared against the OPERATOR'S intended
-     config captured BEFORE the fence as BOTH an OFF-NODE
-     canonical digest AND the COMPLETE UNREDACTED artifact (the
-     cleartext Show* SSOT backs HA sync and the DR archive,
-     `grpcapi/server_config.go:349-352`; a digest alone cannot
-     reconstruct the text for the manual re-convergence), since
+     config captured BEFORE the fence as BOTH the OFF-NODE
+     canonical digest (from the cluster-status surface —
+     redaction-free, no cleartext needed) AND the intended
+     config's TEXT — the OPERATOR'S OWN committed configuration
+     (this procedure changes no config), with the in-box
+     fallback being the on-disk `.configdb/active.json` copied
+     off-node by the root-held operator as a byte-exact
+     STOPPED-DAEMON RESTORE artifact (a JSON envelope, NOT
+     Junos text — it cannot feed `load override` directly,
+     `store_command.go:306-309` — and key-encrypted when the
+     config carries a master password, `crypto.go:262-285`) —
+     no CLI/gRPC capture surface exists or is
+     needed (r46 Codex M3: every rendered surface is redacted,
+     `grpcapi/server_config.go:347-380`, `api/config.go:304-352`,
+     `cmd/cli/show.go:81-120`, and the embedded-TTY cleartext
+     show is not instantiated in service mode,
+     `daemon_run.go:601-616`), since
      the show/export surfaces redact secrets,
      `grpcapi/server_config.go:347-356`, `api/config.go:304-312`;
      not merely cross-node agreement, which a
@@ -6381,8 +6568,18 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      and both digests pass, `store.go:797-809`,
      `daemon_apply_commit.go:464-494`; the config-apply health
      alarm is delayed and diagnostic-only,
-     `sync_conn_config.go:369-379` — r45 Codex M4) — before
-     the repair is declared
+     `sync_conn_config.go:369-379` — r45 Codex M4; the digest's
+     text-scoped semantics are not a hole — a failed same-text
+     reapply leaves the same text's prior converged
+     enforcement, and a failed different-text apply reads false
+     via the digest mismatch, r46 Codex M2c ruled on with
+     evidence) — EXPOSED beside the counter/epoch/digest on the
+     cluster-status rendering (r46 Codex M2a) — AND
+     `IsConfirmPending() == false` AND `IsDirty() == false` (or
+     the candidate explicitly discarded) on BOTH nodes (r46
+     Codex M2b — `store_commit.go:796-800`,
+     `store_lock.go:334-338`, `store_command.go:304-334`) —
+     before the repair is declared
      done),
      and every
      content-INDEPENDENT repair write
@@ -6428,21 +6625,31 @@ the full Go/Rust suites, smoke) run for BOTH units.*
      completes but before the producer's continuation asserts
      the reservation is ALREADY visible (the consumer can
      dequeue at the seam; the counter never reads a false
-     zero); (g) the ENQUEUE-AFTER-TEARDOWN leg (r44 Codex M1 +
-     r45 Codex M1's seam correction) — the seam sits AFTER the
-     live observation/reservation and BEFORE the send: a reader
-     holding a reservation is frozen at the seam, Stop
-     publishes dead and drains, the reader resumes — the
-     serialized check+reserve+enqueue critical section forces
-     either retirement by the drain or the dead-gate drop, and
-     the counter stays balanced at zero across the teardown;
-     (h) the PULSE-BETWEEN-READS leg (r45 Codex M2) — a
+     zero); (g) the ENQUEUE-AFTER-TEARDOWN leg, rewritten as TWO
+     legs (r46 Codex m1 — freezing the reader INSIDE the
+     critical section while Stop publishes+drains is impossible
+     under the same exclusion; the exclusion prevents that
+     interleaving by construction, so the legs test the two
+     orderings instead): (g1) READER-WINS — the reader
+     completes the serialized check+reserve+enqueue FIRST;
+     Stop blocks on the exclusion, then publishes dead and
+     drains; the drain retires the token; the counter ends at
+     zero; (g2) STOP-WINS — Stop publishes dead and drains
+     first; the reader then enters the section, observes dead,
+     and takes the DROP path — no reservation, the counter
+     stays at zero;
+     (h) the PULSE-BETWEEN-READS leg (r45 Codex M2 + r46 Codex
+     M1) — a
      dispatch that lands, applies CLEANLY, and retires between
      the (2c) observation and the (3) re-check returns the
-     level counter to zero but MOVES the monotonic epoch
-     (`lastAppliedConfigGen` / `ConfigsReceived`): the
+     level counter to zero but MOVES the pinned NODE-LIFETIME
+     monotonic dispatch epoch (incremented on each successful
+     reservation, preserved across SessionSync replacements):
+     the
      regression asserts the epoch comparison at (3) catches the
-     pulse the level cannot;
+     pulse the level cannot — including across a
+     transport-changing apply's provider swap
+     (`daemon_apply_tail.go:238-255`);
      the OBSERVABILITY leg
      (r32 Codex M1b) — `ConfigWriteUnverified` renders in /health
      and folds into the aggregate OR, and the retry loop ACTIVELY
