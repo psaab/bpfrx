@@ -282,6 +282,75 @@ func TestClassUnidentifiedIsDenyingNotLegacy_6701(t *testing.T) {
 	}
 }
 
+// TestUnresolvedIdentityMatchesNoConfiguredUser_6701 binds the `id.Resolved()`
+// test in candidateNames, which is the ONLY thing stopping an unidentifiable
+// caller from matching a configured user (#6701 MINOR-1).
+//
+// The premise is measured, not assumed: `system login user "" { class
+// super-user; }` compiles CLEAN — the schema's username validator does not
+// reject a quoted-empty name — so such an entry really can be live. An
+// unidentified caller carries Name == "". If candidateNames offered that name
+// to the match loop, `u.Name == ""` would match the entry and hand the caller
+// super-user, reopening #6701 without touching $USER.
+//
+// The subtests separate PROTECTION from MESSAGE, because the reviewer's
+// citation pointed at the wrong one. Removing the `!id.Resolved()` branch in
+// ResolveLoginClass changes only which denial string is produced — the class is
+// ClassUnidentified either way, because `listed` is already false by then. The
+// class assertion is therefore the real guard; the reason assertion is a
+// message assertion and is labelled as such.
+func TestUnresolvedIdentityMatchesNoConfiguredUser_6701(t *testing.T) {
+	// A config that a real deployment can hold: an empty-named super-user entry.
+	emptyNamed := &config.LoginConfig{Users: []*config.LoginUser{
+		{Name: "", Class: "super-user"},
+		{Name: "bob", Class: "read-only"},
+	}}
+
+	t.Run("PROTECTION: an unresolved identity is not handed the empty-named entry", func(t *testing.T) {
+		for _, id := range []osident.Identity{
+			{UID: 1000},  // no passwd entry
+			{UID: 65534}, // nobody, unresolvable
+			{UID: 1},     // low uid, unresolvable
+		} {
+			got, reason := ResolveLoginClass(emptyNamed, id)
+			if got == "super-user" {
+				t.Errorf("identity %+v matched the empty-named `system login user \"\"` entry and "+
+					"was handed %q — an unidentifiable caller reached full power (reason: %s)",
+					id, got, reason)
+			}
+			if got != ClassUnidentified {
+				t.Errorf("identity %+v resolved to %q, want the fail-closed %q", id, got, ClassUnidentified)
+			}
+		}
+	})
+
+	t.Run("PROTECTION: an unresolved ROOT identity is not handed it either", func(t *testing.T) {
+		// uid 0 unresolved must reach the root default via the "root" candidate
+		// only — never by matching the empty-named entry.
+		got, reason := ResolveLoginClass(emptyNamed, osident.Identity{UID: 0})
+		if got != ClassRootDefault {
+			t.Fatalf("unresolved uid 0 resolved to %q, want %q (reason: %s)", got, ClassRootDefault, reason)
+		}
+		if strings.Contains(reason, `login user ""`) {
+			t.Fatalf("unresolved uid 0 was governed by the empty-named entry: %s", reason)
+		}
+	})
+
+	t.Run("MESSAGE ONLY: the !Resolved branch selects the reason, not the class", func(t *testing.T) {
+		// Documented explicitly so nobody mistakes this for a second guard: with
+		// no empty-named entry present, an unresolved caller is denied by the
+		// `listed == false` fall-through regardless, and the !Resolved branch
+		// only chooses the wording.
+		got, reason := ResolveLoginClass(loginCfg([2]string{"bob", "read-only"}), osident.Identity{UID: 1000})
+		if got != ClassUnidentified {
+			t.Fatalf("class = %q, want %q", got, ClassUnidentified)
+		}
+		if !strings.Contains(reason, "has no passwd entry") {
+			t.Errorf("reason = %q, want it to name the passwd failure", reason)
+		}
+	})
+}
+
 // TestUnauthorizedClassCannotBeWidened_6701 pins the COUPLING the whole
 // fail-closed default rests on, which is easy to miss because it lives in a
 // different function.

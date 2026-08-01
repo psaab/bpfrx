@@ -602,16 +602,25 @@ func TestLoginBlockOnlyStatementsAreSchemaChildren_6662(t *testing.T) {
 			t.Errorf("block-only entry %q: the schema node has no children, so it is a LEAF, "+
 				"not a block — listing it here gates the wrong shape", full)
 		}
-		if node.args != 0 {
-			t.Errorf("block-only entry %q: the schema node takes %d arg(s), so a value on its "+
-				"line is legitimate, not a packed block", full, node.args)
+		// The recorded ARITY must equal the schema's, because the gate skips
+		// exactly that many key tokens before calling the rest a packed body.
+		// Recording it too low rejects the correct nested spelling; too high
+		// lets a packed body through (#6701 MINOR-4).
+		gotArity, listed := loginBlockOnlyArity(keyword, stmt)
+		if !listed {
+			t.Errorf("block-only entry %q: not retrievable through loginBlockOnlyArity", full)
+			continue
+		}
+		if gotArity != node.args {
+			t.Errorf("block-only entry %q: gate records arity %d but the schema node takes %d "+
+				"arg(s) — the gate would skip the wrong number of key tokens", full, gotArity, node.args)
 		}
 	}
 }
 
 // TestLoginBlockOnlyEnumerationIsComplete_6662 is the completeness half: it
 // derives, from the SCHEMA, every `login <keyword> <statement>` that is a block
-// (has children, takes no args) and requires each to be listed as block-only.
+// (has children — at ANY arity) and requires each to be listed as block-only.
 //
 // Reading the compiler by hand is how the enumeration was built; this is what
 // stops it rotting. If someone adds a second block-bodied login statement to
@@ -632,8 +641,16 @@ func TestLoginBlockOnlyEnumerationIsComplete_6662(t *testing.T) {
 			continue
 		}
 		for stmt, node := range inst.children {
-			if node == nil || len(node.children) == 0 || node.args != 0 {
-				continue // a leaf, or a value-bearing statement: not a block
+			// A BLOCK is any node with children, REGARDLESS of arity. The
+			// previous version also skipped `node.args != 0`, which put an
+			// args-bearing block statement (`foo <name> { ... }`) outside the
+			// guard's scope entirely — guard scope narrower than the claim it
+			// protects. Such a statement is exactly as droppable as a
+			// zero-arity one; the arity only changes how many key tokens the
+			// gate must skip, which loginBlockOnlyStatements now records
+			// (#6701 MINOR-4).
+			if node == nil || len(node.children) == 0 {
+				continue // a leaf: not a block
 			}
 			if !listed[keyword+" "+stmt] {
 				missing = append(missing, keyword+" "+stmt)

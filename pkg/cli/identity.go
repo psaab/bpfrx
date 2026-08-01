@@ -182,7 +182,21 @@ func configuredName(login *config.LoginConfig, id osident.Identity) string {
 
 // candidateNames is the ordered set of `system login user` names that may
 // govern id: its passwd-resolved name, plus the literal "root" for uid 0.
-// An unresolved identity contributes no name of its own.
+//
+// The `id.Resolved()` test is LOAD-BEARING, not a tidiness check, and this is
+// the only place that protection exists. An unidentified caller has Name == "",
+// and `system login user "" { class super-user; }` COMPILES CLEAN today
+// (measured — the schema's username validator does not reject the quoted-empty
+// name). Without this test the empty name would be offered to the match loop
+// below, where `u.Name != name` succeeds against that entry and the
+// unidentifiable caller is handed super-user — the #6701 hole reopened from the
+// other side, reached without touching $USER at all.
+//
+// Note this is NOT protected by the `!id.Resolved()` branch in
+// ResolveLoginClass: that branch runs AFTER the lookup and only selects the
+// denial MESSAGE (with it removed the final return denies identically). The
+// refusal to match has to happen here, before any name reaches the loop.
+// TestUnresolvedIdentityMatchesNoConfiguredUser_6701 binds it.
 func candidateNames(id osident.Identity) []string {
 	var names []string
 	if id.Resolved() {

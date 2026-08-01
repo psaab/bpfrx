@@ -101,8 +101,19 @@ var loginInstanceKeywords = []string{"class", "user"}
 // check so adding a block-bodied login statement is a one-line change here, and
 // TestLoginBlockOnlyStatementsAreSchemaChildren_6662 fails if a name listed
 // here is not a real schema child (a typo would silently disable the gate).
-var loginBlockOnlyStatements = map[string]map[string]bool{
-	"user": {"authentication": true},
+//
+// The VALUE is the statement's ARITY: how many tokens after the keyword
+// legitimately belong to its key rather than being a packed body. `authentication`
+// takes none, so anything after the keyword is a packed body. A future
+// block-bodied statement that DOES take an argument (`foo <name> { ... }`,
+// schema `args: 1`) would carry that argument on Keys in the correct nested
+// spelling too, so the packed test has to be `len(Keys) > 1 + arity` rather
+// than `> 1` — otherwise the gate would reject the very spelling it is meant to
+// accept. Recording the arity here keeps that correct by construction instead of
+// leaving an args-bearing block statement outside the guard's scope (#6701
+// MINOR-4).
+var loginBlockOnlyStatements = map[string]map[string]int{
+	"user": {"authentication": 0},
 }
 
 // loginPackedConsequence renders the stanza-specific consequence clause of the
@@ -199,13 +210,16 @@ func checkLoginInstancePacked(keyword, name string, inst *Node, identityKeys int
 	}
 	for _, prop := range inst.Children {
 		stmt := prop.Name()
-		if !blockOnly[stmt] {
+		arity, isBlockOnly := blockOnly[stmt]
+		if !isBlockOnly {
 			continue
 		}
-		if len(prop.Keys) <= 1 {
+		// Keys[0] is the statement; the next `arity` tokens are legitimately
+		// part of its key. Anything beyond that is a packed body.
+		if len(prop.Keys) <= 1+arity {
 			continue
 		}
-		body := strings.Join(prop.Keys[1:], " ")
+		body := strings.Join(prop.Keys[1+arity:], " ")
 		if err := emit(fmt.Sprintf(
 			"system login %s %s %s: body %q is written on the statement line, but xpf "+
 				"compiles `%s` only from a nested block or a `set` statement — the key or "+
@@ -231,6 +245,18 @@ func loginBlockOnlyStatementNames() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// loginBlockOnlyArity returns the recorded arity for a `<keyword> <statement>`
+// entry, and whether it is listed at all. Used by the schema-drift guards so
+// they check the SAME arity the gate applies.
+func loginBlockOnlyArity(keyword, stmt string) (int, bool) {
+	stmts, ok := loginBlockOnlyStatements[keyword]
+	if !ok {
+		return 0, false
+	}
+	arity, ok := stmts[stmt]
+	return arity, ok
 }
 
 // validateLoginClassShadowsBuiltinAST rejects a `system login class <name>`
