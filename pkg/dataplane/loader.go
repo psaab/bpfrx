@@ -114,6 +114,9 @@ func New() *Manager {
 // delegates to the raw helper (sync.Mutex is non-reentrant, so the
 // predicate must NOT call the public getter).
 func (m *Manager) XDPEntryProgram() string {
+	if muAcquireProbeHook != nil {
+		muAcquireProbeHook("XDPEntryProgram")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if xdpEntryProgSelectorHook != nil {
@@ -1324,10 +1327,33 @@ func (m *Manager) Close() error {
 
 // Teardown performs a full teardown: closes handles then removes all
 // pinned BPF state. Use when switching dataplanes or decommissioning.
+//
+// #2114 (Codex PR #6743 r3-1): once Close has closed the Go link handles
+// and Cleanup has unpinned+destroyed the kernel links, the xdpLinks /
+// tcLinks membership entries point at dead handles for links that no
+// longer exist. Clear them so a same-process re-Start (the
+// commit-confirmed rollback → bootstrap-exit re-arm) actually
+// re-attaches: AttachXDP's membership short-circuit would otherwise
+// return "already attached" for a link Cleanup destroyed, and
+// attachUserspaceShimXDP deliberately swallows that exact error — the
+// corrected commit would report success with no AF_XDP ingress. Close
+// alone deliberately does NOT clear: its pinned links stay live in the
+// kernel for hitless-restart reuse, so the membership stays truthful
+// there. The link maps are lifecycle-serialized (Start/Close/Teardown
+// run under the daemon's applySem), matching DetachXDP's delete.
 func (m *Manager) Teardown() error {
 	m.Close()
-	return Cleanup()
+	err := teardownCleanupFn()
+	clear(m.xdpLinks)
+	clear(m.tcLinks)
+	return err
 }
+
+// teardownCleanupFn is Teardown's pinned-state sweep (#2114 test seam:
+// the unit test drives the REAL Teardown with the filesystem sweep
+// neutralized — Cleanup unpins and removes the production
+// /sys/fs/bpf/xpf tree). Production leaves it pointing at Cleanup.
+var teardownCleanupFn = Cleanup
 
 // Cleanup removes all pinned BPF maps and links. This fully tears down
 // the dataplane — use when decommissioning, not during normal restarts.

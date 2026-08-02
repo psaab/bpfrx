@@ -84,6 +84,19 @@ func classifyRegistry(loaded *atomic.Bool, numMaps int) registryState {
 // check per registry lookup, never on the packet path).
 var registryLookupHook func()
 
+// muAcquireProbeHook, when non-nil, runs at the ENTRY of the contended
+// m.mu surfaces — BEFORE the m.mu.Lock call — in lookupMapLocked,
+// lookupProgramLocked, publishShimRegistryLocked, and XDPEntryProgram
+// (#2114 A3 test seam, Codex PR #6743 r3-8). The blocking legs signal
+// arrival from here: a handshake closed BEFORE the goroutine's contended
+// call leaves a preemption window in which the non-completion timeout
+// can pass without the goroutine ever reaching the mutex (a false-green
+// "it blocked" proof); the in-call pre-lock signal proves the goroutine
+// arrived at the contended acquisition. The site argument names the
+// function so a test can filter. Production leaves it nil (one nil
+// check per call, control plane only).
+var muAcquireProbeHook func(site string)
+
 // lookupMapLocked performs the uniform #2114 A3 registry access for
 // m.maps: under ONE scoped m.mu hold it classifies the manager's
 // armedness and selects the named handle ATOMICALLY, so the gate outcome
@@ -92,6 +105,9 @@ var registryLookupHook func()
 // fixtures insert nil handles) from absent. The caller owns the OUTCOME
 // per its class: the helper wraps the lookup, never the outcome.
 func (m *Manager) lookupMapLocked(name string) (h *ebpf.Map, present bool, st registryState) {
+	if muAcquireProbeHook != nil {
+		muAcquireProbeHook("lookupMapLocked")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if registryLookupHook != nil {
@@ -104,6 +120,9 @@ func (m *Manager) lookupMapLocked(name string) (h *ebpf.Map, present bool, st re
 // lookupProgramLocked is lookupMapLocked for the m.programs registry
 // (different value type, same uniform rule).
 func (m *Manager) lookupProgramLocked(name string) (p *ebpf.Program, present bool, st registryState) {
+	if muAcquireProbeHook != nil {
+		muAcquireProbeHook("lookupProgramLocked")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if registryLookupHook != nil {
@@ -135,6 +154,9 @@ var shimRegistryPublishPostStoreHook func()
 // construction, program lookup, pinning) stays OUTSIDE the lock in
 // loadUserspaceShimObjectsOnce.
 func (m *Manager) publishShimRegistryLocked(prog *ebpf.Program, collMaps, sharedMaps map[string]*ebpf.Map) {
+	if muAcquireProbeHook != nil {
+		muAcquireProbeHook("publishShimRegistryLocked")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.programs[userspaceShimEntryProg] = prog
