@@ -1,30 +1,23 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v84 — r82 folds: Codex M1+M2's unified
-  named-publisher design (the v83 canary named the WRAPPER
-  `loadUserspaceShimObjects` while the writes live in the
-  `...Once` function, and a body-wide hold would self-deadlock
-  on the :154 selector — the writer now splits into unlocked
-  privileged ACQUISITION + ONE small named locked publisher
-  `publishShimRegistryLocked` carrying the registry assignments
-  AND the Store(true); the canary allowlist is exactly the
-  registry helper + the publisher, with the locked-interval
-  shape check defeating the Lock→hook→Unlock→access anti-
-  pattern), Codex m1's hook protocol (instance-scoped hooks,
-  one ownership hook per test, TryLock-inside-the-interval),
-  Codex m2's privilege split (always-on classification/
-  ownership legs + privileged semantic-mutation legs), Codex
-  m3's three summary-site carve-out pointers, Codex m4's
-  closure-wording resolution (registry selection CLOSED in
-  every state; the teardown narrowing is limited to the
-  loaded-check set — Close retains a nonempty registry), Codex
-  m5's qualification propagation (canceled context wins first,
-  apply.go:238), Codex m6's inventory fixes (canary pair →
-  set; the ship-it-all escape hatch marked closed post-v69);
-  r82 verdicts: Codex PLAN-NEEDS-MAJOR (2M/5m), AGY PLAN-READY,
-  Claude SMR PLAN-READY-WITH-NITS (0M/1m — the hold-open
-  placement, subsumed and corrected by Codex M2's fuller
-  placement analysis); pending convergence review r83
+- **Status**: DRAFT v85 — r83 folds: Codex M1's canary escape
+  closure (the helper is now exactly named with a NON-ESCAPING
+  signature — `registryLookupLocked(name string) *ebpf.Map`, a
+  key in and the selected handle out; the CONTAINER never
+  escapes: a helper returning `m.maps` wholesale would let a
+  caller index the alias after unlock while the publisher
+  writes, preserving the fatal race through an allowlisted
+  lock-holding helper — the shape rules now reject container
+  return/alias/field-assign/closure/argument-pass/post-unlock
+  indexing, with negative fixtures for both anti-patterns, and
+  the publisher's writes are followed by exactly one in-lock
+  Store(true)), Codex m1's teardown-summary qualifications
+  (both the §4 mechanics bullet and invariant 12 now say the
+  entry Store narrows the LOADED-CHECK SET's admission — Close
+  retains a nonempty registry, so ordinary methods classify
+  retained and proceed); r83 verdicts: Codex PLAN-NEEDS-MAJOR
+  (1M/1m — the last canary escape hole), AGY PLAN-READY,
+  Claude SMR PLAN-READY; pending convergence review r84
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -3227,7 +3220,12 @@
   deadlock and the wrapper/writer allowlist misalignment);
   the hook protocol; the privilege split; the summary
   carve-out pointers; the closure-wording resolution; the
-  qualification propagation; the inventory fixes).
+  qualification propagation; the inventory fixes). v85 (r83:
+  the canary escape closure — the helper exactly named with
+  the non-escaping signature (the container never escapes;
+  alias/return/closure/argument/post-unlock indexing all
+  rejected, with negative fixtures); the teardown summaries
+  qualified to the loaded-check set).
 
 ---
 
@@ -3887,9 +3885,15 @@ class. The fold:
   Store(true) — the FINAL step INSIDE the whole-batch `m.mu` hold,
   after
   all map population; `:458`, `:490`, `:1082` become Load; the
-  Store(false) moves to `Close()`'s ENTRY (:1206 — AGY r69: new
-  entrants gate out BEFORE link-handle teardown begins; honestly an
-  admission bit, NOT a lease — it cannot drain an operation that
+  Store(false) moves to `Close()`'s ENTRY (:1206 — AGY r69;
+  qualified to the loaded-check set at v85 per r83 Codex m1:
+  Close retains a nonempty registry, so ordinary methods classify
+  retained and proceed — what actually changes at the entry Store
+  is that the LOADED-CHECK SET (the attaches, the CompileConfig
+  path) begins rejecting from Close's start, where master flips
+  `loaded` only at :1217's exit and would let them pass against
+  closing links; honestly an admission bit, NOT a lease — it
+  cannot drain an operation that
   already observed true).
 - **Master-today in-window outcomes, preserved-or-improved
   precisely** (v72 wording after r70 Codex M1 falsified v71's
@@ -4497,8 +4501,11 @@ Preserved exactly:
     `CompileUserspaceShim`'s cleanup errors precede the
     selector). NO lifetime or
     teardown exclusion is claimed — the Store(false) at `Close()`'s
-    entry (:1206) gates new FRESH-state entrants (retained-state
-    methods proceed per the two-state rule, = master) and cannot
+    entry (:1206) narrows the LOADED-CHECK SET's admission at
+    teardown (r83 Codex m1's qualification: Close retains a nonempty
+    registry, so ordinary methods classify retained and proceed per
+    the two-state rule, = master; the "fresh-state entrants"
+    phrasing was vacuously true but misleading) and cannot
     drain an in-flight operation; the pre-existing shutdown-window
     link-map race (`Close`'s :1206-1216 range vs the live userspace
     path's link-map writers — pinned-link reuse insertion :534,
@@ -4784,15 +4791,24 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    at the :154 selector, which A3 makes lock-taking) and keeps
    the cleanups' filesystem work outside. The AST canary over
    `pkg/dataplane` forbids direct `m.maps`/`m.programs` access
-   outside the EXACTLY-NAMED allowlist — the registry helper
-   function and `publishShimRegistryLocked` — and asserts the
-   LOCKED-INTERVAL shape: every allowed access is dominated by
-   the allowlisted function's `m.mu` acquisition and precedes its
-   release (the `Lock -> hook -> Unlock -> access` anti-pattern
-   FAILS the shape check, r82 Codex M1's hole). The stale-
-   allowlist self-check (an allowlisted function that stops
-   touching the registry FAILS) and the synthetic negative tests
-   stand. The seam-scoping rule: the synthetic loader replaces
+   outside the EXACTLY-NAMED allowlist — the registry helper and
+   `publishShimRegistryLocked` — with the full precision set (r83
+   Codex M1): the helper's exact name and NON-ESCAPING signature
+   (`func (m *Manager) registryLookupLocked(name string) *ebpf.Map`
+   — a key in, the selected handle out; the CONTAINER never
+   escapes); the shape rules, type-aware on the receiver — every
+   allowed access is dominated by the allowlisted function's `m.mu`
+   acquisition and precedes its release (the `Lock -> hook ->
+   Unlock -> access` anti-pattern FAILS, r82 Codex M1's hole), AND
+   the container is never returned, aliased, assigned to a field,
+   closed over, passed as an argument, or indexed post-unlock (the
+   r83 escape hole: a helper returning `m.maps` wholesale would let
+   a caller index the alias after unlock while the publisher writes
+   — the fatal race preserved through an allowlisted, lock-holding
+   helper); the publisher's writes are followed by EXACTLY ONE
+   in-lock Store(true). The stale-allowlist self-check and the
+   synthetic negative tests stand, now including the alias-escape
+   and unlock-before-access fixtures. The seam-scoping rule: the synthetic loader replaces
    only the privileged acquisition operations (pin/load
    syscalls), never the publisher — the publication writes run
    the production code path under the test's barrier.
@@ -5349,18 +5365,15 @@ Still open:
    PLAN-READY when all three verdicts gate the PR-1 design as
    ready.
 
-7. **r68-r82 resolution (for the record)**: Codex r68 M1 (armed-state
-   admission gate) folded as work item A3; r69-r81 falsified each
-   intermediate form, and r82 pinned the last structural defect (the
-   canary named the wrapper while the writes lived in the ...Once
-   function, and a body-wide hold would self-deadlock on the :154
-   selector) — v84's named-publisher design (unlocked privileged
-   acquisition + publishShimRegistryLocked carrying the writes AND
-   the Store) resolves both, with the canary's locked-interval shape
-   check defeating the Lock→hook→Unlock→access anti-pattern. Each
-   reviewer: verify the publisher design against
-   loader_userspace_shim.go:95-195 and loader.go:152-166, and the
-   hook protocol's one-ownership-hook-per-test rule.
+7. **r68-r83 resolution (for the record)**: Codex r68 M1 (armed-state
+   admission gate) folded as work item A3; r69-r82 falsified each
+   intermediate form, and r83 closed the last canary escape (a
+   helper returning the container wholesale would preserve the fatal
+   race through an allowlisted, lock-holding helper) — v85 pins the
+   helper's exact non-escaping signature and the full shape rules.
+   Each reviewer: verify the canary spec now rejects container
+   escape of every form, and the two teardown-summary
+   qualifications.
 
 ---
 
