@@ -66391,3 +66391,27 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/dataplane/armed_gate.go, pkg/dataplane/loader.go (seam),
   pkg/dataplane/armed_gate_matrix_test.go (new),
   pkg/dataplane/armed_gate_legs_test.go (new), _Log.md
+## 2026-08-02 — #2114 §9 race tests + test-race-dp gate
+
+- **Timestamp**: 2026-08-02 (fix/2114-dp-accessor)
+- **Action**: Added pkg/daemon/daemon_dp_race_test.go — the dataplane-cell
+  regression suite: ConcurrentReadersVsWriter (the §5.4 reader shapes vs
+  the alternating writer), TypedNilAndValueShapes (typed-nil of every
+  nillable kind Stores as nil; value types Store normally),
+  ForwardingStatusAdapter_BackendTypeTransitions (readyProbeOnly →
+  userspace → nil per-call adaptation), BootstrapExit_
+  ArmFailureWithConcurrentReaders (the REAL armBootstrapExitDataplane
+  writer), BootstrapExit_RealSamplerOverlap (the two-sided gate with no
+  happens-before edge between the adapter load and the writer store —
+  verified empirically to trip -race on a plain-field shape),
+  RollbackRearmRecurrence (arm → monitor → rollback-discard → failing
+  re-arm), ClusterStartPublication (RACE-1 watcher shape), and
+  ConfirmTimerStoreVsApplyReader (RACE-3 pure-cell two-sided leg). Wired
+  the test-race-dp make target into test-go (daemon cell patterns +
+  dataplane ArmedGate|PreArm patterns, -count=2 under -race). Fixed the
+  seam-var restore discipline the -race run itself caught (async restore
+  raced the next test's seam read; restores are now synchronous defers
+  with the production loader captured at package init).
+- **File(s)**: pkg/daemon/daemon_dp_race_test.go (new),
+  pkg/dataplane/armed_gate_legs_test.go (restore discipline), Makefile,
+  _Log.md

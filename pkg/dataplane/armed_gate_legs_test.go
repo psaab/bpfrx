@@ -314,9 +314,12 @@ func TestManager_ArmedGate_RetainedOutcomes(t *testing.T) {
 // runSyntheticStart drives LoadUserspaceShim with the acquisition seam
 // replaced by a synthetic registry (the publisher still runs the
 // production code path). Returns a channel receiving the Start result.
+// The seam restore is the CALLER's job (defer restoreShimPrePublishLoad)
+// and must run only after the Start result is received — an asynchronous
+// restore races the next test's seam read (the -race gate caught exactly
+// that here).
 func runSyntheticStart(t *testing.T, m *Manager, registry map[string]*ebpf.Map) chan error {
 	t.Helper()
-	prev := shimPrePublishLoad
 	shimPrePublishLoad = func(m *Manager) error {
 		m.publishShimRegistryLocked(nil, registry, nil)
 		return nil
@@ -324,9 +327,18 @@ func runSyntheticStart(t *testing.T, m *Manager, registry map[string]*ebpf.Map) 
 	done := make(chan error, 1)
 	go func() {
 		done <- m.LoadUserspaceShim()
-		shimPrePublishLoad = prev
 	}()
 	return done
+}
+
+// productionShimPrePublishLoad captures the production loader at package
+// init so the restore below can never drift from the loader.go body.
+var productionShimPrePublishLoad = shimPrePublishLoad
+
+// restoreShimPrePublishLoad puts the production loader back. Pair with
+// runSyntheticStart via defer BEFORE the Start result is consumed.
+func restoreShimPrePublishLoad() {
+	shimPrePublishLoad = productionShimPrePublishLoad
 }
 
 // TestManager_ArmedGate_BlockedStart is the blocked FRESH-Start
@@ -346,6 +358,7 @@ func TestManager_ArmedGate_BlockedStart(t *testing.T) {
 	}
 	defer func() { shimRegistryPublishHook = nil }()
 
+	defer restoreShimPrePublishLoad()
 	startDone := runSyntheticStart(t, m, map[string]*ebpf.Map{"sentinel_unused": nil})
 	<-entered // the publisher holds m.mu, pre-Store(true)
 
@@ -418,6 +431,7 @@ func TestManager_ArmedGate_RetainedReStartOverlap(t *testing.T) {
 	// ABSENT (master's not-found outcomes), never a present-but-nil handle
 	// — production never publishes nil maps, so no method may proceed
 	// against one here.
+	defer restoreShimPrePublishLoad()
 	startDone := runSyntheticStart(t, m, map[string]*ebpf.Map{"sentinel_restart": nil})
 	<-entered
 
@@ -615,7 +629,7 @@ func TestManager_ArmedGate_XDPSelectorTwoSided(t *testing.T) {
 	}
 	defer func() { xdpEntryProgSelectorHook = nil }()
 
-	prev := shimPrePublishLoad
+	defer restoreShimPrePublishLoad()
 	shimPrePublishLoad = func(m *Manager) error {
 		m.publishShimRegistryLocked(nil, map[string]*ebpf.Map{"sentinel_unused": nil}, nil)
 		return nil
@@ -623,7 +637,6 @@ func TestManager_ArmedGate_XDPSelectorTwoSided(t *testing.T) {
 	startDone := make(chan error, 1)
 	go func() {
 		startDone <- m.LoadUserspaceShim()
-		shimPrePublishLoad = prev
 	}()
 	<-entered // the selector write section holds m.mu
 

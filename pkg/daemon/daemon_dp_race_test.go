@@ -1,0 +1,557 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
+	dpruntime "github.com/psaab/xpf/pkg/dataplane/runtime"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/fwdstatus"
+	"golang.org/x/sync/semaphore"
+)
+
+// #2114 dataplane-cell regression tests (plan §9 item 2). Run under
+// `go test -race` via the test-race-dp target. The cell makes the
+// publication race-free; these tests pin that against the REAL writer
+// paths (bootstrap-exit arm, boot publication) with reader shapes drawn
+// from the §5.4 reader audit — and several are two-sided gates with NO
+// happens-before edge between the conflicting accesses, so on a revert to
+// the plain interface field the race detector fires deterministically (the
+// ABSENCE of the HB edge is a memory-model proposition, not a timing one).
+
+// ---------------------------------------------------------------------------
+// Shared fakes.
+// ---------------------------------------------------------------------------
+
+// cellValueDP is a value-receiver RuntimeDataPlane for the value-kind cell
+// leg (a non-nillable concrete value must Store normally, never panic).
+type cellValueDP struct{}
+
+func (cellValueDP) Start(context.Context) error { return nil }
+func (cellValueDP) Close() error                { return nil }
+func (cellValueDP) Teardown() error             { return nil }
+func (cellValueDP) ApplyConfig(context.Context, *config.Config) (*dataplane.ApplyResult, error) {
+	return nil, nil
+}
+func (cellValueDP) LastApplyResult() *dataplane.ApplyResult { return nil }
+func (cellValueDP) Link() dataplane.LinkController          { return nil }
+func (cellValueDP) HA() dataplane.HAController              { return nil }
+func (cellValueDP) Sessions() dataplane.SessionStore        { return nil }
+func (cellValueDP) Telemetry() dataplane.Telemetry          { return nil }
+func (cellValueDP) SessionDeltas() dpruntime.SessionDeltaSource {
+	return nil
+}
+
+// Named nillable kinds carrying the RuntimeDataPlane method set — the
+// kind-gated typed-nil guard must Store each typed-nil of these as nil
+// without panicking (reflect.Value.IsNil panics on non-nillable kinds;
+// named Chan/Func/Map/Slice types can carry methods — the in-repo
+// precedent is pkg/dataplane/userspace/wire_uint8list.go).
+type cellNilSliceDP []byte
+type cellNilMapDP map[string]int
+type cellNilChanDP chan int
+type cellNilFuncDP func()
+
+func (cellNilSliceDP) Start(context.Context) error { return nil }
+func (cellNilSliceDP) Close() error                { return nil }
+func (cellNilSliceDP) Teardown() error             { return nil }
+func (cellNilSliceDP) ApplyConfig(context.Context, *config.Config) (*dataplane.ApplyResult, error) {
+	return nil, nil
+}
+func (cellNilSliceDP) LastApplyResult() *dataplane.ApplyResult { return nil }
+func (cellNilSliceDP) Link() dataplane.LinkController          { return nil }
+func (cellNilSliceDP) HA() dataplane.HAController              { return nil }
+func (cellNilSliceDP) Sessions() dataplane.SessionStore        { return nil }
+func (cellNilSliceDP) Telemetry() dataplane.Telemetry          { return nil }
+func (cellNilSliceDP) SessionDeltas() dpruntime.SessionDeltaSource {
+	return nil
+}
+
+func (cellNilMapDP) Start(context.Context) error { return nil }
+func (cellNilMapDP) Close() error                { return nil }
+func (cellNilMapDP) Teardown() error             { return nil }
+func (cellNilMapDP) ApplyConfig(context.Context, *config.Config) (*dataplane.ApplyResult, error) {
+	return nil, nil
+}
+func (cellNilMapDP) LastApplyResult() *dataplane.ApplyResult { return nil }
+func (cellNilMapDP) Link() dataplane.LinkController          { return nil }
+func (cellNilMapDP) HA() dataplane.HAController              { return nil }
+func (cellNilMapDP) Sessions() dataplane.SessionStore        { return nil }
+func (cellNilMapDP) Telemetry() dataplane.Telemetry          { return nil }
+func (cellNilMapDP) SessionDeltas() dpruntime.SessionDeltaSource {
+	return nil
+}
+
+func (cellNilChanDP) Start(context.Context) error { return nil }
+func (cellNilChanDP) Close() error                { return nil }
+func (cellNilChanDP) Teardown() error             { return nil }
+func (cellNilChanDP) ApplyConfig(context.Context, *config.Config) (*dataplane.ApplyResult, error) {
+	return nil, nil
+}
+func (cellNilChanDP) LastApplyResult() *dataplane.ApplyResult { return nil }
+func (cellNilChanDP) Link() dataplane.LinkController          { return nil }
+func (cellNilChanDP) HA() dataplane.HAController              { return nil }
+func (cellNilChanDP) Sessions() dataplane.SessionStore        { return nil }
+func (cellNilChanDP) Telemetry() dataplane.Telemetry          { return nil }
+func (cellNilChanDP) SessionDeltas() dpruntime.SessionDeltaSource {
+	return nil
+}
+
+func (cellNilFuncDP) Start(context.Context) error { return nil }
+func (cellNilFuncDP) Close() error                { return nil }
+func (cellNilFuncDP) Teardown() error             { return nil }
+func (cellNilFuncDP) ApplyConfig(context.Context, *config.Config) (*dataplane.ApplyResult, error) {
+	return nil, nil
+}
+func (cellNilFuncDP) LastApplyResult() *dataplane.ApplyResult { return nil }
+func (cellNilFuncDP) Link() dataplane.LinkController          { return nil }
+func (cellNilFuncDP) HA() dataplane.HAController              { return nil }
+func (cellNilFuncDP) Sessions() dataplane.SessionStore        { return nil }
+func (cellNilFuncDP) Telemetry() dataplane.Telemetry          { return nil }
+func (cellNilFuncDP) SessionDeltas() dpruntime.SessionDeltaSource {
+	return nil
+}
+
+// failingStartUserspaceDP is the bootstrap-exit arm-failure fake: Start
+// invokes the optional barrier hook and then fails; the CachedStatus probe
+// keeps it on the userspace adapter path so the forwarding-status sampler
+// exercises the full read chain against it.
+type failingStartUserspaceDP struct {
+	runtimeOnlyApplyTestDP
+	onStart func()
+}
+
+func (f *failingStartUserspaceDP) Start(context.Context) error {
+	if f.onStart != nil {
+		f.onStart()
+	}
+	return errors.New("synthetic arm failure (#2114 test)")
+}
+
+func (f *failingStartUserspaceDP) CachedStatus() (dpuserspace.ProcessStatus, bool) {
+	return dpuserspace.ProcessStatus{}, false
+}
+
+// churnDataplaneCellReaders launches the §5.4 reader shapes against the
+// cell until stop closes: the narrowed forwarding-status adapter
+// CachedStatus probe, applyResult(), a PolicySchedulerActiveStateFn-shape
+// probe, the NAT pool sampler closure, and a watchdog-shape per-tick load
+// (one load per tick, shared across a small RG loop).
+func churnDataplaneCellReaders(d *Daemon, stop <-chan struct{}) {
+	var wg sync.WaitGroup
+	adapter := d.forwardingStatusDataplane()
+	sampler := d.natPoolAlarmSampler()
+	shapes := []func(){
+		func() {
+			if adapter != nil {
+				_, _ = adapter.CachedStatus()
+			}
+		},
+		func() { _ = d.applyResult() },
+		func() {
+			rt := d.dataplane()
+			if rt == nil {
+				return
+			}
+			if p, ok := rt.(interface {
+				PolicySchedulerActiveState() map[string]bool
+			}); ok {
+				_ = p.PolicySchedulerActiveState()
+			}
+		},
+		func() { _ = sampler() },
+		func() {
+			// watchdog shape: one load per tick shared across the RG loop
+			rt := d.dataplane()
+			if rt == nil {
+				return
+			}
+			for _, rg := range []int{0, 1} {
+				_ = rt.HA().SetRGActive(context.Background(), rg, true)
+			}
+		},
+	}
+	for _, shape := range shapes {
+		wg.Add(1)
+		go func(fn func()) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					fn()
+				}
+			}
+		}(shape)
+	}
+	wg.Wait()
+}
+
+// ---------------------------------------------------------------------------
+// The tests.
+// ---------------------------------------------------------------------------
+
+// TestDataplaneCell_ConcurrentReadersVsWriter hammers the accessor-routed
+// readers while a writer alternates setDataplane(nil)/setDataplane(fake).
+// Revert-guard: on the plain interface field this is the RACE-2 schedule
+// and the detector fires.
+func TestDataplaneCell_ConcurrentReadersVsWriter(t *testing.T) {
+	d := &Daemon{}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() { churnDataplaneCellReaders(d, stop); close(done) }()
+
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		d.setDataplane(nil)
+		d.setDataplane(&runtimeOnlyApplyTestDP{})
+	}
+	close(stop)
+	<-done
+}
+
+// TestDataplaneCell_TypedNilAndValueShapes is the kind-gated guard matrix:
+// a typed-nil of EVERY nillable kind Stores as nil; a value-type
+// implementation Stores normally (no panic, non-nil read back).
+func TestDataplaneCell_TypedNilAndValueShapes(t *testing.T) {
+	var nilPtr *cellValueDP
+	var nilSlice cellNilSliceDP
+	var nilMap cellNilMapDP
+	var nilChan cellNilChanDP
+	var nilFunc cellNilFuncDP
+
+	cases := []struct {
+		name  string
+		value dataplane.RuntimeDataPlane
+		wantN bool // want d.dataplane() == nil after the Store
+	}{
+		{"typed-nil pointer", nilPtr, true},
+		{"typed-nil named slice", nilSlice, true},
+		{"typed-nil named map", nilMap, true},
+		{"typed-nil named chan", nilChan, true},
+		{"typed-nil named func", nilFunc, true},
+		{"value type stores normally", cellValueDP{}, false},
+		{"pointer value stores normally", &cellValueDP{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &Daemon{}
+			d.setDataplane(tc.value)
+			if got := d.dataplane(); (got == nil) != tc.wantN {
+				t.Fatalf("dataplane() nil=%v, want nil=%v", got == nil, tc.wantN)
+			}
+		})
+	}
+}
+
+// TestForwardingStatusAdapter_BackendTypeTransitions proves per-call
+// capability adaptation across the three backend shapes (plan §9): a
+// readyProbeOnly fake (no CachedStatus — adapter reports ok=false) → a
+// userspace fake (ok=true, injected status) → nil (ok=false). The pre-#2114
+// construction-time wrapper selection could not express the middle leg: a
+// base wrapper permanently lacked CachedStatus and a nil-at-construction
+// accessor never gained it.
+func TestForwardingStatusAdapter_BackendTypeTransitions(t *testing.T) {
+	d := &Daemon{}
+	d.setDataplane(&forwardingStatusDaemonTestDP{}) // no CachedStatus probe
+
+	provider := d.forwardingStatusDataplane()
+	if provider == nil {
+		t.Fatal("forwardingStatusDataplane() returned nil")
+	}
+	if _, ok := provider.CachedStatus(); ok {
+		t.Fatal("CachedStatus() ok=true for a readyProbeOnly backend, want false")
+	}
+
+	d.setDataplane(&forwardingStatusDaemonUserspaceTestDP{
+		forwardingStatusDaemonTestDP: &forwardingStatusDaemonTestDP{},
+		status: dpuserspace.ProcessStatus{
+			WorkerRuntime: []dpuserspace.WorkerRuntimeStatus{{ThreadCPUNS: 42, WallNS: 84}},
+		},
+		cachedStatusOK: true,
+	})
+	st, ok := provider.CachedStatus()
+	if !ok || len(st.WorkerRuntime) != 1 || st.WorkerRuntime[0].ThreadCPUNS != 42 {
+		t.Fatalf("CachedStatus() after userspace swap = %+v, ok=%v; want the injected status", st, ok)
+	}
+
+	d.setDataplane(nil)
+	if _, ok := provider.CachedStatus(); ok {
+		t.Fatal("CachedStatus() ok=true after teardown, want false")
+	}
+}
+
+// TestBootstrapExit_ArmFailureWithConcurrentReaders drives the REAL
+// bootstrap-exit writer (armBootstrapExitDataplane) with a failing-Start
+// fake while the reader shapes churn: -race clean, the cell cleared, and
+// the NAT pool monitor NOT started.
+func TestBootstrapExit_ArmFailureWithConcurrentReaders(t *testing.T) {
+	d := &Daemon{}
+	d.applyBodyForTest = func(_ *config.Config) {}
+	d.natPoolAlarmTestTick = time.Millisecond
+	d.bootstrapMode.Store(false) // exitBootstrapMode already flipped it in production
+	d.setDataplane(&failingStartUserspaceDP{})
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() { churnDataplaneCellReaders(d, stop); close(done) }()
+
+	d.armBootstrapExitDataplane(0)
+
+	close(stop)
+	<-done
+	if d.dataplane() != nil {
+		t.Fatal("cell must be cleared after the arm failure")
+	}
+	if d.natPoolAlarm.Load() != nil {
+		t.Fatal("monitor must NOT start on a failed arm")
+	}
+}
+
+// blockingProcReader is the reader-side barrier of the two-sided
+// RealSamplerOverlap gate: ReadSelfStat (which Sampler.sample calls BEFORE
+// touching the adapter) signals readerEntered and blocks on the shared
+// release, so the adapter's dataplane load and the writer's store proceed
+// with NO happens-before edge between them.
+type blockingProcReader struct {
+	fwdstatus.ProcReader
+	mu           sync.Mutex
+	entries      int
+	readerEntered chan struct{}
+	release       chan struct{}
+	once          sync.Once
+}
+
+func (b *blockingProcReader) ReadSelfStat() (fwdstatus.ProcSelfStat, error) {
+	b.mu.Lock()
+	b.entries++
+	b.mu.Unlock()
+	b.once.Do(func() {
+		close(b.readerEntered)
+		<-b.release
+	})
+	return fwdstatus.ProcSelfStat{UtimeTicks: 10, StimeTicks: 5, StartTimeTicks: 1000}, nil
+}
+
+func (b *blockingProcReader) entryCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.entries
+}
+
+// TestBootstrapExit_RealSamplerOverlap is the deterministic sampler-vs-
+// bootstrap-exit-writer overlap (plan §9, r2 M2 / r3 B1): the gate sits
+// BEFORE the dataplane access on BOTH sides with NO channel between the
+// conflicting accesses — the fake ProcReader blocks the reader before its
+// adapter load; the failing fake's Start blocks the writer before its
+// store; both release together. On the plain field the detector fires
+// (only the absence of an HB edge is required); on the cell it is clean.
+func TestBootstrapExit_RealSamplerOverlap(t *testing.T) {
+	d := &Daemon{}
+	d.applyBodyForTest = func(_ *config.Config) {}
+	d.bootstrapMode.Store(false)
+	d.setDataplane(&failingStartUserspaceDP{})
+
+	readerEntered := make(chan struct{})
+	writerEntered := make(chan struct{})
+	release := make(chan struct{})
+
+	proc := &blockingProcReader{
+		ProcReader:    fwdstatus.OSProcReader{},
+		readerEntered: readerEntered,
+		release:       release,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	sampler := fwdstatus.NewSampler(d.forwardingStatusDataplane(), proc)
+	// Start MUST run on its own goroutine: its prime sample is synchronous.
+	go sampler.Start(ctx)
+
+	// Writer side: the failing fake's Start signals and blocks on the SAME
+	// release before returning its error (the setDataplane(nil) store
+	// happens after Start returns in armBootstrapExitDataplane).
+	fake := &failingStartUserspaceDP{onStart: func() {
+		close(writerEntered)
+		<-release
+	}}
+	d.setDataplane(fake)
+
+	writerDone := make(chan struct{})
+	go func() { d.armBootstrapExitDataplane(0); close(writerDone) }()
+
+	// Wait for BOTH sides to be parked, then release: the adapter's load
+	// and the writer's store proceed with no HB edge.
+	<-readerEntered
+	<-writerEntered
+	close(release)
+
+	<-writerDone
+	if d.dataplane() != nil {
+		t.Fatal("cell must be cleared after the arm failure")
+	}
+
+	// Teardown: the sampler loop exposes no join handle — cancel and then
+	// require SUSTAINED quiescence: ReadSelfStat entries must stay stable
+	// for >= 2x SampleInterval (bounded by the overall timeout so this
+	// cannot hang).
+	cancel()
+	deadline := time.Now().Add(10 * time.Second)
+	last := proc.entryCount()
+	stableSince := time.Now()
+	for time.Now().Before(deadline) {
+		time.Sleep(200 * time.Millisecond)
+		now := proc.entryCount()
+		if now != last {
+			last = now
+			stableSince = time.Now()
+			continue
+		}
+		if time.Since(stableSince) >= 2500*time.Millisecond {
+			return
+		}
+	}
+	t.Fatal("sampler did not quiesce after cancel")
+}
+
+// TestDataplaneCell_RollbackRearmRecurrence drives the full recurrence
+// with REAL helpers (plan §9): successful arm → monitor starts →
+// enterBootstrapMode (monitor discarded, dataplane torn down) → re-exit
+// with a failing Start → cell nil, no monitor, -race clean with
+// watchdog-shape readers churning throughout.
+func TestDataplaneCell_RollbackRearmRecurrence(t *testing.T) {
+	d := &Daemon{}
+	d.applyBodyForTest = func(_ *config.Config) {}
+	d.natPoolAlarmTestTick = time.Millisecond
+	d.bootstrapMode.Store(false)
+	d.setDataplane(&runtimeOnlyApplyTestDP{})
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() { churnDataplaneCellReaders(d, stop); close(done) }()
+
+	// Successful arm: monitor starts.
+	d.armBootstrapExitDataplane(0)
+	if d.dataplane() == nil {
+		t.Fatal("cell must hold the dataplane after a successful arm")
+	}
+	if d.natPoolAlarm.Load() == nil {
+		t.Fatal("monitor must start on a successful arm")
+	}
+
+	// Roll back to bootstrap: the monitor is discarded, the dataplane
+	// object is torn down but the cell still holds it (retained for
+	// re-arm).
+	if err := d.enterBootstrapMode(); err != nil {
+		t.Fatalf("enterBootstrapMode: %v", err)
+	}
+	if d.natPoolAlarm.Load() != nil {
+		t.Fatal("enterBootstrapMode must discard the monitor")
+	}
+
+	// Re-exit with a failing Start: the cell clears, no monitor.
+	d.setDataplane(&failingStartUserspaceDP{})
+	d.bootstrapMode.Store(false)
+	d.armBootstrapExitDataplane(0)
+
+	close(stop)
+	<-done
+	if d.dataplane() != nil {
+		t.Fatal("cell must be cleared after the re-arm failure")
+	}
+	if d.natPoolAlarm.Load() != nil {
+		t.Fatal("no monitor may survive the failed re-arm")
+	}
+}
+
+// TestDataplaneCell_ClusterStartPublication is the RACE-1 shape: a
+// watcher-chain reader loop (the daemon_ha.go handler pattern — one load
+// per event, SetRGActive through the HA domain) racing the boot
+// setDataplane(dp) publication. Every load observes nil or the full slot;
+// never a torn interface (the detector fires on a plain-field revert).
+func TestDataplaneCell_ClusterStartPublication(t *testing.T) {
+	d := &Daemon{}
+	stop := make(chan struct{})
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				rt := d.dataplane()
+				if rt == nil {
+					continue
+				}
+				// The watcher handler chain shape: HA() + SetRGActive.
+				_ = rt.HA().SetRGActive(context.Background(), 0, true)
+			}
+		}
+	}()
+
+	time.Sleep(2 * time.Millisecond) // let the reader spin on the nil cell first
+	d.setDataplane(&runtimeOnlyApplyTestDP{})
+	time.Sleep(2 * time.Millisecond)
+	close(stop)
+	<-readerDone
+	if d.dataplane() == nil {
+		t.Fatal("publication lost")
+	}
+}
+
+// TestDataplaneCell_ConfirmTimerStoreVsApplyReader is the RACE-3 pure-cell
+// leg (plan §9, r68 Codex m1 — no G/H/H2 dependency): a two-sided gate
+// with the publication gated immediately before the Store and an
+// applySem-holding reader gated immediately before its dataplane() load,
+// sharing one release — no channel between the pair.
+func TestDataplaneCell_ConfirmTimerStoreVsApplyReader(t *testing.T) {
+	d := &Daemon{applySem: semaphore.NewWeighted(1)}
+	// The recovered confirm-timer executor's rollback apply holds applySem
+	// while reading the dataplane; take it here so the reader goroutine
+	// below runs inside the same critical-section discipline.
+	if err := d.applySem.Acquire(context.Background(), 1); err != nil {
+		t.Fatalf("applySem acquire: %v", err)
+	}
+
+	writerReady := make(chan struct{})
+	readerReady := make(chan struct{})
+	release := make(chan struct{})
+
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		fake := &runtimeOnlyApplyTestDP{}
+		close(writerReady)
+		<-release
+		d.setDataplane(fake)
+	}()
+
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		// The recovered confirm-timer executor's rollback apply holds
+		// applySem while reading the dataplane (bootstrap.go teardown).
+		close(readerReady)
+		<-release
+		rt := d.dataplane()
+		if rt != nil {
+			_ = rt.Teardown()
+		}
+	}()
+
+	<-writerReady
+	<-readerReady
+	close(release)
+	<-writerDone
+	<-readerDone
+	d.applySem.Release(1)
+
+	if d.dataplane() == nil {
+		t.Fatal("publication lost")
+	}
+}
