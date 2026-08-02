@@ -80,12 +80,20 @@ const ClassRootDefault = "super-user"
 //     resolver: uid 0 with ReasonAmbiguousUID and `user root class read-only`
 //     configured returns read-only.
 //
-//     Two earlier revisions of this list were wrong about this in opposite
-//     directions — first that an explicit class wins "for any uid including 0"
-//     (#6706 MINOR-5), then that it "cannot win when the caller has no name"
-//     (#6706 review r5 F7). The accurate statement is narrower than both: an
-//     explicit class cannot win when the caller has no name AND the stanza is
-//     written for an ALIAS other than `root`.
+//     Three earlier revisions of this list were wrong about this — first that
+//     an explicit class wins "for any uid including 0" (#6706 MINOR-5), then
+//     that it "cannot win when the caller has no name" (#6706 review r5 F7),
+//     then a correct SUFFICIENT condition ("...and the stanza is written for an
+//     ALIAS other than `root`") presented as if it characterised the rule
+//     (#6706 review r7 F6). The CHARACTERIZATION: an explicit class cannot win
+//     when the caller has no name, UNLESS the caller is uid 0 and the stanza is
+//     written for the literal name `root`. candidateNames below is where that
+//     reduces to two lines — it returns an EMPTY slice when the caller is
+//     neither resolved nor uid 0, so for an unnamed non-root caller no stanza
+//     of any name wins, `root` included; and it injects the literal "root" for
+//     uid 0, which is the sole exception. The unnamed non-root case fails
+//     closed (ClassUnidentified), and TestRootAliasClassMatrix_6706 now drives
+//     it rather than leaving it to this sentence.
 //
 //     `system login user toor class read-only` on an unnamed uid 0 is not
 //     applied: configuredClass matches nothing and decision 2 hands back

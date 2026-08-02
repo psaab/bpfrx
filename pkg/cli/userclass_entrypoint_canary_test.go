@@ -23,49 +23,68 @@ import (
 // from `$USER`, from a gRPC-supplied name, or from a "default to super-user"
 // convenience — would reopen the hole without touching any of the code the
 // other tests cover.
+//
+// That premise — "SetUserClass is the ONE write" — is itself now CHECKED, by
+// allowedClassFieldWriters below, rather than asserted here and taken on trust.
+// It was true but unbound: both canaries key on the SELECTOR name, `userClass`
+// is package-private, and pkg/cli is exactly where the command handlers live,
+// so `func (c *CLI) zzPromote() { c.userClass = "super-user" }` in this package
+// gave build rc 0, vet rc 0 and every canary plus the whole pkg/cli and
+// pkg/daemon suites green (#6706 review r7 F3, reproduced firsthand).
 var allowedSetUserClassCallers = map[string]string{
 	"daemon::applyCLILoginClass": "the single #6701 resolution site (cli.ResolveLoginClass + osident.Current)",
 }
 
-// TestSetUserClassHasOneProductionCaller_6701 enumerates every production call
-// to SetUserClass across pkg/ and cmd/ and requires each to be allowlisted.
+// classFieldName is the private CLI field that HOLDS the RBAC class.
+// SetUserClass writes it; permissions.go reads it. Reads are not writes and are
+// not flagged.
+const classFieldName = "userClass"
+
+// allowedClassFieldWriters is the allowlist of production functions permitted
+// to write `<x>.userClass` DIRECTLY, keyed like allowedSetUserClassCallers.
 //
-// FAIL-ON-REVERT: add a `shell.SetUserClass("super-user")` anywhere else — the
-// exact shape of the #6701 defect — and this test names the file and line and
+// It is the check behind the sentence above. Exactly one entry is correct: the
+// setter itself. Anything else in pkg/cli can reach the field without touching
+// SetUserClass at all, which is #6701 reached by a route the selector-name
+// canaries cannot see.
+var allowedClassFieldWriters = map[string]string{
+	"cli::CLI.SetUserClass": "the setter itself (pkg/cli/cli.go) — the one write to the field",
+}
+
+// TestSetUserClassHasOneProductionCaller_6701 enumerates every production call
+// to SetUserClass across the repository — AND every direct write to the field
+// it sets — and requires each to be allowlisted.
+//
+// The two halves answer two different questions. The SetUserClass half bounds
+// who may invoke the setter. The field half bounds the premise that invoking
+// the setter is the only way the class changes; without it, the whole
+// selector-keyed apparatus is bypassable from inside pkg/cli by one assignment
+// (#6706 review r7 F3).
+//
+// FAIL-ON-REVERT: add a `shell.SetUserClass("super-user")` anywhere else, or a
+// `c.userClass = "super-user"` outside the setter — the exact shape of the
+// #6701 defect, by either route — and this test names the file and line and
 // goes RED.
 //
-// Method note: the check is on the SELECTOR name, so it catches the call
+// Method note: both halves check on the SELECTOR name, so they catch the write
 // regardless of the receiver variable's name or type inference. A same-named
-// method on an unrelated type would be a false positive; there is none today,
-// and a false positive here is a prompt to think rather than a silent pass.
+// method or field on an unrelated type would be a false positive; there is none
+// today, and a false positive here is a prompt to think rather than a silent
+// pass.
 func TestSetUserClassHasOneProductionCaller_6701(t *testing.T) {
 	type call struct{ key, pos string }
-	var unexpected []call
+	var unexpected, unexpectedField []call
 	seen := map[string]bool{}
+	seenField := map[string]bool{}
 	scanned := map[string]bool{}
 	var filesScanned int
 
 	for _, root := range productionRoots(t) {
-		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, werr error) error {
-			if werr != nil {
-				return werr
-			}
-			if d.IsDir() {
-				if path != root && (skipCanaryDir(d.Name()) || isNestedModuleRoot(path)) {
-					return fs.SkipDir
-				}
-				return nil
-			}
-			if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-				return nil
-			}
-			if !compiledByGoBuild(path) {
-				return nil
-			}
+		err := walkCanaryFiles(root, func(path string) {
 			fset := token.NewFileSet()
 			f, perr := parser.ParseFile(fset, path, nil, 0)
 			if perr != nil {
-				return nil
+				return
 			}
 			filesScanned++
 			scanned[relKeyFor(root, path)] = true
@@ -76,7 +95,12 @@ func TestSetUserClassHasOneProductionCaller_6701(t *testing.T) {
 					unexpected = append(unexpected, call{key: ref.key, pos: ref.pos})
 				}
 			}
-			return nil
+			for _, ref := range classFieldWrites(fset, f, pkgRelKeyFor(path)) {
+				seenField[ref.key] = true
+				if _, allowed := allowedClassFieldWriters[ref.key]; !allowed {
+					unexpectedField = append(unexpectedField, call{key: ref.key, pos: ref.pos})
+				}
+			}
 		})
 		if err != nil {
 			t.Fatalf("walk %s: %v", root, err)
@@ -89,18 +113,29 @@ func TestSetUserClassHasOneProductionCaller_6701(t *testing.T) {
 			"go through cli.ResolveLoginClass so the fail-closed default cannot be bypassed (#6701)",
 			c.key, c.pos)
 	}
+	for _, c := range unexpectedField {
+		t.Errorf("%s (%s) writes the %s field directly — the RBAC class must change only through "+
+			"SetUserClass, or every guard keyed on that selector is bypassable from inside "+
+			"pkg/cli (#6701)", c.key, c.pos, classFieldName)
+	}
 
-	// The allowlist must not rot into a list of functions that no longer exist:
+	// The allowlists must not rot into lists of functions that no longer exist:
 	// a stale entry would silently permit a future function of the same name.
 	var stale []string
 	for key := range allowedSetUserClassCallers {
 		if !seen[key] {
-			stale = append(stale, key)
+			stale = append(stale, key+" (SetUserClass caller)")
+		}
+	}
+	for key := range allowedClassFieldWriters {
+		if !seenField[key] {
+			stale = append(stale, key+" ("+classFieldName+" writer)")
 		}
 	}
 	sort.Strings(stale)
 	for _, key := range stale {
-		t.Errorf("allowlisted SetUserClass caller %q makes no such call — remove the stale entry", key)
+		t.Errorf("allowlisted %s makes no such write — remove the stale entry, or the walk that "+
+			"was supposed to see it is not reaching the source", key)
 	}
 }
 
@@ -162,6 +197,142 @@ func setUserClassRefs(fset *token.FileSet, f *ast.File, pkgRel string) []classRe
 		})
 	}
 	return out
+}
+
+// classFieldWrites is THE field-write predicate: every production WRITE to
+// `<x>.userClass` in f, keyed by the enclosing top-level declaration exactly as
+// setUserClassRefs keys its results. Both the repository walk and the synthetic
+// control below call it, so breaking it reds the control rather than leaving it
+// proving something about a copy.
+//
+// WHAT COUNTS AS A WRITE, and why each form is here rather than only the
+// obvious one:
+//
+//   - `c.userClass = x` — assignment, including `:=` and the multi-value forms;
+//     every LHS element is checked, so `a, c.userClass = 1, "super-user"` is
+//     caught.
+//   - `&c.userClass` — taking the address hands the field to code this file
+//     cannot follow, which is the same escape analyzeFuncClassWrite already
+//     treats a method VALUE of SetUserClass as.
+//   - `CLI{userClass: "super-user"}` — a composite literal constructs the field
+//     without ever assigning to it.
+//   - `for c.userClass = range xs` — legal Go, and an assignment the AssignStmt
+//     arm does not see because RangeStmt carries its own Key/Value.
+//
+// READS ARE NOT WRITES. permissions.go reads c.userClass in both of its
+// permission gates (:44,51,53 and :94,97) and must not be flagged, which is why
+// this keys on assignment POSITION rather than on the selector appearing at
+// all — the difference between this and setUserClassRefs, where a bare
+// reference IS the violation because a method value defers the write out of
+// sight.
+func classFieldWrites(fset *token.FileSet, f *ast.File, pkgRel string) []classRef {
+	var out []classRef
+	for _, decl := range f.Decls {
+		key := pkgRel + "::" + packageLevelKey
+		if fn, ok := decl.(*ast.FuncDecl); ok {
+			key = funcKeyFor(pkgRel, fn)
+		}
+		record := func(n ast.Node) {
+			out = append(out, classRef{key: key, pos: fset.Position(n.Pos()).String()})
+		}
+		ast.Inspect(decl, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.AssignStmt:
+				for _, lhs := range node.Lhs {
+					if isClassFieldSelector(lhs) {
+						record(lhs)
+					}
+				}
+			case *ast.RangeStmt:
+				for _, lhs := range []ast.Expr{node.Key, node.Value} {
+					if lhs != nil && isClassFieldSelector(lhs) {
+						record(lhs)
+					}
+				}
+			case *ast.UnaryExpr:
+				if node.Op == token.AND && isClassFieldSelector(node.X) {
+					record(node)
+				}
+			case *ast.KeyValueExpr:
+				if id, ok := node.Key.(*ast.Ident); ok && id.Name == classFieldName {
+					record(node)
+				}
+			}
+			return true
+		})
+	}
+	return out
+}
+
+// isClassFieldSelector reports whether expr is a `<x>.userClass` selector.
+func isClassFieldSelector(expr ast.Expr) bool {
+	sel, ok := expr.(*ast.SelectorExpr)
+	return ok && sel.Sel.Name == classFieldName
+}
+
+// TestClassFieldWriteCanaryDetectsEveryWriteForm_6706 proves classFieldWrites
+// is not vacuous and, more to the point, that it discriminates WRITES from
+// READS — a predicate that flagged every mention would red on permissions.go
+// and be deleted within a week, and one that flagged only `=` would miss three
+// forms that reach the field just as well.
+//
+// It runs the REAL predicate, not a copy.
+func TestClassFieldWriteCanaryDetectsEveryWriteForm_6706(t *testing.T) {
+	const src = `package cli
+
+func (c *CLI) plainAssign() { c.userClass = "super-user" }
+
+func (c *CLI) tupleAssign(n int) { n, c.userClass = 1, "super-user" }
+
+func (c *CLI) addressOf() *string { return &c.userClass }
+
+func (c *CLI) composite() *CLI { return &CLI{userClass: "super-user"} }
+
+func (c *CLI) viaRange(xs []string) {
+	for c.userClass = range xs {
+	}
+}
+
+func (c *CLI) readsOnly() bool { return c.userClass == "" || c.userClass == "super-user" }
+
+func (c *CLI) unrelatedWrite() { c.version = "x" }
+
+var packageLevelSetter = func(c *CLI) { c.userClass = "super-user" }
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "synthetic.go", src, 0)
+	if err != nil {
+		t.Fatalf("parse synthetic: %v", err)
+	}
+	got := map[string]int{}
+	for _, ref := range classFieldWrites(fset, f, "cli") {
+		got[ref.key]++
+	}
+	want := map[string]int{
+		"cli::CLI.plainAssign":    1,
+		"cli::CLI.tupleAssign":    1,
+		"cli::CLI.addressOf":      1,
+		"cli::CLI.composite":      1,
+		"cli::CLI.viaRange":       1,
+		"cli::" + packageLevelKey: 1,
+	}
+	for key, n := range want {
+		if got[key] != n {
+			t.Errorf("classFieldWrites found %d writes in %s, want %d — that write form reaches "+
+				"the RBAC class without going through SetUserClass and must not be invisible",
+				got[key], key, n)
+		}
+	}
+	for _, mustNotWrite := range []string{"cli::CLI.readsOnly", "cli::CLI.unrelatedWrite"} {
+		if got[mustNotWrite] != 0 {
+			t.Errorf("classFieldWrites flagged %s (%d times) — reads and unrelated fields are not "+
+				"class writes, and a predicate that says they are gets deleted rather than fixed",
+				mustNotWrite, got[mustNotWrite])
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("classFieldWrites attributed writes to %v, want exactly %d keys", got, len(want))
+	}
 }
 
 // classWrite is the per-function result of analyzeClassWrites.
@@ -345,33 +516,17 @@ func TestSetUserClassCallersResolveThroughTheSharedResolver_6701(t *testing.T) {
 	var filesScanned int
 
 	for _, root := range productionRoots(t) {
-		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, werr error) error {
-			if werr != nil {
-				return werr
-			}
-			if d.IsDir() {
-				if path != root && (skipCanaryDir(d.Name()) || isNestedModuleRoot(path)) {
-					return fs.SkipDir
-				}
-				return nil
-			}
-			if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-				return nil
-			}
-			if !compiledByGoBuild(path) {
-				return nil
-			}
+		err := walkCanaryFiles(root, func(path string) {
 			fset := token.NewFileSet()
 			f, perr := parser.ParseFile(fset, path, nil, 0)
 			if perr != nil {
-				return nil
+				return
 			}
 			filesScanned++
 			scanned[relKeyFor(root, path)] = true
 			for key, cw := range analyzeClassWrites(fset, f, pkgRelKeyFor(path)) {
 				writers[key] = cw
 			}
-			return nil
 		})
 		if err != nil {
 			t.Fatalf("walk %s: %v", root, err)
@@ -663,35 +818,88 @@ func isNestedModuleRoot(path string) bool {
 	return err == nil && !info.IsDir()
 }
 
-// skipCanaryDir reports directories the canary walks must not descend into.
-//
-// It is EXACTLY cmd/go's own directory rule, and the equality is the point.
-// modload/search.go excludes `.`-prefixed, `_`-prefixed and `testdata`
-// subdirectories and prunes `vendor` separately; it has no other name-based
-// rule, in particular NO `node_modules` rule. Skipping node_modules made a
-// package `go build ./...` genuinely compiles invisible to all three #6701
-// canaries — demonstrated at the previous head with a file carrying both defect
-// shapes, `go list ./...` naming the package and every canary green (#6706
-// review r5 F1). Excluding the `_`/`.` trees is the other direction and is
-// correct: scanning them produces a red `go build ./...` and `go vet ./...`
-// disagree with (#6706 MINOR-7, reproduced with an `_scratch/` directory).
-func skipCanaryDir(name string) bool {
-	if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") {
+// walkCanaryFiles is THE traversal rule shared by every #6701 structural
+// canary. VERBATIM COPY of pkg/osident's, which is where its reasoning and its
+// fixture-tree proof live (TestCanaryWalkRuleMatchesTheToolchain_6706); the two
+// packages cannot import each other's test code, and
+// TestCanaryTraversalHelpersMatchTheOsidentCopy_6706 below reds if the bodies
+// drift apart.
+func walkCanaryFiles(root string, visit func(path string)) error {
+	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if skipCanaryDir(root, path) {
+				return fs.SkipDir
+			}
+			// Skip NESTED GO MODULES — a directory below the root carrying its
+			// own go.mod FILE. See isNestedModuleRoot for why the
+			// file-vs-directory distinction is load-bearing rather than
+			// pedantic.
+			if path != root && isNestedModuleRoot(path) {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		if !compiledByGoBuild(path) {
+			return nil
+		}
+		visit(path)
+		return nil
+	})
+}
+
+// skipCanaryDir reports directories the canary walks must not descend into,
+// modelling cmd/go's own directory rule INCLUDING the part of it that is
+// two-phase: `.`/`_`-prefixed and `testdata` directories are skipped before
+// they become packages, while a `vendor` directory IS a package and only its
+// SUBTREE is pruned (modload/search.go:139-152). VERBATIM COPY of pkg/osident's
+// — see it for both escapes this rule has had (an invented `node_modules` skip,
+// #6706 review r5 F1; a `vendor` skip that took the directory's own files with
+// it, r7 F2).
+func skipCanaryDir(root, path string) bool {
+	if path == root {
+		return false
+	}
+	name := filepath.Base(path)
+	if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") || name == "testdata" {
 		return true
 	}
-	return name == "vendor" || name == "testdata"
+	parent := filepath.Dir(path)
+	return parent != root && filepath.Base(parent) == "vendor"
 }
+
+// canaryBuildCtxs are the build contexts a file is offered to; it is scanned if
+// EITHER compiles it. VERBATIM COPY of pkg/osident's — see it for why
+// build.Default alone answers for the developer's machine rather than for the
+// appliance the Makefile builds with CGO_ENABLED=0 (#6706 review r7 F1), why
+// the union is preferred to pinning CgoEnabled=false, and which axes remain
+// uncovered.
+var canaryBuildCtxs = func() [2]build.Context {
+	shipped, devel := build.Default, build.Default
+	shipped.CgoEnabled = false // Makefile builds xpfd and cli with CGO_ENABLED=0
+	devel.CgoEnabled = true
+	return [2]build.Context{shipped, devel}
+}()
 
 // compiledByGoBuild reports whether the toolchain would compile path into the
 // package in its directory, asking go/build ITSELF rather than restating its
-// rule. Mirrors pkg/osident's copy — see it for why the `.go` suffix test alone
-// was not the `./...` rule (#6706 review r5 F2) and for the build-context limit.
+// rule, under either of canaryBuildCtxs. VERBATIM COPY of pkg/osident's — see
+// it for why the `.go` suffix test alone was not the `./...` rule (#6706 review
+// r5 F2).
 func compiledByGoBuild(path string) bool {
-	ok, err := build.Default.MatchFile(filepath.Dir(path), filepath.Base(path))
-	if err != nil {
-		return true
+	dir, name := filepath.Dir(path), filepath.Base(path)
+	for _, ctxt := range canaryBuildCtxs {
+		ok, err := ctxt.MatchFile(dir, name)
+		if err != nil || ok {
+			return true
+		}
 	}
-	return ok
+	return false
 }
 
 // relKeyFor renders a walked path relative to root with forward slashes.

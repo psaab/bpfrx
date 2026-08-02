@@ -74345,3 +74345,105 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/osident/user_env_canary_test.go,
   pkg/cli/userclass_entrypoint_canary_test.go, pkg/cli/identity.go,
   pkg/cli/identity_6701_test.go, _Log.md
+
+## 2026-08-01 — #6706 fold r7: the guard asked the wrong build; make the traversal rule provable
+
+- **Timestamp**: 2026-08-01
+- **Action**: Fold all six findings from the r7 hostile re-gate on PR #6706
+  (`22adac5bd`). Every one was a guard whose stated scope was wider than what it
+  checked; **two of the six were introduced by the r6 round that fixed the first
+  batch**, which is why this round replaces the "read the code and believe the
+  comment" pattern with predicates that are proven against the toolchain and
+  against each other. All six confirmed firsthand before being fixed; no runtime
+  defect this round.
+- **F1 (MAJOR).** `compiledByGoBuild` called `build.Default.MatchFile`, and
+  `build.Default.CgoEnabled` is the AMBIENT `CGO_ENABLED` of the `go test`
+  process — 1 on any machine with a C compiler. The Makefile builds `xpfd`
+  (:37) and `cli` (:41) with `CGO_ENABLED=0`. Reproduced by planting
+  `pkg/daemon/zz_nocgo_probe.go` (`//go:build !cgo`) with BOTH defect shapes:
+  `CGO_ENABLED=0 go list ./pkg/daemon` named it and the ambient one did not;
+  `go build ./...` and `go vet ./...` were **rc 0 under both settings**; the
+  three canaries were **rc 0 — GREEN** ambient and **rc 1 — RED** under
+  `CGO_ENABLED=0`. Two claims were false as written and are rewritten: the
+  "every non-test .go file the toolchain would compile" scope, and a KNOWN LIMIT
+  paragraph that justified the build-context limit with a `//go:build windows`
+  example — the GOOS axis, not the cgo axis where guard and appliance actually
+  differ. **Took the UNION, not the pin.** Pinning `CgoEnabled=false` fixes the
+  whole defect; the union does that AND covers `//go:build cgo` files, which
+  suits a canary whose remit is explicitly prospective, at a cost bounded by an
+  invariant the pin also satisfies — everything scanned is compiled by SOME
+  toolchain configuration on this GOOS/GOARCH, so it can never red on code no
+  `go build` compiles. Today it is a no-op: zero production files carry any
+  `//go:build` line.
+- **F2 (MINOR).** `skipCanaryDir` claimed to be "EXACTLY cmd/go's own directory
+  rule". Read `modload/search.go` (go1.26.4) firsthand: `.`/`_`/`testdata` set
+  `want = false` and SkipDir at :129-131 *before* the directory is added, but a
+  `vendor` directory is added as a package at :139-148 and only THEN has its
+  SUBTREE pruned at :150-152. Reproduced with `pkg/vendor/zzprobe.go`: `go list
+  ./...` reported `github.com/psaab/xpf/pkg/vendor`, build and vet rc 0, all
+  three canaries green. The rule is now expressed on the PATH — descend into a
+  `vendor` directory, skip every directory whose parent is one.
+- **F3 (MINOR).** The allowlist canary's premise, "SetUserClass is the ONE write
+  to the RBAC class", was checked by nothing: both canaries key on the SELECTOR
+  name and `userClass` is package-private to the package where the command
+  handlers live. Reproduced with `func (c *CLI) zzPromote() { c.userClass =
+  "super-user" }` — build rc 0, vet rc 0, all canaries plus the whole `pkg/cli`
+  and `pkg/daemon` suites GREEN. New `classFieldWrites` predicate + a
+  one-entry `allowedClassFieldWriters`; it catches assignment, tuple
+  assignment, `&c.userClass`, a composite-literal key, `for c.userClass = range`
+  and a package-level closure, and does NOT flag `permissions.go`'s five reads.
+- **F4 (MINOR).** `pkg/daemon/daemon_run.go:723` is the one production line that
+  decides whose identity the RBAC class is computed about, and it was bound by
+  nothing. Reproduced the review's decoy — `_ = osident.Current()` kept for the
+  adoption canary, with `osident.Identity{UID: 0, Name: "root"}` handed to
+  `applyCLILoginClass` — which is #6701 restored in full, and got build rc 0,
+  vet rc 0 and `go test ./pkg/cli/... ./pkg/osident/... ./pkg/daemon/...` rc 0.
+  New `pkg/daemon/cli_rbac_wiring_6706_test.go` requires exactly one call site
+  and a literal `osident.Current()` as its identity argument.
+- **F5 (NIT).** The memory bound is NOT "the position of the sixth colon" (r6's
+  claim, and the r6 commit message's). Measured against `readPasswdRow`: an
+  8 MiB colon-free row retains all 8388608 bytes, the same row with five colons
+  retains all of it, and a row whose sixth colon is at byte 12 with an 8 MiB
+  shell field retains 4096. The bound is `min(row length, first read-chunk
+  boundary at or after the sixth colon)` — still exactly `os/user`'s, so the
+  parity claim is untouched.
+- **F6 (NIT).** `identity.go`'s decision-1 scoping was a correct SUFFICIENT
+  condition presented as a characterization. `candidateNames` returns an EMPTY
+  slice when the caller is neither resolved nor uid 0, so an unnamed non-root
+  caller matches no stanza of ANY name. Rewritten as the characterization, and
+  `TestRootAliasClassMatrix_6706` now drives uid 1001 unnamed against `root`,
+  `""` and `alice` stanzas across all three unresolved Reasons.
+- **New guards, each mutation-proven.** `walkCanaryFiles` is now ONE traversal
+  shared by all three walks. `TestCanaryWalkRuleMatchesTheToolchain_6706` drives
+  it over a 17-entry fixture module and cross-checks the expectations against
+  `go list ./...` run under CGO_ENABLED=0 AND =1 — the oracle half is what makes
+  the first half non-circular, since three rounds of this PR shipped a rule that
+  disagreed with cmd/go while its comment claimed equality.
+  `TestCanaryTraversalHelpersMatchTheOsidentCopy_6706` requires the five
+  duplicated helpers to be byte-identical between `pkg/cli` and `pkg/osident`
+  (comparing decl source from `Pos()` to `End()`, which excludes the
+  legitimately-differing doc comments), which is what carries the osident-side
+  proof across to the pkg/cli copies.
+- **RED-then-GREEN, build and vet rc 0 in BOTH states, every mutation.** The
+  four planted escapes now red: `//go:build !cgo` probe (ambient run), `pkg/vendor`
+  package, `c.userClass =` write, call-site decoy. The evasion forms red too:
+  `&c.userClass`, `&CLI{userClass:}`, a package-level closure, a SECOND
+  `applyCLILoginClass` call site. The guard-guards red: reverting
+  `compiledByGoBuild` to `build.Default` reds the `zz_nocgo.go` fixture row;
+  reverting `skipCanaryDir` to `name == "vendor"` reds the `vendor/probe.go`
+  row; drifting ONE copy of `skipCanaryDir` reds the parity test by declaration
+  name; dropping `id.IsRoot()` from `candidateNames` (a real escalation — uid
+  1001 unnamed gets super-user) reds six of the new matrix subtests.
+- **Validation**: `go build ./...` rc 0, `go vet ./...` rc 0,
+  `go test -race -count=1 ./pkg/osident/... ./pkg/cli/... ./pkg/config/...
+  ./pkg/daemon/...` rc 0, full `go test ./...` rc 0. `gofmt -l` clean on every
+  touched file (11 pre-existing non-gofmt files under `pkg/daemon` are identical
+  at the base commit and were not touched). The known `#6709` `pkg/ddns` flake —
+  `newFakeDNSServer` binds UDP on `:0` then binds TCP on that same port number —
+  did not fire on these runs.
+- **File(s)**: pkg/osident/user_env_canary_test.go,
+  pkg/osident/canary_walk_rule_6706_test.go, pkg/osident/osident.go,
+  pkg/cli/userclass_entrypoint_canary_test.go,
+  pkg/cli/canary_helper_parity_6706_test.go, pkg/cli/identity.go,
+  pkg/cli/identity_6701_test.go, pkg/daemon/cli_rbac_wiring_6706_test.go,
+  _Log.md

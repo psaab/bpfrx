@@ -246,11 +246,27 @@ var passwdColon = []byte{':'}
 // "alice" (#6706 review r5 F6). Raising the cap only moves the cliff.
 //
 // os/user reads a row in CHUNKS instead: it accumulates only until the row has
-// the six colons a passwd entry needs, then discards the remainder, so no
-// single row can fail the lookup and the memory cost is bounded by the position
-// of the sixth colon rather than by the row's length. This does the same, which
+// the six colons a passwd entry needs, then discards the remainder, so a
+// pathological row costs at most that prefix and NO single row can fail the
+// lookup — the scan always continues to the next one. This does the same, which
 // is also what makes the package doc's parity claim true of the READER and not
 // merely of the row filters.
+//
+// WHAT THE MEMORY BOUND IS, precisely, because an earlier revision of this
+// comment (and the commit message that shipped it) said "bounded by the
+// position of the sixth colon" and that is not what the loop guarantees.
+// Accumulation stops at a bufio.Reader CHUNK boundary, and only once the
+// accumulated prefix ALREADY holds six colons; a row with fewer than six colons
+// never satisfies that test and is retained WHOLE. Measured directly against
+// this function: an 8 MiB colon-free row retains all 8388608 bytes, the same
+// row with five colons retains all of it, and a row whose sixth colon is at
+// byte 12 followed by an 8 MiB shell field retains 4096. So the bound is
+// min(row length, the first read-chunk boundary at or after the sixth colon).
+// That is EXACTLY the standard library's bound — lookup_unix.go:63 breaks on
+// the same `!isPrefix || bytes.Count(wholeLine, colon) >= readCols` — so the
+// parity claim is unaffected, and /etc/passwd is root-owned, so an
+// attacker-chosen row is not a reachable input. This is comment accuracy, not a
+// defect (#6706 review r7 F5).
 func readPasswdRow(rd *bufio.Reader) (row string, whole bool, err error) {
 	var acc []byte
 	isPrefix := true

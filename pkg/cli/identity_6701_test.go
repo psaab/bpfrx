@@ -592,6 +592,13 @@ func TestAmbiguousUIDFailsClosed_6706(t *testing.T) {
 //   - a stanza written for an ALIAS does not — and that holds for EVERY
 //     unresolved Reason, not for ReasonAmbiguousUID alone. Three reachable
 //     Reasons, not one.
+//   - an unnamed NON-ROOT caller matches no stanza AT ALL, `root` included,
+//     because candidateNames returns an empty slice for it. That is the half
+//     the r5 sentence's replacement still left uncovered — it read as a
+//     characterization while being only a sufficient condition, and only uid 0
+//     was driven here (#6706 review r7 F6). It fails closed, which is why it is
+//     a comment finding and not a defect; the point of asserting it is that the
+//     next revision of that paragraph has to agree with something executable.
 func TestRootAliasClassMatrix_6706(t *testing.T) {
 	unresolved := []struct {
 		name   string
@@ -627,6 +634,25 @@ func TestRootAliasClassMatrix_6706(t *testing.T) {
 					"must not go unreported here", reason)
 			}
 		})
+	}
+
+	// The half a uid-0-only matrix cannot see: an unnamed NON-root caller
+	// matches nothing, so an explicit class cannot win for it under ANY stanza
+	// name — including the literal "root", which candidateNames injects only for
+	// uid 0. Driving `root` and the empty name is the point: those are the two
+	// names a reader might expect to slip through.
+	for _, tc := range unresolved {
+		id := osident.Identity{UID: 1001, Reason: tc.reason}
+		for _, stanza := range []string{"root", "", "alice"} {
+			t.Run(tc.name+": uid 1001 unnamed matches no `"+stanza+"` stanza", func(t *testing.T) {
+				got, reason := ResolveLoginClass(loginCfg([2]string{stanza, ClassRootDefault}), id)
+				if got != ClassUnidentified {
+					t.Fatalf("class = %q, want %q — candidateNames returns an EMPTY slice for a "+
+						"caller that is neither resolved nor uid 0, so no stanza of any name may "+
+						"match it (reason: %s)", got, ClassUnidentified, reason)
+				}
+			})
+		}
 	}
 
 	// The contrast row: once the alias IS resolved, its stanza wins.

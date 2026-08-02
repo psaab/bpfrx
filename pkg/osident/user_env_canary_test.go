@@ -35,15 +35,18 @@ var identityEnvVars = map[string]bool{
 // sites (or add a fourth) and this test names the file, line and variable and
 // goes RED.
 //
-// Scope: every non-test .go file in the REPOSITORY that the toolchain would
-// compile, walked from the module root rather than from pkg/ + cmd/ (#6706
-// MINOR-4 — a future top-level production package, `internal/` or anything else
-// a layout change adds, was previously outside the walk and could read $USER
-// unobserved). The allowlist is EMPTY and is meant to stay that way —
-// pkg/osident.Current() is the one supported way to answer "who is running
-// this", and it reads the kernel credential. os.Getenv for anything that is not
-// an identity (XPF_*, PATH, TMPDIR, ...) is untouched: the check keys on the
-// argument literal.
+// Scope: every non-test .go file in the REPOSITORY that the toolchain compiles
+// for the host GOOS/GOARCH under EITHER cgo setting — the appliance's
+// `CGO_ENABLED=0` and a cgo-enabled developer build; see canaryBuildCtxs for
+// why one setting is not enough. Walked from the module root rather than from
+// pkg/ + cmd/ (#6706 MINOR-4 — a future top-level production package,
+// `internal/` or anything else a layout change adds, was previously outside the
+// walk and could read $USER unobserved).
+//
+// The allowlist is EMPTY and is meant to stay that way — pkg/osident.Current()
+// is the one supported way to answer "who is running this", and it reads the
+// kernel credential. os.Getenv for anything that is not an identity (XPF_*,
+// PATH, TMPDIR, ...) is untouched: the check keys on the argument literal.
 func TestNoIdentityFromEnvironment_6701(t *testing.T) {
 	repoRoot, absErr := filepath.Abs(filepath.Join("..", ".."))
 	if absErr != nil {
@@ -59,40 +62,17 @@ func TestNoIdentityFromEnvironment_6701(t *testing.T) {
 	var hits []identityEnvHit
 
 	for _, root := range roots {
-		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if d.IsDir() {
-				if path != root && skipCanaryDir(d.Name()) {
-					return fs.SkipDir
-				}
-				// Skip NESTED GO MODULES — a directory below the root carrying
-				// its own go.mod FILE. See isNestedModuleRoot for why the
-				// file-vs-directory distinction is load-bearing rather than
-				// pedantic.
-				if path != root && isNestedModuleRoot(path) {
-					return fs.SkipDir
-				}
-				return nil
-			}
-			if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-				return nil
-			}
-			if !compiledByGoBuild(path) {
-				return nil
-			}
+		err := walkCanaryFiles(root, func(path string) {
 			fset := token.NewFileSet()
 			f, perr := parser.ParseFile(fset, path, nil, 0)
 			if perr != nil {
-				return nil // not our business to police unparsable files
+				return // not our business to police unparsable files
 			}
 			filesScanned++
 			if rel, relErr := filepath.Rel(root, path); relErr == nil {
 				scanned[filepath.ToSlash(rel)] = true
 			}
 			hits = append(hits, identityEnvHits(fset, f)...)
-			return nil
 		})
 		if err != nil {
 			t.Fatalf("walk %s: %v", root, err)
@@ -135,27 +115,143 @@ var traversalSentinels = []string{
 	"pkg/osident/osident.go",   // the replacement identity source
 }
 
-// skipCanaryDir reports directories the walk must not descend into.
+// walkCanaryFiles is THE traversal rule shared by every #6701 structural
+// canary: it calls visit with each non-test .go file under root that the
+// toolchain compiles, applying cmd/go's directory rule (skipCanaryDir), its
+// module boundary (isNestedModuleRoot) and its file rule (compiledByGoBuild).
 //
-// It is EXACTLY cmd/go's own directory rule, and the equality is the point.
-// modload/search.go excludes `.`-prefixed, `_`-prefixed and `testdata`
-// subdirectories, and prunes `vendor` separately; it has no other name-based
-// rule. The previous head also skipped `node_modules`, which cmd/go does NOT —
-// so a package under node_modules/ that `go build ./...` genuinely compiles was
-// invisible to all three #6701 canaries. Demonstrated at that head with a file
-// carrying both defect shapes (`os.Getenv("USER")` and
-// `SetUserClass("super-user")`): `go list ./...` reported it, build and vet were
-// rc 0, and every canary was green (#6706 review r5 F1).
-func skipCanaryDir(name string) bool {
-	if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") {
+// It is one function rather than a copy per test for the reason #6706 MINOR-3
+// established for identityEnvHits: a traversal re-implemented beside the thing
+// that tests it proves nothing about the thing under test.
+// TestCanaryWalkRuleMatchesTheToolchain_6706 drives THIS function over a
+// fixture tree and cross-checks its answer against `go list ./...`.
+func walkCanaryFiles(root string, visit func(path string)) error {
+	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if skipCanaryDir(root, path) {
+				return fs.SkipDir
+			}
+			// Skip NESTED GO MODULES — a directory below the root carrying its
+			// own go.mod FILE. See isNestedModuleRoot for why the
+			// file-vs-directory distinction is load-bearing rather than
+			// pedantic.
+			if path != root && isNestedModuleRoot(path) {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		if !compiledByGoBuild(path) {
+			return nil
+		}
+		visit(path)
+		return nil
+	})
+}
+
+// skipCanaryDir reports directories the walk must not descend into, modelling
+// cmd/go's own directory rule INCLUDING the part of it that is two-phase.
+//
+// modload/search.go (go1.26.4) does two DIFFERENT things:
+//
+//   - `.`-prefixed, `_`-prefixed and `testdata` directories set `want = false`
+//     (:105-106), which returns filepath.SkipDir at :129-131, BEFORE the
+//     directory is added as a package. Nothing in them is compiled.
+//   - a `vendor` directory is added as a package FIRST (`isMatch(name)` ->
+//     `addPkg(name)`, :139-148) and only THEN has its SUBTREE pruned
+//     (`elem == "vendor" ... return filepath.SkipDir`, :150-152). Its own files
+//     ARE compiled.
+//
+// The previous revision returned true for the name "vendor", which skipped the
+// directory before reading its files — the same defect shape as the invented
+// `node_modules` skip it replaced, in the other direction. Demonstrated at that
+// head with `pkg/vendor/zzprobe.go` (`package vendor`) carrying both defect
+// shapes: `go list ./...` reported `github.com/psaab/xpf/pkg/vendor`, build and
+// vet were rc 0, and all three canaries were green (#6706 review r7 F2). The
+// node_modules half is the earlier finding (#6706 review r5 F1), reproduced the
+// same way.
+//
+// So the vendor rule is expressed on the PATH, not the name: descend into a
+// `vendor` directory, and skip every directory whose parent is one. Walking
+// top-down, skipping vendor's immediate subdirectories makes its whole subtree
+// unreachable, which is what pruning it means.
+//
+// Left in the SAFE (over-scan) direction and deliberately not implemented:
+// go.mod `ignore` directives (search.go:107-112) also set `want = false`. There
+// are none in this module; if one is added, this walk scans a tree cmd/go does
+// not, which reds rather than falls silent.
+func skipCanaryDir(root, path string) bool {
+	if path == root {
+		return false
+	}
+	name := filepath.Base(path)
+	if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") || name == "testdata" {
 		return true
 	}
-	return name == "vendor" || name == "testdata"
+	parent := filepath.Dir(path)
+	return parent != root && filepath.Base(parent) == "vendor"
 }
+
+// canaryBuildCtxs are the build contexts a file is offered to. A file is
+// scanned if EITHER of them compiles it.
+//
+// WHY NOT build.Default ALONE. build.Default.CgoEnabled is the AMBIENT
+// CGO_ENABLED of the `go test` process — 1 on any machine with a C compiler.
+// The shipped binaries are pinned the other way: Makefile:37 and :41 both build
+// with `CGO_ENABLED=0`, and osident.go:26-28,41-46,60-66 plus
+// docs/system-login.md:161,180 each rest an argument on that. So under
+// build.Default a production file carrying `//go:build !cgo` is compiled into
+// xpfd and cli and excluded from every #6701 canary. Demonstrated with
+// pkg/daemon/zz_nocgo_probe.go carrying both defect shapes: `CGO_ENABLED=0 go
+// list` named it, build and vet were rc 0 under BOTH settings, and all three
+// canaries were green under the ambient one (#6706 review r7 F1). Worse, the
+// same tree gave different coverage on different machines — a CI runner with no
+// C compiler defaults to CGO_ENABLED=0 and scans a different set — so a green
+// run carried no statement about the binary that ships.
+//
+// WHY THE UNION RATHER THAN PINNING CgoEnabled=false. Pinning covers the
+// shipped configuration and makes the answer machine-independent, which is the
+// whole of the defect above. The union does that AND covers `//go:build cgo`
+// files, which the pin excludes. This canary's remit is explicitly prospective
+// ("whether or not anybody remembers to write a test for it"), and a cgo-only
+// file that reads $USER is a defect one Makefile edit away from shipping. The
+// union's cost is bounded by an invariant that the pin also satisfies:
+// everything scanned is compiled by SOME toolchain configuration on this
+// GOOS/GOARCH, so it can never produce a red that no `go build` agrees with —
+// the property #6706 review r5 F2 established. Today the union changes nothing:
+// `grep -rn '^//go:build' --include=*.go` over non-test files returns zero
+// lines, so both settings currently scan the identical set.
+//
+// KNOWN LIMIT, named rather than implied, and now named on the axis that
+// matters. The cgo axis IS covered. What is not: GOOS/GOARCH, which stay at
+// build.Default's host values, and custom `-tags`. A violation inside a
+// `//go:build windows` or `//go:build debuglog` file is not reported — and is
+// not in the appliance either, which is linux/amd64 with no custom tags (the
+// Makefile's `debug-log` feature is a cargo feature of the Rust helper, not a
+// Go build tag). A parse error in the constraint means go/build cannot answer,
+// so the file is SCANNED: on an unanswerable question the guard should fire,
+// not fall silent.
+//
+// One MatchFile quirk, stated because it is an over-scan: a file that imports
+// "C" matches under BOTH settings (the CgoFiles/IgnoredGoFiles split happens in
+// ImportDir, not in MatchFile), so under CGO_ENABLED=0 it is scanned although
+// the shipped build ignores it. The invariant holds — CGO_ENABLED=1 does
+// compile it — and there are no such files outside test sources.
+var canaryBuildCtxs = func() [2]build.Context {
+	shipped, devel := build.Default, build.Default
+	shipped.CgoEnabled = false // Makefile builds xpfd and cli with CGO_ENABLED=0
+	devel.CgoEnabled = true
+	return [2]build.Context{shipped, devel}
+}()
 
 // compiledByGoBuild reports whether the toolchain would compile path into the
 // package in its directory, asking go/build ITSELF rather than restating its
-// rule.
+// rule, under either of canaryBuildCtxs.
 //
 // `./...` excludes more than `_`/`.`-prefixed DIRECTORIES: go/build's matchFile
 // also drops `_`/`.`-prefixed FILES, files whose _GOOS/_GOARCH suffix does not
@@ -166,18 +262,15 @@ func skipCanaryDir(name string) bool {
 // `pkg/osident/zz_windows.go` reddened it with build and vet rc 0 — the exact
 // false red the directory half of the rule exists to prevent (#6706 review r5
 // F2).
-//
-// KNOWN LIMIT, named rather than implied: this binds the CURRENT build context.
-// A violation inside a `//go:build windows` file is not reported here — and is
-// not compiled into the appliance either, which is linux/amd64 only. A parse
-// error in the constraint means go/build cannot answer, so the file is SCANNED:
-// on an unanswerable question the guard should fire, not fall silent.
 func compiledByGoBuild(path string) bool {
-	ok, err := build.Default.MatchFile(filepath.Dir(path), filepath.Base(path))
-	if err != nil {
-		return true
+	dir, name := filepath.Dir(path), filepath.Base(path)
+	for _, ctxt := range canaryBuildCtxs {
+		ok, err := ctxt.MatchFile(dir, name)
+		if err != nil || ok {
+			return true
+		}
 	}
-	return ok
+	return false
 }
 
 // identityEnvHit is one production read of an identity-naming environment
