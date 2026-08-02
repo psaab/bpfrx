@@ -253,9 +253,19 @@ func TestHeartbeatAuthReplay_RetiredSessionABA(t *testing.T) {
 // bounded (heartbeatReplaySessions) with FIFO eviction, and documents the
 // security consequence: an entry is evicted ONLY after heartbeatReplaySessions
 // distinct NEWER sessions arrive — each of which requires a genuine peer reboot
-// (an attacker cannot mint valid frames for new sessions). A post-eviction
-// replay re-anchors ONCE but cannot be sustained (further replays are <= the
-// restored watermark).
+// (an attacker cannot mint valid frames for new sessions).
+//
+// A post-eviction replay of ONE session re-anchors once and no more (further
+// replays of THAT session are <= the restored watermark), which is all the
+// assertions below exercise — they retry the same session immediately. That is
+// NOT the same as "a post-eviction replay cannot be sustained", which an
+// earlier revision of this header claimed: CYCLING all heartbeatReplaySessions+1
+// captured sessions round-robin does sustain it, because FIFO eviction always
+// leaves exactly one just-evicted session to replay back in as never-seen. See
+// TestHeartbeatBootEpochClosesSustainedReplay_6169's
+// baseline_legacy_over_ring_capacity_is_sustained subtest, which measures the
+// sustained case this ring cannot close on its own — closing it is the boot
+// epoch's job (heartbeat_epoch.go).
 func TestHeartbeatAuthReplay_BoundedRing(t *testing.T) {
 	var r heartbeatAuthReplay
 

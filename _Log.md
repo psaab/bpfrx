@@ -66973,3 +66973,99 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/README.md,
   pkg/cluster/heartbeat_epoch_bounds_6669_test.go, pkg/cluster/heartbeat.go,
   _Log.md
+
+## 2026-08-02 — #6669 fold r10: bind the epoch floor to a session; coalesce refines
+
+- **Timestamp**: 2026-08-02
+- **Action**: Fold four Codex MAJORs and a MINOR on PR #6669 at `c76ddec38`.
+  Every finding was REPRODUCED before it was fixed.
+- **MAJOR 1 (CONFIRMED, code fix) — the replacement claim was FALSE for EQUAL
+  EPOCHS, and it was a live replay hole.** "Epoch-bearing captures buy only a
+  finite ascending pass" was stated unconditionally, but `epoch == highEpoch`
+  fell through to the ring, so 65 captured incarnations sharing ONE valid epoch
+  churned it exactly as epochless frames do. Measured before the fix: 325/325 on
+  the first pass, **1625/1625** across five further rounds. The step that fails
+  is "distinct sessions => distinct epochs" — one session per process does NOT
+  imply one epoch per process. Reachable: the wall-clock seed is published
+  before refinement and a failing store never raises it, and `bootEpochSeed`
+  returns the literal `1` for every incarnation of a node whose clock reads at
+  or before the Unix epoch. The existing corpus could not see it because
+  `heartbeat_epoch_test.go:190` hard-codes strictly increasing epochs `1000+i` —
+  a corpus holding constant the very variable the defect lives in.
+  **Fix**: `heartbeatAuthState.highEpochSession` binds the floor to the session
+  that raised it. Equality still falls through to the ring for THAT session (it
+  must — a live peer signs every frame of its incarnation with one epoch, so
+  refusing equality outright declares a healthy peer dead) and is refused for
+  any other, BEFORE `ring.admit`, which is the same ordering the floor itself
+  needs. Raising rebinds. Cost: a peer incarnation whose epoch exactly equals a
+  predecessor's is refused until its epoch moves AT ALL — one nanosecond of wall
+  clock, or one refinement pass (`prev+1`) — so it is durable only under a
+  frozen clock AND a dead store, the regime in which the sender publishes no
+  order at all. Counted as `EpochSessionCollision` and rendered by
+  `show chassis cluster status`.
+- **MAJOR 2 (CONFIRMED, NOT fixable here — claim corrected + characterized).**
+  Recovery via `Manager.refreshBootEpoch` fails when the floor-raising epoch
+  never reached the file. Measured: B persists `b`; delayed A reads `b`,
+  publishes `b+1`, its write FAILS; the peer latches `b+1` and refuses B; five
+  restarts later B is still at `b`. B has NO signal — it wrote `b`, the file
+  says `b`, so every pass returns at the `prev == lastWrote` shortcut. I
+  considered persisting BEFORE publishing and REJECTED it: on a write failure
+  that would stop A raising above a predecessor it has already READ, which is
+  exactly the backward-clock-step case persistence exists for — trading a later
+  lockout of B for an immediate one of A. The second unstated condition is also
+  real and measured: while both incarnations live they leapfrog, each pass
+  raising above the other and ratcheting the file. Both conditions are now
+  stated at `withEpochFileLock`, `refreshBootEpoch` and README residual 7, and
+  characterized in `TestRefineRecoveryNeedsTheRaisingEpochInTheFile_6669`.
+- **MAJOR 3 (CONFIRMED, code fix) — a lost CAS dropped the exact recovery
+  request that was needed.** Measured: with a worker held at the lock, a
+  concurrent `refreshBootEpoch` produced only ONE refine pass. **Fix**:
+  `Manager.bootEpochRefinePending` coalesces — the in-flight worker serves one
+  follow-up pass before exiting, with a re-claim step for the request that lands
+  between the pending check and the flag release. A BIT, not a queue, so the
+  backlog stays bounded at one.
+- **MAJOR 4 (already fixed at `c76ddec38`, VERIFIED not assumed).** Codex's
+  extra detail — a refresh rejects `H+1` as too far forward leaving `prev=0`,
+  then reloads the still-published `H+1` and writes it straight back — is
+  exactly the mechanism the existing wording covers ("every later pass therefore
+  writes bad+1 back"). Traced in code: `epoch := published.Load()`, `next :=
+  prev+1` is 1 which does not exceed `epoch`, so the write re-persists `H+1`. No
+  change needed.
+- **MINOR 5 (CONFIRMED, code fix) — a post-rename durability error ratcheted the
+  file on every pass.** `fsatomic.WriteFileDurable` returns a typed
+  `*PostRenameSyncError` where the content IS visible (#5185). Treating it as a
+  failed write left the watermark stale; measured a +1 ratchet on each of four
+  passes under an injected dir-fsync failure. **Fix**: `errors.As` classifies it
+  and records the watermark from what the file now holds.
+- **Remaining inaccurate claims, all corrected**: the two duplicated three-case
+  descriptions (`heartbeat.go`) said epochs "at or below" the floor never reach
+  the ring immediately before admitting equality; `heartbeat_auth_test.go`
+  claimed a post-eviction replay "cannot be sustained" when its body only
+  retries the SAME session; `heartbeat_epoch_latch_test.go` said the live peer
+  can "never" climb back over the archived floor while asserting only a restart
+  one second later. Also corrected everywhere the #6711 recovery was described
+  as happening "at equality" — with a session-bound floor it happens on the
+  RAISE path, which is the wider door anyway and is now measured
+  (`TestPoisonedFloorStillRecoversByRaise_6669`).
+- **Mutation proof — six gates, build rc=0 and vet rc=0 asserted in EVERY
+  mutated state so no red is a build artifact**: (M1) delete the equality
+  session check → 1625/1625 admitted; (M1b, edge of scope) keep the check but
+  run it AFTER `ring.admit` → 25/1625, still red, proving the ORDERING and not
+  merely the predicate; (M1c, edge of scope) raise the floor without REBINDING →
+  "the live peer was refused at the floor it had just raised", 9 failures across
+  the epoch surface, orthogonal control (bare ring + config sync, 12 tests)
+  green; (M3) restore the drop → "only 1 refine pass(es) ran"; (M5) drop the
+  `errors.As` branch → the file ratchets; (M2) drop the idempotence shortcut so
+  B DOES recover → the characterization reds, proving it binds rather than
+  asserting a tautology.
+- **Validation**: `go build ./...` rc=0, `go vet ./pkg/cluster/...` rc=0,
+  `go test -race ./pkg/cluster/` ok 12.6s, `gofmt -l pkg/cluster/` empty, and
+  pkg/daemon + pkg/conntrack + pkg/grpcapi + pkg/dataplane/... green (the
+  canary-bearing packages). No consumer of `HeartbeatStats` exists outside
+  pkg/cluster, so the new counter crosses no proto or CLI boundary.
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/manager.go, pkg/cluster/heartbeat_manager.go,
+  pkg/cluster/status.go, pkg/cluster/README.md,
+  pkg/cluster/heartbeat_epoch_session_bind_6669_test.go (new),
+  pkg/cluster/heartbeat_epoch_latch_test.go, pkg/cluster/heartbeat_auth_test.go,
+  pkg/cluster/heartbeat_epoch_refresh_6669_test.go, _Log.md

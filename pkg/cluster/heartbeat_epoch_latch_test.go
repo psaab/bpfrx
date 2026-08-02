@@ -801,9 +801,15 @@ func TestBackwardClockStepDoesNotKillALatchedPeer_6169(t *testing.T) {
 	}
 
 	// It was latched earlier, when the clocks still agreed. Model that directly:
-	// the floor holds this incarnation's epoch.
+	// the floor holds this incarnation's epoch AND is bound to the session that
+	// raised it. Both halves, because the real raise path sets both — a floor
+	// with an unbound session is a state admitAuthedLocked cannot reach, and
+	// modelling only the epoch would test the peer against a DIFFERENT
+	// incarnation than the one this test says is already latched.
+	const liveSession = uint64(0x7701)
 	e.r.auth.mu.Lock()
 	e.r.auth.highEpoch = stepped
+	e.r.auth.highEpochSession = liveSession
 	e.r.auth.epochSeen = true
 	e.r.auth.mu.Unlock()
 
@@ -811,7 +817,7 @@ func TestBackwardClockStepDoesNotKillALatchedPeer_6169(t *testing.T) {
 	// must be accepted: it is the incarnation we already latched, and nothing
 	// about it is newer or unordered.
 	for c := 1; c <= 10; c++ {
-		f := marshalHeartbeatAuthEpoch(samplePkt(), e.key, 0x7701, uint64(c), stepped)
+		f := marshalHeartbeatAuthEpoch(samplePkt(), e.key, liveSession, uint64(c), stepped)
 		if !e.feed(f) {
 			t.Fatalf("frame %d from the ALREADY-LATCHED incarnation was rejected after a clock "+
 				"step; the peer is declared dead in ~500ms and the cluster goes dual-master", c)
@@ -880,8 +886,19 @@ func senderIncarnationAt(t *testing.T, path string, clock int64) (published, per
 // persisted term of the seed is bounded, so refineBootEpoch declines to chain
 // from the intact higher value AND durably overwrites it with the lower one.
 // From then on the peer's archived frames carry a HIGHER epoch than the peer
-// itself does, and one of them is enough to raise a floor the live peer can
-// never climb back over.
+// itself does, and one of them is enough to raise a floor the live peer is
+// then refused at.
+//
+// "REFUSED AT", NOT "CAN NEVER CLIMB BACK OVER" — an earlier revision of this
+// header said never, and the body does not test never. What it asserts is a
+// restart ONE SECOND later, which is a lower bound on the lockout, not its
+// duration. The production doc has this right: a clock that stays two hours
+// slow reads past the archived floor two real hours later, and the epoch it
+// then publishes is admitted on the RAISE path and rebinds the floor (see
+// refineBootEpoch's decline branch and
+// TestPoisonedFloorStillRecoversByRaise_6669). The lockout is bounded by how
+// long the published reading stays below the floor — which can be arbitrarily
+// long, and is not forever.
 //
 // The widening this pins, over the plain #6711 sequence, is the ARCHIVED FRAME
 // ARRIVING FIRST at a receiver with FRESH state. The floor is then poisoned by

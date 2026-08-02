@@ -528,6 +528,7 @@ func (m *Manager) HeartbeatStats() HeartbeatStats {
 	// Process-scoped, not receiver-scoped: valid with no receiver installed.
 	s.EpochlessAdmitted = m.hbAuth.epochlessAdmitted.Load()
 	s.EpochDowngradeRejected = m.hbAuth.epochDowngradeRejected.Load()
+	s.EpochSessionCollision = m.hbAuth.epochSessionCollision.Load()
 	s.PeerEpochLatched = m.hbAuth.peerEpochLatched()
 	return s
 }
@@ -553,6 +554,23 @@ type HeartbeatStats struct {
 	// counter that residual is invisible to an operator.
 	EpochlessAdmitted      uint64
 	EpochDowngradeRejected uint64
+
+	// EpochSessionCollision counts frames refused because they claimed the
+	// FLOOR epoch under a session other than the one that raised it
+	// (heartbeatAuthState.highEpochSession).
+	//
+	// It is the meter for the one case the floor's own value cannot order: two
+	// peer incarnations advertising the SAME epoch. Distinct sessions at one
+	// epoch are what let a replay churn the bounded ring, so they are refused —
+	// and a non-zero value says which of the two causes is in play. An attacker
+	// replaying a captured set that shares an epoch climbs it steadily while
+	// peer liveness is unaffected. A sender emitting a constant epoch across
+	// its own incarnations — a clock at or before the Unix epoch, whose store
+	// also never raises the seed — shows it climbing alongside a peer that
+	// keeps being declared dead. Neither is visible in the other two counters:
+	// such a frame carries an epoch (so it is not EpochlessAdmitted) and is not
+	// a downgrade (so it is not EpochDowngradeRejected).
+	EpochSessionCollision uint64
 
 	// PeerEpochLatched is the DOWNGRADE LATCH itself (heartbeatAuthState.
 	// epochSeen): an epoch-bearing frame has been accepted from this peer.

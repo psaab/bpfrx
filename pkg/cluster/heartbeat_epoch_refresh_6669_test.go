@@ -27,10 +27,15 @@ import (
 // waitBootEpochIdle joins whatever refine worker is in flight. startBootEpochRefine
 // takes bootEpochRefining on the CALLER's goroutine before spawning the worker,
 // so a caller that has just requested a refine cannot observe idle too early.
+//
+// It waits on the PENDING bit too. A coalesced request normally runs with
+// bootEpochRefining still held, but the worker's hand-back path releases the
+// flag and re-claims it, so there is an instant where the flag is clear and a
+// pass is still owed. Polling only the flag could observe idle inside it.
 func waitBootEpochIdle(t *testing.T, m *Manager) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
-	for m.bootEpochRefining.Load() {
+	for m.bootEpochRefining.Load() || m.bootEpochRefinePending.Load() {
 		if time.Now().After(deadline) {
 			t.Fatal("a boot-epoch refine worker never finished")
 		}

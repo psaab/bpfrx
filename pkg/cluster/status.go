@@ -254,6 +254,7 @@ func (m *Manager) FormatInformation() string {
 	fmt.Fprintf(&b, "  Heartbeats without epoch:   %d%s\n", hbStats.EpochlessAdmitted,
 		epochlessExposureNote(hbStats))
 	fmt.Fprintf(&b, "  Epoch downgrades rejected:  %d\n", hbStats.EpochDowngradeRejected)
+	fmt.Fprintf(&b, "  Epoch session collisions:   %d\n", hbStats.EpochSessionCollision)
 	fmt.Fprintln(&b)
 
 	// Sync link statistics.
@@ -405,6 +406,7 @@ func (m *Manager) FormatStatistics() string {
 	fmt.Fprintf(&b, "    Heartbeats without epoch:   %d%s\n", hbStats.EpochlessAdmitted,
 		epochlessExposureNote(hbStats))
 	fmt.Fprintf(&b, "    Epoch downgrades rejected:  %d\n", hbStats.EpochDowngradeRejected)
+	fmt.Fprintf(&b, "    Epoch session collisions:   %d\n", hbStats.EpochSessionCollision)
 	fmt.Fprintln(&b)
 
 	// Services synchronized table.
@@ -455,6 +457,7 @@ func (m *Manager) FormatControlPlaneStatistics() string {
 	fmt.Fprintf(&b, "    Heartbeats without epoch:   %d%s\n", hbStats.EpochlessAdmitted,
 		epochlessExposureNote(hbStats))
 	fmt.Fprintf(&b, "    Epoch downgrades rejected:  %d\n", hbStats.EpochDowngradeRejected)
+	fmt.Fprintf(&b, "    Epoch session collisions:   %d\n", hbStats.EpochSessionCollision)
 	fmt.Fprintf(&b, "    Authentication:             %s\n", m.controlLinkAuthStatus())
 	return b.String()
 }

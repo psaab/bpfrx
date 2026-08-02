@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -54,12 +55,32 @@ import (
 //     TestArchivedEpochPoisonsAFreshFloor_6711, which also shows one re-injection
 //     per receiver restart sustaining it.
 //
-// What the floor DOES buy, unconditionally, is that an attacker cannot keep a
-// retired incarnation admitted indefinitely: sustained ring churn needs
-// heartbeatReplaySessions+1 sessions at or above the floor, and one incarnation
-// emits exactly one session (Manager.heartbeatNonce, #6169 Stage 0). Measured on
-// 65 captured epoch-bearing incarnations: 325/325 admitted on the ascending
-// pass, then 0/1625 across five further rounds.
+// What the floor DOES buy is that an attacker cannot keep a retired incarnation
+// admitted indefinitely: sustained ring churn needs heartbeatReplaySessions+1
+// sessions the floor ADMITS, and the floor admits at most one session per epoch
+// VALUE. Measured on 65 captured epoch-bearing incarnations: 325/325 admitted on
+// the ascending pass, then 0/1625 across five further rounds.
+//
+// "ONE SESSION PER EPOCH VALUE" IS THE LOAD-BEARING HALF, AND IT TOOK A SECOND
+// MECHANISM. The natural argument is "one incarnation emits exactly one session
+// (Manager.heartbeatNonce, #6169 Stage 0), so distinct sessions are distinct
+// incarnations, so they carry distinct epochs and all but the newest sit below
+// the floor". The first two steps hold; the third does not. One session per
+// process does NOT imply one epoch per process, and the comparison against the
+// floor alone let equality through to the ring — so 65 captured incarnations
+// SHARING one valid epoch churned it exactly as epochless frames do (measured
+// 1625/1625 before heartbeatAuthState.highEpochSession existed).
+//
+// Equal epochs are reachable rather than contrived: the wall-clock seed is
+// published before refinement and a failing store never raises it, and
+// bootEpochSeed returns the literal 1 for every incarnation of a node whose
+// clock reads at or before the Unix epoch. The floor therefore binds the SESSION
+// that raised it and refuses any other session claiming that same value; see
+// highEpochSession for the mechanism, its cost, and how it clears.
+//
+// The bound is then over DISTINCT EPOCH VALUES rather than over incarnations,
+// and it is finite for the same reason either way: the floor is monotone, so an
+// attacker walks up their captures once and every value is spent behind them.
 //
 // TWO PROPERTIES MAKE THAT ACTUALLY CLOSE THE ATTACK, and both are easy to get
 // wrong:
@@ -230,7 +251,11 @@ func epochUsableAsFloor(epoch uint64) bool {
 // highEpoch. So a frame at epoch == highEpoch that is beyond the forward bound
 // is ADMITTED, not rejected — deliberately, because re-testing an
 // already-accepted epoch after a backward clock step is what declared a healthy
-// peer dead and went dual-master. See epochWithinForwardBound.
+// peer dead and went dual-master. See epochWithinForwardBound. (Equality has a
+// separate gate of its own — it is admitted only from the session that raised
+// the floor, see heartbeatAuthState.highEpochSession — but that gate is
+// clock-INDEPENDENT, so it does not reintroduce the wall-clock sensitivity this
+// split exists to keep off the accept path.)
 //
 // The combined predicate is for callers validating a value they are about to
 // TRUST as a starting point rather than merely order against a floor — today
@@ -379,6 +404,28 @@ func epochWithinForwardBound(epoch uint64, nowNanos int64) bool {
 // mis-ordering and that next start this node IS refused, and there is no
 // periodic re-check — tracked as #6724. See
 // TestConcurrentIncarnationsAreOrderedByLockAcquisition_6669.
+//
+// THAT RECOVERY CARRIES TWO CONDITIONS, and stating it flat overstates it. The
+// re-run reads the FILE, so it can only recover what the file expresses:
+//
+//   - THE FLOOR-RAISING EPOCH MUST HAVE REACHED THE FILE. refineBootEpoch
+//     publishes a raise BEFORE persisting it, deliberately — a node that has
+//     read a predecessor's higher value must still order itself above that
+//     value even when it cannot write, which is the backward-clock-step case
+//     persistence exists for. So A can EMIT `b+1` while the file still reads
+//     `b`. B then has no signal at all: it wrote `b`, the file says `b`, and
+//     every restart returns at refineBootEpoch's `prev == lastWrote` shortcut.
+//     B stays below the peer's floor for its whole process lifetime, however
+//     many times it restarts, because the information is not in the only
+//     channel it reads.
+//   - THE OTHER INCARNATION MUST BE GONE. While both run, each pass raises
+//     above the other and rewrites the file, so they leapfrog indefinitely and
+//     alternately strand each other while the file ratchets. The test above
+//     makes A exit before B re-refines, and that step is load-bearing.
+//
+// Both are characterized in
+// TestRefineRecoveryNeedsTheRaisingEpochInTheFile_6669, and both need the same
+// missing state as the mis-ordering itself, so they are tracked with it.
 //
 // Fails CLOSED: if the lock cannot be taken, the read-modify-write is SKIPPED
 // rather than run unlocked. A lock whose failure path executes the critical
@@ -584,6 +631,12 @@ func (m *Manager) heartbeatBootEpoch() uint64 {
 // mis-ordering itself; it bounds how long one costs us. It raises only when the
 // file has moved above us and is a no-op otherwise, so a routine restart on a
 // healthy node neither ratchets the epoch nor rewrites anything meaningful.
+//
+// ABOVE THE FILE, WHICH IS NOT THE SAME AS ABOVE THE PEER'S FLOOR. If the epoch
+// that raised that floor never landed in the file — the other incarnation
+// published it and its write failed — no number of re-runs sees it, and this
+// node stays refused for its whole process lifetime. See withEpochFileLock for
+// that condition and the leapfrog one beside it.
 func (m *Manager) refreshBootEpoch() {
 	if m == nil || m.bootEpoch.Load() == 0 {
 		// Nothing published yet: heartbeatBootEpoch owns the first resolve.
@@ -595,18 +648,39 @@ func (m *Manager) refreshBootEpoch() {
 // startBootEpochRefine runs one refinement on a worker. ready, when non-nil, is
 // closed once that attempt finishes.
 //
-// ONE AT A TIME. Overlapping refines would be safe on the file (withEpochFileLock
-// serializes them) but they race on the persist watermark, whose whole job is to
-// tell "the file holds what I wrote" from "the file moved under me". A refine
-// requested while one is in flight is DROPPED, not queued. That is a deliberate
-// loss: the in-flight worker may already have read the file, so a request made
-// behind it can miss an update it was asked to pick up, and the pickup then
-// waits for the NEXT heartbeat start. Queueing would only shorten that window,
-// not close it — nothing bounds how long a daemon runs without a heartbeat
-// restart either way (#6724) — and it would put an unbounded backlog of
-// fsync-ing workers behind a call that must not block.
+// ONE AT A TIME, BUT COALESCED. Overlapping refines would be safe on the file
+// (withEpochFileLock serializes them) but they race on the persist watermark,
+// whose whole job is to tell "the file holds what I wrote" from "the file moved
+// under me". So exactly one worker runs — and a request that arrives while it
+// is in flight sets bootEpochRefinePending, which that worker serves as another
+// pass before it exits.
+//
+// AN EARLIER REVISION DROPPED SUCH A REQUEST, and the drop silently discarded
+// precisely the request that was needed. The in-flight worker's locked READ can
+// already be complete, so an update landing behind it is invisible to that
+// pass:
+//
+//   - B's worker finishes its read of file `b`, releases the lock, and is
+//     descheduled before storing its watermark and clearing the in-flight flag;
+//   - A locks next, persists `b+1` and emits it; the peer raises its floor and
+//     refuses B at `b`;
+//   - B's next StartHeartbeat loses the CAS and returns WITHOUT queuing;
+//   - B's old worker resumes, records the stale watermark `b`, and clears the
+//     flag without re-reading.
+//
+// B is then below the peer's floor until some LATER heartbeat start, which
+// nothing bounds (#6724) and which may never come. Coalescing turns "the
+// request is lost" into "the request costs one extra pass", which is the whole
+// difference.
+//
+// It is a BIT, not a queue, so the cost stays bounded: any number of requests
+// arriving during one pass collapse into a single follow-up, and a caller that
+// must not block still cannot build a backlog of fsync-ing workers.
 func (m *Manager) startBootEpochRefine(ready chan struct{}) {
 	if !m.bootEpochRefining.CompareAndSwap(false, true) {
+		// Hand the request to the worker already running rather than dropping
+		// it. The worker re-checks this bit after every pass.
+		m.bootEpochRefinePending.Store(true)
 		// Signal anyway: a caller joining `ready` must never block because
 		// someone else got there first. Only heartbeatBootEpoch passes a
 		// non-nil channel and only from inside bootEpochOnce, so this cannot
@@ -620,13 +694,42 @@ func (m *Manager) startBootEpochRefine(ready chan struct{}) {
 	// override, and a worker reading it later would race the next test.
 	path := bootEpochPath
 	go func() {
+		// `ready` keeps its documented meaning — closed when the FIRST attempt
+		// finishes — rather than being deferred to the end of a coalesced run.
+		// The deferred close covers the paths that leave the loop early.
+		signalled := false
 		defer func() {
-			m.bootEpochRefining.Store(false)
-			if ready != nil {
+			if ready != nil && !signalled {
 				close(ready)
 			}
 		}()
-		m.bootEpochWrote.Store(refineBootEpoch(path, &m.bootEpoch, m.bootEpochWrote.Load()))
+		for {
+			m.bootEpochWrote.Store(refineBootEpoch(path, &m.bootEpoch, m.bootEpochWrote.Load()))
+			if ready != nil && !signalled {
+				signalled = true
+				close(ready)
+			}
+			if m.bootEpochRefinePending.CompareAndSwap(true, false) {
+				// A request arrived while that pass ran. Serve it here, with
+				// the in-flight flag still held, so no second worker spawns.
+				continue
+			}
+			m.bootEpochRefining.Store(false)
+			// A request that lost the CAS between our check above and that
+			// store set the bit and returned expecting US to serve it. Nobody
+			// else will: the setter saw a worker in flight. Re-claim it.
+			if !m.bootEpochRefinePending.CompareAndSwap(true, false) {
+				return
+			}
+			if !m.bootEpochRefining.CompareAndSwap(false, true) {
+				// Another worker took the slot in that window. Hand the request
+				// back rather than consuming it — that worker re-checks the bit
+				// after its own pass, so the request is still served exactly
+				// once and cannot be stranded with no worker running.
+				m.bootEpochRefinePending.Store(true)
+				return
+			}
+		}
 	}()
 }
 
@@ -645,8 +748,14 @@ func (m *Manager) startBootEpochRefine(ready chan struct{}) {
 // that same condition and ratchet the epoch by one every time it ran.
 // lastWrote is the epoch this incarnation last persisted (0 for a first pass),
 // and a file still holding exactly that is left alone. The returned value is the
-// new watermark; a failure path returns lastWrote unchanged, since a pass that
-// did not write did not move the file either.
+// new watermark.
+//
+// A failure path returns lastWrote unchanged, since a pass that did not write
+// did not move the file either — WITH ONE EXCEPTION, and getting it wrong
+// ratcheted the file on every pass. fsatomic.WriteFileDurable reports a
+// post-rename directory-fsync failure as a typed *PostRenameSyncError, and at
+// that point the new content is already VISIBLE (#5185); only its durability is
+// unknown. That pass DID move the file, so it returns the value it wrote.
 func refineBootEpoch(path string, published *atomic.Uint64, lastWrote uint64) (wrote uint64) {
 	wrote = lastWrote
 	if err := fsatomic.MkdirAllDurable(filepath.Dir(path), 0o755); err != nil {
@@ -720,17 +829,25 @@ func refineBootEpoch(path string, published *atomic.Uint64, lastWrote uint64) (w
 				// PUBLISHED READING REMAINS BELOW IT. That is the operative
 				// condition, not "while the clock is wrong" — a clock that stays
 				// two hours slow still reads past the floor two real hours later,
-				// and a restart then publishes a value the peer admits at
-				// equality (epoch == highEpoch falls through to the ring). What
-				// recovers it sooner is fixing the clock, or a receiver restart
-				// paired with a PSK rotation — see the "Recovery is
-				// narrower" paragraph in README.md. Chaining, by contrast, ends
-				// at no restart at all: it strands this node permanently above
-				// the range its peer will ever accept. Carrying an intact
-				// predecessor
-				// across a larger backward step needs a change to persistence
-				// semantics, so it is tracked there rather than papered over
-				// here.
+				// and a restart then publishes a value STRICTLY ABOVE it, which
+				// the peer admits on the raise path and which rebinds the floor
+				// to this incarnation. Strictly above, not "at equality": an
+				// earlier revision of this comment said equality, which was true
+				// while equality fell through to the ring unconditionally and is
+				// not now that the floor is session-bound (highEpochSession). The
+				// raise path is the wider door of the two anyway — a nanosecond
+				// of wall clock past the floor, rather than landing on one exact
+				// value — so the recovery is sooner, not later. Measured in
+				// TestPoisonedFloorStillRecoversByRaise_6669.
+				//
+				// What recovers it sooner still is fixing the clock, or a
+				// receiver restart paired with a PSK rotation — see the
+				// "Recovery is narrower" paragraph in README.md. Chaining, by
+				// contrast, ends at no restart at all: it strands this node
+				// permanently above the range its peer will ever accept.
+				// Carrying an intact predecessor across a larger backward step
+				// needs a change to persistence semantics, so it is tracked
+				// there rather than papered over here.
 				slog.Warn("cluster: HA boot-epoch state cannot be chained from (it, or the epoch derived "+
 					"from it, is out of range); ignoring it and keeping the wall-clock epoch",
 					"path", path, "value", n)
@@ -769,6 +886,25 @@ func refineBootEpoch(path string, published *atomic.Uint64, lastWrote uint64) (w
 			published.Store(epoch)
 		}
 		if err := fsatomic.WriteFileDurable(path, []byte(strconv.FormatUint(epoch, 10)+"\n"), 0o644); err != nil {
+			// NOT EVERY WRITE ERROR MEANS THE FILE DID NOT MOVE. A
+			// *PostRenameSyncError is a directory-fsync failure AFTER a
+			// successful rename (#5185): the new content is already VISIBLE in
+			// the namespace — a later pass, or a restart, reads it — and only
+			// its durability across power loss is unknown. Treating that as
+			// "nothing was written" left the watermark stale, so the next pass
+			// read our OWN value, could not recognise it (prev != lastWrote),
+			// chained from it, and rewrote epoch+1 — ratcheting the file by one
+			// on EVERY pass for as long as the fsync kept failing. Record the
+			// watermark from what the file now holds, and warn about the
+			// durability rather than about a write that in fact landed.
+			var postRename *fsatomic.PostRenameSyncError
+			if errors.As(err, &postRename) {
+				slog.Warn("cluster: HA boot-epoch state persisted but its durability is UNKNOWN "+
+					"(the post-rename directory fsync failed; the value IS visible to the next read, "+
+					"but a power loss could lose it)", "path", path, "epoch", epoch, "err", err)
+				wrote = epoch
+				return
+			}
 			slog.Warn("cluster: HA boot-epoch state persist failed; this incarnation's epoch is NOT durable "+
 				"(a backward clock step across the next restart could regress it)", "path", path, "err", err)
 			return

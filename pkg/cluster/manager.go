@@ -247,11 +247,21 @@ type Manager struct {
 	// what keeps the re-run idempotent — a file still holding our own value is
 	// left alone rather than chained from, which would ratchet the epoch by one
 	// per pass.
-	bootEpochOnce     sync.Once
-	bootEpoch         atomic.Uint64
-	bootEpochReady    chan struct{}
-	bootEpochWrote    atomic.Uint64
-	bootEpochRefining atomic.Bool
+	//
+	// bootEpochRefinePending COALESCES a request that arrives while a worker is
+	// in flight. Dropping it instead lost exactly the request that was needed:
+	// the in-flight worker may already have completed its locked READ, so an
+	// update that lands after it is invisible to that pass, and the caller who
+	// lost the CAS is the one asking for the re-read. See
+	// Manager.startBootEpochRefine. It is a BIT, not a queue: at most one extra
+	// pass is ever outstanding, so a caller that must not block cannot build an
+	// unbounded backlog of fsync-ing workers.
+	bootEpochOnce          sync.Once
+	bootEpoch              atomic.Uint64
+	bootEpochReady         chan struct{}
+	bootEpochWrote         atomic.Uint64
+	bootEpochRefining      atomic.Bool
+	bootEpochRefinePending atomic.Bool
 
 	// lastEpochDowngradeWarn rate-limits the epoch-downgrade rejection warning.
 	// The rejection is operator-actionable — a peer rolled back to a pre-#6169

@@ -328,9 +328,30 @@ peer liveness (`lastSeen`) or drive election.
     `Manager` so it survives a heartbeat restart exactly like the ring):
     `epoch < highEpoch` → REJECT (an incarnation OLDER than the highest one
     accepted — which is a retired one only while the sender's epoch has not
-    regressed; see residual 3); `epoch == highEpoch` → normally the same
-    incarnation, fall through to the ring; `epoch > highEpoch` → let the ring
-    vet the nonce, then raise the floor.
+    regressed; see residual 3); `epoch == highEpoch` → fall through to the
+    ring, but ONLY for the session that raised the floor (`highEpochSession`);
+    `epoch > highEpoch` → let the ring vet the nonce, then raise the floor and
+    rebind it to that session.
+    **The floor admits at most ONE SESSION PER EPOCH VALUE**, and that is what
+    makes it bound the ring rather than merely order it. Equality must fall
+    through for the bound session — a live peer signs every frame of its
+    incarnation with one epoch, so refusing equality outright declares a
+    healthy peer dead — and must not for any other, because distinct sessions
+    sharing one epoch churn the ring exactly as epochless frames do (measured
+    1625/1625 before the binding existed; `epoch == highEpoch` used to fall
+    through unconditionally). Equal epochs across incarnations are reachable:
+    the wall-clock seed is published before refinement and a failing store
+    never raises it, and `bootEpochSeed` returns the literal `1` for every
+    incarnation of a node whose clock reads at or before the Unix epoch. A
+    refused frame is counted as `EpochSessionCollision` and rendered by
+    `show chassis cluster status` as "Epoch session collisions".
+    A peer refused this way recovers as soon as its epoch moves AT ALL — one
+    nanosecond of wall clock, or one successful refinement pass (which
+    persists `prev+1`). It becomes durable only when the clock is frozen AND
+    the store never completes, which is the regime in which the sender
+    publishes no order at all.
+    (`TestEqualEpochsCannotChurnTheRing_6669`,
+    `TestFloorRebindsToTheRaisingIncarnation_6669`.)
     **The floor is tested BEFORE the ring is consulted and a rejected frame
     never reaches `ring.admit`.** That ordering is load-bearing: `admit`
     RECORDS a never-seen session as a side effect, so checking the epoch
@@ -575,9 +596,11 @@ peer liveness (`lastSeen`) or drive election.
     rejected BEFORE the monotonic `lastSeen` update, so the peer was declared
     dead in ~500ms and the cluster went dual-master. The relaxation has a
     price and it is worth naming: when the floor already sits beyond the bound,
-    an equal-epoch frame now reaches `heartbeatAuthReplay.admit` and costs one
-    ascending archive pass. That is the whole cost — equality cannot move the
-    floor, so the one-way door is untouched.
+    an equal-epoch frame from the BOUND session reaches
+    `heartbeatAuthReplay.admit` and costs one ascending archive pass. That is
+    the whole cost — equality cannot move the floor, so the one-way door is
+    untouched, and the session binding above already refuses every other
+    session at that value.
 
     The forward bound is applied ONLY when the receiver's own clock is itself
     credible (`epochClockSaneFloor`, year 2020). An appliance with a dead RTC
@@ -640,9 +663,23 @@ peer liveness (`lastSeen`) or drive election.
     incarnation climbs back above the file at the next `StartHeartbeat` — a VRF
     rebind or an HA comms restart — instead of staying below the peer's floor
     for the life of the process. Between the mis-ordering and that next start
-    this node is refused; there is no periodic re-check.
+    this node is refused; there is no periodic re-check. That recovery carries
+    two conditions — the raising epoch must have reached the FILE, and the
+    other incarnation must be gone — spelled out under residual 7.
     (`TestConcurrentIncarnationsAreOrderedByLockAcquisition_6669`,
-    `TestBootEpochRefreshIsIdempotent_6669`.)
+    `TestBootEpochRefreshIsIdempotent_6669`,
+    `TestRefineRecoveryNeedsTheRaisingEpochInTheFile_6669`.)
+
+    **A post-rename durability failure is not a failed write.**
+    `fsatomic.WriteFileDurable` reports a directory-fsync failure that happened
+    AFTER the rename as a typed `*PostRenameSyncError` (#5185): the new content
+    is already VISIBLE — the next read, or a restart, sees it — and only its
+    durability across power loss is unknown. Refinement records its persist
+    watermark from that value rather than treating the pass as a no-op.
+    Treating it as a failed write left the watermark stale, so the next pass
+    could not recognise its own value, chained from it, and rewrote `epoch+1`
+    — ratcheting the file on EVERY pass for as long as the fsync kept failing.
+    (`TestPostRenameSyncKeepsTheWatermark_6669`.)
 
     **It fails CLOSED — the write is SKIPPED, not run unlocked.** Proceeding
     unlocked does not trade correctness for liveness; it trades a TRANSIENT
@@ -785,8 +822,14 @@ peer liveness (`lastSeen`) or drive election.
        re-publishes from the same bad clock (measured: still below the floor).
        The operative condition is the reading, not the clock: a clock that stays
        two hours slow still reads past the floor two real hours later, and a
-       restart then publishes a value the peer admits at equality (`epoch ==
-       highEpoch` falls through to the ring). Restarting the RECEIVER does
+       restart then publishes a value STRICTLY ABOVE it, which the peer admits
+       on the RAISE path and which rebinds the floor to that incarnation.
+       Strictly above, not "at equality" — equality is now admitted only from
+       the session that raised the floor, and the archived frame that poisoned
+       it holds a different one. The raise path is the wider door of the two
+       anyway (a nanosecond past the floor, rather than landing on one exact
+       value), so this makes the recovery sooner, not later
+       (`TestPoisonedFloorStillRecoversByRaise_6669`). Restarting the RECEIVER does
        clear the floor, but an attacker holding one archived frame from the
        pre-regression incarnation re-raises it immediately, at one re-injection
        per restart — the same shape as residual 5, and it means the floor can be
@@ -874,6 +917,30 @@ peer liveness (`lastSeen`) or drive election.
        there is no periodic re-check. Tracked as **#6724**.
        (`TestConcurrentIncarnationsAreOrderedByLockAcquisition_6669`,
        `TestBootEpochRefreshIsIdempotent_6669`.)
+
+       **That recovery carries two conditions**, and both are the same missing
+       state as the mis-ordering itself. It re-reads the FILE, so it recovers
+       only what the file expresses. First, **the floor-raising epoch must have
+       reached the file**: refinement publishes a raise before persisting it
+       (deliberately — a node that has read a predecessor's higher value must
+       still order itself above it even when it cannot write), so the other
+       incarnation can EMIT `b+1` while the file still reads `b`. This node
+       then has no signal at all — it wrote `b`, the file says `b` — and every
+       restart returns at the idempotence shortcut, leaving it below the peer's
+       floor for its whole process lifetime. Second, **the other incarnation
+       must be gone**: while both run, each pass raises above the other and
+       rewrites the file, so they leapfrog indefinitely, alternately stranding
+       each other while the file ratchets.
+       (`TestRefineRecoveryNeedsTheRaisingEpochInTheFile_6669`.)
+
+       A refine requested while one is in flight used to be DROPPED, which lost
+       exactly this recovery request — the in-flight worker's locked read can
+       already be complete, so an update landing behind it is invisible to that
+       pass. It is now COALESCED into one follow-up pass
+       (`Manager.bootEpochRefinePending`), which bounds the extra work at one
+       outstanding request rather than an unbounded backlog of fsync-ing
+       workers. (`TestOverlappingRefineRequestIsCoalesced_6669`,
+       `TestCoalescingDoesNotRatchetOnAHealthyNode_6669`.)
   - **No clone/bake requirement** (unlike the SNMPv3 engine-id, `pkg/snmp`).
     Epochs are compared per-PEER, never between the two nodes, so two chassis
     cloned from one image may hold identical persisted boot epochs harmlessly;
