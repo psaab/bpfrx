@@ -1,6 +1,30 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v87 — r85 folds: Codex M1's TOTAL class
+- **Status**: DRAFT v88 — r86 folds: Codex M1's PER-ACCESS
+  required/optional semantics (method-level classification plus
+  one `present` dimension could not encode master: real class-1
+  methods mix REQUIRED accesses — absent → master's missing-map
+  error — with OPTIONAL accesses — absent → master's silent
+  skip / nil-guard return while the method still succeeds; the
+  class-1 matrix row now governs REQUIRED accesses, optional
+  accesses keep master's exact per-site outcome, and the complete
+  11-site mixed inventory is named: 9 optional-if-ok reads at
+  `maps_nat.go:261/:274/:300/:328` + `maps_stale.go:224/:241/
+  :285/:291/:322/:328/:336` and 2 nil-guard reads at
+  `compiler.go:353` + `loader.go:591`; the §9 oracle gains a
+  PARTIAL-REGISTRY leg — `nat64_configs` present +
+  `nat64_prefix_map` absent asserts `SetNAT64Config` SUCCEEDS on
+  both armed and retained states); Codex m2's fifth singular
+  site (the canary-allowlist sentence now names the two helpers
+  + publisher); Codex m3's overclaim fixes (the intentional
+  fresh-state behavior changes are exactly TWO — the class-1
+  typed error AND class-4 `NewEventSource`'s fresh typed error —
+  and the lifecycle claims now name the admitted Close-entry
+  `loaded=false` admission-timing narrowing instead of "no
+  lifecycle change"); r86 verdicts: Codex PLAN-NEEDS-MAJOR
+  (1M/2m), AGY PLAN-READY, Claude SMR PLAN-READY; pending
+  convergence review r87.
+- **Prior**: DRAFT v87 — r85 folds: Codex M1's TOTAL class
   outcome matrix (v86's class-2/class-4 text was not total — it
   conditioned neither on presence nor defined the
   present→proceed path, and read literally suppressed valid
@@ -3240,7 +3264,11 @@
   state-independent row; the four-site singular-helper
   pluralization; the fourth unconditional teardown site
   qualified; the swap-fixture state fix — a program-only seed
-  is FRESH, not retained).
+  is FRESH, not retained). v88 (r86: the per-access
+  required/optional semantics — the 11-site mixed inventory +
+  the partial-registry oracle leg; the fifth singular site;
+  the two-change pluralization and the lifecycle-claim
+  qualification).
 
 ---
 
@@ -3926,7 +3954,12 @@ class. The fold:
   nil returns — preserved byte-for-byte; (iii) the class-1
   outcomes (map-not-found error or the fatal concurrent-map
   throw) — these become the one clean typed error on the fresh
-  state, the only intentional behavior change (EXCLUDING the
+  state; the intentional fresh-state behavior changes are exactly
+  TWO (pluralized at v88 per r86 Codex m3): this class-1 typed
+  error AND class-4 `NewEventSource`'s fresh outcome
+  ("events map not loaded", `loader.go:1163` → the typed error,
+  honoring its `(EventSource, error)` signature, §4 A1's class-4
+  bullet) — plus the admission-timing move below (EXCLUDING the
   loaded-check set — the attaches and the CompileConfig path keep
   their own rejections per the carve-out, r82 Codex m3); (iv) the
   class-4 getters' nil-return — preserved, with the typed error
@@ -4454,8 +4487,11 @@ Preserved exactly:
   FRESH-unarmed state (`loaded==false` AND maps empty) — there,
   class-1 methods return the typed `ErrDataplaneNotArmed` instead of
   master's "map not found" error or the fatal concurrent-map throw
-  (the ONLY intentional behavior change — scoped to the fresh state
-  and EXCLUDING the loaded-check set, which keeps its own rejections
+  (one of exactly TWO intentional fresh-state behavior changes —
+  v88 pluralization per r86 Codex m3; the other is class-4
+  `NewEventSource`'s fresh typed error — both scoped to the fresh
+  state and EXCLUDING the loaded-check set, which keeps its own
+  rejections
   per the carve-out, r82 Codex m3; the
   class-3 raw-helper composition rule keeps even the legacy error
   TEXTS stable, r71 Codex M3); class-2 keep master's missing-map
@@ -4469,8 +4505,14 @@ Preserved exactly:
   (r81 Codex m1): the loaded-check set still rejects (never
   reaches the registry), and Teardown-retained FDs are live but
   UNPINNED after `loader.go:1221` (the §10 generation hazard —
-  "live pinned" was wrong for that state). Post-arm behavior
-  bit-identical; no signature changes.
+  "live pinned" was wrong for that state). POST-ARM behavior is
+  bit-identical; no signature changes. (The one admitted
+  non-post-arm divergence, named at v88 per r86 Codex m3: the
+  `loaded=false` move from Close's exit to its ENTRY narrows the
+  loaded-check set's admission window — a deliberate timing
+  change, qualified to that set at v85; every ordinary method
+  classifies retained and proceeds, so this is not a lifecycle
+  redesign but an admission-timing narrowing.)
 
 ## 7. Hidden invariants the change must preserve
 
@@ -4560,7 +4602,7 @@ Preserved exactly:
 | Behavioral regression | **MED** | Large but mechanical diff; compiler-enforced completeness + regenerated §5.4 table + the new dpCell canary. Real risks: (a) a §5.3 snapshot-boundary mistake; (b) canary redesign errors (mitigated by both-direction self-tests); (c) the fwdstatus narrowing touching `NewSampler` (contained: 1 prod caller + 2 test sites; full-suite gate); (d) [FOLLOW-UP — seed] work item H narrows commit-confirmed recovery semantics for the FirstCommit+cluster class (revert-at-Load vs re-arm); the follow-up unit's risks are assessed in `followup-seed.md`; (e) the A3 enumerate-and-gate audit could miss an exported maps-touching method — mitigated by the pre-arm method-matrix test and the blocked-Start -race regression (§9), and bounded by the failure shape (a missed gate reproduces master's map-not-found error, never a NEW failure mode). |
 | Lifetime / borrow | **LOW** | Immutable slots; captured references keep backends alive exactly as today. No FFI/Rust interaction. |
 | Performance regression | **LOW** | One atomic load + indirection per control-plane read (1 Hz sampler, request rate, watchdog 2/s, HA ≤15/s). One small allocation per Store, ≤5/lifetime. No per-packet Go code. |
-| Architectural mismatch | **LOW** | #2116 `atomic.Pointer` precedent; daemon atomics-for-publication idiom; no dataplane-lifecycle redesign (Option B rejected); canary redesign extends the existing boundary-guard pattern. Work items G+H (FOLLOW-UP — `followup-seed.md`) carry a deliberate lifecycle change (startup-outcome gating of the rollback executor + the shutdown-admission fence) and a narrowed recovery semantic; their full risk assessment lives in the seed. PR-1 itself adds no lifecycle change. |
+| Architectural mismatch | **LOW** | #2116 `atomic.Pointer` precedent; daemon atomics-for-publication idiom; no dataplane-lifecycle redesign (Option B rejected); canary redesign extends the existing boundary-guard pattern. Work items G+H (FOLLOW-UP — `followup-seed.md`) carry a deliberate lifecycle change (startup-outcome gating of the rollback executor + the shutdown-admission fence) and a narrowed recovery semantic; their full risk assessment lives in the seed. PR-1 itself adds no lifecycle REDESIGN; its one admitted timing change is the Close-entry `loaded=false` admission narrowing of the loaded-check set (v88 qualification per r86 Codex m3 — the v87 "no lifecycle change" phrasing overclaimed). |
 
 ## 9. Test plan
 
@@ -4833,7 +4875,9 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    at the :154 selector, which A3 makes lock-taking) and keeps
    the cleanups' filesystem work outside. The AST canary over
    `pkg/dataplane` forbids direct `m.maps`/`m.programs` access
-   outside the EXACTLY-NAMED allowlist — the registry helper and
+   outside the EXACTLY-NAMED allowlist — the two registry helpers
+   (`lookupMapLocked`/`lookupProgramLocked`, pluralized at v88 per
+   r86 Codex m2 — the fifth singular site) and
    `publishShimRegistryLocked` — with the full precision set (r83
    Codex M1; the helper shape completed at v86 per r84 Codex M1 —
    the single `*ebpf.Map`-returning signature could not serve the
@@ -4861,6 +4905,42 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    | 2 | neutral | master's missing-map outcome (nil for the no-ops) | proceed with the handle |
    | 3 | state-independent: the pinned legacy behavior | the pinned legacy behavior | the pinned legacy behavior (proceed) |
    | 4 | nil (+ the typed error where the signature carries one) | master's missing outcome (nil for `Map`/`Program`) | proceed (return the handle) |
+
+   The class-1 absent cell is PER-ACCESS, not per-method (r86 Codex
+   M1 — method-level classification plus one `present` dimension
+   cannot encode master: real class-1 methods mix REQUIRED accesses
+   (absent → master's missing-map error) with OPTIONAL accesses
+   (absent → master's silent skip / nil-guard return, the method
+   still succeeds)). The matrix row governs a class-1 method's
+   REQUIRED accesses; an OPTIONAL access inside ANY class keeps
+   master's exact per-site outcome (the `if ok` body simply does
+   not run; the nil-guard simply returns) — only the helper wraps
+   the lookup, never the outcome. THE MIXED-SITE INVENTORY (the
+   complete list — 9 optional-if-ok reads + 2 nil-guard reads,
+   verified against the tree): `maps_nat.go:261` (static_nat_v4),
+   `:274` (static_nat_v6), `:300` (nat64_prefix_map, inside
+   `SetNAT64Config` whose REQUIRED `nat64_configs` at `:290`
+   errors when absent), `:328` (nat64_prefix_map, inside
+   `ClearNAT64Configs`, REQUIRED `nat64_configs` at `:318`);
+   `maps_stale.go:224` (static_nat_v4), `:241` (static_nat_v6),
+   `:285` (nat64_configs), `:291` (nat64_prefix_map), `:322`
+   (nat_pool_configs), `:328` (nat_pool_ips_v4), `:336`
+   (nat_pool_ips_v6); the nil-guard reads `compiler.go:353`
+   (`redirect_capable`, inside the classified `Compile`) and
+   `loader.go:591` (`interface_counters`, inside
+   `seedInterfaceCounter`, called from `AttachXDP`/`AddTxPort`).
+   (`compiler_nat.go:605/:611`'s `ok`s are `netip.AddrFromSlice`
+   conversions, NOT registry reads — excluded.) The canary does
+   not distinguish required from optional — BOTH wrap through the
+   helper; the distinction lives only in how the caller consumes
+   (present, st). The §9 retained oracle gains a PARTIAL-REGISTRY
+   leg (r86 Codex M1's oracle gap — the generic retained-absent
+   fixture stops at the first required lookup and never exercises
+   required-present + optional-absent): a fixture with the
+   REQUIRED map present and the OPTIONAL map ABSENT
+   (`nat64_configs` present, `nat64_prefix_map` absent) asserts
+   `SetNAT64Config` SUCCEEDS (master's mixed outcome) on both the
+   armed and retained states.
 
    `present` includes present-but-nil: callers retain their existing
    handle-level nil behavior. Fresh+present is production-
@@ -5441,18 +5521,21 @@ Still open:
    PLAN-READY when all three verdicts gate the PR-1 design as
    ready.
 
-7. **r68-r85 resolution (for the record)**: Codex r68 M1 (armed-state
+7. **r68-r86 resolution (for the record)**: Codex r68 M1 (armed-state
    admission gate) folded as work item A3; r69-r82 falsified each
    intermediate form, r83 closed the last canary escape, r84
-   replaced the single helper with the typed pair, and r85 made
-   the outcome matrix TOTAL (v86's class-2/class-4 text lacked
-   the present→proceed branch and left class-4's armed/retained
-   cells undefined) plus three wording fixes (the singular-helper
-   pluralization, the fourth unconditional teardown site, the
-   swap-fixture state — a program-only seed is fresh). v87 pins
-   the full class × (state × presence) matrix. Each reviewer:
-   verify the matrix reproduces master's observable behavior in
-   every reachable cell, and the four pluralized sites.
+   replaced the single helper with the typed pair, r85 made the
+   outcome matrix TOTAL, and r86 made it PER-ACCESS (the class-1
+   absent cell could not encode master's mixed required/optional
+   outcomes — the 11-site inventory is now named, optional
+   accesses keep master's per-site outcome, and the oracle gains
+   the partial-registry leg) plus three wording fixes (the fifth
+   singular-helper site, the two-change pluralization, the
+   lifecycle-claim qualification). v88 pins the per-access
+   semantics. Each reviewer: verify the mixed-site inventory is
+   complete (grep the `if ok` + nil-guard registry reads), the
+   partial-registry oracle leg, and the two-change/lifecycle
+   qualifications.
 
 ---
 
