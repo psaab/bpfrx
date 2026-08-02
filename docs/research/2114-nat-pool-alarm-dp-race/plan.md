@@ -1,6 +1,33 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v94 — r91 fold: AGY's single residual (the
+- **Status**: DRAFT v95 — r91 Codex folds (4 documentation-only
+  minors, no MAJOR, no design change): minor-1 was already v94's
+  fold (the review was pinned to v93); minor-2's replacement-
+  bucket falsehood (the v93/v94 "non-comma-ok single-value reads"
+  bucket was itself false for `loader.go:700`, a comma-ok
+  TWO-value read — the exact split is now 14 if-ok + 2
+  single-value (`compiler.go:353` skip-and-continue,
+  `loader.go:591` nil-guard) + 1 comma-ok early return
+  (`loader.go:700`), and the §9 continuation text's "nil-guard
+  SKIPS" label is corrected); minor-3's scope falsehood (the
+  "17 sites are inside methods that ALSO carry a required access
+  or an error signature" claim was false for
+  `DeleteStaleStaticNAT`/`DeleteStaleNAT64`/
+  `ZeroStaleNATPoolConfigs`/`SessionCount` — multi-OPTIONAL-
+  access methods with no error result — the scoping is now
+  "MULTI-ACCESS methods"); minor-4's cardinality confusion
+  ("SINGLE-MAP NEUTRAL SET" renamed "SINGLE-ACCESS-SELECTOR
+  NEUTRAL SET" — `ClearSessionCounts` loops TWO map names,
+  `GetMapStats` loops every descriptor; what is singular is the
+  syntactic selector site). Codex's fold-free passes: the
+  Detach tri-site consistency; the void/error enumeration; the
+  "22 methods / 28 selector sites" fold; the five-leg hook
+  implementability; the A3/§7/§9 cross-block agreement; the
+  census exact (135 = 130 + 5 = 91 + 41 + 3); no G+H+H2 leakage.
+  r91 verdicts: Codex PLAN-NEEDS-MINOR (4m, pinned to v93), AGY
+  PLAN-NEEDS-MINOR (1 residual, folded v94), Claude SMR
+  PLAN-READY; pending convergence review r92.
+- **Prior**: DRAFT v94 — r91 fold: AGY's single residual (the
   summary line's bucket label now matches the body: "3 non-comma-ok
   single-value reads = 17 sites" — the v93 rename landed in the
   body but the summary line kept "3 nil-guard reads"; the SMR r91
@@ -3429,7 +3456,10 @@
   the Detach-qualification propagation to A3/§5.1; the
   signature falsehood + the source-pin correction; the stale
   "22 lookups" label). v94 (r91 AGY's single residual: the
-  summary-line bucket label matches the body).
+  summary-line bucket label matches the body). v95 (r91 Codex's
+  four documentation minors: the exact 14+2+1 split replaces
+  the false bucket names; the multi-access scoping; the
+  selector-site rename; the §9 "nil-guard SKIPS" correction).
 
 ---
 
@@ -5158,16 +5188,34 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    redirect-map population) — only the helper wraps
    the lookup, never the outcome. THE MIXED-SITE INVENTORY (the
    complete MIXED / MULTI-ACCESS subset — 14 optional-if-ok reads +
-   3 non-comma-ok single-value reads = 17 sites (the bucket label
-   aligned with the body at v94 per r91 AGY's single residual);
+   3 other-shape reads = 17 sites (the exact 14+2+1 split pinned
+   at v95 per r91 Codex minors 1-2 — the v94 "non-comma-ok
+   single-value reads" bucket name was itself false for
+   `loader.go:700`, a comma-ok TWO-value read with an early
+   return: the 3 other-shape reads are TWO single-value reads
+   (`compiler.go:353` skip-and-continue, `loader.go:591`
+   nil-guard return) plus ONE comma-ok early return
+   (`loader.go:700`));
    the count and the scoping
    corrected at v90 per r88 AGY b2 — v89's summary said "13 + 3 =
    16" while its own body enumerated FOURTEEN if-ok sites, and
    the "complete list" phrasing overclaimed: the full
    neutral-outcome access set across `pkg/dataplane` is ~41 sites
    (r87 Codex's table), of which these 17 are the ones inside
-   methods that ALSO carry a required access or an error
-   signature — the remainder are the SINGLE-MAP NEUTRAL sites,
+   MULTI-ACCESS methods (methods with MORE THAN ONE registry
+   access — v95 correction per r91 Codex minor-3: the v90
+   "methods that ALSO carry a required access or an error
+   signature" claim was false for `DeleteStaleStaticNAT`,
+   `DeleteStaleNAT64`, `ZeroStaleNATPoolConfigs`, and
+   `SessionCount`, which carry ONLY optional accesses and no
+   error result — they are multi-OPTIONAL-access methods)
+   — the remainder are the SINGLE-ACCESS-SELECTOR NEUTRAL sites
+   (renamed at v95 per r91 Codex minor-4 — "SINGLE-MAP" confused
+   the syntactic selector site with the runtime map cardinality:
+   `ClearSessionCounts` loops TWO map names at
+   `maps_screen.go:58` and `GetMapStats` loops every descriptor
+   at `maps_stats.go:69`; what is singular is the selector site,
+   not the runtime map access),
    named below): the optional-if-ok reads
    `maps_nat.go:261` (static_nat_v4),
    `:274` (static_nat_v6), `:300` (nat64_prefix_map, inside
@@ -5181,9 +5229,12 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    `SessionCount`) and `:337` (sessions_v6, same); and
    `loader.go:730` (vlan_iface_map, inside `setXDPAttachedFlag`,
    reached deferred from `AttachXDP`'s claim propagation); the
-   three non-comma-ok single-value reads (v93 bucket rename per
-   r90 Codex minor-1 — v90 called all three "nil-guard reads",
-   but only `loader.go:591` is syntactically a nil guard):
+   three other-shape reads — TWO single-value reads plus ONE
+   comma-ok early return (the exact split pinned at v95 per r91
+   Codex minor-2 — the v93/v94 "non-comma-ok single-value reads"
+   bucket was itself false for `loader.go:700`, a comma-ok
+   TWO-value read; v90 called all three "nil-guard reads",
+   and only `loader.go:591` is syntactically a nil guard):
    `compiler.go:353`
    (`redirect_capable`, inside the classified `Compile` — absent
    SKIPS the redirect-map population and CONTINUES into the
@@ -5206,8 +5257,12 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    `nat64_configs` (:319) -> optional `nat64_prefix_map` (:328)
    -> required `nat64_count` (:340 via `SetNAT64Count` :309).
    (`compiler_nat.go:605/:611`'s `ok`s are `netip.AddrFromSlice`
-   conversions, NOT registry reads — excluded.) THE SINGLE-MAP
-   NEUTRAL SET (v90 addition per r88 AGY b2 — the remaining
+   conversions, NOT registry reads — excluded.) THE SINGLE-ACCESS-
+   SELECTOR NEUTRAL SET (renamed at v95 per r91 Codex minor-4 —
+   "SINGLE-MAP" confused the syntactic selector site with the
+   runtime map cardinality: `ClearSessionCounts` loops TWO map
+   names, `GetMapStats` loops every descriptor; what is singular
+   is the selector site) (v90 addition per r88 AGY b2 — the remaining
    neutral-outcome accesses, each the ONLY registry access in a
    void or no-error-outcome method; class-assigned at v91 per r88
    Codex M1's table — seventeen are class-2 by the plan's
@@ -5290,8 +5345,10 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    `vlan_iface_map` at `loader.go:730` must continue into the
    physical-interface processing at `:744-826`), and `Compile`
    (absent `redirect_capable` at `compiler.go:353` must continue
-   past into the attachment work — the nil-guard SKIPS the
-   redirect-map population, it does not return). This matters
+   past into the attachment work — the single-value read SKIPS the
+   redirect-map population, it does not return — the v91 "nil-guard"
+   label here contradicted the bucket split, corrected at v95 per
+   r91 Codex minor-2). This matters
    because the AST canary cannot distinguish required from
    optional consumption — the continuation legs are the only
    net catching a premature optional-miss return.
@@ -5907,10 +5964,16 @@ Still open:
    Detach-oracle `iface_zone_map` seeding, and the five-leg
    oracle set; r90's four minors (the "simply returns" residual,
    the Detach-qualification propagation, the signature
-   falsehood, the stale count label) landed in v93. Each
+   falsehood, the stale count label) landed in v93; r91's
+   residuals (AGY's summary-line bucket label; Codex's four
+   documentation minors — the exact 14+2+1 split, the
+   multi-access scoping, the selector-site rename, the §9
+   "nil-guard SKIPS" correction) landed in v94/v95. Each
    reviewer: verify the per-site outcome rule's three-way
    phrasing (skip / return / continue), the A3+§5.1+§9 Detach
-   consistency, the void-host enumeration, and the census
+   consistency, the void-host enumeration, the exact 14+2+1
+   optional-read split, the MULTI-ACCESS scoping, the
+   SINGLE-ACCESS-SELECTOR naming, and the census
    labels.
 
 ---
