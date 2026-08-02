@@ -1,3 +1,136 @@
+## 2026-08-01 — #5561 round 16: the pre-rebind nil publish had ZERO coverage, and three places claimed it had some
+
+- **Timestamp**: 2026-08-01 (fix/5561-rest-authz-r16, PR #6645)
+- **Action**: A coverage-and-accuracy round. No runtime behaviour changed in
+  `reconcileTo` / `publishNilDirectionLocked`; an independent review at
+  1da594597 established with true exit codes that no fail-open exists there.
+  What existed was an untested load-bearing call site and three claims that it
+  was tested.
+
+  **F1 (blocking) — reconcileTo's PRE-rebind `else { publishNilDirectionLocked() }`
+  arm was silent to delete.** Confirmed before writing anything: removing the
+  whole arm left `go build ./...` rc 0, `go vet` rc 0, `ok pkg/daemon`, `ok
+  pkg/api`. Every existing nil-direction case drives a rebind that FAILS, and on
+  that path the pre-rebind call is redundant — the off-loopback leg is RETAINED,
+  keeps following the server-wide snapshot, and the POST-rebind call publishes
+  the same deny-all against the same unchanged `m.cur`.
+
+  The path where it is load-bearing is the rebind that SUCCEEDS. A live leg
+  serves 10.0.0.1:80 under a committed credential; the operator commits `delete
+  system services web-management api-auth`; the #4047/#5127 clamp pulls the bind
+  to 127.0.0.1:80 and this time it binds. `ReconcileHTTP` then RETIRES the old
+  leg, and `api.Server.trackRetiring` PINS it to whatever `s.auth` holds at that
+  instant (`leg.slot.pin`). The post-rebind publish cannot repair that pin:
+  `m.cur` is loopback by then so the committed nil is what goes out, and
+  `authSlot.tighten` drops a nil `next` by design. Without the pre-rebind
+  publish the pin captures the DELETED credential, which then keeps
+  authenticating on the routable address for the whole bounded drain plus every
+  keep-alive connection already accepted.
+
+  Guarded by `TestMgmtRemovedCredentialNeverSurvivesOnTheRetiredLeg_5561`
+  (`pkg/daemon/management_nilpublish_5561_test.go`), which asserts the
+  consumer-visible fact — the retired leg's own handler must refuse
+  `webadmin:secret-a`, and must refuse an unauthenticated caller too (the pin is
+  DENY-ALL, not nil) — with the live loopback leg admitting the unauthenticated
+  request as the control that this is a scoped suppression and not a lockout.
+  Reaching a retired leg from pkg/daemon needed one new cross-package accessor,
+  `api.Server.HTTPHandlerForTest`: the handler is taken BEFORE the reconcile,
+  because afterwards `s.httpLeg` has been replaced and `s.retiring` holds the old
+  leg only until it drains (any later `ReplaceAuth` prunes it), so reading it
+  after the fact is a race.
+
+  Mutation proof: deleting the pre-rebind arm leaves build rc 0 and vet rc 0 and
+  reds EXACTLY ONE test across `pkg/daemon` + `pkg/api` — this one — on a real
+  assertion ("secret-a still authenticates on the RETIRED listener at
+  \"10.0.0.1:80\"").
+
+  **The call site and the deny-all arm are not separable, and that is a property
+  of the code, not of the test.** Deleting `ReplaceAuth(&api.AuthConfig{})`
+  inside the helper reds six (the five pre-existing retained-path cases plus this
+  one). It cannot be otherwise: `publishNilDirectionLocked` has exactly two arms
+  selected by `m.cur.allLoopback()`, and the pre-rebind call takes the DENY-ALL
+  arm precisely when a live leg is off-loopback — which is the only situation in
+  which the pre-rebind publish has any security content at all. When
+  `allLoopback()` is true pre-rebind the call publishes nil, which pins the
+  retired leg to PASS-THROUGH, i.e. strictly more permissive than the mutation,
+  so there is no property to assert in that direction. The discriminator is
+  therefore the red SET, and it is decisive: the call site is red-alone under its
+  own deletion. The converse isolation already exists — a scenario whose
+  post-rebind state is NOT all-loopback reds for the deny-all arm and stays green
+  for the call site, because the post-rebind deny-all then TIGHTENS the pin away.
+
+  **F2 — a godoc binding defect introduced in round 15.** No blank line separated
+  `everyLiveLegNamedBy`'s 21-line doc from the new `allLoopback` comment, so
+  godoc bound the whole block to `allLoopback` and `everyLiveLegNamedBy` had NO
+  doc at all (verified both ways with `go doc -all -u ./pkg/daemon`). The orphaned
+  text is the round-13 grant-gate argument — "read BEFORE the rebinds / read
+  AFTER" — that both `reconcileTo` call sites depend on for their justification,
+  including the one F1 is about, so it was MOVED onto its own function rather
+  than merely separated (a free-floating block would be dropped from godoc
+  entirely).
+
+  **F3 — two revert instructions that were not executable.**
+  `management_authstale_5561_test.go` told a future reader to "restore the `if
+  committed != nil` guard in `withCommittedAuth`", a function this commit range
+  DELETED. Replaced with the mutation that actually reds it — drop the generation
+  fence, i.e. make `committedDesired` return `m.desired(cfg)` without consulting
+  the store — verified: build 0, vet 0, RED at "the stale replay was expected to
+  retry the committed loopback bind and FAIL". The second instruction claimed
+  that gating the nil publish on the rebind OUTCOME makes "the live snapshot go
+  nil"; implemented and run, that mutation leaves the case GREEN, because under
+  the generation fence the replay reconciles to the COMMITTED loopback endpoint
+  whose bind the fixture refuses, so an outcome gate reads false and deny-all
+  publishes. The property is still bound — `allLoopback` mutated to `return true`
+  reds it on "api-auth was removed entirely while the live listener is
+  10.0.0.2:80" — so the text was rewritten to name that mutation and to say which
+  predicate the case actually binds.
+
+  **F4 (discretionary, taken)** — `m.lastHTTPAttempt = next.Addr` in `reconcileTo`
+  was likewise silent to delete. Display-only, but wrong in a way that misdirects:
+  after a boot bind failure at X and a day-2 reconcile to Y that also fails,
+  `show system services` reported X — an address nothing is retrying.
+  `TestEffectiveHTTPListenerReportsTheRETRIED_Address_6401` reds alone on its
+  deletion, build and vet clean.
+
+  **F5 (discretionary, taken)** — two test names outlived their behaviour.
+  `...RemoveAuthDeferredWhenHTTPRebindFails_5866` no longer defers anything (round
+  14 made it publish deny-all immediately) and is now
+  `...RemoveAuthDeniesAllWhenHTTPRebindFails_5866`; the prose calling that
+  direction "still defers" was corrected at the same time.
+  `...WithCommittedNilKeepsOffLoopbackAuth_5561` asserts `CredentialCount == 0`,
+  i.e. it keeps no credential, and is now
+  `...WithCommittedNilNeverDropsOffLoopbackToNoAuth_5561`.
+
+  **F7 (discretionary, taken)** — `pkg/api/auth.go` told the operator that one exit
+  from an empty credential set is "commit the address that is actually serving".
+  True for the ∅ that function produces (the non-nil intersection, whose config
+  carries a credential), false for the deny-all reached via the nil direction:
+  that config has no api-auth, so `resolveAPIBinds` re-clamps any off-loopback
+  address it names straight back to loopback. Scoped the claim and named the
+  nil-direction exits.
+
+  **F6 (discretionary, NOT taken)** — `pkg/api/listener.go` and `server.go` each
+  independently substitute a fresh slot for a nil, so a hypothetical future site
+  passing nil to BOTH `buildHTTPServer` and `serveLegLocked` would give the
+  handler slot X and the leg slot Y and make the pin a silent no-op. Not reachable
+  today (all four production sites verified consistent) and closing it properly
+  means making the leg OWN its slot and hand it to the handler — a signature and
+  ownership change, not a coverage fix, and this round deliberately changed no
+  runtime behaviour.
+
+- **File(s)**: `pkg/daemon/management.go` (F2 doc move only),
+  `pkg/daemon/management_nilpublish_5561_test.go` (new),
+  `pkg/daemon/management_authstale_5561_test.go`,
+  `pkg/daemon/management_5866_test.go`,
+  `pkg/daemon/management_authsanction_5561_test.go`,
+  `pkg/daemon/effective_listeners_6401_test.go`, `pkg/daemon/README.md`,
+  `pkg/api/server.go` (HTTPHandlerForTest), `pkg/api/auth.go` (comment scope)
+- **Validation**: `go build ./...` rc 0; `go vet ./...` rc 0; full `go test ./...`;
+  `-race` on `pkg/api` + `pkg/daemon` + `pkg/config`. Every new/renamed test name
+  confirmed present in `-count=1 -v` output (a polluted GOCACHE has silently
+  skipped new subtests before). Four mutations run to RED-with-real-assertion and
+  reverted byte-identically; one run to GREEN to disprove a claim.
+
 ## 2026-08-01 — #5561 round 11: the budget mechanism was right, its denomination and arbitration were not
 
 - **Timestamp**: 2026-08-01 (fix/5561-rest-per-principal-authz, PR #6645)

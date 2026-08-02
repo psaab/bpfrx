@@ -314,6 +314,22 @@ credential revocation is enforced even on an apply that returns early
       intersection takes on the non-nil path — and the post-rebind call is what
       converges it to nil once the loopback bind lands, so it is an intermediate
       and not a lockout.
+    - **Both call sites are load-bearing, and for DIFFERENT reasons** (#5561
+      round 16). On a rebind that FAILS, the off-loopback leg is RETAINED and
+      keeps following the server-wide snapshot, so the post-rebind call alone
+      would still land the deny-all — there the pre-rebind call is redundant.
+      What it is for is the rebind that SUCCEEDS: the old leg is then RETIRED,
+      and `api.Server.trackRetiring` PINS it to whatever `s.auth` holds at that
+      instant. The post-rebind call cannot repair that pin, because by then
+      `m.cur` is loopback so the committed nil is what publishes, and
+      `api.authSlot.tighten` drops a nil `next` by design. Without the
+      pre-rebind publish the pin captures the credential the operator DELETED,
+      and it keeps authenticating on the routable address for the whole bounded
+      drain plus every keep-alive connection already accepted. Pinned by
+      `TestMgmtRemovedCredentialNeverSurvivesOnTheRetiredLeg_5561`, which is the
+      only case in the package where this nil-direction rebind converges — every
+      other one exercises the retained path, which is why deleting the
+      pre-rebind call site was silent before round 16.
   - **Generation fence — the WHOLE desired state comes from one COMMITTED
     generation** (#5561 round 14, superseding the credential-only pin of rounds
     10 and 12). Serializing applies does not order their CONTENT: a caller that
@@ -362,7 +378,7 @@ credential revocation is enforced even on an apply that returns early
 
   Pinned by `TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866`
   (revocation honored across a failing HTTPS rebind),
-  `TestMgmtReconcileRemoveAuthDeferredWhenHTTPRebindFails_5866` (a retained
+  `TestMgmtReconcileRemoveAuthDeniesAllWhenHTTPRebindFails_5866` (a retained
   non-loopback HTTP listener gets DENY-ALL — neither the nil, which is the
   fail-open, nor the deleted credential),
   `TestMgmtNilAuthNeverDropsARetainedOffLoopbackHTTPSLeg_5561` (the same for a

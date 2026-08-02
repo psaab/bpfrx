@@ -535,7 +535,7 @@ func TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866(t *testing.T) {
 // converges to nil on the retry that binds loopback. The sibling conjunct,
 // covering a retained non-loopback HTTPS leg, is pinned by
 // TestMgmtNilAuthNeverDropsARetainedOffLoopbackHTTPSLeg_5561.
-func TestMgmtReconcileRemoveAuthDeferredWhenHTTPRebindFails_5866(t *testing.T) {
+func TestMgmtReconcileRemoveAuthDeniesAllWhenHTTPRebindFails_5866(t *testing.T) {
 	reg := newFakeReg()
 	m := newTestMgmt(reg)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -618,10 +618,11 @@ func bytesEqual(a, b []byte) bool {
 // rebind converges — asserted here in both directions, since an implementation
 // that published nothing would satisfy the revocation alone.
 //
-// The negative control for the OTHER axis is REMOVING all api-auth, which still
-// defers on a failed HTTP rebind because that direction removes a requirement
-// and can fail open. It is covered by
-// TestMgmtReconcileRemoveAuthDeferredWhenHTTPRebindFails_5866, which must stay
+// The negative control for the OTHER axis is REMOVING all api-auth. That
+// direction removes a requirement and can fail open, so what it WITHHOLDS on a
+// failed HTTP rebind is the nil itself — not the revocation, which lands at once
+// as the DENY-ALL set (#5561 round 14). It is covered by
+// TestMgmtReconcileRemoveAuthDeniesAllWhenHTTPRebindFails_5866, which must stay
 // green.
 func TestMgmtReconcileRotationRevokesDespiteHTTPRebindFailure_5561(t *testing.T) {
 	reg := newFakeReg()

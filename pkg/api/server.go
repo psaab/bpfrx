@@ -865,6 +865,29 @@ func (s *Server) ReplaceAuth(a *AuthConfig) {
 // it never drifts from what is actually enforced.
 func (s *Server) LiveAuth() *AuthConfig { return s.auth.Load() }
 
+// HTTPHandlerForTest returns the http.Handler the LIVE HTTP leg is serving, or
+// nil when no HTTP leg exists. Test-only, and specifically a CROSS-PACKAGE one
+// (#5561 round 16).
+//
+// LiveAuth reports the SERVER-WIDE snapshot, which is not what a retired leg
+// enforces: that leg's handler closes over its own authSlot, pinned at
+// retirement and only ever tightened afterwards. A pkg/daemon test that wants to
+// assert what the listener a reconcile RETIRED still admits therefore has to
+// hold the handler across the reconcile — the leg itself is unexported,
+// ReconcileHTTP has already replaced s.httpLeg by the time the reconcile
+// returns, and s.retiring holds the old leg only until it finishes draining (any
+// later ReplaceAuth prunes it), so reading it afterwards is a race. Taking the
+// handler BEFORE the reconcile is deterministic and observes exactly what a
+// caller arriving on that still-draining socket would be judged by.
+func (s *Server) HTTPHandlerForTest() http.Handler {
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+	if s.httpLeg == nil || s.httpLeg.srv == nil {
+		return nil
+	}
+	return s.httpLeg.srv.Handler
+}
+
 // HTTPSCertForTest returns the served TLS leaf certificate, or nil when the
 // server is HTTP-only (#5866). Test-only: lets a cross-package test read the cert
 // the LIVE HTTPS leg is serving after a reconcile, to assert that the durable

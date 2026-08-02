@@ -71,6 +71,17 @@ type AuthConfig struct {
 // converge the bind, or commit the address that is actually serving — are a
 // single commit away.
 //
+// Both exits are specific to the ∅ THIS function produces, which is the
+// intersection on the NON-NIL direction: that config carries a credential, so
+// committing the address that is actually serving is not re-clamped and
+// everyLiveLegNamedBy then reads true. The OTHER empty set in this system — the
+// deny-all that publishNilDirectionLocked publishes while a live leg is
+// off-loopback — is not reachable through here and does not share the second
+// exit: its config has no api-auth at all, so the #4047/#5127 clamp pulls any
+// off-loopback bind it names straight back to loopback
+// (Daemon.resolveAPIBinds), and re-committing the serving address is a no-op.
+// Its exits are to converge the loopback bind, or to re-add api-auth.
+//
 // The state is LOGGED but not otherwise operator-visible: reconcileTo warns with
 // the withheld count, but `show system services` shows the retained leg as
 // `Listening` (it is serving), has no HTTPS row at all, and the commit itself

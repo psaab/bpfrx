@@ -321,8 +321,20 @@ func mgmtAuthConfigRemoveAuth() string {
 // off-box: under-restriction, the exact direction round 10 claimed was
 // impossible.
 //
-// FAIL-ON-REVERT: restore the `if committed != nil` guard in withCommittedAuth
-// and the stale secret is live on the retained off-box listener.
+// FAIL-ON-REVERT: drop the generation fence — make committedDesired return
+// m.desired(cfg) without consulting m.d.store.ActiveConfig(). The replay then
+// drives C0's own desired state, whose off-loopback bind the fixture does NOT
+// refuse, so the reconcile returns nil where the case requires an error (the
+// t.Fatal at "the stale replay was expected to retry the committed loopback bind
+// and FAIL"), it binds 10.0.0.1:80, and it republishes the deleted secret-a.
+//
+// Round 14 replaced the credential-only override this instruction used to name
+// (`withCommittedAuth`'s `if committed != nil` guard) with that whole-state
+// fence, and the function is gone — see committedDesired for why pinning only
+// the credential half was itself a defect. The step-3 precondition additionally
+// binds publishNilDirectionLocked's DENY-ALL arm: delete
+// `m.srv.ReplaceAuth(&api.AuthConfig{})` and the assertion that the retained
+// off-loopback listener already enforces the empty set fails instead.
 func TestMgmtStaleReplayCannotResurrectRemovedAuth_5561(t *testing.T) {
 	mgmtAuthIfaceAddrs(t)
 	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
@@ -410,9 +422,14 @@ func TestMgmtStaleReplayCannotResurrectRemovedAuth_5561(t *testing.T) {
 	}
 }
 
-// TestMgmtStaleReplayWithCommittedNilKeepsOffLoopbackAuth_5561 guards the hazard
-// the fix above introduces, and the reason the repair is not simply "let the
-// ACTIVE nil overwrite the stale credential".
+// TestMgmtStaleReplayWithCommittedNilNeverDropsOffLoopbackToNoAuth_5561 guards
+// the hazard the fix above introduces, and the reason the repair is not simply
+// "let the ACTIVE nil overwrite the stale credential".
+//
+// The name is about what must NOT happen: the off-loopback listener is never
+// dropped to dynamicAuthMiddleware's pass-through. It does not KEEP a credential
+// — the assertion below is CredentialCount == 0, the deny-all set — because the
+// committed policy authorizes nobody and the removal lands immediately.
 //
 // Propagating a committed NIL through a stale replay is only safe because the
 // nil publish is gated on the addresses the LIVE listeners are bound to. The
@@ -425,10 +442,22 @@ func TestMgmtStaleReplayCannotResurrectRemovedAuth_5561(t *testing.T) {
 // with no authentication at all, which is strictly worse than the credential
 // resurrection the round-12 fix removes.
 //
-// FAIL-ON-REVERT: gate the nil publish on the HTTP rebind outcome instead of on
-// mgmtAddrIsLoopback(m.cur.addr) and the live snapshot goes nil on an
-// off-loopback listener.
-func TestMgmtStaleReplayWithCommittedNilKeepsOffLoopbackAuth_5561(t *testing.T) {
+// FAIL-ON-REVERT: make mgmtEndpoint.allLoopback return true unconditionally
+// (`return true` in place of the two mgmtAddrIsLoopback reads). The nil then
+// publishes against a live listener at 10.0.0.2:80 and the snapshot goes nil on
+// an off-loopback bind — the t.Fatal at "api-auth was removed entirely while the
+// live listener is ...".
+//
+// It is specifically the ADDRESS predicate that this case binds, not the choice
+// to gate at all: gating the publish on the HTTP REBIND OUTCOME — the
+// pre-round-12 shape — leaves it GREEN. Under the generation fence the replay
+// reconciles to the COMMITTED loopback endpoint, whose bind this fixture refuses,
+// so an outcome gate reads FALSE, deny-all publishes, and both assertions below
+// hold. The outcome gate is still wrong (it is a proxy for "the live bind is the
+// one whose #4047/#5127 clamp justified the nil", and a rebind that SUCCEEDS at
+// an off-loopback address satisfies it), but the state that exposes it is not
+// reachable from here once the endpoint is fenced to the committed generation.
+func TestMgmtStaleReplayWithCommittedNilNeverDropsOffLoopbackToNoAuth_5561(t *testing.T) {
 	mgmtAuthIfaceAddrs(t)
 	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
 

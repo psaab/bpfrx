@@ -129,6 +129,16 @@ func endpointOf(cfg api.Config) mgmtEndpoint {
 	return mgmtEndpoint{addr: cfg.Addr, httpsAddr: cfg.HTTPSAddr, tls: cfg.TLS}
 }
 
+// allLoopback reports whether every listener CURRENTLY SERVING under this
+// fingerprint is bound to a loopback address. It gates the remove-all-api-auth
+// (nil) publish: nil disables authentication outright, so it may only be
+// published once no listener is reachable from off the box. Same per-leg
+// reasoning as everyLiveLegNamedBy — an empty addr, or a cleared tls flag, means
+// that leg is not serving and imposes no requirement.
+func (e mgmtEndpoint) allLoopback() bool {
+	return mgmtAddrIsLoopback(e.addr) && (!e.tls || mgmtAddrIsLoopback(e.httpsAddr))
+}
+
 // everyLiveLegNamedBy reports whether every listener CURRENTLY SERVING under
 // this fingerprint sits at an address `next` names. It is the question the
 // grant-half gate means to ask (#5561 round 13); `rebinding && len(errs) == 0`
@@ -150,16 +160,6 @@ func endpointOf(cfg api.Config) mgmtEndpoint {
 // because each field advances only on its own leg's successful reconcile: read
 // BEFORE the rebinds it says whether anything is about to move off what `next`
 // names; read AFTER, whether everything landed on it.
-// allLoopback reports whether every listener CURRENTLY SERVING under this
-// fingerprint is bound to a loopback address. It gates the remove-all-api-auth
-// (nil) publish: nil disables authentication outright, so it may only be
-// published once no listener is reachable from off the box. Same per-leg
-// reasoning as everyLiveLegNamedBy — an empty addr, or a cleared tls flag, means
-// that leg is not serving and imposes no requirement.
-func (e mgmtEndpoint) allLoopback() bool {
-	return mgmtAddrIsLoopback(e.addr) && (!e.tls || mgmtAddrIsLoopback(e.httpsAddr))
-}
-
 func (e mgmtEndpoint) everyLiveLegNamedBy(next api.Config) bool {
 	if e.addr != next.Addr {
 		return false
@@ -550,11 +550,30 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 // over-restricts and waits for the next commit, exactly as the intersection does
 // on the non-nil path (#5561 round 14, MAJOR 4).
 //
-// Both call sites matter. Before the rebinds this can only publish deny-all when
-// a listener is still serving off-loopback — that is the revocation landing
-// immediately. After the rebinds it is what CONVERGES: the loopback bind has
-// landed, so the nil the operator committed genuinely takes effect and deny-all
-// is not a lockout.
+// Both call sites matter, for DIFFERENT reasons, and the pre-rebind one's reason
+// is not the obvious one (#5561 round 16). Read naively it is "the revocation
+// lands immediately" — but on a rebind that FAILS the off-loopback leg is
+// RETAINED, keeps following the server-wide snapshot, and the post-rebind call
+// publishes the same deny-all against the same unchanged m.cur. On that path the
+// pre-rebind call is genuinely redundant, which is why deleting it was silent
+// through round 15.
+//
+// It is load-bearing on the rebind that SUCCEEDS, because there the old leg is
+// RETIRED rather than retained, and a retired leg stops following the
+// server-wide snapshot at the instant of retirement: api.Server.trackRetiring
+// PINS it to whatever s.auth holds then. The post-rebind call cannot repair that
+// pin — m.cur is loopback by then, so what publishes is the committed nil, and
+// api.authSlot.tighten drops a nil next by design (a nil REMOVES a requirement).
+// Without this publish the pin captures the credential the operator DELETED, and
+// retirement is asynchronous: the socket keeps accepting until the serve
+// goroutine reaches Shutdown, and connections already accepted are served for the
+// whole bounded drain. Guarded by
+// TestMgmtRemovedCredentialNeverSurvivesOnTheRetiredLeg_5561 — the only case in
+// the package whose nil-direction rebind converges.
+//
+// After the rebinds it is what CONVERGES: the loopback bind has landed, so the
+// nil the operator committed genuinely takes effect and deny-all is not a
+// lockout.
 func (m *managementReconciler) publishNilDirectionLocked() {
 	if m.cur.allLoopback() {
 		m.srv.ReplaceAuth(nil)

@@ -285,7 +285,7 @@ func TestMgmtWithheldGrantIsExitableByASubsequentCommit_5561(t *testing.T) {
 //	    (!m.cur.tls || mgmtAddrIsLoopback(m.cur.httpsAddr))
 //
 // The sibling conjunct (the live HTTP address) is pinned by
-// TestMgmtReconcileRemoveAuthDeferredWhenHTTPRebindFails_5866. This one was not
+// TestMgmtReconcileRemoveAuthDeniesAllWhenHTTPRebindFails_5866. This one was not
 // pinned by anything: deleting it left the whole pkg/daemon suite green.
 //
 // The state it guards is reachable in one commit. Removing ALL api-auth makes

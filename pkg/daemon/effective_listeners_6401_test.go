@@ -154,3 +154,47 @@ func TestEffectiveHTTPListenerServeExitFails(t *testing.T) {
 		t.Fatalf("HTTP serve exit not reported Failed (still Listening on a dead leg): %+v", got)
 	}
 }
+
+// TestEffectiveHTTPListenerReportsTheRETRIED_Address_6401 covers the reconcileTo
+// half of the #6401 attempted-address record. Both write sites matter and only
+// the startTo one was pinned: deleting `m.lastHTTPAttempt = next.Addr` from
+// reconcileTo left build, vet and the whole pkg/daemon suite green.
+//
+// The state is a boot bind that FAILED (curSet stays false, so
+// effectiveHTTPListener reports lastHTTPAttempt rather than cur.addr) followed by
+// a day-2 commit that moves the bind and fails too. `show system services` must
+// name the address the listener is retrying NOW, not the one it failed at boot —
+// the boot address is not being retried by anything and reporting it sends the
+// operator to check the wrong interface.
+func TestEffectiveHTTPListenerReportsTheRETRIED_Address_6401(t *testing.T) {
+	reg := newFakeReg()
+	reg.failAddr["10.0.0.1:8080"] = true
+	reg.failAddr["10.0.0.2:8080"] = true
+	m := newTestMgmt(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:8080", false, "", nil)); err == nil {
+		t.Fatal("the BOOT bind was expected to fail; the case needs curSet false, which is " +
+			"what makes effectiveHTTPListener report the attempted address at all")
+	}
+	if got := m.effectiveHTTPListener(); got.Addr != "10.0.0.1:8080" || got.State != sysservices.StateFailed {
+		t.Fatalf("after the failed boot bind: %+v, want Failed at 10.0.0.1:8080", got)
+	}
+
+	// Day 2: the operator moves the bind. It fails too, so the listener is still
+	// down — but it is now retrying a DIFFERENT address.
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.2:8080", false, "", nil)); err == nil {
+		t.Fatal("the day-2 rebind was expected to fail as well; if it succeeded the reconciler " +
+			"would be Listening and the attempted-address field would not be read")
+	}
+	got := m.effectiveHTTPListener()
+	if got.State != sysservices.StateFailed {
+		t.Fatalf("state = %v, want StateFailed: %+v", got.State, got)
+	}
+	if got.Addr != "10.0.0.2:8080" {
+		t.Fatalf("`show system services` reports %q, want the address actually being retried, "+
+			"10.0.0.2:8080. The boot address is stale: the operator moved the bind, and every "+
+			"later reconcile now attempts 10.0.0.2:8080", got.Addr)
+	}
+}
