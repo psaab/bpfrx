@@ -953,6 +953,153 @@ fn build_live_forward_request_emits_output_filter_log_event() {
 }
 
 
+/// #6713/#6722 binding for `forward_request.rs`'s OWN `egress_zone_id` call.
+///
+/// `build_live_forward_request` resolves the filter-log egress zone with a
+/// SECOND, independent call to the shared resolver -- it does not go through
+/// `filter_log_egress_zone_id`. Reverting just that line to the pre-#6713
+/// `state.egress`-only read left the entire suite green, because the sibling
+/// test above (`build_live_forward_request_emits_output_filter_log_event`) uses
+/// a MAC-FUL egress interface where both reads agree.
+///
+/// Same topology as that test, with ONE difference: the egress interface is
+/// MAC-less (an IPsec xfrmi), so `populate_egress`'s `src_mac` gate leaves it
+/// with NO `state.egress` row and the zone can only come from the ifindex maps.
+/// The emitted event must still carry the tunnel's real zone. A third ifindex
+/// carrying only a PROPAGATED sibling zone is asserted to log 0 by
+/// `poll_descriptor::filter::filter_log_egress_zone_tests`.
+#[test]
+fn build_live_forward_request_logs_a_macless_egress_zone_6713() {
+    let src_ip = Ipv4Addr::new(10, 0, 0, 1);
+    let dst_ip = Ipv4Addr::new(198, 51, 100, 20);
+    let meta = UserspaceDpMeta {
+        ingress_ifindex: 10,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        pkt_len: 64,
+        dscp: 0,
+        ..UserspaceDpMeta::default()
+    };
+    let flow = SessionFlow {
+        src_ip: IpAddr::V4(src_ip),
+        dst_ip: IpAddr::V4(dst_ip),
+        forward_key: SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(src_ip),
+            dst_ip: IpAddr::V4(dst_ip),
+            src_port: 49152,
+            dst_port: 443,
+        },
+    };
+    let filter_state = crate::filter::parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "egress-log".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "log-web".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["443".into()],
+                action: "accept".into(),
+                log: true,
+                ..Default::default()
+            }],
+        }],
+        &[],
+        &[crate::InterfaceSnapshot {
+            name: "st0.0".into(),
+            ifindex: 12,
+            filter_output_v4: "egress-log".into(),
+            ..Default::default()
+        }],
+        "",
+        "",
+    )
+    .expect("filter state compiles");
+    let mut forwarding = ForwardingState {
+        filter_state,
+        tx_selection_enabled_v4: true,
+        ..ForwardingState::default()
+    };
+    forwarding.ifindex_to_zone_id.insert(10, TEST_LAN_ZONE_ID);
+    // The MAC-less tunnel: zoned in BOTH ifindex maps (what
+    // `populate_interfaces` writes) and deliberately absent from `egress`
+    // (what `populate_egress`'s `src_mac` gate does to an xfrmi).
+    forwarding.ifindex_to_zone_id.insert(12, TEST_WAN_ZONE_ID);
+    forwarding.ifindex_own_zone_id.insert(12, TEST_WAN_ZONE_ID);
+    assert!(
+        !forwarding.egress.contains_key(&12),
+        "precondition: the MAC-less egress interface must have NO egress row"
+    );
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 12,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V4(dst_ip)),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+            tx_vlan_id: 0,
+        },
+        nat: NatDecision::default(),
+    };
+    let ingress = BindingIdentity {
+        slot: 0,
+        queue_id: 0,
+        worker_id: 0,
+        interface: Arc::<str>::from("ge-0-0-1"),
+        ifindex: 10,
+    };
+    let (event_handle, event_rx) = crate::event_stream::test_worker_handle(
+        8,
+        DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+
+    let _req = build_live_forward_request_from_frame(
+        &WorkerBindingLookup::default(),
+        0,
+        &ingress,
+        XdpDesc {
+            addr: 0,
+            len: 0,
+            options: 0,
+        },
+        &[],
+        meta,
+        &decision,
+        &forwarding,
+        Some(&flow),
+        None,
+        false,
+        123,
+        Some(&event_handle),
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("output filter log should not block forwarding");
+
+    let filter_event = event_rx
+        .try_recv()
+        .expect("output filter-log event")
+        .decode_dataplane_event()
+        .expect("filter-log payload");
+    assert_eq!(filter_event.kind, DataplaneEventKind::FilterLog);
+    assert_eq!(filter_event.ingress_zone_id, TEST_LAN_ZONE_ID);
+    assert_eq!(
+        filter_event.egress_zone_id, TEST_WAN_ZONE_ID,
+        "the filter-log record for a flow egressing a MAC-less tunnel must carry \
+         the tunnel's real zone, not the 0 'unknown' sentinel"
+    );
+}
+
+
 #[test]
 fn build_live_forward_request_uses_flow_or_metadata_ports_when_frame_ports_unavailable() {
     let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();

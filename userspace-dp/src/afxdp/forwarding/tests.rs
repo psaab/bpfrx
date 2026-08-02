@@ -5268,13 +5268,22 @@ fn secure_tunnel_operator_deny_is_attributed_to_its_rule_6713() {
     );
 }
 
-/// #6713 scoping guard. The `ifindex_to_zone_id` fallback fires ONLY when the
-/// interface has NO `egress` row. A MAC-ful interface the operator deliberately
-/// left UNZONED keeps to-zone 0 even though `ifindex_to_zone_id` carries the
-/// zone PROPAGATED onto it from a zoned VLAN unit -- inheriting that would
-/// widen the adjudicated zone pair for ordinary trunks.
+/// #6713 scoping guard. The fallback fires ONLY when the interface has NO
+/// `egress` row. A MAC-ful interface the operator deliberately left UNZONED
+/// keeps to-zone 0 even though `ifindex_to_zone_id` carries the zone PROPAGATED
+/// onto it from a zoned VLAN unit -- inheriting that would widen the
+/// adjudicated zone pair for ordinary trunks.
 ///
-/// Widen the fallback to also fire on `Some(0)` and this goes RED.
+/// #6722 note on what this now catches. Widening the fallback to also fire on
+/// `Some(0)` -- the mutation this guard was written for -- no longer reds it on
+/// its own, because the fallback reads `ifindex_own_zone_id` and a genuinely
+/// unzoned interface has no entry there either. That is the fix strengthening
+/// the property, not coverage lost: it takes the FULL widening (fire on
+/// `Some(0)` AND re-point the fallback at the propagated `ifindex_to_zone_id`)
+/// to red this test, and either half alone is caught by
+/// `unzoned_macless_unit_cannot_inherit_a_sibling_zone_6722`, which covers the
+/// MAC-LESS half of the same domain -- the half that has no `egress` row to
+/// stop the fallback in the first place.
 #[test]
 fn unzoned_interface_with_egress_row_stays_zone_zero_6713() {
     let state = build_forwarding_state(&secure_tunnel_snapshot_6713(
@@ -5301,4 +5310,291 @@ fn unzoned_interface_with_egress_row_stays_zone_zero_6713() {
         to_id, 0,
         "an interface with an egress row carrying zone_id 0 must stay 0"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #6722: the #6713 fallback must resolve the interface's OWN zone, never a
+// zone PROPAGATED onto its ifindex from a zoned sibling unit.
+//
+// `populate_interfaces` writes a zoned child's zone onto `parent_ifindex` when
+// the parent has no entry of its own, so `ifindex_to_zone_id` is NOT a pure
+// "this interface's zone" map. For a MAC-FUL parent that propagation is
+// harmless to the egress resolver -- the parent has an `egress` row carrying 0,
+// so the fallback never fires (`unzoned_interface_with_egress_row_stays_zone_zero_6713`).
+// A MAC-LESS parent has no row, so reading the propagated map would hand an
+// interface the operator left in NO zone its sibling's zone, and the sibling's
+// `permit` would then match transit that must be denied.
+// ---------------------------------------------------------------------------
+
+/// The zone the SIBLING tunnel unit is in. Distinct from `lan`; the unzoned
+/// unit under test must never resolve to it.
+const TEST_SIBLING_VPN_ZONE_ID_6722: u16 = TEST_DMZ_ZONE_ID;
+/// `st0` base AND `st0.0` -- one xfrmi netdev, so `snapshotLinuxName` maps unit
+/// 0 back onto the base name and both share this ifindex. UNZONED.
+const UNZONED_TUNNEL_IFINDEX_6722: i32 = 42;
+/// `st0.1` -- its own xfrmi netdev (`bind-interface st0.1`), zoned.
+const ZONED_TUNNEL_IFINDEX_6722: i32 = 43;
+
+/// Two secure tunnels on one `st0`, which is legal config: `pkg/config/xfrmi.go`
+/// names the device `LinuxIfName(bindIface)`, so `bind-interface st0` and
+/// `bind-interface st0.1` are distinct netdevs. The operator zones ONLY unit 1:
+///
+/// ```text
+/// set interfaces st0 unit 0 family inet address 10.5.5.1/30    # NO zone
+/// set interfaces st0 unit 1 family inet address 10.6.6.1/30
+/// set security zones security-zone vpnb interfaces st0.1       # unit 1 only
+/// set routing-options static route 192.168.99.0/24 next-hop 10.5.5.2  # -> unit 0
+/// set routing-options static route 192.168.98.0/24 next-hop 10.6.6.2  # -> unit 1
+/// set security policies from-zone lan to-zone vpnb policy p ... then permit
+/// set security policies default-policy deny-all
+/// ```
+///
+/// Both units are MAC-less, so NEITHER gets a `state.egress` row and the
+/// #6713 fallback is the only thing resolving either to-zone. Unit 1 must
+/// resolve `vpnb` (#6713) and unit 0 must stay 0 (#6722) -- the two properties
+/// this fixture holds together.
+fn sibling_tunnel_units_snapshot_6722() -> ConfigSnapshot {
+    ConfigSnapshot {
+        zones: vec![
+            ZoneSnapshot {
+                name: "lan".to_string(),
+                id: TEST_LAN_ZONE_ID,
+                ..Default::default()
+            },
+            ZoneSnapshot {
+                name: "vpnb".to_string(),
+                id: TEST_SIBLING_VPN_ZONE_ID_6722,
+                ..Default::default()
+            },
+        ],
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "reth1.0".to_string(),
+                zone: "lan".to_string(),
+                linux_name: "ge-0-0-1".to_string(),
+                ifindex: LAN_IFINDEX_6713,
+                mtu: 1500,
+                hardware_addr: "02:bf:72:01:00:01".to_string(),
+                addresses: vec![InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "10.0.61.1/24".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+            // st0 base: no zone, MAC-less. Real Junos zones the UNIT, so the
+            // base is unzoned in the deployed shape whether or not unit 0 is.
+            InterfaceSnapshot {
+                name: "st0".to_string(),
+                linux_name: "st0".to_string(),
+                ifindex: UNZONED_TUNNEL_IFINDEX_6722,
+                mtu: 1400,
+                unit_count: 2,
+                ..Default::default()
+            },
+            // st0.0: addressed and ROUTED but deliberately left in no zone.
+            InterfaceSnapshot {
+                name: "st0.0".to_string(),
+                linux_name: "st0".to_string(),
+                parent_linux_name: "st0".to_string(),
+                ifindex: UNZONED_TUNNEL_IFINDEX_6722,
+                parent_ifindex: UNZONED_TUNNEL_IFINDEX_6722,
+                mtu: 1400,
+                addresses: vec![InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "10.5.5.1/30".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+            // st0.1: zoned `vpnb`, own netdev, parent = the shared st0 base.
+            // Its zone is what `populate_interfaces` propagates onto ifindex 42.
+            InterfaceSnapshot {
+                name: "st0.1".to_string(),
+                zone: "vpnb".to_string(),
+                linux_name: "st0.1".to_string(),
+                parent_linux_name: "st0".to_string(),
+                ifindex: ZONED_TUNNEL_IFINDEX_6722,
+                parent_ifindex: UNZONED_TUNNEL_IFINDEX_6722,
+                mtu: 1400,
+                addresses: vec![InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "10.6.6.1/30".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+        ],
+        routes: vec![
+            RouteSnapshot {
+                table: "inet.0".to_string(),
+                family: "inet".to_string(),
+                destination: "192.168.99.0/24".to_string(),
+                next_hops: vec!["10.5.5.2".to_string()],
+                discard: false,
+                next_table: String::new(),
+                preference: 5,
+            },
+            RouteSnapshot {
+                table: "inet.0".to_string(),
+                family: "inet".to_string(),
+                destination: "192.168.98.0/24".to_string(),
+                next_hops: vec!["10.6.6.2".to_string()],
+                discard: false,
+                next_table: String::new(),
+                preference: 5,
+            },
+        ],
+        default_policy: "deny".to_string(),
+        policies: vec![PolicyRuleSnapshot {
+            name: "lan-to-vpnb".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "vpnb".to_string(),
+            source_addresses: vec!["any".to_string()],
+            destination_addresses: vec!["any".to_string()],
+            applications: vec!["any".to_string()],
+            application_terms: Vec::new(),
+            action: "permit".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// Resolve `dst` through the real FIB and assert it egresses `expect_ifindex`,
+/// then adjudicate LAN -> that ifindex through the real policy evaluator.
+fn adjudicate_lan_transit_6722(
+    state: &ForwardingState,
+    dst: &str,
+    expect_ifindex: i32,
+) -> (u16, crate::policy::PolicyEvaluationResult) {
+    let resolution = lookup_forwarding_resolution_v4(
+        state,
+        None,
+        dst.parse().expect("dst"),
+        "inet.0",
+        0,
+        true,
+        None,
+    );
+    assert_eq!(
+        resolution.egress_ifindex, expect_ifindex,
+        "precondition: the real FIB must hand {dst} to ifindex {expect_ifindex} \
+         (disposition {:?})",
+        resolution.disposition
+    );
+    let (from_id, to_id) =
+        zone_pair_ids_for_flow(state, LAN_IFINDEX_6713, resolution.egress_ifindex);
+    assert_eq!(from_id, TEST_LAN_ZONE_ID, "from-zone");
+    let result = crate::policy::evaluate_policy_result_with_icmp(
+        &state.policy,
+        from_id,
+        to_id,
+        "10.0.61.102".parse().expect("src"),
+        dst.parse().expect("dst"),
+        PROTO_TCP,
+        40000,
+        443,
+        None,
+        64,
+    );
+    (to_id, result)
+}
+
+/// #6722 core, fail-on-revert. Transit routed out the UNZONED MAC-less unit
+/// must adjudicate against `(lan, 0)` and be DENIED by the implicit default
+/// policy. Point the fallback at `ifindex_to_zone_id` (the pre-#6722 read) and
+/// the unit inherits `vpnb` from its sibling, the operator's
+/// `from-zone lan to-zone vpnb permit` matches, and this goes RED on the
+/// zone id, the action AND the policy id.
+///
+/// The permit matching here is a real forwarding change, not a logging one:
+/// the disposition is `MissingNeighbor`, and a PERMIT on that disposition is
+/// `is_slow_path_eligible` -> reinjected to the kernel, while a DENY breaks to
+/// `RecycleAndContinue`.
+#[test]
+fn unzoned_macless_unit_cannot_inherit_a_sibling_zone_6722() {
+    let state = build_forwarding_state(&sibling_tunnel_units_snapshot_6722());
+
+    assert!(
+        !state.egress.contains_key(&UNZONED_TUNNEL_IFINDEX_6722),
+        "precondition: the MAC-less unzoned unit must have NO egress row -- without \
+         that the #6713 fallback never fires and this test cannot detect the widening"
+    );
+    assert_eq!(
+        state
+            .ifindex_to_zone_id
+            .get(&UNZONED_TUNNEL_IFINDEX_6722)
+            .copied(),
+        Some(TEST_SIBLING_VPN_ZONE_ID_6722),
+        "precondition: the sibling's zone IS propagated onto the unzoned unit's \
+         ifindex in ifindex_to_zone_id -- that propagation is exactly what the \
+         egress resolver must refuse to inherit"
+    );
+
+    let (to_id, result) =
+        adjudicate_lan_transit_6722(&state, "192.168.99.7", UNZONED_TUNNEL_IFINDEX_6722);
+
+    assert_eq!(
+        to_id, 0,
+        "an interface the operator left in NO zone must resolve to the 0 'unknown' \
+         sentinel, not to the zone propagated from its zoned sibling unit"
+    );
+    assert_eq!(
+        result.action,
+        PolicyAction::Deny,
+        "the only permit is scoped to (lan, vpnb) and this interface is in no zone; \
+         the default-DENY policy must deny"
+    );
+    assert_eq!(
+        result.policy_id,
+        crate::policy::DEFAULT_POLICY_SENTINEL_ID,
+        "the deny must be attributed to the implicit default policy -- an operator \
+         rule id here means the sibling's permit matched"
+    );
+}
+
+/// #6713 in the DEPLOYED shape, and the other half of the #6722 pair. Real
+/// Junos zones the UNIT (`set security zones security-zone vpnb interfaces
+/// st0.1`), never the base, so the zone reaching the egress resolver comes from
+/// the unit's own entry. This tunnel is MAC-less exactly like the unzoned one
+/// above -- the ONLY difference is that the operator put it in a zone -- and it
+/// must still reach the policy plane and be permitted.
+///
+/// Scoping the #6722 fix too tightly (for example recording only the physical
+/// base's zone) reintroduces #6713 here: to-zone collapses to 0 and the
+/// operator's permit stops matching.
+#[test]
+fn zoned_macless_unit_still_reaches_policy_6713() {
+    let state = build_forwarding_state(&sibling_tunnel_units_snapshot_6722());
+
+    assert!(
+        !state.egress.contains_key(&ZONED_TUNNEL_IFINDEX_6722),
+        "precondition: the zoned unit is MAC-less too, so it also has NO egress row \
+         -- the fallback is the only thing that can resolve its zone"
+    );
+
+    let (to_id, result) =
+        adjudicate_lan_transit_6722(&state, "192.168.98.7", ZONED_TUNNEL_IFINDEX_6722);
+
+    assert_eq!(
+        to_id, TEST_SIBLING_VPN_ZONE_ID_6722,
+        "the tunnel unit's OWN configured zone must reach the policy plane"
+    );
+    assert_eq!(
+        result.action,
+        PolicyAction::Permit,
+        "the operator's from-zone lan to-zone vpnb permit must match"
+    );
+    assert_ne!(
+        result.policy_id,
+        crate::policy::DEFAULT_POLICY_SENTINEL_ID,
+        "the verdict must come from the operator's rule, not the default policy"
+    );
+
+    // The String twin used by test-only callers reads the same helper.
+    let (from_zone, to_zone) =
+        zone_pair_for_flow(&state, LAN_IFINDEX_6713, ZONED_TUNNEL_IFINDEX_6722);
+    assert_eq!(from_zone, "lan");
+    assert_eq!(to_zone, "vpnb");
 }

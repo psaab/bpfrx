@@ -1369,3 +1369,109 @@ mod filter_terminal_tests {
         );
     }
 }
+
+/// #6713/#6722: the filter-log egress-zone field must report exactly the
+/// to-zone the policy plane adjudicated, for BOTH halves of the shared
+/// resolver. `emit_cached_output_filter_log_tail` (the flow-cache-hit output
+/// path) is the only production caller of `filter_log_egress_zone_id`, and
+/// before #6713 it open-coded a `state.egress`-only read.
+///
+/// Nothing bound that call site: every other filter-log assertion in the suite
+/// uses a MAC-FUL interface, where the `egress` row and the ifindex maps agree,
+/// so reverting the helper body to
+/// `forwarding.egress.get(&ifx).map(|i| i.zone_id).unwrap_or(0)` left the whole
+/// suite green. These two tests close it — the first goes RED on that revert,
+/// the second goes RED if the fallback is re-pointed at `ifindex_to_zone_id`.
+#[cfg(test)]
+mod filter_log_egress_zone_tests {
+    use super::*;
+    use crate::test_zone_ids::{TEST_DMZ_ZONE_ID, TEST_LAN_ZONE_ID};
+
+    /// An ordinary MAC-ful zoned interface: `populate_egress` gives it a row.
+    const MACFUL_IFINDEX: i32 = 12;
+    /// A MAC-less unit the operator left UNZONED (`st0` / `st0.0`). It carries
+    /// ONLY the zone its zoned sibling propagated onto the shared parent
+    /// ifindex — the #6722 shape.
+    const MACLESS_UNZONED_IFINDEX: i32 = 42;
+    /// A MAC-less unit the operator DID zone (`st0.1`). No `egress` row either
+    /// (the `src_mac` gate is unconditional for an xfrmi) — the #6713 shape.
+    const MACLESS_ZONED_IFINDEX: i32 = 43;
+
+    /// Mirrors what `build_forwarding_state` produces for the two-tunnels-on-one-
+    /// `st0` topology in `afxdp::forwarding::tests::sibling_tunnel_units_snapshot_6722`:
+    /// no `egress` row for either MAC-less unit, `ifindex_to_zone_id` carrying
+    /// the propagated zone on BOTH, and `ifindex_own_zone_id` carrying it only
+    /// on the unit that is actually in a zone.
+    fn forwarding_with_macless_egress() -> ForwardingState {
+        let mut fw = ForwardingState::default();
+        fw.egress.insert(
+            MACFUL_IFINDEX,
+            EgressInterface {
+                bind_ifindex: MACFUL_IFINDEX,
+                vlan_id: 0,
+                mtu: 1500,
+                src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+                zone_id: TEST_LAN_ZONE_ID,
+                redundancy_group: 0,
+                primary_v4: None,
+                primary_v6: None,
+            },
+        );
+        fw.ifindex_to_zone_id
+            .insert(MACFUL_IFINDEX, TEST_LAN_ZONE_ID);
+        fw.ifindex_own_zone_id
+            .insert(MACFUL_IFINDEX, TEST_LAN_ZONE_ID);
+        fw.ifindex_to_zone_id
+            .insert(MACLESS_UNZONED_IFINDEX, TEST_DMZ_ZONE_ID);
+        fw.ifindex_to_zone_id
+            .insert(MACLESS_ZONED_IFINDEX, TEST_DMZ_ZONE_ID);
+        fw.ifindex_own_zone_id
+            .insert(MACLESS_ZONED_IFINDEX, TEST_DMZ_ZONE_ID);
+        fw
+    }
+
+    /// #6713 at the log site: a flow egressing a correctly-zoned MAC-less
+    /// tunnel must log that tunnel's zone, not 0.
+    #[test]
+    fn filter_log_egress_zone_id_reports_a_macless_tunnels_zone_6713() {
+        let fw = forwarding_with_macless_egress();
+        assert!(
+            !fw.egress.contains_key(&MACLESS_ZONED_IFINDEX),
+            "precondition: the MAC-less tunnel has NO egress row -- that hole is \
+             what makes this call site interesting"
+        );
+        assert_eq!(
+            filter_log_egress_zone_id(&fw, MACLESS_ZONED_IFINDEX),
+            TEST_DMZ_ZONE_ID,
+            "the logged to-zone must match the zone the policy plane adjudicated"
+        );
+        // Control: the MAC-ful interface is unaffected either way.
+        assert_eq!(
+            filter_log_egress_zone_id(&fw, MACFUL_IFINDEX),
+            TEST_LAN_ZONE_ID
+        );
+    }
+
+    /// #6722 at the log site: an interface the operator left UNZONED must log
+    /// zone 0 even though its ifindex carries a zone propagated from a zoned
+    /// sibling. The log must not claim a zone the policy plane refused to use.
+    #[test]
+    fn filter_log_egress_zone_id_refuses_a_propagated_sibling_zone_6722() {
+        let fw = forwarding_with_macless_egress();
+        assert_eq!(
+            fw.ifindex_to_zone_id
+                .get(&MACLESS_UNZONED_IFINDEX)
+                .copied(),
+            Some(TEST_DMZ_ZONE_ID),
+            "precondition: the sibling's zone IS propagated onto this ifindex"
+        );
+        assert_eq!(
+            filter_log_egress_zone_id(&fw, MACLESS_UNZONED_IFINDEX),
+            0,
+            "an unzoned interface logs the 0 sentinel, matching the zone pair the \
+             policy plane adjudicated"
+        );
+        // An ifindex in neither map is 0 as well.
+        assert_eq!(filter_log_egress_zone_id(&fw, 9999), 0);
+    }
+}

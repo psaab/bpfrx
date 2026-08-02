@@ -798,7 +798,7 @@ SAME authoritative source. The ingress half reads
 `ForwardingState::ifindex_to_zone_id`; the egress half calls
 `ForwardingState::egress_zone_id`, which prefers the denormalized
 `EgressInterface.zone_id` (one map lookup + a field load on the hot path) and
-falls back to `ifindex_to_zone_id` when the interface has **no `egress` row at
+falls back to `ifindex_own_zone_id` when the interface has **no `egress` row at
 all**.
 
 That fallback is load-bearing, not defensive. `forwarding_build::populate_egress`
@@ -818,20 +818,78 @@ to the implicit default policy — pointing every diagnostic at the wrong place.
 
 Scope of the fallback:
 
-- It fires ONLY when `egress` has no row. A row that exists carrying
-  `zone_id == 0` (a genuinely unzoned interface) stays 0 — `ifindex_to_zone_id`
-  also holds the zone PROPAGATED from a child unit onto its physical parent, and
-  inheriting that would widen the adjudicated pair for ordinary VLAN trunks. So
-  for every ifindex that HAS an egress row the resolved to-zone is unchanged.
+- **It reads the interface's OWN zone, never a propagated one (#6722).**
+  `ifindex_to_zone_id` is NOT a pure "this interface's zone" map:
+  `populate_interfaces` also writes a zoned child unit's zone onto
+  `parent_ifindex` when the parent has no entry, because the INGRESS half wants
+  that (a packet arriving on a trunk parent is attributed to its unit's zone,
+  #921/#3618). The egress half must not inherit it. `populate_interfaces`
+  therefore records the own-zone value a second time in `ifindex_own_zone_id`,
+  omitting the propagation, and `egress_zone_id`'s fallback reads that map.
+  Both of its branches then answer the same question — `populate_egress` also
+  derives `EgressInterface.zone_id` from the interface's own `iface.zone`.
+
+  Reading the propagated map instead is a fail-OPEN, and the reachable shape is
+  two secure tunnels on one `st0`: `bind-interface st0` (unit 0, addressed and
+  routed, left in NO zone) plus `bind-interface st0.1` (zoned). Both units are
+  MAC-less so neither has an `egress` row to stop the fallback; unit 1's zone is
+  propagated onto the shared parent ifindex; unit 0 would then adjudicate under
+  unit 1's zone and be PERMITTED by its `from-zone lan to-zone <vpn> permit`,
+  sending traffic out a different IPsec SA than the operator authorised. Note
+  the ingress half is NOT symmetrically exposed: an interface with an empty zone
+  is never an AF_XDP ingress bind target (`pkg/dataplane/userspace/interfaces.go`,
+  `maps_sync.go`, all gated on `iface.Zone == ""`), so the egress side is the
+  only reachable path for this widening.
+- A row that exists carrying `zone_id == 0` still stays 0, so for every ifindex
+  that HAS an egress row the resolved to-zone is bit-identical to the pre-#6713
+  read. With the own-zone scoping in place this short-circuit is redundant
+  rather than load-bearing (a genuinely unzoned interface has no own-zone entry
+  either), so the property is defended twice; it is kept because `egress` and
+  `ifindex_own_zone_id` can still diverge under a pathological snapshot in which
+  two interface entries share one ifindex and only one passes the `src_mac` gate.
 - `egress_zone_id` is the single egress-zone resolver: policy adjudication, the
-  #3651 per-zone traffic counter, and the filter-log `egress_zone_id` field all
-  route through it, so the adjudicated zone and the logged/counted zone cannot
-  disagree.
+  #3651 per-zone traffic counter, the filter-log `egress_zone_id` field (both
+  the flow-cache-hit path via `filter_log_egress_zone_id` and
+  `forward_request`'s own independent call), and the local-origin tunnel TX
+  path's `SyncedSessionEntry` zones all route through it, so the adjudicated
+  zone and the logged/counted zone cannot disagree.
 - The MAC-less interface is still ABSENT from `state.egress`, so nothing on the
   TX path changes: `session_glue::populate_egress_resolution` still leaves
   `src_mac = None` and `tx_ifindex = egress_ifindex` for it, and the packet still
   reaches the kernel through the slow-path reinject rather than an AF_XDP TX with
   an all-zero source MAC on a link-layer-less device.
+
+**Downstream consumers of the corrected to-zone.** Resolving a real to-zone
+where the code previously saw 0 changes more than the policy verdict. All are
+correct-direction — the zone the operator configured is finally the zone the
+dataplane uses — but they are behavior changes on a LAN→tunnel flow and are
+listed here so a bisect does not have to rediscover them:
+
+- **Source-NAT rule-set scoping** and the `MissingNeighborSeed` metadata now see
+  the tunnel's zone; a rule-set scoped `to zone <vpn>` fires where it did not.
+- **NPTv6 outbound translation** (`poll_descriptor::translate_outbound`, plus the
+  fragment probe in `frag_assoc`) is egress-zone-scoped by #5176, so an NPTv6
+  rule-set scoped to the tunnel's zone now translates LAN→tunnel traffic. This is
+  a *translation* change, not only a policy change.
+- **Fabric zone-encoded redirect.** The reverse companion of a LAN→tunnel
+  session carries the forward session's egress zone as its `ingress_zone`, so
+  when locally HA-inactive it emits a zone-stamped synthetic fabric source MAC
+  where it previously emitted the real fabric MAC. The receiving side gates the
+  decode on `zone_encoded_fabric_stamp_valid`, which requires `zone_to_rgs[zone]`
+  to be non-empty — and `populate_zone_to_rgs` reads `state.egress`, which a
+  MAC-less tunnel has no row in. For a tunnel-only zone the stamp is therefore
+  rejected and the frame degrades to an ordinary unstamped fabric-ingress
+  packet: wire-visible on the HA fabric, but graceful, with no drop.
+- **Per-zone half-open window.** The #3527 SYN-flood `timeout` override is keyed
+  on the reverse companion's `ingress_zone`, so the tunnel zone's override now
+  applies where the global default used to.
+
+**Upgrade direction.** The change is bidirectional, not permit-only. Under
+`default-policy permit-all` plus an explicit `from-zone lan to-zone <vpn> ...
+then deny`, the pre-#6713 build adjudicated `(lan, 0)` → default permit → traffic
+flowed; it now adjudicates `(lan, vpn)` → the operator's deny matches → traffic
+STOPS on upgrade. That is the configured verdict finally being honored, but it
+is a live-traffic change in the deny direction.
 
 **Malformed-address fail-closed (#3367 legacy, #3711 v3 + books).** Every
 address parse path in the snapshot builder REPORTS an unparseable token and

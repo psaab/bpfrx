@@ -66300,3 +66300,66 @@ break — `go vet` confirmed passing under every revert.
   userspace-dp/src/afxdp/poll_descriptor/filter.rs,
   userspace-dp/src/afxdp/forward_request.rs,
   docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-01
+- **Action**: #6722 fold — scope the #6713 egress-zone fallback to the
+  interface's OWN zone (MAJOR fail-open), bind the two unguarded call sites,
+  sweep the last open-coded reader.
+  The #6713 fallback read `ifindex_to_zone_id`, which is NOT a pure
+  "this interface's zone" map: `populate_interfaces` also propagates a zoned
+  child unit's zone onto `parent_ifindex` when the parent has no entry. The
+  shipped scope claim ("an existing row carrying `zone_id == 0` stays 0, so an
+  unzoned interface does not inherit a propagated zone") covered only the
+  MAC-FUL half of the domain — a MAC-ful parent HAS a row carrying 0, so the
+  fallback never fires. A MAC-LESS parent has NO row, so the propagated zone
+  WAS inherited, which is exactly the widening the claim said was prevented.
+  Reachable shape: two secure tunnels on one `st0` (`bind-interface st0` +
+  `bind-interface st0.1`, both legal per `pkg/config/xfrmi.go`) with unit 0
+  addressed and routed but deliberately left in no zone. Reproduced through the
+  real `build_forwarding_state` -> real FIB -> real policy evaluator: the
+  unzoned unit resolved to-zone 7 (its sibling's `vpnb`), the operator's
+  `from-zone lan to-zone vpnb permit` MATCHED with `policy_id = 0` (a real rule
+  index, not `DEFAULT_POLICY_SENTINEL_ID`), and the `MissingNeighbor`
+  disposition makes a permit `is_slow_path_eligible` -> reinjected to the
+  kernel. Master resolves 0 and denies: a live deny->permit flip, not a logging
+  difference. The ingress half is NOT symmetrically exposed (an empty-zone
+  interface is never an AF_XDP ingress bind target), so #6713 made this
+  reachable for the first time.
+  Fixed by recording the own-zone value a SECOND time in a new
+  `ForwardingState::ifindex_own_zone_id`, written at the same site immediately
+  BEFORE the parent propagation, and pointing the fallback at that map. Chosen
+  over a propagated-flag or a `(u16, bool)` value type because it records only
+  ground truth: it needs no remove-on-own-insert semantics (so no dependence on
+  snapshot iteration order) and touches no existing reader — the ingress half
+  still wants the propagated value. Both branches of `egress_zone_id` now answer
+  the same question, since `populate_egress` also derives
+  `EgressInterface.zone_id` from the interface's own `iface.zone`.
+  Also from the same review: `tunnel.rs`'s local-origin tunnel TX path still
+  open-coded the `egress`-only read (swept through `egress_zone_id`; no runtime
+  difference today because GRE and WireGuard both carry a `tunnel` stanza and
+  so always have a row — the comment records why), and the two #6713 call-site
+  changes shipped with NO test (`filter_log_egress_zone_id` and
+  `forward_request`'s own independent `egress_zone_id` call — reverting either
+  left the whole suite green).
+  Validation: parent-RED at `b73679aaa` with only the test additions applied —
+  `cargo build --release --bins` and `--bins --tests` both rc 0, then exactly
+  ONE assertion failure (`left: 7, right: 0`), with all five #6713 guards green,
+  so the red is an assertion and precisely scoped. Mutations, each with build
+  rc 0: revert the fallback to `ifindex_to_zone_id` -> exactly 2 RED of 4244
+  (the two #6722 guards), rest of the suite green; revert
+  `filter_log_egress_zone_id` -> exactly 1 RED; revert `forward_request`'s call
+  -> exactly 1 RED, and the two are independent (neither mutation reds the
+  other's test, so the review's "same helper" framing does not hold and they
+  needed separate bindings); revert the `tunnel.rs` sweep -> full suite GREEN,
+  which is the honest expected result for an unreachable-today state. The
+  preserved `unzoned_interface_with_egress_row_stays_zone_zero_6713` no longer
+  reds on the single "fire on Some(0)" mutation — the own-zone scoping makes
+  that harmless — but still reds on the FULL widening; recorded in the guard's
+  own comment so the greenness is not read as a coverage gap.
+- **File(s)**: userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  userspace-dp/src/afxdp/tunnel.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/filter.rs,
+  userspace-dp/src/afxdp/frame/tests_ports_live_forward.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md
