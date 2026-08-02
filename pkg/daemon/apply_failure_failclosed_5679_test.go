@@ -14,7 +14,7 @@ import (
 
 // TestApplyConfigLockedFailsCommitOnOrdinaryDataplaneApplyError_5679 is the
 // #5679 commit-level wiring proof. An ORDINARY (non-abort-class) full dataplane
-// apply failure — d.dp.ApplyConfig returns a plain error that is NOT one of the
+// apply failure — the dataplane ApplyConfig returns a plain error that is NOT one of the
 // required-protocol-gate sentinels compileErrorMustAbortApply matches — does
 // NOT disarm the dataplane: the OLD compiled policy stays live and forwarding
 // while store.Commit has already promoted+persisted the NEW config. Before the

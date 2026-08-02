@@ -43,8 +43,8 @@ func newNATPoolAlarmTestDaemon() *Daemon {
 	d.setDataplane(&runtimeOnlyApplyTestDP{})
 	d.applyBodyForTest = func(_ *config.Config) {}
 	// Fast sampler cadence so any monitor that DOES start actively reads
-	// d.dp during the concurrent d.dp-write loops below — making the
-	// sampler-vs-d.dp race detectable under -race if a gate/discard is
+	// the dataplane cell during the concurrent write loops below — making any
+	// residual sampler-vs-publication race detectable under -race if a gate/discard is
 	// removed (not merely caught by the start/discard assertions).
 	d.natPoolAlarmTestTick = time.Millisecond
 	return d
@@ -70,9 +70,9 @@ func writeDPFor(dur time.Duration, d *Daemon) {
 
 // TestNATPoolAlarm_BootGate verifies that the production start helper does NOT
 // launch a sampler goroutine while in bootstrap mode, so the bootstrap-exit
-// d.dp = nil write cannot race a sampler read. With the gate removed, a
-// sampler goroutine started here reads d.dp on its fast tick while the writer
-// nils d.dp → -race trips.
+// cell clear cannot race a sampler read. With the gate removed, a
+// sampler goroutine started here reads the cell on its fast tick while the
+// writer clears it.
 func TestNATPoolAlarm_BootGate(t *testing.T) {
 	d := newNATPoolAlarmTestDaemon()
 	d.bootstrapMode.Store(true)
@@ -83,11 +83,10 @@ func TestNATPoolAlarm_BootGate(t *testing.T) {
 		t.Fatal("monitor must NOT start in bootstrap mode (Edit 1 gate)")
 	}
 
-	// Mirror the bootstrap-exit failure write of d.dp, run long enough to
+	// Mirror the bootstrap-exit failure clear, run long enough to
 	// overlap several 1ms sampler ticks. Because the gate suppressed the
 	// start, no sampler goroutine exists, so this cannot race. If the gate
-	// were removed, a sampler on the 1ms tick would be reading d.dp here and
-	// -race would trip.
+	// were removed, a sampler on the 1ms tick would be reading the cell here.
 	writeDPFor(50*time.Millisecond, d)
 	d.stopAndDiscardNATPoolAlarm()
 
@@ -95,7 +94,7 @@ func TestNATPoolAlarm_BootGate(t *testing.T) {
 	d.bootstrapMode.Store(false)
 	d.maybeStartNATPoolAlarm()
 	if d.natPoolAlarm.Load() == nil {
-		t.Fatal("monitor MUST start once out of bootstrap with d.dp armed")
+		t.Fatal("monitor MUST start once out of bootstrap with the dataplane armed")
 	}
 	d.stopAndDiscardNATPoolAlarm()
 	if d.natPoolAlarm.Load() != nil {
@@ -104,14 +103,14 @@ func TestNATPoolAlarm_BootGate(t *testing.T) {
 }
 
 // TestNATPoolAlarm_RollbackDiscard verifies the rollback path stops AND
-// discards the monitor so a later re-arm-failure d.dp = nil write cannot race
+// discards the monitor so a later re-arm-failure cell clear cannot race
 // a stale sampler goroutine, and a corrected re-arm builds a FRESH monitor
 // (the Monitor is not restartable after Stop).
 func TestNATPoolAlarm_RollbackDiscard(t *testing.T) {
 	d := newNATPoolAlarmTestDaemon()
 
 	// Simulate a successful bootstrap-exit arm: out of bootstrap, monitor
-	// running on the fast (1ms) test tick so it actively samples d.dp.
+	// running on the fast (1ms) test tick so it actively samples the cell.
 	d.bootstrapMode.Store(false)
 	d.maybeStartNATPoolAlarm()
 	first := d.natPoolAlarm.Load()
@@ -136,10 +135,10 @@ func TestNATPoolAlarm_RollbackDiscard(t *testing.T) {
 		t.Fatal("monitor must remain gated off while in bootstrap after rollback")
 	}
 
-	// The re-arm-failure write of d.dp, run long enough to overlap several
+	// The re-arm-failure cell clear, run long enough to overlap several
 	// 1ms sampler ticks: no sampler survives the rollback, so this cannot
 	// race. If the discard were missing, the first monitor's sampler would
-	// be reading d.dp here and -race would trip (in addition to the discard
+	// be reading the cell here (in addition to the discard
 	// assertion above).
 	writeDPFor(50*time.Millisecond, d)
 

@@ -324,7 +324,7 @@ func (d *Daemon) enterBootstrapMode() error {
 	// #2114: stop and DISCARD the NAT pool-alarm monitor. It may have been
 	// started on a prior successful bootstrap-exit arm; rolling back to
 	// bootstrap means a later corrected commit can re-enter
-	// runBootstrapExitStartup and, on an arm failure, write d.dp = nil —
+	// runBootstrapExitStartup and, on an arm failure, clear the dataplane cell —
 	// which would race the still-running monitor's sampler. Discard (not
 	// just Stop) because natpoolalarm.Monitor is not restartable after
 	// Stop(); the next successful re-arm builds a fresh one via

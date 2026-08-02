@@ -66415,3 +66415,29 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/daemon/daemon_dp_race_test.go (new),
   pkg/dataplane/armed_gate_legs_test.go (restore discipline), Makefile,
   _Log.md
+## 2026-08-02 — #2114 docs sweep (§5.5)
+
+- **Timestamp**: 2026-08-02 (fix/2114-dp-accessor)
+- **Action**: Documentation contract per the plan's §5.5: pkg/daemon/README.md
+  gains the dpCell publication contract in ARCHITECTURE plus the
+  bootstrap-mode / first-commit-rollback bullet rewords and the live
+  d.dp.ApplyConfig reference; pkg/dataplane/README.md gains the full
+  armed-state admission contract section (the two-state predicate, the
+  four-class pre-arm outcomes, the carve-out set, the Close-entry
+  narrowing, and the enforcement-surface map); pkg/fwdstatus/README.md
+  rekeys the sampler surface to CachedStatusProvider; the residual
+  `d\.dp` comment prose across pkg/daemon production + test files is
+  reworded to the cell/accessor phrasing (the intentional historical
+  references — daemon.go's field-replacement note, the race-test
+  headers, docs/bugs.md's fixed-bug narrative — are deliberate and stay);
+  docs/ sweep covers ha-failover-status.md, ha-no-hitless-restart.md,
+  rib-group-route-leaking.md, snapshot-publish-redesign.md. The
+  recurrence-contradicting comment set (daemon_run_naming.go
+  "one-way/at most once" et al.) is FOLLOW-UP scope per the plan's
+  §5.5 split (those comments document the recurrence class work item H
+  terminates).
+- **File(s)**: pkg/daemon/README.md, pkg/dataplane/README.md,
+  pkg/fwdstatus/README.md, pkg/fwdstatus/sampler_test.go,
+  docs/ha-failover-status.md, docs/ha-no-hitless-restart.md,
+  docs/rib-group-route-leaking.md, docs/snapshot-publish-redesign.md,
+  15 pkg/daemon comment-only reword files, _Log.md

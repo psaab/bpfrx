@@ -92,7 +92,7 @@ FIB** — a deleted-VRF leak on both forwarding planes that kernel-forwarded /
 local / route-based-IPsec plaintext could follow, despite a successful commit.
 
 **Snapshot ordering (why the gate fix alone is not enough).** The full dataplane
-apply (`d.dp.ApplyConfig`) runs **before** `applyRoutingRules`, so it builds and
+apply (the dataplane `ApplyConfig`) runs **before** `applyRoutingRules`, so it builds and
 publishes the userspace route snapshot from the *pre-reconcile* ip-rule table —
 it captures the stale leak. After `applyRoutingRules` deletes the rule, the
 daemon runs a routes-only republish (`reconcileRouteLeakSnapshot`,
@@ -113,7 +113,7 @@ never compiled into that snapshot, stamping `next.Config = cfg` (and the
 `markAppliedSnapshotLocked` that follows) would advance the applied identity to
 an **old-policy/new-route hybrid** — the operator would be told the new config
 is live while the dataplane still enforces the old policy. This is the #5679
-residual: an ordinary `d.dp.ApplyConfig` failure captures `applyErr` and
+residual: an ordinary dataplane `ApplyConfig` failure captures `applyErr` and
 continues (fail-closed but complete) **without** advancing `m.lastSnapshot`,
 while `store.Commit` has already promoted the new `cfg`; the tail route-leak
 republish (and the ip-monitoring actuator) then pass that new `cfg`. The publish

@@ -12,6 +12,18 @@ every other internal package.
 
 The daemon stores dataplane backends behind `dataplane.RuntimeDataPlane` and
 uses the split config, HA/fabric, sessions, telemetry, and link-cycle domains.
+The runtime dataplane is published through ONE synchronized point (#2114):
+`Daemon.dpCell` (`atomic.Pointer[dpSlot]`) with the `dataplane()` /
+`setDataplane()` accessor pair — the `natPoolAlarm` (#2116) idiom. Every
+reader and writer goes through the accessors; a `pkg/daemon` AST canary
+(`daemon_dp_canary_test.go`) fails the build on a direct `.dpCell`
+reference outside them. Readers that nil-check AND use the value load ONCE
+into a local (the plan's §5.3 snapshot boundaries: one load per
+sampler/watchdog tick, per event/request callback, or per straight-line
+block — never per-element, never a lifetime capture beyond the deliberate
+GC/event-stream capture-once). `setDataplane`'s kind-gated guard keeps a
+non-nil interface wrapping a nil value (any nillable kind) out of the
+cell.
 Legacy `dataplane.DataPlane` access is isolated behind `legacyDP()` for
 callers that still need legacy eBPF compatibility while their domain adapters
 are completed (DPDK retired #1525). Userspace currently reaches those old callers through
@@ -556,8 +568,8 @@ never lock an operator out of a remote box it manages.
   but SUPPRESSES interface takeover ACTIONS — the full rename loop, host
   tunables, `enableForwarding`, dataplane arm (`dp.Start`), the boot-time
   `applyConfig`, and the #2079 NAT pool-alarm monitor start (#2114: the
-  monitor samples `d.dp`, which is still nil-able on a bootstrap-exit arm
-  failure, so it must not run during the bootstrap window). Managers are
+  monitor samples the dataplane cell, which a bootstrap-exit arm failure
+  clears, so it must not run during the bootstrap window). Managers are
   still constructed (so the exit reconcile wires every subsystem). A plain
   first `commit` is REFUSED — the operator must `commit confirmed`. Exit is
   one-way, on the first non-empty config apply (confirmed commit OR cluster
@@ -577,7 +589,7 @@ never lock an operator out of a remote box it manages.
   An explicit non-fxp0 leaf narrows fxp0 off the auto-protection.
 - **First-commit rollback** (`enterBootstrapMode`): a timed-out first
   `commit confirmed` stops+discards the NAT pool-alarm monitor (#2114 — so
-  no sampler survives to race a later re-arm's `d.dp = nil` write; the
+  no sampler survives to race a later re-arm's dataplane-cell clear; the
   monitor is rebuilt fresh on a corrected re-arm because it is not
   restartable after `Stop`), removes the takeover `.network` files (keeping
   the lifeline + `.link` files), clears the FRR managed section, and
@@ -933,7 +945,7 @@ never lock an operator out of a remote box it manages.
   `xfrmManager.Apply` returns-error / tolerates-already-exists half).
   **Ordinary dataplane-apply fail-closed (#5679, mirroring the above):** the
   main config-apply's full dataplane push (`applyDataplaneAndHACore` →
-  `d.dp.ApplyConfig`) split its error into two classes but ACTED on only one.
+  the runtime dataplane's `ApplyConfig`) split its error into two classes but ACTED on only one.
   A required-protocol-gate error (`compileErrorMustAbortApply`) DISARMS the
   dataplane and returns early (terminal `err`, commit fails, peer sync skipped).
   But an ORDINARY (non-abort) apply failure — a control-socket / helper hiccup

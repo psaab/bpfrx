@@ -163,7 +163,7 @@ func TestForwardingStatusAdapterIsNotDataPlaneAccessor(t *testing.T) {
 // an initially-empty cell (bootstrap mode, dataplane constructed but not
 // yet armed/published) returns a NON-nil provider whose per-call probe
 // reports ok=false until a backend publishes — the pre-#2114 constructor
-// returned nil whenever d.dp was nil at construction time, permanently
+// returned nil whenever the dataplane field was nil at construction time, permanently
 // hiding a later-published backend from the sampler.
 func TestForwardingStatusDataplaneConstructionContract(t *testing.T) {
 	var nilDaemon *Daemon

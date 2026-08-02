@@ -378,8 +378,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 
 		// #2079: start the NAT source pool-utilization-alarm monitor HERE —
-		// after d.dp and d.eventReader are both fully assigned above — so the
-		// monitor goroutine's sampler (reads d.dp) and emitter (reads
+		// after the dataplane cell and d.eventReader are both fully assigned above — so the
+		// monitor goroutine's sampler (reads the cell) and emitter (reads
 		// d.eventReader) never race with their initialization. Slow (10s) loop
 		// over the helper's last-applied NAT pool snapshot; raises/clears
 		// `show security alarms` entries with hysteresis and emits one
@@ -388,8 +388,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 		//
 		// #2114: route through maybeStartNATPoolAlarm, which gates on
 		// !inBootstrap() in addition to a constructed dataplane. In bootstrap
-		// mode the dataplane object exists (d.dp != nil) but is not armed, and
-		// the bootstrap-exit path may write d.dp = nil on an arm failure;
+		// mode the dataplane object exists (published) but is not armed, and
+		// the bootstrap-exit path may clear the cell on an arm failure;
 		// launching the sampler here would race that write. The monitor is
 		// instead started in runBootstrapExitStartup once the dataplane is
 		// armed. On a normal (non-bootstrap) boot the gate passes and the
@@ -609,7 +609,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start interactive CLI or block in daemon mode
 	var runErr error
 	if isInteractive() {
-		// d.dp asserted against the local cliDataPlane probe
+		// The published dataplane is asserted against the local cliDataPlane probe
 		// (runtime_probes.go) — structurally identical to pkg/cli's
 		// package-private cliRuntime (pkg/cli/runtime.go, #1517).
 		// Go duck-types the assignment to cli.New's dp parameter at

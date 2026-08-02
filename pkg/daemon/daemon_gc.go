@@ -6,7 +6,7 @@ import (
 	"github.com/psaab/xpf/pkg/conntrack"
 )
 
-// newConntrackGC wires d.dp into pkg/conntrack via the exported
+// newConntrackGC wires the published dataplane into pkg/conntrack via the exported
 // RuntimeDomainProvider (pkg/conntrack/gc.go:45 — a structural
 // SessionStoreProvider + TelemetryProvider). NewGC internally
 // type-asserts against package-private sessionCountPublisher /

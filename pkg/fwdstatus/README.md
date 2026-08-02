@@ -31,7 +31,11 @@ root `pkg/dataplane` package, `pkg/cli`, or `pkg/grpcapi`.
   `Sampler.Start(ctx)`. The renderer consumes already-windowed
   values from the Sampler.
 - The Sampler reads worker telemetry off the **cached** ProcessStatus
-  (`DataPlaneAccessor.CachedStatus()`), NOT its own `Status()` call
+  (`CachedStatusProvider.CachedStatus()` — the Sampler's dataplane
+  surface narrowed to exactly that one method in #2114, so the
+  daemon-side adapter re-probes the currently published dataplane every
+  tick and can never be misrouted into a `Build` path, which keys
+  backend identity on `Status()` presence), NOT its own `Status()` call
   (#3970). The userspace manager's primary 1 Hz status poll
   (`statusLoop`) already fetches full `ProcessStatus` over the shared
   control socket every second and caches it; the Sampler consumes that

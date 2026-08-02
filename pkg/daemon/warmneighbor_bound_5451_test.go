@@ -38,7 +38,7 @@ func (s *warmNeighborTestStore) ForEachV6(fn func(dataplane.SessionKeyV6, datapl
 }
 
 // warmNeighborTestDP is a minimal RuntimeDataPlane whose Sessions() returns the
-// injected store. warmNeighborCache only touches d.dp.Sessions().
+// injected store. warmNeighborCache only touches the dataplane's Sessions().
 type warmNeighborTestDP struct {
 	dataplane.RuntimeDataPlane
 	store dataplane.SessionStore

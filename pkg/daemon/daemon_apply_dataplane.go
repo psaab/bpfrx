@@ -127,7 +127,7 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 	// sync push). The fabric-IPVLAN / VRF / tunnel / bond netlink reconciles
 	// above are idempotent and have each run to completion, so bailing here
 	// leaves a consistent kernel state with the dataplane untouched. Once
-	// d.dp.ApplyConfig and the RETH MAC / VIP / worker-rebind sequence that
+	// the dataplane ApplyConfig and the RETH MAC / VIP / worker-rebind sequence that
 	// follows it begin, they run as one unit (no mid-sequence abort) — the
 	// next boundary is before the FRR reload.
 	if err := ctx.Err(); err != nil {
@@ -144,7 +144,7 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 				return commitOverlay, networkdErr, nil, err
 			}
 			// #5679: an ORDINARY (non-abort-class) full-apply failure does
-			// NOT disarm the dataplane — d.dp.ApplyConfig leaves the OLD
+			// NOT disarm the dataplane — the dataplane ApplyConfig leaves the OLD
 			// compiled policy live and forwarding while store.Commit has
 			// already promoted+persisted the NEW config. Left unhandled the
 			// commit reported SUCCESS against stale enforcement (a tightening

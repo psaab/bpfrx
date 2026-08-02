@@ -107,7 +107,7 @@ func (d *Daemon) shellCommitConfirmedFn() func(context.Context, int) (*config.Co
 // Extracted verbatim from Run()'s PHASE 5 (#4662 Increment 2); the leaf
 // startup block carries no ordering dependency (same code, same call point).
 func (d *Daemon) startGRPCServer(ctx context.Context, wg *sync.WaitGroup, eventBuf *logging.EventBuffer, fwdSampler *fwdstatus.Sampler) {
-	// d.dp asserted against the local grpcDataPlane probe
+	// The published dataplane is asserted against the local grpcDataPlane probe
 	// (runtime_probes.go) — structurally identical to
 	// pkg/grpcapi's package-private grpcRuntime
 	// (pkg/grpcapi/runtime.go, #1516/#1554). Go duck-types the
@@ -246,7 +246,7 @@ func (d *Daemon) startGRPCServer(ctx context.Context, wg *sync.WaitGroup, eventB
 // no ordering dependency (same code, same call point, still guarded by the
 // d.opts.APIAddr check in Run).
 func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventBuf *logging.EventBuffer) {
-	// d.dp asserted against the local apiDataPlane probe
+	// The published dataplane is asserted against the local apiDataPlane probe
 	// (runtime_probes.go) — structurally identical to pkg/api's
 	// package-private apiRuntimeDataPlane. Go duck-types the
 	// assignment to api.Config.DP at this site; signature drift
