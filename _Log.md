@@ -66441,3 +66441,40 @@ break — `go vet` confirmed passing under every revert.
   docs/ha-failover-status.md, docs/ha-no-hitless-restart.md,
   docs/rib-group-route-leaking.md, docs/snapshot-publish-redesign.md,
   15 pkg/daemon comment-only reword files, _Log.md
+## 2026-08-02 — #2114 PR #6743 Codex r1 review-round fixes (6M+1m)
+
+- **Timestamp**: 2026-08-02 (fix/2114-dp-accessor)
+- **Action**: Codex hostile code review returned MERGE-NEEDS-MAJOR (6
+  majors + 1 minor); all verified legitimate and fixed. M1:
+  reconcileRGState now takes ONE dataplane snapshot per pass shared across
+  the per-RG actuation loop (a mid-pass clear could previously let one RG
+  actuate through the old backend while a later RG observed nil and skipped
+  deactivation). M2: the registry canary is now type-aware — the registry
+  owner resolves by *Manager receiver TYPE (any name), *Manager-typed
+  parameters, and one-level aliases; an allowlisted function with no
+  m.mu.Lock fails. M3: the callsite collector refuses to collapse duplicate
+  same-function callsites (loud t.Fatal), and the gated-bit check now
+  requires the registryState return to be BOUND non-blank AND COMPARED
+  against registryFresh (a bind-and-ignore no longer passes), with a
+  synthetic self-test. M4: the canary enforces the publisher's single
+  in-lock loaded.Store(true) positioned after the last registry write and
+  before any direct Unlock; the new TestManager_ArmedGate_PassThenBlock leg
+  arms the post-Store seam — a pre-Store AttachTC rejects with master's
+  loaded rejection, a post-Store/pre-unlock AttachTC passes the precheck
+  and blocks at registry selection, and post-release it returns the
+  armed+absent text (probe switched to AttachTC because the publisher
+  writes xdp_userspace_prog and a present-but-nil program would proceed
+  into link.AttachXDP). M5: the continuation oracle is now coextensive —
+  absent-first discriminating legs for SessionCount, ClearSessionCounts,
+  GetMapStats (all descriptors), DeleteStaleStaticNAT, DeleteStaleNAT64,
+  ZeroStaleNATPoolConfigs (v4+v6), and the AddTxPort seed-present half;
+  Compile's redirect_capable continuation is dispositioned to production
+  coverage (the shim registry never carries that map; every cluster compile
+  exercises the skip-and-continue) with the reason recorded in the test
+  comment. M6: the Detach leg gained its concurrent population actor (the
+  blocked re-Start seam — the detach's registry lookup blocks during the
+  hold) and the absent-link no-registry-access oracle. m1: the
+  nat_port_counters fixture is now a PERCPU_ARRAY matching production.
+- **File(s)**: pkg/daemon/daemon_ha.go,
+  pkg/dataplane/armed_gate_matrix_test.go,
+  pkg/dataplane/armed_gate_legs_test.go, _Log.md

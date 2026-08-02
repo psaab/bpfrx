@@ -709,6 +709,13 @@ func (d *Daemon) reconcileRGState() {
 		return
 	}
 
+	// #2114: ONE dataplane snapshot per reconcile pass (plan §5.3 rule 1),
+	// shared across the per-RG actuation loop below — a mid-pass cell clear
+	// must not let one RG actuate through the old backend while a later RG
+	// observes nil and skips its deactivation (which could leave
+	// rg_active=true set as the peer takes ownership).
+	reconcileDP := d.dataplane()
+
 	// #2156 (B1): re-drive the VRRP instance set from the active config on
 	// every reconcile pass. Combined with the build-before-teardown
 	// ordering in vrrp.UpdateInstances, this gives bounded (~2s)
@@ -810,8 +817,7 @@ func (d *Daemon) reconcileRGState() {
 		// change this pass, a prior UpdateRGActive failure may have
 		// left applied != desired. Retry unconditionally.
 		needsApply := tr.Changed || s.NeedsApply()
-		rt := d.dataplane()
-		if needsApply && rt != nil {
+		if needsApply && reconcileDP != nil {
 			if tr.Changed {
 				slog.Info("reconcile: correcting rg_active drift",
 					"rg", rgID, "active", tr.Active, "epoch", tr.Epoch)
@@ -824,7 +830,7 @@ func (d *Daemon) reconcileRGState() {
 			if tr.Active {
 				// Activation ordering: set rg_active FIRST, then
 				// remove blackholes.
-				if err := rt.HA().SetRGActive(context.Background(), rgID, true); err != nil {
+				if err := reconcileDP.HA().SetRGActive(context.Background(), rgID, true); err != nil {
 					if s.ShouldLogApplyError(err.Error()) {
 						slog.Warn("reconcile: failed to update rg_active",
 							"rg", rgID, "active", true, "err", err)
@@ -840,7 +846,7 @@ func (d *Daemon) reconcileRGState() {
 				// clear rg_active.
 				d.injectBlackholeRoutes(rgID)
 				d.tryPrepareUserspaceRGDemotion(rgID)
-				if err := rt.HA().SetRGActive(context.Background(), rgID, false); err != nil {
+				if err := reconcileDP.HA().SetRGActive(context.Background(), rgID, false); err != nil {
 					if s.ShouldLogApplyError(err.Error()) {
 						slog.Warn("reconcile: failed to update rg_active",
 							"rg", rgID, "active", false, "err", err)

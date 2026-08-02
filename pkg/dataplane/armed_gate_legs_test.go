@@ -3,6 +3,7 @@ package dataplane
 import (
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -407,6 +408,80 @@ func TestManager_ArmedGate_BlockedStart(t *testing.T) {
 	}
 }
 
+// TestManager_ArmedGate_PassThenBlock arms the post-Store seam (the plan's
+// pass-then-block shape, Codex PR #6743 M4): a loaded-check method invoked
+// DURING the pre-Store barrier rejects immediately with master's
+// pre-registry rejection; a NEW invocation AFTER the in-hold Store(true)
+// but BEFORE the unlock passes its loaded precheck and blocks at registry
+// selection — and after release it returns the armed+absent outcome
+// ("tc_main_prog not found"), proving the reader observed the ARMED state,
+// not retained and not fresh. This is the leg that pins the in-hold
+// Store(true) ordering: moving the Store after the unlock flips the second
+// invocation's outcome and fails here. The probe is AttachTC deliberately:
+// its tc_main_prog key is never written by the shim publisher, so the
+// post-release lookup is a clean armed+absent miss (AttachXDP's
+// xdp_userspace_prog IS written — a present-but-nil handle would proceed
+// into link.AttachXDP and nil-deref, which is master's own fixture-only
+// behavior and not what this leg measures).
+func TestManager_ArmedGate_PassThenBlock(t *testing.T) {
+	m := New()
+	defer restoreShimPrePublishLoad()
+
+	preStoreEntered := make(chan struct{})
+	preStoreRelease := make(chan struct{})
+	postStoreEntered := make(chan struct{})
+	postStoreRelease := make(chan struct{})
+	shimRegistryPublishHook = func() {
+		close(preStoreEntered)
+		<-preStoreRelease
+	}
+	shimRegistryPublishPostStoreHook = func() {
+		close(postStoreEntered)
+		<-postStoreRelease
+	}
+	defer func() {
+		shimRegistryPublishHook = nil
+		shimRegistryPublishPostStoreHook = nil
+	}()
+
+	startDone := runSyntheticStart(t, m, map[string]*ebpf.Map{"sentinel_unused": nil})
+	<-preStoreEntered // in-hold, BEFORE Store(true)
+
+	// Pre-Store: the loaded-check carve-out rejects immediately (loaded is
+	// still false), never reaching the registry.
+	if err := m.AttachTC(1); err == nil || err.Error() != "eBPF programs not loaded" {
+		t.Fatalf("pre-Store AttachTC = %v, want the pre-registry loaded rejection", err)
+	}
+
+	close(preStoreRelease)
+	<-postStoreEntered // in-hold, AFTER Store(true), before unlock
+
+	// Post-Store: a NEW invocation passes the loaded precheck and blocks at
+	// registry selection (the publisher still holds m.mu).
+	attachDone := make(chan error, 1)
+	go func() { attachDone <- m.AttachTC(1) }()
+	select {
+	case err := <-attachDone:
+		t.Fatalf("post-Store AttachTC completed (%v) while the publisher held m.mu — did not block at registry selection", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(postStoreRelease)
+	if err := <-startDone; err != nil {
+		t.Fatalf("synthetic Start: %v", err)
+	}
+	// After release the invocation observes ARMED + absent: master's
+	// not-found text (never the fresh typed error, never the loaded
+	// rejection).
+	err := <-attachDone
+	if err == nil || err.Error() != "tc_main_prog not found" {
+		t.Fatalf("post-release AttachTC = %v, want armed+absent master's text", err)
+	}
+	if errors.Is(err, ErrDataplaneNotArmed) {
+		t.Fatal("post-release AttachTC returned the fresh gate error — the in-hold Store ordering is broken")
+	}
+}
+
 // TestManager_ArmedGate_RetainedReStartOverlap is the blocked
 // RETAINED-re-Start leg (plan leg 4): the retained fixture (registry
 // populated, loaded=false — the bootstrap/hitless-restart posture) driven
@@ -691,7 +766,34 @@ func TestManager_ArmedGate_DetachRetainedClaims(t *testing.T) {
 	key := IfaceZoneKey{Ifindex: ifindex, VlanID: 0}
 	m.xdpFlagClaims[key] = map[int]bool{ifindex: true}
 
-	if err := m.DetachXDP(ifindex); err != nil {
+	// The concurrent population actor (the blocked re-Start seam): the
+	// publisher holds m.mu mid-detach; the detach's setXDPAttachedFlag
+	// registry lookup must BLOCK on the hold and complete after release —
+	// race-clean (a raw lookup slipped into the flag path would race the
+	// publisher's writes and trip -race here).
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	shimRegistryPublishHook = func() {
+		close(entered)
+		<-release
+	}
+	defer func() { shimRegistryPublishHook = nil }()
+	defer restoreShimPrePublishLoad()
+	startDone := runSyntheticStart(t, m, map[string]*ebpf.Map{"sentinel_restart": nil})
+	<-entered
+
+	detachDone := make(chan error, 1)
+	go func() { detachDone <- m.DetachXDP(ifindex) }()
+	select {
+	case err := <-detachDone:
+		t.Fatalf("DetachXDP completed (%v) during the publication hold — its registry lookup did not block", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if err := <-startDone; err != nil {
+		t.Fatalf("synthetic re-Start: %v", err)
+	}
+	if err := <-detachDone; err != nil {
 		t.Fatalf("DetachXDP: %v", err)
 	}
 	if _, still := m.xdpFlagClaims[key]; still {
@@ -702,6 +804,27 @@ func TestManager_ArmedGate_DetachRetainedClaims(t *testing.T) {
 	}
 	if !fake.unpinned || !fake.closed {
 		t.Fatalf("fake link lifecycle = unpinned:%v closed:%v, want both", fake.unpinned, fake.closed)
+	}
+}
+
+// TestManager_ArmedGate_DetachAbsentLinkNoRegistryAccess is the absent-link
+// oracle (Codex PR #6743 M6): DetachXDP on an ifindex with NO attached link
+// returns nil at the category-G early return and must NOT touch the
+// registry at all — the registryLookupHook tripwire fails the test if any
+// lookup helper fires.
+func TestManager_ArmedGate_DetachAbsentLinkNoRegistryAccess(t *testing.T) {
+	m := New()
+	m.maps["sentinel_unused"] = nil // retained; irrelevant to the absent-link path
+
+	var tripwire atomic.Int32
+	registryLookupHook = func() { tripwire.Add(1) }
+	defer func() { registryLookupHook = nil }()
+
+	if err := m.DetachXDP(4242); err != nil {
+		t.Fatalf("DetachXDP(absent link) = %v, want nil (master's category-G early return)", err)
+	}
+	if got := tripwire.Load(); got != 0 {
+		t.Fatalf("absent-link DetachXDP touched the registry %d times — the early return must not reach a lookup helper", got)
 	}
 }
 
@@ -771,6 +894,20 @@ func TestManager_ArmedGate_SeedInterfaceCounterNilGuard(t *testing.T) {
 // semantic-mutation set (plan's oracle split): real-map fixtures assert
 // the mixed-method CONTINUATION behavior that a premature optional-miss
 // return would break. Skips where BPF map creation is unavailable.
+//
+// Coverage note (Codex PR #6743 M5 disposition): Compile's absent-
+// redirect_capable continuation (compiler.go:353 skip-and-continue into
+// the attachment work) is NOT unit-legged here — reaching :353 requires a
+// full successful zone compile (real BPF maps for every required write)
+// plus a netlink XDP attach, which a sandboxed/hostile-environment test
+// cannot perform safely. It is covered in production instead: the retained
+// shim's registry NEVER contains redirect_capable (neither
+// userspacePinnedShimMaps nor userspaceShimSharedMapSpecs declares it),
+// so every userspace compile takes the skip-and-continue path — the
+// loss-cluster smoke lanes (Pass A/B + the HA failover/crash batteries)
+// exercise it on every commit, and the redirect-map population it skips is
+// inert on the userspace dataplane (the legacy xdp_forward consumer was
+// deleted in #1476).
 func TestManager_ArmedGate_ContinuationLegsPrivileged(t *testing.T) {
 	newArray := func(st *testing.T, name string, valueSize, maxEntries uint32) *ebpf.Map {
 		m, err := ebpf.NewMap(&ebpf.MapSpec{
@@ -786,6 +923,32 @@ func TestManager_ArmedGate_ContinuationLegsPrivileged(t *testing.T) {
 	newHash := func(st *testing.T, name string, keySize, valueSize, maxEntries uint32) *ebpf.Map {
 		m, err := ebpf.NewMap(&ebpf.MapSpec{
 			Name: name, Type: ebpf.Hash, KeySize: keySize,
+			ValueSize: valueSize, MaxEntries: maxEntries,
+		})
+		if err != nil {
+			skipIfBPFUnavailable(st, "new "+name, err)
+		}
+		st.Cleanup(func() { m.Close() })
+		return m
+	}
+	newPerCPUHash := func(st *testing.T, name string, keySize, valueSize, maxEntries uint32) *ebpf.Map {
+		m, err := ebpf.NewMap(&ebpf.MapSpec{
+			Name: name, Type: ebpf.PerCPUHash, KeySize: keySize,
+			ValueSize: valueSize, MaxEntries: maxEntries,
+		})
+		if err != nil {
+			skipIfBPFUnavailable(st, "new "+name, err)
+		}
+		st.Cleanup(func() { m.Close() })
+		return m
+	}
+	// newPerCPUArray matches the production nat_port_counters shape
+	// (perCPUArrayMapSpec, loader_userspace_shim.go) — a plain ARRAY
+	// rejects the per-CPU slice Update/Lookup the seed path uses (Codex
+	// PR #6743 m1).
+	newPerCPUArray := func(st *testing.T, name string, valueSize, maxEntries uint32) *ebpf.Map {
+		m, err := ebpf.NewMap(&ebpf.MapSpec{
+			Name: name, Type: ebpf.PerCPUArray, KeySize: 4,
 			ValueSize: valueSize, MaxEntries: maxEntries,
 		})
 		if err != nil {
@@ -867,40 +1030,35 @@ func TestManager_ArmedGate_ContinuationLegsPrivileged(t *testing.T) {
 			}
 		})
 
-		t.Run(name+"_SessionCount_reports_both_families", func(t *testing.T) {
+		t.Run(name+"_SessionCount_absent_first_family_continues", func(t *testing.T) {
+			// Discriminating continuation (Codex PR #6743 M5): sessions is
+			// ABSENT, sessions_v6 present with an entry — the v4-absent path
+			// must CONTINUE to the v6 count (a premature first-miss return
+			// reports (0,0) and fails).
 			m := New()
-			v4 := newHash(t, "sessions", uint32(sizeOf[SessionKey]()), ConntrackSessionValueSize, 8)
 			v6 := newHash(t, "sessions_v6", uint32(sizeOf[SessionKeyV6]()), ConntrackSessionValueSizeV6, 8)
-			m.maps["sessions"] = v4
 			m.maps["sessions_v6"] = v6
 			m.loaded.Store(armed)
 
-			k4 := SessionKey{Protocol: 6}
-			if err := v4.Update(k4, make([]byte, ConntrackSessionValueSize), ebpf.UpdateAny); err != nil {
-				t.Fatalf("seed sessions: %v", err)
-			}
 			k6 := SessionKeyV6{Protocol: 6}
 			if err := v6.Update(k6, make([]byte, ConntrackSessionValueSizeV6), ebpf.UpdateAny); err != nil {
 				t.Fatalf("seed sessions_v6: %v", err)
 			}
 			got4, got6 := m.SessionCount()
-			if got4 != 1 || got6 != 1 {
-				t.Fatalf("SessionCount = (%d,%d), want (1,1) — both families must be reported", got4, got6)
+			if got4 != 0 || got6 != 1 {
+				t.Fatalf("SessionCount = (%d,%d), want (0,1) — the absent v4 lookup must continue to v6", got4, got6)
 			}
 		})
 
-		t.Run(name+"_ClearSessionCounts_clears_both_maps", func(t *testing.T) {
+		t.Run(name+"_ClearSessionCounts_absent_first_map_continues", func(t *testing.T) {
+			// session_count_src ABSENT, dst present with an entry — the
+			// loop's first-miss continue must reach the second map.
 			m := New()
-			src := newHash(t, "session_count_src", uint32(sizeOf[SessionCountKey]()), uint32(sizeOf[SessionCountValue]()), 8)
 			dst := newHash(t, "session_count_dst", uint32(sizeOf[SessionCountKey]()), uint32(sizeOf[SessionCountValue]()), 8)
-			m.maps["session_count_src"] = src
 			m.maps["session_count_dst"] = dst
 			m.loaded.Store(armed)
 
 			k := SessionCountKey{}
-			if err := src.Update(k, SessionCountValue{Count: 3}, ebpf.UpdateAny); err != nil {
-				t.Fatalf("seed src: %v", err)
-			}
 			if err := dst.Update(k, SessionCountValue{Count: 4}, ebpf.UpdateAny); err != nil {
 				t.Fatalf("seed dst: %v", err)
 			}
@@ -908,11 +1066,128 @@ func TestManager_ArmedGate_ContinuationLegsPrivileged(t *testing.T) {
 				t.Fatalf("ClearSessionCounts = %v", err)
 			}
 			var out SessionCountValue
-			if err := src.Lookup(k, &out); !errors.Is(err, ebpf.ErrKeyNotExist) {
-				t.Fatalf("src entry survives (err=%v) — first-map loop did not clear", err)
-			}
 			if err := dst.Lookup(k, &out); !errors.Is(err, ebpf.ErrKeyNotExist) {
-				t.Fatalf("dst entry survives (err=%v) — the loop did not continue to the second map", err)
+				t.Fatalf("dst entry survives (err=%v) — the loop's first-miss continue did not reach the second map", err)
+			}
+		})
+
+		t.Run(name+"_GetMapStats_all_descriptors_reported", func(t *testing.T) {
+			// Two descriptor maps present (one countable hash, one
+			// non-countable array), the rest absent — both must be reported
+			// and the absent descriptors skipped without aborting the loop.
+			m := New()
+			m.maps["sessions"] = newHash(t, "sessions", uint32(sizeOf[SessionKey]()), ConntrackSessionValueSize, 8)
+			m.maps["zone_configs"] = newArray(t, "zone_configs", uint32(sizeOf[ZoneConfig]()), 8)
+			m.loaded.Store(armed)
+
+			stats := m.GetMapStats()
+			var sawSessions, sawZoneConfigs bool
+			for _, ms := range stats {
+				if ms.Name == "sessions" {
+					sawSessions = true
+				}
+				if ms.Name == "zone_configs" {
+					sawZoneConfigs = true
+				}
+			}
+			if !sawSessions || !sawZoneConfigs {
+				t.Fatalf("GetMapStats = %+v, want sessions AND zone_configs reported (the descriptor loop must continue past absent maps)", stats)
+			}
+		})
+
+		t.Run(name+"_DeleteStaleStaticNAT_absent_v4_continues", func(t *testing.T) {
+			// static_nat_v4 ABSENT, v6 present with a stale entry — the
+			// absent-v4 path must continue and delete the v6 entry.
+			m := New()
+			v6 := newHash(t, "static_nat_v6", uint32(sizeOf[StaticNATKeyV6]()), uint32(sizeOf[StaticNATValueV6]()), 8)
+			m.maps["static_nat_v6"] = v6
+			m.loaded.Store(armed)
+
+			stale := StaticNATKeyV6{Direction: 9}
+			if err := v6.Update(stale, StaticNATValueV6{}, ebpf.UpdateAny); err != nil {
+				t.Fatalf("seed static_nat_v6: %v", err)
+			}
+			m.DeleteStaleStaticNAT(nil, nil) // nothing written => everything stale
+			var out StaticNATValueV6
+			if err := v6.Lookup(stale, &out); !errors.Is(err, ebpf.ErrKeyNotExist) {
+				t.Fatalf("stale v6 entry survives (err=%v) — the absent-v4 path did not continue", err)
+			}
+		})
+
+		t.Run(name+"_DeleteStaleNAT64_absent_configs_continues", func(t *testing.T) {
+			// nat64_configs ABSENT, nat64_prefix_map present with a stale
+			// prefix — the absent first access must continue to the prefix
+			// cleanup.
+			m := New()
+			pm := newHash(t, "nat64_prefix_map", uint32(sizeOf[NAT64PrefixKey]()), uint32(sizeOf[NAT64Config]()), 8)
+			m.maps["nat64_prefix_map"] = pm
+			m.loaded.Store(armed)
+
+			stale := NAT64PrefixKey{}
+			if err := pm.Update(stale, NAT64Config{}, ebpf.UpdateAny); err != nil {
+				t.Fatalf("seed nat64_prefix_map: %v", err)
+			}
+			m.DeleteStaleNAT64(0, nil)
+			var out NAT64Config
+			if err := pm.Lookup(stale, &out); !errors.Is(err, ebpf.ErrKeyNotExist) {
+				t.Fatalf("stale prefix survives (err=%v) — the absent-configs path did not continue", err)
+			}
+		})
+
+		t.Run(name+"_ZeroStaleNATPoolConfigs_absent_configs_continues", func(t *testing.T) {
+			// nat_pool_configs ABSENT, nat_pool_ips_v4 present with a stale
+			// IP slot — the absent first access must continue to the IP
+			// zeroing.
+			m := New()
+			v4 := newArray(t, "nat_pool_ips_v4", 4, 32*MaxNATPoolIPsPerPool)
+			v6 := newArray(t, "nat_pool_ips_v6", uint32(sizeOf[NATPoolIPV6]()), 32*MaxNATPoolIPsPerPool)
+			m.maps["nat_pool_ips_v4"] = v4
+			m.maps["nat_pool_ips_v6"] = v6
+			m.loaded.Store(armed)
+
+			slot := uint32(3 * MaxNATPoolIPsPerPool) // pool 3, first slot
+			if err := v4.Update(slot, uint32(0x0a000001), ebpf.UpdateAny); err != nil {
+				t.Fatalf("seed nat_pool_ips_v4: %v", err)
+			}
+			v6val := NATPoolIPV6{}
+			v6val.IP[0] = 0x2a
+			if err := v6.Update(slot, v6val, ebpf.UpdateAny); err != nil {
+				t.Fatalf("seed nat_pool_ips_v6: %v", err)
+			}
+			m.ZeroStaleNATPoolConfigs(3)
+			var got uint32
+			if err := v4.Lookup(slot, &got); err != nil {
+				t.Fatalf("read back nat_pool_ips_v4: %v", err)
+			}
+			if got != 0 {
+				t.Fatalf("nat_pool_ips_v4 slot = %#x, want 0 — the absent-configs path did not continue to the IP zeroing", got)
+			}
+			var got6 NATPoolIPV6
+			if err := v6.Lookup(slot, &got6); err != nil {
+				t.Fatalf("read back nat_pool_ips_v6: %v", err)
+			}
+			if got6 != (NATPoolIPV6{}) {
+				t.Fatalf("nat_pool_ips_v6 slot = %+v, want zero — the v4 leg did not continue to v6", got6)
+			}
+		})
+
+		t.Run(name+"_AddTxPort_seeds_interface_counter_when_present", func(t *testing.T) {
+			// Leg (ii) present half: interface_counters present (real
+			// PERCPU_HASH) + tx_ports present — AddTxPort succeeds AND the
+			// seed entry exists, distinguishing the seed's write from the
+			// nil-guard skip.
+			m := New()
+			ic := newPerCPUHash(t, "interface_counters", 4, uint32(sizeOf[InterfaceCounterValue]()), MaxInterfaces)
+			m.maps["interface_counters"] = ic
+			m.maps["tx_ports"] = newArray(t, "tx_ports", 8, MaxInterfaces)
+			m.loaded.Store(armed)
+
+			if err := m.AddTxPort(1); err != nil {
+				t.Fatalf("AddTxPort = %v", err)
+			}
+			var vals []InterfaceCounterValue
+			if err := ic.Lookup(uint32(1), &vals); err != nil {
+				t.Fatalf("interface_counters[1] missing after AddTxPort: %v — the seed did not write", err)
 			}
 		})
 
@@ -921,7 +1196,7 @@ func TestManager_ArmedGate_ContinuationLegsPrivileged(t *testing.T) {
 			// writes (distinguishing the nil-guard skip from a spurious
 			// error or a silent no-op).
 			m := New()
-			npc := newArray(t, "nat_port_counters", uint32(sizeOf[NATPortCounter]()), 32)
+			npc := newPerCPUArray(t, "nat_port_counters", uint32(sizeOf[NATPortCounter]()), 32)
 			m.maps["nat_port_counters"] = npc
 			m.loaded.Store(armed)
 

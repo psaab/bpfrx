@@ -291,13 +291,27 @@ var registryAccessAllowlist = map[string]bool{
 // that is not an index read/write or len() (the container is never
 // returned, aliased, assigned, closed over, or passed as an argument), and
 // (c) for the publisher, that its writes are followed by EXACTLY ONE
-// in-lock loaded.Store(true).
+// in-lock loaded.Store(true) positioned AFTER the last registry write.
+//
+// Receiver handling (Codex PR #6743 M2): the registry owner is identified
+// by TYPE, not by the identifier spelling — the *Manager receiver (whatever
+// it is named), any *Manager-typed parameter, and one-level local aliases
+// (`x := m`) all resolve, so `mgr.maps["x"]` or `alias.maps["x"]` cannot
+// slip past by renaming.
 func registryCanaryViolations(t *testing.T, root string) []string {
 	t.Helper()
 
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		t.Fatalf("read %s: %v", root, err)
+	}
+	isManagerStar := func(expr ast.Expr) bool {
+		star, ok := expr.(*ast.StarExpr)
+		if !ok {
+			return false
+		}
+		id, ok := star.X.(*ast.Ident)
+		return ok && id.Name == "Manager"
 	}
 	var violations []string
 	for _, entry := range entries {
@@ -318,91 +332,94 @@ func registryCanaryViolations(t *testing.T, root string) []string {
 			}
 			allowed := registryAccessAllowlist[fn.Name.Name]
 
-			// Collect lock/unlock positions and registry references.
-			var lockPos, explicitUnlockPos token.Pos
-			storeTrueCount := 0
-			lastWritePos := token.NoPos
-			type regRef struct {
-				pos     token.Pos
-				indexed bool
-				write   bool
-			}
-			var refs []regRef
-
-			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				switch node := n.(type) {
-				case *ast.CallExpr:
-					if sel, ok := node.Fun.(*ast.SelectorExpr); ok {
-						switch {
-						case sel.Sel.Name == "Lock" || sel.Sel.Name == "Unlock":
-							if id, ok := sel.X.(*ast.SelectorExpr); ok && id.Sel.Name == "mu" {
-								if sel.Sel.Name == "Lock" && lockPos == token.NoPos {
-									lockPos = node.Pos()
-								}
-								if sel.Sel.Name == "Unlock" {
-									// A deferred Unlock releases at function
-									// end; only a DIRECT call narrows the hold.
-									if explicitUnlockPos == token.NoPos {
-										// check whether this CallExpr is the
-										// DeferStmt's call — handled by the
-										// parent walk below; approximate:
-										// treat as explicit unless directly
-										// under a DeferStmt.
-									}
-								}
-							}
-						case sel.Sel.Name == "Store":
-							if len(node.Args) > 0 {
-								if id, ok := node.Args[0].(*ast.Ident); ok && id.Name == "true" {
-									storeTrueCount++
-								}
-							}
+			// The registry-owner identifier set: the *Manager receiver,
+			// *Manager-typed parameters, and one-level local aliases.
+			owners := map[string]bool{}
+			if fn.Recv != nil {
+				for _, rf := range fn.Recv.List {
+					if isManagerStar(rf.Type) {
+						for _, n := range rf.Names {
+							owners[n.Name] = true
 						}
 					}
 				}
-				return true
-			})
+			}
+			if fn.Type.Params != nil {
+				for _, pf := range fn.Type.Params.List {
+					if isManagerStar(pf.Type) {
+						for _, n := range pf.Names {
+							owners[n.Name] = true
+						}
+					}
+				}
+			}
+			if len(owners) > 0 {
+				// One-level alias propagation: x := <owner> makes x an owner.
+				ast.Inspect(fn.Body, func(n ast.Node) bool {
+					as, ok := n.(*ast.AssignStmt)
+					if !ok {
+						return true
+					}
+					if len(as.Lhs) != len(as.Rhs) {
+						return true
+					}
+					for i, rhs := range as.Rhs {
+						id, ok := rhs.(*ast.Ident)
+						if !ok || !owners[id.Name] {
+							continue
+						}
+						if lid, ok := as.Lhs[i].(*ast.Ident); ok {
+							owners[lid.Name] = true
+						}
+					}
+					return true
+				})
+			}
 
-			// Direct (non-deferred) Unlock positions narrow the hold.
+			// Lock/unlock positions and the receiver-scoped loaded.Store(true).
+			var lockPos token.Pos
 			var directUnlocks []token.Pos
+			storeTrueCount := 0
+			var storeTruePos token.Pos
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
 				switch node := n.(type) {
 				case *ast.DeferStmt:
 					return false // deferred calls run at function end
 				case *ast.CallExpr:
-					if sel, ok := node.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Unlock" {
-						if recv, ok := sel.X.(*ast.SelectorExpr); ok && recv.Sel.Name == "mu" {
-							directUnlocks = append(directUnlocks, node.Pos())
+					sel, ok := node.Fun.(*ast.SelectorExpr)
+					if !ok {
+						return true
+					}
+					recvSel, ok := sel.X.(*ast.SelectorExpr)
+					if !ok {
+						return true
+					}
+					recvID, ok := recvSel.X.(*ast.Ident)
+					if !ok || !owners[recvID.Name] {
+						return true
+					}
+					switch {
+					case recvSel.Sel.Name == "mu" && sel.Sel.Name == "Lock":
+						if lockPos == token.NoPos {
+							lockPos = node.Pos()
+						}
+					case recvSel.Sel.Name == "mu" && sel.Sel.Name == "Unlock":
+						directUnlocks = append(directUnlocks, node.Pos())
+					case recvSel.Sel.Name == "loaded" && sel.Sel.Name == "Store":
+						if len(node.Args) > 0 {
+							if id, ok := node.Args[0].(*ast.Ident); ok && id.Name == "true" {
+								storeTrueCount++
+								storeTruePos = node.Pos()
+							}
 						}
 					}
 				}
 				return true
 			})
-			_ = explicitUnlockPos
 
-			// Registry references with index/write classification.
-			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				sel, ok := n.(*ast.SelectorExpr)
-				if !ok || (sel.Sel.Name != "maps" && sel.Sel.Name != "programs") {
-					return true
-				}
-				recv, ok := sel.X.(*ast.Ident)
-				if !ok || recv.Name != "m" {
-					return true
-				}
-				refs = append(refs, regRef{pos: sel.Pos()})
-				return true
-			})
-
-			// Classify each ref: indexed (m.maps[...] incl. writes and
-			// reads) or len(); anything else is an escape.
-			for _, r := range refs {
-				_ = r
-			}
-			// Walk again with parent tracking for shape classification.
+			// Registry references with shape + domination classification.
 			var shapeViolations []string
-			var walk func(n ast.Node, parent ast.Node) bool
-			_ = walk
+			var lastWritePos token.Pos
 			var stack []ast.Node
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
 				if n == nil {
@@ -417,17 +434,15 @@ func registryCanaryViolations(t *testing.T, root string) []string {
 					return true
 				}
 				recv, ok := sel.X.(*ast.Ident)
-				if !ok || recv.Name != "m" {
+				if !ok || !owners[recv.Name] {
 					return true
 				}
 				pos := fset.Position(sel.Pos())
 				if !allowed {
 					shapeViolations = append(shapeViolations,
-						fmt.Sprintf("%s:%s: raw m.%s access in %s (outside the allowlist)", name, pos, sel.Sel.Name, fn.Name.Name))
+						fmt.Sprintf("%s:%s: raw %s.%s access in %s (outside the allowlist)", name, pos, recv.Name, sel.Sel.Name, fn.Name.Name))
 					return true
 				}
-				// Shape: the parent must be an IndexExpr (m.maps[name]) or a
-				// len() call. Anything else returns/aliases the container.
 				var parent ast.Node
 				if len(stack) >= 2 {
 					parent = stack[len(stack)-2]
@@ -437,6 +452,17 @@ func registryCanaryViolations(t *testing.T, root string) []string {
 				case *ast.IndexExpr:
 					if p.X == sel {
 						shapeOK = true
+						// Track the last registry index-WRITE for the
+						// publisher's Store-ordering rule.
+						if len(stack) >= 3 {
+							if as, ok := stack[len(stack)-3].(*ast.AssignStmt); ok {
+								for _, lhs := range as.Lhs {
+									if lhs == ast.Expr(p) {
+										lastWritePos = sel.Pos()
+									}
+								}
+							}
+						}
 					}
 				case *ast.CallExpr:
 					if id, ok := p.Fun.(*ast.Ident); ok && id.Name == "len" {
@@ -445,18 +471,21 @@ func registryCanaryViolations(t *testing.T, root string) []string {
 				}
 				if !shapeOK {
 					shapeViolations = append(shapeViolations,
-						fmt.Sprintf("%s:%s: m.%s escapes as a non-indexed reference in %s (container returned/aliased/assigned/passed)", name, pos, sel.Sel.Name, fn.Name.Name))
+						fmt.Sprintf("%s:%s: %s.%s escapes as a non-indexed reference in %s (container returned/aliased/assigned/passed)", name, pos, recv.Name, sel.Sel.Name, fn.Name.Name))
 				}
-				// Domination: after the (first) m.mu.Lock and not after any
-				// direct m.mu.Unlock.
-				if lockPos != token.NoPos && sel.Pos() < lockPos {
+				// Domination: an allowlisted function MUST hold the lock;
+				// the access must follow the first lock and no direct unlock.
+				if lockPos == token.NoPos {
 					shapeViolations = append(shapeViolations,
-						fmt.Sprintf("%s:%s: m.%s access precedes the m.mu.Lock in %s", name, pos, sel.Sel.Name, fn.Name.Name))
+						fmt.Sprintf("%s:%s: %s.%s access in allowlisted %s without any m.mu.Lock", name, pos, recv.Name, sel.Sel.Name, fn.Name.Name))
+				} else if sel.Pos() < lockPos {
+					shapeViolations = append(shapeViolations,
+						fmt.Sprintf("%s:%s: %s.%s access precedes the m.mu.Lock in %s", name, pos, recv.Name, sel.Sel.Name, fn.Name.Name))
 				}
 				for _, up := range directUnlocks {
 					if sel.Pos() > up {
 						shapeViolations = append(shapeViolations,
-							fmt.Sprintf("%s:%s: m.%s access follows a direct m.mu.Unlock in %s (unlock-before-access)", name, pos, sel.Sel.Name, fn.Name.Name))
+							fmt.Sprintf("%s:%s: %s.%s access follows a direct m.mu.Unlock in %s (unlock-before-access)", name, pos, recv.Name, sel.Sel.Name, fn.Name.Name))
 					}
 				}
 				return true
@@ -466,8 +495,25 @@ func registryCanaryViolations(t *testing.T, root string) []string {
 				if storeTrueCount != 1 {
 					shapeViolations = append(shapeViolations,
 						fmt.Sprintf("%s: publishShimRegistryLocked has %d loaded.Store(true) calls, want exactly 1", name, storeTrueCount))
+				} else {
+					// The armed flag is the batch's FINAL in-hold step: the
+					// Store must follow the lock, follow the last registry
+					// write, and precede any direct unlock.
+					if lockPos == token.NoPos || storeTruePos < lockPos {
+						shapeViolations = append(shapeViolations,
+							fmt.Sprintf("%s: publishShimRegistryLocked's Store(true) is not inside the m.mu hold", name))
+					}
+					if lastWritePos != token.NoPos && storeTruePos < lastWritePos {
+						shapeViolations = append(shapeViolations,
+							fmt.Sprintf("%s: publishShimRegistryLocked's Store(true) precedes a registry write — the batch must publish population BEFORE the flag", name))
+					}
+					for _, up := range directUnlocks {
+						if storeTruePos > up {
+							shapeViolations = append(shapeViolations,
+								fmt.Sprintf("%s: publishShimRegistryLocked's Store(true) follows a direct Unlock — outside the hold", name))
+						}
+					}
 				}
-				_ = lastWritePos
 			}
 			violations = append(violations, shapeViolations...)
 		}
@@ -563,6 +609,34 @@ func (m *Manager) lookupProgramLocked(name string) *ebpf.Program {
 	return m.programs[name]
 }
 `
+	renamedReceiver := `package dataplane
+
+func (mgr *Manager) sneakyRenamed(name string) *ebpf.Map {
+	return mgr.maps[name]
+}
+`
+	aliasReceiver := `package dataplane
+
+func (m *Manager) sneakyAlias(name string) *ebpf.Map {
+	alias := m
+	return alias.maps[name]
+}
+`
+	noLockAllowlisted := `package dataplane
+
+func (m *Manager) lookupMapLocked(name string) *ebpf.Map {
+	return m.maps[name]
+}
+`
+	storeAfterUnlock := `package dataplane
+
+func (m *Manager) publishShimRegistryLocked(prog *ebpf.Program, collMaps map[string]*ebpf.Map) {
+	m.mu.Lock()
+	m.programs["x"] = prog
+	m.mu.Unlock()
+	m.loaded.Store(true)
+}
+`
 
 	dir := t.TempDir()
 	write := func(n, src string) {
@@ -579,22 +653,34 @@ func (m *Manager) lookupProgramLocked(name string) *ebpf.Program {
 	write("bad_raw.go", rawAccess)
 	write("bad_alias.go", aliasEscape)
 	write("bad_unlock.go", unlockBeforeAccess)
+	write("bad_recv.go", renamedReceiver)
+	write("bad_recv_alias.go", aliasReceiver)
+	write("bad_nolock.go", noLockAllowlisted)
+	write("bad_store_order.go", storeAfterUnlock)
 	violations := registryCanaryViolations(t, dir)
-	var sawRaw, sawAlias, sawUnlock bool
+	saw := map[string]bool{}
 	for _, v := range violations {
-		if strings.Contains(v, "sneaky") && strings.Contains(v, "outside the allowlist") {
-			sawRaw = true
-		}
-		if strings.Contains(v, "escapes as a non-indexed reference") {
-			sawAlias = true
-		}
-		if strings.Contains(v, "unlock-before-access") {
-			sawUnlock = true
+		switch {
+		case strings.Contains(v, "in sneaky ") && strings.Contains(v, "outside the allowlist"):
+			saw["raw"] = true
+		case strings.Contains(v, "sneakyAlias") && strings.Contains(v, "outside the allowlist"):
+			saw["recvAlias"] = true
+		case strings.Contains(v, "sneakyRenamed") && strings.Contains(v, "outside the allowlist"):
+			saw["renamedRecv"] = true
+		case strings.Contains(v, "escapes as a non-indexed reference"):
+			saw["alias"] = true
+		case strings.Contains(v, "unlock-before-access"):
+			saw["unlock"] = true
+		case strings.Contains(v, "without any m.mu.Lock"):
+			saw["nolock"] = true
+		case strings.Contains(v, "Store(true) follows a direct Unlock"):
+			saw["storeOrder"] = true
 		}
 	}
-	if !sawRaw || !sawAlias || !sawUnlock {
-		t.Fatalf("canary missed synthetic negatives (raw=%v alias=%v unlock=%v):\n%s",
-			sawRaw, sawAlias, sawUnlock, strings.Join(violations, "\n"))
+	for _, k := range []string{"raw", "recvAlias", "renamedRecv", "alias", "unlock", "nolock", "storeOrder"} {
+		if !saw[k] {
+			t.Errorf("canary missed synthetic negative %q; violations:\n%s", k, strings.Join(violations, "\n"))
+		}
 	}
 }
 
@@ -808,22 +894,45 @@ func collectRegistryCallsites(t *testing.T, root string) map[string]bool {
 			if sel.Sel.Name == "lookupProgramLocked" {
 				kind = "prog"
 			}
-			out[fmt.Sprintf("%s|%s|%s|%s", name, encl, kind, arg)] = true
+			key := fmt.Sprintf("%s|%s|%s|%s", name, encl, kind, arg)
+			if out[key] {
+				// A second IDENTICAL call in the same function collapses
+				// the manifest key — refuse to collapse it silently
+				// (Codex PR #6743 M3): the reviewer must disambiguate the
+				// manifest entry (or the code) deliberately.
+				t.Fatalf("duplicate helper callsite %s in %s — the manifest cannot key it; rename or restructure so each callsite is distinct", key, name)
+			}
+			out[key] = true
 			return true
 		})
 	}
 	return out
 }
 
-// collectRegistryGatedCallsites returns the subset of callsites (same
-// "file|fn|kind|arg" key form) whose assignment binds the registryState
-// return to a NON-BLANK identifier — i.e. the callsite actually consumes
-// the gate classification. That is the per-callsite gated bit: required
-// accesses check `st == registryFresh`; optional/raw/class-4-nil accesses
-// blank it out.
+// collectRegistryGatedCallsites returns the per-callsite gate-consumption
+// evidence (same "file|fn|kind|arg" key form): the name of the identifier
+// the registryState return is bound to ("" when blanked), and whether the
+// enclosing function compares that identifier against registryFresh. The
+// manifest test requires "required" callsites to BIND non-blank AND
+// COMPARE — binding st and ignoring it must not pass (Codex PR #6743 M3).
 func collectRegistryGatedCallsites(t *testing.T, root string) map[string]bool {
 	t.Helper()
-	out := map[string]bool{}
+	out := gatedCallsiteEvidence(t, root)
+	result := map[string]bool{}
+	for key, ev := range out {
+		result[key] = ev.bound && ev.compared
+	}
+	return result
+}
+
+type gatedEvidence struct {
+	bound    bool   // third result bound non-blank
+	compared bool   // that identifier compared against registryFresh in-body
+}
+
+func gatedCallsiteEvidence(t *testing.T, root string) map[string]gatedEvidence {
+	t.Helper()
+	out := map[string]gatedEvidence{}
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		t.Fatalf("read %s: %v", root, err)
@@ -877,16 +986,14 @@ func collectRegistryGatedCallsites(t *testing.T, root string) map[string]bool {
 				kind = "prog"
 			}
 			key := fmt.Sprintf("%s|%s|%s|%s", name, encl, kind, arg)
-			// gated iff the third result (registryState) is bound non-blank
-			// by the enclosing assignment.
-			// The call sits inside an AssignStmt's Rhs (possibly the only
-			// element); find it by walking the enclosing function's
-			// statements — ast.Inspect parent tracking is unavailable, so
-			// re-walk the enclosing body.
+			// The call sits inside an AssignStmt's Rhs; find the bound
+			// third-LHS identifier by re-walking the enclosing body, then
+			// look for an `<ident> == registryFresh` comparison in it.
 			for _, g := range fns {
 				if g.name != encl {
 					continue
 				}
+				ev := out[key]
 				ast.Inspect(g.body, func(n2 ast.Node) bool {
 					as, ok := n2.(*ast.AssignStmt)
 					if !ok {
@@ -899,17 +1006,107 @@ func collectRegistryGatedCallsites(t *testing.T, root string) map[string]bool {
 						}
 						if len(as.Lhs) == 3 {
 							if id, ok := as.Lhs[2].(*ast.Ident); ok && id.Name != "_" {
-								out[key] = true
+								ev.bound = true
+								boundName := id.Name
+								ast.Inspect(g.body, func(n3 ast.Node) bool {
+									be, ok := n3.(*ast.BinaryExpr)
+									if !ok || be.Op.String() != "==" {
+										return true
+									}
+									var leftName, rightName string
+									if id, ok := be.X.(*ast.Ident); ok {
+										leftName = id.Name
+									}
+									if id, ok := be.Y.(*ast.Ident); ok {
+										rightName = id.Name
+									}
+									if (leftName == boundName && rightName == "registryFresh") ||
+										(leftName == "registryFresh" && rightName == boundName) {
+										ev.compared = true
+									}
+									return true
+								})
 							}
 						}
 					}
 					return true
 				})
+				out[key] = ev
 			}
 			return true
 		})
 	}
 	return out
+}
+
+// TestManagerRegistryGateEvidenceSelfTest drives the gate-evidence collector
+// over synthetic fixtures: bind-and-COMPARE yields gated=true;
+// bind-and-ignore yields gated=false (the M3 hole); blanking yields
+// gated=false.
+func TestManagerRegistryGateEvidenceSelfTest(t *testing.T) {
+	t.Parallel()
+
+	compared := `package dataplane
+
+func (m *Manager) good(name string) error {
+	zm, present, st := m.lookupMapLocked(name)
+	if st == registryFresh {
+		return ErrDataplaneNotArmed
+	}
+	if !present {
+		return nil
+	}
+	_ = zm
+	return nil
+}
+`
+	bindIgnore := `package dataplane
+
+func (m *Manager) bad(name string) error {
+	zm, present, st := m.lookupMapLocked(name)
+	_ = st
+	if !present {
+		return nil
+	}
+	_ = zm
+	return nil
+}
+`
+	blanked := `package dataplane
+
+func (m *Manager) blank(name string) error {
+	zm, present, _ := m.lookupMapLocked(name)
+	if !present {
+		return nil
+	}
+	_ = zm
+	return nil
+}
+`
+
+	dir := t.TempDir()
+	write := func(n, s string) {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte(s), 0o644); err != nil {
+			t.Fatalf("write %s: %v", n, err)
+		}
+	}
+	write("a.go", compared)
+	write("b.go", bindIgnore)
+	write("c.go", blanked)
+
+	ev := gatedCallsiteEvidence(t, dir)
+	if got := ev["a.go|good|map|<ident:name>"].bound && ev["a.go|good|map|<ident:name>"].compared; !got {
+		t.Error("bind-and-compare fixture must yield bound+compared")
+	}
+	if ev["b.go|bad|map|<ident:name>"].compared {
+		t.Error("bind-and-ignore fixture must NOT yield compared (the M3 hole)")
+	}
+	if !ev["b.go|bad|map|<ident:name>"].bound {
+		t.Error("bind-and-ignore fixture should still register the non-blank binding")
+	}
+	if ev["c.go|blank|map|<ident:name>"].bound {
+		t.Error("blanked fixture must not register a binding")
+	}
 }
 
 // TestManagerRegistryCallsiteManifest is the stale-checked helper-callsite
