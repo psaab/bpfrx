@@ -18,6 +18,14 @@ import (
 // *dataplane/userspace.LegacyDataPlaneAdapter satisfy
 // RuntimeDomainProvider directly (Sessions()/Telemetry()), so the
 // daemon no longer needs the BPF-shaped escape hatch here.
-func (d *Daemon) newConntrackGC(interval time.Duration) *conntrack.GC {
-	return conntrack.NewGC(d.dataplane(), interval)
+//
+// #2114 (Codex PR #6743 r3-7): the caller passes its pass snapshot —
+// Run's phase-5 guard loaded the cell once, and the GC must be wired
+// to THAT publication rather than re-loading (a clear landing between
+// the two loads would construct the GC against a different backend
+// than the guard validated). The parameter is the conntrack-facing
+// interface (NOT dataplane.RuntimeDataPlane) so this file stays out
+// of the #1451 legacy-import allowlist.
+func (d *Daemon) newConntrackGC(rt conntrack.RuntimeDomainProvider, interval time.Duration) *conntrack.GC {
+	return conntrack.NewGC(rt, interval)
 }

@@ -224,7 +224,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			starter.StartFIBSync(ctx)
 		}
 
-		gc := d.newConntrackGC(10 * time.Second)
+		gc := d.newConntrackGC(rt, 10*time.Second)
 		d.gc = gc
 
 		// When the userspace dataplane is active, skip BPF session map

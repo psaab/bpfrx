@@ -273,8 +273,9 @@ func (d *Daemon) checkUserspaceTakeoverReadinessFor(rt dataplane.RuntimeDataPlan
 	if !userspaceRGConfigured(cfg, rgID) {
 		return true, nil
 	}
-	// Copilot fix: if the dataplane is unpublished or wrong type but config
-	// says userspace, the dataplane isn't ready — don't report takeover-ready.
+	// Fail closed: when the config says userspace but no dataplane is
+	// published (or it is not the userspace adapter), the dataplane is
+	// not ready — never report takeover-ready for an absent backend.
 	if rt == nil {
 		return false, []string{fmt.Sprintf("userspace dataplane not initialized for RG %d", rgID)}
 	}

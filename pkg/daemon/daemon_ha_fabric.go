@@ -752,10 +752,11 @@ func (d *Daemon) refreshFabricFwd(ctx context.Context, fabIface, overlay string,
 
 	// Push updated fabric MACs to userspace helper so it can do
 	// cross-chassis fabric redirect. The initial snapshot may have
-	// been built before the peer MAC was resolved.
-	if rt := d.dataplane(); rt != nil {
-		rt.HA().SyncFabricState(ctx)
-	}
+	// been built before the peer MAC was resolved. #2114 (Codex PR
+	// #6743 r3-7): reuse the snapshot from above — the map update and
+	// the helper sync are one coupled operation, and a second load
+	// could observe a mid-refresh clear (map updated, sync skipped).
+	rt.HA().SyncFabricState(ctx)
 
 	return true
 }
