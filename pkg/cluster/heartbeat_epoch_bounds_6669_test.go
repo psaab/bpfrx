@@ -174,14 +174,20 @@ func TestRefinementValidatesThePublishedEpochNotJustThePersistedOne_6169(t *test
 // year-2191 fixture below by ~222) and nothing on this node separates them,
 // because the predicate that WOULD discriminate is exactly the one being
 // skipped — so this test documents a residual rather than a bug to fix.
-// The FIRST pass of a boot is the one that matters here: refinement is re-run at
-// each later heartbeat start (Manager.refreshBootEpoch), so an NTP correction
-// followed by a StartHeartbeat does heal the file — but nothing forces such an
-// event, and the epoch already published by this incarnation is never lowered.
+// The FIRST pass of a boot is the one that matters here. Refinement IS re-run at
+// each later heartbeat start (Manager.refreshBootEpoch), but re-validating is not
+// healing: refinement persists the published epoch, which only ever rises, so
+// once the first pass has chained from the corrupt value every later pass writes
+// that raised value back and nothing lowers the file. An earlier revision of this
+// header claimed an NTP correction plus a StartHeartbeat heals it; it does not,
+// and nothing below asserted that it did.
 //
-// RED-on-revert for the DOCUMENTATION: if the healing precondition is ever
-// removed from epochWithinForwardBound / the README, this test still pins the
-// behaviour those texts must describe.
+// SCOPE OF THIS TEST, stated so the header does not outrun the body: the
+// subtests cover the FIRST pass only — that a credible clock declines the corrupt
+// value and an uncredible one chains from it. The multi-pass no-heal property
+// above is NOT asserted here; it follows from published being monotone
+// non-decreasing (heartbeat_epoch.go), and if it is ever tested it needs a second
+// refineBootEpoch call with the lastWrote watermark carried.
 func TestPersistedEpochHealsOnlyWhenClockCredible_6169(t *testing.T) {
 	// Year ~2191: wrong by any measure, but below the absolute year-2200 band,
 	// so only the forward bound can catch it.

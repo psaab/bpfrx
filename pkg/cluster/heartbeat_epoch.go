@@ -271,12 +271,26 @@ func epochOrderable(epoch uint64, nowNanos int64) bool {
 //
 // Refinement is RE-RUN at each later heartbeat start (Manager.refreshBootEpoch),
 // so once NTP has corrected the clock the NEXT StartHeartbeat — a VRF rebind,
-// an HA comms restart — does re-validate the file and heal it, which bounds the
-// damage to boots with no such event. It does not repair the epoch THIS
-// incarnation already published: refinement only ever raises, and lowering a
-// published epoch mid-incarnation is the one direction the design refuses. So
-// the file is healed for the next boot while this node stays high until it
-// restarts.
+// an HA comms restart — does RE-VALIDATE the file. It does NOT heal it, and an
+// earlier revision of this comment said it did. Re-validation and healing are
+// different things and only the first is new here:
+//
+// refineBootEpoch ends by persisting published.Load(), and published is monotone
+// non-decreasing — the sole store is gated on next > epoch. This residual's
+// premise is that the FIRST pass already chained from the corrupt value, so
+// published is by then bad+1. Every later pass therefore writes bad+1 back, or
+// returns without writing (prev == lastWrote, a read error, a MkdirAll failure).
+// No path can LOWER the file, and lowering is exactly what healing would mean
+// here — contrast heartbeat_epoch.go's first-pass DECLINE ("ignoring it heals
+// the file"), which heals precisely because published is still the sane
+// wall-clock seed at that point.
+//
+// What actually clears it is a daemon restart with a credible clock. On the box
+// this residual describes — a dead RTC, xpfd starting before time sync — that
+// does not happen either: the first pass of EVERY boot chains again and the
+// value ratchets +1 per boot. Re-running refinement bounds a different failure
+// (an incarnation stranded BELOW its peer's floor climbs back, rather than being
+// pinned by sync.Once for the life of the process); it does not bound this one.
 //
 // It cannot be closed COMPLETELY here, and the qualifier matters — an earlier
 // revision of this comment said "cannot be closed" flat, which is too strong.

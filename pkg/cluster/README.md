@@ -830,10 +830,15 @@ peer liveness (`lastSeen`) or drive election.
        time sync, the FIRST pass of every boot is made against an uncredible
        clock, and a correctly clocked peer then refuses this node's epoch on its
        raise path — asymmetric visibility, not mutual isolation. Refinement is
-       re-run at each later heartbeat start (`Manager.refreshBootEpoch`), so once
-       NTP corrects the clock the next `StartHeartbeat` heals the *file*; nothing
-       forces such an event, and the epoch this incarnation already published is
-       never lowered. No complete close exists:
+       re-run at each later heartbeat start (`Manager.refreshBootEpoch`), which
+       RE-VALIDATES the file but does **not** heal it — an earlier revision of
+       this paragraph said it did, and that was wrong. Refinement persists the
+       published epoch, which only ever rises, so once the first pass has chained
+       from the corrupt value every later pass writes the same raised value back.
+       Nothing lowers the file, and lowering is what healing would mean. On the
+       dead-RTC box this residual describes, a restart does not clear it either:
+       the first pass of every boot chains again and the value ratchets. No
+       complete close exists:
        under a dead RTC a legitimate previous epoch and a corrupt future one are
        indistinguishable (nothing on the node is a trustworthy time reference),
        and healing after the fact would mean LOWERING a published epoch

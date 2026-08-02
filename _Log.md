@@ -66926,3 +66926,50 @@ break — `go vet` confirmed passing under every revert.
   pkg/cluster/heartbeat_epoch_stats_scope_6669_test.go,
   pkg/cluster/heartbeat_epoch_status_6169_test.go, pkg/cluster/README.md,
   _Log.md
+
+## 2026-08-02 — #6669 fold r9: withdraw the "a re-run heals the file" claim
+
+- **Timestamp**: 2026-08-02
+- **Action**: Fold the r7 hostile re-gate's F1 (MAJOR) and F2 (MINOR) on PR
+  #6669 at `706c06748`. Both are claim defects; zero executable lines change.
+- **F1 — the previous fold replaced a TRUE statement with a FALSE one.** It
+  claimed `Manager.refreshBootEpoch` means "the NEXT StartHeartbeat does
+  re-validate the file AND HEAL IT", so "the file is healed for the next boot".
+  The re-validate half is true and new. The heal half is false and unreachable
+  by construction, which I verified in the code rather than accepting the
+  review: `refineBootEpoch` computes `epoch := published.Load()`, raises only
+  under `if next := prev + 1; next > epoch`, and then persists that `epoch`
+  (`heartbeat_epoch.go:755/764-769/771`). Residual 6's premise is that the FIRST
+  pass already chained from the corrupt value, so `published` is by then
+  `bad+1`; every later pass therefore writes `bad+1` back or returns without
+  writing (`prev == lastWrote`, read error, MkdirAll failure). No path LOWERS
+  the file, and lowering is exactly what healing means here — contrast the
+  first-pass decline, which heals precisely because `published` is still the
+  sane wall-clock seed. On the dead-RTC box this residual describes, a restart
+  does not clear it either: the first pass of every boot chains again and the
+  value ratchets +1 per boot. Corrected at `heartbeat_epoch.go:272-279` (code
+  comment), `README.md:832-834` (operator-facing residual 6) and the
+  `TestPersistedEpochHealsOnlyWhenClockCredible_6169` header.
+- **The test header also promised more than the body asserts**, the shape this
+  PR exists to remove: nothing below it exercised a second pass. The header now
+  states its scope — first pass only — and says what a multi-pass test would
+  need (a second `refineBootEpoch` with the `lastWrote` watermark carried).
+- **What re-running refinement DOES bound** is stated instead: an incarnation
+  stranded BELOW its peer's floor climbs back rather than being pinned by
+  `sync.Once` for the life of the process. That is a different failure from
+  residual 6, and conflating them is what produced the false claim.
+- **F2 — the withdrawn claim survived verbatim six lines above its own
+  withdrawal** at `heartbeat.go:558-560`: "a frame from a retired incarnation
+  never reaches admit()". The next paragraph says the opposite. Rewritten to
+  "a frame the floor REJECTS never reaches admit()… an ORDERING property, not a
+  claim that every retired incarnation is rejected". Not pre-existing —
+  `origin/master` has no `heartbeat_epoch.go` and no such sentence. Also
+  restored the `//` paragraph separator the previous rewrite dropped.
+- **Validation**: `go build ./...` rc=0, `go vet ./pkg/cluster/...` rc=0,
+  `go test -race ./pkg/cluster/` ok 13.0s, and
+  `TestPersistedEpochHealsOnlyWhenClockCredible_6169` confirmed by name under
+  `-v` to have RUN both subtests rather than been skipped. No executable line
+  changed, so no mutation proof applies — the defect was the prose.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/README.md,
+  pkg/cluster/heartbeat_epoch_bounds_6669_test.go, pkg/cluster/heartbeat.go,
+  _Log.md

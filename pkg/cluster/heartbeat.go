@@ -556,8 +556,10 @@ func verifyHeartbeatMAC(data, authKey []byte) bool {
 // This receiver-only map cannot close that residual by itself — it needs an
 // order over peer incarnations, which random session ids cannot provide. That
 // order SHIPPED in #6169 as the signed boot epoch (heartbeat_epoch.go):
-// admitAuthedLocked consults the epoch floor BEFORE this ring, so a frame from
-// a retired incarnation never reaches admit() and therefore cannot churn it.
+// admitAuthedLocked consults the epoch floor BEFORE this ring, so a frame the
+// floor REJECTS never reaches admit() and therefore cannot churn it. That is an
+// ORDERING property, not a claim that every retired incarnation is rejected —
+// see the #6711 paragraph below, where the opposite happens.
 //
 // It is a TOTAL order only while the sender's clock advances monotonically
 // across incarnations. A backward step larger than bootEpochMaxSkew sorts a
@@ -582,6 +584,7 @@ func verifyHeartbeatMAC(data, authKey []byte) bool {
 // ascending pass, then 0/1625 across five further rounds. It is the
 // epoch-LESS captures that stay indefinitely churnable, which is what the
 // downgrade latch exists for.
+//
 // The ring is retained and still owns within-incarnation replay. It does NOT
 // cause a genuine-peer lockout (an evicted live-peer watermark just makes the
 // peer's next frame never-seen -> admitted) and cannot grow memory (fixed
