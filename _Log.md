@@ -1,3 +1,110 @@
+## 2026-08-01 — #5561 round 11: the budget mechanism was right, its denomination and arbitration were not
+
+- **Timestamp**: 2026-08-01 (fix/5561-rest-per-principal-authz, PR #6645)
+- **Action**: Two MAJORs and three MINORs on the round-10 fold. Round 10's own
+  three fixes all survived re-gate and were not re-litigated. Both MAJORs
+  reproduced firsthand before any fix.
+
+  **The design question first.** Round 9 introduced an unbounded body buffer;
+  round 10 bounded it with per-route ceilings plus a 64 MiB aggregate byte
+  budget; round 10's budget then created a privilege-crossing denial neither
+  master nor round 9 had. Rather than patch a third time, the mechanism was
+  re-examined: the budget SURVIVES, because bounding the memory a caller can
+  make the daemon hold is the right idea and there is no cheaper way to state
+  it. Two things about round 10's budget were wrong, and they are independent
+  defects rather than one bug with two symptoms — a wrong UNIT and a wrong
+  ARBITRATION.
+
+  **MAJOR 1a — the budget was denominated in DECLARED bytes.** `admitMutationBody`
+  reserved `min(Content-Length, ceiling)` up front and held it for the request's
+  whole lifetime. A Content-Length is a promise; the memory only exists once the
+  bytes do. Measured amplification 65536x: 1024 half-open `POST
+  /api/v1/diagnostics/ping` with `Content-Length: 65536` and one byte sent, from
+  a `read-only` (PermView) principal, filled the entire 64 MiB with ~1 KB of
+  traffic. Fixed by charging the buffer as it GROWS: `bufferMutationBody` is now
+  io.ReadAll with its growth steps charged against a per-request `bodyBudget`, so
+  a half-open request holds one 512-byte allocation and is charged for one
+  512-byte allocation. A grow charges the old allocation AND the new one across
+  the copy, so the number bounds peak resident bytes — which also closes the
+  reviewer's NOTE 6 (the old budget was ~100 MiB resident for a 64 MiB name)
+  rather than documenting it. Also removes the reserve<=0 skip, so the HTTP/2
+  `content-length: 0`-on-an-open-stream row (MINOR 5) is inside the accounting
+  by construction: there is no declaration-based path left to slip past.
+
+  **MAJOR 1b — the budget was one undivided pool.** Pass 1 guarantees only that
+  a buffering caller is authorized for the route it called, and the cheapest
+  permission on the surface is authorized for something — so view-tier traffic
+  and a super-user's commit drew on the same bytes and the view tier could take
+  all of them. Fixed with `mutationBodyTierCeilings`, a reserve ladder keyed on
+  the permission the ROUTE requires (view/clear/control 16 MiB, config 48 MiB,
+  maint 64 MiB out of the same 64 MiB total): a request is admitted only while
+  the running total is within ITS tier's share, so whatever the view tier takes,
+  a whole-configuration load is permanently out of its reach. Keyed on the route
+  rather than the caller deliberately — it is the action being protected, and
+  pass 1 has already established that only a holder of that permission gets
+  here, so a super-user's pings draw on the view tier like anyone else's and
+  cannot crowd out that same super-user's commit. Total across tiers is
+  unchanged, so the memory bound is unchanged.
+
+  **MAJOR 2 — the no-body class covered 2 of the 7 routes meeting its own
+  definition.** `config/enter`, `exit`, `commit`, `commit-check` (signature
+  literally `_ *http.Request`) and `confirm` all answer from the
+  X-Config-Session header alone, yet all five PARKED on a withheld body and each
+  reserved 1 MiB of MAJOR 1's budget while doing so. All five reclassified
+  `mutationBodyNone`. The old guard could not fire because it asked "did this
+  request park", which the GATE decides — a tautology about the classification
+  it was meant to discriminate, and its control asserted `config/enter` "DOES
+  decode one", which is false. Replaced with
+  `TestNoBodyClassMatchesTheHandlersThatDecode_5561`: it sends every guarded
+  route a malformed body and requires the set that answers 400 "invalid JSON
+  body" to be exactly the complement of the class. That probe found a false
+  positive in ITSELF on the first run — `dhcp/identifiers/clear` answers "No
+  DHCP clients running" and returns BEFORE its decode when `s.dhcp` is nil, so
+  an unwired fixture reported it as a no-body route. Acting on that would have
+  moved a route whose handler DOES block on the caller out of the second
+  adjudication's ordering. The fixture now wires a real `dhcp.Manager`, and the
+  hazard is written into the test.
+
+  **SEQUENCING.** The freshness tests parked on `config/enter`, so reclassifying
+  it first would have left them passing while no longer reaching the window they
+  exist to test. Both were moved to `POST /api/v1/config/set` — a route whose
+  HANDLER decodes before it does anything else — BEFORE the reclassification.
+
+  **MINOR 3 — nothing bound the release.** Dropping `defer release()` left the
+  aggregate test green in isolation; it was caught only by whichever later test
+  inherited the poisoned global.
+  `TestBodyBudgetReservationIsReleasedOnEveryExitPath_5561` now drives handler-
+  returned, caller-hung-up-mid-body and body-overran-the-ceiling and asserts the
+  counter is whole after each.
+
+  **MINOR 4 / NOTE 7 — documented rather than only benefited from.**
+  `withCommittedAuth`'s one-directional override leaves the api-auth REMOVAL
+  direction unpinned (a deleted credential is resurrected by a stale replay);
+  the comment and `pkg/daemon/README.md` now state that cost and why the
+  asymmetry is still the right choice. `dhcp/identifiers/clear`'s 413 threshold
+  moving 16 MiB -> 64 KiB is now stated in both the table and `pkg/api/README.md`.
+
+  Validation. Both MAJORs reproduced at `e4e015342` before fixing. TRUE parent
+  RED by assertion at `e4e015342` with `go build ./...` rc 0 and `go vet` rc 0
+  there, on `TestHalfOpenBodyIsChargedForWhatItHoldsNotWhatItDeclared_5561`,
+  `TestLowPrivilegeCallerCannotDenyAPrivilegedOne_5561`,
+  `TestViewTierSaturationLeavesHeadroomForTheConfigureTier_5561` and
+  `TestNoBodyClassMatchesTheHandlersThatDecode_5561`; every other `_5561` case
+  green there, so the reds are the findings and not collateral. The guards on
+  mechanisms this round INTRODUCES cannot be parent-RED, so they were proved by
+  mutation instead, each with build rc 0 / vet rc 0: flattening the tier ladder
+  reds both tier guards and leaves the denomination and aggregate guards green;
+  moving a genuine body-taker INTO the no-body class reds the partition guard in
+  the other direction; dropping the release reds the release guard IN ISOLATION;
+  pointing the freshness tests back at `config/enter` reds them with "no request
+  ever parked", which is the sequencing hazard closed.
+- **File(s)**: `pkg/api/authz.go`,
+  `pkg/api/authz_bodybudget_fairness_5561_test.go` (new),
+  `pkg/api/authz_bodybudget_5561_test.go`,
+  `pkg/api/authz_bodywindow_5561_test.go`,
+  `pkg/api/authz_freshness_5561_test.go`, `pkg/api/README.md`,
+  `pkg/daemon/management.go`, `pkg/daemon/README.md`, `_Log.md`
+
 ## 2026-08-01 — #5561 round 10: fold three MAJOR findings on PR #6645
 
 - **Timestamp**: 2026-08-01 (fix/5561-rest-config-auth, PR #6645)

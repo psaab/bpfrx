@@ -229,6 +229,17 @@ func (m *managementReconciler) reconcile(cfg *config.Config) error {
 // credential set, i.e. it never turns a non-nil publish into a nil one. That
 // keeps it incapable of relaxing the #4047/#5127 clamp, whose requirement is
 // derived from `next`'s own bind address rather than from the active config's.
+//
+// That asymmetry has a price, and it is stated rather than only its benefit: a
+// commit that REMOVES api-auth is not pinned. `committed` is then nil, no
+// override happens, and reconcileTo publishes the stale replay's non-nil Auth —
+// so a credential the operator deleted stays live and uncredentialed callers
+// keep getting 401 until the next commit republishes. The asymmetry is
+// deliberate anyway, because the two directions are not symmetric in
+// consequence: a resurrected credential over-restricts a management API that is
+// clamped to loopback regardless, while the mirror-image rule (letting a stale
+// snapshot clear a credential) would be an authentication bypass. Over-restrict
+// and wait for the next commit; never under-restrict.
 func (m *managementReconciler) withCommittedAuth(next api.Config) api.Config {
 	if m.d == nil || m.d.store == nil {
 		return next

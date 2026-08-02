@@ -1,14 +1,19 @@
 package api
 
 import (
+	"bufio"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/psaab/xpf/pkg/dhcp"
 )
 
 // authz_bodywindow_5561_test.go guards the window the mutation gate holds open
@@ -102,7 +107,12 @@ func TestLocalCallerCredentialIsRevalidatedAfterTheBody_5561(t *testing.T) {
 						PeerLookupFn: fixedPeerUID(authzUIDSuperuser),
 					})
 
-					req := openWithheldBody(t, base, "POST /api/v1/config/enter", tc.hdrs)
+					// A route whose HANDLER blocks on the caller (configSetHandler
+					// decodes before anything else), so the window driven here is
+					// the real one rather than an artefact of the gate buffering on
+					// some handler's behalf — a route in the mutationBodyNone class
+					// answers without entering it at all.
+					req := openWithheldBody(t, base, "POST /api/v1/config/set", tc.hdrs)
 
 					// Authorized, and now parked reading a body the caller has not
 					// sent. This is the window, and the caller holds it open.
@@ -167,12 +177,20 @@ func openDeclaredBody(t *testing.T, base, route string, declared int, sent strin
 		fmt.Fprintf(&b, "%s: %s\r\n", k, v)
 	}
 	b.WriteString("Connection: close\r\n\r\n")
-	b.WriteString(sent)
 	if err := conn.SetDeadline(time.Now().Add(60 * time.Second)); err != nil {
 		t.Fatalf("SetDeadline: %v", err)
 	}
 	if _, err := io.WriteString(conn, b.String()); err != nil {
 		t.Fatalf("write request headers: %v", err)
+	}
+	// The body goes separately, and a short write on it is NOT fatal: a request
+	// the gate refuses has its response written and its connection closed while
+	// the caller is still sending, which is exactly the outcome some cases are
+	// here to observe. The status is still readable from what the server sent
+	// before it hung up. A failed HEADER write above is always a bug, so that
+	// one stays fatal.
+	if sent != "" {
+		_, _ = io.WriteString(conn, sent)
 	}
 	return conn
 }
@@ -205,27 +223,34 @@ func readStatus(t *testing.T, conn net.Conn, within time.Duration) (int, bool) {
 	return code, true
 }
 
-// TestNoBodyRouteIsNotBufferedByTheGate_5561 pins the restored immediate answer
-// on the routes whose handlers never touch the request body.
+// TestNoBodyRouteIsNotBufferedByTheGate_5561 pins the restored immediate
+// answer on EVERY route in the no-body class.
 //
-// `POST /api/v1/security/sessions/clear` is parameterless by contract (#3421
-// H6): it answers on any query string or non-zero ContentLength WITHOUT reading
-// a byte. `POST /api/v1/security/counters/clear` ignores the request entirely.
-// Once the gate began draining every authorized mutating request, both answers
-// moved behind a read the CALLER controls — so a caller could declare 16 MiB,
-// send all but the last byte, and make the daemon hold a buffer until
-// apiReadTimeout (30s), once per connection, for a request no handler was going
-// to read.
+// Those handlers answer from the request line and its headers — the two clear
+// verbs are parameterless by contract (#3421 H6) and the five config lifecycle
+// and commit verbs are addressed by the X-Config-Session header — so once the
+// gate began draining every authorized mutating request, their answers moved
+// behind a read the CALLER controls. A caller could declare 16 MiB, send all
+// but the last byte, and make the daemon hold a buffer until apiReadTimeout
+// (30s), once per connection, for a request no handler was going to read.
+//
+// The class is read from restMutationBodyLimits rather than listed here, so a
+// route added to it is covered without anybody remembering to extend this case.
+// Its MEMBERSHIP is a separate question, answered against the handlers
+// themselves by TestNoBodyClassMatchesTheHandlersThatDecode_5561.
 //
 // The assertion is the outcome the caller sees on a body it never finishes: the
 // answer must arrive WITHOUT it, and no request may be parked reading one. The
 // status itself is deliberately not asserted — it depends on whether the
-// fixture wires a dataplane, and the property under test is that the handler
-// was reached at all before the caller chose to finish.
+// fixture wires a dataplane, and the property under test is that the handler was
+// reached at all before the caller chose to finish.
 //
-// The CONTROL is the discriminator: `POST /api/v1/config/enter` DOES take a
-// body, so it must still park. Without it, a probe that reported "answered"
-// for every route would look like a pass.
+// The CONTROL is the discriminator, and it has to be a route whose HANDLER
+// blocks on the caller — not merely one the gate buffers, which would be a
+// tautology about the classification the case is trying to discriminate.
+// configSetHandler decodes the body before it looks at anything else, so
+// POST /api/v1/config/set parks because of what it does, not because of how it
+// is classified.
 func TestNoBodyRouteIsNotBufferedByTheGate_5561(t *testing.T) {
 	usePasswdFixture(t)
 	_, base := authzServer(t, Config{
@@ -234,10 +259,18 @@ func TestNoBodyRouteIsNotBufferedByTheGate_5561(t *testing.T) {
 		PeerLookupFn: fixedPeerUID(authzUIDSuperuser),
 	})
 
-	for _, route := range []string{
-		"POST /api/v1/security/sessions/clear",
-		"POST /api/v1/security/counters/clear",
-	} {
+	noBody := make([]string, 0, len(restMutationBodyLimits))
+	for route, limit := range restMutationBodyLimits {
+		if limit == mutationBodyNone {
+			noBody = append(noBody, route)
+		}
+	}
+	sort.Strings(noBody)
+	if len(noBody) == 0 {
+		t.Fatal("no route is classified mutationBodyNone, so this case asserts nothing")
+	}
+
+	for _, route := range noBody {
 		t.Run(route, func(t *testing.T) {
 			// A 16 MiB declaration with ONE byte sent and the rest withheld.
 			conn := openDeclaredBody(t, base, route, 16<<20, "{", nil)
@@ -255,13 +288,107 @@ func TestNoBodyRouteIsNotBufferedByTheGate_5561(t *testing.T) {
 		})
 	}
 
-	t.Run("control: a body-taking route still parks", func(t *testing.T) {
-		conn := openDeclaredBody(t, base, "POST /api/v1/config/enter", 16<<20, "{", nil)
+	t.Run("control: a route whose handler decodes still parks", func(t *testing.T) {
+		conn := openDeclaredBody(t, base, "POST /api/v1/config/set", 16<<20, "{", nil)
 		if status, got := readStatus(t, conn, 2*time.Second); got {
-			t.Fatalf("POST /api/v1/config/enter answered %d before its body arrived. It "+
-				"DOES decode one, so the gate must hold the second adjudication until the "+
-				"caller supplies it — and the probe above cannot distinguish anything if "+
-				"every route answers early", status)
+			t.Fatalf("POST /api/v1/config/set answered %d before its body arrived. Its handler "+
+				"decodes one before it does anything else, so the gate must hold the second "+
+				"adjudication until the caller supplies it — and the probe above cannot "+
+				"distinguish anything if every route answers early", status)
 		}
 	})
+}
+
+// TestNoBodyClassMatchesTheHandlersThatDecode_5561 pins the MEMBERSHIP of the
+// no-body class against the handlers themselves.
+//
+// mutationBodyNone means "this route's handler never reads the request body",
+// and everything the class buys follows from that being true: the gate skips
+// the drain, so the route keeps its immediate answer, never enters the window
+// the caller controls, and never charges the aggregate budget for a body
+// nobody is going to look at. A route that belongs in the class and is not in
+// it pays all three costs for nothing; one that does NOT belong and is in it
+// loses the second adjudication's ordering.
+//
+// The probe cannot ask "did this request park", because the GATE parks it — a
+// route buffered by the gate parks whether or not its handler would have read
+// anything, which makes that observation a tautology about the classification
+// rather than a test of it. So it asks the handler a question only a handler
+// that decodes can answer: it sends a complete, tiny, syntactically INVALID
+// JSON body. A handler that decodes answers 400 "invalid JSON body"; a handler
+// that never looks answers whatever it answers from headers alone. That
+// partition must be exactly the classification.
+func TestNoBodyClassMatchesTheHandlersThatDecode_5561(t *testing.T) {
+	usePasswdFixture(t)
+	// The DHCP manager is wired deliberately. clearDHCPIdentifiersHandler
+	// answers "No DHCP clients running" and returns BEFORE its decode when
+	// s.dhcp is nil, so an unwired fixture reports that route as one that never
+	// reads a body — and acting on that would move a route whose handler DOES
+	// block on the caller out of the ordering the second adjudication provides.
+	// A probe of handler behaviour has to reach the handler's real path.
+	dhcpMgr, err := dhcp.New(t.TempDir(), func() {}, func() {})
+	if err != nil {
+		t.Fatalf("dhcp.New: %v", err)
+	}
+	_, base := authzServer(t, Config{
+		Addr:  "127.0.0.1:8080",
+		Store: authzStore(t, authzTestConfig),
+		DHCP:  dhcpMgr,
+		// super-user: every guarded route is authorized, so the answer observed
+		// is the HANDLER's and not the gate's.
+		PeerLookupFn: fixedPeerUID(authzUIDSuperuser),
+	})
+
+	// The message both decode sites write on malformed input — pkg/api/api.go's
+	// shared decodeJSONBody and pkg/api/dhcp.go's equivalent.
+	const decodeErr = "invalid JSON body"
+
+	routes := make([]string, 0, len(restMutationBodyLimits))
+	for route := range restMutationBodyLimits {
+		routes = append(routes, route)
+	}
+	sort.Strings(routes)
+
+	for _, route := range routes {
+		t.Run(route, func(t *testing.T) {
+			conn := openDeclaredBody(t, base, route, 1, "!", nil)
+			status, msg := readWholeResponse(t, conn, 10*time.Second)
+			decoded := status == http.StatusBadRequest && msg == decodeErr
+			inClass := restMutationBodyLimits[route] == mutationBodyNone
+
+			switch {
+			case decoded && inClass:
+				t.Fatalf("%s is classified mutationBodyNone, but its handler DECODED the body "+
+					"(%d %q). The gate skips the drain for this class, so the second "+
+					"adjudication no longer sits in front of the block the caller controls — "+
+					"the ordering the whole two-pass gate exists for is gone on this route",
+					route, status, msg)
+			case !decoded && !inClass:
+				t.Fatalf("%s answered %d %q WITHOUT decoding the body, yet it is classified as "+
+					"a body-taking route (limit %d). The gate drains a body its handler never "+
+					"reads: an immediate answer becomes a read the caller can stall for the "+
+					"whole apiReadTimeout, and it charges the aggregate body budget for the "+
+					"stall. It belongs in mutationBodyNone",
+					route, status, msg, restMutationBodyLimits[route])
+			}
+		})
+	}
+}
+
+// readWholeResponse reads a complete HTTP response off a raw connection and
+// returns its status and the Response.Error field.
+func readWholeResponse(t *testing.T, conn net.Conn, within time.Duration) (int, string) {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(within)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodPost})
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var r Response
+	_ = json.Unmarshal(raw, &r)
+	return resp.StatusCode, r.Error
 }

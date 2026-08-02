@@ -107,21 +107,29 @@ var restMutationPermissions = map[string]config.LoginClassPermission{
 //
 // The gate reads a mutating request's body BEFORE the verdict the handler runs
 // under (mutationAuthzGuard says why). That read is the one step of the gate a
-// CALLER controls outright, so its memory cost has to be bounded in both
-// dimensions: per request, and in aggregate across every request in flight.
-// A blanket maxRequestBodyBytes did neither usefully — 16 MiB is the ceiling
-// the ONE route that carries a whole candidate configuration needs, and
+// CALLER controls outright, so its cost has to be bounded in three dimensions:
+// per request (here), in aggregate across every request in flight
+// (mutationBodyBudgetBytes), and per privilege tier within that aggregate
+// (mutationBodyTierCeilings), so the bound is not itself a denial lever.
+// A blanket maxRequestBodyBytes served none of the three — 16 MiB is the
+// ceiling the ONE route that carries a whole candidate configuration needs, and
 // applying it to `POST /api/v1/diagnostics/ping` let the cheapest permission on
-// the surface (PermView, a `read-only` shell account) reserve the same 16 MiB
-// per connection as a configure-authorized commit.
+// the surface (PermView, a `read-only` shell account) buffer in the same units
+// as a configure-authorized commit.
 const (
 	// mutationBodyNone marks a route that consumes NO request body. The gate
-	// does not buffer for these AT ALL: their handlers never read the body (two
-	// of the three reject a non-zero ContentLength outright, #3421 H6 / #4794),
-	// so there is no caller-controlled block between the gate and the mutation
-	// and nothing for the second adjudication to get in front of. Buffering
-	// them was pure cost — it turned an immediate 400 into a 16 MiB read the
-	// caller could stall for the whole apiReadTimeout.
+	// does not buffer for these AT ALL: their handlers answer from the request
+	// LINE and its headers, so there is no caller-controlled block between the
+	// gate and the mutation and nothing for the second adjudication to get in
+	// front of. Buffering them was pure cost — it turned an immediate answer
+	// into a read the caller could stall for the whole apiReadTimeout, and it
+	// charged the aggregate budget for a body nobody was going to look at.
+	//
+	// Membership is a fact about the handler, not a judgement:
+	// TestNoBodyClassMatchesTheHandlersThatDecode_5561 asks every guarded route
+	// for a malformed body and requires the set that DECODES it to be exactly
+	// the complement of this class, so a handler that starts reading — or stops
+	// — fails the build rather than silently changing what the gate does.
 	mutationBodyNone int64 = 0
 	// mutationBodySmall fits a JSON object of scalar options — a ping target
 	// plus counts, a system action verb. Orders of magnitude above the real
@@ -151,27 +159,45 @@ var restMutationBodyLimits = map[string]int64{
 	// and nothing to buffer.
 	"POST /api/v1/security/sessions/clear": mutationBodyNone,
 	"POST /api/v1/security/counters/clear": mutationBodyNone,
+	// NOTE the DHCP clear below is deliberately NOT here even though it too
+	// answers without a body when no DHCP client is running: that early return
+	// is a property of the daemon's state, not of the route, and the handler
+	// decodes as soon as a client exists.
 	// The DHCP clear is NOT in that class despite its name: #4794 made it
 	// DECODE an optional {"interface":...} body whenever ContentLength is
 	// non-zero, so its handler does block on the caller and must keep the
 	// buffered-body ordering. Its payload is one interface name.
+	//
+	// OPERATOR-VISIBLE CHANGE: this route used to 413 only past the handler's
+	// own MaxBytesReader (maxRequestBodyBytes, 16 MiB, pkg/api/dhcp.go); the
+	// gate now answers 413 above 64 KiB. Nothing legitimate is affected — the
+	// body is one interface name — but the threshold moved by three orders of
+	// magnitude, so it is stated here and in pkg/api/README.md rather than left
+	// for an operator to discover from a 413.
 	"POST /api/v1/dhcp/identifiers/clear": mutationBodySmall,
 
 	// Diagnostics: a target plus a handful of scalars.
 	"POST /api/v1/diagnostics/ping":       mutationBodySmall,
 	"POST /api/v1/diagnostics/traceroute": mutationBodySmall,
 
-	// Configuration edits and the commit family.
-	"POST /api/v1/config/enter":            mutationBodyEdit,
-	"POST /api/v1/config/exit":             mutationBodyEdit,
+	// The candidate LIFECYCLE verbs, and the commit family that acts on
+	// whatever the candidate already holds. Every one of these is addressed by
+	// the X-Config-Session header alone — enter mints or re-enters a session,
+	// exit/commit/confirm name one, and commit-check takes no request at all
+	// (its handler's signature is `_ *http.Request`). None of them reads a byte
+	// of body, so none of them is buffered.
+	"POST /api/v1/config/enter":        mutationBodyNone,
+	"POST /api/v1/config/exit":         mutationBodyNone,
+	"POST /api/v1/config/commit":       mutationBodyNone,
+	"POST /api/v1/config/commit-check": mutationBodyNone,
+	"POST /api/v1/config/confirm":      mutationBodyNone,
+
+	// Configuration edits: the routes that really do carry one.
 	"POST /api/v1/config/set":              mutationBodyEdit,
 	"POST /api/v1/config/delete":           mutationBodyEdit,
 	"POST /api/v1/config/deactivate":       mutationBodyEdit,
 	"POST /api/v1/config/activate":         mutationBodyEdit,
-	"POST /api/v1/config/commit":           mutationBodyEdit,
-	"POST /api/v1/config/commit-check":     mutationBodyEdit,
 	"POST /api/v1/config/commit-confirmed": mutationBodyEdit,
-	"POST /api/v1/config/confirm":          mutationBodyEdit,
 	"POST /api/v1/config/rollback":         mutationBodyEdit,
 	"POST /api/v1/config/annotate":         mutationBodyEdit,
 
@@ -770,9 +796,12 @@ func (s *Server) mutationAuthzGuard(next http.Handler) http.Handler {
 		//	        Authorization is a necessary bound and not a sufficient one,
 		//	        though — the cheapest permission on the surface (PermView, a
 		//	        `read-only` shell account, on /diagnostics/ping) is still a
-		//	        principal — so the drain is ALSO bounded per route and in
-		//	        aggregate; see restMutationBodyLimits and
-		//	        mutationBodyBudgetBytes.
+		//	        principal — so the drain is ALSO bounded per route, in
+		//	        aggregate, and by privilege tier within that aggregate, the
+		//	        last of these because a shared bound is itself something an
+		//	        authorized caller can spend to deny someone above it. See
+		//	        restMutationBodyLimits, mutationBodyBudgetBytes and
+		//	        mutationBodyTierCeilings.
 		//	drain   the caller-controlled block, moved in front of the verdict
 		//	        that admits the mutation.
 		//	pass 2  the verdict the handler actually runs under. It re-reads the
@@ -811,17 +840,17 @@ func (s *Server) mutationAuthzGuard(next http.Handler) http.Handler {
 			return
 		}
 
-		// The drain is bounded in BOTH dimensions before it starts: this route's
-		// own ceiling, and the aggregate budget across every request in flight.
-		// The availability argument above is only true with the second one — a
-		// per-request cap says nothing about how many requests a caller opens.
-		limit := mutationBodyLimit(route)
-		release, admitted := admitMutationBody(w, r, limit)
-		if !admitted {
-			return
-		}
-		defer release()
-		if !bufferMutationBody(w, r, limit) {
+		// The drain is bounded in every dimension a caller controls: this
+		// route's own ceiling, the aggregate across every request in flight,
+		// and — because an aggregate is a shared resource and a shared resource
+		// is a denial lever — the share of that aggregate this route's tier may
+		// reach. The availability argument above needs all three: a per-request
+		// cap says nothing about how many requests a caller opens, and an
+		// undivided aggregate says nothing about WHOSE request gets refused
+		// when it runs out.
+		budget := bodyBudget{ceiling: mutationBodyTierCeiling(required)}
+		defer budget.release()
+		if !bufferMutationBody(w, r, mutationBodyLimit(route), &budget) {
 			return
 		}
 
@@ -852,90 +881,177 @@ var mutationBodyWaitersInFlight atomic.Int64
 // reading their caller's body between the gate's two adjudications. Test-only.
 func MutationBodyWaitersForTest() int { return int(mutationBodyWaitersInFlight.Load()) }
 
-// mutationBodyBudgetBytes bounds the TOTAL request-body bytes the gate may have
-// admitted across every mutating request in flight (#5561 round 10, finding 2).
+// mutationBodyBudgetBytes bounds the TOTAL request-body bytes the gate holds
+// buffered across every mutating request in flight (#5561 round 10, finding 2;
+// re-denominated and tiered in round 11).
 //
 // The per-route ceiling above bounds ONE request; it says nothing about a
 // thousand. The gate holds its buffer for as long as the caller takes to send
 // the body, which is up to apiReadTimeout (30s) and entirely the caller's
 // choice, so per-request caps alone leave the daemon's heap a function of how
 // many connections a caller opens: 64 half-sent 16 MiB posts from ONE
-// `read-only` shell account is a gigabyte of resident memory, reached without
-// ever completing a request.
+// `read-only` shell account would be a gigabyte of resident memory.
 //
 // This is the bound that makes the availability argument in mutationAuthzGuard
 // true rather than merely intended: past it a request is REFUSED (429) instead
 // of admitted to buffer, so the memory a caller can make the daemon hold is
-// capped no matter how many sockets it opens. 64 MiB is four concurrent
-// whole-configuration loads — far above operator concurrency on a surface that
-// answers a handful of actions per second — and the per-route ceilings keep a
-// view-tier caller from reserving in units a configure-tier caller needs.
+// capped no matter how many sockets it opens.
+//
+// # What the number counts
+//
+// Bytes the gate has ALLOCATED, charged as the body arrives — not bytes the
+// caller declared. That distinction is the whole of round 11's finding 1. A
+// Content-Length is a promise; the memory only exists once the bytes do. The
+// first shape of this budget charged the declaration and held it for the
+// request's lifetime, which meant a caller could buy 64 KiB of budget with one
+// byte of traffic — a 65536x amplification — and 1026 such sockets emptied the
+// whole 64 MiB for about a kilobyte. bufferMutationBody therefore grows its
+// charge with its buffer: a half-open request holds one small allocation and is
+// charged for one small allocation.
+//
+// The number bounds PEAK resident bytes, not settled ones: a grow holds the old
+// allocation and the new one at once and is charged for both. Sized against the
+// real payloads rather than the ceilings — the largest configuration this
+// daemon actually carries is well under a megabyte, so the 48 MiB the configure
+// tier may drive is on the order of twenty concurrent `config/load`s, far above
+// operator concurrency on a surface answering a handful of actions per second.
+// At the pathological extreme, where a caller really does send a 16 MiB
+// candidate, that same 48 MiB holds two at once and refuses the third with a
+// 429 rather than growing the heap.
 const mutationBodyBudgetBytes int64 = 64 << 20 // 64 MiB
 
-// mutationBodyBytesAdmitted is the live sum of those reservations.
+// mutationBodyTierCeilings partitions that budget by the permission the ROUTE
+// requires, so exhausting it is not a way to deny someone more privileged than
+// you (#5561 round 11, finding 1).
+//
+// A single undivided pool is a bound in one dimension and a denial lever in
+// another. Pass 1 guarantees only that a buffering caller is authorized for the
+// route it is calling, and the cheapest permission on this surface (PermView,
+// held by a `read-only` shell account, on /diagnostics/ping) is authorized for
+// something. With one pool, that account's traffic and a super-user's `commit`
+// draw on the same bytes, so the view tier could take all of them and 429 the
+// configure tier off the entire mutating surface.
+//
+// The ladder fixes that the way a filesystem reserves blocks for root: a
+// request may be admitted only while the running total is within ITS tier's
+// share, and the shares increase with privilege. Whatever the view tier takes,
+// it stops at 16 MiB — so 48 MiB is permanently out of its reach and belongs to
+// the configure tier; and the configure tier in turn cannot take the last
+// 16 MiB the maintenance verbs need. The total across every tier is still
+// mutationBodyBudgetBytes, so the memory bound is unchanged.
+//
+// The guarantee is one-directional, and deliberately so. Each ceiling is tested
+// against the AGGREGATE, so a tier is protected from every tier below it and
+// from none above it: a configure-tier flood can push the total past 16 MiB and
+// refuse view-tier traffic outright. That is the correct asymmetry — a
+// privileged action crowding out a cheap one is scheduling, a cheap one
+// crowding out a privileged one is a denial primitive — and it is the whole
+// reason the shares are ordered rather than equal.
+//
+// Keying on the ROUTE's required permission rather than on the CALLER's class
+// is deliberate: it is the action that is being protected, and pass 1 has
+// already established that only a principal holding that permission can reach
+// this point. A super-user's pings draw on the view tier, exactly like anyone
+// else's, and cannot crowd out that same super-user's commit.
+var mutationBodyTierCeilings = map[config.LoginClassPermission]int64{
+	config.PermView:    mutationBodyBudgetBytes / 4,     // 16 MiB
+	config.PermClear:   mutationBodyBudgetBytes / 4,     // 16 MiB
+	config.PermControl: mutationBodyBudgetBytes / 4,     // 16 MiB
+	config.PermConfig:  mutationBodyBudgetBytes * 3 / 4, // 48 MiB
+	config.PermMaint:   mutationBodyBudgetBytes,         // 64 MiB
+}
+
+// mutationBodyTierCeiling returns how far the running total may be driven by a
+// route requiring `required`.
+//
+// An unlisted permission gets the SMALLEST share: a new route whose tier nobody
+// thought about must not be able to starve the tiers that were thought about.
+// TestEveryGuardedRouteDeclaresABodyTier_5561 fails if a guarded route's
+// permission is missing from the table, so the fallback is a safety net rather
+// than a routine path.
+func mutationBodyTierCeiling(required config.LoginClassPermission) int64 {
+	if n, ok := mutationBodyTierCeilings[required]; ok {
+		return n
+	}
+	smallest := mutationBodyBudgetBytes
+	for _, n := range mutationBodyTierCeilings {
+		if n < smallest {
+			smallest = n
+		}
+	}
+	return smallest
+}
+
+// mutationBodyBytesAdmitted is the live sum of every in-flight charge.
 var mutationBodyBytesAdmitted atomic.Int64
 
-// MutationBodyBytesAdmittedForTest reports the bytes currently reserved against
+// MutationBodyBytesAdmittedForTest reports the bytes currently charged against
 // the gate's aggregate body budget. Test-only.
 func MutationBodyBytesAdmittedForTest() int64 { return mutationBodyBytesAdmitted.Load() }
 
 // MutationBodyBudgetForTest reports the aggregate budget. Test-only.
 func MutationBodyBudgetForTest() int64 { return mutationBodyBudgetBytes }
 
-// reserveMutationBodyBytes takes n bytes of the aggregate budget. ok=false
-// means the budget is exhausted and nothing was taken.
+// mutationBodyInitialBuf is the first allocation a buffered read makes, and so
+// the whole cost of a request whose caller sends (almost) nothing. It matches
+// io.ReadAll's own starting size — the read loop below is io.ReadAll with the
+// growth steps charged.
+const mutationBodyInitialBuf int64 = 512
+
+// bodyBudget is ONE request's live charge against mutationBodyBytesAdmitted.
 //
-// A CAS loop rather than a mutex: the reservation is a load and an add on a
-// path that goes on to do IO, and a failed CAS means another request moved the
+// It is not a reservation taken up front: `held` tracks what the request has
+// actually allocated, moving with the buffer as the caller's bytes arrive. The
+// gate defers release for the whole request because the buffer it stands for is
+// handed to the handler and lives until the handler returns — releasing when
+// the read finished would under-count exactly the memory being bounded.
+type bodyBudget struct {
+	// ceiling is this request's tier share (mutationBodyTierCeilings).
+	ceiling int64
+	held    int64
+}
+
+// resize moves this request's charge to want, refusing a GROWTH that would push
+// the aggregate past the request's tier ceiling. A shrink always succeeds — the
+// memory is already gone, and refusing to account for that would leak.
+//
+// A CAS loop rather than a mutex: the update is a load and an add on a path
+// that goes on to do IO, and a failed CAS means another request moved the
 // total, which is exactly when the ceiling must be re-tested.
-func reserveMutationBodyBytes(n int64) bool {
+func (b *bodyBudget) resize(want int64) bool {
 	for {
 		cur := mutationBodyBytesAdmitted.Load()
-		if cur+n > mutationBodyBudgetBytes {
+		delta := want - b.held
+		if delta > 0 && cur+delta > b.ceiling {
 			return false
 		}
-		if mutationBodyBytesAdmitted.CompareAndSwap(cur, cur+n) {
+		if mutationBodyBytesAdmitted.CompareAndSwap(cur, cur+delta) {
+			b.held = want
 			return true
 		}
 	}
 }
 
-// admitMutationBody reserves the budget this request's body can cost and
-// returns the release, which the gate defers for the WHOLE request — the
-// buffer the reservation stands for is handed to the handler and lives until
-// the handler returns, so releasing it when the read finishes would under-count
-// exactly the memory being bounded.
-//
-// ok=false means the budget is exhausted and the 429 has already been written.
-// A route that consumes no body reserves nothing and gets a no-op release.
-func admitMutationBody(w http.ResponseWriter, r *http.Request, limit int64) (release func(), ok bool) {
-	noop := func() {}
-	if r.Body == nil || r.Body == http.NoBody || limit == mutationBodyNone {
-		return noop, true
+// release returns everything this request holds. Idempotent, so the gate can
+// defer it unconditionally.
+func (b *bodyBudget) release() {
+	if b.held == 0 {
+		return
 	}
-	// Reserve what this request can actually cost. A declared ContentLength is
-	// authoritative for a non-chunked body — net/http will not deliver more
-	// than it — so a small declared body reserves small and a legitimate
-	// operator action does not consume a whole route-ceiling slot. A chunked
-	// body (ContentLength -1) declares nothing, so it reserves the ceiling.
-	reserve := limit + 1
-	if r.ContentLength >= 0 && r.ContentLength < reserve {
-		reserve = r.ContentLength
-	}
-	if reserve <= 0 {
-		return noop, true
-	}
-	if !reserveMutationBodyBytes(reserve) {
-		// Debug, not Warn: caller-driven, so a Warn here is a log-amplification
-		// lever (CLAUDE.md).
-		slog.Debug("api: refused mutating request body admission",
-			"method", r.Method, "path", r.URL.Path, "want", reserve,
-			"admitted", mutationBodyBytesAdmitted.Load())
-		writeError(w, http.StatusTooManyRequests,
-			"request body admission limit reached; retry shortly")
-		return nil, false
-	}
-	return func() { mutationBodyBytesAdmitted.Add(-reserve) }, true
+	mutationBodyBytesAdmitted.Add(-b.held)
+	b.held = 0
+}
+
+// refuseMutationBody writes the 429 a charge that would breach the tier ceiling
+// answers with.
+func refuseMutationBody(w http.ResponseWriter, r *http.Request, want int64) {
+	// Debug, not Warn: caller-driven, so a Warn here is a log-amplification
+	// lever (CLAUDE.md).
+	slog.Debug("api: refused mutating request body admission",
+		"method", r.Method, "path", r.URL.Path, "want", want,
+		"admitted", mutationBodyBytesAdmitted.Load())
+	writeError(w, http.StatusTooManyRequests,
+		"request body admission limit reached; retry shortly")
 }
 
 // bufferMutationBody reads a mutating request's body to completion and replaces
@@ -957,20 +1073,76 @@ func admitMutationBody(w http.ResponseWriter, r *http.Request, limit int64) (rel
 // same status and the same message decodeJSONBody produces. A body under the
 // limit is handed over whole, so decode behaviour — including which malformed
 // inputs produce 400 — is unchanged.
-func bufferMutationBody(w http.ResponseWriter, r *http.Request, limit int64) bool {
+//
+// The read is io.ReadAll with its growth steps charged against b, which is what
+// makes the aggregate budget a statement about memory rather than about
+// promises: nothing is taken for a declared Content-Length, and a caller that
+// declares a route's whole ceiling and then sends one byte is charged for the
+// one small buffer that byte actually lives in. A grow that would push the
+// aggregate past the request's tier ceiling answers 429 and the handler never
+// runs.
+func bufferMutationBody(w http.ResponseWriter, r *http.Request, limit int64, b *bodyBudget) bool {
 	if r.Body == nil || r.Body == http.NoBody || limit == mutationBodyNone {
 		return true
 	}
-	mutationBodyWaitersInFlight.Add(1)
-	buf, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
-	mutationBodyWaitersInFlight.Add(-1)
-	if err != nil {
-		// The caller hung up, timed out, or sent a malformed chunked body. Not
-		// an authorization outcome: 400, and the handler never runs.
-		slog.Debug("api: could not read mutating request body",
-			"method", r.Method, "path", r.URL.Path, "err", err)
-		writeError(w, http.StatusBadRequest, "could not read request body")
+	// One past the ceiling, so an oversized body is DETECTED rather than
+	// silently truncated into a body the handler would accept.
+	max := limit + 1
+
+	first := mutationBodyInitialBuf
+	if first > max {
+		first = max
+	}
+	if !b.resize(first) {
+		refuseMutationBody(w, r, first)
 		return false
+	}
+	buf := make([]byte, 0, first)
+
+	// Counted from AFTER the first charge succeeds: a request refused before it
+	// read anything never parked on its caller, and the waiter count is the edge
+	// a test uses to know the gate is inside the window a revocation has to land
+	// in.
+	mutationBodyWaitersInFlight.Add(1)
+	defer mutationBodyWaitersInFlight.Add(-1)
+
+	for int64(len(buf)) < max {
+		if len(buf) == cap(buf) {
+			next := int64(cap(buf)) * 2
+			// Step to the ceiling before stepping past it, so a body that
+			// legitimately fills the route's whole limit is not charged for a
+			// doubling it needs one byte of. Only a body that then keeps going
+			// — one this function is about to 413 — pays for the last step.
+			if next > limit && int64(cap(buf)) < limit {
+				next = limit
+			}
+			if next > max {
+				next = max
+			}
+			// Both allocations are live across the copy, so both are charged;
+			// the budget bounds peak resident bytes, not settled ones.
+			if !b.resize(int64(cap(buf)) + next) {
+				refuseMutationBody(w, r, int64(cap(buf))+next)
+				return false
+			}
+			grown := make([]byte, len(buf), next)
+			copy(grown, buf)
+			buf = grown
+			b.resize(next) // a shrink cannot fail
+		}
+		n, err := r.Body.Read(buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+n]
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			// The caller hung up, timed out, or sent a malformed chunked body.
+			// Not an authorization outcome: 400, and the handler never runs.
+			slog.Debug("api: could not read mutating request body",
+				"method", r.Method, "path", r.URL.Path, "err", err)
+			writeError(w, http.StatusBadRequest, "could not read request body")
+			return false
+		}
 	}
 	if int64(len(buf)) > limit {
 		writeError(w, http.StatusRequestEntityTooLarge, "request body too large")

@@ -587,7 +587,7 @@ func waitForMutationBodyWaiter(t *testing.T) {
 // returned its verdict, for as long as apiReadTimeout (30s) allows, and the
 // caller chooses how long that takes:
 //
-//	send headers for POST /api/v1/config/enter, withhold the body
+//	send headers for POST /api/v1/config/set, withhold the body
 //	  -> the gate authorizes and the handler is entered, parked in Decode
 //	another session commits a demotion / revokes the credential
 //	  -> nothing re-reads it
@@ -653,7 +653,13 @@ func TestAuthorizationIsRemadeAfterTheCallerSuppliesItsBody_5561(t *testing.T) {
 					}
 					s, base := authzServer(t, cfg)
 
-					req := openWithheldBody(t, base, "POST /api/v1/config/enter", tc.hdrs)
+					// config/set is a route whose HANDLER genuinely blocks on the
+					// caller: configSetHandler decodes the body before it looks at
+					// anything else, so the window this case drives is the real one
+					// and not an artefact of the gate buffering on a handler's
+					// behalf. A route in the mutationBodyNone class would answer
+					// without ever entering it.
+					req := openWithheldBody(t, base, "POST /api/v1/config/set", tc.hdrs)
 
 					// The request has been authorized and is now parked reading the
 					// body it has not sent. This is the window, and it is the caller

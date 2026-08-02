@@ -3,7 +3,6 @@ package api
 import (
 	"net/http"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -32,30 +31,34 @@ func waitForAdmittedToSettle(t *testing.T, want int64) {
 		want, MutationBodyBytesAdmittedForTest())
 }
 
-// TestGateBodyBufferIsBoundedInAggregate_5561 is the AGGREGATE bound.
+// TestGateBodyBufferIsBoundedInAggregate_5561 is the AGGREGATE bound, driven
+// on the route with the largest per-request ceiling.
 //
 // A per-request ceiling says nothing about how many requests a caller opens,
 // and the gate holds each buffer for as long as that caller takes to finish
 // sending — up to apiReadTimeout (30s), entirely the caller's choice. So an
-// authorized principal (any authorized principal: the cheapest permission on
-// this surface is PermView, held by a `read-only` shell account) could pin
-// ceiling x N bytes of daemon heap with N sockets and never complete a request.
-// That is precisely the availability property the two-pass gate is justified by
-// — pass 1 exists so only an authorized principal can make the daemon hold a
-// buffer — reinstated at the dimension authorization does not bound.
+// authorized principal could pin ceiling x N bytes of daemon heap with N
+// sockets and never complete a request: at the 16 MiB whole-configuration
+// ceiling, 64 sockets is a gigabyte. That is precisely the availability
+// property the two-pass gate is justified by — pass 1 exists so only an
+// authorized principal can make the daemon hold a buffer — reinstated at the
+// dimension authorization does not bound.
 //
-// The case opens more concurrent withheld-body requests than the budget can
-// hold and asserts BOTH halves:
+// The flood sends REAL bytes, because that is what the budget counts: since
+// round 11 a reservation is the memory a request has allocated, not the
+// Content-Length it announced (authz_bodybudget_fairness_5561_test.go owns
+// that half). Each socket delivers a megabyte of a declared 16 MiB body and
+// then stalls, so it holds a megabyte and is charged for a megabyte.
+//
+// Both halves are asserted:
 //
 //   - the admitted total never exceeds mutationBodyBudgetBytes, and
 //   - the excess is REFUSED (429) rather than admitted to buffer, which is the
 //     observable behaviour that says the ceiling is enforced rather than merely
 //     measured.
 //
-// Two controls keep it from passing for the wrong reason: one request on an
-// idle budget must be ADMITTED and park (so the refusals are attributable to
-// the budget rather than to a broken route), and some of the burst must get in
-// (so a bound that refuses everything is not mistaken for a bound).
+// The control keeps it from passing for the wrong reason: some of the burst
+// must get in, so a bound that refuses everything is not mistaken for a bound.
 func TestGateBodyBufferIsBoundedInAggregate_5561(t *testing.T) {
 	usePasswdFixture(t)
 	_, base := authzServer(t, Config{
@@ -69,48 +72,16 @@ func TestGateBodyBufferIsBoundedInAggregate_5561(t *testing.T) {
 
 	waitForAdmittedToSettle(t, 0)
 
-	// CONTROL: one request on an idle budget is admitted and parks reading the
-	// body it withheld.
-	ctrl := openDeclaredBody(t, base, route, declared, `{"content":"`, nil)
-	waitForMutationBodyWaiter(t)
-	if status, got := readStatus(t, ctrl, 250*time.Millisecond); got {
-		t.Fatalf("the CONTROL was answered %d before it sent its body — it must be admitted "+
-			"and park, or the refusals below prove nothing about the budget", status)
-	}
+	// A megabyte per socket, and enough sockets that their real bytes exceed
+	// the whole budget. `{"content":"` opens a JSON string the caller never
+	// closes, so the body is well-formed as far as it goes and the request is
+	// waiting on its caller rather than on a parse error.
+	const perSocket = 1 << 20
+	sent := `{"content":"` + strings.Repeat("a", perSocket-12)
+	n := int(MutationBodyBudgetForTest()/perSocket) + 8
 
-	// Now open enough further requests to exceed the budget several times over.
-	// Each declares the route ceiling, so the budget admits
-	// mutationBodyBudgetBytes/ceiling of them and must refuse the rest.
-	want := int(MutationBodyBudgetForTest()/int64(declared)) + 3
-	var (
-		mu       sync.Mutex
-		refused  int
-		admitted int
-		peak     int64
-	)
-	var wg sync.WaitGroup
-	for i := 0; i < want; i++ {
-		conn := openDeclaredBody(t, base, route, declared, `{"content":"`, nil)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			status, got := readStatus(t, conn, 5*time.Second)
-			mu.Lock()
-			defer mu.Unlock()
-			switch {
-			case !got:
-				admitted++ // parked reading the body it withheld
-			case status == http.StatusTooManyRequests:
-				refused++
-			default:
-				admitted++
-			}
-		}()
-		if n := MutationBodyBytesAdmittedForTest(); n > peak {
-			peak = n
-		}
-	}
-	wg.Wait()
+	parked, refused := floodDeclaredBodies(t, base, route, n, declared, sent)
+	peak := MutationBodyBytesAdmittedForTest()
 
 	if peak > MutationBodyBudgetForTest() {
 		t.Fatalf("the gate admitted %d bytes of request body at once against a budget of %d — "+
@@ -118,16 +89,16 @@ func TestGateBodyBufferIsBoundedInAggregate_5561(t *testing.T) {
 			MutationBodyBudgetForTest())
 	}
 	if refused == 0 {
-		t.Fatalf("%d concurrent requests each declaring %d bytes were ALL admitted to buffer "+
-			"(admitted=%d, peak reserved=%d) against a budget of %d. The gate holds each "+
-			"buffer for as long as its caller takes to finish sending, so an authorized "+
-			"principal pins ceiling x N bytes of daemon heap with N sockets and never "+
-			"completes a request", want, declared, admitted, peak, MutationBodyBudgetForTest())
+		t.Fatalf("%d concurrent requests each holding %d body bytes were ALL admitted to buffer "+
+			"(parked=%d, reserved=%d) against a budget of %d. The gate holds each buffer for as "+
+			"long as its caller takes to finish sending, so an authorized principal pins "+
+			"ceiling x N bytes of daemon heap with N sockets and never completes a request",
+			n, perSocket, parked, peak, MutationBodyBudgetForTest())
 	}
 	// And the refusal is admission control, not a wedge: some requests DID get in.
-	if admitted == 0 {
+	if parked == 0 {
 		t.Fatalf("every one of %d requests was refused — the budget is rejecting requests it "+
-			"has room for, which is an availability regression rather than a bound", want)
+			"has room for, which is an availability regression rather than a bound", n)
 	}
 }
 
@@ -145,6 +116,8 @@ func TestPerRouteBodyLimitIsEnforced_5561(t *testing.T) {
 		// opsuser is `read-only`: PermView, which /diagnostics/ping requires.
 		PeerLookupFn: fixedPeerUID(authzUIDReadOnly),
 	})
+
+	waitForAdmittedToSettle(t, 0)
 
 	// A body one byte past the diagnostics ceiling, sent in full.
 	over := int(mutationBodySmall) + 1

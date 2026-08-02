@@ -282,7 +282,13 @@ credential revocation is enforced even on an apply that returns early
     Gating the publish on the rebind outcome instead is NOT the repair — it
     restores the round-7 fail-open in the same edit;
     `management_authstale_5561_test.go` drives both directions for exactly that
-    reason.
+    reason. The one-directional override has a cost, and it is a cost rather
+    than an oversight: a commit that REMOVES api-auth is not pinned, so a stale
+    replay republishes the deleted credential and uncredentialed callers get 401
+    until the next commit. That direction is chosen deliberately — a resurrected
+    credential over-restricts a management API already clamped to loopback,
+    while the mirror-image rule (a stale snapshot clearing a credential) would
+    be an authentication bypass.
 
   Pinned by `TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866`
   (revocation honored across a failing HTTPS rebind),

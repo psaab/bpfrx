@@ -404,7 +404,7 @@ So the body is drained **inside the gate**, between two adjudications:
 | step | why it is where it is |
 |---|---|
 | **pass 1** | Fail-fast, and it comes first for *availability*, not authorization. Buffering before deciding would let any caller that can open a socket park daemon memory behind a 30s read timeout. With the check first, only a principal already authorized for **this** route can make the daemon hold a buffer. That is a necessary bound and not a sufficient one — the cheapest permission on the surface is `PermView`, held by a `read-only` shell account — so the drain is bounded again below. |
-| **drain** | The caller-controlled block, moved in front of the verdict that admits the mutation, and bounded in **both** dimensions. **Per route** (`restMutationBodyLimits`): `POST /api/v1/config/load` keeps the 16 MiB whole-configuration ceiling, config edits get 1 MiB, diagnostics and `system/action` get 64 KiB, and the two routes whose handlers never touch the body (`security/sessions/clear`, `security/counters/clear`) are **not buffered at all** — their own immediate answer is restored rather than moved behind a read the caller controls. `dhcp/identifiers/clear` is deliberately *not* in that class: #4794 made it decode an optional body, so it keeps the ordering. **In aggregate** (`mutationBodyBudgetBytes`, 64 MiB): a request reserves `min(Content-Length, route ceiling)` for its whole lifetime and is refused **429** when the budget is exhausted, so the memory a caller can pin is capped no matter how many sockets it opens. On the one route still at the 16 MiB cap the read is `limit+1`, so an oversized body still reaches `MaxBytesReader` and still answers 413; on a tighter route the gate answers 413 itself, with the same status and message. |
+| **drain** | The caller-controlled block, moved in front of the verdict that admits the mutation, and bounded in **three** dimensions. **Per route** (`restMutationBodyLimits`): `POST /api/v1/config/load` keeps the 16 MiB whole-configuration ceiling, config edits get 1 MiB, diagnostics and `system/action` get 64 KiB, and the routes whose handlers never read a body are **not buffered at all** — their own immediate answer is restored rather than moved behind a read the caller controls. That no-body class is `security/sessions/clear`, `security/counters/clear`, and the candidate-lifecycle and commit verbs addressed by the `X-Config-Session` header alone: `config/enter`, `config/exit`, `config/commit`, `config/commit-check` and `config/confirm`. `dhcp/identifiers/clear` is deliberately *not* in it — #4794 made it decode an optional body, so it keeps the ordering — but note its 413 threshold **moved from 16 MiB to 64 KiB**: the gate's ceiling now trips before the handler's own `MaxBytesReader`. **In aggregate** (`mutationBodyBudgetBytes`, 64 MiB): a request is charged for the buffer it has actually ALLOCATED, grown as the caller's bytes arrive, and is refused **429** when a growth step would breach its share — so the memory a caller can pin is capped no matter how many sockets it opens, and a declared `Content-Length` buys nothing on its own. **Per privilege tier** (`mutationBodyTierCeilings`): that aggregate is partitioned by the permission the route requires — view/clear/control 16 MiB, config 48 MiB, maint 64 MiB — so a caller flooding the cheapest routes cannot deny a privileged one. On the one route still at the 16 MiB cap the read is `limit+1`, so an oversized body still reaches `MaxBytesReader` and still answers 413; on a tighter route the gate answers 413 itself, with the same status and message. |
 | **pass 2** | The verdict the handler actually runs under. It re-reads the **live** half — the config snapshot and the api-auth credential, the two things a commit can change under an in-flight request — **on every row**, not only on the credential row. The credential re-check used to sit inside `principalFrom`'s off-box branch, which an attributed *local* caller never reaches, so a configured administrator on this host could present secret A, withhold its body, let another session rotate A to B, and still have the mutation run; the same hole in its worst spelling let a request admitted while the listener had *no* api-auth stay credentialless after a commit added one. The **connection-fixed** half (the accept-time peer UID, and the credential row's locality re-derivation) is reused: a connection's addresses do not change mid-request, and re-enumerating interfaces per pass would make every credentialed mutation pay twice for an unchanged answer. The `/etc/passwd` resolution *is* repeated, deliberately — it is a page-cached read of a small local file, and repeating it means an account deleted mid-request is noticed. |
 
 Two residuals, both named. Locality is answered from an enumeration started on
@@ -425,12 +425,43 @@ pins the enumeration count at exactly one per request.
 leave empty — a LOCAL attributed caller whose credential is rotated, or newly
 required, inside the window — which is exactly where the credential re-check
 did not run. `authz_bodybudget_5561_test.go` owns what the window may cost:
-`TestNoBodyRouteIsNotBufferedByTheGate_5561` (with a body-taking control that
-must still park), `TestPerRouteBodyLimitIsEnforced_5561`,
-`TestGateBodyBufferIsBoundedInAggregate_5561` (concurrent withheld-body
-requests exceeding the budget must be REFUSED, not admitted), and
+`TestPerRouteBodyLimitIsEnforced_5561`,
+`TestGateBodyBufferIsBoundedInAggregate_5561` (concurrent requests really
+holding more than the budget must be REFUSED, not admitted), and
 `TestEveryGuardedRouteDeclaresABodyLimit_5561`, which keeps the permission and
 body-limit tables from diverging.
+
+`authz_bodybudget_fairness_5561_test.go` owns the other direction of the same
+availability property — that the bound is not itself a denial lever.
+`TestHalfOpenBodyIsChargedForWhatItHoldsNotWhatItDeclared_5561` pins the
+denomination (a socket that declares a route ceiling and sends one byte is
+charged for one small buffer, not for the declaration);
+`TestLowPrivilegeCallerCannotDenyAPrivilegedOne_5561` drives the exact shape
+that broke — a `read-only` principal opening enough half-open `diagnostics/ping`
+requests to have emptied the undivided budget, after which a super-user's
+`config/set` must still be served;
+`TestViewTierSaturationLeavesHeadroomForTheConfigureTier_5561` does the same
+with real bytes and asserts the view tier is capped with a whole-configuration
+load still free behind it; `TestBodyBudgetTiersLeaveThePrivilegedTiersUnreachable_5561`
+states the ladder in the units of the work it protects (a merely monotonic
+ladder can still protect nothing);
+`TestEveryGuardedRouteDeclaresABodyTier_5561` keeps the ladder covering the
+routes it arbitrates between; and
+`TestBodyBudgetReservationIsReleasedOnEveryExitPath_5561` binds the release on
+each of the three exit paths (handler returned, caller hung up mid-body, body
+overran the ceiling) rather than leaving it to whichever later test inherits a
+poisoned counter.
+
+Membership of the no-body class is checked against the handlers themselves, not
+asserted: `TestNoBodyClassMatchesTheHandlersThatDecode_5561` sends every guarded
+route a malformed body and requires the set that DECODES it to be exactly the
+complement of the class. A probe that asked "did this request park" would be a
+tautology — the gate parks a buffered route whether or not its handler would
+have read anything — which is how five routes sat in the buffered class while
+answering from headers alone. `TestNoBodyRouteIsNotBufferedByTheGate_5561` then
+pins the resulting behaviour across the whole class, with a control
+(`config/set`) that parks because its handler decodes rather than because of how
+it is classified.
 
 The rule has been narrowed twice, each time because a weaker version had a hole
 the claim did not admit to:
