@@ -760,9 +760,36 @@ security { nat { static { rule-set rs1 { from zone untrust;
 	if err != nil {
 		t.Fatalf("tolerant compile: %v", err)
 	}
+	// The premise — the SELECTED value is the authored blank — must be pinned
+	// against something only the selection produces. `Match == ""` alone is the
+	// field's ZERO VALUE, so it holds even if `rule.Match = nodeVal(m)` is
+	// deleted outright and nothing selects anything (#6673 round 9: that made
+	// this premise vacuous). The paired control below swaps the two slots: with
+	// the blank in the SECOND slot the same leaf must select the OTHER value,
+	// which no zero value can satisfy, so the pair together says "the selection
+	// is positional and live".
 	if got := cfg.Security.NAT.Static[0].Rules[0].Match; got != "" {
 		t.Fatalf("Match = %q, want %q — the premise of this test is that the "+
 			"SELECTED value is the authored blank", got, "")
+	}
+	swapped := hierTree6659(t, `
+security { nat { static { rule-set rs1 { from zone untrust;
+    rule r1 { match { destination-address [ not-an-address "" ]; }
+              then { static-nat prefix 10.0.0.1/32; } } } } } }`)
+	cfgSwapped, err := CompileConfigLenient(swapped)
+	if err != nil {
+		t.Fatalf("tolerant compile (swapped): %v", err)
+	}
+	if got := cfgSwapped.Security.NAT.Static[0].Rules[0].Match; got != "not-an-address" {
+		t.Fatalf("with the blank in the SECOND slot, Match = %q, want "+
+			"%q — the leading value is what nodeVal selects, and this control "+
+			"is what stops the sibling assertion above from passing on the "+
+			"field's zero value", got, "not-an-address")
+	}
+	wSwapped := findWarning6673(t, cfgSwapped, "not-an-address", "is not a valid IP address or CIDR prefix")
+	if strings.Contains(wSwapped, "EMPTY") {
+		t.Fatalf("the SELECTED value is %q, not a blank, so the warning must "+
+			"not describe the selection as empty:\n  %s", "not-an-address", wSwapped)
 	}
 	w := findWarning6673(t, cfg, "not-an-address", "is not a valid IP address or CIDR prefix")
 	if strings.Contains(w, "stays active") {
@@ -1316,7 +1343,7 @@ security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.1; 192.0.2.2
 			// installedProxyARP6673 applies the installer's own gate, so a
 			// compiled value that promotes a malformed range's endpoint shows
 			// up here as an address master never answered ARP for.
-			if inst := installedProxyARP6673(got); !reflect.DeepEqual(inst, tc.wantInstalled) {
+			if inst := installedProxyARP6673(cfg.Security.NAT.ProxyARP); !reflect.DeepEqual(inst, tc.wantInstalled) {
 				t.Fatalf("dataplane would install %q, want %q\n"+
 					"pkg/dataplane/proxyarp.go adds an NTF_PROXY neighbour and enables "+
 					"the interface proxy responder for every address that survives "+
@@ -1331,20 +1358,104 @@ security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.1; 192.0.2.2
 	}
 }
 
-// installedProxyARP6673 returns the subset of compiled proxy-ARP addresses that
-// pkg/dataplane/proxyarp.go would actually install — it applies that installer's
-// own netip.ParsePrefix gate, the one that makes "to/32" inert.
-func installedProxyARP6673(addrs []string) []string {
+// installedProxyARP6673 returns one entry per NTF_PROXY neighbour
+// pkg/dataplane/proxyarp.go would actually create.
+//
+// It models that installer's identity, not a convenient approximation of it:
+//
+//   - the netip.ParsePrefix gate, which is what makes a promoted "to/32" inert;
+//   - the neighbour KEY, `proxyKey{ifindex, prefix.Addr()}` — a PREFIX, not a
+//     prefix string. Two listed values that share an address create ONE
+//     neighbour however differently they are written, so `address
+//     [ 192.0.2.1/24 192.0.2.1/32 ]` is one installed thing, not two (#6673
+//     round 9: keying on the raw CIDR text claimed two, so a change that turned
+//     one neighbour into two — or two into one — was invisible to every row of
+//     the corpus below);
+//   - the INTERFACE, because the key is per-ifindex: the same address listed on
+//     two interfaces is two neighbours and must not collapse.
+//
+// The returned string is the value that CREATED the neighbour, kept in CIDR
+// form so a failure names the statement to look at. Only the CARDINALITY and
+// IDENTITY come from the installer; comparing the creating text is strictly
+// tighter than comparing addresses, so it cannot pass something the installer
+// would treat as different.
+func installedProxyARP6673(entries []*ProxyARPEntry) []string {
+	type key struct {
+		iface string
+		addr  netip.Addr
+	}
+	seen := make(map[key]struct{})
 	var out []string
-	for _, a := range addrs {
-		if a == "" {
+	for _, e := range entries {
+		if e == nil {
 			continue
 		}
-		if _, err := netip.ParsePrefix(a); err == nil {
+		for _, a := range e.Addresses {
+			if a == "" {
+				continue
+			}
+			p, err := netip.ParsePrefix(a)
+			if err != nil {
+				continue
+			}
+			k := key{iface: e.Interface, addr: p.Addr()}
+			if _, dup := seen[k]; dup {
+				continue
+			}
+			seen[k] = struct{}{}
 			out = append(out, a)
 		}
 	}
 	return out
+}
+
+// TestProxyARP6673InstalledHelperModelsTheInstallerIdentity is the guard on the
+// helper above — the round-9 finding that a test helper which models the
+// consumer DIFFERENTLY from the consumer cannot detect a consumer-visible
+// change.
+//
+// pkg/dataplane/proxyarp.go keys `desired` on proxyKey{ifindex, prefix.Addr()},
+// so two listed prefixes sharing an address are ONE neighbour and the same
+// address on two interfaces is TWO. A helper that deduped on the raw CIDR text
+// got both wrong.
+func TestProxyARP6673InstalledHelperModelsTheInstallerIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  string
+		want []string
+	}{
+		{
+			// One address, two spellings: proxyarp.go creates ONE neighbour
+			// (both parse to 192.0.2.1) and enables the responder once.
+			name: "two prefixes over one address are one neighbour",
+			cfg: `
+security { nat { proxy-arp { interface ge-0-0-0 { address [ 192.0.2.1/24 192.0.2.1/32 ]; } } } }`,
+			want: []string{"192.0.2.1/24"},
+		},
+		{
+			// Same address on two interfaces: two ifindexes, two neighbours.
+			name: "the same address on two interfaces is two neighbours",
+			cfg: `
+security { nat { proxy-arp {
+    interface ge-0-0-0 { address 192.0.2.1; }
+    interface ge-0-0-1 { address 192.0.2.1; } } } }`,
+			want: []string{"192.0.2.1/32", "192.0.2.1/32"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := CompileConfig(hierTree6659(t, tc.cfg))
+			if err != nil {
+				t.Fatalf("strict compile: %v", err)
+			}
+			got := installedProxyARP6673(cfg.Security.NAT.ProxyARP)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("installed neighbours = %q, want %q\n"+
+					"pkg/dataplane/proxyarp.go keys desired[] on "+
+					"proxyKey{ifindex, prefix.Addr()}; this helper must count "+
+					"the same things the installer counts", got, tc.want)
+			}
+		})
+	}
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -1437,9 +1548,6 @@ func TestStaticNATMatch6673RuleVerdictIsObservedNotMirrored(t *testing.T) {
 		// did NOT select — the one whose suffix is under test.
 		nonSelectedSub string
 		wantSelected   string
-		// ruleDropped: some OTHER verdict on this rule drops it, so the
-		// complaint must not promise the selected value stays active.
-		ruleDropped bool
 		// blamesSelected: the dropping cause IS the selected match value, so
 		// the complaint may name it as invalid. False when the cause is on the
 		// `then` side — blaming the selected value would be a fresh falsehood.
@@ -1459,7 +1567,6 @@ security { nat { static { rule-set rs1 { from zone untrust;
               then { static-nat prefix not-an-addr; } } } } } }`,
 			nonSelectedSub:  `destination-address "198.51.100.0/24" must be a host route`,
 			wantSelected:    "192.0.2.1/32",
-			ruleDropped:     true,
 			droppedCauseSub: `then static-nat prefix "not-an-addr" is not a valid`,
 		},
 		{
@@ -1476,7 +1583,6 @@ security { nat { static { rule-set rs1 { from zone untrust;
               then { static-nat prefix 0.0.0.0/0; } } } } } }`,
 			nonSelectedSub:  `zero-length (/0) prefix (match destination-address "0.0.0.0/0"`,
 			wantSelected:    "192.0.2.1/32",
-			ruleDropped:     true,
 			droppedCauseSub: `then static-nat prefix "0.0.0.0/0" must be a host route`,
 		},
 		{
@@ -1492,7 +1598,6 @@ security { nat { static { rule-set rs1 { from zone untrust;
               then { static-nat prefix 0.0.0.0/0; } } } } } }`,
 			nonSelectedSub:  `destination-address "192.0.2.0/24" must be a host route`,
 			wantSelected:    "0.0.0.0/0",
-			ruleDropped:     true,
 			blamesSelected:  true,
 			droppedCauseSub: `zero-length (/0) prefix (match destination-address "0.0.0.0/0"`,
 		},
@@ -1514,7 +1619,6 @@ security { nat { static { rule-set rs1 { from zone untrust;
               then { static-nat { prefix 10.0.0.1/32; mapped-port 8080; } } } } } } }`,
 			nonSelectedSub:  `destination-address "198.51.100.0/24" must be a host route`,
 			wantSelected:    "192.0.2.1/32",
-			ruleDropped:     true,
 			droppedCauseSub: "match destination-port 70000 is out of range",
 		},
 		{
@@ -1535,7 +1639,6 @@ security { nat { static { rule-set rs1 { from zone untrust;
               then { static-nat { prefix 10.0.0.0/24; mapped-port 8080; } } } } } } }`,
 			nonSelectedSub:  `destination-address "198.51.100.0/25" must be a host route`,
 			wantSelected:    "10.1.1.0/24",
-			ruleDropped:     true,
 			droppedCauseSub: "maps a subnet (block-to-block prefix) but also specifies a port",
 		},
 		{
@@ -1549,7 +1652,6 @@ security { nat { static { rule-set rs1 { from zone untrust;
               then { static-nat prefix 10.0.0.1/32; } } } } } }`,
 			nonSelectedSub: `destination-address "198.51.100.0/24" must be a host route`,
 			wantSelected:   "192.0.2.1/32",
-			ruleDropped:    false,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1563,7 +1665,15 @@ security { nat { static { rule-set rs1 { from zone untrust;
 					"which value the compiler selects", rule.Match, tc.wantSelected)
 			}
 			w := findWarning6673(t, cfg, tc.nonSelectedSub)
-			if !tc.ruleDropped {
+			// #6673 round 9: whether the rule is dropped is DERIVED from the
+			// case's own dropping cause, not carried as a hand-set bool.
+			// A hardcoded flag can silently disagree with the config beside it
+			// — set it wrong and the test asserts the opposite claim while
+			// still passing. droppedCauseSub names a warning that must exist
+			// AND must itself carry the "rule dropped by dataplane until
+			// corrected" suffix (checked below), so the two cannot drift.
+			ruleDropped := tc.droppedCauseSub != ""
+			if !ruleDropped {
 				if !strings.Contains(w, "stays active") {
 					t.Fatalf("nothing about this rule drops it, so the complaint "+
 						"about the non-selected value must say the selected value "+

@@ -73933,3 +73933,75 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/config/compiler_validate_strict_routing.go,
   pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
   docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-08-01
+- **Action**: #6673 round 9 — a widened read must not PROMOTE a token the old
+  reader DISCARDED. Codex at 705bd0fa1 returned MERGE-NEEDS-MAJOR with four
+  items, all the same mistake in a different arm. (R1, MAJOR, runtime) A
+  bracketed `attributes-match [ "e.a matches X" "e.b matches Y" ]` has no
+  children — each quoted member is one token on Keys[1:] — and the reader joined
+  the tail into ONE impossible expression. `ParseEventAttributesMatch` splits at
+  the FIRST " matches " and the remainder compiles as a valid regex, so strict
+  commit ACCEPTED it and `attributesMatch` then compared that composite against
+  `ev.TestOwner` alone: an active policy became permanently inert with no
+  diagnostic. Master compiled nothing from a packed tail, so master FIRED. (R2,
+  MAJOR, runtime) `commands bogus { "set …"; }` parses as Keys=["commands",
+  "bogus"] with one child; master read Children only and the remediation ran.
+  Emitting both hands `classifyPlan` a token matching neither the `set ` nor the
+  `delete ` prefix, which rejects the WHOLE batch. (R4, MAJOR, invented
+  rejection) The same mixed shape on `attributes-match` turned a config that
+  committed before #6659 into a hard commit rejection. Fix for all three:
+  CHILDREN WIN — when the node has children they are the whole value list and
+  the node's own tail is ignored, verbatim master behaviour; the tail is read
+  only when there are no children, the shape master compiled NOTHING from. On
+  the tail, a token containing " matches " can only come from a quoted bracket
+  member (the lexer never leaves a space in an unquoted token), so any such
+  token makes the tail a LIST; otherwise it joins into one expression. Scope,
+  stated because four turned up in one review: this regression is only possible
+  where the old reader read Children EXCLUSIVELY. `nodeVal` prefers Keys[1] and
+  falls back to Children[0], so the other three widened arms (proxy-ARP address,
+  static-NAT match destination-address, forwarding-table export) already
+  preferred the tail and cannot promote a discarded token; the two event-options
+  arms are the only Children-only readers in the #6659 set, and both were hit.
+  (R3, decision, no code change) `flag [ "" session ]` installs {session} where
+  master installed both writer defaults. Reviewed and KEPT: master's rule was
+  slot-0 selection, so it installed different sets for `[ "" session ]` and
+  `[ session "" ]` — the same config with the tokens swapped — and installed one
+  flag when the operator asked for two. The rule is now position-independent
+  (every non-empty authored flag installs; an empty token is not a flag). An
+  empty token is NOT rejected, because master accepted it; the defaults stay
+  reachable by authoring no `flag` stanza. Written down in docs/config-schema.md
+  with the before/after table and pinned at `NewTraceWriter`'s own flag map.
+  (G1, validation escape) `staticNATMatchAddrKey` masks a prefix because plain
+  static NAT's `parse_nat_prefix` masks too — but NPTv6's `parse_prefix` FAILS
+  CLOSED on host bits (#4519, "do NOT mask"). So `[ 2001:db8:1::/48
+  2001:db8:1:2::/48 ]` collapsed to one key, the cardinality gate counted one,
+  the per-address validator skips NPTv6, and the NPTv6 validator reads only the
+  scalar: the invalid tail reached no gate at all, falsifying the PR's "every
+  widened value is validated". `staticNATMatchAddrKeyFor(rule.IsNPTv6)` withholds
+  masking from a value carrying host bits, so the pair counts as two and the
+  gate fires; the claim is now the narrow true one (a DISTINCT widened value is
+  rejected by cardinality, an IDENTICAL one IS the selected value the NPTv6
+  validator already checks). Also fixed the four test-claim defects that let the
+  four regressions ship: `installedProxyARP6673` now models
+  `proxyKey{ifindex, prefix.Addr()}` (it claimed two installs where proxyarp.go
+  creates one neighbour); the empty-selection test gained a swapped-slot control
+  so `Match == ""` is no longer satisfied by the field's zero value; the
+  Format round-trip test now reparses `Format()` — what store_persist.go writes
+  — instead of `FormatSet()`; and `ruleDropped` is DERIVED from the case's own
+  dropping cause instead of hand-set, with the snapshot-level observation and
+  the missing NPTv6 end-to-end coverage added in pkg/dataplane/userspace.
+  Differential proof for each: RED at 705bd0fa1 with a real assertion failure
+  (build+vet clean there), GREEN after, RED again under Edit-mutation of the
+  fix. Controls (packed forms, repeated identical prefixes, plain static-NAT
+  masking) PASS in every state, so the reds are scoped.
+- **File(s)**: pkg/config/compiler_services.go,
+  pkg/config/compiler_nat_static.go,
+  pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
+  pkg/config/multivalue_mixed_shape_6673_test.go,
+  pkg/eventengine/multivalue_leaf_runtime_6673_test.go,
+  pkg/logging/flow_trace_flag_installed_6673_test.go,
+  pkg/dataplane/userspace/nptv6_multivalue_match_6673_test.go,
+  pkg/dataplane/userspace/static_nat_repeated_match_6673_test.go,
+  docs/config-schema.md, _Log.md

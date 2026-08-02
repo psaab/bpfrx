@@ -67,6 +67,50 @@ func natStaticPrefixInfo(addr string) (fam string, bits int, isHost, parsedIP bo
 // because net.IP folds IPv4-mapped IPv6 into IPv4 (#6327); natStaticPrefixInfo
 // supplies the family and width from the colon-strict natAddrFamily, so the two
 // agree on which width a 4-in-6 literal has.
+// staticNATMatchAddrKeyFor picks the install-identity key for a rule's `match
+// destination-address` values. The identity depends on the CONSUMER, and static
+// NAT and NPTv6 have different ones.
+//
+// #6673 fold. staticNATMatchAddrKey masks the value to its prefix length
+// because plain static NAT's consumer masks too (parse_nat_prefix in
+// userspace-dp/src/nat/static_nat.rs: `base = addr & !host_mask(len)`), so two
+// spellings that mask alike really do lower to a byte-identical row. NPTv6's
+// consumer does the OPPOSITE: parse_prefix in userspace-dp/src/nptv6.rs
+// documents "OR host bits are set beyond the prefix length (#4519 — fail
+// closed, do NOT mask)" and returns None. So for an NPTv6 rule
+// `2001:db8:1:2::/48` and `2001:db8:1::/48` mask alike but do NOT install
+// alike — one translates and one is rejected — and collapsing them let a value
+// with host bits ride along invisibly: the cardinality gate saw one prefix, the
+// per-address validator skips NPTv6 rules, and the NPTv6 validator reads only
+// the scalar rule.Match. Nothing rejected it and nothing installed it.
+//
+// Keying a host-bits value on its raw text restores the distinction, so the
+// #6659 cardinality gate fires on the pair. Every widened NPTv6 value is then
+// covered by SOME strict gate, which is the honest form of the claim: a value
+// DISTINCT from the selected one is rejected by the cardinality gate; a value
+// IDENTICAL to it is the selected value, which
+// validateNPTv6PrefixesStrict already checks (length, family, /48-or-/64,
+// host bits). No per-value NPTv6 validator is added or needed.
+func staticNATMatchAddrKeyFor(isNPTv6 bool) func(string) string {
+	if !isNPTv6 {
+		return staticNATMatchAddrKey
+	}
+	return nptv6MatchAddrKey
+}
+
+// nptv6MatchAddrKey is staticNATMatchAddrKey with masking withheld from any
+// value that actually carries host bits — the values NPTv6 refuses to install.
+// Two identical spellings still collapse (that is the invented-rejection fix
+// dedupeValuesBy exists for), and so do two masked-equal spellings that are both
+// already canonical; only a value the NPTv6 consumer would reject is kept
+// distinct from the one it accepts.
+func nptv6MatchAddrKey(v string) string {
+	if p, err := netip.ParsePrefix(v); err == nil && p.Masked() != p {
+		return "hostbits\x00" + v
+	}
+	return staticNATMatchAddrKey(v)
+}
+
 func staticNATMatchAddrKey(v string) string {
 	_, bits, _, parsedIP := natStaticPrefixInfo(v)
 	if !parsedIP || bits < 0 {

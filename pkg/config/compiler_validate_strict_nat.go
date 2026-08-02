@@ -2529,7 +2529,17 @@ func validateStaticNATMatchAddressesStrict(cfg *Config) error {
 			// value. Nothing is ignored and nothing is lost. staticNATMatchAddrKey
 			// collapses only values that lower to the SAME dataplane row, so the
 			// #6659 rejection for genuinely distinct prefixes is untouched.
-			addrs := dedupeValuesBy(nonEmptyValues(rule.MatchAddresses), staticNATMatchAddrKey)
+			// #6673 fold: the identity a value is deduped on is the
+			// CONSUMER's. Plain static NAT masks a prefix to its length, so two
+			// masked-equal spellings install the same row and count once; NPTv6
+			// REJECTS host bits instead of masking (nptv6.rs parse_prefix,
+			// #4519), so for an NPTv6 rule a host-bits value is NOT the same
+			// prefix as its masked form and must not collapse into it — that
+			// collapse was how `destination-address [ 2001:db8:1::/48
+			// 2001:db8:1:2::/48 ]` committed clean with the invalid tail
+			// visible to no gate at all. See staticNATMatchAddrKeyFor.
+			addrs := dedupeValuesBy(nonEmptyValues(rule.MatchAddresses),
+				staticNATMatchAddrKeyFor(rule.IsNPTv6))
 			if len(addrs) > 1 {
 				// #6673: the selected slot can itself be the authored BLANK —
 				// `destination-address [ "" 192.0.2.1/32 198.51.100.1/32 ];`

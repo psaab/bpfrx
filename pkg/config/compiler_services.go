@@ -1776,6 +1776,33 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 //   - packed leaf       `attributes-match e.owner matches Comcast;`
 //     → NO children; the whole expression rides on the node's own Keys after
 //     the keyword. Reading only Children compiled ZERO constraints.
+//   - bracket list      `attributes-match [ "e.a matches X" "e.b matches Y" ];`
+//     → NO children either; the lexer strips the brackets and each QUOTED
+//     member is ONE token, so the members collapse onto Keys[1:] side by side.
+//     Joining that tail would fuse two constraints into one impossible regex.
+//
+// Hence the two rules below, which are about the two ways a tail can be
+// spelled, not about two different leaves:
+//
+//   - CHILDREN WIN. When the node has children they are the whole expression
+//     list and the node's OWN tail is ignored — verbatim master behaviour,
+//     because master read Children and nothing else. `attributes-match bogus {
+//     "e.owner matches X"; }` parses as Keys=["attributes-match","bogus"] with
+//     one child; master ignored `bogus` and committed, so promoting it into a
+//     constraint here would REJECT (as a malformed match expression) a
+//     configuration that committed before #6659. Widening a read must not
+//     invent a rejection out of a token the previous reader discarded.
+//   - Only when there are NO children does the tail carry the expression(s),
+//     and then a token containing " matches " is a self-contained expression
+//     (it can only have come from a quoted member) while a run of bare tokens
+//     is ONE unquoted expression split by the lexer. So: if ANY tail token
+//     contains the separator, every tail token is its own expression;
+//     otherwise the whole tail joins into one. A bracketed list mixing a
+//     well-formed member with a bare garbage token therefore yields the
+//     garbage token as its own (malformed) expression and strict commit
+//     rejects it — that is the #6659 fail-closed conversion, not a new
+//     invented rejection, because master compiled NOTHING from any packed
+//     tail and so let the whole list fail open.
 //
 // Dropping the constraints is a FAIL-OPEN: an event policy with no
 // attributes-match fires on every occurrence of the event rather than the
@@ -1802,17 +1829,32 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 // changes the COMPILED policy and its consumers: policySemanticRevision (which
 // re-arms the engine), `show event-options`, and the quoted diagnostic.
 func eventAttributesMatchExprs(child *Node) []string {
-	var exprs []string
+	// Block / flat-set: one expression per child, and the node's own tail is
+	// the identifier slot master discarded. Do not promote it (#6673 fold).
+	if len(child.Children) > 0 {
+		exprs := make([]string, 0, len(child.Children))
+		for _, amChild := range child.Children {
+			exprs = append(exprs, strings.Join(amChild.Keys, " "))
+		}
+		return exprs
+	}
+	if len(child.Keys) < 2 {
+		// No value slot at all (`attributes-match;`): no constraint authored.
+		return nil
+	}
+	tail := child.Keys[1:]
+	// A tail token that carries the " matches " separator can only have come
+	// from a QUOTED member of a bracket list — the lexer never leaves a space
+	// inside an unquoted token. One such token means the tail is a LIST of
+	// whole expressions, not the tokens of a single one.
+	for _, tok := range tail {
+		if strings.Contains(tok, eventAttributesMatchSep) {
+			return append([]string(nil), tail...)
+		}
+	}
 	// Packed leaf: the tail tokens form exactly ONE expression. Emitted
 	// whenever a value slot exists, even if the expression is empty.
-	if len(child.Keys) > 1 {
-		exprs = append(exprs, strings.Join(child.Keys[1:], " "))
-	}
-	// Block / flat-set: one expression per child.
-	for _, amChild := range child.Children {
-		exprs = append(exprs, strings.Join(amChild.Keys, " "))
-	}
-	return exprs
+	return []string{strings.Join(tail, " ")}
 }
 
 // eventChangeConfigCommands extracts every `then change-configuration commands`
@@ -1836,6 +1878,17 @@ func eventAttributesMatchExprs(child *Node) []string {
 //
 // A child boundary and a tail-token boundary are different things, so the two
 // rules do not conflict.
+//
+// #6673 fold: CHILDREN WIN, exactly as in eventAttributesMatchExprs and for
+// exactly the same reason. `commands bogus { "set system host-name foo"; }`
+// parses as Keys=["commands","bogus"] with one child. Master read Children and
+// nothing else, so it ignored `bogus` and the remediation RAN. Emitting both
+// hands eventengine.classifyPlan a token that matches neither the `set ` nor
+// the `delete ` prefix, and classifyPlan rejects the WHOLE batch (`return nil,
+// false`) — HandleEvent then discards it. Both trees accept the configuration;
+// only the widened read makes the remediation inert. A tail is read ONLY when
+// the node has no children, which is the shape where master compiled nothing at
+// all (the #6659 fail-open this helper exists to close).
 // #6673: an authored-but-EMPTY command is kept, not skipped — but for a
 // DIFFERENT reason than eventAttributesMatchExprs above, and the obvious guess
 // is wrong. Before #6659 the block spelling appended cmdChild.Name()
@@ -1857,17 +1910,21 @@ func eventAttributesMatchExprs(child *Node) []string {
 // classifyPlan trims them itself. A `commands;` with no value slot still
 // contributes nothing.
 func eventChangeConfigCommands(cmdsNode *Node) []string {
-	var cmds []string
-	// Packed: each trailing token is one complete (quoted) command.
-	for _, k := range cmdsNode.Keys[1:] {
-		cmds = append(cmds, k)
-	}
 	// Block: each child is one command; join its Keys so an unquoted command
-	// survives whole instead of truncating to its first word.
-	for _, cmdChild := range cmdsNode.Children {
-		cmds = append(cmds, strings.Join(cmdChild.Keys, " "))
+	// survives whole instead of truncating to its first word. The node's own
+	// tail is the identifier slot master discarded — do not promote it.
+	if len(cmdsNode.Children) > 0 {
+		cmds := make([]string, 0, len(cmdsNode.Children))
+		for _, cmdChild := range cmdsNode.Children {
+			cmds = append(cmds, strings.Join(cmdChild.Keys, " "))
+		}
+		return cmds
 	}
-	return cmds
+	// Packed: each trailing token is one complete (quoted) command.
+	if len(cmdsNode.Keys) < 2 {
+		return nil
+	}
+	return append([]string(nil), cmdsNode.Keys[1:]...)
 }
 
 func compileEventOptions(node *Node, policies *[]*EventPolicy) error {

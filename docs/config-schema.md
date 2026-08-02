@@ -1000,6 +1000,115 @@ repeated value is one value, and rejecting it invents a rejection too. See
 "A cardinality gate counts DISTINCT values" below for how each leaf picks its
 identity.
 
+### A widened read must not PROMOTE a token the old reader discarded (#6673)
+
+Widening a one-sided reader has a failure mode symmetric to the one it fixes.
+The old reader ignored one side of the AST; where the ignored side held garbage,
+ignoring it was LOAD-BEARING. Reading it now materialises that garbage into the
+compiled config, and a downstream consumer that refuses it converts a working
+configuration into an inert one — with commit still succeeding on both trees, so
+no gate reports anything.
+
+**Where this can happen is decidable, not a matter of taste.** `nodeVal` reads
+`Keys[1]` when present and falls back to `Children[0].Name()`, so every leaf
+that used it ALREADY preferred the node's own tail; widening such a leaf can
+only add values from slots the old reader never reached. The two `event-options`
+arms are the exception in the #6659 set: they read `Children` and NOTHING else,
+so for them the tail is exactly the discarded side. Both regressions landed
+there, and only there.
+
+The concrete shape is a node carrying BOTH a tail and children —
+`<leaf> <identifier> { <value>; }`, which the parser renders as
+`Keys=["<leaf>","<identifier>"]` with one child:
+
+```
+attributes-match bogus { "e.test-owner matches ^alice$"; }
+then { change-configuration { commands bogus { "set system host-name foo"; } } }
+```
+
+Master discarded `bogus` in both. Promoting it made the first a HARD COMMIT
+REJECTION (`ValidateEventAttributesMatchStrict` sees an expression with no
+`matches` separator) and the second an INERT REMEDIATION
+(`eventengine.classifyPlan` matches neither the `set ` nor the `delete ` prefix
+and rejects the WHOLE batch, so `HandleEvent` discards it). Hence the rule both
+readers now follow: **CHILDREN WIN — when the node has children they are the
+whole value list and the node's own tail is ignored, verbatim master behaviour;
+the tail is read only when there are no children, which is the shape master
+compiled nothing from.**
+
+The tail itself then needs one more distinction, because two different spellings
+land there:
+
+| Spelling | `Keys[1:]` | Meaning |
+|---|---|---|
+| `attributes-match e.owner matches X;` | `["e.owner","matches","X"]` | ONE expression the lexer split |
+| `attributes-match [ "e.a matches X" "e.b matches Y" ];` | `["e.a matches X","e.b matches Y"]` | TWO whole expressions |
+
+The lexer never leaves a space inside an unquoted token, so a tail token
+CONTAINING `" matches "` can only have come from a quoted bracket member. If any
+tail token carries the separator the tail is a list of expressions; otherwise it
+joins into one. Joining unconditionally produced
+`e.test-owner matches ^alice$ e.test-name matches ^wan$`, which
+`ParseEventAttributesMatch` splits at the FIRST separator and accepts — the
+remainder compiles as a valid regex — so the policy committed and then never
+matched anything. The `commands` tail needs no such rule: each trailing token is
+already one complete (quoted) command.
+
+**Test this at the CONSUMER.** Every one of these is invisible to an assertion
+about the compiler's intermediate string: the constraint list exists, the
+command list exists, the config commits. What changed is the engine's verdict.
+`pkg/eventengine/multivalue_leaf_runtime_6673_test.go` asserts whether the
+policy fires and whether the batch classifies into an executable plan, against
+origin/master's own reader run over the same AST.
+
+Two consequences worth stating rather than leaving to be re-derived:
+
+- **The `nodeVal` arms were checked and are NOT instances of this.** Feeding the
+  same mixed shape to them — `destination-address 192.0.2.1/32 { 198.51.100.1/32;
+  }`, `export p1 { p2; }` — does now fail commit where master accepted, but for
+  a different reason and one that is not shape-specific: the tail there IS a
+  value slot (`nodeVal` selects it), so the node carries two genuinely authored
+  values and the cardinality gate rejects it in EVERY spelling, brackets
+  included. That gate is #6659's reviewed core. Nothing is being promoted that
+  the old reader threw away. `proxy-arp … address a { b; }` still commits.
+- **The residual, stated: a value in the identifier slot beside a block is
+  DROPPED.** `attributes-match "e.a matches X" { "e.b matches Y"; }` compiles to
+  the child alone, and so does `commands "set a" { "set b"; }`. That is exactly
+  what master did, so nothing regresses — but authoring a value there has never
+  been supported and silently loses it. Author the block members, or the packed
+  form; not both.
+
+### The `flag` leaf installs every NON-EMPTY value, in every slot (#6673)
+
+`security flow traceoptions flag` is a SET leaf, and #6659 changed what installs
+for any multi-slot list. That change is deliberate and is recorded here because
+it is operator-visible on upgrade.
+
+Before #6659 the compiler read the leaf with `nodeVal` — the FIRST slot only —
+and dropped an empty selection, so the installed set depended on where the
+operator happened to write things:
+
+| Authored | master installed | now installs |
+|---|---|---|
+| `flag [ session basic-datapath ];` | `{session}` | `{basic-datapath, session}` |
+| `flag [ "" session ];` | `{basic-datapath, session}` (writer defaults) | `{session}` |
+| `flag [ session "" ];` | `{session}` | `{session}` |
+
+The middle two rows are the same configuration with the tokens swapped, and
+master installed different flag sets for them; the first row is an operator
+asking for two flags and getting one with no diagnostic. Neither behaviour was
+designed — both fall out of slot-0 selection. The rule now is
+POSITION-INDEPENDENT: every non-empty authored flag installs, and an empty token
+is not a flag — it contributes nothing, it does not suppress the flags beside it,
+and it does not re-enable `NewTraceWriter`'s defaults.
+
+An empty token is NOT rejected at commit, because master accepted it and
+inventing a rejection for an already-committed configuration is the failure mode
+above. The "writer defaults apply" state is not lost either: authoring no `flag`
+stanza remains the documented way to get it, which is what
+`pkg/logging/flow_trace_flag_installed_6673_test.go` pins — at the writer, using
+`NewTraceWriter`'s own flag map rather than the compiled slice.
+
 ### Detect a grammar keyword by CLASS, never by position (#6673)
 
 `proxyARPAddressValues` is a SET reader with one exception: a MALFORMED RANGE
@@ -1132,7 +1241,7 @@ leaves "stays active" standing. Two cases, both measured: an EMPTY `then
 static-nat` target (a misspelled target keyword — the Go lowering emits
 `InternalIP: ""` and the Rust parse drops the mapping; it IS reported, but by the
 sibling `validateStaticNATThenTargetStrict` (#4290), whose emissions this flag
-cannot see), and a CROSS-FAMILY host pair such as `192.0.2.1/32` -> 
+cannot see), and a CROSS-FAMILY host pair such as `192.0.2.1/32` ->
 `2001:db8::1/128` (both sides parse and both are host routes, so no validator
 checks it at all). Closing either needs a cross-validator verdict channel or a
 new rejection, not a wording change. Write the inventory, not one example — "one
@@ -1171,6 +1280,26 @@ Choose the IDENTITY per leaf, and justify it:
   what makes collapsing SOUND rather than merely lenient; a value with no
   canonical form (unparseable, malformed mask) keys on its raw text so two
   different typos never merge into one.
+- **…but the identity belongs to the CONSUMER, and `match destination-address`
+  has two.** The masking above mirrors `parse_nat_prefix`, which is the plain
+  static-NAT lowering. The SAME leaf on an `nptv6-prefix` rule is consumed by
+  `parse_prefix` in `userspace-dp/src/nptv6.rs`, which does the opposite: *"OR
+  host bits are set beyond the prefix length (#4519 — fail closed, do NOT
+  mask)"*, returning `None`. So for an NPTv6 rule `2001:db8:1:2::/48` and
+  `2001:db8:1::/48` mask alike and install NOTHING alike — one translates, the
+  other is refused. Keying them together made
+  `destination-address [ 2001:db8:1::/48 2001:db8:1:2::/48 ]` commit clean with
+  the invalid tail visible to no gate at all: the cardinality gate counted one
+  prefix, the per-address validator skips NPTv6 rules, and
+  `validateNPTv6PrefixesStrict` reads only the scalar `rule.Match`.
+  `staticNATMatchAddrKeyFor(rule.IsNPTv6)` therefore withholds masking from a
+  value that actually carries host bits, so the pair counts as two and the
+  cardinality gate fires. The resulting coverage claim is narrow and exact: a
+  widened NPTv6 value DISTINCT from the selected one is rejected by the
+  cardinality gate, and a value IDENTICAL to it *is* the selected value, which
+  `validateNPTv6PrefixesStrict` already checks. There is no per-value NPTv6
+  validator. **Before reusing a dedupe key on a second leaf, check that the
+  second leaf's consumer reduces values the same way the first one does.**
 
 Deduplication must never loosen the rejection itself: genuinely distinct
 prefixes or policies still fail commit, because one of them really would carry

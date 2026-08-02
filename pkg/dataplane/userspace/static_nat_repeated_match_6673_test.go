@@ -96,21 +96,20 @@ func TestStaticNATRepeatedMatchSurvivesFormatRoundTrip6673(t *testing.T) {
 		t.Fatalf("Format() dropped a sibling destination-address; both must round-trip:\n%s", formatted)
 	}
 
-	// Re-parse the rendered config exactly as a restart would, then compile
-	// tolerantly again.
-	reparsed := &config.ConfigTree{}
-	for _, cmd := range strings.Split(strings.TrimSpace(repeatedMatchTree6673(t).FormatSet()), "\n") {
-		cmd = strings.TrimSpace(cmd)
-		if cmd == "" {
-			continue
-		}
-		path, err := config.ParseSetCommand(cmd)
-		if err != nil {
-			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
-		}
-		if err := reparsed.SetPath(path); err != nil {
-			t.Fatalf("SetPath(%q): %v", cmd, err)
-		}
+	// Re-parse the rendered config exactly as a restart would.
+	//
+	// #6673 round 9: this must reparse the SAME rendering persistence writes.
+	// configstore's writeActive does `data := s.active.Format()`
+	// (pkg/configstore/store_persist.go:784, and :941 for the boot snapshot), so
+	// the on-disk artefact is Format() output and the restart path re-parses it
+	// with the hierarchical parser. Rendering with Format() and then reparsing
+	// FormatSet() through ParseSetCommand exercised a DIFFERENT round trip from
+	// the one the comment above claims — and flat-set reparsing is precisely the
+	// route that cannot reproduce this bug's shape, because SetPath merges the
+	// two statements differently.
+	reparsed, perrs := config.NewParser(formatted).Parse()
+	if len(perrs) != 0 {
+		t.Fatalf("re-parsing the persisted Format() rendering failed: %v\n%s", perrs, formatted)
 	}
 	cfg, err := config.CompileConfigLenient(reparsed)
 	if err != nil {
