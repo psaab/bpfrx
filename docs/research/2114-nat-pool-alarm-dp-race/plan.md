@@ -1,23 +1,26 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v85 — r83 folds: Codex M1's canary escape
-  closure (the helper is now exactly named with a NON-ESCAPING
-  signature — `registryLookupLocked(name string) *ebpf.Map`, a
-  key in and the selected handle out; the CONTAINER never
-  escapes: a helper returning `m.maps` wholesale would let a
-  caller index the alias after unlock while the publisher
-  writes, preserving the fatal race through an allowlisted
-  lock-holding helper — the shape rules now reject container
-  return/alias/field-assign/closure/argument-pass/post-unlock
-  indexing, with negative fixtures for both anti-patterns, and
-  the publisher's writes are followed by exactly one in-lock
-  Store(true)), Codex m1's teardown-summary qualifications
-  (both the §4 mechanics bullet and invariant 12 now say the
-  entry Store narrows the LOADED-CHECK SET's admission — Close
-  retains a nonempty registry, so ordinary methods classify
-  retained and proceed); r83 verdicts: Codex PLAN-NEEDS-MAJOR
-  (1M/1m — the last canary escape hole), AGY PLAN-READY,
-  Claude SMR PLAN-READY; pending convergence review r84
+- **Status**: DRAFT v86 — r84 folds: Codex M1's typed helper
+  pair (the single `*ebpf.Map`-returning helper could not serve
+  the PROGRAM registry — program reads exist at `loader.go:495`,
+  `:609`, `:1086`, `:1156` — nor carry the classification its
+  callers need): TWO helpers with typed results,
+  `lookupMapLocked`/`lookupProgramLocked`, each returning
+  (handle, present, registryState) — `present` (comma-ok)
+  distinguishes present-but-nil (the retained XDP fixture's
+  deliberate insert, `xdp_shim_decouple_test.go:321`) from
+  absent, and `registryState` ∈ {armed, fresh, retained} drives
+  each class's outcome; the canary allowlist + negative fixtures
+  align to these signatures. Codex m1's never-armed-Close
+  qualification (New() starts with empty registries and
+  bootstrap can skip Start, `daemon_run_bringup.go:483` — so
+  the retained-rationale is scoped to an ARMED Manager's Close;
+  a never-armed Close stays fresh and the entry Store changes
+  nothing); Codex explicitly declined the mid-Close-publisher
+  schedule as out-of-scope (v85 excludes re-arm
+  linearizability and teardown lifetime ordering); r84
+  verdicts: Codex PLAN-NEEDS-MAJOR (1M/1m), AGY PLAN-READY,
+  Claude SMR PLAN-READY; pending convergence review r85
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -3225,7 +3228,12 @@
   the non-escaping signature (the container never escapes;
   alias/return/closure/argument/post-unlock indexing all
   rejected, with negative fixtures); the teardown summaries
-  qualified to the loaded-check set).
+  qualified to the loaded-check set). v86 (r84: the typed
+  helper pair (handle, presence, classification) — one
+  signature could not serve both registries nor carry the
+  classification; the never-armed-Close qualification; the
+  mid-Close-publisher schedule explicitly declined as
+  out-of-scope).
 
 ---
 
@@ -3886,14 +3894,19 @@ class. The fold:
   after
   all map population; `:458`, `:490`, `:1082` become Load; the
   Store(false) moves to `Close()`'s ENTRY (:1206 — AGY r69;
-  qualified to the loaded-check set at v85 per r83 Codex m1:
-  Close retains a nonempty registry, so ordinary methods classify
-  retained and proceed — what actually changes at the entry Store
-  is that the LOADED-CHECK SET (the attaches, the CompileConfig
-  path) begins rejecting from Close's start, where master flips
-  `loaded` only at :1217's exit and would let them pass against
-  closing links; honestly an admission bit, NOT a lease — it
-  cannot drain an operation that
+  qualified to the loaded-check set at v85 per r83 Codex m1, and
+  scoped to an ARMED Manager's Close at v86 per r84 Codex m1:
+  `New()` starts with empty registries (`loader.go:89`) and
+  bootstrap can skip Start while retaining the constructed backend
+  (`daemon_run_bringup.go:483`), so a never-armed Close remains
+  fresh and the entry Store changes nothing there; for an armed
+  Manager's Close the registry is retained-nonempty, so ordinary
+  methods classify retained and proceed — what actually changes at
+  the entry Store is that the LOADED-CHECK SET (the attaches, the
+  CompileConfig path) begins rejecting from Close's start, where
+  master flips `loaded` only at :1217's exit and would let them
+  pass against closing links; honestly an admission bit, NOT a
+  lease — it cannot drain an operation that
   already observed true).
 - **Master-today in-window outcomes, preserved-or-improved
   precisely** (v72 wording after r70 Codex M1 falsified v71's
@@ -4049,9 +4062,11 @@ v20 history). The delivery is TWO units:
   registry rule + whole-batch publication); and the teardown-window
   exposure is NARROWED with no closure claimed — the `Close()`-entry
   Store(false) narrows the LOADED-CHECK SET's admission at teardown
-  (r82 Codex m4's precision: Close retains a nonempty registry, so
-  ordinary methods classify retained and proceed — the narrowing is
-  limited to the loaded-check set, not "fresh-state admission";
+  (r82 Codex m4's precision, scoped at v86 per r84 Codex m1: an
+  ARMED Manager's Close retains a nonempty registry, so ordinary
+  methods classify retained and proceed — a never-armed Manager's
+  Close has an empty registry and changes nothing — the narrowing
+  is limited to the loaded-check set, not "fresh-state admission";
   the r70-era framing sentence is rewritten accordingly); the
   §10 residuals remain open).
 - **Follow-up issue (filed at /engineer time; seeded from this
@@ -4502,9 +4517,11 @@ Preserved exactly:
     selector). NO lifetime or
     teardown exclusion is claimed — the Store(false) at `Close()`'s
     entry (:1206) narrows the LOADED-CHECK SET's admission at
-    teardown (r83 Codex m1's qualification: Close retains a nonempty
-    registry, so ordinary methods classify retained and proceed per
-    the two-state rule, = master; the "fresh-state entrants"
+    teardown (r83 Codex m1's qualification, scoped at v86 per r84
+    Codex m1: an ARMED Manager's Close retains a nonempty registry,
+    so ordinary methods classify retained and proceed per the
+    two-state rule, = master; a never-armed Close stays fresh and
+    the entry Store changes nothing; the "fresh-state entrants"
     phrasing was vacuously true but misleading) and cannot
     drain an in-flight operation; the pre-existing shutdown-window
     link-map race (`Close`'s :1206-1216 range vs the live userspace
@@ -4793,10 +4810,26 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    `pkg/dataplane` forbids direct `m.maps`/`m.programs` access
    outside the EXACTLY-NAMED allowlist — the registry helper and
    `publishShimRegistryLocked` — with the full precision set (r83
-   Codex M1): the helper's exact name and NON-ESCAPING signature
-   (`func (m *Manager) registryLookupLocked(name string) *ebpf.Map`
-   — a key in, the selected handle out; the CONTAINER never
-   escapes); the shape rules, type-aware on the receiver — every
+   Codex M1; the helper shape completed at v86 per r84 Codex M1 —
+   the single `*ebpf.Map`-returning signature could not serve the
+   PROGRAM registry (different value type: reads at `loader.go:495`,
+   `:609`, `:1086`, `:1156`) nor carry the classification its
+   callers need): TWO helpers with typed results —
+   `lookupMapLocked(name string) (h *ebpf.Map, present bool, st
+   registryState)` and `lookupProgramLocked(name string) (p
+   *ebpf.Program, present bool, st registryState)`, where
+   `registryState` ∈ {armed, fresh, retained} is the under-lock
+   classification and `present` is the comma-ok bit (distinguishing
+   present-but-nil — the retained XDP fixture inserts exactly that,
+   `xdp_shim_decouple_test.go:321` — from absent). A class-1 caller:
+   st==fresh → `ErrDataplaneNotArmed`; st∈{armed,retained} ∧
+   !present → master's missing-map error; else proceed with the
+   handle. Class-2: st==fresh → neutral; else master's missing-map
+   outcome (nil for the no-ops). Class-4: st==fresh → nil (+ the
+   typed error where the signature carries one). The canary
+   allowlist names exactly these two helpers + the publisher, with
+   the negative fixtures aligned to these signatures; the shape
+   rules, type-aware on the receiver — every
    allowed access is dominated by the allowlisted function's `m.mu`
    acquisition and precedes its release (the `Lock -> hook ->
    Unlock -> access` anti-pattern FAILS, r82 Codex M1's hole), AND
@@ -5365,15 +5398,19 @@ Still open:
    PLAN-READY when all three verdicts gate the PR-1 design as
    ready.
 
-7. **r68-r83 resolution (for the record)**: Codex r68 M1 (armed-state
+7. **r68-r84 resolution (for the record)**: Codex r68 M1 (armed-state
    admission gate) folded as work item A3; r69-r82 falsified each
-   intermediate form, and r83 closed the last canary escape (a
-   helper returning the container wholesale would preserve the fatal
-   race through an allowlisted, lock-holding helper) — v85 pins the
-   helper's exact non-escaping signature and the full shape rules.
-   Each reviewer: verify the canary spec now rejects container
-   escape of every form, and the two teardown-summary
-   qualifications.
+   intermediate form, r83 closed the last canary escape (a helper
+   returning the container wholesale would preserve the fatal race
+   through an allowlisted, lock-holding helper), and r84 replaced
+   the single helper with the typed pair — a `*ebpf.Map`-returning
+   signature could not serve the program registry (reads at
+   `loader.go:495`, `:609`, `:1086`, `:1156`) nor carry the
+   presence/classification its callers need. v86 pins
+   `lookupMapLocked`/`lookupProgramLocked` returning
+   (handle, present, registryState). Each reviewer: verify the
+   canary spec serves every production registry access shape,
+   and the never-armed-Close qualification.
 
 ---
 
