@@ -502,6 +502,32 @@ func TestScopedRemotePeerStillReachesTheCredential_5561(t *testing.T) {
 	if id.OK {
 		t.Fatalf("an off-box scoped peer was attributed: %+v", id)
 	}
+	// OK=false and Local=false are BOTH the zero values of PeerIdentity, so the
+	// two assertions above are equally satisfied by a function that decided
+	// nothing. The Detail is not defaulted — the credential row is reached
+	// through an explicit `return PeerIdentity{Detail: "peer %v is not on this
+	// host"}`, so requiring it proves a verdict was computed.
+	if !strings.Contains(id.Detail, "is not on this host") {
+		t.Fatalf("the off-box verdict carries Detail %q. OK and Local are both false by "+
+			"DEFAULT, so without this the case is satisfied by any implementation that "+
+			"returns a zero PeerIdentity — including one that never classified the "+
+			"caller at all", id.Detail)
+	}
+	// Discrimination control: the SAME scoped shape, against a table that is
+	// equally present and empty, must NOT reach the credential row when the
+	// caller's address is one of ours. Without this, "reaches the credential"
+	// could be this function's answer for every scoped peer, which is the
+	// opposite fail-open of the one the case is named for.
+	defer setLocalAddrsForTest([]net.Addr{
+		&net.IPNet{IP: net.ParseIP("fe80::ee01:0:0:99"), Mask: net.CIDRMask(64, 128)},
+		&net.IPNet{IP: net.ParseIP("fe80::e01:0:0:1"), Mask: net.CIDRMask(64, 128)},
+	})()
+	if ours := LookupPeer(client, server); !ours.Local || ours.OK {
+		t.Fatalf("a scope-qualified peer whose address IS assigned to this host was reported "+
+			"%+v, want LOCAL and unattributable. A scoped caller on our own address must be "+
+			"denied, not handed the credential row — if this reaches the credential too, the "+
+			"assertions above are not distinguishing anything", ours)
+	}
 }
 
 // TestProcParserRejectsNonEstablishedRow_5561 is the fixture half of the

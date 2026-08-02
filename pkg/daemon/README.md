@@ -293,6 +293,21 @@ credential revocation is enforced even on an apply that returns early
     while some listener really is serving an unnamed address, so a later commit
     always exits it: converge that bind, or commit the address that is actually
     serving (which moves nothing and publishes whole).
+
+    Both exits rest on the unnamed address being one a committed config CAN
+    name, and round 13's predicate quietly assumed the HTTP leg is always live
+    at `cur.addr`. It is not: a boot HTTP bind failure leaves `curSet` false and
+    `cur.addr` empty, and — since round 14 made `startTo` adopt the server so
+    the bind can be retried — a later reconcile can bind the HTTPS leg while
+    HTTP still fails. The absent HTTP leg then read as a mismatch, so a rotation
+    on the live, correctly-named HTTPS listener intersected to `∅` with NEITHER
+    exit available: the HTTP bind keeps failing, and no committed config can
+    make `next.Addr` empty because `resolveAPIBinds` always yields a concrete
+    address. `everyLiveLegNamedBy` now treats an empty `e.addr` as "that leg is
+    not serving, so it imposes no requirement", symmetric with the cleared-`tls`
+    arm. Pinned by
+    `TestMgmtLiveHTTPSLegIsGrantedWhenTheHTTPLegNeverBound_5561` (#5561 round
+    16).
   - **Removing ALL api-auth is a revocation too, and it lands immediately**
     (#5561 round 14). The committed policy authorizes no credential, and there
     are exactly two ways to say that to a listener:

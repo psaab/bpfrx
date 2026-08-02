@@ -1,3 +1,91 @@
+## 2026-08-01 — #5561 round 16b: a Codex leg found a RUNTIME regression the hostile Claude review missed
+
+- **Timestamp**: 2026-08-01 (fix/5561-rest-authz-r16, PR #6645)
+- **Action**: Folded a Codex MERGE-NEEDS-MAJOR taken at 1da594597. It
+  independently confirmed the round-16 F1 finding (both nil-publication call
+  sites are line-executed, only the post-rebind result is discriminatingly
+  asserted) and added one item round 16 did not have: incorrect BEHAVIOUR, not a
+  missing guard.
+
+  **MAJOR — an absent HTTP leg counted as a listener at an unnamed address, and
+  stranded a live HTTPS leg in an absorbing empty set.** `everyLiveLegNamedBy`
+  documented "the HTTP leg is always serving, at e.addr". That premise is false
+  when the HTTP leg has NEVER bound: `m.cur` starts zeroed and `startTo`
+  re-zeroes it on a boot bind failure. The gate then compared "" against
+  next.Addr, read FALSE, and treated the absent leg as a listener the config does
+  not name.
+
+  Reachable sequence, reproduced firsthand before any fix: the boot HTTP bind at
+  H fails (api.Server.Start returns before it reaches the HTTPS leg, so nothing
+  is serving); a later commit retries — H still fails, but the HTTPS leg at S
+  BINDS and becomes the only live listener, at exactly the address `next` names.
+  A subsequent password rotation from {A} to {B} then publishes the early
+  intersection {A} ∩ {B} = ∅, and the late full-publish gate re-reads the same
+  predicate — still false, because m.cur.addr is still "" — so it never
+  converges. The live, correctly-named HTTPS listener rejects EVERY credential.
+
+  Neither exit named in AuthForRetainedListener's own contract exists here.
+  "Converge the bind" is unreachable while the HTTP bind keeps failing, and
+  "commit the address that is actually serving" is not expressible at all:
+  resolveAPIBinds always yields a concrete Addr, so no committed config can make
+  next.Addr equal "". Re-committing repeats ∅ ∩ {B} = ∅, which is absorbing.
+
+  **It is a regression of this branch, verified against origin/master rather
+  than taken on report.** Master has neither predicate; its startTo returns early
+  on a boot bind failure leaving m.srv nil, so reconcileTo short-circuits and
+  NEITHER leg is ever retried; and its publish is gated on a plain httpOK with no
+  intersection at all. The state is reachable only because round 14 made startTo
+  adopt the server so the bind CAN be retried — a fix that put the reconciler
+  into a configuration the round-13 gate could not describe.
+
+  Fixed by treating an empty e.addr as "that leg is not serving, so it imposes no
+  requirement" — symmetric with the arm that already says exactly that for a
+  cleared tls flag, and the same reading mgmtAddrIsLoopback already gives an
+  empty bind. Guarded by
+  TestMgmtLiveHTTPSLegIsGrantedWhenTheHTTPLegNeverBound_5561; dropping the
+  `e.addr != ""` guard reds it alone across pkg/daemon + pkg/api, build and vet
+  clean.
+
+  This also falsified pkg/daemon/README.md's "every state that can reach ∅ has an
+  EXIT", which assumed HTTP is always live at cur.addr. Corrected in place with
+  the sequence that breaks it, not softened.
+
+  **Two more failure-default assertions**, the same shape as round 16's F5.
+  `TestMgmtBootHTTPBindFailureIsRetriedByTheNextCommit_5561` asserted
+  `m.curSet == false` on a FRESH reconciler — the zero value — so deleting
+  startTo's error-path `m.cur, m.curSet = mgmtEndpoint{}, false` left it green.
+  It now seeds a converged fingerprint first, which makes the RESET observable;
+  the seeding is documented as pinning a defensive reset rather than a state
+  production reaches, which is precisely why nothing pinned it.
+  `TestScopedRemotePeerStillReachesTheCredential_5561` asserted only
+  `Local == false` and `OK == false`, both zero values of PeerIdentity. It now
+  also requires the Detail the off-box return path explicitly sets, and adds a
+  discrimination control (the same scoped shape with the caller's address
+  assigned to this host must be denied). Both bind independently: stubbing the
+  off-box verdict to a zero PeerIdentity reds the first, disabling the scoped
+  couldBeLocal reds the second.
+
+  **Filed, not fixed here.** #6733 — the REST config GET surface returns
+  URL/hostname fields unredacted (LicenseAutoUpdate, ArchiveSites, DynamicDNS
+  Server/URLTemplate/CheckIPURL, RPM http-get Target, DynamicAddress FeedServers,
+  plus two raw-AST-only leaks). The redaction pass is NAME-keyed while these
+  values are sensitive by CONTENT, so it is structural rather than a list of
+  misses. Verified UNCHANGED from origin/master — pre-existing, deliberately not
+  folded. #6734 — the round-16 F6 latent slot divergence: pkg/api substitutes a
+  fresh authSlot for nil in two independent places, so a future site passing nil
+  to both would pin a slot the handler never reads. Not reachable today (all four
+  production sites thread one non-nil pointer), and closing it means an ownership
+  change across all four.
+
+- **File(s)**: `pkg/daemon/management.go`,
+  `pkg/daemon/management_authsanction_5561_test.go`,
+  `pkg/daemon/management_bootretry_5561_test.go`, `pkg/daemon/README.md`,
+  `pkg/authz/peer_5561_test.go`
+- **Validation**: `go build ./...` rc 0; `go vet ./...` rc 0; full `go test ./...`;
+  `-race` on `pkg/api` + `pkg/daemon` + `pkg/authz` + `pkg/config`. Four mutations
+  driven to RED-with-real-assertion with build and vet clean under each, then
+  reverted and diffed byte-identical.
+
 ## 2026-08-01 — #5561 round 16: the pre-rebind nil publish had ZERO coverage, and three places claimed it had some
 
 - **Timestamp**: 2026-08-01 (fix/5561-rest-authz-r16, PR #6645)

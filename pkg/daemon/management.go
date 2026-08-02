@@ -147,7 +147,13 @@ func (e mgmtEndpoint) allLoopback() bool {
 //
 // Per leg:
 //
-//   - The HTTP leg is always serving, at e.addr. `next` names it iff
+//   - The HTTP leg is serving at e.addr unless e.addr is EMPTY, which means no
+//     HTTP listener has ever bound: m.cur starts zeroed and startTo re-zeroes it
+//     on a boot bind failure, while every successful bind records a non-empty
+//     address (api.Server.ReconcileHTTP refuses an empty one outright). An absent
+//     leg has no credential to hand out and imposes no requirement — the same
+//     reading mgmtAddrIsLoopback gives an empty bind, and the same reasoning the
+//     HTTPS arm below uses for a cleared tls flag. Otherwise `next` names it iff
 //     next.Addr == e.addr.
 //   - The HTTPS leg is serving only when e.tls is set. api.Server.ReconcileHTTPS
 //     assigns s.httpsLeg only after BOTH the keypair and the bind succeed, so a
@@ -161,7 +167,7 @@ func (e mgmtEndpoint) allLoopback() bool {
 // BEFORE the rebinds it says whether anything is about to move off what `next`
 // names; read AFTER, whether everything landed on it.
 func (e mgmtEndpoint) everyLiveLegNamedBy(next api.Config) bool {
-	if e.addr != next.Addr {
+	if e.addr != "" && e.addr != next.Addr {
 		return false
 	}
 	if !e.tls {

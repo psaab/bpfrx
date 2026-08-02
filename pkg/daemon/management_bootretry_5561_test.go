@@ -34,12 +34,27 @@ func TestMgmtBootHTTPBindFailureIsRetriedByTheNextCommit_5561(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Seed a CONVERGED fingerprint before the failing bind. Asserting
+	// `curSet == false` on a fresh reconciler asserts the zero value and binds
+	// nothing — deleting startTo's error-path `m.cur, m.curSet = mgmtEndpoint{},
+	// false` leaves it green. Seeding makes the RESET observable, and the reset is
+	// what the retry below depends on: a fingerprint left naming the endpoint that
+	// FAILED makes `next.Addr != m.cur.addr` false on the next commit, so
+	// ReconcileHTTP is never called and the management API stays down for the life
+	// of the process. Daemon.Run only ever calls startTo once, on a fresh
+	// reconciler, so this is a defensive reset being pinned rather than a state
+	// production reaches — which is precisely why nothing pinned it before.
+	m.cur = mgmtEndpoint{addr: "10.0.0.1:8080", tls: true, httpsAddr: "10.0.0.1:8443"}
+	m.curSet = true
+
 	reg.failAddr["10.0.0.1:8080"] = true
 	if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:8080", false, "", nil)); err == nil {
 		t.Fatal("the boot bind was expected to FAIL, so the case never reached the state it tests")
 	}
-	if m.curSet {
-		t.Fatal("a boot bind failure must not record a converged fingerprint")
+	if m.curSet || m.cur != (mgmtEndpoint{}) {
+		t.Fatalf("a boot bind failure left the fingerprint at (%+v, curSet=%v); NOTHING converged, "+
+			"so it must be emptied or the next reconcile sees no leg as changed and retries "+
+			"neither bind", m.cur, m.curSet)
 	}
 	// `show system services` reports the address it could not bind (#6401).
 	if got := m.effectiveHTTPListener(); got.State != sysservices.StateFailed || got.Addr != "10.0.0.1:8080" {

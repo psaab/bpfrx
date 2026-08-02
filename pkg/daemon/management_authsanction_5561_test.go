@@ -374,3 +374,109 @@ func TestMgmtNilAuthNeverDropsARetainedOffLoopbackHTTPSLeg_5561(t *testing.T) {
 			"the committed removal of api-auth must take effect", snap)
 	}
 }
+
+// TestMgmtLiveHTTPSLegIsGrantedWhenTheHTTPLegNeverBound_5561 is the fail-on-revert
+// gate for the round-16 MAJOR: `everyLiveLegNamedBy` asserted that "the HTTP leg
+// is always serving, at e.addr", and that premise is false when the HTTP leg has
+// NEVER bound.
+//
+// The state is reachable only because of this branch. On master, startTo returned
+// early on a boot HTTP bind failure and left m.srv nil, so reconcileTo's
+// `m.srv == nil` short-circuit made every later reconcile a no-op — neither leg
+// was ever retried. Round 14 fixed that (the server is adopted regardless so the
+// bind CAN be retried), and the fix put the reconciler into a configuration the
+// gate could not describe: curSet false, m.cur.addr "", and an HTTPS leg that a
+// later reconcile successfully binds.
+//
+// From there the gate compared "" against next.Addr, read FALSE, and treated the
+// absent HTTP leg as a listener sitting at an address the config does not name.
+// The consequence lands on the HTTPS leg, which is the only listener there is and
+// is at exactly the address next names:
+//
+//   - The early publish intersects, so a ROTATION from {A} to {B} publishes
+//     {A} ∩ {B} = ∅ and the live HTTPS listener rejects every credential.
+//   - The late full-publish gate re-reads the same predicate, which is still
+//     false because m.cur.addr is still "" — so it never converges.
+//   - Neither exit named in AuthForRetainedListener's contract is available.
+//     "Converge the bind" cannot be reached while the HTTP bind keeps failing,
+//     and "commit the address that is actually serving" is not expressible:
+//     resolveAPIBinds always yields a non-empty Addr, so no committed config can
+//     make next.Addr equal "". Re-committing repeats ∅ ∩ {B} = ∅, which is
+//     absorbing.
+//
+// An empty addr means that leg is not serving and imposes no requirement — the
+// same reasoning the HTTPS arm already used for a cleared tls flag, and the same
+// reading mgmtAddrIsLoopback already gives an empty bind.
+//
+// FAIL-ON-REVERT: drop the `e.addr != ""` guard in everyLiveLegNamedBy so the
+// absent HTTP leg counts as a mismatch again, and the rotation below locks the
+// live HTTPS listener out permanently.
+func TestMgmtLiveHTTPSLegIsGrantedWhenTheHTTPLegNeverBound_5561(t *testing.T) {
+	reg := newFakeReg()
+	m := newTestMgmt(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// The HTTP bind is refused for the whole case; HTTPS is bindable.
+	reg.failAddr["10.0.0.1:80"] = true
+	a := &api.AuthConfig{Users: map[string]string{"webadmin": "secret-a"}}
+	b := &api.AuthConfig{Users: map[string]string{"webadmin": "secret-b"}}
+
+	// Boot: the HTTP bind fails. api.Server.Start returns before it reaches the
+	// HTTPS leg, so nothing is serving at all and the fingerprint stays empty.
+	if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:80", true, "10.0.0.1:443", a)); err == nil {
+		t.Fatal("the BOOT HTTP bind was expected to fail; without that the reconciler never " +
+			"reaches the curSet-false state this case is about")
+	}
+	if m.curSet || m.cur.addr != "" {
+		t.Fatalf("after the failed boot bind: curSet=%v cur.addr=%q, want false and empty — the "+
+			"whole case rests on the HTTP leg having never bound", m.curSet, m.cur.addr)
+	}
+
+	// The retry commit. HTTP still fails; the HTTPS leg binds and becomes the ONLY
+	// live listener — at exactly the address this config names.
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.1:80", true, "10.0.0.1:443", a)); err == nil {
+		t.Fatal("the HTTP retry was expected to fail (the HTTPS leg still binds), so the " +
+			"reconcile must surface the HTTP error")
+	}
+	if ln := reg.get("10.0.0.1:443"); ln == nil || !ln.isOpen() {
+		t.Fatal("the HTTPS leg did not bind, so there is no live listener to lock out and the " +
+			"case proves nothing")
+	}
+	if m.cur.addr != "" || !m.cur.tls || m.cur.httpsAddr != "10.0.0.1:443" {
+		t.Fatalf("fingerprint after the retry = %+v, want an EMPTY http addr with the HTTPS leg "+
+			"converged", m.cur)
+	}
+	if got := mgmtAuthSecret(t, m.srv.LiveAuth()); got != "secret-a" {
+		t.Fatalf("the live snapshot is %q before the rotation, want secret-a", got)
+	}
+
+	// The operator rotates the password. Nothing is serving an address this config
+	// does not name, so the full committed set must go out.
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.1:80", true, "10.0.0.1:443", b)); err == nil {
+		t.Fatal("the HTTP retry was expected to fail again")
+	}
+	snap := m.srv.LiveAuth()
+	if snap != nil && api.CredentialCount(snap) == 0 {
+		t.Fatal("the rotation intersected to the EMPTY set. The only listener serving is the " +
+			"HTTPS leg at 10.0.0.1:443, which is exactly the address this config names — there " +
+			"is no retained listener anywhere to protect, because the HTTP leg has never bound. " +
+			"An empty non-nil snapshot rejects every non-exempt request, so a correctly-named, " +
+			"correctly-bound management listener now 401s the operator's own credential")
+	}
+	if got := mgmtAuthSecret(t, snap); got != "secret-b" {
+		t.Fatalf("the live HTTPS listener enforces webadmin=%q after the rotation, want secret-b", got)
+	}
+
+	// The exit that does not exist under the defect: re-committing is absorbing,
+	// and no committed config can name an empty HTTP address, so ∅ would be
+	// permanent.
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.1:80", true, "10.0.0.1:443", b)); err == nil {
+		t.Fatal("the HTTP retry was expected to fail on the re-commit too")
+	}
+	if got := mgmtAuthSecret(t, m.srv.LiveAuth()); got != "secret-b" {
+		t.Fatalf("re-committing the identical config leaves webadmin=%q, want secret-b — an "+
+			"empty intersection is absorbing (∅ ∩ X = ∅), so if the rotation ever enters it "+
+			"there is no commit that leaves it", got)
+	}
+}
