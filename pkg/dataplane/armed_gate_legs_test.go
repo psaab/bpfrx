@@ -366,16 +366,27 @@ func TestManager_ArmedGate_BlockedStart(t *testing.T) {
 	startDone := runSyntheticStart(t, m, map[string]*ebpf.Map{"sentinel_unused": nil})
 	<-entered // the publisher holds m.mu, pre-Store(true)
 
-	// Readers from every helper-consuming class block on the hold.
+	// Readers from every helper-consuming class block on the hold. Each
+	// goroutine signals started immediately BEFORE its call (Codex PR
+	// #6743 r2-5b: without an arrival handshake, a goroutine first
+	// scheduled AFTER the release would complete on time and falsely
+	// prove it blocked).
 	type pendingCall struct {
-		name string
-		done chan error
+		name    string
+		started chan struct{}
+		done    chan error
 	}
 	var pending []pendingCall
 	for name, call := range invoke {
-		p := pendingCall{name: name, done: make(chan error, 1)}
-		go func(c func(m *Manager) error, d chan error) { d <- c(m) }(call, p.done)
+		p := pendingCall{name: name, started: make(chan struct{}), done: make(chan error, 1)}
+		go func(c func(m *Manager) error, p pendingCall) {
+			close(p.started)
+			p.done <- c(m)
+		}(call, p)
 		pending = append(pending, p)
+	}
+	for _, p := range pending {
+		<-p.started // every reader is in-flight before the silence window
 	}
 
 	// None may complete during the hold.
@@ -460,9 +471,16 @@ func TestManager_ArmedGate_PassThenBlock(t *testing.T) {
 	<-postStoreEntered // in-hold, AFTER Store(true), before unlock
 
 	// Post-Store: a NEW invocation passes the loaded precheck and blocks at
-	// registry selection (the publisher still holds m.mu).
+	// registry selection (the publisher still holds m.mu). The started
+	// handshake proves the goroutine reached the call during the hold
+	// (Codex PR #6743 r2-5b).
+	attachStarted := make(chan struct{})
 	attachDone := make(chan error, 1)
-	go func() { attachDone <- m.AttachTC(1) }()
+	go func() {
+		close(attachStarted)
+		attachDone <- m.AttachTC(1)
+	}()
+	<-attachStarted
 	select {
 	case err := <-attachDone:
 		t.Fatalf("post-Store AttachTC completed (%v) while the publisher held m.mu — did not block at registry selection", err)
@@ -514,14 +532,21 @@ func TestManager_ArmedGate_RetainedReStartOverlap(t *testing.T) {
 	<-entered
 
 	type pendingCall struct {
-		name string
-		done chan error
+		name    string
+		started chan struct{}
+		done    chan error
 	}
 	var pending []pendingCall
 	for name, call := range invoke {
-		p := pendingCall{name: name, done: make(chan error, 1)}
-		go func(c func(m *Manager) error, d chan error) { d <- c(m) }(call, p.done)
+		p := pendingCall{name: name, started: make(chan struct{}), done: make(chan error, 1)}
+		go func(c func(m *Manager) error, p pendingCall) {
+			close(p.started)
+			p.done <- c(m)
+		}(call, p)
 		pending = append(pending, p)
+	}
+	for _, p := range pending {
+		<-p.started
 	}
 	time.Sleep(150 * time.Millisecond)
 	for _, p := range pending {
@@ -626,11 +651,14 @@ func TestManager_ArmedGate_LookupOwnership(t *testing.T) {
 			}()
 			<-entered // the helper holds m.mu
 
+			pubStarted := make(chan struct{})
 			pubDone := make(chan struct{})
 			go func() {
 				defer close(pubDone)
+				close(pubStarted) // arrival handshake before the contended call (r2-5b)
 				m.publishShimRegistryLocked(nil, map[string]*ebpf.Map{"sessions": nil}, nil)
 			}()
+			<-pubStarted
 			select {
 			case <-pubDone:
 				t.Fatal("publisher completed while the lookup helper held m.mu")
@@ -671,8 +699,13 @@ func TestManager_ArmedGate_SwapXDPEntryProgOwnership(t *testing.T) {
 	go func() { swapDone <- m.swapXDPEntryProg("test_prog") }()
 	<-entered // the :632 write section holds m.mu
 
+	getterStarted := make(chan struct{})
 	getterDone := make(chan string, 1)
-	go func() { getterDone <- m.XDPEntryProgram() }()
+	go func() {
+		close(getterStarted) // arrival handshake (r2-5b)
+		getterDone <- m.XDPEntryProgram()
+	}()
+	<-getterStarted
 	select {
 	case got := <-getterDone:
 		t.Fatalf("XDPEntryProgram() = %q during the swap write hold — the getter did not block", got)
@@ -718,8 +751,13 @@ func TestManager_ArmedGate_XDPSelectorTwoSided(t *testing.T) {
 	}()
 	<-entered // the selector write section holds m.mu
 
+	getterStarted := make(chan struct{})
 	getterDone := make(chan string, 1)
-	go func() { getterDone <- m.XDPEntryProgram() }()
+	go func() {
+		close(getterStarted) // arrival handshake (r2-5b)
+		getterDone <- m.XDPEntryProgram()
+	}()
+	<-getterStarted
 	select {
 	case got := <-getterDone:
 		t.Fatalf("XDPEntryProgram() = %q during the selector write hold — did not block", got)
@@ -785,8 +823,13 @@ func TestManager_ArmedGate_DetachRetainedClaims(t *testing.T) {
 	startDone := runSyntheticStart(t, m, map[string]*ebpf.Map{"sentinel_restart": nil})
 	<-entered
 
+	detachStarted := make(chan struct{})
 	detachDone := make(chan error, 1)
-	go func() { detachDone <- m.DetachXDP(ifindex) }()
+	go func() {
+		close(detachStarted) // arrival handshake (r2-5b)
+		detachDone <- m.DetachXDP(ifindex)
+	}()
+	<-detachStarted
 	select {
 	case err := <-detachDone:
 		t.Fatalf("DetachXDP completed (%v) during the publication hold — its registry lookup did not block", err)
@@ -898,19 +941,24 @@ func TestManager_ArmedGate_SeedInterfaceCounterNilGuard(t *testing.T) {
 // the mixed-method CONTINUATION behavior that a premature optional-miss
 // return would break. Skips where BPF map creation is unavailable.
 //
-// Coverage note (Codex PR #6743 M5 disposition): Compile's absent-
-// redirect_capable continuation (compiler.go:353 skip-and-continue into
-// the attachment work) is NOT unit-legged here — reaching :353 requires a
-// full successful zone compile (real BPF maps for every required write)
-// plus a netlink XDP attach, which a sandboxed/hostile-environment test
-// cannot perform safely. It is covered in production instead: the retained
-// shim's registry NEVER contains redirect_capable (neither
-// userspacePinnedShimMaps nor userspaceShimSharedMapSpecs declares it),
-// so every userspace compile takes the skip-and-continue path — the
-// loss-cluster smoke lanes (Pass A/B + the HA failover/crash batteries)
-// exercise it on every commit, and the redirect-map population it skips is
-// inert on the userspace dataplane (the legacy xdp_forward consumer was
-// deleted in #1476).
+// Coverage note (Codex PR #6743 r2-6 — the r1 production-coverage
+// disposition was REBUTTED and is corrected here): root
+// (*dataplane.Manager).Compile is DEAD IN PRODUCTION — the daemon's
+// runtime dataplane is always the userspace adapter, whose compile path
+// runs CompileUserspaceShim (userspace/manager_compile.go), never the
+// root Compile (compiler.go:316). The root Compile remains only as a
+// retired-DataPlane interface obligation, so its :353 continuation
+// outcome is a dead-surface property; reaching :353 in a unit test would
+// require a full successful zone compile (every required map seeded)
+// plus netlink interface mutation, which no test environment may perform
+// safely. What IS pinned: (a) the :353 read goes through the scoped
+// registry helper, so even a hypothetical live call is race-safe; (b)
+// the daemon-constructor pin in pkg/daemon
+// (TestRuntimeDataplaneNeverBareRootManager) fails if the root Manager
+// ever becomes the daemon's dataplane again — which would make :353
+// live and REQUIRE a continuation leg at that time; (c) Compile's
+// fresh/retained outcomes (the CompileConfig loaded rejection on both
+// unarmed states) are asserted directly in the fresh/retained legs above.
 func TestManager_ArmedGate_ContinuationLegsPrivileged(t *testing.T) {
 	newArray := func(st *testing.T, name string, valueSize, maxEntries uint32) *ebpf.Map {
 		m, err := ebpf.NewMap(&ebpf.MapSpec{
@@ -1053,6 +1101,29 @@ func TestManager_ArmedGate_ContinuationLegsPrivileged(t *testing.T) {
 			}
 		})
 
+		t.Run(name+"_SessionCount_both_present", func(t *testing.T) {
+			// Both-present complement of the absent-first leg (Codex PR
+			// #6743 r2-7): the continuation leg alone would pass if the
+			// first map's count were dropped entirely.
+			m := New()
+			v4 := newHash(t, "sessions", uint32(sizeOf[SessionKey]()), ConntrackSessionValueSize, 8)
+			v6 := newHash(t, "sessions_v6", uint32(sizeOf[SessionKeyV6]()), ConntrackSessionValueSizeV6, 8)
+			m.maps["sessions"] = v4
+			m.maps["sessions_v6"] = v6
+			m.loaded.Store(armed)
+
+			if err := v4.Update(SessionKey{Protocol: 6}, make([]byte, ConntrackSessionValueSize), ebpf.UpdateAny); err != nil {
+				t.Fatalf("seed sessions: %v", err)
+			}
+			if err := v6.Update(SessionKeyV6{Protocol: 6}, make([]byte, ConntrackSessionValueSizeV6), ebpf.UpdateAny); err != nil {
+				t.Fatalf("seed sessions_v6: %v", err)
+			}
+			got4, got6 := m.SessionCount()
+			if got4 != 1 || got6 != 1 {
+				t.Fatalf("SessionCount = (%d,%d), want (1,1) — both families counted", got4, got6)
+			}
+		})
+
 		t.Run(name+"_ClearSessionCounts_absent_first_map_continues", func(t *testing.T) {
 			// session_count_src ABSENT, dst present with an entry — the
 			// loop's first-miss continue must reach the second map.
@@ -1071,6 +1142,85 @@ func TestManager_ArmedGate_ContinuationLegsPrivileged(t *testing.T) {
 			var out SessionCountValue
 			if err := dst.Lookup(k, &out); !errors.Is(err, ebpf.ErrKeyNotExist) {
 				t.Fatalf("dst entry survives (err=%v) — the loop's first-miss continue did not reach the second map", err)
+			}
+		})
+
+		t.Run(name+"_ClearSessionCounts_both_present", func(t *testing.T) {
+			// Both-present complement (r2-7): dropping the source map's
+			// clear must fail here even though the absent-first leg passes.
+			m := New()
+			srcM := newHash(t, "session_count_src", uint32(sizeOf[SessionCountKey]()), uint32(sizeOf[SessionCountValue]()), 8)
+			dstM := newHash(t, "session_count_dst", uint32(sizeOf[SessionCountKey]()), uint32(sizeOf[SessionCountValue]()), 8)
+			m.maps["session_count_src"] = srcM
+			m.maps["session_count_dst"] = dstM
+			m.loaded.Store(armed)
+
+			k := SessionCountKey{}
+			if err := srcM.Update(k, SessionCountValue{Count: 3}, ebpf.UpdateAny); err != nil {
+				t.Fatalf("seed src: %v", err)
+			}
+			if err := dstM.Update(k, SessionCountValue{Count: 4}, ebpf.UpdateAny); err != nil {
+				t.Fatalf("seed dst: %v", err)
+			}
+			if err := m.ClearSessionCounts(); err != nil {
+				t.Fatalf("ClearSessionCounts = %v", err)
+			}
+			var out SessionCountValue
+			if err := srcM.Lookup(k, &out); !errors.Is(err, ebpf.ErrKeyNotExist) {
+				t.Fatalf("src entry survives (err=%v) — the first map was not cleared", err)
+			}
+			if err := dstM.Lookup(k, &out); !errors.Is(err, ebpf.ErrKeyNotExist) {
+				t.Fatalf("dst entry survives (err=%v) — the second map was not cleared", err)
+			}
+		})
+
+		t.Run(name+"_ZeroStaleNATPoolConfigs_all_present", func(t *testing.T) {
+			// All-three-present complement (r2-7 "middle" continuation):
+			// configs AND both IP maps present — every map must be zeroed
+			// from startID, not just the first.
+			m := New()
+			cfgs := newArray(t, "nat_pool_configs", uint32(sizeOf[NATPoolConfig]()), 32)
+			v4 := newArray(t, "nat_pool_ips_v4", 4, 32*MaxNATPoolIPsPerPool)
+			v6 := newArray(t, "nat_pool_ips_v6", uint32(sizeOf[NATPoolIPV6]()), 32*MaxNATPoolIPsPerPool)
+			m.maps["nat_pool_configs"] = cfgs
+			m.maps["nat_pool_ips_v4"] = v4
+			m.maps["nat_pool_ips_v6"] = v6
+			m.loaded.Store(armed)
+
+			cfg := NATPoolConfig{NumIPs: 7}
+			if err := cfgs.Update(3, cfg, ebpf.UpdateAny); err != nil {
+				t.Fatalf("seed nat_pool_configs: %v", err)
+			}
+			slot := uint32(3 * MaxNATPoolIPsPerPool)
+			if err := v4.Update(slot, uint32(0x0a000001), ebpf.UpdateAny); err != nil {
+				t.Fatalf("seed v4: %v", err)
+			}
+			v6val := NATPoolIPV6{}
+			v6val.IP[0] = 0x2a
+			if err := v6.Update(slot, v6val, ebpf.UpdateAny); err != nil {
+				t.Fatalf("seed v6: %v", err)
+			}
+			m.ZeroStaleNATPoolConfigs(3)
+			var backCfg NATPoolConfig
+			if err := cfgs.Lookup(uint32(3), &backCfg); err != nil {
+				t.Fatalf("read back configs: %v", err)
+			}
+			if backCfg != (NATPoolConfig{}) {
+				t.Fatalf("nat_pool_configs[3] = %+v, want zero (all-present continuation)", backCfg)
+			}
+			var got4 uint32
+			if err := v4.Lookup(slot, &got4); err != nil {
+				t.Fatalf("read back v4: %v", err)
+			}
+			if got4 != 0 {
+				t.Fatalf("nat_pool_ips_v4 slot = %#x, want 0", got4)
+			}
+			var got6 NATPoolIPV6
+			if err := v6.Lookup(slot, &got6); err != nil {
+				t.Fatalf("read back v6: %v", err)
+			}
+			if got6 != (NATPoolIPV6{}) {
+				t.Fatalf("nat_pool_ips_v6 slot = %+v, want zero", got6)
 			}
 		})
 

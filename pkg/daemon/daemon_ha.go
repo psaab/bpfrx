@@ -713,8 +713,11 @@ func (d *Daemon) reconcileRGState() {
 	// shared across the per-RG actuation loop below — a mid-pass cell clear
 	// must not let one RG actuate through the old backend while a later RG
 	// observes nil and skips its deactivation (which could leave
-	// rg_active=true set as the peer takes ownership).
+	// rg_active=true set as the peer takes ownership). The userspace-active
+	// mode check and the per-RG readiness/blackhole helpers are fed the
+	// SAME snapshot (Codex PR #6743 r2-1 — no transitive per-RG reloads).
 	reconcileDP := d.dataplane()
+	reconcileDPUserspaceActive := d.userspaceDataplaneActiveFor(reconcileDP)
 
 	// #2156 (B1): re-drive the VRRP instance set from the active config on
 	// every reconcile pass. Combined with the build-before-teardown
@@ -793,7 +796,7 @@ func (d *Daemon) reconcileRGState() {
 	if mon := d.cluster.Monitor(); mon != nil {
 		for _, rgID := range rgIDs {
 			ifReady, ifReasons := mon.RGInterfaceReady(rgID)
-			ready, reasons := d.takeoverReadinessForRG(rgID, ifReady, ifReasons, fabricReady, noRethVRRP)
+			ready, reasons := d.takeoverReadinessForRG(reconcileDP, rgID, ifReady, ifReasons, fabricReady, noRethVRRP)
 			d.cluster.SetRGReady(rgID, ready, reasons)
 		}
 	}
@@ -844,7 +847,7 @@ func (d *Daemon) reconcileRGState() {
 			} else {
 				// Deactivation ordering: blackholes FIRST, then
 				// clear rg_active.
-				d.injectBlackholeRoutes(rgID)
+				d.injectBlackholeRoutesFor(reconcileDPUserspaceActive, rgID)
 				d.tryPrepareUserspaceRGDemotion(rgID)
 				if err := reconcileDP.HA().SetRGActive(context.Background(), rgID, false); err != nil {
 					if s.ShouldLogApplyError(err.Error()) {
@@ -862,9 +865,9 @@ func (d *Daemon) reconcileRGState() {
 		// set that should exist regardless of prior transition results.
 		// Active RGs should NOT have blackholes; inactive RGs SHOULD.
 		if tr.Active {
-			d.removeBlackholeRoutes(rgID)
+			d.removeBlackholeRoutesFor(reconcileDPUserspaceActive, rgID)
 		} else {
-			d.injectBlackholeRoutes(rgID)
+			d.injectBlackholeRoutesFor(reconcileDPUserspaceActive, rgID)
 		}
 
 		// VRRP posture reconciliation (#86): detect sustained mismatch
@@ -1069,7 +1072,16 @@ func rethInterfacesForRG(cfg *config.Config, rgID int) []string {
 // return traffic via the default route (which would escape via WAN). Instead,
 // FIB returns BLACKHOLE and the BPF failure handler triggers fabric redirect.
 func (d *Daemon) injectBlackholeRoutes(rgID int) {
-	if d.userspaceDataplaneActive() {
+	d.injectBlackholeRoutesFor(d.userspaceDataplaneActive(), rgID)
+}
+
+// injectBlackholeRoutesFor is injectBlackholeRoutes with the
+// userspace-active mode decision supplied by the caller, so a reconcile
+// pass evaluates all RGs against ONE dataplane snapshot (#2114, Codex PR
+// #6743 r2-1). Event-path callers keep the per-invocation load via the
+// zero-arg wrapper.
+func (d *Daemon) injectBlackholeRoutesFor(userspaceActive bool, rgID int) {
+	if userspaceActive {
 		return
 	}
 	d.blackholeMu.Lock()
@@ -1128,7 +1140,14 @@ func (d *Daemon) injectBlackholeRoutes(rgID int) {
 // given RG. Called on VRRP MASTER transition — the connected route returns
 // naturally when the VIP is added back.
 func (d *Daemon) removeBlackholeRoutes(rgID int) {
-	if d.userspaceDataplaneActive() {
+	d.removeBlackholeRoutesFor(d.userspaceDataplaneActive(), rgID)
+}
+
+// removeBlackholeRoutesFor is removeBlackholeRoutes with the
+// userspace-active mode decision supplied by the caller (#2114, Codex PR
+// #6743 r2-1 — see injectBlackholeRoutesFor).
+func (d *Daemon) removeBlackholeRoutesFor(userspaceActive bool, rgID int) {
+	if userspaceActive {
 		return
 	}
 	d.blackholeMu.Lock()

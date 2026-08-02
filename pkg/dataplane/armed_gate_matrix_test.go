@@ -348,14 +348,6 @@ func registryCanaryViolations(t *testing.T, root string) []string {
 	if err != nil {
 		t.Fatalf("read %s: %v", root, err)
 	}
-	isManagerStar := func(expr ast.Expr) bool {
-		star, ok := expr.(*ast.StarExpr)
-		if !ok {
-			return false
-		}
-		id, ok := star.X.(*ast.Ident)
-		return ok && id.Name == "Manager"
-	}
 	var violations []string
 	for _, entry := range entries {
 		name := entry.Name()
@@ -367,6 +359,41 @@ func registryCanaryViolations(t *testing.T, root string) []string {
 		file, err := parser.ParseFile(fset, path, nil, 0)
 		if err != nil {
 			t.Fatalf("parse %s: %v", path, err)
+		}
+		// Type aliases declared at file scope (`type X = Manager`) resolve
+		// to Manager for receiver/param typing (Codex PR #6743 r2-3).
+		managerAliases := map[string]bool{"Manager": true}
+		for _, decl := range file.Decls {
+			gd, ok := decl.(*ast.GenDecl)
+			if !ok {
+				continue
+			}
+			for _, spec := range gd.Specs {
+				ts, ok := spec.(*ast.TypeSpec)
+				if !ok || ts.Assign == token.NoPos {
+					continue
+				}
+				if id, ok := ts.Type.(*ast.Ident); ok && id.Name == "Manager" {
+					managerAliases[ts.Name.Name] = true
+				}
+			}
+		}
+		// isManagerStar recognizes *Manager and Manager-typed (or
+		// file-scope-aliased) receivers/params — including value params of
+		// an aliased struct type, whose map field copy still aliases the
+		// shared registry (Codex PR #6743 r2-3).
+		var isManagerStar func(ast.Expr) bool
+		isManagerStar = func(expr ast.Expr) bool {
+			switch t := expr.(type) {
+			case *ast.StarExpr:
+				id, ok := t.X.(*ast.Ident)
+				return ok && managerAliases[id.Name]
+			case *ast.Ident:
+				return managerAliases[t.Name]
+			case *ast.ParenExpr:
+				return isManagerStar(t.X)
+			}
+			return false
 		}
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
@@ -396,27 +423,66 @@ func registryCanaryViolations(t *testing.T, root string) []string {
 					}
 				}
 			}
+			// The lock-credit set is the RECEIVER's own alias closure only —
+			// locking a *Manager PARAMETER (possibly a different object)
+			// must not count as holding this registry's lock (Codex PR
+			// #6743 r2-3).
+			lockOwners := map[string]bool{}
+			if fn.Recv != nil {
+				for _, rf := range fn.Recv.List {
+					if isManagerStar(rf.Type) {
+						for _, n := range rf.Names {
+							lockOwners[n.Name] = true
+						}
+					}
+				}
+			}
 			if len(owners) > 0 {
-				// One-level alias propagation: x := <owner> makes x an owner.
-				ast.Inspect(fn.Body, func(n ast.Node) bool {
-					as, ok := n.(*ast.AssignStmt)
-					if !ok {
-						return true
-					}
-					if len(as.Lhs) != len(as.Rhs) {
-						return true
-					}
-					for i, rhs := range as.Rhs {
-						id, ok := rhs.(*ast.Ident)
-						if !ok || !owners[id.Name] {
-							continue
+				// Alias propagation to a fixpoint: x := <owner> makes x an
+				// owner; iterate so a := m; b := a resolves (r2-3).
+				for changed := true; changed; {
+					changed = false
+					ast.Inspect(fn.Body, func(n ast.Node) bool {
+						as, ok := n.(*ast.AssignStmt)
+						if !ok {
+							return true
 						}
-						if lid, ok := as.Lhs[i].(*ast.Ident); ok {
-							owners[lid.Name] = true
+						if len(as.Lhs) != len(as.Rhs) {
+							return true
 						}
-					}
-					return true
-				})
+						for i, rhs := range as.Rhs {
+							id, ok := rhs.(*ast.Ident)
+							if !ok || !owners[id.Name] {
+								continue
+							}
+							if lid, ok := as.Lhs[i].(*ast.Ident); ok && !owners[lid.Name] {
+								owners[lid.Name] = true
+								changed = true
+							}
+						}
+						return true
+					})
+				}
+				for changed := true; changed; {
+					changed = false
+					ast.Inspect(fn.Body, func(n ast.Node) bool {
+						as, ok := n.(*ast.AssignStmt)
+						if !ok || len(as.Lhs) != len(as.Rhs) {
+							return true
+						}
+						for i, rhs := range as.Rhs {
+							id, ok := rhs.(*ast.Ident)
+							if !ok || !lockOwners[id.Name] {
+								continue
+							}
+							if lid, ok := as.Lhs[i].(*ast.Ident); ok && !lockOwners[lid.Name] {
+								lockOwners[lid.Name] = true
+								changed = true
+							}
+						}
+						return true
+					})
+				}
 			}
 
 			// Lock/unlock positions and the receiver-scoped loaded.Store(true).
@@ -424,6 +490,7 @@ func registryCanaryViolations(t *testing.T, root string) []string {
 			var directUnlocks []token.Pos
 			storeTrueCount := 0
 			var storeTruePos token.Pos
+			var shapeViolations []string
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
 				switch node := n.(type) {
 				case *ast.DeferStmt:
@@ -437,8 +504,18 @@ func registryCanaryViolations(t *testing.T, root string) []string {
 					if !ok {
 						return true
 					}
-					recvID, ok := recvSel.X.(*ast.Ident)
-					if !ok || !owners[recvID.Name] {
+					var recvID *ast.Ident
+					switch x := recvSel.X.(type) {
+					case *ast.Ident:
+						recvID = x
+					case *ast.ParenExpr: // (*m).mu.… — Codex PR #6743 r2-3
+						if st, ok2 := x.X.(*ast.StarExpr); ok2 {
+							recvID, _ = st.X.(*ast.Ident)
+						} else {
+							recvID, _ = x.X.(*ast.Ident)
+						}
+					}
+					if recvID == nil || !lockOwners[recvID.Name] {
 						return true
 					}
 					switch {
@@ -460,8 +537,44 @@ func registryCanaryViolations(t *testing.T, root string) []string {
 				return true
 			})
 
+			// Method-value lock/unlock aliases (Codex PR #6743 r2-5a):
+			// `u := m.mu.Unlock; u()` releases the hold invisible to the
+			// direct-call scan — flag the method-value assignment itself.
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				as, ok := n.(*ast.AssignStmt)
+				if !ok {
+					return true
+				}
+				for _, rhs := range as.Rhs {
+					sel, ok := rhs.(*ast.SelectorExpr)
+					if !ok || (sel.Sel.Name != "Unlock" && sel.Sel.Name != "Lock") {
+						continue
+					}
+					muSel, ok := sel.X.(*ast.SelectorExpr)
+					if !ok || muSel.Sel.Name != "mu" {
+						continue
+					}
+					var recvID *ast.Ident
+					switch x := muSel.X.(type) {
+					case *ast.Ident:
+						recvID = x
+					case *ast.ParenExpr:
+						if st, ok2 := x.X.(*ast.StarExpr); ok2 {
+							recvID, _ = st.X.(*ast.Ident)
+						} else {
+							recvID, _ = x.X.(*ast.Ident)
+						}
+					}
+					if recvID == nil || !lockOwners[recvID.Name] {
+						continue
+					}
+					shapeViolations = append(shapeViolations,
+						fmt.Sprintf("%s:%s: m.mu.%s taken as a method value in %s — the lock operation escapes the lexical scan", name, fset.Position(as.Pos()), sel.Sel.Name, fn.Name.Name))
+				}
+				return true
+			})
+
 			// Registry references with shape + domination classification.
-			var shapeViolations []string
 			var lastWritePos token.Pos
 			var stack []ast.Node
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
@@ -477,7 +590,18 @@ func registryCanaryViolations(t *testing.T, root string) []string {
 					return true
 				}
 				recv, ok := sel.X.(*ast.Ident)
-				if !ok || !owners[recv.Name] {
+				if !ok {
+					// (*m).maps — the parens wrap a StarExpr, so unwrap
+					// both layers (Codex PR #6743 r2-3).
+					if pe, ok2 := sel.X.(*ast.ParenExpr); ok2 {
+						if st, ok3 := pe.X.(*ast.StarExpr); ok3 {
+							recv, ok = st.X.(*ast.Ident)
+						} else {
+							recv, ok = pe.X.(*ast.Ident)
+						}
+					}
+				}
+				if !ok || recv == nil || !owners[recv.Name] {
 					return true
 				}
 				pos := fset.Position(sel.Pos())
@@ -680,6 +804,46 @@ func (m *Manager) publishShimRegistryLocked(prog *ebpf.Program, collMaps map[str
 	m.loaded.Store(true)
 }
 `
+	parenReceiver := `package dataplane
+
+func (m *Manager) sneakyParen(name string) *ebpf.Map {
+	return (*m).maps[name]
+}
+`
+	twoHopAlias := `package dataplane
+
+func (m *Manager) sneakyTwoHop(name string) *ebpf.Map {
+	a := m
+	b := a
+	return b.maps[name]
+}
+`
+	typeAliasParam := `package dataplane
+
+type managerAlias = Manager
+
+func sneakyAliasParam(mgr managerAlias, name string) *ebpf.Map {
+	return mgr.maps[name]
+}
+`
+	methodValueUnlock := `package dataplane
+
+func (m *Manager) lookupMapLocked(name string) (h *ebpf.Map, present bool, st registryState) {
+	m.mu.Lock()
+	u := m.mu.Unlock
+	u()
+	h, present = m.maps[name]
+	return h, present, registryFresh
+}
+`
+	paramLockNotCredited := `package dataplane
+
+func (m *Manager) lookupMapLocked(other *Manager, name string) *ebpf.Map {
+	other.mu.Lock()
+	defer other.mu.Unlock()
+	return m.maps[name]
+}
+`
 
 	dir := t.TempDir()
 	write := func(n, src string) {
@@ -700,13 +864,20 @@ func (m *Manager) publishShimRegistryLocked(prog *ebpf.Program, collMaps map[str
 	write("bad_recv_alias.go", aliasReceiver)
 	write("bad_nolock.go", noLockAllowlisted)
 	write("bad_store_order.go", storeAfterUnlock)
+	write("bad_paren.go", parenReceiver)
+	write("bad_twohop.go", twoHopAlias)
+	write("bad_typealias.go", typeAliasParam)
+	write("bad_methodvalue.go", methodValueUnlock)
+	write("bad_paramlock.go", paramLockNotCredited)
 	violations := registryCanaryViolations(t, dir)
 	saw := map[string]bool{}
 	for _, v := range violations {
 		switch {
 		case strings.Contains(v, "in sneaky ") && strings.Contains(v, "outside the allowlist"):
 			saw["raw"] = true
-		case strings.Contains(v, "sneakyAlias") && strings.Contains(v, "outside the allowlist"):
+		case strings.Contains(v, "in sneakyAliasParam ") && strings.Contains(v, "outside the allowlist"):
+			saw["typealias"] = true
+		case strings.Contains(v, "in sneakyAlias ") && strings.Contains(v, "outside the allowlist"):
 			saw["recvAlias"] = true
 		case strings.Contains(v, "sneakyRenamed") && strings.Contains(v, "outside the allowlist"):
 			saw["renamedRecv"] = true
@@ -714,13 +885,21 @@ func (m *Manager) publishShimRegistryLocked(prog *ebpf.Program, collMaps map[str
 			saw["alias"] = true
 		case strings.Contains(v, "unlock-before-access"):
 			saw["unlock"] = true
+		case strings.Contains(v, "bad_paramlock.go") && strings.Contains(v, "without any m.mu.Lock"):
+			saw["paramlock"] = true
 		case strings.Contains(v, "without any m.mu.Lock"):
 			saw["nolock"] = true
 		case strings.Contains(v, "Store(true) follows a direct Unlock"):
 			saw["storeOrder"] = true
+		case strings.Contains(v, "sneakyParen"):
+			saw["paren"] = true
+		case strings.Contains(v, "sneakyTwoHop"):
+			saw["twohop"] = true
+		case strings.Contains(v, "method value"):
+			saw["methodvalue"] = true
 		}
 	}
-	for _, k := range []string{"raw", "recvAlias", "renamedRecv", "alias", "unlock", "nolock", "storeOrder"} {
+	for _, k := range []string{"raw", "recvAlias", "renamedRecv", "alias", "unlock", "nolock", "storeOrder", "paren", "twohop", "typealias", "methodvalue", "paramlock"} {
 		if !saw[k] {
 			t.Errorf("canary missed synthetic negative %q; violations:\n%s", k, strings.Join(violations, "\n"))
 		}
@@ -1051,21 +1230,34 @@ func gatedCallsiteEvidence(t *testing.T, root string) map[string]gatedEvidence {
 							if id, ok := as.Lhs[2].(*ast.Ident); ok && id.Name != "_" {
 								ev.bound = true
 								boundName := id.Name
+								// Codex PR #6743 r2-4: the comparison must
+								// reference THIS callsite's binding, appear
+								// AFTER the assignment, and NOT inside a
+								// nested closure — a comparison anywhere
+								// else in the function must not satisfy the
+								// gate evidence for this callsite.
 								ast.Inspect(g.body, func(n3 ast.Node) bool {
-									be, ok := n3.(*ast.BinaryExpr)
-									if !ok || be.Op.String() != "==" {
-										return true
-									}
-									var leftName, rightName string
-									if id, ok := be.X.(*ast.Ident); ok {
-										leftName = id.Name
-									}
-									if id, ok := be.Y.(*ast.Ident); ok {
-										rightName = id.Name
-									}
-									if (leftName == boundName && rightName == "registryFresh") ||
-										(leftName == "registryFresh" && rightName == boundName) {
-										ev.compared = true
+									switch node := n3.(type) {
+									case *ast.FuncLit:
+										return false // comparisons inside closures do not count
+									case *ast.BinaryExpr:
+										if node.Pos() <= as.Pos() {
+											return true // must come after the binding
+										}
+										if node.Op != token.EQL {
+											return true
+										}
+										var leftName, rightName string
+										if id, ok := node.X.(*ast.Ident); ok {
+											leftName = id.Name
+										}
+										if id, ok := node.Y.(*ast.Ident); ok {
+											rightName = id.Name
+										}
+										if (leftName == boundName && rightName == "registryFresh") ||
+											(leftName == "registryFresh" && rightName == boundName) {
+											ev.compared = true
+										}
 									}
 									return true
 								})
@@ -1115,6 +1307,29 @@ func (m *Manager) bad(name string) error {
 	return nil
 }
 `
+	closureCompare := `package dataplane
+
+func (m *Manager) closureBad(name string) error {
+	zm, present, st := m.lookupMapLocked(name)
+	_ = zm
+	_ = present
+	f := func() bool { return st == registryFresh } // never called
+	_ = f
+	return nil
+}
+`
+	earlyCompare := `package dataplane
+
+func (m *Manager) earlyBad(name string) error {
+	var st registryState
+	if st == registryFresh { // compares st BEFORE the lookup assignment reuses it
+		return ErrDataplaneNotArmed
+	}
+	zm, present, st := m.lookupMapLocked(name)
+	_, _ = zm, present
+	return nil
+}
+`
 	blanked := `package dataplane
 
 func (m *Manager) blank(name string) error {
@@ -1136,6 +1351,8 @@ func (m *Manager) blank(name string) error {
 	write("a.go", compared)
 	write("b.go", bindIgnore)
 	write("c.go", blanked)
+	write("d.go", closureCompare)
+	write("e.go", earlyCompare)
 
 	ev := gatedCallsiteEvidence(t, dir)
 	if got := ev["a.go|good|map|<ident:name>"].bound && ev["a.go|good|map|<ident:name>"].compared; !got {
@@ -1149,6 +1366,15 @@ func (m *Manager) blank(name string) error {
 	}
 	if ev["c.go|blank|map|<ident:name>"].bound {
 		t.Error("blanked fixture must not register a binding")
+	}
+	// Codex PR #6743 r2-4 negatives: a comparison inside a never-called
+	// closure and a comparison positioned BEFORE the binding must NOT
+	// satisfy the gate evidence.
+	if ev["d.go|closureBad|map|<ident:name>"].compared {
+		t.Error("closure comparison must not count as gate evidence")
+	}
+	if got := ev["e.go|earlyBad|map|<ident:name>"]; got.compared {
+		t.Error("pre-binding comparison must not count as gate evidence")
 	}
 }
 

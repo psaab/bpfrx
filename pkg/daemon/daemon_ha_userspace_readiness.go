@@ -194,12 +194,51 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 	return nil
 }
 
+// takeoverReadinessForRG evaluates the per-RG takeover gate against rt,
+// the caller's per-pass dataplane snapshot (#2114: one publication read
+// per reconcile pass, Codex PR #6743 r2-1).
+func (d *Daemon) takeoverReadinessForRG(rt dataplane.RuntimeDataPlane, rgID int, ifReady bool, ifReasons []string, fabricReady, noRethVRRP bool) (bool, []string) {
+	var takeoverGateReady bool
+	var takeoverGateReasons []string
+	if noRethVRRP {
+		// This reduces the no-RETH VRRP/takeover gate component to
+		// whether VIP ownership can be established on the local node.
+		takeoverGateReady, takeoverGateReasons = d.checkNoRethTakeoverReadiness(rgID)
+	} else if d.vrrpMgr != nil {
+		hasRETH := rgHasRETH(d.store.ActiveConfig(), rgID)
+		takeoverGateReady, takeoverGateReasons = d.vrrpMgr.RGVRRPReady(rgID, hasRETH)
+	} else {
+		takeoverGateReady = true // no VRRP = always ready
+	}
+
+	userspaceReady, userspaceReasons := d.checkUserspaceTakeoverReadinessFor(rt, rgID)
+	ready := ifReady && takeoverGateReady && fabricReady && userspaceReady
+
+	var reasons []string
+	reasons = append(reasons, ifReasons...)
+	reasons = append(reasons, takeoverGateReasons...)
+	if !fabricReady {
+		reasons = append(reasons, "fabric forwarding path not ready")
+	}
+	reasons = append(reasons, userspaceReasons...)
+	return ready, reasons
+}
+
 // userspaceDataplaneActive returns true when the userspace dataplane is
 // running in a mode that handles forwarding (not eBPF-only). Callers use
 // this to skip eBPF-specific workarounds (blackhole routes) that the
-// userspace pipeline doesn't need.
+// userspace pipeline doesn't need. It takes ONE fresh cell load per call;
+// multi-RG loops (the reconcile pass) must hoist a per-pass snapshot and
+// use userspaceDataplaneActiveFor instead (#2114, Codex PR #6743 r2-1).
 func (d *Daemon) userspaceDataplaneActive() bool {
-	if runtime, ok := d.dataplane().(userspaceRuntimeModeReporter); ok {
+	return d.userspaceDataplaneActiveFor(d.dataplane())
+}
+
+// userspaceDataplaneActiveFor is userspaceDataplaneActive against a
+// caller-supplied snapshot, so a reconcile pass evaluates every RG against
+// ONE published dataplane instead of reloading per RG.
+func (d *Daemon) userspaceDataplaneActiveFor(rt dataplane.RuntimeDataPlane) bool {
+	if runtime, ok := rt.(userspaceRuntimeModeReporter); ok {
 		return runtime.Mode() != dpuserspace.ModeEBPFOnly
 	}
 	return false
@@ -219,16 +258,23 @@ func userspaceRGConfigured(cfg *config.Config, rgID int) bool {
 
 // checkUserspaceTakeoverReadiness returns whether the userspace dataplane
 // is ready to take over forwarding for the given RG. Returns (true, nil)
-// for non-userspace RGs or when the dataplane is healthy.
+// for non-userspace RGs or when the dataplane is healthy. It takes ONE
+// fresh cell load per call; the reconcile pass must use
+// checkUserspaceTakeoverReadinessFor with its per-pass snapshot (#2114,
+// Codex PR #6743 r2-1).
 func (d *Daemon) checkUserspaceTakeoverReadiness(rgID int) (bool, []string) {
+	return d.checkUserspaceTakeoverReadinessFor(d.dataplane(), rgID)
+}
+
+// checkUserspaceTakeoverReadinessFor is checkUserspaceTakeoverReadiness
+// against a caller-supplied snapshot (one evaluation per reconcile pass).
+func (d *Daemon) checkUserspaceTakeoverReadinessFor(rt dataplane.RuntimeDataPlane, rgID int) (bool, []string) {
 	cfg := d.store.ActiveConfig()
 	if !userspaceRGConfigured(cfg, rgID) {
 		return true, nil
 	}
 	// Copilot fix: if the dataplane is unpublished or wrong type but config
 	// says userspace, the dataplane isn't ready — don't report takeover-ready.
-	// #2114: one snapshot feeds the nil-check and the assertion.
-	rt := d.dataplane()
 	if rt == nil {
 		return false, []string{fmt.Sprintf("userspace dataplane not initialized for RG %d", rgID)}
 	}

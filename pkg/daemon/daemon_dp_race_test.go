@@ -117,6 +117,29 @@ func (cellNilFuncDP) SessionDeltas() dpruntime.SessionDeltaSource {
 	return nil
 }
 
+// TestRuntimeDataplaneNeverBareRootManager pins the dead-surface
+// property the #2114 A3 Compile-continuation waiver rests on (Codex PR
+// #6743 r2-6): the daemon's runtime dataplane is NEVER the bare root
+// *dataplane.Manager — it is the userspace adapter — so the root
+// Manager.Compile (compiler.go) is unreachable in production and its
+// absent-redirect_capable continuation is a dead-surface property. If
+// this ever fails, the root Compile is live again and compiler.go:353's
+// continuation needs a real discriminating leg before merge.
+func TestRuntimeDataplaneNeverBareRootManager(t *testing.T) {
+	dp, err := buildRuntimeDataPlane("")
+	if err != nil {
+		t.Fatalf("buildRuntimeDataPlane: %v", err)
+	}
+	if _, bare := dp.(*dataplane.Manager); bare {
+		t.Fatal("the daemon's runtime dataplane is the bare root *dataplane.Manager")
+	}
+	if _, ok := dp.(interface {
+		Manager() *dpuserspace.Manager
+	}); !ok {
+		t.Fatalf("runtime dataplane = %T, want the userspace adapter (Manager() probe)", dp)
+	}
+}
+
 // failingStartUserspaceDP is the bootstrap-exit arm-failure fake: Start
 // invokes the optional barrier hook and then fails; the CachedStatus probe
 // keeps it on the userspace adapter path so the forwarding-status sampler
@@ -418,17 +441,53 @@ func TestBootstrapExit_RealSamplerOverlap(t *testing.T) {
 	t.Fatal("sampler did not quiesce after cancel")
 }
 
+// armedRecorderDP is the recurrence fake: it records Start/Teardown calls
+// so the rollback-rearm test can assert the SAME object is retained across
+// the rollback and re-Started on the re-arm (Codex PR #6743 r2-8).
+type armedRecorderDP struct {
+	runtimeOnlyApplyTestDP
+	startCalls    int
+	teardownCalls int
+	failStart     bool
+}
+
+func (f *armedRecorderDP) Start(context.Context) error {
+	f.startCalls++
+	if f.failStart {
+		return errors.New("synthetic re-arm failure (#2114 test)")
+	}
+	return nil
+}
+
+func (f *armedRecorderDP) Teardown() error {
+	f.teardownCalls++
+	return nil
+}
+
 // TestDataplaneCell_RollbackRearmRecurrence drives the full recurrence
 // with REAL helpers (plan §9): successful arm → monitor starts →
 // enterBootstrapMode (monitor discarded, dataplane torn down) → re-exit
 // with a failing Start → cell nil, no monitor, -race clean with
-// watchdog-shape readers churning throughout.
+// watchdog-shape readers churning throughout. The identity assertions pin
+// the retention contract (r2-8): the rollback's Teardown keeps the SAME
+// published object in the cell (a clear-on-teardown would strand the
+// corrected-commit re-arm), and the re-arm Starts THAT object — a fresh
+// replacement would re-arm into a dataplane whose teardown never ran.
 func TestDataplaneCell_RollbackRearmRecurrence(t *testing.T) {
+	// Codex PR #6743 r2-8: run the PRODUCTION teardown path (the default
+	// enterBootstrapMode branch → runBootstrapTeardownSteps → the real
+	// dataplane Teardown call), not the applyBodyForTest seam that skips
+	// it. linkDir is redirected to an empty temp dir so the networkd step
+	// removes nothing and never calls networkctl; d.frr is nil so the FRR
+	// step is skipped.
 	d := &Daemon{}
-	d.applyBodyForTest = func(_ *config.Config) {}
+	prevLinkDir := linkDir
+	linkDir = t.TempDir()
+	t.Cleanup(func() { linkDir = prevLinkDir })
 	d.natPoolAlarmTestTick = time.Millisecond
 	d.bootstrapMode.Store(false)
-	d.setDataplane(&runtimeOnlyApplyTestDP{})
+	backend := &armedRecorderDP{}
+	d.setDataplane(backend)
 
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -442,6 +501,9 @@ func TestDataplaneCell_RollbackRearmRecurrence(t *testing.T) {
 	if d.natPoolAlarm.Load() == nil {
 		t.Fatal("monitor must start on a successful arm")
 	}
+	if backend.startCalls != 1 || backend.teardownCalls != 0 {
+		t.Fatalf("after arm: start=%d teardown=%d, want 1/0", backend.startCalls, backend.teardownCalls)
+	}
 
 	// Roll back to bootstrap: the monitor is discarded, the dataplane
 	// object is torn down but the cell still holds it (retained for
@@ -452,14 +514,28 @@ func TestDataplaneCell_RollbackRearmRecurrence(t *testing.T) {
 	if d.natPoolAlarm.Load() != nil {
 		t.Fatal("enterBootstrapMode must discard the monitor")
 	}
+	// r2-8: the rollback's Teardown ran against the SAME object and the
+	// cell STILL HOLDS it — clearing on teardown would make the corrected
+	// re-arm construct nothing (or a fresh object whose teardown never
+	// ran).
+	if backend.teardownCalls != 1 {
+		t.Fatalf("rollback teardown calls = %d, want 1", backend.teardownCalls)
+	}
+	if got := d.dataplane(); got != dataplane.RuntimeDataPlane(backend) {
+		t.Fatalf("the cell must retain the SAME backend object across the rollback (got %T %p)", got, got)
+	}
 
-	// Re-exit with a failing Start: the cell clears, no monitor.
-	d.setDataplane(&failingStartUserspaceDP{})
+	// Re-exit with a failing Start on the SAME retained object: the cell
+	// clears, no monitor.
+	backend.failStart = true
 	d.bootstrapMode.Store(false)
 	d.armBootstrapExitDataplane(0)
 
 	close(stop)
 	<-done
+	if backend.startCalls != 2 {
+		t.Fatalf("re-arm Start calls = %d, want 2 (the retained object is re-Started, not replaced)", backend.startCalls)
+	}
 	if d.dataplane() != nil {
 		t.Fatal("cell must be cleared after the re-arm failure")
 	}

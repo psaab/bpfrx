@@ -49,15 +49,29 @@ func dpCellBypassViolations(t *testing.T, root string) []string {
 			t.Fatalf("parse %s: %v", path, err)
 		}
 		// Map every function declaration's body span to its name so a
-		// selector can be attributed to its enclosing function.
+		// selector can be attributed to its enclosing function. The match
+		// must be a *Daemon method — a same-named function or a method on
+		// another type is NOT the accessor (Codex PR #6743 r2-2: a
+		// compile-valid `func (bypass) setDataplane(...)` on an unrelated
+		// type otherwise bypasses the typed-nil normalization and the
+		// single-writer contract).
 		type fnSpan struct {
-			name string
-			body *ast.BlockStmt
+			name      string
+			body      *ast.BlockStmt
+			isDaemonM bool
 		}
 		var fns []fnSpan
 		for _, decl := range file.Decls {
 			if fn, ok := decl.(*ast.FuncDecl); ok && fn.Body != nil {
-				fns = append(fns, fnSpan{name: fn.Name.Name, body: fn.Body})
+				span := fnSpan{name: fn.Name.Name, body: fn.Body}
+				if fn.Recv != nil && len(fn.Recv.List) == 1 {
+					if star, ok := fn.Recv.List[0].Type.(*ast.StarExpr); ok {
+						if id, ok := star.X.(*ast.Ident); ok && id.Name == "Daemon" {
+							span.isDaemonM = true
+						}
+					}
+				}
+				fns = append(fns, span)
 			}
 		}
 		ast.Inspect(file, func(n ast.Node) bool {
@@ -66,13 +80,15 @@ func dpCellBypassViolations(t *testing.T, root string) []string {
 				return true
 			}
 			enclosing := "<file scope>"
+			isAccessor := false
 			for _, fn := range fns {
 				if fn.body.Pos() <= sel.Pos() && sel.Pos() < fn.body.End() {
 					enclosing = fn.name
+					isAccessor = fn.isDaemonM && dpCellAccessorFuncs[fn.name]
 					break
 				}
 			}
-			if !dpCellAccessorFuncs[enclosing] {
+			if !isAccessor {
 				pos := fset.Position(sel.Pos())
 				violations = append(violations,
 					name+":"+pos.String()+" references .dpCell outside the dataplane()/setDataplane() accessors (in "+enclosing+")")
@@ -125,6 +141,13 @@ func (d *Daemon) sneaky() int {
 	return d.dpCell.Load().v
 }
 `
+	typeCollision := clean + `
+type bypass struct{}
+
+func (b bypass) setDataplane(d *Daemon, v int) {
+	d.dpCell.Store(&dpSlot{v: v})
+}
+`
 
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "clean.go"), []byte(clean), 0o644); err != nil {
@@ -139,5 +162,19 @@ func (d *Daemon) sneaky() int {
 	violations := dpCellBypassViolations(t, dir)
 	if len(violations) != 1 || !strings.Contains(violations[0], "sneaky") {
 		t.Fatalf("bypass fixture violations = %v, want exactly one naming sneaky", violations)
+	}
+
+	// The cross-type name-collision fixture must also fail: a setDataplane
+	// method on an unrelated type is not the accessor.
+	dir2 := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir2, "clean.go"), []byte(clean), 0o644); err != nil {
+		t.Fatalf("write clean fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir2, "collision.go"), []byte(typeCollision), 0o644); err != nil {
+		t.Fatalf("write collision fixture: %v", err)
+	}
+	violations2 := dpCellBypassViolations(t, dir2)
+	if len(violations2) != 1 || !strings.Contains(violations2[0], "collision.go") {
+		t.Fatalf("type-collision fixture violations = %v, want exactly one in collision.go", violations2)
 	}
 }

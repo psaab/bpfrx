@@ -66493,3 +66493,46 @@ break — `go vet` confirmed passing under every revert.
   listing or a stale exemption.
 - **File(s)**: pkg/dataplane/armed_gate_legs_test.go,
   pkg/dataplane/armed_gate_matrix_test.go, _Log.md
+## 2026-08-02 — #2114 PR #6743 Codex r2 review-round fixes (6M+2m)
+
+- **Timestamp**: 2026-08-02 (fix/2114-dp-accessor)
+- **Action**: Codex r2 returned MERGE-NEEDS-MAJOR (6 majors + 2 minors,
+  pinned at 989bfca8b). All verified and folded. r2-1: the reconcile pass
+  still reloaded transitively — takeoverReadinessForRG →
+  checkUserspaceTakeoverReadiness (:231) and the blackhole helpers →
+  userspaceDataplaneActive (:202) reloaded per RG. Threaded the pass
+  snapshot through: userspaceDataplaneActiveFor /
+  checkUserspaceTakeoverReadinessFor / injectBlackholeRoutesFor /
+  removeBlackholeRoutesFor snapshot variants with the per-invocation
+  wrappers preserved for the event paths, and takeoverReadinessForRG moved
+  to daemon_ha_userspace_readiness.go (avoids a new pkg/dataplane import
+  in daemon_ha_vip.go, which the legacy-import boundary canary correctly
+  rejected). r2-2: the dpCell canary now requires the *Daemon receiver —
+  a same-named method on an unrelated type no longer passes (collision
+  negative added). r2-3: the registry canary resolves owners through
+  file-scope type aliases, ParenExpr+StarExpr unwraps, and fixpoint alias
+  propagation; lock credit is restricted to the receiver's own alias
+  closure (a locked *Manager parameter does not count). r2-4: the
+  gate-evidence comparison must reference the callsite's own bound
+  identifier, positioned AFTER the assignment, outside any FuncLit
+  (closure/early negatives added). r2-5: method-value lock/unlock aliases
+  flagged; every timeout-based blocking assertion gained an arrival
+  handshake so a goroutine first scheduled after the release can no longer
+  falsely prove it blocked. r2-6: the Compile production-coverage
+  disposition was REBUTTED (userspace compiles never reach root
+  Manager.Compile) — corrected to the dead-surface waiver with the
+  daemon-constructor pin (TestRuntimeDataplaneNeverBareRootManager) that
+  fails if the root Manager ever becomes the daemon's dataplane again.
+  r2-7: restored the both-present SessionCount/ClearSessionCounts legs
+  alongside the absent-first discriminators and added the all-present
+  ZeroStaleNATPoolConfigs middle variant. r2-8: the recurrence test now
+  runs the PRODUCTION enterBootstrapMode default branch (linkDir
+  redirected to a temp dir) so the real dataplane Teardown call executes;
+  identity assertions pin that the SAME object is retained across the
+  rollback and re-Started on the failing re-arm.
+- **File(s)**: pkg/daemon/daemon_ha.go, pkg/daemon/daemon_ha_vip.go,
+  pkg/daemon/daemon_ha_userspace_readiness.go,
+  pkg/daemon/daemon_dp_canary_test.go,
+  pkg/daemon/daemon_dp_race_test.go,
+  pkg/dataplane/armed_gate_matrix_test.go,
+  pkg/dataplane/armed_gate_legs_test.go, _Log.md
