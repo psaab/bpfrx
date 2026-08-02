@@ -1,26 +1,28 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v86 — r84 folds: Codex M1's typed helper
-  pair (the single `*ebpf.Map`-returning helper could not serve
-  the PROGRAM registry — program reads exist at `loader.go:495`,
-  `:609`, `:1086`, `:1156` — nor carry the classification its
-  callers need): TWO helpers with typed results,
-  `lookupMapLocked`/`lookupProgramLocked`, each returning
-  (handle, present, registryState) — `present` (comma-ok)
-  distinguishes present-but-nil (the retained XDP fixture's
-  deliberate insert, `xdp_shim_decouple_test.go:321`) from
-  absent, and `registryState` ∈ {armed, fresh, retained} drives
-  each class's outcome; the canary allowlist + negative fixtures
-  align to these signatures. Codex m1's never-armed-Close
-  qualification (New() starts with empty registries and
-  bootstrap can skip Start, `daemon_run_bringup.go:483` — so
-  the retained-rationale is scoped to an ARMED Manager's Close;
-  a never-armed Close stays fresh and the entry Store changes
-  nothing); Codex explicitly declined the mid-Close-publisher
-  schedule as out-of-scope (v85 excludes re-arm
-  linearizability and teardown lifetime ordering); r84
-  verdicts: Codex PLAN-NEEDS-MAJOR (1M/1m), AGY PLAN-READY,
-  Claude SMR PLAN-READY; pending convergence review r85
+- **Status**: DRAFT v87 — r85 folds: Codex M1's TOTAL class
+  outcome matrix (v86's class-2/class-4 text was not total — it
+  conditioned neither on presence nor defined the
+  present→proceed path, and read literally suppressed valid
+  present-map behavior: `SessionCount` counts present maps,
+  `ClearSessionCounts` mutates them, `GetMapStats` reports
+  them; the matrix is now a full class × (fresh / armed-or-
+  retained-absent / armed-or-retained-present) table with the
+  fresh+present production-unreachable note and the
+  present-but-nil qualification); Codex m2's singular-helper
+  pluralization (four normative sites — the uniform registry
+  rule, the §4.7 inventory bullet, the `m.mu` contract comment,
+  the ownership test — now name the helper PAIR, and the
+  ownership test exercises BOTH helpers); Codex m3's fourth
+  unconditional teardown site (§9's fixture-scope rationale now
+  says an ARMED Manager's Close/Teardown presents the nonempty
+  registry); Codex m4's swap-fixture state fix (v86 seeded only
+  `m.programs`, leaving `m.maps` empty → FRESH → the class-1
+  gate would fire before the `:632` write; the fixture now
+  seeds any one map entry so it classifies RETAINED — the gate
+  reads `m.maps` emptiness, not `m.programs`); r85 verdicts:
+  Codex PLAN-NEEDS-MAJOR (1M/3m), AGY PLAN-READY, Claude SMR
+  PLAN-READY; pending convergence review r86
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -3233,7 +3235,12 @@
   signature could not serve both registries nor carry the
   classification; the never-armed-Close qualification; the
   mid-Close-publisher schedule explicitly declined as
-  out-of-scope).
+  out-of-scope). v87 (r85: the TOTAL class outcome matrix —
+  the present→proceed branch for classes 2/4, the class-3
+  state-independent row; the four-site singular-helper
+  pluralization; the fourth unconditional teardown site
+  qualified; the swap-fixture state fix — a program-only seed
+  is FRESH, not retained).
 
 ---
 
@@ -3673,8 +3680,10 @@ class. The fold:
     means a post-release reader sees a fully-populated registry.
     **THE UNIFORM REGISTRY-ACCESS RULE (r76 Codex M1 + AGY r76 M1 —
     the retained-proceed race fix):** EVERY `m.maps`/`m.programs`
-    access in EVERY class in EVERY state goes through the single
-    `m.mu`-scoped registry helper — classification AND handle
+    access in EVERY class in EVERY state goes through the
+    `m.mu`-scoped registry helpers (`lookupMapLocked`/
+    `lookupProgramLocked`, pluralized at v87 per r85 Codex m2) —
+    classification AND handle
     selection happen as ONE scoped operation under the lock (the
     gate outcome and the handle copy are atomic), and the
     population publishes as ONE whole-batch critical section (the
@@ -4138,8 +4147,10 @@ convergence on the seed before any implementation of G/H/H2.
   step INSIDE the whole-batch `m.mu` hold — batch+flag publish as
   one atomic operation, r77 Codex M2's placement fix); the uniform
   registry-access rule (every `m.maps`/`m.programs` access in every
-  class in every state goes through the single `m.mu`-scoped
-  helper, classification + handle selection atomic within it); the
+  class in every state goes through the `m.mu`-scoped helper PAIR
+  (`lookupMapLocked`/`lookupProgramLocked`, pluralized at v87 per
+  r85 Codex m2), classification + handle selection atomic within
+  the scoped operation); the
   total, exclusive partition of all 157 exported methods (§4 A1)
   by Start-state access with the escape-first precedence rule: class-1
   fallible map-required (gate before the first Start-state access;
@@ -4332,7 +4343,8 @@ classification snapshot.
   rule at v80 per r78 Codex M1): today it names only the offset
   state; it is updated to name the offset state, the uniform
   registry rule (EVERY `m.maps`/`m.programs` access in every class
-  — classification + handle selection inside the scoped helper),
+  — classification + handle selection inside the scoped helper
+  PAIR, `lookupMapLocked`/`lookupProgramLocked`),
   the whole-batch population publication, AND the `xdpEntryProg`
   field.
 - Stale source comments describing direct `d.dp` access or the
@@ -4724,8 +4736,15 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    `:154` selector write with getter/predicate/swap driven across
    it; and the `:632` lock is pinned DIRECTLY (r74 Codex M2) by a
    DIRECT `swapXDPEntryProg` call with a seeded DISTINCT test-only
-   program (seed `m.programs["test_prog"]` and
-   `xdpEntryProg="other"` so both early exits fail and `:632`
+   program (seed `m.programs["test_prog"]`, ANY one `m.maps` entry
+   — the sentinel map suffices — and
+   `xdpEntryProg="other"` so the fixture classifies RETAINED under
+   the two-state predicate (v87 fix per r85 Codex m4: v86 seeded
+   only `m.programs`, leaving `m.maps` empty → FRESH → the class-1
+   gate would return `ErrDataplaneNotArmed` before reaching the
+   lookup — a nonempty `m.programs` alone does NOT make the manager
+   retained; the gate reads `m.maps` emptiness) and both early
+   exits fail and `:632`
    executes), the section containing a test hook that HOLDS it
    while a getter attempts — the getter BLOCKS until release (or
    fails an in-section `TryLock`), proving lock OWNERSHIP, not
@@ -4746,8 +4765,11 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    PLUS the RETAINED-state coverage (r76 Codex m2; corrected to the
    four-leg form at v81 per r79 Codex M1; the fixture scope pinned
    at v82 per r80 Codex m1 — ONE seeded retained fixture suffices
-   for A3's state classification because Close and Teardown both
-   present `loaded=false` + a nonempty registry; NO duplicate
+   for A3's state classification because an ARMED Manager's Close
+   and Teardown both present `loaded=false` + a nonempty registry
+   (armed-only qualification at v87 per r85 Codex m3 — the fourth
+   unconditional site: `New()` starts empty (`loader.go:89`) and a
+   never-armed Close/Teardown cannot populate it); NO duplicate
    Teardown outcome matrix, and no current-generation-delivery
    claim; a small Close-transition assertion proves production
    preservation of the registry; the oracle split for privilege at
@@ -4783,9 +4805,12 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    fix — the critical intervals (side-effect unlock
    `maps_counters.go:179` -> raw lookup :181) contain no injectable
    operation, so an external test cannot guarantee writer
-   acquisition between adjacent statements): the registry helper's
-   own section holds a test hook while a racing writer attempt
-   must block until release (the same ownership-assertion pattern
+   acquisition between adjacent statements): EACH registry
+   helper's own section holds a test hook while a racing writer
+   attempt must block until release — the ownership test exercises
+   BOTH typed helpers (`lookupMapLocked` AND
+   `lookupProgramLocked`, pinned at v87 per r85 Codex m2; the
+   same ownership-assertion pattern
    as the `:632` proof); and (b) the structural net per this
    repo's compile-time-invariant discipline, now fully specified
    (r81 Codex M1; the allowlist/publisher alignment fixed at v84
@@ -4821,12 +4846,30 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    `registryState` ∈ {armed, fresh, retained} is the under-lock
    classification and `present` is the comma-ok bit (distinguishing
    present-but-nil — the retained XDP fixture inserts exactly that,
-   `xdp_shim_decouple_test.go:321` — from absent). A class-1 caller:
-   st==fresh → `ErrDataplaneNotArmed`; st∈{armed,retained} ∧
-   !present → master's missing-map error; else proceed with the
-   handle. Class-2: st==fresh → neutral; else master's missing-map
-   outcome (nil for the no-ops). Class-4: st==fresh → nil (+ the
-   typed error where the signature carries one). The canary
+   `xdp_shim_decouple_test.go:321` — from absent). The per-class
+   outcome matrix is TOTAL (r85 Codex M1 — v86's class-2/class-4
+   text was not: it conditioned neither on presence nor defined the
+   present→proceed path, and read literally it suppressed valid
+   present-map behavior — `SessionCount` counts present maps
+   (`maps_session.go:326`), `ClearSessionCounts` mutates them
+   (`maps_screen.go:57`), `GetMapStats` reports them
+   (`maps_stats.go:68`), all under armed/retained states):
+
+   | class | fresh | armed/retained + absent | armed/retained + present |
+   |-------|-------|--------------------------|---------------------------|
+   | 1 | typed `ErrDataplaneNotArmed` | master's missing-map error | proceed with the handle |
+   | 2 | neutral | master's missing-map outcome (nil for the no-ops) | proceed with the handle |
+   | 3 | state-independent: the pinned legacy behavior | the pinned legacy behavior | the pinned legacy behavior (proceed) |
+   | 4 | nil (+ the typed error where the signature carries one) | master's missing outcome (nil for `Map`/`Program`) | proceed (return the handle) |
+
+   `present` includes present-but-nil: callers retain their existing
+   handle-level nil behavior. Fresh+present is production-
+   unreachable for map lookups (the two-state predicate reads
+   `m.maps` emptiness; a nonempty `m.programs` alone does NOT make
+   the manager retained — r85 Codex m4); if constructed
+   artificially, the fresh rule wins. The loaded-check carve-out
+   subset (AttachXDP/AttachTC/CompileConfig) still preempts the
+   helper on both unarmed states. The canary
    allowlist names exactly these two helpers + the publisher, with
    the negative fixtures aligned to these signatures; the shape
    rules, type-aware on the receiver — every
@@ -5398,19 +5441,18 @@ Still open:
    PLAN-READY when all three verdicts gate the PR-1 design as
    ready.
 
-7. **r68-r84 resolution (for the record)**: Codex r68 M1 (armed-state
+7. **r68-r85 resolution (for the record)**: Codex r68 M1 (armed-state
    admission gate) folded as work item A3; r69-r82 falsified each
-   intermediate form, r83 closed the last canary escape (a helper
-   returning the container wholesale would preserve the fatal race
-   through an allowlisted, lock-holding helper), and r84 replaced
-   the single helper with the typed pair — a `*ebpf.Map`-returning
-   signature could not serve the program registry (reads at
-   `loader.go:495`, `:609`, `:1086`, `:1156`) nor carry the
-   presence/classification its callers need. v86 pins
-   `lookupMapLocked`/`lookupProgramLocked` returning
-   (handle, present, registryState). Each reviewer: verify the
-   canary spec serves every production registry access shape,
-   and the never-armed-Close qualification.
+   intermediate form, r83 closed the last canary escape, r84
+   replaced the single helper with the typed pair, and r85 made
+   the outcome matrix TOTAL (v86's class-2/class-4 text lacked
+   the present→proceed branch and left class-4's armed/retained
+   cells undefined) plus three wording fixes (the singular-helper
+   pluralization, the fourth unconditional teardown site, the
+   swap-fixture state — a program-only seed is fresh). v87 pins
+   the full class × (state × presence) matrix. Each reviewer:
+   verify the matrix reproduces master's observable behavior in
+   every reachable cell, and the four pluralized sites.
 
 ---
 
