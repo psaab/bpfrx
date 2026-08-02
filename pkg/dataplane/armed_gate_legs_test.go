@@ -302,6 +302,9 @@ func TestManager_ArmedGate_RetainedOutcomes(t *testing.T) {
 	if err := m.AttachXDP(1, false); err == nil || err.Error() != "eBPF programs not loaded" {
 		t.Errorf("retained AttachXDP = %v, want master's loaded rejection", err)
 	}
+	if _, err := m.Compile(&config.Config{}); err == nil || err.Error() != "dataplane not loaded" {
+		t.Errorf("retained Compile(empty) = %v, want master's CompileConfig loaded rejection", err)
+	}
 
 	// Class 4: master's missing outcomes.
 	if got := m.Map("sessions"); got != nil {

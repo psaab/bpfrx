@@ -234,6 +234,31 @@ func TestManager_PreArmMethodMatrix(t *testing.T) {
 		}
 	}
 
+	// Invoke-table coextensiveness (Codex PR #6743 self-audit hardened):
+	// every class-1/2/3 manifest member must be driven by the
+	// armedGateInvoke driver or named in the exemption set — a method
+	// silently absent from BOTH is untested by the fresh/retained/blocked
+	// legs and fails here.
+	invoke := armedGateInvoke()
+	for name, class := range managerMethodClasses {
+		if class != "class1" && class != "class2" && class != "class3" && class != "class1-carveout" {
+			continue
+		}
+		_, driven := invoke[name]
+		_, exempt := armedGateInvokeExemptions[name]
+		if !driven && !exempt {
+			t.Errorf("manifest member %s (%s) is neither driven by armedGateInvoke nor exempted — the outcome legs do not cover it", name, class)
+		}
+		if driven && exempt {
+			t.Errorf("manifest member %s is both driven and exempted — remove one", name)
+		}
+	}
+	for name := range armedGateInvokeExemptions {
+		if _, ok := managerMethodClasses[name]; !ok {
+			t.Errorf("exemption %s is not a manifest member (stale)", name)
+		}
+	}
+
 	// Class-3 raw-helper composition shape: ClearAllCounters' body must
 	// reference the raw internals and must NOT call the public gated
 	// ClearInterfaceCounters/ClearPolicyCounters/ClearFilterCounters.
@@ -270,6 +295,24 @@ func TestManager_PreArmMethodMatrix(t *testing.T) {
 		}
 		return false
 	})
+}
+
+// armedGateInvokeExemptions names the class-1/2/3 manifest members that
+// legitimately CANNOT join the armedGateInvoke driver, with the reason —
+// the matrix asserts the invoke table plus this set is coextensive with
+// the manifest (a missing entry fails either side).
+var armedGateInvokeExemptions = map[string]string{
+	// The carve-out pair reject at their own pre-registry loaded check on
+	// both unarmed states and attach netlink links when armed — they are
+	// asserted directly in the fresh/retained/pass-then-block legs.
+	"AttachXDP": "carve-out: asserted directly (fresh+retained+pass-then-block legs)",
+	"AttachTC":  "carve-out: asserted directly (pass-then-block leg)",
+	// Compile's only direct registry access (redirect_capable) runs past
+	// CompileConfig's loaded check, so it never blocks pre-arm and cannot
+	// join the blocked legs; its fresh/retained outcomes are asserted
+	// directly and its armed continuation maps to production smoke (the
+	// shim registry never carries redirect_capable).
+	"Compile": "carve-out path: fresh/retained loaded-rejection asserted directly; armed continuation via production smoke",
 }
 
 // registryAccessAllowlist names the ONLY functions permitted to touch

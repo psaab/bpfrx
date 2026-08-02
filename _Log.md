@@ -66478,3 +66478,18 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/daemon/daemon_ha.go,
   pkg/dataplane/armed_gate_matrix_test.go,
   pkg/dataplane/armed_gate_legs_test.go, _Log.md
+## 2026-08-02 — #2114 self-audit hardening (invoke coextensiveness)
+
+- **Timestamp**: 2026-08-02 (fix/2114-dp-accessor)
+- **Action**: Author self-audit after the Codex r1 fold: the armed-gate
+  invoke driver missed Compile (class 2 — its only registry access runs
+  past CompileConfig's loaded check so it can never block pre-arm; its
+  outcomes were already asserted directly). Added the retained-state
+  Compile rejection assertion and made the coextensiveness mechanical:
+  TestManager_PreArmMethodMatrix now fails if any class-1/2/3 manifest
+  member is neither driven by armedGateInvoke nor named in the new
+  armedGateInvokeExemptions set (AttachXDP/AttachTC/Compile, each with
+  its documented reason), and fails on a driven-and-exempted double
+  listing or a stale exemption.
+- **File(s)**: pkg/dataplane/armed_gate_legs_test.go,
+  pkg/dataplane/armed_gate_matrix_test.go, _Log.md
