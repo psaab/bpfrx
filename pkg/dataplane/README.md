@@ -277,17 +277,39 @@ The gate predicate is TWO-STATE on the unarmed side:
   admission flag, NOT a lease — it cannot drain an in-flight operation,
   and no teardown/lifetime exclusion is claimed (cilium/ebpf documents
   close-in-use as unsafe).
+- `Teardown()` (= `Close` + `Cleanup`) additionally CLEARS the
+  `xdpLinks`/`tcLinks` membership maps: `Close` closed the Go handles
+  and `Cleanup` unpinned and destroyed the kernel links, so the entries
+  would otherwise point at dead handles for links that no longer exist,
+  and a same-process re-Start (the commit-confirmed rollback →
+  bootstrap-exit re-arm) would hit `AttachXDP`'s stale-membership
+  "already attached" short-circuit — which `attachUserspaceShimXDP`
+  deliberately swallows — and report success with no AF_XDP ingress
+  (Codex PR #6743 r3-1). `Close` alone deliberately keeps the
+  membership: its pinned links stay live in the kernel for hitless
+  reuse, so the entries remain truthful there.
+  `TestManagerTeardownClearsLinkMembership` pins both polarities.
 
 Enforcement (all in `armed_gate_matrix_test.go` /
 `armed_gate_legs_test.go`): the 157-method class manifest is
 AST-verified for totality; the registry canary fails the build on any
 raw `m.maps`/`m.programs` access outside the two helpers + the
-publisher (with alias-escape and unlock-before-access negatives); the
+publisher, with negatives covering package-wide/chained/pointer type
+aliases, `var`-declared and fixpoint local aliases, multi-layer
+parenthesized access, cross-object lock credit (a locked `*Manager`
+parameter never covers the receiver's registry), closure-hidden locks,
+method-value lock/unlock escapes, and helper method-value escapes; the
 stale-checked callsite manifest pins all 135 helper callsites with
-their outcome roles; and the five-leg runtime oracle (fresh outcomes,
-retained outcomes, blocked fresh-Start, blocked retained-reStart,
-Close-window `IsLoaded`) plus the continuation legs run under
-`make test-race-dp`.
+their outcome roles, and the per-callsite gate evidence only counts a
+`registryFresh` comparison that evaluates THAT callsite's own binding
+(the scan stops at the bound identifier's reassignment — the
+`ClearNATPoolIPs` two-lookup reuse shape). The five-leg runtime oracle
+(fresh outcomes, retained outcomes, blocked fresh-Start, blocked
+retained-reStart, Close-window `IsLoaded`) plus the continuation legs
+run under `make test-race-dp`; every blocking leg proves goroutine
+arrival from the `muAcquireProbeHook` pre-lock seam (a signal before
+the contended call can pass the silence window without the goroutine
+ever reaching the mutex).
 
 ## Entry points
 

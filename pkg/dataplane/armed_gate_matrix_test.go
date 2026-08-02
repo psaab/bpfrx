@@ -326,6 +326,25 @@ var registryAccessAllowlist = map[string]bool{
 	"publishShimRegistryLocked":  true,
 }
 
+// unwrapOwnerIdent strips any parenthesization and pointer-dereference
+// layers to reach the underlying owner identifier (Codex PR #6743 r3-2):
+// m, (*m), and ((*m)) all resolve to the same ident; anything more
+// complex (calls, selector chains) yields nil so it cannot claim credit.
+func unwrapOwnerIdent(expr ast.Expr) *ast.Ident {
+	for {
+		switch x := expr.(type) {
+		case *ast.ParenExpr:
+			expr = x.X
+		case *ast.StarExpr:
+			expr = x.X
+		case *ast.Ident:
+			return x
+		default:
+			return nil
+		}
+	}
+}
+
 // registryCanaryViolations parses every production .go file under root and
 // reports: (a) any m.maps/m.programs reference outside the allowlisted
 // functions; (b) inside an allowlisted function, any registry reference NOT
@@ -349,6 +368,17 @@ func registryCanaryViolations(t *testing.T, root string) []string {
 		t.Fatalf("read %s: %v", root, err)
 	}
 	var violations []string
+
+	// Parse every production file ONCE, up front (Codex PR #6743 r3-2):
+	// type aliases resolve PACKAGE-wide, so the alias set must be
+	// collected across all files before any per-file check runs — an
+	// alias declared in another file used to produce no owner at all.
+	type parsedFile struct {
+		name string
+		fset *token.FileSet
+		file *ast.File
+	}
+	var parsed []parsedFile
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
@@ -360,41 +390,67 @@ func registryCanaryViolations(t *testing.T, root string) []string {
 		if err != nil {
 			t.Fatalf("parse %s: %v", path, err)
 		}
-		// Type aliases declared at file scope (`type X = Manager`) resolve
-		// to Manager for receiver/param typing (Codex PR #6743 r2-3).
-		managerAliases := map[string]bool{"Manager": true}
-		for _, decl := range file.Decls {
-			gd, ok := decl.(*ast.GenDecl)
-			if !ok {
-				continue
-			}
-			for _, spec := range gd.Specs {
-				ts, ok := spec.(*ast.TypeSpec)
-				if !ok || ts.Assign == token.NoPos {
+		parsed = append(parsed, parsedFile{name, fset, file})
+	}
+
+	// The Manager-alias set, package-wide and to a fixpoint (Codex PR
+	// #6743 r3-2): direct `type X = Manager`, chained `type B = A`
+	// where A is itself an alias, and pointer-RHS `type P = *Manager`
+	// (a pointer alias cannot be a receiver base type, but it CAN type
+	// a parameter whose registry access aliases the shared maps).
+	managerAliases := map[string]bool{"Manager": true}
+	for changed := true; changed; {
+		changed = false
+		for _, pf := range parsed {
+			for _, decl := range pf.file.Decls {
+				gd, ok := decl.(*ast.GenDecl)
+				if !ok {
 					continue
 				}
-				if id, ok := ts.Type.(*ast.Ident); ok && id.Name == "Manager" {
-					managerAliases[ts.Name.Name] = true
+				for _, spec := range gd.Specs {
+					ts, ok := spec.(*ast.TypeSpec)
+					if !ok || ts.Assign == token.NoPos || managerAliases[ts.Name.Name] {
+						continue
+					}
+					switch rhs := ts.Type.(type) {
+					case *ast.Ident:
+						if managerAliases[rhs.Name] {
+							managerAliases[ts.Name.Name] = true
+							changed = true
+						}
+					case *ast.StarExpr:
+						if id, ok := rhs.X.(*ast.Ident); ok && managerAliases[id.Name] {
+							managerAliases[ts.Name.Name] = true
+							changed = true
+						}
+					}
 				}
 			}
 		}
-		// isManagerStar recognizes *Manager and Manager-typed (or
-		// file-scope-aliased) receivers/params — including value params of
-		// an aliased struct type, whose map field copy still aliases the
-		// shared registry (Codex PR #6743 r2-3).
-		var isManagerStar func(ast.Expr) bool
-		isManagerStar = func(expr ast.Expr) bool {
-			switch t := expr.(type) {
-			case *ast.StarExpr:
-				id, ok := t.X.(*ast.Ident)
-				return ok && managerAliases[id.Name]
-			case *ast.Ident:
-				return managerAliases[t.Name]
-			case *ast.ParenExpr:
-				return isManagerStar(t.X)
-			}
-			return false
+	}
+
+	// isManagerStar recognizes *Manager and Manager-typed (or
+	// package-aliased) receivers/params — including value params of
+	// an aliased struct type, whose map field copy still aliases the
+	// shared registry (Codex PR #6743 r2-3).
+	var isManagerStar func(ast.Expr) bool
+	isManagerStar = func(expr ast.Expr) bool {
+		switch t := expr.(type) {
+		case *ast.StarExpr:
+			id, ok := t.X.(*ast.Ident)
+			return ok && managerAliases[id.Name]
+		case *ast.Ident:
+			return managerAliases[t.Name]
+		case *ast.ParenExpr:
+			return isManagerStar(t.X)
 		}
+		return false
+	}
+
+	for _, pf := range parsed {
+		name := pf.name
+		fset := pf.fset
+		file := pf.file
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
 			if !ok || fn.Body == nil {
@@ -438,51 +494,45 @@ func registryCanaryViolations(t *testing.T, root string) []string {
 				}
 			}
 			if len(owners) > 0 {
-				// Alias propagation to a fixpoint: x := <owner> makes x an
-				// owner; iterate so a := m; b := a resolves (r2-3).
-				for changed := true; changed; {
-					changed = false
-					ast.Inspect(fn.Body, func(n ast.Node) bool {
-						as, ok := n.(*ast.AssignStmt)
-						if !ok {
-							return true
-						}
-						if len(as.Lhs) != len(as.Rhs) {
-							return true
-						}
-						for i, rhs := range as.Rhs {
-							id, ok := rhs.(*ast.Ident)
-							if !ok || !owners[id.Name] {
-								continue
+				// Alias propagation to a fixpoint: `x := <owner>` or
+				// `var x = <owner>` makes x an owner; iterate so a := m;
+				// b := a resolves (r2-3). The ValueSpec shape is covered
+				// too — a var-declared alias propagates identically
+				// (Codex PR #6743 r3-2).
+				propagate := func(set map[string]bool) {
+					for changed := true; changed; {
+						changed = false
+						pair := func(l, r ast.Expr) {
+							id, ok := r.(*ast.Ident)
+							if !ok || !set[id.Name] {
+								return
 							}
-							if lid, ok := as.Lhs[i].(*ast.Ident); ok && !owners[lid.Name] {
-								owners[lid.Name] = true
+							if lid, ok := l.(*ast.Ident); ok && !set[lid.Name] {
+								set[lid.Name] = true
 								changed = true
 							}
 						}
-						return true
-					})
-				}
-				for changed := true; changed; {
-					changed = false
-					ast.Inspect(fn.Body, func(n ast.Node) bool {
-						as, ok := n.(*ast.AssignStmt)
-						if !ok || len(as.Lhs) != len(as.Rhs) {
+						ast.Inspect(fn.Body, func(n ast.Node) bool {
+							switch as := n.(type) {
+							case *ast.AssignStmt:
+								if len(as.Lhs) == len(as.Rhs) {
+									for i := range as.Lhs {
+										pair(as.Lhs[i], as.Rhs[i])
+									}
+								}
+							case *ast.ValueSpec:
+								if len(as.Names) == len(as.Values) {
+									for i := range as.Names {
+										pair(as.Names[i], as.Values[i])
+									}
+								}
+							}
 							return true
-						}
-						for i, rhs := range as.Rhs {
-							id, ok := rhs.(*ast.Ident)
-							if !ok || !lockOwners[id.Name] {
-								continue
-							}
-							if lid, ok := as.Lhs[i].(*ast.Ident); ok && !lockOwners[lid.Name] {
-								lockOwners[lid.Name] = true
-								changed = true
-							}
-						}
-						return true
-					})
+						})
+					}
 				}
+				propagate(owners)
+				propagate(lockOwners)
 			}
 
 			// Lock/unlock positions and the receiver-scoped loaded.Store(true).
@@ -495,6 +545,11 @@ func registryCanaryViolations(t *testing.T, root string) []string {
 				switch node := n.(type) {
 				case *ast.DeferStmt:
 					return false // deferred calls run at function end
+				case *ast.FuncLit:
+					// Codex PR #6743 r3-3: a lock inside a closure runs at
+					// closure-CALL time (possibly never), so it must not
+					// credit a lexically-later access with the hold.
+					return false
 				case *ast.CallExpr:
 					sel, ok := node.Fun.(*ast.SelectorExpr)
 					if !ok {
@@ -504,17 +559,7 @@ func registryCanaryViolations(t *testing.T, root string) []string {
 					if !ok {
 						return true
 					}
-					var recvID *ast.Ident
-					switch x := recvSel.X.(type) {
-					case *ast.Ident:
-						recvID = x
-					case *ast.ParenExpr: // (*m).mu.… — Codex PR #6743 r2-3
-						if st, ok2 := x.X.(*ast.StarExpr); ok2 {
-							recvID, _ = st.X.(*ast.Ident)
-						} else {
-							recvID, _ = x.X.(*ast.Ident)
-						}
-					}
+					recvID := unwrapOwnerIdent(recvSel.X)
 					if recvID == nil || !lockOwners[recvID.Name] {
 						return true
 					}
@@ -540,12 +585,22 @@ func registryCanaryViolations(t *testing.T, root string) []string {
 			// Method-value lock/unlock aliases (Codex PR #6743 r2-5a):
 			// `u := m.mu.Unlock; u()` releases the hold invisible to the
 			// direct-call scan — flag the method-value assignment itself.
+			// The var-decl shape `var u = m.mu.Unlock` escapes identically
+			// (Codex PR #6743 r3-5a), so ValueSpec values are scanned too.
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				as, ok := n.(*ast.AssignStmt)
-				if !ok {
+				var rhss []ast.Expr
+				var stmtPos token.Pos
+				switch st := n.(type) {
+				case *ast.AssignStmt:
+					rhss = st.Rhs
+					stmtPos = st.Pos()
+				case *ast.ValueSpec:
+					rhss = st.Values
+					stmtPos = st.Pos()
+				default:
 					return true
 				}
-				for _, rhs := range as.Rhs {
+				for _, rhs := range rhss {
 					sel, ok := rhs.(*ast.SelectorExpr)
 					if !ok || (sel.Sel.Name != "Unlock" && sel.Sel.Name != "Lock") {
 						continue
@@ -554,23 +609,41 @@ func registryCanaryViolations(t *testing.T, root string) []string {
 					if !ok || muSel.Sel.Name != "mu" {
 						continue
 					}
-					var recvID *ast.Ident
-					switch x := muSel.X.(type) {
-					case *ast.Ident:
-						recvID = x
-					case *ast.ParenExpr:
-						if st, ok2 := x.X.(*ast.StarExpr); ok2 {
-							recvID, _ = st.X.(*ast.Ident)
-						} else {
-							recvID, _ = x.X.(*ast.Ident)
-						}
-					}
+					recvID := unwrapOwnerIdent(muSel.X)
 					if recvID == nil || !lockOwners[recvID.Name] {
 						continue
 					}
 					shapeViolations = append(shapeViolations,
-						fmt.Sprintf("%s:%s: m.mu.%s taken as a method value in %s — the lock operation escapes the lexical scan", name, fset.Position(as.Pos()), sel.Sel.Name, fn.Name.Name))
+						fmt.Sprintf("%s:%s: m.mu.%s taken as a method value in %s — the lock operation escapes the lexical scan", name, fset.Position(stmtPos), sel.Sel.Name, fn.Name.Name))
 				}
+				return true
+			})
+
+			// Lookup-helper method-value escapes (Codex PR #6743 r3-5b):
+			// `lookup := m.lookupMapLocked; lookup("sessions")` adds an
+			// unmanifested, potentially ungated callsite the direct-call
+			// collectors (and their 135-row manifest) cannot see. Flag
+			// any helper reference that is not in call position.
+			var mvStack []ast.Node
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				if n == nil {
+					if len(mvStack) > 0 {
+						mvStack = mvStack[:len(mvStack)-1]
+					}
+					return true
+				}
+				mvStack = append(mvStack, n)
+				sel, ok := n.(*ast.SelectorExpr)
+				if !ok || (sel.Sel.Name != "lookupMapLocked" && sel.Sel.Name != "lookupProgramLocked") {
+					return true
+				}
+				if len(mvStack) >= 2 {
+					if call, ok := mvStack[len(mvStack)-2].(*ast.CallExpr); ok && call.Fun == sel {
+						return true // direct call — the callsite collectors cover it
+					}
+				}
+				shapeViolations = append(shapeViolations,
+					fmt.Sprintf("%s:%s: lookup helper %s referenced as a method value in %s — an unmanifested callsite the gate manifest cannot key", name, fset.Position(sel.Pos()), sel.Sel.Name, fn.Name.Name))
 				return true
 			})
 
@@ -589,25 +662,26 @@ func registryCanaryViolations(t *testing.T, root string) []string {
 				if !ok || (sel.Sel.Name != "maps" && sel.Sel.Name != "programs") {
 					return true
 				}
-				recv, ok := sel.X.(*ast.Ident)
-				if !ok {
-					// (*m).maps — the parens wrap a StarExpr, so unwrap
-					// both layers (Codex PR #6743 r2-3).
-					if pe, ok2 := sel.X.(*ast.ParenExpr); ok2 {
-						if st, ok3 := pe.X.(*ast.StarExpr); ok3 {
-							recv, ok = st.X.(*ast.Ident)
-						} else {
-							recv, ok = pe.X.(*ast.Ident)
-						}
-					}
-				}
-				if !ok || recv == nil || !owners[recv.Name] {
+				// m.maps / (*m).maps / ((*m)).maps all resolve to m
+				// (Codex PR #6743 r3-2: the one-layer unwrap used to
+				// stop at the first paren).
+				recv := unwrapOwnerIdent(sel.X)
+				if recv == nil || !owners[recv.Name] {
 					return true
 				}
 				pos := fset.Position(sel.Pos())
 				if !allowed {
 					shapeViolations = append(shapeViolations,
 						fmt.Sprintf("%s:%s: raw %s.%s access in %s (outside the allowlist)", name, pos, recv.Name, sel.Sel.Name, fn.Name.Name))
+					return true
+				}
+				// Codex PR #6743 r3-3: the lock credit belongs to the
+				// RECEIVER's own alias closure — an allowlisted access
+				// through a *Manager PARAMETER (possibly a different
+				// object) is not guarded by the receiver's m.mu hold.
+				if !lockOwners[recv.Name] {
+					shapeViolations = append(shapeViolations,
+						fmt.Sprintf("%s:%s: registry access through %s in allowlisted %s is not covered by the receiver's own m.mu hold (a locked *Manager parameter can be a different object)", name, pos, recv.Name, fn.Name.Name))
 					return true
 				}
 				var parent ast.Node
@@ -844,6 +918,82 @@ func (m *Manager) lookupMapLocked(other *Manager, name string) *ebpf.Map {
 	return m.maps[name]
 }
 `
+	// Codex PR #6743 r3-2 negatives: the alias shapes that used to produce
+	// NO owner (and therefore no violation) — cross-file aliases, chained
+	// aliases, pointer-RHS aliases, and multi-layer parenthesized access.
+	crossFileAliasDecl := `package dataplane
+
+type managerCrossAlias = Manager
+`
+	crossFileAliasUse := `package dataplane
+
+func sneakyCrossFile(mgr managerCrossAlias, name string) *ebpf.Map {
+	return mgr.maps[name]
+}
+`
+	chainedAlias := `package dataplane
+
+type managerChainA = Manager
+type managerChainB = managerChainA
+
+func sneakyChained(mgr managerChainB, name string) *ebpf.Map {
+	return mgr.maps[name]
+}
+`
+	pointerAliasParam := `package dataplane
+
+type managerPtrAlias = *Manager
+
+func sneakyPtrAlias(mgr managerPtrAlias, name string) *ebpf.Map {
+	return mgr.maps[name]
+}
+`
+	multiParen := `package dataplane
+
+func (m *Manager) sneakyMultiParen(name string) *ebpf.Map {
+	return ((*m)).maps[name]
+}
+`
+	// Codex PR #6743 r3-3 negatives: locking the receiver while reading
+	// THROUGH A PARAMETER (possibly a different object), and a lock inside
+	// a never-called closure — both used to credit the access.
+	crossObjectLock := `package dataplane
+
+func (m *Manager) lookupMapLocked(other *Manager, name string) *ebpf.Map {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return other.maps[name]
+}
+`
+	closureLock := `package dataplane
+
+func (m *Manager) lookupMapLocked(name string) *ebpf.Map {
+	f := func() { m.mu.Lock() }
+	_ = f
+	return m.maps[name]
+}
+`
+	// Codex PR #6743 r3-5 negatives: the var-declared lock method value,
+	// and a lookup helper referenced as a method value (an unmanifested
+	// callsite).
+	varMethodValue := `package dataplane
+
+func (m *Manager) lookupMapLocked(name string) (h *ebpf.Map, present bool, st registryState) {
+	m.mu.Lock()
+	var u = m.mu.Unlock
+	u()
+	h, present = m.maps[name]
+	return h, present, registryFresh
+}
+`
+	helperMethodValue := `package dataplane
+
+func (m *Manager) sneakyHelperValue(name string) *ebpf.Map {
+	lookup := m.lookupMapLocked
+	h, _, _ := lookup(name)
+	return h
+}
+`
 
 	dir := t.TempDir()
 	write := func(n, src string) {
@@ -869,12 +1019,33 @@ func (m *Manager) lookupMapLocked(other *Manager, name string) *ebpf.Map {
 	write("bad_typealias.go", typeAliasParam)
 	write("bad_methodvalue.go", methodValueUnlock)
 	write("bad_paramlock.go", paramLockNotCredited)
+	write("bad_crossfile_decl.go", crossFileAliasDecl)
+	write("bad_crossfile_use.go", crossFileAliasUse)
+	write("bad_chained.go", chainedAlias)
+	write("bad_ptralias.go", pointerAliasParam)
+	write("bad_multiparen.go", multiParen)
+	write("bad_crossobject.go", crossObjectLock)
+	write("bad_closurelock.go", closureLock)
+	write("bad_varmethodvalue.go", varMethodValue)
+	write("bad_helpermethodvalue.go", helperMethodValue)
 	violations := registryCanaryViolations(t, dir)
 	saw := map[string]bool{}
 	for _, v := range violations {
 		switch {
 		case strings.Contains(v, "in sneaky ") && strings.Contains(v, "outside the allowlist"):
 			saw["raw"] = true
+		case strings.Contains(v, "in sneakyCrossFile ") && strings.Contains(v, "outside the allowlist"):
+			saw["crossfilealias"] = true
+		case strings.Contains(v, "in sneakyChained ") && strings.Contains(v, "outside the allowlist"):
+			saw["chainedalias"] = true
+		case strings.Contains(v, "in sneakyPtrAlias ") && strings.Contains(v, "outside the allowlist"):
+			saw["ptralias"] = true
+		case strings.Contains(v, "in sneakyMultiParen ") && strings.Contains(v, "outside the allowlist"):
+			saw["multiparen"] = true
+		case strings.Contains(v, "in sneakyHelperValue ") && strings.Contains(v, "unmanifested callsite"):
+			saw["helpermethodvalue"] = true
+		case strings.Contains(v, "not covered by the receiver's own m.mu hold"):
+			saw["crossobject"] = true
 		case strings.Contains(v, "in sneakyAliasParam ") && strings.Contains(v, "outside the allowlist"):
 			saw["typealias"] = true
 		case strings.Contains(v, "in sneakyAlias ") && strings.Contains(v, "outside the allowlist"):
@@ -887,6 +1058,8 @@ func (m *Manager) lookupMapLocked(other *Manager, name string) *ebpf.Map {
 			saw["unlock"] = true
 		case strings.Contains(v, "bad_paramlock.go") && strings.Contains(v, "without any m.mu.Lock"):
 			saw["paramlock"] = true
+		case strings.Contains(v, "bad_closurelock.go") && strings.Contains(v, "without any m.mu.Lock"):
+			saw["closurelock"] = true
 		case strings.Contains(v, "without any m.mu.Lock"):
 			saw["nolock"] = true
 		case strings.Contains(v, "Store(true) follows a direct Unlock"):
@@ -895,11 +1068,13 @@ func (m *Manager) lookupMapLocked(other *Manager, name string) *ebpf.Map {
 			saw["paren"] = true
 		case strings.Contains(v, "sneakyTwoHop"):
 			saw["twohop"] = true
+		case strings.Contains(v, "bad_varmethodvalue.go") && strings.Contains(v, "method value"):
+			saw["varmethodvalue"] = true
 		case strings.Contains(v, "method value"):
 			saw["methodvalue"] = true
 		}
 	}
-	for _, k := range []string{"raw", "recvAlias", "renamedRecv", "alias", "unlock", "nolock", "storeOrder", "paren", "twohop", "typealias", "methodvalue", "paramlock"} {
+	for _, k := range []string{"raw", "recvAlias", "renamedRecv", "alias", "unlock", "nolock", "storeOrder", "paren", "twohop", "typealias", "methodvalue", "paramlock", "crossfilealias", "chainedalias", "ptralias", "multiparen", "crossobject", "closurelock", "varmethodvalue", "helpermethodvalue"} {
 		if !saw[k] {
 			t.Errorf("canary missed synthetic negative %q; violations:\n%s", k, strings.Join(violations, "\n"))
 		}
@@ -1230,6 +1405,42 @@ func gatedCallsiteEvidence(t *testing.T, root string) map[string]gatedEvidence {
 							if id, ok := as.Lhs[2].(*ast.Ident); ok && id.Name != "_" {
 								ev.bound = true
 								boundName := id.Name
+								// Codex PR #6743 r3-4: a comparison only
+								// evidences THIS callsite's gate when it
+								// evaluates the value THIS binding produced.
+								// Find the first reassignment of the bound
+								// identifier after the binding — comparisons
+								// at or past it evaluate a LATER lookup's
+								// value (the ClearNATPoolIPs two-lookup
+								// shape reuses st; the second comparison
+								// must not satisfy the first callsite).
+								reassignPos := token.NoPos
+								ast.Inspect(g.body, func(n4 ast.Node) bool {
+									mark := func(p token.Pos) {
+										if p > as.Pos() && (reassignPos == token.NoPos || p < reassignPos) {
+											reassignPos = p
+										}
+									}
+									switch node := n4.(type) {
+									case *ast.AssignStmt:
+										for _, lhs := range node.Lhs {
+											if lid, ok := lhs.(*ast.Ident); ok && lid.Name == boundName {
+												mark(node.Pos())
+											}
+										}
+									case *ast.ValueSpec:
+										for _, nm := range node.Names {
+											if nm.Name == boundName {
+												mark(node.Pos())
+											}
+										}
+									case *ast.IncDecStmt:
+										if xid, ok := node.X.(*ast.Ident); ok && xid.Name == boundName {
+											mark(node.Pos())
+										}
+									}
+									return true
+								})
 								// Codex PR #6743 r2-4: the comparison must
 								// reference THIS callsite's binding, appear
 								// AFTER the assignment, and NOT inside a
@@ -1243,6 +1454,9 @@ func gatedCallsiteEvidence(t *testing.T, root string) map[string]gatedEvidence {
 									case *ast.BinaryExpr:
 										if node.Pos() <= as.Pos() {
 											return true // must come after the binding
+										}
+										if reassignPos != token.NoPos && node.Pos() >= reassignPos {
+											return true // past the reassignment: evaluates a later value (r3-4)
 										}
 										if node.Op != token.EQL {
 											return true
@@ -1341,6 +1555,25 @@ func (m *Manager) blank(name string) error {
 	return nil
 }
 `
+	crossCredit := `package dataplane
+
+func (m *Manager) reused(name string) error {
+	v4, present, st := m.lookupMapLocked("nat_pool_ips_v4")
+	if !present {
+		return nil
+	}
+	_ = v4
+	v6, present, st := m.lookupMapLocked("nat_pool_ips_v6")
+	if st == registryFresh {
+		return ErrDataplaneNotArmed
+	}
+	if !present {
+		return nil
+	}
+	_ = v6
+	return nil
+}
+`
 
 	dir := t.TempDir()
 	write := func(n, s string) {
@@ -1353,6 +1586,7 @@ func (m *Manager) blank(name string) error {
 	write("c.go", blanked)
 	write("d.go", closureCompare)
 	write("e.go", earlyCompare)
+	write("f.go", crossCredit)
 
 	ev := gatedCallsiteEvidence(t, dir)
 	if got := ev["a.go|good|map|<ident:name>"].bound && ev["a.go|good|map|<ident:name>"].compared; !got {
@@ -1375,6 +1609,15 @@ func (m *Manager) blank(name string) error {
 	}
 	if got := ev["e.go|earlyBad|map|<ident:name>"]; got.compared {
 		t.Error("pre-binding comparison must not count as gate evidence")
+	}
+	// Codex PR #6743 r3-4: the reused-identifier shape (the ClearNATPoolIPs
+	// pattern) — the SECOND lookup's comparison must not satisfy the FIRST
+	// callsite's evidence; the first callsite here has NO check of its own.
+	if got := ev[`f.go|reused|map|"nat_pool_ips_v4"`]; got.compared {
+		t.Error("a comparison after the identifier's reassignment must not count for the earlier callsite (the ClearNATPoolIPs cross-credit)")
+	}
+	if got := ev[`f.go|reused|map|"nat_pool_ips_v6"`]; !got.compared {
+		t.Error("the second callsite's own comparison must still count")
 	}
 }
 

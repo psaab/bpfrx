@@ -3347,17 +3347,21 @@ func checkDaemonDPFieldShape(path string) error {
 		switch typeSpec.Name.Name {
 		case "Daemon":
 			for _, field := range st.Fields.List {
+				fieldType := canaryExprString(field.Type)
 				for _, name := range field.Names {
-					switch name.Name {
-					case "dpCell":
+					if name.Name == "dpCell" {
 						foundCell = true
-						if got := canaryExprString(field.Type); got != "atomic.Pointer[dpSlot]" {
-							inspectErr = fmt.Errorf("Daemon.dpCell = %s, want atomic.Pointer[dpSlot]", got)
+						if fieldType != "atomic.Pointer[dpSlot]" {
+							inspectErr = fmt.Errorf("Daemon.dpCell = %s, want atomic.Pointer[dpSlot]", fieldType)
 						}
-					case "dp":
-						if got := canaryExprString(field.Type); got == "dataplane.RuntimeDataPlane" {
-							inspectErr = fmt.Errorf("Daemon.dp is a raw dataplane.RuntimeDataPlane field; #2114 publishes the dataplane through dpCell (atomic.Pointer[dpSlot])")
-						}
+						continue
+					}
+					// Codex PR #6743 r3-6: reject the raw interface field
+					// under ANY name — a renamed `fallback dataplane.
+					// RuntimeDataPlane` recreates the exact unsynchronized
+					// publication path this shape pins.
+					if fieldType == "dataplane.RuntimeDataPlane" {
+						inspectErr = fmt.Errorf("Daemon.%s is a raw dataplane.RuntimeDataPlane field; #2114 publishes the dataplane through dpCell (atomic.Pointer[dpSlot])", name.Name)
 					}
 				}
 			}
@@ -3431,6 +3435,15 @@ type Daemon struct {
 	dpCell atomic.Pointer[dpSlot]
 }
 `
+	renamedRaw := `package daemon
+
+type dpSlot struct{ v dataplane.RuntimeDataPlane }
+
+type Daemon struct {
+	dpCell   atomic.Pointer[dpSlot]
+	fallback dataplane.RuntimeDataPlane
+}
+`
 
 	cases := []struct {
 		name    string
@@ -3442,6 +3455,9 @@ type Daemon struct {
 		{"wrong cell type rejected", wrongCellType, true},
 		{"missing dpSlot rejected", missingSlot, true},
 		{"wrong slot payload rejected", wrongSlotPayload, true},
+		// Codex PR #6743 r3-6: the raw field under a DIFFERENT name must
+		// fail too — the name-literal check used to pass it.
+		{"renamed raw field rejected", renamedRaw, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

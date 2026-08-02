@@ -3,6 +3,7 @@ package dataplane
 import (
 	"errors"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,6 +19,97 @@ import (
 // entry with sentinel/absent registries (no BPF privileges needed); the
 // PRIVILEGED semantic-mutation legs run where BPF map creation works and
 // skip elsewhere (the repo's skipIfBPFUnavailable idiom).
+
+// armMuProbeArrival arms the muAcquireProbeHook seam (Codex PR #6743
+// r3-8) to close the returned channel the FIRST time a contended m.mu
+// surface is entered while armed — the blocking legs' arrival proof.
+// Arm it AFTER the holding party is parked (the holder's own pre-hook
+// fire happens before its park), start the probe goroutine, and wait on
+// the channel: the goroutine is then PROVABLY at the contended m.mu
+// acquisition, so the following non-completion window cannot pass
+// vacuously the way a signal-before-call handshake can (the goroutine
+// could previously be descheduled between signal and call for the whole
+// window). The returned disarm restores the nil production value.
+func armMuProbeArrival() (arrived <-chan struct{}, disarm func()) {
+	ch := make(chan struct{})
+	var once sync.Once
+	muAcquireProbeHook = func(site string) { once.Do(func() { close(ch) }) }
+	return ch, func() { muAcquireProbeHook = nil }
+}
+
+// armedGateDirectLockSet pins the invoke-table members that block on a
+// DIRECT m.mu acquisition BEFORE reaching any probed surface (the
+// class-3 counter/offset methods take m.mu for the offset maps ahead
+// of — or instead of — a lookup helper), so the muAcquireProbeHook
+// pre-lock seam never fires for them during the hold (Codex PR #6743
+// r3-8). The blocking legs COMPUTE the set by serialized per-member
+// attribution and require it to equal this pin: any drift means a
+// member changed its contention path and the arrival proof no longer
+// covers what the author believes. Direct-first members still get the
+// in-hold non-completion check and the post-release outcome assertion;
+// the per-goroutine arrival proof covers the helper-routed majority.
+var armedGateDirectLockSet = map[string]bool{
+	"ClearAllCounters":     true, // composes the raw counter clears under its own m.mu section
+	"ClearGlobalCounters":  true, // class 3: offset-map section precedes the registry work
+	"ClearNATRuleCounters": true, // class 3: same direct-lock shape
+	"ClearZoneCounters":    true, // class 3: same direct-lock shape
+}
+
+// startArmedGateInvoke starts every invoke-table member against m
+// (whose publisher is parked mid-hold) ONE AT A TIME, waiting for each
+// member's pre-lock probe fire before starting the next — the
+// per-member arrival proof of Codex PR #6743 r3-8. A signal-before-call
+// handshake can pass the silence window with the goroutine descheduled
+// for its whole length; the in-call pre-lock fire proves the goroutine
+// reached the contended acquisition. Members that never fire block on
+// a direct m.mu acquisition ahead of any probed surface; they are
+// named and checked against armedGateDirectLockSet. Arm the probe ONLY
+// after the publisher parked: the publisher's own pre-lock fire
+// precedes its park and would corrupt the attribution.
+func startArmedGateInvoke(t *testing.T, m *Manager, invoke map[string]func(*Manager) error) []armedGatePendingCall {
+	t.Helper()
+	var arrived atomic.Int32
+	muAcquireProbeHook = func(site string) { arrived.Add(1) }
+	t.Cleanup(func() { muAcquireProbeHook = nil })
+
+	var pending []armedGatePendingCall
+	var preLockBlockers []string
+	for name, call := range invoke {
+		before := arrived.Load()
+		p := armedGatePendingCall{name: name, done: make(chan error, 1)}
+		go func(c func(m *Manager) error, p armedGatePendingCall) {
+			p.done <- c(m)
+		}(call, p)
+		pending = append(pending, p)
+		deadline := time.Now().Add(2 * time.Second)
+		for arrived.Load() == before && time.Now().Before(deadline) {
+			select {
+			case err := <-p.done:
+				t.Fatalf("%s completed (%v) during the hold before any probe fire — it neither blocked nor reached a contended surface", name, err)
+			default:
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if arrived.Load() == before {
+			preLockBlockers = append(preLockBlockers, name)
+		}
+	}
+	if len(preLockBlockers) != len(armedGateDirectLockSet) {
+		t.Fatalf("direct-first-lock set %v drifted from the pin %v", preLockBlockers, armedGateDirectLockSet)
+	}
+	for _, name := range preLockBlockers {
+		if !armedGateDirectLockSet[name] {
+			t.Fatalf("direct-first-lock set %v drifted from the pin %v", preLockBlockers, armedGateDirectLockSet)
+		}
+	}
+	return pending
+}
+
+// armedGatePendingCall tracks one in-flight invoke-table member.
+type armedGatePendingCall struct {
+	name string
+	done chan error
+}
 
 // armedGateSentinel seeds the registry into the retained classification
 // (nonempty m.maps, loaded=false) without providing any map a method
@@ -366,31 +458,17 @@ func TestManager_ArmedGate_BlockedStart(t *testing.T) {
 	startDone := runSyntheticStart(t, m, map[string]*ebpf.Map{"sentinel_unused": nil})
 	<-entered // the publisher holds m.mu, pre-Store(true)
 
-	// Readers from every helper-consuming class block on the hold. Each
-	// goroutine signals started immediately BEFORE its call (Codex PR
-	// #6743 r2-5b: without an arrival handshake, a goroutine first
-	// scheduled AFTER the release would complete on time and falsely
-	// prove it blocked).
-	type pendingCall struct {
-		name    string
-		started chan struct{}
-		done    chan error
-	}
-	var pending []pendingCall
-	for name, call := range invoke {
-		p := pendingCall{name: name, started: make(chan struct{}), done: make(chan error, 1)}
-		go func(c func(m *Manager) error, p pendingCall) {
-			close(p.started)
-			p.done <- c(m)
-		}(call, p)
-		pending = append(pending, p)
-	}
-	for _, p := range pending {
-		<-p.started // every reader is in-flight before the silence window
-	}
+	// Readers from every helper-consuming class block on the hold. Codex
+	// PR #6743 r3-8: prove EVERY reader arrived at its contended m.mu
+	// acquisition before the silence window — the previous
+	// signal-before-call handshake plus sleep could pass with a goroutine
+	// descheduled for the whole window (a false-green "it blocked"). The
+	// starter waits for every helper-routed member's pre-lock probe fire
+	// (the publisher's own fire preceded its park); the calibrated
+	// direct-lock members are exempt per the pin.
+	pending := startArmedGateInvoke(t, m, invoke)
 
 	// None may complete during the hold.
-	time.Sleep(150 * time.Millisecond)
 	for _, p := range pending {
 		select {
 		case err := <-p.done:
@@ -471,16 +549,17 @@ func TestManager_ArmedGate_PassThenBlock(t *testing.T) {
 	<-postStoreEntered // in-hold, AFTER Store(true), before unlock
 
 	// Post-Store: a NEW invocation passes the loaded precheck and blocks at
-	// registry selection (the publisher still holds m.mu). The started
-	// handshake proves the goroutine reached the call during the hold
-	// (Codex PR #6743 r2-5b).
-	attachStarted := make(chan struct{})
+	// registry selection (the publisher still holds m.mu). The arrival
+	// signal fires from the muAcquireProbeHook seam INSIDE the contended
+	// call (Codex PR #6743 r3-8) — a pre-call handshake could pass the
+	// timeout below without the goroutine ever reaching m.mu.
+	probeArrived, disarmProbe := armMuProbeArrival()
+	defer disarmProbe()
 	attachDone := make(chan error, 1)
 	go func() {
-		close(attachStarted)
 		attachDone <- m.AttachTC(1)
 	}()
-	<-attachStarted
+	<-probeArrived
 	select {
 	case err := <-attachDone:
 		t.Fatalf("post-Store AttachTC completed (%v) while the publisher held m.mu — did not block at registry selection", err)
@@ -531,24 +610,10 @@ func TestManager_ArmedGate_RetainedReStartOverlap(t *testing.T) {
 	startDone := runSyntheticStart(t, m, map[string]*ebpf.Map{"sentinel_restart": nil})
 	<-entered
 
-	type pendingCall struct {
-		name    string
-		started chan struct{}
-		done    chan error
-	}
-	var pending []pendingCall
-	for name, call := range invoke {
-		p := pendingCall{name: name, started: make(chan struct{}), done: make(chan error, 1)}
-		go func(c func(m *Manager) error, p pendingCall) {
-			close(p.started)
-			p.done <- c(m)
-		}(call, p)
-		pending = append(pending, p)
-	}
-	for _, p := range pending {
-		<-p.started
-	}
-	time.Sleep(150 * time.Millisecond)
+	// Codex PR #6743 r3-8: same arrival proof as the fresh blocked-Start
+	// leg — every helper-routed reader must PROVABLY reach its contended
+	// m.mu acquisition before the silence window.
+	pending := startArmedGateInvoke(t, m, invoke)
 	for _, p := range pending {
 		select {
 		case err := <-p.done:
@@ -651,14 +716,14 @@ func TestManager_ArmedGate_LookupOwnership(t *testing.T) {
 			}()
 			<-entered // the helper holds m.mu
 
-			pubStarted := make(chan struct{})
+			probeArrived, disarmProbe := armMuProbeArrival()
+			defer disarmProbe()
 			pubDone := make(chan struct{})
 			go func() {
 				defer close(pubDone)
-				close(pubStarted) // arrival handshake before the contended call (r2-5b)
 				m.publishShimRegistryLocked(nil, map[string]*ebpf.Map{"sessions": nil}, nil)
 			}()
-			<-pubStarted
+			<-probeArrived // the publisher provably reached the contended m.mu acquisition (r3-8)
 			select {
 			case <-pubDone:
 				t.Fatal("publisher completed while the lookup helper held m.mu")
@@ -699,13 +764,13 @@ func TestManager_ArmedGate_SwapXDPEntryProgOwnership(t *testing.T) {
 	go func() { swapDone <- m.swapXDPEntryProg("test_prog") }()
 	<-entered // the :632 write section holds m.mu
 
-	getterStarted := make(chan struct{})
+	probeArrived, disarmProbe := armMuProbeArrival()
+	defer disarmProbe()
 	getterDone := make(chan string, 1)
 	go func() {
-		close(getterStarted) // arrival handshake (r2-5b)
 		getterDone <- m.XDPEntryProgram()
 	}()
-	<-getterStarted
+	<-probeArrived // the getter provably reached the contended m.mu acquisition (r3-8)
 	select {
 	case got := <-getterDone:
 		t.Fatalf("XDPEntryProgram() = %q during the swap write hold — the getter did not block", got)
@@ -751,13 +816,13 @@ func TestManager_ArmedGate_XDPSelectorTwoSided(t *testing.T) {
 	}()
 	<-entered // the selector write section holds m.mu
 
-	getterStarted := make(chan struct{})
+	probeArrived, disarmProbe := armMuProbeArrival()
+	defer disarmProbe()
 	getterDone := make(chan string, 1)
 	go func() {
-		close(getterStarted) // arrival handshake (r2-5b)
 		getterDone <- m.XDPEntryProgram()
 	}()
-	<-getterStarted
+	<-probeArrived // the getter provably reached the contended m.mu acquisition (r3-8)
 	select {
 	case got := <-getterDone:
 		t.Fatalf("XDPEntryProgram() = %q during the selector write hold — did not block", got)
@@ -823,13 +888,13 @@ func TestManager_ArmedGate_DetachRetainedClaims(t *testing.T) {
 	startDone := runSyntheticStart(t, m, map[string]*ebpf.Map{"sentinel_restart": nil})
 	<-entered
 
-	detachStarted := make(chan struct{})
+	probeArrived, disarmProbe := armMuProbeArrival()
+	defer disarmProbe()
 	detachDone := make(chan error, 1)
 	go func() {
-		close(detachStarted) // arrival handshake (r2-5b)
 		detachDone <- m.DetachXDP(ifindex)
 	}()
-	<-detachStarted
+	<-probeArrived // the detach provably reached the contended registry lookup (r3-8)
 	select {
 	case err := <-detachDone:
 		t.Fatalf("DetachXDP completed (%v) during the publication hold — its registry lookup did not block", err)
@@ -885,6 +950,53 @@ type armedGateFakeLink struct {
 
 func (l *armedGateFakeLink) Unpin() error { l.unpinned = true; return nil }
 func (l *armedGateFakeLink) Close() error { l.closed = true; return nil }
+
+// TestManagerTeardownClearsLinkMembership is the Codex PR #6743 r3-1
+// regression leg: Teardown (Close + Cleanup) destroys the kernel links,
+// so the xdpLinks/tcLinks membership it leaves behind must be EMPTY —
+// otherwise a same-process re-Start (the commit-confirmed rollback →
+// bootstrap-exit re-arm) hits AttachXDP's stale-membership short-circuit,
+// attachUserspaceShimXDP swallows the "already attached" error, and the
+// corrected commit reports success with no AF_XDP ingress. Fail-on-
+// revert: without the Teardown clear the memberships survive and the
+// assertions fail. The filesystem sweep is neutralized through the
+// teardownCleanupFn seam (the real Cleanup unpins and removes the
+// production /sys/fs/bpf/xpf tree). The second half pins the Close-only
+// polarity: Close keeps the membership because its pinned kernel links
+// stay live for hitless restart — a "clear in Close too" simplification
+// would make a post-Close AttachXDP double-attach over a live link.
+func TestManagerTeardownClearsLinkMembership(t *testing.T) {
+	defer func(fn func() error) { teardownCleanupFn = fn }(teardownCleanupFn)
+	teardownCleanupFn = func() error { return nil }
+
+	xdpFake := &armedGateFakeLink{}
+	tcFake := &armedGateFakeLink{}
+	m := New()
+	m.xdpLinks[7] = xdpFake
+	m.tcLinks[9] = tcFake
+
+	if err := m.Teardown(); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	if !xdpFake.closed || !tcFake.closed {
+		t.Fatalf("Teardown did not close the link handles (xdp:%v tc:%v)", xdpFake.closed, tcFake.closed)
+	}
+	if len(m.xdpLinks) != 0 || len(m.tcLinks) != 0 {
+		t.Fatalf("Teardown left stale link membership (xdp:%d tc:%d) — a re-Start would skip re-attach on the destroyed links",
+			len(m.xdpLinks), len(m.tcLinks))
+	}
+
+	// Close-only polarity: the hitless path keeps the pinned kernel links
+	// live, so the membership must survive Close.
+	m2 := New()
+	m2.xdpLinks[11] = &armedGateFakeLink{}
+	if err := m2.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if len(m2.xdpLinks) != 1 {
+		t.Fatal("Close cleared the xdpLinks membership — a post-Close AttachXDP would double-attach over the live pinned link")
+	}
+}
 
 // TestManager_ArmedGate_AbsentIfaceZoneMapNoOp is continuation leg (iii):
 // with iface_zone_map ABSENT (armed or retained), setXDPAttachedFlag

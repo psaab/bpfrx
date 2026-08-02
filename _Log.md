@@ -66536,3 +66536,58 @@ break — `go vet` confirmed passing under every revert.
   pkg/daemon/daemon_dp_race_test.go,
   pkg/dataplane/armed_gate_matrix_test.go,
   pkg/dataplane/armed_gate_legs_test.go, _Log.md
+## 2026-08-02 — #2114 PR #6743 Codex r3 review-round fixes (6M+2m)
+
+- **Timestamp**: 2026-08-02 (fix/2114-dp-accessor)
+- **Action**: Codex r3 (pinned at 2e84d42fd) returned MERGE-NEEDS-MAJOR
+  (6 majors + 2 minors). All verified against the tree and folded.
+  r3-1 (production): Manager.Teardown now CLEARS the xdpLinks/tcLinks
+  membership after Close+Cleanup — Close closed the Go handles and
+  Cleanup destroyed the kernel links, so the surviving entries made a
+  same-process re-Start (commit-confirmed rollback → bootstrap-exit
+  re-arm) hit AttachXDP's stale "already attached" short-circuit, which
+  attachUserspaceShimXDP swallows: the corrected commit reported success
+  with no AF_XDP ingress. Close alone deliberately keeps the membership
+  (hitless restart's pinned links stay live in the kernel). The /sys
+  sweep is test-neutralized through the new teardownCleanupFn seam;
+  TestManagerTeardownClearsLinkMembership pins both polarities and is
+  fail-on-revert verified. The flow pre-existed on master byte-for-byte;
+  this PR's recurrence test newly drove the real Teardown, so the hole
+  is fixed here rather than deferred to #6741. r3-2: the registry
+  canary's alias resolution is now PACKAGE-wide with a fixpoint
+  (cross-file aliases, chained `type B = A`, pointer-RHS `type P =
+  *Manager` params), local propagation covers `var x = m`, and a shared
+  recursive unwrapOwnerIdent replaces the one-layer paren/star unwraps.
+  r3-3: lock credit is scoped to the receiver's own alias closure (an
+  access through a *Manager parameter in an allowlisted function now
+  fails) and the lock scan prunes FuncLit bodies (a never-called
+  closure's Lock no longer credits a later access). r3-4: the
+  gate-evidence comparison scan stops at the bound identifier's
+  REASSIGNMENT — the ClearNATPoolIPs two-lookup st-reuse no longer
+  cross-credits the second comparison to the first callsite
+  (fail-on-revert verified against the live site). r3-5: method-value
+  detection covers `var u = m.mu.Unlock`, and any lookup-helper
+  reference outside call position (an unmanifested callsite) fails the
+  canary. r3-6: the Daemon field-shape canary rejects a raw
+  dataplane.RuntimeDataPlane field under ANY name, not just `dp`.
+  r3-7: three residual snapshot double-loads threaded —
+  refreshFabricFwd's SetFabricForwarding/SyncFabricState pair now shares
+  one cell load, newConntrackGC takes Run's phase-5 snapshot (as
+  conntrack.RuntimeDomainProvider, keeping daemon_gc.go out of the
+  #1451 import allowlist), and applySyslogConfig drops its redundant
+  dataplane() guard (one nil-safe load inside applyResult). r3-8: every
+  timeout-based blocking leg now proves goroutine arrival from the new
+  muAcquireProbeHook pre-lock seam (lookup helpers, publisher,
+  XDPEntryProgram) — the invoke-table legs use serialized per-member
+  attribution with the direct-first-lock set (the four class-3 Clear*
+  counter methods) computed and pin-checked. Also folded two Copilot
+  suppressed comments (the daemon_system.go double-load — same fix as
+  r3-7c — and a tooling-attribution comment reworded to the invariant).
+- **File(s)**: pkg/dataplane/loader.go, pkg/dataplane/armed_gate.go,
+  pkg/dataplane/armed_gate_matrix_test.go,
+  pkg/dataplane/armed_gate_legs_test.go,
+  pkg/dataplane/retirement_boundary_canary_test.go,
+  pkg/dataplane/README.md, pkg/daemon/daemon_ha_fabric.go,
+  pkg/daemon/daemon_gc.go, pkg/daemon/daemon_gc_test.go,
+  pkg/daemon/daemon_run.go, pkg/daemon/daemon_system.go,
+  pkg/daemon/daemon_ha_userspace_readiness.go, _Log.md
