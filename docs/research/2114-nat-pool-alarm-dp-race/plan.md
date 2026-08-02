@@ -1,6 +1,37 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v97 — r93 Codex folds (2 documentation
+- **Status**: DRAFT v98 — r94 Codex fold (1 MAJOR — the first
+  MAJOR since r88): the v97 oracle-role definition was non-
+  exclusive in BOTH directions (§9 applied the continuation
+  oracle to `ClearSessionCounts`/`GetMapStats`, OUTSIDE the 17,
+  while three intended sites had no named leg —
+  `SetNAT64Config`'s optional `nat64_prefix_map` (the generic
+  fresh oracle stops at the required `nat64_configs` first),
+  `seedInterfaceCounter`'s `interface_counters`, and
+  `setXDPAttachedFlag`'s absent-`iface_zone_map` path). v98
+  reverts to the EXTENSIONAL definition (the 17 sites ARE the
+  enumerated list — the list is the definition) and makes the
+  §9 continuation coverage COEXTENSIVE with it: three new legs
+  named ((i) `SetNAT64Config` required-present/optional-absent
+  asserts success AND the required write landed; (ii)
+  `seedInterfaceCounter`'s nil-guard distinguished from a
+  spurious error via absent/present fixture pair; (iii) the
+  absent-`iface_zone_map` early-boot no-op NIL asserted
+  distinct from the Detach leg's map-present seed), and the
+  continuation-PATTERN's application to the single-selector
+  set's multi-runtime-map methods (`ClearSessionCounts`,
+  `GetMapStats`) made explicit as pattern-not-membership.
+  Codex's fold-2 verification (fold-free): the five-shape
+  taxonomy correct and disjoint with the per-file breakdown
+  table (14+1+3+21+2 = 41 matching the per-file
+  1+7+2+6+1+1+3+19+1); no double count (classification follows
+  the absent-key branch — loader.go:730 is an if-ok skip
+  because absence continues at :744 even though its present
+  body can return an error); the A3/§7/§9 cross-block agreement
+  otherwise intact. r94 verdicts: Codex PLAN-NEEDS-MAJOR (1M),
+  AGY PLAN-READY, Claude SMR PLAN-READY; pending convergence
+  review r95.
+- **Prior**: DRAFT v97 — r93 Codex folds (2 documentation
   minors, no MAJOR, no design change): minor-1's transitivity
   reframe (the v96 "composed into multi-access operations"
   criterion was transitive and therefore non-exhaustive — the
@@ -3513,7 +3544,9 @@
   Codex's two documentation minors: the oracle-role reframe of
   the 17-site subset (host shapes as description, not
   criterion); the fifth optional-read shape + the full 41-read
-  breakdown).
+  breakdown). v98 (r94 Codex's MAJOR: the extensional
+  definition restored + the coextensive continuation coverage —
+  three new legs named).
 
 ---
 
@@ -5267,18 +5300,22 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    16" while its own body enumerated FOURTEEN if-ok sites, and
    the "complete list" phrasing overclaimed: the full
    neutral-outcome access set across `pkg/dataplane` is ~41 sites
-   (r87 Codex's table), of which these 17 are the ones whose
-   absent outcome the §9 mixed-method oracle legs exercise —
-   the MIXED-METHOD subset, defined by that oracle role and NOT
-   by a transitive multi-access criterion (v97 reframe per r93
-   Codex minor-1 — the v96 "composed into multi-access
-   operations" criterion was transitive and therefore non-
-   exhaustive: the same proof composes `Compile` with
-   `clearNativeXDPFlagsForIfindexes`, whose selector
-   `loader.go:928` sits in the single-selector remainder, and
-   `ClearSessionCounts`/`GetMapStats` are single-selector-but-
-   multi-runtime-map; the accurate statement is the host-shape
-   DESCRIPTION, not a defining criterion: 15 sites in
+   (r87 Codex's table), of which these 17 form the MIXED-METHOD
+   subset — defined EXTENSIONALLY (the 17 sites ARE the
+   enumerated list below; the list is the definition, v98 per
+   r94 Codex M1 — the v97 oracle-role definition was non-
+   exclusive in BOTH directions: §9 applies the continuation
+   oracle to `ClearSessionCounts`/`GetMapStats`, which are
+   OUTSIDE the 17, while three intended sites' absent outcomes
+   had no named leg — `SetNAT64Config`'s optional
+   `nat64_prefix_map` (the generic fresh oracle stops at the
+   required `nat64_configs` first), `seedInterfaceCounter`'s
+   `interface_counters`, and `setXDPAttachedFlag`'s absent
+   `iface_zone_map` path (the Detach leg requires that map
+   PRESENT); the §9 coverage is made coextensive with the
+   enumerated list below). The host shapes, as DESCRIPTION only
+   (v97 per r93 Codex minor-1 — no transitive criterion):
+   15 sites in
    MULTI-SELECTOR methods (methods with more than one DIRECT
    registry selector) plus TWO single-selector sites
    (`compiler.go:353`, `loader.go:591`) whose host methods
@@ -5431,7 +5468,32 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    past into the attachment work — the single-value read SKIPS the
    redirect-map population, it does not return — the v91 "nil-guard"
    label here contradicted the bucket split, corrected at v95 per
-   r91 Codex minor-2). This matters
+   r91 Codex minor-2). The continuation coverage is COEXTENSIVE
+   with the enumerated 17-site list (v98 per r94 Codex M1 — the
+   v97 oracle-role definition left three sites' absent outcomes
+   without a named leg, now added): (i) `SetNAT64Config`'s
+   optional access — a fixture with REQUIRED `nat64_configs`
+   PRESENT and OPTIONAL `nat64_prefix_map` ABSENT asserts the
+   call SUCCEEDS AND the required write landed (the config at
+   index 0 is readable back / the armed+retained states both
+   proceed), catching an incorrect error-on-optional-absent;
+   (ii) `seedInterfaceCounter`'s nil-guard — a fixture with
+   `interface_counters` ABSENT asserts `AttachXDP`/`AddTxPort`
+   SUCCEED (the seed skips) AND a fixture with it PRESENT asserts
+   the seed wrote (the pre-populated entry exists), distinguishing
+   the nil-guard return from a spurious error; (iii)
+   `setXDPAttachedFlag`'s absent-`iface_zone_map` path — a
+   fixture with `iface_zone_map` ABSENT asserts the call returns
+   master's early-boot no-op NIL (the :700 early return) WITHOUT
+   touching the claims, distinct from the Detach leg's
+   map-PRESENT seed. And the §9 continuation pattern's application
+   to `ClearSessionCounts`/`GetMapStats` (single-ACCESS-SELECTOR
+   set members whose selectors loop multiple runtime maps) is
+   explicit: their legs exercise the multi-map continuation, and
+   they are NOT in the 17-site mixed list — the two sets'
+   relationship is: the continuation-assertion PATTERN applies to
+   both, the 17-site list is the extensional definition of the
+   mixed subset. This matters
    because the AST canary cannot distinguish required from
    optional consumption — the continuation legs are the only
    net catching a premature optional-miss return.
@@ -6058,7 +6120,9 @@ Still open:
    optional-read split, the mixed-subset oracle-role scoping
    (host shapes described, not defining, per v97), the
    SINGLE-ACCESS-SELECTOR naming, the FIVE-shape optional-outcome
-   enumeration (14+1+3+21+2 = 41), and the census
+   enumeration (14+1+3+21+2 = 41), the EXTENSIONAL 17-site
+   definition with the coextensive continuation coverage (the
+   three v98 legs), and the census
    labels.
 
 ---
