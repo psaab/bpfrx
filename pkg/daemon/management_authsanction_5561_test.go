@@ -298,8 +298,12 @@ func TestMgmtWithheldGrantIsExitableByASubsequentCommit_5561(t *testing.T) {
 // pass-through: an unauthenticated, mutating REST/config API reachable from the
 // network.
 //
-// FAIL-ON-REVERT: delete `(!m.cur.tls || mgmtAddrIsLoopback(m.cur.httpsAddr))`
-// and the live snapshot goes nil here while 10.0.0.1:8443 is serving.
+// FAIL-ON-REVERT: delete the `mgmtAddrIsLoopback(e.httpsAddr)` conjunct from
+// mgmtEndpoint.allLoopback and the live snapshot goes nil here while
+// 10.0.0.1:8443 is serving.
+//
+// What the retained leg enforces INSTEAD of the nil is the deny-all set (#5561
+// round 14, MAJOR 4), not the credential the commit deleted — asserted below.
 func TestMgmtNilAuthNeverDropsARetainedOffLoopbackHTTPSLeg_5561(t *testing.T) {
 	reg := newFakeReg()
 	m := newTestMgmt(reg)
@@ -345,9 +349,16 @@ func TestMgmtNilAuthNeverDropsARetainedOffLoopbackHTTPSLeg_5561(t *testing.T) {
 			"all. The #4047/#5127 clamp that justified the nil was evaluated against the bind "+
 			"this commit attempted, not against the listener that is actually serving — FAIL-OPEN",
 			m.cur.httpsAddr)
-	} else if snap.Users["webadmin"] != "secret" {
-		t.Fatalf("the retained off-loopback HTTPS listener lost its credential set (snapshot "+
-			"%+v) — it must keep enforcing the previous one until the loopback bind converges", snap)
+	} else if pw, ok := snap.Users["webadmin"]; ok {
+		t.Fatalf("the retained off-loopback HTTPS listener still accepts webadmin=%q, a credential "+
+			"this commit DELETED (#5561 round 14, MAJOR 4). Keeping the previous set alive there "+
+			"was the pre-round-14 behavior and it inverted the operator's instruction: the secret "+
+			"they removed kept authenticating full-power requests on a routable address for as "+
+			"long as the loopback bind kept failing", pw)
+	} else if api.CredentialCount(snap) != 0 {
+		t.Fatalf("the retained off-loopback HTTPS listener enforces %+v, want the EMPTY (deny-all) "+
+			"set — the committed policy authorizes no credential, and deny-all is the only way to "+
+			"say that at an address where nil would fail open", snap)
 	}
 
 	// Control: the suppression is scoped to the RETAINED off-loopback leg. Once

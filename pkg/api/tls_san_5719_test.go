@@ -388,7 +388,7 @@ func TestBuildHTTPSServerThreadsBindHost(t *testing.T) {
 		got = bindHost
 		return tls.Certificate{}, nil
 	}
-	if _, err := s.buildHTTPSServer("10.0.0.1:8443"); err != nil {
+	if _, err := s.buildHTTPSServer("10.0.0.1:8443", s.newAuthSlot()); err != nil {
 		t.Fatalf("buildHTTPSServer: %v", err)
 	}
 	if got != "10.0.0.1" {
@@ -397,7 +397,7 @@ func TestBuildHTTPSServerThreadsBindHost(t *testing.T) {
 
 	// A wildcard bind yields an empty host (no single name to certify).
 	got = "sentinel"
-	if _, err := s.buildHTTPSServer(":8443"); err != nil {
+	if _, err := s.buildHTTPSServer(":8443", s.newAuthSlot()); err != nil {
 		t.Fatalf("buildHTTPSServer wildcard: %v", err)
 	}
 	if got != "" {

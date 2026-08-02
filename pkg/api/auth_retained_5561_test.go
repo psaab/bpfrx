@@ -98,6 +98,36 @@ func TestAuthForRetainedListenerDoesNotAlias_5561(t *testing.T) {
 	}
 }
 
+// The no-alias property must hold on the UNIVERSAL-live path too. That branch
+// used to return `next` itself, so the claim above ("neither operand is ever
+// shared") was true only of the branch its own test happened to take — and this
+// is the branch the round-9 hoist relies on, where the snapshot published before
+// an off-box socket is created comes straight from the config the reconciler is
+// still holding (#5561 round 14).
+func TestAuthForRetainedListenerUniversalLiveDoesNotAlias_5561(t *testing.T) {
+	next := &AuthConfig{Users: map[string]string{"admin": "pw"}, APIKeys: map[string]bool{"k": true}}
+	got := AuthForRetainedListener(nil, next)
+	if got == nil {
+		t.Fatal("got nil: a nil live snapshot is the UNIVERSAL set, so next is a tightening and " +
+			"must be published whole")
+	}
+	if got == next {
+		t.Fatal("the result IS next: a later edit of the config rewrites what the listener enforces")
+	}
+	next.Users["sneak"] = "in"
+	next.APIKeys["sneaky-key"] = true
+	if _, ok := got.Users["sneak"]; ok {
+		t.Fatalf("got %+v: the result aliases next.Users", got)
+	}
+	if got.APIKeys["sneaky-key"] {
+		t.Fatalf("got %+v: the result aliases next.APIKeys", got)
+	}
+	// Still the whole committed set — the copy must not lose anything.
+	if got.Users["admin"] != "pw" || !got.APIKeys["k"] {
+		t.Fatalf("got %+v, want a faithful copy of the committed set", got)
+	}
+}
+
 // A nil `next` is the remove-all-api-auth direction, which reconcileTo handles
 // separately behind its loopback gate; the helper must not manufacture a
 // credential set for it.

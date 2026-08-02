@@ -67348,3 +67348,94 @@ break — `go vet` confirmed passing under every revert.
   pkg/daemon/management_authsanction_5561_test.go,
   pkg/daemon/management_5866_test.go, pkg/daemon/README.md, pkg/api/README.md,
   _Log.md
+
+## 2026-08-01 — #5561 round 14: fence the management desired state to ONE committed generation
+
+- **Timestamp**: 2026-08-01
+- **Action**: Fold the five MAJORs from the independent Codex review of
+  `47bbef4fc`. Four of them are consequences of one root cause the last four
+  rounds patched around: `reconcile` derived the ENDPOINT from a possibly-stale
+  configuration and then repaired only its auth field. Round 14 fences the
+  generation instead of adjusting another predicate.
+- **The fence (MAJOR 1 + MAJOR 3)** — `withCommittedAuth` (endpoint from `cfg`,
+  credentials from the store) is replaced by `committedDesired` (BOTH from
+  `store.ActiveConfig()`). The hybrid it produced belonged to no committed
+  generation, and nothing downstream could reason about it:
+  - with the committed policy NIL, the hybrid is C0's OFF-LOOPBACK endpoint
+    under C1's nil auth. Nil auth has no pre-bind publication and `ReconcileHTTP`
+    serves before it returns, so the listener binds and serves unauthenticated;
+    the post-bind gate only suppresses ANOTHER nil store and cannot restore
+    authentication. Permanent, routable, unauthenticated mutating API (MAJOR 1).
+  - with it non-nil, the hybrid's `next` NAMES the stale address, so
+    `everyLiveLegNamedBy` reads TRUE and the whole committed set publishes at an
+    endpoint the commit never authorized it for (MAJOR 3). **Round 13 did not
+    close this** — it sharpened WHICH question is asked; the hybrid corrupts the
+    `next` the question is asked ABOUT. Confirmed by mutation, not by reading.
+- **The claim in the header comment was FALSE as written** and is corrected:
+  "the apply path already runs commits one at a time, so a newer generation can
+  never race or complete out of order behind an older one". Applies are
+  serialized; their CONTENT is not ordered. `daemon_dhcp.go:85` snapshots
+  `ActiveConfig()` and THEN waits on the apply semaphore, so an OLDER generation
+  can be the LAST one applied while no two applies ever interleave.
+- **MAJOR 2 — per-leg auth snapshots** (`authSlot`, `pkg/api`). `stopLegLocked`
+  only closes a channel; the socket keeps accepting until the serve goroutine
+  reaches `Shutdown`, and what it accepted is served for the whole drain, while
+  `ReconcileHTTP`/`ReconcileHTTPS` return immediately and the reconciler then
+  publishes. A credential authorized for the NEW address was therefore valid on
+  the address the same commit RETIRED. Each leg now carries its own slot: LIVE
+  legs FOLLOW `s.auth` (the #5866 live swap is byte-for-byte unchanged), a leg
+  is PINNED at retirement to what it was already serving, and `ReplaceAuth` only
+  ever intersects a pinned slot — revocations still land on a draining listener,
+  grants and nils never do.
+- **MAJOR 4 — a nil publish that cannot land becomes DENY-ALL, not the deleted
+  secret.** When `next.Auth == nil` and a live leg is still off-loopback, rounds
+  7-13 left the live snapshot ALONE: the credential the operator had just
+  deleted went on authenticating there for as long as the loopback bind kept
+  failing. Indefinite, and the exact inversion of the instruction. The single
+  `publishNilDirectionLocked` (called before AND after the rebinds) publishes
+  nil once every live leg is loopback and the EMPTY (deny-all) set otherwise —
+  the same over-restrict-and-retry posture the intersection takes. **Two tests
+  pinned the unsafe behaviour and are inverted with the property restated**
+  (`management_5866_test.go`, `management_authsanction_5561_test.go`); the two
+  stale-replay tests whose premise the fence removes are restated around the
+  fence itself. That is the second time on this PR a test locked in what it was
+  meant to prevent.
+- **MAJOR 5 — boot retry debt was not real debt.** Every "over-restrict and let
+  the next commit converge" argument in this file is only as good as the
+  convergence, and two boot paths had none. A boot HTTP bind failure returned
+  before `m.srv` was assigned, so `reconcileTo`'s `m.srv == nil` short-circuit
+  made every later reconcile a silent no-op — management down for the life of
+  the process. A boot HTTPS failure is deliberately non-fatal, but `startTo`
+  recorded the DESIRED HTTPS fingerprint as CONVERGED, so the leg-changed test
+  was false on every subsequent commit and `ReconcileHTTPS` was never called
+  again. `startTo` now adopts the server whether or not the bind succeeded (it
+  holds no socket on that path) and asks the new `api.Server.HTTPSServing()`
+  rather than inferring convergence from a nil error.
+- **Also**: the fourth inverted assertion (`management_authpublish_5561_test.go`)
+  checked only "non-nil and not old", which a premature publish of the NEW
+  secret satisfies — it now asserts the empty intersection the socket is
+  actually created under. And `AuthForRetainedListener(nil, next)` aliased
+  `next` while the no-alias test claimed neither operand is ever shared; the
+  universal-live branch now returns a copy, with a test that takes that branch.
+- **RED-then-GREEN**, `go build ./...` and `go vet ./pkg/api/... ./pkg/daemon/...`
+  rc 0 in EVERY state (mutant and restored). Eight mutations, each reddening
+  only its own guards with a clean control: (1) endpoint from `cfg`, auth from
+  the store → the three stale-replay guards red; (2) no pin at retirement → both
+  retired-leg guards red, live-leg control green; (3) `tighten` applies a nil →
+  the no-auth guard red ALONE; (4) delete the deny-all arm → five guards red;
+  (5) drop the server on a boot HTTP bind failure → the HTTP retry guard red;
+  (6) record an unserved HTTPS fingerprint → the HTTPS retry guard red; (7)
+  return `next` itself on universal-live → the alias guard red; (8) publish the
+  whole set early → the strengthened ordering assertion red. The first attempt
+  at (5) also dropped `m.srv` on the SUCCESS path and reddened its controls —
+  a mutation wider than the claim, redone faithfully.
+- **File(s)**: pkg/daemon/management.go, pkg/api/listener.go, pkg/api/server.go,
+  pkg/api/auth.go, pkg/api/listener_retiredauth_5561_test.go,
+  pkg/api/auth_retained_5561_test.go, pkg/api/config_authz_5561_test.go,
+  pkg/api/server_authswap_5866_test.go, pkg/api/tls_san_5719_test.go,
+  pkg/daemon/management_bootretry_5561_test.go,
+  pkg/daemon/management_authstale_5561_test.go,
+  pkg/daemon/management_authsanction_5561_test.go,
+  pkg/daemon/management_authpublish_5561_test.go,
+  pkg/daemon/management_5866_test.go, pkg/daemon/README.md, pkg/api/README.md,
+  _Log.md

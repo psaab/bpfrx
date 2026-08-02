@@ -206,6 +206,17 @@ func TestMgmtCredentialRotationPrecedesTheRebind_5561(t *testing.T) {
 			"secret. It serves from the moment it is created, so the secret the operator "+
 			"replaced was live on the new socket for as long as the bind took", snap)
 	}
+	// "not the old secret" is satisfied by publishing the NEW one early, which is
+	// the grant this rotation must withhold until the rebind converges — the old
+	// listener is still serving at 10.0.0.1:8080 while this bind is in flight, and
+	// secret-b was committed for 10.0.0.2:8080. So assert the VALUE the socket is
+	// created under, not merely what it is not (#5561 round 14).
+	if api.CredentialCount(snap) != 0 {
+		t.Fatalf("the rebound HTTP listener was bound under auth snapshot %+v, want the EMPTY "+
+			"(deny-all) intersection. A disjoint rotation intersects to nothing, and publishing "+
+			"secret-b before this bind converges would hand it to the listener still serving "+
+			"10.0.0.1:8080 — the address this commit is moving away from", snap)
+	}
 	if live := m.srv.LiveAuth(); live == nil || live.Users["admin"] != "secret-b" {
 		t.Fatalf("post-reconcile snapshot = %+v, want the rotated secret — the rebind converged, "+
 			"so the full committed set must be live", live)

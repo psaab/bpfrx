@@ -22,6 +22,17 @@ type listenerLeg struct {
 	ln       net.Listener
 	stopCh   chan struct{}
 	stopOnce sync.Once
+	// slot is THIS leg's view of the credential policy (#5561 round 14). While
+	// the leg is live it FOLLOWS the server-wide snapshot, so a ReplaceAuth is
+	// enforced on the very next request exactly as before. When the leg is
+	// RETIRED (stopLegLocked) the slot is PINNED to what this address was
+	// serving at that instant, and from then on only ever tightens — see
+	// authSlot and Server.ReplaceAuth.
+	slot *authSlot
+	// drained is set by the serve goroutine as its LAST act, so a retired leg can
+	// be reaped from Server.retiring without joining it. Atomic for the same
+	// lock-ordering reason as dead.
+	drained atomic.Bool
 	// dead is set when the leg's serve loop exits UNEXPECTEDLY — the listener
 	// terminated on its own, not via a requested shutdown (stopLegLocked /
 	// rootCtx). EffectiveHTTPAddr treats a dead leg as not-serving so `show
@@ -43,12 +54,21 @@ type listenerLeg struct {
 // (stopLegLocked), or (c) the daemon root context is cancelled — then it runs a
 // bounded 5s graceful drain (Shutdown closes ln + unblocks Serve) and joins.
 // Caller holds lifeMu (so rootCtx is set and reads are consistent).
-func (s *Server) serveLegLocked(srv *http.Server, ln net.Listener, isTLS bool) *listenerLeg {
-	leg := &listenerLeg{srv: srv, ln: ln, stopCh: make(chan struct{})}
+// slot is the credential slot srv's handler was built with (buildHTTPServer /
+// buildHTTPSServer); every production call site supplies the same one, so the
+// leg's pin and the handler's reads are the same object. A nil is substituted
+// rather than stored, so ReplaceAuth's walk over retiring legs can never meet
+// one.
+func (s *Server) serveLegLocked(srv *http.Server, ln net.Listener, isTLS bool, slot *authSlot) *listenerLeg {
+	if slot == nil {
+		slot = s.newAuthSlot()
+	}
+	leg := &listenerLeg{srv: srv, ln: ln, stopCh: make(chan struct{}), slot: slot}
 	rootCtx := s.rootCtx
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		defer leg.drained.Store(true)
 
 		serveErr := make(chan error, 1)
 		go func() {
@@ -98,11 +118,57 @@ func (s *Server) serveLegLocked(srv *http.Server, ln net.Listener, isTLS bool) *
 // stopLegLocked idempotently requests a leg's graceful retirement. The leg's
 // goroutine drains + joins in the background; wg.Wait (Server.Wait) joins it on
 // daemon shutdown. Caller holds lifeMu.
+//
+// Retirement is ASYNCHRONOUS and that is the point of the auth pin (#5561 round
+// 14). Closing stopCh only WAKES the serve goroutine; the socket keeps accepting
+// until that goroutine reaches Shutdown, and connections it already accepted are
+// served for the whole bounded drain. ReconcileHTTP/ReconcileHTTPS return as soon
+// as this call does, and the management reconciler then publishes the committed
+// credential set — so without the pin a credential the commit authorized for the
+// NEW address became valid on the address that same commit retired. Pinning the
+// leg here to what it was already serving makes that impossible: from this
+// moment the retiring listener's policy can only tighten (Server.ReplaceAuth
+// intersects it), never gain a value it did not already accept.
 func (s *Server) stopLegLocked(leg *listenerLeg) {
 	if leg == nil {
 		return
 	}
-	leg.stopOnce.Do(func() { close(leg.stopCh) })
+	leg.stopOnce.Do(func() {
+		// Pin BEFORE the wake-up so there is no interval in which the leg is
+		// retired but still following the server-wide snapshot.
+		s.trackRetiring(leg)
+		close(leg.stopCh)
+	})
+}
+
+// trackRetiring pins a retired leg's policy and registers it so ReplaceAuth can
+// keep tightening it while it drains, reaping the ones that have finished.
+//
+// The pin and the registration happen under ONE hold of retireMu so no
+// revocation can slip between them: a ReplaceAuth that lands before this pins at
+// the value it published, and one that lands after finds the leg on the list and
+// intersects it. The bookkeeping takes its own mutex rather than lifeMu because
+// Server.Wait holds lifeMu across wg.Wait — a ReplaceAuth racing daemon
+// shutdown would otherwise block for the whole drain. Callers hold lifeMu, so
+// the order is always lifeMu -> retireMu.
+func (s *Server) trackRetiring(leg *listenerLeg) {
+	s.retireMu.Lock()
+	defer s.retireMu.Unlock()
+	leg.slot.pin(s.auth.Load())
+	s.retiring = append(s.pruneRetiredLocked(), leg)
+}
+
+// pruneRetiredLocked compacts s.retiring down to the legs that are still
+// draining and returns it. Caller holds retireMu.
+func (s *Server) pruneRetiredLocked() []*listenerLeg {
+	live := s.retiring[:0]
+	for _, leg := range s.retiring {
+		if !leg.drained.Load() {
+			live = append(live, leg)
+		}
+	}
+	s.retiring = live
+	return live
 }
 
 // Start binds the configured listeners and serves each in its own leg (#5866),
@@ -122,7 +188,7 @@ func (s *Server) Start(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("api: bind HTTP listener %q: %w", s.httpServer.Addr, err)
 		}
-		s.httpLeg = s.serveLegLocked(s.httpServer, ln, false)
+		s.httpLeg = s.serveLegLocked(s.httpServer, ln, false, s.httpSlot)
 		slog.Info("HTTP API server listening", "addr", s.httpServer.Addr)
 	}
 	if s.httpsServer != nil {
@@ -131,7 +197,7 @@ func (s *Server) Start(ctx context.Context) error {
 			slog.Error("api: HTTPS listener bind failed at start; HTTPS disabled until the next reconcile",
 				"addr", s.httpsServer.Addr, "err", err)
 		} else {
-			s.httpsLeg = s.serveLegLocked(s.httpsServer, ln, true)
+			s.httpsLeg = s.serveLegLocked(s.httpsServer, ln, true, s.httpsSlot)
 			slog.Info("HTTPS API server listening", "addr", s.httpsServer.Addr)
 		}
 	}
@@ -181,15 +247,27 @@ func (s *Server) ReconcileHTTP(addr string) error {
 	if s.httpLeg != nil && s.httpLeg.srv.Addr == addr {
 		return nil
 	}
-	srv := s.buildHTTPServer(addr)
+	slot := s.newAuthSlot()
+	srv := s.buildHTTPServer(addr, slot)
 	ln, err := s.listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("api: bind HTTP listener %q: %w", addr, err)
 	}
 	old := s.httpLeg
-	s.httpLeg = s.serveLegLocked(srv, ln, false)
+	s.httpLeg = s.serveLegLocked(srv, ln, false, slot)
 	s.stopLegLocked(old) // retire the previous HTTP listener only after the new one is serving
 	return nil
+}
+
+// HTTPSServing reports whether an HTTPS leg is CURRENTLY serving (#5561 round
+// 14). Start treats an HTTPS bind failure as non-fatal — the HTTP plane stays up
+// and the leg is simply absent — so the management reconciler must ask this
+// rather than infer convergence from Start's nil error, or it records a desired
+// HTTPS fingerprint that no listener implements and never retries the bind.
+func (s *Server) HTTPSServing() bool {
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+	return s.httpsLeg != nil && !s.httpsLeg.dead.Load()
 }
 
 // ReconcileHTTPS enables, disables, or make-before-break rebinds ONLY the HTTPS
@@ -215,7 +293,8 @@ func (s *Server) ReconcileHTTPS(useTLS bool, addr string) error {
 	case s.httpsLeg != nil && s.httpsLeg.srv.Addr == addr:
 		return nil
 	default:
-		srv, err := s.buildHTTPSServer(addr)
+		slot := s.newAuthSlot()
+		srv, err := s.buildHTTPSServer(addr, slot)
 		if err != nil {
 			return fmt.Errorf("api: generate HTTPS certificate for %q: %w", addr, err)
 		}
@@ -224,7 +303,7 @@ func (s *Server) ReconcileHTTPS(useTLS bool, addr string) error {
 			return fmt.Errorf("api: bind HTTPS listener %q: %w", addr, err)
 		}
 		old := s.httpsLeg
-		s.httpsLeg = s.serveLegLocked(srv, ln, true)
+		s.httpsLeg = s.serveLegLocked(srv, ln, true, slot)
 		s.stopLegLocked(old)
 		return nil
 	}

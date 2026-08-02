@@ -82,7 +82,7 @@ func authzServer(t *testing.T, cfg Config) (*Server, string) {
 	}
 	// buildHTTPServer is the production path: it installs listenerHandler
 	// (cross-site guard -> authz guard -> mux) AND the ConnContext hook.
-	srv := s.buildHTTPServer(ln.Addr().String())
+	srv := s.buildHTTPServer(ln.Addr().String(), s.newAuthSlot())
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() { _ = srv.Close() })
 	return s, "http://" + ln.Addr().String()
@@ -996,7 +996,7 @@ func TestInjectedResolverIsNormalized_5561(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := s.buildHTTPServer(ln.Addr().String())
+	srv := s.buildHTTPServer(ln.Addr().String(), s.newAuthSlot())
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() { _ = srv.Close() })
 	status, errMsg := postRoute(t, "http://"+ln.Addr().String(), "POST /api/v1/config/enter",
@@ -1454,7 +1454,7 @@ func authzServerAt(t *testing.T, cfg Config, bind string) (*Server, string) {
 	if err != nil {
 		t.Skipf("cannot listen on %s: %v", bind, err)
 	}
-	srv := s.buildHTTPServer(ln.Addr().String())
+	srv := s.buildHTTPServer(ln.Addr().String(), s.newAuthSlot())
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() { _ = srv.Close() })
 	return s, "http://" + ln.Addr().String()

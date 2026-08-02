@@ -785,7 +785,7 @@ population #5561 exists to constrain. Three bounds:
   re-derivations collapse into one enumeration through the same
   waiter-set-before-read batching `socketscan.go` uses, so the batch is answered
   from an observation newer than every arrival in it.
-  `TestUncredentialedCallerDrivesNoInterfaceEnumeration_5561` pins the ordering
+  `TestUncredentialedCallerDrivesNoLocalityRecheck_5561` pins the ordering
   and `TestConfirmationIsSingleFlighted_5561` the batching.
 
 A *local* attacker can still make connections that each join a batched read.
@@ -903,19 +903,43 @@ under the daemon's errgroup. Nothing else imports this package.
       is what makes the state acceptable; a dedicated HTTPS row in
       `show system services` would be a real improvement and is not in this
       change.
-    - **Removing all api-auth** (nil) publishes AFTER the rebinds and only when
-      BOTH live bind addresses are loopback. The justification for a nil is the
-      #4047/#5127 clamp, which `resolveAPIBinds` evaluates against the config
-      being applied and never re-evaluates against the listener that is serving —
-      so the live addresses must be proven loopback directly rather than inferred
-      from "the rebind succeeded" (round 12).
-    - **Freshness**: the credential half always comes from the store's ACTIVE
-      config, including when that is nil (`withCommittedAuth`). An apply caller
-      that snapshots `ActiveConfig()` and then waits on the apply semaphore (the
-      DHCP lease-change callback) can be overtaken by a commit; without this a
-      stale replay republished a superseded — or a deleted — secret on the
-      listener the newer commit had moved to. Only the credential half is pinned;
-      a stale replay still drives the ENDPOINT, which is #6716.
+    - **Removing all api-auth is a revocation and lands immediately** (round 14).
+      The **nil** — the pass-through — publishes only when every live bind
+      address is loopback, because the justification for a nil is the #4047/#5127
+      clamp, which `resolveAPIBinds` evaluates against the config being applied
+      and never re-evaluates against the listener that is serving. While any live
+      leg is still off-loopback, what publishes is the **deny-all** set (non-nil,
+      empty). Rounds 7-13 left the live snapshot ALONE there, so the credential
+      the operator had just deleted kept authenticating on that routable address
+      for as long as the loopback bind kept failing — indefinite, and the exact
+      inversion of the instruction. The decision is re-taken after the rebinds
+      (`publishNilDirectionLocked`), which is what converges deny-all to nil once
+      the loopback bind lands.
+    - **Freshness — one COMMITTED generation, endpoint AND credentials** (round
+      14, `committedDesired`). An apply caller that snapshots `ActiveConfig()`
+      and then waits on the apply semaphore (the DHCP lease-change callback) can
+      be overtaken by commits: serializing applies orders them but not their
+      CONTENT, so an OLDER generation can still be the last one applied. Rounds
+      10 and 12 pinned only the credential half, which left the listener driven
+      toward the STALE endpoint under the COMMITTED policy — a hybrid belonging
+      to no committed generation. With the policy nil that is an off-loopback
+      listener with NO authentication and nothing left to restore; with it
+      non-nil, the hybrid's `next` NAMES the stale address, so
+      `everyLiveLegNamedBy` reads TRUE and the full set publishes at an endpoint
+      the committed config never authorized it for. Deriving both halves from
+      `ActiveConfig()` removes both: a stale replay computes the newest commit's
+      desired state, so it is a no-op or a bind retry. This fences the management
+      listener only; the rest of the apply pipeline reconciling toward a
+      superseded generation is #6716.
+    - **A RETIRED leg never gains a credential** (round 14). `stopLegLocked` only
+      closes a channel — the socket keeps accepting until the serve goroutine
+      reaches `Shutdown`, and what it accepted is served for the whole bounded
+      drain — while `ReconcileHTTP`/`ReconcileHTTPS` return immediately, and the
+      reconciler then publishes. Each leg therefore carries its own `authSlot`:
+      LIVE legs FOLLOW `s.auth` (the live swap above is unchanged), and a leg is
+      PINNED at retirement to what it was already serving, after which
+      `ReplaceAuth` only intersects it. Revocations still reach a draining
+      listener; grants and nils never do.
   - The HTTP and HTTPS listeners run in INDEPENDENT legs (`listener.go`), each
     make-before-break: `ReconcileHTTP(addr)` rebinds only the HTTP leg and
     `ReconcileHTTPS(tls, addr)` enables / disables / rebinds only the HTTPS leg —
@@ -928,8 +952,13 @@ under the daemon's errgroup. Nothing else imports this package.
     retiring the old (no unreachable window on that plane, no double-bind of an
     unchanged socket); a bind (or HTTPS cert) failure fail-closes to the retained
     previous leg. `Start(ctx)` binds HTTP synchronously (fail-closed if it fails)
-    and HTTPS best-effort (a boot HTTPS failure leaves HTTP up, retried next
-    commit). `Wait()` joins every live + retiring leg goroutine on shutdown.
+    and HTTPS best-effort (a boot HTTPS failure leaves HTTP up). BOTH boot
+    failures are retried on the next commit — but only since #5561 round 14,
+    which made the retry debt real: the reconciler now keeps the `Server` after a
+    failed boot HTTP bind (it holds no socket on that path, and dropping it made
+    every later reconcile a no-op), and asks `HTTPSServing()` instead of
+    inferring a converged HTTPS leg from `Start`'s nil error. `Wait()` joins
+    every live + retiring leg goroutine on shutdown.
     Listeners bind via `Config.ListenFunc` (default `net.Listen`) so tests inject
     a fake factory that models `EADDRINUSE`. Pinned by
     `server_authswap_5866_test.go` (live auth swap) +

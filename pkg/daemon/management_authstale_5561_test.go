@@ -107,21 +107,33 @@ func mgmtAuthSecret(t *testing.T, snap *api.AuthConfig) string {
 	return pw
 }
 
-// TestMgmtFailedRebindKeepsTheCommittedCredential_5561 is the stale-replay
-// direction.
+// TestMgmtStaleReplayNeverDrivesTheStaleEndpoint_5561 is the generation fence
+// itself (#5561 round 14), and it replaces
+// TestMgmtFailedRebindKeepsTheCommittedCredential_5561 — which asserted the same
+// credential property but through a mechanism the fence removes.
 //
 // C1 binds ge-0/0/0 with secret-a; C2 binds ge-0/0/1 with secret-b and is
 // committed second, so the live listener is at C2's endpoint under secret-b and
-// secret-a is REVOKED. A stale apply then replays C1: it publishes a credential
-// and attempts a rebind to C1's endpoint, which fails (its address is refused —
-// in production, an old listener still retiring, or an address that has since
-// gone away). C2's listener therefore keeps serving, and the credential
-// governing it must still be the committed one.
+// secret-a is REVOKED. A stale apply then replays C1.
 //
-// FAIL-ON-REVERT: publish next.Auth unconditionally and the retained
-// off-loopback listener answers `POST /api/v1/system/action` to the secret the
-// operator already replaced.
-func TestMgmtFailedRebindKeepsTheCommittedCredential_5561(t *testing.T) {
+// Rounds 10 and 12 pinned only the CREDENTIAL half against the store, which left
+// the replay driving the listener toward C1's ENDPOINT under C2's credentials —
+// a desired state belonging to no committed generation. Everything downstream
+// then reasons about that fiction: the grant gate asks whether every serving leg
+// sits at an address `next` names, and `next` names the stale address, so it
+// reads TRUE and publishes the full committed set at an endpoint the committed
+// config never authorized it for (round 14, MAJOR 3). With the credential half
+// nil, the same rewrite yields an off-loopback endpoint with NO authentication
+// and nothing left to restore (MAJOR 1).
+//
+// So the assertion is not about what the stale rebind does — it is that there is
+// no stale rebind. The replay's desired state IS the committed one, which is
+// already converged, so it is a no-op that republishes secret-b.
+//
+// FAIL-ON-REVERT: derive the endpoint from `cfg` (the pre-round-14
+// withCommittedAuth shape) instead of from the store's active generation, and
+// the replay binds 10.0.0.1:80 and moves the live listener onto it.
+func TestMgmtStaleReplayNeverDrivesTheStaleEndpoint_5561(t *testing.T) {
 	mgmtAuthIfaceAddrs(t)
 	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
 
@@ -148,32 +160,41 @@ func TestMgmtFailedRebindKeepsTheCommittedCredential_5561(t *testing.T) {
 	if got := mgmtAuthSecret(t, m.srv.LiveAuth()); got != "secret-b" {
 		t.Fatalf("the live snapshot is %q before the case starts, want secret-b", got)
 	}
-
-	// The stale replay's own endpoint refuses to bind.
-	staleDesired := m.desired(stale)
-	if staleDesired.Addr != "10.0.0.1:80" {
-		t.Fatalf("the stale config resolves to %q, want 10.0.0.1:80", staleDesired.Addr)
-	}
-	reg.failAddr[staleDesired.Addr] = true
-
-	if err := m.reconcile(stale); err == nil {
-		t.Fatal("the stale replay's rebind was expected to FAIL, so the case never reached " +
-			"the state it tests (a retained listener under a republished credential)")
+	if staleDesired := m.desired(stale); staleDesired.Addr != "10.0.0.1:80" {
+		t.Fatalf("the stale config resolves to %q, want 10.0.0.1:80 — if the two generations "+
+			"named the same endpoint the case could not tell them apart", staleDesired.Addr)
 	}
 
-	// The property.
+	// The stale replay. It must be a no-op: the newest committed generation is
+	// already live.
+	if err := m.reconcile(stale); err != nil {
+		t.Fatalf("the stale replay must reconcile to the ALREADY-CONVERGED committed state, "+
+			"which binds nothing and cannot fail: %v", err)
+	}
+
+	// The property: the replay never reached for the stale endpoint at all.
+	if ln := reg.get("10.0.0.1:80"); ln != nil {
+		t.Fatalf("the stale replay bound 10.0.0.1:80 — the endpoint of a generation the store " +
+			"has already superseded. Endpoint and credentials must come from ONE committed " +
+			"generation; a listener at C1's address under C2's policy is a state the operator " +
+			"never committed, and it is the state MAJOR 1 and MAJOR 3 are both reached through")
+	}
+	if m.cur.addr != "10.0.0.2:80" {
+		t.Fatalf("live HTTP bind = %q after the stale replay, want the committed 10.0.0.2:80", m.cur.addr)
+	}
+
+	// The credential property the superseded test guarded, restated: the listener
+	// that is serving is governed by the COMMITTED credential, never the replay's.
 	if got := mgmtAuthSecret(t, m.srv.LiveAuth()); got != "secret-b" {
-		t.Fatalf("after a FAILED rebind the live listener is governed by %q, want secret-b. "+
-			"The listener at 10.0.0.2:80 is still serving — the rebind that would have moved "+
-			"it away failed — and it now accepts a credential the operator's later commit "+
-			"REPLACED, which on this off-loopback bind is a full-power remote authentication "+
-			"bypass", got)
+		t.Fatalf("after the stale replay the live listener is governed by %q, want secret-b. "+
+			"It accepts a credential the operator's later commit REPLACED, which on this "+
+			"off-loopback bind is a full-power remote authentication bypass", got)
 	}
-	// Control: the retained listener really is the one still serving, so the
-	// assertion above is about the credential and not about a dead socket.
+	// Control: the committed listener really is the one still serving, so the
+	// assertions above are about a live socket and not a dead one.
 	if ln := reg.get("10.0.0.2:80"); ln == nil || !ln.isOpen() {
-		t.Fatal("the committed listener at 10.0.0.2:80 is not serving after the failed " +
-			"rebind, so the credential governing it is moot and the case proved nothing")
+		t.Fatal("the committed listener at 10.0.0.2:80 is not serving after the replay, " +
+			"so the credential governing it is moot and the case proved nothing")
 	}
 }
 
@@ -344,16 +365,22 @@ func TestMgmtStaleReplayCannotResurrectRemovedAuth_5561(t *testing.T) {
 		t.Fatalf("the retained live HTTP bind is %q, which IS loopback — the case cannot "+
 			"demonstrate under-restriction on a clamped listener and proves nothing", m.cur.addr)
 	}
-	if got := mgmtAuthSecret(t, m.srv.LiveAuth()); got != "secret-b" {
-		t.Fatalf("before the replay the retained listener is governed by %q, want secret-b", got)
+	// The api-auth removal has already revoked secret-b: the committed policy
+	// authorizes no credential, and the live listener is off-loopback, so the
+	// only expression of that which does not fail open is DENY-ALL (#5561 round
+	// 14, MAJOR 4). Keeping secret-b alive here — the pre-round-14 behavior —
+	// left a deleted secret authenticating on a routable address indefinitely.
+	if snap := m.srv.LiveAuth(); snap == nil || api.CredentialCount(snap) != 0 {
+		t.Fatalf("before the replay the retained off-loopback listener enforces %+v, want the "+
+			"EMPTY (deny-all) set — C2 deleted api-auth, and a revocation lands immediately "+
+			"whatever the rebind does", snap)
 	}
 
-	// Step 4: the stale replay. Its own endpoint also fails to bind, so the
-	// off-loopback listener from C1 keeps serving.
-	sd := m.desired(stale)
-	reg.failAddr[sd.Addr] = true
+	// Step 4: the stale replay. Under the generation fence it reconciles to C2's
+	// desired state, not C0's, so it retries the SAME loopback bind — which is
+	// still refused — and the off-loopback listener keeps serving.
 	if err := m.reconcile(stale); err == nil {
-		t.Fatal("the stale replay's rebind was expected to FAIL")
+		t.Fatal("the stale replay was expected to retry the committed loopback bind and FAIL")
 	}
 
 	// The property.
@@ -363,17 +390,19 @@ func TestMgmtStaleReplayCannotResurrectRemovedAuth_5561(t *testing.T) {
 			"management API with no authentication is the fail-open the nil gate exists to "+
 			"prevent", m.cur.addr)
 	}
-	if got := snap.Users["webadmin"]; got == "secret-a" {
-		t.Fatalf("the off-loopback listener at %q accepts secret-a, a credential one commit "+
-			"REPLACED and the next DELETED. A stale apply replay must not publish its own "+
-			"credential over the committed policy, and `committed == nil` is not a licence to "+
-			"skip the override — it is the case where the operator asked for the credential to "+
-			"be gone", m.cur.addr)
+	if got, ok := snap.Users["webadmin"]; ok {
+		t.Fatalf("the off-loopback listener at %q accepts webadmin=%q. secret-a was REPLACED by "+
+			"one commit and secret-b DELETED by the next; a stale apply replay must not publish "+
+			"its own credential over the committed policy, and the committed policy being nil is "+
+			"not a licence to keep the old one — it is the case where the operator asked for "+
+			"every credential to be gone", m.cur.addr, got)
 	}
-	if got := snap.Users["webadmin"]; got != "secret-b" {
-		t.Fatalf("the retained listener is governed by %+v; the committed policy is nil and the "+
-			"live bind is off-loopback, so the credential that was already governing it must "+
-			"stay in force", snap)
+	if api.CredentialCount(snap) != 0 {
+		t.Fatalf("the retained listener is governed by %+v, want the EMPTY (deny-all) set", snap)
+	}
+	// The fence itself: the replay never reached for C0's endpoint.
+	if ln := reg.get("10.0.0.1:80"); ln != nil {
+		t.Fatal("the stale replay bound 10.0.0.1:80, the endpoint of a superseded generation")
 	}
 	if ln := reg.get("10.0.0.2:80"); ln == nil || !ln.isOpen() {
 		t.Fatal("the off-loopback listener at 10.0.0.2:80 is not serving, so the credential " +
@@ -424,20 +453,37 @@ func TestMgmtStaleReplayWithCommittedNilKeepsOffLoopbackAuth_5561(t *testing.T) 
 		t.Fatal("the loopback rebind was expected to FAIL")
 	}
 
-	// The stale replay's endpoint DOES bind — it is a legitimate off-loopback
-	// address, because the config it came from carried a credential.
+	// The stale replay's OWN endpoint is a legitimate off-loopback address (the
+	// config it came from carried a credential), and it is bindable — the
+	// registry does not refuse it. That is what made the pre-round-14 hybrid
+	// dangerous: the rewrite kept C0's endpoint, the bind succeeded, and the
+	// off-loopback listener it created was then governed by the committed NIL.
 	sd := m.desired(stale)
 	if mgmtAddrIsLoopback(sd.Addr) {
 		t.Fatalf("the stale config resolves to %q; the case needs an off-loopback stale endpoint "+
-			"to break the rebind-outcome proxy", sd.Addr)
+			"for the hybrid to be able to expose one", sd.Addr)
 	}
-	if err := m.reconcile(stale); err != nil {
-		t.Fatalf("the stale replay's rebind was expected to SUCCEED (that is what makes the "+
-			"rebind-outcome proxy read TRUE): %v", err)
+	if reg.failAddr[sd.Addr] {
+		t.Fatalf("the stale endpoint %q is refused by the fixture, so a hybrid would fail to bind "+
+			"it and the case could not reach the state it tests", sd.Addr)
 	}
-	if m.cur.addr != sd.Addr {
-		t.Fatalf("live HTTP bind = %q, want the stale endpoint %q — the replay did not move the "+
-			"listener, so the case never reached the state it tests", m.cur.addr, sd.Addr)
+	if err := m.reconcile(stale); err == nil {
+		t.Fatal("under the generation fence the replay reconciles to the COMMITTED desired " +
+			"state, whose loopback bind is still refused, so it must still surface an error")
+	}
+
+	// The fence: the replay never bound the stale endpoint, so the live listener
+	// is still the one the committed generation left retained.
+	if ln := reg.get(sd.Addr); ln != nil {
+		t.Fatalf("the stale replay bound %q. Its endpoint came from a superseded generation and "+
+			"its credentials from the newest one — a hybrid the operator never committed. With "+
+			"the committed policy NIL, that hybrid is an off-loopback listener with NO "+
+			"authentication, and reconcileTo cannot repair it: the nil gate only declines to "+
+			"publish ANOTHER nil, and the nil is already live. There is no credential left to "+
+			"restore (#5561 round 14, MAJOR 1)", sd.Addr)
+	}
+	if m.cur.addr != "10.0.0.2:80" {
+		t.Fatalf("live HTTP bind = %q, want the retained 10.0.0.2:80", m.cur.addr)
 	}
 
 	// The property: an off-loopback listener is never dropped to no-auth.
@@ -448,9 +494,9 @@ func TestMgmtStaleReplayWithCommittedNilKeepsOffLoopbackAuth_5561(t *testing.T) 
 			"justified only by the loopback clamp on the bind that config asked for, and this is "+
 			"not that bind", m.cur.addr)
 	}
-	if got := snap.Users["webadmin"]; got != "secret-b" {
-		t.Fatalf("the live snapshot is %+v; the credential already governing the management API "+
-			"must stay in force until a listener the committed nil actually justifies is "+
-			"serving (want secret-b, got %q)", snap, got)
+	if api.CredentialCount(snap) != 0 {
+		t.Fatalf("the live snapshot is %+v, want the EMPTY (deny-all) set: the committed policy "+
+			"authorizes no credential at all, and at an off-loopback address the only "+
+			"non-fail-open way to say so is to accept nobody (#5561 round 14, MAJOR 4)", snap)
 	}
 }

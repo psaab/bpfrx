@@ -43,9 +43,9 @@ type AuthConfig struct {
 // A nil `live` is the UNIVERSAL set, not the empty one: a nil snapshot is
 // dynamicAuthMiddleware's pass-through, so that listener already accepts every
 // caller and `next` is unambiguously a tightening. Returning `next` whole there
-// is what lets a commit that moves a bind off-loopback AND adds the credential
-// the #4047/#5127 clamp requires publish that credential BEFORE the new socket
-// serves (#5561 round 9).
+// (as a COPY — see below) is what lets a commit that moves a bind off-loopback
+// AND adds the credential the #4047/#5127 clamp requires publish that credential
+// BEFORE the new socket serves (#5561 round 9).
 //
 // The result can be EMPTY (non-nil with no credentials), and that is deliberate:
 // dynamicAuthMiddleware rejects every non-exempt request against an empty set,
@@ -86,12 +86,23 @@ func AuthForRetainedListener(live, next *AuthConfig) *AuthConfig {
 	if next == nil {
 		return nil
 	}
-	if live == nil {
-		return next
-	}
-	// A fresh value: never alias (or mutate) either operand, so the published
-	// snapshot cannot change under a later edit of the config it came from.
+	// A fresh value on EVERY non-nil path: never alias (or mutate) either
+	// operand, so the published snapshot cannot change under a later edit of the
+	// config it came from. The universal-`live` shortcut used to return `next`
+	// itself, which made the no-alias property conditional on a branch the test
+	// for it never took (#5561 round 14).
 	out := &AuthConfig{Users: map[string]string{}, APIKeys: map[string]bool{}}
+	if live == nil {
+		for user, pw := range next.Users {
+			out.Users[user] = pw
+		}
+		for key, ok := range next.APIKeys {
+			if ok {
+				out.APIKeys[key] = true
+			}
+		}
+		return out
+	}
 	for user, pw := range next.Users {
 		// Match on the PAIR. A same-username secret rotation is a revocation
 		// plus a grant, and the grant half is withheld like any other.

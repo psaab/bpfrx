@@ -293,54 +293,91 @@ credential revocation is enforced even on an apply that returns early
     while some listener really is serving an unnamed address, so a later commit
     always exits it: converge that bind, or commit the address that is actually
     serving (which moves nothing and publishes whole).
-  - A **nil** `next.Auth` (remove ALL api-auth) publishes **after** the rebinds
-    and stays gated on the LIVE bind addresses — `mgmtAddrIsLoopback(cur.addr)`
-    AND the live HTTPS leg off or loopback. It REMOVES a requirement, and the
-    justification for a nil is the #4047/#5127 clamp, which `resolveAPIBinds`
-    evaluates against the config being APPLIED and never re-evaluates against
-    the listener that is serving. So both live addresses must be proven loopback
-    directly; "the rebind succeeded" is a proxy that holds only while the config
-    being applied is the newest one, and `withCommittedAuth` now propagates a
-    committed nil through stale replays (#5561 round 12). Both gates read the
-    fingerprint the rebinds just updated, so this direction cannot move earlier.
-  - **Auth freshness — the credential half is pinned to the COMMITTED policy,
-    in BOTH directions** (#5561 rounds 10 and 12). Publishing `next.Auth`
-    regardless of the rebind outcome is right only while `next` came from the
-    newest committed config, and on the apply path it need not have: a caller
-    that snapshots `store.ActiveConfig()` and THEN waits on the apply semaphore
-    (the DHCP lease-change callback) can be overtaken by a commit and re-enter
-    `applyConfig` carrying a superseded config. `reconcile` therefore routes the
-    desired config through `withCommittedAuth`, which replaces the credential
-    half with the store's ACTIVE one **unconditionally, including when that is
-    nil**. Round 10 pinned only the non-nil direction, on the argument that a
-    resurrected credential over-restricts a management API "already clamped to
-    loopback regardless". **That premise is false**, and the clamp is why: a
-    config carrying a credential binds off-loopback legitimately, and when a
-    LATER commit removes api-auth its own bind is clamped to loopback while the
-    off-loopback listener stays RETAINED if that clamped bind fails. The live
-    listener is then non-loopback under a nil-auth active config, and a stale
-    replay carrying the deleted credential published it there — a revoked secret
-    authorizing mutating requests from off-box. Only the credential half is
-    pinned: a stale replay still drives the listener toward the stale ENDPOINT,
-    which is the general stale-snapshot apply defect (#6716) and lives in the
-    apply path. Gating the publish on the rebind outcome instead is NOT the
-    repair — it restores the round-7 fail-open in the same edit;
-    `management_authstale_5561_test.go` drives both directions for exactly that
-    reason.
+  - **Removing ALL api-auth is a revocation too, and it lands immediately**
+    (#5561 round 14). The committed policy authorizes no credential, and there
+    are exactly two ways to say that to a listener:
+    `mgmtEndpoint.allLoopback()` decides which (`publishNilDirectionLocked`,
+    called before AND after the rebinds).
+    - **nil** — `dynamicAuthMiddleware`'s pass-through — goes out only once
+      every LIVE leg is at a loopback address. Its justification is the
+      #4047/#5127 clamp, which `resolveAPIBinds` evaluates against the bind the
+      COMMITTED config asked for and never re-evaluates against the listener
+      that is serving; a leg retained by a failed rebind is not that bind, so
+      "the rebind succeeded" is a proxy and the addresses are checked directly.
+    - **Deny-all** — non-nil and EMPTY, rejecting every non-exempt request —
+      goes out while any live leg is still off-loopback. Before round 14 there
+      was no second arm: the live snapshot was left ALONE, so the credential the
+      operator had just deleted went on authenticating on that routable address
+      for as long as the loopback bind kept failing. That is indefinite, not a
+      window, and it inverts the instruction. Deny-all honours the revocation
+      without the fail-open, the same over-restrict-and-retry posture the
+      intersection takes on the non-nil path — and the post-rebind call is what
+      converges it to nil once the loopback bind lands, so it is an intermediate
+      and not a lockout.
+  - **Generation fence — the WHOLE desired state comes from one COMMITTED
+    generation** (#5561 round 14, superseding the credential-only pin of rounds
+    10 and 12). Serializing applies does not order their CONTENT: a caller that
+    snapshots `store.ActiveConfig()` and THEN waits on the apply semaphore (the
+    DHCP lease-change callback) can be overtaken by commits and then run, alone
+    and in order, carrying a superseded generation. `reconcile` therefore routes
+    through `committedDesired`, which re-derives endpoint AND credentials from
+    `store.ActiveConfig()`. On the ordinary commit path that is the identity
+    (`store.Commit` / `PromoteRollback` promote before the apply runs); on a
+    stale replay it is the repair.
+
+    Pinning only the credential half left the listener being driven toward the
+    STALE endpoint under the COMMITTED policy — a hybrid belonging to no
+    committed generation, and one nothing downstream can reason about. With the
+    committed policy nil, that hybrid is an OFF-LOOPBACK listener with NO
+    authentication, and the nil gate cannot repair it: it only declines to
+    publish ANOTHER nil, and the nil is already live, so there is no credential
+    left to restore. With the policy non-nil, the hybrid's `next` NAMES the
+    stale address, so `everyLiveLegNamedBy` reads TRUE and the full credential
+    set publishes at an endpoint the committed config never authorized it for.
+    Round 13 did not close that: it sharpened which question is asked; the
+    hybrid corrupts the `next` the question is asked about. Fencing the
+    generation removes both. This fences the MANAGEMENT LISTENER only — the rest
+    of the pipeline still reconciling toward a superseded generation is #6716.
+  - **A RETIRED listener never gains a credential** (#5561 round 14). Retirement
+    is asynchronous: `stopLegLocked` closes a channel, and the leg's goroutine
+    closes the socket and drains later, so `ReconcileHTTP` returns while the old
+    address is still accepting and still serving what it accepted. Publishing
+    the committed set right after therefore handed a credential authorized for
+    the NEW address to the one the same commit retired. Each leg now carries its
+    own `authSlot`: LIVE legs follow the server-wide snapshot (the #5866 live
+    swap is unchanged), and a leg is PINNED at retirement to what it was already
+    serving, after which `ReplaceAuth` only ever intersects it — revocations
+    still land there, grants and nils never do.
+  - **Boot retry debt is real debt** (#5561 round 14). Every "over-restrict and
+    let the next commit converge" argument above is only as good as the
+    convergence, and two boot paths had none. An HTTP bind failure returned
+    before `m.srv` was assigned, so `reconcileTo`'s `m.srv == nil`
+    short-circuit made every later reconcile a silent no-op — management stayed
+    down for the life of the process. An HTTPS bind failure is deliberately
+    non-fatal, but `startTo` recorded the DESIRED HTTPS fingerprint as converged
+    anyway, so the leg-changed test was false on every subsequent commit and
+    `ReconcileHTTPS` was never called again. `startTo` now adopts the server
+    whether or not the bind succeeded, and asks `api.Server.HTTPSServing()`
+    rather than inferring convergence from a nil error.
 
   Pinned by `TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866`
   (revocation honored across a failing HTTPS rebind),
-  `TestMgmtReconcileRemoveAuthDeferredWhenHTTPRebindFails_5866` (nil auth NOT
-  applied to a retained non-loopback HTTP listener — no fail-open),
+  `TestMgmtReconcileRemoveAuthDeferredWhenHTTPRebindFails_5866` (a retained
+  non-loopback HTTP listener gets DENY-ALL — neither the nil, which is the
+  fail-open, nor the deleted credential),
   `TestMgmtNilAuthNeverDropsARetainedOffLoopbackHTTPSLeg_5561` (the same for a
   retained non-loopback HTTPS leg while the HTTP leg converged onto loopback),
   `management_authsanction_5561_test.go` (the grant gate asks where the live
   legs are — both the never-moved and the converged-move shapes — and every
-  empty intersection is exitable), and `management_authpublish_5561_test.go`,
-  which records the LIVE snapshot at the instant each listener is bound and
-  requires it to be the published one. The reconcile is serialized by its mutex
-  and the apply semaphore, so a newer generation never completes behind an older
-  one.
+  empty intersection is exitable), `management_authpublish_5561_test.go`, which
+  records the LIVE snapshot at the instant each listener is bound and requires
+  it to be the published one, `management_authstale_5561_test.go` (the fence: a
+  stale replay never binds the superseded generation's endpoint, in both the
+  credentialed and the removed-api-auth directions),
+  `management_bootretry_5561_test.go` (both boot paths retry, and the deny-all
+  intermediate exits), and `pkg/api/listener_retiredauth_5561_test.go` (a
+  retired leg gains no grant and is never dropped to no-auth, while a live leg
+  still follows the snapshot).
 
 #### Effective-listener snapshot for `show system services` (#6385/#6401)
 

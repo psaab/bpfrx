@@ -342,6 +342,17 @@ type Server struct {
 	wg         sync.WaitGroup  // joins EVERY serve goroutine (live + retiring legs)
 	httpLeg    *listenerLeg    // live HTTP listener leg (nil = not started / HTTP off)
 	httpsLeg   *listenerLeg    // live HTTPS listener leg (nil = HTTPS off)
+	// httpSlot / httpsSlot are the credential slots of the legs Start launches
+	// from the construction-time servers (#5561 round 14). Every leg gets one;
+	// a live slot follows s.auth, a retired one is pinned. See authSlot.
+	httpSlot  *authSlot
+	httpsSlot *authSlot
+	// retiring holds the legs that have been asked to stop but have not finished
+	// draining. Their slots are pinned, and ReplaceAuth keeps tightening them so
+	// a revocation still reaches a listener on its way out. Guarded by retireMu
+	// — NOT lifeMu, which Server.Wait holds across the whole drain.
+	retireMu sync.Mutex
+	retiring []*listenerLeg
 	// listen is the listener factory (#5866): Config.ListenFunc or net.Listen. A
 	// test injects a fake so the make-before-break reconcile is exercised without
 	// binding real ports.
@@ -631,12 +642,14 @@ func NewServer(cfg Config) *Server {
 	s.certGen = generateSelfSignedCert
 
 	if cfg.Addr != "" {
-		s.httpServer = s.buildHTTPServer(cfg.Addr)
+		s.httpSlot = s.newAuthSlot()
+		s.httpServer = s.buildHTTPServer(cfg.Addr, s.httpSlot)
 	}
 
 	// Set up HTTPS server with auto-generated self-signed certificate
 	if cfg.TLS && cfg.HTTPSAddr != "" {
-		if hs, err := s.buildHTTPSServer(cfg.HTTPSAddr); err != nil {
+		s.httpsSlot = s.newAuthSlot()
+		if hs, err := s.buildHTTPSServer(cfg.HTTPSAddr, s.httpsSlot); err != nil {
 			slog.Warn("failed to generate self-signed certificate", "err", err)
 		} else {
 			s.httpsServer = hs
@@ -646,21 +659,84 @@ func NewServer(cfg Config) *Server {
 	return s
 }
 
+// authSlot is one listener leg's view of the credential policy (#5561 round 14).
+//
+// While the leg is LIVE the slot follows the server-wide snapshot: load() reads
+// s.auth, so a ReplaceAuth is enforced on that leg's very next request with no
+// per-leg bookkeeping — byte-for-byte the pre-round-14 behavior, and the reason
+// the plain day-2 credential swap is untouched by this.
+//
+// When the leg is RETIRED the slot is PINNED to what that address was serving at
+// the moment of retirement, and from then on it can only tighten. That is the
+// ordering fix: retirement is asynchronous (stopLegLocked only wakes the serve
+// goroutine, which closes the socket and drains later), so between
+// ReconcileHTTP returning and the retired listener actually going away there is
+// an interval in which the reconciler publishes the credential set the commit
+// authorized for the NEW address. Following s.auth through that interval handed
+// that credential to the address the commit had just retired.
+type authSlot struct {
+	srv    *Server
+	pinned atomic.Pointer[AuthConfig]
+	// isPinned is separate from a nil `pinned` because nil is a MEANINGFUL
+	// policy (no authentication at all), not "unset".
+	isPinned atomic.Bool
+}
+
+// newAuthSlot allocates a live (following) slot for a new leg.
+func (s *Server) newAuthSlot() *authSlot { return &authSlot{srv: s} }
+
+// load returns the policy this leg must enforce for the request in hand.
+// listenerHandler guarantees every middleware has a slot, so there is no nil
+// receiver here — and deliberately no nil-receiver fallback, because the only
+// plausible one (return nil) is dynamicAuthMiddleware's PASS-THROUGH.
+func (a *authSlot) load() *AuthConfig {
+	if a.isPinned.Load() {
+		return a.pinned.Load()
+	}
+	return a.srv.auth.Load()
+}
+
+// pin freezes the slot at cur. Ordered so the pinned value is visible before the
+// slot stops following: a request racing this sees either the server-wide
+// snapshot or cur, and at the pin instant those are the same value.
+func (a *authSlot) pin(cur *AuthConfig) {
+	a.pinned.Store(cur)
+	a.isPinned.Store(true)
+}
+
+// tighten intersects a PINNED slot with next, so a revocation still reaches a
+// listener that is draining while no grant does. A nil next (remove-all-api-auth)
+// is NOT applied: that direction removes a requirement, and its justification is
+// the #4047/#5127 clamp on the address the COMMITTED config binds — never the
+// address this leg is being retired from.
+func (a *authSlot) tighten(next *AuthConfig) {
+	if next == nil || !a.isPinned.Load() {
+		return
+	}
+	a.pinned.Store(AuthForRetainedListener(a.pinned.Load(), next))
+}
+
 // listenerHandler wraps the shared pre-auth base with the per-listener auth gate
 // for a bind address (#4162/#5866): only a literal loopback bind leaves /metrics
-// open when auth is configured. The dynamic middleware reads the live auth
-// snapshot per request, so ReplaceAuth needs no rebind.
-func (s *Server) listenerHandler(addr string) http.Handler {
-	return s.dynamicAuthMiddleware(!isLoopbackBindAddr(addr), s.sharedBase)
+// open when auth is configured. The dynamic middleware reads the leg's own slot
+// per request — which follows the live snapshot until the leg is retired — so
+// ReplaceAuth needs no rebind.
+func (s *Server) listenerHandler(addr string, slot *authSlot) http.Handler {
+	if slot == nil {
+		// Never let a missing slot become a pass-through: substitute a FOLLOWING
+		// slot, which is what a live leg has anyway.
+		slot = s.newAuthSlot()
+	}
+	return s.dynamicAuthMiddleware(!isLoopbackBindAddr(addr), slot, s.sharedBase)
 }
 
 // buildHTTPServer constructs a fresh HTTP *http.Server bound-for addr with the
 // per-listener handler (#5866). Used at construction and by a per-leg HTTP
 // rebind.
-func (s *Server) buildHTTPServer(addr string) *http.Server {
+func (s *Server) buildHTTPServer(addr string, slot *authSlot) *http.Server {
 	return &http.Server{
 		Addr:              addr,
-		Handler:           s.listenerHandler(addr),
+		Handler:           s.listenerHandler(addr, slot),
 		ReadHeaderTimeout: apiReadHeaderTimeout,
 		ReadTimeout:       apiReadTimeout,
 		IdleTimeout:       apiIdleTimeout,
@@ -679,7 +755,7 @@ func (s *Server) buildHTTPServer(addr string) *http.Server {
 // on-disk pair AS-IS and mints a fresh cert ONLY when no on-disk pair exists (a
 // rebind does not re-mint — #1916 D6). A cert-resolution failure is returned so
 // the caller retains the previous leg (fail-closed).
-func (s *Server) buildHTTPSServer(addr string) (*http.Server, error) {
+func (s *Server) buildHTTPSServer(addr string, slot *authSlot) (*http.Server, error) {
 	// Thread the listener's host into cert generation so a non-loopback
 	// management bind IP (e.g. `web-management https interface 10.0.0.1`)
 	// lands in the cert's SANs and a remote client verifies under strict
@@ -695,7 +771,7 @@ func (s *Server) buildHTTPSServer(addr string) (*http.Server, error) {
 	}
 	return &http.Server{
 		Addr:              addr,
-		Handler:           s.listenerHandler(addr),
+		Handler:           s.listenerHandler(addr, slot),
 		ReadHeaderTimeout: apiReadHeaderTimeout,
 		ReadTimeout:       apiReadTimeout,
 		IdleTimeout:       apiIdleTimeout,
@@ -764,8 +840,21 @@ func (s *Server) bindListeners() (httpLn, httpsLn net.Listener, err error) {
 // request, so a revoked credential is rejected immediately — no listener bounce,
 // no restart, no window. a==nil disables auth (only reached on a loopback bind;
 // the #4047/#5127 clamp forces a non-loopback no-auth bind through a rebuild).
+//
+// The swap reaches every LIVE leg at once (they read s.auth through their slots)
+// and reaches each RETIRING leg only as a TIGHTENING (#5561 round 14). A leg
+// that a reconcile replaced is still accepting and serving for the width of its
+// bounded drain, and the address it is serving is one the committed config asked
+// to leave: a revocation must still land there, a grant must not, and a nil must
+// not — the clamp that licenses a nil was evaluated against the address the
+// commit BOUND, not the one it retired.
 func (s *Server) ReplaceAuth(a *AuthConfig) {
 	s.auth.Store(a)
+	s.retireMu.Lock()
+	defer s.retireMu.Unlock()
+	for _, leg := range s.pruneRetiredLocked() {
+		leg.slot.tighten(a)
+	}
 }
 
 // LiveAuth returns the credential snapshot the listeners are currently
@@ -814,14 +903,16 @@ func (s *Server) SetTLSCertDirForTest(dir string) {
 	}
 }
 
-// dynamicAuthMiddleware wraps next with the LIVE auth snapshot (#5866): it reads
-// s.auth atomically per request so a ReplaceAuth swap takes effect immediately.
+// dynamicAuthMiddleware wraps next with the auth snapshot of the LEG that
+// accepted the request (#5866; per-leg since #5561 round 14): a live leg's slot
+// reads s.auth atomically per request so a ReplaceAuth swap takes effect
+// immediately, and a retired leg's slot reads the policy it was pinned to.
 // A nil snapshot passes through (no auth) — the loopback clamp guarantees such a
 // listener is loopback-only. It enforces byte-for-byte the same checks as the
 // static authMiddleware via the shared authCheck.
-func (s *Server) dynamicAuthMiddleware(metricsRequireAuth bool, next http.Handler) http.Handler {
+func (s *Server) dynamicAuthMiddleware(metricsRequireAuth bool, slot *authSlot, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		a := s.auth.Load()
+		a := slot.load()
 		if a == nil {
 			next.ServeHTTP(w, r)
 			return
