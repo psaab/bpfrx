@@ -158,19 +158,20 @@ func (d *Daemon) runShutdownSequence(wg *sync.WaitGroup, stop func(), runErr err
 
 	// In HA fail-closed mode, clear rg_active and watchdog immediately so
 	// BPF stops forwarding traffic even if subsequent cleanup steps hang.
-	if !hitless && d.dp != nil && cfg.Chassis.Cluster != nil {
+	// #2114: one snapshot for the whole HA-clear block (plan §5.3 rule 5).
+	if rt := d.dataplane(); !hitless && rt != nil && cfg.Chassis.Cluster != nil {
 		slog.Info("HA shutdown: clearing rg_active for all RGs")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
 			err := runHAShutdownUpdate(shutdownCtx, func(ctx context.Context) error {
-				return d.dp.HA().SetRGActive(ctx, rg.ID, false)
+				return rt.HA().SetRGActive(ctx, rg.ID, false)
 			})
 			if err != nil {
 				slog.Warn("failed to clear rg_active on shutdown", "rg", rg.ID, "err", err)
 			}
 			err = runHAShutdownUpdate(shutdownCtx, func(ctx context.Context) error {
-				return d.dp.HA().SetHAWatchdog(ctx, rg.ID, 0)
+				return rt.HA().SetHAWatchdog(ctx, rg.ID, 0)
 			})
 			if err != nil {
 				slog.Warn("failed to clear ha_watchdog on shutdown", "rg", rg.ID, "err", err)
@@ -211,22 +212,24 @@ func (d *Daemon) runShutdownSequence(wg *sync.WaitGroup, stop func(), runErr err
 		ss.Stop()
 	}
 
-	if d.dp != nil {
+	// #2114: a SECOND snapshot for final-stats + Close/Teardown (plan §5.3
+	// rule 5), matching the pre-cell two separate reads.
+	if rt := d.dataplane(); rt != nil {
 		// logFinalStats now reads through the runtime Telemetry
 		// domain (#1519); the dataplaneReadyProbe gate keeps the
 		// "no-op when dp not loaded" contract intact for both
 		// backends.
-		if ready, ok := d.dp.(dataplaneReadyProbe); ok {
-			logFinalStats(ready, d.dp.Telemetry())
+		if ready, ok := rt.(dataplaneReadyProbe); ok {
+			logFinalStats(ready, rt.Telemetry())
 		}
 		if hitless {
 			// Hitless: close Go handles only — BPF programs keep running.
 			slog.Info("hitless shutdown: preserving BPF state")
-			d.dp.Close()
+			rt.Close()
 		} else {
 			// Fail-closed: tear down all pinned BPF state.
 			slog.Info("HA shutdown: tearing down BPF state")
-			d.dp.Teardown()
+			rt.Teardown()
 		}
 	}
 

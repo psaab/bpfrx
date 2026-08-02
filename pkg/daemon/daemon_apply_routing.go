@@ -364,7 +364,7 @@ func (d *Daemon) reconcileRouteLeakSnapshot(cfg *config.Config, overlay []config
 	if cfg == nil {
 		return nil
 	}
-	pub, ok := d.dp.(routeOverlayPublisher)
+	pub, ok := d.dataplane().(routeOverlayPublisher)
 	if !ok {
 		// Helperless (no userspace dataplane publisher): the kernel ip-rule
 		// reconcile above is the only route-leak consumer and it already ran.

@@ -163,7 +163,8 @@ func TestClearSessionsForDeletedPolicies(t *testing.T) {
 		},
 	}
 
-	d := &Daemon{dp: dp}
+	d := &Daemon{}
+	d.setDataplane(dp)
 	d.clearSessionsForDeletedPolicies(old, newCfg)
 
 	if _, ok := dp.v4[webSess]; ok {
@@ -204,7 +205,8 @@ func TestClearSessionsForDeletedPolicies_FirstPolicyIdZeroNotSwept(t *testing.T)
 			syncedV6: {State: dataplane.SessStateEstablished, PolicyID: 0},
 		},
 	}
-	d := &Daemon{dp: dp}
+	d := &Daemon{}
+	d.setDataplane(dp)
 	d.clearSessionsForDeletedPolicies(old, newCfg)
 
 	if _, ok := dp.v4[hostSess]; !ok {
@@ -232,7 +234,8 @@ func TestClearSessionsForDeletedPolicies_RenameFirstPolicyNotSwept(t *testing.T)
 			hostSess: {State: dataplane.SessStateEstablished, PolicyID: 0},
 		},
 	}
-	d := &Daemon{dp: dp}
+	d := &Daemon{}
+	d.setDataplane(dp)
 	d.clearSessionsForDeletedPolicies(old, newCfg)
 
 	if _, ok := dp.v4[hostSess]; !ok {
@@ -251,7 +254,8 @@ func TestClearSessionsForDeletedPolicies_NoDeletionIsNoop(t *testing.T) {
 			sess: {State: dataplane.SessStateEstablished, PolicyID: webID},
 		},
 	}
-	d := &Daemon{dp: dp}
+	d := &Daemon{}
+	d.setDataplane(dp)
 	d.clearSessionsForDeletedPolicies(old, newCfg)
 
 	if _, ok := dp.v4[sess]; !ok {
@@ -392,7 +396,8 @@ func TestClearSessionsForPolicyIDsEnumerateErrorPropagates(t *testing.T) {
 	errBoom := errors.New("v4 iterator exploded")
 	dp.iterErr = errBoom
 
-	d := &Daemon{dp: dp}
+	d := &Daemon{}
+	d.setDataplane(dp)
 
 	err := d.clearSessionsForDeletedPolicies(oldCfg, newCfg)
 	if err == nil {
@@ -421,7 +426,8 @@ func TestClearSessionsForPolicyIDsDeleteErrorPropagates(t *testing.T) {
 	errBoom := errors.New("batch delete failed")
 	dp.delErr = errBoom
 
-	d := &Daemon{dp: dp}
+	d := &Daemon{}
+	d.setDataplane(dp)
 
 	err := d.clearSessionsForDeletedPolicies(oldCfg, newCfg)
 	if err == nil {
@@ -453,12 +459,12 @@ func TestApplyAndSyncCommittedSurfacesInvalidationError(t *testing.T) {
 	dp.delErr = errBoom
 
 	d := &Daemon{
-		dp: dp,
 		// Bypass the heavy reconcile: the apply "succeeds" so the post-apply
 		// invalidation runs and its error is the only thing under test.
 		applyBodyForTest: func(*config.Config) {},
 		applyErrForTest:  nil,
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 
 	// syncPeer=false: no cluster wiring needed; the peer push is orthogonal.
 	got, err := d.applyAndSyncCommitted(oldActive, compiled, false)

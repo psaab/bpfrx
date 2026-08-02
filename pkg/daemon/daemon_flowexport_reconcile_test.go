@@ -285,13 +285,13 @@ func TestApplyConfigLockedReconcilesFlowExporters(t *testing.T) {
 	installFakeNetworkctl(t)
 	d := &Daemon{
 		applySem:    semaphore.NewWeighted(1),
-		dp:          &runtimeOnlyApplyTestDP{},
 		vrrpMgr:     vrrp.NewManager(),
 		store:       newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		eventReader: logging.NewEventReader(nil, nil),
 		daemonCtx:   context.Background(),
 		opts:        Options{NoDataplane: true},
 	}
+	d.setDataplane(&runtimeOnlyApplyTestDP{}) // #2114: publish through the cell
 	t.Cleanup(d.stopFlowExporter)
 
 	if err := d.applyConfigLocked(context.Background(), flowSamplingConfig("127.0.0.1", 100)); err != nil {

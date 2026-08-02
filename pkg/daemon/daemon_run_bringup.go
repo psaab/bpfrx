@@ -445,7 +445,7 @@ func (d *Daemon) setupDataplaneAndInitialConfig() error {
 				"err", err,
 				"remediation", "set system dataplane-type userspace",
 			)
-			d.dp = nil
+			d.setDataplane(nil)
 		} else if errors.Is(err, dataplane.ErrEBPFBackendRetired) {
 			// #1476: mechanical source removal of the legacy
 			// eBPF dataplane. Behaviour mirrors the DPDK arm
@@ -461,20 +461,25 @@ func (d *Daemon) setupDataplaneAndInitialConfig() error {
 				"err", err,
 				"remediation", "set system dataplane-type userspace",
 			)
-			d.dp = nil
+			d.setDataplane(nil)
 		} else if err != nil {
 			slog.Error("failed to create dataplane", "type", dpType, "err", err)
 			return fmt.Errorf("create dataplane: %w", err)
 		} else {
-			d.dp = dp
+			d.setDataplane(dp)
 		}
+		// #2114: snapshot the just-published dataplane ONCE for the rest
+		// of this straight-line boot block (plan §5.3 rule 3) — the
+		// nil-check, the cold-path mask stamp, Start, and the seeder all
+		// share one coherent view.
+		rt := d.dataplane()
 		// #1620: stamp the cold-path sample mask onto the userspace
 		// Manager so the next buildSnapshot includes it. Mask
 		// validation already happened in cmd/xpfd/main.go (two-flag
 		// scheme, pow-of-2-1, reject u64::MAX). nil pointer ⇒ no
 		// operator setting, userspace-dp defaults to 0xff.
-		if d.dp != nil && d.opts.ColdPathSampleMask != nil {
-			if adapter, ok := d.dp.(interface{ Manager() *dpuserspace.Manager }); ok {
+		if rt != nil && d.opts.ColdPathSampleMask != nil {
+			if adapter, ok := rt.(interface{ Manager() *dpuserspace.Manager }); ok {
 				if mgr := adapter.Manager(); mgr != nil {
 					mgr.SetColdPathSampleMask(d.opts.ColdPathSampleMask)
 				}
@@ -483,18 +488,18 @@ func (d *Daemon) setupDataplaneAndInitialConfig() error {
 		// #1922 Item 2: in bootstrap mode, do NOT arm the dataplane
 		// (AF_XDP attach) and do NOT run the boot-time applyConfig
 		// (interface/FRR/routing takeover). The backend object stays
-		// constructed (d.dp != nil) so the bootstrap-exit reconcile can
+		// constructed (rt != nil) so the bootstrap-exit reconcile can
 		// arm it on the first confirmed commit (C1: construct always, arm
 		// only when not bootstrap). The control plane (gRPC/REST/CLI) is
 		// started later regardless.
 		if d.inBootstrap() {
 			slog.Info("bootstrap mode: dataplane arm and boot-time config apply suppressed")
 		} else {
-			if d.dp != nil {
-				if err := d.dp.Start(d.daemonCtx); err != nil {
+			if rt != nil {
+				if err := rt.Start(d.daemonCtx); err != nil {
 					slog.Warn("failed to start dataplane, running in config-only mode",
 						"err", err)
-					d.dp = nil
+					d.setDataplane(nil)
 				} else {
 					// natSeeder is satisfied by both *dataplane.Manager
 					// (legacy eBPF — SeedNATPortCounters in maps_nat.go,
@@ -503,7 +508,7 @@ func (d *Daemon) setupDataplaneAndInitialConfig() error {
 					// seed methods are no-ops on the userspace fast path
 					// but harmless to invoke. The legacyDP() round-trip is
 					// no longer required (#1519).
-					if seeder, ok := d.dp.(natSeeder); ok {
+					if seeder, ok := rt.(natSeeder); ok {
 						seeder.SeedNATPortCounters()
 						nodeID := 0
 						if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {

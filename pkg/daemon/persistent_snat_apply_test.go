@@ -58,11 +58,11 @@ func TestApplyConfigLockedAbortsCommitOnPersistentSourceNATProtocolMismatch(t *t
 		applyErr: dpuserspace.ErrPersistentSourceNATProtocolIncompatible,
 	}
 	d := &Daemon{
-		dp:      dp,
 		vrrpMgr: vrrp.NewManager(),
 		store:   newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		opts:    Options{NoDataplane: true},
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 
 	err := d.applyConfigLocked(context.Background(), persistentSourceNATConfig())
 	if !errors.Is(err, dpuserspace.ErrPersistentSourceNATProtocolIncompatible) {
@@ -96,11 +96,11 @@ func TestApplyConfigLenientWrapperSwallowsPersistentSourceNATProtocolMismatch(t 
 	}
 	d := &Daemon{
 		applySem: semaphore.NewWeighted(1),
-		dp:       dp,
 		vrrpMgr:  vrrp.NewManager(),
 		store:    newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		opts:     Options{NoDataplane: true},
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 
 	// The void wrapper must return normally (log + swallow) — no panic, no
 	// propagation. If this path aborted/propagated, a node carrying a

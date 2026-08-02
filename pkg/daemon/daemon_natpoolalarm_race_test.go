@@ -9,33 +9,38 @@ import (
 )
 
 // #2114 regression tests for the NAT pool-alarm monitor's lifecycle vs the
-// daemon's d.dp / bootstrap-exit transitions. These MUST be run under
-// `go test -race`; the bug they guard is a data race on the unsynchronized
-// d.dp interface field (sampler read vs bootstrap-exit d.dp=nil write) and a
-// second race on the d.natPoolAlarm pointer itself (now atomic.Pointer) that
-// the runtime start/discard introduced and the show-security-alarms reader
-// raced.
+// daemon's dataplane-cell / bootstrap-exit transitions. These MUST be run
+// under `go test -race`. The original bug was a data race on the
+// unsynchronized d.dp interface field (sampler read vs bootstrap-exit
+// d.dp=nil write); the field is now the dpCell atomic.Pointer
+// (dataplane()/setDataplane()), and writeDPFor publishes through
+// setDataplane, so these tests pin the lifecycle gates (bootstrap start
+// gate, rollback stop+discard, pointer publication) against the REAL
+// concurrent writer. The second race these cover is on the d.natPoolAlarm
+// pointer itself (atomic.Pointer) that the runtime start/discard introduced
+// and the show-security-alarms reader raced.
 //
 // The tests target the REAL production gating helpers (maybeStartNATPoolAlarm,
 // stopAndDiscardNATPoolAlarm, natPoolAlarms) rather than a hand-rolled racy
 // field, so they are genuine fail-pre / pass-post regression guards:
 //   - TestNATPoolAlarm_BootGate fails if the boot-time start drops its
-//     !inBootstrap() gate (Edit 1): a sampler goroutine then reads d.dp while
-//     the test writes d.dp = nil.
+//     !inBootstrap() gate (Edit 1): a sampler goroutine then reads the
+//     dataplane cell while the test clears it.
 //   - TestNATPoolAlarm_RollbackDiscard fails if enterBootstrapMode drops the
 //     stop+discard (Edit 3): a stale sampler survives the rollback and races
-//     a later d.dp = nil re-arm-failure write.
+//     a later re-arm-failure clear.
 //   - TestNATPoolAlarm_PointerPublication fails if d.natPoolAlarm reverts to a
 //     plain pointer (Edit 0): the show-security-alarms reader races the
 //     runtime start/discard writes.
 
 // newNATPoolAlarmTestDaemon builds a minimal *Daemon with a non-nil runtime
-// dataplane fake (so d.dp != nil) and an injected apply-body seam (so
+// dataplane fake published in the cell (so d.dataplane() != nil) and an
+// injected apply-body seam (so
 // enterBootstrapMode skips the real fs/FRR/dataplane teardown but still runs
 // the #2114 stop+discard placed before that seam return).
 func newNATPoolAlarmTestDaemon() *Daemon {
 	d := &Daemon{}
-	d.dp = &runtimeOnlyApplyTestDP{}
+	d.setDataplane(&runtimeOnlyApplyTestDP{})
 	d.applyBodyForTest = func(_ *config.Config) {}
 	// Fast sampler cadence so any monitor that DOES start actively reads
 	// d.dp during the concurrent d.dp-write loops below — making the
@@ -45,10 +50,10 @@ func newNATPoolAlarmTestDaemon() *Daemon {
 	return d
 }
 
-// writeDPFor mirrors the bootstrap-exit/re-arm-failure write of the daemon's
-// d.dp field in a tight loop for the given duration, then joins. It is the
-// concurrent writer the monitor's sampler would race if a start gate or the
-// rollback discard were removed.
+// writeDPFor mirrors the bootstrap-exit/re-arm-failure publication of the
+// daemon's dataplane cell in a tight loop for the given duration, then joins.
+// It is the concurrent writer the monitor's sampler would race if a start
+// gate or the rollback discard were removed.
 func writeDPFor(dur time.Duration, d *Daemon) {
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -56,8 +61,8 @@ func writeDPFor(dur time.Duration, d *Daemon) {
 		defer wg.Done()
 		deadline := time.Now().Add(dur)
 		for time.Now().Before(deadline) {
-			d.dp = nil
-			d.dp = &runtimeOnlyApplyTestDP{}
+			d.setDataplane(nil)
+			d.setDataplane(&runtimeOnlyApplyTestDP{})
 		}
 	}()
 	wg.Wait()

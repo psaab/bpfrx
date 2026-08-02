@@ -47,12 +47,12 @@ func TestApplyConfigLockedFailsCommitOnOrdinaryDataplaneApplyError_5679(t *testi
 
 	dp := &runtimeOnlyApplyTestDP{applyErr: injected}
 	d := &Daemon{
-		dp:       dp,
 		networkd: networkd.NewInDir(t.TempDir()),
 		store:    newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		vrrpMgr:  vrrp.NewManager(),
 		opts:     Options{NoDataplane: true},
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 
 	cfg := &config.Config{}
 	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
@@ -100,12 +100,12 @@ func TestApplyConfigLockedAbortClassStillEarlyReturns_5679(t *testing.T) {
 
 	dp := &runtimeOnlyApplyTestDP{applyErr: dpuserspace.ErrPolicySchedulerProtocolIncompatible}
 	d := &Daemon{
-		dp:       dp,
 		networkd: networkd.NewInDir(t.TempDir()),
 		store:    newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		vrrpMgr:  vrrp.NewManager(),
 		opts:     Options{NoDataplane: true},
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 
 	cfg := &config.Config{}
 	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{

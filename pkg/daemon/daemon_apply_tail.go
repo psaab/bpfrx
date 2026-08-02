@@ -488,10 +488,11 @@ func lldpConfigEqual(a, b *lldp.LLDPConfig) bool {
 }
 
 func (d *Daemon) publishInitialPolicySchedulerStateLocked(cfg *config.Config, activeState map[string]bool, applyResult *dataplane.ApplyResult) {
-	if d.dp == nil || activeState == nil || applyResult == nil {
+	rt := d.dataplane()
+	if rt == nil || activeState == nil || applyResult == nil {
 		return
 	}
-	if _, isUserspace := d.dp.(userspaceRuntimeModeReporter); isUserspace {
+	if _, isUserspace := rt.(userspaceRuntimeModeReporter); isUserspace {
 		return
 	}
 	// #3780: initial (eBPF-path) publish rides the apply transaction; a

@@ -15,10 +15,17 @@ import (
 // reports Available:false so the monitor HOLDs (makes no decision).
 func (d *Daemon) natPoolAlarmSampler() natpoolalarm.Sampler {
 	return func() natpoolalarm.View {
-		if d == nil || d.dp == nil {
+		if d == nil {
 			return natpoolalarm.View{Available: false}
 		}
-		adapter, ok := d.dp.(interface {
+		// #2114: one dataplane snapshot per sampler tick (plan §5.3
+		// rule 1) — the monitor goroutine runs concurrently with the
+		// bootstrap-exit writer.
+		rt := d.dataplane()
+		if rt == nil {
+			return natpoolalarm.View{Available: false}
+		}
+		adapter, ok := rt.(interface {
 			Manager() *dpuserspace.Manager
 		})
 		if !ok {
@@ -98,7 +105,7 @@ func (d *Daemon) natPoolAlarms() []natpoolalarm.ActiveAlarm {
 // The d.dp==nil guard keeps the helper self-contained: bootstrap suppresses
 // the start, and a torn-down/never-armed dataplane has nothing to sample.
 func (d *Daemon) maybeStartNATPoolAlarm() {
-	if d.opts.NoDataplane || d.inBootstrap() || d.dp == nil {
+	if d.opts.NoDataplane || d.inBootstrap() || d.dataplane() == nil {
 		return
 	}
 	if d.natPoolAlarm.Load() != nil {

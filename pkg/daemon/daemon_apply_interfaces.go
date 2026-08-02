@@ -39,7 +39,7 @@ func (d *Daemon) applyFabricIPVLAN(cfg *config.Config) {
 		addrs  []string
 	}
 	var deferredOverlays []deferredIPVLAN
-	bindingCtrl, isUserspaceDP := d.dp.(userspaceXSKBindingController)
+	bindingCtrl, isUserspaceDP := d.dataplane().(userspaceXSKBindingController)
 	for ifName, ifCfg := range cfg.Interfaces.Interfaces {
 		if ifCfg == nil || ifCfg.LocalFabricMember == "" || !strings.HasPrefix(ifName, "fab") {
 			continue

@@ -190,7 +190,7 @@ func syncPrimeProgressObserved(current, baseline cluster.SyncStatsSnapshot) bool
 
 func (d *Daemon) startSessionSyncPrimeRetry(gen uint64) {
 	ss := d.getSessionSync()
-	if ss == nil || d.dp == nil {
+	if ss == nil || d.dataplane() == nil {
 		return
 	}
 	go func() {
@@ -294,10 +294,13 @@ func (d *Daemon) bulkSyncViaEventStreamOrFallback(ss *cluster.SessionSync) error
 	// userspaceEventStreamExporter is a local probe satisfied by
 	// *dataplane/userspace.LegacyDataPlaneAdapter via
 	// ExportAllSessionsViaEventStream (legacy_dataplane.go:422).
-	// Type-assertion target is d.dp directly — the legacyDP()
-	// round-trip retired in #1519 added no method-set coverage.
-	if d.dp != nil {
-		if exporter, ok := d.dp.(userspaceEventStreamExporter); ok {
+	// Type-assertion target is the published dataplane directly — the
+	// legacyDP() round-trip retired in #1519 added no method-set coverage.
+	// #2114: ONE snapshot feeds the nil-check, the assertion, and the %T
+	// log below (plan §5.3 rules 3/9).
+	rt := d.dataplane()
+	if rt != nil {
+		if exporter, ok := rt.(userspaceEventStreamExporter); ok {
 			slog.Info("cluster: using event stream export for bulk sync")
 			if err := exporter.ExportAllSessionsViaEventStream(); err != nil {
 				slog.Warn("cluster: event stream bulk export failed, falling back to BulkSync", "err", err)
@@ -308,7 +311,7 @@ func (d *Daemon) bulkSyncViaEventStreamOrFallback(ss *cluster.SessionSync) error
 		}
 	}
 	slog.Info("cluster: event stream export not available, falling back to BulkSync",
-		"dp_type", fmt.Sprintf("%T", d.dp))
+		"dp_type", fmt.Sprintf("%T", rt))
 	if ss == nil {
 		return fmt.Errorf("session sync not initialized")
 	}
@@ -724,13 +727,14 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 	// map every 500ms for each configured RG. If the daemon is SIGKILL'd,
 	// the timestamp goes stale and BPF stops forwarding within 2s.
 	//
-	// #3917: gate on d.dp only (not the startup RG count) and re-read the
+	// #3917: gate on the published dataplane only (not the startup RG
+	// count) and re-read the
 	// CURRENT redundancy-group set each tick. Comms are only restarted on a
 	// transport-field change, so binding cc.RedundancyGroups here would
 	// starve a day-2 RG (added by a later commit) of watchdog heartbeats ->
 	// its watchdog goes stale -> the dataplane stops forwarding for it.
 	// This mirrors the live-config read the fence path now uses.
-	if d.dp != nil {
+	if d.dataplane() != nil {
 		go func() {
 			ticker := time.NewTicker(500 * time.Millisecond)
 			defer ticker.Stop()
@@ -739,6 +743,13 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				case <-commsCtx.Done():
 					return
 				case <-ticker.C:
+					// #2114: ONE load per tick, shared across the RG loop
+					// (plan §5.3 rule 1) — never per-RG, never a lifetime
+					// capture.
+					rt := d.dataplane()
+					if rt == nil {
+						continue
+					}
 					rgs := d.currentRedundancyGroups()
 					if len(rgs) == 0 {
 						continue
@@ -747,7 +758,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 					_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
 					now := uint64(ts.Sec)
 					for _, rg := range rgs {
-						if err := d.dp.HA().SetHAWatchdog(commsCtx, rg.ID, now); err != nil {
+						if err := rt.HA().SetHAWatchdog(commsCtx, rg.ID, now); err != nil {
 							slog.Warn("ha watchdog write failed", "rg", rg.ID, "err", err)
 						}
 					}
@@ -1114,14 +1125,14 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			ss.SetVRFDevice(vrfDevice)
 			var streamProvider userspaceEventStreamProvider
 			streamCallbacksWired := false
-			if d.dp != nil {
+			if rt := d.dataplane(); rt != nil {
 				// userspaceEventStreamProvider is a local probe;
 				// userspace LegacyDataPlaneAdapter satisfies it via
 				// EventStream (legacy_dataplane.go:414). Type-
-				// assertion target is d.dp directly — the legacyDP()
-				// round-trip retired in #1519 added no method-set
-				// coverage.
-				if provider, ok := d.dp.(userspaceEventStreamProvider); ok {
+				// assertion target is the published dataplane directly —
+				// the legacyDP() round-trip retired in #1519 added no
+				// method-set coverage.
+				if provider, ok := rt.(userspaceEventStreamProvider); ok {
 					streamProvider = provider
 					wireCtx, cancel := context.WithTimeout(commsCtx, 5*time.Second)
 					streamCallbacksWired = d.wireUserspaceEventStreamCallbacks(wireCtx, provider)
@@ -1155,14 +1166,15 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 
 				// Wire dataplane into session sync and start the sweep.
 				// Must happen here (not in Run) because the session-sync
-				// object `ss` is created asynchronously in this goroutine. d.dp
-				// is a dataplane.RuntimeDataPlane; both the legacy *Manager and
+				// object `ss` is created asynchronously in this goroutine. The
+				// published dataplane is a dataplane.RuntimeDataPlane; both the
+				// legacy *Manager and
 				// the userspace LegacyDataPlaneAdapter implement
 				// Sessions()/Telemetry() so they satisfy the cluster
 				// package's narrow clusterRuntime contract directly
 				// (#1518).
-				if d.dp != nil {
-					ss.SetRuntime(d.dp)
+				if rt := d.dataplane(); rt != nil {
+					ss.SetRuntime(rt)
 					ss.IsPrimaryFn = func() bool {
 						return d.cluster != nil && d.cluster.IsLocalPrimary(0)
 					}
@@ -1276,14 +1288,16 @@ func (d *Daemon) currentRedundancyGroups() []*config.RedundancyGroup {
 // fenced too. Safe when the dataplane is nil (config-only mode) or the
 // config has no cluster/RGs.
 func (d *Daemon) fenceAllRedundancyGroups(ctx context.Context) {
-	// Guard d.dp: the daemon can run in config-only mode (d.dp == nil)
+	// Guard the published dataplane: the daemon can run in config-only mode
+	// (no published dataplane)
 	// when the runtime dataplane factory rejects the configured backend —
 	// for example, a stale "system dataplane-type dpdk" config triggers
-	// dataplane.ErrDPDKBackendRetired and daemon_run.go falls back to nil
-	// dp. Without this guard a peer fence would panic on a nil pointer
+	// dataplane.ErrDPDKBackendRetired and daemon_run.go falls back to no
+	// dataplane. Without this guard a peer fence would panic on a nil pointer
 	// dereference. The same applies to any future Start() failure that
-	// leaves d.dp == nil.
-	if d.dp == nil {
+	// leaves the dataplane unpublished.
+	rt := d.dataplane()
+	if rt == nil {
 		slog.Warn("cluster: fence received but dataplane is nil; skipping RG deactivation",
 			"mode", "config-only",
 			"action", "skip_rg_deactivation",
@@ -1294,7 +1308,7 @@ func (d *Daemon) fenceAllRedundancyGroups(ctx context.Context) {
 	rgs := d.currentRedundancyGroups()
 	slog.Warn("cluster: fence: disabling all RGs", "rg_count", len(rgs))
 	for _, rg := range rgs {
-		if err := d.dp.HA().SetRGActive(ctx, rg.ID, false); err != nil {
+		if err := rt.HA().SetRGActive(ctx, rg.ID, false); err != nil {
 			slog.Warn("cluster: fence: failed to disable rg_active",
 				"rg", rg.ID, "err", err)
 		}

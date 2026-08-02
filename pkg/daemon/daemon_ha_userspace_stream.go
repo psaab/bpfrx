@@ -64,7 +64,7 @@ func (d *Daemon) shouldSyncUserspaceDelta(ss *cluster.SessionSync, delta dpusers
 }
 
 func (d *Daemon) syncUserspaceSessionDeltas(ctx context.Context) {
-	drainer, ok := d.dp.(userspaceSessionDeltaDrainer)
+	drainer, ok := d.dataplane().(userspaceSessionDeltaDrainer)
 	if !ok || d.cluster == nil || d.getSessionSync() == nil {
 		return
 	}
@@ -119,7 +119,7 @@ func (d *Daemon) syncUserspaceSessionDeltas(ctx context.Context) {
 // binary event stream. Falls back to the existing polling loop when the stream
 // is unavailable or disconnected.
 func (d *Daemon) runUserspaceEventStream(ctx context.Context) {
-	provider, ok := d.dp.(userspaceEventStreamProvider)
+	provider, ok := d.dataplane().(userspaceEventStreamProvider)
 	if !ok {
 		// Manager doesn't support event stream — fall back to polling.
 		d.syncUserspaceSessionDeltas(ctx)
@@ -232,7 +232,7 @@ func (d *Daemon) handleEventStreamFullResync() bool {
 		slog.Debug("userspace event stream: full resync deferred (sync not connected)")
 		return false
 	}
-	exporter, ok := d.dp.(userspaceSessionExporter)
+	exporter, ok := d.dataplane().(userspaceSessionExporter)
 	if !ok {
 		return false
 	}
@@ -256,7 +256,7 @@ func (d *Daemon) handleEventStreamFullResync() bool {
 // When the event stream is live, polling slows to 5s reconciliation;
 // when disconnected, it runs at 100ms to compensate for the lost stream.
 func (d *Daemon) eventStreamFallbackLoop(ctx context.Context, provider userspaceEventStreamProvider) {
-	drainer, hasDrainer := d.dp.(userspaceSessionDeltaDrainer)
+	drainer, hasDrainer := d.dataplane().(userspaceSessionDeltaDrainer)
 	if d.cluster == nil || d.getSessionSync() == nil {
 		return
 	}

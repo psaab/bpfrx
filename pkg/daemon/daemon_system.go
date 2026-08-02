@@ -38,7 +38,7 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 	er.SetZoneNames(zoneNames)
 
 	// Wire policy names and app names for structured logging
-	if d.dp != nil {
+	if d.dataplane() != nil {
 		if cr := d.applyResult(); cr != nil {
 			er.SetPolicyNames(cr.PolicyNames)
 			if cr.AppNames != nil {

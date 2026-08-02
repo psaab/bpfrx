@@ -45,12 +45,12 @@ func TestApplyConfigLockedSurfacesHostInboundFailure(t *testing.T) {
 
 	networkDir := t.TempDir()
 	d := &Daemon{
-		dp:       &runtimeOnlyApplyTestDP{},
 		networkd: networkd.NewInDir(networkDir),
 		store:    newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		vrrpMgr:  vrrp.NewManager(),
 		opts:     Options{NoDataplane: true},
 	}
+	d.setDataplane(&runtimeOnlyApplyTestDP{}) // #2114: publish through the cell
 
 	// Enforceable host-inbound config: a non-lifeline zone with a static
 	// address and a host-inbound stanza, so applyConfigLocked reaches the APPLY
@@ -109,12 +109,12 @@ func TestApplyConfigLockedSurfacesLo0Failure(t *testing.T) {
 
 	networkDir := t.TempDir()
 	d := &Daemon{
-		dp:       &runtimeOnlyApplyTestDP{},
 		networkd: networkd.NewInDir(networkDir),
 		store:    newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		vrrpMgr:  vrrp.NewManager(),
 		opts:     Options{NoDataplane: true},
 	}
+	d.setDataplane(&runtimeOnlyApplyTestDP{}) // #2114: publish through the cell
 
 	// An lo0 input filter is bound (so applyLo0Filter reaches the APPLY path and
 	// the injected nft failure is the filter-not-installed failure). The single
@@ -170,13 +170,13 @@ func TestApplyConfigRuntimeResultDrivesDownstreamConsumers(t *testing.T) {
 	ss.IsPrimaryFn = func() bool { return false }
 	ss.IsPrimaryForRGFn = func(rgID int) bool { return rgID == 2 }
 	d := &Daemon{
-		dp:          dp,
 		networkd:    networkd.NewInDir(networkDir),
 		sessionSync: ss,
 		store:       newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		vrrpMgr:     vrrp.NewManager(),
 		opts:        Options{NoDataplane: true},
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 	cfg := &config.Config{
 		Interfaces: config.InterfacesConfig{
 			Interfaces: map[string]*config.InterfaceConfig{

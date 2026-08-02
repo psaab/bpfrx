@@ -209,7 +209,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// ===== PHASE 5: Background-service starts + HTTP/gRPC API =====
 	// Start background services if dataplane is loaded
 	var er *logging.EventReader
-	if d.dp != nil {
+	if rt := d.dataplane(); rt != nil {
 		// StartFIBSync is a no-op on every in-tree backend: eBPF
 		// resolves FIB queries via bpf_fib_lookup in-kernel and the
 		// userspace AF_XDP runtime wraps that no-op through the
@@ -220,7 +220,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// (kernel bpf_fib_lookup handles FIB resolution); the probe
 		// is retained for forward compatibility (a future backend
 		// may need a userspace route populator).
-		if starter, ok := d.dp.(fibSyncStarter); ok {
+		if starter, ok := rt.(fibSyncStarter); ok {
 			starter.StartFIBSync(ctx)
 		}
 
@@ -235,7 +235,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// The helper still mirrors sessions to BPF conntrack for display
 		// and periodically refreshes last_seen (~10s) so IterateSessions
 		// callers see accurate idle times.  See #333.
-		if _, ok := d.dp.(userspaceSessionDeltaDrainer); ok {
+		if _, ok := rt.(userspaceSessionDeltaDrainer); ok {
 			gc.SkipSweep = func() bool { return true }
 		}
 
@@ -267,7 +267,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			gc.Run(ctx)
 		}()
 
-		evSrc, evErr := d.dp.Telemetry().NewEventSource()
+		evSrc, evErr := rt.Telemetry().NewEventSource()
 		if evErr != nil {
 			slog.Warn("failed to create event source", "err", evErr)
 		}
@@ -300,6 +300,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 					if len(raw) < 56 {
 						return
 					}
+					// #2114: one dataplane snapshot per event (plan §5.3
+					// rule 7) — the closure runs on the event-reader
+					// goroutine long after this block published it.
+					rt := d.dataplane()
+					if rt == nil {
+						return
+					}
 					proto := raw[53]
 					af := raw[55]
 					if af == dataplane.AFInet6 {
@@ -309,7 +316,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 						key.SrcPort = binary.BigEndian.Uint16(raw[40:42])
 						key.DstPort = binary.BigEndian.Uint16(raw[42:44])
 						key.Protocol = proto
-						if val, err := d.dp.Sessions().GetV6(key); err == nil && val.IsReverse == 0 {
+						if val, err := rt.Sessions().GetV6(key); err == nil && val.IsReverse == 0 {
 							if ss.ShouldSyncZone(val.IngressZone) {
 								ss.QueueSessionV6(key, val)
 							}
@@ -321,7 +328,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 						key.SrcPort = binary.BigEndian.Uint16(raw[40:42])
 						key.DstPort = binary.BigEndian.Uint16(raw[42:44])
 						key.Protocol = proto
-						if val, err := d.dp.Sessions().GetV4(key); err == nil && val.IsReverse == 0 {
+						if val, err := rt.Sessions().GetV4(key); err == nil && val.IsReverse == 0 {
 							if ss.ShouldSyncZone(val.IngressZone) {
 								ss.QueueSessionV4(key, val)
 							}
@@ -351,7 +358,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 		}
 		if er == nil {
-			if _, ok := d.dp.(userspaceEventStreamProvider); ok {
+			if _, ok := rt.(userspaceEventStreamProvider); ok {
 				er = logging.NewEventReader(nil, eventBuf)
 				d.eventReader = er
 				if cfg := d.store.ActiveConfig(); cfg != nil {
@@ -362,7 +369,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 		}
 
-		if _, ok := d.dp.(userspaceEventStreamProvider); ok && d.cluster == nil {
+		if _, ok := rt.(userspaceEventStreamProvider); ok && d.cluster == nil {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -608,8 +615,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// Go duck-types the assignment to cli.New's dp parameter at
 		// this site; signature drift surfaces as a compile error.
 		var cliDP cliDataPlane
-		if d.dp != nil {
-			if probe, ok := d.dp.(cliDataPlane); ok {
+		if rt := d.dataplane(); rt != nil {
+			if probe, ok := rt.(cliDataPlane); ok {
 				cliDP = probe
 			}
 		}

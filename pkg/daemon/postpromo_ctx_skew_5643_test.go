@@ -68,11 +68,11 @@ func TestPostPromotionCancelRunsHostAuthorizationCloseout(t *testing.T) {
 
 	dp := &postPromoCancelDP{cancel: cancel}
 	d := &Daemon{
-		dp:      dp,
 		vrrpMgr: vrrp.NewManager(),
 		store:   newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		opts:    Options{NoDataplane: true},
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 
 	err := d.applyConfigLocked(ctx, &config.Config{})
 
@@ -136,11 +136,11 @@ func TestPostPromotionCancelReconcilesRootAuth(t *testing.T) {
 
 	dp := &postPromoCancelDP{cancel: cancel}
 	d := &Daemon{
-		dp:      dp,
 		vrrpMgr: vrrp.NewManager(),
 		store:   newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		opts:    Options{NoDataplane: true},
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 
 	err := d.applyConfigLocked(ctx, rootAuthCloseoutCfg(rootAuthCloseoutHash))
 
@@ -178,11 +178,11 @@ func TestC1PostPromotionCancelRunsHostAuthorizationCloseout(t *testing.T) {
 
 	dp := &runtimeOnlyApplyTestDP{}
 	d := &Daemon{
-		dp:      dp,
 		vrrpMgr: vrrp.NewManager(),
 		store:   newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		opts:    Options{NoDataplane: true},
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // pre-canceled: applyVRFReconcile bails at C1 before the dataplane apply
@@ -233,11 +233,11 @@ func TestLiveApplyRunsHostAuthorizationTailOnce(t *testing.T) {
 
 	dp := &runtimeOnlyApplyTestDP{}
 	d := &Daemon{
-		dp:      dp,
 		vrrpMgr: vrrp.NewManager(),
 		store:   newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		opts:    Options{NoDataplane: true},
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 
 	if err := d.applyConfigLocked(context.Background(), &config.Config{}); err != nil {
 		t.Fatalf("applyConfigLocked(live ctx) = %v, want nil", err)

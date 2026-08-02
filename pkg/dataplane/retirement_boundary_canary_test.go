@@ -3314,38 +3314,149 @@ func hasDaemonRuntimeConstructorCall(t *testing.T, path, name string) bool {
 func assertDaemonDPFieldIsRuntimeDataPlane(t *testing.T) {
 	t.Helper()
 
+	if err := checkDaemonDPFieldShape(filepath.Join("..", "daemon", "daemon.go")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// checkDaemonDPFieldShape verifies the #2114 dataplane-publication shape:
+// the Daemon struct carries the runtime dataplane ONLY as the
+// `dpCell atomic.Pointer[dpSlot]` publication cell, and the `dpSlot`
+// payload struct's `v` field is a `dataplane.RuntimeDataPlane`. The
+// pre-#2114 raw `dp dataplane.RuntimeDataPlane` field raced the
+// bootstrap-exit writer against the sampler/HA-watcher readers, so its
+// reappearance (or a dpSlot payload of any other type) fails here.
+func checkDaemonDPFieldShape(path string) error {
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, filepath.Join("..", "daemon", "daemon.go"), nil, 0)
+	file, err := parser.ParseFile(fset, path, nil, 0)
 	if err != nil {
-		t.Fatalf("parse daemon.go: %v", err)
+		return fmt.Errorf("parse %s: %v", path, err)
 	}
 
-	var found bool
+	var foundCell, foundSlot bool
+	var inspectErr error
 	ast.Inspect(file, func(n ast.Node) bool {
 		typeSpec, ok := n.(*ast.TypeSpec)
-		if !ok || typeSpec.Name.Name != "Daemon" {
+		if !ok {
 			return true
 		}
 		st, ok := typeSpec.Type.(*ast.StructType)
 		if !ok {
-			t.Fatalf("Daemon is %T, want struct", typeSpec.Type)
+			return true
 		}
-		for _, field := range st.Fields.List {
-			for _, name := range field.Names {
-				if name.Name != "dp" {
-					continue
+		switch typeSpec.Name.Name {
+		case "Daemon":
+			for _, field := range st.Fields.List {
+				for _, name := range field.Names {
+					switch name.Name {
+					case "dpCell":
+						foundCell = true
+						if got := canaryExprString(field.Type); got != "atomic.Pointer[dpSlot]" {
+							inspectErr = fmt.Errorf("Daemon.dpCell = %s, want atomic.Pointer[dpSlot]", got)
+						}
+					case "dp":
+						if got := canaryExprString(field.Type); got == "dataplane.RuntimeDataPlane" {
+							inspectErr = fmt.Errorf("Daemon.dp is a raw dataplane.RuntimeDataPlane field; #2114 publishes the dataplane through dpCell (atomic.Pointer[dpSlot])")
+						}
+					}
 				}
-				found = true
-				if got := canaryExprString(field.Type); got != "dataplane.RuntimeDataPlane" {
-					t.Fatalf("Daemon.dp = %s, want dataplane.RuntimeDataPlane", got)
+			}
+		case "dpSlot":
+			for _, field := range st.Fields.List {
+				for _, name := range field.Names {
+					if name.Name != "v" {
+						continue
+					}
+					foundSlot = true
+					if got := canaryExprString(field.Type); got != "dataplane.RuntimeDataPlane" {
+						inspectErr = fmt.Errorf("dpSlot.v = %s, want dataplane.RuntimeDataPlane", got)
+					}
 				}
 			}
 		}
-		return false
+		return true
 	})
+	if inspectErr != nil {
+		return inspectErr
+	}
+	if !foundCell {
+		return fmt.Errorf("Daemon.dpCell field not found (want dpCell atomic.Pointer[dpSlot])")
+	}
+	if !foundSlot {
+		return fmt.Errorf("dpSlot struct with a v dataplane.RuntimeDataPlane field not found")
+	}
+	return nil
+}
 
-	if !found {
-		t.Fatal("Daemon.dp field not found")
+// TestDaemonDPFieldShapeSelfTest feeds synthetic fixtures through
+// checkDaemonDPFieldShape in BOTH directions (#2114): the redesign must
+// reject the pre-#2114 raw field shape and accept the cell shape, so a
+// revert trips the boundary canary above.
+func TestDaemonDPFieldShapeSelfTest(t *testing.T) {
+	t.Parallel()
+
+	good := `package daemon
+
+type dpSlot struct{ v dataplane.RuntimeDataPlane }
+
+type Daemon struct {
+	dpCell atomic.Pointer[dpSlot]
+}
+`
+	rawField := `package daemon
+
+type Daemon struct {
+	dp dataplane.RuntimeDataPlane
+}
+`
+	wrongCellType := `package daemon
+
+type dpSlot struct{ v dataplane.RuntimeDataPlane }
+
+type Daemon struct {
+	dpCell atomic.Pointer[int]
+}
+`
+	missingSlot := `package daemon
+
+type Daemon struct {
+	dpCell atomic.Pointer[dpSlot]
+}
+`
+	wrongSlotPayload := `package daemon
+
+type dpSlot struct{ v int }
+
+type Daemon struct {
+	dpCell atomic.Pointer[dpSlot]
+}
+`
+
+	cases := []struct {
+		name    string
+		src     string
+		wantErr bool
+	}{
+		{"cell shape accepted", good, false},
+		{"raw field rejected", rawField, true},
+		{"wrong cell type rejected", wrongCellType, true},
+		{"missing dpSlot rejected", missingSlot, true},
+		{"wrong slot payload rejected", wrongSlotPayload, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "daemon.go")
+			if err := os.WriteFile(path, []byte(tc.src), 0o644); err != nil {
+				t.Fatalf("write fixture: %v", err)
+			}
+			err := checkDaemonDPFieldShape(path)
+			if tc.wantErr && err == nil {
+				t.Fatal("checkDaemonDPFieldShape accepted a bad shape")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("checkDaemonDPFieldShape rejected the cell shape: %v", err)
+			}
+		})
 	}
 }
 
@@ -3359,6 +3470,16 @@ func canaryExprString(expr ast.Expr) string {
 		return "*" + canaryExprString(e.X)
 	case *ast.BasicLit:
 		return e.Value
+	case *ast.IndexExpr:
+		// Generic instantiation with one type argument, e.g.
+		// atomic.Pointer[dpSlot] (#2114).
+		return canaryExprString(e.X) + "[" + canaryExprString(e.Index) + "]"
+	case *ast.IndexListExpr:
+		parts := make([]string, 0, len(e.Indices))
+		for _, idx := range e.Indices {
+			parts = append(parts, canaryExprString(idx))
+		}
+		return canaryExprString(e.X) + "[" + strings.Join(parts, ", ") + "]"
 	default:
 		return ""
 	}

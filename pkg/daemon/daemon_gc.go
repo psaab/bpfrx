@@ -19,5 +19,5 @@ import (
 // RuntimeDomainProvider directly (Sessions()/Telemetry()), so the
 // daemon no longer needs the BPF-shaped escape hatch here.
 func (d *Daemon) newConntrackGC(interval time.Duration) *conntrack.GC {
-	return conntrack.NewGC(d.dp, interval)
+	return conntrack.NewGC(d.dataplane(), interval)
 }

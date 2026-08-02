@@ -108,7 +108,8 @@ func TestClearSessionsForModifiedPolicies_SchedulerBecameInactive(t *testing.T) 
 				webSessV6: {State: dataplane.SessStateEstablished, PolicyID: webID},
 			},
 		}
-		d := &Daemon{dp: dp}
+		d := &Daemon{}
+		d.setDataplane(dp) // #2114: publish through the cell
 		d.clearSessionsForModifiedPolicies(old, newCfg)
 
 		if _, ok := dp.v4[webSess]; ok {
@@ -126,7 +127,8 @@ func TestClearSessionsForModifiedPolicies_SchedulerBecameInactive(t *testing.T) 
 				webSess: {State: dataplane.SessStateEstablished, PolicyID: webID},
 			},
 		}
-		d := &Daemon{dp: dp}
+		d := &Daemon{}
+		d.setDataplane(dp) // #2114: publish through the cell
 		d.clearSessionsForModifiedPolicies(old, steady)
 
 		if _, ok := dp.v4[webSess]; !ok {

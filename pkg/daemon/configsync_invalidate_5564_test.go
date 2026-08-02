@@ -112,7 +112,8 @@ func TestSyncAndApplyRunsInvalidatorsOnNonFatalApplyError(t *testing.T) {
 	s, peerText, webID := newSyncReadyStore(t)
 	dp, v4, v6 := syncSessionDP(webID)
 
-	d := &Daemon{applySem: semaphore.NewWeighted(1), store: s, dp: dp}
+	d := &Daemon{applySem: semaphore.NewWeighted(1), store: s}
+	d.setDataplane(dp) // #2114: publish through the cell
 	d.applyBodyForTest = func(*config.Config) {}
 	// Exactly the shape applyConfigLocked's tail joins (networkd/nft/Kea): the
 	// config is active + the dataplane armed, only a best-effort subsystem failed.
@@ -163,7 +164,8 @@ func TestSyncAndApplySkipsInvalidatorsOnFatalApplyError(t *testing.T) {
 	s, peerText, webID := newSyncReadyStore(t)
 	dp, v4, v6 := syncSessionDP(webID)
 
-	d := &Daemon{applySem: semaphore.NewWeighted(1), store: s, dp: dp}
+	d := &Daemon{applySem: semaphore.NewWeighted(1), store: s}
+	d.setDataplane(dp) // #2114: publish through the cell
 	d.applyBodyForTest = func(*config.Config) {}
 	d.applyErrForTest = dpuserspace.ErrPolicySchedulerProtocolIncompatible
 
@@ -197,7 +199,8 @@ func TestSyncAndApplyRunsInvalidatorsOnCleanApply(t *testing.T) {
 	s, peerText, webID := newSyncReadyStore(t)
 	dp, v4, v6 := syncSessionDP(webID)
 
-	d := &Daemon{applySem: semaphore.NewWeighted(1), store: s, dp: dp}
+	d := &Daemon{applySem: semaphore.NewWeighted(1), store: s}
+	d.setDataplane(dp) // #2114: publish through the cell
 	d.applyBodyForTest = func(*config.Config) {}
 	// applyErrForTest nil = clean apply.
 
@@ -227,7 +230,8 @@ func TestSyncAndApplySurfacesPartialInvalidationError(t *testing.T) {
 	errBoom := errors.New("batch delete failed")
 	dp.delErr = errBoom
 
-	d := &Daemon{applySem: semaphore.NewWeighted(1), store: s, dp: dp}
+	d := &Daemon{applySem: semaphore.NewWeighted(1), store: s}
+	d.setDataplane(dp) // #2114: publish through the cell
 	d.applyBodyForTest = func(*config.Config) {}
 
 	compiled, err := d.syncAndApply(context.Background(), peerText, nil)

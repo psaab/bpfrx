@@ -25,12 +25,12 @@ func TestApplyTailReconcilesSurfacesVRRPIdentityCollision(t *testing.T) {
 	defer func() { nftApplyPayload, nftDeleteTable = origApply, origDelete }()
 
 	d := &Daemon{
-		dp:       &runtimeOnlyApplyTestDP{},
 		networkd: networkd.NewInDir(t.TempDir()),
 		store:    newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		vrrpMgr:  vrrp.NewManager(),
 		opts:     Options{NoDataplane: true},
 	}
+	d.setDataplane(&runtimeOnlyApplyTestDP{}) // #2114: publish through the cell
 
 	group := func(vip string) map[string]*config.VRRPGroup {
 		return map[string]*config.VRRPGroup{

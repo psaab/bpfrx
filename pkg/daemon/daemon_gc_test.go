@@ -28,7 +28,8 @@ func TestDaemonConntrackGCPreservesLegacyDomains(t *testing.T) {
 			},
 		},
 	}
-	d := &Daemon{dp: dp}
+	d := &Daemon{}
+	d.setDataplane(dp) // #2114: publish through the cell
 	gc := d.newConntrackGC(time.Millisecond)
 	gc.SetSessionLimitEnabled(true)
 

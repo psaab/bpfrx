@@ -283,11 +283,12 @@ func (d *Daemon) clearSessionsForPolicyChanges(oldCfg, newCfg *config.Config) er
 // there was nothing to do (no ids / no dataplane / no matching sessions) or the
 // clear fully succeeded.
 func (d *Daemon) clearSessionsForPolicyIDs(ids map[uint32]struct{}, reason dataplane.DeleteReason, what string) error {
-	if d.dp == nil || len(ids) == 0 {
+	rt := d.dataplane()
+	if rt == nil || len(ids) == 0 {
 		return nil
 	}
 
-	store := d.dp.Sessions()
+	store := rt.Sessions()
 	if store == nil {
 		return nil
 	}

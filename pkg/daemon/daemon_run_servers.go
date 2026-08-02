@@ -114,8 +114,8 @@ func (d *Daemon) startGRPCServer(ctx context.Context, wg *sync.WaitGroup, eventB
 	// assignment to grpcapi.Config.DP at this site; signature
 	// drift surfaces as a compile error here.
 	var grpcDP grpcDataPlane
-	if d.dp != nil {
-		if probe, ok := d.dp.(grpcDataPlane); ok {
+	if rt := d.dataplane(); rt != nil {
+		if probe, ok := rt.(grpcDataPlane); ok {
 			grpcDP = probe
 		}
 	}
@@ -252,8 +252,8 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 	// assignment to api.Config.DP at this site; signature drift
 	// surfaces as a compile error here.
 	var apiDP apiDataPlane
-	if d.dp != nil {
-		if probe, ok := d.dp.(apiDataPlane); ok {
+	if rt := d.dataplane(); rt != nil {
+		if probe, ok := rt.(apiDataPlane); ok {
 			apiDP = probe
 		}
 	}
@@ -406,10 +406,13 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		// matching the dataplane's nil-state behavior rather than certifying
 		// an as-if-active verdict it is skipping.
 		PolicySchedulerActiveStateFn: func() (map[string]bool, bool) {
-			if d.dp == nil {
+			// #2114: one dataplane snapshot per request (plan §5.3
+			// rule 7).
+			rt := d.dataplane()
+			if rt == nil {
 				return nil, false
 			}
-			p, ok := d.dp.(interface {
+			p, ok := rt.(interface {
 				PolicySchedulerActiveState() map[string]bool
 			})
 			if !ok {

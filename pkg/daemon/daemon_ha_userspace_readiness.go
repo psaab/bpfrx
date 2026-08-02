@@ -199,7 +199,7 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 // this to skip eBPF-specific workarounds (blackhole routes) that the
 // userspace pipeline doesn't need.
 func (d *Daemon) userspaceDataplaneActive() bool {
-	if runtime, ok := d.dp.(userspaceRuntimeModeReporter); ok {
+	if runtime, ok := d.dataplane().(userspaceRuntimeModeReporter); ok {
 		return runtime.Mode() != dpuserspace.ModeEBPFOnly
 	}
 	return false
@@ -225,12 +225,14 @@ func (d *Daemon) checkUserspaceTakeoverReadiness(rgID int) (bool, []string) {
 	if !userspaceRGConfigured(cfg, rgID) {
 		return true, nil
 	}
-	// Copilot fix: if dp is nil or wrong type but config says userspace,
-	// the dataplane isn't ready — don't report takeover-ready.
-	if d.dp == nil {
+	// Copilot fix: if the dataplane is unpublished or wrong type but config
+	// says userspace, the dataplane isn't ready — don't report takeover-ready.
+	// #2114: one snapshot feeds the nil-check and the assertion.
+	rt := d.dataplane()
+	if rt == nil {
 		return false, []string{fmt.Sprintf("userspace dataplane not initialized for RG %d", rgID)}
 	}
-	ready, ok := d.dp.(userspaceTakeoverReadiness)
+	ready, ok := rt.(userspaceTakeoverReadiness)
 	if !ok {
 		return false, []string{fmt.Sprintf("userspace dataplane readiness provider not available for RG %d", rgID)}
 	}

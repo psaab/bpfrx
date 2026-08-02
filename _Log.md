@@ -66266,3 +66266,44 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+## 2026-08-02 — #2114 A1: publish the runtime dataplane through the dpCell atomic accessor
+
+- **Timestamp**: 2026-08-02 (fix/2114-dp-accessor)
+- **Action**: Implemented work item A1 of the converged #2114 plan
+  (docs/research/2114-nat-pool-alarm-dp-race/plan.md v99, PLAN-READY 3-of-3):
+  the plain `dp dataplane.RuntimeDataPlane` field (5 writers / 129 readers,
+  raced by the bootstrap-exit clear, the HA watcher chain, and the recovered
+  commit-confirmed timer) is replaced by `dpCell atomic.Pointer[dpSlot]` with
+  the `dataplane()`/`setDataplane()` accessor pair (kind-gated typed-nil
+  guard over Chan/Func/Map/Pointer/Slice/UnsafePointer). All 5 writer sites
+  converted (4 boot writers in daemon_run_bringup.go, bootstrap-exit arm in
+  daemon_run_naming.go — the latter extracted as armBootstrapExitDataplane so
+  the race tests drive the real writer). All readers converted per the plan's
+  §5.3 snapshot-boundary rules (one load per tick/callback/straight-line
+  block). The fwdstatus adapter is structurally narrowed to the sampler-only
+  CachedStatusProvider (fwdstatus.NewSampler retyped; the daemon adapter
+  collapses to one per-call-probing CachedStatus method; IsLoaded/GetMapStats/
+  Status leave the daemon adapter). ~80 `Daemon{dp: ...}` test literals
+  converted to setDataplane publication. Retirement-boundary canary matcher
+  extended (dpCell+dpSlot shape, *ast.IndexExpr rendering, both-direction
+  self-tests); new pkg/daemon AST canary forbids .dpCell access outside the
+  accessors.
+- **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_run_bringup.go,
+  pkg/daemon/daemon_run_naming.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/daemon_run_servers.go, pkg/daemon/daemon_run_shutdown.go,
+  pkg/daemon/daemon_ha.go, pkg/daemon/daemon_ha_sync.go,
+  pkg/daemon/daemon_ha_fabric.go, pkg/daemon/daemon_ha_userspace_stream.go,
+  pkg/daemon/daemon_ha_userspace_readiness.go, pkg/daemon/daemon_health.go,
+  pkg/daemon/daemon_ipmon.go, pkg/daemon/daemon_gc.go,
+  pkg/daemon/daemon_apply_dataplane.go, pkg/daemon/daemon_apply_tail.go,
+  pkg/daemon/daemon_apply_interfaces.go, pkg/daemon/daemon_apply_routing.go,
+  pkg/daemon/daemon_scheduler.go, pkg/daemon/daemon_system.go,
+  pkg/daemon/daemon_policy_invalidate.go,
+  pkg/daemon/daemon_neighbor_listener.go, pkg/daemon/bootstrap.go,
+  pkg/daemon/daemon_forwarding_status.go,
+  pkg/daemon/daemon_forwarding_status_test.go,
+  pkg/daemon/daemon_natpoolalarm.go,
+  pkg/daemon/daemon_natpoolalarm_race_test.go,
+  pkg/daemon/daemon_dp_canary_test.go (new), pkg/fwdstatus/sampler.go,
+  pkg/dataplane/retirement_boundary_canary_test.go, 29 daemon test files
+  (literal conversions), _Log.md

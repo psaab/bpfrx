@@ -294,9 +294,9 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				// Re-read desired state to guard against a
 				// concurrent VRRP goroutine that may have
 				// already superseded this transition.
-				if tr.Changed && d.dp != nil {
+				if rt := d.dataplane(); tr.Changed && rt != nil {
 					cur, _ := s.CurrentDesired()
-					if err := d.dp.HA().SetRGActive(ctx, ev.GroupID, cur); err != nil {
+					if err := rt.HA().SetRGActive(ctx, ev.GroupID, cur); err != nil {
 						slog.Warn("failed to update rg_active from cluster event",
 							"rg", ev.GroupID, "active", cur, "err", err)
 					} else {
@@ -334,7 +334,7 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 					d.reconcileDirectVIPOwnership(ev.GroupID, "cluster-primary")
 					go d.RefreshFabricFwd()
 				}
-				if noRethVRRP && d.cluster != nil && d.cluster.IsLocalPrimary(ev.GroupID) && (d.dp == nil || !s.NeedsApply()) {
+				if noRethVRRP && d.cluster != nil && d.cluster.IsLocalPrimary(ev.GroupID) && (d.dataplane() == nil || !s.NeedsApply()) {
 					d.setLocalFailoverCommitReady(ev.GroupID, true)
 				}
 			} else {
@@ -345,7 +345,7 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				// transition window. ResignRG must follow preflight
 				// so traffic is already on the fabric path before
 				// the VRRP BACKUP transition removes VIPs.
-				if clusterDemotionEdge && d.dp != nil {
+				if clusterDemotionEdge && d.dataplane() != nil {
 					d.tryPrepareUserspaceRGDemotion(ev.GroupID)
 				}
 				if !noRethVRRP {
@@ -359,12 +359,12 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				if tr.Changed && !tr.Active {
 					d.injectBlackholeRoutes(ev.GroupID)
 				}
-				if tr.Changed && d.dp != nil {
+				if rt := d.dataplane(); tr.Changed && rt != nil {
 					cur, _ := s.CurrentDesired()
 					if !cur && !clusterDemotionEdge {
 						d.tryPrepareUserspaceRGDemotion(ev.GroupID)
 					}
-					if err := d.dp.HA().SetRGActive(ctx, ev.GroupID, cur); err != nil {
+					if err := rt.HA().SetRGActive(ctx, ev.GroupID, cur); err != nil {
 						slog.Warn("failed to update rg_active from cluster event",
 							"rg", ev.GroupID, "active", cur, "err", err)
 					} else {
@@ -539,14 +539,14 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 			if ev.State == vrrp.StateMaster {
 				s := d.getOrCreateRGState(rgID)
 				tr := s.SetVRRP(ev.Interface, true)
-				if tr.Changed && tr.Active && d.dp != nil {
+				if rt := d.dataplane(); tr.Changed && tr.Active && rt != nil {
 					// Activation order: set rg_active FIRST, then
 					// remove blackhole routes. Re-read desired state
 					// to guard against interleaved cluster goroutine.
 					// Only activate when ALL VRRP instances in the RG
 					// are MASTER — prevents partial ownership (#132).
 					cur, _ := s.CurrentDesired()
-					if err := d.dp.HA().SetRGActive(ctx, rgID, cur); err != nil {
+					if err := rt.HA().SetRGActive(ctx, rgID, cur); err != nil {
 						slog.Warn("failed to update rg_active", "rg", rgID, "err", err)
 					} else {
 						recordRGActiveAppliedIfCurrentOrStable(s, tr, cur)
@@ -575,12 +575,12 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 					// then clear rg_active. Re-read desired state to
 					// guard against interleaved cluster goroutine.
 					d.injectBlackholeRoutes(rgID)
-					if d.dp != nil {
+					if rt := d.dataplane(); rt != nil {
 						cur, _ := s.CurrentDesired()
 						if !cur {
 							d.tryPrepareUserspaceRGDemotion(rgID)
 						}
-						if err := d.dp.HA().SetRGActive(ctx, rgID, cur); err != nil {
+						if err := rt.HA().SetRGActive(ctx, rgID, cur); err != nil {
 							slog.Warn("failed to update rg_active", "rg", rgID, "err", err)
 						} else {
 							recordRGActiveAppliedIfCurrentOrStable(s, tr, cur)
@@ -810,7 +810,8 @@ func (d *Daemon) reconcileRGState() {
 		// change this pass, a prior UpdateRGActive failure may have
 		// left applied != desired. Retry unconditionally.
 		needsApply := tr.Changed || s.NeedsApply()
-		if needsApply && d.dp != nil {
+		rt := d.dataplane()
+		if needsApply && rt != nil {
 			if tr.Changed {
 				slog.Info("reconcile: correcting rg_active drift",
 					"rg", rgID, "active", tr.Active, "epoch", tr.Epoch)
@@ -823,7 +824,7 @@ func (d *Daemon) reconcileRGState() {
 			if tr.Active {
 				// Activation ordering: set rg_active FIRST, then
 				// remove blackholes.
-				if err := d.dp.HA().SetRGActive(context.Background(), rgID, true); err != nil {
+				if err := rt.HA().SetRGActive(context.Background(), rgID, true); err != nil {
 					if s.ShouldLogApplyError(err.Error()) {
 						slog.Warn("reconcile: failed to update rg_active",
 							"rg", rgID, "active", true, "err", err)
@@ -839,7 +840,7 @@ func (d *Daemon) reconcileRGState() {
 				// clear rg_active.
 				d.injectBlackholeRoutes(rgID)
 				d.tryPrepareUserspaceRGDemotion(rgID)
-				if err := d.dp.HA().SetRGActive(context.Background(), rgID, false); err != nil {
+				if err := rt.HA().SetRGActive(context.Background(), rgID, false); err != nil {
 					if s.ShouldLogApplyError(err.Error()) {
 						slog.Warn("reconcile: failed to update rg_active",
 							"rg", rgID, "active", false, "err", err)
@@ -1518,7 +1519,10 @@ func (d *Daemon) warmDialer() neighborWarmDialer {
 // warmed; warming stays best-effort (a per-probe error does not abort the
 // rest).
 func (d *Daemon) warmNeighborCache() {
-	if d.dp == nil {
+	// #2114: snapshot-per-operation (plan §5.3 rule 5) — one load feeds
+	// both the v4 and the v6 iteration below.
+	rt := d.dataplane()
+	if rt == nil {
 		return
 	}
 
@@ -1528,7 +1532,7 @@ func (d *Daemon) warmNeighborCache() {
 	// Iterate IPv4 sessions: collect unique dst IPs (forward entries
 	// need ARP for the next-hop toward the destination) and unique src IPs
 	// (return entries need ARP for the on-link client).
-	_ = d.dp.Sessions().ForEachV4(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+	_ = rt.Sessions().ForEachV4(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		if val.IsReverse != 0 {
 			return true
 		}
@@ -1542,7 +1546,7 @@ func (d *Daemon) warmNeighborCache() {
 	})
 
 	// Iterate IPv6 sessions.
-	_ = d.dp.Sessions().ForEachV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+	_ = rt.Sessions().ForEachV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 		if val.IsReverse != 0 {
 			return true
 		}

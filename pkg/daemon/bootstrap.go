@@ -469,8 +469,8 @@ func (d *Daemon) runBootstrapTeardownSteps() []bootstrapTeardownStep {
 
 	// (4) Detach the dataplane (inverse of Start). Keep the object so a later
 	// confirmed commit re-arms it via runBootstrapExitStartup.
-	if d.dp != nil {
-		if err := d.dp.Teardown(); err != nil {
+	if rt := d.dataplane(); rt != nil {
+		if err := rt.Teardown(); err != nil {
 			steps = append(steps, bootstrapTeardownStep{name: "dataplane teardown", err: err})
 		}
 	}

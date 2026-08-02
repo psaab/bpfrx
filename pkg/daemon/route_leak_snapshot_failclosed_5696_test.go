@@ -30,7 +30,8 @@ import (
 func TestRouteLeakReconcileFailsCommitOnPublishError(t *testing.T) {
 	sentinel := errors.New("apply_snapshot socket timeout")
 	dp := &fakeOverlayDP{publishErr: sentinel}
-	d := &Daemon{dp: dp}
+	d := &Daemon{}
+	d.setDataplane(dp)
 
 	err := d.reconcileRouteLeakSnapshot(&config.Config{}, nil)
 	if err == nil {
@@ -56,7 +57,8 @@ func TestRouteLeakReconcileFailsCommitOnPublishError(t *testing.T) {
 func TestRouteLeakReconcileFailsCommitOnBumpError(t *testing.T) {
 	sentinel := errors.New("bump_fib_generation control socket timeout")
 	dp := &fakeOverlayDP{bumpErr: sentinel}
-	d := &Daemon{dp: dp}
+	d := &Daemon{}
+	d.setDataplane(dp)
 
 	err := d.reconcileRouteLeakSnapshot(&config.Config{}, nil)
 	if err == nil {
@@ -75,7 +77,8 @@ func TestRouteLeakReconcileFailsCommitOnBumpError(t *testing.T) {
 // no-op — nil error, and no FIB-generation bump churn.
 func TestRouteLeakReconcileDuplicateSkipStaysSuccess(t *testing.T) {
 	dp := &fakeOverlayDP{publishSkipped: true}
-	d := &Daemon{dp: dp}
+	d := &Daemon{}
+	d.setDataplane(dp)
 
 	if err := d.reconcileRouteLeakSnapshot(&config.Config{}, nil); err != nil {
 		t.Fatalf("duplicate-skip must stay a successful commit; got %v", err)
@@ -91,7 +94,8 @@ func TestRouteLeakReconcileDuplicateSkipStaysSuccess(t *testing.T) {
 // confirmed bump is a clean, successful commit.
 func TestRouteLeakReconcileSuccessStaysSuccess(t *testing.T) {
 	dp := &fakeOverlayDP{}
-	d := &Daemon{dp: dp}
+	d := &Daemon{}
+	d.setDataplane(dp)
 
 	if err := d.reconcileRouteLeakSnapshot(&config.Config{}, nil); err != nil {
 		t.Fatalf("clean republish+bump must be a successful commit; got %v", err)
@@ -129,12 +133,12 @@ func TestApplyTailReconcilesSurfacesRouteLeakError(t *testing.T) {
 	defer func() { nftApplyPayload, nftDeleteTable = origApply, origDelete }()
 
 	d := &Daemon{
-		dp:       &runtimeOnlyApplyTestDP{},
 		networkd: networkd.NewInDir(t.TempDir()),
 		store:    newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		vrrpMgr:  vrrp.NewManager(),
 		opts:     Options{NoDataplane: true},
 	}
+	d.setDataplane(&runtimeOnlyApplyTestDP{}) // #2114: publish through the cell
 
 	cfg := &config.Config{}
 	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
