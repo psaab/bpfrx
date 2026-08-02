@@ -1,27 +1,28 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v82 — r80 folds: Codex M1's class-2
-  predicate correction (the v80 precedence literally swept the
-  fabric methods into class 2 — class 2 is now the NEUTRAL
-  missing-map outcome set, nil/zero/empty never an error;
-  error-outcome methods are class 1 regardless), Codex M2's
-  carve-out precision (the loaded-check set rejects WHENEVER
-  `loaded==false` — "every state" was false for armed; the
-  nil-config/loaded ordering within CompileConfig named), Codex
-  M3's per-entry-point side-effect ordering (direct Compile/
-  ApplyConfig reject immediately even pre-Store;
-  CompileUserspaceShim blocks at the selector, :181; production
-  Compile blocks at its outer selector; the pass-then-block
-  barrier named), Codex M4's reverse-schedule guard (the class-3
-  hybrids' side-effect lock precedes their raw lookup, so the
-  writer-first test could pass with unlocked lookups — the
-  lookup-entry reverse-schedule seam PLUS the AST canary
-  forbidding direct registry access outside the helper/writer),
-  Codex m1's obsolete-generation wording + retained-fixture
-  scope pin, Codex m2's idempotency weakening + citation fix;
-  r80 verdicts: Codex PLAN-NEEDS-MAJOR (4M/2m — all precision/
-  consistency), AGY PLAN-READY, Claude SMR PLAN-READY; pending
-  convergence review r81
+- **Status**: DRAFT v83 — r81 folds: Codex M1's canary
+  specification (the registry AST canary now pins an exactly-
+  named allowlist — the registry helper + `loadUserspaceShimObjects`
+  — with permitted shapes, the stale-allowlist self-check, and
+  synthetic negative tests; the whole-batch hold's placement is
+  now structurally exact: the `m.mu` hold is taken in
+  `LoadUserspaceShim` SPANNING the `loadUserspaceShimObjects`
+  call AND the Store(true) at :163 — batch+flag publish as one
+  atomic operation inside one function's hold; the canary joins
+  §5.1/§9 item 5), Codex M2's reverse-schedule implementability
+  fix (the adjacent-statement interval has no injectable
+  operation — the runtime proof is now the helper lock-ownership
+  test + the canary net, and the synthetic loader replaces only
+  privileged syscalls, never the production registry writes),
+  Codex m1-m4 (the class-1/§6 summary carve-out pointers; the
+  per-entry-point oracle subcases — nil config :179, canceled
+  context apply.go:238, cleanup failures, the pin removal at
+  manager_compile.go:163, and the two-invocation shape for
+  loaded-check entries; the closure-wording consistency fix;
+  the UpdateFabricFwd :18 citation + the higher-precedence
+  overbreadth fix); r81 verdicts: Codex PLAN-NEEDS-MAJOR
+  (2M/4m — specification precision), AGY PLAN-READY, Claude
+  SMR PLAN-READY; pending convergence review r82
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -3211,7 +3212,14 @@
   whenever-loaded-false precision; the per-entry-point
   side-effect ordering; the reverse-schedule seam + the AST
   canary structural net; the obsolete-generation wording;
-  the idempotency weakening).
+  the idempotency weakening). v83 (r81: the canary fully
+  specified (exact allowlist + stale-allowlist self-check +
+  negative tests); the batch-hold placement made structural
+  (the hold spans LoadUserspaceShim's body, Store included);
+  the reverse-schedule runtime proof replaced by the helper
+  ownership test + the canary; the summary carve-out
+  pointers; the oracle subcase qualifications; the closure
+  wording; citations).
 
 ---
 
@@ -3601,7 +3609,10 @@ class. The fold:
   is class 2, any signature; else a method touching Start-state (its
   missing-map outcome is an ERROR) is class 1 — the typed
   `ErrDataplaneNotArmed` replaces exactly that error on the fresh
-  state (the class-2 predicate corrected at v82 per r80 Codex M1:
+  state (subject to the higher-precedence classes 3/4, r81 Codex
+  m4's overbreadth fix — a class-3 hybrid with an error signature
+  stays class 3; a class-4 getter stays class 4; the class-2
+  predicate corrected at v82 per r80 Codex M1:
   the v80 form "missing-map outcome, any signature" literally swept
   the class-1 fabric methods into class 2 — `UpdateRGActive`/
   `UpdateFabricFwd` return missing-map ERRORS, `maps_fabric.go:18,
@@ -3619,8 +3630,13 @@ class. The fold:
   plan no longer claims it can.
   - **Class 1 — fallible map-required methods, no required pre-gate
     side effects** (e.g. `maps_fabric.go` `UpdateRGActive` :38,
-    `UpdateFabricFwd` :30; the attach family `AttachXDP`/`AttachTC` —
-    NOT the detaches, r72 Codex M3): enter the registry helper and
+    `UpdateFabricFwd` :18 (citation corrected from :30, r81 Codex m4 —
+    :30 is `UpdateFabricFwd1`); the attach family `AttachXDP`/
+    `AttachTC` and the `CompileConfig` path KEEP their own
+    pre-registry loaded rejections (the carve-out, below — the
+    typed error never fires for them, r81 Codex m1's summary
+    pointer); the detaches are NOT here, r72 Codex M3): enter the
+    registry helper and
     classify + select ATOMICALLY under `m.mu` (the uniform rule;
     the one-state acquire-load phrasing is deleted, r79 Codex m1 /
     AGY r79) — on the fresh state return the typed `ErrDataplaneNotArmed`
@@ -4016,8 +4032,12 @@ v20 history). The delivery is TWO units:
   regresses nothing: no pre-existing hazard is WORSENED, and two
   pre-existing windows are NARROWED without closure being claimed
   (r70 Codex m3 — the `Close()`-entry Store(false) narrows new
-  fresh-state admission at teardown; the population `m.mu` narrows
-  the lookup-vs-population window; the §10 residuals remain open).
+  fresh-state admission at teardown; the population `m.mu` plus
+  the uniform registry rule CLOSES the registry-selection race in
+  every state (r81 Codex m3's consistency fix — the earlier
+  "narrows without closure" phrasing contradicted the §4.7 claim;
+  the narrowing language applies only to the teardown window);
+  the §10 residuals remain open).
 - **Follow-up issue (filed at /engineer time; seeded from this
   document)**: "commit-confirmed recovery integrity: startup gate +
   FirstCommit+cluster Load recovery + confirm-record durability" —
@@ -4119,6 +4139,9 @@ convergence on the seed before any implementation of G/H/H2.
   + `Sampler.dp` retyped; `sample()` direct call.
 - `pkg/dataplane/retirement_boundary_canary_test.go`: matcher extension
   (incl. `*ast.IndexExpr` renderer support).
+  PLUS the registry-access AST canary (r80 Codex M4's structural net,
+  fully specified r81 Codex M1): the allowlist, the stale-allowlist
+  self-check, and the synthetic negative tests.
 - `pkg/daemon/daemon_dp_canary_test.go` (new): dpCell-access AST canary.
 - `pkg/grpcapi`, `pkg/cli` CODE-untouched (r46 Codex fold-8/m3 —
   they RELAY the cluster manager's formatted status,
@@ -4394,8 +4417,12 @@ Preserved exactly:
   the typed error where the signature carries one). On the
   RETAINED-unarmed state every class proceeds EXACTLY as master
   (r75 Codex M1 — retained reads report retained state, retained
-  mutations reach the live pinned maps; suppression would be a
-  policy change, not preservation). Post-arm behavior
+  mutations reach the retained maps; suppression would be a
+  policy change, not preservation) — with both qualifications
+  (r81 Codex m1): the loaded-check set still rejects (never
+  reaches the registry), and Teardown-retained FDs are live but
+  UNPINNED after `loader.go:1221` (the §10 generation hazard —
+  "live pinned" was wrong for that state). Post-arm behavior
   bit-identical; no signature changes.
 
 ## 7. Hidden invariants the change must preserve
@@ -4628,7 +4655,17 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    `CompileConfig` rejection (`compiler.go:182`) and BLOCKS at the
    selector during the hold (proceeding armed after release);
    production `userspace.Manager.Compile` blocks at its OUTER
-   selector (`manager_compile.go:184`) even earlier. The side
+   selector (`manager_compile.go:184`) even earlier — and it
+   removes the XDP link pins BEFORE that outer selector
+   (`manager_compile.go:163`). The subcase qualifications (r81
+   Codex m2): nil config wins first (`compiler.go:179`), a canceled
+   context wins first (`apply.go:238`), cleanup failures return
+   first — "the rejection fires whenever `loaded==false`" reads
+   with those qualifications; and the "every class blocks"
+   summaries carry the two-invocation shape for loaded-check
+   entries (a pre-Store invocation rejects; a NEW post-Store
+   invocation blocks at registry selection — implementable via the
+   seam's second barrier). The side
    effects are safe/no-op when repeated after a successful cleanup
    (NOT unconditionally idempotent, r80 Codex m2: partial
    Unpin/Close failures aggregate after partial progress, and
@@ -4686,12 +4723,33 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    side-effect lock even if the later lookup never adopts the
    helper, missing the dangerous REVERSE schedule: side-effect
    unlock -> Start writes -> raw lookup races): (a) a
-   lookup-entry reverse-schedule seam — the class-3 lookup's entry
-   barrier raced against the population writer released BETWEEN
-   the side-effect unlock and the lookup; and (b) the structural
-   net per this repo's compile-time-invariant discipline: an AST
-   canary forbidding direct `m.maps`/`m.programs` access outside
-   the registry helper and the whole-batch publication writer.
+   lookup-entry lock-ownership test (r81 Codex M2's implementability
+   fix — the critical intervals (side-effect unlock
+   `maps_counters.go:179` -> raw lookup :181) contain no injectable
+   operation, so an external test cannot guarantee writer
+   acquisition between adjacent statements): the registry helper's
+   own section holds a test hook while a racing writer attempt
+   must block until release (the same ownership-assertion pattern
+   as the `:632` proof); and (b) the structural net per this
+   repo's compile-time-invariant discipline, now fully specified
+   (r81 Codex M1): an AST canary over `pkg/dataplane` forbidding
+   direct `m.maps`/`m.programs` access outside an EXACTLY-NAMED
+   allowlist — the registry helper function and the whole-batch
+   writer `loadUserspaceShimObjects` — with permitted access
+   shapes only inside the allowlist, a stale-allowlist self-check
+   (an allowlisted function that no longer touches the registry
+   FAILS the canary, keeping the list current), and synthetic
+   negative tests (a test-only file with a forbidden access fails
+   the canary). The whole-batch hold's placement is now structurally
+   exact (r81 Codex M1's observation): the Store(true) lives in the
+   CALLER (`LoadUserspaceShim`, `loader.go:163`), so the `m.mu`
+   hold is taken in `LoadUserspaceShim` SPANNING the
+   `loadUserspaceShimObjects` call AND the Store — batch+flag as
+   one atomic publication inside one function's hold. The seam-
+   scoping rule: the synthetic loader replaces only the privileged
+   operations (pin/load syscalls), never the registry writes —
+   publication writes run the production code path under the
+   test's barrier.
    The fixture-migration classification is REDONE under the
    two-state rule (r76 Codex m3 — v77's prescription was stale):
    `injectShimMap` modifies only `maps`, never `loaded`
@@ -4718,7 +4776,8 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    **[CORE]**
 5. Canary tests: redesigned matcher self-tests both directions; new
    `daemon_dp_canary_test.go` asserts no direct `dpCell` access outside the
-   accessors. **[CORE]**
+   accessors; the registry-access canary's synthetic negative tests
+   plus its stale-allowlist self-check (r81 Codex M1). **[CORE]**
 6. `make test` explicitly (Go + Rust legs), plus the full Go suite.
 7. Smoke gates (engineering-style.md:93-103 — NOT waivable; r2 Codex M6
    specifics folded):
@@ -5244,17 +5303,18 @@ Still open:
    PLAN-READY when all three verdicts gate the PR-1 design as
    ready.
 
-7. **r68-r80 resolution (for the record)**: Codex r68 M1 (armed-state
-   admission gate) folded as work item A3; r69-r79 falsified each
-   intermediate form, and r80 caught the precision stragglers (the
-   class-2 predicate sweeping error-outcome methods; the "every
-   state" carve-out phrasing; the per-entry-point ordering; the
-   class-3 reverse-schedule blind spot — now covered by the
-   lookup-entry seam AND the AST canary forbidding direct registry
-   access outside the helper/writer). v82 carries them. Each
-   reviewer: verify the corrected precedence against
-   maps_fabric.go:18/:38, the four oracle legs' mutual consistency,
-   and the reverse-schedule seam's schedule.
+7. **r68-r81 resolution (for the record)**: Codex r68 M1 (armed-state
+   admission gate) folded as work item A3; r69-r80 falsified each
+   intermediate form, and r81 pinned the last two guards to
+   implementation grade (the registry canary's exact allowlist +
+   stale-allowlist self-check + negative tests, with the batch hold
+   structurally spanning LoadUserspaceShim's body; the reverse-
+   schedule runtime proof replaced by the helper lock-ownership test
+   since the adjacent-statement interval has no injectable
+   operation). v83 carries them plus the summary/oracle subcase
+   qualifications. Each reviewer: verify the canary spec against
+   loader_userspace_shim.go:183-190 + loader.go:152-166, and the
+   two-invocation shape for loaded-check entries.
 
 ---
 
