@@ -1683,16 +1683,19 @@ func userspaceSkipsIngressInterface(iface InterfaceSnapshot) bool {
 		// dataplane, and this arm says so out loud.
 		//
 		// EXACTLY what is matched: `base` is the row's name with any unit
-		// suffix stripped (above), and IsSecureTunnelIfName accepts `st`
-		// followed by a numeric remainder. So every spelling of a secure
-		// tunnel is covered — a bare `st0`, the usual `st0.0`, and a
+		// suffix stripped (above), and IsSecureTunnelIfName accepts exactly
+		// the base names XFRMIfNameAndID will build an xfrmi for — `st`
+		// followed by an index in [0, 65536). So every spelling of a real
+		// secure tunnel is covered — a bare `st0`, the usual `st0.0`, and a
 		// multi-digit interface AND unit like `st10.5` (base `st10`) — while
-		// names that merely begin with "st" are NOT matched and stay
-		// adjudicated: `stx` and `start0` have non-numeric remainders. This
-		// is a base-name match, not a whole-string match and not a bare
-		// HasPrefix("st"); over-matching here would silently drop a real data
-		// interface out of adjudication, which is worse than the gap below.
-		// TestSecureTunnelStaysOutOfDataplaneSets and
+		// everything that cannot BE an xfrmi stays adjudicated: `stx` and
+		// `start0` (non-numeric), and — the #6691 fix — `st65536` and `st-3`,
+		// which are out of if_id range and so are just ordinary wildcard-
+		// authorable data interfaces. This is a base-name match, not a
+		// whole-string match and not a bare HasPrefix("st"); over-matching
+		// here silently drops a real data interface out of adjudication AND
+		// out of its AF_XDP binding, which is a traffic outage, worse than the
+		// gap below. TestSecureTunnelStaysOutOfDataplaneSets and
 		// TestSecureTunnelNonTunnelStNamesStayAdjudicated pin both directions.
 		//
 		// Route-based IPsec decrypts in the KERNEL XFRM stack, which delivers
@@ -1711,13 +1714,19 @@ func userspaceSkipsIngressInterface(iface InterfaceSnapshot) bool {
 		// SCOPE, stated because the narrower truth matters: this predicate does
 		// NOT make the xfrmi invisible to the dataplane generally. Once #5619
 		// made its ifindex resolve, the tunnel DOES enter the Rust
-		// forwarding-state maps that are gated on `ifindex > 0` rather than on
-		// this predicate — `populate_interfaces` and `populate_egress`
+		// forwarding-state maps gated on `ifindex > 0` rather than on this
+		// predicate — `populate_interfaces`
 		// (userspace-dp/src/afxdp/forwarding_build/interfaces.rs), hence
-		// `name_to_ifindex`, the zone map and the egress map. A static route
-		// `next-hop st0.0` therefore resolves to a real ifindex now where it
-		// resolved to 0 before (resolve_next_hop_target_v4, fib.rs, ends
-		// `.unwrap_or((0, 0))`).
+		// `name_to_ifindex` and the zone map.
+		//
+		// It does NOT enter the EGRESS map: `populate_egress` needs a source
+		// MAC (own, parent's, or the tunnel flag), and an xfrmi is ARPHRD_NONE
+		// with no parent and no tunnel flag, so the row hits `None => continue`
+		// and no EgressInterface is built. Nor does an authored `next-hop
+		// st0.0` resolve: it reaches `parse_route_next_hop` as the bare string
+		// `"st0.0"`, which returns `(None, None)` and leaves the target at
+		// `(0, 0)` on both revisions — an earlier version of this comment
+		// claimed both of those, and both were wrong.
 		//
 		// AND IT MOVES A TX DISPOSITION — an earlier version of this comment
 		// claimed otherwise ("the TX dispatcher drops it as
@@ -1733,20 +1742,29 @@ func userspaceSkipsIngressInterface(iface InterfaceSnapshot) bool {
 		// so this is a CONVERGENCE onto what the canonical bare spelling
 		// already did — the divergence WAS the name bug. It is still
 		// operator-visible, because the two arms differ: `NoRoute` reinjects
-		// to the kernel unconditionally, while `MissingNeighbor` runs its own
-		// zone-policy evaluation first and a DENY exits before the reinject
-		// gate. So a LAN->tunnel flow with no `from-zone <lan> to-zone
-		// <tunnel-zone>` permit goes from kernel-delivered to dropped on the
-		// dotted spelling. That reinject was a zone-policy bypass — #5619's
-		// subject — so the drop is the correction; under a PERMIT both arms
-		// reinject and nothing changes at this gate.
+		// to the kernel unconditionally, while `MissingNeighbor` resolves zone
+		// ids and evaluates policy first, and a DENY exits before the reinject
+		// gate.
+		//
+		// A PERMIT does NOT currently rescue it, and saying otherwise was the
+		// review finding: with no EgressInterface (above) the to-zone reads 0,
+		// and `evaluate_policy_result_l3_aware` refuses to match any rule —
+		// exact, wildcard OR junos-global — when either zone id is 0, so the
+		// flow takes the default action. That MAC-less-egress zone resolution
+		// is a PRE-EXISTING defect (#6713) fixed by #6722; only once #6722
+		// lands does a matching `from-zone <lan> to-zone <tunnel-zone> permit`
+		// preserve delivery here. Until then the dotted spelling converges onto
+		// the bare spelling's disposition — which is the point, the bare
+		// spelling being what master already did — but it converges onto a
+		// currently-denying one.
 		// TestSecureTunnelSpellingsAgreeOnForwardingInputs pins the
 		// convergence.
 		//
 		// Widening this exclusion to cover those maps would ALSO drop the
-		// egress-zone resolution, and an interface absent from the zone maps
-		// resolves to zone_id 0, which a `from-zone any to-zone any permit`
-		// matches (#6682).
+		// zone-map entry, and an interface absent from the zone map resolves
+		// to zone_id 0 — which, per the guard just cited, matches nothing and
+		// falls to the default action, so it would trade an adjudicated
+		// disposition for an unadjudicable one.
 		//
 		// Admitting it to the sets below would make
 		// the shim claim the xfrmi's ingress and steer it to an XSK that

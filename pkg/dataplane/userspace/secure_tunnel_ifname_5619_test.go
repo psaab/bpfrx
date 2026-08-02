@@ -23,10 +23,20 @@ var secureTunnelIfNameCases = []struct {
 	{"st9", true},
 	{"st10", true},
 	{"st0000", true},
-	// Atoi accepts a sign, so both planes must classify these the same way
-	// even though XFRMIfNameAndID would refuse to build a device for them.
-	{"st-3", true},
+	// Atoi accepts a leading sign, so `st+5` parses to index 5 and DOES yield
+	// an xfrmi — both planes must classify it as a tunnel. (An earlier comment
+	// here claimed XFRMIfNameAndID refuses this spelling; it does not.)
 	{"st+5", true},
+	// #6691 range boundary. The if_id is `stIndex<<16 | unit+1`, so an index
+	// >= 0x10000 has no room and XFRMIfNameAndID builds nothing; a negative
+	// index likewise. The classifier must agree, or a wildcard-authored
+	// ordinary interface named `st65536` is stripped of adjudication and of
+	// its AF_XDP binding — a traffic outage on a valid interface.
+	{"st65535", true},
+	{"st65536", false},
+	{"st99999", false},
+	{"st-1", false},
+	{"st-3", false},
 	// Not secure tunnels.
 	{"st", false},
 	{"stx", false},
@@ -97,6 +107,110 @@ func TestSecureTunnelIfNameClassification(t *testing.T) {
 		if got := config.IsSecureTunnelIfName(tc.base); got != tc.want {
 			t.Errorf("IsSecureTunnelIfName(%q) = %v, want %v", tc.base, got, tc.want)
 		}
+	}
+}
+
+// TestSecureTunnelClassifierAgreesWithConstructor is the #6691 SSOT guard, and
+// the reason the range now lives in one place.
+//
+// The classifier (IsSecureTunnelIfName) and the constructor (XFRMIfNameAndID)
+// answer the same question and MUST NOT disagree on any name. They did: the
+// classifier ran a bare Atoi, so `st-3` and `st65536` classified as secure
+// tunnels while the constructor builds an xfrmi for neither. Nothing reserves
+// the `st` prefix — `set interfaces st65536 ...` is an ordinary wildcard-
+// authorable data interface — so the disagreement removed a live interface from
+// the ingress map, the AF_XDP binding plan and the RSS allowlist.
+//
+// This is asserted as an EQUIVALENCE over a corpus rather than as a table of
+// expected verdicts, so it cannot be satisfied by editing an expectation: the
+// oracle is the constructor's own behaviour. The corpus sweeps the decade
+// boundaries around 0x10000 (where the if_id's 16-bit index field runs out),
+// both sign forms, and the non-numeric shapes.
+func TestSecureTunnelClassifierAgreesWithConstructor(t *testing.T) {
+	corpus := []string{
+		"st", "st0", "st1", "st9", "st10", "st0000", "st007",
+		"st+0", "st+5", "st+65535", "st+65536",
+		"st-0", "st-1", "st-3", "st-65535",
+		"st65534", "st65535", "st65536", "st65537", "st99999", "st1000000",
+		"st9223372036854775808", // overflows int64: Atoi errors
+		"stx", "st0x", "st 5", "st5 ", "start0",
+		"", "s", "ge-0-0-0", "reth0", "lo0", "fxp0", "em0", "fab0", "gr-0-0-0",
+	}
+	var tunnels, ordinary int
+	for _, base := range corpus {
+		// The constructor's own verdict for this BASE name: a non-zero if_id
+		// means it builds an xfrmi, which is exactly what "is a secure tunnel"
+		// means.
+		_, ifID := config.XFRMIfNameAndID(base)
+		want := ifID != 0
+		if got := config.IsSecureTunnelIfName(base); got != want {
+			t.Errorf("IsSecureTunnelIfName(%q) = %v but XFRMIfNameAndID(%q) yields "+
+				"if_id %d (builds a device = %v) — a classifier that disagrees with the "+
+				"constructor either strips a real interface out of the dataplane or "+
+				"admits a name no xfrmi exists for", base, got, base, ifID, want)
+		}
+		if want {
+			tunnels++
+		} else {
+			ordinary++
+		}
+	}
+	// A corpus that landed entirely on one side would make the equivalence
+	// vacuous (both functions returning a constant would pass).
+	if tunnels < 5 || ordinary < 5 {
+		t.Fatalf("corpus is degenerate: %d tunnels / %d ordinary — the equivalence "+
+			"proves nothing unless both verdicts are well represented", tunnels, ordinary)
+	}
+
+	// The corpus above is dot-free on purpose: the equivalence holds over the
+	// classifier's DOMAIN, which is base names. A dotted string is a unit REF —
+	// XFRMIfNameAndID accepts one (it splits the unit off itself) while the
+	// classifier must reject it, so the two legitimately disagree there. Callers
+	// split first and pass the base (SecureTunnelUnitNetdev, and the `base` local
+	// in userspaceSkipsIngressInterface), so pin that a ref never sneaks through
+	// as a base.
+	for _, ref := range []string{"st0.0", "st0.1", "st10.5", "st.0"} {
+		if config.IsSecureTunnelIfName(ref) {
+			t.Errorf("IsSecureTunnelIfName(%q) = true, but it takes BASE names — a ref "+
+				"reaching it unsplit means a caller skipped the split and would resolve "+
+				"the unit suffix twice", ref)
+		}
+	}
+}
+
+// TestSecureTunnelOutOfRangeStNameKeepsItsDataplaneBinding is the #6691
+// behavioural consequence, at the EDGE of the range rather than in its middle.
+//
+// `st65535` is a secure tunnel and must be excluded; `st65536` is one character
+// longer, is NOT a secure tunnel (no if_id fits), and must keep both its
+// ingress adjudication and its AF_XDP binding. A classifier bounded anywhere
+// other than exactly 0x10000 fails one of these two.
+func TestSecureTunnelOutOfRangeStNameKeepsItsDataplaneBinding(t *testing.T) {
+	for _, tc := range []struct {
+		base    string
+		skipped bool // want: excluded from the dataplane sets
+	}{
+		{base: "st65535", skipped: true},
+		{base: "st65536", skipped: false},
+		{base: "st-3", skipped: false},
+		{base: "st+5", skipped: true},
+	} {
+		t.Run(tc.base, func(t *testing.T) {
+			snap := InterfaceSnapshot{
+				Name: tc.base + ".0", LinuxName: tc.base, Zone: "trust", Ifindex: 11,
+			}
+			if got := userspaceSkipsIngressInterface(snap); got != tc.skipped {
+				verb := "was excluded from"
+				why := "it is an ordinary data interface — no xfrmi is created for an " +
+					"index outside [0, 65536), so excluding it is a traffic outage"
+				if tc.skipped {
+					verb = "stayed in"
+					why = "it IS a secure tunnel; admitting it steers decrypted plaintext " +
+						"to an XSK that cannot bind on a virtual netdev"
+				}
+				t.Errorf("%q %s the dataplane ingress set — %s", snap.Name, verb, why)
+			}
+		})
 	}
 }
 
@@ -493,27 +607,84 @@ func TestSecureTunnelSpellingsAgreeOnForwardingInputs(t *testing.T) {
 	}
 }
 
-// TestSecureTunnelNetdevForRefIsDeterministicUnderCollision pins the
-// tolerant-load path. Two DISTINCT bind-interface strings sharing one if_id are
-// rejected at commit (#2933) and refused at apply (#2909), but a tolerantly
-// loaded config can still reach the resolver — and it must be a pure function
-// of the config rather than Go map-iteration order.
-func TestSecureTunnelNetdevForRefIsDeterministicUnderCollision(t *testing.T) {
+// TestSecureTunnelNetdevForRefFailsClosedUnderCollision pins the tolerant-load
+// path to the SAME contract pkg/routing enforces.
+//
+// #6691: an earlier revision of this test required the opposite — it asserted
+// that a colliding pair resolves to the lexicographically smallest name, "for
+// determinism". That pinned a defect. Two DISTINCT bind-interface strings
+// deriving one if_id (`st0` and `st0.0` both yield if_id 1) are rejected at
+// commit (#2933) and refused at apply, where pkg/routing/xfrm.go deletes BOTH
+// from its desired set — "refusing to create either (cross-VPN leak / EEXIST
+// risk)". So on a box in that state NEITHER device exists, and a resolver that
+// names one anyway is not deterministic-and-correct, it is deterministically
+// WRONG: it attaches forwarding state to a device the reconciler has guaranteed
+// is absent. Determinism was the wrong property; agreeing with routing is the
+// right one.
+//
+// The tolerant-load path is exactly the path that matters, since strict commit
+// never produces this config.
+func TestSecureTunnelNetdevForRefFailsClosedUnderCollision(t *testing.T) {
+	// PREMISE: the two spellings really do collide on one if_id. If they ever
+	// stopped colliding, the fail-closed assertion below would pass vacuously.
+	nameA, idA := config.XFRMIfNameAndID("st0.0")
+	nameB, idB := config.XFRMIfNameAndID("st0")
+	if idA == 0 || idA != idB || nameA == nameB {
+		t.Fatalf("premise broken: expected distinct names sharing one if_id, got "+
+			"%q/%d and %q/%d", nameA, idA, nameB, idB)
+	}
+
 	cfg := &config.Config{}
 	cfg.Security.IPsec.VPNs = map[string]*config.IPsecVPN{
 		"a": {Name: "a", BindInterface: "st0.0"},
 		"b": {Name: "b", BindInterface: "st0"},
 	}
-	first, ok := cfg.SecureTunnelNetdevForRef("st0.0")
-	if !ok {
-		t.Fatal("premise broken: no device resolved for a colliding pair")
-	}
+	// Repeated: a map-order-dependent implementation could fail closed on one
+	// iteration order and resolve on another.
 	for i := 0; i < 50; i++ {
-		got, ok := cfg.SecureTunnelNetdevForRef("st0.0")
-		if !ok || got != first {
-			t.Fatalf("SecureTunnelNetdevForRef is map-order dependent: got %q (ok=%v), "+
-				"first call returned %q", got, ok, first)
+		if got, ok := cfg.SecureTunnelNetdevForRef("st0.0"); ok {
+			t.Fatalf("SecureTunnelNetdevForRef resolved %q under an if_id collision; "+
+				"pkg/routing creates NEITHER colliding device, so no name is correct here "+
+				"(iteration %d)", got, i)
 		}
+	}
+
+	// Two VPNs authoring the SAME string are NOT a collision — one name, one
+	// device — and routing programs it. Fail-closed must not swallow this.
+	same := &config.Config{}
+	same.Security.IPsec.VPNs = map[string]*config.IPsecVPN{
+		"a": {Name: "a", BindInterface: "st0.0"},
+		"b": {Name: "b", BindInterface: "st0.0"},
+	}
+	got, ok := same.SecureTunnelNetdevForRef("st0.0")
+	if !ok || got != nameA {
+		t.Errorf("SecureTunnelNetdevForRef = %q (ok=%v) for two VPNs on the SAME "+
+			"bind-interface, want %q — that is one device, not a collision, and routing "+
+			"programs it", got, ok, nameA)
+	}
+}
+
+// TestSecureTunnelUnitNetdevFallsBackUnderCollision pins what the SHARED
+// resolver returns once the lookup fails closed: the verbatim dotted ref, which
+// names no device on a box where routing refused to create either colliding
+// xfrmi — NOT the unit-zero collapse onto `st0`, which is precisely the name
+// the other half of the colliding pair asked for.
+func TestSecureTunnelUnitNetdevFallsBackUnderCollision(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.IPsec.VPNs = map[string]*config.IPsecVPN{
+		"a": {Name: "a", BindInterface: "st0.0"},
+		"b": {Name: "b", BindInterface: "st0"},
+	}
+	got, ok := cfg.SecureTunnelUnitNetdev("st0.0")
+	if !ok {
+		t.Fatal("SecureTunnelUnitNetdev refused a secure-tunnel unit ref outright; " +
+			"ok=false means `not a secure tunnel` and would send every caller into the " +
+			"unit-zero collapse this fix exists to bypass")
+	}
+	if got != "st0.0" {
+		t.Errorf("SecureTunnelUnitNetdev(%q) = %q, want %q — under a collision routing "+
+			"creates neither device, so the ref itself is the honest answer",
+			"st0.0", got, "st0.0")
 	}
 }
 

@@ -2413,11 +2413,22 @@ fn secure_tunnel_ifname_matches_go() {
         ("st9", true),
         ("st10", true),
         ("st0000", true),
-        // Go classifies with strconv.Atoi, which accepts a sign. Both planes
-        // must agree here even though XFRMIfNameAndID would refuse to build a
-        // device for them.
-        ("st-3", true),
+        // Go classifies with strconv.Atoi, which accepts a sign. `st+5` parses
+        // to index 5 and DOES yield a device, so both planes classify it as a
+        // tunnel. (An earlier comment here claimed XFRMIfNameAndID refuses this
+        // spelling; it does not.)
         ("st+5", true),
+        // #6691 range boundary, mirroring the Go `secureTunnelIndex` bound. The
+        // if_id is `stIndex<<16 | unit+1`, so an index >= 0x10000 (or a negative
+        // one) yields no if_id and no xfrmi. Interface names are wildcard-
+        // authorable with no `st` reservation, so `st65536` is an ordinary data
+        // interface: classifying it as a tunnel strips its AF_XDP binding, a
+        // traffic outage on a valid interface.
+        ("st65535", true),
+        ("st65536", false),
+        ("st99999", false),
+        ("st-1", false),
+        ("st-3", false),
         ("st", false),
         ("stx", false),
         ("st0x", false),

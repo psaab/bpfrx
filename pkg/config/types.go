@@ -150,15 +150,16 @@ func (c *Config) ResolveFab(ref string) string {
 //  2. Dotted refs (e.g. "ge-0/0/0.80", "reth0.50", "gr-0/0/0.0",
 //     "irb.0", "st0.0"):
 //     a. st<N>.<M>: resolve the xfrmi device from the AUTHORED
-//     bind-interface via SecureTunnelNetdevForRef (#5619). A bare
+//     bind-interface via SecureTunnelUnitNetdev (#5619). A bare
 //     `bind-interface st0` and an explicit `bind-interface st0.0`
 //     derive the same if_id under DIFFERENT device names, while
 //     the unit ref is `st0.0` either way — so it is read from the
 //     config, NOT reconstructed from the ref. Falls back to the
 //     verbatim ref only when no VPN binds the unit, since no xfrmi
-//     device exists for it then. The lexical test lives in
-//     IsSecureTunnelIfName so snapshotLinuxName applies the
-//     identical rule rather than a hand-copied third instance.
+//     device exists for it then. That whole rule lives in
+//     SecureTunnelUnitNetdev, which snapshotLinuxName and
+//     junosHostLinuxName also call — one resolver, not three
+//     copies asserted to agree (#6691).
 //     b. IRB: look up via IRBToBridge(cfg.BridgeDomains) and return
 //     the bridge device name (no suffix).
 //     c. Tunnel: if TunnelNameMap[ref] is set, return that name
@@ -198,14 +199,11 @@ func (c *Config) ResolveKernelIfName(ref string) string {
 	// when no VPN binds this unit: no xfrmi device exists for it then, and
 	// the verbatim ref is what this returned before.
 	//
-	// The lexical test lives in IsSecureTunnelIfName (xfrmi.go) so
-	// snapshotLinuxName can apply the IDENTICAL rule instead of a
-	// hand-copied third instance of it.
-	if IsSecureTunnelIfName(base) {
-		if dev, ok := c.SecureTunnelNetdevForRef(ref); ok {
-			return dev
-		}
-		return LinuxIfName(ref)
+	// The whole rule lives in SecureTunnelUnitNetdev (xfrmi.go) so
+	// snapshotLinuxName and junosHostLinuxName apply the IDENTICAL one
+	// instead of hand-copied instances of it (#6691).
+	if dev, ok := c.SecureTunnelUnitNetdev(ref); ok {
+		return dev
 	}
 
 	// IRB.

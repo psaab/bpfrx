@@ -426,23 +426,21 @@ func snapshotLinuxName(cfg *config.Config, ifName string, iface *config.Interfac
 		return config.LinuxIfName(ifName)
 	}
 	if unit != nil {
-		// #5619: a secure-tunnel unit's kernel device is the dotted ref
-		// VERBATIM — `st0.0` is created by the xfrmi reconciler as a netdev
-		// literally named `st0.0` (XFRMIfNameAndID returns
-		// LinuxIfName(bindInterface)). The unit-0 collapse below would yield
-		// `st0`, a name that exists on no box, so buildLinkSnapshot missed and
-		// the unit reported ifindex 0 / MTU 0 / no addresses.
+		// #5619: a secure-tunnel unit's kernel device is the one the xfrmi
+		// reconciler creates for the AUTHORED bind-interface, which is NOT
+		// derivable from the unit ref. The unit-0 collapse below yielded
+		// `st0` for `bind-interface st0.0`, a name that exists on no box, so
+		// buildLinkSnapshot missed and the unit reported ifindex 0 / MTU 0 /
+		// no addresses.
 		//
-		// This mirrors the identical short-circuit in
-		// config.ResolveKernelIfName, whose doc comment already required this
-		// function to be kept in sync with it and which had the rule while
-		// this one did not. Placed FIRST, matching that function's ordering
-		// (the st rule takes precedence over the tunnel-name map there too).
-		// TestSecureTunnelResolverParity pins the two together.
+		// The rule itself lives in config.SecureTunnelUnitNetdev and is SHARED
+		// with config.ResolveKernelIfName and config.junosHostLinuxName — not
+		// re-derived here (#6691). Placed FIRST, matching ResolveKernelIfName's
+		// ordering (the st rule precedes the tunnel-name map there too).
+		// TestSecureTunnelResolverParity pins the resolvers together.
 		//
-		// The name is READ BACK from the authored bind-interface, never
-		// reconstructed from the unit: a bare `bind-interface st0` and an
-		// explicit `bind-interface st0.0` derive one if_id under two DIFFERENT
+		// Why it cannot be reconstructed: a bare `bind-interface st0` and an
+		// explicit `bind-interface st0.0` derive ONE if_id under two DIFFERENT
 		// device names ("st0" vs "st0.0", pkg/routing/xfrm.go), while the unit
 		// ref is `st0.0` in both. Synthesizing "<ifName>.<unit>" here would be
 		// right for the dotted spelling and WRONG for the bare one — the same
@@ -469,24 +467,27 @@ func snapshotLinuxName(cfg *config.Config, ifName string, iface *config.Interfac
 		// change is a CONVERGENCE onto what the canonical bare spelling
 		// already did, not a new state. It is still operator-visible: the
 		// `NoRoute` arm reinjects unconditionally, whereas the
-		// `MissingNeighbor` arm runs its OWN zone-policy evaluation first
-		// (poll_descriptor/mod.rs), so a LAN->tunnel flow with no
-		// `from-zone <lan> to-zone <tunnel-zone>` permit is now DROPPED where
-		// the dotted spelling used to be kernel-reinjected and delivered.
-		// That reinject was a zone-policy bypass — the #5619 subject — so the
-		// deny is the correction, but it is a behaviour change and is stated
-		// in the PR body too. Under a PERMIT both arms reinject, so a
-		// policied tunnel is unaffected at this gate.
+		// `MissingNeighbor` arm resolves zone ids and evaluates policy first
+		// (poll_descriptor/mod.rs), so a LAN->tunnel flow is now adjudicated
+		// where the dotted spelling used to be kernel-reinjected unread.
+		//
+		// WHAT THAT ADJUDICATION CURRENTLY DECIDES, stated exactly: an xfrmi
+		// is ARPHRD_NONE, so `populate_egress` cannot build an EgressInterface
+		// for it (its src_mac gate needs a MAC, a parent's MAC, or the tunnel
+		// flag, and a secure-tunnel unit carries none of the three), the
+		// to-zone therefore reads 0, and `evaluate_policy_result_l3_aware`
+		// refuses to match ANY rule — exact, wildcard or junos-global — when
+		// either zone id is 0. So today the flow lands on the default action
+		// and a matching `permit` does NOT preserve delivery. That is a
+		// PRE-EXISTING MAC-less-egress defect (#6713), not one this change
+		// introduces, and it is fixed by #6722; the permit-preserves-delivery
+		// behaviour this arm is meant to have DEPENDS ON #6722 landing.
 		// TestSecureTunnelSpellingsAgreeOnForwardingInputs pins the
 		// convergence; `secure_tunnel_unit_ifindex_decides_route_disposition`
 		// (userspace-dp) pins the FIB consequence the claim rests on.
-		if config.IsSecureTunnelIfName(ifName) {
-			ref := fmt.Sprintf("%s.%d", ifName, unit.Number)
-			if dev, ok := cfg.SecureTunnelNetdevForRef(ref); ok {
-				return dev
-			}
-			// No VPN binds this unit — no xfrmi device exists for it.
-			return config.LinuxIfName(ref)
+		if dev, ok := cfg.SecureTunnelUnitNetdev(
+			fmt.Sprintf("%s.%d", ifName, unit.Number)); ok {
+			return dev
 		}
 		if tunnelNames := cfg.TunnelNameMap(); len(tunnelNames) > 0 {
 			ref := fmt.Sprintf("%s.%d", ifName, unit.Number)

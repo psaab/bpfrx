@@ -1,3 +1,78 @@
+## 2026-08-01 — #5619 PR1 round 6: four Codex MAJORs folded; a security guard that could not fire
+
+- **Timestamp**: 2026-08-01 20:46 (fix/6691-secure-tunnel-ifname-r4)
+- **Action**: Folded four of the five MAJORs from the hostile Codex review of
+  `ebe370701...f754bee3a`. The fifth (a MAC-less xfrmi egress resolving to zone
+  0) is a pre-existing defect tracked as #6713 and fixed by open PR #6722, which
+  owns the same two Rust files; it is NOT touched here, and the documentation
+  claims that depended on it being fixed are corrected instead.
+
+  **M4 — junos-host denies were scoped to the wrong kernel device (FAIL-OPEN).**
+  This one the PR CREATED. `junosHostLinuxName` resolves the `iifname` scope for
+  `to-zone junos-host ... then deny` nft rules and claims to mirror
+  `snapshotLinuxName` exactly, but it still performed the generic unit-zero
+  collapse. Before the PR both sides collapsed `st0.0` -> `st0` and agreed on a
+  wrong name; the PR fixed only the snapshot, so with `bind-interface st0.0` the
+  renderer emitted `iifname st0` while the decrypted plaintext arrives on
+  `st0.0`. The deny could never match. Fixed by deriving BOTH names from one
+  resolver, `Config.SecureTunnelUnitNetdev` (`pkg/config/xfrmi.go`), which
+  `ResolveKernelIfName`, `snapshotLinuxName` and `junosHostLinuxName` now all
+  call — not three copies asserted to agree.
+
+  **M2 — the secure-tunnel predicate admitted names that cannot be xfrmis.**
+  `XFRMIfNameAndID` bounds the index to `[0, 65536)` (the if_id is
+  `stIndex<<16 | unit+1`); `IsSecureTunnelIfName` ran a bare `Atoi` with no
+  bounds, so `st-3` and `st65536` classified as secure tunnels. Interface names
+  are wildcard-authorable with no `st` reservation, so `st65536` is an ordinary
+  data interface — and the PR's new exclusion removed it from the ingress map,
+  the AF_XDP binding plan and the RSS allowlist. A traffic outage on a valid
+  interface. Both now share one unexported `secureTunnelIndex`; the Rust mirror
+  `is_secure_tunnel_ifname` gets the identical bound.
+
+  **M5 — the collision fallback contradicted the routing fail-closed contract.**
+  Two DISTINCT bind-interface strings deriving one if_id made
+  `SecureTunnelNetdevForRef` return the lexicographically smallest name "for
+  determinism", and a test REQUIRED that. `pkg/routing/xfrm.go` deletes BOTH
+  colliding devices from its desired set, so neither exists on the box; naming
+  one is deterministically wrong. Now returns `("", false)`. Two VPNs authoring
+  the SAME string are still not a collision — one name, one device — and still
+  resolve.
+
+  **M3 — multiple resolvers disagree.** Scoped deliberately. The three that this
+  PR's rule belongs to are unified above. Four pre-existing divergences in LIVE
+  code (reached via `CompileUserspaceShim` -> `CompileConfig` -> `compileZones`,
+  not retired-eBPF-only) were verified firsthand and FILED rather than
+  half-fixed: #6728, #6729, #6730, #6731.
+
+  **Documentation.** Six claims Codex flagged as false were verified against the
+  code and corrected, not softened: the xfrmi does NOT enter the egress map
+  (`populate_egress`'s src_mac gate needs a MAC, a parent's MAC or the tunnel
+  flag, and an ARPHRD_NONE xfrmi has none); a matching permit does NOT preserve
+  delivery today (`evaluate_policy_result_l3_aware` wraps its whole walk —
+  exact, wildcard AND `junos-global` — in `if from_id != 0 && to_id != 0`), and
+  that behaviour DEPENDS ON #6722; an any/any policy does NOT match zone zero
+  (same guard, since #3110); `next-hop st0.0` still does not resolve; and a
+  deployment with no bound VPN is NOT unchanged (the merge base collapsed an
+  unbound unit zero to `st0`, head returns `st0.0`, and the exclusion keys on
+  the NAME, not on the presence of a VPN).
+
+- **File(s)**: `pkg/config/xfrmi.go`, `pkg/config/types.go`,
+  `pkg/config/junos_host_deny.go`, `pkg/dataplane/userspace/interfaces.go`,
+  `pkg/dataplane/userspace/maps_sync.go`,
+  `pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go`,
+  `pkg/dataplane/userspace/junos_host_netdev_parity_test.go`,
+  `userspace-dp/src/server/helpers/planning.rs`,
+  `userspace-dp/src/main_tests.rs`, `userspace-dp/src/server/README.md`
+- **Validation**: Every behavioural fix was proven by mutating the fix OUT and
+  confirming build + `go vet` CLEAN with the specific guard RED on a real
+  assertion. Six mutations, including two at the EDGE of the claim rather than
+  its centre: an off-by-one bound (`>` for `>=`) that keeps `st65535` green
+  while `st65536` reds, and an over-strict collision test that reds only the
+  same-bind-interface case. One mutation deliberately moved the SHARED resolver
+  so both planes agreed on the wrong name — the parity test stayed GREEN and
+  only the new absolute test went RED, which is why an absolute assertion was
+  added rather than relying on parity.
+
 ## 2026-08-01 — #5619 PR1 round 5: the TX-disposition trace was WRONG; retraced by execution
 
 - **Timestamp**: 2026-08-01 (fix/5619-ipsec-passthrough-zone-policy)

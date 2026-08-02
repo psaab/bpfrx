@@ -1204,8 +1204,27 @@ func JunosHostZoneIngressNetdevs(cfg *Config) map[string][]string {
 // #4146 iifname scope can be resolved purely from config (the dataplane consumes
 // the result via JunosHostDenyProgram.IngressNetdevs); TestJunosHostZoneNetdevs
 // MatchSnapshot pins it against the snapshot.
+//
+// The secure-tunnel arm is NOT mirrored — it is SHARED
+// (Config.SecureTunnelUnitNetdev, xfrmi.go). #6691: that rule cannot be
+// re-derived here, because the netdev depends on the authored bind-interface
+// string rather than on the ref, and this function does not otherwise read the
+// IPsec config at all. A mirrored copy of it drifted once already and left a
+// junos-host deny scoped to a nonexistent netdev; the remaining arms are still
+// mirrors, held by the parity test, which now carries a secure-tunnel case.
 func junosHostLinuxName(cfg *Config, ifName string, unit *InterfaceUnit) string {
 	if unit != nil {
+		// #6691: a secure-tunnel unit's netdev is resolved from the AUTHORED
+		// bind-interface, NOT by the unit-zero collapse below. Both this and
+		// snapshotLinuxName call the one resolver rather than restating the
+		// rule — restating it is how the iifname scope of a junos-host deny
+		// came to name `st0` while the decrypted traffic arrived on `st0.0`,
+		// leaving the deny unable to fire. Placed FIRST, matching
+		// ResolveKernelIfName's ordering (the st rule precedes the tunnel-name
+		// map there too).
+		if dev, ok := cfg.SecureTunnelUnitNetdev(fmt.Sprintf("%s.%d", ifName, unit.Number)); ok {
+			return dev
+		}
 		if tunnelNames := cfg.TunnelNameMap(); len(tunnelNames) > 0 {
 			ref := fmt.Sprintf("%s.%d", ifName, unit.Number)
 			if linuxName, ok := tunnelNames[ref]; ok && linuxName != "" {

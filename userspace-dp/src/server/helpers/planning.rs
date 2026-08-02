@@ -283,12 +283,15 @@ pub(crate) fn include_userspace_binding_interface(iface: &InterfaceSnapshot) -> 
     // #5619: an IPsec secure tunnel gets no AF_XDP binding.
     //
     // EXACTLY what is matched: `base` is the interface name with any unit
-    // suffix stripped (above), and `is_secure_tunnel_ifname` accepts `st`
-    // followed by a numeric remainder. Every spelling is covered — bare `st0`,
-    // the usual `st0.0`, and a multi-digit interface AND unit like `st10.5`
-    // (base `st10`) — while `stx` / `start0` are NOT matched and keep their
-    // bindings. Over-matching here would silently strip a real data interface
-    // of its AF_XDP binding, which is worse than the gap below.
+    // suffix stripped (above), and `is_secure_tunnel_ifname` accepts exactly
+    // the base names the Go constructor builds an xfrmi for — `st` followed by
+    // an index in `[0, 65536)`. Every spelling of a real tunnel is covered —
+    // bare `st0`, the usual `st0.0`, and a multi-digit interface AND unit like
+    // `st10.5` (base `st10`) — while `stx` / `start0` (non-numeric) and
+    // `st65536` / `st-3` (out of if_id range, so ordinary data interfaces)
+    // keep their bindings. Over-matching here silently strips a real data
+    // interface of its AF_XDP binding — a traffic outage, worse than the gap
+    // below, and exactly what #6691 fixed.
     //
     // Route-based IPsec decrypts in the kernel XFRM stack and the plaintext
     // is delivered on the xfrmi netdev; the dataplane has no path to hand a
@@ -310,20 +313,24 @@ pub(crate) fn include_userspace_binding_interface(iface: &InterfaceSnapshot) -> 
     !matches!(iface.zone.as_str(), "mgmt" | "control")
 }
 
-/// #5619: `st<N>` with a numeric N — the secure-tunnel base-name shape.
+/// #5619: `st<N>` with N in `[0, 65536)` — the secure-tunnel base-name shape.
 ///
-/// Mirrors `config.IsSecureTunnelIfName` (pkg/config/xfrmi.go). Lexical only:
-/// the Go side additionally bounds the index when deriving an XFRM if_id, but
-/// that stricter test decides device creation, not interface classification.
+/// Mirrors `config.IsSecureTunnelIfName` (pkg/config/xfrmi.go), which shares
+/// its range check with `XFRMIfNameAndID`. The bound is NOT decoration: an
+/// index >= 0x10000 (or a negative one) yields no if_id and so no xfrmi, and
+/// interface names are wildcard-authorable with no `st` reservation — `st65536`
+/// is an ordinary data interface. #6691: without the bound this predicate
+/// stripped that interface of its AF_XDP binding, a traffic outage on a valid
+/// interface. A classifier must not admit names the constructor rejects.
 ///
 /// `parse::<i64>()` rather than an all-digits test is deliberate: the Go side
 /// classifies with `strconv.Atoi`, which also accepts a leading `+`/`-`. An
-/// all-digits test would diverge on `st-3` — unreachable as a real tunnel
-/// (XFRMIfNameAndID rejects a negative index), but a mirrored predicate that
-/// disagrees anywhere is the drift class this comment exists to prevent.
+/// all-digits test would diverge on `st+5`, which parses to index 5 and DOES
+/// yield a device. `st-3` parses to -3 and is rejected by the range check on
+/// both planes. `secure_tunnel_ifname_matches_go` pins the shared table.
 pub(crate) fn is_secure_tunnel_ifname(base: &str) -> bool {
     match base.strip_prefix("st") {
-        Some(rest) => rest.parse::<i64>().is_ok(),
+        Some(rest) => matches!(rest.parse::<i64>(), Ok(idx) if (0..0x1_0000).contains(&idx)),
         None => false,
     }
 }

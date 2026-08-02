@@ -2,6 +2,7 @@ package userspace
 
 import (
 	"reflect"
+	"slices"
 	"sort"
 	"testing"
 
@@ -83,6 +84,19 @@ func TestJunosHostZoneNetdevsMatchSnapshot(t *testing.T) {
 			}
 			return cfg
 		}(),
+		// #6691: the parity corpus had no secure tunnel, which is how the
+		// junos-host iifname scope came to name a netdev the snapshot no
+		// longer used. Both spellings are here because they are the pair that
+		// diverges: `bind-interface st0.0` and `bind-interface st0` describe
+		// the SAME unit ref `st0.0` under DIFFERENT device names, so a
+		// resolver that reconstructs the name from the ref gets exactly one of
+		// them right.
+		"secure tunnel (dotted bind-interface)": func() *config.Config {
+			return secureTunnelParityConfig("st0.0")
+		}(),
+		"secure tunnel (bare bind-interface)": func() *config.Config {
+			return secureTunnelParityConfig("st0")
+		}(),
 		"cross-zone-ambiguous trunk": func() *config.Config {
 			cfg := &config.Config{}
 			cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
@@ -105,6 +119,95 @@ func TestJunosHostZoneNetdevsMatchSnapshot(t *testing.T) {
 			got := config.JunosHostZoneIngressNetdevs(cfg)
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("config netdev SSOT diverged from snapshot:\n  config=%v\n  snap  =%v", got, want)
+			}
+		})
+	}
+}
+
+// secureTunnelParityConfig builds a LAN + route-based-VPN topology whose tunnel
+// unit `st0.0` is in zone `vpn`, with the bind-interface authored exactly as
+// given. The two spellings the caller passes derive the SAME if_id and the SAME
+// unit ref but DIFFERENT kernel device names — that asymmetry is the point.
+func secureTunnelParityConfig(bindIface string) *config.Config {
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"ge-0/0/1": {Name: "ge-0/0/1", Units: map[int]*config.InterfaceUnit{
+			0: {Number: 0, Addresses: []string{"10.0.1.1/24"}}}},
+		"st0": {Name: "st0", Units: map[int]*config.InterfaceUnit{
+			0: {Number: 0, Addresses: []string{"10.5.5.1/30"}}}},
+	}
+	cfg.Security.IPsec.VPNs = map[string]*config.IPsecVPN{
+		"v": {Name: "v", BindInterface: bindIface},
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"trust": {Name: "trust", Interfaces: []string{"ge-0/0/1.0"}},
+		"vpn":   {Name: "vpn", Interfaces: []string{"st0.0"}},
+	}
+	return cfg
+}
+
+// TestJunosHostDenyScopeNamesTheSecureTunnelDevice is the #6691 MAJOR guard,
+// and it asserts an ABSOLUTE name rather than parity.
+//
+// A `from-zone vpn to-zone junos-host ... then deny` is rendered as an nft rule
+// scoped by `iifname` (daemon_nft.go), and the names come from this SSOT. Route-
+// based IPsec decrypts in the kernel XFRM stack and delivers the plaintext on
+// the xfrmi netdev — which for `bind-interface st0.0` is literally named
+// `st0.0`. If the SSOT emits `st0` instead, the rule is scoped to a device that
+// exists on no box, the iifname never matches, and the deny CANNOT FIRE. A
+// security guard silently unable to fire is worse than an absent one, because
+// `show` reports it configured.
+//
+// Parity with the snapshot is necessary but NOT sufficient here: both planes
+// collapsing `st0.0` onto `st0` agree perfectly and are both wrong — which is
+// exactly the state before #5619. So this pins the name itself, derived from
+// XFRMIfNameAndID (the constructor the xfrmi reconciler uses) rather than
+// hardcoded.
+//
+// It is also a DIFFERENTIAL across the two spellings, because "contains the
+// right name" alone can be satisfied by emitting both names. `st0.0` must
+// appear in the scope for `bind-interface st0.0` and must NOT appear for
+// `bind-interface st0`, where no such device is created.
+//
+// (`st0` appears in the scope under BOTH spellings. That is the BASE interface
+// row — `set interfaces st0` itself, unit-less — which resolves to `st0` by
+// design on both planes; see snapshotLinuxName's "Only the UNIT path resolves
+// this way". Under `bind-interface st0.0` it names no device, so the iifname
+// simply never matches: an over-narrow scope, never an over-broad one. It is
+// pre-existing and out of this fix's scope.)
+func TestJunosHostDenyScopeNamesTheSecureTunnelDevice(t *testing.T) {
+	const unitDev = "st0.0" // the device created ONLY by `bind-interface st0.0`
+	for _, tc := range []struct {
+		bindIface   string
+		wantUnitDev bool
+	}{
+		{bindIface: "st0.0", wantUnitDev: true},
+		{bindIface: "st0", wantUnitDev: false},
+	} {
+		t.Run(tc.bindIface, func(t *testing.T) {
+			cfg := secureTunnelParityConfig(tc.bindIface)
+
+			wantDev, ifID := config.XFRMIfNameAndID(tc.bindIface)
+			if ifID == 0 || wantDev == "" {
+				t.Fatalf("premise broken: bind-interface %q creates no xfrmi", tc.bindIface)
+			}
+			if (wantDev == unitDev) != tc.wantUnitDev {
+				t.Fatalf("premise broken: bind-interface %q creates device %q, which does "+
+					"not match this row's expectation about %q", tc.bindIface, wantDev, unitDev)
+			}
+
+			got := config.JunosHostZoneIngressNetdevs(cfg)["vpn"]
+			if !slices.Contains(got, wantDev) {
+				t.Errorf("junos-host iifname scope for zone vpn = %v, missing %q — with "+
+					"`bind-interface %s` the decrypted plaintext arrives on %q, so a deny "+
+					"scoped to anything else never matches and CANNOT FIRE",
+					got, wantDev, tc.bindIface, wantDev)
+			}
+			if has := slices.Contains(got, unitDev); has != tc.wantUnitDev {
+				t.Errorf("junos-host iifname scope for zone vpn = %v: contains %q = %v, "+
+					"want %v under `bind-interface %s` — the two spellings create DIFFERENT "+
+					"devices, so the scope must discriminate between them",
+					got, unitDev, has, tc.wantUnitDev, tc.bindIface)
 			}
 		})
 	}

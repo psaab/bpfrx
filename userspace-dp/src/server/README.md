@@ -186,11 +186,59 @@ would make the shim claim the interface, find no usable binding, and
 Before #5619 the exclusion happened by **accident**: the Go snapshot resolved
 `st0.0` to the nonexistent netdev `st0` (the unit-0 collapse), so the unit
 carried ifindex 0 and fell out of every ifindex-keyed set. #5619 fixed that
-name — `XFRMIfNameAndID` creates the device under the *verbatim* dotted ref —
-which is why the exclusion is now stated explicitly on both planes
+name — the reconciler creates the device under the AUTHORED `bind-interface`
+string, which for `bind-interface st0.0` is `st0.0` and for `bind-interface st0`
+is `st0`, so it is read back from the config rather than reconstructed from the
+ref (`Config.SecureTunnelUnitNetdev`) — which is why the exclusion is now
+stated explicitly on both planes
 (`is_secure_tunnel_ifname` here, `config.IsSecureTunnelIfName` in Go) and
 pinned by `binding_candidate_excludes_secure_tunnel` +
 `secure_tunnel_ifname_matches_go`.
+
+**An unbound `st` interface is NOT unaffected.** The claim that "a deployment
+without a bound VPN sees no change at all" was made earlier and is false, in two
+independent ways. First, the name: at the merge base `snapshotLinuxName`
+collapsed an unbound `st0 unit 0` to `st0`; at head it returns `st0.0`, because
+the resolver falls back to the verbatim ref when no VPN binds the unit. Second,
+the exclusion: it keys on the interface NAME, not on the presence of a VPN, so
+`set interfaces st0 unit 0 …` with no `security ipsec vpn` at all is still
+dropped from the ingress map, the binding plan and the RSS allowlist. Authoring
+an `st`-named interface without a route-based VPN is not a supported topology —
+`st` is the secure-tunnel namespace — but the honest statement is that the
+change is scoped by name, not by whether a tunnel is configured.
+
+The name range is part of that scoping: `IsSecureTunnelIfName` /
+`is_secure_tunnel_ifname` accept only `st<N>` for N in `[0, 65536)`, the range
+`XFRMIfNameAndID` will build an if_id for. Interface names are wildcard-
+authorable and nothing reserves the `st` prefix, so `st65536` is an ordinary
+data interface and must keep its adjudication and its AF_XDP binding (#6691).
+
+**Search scope of the "one resolver" claim — it is narrower than "every
+resolver in the tree".** #6691 unified the secure-tunnel rule across the three
+resolvers that answer "what kernel netdev does this Junos unit ref name?" for
+the userspace dataplane and the junos-host `iifname` scope:
+`Config.ResolveKernelIfName` (`pkg/config/types.go`),
+`userspace.snapshotLinuxName` (`pkg/dataplane/userspace/interfaces.go`) and
+`config.junosHostLinuxName` (`pkg/config/junos_host_deny.go`), all now calling
+`Config.SecureTunnelUnitNetdev`, plus the Rust classifier mirror
+`is_secure_tunnel_ifname`.
+
+Audited and deliberately NOT changed, each filed instead so this claim is not
+broader than the sweep:
+
+| site | disposition |
+|---|---|
+| `dataplane.resolveInterfaceRef` (`compiler_iface.go:72`) | over-matches `st*` (#6728); reconstructs the name from the ref (#6729) |
+| `dataplane.buildInterfaceNetworkdModels` (`compiler_iface.go:754`) | raw prefix branch drops every unit of `start0` (#6730) |
+| ip-monitoring next-hop validator (`compiler_services.go:1058`) | raw prefix rejection, fails closed (#6731) |
+| `daemon.resolveConfigSubnetLinuxName` (`daemon_dhcp.go:279`) | has no production caller — referenced only by its own test |
+
+The first three are LIVE on the userspace path (`CompileUserspaceShim` →
+`CompileConfig` → `compileZones`), not retired-eBPF-only. Not audited: resolvers
+outside the Junos-ref → netdev question (`LinuxIfName`'s `/`→`-` transform,
+`ResolveReth`, `ResolveFab`) and anything in `pkg/frr`, `pkg/networkd` or
+`pkg/routing` beyond `xfrm.go`, whose contract this change reads but does not
+alter.
 
 The consequence is real and operator-visible: **decrypted IPsec plaintext
 traverses Linux routing with no xpf zone policy.** That is #5619's open half —
@@ -202,10 +250,19 @@ building that path re-opens the drop above rather than fixing the gap.
 tunnels".** The predicate gates three sets and only three: the
 ingress-adjudication map, the AF_XDP binding plan and the RSS allowlist. Since
 #5619 made the xfrmi's ifindex resolve, the tunnel *does* enter the forwarding
-state built by `populate_interfaces` / `populate_egress`
-(`afxdp/forwarding_build/interfaces.rs`), which gate on `ifindex > 0` rather
-than on this predicate — so `name_to_ifindex`, the zone map and the egress map
-all see it. Note the resolution applies to the `<ip>@<iface>` next-hop
+state built by `populate_interfaces`
+(`afxdp/forwarding_build/interfaces.rs`), which gates on `ifindex > 0` rather
+than on this predicate — so `name_to_ifindex` and the zone map see it.
+
+It does **not** enter the **egress map**. `populate_egress` needs a source MAC
+and takes it from the interface's own `hardware_addr`, else the parent's MAC,
+else the `tunnel` flag. An xfrmi is `ARPHRD_NONE` (no MAC), has no parent
+ifindex, and a secure-tunnel unit carries no `tunnel` flag (the Go snapshot sets
+it from `iface.Tunnel`/`unit.Tunnel`, which a `bind-interface` stanza does not
+populate) — so the row hits `None => continue` and no `EgressInterface` is
+built. An earlier revision of this paragraph asserted the egress map saw it;
+that was wrong, and the consequence is spelled out under "what the adjudication
+decides" below. Note the resolution applies to the `<ip>@<iface>` next-hop
 encoding: an authored `next-hop st0.0` still reaches `parse_route_next_hop` as
 the bare string `"st0.0"`, which returns `(None, None)` and leaves the target at
 `(0, 0)` on both revisions. Measured — do not restate this as "a static route
@@ -233,19 +290,37 @@ tunnel took different dispositions depending on how it was spelled.
 `MissingNeighbor` is not invented here: it is what master already does for this
 flow on the canonical bare spelling. The `NoRoute` was the artifact.
 
-It is also not an unconditional delivered→dropped. Both dispositions are
-`is_slow_path_eligible`. `NoRoute` falls straight to the reinject gate with zone
-policy never evaluated; `MissingNeighbor` resolves zone ids from the egress
-ifindex and evaluates policy — a permit falls through to the same reinject
-(unchanged), a deny converts to `PolicyDenied` and `break …
-RecycleAndContinue`, which skips the reinject. So delivery changes only for a
-deployment with **no** `from-zone <lan> to-zone <tunnel-zone>` permit — i.e.
-precisely the policy bypass #5619 exists to close.
+**What the adjudication decides today — and the #6722 dependency.** Both
+dispositions are `is_slow_path_eligible`. `NoRoute` falls straight to the
+reinject gate with zone policy never evaluated; `MissingNeighbor` resolves zone
+ids from the egress ifindex and evaluates policy, and a deny converts to
+`PolicyDenied` and `break … RecycleAndContinue`, which skips the reinject.
+
+An earlier revision of this section said a matching permit falls through to the
+same reinject, so that only deployments with **no** `from-zone <lan> to-zone
+<tunnel-zone>` permit change. **That is false at this commit.** Because
+`populate_egress` builds no `EgressInterface` for the MAC-less xfrmi (above),
+the egress zone id reads **0**, and `evaluate_policy_result_l3_aware` wraps its
+entire rule walk — exact zone pair, the #3090 wildcard tiers *and* `junos-global`
+— in `if from_id != 0 && to_id != 0`. A flow with either zone unknown matches
+**nothing** and falls to the default action, so an authored permit does not
+rescue it.
+
+That MAC-less-egress zone resolution is a **pre-existing defect, tracked as
+#6713 and fixed by open PR #6722** (which touches
+`forwarding_build/interfaces.rs` and `forwarding/mod.rs`). It is not introduced
+here — this change only makes the dotted spelling reach the same code path the
+bare spelling already took. **The permit-preserves-delivery behaviour described
+above requires #6722 to land**; until then a LAN→tunnel transit flow is denied
+regardless of policy, on both spellings.
 
 Do **not** "fix" this by widening the exclusion into those maps. An interface
-absent from the zone maps resolves to `zone_id = 0`, and a `from-zone any
-to-zone any permit` matches zone-pair (0, 0) with no zone guard (#6682) — that
-would trade an adjudicated drop for a possible policy bypass. Separately,
+absent from the zone map resolves to `zone_id = 0`, and per the guard just
+cited a zone-0 flow matches no rule at all — not even `from-zone any to-zone
+any` — so widening would trade an adjudicable interface for one whose
+disposition no policy can influence. (An earlier revision claimed the opposite,
+that an any/any permit *matches* zone pair (0, 0) with no zone guard; the guard
+is right there in `policy.rs` and has been since #3110.) Separately,
 whether the negative-neighbor cache (3 s TTL) can fast-fail a *permitted*
 LAN→tunnel flow is tracked as #6710; it is pre-existing on master for bare
 `st0`, and this change extends its reach to the dotted spelling.
