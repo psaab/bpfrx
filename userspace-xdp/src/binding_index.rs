@@ -63,22 +63,43 @@
 //!     that is one binding FORM out of many, and a tuple pattern, a
 //!     `let … else`, a `macro_rules!` body taking an `$n:ident` and a closure
 //!     parameter each rebind without writing it — a hostile round drove a
-//!     compiled defect through all four. What works is COUNTING. The lookup
-//!     statement is pinned so both coordinates must arrive under a fixed NAME,
-//!     and the total number of times each of those names appears anywhere in
-//!     the crate is pinned too. A binding cannot exist without writing the name
-//!     it binds, whatever form it takes, so every one of them moves that count.
+//!     compiled defect through all four. What works is COUNTING, per file. The
+//!     lookup statement is pinned so both coordinates must arrive under a fixed
+//!     NAME, and the number of times each of those names appears in each file
+//!     of the crate is pinned too. A binding written in this crate cannot exist
+//!     without writing the name it binds, whatever form it takes, so every one
+//!     of them moves that tally.
+//!
+//!     "Written in this crate" is a real qualifier and an earlier revision of
+//!     this comment left it out. A PROC MACRO binds a name without writing it
+//!     here: its expansion carries `Span::call_site()`, which resolves — and
+//!     shadows — at the invocation. A hostile round built one outside the walked
+//!     directory, invoked it with a single line naming neither coordinate, and
+//!     the emitted object gained a mask on the queue index with every source
+//!     bound green. Counting cannot see that, so the parity tests bound the
+//!     ROUTE instead: this crate's `Cargo.toml` is pinned token-for-token and
+//!     both cargo configs read for this build refuse `--extern`, `[patch]` and
+//!     `[replace]`, so acquiring a proc macro IN TREE reds. That bounds
+//!     acquisition and nothing more — the two dependencies already pinned (one
+//!     of which is a proc-macro crate, since `#[xdp]` comes from it) are
+//!     upstream code no test here reads, and a cargo config or `RUSTFLAGS`
+//!     outside the repository is not source at all.
 //!
 //! The honest summary: the source-asserted surface cannot reach ZERO while the
 //! coordinate originates in aya-dependent code. What remains is CONSERVATION —
-//! a count bounds occurrences, it does not classify them, so an author who
+//! a tally bounds occurrences, it classifies them only in part, so an author who
 //! DELETES an existing use or line of prose can pay for a shadow and leave the
-//! total where it was. Every mention it counts is a pinned statement, a
-//! compiled use or documentation, so that means removing real code or real
-//! prose from a hash-pinned file rather than quietly adding a line, and it is a
-//! far narrower residual than the open set of binding forms it replaced. What
-//! the bounds can do, and now do, is make every known reintroduction of #5173
-//! either fail to compile, fail a pinned statement, or move a pinned count.
+//! tally where it was. The two coordinates are in different positions and the
+//! parity tests say so precisely rather than in the aggregate: for the queue
+//! half every mention in the packet-path file is inside a pinned statement, so
+//! there is nothing free to spend there; for the interface half free mentions
+//! still exist outside the index path, and that is stated there as an open
+//! residual rather than defended. What the bounds can do, and now do, is make
+//! every reintroduction of #5173 DEMONSTRATED in five hostile rounds either fail
+//! to compile, fail a pinned token sequence — a statement, a signature, or this
+//! crate's manifest — trip a refused build capability, or move a pinned tally.
+//! Undemonstrated variants of the interface-half conservation escape are not
+//! covered, and the parity tests name the mentions that are still free.
 //!
 //! Nothing here may depend on `aya`, on a BPF map, or on `std` — that is what
 //! keeps it host-compilable, and it is the whole point.

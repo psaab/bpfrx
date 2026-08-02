@@ -66543,3 +66543,33 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-08-01 17:41
+- **Action**: #5173 round-5 fold — the #6676 guard claimed CLASS-COMPLETENESS
+  over binding forms that a proc macro breaks, and understated its own
+  CONSERVATION residual for both counted names. Both reproduced firsthand
+  against the tracked object (pristine sha256 `114354c9a2238b…`, zero `&= 0x3`
+  instructions anywhere). (1) A `proc-macro = true` crate outside
+  `userspace-xdp/src`, emitting a shadow from a parsed string so every span is
+  `call_site`, invoked by one line naming neither coordinate: build rc 0, test
+  rc 0, all three guards green, object `eb71ef9e…` gaining `r2 &= 0x3` right
+  after the `xdp_md.rx_queue_index` load. (2a) Re-sourcing `rx_queue_index`
+  from the context field freed the mention that paid for a tuple-pattern
+  `transmute` shadow — object `5122c347…`, count still exactly 7. (2b) A
+  cosmetic rename of `binding_slot`'s parameter freed THREE more (7 -> 4),
+  topped back up with prose. (2c) An alias plus two rerouted `record_trace`
+  arguments bought an ifindex shadow with NOTHING deleted — object
+  `e0707678…` — so the shipped "costs a visibly deleted telemetry call" was
+  false. Fix: five new token pins (the shim `Cargo.toml` dependency manifest;
+  a capability refusal of `extern`/`patch`/`replace`/`rustflags` in both cargo
+  configs; the `for_trace()` readback statement; `binding_slot`'s signature;
+  `record_trace`'s signature plus every call site's canonical argument prefix)
+  and the mention tally split PER FILE so a mention freed in one file can no
+  longer pay for a shadow in another. Every claim rewritten to what the checks
+  deliver: the tally is complete over binding forms WRITTEN IN THE WALKED
+  SOURCE, a proc-macro expansion is bounded by in-tree acquisition cost only,
+  and the interface half's remaining free mentions are named rather than
+  defended. Seven mutations proved RED-then-GREEN with build+`--no-run` rc 0
+  in both states; `make generate` left the object bit-identical.
+- **File(s)**: userspace-dp/src/main_tests.rs,
+  userspace-xdp/src/binding_index.rs,
+  pkg/dataplane/userspace_xdp_manifest.json, _Log.md

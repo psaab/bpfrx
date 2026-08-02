@@ -2614,9 +2614,33 @@ fn shim_raw_rx_queue_exposes_no_arithmetic() {
 ///     before the map lookup and losing the `> 0xf` stride guard —
 ///     `let Some(<name>) = … else`, a `macro_rules!` body taking an
 ///     `$n:ident`, and the closure/`fn` parameter that used to be carried
-///     below as the declared residual. Hence the mention COUNT, which is
-///     class-complete over binding forms in a way no pattern match is: a
-///     binding cannot exist without writing the name it binds.
+///     below as the declared residual. Hence the mention TALLY, which is
+///     complete over binding forms WRITTEN IN THE WALKED SOURCE in a way no
+///     pattern match is: such a binding cannot exist without writing the name
+///     it binds.
+///  6. **"Written in the walked source" is load-bearing, and round 5 broke the
+///     claim that omitted it.** A PROC MACRO binds a name without writing it
+///     here: its expansion carries `Span::call_site()`, so it resolves — and
+///     shadows — at the invocation. `macro_rules!` is not this hole (a body
+///     identifier is def-site hygienic, and an `$n:ident` metavariable is
+///     written by the invocation, which IS in the walk); a proc macro is. A
+///     crate outside `userspace-xdp/src` emitting
+///     `let rx_queue = RawRxQueue::from_ctx_field(rx_queue.for_trace() % 4);`
+///     from a parsed string, invoked by the one line `xdp_evil::tune!();`,
+///     left every tally exactly where it was, all three tests green, and the
+///     emitted object carrying `r2 &= 0x3` after the `xdp_md.rx_queue_index`
+///     load the pristine object performs unmasked. Counting cannot see that by
+///     construction, so the ROUTE is bounded instead: the shim's Cargo manifest
+///     is pinned token-for-token, and both cargo configs read for this build
+///     refuse `--extern`, `[patch]` and `[replace]`. Acquiring a proc macro in
+///     tree therefore reds. Which is a bound on ACQUIRING one, not on the two
+///     already pinned, and not on a config outside the repository — see the
+///     residual below.
+///  7. **A tally is per FILE, or it is fungible.** A crate total lets a mention
+///     freed in one file pay for a shadow added to another; the tally is
+///     therefore pinned per file. For the queue coordinate that is what closes
+///     conservation, because every one of its `lib.rs` mentions is inside a
+///     pinned statement. For the interface coordinate it does not — also below.
 ///
 /// # What is still unbound — and it cannot be driven to zero here
 ///
@@ -2629,51 +2653,94 @@ fn shim_raw_rx_queue_exposes_no_arithmetic() {
 /// only be USED by binding the name the pinned lookup passes, and every form of
 /// binding raises that name's count. What remains:
 ///
-///  - **CONSERVATION — the mention bound counts, it does not classify.** Every
-///    binding form has to write the name, so none of them is FREE; but an
-///    author who also DELETES an existing mention pays for one and leaves the
-///    total where it was. That is what is left of the binding residual, and it
-///    is not the same shape as what it replaced: the escape is no longer an
-///    added line, it is an added line plus a deletion. Every mention counted is
-///    a pinned statement, a compiled use, or one documentation line, so the
-///    deletion has to remove real code or real prose from a hash-pinned file.
-///    The two counts leave very different amounts of slack, and it is worth
-///    saying which. `rx_queue`'s six code sites are the two pinned statements,
-///    `for_trace()`'s only caller, and `binding_slot`'s parameter plus its two
-///    uses — deleting ANY of them breaks a pin, the build, or the executed
-///    stride test, so its one doc line is the only free slot. `ingress_ifindex`
-///    is looser: most of its 24 code sites are `record_trace` arguments, and
-///    dropping a trace call compiles. Buying a shadow there costs a visibly
-///    deleted telemetry call rather than nothing.
+///  - **A PROC-MACRO EXPANSION binds without writing the name here.** The
+///    tally walks source; a proc macro's tokens are in another crate and its
+///    `Span::call_site()` spans shadow a local at the invocation. Round 5 built
+///    one and it left every bound green with `& 0x3` in the emitted object.
+///    What ships against it is a bound on the ROUTE — the shim's Cargo manifest
+///    is pinned token-for-token and both cargo configs refuse `--extern`,
+///    `[patch]` and `[replace]` — so acquiring a proc macro IN TREE reds. Three
+///    things that does not reach, stated because a route bound is only worth its
+///    coverage: the two dependencies already pinned (`aya-ebpf-macros` is itself
+///    a proc-macro crate, since `#[xdp]` comes from it, and no test here reads
+///    upstream source); a cargo config outside the repository; and `RUSTFLAGS`
+///    in the environment. The last two are properties of the machine running
+///    the build rather than of reviewable source. So the honest statement is
+///    that a proc-macro expansion is bounded by in-tree acquisition cost, not by
+///    the tally, and an existing macro's behaviour is out of scope entirely.
+///    This is the one residual that is not conservation.
+///  - **CONSERVATION — the tally counts, and classifies only in part.** Every
+///    binding form written here has to write the name, so none of them is FREE;
+///    but an author who also DELETES an existing mention pays for one and leaves
+///    the tally where it was. The shipped version of this paragraph then claimed
+///    more than was true for BOTH names, so the inventory is now stated site by
+///    site.
+///
+///    The tally is PER FILE, which stops a mention freed in one file from paying
+///    for a shadow in another. For `rx_queue` that closes it. Its three `lib.rs`
+///    mentions are all inside pinned statements — the construction, the
+///    `for_trace()` readback and the lookup — and `lib.rs` is the only file a
+///    shadow can sit in, because that is where the pinned definition and the
+///    pinned use are. In `binding_index.rs` the parameter is pinned by the
+///    signature and the two body uses are load-bearing for the build and the
+///    executed stride test, so the one free mention in the whole crate is a
+///    single doc line there — and per-file pinning means it cannot be spent on
+///    `lib.rs`. (Before round 5 this was NOT true and the paragraph claimed it
+///    anyway: `for_trace()`'s caller was unpinned, and renaming `binding_slot`'s
+///    parameter freed three more. Five of the seven were free, not one.)
+///
+///    For `ingress_ifindex` it does NOT close, and the previous claim that
+///    buying a shadow there "costs a visibly deleted telemetry call" was false:
+///    an ALIAS refunds mentions with nothing deleted at all. Two pins narrow
+///    that — every `record_trace` call's argument prefix, so an argument cannot
+///    be rerouted through an alias, and `record_trace`'s own signature, because
+///    renaming its interface parameter was itself worth two free mentions. What
+///    is left, stated as inventory rather than as a defence: the coordinate can
+///    be dropped from the trace-key mix (it compiles, and it degrades trace-key
+///    distribution rather than the index path), and neither `#[repr(C)]`
+///    struct's field DECLARATION is pinned here — the wire contract with
+///    userspace-dp is by offset, so this test says nothing about those names.
+///    Buying a shadow of the interface coordinate therefore still costs only
+///    edits that compile and red nothing, and this test does not prevent it.
+///    Driving it to zero would mean pinning most of a trace function that has
+///    nothing to do with the index path; the bound above is the bound that
+///    ships.
 ///  - **The ifindex half is a bare `u32`.** `binding_slot`'s queue argument is a
 ///    newtype; its ifindex argument is not, and it cannot be one without a
 ///    second wrapper whose constructor would take a bare `u32` for the same
-///    aya-shaped reason — moving the residual, not closing it. Both of its
-///    statements and its binding count are pinned below; none of that is the
-///    type system.
+///    aya-shaped reason — moving the residual, not closing it. Its definition,
+///    its use, `binding_slot`'s signature, every trace call's argument prefix
+///    and its per-file tally are pinned below; none of that is the type system,
+///    and the paragraph above says where that leaves it.
 ///  - **Anything the tokenizer sees as identical text.** Comments and string
 ///    literals are tokenized like code. That direction is fail-CLOSED (a
 ///    spurious RED, never a silent pass), which is the correct polarity, but it
 ///    does mean a prose mention can trip the count bounds below.
 #[test]
 fn shim_index_path_has_one_construction_and_one_lookup() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("userspace-xdp")
-        .join("src");
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let crate_dir = repo_root.join("userspace-xdp");
+    let root = crate_dir.join("src");
     let mut sources: Vec<(String, String)> = Vec::new();
-    fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+    fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, String)>) {
         for e in std::fs::read_dir(dir).expect("read shim src dir") {
             let p = e.expect("dir entry").path();
             if p.is_dir() {
-                walk(&p, out);
+                walk(root, &p, out);
             } else if p.extension().and_then(|x| x.to_str()) == Some("rs") {
                 let body = std::fs::read_to_string(&p).expect("read shim source");
-                out.push((p.display().to_string(), body));
+                // RELATIVE to the walked root. The per-file mention tally at the
+                // bottom pins these names, and an absolute path — which depends
+                // on where the checkout lives — is not pinnable.
+                let rel = p.strip_prefix(root).unwrap_or(&p).display().to_string();
+                out.push((rel, body));
             }
         }
     }
-    walk(&root, &mut sources);
+    walk(&root, &root, &mut sources);
+    // `read_dir` order is unspecified; the per-file tally is compared as an
+    // ordered list, so sort before anything reads this.
+    sources.sort();
     assert!(!sources.is_empty(), "found no shim sources under {}", root.display());
 
     let tokens: Vec<(String, Vec<String>)> = sources
@@ -2729,6 +2796,130 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
          this is a false RED; reword it.)",
         root.display()
     );
+
+    // ---- …and a DEPENDENCY is a third way in that the walk cannot see. ----
+    //
+    // `#[path]` and `include!` pull SOURCE in from outside the walk, and are
+    // refused above. A proc-macro dependency does something the token bounds
+    // cannot see at all: its expansion is tokens that appear in no file here,
+    // and a `Span::call_site()` token resolves — and SHADOWS — at the
+    // invocation. Round 5 built it. A crate outside `userspace-xdp/src`
+    // emitting, from a parsed string,
+    //
+    //     let rx_queue = RawRxQueue::from_ctx_field(rx_queue.for_trace() % 4);
+    //
+    // invoked by the single line `xdp_evil::tune!();` — thirteen tokens naming
+    // neither coordinate and neither constructor — left EVERY count below
+    // exactly where it was, all three tests green, and the emitted object
+    // carrying `r2 &= 0x3` immediately after the `xdp_md.rx_queue_index` load
+    // that the pristine object performs unmasked. Compiled and disassembled,
+    // not argued.
+    //
+    // `macro_rules!` is not this hole: a body identifier is def-site hygienic,
+    // and an `$n:ident` metavariable is written by the INVOCATION, which is in
+    // the walk. Only a proc macro binds a name that is written nowhere here.
+    //
+    // Counting mentions cannot see it by construction, so bound the ROUTE
+    // instead: the expansion needs a proc-macro crate, a proc-macro crate needs
+    // a dependency entry, and the manifest is pinned token-for-token here. That
+    // makes acquiring one a deliberate act that reds — the same idiom as
+    // `BINDINGS_MENTIONS`. It is a cheap pin to hold: this file has changed
+    // twice in the repo's history, once to add it and once in a repo-wide
+    // rename.
+    //
+    // What this does NOT bound, stated because the rest of this test is only
+    // worth what its claims are worth: the two dependencies already pinned.
+    // `aya-ebpf-macros` IS a proc-macro crate (it supplies `#[xdp]`), and
+    // nothing here reads upstream code. That residual is carried on the doc
+    // comment; it is not covered by any bound below.
+    let manifest_path = crate_dir.join("Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", manifest_path.display()));
+    #[rustfmt::skip]
+    const SHIM_MANIFEST: &[&str] = &[
+        "[", "package", "]",
+        "name", "=", "\"", "xpf", "-", "userspace", "-", "xdp", "\"",
+        "version", "=", "\"", "0", ".", "1", ".", "0", "\"",
+        "edition", "=", "\"", "2024", "\"",
+        "[", "dependencies", "]",
+        "aya", "-", "ebpf", "=", "\"", "0", ".", "1", ".", "1", "\"",
+        "aya", "-", "ebpf", "-", "macros", "=", "\"", "0", ".", "1", ".", "2", "\"",
+        "[", "lib", "]",
+        "crate", "-", "type", "=", "[", "\"", "cdylib", "\"", "]",
+    ];
+    let manifest_owned = shim_token_vec(&manifest);
+    let manifest_tokens: Vec<&str> = manifest_owned.iter().map(String::as_str).collect();
+    assert_eq!(
+        manifest_tokens,
+        SHIM_MANIFEST,
+        "#5173: {} must be exactly:\n  {}\nA new dependency is the one route by which a binding \
+         of either coordinate can exist without its name appearing anywhere the mention tally \
+         below walks: a proc macro's expansion is call-site hygienic, so it shadows a local here \
+         while writing nothing here. That was demonstrated compiling, with all three tests green \
+         and `& 0x3` in the emitted object. Matched on TOKENS, so whitespace and line breaks are \
+         not a RED, but a `[patch]`, a `[replace]`, a path dependency, a reordered key or a \
+         version bump all are. \
+         If you are changing this deliberately, update this constant and say why — and if what \
+         you added can expand to arbitrary statements, the mention tally below no longer bounds \
+         rebindings and this test's doc comment needs revising with it.",
+        manifest_path.display(),
+        SHIM_MANIFEST.join(" "),
+    );
+
+    // ---- …and the manifest is not the only file that can add a crate. -----
+    //
+    // Pinning `Cargo.toml` bounds the ORDINARY route. Two cargo config files
+    // are read for this build — the crate's own and the repo root's, since
+    // cargo loads ancestor configs — and either can inject a crate the manifest
+    // never names, via a `--extern` rustflag, or swap one it does name, via
+    // `[patch]` / `[replace]`. So refuse those CAPABILITIES rather than pin the
+    // files: both are mostly explanatory comments and a token-exact pin of
+    // either would red on a reworded sentence.
+    //
+    // `extern`, `patch` and `replace` are refused in BOTH files; `rustflags` is
+    // refused only in the crate-local one, because the repo-root config carries
+    // an x86_64-scoped link-arg (#3595) that is inert for `bpfel-unknown-none`
+    // — and the `extern` refusal covers that file's injection route regardless
+    // of the flag it would be spelled with.
+    //
+    // NOT covered, and it cannot be: a cargo config outside the repository
+    // (`$CARGO_HOME/config.toml`), or `RUSTFLAGS` in the environment. Those are
+    // properties of the machine running the build, not of reviewable source;
+    // the build recipe that sets the environment is itself hashed by the #4977
+    // freshness manifest.
+    for (label, path, banned) in [
+        (
+            "userspace-xdp/.cargo/config.toml",
+            crate_dir.join(".cargo").join("config.toml"),
+            &["extern", "patch", "replace", "rustflags"][..],
+        ),
+        (
+            ".cargo/config.toml",
+            repo_root.join(".cargo").join("config.toml"),
+            &["extern", "patch", "replace"][..],
+        ),
+    ] {
+        let body = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let toks = shim_token_vec(&body);
+        let found: Vec<&str> = banned
+            .iter()
+            .copied()
+            .filter(|k| shim_token_seq_count(&toks, &[k]) > 0)
+            .collect();
+        assert!(
+            found.is_empty(),
+            "#5173: {label} names {found:?}, any of which can put a crate into the shim build \
+             that {} never mentions — `--extern` injects one outright, `[patch]`/`[replace]` \
+             substitutes one already pinned. A proc macro acquired that way expands \
+             call-site-hygienic tokens that shadow a coordinate while writing its name nowhere \
+             the tally below walks, which is the escape the manifest pin above exists to close; \
+             a second door to the same room closes with it. Refused as capabilities rather than \
+             pinned token-for-token because these files are mostly comments. (Prose using one of \
+             these words is a spurious RED; reword it.)",
+            manifest_path.display(),
+        );
+    }
 
     // ---- The binding lookup, pinned as a whole statement. -----------------
     //
@@ -2837,6 +3028,79 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
         ctors.len(),
     );
 
+    // ---- The wrap site's only READER, pinned too. -------------------------
+    //
+    // `for_trace()` has exactly one caller, and until round 5 that caller was
+    // the only statement on the packet path naming the queue coordinate that
+    // was NOT pinned — which made it a FREE mention rather than a load-bearing
+    // one. Re-sourcing the traced index straight from the context field,
+    //
+    //     let rx_queue_index = unsafe { (*ctx.ctx).rx_queue_index };
+    //
+    // is the same value, deletes nothing, and costs ZERO tokens of the counted
+    // name (`rx_queue_index` is a different token to `rx_queue`). The freed slot
+    // then paid for a tuple-pattern `transmute` shadow with the crate tally
+    // still exactly at its bound: compiled, all three tests green, and the
+    // emitted object carrying `r1 &= 0x3` immediately before the `<<= 0x4`
+    // stride multiply. Pinning the readback removes that slot, and it is worth
+    // pinning on its own account: it makes the queue index every `record_trace`
+    // reports the WRAPPED coordinate read back, not an independent read that
+    // could disagree with the one the lookup consumed.
+    #[rustfmt::skip]
+    const TRACE_READBACK_STATEMENT: &[&str] = &[
+        "let", "rx_queue_index", "=", "rx_queue", ".", "for_trace", "(", ")", ";",
+    ];
+    let readback = seq(TRACE_READBACK_STATEMENT);
+    assert_eq!(
+        readback.len(),
+        1,
+        "#5173: the traced queue index must be read back by exactly this statement, once:\n  \
+         {}\nfound {} occurrence(s) {readback:?}. Re-sourcing it from the context field is the \
+         same value for zero tokens of the counted name, and the mention it frees is enough to \
+         buy a shadow with the crate tally unchanged — demonstrated compiling with every other \
+         bound green and `& 0x3` in the emitted object. It also keeps telemetry honest: what is \
+         traced must be the coordinate that was wrapped, not a second read of the context.",
+        TRACE_READBACK_STATEMENT.join(" "),
+        readback.len(),
+    );
+
+    // ---- `binding_slot`'s SIGNATURE, pinned. ------------------------------
+    //
+    // The lookup statement pins the CALLER's argument names. Nothing pinned the
+    // callee's parameter names, and three of the seven mentions of the queue
+    // coordinate live there. Renaming the parameter and its two body uses is
+    // behaviour-preserving — the executed stride test calls positionally — so
+    // it reddened nothing while dropping the tally from 7 to 4, and a deficit
+    // is topped back up with prose, which the tokenizer counts identically to
+    // code. That is three free slots bought with a cosmetic edit, and round 5
+    // composed exactly that with the readback re-source above into a compiled
+    // #5173 sitting at the bound.
+    //
+    // With the signature pinned the rename has nowhere to go: rename the
+    // parameter and this sequence breaks; leave it and neither body use can be
+    // deleted without breaking the build or the executed stride test. The pin
+    // also fixes the parameter ORDER and both parameter TYPES, which nothing
+    // else here did.
+    #[rustfmt::skip]
+    const BINDING_SLOT_SIGNATURE: &[&str] = &[
+        "pub", "fn", "binding_slot", "(",
+        "ingress_ifindex", ":", "u32", ",", "rx_queue", ":", "RawRxQueue", ")",
+        "-", ">", "Option", "<", "u32", ">",
+    ];
+    let slot_sig = seq(BINDING_SLOT_SIGNATURE);
+    assert_eq!(
+        slot_sig.len(),
+        1,
+        "#5173: the slot resolver must be declared by exactly this signature, once:\n  {}\nfound \
+         {} occurrence(s) {slot_sig:?}. A parameter rename here is behaviour-preserving and the \
+         executed stride test calls positionally, so nothing else sees it — but it moves three \
+         mentions out of the tally below, and the tally is what bounds rebindings of the name. \
+         Renaming a parameter is not worth breaking a build over; buying three free slots with \
+         it is.",
+        BINDING_SLOT_SIGNATURE.join(" "),
+        slot_sig.len(),
+    );
+
     // ---- The INTERFACE half of the index, pinned the same way. ------------
     //
     // `binding_slot` takes two coordinates and only the queue one is a
@@ -2868,6 +3132,104 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
         ifx_site.len(),
     );
 
+    // ---- Telemetry must report the coordinates the lookup CONSUMES. -------
+    //
+    // The shipped version of the residual said that buying a shadow of the
+    // interface coordinate "costs a visibly deleted telemetry call". It does
+    // not. Round 5 bought one with an ALIAS and deleted nothing:
+    //
+    //     let ifx = ingress_ifindex;                     // +1
+    //     let (ingress_ifindex, _z) = (ifx % 4, 0u32);   // +1  (tuple pattern)
+    //
+    // then routed TWO existing `record_trace` arguments through `ifx` instead
+    // (-2). Net zero. The tally stayed exactly at its bound, `["let", name]`
+    // stayed at one, all three tests stayed green, no trace call was removed and
+    // the two rerouted sites record the identical integer — while the emitted
+    // object gained `r1 &= 0x3` after the `xdp_md.ingress_ifindex` load. That is
+    // #5173 through the interface dimension, which is precisely the round-3
+    // defect, reintroduced without deleting anything.
+    //
+    // Pinning the argument PREFIX is what sees it, and it is a CLASSIFYING
+    // bound rather than a counting one: it says where the mentions are, not just
+    // how many there are. Every call must report the same three names the
+    // binding lookup consumes, so an alias cannot be refunded there. It also
+    // fixes a real telemetry property — a trace record that names a different
+    // interface or queue than the one the redirect used is the "drop MIS-TRACED
+    // as having reached redirect" hazard `binding_index.rs` documents.
+    //
+    // The two counts are pinned separately so a red says which happened: a new
+    // trace call (raise both), or an existing one no longer passing the
+    // canonical coordinates (raise neither — fix the call).
+    //
+    // The CALLEE's signature is pinned with them, for the same reason
+    // `binding_slot`'s is: pinning only the call sites leaves the parameter name
+    // free, and renaming `record_trace`'s own `ingress_ifindex` parameter is
+    // behaviour-preserving, reds nothing else, and frees TWO mentions — the
+    // declaration and the trace-key mix — which is exactly the price of the
+    // alias shadow above. Found while checking what the residual actually was;
+    // it is cheaper to pin than to document.
+    const TRACE_CALL_SITES: usize = 12;
+    #[rustfmt::skip]
+    const TRACE_SIGNATURE: &[&str] = &[
+        "fn", "record_trace", "(",
+        "ctrl_flags", ":", "u32", ",",
+        "ingress_ifindex", ":", "u32", ",",
+        "rx_queue_index", ":", "u32", ",",
+        "selected_queue", ":", "u32", ",",
+        "slot", ":", "u32", ",",
+        "stage", ":", "u32", ",",
+        "reason", ":", "u32", ",",
+        "parsed", ":", "&", "ParsedPacket", ",",
+        ")",
+    ];
+    let trace_sig = seq(TRACE_SIGNATURE);
+    assert_eq!(
+        trace_sig.len(),
+        1,
+        "#5173: the trace recorder must be declared by exactly this signature, once:\n  {}\nfound \
+         {} occurrence(s) {trace_sig:?}. Renaming the interface parameter here is invisible to \
+         the call-site pin below and to every other bound, and it frees two mentions from the \
+         tally — the declaration and the trace-key mix — which is the exact price of buying a \
+         shadow with an alias. Reordering or retyping the parameters also lands here, which is \
+         worth having on its own: the call sites are pinned positionally.",
+        TRACE_SIGNATURE.join(" "),
+        trace_sig.len(),
+    );
+    #[rustfmt::skip]
+    const TRACE_ARGUMENT_PREFIX: &[&str] = &[
+        "record_trace", "(",
+        "ctrl", ".", "flags", ",",
+        "ingress_ifindex", ",", "rx_queue_index", ",", "selected_queue", ",",
+    ];
+    // The `fn record_trace(` item tokenizes to the same pair as a call, so the
+    // total is the call sites plus the definition.
+    let trace_opens = seq(&["record_trace", "("]);
+    assert_eq!(
+        trace_opens.len(),
+        TRACE_CALL_SITES + 1,
+        "#5173: the shim crate must contain exactly {} `record_trace(` occurrences — \
+         {TRACE_CALL_SITES} call sites plus the `fn` item — but found {} {trace_opens:?}. This \
+         is pinned because the NEXT assertion counts only the calls that DO pass the canonical \
+         coordinates, and on its own that is satisfied by adding a thirteenth call that does \
+         not. Pinning the total is what makes the pair say `all of them`. If you are adding or \
+         removing a trace call, move both constants together and say why.",
+        TRACE_CALL_SITES + 1,
+        trace_opens.len(),
+    );
+    let canonical_traces = seq(TRACE_ARGUMENT_PREFIX);
+    assert_eq!(
+        canonical_traces.len(),
+        TRACE_CALL_SITES,
+        "#5173: every `record_trace` call must open with exactly:\n  {}\nfound {} of \
+         {TRACE_CALL_SITES} {canonical_traces:?}. A call that reports the coordinates under any \
+         OTHER name is how a shadow is paid for without deleting anything: alias the interface \
+         coordinate, reroute two arguments through the alias, and the mention tally below is \
+         refunded while the object gains a mask on the index. It is also wrong on its own terms \
+         — a trace record must describe the packet the binding lookup actually resolved.",
+        TRACE_ARGUMENT_PREFIX.join(" "),
+        canonical_traces.len(),
+    );
+
     // ---- Neither coordinate may be re-bound, in ANY binding form. ---------
     //
     // The two statement pins fix the definition and the use; a SHADOW between
@@ -2897,11 +3259,11 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
     // exactly that way. Reassignment without `let` needs `mut`, which breaks
     // whichever statement pin above declares the name.
     //
-    // The MENTION COUNT is the CLASS-COMPLETE bound, and it ships because
-    // `let <name>` on its own was escaped FOUR ways in round 4 — every one of
-    // them compiling for `bpfel-unknown-none`, with all three tests green.
-    // `["let", name]` matches only a BARE-IDENTIFIER `let` pattern; put any
-    // token between the two and it is gone. The four:
+    // The MENTION TALLY is the bound that is complete over binding FORMS, and
+    // it ships because `let <name>` on its own was escaped FOUR ways in round 4
+    // — every one of them compiling for `bpfel-unknown-none`, with all three
+    // tests green. `["let", name]` matches only a BARE-IDENTIFIER `let` pattern;
+    // put any token between the two and it is gone. The four:
     //
     //   - a tuple pattern —
     //         let (rx_queue, _z) = (transmute::<u32, RawRxQueue>(q % 4), 0u32);
@@ -2920,23 +3282,58 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
     //     declared residual, and no longer does.
     //
     // Enumerating binding FORMS would always be one form behind, exactly as
-    // enumerating fabrication symbols would. Counting MENTIONS is not, and that
-    // is the whole reason it is what ships: a binding of `<name>` — tuple,
+    // enumerating fabrication symbols would. Counting MENTIONS is not — for
+    // bindings WRITTEN IN THE WALKED SOURCE. A binding of `<name>` — tuple,
     // struct, slice or `Some(..)` pattern, `let … else`, `if let`, `while let`,
-    // `for`, a match arm, a macro expansion, a closure or `fn` parameter —
-    // cannot exist without WRITING `<name>`, so every one of them raises this
-    // count. Same idiom, and the same reasoning, as `BINDINGS_MENTIONS` and
-    // `CTOR_MENTIONS` above; the counts are larger here only because these two
-    // are ordinary working identifiers rather than one-site symbols.
+    // `for`, a match arm, a `macro_rules!` expansion, a closure or `fn`
+    // parameter — cannot exist without writing the name here, so every one of
+    // them moves this tally. Same idiom, and the same reasoning, as
+    // `BINDINGS_MENTIONS` and `CTOR_MENTIONS` above; the numbers are larger only
+    // because these two are ordinary working identifiers rather than one-site
+    // symbols.
     //
-    // What the count does NOT do is classify — it counts. What that leaves is
-    // on this test's doc comment under CONSERVATION.
-    const INGRESS_IFINDEX_MENTIONS: usize = 25; // 24 code sites + 1 doc line
-    const RX_QUEUE_MENTIONS: usize = 7; //         6 code sites + 1 doc line
-    for (name, mention_bound) in [
-        ("ingress_ifindex", INGRESS_IFINDEX_MENTIONS),
-        ("rx_queue", RX_QUEUE_MENTIONS),
-    ] {
+    // "Written in the walked source" is a REAL qualifier and round 5 found the
+    // gap: a PROC MACRO binds a name without writing it here, because its
+    // expansion carries `Span::call_site()` and therefore resolves — and
+    // shadows — at the invocation. Counting cannot see that by construction; the
+    // manifest pin above bounds the route to it instead, and the doc comment
+    // carries what remains as a residual. Do not restate this tally as complete
+    // over binding forms without that qualifier: an earlier revision did, and it
+    // was false.
+    //
+    // PER FILE, not crate-wide. A crate total is FUNGIBLE across files: a doc
+    // line deleted in `binding_index.rs` would pay for a shadow added to
+    // `lib.rs`, which is a conservation escape the total cannot see. Pinning the
+    // tally per file makes the conservation residual per-file too, and that is
+    // what closes it for the queue coordinate: `lib.rs` names it three times and
+    // all three are inside pinned statements — the construction, the `for_trace`
+    // readback and the lookup — so the ONE file a shadow could sit in, between
+    // the pinned definition and the pinned use, has nothing left to spend. It is
+    // NOT closed for the interface coordinate; see CONSERVATION on the doc
+    // comment for the free slots that remain there.
+    //
+    // Paths are relative to the walked root, so this is pinnable and a NEW file
+    // that mentions either name is a red rather than an invisible addition.
+    #[rustfmt::skip]
+    const MENTIONS_PER_FILE: &[(&str, usize, usize)] = &[
+        //  file                 ingress_ifindex  rx_queue
+        //                       ---------------  --------
+        //  binding_index.rs:    1 doc + param    1 doc + param
+        //                       + 1 body use     + 2 body uses
+        //  lib.rs:              2 struct fields, 3, ALL inside pinned
+        //                       the pinned read  statements: the
+        //                       (x2), the iface  construction, the
+        //                       gate, the pinned `for_trace` readback
+        //                       lookup, 12 trace and the lookup
+        //                       args, the meta
+        //                       write, the trace
+        //                       fn's param, its
+        //                       struct init and
+        //                       its key mix
+        ("binding_index.rs",     3,               4),
+        ("lib.rs",               22,              3),
+    ];
+    for name in ["ingress_ifindex", "rx_queue"] {
         let rebinds = seq(&["let", name]);
         assert_eq!(
             rebinds.len(),
@@ -2949,40 +3346,46 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
              of this name; if the value genuinely needs deriving, give the derived value a \
              DIFFERENT name and note that the pinned lookup statement will then reject passing \
              it. (This bound sees a bare-identifier `let` and nothing else — a tuple pattern, a \
-             `let … else`, a macro expansion or a parameter slips it, which is what the mention \
-             bound below is for.)",
+             `let … else`, a macro expansion or a parameter slips it, which is what the tally \
+             below is for.)",
             rebinds.len(),
         );
-
-        // Per-file tally rather than one entry per occurrence: at these counts
-        // a flat list is a wall of the same path, and which FILE moved is the
-        // only part an author needs.
-        let tally: Vec<String> = tokens
-            .iter()
-            .filter_map(|(file, toks)| match shim_token_seq_count(toks, &[name]) {
-                0 => None,
-                n => Some(format!("{file}: {n}")),
-            })
-            .collect();
-        let mentions = seq(&[name]);
-        assert_eq!(
-            mentions.len(),
-            mention_bound,
-            "#5173: `{name}` must be NAMED exactly {mention_bound} times in the shim crate, but \
-             was named {} times. Per file: {tally:#?}\nThis is the CLASS-COMPLETE half of the \
-             binding bound and the reason it is a count rather than a pattern match: a rebinding \
-             of this name in ANY form — a tuple, struct, slice or `Some(..)` pattern, a \
-             `let … else`, `if let`, `while let`, `for`, a match arm, a `macro_rules!` expansion, \
-             or a closure/`fn` parameter — has to WRITE the name to exist, so all of them land \
-             here even though only the bare-identifier `let` lands on the bound above. Four such \
-             forms were demonstrated compiling with every other check green, one of them a \
-             `transmute` forgery bound through a tuple pattern that reintroduced #5173 in the \
-             emitted object. A comment or doc line that spells the identifier trips this too; \
-             that is a spurious RED, never a silent pass. If you are adding a legitimate mention, \
-             raise the constant deliberately and say why.",
-            mentions.len(),
-        );
     }
+
+    // One row per file that names either coordinate, in walk order. Compared as
+    // a whole list so a file appearing, disappearing or trading a mention with
+    // another file is a red — which a pair of crate totals is not.
+    let tally: Vec<(String, usize, usize)> = tokens
+        .iter()
+        .filter_map(|(file, toks)| {
+            let ifx = shim_token_seq_count(toks, &["ingress_ifindex"]);
+            let queue = shim_token_seq_count(toks, &["rx_queue"]);
+            (ifx + queue > 0).then(|| (file.clone(), ifx, queue))
+        })
+        .collect();
+    let expected: Vec<(String, usize, usize)> = MENTIONS_PER_FILE
+        .iter()
+        .map(|(f, ifx, queue)| ((*f).to_string(), *ifx, *queue))
+        .collect();
+    assert_eq!(
+        tally, expected,
+        "#5173: the shim crate must name `ingress_ifindex` and `rx_queue` exactly this many times \
+         in exactly these files — (file, ingress_ifindex, rx_queue) — but the walk found \
+         {tally:#?} against {expected:#?}.\nThis is the bound that is complete over binding FORMS \
+         written here, and the reason it is a tally rather than a pattern match: a rebinding in \
+         ANY form — a tuple, struct, slice or `Some(..)` pattern, a `let … else`, `if let`, \
+         `while let`, `for`, a match arm, a `macro_rules!` expansion, or a closure/`fn` parameter \
+         — has to WRITE the name to exist, so all of them land here even though only the \
+         bare-identifier `let` lands on the bound above. Four such forms were demonstrated \
+         compiling with every other check green, one of them a `transmute` forgery bound through \
+         a tuple pattern that reintroduced #5173 in the emitted object.\nIt is PER FILE because a \
+         crate total is fungible: a freed mention in one file would pay for a shadow in another. \
+         What it does NOT see is a binding written outside the walk — a proc-macro expansion; the \
+         manifest pin above bounds the route to that, and this test's doc comment carries it as a \
+         residual.\nA comment or doc line that spells either identifier lands here too; that is a \
+         spurious RED, never a silent pass. If you are adding a legitimate mention, move the row \
+         deliberately and say why.",
+    );
 
     // ---- The newtype's compile-time half, tested rather than assumed. -----
     //
