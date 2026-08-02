@@ -798,7 +798,7 @@ SAME authoritative source. The ingress half reads
 `ForwardingState::ifindex_to_zone_id`; the egress half calls
 `ForwardingState::egress_zone_id`, which prefers the denormalized
 `EgressInterface.zone_id` (one map lookup + a field load on the hot path) and
-falls back to `ifindex_own_zone_id` when the interface has **no `egress` row at
+falls back to `ifindex_to_zone_id` when the interface has **no `egress` row at
 all**.
 
 That fallback is load-bearing, not defensive. `forwarding_build::populate_egress`
@@ -818,35 +818,51 @@ to the implicit default policy — pointing every diagnostic at the wrong place.
 
 Scope of the fallback:
 
-- **It reads the interface's OWN zone, never a propagated one (#6722).**
-  `ifindex_to_zone_id` is NOT a pure "this interface's zone" map:
-  `populate_interfaces` also writes a zoned child unit's zone onto
-  `parent_ifindex` when the parent has no entry, because the INGRESS half wants
-  that (a packet arriving on a trunk parent is attributed to its unit's zone,
-  #921/#3618). The egress half must not inherit it. `populate_interfaces`
-  therefore records the own-zone value a second time in `ifindex_own_zone_id`,
-  omitting the propagation, and `egress_zone_id`'s fallback reads that map.
-  Both of its branches then answer the same question — `populate_egress` also
-  derives `EgressInterface.zone_id` from the interface's own `iface.zone`.
+- **An ifindex can carry several logical units, and the fallback resolves the
+  ifindex, not the unit (#6722).** `pkg/dataplane/userspace/interfaces.go`'s
+  `snapshotLinuxName` collapses a non-VLAN unit 0 onto its base netdev, so `st0`
+  and `st0.0` are ONE ifindex, as are `ge-0/0/1` and `ge-0/0/1.0`. And
+  `buildInterfaceZoneMap` (`pkg/dataplane/userspace/zones.go`) writes
+  `out[base]` for a unit-suffixed zone reference, so zoning `st0.1` zones `st0`
+  as well. The consequence, which is a behaviour and not an accident: **a
+  MAC-less unit that shares a base ifindex with a zoned sibling adjudicates
+  under that zone.** Two secure tunnels on one `st0` — `bind-interface st0`
+  (unit 0, addressed and routed, never named in a zone) plus `bind-interface
+  st0.1` (zoned `vpnb`) — put transit out unit 0 in the pair `(lan, vpnb)`, and
+  a `from-zone lan to-zone vpnb permit` applies to it.
 
-  Reading the propagated map instead is a fail-OPEN, and the reachable shape is
-  two secure tunnels on one `st0`: `bind-interface st0` (unit 0, addressed and
-  routed, left in NO zone) plus `bind-interface st0.1` (zoned). Both units are
-  MAC-less so neither has an `egress` row to stop the fallback; unit 1's zone is
-  propagated onto the shared parent ifindex; unit 0 would then adjudicate under
-  unit 1's zone and be PERMITTED by its `from-zone lan to-zone <vpn> permit`,
-  sending traffic out a different IPsec SA than the operator authorised. Note
-  the ingress half is NOT symmetrically exposed: an interface with an empty zone
-  is never an AF_XDP ingress bind target (`pkg/dataplane/userspace/interfaces.go`,
-  `maps_sync.go`, all gated on `iface.Zone == ""`), so the egress side is the
-  only reachable path for this widening.
+  That is defensible because it is the value the INGRESS half has always used
+  for that same ifindex: `ifindex_to_zone_id` is the from-zone source, so a
+  packet arriving on ifindex `st0` is from-zone `vpnb` too. Resolving the egress
+  half through the same map keeps **one ifindex answering one zone in both
+  directions**. Scoping the egress half to a narrower per-interface map — the
+  approach #6722 first attempted — makes egress return the 0 sentinel for an
+  ifindex ingress calls `vpnb`, and 0 matches no exact, wildcard or
+  `junos-global` rule, which is #6713 again for that config.
+
+  Junos zones logical UNITS, so `st0.0` and `st0.1` sharing a zone is a genuine
+  parity gap. Closing it needs per-unit identity end to end — the snapshot's
+  unit-0 ifindex collapse, both halves of the zone resolver, and the AF_XDP bind
+  keying — and is tracked separately rather than papered over at this one read.
+
+  The Rust child→parent zone propagation in `populate_interfaces` is
+  **unreachable for a snapshot the Go builder produces** and is kept only as a
+  helper-boundary backstop: a zoned unit's parent row always arrives already
+  carrying a zone of its own (base rows are emitted before their units), so
+  `ifindex_to_zone_id` has no "propagated but not own" entries to distinguish.
+  `pkg/dataplane/userspace/zone_propagation_6722_test.go` pins both Go-side
+  facts this paragraph rests on, so the userspace-dp fixtures that model these
+  shapes cannot drift back to a snapshot the builder cannot emit.
 - A row that exists carrying `zone_id == 0` still stays 0, so for every ifindex
   that HAS an egress row the resolved to-zone is bit-identical to the pre-#6713
-  read. With the own-zone scoping in place this short-circuit is redundant
-  rather than load-bearing (a genuinely unzoned interface has no own-zone entry
-  either), so the property is defended twice; it is kept because `egress` and
-  `ifindex_own_zone_id` can still diverge under a pathological snapshot in which
-  two interface entries share one ifindex and only one passes the `src_mac` gate.
+  read. That short-circuit is **load-bearing, not defensive**. `populate_egress`
+  is last-write-wins across snapshot rows, so a zoned trunk with a declared but
+  unzoned unit 0 (`ge-0/0/9` zoned `lan`, `ge-0/0/9.0` in no zone, both MAC-ful,
+  both ifindex 90) ends up with `egress[90].zone_id == 0` while
+  `ifindex_to_zone_id[90] == lan`. Deleting the short-circuit changes the
+  adjudicated to-zone of every such interface;
+  `unzoned_interface_with_egress_row_stays_zone_zero_6713` builds exactly that
+  shape and reds on the removal.
 - `egress_zone_id` is the single egress-zone resolver: policy adjudication, the
   #3651 per-zone traffic counter, the filter-log `egress_zone_id` field (both
   the flow-cache-hit path via `filter_log_egress_zone_id` and

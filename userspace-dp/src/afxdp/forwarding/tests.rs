@@ -4932,8 +4932,13 @@ const TEST_VPN_ZONE_ID_6713: u16 = TEST_DMZ_ZONE_ID;
 
 const TUNNEL_IFINDEX_6713: i32 = 42;
 const LAN_IFINDEX_6713: i32 = 24;
-/// MAC-ful, UNZONED physical parent of a zoned VLAN unit — the scoping guard.
-const UNZONED_PARENT_IFINDEX_6713: i32 = 90;
+/// The MAC-ful ifindex a zoned trunk (`ge-0/0/9`) SHARES with its declared but
+/// deliberately unzoned unit 0 — `snapshotLinuxName` collapses a non-VLAN unit
+/// 0 onto the base netdev, so one ifindex carries two snapshot rows and
+/// `populate_egress` (last-write-wins) leaves the unit-0 row's `zone_id == 0`
+/// on it while `ifindex_to_zone_id` carries the trunk's zone. The scoping
+/// guard.
+const TRUNK_UNIT0_IFINDEX_6713: i32 = 90;
 
 /// Policy shape for the #6713 fixture.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5014,18 +5019,39 @@ fn secure_tunnel_snapshot_6713(policy: TunnelPolicy6713) -> ConfigSnapshot {
                 }],
                 ..Default::default()
             },
-            // Scoping control: a MAC-ful physical parent the operator left
-            // UNZONED, carrying a zoned VLAN unit. `populate_interfaces`
-            // propagates the unit's zone onto the parent ifindex, so
-            // `ifindex_to_zone_id` has a non-zero entry for it -- but the
-            // parent DOES have an `egress` row (zone_id 0), and the egress
-            // resolver must keep answering 0 for it.
+            // Scoping control, in the shape the GO BUILDER ACTUALLY EMITS
+            // (#6722 r3 — measured with `buildInterfaceZoneMap` +
+            // `buildInterfaceSnapshots`, see
+            // `pkg/dataplane/userspace/zone_propagation_6722_test.go`):
+            //
+            //   set interfaces ge-0/0/9 unit 0 family inet filter input guard
+            //   set interfaces ge-0/0/9 unit 100 vlan-id 100 family inet address ...
+            //   set security zones security-zone lan interfaces ge-0/0/9.100
+            //
+            // The BASE row arrives carrying `lan` — a unit-suffixed zone
+            // reference writes `out[base]` in Go — and unit 0 collapses onto
+            // the base netdev, so rows 1 and 2 share ifindex 90 and both are
+            // MAC-ful. `populate_egress` is last-write-wins, so the UNZONED
+            // unit-0 row wins and `egress[90].zone_id == 0` while
+            // `ifindex_to_zone_id[90] == lan`. That divergence is what makes
+            // `egress_zone_id`'s `Some(0)` short-circuit load-bearing.
             InterfaceSnapshot {
                 name: "ge-0/0/9".to_string(),
+                zone: "lan".to_string(),
                 linux_name: "ge-0-0-9".to_string(),
-                ifindex: UNZONED_PARENT_IFINDEX_6713,
+                ifindex: TRUNK_UNIT0_IFINDEX_6713,
                 mtu: 1500,
-                unit_count: 1,
+                unit_count: 2,
+                hardware_addr: "02:bf:72:09:00:00".to_string(),
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "ge-0/0/9.0".to_string(),
+                linux_name: "ge-0-0-9".to_string(),
+                parent_linux_name: "ge-0-0-9".to_string(),
+                ifindex: TRUNK_UNIT0_IFINDEX_6713,
+                parent_ifindex: TRUNK_UNIT0_IFINDEX_6713,
+                mtu: 1500,
                 hardware_addr: "02:bf:72:09:00:00".to_string(),
                 ..Default::default()
             },
@@ -5035,7 +5061,7 @@ fn secure_tunnel_snapshot_6713(policy: TunnelPolicy6713) -> ConfigSnapshot {
                 linux_name: "ge-0-0-9.100".to_string(),
                 parent_linux_name: "ge-0-0-9".to_string(),
                 ifindex: 91,
-                parent_ifindex: UNZONED_PARENT_IFINDEX_6713,
+                parent_ifindex: TRUNK_UNIT0_IFINDEX_6713,
                 vlan_id: 100,
                 mtu: 1500,
                 hardware_addr: "02:bf:72:09:00:00".to_string(),
@@ -5268,44 +5294,51 @@ fn secure_tunnel_operator_deny_is_attributed_to_its_rule_6713() {
     );
 }
 
-/// #6713 scoping guard. The fallback fires ONLY when the interface has NO
-/// `egress` row. A MAC-ful interface the operator deliberately left UNZONED
-/// keeps to-zone 0 even though `ifindex_to_zone_id` carries the zone PROPAGATED
-/// onto it from a zoned VLAN unit -- inheriting that would widen the
-/// adjudicated zone pair for ordinary trunks.
+/// #6713 scoping guard, on the shape the GO BUILDER EMITS (#6722 r3). The
+/// fallback fires ONLY when the ifindex has NO `egress` row; an existing row
+/// carrying `zone_id == 0` must stay 0.
 ///
-/// #6722 note on what this now catches. Widening the fallback to also fire on
-/// `Some(0)` -- the mutation this guard was written for -- no longer reds it on
-/// its own, because the fallback reads `ifindex_own_zone_id` and a genuinely
-/// unzoned interface has no entry there either. That is the fix strengthening
-/// the property, not coverage lost: it takes the FULL widening (fire on
-/// `Some(0)` AND re-point the fallback at the propagated `ifindex_to_zone_id`)
-/// to red this test, and either half alone is caught by
-/// `unzoned_macless_unit_cannot_inherit_a_sibling_zone_6722`, which covers the
-/// MAC-LESS half of the same domain -- the half that has no `egress` row to
-/// stop the fallback in the first place.
+/// The producible divergence is a zoned trunk with a declared-but-unzoned unit
+/// 0. Unit 0 collapses onto the base netdev, so `egress[90]` (last-write-wins,
+/// unit-0 row) carries 0 while `ifindex_to_zone_id[90]` carries the trunk's
+/// `lan`. Delete the `Some(0)` short-circuit and the fallback fires on that
+/// row, changing the adjudicated to-zone of every such interface from 0 to
+/// `lan` -- this test reds on the LONE mutation.
+///
+/// The pre-r3 fixture instead built an UNZONED physical parent carrying a
+/// zoned VLAN unit. That snapshot does not occur: `buildInterfaceZoneMap`
+/// writes `out[base]` for a unit-suffixed zone reference, so the parent row
+/// always arrives zoned (measured in
+/// `pkg/dataplane/userspace/zone_propagation_6722_test.go`). The guard was
+/// green on an impossible shape and stopped binding the short-circuit.
 #[test]
 fn unzoned_interface_with_egress_row_stays_zone_zero_6713() {
     let state = build_forwarding_state(&secure_tunnel_snapshot_6713(
         TunnelPolicy6713::PermitLanToVpn,
     ));
 
-    assert!(
-        state.egress.contains_key(&UNZONED_PARENT_IFINDEX_6713),
-        "precondition: the MAC-ful unzoned parent DOES have an egress row"
+    assert_eq!(
+        state
+            .egress
+            .get(&TRUNK_UNIT0_IFINDEX_6713)
+            .map(|iface| iface.zone_id),
+        Some(0),
+        "precondition: the shared ifindex HAS an egress row and the unzoned unit-0 \
+         row won it, so the row carries zone_id 0"
     );
     assert_eq!(
         state
             .ifindex_to_zone_id
-            .get(&UNZONED_PARENT_IFINDEX_6713)
+            .get(&TRUNK_UNIT0_IFINDEX_6713)
             .copied()
             .unwrap_or(0),
         TEST_LAN_ZONE_ID,
-        "precondition: its child's zone IS propagated onto it in ifindex_to_zone_id -- \
-         without that this test cannot detect an over-firing fallback"
+        "precondition: the SAME ifindex resolves the trunk's zone in \
+         ifindex_to_zone_id -- without that divergence this test cannot detect an \
+         over-firing fallback"
     );
 
-    let (_, to_id) = zone_pair_ids_for_flow(&state, LAN_IFINDEX_6713, UNZONED_PARENT_IFINDEX_6713);
+    let (_, to_id) = zone_pair_ids_for_flow(&state, LAN_IFINDEX_6713, TRUNK_UNIT0_IFINDEX_6713);
     assert_eq!(
         to_id, 0,
         "an interface with an egress row carrying zone_id 0 must stay 0"
@@ -5313,25 +5346,33 @@ fn unzoned_interface_with_egress_row_stays_zone_zero_6713() {
 }
 
 // ---------------------------------------------------------------------------
-// #6722: the #6713 fallback must resolve the interface's OWN zone, never a
-// zone PROPAGATED onto its ifindex from a zoned sibling unit.
+// #6722: what a MAC-less unit that SHARES a base ifindex with a zoned sibling
+// resolves to.
 //
-// `populate_interfaces` writes a zoned child's zone onto `parent_ifindex` when
-// the parent has no entry of its own, so `ifindex_to_zone_id` is NOT a pure
-// "this interface's zone" map. For a MAC-FUL parent that propagation is
-// harmless to the egress resolver -- the parent has an `egress` row carrying 0,
-// so the fallback never fires (`unzoned_interface_with_egress_row_stays_zone_zero_6713`).
-// A MAC-LESS parent has no row, so reading the propagated map would hand an
-// interface the operator left in NO zone its sibling's zone, and the sibling's
-// `permit` would then match transit that must be denied.
+// Two secure tunnels on one `st0` with a zone on unit 1 only. `st0.0` collapses
+// onto the `st0` base netdev, and the Go builder emits that BASE row carrying
+// unit 1's zone (`buildInterfaceZoneMap` writes `out[base]` for a
+// unit-suffixed zone reference). So `ifindex_to_zone_id[42] == vpnb` comes from
+// the base row's own entry -- the Rust child->parent propagation in
+// `populate_interfaces` never even fires for it.
+//
+// Transit routed out `st0.0` therefore adjudicates `(lan, vpnb)`. That is the
+// shipped behaviour, chosen deliberately: the INGRESS half has always resolved
+// ifindex 42 to `vpnb`, so scoping only the egress half to a narrower map would
+// make one ifindex answer two different zones depending on direction -- and the
+// narrower answer is the 0 sentinel, which matches no rule at all (#6713).
+//
+// Junos zones logical UNITS, so `st0.0` and `st0.1` sharing a zone here is a
+// real parity gap. It needs per-unit identity end to end (the snapshot's unit-0
+// ifindex collapse included) and is tracked separately.
 // ---------------------------------------------------------------------------
 
-/// The zone the SIBLING tunnel unit is in. Distinct from `lan`; the unzoned
-/// unit under test must never resolve to it.
+/// The zone the operator put on tunnel unit 1. Distinct from `lan`.
 const TEST_SIBLING_VPN_ZONE_ID_6722: u16 = TEST_DMZ_ZONE_ID;
 /// `st0` base AND `st0.0` -- one xfrmi netdev, so `snapshotLinuxName` maps unit
-/// 0 back onto the base name and both share this ifindex. UNZONED.
-const UNZONED_TUNNEL_IFINDEX_6722: i32 = 42;
+/// 0 back onto the base name and both share this ifindex. The operator zoned
+/// only unit 1; the BASE row still arrives carrying that zone (Go propagation).
+const SHARED_TUNNEL_IFINDEX_6722: i32 = 42;
 /// `st0.1` -- its own xfrmi netdev (`bind-interface st0.1`), zoned.
 const ZONED_TUNNEL_IFINDEX_6722: i32 = 43;
 
@@ -5340,7 +5381,7 @@ const ZONED_TUNNEL_IFINDEX_6722: i32 = 43;
 /// `bind-interface st0.1` are distinct netdevs. The operator zones ONLY unit 1:
 ///
 /// ```text
-/// set interfaces st0 unit 0 family inet address 10.5.5.1/30    # NO zone
+/// set interfaces st0 unit 0 family inet address 10.5.5.1/30    # no zone REF
 /// set interfaces st0 unit 1 family inet address 10.6.6.1/30
 /// set security zones security-zone vpnb interfaces st0.1       # unit 1 only
 /// set routing-options static route 192.168.99.0/24 next-hop 10.5.5.2  # -> unit 0
@@ -5349,10 +5390,16 @@ const ZONED_TUNNEL_IFINDEX_6722: i32 = 43;
 /// set security policies default-policy deny-all
 /// ```
 ///
+/// The row shapes below are MEASURED, not assumed --
+/// `pkg/dataplane/userspace/zone_propagation_6722_test.go` runs
+/// `buildInterfaceZoneMap` + `buildInterfaceSnapshots` on exactly this config
+/// and pins them. In particular the `st0` BASE row carries `zone = "vpnb"`:
+/// zoning `st0.1` zones `st0` too. An earlier revision of this fixture left the
+/// base row unzoned, which the builder never emits, and every conclusion drawn
+/// from it was wrong.
+///
 /// Both units are MAC-less, so NEITHER gets a `state.egress` row and the
-/// #6713 fallback is the only thing resolving either to-zone. Unit 1 must
-/// resolve `vpnb` (#6713) and unit 0 must stay 0 (#6722) -- the two properties
-/// this fixture holds together.
+/// #6713 fallback is the only thing resolving either to-zone.
 fn sibling_tunnel_units_snapshot_6722() -> ConfigSnapshot {
     ConfigSnapshot {
         zones: vec![
@@ -5382,23 +5429,29 @@ fn sibling_tunnel_units_snapshot_6722() -> ConfigSnapshot {
                 }],
                 ..Default::default()
             },
-            // st0 base: no zone, MAC-less. Real Junos zones the UNIT, so the
-            // base is unzoned in the deployed shape whether or not unit 0 is.
+            // st0 base: MAC-less, and ZONED `vpnb` -- not because the operator
+            // referenced it, but because `buildInterfaceZoneMap` writes
+            // `out["st0"]` when the zone reference is `st0.1`. This is the row
+            // that puts `vpnb` on ifindex 42.
             InterfaceSnapshot {
                 name: "st0".to_string(),
+                zone: "vpnb".to_string(),
                 linux_name: "st0".to_string(),
-                ifindex: UNZONED_TUNNEL_IFINDEX_6722,
+                ifindex: SHARED_TUNNEL_IFINDEX_6722,
                 mtu: 1400,
                 unit_count: 2,
                 ..Default::default()
             },
-            // st0.0: addressed and ROUTED but deliberately left in no zone.
+            // st0.0: addressed and ROUTED, carrying no zone of its own, sharing
+            // the base's ifindex. Emitted AFTER the base row, and with an empty
+            // zone it makes no zone insert at all -- it cannot displace the
+            // base's `vpnb` on ifindex 42.
             InterfaceSnapshot {
                 name: "st0.0".to_string(),
                 linux_name: "st0".to_string(),
                 parent_linux_name: "st0".to_string(),
-                ifindex: UNZONED_TUNNEL_IFINDEX_6722,
-                parent_ifindex: UNZONED_TUNNEL_IFINDEX_6722,
+                ifindex: SHARED_TUNNEL_IFINDEX_6722,
+                parent_ifindex: SHARED_TUNNEL_IFINDEX_6722,
                 mtu: 1400,
                 addresses: vec![InterfaceAddressSnapshot {
                     family: "inet".to_string(),
@@ -5408,14 +5461,13 @@ fn sibling_tunnel_units_snapshot_6722() -> ConfigSnapshot {
                 ..Default::default()
             },
             // st0.1: zoned `vpnb`, own netdev, parent = the shared st0 base.
-            // Its zone is what `populate_interfaces` propagates onto ifindex 42.
             InterfaceSnapshot {
                 name: "st0.1".to_string(),
                 zone: "vpnb".to_string(),
                 linux_name: "st0.1".to_string(),
                 parent_linux_name: "st0".to_string(),
                 ifindex: ZONED_TUNNEL_IFINDEX_6722,
-                parent_ifindex: UNZONED_TUNNEL_IFINDEX_6722,
+                parent_ifindex: SHARED_TUNNEL_IFINDEX_6722,
                 mtu: 1400,
                 addresses: vec![InterfaceAddressSnapshot {
                     family: "inet".to_string(),
@@ -5501,69 +5553,72 @@ fn adjudicate_lan_transit_6722(
     (to_id, result)
 }
 
-/// #6722 core, fail-on-revert. Transit routed out the UNZONED MAC-less unit
-/// must adjudicate against `(lan, 0)` and be DENIED by the implicit default
-/// policy. Point the fallback at `ifindex_to_zone_id` (the pre-#6722 read) and
-/// the unit inherits `vpnb` from its sibling, the operator's
-/// `from-zone lan to-zone vpnb permit` matches, and this goes RED on the
-/// zone id, the action AND the policy id.
+/// #6722, the DIRECTIONAL COHERENCE property that makes the shipped behaviour
+/// defensible. One ifindex must answer ONE zone: whatever `st0`'s shared
+/// ifindex resolves to as an INGRESS from-zone, it must also resolve to as an
+/// EGRESS to-zone. Both halves read `ifindex_to_zone_id` (the egress half via
+/// `egress_zone_id`'s fallback, since a MAC-less xfrmi has no `egress` row), so
+/// they agree by construction -- and this test is what makes that construction
+/// deliberate rather than incidental.
 ///
-/// The permit matching here is a real forwarding change, not a logging one:
-/// the disposition is `MissingNeighbor`, and a PERMIT on that disposition is
-/// `is_slow_path_eligible` -> reinjected to the kernel, while a DENY breaks to
-/// `RecycleAndContinue`.
+/// Scoping the egress half to a narrower per-interface map (the round-2 attempt
+/// at this PR) reds the second assertion below: egress would answer 0 for
+/// ifindex 42 while ingress kept answering `vpnb`. Since zone 0 matches no
+/// exact, wildcard or `junos-global` rule, that narrower answer is #6713 all
+/// over again for this config.
+///
+/// NOT a fail-open guard, and it is not claimed as one. The `(lan, vpnb)`
+/// verdict asserted here is what a zoned sibling on a shared ifindex produces;
+/// per-unit zoning is a separate parity gap.
 #[test]
-fn unzoned_macless_unit_cannot_inherit_a_sibling_zone_6722() {
+fn macless_unit_on_a_shared_ifindex_resolves_one_zone_both_directions_6722() {
     let state = build_forwarding_state(&sibling_tunnel_units_snapshot_6722());
 
     assert!(
-        !state.egress.contains_key(&UNZONED_TUNNEL_IFINDEX_6722),
-        "precondition: the MAC-less unzoned unit must have NO egress row -- without \
-         that the #6713 fallback never fires and this test cannot detect the widening"
+        !state.egress.contains_key(&SHARED_TUNNEL_IFINDEX_6722),
+        "precondition: the MAC-less unit must have NO egress row -- without that the \
+         #6713 fallback never fires and the two halves cannot be compared"
     );
+
+    // Ingress half, read the way the from-zone source is read.
+    let ingress_zone = state
+        .ifindex_to_zone_id
+        .get(&SHARED_TUNNEL_IFINDEX_6722)
+        .copied()
+        .unwrap_or(0);
     assert_eq!(
-        state
-            .ifindex_to_zone_id
-            .get(&UNZONED_TUNNEL_IFINDEX_6722)
-            .copied(),
-        Some(TEST_SIBLING_VPN_ZONE_ID_6722),
-        "precondition: the sibling's zone IS propagated onto the unzoned unit's \
-         ifindex in ifindex_to_zone_id -- that propagation is exactly what the \
-         egress resolver must refuse to inherit"
+        ingress_zone, TEST_SIBLING_VPN_ZONE_ID_6722,
+        "precondition: the shared ifindex is from-zone `vpnb` on ingress -- the Go \
+         builder zones the `st0` base row when the operator zones `st0.1`"
     );
 
     let (to_id, result) =
-        adjudicate_lan_transit_6722(&state, "192.168.99.7", UNZONED_TUNNEL_IFINDEX_6722);
+        adjudicate_lan_transit_6722(&state, "192.168.99.7", SHARED_TUNNEL_IFINDEX_6722);
 
     assert_eq!(
-        to_id, 0,
-        "an interface the operator left in NO zone must resolve to the 0 'unknown' \
-         sentinel, not to the zone propagated from its zoned sibling unit"
+        to_id, ingress_zone,
+        "one ifindex, one zone: the egress half must resolve exactly what the \
+         ingress half resolves for the same ifindex"
     );
     assert_eq!(
         result.action,
-        PolicyAction::Deny,
-        "the only permit is scoped to (lan, vpnb) and this interface is in no zone; \
-         the default-DENY policy must deny"
+        PolicyAction::Permit,
+        "adjudicating (lan, vpnb), the operator's permit applies"
     );
-    assert_eq!(
+    assert_ne!(
         result.policy_id,
         crate::policy::DEFAULT_POLICY_SENTINEL_ID,
-        "the deny must be attributed to the implicit default policy -- an operator \
-         rule id here means the sibling's permit matched"
+        "the verdict must come from the operator's rule, not the default policy"
     );
 }
 
-/// #6713 in the DEPLOYED shape, and the other half of the #6722 pair. Real
-/// Junos zones the UNIT (`set security zones security-zone vpnb interfaces
-/// st0.1`), never the base, so the zone reaching the egress resolver comes from
-/// the unit's own entry. This tunnel is MAC-less exactly like the unzoned one
-/// above -- the ONLY difference is that the operator put it in a zone -- and it
-/// must still reach the policy plane and be permitted.
-///
-/// Scoping the #6722 fix too tightly (for example recording only the physical
-/// base's zone) reintroduces #6713 here: to-zone collapses to 0 and the
-/// operator's permit stops matching.
+/// #6713 in the DEPLOYED spelling. Real Junos zones the UNIT
+/// (`set security zones security-zone vpnb interfaces st0.1`), never the base,
+/// and `st0.1` has its OWN netdev/ifindex -- so unlike the shared-ifindex case
+/// above, the zone reaching the egress resolver here is unambiguously the one
+/// the operator referenced. It is MAC-less, so the #6713 fallback is the only
+/// thing that can resolve it, and it must reach the policy plane and be
+/// permitted.
 #[test]
 fn zoned_macless_unit_still_reaches_policy_6713() {
     let state = build_forwarding_state(&sibling_tunnel_units_snapshot_6722());
@@ -5598,3 +5653,4 @@ fn zoned_macless_unit_still_reaches_policy_6713() {
     assert_eq!(from_zone, "lan");
     assert_eq!(to_zone, "vpnb");
 }
+

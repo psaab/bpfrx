@@ -133,19 +133,6 @@ pub(in crate::afxdp) struct ForwardingState {
     /// read u16 directly; slow-path display sites translate via
     /// `zone_id_to_name`. Unknown / dropped zones map to `0`.
     pub(in crate::afxdp) ifindex_to_zone_id: FastMap<i32, u16>,
-    /// #6722: ifindex → the zone ID configured on THAT interface, with the
-    /// parent propagation of `ifindex_to_zone_id` deliberately omitted. Built
-    /// at the same site (`forwarding_build::interfaces::populate_interfaces`)
-    /// from the same validated `zone_name_to_id` lookup, so an entry here is
-    /// always identical to `ifindex_to_zone_id`'s — this map simply has FEWER
-    /// entries: it never records the zone a zoned child unit propagates onto
-    /// its parent's ifindex.
-    ///
-    /// The ingress half wants the propagated value (a packet arriving on a
-    /// trunk parent with no zone of its own is attributed to its unit's zone,
-    /// #921/#3618), so `ifindex_to_zone_id` stays the from-zone source. The
-    /// EGRESS half must not inherit it: see `egress_zone_id`, the only reader.
-    pub(in crate::afxdp) ifindex_own_zone_id: FastMap<i32, u16>,
     pub(in crate::afxdp) zone_name_to_id: FastMap<String, u16>,
     pub(in crate::afxdp) zone_id_to_name: FastMap<u16, String>,
     /// #6458: zone ID → deduplicated redundancy-group IDs (> 0) of the
@@ -527,34 +514,53 @@ impl ForwardingState {
     /// no operator-authored permit could ever apply to LAN->tunnel transit and
     /// every packet fell to the default policy.
     ///
-    /// #6722: the fallback reads `ifindex_own_zone_id` — the zone configured on
-    /// THAT interface — and NOT `ifindex_to_zone_id`, which additionally
-    /// carries the zone PROPAGATED from a zoned child unit onto its parent's
-    /// ifindex. Both branches therefore answer the same question ("what zone
-    /// did the operator put THIS interface in"): `populate_egress` also derives
-    /// `EgressInterface.zone_id` from the interface's own `iface.zone` and
-    /// never from a propagation.
+    /// #6722, WHAT THE FALLBACK RESOLVES FOR A SHARED IFINDEX. Several logical
+    /// units can share ONE ifindex — `pkg/dataplane/userspace/interfaces.go`'s
+    /// `snapshotLinuxName` collapses a non-VLAN unit 0 onto its base netdev, so
+    /// `st0` and `st0.0` are one ifindex, as are `ge-0/0/1` and `ge-0/0/1.0`.
+    /// `ifindex_to_zone_id` is therefore a per-NETDEV map, not a per-unit one,
+    /// and it additionally carries the zone `populate_interfaces` propagates
+    /// from a zoned child unit onto `parent_ifindex`.
     ///
-    /// Reading the propagated map here would let an interface the operator
-    /// deliberately left UNZONED adjudicate — and be PERMITTED — under a zoned
-    /// SIBLING's policy. Two secure tunnels on one `st0` (`bind-interface st0`
-    /// plus `bind-interface st0.1`) with unit 0 addressed and routed but left
-    /// out of every zone is the reachable shape: unit 1 propagates its zone
-    /// onto the shared parent ifindex, unit 0 is MAC-less so it has no `egress`
-    /// row to stop the fallback, and a `from-zone lan to-zone <unit 1's zone>
-    /// permit` then matches transit that master denied. Scoping to the own-zone
-    /// map keeps an unzoned interface at 0 whether or not it has an `egress`
-    /// row, which is the property the guards assert.
+    /// The consequence, stated plainly because it IS a behaviour and not an
+    /// accident: **a MAC-less unit that shares a base ifindex with a zoned
+    /// sibling adjudicates under the base row's zone.** Zone only `st0.1` and
+    /// the Go builder still emits the `st0` BASE row carrying that zone
+    /// (`buildInterfaceZoneMap`, `pkg/dataplane/userspace/zones.go` — a
+    /// unit-suffixed zone reference writes `out[base]` as well), and unit 0
+    /// shares the base's ifindex. Transit routed out `st0.0` is adjudicated
+    /// `(from, vpnb)`, not `(from, 0)`.
     ///
-    /// A row that exists and carries `zone_id == 0` is still left at 0, so for
-    /// every ifindex that HAS an egress row this remains bit-identical to the
-    /// pre-#6713 read; only the MAC-less-interface hole is closed.
+    /// That is defensible precisely because it is the value the INGRESS half
+    /// has always used for that same ifindex: a packet arriving on ifindex
+    /// `st0` is from-zone `vpnb` (`ifindex_to_zone_id`, the from-zone source),
+    /// so resolving the egress half through the same map keeps one ifindex
+    /// answering one zone in both directions. Scoping the egress half to a
+    /// narrower "own zone" map would make egress return the 0 sentinel for an
+    /// ifindex ingress calls `vpnb` — and 0 refuses to match ANY rule, which is
+    /// #6713 again for that config.
+    ///
+    /// Junos zones LOGICAL UNITS, so `st0.0` and `st0.1` being one zone here is
+    /// a genuine parity gap. Closing it needs per-unit identity end to end (the
+    /// snapshot's unit-0 ifindex collapse, both halves of the zone resolver, and
+    /// the AF_XDP bind keying) — it is tracked separately and deliberately NOT
+    /// papered over at this single read.
+    ///
+    /// A row that exists and carries `zone_id == 0` is still left at 0, and that
+    /// short-circuit is LOAD-BEARING, not defensive: `populate_egress` is
+    /// last-write-wins across snapshot rows, so for a zoned trunk with a
+    /// declared-but-unzoned unit 0 (`ge-0/0/1` zoned, `ge-0/0/1.0` in no zone,
+    /// both MAC-ful, both ifindex 10) the unit-0 row wins and `egress[10]`
+    /// carries 0 while `ifindex_to_zone_id[10]` carries the trunk's zone.
+    /// Deleting the short-circuit changes the adjudicated to-zone of every such
+    /// interface. `unzoned_interface_with_egress_row_stays_zone_zero_6713`
+    /// builds exactly that shape and reds on its removal.
     #[inline]
     pub(in crate::afxdp) fn egress_zone_id(&self, egress_ifindex: i32) -> u16 {
         self.egress
             .get(&egress_ifindex)
             .map(|iface| iface.zone_id)
-            .or_else(|| self.ifindex_own_zone_id.get(&egress_ifindex).copied())
+            .or_else(|| self.ifindex_to_zone_id.get(&egress_ifindex).copied())
             .unwrap_or(0)
     }
 

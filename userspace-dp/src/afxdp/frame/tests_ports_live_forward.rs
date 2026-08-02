@@ -953,7 +953,7 @@ fn build_live_forward_request_emits_output_filter_log_event() {
 }
 
 
-/// #6713/#6722 binding for `forward_request.rs`'s OWN `egress_zone_id` call.
+/// #6713 binding for `forward_request.rs`'s OWN `egress_zone_id` call.
 ///
 /// `build_live_forward_request` resolves the filter-log egress zone with a
 /// SECOND, independent call to the shared resolver -- it does not go through
@@ -964,10 +964,16 @@ fn build_live_forward_request_emits_output_filter_log_event() {
 ///
 /// Same topology as that test, with ONE difference: the egress interface is
 /// MAC-less (an IPsec xfrmi), so `populate_egress`'s `src_mac` gate leaves it
-/// with NO `state.egress` row and the zone can only come from the ifindex maps.
-/// The emitted event must still carry the tunnel's real zone. A third ifindex
-/// carrying only a PROPAGATED sibling zone is asserted to log 0 by
-/// `poll_descriptor::filter::filter_log_egress_zone_tests`.
+/// with NO `state.egress` row and the zone can only come from
+/// `ifindex_to_zone_id`. The emitted event must still carry the tunnel's real
+/// zone.
+///
+/// FIXTURE SCAFFOLDING, do not read as the invariant: the hand-built
+/// `ForwardingResolution` below carries `src_mac: Some(..)`, which the real
+/// `session_glue::populate_egress_resolution` would leave `None` for a row-less
+/// interface. It is the house style for every fixture in this file, the field
+/// is not on the path under test, and the assertion this test makes is the
+/// logged `egress_zone_id`.
 #[test]
 fn build_live_forward_request_logs_a_macless_egress_zone_6713() {
     let src_ip = Ipv4Addr::new(10, 0, 0, 1);
@@ -1022,11 +1028,10 @@ fn build_live_forward_request_logs_a_macless_egress_zone_6713() {
         ..ForwardingState::default()
     };
     forwarding.ifindex_to_zone_id.insert(10, TEST_LAN_ZONE_ID);
-    // The MAC-less tunnel: zoned in BOTH ifindex maps (what
+    // The MAC-less tunnel: zoned in `ifindex_to_zone_id` (what
     // `populate_interfaces` writes) and deliberately absent from `egress`
     // (what `populate_egress`'s `src_mac` gate does to an xfrmi).
     forwarding.ifindex_to_zone_id.insert(12, TEST_WAN_ZONE_ID);
-    forwarding.ifindex_own_zone_id.insert(12, TEST_WAN_ZONE_ID);
     assert!(
         !forwarding.egress.contains_key(&12),
         "precondition: the MAC-less egress interface must have NO egress row"

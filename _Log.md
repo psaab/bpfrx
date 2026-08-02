@@ -66302,8 +66302,11 @@ break — `go vet` confirmed passing under every revert.
   docs/userspace-dataplane-architecture.md, _Log.md
 
 - **Timestamp**: 2026-08-01
-- **Action**: #6722 fold — scope the #6713 egress-zone fallback to the
-  interface's OWN zone (MAJOR fail-open), bind the two unguarded call sites,
+- **Action**: #6722 fold — **SUPERSEDED IN PART by the 2026-08-01 r3 entry
+  below: the `ifindex_own_zone_id` map this entry describes was built on a false
+  premise and has been deleted. The call-site bindings and the `tunnel.rs` sweep
+  stand.** Kept as the record of what was attempted. Scope the #6713 egress-zone
+  fallback to the interface's OWN zone, bind the two unguarded call sites,
   sweep the last open-coded reader.
   The #6713 fallback read `ifindex_to_zone_id`, which is NOT a pure
   "this interface's zone" map: `populate_interfaces` also propagates a zoned
@@ -66313,10 +66316,14 @@ break — `go vet` confirmed passing under every revert.
   MAC-FUL half of the domain — a MAC-ful parent HAS a row carrying 0, so the
   fallback never fires. A MAC-LESS parent has NO row, so the propagated zone
   WAS inherited, which is exactly the widening the claim said was prevented.
-  Reachable shape: two secure tunnels on one `st0` (`bind-interface st0` +
+  Shape used: two secure tunnels on one `st0` (`bind-interface st0` +
   `bind-interface st0.1`, both legal per `pkg/config/xfrmi.go`) with unit 0
-  addressed and routed but deliberately left in no zone. Reproduced through the
-  real `build_forwarding_state` -> real FIB -> real policy evaluator: the
+  addressed and routed but deliberately left in no zone. **The r3 entry records
+  why this was wrong: the config is reachable, but the SNAPSHOT the fix keyed on
+  is not — the Go builder emits the `st0` BASE row already carrying `vpnb`, so
+  the two maps are identical on every producible input and this fix was inert at
+  runtime.** Reproduced through the real `build_forwarding_state` -> real FIB ->
+  real policy evaluator using a hand-built snapshot: the
   unzoned unit resolved to-zone 7 (its sibling's `vpnb`), the operator's
   `from-zone lan to-zone vpnb permit` MATCHED with `policy_id = 0` (a real rule
   index, not `DEFAULT_POLICY_SENTINEL_ID`), and the `MissingNeighbor`
@@ -66362,4 +66369,116 @@ break — `go vet` confirmed passing under every revert.
   userspace-dp/src/afxdp/forwarding/tests.rs,
   userspace-dp/src/afxdp/poll_descriptor/filter.rs,
   userspace-dp/src/afxdp/frame/tests_ports_live_forward.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-01 21:05
+- **Action**: #6722 round 3 — delete `ifindex_own_zone_id`; the round-2 fix was
+  INERT and its premise was false. Round 2 read "the interface's own zone" from
+  `InterfaceSnapshot.zone`, but that field is `zoneByInterface[name]` and
+  `buildInterfaceZoneMap` (`pkg/dataplane/userspace/zones.go`) has ALREADY
+  propagated in Go: a unit-suffixed zone reference writes `out[base]` as well.
+  Combined with `snapshotLinuxName`'s non-VLAN-unit-0 collapse
+  (`pkg/dataplane/userspace/interfaces.go`), the base row and `st0.0` share one
+  ifindex, so a zone the operator put on `st0.1` lands on the very ifindex unit
+  0 forwards out of. Measured firsthand with `buildInterfaceZoneMap` +
+  `buildInterfaceSnapshots` on the fixture's own config (`buildLinkSnapshot` is
+  a package var for exactly this): `snap name="st0" ifindex=42 zone="vpnb"`.
+  The round-2 Rust fixture gave that base row NO zone — a snapshot the builder
+  never emits — and the general case follows: a propagation can only add an
+  entry for `parent_ifindex(U)`, which IS the base row's ifindex, and the base
+  row's own `Zone` is non-empty in both zone-ref spellings, so
+  `ifindex_own_zone_id` and `ifindex_to_zone_id` are the SAME map on every
+  producible snapshot. The Rust child→parent propagation in
+  `populate_interfaces` is likewise unreachable for a Go-produced snapshot; it
+  stays as a helper-boundary backstop with a comment saying so.
+  Resolution: ACCEPT the propagated behaviour rather than carry an
+  own-vs-inherited flag across the Go→Rust boundary. The ingress half already
+  resolves ifindex 42 to `vpnb` (`ifindex_to_zone_id` is the from-zone source),
+  so scoping only the egress half would make ONE ifindex answer two zones by
+  direction — and the narrower answer is the 0 sentinel, which matches no exact,
+  wildcard or `junos-global` rule, i.e. #6713 again for that config. Junos zones
+  logical UNITS, so `st0.0` and `st0.1` sharing a zone is a real parity gap; it
+  needs per-unit identity end to end (the unit-0 ifindex collapse included) and
+  is filed separately rather than papered over at this one read.
+  Deleted: the `ifindex_own_zone_id` field, its insert, and the two #6722
+  guards; fallback re-pointed at `ifindex_to_zone_id`. Every claim the round-2
+  code comment, architecture doc and `_Log.md` entry made about "own vs
+  propagated" is corrected, including the falsified "the ingress half is NOT
+  symmetrically exposed" argument.
+  Also corrected, and this one was a live coverage hole: the round-2 sentence
+  calling `egress_zone_id`'s `Some(0)` short-circuit "redundant rather than
+  load-bearing" is wrong. `populate_egress` is last-write-wins across snapshot
+  rows, so a zoned trunk with a declared-but-unzoned unit 0 (`ge-0/0/9` zoned
+  `lan`, `ge-0/0/9.0` in no zone, both MAC-ful, both ifindex 90) gets
+  `egress[90].zone_id == 0` while `ifindex_to_zone_id[90] == lan` — the
+  short-circuit is the ONLY thing holding the to-zone at 0. The preserved
+  `unzoned_interface_with_egress_row_stays_zone_zero_6713` had been modelling an
+  UNZONED physical parent carrying a zoned VLAN unit, which the builder never
+  emits (its parent row arrives zoned), so it was green on an impossible shape
+  and had stopped binding the short-circuit. Re-pointed at the producible shape;
+  it now reds on the LONE `Some(0)` widening again.
+  New Go guard `pkg/dataplane/userspace/zone_propagation_6722_test.go` pins the
+  two cross-boundary facts the Rust fixtures encode — a unit-suffixed zone
+  reference zones the base row, and a non-VLAN unit 0 shares the base ifindex —
+  so a userspace-dp fixture cannot drift back to a snapshot the builder cannot
+  produce. That drift is what cost rounds 1 and 2.
+  Validation. Seven mutations, each applied ALONE against a sha256-verified
+  pristine baseline, with `cargo build --release --bins --tests` asserted rc 0
+  BEFORE the test run so a build break cannot be misread as a red. Rust rows run
+  `-- --test-threads=1`. Six tests reach the resolver through the real
+  `build_forwarding_state` from a `ConfigSnapshot`; two others hand-build a
+  `ForwardingState` directly, and that distinction is what several rows turn on.
+
+  - M-A widen the `egress` branch to fire on `Some(0)` (delete the
+    short-circuit) — build rc 0, **1 RED**:
+    `unzoned_interface_with_egress_row_stays_zone_zero_6713`. This is the
+    round-2 coverage hole closed: that guard had stopped firing on the lone
+    mutation because it modelled an impossible snapshot.
+  - M-B delete the fallback entirely (undo #6713) — build rc 0, **7 RED**: five
+    of the six real-builder guards (the sixth,
+    `unzoned_interface_with_egress_row_stays_zone_zero_6713`, correctly stays
+    green — it asserts the egress row's 0 survives) plus both hand-built
+    log-site tests.
+  - M-C `filter_log_egress_zone_id` body → `egress`-only — build rc 0, **1 RED**:
+    `filter_log_egress_zone_id_reports_a_macless_tunnels_zone_6713`.
+  - M-D `forward_request.rs`'s own call → `egress`-only — build rc 0, **1 RED**:
+    `build_live_forward_request_logs_a_macless_egress_zone_6713`. M-C and M-D do
+    not red each other's test, so the two call sites remain independently bound.
+  - M-E restore round-2's own-zone scoping VERBATIM (both files at `204b8830b`)
+    — build rc 0, **2 RED**, and this row IS the finding: the only reds are the
+    two hand-built fixtures, which no longer populate the map that code reads.
+    All SIX tests routed through the real `build_forwarding_state` stayed GREEN.
+    Round 2's fix changed nothing on any producible snapshot — measured, not
+    argued.
+  - M-F (Go) drop `out[base] = zoneName` in `buildInterfaceZoneMap` — build rc 0,
+    **3 RED**: both new #6722 Go guards plus the PRE-EXISTING
+    `TestHostInboundVlanUnit0KeepsBaseAddress_5699`. Stated without
+    overclaiming: the new guards are not the only thing holding that Go write;
+    what they add is pinning the two specific facts the Rust reasoning rests on.
+  - M-G option-(a) semantics — an own-zone map that ACTUALLY excludes a base
+    row's inherited zone (populated only from unit rows), fallback pointed at it
+    — build rc 0, **3 RED**: the coherence test
+    `macless_unit_on_a_shared_ifindex_resolves_one_zone_both_directions_6722`
+    plus the same two hand-built fixtures. The other five real-builder tests
+    stay green, so the coherence test binds the option-(a) direction and nothing
+    else does.
+
+  Flake attributed firsthand: an earlier interrupted run of M-C was 2 RED,
+  the extra being
+  `afxdp::wg::engine::engine_internal_tests::install_session_serializes_with_reconcile_removal`.
+  The clean re-run of the SAME mutation under the same `--test-threads=1` is
+  1 RED with no wg test, and it was green in the baseline and every other row —
+  a load-sensitive flake (#6657 family), not an M-C effect.
+
+  #6713 itself is NOT re-broken: the plain `bind-interface st0` matrix (2 zone-ref
+  spellings x 3 next-hops x 2 destinations x 3 policy shapes = 36 cells) run
+  through the real snapshot -> `build_forwarding_state` -> FIB -> policy chain
+  shows `permitted_dropped=0/12` with every permitted cell resolving
+  `from=lan to=vpn` under an operator rule id, and `control_denied=24/24`.
+- **File(s)**: userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/filter.rs,
+  userspace-dp/src/afxdp/frame/tests_ports_live_forward.rs,
+  pkg/dataplane/userspace/zone_propagation_6722_test.go,
   docs/userspace-dataplane-architecture.md, _Log.md

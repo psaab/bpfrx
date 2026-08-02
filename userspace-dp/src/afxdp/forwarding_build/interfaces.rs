@@ -4,8 +4,6 @@
 //!
 //! 1. [`populate_interfaces`] — walks `snapshot.interfaces`,
 //!    populates `state.ifindex_to_*`, `state.ifindex_to_zone_id`,
-//!    `state.ifindex_own_zone_id` (#6722 — the same values MINUS the
-//!    child→parent propagation; see `ForwardingState::egress_zone_id`),
 //!    `state.tunnel_interfaces`, `state.local_v[46]`,
 //!    `state.interface_nat_v[46]`, `state.connected_v[46]`. Returns
 //!    an [`IfaceIndex`] context with `name_to_ifindex` /
@@ -81,15 +79,16 @@ pub(super) fn populate_interfaces(
                 }
             };
             state.ifindex_to_zone_id.insert(iface.ifindex, zone_id);
-            // #6722: record the interface's OWN zone separately, BEFORE the
-            // parent propagation below. `ForwardingState::egress_zone_id`
-            // resolves the to-zone of an interface with no `egress` row (a
-            // MAC-less xfrmi, #6713) through this map, and must never inherit
-            // a zone propagated from a zoned SIBLING onto an interface the
-            // operator deliberately left unzoned — that would adjudicate the
-            // unzoned interface under the sibling's policy. Keep this insert
-            // out of the `parent_ifindex` arm.
-            state.ifindex_own_zone_id.insert(iface.ifindex, zone_id);
+            // #6722: this propagation is UNREACHABLE for a snapshot the Go
+            // builder produces, and is kept only as a helper-boundary backstop.
+            // `buildInterfaceZoneMap` (`pkg/dataplane/userspace/zones.go`)
+            // already writes `out[base]` for a unit-suffixed zone reference and
+            // fans a base-named one out to every unit, so a zoned unit's parent
+            // row always arrives carrying a zone of its own and does its own
+            // insert above (rows are emitted base-first,
+            // `pkg/dataplane/userspace/interfaces.go`). Do NOT reason about
+            // `ifindex_to_zone_id` as "propagated vs own" — on every producible
+            // snapshot there is no difference to reason about.
             if iface.parent_ifindex > 0 {
                 match state.ifindex_to_zone_id.get(&iface.parent_ifindex) {
                     Some(existing) if *existing != zone_id => {}
