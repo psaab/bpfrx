@@ -54,7 +54,28 @@ type AuthConfig struct {
 // converges. That is the direction this file has consistently chosen —
 // over-restrict and wait for the next commit, never under-restrict — and the
 // REST API is not the box's lifeline (console/SSH and the local CLI are
-// untouched). reconcileTo logs the withholding so the state is diagnosable.
+// untouched).
+//
+// "Wait for the next commit" is load-bearing, and it is a constraint on the
+// CALLER, not on this function. The empty set is ABSORBING here: the loop keeps
+// only values already present in `live`, so ∅ ∩ X = ∅ for every X, and no later
+// rotation can re-introduce a credential through this path. What restores
+// access is a commit that makes every serving listener sit at an address the
+// config names, after which reconcileTo publishes the committed set WHOLE
+// instead of calling this. A caller that can enter the intersection in a state
+// whose endpoint can never converge therefore creates a lockout with no exit —
+// which is exactly what `rebinding && len(errs) == 0` did before #5561 round 13
+// (it intersected on a failed leg ENABLE, where nothing is retained anywhere).
+// The gate is now mgmtEndpoint.everyLiveLegNamedBy, so ∅ is reachable only while
+// a listener really is serving an unnamed address, and both exits from that —
+// converge the bind, or commit the address that is actually serving — are a
+// single commit away.
+//
+// The state is LOGGED but not otherwise operator-visible: reconcileTo warns with
+// the withheld count, but `show system services` shows the retained leg as
+// `Listening` (it is serving), has no HTTPS row at all, and the commit itself
+// reports success. Do not weaken the exit argument by appealing to
+// diagnosability.
 //
 // Secrets are compared with ==, not crypto/subtle: both operands are configured
 // values from the daemon's own config store, never attacker-supplied request

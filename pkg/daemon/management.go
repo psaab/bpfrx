@@ -52,8 +52,13 @@ import (
 //     credential set is committed together with the endpoint it is meant for:
 //     while a leg is retained at an address this config asked to leave, only the
 //     intersection with what that listener already accepted may be enforced
-//     (#5561 round 12, api.AuthForRetainedListener). An endpoint-only-unchanged
-//     commit has nothing to converge and publishes whole. Removing ALL api-auth
+//     (#5561 round 12, api.AuthForRetainedListener). The gate for that is the
+//     property itself — every listener that is actually SERVING sits at an
+//     address `next` names (mgmtEndpoint.everyLiveLegNamedBy, #5561 round 13) —
+//     not "some leg moved and every rebind succeeded", which was a strictly
+//     wider proxy. A commit with nothing to converge, and one whose only failure
+//     was to ENABLE a leg that therefore does not exist, both publish whole.
+//     Removing ALL api-auth
 //     (nil) publishes AFTER the rebinds and is gated on both LIVE bind addresses
 //     being loopback: it REMOVES a requirement, so the #4047/#5127 clamp that
 //     justified the nil must be proven against the listeners that are actually
@@ -106,6 +111,37 @@ func (e mgmtEndpoint) summary() string {
 
 func endpointOf(cfg api.Config) mgmtEndpoint {
 	return mgmtEndpoint{addr: cfg.Addr, httpsAddr: cfg.HTTPSAddr, tls: cfg.TLS}
+}
+
+// everyLiveLegNamedBy reports whether every listener CURRENTLY SERVING under
+// this fingerprint sits at an address `next` names. It is the question the
+// grant-half gate means to ask (#5561 round 13); `rebinding && len(errs) == 0`
+// was a proxy for it, and the proxy is wider than the property in a reachable
+// direction — see reconcileTo.
+//
+// Per leg:
+//
+//   - The HTTP leg is always serving, at e.addr. `next` names it iff
+//     next.Addr == e.addr.
+//   - The HTTPS leg is serving only when e.tls is set. api.Server.ReconcileHTTPS
+//     assigns s.httpsLeg only after BOTH the keypair and the bind succeed, so a
+//     failed ENABLE leaves nothing behind; a disable stops the leg outright. So
+//     when e.tls is clear there is no HTTPS listener to hand a credential to and
+//     that leg imposes no requirement. When it is set, `next` names the serving
+//     listener iff next still wants TLS at exactly e.httpsAddr.
+//
+// The same predicate answers two different questions depending on WHEN it runs,
+// because each field advances only on its own leg's successful reconcile: read
+// BEFORE the rebinds it says whether anything is about to move off what `next`
+// names; read AFTER, whether everything landed on it.
+func (e mgmtEndpoint) everyLiveLegNamedBy(next api.Config) bool {
+	if e.addr != next.Addr {
+		return false
+	}
+	if !e.tls {
+		return true
+	}
+	return next.TLS && next.HTTPSAddr == e.httpsAddr
 }
 
 // newManagementReconciler builds the owner around the runtime-dependency base
@@ -279,11 +315,12 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 
 	var errs []error
 
-	// Which legs this reconcile will move. While ANY leg is moving, some live
-	// listener is (or may end up) at an address `next` does not name, which is
-	// what makes the credential publish below conditional.
-	rebinding := next.Addr != m.cur.addr ||
-		next.TLS != m.cur.tls || next.HTTPSAddr != m.cur.httpsAddr
+	// Whether every listener that is CURRENTLY serving sits at an address `next`
+	// names. Read here, before any rebind, it says whether some live listener is
+	// about to move off (or is already off) what this config named — which is
+	// what makes the credential publish below conditional. It is read AGAIN
+	// after the rebinds, where it says whether everything landed.
+	sanctioned := m.cur.everyLiveLegNamedBy(next)
 
 	// The REVOCATION half of a non-nil credential set is published BEFORE any
 	// listener is bound (#5561 round 9 finding 3; the grant half split off in
@@ -310,25 +347,26 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 	// value acceptable that was not acceptable before, and the listener it
 	// becomes acceptable on may be one this config never asked to keep serving —
 	// the endpoint it did ask for is still unbound at this point, and may fail to
-	// bind at all. So while any leg is moving, only the intersection with the
-	// live snapshot goes out (#5561 round 12): every revocation lands
-	// immediately, no grant does. A nil live snapshot is the universal set, so
-	// the round-9 case still publishes the full credential set before the new
-	// off-box socket serves.
+	// bind at all. So while some LIVE listener sits at an address this config
+	// does not name, only the intersection with the live snapshot goes out (#5561
+	// round 12): every revocation lands immediately, no grant does. A nil live
+	// snapshot is the universal set, so the round-9 case still publishes the full
+	// credential set before the new off-box socket serves.
 	//
 	// The full set follows below, once every leg has converged onto an address
-	// THIS config names. When the endpoint is unchanged there is nothing to
-	// converge and no retained listener to protect, so the full set goes out
-	// here — the plain day-2 credential change, which must not be degraded to an
-	// intersection (that would revoke without granting, i.e. lock the operator
-	// out of an endpoint the commit never touched).
+	// THIS config names. When every live leg ALREADY sits at an address this
+	// config names there is nothing to converge and no retained listener to
+	// protect, so the full set goes out here — the plain day-2 credential change,
+	// which must not be degraded to an intersection (that would revoke without
+	// granting, i.e. lock the operator out of an endpoint the commit never
+	// touched).
 	//
 	// The nil (remove-all-api-auth) direction stays BELOW the rebinds, because it
 	// REMOVES a requirement and its safety gate reads m.cur, which the rebinds
 	// update.
 	if next.Auth != nil {
 		publish := next.Auth
-		if rebinding {
+		if !sanctioned {
 			publish = api.AuthForRetainedListener(m.srv.LiveAuth(), next.Auth)
 			if withheld := api.CredentialCount(next.Auth) - api.CredentialCount(publish); withheld > 0 {
 				slog.Warn("web-management endpoint is moving; withholding committed credentials from the listener that is still serving until the rebind converges",
@@ -377,14 +415,39 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 	// property exactly: A is not in it, so A stops working the moment the commit
 	// lands, whatever the rebind does.
 	//
-	// What the rebind outcome DOES gate is the grant half. Once every leg has
-	// converged, every live listener is at an address this config names, so the
-	// credential set it committed for those addresses can go out whole. If any
-	// leg failed, some listener is still serving an address the config asked to
-	// leave, and the restricted set published above stays in force until a later
-	// reconcile converges (each commit retries; the error and the Warn above make
-	// the state visible).
-	if next.Auth != nil && rebinding && len(errs) == 0 {
+	// What the rebinds DO gate is the grant half — but on where the live legs
+	// ended up, not on whether every call returned nil. Once every SERVING
+	// listener is at an address this config names, the credential set it
+	// committed for those addresses goes out whole. If some listener is still
+	// serving an address the config asked to leave, the restricted set published
+	// above stays in force until a later reconcile converges (each commit
+	// retries; the error and the Warn above make the state visible).
+	//
+	// `len(errs) == 0` was the proxy for that, and it is strictly wider than the
+	// property in one reachable direction: failing to ENABLE a leg leaves NO
+	// listener at an unnamed address (ReconcileHTTPS creates the leg only after
+	// the bind succeeds), yet it withheld anyway (#5561 round 13). The concrete
+	// shape is an ordinary one — one commit rotates the web-management password
+	// and enables TLS; the HTTPS bind fails; the HTTP listener never moved off
+	// the address the same commit named. Under the proxy the single-account
+	// rotation intersected to the EMPTY set, which rejects every non-exempt
+	// request, so the management API 401'd every caller on the committed address
+	// while the commit reported success. And that state had no exit: the empty
+	// set is absorbing under the intersection (∅ ∩ X = ∅), and the endpoint
+	// fingerprint could not converge while the port stayed held, so neither
+	// re-committing nor rotating again recovered — only backing the TLS enable
+	// out did. Asking where the live legs ARE never enters it, because nothing
+	// was ever retained anywhere.
+	//
+	// The empty set stays representable. Refusing it would mean keeping a
+	// credential the committed config no longer carries alive on a listener the
+	// operator asked to leave, which is the round-7 fail-open. What matters is
+	// that every ∅ this gate can now enter has an EXIT a later commit can reach:
+	// it is entered only while some listener really is retained at an unnamed
+	// address, so converging that bind, or committing the address that is
+	// actually serving, publishes the full set
+	// (TestMgmtWithheldGrantIsExitableByASubsequentCommit_5561).
+	if next.Auth != nil && !sanctioned && m.cur.everyLiveLegNamedBy(next) {
 		m.srv.ReplaceAuth(next.Auth)
 	}
 

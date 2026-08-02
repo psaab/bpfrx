@@ -868,21 +868,41 @@ under the daemon's errgroup. Nothing else imports this package.
       (round 7), and publishing after the rebind left a freshly-bound socket
       serving under the old snapshot for the width of the intervening HTTPS
       reconcile (round 9; `ReconcileHTTP` serves before it returns).
-    - The **grant** half waits for every leg to converge. A credential set is
-      committed together with the endpoint it is meant for, so while a leg is
-      retained at an address this config asked to leave, only
+    - The **grant** half waits until every listener that is SERVING sits at an
+      address the committed config names. A credential set is committed together
+      with the endpoint it is meant for, so while a listener is retained at an
+      address this config asked to leave, only
       `AuthForRetainedListener(live, next)` — the intersection of what that
       listener already accepted with what is still committed — may be enforced
       (round 12). Otherwise a commit that moves management to loopback while
       introducing a credential would, on a failed rebind, publish that credential
       on the routable address the operator was withdrawing. A **nil** live
       snapshot is the UNIVERSAL set, not the empty one (it is the pass-through
-      posture), which is what keeps the round-9 case publishing whole. An
-      endpoint-only-unchanged commit has nothing to converge and publishes whole.
-      The intersection can be EMPTY, which denies everyone on the retained
-      listener until a later reconcile converges — deliberate, logged, and
-      bounded to a state that already returns an error and shows `Failed` in
-      `show system services`.
+      posture), which is what keeps the round-9 case publishing whole. A commit
+      with nothing to converge publishes whole, and so does one whose only
+      failure was to ENABLE a leg — that leaves no listener behind at all, so
+      there is nothing to protect (`mgmtEndpoint.everyLiveLegNamedBy`, round 13;
+      the previous `rebinding && len(errs) == 0` was a proxy wider than the
+      property, and the excess denied every caller on an address the same commit
+      had named).
+    - The intersection can be EMPTY, which denies everyone on the retained
+      listener until a later reconcile converges. That is deliberate — refusing
+      to represent `∅` would mean keeping a credential the committed config no
+      longer carries alive on a listener the operator asked to leave, which is
+      the round-7 fail-open — and it is acceptable because every state that can
+      reach it has an EXIT a later commit reaches: converge the failing bind, or
+      commit the address that is actually serving. **It is not, however, visible
+      to the operator.** `show system services` reports the retained leg as
+      `Listening`, because it genuinely is serving (`pkg/daemon/README.md`
+      "Effective-listener snapshot"); there is no HTTPS row at all
+      (`sysservices.Listeners` renders gRPC and HTTP only); and `applyConfig`
+      logs the reconcile error as a warning rather than failing the commit, so
+      the operator sees a SUCCESSFUL commit. The only signal is in the log — the
+      `Warn` `reconcileTo` emits naming how many credentials it withheld, and
+      the `Warn` for the incomplete reconcile. Exitability, not diagnosability,
+      is what makes the state acceptable; a dedicated HTTPS row in
+      `show system services` would be a real improvement and is not in this
+      change.
     - **Removing all api-auth** (nil) publishes AFTER the rebinds and only when
       BOTH live bind addresses are loopback. The justification for a nil is the
       #4047/#5127 clamp, which `resolveAPIBinds` evaluates against the config

@@ -67238,6 +67238,12 @@ break — `go vet` confirmed passing under every revert.
   not the box's lifeline (console/SSH + the local CLI are untouched), the state
   already returns an error and shows `Failed` in `show system services`, and
   reconcileTo now logs the withheld count.
+  **[CORRECTED in round 13]** the `Failed` claim is FALSE — `show system
+  services` reports the RETAINED leg as `Listening` (it is serving), renders no
+  HTTPS row at all, and `applyConfig` logs the reconcile error as a warning while
+  the commit reports SUCCESS. The state is silent outside the log. It was also
+  reachable with NOTHING retained anywhere, and unexitable there; round 13 fixes
+  that and rests the argument on exitability, not diagnosability.
 - **Four existing assertions inverted, deliberately** — each keeps the security
   property it was written for and loses only an availability corollary that IS
   MAJOR-2's shape (the retained listener also GAINING the new credential), and
@@ -67267,3 +67273,78 @@ break — `go vet` confirmed passing under every revert.
   pkg/daemon/management.go, pkg/daemon/management_5866_test.go,
   pkg/daemon/management_authstale_5561_test.go,
   pkg/daemon/management_authpublish_5561_test.go, _Log.md
+
+- **Timestamp**: 2026-08-01 (#5561 round-13 — Claude MAJOR-1 + MAJOR-2 CONFIRMED
+  by probe before any fix; MAJOR-3 docs contract; MINOR false claim)
+- **Action**: the round-12 grant-half gate `rebinding && len(errs) == 0` was
+  ITSELF a proxy — the same defect class this PR fixes, one level up. Replaced it
+  with the property: `mgmtEndpoint.everyLiveLegNamedBy(next)`, read BEFORE the
+  rebinds (is anything about to move off what `next` names?) and AGAIN after (did
+  everything land on it?). Per leg: the HTTP leg is always serving at `cur.addr`;
+  the HTTPS leg is serving only when `cur.tls` is set, because
+  `api.Server.ReconcileHTTPS` assigns `s.httpsLeg` only after BOTH the keypair
+  and the bind succeed (`pkg/api/listener.go:217-229`).
+- **MAJOR-1 reproduced firsthand** (probe, before any fix): live HTTP
+  `10.0.0.1:80` + `{webadmin: secret-a}`; ONE commit rotates to `secret-b` AND
+  enables HTTPS on `10.0.0.1:443`, whose bind fails. `cur = {addr:10.0.0.1:80
+  httpsAddr: tls:false}` — the HTTP listener is at exactly the address the commit
+  named and never moved, and NO HTTPS listener exists. Yet
+  `live snapshot = &{Users:map[] APIKeys:map[]}` (credCount 0): the management
+  API 401s every caller while the commit reports success. The state had NO EXIT —
+  identical re-commit credCount=0, further rotation credCount=0 (∅ is absorbing:
+  `∅ ∩ X = ∅`), only backing the HTTPS enable out recovered (credCount=1). The
+  fix has two halves because the predicate is read twice, and each half owns a
+  DIFFERENT reachable shape: the never-moved case is settled by the early read
+  alone, the converged-HTTP-move-plus-failed-TLS-enable case only by the late one.
+- **MAJOR-2 reproduced firsthand**: deleting
+  `(!m.cur.tls || mgmtAddrIsLoopback(m.cur.httpsAddr))` from the nil gate left
+  `go test ./pkg/daemon/` fully green on the round-12 head. The state is real —
+  removing api-auth clamps BOTH binds to loopback, the HTTP leg converges and the
+  HTTPS leg's bind fails, so `cur = {addr:127.0.0.1:8080 httpsAddr:10.0.0.1:8443
+  tls:true}` and the sibling conjunct is satisfied; without this one the snapshot
+  goes `<nil>`, an unauthenticated off-loopback mutating REST API. Now pinned by
+  `TestMgmtNilAuthNeverDropsARetainedOffLoopbackHTTPSLeg_5561`, whose
+  preconditions assert the HTTP address IS loopback so it can never degrade into
+  a duplicate of the sibling guard.
+- **∅ stays representable, deliberately** — refusing it would mean keeping a
+  credential the committed config no longer carries alive on a listener the
+  operator asked to leave, which is the round-7 fail-open. What was wrong was
+  entering it with nothing retained anywhere and no way out. It is now reachable
+  only while some listener really is serving an unnamed address, and both exits
+  (converge the bind; commit the address that is actually serving) are one commit
+  away — pinned by `TestMgmtWithheldGrantIsExitableByASubsequentCommit_5561`,
+  which first asserts the absorbing behaviour it is testing the exit from.
+- **MINOR — a false claim corrected, not re-argued**: "shows `Failed` in
+  `show system services`" is FALSE. `effectiveHTTPListener()` returns
+  StateListening in both failure states (the retained leg IS serving);
+  `sysservices.Listeners` has gRPC and HTTP rows only, so an HTTPS bind failure
+  is invisible under any state value; `daemon_apply.go` swallows the error into a
+  `slog.Warn` and the commit reports SUCCESS. Corrected in `pkg/api/README.md`,
+  `pkg/api/auth.go`, and the round-12 `_Log.md` entry, and the acceptability
+  argument now rests on EXITABILITY, not diagnosability. The state is otherwise
+  silent; a dedicated HTTPS row in `show system services` would be a real
+  improvement and is deliberately not in this change (it changes the CLI output
+  and the gRPC listener contract).
+- **MAJOR-3 — `pkg/daemon/README.md` rewritten**: it documented the SUPERSEDED
+  contract on four points (an "unconditional" non-nil publish; the removed
+  `httpOK` gate; `withCommittedAuth` "never turning a non-nil publish into a nil
+  one" — the opposite of the shipped code; and the "already clamped to loopback"
+  premise this PR declares FALSE, presented as deliberate design). Stale
+  `httpOK` reference in `management_5866_test.go` fixed too.
+- **RED-then-GREEN**, `go build ./...` and `go vet` rc 0 in EVERY state:
+  `TestMgmtFailedHTTPSEnableStillGrantsOnTheUnmovedListener_5561` RED on the
+  round-12 head (`live snapshot = &{Users:map[] APIKeys:map[]}`), GREEN after.
+  Six mutations, each reddening only its own guards: (A) restore
+  `rebinding && len(errs) == 0` on the LATE gate → `...AfterAConvergedHTTPMove`
+  red ALONE (the unmoved case is settled by the early read, so it correctly does
+  not); (F) restore `rebinding` on the EARLY gate → `...OnTheUnmovedListener` red
+  ALONE — the two halves are separately bound; (B) delete the HTTPS conjunct of
+  the nil gate → `...NeverDropsARetainedOffLoopbackHTTPSLeg` red alone; (C)
+  publish the full set before the rebind → the five grant-half guards red; (D)
+  drop the "no HTTPS leg is serving" branch of the predicate (over-restrict) → 8
+  red; (E) drop its HTTP-address half (under-restrict) → the 4 grant-withholding
+  guards red.
+- **File(s)**: pkg/daemon/management.go, pkg/api/auth.go,
+  pkg/daemon/management_authsanction_5561_test.go,
+  pkg/daemon/management_5866_test.go, pkg/daemon/README.md, pkg/api/README.md,
+  _Log.md

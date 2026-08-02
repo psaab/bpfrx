@@ -517,8 +517,12 @@ func TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866(t *testing.T) {
 // removing ALL api-auth (next.Auth == nil, which clamps the HTTP bind to
 // loopback) while the HTTP leg's OWN rebind to that loopback address FAILS must
 // NOT drop the retained NON-loopback HTTP listener to no-auth. The nil auth is
-// deferred (httpOK == false), so the retained listener keeps its previous
-// credential set — no fail-open — and converges on retry.
+// deferred because the gate reads the LIVE HTTP address (mgmtAddrIsLoopback of
+// m.cur.addr, which the failed rebind left at the old non-loopback bind), so the
+// retained listener keeps its previous credential set — no fail-open — and
+// converges on retry. The sibling conjunct, covering a retained non-loopback
+// HTTPS leg, is pinned by
+// TestMgmtNilAuthNeverDropsARetainedOffLoopbackHTTPSLeg_5561.
 func TestMgmtReconcileRemoveAuthDeferredWhenHTTPRebindFails_5866(t *testing.T) {
 	reg := newFakeReg()
 	m := newTestMgmt(reg)
