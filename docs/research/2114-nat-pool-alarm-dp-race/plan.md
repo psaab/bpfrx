@@ -1,25 +1,25 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v80 — r78 folds: Codex M1's class-text
-  consistency (the one-state behavioral sentences in the class-1/
-  class-2 bullets deleted — every method now enters the registry
-  helper, classifies + selects atomically under `m.mu`, blocks
-  during the batch hold, observes armed after release), Codex M2's
-  oracle-set rewrite (the v79 "legacy overlap shape retained for
-  the record" sentence kept the contradictory fresh-during-hold
-  oracle alive — DELETED; the four clean legs: quiescent fresh,
-  quiescent retained, blocked fresh-Start, blocked retained
-  re-Start, the blocked legs observing armed after release; hook
-  placement explicit), Codex M3's carve-out completion (the
-  pre-existing loaded-check SET is attaches + the CompileConfig
-  path — `compiler.go:182` rejects `!dp.IsLoaded()` before
-  registry access, reached by Compile/ApplyConfig/
-  CompileUserspaceShim), Codex m1's two stale Store-placement
-  descriptions and Codex m2's H-attribution stragglers fixed;
-  r78 verdicts: Codex PLAN-NEEDS-MAJOR (3M/2m — all residual
-  text contradictions; zero new mechanism since r75), AGY
-  PLAN-READY, Claude SMR PLAN-READY; pending convergence review
-  r79
+- **Status**: DRAFT v81 — r79 folds: Codex M1's retained-oracle
+  correction (the v80 retained overlap text still had retained
+  methods "proceeding" across the held seam — impossible under
+  the uniform mutex; the quiescent retained leg is now its own
+  named test `TestManager_ArmedGate_RetainedOutcomes`, and the
+  overlap leg reads block-during-hold + armed-after-release),
+  Codex M2's pre-rejection side-effect clause
+  (`CompileUserspaceShim` runs the idempotent cleanups + the
+  constant selector write before the `CompileConfig` rejection —
+  the rejection fires in every state; serialization-after-Start
+  documented as master's own race-winner-proceeds shape), Codex
+  M3's invariant-12 carve-out (the loaded-check set rejects per
+  master on every state), Codex m1's two acquire-load remnants
+  (independently found by AGY r79; AGY's third finding — a
+  Store(true)-at-Close typo — was verified a MISREAD and not
+  folded), Codex m2's §5.5 H-attribution fix; r79 verdicts:
+  Codex PLAN-NEEDS-MAJOR (3M/2m — all text-level), AGY
+  PLAN-NEEDS-MINOR (0M/3m — one a verified misread), Claude SMR
+  PLAN-READY-WITH-NITS (0M/2m — the two real stragglers);
+  pending convergence review r80
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -3199,7 +3199,12 @@
   four-leg oracle set (the contradictory legacy-oracle
   sentence deleted); the carve-out completed with the
   CompileConfig path; the stale Store-placement and
-  H-attribution stragglers).
+  H-attribution stragglers). v81 (r79: the retained-oracle
+  correction (quiescent retained as its own leg; the overlap
+  leg blocks-then-armed); the pre-rejection side-effect
+  clause; the invariant-12 carve-out; the two acquire-load
+  remnants; the §5.5 attribution; AGY's third finding
+  verified a misread, not folded).
 
 ---
 
@@ -3602,8 +3607,10 @@ class. The fold:
   - **Class 1 — fallible map-required methods, no required pre-gate
     side effects** (e.g. `maps_fabric.go` `UpdateRGActive` :38,
     `UpdateFabricFwd` :30; the attach family `AttachXDP`/`AttachTC` —
-    NOT the detaches, r72 Codex M3): acquire-load `m.loaded` BEFORE THE FIRST
-    Start-state access; pre-arm return the typed `ErrDataplaneNotArmed`
+    NOT the detaches, r72 Codex M3): enter the registry helper and
+    classify + select ATOMICALLY under `m.mu` (the uniform rule;
+    the one-state acquire-load phrasing is deleted, r79 Codex m1 /
+    AGY r79) — on the fresh state return the typed `ErrDataplaneNotArmed`
     — contract specified (r72 Codex m3): declared in `pkg/dataplane`
     as `var ErrDataplaneNotArmed = errors.New("dataplane not armed")`,
     wrapped with `%w` at each gate site, `errors.Is`-compatible.
@@ -4068,7 +4075,7 @@ convergence on the seed before any implementation of G/H/H2.
   by Start-state access with the escape-first precedence rule: class-1
   fallible map-required (gate before the first Start-state access;
   pure validation may precede); class-2 neutral-outcome ANY
-  signature WITH the acquire-load rule (class-2 joins the
+  signature WITH the synchronization rule (class-2 joins the
   blocked-Start overlap); class-3 required-side-effect hybrids
   UNGATED with scoped `m.mu` lookup locking, population loops under
   `m.mu`, and the raw-helper nested-call rule; class-4 escaping
@@ -4220,8 +4227,9 @@ classification snapshot.
   `d.dp.ApplyConfig` reference (:936) (r2 Codex MINOR 3).
 - Source comments contradicting the rollback recurrence get reworded in
   the FOLLOW-UP unit (§4.7, `followup-seed.md` — these comments document
-  the recurrence work item H terminates; the "same PR" framing predates
-  the r28 split): `daemon_run_naming.go:200-206` ("one-way ... at most once"),
+  the recurrence CLASS work item H terminates; the generic
+  lifecycle/generation redesign is its own follow-up, r77 Codex m2 /
+  §10 — the "same PR" framing predates the r28 split): `daemon_run_naming.go:200-206` ("one-way ... at most once"),
   `bootstrap.go:284-289` ("one-way for the daemon's lifetime"),
   `daemon_apply.go:213-220` ("Exit is one-way"), plus the r3 additions
   `daemon.go:901`, `bootstrap.go:276` ("written once at startup and at most
@@ -4418,7 +4426,10 @@ Preserved exactly:
     touches Start-populated state; (ii) a method observing true
     sees a fully-populated registry; (iii) a retained-state method
     proceeds against the retained registry UNDER the uniform
-    registry rule — master's exact behavior. NO lifetime or
+    registry rule — master's exact behavior (r79 Codex M3's
+    carve-out: methods WITH a pre-existing loaded check — the
+    attaches, the CompileConfig path — reject per master on EVERY
+    state and never reach the registry). NO lifetime or
     teardown exclusion is claimed — the Store(false) at `Close()`'s
     entry (:1206) gates new FRESH-state entrants (retained-state
     methods proceed per the two-state rule, = master) and cannot
@@ -4586,7 +4597,17 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    BEFORE the in-hold Store(true), preserved loaded-check methods
    (the attaches, the CompileConfig path) return immediately;
    after it, they pass their precheck and block at registry
-   selection. The XDP field's dedicated two-sided seam stands
+   selection. The PRE-REJECTION SIDE-EFFECT clause (r79 Codex M2):
+   `CompileUserspaceShim` runs the two legacy cleanups (:174/:177)
+   and the selector write (:180) BEFORE the `CompileConfig`
+   rejection (`compiler.go:182`), and the production compiler calls
+   the selector before `CompileUserspaceShim`
+   (`manager_compile.go:184`) — all idempotent (the selector writes
+   a constant; the cleanups remove legacy pins/links), the
+   rejection fires in every state, and a call blocked at the
+   selector during the hold proceeds after release when armed —
+   master's own race-winner-proceeds shape (serialization-after-
+   Start accepted and documented, not a behavior change). The XDP field's dedicated two-sided seam stands
    (r73 Codex M3): a second entered/resume barrier around the
    `:154` selector write with getter/predicate/swap driven across
    it; and the `:632` lock is pinned DIRECTLY (r74 Codex M2) by a
@@ -4604,17 +4625,24 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    m1's wording fix) — and the class-3 raw-helper composition shape
    is asserted (r71 Codex M3 — `ClearAllCounters` composes through
    internal raw helpers, preserving its pinned legacy error text).
-   PLUS the RETAINED-state coverage the §4 contract promised (r76
-   Codex m2 — the v77 text promised it but §9 never gained it):
-   `TestManager_ArmedGate_RetainedReStartOverlap` — a retained
-   fixture (seed maps+programs, `loaded=false`) driven through a
-   blocked re-`Start` whose whole-batch critical section holds a
-   hook, with EVERY class's methods driven across the seam: fresh
-   methods gate, retained methods proceed under the registry rule,
-   no fatal fault, and the whole-batch boundary proven (no partial
-   registry is observable). The named Detach test's "race-free"
-   gains its concurrent population actor (the same blocked
-   re-`Start` seam).
+   PLUS the RETAINED-state coverage (r76 Codex m2; corrected to the
+   four-leg form at v81 per r79 Codex M1 — the v80 text still had
+   retained methods "proceeding" across the held seam, impossible
+   under the uniform mutex): `TestManager_ArmedGate_RetainedOutcomes`
+   — the QUIESCENT retained leg as its own named test (seeded
+   retained registry: maps+programs present, `loaded=false`; no
+   overlap; every class proceeds exactly as master — retained reads
+   report, retained mutations reach the retained maps, the
+   loaded-check set rejects per master); and
+   `TestManager_ArmedGate_RetainedReStartOverlap` — leg (4) of the
+   oracle set: the retained fixture driven through the blocked
+   re-`Start` whose whole-batch hold contains the hook; every
+   class's readers BLOCK until release and observe the ARMED state
+   after it (Store(true) is the batch's final in-hold step) —
+   proving both the whole-batch boundary (no partial registry
+   observable) and lock ownership. The named Detach test's
+   "race-free" gains its concurrent population actor (the same
+   blocked re-`Start` seam).
    The fixture-migration classification is REDONE under the
    two-state rule (r76 Codex m3 — v77's prescription was stale):
    `injectShimMap` modifies only `maps`, never `loaded`
@@ -5165,18 +5193,18 @@ Still open:
    PLAN-READY when all three verdicts gate the PR-1 design as
    ready.
 
-7. **r68-r78 resolution (for the record)**: Codex r68 M1 (armed-state
-   admission gate) folded as work item A3; r69-r77 falsified each
-   intermediate form, and r78 caught the residual text contradictions
-   (one-state behavioral sentences surviving beside the uniform rule;
-   the legacy-oracle sentence keeping the contradiction alive in §9;
-   the CompileConfig path missing from the loaded-check carve-out).
-   v80 carries the consistent uniform text, the four-leg oracle set,
-   the completed loaded-check set (attaches + CompileConfig), and the
-   placement/attribution straggler fixes. Each reviewer: verify the
-   class texts are now uniform-rule-consistent everywhere, the four
-   oracle legs are mutually consistent, and the carve-out covers
-   compiler.go:182's path.
+7. **r68-r79 resolution (for the record)**: Codex r68 M1 (armed-state
+   admission gate) folded as work item A3; r69-r78 falsified each
+   intermediate form, and r79 caught the last text-level
+   contradictions (the retained overlap oracle surviving beside its
+   four-leg summary; the pre-rejection side-effect ordering in
+   CompileUserspaceShim; the invariant-12 carve-out erasure; the two
+   acquire-load remnants — the pair independently found by AGY, whose
+   third finding was verified a misread and is NOT folded). v81
+   carries the corrected retained legs, the side-effect clause, and
+   the carve-out-complete invariant. Each reviewer: verify the four
+   oracle legs are now self-consistent with their named tests, and
+   the selector/cleanup ordering claim against loader.go:174-186.
 
 ---
 
