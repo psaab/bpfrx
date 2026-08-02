@@ -72,9 +72,17 @@
 #![allow(unused_imports)]
 
 use super::*;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
-const PROBE_TCP: u8 = 6;
+// IPv6 next-header values used throughout this file. TCP is the terminal
+// every probe and corpus chain ends on.
+const TCP: u8 = 6;
+const HBH: u8 = 0;
+const AH: u8 = 51;
+const FRAG: u8 = 44;
+const DEST: u8 = 60;
+const MOBILITY: u8 = 135;
 
 // Extension-header classes, mirroring EH_CLASS_* in
 // userspace-xdp/src/lib.rs and pkg/dataplane/userspace_xdp_facts.go.
@@ -222,7 +230,7 @@ fn userspace_class(proto: u8) -> u8 {
     let mut buf = vec![0u8; 96];
     buf[0] = 0x60;
     buf[6] = proto;
-    buf[40] = PROBE_TCP;
+    buf[40] = TCP;
     buf[41] = 1;
     let walk = walk_ipv6_ext_chain(&buf, 0);
     match walk.outcome {
@@ -234,9 +242,9 @@ fn userspace_class(proto: u8) -> u8 {
             );
             EH_CLASS_TERMINAL
         }
-        ExtChainOutcome::L4(56, PROBE_TCP) => EH_CLASS_GENERIC,
-        ExtChainOutcome::L4(52, PROBE_TCP) => EH_CLASS_AUTH,
-        ExtChainOutcome::L4(48, PROBE_TCP) => {
+        ExtChainOutcome::L4(56, TCP) => EH_CLASS_GENERIC,
+        ExtChainOutcome::L4(52, TCP) => EH_CLASS_AUTH,
+        ExtChainOutcome::L4(48, TCP) => {
             assert!(
                 walk.fragment.is_some(),
                 "probe for next-header {proto} advanced 8 bytes without recording a Fragment \
@@ -253,13 +261,12 @@ fn userspace_class(proto: u8) -> u8 {
 
 /// Bytes this crate's walker advances past a Fragment header, measured.
 fn userspace_fragment_advance() -> usize {
-    const FRAGMENT: u8 = 44;
     let mut buf = vec![0u8; 96];
     buf[0] = 0x60;
-    buf[6] = FRAGMENT;
-    buf[40] = PROBE_TCP;
+    buf[6] = FRAG;
+    buf[40] = TCP;
     match walk_ipv6_ext_chain(&buf, 0).outcome {
-        ExtChainOutcome::L4(off, PROBE_TCP) => off - 40,
+        ExtChainOutcome::L4(off, TCP) => off - 40,
         other => panic!("the userspace fragment probe no longer resolves to TCP ({other:?})"),
     }
 }
@@ -267,17 +274,16 @@ fn userspace_fragment_advance() -> usize {
 /// Build `n` chained 8-byte DestOpt headers terminated by TCP and report
 /// whether this crate's walker resolves the terminal.
 fn userspace_resolves_chain_of(n: usize) -> bool {
-    const DEST_OPT: u8 = 60;
     let mut buf = vec![0u8; 40 + 8 * n + 20];
     buf[0] = 0x60;
-    buf[6] = if n == 0 { PROBE_TCP } else { DEST_OPT };
+    buf[6] = if n == 0 { TCP } else { DEST };
     for i in 0..n {
         let at = 40 + 8 * i;
-        buf[at] = if i + 1 == n { PROBE_TCP } else { DEST_OPT };
+        buf[at] = if i + 1 == n { TCP } else { DEST };
     }
     matches!(
         walk_ipv6_ext_chain(&buf, 0).outcome,
-        ExtChainOutcome::L4(off, PROBE_TCP) if off == 40 + 8 * n
+        ExtChainOutcome::L4(off, TCP) if off == 40 + 8 * n
     )
 }
 
@@ -545,7 +551,112 @@ fn userspace_verdict(buf: &[u8], l3: usize) -> Verdict {
 /// `l3_offset as usize` with `0usize` is bit-identical at 0 and a fail-open of
 /// exactly `l3` bytes at 14 and 18. 0 is kept because `walk_ipv6_ext_chain`'s
 /// other callers pass an L3-relative slice.
+///
+/// Floor 5 in `parity_corpus` MEASURES the two non-zero values, by asking
+/// `frame_l3_offset` where L3 starts in the prefixes `at_l3` builds. It cannot
+/// measure `parse_l2`: that function is in the aya crate and does not link
+/// here. That the two agree on 14/18 is the documented claim above, and is the
+/// one thing in this file still asserted rather than run.
 const L3_OFFSETS: [usize; 3] = [0, 14, 18];
+
+/// One arm's boundary WITNESS PAIR, DECLARED here and VERIFIED by floor 1.
+///
+/// The pair is `(padded, tight)`: the same single-extension-header packet, cut
+/// to exactly `target` bytes and to `target - 1`. Floor 1 requires this crate's
+/// walker to resolve the terminal at exactly `target` on the padded twin and to
+/// fail closed on the tight one.
+///
+/// That pairing is the whole point. "Fails closed" ALONE is a proxy: a 40-byte
+/// packet declaring an arm also fails closed, at the arm's INITIAL two-byte
+/// read, having never reached the advance or the post-advance revalidation —
+/// so a corpus of such stubs satisfies a fail-closed count while every
+/// boundary case has been deleted. The padded twin resolving AT `target` is
+/// what proves the arm ran its advance and landed there; the tight twin then
+/// attributes the refusal to the length check, because the two differ by one
+/// trailing byte and nothing else.
+struct ArmBoundary {
+    /// Label used in floor 1's messages and in the corpus case names.
+    arm: &'static str,
+    /// Class `proto` must MEASURE as, via `userspace_class`. An entry that
+    /// files a header under the wrong arm reds rather than mislabelling the
+    /// coverage.
+    class: u8,
+    /// The single extension header the witness declares at offset 40.
+    proto: u8,
+    /// The header's second byte: HdrExtLen for GENERIC/AUTH, the Fragment
+    /// header's `reserved` byte (which neither walker reads) for FRAGMENT.
+    hdr_len: u8,
+    /// L3-relative offset the arm advances to. NOT a model of the arithmetic:
+    /// floor 1 runs `walk_ipv6_ext_chain` on the padded twin and requires the
+    /// terminal at exactly this offset, so a wrong value here reds instead of
+    /// quietly re-describing the advance this file exists to stop describing.
+    target: usize,
+}
+
+/// GENERIC advances `(HdrExtLen + 1) * 8`, AUTH `(HdrExtLen + 2) * 4`
+/// (RFC 4302), FRAGMENT reads and advances a fixed 8 (RFC 8200 §4.5).
+///
+/// Two DISTINCT declared lengths for the two length-parameterised arms, one
+/// witness for the constant one — derived, not chosen. An arithmetic error in
+/// a length-parameterised arm is some `f'(l) = f(l) + a*l + b`; it is invisible
+/// at a declared length where `a*l + b == 0`, and an affine expression that
+/// vanishes at two distinct `l` is identically zero. So two distinct
+/// `hdr_len` values are necessary and sufficient to exclude that whole family,
+/// and floor 1 counts DISTINCT lengths rather than cases — two byte-identical
+/// witnesses are one magnitude, which is what the previous per-arm count
+/// missed. FRAGMENT's read and advance take no declared length, so its error
+/// family is the constant `f' = f + b` and one witness excludes it; a second
+/// would be decoration.
+const ARM_BOUNDARIES: &[ArmBoundary] = &[
+    ArmBoundary {
+        arm: "GENERIC",
+        class: EH_CLASS_GENERIC,
+        proto: DEST,
+        hdr_len: 0,
+        target: 48,
+    },
+    ArmBoundary {
+        arm: "GENERIC",
+        class: EH_CLASS_GENERIC,
+        proto: DEST,
+        hdr_len: 5,
+        target: 88,
+    },
+    ArmBoundary {
+        arm: "AUTH",
+        class: EH_CLASS_AUTH,
+        proto: AH,
+        hdr_len: 0,
+        target: 48,
+    },
+    ArmBoundary {
+        arm: "AUTH",
+        class: EH_CLASS_AUTH,
+        proto: AH,
+        hdr_len: 3,
+        target: 60,
+    },
+    ArmBoundary {
+        arm: "FRAGMENT",
+        class: EH_CLASS_FRAGMENT,
+        proto: FRAG,
+        hdr_len: 0,
+        target: 48,
+    },
+];
+
+/// `IPv6 || (proto, hdr_len) || zeroes`, cut to exactly `total` bytes.
+///
+/// The declared next header is TCP, so a walk that reaches the advance target
+/// resolves a TCP terminal there.
+fn boundary_case(proto: u8, hdr_len: u8, total: usize) -> Vec<u8> {
+    let mut b = vec![0u8; 40];
+    b[0] = 0x60;
+    b[6] = proto;
+    b.extend_from_slice(&[TCP, hdr_len]);
+    b.resize(total, 0);
+    b
+}
 
 /// Prefix an L3-relative buffer with `l3` bytes of L2, so one corpus case can
 /// be walked at every L3 offset the shim produces. Neither walker parses these
@@ -593,13 +704,6 @@ fn chain(headers: &[(u8, u8)], terminal: u8, trim: usize) -> Vec<u8> {
 /// starts at the IPv6 fixed header; `at_l3` prefixes it for the non-zero L3
 /// offsets.
 fn parity_corpus() -> Vec<(String, Vec<u8>)> {
-    const TCP: u8 = 6;
-    const HBH: u8 = 0;
-    const DEST: u8 = 60;
-    const AH: u8 = 51;
-    const FRAG: u8 = 44;
-    const MOBILITY: u8 = 135;
-
     let mut cases: Vec<(String, Vec<u8>)> = Vec::new();
 
     // Chain lengths across the 7/8 resolvable boundary, minimum-size headers.
@@ -663,33 +767,37 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
     frag_min[6] = FRAG;
     frag_min.extend_from_slice(&[TCP, 0]);
     cases.push(("Fragment truncated to 2 bytes".into(), frag_min));
-    // EXACT-BOUNDARY pairs, ONE PER ARM. The rule is the arm's own
-    // (`ipv6_ext_walk.rs`): a case can observe a weakened revalidation only when
-    // the packet ENDS at or before the advance target. "Exactly at end" must
-    // resolve and "one byte short" must fail closed, so any relaxation of the
-    // bounds check by even one byte flips the short case and reds this corpus.
+    // BOUNDARY WITNESS PAIRS, from `ARM_BOUNDARIES`. Each entry contributes the
+    // same packet cut to exactly its advance target and to one byte short of
+    // it. The rule is the arm's own (`ipv6_ext_walk.rs`): a case can observe a
+    // weakened revalidation only when the packet ENDS at or before the advance
+    // target, because with slack after the header the walk lands inside the
+    // buffer either way.
     //
     // Having the pair on the GENERIC arm alone was not enough: an off-by-one in
     // the AUTH revalidation, and a Fragment read shortened 8 -> 7, both survived
     // the whole corpus while the identical off-by-one in the generic arm red.
     // The shortest AUTH case left 18 bytes of slack and the shortest FRAGMENT
-    // case 6, so neither arm's bound was ever the thing under test. Each of the
-    // three below is a genuine fail-open when weakened: a 47-byte buffer goes
-    // from `None` to `Some((48, TCP))`, an L4 offset one byte past the packet.
+    // case 6, so neither arm's bound was ever the thing under test. Each tight
+    // twin is a genuine fail-open when the bound is weakened: a 47-byte buffer
+    // goes from `None` to `Some((48, TCP))`, an L4 offset one byte past the
+    // packet.
     //
-    //   GENERIC  DestOpt(len=0) at 40 advances (0+1)*8 -> 48
-    //   AUTH     AH(len=0)      at 40 advances (0+2)*4 -> 48   (RFC 4302)
-    //   FRAGMENT Fragment       at 40 reads all 8 bytes -> 48  (RFC 8200 §4.5)
-    //
-    // All three land on 48, so the pair is (48, 47) for every arm.
-    for (arm, first) in [("DestOpt(len=0)", DEST), ("AH(len=0)", AH), ("Fragment", FRAG)] {
-        for (name, total) in [("exactly at end", 48usize), ("one byte short", 47)] {
-            let mut b = vec![0u8; 40];
-            b[0] = 0x60;
-            b[6] = first;
-            b.extend_from_slice(&[TCP, 0]);
-            b.resize(total, 0);
-            cases.push((format!("{arm} buffer {name}"), b));
+    // Floor 1 verifies the pair semantics — padded resolves AT `target`, tight
+    // fails closed — so these are the corpus's boundary coverage AND its own
+    // evidence of being boundary coverage.
+    for w in ARM_BOUNDARIES {
+        for (name, total) in [
+            ("exactly at target", w.target),
+            ("one byte short of target", w.target - 1),
+        ] {
+            cases.push((
+                format!(
+                    "{} proto={} hdr_len={} buffer {name} {}",
+                    w.arm, w.proto, w.hdr_len, w.target
+                ),
+                boundary_case(w.proto, w.hdr_len, total),
+            ));
         }
     }
     // NON-FIRST fragment: frag_off bits set, so the bytes after the Fragment
@@ -705,54 +813,6 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
         b.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
         b.extend_from_slice(&[0x11; 20]);
         cases.push((format!("NON-FIRST Fragment(frag_off={frag_off:#06x}) -> TCP"), b));
-    }
-
-    // BOUNDARY-EXACT cases: the packet ends exactly ONE BYTE SHORT of each
-    // arm's advance target. A minimal-length packet proves the arm is
-    // exercised; it does not prove it is exercised AT THE BOUNDARY, and a
-    // realistic regression is a length computed one byte short, not a deleted
-    // check. With the packet ending at `target - 1` the correct revalidation
-    // (which demands `target`) fails while a `- 1` variant succeeds, so the two
-    // produce different verdicts. The generic arm already had this shape — its
-    // `one byte short` case is why a generic length-1 mutation reds — and these
-    // copy it to AH and Fragment, which did not.
-    //
-    // These sit at a DIFFERENT magnitude from the (48, 47) pairs above, on
-    // purpose: the pairs put every arm's boundary at the same target, so an
-    // error that scales with the declared length (rather than being a constant
-    // off-by-one) could hide in the coincidence. HdrExtLen 3 and 5 move the
-    // target to 60 and 88.
-    //
-    // AH: header at 40, HdrExtLen 3 -> advance (3+2)*4 = 20 -> target 60.
-    // Packet length 59 is one byte short of that.
-    {
-        let mut b = vec![0u8; 40];
-        b[0] = 0x60;
-        b[6] = AH;
-        b.extend_from_slice(&[TCP, 3]);
-        b.resize(59, 0);
-        cases.push(("AH(len=3) packet ends one byte short of target 60".into(), b));
-    }
-    // Fragment reads a fixed 8 bytes before advancing. A packet with exactly 7
-    // bytes available at the header start separates an 8-byte read from a
-    // 7-byte one: the former fails closed, the latter proceeds.
-    {
-        let mut b = vec![0u8; 40];
-        b[0] = 0x60;
-        b[6] = FRAG;
-        b.resize(47, 0);
-        b[40] = TCP;
-        cases.push(("Fragment with exactly 7 bytes available".into(), b));
-    }
-    // And the same one-short shape for the generic arm at a larger declared
-    // length, so the boundary is covered at more than one magnitude.
-    {
-        let mut b = vec![0u8; 40];
-        b[0] = 0x60;
-        b[6] = DEST;
-        b.extend_from_slice(&[TCP, 5]);
-        b.resize(87, 0); // target is 40 + (5+1)*8 = 88
-        cases.push(("DestOpt(len=5) packet ends one byte short of target 88".into(), b));
     }
 
     // Fragment and AH have their own advance arithmetic.
@@ -781,12 +841,8 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
         "HbH + Mobility -> TCP".into(),
         chain(&[(HBH, 0), (MOBILITY, 0)], TCP, 0),
     ));
-    // Everything above is HAND-CRAFTED, one named shape per case. Snapshot the
-    // count here, before the homogeneous sweep below, so a floor can see this
-    // block on its own. 54 cases today.
-    let handcrafted = cases.len();
-
-    // Every next-header value as the first header.
+    // Every next-header value as the first header, one minimum-size header in
+    // a 68-byte buffer.
     for p in 0u16..=255 {
         cases.push((format!("first={p}"), chain(&[(p as u8, 0)], TCP, 0)));
     }
@@ -799,20 +855,37 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
     // empty permissive list is empty, and `0 == 0 * 3`. Emptying this function
     // was measured to leave all five tests reporting `ok` in 0.00s.
     //
-    // What stood here was a single `cases.len() >= 200` whose message promised
-    // that no assertion in the file could pass vacuously. It was a VACUITY floor
-    // wearing a COVERAGE message: the 256-entry sweep directly above clears 200
-    // by itself with 56 to spare, so cutting the corpus down to that sweep AND
-    // deleting the generic arm's post-advance revalidation — the security
-    // property — was measured to leave all five tests `ok`. A floor whose prose
-    // is broader than its predicate is worse than no floor, because it
-    // manufactures the belief that a shape is protected.
+    // Two earlier rounds of floors stood here and both were PROXIES.
     //
-    // So each floor below binds ONE named property and its message claims only
-    // that. None of them claims the corpus is ADEQUATE: adequacy is not a
-    // property of a count, it is what `test/mutation/shim-ext-parity-acceptance.sh`
-    // measures by mutating the shim and requiring each guard to red. These floors
-    // exist to stop a shape being DELETED between acceptance runs.
+    //   Round 5 was a single `cases.len() >= 200` whose message promised that no
+    //   assertion in the file could pass vacuously. The 256-entry sweep above
+    //   clears 200 by itself with 56 to spare, so cutting the corpus down to
+    //   that sweep AND deleting the generic arm's post-advance revalidation —
+    //   the security property — was measured to leave all five tests `ok`.
+    //
+    //   Round 6 replaced it with five floors "each binding one shape". Three of
+    //   them bound CORRELATES of their shape rather than the shape: per-arm
+    //   coverage counted `b[6] == arm && fails_closed`, which a 40-byte packet
+    //   satisfies by failing the arm's INITIAL read having never reached the
+    //   boundary (and which two byte-identical 47-byte Fragment cases satisfied
+    //   twice over, so the "more than one magnitude" claim was unbound); the
+    //   chain-length floor counted a terminal OFFSET, which one `DestOpt(len=6)`
+    //   header reaches; and the next-header floor read `b[6]` off buffers that
+    //   need not be walked at all, which 256 seven-byte stubs satisfy. One
+    //   corpus edit defeating all three while all five floors passed was
+    //   measured, again with the generic revalidation deleted.
+    //
+    // So each floor below binds its shape by CONSTRUCTION (the corpus must
+    // contain a locally rebuilt reference buffer, byte for byte) and, where the
+    // shape is behavioural, by MEASUREMENT with this crate's walker. A count of
+    // cases satisfying a predicate is exactly what kept failing; a named buffer
+    // that must be present, and must behave as claimed, does not have a
+    // degenerate satisfier.
+    //
+    // None of them claims the corpus is ADEQUATE: adequacy is not a property of
+    // a floor, it is what `test/mutation/shim-ext-parity-acceptance.sh` measures
+    // by mutating the shim and requiring each guard to red. These floors exist
+    // to stop a shape being DELETED between acceptance runs.
     //
     // All of them read only the corpus bytes and this crate's walker. Nothing
     // here touches the shim, so no mutation the acceptance matrix applies can
@@ -820,128 +893,237 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
     // finding. Neither negative-control test calls this function, so a floor red
     // leaves both CONTROL columns `ok` and the harness's attributability rule
     // intact.
-    let fails_closed = |b: &[u8]| userspace_verdict(b, 0) == Verdict::FailClosed;
+    let present: HashSet<&[u8]> = cases.iter().map(|(_, b)| b.as_slice()).collect();
+    let contains = |b: &[u8]| present.contains(b);
 
-    // 1. THE HAND-CRAFTED BLOCK EXISTS. Counts only the cases built before the
-    //    sweep, so the sweep cannot satisfy it.
-    //    Binds: the block was not removed wholesale.
-    //    Does NOT bind: any individual shape, or the block's internal balance —
-    //    floors 2-5 each name one shape.
-    assert!(
-        handcrafted >= 40,
-        "the #4555 parity corpus built only {handcrafted} hand-crafted cases before the \
-         next-header sweep. The sweep contributes 256 cases of ONE homogeneous shape (a single \
-         minimum-size header in a 68-byte buffer) and clears any aggregate size floor by itself, \
-         so `cases.len()` cannot see this block disappear — which is why this floor counts the \
-         block alone."
-    );
-
-    // 2. PER-ARM BOUNDARY-TIGHT COVERAGE. A case can observe a post-advance
-    //    revalidation that was deleted, or weakened by a byte, only if the packet
-    //    ENDS at or before the advance target: with slack after the header the
-    //    walk lands inside the buffer either way. "Ends at or before the target"
-    //    is not read off the bytes here — that would re-model the advance
-    //    arithmetic this file exists to stop modelling — it is MEASURED, as this
-    //    crate's walker failing closed.
+    // 1. PER-ARM BOUNDARY WITNESS PAIRS.
     //
-    //    Keyed by the FIRST extension header the case declares. Every
-    //    boundary-tight case here is a single-header chain, so that is also the
-    //    arm which truncates; a multi-header chain truncating on a LATER arm
-    //    would be counted under its first header's arm. The count is therefore a
-    //    lower bound on per-arm coverage, not a census.
+    //    For every `ARM_BOUNDARIES` entry the corpus must contain BOTH twins,
+    //    and the pair must behave as a boundary witness:
+    //      - the PADDED twin (exactly `target` bytes) resolves the terminal at
+    //        exactly `target`, which can only happen if the arm ran its advance
+    //        and landed there — this is what proves the boundary was REACHED;
+    //      - the TIGHT twin (one byte shorter, identical otherwise) fails
+    //        closed, which attributes the refusal to the length check at
+    //        `target` rather than to an earlier read.
+    //    Neither half alone is the property. Round 6 asserted only the
+    //    fail-closed half, and a 40-byte packet declaring the arm satisfies that
+    //    while failing the arm's first two-byte read.
     //
-    //    Two per arm, not one: one case makes the arm's bound observable at a
-    //    single magnitude, and an error that scales with the declared length
-    //    could hide in a coincidence at that magnitude — which is why the AUTH
-    //    cases above end at 42/47/59 and the FRAGMENT cases at 42/47/47 rather
-    //    than all at one target. GENERIC 6, AUTH 3, FRAGMENT 3 today.
-    for (arm, firsts, want) in [
-        ("GENERIC", &[HBH, DEST, MOBILITY][..], 2usize),
-        ("AUTH", &[AH][..], 2),
-        ("FRAGMENT", &[FRAG][..], 2),
-    ] {
-        let n = cases
-            .iter()
-            .filter(|(_, b)| firsts.contains(&b[6]) && fails_closed(b))
-            .count();
+    //    Binds: per arm, that boundary coverage exists at >= `want` DISTINCT
+    //    declared lengths (see `ARM_BOUNDARIES` for why 2/2/1 is derived rather
+    //    than chosen), that the corpus still carries those exact buffers, and
+    //    that the header each entry names really is classified into the arm it
+    //    claims.
+    //    Does NOT bind: boundary coverage of an arm reached as a LATER header in
+    //    a multi-header chain — every witness here is a single-header packet, so
+    //    an arm's bound is exercised only at offset 40 (plus the L3 prefix).
+    //    Does NOT bind: any non-boundary shape (truncation, non-first fragment,
+    //    over-long declared lengths); those are separate cases above, and only
+    //    the acceptance matrix measures whether they are pulling their weight.
+    for w in ARM_BOUNDARIES {
+        let padded = boundary_case(w.proto, w.hdr_len, w.target);
+        let tight = boundary_case(w.proto, w.hdr_len, w.target - 1);
+        assert_eq!(
+            userspace_class(w.proto),
+            w.class,
+            "#4555 corpus floor 1: ARM_BOUNDARIES files next-header {} under the {} arm, but this \
+             crate classifies it as {}. The witness would report coverage of an arm it does not \
+             exercise.",
+            w.proto,
+            w.arm,
+            class_name(userspace_class(w.proto)),
+        );
+        assert_eq!(
+            userspace_verdict(&padded, 0),
+            Verdict::L4(w.target, TCP),
+            "#4555 corpus floor 1: the {} witness (proto={}, hdr_len={}) does not resolve a \
+             terminal at its declared advance target {} when the packet ends exactly there — it \
+             gives {:?}. Either the target is wrong or the arm is not reached, and in both cases \
+             the tight twin's fail-closed proves nothing about this arm's boundary.",
+            w.arm,
+            w.proto,
+            w.hdr_len,
+            w.target,
+            userspace_verdict(&padded, 0),
+        );
+        assert_eq!(
+            userspace_verdict(&tight, 0),
+            Verdict::FailClosed,
+            "#4555 corpus floor 1: the {} witness (proto={}, hdr_len={}) still resolves with the \
+             packet one byte short of target {}. The pair no longer isolates the post-advance \
+             length check to a single byte.",
+            w.arm,
+            w.proto,
+            w.hdr_len,
+            w.target,
+        );
         assert!(
-            n >= want,
-            "the #4555 parity corpus has only {n} boundary-tight case(s) on the {arm} arm \
-             (want >= {want}): cases declaring a first extension header in {firsts:?} whose packet \
-             ends at or before the advance target, measured as walk_ipv6_ext_chain failing closed. \
-             Only that shape can observe a deleted or one-byte-weakened post-advance revalidation \
-             in this arm; a padded case lands inside the buffer with or without the check. Two are \
-             required so the arm's bound is exercised at more than one magnitude."
+            contains(&padded) && contains(&tight),
+            "#4555 corpus floor 1: the {} boundary witness pair (proto={}, hdr_len={}, target={}) \
+             is no longer in the corpus. Only a packet ENDING at or before an arm's advance target \
+             can observe a deleted or one-byte-weakened post-advance revalidation in that arm; a \
+             padded case lands inside the buffer with or without the check.",
+            w.arm,
+            w.proto,
+            w.hdr_len,
+            w.target,
+        );
+    }
+    for (arm, want) in [("GENERIC", 2usize), ("AUTH", 2), ("FRAGMENT", 1)] {
+        let lens: BTreeSet<u8> = ARM_BOUNDARIES
+            .iter()
+            .filter(|w| w.arm == arm)
+            .map(|w| w.hdr_len)
+            .collect();
+        assert!(
+            lens.len() >= want,
+            "#4555 corpus floor 1: the {arm} arm has boundary witnesses at only {} distinct \
+             declared length(s) {lens:?}, want >= {want}. An arithmetic error of the form \
+             `f(l) + a*l + b` is invisible wherever `a*l + b == 0`, so one magnitude cannot \
+             exclude it; two distinct lengths can, because an affine expression vanishing at two \
+             points is identically zero. Adding a SECOND witness at the SAME declared length does \
+             not help, which is why this counts distinct lengths and not cases.",
+            lens.len(),
         );
     }
 
-    // 3. THE RESOLVABLE-CHAIN-LENGTH BOUNDARY IS STRADDLED.
+    // 2. THE RESOLVABLE-CHAIN-LENGTH BOUNDARY IS STRADDLED, BY CONSTRUCTION.
     //    `shim_ipv6_ext_walk_matches_userspace_walker` argues the shim's
-    //    `MAX_EXT_HDRS == MAX_IPV6_EXT_HEADERS - 1` relation rather than asserting
-    //    numeric equality, and cites THIS corpus as what measures the exit
-    //    semantics the argument rests on. That citation is only true while the
-    //    corpus contains a chain at the longest resolvable length and a chain
-    //    past it. Both are measured on this crate's walker.
-    //    Does NOT bind: that the two sit adjacent, nor that the intermediate
-    //    lengths are present.
-    let longest_resolved = 40 + 8 * (MAX_IPV6_EXT_HEADERS - 1);
-    let at_max_len = cases
-        .iter()
-        .filter(|(_, b)| userspace_verdict(b, 0) == Verdict::L4(longest_resolved, TCP))
-        .count();
-    let over_limit = cases
-        .iter()
-        .filter(|(_, b)| userspace_verdict(b, 0) == Verdict::OverLimit)
-        .count();
+    //    `MAX_EXT_HDRS == MAX_IPV6_EXT_HEADERS - 1` relation rather than
+    //    asserting numeric equality, and cites THIS corpus as what measures the
+    //    exit semantics the argument rests on. That citation is only true while
+    //    the corpus contains a chain of exactly the longest resolvable NUMBER OF
+    //    HEADERS and one header more.
+    //
+    //    Counting header-count-by-terminal-offset was the round-6 defect: a
+    //    single `DestOpt(len=6)` header also lands on `40 + 8 * (MAX - 1)`, so
+    //    every seven-header case could be deleted while the floor reported a
+    //    seven-header chain present. The two chains are therefore rebuilt here
+    //    and required by byte identity, and their verdicts are measured so the
+    //    boundary is observed rather than assumed.
+    //    Does NOT bind: the intermediate lengths, nor chains built from
+    //    non-minimum-size or non-DestOpt headers.
+    let at_max_hdrs = MAX_IPV6_EXT_HEADERS - 1;
+    let at_max = chain(&vec![(DEST, 0); at_max_hdrs], TCP, 0);
+    let over = chain(&vec![(DEST, 0); at_max_hdrs + 1], TCP, 0);
     assert!(
-        at_max_len >= 1 && over_limit >= 1,
-        "the #4555 parity corpus no longer straddles the resolvable chain-length boundary: \
-         {at_max_len} case(s) resolve a terminal at offset {longest_resolved} (a chain of \
-         MAX_IPV6_EXT_HEADERS - 1 = {} minimum-size headers, the longest this crate resolves) and \
-         {over_limit} case(s) exceed the bound. Without one of each, nothing here measures where \
-         either walker stops, and the MAX_EXT_HDRS == MAX_IPV6_EXT_HEADERS - 1 relation asserted \
-         in shim_ipv6_ext_walk_matches_userspace_walker is argued from a comment rather than \
+        contains(&at_max) && contains(&over),
+        "#4555 corpus floor 2: the corpus no longer contains BOTH the chain of exactly \
+         {at_max_hdrs} minimum-size DestOpt headers (the longest this crate resolves) and the \
+         chain of {} (the first it refuses). Without the pair, nothing here measures where either \
+         walker stops, and the MAX_EXT_HDRS == MAX_IPV6_EXT_HEADERS - 1 relation asserted in \
+         shim_ipv6_ext_walk_matches_userspace_walker is argued from a comment rather than \
          observed.",
-        MAX_IPV6_EXT_HEADERS - 1,
+        at_max_hdrs + 1,
     );
-
-    // 4. EVERY NEXT-HEADER VALUE APPEARS AS A FIRST HEADER. The behavioural
-    //    walked-type-set comparison — which values one walker steps THROUGH and
-    //    the other treats as terminal — exists only where the corpus supplies
-    //    that value. (`shim_ipv6_ext_walk_matches_userspace_walker` covers all 256
-    //    against the EMITTED table, but that is the manifest's classification,
-    //    not the executed walk's.)
-    //    Does NOT bind: that each value is presented in more than one position;
-    //    only the first-header position is swept.
-    let mut seen = [false; 256];
-    for (_, b) in &cases {
-        seen[usize::from(b[6])] = true;
-    }
-    let distinct = seen.iter().filter(|s| **s).count();
     assert_eq!(
-        distinct, 256,
-        "the #4555 parity corpus presents only {distinct} of 256 next-header values as a chain's \
-         first header; the executed walked-type-set comparison is blind to the missing ones"
+        userspace_verdict(&at_max, 0),
+        Verdict::L4(40 + 8 * at_max_hdrs, TCP),
+        "#4555 corpus floor 2: this crate no longer resolves a chain of {at_max_hdrs} minimum-size \
+         extension headers, so the corpus does not straddle the boundary it claims to"
+    );
+    assert_eq!(
+        userspace_verdict(&over, 0),
+        Verdict::OverLimit,
+        "#4555 corpus floor 2: this crate no longer refuses a chain of {} minimum-size extension \
+         headers; the over-limit side of the boundary is not in the corpus",
+        at_max_hdrs + 1,
     );
 
-    // 5. THE L3 OFFSETS ARE NOT ALL ZERO, AND INCLUDE ZERO.
-    //    `L3_OFFSETS.len() >= 3` stood here and asserted a PROXY: `[0, 0, 0]` has
-    //    length 3 and restores exactly the l3-blindness the message described.
-    //    The two properties the array actually carries are below, each asserted
-    //    directly.
-    //    Does NOT bind: the specific 14 and 18 `parse_l2` produces. Those are
-    //    declared two screens up in a three-element const; the corpus is 200
-    //    lines, which is the asymmetry these floors exist for.
+    // 3. EVERY NEXT-HEADER VALUE IS PRESENTED AS A WALKED FIRST HEADER.
+    //    The behavioural walked-type-set comparison — which values one walker
+    //    steps THROUGH and the other treats as terminal — exists only where the
+    //    corpus supplies that value in a buffer both walkers actually walk.
+    //    (`shim_ipv6_ext_walk_matches_userspace_walker` covers all 256 against
+    //    the EMITTED table, but that is the manifest's classification, not the
+    //    executed walk's.)
+    //
+    //    Round 6 read `b[6]` off every case, which 256 seven-byte buffers
+    //    satisfy — both walkers reject those before reading the fixed IPv6
+    //    header, so no classifier ever runs. Here the canonical 68-byte case is
+    //    rebuilt for each value and required by byte identity, and each is
+    //    required NOT to fail closed, which is the direct statement that the
+    //    walk got far enough to classify the value.
+    //    Does NOT bind: that each value is presented in more than one position;
+    //    only the first-header position is swept, at one declared length.
+    let mut missing: Vec<u16> = Vec::new();
+    let mut unwalked: Vec<u16> = Vec::new();
+    for p in 0u16..=255 {
+        let want = chain(&[(p as u8, 0)], TCP, 0);
+        if !contains(&want) {
+            missing.push(p);
+        } else if userspace_verdict(&want, 0) == Verdict::FailClosed {
+            unwalked.push(p);
+        }
+    }
     assert!(
-        L3_OFFSETS.iter().any(|&o| o != 0),
-        "every #4555 corpus L3 offset is 0 ({L3_OFFSETS:?}): replacing the revalidation's base \
-         `l3_offset as usize` with `0usize` is BIT-IDENTICAL at l3 = 0 and a fail-open of exactly \
-         l3 bytes at the 14 and 18 the shim passes, so at l3 = 0 alone that mutation is invisible \
-         by construction — which is how it survived three rounds."
+        missing.is_empty() && unwalked.is_empty(),
+        "#4555 corpus floor 3: {} of 256 next-header values have no canonical single-header case \
+         ({missing:?}) and {} are present but fail closed before classification ({unwalked:?}). \
+         The executed walked-type-set comparison is blind to both.",
+        missing.len(),
+        unwalked.len(),
     );
+
+    // 4. A CHAIN WHOSE WALK REACHES LARGE INTERMEDIATE OFFSETS.
+    //    A statement added inside the walk loop but OUTSIDE the `match` (leak
+    //    #3, and acceptance row 10) perturbs nothing on a short chain: the
+    //    concrete mutation is `if offset > 200 { break; }`, invisible until the
+    //    walk is still on an extension header past that offset. Only a chain of
+    //    several maximum-declared-length headers gets there.
+    //    Binds: those two chains are still in the corpus.
+    //    Does NOT bind: any particular offset threshold — the shape is "a
+    //    multi-header chain that walks a long way", and a mutation guarded at a
+    //    higher offset than these chains reach would survive. That is what the
+    //    acceptance matrix measures, not this floor.
+    for n in [3usize, 5] {
+        let long = chain(&vec![(DEST, 15); n], TCP, 0);
+        assert!(
+            contains(&long),
+            "#4555 corpus floor 4: the chain of {n} x DestOpt(len=15) is gone. A statement placed \
+             inside the walk loop but outside the `match` is observable only while the walk is \
+             still on an extension header at a large offset, which needs a chain of several \
+             maximum-length headers."
+        );
+    }
+
+    // 5. THE CORPUS WALKS AT EVERY L3 OFFSET THIS CRATE'S L2 PARSER PRODUCES.
+    //    `L3_OFFSETS.len() >= 3` stood here in round 5 and asserted a PROXY:
+    //    `[0, 0, 0]` has length 3 and restores exactly the l3-blindness the
+    //    message described. Round 6 replaced it with `any(!= 0)` and
+    //    `contains(0)`, which `[0, 14, 14]` also satisfies while dropping the
+    //    tagged offset entirely. So the offsets are MEASURED here: `at_l3`
+    //    builds the untagged and 802.1Q prefixes, and `frame_l3_offset` — the
+    //    function that computes the L3 offset the forwarding path walks at —
+    //    says where L3 starts in each.
+    //    Binds: every offset this crate's L2 parser produces is in the array,
+    //    plus 0, the offset `walk_ipv6_ext_chain`'s other callers pass when they
+    //    hand it an L3-relative slice.
+    //    Does NOT bind: the SHIM's `parse_l2`, which is in the aya crate and
+    //    cannot be linked here. That the two agree on 14/18 is a documented
+    //    claim (see `L3_OFFSETS`), not something this floor measures.
+    let probe = chain(&[], TCP, 0);
+    for tag in [14usize, 18] {
+        let framed = at_l3(&probe, tag);
+        let measured = frame_l3_offset(&framed).unwrap_or_else(|| {
+            panic!(
+                "#4555 corpus floor 5: frame_l3_offset refused the {tag}-byte L2 prefix at_l3 \
+                 builds; the floor cannot measure what it claims to"
+            )
+        });
+        assert!(
+            L3_OFFSETS.contains(&measured),
+            "#4555 corpus floor 5: the L3 offsets ({L3_OFFSETS:?}) omit {measured}, an offset this crate's \
+             frame_l3_offset produces (here from the {tag}-byte prefix). Replacing the \
+             revalidation's base `l3_offset as usize` with `0usize` is BIT-IDENTICAL at l3 = 0 and \
+             a fail-open of exactly l3 bytes at every non-zero offset, so an offset missing from \
+             this array is a mutation nothing can see."
+        );
+    }
     assert!(
         L3_OFFSETS.contains(&0),
-        "the #4555 corpus L3 offsets ({L3_OFFSETS:?}) no longer include 0, the offset \
+        "#4555 corpus floor 5: the L3 offsets ({L3_OFFSETS:?}) no longer include 0, the offset \
          `walk_ipv6_ext_chain`'s other callers pass when they hand it an L3-relative slice"
     );
 
@@ -1046,9 +1228,6 @@ fn shim_walk_and_userspace_walk_agree_over_a_corpus() {
 /// sighting — a shim change, `make generate`, and the #1864 verifier gate.
 #[test]
 fn shim_is_not_more_permissive() {
-    const TCP: u8 = 6;
-    const FRAG: u8 = 44;
-
     // `IPv6 || Fragment(next=TCP, frag_off, ident) || 20 payload bytes`.
     // Byte 60 is the payload byte `parse_l4` would read as the TCP data offset,
     // set so the shim's TCP parse ACCEPTS these payload bytes as a header.
@@ -1192,17 +1371,22 @@ fn shim_is_not_more_permissive() {
 /// alongside the corpus and proved nothing about it. That assertion is now
 /// userspace-only.
 ///
-/// What is left on the shim side executes NO arm body at all:
-///   - a chain with no extension headers never enters a `match` arm, so no
-///     advance arithmetic, no revalidation and no loop-body statement applies;
+/// What is left on the shim side executes no arm body any mutation touches:
+///   - a chain with NO extension headers does enter the walk loop — it runs
+///     the classifier once, takes the `match`'s terminal catch-all and breaks —
+///     but that path has no advance arithmetic, no post-advance revalidation
+///     and no header read to perturb. The acceptance matrix's added
+///     `if offset > 200 { break; }` (the statement-inside-the-loop row) IS
+///     executed here, at offset 40, where it is false: the statement runs and
+///     changes nothing, which is precisely what makes this a control rather
+///     than a co-signer. An earlier revision claimed the packet "never enters
+///     a `match` arm", which is not what the loop does;
 ///   - a buffer too short for the fixed 40-byte header fails closed before the
-///     walk starts.
-/// Both are fixed by RFC 8200 and unchanged by any mutation to the walk, so a
-/// red here means the corpus harness or this crate's walker broke.
+///     walk starts, so no iteration runs at all.
+/// Both outcomes are fixed by RFC 8200 and unchanged by any mutation to the
+/// walk, so a red here means the corpus harness or this crate's walker broke.
 #[test]
 fn shim_walk_corpus_negative_control() {
-    const TCP: u8 = 6;
-    const DEST: u8 = 60;
     // No extension headers: L4 sits immediately after the fixed 40-byte header.
     let plain = chain(&[], TCP, 0);
     assert_eq!(userspace_verdict(&plain, 0), Verdict::L4(40, TCP));

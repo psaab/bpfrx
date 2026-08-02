@@ -50,9 +50,12 @@
 #      window; the `cmp` is what proves the restore happened.
 #   4. EVERY ROW CARRIES AN EXPECTATION. A row that must RED and a row that must
 #      SURVIVE are both checked, so a harness that reds unconditionally fails
-#      just as loudly as one that never reds. Row 11 is a semantically null
+#      just as loudly as one that never reds. Row 12 is a semantically null
 #      edit to the mutated file: it must survive, which is what separates "the
 #      guard binds this BEHAVIOUR" from "the guard noticed the file changed".
+#   5. ONE MUTATION PER ROW, and one arm per row where an edit could be
+#      applied to several. A row that mutates two arms at once scores RED on
+#      either one reding, so it cannot support a claim about both.
 #
 # Usage:  test/mutation/shim-ext-parity-acceptance.sh
 # Requires: cargo + the pinned toolchain, python3; no root, no cluster, no
@@ -234,13 +237,19 @@ echo "=== #4555 acceptance: mutate the shim walk, the guards must red ==="
 
 # --- preconditions --------------------------------------------------------
 if git -C "${REPO}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  if ! git -C "${REPO}" diff --quiet -- "${WALK}"; then
-    echo "ABORT: ${WALK_REL} differs from git HEAD. A mutation the guards do NOT"
-    echo "       detect would be captured as the pristine copy and restored as"
-    echo "       such; passing tests are not tree cleanliness."
+  # `diff --quiet HEAD --`, NOT `diff --quiet --`. The latter compares the
+  # worktree against the INDEX, so a STAGED mutation is "no difference" and
+  # sails through a check whose own abort text spells out the consequence: the
+  # mutation is captured as GOLD, restored as pristine, and the whole matrix
+  # runs against a poisoned baseline. `HEAD` compares against the commit, which
+  # is what "matches git HEAD" claims and what the property needs.
+  if ! git -C "${REPO}" diff --quiet HEAD -- "${WALK}"; then
+    echo "ABORT: ${WALK_REL} differs from git HEAD (staged or unstaged). A mutation"
+    echo "       the guards do NOT detect would be captured as the pristine copy and"
+    echo "       restored as such; passing tests are not tree cleanliness."
     exit 1
   fi
-  echo "PRECONDITION: ${WALK_REL} matches git HEAD"
+  echo "PRECONDITION: ${WALK_REL} matches git HEAD (index included)"
 else
   echo "PRECONDITION: tree cleanliness UNVERIFIED — ${REPO} is not a git work tree"
 fi
@@ -302,8 +311,6 @@ AUTH_ARM='            EH_CLASS_AUTH => {
             }'
 FRAG_READ='                let frag = read_bytes(data, data_end, offset as usize, 8)?;'
 LOOP_HEAD='    for _ in 0..MAX_EXT_HDRS {'
-REVAL_BASE='                    l3_offset as usize,
-                    (offset - l3_offset) as usize,'
 
 # Quoted patterns, so bash treats them literally rather than as globs.
 GENERIC_ADV16="${GENERIC_ARM/"+ 1) * 8"/"+ 1) * 16"}"
@@ -312,7 +319,11 @@ AUTH_ADV8="${AUTH_ARM/"+ 2) * 4"/"+ 2) * 8"}"
 AUTH_REVAL_M1="${AUTH_ARM/"(offset - l3_offset) as usize"/"(offset - l3_offset - 1) as usize"}"
 FRAG_READ_7="${FRAG_READ/", 8)?;"/", 7)?;"}"
 FRAG_READ_2="${FRAG_READ/", 8)?;"/", 2)?;"}"
-REVAL_BASE_0="${REVAL_BASE/"l3_offset as usize,"/"0usize,"}"
+# The revalidation's BASE offset, PER ARM. `${var/pat/rep}` replaces the first
+# match, which inside a single arm is that arm's `l3_offset as usize,` line —
+# `offset as usize, 2)` on the read above it does not contain the `l3_` prefix.
+GENERIC_REVAL_L3_0="${GENERIC_ARM/"l3_offset as usize,"/"0usize,"}"
+AUTH_REVAL_L3_0="${AUTH_ARM/"l3_offset as usize,"/"0usize,"}"
 # A real edit that compiles and changes nothing observable — see property 4.
 GENERIC_RENAMED="${GENERIC_ARM//opt/hdr}"
 # Drop the whole post-advance revalidation call from an arm.
@@ -344,11 +355,29 @@ m_stmt_outside_match()   { spec "${LOOP_HEAD}"    "${LOOP_HEAD_GUARDED}"  | py_s
 m_semantically_null()    { spec "${GENERIC_ARM}"  "${GENERIC_RENAMED}"    | py_sub 1; }
 # The revalidation's BASE offset stops accounting for l3. Bit-identical at
 # l3 = 0 — the only value the corpus used to walk at — and a fail-open of
-# exactly l3 bytes at the 14 and 18 the shim actually passes. Both arms.
-m_l3_base_zero()         { spec "${REVAL_BASE}"   "${REVAL_BASE_0}"       | py_sub 2; }
+# exactly l3 bytes at the 14 and 18 the shim actually passes.
+#
+# ONE ROW PER ARM, deliberately. A single row mutating BOTH arms at once
+# requires only ONE guard failure to score RED, so the GENERIC arm reding
+# satisfies it while AUTH coverage has degenerated to nothing — the row's
+# "both arms" label would then be a claim the row cannot support. Split, each
+# row is attributable to the arm it names.
+m_generic_reval_l3_zero() { spec "${GENERIC_ARM}" "${GENERIC_REVAL_L3_0}" | py_sub 1; }
+m_auth_reval_l3_zero()    { spec "${AUTH_ARM}"    "${AUTH_REVAL_L3_0}"    | py_sub 1; }
 
 # --- the matrix -----------------------------------------------------------
+#
+# Rows are ACCOUNTED, not just aggregated into a final PASS/FAIL. A bare
+# "acceptance PASS" cannot be audited against the matrix it claims to have run:
+# a row silently dropped from the list below produces the same line as a row
+# that passed. The tail prints passed-of-total with every row's name and
+# outcome, so the evidence quoted in a PR body is checkable against the script.
 rc=0
+rows_total=0
+rows_passed=0
+declare -a row_names=()
+declare -a row_outcomes=()
+
 row() {  # row <mutator> <red|survive> <label>
   local fn="$1" want="$2" label="$3"
   cp "${GOLD}" "${WALK}"
@@ -356,30 +385,54 @@ row() {  # row <mutator> <red|survive> <label>
   cmp -s "${GOLD}" "${WALK}" && fail "mutator ${fn} left the file unchanged"
   run "${label}"
   local got=$?
+  local outcome
+  rows_total=$((rows_total + 1))
   case "${want}:${got}" in
-    red:1|survive:0) ;;
-    red:0)     echo "      ^^ MUTATION SURVIVED — the guards do not bind this edit"; rc=1 ;;
-    survive:1) echo "      ^^ RED ON A SEMANTICALLY NULL EDIT — this harness reds on change, not on behaviour"; rc=1 ;;
-    *:2)       echo "      ^^ BUILD FAILED — this row proves nothing about the guards"; rc=1 ;;
-    *:3)       echo "      ^^ CONTROL MOVED — this row proves nothing about the guards"; rc=1 ;;
-    *)         echo "      ^^ unexpected outcome ${got} for expectation ${want}"; rc=1 ;;
+    red:1)     outcome="PASS (red as required)"; rows_passed=$((rows_passed + 1)) ;;
+    survive:0) outcome="PASS (survived as required)"; rows_passed=$((rows_passed + 1)) ;;
+    red:0)     outcome="FAIL (mutation SURVIVED)"
+               echo "      ^^ MUTATION SURVIVED — the guards do not bind this edit"; rc=1 ;;
+    survive:1) outcome="FAIL (red on a null edit)"
+               echo "      ^^ RED ON A SEMANTICALLY NULL EDIT — this harness reds on change, not on behaviour"; rc=1 ;;
+    *:2)       outcome="FAIL (build)"
+               echo "      ^^ BUILD FAILED — this row proves nothing about the guards"; rc=1 ;;
+    *:3)       outcome="FAIL (control moved)"
+               echo "      ^^ CONTROL MOVED — this row proves nothing about the guards"; rc=1 ;;
+    *)         outcome="FAIL (outcome ${got} for ${want})"
+               echo "      ^^ unexpected outcome ${got} for expectation ${want}"; rc=1 ;;
   esac
+  row_names+=("${label}")
+  row_outcomes+=("${outcome}")
 }
 
-row m_generic_advance      red     " 1. GENERIC advance *8 -> *16"
-row m_generic_reval_delete red     " 2. GENERIC post-advance revalidation DELETED"
-row m_generic_reval_minus1 red     " 3. GENERIC revalidation length - 1"
-row m_auth_advance         red     " 4. AUTH advance *4 -> *8"
-row m_auth_reval_delete    red     " 5. AUTH post-advance revalidation DELETED"
-row m_auth_reval_minus1    red     " 6. AUTH revalidation length - 1"
-row m_frag_read_2          red     " 7. FRAGMENT read 8 -> 2"
-row m_frag_read_7          red     " 8. FRAGMENT read 8 -> 7"
-row m_l3_base_zero         red     " 9. revalidation base l3_offset -> 0 (both arms)"
-row m_stmt_outside_match   red     "10. statement inside the loop, outside the match"
-row m_semantically_null    survive "11. NEG-CTL semantically null rename (must survive)"
+row m_generic_advance       red     " 1. GENERIC advance *8 -> *16"
+row m_generic_reval_delete  red     " 2. GENERIC post-advance revalidation DELETED"
+row m_generic_reval_minus1  red     " 3. GENERIC revalidation length - 1"
+row m_auth_advance          red     " 4. AUTH advance *4 -> *8"
+row m_auth_reval_delete     red     " 5. AUTH post-advance revalidation DELETED"
+row m_auth_reval_minus1     red     " 6. AUTH revalidation length - 1"
+row m_frag_read_2           red     " 7. FRAGMENT read 8 -> 2"
+row m_frag_read_7           red     " 8. FRAGMENT read 8 -> 7"
+row m_generic_reval_l3_zero red     " 9. GENERIC revalidation base l3_offset -> 0"
+row m_auth_reval_l3_zero    red     "10. AUTH revalidation base l3_offset -> 0"
+row m_stmt_outside_match    red     "11. statement inside the loop, outside the match"
+row m_semantically_null     survive "12. NEG-CTL semantically null rename (must survive)"
 
 cp "${GOLD}" "${WALK}"
 cmp -s "${GOLD}" "${WALK}" || fail "restore did not reproduce the pristine file"
-run "12. RESTORED" || rc=1
+rows_total=$((rows_total + 1))
+if run "13. RESTORED"; then
+  rows_passed=$((rows_passed + 1))
+  row_names+=("13. RESTORED"); row_outcomes+=("PASS (green again)")
+else
+  rc=1
+  row_names+=("13. RESTORED"); row_outcomes+=("FAIL (tree not green after restore)")
+fi
+
+echo "--- row accounting ---------------------------------------------------"
+for i in "${!row_names[@]}"; do
+  printf '%-56s %s\n' "${row_names[$i]}" "${row_outcomes[$i]}"
+done
+echo "rows passed: ${rows_passed}/${rows_total} (plus row 0 baseline and preflights P1/P2)"
 echo "=== acceptance $([ ${rc} -eq 0 ] && echo PASS || echo FAIL) ==="
 exit ${rc}

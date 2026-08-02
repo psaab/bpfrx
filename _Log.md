@@ -66816,3 +66816,126 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+
+## 2026-08-01 — #4555 round 7: the replacement corpus floors were themselves proxies
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Third layer of one defect. Round 5 had a single
+  `cases.len() >= 200` floor that 256 sweep cases cleared alone. Round 6
+  replaced it with five floors "each binding one shape". Three of the five
+  bound CORRELATES of their shape, and ONE corpus edit defeated all three
+  with all five still passing.
+
+  **Reproduced before fixing.** Applied the degenerate corpus (40 pre-sweep
+  filler entries, two 40-byte unreadable-header stubs per arm, one padded
+  `DestOpt(len=6)`, one eight-header chain, the sweep replaced by 256
+  seven-byte stubs, `L3_OFFSETS` untouched) TOGETHER with the shim's GENERIC
+  post-advance revalidation deleted: all five parity tests reported `ok`.
+  Each defeat also confirmed individually in the same run — a 40-byte packet
+  satisfies `b[6] == arm && fails_closed` while `raw_shim_walk` returns
+  `None` at the arm's INITIAL two-byte read; the two FRAGMENT cases the
+  "more than one magnitude" claim rested on are BYTE-IDENTICAL (both 47
+  bytes, `b[40] = TCP`, rest zero); `chain(&[(DEST, 6)], TCP, 0)` — ONE
+  header — resolves `L4(96, TCP)`, the same offset a seven-header chain
+  lands on; and 256 seven-byte buffers give `distinct == 256` with both
+  walkers rejecting before the fixed IPv6 header.
+
+  **M-1..3 — floors now bind by CONSTRUCTION and MEASUREMENT, not by a
+  count of predicate-satisfying cases.** A count has degenerate satisfiers;
+  a named buffer that must be present byte-for-byte, and must behave as
+  claimed, does not.
+
+  Floor 1 is a WITNESS PAIR per `ARM_BOUNDARIES` entry: the padded twin
+  (exactly `target` bytes) must resolve the terminal at exactly `target`,
+  which can only happen if the arm ran its advance and landed there — that
+  is what proves the boundary was REACHED — and the tight twin, one byte
+  shorter and otherwise identical, must fail closed, which attributes the
+  refusal to the length check rather than an earlier read. `FailClosed`
+  alone was the round-6 proxy: it loses WHICH read failed. The entry's
+  named arm is checked against `userspace_class(proto)`, so a witness
+  cannot report coverage of an arm it does not exercise. Per-arm counts
+  are over DISTINCT declared lengths and are DERIVED: an advance error
+  `f(l) + a*l + b` is invisible wherever `a*l + b == 0`, and an affine
+  expression vanishing at two distinct `l` is identically zero, so
+  GENERIC/AUTH need 2 distinct lengths; FRAGMENT's read and advance take no
+  declared length, so its error family is the constant `f + b` and one
+  witness excludes it. Counting distinct LENGTHS rather than cases is what
+  kills the byte-identical duplicate.
+
+  Floor 2 rebuilds the chains of exactly `MAX_IPV6_EXT_HEADERS - 1` and
+  `MAX_IPV6_EXT_HEADERS` minimum-size DestOpt headers and requires both by
+  byte identity, plus their measured verdicts — terminal offset is no
+  longer a stand-in for header COUNT. Floor 3 rebuilds the canonical
+  68-byte single-header case for each of the 256 next-header values,
+  requires each by byte identity, and requires each NOT to fail closed,
+  which is the direct statement that the walk got far enough to classify
+  the value. Floor 4 (new) requires the two `DestOpt(len=15)` chains the
+  statement-outside-the-match mutation needs. Floor 5 MEASURES the L3
+  offsets with `frame_l3_offset` on the prefixes `at_l3` builds, so
+  `[0, 14, 14]` — which satisfied round 6's `any(!= 0)` + `contains(0)` —
+  now reds.
+
+  Round 6's floor 1 (`handcrafted >= 40`) was DELETED rather than kept: 40
+  is not derivable from any property, and the identity floors subsume
+  "the block was not removed wholesale".
+
+  Every floor reads only the corpus bytes and this crate's walker, so a
+  floor red is always a corpus defect and never a shim finding — confirmed
+  by both CONTROL columns and the manifest-facts guard staying `ok` in
+  every RED row.
+
+  **M-4 — acceptance row 9 mutated GENERIC and AUTH together** but scored
+  RED on either arm reding, so it could not support the "both arms" claim
+  its label made: GENERIC alone could red while AUTH coverage had
+  degenerated. Split into per-arm rows 9 and 10 (12 mutation rows now).
+  Added property 5 to the harness header ("one mutation per row, and one
+  ARM per row"), and per-row accounting at the tail so quoted evidence is
+  checkable against the matrix rather than against a bare `PASS`.
+
+  **M-5 — the precondition compared the worktree against the INDEX.**
+  `git diff --quiet -- "$WALK"` while printing "differs from git HEAD": a
+  STAGED mutation passes, and the script's own abort text spells out the
+  consequence — it would be captured as GOLD and restored as pristine, so
+  the whole matrix runs against a poisoned baseline. Verified by staging a
+  mutation: the old check returned rc 0, `git diff --quiet HEAD --` returns
+  1. Fixed; it is the only git comparison in the file.
+
+  **MINORs.** `cmd/shimverify`'s decision is now a testable `decide(stats,
+  overridden) -> shimverifyDecision`, with every (stats, override)
+  combination pinned in `cmd/shimverify/main_test.go` including the exit-6
+  override-success arm; the pkg/dataplane test that CLAIMED to pin that
+  decision only re-asserted `Measured()` and `HeadroomPct()` and is now
+  scoped to the invariant it does carry (the floor must stay strictly
+  positive, or unmeasured stats read as acceptable in a caller that skips
+  `Measured()`). The recipe exit-code list gained `6)` and — found by a
+  scope-edge mutation while RED-proving it — is now matched as a case
+  PATTERN AT LINE START: `strings.Contains(recipe, "6)")` was satisfied by
+  `66)`, so renaming the arm left it green. The FragHdr compile-time
+  assertion is matched as a `const _: () = assert!(` item at line start
+  rather than a raw substring a comment satisfies. `main.go`'s claim that
+  an override is visible "in the manifest" was false — the manifest carries
+  the object hash, the shim facts and hashed inputs, and no override status
+  — and now says so. The negative control's claim that a plain packet
+  "never enters a `match` arm" was wrong: it enters the loop, classifies,
+  and takes the terminal catch-all; the added `if offset > 200` statement
+  runs there and is false, which is what makes it a control. README scoped
+  the "vacuous on an empty corpus" claim to the corpus-CONSUMING assertions.
+
+- **Validation**: per-floor RED matrix (6 corpus-only mutations, each
+  `cargo build` rc 0 + `cargo test --no-run` rc 0 in the red state, both
+  CONTROLs `ok`, manifest-facts guard `ok`): F1a distinct-length collapse,
+  F1b wrong-arm entry, F2 seven-header chain replaced by the same-offset
+  one-header proxy, F3 sweep replaced by unwalked stubs, F4 long chains
+  deleted, F5 `[0,14,18] -> [0,14,14]` — all RED, restore byte-exact.
+  Go RED proofs: `decide` returning 0 on unmeasured RED; floor 0.0 RED;
+  recipe arms `0)`, `5)`, `6)` renamed RED. `ipv6_ext_walk.rs` is
+  byte-identical to HEAD, so no `make generate` and the object hash is
+  unchanged. `cargo fmt --check` delta measured against a throwaway
+  detached worktree at the parent: 2501 -> 2498 hunks over the same 328
+  files, all three removed from `tests_shim_ext_parity.rs`, zero added
+  anywhere.
+- **File(s)**: userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  test/mutation/shim-ext-parity-acceptance.sh, cmd/shimverify/main.go,
+  cmd/shimverify/main_test.go,
+  pkg/dataplane/verify_userspace_shim_headroom_test.go,
+  pkg/dataplane/README.md, _Log.md

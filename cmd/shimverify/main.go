@@ -39,8 +39,13 @@
 // check, and someone had the variable exported", which a non-interactive
 // caller cannot tell apart — and the recipe's `0) ;;` arm installed both
 // without comment. 6 still INSTALLS (the override means the operator
-// accepted the risk) but it is visible to the recipe, to CI, and in the
-// manifest without anyone parsing stderr.
+// accepted the risk) but it is visible to the recipe and to CI as an exit
+// code and as the `OVERRIDDEN` status word on stdout, without anyone
+// parsing stderr. It is NOT recorded in
+// pkg/dataplane/userspace_xdp_manifest.json: that file carries the object
+// hash, the shim facts and the hashed inputs, and nothing about how the
+// gate was satisfied. An object installed under an override is therefore
+// indistinguishable from one that passed, ONCE THE BUILD LOG IS GONE.
 //
 // Exit codes: 0 PASS (measured, above the floor), 2 usage, 3 verifier
 // REJECT, 4 loads but headroom below the floor, 5 loads but headroom could
@@ -73,16 +78,17 @@ func main() {
 	}
 
 	overridden := os.Getenv(allowLowHeadroomEnv) == "1"
+	decision := decide(stats, overridden)
 
 	if !stats.Measured() {
-		if overridden {
-			fmt.Printf("OVERRIDDEN %s (headroom UNMEASURED)\n", path)
+		if decision.overrideConsumed {
+			fmt.Printf("%s %s (headroom UNMEASURED)\n", decision.label, path)
 			announceOverrideConsumed(path,
 				"this kernel's verifier log carried no \"processed N insns (limit M)\" line, "+
 					"so the floor could not be applied at all")
-			os.Exit(6)
+			os.Exit(decision.exit)
 		}
-		fmt.Printf("UNMEASURED-HEADROOM %s\n", path)
+		fmt.Printf("%s %s\n", decision.label, path)
 		fmt.Fprintf(os.Stderr,
 			"shimverify: the candidate LOADS, but this kernel's verifier log carried no "+
 				"\"processed N insns (limit M)\" line, so the #4555 headroom floor (%.1f%%) "+
@@ -95,7 +101,7 @@ func main() {
 				"  If your kernel genuinely reports differently, set %s=1 to install anyway — "+
 				"that is an explicit acknowledgement that this object shipped unmeasured.\n",
 			dataplane.UserspaceShimMinVerifierHeadroomPct, allowLowHeadroomEnv)
-		os.Exit(5)
+		os.Exit(decision.exit)
 	}
 
 	headroom := stats.HeadroomPct()
@@ -103,15 +109,15 @@ func main() {
 		stats.ProcessedInsns, stats.InsnLimit, headroom)
 
 	if headroom < dataplane.UserspaceShimMinVerifierHeadroomPct {
-		if overridden {
-			fmt.Printf("OVERRIDDEN %s (%s)\n", path, summary)
+		if decision.overrideConsumed {
+			fmt.Printf("%s %s (%s)\n", decision.label, path, summary)
 			announceOverrideConsumed(path, fmt.Sprintf(
 				"headroom %.2f%% is below the floor of %.1f%%; the next change to the shim's "+
 					"hot parsing paths may not fit",
 				headroom, dataplane.UserspaceShimMinVerifierHeadroomPct))
-			os.Exit(6)
+			os.Exit(decision.exit)
 		}
-		fmt.Printf("LOW-HEADROOM %s (%s)\n", path, summary)
+		fmt.Printf("%s %s (%s)\n", decision.label, path, summary)
 		fmt.Fprintf(os.Stderr,
 			"shimverify: the candidate LOADS, but leaves only %.2f%% of the verifier's "+
 				"processed-insn budget unused — below the #4555 floor of %.1f%%.\n"+
@@ -123,26 +129,76 @@ func main() {
 				"parse_ipv6 is the largest consumer, see pkg/dataplane/README.md — or set "+
 				"%s=1 to install anyway with the risk understood.\n",
 			headroom, dataplane.UserspaceShimMinVerifierHeadroomPct, allowLowHeadroomEnv)
-		os.Exit(4)
+		os.Exit(decision.exit)
 	}
 
 	// The override is read from the ambient environment, so a value
 	// exported once to get past a low-headroom object would silently
 	// disarm every later run. Surface it on the HEALTHY path too: the
 	// only place staleness is visible is a build that did not need it.
-	if overridden {
+	if decision.staleOverrideNote {
 		fmt.Fprintf(os.Stderr,
 			"shimverify: NOTE: %s=1 is set in the environment but was NOT needed — this object "+
 				"is measured at %.2f%% headroom, above the %.1f%% floor. If that value is left "+
 				"exported it will silently disarm the gate on a future run. Unset it.\n",
 			allowLowHeadroomEnv, headroom, dataplane.UserspaceShimMinVerifierHeadroomPct)
 	}
-	fmt.Printf("PASS %s (%s)\n", path, summary)
+	fmt.Printf("%s %s (%s)\n", decision.label, path, summary)
 }
 
 // allowLowHeadroomEnv is the documented, deliberate override for BOTH
 // #4555 refusals: measured-but-below-floor and could-not-measure.
 const allowLowHeadroomEnv = "XPF_SHIM_ALLOW_LOW_HEADROOM"
+
+// shimverifyDecision is what the #4555 gate CONCLUDES about one candidate,
+// separated from how it says so. main() prints the long-form diagnostics;
+// this carries the part a caller acts on.
+//
+// It exists so the decision can be TESTED. Before it, the only assertion
+// about "an unmeasurable stats line must reach the refusal path" re-tested
+// parseShimVerifierStats and HeadroomPct() — both already covered
+// elsewhere — and would have stayed green with this binary passing every
+// input. A gate's decision has to be checkable without a kernel verifier.
+type shimverifyDecision struct {
+	// exit is the process exit status; build-userspace-xdp.sh carries one
+	// arm per value.
+	exit int
+	// label is the status word on stdout: PASS, LOW-HEADROOM,
+	// UNMEASURED-HEADROOM or OVERRIDDEN.
+	label string
+	// overrideConsumed is true when XPF_SHIM_ALLOW_LOW_HEADROOM=1 turned a
+	// refusal into an install. That run must announce itself loudly.
+	overrideConsumed bool
+	// staleOverrideNote is true when the override was exported but the
+	// object did not need it — the only run where a stale exported value is
+	// visible, so it is where we warn.
+	staleOverrideNote bool
+}
+
+// decide maps (stats, override) to the gate's verdict.
+//
+// UNMEASURED is a refusal, not a pass: this tripwire exists because nothing
+// was watching while the shim crept to 0.92% headroom, and a gate that
+// switches itself off when the kernel's log format changes reproduces that
+// failure at the one moment headroom is unknown. Both refusals take the
+// same override, and an overridden run is 6 — never 0 — so "installed with
+// the gate satisfied" and "installed because someone said so" stay distinct
+// to a non-interactive caller.
+func decide(stats dataplane.ShimVerifierStats, overridden bool) shimverifyDecision {
+	if !stats.Measured() {
+		if overridden {
+			return shimverifyDecision{exit: 6, label: "OVERRIDDEN", overrideConsumed: true}
+		}
+		return shimverifyDecision{exit: 5, label: "UNMEASURED-HEADROOM"}
+	}
+	if stats.HeadroomPct() < dataplane.UserspaceShimMinVerifierHeadroomPct {
+		if overridden {
+			return shimverifyDecision{exit: 6, label: "OVERRIDDEN", overrideConsumed: true}
+		}
+		return shimverifyDecision{exit: 4, label: "LOW-HEADROOM"}
+	}
+	return shimverifyDecision{exit: 0, label: "PASS", staleOverrideNote: overridden}
+}
 
 // announceOverrideConsumed logs, loudly and unambiguously, that a build
 // installed an object the #4555 gate would otherwise have refused, and

@@ -44,8 +44,16 @@ sent while exact queues were still backlogged.
 
 `userspace-xdp/src/ipv6_ext_walk.rs` is guarded by
 `test/mutation/shim-ext-parity-acceptance.sh`, not by `make test` alone. The
-script mutates the walk across a 13-row matrix and requires the parity guards in
-`userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs` to red on each edit.
+script mutates the walk across 12 mutation rows, bracketed by a green baseline
+(row 0) and a post-restore recheck (row 13), and requires the parity guards in
+`userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs` to red on each edit. It
+prints per-row accounting at the end, so the evidence quoted in a PR body is
+checkable against the matrix rather than against a bare `PASS`.
+
+One mutation per row, and one ARM per row where an edit applies to several: a
+row that mutated the GENERIC and AUTH revalidation bases together scored RED on
+either arm reding, so it could not support the claim about both that its label
+made.
 
 Run it whenever you change that walk. `make test` tells you the guards are
 green; it does not tell you they still bind, and this file has a history of the
@@ -56,20 +64,42 @@ error produced `BUILD rc=0 TEST rc=101` and was scored as "the guard fired".
 Two preflights run first and must themselves fail when broken — one proves the
 build gate really compiles the file under test, one proves a filter matching
 nothing is scored MISSING rather than `ok` (`cargo test` exits 0 on a filter that
-matches no test). The corpus builder also carries non-vacuity floors, because
-every assertion in that file is of the form "this collection is empty" or "this
-count equals cases * offsets", and both hold trivially on an empty corpus.
+matches no test). The precondition check compares the walk against `HEAD`, index
+included; comparing against the index alone let a STAGED mutation be captured as
+the pristine gold copy and restored as such, which is the failure the check's own
+abort text describes.
 
-Those floors are named per SHAPE — the hand-crafted block, per-arm
-boundary-tight cases, the chain-length boundary, the next-header sweep, the L3
-offsets — and not as one size threshold, because a size threshold did not bind.
-A single `cases.len() >= 200` stood there: 256 of the ~310 cases come from one
-homogeneous next-header sweep, so cutting the corpus down to that sweep AND
+The corpus builder also carries non-vacuity floors. The assertions that CONSUME
+the corpus are of the form "this collection is empty" or "this count equals
+cases * offsets", and both hold trivially on an empty corpus — the guards that
+read the manifest's emitted facts, and both negative controls, do not consume it
+and are unaffected.
+
+Those floors are named per SHAPE — per-arm boundary witness pairs, the
+chain-length boundary, the next-header sweep, the long-chain shape, the L3
+offsets — and not as one size threshold, because a size threshold did not bind:
+a single `cases.len() >= 200` stood there while 256 of the ~310 cases came from
+one homogeneous next-header sweep, so cutting the corpus down to that sweep AND
 deleting the generic arm's post-advance bounds revalidation was measured to
-leave all five tests `ok`. A floor is worth its predicate, never the prose
-beside it, so each one now also states what it does NOT cover. They stop a shape
-being deleted between acceptance runs; they do not establish that the corpus is
-adequate, which is what the matrix above measures.
+leave all five tests `ok`.
+
+Naming the shape is not enough either. The replacement floors counted CASES
+SATISFYING A PREDICATE, and three of the five predicates had degenerate
+satisfiers: a 40-byte packet declaring an arm "fails closed" without ever
+reaching that arm's boundary, one `DestOpt(len=6)` header lands on the same
+terminal offset as a seven-header chain, and a seven-byte buffer carries a
+next-header byte neither walker ever classifies. So each floor now binds its
+shape by CONSTRUCTION — the corpus must contain a locally rebuilt reference
+buffer, byte for byte — and, where the shape is behavioural, by MEASUREMENT
+with this crate's walker. The per-arm floor requires a WITNESS PAIR: the padded
+twin must resolve the terminal at exactly the advance target (proving the
+boundary was reached) and the tight twin, one byte shorter, must fail closed
+(attributing the refusal to the length check).
+
+A floor is worth its predicate, never the prose beside it, so each one also
+states what it does NOT cover. They stop a shape being deleted between
+acceptance runs; they do not establish that the corpus is adequate, which is
+what the matrix above measures.
 
 Note `ipv6_ext_walk.rs` is a hashed input of `userspace_xdp_manifest.json`, so
 even a comment edit there requires `make generate` and trips
