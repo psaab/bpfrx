@@ -768,11 +768,13 @@ func (s *Server) ReplaceAuth(a *AuthConfig) {
 	s.auth.Store(a)
 }
 
-// AuthSnapshotForTest returns the live auth snapshot (#5866). Test-only: it lets
-// a cross-package test (pkg/daemon managementReconciler) assert that a
-// same-endpoint reconcile published the new snapshot in place. Dep-free (no
-// test-only imports leak into the production binary).
-func (s *Server) AuthSnapshotForTest() *AuthConfig { return s.auth.Load() }
+// LiveAuth returns the credential snapshot the listeners are currently
+// enforcing (#5866). The management reconciler reads it to compute what a
+// listener RETAINED by a failed rebind is allowed to keep accepting (#5561
+// round 12, AuthForRetainedListener); tests read it to assert what a reconcile
+// published. It is the same atomic pointer the middleware reads per request, so
+// it never drifts from what is actually enforced.
+func (s *Server) LiveAuth() *AuthConfig { return s.auth.Load() }
 
 // HTTPSCertForTest returns the served TLS leaf certificate, or nil when the
 // server is HTTP-only (#5866). Test-only: lets a cross-package test read the cert

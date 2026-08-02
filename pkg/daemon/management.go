@@ -40,22 +40,27 @@ import (
 //     RETAINED (fail-closed, not mgmt-down), its fingerprint field is left
 //     unrecorded so the next commit RETRIES the bind (retry debt), and the error
 //     is surfaced.
-//   - AUTH ORDERING: the two directions are not symmetric. A TIGHTENING
-//     (non-nil) publishes BEFORE either leg is (re)bound and unconditionally —
-//     it only ADDS a requirement, so applying it to whatever is live is strictly
-//     more restrictive than leaving the previous snapshot there. That keeps a
-//     committed revocation from being blocked by a bind failure (#5866 Finding A,
-//     #5561 round 7: deferring it left the RETAINED listener honouring the old
-//     secret permanently) AND keeps a freshly-bound listener from ever serving
-//     under a superseded snapshot (#5561 round 9: ReconcileHTTP serves before it
-//     returns, so publishing afterwards left the new socket on the old policy for
-//     the width of the intervening ReconcileHTTPS). Removing ALL api-auth (nil)
-//     publishes AFTER the rebinds and stays gated on httpOK plus the LIVE HTTPS
-//     being off/loopback: it REMOVES a requirement, and both gates read the
-//     fingerprint the rebinds just advanced.
-//   - AUTH FRESHNESS: an unconditional publish is only safe while the config it
-//     came from is the newest COMMITTED one, so reconcile pins the credential
-//     half to the store's active config before handing it to reconcileTo — see
+//   - AUTH ORDERING: the two directions are not symmetric, and a non-nil set is
+//     itself split. Its REVOCATION half publishes BEFORE either leg is (re)bound
+//     and regardless of the outcome, so a committed revocation is never blocked
+//     by a bind failure (#5866 Finding A, #5561 round 7: deferring it left the
+//     RETAINED listener honouring the old secret permanently) and a freshly-bound
+//     listener never serves under a superseded snapshot (#5561 round 9:
+//     ReconcileHTTP serves before it returns, so publishing afterwards left the
+//     new socket on the old policy for the width of the intervening
+//     ReconcileHTTPS). Its GRANT half waits for every leg to converge, because a
+//     credential set is committed together with the endpoint it is meant for:
+//     while a leg is retained at an address this config asked to leave, only the
+//     intersection with what that listener already accepted may be enforced
+//     (#5561 round 12, api.AuthForRetainedListener). An endpoint-only-unchanged
+//     commit has nothing to converge and publishes whole. Removing ALL api-auth
+//     (nil) publishes AFTER the rebinds and is gated on both LIVE bind addresses
+//     being loopback: it REMOVES a requirement, so the #4047/#5127 clamp that
+//     justified the nil must be proven against the listeners that are actually
+//     serving.
+//   - AUTH FRESHNESS: the publish is only safe while the credential policy it
+//     came from is the newest COMMITTED one, so reconcile replaces the credential
+//     half with the store's active config before handing it to reconcileTo — see
 //     withCommittedAuth. Without that, a stale-snapshot apply replay could
 //     resurrect a superseded credential on a listener the operator had already
 //     moved past.
@@ -198,14 +203,14 @@ func (m *managementReconciler) reconcile(cfg *config.Config) error {
 	return m.reconcileTo(m.withCommittedAuth(m.desired(cfg)))
 }
 
-// withCommittedAuth pins next's api-auth policy to the one the store's ACTIVE
-// config carries, whenever that config specifies one (#5561 round 10,
-// finding 3).
+// withCommittedAuth replaces next's api-auth policy with the one the store's
+// ACTIVE config carries — INCLUDING when that policy is nil (#5561 round 10
+// finding 3; the nil direction added in round 12).
 //
 // The credential set published here governs the LIVE listener, and reconcileTo
-// publishes a non-nil one UNCONDITIONALLY — before the rebind and regardless of
-// whether the rebind succeeds — because a committed revocation must not be
-// blocked by a bind failure (#5561 round 7). That is right only while `cfg` is
+// publishes its REVOCATION half before the rebind and regardless of whether the
+// rebind succeeds, because a committed revocation must not be blocked by a bind
+// failure (#5561 round 7). That is right only while `cfg` is
 // the newest committed policy, and on one path it is not: applyConfig callers
 // that snapshot store.ActiveConfig() and THEN wait on the apply semaphore (the
 // DHCP lease-change callback is the live example) can be overtaken by a commit
@@ -225,21 +230,28 @@ func (m *managementReconciler) reconcile(cfg *config.Config) error {
 // control: a stale bind is a reachability bug the next commit corrects, while a
 // resurrected credential is an authentication bypass that persists.
 //
-// Direction of the override: it applies only when the ACTIVE config specifies a
-// credential set, i.e. it never turns a non-nil publish into a nil one. That
-// keeps it incapable of relaxing the #4047/#5127 clamp, whose requirement is
-// derived from `next`'s own bind address rather than from the active config's.
+// Direction of the override: BOTH. Round 10 pinned only the non-nil direction,
+// on the argument that a stale replay could then over-restrict but never
+// under-restrict, "because a resurrected credential over-restricts a management
+// API that is clamped to loopback regardless". That premise is false, and the
+// #4047/#5127 clamp is exactly why: the clamp is evaluated by resolveAPIBinds
+// against the config being applied, using THAT config's own api-auth, and it is
+// never re-evaluated against the listener that is actually serving. A config
+// that carries a credential therefore binds off-loopback legitimately — and when
+// a LATER commit removes api-auth, its own bind is clamped to loopback while the
+// off-loopback listener the previous commit bound is RETAINED if that loopback
+// bind fails. The live listener is then non-loopback with a nil-auth active
+// config, and a stale replay carrying the credential the operator deleted
+// published it there: a revoked secret authorizing `POST /api/v1/system/action`
+// from off-box. That is under-restriction, and it is the interleaving round 10
+// left open (#5561 round 12).
 //
-// That asymmetry has a price, and it is stated rather than only its benefit: a
-// commit that REMOVES api-auth is not pinned. `committed` is then nil, no
-// override happens, and reconcileTo publishes the stale replay's non-nil Auth —
-// so a credential the operator deleted stays live and uncredentialed callers
-// keep getting 401 until the next commit republishes. The asymmetry is
-// deliberate anyway, because the two directions are not symmetric in
-// consequence: a resurrected credential over-restricts a management API that is
-// clamped to loopback regardless, while the mirror-image rule (letting a stale
-// snapshot clear a credential) would be an authentication bypass. Over-restrict
-// and wait for the next commit; never under-restrict.
+// So the credential half is taken from the ACTIVE config unconditionally. The
+// nil direction is safe to propagate ONLY because reconcileTo's nil publish is
+// gated on the addresses the LIVE listeners are actually bound to rather than on
+// the rebind outcome: a stale replay whose own (stale, possibly off-loopback)
+// endpoint binds SUCCESSFULLY must not be read as "the live bind is the one
+// whose clamp justified the nil". See the nil gate in reconcileTo.
 func (m *managementReconciler) withCommittedAuth(next api.Config) api.Config {
 	if m.d == nil || m.d.store == nil {
 		return next
@@ -248,9 +260,7 @@ func (m *managementReconciler) withCommittedAuth(next api.Config) api.Config {
 	if active == nil {
 		return next
 	}
-	if committed := m.desired(active).Auth; committed != nil {
-		next.Auth = committed
-	}
+	next.Auth = m.desired(active).Auth
 	return next
 }
 
@@ -269,8 +279,15 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 
 	var errs []error
 
-	// A NON-NIL credential set is published BEFORE any listener is bound (#5561
-	// round 9, finding 3).
+	// Which legs this reconcile will move. While ANY leg is moving, some live
+	// listener is (or may end up) at an address `next` does not name, which is
+	// what makes the credential publish below conditional.
+	rebinding := next.Addr != m.cur.addr ||
+		next.TLS != m.cur.tls || next.HTTPSAddr != m.cur.httpsAddr
+
+	// The REVOCATION half of a non-nil credential set is published BEFORE any
+	// listener is bound (#5561 round 9 finding 3; the grant half split off in
+	// round 12).
 	//
 	// api.Server.ReconcileHTTP binds the new listener AND STARTS SERVING IT
 	// (listener.go, serveLegLocked) before it returns. Publishing auth at the end
@@ -285,27 +302,47 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 	// for the duration of the TLS reconcile the new off-box listener answered
 	// every caller with dynamicAuthMiddleware's nil-snapshot pass-through.
 	//
-	// Hoisting is sound in exactly the direction the paragraph below already
-	// argues: a non-nil Auth only ADDS a requirement, so applying it to whatever
-	// is currently live — the old bind, or nothing yet — is strictly more
-	// restrictive than leaving the previous snapshot there, whatever that bind
-	// is. It cannot fail open, and it removes the ordering that could.
+	// What is hoisted is NOT the whole committed set. Round 9 justified the hoist
+	// on the claim that a non-nil Auth "only ADDS a requirement", so applying it
+	// to whatever is live is strictly more restrictive. That is true only when
+	// the live snapshot is nil (the pass-through case the hoist was written for).
+	// Credential sets are not monotonic: {A} -> {A,B} and {A} -> {B} both make a
+	// value acceptable that was not acceptable before, and the listener it
+	// becomes acceptable on may be one this config never asked to keep serving —
+	// the endpoint it did ask for is still unbound at this point, and may fail to
+	// bind at all. So while any leg is moving, only the intersection with the
+	// live snapshot goes out (#5561 round 12): every revocation lands
+	// immediately, no grant does. A nil live snapshot is the universal set, so
+	// the round-9 case still publishes the full credential set before the new
+	// off-box socket serves.
+	//
+	// The full set follows below, once every leg has converged onto an address
+	// THIS config names. When the endpoint is unchanged there is nothing to
+	// converge and no retained listener to protect, so the full set goes out
+	// here — the plain day-2 credential change, which must not be degraded to an
+	// intersection (that would revoke without granting, i.e. lock the operator
+	// out of an endpoint the commit never touched).
 	//
 	// The nil (remove-all-api-auth) direction stays BELOW the rebinds, because it
 	// REMOVES a requirement and its safety gate reads m.cur, which the rebinds
 	// update.
 	if next.Auth != nil {
-		m.srv.ReplaceAuth(next.Auth)
+		publish := next.Auth
+		if rebinding {
+			publish = api.AuthForRetainedListener(m.srv.LiveAuth(), next.Auth)
+			if withheld := api.CredentialCount(next.Auth) - api.CredentialCount(publish); withheld > 0 {
+				slog.Warn("web-management endpoint is moving; withholding committed credentials from the listener that is still serving until the rebind converges",
+					"withheld", withheld, "live_http", m.cur.addr, "desired", endpointOf(next).summary())
+			}
+		}
+		m.srv.ReplaceAuth(publish)
 	}
 
 	// HTTP leg: make-before-break rebind ONLY if the HTTP bind changed. Advance
-	// the converged fingerprint only on success (retry debt on failure); httpOK
-	// records whether the live HTTP listener is now at next.Addr.
-	httpOK := true
+	// the converged fingerprint only on success (retry debt on failure).
 	if next.Addr != m.cur.addr {
 		if err := m.srv.ReconcileHTTP(next.Addr); err != nil {
 			errs = append(errs, err)
-			httpOK = false
 		} else {
 			m.cur.addr = next.Addr
 		}
@@ -324,32 +361,49 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 
 	// Auth is published DECOUPLED from the HTTPS leg (#5866 Finding A): a
 	// committed credential revocation must not be blocked by an HTTPS bind
-	// failure. A credential TIGHTENING (non-nil) only ADDS a requirement, so it
-	// is published unconditionally and EARLY — above, before any rebind — which
-	// covers the case where the HTTP leg's OWN rebind then FAILS and the old
-	// listener is retained (#5561 round 7, MAJOR-2), and the case where a
-	// freshly-bound listener would otherwise serve under the old snapshot for
-	// the duration of the HTTPS reconcile (#5561 round 9, finding 3).
+	// failure. That is why the REVOCATION half of a non-nil set goes out EARLY,
+	// above, before any rebind and regardless of its outcome — it covers the case
+	// where the HTTP leg's OWN rebind then FAILS and the old listener is retained
+	// (#5561 round 7, MAJOR-2), and the case where a freshly-bound listener would
+	// otherwise serve under the old snapshot for the duration of the HTTPS
+	// reconcile (#5561 round 9, finding 3).
 	//
-	// Round 7 established the first half: gating the non-nil publish on httpOK
-	// was a fail-open for credential ROTATION and REVOCATION, which is the common
-	// case — replacing secret A with secret B means A must stop working, and
-	// skipping ReplaceAuth left the RETAINED listener honouring A indefinitely,
-	// until some later reconcile happened to succeed. Not a race window; a
-	// permanent one. Applying B to the retained old bind is strictly more
-	// restrictive than leaving A on it, whatever that bind is — and that same
-	// argument is what licenses publishing it before the rebind rather than
-	// after.
+	// Round 7 established the first half: gating the non-nil publish on the
+	// rebind outcome was a fail-open for credential ROTATION and REVOCATION,
+	// which is the common case — replacing secret A with secret B means A must
+	// stop working, and skipping ReplaceAuth left the RETAINED listener honouring
+	// A indefinitely, until some later reconcile happened to succeed. Not a race
+	// window; a permanent one. Publishing the intersection early keeps that
+	// property exactly: A is not in it, so A stops working the moment the commit
+	// lands, whatever the rebind does.
 	//
-	// Dropping to NO auth stays HERE, after the rebinds, and still requires
-	// httpOK plus the LIVE HTTPS being off or loopback. That direction REMOVES a
-	// requirement and is the one that can fail open: httpOK means the live HTTP
-	// listener is at next.Addr, whose #4047/#5127 loopback clamp JUSTIFIED the
-	// nil (a legitimate nil-on-loopback); a retained old bind may not match that
-	// clamp, and a non-loopback HTTPS retained by a failed HTTPS rebind must
-	// never be dropped to no-auth. Both gates read m.cur, which the rebinds above
-	// have just updated, so this cannot move earlier.
-	if next.Auth == nil && httpOK && (!m.cur.tls || mgmtAddrIsLoopback(m.cur.httpsAddr)) {
+	// What the rebind outcome DOES gate is the grant half. Once every leg has
+	// converged, every live listener is at an address this config names, so the
+	// credential set it committed for those addresses can go out whole. If any
+	// leg failed, some listener is still serving an address the config asked to
+	// leave, and the restricted set published above stays in force until a later
+	// reconcile converges (each commit retries; the error and the Warn above make
+	// the state visible).
+	if next.Auth != nil && rebinding && len(errs) == 0 {
+		m.srv.ReplaceAuth(next.Auth)
+	}
+
+	// Dropping to NO auth stays HERE, after the rebinds, because that direction
+	// REMOVES a requirement and is the one that can fail open. It requires the
+	// LIVE listeners — both legs, read from m.cur, which the rebinds above have
+	// just advanced — to be loopback.
+	//
+	// The gate is on the live ADDRESSES, not on the rebind outcome. A nil auth is
+	// justified by the #4047/#5127 clamp, and that clamp is evaluated against the
+	// bind of the config that carried the nil; a listener retained by a failed
+	// rebind, or moved by a STALE apply replay whose own endpoint bound fine, is
+	// not that bind and its address must be proven loopback directly. Testing
+	// "the HTTP rebind succeeded" instead is a proxy that holds only while the
+	// config being applied is the newest one — withCommittedAuth now propagates a
+	// committed nil through stale replays, so the proxy would license dropping an
+	// off-loopback listener to no-auth (#5561 round 12).
+	if next.Auth == nil && mgmtAddrIsLoopback(m.cur.addr) &&
+		(!m.cur.tls || mgmtAddrIsLoopback(m.cur.httpsAddr)) {
 		m.srv.ReplaceAuth(nil)
 	}
 

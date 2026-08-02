@@ -42,11 +42,30 @@ func newAuthAtBind(reg *fakeReg) *authAtBind {
 func (a *authAtBind) listen(network, addr string) (net.Listener, error) {
 	a.mu.Lock()
 	if a.srv != nil {
-		a.seen[addr] = a.srv.AuthSnapshotForTest()
+		// COPY, do not alias. The recorded value must be what was live at THIS
+		// instant; keeping the pointer would let a snapshot published later — or
+		// an in-place edit of the AuthConfig the caller still holds — rewrite
+		// history and turn a failing ordering assertion green.
+		a.seen[addr] = copyAuth(a.srv.LiveAuth())
 		a.hit[addr]++
 	}
 	a.mu.Unlock()
 	return a.reg.listen(network, addr)
+}
+
+// copyAuth deep-copies an auth snapshot (nil stays nil).
+func copyAuth(a *api.AuthConfig) *api.AuthConfig {
+	if a == nil {
+		return nil
+	}
+	out := &api.AuthConfig{Users: map[string]string{}, APIKeys: map[string]bool{}}
+	for k, v := range a.Users {
+		out.Users[k] = v
+	}
+	for k, v := range a.APIKeys {
+		out.APIKeys[k] = v
+	}
+	return out
 }
 
 // watch starts recording once the server exists (startTo constructs it).
@@ -88,7 +107,7 @@ func TestMgmtNewListenerNeverServesUnderTheOldAuth_5561(t *testing.T) {
 	if err := m.startTo(ctx, boot); err != nil {
 		t.Fatalf("initial start: %v", err)
 	}
-	if snap := m.srv.AuthSnapshotForTest(); snap != nil {
+	if snap := m.srv.LiveAuth(); snap != nil {
 		t.Fatalf("boot snapshot = %+v, want nil (a loopback bind carries no api-auth)", snap)
 	}
 	fac.watch(m.srv)
@@ -123,7 +142,10 @@ func TestMgmtNewListenerNeverServesUnderTheOldAuth_5561(t *testing.T) {
 				"through unauthenticated — a window as wide as the TLS reconcile that runs "+
 				"inside it", leg.what, leg.addr)
 		}
-		if _, ok := snap.Users["admin"]; !ok {
+		// The VALUE, not just the key: a snapshot naming admin under some other
+		// secret is a different credential set, and the property is that the one
+		// this commit published was live before the socket existed.
+		if snap.Users["admin"] != "secret" {
 			t.Fatalf("the new %s listener at %s was bound under auth snapshot %+v, which is not "+
 				"the credential this commit published", leg.what, leg.addr, snap)
 		}
@@ -131,7 +153,7 @@ func TestMgmtNewListenerNeverServesUnderTheOldAuth_5561(t *testing.T) {
 
 	// Control: the reconcile actually converged, so the assertions above are
 	// about the ORDER of two things that both happened.
-	if snap := m.srv.AuthSnapshotForTest(); snap == nil || snap.Users["admin"] != "secret" {
+	if snap := m.srv.LiveAuth(); snap == nil || snap.Users["admin"] != "secret" {
 		t.Fatalf("post-reconcile snapshot = %+v, want the published credential", snap)
 	}
 	if ln := reg.get("10.0.0.1:8080"); ln == nil || !ln.isOpen() {
@@ -141,13 +163,18 @@ func TestMgmtNewListenerNeverServesUnderTheOldAuth_5561(t *testing.T) {
 
 // TestMgmtCredentialRotationPrecedesTheRebind_5561 is the same ordering at the
 // other edge of its scope: a ROTATION (secret A -> secret B) on a bind that also
-// moves. Publishing after the HTTP rebind but before the HTTPS one would satisfy
-// nothing here either — the new listener would serve secret A for as long as the
+// moves. The property is about secret A: it must already be gone from the live
+// snapshot when the new socket is created, because that socket serves from the
+// moment it exists. Publishing after the HTTP rebind — or after the HTTPS one —
+// would leave the superseded secret live on the new listener for as long as the
 // bind takes.
 //
-// It also pins the direction that must NOT move: the tightening publish is
-// hoisted, and the case still converges to B rather than being overwritten by a
-// later publish.
+// What the new socket is bound UNDER is the restricted set (#5561 round 12):
+// while the rebind is in flight the OLD listener is still serving, and secret B
+// was committed for the address being bound, not for that one. The rotation
+// therefore converges to B only after the rebind succeeds, which the final
+// assertion pins — so the case still proves the hoisted publish is not
+// overwritten by a later one.
 func TestMgmtCredentialRotationPrecedesTheRebind_5561(t *testing.T) {
 	reg := newFakeReg()
 	fac := newAuthAtBind(reg)
@@ -170,12 +197,100 @@ func TestMgmtCredentialRotationPrecedesTheRebind_5561(t *testing.T) {
 	if !bound {
 		t.Fatal("the HTTP leg was never rebound, so the case observed nothing")
 	}
-	if snap == nil || snap.Users["admin"] != "secret-b" {
-		t.Fatalf("the rebound HTTP listener was bound under auth snapshot %+v, want the ROTATED "+
-			"secret. It serves from the moment it is created, so the superseded secret was live "+
-			"on the new socket", snap)
+	if snap == nil {
+		t.Fatal("the rebound HTTP listener was bound under a nil snapshot — it serves from the " +
+			"moment it is created, so every caller was passed through unauthenticated")
 	}
-	if live := m.srv.AuthSnapshotForTest(); live == nil || live.Users["admin"] != "secret-b" {
-		t.Fatalf("post-reconcile snapshot = %+v, want the rotated secret", live)
+	if snap.Users["admin"] == "secret-a" {
+		t.Fatalf("the rebound HTTP listener was bound under auth snapshot %+v — the SUPERSEDED "+
+			"secret. It serves from the moment it is created, so the secret the operator "+
+			"replaced was live on the new socket for as long as the bind took", snap)
+	}
+	if live := m.srv.LiveAuth(); live == nil || live.Users["admin"] != "secret-b" {
+		t.Fatalf("post-reconcile snapshot = %+v, want the rotated secret — the rebind converged, "+
+			"so the full committed set must be live", live)
+	}
+}
+
+// TestMgmtRetainedListenerNeverGainsACredential_5561 is the fail-on-revert gate
+// for the #5561 round-12 GRANT property: a listener RETAINED by a failed rebind
+// must never start accepting a credential it did not already accept.
+//
+// The comment that licensed the unconditional publish argued that a non-nil auth
+// "only ADDS a requirement, so applying it to whatever is currently live is
+// strictly more restrictive". That is true only against a NIL live snapshot.
+// Credential sets are not monotonic: they expand and rotate, and every value
+// they gain is a value that was not accepted a moment ago.
+//
+// The operator's commit is a pair — this credential set, at this endpoint. When
+// the endpoint fails to bind, the fail-safe keeps the OLD listener serving, and
+// publishing the whole set hands the new credentials to an address the commit
+// asked to stop serving. The sharp version is a commit that moves management
+// off a routable address (or onto loopback) while introducing an automation
+// credential: the credential was scoped to the endpoint the operator was moving
+// to, and a failed rebind would otherwise expose it exactly where the operator
+// was trying to withdraw it.
+//
+// FAIL-ON-REVERT: publish next.Auth whole before the rebind and the retained
+// listener accepts both the new principal and the new api-key.
+func TestMgmtRetainedListenerNeverGainsACredential_5561(t *testing.T) {
+	reg := newFakeReg()
+	m := newTestMgmt(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Live: an off-box listener accepting exactly one credential.
+	live := &api.AuthConfig{Users: map[string]string{"webadmin": "secret-a"}}
+	if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:8080", false, "", live)); err != nil {
+		t.Fatalf("initial start: %v", err)
+	}
+
+	// The commit: keep webadmin, ADD an automation principal and an api-key, and
+	// move the bind. The move fails, so 10.0.0.1:8080 keeps serving.
+	expanded := &api.AuthConfig{
+		Users:   map[string]string{"webadmin": "secret-a", "autobot": "secret-c"},
+		APIKeys: map[string]bool{"key-new": true},
+	}
+	reg.failAddr["10.0.0.2:8080"] = true
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.2:8080", false, "", expanded)); err == nil {
+		t.Fatal("the rebind was expected to FAIL, so the case never reached the state it tests " +
+			"(a retained listener under a widened credential set)")
+	}
+
+	snap := m.srv.LiveAuth()
+	if snap == nil {
+		t.Fatal("the live snapshot went nil on a failed rebind — that drops api-auth entirely " +
+			"on an off-box listener")
+	}
+	if _, ok := snap.Users["autobot"]; ok {
+		t.Fatalf("the listener at %q now accepts principal autobot. The committed config "+
+			"authorized autobot at 10.0.0.2:8080, an endpoint that FAILED to bind; this "+
+			"listener is the one the commit asked to leave, and it never accepted autobot "+
+			"before", m.cur.addr)
+	}
+	if snap.APIKeys["key-new"] {
+		t.Fatalf("the listener at %q now accepts api-key key-new, which it never accepted "+
+			"before and which was committed for an endpoint that failed to bind", m.cur.addr)
+	}
+	// The withholding is an intersection, not a lockout: a credential that was
+	// already accepted here AND is still committed keeps working.
+	if got := snap.Users["webadmin"]; got != "secret-a" {
+		t.Fatalf("the retained listener lost webadmin (snapshot %+v). The commit did not revoke "+
+			"it and this listener already accepted it, so withholding it is over-restriction "+
+			"with no property behind it", snap)
+	}
+
+	// Control: the withholding is scoped to the FAILURE. When the rebind
+	// converges, every live listener is at an address this config names and the
+	// full set lands — otherwise the assertions above would also be satisfied by
+	// an implementation that never grants a credential after any endpoint change.
+	delete(reg.failAddr, "10.0.0.2:8080")
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.2:8080", false, "", expanded)); err != nil {
+		t.Fatalf("retry reconcile: %v", err)
+	}
+	snap = m.srv.LiveAuth()
+	if snap == nil || snap.Users["autobot"] != "secret-c" || !snap.APIKeys["key-new"] {
+		t.Fatalf("post-convergence snapshot = %+v, want the full committed set — the listener is "+
+			"now at the endpoint the credentials were committed for", snap)
 	}
 }

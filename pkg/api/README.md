@@ -858,6 +858,44 @@ under the daemon's errgroup. Nothing else imports this package.
     `authMiddleware`, so the swap enforces byte-identical semantics (the #4157
     constant-time + #5636 empty-secret guards, `/health` + loopback-`/metrics`
     exemptions).
+  - **What is published, and when (#5561 rounds 7/9/10/12).** A commit's
+    credential set is not published as one atomic thing, because a credential
+    change is really two changes with opposite safety directions and a listener
+    may be serving an address the commit asked to leave.
+    - The **revocation** half goes out FIRST — before either leg is (re)bound and
+      regardless of the outcome. Deferring it behind a bind that may never
+      succeed left the retained listener honouring a replaced secret permanently
+      (round 7), and publishing after the rebind left a freshly-bound socket
+      serving under the old snapshot for the width of the intervening HTTPS
+      reconcile (round 9; `ReconcileHTTP` serves before it returns).
+    - The **grant** half waits for every leg to converge. A credential set is
+      committed together with the endpoint it is meant for, so while a leg is
+      retained at an address this config asked to leave, only
+      `AuthForRetainedListener(live, next)` — the intersection of what that
+      listener already accepted with what is still committed — may be enforced
+      (round 12). Otherwise a commit that moves management to loopback while
+      introducing a credential would, on a failed rebind, publish that credential
+      on the routable address the operator was withdrawing. A **nil** live
+      snapshot is the UNIVERSAL set, not the empty one (it is the pass-through
+      posture), which is what keeps the round-9 case publishing whole. An
+      endpoint-only-unchanged commit has nothing to converge and publishes whole.
+      The intersection can be EMPTY, which denies everyone on the retained
+      listener until a later reconcile converges — deliberate, logged, and
+      bounded to a state that already returns an error and shows `Failed` in
+      `show system services`.
+    - **Removing all api-auth** (nil) publishes AFTER the rebinds and only when
+      BOTH live bind addresses are loopback. The justification for a nil is the
+      #4047/#5127 clamp, which `resolveAPIBinds` evaluates against the config
+      being applied and never re-evaluates against the listener that is serving —
+      so the live addresses must be proven loopback directly rather than inferred
+      from "the rebind succeeded" (round 12).
+    - **Freshness**: the credential half always comes from the store's ACTIVE
+      config, including when that is nil (`withCommittedAuth`). An apply caller
+      that snapshots `ActiveConfig()` and then waits on the apply semaphore (the
+      DHCP lease-change callback) can be overtaken by a commit; without this a
+      stale replay republished a superseded — or a deleted — secret on the
+      listener the newer commit had moved to. Only the credential half is pinned;
+      a stale replay still drives the ENDPOINT, which is #6716.
   - The HTTP and HTTPS listeners run in INDEPENDENT legs (`listener.go`), each
     make-before-break: `ReconcileHTTP(addr)` rebinds only the HTTP leg and
     `ReconcileHTTPS(tls, addr)` enables / disables / rebinds only the HTTPS leg —

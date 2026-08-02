@@ -14,6 +14,89 @@ type AuthConfig struct {
 	APIKeys map[string]bool   // valid API key tokens
 }
 
+// AuthForRetainedListener returns the credential set that may be published while
+// some live listener is RETAINED at an address the committed config does not
+// name — the fail-safe state a failed (re)bind leaves behind, and the window a
+// make-before-break rebind passes through (#5561 round 12).
+//
+// It is the intersection: a credential survives only if the SAME value was
+// already accepted on that listener AND the committed config still carries it.
+// Both halves matter and they close opposite holes:
+//
+//   - Dropping what the committed config no longer carries is the REVOCATION
+//     half (#5561 round 7). The retained listener must stop honouring a secret
+//     the operator replaced, and it must stop immediately rather than whenever
+//     some later reconcile happens to bind — that deferral was not a race window
+//     but a permanent one.
+//
+//   - Withholding what was NOT already accepted there is the GRANT half. The
+//     credential set the operator committed is authorized in the context of the
+//     endpoint committed alongside it; when that endpoint fails to bind,
+//     publishing the whole set hands a credential to a listener the config never
+//     asked to keep serving. The sharp case is a commit that moves management
+//     from an off-box address to loopback AND introduces a credential: the new
+//     secret was meant to be reachable only from the box, and a failed rebind
+//     would otherwise expose it on the routable address the operator was trying
+//     to retire. Rotation is the same shape — revoking A tightens, granting B
+//     does not.
+//
+// A nil `live` is the UNIVERSAL set, not the empty one: a nil snapshot is
+// dynamicAuthMiddleware's pass-through, so that listener already accepts every
+// caller and `next` is unambiguously a tightening. Returning `next` whole there
+// is what lets a commit that moves a bind off-loopback AND adds the credential
+// the #4047/#5127 clamp requires publish that credential BEFORE the new socket
+// serves (#5561 round 9).
+//
+// The result can be EMPTY (non-nil with no credentials), and that is deliberate:
+// dynamicAuthMiddleware rejects every non-exempt request against an empty set,
+// so a commit that replaces the credentials wholesale AND fails to move the
+// endpoint leaves the retained listener refusing everyone until a later reconcile
+// converges. That is the direction this file has consistently chosen —
+// over-restrict and wait for the next commit, never under-restrict — and the
+// REST API is not the box's lifeline (console/SSH and the local CLI are
+// untouched). reconcileTo logs the withholding so the state is diagnosable.
+//
+// Secrets are compared with ==, not crypto/subtle: both operands are configured
+// values from the daemon's own config store, never attacker-supplied request
+// content, so there is no request-timing channel to close here (the
+// constant-time comparisons live in checkAuthorization, against the presented
+// credential).
+func AuthForRetainedListener(live, next *AuthConfig) *AuthConfig {
+	if next == nil {
+		return nil
+	}
+	if live == nil {
+		return next
+	}
+	// A fresh value: never alias (or mutate) either operand, so the published
+	// snapshot cannot change under a later edit of the config it came from.
+	out := &AuthConfig{Users: map[string]string{}, APIKeys: map[string]bool{}}
+	for user, pw := range next.Users {
+		// Match on the PAIR. A same-username secret rotation is a revocation
+		// plus a grant, and the grant half is withheld like any other.
+		if was, ok := live.Users[user]; ok && was == pw {
+			out.Users[user] = pw
+		}
+	}
+	for key, ok := range next.APIKeys {
+		if ok && live.APIKeys[key] {
+			out.APIKeys[key] = true
+		}
+	}
+	return out
+}
+
+// CredentialCount reports how many usable credentials a snapshot carries. A nil
+// snapshot means no authentication at all, which is not a count of credentials;
+// the management reconciler uses this only to log how much of a committed set it
+// had to withhold from a retained listener.
+func CredentialCount(a *AuthConfig) int {
+	if a == nil {
+		return 0
+	}
+	return len(a.Users) + len(a.APIKeys)
+}
+
 // authMiddleware wraps an http.Handler with Basic Auth / Bearer / X-API-Key
 // checks. /health always bypasses authentication (it exposes no sensitive data
 // and is a liveness probe). /metrics bypasses authentication only when

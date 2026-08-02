@@ -67187,3 +67187,83 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/api/authz.go, pkg/api/authz_freshness_5561_test.go,
   pkg/api/README.md, pkg/authz/authz_5561_test.go, pkg/config/login_perms.go,
   docs/system-login.md, _Log.md
+
+- **Timestamp**: 2026-08-01 (#5561 round-12 — Codex MAJOR-1 + MAJOR-2 CONFIRMED
+  and fixed; 2 test overclaims closed)
+- **Action**: Fixed the two credential-publication interleavings an independent
+  Codex review found in the web-management reconcile, and corrected the comment
+  that had justified one of them on a false premise.
+- **The central question — can a RETAINED listener be non-loopback?** YES,
+  established firsthand before any fix. The #4047/#5127 clamp is evaluated by
+  `resolveAPIBinds` against the config being APPLIED, using that config's own
+  api-auth, and is never re-evaluated against the listener that is serving. So a
+  config carrying a credential binds off-loopback legitimately; when a later
+  commit REMOVES api-auth its own bind is clamped to loopback, and if that bind
+  fails the off-loopback listener is RETAINED. Evidence, from the reproduction
+  before the fix: `removed-auth desired: addr="127.0.0.1:80" auth=<nil>` /
+  `retained live HTTP bind: "10.0.0.2:80" loopback=false` /
+  `post-replay snapshot on the OFF-BOX retained listener: Users[webadmin:secret-a]`.
+  Round 11's comment justified leaving the nil direction unpinned on the claim
+  that a resurrected credential "over-restricts a management API that is clamped
+  to loopback regardless" — false for exactly this path, and the outcome is
+  UNDER-restriction: a deleted secret authorizing `POST /api/v1/system/action`
+  from off-box. The comment is rewritten to state the clamp's real scope.
+- **MAJOR-1 (stale replay vs a committed NIL) — CONFIRMED, fixed**:
+  `withCommittedAuth` now propagates the ACTIVE config's credential policy
+  unconditionally, including nil. Codex's warning that letting the ACTIVE nil
+  overwrite would instead expose a retained off-box listener with NO auth is
+  correct against the OLD nil gate, so the gate moved too: the nil publish is now
+  gated on `mgmtAddrIsLoopback(m.cur.addr)` — the address the live listener is
+  actually bound to — instead of on the HTTP rebind outcome. The rebind-outcome
+  test was a PROXY for "the live bind is the one whose clamp justified the nil",
+  and a stale replay breaks the proxy: its endpoint came from a config that
+  carried a credential, so it is legitimately off-loopback and can bind
+  successfully. Guarded in both directions.
+- **MAJOR-2 (a non-nil publish can RELAX) — CONFIRMED, fixed**: the comment's
+  "every non-nil auth change is strictly more restrictive" is true only against a
+  NIL live snapshot. Adopted Codex's ordering — intersection before the bind, the
+  complete set after convergence — via `api.AuthForRetainedListener(live, next)`.
+  A nil `live` is the UNIVERSAL set (the pass-through posture), which is what
+  keeps the round-9 hoist publishing whole; an endpoint-unchanged commit
+  publishes whole because there is no retained listener to protect. Users match
+  on the (name, secret) PAIR, so a rotation is a revocation plus a grant and only
+  the revocation lands early.
+- **Deliberate consequence, stated**: the intersection can be EMPTY, which denies
+  everyone on a listener retained by a failed rebind until a later reconcile
+  converges. Considered and rejected a principal-name-scoped variant that would
+  have preserved four existing assertions unchanged: it only rescues same-
+  username rotations (a `{admin}`→`{other}` replacement still empties the set),
+  so it buys an inconsistent guarantee for a weaker rule, and it would let a
+  secret the operator scoped to a loopback endpoint work off-box. The REST API is
+  not the box's lifeline (console/SSH + the local CLI are untouched), the state
+  already returns an error and shows `Failed` in `show system services`, and
+  reconcileTo now logs the withheld count.
+- **Four existing assertions inverted, deliberately** — each keeps the security
+  property it was written for and loses only an availability corollary that IS
+  MAJOR-2's shape (the retained listener also GAINING the new credential), and
+  each gains a convergence control so the withhold cannot be satisfied by an
+  implementation that simply stopped publishing:
+  `TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866` (admin still
+  revoked; `other` withheld), `...RotationHonored...` →
+  `TestMgmtReconcileRotationRevokesDespiteHTTPRebindFailure_5561`,
+  `TestMgmtFailedRebindStillPublishesACommittedRotation_5561` →
+  `...StillRevokes...`, `TestMgmtCredentialRotationPrecedesTheRebind_5561` (the
+  new socket must not be bound under the SUPERSEDED secret — the property its own
+  doc comment names).
+- **Test overclaims closed** (both from Codex): `management_authstale_5561_test.go`'s
+  fixture always supplied non-nil auth, which is precisely why MAJOR-1 went
+  unseen — added `mgmtAuthConfigRemoveAuth`; `management_authpublish_5561_test.go`
+  recorded a mutable pointer (now deep-copied) and checked only that `admin`
+  EXISTS (now checks the password).
+- **RED-then-GREEN**: both MAJORs reproduced BEFORE any fix. Mutation-proved
+  after, build+vet rc=0 in every state: (M1) restore round-10's
+  `committed != nil` guard → `TestMgmtStaleReplayCannotResurrectRemovedAuth_5561`
+  + `...WithCommittedNilKeepsOffLoopbackAuth_5561` red, rest green. (M2) publish
+  the full set before the rebind → the four grant-half guards red, rest green.
+  (M3) gate the nil publish on `httpOK` instead of the live bind address →
+  `TestMgmtStaleReplayWithCommittedNilKeepsOffLoopbackAuth_5561` red alone.
+- **File(s)**: pkg/api/auth.go, pkg/api/server.go,
+  pkg/api/auth_retained_5561_test.go, pkg/api/README.md,
+  pkg/daemon/management.go, pkg/daemon/management_5866_test.go,
+  pkg/daemon/management_authstale_5561_test.go,
+  pkg/daemon/management_authpublish_5561_test.go, _Log.md
