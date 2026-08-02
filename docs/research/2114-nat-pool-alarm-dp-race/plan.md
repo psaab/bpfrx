@@ -1,6 +1,34 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v91 — r88 Codex folds (its verdict ran
+- **Status**: DRAFT v92 — r89 folds: Codex's five minors (no
+  MAJOR this round — the first all-minor Codex verdict since
+  r68): minor-1's class-partition completion (`maps_nat.go:400`
+  joins the class-3 hybrid assignment — `ClearNATRuleCounters`
+  resets offsets before its sole lookup at `:399`; and the
+  "OTHER accesses are required" claim deleted — the five named
+  methods each have ONLY one registry access); minor-2's
+  per-site-outcome precision (the generic rule now says the
+  absent outcome is master's EXACT per-site behavior — skip /
+  nil-guard return / skip-and-CONTINUE preserved site-by-site;
+  `Compile`'s `compiler.go:353` continues, `loader.go:700` is a
+  comma-ok early return not a nil guard); minor-3's §6/§8
+  summary pluralization (both now name the IsLoaded surface
+  alongside the loaded-check narrowing); minor-4's Detach-oracle
+  seeding (the test now explicitly seeds a usable
+  `iface_zone_map` — absent it, `loader.go:700`'s early return
+  never reaches claim discovery; "always runs" excludes the
+  absent-map no-op); minor-5's five-leg bookkeeping (the "four
+  legs are the complete set" and "four-leg form" texts
+  renumbered, and the hook-placement transition marked as the
+  START-path seam, distinct from leg 5's Close-window hook).
+  Codex's verified folds (fold-free): the Close-window leg
+  implementable; the class-3 assignments correct; all three
+  continuation paths real; the pinned-link reuse confirmed; the
+  per-access preamble; the §4.7/§7 cross-references; no G+H+H2
+  leakage. r89 verdicts: Codex PLAN-NEEDS-MINOR (5m), AGY
+  PLAN-READY, Claude SMR PLAN-READY; pending convergence review
+  r90.
+- **Prior**: DRAFT v91 — r88 Codex folds (its verdict ran
   against v89; both of its headline defects were already v90's
   AGY folds, and its three residuals are folded here): the
   partition preamble now classifies per-access (class 2 = "EVERY
@@ -3355,7 +3383,10 @@
   per-access partition preamble; the class-assigned omitted
   set; the three continuation-oracle paths; the AttachXDP
   pinned-link qualification; the limiting-summary cross-
-  references).
+  references). v92 (r89 Codex's five minors: the class-3
+  completion + the "other required" deletion; the per-site
+  outcome precision; the §6/§8 pluralization; the Detach-oracle
+  seeding; the five-leg bookkeeping).
 
 ---
 
@@ -4623,10 +4654,15 @@ Preserved exactly:
   reaches the registry), and Teardown-retained FDs are live but
   UNPINNED after `loader.go:1221` (the §10 generation hazard —
   "live pinned" was wrong for that state). POST-ARM behavior is
-  bit-identical; no signature changes. (The one admitted
-  non-post-arm divergence, named at v88 per r86 Codex m3: the
+  bit-identical; no signature changes. (The admitted
+  non-post-arm divergences, named at v88 per r86 Codex m3 and
+  pluralized at v92 per r89 Codex minor-3: the
   `loaded=false` move from Close's exit to its ENTRY narrows the
-  loaded-check set's admission window — a deliberate timing
+  loaded-check set's admission window AND advances the externally
+  observable `IsLoaded()` surface (`loader.go:456` → the REST
+  `health.go:107` / gRPC `server_show_status.go:22`
+  `DataplaneLoaded` reads; §9 leg 5 asserts the window) — a
+  deliberate timing
   change, qualified to that set at v85; every ordinary method
   classifies retained and proceeds, so this is not a lifecycle
   redesign but an admission-timing narrowing.)
@@ -4722,7 +4758,7 @@ Preserved exactly:
 | Behavioral regression | **MED** | Large but mechanical diff; compiler-enforced completeness + regenerated §5.4 table + the new dpCell canary. Real risks: (a) a §5.3 snapshot-boundary mistake; (b) canary redesign errors (mitigated by both-direction self-tests); (c) the fwdstatus narrowing touching `NewSampler` (contained: 1 prod caller + 2 test sites; full-suite gate); (d) [FOLLOW-UP — seed] work item H narrows commit-confirmed recovery semantics for the FirstCommit+cluster class (revert-at-Load vs re-arm); the follow-up unit's risks are assessed in `followup-seed.md`; (e) the A3 enumerate-and-gate audit could miss an exported maps-touching method — mitigated by the pre-arm method-matrix test and the blocked-Start -race regression (§9), and bounded by the failure shape (a missed gate reproduces master's map-not-found error, never a NEW failure mode). |
 | Lifetime / borrow | **LOW** | Immutable slots; captured references keep backends alive exactly as today. No FFI/Rust interaction. |
 | Performance regression | **LOW** | One atomic load + indirection per control-plane read (1 Hz sampler, request rate, watchdog 2/s, HA ≤15/s). One small allocation per Store, ≤5/lifetime. No per-packet Go code. |
-| Architectural mismatch | **LOW** | #2116 `atomic.Pointer` precedent; daemon atomics-for-publication idiom; no dataplane-lifecycle redesign (Option B rejected); canary redesign extends the existing boundary-guard pattern. Work items G+H (FOLLOW-UP — `followup-seed.md`) carry a deliberate lifecycle change (startup-outcome gating of the rollback executor + the shutdown-admission fence) and a narrowed recovery semantic; their full risk assessment lives in the seed. PR-1 itself adds no lifecycle REDESIGN; its one admitted timing change is the Close-entry `loaded=false` admission narrowing of the loaded-check set (v88 qualification per r86 Codex m3 — the v87 "no lifecycle change" phrasing overclaimed). |
+| Architectural mismatch | **LOW** | #2116 `atomic.Pointer` precedent; daemon atomics-for-publication idiom; no dataplane-lifecycle redesign (Option B rejected); canary redesign extends the existing boundary-guard pattern. Work items G+H (FOLLOW-UP — `followup-seed.md`) carry a deliberate lifecycle change (startup-outcome gating of the rollback executor + the shutdown-admission fence) and a narrowed recovery semantic; their full risk assessment lives in the seed. PR-1 itself adds no lifecycle REDESIGN; its admitted timing change is the Close-entry `loaded=false` narrowing of the loaded-check set's admission AND the externally observable `IsLoaded()` surface (`loader.go:456` → REST/gRPC `DataplaneLoaded`; §9 leg 5 asserts the window) (v88 qualification per r86 Codex m3, pluralized at v92 per r89 Codex minor-3 — the v87 "no lifecycle change" phrasing overclaimed). |
 
 ## 9. Test plan
 
@@ -4846,7 +4882,9 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    in-batch lock-ownership test: the whole-batch hold contains a
    test hook, readers from every class BLOCK until the hold
    releases, and after release they observe the ARMED state (the
-   Store(true) is the batch's final in-hold step). The four legs
+   Store(true) is the batch's final in-hold step). The FIVE legs
+   (renumbered at v92 per r89 Codex minor-5 — the v90 leg-(5)
+   addition left this "four legs" bookkeeping stale)
    are the complete, mutually consistent oracle set (r78 Codex
    M2's required split — the v79 text's "legacy overlap shape
    retained for the record" sentence kept the contradictory
@@ -4872,7 +4910,11 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    observes `false` DURING the window, where master (flip at the
    `:1217` exit) would still report true. The leg pins the
    intended early-report semantics as asserted behavior, not an
-   incidental side effect. Hook placement is explicit:
+   incidental side effect. (Transition pinned at v92 per r89 Codex
+   minor-5: the following hook-placement text concerns the START
+   path's in-hold Store(true), NOT leg 5's Close-window hook after
+   Store(false) — the two hooks are distinct seams.) Hook placement
+   for the START-path legs is explicit:
    BEFORE the in-hold Store(true), preserved loaded-check methods
    (the attaches, the CompileConfig path) return immediately;
    after it, they pass their precheck and block at registry
@@ -4939,7 +4981,9 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    is asserted (r71 Codex M3 — `ClearAllCounters` composes through
    internal raw helpers, preserving its pinned legacy error text).
    PLUS the RETAINED-state coverage (r76 Codex m2; corrected to the
-   four-leg form at v81 per r79 Codex M1; the fixture scope pinned
+   four-leg form at v81 per r79 Codex M1, FIVE-leg since v90's
+   Close-window addition per r88 AGY b1 — the "four-leg" bookkeeping
+   here was stale, r89 Codex minor-5; the fixture scope pinned
    at v82 per r80 Codex m1 — ONE seeded retained fixture suffices
    for A3's state classification because an ARMED Manager's Close
    and Teardown both present `loaded=false` + a nonempty registry
@@ -5044,8 +5088,16 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    M1 — method-level classification plus one `present` dimension
    cannot encode master: real class-1 methods mix REQUIRED accesses
    (absent → master's missing-map error) with OPTIONAL accesses
-   (absent → master's silent skip / nil-guard return, the method
-   still succeeds)). The matrix row governs a class-1 method's
+   (absent → master's EXACT per-site outcome — the silent skip,
+   the nil-guard return, OR the skip-and-CONTINUE, preserved
+   site-by-site; v92 precision per r89 Codex minor-2 — the v88
+   "nil-guard return" phrasing overgeneralized: `Compile`'s
+   absent `redirect_capable` at `compiler.go:353` SKIPS the
+   redirect-map population and CONTINUES into the attachment
+   work, it does not return; and `loader.go:700`'s
+   `iface_zone_map` access is a comma-ok early return, not
+   syntactically a nil guard)). The matrix row governs a class-1
+   method's
    REQUIRED accesses; an OPTIONAL access inside ANY class keeps
    master's exact per-site outcome (the `if ok` body simply does
    not run; the nil-guard simply returns) — only the helper wraps
@@ -5098,7 +5150,11 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    precedence rule (the twelve stale cleanups, `maps_nat.go:435`,
    `maps_policy.go:253`, `maps_screen.go:60`, `maps_session.go:612`,
    `maps_stats.go:72`), while `maps_counters.go:181` and `:233`
-   sit in class-3 hybrid methods (`ClearGlobalCounters` resets the
+   AND `maps_nat.go:400` (added at v92 per r89 Codex minor-1 —
+   v91's class-3 assignment omitted it though A3 correctly lists
+   `ClearNATRuleCounters` as class-3)
+   sit in class-3 hybrid methods (`ClearGlobalCounters`,
+   `ClearZoneCounters`, `ClearNATRuleCounters` each reset the
    Go offsets BEFORE the map access — the pinned side-effect-plus-
    neutral composition, NOT pure class-2) and the class-4 getters
    (`loader.go:1152`/`:1157`) plus the internal composed helpers
@@ -5115,14 +5171,24 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    — the offset reset is the meaningful clear, absent map is not
    an error by the pinned comment) and `maps_stats.go:72`
    (`GetMapStats`' per-descriptor `!ok → continue`). The
-   mixed-method neutral-returns (`maps_nat.go:400`
-   nat_rule_counters, `:435` nat_port_counters,
+   mixed-method neutral-returns (`maps_nat.go:435`
+   nat_port_counters,
    `maps_policy.go:253` policy_rules, `maps_session.go:612`
    session_id_gen, `loader.go:910`/`:928` iface_zone_map,
    `maps_counters.go:233` zone_counters) are inside
-   error-signature methods whose OTHER accesses are required —
+   error-signature methods
+   (v92 correction per r89 Codex minor-1 — v91 said their "OTHER
+   accesses are required", which is FALSE: `ClearNATRuleCounters`,
+   `ClearZoneCounters`, `SeedNATPortCounters`,
+   `UpdatePolicyScheduleState`, and `SeedSessionIDCounter` each
+   have ONLY that one registry access; the correct statement is
+   that these methods are class-3 hybrids or class-2 by their
+   Go-side effects and signatures, and the neutral access keeps
+   master's outcome) —
    they follow the same per-access rule (the helper wraps the
    lookup; the absent branch keeps master's neutral return).
+   (`maps_nat.go:400` nat_rule_counters is class-3 per the
+   assignment above.)
    The canary does
    not distinguish required from optional — BOTH wrap through the
    helper; the distinction lives only in how the caller consumes
@@ -5201,12 +5267,21 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    estimate (most injected fixtures proceed unchanged). The Detach leg gets its named test
    (r75 Codex m2): `TestManager_ArmedGate_DetachRetainedClaims`
    (matching the race target's `-run` pattern) — the fake
-   `link.Link` embed, `xdpLinks`+`xdpFlagClaims` seeded, cleanup
+   `link.Link` embed, `xdpLinks`+`xdpFlagClaims` seeded, AND a
+   usable `iface_zone_map` explicitly seeded/seamed (v92
+   addition per r89 Codex minor-4 — without it the
+   `iface_zone_map` lookup at `loader.go:700` returns nil as
+   master's early-boot no-op and the test never reaches claim
+   discovery at `:711` or deletion at `:777`; the pinned-AttachXDP
+   defer reaches `:730` only if the `:700` selection succeeds),
+   cleanup
    asserted race-free — with the error-order qualification:
    "cleanup always runs" means UNLESS a discovery failure returns
    first (the `vlan_iface_map` lookup :730 and `iface_zone_map`
    iteration :747 error paths preserve claims and the link for
-   retry — claims are never deleted before those failures).
+   retry — claims are never deleted before those failures) AND
+   EXCLUDES the absent-`iface_zone_map` no-op (the :700 early
+   return is master's preserved outcome, not a cleanup skip).
    **[CORE]**
 5. Canary tests: redesigned matcher self-tests both directions; new
    `daemon_dp_canary_test.go` asserts no direct `dpCell` access outside the
@@ -5749,12 +5824,16 @@ Still open:
    residuals (the per-access partition preamble, the class-
    assigned omitted set, the three continuation-oracle paths,
    the AttachXDP pinned-link qualification, the limiting-summary
-   cross-references) landed in v91. Each reviewer: verify the
-   17-site mixed inventory AND the class-assigned neutral sets
-   against your own grep, the discriminating oracle's
-   continuation assertions (including the three v91 paths), the
-   per-access gating phrasing (preamble included), and the
-   IsLoaded window leg.
+   cross-references) landed in v91; r89's five minors (the
+   class-3 completion + the "other required" deletion, the
+   per-site outcome precision, the §6/§8 pluralization, the
+   Detach-oracle seeding, the five-leg bookkeeping) landed in
+   v92. Each reviewer: verify the full census (91 required + 41
+   optional + 3 writes = 135), the class-3 triple
+   (`maps_counters.go:181`/`:233` + `maps_nat.go:400`), the
+   per-site outcome rule (skip/return/continue preserved), the
+   Detach-oracle `iface_zone_map` seeding, and the five-leg
+   oracle set.
 
 ---
 
