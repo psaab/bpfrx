@@ -365,8 +365,17 @@ peer liveness (`lastSeen`) or drive election.
     on the same `prev+1`. So the honest statement is *durable across every
     restart in a window up to `bootEpochMaxSkew` whenever the persist half
     cannot advance the file*, and the bound buys one restart inside that
-    window rather than removing it. Recovery needs the wall clock to climb
-    past `prev+1` **and** another restart — at most an hour. **When
+    window rather than removing it, and it buys NONE at all against an on-link
+    replay attacker: every prior incarnation's frames carry the current floor
+    value under a distinct session in this regime, so one replayed archived
+    frame fills the second slot and the first genuine successor is refused.
+    Raising the bound does not help — an attacker spends `k-1` slots as cheaply
+    as one. **Sender-side recovery** needs the wall clock to climb past
+    `prev+1` **and** another restart — at most an hour. **Restarting the
+    RECEIVER clears it at once**: `highEpoch` and `highEpochSessions` are
+    Manager-scoped, so a receiver restart zeroes the floor and the stranded
+    successor is admitted immediately on the raise-from-0 path. Prefer that
+    when both nodes are reachable. **When
     "Epoch session collisions" climbs alongside a peer that keeps being
     declared dead, check for a non-writable `/var` on the peer first**
     (`df`, and a test write under `/var/lib/xpf`); a clock at or before the

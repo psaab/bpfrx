@@ -649,10 +649,28 @@ const heartbeatReplaySessions = 64
 // particular not by the bound session going quiet, which is free (wait out the
 // dead-peer interval between captures) and restores unbounded admissions.
 //
-// 2 is the smallest value that admits a legitimate successor at an unchanged
-// epoch, and it is far below heartbeatReplaySessions so the sessions bound at
-// one value can never evict each other from the ring. What it does NOT cover is
-// stated where the cost is: see heartbeatAuthState.highEpochSessions.
+// 2 admits a legitimate successor at an unchanged epoch ONLY when nothing else
+// has spent a slot, and it is far below heartbeatReplaySessions so the sessions
+// bound at one value can never evict each other from the ring.
+//
+// AN ATTACKER SPENDS SLOTS AS CHEAPLY AS THE PEER DOES, and an earlier revision
+// of this comment claimed 2 was "the smallest value that admits a legitimate
+// successor" without that qualifier. In the equal-epoch regime EVERY prior
+// incarnation's frames carry the current floor value under a distinct session,
+// so an on-link recorder holds them for free: one replayed archived frame fills
+// the second slot, and the first genuine successor is then refused. Measured —
+// A1 admitted (slots {A1}), one archived frame from an earlier incarnation at
+// the same epoch admitted (slots FULL), A1 exits, successor A2 REFUSED with
+// EpochSessionCollision=1.
+//
+// So the headroom this buys is k-1-j restarts, where j is the number of distinct
+// captured sessions an attacker can present at the live epoch value, and j >= 1
+// is free in exactly the regime that produces equal epochs. Against a no-attacker
+// fault it buys one restart; against an on-link replay attacker it buys none.
+// Raising k does not fix that — k-1 slots are as cheap to spend as one — which is
+// why this is stated rather than tuned. The SECURITY property is unaffected: the
+// floor stays monotone and the budget stays finite and non-refilling.
+// See heartbeatAuthState.highEpochSessions for the rest of the cost.
 const heartbeatEpochSessionsPerEpoch = 2
 
 // replaySessionMark is one remembered (session, high-water counter) pair.
@@ -859,16 +877,22 @@ type heartbeatAuthState struct {
 	// is refilled by the attacker.
 	//
 	// Fixing the GENERATOR so it stops emitting equal epochs cannot replace this
-	// bound, only narrow it. The collision is deterministic precisely because
-	// prev+1 is a pure function of the file, and the only local source of
-	// distinctness is this incarnation's own entropy — so any generator fix is
-	// PROBABILISTIC (a jittered chain collides at 2^-j rather than never) and,
-	// worse, has no entropy to draw on in the case that motivated the mechanism:
-	// a clock at or before the Unix epoch with NO chainable file makes
-	// bootEpochSeed return the literal 1 for every incarnation, with nothing to
-	// jitter. A receiver-side bound is needed in every regime; a sender-side
-	// jitter is needed in none of them on its own. It is therefore left out
-	// rather than stacked on top, and the residual above is stated instead.
+	// bound, only narrow it — but not for the reason an earlier revision of this
+	// comment gave. It claimed there is "nothing to jitter" when the clock is at
+	// or before the Unix epoch and no chainable file exists. That is false:
+	// randomSessionID() draws from crypto/rand in that same process, so entropy
+	// is available.
+	//
+	// The sound reason is that a randomised epoch stops being an ORDER, which is
+	// the only thing the epoch exists to provide. Jitter can only be added in low
+	// bits, and every bit spent on distinctness is a bit of ordering resolution
+	// given up; a jittered chain then collides at 2^-j rather than never, so the
+	// receiver still needs a bound for the collision it does not prevent.
+	// Decisively, the ATTACKER controls the frames it replays and will not jitter
+	// them, so a sender-side change cannot bind admissions at all. A receiver-side
+	// bound is needed in every regime; a sender-side jitter in none of them on its
+	// own. It is therefore left out rather than stacked on top, and the residual
+	// above is stated instead.
 	//
 	// A peer session id of 0 is possible (crypto/rand) at ~2^-64 and needs no
 	// special case: it binds and compares like any other value, because
@@ -1376,9 +1400,21 @@ func (s *heartbeatAuthState) epochSessionAdmissible(session uint64) bool {
 // bindEpochSession records session as one of the incarnations admitted at the
 // current floor. reset drops every previous binding, which is what a raise
 // does; otherwise the session is added if it is not already present and a slot
-// is free. Adding when the set is full is a no-op rather than an eviction —
-// evicting would make the budget refillable and hand an attacker back the
-// unbounded churn the bound exists to stop.
+// is free.
+//
+// THE NO-REFILL PROPERTY IS ENFORCED BY epochSessionAdmissible, NOT HERE. An
+// earlier revision of this comment credited it to the full-set branch below —
+// "adding when the set is full is a no-op rather than an eviction" — which told
+// a reader the security decision lives at a line that cannot execute. Under the
+// same s.mu hold, epochSessionAdmissible already returns false for any session
+// not in the set once the count reaches len(highEpochSessions), and nothing
+// between that check and this call mutates the set, so admitAuthedLocked never
+// reaches the full-set branch. Mutating that branch to evict slot 0 leaves the
+// whole suite green; the property is bound by the admissibility gate instead.
+// The branch is kept as defence-in-depth against a future caller that does not
+// pre-check, and is deliberately a no-op because eviction would make the budget
+// refillable and hand an attacker back the unbounded churn the bound exists to
+// stop.
 //
 // s.mu must be held.
 func (s *heartbeatAuthState) bindEpochSession(session uint64, reset bool) {

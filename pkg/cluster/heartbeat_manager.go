@@ -579,10 +579,17 @@ type HeartbeatStats struct {
 	// Either way the sender recovers once its epoch can move again; see
 	// pkg/cluster/README.md.
 	//
-	// CLIMBING WHILE PEER LIVENESS IS UNAFFECTED is an attacker replaying a
-	// captured set that shares an epoch. Neither cause is visible in the other
-	// two counters: such a frame carries an epoch (so it is not
-	// EpochlessAdmitted) and is not a downgrade (so it is not
+	// CLIMBING WHILE PEER LIVENESS IS STILL HEALTHY is an attacker replaying a
+	// captured set that shares an epoch. Read that as "not yet affected" rather
+	// than "harmless": an earlier revision of this note said liveness is
+	// UNAFFECTED, and it is not. Each replayed session spends one of the epoch
+	// value's slots, so the peer's NEXT restart at that same value finds the slot
+	// it needs already taken and is refused — the same lockout the first cause
+	// produces, deferred until the peer happens to restart. Investigate a
+	// climbing count even while the peer is up.
+	//
+	// Neither cause is visible in the other two counters: such a frame carries an
+	// epoch (so it is not EpochlessAdmitted) and is not a downgrade (so it is not
 	// EpochDowngradeRejected).
 	EpochSessionCollision uint64
 

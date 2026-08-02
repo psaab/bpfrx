@@ -75,6 +75,13 @@ func startedIncarnation(t *testing.T, what string) *Manager {
 	case <-time.After(5 * time.Second):
 		t.Fatalf("%s: the first refine never completed", what)
 	}
+	// bootEpochReady is NOT a drain: the worker closes it and then still reads
+	// the epochRefineBeforeRelease package var before clearing bootEpochRefining.
+	// Joining only ready lets this test return and a later test assign that var
+	// while the read is in flight — the same "ready is not a drain" shape the
+	// round-11 fix removed from TestInitHeartbeatEpochStateNeverBlocks_6169, so
+	// it must not be reintroduced here.
+	waitBootEpochIdle(t, m)
 	return m
 }
 

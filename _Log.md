@@ -67152,3 +67152,70 @@ break — `go vet` confirmed passing under every revert.
   pkg/cluster/heartbeat_epoch_session_budget_6669_test.go (new),
   pkg/cluster/heartbeat_epoch_session_bind_6669_test.go,
   pkg/cluster/heartbeat_epoch_latch_test.go, _Log.md
+
+## 2026-08-02 — #6669 fold r12: correct the k=2 availability claim and three misattributions
+
+- **Timestamp**: 2026-08-02
+- **Action**: Fold the r9 hostile re-gate's six findings on PR #6669 at
+  `bdbfc0f33`. All six are claim/attribution defects — the reviewer states
+  explicitly that none changes runtime behaviour and that every load-bearing
+  property remains bound — so this is prose plus two small test/comment touches,
+  folded inline rather than via an agent round.
+- **F1 — the k=2 availability claim was false against the threat model the file
+  is written for.** `heartbeat.go` said 2 is "the smallest value that admits a
+  legitimate successor at an unchanged epoch". An attacker spends a slot as
+  cheaply as the peer does: in the equal-epoch regime EVERY prior incarnation's
+  frames carry the current floor value under a distinct session, so one replayed
+  archived frame fills the second slot and the first genuine successor is
+  refused. Measured by the reviewer through the real `newEpochEnv`/`feed` gate —
+  A1 admitted, one archived frame admitted (set FULL), A1 exits, successor A2
+  REFUSED with `EpochSessionCollision=1`. The headroom is therefore `k-1-j`
+  restarts where `j` is the number of distinct captured sessions presentable at
+  the live epoch, and `j >= 1` is free for an on-link recorder. Raising k does
+  not fix it (k-1 slots are as cheap to spend as one), which is why the comment
+  now states the bound rather than tuning it. The SECURITY property is
+  unaffected — the floor stays monotone, the budget finite and non-refilling.
+- **F2 — the no-refill property was credited to a line that cannot execute.**
+  `bindEpochSession`'s full-set branch is unreachable from `admitAuthedLocked`:
+  under the same `s.mu` hold, `epochSessionAdmissible` already returns false for
+  any session not in the set once the count reaches capacity, and nothing
+  between the check and the bind mutates the set. Mutating the branch to evict
+  slot 0 leaves the whole suite green. The comment now names
+  `epochSessionAdmissible` as the enforcer and marks the branch defence-in-depth
+  for a state the caller cannot present.
+- **F3 — the stated recovery omitted the receiver restart.** `highEpoch` and
+  `highEpochSessions` are Manager-scoped, so restarting the RECEIVER zeroes the
+  floor and admits the stranded successor at once, on the raise-from-0 path. The
+  README told the operator the only exit was up to an hour of waiting for the
+  sender's clock. Both are now stated, with the receiver restart preferred when
+  both nodes are reachable.
+- **F5 — `bootEpochReady` is not a drain, reintroduced in the new helper.** The
+  worker closes it and then still reads the `epochRefineBeforeRelease` package
+  var before clearing `bootEpochRefining`, so a test joining only `ready` can
+  return and let a later test assign that var mid-read. `startedIncarnation` now
+  calls `waitBootEpochIdle`. This is the identical shape round 11's commit
+  message says it removed elsewhere.
+- **F6 — the reason for declining the generator fix was wrong, the conclusion
+  right.** The comment claimed there is "nothing to jitter" with a pre-epoch
+  clock and no chainable file; `randomSessionID()` draws from crypto/rand in the
+  same process, so entropy IS available. The sound reason is that a randomised
+  epoch stops being an ORDER — the only thing the epoch provides — and that the
+  ATTACKER controls the frames it replays and will not jitter them, so a
+  sender-side change cannot bind admissions at all. Decline kept, reason
+  restated.
+- **F4 left as the reviewer characterised it**: `waitBootEpochIdle` has a window
+  on the re-claim path where both flags read idle while the worker is still
+  alive. Measured 0/12000 in the production shape and not exposed by any current
+  test; closing it needs the two flags to move as one word, which the code
+  already names as a larger change.
+- **Validation, stated with its gap.** `go build ./...` rc 0, `go vet
+  ./pkg/cluster/...` rc 0, `gofmt` clean. `go test -race ./pkg/cluster/`: the
+  FIRST run after these edits FAILED, and I could not reproduce it — 6 warm runs
+  and 3 cold-cache runs all passed, and I did not capture the failing run's
+  detail before it was overwritten. So the honest record is 9/10 clean with one
+  unreproduced failure of unknown cause, NOT a clean sweep. It is consistent
+  with F4's latent window; the re-gate should treat `-race` on this package as
+  unsettled rather than green.
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_manager.go,
+  pkg/cluster/README.md,
+  pkg/cluster/heartbeat_epoch_session_budget_6669_test.go, _Log.md
