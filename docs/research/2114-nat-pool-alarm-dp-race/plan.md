@@ -1,6 +1,19 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v99 — r95 Codex fold (1 minor, not a design
+- **Status**: **CONVERGED v99 — PLAN-READY (3-of-3 at r96)**:
+  Codex r96 returned PLAN-READY with findings NONE ("Nothing in
+  PR-1 blocks PLAN-READY for #2114" — the manifest mechanically
+  stale-checked via the existing canary's AST pattern, the census
+  exact, the manifest granularity sufficient, no residual
+  contradiction); AGY r96 PLAN-READY; Claude SMR r96 PLAN-READY.
+  The r68-r96 chain (the armed-state admission gate from Codex
+  r68 M1 through the falsified intermediate forms, the canary
+  escape closure, the typed helper pair, the total/per-access/
+  per-site outcome matrix, the 17-site mixed inventory with the
+  coextensive continuation coverage, and the stale-checked
+  callsite manifest) is recorded per-round in the review docs
+  and the ledger. The plan is ready for /engineer.
+- **Prior**: DRAFT v99 — r95 Codex fold (1 minor, not a design
   major): the extensional 17-site inventory is load-bearing but
   was mechanically UNCHECKED (an omitted or newly added helper
   callsite would pass silently — the registry canary forbids raw
