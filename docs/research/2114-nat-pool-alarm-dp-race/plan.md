@@ -1,12 +1,37 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v89 — r87 folds: Codex M1's inventory
+- **Status**: DRAFT v90 — r88 folds: AGY b1's missing §9 test
+  leg (v89 claimed "the §9 teardown legs assert this directly"
+  but named NO such leg — the oracle set gains leg (5),
+  `TestManager_ArmedGate_CloseWindowIsLoaded`: Close held at a
+  hook after the entry Store(false), a concurrent IsLoaded /
+  REST `health.go:107` / gRPC `server_show_status.go:22` read
+  observes `DataplaneLoaded==false` DURING the window where
+  master would still report true); AGY b2's arithmetic +
+  terminology correction (v89's summary said "13 + 3 = 16"
+  while its own body enumerated FOURTEEN if-ok sites — the
+  mixed subset is 14 if-ok + 3 nil-guard = 17 sites, and it is
+  now explicitly scoped as the MIXED / MULTI-ACCESS subset of
+  the ~41 total neutral-outcome accesses; the SINGLE-MAP
+  NEUTRAL SET is named — the twelve stale cleanups at
+  `maps_stale.go:18/:41/:65/:93/:117/:148/:178/:201/:262/:309/
+  :348/:371`, `maps_counters.go:181`, `maps_stats.go:72` — plus
+  the mixed-method neutral-returns at `maps_nat.go:400/:435`,
+  `maps_policy.go:253`, `maps_session.go:612`, `loader.go:910/
+  :928`, `maps_counters.go:233`); AGY's oracle verification
+  (ClearNAT64Configs' chain VERIFIED DISCRIMINATING) and
+  per-access gating audit (no residual method-gated phrasing)
+  are fold-free; r88 verdicts: Codex PENDING (task-msbc0207-
+  pjmnbd), AGY PLAN-NEEDS-MINOR (2 blocking minors), Claude SMR
+  PENDING; pending Codex r88 + convergence review r89.
+- **Prior**: DRAFT v89 — r87 folds: Codex M1's inventory
   correction + discriminating oracle (v88's "complete" list said
   9+2=11 and omitted FOUR optional sites — SessionCount's
   sessions/sessions_v6 at `maps_session.go:327`/`:337` and
   setXDPAttachedFlag's vlan_iface_map at `loader.go:730` plus the
-  iface_zone_map nil-guard at `loader.go:700`; the true count is
-  13 optional-if-ok + 3 nil-guard = 16 sites, and the
+  iface_zone_map nil-guard at `loader.go:700`; v89 called the
+  count "13 + 3 = 16" — itself miscounted, corrected at v90 per
+  r88 AGY b2 to 14 + 3 = 17 mixed sites) and the
   AttachXDP/ClearNAT64Configs required-optional composition
   chains are now spelled out; the SUCCEEDS-only partial-registry
   oracle was NON-DISCRIMINATING — both correct skip-and-
@@ -3297,7 +3322,10 @@
   qualification). v89 (r87: the inventory correction — 16
   optional sites, not 11 — and the discriminating
   required→optional→required oracle; the per-access gating
-  semantics; the IsLoaded observability surface).
+  semantics; the IsLoaded observability surface). v90 (r88
+  AGY: the §9 IsLoaded-window test leg (leg 5); the inventory
+  arithmetic + scoping correction — 17 mixed sites, the
+  single-map neutral set named).
 
 ---
 
@@ -4788,7 +4816,21 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    observe armed after release); (4) the blocked RETAINED-re-Start
    lock-ownership leg (same, on the retained fixture) — both
    blocked legs observe ARMED after release because Store(true) is
-   the batch's final in-hold step. Hook placement is explicit:
+   the batch's final in-hold step; (5) the ISLOADED-WINDOW leg
+   (v90 addition per r88 AGY b1 — the v89 text claimed "the §9
+   teardown legs assert this directly" but named NO such leg):
+   `TestManager_ArmedGate_CloseWindowIsLoaded` — an armed
+   Manager's `Close()` is held at a test hook placed immediately
+   AFTER the entry `Store(false)` (`loader.go:1206`) and BEFORE
+   the link-handle closes; a concurrent `Manager.IsLoaded()` read
+   (and, through the userspace adapter
+   `legacy_dataplane.go:86`, the REST `statusHandler`'s
+   `DataplaneLoaded` at `health.go:107` and gRPC `GetStatus`'s at
+   `server_show_status.go:22` — the direct-callable surface)
+   observes `false` DURING the window, where master (flip at the
+   `:1217` exit) would still report true. The leg pins the
+   intended early-report semantics as asserted behavior, not an
+   incidental side effect. Hook placement is explicit:
    BEFORE the in-hold Store(true), preserved loaded-check methods
    (the attaches, the CompileConfig path) return immediately;
    after it, they pass their precheck and block at registry
@@ -4966,9 +5008,16 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    master's exact per-site outcome (the `if ok` body simply does
    not run; the nil-guard simply returns) — only the helper wraps
    the lookup, never the outcome. THE MIXED-SITE INVENTORY (the
-   complete list — 13 optional-if-ok reads + 3 nil-guard reads =
-   16 sites, corrected at v89 per r87 Codex M1 — v88 said "9 + 2"
-   and omitted four): the optional-if-ok reads
+   complete MIXED / MULTI-ACCESS subset — 14 optional-if-ok reads +
+   3 nil-guard reads = 17 sites; the count and the scoping
+   corrected at v90 per r88 AGY b2 — v89's summary said "13 + 3 =
+   16" while its own body enumerated FOURTEEN if-ok sites, and
+   the "complete list" phrasing overclaimed: the full
+   neutral-outcome access set across `pkg/dataplane` is ~41 sites
+   (r87 Codex's table), of which these 17 are the ones inside
+   methods that ALSO carry a required access or an error
+   signature — the remainder are the SINGLE-MAP NEUTRAL sites,
+   named below): the optional-if-ok reads
    `maps_nat.go:261` (static_nat_v4),
    `:274` (static_nat_v6), `:300` (nat64_prefix_map, inside
    `SetNAT64Config` whose REQUIRED `nat64_configs` at `:290`
@@ -4994,7 +5043,31 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    `nat64_configs` (:319) -> optional `nat64_prefix_map` (:328)
    -> required `nat64_count` (:340 via `SetNAT64Count` :309).
    (`compiler_nat.go:605/:611`'s `ok`s are `netip.AddrFromSlice`
-   conversions, NOT registry reads — excluded.) The canary does
+   conversions, NOT registry reads — excluded.) THE SINGLE-MAP
+   NEUTRAL SET (v90 addition per r88 AGY b2 — the remaining
+   neutral-outcome accesses, each the ONLY registry access in a
+   void or no-error-outcome method, class-2 by the plan's own
+   precedence rule; their absent outcome is master's silent
+   return/continue, no error): the twelve stale cleanups
+   `maps_stale.go:18` (iface_zone_map), `:41` (vlan_iface_map),
+   `:65` (zone_pair_policies), `:93` (applications), `:117`
+   (snat_rules), `:148` (snat_rules_v6), `:178` (dnat_table),
+   `:201` (dnat_table_v6), `:262` (nptv6_rules), `:309`
+   (screen_configs), `:348` (iface_filter_map), `:371`
+   (filter_configs) — all `!ok → return` in void methods; plus
+   `maps_counters.go:181` (`ClearGlobalCounters`' global_counters
+   — the offset reset is the meaningful clear, absent map is not
+   an error by the pinned comment) and `maps_stats.go:72`
+   (`GetMapStats`' per-descriptor `!ok → continue`). The
+   mixed-method neutral-returns (`maps_nat.go:400`
+   nat_rule_counters, `:435` nat_port_counters,
+   `maps_policy.go:253` policy_rules, `maps_session.go:612`
+   session_id_gen, `loader.go:910`/`:928` iface_zone_map,
+   `maps_counters.go:233` zone_counters) are inside
+   error-signature methods whose OTHER accesses are required —
+   they follow the same per-access rule (the helper wraps the
+   lookup; the absent branch keeps master's neutral return).
+   The canary does
    not distinguish required from optional — BOTH wrap through the
    helper; the distinction lives only in how the caller consumes
    (present, st). The §9 retained oracle gains a PARTIAL-REGISTRY
@@ -5596,21 +5669,20 @@ Still open:
    PLAN-READY when all three verdicts gate the PR-1 design as
    ready.
 
-7. **r68-r87 resolution (for the record)**: Codex r68 M1 (armed-state
+7. **r68-r88 resolution (for the record)**: Codex r68 M1 (armed-state
    admission gate) folded as work item A3; r69-r82 falsified each
    intermediate form, r83 closed the last canary escape, r84
    replaced the single helper with the typed pair, r85 made the
-   outcome matrix TOTAL, r86 made it PER-ACCESS, and r87
-   corrected the inventory (16 optional sites, not 11 —
-   SessionCount's pair and setXDPAttachedFlag's pair were
-   omitted), made the oracle DISCRIMINATING (the
-   ClearNAT64Configs required→optional→required chain asserts
-   success AND the count zeroed), aligned the gating semantics
-   (per-required-access, not method-level), and named the
-   IsLoaded observability surface. v89 pins all four. Each
-   reviewer: verify the 16-site inventory against your own grep,
-   the discriminating oracle's continuation assertion, the
-   per-access gating phrasing, and the IsLoaded surface.
+   outcome matrix TOTAL, r86 made it PER-ACCESS, r87 corrected
+   the inventory and made the oracle DISCRIMINATING, and r88
+   (AGY) fixed the inventory arithmetic + scoping (17 mixed
+   sites, not 16; the single-map neutral set named) and added
+   the missing §9 IsLoaded-window test leg (leg 5). v90 pins
+   all of these. Each reviewer: verify the 17-site mixed
+   inventory AND the named single-map neutral set against your
+   own grep, the discriminating oracle's continuation assertion,
+   the per-access gating phrasing, and the IsLoaded window
+   leg.
 
 ---
 

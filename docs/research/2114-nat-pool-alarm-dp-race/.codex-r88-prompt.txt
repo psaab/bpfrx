@@ -1,0 +1,16 @@
+Adversarial PLAN review for #2114 — round 88 (CONVERGENCE), plan v89 @ 14d74b3628dc on branch research/2114-nat-pool-alarm-dp-race.
+
+Repo: /home/ps/git/kimi-xpf/.claude/worktrees/2114-research-nat-pool-alarm-dp-race
+
+This is a PLAN review, NOT a code review. No code has been written. The verdict surface is PR-1 ONLY (the G+H+H2 follow-up unit lives in followup-seed.md, out of scope).
+
+CONTEXT: your r87 review returned PLAN-NEEDS-MAJOR (1M/2m). v89 folds all three findings. Re-verify each fold against the real code and the document's internal consistency, then attack the v89 delta freshly.
+
+Fold verification (plan.md v89):
+1. Your M1 → the inventory is now 16 optional sites (13 if-ok: maps_nat.go:261/:274/:300/:328, maps_stale.go:224/:241/:285/:291/:322/:328/:336, maps_session.go:327/:337, loader.go:730; 3 nil-guard: compiler.go:353, loader.go:591, loader.go:700) with the AttachXDP and ClearNAT64Configs composition chains spelled out; the oracle leg now uses ClearNAT64Configs and asserts success AND the nat64_count zeroed, with the continuation-assertion pattern named for SessionCount/ClearSessionCounts/GetMapStats/the stale cleanups. VERIFY: (a) is the 16-site list now COMPLETE — your own r87 table said 41 optional sites across 13 files (maps_stale.go alone had 19) — reconcile: is the 16-site list the complete OPTIONAL-ACCESS set or only the optional-if-ok/nil-guard subset, and does the plan's terminology match what it enumerates? (b) does the discriminating oracle close the continuation hazard for the named methods? (c) is the AttachXDP chain (required :495 → optional :591 → deferred optional :700/:730) accurate against the code?
+2. Your m2 → class 1 now means "contains at least one REQUIRED access", gating at each required access (both the class-1 bullet and the §5.1 one-liner). VERIFY and hunt for residual method-gated phrasing.
+3. Your m3 → the IsLoaded observability surface is named (loader.go:456 → legacy_dataplane.go:86 → health.go:104 + server_show_status.go:19) and the §9 teardown legs assert the early false report. VERIFY.
+4. Fresh attacks on v89 (be hostile): (a) your r87 table counted 41 optional sites but the v89 inventory names 16 — if the other 25 exist (e.g. plain comma-ok-without-error branches in maps_policy.go/maps_screen.go/maps_session.go/maps_counters.go), are they class-2 neutral by construction, and does the plan's "optional" definition cover them or does the 16-site claim overclaim completeness again? (b) the discriminating oracle's nat64_count zeroing — does ClearNAT64Configs actually zero via SetNAT64Count(0) at :340, and is the fixture's nonzero seed consistent with the test's ability to observe the zeroing? (c) final full read of the A3 block + §7 + §9 — any remaining contradiction?
+5. Anything else in the PR-1 surface that regresses, overclaims, or misses a hazard.
+
+Verdict: PLAN-READY / PLAN-NEEDS-MINOR / PLAN-NEEDS-MAJOR / PLAN-KILL, findings numbered with file:line evidence. State explicitly: does anything in PR-1 block PLAN-READY for #2114? Be hostile.

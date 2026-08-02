@@ -1,0 +1,19 @@
+Adversarial PLAN review for #2114 — round 88 (CONVERGENCE), plan v89 @ 14d74b3628dc, branch research/2114-nat-pool-alarm-dp-race.
+
+You are an expert in concurrent Go, memory ordering, OS, and networking. The codebase is xpf, a Junos-style firewall with a Rust AF_XDP userspace dataplane driven by a Go control plane.
+
+This is a PLAN review, NOT a code review. Verdict surface: PR-1 ONLY (G+H+H2 in followup-seed.md, out of scope).
+
+CONTEXT: at r87 you returned PLAN-READY on v88 while Codex found the inventory was not exhaustive (16 optional sites, not 11 — SessionCount's pair at maps_session.go:327/:337 and setXDPAttachedFlag's pair at loader.go:700/:730 were omitted) and the SUCCEEDS-only oracle was non-discriminating (ClearNAT64Configs' required→optional→required chain at :319→:328→:340-via-:309 is the discriminating path). Your r87 pass accepted v88's inventory claim without re-deriving it. v89 folds the 16-site inventory + the discriminating oracle + per-access gating + the IsLoaded surface. Review v89 freshly and hostilely.
+
+Plan doc: /home/ps/git/kimi-xpf/.claude/worktrees/2114-research-nat-pool-alarm-dp-race/docs/research/2114-nat-pool-alarm-dp-race/plan.md
+Repo root: /home/ps/git/kimi-xpf/.claude/worktrees/2114-research-nat-pool-alarm-dp-race
+
+Verify hostilely:
+1. RE-DERIVE THE INVENTORY YOURSELF: grep every production m.maps[...] / m.programs[...] read in pkg/dataplane (non-test). Classify each: required (error on absent), optional-if-ok (skip on absent), nil-guard (return on nil), write, or getter. Does the v89 16-site optional list (13 if-ok + 3 nil-guard) match your derivation EXACTLY? Note Codex's r87 table counted 41 optional sites across 13 files (maps_stale.go: 19) — is the v89 "16-site" claim the complete OPTIONAL set or only a subset, and does the plan's terminology overclaim?
+2. THE DISCRIMINATING ORACLE: does ClearNAT64Configs zero nat64_count via SetNAT64Count(0) at :340, and does seeding nat64_configs + a nonzero nat64_count while omitting nat64_prefix_map let the test observe a premature optional-miss return (count left non-zero → FAIL)?
+3. THE PER-ACCESS GATING: class 1 = "contains at least one REQUIRED access", gating at each required access. Hunt for residual method-gated phrasing ("gate before the first Start-state access" or similar).
+4. THE ISLOADED SURFACE: loader.go:456 → legacy_dataplane.go:86 → health.go:104 + server_show_status.go:19. Verify the chain and the teardown-leg assertion.
+5. Fresh attack on any other PR-1 claim.
+
+Verdict: PLAN-READY / PLAN-NEEDS-MINOR / PLAN-NEEDS-MAJOR / PLAN-KILL with file:line evidence. State explicitly: does anything in PR-1 block PLAN-READY for #2114? Be hostile.
