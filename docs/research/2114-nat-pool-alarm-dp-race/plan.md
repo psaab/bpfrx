@@ -1,6 +1,29 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v95 — r91 Codex folds (4 documentation-only
+- **Status**: DRAFT v96 — r92 Codex folds (2 documentation-only
+  minors, no MAJOR, no design change): minor-1's MULTI-ACCESS
+  partition precision (the v95 "methods with MORE THAN ONE
+  registry access" was false under direct-access semantics for
+  `Compile` — its only direct selector is `compiler.go:353` —
+  and `seedInterfaceCounter` — its only selector is
+  `loader.go:591`; the 17-site subset is now precisely "15 sites
+  in MULTI-SELECTOR methods plus TWO single-selector sites
+  composed into multi-access operations" — `Compile` composes
+  with `clearNativeXDPFlagsForIfindexes` at `compiler.go:399`
+  (whose selector `loader.go:928` sits in the single-selector
+  set) and `seedInterfaceCounter` composes into
+  `AttachXDP`/`AddTxPort`); minor-2's fourth outcome shape (the
+  generic optional rule now enumerates four exhaustive shapes —
+  the if-ok skip, the nil-guard return, the skip-and-continue,
+  AND the comma-ok early return (`loader.go:700`)). Codex's
+  fold-free passes: the exact 14+2+1 split matches the code; all
+  four counterexample methods fit; SINGLE-ACCESS-SELECTOR landed
+  everywhere normative; the census exact; no A3/§7/§9
+  contradiction, oracle gap, G+H+H2 leakage, or PR-1 design
+  regression. r92 verdicts: Codex PLAN-NEEDS-MINOR (2m), AGY
+  PLAN-READY, Claude SMR PLAN-READY; pending convergence review
+  r93.
+- **Prior**: DRAFT v95 — r91 Codex folds (4 documentation-only
   minors, no MAJOR, no design change): minor-1 was already v94's
   fold (the review was pinned to v93); minor-2's replacement-
   bucket falsehood (the v93/v94 "non-comma-ok single-value reads"
@@ -3460,6 +3483,9 @@
   four documentation minors: the exact 14+2+1 split replaces
   the false bucket names; the multi-access scoping; the
   selector-site rename; the §9 "nil-guard SKIPS" correction).
+  v96 (r92 Codex's two documentation minors: the MULTI-ACCESS
+  partition precision — 15 multi-selector + 2 composed single-
+  selector; the fourth optional-outcome shape).
 
 ---
 
@@ -5181,8 +5207,13 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    method's
    REQUIRED accesses; an OPTIONAL access inside ANY class keeps
    master's exact per-site outcome — the `if ok` body does not
-   run, the nil-guard returns, OR the skip-and-continue proceeds
-   past the skipped block (v93 precision per r90 Codex minor-1 —
+   run, the nil-guard returns, the skip-and-continue proceeds
+   past the skipped block, OR the comma-ok early return fires
+   (the fourth shape added at v96 per r92 Codex minor-2 — the
+   three-form enumeration omitted `loader.go:700`'s comma-ok
+   early return, which the same block correctly names; the four
+   shapes are exhaustive across the 41 optional reads)
+   (v93 precision per r90 Codex minor-1 —
    the parenthetical's "simply returns" half-undid the v92 rule
    change; `compiler.go:353` CONTINUES past the skipped
    redirect-map population) — only the helper wraps
@@ -5202,8 +5233,19 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    the "complete list" phrasing overclaimed: the full
    neutral-outcome access set across `pkg/dataplane` is ~41 sites
    (r87 Codex's table), of which these 17 are the ones inside
-   MULTI-ACCESS methods (methods with MORE THAN ONE registry
-   access — v95 correction per r91 Codex minor-3: the v90
+   MULTI-ACCESS OPERATIONS — precisely: 15 sites in
+   MULTI-SELECTOR methods (methods with more than one DIRECT
+   registry selector) plus TWO single-selector sites composed
+   into multi-access operations (v96 precision per r92 Codex
+   minor-1 — the v95 "methods with MORE THAN ONE registry
+   access" was false under A3's direct-access semantics for
+   `Compile`, whose only direct selector is `compiler.go:353`,
+   and `seedInterfaceCounter`, whose only selector is
+   `loader.go:591`: `Compile` composes with
+   `clearNativeXDPFlagsForIfindexes` at `compiler.go:399` (that
+   helper's selector `loader.go:928` sits in the single-selector
+   set) and `seedInterfaceCounter` composes into
+   `AttachXDP`/`AddTxPort`; the v90
    "methods that ALSO carry a required access or an error
    signature" claim was false for `DeleteStaleStaticNAT`,
    `DeleteStaleNAT64`, `ZeroStaleNATPoolConfigs`, and
@@ -5972,8 +6014,10 @@ Still open:
    reviewer: verify the per-site outcome rule's three-way
    phrasing (skip / return / continue), the A3+§5.1+§9 Detach
    consistency, the void-host enumeration, the exact 14+2+1
-   optional-read split, the MULTI-ACCESS scoping, the
-   SINGLE-ACCESS-SELECTOR naming, and the census
+   optional-read split, the MULTI-ACCESS scoping (precisely 15
+   multi-selector + 2 composed single-selector, per v96), the
+   SINGLE-ACCESS-SELECTOR naming, the four-shape optional-outcome
+   enumeration, and the census
    labels.
 
 ---
