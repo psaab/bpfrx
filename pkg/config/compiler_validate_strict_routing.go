@@ -309,7 +309,17 @@ func validateForwardingTableExportSingleStrict(cfg *Config) error {
 	// it was before #6659. The selected policy is the scalar, NOT element [0]:
 	// with two top-level `routing-options` roots the last root wins, so [0]
 	// named a policy that does not render.
-	exports := nonEmptyValues(cfg.RoutingOptions.ForwardingTableExports)
+	//
+	// #6673 fold: count only DISTINCT ones too, for the same reason. `export
+	// [ p1 p1 ];` (or `export p1;` twice) names ONE policy; master accepted it
+	// and rendered the identical ECMP lookup, and the raw count rejected it at
+	// commit while claiming "the rest would be silently ignored" about the very
+	// policy that renders. Exact-text identity is the right one here — an export
+	// value is an opaque POLICY NAME with no canonical form, so two spellings
+	// are two different references and only an exact repeat may be collapsed
+	// (dedupeValues). The #6659 rejection for a genuine multi-policy chain,
+	// where the tail really does not render, is untouched.
+	exports := dedupeValues(nonEmptyValues(cfg.RoutingOptions.ForwardingTableExports))
 	if n := len(exports); n > 1 {
 		// #6673: the selected slot can itself be an authored BLANK —
 		// `export [ "" p1 p2 ];` counts two policies but nodeVal selects the

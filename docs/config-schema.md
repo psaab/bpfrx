@@ -994,7 +994,11 @@ strips, leaving `Keys=["export"]`), for which it returns one empty value because
 that is what `nodeVal` selects. Consumers therefore MUST skip empty entries when
 validating a value and MUST count only non-empty entries when enforcing
 cardinality (`nonEmptyValues`) — an empty slot is a selection, not a second
-policy or prefix, so counting it would invent a rejection.
+policy or prefix, so counting it would invent a rejection. For the same reason a
+cardinality gate must also count only DISTINCT entries (`dedupeValuesBy`): a
+repeated value is one value, and rejecting it invents a rejection too. See
+"A cardinality gate counts DISTINCT values" below for how each leaf picks its
+identity.
 
 ### Detect a grammar keyword by CLASS, never by position (#6673)
 
@@ -1090,15 +1094,49 @@ parser's shapes.
 The reliable form is to make the emission itself carry the verdict.
 `validateNATHostMaskStrict` declares a per-rule `ruleDropped` flag that `emit` —
 the closure whose suffix is *"rule dropped by dataplane until corrected"* — sets
-on every call, while the port-scoped `emitSuffix` callers deliberately do not.
-Any check added later participates for free. The per-value complaints are then
-appended with a blank suffix and patched in place at the end of the rule (which
-preserves warning order), once the verdict is final. Note the bound this puts on
-the claim: it reports what THAT validator concluded, so a way to break a rule it
-does not check at all — a cross-family `then` prefix, today — still leaves
-"stays active" standing. Also keep the empty-selection case, which is not a
-verdict about validity at all: `[ "" a b ]` blanks `ExternalIP` and the Rust
-parse drops the mapping, so there is no surviving rule to describe.
+on every call, while the genuinely narrower `emitSuffix` callers deliberately do
+not. Any check added later participates for free. The per-value complaints are
+then appended with a blank suffix and patched in place at the end of the rule
+(which preserves warning order), once the verdict is final. Also keep the
+empty-selection case, which is not a verdict about validity at all: `[ "" a b ]`
+blanks `ExternalIP` and the Rust parse drops the mapping, so there is no
+surviving rule to describe.
+
+**"Observed, not mirrored" is only as good as the ROUTING of each check.** Two
+whole-rule-dropping checks were reported through `emitSuffix` with port-scoped
+wording and so never set the flag: the block-pair-plus-port gate (#3202 — the
+Rust block branch `continue`s on any port) and the out-of-range `match
+destination-port` gate (#5101 — `buildStaticNATSnapshots` drops the rule so an
+invalid port cannot fail OPEN onto the port-0 wildcard). Both now go through
+`emit`. Decide the routing from the two LOWERING stages, never from how narrow
+the message sounds:
+
+| Check | Effect | Route |
+|---|---|---|
+| match/then address unparseable, non-host, or `/0` block pair | whole rule dropped (Rust `from_snapshots`) | `emit` |
+| block pair + any port (#3202) | whole rule dropped (Rust block branch) | `emit` |
+| `match destination-port` out of range (#5101) | whole rule dropped (Go `buildStaticNATSnapshots`) | `emit` |
+| `match destination-port` with no `mapped-port` | port-scoped 1:1 still installs | `emitSuffix` |
+| `mapped-port` present-but-malformed | folds to 0; plain 1:1 still installs | `emitSuffix` |
+| `mapped-port` with no `match destination-port` | port dropped; plain 1:1 still installs | `emitSuffix` |
+
+The malformed-`mapped-port` row is narrower only because
+`combineMappedPortOperands` folds ANY malformed operand to `0`, while the
+`destination-port` arm stores whatever `Atoi` returned — so the arithmetically
+identical fault reaches the whole-rule drop on one leaf and not the other. If
+that fold ever changes, that row moves to `emit`.
+
+**The bound, as an inventory rather than an example.** The flag reports what
+THAT validator concluded, so a rule-breaking cause it does not itself report
+leaves "stays active" standing. Two cases, both measured: an EMPTY `then
+static-nat` target (a misspelled target keyword — the Go lowering emits
+`InternalIP: ""` and the Rust parse drops the mapping; it IS reported, but by the
+sibling `validateStaticNATThenTargetStrict` (#4290), whose emissions this flag
+cannot see), and a CROSS-FAMILY host pair such as `192.0.2.1/32` -> 
+`2001:db8::1/128` (both sides parse and both are host routes, so no validator
+checks it at all). Closing either needs a cross-validator verdict channel or a
+new rejection, not a wording change. Write the inventory, not one example — "one
+exception" invites the next reader to assume the rest are covered.
 
 **Cardinality gates name the SELECTED value, which is not element `[0]`.**
 `compileNATStatic` assigns `rule.Match = nodeVal(m)` once per
@@ -1107,6 +1145,43 @@ one bracket/block list is the selected value that statement's first. The
 forwarding-table export scalar behaves the same way across repeated
 `routing-options` roots. Both gates quote the scalar, and both special-case an
 empty scalar — "only one is honoured" is false when the answer is none.
+
+**A cardinality gate counts DISTINCT values, never raw value slots (#6673).**
+Widening a read makes repetition visible for the first time, and a gate that
+counts slots then hard-rejects a configuration `origin/master` accepted and
+compiled BYTE-IDENTICALLY — an invented rejection, which is the opposite failure
+mode to the silent value-drop the widening was fixing. A repeat is not a second
+prefix or policy: the scalar selects the same value either way, the lowering
+emits the same single row, and *"only `X` would take effect and the rest would be
+silently ignored"* is false when "the rest" IS `X`. Both gates therefore run
+`dedupeValuesBy` after `nonEmptyValues`, for exactly the reason the empty slot is
+already spared.
+
+Choose the IDENTITY per leaf, and justify it:
+
+- `forwarding-table export` values are opaque POLICY NAMES with no canonical
+  form, so only an exact text repeat may be collapsed (`dedupeValues`).
+- `match destination-address` values are ADDRESSES, so the identity is the
+  canonical form the dataplane reduces them to — `staticNATMatchAddrKey` mirrors
+  Rust `parse_nat_prefix` (a bare address is a host route; the base is masked to
+  the prefix length). That collapses `192.0.2.1` with `192.0.2.1/32`, and
+  `192.0.2.5/24` with `192.0.2.0/24`. Exact-text dedupe alone would leave those
+  rejected — the same invented rejection, one spelling over. Equal keys mean the
+  rule translates identically whichever spelling the compiler selects, which is
+  what makes collapsing SOUND rather than merely lenient; a value with no
+  canonical form (unparseable, malformed mask) keys on its raw text so two
+  different typos never merge into one.
+
+Deduplication must never loosen the rejection itself: genuinely distinct
+prefixes or policies still fail commit, because one of them really would carry
+no translation.
+
+The exposure is not hypothetical even where the CLI cannot author it. Flat set
+is idempotent and `apply-groups` does not duplicate, but a repeat survives
+`tree.Format()` verbatim — a hand-edited config, a `load merge`, a generated
+config or a peer-synced tree keeps it across reboot and HA sync. The tolerant
+load path only warns (#1960) so the box boots, and the operator then cannot
+commit ANY change until they find the duplicated line.
 
 **A multi-value leaf can be PRESENT and still carry NOTHING — presence must be
 decided by VALUES, never by the leaf NAME (#6526).** `firewallMatchValues`

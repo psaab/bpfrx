@@ -1262,22 +1262,63 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 	// of causes. `emit` IS the rule-dropped closure — its suffix is "rule
 	// dropped by dataplane until corrected" — so every present and future
 	// caller of it marks the rule automatically, and a check that reports a
-	// NARROWER effect (the port-scoped emitSuffix callers below) correctly does
-	// not. The previous spelling mirrored the two match-side loops by hand and
-	// was wrong by three causes: the then-side parse, the then-side host-mask,
-	// and the /0 block-pair loop each drop the rule without touching a match
-	// address, so a warning about a non-selected match value announced that the
-	// selected value "stays active" while the rule was in fact dropped.
-	// Observing the emissions cannot drift the way mirroring them did.
+	// NARROWER effect correctly does not. The previous spelling mirrored the two
+	// match-side loops by hand and was wrong by three causes: the then-side
+	// parse, the then-side host-mask, and the /0 block-pair loop each drop the
+	// rule without touching a match address, so a warning about a non-selected
+	// match value announced that the selected value "stays active" while the
+	// rule was in fact dropped. Observing the emissions cannot drift the way
+	// mirroring them did.
 	//
-	// RESIDUAL, stated because observation bounds the claim: this reports what
-	// THIS validator concludes, so a way to break a rule that it does not check
-	// at all still leaves "stays active" standing. Measured example: `match
-	// destination-address 192.0.2.1/32` with `then static-nat prefix
-	// 2001:db8::1/128` emits no then-side complaint (the target parses and is a
-	// host route), so a non-selected match value is still told the rule stays
-	// active. Adding a cross-family gate is a new rejection, not a wording fix,
-	// and belongs in its own change.
+	// #6673 fold: "every caller of emit participates" is only worth as much as
+	// the ROUTING of each check, and two whole-rule-dropping checks were routed
+	// through emitSuffix instead — the block-pair-plus-port gate (#3202) and the
+	// out-of-range `match destination-port` gate (#5101). Both were worded as
+	// port-scoped and both really discard the entire rule, so "stays active" was
+	// emitted for a rule the dataplane installs nothing for. They now go through
+	// emit. The complete routing of the static-NAT rule loop, enumerated from
+	// the two lowering stages rather than from the messages:
+	//
+	//	WHOLE-RULE DROP -> emit (marks the rule)
+	//	  match destination-address unparseable   Rust parse_nat_prefix(external)
+	//	  then static-nat prefix unparseable      Rust parse_nat_prefix(internal)
+	//	  match destination-address non-host      Rust host/length/family check
+	//	  then static-nat prefix non-host         Rust host/length/family check
+	//	  /0 block pair                           Rust zero-length reject (#5658)
+	//	  block pair + any port                   Rust block-branch port reject (#3202)
+	//	  match destination-port out of range     Go buildStaticNATSnapshots (#5101)
+	//	NARROWER -> emitSuffix (does NOT mark the rule)
+	//	  match destination-port without mapped-port  installs port-scoped 1:1
+	//	  mapped-port present-but-malformed           installs plain 1:1, port dropped
+	//	  mapped-port without match destination-port  installs plain 1:1, port dropped
+	//	  nat64 source-pool non-host address          that pool entry only
+	//
+	// The three narrower port cases are Rust `(0,_)/(m,0)` folds in the host
+	// branch of from_snapshots, which build an entry rather than `continue`;
+	// each is argued at its own call site. `then static-nat inet` and IsNPTv6
+	// rules drop too, but the loop `continue`s past them before any emit, so no
+	// claim about them is ever made here.
+	//
+	// RESIDUAL — an inventory, not an example, because "one exception" invited
+	// the reader to assume the rest were covered. ruleDropped observes what THIS
+	// validator emits, so a rule-breaking cause it does not itself report leaves
+	// "stays active" standing. Both known cases, measured:
+	//
+	//   - EMPTY `then static-nat` target (a misspelled / unhandled target
+	//     keyword). rule.Then == "" so the then-side checks here are guarded off,
+	//     the Go lowering emits InternalIP: "" and Rust parse_nat_prefix("")
+	//     drops the whole mapping (pinned by tests_static.rs "a static-NAT rule
+	//     with an unparseable internal-ip must be dropped"). It IS reported — by
+	//     validateStaticNATThenTargetStrict (#4290), a SIBLING validator whose
+	//     emissions this flag cannot see. Not the "not checked at all" kind.
+	//   - CROSS-FAMILY host pair: `match destination-address 192.0.2.1/32` with
+	//     `then static-nat prefix 2001:db8::1/128`. Both sides parse and both are
+	//     host routes, so nothing here complains and the Rust host branch builds
+	//     an entry from a v4 external and a v6 internal. This one genuinely is
+	//     not checked at all, by any validator.
+	//
+	// Closing either needs a cross-validator verdict channel or a new rejection,
+	// not a wording change, so both are stated rather than papered over.
 	// selectedMatchInvalid narrows that: the rule-dropping cause was the
 	// SELECTED match address failing one of the match-side checks, so the
 	// complaint about another slot can name it as invalid rather than pointing
@@ -1575,11 +1616,23 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			// operator authors a host static-NAT rule for the port forward, or
 			// drops the port tokens for a whole-subnet 1:1. (#3031 added the
 			// address-only block map; it did not add this rejection.)
+			//
+			// #6673 fold: this reports a WHOLE-RULE drop, so it goes through
+			// `emit` and marks the rule. The message's "the port mapping is
+			// silently dropped" described the pre-#3202 hazard the gate was
+			// written to prevent, not what the dataplane does today: from_snapshots
+			// `continue`s on `snap.match_destination_port != 0 || snap.mapped_port
+			// != 0` inside the block-pair branch, dropping the ENTIRE rule (pinned
+			// by static_nat_block_with_port_is_dropped and
+			// static_nat_block_with_match_port_only_is_dropped in
+			// userspace-dp/src/nat/tests_static.rs). Routed through emitSuffix with
+			// a port-scoped suffix it left ruleDropped false, so a complaint about
+			// a non-selected match value on the same rule announced that the
+			// selected value "stays active" while the rule installed nothing.
 			if blockPair && (rule.MatchDestinationPort != 0 || rule.MappedPort != 0) {
-				if err := emitSuffix(fmt.Sprintf(
-					"security nat static rule-set %q rule %q maps a subnet (block-to-block prefix) but also specifies a port (match destination-port / then static-nat mapped-port); subnet static NAT is address-only 1:1 and the dataplane cannot translate per-port for a block, so the port mapping is silently dropped (use a /32 host match+prefix for a port forward, or drop the port tokens for a whole-subnet 1:1)",
-					rs.Name, rule.Name),
-					" (ignored: port mapping dropped by dataplane until corrected)"); err != nil {
+				if err := emit(fmt.Sprintf(
+					"security nat static rule-set %q rule %q maps a subnet (block-to-block prefix) but also specifies a port (match destination-port / then static-nat mapped-port); subnet static NAT is address-only 1:1 and the dataplane cannot translate per-port for a block, so the whole rule is dropped (use a /32 host match+prefix for a port forward, or drop the port tokens for a whole-subnet 1:1)",
+					rs.Name, rule.Name)); err != nil {
 					return nil, err
 				}
 			}
@@ -1623,11 +1676,20 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			// destination-port`: without an external port to match, the port
 			// rewrite has no inbound trigger and the reverse SNAT cannot
 			// recover the original port.
+			//
+			// #6673 fold: this too reports a WHOLE-RULE drop, so it goes through
+			// `emit`. buildStaticNATSnapshots (pkg/dataplane/userspace/nat_static.go,
+			// #5101) `continue`s on staticNATPortOutOfRange(rule.MatchDestinationPort)
+			// — the rule never reaches a snapshot at all, let alone the dataplane,
+			// because clamping an invalid port to 0 would fail OPEN onto the
+			// whole-address wildcard. Measured: `destination-port 70000` yields 0
+			// snapshots. The port-scoped suffix understated that and, worse, left
+			// ruleDropped false so a non-selected match value was told the selected
+			// one "stays active" for a rule that installs nothing.
 			if rule.MatchDestinationPort != 0 && (rule.MatchDestinationPort < 1 || rule.MatchDestinationPort > 65535) {
-				if err := emitSuffix(fmt.Sprintf(
+				if err := emit(fmt.Sprintf(
 					"security nat static rule-set %q rule %q match destination-port %d is out of range (1-65535)",
-					rs.Name, rule.Name, rule.MatchDestinationPort),
-					" (ignored: port match dropped by dataplane until corrected)"); err != nil {
+					rs.Name, rule.Name, rule.MatchDestinationPort)); err != nil {
 					return nil, err
 				}
 			}
@@ -1678,6 +1740,30 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			// the dataplane installs a plain 1:1 (MappedPort==0, no bogus port).
 			// MappedPortPresent is compile-only (json:"-") and never reaches the
 			// dataplane.
+			//
+			// #6673 fold: this stays on emitSuffix — it is genuinely NARROWER —
+			// even though its sibling `match destination-port` check above now
+			// drops the rule for the arithmetically identical fault. The
+			// asymmetry is in the COMPILER, not in the gate:
+			// combineMappedPortOperands folds ANY malformed mapped-port operand
+			// (empty, bare, non-numeric, out-of-range) to MappedPort == 0 and
+			// records the offending token separately, whereas the
+			// `destination-port` arm stores whatever Atoi returned verbatim
+			// (compiler_nat_static.go). So the value that reaches
+			// buildStaticNATSnapshots is 0, staticNATPortOutOfRange(0) is FALSE
+			// (0 is the legitimate "port absent" sentinel), and the rule lowers
+			// and installs as a plain 1:1 with no port translation — measured:
+			// `mapped-port 70000` yields 1 snapshot with mapped=0, while
+			// `destination-port 70000` yields 0 snapshots. The reported effect
+			// really is "the port translation is dropped", not the rule.
+			//
+			// The bound this rests on: MappedPort is only ever 0 or a valid
+			// 1-65535 on every path that reaches here, because both compile
+			// entry points build it through combineMappedPortOperands and
+			// MappedPortPresent is json:"-" so a peer-synced / restored typed
+			// config cannot arrive with the flag set at all. If either of those
+			// ever changes, a PRESENT non-zero out-of-range MappedPort WOULD hit
+			// the #5101 drop and this call must move to `emit`.
 			if rule.MappedPortPresent && (rule.MappedPort < 1 || rule.MappedPort > 65535) {
 				token := "(missing value)"
 				if rule.MappedPortRaw != "" {
@@ -2430,7 +2516,20 @@ func validateStaticNATMatchAddressesStrict(cfg *Config) error {
 			// followed by `destination-address [ ]` authors ONE prefix and
 			// blanks it, which master accepted, so counting raw length here
 			// would invent a rejection this gate was never meant to make.
-			addrs := nonEmptyValues(rule.MatchAddresses)
+			//
+			// #6673 fold: and count only DISTINCT ones, for exactly the same
+			// reason the empty slot is spared. A REPEATED prefix —
+			// `destination-address 192.0.2.1/32;` written twice, `[ 192.0.2.1/32
+			// 192.0.2.1/32 ]`, two `match {}` stanzas carrying the same prefix,
+			// or `192.0.2.1` beside `192.0.2.1/32` — authors ONE external
+			// prefix. Master accepted every one of those and compiled a
+			// byte-identical rule.Match; the raw count rejected them at commit,
+			// and the message ("only %q would take effect and the rest would be
+			// silently ignored") was false because "the rest" IS the selected
+			// value. Nothing is ignored and nothing is lost. staticNATMatchAddrKey
+			// collapses only values that lower to the SAME dataplane row, so the
+			// #6659 rejection for genuinely distinct prefixes is untouched.
+			addrs := dedupeValuesBy(nonEmptyValues(rule.MatchAddresses), staticNATMatchAddrKey)
 			if len(addrs) > 1 {
 				// #6673: the selected slot can itself be the authored BLANK —
 				// `destination-address [ "" 192.0.2.1/32 198.51.100.1/32 ];`

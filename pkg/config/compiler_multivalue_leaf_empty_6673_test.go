@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"net/netip"
 	"reflect"
 	"strings"
@@ -1176,8 +1177,20 @@ func TestProxyARPAddresses6673MalformedRangeInstallsExactlyWhatMasterInstalled(t
 		name string
 		cfg  string
 		want []string // compiled ProxyARPEntry.Addresses
-		// wantInstalled is what origin/master's compiled output survives
-		// netip.ParsePrefix to install. It must match head's exactly.
+		// wantInstalled is what head's compiled output survives
+		// netip.ParsePrefix to install.
+		//
+		// For every row whose token stream contains a `to` — the malformed-range
+		// rows this test exists for — it is ALSO origin/master's measured
+		// installed set, which is the parity claim being pinned.
+		//
+		// It is NOT master's set for the two rows marked CONTROL: `[ 192.0.2.1
+		// 192.0.2.2 ]` and its block form carry no range keyword, so they are the
+		// #6659 WIDENING itself. Master installs only 192.0.2.1/32 there and head
+		// deliberately installs both. They sit in this corpus to prove the range
+		// detector did not un-widen a well-formed list, so their wantInstalled is
+		// head's intended set, not a parity oracle — do not "restore" them to
+		// master's single address.
 		wantInstalled []string
 	}{
 		{"bracket leading with the keyword", `
@@ -1304,12 +1317,15 @@ security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.1; 192.0.2.2
 			// compiled value that promotes a malformed range's endpoint shows
 			// up here as an address master never answered ARP for.
 			if inst := installedProxyARP6673(got); !reflect.DeepEqual(inst, tc.wantInstalled) {
-				t.Fatalf("dataplane would install %q, but origin/master installed %q\n"+
+				t.Fatalf("dataplane would install %q, want %q\n"+
 					"pkg/dataplane/proxyarp.go adds an NTF_PROXY neighbour and enables "+
 					"the interface proxy responder for every address that survives "+
 					"netip.ParsePrefix; a malformed range must not promote its "+
 					"surviving endpoint into that set, and must not drop an endpoint "+
-					"master did install", inst, tc.wantInstalled)
+					"master did install. On a malformed-range row the want IS "+
+					"origin/master's measured installed set; on the two CONTROL rows "+
+					"it is head's intended #6659 widening, which master does not "+
+					"install (see the wantInstalled field comment)", inst, tc.wantInstalled)
 			}
 		})
 	}
@@ -1481,6 +1497,48 @@ security { nat { static { rule-set rs1 { from zone untrust;
 			droppedCauseSub: `zero-length (/0) prefix (match destination-address "0.0.0.0/0"`,
 		},
 		{
+			// #6673 fold. Cause: an out-of-range `match destination-port`.
+			// buildStaticNATSnapshots (#5101) drops the WHOLE rule for it —
+			// clamping an invalid port to 0 would fail OPEN onto the
+			// whole-address wildcard — so the rule never reaches a snapshot;
+			// measured, this config lowers to 0 snapshots. The check reported it
+			// through the port-scoped emitSuffix, which does not set the verdict
+			// flag, so the non-selected complaint said "stays active" for a rule
+			// that installs nothing. Routing it through `emit` is what makes
+			// "every rule-dropping check participates" true rather than claimed.
+			name: "match destination-port out of range drops the whole rule",
+			cfg: `
+security { nat { static { rule-set rs1 { from zone untrust;
+    rule r1 { match { destination-address [ 192.0.2.1/32 198.51.100.0/24 ];
+                      destination-port 70000; }
+              then { static-nat { prefix 10.0.0.1/32; mapped-port 8080; } } } } } } }`,
+			nonSelectedSub:  `destination-address "198.51.100.0/24" must be a host route`,
+			wantSelected:    "192.0.2.1/32",
+			ruleDropped:     true,
+			droppedCauseSub: "match destination-port 70000 is out of range",
+		},
+		{
+			// #6673 fold. Cause: a block pair that also carries a port. The Rust
+			// block branch of from_snapshots `continue`s on `match_destination_port
+			// != 0 || mapped_port != 0` (#3202), dropping the whole rule — pinned
+			// by static_nat_block_with_port_is_dropped and
+			// static_nat_block_with_match_port_only_is_dropped in
+			// userspace-dp/src/nat/tests_static.rs. The Go lowering passes this one
+			// through (1 snapshot), so the drop is genuinely Rust-side; the check
+			// still reported it as "the port mapping is silently dropped" through
+			// emitSuffix and left the verdict unset.
+			name: "block pair with a port drops the whole rule",
+			cfg: `
+security { nat { static { rule-set rs1 { from zone untrust;
+    rule r1 { match { destination-address [ 10.1.1.0/24 198.51.100.0/25 ];
+                      destination-port 80; }
+              then { static-nat { prefix 10.0.0.0/24; mapped-port 8080; } } } } } } }`,
+			nonSelectedSub:  `destination-address "198.51.100.0/25" must be a host route`,
+			wantSelected:    "10.1.1.0/24",
+			ruleDropped:     true,
+			droppedCauseSub: "maps a subnet (block-to-block prefix) but also specifies a port",
+		},
+		{
 			// CONTROL: nothing drops the rule, so the complaint must still say
 			// the selected value stays active. This is what stops the fix from
 			// degenerating into "never promise anything".
@@ -1550,30 +1608,350 @@ security { nat { static { rule-set rs1 { from zone untrust;
 
 // TestStaticNATMatch6673PortVerdictsDoNotDropTheRule is the negative half of
 // the guard above. The verdict flag is set by `emit`, so a check that reports a
-// NARROWER effect through emitSuffix — the port-scoped ones — must NOT mark the
-// rule as dropped. If it did, the fix would swing from over-promising to
-// over-warning: a rule whose only fault is a bad `mapped-port` still installs
-// its address translation, and the complaint about an unused match value must
-// keep saying so.
+// genuinely NARROWER effect through emitSuffix must NOT mark the rule as
+// dropped. If it did, the fix would swing from over-promising to over-warning:
+// a rule whose only fault is a bad `mapped-port` still installs its address
+// translation, and the complaint about an unused match value must keep saying
+// so.
+//
+// #6673 fold: this is a TABLE now, and it covers all three narrower port
+// faults. It previously had one case — a malformed `mapped-port` — and
+// generalised from it to "the port-scoped ones", which was wrong: two of the
+// port checks drop the whole rule and are now routed through `emit` (see the
+// cases added to the positive half). The three below are the ones that really
+// are narrower, and each is narrower for a reason read off the Rust host branch
+// of from_snapshots, which BUILDS an entry rather than `continue`ing:
+//
+//	(0, _) -> (None, None)      mapped-port with no match port: port dropped, rule installs
+//	(m, 0) -> (Some(m), None)   match port with no mapped-port: port-scoped 1:1 installs
+//
+// The malformed-mapped-port case lands on `(m, 0)` because
+// combineMappedPortOperands folds ANY malformed operand to 0 — the asymmetry
+// with `match destination-port`, which stores whatever Atoi returned and so
+// really does reach the #5101 whole-rule drop.
 func TestStaticNATMatch6673PortVerdictsDoNotDropTheRule(t *testing.T) {
-	cfg, err := CompileConfigLenient(hierTree6659(t, `
+	for _, tc := range []struct {
+		name string
+		cfg  string
+		// portFaultSub identifies the port complaint, and wantPortSuffix is the
+		// narrower effect it must report. Asserting the premise stops the test
+		// from passing because the fault was never reported at all.
+		portFaultSub, wantPortSuffix string
+	}{
+		{
+			name: "malformed mapped-port folds to 0 and the rule installs a plain 1:1",
+			cfg: `
 security { nat { static { rule-set rs1 { from zone untrust;
     rule r1 { match { destination-address 198.51.100.0/24; destination-address 192.0.2.1/32;
                       destination-port 80; }
-              then { static-nat prefix 10.0.0.1/32 mapped-port 70000; } } } } } }`))
-	if err != nil {
-		t.Fatalf("tolerant compile: %v", err)
+              then { static-nat prefix 10.0.0.1/32 mapped-port 70000; } } } } } }`,
+			portFaultSub:   "mapped-port \"70000\" is not a valid port number",
+			wantPortSuffix: "port translation dropped",
+		},
+		{
+			name: "match destination-port without a mapped-port installs a port-scoped 1:1",
+			cfg: `
+security { nat { static { rule-set rs1 { from zone untrust;
+    rule r1 { match { destination-address 198.51.100.0/24; destination-address 192.0.2.1/32;
+                      destination-port 80; }
+              then { static-nat prefix 10.0.0.1/32; } } } } } }`,
+			portFaultSub:   "match destination-port 80 requires a matching",
+			wantPortSuffix: "port match dropped",
+		},
+		{
+			name: "mapped-port without a match destination-port installs a plain 1:1",
+			cfg: `
+security { nat { static { rule-set rs1 { from zone untrust;
+    rule r1 { match { destination-address 198.51.100.0/24; destination-address 192.0.2.1/32; }
+              then { static-nat { prefix 10.0.0.1/32; mapped-port 8080; } } } } } } }`,
+			portFaultSub:   "mapped-port 8080 requires a matching",
+			wantPortSuffix: "port translation dropped",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := CompileConfigLenient(hierTree6659(t, tc.cfg))
+			if err != nil {
+				t.Fatalf("tolerant compile: %v", err)
+			}
+			if got := cfg.Security.NAT.Static[0].Rules[0].Match; got != "192.0.2.1/32" {
+				t.Fatalf("Match = %q, want %q — the premise of this case is which "+
+					"value the compiler selects", got, "192.0.2.1/32")
+			}
+			// Premise: the port fault really is reported, and reported with the
+			// narrower effect rather than as a rule drop.
+			port := findWarning6673(t, cfg, tc.portFaultSub)
+			if !strings.Contains(port, tc.wantPortSuffix) {
+				t.Fatalf("premise failed: the port fault is not reported with a "+
+					"port-scoped effect (want %q):\n  %s", tc.wantPortSuffix, port)
+			}
+			if strings.Contains(port, "rule dropped by dataplane until corrected") {
+				t.Fatalf("a narrower port fault reports itself as a WHOLE-RULE drop; "+
+					"the dataplane still installs the address translation for it:\n  %s",
+					port)
+			}
+			w := findWarning6673(t, cfg, `destination-address "198.51.100.0/24" must be a host route`)
+			if !strings.Contains(w, "stays active") {
+				t.Fatalf("a port-scoped fault does not drop the rule — the address "+
+					"translation still installs on the selected value — so the complaint "+
+					"about the unused match value must still say it stays active:\n  %s", w)
+			}
+		})
 	}
-	// Premise: the port fault really is reported, and reported as port-scoped.
-	port := findWarning6673(t, cfg, "mapped-port", "is not a valid port number")
-	if !strings.Contains(port, "port translation dropped") {
-		t.Fatalf("premise failed: the mapped-port fault is not reported with a "+
-			"port-scoped effect:\n  %s", port)
+}
+
+// --- #6673 fold: a REPEATED value is one value, not a cardinality violation --
+
+// TestStaticNATMatchAddresses6673RepeatedIdenticalPrefixCommits guards the
+// invented rejection the raw count introduced.
+//
+// validateStaticNATMatchAddressesStrict counts how many external prefixes a
+// static-NAT rule authors, because only one can lower to
+// StaticNATRuleSnapshot.ExternalIP. Counting raw value slots made a REPEATED
+// prefix a hard commit failure: origin/master accepted every spelling below and
+// compiled a byte-identical rule.Match, and head rejected them with "only %q
+// would take effect and the rest would be silently ignored" — where "the rest"
+// IS the selected value, so nothing is ignored and nothing is lost.
+//
+// That matters beyond tidiness because the operator cannot then commit ANY
+// change until they find the duplicated line: the tolerant load path warns and
+// boots (#1960), but `commit` / `commit check` fails on a config that was
+// committed clean before. Flat set is idempotent so the CLI cannot author a
+// repeat, but one survives tree.Format() verbatim — a hand-edited config, a
+// `load merge`, a generated config or a peer-synced tree keeps it across reboot
+// and HA sync.
+//
+// Each case asserts BOTH halves: strict accepts, AND the rule compiles to
+// exactly what the single-statement form compiles to. Accepting while compiling
+// something else would be a different bug wearing this test as cover.
+func TestStaticNATMatchAddresses6673RepeatedIdenticalPrefixCommits(t *testing.T) {
+	const wrap = `
+security { nat { static { rule-set rs1 { from zone untrust;
+    rule r1 { %s
+              then { static-nat prefix %s; } } } } } }`
+	for _, tc := range []struct {
+		name string
+		// dup is the spelling under test; single is the same configuration with
+		// the repetition removed. Both must compile, to the SAME rule.
+		dup, single, then string
+	}{
+		{"duplicate sibling statements",
+			`match { destination-address 192.0.2.1/32; destination-address 192.0.2.1/32; }`,
+			`match { destination-address 192.0.2.1/32; }`, "10.0.0.1/32"},
+		{"duplicate inside one bracket",
+			`match { destination-address [ 192.0.2.1/32 192.0.2.1/32 ]; }`,
+			`match { destination-address [ 192.0.2.1/32 ]; }`, "10.0.0.1/32"},
+		{"duplicate across two match stanzas",
+			`match { destination-address 192.0.2.1/32; }
+             match { destination-address 192.0.2.1/32; }`,
+			`match { destination-address 192.0.2.1/32; }`, "10.0.0.1/32"},
+		{"triplicate",
+			`match { destination-address [ 192.0.2.1/32 192.0.2.1/32 192.0.2.1/32 ]; }`,
+			`match { destination-address [ 192.0.2.1/32 ]; }`, "10.0.0.1/32"},
+		{"duplicate beside an authored blank",
+			`match { destination-address 192.0.2.1/32; destination-address 192.0.2.1/32;
+                     destination-address [ ]; }`,
+			`match { destination-address 192.0.2.1/32; destination-address [ ]; }`,
+			"10.0.0.1/32"},
+		// Exact-text dedupe alone would leave the rest rejected, which is the
+		// same invented rejection one spelling over: a bare address IS a host
+		// route, and the Rust parse_nat_prefix masks the base, so each pair
+		// lowers to a byte-identical row. staticNATMatchAddrKey keys on that
+		// canonical form.
+		{"bare address beside its own /32",
+			`match { destination-address 192.0.2.1; destination-address 192.0.2.1/32; }`,
+			`match { destination-address 192.0.2.1/32; }`, "10.0.0.1/32"},
+		{"IPv6 bare address beside its own /128",
+			`match { destination-address [ 2001:db8::1 2001:db8::1/128 ]; }`,
+			`match { destination-address [ 2001:db8::1 ]; }`, "2001:db8:1::1/128"},
+		// A block pair, so the host-route gate does not fire on either spelling.
+		{"two spellings of one masked block",
+			`match { destination-address [ 192.0.2.0/24 192.0.2.5/24 ]; }`,
+			`match { destination-address [ 192.0.2.0/24 ]; }`, "10.0.0.0/24"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Premise: the de-duplicated spelling commits, so a failure below is
+			// the repetition and not some unrelated fault in the fixture.
+			ref := mustCompile6659(t, hierTree6659(t, fmt.Sprintf(wrap, tc.single, tc.then)))
+			refRule := ref.Security.NAT.Static[0].Rules[0]
+
+			cfg, err := CompileConfig(hierTree6659(t, fmt.Sprintf(wrap, tc.dup, tc.then)))
+			if err != nil {
+				t.Fatalf("strict commit REJECTED a repeated identical prefix that "+
+					"origin/master accepts and compiles identically — a repeat authors "+
+					"ONE external prefix, so the cardinality gate must count distinct "+
+					"values (dedupeValuesBy + staticNATMatchAddrKey), not raw slots:\n  %v",
+					err)
+			}
+			// Parity on the fields that reach the dataplane. MatchAddresses is
+			// deliberately NOT compared: it records every authored slot for the
+			// per-value diagnostics, and only the CARDINALITY GATE deduplicates.
+			got := cfg.Security.NAT.Static[0].Rules[0]
+			if got.Match != refRule.Match || got.Then != refRule.Then {
+				t.Fatalf("accepted, but compiled a different rule than the "+
+					"de-duplicated form: Match=%q Then=%q, want Match=%q Then=%q",
+					got.Match, got.Then, refRule.Match, refRule.Then)
+			}
+		})
 	}
-	w := findWarning6673(t, cfg, `destination-address "198.51.100.0/24" must be a host route`)
-	if !strings.Contains(w, "stays active") {
-		t.Fatalf("a port-scoped fault does not drop the rule — the address "+
-			"translation still installs on the selected value — so the complaint "+
-			"about the unused match value must still say it stays active:\n  %s", w)
+}
+
+// TestStaticNATMatchAddresses6673DistinctPrefixesStillRejected is the other
+// half: deduplication must not loosen the #6659 rejection. A rule naming two
+// GENUINELY different external prefixes still translates only one of them, so
+// the rest really would be silently ignored — the rejection that makes that
+// loud is the feature, and only exact repeats may be collapsed.
+func TestStaticNATMatchAddresses6673DistinctPrefixesStillRejected(t *testing.T) {
+	const wrap = `
+security { nat { static { rule-set rs1 { from zone untrust;
+    rule r1 { match { destination-address %s; }
+              then { static-nat prefix 10.0.0.1/32; } } } } } }`
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{"two distinct prefixes", `[ 192.0.2.1/32 198.51.100.1/32 ]`},
+		{"a repeat AND a distinct prefix", `[ 192.0.2.1/32 192.0.2.1/32 198.51.100.1/32 ]`},
+		{"same address, different prefix lengths", `[ 192.0.2.0/24 192.0.2.0/25 ]`},
+		{"same text, different family", `[ 192.0.2.1/32 ::/0 ]`},
+		// Two malformed tokens have no canonical form; keying them on raw text
+		// keeps them two, so a typo'd pair cannot slip through as "one prefix".
+		{"two distinct unparseable tokens", `[ not-an-ip also-not-an-ip ]`},
+		{"two distinct malformed masks", `[ 192.0.2.1/33 192.0.2.2/33 ]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := CompileConfigMustFail6673(t, hierTree6659(t, fmt.Sprintf(wrap, tc.value)))
+			if !strings.Contains(err.Error(), "`match destination-address` prefixes") {
+				t.Fatalf("rejected, but not by the cardinality gate — deduplication "+
+					"must not let a genuine multi-prefix rule through:\n  %v", err)
+			}
+		})
+	}
+}
+
+// TestForwardingTableExport6673RepeatedIdenticalPolicyCommits is the same guard
+// on the sibling cardinality gate. Both gates were written from one template and
+// both counted raw slots, so both invented the same rejection: `export [ p1 p1 ]`
+// names ONE policy, master accepted it and rendered the identical ECMP lookup.
+//
+// Identity here is exact TEXT, not a canonical form: an export value is an
+// opaque policy name, so two spellings are two different references.
+func TestForwardingTableExport6673RepeatedIdenticalPolicyCommits(t *testing.T) {
+	const wrap = `
+policy-options { policy-statement p1 { term t1 { then accept; } }
+                 policy-statement p2 { term t1 { then accept; } } }
+routing-options { forwarding-table { %s } }`
+	for _, tc := range []struct {
+		name string
+		// dup is the spelling under test; single is the same configuration with
+		// the repetition removed. Both must compile, to the SAME rendered scalar.
+		dup, single string
+	}{
+		{"duplicate inside one bracket", `export [ p1 p1 ];`, `export [ p1 ];`},
+		{"duplicate sibling statements", `export p1; export p1;`, `export p1;`},
+		{"triplicate", `export [ p1 p1 p1 ];`, `export [ p1 ];`},
+		// nodeVal selects the leading blank in both spellings, so the rendered
+		// scalar is "" for each — the repeat must not change that either.
+		{"duplicate beside an authored blank", `export [ "" p1 p1 ];`, `export [ "" p1 ];`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ref := mustCompile6659(t, hierTree6659(t, fmt.Sprintf(wrap, tc.single)))
+			cfg, err := CompileConfig(hierTree6659(t, fmt.Sprintf(wrap, tc.dup)))
+			if err != nil {
+				t.Fatalf("strict commit REJECTED a repeated identical export policy "+
+					"that origin/master accepts and renders identically — a repeat "+
+					"names ONE policy, so the gate must count distinct values:\n  %v", err)
+			}
+			if got, want := cfg.RoutingOptions.ForwardingTableExport,
+				ref.RoutingOptions.ForwardingTableExport; got != want {
+				t.Fatalf("accepted, but rendered export policy %q, want %q "+
+					"(the de-duplicated spelling's)", got, want)
+			}
+		})
+	}
+}
+
+// TestForwardingTableExport6673DistinctPoliciesStillRejected is the other half:
+// a genuine multi-policy chain still renders only one policy, so the #6659
+// rejection that makes that loud must survive deduplication. Identity here is
+// exact TEXT — an export value is an opaque policy name with no canonical form,
+// so two spellings are two different references.
+func TestForwardingTableExport6673DistinctPoliciesStillRejected(t *testing.T) {
+	const wrap = `
+policy-options { policy-statement p1 { term t1 { then accept; } }
+                 policy-statement p2 { term t1 { then accept; } } }
+routing-options { forwarding-table { %s } }`
+	for _, tc := range []struct{ name, export string }{
+		{"two distinct policies", `export [ p1 p2 ];`},
+		{"a repeat AND a distinct policy", `export [ p1 p1 p2 ];`},
+		{"distinct policies in separate statements", `export p1; export p2;`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := CompileConfigMustFail6673(t, hierTree6659(t, fmt.Sprintf(wrap, tc.export)))
+			if !strings.Contains(err.Error(), "forwarding-table export declares") {
+				t.Fatalf("rejected, but not by the cardinality gate — deduplication "+
+					"must collapse only exact repeats:\n  %v", err)
+			}
+		})
+	}
+}
+
+// TestStaticNATMatchAddrKey6673 pins the identity staticNATMatchAddrKey uses,
+// directly rather than through a commit verdict. Equal keys must mean "these
+// lower to the same dataplane row" — that soundness argument is what lets the
+// cardinality gate count them once without weakening the #6659 rejection.
+func TestStaticNATMatchAddrKey6673(t *testing.T) {
+	same := [][2]string{
+		{"192.0.2.1", "192.0.2.1/32"},
+		{"2001:db8::1", "2001:db8::1/128"},
+		{"192.0.2.0/24", "192.0.2.5/24"}, // Rust masks the base
+		{"2001:db8::/64", "2001:db8::5/64"},
+		{"192.0.2.1/32", "192.0.2.1/32"},
+	}
+	for _, p := range same {
+		if a, b := staticNATMatchAddrKey(p[0]), staticNATMatchAddrKey(p[1]); a != b {
+			t.Errorf("%q and %q install the same dataplane row but key differently (%q vs %q)",
+				p[0], p[1], a, b)
+		}
+	}
+	differ := [][2]string{
+		{"192.0.2.1/32", "192.0.2.2/32"},
+		{"192.0.2.0/24", "192.0.2.0/25"},
+		{"192.0.2.1/32", "2001:db8::1/128"},
+		{"not-an-ip", "also-not-an-ip"},
+		{"192.0.2.1/33", "192.0.2.1/34"}, // malformed masks: no canonical form
+		// A malformed token must never collide with a well-formed address.
+		{"192.0.2.1/33", "192.0.2.1/32"},
+		{"", "192.0.2.1/32"},
+	}
+	for _, p := range differ {
+		if a, b := staticNATMatchAddrKey(p[0]), staticNATMatchAddrKey(p[1]); a == b {
+			t.Errorf("%q and %q are distinct values but share key %q", p[0], p[1], a)
+		}
+	}
+}
+
+// TestDedupeValues6673 pins the helper's contract: first-appearance order, only
+// exact repeats removed, and nothing collapsed at all below two entries.
+func TestDedupeValues6673(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{"nil", nil, nil},
+		{"single", []string{"p1"}, []string{"p1"}},
+		{"no repeats", []string{"p1", "p2"}, []string{"p1", "p2"}},
+		{"adjacent repeat", []string{"p1", "p1"}, []string{"p1"}},
+		{"non-adjacent repeat keeps first-appearance order",
+			[]string{"p1", "p2", "p1"}, []string{"p1", "p2"}},
+		{"triplicate", []string{"p1", "p1", "p1"}, []string{"p1"}},
+		{"empty strings are values here (nonEmptyValues runs first)",
+			[]string{"", ""}, []string{""}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := dedupeValues(tc.in); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("dedupeValues(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }

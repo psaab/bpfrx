@@ -3100,6 +3100,59 @@ Validation: `go build ./...` rc 0; `go test ./pkg/config/ -count=1` ok;
   `pkg/routing/test_seams.go`,
   `pkg/routing/close_partial_manager_5718_test.go`,
   `pkg/routing/README.md`, `_Log.md`
+## 2026-08-01 — #6673 round 8: an invented rejection for a repeated identical prefix, and two rule-dropping checks that never marked the rule
+
+- **Timestamp**: 2026-08-01 (fix/6659-multivalue-leaf-arms, PR #6673)
+- **Action**: MAJOR — the #6659 cardinality gates counted RAW value slots, so a
+  REPEATED identical value became a hard commit rejection for a config
+  `origin/master` accepted and compiled byte-identically. Reproduced on both
+  trees through `CompileConfig` in strict mode before touching anything: three
+  authoring spellings (duplicate sibling statements, a duplicate inside one
+  bracket, two `match {}` stanzas) all ACCEPT on `ad9591177` and REJECT on
+  `b5da4d4d2`, with `rule.Match` identical on both. The same trap sat on the
+  SIBLING gate — `export [ p1 p1 ]` and `export p1; export p1;` measured the
+  same way — which the review had not looked at; both gates were written from
+  one template and both spared empties while rejecting duplicates. Both now run
+  `dedupeValuesBy` after `nonEmptyValues`. Identity is chosen per leaf: exact
+  text for the export gate (opaque policy names), and `staticNATMatchAddrKey`
+  for `match destination-address`, which mirrors Rust `parse_nat_prefix` (bare
+  address = host route, base masked to the prefix length) so `192.0.2.1` and
+  `192.0.2.1/32` collapse too — exact-text dedupe alone would have left the same
+  invented rejection one spelling over. Equal keys mean the rule lowers to a
+  byte-identical row, which is what makes collapsing sound rather than lenient;
+  genuinely distinct prefixes/policies still fail commit.
+- **Action (MINOR-1)**: the round-7 claim "every rule-dropping check
+  participates automatically" was true of `emit` and false of the ROUTING: two
+  whole-rule-dropping checks reported through the port-scoped `emitSuffix` and
+  so left `ruleDropped` false, emitting "stays active" for a rule the dataplane
+  discards. The review named one (out-of-range `match destination-port`, #5101 —
+  measured, 0 snapshots); enumerating the drop causes from BOTH lowering stages
+  found a second it had not: the block-pair-plus-port gate (#3202), where the Go
+  leg passes the rule through and the Rust block branch `continue`s (pinned by
+  `static_nat_block_with_port_is_dropped`). Both routed through `emit`. The
+  three remaining port checks are genuinely narrower and stay on `emitSuffix`,
+  each with the Rust `(0,_)/(m,0)` fold that installs an entry stated at its call
+  site — including why the malformed-`mapped-port` sibling differs from the
+  `destination-port` one (`combineMappedPortOperands` folds any malformed
+  operand to 0; the `destination-port` arm stores whatever `Atoi` returned).
+- **Action (MINOR-2/3)**: the residual is now an INVENTORY, not one example —
+  the empty `then static-nat` target (reported, but by a sibling validator whose
+  emissions the flag cannot see) beside the cross-family host pair (not checked
+  by any validator). The oracle field comment no longer claims all 23
+  `wantInstalled` rows are master's installed set: the two CONTROL rows are
+  head's intended #6659 widening, which master does not install.
+- **Validation**: RED-then-GREEN on four mutations, build rc 0 AND vet rc 0 in
+  both states each time — drop the static-NAT dedupe (8 subtests of
+  `…RepeatedIdenticalPrefixCommits` red, nothing else), drop the export dedupe
+  (its 4 subtests), revert `destination-port` to `emitSuffix` (1 subtest),
+  revert block-pair+port to `emitSuffix` (1 subtest). `go build`/`go vet` rc 0,
+  `go test ./pkg/config/... ./pkg/dataplane/...` ok, full `go test ./...` rc 0,
+  59 packages ok, 0 FAIL. gofmt clean on every touched file.
+- **File(s)**: `pkg/config/ast.go`, `pkg/config/compiler_nat_static.go`,
+  `pkg/config/compiler_validate_strict_nat.go`,
+  `pkg/config/compiler_validate_strict_routing.go`,
+  `pkg/config/compiler_multivalue_leaf_empty_6673_test.go`,
+  `docs/config-schema.md`, `_Log.md`
 
 ## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
 

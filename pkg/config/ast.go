@@ -267,6 +267,53 @@ func nonEmptyValues(vals []string) []string {
 	return out
 }
 
+// dedupeValuesBy returns vals with every entry whose key() repeats an earlier
+// entry's key removed, preserving first-appearance order.
+//
+// #6673 fold: a cardinality gate over a multiLeafAuthoredValues list must count
+// how many DISTINCT things the operator authored, not how many value slots the
+// leaf carries. Counting raw slots turns a repeated IDENTICAL value into a hard
+// commit rejection for a configuration that origin/master accepted and compiled
+// BYTE-IDENTICALLY — an INVENTED rejection, the failure mode these gates
+// explicitly spare an empty slot from (see nonEmptyValues). The repeat is not a
+// second policy/prefix: the scalar selects the same value either way, the
+// lowering emits the same single row, and the gate's own "the rest would be
+// silently ignored" is false when "the rest" IS the selected value.
+//
+// The CLI cannot author a repeat (flat set is idempotent) and apply-groups does
+// not duplicate, but a repeat survives tree.Format() verbatim, so once a
+// hand-edited config, a `load merge`, a generated config or a peer-synced tree
+// contains one it persists across reboot and HA sync — and the operator can then
+// commit nothing at all until they find the duplicated line.
+//
+// key() lets a caller choose the identity that matters for its own leaf: exact
+// text where the values are opaque names, or a canonical form where two
+// spellings provably install the same thing (staticNATMatchAddrKey).
+func dedupeValuesBy(vals []string, key func(string) string) []string {
+	if len(vals) < 2 {
+		return vals
+	}
+	seen := make(map[string]struct{}, len(vals))
+	out := make([]string, 0, len(vals))
+	for _, v := range vals {
+		k := key(v)
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+// dedupeValues is dedupeValuesBy keyed on the value text itself — the right
+// identity for a leaf whose values are OPAQUE NAMES with no canonical form (a
+// policy name, a filter name). Two different spellings of such a name are two
+// different references, so nothing beyond exact repetition may be collapsed.
+func dedupeValues(vals []string) []string {
+	return dedupeValuesBy(vals, func(v string) string { return v })
+}
+
 // ConfigTree is the root of a parsed configuration.
 type ConfigTree struct {
 	Children []*Node

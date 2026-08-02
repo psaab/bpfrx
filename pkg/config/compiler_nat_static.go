@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net/netip"
 	"strconv"
 	"strings"
 )
@@ -35,6 +36,55 @@ func natStaticPrefixInfo(addr string) (fam string, bits int, isHost, parsedIP bo
 		return fam, -1, false, true
 	}
 	return fam, n, n == max, true
+}
+
+// staticNATMatchAddrKey returns the INSTALL IDENTITY of a `match
+// destination-address` value: two values with the same key lower to a
+// byte-identical dataplane row, so a cardinality gate may count them once.
+//
+// #6673 fold. The gate over this leaf must count how many DISTINCT external
+// prefixes were authored; counting raw value slots invented a commit rejection
+// for a repeated identical prefix that origin/master accepted (dedupeValuesBy).
+// Exact-text dedupe alone would still reject `192.0.2.1` beside `192.0.2.1/32`,
+// which is the SAME host route written two ways — the same invented rejection,
+// one spelling over. So the key is the canonical form the dataplane itself
+// reduces the value to.
+//
+// The canonical form mirrors Rust parse_nat_prefix (static_nat.rs): a bare
+// address is a host route of the family's full width, and the base is MASKED to
+// the prefix length (`base = addr & !host_mask(len)`), which is why
+// `192.0.2.5/24` keys the same as `192.0.2.0/24`. That masking is what makes
+// collapsing SOUND rather than lenient: equal keys mean the rule translates
+// identically whichever spelling the compiler selects, so counting them once
+// cannot suppress a rejection that would have changed what installs. The #6659
+// rejection for GENUINELY distinct prefixes — where one of them really would
+// carry no translation — is untouched.
+//
+// A value that does not parse as an IP, or whose mask is malformed, has no
+// canonical form and keys on its raw text under a distinct prefix, so two
+// different malformed tokens never collapse into one and a malformed token can
+// never collide with a well-formed address. netip is used rather than net.IP
+// because net.IP folds IPv4-mapped IPv6 into IPv4 (#6327); natStaticPrefixInfo
+// supplies the family and width from the colon-strict natAddrFamily, so the two
+// agree on which width a 4-in-6 literal has.
+func staticNATMatchAddrKey(v string) string {
+	_, bits, _, parsedIP := natStaticPrefixInfo(v)
+	if !parsedIP || bits < 0 {
+		return "raw\x00" + v
+	}
+	ipPart := v
+	if slash := strings.IndexByte(v, '/'); slash >= 0 {
+		ipPart = v[:slash]
+	}
+	addr, err := netip.ParseAddr(ipPart)
+	if err != nil {
+		return "raw\x00" + v
+	}
+	p := netip.PrefixFrom(addr, bits)
+	if !p.IsValid() {
+		return "raw\x00" + v
+	}
+	return "ip\x00" + p.Masked().String()
 }
 
 // isStaticBlockPair reports whether (match, then) is a valid block-to-block
